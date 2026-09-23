@@ -13,7 +13,8 @@ import type {
 	FsSnapshotId,
 } from "@thinkthread/agent-posix";
 import type { SpeculativeAgentExecutionWorld, SpeculativeToolExecutionContext } from "../agent-execution-world.ts";
-import { asRecord, type ActionKey, PI_ACTION_SEMANTICS } from "../action-semantics.ts";
+import { type ActionKey, PI_ACTION_SEMANTICS } from "../action-semantics.ts";
+import { asRecord } from "../stable-json.ts";
 import {
 	effectCapabilitiesCover,
 	RESOURCE_OBSERVATION_EFFECTS,
@@ -38,7 +39,6 @@ import {
 	encodeThinkThreadToolRunnerRequest,
 	encodeThinkThreadToolRunnerResponse,
 	THINKTHREAD_TOOL_NAMES,
-	THINKTHREAD_TOOL_RUNNER_VERSION,
 	type ThinkThreadToolName,
 	type ThinkThreadToolRunnerRequest,
 } from "./tool-runner-protocol.ts";
@@ -102,9 +102,8 @@ export function createThinkThreadExecutionWorld(
 			runnerFingerprint = attempt;
 		}
 		return (await Promise.all([
-			"thinkthread-fs-v2", snapshotInputs ? "sealed-inputs" : "runner",
+			"thinkthread-fs", snapshotInputs ? "sealed-inputs" : "runner",
 			import("@thinkthread/agent-posix").then((sdk) => sdk.CONTRACT_FINGERPRINT),
-			THINKTHREAD_TOOL_RUNNER_VERSION,
 			runnerFingerprint,
 			nodePath, settings.autoResizeImages, settings.modelSupportsImages,
 		])).join(":");
@@ -215,7 +214,6 @@ async function forkThinkThreadWorld(
 	try {
 		context.signal.throwIfAborted();
 		const request = encodeThinkThreadToolRunnerRequest({
-			version: THINKTHREAD_TOOL_RUNNER_VERSION,
 			tool,
 			callID: context.callID,
 			args: context.args,
@@ -501,7 +499,7 @@ async function assertInputAuthority(version: ResourceVersionToken): Promise<void
 function runnerSettings(action: ActionKey | undefined, autoResizeImages: boolean, cwd?: string) {
 	if (!action) return { autoResizeImages, modelSupportsImages: true }; // Capability preparation has no invocation yet.
 	const invocation = asRecord(action.executionContext), identity = asRecord(invocation?.identity);
-	if (invocation?.executor !== "pi.filesystem.local.v2" || typeof invocation.filesystem !== "function" ||
+	if (invocation?.executor !== "pi.filesystem.local" || typeof invocation.filesystem !== "function" ||
 		identity?.executor !== invocation.executor || identity.version !== "0.84.1" || action.semantics ||
 		action.semanticsEpoch !== PI_ACTION_SEMANTICS.definition(action.tool)?.epoch ||
 		typeof identity.cwd !== "string" || !path.isAbsolute(identity.cwd) || (cwd !== undefined && identity.cwd !== cwd) ||

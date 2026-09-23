@@ -119,7 +119,7 @@ export type PatternAwarePattern = Readonly<Omit<MutablePattern, "context" | "bin
 	readonly bindings: Readonly<Record<string, PatternAwareBinding>>;
 	readonly dependencies?: ReadonlyArray<PatternAwareDependency>;
 	readonly gapCounts: Readonly<Record<string, number>>;
-	readonly gapLastSeen?: Readonly<Record<string, number>>;
+	readonly gapLastSeen: Readonly<Record<string, number>>;
 	readonly empiricalProbability: number;
 	readonly adoptionProbability: number;
 	readonly feedback: PatternAwareFeedback;
@@ -206,7 +206,6 @@ type PersistedPatternPool = Omit<PatternPool, "samples"> & {
 };
 
 type PersistedState = {
-	readonly version: typeof PERSISTENCE_VERSION;
 	readonly patterns: ReadonlyArray<PatternAwarePattern>;
 	readonly events: ReadonlyArray<PatternAwareEvent>;
 	readonly pools: ReadonlyArray<unknown>;
@@ -275,7 +274,6 @@ const MAX_PATH_SOURCES = 24;
 // Bound crash-loss while amortizing full-state serialization across active tool loops.
 // Terminal/dispose paths still flush immediately.
 const PERSIST_CHECKPOINT_INTERVAL_MS = 30_000;
-const PERSISTENCE_VERSION = 20;
 
 class PredictiveContextTrie {
 	private readonly root: TrieNode = { children: new Map(), patterns: new Set() };
@@ -359,7 +357,7 @@ export class PatternAwareStore {
 			.catch(() => undefined);
 		if (
 			!parsed ||
-			parsed.version !== PERSISTENCE_VERSION ||
+			Object.keys(parsed).length !== 4 ||
 			!Array.isArray(parsed.patterns) ||
 			!Array.isArray(parsed.events) ||
 			!Array.isArray(parsed.pools) ||
@@ -912,7 +910,6 @@ export class PatternAwareStore {
 			this.write ??= Promise.resolve().then(async () => {
 				this.dirty = false;
 				await writeJsonFile(target, {
-					version: PERSISTENCE_VERSION,
 					patterns: this.snapshot(),
 					...this.persistedLearningState(),
 					sequenceCounts: this.sequenceModel.snapshot(this.settings.maxPatterns),
@@ -2122,7 +2119,7 @@ function groupGapTiming(patterns: ReadonlyArray<MutablePattern>, settings: Patte
 		for (const [value, count] of Object.entries(pattern.gapCounts)) {
 			const parsed = Number.parseInt(value, 10);
 			const gap = Number.isFinite(parsed) ? Math.max(0, parsed) : 0;
-			const lastSeen = pattern.gapLastSeen[value] ?? pattern.lastSeenSequence;
+			const lastSeen = pattern.gapLastSeen[value]!;
 			const weight = Math.max(0, count) * recencyWeight(lastSeen, clock, settings.decayHalfLifeEvents);
 			if (!(weight > 0) || gap > settings.maxFutureGap) continue;
 			combined.set(gap, (combined.get(gap) ?? 0) + weight);
@@ -2311,7 +2308,7 @@ function readonlyPattern(pattern: MutablePattern, clock: number, halfLife: numbe
 function mutablePattern(value: PatternAwarePattern): MutablePattern | undefined {
 	const record = asRecord(value);
 	const bindings = asRecord(record?.bindings);
-	const gapCounts = numericRecord(record?.gapCounts);
+	const gapCounts = numericRecord(record?.gapCounts), gapLastSeen = numericRecord(record?.gapLastSeen);
 	const feedback = mutablePatternFeedback(record?.feedback);
 	if (
 		!record ||
@@ -2320,7 +2317,7 @@ function mutablePattern(value: PatternAwarePattern): MutablePattern | undefined 
 		!record.context.every(isEventSignature) ||
 		typeof record.targetTool !== "string" ||
 		!bindings ||
-		!gapCounts ||
+		!gapCounts || !gapLastSeen || Object.keys(gapCounts).some(gap => gapLastSeen[gap] === undefined) ||
 		!feedback ||
 		![
 			record.occurrences,
@@ -2344,12 +2341,7 @@ function mutablePattern(value: PatternAwarePattern): MutablePattern | undefined 
 		bindings: safeBindings,
 		...(value.targetSchemaHash ? { targetSchemaHash: value.targetSchemaHash } : {}),
 		gapCounts,
-		gapLastSeen: Object.fromEntries(
-			Object.keys(gapCounts).map((gap) => [
-				gap,
-				isFiniteNumber(value.gapLastSeen?.[gap]) ? value.gapLastSeen[gap]! : finite(value.lastSeenSequence),
-			]),
-		),
+		gapLastSeen,
 		occurrences: finite(value.occurrences),
 		replayMatches: finite(value.replayMatches),
 		historicalOpportunities: Math.max(1, value.historicalOpportunities),

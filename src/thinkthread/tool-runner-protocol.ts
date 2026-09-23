@@ -1,16 +1,15 @@
 import { createHash } from "node:crypto";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
+import { asRecord } from "../stable-json.ts";
 import type { ToolSettlement } from "../tool-settlement.ts";
 
-export const THINKTHREAD_TOOL_RUNNER_VERSION = 2 as const;
-const THINKTHREAD_TOOL_RUNNER_PREFIX = "PI_SPECULATIVE_ACTION_RESULT_V2:";
+const THINKTHREAD_TOOL_RUNNER_PREFIX = "PI_SPECULATIVE_ACTION_RESULT:";
 export const THINKTHREAD_TOOL_RUNNER_MAX_REQUEST_BYTES = 1024 * 1024;
 
 export const THINKTHREAD_TOOL_NAMES = ["read", "grep", "find", "ls", "write", "edit"] as const;
 export type ThinkThreadToolName = typeof THINKTHREAD_TOOL_NAMES[number];
 
 export interface ThinkThreadToolRunnerRequest {
-	readonly version: typeof THINKTHREAD_TOOL_RUNNER_VERSION;
 	readonly tool: ThinkThreadToolName;
 	readonly callID: string;
 	readonly args: unknown;
@@ -19,7 +18,6 @@ export interface ThinkThreadToolRunnerRequest {
 }
 
 interface ThinkThreadToolRunnerResponse {
-	readonly version: typeof THINKTHREAD_TOOL_RUNNER_VERSION;
 	readonly settlement: {
 		readonly result: {
 			readonly content: AgentToolResult<unknown>["content"];
@@ -50,10 +48,7 @@ export function decodeThinkThreadToolRunnerRequest(bytes: Uint8Array): ThinkThre
 		throw new Error("ThinkThread tool runner request is not valid UTF-8 JSON");
 	}
 	const record = asRecord(parsed);
-	if (!record || record.version !== THINKTHREAD_TOOL_RUNNER_VERSION) {
-		throw new Error("ThinkThread tool runner request version is unsupported");
-	}
-	if (typeof record.tool !== "string" || !TOOL_NAMES.has(record.tool)) {
+	if (!record || typeof record.tool !== "string" || !TOOL_NAMES.has(record.tool)) {
 		throw new Error("ThinkThread tool runner request tool is unsupported");
 	}
 	if (typeof record.callID !== "string" || record.callID.length === 0) {
@@ -63,7 +58,6 @@ export function decodeThinkThreadToolRunnerRequest(bytes: Uint8Array): ThinkThre
 		throw new Error("ThinkThread tool runner request image options are invalid");
 	}
 	return {
-		version: THINKTHREAD_TOOL_RUNNER_VERSION,
 		tool: record.tool as ThinkThreadToolName,
 		callID: record.callID,
 		args: record.args,
@@ -74,7 +68,6 @@ export function decodeThinkThreadToolRunnerRequest(bytes: Uint8Array): ThinkThre
 
 export function encodeThinkThreadToolRunnerResponse(settlement: ToolSettlement): string {
 	const response: ThinkThreadToolRunnerResponse = {
-		version: THINKTHREAD_TOOL_RUNNER_VERSION,
 		settlement: {
 			result: {
 				content: settlement.result.content,
@@ -113,7 +106,6 @@ export function decodeThinkThreadToolRunnerResponse(stdout: Uint8Array): ToolSet
 	const settlement = asRecord(response?.settlement);
 	const result = asRecord(settlement?.result);
 	if (
-		response?.version !== THINKTHREAD_TOOL_RUNNER_VERSION ||
 		!settlement ||
 		typeof settlement.isError !== "boolean" ||
 		!result ||
@@ -134,12 +126,6 @@ export function decodeThinkThreadToolRunnerResponse(stdout: Uint8Array): ToolSet
 function validContent(value: unknown): boolean {
 	const content = asRecord(value);
 	return !!content && typeof content.type === "string";
-}
-
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-	return value !== null && typeof value === "object" && !Array.isArray(value)
-		? (value as Record<string, unknown>)
-		: undefined;
 }
 
 function digest(bytes: Uint8Array): string {

@@ -75,7 +75,7 @@ Linux 后端可在同一会话内保留真实原生执行或已封存子进程�
 
 消费、窥读、写入、短写/错误、poll/select/内部 epoll、splice/tee、消息及控制消息、关闭和半关闭使用同一有序资源日志，验证后提交一次；提交后失败终止进程树，避免重复执行副作用。Unix datagram/seqpacket 支持提前执行中新产生的包及其边界、空包、截断和窥读。已有非空包队列、外部网络或未知持有者仍拒绝移交。日志前缀受 2 MiB 输入、每端 4096 字节／16 次写入及 1024 条操作预算限制，写入须满足实际容量。
 
-在合格的 x86-64 Linux 上，单线程提前执行可暂停在 read/readv/recvfrom/recvmsg 或 write/writev/sendto/sendmsg，封存内存、寄存器、TLS、信号与最终 FD 表，然后通过已有事务移交到 Actor 原本的子进程。后续使用真实 PID、FD/OFD 和对端，持续接收新输入并输出；前缀的标准输出/错误仍通过既有缓冲路由交付，并保留管道与 socket 的类型、合并路由及背压。私有文件映射保留真实文件对象和每页写时复制状态；复制、关闭和重编号沿用同一资源图。映像只驻留内存、一次消费，等待输入的时间不记作复用计算收益。当前只接受原有 OFD 构成的最终 FD 表，拒绝已读取 PID/TID、未封闭线程/进程树、共享映射、未建模内核对象等状态；恢复后可创建新线程。Windows 原生 HANDLE 移交尚未实现。此版本使用 helper 协议 34、FD6 输入／FD4 输出清单和证书版本 16，旧 helper 需重新构建。
+在合格的 x86-64 Linux 上，单线程提前执行可暂停在 read/readv/recvfrom/recvmsg 或 write/writev/sendto/sendmsg，封存内存、寄存器、TLS、信号与最终 FD 表，然后通过已有事务移交到 Actor 原本的子进程。后续使用真实 PID、FD/OFD 和对端，持续接收新输入并输出；前缀的标准输出/错误仍通过既有缓冲路由交付，并保留管道与 socket 的类型、合并路由及背压。私有文件映射保留真实文件对象和每页写时复制状态；复制、关闭和重编号沿用同一资源图。映像只驻留内存、一次消费，等待输入的时间不记作复用计算收益。当前只接受原有 OFD 构成的最终 FD 表，拒绝已读取 PID/TID、未封闭线程/进程树、共享映射、未建模内核对象等状态；恢复后可创建新线程。Windows 原生 HANDLE 移交尚未实现。内部协议和缓存只维护当前数据结构，不设版本号或迁移分支。更新原生实现后运行 `npm run setup:linux`，安装器按源码和二进制摘要重新构建及验证；不匹配的缓存重新学习。
 
 ### Actor probe
 
@@ -108,7 +108,7 @@ Linux x86_64 alpha4 的 `read/ls/edit` 有采纳验证；新文件 `write` 的�
 - Linux 进程观察记录 `fcntl/flock`；无法封闭的锁、租约、共享标志等状态禁止结果复用，旧观察契约的证书不再采纳。
 - metadata、watcher 事件或缓存命中不能替代内容证明。Windows 原生 Actor 观察因目录替换窗口限制而关闭，受控文件路线保留。输入读取可能影响访问时间。
 
-程序接入使用 `./core`、`./process-reuse`、`./pattern-aware`、`./extension` 等窄入口。自定义执行环境通过 Host 的 `executionWorlds` 注册，并由所属会话调用 `host.dispose()`；自定义工具未经明确绑定不会自动获得投机资格。
+根入口只提供 Pi Host API；程序接入按需使用 `./core`、`./process-reuse`、`./pattern-aware`、`./extension` 等窄入口。自定义执行环境通过 Host 的 `executionWorlds` 注册，并由所属会话调用 `host.dispose()`；自定义工具未经明确绑定不会自动获得投机资格。
 
 直接使用核心 Runtime 时，以 `disposeSession(sessionID)` 清理单个会话，以 `dispose()` 清理全部会话。
 

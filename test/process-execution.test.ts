@@ -1,8 +1,42 @@
 import { gated, deferred as barrier } from "./async.ts";
+import { execFile } from "node:child_process";
+import { writeFile } from "node:fs/promises";
+import net from "node:net";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+import { temporaryDirectories } from "./filesystem.ts";
 import { describe, expect, test, vi } from "vitest";
 import { ProcessExecutionCoordinator, type PreparedProcessExecutionRoute, type ProcessExecutor } from "../src/process-execution.ts";
 
 describe("ProcessExecutionCoordinator", () => {
+	test.runIf(process.platform === "linux")("dispatches only explicit broker outcomes and refuses failed or malformed replies", async () => {
+		const directories = temporaryDirectories("pi-dispatch-"), root = await directories.create();
+		const socketPath = path.join(root, "broker"), configuration = path.join(root, "config.json");
+		try {
+			await writeFile(configuration, JSON.stringify({ socketPath, token: "owned", directories: [] }));
+			for (const response of [null, { kind: "failed" }, { kind: "unknown" }, { kind: "bypass" },
+				{ kind: "bypass", executable: process.execPath },
+				{ kind: "hit", output: [{ fd: 1, data: Buffer.from("replayed").toString("base64") }], exit: { kind: "code", code: 0 } }]) {
+				let received: Record<string, unknown> | undefined;
+				const server = net.createServer({ allowHalfOpen: true }, socket => {
+					let body = ""; socket.setEncoding("utf8").on("data", chunk => { body += chunk; });
+					socket.on("end", () => { received = JSON.parse(body); socket.end(JSON.stringify(response)); });
+				});
+				await new Promise<void>(resolve => server.listen(socketPath, resolve));
+				try {
+					const result = await promisify(execFile)(process.execPath, [fileURLToPath(new URL("../src/process-dispatcher.mjs", import.meta.url)),
+						"--native-dispatch", configuration, process.execPath, process.execPath, "-e", "process.stdout.write('native')"], { cwd: root })
+						.then(value => ({ ...value, code: 0 }), error => ({ code: error.code, stdout: error.stdout }));
+					const expected = response?.kind === "hit" ? "replayed" : response?.kind === "bypass" && response.executable ? "native" : "";
+					expect(result).toMatchObject({ code: expected ? 0 : 125, stdout: expected });
+					expect(received?.token).toBe("owned");
+					expect(Object.keys(received!).sort()).toEqual(["args", "argv0", "context", "cwd", "environment", "invokedPath", "name", "token"]);
+				} finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); }
+			}
+		} finally { await directories.dispose(); }
+	});
+
 	test.each(["preparing", "executing", "rejected", "thrown"] as const)("owns route retirement while %s", async (phase) => {
 		for (const dispose of [false, true]) for (const warm of [false, true]) {
 			const calls: string[] = [], prepared = barrier<PreparedProcessExecutionRoute>(), probing = barrier();

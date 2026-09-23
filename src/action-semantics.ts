@@ -12,7 +12,6 @@ import {
 } from "./effect-model.ts";
 import { asRecord, immutableSnapshot, isImmutableSnapshot, stableStringify } from "./stable-json.ts";
 import { positiveInteger, nonNegativeInteger } from "./setting-input.ts";
-export { asRecord } from "./stable-json.ts";
 
 /** Observable effects of an action, independent of any concrete isolation backend. */
 export type ActionEffect = "observation" | "workspace_mutation" | "unbounded";
@@ -33,7 +32,7 @@ export interface ActionKey {
 	readonly resources: readonly string[];
 	/** Root for resolving logical resource names during retrieval; not equivalence evidence. */
 	readonly resourceRoot?: string;
-	/** Version of the canonicalization and execution contract, independent of the input schema. */
+	/** Identity of the canonicalization and execution contract, independent of the input schema. */
 	readonly semanticsEpoch: string;
 	/** Stable hash of the validated input schema used by both producer and consumer. */
 	readonly schemaHash: string;

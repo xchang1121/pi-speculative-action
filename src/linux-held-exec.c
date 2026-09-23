@@ -391,7 +391,6 @@ done:
 
 /* Called by the already authorized strace owner; no new ptracer exception or
  * sandbox permission is needed. The private process is retired on either result. */
-unsigned pi_process_image_protocol(void) { return 34; }
 int pi_process_image_frontier(long number) {
 	return number == SYS_read || number == SYS_readv || number == SYS_recvfrom || number == SYS_recvmsg ||
 		number == SYS_write || number == SYS_writev || number == SYS_sendto || number == SYS_sendmsg;
@@ -476,7 +475,7 @@ int pi_capture_process_image(pid_t pid, const char *path, unsigned long watched_
 	}
 	header->magic = UINT64_C(0x50494d4147453033);
 	output = open(path, O_WRONLY | O_CLOEXEC | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
-	if (output < 0 || dprintf(output, "PIIMAGE3 %d %u %zu %" PRIu64 "\n", pid, image->fd_count, sizeof(*header), header->length) < 0) goto done;
+	if (output < 0 || dprintf(output, "PIIMAGE %d %u %zu %" PRIu64 "\n", pid, image->fd_count, sizeof(*header), header->length) < 0) goto done;
 	for (unsigned i = 0; i < image->fd_count; i++) if (dprintf(output, "%d %d %" PRId64 " %ju %ju %d\n", image->fds[i].fd,
 		image->fds[i].flags, image->fds[i].offset, image->fds[i].device, image->fds[i].inode, image->fds[i].fd) < 0) goto done;
 	if (transfer(output, header, sizeof(*header), 1) == 0 && transfer(output, image->data, (size_t)header->length, 1) == 0) result = 0;
@@ -497,7 +496,7 @@ static int image_load(struct decision_job *job, size_t length, const char *physi
 	struct process_image *image = job->image;
 	struct image_reader input = {.cursor = image->allocation, .remaining = length};
 	struct image_header *header = &image->header; char line[MAX_LINE]; size_t header_size; uint64_t bytes;
-	if (image_line(&input, line, sizeof(line)) < 0 || sscanf(line, "PIIMAGE3 %d %u %zu %" SCNu64, &image->producer,
+	if (image_line(&input, line, sizeof(line)) < 0 || sscanf(line, "PIIMAGE %d %u %zu %" SCNu64, &image->producer,
 		&image->fd_count, &header_size, &bytes) != 4 || image->producer <= 0 || image->fd_count > MAX_HANDLES ||
 		header_size != sizeof(*header) || bytes > IMAGE_BYTES) goto fail;
 	for (unsigned i = 0; i < image->fd_count; i++) if (image_line(&input, line, sizeof(line)) < 0 ||
@@ -2334,7 +2333,7 @@ static int actor_decision(struct decision_job *job) {
 		pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
 	}
 	int request_length = snprintf(line, sizeof(line),
-		"{\"version\":1,\"token\":\"%s\",\"execution\":\"%s\",\"pid\":%ld,\"tracer\":%ld%s",
+		"{\"token\":\"%s\",\"execution\":\"%s\",\"pid\":%ld,\"tracer\":%ld%s",
 		job->token, job->execution_id, (long)job->pid, (long)getpid(),
 		captured ? ",\"descriptors\":[" : job->needs_tracking ? ",\"trackQueues\":true" : "");
 	int sent = request_length > 0 && request_length < (int)sizeof(line) && transfer(connection, line, (size_t)request_length, 1) == 0 &&
@@ -2845,7 +2844,7 @@ static int execute_descriptors(const char *manifest, const char *report, char *e
 	int result = 70, minimum = 3, output = -1, root_status = -1;
 	FILE *input = fopen(manifest, "re");
 	if (!input) return result;
-	if (!fgets(line, sizeof(line), input) || sscanf(line, "FD6 %u %u %u", &count, &close_input, &journal) != 3 ||
+	if (!fgets(line, sizeof(line), input) || sscanf(line, "INPUTS %u %u %u", &count, &close_input, &journal) != 3 ||
 		count > MAX_POSITIONS || close_input > 1 || journal > 1) goto done;
 	for (unsigned index = 0; index < count; index++) {
 		struct file_position *position = &positions[index];
@@ -3053,7 +3052,7 @@ static int execute_descriptors(const char *manifest, const char *report, char *e
 		execv(executable, command);
 		_exit(errno == ENOENT ? 127 : 126);
 	}
-	if (dprintf(output, "RUN1 %d\n", root) < 0) { kill(root, SIGKILL); goto done; }
+	if (dprintf(output, "RUNNING %d\n", root) < 0) { kill(root, SIGKILL); goto done; }
 	/* Journaling owns observations, not endpoints. Retain only references representing
 	 * real owners outside the private subtree; target aliases/forks own their own FDs. */
 	if (journal) for (unsigned index = 0; index < count; index++) {
@@ -3089,7 +3088,7 @@ static int execute_descriptors(const char *manifest, const char *report, char *e
 		void *failed; int joined = pthread_join(relays[index].thread, &failed); relays[index].started = 0;
 		if (joined || failed) goto done;
 	}
-	if (ftruncate(output, 0) < 0 || lseek(output, 0, SEEK_SET) != 0 || dprintf(output, "FD4 %u\n", count) < 0) goto done;
+	if (ftruncate(output, 0) < 0 || lseek(output, 0, SEEK_SET) != 0 || dprintf(output, "OFD %u\n", count) < 0) goto done;
 	for (unsigned index = 0; index < count; index++) {
 		struct file_position *position = &positions[index];
 		int flags = position->duplicate < 0 ? position->flags : fcntl(position->duplicate, F_GETFL);
@@ -3142,10 +3141,6 @@ done:
 int main(int argc, char **argv) {
 	int dispatched = image_dispatch(argc, argv);
 	if (dispatched >= 0) return dispatched;
-	if (argc == 2 && !strcmp(argv[1], "--protocol-version")) {
-		printf("%u\n", pi_process_image_protocol());
-		return 0;
-	}
 	if (argc >= 2 && (!strcmp(argv[1], "--exec") || !strcmp(argv[1], "--exec-closed-input") || !strcmp(argv[1], "--exec-fds"))) {
 		int descriptors = !strcmp(argv[1], "--exec-fds");
 		if (argc < (descriptors ? 7 : 5) || strspn(argv[2], "12") != 2 ||

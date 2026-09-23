@@ -931,7 +931,7 @@ describe("workspace-branch ExecutionWorld", () => {
 		};
 		const execute = (args: { path: string; content: string }) => route === "native"
 			? sandbox.createExecutionWorld().speculation.execute(context(root, "write", countingTool, args))
-			: runThinkThreadTool({ version: 2, tool: "write", callID: "guard", args, autoResizeImages: true, modelSupportsImages: true }, root);
+			: runThinkThreadTool({ tool: "write", callID: "guard", args, autoResizeImages: true, modelSupportsImages: true }, root);
 		const escapingInput = { path: "../outside.txt", content: "no" };
 		await expect(execute(escapingInput)).rejects.toThrow();
 		await symlink(outside, path.join(root, "linked"), process.platform === "win32" ? "junction" : "dir");

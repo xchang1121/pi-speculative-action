@@ -3,8 +3,6 @@ import { hash } from "node:crypto";
 import { cloneSharedData, stableEqual, stableStringify } from "./stable-json.ts";
 import type { WorkspaceFileMutation } from "./workspace-state.ts";
 
-export const PROCESS_CERTIFICATE_VERSION = 16 as const;
-
 /** Decimal strings preserve filesystem cookies beyond JavaScript's exact integer range. */
 export type OFDPosition = number | string;
 export function isOFDPosition(value: unknown): value is OFDPosition {
@@ -221,7 +219,6 @@ export type ProcessResultRecord = {
 
 /** Immutable completed-execution evidence indexed by WeakKey and validated into StrongKey. */
 export interface ProcessProvenanceCertificate {
-	readonly version: typeof PROCESS_CERTIFICATE_VERSION;
 	readonly id: Sha256Digest;
 	readonly weakKey: Sha256Digest;
 	readonly strongKey: Sha256Digest;
@@ -251,7 +248,7 @@ export function createExecPrototype(input: ProcessPrototypeInput): ExecPrototype
 }
 
 export function processWeakKey(prototype: ExecPrototype): Sha256Digest {
-	return digestObject({ version: PROCESS_CERTIFICATE_VERSION, prototype: normalizePrototype(prototype) });
+	return digestObject({ prototype: normalizePrototype(prototype) });
 }
 
 export function dependencyPathsetKey(certificate: DynamicDependencyCertificate): Sha256Digest {
@@ -315,11 +312,10 @@ export function sealProcessCertificate(input: {
 	});
 	const result = normalizeResult(input.result, prototype);
 	// These records are already captured and validated; public key functions still normalize raw callers.
-	const weakKey = digestObject({ version: PROCESS_CERTIFICATE_VERSION, prototype });
+	const weakKey = digestObject({ prototype });
 	const strongKey = digestObject({ weakKey, dependencies: dependencyCertificate.dependencies });
 	const createdAt = finiteTimestamp(input.createdAt ?? Date.now());
 	const body = {
-		version: PROCESS_CERTIFICATE_VERSION,
 		weakKey,
 		strongKey,
 		prototype,
@@ -335,7 +331,6 @@ export function parseProcessCertificate(value: unknown): ProcessProvenanceCertif
 	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
 	const candidate = value as Partial<ProcessProvenanceCertificate>;
 	if (
-		candidate.version !== PROCESS_CERTIFICATE_VERSION ||
 		!isSha256Digest(candidate.id) ||
 		!candidate.prototype ||
 		!candidate.producer ||

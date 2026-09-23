@@ -15,7 +15,6 @@ import { captureStableFile, hashExecutableFile, type StableFilesystemCapture } f
 import { captureFileDependency, validateDynamicDependencyCertificate } from "../src/provenance-validation.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { runThinkThreadTool } from "../src/thinkthread/tool-runner.ts";
-import { THINKTHREAD_TOOL_RUNNER_VERSION } from "../src/thinkthread/tool-runner-protocol.ts";
 import {
 	captureResourceVersion,
 	invalidateResourceInputs,
@@ -807,6 +806,7 @@ describe("speculative action resource versions", () => {
 		}
 		const execute = () => world.speculation!.execute({ cwd: root, tool: native, toolName: "read", args, action: key, callID: "spec", signal });
 		const branch = await execute();
+		const reconstructed = vi.spyOn(branch, "reconstruct");
 		try {
 			const expanded = PI_ACTION_SEMANTICS.buildKey("read", args, root, "", { ...binding,
 				semantics: { ...PI_ACTION_SEMANTICS.definition("read")!, requirements: { capabilities: ["filesystem.read", "validation.resource_snapshot", "network.mediate"] } } })!;
@@ -833,7 +833,10 @@ describe("speculative action resource versions", () => {
 			expect((await branch.reconstruct!({ action: key, args, callID: "retry", signal }))?.output.result).toEqual(await native.execute("native", args));
 			await fs.writeFile(configuration, "B");
 			expect((await branch.validate!()).status).toBe(capturedOnly ? "stale" : "valid");
-		} finally { await branch.dispose(); }
+		} finally {
+			await Promise.allSettled(reconstructed.mock.results.map(async ({ value }) => (await value)?.dispose?.()));
+			await branch.dispose();
+		}
 		for (const target of capturedOnly ? [file, configuration] : [file]) {
 			const before = await fs.readFile(target), expected = await native.execute("control", args);
 			afterRead = () => fs.writeFile(target, "changed before sealing");
@@ -1249,7 +1252,7 @@ describe("speculative action resource versions", () => {
 				const output = await invocation.filesystem!(token.view!, { args, callID: "speculate", signal: new AbortController().signal });
 				expect(expected.content.some((item) => item.type === "image")).toBe(true);
 				expect(output.result).toEqual(expected);
-				expect(await runThinkThreadTool({ version: THINKTHREAD_TOOL_RUNNER_VERSION, tool: "read", args,
+				expect(await runThinkThreadTool({ tool: "read", args,
 					callID: "runner", autoResizeImages, modelSupportsImages }, root)).toEqual(output);
 			}
 		} finally { releaseResourceVersion(token); }

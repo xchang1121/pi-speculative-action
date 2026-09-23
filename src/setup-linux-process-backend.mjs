@@ -172,7 +172,6 @@ async function installStrace() {
 	const patch = await readFile(STRACE_PATCH), sourceDigest = sha256(STRACE_SHA256, patch);
 	const target = path.join(localBin, "pi-speculative-strace"), stamp = `${target}.sha256`;
 	const qualify = async binary => {
-		await run(binary, ["--handoff-version"]);
 		await run(binary, ["--kill-on-exit", "-f", "-q", "-e", "trace=none", "-o", "/dev/null",
 			`--handoff-library=${heldExec}.so`, "--handoff-image=/dev/null", "--", "/bin/true"]);
 	};

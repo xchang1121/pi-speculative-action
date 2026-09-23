@@ -15,7 +15,7 @@ import { PI_OPERATION_TOOLS, resolvePiToolInvocation } from "../src/pi-tool-invo
 import { stableValueHash } from "../src/stable-value-hash.ts";
 import { runThinkThreadTool } from "../src/thinkthread/tool-runner.ts";
 import {
-	decodeThinkThreadToolRunnerResponse, encodeThinkThreadToolRunnerResponse, THINKTHREAD_TOOL_RUNNER_VERSION,
+	decodeThinkThreadToolRunnerResponse, encodeThinkThreadToolRunnerResponse,
 	type ThinkThreadToolName,
 } from "../src/thinkthread/tool-runner-protocol.ts";
 import { ToolExecutionGateway } from "../src/tool-execution-gateway.ts";
@@ -106,7 +106,7 @@ export async function qualifyStockTool(
 		await executeRoute();
 		await reset();
 		const output = wire(await runThinkThreadTool({
-			version: THINKTHREAD_TOOL_RUNNER_VERSION, tool: name, args, callID: context.callID, autoResizeImages: true, modelSupportsImages: true,
+			tool: name, args, callID: context.callID, autoResizeImages: true, modelSupportsImages: true,
 		}, cwd));
 		assert.deepEqual(output, baseline, `${name}: local wire runner output differs`);
 		assert.deepEqual(await workspaceState(root), expected, `${name}: local wire runner effects differ`);

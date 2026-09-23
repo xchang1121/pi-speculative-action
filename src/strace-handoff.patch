@@ -122,18 +122,17 @@
  static void ATTRIBUTE_NOINLINE
  init(int argc, char *argv[])
  {
-@@ -2364,6 +2472,10 @@
+@@ -2364,6 +2472,9 @@
  		{ "help",		no_argument,	   0, 'h' },
  		{ "instruction-pointer", no_argument,      0, 'i' },
  		{ "interruptible",	required_argument, 0, 'I' },
 +		{ "handoff-fd", required_argument, 0, 0x4000 },
 +        { "handoff-library", required_argument, 0, 0x4001 },
 +        { "handoff-image", required_argument, 0, 0x4002 },
-+        { "handoff-version", no_argument, 0, 0x4003 },
  		{ "kill-on-exit",	no_argument,	   0, GETOPT_KILL_ON_EXIT },
  		{ "stack-trace" ,	optional_argument, 0, GETOPT_STACK },
  		{ "stack-traces" ,	optional_argument, 0, GETOPT_STACK },
-@@ -2564,6 +2676,14 @@
+@@ -2564,6 +2675,13 @@
  					  "by this build of strace");
  #endif
  			break;
@@ -144,11 +143,10 @@
 +            break;
 +        case 0x4001: handoff_library = optarg; break;
 +        case 0x4002: handoff_image = optarg; break;
-+        case 0x4003: puts("2"); exit(0);
  		case GETOPT_KILL_ON_EXIT:
  			opt_kill_on_exit = true;
  			break;
-@@ -3007,6 +3127,9 @@
+@@ -3007,6 +3125,9 @@
  
  	debug_msg("ptrace_setoptions = %#x", ptrace_setoptions);
  	test_ptrace_seize();
@@ -158,7 +156,7 @@
  	test_ptrace_get_syscall_info();
  
  	/*
-@@ -3588,6 +3711,7 @@
+@@ -3588,6 +3709,7 @@
  static const struct tcb_wait_data *
  next_event(void)
  {
@@ -166,7 +164,7 @@
  	if (interrupted)
  		return NULL;
  
-@@ -3913,6 +4037,26 @@
+@@ -3913,6 +4035,26 @@
  	 * around union wait fixed by glibc commit glibc-2.24~391
  	 */
  	int status = wd ? wd->status : 0;
@@ -193,7 +191,7 @@
  
  	if (current_tcp && has_seccomp_filter(current_tcp))
  		restart_op = seccomp_filter_restart_operator(current_tcp);
-@@ -3951,6 +4095,8 @@
+@@ -3951,6 +4093,8 @@
  		ATTRIBUTE_FALLTHROUGH;
  
  	case TE_SYSCALL_STOP:
@@ -202,7 +200,7 @@
  		if (trace_syscall(current_tcp, &restart_sig) < 0) {
  			/*
  			 * ptrace() failed in trace_syscall().
-@@ -4034,6 +4180,9 @@
+@@ -4034,6 +4178,9 @@
  		return true;
  
  	case TE_STOP_BEFORE_EXECVE:
@@ -212,7 +210,7 @@
  		/* The syscall succeeded, clear the flag.  */
  		current_tcp->flags &= ~TCB_CHECK_EXEC_SYSCALL;
  		/*
-@@ -4231,6 +4380,15 @@
+@@ -4231,6 +4378,14 @@
  {
  	setlocale(LC_ALL, "");
  	init(argc, argv);
@@ -220,9 +218,8 @@
 +        void *library = dlopen(handoff_library, RTLD_NOW | RTLD_LOCAL);
 +        if (!library || !handoff_image) error_msg_and_die("invalid handoff library: %s", dlerror());
 +        handoff_capture = dlsym(library, "pi_capture_process_image");
-+        unsigned (*protocol)(void) = dlsym(library, "pi_process_image_protocol");
 +        handoff_frontier = dlsym(library, "pi_process_image_frontier");
-+        if (!handoff_capture || !handoff_frontier || !protocol || protocol() != 34) error_msg_and_die("incompatible capture ABI");
++        if (!handoff_capture || !handoff_frontier) error_msg_and_die("incompatible capture ABI");
 +    }
 +	if (handoff_fd >= 0) set_sighandler(SIGUSR2, handoff_signal, NULL);
  

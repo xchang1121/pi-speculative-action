@@ -1156,7 +1156,7 @@ describe("structural speculative runtime", () => {
 		}
 	});
 
-	it.each((["legacy-miss", "valid", "proof-missing", "uncovered", "rejected", "changed", "aborted", "running-unproven", "running-outside", "running-covered", "running-throws",
+	it.each((["no-reconstruction", "valid", "proof-missing", "uncovered", "rejected", "changed", "aborted", "running-unproven", "running-outside", "running-covered", "running-throws",
 		"output-valid", "output-uncovered", "output-rejected", "output-opaque", "output-preferred", "input-lookup", "input-scope"] as const)
 		.flatMap((scenario) => [false, ...(!scenario.startsWith("running") ? [true] : [])].map((preview) => [scenario, preview] as const)))(
 	"adopts reconstructed input or owned output coverage only after stable evaluation: %s (preview=%s)", async (scenario, preview) => {
@@ -1203,7 +1203,7 @@ describe("structural speculative runtime", () => {
 				return {
 				...world("wide", { validate: scoped ? async () => { throw new Error("unrelated input is stale"); } : validate }),
 				inputResources: [{ path: "/workspace/README.md" }],
-				...(scenario === "legacy-miss" || (outputOnly && scenario !== "output-preferred") ? {} : { reconstruct }),
+				...(scenario === "no-reconstruction" || (outputOnly && scenario !== "output-preferred") ? {} : { reconstruct }),
 				commit,
 			}; },
 		});
@@ -1214,7 +1214,7 @@ describe("structural speculative runtime", () => {
 		else { evidence.complete = true; evidence.view.text = "changed by producer"; }
 		const preparation = preview ? runtime.previewActorCall(actor, controller.signal) : Promise.resolve();
 		if (preview) {
-			if (!running && !outputOnly && scenario !== "legacy-miss") await gate.entered;
+			if (!running && !outputOnly && scenario !== "no-reconstruction") await gate.entered;
 			else await preparation;
 			expect(validate).not.toHaveBeenCalled(); expect(commit).not.toHaveBeenCalled();
 			if (scenario === "valid" || inputLookup) { gate.release(); await preparation; }
@@ -1224,7 +1224,7 @@ describe("structural speculative runtime", () => {
 			if (running) {
 				expect(await Promise.race([consumed, authorized.promise.then(() => "joined")])).toBe(succeeds ? "joined" : undefined);
 				completion.arrive(); gate.release();
-			} else if (scenario !== "legacy-miss" && !outputOnly) {
+			} else if (scenario !== "no-reconstruction" && !outputOnly) {
 				await gate.entered; changed = scenario === "changed";
 				if (scenario === "aborted") controller.abort();
 				gate.release();
@@ -1516,9 +1516,6 @@ describe("structural speculative runtime", () => {
 				toolExecutionMs: unretained ? 20 : 0, authoritativeToolCount: unretained ? 1 : 0, hiddenLatencyMs: 0,
 				estimatedSavingsMs: unretained ? 0 : 17,
 			});
-			const legacy = structuredClone(events);
-			for (const event of legacy) if (event.type === "task") Reflect.deleteProperty(event.timing, "estimatedSavingsMs");
-			expect(summarizeSpeculativeTrace(legacy).estimatedSavingsMs).toBeUndefined();
 		} finally { await runtime.dispose(); clock.mockRestore(); admission.mockRestore(); }
 		expect(disposed).toHaveBeenCalledOnce(); expect(runtime.inspect().sharedCandidates).toBe(0);
 		for (const dispose of queryDisposals) expect(dispose).toHaveBeenCalledOnce();

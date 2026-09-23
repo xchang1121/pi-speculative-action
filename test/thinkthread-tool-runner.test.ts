@@ -6,7 +6,7 @@ import { qualifyStockTool, STOCK_TOOL_CASES } from "../bench/stock-tool-qualific
 import { runThinkThreadTool } from "../src/thinkthread/tool-runner.ts";
 import {
 	decodeThinkThreadToolRunnerRequest, decodeThinkThreadToolRunnerResponse,
-	encodeThinkThreadToolRunnerRequest, encodeThinkThreadToolRunnerResponse, THINKTHREAD_TOOL_RUNNER_VERSION,
+	encodeThinkThreadToolRunnerRequest, encodeThinkThreadToolRunnerResponse,
 } from "../src/thinkthread/tool-runner-protocol.ts";
 
 vi.mock("node:fs/promises", { spy: true });
@@ -14,11 +14,11 @@ vi.mock("node:fs/promises", { spy: true });
 describe("ThinkThread stock Pi tool runner", () => {
 	it("round-trips integrity-checked frames and rejects unqualified Pi modules", async () => {
 		const request = {
-			version: THINKTHREAD_TOOL_RUNNER_VERSION, tool: "read" as const,
+			tool: "read" as const,
 			callID: "call-read", args: { path: "notes.txt" }, autoResizeImages: true, modelSupportsImages: false,
 		};
 		expect(decodeThinkThreadToolRunnerRequest(encodeThinkThreadToolRunnerRequest(request))).toEqual(request);
-		for (const invalid of [{ version: 1 }, { autoResizeImages: undefined }, { modelSupportsImages: undefined }, { modelSupportsImages: "false" }]) {
+		for (const invalid of [{ tool: "unknown" }, { autoResizeImages: undefined }, { modelSupportsImages: undefined }, { modelSupportsImages: "false" }]) {
 			expect(() => decodeThinkThreadToolRunnerRequest(Buffer.from(JSON.stringify({ ...request, ...invalid })))).toThrow();
 		}
 		const settlement = {

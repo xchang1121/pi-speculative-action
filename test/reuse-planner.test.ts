@@ -1,4 +1,4 @@
-import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { unlink, writeFile } from "node:fs/promises";
 import { temporaryDirectories } from "./filesystem.ts";
 import { processPrototype as basePrototype, processCertificate } from "./process-fixture.ts";
 import path from "node:path";
@@ -59,29 +59,6 @@ describe("ProcessReusePlanner", () => {
 		});
 	});
 
-	it("rejects obsolete certificate identities and rewarms the current weak namespace", async () => {
-		const root = await temporaryRoot(), store = new ProvenanceCertificateStore(root);
-		const certificate = processCertificate(processPrototype(), { createdAt: 123 });
-		// Recorded incompatible hashes, with the same prototype, producer, dependencies, result, and timestamp.
-		const legacy = { ...certificate, version: 6,
-			weakKey: "sha256:063acac52cc249aa186e4f796eb0cb8dc3d1656c13c185912724042764cc325c" as const,
-			strongKey: "sha256:80149901d114aae4530bf0dd5e9dedd8d7ca7320f6c5d78ec2829e786c2a4ac7" as const,
-			id: "sha256:c525fd6be73f1489f052dafad1414e4ec0802d729e18841b4db21ac165972496" as const,
-		};
-		const id = legacy.id.slice(7), weak = legacy.weakKey.slice(7);
-		const file = path.join(root, "certificates", id.slice(0, 2), `${id.slice(2)}.json`);
-		const index = path.join(root, "indexes", "weak", weak.slice(0, 2), weak.slice(2));
-		await mkdir(path.dirname(file), { recursive: true }); await mkdir(index, { recursive: true });
-		const bytes = JSON.stringify(legacy);
-		await writeFile(file, bytes); await writeFile(path.join(index, `${id}.ref`), "");
-		const planner = new ProcessReusePlanner({ store }), request = { weakKey: processWeakKey(certificate.prototype), executablePath: certificate.prototype.executablePath, contract: contract() };
-		expect(await planner.plan(request)).toMatchObject({ kind: "miss", reasons: ["no_candidate_pathset"], lookup: { candidateCertificates: 0 } });
-		expect(await readFile(file, "utf8")).toBe(bytes);
-		await expect(store.get(legacy.id)).rejects.toThrow("certificate integrity check failed");
-		await store.put(certificate);
-		expect(await planner.plan(request)).toMatchObject({ kind: "completed_replay", source: "l2", certificate: { id: certificate.id, version: 16 } });
-		await store.stats();
-	});
 
 	it("lets the execution authority reject an otherwise matching producer proof", async () => {
 		const fixture = await fixtureWithCertificate();

@@ -166,8 +166,8 @@ describe("process provenance certificates", () => {
 	});
 
 	it.each([
-		["a", "b", "sha256:b95734cb1c7755c46af9754cd6519dc51b02034c44ca02496f45b5c822ea7da5"],
-		["e\u0301", "\u00e9", "sha256:d91e5de48608fd53ab76de2ac5832b1ec587639dba49c8398ddedf585c028a2f"],
+		["a", "b", "sha256:948299d4e0f17f7e450cdc06f6492f7bb637d81c2bfe932e36fe2c43df5ac013"],
+		["e\u0301", "\u00e9", "sha256:d8fbf7e3989dafe6000116c99cd218b9aca85a20d768ba077b75f1f5daa5e8bc"],
 	] as const)("owns an exact dependency set independently of capture order (%s, %s)", (left, right, id) => {
 		const a = { kind: "absence" as const, path: `/workspace/${left}`, parentEntriesDigest: sha256Digest("entries"), parentExcludedEntries: [".pi", ".git", ".pi"] };
 		const b = { ...a, path: `/workspace/${right}` };

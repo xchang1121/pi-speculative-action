@@ -44,7 +44,7 @@ export interface ToolFilesystemOperations {
 		consume: (value: Value) => Promise<Result>, resource?: string) => Promise<Result>;
 }
 
-/** Versioned identity of the concrete tool executor. */
+/** Identity of the concrete tool executor. */
 export interface ToolInvocation {
 	readonly executor: string;
 	/** Internal execution uses the current enclosing action for permission and an opaque backend binding. */

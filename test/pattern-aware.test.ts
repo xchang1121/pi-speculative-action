@@ -432,7 +432,7 @@ describe("PatternAware", () => {
 		const raw = await fs.readFile(file, "utf8");
 		expect(raw).not.toContain('"history"');
 		const persisted = JSON.parse(raw);
-		expect(persisted.version).toBe(20);
+		expect(Object.keys(persisted).sort()).toEqual(["events", "patterns", "pools", "sequenceCounts"]);
 		expect(persisted.events.length).toBeGreaterThan(0);
 		expect(
 			persisted.pools.every((pool: { samples: Array<{ context: number[]; target: number }> }) =>
@@ -441,8 +441,8 @@ describe("PatternAware", () => {
 				),
 			),
 		).toBe(true);
-		for (const version of [persisted.version - 1, persisted.version + 1]) {
-			const unsupported = JSON.stringify({ ...persisted, version });
+		for (const field of ["events", "pools", "sequenceCounts"]) {
+			const unsupported = JSON.stringify({ ...persisted, [field]: undefined });
 			await fs.writeFile(file, unsupported);
 			const ignored = patternStore({}, file);
 			await ignored.load(); await ignored.flush();
@@ -459,14 +459,15 @@ describe("PatternAware", () => {
 		expect(second.snapshot().find((item) => item.targetTool === "read")?.historicalOpportunities).toBe(3);
 	});
 
-	test.each([19, 20])("restores valid patterns and owns public snapshots (version=%s)", async (version) => {
+	test("restores valid patterns and owns public snapshots", async () => {
 		const file = await patternFile();
 		const restoredInput = { path: "README.md", fields: { "\u00e9": 2, "e\u0301": 1 } };
 		const valid = validatedGapPattern({ "0": 10 }, { id: "valid-persisted-pattern", bindings: constantBindings(restoredInput) });
 		const counters = Object.keys(valid.feedback).filter((key) => typeof valid.feedback[key as keyof typeof valid.feedback] === "number");
 		Object.assign(valid.feedback, Object.fromEntries(counters.map((key, index) => [key, index + 1])));
-		await fs.writeFile(file, JSON.stringify({ version,
+		await fs.writeFile(file, JSON.stringify({
 			patterns: [valid,
+				{ ...valid, id: "missing-gap-times", gapLastSeen: undefined },
 				{ ...valid, id: "bad-context", context: [{ tool: 7, outcome: "success" }] },
 				{ ...valid, id: "bad-target-path", bindings: { "not-json": { type: "constant", value: "x" } } },
 				{ ...valid, id: "bad-binding", bindings: { '["filePath"]': { type: "event", relativeEvent: -1, field: "output", path: "not-an-array" } } },
@@ -480,7 +481,6 @@ describe("PatternAware", () => {
 		}));
 		const store = patternStore({ minOccurrences: 1 }, file);
 		await expect(store.load()).resolves.toBeUndefined();
-		if (version === 19) { expect(store.snapshot()).toEqual([]); return; }
 		const expected = store.snapshot(), exposed = store.snapshot()[0]!;
 		expect(expected.map((pattern) => pattern.id)).toEqual(["valid-persisted-pattern"]);
 		expect(exposed.feedback).toEqual(valid.feedback);
@@ -561,7 +561,7 @@ describe("PatternAware", () => {
 		);
 		await fs.writeFile(
 			file,
-			JSON.stringify({ version: 20, patterns: [long], events: [], pools: [], sequenceCounts: [] }),
+			JSON.stringify({ patterns: [long], events: [], pools: [], sequenceCounts: [] }),
 		);
 
 		const store = patternStore({ maxContextLength: 1 }, file);
@@ -638,7 +638,7 @@ describe("PatternAware", () => {
 
 		const persisted = JSON.parse(await fs.readFile(file, "utf8"));
 		expect(persisted.patterns).toEqual(first.snapshot());
-		expect(persisted.version).toBe(20);
+		expect(Object.keys(persisted).sort()).toEqual(["events", "patterns", "pools", "sequenceCounts"]);
 		expect(persisted.sequenceCounts.length).toBeGreaterThan(0);
 		const restored = new PatternAwareStore(configured, file);
 		await restored.load();
