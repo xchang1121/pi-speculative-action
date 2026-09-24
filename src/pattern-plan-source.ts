@@ -437,7 +437,9 @@ function extractOutputPaths(
 	const searchRoot = typeof actionInput.path === "string" && actionInput.path ? actionInput.path : ".";
 	const text = result.content.flatMap((item) => item.type === "text" ? [item.text] : []).join("\n");
 	if (tool === "bash") { // The files a command names as it runs, and those its output reports.
-		const named = [...`${actionInput.command}\n${text}`.matchAll(RUN_OUTPUT_PATH)].flatMap((match) => match[2] || /[\\/]/u.test(match[1]!) ? [match[1]!] : []);
+		// A git diff names each file as a/path and b/path.
+		const diff = /^(?:diff --git|\+\+\+|---) [ab]\//mu.test(text), named = [...`${actionInput.command}\n${text}`.matchAll(RUN_OUTPUT_PATH)]
+			.flatMap((match) => match[2] || /[\\/]/u.test(match[1]!) ? [diff ? match[1]!.replace(/^[ab]\//u, "") : match[1]!] : []);
 		return named.length ? [...new Set(named)].slice(0, 32) : undefined;
 	}
 	const paths = text

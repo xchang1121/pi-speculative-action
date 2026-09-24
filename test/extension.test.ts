@@ -53,9 +53,7 @@ describe("zero-modification Pi extension", () => {
 		const read = fixture.tools.get("read")!;
 		expect(read).toMatchObject({ name: "read", label: "read" });
 		await fixture.emit("context", { messages: [] });
-		const partial = {
-			content: [{ type: "toolCall", id: "actor-read", name: "read", arguments: {} }],
-		};
+		const partial = { content: [{ type: "toolCall", id: "actor-read", name: "read", arguments: {} }] };
 		await fixture.emit(
 			"message_update",
 			{ assistantMessageEvent: { type: "toolcall_start", contentIndex: 0, partial } },
@@ -370,9 +368,7 @@ describe("zero-modification Pi extension", () => {
 		expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Tool   Predict  Replay"), "info");
 		expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringMatching(/bash\s+Off\s+(Ready|Unavailable)/u), "info");
 		expect(fixture.ui.notify).not.toHaveBeenCalledWith(expect.stringContaining("bash cannot be enabled here"), "warning");
-		expect(fixture.ui.notify).toHaveBeenCalledWith(
-			expect.stringContaining("storage 3/32, 2 KiB/4 KiB, 1 orphan artifacts"), "info",
-		);
+		expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining("storage 3/32, 2 KiB/4 KiB, 1 orphan artifacts"), "info");
 		expect(JSON.stringify([...menus.values()])).not.toContain("sandbox");
 		expect((await fixture.hostSettings())?.tools).not.toContain("bash");
 		const footer = vi.mocked(fixture.ui.setStatus).mock.calls.at(-1)?.[1] ?? "";
