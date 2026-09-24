@@ -333,7 +333,7 @@ export class LinuxProcessReuseBackend {
 
 	constructor(options: LinuxProcessBackendOptions) {
 		this.options = options;
-		this.store = new ProvenanceCertificateStore(options.storeRoot, options.store);
+		this.store = new ProvenanceCertificateStore(options.storeRoot, { ...options.store, acceptedTaints: SAME_CONFINEMENT_TAINTS });
 		this.planner = new ProcessReusePlanner({ store: this.store });
 		this.handoffs = new ProcessHandoffRegistry(this.store.limits.maxCertificates, Math.min(MAX_CONTINUATION_BYTES, this.store.limits.maxBytes));
 		this.storage = {

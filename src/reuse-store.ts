@@ -7,6 +7,7 @@ import {
 	isSha256Digest,
 	parseProcessCertificate,
 	type ProcessProvenanceCertificate,
+	type ProvenanceTaint,
 	referencedArtifacts,
 	sha256Digest,
 	type Sha256Digest,
@@ -23,6 +24,8 @@ export interface ProvenanceStoreLimits {
 export interface ProvenanceStoreOptions extends Partial<ProvenanceStoreLimits> {
 	readonly gcIntervalMs?: number;
 	readonly orphanGraceMs?: number;
+	/** Taints the publisher accepted: retention and stats keep what its lookups can still replay. */
+	readonly acceptedTaints?: readonly ProvenanceTaint[];
 }
 
 export interface ProvenanceStoreStats {
@@ -68,9 +71,7 @@ export class ArtifactCAS {
 
 	async get(reference: ArtifactReference): Promise<Buffer | undefined> {
 		const { digest, size } = reference;
-		if (!isSha256Digest(digest) || !Number.isSafeInteger(size) || size < 0) {
-			throw new Error("invalid artifact reference");
-		}
+		if (!isSha256Digest(digest) || !Number.isSafeInteger(size) || size < 0) throw new Error("invalid artifact reference");
 		const bytes = await readOptional(this.artifactPath(digest));
 		if (bytes && (bytes.byteLength !== size || sha256Digest(bytes) !== digest)) {
 			throw new Error(`artifact integrity check failed for ${digest}`);
@@ -101,9 +102,7 @@ export class ArtifactCAS {
 			artifacts: values.size,
 			bytes: [...values.values()].reduce((total, value) => total + value.byteLength, 0),
 			read: ({ digest, size }: ArtifactReference): Buffer => {
-				if (!isSha256Digest(digest) || !Number.isSafeInteger(size) || size < 0) {
-					throw new Error("invalid artifact reference");
-				}
+				if (!isSha256Digest(digest) || !Number.isSafeInteger(size) || size < 0) throw new Error("invalid artifact reference");
 				const value = values.get(digest);
 				if (!value || value.byteLength !== size) {
 					throw new Error(`artifact is outside the verified closure: ${digest}`);
@@ -133,6 +132,7 @@ export class ProvenanceCertificateStore {
 	private limitsValue: ProvenanceStoreLimits;
 	private readonly gcIntervalMs: number;
 	private readonly orphanGraceMs: number;
+	private readonly acceptedTaints: readonly ProvenanceTaint[];
 	private maintenance: Promise<void> = Promise.resolve();
 	private gcDueAt: number;
 	private statsValue?: ProvenanceStoreStats;
@@ -146,6 +146,7 @@ export class ProvenanceCertificateStore {
 		});
 		this.gcIntervalMs = nonNegativeNumber(options.gcIntervalMs, DEFAULT_GC_INTERVAL_MS);
 		this.orphanGraceMs = nonNegativeNumber(options.orphanGraceMs, DEFAULT_ORPHAN_GRACE_MS);
+		this.acceptedTaints = Object.freeze([...options.acceptedTaints ?? []]);
 		this.gcDueAt = Date.now() + this.gcIntervalMs;
 	}
 
@@ -172,10 +173,7 @@ export class ProvenanceCertificateStore {
 					throw new Error(`certificate references missing artifact ${reference.digest}`);
 				}
 			}
-			const published = await publishImmutable(
-				this.certificatePath(owned.id),
-				Buffer.from(stableStringify(owned), "utf8"),
-			);
+			const published = await publishImmutable(this.certificatePath(owned.id), Buffer.from(stableStringify(owned), "utf8"));
 			if ((await this.get(owned.id))?.id !== owned.id) throw new Error("certificate publication failed");
 			await publishImmutable(this.weakReferencePath(owned), new Uint8Array());
 			return published;
@@ -233,7 +231,7 @@ export class ProvenanceCertificateStore {
 
 	async stats(refresh = false): Promise<ProvenanceStoreStats> {
 		await this.maintenance;
-		if (refresh || !this.statsValue) this.statsValue = inventoryStats(await this.inventory(), this.limits);
+		if (refresh || !this.statsValue) this.statsValue = inventoryStats(await this.inventory(), this.limits, this.acceptedTaints);
 		return this.statsValue;
 	}
 
@@ -243,7 +241,7 @@ export class ProvenanceCertificateStore {
 
 	clear(): Promise<ProvenanceStoreGCResult> {
 		return this.exclusive(async () => {
-			const before = inventoryStats(await this.inventory(), this.limits);
+			const before = inventoryStats(await this.inventory(), this.limits, this.acceptedTaints);
 			await mkdir(this.root, { recursive: true });
 			const tomb = path.join(this.root, `.clear-${randomUUID()}`);
 			await mkdir(tomb);
@@ -267,7 +265,7 @@ export class ProvenanceCertificateStore {
 			(left, right) => (right.certificate?.createdAt ?? 0) - (left.certificate?.createdAt ?? 0),
 		)) {
 			const certificate = record.certificate;
-			if (!certificate || !certificateReplayable(certificate)) continue;
+			if (!certificate || !certificateReplayable(certificate, this.acceptedTaints)) continue;
 			const references = referencedArtifacts(certificate);
 			if (!references.every((reference) => inventory.artifacts.get(reference.digest)?.bytes === reference.size)) continue;
 			const addedArtifacts = references.filter((reference) => !retainedArtifacts.has(reference.digest));
@@ -292,8 +290,7 @@ export class ProvenanceCertificateStore {
 			removedCertificates: removed.length,
 			removedArtifacts: orphans.length,
 			removedBytes:
-				removed.reduce((total, record) => total + record.bytes, 0) +
-				orphans.reduce((total, artifact) => total + artifact.bytes, 0),
+				removed.reduce((total, record) => total + record.bytes, 0) + orphans.reduce((total, artifact) => total + artifact.bytes, 0),
 		};
 	}
 
@@ -374,13 +371,8 @@ interface StoreInventory {
 	readonly artifacts: ReadonlyMap<Sha256Digest, StoredFile>;
 }
 
-function inventoryStats(
-	inventory: StoreInventory,
-	limits: ProvenanceStoreLimits,
-): ProvenanceStoreStats {
-	const replayable = inventory.certificates.flatMap((record) =>
-		record.certificate && certificateReplayable(record.certificate) ? [record.certificate] : [],
-	);
+function inventoryStats(inventory: StoreInventory, limits: ProvenanceStoreLimits, acceptedTaints: readonly ProvenanceTaint[]): ProvenanceStoreStats {
+	const replayable = inventory.certificates.flatMap((record) => record.certificate && certificateReplayable(record.certificate, acceptedTaints) ? [record.certificate] : []);
 	const referenced = new Set(replayable.flatMap(referencedArtifacts).map((reference) => reference.digest));
 	const certificateBytes = inventory.certificates.reduce((total, record) => total + record.bytes, 0);
 	const artifactBytes = [...inventory.artifacts.values()].reduce((total, record) => total + record.bytes, 0);
