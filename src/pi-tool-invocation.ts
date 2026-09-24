@@ -4,7 +4,8 @@ import {
 	getAgentDir, getShellConfig, VERSION, type ExtensionContext, type ToolsOptions,
 } from "@earendil-works/pi-coding-agent";
 import type { ToolFilesystemOperations, ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
-import { PI_ACTION_SEMANTICS, type ActionSemanticsDefinition } from "./action-semantics.ts";
+import { BASH_TIMEOUT_ACTION_KEY_PROJECTOR, PI_ACTION_SEMANTICS, type ActionSemanticsDefinition } from "./action-semantics.ts";
+import type { ActionProjectionRule } from "./action-key-projection.ts";
 import { asRecord } from "./stable-json.ts";
 import { RESOURCE_OBSERVATION_EFFECTS } from "./effect-model.ts";
 import { captureResourceVersion, type ResourceInput } from "./resource-version.ts";
@@ -126,6 +127,13 @@ export function resolvePiToolInvocation(
 		},
 	};
 }
+
+/** Only a finished command projects: Pi reports a timeout or non-zero exit as an error, which no other timeout reproduces. */
+export const PI_BASH_TIMEOUT_PROJECTION_RULE: ActionProjectionRule<ToolSettlement> = {
+	...BASH_TIMEOUT_ACTION_KEY_PROJECTOR,
+	captureCoverage: (action, output) => action.tool === "bash" && !output.isError ? true : undefined,
+	projectOutput: ({ output }) => output.isError ? undefined : output,
+};
 
 /** Retain stock write poststates; edit normalization and queuing stay in Pi. */
 function captureActorWrites(execute: NonNullable<ToolInvocation["filesystem"]>, root: string): Pick<ToolInvocation, "authoritative" | "captureInputs"> {

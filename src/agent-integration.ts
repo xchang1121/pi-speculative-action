@@ -32,6 +32,7 @@ import {
 	patternAwareSettings,
 } from "./pattern-aware.ts";
 import { createPatternPlanSource } from "./pattern-plan-source.ts";
+import { PI_BASH_TIMEOUT_PROJECTION_RULE } from "./pi-tool-invocation.ts";
 import type { TimelineDependency } from "./task-timing.ts";
 import type {
 	CandidatePreflight,
@@ -196,13 +197,10 @@ export function createSpeculativeActionHost(
 	options: CreateSpeculativeActionHostOptions,
 ): SpeculativeActionHost {
 	const actionSemantics = options.actionSemantics ?? PI_ACTION_SEMANTICS;
-	const projectionRules = resolveActionProjectionRules(options.projectionRules ?? [], actionSemantics);
+	const projectionRules = resolveActionProjectionRules([...options.projectionRules ?? [], PI_BASH_TIMEOUT_PROJECTION_RULE], actionSemantics);
 	const executionWorlds = [...new Set(options.executionWorlds ?? [])];
 	if (
-		!executionWorlds.some(
-			(world) =>
-				world.id === "resource_version" && world.scope === "fallback" && world.isolation === "resource_snapshot",
-		)
+		!executionWorlds.some((world) => world.id === "resource_version" && world.scope === "fallback" && world.isolation === "resource_snapshot")
 	) {
 		executionWorlds.push(createResourceSnapshotExecutionWorld(actionSemantics));
 	}
