@@ -1308,12 +1308,14 @@ export function makeSpeculativeActionRuntime<
 					concurrentLimit(session.settings),
 					(victim) => {
 						if (victim.work.execution.status !== "running" || !reservationAvailable(victim.work.reservation)) return false;
-						const other = session.scheduler.evaluate(forecastsForCandidate(session, victim));
-						return other.background || work.decisionBatchesUntilCall < other.decisionBatchesUntilCall ||
+						const forecasts = forecastsForCandidate(session, victim), other = session.scheduler.evaluate(forecasts);
+						// An orphan that no pending prediction still wants holds capacity for nothing.
+						return !forecasts.length || other.background || work.decisionBatchesUntilCall < other.decisionBatchesUntilCall ||
 							(work.decisionBatchesUntilCall === other.decisionBatchesUntilCall && work.priorityMs > other.priorityMs);
-					},
+					}, draining,
 				)) {
 					discardCandidate(session, victim, cause("admission", "scheduler_preempted"), false);
+					session.plan.rearmExecution(victim.id); // Its predictions relaunch once capacity returns.
 				}
 				// Only executor completion, after cleanup, can admit the next batch.
 			}
@@ -2502,10 +2504,15 @@ export function makeSpeculativeActionRuntime<
 			1,
 			concurrentLimit(settings),
 			(candidate) => candidate.work.execution.status === "running" && !protectedCandidates.includes(candidate) && reservationAvailable(candidate.work.reservation),
+			draining,
 		)) {
 			discardCandidate(session, candidate, cause("admission", "preempted_by_actor"));
+			session.plan.rearmExecution(candidate.id);
 		}
 	};
+
+	/** Admitted work whose executor has not returned its units yet, after cancellation or completion. */
+	const draining = (candidate: Candidate): boolean => candidate.work.execution.status !== "running";
 
 	const discardCandidate = (
 		session: Session,
