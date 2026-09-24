@@ -1,14 +1,10 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { hash } from "node:crypto";
 import { type BigIntStats, type Stats, type FSWatcher, watch } from "node:fs";
 import fs, { type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { setImmediate as watcherTurn } from "node:timers/promises";
-import {
-	type ActionKey,
-	type ActionSemanticsRegistry,
-	PI_ACTION_SEMANTICS,
-	type ResourceDependencyScope,
-} from "./action-semantics.ts";
+import { type ActionKey, type ActionSemanticsRegistry, PI_ACTION_SEMANTICS, type ResourceDependencyScope } from "./action-semantics.ts";
 import { type StableFilesystemCapture, captureFilesystemEntry, captureStableFile, FILESYSTEM_CONCURRENCY, mapFilesystem, sameFilesystemIdentity, walkFilesystemPath } from "./filesystem-evidence.ts";
 import { containsFilesystemPath, filesystemPathKey } from "./path-utils.ts";
 import type { ToolFilesystemOperations, ToolFilesystemStat } from "./tool-settlement.ts";
@@ -536,10 +532,7 @@ export class ResourceVersionManager {
 				const changed = filename ? path.resolve(this.root, filename) : this.root;
 				this.changed(changed, event);
 			});
-			this.watcher.on("error", () => {
-				this.reliable = false;
-				this.changed(this.root, "unknown");
-			});
+			this.watcher.on("error", () => { this.reliable = false; this.changed(this.root, "unknown"); });
 			this.reliable = true;
 			await watcherTurn();
 		} catch {
@@ -632,8 +625,9 @@ export class ResourceVersionManager {
 		}
 	}
 
+	/** Adoption waits on these few checks, so their I/O never queues behind a whole-tree scan's waiters. */
 	async validate(token: ResourceVersionToken): Promise<ResourceVersionValidation> {
-		return this.inspect(token, false);
+		return priorityIO.run(true, () => this.inspect(token, false));
 	}
 
 	async seal(token: ResourceVersionToken): Promise<ResourceVersionValidation> {
@@ -690,10 +684,7 @@ export class ResourceVersionManager {
 			return { uncertain: true, paths: [] };
 		}
 		const events = this.events.filter((event) => event.epoch > token.epoch);
-		return {
-			uncertain: events.some((event) => event.type === "unknown"),
-			paths: [...new Set(events.map((event) => event.path))],
-		};
+		return { uncertain: events.some((event) => event.type === "unknown"), paths: [...new Set(events.map((event) => event.path))] };
 	}
 
 	close() {
@@ -727,10 +718,7 @@ export class ResourceVersionManager {
 			}
 			try {
 				const watcher = watch(target, (event) => this.changed(target, event));
-				watcher.on("error", () => {
-					this.reliable = false;
-					this.changed(target, "unknown");
-				});
+				watcher.on("error", () => { this.reliable = false; this.changed(target, "unknown"); });
 				this.preciseWatches.set(key, { watcher, references: 1 });
 				paths.push(target);
 			} catch {
@@ -1005,13 +993,7 @@ async function fingerprintDependencies(
 			const followed = source === undefined ? undefined : await fingerprintPath(source, scope, dependency, new Set(ancestors).add(identity), descend);
 			view?.capture(target, { type: "alias", target: source && filesystemPathKey(source), link: link!, realPath: realTarget, dependency });
 			return {
-				value: {
-					type: "symlink",
-					link,
-					mode: Number(info.mode),
-					resolved: identity,
-					target: followed?.value,
-				},
+				value: { type: "symlink", link, mode: Number(info.mode), resolved: identity, target: followed?.value },
 				stamp: digest(["symlink", link, statStamp(info), links, followed?.stamp]),
 				bytesRead: followed?.bytesRead ?? 0,
 				filesRead: followed?.filesRead ?? 0,
@@ -1207,15 +1189,16 @@ function releaseOnce<Result>(release: () => Result): () => Result | undefined {
 	};
 }
 
-const fingerprintIO = (() => {
+const priorityIO = new AsyncLocalStorage<true>();
+export const fingerprintIO = (() => {
 	let active = 0;
-	const waiting: Array<() => void> = [];
+	const waiting: Array<() => void> = [], priority: Array<() => void> = [];
 	return async <Value>(task: () => Promise<Value>): Promise<Value> => {
 		if (active < FILESYSTEM_CONCURRENCY) active++;
-		else await new Promise<void>((resolve) => waiting.push(resolve));
+		else await new Promise<void>((resolve) => (priorityIO.getStore() ? priority : waiting).push(resolve));
 		try { return await task(); }
 		finally {
-			const next = waiting.shift();
+			const next = priority.shift() ?? waiting.shift();
 			if (next) next();
 			else active--;
 		}
