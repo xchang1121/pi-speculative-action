@@ -463,9 +463,7 @@ export class LinuxProcessReuseBackend {
 			actorReplayProducer(producer, sensitivePaths(this.options.storeRoot, this.options.deniedPaths));
 		return {
 			execute: async (request) => {
-				if (process.platform !== "linux" || !pathContains(sourceRoot, request.cwd)) {
-					return host.execute(request);
-				}
+				if (process.platform !== "linux" || !pathContains(sourceRoot, request.cwd)) return host.execute(request);
 				const requestStarted = performance.now();
 				this.addActor("wholeCommandRequests");
 				let committed = false;
@@ -820,9 +818,7 @@ export class LinuxProcessReuseBackend {
 			result: await captureProcessResult(this.store, execution.outcome, execution.observedProcessMs,
 				changes.map(change => ({ logicalPath: slash(path.resolve(session.sourceRoot, change.resource)), change }))),
 		});
-		if (await this.planner.publishCompleted(certificate, SAME_CONFINEMENT_TAINTS)) {
-			this.add(session, "wholeCommandPublished");
-		}
+		if (await this.planner.publishCompleted(certificate, SAME_CONFINEMENT_TAINTS)) this.add(session, "wholeCommandPublished");
 	}
 
 	private serve(session: ActiveSession, socket: net.Socket): void {
@@ -925,9 +921,7 @@ export class LinuxProcessReuseBackend {
 		let waitedMs = 0;
 		const waits: { readonly handoff: ProcessHandoff; readonly interval: TimelineInterval }[] = [];
 		let admission = "timing" in participant ? this.processScheduler.assessCandidateJoin({ identity: participant.timing, state: "succeeded" }) : undefined;
-		if (admission && !admission.allowed) {
-			return { joined: false, waitedMs };
-		}
+		if (admission && !admission.allowed) return { joined: false, waitedMs };
 		const acquired = await this.handoffs.acquire({
 			key: weakKey,
 			scope,
@@ -1458,9 +1452,7 @@ export class LinuxProcessReuseBackend {
 					taints.add("untracked_fd");
 				}
 				for (const taint of evidence.taints) taints.add(taint);
-				if (!observation.complete) {
-					taints.add("trace_incomplete");
-				}
+				if (!observation.complete) taints.add("trace_incomplete");
 				dependencyCertificate = {
 					complete: observation.complete && evidence.complete,
 					dependencies: evidence.dependencies,
@@ -1514,12 +1506,7 @@ export class LinuxProcessReuseBackend {
 				const result: ProcessResultRecord = { ...prefixResult, ...(continuation ? { continuation: { imageDigest: sha256Digest(continuation.image), imageBytes: continuation.image.length } } : { exit: exit! }),
 					...(descriptorOffsets ? { resources: { ...descriptorEffects(request.resources!, descriptorOffsets), ...(resourceJournal ? { transitions } : {}) } } : {}) };
 				stage = "certificate";
-				const certificate = sealProcessCertificate({
-					prototype,
-					producer: session.nestedProducer,
-					dependencyCertificate,
-					result,
-				});
+				const certificate = sealProcessCertificate({ prototype, producer: session.nestedProducer, dependencyCertificate, result });
 				certificateID = certificate.id;
 				session.nestedEvidence.push(certificate.dependencyCertificate);
 				if (taints.size) {
@@ -1849,12 +1836,7 @@ async function sealSessionEvidence(
 		beforeMode: change.beforeMode,
 		afterMode: change.afterMode,
 	}]);
-	const effects = diffWorkspaceStructures(
-		capture.before,
-		capture.after,
-		regularDeltas,
-		session.projection,
-	);
+	const effects = diffWorkspaceStructures(capture.before, capture.after, regularDeltas, session.projection);
 	if (!effects.complete) {
 		session.incompleteReasons.add(`top_effects:${effects.reason ?? "incomplete"}`);
 		session.topLevelEvidence = { complete: false, dependencies: [], taints: ["trace_incomplete"] };
@@ -2047,21 +2029,14 @@ async function captureDependencies(
 		}
 		add(await workspaceDependency(physical, effect.logicalPath, "input"));
 	}
-	return {
-		complete,
-		dependencies: [...dependencies.values()],
-		taints: [...taints],
-		incompleteReasons: [...incompleteReasons],
-	};
+	return { complete, dependencies: [...dependencies.values()], taints: [...taints], incompleteReasons: [...incompleteReasons] };
 }
 
 const STABLE_SANDBOX_DEVICES = new Set(["/dev/null", "/dev/tty", "/dev/zero", "/dev/full"]);
 const SAME_CONFINEMENT_TAINTS = ["confinement_observation"] as const;
 
 function workspaceMetadataExclusions(session: ActiveSession, target: string): readonly string[] | undefined {
-	return path.resolve(target) === path.resolve(session.workspace.sandboxRoot)
-		? session.workspace.observationExcludes
-		: undefined;
+	return path.resolve(target) === path.resolve(session.workspace.sandboxRoot) ? session.workspace.observationExcludes : undefined;
 }
 
 async function captureHostPath(
@@ -2798,15 +2773,11 @@ function mergeDependencyEvidence(
 				existing.contentDigest === dependency.contentDigest &&
 				existing.metadataDigest === dependency.metadataDigest && stableEqual(existing.aliases, dependency.aliases)
 			) {
-				if (existing.role !== "executable" && dependency.role === "executable") {
-					dependencies.set(identity, dependency);
-				}
+				if (existing.role !== "executable" && dependency.role === "executable") dependencies.set(identity, dependency);
 				continue;
 			}
 			if (existing && !stableEqual(existing, dependency)) {
-				if (dependency.kind === "directory" && mutatedDirectories.has(dependency.path.replaceAll("\\", "/"))) {
-					continue;
-				}
+				if (dependency.kind === "directory" && mutatedDirectories.has(dependency.path.replaceAll("\\", "/"))) continue;
 				complete = false;
 				incompleteReasons.add(`dependency_changed_during_execution:${identity}`);
 				continue;

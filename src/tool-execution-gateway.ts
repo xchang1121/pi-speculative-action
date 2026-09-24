@@ -2,6 +2,7 @@ import type { ActionEffect, ActionKey } from "./action-semantics.ts";
 import type { EffectRequirements } from "./effect-model.ts";
 import type { ToolInvocation } from "./tool-settlement.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
+const REUSED_FAILURE = Symbol("reused tool failure");
 import { TimelineInterval, type TimelineDependency } from "./task-timing.ts";
 import {
 	EffectTransactionCoordinator,
@@ -124,6 +125,11 @@ export class ToolExecutionGateway<Context, Output> {
 		);
 	}
 
+	/** Reuse supplied an adopted failure: the Actor receives the error its native run throws, not a native rerun. */
+	static reusedFailure(message: string): Error {
+		return Object.assign(new Error(message), { [REUSED_FAILURE]: true });
+	}
+
 	async executeAuthoritative<AuthoritativeOutput>(
 		operation: ToolOperation,
 		executor: AuthoritativeToolExecutor<AuthoritativeOutput>,
@@ -135,7 +141,7 @@ export class ToolExecutionGateway<Context, Output> {
 					const reused = await hooks.reuse();
 					if (reused !== undefined) return reused;
 				} catch (error) {
-					if (isPoisonedEffectCommit(error)) throw error;
+					if (isPoisonedEffectCommit(error) || (error as { [REUSED_FAILURE]?: true } | undefined)?.[REUSED_FAILURE]) throw error;
 					// Reuse is optional; the supplied Actor executor remains authoritative.
 				}
 			}

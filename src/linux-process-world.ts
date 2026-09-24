@@ -166,27 +166,23 @@ export function createLinuxProcessExecutionWorld(
 						acceptOperationScope: context.acceptOperationScope,
 					});
 					const executor = session.executor;
-					let launches = 0;
+					let launches = 0, exitCode: number | null | undefined;
 					try {
 						if (operation) {
 							const result = await session.executeBinding(operation);
 							// Scheduler-only output. The held native exec consumes the original ordered byte journal.
 							return { result: { content: [], details: result.suspended ? { suspended: true } : { exit: result.exit } }, isError: false };
 						}
-						const result = await options.coordinator.runWith(
-							{
-								execute: (request) => {
-									launches++;
-									return executor.execute(request);
-								},
-							},
-							() => context.tool.execute(context.callID, context.args as never, context.signal),
-						);
+						const result = await options.coordinator.runWith({ execute: async (request) => {
+							launches++;
+							return { exitCode } = await executor.execute(request);
+						} }, () => context.tool.execute(context.callID, context.args as never, context.signal));
 						if (launches === 0) throw new Error("process-backed tool bypassed the process execution outlet");
 						// The virtual root already preserves logical paths. Output bytes are data, not paths to rewrite.
 						return { result, isError: false };
 					} catch (error) {
-						return toolErrorSettlement(error);
+						// A command that ran to completion and exited non-zero failed on its own terms, unlike a timeout, abort or backend fault.
+						return launches === 1 && typeof exitCode === "number" && exitCode !== 0 ? { ...toolErrorSettlement(error), exitCode } : toolErrorSettlement(error);
 					} finally {
 						await session.close();
 					}

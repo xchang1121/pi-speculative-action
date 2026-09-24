@@ -367,7 +367,7 @@ export function createSpeculativeActionHost(
 				},
 			);
 		},
-		rejectCandidateOutput: ({ output }) => (output.isError ? "tool_error_result" : undefined),
+		rejectCandidateOutput: ({ output }) => (output.isError && output.exitCode === undefined ? "tool_error_result" : undefined),
 		projectionRules,
 		onTurnStarted: async ({ startInput, decisionSequence, settings }) => {
 			try {
@@ -447,7 +447,9 @@ export function createSpeculativeActionHost(
 					? {
 							reuse: async () => {
 								prepared = await runtime.prepareActorCall(actorCall, signal);
-								return prepared?.output?.result;
+								const output = prepared?.output;
+								if (output?.isError) throw ToolExecutionGateway.reusedFailure(output.result.content.flatMap((item) => item.type === "text" ? [item.text] : []).join("\n"));
+								return output?.result;
 							},
 							settled: async (settlement) => {
 								if (!prepared) return;
