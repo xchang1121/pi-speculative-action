@@ -179,7 +179,6 @@ type MutablePattern = {
 	gapCounts: Record<string, number>;
 	gapLastSeen: Record<string, number>;
 	occurrences: number;
-	replayMatches: number;
 	historicalOpportunities: number;
 	historicalMatches: number;
 	feedback: MutablePatternFeedback;
@@ -249,7 +248,6 @@ const patternAwareDefaults = {
 	/** Support required to promote a relation after its single bounded first-recurrence probe. */
 	minOccurrences: 2,
 	/** Minimum historical replay precision required for a concrete argument mapper. */
-	minBindingReplayProbability: 0.75,
 	maxPatterns: 4096,
 };
 
@@ -265,7 +263,6 @@ const parsePatternSettings = settingsParser(patternAwareDefaults, {
 	futureGapCoverage: probabilitySetting,
 	decayHalfLifeEvents: positiveInteger,
 	minOccurrences: positiveInteger,
-	minBindingReplayProbability: probabilitySetting,
 	maxPatterns: positiveInteger,
 });
 
@@ -1092,7 +1089,6 @@ export class PatternAwareStore {
 				gapCounts: {} as Record<string, number>,
 				gapLastSeen: {} as Record<string, number>,
 				occurrences: support.length,
-				replayMatches: support.length,
 				averageDurationMs: 0,
 				lastSeenSequence: -Infinity,
 			};
@@ -1371,7 +1367,7 @@ export function patternAwareAnalyzerKey(settings: PatternAwareSettings): string 
 		maxFutureGap: settings.maxFutureGap,
 		decayHalfLifeEvents: settings.decayHalfLifeEvents,
 		minOccurrences: settings.minOccurrences,
-		minBindingReplayProbability: settings.minBindingReplayProbability,
+		minBindingReplayProbability: 0.75, // Retired setting at its old default: learned state keeps its file name.
 		maxPatterns: settings.maxPatterns,
 	});
 }
@@ -2070,8 +2066,7 @@ function structurallyEligible(pattern: MutablePattern, settings: PatternAwareSet
 			(pattern.occurrences === 1 &&
 				pattern.context.length === 1 &&
 				pattern.gapCounts["0"] === 1 &&
-				pattern.feedback.issued === 0)) &&
-		pattern.replayMatches / Math.max(1, pattern.occurrences) >= settings.minBindingReplayProbability
+				pattern.feedback.issued === 0))
 	);
 }
 
@@ -2228,7 +2223,7 @@ function backoffProbability(
 function patternRank(pattern: MutablePattern, clock: number, halfLife: number) {
 	const feedback = feedbackEvidence(pattern, clock, halfLife);
 	return (
-		(feedback.matched * 4 + pattern.replayMatches * 2 + probability(pattern) - feedback.mismatched) *
+		(feedback.matched * 4 + pattern.occurrences * 2 + probability(pattern) - feedback.mismatched) *
 		recencyWeight(pattern.lastSeenSequence, clock, halfLife)
 	);
 }
@@ -2283,7 +2278,6 @@ function mutablePattern(value: PatternAwarePattern): MutablePattern | undefined 
 		!feedback ||
 		![
 			record.occurrences,
-			record.replayMatches,
 			record.historicalOpportunities,
 			record.historicalMatches,
 			record.averageDurationMs,
@@ -2305,7 +2299,6 @@ function mutablePattern(value: PatternAwarePattern): MutablePattern | undefined 
 		gapCounts,
 		gapLastSeen,
 		occurrences: finiteNumber(value.occurrences) ?? 0,
-		replayMatches: finiteNumber(value.replayMatches) ?? 0,
 		historicalOpportunities: Math.max(1, value.historicalOpportunities),
 		historicalMatches: value.historicalMatches,
 		feedback,

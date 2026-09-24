@@ -122,9 +122,6 @@ const PATTERN_SETTING_INPUTS = {
 	maxPatterns: positiveIntegerInput("Stored pattern limit"),
 	beamWidth: positiveIntegerInput("Alternatives retained per tool"),
 	maxPredictionDepth: positiveIntegerInput("Maximum predicted tool steps"),
-	minBindingReplayProbability: probabilityInput("Minimum argument-replay confidence (0-1)", {
-		error: "Minimum argument-replay confidence must be between 0 and 1.",
-	}),
 } satisfies Partial<SettingInputDescriptors<PatternAwareSettings, keyof PatternAwareSettings>>;
 
 const DRAFTER_TEMPERATURE_INPUT = settingInput<readonly [number, number]>(
@@ -203,7 +200,7 @@ export function formatSpeculativeActionStatus(input: {
 		`Simultaneous speculative tools: ${settings.maxConcurrentActions}`,
 		`Storage policy: ${settings.resourceCacheMaxEntries} live results/${formatBytes(settings.resourceCacheMaxBytes)}; ${settings.executionStoreMaxEntries} reusable commands/${formatBytes(settings.executionStoreMaxBytes)}`,
 		`Prediction wait limit: ${formatDuration(settings.predictionTimeoutMs)}`,
-		`Learned patterns: ${settings.patternAware.enabled ? "On" : "Off"}; follow-up steps: ${settings.patternAware.multiStepEnabled ? "On" : "Off"} (alternatives/tool ${settings.patternAware.beamWidth}, depth ${settings.patternAware.maxPredictionDepth}, learn after ${settings.patternAware.minOccurrences}, replay confidence≥${formatPercent(settings.patternAware.minBindingReplayProbability)}, gap ${settings.patternAware.maxFutureGap}, coverage ${formatPercent(settings.patternAware.futureGapCoverage)}, half-life ${settings.patternAware.decayHalfLifeEvents})`,
+		`Learned patterns: ${settings.patternAware.enabled ? "On" : "Off"}; follow-up steps: ${settings.patternAware.multiStepEnabled ? "On" : "Off"} (alternatives/tool ${settings.patternAware.beamWidth}, depth ${settings.patternAware.maxPredictionDepth}, learn after ${settings.patternAware.minOccurrences}, gap ${settings.patternAware.maxFutureGap}, coverage ${formatPercent(settings.patternAware.futureGapCoverage)}, half-life ${settings.patternAware.decayHalfLifeEvents})`,
 		`Actor probe: ${self.enabled && self.forkEnabled ? `On (${self.forkTransport})` : "Off"}; target verification ${self.enabled ? "On" : "Off"}; early tool execution ${self.enabled && self.forkTransport === "sidecar" && self.forkEnabled && self.forkActionEnabled ? `On (tool-name confidence ≥${formatPercent(self.forkActionMinConfidence)})` : "Off"}; benefit control ${self.forkGateEnabled ? `On (${self.forkGateWindowSize} samples, ≥${formatDuration(self.forkGateMinNetBenefitMs)} net)` : "Off"}; ${self.maxCandidates} candidates × ${self.maxDraftTokens} draft tokens; Actor Profile=${self.actorProfile}; ${self.draftFormat} (${syntaxSettingLabel(self.draftBoundary)} boundary); ${self.forkTransport === "sidecar" ? self.endpoint : "provider-integrated"}`,
 		`Prediction tools: ${toolsSummary(settings.tools)}`,
 		`Execution routing: unified ${settings.executionRouting.primary ? "On" : "Off"}; native fallback ${settings.executionRouting.nativeFallback ? "On" : "Off"}; Actor always available`,
@@ -975,7 +972,6 @@ function openPatternAwareSettings(
 		] : [
 			input("beamWidth"),
 			input("maxPredictionDepth"),
-			input("minBindingReplayProbability", "Minimum argument-replay confidence", formatPercent),
 		]);
 	});
 }

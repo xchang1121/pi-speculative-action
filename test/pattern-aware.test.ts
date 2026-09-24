@@ -379,7 +379,6 @@ describe("PatternAware", () => {
 			gapLastSeen: { "0": 0, "3": 1000 },
 			lastSeenSequence: 1000,
 			occurrences: 1010,
-			replayMatches: 1010,
 			historicalOpportunities: 1010,
 			historicalMatches: 1010,
 		});
@@ -742,7 +741,7 @@ describe("PatternAware", () => {
 	});
 
 	test("emits weak control-flow candidates for bounded utility admission", () => {
-		const store = patternStore({ minBindingReplayProbability: 0.75 });
+		const store = patternStore();
 		trainGrepRead(store, "one", "src/a.ts");
 		trainGrepRead(store, "two", "src/b.ts");
 
@@ -762,8 +761,6 @@ describe("PatternAware", () => {
 		const candidate = store.predict("probe").find((item) => item.tool === "read");
 		expect(candidate?.empiricalProbability).toBeGreaterThan(0);
 		expect(candidate?.empiricalProbability).toBeLessThan(0.75);
-		expect(store.registerValidatedPattern(validatedGapPattern({ "0": 10 },
-			{ id: "unreliable-binding", occurrences: 10, replayMatches: 7 }))).toBe(false);
 	});
 
 	test.each([
@@ -891,7 +888,7 @@ describe("PatternAware", () => {
 		expect(store.snapshot()).toEqual(before);
 		if (count === 1) {
 			acceptPattern(store, { "0": 30 }, { id: "independent", bindings: constantBindings({ path: "src/a.ts" }),
-				occurrences: 30, replayMatches: 30, historicalOpportunities: 30, historicalMatches: 15, averageDurationMs: 300,
+				occurrences: 30, historicalOpportunities: 30, historicalMatches: 15, averageDurationMs: 300,
 				feedback: patternFeedback({ recentRejectedWeight: 3 }),
 			});
 			const [merged] = store.predict("probe");
@@ -1585,7 +1582,6 @@ function validatedGapPattern(
 		gapCounts,
 		gapLastSeen: Object.fromEntries(Object.keys(gapCounts).map((gap) => [gap, 1])),
 		occurrences: 10,
-		replayMatches: 10,
 		historicalOpportunities: 10,
 		historicalMatches: 10,
 		empiricalProbability: 1,
