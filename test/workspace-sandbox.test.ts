@@ -1103,6 +1103,7 @@ describe("workspace-branch ExecutionWorld", () => {
 			await writeFile(path.join(root, "value.txt"), "after\n");
 			pending.push(sandbox.prepare(root, { driver: "git" }));
 			await vi.waitFor(() => expect(repository.baseline.commit).not.toBe(previous.commit));
+			expect((await repository.git(["cat-file", "-p", repository.baseline.commit])).toString("utf8")).not.toMatch(/^parent /m);
 			await repository.lock; await nextTurn();
 			expect(observations).toHaveBeenCalledTimes(1);
 			const third = sandbox.prepare(root, { driver: "git" }); pending.push(third);
