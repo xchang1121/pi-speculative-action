@@ -44,7 +44,6 @@ export interface PlanProposal {
 	readonly source: string;
 	readonly revision: number;
 	readonly actions: readonly PlanAction[];
-	readonly draftTokens?: number;
 }
 
 /** Incremental update to a proposal. Revisions must be strictly increasing. */
@@ -54,7 +53,6 @@ export interface PlanDelta {
 	readonly revision: number;
 	readonly upsert?: readonly PlanAction[];
 	readonly remove?: readonly string[];
-	readonly draftTokens?: number;
 }
 
 export type PlanUpdate = PlanProposal | PlanDelta;

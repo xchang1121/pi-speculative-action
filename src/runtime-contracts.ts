@@ -162,6 +162,8 @@ export interface SpeculativePlanSource<
 		readonly proposalIndex: number;
 		readonly proposalCount: number;
 		readonly signal: AbortSignal;
+		/** Provider tokens this request spent, reported whatever it returns; later reports still count. */
+		readonly reportDraftTokens?: (tokens: number) => void;
 	}) => MaybePromise<PlanProposal | readonly PlanProposal[] | undefined>;
 	readonly continue?: (input: RuntimeTurnContext<StartInput, StateData> & PlanActionFeedback & {
 		readonly candidate: SpeculativeCandidate;
@@ -170,6 +172,7 @@ export interface SpeculativePlanSource<
 		readonly output: Output;
 		readonly trigger: "execution_succeeded" | "actor_adopted";
 		readonly signal: AbortSignal;
+		readonly reportDraftTokens?: (tokens: number) => void;
 	}) => MaybePromise<PlanUpdate | readonly PlanUpdate[] | undefined>;
 	/** Declare the original ordered batch; peers receive it only after every root execution succeeds. */
 	readonly continuationBatch?: (input: PlanActionFeedback) => readonly string[] | undefined;

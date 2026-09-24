@@ -83,6 +83,7 @@ export type SpeculativeActionEvent<SessionID> =
 	| (EventEnvelope<SessionID> & {
 			readonly type: "source_request";
 			readonly request: SettledSourceRequest;
+			readonly totalDraftTokens: number;
 	  })
 	| (EventEnvelope<SessionID> & {
 			readonly type: "prediction";

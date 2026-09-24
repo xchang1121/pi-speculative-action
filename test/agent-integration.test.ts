@@ -221,6 +221,16 @@ describe("speculative action host", () => {
 		}
 	});
 
+	it("counts Drafter tokens of empty and failed requests when they are spent", async () => {
+		const cwd = await temporaryWorkspace(), tool = createReadTool(cwd), replies = [assistant([{ type: "text", text: "no tool" }], "stop"), assistant([], "error")];
+		const { host, events } = drafterHost("session", { cwd, complete: async () => replies.shift()!, getSettings: () => settings(2) });
+		try {
+			await host.startTurn(startInput(tool));
+			await waitFor(() => events.filter((event) => event.type === "source_request").length === 2);
+			expect(events.flatMap((event) => event.type === "source_request" ? [event.totalDraftTokens] : []).at(-1)).toBe(4);
+		} finally { await host.dispose(); }
+	});
+
 	it("prepares active requests and charges late Drafter continuations to their original observation", async () => {
 		let now = 0;
 		const prepareExecution = vi.fn();
