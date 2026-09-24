@@ -1313,7 +1313,7 @@ export class LinuxProcessReuseBackend {
 				return false;
 			};
 			releaseInputs = this.handoffs.observeInputs(weakKey, work, () => inputCheck ??=
-				changedInput().catch(() => false).finally(() => { inputCheck = undefined; }));
+				changedInput().catch(() => true /* an unproven check rejects the join */).finally(() => { inputCheck = undefined; }));
 			const imagePath = path.join(traceRoot, "continuation");
 			const command = straceCommand(ready.strace, tracePrefix, [
 				ready.sandlock,

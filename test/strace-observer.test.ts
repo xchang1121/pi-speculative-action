@@ -89,8 +89,27 @@ describe("strace provenance decoder", () => {
 		const failed = await observe({ 100: [EXEC, 'newfstatat(AT_FDCWD, "/work/result=0", 0xabc, 0) = -1 ENOENT (No such file or directory)'] });
 		expect(failed).toMatchObject({ complete: true, taints: ["clock", "random"], incompleteReasons: [] });
 		expect(failed.paths).toContainEqual({ path: "/work/result=0", role: "input" });
-		for (const line of ['openat(AT_FDCWD, "/work/\\377", O_RDONLY) = 3', 'openat(8, "unresolved", O_RDONLY) = 3'])
-			await expect(observe({ 100: [EXEC, line] })).rejects.toThrow();
+		await expect(observe({ 100: [EXEC, 'openat(AT_FDCWD, "/work/\\377", O_RDONLY) = 3'] })).rejects.toThrow();
+		// A failed lookup from no known directory read nothing; a successful one leaves the transcript incomplete.
+		expect(await observe({ 100: [EXEC, 'openat(8, "unresolved", O_RDONLY) = -1 EBADF (Bad file descriptor)', "statx(0<pipe:[8]>, NULL, 0, STATX_ALL, NULL) = -1 EFAULT (Bad address)"] }))
+			.toMatchObject({ complete: true, paths: [{ path: "/usr/bin/example", role: "executable" }], incompleteReasons: [] });
+		expect(await observe({ 100: [EXEC, 'openat(8, "unresolved", O_RDONLY) = 3'] })).toMatchObject({ complete: false, incompleteReasons: ["unresolved_pathname:openat:100"] });
+	});
+
+	test("reads statx as stat, and an empty or NULL name as its descriptor", async () => {
+		const STATX = "{stx_mask=STATX_BASIC_STATS|STATX_MNT_ID, stx_blksize=4096, stx_attributes=0, stx_nlink=1, stx_uid=0, stx_gid=0, stx_mode=S_IFREG|0644, stx_ino=42, stx_size=4, stx_blocks=8, " +
+			"stx_attributes_mask=STATX_ATTR_DAX, stx_atime={tv_sec=10, tv_nsec=1} /* 1970-01-01T00:00:10.000000001+0000 */, stx_ctime={tv_sec=12, tv_nsec=3}, stx_mtime={tv_sec=11, tv_nsec=2}, " +
+			"stx_rdev_major=0, stx_rdev_minor=0, stx_dev_major=0, stx_dev_minor=1, stx_mnt_id=0x52}";
+		const observation = await observe({ 100: [EXEC, // As node, rg and coreutils call it under strace 6.8
+			`statx(AT_FDCWD</work>, "file.txt", AT_STATX_SYNC_AS_STAT, STATX_ALL, ${STATX}) = 0`,
+			`statx(3</work/link>, "", AT_STATX_SYNC_AS_STAT|AT_SYMLINK_NOFOLLOW|AT_EMPTY_PATH, STATX_ALL, ${STATX}) = 0`,
+			`statx(1<pipe:[7]>, "", AT_STATX_SYNC_AS_STAT|AT_EMPTY_PATH, STATX_ALL, ${STATX}) = 0`,
+			'statx(AT_FDCWD</work>, "missing.txt", AT_STATX_SYNC_AS_STAT, STATX_ALL, 0x7ffd4527f9f0) = -1 ENOENT (No such file or directory)',
+			'readlinkat(4</work/alias>, "", "target", 4096) = 6', 'linkat(5</work/anonymous>, "", AT_FDCWD</work>, "named", AT_EMPTY_PATH) = 0'] });
+		expect(observation).toMatchObject({ complete: true, taints: ["clock", "descriptor_observation", "random"], incompleteReasons: [] });
+		expect(observation.paths).toEqual([{ path: "/usr/bin/example", role: "executable" },
+			...["/work/alias", "/work/anonymous", "/work/missing.txt", "/work/named"].map(path => ({ path, role: "input" })),
+			{ path: "/work/link", role: "metadata", followSymlinks: false, digest: STAT_DIGEST }, { path: "/work/file.txt", role: "metadata", followSymlinks: true, digest: STAT_DIGEST }]);
 	});
 
 	test("binds reassembled descendants to copied or proven-stable shared cwd contexts", async () => {
