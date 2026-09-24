@@ -267,10 +267,7 @@ describe("PatternAware", () => {
 
 		const candidate = store.predict("probe").find((item) => item.tool === "read");
 		const immediateCandidate = immediate.predict("probe").find((item) => item.tool === "read");
-		expect(candidate).toMatchObject({
-			horizon: 0,
-			latestHorizon: 5,
-		});
+		expect(candidate).toMatchObject({ horizon: 0, latestHorizon: 5 });
 		expect(immediateCandidate).toMatchObject({ horizon: 0, latestHorizon: 0 });
 		expect(candidate?.conditionalProbability).toBe(immediateCandidate?.conditionalProbability);
 		for (let gap = 0; gap < 5; gap++) {
@@ -386,6 +383,20 @@ describe("PatternAware", () => {
 		const [grep, write] = store.recent("large");
 		expect([grep!.outputPaths, (grep!.output as { values: string[] }).values]).toEqual([values.slice(0, 256), values.slice(0, 256)]);
 		expect(write).toMatchObject({ learnTarget: false, input: { path: "a.ts", content: expect.stringMatching(/^sha256:[0-9a-f]{32}$/) } });
+	});
+
+	test("learns a batch wider than a context from its newest calls and matches contexts only where learning starts them", () => {
+		const store = patternStore({ maxContextLength: 4, maxFutureGap: 0 });
+		const reads = (sessionID: string, width: number) =>
+			Array.from({ length: width }, (_, index) => input(sessionID, "read", { filePath: `src/${index}.ts` }, { turnID: `${sessionID}:reads` }));
+		for (const sessionID of ["one", "two", "three", "four"]) {
+			store.observeBatch(reads(sessionID, 5)); store.observeBatch([input(sessionID, "bash", { command: "npm test" }, { turnID: `${sessionID}:test` })]);
+			store.observeBatch(reads(`${sessionID}-single`, 1)); store.observeBatch([input(`${sessionID}-single`, "grep", { pattern: "TODO" }, { turnID: "grep" })]);
+		}
+		store.observeBatch(reads("probe", 6)); // A single read's successor is no successor of a wide batch's last member.
+		const contexts = new Map(store.snapshot().map((pattern) => [pattern.id, pattern.context.length]));
+		expect(store.predict("probe").flatMap((candidate) => contexts.has(candidate.patternID) ? [[candidate.tool, contexts.get(candidate.patternID)]] : []))
+			.toEqual([["bash", 4]]);
 	});
 
 	test("lets recent gap behavior replace stale high-volume history", () => {
@@ -574,10 +585,7 @@ describe("PatternAware", () => {
 				],
 			},
 		);
-		await fs.writeFile(
-			file,
-			JSON.stringify({ patterns: [long], events: [], pools: [], sequenceCounts: [] }),
-		);
+		await fs.writeFile(file, JSON.stringify({ patterns: [long], events: [], pools: [], sequenceCounts: [] }));
 
 		const store = patternStore({ maxContextLength: 1 }, file);
 		await store.load();
@@ -591,7 +599,7 @@ describe("PatternAware", () => {
 			store.observe(input(sessionID, "write", { filePath: "src/a.ts" }));
 			store.finishSession(sessionID);
 		}
-		expect(store.snapshot()).toEqual([]);
+		expect(store.snapshot().map((pattern) => pattern.context.length)).toEqual([1]); // A wider batch lends only its newest calls.
 	});
 
 	test("transfers data-flow patterns across processes before global support", async () => {
@@ -724,10 +732,7 @@ describe("PatternAware", () => {
 	test("probes an adjacent transition once and preserves feedback until configured promotion", () => {
 		const store = patternStore({ minOccurrences: 3 });
 		trainGrepRead(store, "one", "src/a.ts");
-		expect(store.snapshot().find((item) => item.targetTool === "read")).toMatchObject({
-			occurrences: 1,
-			feedback: { issued: 0 },
-		});
+		expect(store.snapshot().find((item) => item.targetTool === "read")).toMatchObject({ occurrences: 1, feedback: { issued: 0 } });
 
 		store.observe(input("two", "grep", {}, { outputPaths: ["src/b.ts"] }));
 		const candidate = store.predict("two").find((item) => item.tool === "read")!;
@@ -749,10 +754,7 @@ describe("PatternAware", () => {
 		const promoted = store.predict("four");
 		expect(promoted).toContainEqual(expect.objectContaining({ tool: "read", input: { filePath: "src/d.ts" } }));
 		expect(promoted.find((item) => item.tool === "read")?.background).toBeUndefined();
-		expect(store.snapshot().find((item) => item.targetTool === "read")).toMatchObject({
-			occurrences: 3,
-			feedback: { issued: 1 },
-		});
+		expect(store.snapshot().find((item) => item.targetTool === "read")).toMatchObject({ occurrences: 3, feedback: { issued: 1 } });
 	});
 
 	test("emits weak control-flow candidates for bounded utility admission", () => {
@@ -814,11 +816,7 @@ describe("PatternAware", () => {
 			store.finishSession(sessionID);
 		}
 
-		store.observe(
-			input("probe", "read", { filePath: "services/c" }, {
-				output: { preview: "export const value = 1" },
-			}),
-		);
+		store.observe(input("probe", "read", { filePath: "services/c" }, { output: { preview: "export const value = 1" } }));
 
 		expect(store.predict("probe").find((item) => item.tool === "read")).toBeUndefined();
 	});
@@ -828,11 +826,7 @@ describe("PatternAware", () => {
 		trainResultReads(store, "one", ["src/a.ts", "src/b.ts"], ["src/b.ts", "src/a.ts"]);
 		trainResultReads(store, "two", ["src/c.ts", "src/d.ts"], ["src/c.ts", "src/d.ts"]);
 
-		store.observe(
-			input("probe", "grep", { pattern: "symbol" }, {
-				output: { results: [{ path: "src/e.ts" }, { path: "src/f.ts" }] },
-			}),
-		);
+		store.observe(input("probe", "grep", { pattern: "symbol" }, { output: { results: [{ path: "src/e.ts" }, { path: "src/f.ts" }] } }));
 		const paths = store
 			.predict("probe")
 			.filter((item) => item.tool === "read" && item.type === "tool_call")
@@ -959,12 +953,7 @@ describe("PatternAware", () => {
 			["a-composite", { type: "template" as const, source, prefix: "wrong/", suffix: "" }, 100],
 			["a-memorized", { type: "constant" as const, value: "README.md" }, 120],
 		] as const) {
-			acceptPattern(store, { "0": 2 }, {
-				id,
-				occurrences: 2,
-				bindings: { '["path"]': binding },
-				averageDurationMs,
-			});
+			acceptPattern(store, { "0": 2 }, { id, occurrences: 2, bindings: { '["path"]': binding }, averageDurationMs });
 		}
 
 		store.observe(input("probe", "grep", { path: "src/index.ts" }));
