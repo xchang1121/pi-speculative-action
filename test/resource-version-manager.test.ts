@@ -18,6 +18,7 @@ import {
 	captureResourceVersion,
 	invalidateResourceInputs,
 	closeResourceVersionManagers,
+	fingerprintIO,
 	ResourceVersionManager,
 	type ResourceVersionToken,
 	type ResourceInput,
@@ -43,6 +44,20 @@ afterEach(async () => {
 });
 
 describe("speculative action resource versions", () => {
+	test("serves adoption validation I/O ahead of queued whole-tree work", async () => {
+		const root = await directories.create(), manager = new ResourceVersionManager(root), file = path.join(root, "file.txt"), order: string[] = [];
+		await fs.writeFile(file, "same");
+		const token = await manager.capture([{ path: file, scope: "content" }]), gate = deferred<void>();
+		const held = Array.from({ length: 12 }, () => fingerprintIO(() => gate.promise));
+		const queued = Array.from({ length: 80 }, (_, index) => fingerprintIO(async () => { order.push(`scan:${index}`); await new Promise(resolve => setTimeout(resolve, 5)); }));
+		const validation = manager.validate(token).then((result) => { order.push("validated"); return result; });
+		gate.resolve();
+		expect((await validation).expired).toBe(false);
+		await Promise.all([...held, ...queued]);
+		expect(order.indexOf("validated")).toBeLessThan(60); // A few slot turnovers, not the whole queue.
+		await token.release();
+	});
+
 	test("binds hardlink topology even when every name, byte and link count stays equal", async () => {
 		const root = await directories.create(), manager = new ResourceVersionManager(root);
 		const named = (name: string) => path.join(root, name);
