@@ -375,13 +375,10 @@ describe("self-speculation control plane", () => {
 					? forkReceipt("write", { path: "out.txt" })
 					: { registered: true, draft_token_count: 8 },
 		);
-		coordinator.startTurn("turn-1", model(), context(), 1);
+		coordinator.startTurn("turn-1", model("https://api.example.invalid/v1"), context(), 1);
 		coordinator.addCandidate(candidate("drafter", "fork-write", "unused", "write", { path: "out.txt" }, 0.9));
-		expect(coordinator.decorateActorPayload({ model: "actor", prompt: "PROMPT" })).toEqual({
-			model: "actor",
-			prompt: "PROMPT",
-			request_id: "actor-request",
-		});
+		// A hosted Actor keeps its exact request; the sidecar still forks from the bound payload.
+		expect(coordinator.decorateActorPayload({ model: "actor", prompt: "PROMPT" })).toEqual({ model: "actor", prompt: "PROMPT" });
 		coordinator.observeActorOutput(delta("thinking_delta", "reason"));
 		coordinator.observeActorOutput(delta("text_delta", "later"));
 		await vi.waitFor(() => expect(coordinator.snapshot().forkCompletions).toBe(1));
@@ -757,8 +754,8 @@ function action(key: string, hash: string, tool: string, input: Record<string, u
 	};
 }
 
-function model() {
-	return testModel("actor-model", { name: "Actor", baseUrl: "http://localhost:8000/v1", maxTokens: 1_024 });
+function model(baseUrl = "http://127.0.0.1:8000/v1") {
+	return testModel("actor-model", { name: "Actor", baseUrl, maxTokens: 1_024 });
 }
 
 function context(): Context {

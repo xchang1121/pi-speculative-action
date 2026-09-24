@@ -293,7 +293,9 @@ export class SelfSpeculationCoordinator {
 		state.providerPayload = cloneSerializable(payload);
 		this.actorForkPlanSource.bindActorRequest(state.turnID);
 		this.scheduleFlush(state);
-		return providerPayload(payload, settings, state.requestID, this.actorForkPlanSource.schedule);
+		// Only the runtime exposing the control plane accepts these fields; hosted APIs reject unknown ones.
+		return originOf(state.model.baseUrl) === originOf(settings.endpoint)
+			? providerPayload(payload, settings, state.requestID, this.actorForkPlanSource.schedule) : payload;
 	}
 
 	actorRequestID(): string | undefined {
@@ -834,10 +836,7 @@ function providerPayload(
 	probeSchedule: ActorProbeSchedule,
 ): unknown {
 	if (!isRecord(payload)) return payload;
-	const identified = {
-		...payload,
-		[settings.requestIDField]: requestID,
-	};
+	const identified = { ...payload, [settings.requestIDField]: requestID };
 	if (settings.forkTransport === "sidecar") return identified;
 	const { max_tokens, temperature, decoder, forced_prefix, ...fork } = forkPayload(settings);
 	return {
@@ -973,6 +972,8 @@ function modelPayload(model: Model<Api>): Readonly<Record<string, unknown>> {
 function modelKey(model: Model<Api>): string {
 	return JSON.stringify([model.provider, model.api, model.id]);
 }
+
+const originOf = (value: string | undefined) => URL.canParse(value ?? "") ? new URL(value!).origin : undefined;
 
 function decoderEvidenceContext(state: TurnState, tool: string, source: string) {
 	return {
