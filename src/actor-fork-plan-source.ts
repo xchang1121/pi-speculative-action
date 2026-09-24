@@ -41,10 +41,7 @@ export interface ActorProbeSchedule {
 	readonly retryStreamUpdates: number;
 }
 
-export const ACTOR_PROBE_SCHEDULE: ActorProbeSchedule = Object.freeze({
-	maxAttempts: 5,
-	retryStreamUpdates: 50,
-});
+export const ACTOR_PROBE_SCHEDULE: ActorProbeSchedule = Object.freeze({ maxAttempts: 5, retryStreamUpdates: 50 });
 
 interface PendingFork {
 	readonly promise: Promise<readonly ActorForkActionBatch[]>;
@@ -79,6 +76,11 @@ export class ActorForkPlanSource {
 		enabled: (settings) => settings.sourceConfig?.actorForkActionEnabled === true,
 		timeoutMs: (settings) => settings.predictionTimeoutMs,
 		requestLifetime: "actor_decision",
+		// A forked batch is one decision, as a Drafter batch is: peers such as PatternAware continue from all of it.
+		continuationBatch: ({ feedback }) => {
+			const calls = (feedback as { batchCalls?: unknown } | undefined)?.batchCalls;
+			return Array.isArray(calls) && calls.every((id) => typeof id === "string") ? calls : undefined;
+		},
 		propose: async ({ startInput, data, candidateNames, signal }) => {
 			const pending = this.pending.get(startInput.turnID);
 			if (pending && !pending.settled && !pending.controller.signal.aborted) {
@@ -99,7 +101,7 @@ export class ActorForkPlanSource {
 						type: "tool_call" as const,
 						tool: call.tool,
 						input: call.input,
-						feedback: { batchID: batch.id, callID: call.id, callIndex: call.index, evidence: batch.evidence },
+						feedback: { batchID: batch.id, batchCalls: batch.calls.map(({ id }) => id), callID: call.id, callIndex: call.index, evidence: batch.evidence },
 					})),
 				}));
 		},
@@ -108,9 +110,7 @@ export class ActorForkPlanSource {
 	startTurn(turnID: string): void {
 		this.closeTurn(turnID);
 		let resolve!: (batches: readonly ActorForkActionBatch[]) => void;
-		const promise = new Promise<readonly ActorForkActionBatch[]>((settle) => {
-			resolve = settle;
-		});
+		const promise = new Promise<readonly ActorForkActionBatch[]>((settle) => { resolve = settle; });
 		this.pending.set(turnID, {
 			promise,
 			resolve,
@@ -221,15 +221,9 @@ export class ActorForkPlanSource {
 		const pending = this.pending.get(turnID);
 		if (!pending || signal.aborted) return Promise.resolve([]);
 		return new Promise((resolve) => {
-			const aborted = () => {
-				pending.controller.abort();
-				resolve([]);
-			};
+			const aborted = () => { pending.controller.abort(); resolve([]); };
 			signal.addEventListener("abort", aborted, { once: true });
-			void pending.promise.then((batches) => {
-				signal.removeEventListener("abort", aborted);
-				resolve(batches);
-			});
+			void pending.promise.then((batches) => { signal.removeEventListener("abort", aborted); resolve(batches); });
 		});
 	}
 }
