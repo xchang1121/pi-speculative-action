@@ -233,7 +233,7 @@ describe("speculative action host", () => {
 			matchedPredictions: [{ source: "drafter" }, { source: "self-speculation" }] } as never });
 		controller.finishTurn("session", "turn-1");
 		await Promise.resolve();
-		expect(controller.snapshot()).toMatchObject({ samples: 1, expectedNetBenefitMs: 420 / 2 - 20 / 2 - 100 });
+		expect(controller.snapshot()).toMatchObject({ samples: 1, expectedNetBenefitMs: 420 / 2 - 20 / 2 });
 	});
 
 	it("counts Drafter tokens of empty and failed requests when they are spent", async () => {
@@ -246,7 +246,7 @@ describe("speculative action host", () => {
 		} finally { await host.dispose(); }
 	});
 
-	it("prepares active requests and charges late Drafter continuations to their original observation", async () => {
+	it("prepares active requests and amends one observation with late continuations without charging their requests", async () => {
 		let now = 0;
 		const prepareExecution = vi.fn();
 		vi.spyOn(performance, "now").mockImplementation(() => now);
@@ -264,7 +264,7 @@ describe("speculative action host", () => {
 		if (!proposal || Array.isArray(proposal) || !("actions" in proposal)) throw new Error("missing proposal");
 		controller.finishTurn("session", "turn-1");
 		await Promise.resolve();
-		expect(controller.snapshot()).toMatchObject({ samples: 1, expectedNetBenefitMs: -100 });
+		expect(controller.snapshot()).toMatchObject({ samples: 1, expectedNetBenefitMs: 0 });
 		const continuation = { ...request, candidate: { id: "candidate", key: PI_ACTION_SEMANTICS.buildKey("read", { path: "notes.txt" }, "/")!,
 			tool: "read", input: { path: "notes.txt" } }, proposalID: proposal.id, actionID: proposal.actions[0]!.id, revision: 1,
 			feedback: proposal.actions[0]!.feedback, output: { result: { content: [], details: {} }, isError: false }, trigger: "execution_succeeded" as const };
@@ -273,7 +273,7 @@ describe("speculative action host", () => {
 		expect(controller.source.continueOn(continuation)).toBe(true);
 		await Promise.all([controller.source.continue!(continuation), controller.source.continue!(continuation)]);
 		expect(controller.source.continueOn(continuation)).toBe(false);
-		expect(controller.snapshot()).toMatchObject({ samples: 1, expectedNetBenefitMs: -200 });
+		expect(controller.snapshot()).toMatchObject({ samples: 1, expectedNetBenefitMs: 0 }); // Drafter requests run beside the Actor.
 		expect(prepareExecution).toHaveBeenCalledOnce();
 		for (let turn = 2; turn <= 5; turn++) {
 			const turnID = `turn-${turn}`;
@@ -285,15 +285,15 @@ describe("speculative action host", () => {
 		}
 		expect(controller.snapshot().skippedBatches).toBe(1);
 		controller.finishSession();
-		expect(controller.snapshot().samples).toBe(0);
+		expect(controller.snapshot().samples).toBe(4); // Utility evidence spans the session's prompts.
 		const valid = reply.content[0]!;
 		for (const [content, stopReason] of [
 			[[], "stop"], [[valid, valid], "toolUse"],
 			[[valid, { type: "toolCall", id: "disabled", name: "bash", arguments: {} }], "toolUse"],
 			[[], "error"], [[], "aborted"],
 		] as const) {
-			reply = assistant([...content], stopReason);
-			const proposal = controller.source.propose(request);
+			reply = assistant([...content], stopReason); // The session's gate state persists: probe replies with it disabled.
+			const proposal = controller.source.propose({ ...request, settings: { ...request.settings, sourceConfig: { drafterGateEnabled: false } } });
 			if (stopReason === "error" || stopReason === "aborted") await expect(proposal).rejects.toThrow(`Drafter stopped with ${stopReason}`);
 			else expect(await proposal).toBeUndefined();
 			expect((prepareExecution.mock.calls.at(-1)![1] as AbortSignal).aborted, "a batch with no usable proposals must retire its warm-up").toBe(true);

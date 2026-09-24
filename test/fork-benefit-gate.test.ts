@@ -7,7 +7,7 @@ import {
 } from "../src/fork-benefit-gate.ts";
 
 describe("fork benefit gate", () => {
-	it("keeps censored hit benefit unknown while charging requests and late continuations", () => {
+	it("keeps censored hit benefit unknown and charges only Actor-visible adoption latency", () => {
 		for (const expectedActorMs of [undefined, 50, 300]) {
 			const gate = new DrafterUtilityGate();
 			gate.finish(gate.start("drafter", true));
@@ -16,19 +16,19 @@ describe("fork benefit gate", () => {
 				const batch = gate.start("drafter", true);
 				expect(batch.allowed).toBe(true);
 				gate.requestStarted(batch); gate.requestStarted(batch);
-				gate.requestSettled(batch, 10); gate.finish(batch);
+				gate.requestSettled(batch); gate.finish(batch);
 				expect(gate.snapshot().samples).toBe(index);
-				gate.requestSettled(batch, 10);
-				gate.requestStarted(batch); gate.requestSettled(batch, 130);
+				gate.requestSettled(batch);
+				gate.requestStarted(batch); gate.requestSettled(batch); // A late continuation runs beside the Actor.
 				gate.creditAdoption(batch, { executionAheadMs: 10000, attemptLeadMs: 20000, hitLatencyMs: 100, expectedActorMs });
 				expect(gate.snapshot().samples).toBe(index + 1);
-				expect(gate.snapshot().expectedNetBenefitMs).toBe(expectedActorMs === undefined ? undefined : expectedActorMs - 250);
+				expect(gate.snapshot().expectedNetBenefitMs).toBe(expectedActorMs === undefined ? undefined : expectedActorMs - 100);
 			}
 			expect(gate.start("drafter", true).allowed).toBe(expectedActorMs !== 50);
 			if (expectedActorMs === undefined) {
 				for (let index = 0; index < 4; index++) {
 					const missed = gate.start("drafter", true);
-					gate.requestStarted(missed); gate.requestSettled(missed, 100); gate.finish(missed);
+					gate.requestStarted(missed); gate.requestSettled(missed); gate.finish(missed);
 				}
 				expect(gate.start("drafter", true).allowed).toBe(false);
 			}
