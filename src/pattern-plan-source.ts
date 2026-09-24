@@ -72,6 +72,7 @@ export function createPatternPlanSource({
 	const revisions = new Map<string, number>();
 	const carriedPredictions = new Map<string, CarriedPrediction>();
 	const predictionBatches = new WeakMap<PatternPlanFeedback, CarriedPrediction>(), served = new WeakSet<PatternPlanFeedback>();
+	const issuedParents = new WeakSet<object>();
 	// Capabilities stay in this session; the persisted Pattern store receives only real tool batches.
 	const operationBindings = new BoundedRecencyMap<string, ObservedOperation>(PATTERN_AWARE_DEFAULTS.maxPatterns);
 	let analysisTail: Promise<void> = Promise.resolve();
@@ -287,7 +288,10 @@ export function createPatternPlanSource({
 		onIssued: ({ feedback }) => {
 			if (lifecycle.sealed) return;
 			const context = asPatternPlanFeedback(feedback);
-			if (context && !context.operation) for (const support of [context.continuation, ...context.patternIDs]) context.store.issued(support);
+			// A parent's operation choices issue its prediction once, so its one-time probe clears as a tool call's does.
+			if (!context || context.operation && issuedParents.has(context.continuation)) return;
+			issuedParents.add(context.continuation);
+			for (const support of [context.continuation, ...context.patternIDs]) context.store.issued(support);
 		},
 		onSettled: ({ feedback, settlement }) => {
 			if (lifecycle.sealed) return;
@@ -298,7 +302,7 @@ export function createPatternPlanSource({
 				// Execution failure retires this preparation hint; absence of an OS observation is not a negative example.
 				if (settlement.observation === "unobserved" && settlement.cause.stage === "execution" &&
 					operationBindings.get(context.operation.key) === context.operation) operationBindings.delete(context.operation.key);
-				return;
+				if (settlement.observation === "unobserved") return; // An adopted child credits its parent pattern.
 			}
 			if (context) for (const support of [context.continuation, ...context.patternIDs]) context.store.settled(support, settlement, served.has(context));
 		},
