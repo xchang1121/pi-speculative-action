@@ -99,6 +99,16 @@ describe("zero-modification Pi extension", () => {
 		expect(fixture.settle).not.toHaveBeenCalled();
 	});
 
+	it("sends Drafter requests as simple options through the provider with registry auth", async () => {
+		const fixture = await createFixture(), message = { role: "assistant" }, streamSimple = vi.fn(() => ({ result: async () => message }));
+		await fixture.emit("session_start");
+		Object.assign(fixture.context.modelRegistry, { getProvider: () => ({ streamSimple }),
+			getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "key", headers: { a: "1" }, baseUrl: "http://proxy" }) });
+		await expect(fixture.drafterComplete(testModel("mock"), { messages: [] }, { reasoning: "low", headers: { b: "2" } })).resolves.toBe(message);
+		expect(streamSimple).toHaveBeenCalledWith({ ...testModel("mock"), baseUrl: "http://proxy" }, { messages: [] },
+			{ reasoning: "low", apiKey: "key", headers: { a: "1", b: "2" }, env: {} });
+	});
+
 	it("keeps same-name extension tools authoritative and excludes them from speculation", async () => {
 		const fixture = await createFixture({ overriddenTools: ["read"] });
 		const customRead = fixture.customTools.get("read") as ToolDefinition | undefined;
@@ -445,7 +455,7 @@ describe("zero-modification Pi extension", () => {
 		fixture.ui.input = async (title) =>
 			({
 				"Prediction wait limit (ms)": "1",
-				"Maximum Drafter output tokens (blank for provider default)": "",
+				"Maximum Drafter output tokens": "512",
 				"Live result memory (MiB)": "96",
 				"Reusable command history entries": "2048",
 				"Reusable command history memory (MiB)": "768",
@@ -460,7 +470,7 @@ describe("zero-modification Pi extension", () => {
 		await fixture.commands.get("speculative-action")?.handler("", fixture.context as ExtensionCommandContext);
 
 		expect(fixture.store.effective()).toMatchObject({
-			predictionTimeoutMs: 1, drafterMaxDepth: 1,
+			predictionTimeoutMs: 1, drafterMaxDepth: 1, drafterMaxTokens: 512,
 			resourceCacheMaxBytes: 96 * 1024 * 1024,
 			executionStoreMaxEntries: 2048,
 			executionStoreMaxBytes: 768 * 1024 * 1024,
@@ -473,13 +483,12 @@ describe("zero-modification Pi extension", () => {
 		});
 		expect(clearConfirmations).toBe(2);
 		expect(menus.get("Learned-pattern advanced")?.some((label) => label.startsWith("Multi-step search"))).toBe(false);
-		expect(fixture.store.effective()).not.toHaveProperty("drafterMaxTokens");
 		expect(menus.get("Model Drafter")).toEqual(expect.arrayContaining([
 			"Enabled: On", expect.stringMatching(/^Model ›/), "Candidate requests per decision: 2",
 		]));
 		expect(menus.get("Model Drafter")).not.toEqual(expect.arrayContaining([expect.stringMatching(/^Sampling temperature:/)]));
 		expect(menus.get("Model Drafter advanced")).toEqual(expect.arrayContaining([
-			"Pause drafts on estimated negative utility: On", "Follow-up tool steps: 1", "Maximum output tokens: Provider default",
+			"Pause drafts on estimated negative utility: On", "Follow-up tool steps: 1", "Maximum output tokens: 512",
 			"Temperature-0 candidates: 1", "Sampling temperature: 0.7-0.7",
 		]));
 		expect(configure).toHaveBeenLastCalledWith({ maxEntries: 2048, maxBytes: 768 * 1024 * 1024 });
@@ -570,7 +579,6 @@ async function createFixture(options: FixtureOptions = {}) {
 		ui,
 		model: testModel("mock"),
 		modelRegistry: {
-			complete: vi.fn(),
 			getAvailable: () => [testModel("mock")],
 		},
 		sessionManager: { getSessionId: () => "session", getSessionFile: () => undefined },
@@ -614,6 +622,7 @@ async function createFixture(options: FixtureOptions = {}) {
 	return {
 		actorTools, baseTools, commands, context, createExecutionWorlds, customTools, cwd, emit, handlers, host, settle,
 		executionWorlds: () => hostOptions?.executionWorlds ?? [],
+		drafterComplete: (...args: Parameters<CreateSpeculativeActionHostOptions["complete"]>) => hostOptions!.complete(...args),
 		executionWorldEnabled: (backend: string) => hostOptions?.speculativeExecutionWorldEnabled?.(backend),
 		hostSettings: async () => hostOptions?.getSettings?.(), resolveInvocation, store, tools, ui,
 	};

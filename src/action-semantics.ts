@@ -11,6 +11,7 @@ import {
 	WORKSPACE_PATH_MUTATION_EFFECTS,
 } from "./effect-model.ts";
 import { asRecord, immutableSnapshot, isImmutableSnapshot, stableStringify } from "./stable-json.ts";
+import { finiteNumber } from "./number-utils.ts";
 import { positiveInteger, nonNegativeInteger } from "./setting-input.ts";
 
 /** Observable effects of an action, independent of any concrete isolation backend. */
@@ -440,12 +441,8 @@ export function normalizeReadOffset(value: unknown): number {
 }
 
 export function normalizeReadLimit(value: unknown): number {
-	const limit = finiteOrUndefined(value);
+	const limit = finiteNumber(value);
 	return limit === undefined ? READ_DEFAULT_LIMIT : Math.max(0, Math.floor(limit));
-}
-
-function finiteOrUndefined(value: unknown): number | undefined {
-	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 function canonicalPiAction(tool: string, input: unknown, cwd: string): CanonicalAction | undefined {
@@ -455,7 +452,7 @@ function canonicalPiAction(tool: string, input: unknown, cwd: string): Canonical
 		if (typeof record.command !== "string") return undefined;
 		const resource = slash(path.resolve(cwd));
 		return { resources: [resource], input: { command: record.command, cwd: resource,
-			...(finiteOrUndefined(record.timeout) !== undefined ? { timeout: record.timeout } : {}) } };
+			...(finiteNumber(record.timeout) !== undefined ? { timeout: record.timeout } : {}) } };
 	}
 	const query = tool === "grep" || tool === "find" || tool === "ls";
 	if (!query && typeof record.path !== "string") return undefined;

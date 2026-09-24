@@ -53,7 +53,7 @@ import {
 import { DEFAULT_PROVENANCE_STORE_LIMITS } from "./reuse-store.ts";
 import type { SpeculativeActionEvent } from "./runtime.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
-import { nonEmptyTextInput, nonNegativeIntegerInput, nonNegativeNumberInput, optionalPositiveIntegerInput, optionalTextInput,
+import { nonEmptyTextInput, nonNegativeIntegerInput, nonNegativeNumberInput, optionalTextInput,
 	positiveIntegerInput, positiveInteger, probabilityInput, settingInput, type SettingInputDescriptor } from "./setting-input.ts";
 import { errorMessage } from "./error-utils.ts";
 import {
@@ -91,7 +91,7 @@ const ROOT_SETTING_INPUTS = {
 	executionStoreMaxEntries: positiveIntegerInput("Reusable command history entries"),
 	executionStoreMaxBytes: mebibyteInput("Reusable command history memory"),
 	predictionTimeoutMs: positiveIntegerInput("Prediction wait limit (ms)"),
-	drafterMaxTokens: optionalPositiveIntegerInput("Maximum Drafter output tokens (blank for provider default)"),
+	drafterMaxTokens: positiveIntegerInput("Maximum Drafter output tokens"),
 	drafterMaxDepth: nonNegativeIntegerInput("Drafter follow-up tool steps"),
 	drafterDeterministicCandidates: nonNegativeIntegerInput("Temperature-0 Drafter candidates"),
 } satisfies Partial<SettingInputDescriptors<EffectiveSpeculativeActionSettings, keyof EffectiveSpeculativeActionSettings>>;
@@ -221,7 +221,7 @@ export function formatSpeculativeActionStatus(input: {
 		`Model Drafter: ${settings.drafterEnabled ? "On" : "Off"}`,
 		`Drafter model: ${settings.draftModel ?? "active model"}`,
 		`Candidate requests per Actor decision: ${settings.candidateLimit}`,
-		`Model Drafter policy: ${settings.drafterMaxDepth} follow-up steps; ${settings.drafterMaxTokens ?? "provider default"} tokens; ${settings.drafterDeterministicCandidates} temperature-0 candidates; sampling ${formatNumber(settings.drafterTemperatureMin)}-${formatNumber(settings.drafterTemperatureMax)}`,
+		`Model Drafter policy: ${settings.drafterMaxDepth} follow-up steps; ${settings.drafterMaxTokens} tokens; ${settings.drafterDeterministicCandidates} temperature-0 candidates; sampling ${formatNumber(settings.drafterTemperatureMin)}-${formatNumber(settings.drafterTemperatureMax)}`,
 		`Simultaneous speculative tools: ${settings.maxConcurrentActions}`,
 		`Storage policy: ${settings.resourceCacheMaxEntries} live results/${formatBytes(settings.resourceCacheMaxBytes)}; ${settings.executionStoreMaxEntries} reusable commands/${formatBytes(settings.executionStoreMaxBytes)}`,
 		`Prediction wait limit: ${formatDuration(settings.predictionTimeoutMs)}`,
@@ -469,8 +469,13 @@ async function installController(
 	const host = (dependencies.createHost ?? createSpeculativeActionHost)(sessionID, {
 		cwd: context.cwd,
 		getSettings: runtimeSettings,
-		complete: (model, llmContext, options) =>
-			providerRequest.run("drafter", () => latestContext.modelRegistry.complete(model, llmContext, options)),
+		// Registry completion takes raw per-API options; Drafter options are simple (reasoning levels) like the Actor's.
+		complete: (model, llmContext, options) => providerRequest.run("drafter", async () => {
+			const registry = latestContext.modelRegistry, provider = registry.getProvider(model.provider), auth = await registry.getApiKeyAndHeaders(model);
+			if (!provider || !auth.ok) throw new Error(auth.ok ? `Unknown provider: ${model.provider}` : auth.error);
+			return provider.streamSimple({ ...model, baseUrl: auth.baseUrl ?? model.baseUrl }, llmContext, { ...options, apiKey: options?.apiKey ?? auth.apiKey,
+				headers: { ...auth.headers, ...options?.headers }, env: { ...auth.env, ...options?.env } }).result();
+		}),
 		draftModel: (actorModel) =>
 			resolveSpeculativeDraftModel(settings().draftModel, actorModel, latestContext.modelRegistry),
 		preflight: ({ toolName }) =>
@@ -894,7 +899,7 @@ function openDrafterSettings(ctx: ExtensionContext, controller: SpeculativeActio
 		] : [
 			toggle("drafterGateEnabled", "Pause drafts on estimated negative utility"),
 			input("drafterMaxDepth", "Follow-up tool steps"),
-			input("drafterMaxTokens", "Maximum output tokens", value => value ?? "Provider default"),
+			input("drafterMaxTokens", "Maximum output tokens"),
 			input("drafterDeterministicCandidates", "Temperature-0 candidates"),
 			[`Sampling temperature: ${formatNumber(settings.drafterTemperatureMin)}-${formatNumber(settings.drafterTemperatureMax)}`, () => editDrafterTemperatureRange(ctx, controller, settings)],
 		]);

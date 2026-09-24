@@ -3,7 +3,6 @@ import {
 	nonEmptyTextInput,
 	nonNegativeIntegerInput,
 	nonNegativeNumberInput,
-	optionalPositiveIntegerInput,
 	optionalTextInput,
 	positiveIntegerInput,
 	probabilityInput,
@@ -37,12 +36,6 @@ describe("typed setting input", () => {
 	});
 
 	it("models optional values without weakening the underlying validation", () => {
-		const tokens = optionalPositiveIntegerInput("Tokens");
-		expect(tokens.format(undefined)).toBe("");
-		expect(tokens.parse("  ")).toEqual({ ok: true, value: undefined });
-		expect(tokens.parse("16")).toEqual({ ok: true, value: 16 });
-		expect(tokens.parse("0").ok).toBe(false);
-
 		expect(nonEmptyTextInput("Decoder").parse(" auto ")).toEqual({ ok: true, value: "auto" });
 		expect(nonEmptyTextInput("Decoder").parse(" ").ok).toBe(false);
 		expect(optionalTextInput("Token environment").parse("  ")).toEqual({ ok: true, value: undefined });

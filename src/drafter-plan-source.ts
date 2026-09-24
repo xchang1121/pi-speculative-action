@@ -35,7 +35,7 @@ import type { ActorActionFeedback } from "./runtime.ts";
 interface DrafterBatch {
 	readonly model: Model<Api>;
 	readonly context: Context;
-	readonly options: SimpleStreamOptions;
+	readonly options: SimpleStreamOptions & { readonly toolChoice?: "auto" | "required" };
 	readonly utility: DrafterUtilityBatch;
 	readonly tools: ReadonlySet<string>;
 }
@@ -116,7 +116,8 @@ export function createDrafterPlanSource(input: {
 		const startedAt = performance.now();
 		let failed = false;
 		try {
-			const message = await input.complete(batch.model, batch.context, { ...batch.options, signal });
+			const { options } = batch, forced = options.toolChoice === "required" ? { onPayload: forceToolChoice(options.onPayload) } : {};
+			const message = await input.complete(batch.model, batch.context, { ...options, ...forced, signal });
 			if (message.stopReason === "error" || message.stopReason === "aborted")
 				throw new Error(message.errorMessage ?? `Drafter stopped with ${message.stopReason}`);
 			const calls = message.content.filter((item): item is AgentToolCall => item.type === "toolCall");
@@ -211,10 +212,10 @@ export function createDrafterPlanSource(input: {
 				batches.set(batchKey, batch);
 			}
 			return batch.propose(signal, async (prepared, signal) => {
-				const draftOptions: SimpleStreamOptions & { readonly toolChoice: "auto" | "required" } = {
+				const draftOptions: DrafterBatch["options"] = {
 					...prepared.options,
 					temperature: drafterRequestTemperature(proposalIndex, proposalCount, drafter),
-					...(drafter.drafterMaxTokens ? { maxTokens: drafter.drafterMaxTokens } : {}),
+					maxTokens: drafter.drafterMaxTokens,
 					// Thinking providers can reject forced tool calls; preserve their normal tool decision.
 					toolChoice: prepared.options.reasoning ? "auto" : "required",
 					deferred: false,
@@ -265,6 +266,16 @@ export function createDrafterPlanSource(input: {
 		},
 	};
 }
+
+/** Simple streams drop toolChoice for most APIs; spell a forced call on the final payload where the API has one. */
+function forceToolChoice(inherited: SimpleStreamOptions["onPayload"]): SimpleStreamOptions["onPayload"] {
+	return async (payload, model) => {
+		const next = (await inherited?.(payload, model)) ?? payload, forced = FORCED_TOOL_CHOICE[model.api];
+		return forced && next && typeof next === "object" && "tools" in next ? { ...next, tool_choice: forced } : next;
+	};
+}
+const FORCED_TOOL_CHOICE: Readonly<Record<string, unknown>> = { "anthropic-messages": { type: "any" }, "openai-completions": "required",
+	"openai-responses": "required", "azure-openai-responses": "required", "openai-codex-responses": "required" };
 
 /** Preserve the Actor-visible history whole; a shorter Drafter skips instead of compacting it. */
 function drafterContextFits(model: Model<Api>, context: Context, maxTokens: number | undefined): boolean {

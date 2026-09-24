@@ -32,7 +32,7 @@ describe("speculative action common", () => {
 
 	it("stratifies configurable Drafter sampling for arbitrary candidate counts", () => {
 		const baseline = normalizeDrafterRequestSettings(undefined);
-		expect(baseline.drafterMaxTokens).toBeUndefined();
+		expect(baseline.drafterMaxTokens).toBe(4096);
 		expect([0, 1, 2].map((index) => drafterRequestTemperature(index, 3, baseline))).toEqual([0, 0.7, 0.7]);
 		const diverse = normalizeDrafterRequestSettings({
 			drafterMaxDepth: 3,
@@ -57,6 +57,7 @@ describe("speculative action common", () => {
 			}),
 		).toEqual({
 			drafterMaxDepth: DEFAULTS.drafterMaxDepth,
+			drafterMaxTokens: DEFAULTS.drafterMaxTokens,
 			drafterDeterministicCandidates: DEFAULTS.drafterDeterministicCandidates,
 			drafterTemperatureMin: 0.5,
 			drafterTemperatureMax: 2,

@@ -1,4 +1,5 @@
-import { creditAdoption, metric, BenefitGate, DEFAULT_BENEFIT_GATE_POLICY, type BenefitGatePolicy } from "./fork-benefit-gate.ts";
+import { creditAdoption, BenefitGate, DEFAULT_BENEFIT_GATE_POLICY, type BenefitGatePolicy } from "./fork-benefit-gate.ts";
+import { nonNegativeFinite as metric } from "./number-utils.ts";
 import type { ActorHitTiming } from "./settlement.ts";
 
 export interface DrafterUtilityBatch {
