@@ -64,6 +64,13 @@ describe("workspace-branch ExecutionWorld", () => {
 			} finally { await child.dispose(); }
 		} finally { await branch.dispose(); }
 	});
+	it("keeps other spellings of its private .git out of the view on case-insensitive volumes", async ({ skip }) => {
+		if (process.platform !== "win32" && process.platform !== "darwin") return skip("case-sensitive volume");
+		const root = await temporaryRoot(), world = sandbox.createExecutionWorld({ driver: "git" });
+		for (const name of [".GIT", ".Git/config", ...(process.platform === "win32" ? [".git.", ".git ./config"] : [])])
+			await expect(world.speculation.execute(boundContext(root, async (view) => settlement((await view.readFile(path.join(root, name))).toString()))))
+				.rejects.toThrow("outside the workspace view");
+	});
 	it.each((["git", ...(process.platform === "linux" ? ["overlayfs"] : [])] as Array<"git" | "overlayfs">).flatMap(driver =>
 		["write", "replace", "unlink", "rename", "swap", "join", "create", ...(process.platform === "linux" ? ["chmod"] : [])].map(mode => [driver, mode] as const)))("commits %s %s through the same file object and namespace transaction", async (driver, mode) => {
 		const root = await temporaryRoot(), a = path.join(root, "a"), b = path.join(root, "b"), c = path.join(root, "c");
