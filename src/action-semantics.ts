@@ -138,21 +138,13 @@ export class ActionSemanticsRegistry {
 		return [...this.definitionsByTool.values()].filter((definition) => effect === undefined || definition.effect === effect).map((definition) => definition.tool);
 	}
 
-	effect(action: string | ActionKey): ActionEffect | undefined {
-		return this.definition(action)?.effect;
-	}
+	effect(action: string | ActionKey): ActionEffect | undefined { return this.definition(action)?.effect; }
 
-	requirements(action: string | ActionKey): EffectRequirements | undefined {
-		return this.definition(action)?.requirements;
-	}
+	requirements(action: string | ActionKey): EffectRequirements | undefined { return this.definition(action)?.requirements; }
 
-	projectors(): readonly ActionKeyProjector[] {
-		return [...this.projectorsByID.values()];
-	}
+	projectors(): readonly ActionKeyProjector[] { return [...this.projectorsByID.values()]; }
 
-	supportsProjector(id: string): boolean {
-		return this.projectorsByID.has(id);
-	}
+	supportsProjector(id: string): boolean { return this.projectorsByID.has(id); }
 
 	buildKey(
 		tool: string,
@@ -224,9 +216,14 @@ export const GREP_LITERAL_ACTION_KEY_PROJECTOR: ActionKeyProjector = ownActionKe
 	project: (speculative, actor) => {
 		const found = speculative.input.pattern, sought = actor.input.pattern, partition = grepLiteralPartition(speculative);
 		return partition !== undefined && partition === grepLiteralPartition(actor) && typeof found === "string" && typeof sought === "string" &&
-			sought.includes(found) ? { action: actor, distance: sought.length - found.length } : undefined;
+			grepLiteralMatches(sought, found, actor.input.ignoreCase === true) ? { action: actor, distance: sought.length - found.length } : undefined;
 	},
 });
+
+/** rg's case-insensitive literal folds each code point simply, as `/iu` does; the printable-ASCII patterns it projects share every fold. */
+export function grepLiteralMatches(text: string, literal: string, ignoreCase: boolean): boolean {
+	return ignoreCase ? new RegExp(literal.replace(/[\\^$.*+?()[\]{}|/]/g, "\\$&"), "iu").test(text) : text.includes(literal);
+}
 
 export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry(([
 	{ tool: "read", effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS, resourceScope: "content", projectors: [READ_RANGE_ACTION_KEY_PROJECTOR] },
@@ -354,8 +351,7 @@ export function readRangesShareInFlight(speculative: ActionKey, actor: ActionKey
 }
 
 export function normalizeRelativeRoot(value: unknown, cwd: string): string | undefined {
-	if (value !== undefined && typeof value !== "string") return undefined;
-	return normalizeWorkspacePath(value ?? ".", cwd);
+	return value !== undefined && typeof value !== "string" ? undefined : normalizeWorkspacePath(value ?? ".", cwd);
 }
 
 export function inferredActionEffect(tool: string): ActionEffect | undefined {
@@ -424,10 +420,10 @@ function bashTimeoutPartition(action: ActionKey): string | undefined {
 		action.executionFingerprint, action.resources, Object.entries(action.input).filter(([name]) => name !== "timeout")]) : undefined;
 }
 
-/** Everything but the pattern and limit. rg matches within one line's bytes, so a case fold, context, line break or U+FFFD never projects. */
+/** Everything but the pattern and limit. rg matches within one line's bytes: context, a line break, U+FFFD or a non-ASCII case fold never projects. */
 function grepLiteralPartition(action: ActionKey): string | undefined {
 	const { pattern, literal, ignoreCase, context } = action.input;
-	return action.tool === "grep" && literal === true && ignoreCase === false && context === 0 && typeof pattern === "string" && /^[^\r\n�]+$/u.test(pattern)
+	return action.tool === "grep" && literal === true && context === 0 && typeof pattern === "string" && (ignoreCase ? /^[\x20-\x7e]+$/ : /^[^\r\n�]+$/u).test(pattern)
 		? stableStringify([action.semanticsEpoch, action.schemaHash, action.executionFingerprint, action.resources,
 			Object.entries(action.input).filter(([name]) => name !== "pattern" && name !== "limit")]) : undefined;
 }

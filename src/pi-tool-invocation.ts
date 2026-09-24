@@ -4,7 +4,7 @@ import {
 	getAgentDir, getShellConfig, VERSION, type ExtensionContext, type ToolsOptions,
 } from "@earendil-works/pi-coding-agent";
 import type { ToolFilesystemOperations, ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
-import { BASH_TIMEOUT_ACTION_KEY_PROJECTOR, GREP_LITERAL_ACTION_KEY_PROJECTOR, PI_ACTION_SEMANTICS, resolvePiToolPath, type ActionSemanticsDefinition } from "./action-semantics.ts";
+import { BASH_TIMEOUT_ACTION_KEY_PROJECTOR, GREP_LITERAL_ACTION_KEY_PROJECTOR, grepLiteralMatches, PI_ACTION_SEMANTICS, resolvePiToolPath, type ActionSemanticsDefinition } from "./action-semantics.ts";
 import type { ActionProjectionRule } from "./action-key-projection.ts";
 import { asRecord } from "./stable-json.ts";
 import { RESOURCE_OBSERVATION_EFFECTS } from "./effect-model.ts";
@@ -148,11 +148,11 @@ export const PI_GREP_LITERAL_PROJECTION_RULE: ActionProjectionRule<ToolSettlemen
 		const [content, ...rest] = output.result.content, found = String(speculative.input.pattern), sought = String(actor.input.pattern);
 		if (output.isError || output.result.details !== undefined || rest.length || content?.type !== "text") return undefined;
 		if (content.text === "No matches found") return output;
-		const kept: string[] = [];
+		const kept: string[] = [], holds = (text: string, literal: string) => grepLiteralMatches(text, literal, actor.input.ignoreCase === true);
 		for (const line of content.text.split("\n")) {
 			// A path may itself contain `:N: `: every split whose text holds the found literal must agree.
 			const verdicts = new Set([...line.matchAll(/:\d+: /g)].map((split) => line.slice(split.index + split[0].length))
-				.filter((text) => text.includes(found)).map((text) => text.includes(sought)));
+				.filter((text) => holds(text, found)).map((text) => holds(text, sought)));
 			if (verdicts.size !== 1) return undefined;
 			if (verdicts.has(true)) kept.push(line);
 		}
