@@ -24,6 +24,7 @@ import {
 import { ExecutionWorldRouter, type ExecutionWorldDiagnosticSnapshot } from "../src/execution-world.ts";
 import {
 	createSpeculativeActionExtension,
+	formatSpeculativeActionEvent,
 	type SpeculativeSettingsStore,
 } from "../src/extension.ts";
 import { LinuxProcessReuseBackend } from "../src/linux-process-backend.ts";
@@ -54,10 +55,7 @@ describe("zero-modification Pi extension", () => {
 		expect(read).toMatchObject({ name: "read", label: "read" });
 		await fixture.emit("context", { messages: [] });
 		const partial = { content: [{ type: "toolCall", id: "actor-read", name: "read", arguments: {} }] };
-		await fixture.emit(
-			"message_update",
-			{ assistantMessageEvent: { type: "toolcall_start", contentIndex: 0, partial } },
-		);
+		await fixture.emit("message_update", { assistantMessageEvent: { type: "toolcall_start", contentIndex: 0, partial } });
 		expect(fixture.host.previewActorTool).toHaveBeenCalledWith({ turnID: "turn_1", tool: "read" }, undefined);
 		await fixture.emit(
 			"message_update",
@@ -82,13 +80,7 @@ describe("zero-modification Pi extension", () => {
 			},
 		);
 		expect(fixture.host.previewActorCall).toHaveBeenCalledWith(
-			{
-				turnID: "turn_1",
-				id: "actor-read",
-				tool: "read",
-				args: { path: "notes.txt" },
-				tools: expect.any(Array),
-			},
+			{ turnID: "turn_1", id: "actor-read", tool: "read", args: { path: "notes.txt" }, tools: expect.any(Array) },
 			undefined,
 		);
 		expect(fixture.host.runtime.prepareActorCall).not.toHaveBeenCalled();
@@ -96,6 +88,12 @@ describe("zero-modification Pi extension", () => {
 		expect(result.content).toEqual([{ type: "text", text: "cached" }]);
 		expect(fixture.host.runtime.prepareActorCall).toHaveBeenCalledOnce();
 		expect(fixture.settle).not.toHaveBeenCalled();
+	});
+
+	it("leads task timing with the optimistic gain and keeps the signed net estimate beside it", () => {
+		const timing = { endToEndMs: 1000, optimisticSavingsMs: 300, estimatedSavingsMs: -50, hiddenLatencyMs: 100, toolExecutionMs: 400 };
+		expect(formatSpeculativeActionEvent({ type: "task", sessionID: "s", turnID: "t", timing } as never)).toContain(
+			"1s wall; 300ms optimistic savings (net -50ms); End-to-End SpeedUp +30.0% (net -5.0%); Tool time speed up 25.0%; 100ms of 400ms tool time hidden");
 	});
 
 	it("sends Drafter requests as simple options through the provider with registry auth", async () => {
@@ -133,13 +131,7 @@ describe("zero-modification Pi extension", () => {
 		const turn = vi.mocked(fixture.host.startTurn).mock.calls[0]?.[0];
 		expect(turn?.tools.map((tool) => tool.name)).not.toContain("read");
 
-		const result = await customRead?.execute(
-			"actor-read",
-			{ path: "notes.txt" },
-			undefined,
-			undefined,
-			fixture.context,
-		);
+		const result = await customRead?.execute("actor-read", { path: "notes.txt" }, undefined, undefined, fixture.context);
 		expect(result?.content).toEqual([{ type: "text", text: "custom read" }]);
 		expect(fixture.host.runtime.prepareActorCall).not.toHaveBeenCalled();
 		expect(fixture.settle).not.toHaveBeenCalled();
@@ -507,14 +499,8 @@ describe("zero-modification Pi extension", () => {
 		expect(menus.get("Fork decoding")).not.toEqual(
 			expect.arrayContaining([expect.stringMatching(/^Require token probabilities/)]),
 		);
-		expect(fixture.ui.notify).toHaveBeenCalledWith(
-			"Reusable command history cleared: 2 entries, 3 artifacts, 4 KiB.",
-			"info",
-		);
-		expect(fixture.ui.notify).toHaveBeenCalledWith(
-			"Endpoint must be an absolute HTTP(S) URL.",
-			"warning",
-		);
+		expect(fixture.ui.notify).toHaveBeenCalledWith("Reusable command history cleared: 2 entries, 3 artifacts, 4 KiB.", "info");
+		expect(fixture.ui.notify).toHaveBeenCalledWith("Endpoint must be an absolute HTTP(S) URL.", "warning");
 		expect(menus.get("Actor probe")).toEqual(
 			expect.arrayContaining([
 				"Use forked calls for tool pre-execution: On",

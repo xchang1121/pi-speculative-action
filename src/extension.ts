@@ -169,9 +169,7 @@ export function normalizeSpeculativeActionSettings(
 	return {
 		...normalizeSpeculativeAgentSettings(input),
 		searchExecution: input?.searchExecution === "captured" ? "captured" : "native",
-		...(typeof input?.draftModel === "string" && input.draftModel.trim()
-			? { draftModel: input.draftModel.trim() }
-			: {}),
+		...(typeof input?.draftModel === "string" && input.draftModel.trim() ? { draftModel: input.draftModel.trim() } : {}),
 		executionStoreMaxEntries: positiveInteger(input?.executionStoreMaxEntries, DEFAULT_PROVENANCE_STORE_LIMITS.maxCertificates),
 		executionStoreMaxBytes: positiveInteger(input?.executionStoreMaxBytes, DEFAULT_PROVENANCE_STORE_LIMITS.maxBytes),
 		executionRouting: { primary: input?.executionRouting?.primary !== false, nativeFallback: input?.executionRouting?.nativeFallback !== false },
@@ -214,9 +212,9 @@ export function formatSpeculativeActionStatus(input: {
 		`Actor candidate rejections: ${countSummary(metrics.actorCandidateRejections)}`,
 		`Candidates: ${metrics.candidateStarted} started; ${metrics.candidateSucceeded} succeeded; ${metrics.candidateFailed} failed; ${metrics.candidateCancelled} cancelled`,
 		metrics.tasks > 0
-			? `Task timing (${metrics.tasks} completed): ${formatTaskTiming(metrics)}. Estimated savings are signed estimates against native history, not a measured no-speculation comparison.`
+			? `Task timing (${metrics.tasks} completed): ${formatTaskTiming(metrics)}. Optimistic savings credit each hit with the larger of its computation and the expected Actor time; net savings are signed against native history and charge speculation's cost. Neither is a measured no-speculation comparison.`
 			: "Task timing: n/a (no completed task); serialized overlap and speedup are not reported as 0.",
-		`Drafter tokens (input + output, every request): ${metrics.totalDraftTokens}${metrics.estimatedSavingsMs > 0 ? `; ${Math.round(metrics.totalDraftTokens * 1000 / metrics.estimatedSavingsMs)} per estimated second saved` : ""}`,
+		`Drafter tokens (input + output, every request): ${metrics.totalDraftTokens}${metrics.estimatedSavingsMs > 0 ? `; ${Math.round(metrics.totalDraftTokens * 1000 / metrics.estimatedSavingsMs)} per net second saved` : ""}`,
 		`Live speculative results: ${cache.resultEntries}/${cache.cacheCapacity}, ${formatBytes(cache.resultBytes)}/${formatBytes(cache.cacheByteCapacity ?? 0)}; cold: ${cache.cacheCold}; hot: ${cache.cacheHot}; jobs: ${cache.inFlightJobs}; branches: ${cache.branchEntries} (${formatBytes(cache.branchBytes)})`,
 	].join("\n");
 }
@@ -1512,16 +1510,18 @@ function countSummary(counts: Readonly<Record<string, number>>): string {
 	return entries.length > 0 ? entries.map(([key, count]) => `${key}=${count}`).join(", ") : "none";
 }
 
-function formatTaskTiming(timing: Pick<SpeculativeTraceSummary, "endToEndMs" | "estimatedSavingsMs" | "hiddenLatencyMs" | "toolExecutionMs">): string {
-	const savings = timing.estimatedSavingsMs, loss = savings < 0 ? "-" : "";
-	return `${formatDuration(timing.endToEndMs)} wall; ${loss}${formatDuration(Math.abs(savings))} estimated savings; ${formatSpeedups(timing)}; ${formatDuration(timing.hiddenLatencyMs)} of ${formatDuration(timing.toolExecutionMs)} tool time hidden`;
+type TimingSummary = Pick<SpeculativeTraceSummary, "endToEndMs" | "estimatedSavingsMs" | "optimisticSavingsMs" | "hiddenLatencyMs" | "toolExecutionMs">;
+
+function formatTaskTiming(timing: TimingSummary): string {
+	const net = timing.estimatedSavingsMs;
+	return `${formatDuration(timing.endToEndMs)} wall; ${formatDuration(timing.optimisticSavingsMs)} optimistic savings (net ${net < 0 ? "-" : ""}${formatDuration(Math.abs(net))}); ${formatSpeedups(timing)}; ${formatDuration(timing.hiddenLatencyMs)} of ${formatDuration(timing.toolExecutionMs)} tool time hidden`;
 }
 
-function formatSpeedups(timing: Pick<SpeculativeTraceSummary, "endToEndMs" | "estimatedSavingsMs" | "hiddenLatencyMs" | "toolExecutionMs">): string {
-	const savings = timing.estimatedSavingsMs;
-	const percent = timing.endToEndMs > 0 && Number.isFinite(savings) ? `${savings < 0 ? "" : "+"}${(100 * savings / timing.endToEndMs).toFixed(1)}%` : "n/a";
+/** The optimistic estimate leads, as the TUI has always shown it; the signed net estimate follows. */
+function formatSpeedups(timing: TimingSummary): string {
+	const percent = (savings: number) => timing.endToEndMs > 0 && Number.isFinite(savings) ? `${savings < 0 ? "" : "+"}${(100 * savings / timing.endToEndMs).toFixed(1)}%` : "n/a";
 	const toolPercent = timing.toolExecutionMs > 0 && Number.isFinite(timing.hiddenLatencyMs) ? `${(100 * timing.hiddenLatencyMs / timing.toolExecutionMs).toFixed(1)}%` : "n/a";
-	return `End-to-End SpeedUp ${percent}; Tool time speed up ${toolPercent}`;
+	return `End-to-End SpeedUp ${percent(timing.optimisticSavingsMs)} (net ${percent(timing.estimatedSavingsMs)}); Tool time speed up ${toolPercent}`;
 }
 
 function formatDuration(ms: number): string {

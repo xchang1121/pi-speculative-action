@@ -34,7 +34,7 @@ export function emptySpeculativeTraceSummary(cache: SpeculativeCacheSnapshot | P
 		actorFallbacks: 0,
 		hitRate: 0,
 		actorCandidateRejections: {} as Readonly<Record<string, number>>,
-		tasks: 0, endToEndMs: 0, nonToolMs: 0, actorPhaseMs: 0, orchestrationMs: 0, toolExecutionMs: 0, serializedMs: 0, hiddenLatencyMs: 0, estimatedSavingsMs: 0,
+		tasks: 0, endToEndMs: 0, nonToolMs: 0, actorPhaseMs: 0, orchestrationMs: 0, toolExecutionMs: 0, serializedMs: 0, hiddenLatencyMs: 0, estimatedSavingsMs: 0, optimisticSavingsMs: 0,
 		speculativeExecutionMs: 0, actorExecutionMs: 0, executionAheadMs: 0, attemptLeadMs: 0, hitLatencyMs: 0, totalDraftTokens: 0,
 		processReuse: emptyWorldReuseMetrics(), // Inside speculative worlds, never the Actor route.
 		cache: cloneCache({ ...EMPTY_CACHE, ...cache }),
@@ -66,6 +66,7 @@ export function reduceSpeculativeTrace<SessionID>(
 			next.serializedMs += metric(event.timing.serializedMs);
 			next.hiddenLatencyMs += metric(event.timing.hiddenLatencyMs);
 			next.estimatedSavingsMs += finiteNumber(event.timing.estimatedSavingsMs) ?? 0; // Signed: speculation can cost time.
+			next.optimisticSavingsMs += metric(event.timing.optimisticSavingsMs);
 			break;
 		case "source_request":
 			next.sourceRequests++;
@@ -96,9 +97,7 @@ export function reduceSpeculativeTrace<SessionID>(
 			next.totalDraftTokens = Math.max(next.totalDraftTokens, metric(event.candidate.totalDraftTokens));
 			if (event.state.status === "running") next.candidateStarted++;
 			else {
-				if (event.candidate.origin === "prediction") {
-					next.speculativeExecutionMs += metric(event.state.executionMs);
-				}
+				if (event.candidate.origin === "prediction") next.speculativeExecutionMs += metric(event.state.executionMs);
 				if (event.state.status === "succeeded") {
 					next.candidateSucceeded++;
 					const reuse = event.candidate.world?.executionMetrics.reuse;
