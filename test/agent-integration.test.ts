@@ -33,11 +33,7 @@ import {
 } from "../src/self-speculation.ts";
 
 const directories = temporaryDirectories("pi-spec-host-");
-const readSchema = Type.Object({
-	path: Type.String(),
-	offset: Type.Optional(Type.Number()),
-	limit: Type.Optional(Type.Number()),
-});
+const readSchema = Type.Object({ path: Type.String(), offset: Type.Optional(Type.Number()), limit: Type.Optional(Type.Number()) });
 const grepSchema = Type.Object({ pattern: Type.String(), path: Type.Optional(Type.String()) });
 const bashSchema = Type.Object({ command: Type.String(), timeout: Type.Optional(Type.Number()) });
 const mockToolSchema = Type.Any();
@@ -120,10 +116,7 @@ async function temporaryWorkspace(base?: string): Promise<string> {
 	return root;
 }
 
-afterEach(async () => {
-	vi.restoreAllMocks();
-	await directories.dispose();
-});
+afterEach(async () => { vi.restoreAllMocks(); await directories.dispose(); });
 
 describe("speculative action host", () => {
 	it("owns concurrent binding and completion independently of caller IDs", async () => {
@@ -221,6 +214,17 @@ describe("speculative action host", () => {
 		}
 	});
 
+	it("keeps the predictable calls of a mixed Drafter batch without continuing it", async () => {
+		const tool = createReadTool(await temporaryWorkspace()), controller = createDrafterPlanSource({ sessionID: "session", complete: async () => assistant([
+			{ type: "toolCall", id: "r", name: "read", arguments: { path: "a.txt" } }, { type: "toolCall", id: "b", name: "bash", arguments: { command: "ls" } }], "toolUse") });
+		const proposal = await controller.source.propose({ startInput: { ...startInput(tool), sessionID: "session" }, data: { tools: new Map([["read", tool]]), schemaHashes: {} },
+			settings: { ...settings(), resourceCacheMaxEntries: 4, predictionTimeoutMs: 1000 }, definitions: [], candidateNames: ["read"], proposalIndex: 0, proposalCount: 1, signal: new AbortController().signal });
+		if (!proposal || Array.isArray(proposal) || !("actions" in proposal) || typeof controller.source.continueOn !== "function") throw new Error("missing proposal");
+		expect(proposal.actions).toMatchObject([{ tool: "read", input: { path: "a.txt" } }]);
+		expect(controller.source.continueOn({ actionID: proposal.actions[0]!.id, feedback: proposal.actions[0]!.feedback,
+			output: { result: { content: [], details: {} }, isError: false }, trigger: "execution_succeeded" })).toBe(false);
+	});
+
 	it("splits one adoption among the sources that predicted it, whichever one executed it", async () => {
 		let now = 0;
 		vi.spyOn(performance, "now").mockImplementation(() => now);
@@ -252,10 +256,7 @@ describe("speculative action host", () => {
 		vi.spyOn(performance, "now").mockImplementation(() => now);
 		const tool = createReadTool(await temporaryWorkspace());
 		let reply = drafterCall({ path: "notes.txt" });
-		const controller = createDrafterPlanSource({ sessionID: "session", complete: async () => {
-			now += 100;
-			return reply;
-		} });
+		const controller = createDrafterPlanSource({ sessionID: "session", complete: async () => { now += 100; return reply; } });
 		const request = { startInput: { ...startInput(tool), sessionID: "session" },
 			data: { tools: new Map([["read", tool]]), schemaHashes: {}, prepareExecution },
 			settings: { ...settings(), resourceCacheMaxEntries: 4, predictionTimeoutMs: 1000 },
@@ -288,9 +289,7 @@ describe("speculative action host", () => {
 		expect(controller.snapshot().samples).toBe(4); // Utility evidence spans the session's prompts.
 		const valid = reply.content[0]!;
 		for (const [content, stopReason] of [
-			[[], "stop"], [[valid, valid], "toolUse"],
-			[[valid, { type: "toolCall", id: "disabled", name: "bash", arguments: {} }], "toolUse"],
-			[[], "error"], [[], "aborted"],
+			[[], "stop"], [[valid, valid], "toolUse"], [[], "error"], [[], "aborted"],
 		] as const) {
 			reply = assistant([...content], stopReason); // The session's gate state persists: probe replies with it disabled.
 			const proposal = controller.source.propose({ ...request, settings: { ...request.settings, sourceConfig: { drafterGateEnabled: false } } });
@@ -334,11 +333,7 @@ describe("speculative action host", () => {
 				const expected = resourceExecution ? toolName === "read" ? "two\nthree\nfour" : "notes.txt" : `${phase}:${toolName}`;
 				const { promise: gate, resolve: release } = deferred<void>();
 				const started = deferred<void>(), completed = deferred<void>(), adopted = deferred<void>();
-				const speculativeExecution = vi.fn(async () => {
-					started.resolve();
-					await gate;
-					return textResult(expected);
-				});
+				const speculativeExecution = vi.fn(async () => { started.resolve(); await gate; return textResult(expected); });
 				const actorExecution = vi.fn(async () => speculativeExecution());
 				const permissions: Array<{ args: unknown; action: { input: unknown } }> = [];
 				const prepareArguments = vi.fn((input: unknown) => {
@@ -1602,12 +1597,7 @@ describe("speculative action host", () => {
 			execute: async (_id, input) => { await new Promise((resolve) => setTimeout(resolve, 80)); return textResult(input.path); } };
 		const host = createSpeculativeActionHost("session", {
 			cwd,
-			getSettings: () => ({
-				...settings(1),
-				drafterEnabled: false,
-				maxConcurrentActions: 2,
-				selfSpeculation: selfSettings(),
-			}),
+			getSettings: () => ({ ...settings(1), drafterEnabled: false, maxConcurrentActions: 2, selfSpeculation: selfSettings() }),
 			actorForkPlanSource: actorForkPlans,
 			complete: async () => assistant([], "stop"),
 			preflight: async ({ args }) => {

@@ -121,10 +121,11 @@ export function createDrafterPlanSource(input: {
 			if (message.stopReason === "error" || message.stopReason === "aborted")
 				throw new Error(message.errorMessage ?? `Drafter stopped with ${message.stopReason}`);
 			const calls = message.content.filter((item): item is AgentToolCall => item.type === "toolCall");
-			if (!calls.length || calls.some((call) => !batch.tools.has(call.name)) ||
-				new Set(calls.map((call) => call.id)).size !== calls.length) return undefined;
+			// Calls to tools outside the prediction list drop out; the partial batch can no longer be continued as a whole.
+			const kept = calls.filter((call) => batch.tools.has(call.name));
+			if (!kept.length || new Set(calls.map((call) => call.id)).size !== calls.length) return undefined;
 			const feedback: DrafterPlanFeedback = { ...batch, kind: "drafter_plan", message, depth,
-				calls: new Map(calls.map((call, index) => [`${prefix}:${index}`, call])), results: new Map(), claimed: false };
+				calls: new Map(kept.map((call, index) => [`${prefix}:${index}`, call])), results: new Map(), claimed: kept.length < calls.length };
 			return { actions: [...feedback.calls].map(([id, call]): PlanAction => ({
 				id, type: "tool_call", tool: call.name, input: call.arguments, depth, feedback, dependsOn,
 				diagnostic: JSON.stringify({ toolCallID: call.id, tool: call.name, input: call.arguments }, null, 2),
