@@ -2293,10 +2293,10 @@ export function makeSpeculativeActionRuntime<
 		for (const peer of peers) {
 			if (requested.has(peer.id)) continue;
 			requested.add(peer.id);
-			const pending = requestContinuation(session, peer, parents, node.expectedDecisionSeq + 1, async (requestSignal) => {
+			const pending = requestContinuation(session, peer, parents, node.expectedDecisionSeq + 1, async (requestSignal, reportDraftTokens) => {
 				const signal = AbortSignal.any([requestSignal, ...parents.map((parent) => parent.admissionSignal)]);
 				if (signal.aborted) return undefined;
-				const update = await peer.continueFrom!({ ...turnContext(context), batch, signal });
+				const update = await peer.continueFrom!({ ...turnContext(context), batch, signal, reportDraftTokens });
 				return signal.aborted ? undefined : update;
 			}).catch(() => { /* Peer prediction cannot revoke the completed parent batch. */ });
 			trackSourceTask(session, pending);

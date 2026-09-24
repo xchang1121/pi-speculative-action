@@ -31,6 +31,7 @@ import {
 } from "./agent-runtime-types.ts";
 import type { PlanAction, PlanProposal } from "./plan-proposal.ts";
 import type { ActorActionFeedback } from "./runtime.ts";
+import { stableValueHash } from "./stable-value-hash.ts";
 
 interface DrafterBatch {
 	readonly model: Model<Api>;
@@ -216,6 +217,23 @@ export function createDrafterPlanSource(input: {
 			const draft = await completeDraft({ ...previous, context, options }, signal, reportDraftTokens, `rollout:${revision}`, previous.depth + 1,
 				[...previous.calls.keys()].map((actionID) => ({ actionID, condition: "execution_succeeded" })));
 			return draft && { proposalID, source: "drafter", revision, upsert: draft.actions };
+		},
+		// A peer's executed batch, such as a fork's early calls, rolls out as the Drafter's own does: its calls and results extend the Actor context.
+		continueFrom: async ({ startInput, settings, batch: peers, signal, reportDraftTokens }) => {
+			const prepared = await batches.get(agentBatchKey(startInput.sessionID, startInput.turnID))?.ready.catch(() => undefined);
+			const drafter = normalizeDrafterRequestSettings(settings.sourceConfig), ids = peers.map((_, index) => `peer:${index}`);
+			if (!prepared || signal.aborted) return undefined;
+			const zero = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, message: AssistantMessage = { role: "assistant", api: prepared.model.api,
+				provider: prepared.model.provider, model: prepared.model.id, stopReason: "toolUse", timestamp: Date.now(), usage: { ...zero, totalTokens: 0, cost: { ...zero, total: 0 } },
+				content: peers.map(({ candidate }, index) => ({ type: "toolCall", id: ids[index]!, name: candidate.tool, arguments: { ...candidate.input } })) };
+			const context: Context = { ...prepared.context, messages: [...prepared.context.messages, message, ...peers.map(({ candidate, output }, index): ToolResultMessage => ({
+				role: "toolResult", toolCallId: ids[index]!, toolName: candidate.tool, content: output.result.content, details: output.result.details, isError: output.isError, timestamp: Date.now() }))] };
+			const options = { ...prepared.options, temperature: drafterRequestTemperature(0, 1, drafter), maxTokens: drafter.drafterMaxTokens, toolChoice: "auto" as const };
+			if (!drafterContextFits(prepared.model, context, options.maxTokens)) return undefined;
+			const id = `drafter:peer:${stableValueHash(peers.map(({ identity }) => identity.id))}`;
+			const draft = await completeDraft({ ...prepared, context, options }, signal, reportDraftTokens, id, 1, peers.map(({ identity }) =>
+				({ proposalID: identity.proposalID, actionID: identity.actionID, identity: identity.id, condition: "execution_succeeded" as const })));
+			return draft && { id, source: "drafter", revision: 0, actions: draft.actions };
 		},
 	};
 
