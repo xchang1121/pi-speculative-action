@@ -1664,9 +1664,8 @@ describe("structural speculative runtime", () => {
 			await closing; await runtime.dispose();
 			expect(commit).toHaveBeenCalledTimes(1); expect(cleanup).toHaveBeenCalledTimes(1);
 			expect(continuation).not.toHaveBeenCalled();
-			if (phase !== "poisoned") expect(settlements).toEqual([expect.objectContaining({
-				match: expect.objectContaining({ matched: true, adoption: expect.objectContaining({ status: "adopted" }) }),
-			})]);
+			// A poisoned commit fails the Actor call, but its claim still settles instead of staying "matching" forever.
+			expect(settlements).toMatchObject([{ match: { matched: true, adoption: { status: phase === "poisoned" ? "rejected" : "adopted" } } }]);
 		} finally { gate.release(); await Promise.allSettled([consuming, closing]); await runtime.dispose(); }
 	});
 

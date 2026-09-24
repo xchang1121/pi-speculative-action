@@ -82,9 +82,7 @@ function concurrentLimit(settings: SpeculativeActionSettings): number {
 }
 
 function cacheEntryLimit(settings: SpeculativeActionSettings): number {
-	return Number.isFinite(settings.resourceCacheMaxEntries)
-		? Math.max(1, Math.floor(settings.resourceCacheMaxEntries))
-		: 1;
+	return Number.isFinite(settings.resourceCacheMaxEntries) ? Math.max(1, Math.floor(settings.resourceCacheMaxEntries)) : 1;
 }
 
 function cacheByteLimit(settings: SpeculativeActionSettings): number {
@@ -110,17 +108,13 @@ function forecastFor(
 ): PredictionForecast {
 	return {
 		tool: node.action.tool,
-		...(node.actionKey
-			? { executionFingerprint: node.actionKey.executionFingerprint, actionKeyHash: node.actionKey.hash }
-			: {}),
+		...(node.actionKey ? { executionFingerprint: node.actionKey.executionFingerprint, actionKeyHash: node.actionKey.hash } : {}),
 		...(node.action.expectedDurationMs !== undefined ? { expectedDurationMs: node.action.expectedDurationMs } : {}),
 		...(node.action.resourceDemand !== undefined ? { resourceDemand: node.action.resourceDemand } : {}),
 		decisionBatchesUntilCall: Math.max(0, node.expectedDecisionSeq - decisionSequence),
 		...(actorPhase ? { actorPhase } : {}),
 		criticalPathMs: node.criticalPathMs,
-		...(node.action.expectedLatencyBenefitMs !== undefined
-			? { expectedLatencyBenefitMs: node.action.expectedLatencyBenefitMs }
-			: {}),
+		...(node.action.expectedLatencyBenefitMs !== undefined ? { expectedLatencyBenefitMs: node.action.expectedLatencyBenefitMs } : {}),
 		...(node.action.background ? { background: true } : {}),
 		...((node.action.dependsOn?.length ?? 0) > 0 && (node.action.horizon ?? 0) <= 0
 			? { dependenciesResolved: true }
@@ -1894,6 +1888,7 @@ export function makeSpeculativeActionRuntime<
 			);
 		}
 
+		let matchingPredictions: ClaimedPrediction[] = [];
 		try {
 			if (!actualKey) {
 				const failure = cause("matching", "action_not_keyable");
@@ -1904,7 +1899,7 @@ export function makeSpeculativeActionRuntime<
 				return Object.freeze(prepared);
 			}
 
-			const matchingPredictions: ClaimedPrediction[] = predictionMatches(
+			matchingPredictions = predictionMatches(
 				state.session,
 				actualKey,
 				state.decisionSequence,
@@ -1974,9 +1969,14 @@ export function makeSpeculativeActionRuntime<
 				capturePreparationMs = Math.max(0, performance.now() - startedAt);
 			}
 			return Object.freeze(prepared);
+		} catch (error) {
+			if (isPoisonedEffectCommit(error)) throw error;
+			return Object.freeze(prepared); // Speculation failed after matching: the native run still settles and is recorded.
 		} finally {
 			abandonActorPreview(state, preview, actorAction.fallback.cause);
-			actorAction.deferToFallback();
+			// Claims still open after a throw settle as matched but not served, instead of staying "matching" forever.
+			const adoption = actorAction.deferToFallback(matchingPredictions.map(({ opportunity }) => opportunity.identity));
+			if (adoption) confirmPredictions(state.session, matchingPredictions, identity, adoption);
 		}
 	};
 
