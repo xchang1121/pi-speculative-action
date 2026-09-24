@@ -1886,7 +1886,7 @@ int main(void) {
 			});
 			branch = await forkReusableBash(fixture, {
 				label: "concurrency",
-				command: "set -e; /usr/bin/printf 'trace-root-fallback\\n'; mkdir barrier; barrier-worker barrier & first=$!; barrier-worker barrier & second=$!; wait \"$first\"; wait \"$second\"; redirect-worker | { read line; printf '%s\\n' \"$line\" > redirected.txt; printf '%s\\n' \"$line\"; }; " +
+				command: "set -e; /bin/bash -c '(/bin/sleep 0.05; echo x > escaped.txt) 2>/dev/null & exit 0'; /usr/bin/printf 'trace-root-fallback\\n'; mkdir barrier; barrier-worker barrier & first=$!; barrier-worker barrier & second=$!; wait \"$first\"; wait \"$second\"; redirect-worker | { read line; printf '%s\\n' \"$line\" > redirected.txt; printf '%s\\n' \"$line\"; }; " +
 					"/usr/bin/printf 'file-fallback\\n' > redirected-file.txt; /usr/bin/cat < redirected-file.txt; printf 'pipe-fallback\\n' | /usr/bin/cat; " + streamProbes + "; printf '%32768s:end' ''",
 				actionNamespace: "process-concurrency-test",
 				executionFingerprint,
@@ -1901,6 +1901,7 @@ int main(void) {
 			expect(branch.executionMetrics.reuse?.misses).toBeGreaterThanOrEqual(3);
 			expect(branch.executionMetrics.reuse?.bypasses).toBe(5); // Capture failure, internal pipeline and three unsupported stdio contexts.
 			expect(JSON.stringify(await branch.validate?.())).toContain("broker_bypass:redirect-worker:output_endpoint_mismatch");
+			expect(existsSync(path.join(fixture.workspace, "escaped.txt")), "an orphan outside the supervisor must not reach the source").toBe(false);
 			await branch.dispose();
 			branch = undefined;
 			for (const failure of ["spawn", "abort", "nested-abort", "nested-seal", "session-close"] as const) {
