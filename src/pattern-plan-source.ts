@@ -27,7 +27,7 @@ import {
 } from "./pattern-aware.ts";
 import type { PlanAction } from "./plan-proposal.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
-import type { SpeculativeActionSettings, SpeculativeCandidate } from "./runtime.ts";
+import type { ActorActionFeedback, SpeculativeActionSettings, SpeculativeCandidate } from "./runtime.ts";
 import { candidateExecutionMs, candidateToolNames } from "./runtime.ts";
 import { stableValueHash } from "./stable-value-hash.ts";
 import type { ToolSettlement } from "./tool-settlement.ts";
@@ -47,6 +47,7 @@ export interface PatternPlanSourceController {
 		settings: SpeculativeActionSettings,
 		terminal: boolean,
 	) => void;
+	readonly actorActionSettled: (feedback: ActorActionFeedback<string>) => void;
 	readonly finishSession: () => Promise<void>;
 	readonly dispose: () => Promise<void>;
 }
@@ -70,7 +71,7 @@ export function createPatternPlanSource({
 	const authoritativeBatches = new Map<string, Map<number, PatternAwareEventInput>>();
 	const revisions = new Map<string, number>();
 	const carriedPredictions = new Map<string, CarriedPrediction>();
-	const predictionBatches = new WeakMap<PatternPlanFeedback, CarriedPrediction>();
+	const predictionBatches = new WeakMap<PatternPlanFeedback, CarriedPrediction>(), served = new WeakSet<PatternPlanFeedback>();
 	// Capabilities stay in this session; the persisted Pattern store receives only real tool batches.
 	const operationBindings = new BoundedRecencyMap<string, ObservedOperation>(PATTERN_AWARE_DEFAULTS.maxPatterns);
 	let analysisTail: Promise<void> = Promise.resolve();
@@ -286,9 +287,7 @@ export function createPatternPlanSource({
 		onIssued: ({ feedback }) => {
 			if (lifecycle.sealed) return;
 			const context = asPatternPlanFeedback(feedback);
-			if (context?.operation) return;
-			if (context) context.store.issued(context.continuation);
-			for (const patternID of context?.patternIDs ?? []) context?.store.issued(patternID);
+			if (context && !context.operation) for (const support of [context.continuation, ...context.patternIDs]) context.store.issued(support);
 		},
 		onSettled: ({ feedback, settlement }) => {
 			if (lifecycle.sealed) return;
@@ -301,8 +300,7 @@ export function createPatternPlanSource({
 					operationBindings.get(context.operation.key) === context.operation) operationBindings.delete(context.operation.key);
 				return;
 			}
-			if (context) context.store.settled(context.continuation, settlement);
-			for (const patternID of context?.patternIDs ?? []) context?.store.settled(patternID, settlement);
+			if (context) for (const support of [context.continuation, ...context.patternIDs]) context.store.settled(support, settlement, served.has(context));
 		},
 		flush: () => lifecycle.run(() => flushStores()),
 	};
@@ -339,6 +337,10 @@ export function createPatternPlanSource({
 		source,
 		turnStarted: observeTurn,
 		turnFinished: observeTurn,
+		// Serving the Actor is recorded before the owning prediction settles, which credits it even when unmatched.
+		actorActionSettled: ({ settlement, candidateFeedback: feedback }) => {
+			if (settlement.provider.kind === "speculative" && asPatternPlanFeedback(feedback)) served.add(feedback as PatternPlanFeedback);
+		},
 		finishSession: () => lifecycle.run(async () => {
 			await lifecycle.drain();
 			revisions.clear();

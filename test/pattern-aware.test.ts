@@ -369,6 +369,18 @@ describe("PatternAware", () => {
 		);
 	});
 
+	test("credits an unmatched prediction whose candidate served the Actor instead of counting a miss", () => {
+		const store = patternStore({ minOccurrences: 2 }), predict = () => store.predict("probe").find((item) => item.patternID === "prefetch")!;
+		acceptPattern(store, { "0": 10 }, { id: "prefetch" });
+		store.observe(input("probe", "grep", { pattern: "TODO" }));
+		store.settled("prefetch", rejectedSettlement("freshness", "resource_changed"));
+		const before = predict();
+		store.settled("prefetch", unmatchedSettlement(), true);
+		expect(predict()).toMatchObject({ empiricalProbability: before.empiricalProbability, adoptionProbability: 2 / 3 });
+		store.settled("prefetch", unmatchedSettlement());
+		expect(predict().empiricalProbability).toBeLessThan(before.empiricalProbability);
+	});
+
 	test("lets recent gap behavior replace stale high-volume history", () => {
 		const store = patternStore({
 				maxFutureGap: 8,

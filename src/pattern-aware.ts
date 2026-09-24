@@ -580,11 +580,7 @@ export class PatternAwareStore {
 				);
 				const identity = action
 					? JSON.stringify({ actionKey: action.key, type: "tool_call" })
-					: stableStringify({
-							type: "tool_call",
-							tool: pattern.targetTool,
-							input: applied.input,
-						});
+					: stableStringify({ type: "tool_call", tool: pattern.targetTool, input: applied.input });
 				const group = groups.get(identity) ?? [];
 				// A pattern emits its variants together; aliases share one evidence weight.
 				const support = group.at(-1);
@@ -634,10 +630,7 @@ export class PatternAwareStore {
 			const mapperComplexity = Math.min(...ordered.map((item) => analyzeBindings(item.pattern.bindings).complexity));
 			const mapperConfidence = totalWeight / (totalWeight + mapperComplexity);
 			const expectedLatencyBenefitMs =
-				empiricalProbability *
-				adoptionProbability *
-				mapperConfidence *
-				Math.max(1, Math.max(0, expectedDurationMs));
+				empiricalProbability * adoptionProbability * mapperConfidence * Math.max(1, Math.max(0, expectedDurationMs));
 			const background = patterns.every((pattern) => {
 				const feedback = feedbackEvidence(pattern, this.clock, settings.decayHalfLifeEvents);
 				return pattern.occurrences < settings.minOccurrences || feedback.mismatched > feedback.matched;
@@ -829,7 +822,7 @@ export class PatternAwareStore {
 		if (typeof support === "string") this.persist();
 	}
 
-	settled(support: string | PatternAwareContinuation, settlement: PredictionSettlement) {
+	settled(support: string | PatternAwareContinuation, settlement: PredictionSettlement, served = false) {
 		const feedback = this.supportFeedback(support);
 		if (!feedback) return;
 		const recent = feedbackEvidence({ feedback }, this.clock, this.settings.decayHalfLifeEvents);
@@ -844,7 +837,8 @@ export class PatternAwareStore {
 		} else {
 			feedback.observed++;
 			if (!settlement.match.matched) {
-				feedback.recentMismatchedWeight++;
+				// Its candidate served a different Actor call through its inputs: useful, though not the call itself.
+				if (served) { feedback.adopted++; feedback.recentAdoptedWeight++; } else feedback.recentMismatchedWeight++;
 			} else {
 				feedback.matched++;
 				feedback.recentMatchedWeight++;
@@ -867,9 +861,7 @@ export class PatternAwareStore {
 	}
 
 	snapshot(): ReadonlyArray<PatternAwarePattern> {
-		return [...this.patterns.values()].map((pattern) =>
-			readonlyPattern(pattern, this.clock, this.settings.decayHalfLifeEvents),
-		);
+		return [...this.patterns.values()].map((pattern) => readonlyPattern(pattern, this.clock, this.settings.decayHalfLifeEvents));
 	}
 
 	recent(sessionID: string): ReadonlyArray<PatternAwareEvent> {
@@ -1323,11 +1315,7 @@ export async function acquirePatternAwareStore(
 		throw new Error("Pattern action semantics require an explicit namespace");
 	}
 	const semanticsKey = actionSemantics ? JSON.stringify(actionSemantics.namespace) : "default";
-	const file = configuredPersistenceFile(
-		patternAwarePersistenceFile(workspace, stateDirectory),
-		analyzerKey,
-		semanticsKey,
-	);
+	const file = configuredPersistenceFile(patternAwarePersistenceFile(workspace, stateDirectory), analyzerKey, semanticsKey);
 	const poolKey = `${file}\0${analyzerKey}\0${semanticsKey}`;
 	let pooled = stores.get(poolKey);
 	if (!pooled) {
@@ -1436,10 +1424,7 @@ export function projectPatternAwareObservation(
 		return copy ? Object.fromEntries(entries) : value;
 	};
 	const structured = project(structuredOutput(output)), uniquePaths = uniqueStrings(paths).sort();
-	return {
-		...(structured !== undefined ? { output: structured } : {}),
-		...(uniquePaths.length ? { outputPaths: uniquePaths } : {}),
-	};
+	return { ...(structured !== undefined ? { output: structured } : {}), ...(uniquePaths.length ? { outputPaths: uniquePaths } : {}) };
 }
 
 /** Derived state belongs to one analyzer; public helpers get a fresh scope for mutable caller data. */
@@ -1559,10 +1544,7 @@ class PatternBindingAnalysis {
 			if (selected >= 0) counts.set(selected, (counts.get(selected) ?? 0) + 1);
 		}
 		if (width <= 1 || counts.size === 0) return binding;
-		return {
-			...binding,
-			variantCounts: Object.fromEntries([...counts.entries()].map(([index, count]) => [String(index), count])),
-		};
+		return { ...binding, variantCounts: Object.fromEntries([...counts.entries()].map(([index, count]) => [String(index), count])) };
 	}
 
 	applyWeightedBindings(
@@ -1865,10 +1847,7 @@ function structuredOutput(value: unknown): unknown {
 			record.content.flatMap((item) => {
 				const content = asRecord(item);
 				if (content?.type !== "text" || typeof content.text !== "string") return [];
-				return content.text
-					.split(/\r?\n/)
-					.map((line) => line.trim())
-					.filter((line) => line.length >= 3 && !/\s/.test(line));
+				return content.text.split(/\r?\n/).map((line) => line.trim()).filter((line) => line.length >= 3 && !/\s/.test(line));
 			}),
 		);
 		return values.length ? { values } : undefined;

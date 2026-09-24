@@ -1346,9 +1346,11 @@ describe("speculative action host", () => {
 				const active = await patternStoreLease(cwd, older);
 				try { expect(active.store).toBe(oldStore); } finally { await active.release(); }
 			}
-			const before = oldStore.snapshot().find(pattern => pattern.id === patternID)!.feedback.observed;
+			const { observed, adopted } = oldStore.snapshot().find(pattern => pattern.id === patternID)!.feedback;
 			const settlement = { prediction: { id: "prediction", source: "pattern_aware", proposalID: plan.id, actionID: action.id },
 				observation: "observed" as const, actorAction: { id: "actor", sequence: 0, turnID: "turn-1" }, match: { matched: false as const } };
+			// Its candidate served the Actor's different call, so the miss is credited as an adoption.
+			controller.actorActionSettled({ sessionID: "probe", turnID: "turn-1", settlement: { provider: { kind: "speculative" } } as never, candidateFeedback: action.feedback });
 			await controller.source.onSettled!({ ...feedback, settlement });
 			await controller.finishSession(); await controller.dispose();
 			const closed = oldStore.snapshot();
@@ -1357,7 +1359,7 @@ describe("speculative action host", () => {
 			const fresh = await patternStoreLease(cwd, older);
 			try {
 				expect(fresh.store).not.toBe(oldStore);
-				expect(fresh.store.snapshot().find(pattern => pattern.id === patternID)!.feedback.observed).toBe(before + 1);
+				expect(fresh.store.snapshot().find(pattern => pattern.id === patternID)!.feedback).toMatchObject({ observed: observed + 1, adopted: adopted + 1 });
 			} finally { await fresh.release(); }
 		} finally { await controller.dispose(); await bootstrap.release(); await oldStore.flush(); }
 	});
