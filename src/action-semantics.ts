@@ -222,12 +222,20 @@ export const READ_RANGE_ACTION_KEY_PROJECTOR: ActionKeyProjector = ownActionKeyP
 // A static workspace tree is not their dependency closure or their isolation authority.
 const HOST_PROCESS_EFFECTS = effectRequirements("invocation.host_function", ...UNRESTRICTED_PROCESS_EFFECTS.capabilities);
 
+/** A command that finished within its timeout finishes, with the same output, under any longer or no timeout. */
+export const BASH_TIMEOUT_ACTION_KEY_PROJECTOR: ActionKeyProjector = ownActionKeyProjector({
+	id: "bash.timeout",
+	partition: bashTimeoutPartition,
+	project: (speculative, actor) => bashTimeoutCovers(speculative, actor) ? { action: actor, distance: 1 } : undefined,
+	canShareInFlight: bashTimeoutCovers,
+});
+
 export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry(([
 	{ tool: "read", effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS, resourceScope: "content", projectors: [READ_RANGE_ACTION_KEY_PROJECTOR] },
 	{ tool: "grep", effect: "unbounded", requirements: HOST_PROCESS_EFFECTS },
 	{ tool: "find", effect: "unbounded", requirements: HOST_PROCESS_EFFECTS },
 	{ tool: "ls", effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS, resourceScope: "entries" },
-	{ tool: "bash", effect: "unbounded", requirements: UNRESTRICTED_PROCESS_EFFECTS },
+	{ tool: "bash", effect: "unbounded", requirements: UNRESTRICTED_PROCESS_EFFECTS, projectors: [BASH_TIMEOUT_ACTION_KEY_PROJECTOR] },
 	{ tool: "write", effect: "workspace_mutation", requirements: WORKSPACE_PATH_MUTATION_EFFECTS },
 	{ tool: "edit", effect: "workspace_mutation", requirements: WORKSPACE_PATH_MUTATION_EFFECTS },
 ] satisfies Omit<ActionSemanticsDefinition, "epoch" | "canonicalize">[]).map((definition): ActionSemanticsDefinition => ({
@@ -453,6 +461,15 @@ function canonicalPiAction(tool: string, input: unknown, cwd: string): Canonical
 	if (resource === undefined || ((tool === "write" || tool === "edit") && resource === ".")) return undefined;
 	fields.path = resource;
 	return { resources: [resource], input: fields };
+}
+
+function bashTimeoutPartition(action: ActionKey): string | undefined {
+	return action.tool === "bash" ? JSON.stringify([action.semanticsEpoch, action.schemaHash, action.executionFingerprint, action.resources, action.input.command, action.input.cwd]) : undefined;
+}
+
+function bashTimeoutCovers(speculative: ActionKey, actor: ActionKey): boolean {
+	const limit = (action: ActionKey) => typeof action.input.timeout === "number" ? action.input.timeout : Number.POSITIVE_INFINITY;
+	return bashTimeoutPartition(speculative) !== undefined && bashTimeoutPartition(speculative) === bashTimeoutPartition(actor) && limit(actor) >= limit(speculative);
 }
 
 function readProjectionPartition(action: ActionKey): string | undefined {

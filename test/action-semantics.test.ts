@@ -8,6 +8,7 @@ import {
 	actionKeyCovers,
 	actionKeyMatch,
 	actionKeyMismatchReason,
+	BASH_TIMEOUT_ACTION_KEY_PROJECTOR,
 	buildActionKey,
 	buildPiActionKey,
 	KEYABLE_TOOLS,
@@ -17,6 +18,7 @@ import {
 	UNBOUNDED_ACTION_TOOLS,
 	WORKSPACE_MUTATION_ACTION_TOOLS,
 } from "../src/action-semantics.ts";
+import { PI_BASH_TIMEOUT_PROJECTION_RULE } from "../src/pi-tool-invocation.ts";
 import {
 	RESOURCE_OBSERVATION_EFFECTS,
 	UNRESTRICTED_PROCESS_EFFECTS,
@@ -31,18 +33,9 @@ describe("ActionSemanticsRegistry", () => {
 		expect(WORKSPACE_MUTATION_ACTION_TOOLS).toEqual(["write", "edit"]);
 		expect(UNBOUNDED_ACTION_TOOLS).toEqual(["grep", "find", "bash"]);
 
-		expect(PI_ACTION_SEMANTICS.definition("read")).toMatchObject({
-			effect: "observation",
-			resourceScope: "content",
-		});
-		expect(PI_ACTION_SEMANTICS.definition("ls")).toMatchObject({
-			effect: "observation",
-			resourceScope: "entries",
-		});
-		expect(PI_ACTION_SEMANTICS.definition("bash")).toMatchObject({
-			effect: "unbounded",
-			requirements: UNRESTRICTED_PROCESS_EFFECTS,
-		});
+		expect(PI_ACTION_SEMANTICS.definition("read")).toMatchObject({ effect: "observation", resourceScope: "content" });
+		expect(PI_ACTION_SEMANTICS.definition("ls")).toMatchObject({ effect: "observation", resourceScope: "entries" });
+		expect(PI_ACTION_SEMANTICS.definition("bash")).toMatchObject({ effect: "unbounded", requirements: UNRESTRICTED_PROCESS_EFFECTS });
 		expect(PI_ACTION_SEMANTICS.definition("write")).toMatchObject({
 			effect: "workspace_mutation",
 			requirements: WORKSPACE_PATH_MUTATION_EFFECTS,
@@ -55,12 +48,7 @@ describe("ActionSemanticsRegistry", () => {
 		const explicit = buildPiActionKey("ls", { path: ".", limit: 500 }, "/workspace");
 
 		expect(implicit?.key).toBe(explicit?.key);
-		expect(implicit).toMatchObject({
-			tool: "ls",
-			semanticsEpoch: "pi.ls",
-			resources: ["."],
-			input: { path: ".", limit: 500 },
-		});
+		expect(implicit).toMatchObject({ tool: "ls", semanticsEpoch: "pi.ls", resources: ["."], input: { path: ".", limit: 500 } });
 		expect(buildPiActionKey("ls", { path: "../outside" }, "/workspace")).toBeUndefined();
 		expect(buildPiActionKey("ls", { path: "..cache" }, "/workspace")).toBeDefined();
 		if (process.platform === "win32") for (const [cwd, target] of [["c:\\Work", "C:\\Work\\a.ts"], ["C:\\Work", "c:/Work/a.ts"], ["C:\\Work", "/c/Work/a.ts"]])
@@ -75,28 +63,29 @@ describe("ActionSemanticsRegistry", () => {
 
 	it("keeps read's omitted-limit view distinct inside its versioned K(a)", () => {
 		const implicit = buildPiActionKey("read", { path: "src/a.ts" }, "/workspace", "schema-base");
-		const explicit = buildPiActionKey(
-			"read",
-			{ path: "src/a.ts", offset: 1, limit: 2000 },
-			"/workspace",
-			"schema-base",
-		);
+		const explicit = buildPiActionKey("read", { path: "src/a.ts", offset: 1, limit: 2000 }, "/workspace", "schema-base");
 
 		expect(implicit?.key).not.toBe(explicit?.key);
 		const relation = implicit && explicit ? actionKeyMatch(implicit, explicit, [READ_RANGE_ACTION_KEY_PROJECTOR]) : undefined;
 		expect(relation).toMatchObject({ kind: "projected", projector: "read.range" });
-		expect(implicit).toMatchObject({
-			tool: "read",
-			semanticsEpoch: "pi.read",
-			schemaHash: "schema-base",
-			resources: ["src/a.ts"],
-		});
+		expect(implicit).toMatchObject({ tool: "read", semanticsEpoch: "pi.read", schemaHash: "schema-base", resources: ["src/a.ts"] });
 		expect(implicit?.input).not.toHaveProperty("limit");
 		expect(explicit?.input).toHaveProperty("limit", 2000);
 		expect(implicit?.key).toContain('"semanticsEpoch":"pi.read"');
 		expect(Object.isFrozen(implicit)).toBe(true);
 		expect(Object.isFrozen(implicit?.input)).toBe(true);
 		expect(Object.isFrozen(implicit?.resources)).toBe(true);
+	});
+
+	it("projects a finished Bash command onto any longer or absent timeout", async () => {
+		const key = (timeout?: number, command = "npm test") => buildPiActionKey("bash", { command, ...(timeout === undefined ? {} : { timeout }) }, "/workspace")!;
+		const match = (speculative?: number, actor?: number) => actionKeyMatch(key(speculative), key(actor), [BASH_TIMEOUT_ACTION_KEY_PROJECTOR])?.kind;
+		expect([match(60, 120), match(60, undefined), match(120, 60), match(undefined, 60), match(undefined, undefined)]).toEqual(["projected", "projected", undefined, undefined, "exact"]);
+		expect(actionKeyMatch(key(60), key(120, "npm run build"), [BASH_TIMEOUT_ACTION_KEY_PROJECTOR])).toBeUndefined();
+		const passed = { result: { content: [{ type: "text" as const, text: "pass" }], details: undefined }, isError: false }, failed = { ...passed, isError: true };
+		expect([passed, failed].map((output) => PI_BASH_TIMEOUT_PROJECTION_RULE.captureCoverage!(key(60), output))).toEqual([true, undefined]);
+		expect(await PI_BASH_TIMEOUT_PROJECTION_RULE.projectOutput!({ speculative: key(60), actor: key(120), output: passed, coverage: true,
+			keyMatch: { kind: "projected", projector: "bash.timeout", distance: 1 } })).toBe(passed);
 	});
 
 	it("fails closed instead of folding unsupported numeric query views into valid keys", () => {
@@ -125,15 +114,8 @@ describe("ActionSemanticsRegistry", () => {
 		expect(actionKeyMatch(base, buildActionKey({
 			...base, input: { ...base.input, fields: { "e\u0301": 1, "\u00e9": 2 } },
 		}))).toMatchObject({ kind: "exact", distance: 0 });
-		const sameEnvelope = buildActionKey({
-			...base,
-			resources: ["a.ts"],
-			input: { path: "a.ts", offset: 2 },
-		});
-		expect(actionKeyMatch(base, sameEnvelope, [permissive])).toMatchObject({
-			kind: "projected",
-			projector: "permissive",
-		});
+		const sameEnvelope = buildActionKey({ ...base, resources: ["a.ts"], input: { path: "a.ts", offset: 2 } });
+		expect(actionKeyMatch(base, sameEnvelope, [permissive])).toMatchObject({ kind: "projected", projector: "permissive" });
 		const covering = { ...permissive, id: "covering", canShareInFlight: () => true };
 		expect(actionKeyCovers(base, sameEnvelope, [permissive])).toBe(false);
 		expect(actionKeyCovers(base, sameEnvelope, [permissive, covering])).toBe(true);
@@ -197,12 +179,7 @@ describe("ActionSemanticsRegistry", () => {
 		const key = registry.buildKey("stat", { path: "a.ts" }, "/workspace", "schema")!;
 		expect(resourceDependencies(key, "/workspace", registry)).toEqual([{ path: path.resolve("/workspace/a.ts"), scope: "tree_entries" }]);
 		expect(resourceDependencies({ ...key, tool: "custom_write" }, "/workspace", registry)).toEqual([]);
-		expect(key).toMatchObject({
-			tool: "stat",
-			input: { path: "a.ts" },
-			resources: ["a.ts"],
-			semanticsEpoch: "host.stat",
-		});
+		expect(key).toMatchObject({ tool: "stat", input: { path: "a.ts" }, resources: ["a.ts"], semanticsEpoch: "host.stat" });
 		expect(registry.buildKey("unknown", {}, "/workspace")).toBeUndefined();
 	});
 
