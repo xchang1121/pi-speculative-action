@@ -30,6 +30,7 @@ import { LinuxProcessReuseBackend } from "../src/linux-process-backend.ts";
 import type { ProcessExecutionRequest } from "../src/process-execution.ts";
 import * as piTools from "../src/pi-tool-invocation.ts";
 import type { PiToolDefinition } from "../src/pi-tool-invocation.ts";
+import { SelfSpeculationCoordinator } from "../src/self-speculation.ts";
 import type { SpeculativeActionPackageSettings } from "../src/settings-store.ts";
 import type { ToolSettlement } from "../src/tool-settlement.ts";
 import { TimelineInterval } from "../src/task-timing.ts";
@@ -114,6 +115,13 @@ describe("zero-modification Pi extension", () => {
 		await fixture.emit("session_start");
 		expect([fixture.drafterModel(actor), fixture.drafterModel(actor), fixture.drafterModel(actor)]).toEqual([actor, actor, actor]);
 		expect(fixture.ui.notify.mock.calls.filter(([, level]) => level === "warning")).toEqual([["Drafter model missing/model is unavailable; drafting with the active model.", "warning"]]);
+	});
+
+	it("ends fork probing when Pi finalizes an assistant message", async () => {
+		const fixture = await createFixture(), finish = vi.spyOn(SelfSpeculationCoordinator.prototype, "finishActorOutput");
+		await fixture.emit("session_start");
+		for (const role of ["user", "assistant"]) await fixture.emit("message_end", { message: { role } });
+		expect(finish).toHaveBeenCalledOnce();
 	});
 
 	it("keeps same-name extension tools authoritative and excludes them from speculation", async () => {

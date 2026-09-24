@@ -134,10 +134,7 @@ const DRAFTER_TEMPERATURE_INPUT = settingInput<readonly [number, number]>(
 		const [lower, upper, ...extra] = input.split(",").map((item) => Number(item.trim()));
 		return extra.length === 0 && Number.isFinite(lower) && Number.isFinite(upper) && lower >= 0 && upper >= lower
 			? { ok: true, value: [lower, upper] as const }
-			: {
-					ok: false,
-					error: "Drafter temperature range must be two non-negative comma-separated numbers in ascending order.",
-				};
+			: { ok: false, error: "Drafter temperature range must be two non-negative comma-separated numbers in ascending order." };
 	},
 );
 
@@ -184,15 +181,9 @@ export function normalizeSpeculativeActionSettings(
 		...(typeof input?.draftModel === "string" && input.draftModel.trim()
 			? { draftModel: input.draftModel.trim() }
 			: {}),
-		executionStoreMaxEntries: positiveInteger(
-			input?.executionStoreMaxEntries,
-			DEFAULT_PROVENANCE_STORE_LIMITS.maxCertificates,
-		),
+		executionStoreMaxEntries: positiveInteger(input?.executionStoreMaxEntries, DEFAULT_PROVENANCE_STORE_LIMITS.maxCertificates),
 		executionStoreMaxBytes: positiveInteger(input?.executionStoreMaxBytes, DEFAULT_PROVENANCE_STORE_LIMITS.maxBytes),
-		executionRouting: {
-			primary: input?.executionRouting?.primary !== false,
-			nativeFallback: input?.executionRouting?.nativeFallback !== false,
-		},
+		executionRouting: { primary: input?.executionRouting?.primary !== false, nativeFallback: input?.executionRouting?.nativeFallback !== false },
 	} as const;
 }
 
@@ -258,10 +249,7 @@ export function createSpeculativeActionExtension(
 			controller = await installController(ctx, pi, dependencies, wrapperSources, providerRequest);
 			controller.attachUI(ctx.ui);
 		}));
-		pi.on("context", async (event, ctx) => {
-			actorStream.clear();
-			await controller?.startTurn(event.messages, ctx);
-		});
+		pi.on("context", async (event, ctx) => { actorStream.clear(); await controller?.startTurn(event.messages, ctx); });
 		pi.on("message_update", (event, ctx) => {
 			controller?.observeActorOutput(event.assistantMessageEvent);
 			for (const preview of actorStream.observe(event.assistantMessageEvent)) {
@@ -272,12 +260,9 @@ export function createSpeculativeActionExtension(
 				}
 			}
 		});
-		pi.on("turn_end", async () => {
-			await controller?.finishTurn(false);
-		});
-		pi.on("agent_end", async () => {
-			await controller?.finishTurn(true);
-		});
+		pi.on("message_end", (event) => { if (event.message.role === "assistant") controller?.finishActorOutput(); });
+		pi.on("turn_end", async () => { await controller?.finishTurn(false); });
+		pi.on("agent_end", async () => { await controller?.finishTurn(true); });
 		pi.on("session_shutdown", (_event, ctx) => sessions.run(async () => {
 			ctx.ui.setStatus(STATUS_KEY, undefined);
 			const current = controller;
@@ -402,10 +387,7 @@ async function installController(
 			: currentSettings.executionRouting.nativeFallback);
 	const configureExecutionStorage = () => {
 		for (const world of executionWorlds)
-			world.storage?.configure({
-				maxEntries: currentSettings.executionStoreMaxEntries,
-				maxBytes: currentSettings.executionStoreMaxBytes,
-			});
+			world.storage?.configure({ maxEntries: currentSettings.executionStoreMaxEntries, maxBytes: currentSettings.executionStoreMaxBytes });
 	};
 	configureExecutionStorage();
 	let executionDiagnostics: readonly ExecutionWorldDiagnosticSnapshot[] = [];
@@ -441,14 +423,8 @@ async function installController(
 		currentSettings, baseDefinitions.keys(), toolConflicts, executionRoutes(),
 		closedSearchEnabled() ? search?.profile?.invocations : undefined,
 	);
-	const runtimeSettings = () => ({
-		...currentSettings,
-		tools: predictionTools(currentSettings, baseDefinitions.keys()),
-	});
-	const visibleMetrics = (): SpeculativeActionMetrics => ({
-		...currentMetrics,
-		actorProcessReuse: processBackend.actorMetrics(),
-	});
+	const runtimeSettings = () => ({ ...currentSettings, tools: predictionTools(currentSettings, baseDefinitions.keys()) });
+	const visibleMetrics = (): SpeculativeActionMetrics => ({ ...currentMetrics, actorProcessReuse: processBackend.actorMetrics() });
 	function renderFooter(): void {
 		if (!ui) return;
 		ui.setStatus(
@@ -583,11 +559,7 @@ async function installController(
 					.getActiveTools()
 					.map((name) => agentTools.get(name))
 					.filter((tool): tool is AgentTool => tool !== undefined);
-				const actorContext = {
-					systemPrompt: nextContext.getSystemPrompt(),
-					messages: convertToLlm(messages),
-					tools: [...turnTools],
-				};
+				const actorContext = { systemPrompt: nextContext.getSystemPrompt(), messages: convertToLlm(messages), tools: [...turnTools] };
 				await host.startTurn(
 					{
 						turnID: currentTurnID,
@@ -617,6 +589,7 @@ async function installController(
 		},
 		decorateActorPayload: (payload: unknown) => selfSpeculation.decorateActorPayload(payload),
 		observeActorOutput: (event: Parameters<SelfSpeculationCoordinator["observeActorOutput"]>[0]) => selfSpeculation.observeActorOutput(event),
+		finishActorOutput: () => selfSpeculation.finishActorOutput(),
 		selfSpeculationSnapshot: () => selfSpeculation.snapshot(),
 		finishTurn: async (terminal = false) => {
 			const turnID = currentTurnID ?? (terminal ? lastTurnID : undefined);
@@ -804,10 +777,7 @@ async function openSettings(ctx: ExtensionContext, controller: SpeculativeAction
 			draft = structuredClone(normalizeSpeculativeActionSettings(value));
 		},
 	};
-	const reload = () => {
-		applied = structuredClone(controller.editableSettings());
-		draft = structuredClone(applied);
-	};
+	const reload = () => { applied = structuredClone(controller.editableSettings()); draft = structuredClone(applied); };
 	while (true) {
 		const dirty = !isDeepStrictEqual(draft, applied);
 		const toolPolicy = toolPolicyCounts(draft, controller.registeredTools());

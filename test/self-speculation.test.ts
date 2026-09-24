@@ -574,6 +574,21 @@ describe("self-speculation control plane", () => {
 		await coordinator.dispose();
 	});
 
+	it("settles fork probing empty when the Actor's text-only message ends", async () => {
+		const actorForkPlans = createActorForkPlanSource({ maxAttempts: 3, retryStreamUpdates: 1 }), { promise: forkGate, resolve: releaseFork } = deferred();
+		const coordinator = coordinatorFixture([], { forkTransport: "sidecar" }, ["actor-request"], async (request) => {
+			if (request.path === SELF_SPECULATION_DEFAULTS.forkPath) await forkGate;
+			return request.path === SELF_SPECULATION_DEFAULTS.forkPath ? forkReceipt("read", { path: "late.txt" }) : {};
+		}, actorForkPlans);
+		coordinator.startTurn("turn-1", model(), context(), 1);
+		const pending = actorForkPlans.waitForBatches("turn-1", new AbortController().signal);
+		coordinator.decorateActorPayload({ prompt: "P" });
+		coordinator.observeActorOutput(delta("text_delta", "answer"));
+		coordinator.finishActorOutput();
+		expect(await pending).toEqual([]);
+		releaseFork(); await coordinator.dispose();
+	});
+
 	it("waits for an in-flight sidecar fork before clearing its request", async () => {
 		const requests: CapturedRequest[] = [];
 		const { promise: forkGate, resolve: releaseFork } = deferred();
