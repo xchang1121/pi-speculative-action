@@ -223,44 +223,13 @@ export const READ_RANGE_ACTION_KEY_PROJECTOR: ActionKeyProjector = ownActionKeyP
 const HOST_PROCESS_EFFECTS = effectRequirements("invocation.host_function", ...UNRESTRICTED_PROCESS_EFFECTS.capabilities);
 
 export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry(([
-	{
-		tool: "read",
-		effect: "observation",
-		requirements: RESOURCE_OBSERVATION_EFFECTS,
-		resourceScope: "content",
-		projectors: [READ_RANGE_ACTION_KEY_PROJECTOR],
-	},
-	{
-		tool: "grep",
-		effect: "unbounded",
-		requirements: HOST_PROCESS_EFFECTS,
-	},
-	{
-		tool: "find",
-		effect: "unbounded",
-		requirements: HOST_PROCESS_EFFECTS,
-	},
-	{
-		tool: "ls",
-		effect: "observation",
-		requirements: RESOURCE_OBSERVATION_EFFECTS,
-		resourceScope: "entries",
-	},
-	{
-		tool: "bash",
-		effect: "unbounded",
-		requirements: UNRESTRICTED_PROCESS_EFFECTS,
-	},
-	{
-		tool: "write",
-		effect: "workspace_mutation",
-		requirements: WORKSPACE_PATH_MUTATION_EFFECTS,
-	},
-	{
-		tool: "edit",
-		effect: "workspace_mutation",
-		requirements: WORKSPACE_PATH_MUTATION_EFFECTS,
-	},
+	{ tool: "read", effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS, resourceScope: "content", projectors: [READ_RANGE_ACTION_KEY_PROJECTOR] },
+	{ tool: "grep", effect: "unbounded", requirements: HOST_PROCESS_EFFECTS },
+	{ tool: "find", effect: "unbounded", requirements: HOST_PROCESS_EFFECTS },
+	{ tool: "ls", effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS, resourceScope: "entries" },
+	{ tool: "bash", effect: "unbounded", requirements: UNRESTRICTED_PROCESS_EFFECTS },
+	{ tool: "write", effect: "workspace_mutation", requirements: WORKSPACE_PATH_MUTATION_EFFECTS },
+	{ tool: "edit", effect: "workspace_mutation", requirements: WORKSPACE_PATH_MUTATION_EFFECTS },
 ] satisfies Omit<ActionSemanticsDefinition, "epoch" | "canonicalize">[]).map((definition): ActionSemanticsDefinition => ({
 	...definition,
 	epoch: `pi.${definition.tool}`,

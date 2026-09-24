@@ -1,4 +1,4 @@
-import { nonNegativeFinite as metric } from "./number-utils.ts";
+import { finiteNumber, nonNegativeFinite as metric } from "./number-utils.ts";
 import type { SpeculativeActionEvent, SpeculativeCacheSnapshot } from "./events.ts";
 import { emptyWorldReuseMetrics, type WorldReuseMetrics } from "./execution-world.ts";
 import type { ResolutionCause } from "./settlement.ts";
@@ -94,7 +94,7 @@ export function reduceSpeculativeTrace<SessionID>(
 			next.toolExecutionMs += metric(event.timing.toolExecutionMs);
 			next.serializedMs += metric(event.timing.serializedMs);
 			next.hiddenLatencyMs += metric(event.timing.hiddenLatencyMs);
-			next.estimatedSavingsMs += metric(event.timing.estimatedSavingsMs);
+			next.estimatedSavingsMs += finiteNumber(event.timing.estimatedSavingsMs) ?? 0; // Signed: speculation can cost time.
 			break;
 		case "source_request":
 			next.sourceRequests++;

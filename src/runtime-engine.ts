@@ -1869,6 +1869,7 @@ export function makeSpeculativeActionRuntime<
 						attemptLeadMs: Math.max(0, actorArrivedAt - candidate.attemptStartedAt),
 						hitLatencyMs: Math.max(0, performance.now() - actorArrivedAt),
 						...(join.expectedActorMs === undefined ? {} : { expectedActorMs: join.expectedActorMs }),
+						...(join.expectedNativeMs === undefined ? {} : { expectedNativeMs: join.expectedNativeMs }),
 					},
 					toolExecution,
 					...(projection.execution ? { projection: projection.execution } : {}),
@@ -1938,7 +1939,7 @@ export function makeSpeculativeActionRuntime<
 				}); } finally { inputs.dispose(); }
 			},
 			settle: (toolExecution, output, operations) => state.session.lifecycle.track(
-				settleActorCall(state, input, actualCall, actorAction, output, capturePreparationMs, toolExecution, operations && Object.freeze([...operations]))),
+				settleActorCall(state, input, actualCall, actorAction, output, capturePreparationMs, toolExecution, operations && Object.freeze([...operations]), actorArrivedAt)),
 		};
 		const onActorActionMaterialized = adapter.onActorActionMaterialized;
 		if (actualKey && onActorActionMaterialized) {
@@ -2094,6 +2095,7 @@ export function makeSpeculativeActionRuntime<
 		capturePreparationMs: number,
 		toolExecution: TimelineInterval,
 		operations?: readonly ExecutionOperationBinding[],
+		actorArrivedAt = toolExecution.startedAt,
 	): Promise<void> => {
 		if (!state.actorActions.delete(actorAction)) return;
 		const settlementStartedAt = performance.now();
@@ -2113,9 +2115,11 @@ export function makeSpeculativeActionRuntime<
 		} else if (capture) {
 			state.session.lifecycle.release(capture);
 		}
-		// Compare complete alternatives; optional capture waits belong to the native path.
-		if (key) state.session.scheduler.observeActorService(actionTimingIdentity(key),
-			durationMs + capturePreparationMs + Math.max(0, performance.now() - settlementStartedAt));
+		// Compare complete alternatives; optional capture waits belong to the native path, not the native reference.
+		const settledMs = Math.max(0, performance.now() - settlementStartedAt);
+		if (key) state.session.scheduler.observeActorService(actionTimingIdentity(key), durationMs + capturePreparationMs + settledMs, durationMs);
+		// Matching, failed joins, capture and settlement are what speculation cost this native call.
+		state.session.timeline?.recordOverhead(toolExecution.startedAt - actorArrivedAt + settledMs);
 	};
 
 	const queueActorSettlement = (
