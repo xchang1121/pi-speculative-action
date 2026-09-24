@@ -33,6 +33,8 @@ npm run bench:exec-boundary -- --reporter=json --outputFile=/tmp/exec-boundary.j
 npm run bench:overlay-probe
 ```
 
+在 Windows 上可用 `wsl.exe -e bash -lc 'bash "$(wslpath "<checkout>")/scripts/wsl-verify.sh" [vitest 参数]'`：它把当前 HEAD 与未提交修改同步到 WSL 原生文件系统的克隆中，在隔离 HOME 中构建本机助手后运行测试（`PI_SPEC_WSL_WORK`/`PI_SPEC_WSL_CHECKOUT`/`PI_SPEC_WSL_HOME` 可改位置）。
+
 `PI_SPEC_SANDLOCK`、`PI_SPEC_HELD_EXEC` 可指定已经验证匹配的 binary。exec 入口直接运行进程测试，输出 Vitest 报告，检查真实退出、描述符、输出与文件效果、跨父命令 completed/running 接管、一次消费及改变输入后的回退。场景与日常测试共用，不再维护另一套运行器或组件计时报告。OverlayFS 入口复用生产驱动的能力、隔离和回收测试，缺少能力时保留跳过原因；它不代替完整进程资格。
 
 失败时保留原错误和最小复现信息；时钟证明拒绝不能通过延长等待或跳过检查消除。
