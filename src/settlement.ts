@@ -121,6 +121,8 @@ export interface SettledSourceRequest {
 	readonly startedAt: number;
 	readonly durationMs: number;
 	readonly settlement: SourceRequestSettlement;
+	/** Provider tokens reported by the time the request settled. */
+	readonly draftTokens?: number;
 }
 
 export interface CandidateRejection {

@@ -109,8 +109,8 @@ export function createDrafterPlanSource(input: {
 		// Model/auth failures are already represented by source request events.
 		void batch?.ready.then((value) => { if (value) gate.finish(value.utility); }).catch(() => {});
 	};
-	const completeDraft = async (batch: DrafterBatch, signal: AbortSignal, prefix: string,
-		depth = 0, dependsOn?: PlanAction["dependsOn"]) => {
+	const completeDraft = async (batch: DrafterBatch, signal: AbortSignal, report: ((tokens: number) => void) | undefined,
+		prefix: string, depth = 0, dependsOn?: PlanAction["dependsOn"]) => {
 		signal.throwIfAborted();
 		gate.requestStarted(batch.utility);
 		const startedAt = performance.now();
@@ -118,6 +118,7 @@ export function createDrafterPlanSource(input: {
 		try {
 			const { options } = batch, forced = options.toolChoice === "required" ? { onPayload: forceToolChoice(options.onPayload) } : {};
 			const message = await input.complete(batch.model, batch.context, { ...options, ...forced, signal });
+			report?.(calculateContextTokens(message.usage));
 			if (message.stopReason === "error" || message.stopReason === "aborted")
 				throw new Error(message.errorMessage ?? `Drafter stopped with ${message.stopReason}`);
 			const calls = message.content.filter((item): item is AgentToolCall => item.type === "toolCall");
@@ -128,7 +129,7 @@ export function createDrafterPlanSource(input: {
 			return { actions: [...feedback.calls].map(([id, call]): PlanAction => ({
 				id, type: "tool_call", tool: call.name, input: call.arguments, depth, feedback, dependsOn,
 				diagnostic: JSON.stringify({ toolCallID: call.id, tool: call.name, input: call.arguments }, null, 2),
-			})), draftTokens: calculateContextTokens(message.usage) };
+			})) };
 		} catch (error) {
 			failed = !signal.aborted;
 			throw error;
@@ -162,15 +163,7 @@ export function createDrafterPlanSource(input: {
 		proposalCount: (settings) => clampCandidateLimit(settings.candidateLimit ?? DEFAULTS.candidateLimit),
 		concurrentProposalPolicy: (settings) =>
 			clampCandidateLimit(settings.candidateLimit ?? DEFAULTS.candidateLimit) === 2 ? "first_produced" : "all",
-		propose: async ({
-			startInput,
-			data,
-			candidateNames,
-			proposalIndex,
-			proposalCount,
-			signal,
-			settings,
-		}): Promise<PlanProposal | undefined> => {
+		propose: async ({ startInput, data, candidateNames, proposalIndex, proposalCount, signal, settings, reportDraftTokens }): Promise<PlanProposal | undefined> => {
 			if (signal.aborted) return undefined;
 			const drafter = normalizeDrafterRequestSettings(settings.sourceConfig);
 			const batchKey = agentBatchKey(startInput.sessionID, startInput.turnID);
@@ -223,11 +216,11 @@ export function createDrafterPlanSource(input: {
 					cacheRetention: prepared.options.cacheRetention ?? "short",
 				};
 				if (!prepared.utility.startedRequests) data.prepareExecution?.(candidateNames, batch.signal);
-				const draft = await completeDraft({ ...prepared, options: draftOptions }, signal, String(proposalIndex));
+				const draft = await completeDraft({ ...prepared, options: draftOptions }, signal, reportDraftTokens, String(proposalIndex));
 				return draft && { id: `drafter:${startInput.turnID}:${proposalIndex}`, source: "drafter", revision: 0, ...draft };
 			});
 		},
-		continue: async ({ proposalID, revision, feedback, signal }) => {
+		continue: async ({ proposalID, revision, feedback, signal, reportDraftTokens }) => {
 			const previous = asDrafterPlanFeedback(feedback);
 			if (!previous || signal.aborted || previous.claimed || previous.results.size !== previous.calls.size) return undefined;
 			previous.claimed = true;
@@ -238,9 +231,9 @@ export function createDrafterPlanSource(input: {
 			};
 			const options = { ...previous.options, toolChoice: "auto" as const };
 			if (!drafterContextFits(previous.model, context, options.maxTokens)) return undefined;
-			const draft = await completeDraft({ ...previous, context, options }, signal, `rollout:${revision}`, previous.depth + 1,
+			const draft = await completeDraft({ ...previous, context, options }, signal, reportDraftTokens, `rollout:${revision}`, previous.depth + 1,
 				[...previous.calls.keys()].map((actionID) => ({ actionID, condition: "execution_succeeded" })));
-			return draft && { proposalID, source: "drafter", revision, upsert: draft.actions, draftTokens: draft.draftTokens };
+			return draft && { proposalID, source: "drafter", revision, upsert: draft.actions };
 		},
 	};
 

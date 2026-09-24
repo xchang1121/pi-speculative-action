@@ -231,7 +231,7 @@ export function formatSpeculativeActionStatus(input: {
 		metrics.tasks > 0
 			? `Task timing (${metrics.tasks} completed): ${formatTaskTiming(metrics)}. Estimated savings are optimistic, not a measured no-speculation comparison.`
 			: "Task timing: n/a (no completed task); serialized overlap and speedup are not reported as 0.",
-		`Draft tokens: ${metrics.totalDraftTokens}`,
+		`Drafter tokens (input + output, every request): ${metrics.totalDraftTokens}`,
 		`Live speculative results: ${cache.resultEntries}/${cache.cacheCapacity}, ${formatBytes(cache.resultBytes)}/${formatBytes(cache.cacheByteCapacity ?? 0)}; cold: ${cache.cacheCold}; hot: ${cache.cacheHot}; jobs: ${cache.inFlightJobs}; branches: ${cache.branchEntries} (${formatBytes(cache.branchBytes)})`,
 	].join("\n");
 }

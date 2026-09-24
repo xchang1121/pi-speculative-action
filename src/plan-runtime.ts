@@ -149,7 +149,6 @@ type MutablePlan = {
 	source: string;
 	revision: number;
 	nextRevision: number;
-	draftTokens: number;
 	nodes: Map<string, MutableNode>;
 	graph: PlanGraph;
 };
@@ -224,11 +223,7 @@ export class PlanRuntime {
 		const ordered = dependencyOrder(actions, (dependency) =>
 			dependency.proposalID !== id && this.parent(id, dependency) !== undefined);
 		if (!ordered) return { accepted: false, reason: "invalid_dependency" };
-		return this.commit({
-			id, source: owned.source, revision: owned.revision,
-			draftTokens: (proposal ? 0 : current!.draftTokens) + finiteMetric(owned.draftTokens),
-			actions, upserted, ordered, anchorDecisionSeq,
-		});
+		return this.commit({ id, source: owned.source, revision: owned.revision, actions, upserted, ordered, anchorDecisionSeq });
 	}
 
 	plan(proposalID: string): MaterializedPlan | undefined {
@@ -399,7 +394,6 @@ export class PlanRuntime {
 		readonly id: string;
 		readonly source: string;
 		readonly revision: number;
-		readonly draftTokens: number;
 		readonly actions: ReadonlyMap<string, PlanAction>;
 		readonly upserted: readonly PlanAction[];
 		readonly ordered: readonly PlanAction[];
@@ -450,7 +444,6 @@ export class PlanRuntime {
 			source: input.source,
 			revision: input.revision,
 			nextRevision: Math.max(current?.nextRevision ?? 0, input.revision + 1),
-			draftTokens: input.draftTokens,
 			nodes,
 			graph,
 		};
@@ -677,7 +670,6 @@ function planSnapshot(plan: MutablePlan): MaterializedPlan {
 		source: plan.source,
 		revision: plan.revision,
 		actions: Object.freeze([...plan.nodes.values()].map((node) => node.action)),
-		draftTokens: plan.draftTokens,
 	});
 }
 

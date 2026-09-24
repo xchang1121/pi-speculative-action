@@ -891,14 +891,14 @@ export function makeSpeculativeActionRuntime<
 					state.generation.signal,
 				);
 				if (!slot) break;
-				const pending = requestSource({ ...turnContext(state), session: state.session, slot }, source, (signal) =>
+				const pending = requestSource({ ...turnContext(state), session: state.session, slot }, source, (signal, reportDraftTokens) =>
 					source.propose({
 						...turnContext(state),
 						definitions: state.definitions,
 						candidateNames: state.candidateNames,
 						proposalIndex: index,
 						proposalCount: count,
-						signal,
+						signal, reportDraftTokens,
 					}));
 				trackSourceTask(state.session, pending);
 			}
@@ -909,17 +909,21 @@ export function makeSpeculativeActionRuntime<
 	const requestSource = (
 		scope: PlanAdmissionScope<SessionID, Output, StartInput, StateData>,
 		source: Source,
-		produce: (signal: AbortSignal) => ReturnType<NonNullable<Source["continue"]>>,
+		produce: (signal: AbortSignal, reportDraftTokens: (tokens: number) => void) => ReturnType<NonNullable<Source["continue"]>>,
 	): Promise<void> => {
 		const { session, slot } = scope;
 		session.pendingSourceRequests++;
+		// Tokens count when spent: empty, failed, aborted and never-admitted requests cost the same as productive ones.
+		let draftTokens = 0;
+		const reportDraftTokens = (tokens: number) => { const spent = finiteMetric(tokens); draftTokens += spent; session.tokenTotal += spent; };
 		return runSourceRequest({
 			request: slot.request,
 			generation: slot.generation,
 			timeoutMs: source.timeoutMs?.(scope.settings),
-			produce: (signal) => trackSourceTask(session, Promise.resolve(produce(signal))),
+			produce: (signal) => trackSourceTask(session, Promise.resolve(produce(signal, reportDraftTokens))),
 			count: (value) => asUpdates(value).length,
-		}).then(async (request) => {
+		}).then(async (settled) => {
+			const request = { ...settled, draftTokens };
 			session.pendingSourceRequests = Math.max(0, session.pendingSourceRequests - 1);
 			try {
 				queueSourceRequestEvent(session, slot.request.turnID, scope.settings, request);
@@ -964,11 +968,9 @@ export function makeSpeculativeActionRuntime<
 		const { session } = scope;
 		if (session.lifecycle.sealed || !scope.slot.generation.active) return;
 		if (update.source !== source.id) return;
-		const draftTokens = finiteMetric(update.draftTokens);
 		const applied = session.plan.apply(update, session.decisionSequence);
 		if (!applied.accepted) return;
 		for (const retired of applied.retired) retirePlanAction(session, retired, cause("plan", "superseded"));
-		session.tokenTotal += draftTokens;
 		const materializations: Promise<void>[] = [];
 		for (const action of applied.upserted) {
 			const node = session.plan.get(applied.plan.id, action.id);
@@ -985,7 +987,7 @@ export function makeSpeculativeActionRuntime<
 					...turnContext(scope),
 					attemptStartedAt: request?.startedAt ?? performance.now(),
 					predictionLatencyMs: request?.durationMs ?? 0,
-					draftTokens,
+					draftTokens: request?.draftTokens ?? 0,
 					totalDraftTokens: session.tokenTotal,
 					draft: planActionDraft(node),
 					admissionSignal: AbortSignal.any([scope.slot.generation.signal, admissionController.signal]),
@@ -2309,14 +2311,14 @@ export function makeSpeculativeActionRuntime<
 				: current.expectedDecisionSeq;
 		const targetDecisionSequence = parentDecisionSequence + 1;
 		const pending = context.continuationTail
-			.then(() => requestContinuation(session, source, [context], targetDecisionSequence, (signal) => {
+			.then(() => requestContinuation(session, source, [context], targetDecisionSequence, (signal, reportDraftTokens) => {
 				const revision = session.plan.reserveRevision(node.proposalID);
 				if (revision === undefined) return undefined;
 				return source.continue!({
 					...turnContext(context),
 					candidate: predictionCandidate(candidate, node), ...(adoptedAction ? { adoptedAction } : {}),
 					proposalID: node.proposalID, actionID: node.action.id, revision,
-					feedback: context.feedback, output, trigger, signal,
+					feedback: context.feedback, output, trigger, signal, reportDraftTokens,
 				});
 			}))
 			.catch(() => {
@@ -2331,7 +2333,7 @@ export function makeSpeculativeActionRuntime<
 		source: Source,
 		parents: readonly PlanActionContext<StartInput, StateData>[],
 		targetDecisionSequence: number,
-		produce: (signal: AbortSignal) => ReturnType<NonNullable<Source["continue"]>>,
+		produce: Parameters<typeof requestSource>[2],
 	): Promise<void> => {
 		const context = parents[0]!;
 		if (session.lifecycle.sealed || targetDecisionSequence <= session.decisionSequence || parents.some(({ identity }) =>
@@ -2925,7 +2927,9 @@ export function makeSpeculativeActionRuntime<
 	): void => {
 		if (adapter.onEvent) session.events.enqueue({
 			type: "source_request", ...eventEnvelope(session, turnID, settings),
-			request: { request: result.request, startedAt: result.startedAt, durationMs: result.durationMs, settlement: result.settlement },
+			request: { request: result.request, startedAt: result.startedAt, durationMs: result.durationMs, settlement: result.settlement,
+				...(result.draftTokens ? { draftTokens: result.draftTokens } : {}) },
+			totalDraftTokens: session.tokenTotal,
 		});
 	};
 

@@ -108,8 +108,7 @@ describe("PlanRuntime", () => {
 		const offered = { ...action("keyed"), background: true, feedback };
 		const peer = { ...action("peer"), dependsOn: [{ actionID: "keyed" }] };
 		const update = kind === "proposal"
-			? { ...proposal([offered, peer]), draftTokens: 3 }
-			: { proposalID: "plan", source: "source", revision: 2, upsert: [offered, peer], remove: [] as string[], draftTokens: 3 };
+			? { ...proposal([offered, peer]) } : { proposalID: "plan", source: "source", revision: 2, upsert: [offered, peer], remove: [] as string[] };
 		let path = "keyed.ts", reads = 0;
 		offered.input = {
 			get path() {
@@ -119,7 +118,7 @@ describe("PlanRuntime", () => {
 				peer.dependsOn[0]!.actionID = "missing";
 				update.remove?.push("retained");
 				Object.assign(update, {
-					[kind === "proposal" ? "id" : "proposalID"]: "drifted", source: "drifted", revision: -1, draftTokens: 99,
+					[kind === "proposal" ? "id" : "proposalID"]: "drifted", source: "drifted", revision: -1,
 				});
 				return path;
 			},
@@ -131,7 +130,7 @@ describe("PlanRuntime", () => {
 		expect(Object.isFrozen(captured.update)).toBe(true);
 		expect(plan.apply(captured.update, 0)).toMatchObject({
 			accepted: true,
-			plan: { id: "plan", source: "source", revision: kind === "proposal" ? 1 : 2, draftTokens: 3 },
+			plan: { id: "plan", source: "source", revision: kind === "proposal" ? 1 : 2 },
 		});
 		const capturedAction = "actions" in captured.update ? captured.update.actions[0] : captured.update.upsert![0];
 		expect(plan.get("plan", "keyed")?.action).toBe(capturedAction);

@@ -548,15 +548,10 @@ describe("structural speculative runtime", () => {
 		const settlements: PredictionSettlement[] = [];
 		const issued = vi.fn(), admitted = vi.fn();
 		const actionKey = vi.fn((tool: string, args: unknown) => buildPiActionKey(tool, args, "/workspace"));
-		const offered = { ...plan("stale", {}), draftTokens: 3 };
-		offered.actions[0]!.input = {
-			get path() {
-				offered.draftTokens = 99;
-				return "README.md";
-			},
-		};
+		const offered = plan("stale", {});
+		offered.actions[0]!.input = { path: "README.md" };
 		const source = planSource({
-			propose: () => offered,
+			propose: ({ reportDraftTokens }) => { reportDraftTokens?.(3); return offered; },
 			onIssued: issued, onAdmitted: admitted,
 			onSettled: ({ settlement }) => {
 				settlements.push(settlement);

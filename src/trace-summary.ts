@@ -98,6 +98,7 @@ export function reduceSpeculativeTrace<SessionID>(
 			break;
 		case "source_request":
 			next.sourceRequests++;
+			next.totalDraftTokens = Math.max(next.totalDraftTokens, metric(event.totalDraftTokens));
 			next.sourceOutcomes = increment(current.sourceOutcomes, event.request.settlement.status);
 			break;
 		case "prediction": {
