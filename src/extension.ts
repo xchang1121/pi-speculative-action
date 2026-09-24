@@ -53,18 +53,9 @@ import {
 import { DEFAULT_PROVENANCE_STORE_LIMITS } from "./reuse-store.ts";
 import type { SpeculativeActionEvent } from "./runtime.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
-import {
-	nonEmptyTextInput,
-	nonNegativeIntegerInput,
-	nonNegativeNumberInput,
-	optionalPositiveIntegerInput,
-	optionalTextInput,
-	positiveIntegerInput,
-	positiveInteger,
-	probabilityInput,
-	settingInput,
-	type SettingInputDescriptor,
-} from "./setting-input.ts";
+import { nonEmptyTextInput, nonNegativeIntegerInput, nonNegativeNumberInput, optionalPositiveIntegerInput, optionalTextInput,
+	positiveIntegerInput, positiveInteger, probabilityInput, settingInput, type SettingInputDescriptor } from "./setting-input.ts";
+import { errorMessage } from "./error-utils.ts";
 import {
 	SelfSpeculationCoordinator,
 	type SelfSpeculationCoordinatorSnapshot,
@@ -99,7 +90,7 @@ const ROOT_SETTING_INPUTS = {
 	resourceCacheMaxBytes: mebibyteInput("Live result memory"),
 	executionStoreMaxEntries: positiveIntegerInput("Reusable command history entries"),
 	executionStoreMaxBytes: mebibyteInput("Reusable command history memory"),
-	predictionTimeoutMs: nonNegativeIntegerInput("Prediction wait limit (ms)"),
+	predictionTimeoutMs: positiveIntegerInput("Prediction wait limit (ms)"),
 	drafterMaxTokens: optionalPositiveIntegerInput("Maximum Drafter output tokens (blank for provider default)"),
 	drafterMaxDepth: nonNegativeIntegerInput("Drafter follow-up tool steps"),
 	drafterDeterministicCandidates: nonNegativeIntegerInput("Temperature-0 Drafter candidates"),
@@ -561,8 +552,7 @@ async function installController(
 		},
 		setSettings: async (value: SpeculativeActionPackageSettings | undefined) => {
 			const previous = currentSettings;
-			if (value)
-				settingsStore.setEffective(value, normalizeSpeculativeActionSettings(settingsStore.editable("global")));
+			if (value) settingsStore.setEffective(value, normalizeSpeculativeActionSettings(settingsStore.scope === "project" ? settingsStore.editable("global") : undefined));
 			else settingsStore.clear();
 			currentSettings = normalizeSpeculativeActionSettings(settingsStore.effective());
 			configureExecutionStorage();
@@ -573,6 +563,7 @@ async function installController(
 				previous.executionRouting.primary !== currentSettings.executionRouting.primary ||
 				previous.executionRouting.nativeFallback !== currentSettings.executionRouting.nativeFallback,
 			));
+			await settingsStore.flush(); // Applied for this session either way; callers report whether it was saved.
 		},
 		attachUI: (nextUI: ExtensionUIContext) => {
 			ui = nextUI;
@@ -779,8 +770,8 @@ async function runCommand(
 	}
 	const command = args.trim().toLowerCase();
 	if (command === "on" || command === "off") {
-		await controller.setSettings({ ...controller.settings(), enabled: command === "on" });
-		ctx.ui.notify(`Speculative action ${command === "on" ? "enabled" : "disabled"}.`, "info");
+		const saved = await controller.setSettings({ ...controller.editableSettings(), enabled: command === "on" }).then(() => "", (error: unknown) => ` (not saved: ${errorMessage(error)})`);
+		ctx.ui.notify(`Speculative action ${controller.settings().enabled ? "enabled" : "disabled"}${controller.settings().enabled === (command === "on") ? "" : " by the active project settings"}${saved}.`, saved ? "warning" : "info");
 		return;
 	}
 	if (command === "reset") {
@@ -837,9 +828,9 @@ async function openSettings(ctx: ExtensionContext, controller: SpeculativeAction
 			["Advanced settings › tuning, decoding, scheduling, storage", () => openAdvancedSettings(ctx, editor)],
 			[`Apply changes${dirty ? " (pending)" : ""}`, async () => {
 				if (!dirty) return ctx.ui.notify("No pending speculative-action changes.", "info");
-				await controller.setSettings(draft);
+				const saved = await controller.setSettings(draft).then(() => true, (error: unknown) => void ctx.ui.notify(`Speculative-action settings apply to this session but were not saved: ${errorMessage(error)}`, "error"));
 				reload();
-				ctx.ui.notify("Speculative-action settings applied.", "info");
+				if (saved) ctx.ui.notify("Speculative-action settings applied.", "info");
 			}],
 		]);
 		if (dirty) actions.set("Discard changes", () => { draft = structuredClone(applied); });
@@ -850,23 +841,10 @@ async function openSettings(ctx: ExtensionContext, controller: SpeculativeAction
 		actions.set("Recent events", () => showRecentEvents(ctx, controller));
 		actions.set("Restore defaults", async () => {
 			if (!await ctx.ui.confirm("Restore defaults?", "Restore tuning values while keeping the main switch and prediction-source choices?")) return;
-			const defaults = normalizeSpeculativeActionSettings(undefined);
-			await editor.setSettings({
-				...defaults,
-				enabled: draft.enabled,
-				drafterEnabled: draft.drafterEnabled,
-				patternAware: {
-					...defaults.patternAware,
-					enabled: draft.patternAware.enabled,
-					multiStepEnabled: draft.patternAware.multiStepEnabled,
-				},
-				selfSpeculation: {
-					...defaults.selfSpeculation,
-					enabled: draft.selfSpeculation.enabled,
-					forkEnabled: draft.selfSpeculation.forkEnabled,
-					forkActionEnabled: draft.selfSpeculation.forkActionEnabled,
-				},
-			});
+			const defaults = normalizeSpeculativeActionSettings(undefined), { patternAware: pattern, selfSpeculation: probe } = draft;
+			await editor.setSettings({ ...defaults, enabled: draft.enabled, drafterEnabled: draft.drafterEnabled,
+				patternAware: { ...defaults.patternAware, enabled: pattern.enabled, multiStepEnabled: pattern.multiStepEnabled },
+				selfSpeculation: { ...defaults.selfSpeculation, enabled: probe.enabled, forkEnabled: probe.forkEnabled, forkActionEnabled: probe.forkActionEnabled } });
 		});
 		const choice = await ctx.ui.select("Speculative action", [...actions.keys(), CLOSE]);
 		if (!choice || choice === CLOSE) {
