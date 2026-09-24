@@ -78,12 +78,7 @@ function readAction<Input>(
 }
 
 function plan(proposalID: string, input: Record<string, unknown> = { path: "README.md" }) {
-	return {
-		id: proposalID,
-		source: "source",
-		revision: 0,
-		actions: [readAction("next", input, { feedback: proposalID })],
-	};
+	return { id: proposalID, source: "source", revision: 0, actions: [readAction("next", input, { feedback: proposalID })] };
 }
 
 function childPlanUpdate(
@@ -604,23 +599,12 @@ describe("structural speculative runtime", () => {
 		const validate = vi.fn((version: unknown) =>
 			version
 				? validResource()
-				: {
-						status: "indeterminate" as const,
-						cause: cause("freshness", "resource_version_missing"),
-						metrics: zeroValidationMetrics(),
-					},
+				: { status: "indeterminate" as const, cause: cause("freshness", "resource_version_missing"), metrics: zeroValidationMetrics() },
 		);
 		const source = planSource({
 			propose: () => plan("in-flight"),
 		});
-		const { runtime } = harness({
-			source,
-			capture: () => {
-				captureStarted.arrive();
-				return captured.promise;
-			},
-			validate,
-		});
+		const { runtime } = harness({ source, capture: () => { captureStarted.arrive(); return captured.promise; }, validate });
 		await runtime.startTurn(start("turn"));
 		await captureStarted.promise;
 
@@ -654,13 +638,7 @@ describe("structural speculative runtime", () => {
 			observesOperations: true,
 			observe: () => undefined,
 		});
-		const { runtime, events, ready: candidateReady } = harness({
-			source,
-			execute: async () => {
-				await gate.wait();
-				return "learned";
-			},
-		});
+		const { runtime, events, ready: candidateReady } = harness({ source, execute: async () => { await gate.wait(); return "learned"; } });
 
 		await runtime.startTurn(start("calibration"));
 		const calibration = call("calibration");
@@ -682,12 +660,7 @@ describe("structural speculative runtime", () => {
 			events.find(
 				(event) => event.type === "actor_action" && event.turnID === "prediction",
 			),
-		).toMatchObject({
-			settlement: {
-				provider: { kind: "actor" },
-				rejections: [{ cause: { code: "candidate_join_deadline" } }],
-			},
-		});
+		).toMatchObject({ settlement: { provider: { kind: "actor" }, rejections: [{ cause: { code: "candidate_join_deadline" } }] } });
 		enabled = false;
 		await runtime.startTurn(start("retained"));
 		expect(await runtime.prepareActorCall(call("retained"))).toMatchObject({ output: "learned", observeOperations: false });
@@ -1064,6 +1037,25 @@ describe("structural speculative runtime", () => {
 				expect((await runtime.prepareActorCall(next))?.output).toBe("speculative");
 			}
 		} finally { await runtime.dispose(); admission.mockRestore(); }
+	});
+
+	it("re-arms a preempted future prediction so it relaunches once capacity returns", async () => {
+		const executed: string[] = [], farStarted = barrier(), release = deferred<void>();
+		const { runtime } = harness({ settings: () => ({ ...settings, maxConcurrentActions: 1 }),
+			source: planSource({ propose: () => ({ id: "far", source: "source", revision: 0, actions: [readAction("far", { path: "far.ts" }, { horizon: 1 })] }) }),
+			peers: [{ id: "peer", enabled: () => true, propose: async () => { await farStarted.promise; return { id: "near", source: "peer", revision: 0, actions: [readAction("near", { path: "near.ts" })] }; } }],
+			execute: async (_tool, input, signal) => {
+				const path = String(input.path); executed.push(path);
+				if (executed.length === 1) { farStarted.arrive(); await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true })); }
+				if (path === "near.ts") await release.promise;
+				return path;
+			} });
+		try {
+			await runtime.startTurn(start("turn"));
+			await vi.waitFor(() => expect(executed).toEqual(["far.ts", "near.ts"]));
+			release.resolve();
+			await vi.waitFor(() => expect(executed).toEqual(["far.ts", "near.ts", "far.ts"]));
+		} finally { release.resolve(); await runtime.dispose(); }
 	});
 
 	it("holds speculative capacity through cancellation and cleanup, but never queues the actual Actor behind it", async () => {
@@ -2279,14 +2271,7 @@ describe("structural speculative runtime", () => {
 			continue: async ({ proposalID, revision, trigger }) => {
 				if (trigger !== "actor_adopted") return undefined;
 				await gate.wait();
-				return {
-					proposalID,
-					source: "source",
-					revision,
-					upsert: [
-						readAction("child", { path: "child.ts" }),
-					],
-				};
+				return { proposalID, source: "source", revision, upsert: [ readAction("child", { path: "child.ts" })] };
 			},
 			onSettled: ({ settlement }) => {
 				settlements.push(settlement);
@@ -2304,13 +2289,7 @@ describe("structural speculative runtime", () => {
 		await runtime.startTurn(start("parallel-continuation"));
 		await parentReady.promise;
 
-		const parent = {
-			sessionID: "session",
-			turnID: "parallel-continuation",
-			id: "parent-call",
-			tool: "read",
-			input: { path: "parent.ts" },
-		};
+		const parent = { sessionID: "session", turnID: "parallel-continuation", id: "parent-call", tool: "read", input: { path: "parent.ts" } };
 		expect((await runtime.prepareActorCall(parent))?.output).toBe("parent.ts:output");
 		await gate.entered;
 

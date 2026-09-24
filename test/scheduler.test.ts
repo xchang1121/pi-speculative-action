@@ -353,6 +353,7 @@ describe("SpeculationScheduler", () => {
 			scheduler.admit(far, [forecast({ decisionBatchesUntilCall: 4, criticalPathMs: 10 })], 2);
 			const victim = joined ? near : far;
 			expect(scheduler.preemptFor(1, 2, (job) => !joined || job !== far)).toEqual([victim]);
+			expect(scheduler.preemptFor(1, 2, () => true, (job) => job === victim)).toEqual([]); // Draining units are about to return.
 			expect(scheduler.snapshot().map((entry) => entry.job)).toEqual([near, far]);
 			expect(scheduler.admit(next, [forecast()], 2).admitted).toBe(false);
 			scheduler.complete(victim);

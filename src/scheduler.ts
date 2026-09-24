@@ -199,8 +199,10 @@ export class SpeculationScheduler<Job extends object> {
 		resourceUnits: number,
 		capacity: number,
 		canPreempt: (job: Job) => boolean = () => true,
+		/** Cancelled work still draining returns its units soon: never a reason to cancel one more victim. */
+		releasing: (job: Job) => boolean = () => false,
 	): readonly Job[] {
-		const remaining = [...this.entries.values()];
+		const remaining = [...this.entries.values()].filter((entry) => !releasing(entry.job));
 		const victims: Job[] = [];
 		while (!fitsResourceBudget(remaining, resourceUnits, capacity)) {
 			const victim = remaining .filter((entry) => canPreempt(entry.job)) .sort(compareVictim)[0];
