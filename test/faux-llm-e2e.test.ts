@@ -38,7 +38,7 @@ describe("faux LLM speculative action end to end", () => {
 		});
 		expect(result.streamEvents).toEqual(expect.arrayContaining(["thinking_delta", "toolcall_delta"]));
 		expect(result.summary).toMatchObject({ tasks: 1, actorActions: 5, speculativeHits: 5, exactReuseHits: 5, actorFallbacks: 0,
-			sourceRequests: 6, sourceOutcomes: { produced: 5 },
+			sourceRequests: 6, sourceOutcomes: { produced: 5 }, predictionsBySource: { drafter: [5, 5, 5] }, actorActionsByTool: { read: [5, 5] },
 			predictionsSettled: 5, predictionsObserved: 5, predictionsMatched: 5, predictionsAdopted: 5, predictionPrecision: 1, adoptionYield: 1,
 			candidateStarted: 5, candidateSucceeded: 5, cache: { resultEntries: 5, cacheCold: 0, cacheHot: 5 } });
 		expect(result.executions).toEqual({ read: 5 });
@@ -114,7 +114,7 @@ describe("faux LLM speculative action end to end", () => {
 			expect(result.actorFallbacks).toEqual(["read"]);
 			expect(result.executions.read).toBe(mode === "candidate error" ? 2 : 1);
 			expect(result.outputs).toEqual([textResult("one\ntwo\nthree\n")]);
-			if (mode === "draft error") expect(result.summary.sourceOutcomes.error).toBeGreaterThanOrEqual(1);
+			if (mode === "draft error") expect(result.summary).toMatchObject({ sourceOutcomes: { error: 1 }, lastSourceFailure: expect.stringMatching(/^drafter source:producer_error .*mock stream disconnected/) });
 			if (mode === "candidate error") expect(result.summary.candidateFailed).toBe(1);
 		}
 	});

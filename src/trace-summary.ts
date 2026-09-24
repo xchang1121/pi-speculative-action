@@ -6,41 +6,25 @@ import type { ResolutionCause } from "./settlement.ts";
 export type SpeculativeTraceSummary = Readonly<ReturnType<typeof emptySpeculativeTraceSummary>>;
 
 const EMPTY_CACHE: SpeculativeCacheSnapshot = {
-	cacheCapacity: 0,
-	cacheByteCapacity: 0,
-	cacheCold: 0,
-	cacheHot: 0,
-	inFlightJobs: 0,
-	resultEntries: 0,
-	resultBytes: 0,
-	branchEntries: 0,
-	branchBytes: 0,
-	exclusiveCandidates: 0,
-	sharedCandidates: 0,
-	cacheTools: [],
-	cacheExecutions: [],
+	cacheCapacity: 0, cacheByteCapacity: 0, cacheCold: 0, cacheHot: 0, inFlightJobs: 0, resultEntries: 0, resultBytes: 0,
+	branchEntries: 0, branchBytes: 0, exclusiveCandidates: 0, sharedCandidates: 0, cacheTools: [], cacheExecutions: [],
 };
 
 export function emptySpeculativeTraceSummary(cache: SpeculativeCacheSnapshot | Pick<SpeculativeCacheSnapshot, "cacheCapacity" | "cacheByteCapacity"> = EMPTY_CACHE) {
 	return {
 		sourceRequests: 0,
 		sourceOutcomes: {} as Readonly<Record<string, number>>,
-		predictionsSettled: 0,
-		predictionsObserved: 0,
-		predictionsMatched: 0,
-		predictionsAdopted: 0,
-		predictionPrecision: 0,
-		adoptionYield: 0,
+		lastSourceFailure: undefined as string | undefined,
+		predictionsSettled: 0, predictionsObserved: 0, predictionsMatched: 0, predictionsAdopted: 0, predictionPrecision: 0, adoptionYield: 0,
+		predictionsBySource: {} as Readonly<Record<string, readonly number[]>>, // [observed, matched, adopted]
 		predictionUnobserved: {} as Readonly<Record<string, number>>,
 		predictionRejectedAfterMatch: {} as Readonly<Record<string, number>>,
 		operationPredictionsSettled: 0,
 		operationPredictionsAdopted: 0,
-		candidateStarted: 0,
-		candidateSucceeded: 0,
-		candidateFailed: 0,
-		candidateCancelled: 0,
+		candidateStarted: 0, candidateSucceeded: 0, candidateFailed: 0, candidateCancelled: 0,
 		candidateTerminalCauses: {} as Readonly<Record<string, number>>,
 		actorActions: 0,
+		actorActionsByTool: {} as Readonly<Record<string, readonly number[]>>, // [actions, reused]
 		speculativeHits: 0,
 		exactReuseHits: 0, // Adopted identical K(a) results.
 		inputReuseHits: 0, // Current tool semantics evaluated over another execution's sealed inputs.
@@ -50,21 +34,8 @@ export function emptySpeculativeTraceSummary(cache: SpeculativeCacheSnapshot | P
 		actorFallbacks: 0,
 		hitRate: 0,
 		actorCandidateRejections: {} as Readonly<Record<string, number>>,
-		tasks: 0,
-		endToEndMs: 0,
-		nonToolMs: 0,
-		actorPhaseMs: 0,
-		orchestrationMs: 0,
-		toolExecutionMs: 0,
-		serializedMs: 0,
-		hiddenLatencyMs: 0,
-		estimatedSavingsMs: 0,
-		speculativeExecutionMs: 0,
-		actorExecutionMs: 0,
-		executionAheadMs: 0,
-		attemptLeadMs: 0,
-		hitLatencyMs: 0,
-		totalDraftTokens: 0,
+		tasks: 0, endToEndMs: 0, nonToolMs: 0, actorPhaseMs: 0, orchestrationMs: 0, toolExecutionMs: 0, serializedMs: 0, hiddenLatencyMs: 0, estimatedSavingsMs: 0,
+		speculativeExecutionMs: 0, actorExecutionMs: 0, executionAheadMs: 0, attemptLeadMs: 0, hitLatencyMs: 0, totalDraftTokens: 0,
 		processReuse: emptyWorldReuseMetrics(), // Inside speculative worlds, never the Actor route.
 		cache: cloneCache({ ...EMPTY_CACHE, ...cache }),
 	};
@@ -100,6 +71,10 @@ export function reduceSpeculativeTrace<SessionID>(
 			next.sourceRequests++;
 			next.totalDraftTokens = Math.max(next.totalDraftTokens, metric(event.totalDraftTokens));
 			next.sourceOutcomes = increment(current.sourceOutcomes, event.request.settlement.status);
+			if (event.request.settlement.status === "error" || event.request.settlement.status === "timeout") {
+				const { cause } = event.request.settlement;
+				next.lastSourceFailure = `${event.request.request.source} ${causeKey(cause)}${cause.detail ? ` ${cause.detail.slice(0, 200)}` : ""}`;
+			}
 			break;
 		case "prediction": {
 			next.predictionsSettled++;
@@ -109,6 +84,8 @@ export function reduceSpeculativeTrace<SessionID>(
 				break;
 			}
 			next.predictionsObserved++;
+			next.predictionsBySource = tally(current.predictionsBySource, settlement.prediction.source, true, settlement.match.matched,
+				settlement.match.matched && settlement.match.adoption.status === "adopted");
 			if (!settlement.match.matched) break;
 			next.predictionsMatched++;
 			if (settlement.match.adoption.status === "adopted") next.predictionsAdopted++;
@@ -136,6 +113,7 @@ export function reduceSpeculativeTrace<SessionID>(
 			break;
 		case "actor_action":
 			next.actorActions++;
+			next.actorActionsByTool = tally(current.actorActionsByTool, event.settlement.tool, true, event.settlement.provider.kind === "speculative");
 			if (event.settlement.rejections.length) {
 				const counts = { ...current.actorCandidateRejections };
 				for (const rejection of event.settlement.rejections) {
@@ -196,6 +174,11 @@ function causeKey(cause: ResolutionCause): string {
 
 function ratio(numerator: number, denominator: number): number {
 	return denominator > 0 ? numerator / denominator : 0;
+}
+
+/** Parallel counters per key: each flag increments its own position. */
+function tally(target: Readonly<Record<string, readonly number[]>>, key: string, ...flags: boolean[]): Record<string, readonly number[]> {
+	return { ...target, [key]: flags.map((flag, index) => (target[key]?.[index] ?? 0) + Number(flag)) };
 }
 
 function increment(target: Readonly<Record<string, number>>, key: string): Record<string, number> {
