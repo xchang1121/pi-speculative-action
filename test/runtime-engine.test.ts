@@ -1369,6 +1369,31 @@ describe("structural speculative runtime", () => {
 		expect(dispose).toHaveBeenCalledOnce();
 	});
 
+	it("keeps running work through an unbounded native call and adopts it after validation", async () => {
+		const started = deferred<void>(), release = deferred<void>();
+		const { runtime, executions } = harness({ actionKey: (tool, args) => buildPiActionKey(tool, args, process.cwd()),
+			source: planSource({ propose: () => plan("read") }), execute: async () => { started.resolve(); await release.promise; } });
+		try {
+			await runtime.startTurn(start("turn")); await started.promise;
+			await runFallback(runtime, { ...call("turn"), id: "native", tool: "bash", input: { command: "git status" } });
+			release.resolve();
+			expect((await runtime.prepareActorCall(call("turn")))?.output).toBe("speculative");
+			expect(executions()).toBe(1);
+		} finally { await runtime.dispose(); }
+	});
+
+	it.each([false, true])("re-validates finished exclusive work off the Actor path after an unbounded native call (stale=%s)", async (stale) => {
+		const validate = vi.fn(async () => stale ? { status: "stale" as const, cause: cause("freshness", "resource_changed"), metrics: zeroValidationMetrics() } : validResource());
+		const { runtime, ready, executions } = harness({ actionKey: (tool, args) => buildPiActionKey(tool, args, process.cwd()), execute: () => world("written", { validate }),
+			source: planSource({ propose: () => ({ ...plan("write"), actions: [{ id: "write", type: "tool_call", tool: "write", input: { path: "out.txt", content: "x" } }] }) }) });
+		try {
+			await runtime.startTurn(start("turn")); await ready.promise;
+			await runFallback(runtime, { ...call("turn"), id: "native", tool: "bash", input: { command: "git status" } });
+			await vi.waitFor(() => expect(executions()).toBe(stale ? 2 : 1));
+			expect(validate).toHaveBeenCalled();
+		} finally { await runtime.dispose(); }
+	});
+
 	it("charges a native call's matching, capture and settlement time as negative savings", async () => {
 		let now = 100;
 		const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
