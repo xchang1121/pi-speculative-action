@@ -636,6 +636,7 @@ describe("structural speculative runtime", () => {
 			observe: () => undefined,
 		});
 		const { runtime, events, ready: candidateReady } = harness({ source, execute: async () => { await gate.wait(); return "learned"; } });
+		const adoption = vi.spyOn(SpeculationScheduler.prototype, "observeAdoption");
 
 		await runtime.startTurn(start("calibration"));
 		const calibration = call("calibration");
@@ -658,6 +659,7 @@ describe("structural speculative runtime", () => {
 				(event) => event.type === "actor_action" && event.turnID === "prediction",
 			),
 		).toMatchObject({ settlement: { provider: { kind: "actor" }, rejections: [{ cause: { code: "candidate_join_deadline" } }] } });
+		expect(adoption).not.toHaveBeenCalled(); adoption.mockRestore(); // A deadline exit began no adoption work to sample.
 		enabled = false;
 		await runtime.startTurn(start("retained"));
 		expect(await runtime.prepareActorCall(call("retained"))).toMatchObject({ output: "learned", observeOperations: false });
