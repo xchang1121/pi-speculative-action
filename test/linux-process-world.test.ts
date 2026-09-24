@@ -216,7 +216,7 @@ int main(int argc, char **argv) {
 			expect(fixture.backend.actorMetrics().joinedHits, diagnostic()).toBe(Number(resumed));
 			if (resumed) expect(publishing.mock.calls.some(([, , certificate]) => certificate?.result.continuation), diagnostic()).toBe(true);
 			if (mode !== "cancel") await host.finishTurn("prepared");
-			expect(existsSync(`/proc/${privatePid}`)).toBe(false);
+			await expect.poll(() => existsSync(`/proc/${privatePid}`), { timeout: 5_000 }).toBe(false); // Retirement kills asynchronously, as for cancel.
 			if (resumed) expect(events.filter(event => event.type === "operation_prediction"), diagnostic()).toContainEqual(expect.objectContaining({ settlement: expect.objectContaining({
 				observation: "observed", match: expect.objectContaining({ matched: true, adoption: expect.objectContaining({ status: "adopted" }) }) }) }));
 		} finally { await host?.dispose(); await fixture.dispose(); }
