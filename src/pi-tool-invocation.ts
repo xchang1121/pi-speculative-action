@@ -4,12 +4,12 @@ import {
 	getAgentDir, getShellConfig, VERSION, type ExtensionContext, type ToolsOptions,
 } from "@earendil-works/pi-coding-agent";
 import type { ToolFilesystemOperations, ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
-import { BASH_TIMEOUT_ACTION_KEY_PROJECTOR, PI_ACTION_SEMANTICS, type ActionSemanticsDefinition } from "./action-semantics.ts";
+import { BASH_TIMEOUT_ACTION_KEY_PROJECTOR, PI_ACTION_SEMANTICS, resolvePiToolPath, type ActionSemanticsDefinition } from "./action-semantics.ts";
 import type { ActionProjectionRule } from "./action-key-projection.ts";
 import { asRecord } from "./stable-json.ts";
 import { RESOURCE_OBSERVATION_EFFECTS } from "./effect-model.ts";
 import { captureResourceVersion, type ResourceInput } from "./resource-version.ts";
-import { relativeFilesystemPath, slash } from "./path-utils.ts";
+import { relativeFilesystemPath, sameFilesystemPath, slash } from "./path-utils.ts";
 import fs from "node:fs/promises";
 import process from "node:process";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -73,9 +73,12 @@ export function resolvePiToolInvocation(
 			identity: { executor, cwd, version: VERSION, autoResizeImages, modelSupportsImages },
 			filesystem: async (view, request) => {
 				const denied = (): never => { throw new Error("Filesystem operation is not authorized by this execution world"); };
+				// Pi guesses filename variants with host access(); the view proves only the file chosen, so a guess never answers.
+				let guessed = false;
 				const scoped: ToolsOptions = tool === "read" ? {
 					read: { autoResizeImages, operations: {
-						access: view.access, readFile: view.readFile,
+						access: (target) => { guessed ||= !sameFilesystemPath(target, resolvePiToolPath(String(asRecord(request.args)?.path), cwd)); return view.access(target); },
+						readFile: view.readFile,
 						detectImageMimeType: async (target) => {
 							const mime = await import(new URL("./utils/mime.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href);
 							return mime.detectSupportedImageMimeType(await view.readFile(target, 4100));
@@ -94,6 +97,7 @@ export function resolvePiToolInvocation(
 				// Stock cancellation can reject before its internal operation and image worker finish.
 				const result = await settleFilesystemOperation<ToolSettlement["result"]>(() =>
 					definition.execute(request.callID, request.args as never, undefined, undefined, context), request.signal);
+				if (guessed) throw new Error("resource_access_unproven:read_path_variant");
 				return { result, isError: false };
 			},
 		};

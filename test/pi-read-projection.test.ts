@@ -61,13 +61,7 @@ async function project(
 	if (keyMatch?.kind !== "projected") throw new Error("Expected a projected read-key match");
 	const realizedCoverage = PI_READ_RANGE_PROJECTION_RULE.captureCoverage(speculative, output);
 	if (realizedCoverage === undefined) return undefined;
-	return PI_READ_RANGE_PROJECTION_RULE.projectOutput({
-		speculative,
-		actor,
-		output,
-		coverage: realizedCoverage,
-		keyMatch,
-	});
+	return PI_READ_RANGE_PROJECTION_RULE.projectOutput({ speculative, actor, output, coverage: realizedCoverage, keyMatch });
 }
 
 function outputText(output: ToolSettlement | undefined): string | undefined {
@@ -125,22 +119,16 @@ describe("Pi read range projection", () => {
 
 	it("rejects coverage whose descriptor exceeds the existing output payload", async () => {
 		const snapshot = coverage(["one", "two"]);
-		expect(
-			await project(readKey("notes.txt", 1, 2), readKey("notes.txt", 2, 1), settlement(snapshot, "one")),
-		).toBeUndefined();
+		expect(await project(readKey("notes.txt", 1, 2), readKey("notes.txt", 2, 1), settlement(snapshot, "one"))).toBeUndefined();
 	});
 
 	it("does not capture missing coverage, tool errors, or non-read outputs", () => {
 		const read = readKey("notes.txt", 1, 2);
 		const grep = buildPiActionKey("grep", { pattern: "TODO", path: "." }, cwd);
 		expect(PI_READ_RANGE_PROJECTION_RULE.captureCoverage(read, settlement())).toBeUndefined();
-		expect(
-			PI_READ_RANGE_PROJECTION_RULE.captureCoverage(read, coveredSettlement(["one", "two"], {}, true)),
-		).toBeUndefined();
+		expect(PI_READ_RANGE_PROJECTION_RULE.captureCoverage(read, coveredSettlement(["one", "two"], {}, true))).toBeUndefined();
 		expect(grep).toBeDefined();
-		if (grep) {
-			expect(PI_READ_RANGE_PROJECTION_RULE.captureCoverage(grep, coveredSettlement(["one", "two"]))).toBeUndefined();
-		}
+		if (grep) expect(PI_READ_RANGE_PROJECTION_RULE.captureCoverage(grep, coveredSettlement(["one", "two"]))).toBeUndefined();
 	});
 
 	it("keeps different resources and grep/find actions outside the read relation", () => {
@@ -151,9 +139,7 @@ describe("Pi read range projection", () => {
 			const actor = buildPiActionKey(tool, { path: ".", pattern: "*.ts", limit: 2 }, cwd);
 			expect(speculative).toBeDefined();
 			expect(actor).toBeDefined();
-			if (speculative && actor) {
-				expect(actionKeyMatch(speculative, actor, [PI_READ_RANGE_PROJECTION_RULE])).toBeUndefined();
-			}
+			if (speculative && actor) expect(actionKeyMatch(speculative, actor, [PI_READ_RANGE_PROJECTION_RULE])).toBeUndefined();
 		}
 	});
 });

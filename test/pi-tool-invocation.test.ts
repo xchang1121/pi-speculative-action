@@ -81,6 +81,16 @@ describe("stock Pi invocation identity", () => {
 		expect(written).toEqual(tool === "write" ? ["after"] : tool === "edit" ? ["after\n"] : []);
 	});
 
+	it("declines a read answered from a filename variant Pi guessed outside the view", async () => {
+		const cwd = await directories.create(), args = { path: "it's notes.txt" }, signal = new AbortController().signal;
+		const view: ToolFilesystemOperations = { access: target => fs.access(target), readFile: target => fs.readFile(target) };
+		const read = () => resolvePiToolInvocation("read", args, { cwd, environment: {} })!.filesystem!(view, { callID: "variant", args, signal });
+		await fs.writeFile(path.join(cwd, "it\u2019s notes.txt"), "VARIANT\n");
+		await expect(read()).rejects.toThrow("read_path_variant");
+		await fs.writeFile(path.join(cwd, args.path), "ORIGINAL\n");
+		expect((await read()).result.content).toMatchObject([{ text: expect.stringContaining("ORIGINAL") }]);
+	});
+
 	it("binds exact execution semantics independently of call arguments and owns filesystem completion", async () => {
 		const options = { cwd: process.cwd(), environment: { PATH: "tools", BENCHMARK: "true" },
 			shellPath: process.execPath, shellCommandPrefix: "set -e" };
