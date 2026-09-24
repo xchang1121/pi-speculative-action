@@ -34,7 +34,7 @@ export type StableFilesystemCapture = {
 	readonly content?: Buffer;
 	/** Directory names use the same byte order as libuv scandir; content retains the kernel image. */
 	readonly entries?: readonly string[];
-	/** Content bytes came from another ongoing capture; bytesRead still describes logical size. */
+	/** Content bytes came from another capture's retained buffer; bytesRead still describes logical size. */
 	readonly shared?: true;
 	/** Optional real open file description, owned by the input version rather than its pathname. */
 	readonly object?: CapturedFilesystemObject;
@@ -159,28 +159,9 @@ async function captureFile(
 		if (!sameFilesystemIdentity(before, await handle.stat({ bigint: true }))) throw new Error("file_changed_during_capture");
 		observation?.pinned();
 		observation?.signal.throwIfAborted();
-		const identity = IDENTITY_FIELDS.map(field => String(before[field])).join(":"), borrower = { signal: observation?.signal };
-		const key = identity + (retainContent || fileCaptures.has(identity + ":content") ? ":content" : ":hash");
-		let pending = fileCaptures.get(key);
-		const joined = !!pending;
-		if (!pending) {
-			const borrowers = new Set([borrower]), reader = handle;
-			pending = { borrowers, result: Promise.resolve().then(() => readFileContents(reader, before, maxBytes, retainContent, () => {
-				for (const borrower of borrowers) if (!borrower.signal?.aborted) return;
-				borrowers.values().next().value?.signal?.throwIfAborted();
-			})).finally(() => { if (fileCaptures.get(key) === pending) fileCaptures.delete(key); }) };
-			fileCaptures.set(key, pending);
-		} else pending.borrowers.add(borrower);
-		let captured: Omit<StableFilesystemCapture, "realPath">;
-		try {
-			const result = await pending.result;
-			// Retained buffers belong to individual snapshots; hash-only borrowers retain no payload.
-			const content = retainContent && result.content
-				? joined || pending.borrowers.size > 1 ? Buffer.from(result.content) : result.content : undefined;
-			const stat = joined ? await handle.stat({ bigint: true }) : result.stat;
-			if (joined && !sameFilesystemIdentity(before, stat)) throw new Error("file_changed_during_capture");
-			captured = { ...result, stat, content, ...(joined ? { shared: true } : {}) };
-		} finally { pending.borrowers.delete(borrower); }
+		// Never borrow another capture's ongoing read: bytes read before this stat can predate a same-size rewrite
+		// that coarse timestamps leave with the same identity.
+		const captured = await readFileContents(handle, before, maxBytes, retainContent, () => observation?.signal.throwIfAborted());
 		observation?.signal.throwIfAborted();
 		const after = captured.stat;
 		if (verifyPath) {
@@ -198,12 +179,6 @@ async function captureFile(
 		try { await handle?.close(); } finally { await binding?.close(); }
 	}
 }
-
-/** Share only ongoing file reads; every borrower pins and fences its own descriptor. */
-const fileCaptures = new Map<string, {
-	readonly borrowers: Set<{ readonly signal: AbortSignal | undefined }>;
-	readonly result: Promise<Omit<StableFilesystemCapture, "realPath">>;
-}>();
 
 async function readFileContents(handle: FileHandle, before: BigIntStats, maxBytes: number, retainContent: boolean, check?: () => void) {
 	const hash = createHash("sha256");

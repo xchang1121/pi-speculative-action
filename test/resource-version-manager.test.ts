@@ -11,8 +11,7 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import { buildActionKey, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { borrowResourceObject, createCommittedResourceInputs, createResourceSnapshotExecutionWorld } from "../src/agent-execution-world.ts";
 import { captureHeldDescriptorInputs } from "../src/linux-held-exec.ts";
-import { captureStableFile, hashExecutableFile, type StableFilesystemCapture } from "../src/filesystem-evidence.ts";
-import { captureFileDependency, validateDynamicDependencyCertificate } from "../src/provenance-validation.ts";
+import { captureStableFile, hashExecutableFile } from "../src/filesystem-evidence.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { runThinkThreadTool } from "../src/thinkthread/tool-runner.ts";
 import {
@@ -956,85 +955,25 @@ describe("speculative action resource versions", () => {
 		}
 	});
 
-	test.for([
-		...["shared", "distinct", "cancel-owner", "cancel-reader", "cancel-all", "changed", "late-change", "read-error"].map(mode => ["executable", mode]),
-		...["hash", "content", "mixed"].flatMap(kind => ["shared", "distinct", "changed", "late-change", "read-error"].map(mode => [kind, mode])),
-		["reverse", "shared"], ["validation", "shared"],
-	])("shares an ongoing file read with independent descriptor ownership (%s/%s)", async ([kind, mode]) => {
-		const payload = Buffer.alloc(2 * 1024 * 1024 + 7, 43), root = await workspace({ image: payload });
-		const file = path.join(root, "image"), alias = path.join(root, "alias");
-		if (mode === "distinct") await fs.writeFile(alias, payload); else await fs.link(file, alias);
-		const manager = kind === "validation" ? new ResourceVersionManager(root, { watch: false }) : undefined;
-		const token = await manager?.capture([{ path: file, scope: "content" }]);
-		const dependency = kind === "validation" ? (await captureFileDependency(alias, alias)).dependency : undefined;
-		const gate = gated(), admitted = deferred(), controllers = [new AbortController(), new AbortController()];
-		const cancelled = controllers.map((_, index) => new Error("cancelled reader " + index));
-		const nativeOpen = fs.open.bind(fs), handles: Awaited<ReturnType<typeof fs.open>>[] = [];
+	test("reads a hard-link alias independently of another capture's ongoing read", async () => {
+		const payload = Buffer.alloc(2 * 1024 * 1024 + 7, 43), root = await workspace({ image: payload }), gate = gated();
+		const file = path.join(root, "image"), alias = path.join(root, "alias"), nativeOpen = fs.open.bind(fs);
+		await fs.link(file, alias);
+		let opened = 0;
 		const open = vi.spyOn(fs, "open").mockImplementation(async (target, flags, permissions) => {
-			const handle = await nativeOpen(target, flags, permissions);
-			if (!isDataOpen(flags)) return handle;
-			const index = handles.length; handles.push(handle);
-			const read = handle.read.bind(handle), stat = handle.stat.bind(handle); let reads = 0, inspections = 0;
-			vi.spyOn(handle, "read").mockImplementation((async (...args: Parameters<typeof handle.read>) => {
-				if (index === 0 && ++reads === 1) { await gate.wait(); if (mode === "read-error") throw new Error("shared read failed"); }
-				return read(...args);
+			const handle = await nativeOpen(target, flags, permissions), read = handle.read.bind(handle);
+			if (isDataOpen(flags) && opened++ === 0) vi.spyOn(handle, "read").mockImplementationOnce((async (...args: Parameters<typeof handle.read>) => {
+				await gate.wait(); return read(...args);
 			}) as typeof handle.read);
-			vi.spyOn(handle, "stat").mockImplementation((async (...args: Parameters<typeof handle.stat>) => {
-				if (mode === "late-change" && index === 1 && ++inspections === 2) await fs.appendFile(file, "changed");
-				const observed = await stat(...args);
-				if (index === 1) admitted.resolve();
-				return observed;
-			}) as typeof handle.stat);
 			return handle;
 		});
-		const digest = (bytes: Buffer) => "sha256:" + createHash("sha256").update(bytes).digest("hex");
-		let settled: Promise<PromiseSettledResult<string | StableFilesystemCapture>[]> | undefined;
-		const capture = async (target: string, index: number) => {
-			if (kind === "validation") {
-				const result = index === 0 ? await manager!.validate(token!)
-					: await validateDynamicDependencyCertificate({ complete: true, dependencies: [dependency!], taints: [] });
-				expect(result).toMatchObject({ ...(index === 0 ? { expired: false } : { status: "valid" }), filesRead: index === 0 ? 1 : 0, bytesRead: index === 0 ? payload.length : 0 });
-				return digest(payload);
-			}
-			return kind === "executable" ? hashExecutableFile(target, { signal: controllers[index]!.signal, pinned: () => {} })
-				: captureStableFile(target, Infinity, kind === "content" || kind === "mixed" && index === 0 || kind === "reverse" && index === 1);
-		};
 		try {
-			const owner = capture(file, 0); await gate.entered;
-			const reader = capture(alias, 1);
-			settled = Promise.allSettled([owner, reader]); await admitted.promise; await nextTurn();
-			if (mode === "cancel-owner" || mode === "cancel-all") controllers[0]!.abort(cancelled[0]);
-			if (mode === "cancel-reader" || mode === "cancel-all") controllers[1]!.abort(cancelled[1]);
-			if (mode === "changed") await fs.appendFile(file, "changed");
+			const owner = captureStableFile(file), hash = createHash("sha256").update(payload).digest("hex"); await gate.entered;
+			// Bytes the owner already read could predate a same-size rewrite that coarse timestamps hide from this stat.
+			expect(await captureStableFile(alias)).toMatchObject({ hash, bytesRead: payload.length });
 			gate.release();
-			const results = await settled;
-			for (const [index, result] of results.entries()) {
-				const error = controllers[index]!.signal.aborted ? cancelled[index]!.message : mode === "read-error" ? "shared read failed"
-					: mode === "changed" || mode === "late-change" && index === 1 ? "file_changed_during_capture" : undefined;
-				// A pathname owner may also observe the late mutation in its final namespace fence.
-				if (!error && kind !== "executable" && mode === "late-change" && result.status === "rejected") {
-					expect(result.reason.message).toBe("file_changed_during_capture"); continue;
-				}
-				expect(result).toMatchObject(error ? { status: "rejected", reason: { message: error } } : { status: "fulfilled" });
-				if (result.status === "fulfilled") {
-					if (typeof result.value === "string") expect(result.value).toBe(digest(payload));
-					else {
-						expect(result.value).toMatchObject({ hash: digest(payload).slice(7), bytesRead: payload.length });
-						expect(result.value.shared).toBe(index === 1 && mode !== "distinct" && kind !== "reverse" ? true : undefined);
-						expect(result.value.content).toEqual(kind === "content" || kind === "mixed" && index === 0 || kind === "reverse" && index === 1 ? payload : undefined);
-					}
-				}
-			}
-			if (kind === "content" && mode === "shared") {
-				const captures = results.map(result => (result as PromiseFulfilledResult<StableFilesystemCapture>).value);
-				captures[0]!.content![0] = 0; captures[0]!.stat.mode = 0n;
-				expect(captures[1]!.content).toEqual(payload); expect(captures[1]!.stat.mode).not.toBe(0n);
-			}
-			expect(vi.mocked(handles[1]!.read).mock.calls.length > 0).toBe(mode === "distinct" || kind === "reverse");
-			for (const handle of handles) expect(handle.fd).toBe(-1);
-			expect(await hashExecutableFile(file)).toBe(digest(await fs.readFile(file)));
-			expect(handles.at(-1)!.read).toHaveBeenCalled(); expect(handles.at(-1)!.fd).toBe(-1);
-		} finally { gate.release(); await settled; open.mockRestore(); await Promise.allSettled(handles.map(handle => handle.close())); await token?.release(); manager?.close(); }
+			expect(await owner).toMatchObject({ hash, bytesRead: payload.length });
+		} finally { gate.release(); open.mockRestore(); }
 	});
 
 	test.runIf(process.platform === "linux")("distinguishes pinned images from pathname snapshots after alias targets change", async () => {
