@@ -225,7 +225,8 @@ async function projectOutput<Output>(
 	if ((branch.inputsOnly || candidate.outputStale) && match.kind !== "inputs") return { ok: false, cause: cause("projection", "input_only_branch") };
 	if (match.kind === "exact") return { ok: true, output: branch.output };
 	const retained = candidate.resultViews?.get(actor.key);
-	if (retained && (!candidate.outputStale || retained.validate)) {
+	// A view kept without its proof is served only by a branch that can still commit and validate as a whole.
+	if (retained && (retained.validate || !candidate.outputStale && !branch.inputsOnly)) {
 		const output = cloneSharedData(retained.output);
 		if (retained.resource) retained.resource.references++;
 		return { ok: true, ...retained, output };
@@ -1166,7 +1167,7 @@ export function makeSpeculativeActionRuntime<
 				: { kind: "cycle", elapsedMs: Math.max(0, now - session.lastActorArrivedAt) };
 	};
 
-	const dispatchReady = (session: Session, immediatePredictionID?: string): void => {
+	const dispatchReady = (session: Session): void => {
 		if (session.lifecycle.sealed) return;
 		settleBlockedPlanActions(session);
 		const now = performance.now();
@@ -1175,19 +1176,13 @@ export function makeSpeculativeActionRuntime<
 		for (const node of session.plan.launchable()) {
 			if (!node.actionKey) continue;
 			const existingTimer = session.launchTimers.get(node.prediction.id);
-			if (
-				existingTimer &&
-				node.expectedDecisionSeq > session.decisionSequence + 1 &&
-				node.prediction.id !== immediatePredictionID
-			) {
-				continue;
-			}
+			if (existingTimer && node.expectedDecisionSeq > session.decisionSequence + 1) continue;
 			if (existingTimer) clearTimeout(existingTimer);
 			session.launchTimers.delete(node.prediction.id);
 			const context = session.actionContexts.get(node.identity.id);
 			if (!context?.executionRoute) continue;
 			const forecast = forecastFor(node, session.decisionSequence, actorPhase);
-			const delay = node.prediction.id === immediatePredictionID ? 0 : session.scheduler.launchDelay(forecast);
+			const delay = session.scheduler.launchDelay(forecast);
 			if (delay <= 0) {
 				const promoted = session.plan.promote(node.proposalID, node.action.id);
 				if (promoted.status === "scheduled") immediate.push(promoted.node);
