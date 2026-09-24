@@ -8,6 +8,9 @@ import { once } from "node:events";
 import { captureProcessContext } from "./process-context.mjs";
 
 const environment = { ...process.env };
+// The launcher's record of what this process received, for an in-place bypass; never part of the command's environment.
+const nativeState = environment.PI_SPEC_NATIVE_STATE, inPlace = nativeState !== undefined && typeof process.execve === "function";
+delete environment.PI_SPEC_NATIVE_STATE;
 // Node ignores SIGXFSZ at startup; an exec outlet must preserve the shell's default disposition.
 const resetXfsz = () => {};
 process.on("SIGXFSZ", resetXfsz);
@@ -36,6 +39,7 @@ if (process.argv.length === 5 && process.argv[2] === "--probe-context" && proces
 			cwd: process.cwd(),
 			environment,
 			context: await captureProcessContext("self", ["0", "1", "2"]),
+			...(inPlace ? { pid: process.pid } : {}),
 		}, configuration.socketPath);
 		if (!response || !["bypass", "hit", "executed", "suspended"].includes(response.kind)) throw new Error("invalid dispatch response");
 		if (response.kind === "bypass") {
@@ -46,6 +50,8 @@ if (process.argv.length === 5 && process.argv[2] === "--probe-context" && proces
 					[target, view].some(candidate => path.resolve(path.dirname(executable)) === path.resolve(candidate)));
 				if (directory) executable = path.join(directory.shadow, path.basename(executable));
 			}
+			// Back through the launcher, the native image runs in this traced process with what it received.
+			if (inPlace) try { process.execve(invokedPath, [argv0, ...args], { ...environment, PI_SPEC_NATIVE_STATE: nativeState }); } catch { /* An escaped bypass. */ }
 			await run(executable, args, argv0);
 		} else {
 			for (const event of response.output ?? []) {
@@ -75,17 +81,8 @@ async function run(executable, commandArgs, argv0) {
 }
 
 function validConfiguration(value) {
-	return Boolean(
-		value &&
-			typeof value.socketPath === "string" &&
-			typeof value.token === "string" &&
-			Array.isArray(value.directories) &&
-			value.directories.every(
-				(directory) =>
-					directory && typeof directory.target === "string" && typeof directory.view === "string" &&
-					typeof directory.shadow === "string",
-			),
-	);
+	return Boolean(value && typeof value.socketPath === "string" && typeof value.token === "string" && Array.isArray(value.directories) &&
+		value.directories.every((directory) => directory && ["target", "view", "shadow"].every((field) => typeof directory[field] === "string")));
 }
 
 async function exchange(request, socketPath) {

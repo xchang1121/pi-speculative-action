@@ -1899,7 +1899,10 @@ int main(void) {
 			expect(captures[0]!.finish).not.toHaveBeenCalled();
 			expect(branch.executionMetrics.reuse?.misses).toBeGreaterThanOrEqual(3);
 			expect(branch.executionMetrics.reuse?.bypasses).toBe(5); // Capture failure, internal pipeline and three unsupported stdio contexts.
-			expect(JSON.stringify(await branch.validate?.())).toContain("broker_bypass:redirect-worker:output_endpoint_mismatch");
+			// With process.execve a bypass runs its native image in place, inside the top-level trace; the injected capture failure still escapes it.
+			const validation = JSON.stringify(await branch.validate?.());
+			expect([validation.includes("broker_bypass:"), validation.includes("injected trace allocation failure")], validation)
+				.toEqual([typeof process.execve !== "function", true]);
 			expect(existsSync(path.join(fixture.workspace, "escaped.txt")), "an orphan outside the supervisor must not reach the source").toBe(false);
 			await branch.dispose();
 			branch = undefined;

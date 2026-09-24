@@ -222,6 +222,8 @@ interface DispatcherRequest {
 	readonly cwd: string;
 	readonly environment: Readonly<Record<string, string>>;
 	readonly context: ProcessExecutionContext;
+	/** Present when a bypass will exec the native image in place of this process. */
+	readonly pid?: number;
 }
 
 /** The outlet each target output uses; 0 discards into /dev/null. */
@@ -270,6 +272,8 @@ interface ActiveSession {
 	readonly executionBindings: Map<number, ProcessExecutionBinding>;
 	readonly computations: TimelineDependency[];
 	readonly incompleteReasons: Set<string>;
+	/** Bypasses that exec their native image in place; the top-level trace must show each one resume. */
+	readonly bypasses: [pid: number, reason: string][];
 	readonly metrics: MutableLinuxProcessReuseMetrics;
 	topLevelCapture?: TopLevelCapture;
 	topLevelExecution?: {
@@ -564,7 +568,7 @@ export class LinuxProcessReuseBackend {
 			nestedEvidence: [],
 			executionBindings: new Map(),
 			computations: [],
-			incompleteReasons: new Set<string>(),
+			incompleteReasons: new Set<string>(), bypasses: [],
 			metrics: { ...emptyWorldReuseMetrics() },
 		};
 		this.producers++;
@@ -756,7 +760,7 @@ export class LinuxProcessReuseBackend {
 			try {
 				const after = await session.workspace.structure.capture();
 				const observation = await observeStrace(tracePrefix, session.invocation.shell, logicalCwd, {
-					interposedExecutables: session.interposition.executables,
+					interposedExecutables: session.interposition.executables, interpositionInterpreter: process.execPath,
 					guardFilesystemSemanticsWithin: [session.workspace.sandboxRoot, session.sourceRoot],
 				});
 				session.topLevelCapture = { before, after, observation };
@@ -855,7 +859,9 @@ export class LinuxProcessReuseBackend {
 		const eligibility = await eligibleRequest(session, request, ready.executionContext);
 		if ("reason" in eligibility) {
 			this.add(session, "bypasses");
-			session.incompleteReasons.add(`broker_bypass:${request.name}:${eligibility.reason}`);
+			const reason = `broker_bypass:${request.name}:${eligibility.reason}`;
+			if (request.pid === undefined) session.incompleteReasons.add(reason);
+			else session.bypasses.push([request.pid, reason]);
 			return { kind: "bypass", executable };
 		}
 		const { argv0, args, cwd, environment } = request;
@@ -1822,6 +1828,8 @@ async function sealSessionEvidence(
 		session.topLevelEvidence ??= { complete: false, dependencies: [], taints: ["trace_incomplete"] };
 		throw new Error("top-level workspace capture is missing");
 	}
+	// A bypass that did not resume in place ran outside the top-level trace.
+	for (const [pid, reason] of session.bypasses) if (!capture.observation.resumedInterpositions?.includes(pid)) session.incompleteReasons.add(reason);
 	const frontier = [...new Set([...capture.before.entries.keys(), ...capture.after.entries.keys()])].filter(name => {
 		const before = capture.before.entries.get(name), after = capture.after.entries.get(name);
 		return name && (before?.kind === "file" || after?.kind === "file") && before?.changeDigest !== after?.changeDigest && !changes.some(change => path.normalize(change.resource) === name);
@@ -2557,30 +2565,12 @@ function parseDispatcherRequest(body: string): DispatcherRequest | undefined {
 		const value: unknown = JSON.parse(body.trim());
 		if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
 		const request = value as Partial<DispatcherRequest>;
-		if (
-			typeof request.token !== "string" ||
-			typeof request.name !== "string" ||
-			typeof request.invokedPath !== "string" ||
-			request.invokedPath.includes("\0") ||
-			typeof request.argv0 !== "string" ||
-			request.argv0.length > 1024 * 1024 ||
-			request.argv0.includes("\0") ||
-			!Array.isArray(request.args) ||
-			!request.args.every((argument) => typeof argument === "string" && !argument.includes("\0")) ||
-			typeof request.cwd !== "string" ||
-			!request.environment ||
-			typeof request.environment !== "object"
-		) {
-			return undefined;
-		}
-		if (
-			!Object.entries(request.environment).every(
-				([name, value]) => name.length > 0 && !name.includes("=") && !name.includes("\0") && typeof value === "string" && !value.includes("\0"),
-			)
-		) {
-			return undefined;
-		}
-		return request as DispatcherRequest;
+		const text = (field: unknown) => typeof field === "string" && !field.includes("\0");
+		return typeof request.token === "string" && typeof request.name === "string" && text(request.invokedPath) && text(request.argv0) &&
+			request.argv0!.length <= 1024 * 1024 && Array.isArray(request.args) && request.args.every(text) && typeof request.cwd === "string" &&
+			!!request.environment && typeof request.environment === "object" && (request.pid === undefined || Number.isSafeInteger(request.pid) && request.pid > 0) &&
+			Object.entries(request.environment).every(([name, value]) => name.length > 0 && !name.includes("=") && text(name) && text(value))
+			? request as DispatcherRequest : undefined;
 	} catch {
 		return undefined;
 	}

@@ -43,6 +43,8 @@ export interface StraceObservation {
 	readonly resourceJournal?: readonly { readonly inode: string; readonly description?: number; readonly kind: ResourceTransitionKind; readonly data: Buffer; readonly requested?: number }[];
 	readonly retainedDescriptions?: readonly number[];
 	readonly finalHandles?: readonly { readonly fd: number; readonly description?: number; readonly cloexec: boolean }[];
+	/** Processes whose every intercepted exec resumed at its native image in place. */
+	readonly resumedInterpositions?: readonly number[];
 }
 
 export interface StraceObservationOptions {
@@ -50,8 +52,10 @@ export interface StraceObservationOptions {
 	readonly previewBytes?: number;
 	/** An owned tracer flushed this exact byte boundary while the target was stopped in restartable I/O. */
 	readonly frozen?: { readonly pid: number; readonly fd: number; readonly syscall: string; readonly bytes: number };
-	/** Intercepted path to native target; a direct second exec proves descriptor-preserving bypass. */
+	/** Intercepted path to native target; a later exec of the target in the same process proves descriptor-preserving bypass. */
 	readonly interposedExecutables?: readonly (readonly [intercepted: string, original: string])[];
+	/** The dispatcher's interpreter, which may run between an intercepted exec and its in-place native exec. */
+	readonly interpositionInterpreter?: string;
 	/**
 	 * Workspace roots whose driver-specific unsupported errors must invalidate adoption. This keeps
 	 * a COW substrate from changing a command result when the Actor filesystem supports the syscall.
@@ -616,13 +620,10 @@ export async function observeStrace(
 	const taints = new Set<ProvenanceTaint>(["clock", "random"]);
 	const { journal: resourceJournal, handled: streamCalls, retained, finalHandles } = options.inheritedHandles?.length || options.inheritedStreams?.length
 		? resourceTransitions(selected, root.file.pid, options) : { journal: [], handled: new Set<TraceLine>(), retained: [], finalHandles: [] };
-	const interposedExecutables = new Map(
-		(options.interposedExecutables ?? []).map(([intercepted, original]) => [
-			path.posix.resolve(intercepted), path.posix.resolve(original),
-		]),
-	);
+	const interposedExecutables = new Map((options.interposedExecutables ?? []).map(([intercepted, original]) => [path.posix.resolve(intercepted), path.posix.resolve(original)]));
 	const semanticRoots = (options.guardFilesystemSemanticsWithin ?? []).map((value) => path.posix.resolve(value));
-	const ignoredSegments = ignoredProcessSegments(selected, interposedExecutables);
+	const { ignored: ignoredSegments, resumed: resumedInterpositions } = ignoredProcessSegments(selected, interposedExecutables,
+		options.interpositionInterpreter && path.posix.resolve(options.interpositionInterpreter));
 	const observeMetadata = (observedPath: string, followSymlinks: boolean, digest: Sha256Digest) => {
 		const identity = `metadata:${followSymlinks}:${observedPath}`;
 		if (metadata.get(identity)?.digest !== undefined && metadata.get(identity)?.digest !== digest) {
@@ -755,6 +756,7 @@ export async function observeStrace(
 			),
 		).length,
 		incompleteReasons: Object.freeze([...incompleteReasons].sort()),
+		...(resumedInterpositions.length ? { resumedInterpositions } : {}),
 	};
 }
 
@@ -791,25 +793,8 @@ const MODELED_METADATA_SYSCALLS = new Map<string, readonly [structure: number, f
 const UNMODELED_METADATA_SYSCALLS = new Set(["statfs", "fstatfs", "getdents", "getdents64"]);
 
 /** Persistent metadata not represented by the typed workspace transaction must never be replayed. */
-const UNMODELED_FILE_SEMANTICS_SYSCALLS = new Set([
-	"fallocate", "splice", "tee",
-	"fgetxattr",
-	"flistxattr",
-	"fremovexattr",
-	"fsetxattr",
-	"futimesat",
-	"getxattr",
-	"lgetxattr",
-	"listxattr",
-	"llistxattr",
-	"lremovexattr",
-	"lsetxattr",
-	"removexattr",
-	"setxattr",
-	"utime",
-	"utimensat",
-	"utimes",
-]);
+const UNMODELED_FILE_SEMANTICS_SYSCALLS = new Set(["fallocate", "splice", "tee", "fgetxattr", "flistxattr", "fremovexattr", "fsetxattr", "futimesat",
+	"getxattr", "lgetxattr", "listxattr", "llistxattr", "lremovexattr", "lsetxattr", "removexattr", "setxattr", "utime", "utimensat", "utimes"]);
 
 const UNMODELED_MUTATING_IOCTL = /\b(?:FICLONE|FICLONERANGE|FIDEDUPERANGE|FS_IOC_SETFLAGS|FS_IOC_SETVERSION|FS_IOC_FSSETXATTR)\b/;
 const DRIVER_SEMANTIC_GAP_RESULT = /^-1\s+(?:EXDEV|EOPNOTSUPP|ENOTSUP|ENOSYS)\b/;
@@ -834,29 +819,9 @@ function workspaceDriverSemanticGap(
 	return [...referenced].some((candidate) => roots.some((root) => containsLogicalPath(root, candidate)));
 }
 
-const NETWORK_SYSCALLS = new Set([
-	"getsockname", "getpeername", "getsockopt", "setsockopt", "listen", "shutdown",
-	"accept",
-	"accept4",
-	"bind",
-	"connect",
-	"recvfrom",
-	"recvmmsg",
-	"recvmsg",
-	"sendmmsg",
-	"sendmsg",
-	"sendto",
-	"socket",
-	"socketpair",
-]);
-
-const IPC_SYSCALLS = new Set([
-	"mq_open",
-	"msgget",
-	"semget",
-	"shmat",
-	"shmget",
-]);
+const NETWORK_SYSCALLS = new Set(["getsockname", "getpeername", "getsockopt", "setsockopt", "listen", "shutdown", "accept", "accept4", "bind",
+	"connect", "recvfrom", "recvmmsg", "recvmsg", "sendmmsg", "sendmsg", "sendto", "socket", "socketpair"]);
+const IPC_SYSCALLS = new Set(["mq_open", "msgget", "semget", "shmat", "shmget"]);
 
 /** A failed query of a proven file/pipe reveals no socket state; unknown descriptor types stay tainted. */
 function nonSocketQuery(line: TraceLine): boolean {
@@ -870,12 +835,9 @@ function resourceLimitMutation(line: TraceLine, syscall: string): boolean {
 	return syscall === "setrlimit" || (syscall === "prlimit64" && line.args[2] !== "NULL");
 }
 
-function ignoredProcessSegments(
-	selected: ReadonlyMap<number, TraceProcess>,
-	interposedExecutables: ReadonlyMap<string, string>,
-): Map<number, Array<readonly [number, number]>> {
-	const ignored = new Map<number, Array<readonly [number, number]>>();
-	if (!interposedExecutables.size) return ignored;
+function ignoredProcessSegments(selected: ReadonlyMap<number, TraceProcess>, interposedExecutables: ReadonlyMap<string, string>, interpreter?: string) {
+	const ignored = new Map<number, Array<readonly [number, number]>>(), resumed = new Set<number>();
+	if (!interposedExecutables.size) return { ignored, resumed: [] };
 	const fullyIgnored = new Map<number, number>();
 	for (const [pid, { file, start, cwd: initial }] of selected) {
 		let cwd = initial;
@@ -886,18 +848,21 @@ function ignoredProcessSegments(
 			const executable = quotedStrings(line)[0];
 			const original = executable && interposedExecutables.get(tracedPath(executable, cwd) ?? "");
 			if (!original) continue;
-			let resumed = -1, resumedExecutable: string | undefined, resumedCwd = cwd;
+			let resumedAt = -1, resumedExecutable: string | undefined, resumedCwd = cwd;
 			for (let candidateIndex = index + 1; candidateIndex < file.lines.length; candidateIndex++) {
 				const candidate = file.lines[candidateIndex]!;
 				resumedCwd = tracedCwd(candidate, resumedCwd);
 				if (!successfulExec(candidate)) continue;
-				resumed = candidateIndex;
-				resumedExecutable = quotedStrings(candidate)[0];
-				break;
+				resumedAt = candidateIndex;
+				const target = quotedStrings(candidate)[0];
+				resumedExecutable = target && tracedPath(target, resumedCwd);
+				// An in-place bypass passes through the dispatcher's interpreter and the launcher at an intercepted path.
+				if (resumedExecutable !== interpreter && !interposedExecutables.has(resumedExecutable ?? "")) break;
 			}
-			if (resumedExecutable && tracedPath(resumedExecutable, resumedCwd) === original) {
-				(ignored.get(pid) ?? ignored.set(pid, []).get(pid)!).push([index, resumed]);
-				index = resumed - 1;
+			if (resumedExecutable === original) {
+				(ignored.get(pid) ?? ignored.set(pid, []).get(pid)!).push([index, resumedAt]);
+				resumed.add(pid);
+				index = resumedAt - 1;
 				continue;
 			}
 			(ignored.get(pid) ?? ignored.set(pid, []).get(pid)!).push([index, file.lines.length]);
@@ -915,7 +880,7 @@ function ignoredProcessSegments(
 			fullyIgnored.set(child, 0);
 		}
 	}
-	return ignored;
+	return { ignored, resumed: [...resumed].filter((pid) => !fullyIgnored.has(pid)) };
 }
 
 function tracedCwd(line: TraceLine, cwd: string | undefined): string | undefined {
