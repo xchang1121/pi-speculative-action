@@ -40,6 +40,7 @@ export class TaskTimeline {
 	private readonly authoritativeTools: { readonly startedAt: number; readonly endpoints: readonly number[]; native: boolean }[] = [];
 	private readonly computations = new WeakMap<TimelineInterval, { native: boolean }>();
 	private estimatedSavingsMs = 0;
+	private optimisticSavingsMs = 0;
 	readonly startedAt: number;
 
 	constructor(startedAt: number) { this.startedAt = metric(startedAt); }
@@ -49,7 +50,7 @@ export class TaskTimeline {
 	}
 
 	/** Call once per settled Actor operation; adoption includes its actual waiting and validation time. */
-	recordTool(interval: TimelineInterval, adoption?: { readonly hitLatencyMs: number; readonly expectedNativeMs?: number }): void {
+	recordTool(interval: TimelineInterval, adoption?: { readonly hitLatencyMs: number; readonly expectedActorMs?: number; readonly expectedNativeMs?: number }): void {
 		const costs = new Map<TimelineInterval, number>();
 		// Only a native Actor execution stays native; adopted and reused computations ran ahead of their callers.
 		const visit = (computation: TimelineInterval, native: boolean): number => {
@@ -78,6 +79,8 @@ export class TaskTimeline {
 		const referenceMs = adoption?.expectedNativeMs ?? serialMs;
 		const actualMs = adoption ? metric(adoption.hitLatencyMs) : interval.completedAt - interval.startedAt;
 		this.estimatedSavingsMs += nonNegativeDifference(referenceMs, actualMs) - nonNegativeDifference(actualMs, referenceMs);
+		// Optimistic: the larger of the computation and the Actor's expected service is avoided, and speculation is charged nothing.
+		this.optimisticSavingsMs += nonNegativeDifference(Math.max(serialMs, metric(adoption?.expectedActorMs)), actualMs);
 	}
 
 	/** Speculation's own time on a native Actor call's path. */
@@ -100,6 +103,8 @@ export class TaskTimeline {
 		return Object.freeze({ startedAt, completedAt, endToEndMs, nonToolMs, actorPhaseMs, orchestrationMs, toolExecutionMs, serializedMs, hiddenLatencyMs,
 			/** Signed avoided service time against native history, net of speculation's own cost on native calls. */
 			estimatedSavingsMs: this.estimatedSavingsMs,
+			/** Optimistic avoided service time: never negative, not a measured no-speculation counterfactual. */
+			optimisticSavingsMs: this.optimisticSavingsMs,
 			/** Distinct accepted computations with exclusive time in this task, not Actor call count. */
 			authoritativeToolCount: computations.length,
 		});
@@ -140,9 +145,7 @@ function duration(intervals: readonly TimelineInterval[]): number {
 }
 
 function unionDuration(intervals: readonly TimelineInterval[]): number {
-	const sorted = [...intervals].sort(
-		(left, right) => left.startedAt - right.startedAt || left.completedAt - right.completedAt,
-	);
+	const sorted = [...intervals].sort((left, right) => left.startedAt - right.startedAt || left.completedAt - right.completedAt);
 	let total = 0;
 	let start = 0, end = 0;
 	for (const interval of sorted) {
