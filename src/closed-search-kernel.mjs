@@ -18,7 +18,7 @@ export const CLOSED_SEARCH_PROFILE = Object.freeze({
 		process: "caller-owned pinned rg", filesystem: "caller-granted stat and readFile; no ambient fallback" }),
 	bootstrapEnvironment: Object.freeze({ PWD: "/workspace", HOME: "/workspace", LC_ALL: "C" }),
 	filesystem: "readonly /workspace namespace; exact spelling; normalized in-root aliases; no ambient filesystem fallback",
-	limits: Object.freeze({ inputBytes: 8 * 1024 * 1024, entries: 4096, requestBytes: 9 * 1024 * 1024, resultBytes: 1024 * 1024 }),
+	limits: Object.freeze({ inputBytes: 8 * 1024 * 1024, entries: 65536, requestBytes: 9 * 1024 * 1024, resultBytes: 1024 * 1024 }),
 });
 let owned = false;
 const systemErrors = new Set([...getSystemErrorMap().values()].map(([code]) => code));
