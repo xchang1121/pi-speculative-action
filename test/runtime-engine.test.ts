@@ -573,10 +573,7 @@ describe("structural speculative runtime", () => {
 		}
 		expect(settlements[0]).toMatchObject({
 			observation: "observed",
-			match: {
-				matched: true,
-				adoption: { status: "rejected", cause: { stage: "freshness" } },
-			},
+			match: { matched: true, adoption: { status: "rejected", cause: { stage: "freshness" } } },
 		});
 		const predictionEvents = events.filter((event) => event.type === "prediction");
 		expect(predictionEvents).toHaveLength(1);
@@ -984,11 +981,7 @@ describe("structural speculative runtime", () => {
 		admission.release();
 		await requestsSettled.promise;
 		expect(executionCount()).toBe(0);
-		expect(
-			events.filter(
-				(event) => event.type === "source_request" && event.request.settlement.status === "aborted",
-			),
-		).toHaveLength(1);
+		expect(events.filter((event) => event.type === "source_request" && event.request.settlement.status === "aborted")).toHaveLength(1);
 		await prepared?.settle(simulatedExecution(1), "actor");
 		await runtime.finishTurn({ ...call("turn"), terminal: true });
 		expect(runtime.inspect().pendingPredictions).toBe(0);
@@ -1037,6 +1030,18 @@ describe("structural speculative runtime", () => {
 				expect((await runtime.prepareActorCall(next))?.output).toBe("speculative");
 			}
 		} finally { await runtime.dispose(); admission.mockRestore(); }
+	});
+
+	it("orders queued predictions by the streamed tool name without holding the others back", async () => {
+		const started: string[] = [], release = deferred<void>();
+		const { runtime } = harness({ source: planSource({ propose: async () => { await release.promise; return plan("next", { path: "next.ts" }); } }),
+			execute: async (_tool, input) => { started.push(String(input.path)); return "speculative"; } });
+		try {
+			await runtime.startTurn(start("turn"));
+			await runtime.previewActorTool({ ...call("turn"), tool: "write" }); // The Actor is streaming a write call.
+			release.resolve();
+			await vi.waitFor(() => expect(started).toEqual(["next.ts"]));
+		} finally { release.resolve(); await runtime.dispose(); }
 	});
 
 	it("re-arms a preempted future prediction so it relaunches once capacity returns", async () => {
@@ -1632,11 +1637,7 @@ describe("structural speculative runtime", () => {
 		const gate = gated();
 		const coordinator = new EffectTransactionCoordinator<string>(), cleanup = vi.fn();
 		const continuation = vi.fn(() => undefined), settlements: PredictionSettlement[] = [];
-		const commit = vi.fn(async () => {
-			await gate.wait();
-			if (phase === "poisoned") throw poisoned;
-			return "speculative";
-		});
+		const commit = vi.fn(async () => { await gate.wait(); if (phase === "poisoned") throw poisoned; return "speculative"; });
 		const source = planSource({
 			propose: () => plan("claimed"),
 			continueOn: ["actor_adopted"], continue: continuation,
@@ -1733,10 +1734,7 @@ describe("structural speculative runtime", () => {
 		const source = planSource({
 			propose: () => plan("epoch"),
 		});
-		const { runtime, ready: candidateReady } = harness({
-			source,
-			settings: () => configured,
-		});
+		const { runtime, ready: candidateReady } = harness({ source, settings: () => configured });
 		await runtime.startTurn(start("turn-1"));
 		await candidateReady.promise;
 

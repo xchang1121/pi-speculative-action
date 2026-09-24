@@ -1266,13 +1266,10 @@ export function makeSpeculativeActionRuntime<
 	};
 
 	const launchCandidateBatch = (session: Session, preferred?: Candidate): void => {
-		const actorToolHints = pendingActorTurn(session)?.actorToolHints;
+		// The streamed tool name only orders queued work; free capacity still launches the rest.
+		const hinted = (candidate: Candidate) => Number(pendingActorTurn(session)?.actorToolHints.has(candidate.key.tool) === true);
 		const queued = (preferred ? [preferred] : candidateStore.pending(session.id))
-			.filter(
-				(candidate) =>
-					candidate.work.execution.status === "queued" &&
-					(!actorToolHints?.size || actorToolHints.has(candidate.key.tool)),
-			)
+			.filter((candidate) => candidate.work.execution.status === "queued")
 			.flatMap((candidate) => {
 				const forecasts = forecastsForCandidate(session, candidate);
 				if (!forecasts.length) {
@@ -1284,7 +1281,7 @@ export function makeSpeculativeActionRuntime<
 			.sort(
 				(left, right) =>
 					Number(!reservationAvailable(right.candidate.work.reservation)) -
-						Number(!reservationAvailable(left.candidate.work.reservation)) ||
+						Number(!reservationAvailable(left.candidate.work.reservation)) || hinted(right.candidate) - hinted(left.candidate) ||
 					Number(left.work.background) - Number(right.work.background) ||
 					left.work.decisionBatchesUntilCall - right.work.decisionBatchesUntilCall ||
 					right.work.priorityMs - left.work.priorityMs ||
