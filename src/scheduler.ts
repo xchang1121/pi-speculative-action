@@ -172,11 +172,12 @@ export class SpeculationScheduler<Job extends object> {
 		if (role === "producer") {
 			if (forecasts.length && !forecasts.some((forecast) => this.canLaunch(forecast, work.expectedDurationMs)))
 				return { admitted: false, work, reason: "not_profitable" };
-			if (!fitsResourceBudget(this.entries.values(), work.resourceUnits, capacity))
-				return { admitted: false, work, reason: "budget_exhausted" };
+			// Before the budget: a job the circuit refuses must not make room for itself by preempting others.
 			if (executionIdentity?.actionKeyHash &&
 				this.speculativeServiceTimes.get(timingKeys(executionIdentity)[0]!)?.allowExecution(job, this.decisionSequence) === false)
 				return { admitted: false, work, reason: "failure_circuit" };
+			if (!fitsResourceBudget(this.entries.values(), work.resourceUnits, capacity))
+				return { admitted: false, work, reason: "budget_exhausted" };
 		}
 		this.entries.set(job, { job, work, sequence: this.sequence++ });
 		return { admitted: true, work };
