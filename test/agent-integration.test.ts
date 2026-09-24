@@ -22,7 +22,7 @@ import { PI_READ_RANGE_PROJECTION_RULE, withPiProjectionCoverage } from "../src/
 import { createClosedSearchProfile, resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import type { MaterializedSpeculativeCandidate, SpeculativeActionEvent } from "../src/runtime.ts";
 import { createActorForkPlanSource } from "../src/actor-fork-plan-source.ts";
-import type { ToolInvocation, ToolSettlement } from "../src/tool-settlement.ts";
+import { toolErrorSettlement, type ToolInvocation, type ToolSettlement } from "../src/tool-settlement.ts";
 import { summarizeSpeculativeTrace } from "../src/trace-summary.ts";
 import { ResourceVersionManager } from "../src/resource-version.ts";
 import { WorkspaceSandboxService } from "../src/workspace-sandbox.ts";
@@ -238,6 +238,20 @@ describe("speculative action host", () => {
 			dependsOn: [{ proposalID: identity.proposalID, actionID: "0:fork", identity: "fork-call", condition: "execution_succeeded" }] }] });
 		expect(contexts[1]!.messages.slice(-2)).toMatchObject([{ role: "assistant", content: [{ type: "toolCall", name: "read", arguments: input }] },
 			{ role: "toolResult", toolName: "read", content: [{ type: "text", text: "forked" }] }]);
+	});
+
+	it.each([true, false])("delivers a validated completed failure as the Actor's own error (completed=%s)", async (completed) => {
+		const cwd = await temporaryWorkspace(), tool = createReadTool(cwd), ready = deferred<void>(), failure = "tests failed\n\nCommand exited with code 2";
+		const { host } = drafterHost("session", { cwd, getSettings: () => ({ ...settings(), drafterMaxDepth: 0 }), complete: async () => drafterCall({ path: "notes.txt" }),
+			executionWorlds: [mockRuntimeWorld(async () => ({ ...toolErrorSettlement(new Error(failure)), ...(completed ? { exitCode: 2 } : {}) }))],
+			onEvent: (event) => { if (event.type === "candidate" && (event.state.status === "succeeded" || event.state.status === "failed")) ready.resolve(); } });
+		const native = vi.fn(async (): Promise<never> => { throw new Error("native failure"); });
+		try {
+			await host.startTurn(startInput(tool)); await ready.promise;
+			await expect(host.execute({ turnID: "turn-1", id: "run", tool: "read", args: { path: "notes.txt" }, tools: [tool] }, undefined, native))
+				.rejects.toThrow(completed ? failure : "native failure"); // A timeout, abort or backend fault still runs natively.
+			expect(native).toHaveBeenCalledTimes(completed ? 0 : 1);
+		} finally { await host.dispose(); }
 	});
 
 	it("splits one adoption among the sources that predicted it, whichever one executed it", async () => {

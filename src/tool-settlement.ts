@@ -6,6 +6,8 @@ import type { ExecutionOperationBinding, WorldResultCapture } from "./execution-
 export interface ToolSettlement<TDetails = unknown> {
 	readonly result: AgentToolResult<TDetails>;
 	readonly isError: boolean;
+	/** A process that ran to completion and exited non-zero failed on its own terms: once validated, the Actor may adopt it. */
+	readonly exitCode?: number;
 }
 
 export function toolErrorSettlement(error: unknown): ToolSettlement {

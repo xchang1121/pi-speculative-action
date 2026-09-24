@@ -2176,7 +2176,7 @@ int main(void) {
 		const backend = new LinuxProcessReuseBackend({ storeRoot });
 		const coordinator = new ProcessExecutionCoordinator(adaptProcessToolOperations(createLocalBashOperations()));
 		const world = createLinuxProcessExecutionWorld({ coordinator, tools: PI_OPERATION_TOOLS.process, backend, storeRoot });
-		let payload = "", ownedAtClose = false;
+		let payload = "", ownedAtClose = false, exit = 0;
 		const ownership = new ProcessHandoffOwnership();
 		const registry = new ProcessHandoffRegistry<null>(1, 16), scope = { sessionID: "cost", turnID: "first" };
 		const binding = registry.observe(sha256Digest("cost"), "/worker", scope, null, 10)!;
@@ -2186,7 +2186,7 @@ int main(void) {
 			executeBinding: async () => { throw new Error("unexpected process binding"); },
 			executionBindings: () => [binding],
 			computationDependencies: () => [],
-			executor: { execute: async (request) => { payload = `opaque bytes: ${workspace.sandboxRoot}`; request.onData(Buffer.from(payload)); return { exitCode: 0 }; } },
+			executor: { execute: async (request) => { payload = `opaque bytes: ${workspace.sandboxRoot}`; request.onData(Buffer.from(payload)); return { exitCode: exit }; } },
 			metrics: emptyWorldReuseMetrics, seal: async () => [], close: () => close(workspace.sandboxRoot),
 			validate: async () => ({ status: "valid", metrics: { durationMs: 0, bytesRead: 0, filesRead: 0, mode: "exact" } }),
 		}));
@@ -2196,8 +2196,8 @@ int main(void) {
 			const args = { command: "opaque" };
 			const invocation = resolvePiToolInvocation("bash", args, { cwd: root, environment: {} })!;
 			const action = PI_ACTION_SEMANTICS.buildKey("bash", args, root, "", { fingerprint: "fake-process", context: invocation })!;
-			const branch = await world.speculation.execute({ cwd: root, toolName: "bash", args, action, callID: "opaque",
-				tool: createBashTool(root, { operations: coordinator.operations }), signal: new AbortController().signal });
+			const context = { cwd: root, toolName: "bash", args, action, callID: "opaque", tool: createBashTool(root, { operations: coordinator.operations }), signal: new AbortController().signal };
+			const branch = await world.speculation.execute(context);
 			try {
 				expect(branch.output.result.content).toEqual([{ type: "text", text: payload }]);
 				const operation = branch.operations![0]!, preparedMs = operation.expectedDurationMs;
@@ -2214,6 +2214,12 @@ int main(void) {
 			finally { await branch.dispose(); }
 			expect(close).toHaveBeenCalledOnce();
 			expect(ownedAtClose).toBe(true);
+			exit = 3; // A command that ran to completion and failed stays adoptable, carrying its exit code.
+			const failed = await world.speculation.execute({ ...context, callID: "failed" });
+			try { expect(failed.output).toMatchObject({ isError: true, exitCode: 3, result: { content: [{ text: `${payload}
+
+Command exited with code 3` }] } }); }
+			finally { await failed.dispose(); }
 		} finally {
 			await world.dispose?.();
 			registry.dispose();
