@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { link, mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { link, mkdir, open, readFile, readdir, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
 	type ArtifactReference,
@@ -253,11 +253,7 @@ export class ProvenanceCertificateStore {
 				});
 			}
 			await rm(tomb, { recursive: true, force: true });
-			return {
-				removedCertificates: before.certificates,
-				removedArtifacts: before.artifacts,
-				removedBytes: before.totalBytes,
-			};
+			return { removedCertificates: before.certificates, removedArtifacts: before.artifacts, removedBytes: before.totalBytes };
 		});
 	}
 
@@ -282,22 +278,16 @@ export class ProvenanceCertificateStore {
 			for (const reference of references) retainedArtifacts.add(reference.digest);
 		}
 		const removed = inventory.certificates.filter((record) => !record.certificate || !retained.has(record.certificate.id));
-		const orphans = [...inventory.artifacts].flatMap(([digest, artifact]) =>
-			!retainedArtifacts.has(digest) && now - artifact.modifiedAt >= this.orphanGraceMs ? [artifact] : [],
-		);
+		// A deduplicated put renews an artifact after the inventory: re-check each orphan's age just before removal.
+		const orphans = (await Promise.all([...inventory.artifacts].map(async ([digest, artifact]) => !retainedArtifacts.has(digest) &&
+			now - artifact.modifiedAt >= this.orphanGraceMs && now - ((await stat(artifact.path).catch(() => undefined))?.mtimeMs ?? now) >= this.orphanGraceMs
+			? [artifact] : []))).flat();
 		const removals = [
 			...removed.map((record) => rm(record.path, { force: true })),
-			...removed.flatMap((record) =>
-				record.certificate
-					? [rm(this.weakReferencePath(record.certificate), { force: true })]
-					: [],
-			),
+			...removed.flatMap((record) => record.certificate ? [rm(this.weakReferencePath(record.certificate), { force: true })] : []),
 			...orphans.map((artifact) => rm(artifact.path, { force: true })),
 		];
-		await Promise.all(removals).catch(async (error) => {
-			await Promise.allSettled(removals);
-			throw error;
-		});
+		await Promise.all(removals).catch(async (error) => { await Promise.allSettled(removals); throw error; });
 		return {
 			removedCertificates: removed.length,
 			removedArtifacts: orphans.length,
@@ -428,6 +418,8 @@ async function publishImmutable(target: string, bytes: Uint8Array): Promise<bool
 			return true;
 		} catch (error) {
 			if (!hasErrorCode(error, "EEXIST")) throw error;
+			const renewed = new Date(); // An existing object is referenced again: its orphan grace restarts now.
+			await utimes(target, renewed, renewed);
 			return false;
 		}
 	} finally {

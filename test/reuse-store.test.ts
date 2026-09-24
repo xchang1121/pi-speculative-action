@@ -120,6 +120,9 @@ describe("persistent provenance store", () => {
 			removedArtifacts: phase === "delete_failure" ? 0 : 1,
 		});
 		expect(await store.stats()).toMatchObject({ certificates: 1, artifacts: 2, orphanArtifacts: 1 });
+		const graced = new ProvenanceCertificateStore(root, { maxCertificates: 1, maxBytes: 1024 * 1024, gcIntervalMs: 0, orphanGraceMs: 60_000 });
+		await utimes(artifactPaths[1]!, 1, 1); await graced.artifacts.put("orphan");
+		expect(await graced.gc()).toMatchObject({ removedArtifacts: 0 });
 		await utimes(artifactPaths[1]!, 1, 1);
 		expect(await store.gc()).toMatchObject({ removedCertificates: 0, removedArtifacts: 1 });
 		expect(await store.stats()).toMatchObject({ certificates: 1, artifacts: 1, orphanArtifacts: 0, overBudget: false });
