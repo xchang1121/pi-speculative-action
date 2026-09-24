@@ -60,8 +60,8 @@ export class DrafterUtilityGate {
 		this.observe(batch);
 	}
 
-	creditAdoption(batch: DrafterUtilityBatch, timing: ActorHitTiming): void {
-		creditAdoption(batch, timing);
+	creditAdoption(batch: DrafterUtilityBatch, timing: ActorHitTiming, shares?: number): void {
+		creditAdoption(batch, timing, shares);
 		this.observe(batch);
 	}
 

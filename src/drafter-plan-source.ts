@@ -172,35 +172,17 @@ export function createDrafterPlanSource(input: {
 				const tools = new Set(candidateNames.filter((name) => data.tools.has(name)));
 				if (!tools.size) return undefined;
 				batch = new DrafterPreparation(async (signal) => {
-					const model = (
-						typeof input.draftModel === "function"
-							? await input.draftModel(startInput.actorModel)
-							: input.draftModel) ?? startInput.actorModel;
+					const { draftModel, getDraftOptions } = input, { actorModel, actorOptions, context } = startInput;
+					const model = (typeof draftModel === "function" ? await draftModel(actorModel) : draftModel) ?? actorModel;
 					if (signal.aborted) return undefined;
-					const utility = gate.start(
-						JSON.stringify([model.provider, model.api, model.baseUrl, model.id]),
-						settings.sourceConfig?.drafterGateEnabled !== false,
-					);
-					if (!utility.allowed || !drafterContextFits(model, startInput.context, drafter.drafterMaxTokens)) return undefined;
-					const configuredDraftOptions = input.getDraftOptions
-						? await input.getDraftOptions({
-							actorModel: startInput.actorModel,
-							draftModel: model,
-							actorOptions: startInput.actorOptions,
-							signal,
-						})
-						: startInput.actorOptions;
+					const utility = gate.start(JSON.stringify([model.provider, model.api, model.baseUrl, model.id]), settings.sourceConfig?.drafterGateEnabled !== false);
+					if (!utility.allowed || !drafterContextFits(model, context, drafter.drafterMaxTokens)) return undefined;
+					const configuredDraftOptions = getDraftOptions ? await getDraftOptions({ actorModel, draftModel: model, actorOptions, signal }) : actorOptions;
 					if (signal.aborted) return undefined;
 					// Inherit transport options, while the Drafter owns its reasoning and output budget.
 					const { maxTokens: _actorMaxTokens, reasoning: requestedReasoning, ...requestOptions } = configuredDraftOptions ?? {};
-					const reasoning = clampThinkingLevel(model, input.getDraftOptions ? requestedReasoning ?? "off" : "off");
-					return {
-						model,
-						context: startInput.context,
-						options: { ...requestOptions, reasoning: reasoning === "off" ? undefined : reasoning },
-						utility,
-						tools,
-					};
+					const reasoning = clampThinkingLevel(model, getDraftOptions ? requestedReasoning ?? "off" : "off");
+					return { model, context, options: { ...requestOptions, reasoning: reasoning === "off" ? undefined : reasoning }, utility, tools };
 				});
 				batches.set(batchKey, batch);
 			}
@@ -241,17 +223,13 @@ export function createDrafterPlanSource(input: {
 		source,
 		snapshot: () => gate.snapshot(),
 		finishTurn: (sessionID, turnID) => finishBatch(agentBatchKey(sessionID, turnID)),
-		actorActionSettled: async (feedback) => {
-			const { settlement } = feedback;
-			const owner = asDrafterPlanFeedback(feedback.candidateFeedback);
-			if (
-				!owner ||
-				feedback.candidate?.source !== "drafter" ||
-				settlement.provider.kind !== "speculative" ||
-				!settlement.matchedPredictions.some((prediction) => prediction.source === "drafter")
-			)
-				return;
-			gate.creditAdoption(owner.utility, settlement.provider.timing);
+		actorActionSettled: async ({ settlement, candidate, candidateFeedback, sessionID, turnID }) => {
+			const sources = new Set(settlement.matchedPredictions.map((prediction) => prediction.source));
+			if (settlement.provider.kind !== "speculative" || !sources.has("drafter")) return;
+			// Every source that predicted the adopted call shares its credit, whichever one executed it.
+			const owner = candidate?.source === "drafter" ? asDrafterPlanFeedback(candidateFeedback) : undefined;
+			const utility = owner?.utility ?? (await batches.get(agentBatchKey(sessionID, turnID))?.ready.catch(() => undefined))?.utility;
+			if (utility) gate.creditAdoption(utility, settlement.provider.timing, sources.size);
 		},
 		finishSession: () => {
 			for (const key of batches.keys()) finishBatch(key);
