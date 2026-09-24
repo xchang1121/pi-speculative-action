@@ -140,8 +140,8 @@ interface TurnState {
 	readonly reportedCandidates: Map<string, ReportedCandidate>;
 	readonly gateKey: string;
 	readonly forkUtility: { costMs: number; benefitMs: number | undefined };
-	forkStartedAt?: number;
-	forkCompletedAt?: number;
+	/** Summed probe compute; the Actor's streaming between retries costs the fork nothing. */
+	forkBusyMs?: number;
 	forkFailed: boolean;
 	ended: boolean;
 	gateSampleRecorded: boolean;
@@ -398,8 +398,7 @@ export class SelfSpeculationCoordinator {
 			this.counters.forkRetries++;
 		}
 		this.counters.forkRequests++;
-		state.forkStartedAt ??= performance.now();
-		const signal = this.actorForkPlanSource.startProbe(state.turnID);
+		const probeStartedAt = performance.now(), signal = this.actorForkPlanSource.startProbe(state.turnID);
 		const task = this.post(
 			settings.forkPath,
 			{
@@ -420,19 +419,16 @@ export class SelfSpeculationCoordinator {
 			settings,
 			signal,
 		)
+			.finally(() => { state.forkBusyMs = (state.forkBusyMs ?? 0) + performance.now() - probeStartedAt; })
 			.then((receipt) => {
 				const outcome = this.recordReceipt(receipt, state, true);
 				const exhausted = this.actorForkPlanSource.finishProbe(state.turnID);
 				if (settings.forkActionEnabled && !outcome?.committed && !exhausted) return;
-				this.actorForkPlanSource.publish(
-					state.turnID,
-					state.settings.forkActionEnabled ? outcome?.batches ?? [] : [],
-				);
+				this.actorForkPlanSource.publish(state.turnID, state.settings.forkActionEnabled ? outcome?.batches ?? [] : []);
 				this.reconcileForkMatches(state);
 				this.finalizeGateSample(state);
 			})
 			.catch((error: unknown) => {
-				state.forkCompletedAt = performance.now();
 				this.actorForkPlanSource.finishProbe(state.turnID);
 				this.actorForkPlanSource.publish(state.turnID, []);
 				if (signal?.aborted) {
@@ -478,11 +474,7 @@ export class SelfSpeculationCoordinator {
 		const settlement = feedback.settlement;
 		if (!state || settlement.observation !== "observed") return;
 		const adopted = settlement.match.matched && settlement.match.adoption.status === "adopted";
-		this.actionEvidence.observe(
-			actionEvidenceContext(state, feedback.tool, settlement.prediction.source),
-			1,
-			adopted ? 1 : 0,
-		);
+		this.actionEvidence.observe(actionEvidenceContext(state, feedback.tool, settlement.prediction.source), 1, adopted ? 1 : 0);
 	}
 
 	endTurn(): void {
@@ -572,11 +564,7 @@ export class SelfSpeculationCoordinator {
 		const verification = record(record(receipt)?.verification);
 		if (!verification || !state.requestID) return;
 		try {
-			const outcome = parseVerificationOutcome(
-				verification,
-				state.requestID,
-				state.reportedCandidates,
-			);
+			const outcome = parseVerificationOutcome(verification, state.requestID, state.reportedCandidates);
 			this.counters.verificationRequests++;
 			this.counters.verifiedDraftProposals += outcome.speculativeSteps;
 			this.counters.verifiedDraftTokens += outcome.draftedTokens;
@@ -605,11 +593,7 @@ export class SelfSpeculationCoordinator {
 				: [...new Set(records.flatMap((candidate) => [...candidate.sources]))];
 			for (const tool of tools) {
 				for (const source of sources) {
-					this.decoderEvidence.observe(
-						decoderEvidenceContext(state, tool, source),
-						step.draftedTokens,
-						step.acceptedTokens,
-					);
+					this.decoderEvidence.observe(decoderEvidenceContext(state, tool, source), step.draftedTokens, step.acceptedTokens);
 				}
 			}
 		}
@@ -678,10 +662,7 @@ export class SelfSpeculationCoordinator {
 		this.counters.candidateReceipts++;
 		this.counters.submittedDraftTokens += nonNegativeCount(receipt.draft_token_count);
 		this.counters.acceptedDraftTokens += nonNegativeCount(receipt.accepted_token_count);
-		if (fork) {
-			this.counters.forkCompletions++;
-			state.forkCompletedAt = performance.now();
-		}
+		if (fork) this.counters.forkCompletions++;
 		const details = record(receipt.details);
 		const bundle = record(details?.bundle);
 		const actionBatches = new Map<string, ActorForkActionBatch>();
@@ -763,21 +744,11 @@ export class SelfSpeculationCoordinator {
 	}
 
 	private finalizeGateSample(state: TurnState): void {
-		if (
-			state.gateSampleRecorded ||
-			!state.ended ||
-			state.forkStartedAt === undefined ||
-			state.forkCompletedAt === undefined
-		)
-			return;
+		if (state.gateSampleRecorded || !state.ended || state.forkBusyMs === undefined) return;
 		state.gateSampleRecorded = true;
 		this.forkGate.observe(
 			state.gateKey,
-			{
-				...state.forkUtility,
-				costMs: state.forkCompletedAt - state.forkStartedAt + state.forkUtility.costMs,
-				...(state.forkFailed ? { failed: true } : {}),
-			},
+			{ ...state.forkUtility, costMs: state.forkBusyMs + state.forkUtility.costMs, ...(state.forkFailed ? { failed: true } : {}) },
 			forkGatePolicy(state.settings),
 		);
 	}

@@ -551,6 +551,29 @@ describe("self-speculation control plane", () => {
 		}
 	});
 
+	it("charges each probe's busy time to the fork gate, not the Actor's streaming between retries", async () => {
+		let now = 0, probe = 0;
+		vi.spyOn(performance, "now").mockImplementation(() => now);
+		const actorForkPlans = createActorForkPlanSource({ maxAttempts: 2, retryStreamUpdates: 1 });
+		const coordinator = coordinatorFixture([], { forkTransport: "sidecar" }, Array.from({ length: 4 }, (_, index) => `actor-${index + 1}`), (request) => {
+			if (request.path !== SELF_SPECULATION_DEFAULTS.forkPath) return {};
+			now += 100;
+			return forkReceipt("read", { path: "a.txt" }, { token_count: 2, mean: -0.1, tool_name: { minimum_probability: ++probe % 2 ? 0.5 : 0.95 } });
+		}, actorForkPlans);
+		for (let decision = 1; decision <= 4; decision++) {
+			coordinator.startTurn(`turn-${decision}`, model(), context(), decision);
+			coordinator.decorateActorPayload({ prompt: "P" });
+			coordinator.observeActorOutput(delta("thinking_delta", "first"));
+			await vi.waitFor(() => expect(coordinator.snapshot().forkCompletions).toBe(2 * decision - 1));
+			now += 1000;
+			coordinator.observeActorOutput(delta("thinking_delta", " later"));
+			await vi.waitFor(() => expect(coordinator.snapshot().forkCompletions).toBe(2 * decision));
+			coordinator.endTurn();
+		}
+		expect(coordinator.snapshot()).toMatchObject({ forkGateSamples: 4, forkGateExpectedNetBenefitMs: -200 });
+		await coordinator.dispose();
+	});
+
 	it("waits for an in-flight sidecar fork before clearing its request", async () => {
 		const requests: CapturedRequest[] = [];
 		const { promise: forkGate, resolve: releaseFork } = deferred();
