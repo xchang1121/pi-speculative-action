@@ -376,11 +376,7 @@ export class PatternAwareStore {
 			this.clock = Math.max(this.clock, pattern.lastSeenSequence);
 		}
 		for (const pool of mutablePools(parsed.events, parsed.pools)) {
-			if (
-				pool.context.length > this.settings.maxContextLength ||
-				pool.context.some((event) => event.tool === "$llm")
-			)
-				continue;
+			if (pool.context.length > this.settings.maxContextLength || pool.context.some((event) => event.tool === "$llm")) continue;
 			this.pools.set(pool.key, pool);
 			this.addControlOpportunities(pool, pool.samples, 1);
 			for (const patternID of pool.patternIDs ?? []) {
@@ -1867,7 +1863,8 @@ function structuredOutput(value: unknown): unknown {
 			return !!content && typeof content.type === "string";
 		})
 	) {
-		if (record.details !== undefined) return record.details;
+		// Empty details (a failed call's settlement) carry nothing; its text still names paths.
+		if (record.details !== undefined && Object.keys(asRecord(record.details) ?? { value: true }).length) return record.details;
 		const values = uniqueStrings(
 			record.content.flatMap((item) => {
 				const content = asRecord(item);

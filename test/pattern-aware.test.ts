@@ -1405,6 +1405,7 @@ describe("PatternAware", () => {
 			[],
 			{ output: { values: ["tests/value.test.ts::case", "abc1234"] } },
 		],
+		["failed call", { content: [{ type: "text", text: "src/broken.ts\nerror TS2322: not assignable" }], details: {} }, [], { output: { values: ["src/broken.ts"] } }],
 	] as const)("projects %s without parsing display text", (_name, output, paths, expected) => {
 		expect(projectPatternAwareObservation(output, paths)).toEqual(expected);
 	});
