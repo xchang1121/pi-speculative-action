@@ -18,14 +18,8 @@ import {
 	type ProvenanceTaint,
 	sha256Digest,
 } from "../src/provenance-certificate.ts";
-import {
-	captureAbsenceDependency,
-	captureDirectoryDependency,
-	captureFileDependency,
-	captureMetadataDependency,
-	captureSymlinkDependency,
-	validateProcessCertificate,
-} from "../src/provenance-validation.ts";
+import { captureAbsenceDependency, captureDirectoryDependency, captureFileDependency, captureMetadataDependency,
+	captureSymlinkDependency, validateDynamicDependencyCertificate, validateProcessCertificate } from "../src/provenance-validation.ts";
 
 const { create: workspace, dispose } = temporaryDirectories("pi-provenance-");
 
@@ -42,6 +36,8 @@ describe("process provenance certificates", () => {
 		await unlink(path.join(root, "b")); await unlink(path.join(root, "d"));
 		await link(path.join(root, "a"), path.join(root, "d")); await link(path.join(root, "c"), path.join(root, "b"));
 		expect(await validateProcessCertificate(certificate, { resolvePath })).toMatchObject({ status: "stale" });
+		const observed = await validateDynamicDependencyCertificate(certificate.dependencyCertificate, { resolvePath }); // The planner keys stale observations too.
+		expect(processStrongKey(certificate.weakKey, { complete: true, dependencies: observed.dependencies, taints: [] })).not.toBe(certificate.strongKey);
 	});
 	it("shares queue consumption across independent OFDs while retaining independent flags", () => {
 		const graph: ProcessResourceGraph = { handles: [0, 3, 8].map(fd => ({ fd, description: fd === 3 ? 0 : fd })),
