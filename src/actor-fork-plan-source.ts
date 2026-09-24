@@ -93,20 +93,13 @@ export class ActorForkPlanSource {
 			}
 			const batches = await this.waitForBatches(startInput.turnID, signal);
 			const allowed = new Set(candidateNames);
-			return batches
-				.filter((batch) => batch.calls.length > 0 && batch.calls.every((call) => allowed.has(call.tool)))
-				.map((batch) => ({
-					id: `self-speculation:${startInput.turnID}:${batch.id}`,
-					source: "self-speculation",
-					revision: 0,
-					actions: batch.calls.map((call) => ({
-						id: call.id,
-						type: "tool_call" as const,
-						tool: call.tool,
-						input: call.input,
-						feedback: { batchID: batch.id, batchCalls: batch.calls.map(({ id }) => id), callID: call.id, callIndex: call.index, evidence: batch.evidence },
-					})),
-				}));
+			return batches.flatMap((batch) => {
+				// As for a Drafter batch, the predictable calls of a mixed batch stay; no peer continues from a partial one.
+				const kept = batch.calls.filter((call) => allowed.has(call.tool)), whole = kept.length === batch.calls.length;
+				return kept.length ? [{ id: `self-speculation:${startInput.turnID}:${batch.id}`, source: "self-speculation", revision: 0,
+					actions: kept.map((call) => ({ id: call.id, type: "tool_call" as const, tool: call.tool, input: call.input,
+						feedback: { batchID: batch.id, ...(whole ? { batchCalls: kept.map(({ id }) => id) } : {}), callID: call.id, callIndex: call.index, evidence: batch.evidence } })) }] : [];
+			});
 		},
 	};
 
