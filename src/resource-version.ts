@@ -2,6 +2,7 @@ import { hash } from "node:crypto";
 import { type BigIntStats, type Stats, type FSWatcher, watch } from "node:fs";
 import fs, { type FileHandle } from "node:fs/promises";
 import path from "node:path";
+import { setImmediate as watcherTurn } from "node:timers/promises";
 import {
 	type ActionKey,
 	type ActionSemanticsRegistry,
@@ -1187,9 +1188,6 @@ function sameValues<Value>(left: ReadonlyArray<Value>, right: ReadonlyArray<Valu
 	return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
-function watcherTurn() {
-	return new Promise<void>((resolve) => setImmediate(resolve));
-}
 
 function errorCode(error: unknown) {
 	return error && typeof error === "object" && "code" in error ? String(error.code) : "unknown";

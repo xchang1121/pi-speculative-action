@@ -115,7 +115,7 @@ export interface PredictionFeedback<SessionID> {
 /** The concrete Actor action represented by an `actor_adopted` continuation output. */
 export type AdoptedAction = Pick<SpeculativeCandidate, "key" | "input">;
 
-interface TurnInput<SessionID> {
+export interface TurnInput<SessionID> {
 	readonly sessionID: SessionID;
 	readonly turnID: string;
 	readonly terminal?: boolean;

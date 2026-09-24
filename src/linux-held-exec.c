@@ -1447,7 +1447,18 @@ static int queue_references(struct decision_job *job, pid_t pid, int fd, const s
 }
 
 /* References outside the exec image survive its closes. No snapshot pin is an owner. */
-static int outside_references(struct decision_job *job, int pin) {
+/* Decision threads walk the tracer's process list; the tracer unlinks and releases nodes only under this lock. */
+static pthread_mutex_t process_list_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int walk_process_list(int (*walk)(struct decision_job *, int), struct decision_job *job, int pin) {
+	int state, result;
+	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &state); pthread_mutex_lock(&process_list_lock);
+	result = walk(job, pin);
+	pthread_mutex_unlock(&process_list_lock); pthread_setcancelstate(state, NULL);
+	return result;
+}
+
+static int outside_references_locked(struct decision_job *job, int pin) {
 	struct descriptor_domain *domain = job->domain;
 	if (!domain) return 3;
 	if (!domain->enabled) {
@@ -1535,7 +1546,7 @@ static void discard_captures(struct decision_job *job) {
 
 /* An observation pin is not an owner. Only a kernel-confirmed shared OFD in the
  * frozen tree grants a keeper; unknown message owners leave the proof incomplete. */
-static int outside_description(struct decision_job *job, int pin) {
+static int outside_description_locked(struct decision_job *job, int pin) {
 	struct descriptor_domain *domain = job->domain;
 	if (!domain || (domain->enabled && !owned_pin(domain, pin))) return -1;
 	unsigned object = domain->enabled ? (unsigned)(pin_object(domain, pin) - domain->objects) + 1 : 0;
@@ -1675,7 +1686,7 @@ static int descriptor_context(struct decision_job *job, char *line, size_t capac
 		used += (size_t)length;
 		if (!capture->installed) used += (size_t)sprintf(line + used, ",\"pin\":%d", pin);
 		if (S_ISREG(state.st_mode)) {
-			if (capture->alias == capture->descriptor) capture->outside = outside_description(job, pin) == 0 ? 0 : 3;
+			if (capture->alias == capture->descriptor) capture->outside = walk_process_list(outside_description_locked, job, pin) == 0 ? 0 : 3;
 			else for (unsigned previous = 0; previous < index; previous++) if (job->captures[previous].descriptor == capture->alias) capture->outside = job->captures[previous].outside;
 			used += (size_t)sprintf(line + used, ",\"outside\":%d", capture->outside);
 		}
@@ -1699,7 +1710,7 @@ static int descriptor_context(struct decision_job *job, char *line, size_t capac
 				line[used++] = "0123456789abcdef"[capture->content[byte] >> 4]; line[used++] = "0123456789abcdef"[capture->content[byte] & 15];
 			}
 			line[used++] = '"';
-			if (capture->stream) used += (size_t)sprintf(line + used, ",\"eof\":%s,\"capacity\":%d,\"outside\":%d", capture->eof ? "true" : "false", capture->capacity, outside_references(job, pin));
+			if (capture->stream) used += (size_t)sprintf(line + used, ",\"eof\":%s,\"capacity\":%d,\"outside\":%d", capture->eof ? "true" : "false", capture->capacity, walk_process_list(outside_references_locked, job, pin));
 			if (capture->messages.count) {
 				used += (size_t)sprintf(line + used, ",\"messages\":[");
 				for (unsigned message = 0; message < capture->messages.count; message++) {
@@ -2044,7 +2055,7 @@ static int resource_events(struct decision_job *job, int apply) {
 			} else {
 				if (event->kind != 4 || event->length != 1 || event->data[0] != 3) goto done;
 				if (selected[handle]) {
-					if (!apply && outside_description(job, position->duplicate) != (position->outside ? 1 : 0)) goto done;
+					if (!apply && walk_process_list(outside_description_locked, job, position->duplicate) != (position->outside ? 1 : 0)) goto done;
 					if (!position->outside) {
 						if (apply) {
 							/* The retired exec image still contains its FD slots. Removing only
@@ -2171,7 +2182,7 @@ static int resource_events(struct decision_job *job, int apply) {
 		} else if (event->kind == 4) {
 			if (position->event) goto done;
 			if (event->length != 1 || !event->data[0] || event->data[0] > 3 ||
-				(outside_references(job, position->duplicate) & event->data[0])) goto done;
+				(walk_process_list(outside_references_locked, job, position->duplicate) & event->data[0])) goto done;
 			for (unsigned cursor = 0; cursor < message_count; cursor++) if (messages[cursor].object != -1)
 				for (unsigned right = 0; right < messages[cursor].count; right++) {
 					unsigned reference = messages[cursor].rights[right];
@@ -2563,7 +2574,7 @@ static int track_process(struct traced_process **processes, pid_t pid) {
 	struct traced_process *observer = malloc(sizeof(*observer));
 	if (!observer) return -1;
 	*observer = (struct traced_process){.pid = pid, .fd = -1, .next = *processes};
-	*processes = observer;
+	pthread_mutex_lock(&process_list_lock); *processes = observer; pthread_mutex_unlock(&process_list_lock);
 	return 0;
 }
 
@@ -2572,7 +2583,7 @@ static void release_process(struct traced_process **processes, pid_t pid, struct
 	while (*cursor) {
 		struct traced_process *observer = *cursor;
 		if (observer->pid != pid) { cursor = &observer->next; continue; }
-		*cursor = observer->next;
+		pthread_mutex_lock(&process_list_lock); *cursor = observer->next; pthread_mutex_unlock(&process_list_lock);
 		if (observer->job) {
 			pthread_cancel(observer->job->thread);
 			pthread_join(observer->job->thread, NULL);
@@ -2586,7 +2597,7 @@ static void release_process(struct traced_process **processes, pid_t pid, struct
 			sent += (size_t)moved;
 		}
 		close(observer->fd);
-		drop_descriptor_table(observer, domain);
+		pthread_mutex_lock(&process_list_lock); drop_descriptor_table(observer, domain); pthread_mutex_unlock(&process_list_lock);
 		free(observer);
 	}
 }

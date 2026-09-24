@@ -36,7 +36,7 @@ import type {
 	SpeculativeCandidate,
 	SpeculativeDraftCandidate,
 	SpeculativePlanSource,
-	SpeculativeRuntimeInspection,
+	SpeculativeRuntimeInspection, TurnInput,
 } from "./runtime-contracts.ts";
 import {
 	type CandidateJoinDecision,
@@ -59,12 +59,6 @@ import type {
 import { cause } from "./settlement.ts";
 import { runSourceRequest, SourceGeneration } from "./source-request.ts";
 import { TaskTimeline, TimelineInterval } from "./task-timing.ts";
-
-interface TurnInput<SessionID> {
-	readonly sessionID: SessionID;
-	readonly turnID: string;
-	readonly terminal?: boolean;
-}
 
 class CandidateFailure extends Error {
 	readonly failure: ResolutionCause;
