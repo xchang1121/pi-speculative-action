@@ -79,7 +79,7 @@ Linux 后端可在同一会话内保留真实原生执行或已封存子进程�
 
 ### Actor probe
 
-`selfSpeculation` 默认关闭，只对权威 Actor 流生效。`sidecar` 需要实现 `/self-speculation/fork`、`candidates`、`clear` 的服务；`provider` 需要真正支持相应 SPORK 协议和概率证据的推理端，普通兼容 API 不因此获得自投机能力。
+`selfSpeculation` 默认关闭，只对权威 Actor 流生效。`sidecar` 需要实现 `/self-speculation/fork`、`candidates`、`clear` 的服务；`provider` 需要真正支持相应 SPORK 协议和概率证据的推理端，普通兼容 API 不因此获得自投机能力；只有 Actor 与 `endpoint` 同源时才在其请求中加入 `request_id` 等字段，托管 API 的请求保持原样。
 
 端点、传输方式、Actor Profile、置信度和预算在 TUI 配置。provider 控制载荷、候选及 sidecar options 显式传递 `actor_profile`。Profile 和格式覆盖必须与 Actor 实际模板和 tokenizer 一致；认证使用 `apiKeyEnv`。目标端 token 验收与工具采纳分别统计，候选注册确认不算 token 验收。
 
