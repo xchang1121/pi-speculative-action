@@ -109,6 +109,13 @@ describe("zero-modification Pi extension", () => {
 			{ reasoning: "low", apiKey: "key", headers: { a: "1", b: "2" }, env: {} });
 	});
 
+	it("warns once per unavailable Drafter model while drafting with the active model", async () => {
+		const fixture = await createFixture({ settings: { enabled: true, draftModel: "missing/model" } }), actor = testModel("actor");
+		await fixture.emit("session_start");
+		expect([fixture.drafterModel(actor), fixture.drafterModel(actor), fixture.drafterModel(actor)]).toEqual([actor, actor, actor]);
+		expect(fixture.ui.notify.mock.calls.filter(([, level]) => level === "warning")).toEqual([["Drafter model missing/model is unavailable; drafting with the active model.", "warning"]]);
+	});
+
 	it("keeps same-name extension tools authoritative and excludes them from speculation", async () => {
 		const fixture = await createFixture({ overriddenTools: ["read"] });
 		const customRead = fixture.customTools.get("read") as ToolDefinition | undefined;
@@ -623,6 +630,7 @@ async function createFixture(options: FixtureOptions = {}) {
 		actorTools, baseTools, commands, context, createExecutionWorlds, customTools, cwd, emit, handlers, host, settle,
 		executionWorlds: () => hostOptions?.executionWorlds ?? [],
 		drafterComplete: (...args: Parameters<CreateSpeculativeActionHostOptions["complete"]>) => hostOptions!.complete(...args),
+		drafterModel: (actor: ReturnType<typeof testModel>) => (hostOptions!.draftModel as (actor: unknown) => unknown)(actor),
 		executionWorldEnabled: (backend: string) => hostOptions?.speculativeExecutionWorldEnabled?.(backend),
 		hostSettings: async () => hostOptions?.getSettings?.(), resolveInvocation, store, tools, ui,
 	};

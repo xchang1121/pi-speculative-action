@@ -3,21 +3,8 @@ import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import type { AgentMessage, AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@earendil-works/pi-agent-core";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import {
-	convertToLlm,
-	createLocalBashOperations,
-	type ExtensionAPI,
-	type ExtensionCommandContext,
-	type ExtensionContext,
-	type ExtensionFactory,
-	type ExtensionUIContext,
-	getAgentDir,
-	getShellConfig,
-	type ModelRegistry,
-	SettingsManager,
-	type SourceInfo,
-	type ToolDefinition,
-} from "@earendil-works/pi-coding-agent";
+import { convertToLlm, createLocalBashOperations, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, type ExtensionFactory,
+	type ExtensionUIContext, getAgentDir, getShellConfig, SettingsManager, type SourceInfo, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import {
 	KEYABLE_TOOLS,
 	OBSERVATION_ACTION_TOOLS,
@@ -316,7 +303,7 @@ async function installController(
 ) {
 	let ui: ExtensionUIContext | undefined;
 	let latestContext = context;
-	let currentTurnID: string | undefined;
+	let currentTurnID: string | undefined, unavailableDraftModel: string | undefined;
 	const sessionID = context.sessionManager.getSessionId();
 	let lastTurnID: string | undefined;
 	let turnSequence = 0;
@@ -476,8 +463,12 @@ async function installController(
 			return provider.streamSimple({ ...model, baseUrl: auth.baseUrl ?? model.baseUrl }, llmContext, { ...options, apiKey: options?.apiKey ?? auth.apiKey,
 				headers: { ...auth.headers, ...options?.headers }, env: { ...auth.env, ...options?.env } }).result();
 		}),
-		draftModel: (actorModel) =>
-			resolveSpeculativeDraftModel(settings().draftModel, actorModel, latestContext.modelRegistry),
+		draftModel: (actorModel) => {
+			const reference = settings().draftModel, model = reference ? findExactModelReferenceMatch(reference, latestContext.modelRegistry.getAvailable()) : actorModel;
+			if (!model && reference !== unavailableDraftModel) ui?.notify(`Drafter model ${reference} is unavailable; drafting with the active model.`, "warning");
+			unavailableDraftModel = model ? undefined : reference;
+			return model ?? actorModel;
+		},
 		preflight: ({ toolName }) =>
 			latestContext.isProjectTrusted() && baseDefinitions.has(toolName) && pi.getActiveTools().includes(toolName),
 		resolveInvocation: async (tool, input) => {
@@ -1336,15 +1327,6 @@ function causeSummary(value: { readonly stage: string; readonly code: string; re
 function compactEventText(value: string): string {
 	const compact = value.replace(/\s+/g, " ").trim();
 	return compact.length <= 120 ? compact : `${compact.slice(0, 117)}...`;
-}
-
-export function resolveSpeculativeDraftModel(
-	reference: string | undefined,
-	actorModel: Model<Api>,
-	modelRegistry: ModelRegistry,
-): Model<Api> {
-	if (!reference) return actorModel;
-	return findExactModelReferenceMatch(reference, modelRegistry.getAvailable()) ?? actorModel;
 }
 
 function findExactModelReferenceMatch(reference: string, models: readonly Model<Api>[]): Model<Api> | undefined {
