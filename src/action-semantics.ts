@@ -203,17 +203,8 @@ export const READ_RANGE_ACTION_KEY_PROJECTOR: ActionKeyProjector = ownActionKeyP
 		const actorRange = readActionRange(actor);
 		if (!speculativeRange || !actorRange) return undefined;
 		if (readProjectionPartition(speculative) !== readProjectionPartition(actor)) return undefined;
-		if (
-			speculativeRange.limit === 0 ||
-			speculativeRange.offset > actorRange.offset ||
-			actorRange.offset > speculativeRange.end + 1
-		) {
-			return undefined;
-		}
-		return {
-			action: actor,
-			distance: actorRange.offset - speculativeRange.offset + Math.abs(speculativeRange.end - actorRange.end),
-		};
+		if (speculativeRange.limit === 0 || speculativeRange.offset > actorRange.offset || actorRange.offset > speculativeRange.end + 1) return undefined;
+		return { action: actor, distance: actorRange.offset - speculativeRange.offset + Math.abs(speculativeRange.end - actorRange.end) };
 	},
 	canShareInFlight: readRangesShareInFlight,
 });
@@ -463,8 +454,10 @@ function canonicalPiAction(tool: string, input: unknown, cwd: string): Canonical
 	return { resources: [resource], input: fields };
 }
 
+/** Everything but the timeout: internal process operations share a Bash key shape without a command, and never project. */
 function bashTimeoutPartition(action: ActionKey): string | undefined {
-	return action.tool === "bash" ? JSON.stringify([action.semanticsEpoch, action.schemaHash, action.executionFingerprint, action.resources, action.input.command, action.input.cwd]) : undefined;
+	return action.tool === "bash" && typeof action.input.command === "string" ? stableStringify([action.semanticsEpoch, action.schemaHash,
+		action.executionFingerprint, action.resources, Object.entries(action.input).filter(([name]) => name !== "timeout")]) : undefined;
 }
 
 function bashTimeoutCovers(speculative: ActionKey, actor: ActionKey): boolean {
