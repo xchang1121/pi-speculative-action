@@ -1,7 +1,7 @@
 import path from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
-import { relativeFilesystemPath, slash } from "./path-utils.ts";
+import { relativeFilesystemPath, sameFilesystemPath, slash } from "./path-utils.ts";
 import {
 	type EffectRequirements,
 	normalizeEffectRequirements,
@@ -259,13 +259,7 @@ export function buildActionKey(input: {
 	if (semantics && (semantics.tool !== input.tool || semantics.epoch !== semanticsEpoch)) throw new Error("action contract identity mismatch");
 	const canonicalInput = immutableSnapshot(input.input);
 	if (!isImmutableSnapshot(canonicalInput)) throw new Error("Action input has no immutable data identity");
-	const key = stableStringify({
-		tool: input.tool,
-		semanticsEpoch,
-		schemaHash,
-		executionFingerprint,
-		input: canonicalInput,
-	});
+	const key = stableStringify({ tool: input.tool, semanticsEpoch, schemaHash, executionFingerprint, input: canonicalInput });
 	return Object.freeze({
 		key,
 		hash: fastHash(key),
@@ -464,13 +458,7 @@ function canonicalPiAction(tool: string, input: unknown, cwd: string): Canonical
 function readProjectionPartition(action: ActionKey): string | undefined {
 	const range = readActionRange(action);
 	if (!range) return undefined;
-	return JSON.stringify([
-		action.semanticsEpoch,
-		action.schemaHash,
-		action.executionFingerprint,
-		action.resources,
-		range.path,
-	]);
+	return JSON.stringify([ action.semanticsEpoch, action.schemaHash, action.executionFingerprint, action.resources, range.path]);
 }
 
 /** Capture rule slots once; retain source identity only for conflicting-registration checks. */
@@ -538,7 +526,7 @@ function normalizeWorkspacePath(value: string, cwd: string, reading = false): st
 	const relative = relativeFilesystemPath(root, target);
 	if (relative === undefined) return undefined;
 	const resource = slash(relative || ".");
-	return piPaths.resolveToCwd(resource, root) === target ? resource : `./${resource}`;
+	return sameFilesystemPath(piPaths.resolveToCwd(resource, root), target) ? resource : `./${resource}`;
 }
 
 function validOptionalInteger(value: unknown, minimum: number): boolean {

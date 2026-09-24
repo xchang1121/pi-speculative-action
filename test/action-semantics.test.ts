@@ -63,6 +63,8 @@ describe("ActionSemanticsRegistry", () => {
 		});
 		expect(buildPiActionKey("ls", { path: "../outside" }, "/workspace")).toBeUndefined();
 		expect(buildPiActionKey("ls", { path: "..cache" }, "/workspace")).toBeDefined();
+		if (process.platform === "win32") for (const [cwd, target] of [["c:\\Work", "C:\\Work\\a.ts"], ["C:\\Work", "c:/Work/a.ts"], ["C:\\Work", "/c/Work/a.ts"]])
+			expect(buildPiActionKey("read", { path: target }, cwd)?.key).toBe(buildPiActionKey("read", { path: "a.ts" }, cwd)?.key); // Drive-letter spellings.
 		expect(buildPiActionKey("ls", { limit: 0 }, "/workspace")).toBeUndefined();
 		expect(buildPiActionKey("ls", { limit: 1.5 }, "/workspace")).toBeUndefined();
 		for (const tool of ["grep", "find"] as const) {

@@ -29,6 +29,7 @@ describe("filesystem path policy", () => {
 		expect(containsFilesystemPath("C:\\Work\\Repo", "C:/Work/Repo/src")).toBe(true);
 		expect(containsFilesystemPath("C:\\Work\\Repo", "D:\\Work\\Repo\\src")).toBe(false);
 		expect(containsFilesystemPath("C:\\Work\\Repo", "C:\\work\\repo\\src")).toBe(false);
+		expect([relativeFilesystemPath("c:\\Work\\Repo", "C:\\Work\\Repo\\src"), relativeFilesystemPath("C:\\Work", "c:\\Work")]).toEqual(["src", ""]);
 	});
 });
 
