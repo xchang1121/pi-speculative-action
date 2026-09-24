@@ -1117,22 +1117,14 @@ async function createGitWorkspaceTransactionDriver(workspace: PrivateSandboxWork
 
 	async function finish(capture: Capture): Promise<WorkspaceTransactionDelta> {
 		return withWorkspaceLock(lock, async () => {
-			if (!active.delete(capture)) {
-				return { complete: false, changes: [], reason: "transaction_already_settled" };
-			}
-			if (capture.contaminated) {
-				return { complete: false, changes: [], reason: "overlapping_workspace_transaction" };
-			}
-			if (!capture.before) {
-				return { complete: false, changes: [], reason: poisonReason ?? "workspace_transaction_unavailable" };
-			}
+			if (!active.delete(capture)) return { complete: false, changes: [], reason: "transaction_already_settled" };
+			if (capture.contaminated) return { complete: false, changes: [], reason: "overlapping_workspace_transaction" };
+			if (!capture.before) return { complete: false, changes: [], reason: poisonReason ?? "workspace_transaction_unavailable" };
 			try {
 				const observed = await captureStructure();
 				await advanceChangeClock(observed);
 				const after = await captureStructure();
-				if (!sameWorkspaceChangeSnapshot(observed, after)) {
-					throw new Error("workspace changed while fencing transaction endpoint");
-				}
+				if (!sameWorkspaceChangeSnapshot(observed, after)) throw new Error("workspace changed while fencing transaction endpoint");
 				const transitions = regularStructureTransitions(capture.before, after);
 				lastStructure = after;
 				if (!transitions.complete) {
@@ -1141,9 +1133,7 @@ async function createGitWorkspaceTransactionDriver(workspace: PrivateSandboxWork
 				}
 				const changes = await captureTransitions(transitions.paths, after);
 				const verified = await captureStructure();
-				if (!sameWorkspaceChangeSnapshot(after, verified)) {
-					throw new Error("workspace changed while sealing transaction endpoint");
-				}
+				if (!sameWorkspaceChangeSnapshot(after, verified)) throw new Error("workspace changed while sealing transaction endpoint");
 				lastStructure = verified;
 				return { complete: true, changes, before: capture.before, after: verified };
 			} catch (error) {
@@ -1623,12 +1613,13 @@ function snapshotPathspecs(): string[] {
 	];
 }
 
+/** Case-insensitive volumes, and win32 trailing dots and spaces, spell the same excluded entry differently. */
+const snapshotSegment = process.platform === "win32" ? (segment: string) => segment.replace(/[. ]+$/u, "").toLowerCase()
+	: process.platform === "darwin" ? (segment: string) => segment.toLowerCase() : (segment: string) => segment;
+
 function isSnapshotExcluded(relative: string): boolean {
-	const segments = relative.split("/");
-	return (
-		segments.some((segment) => (SNAPSHOT_EXCLUDES as readonly string[]).includes(segment)) ||
-		segments.some((segment) => segment.startsWith(SANDBOX_STAGING_FILE_PREFIX) && segment.endsWith(".tmp"))
-	);
+	return relative.split("/").map(snapshotSegment).some((segment) => (SNAPSHOT_EXCLUDES as readonly string[]).includes(segment) ||
+		segment.startsWith(SANDBOX_STAGING_FILE_PREFIX) && segment.endsWith(".tmp"));
 }
 
 function assertWorkspaceSandboxOpen(state: WorkspaceSandboxState): void {
@@ -1930,7 +1921,8 @@ async function assertNoDirectoryLinks(root: string, relative: string): Promise<v
 async function assertCommitTarget(change: SandboxWorkspaceChange): Promise<void> {
 	const root = path.resolve(change.root);
 	const target = path.resolve(change.target);
-	if (!containsFilesystemPath(root, target) || (target === root && !change.validationOnly) || target !== path.resolve(root, change.resource)) {
+	if (!containsFilesystemPath(root, target) || (target === root && !change.validationOnly) || target !== path.resolve(root, change.resource) ||
+		isSnapshotExcluded(slash(change.resource))) {
 		throw new Error(`sandbox commit path escapes workspace: ${change.resource}`);
 	}
 	if (change.kind === "directory" && change.operation && (change.before || !change.after)) {
