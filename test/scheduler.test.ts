@@ -38,12 +38,12 @@ describe("SpeculationScheduler", () => {
 			const job = {};
 			expect(admit(job, other).admitted).toBe(true); scheduler.complete(job);
 		}
-		const actor = {}, preview = {};
+		const actor = {}, preview = {}, blocked = {};
 		expect(admit(actor, identity, "actor", 1).admitted).toBe(true);
+		expect(admit(blocked, identity, "producer", 1)).toMatchObject({ reason: "failure_circuit" }); // Never budget_exhausted, which preempts.
 		expect(scheduler.admit(preview, consumers, 1)).toMatchObject({ admitted: false, reason: "budget_exhausted" });
 		scheduler.complete(actor);
 		expect(scheduler.admit(preview, consumers, 1).admitted).toBe(true); scheduler.complete(preview);
-		const blocked = {};
 		expect(admit(blocked)).toMatchObject({ admitted: false, reason: "failure_circuit" });
 		scheduler.observeSpeculativeService(identity, 0);
 		expect(admit(blocked).admitted).toBe(true); scheduler.complete(blocked);
@@ -375,12 +375,7 @@ describe("SpeculationScheduler", () => {
 });
 
 function forecast(overrides: Partial<PredictionForecast> = {}): PredictionForecast {
-	return {
-		tool: "read",
-		expectedDurationMs: 50,
-		decisionBatchesUntilCall: 1,
-		...overrides,
-	};
+	return { tool: "read", expectedDurationMs: 50, decisionBatchesUntilCall: 1, ...overrides };
 }
 
 function joinDecision(
@@ -388,10 +383,5 @@ function joinDecision(
 	identity: ServiceTimingIdentity,
 	overrides: Partial<Omit<CandidateJoinRequest, "identity">> = {},
 ) {
-	return scheduler.assessCandidateJoin({
-		identity,
-		state: "running",
-		expectedSpeculativeDurationMs: 1,
-		...overrides,
-	});
+	return scheduler.assessCandidateJoin({ identity, state: "running", expectedSpeculativeDurationMs: 1, ...overrides });
 }
