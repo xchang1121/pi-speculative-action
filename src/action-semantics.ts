@@ -525,18 +525,21 @@ function assertDefinitionCoherence(definition: ActionSemanticsDefinition): void 
 const require = createRequire(import.meta.url);
 let piPaths: { resolveToCwd: (value: string, cwd: string) => string; resolveReadPath: (value: string, cwd: string) => string };
 
-function normalizeWorkspacePath(value: string, cwd: string, reading = false): string | undefined {
-	// Pi does not export its path resolver. Use its installed implementation lazily;
-	// an incompatible package layout makes buildKey decline reuse, never invent an identity.
+/** Pi's resolution of a tool path; `reading` adds its filename guessing. Pi does not export the resolver, so use its installed one lazily. */
+export function resolvePiToolPath(value: string, cwd: string, reading = false): string {
 	piPaths ??= require(fileURLToPath(new URL("./core/tools/path-utils.js", import.meta.resolve("@earendil-works/pi-coding-agent"))));
-	const root = path.resolve(cwd);
-	const target = piPaths.resolveToCwd(value, root);
+	return (reading ? piPaths.resolveReadPath : piPaths.resolveToCwd)(value, cwd);
+}
+
+function normalizeWorkspacePath(value: string, cwd: string, reading = false): string | undefined {
+	// An incompatible package layout makes buildKey decline reuse, never invent an identity.
+	const root = path.resolve(cwd), target = resolvePiToolPath(value, root);
 	// Filename guessing needs a proof of the whole search, not only the chosen file.
-	if (reading && piPaths.resolveReadPath(value, root) !== target) return undefined;
+	if (reading && resolvePiToolPath(value, root, true) !== target) return undefined;
 	const relative = relativeFilesystemPath(root, target);
 	if (relative === undefined) return undefined;
 	const resource = slash(relative || ".");
-	return sameFilesystemPath(piPaths.resolveToCwd(resource, root), target) ? resource : `./${resource}`;
+	return sameFilesystemPath(resolvePiToolPath(resource, root), target) ? resource : `./${resource}`;
 }
 
 function validOptionalInteger(value: unknown, minimum: number): boolean {

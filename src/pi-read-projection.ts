@@ -36,19 +36,11 @@ export const PI_READ_RANGE_PROJECTION_RULE = {
 		const selectionEndExclusive = actorUsesDefaultLimit
 			? snapshot.totalLines + 1
 			: Math.min(actorRange.offset + actorRange.limit, snapshot.totalLines + 1);
-		if (actorRange.offset < snapshot.startLine || selectionEndExclusive > snapshot.endLineExclusive) {
-			return undefined;
-		}
+		if (actorRange.offset < snapshot.startLine || selectionEndExclusive > snapshot.endLineExclusive) return undefined;
 
-		const selectedLines = sourceLines.slice(
-			actorRange.offset - snapshot.startLine,
-			selectionEndExclusive - snapshot.startLine,
-		);
+		const selectedLines = sourceLines.slice(actorRange.offset - snapshot.startLine, selectionEndExclusive - snapshot.startLine);
 		const selectedContent = selectedLines.join("\n");
-		const truncation = truncateHead(selectedContent, {
-			maxLines: snapshot.maxLines,
-			maxBytes: snapshot.maxBytes,
-		});
+		const truncation = truncateHead(selectedContent, { maxLines: snapshot.maxLines, maxBytes: snapshot.maxBytes });
 		if (truncation.firstLineExceedsLimit) return undefined;
 
 		const startLine = actorRange.offset;
@@ -82,10 +74,7 @@ export const PI_READ_RANGE_PROJECTION_RULE = {
 			result: {
 				...output.result,
 				content: [{ type: "text", text: outputText }],
-				details: {
-					...(truncation.truncated ? { truncation } : {}),
-					[READ_RANGE_COVERAGE_DETAILS_KEY]: projectedCoverage,
-				},
+				details: { ...(truncation.truncated ? { truncation } : {}), [READ_RANGE_COVERAGE_DETAILS_KEY]: projectedCoverage },
 			},
 			isError: false,
 		};
@@ -120,10 +109,7 @@ export function withPiReadCoverage(
 ): AgentToolResult<ReadToolDetails | undefined> {
 	const coverage = inferPiReadCoverage(input, result);
 	if (!coverage) return result;
-	const details = {
-		...(result.details ?? {}),
-		[READ_RANGE_COVERAGE_DETAILS_KEY]: coverage,
-	};
+	const details = { ...(result.details ?? {}), [READ_RANGE_COVERAGE_DETAILS_KEY]: coverage };
 	return { ...result, details };
 }
 
