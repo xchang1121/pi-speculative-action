@@ -399,6 +399,16 @@ describe("PatternAware", () => {
 			.toEqual([["bash", 4]]);
 	});
 
+	test("rewrites a source path into its test path by the shared name stem", () => {
+		const store = patternStore();
+		for (const name of ["alpha", "beta", "gamma"]) {
+			store.observe(input(name, "edit", { path: `src/${name}/${name}.ts` })); store.observe(input(name, "read", { path: `src/${name}/${name}.test.ts` }));
+			store.finishSession(name);
+		}
+		store.observe(input("probe", "edit", { path: "lib/zeta.ts" }));
+		expect(store.predict("probe").map((candidate) => candidate.input)).toContainEqual({ path: "lib/zeta.test.ts" });
+	});
+
 	test("lets recent gap behavior replace stale high-volume history", () => {
 		const store = patternStore({ maxFutureGap: 8, futureGapCoverage: 0.9, decayHalfLifeEvents: 10 });
 		acceptPattern(store, { "0": 1000, "3": 10 }, {
@@ -992,11 +1002,7 @@ describe("PatternAware", () => {
 		await first.flush();
 		const store = patternStore({}, file);
 		await store.load();
-		store.observe(
-			input("probe-invalid-counts", "grep", {}, {
-				output: { results: [{ path: "src/a.ts" }, { path: "src/b.ts" }] },
-			}),
-		);
+		store.observe(input("probe-invalid-counts", "grep", {}, { output: { results: [{ path: "src/a.ts" }, { path: "src/b.ts" }] } }));
 
 		const probabilities = store
 			.predict("probe-invalid-counts")
@@ -1055,11 +1061,7 @@ describe("PatternAware", () => {
 			store.observe(input(sessionID, "read", { path: filePath, offset, limit }));
 		}
 
-		store.observe(
-			input("probe", "grep", { pattern: "symbol" }, {
-				output: { results: [{ path: "src/c.ts", line: 1_200 }] },
-			}),
-		);
+		store.observe(input("probe", "grep", { pattern: "symbol" }, { output: { results: [{ path: "src/c.ts", line: 1_200 }] } }));
 
 		expect(store.predict("probe").find((item) => item.tool === "read")?.input).toEqual({
 			path: "src/c.ts",
@@ -1350,10 +1352,7 @@ describe("PatternAware", () => {
 			let candidate = store.predict(sessionID)[0];
 			while (candidate) {
 				candidates.push(candidate);
-				candidate = store.continue(
-					candidate.continuation,
-					input(sessionID, "inspect", candidate.input, { learnTarget: false }),
-				)[0];
+				candidate = store.continue(candidate.continuation, input(sessionID, "inspect", candidate.input, { learnTarget: false }))[0];
 			}
 			return candidates;
 		};
