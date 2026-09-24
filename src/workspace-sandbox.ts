@@ -185,6 +185,7 @@ interface PooledGitRepository {
 	registration?: Promise<PooledGitRepository>;
 	idleTimer?: ReturnType<typeof setTimeout>;
 	disposal?: Promise<void>;
+	prunedAt?: number;
 }
 
 interface PreparedGitWorkspace {
@@ -252,6 +253,8 @@ function sameWorkspaceChangeSnapshot(left: WorkspaceStructureSnapshot, right: Wo
 // replaced by the private repository and commit's own temporary files are internal.
 const SNAPSHOT_EXCLUDES = [".git"] as const;
 const SANDBOX_REPOSITORY_IDLE_MS = 5 * 60 * 1000;
+/** Replaced baselines stay referenced only by live workspaces; aged loose objects are the rest of their copies. */
+const SANDBOX_PRUNE_INTERVAL_MS = 5 * 60 * 1000;
 const WORKSPACE_TRANSACTION_MAX_BYTES = 512 * 1024 * 1024;
 const WORKSPACE_TRANSACTION_MAX_FILES = 100_000;
 const WORKSPACE_TRANSACTION_STABILITY_ATTEMPTS = 3;
@@ -1142,21 +1145,11 @@ async function createGitWorkspaceTransactionDriver(workspace: PrivateSandboxWork
 					throw new Error("workspace changed while sealing transaction endpoint");
 				}
 				lastStructure = verified;
-				return {
-					complete: true,
-					changes,
-					before: capture.before,
-					after: verified,
-				};
+				return { complete: true, changes, before: capture.before, after: verified };
 			} catch (error) {
 				const reason = `workspace_transaction_capture:${errorMessage(error)}`;
 				poisonReason = reason;
-				return {
-					complete: false,
-					changes: [],
-					reason,
-					before: capture.before,
-				};
+				return { complete: false, changes: [], reason, before: capture.before };
 			}
 		});
 	}
@@ -1382,14 +1375,17 @@ async function acquireSandboxBaseline(
 				await repository.index(["read-tree", "--empty"]);
 				await repository.index(["add", "-f", "-A", "--", ...snapshotPathspecs()]);
 				const tree = (await repository.index(["write-tree"])).toString("utf8").trim();
-				const commit = tree === baseline?.tree && JSON.stringify(aliases) === JSON.stringify(baseline.aliases) ? baseline.commit : (await repository.git(
-					["commit-tree", tree, ...(baseline ? ["-p", baseline.commit] : []), "-m", "speculative baseline"],
-					{ environment: SANDBOX_AUTHOR_ENVIRONMENT },
-				)).toString("utf8").trim();
+				// Baselines are independent snapshots: a parent chain would keep every replaced copy reachable.
+				const commit = tree === baseline?.tree && JSON.stringify(aliases) === JSON.stringify(baseline.aliases) ? baseline.commit
+					: (await repository.git(["commit-tree", tree, "-m", "speculative baseline"], { environment: SANDBOX_AUTHOR_ENVIRONMENT })).toString("utf8").trim();
 				if (!warmup && (await repository.versions.validate(version)).expired) continue;
 				// An ABA during staging can restore captured source bytes after Git copied different bytes.
 				if (!warmup && (await sandboxIndexChanges(repository)).length) continue;
 				if (commit !== baseline?.commit) await repository.git(["update-ref", "refs/heads/baseline", commit]);
+				if (commit !== baseline?.commit && Date.now() >= (repository.prunedAt ?? 0) + SANDBOX_PRUNE_INTERVAL_MS) {
+					repository.prunedAt = Date.now(); // The grace keeps objects that concurrent workspace staging has not referenced yet.
+					await repository.git(["prune", "--expire=5.minutes.ago"]).catch(() => undefined);
+				}
 				repository.baseline = { commit, tree, version, aliases };
 				baseline?.version.release();
 				return repository.baseline;
