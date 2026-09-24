@@ -381,6 +381,18 @@ describe("PatternAware", () => {
 		expect(predict().empiricalProbability).toBeLessThan(before.empiricalProbability);
 	});
 
+	test("lets a new relation displace stale pools and retires each evicted pool's patterns with it", async () => {
+		const file = await patternFile(), store = patternStore({ maxPatterns: 2, maxContextLength: 1, maxFutureGap: 0, decayHalfLifeEvents: 1 }, file);
+		await store.load();
+		for (const index of [1, 2, 3, 4, 5]) for (const run of ["x", "y"]) {
+			trainGrepRead(store, `${index}${run}`, `f${index}.ts`, `schema${index}`); store.finishSession(`${index}${run}`);
+		}
+		await store.flush();
+		const targets = store.snapshot().map((pattern) => pattern.targetSchemaHash).sort(), persisted = JSON.parse(await fs.readFile(file, "utf8"));
+		expect(targets).toContain("schema5");
+		expect(persisted.pools.map((pool: { targetSchemaHash: string }) => pool.targetSchemaHash).sort()).toEqual(targets);
+	});
+
 	test("lets recent gap behavior replace stale high-volume history", () => {
 		const store = patternStore({
 				maxFutureGap: 8,
