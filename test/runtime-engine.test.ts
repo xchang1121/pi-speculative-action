@@ -106,12 +106,7 @@ function harness<SessionID = string>(input: Partial<Pick<TestAdapter<SessionID>,
 >> & {
 	readonly source: Source<SessionID>;
 	readonly peers?: readonly Source<SessionID>[];
-	readonly execute?: (
-		tool: string,
-		input: Readonly<Record<string, unknown>>,
-		signal: AbortSignal,
-		parentWorld?: WorldBranch<string>,
-	) => unknown | Promise<unknown>;
+	readonly execute?: (tool: string, input: Readonly<Record<string, unknown>>, signal: AbortSignal, parentWorld?: WorldBranch<string>, turnID?: string) => unknown;
 	readonly capture?: () => unknown | Promise<unknown>;
 	readonly validate?: (version: unknown) => ResourceValidation;
 	readonly projection?: ActionProjectionRule<string>;
@@ -133,11 +128,11 @@ function harness<SessionID = string>(input: Partial<Pick<TestAdapter<SessionID>,
 		actual: (call) => call,
 		preflightCandidate: input.preflightCandidate ?? (() => ({ ok: true })),
 		authorizeCandidate: input.authorizeCandidate,
-		executeCandidate: input.executeCandidate ?? (async ({ tool, concrete, action, route, signal, parentWorld }) => {
+		executeCandidate: input.executeCandidate ?? (async ({ startInput, tool, concrete, action, route, signal, parentWorld }) => {
 			executions++;
 			const version =
 				route.isolation === "resource_snapshot" ? await (input.capture?.() ?? { version: 1 }) : undefined;
-			const executed = await input.execute?.(tool, concrete, signal, parentWorld);
+			const executed = await input.execute?.(tool, concrete, signal, parentWorld, startInput.turnID);
 			if (isWorldBranch(executed)) return executed;
 			return world((executed as string | undefined) ?? "speculative", {
 				executionFingerprint: action.executionFingerprint,
@@ -2342,10 +2337,12 @@ describe("structural speculative runtime", () => {
 				upsert: [readAction("next", { path: "replacement.ts" })],
 			} : undefined,
 		});
+		const childTurns: (string | undefined)[] = [];
 		const { runtime } = harness({
 			source,
-			execute: (_tool, input) => {
+			execute: (_tool, input, _signal, _parent, turnID) => {
 				executed.push(String(input.path));
+				if (input.path !== "parent.ts") childTurns.push(turnID);
 				return `${String(input.path)}:output`;
 			},
 			onEvent: (event) => { childReady.observe(event); replacementReady.observe(event); },
@@ -2375,6 +2372,8 @@ describe("structural speculative runtime", () => {
 			await nextTurn();
 			expect(continuations).toEqual(["execution_succeeded", ...(phase === "retry" ? ["actor_adopted"] : [])]);
 			expect(executed).toEqual(["parent.ts", ...(retained ? [`${nextChild}.ts`] : phase === "replaced" ? ["replacement.ts"] : [])]);
+			// A child launched after its parent's turn closed runs in the live turn's execution scope.
+			if (retained) expect(childTurns).toEqual(["child-turn"]);
 			if (retained) {
 				expect((await runtime.prepareActorCall(call("child-turn", { path: `${nextChild}.ts` })))?.output).toBe(`${nextChild}.ts:output`);
 				await runtime.finishTurn({ ...call("child-turn"), terminal: true });
