@@ -28,12 +28,7 @@ describe("PatternAware", () => {
 		const paths = ["src/a.ts"], target = { filePath: "src/a.ts", offset: 1 };
 		const context = [event("one", "grep", { pattern: "TODO" }, { outputPaths: paths })];
 		const bindings = inferBindings(context, target);
-		expect(bindings['["filePath"]']).toEqual({
-			type: "event",
-			relativeEvent: -1,
-			field: "outputPaths",
-			path: [0],
-		});
+		expect(bindings['["filePath"]']).toEqual({ type: "event", relativeEvent: -1, field: "outputPaths", path: [0] });
 		expect(bindings['["offset"]']).toEqual({ type: "constant", value: 1 });
 		for (const [filePath, offset] of [["src/a.ts", 1], ["src/b.ts", 2]] as const) {
 			paths[0] = filePath;
@@ -67,10 +62,7 @@ describe("PatternAware", () => {
 
 	test("merges nested binding paths and rejects incomplete or unsafe mappings", () => {
 		const context = [event("one", "seed", { oldText: "before" })];
-		const target = {
-			range: { start: 1, end: 2 },
-			edits: [{ oldText: "before", newText: "after" }],
-		};
+		const target = { range: { start: 1, end: 2 }, edits: [{ oldText: "before", newText: "after" }] };
 
 		expect(applyBindings(inferBindings(context, target), context)).toEqual(target);
 		target.edits[0]!.newText = "changed";
@@ -94,15 +86,9 @@ describe("PatternAware", () => {
 
 	test("derives adjacent paths and commands through bounded path templates", () => {
 		const context = [event("one", "read", { filePath: "services/alpha/config.ts" })];
-		const bindings = inferBindings(context, {
-			command: "bun test services/alpha/config.test.ts",
-			workdir: "services/alpha",
-		});
+		const bindings = inferBindings(context, { command: "bun test services/alpha/config.test.ts", workdir: "services/alpha" });
 
-		expect(applyBindings(bindings, context)).toEqual({
-			command: "bun test services/alpha/config.test.ts",
-			workdir: "services/alpha",
-		});
+		expect(applyBindings(bindings, context)).toEqual({ command: "bun test services/alpha/config.test.ts", workdir: "services/alpha" });
 		const next = [event("two", "read", { filePath: "services/beta/config.ts" })];
 		for (const name of ["beta", "beta", "gamma"]) {
 			next[0]!.input.filePath = `services/${name}/config.ts`;
@@ -393,12 +379,17 @@ describe("PatternAware", () => {
 		expect(persisted.pools.map((pool: { targetSchemaHash: string }) => pool.targetSchemaHash).sort()).toEqual(targets);
 	});
 
+	test("bounds oversized payloads and never learns an action whose input it had to shorten", () => {
+		const store = patternStore(), values = Array.from({ length: 1000 }, (_, index) => `value-${index}`);
+		store.observe(input("large", "grep", { pattern: "TODO" }, { output: { values }, outputPaths: values }));
+		store.observe(input("large", "write", { path: "a.ts", content: "x".repeat(5000) }, { output: { values } }));
+		const [grep, write] = store.recent("large");
+		expect([grep!.outputPaths, (grep!.output as { values: string[] }).values]).toEqual([values.slice(0, 256), values.slice(0, 256)]);
+		expect(write).toMatchObject({ learnTarget: false, input: { path: "a.ts", content: expect.stringMatching(/^sha256:[0-9a-f]{32}$/) } });
+	});
+
 	test("lets recent gap behavior replace stale high-volume history", () => {
-		const store = patternStore({
-				maxFutureGap: 8,
-				futureGapCoverage: 0.9,
-				decayHalfLifeEvents: 10,
-			});
+		const store = patternStore({ maxFutureGap: 8, futureGapCoverage: 0.9, decayHalfLifeEvents: 10 });
 		acceptPattern(store, { "0": 1000, "3": 10 }, {
 			gapLastSeen: { "0": 0, "3": 1000 },
 			lastSeenSequence: 1000,
@@ -818,11 +809,7 @@ describe("PatternAware", () => {
 			["one", "services/a", "alpha.ts"],
 			["two", "services/b", "beta.ts"],
 		]) {
-			store.observe(
-				input(sessionID, "read", { filePath: root }, {
-					output: { preview },
-				}),
-			);
+			store.observe(input(sessionID, "read", { filePath: root }, { output: { preview } }));
 			store.observe(input(sessionID, "read", { filePath: `${root}/${preview}` }));
 			store.finishSession(sessionID);
 		}
