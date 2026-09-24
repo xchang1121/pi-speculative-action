@@ -271,6 +271,8 @@ const MAX_PATH_SOURCES = 24;
 // Bound crash-loss while amortizing full-state serialization across active tool loops.
 // Terminal/dispose paths still flush immediately.
 const PERSIST_CHECKPOINT_INTERVAL_MS = 30_000;
+/** Longer strings and lists are neither bindable nor worth their memory, persisted bytes and analysis caches. */
+const PATTERN_VALUE_MAX_CHARS = 4096, PATTERN_VALUE_MAX_ITEMS = 256;
 
 class PredictiveContextTrie {
 	private readonly root: TrieNode = { children: new Map(), patterns: new Set() };
@@ -405,13 +407,8 @@ export class PatternAwareStore {
 		if (!this.settings.enabled) return;
 		const first = inputs[0];
 		if (!first) return;
-		const events = inputs.map(
-			(input, index): PatternAwareEvent => ({
-				...input,
-				sequence: ++this.clock,
-				...(batchID ? { batchID, batchIndex: index, batchSize: inputs.length } : {}),
-			}),
-		);
+		const events = inputs.map((input, index): PatternAwareEvent => ({ ...boundedEventPayload(input), sequence: ++this.clock,
+			...(batchID ? { batchID, batchIndex: index, batchSize: inputs.length } : {}) }));
 		let session = this.sessions.get(first.sessionID);
 		if (!session) {
 			session = { history: [], pending: [], recurrentActions: new BoundedRecencyMap(this.sessionBudgets.recurrentActionsPerSession) };
@@ -2457,6 +2454,19 @@ function normalizePath(value: string) {
 
 function hash(value: string) {
 	return cryptoHash("sha256", value).slice(0, 32);
+}
+
+/** Keeps a digest of an oversized string and a list's head; an action whose input was shortened is context only, never predicted. */
+function boundedEventPayload(event: PatternAwareEventInput): PatternAwareEventInput {
+	let shortened = false;
+	const bound = (value: unknown): unknown => {
+		if (typeof value === "string" && value.length > PATTERN_VALUE_MAX_CHARS) { shortened = true; return `sha256:${hash(value)}`; }
+		if (Array.isArray(value)) { shortened ||= value.length > PATTERN_VALUE_MAX_ITEMS; return value.slice(0, PATTERN_VALUE_MAX_ITEMS).map(bound); }
+		return isObject(value) ? Object.fromEntries(Object.entries(value).map(([key, item]) => [key, bound(item)])) : value;
+	};
+	const input = bound(event.input) as Record<string, unknown>, learnTarget = shortened ? { learnTarget: false } : {};
+	return { ...event, input, ...learnTarget, ...(event.output === undefined ? {} : { output: bound(event.output) }),
+		...(event.outputPaths ? { outputPaths: event.outputPaths.slice(0, PATTERN_VALUE_MAX_ITEMS) } : {}) };
 }
 
 function probability(pattern: Pick<MutablePattern, "historicalMatches" | "historicalOpportunities">) {
