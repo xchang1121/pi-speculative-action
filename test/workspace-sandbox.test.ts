@@ -38,8 +38,9 @@ const { create: temporaryRoot, dispose: disposeRoots } = temporaryDirectories("p
 beforeEach(() => { sandbox = new WorkspaceSandboxService(); });
 vi.mock("node:fs/promises", async (original) => {
 	const fs = await original<typeof import("node:fs/promises")>();
-	return { ...fs, mkdir: vi.fn(fs.mkdir), mkdtemp: vi.fn(fs.mkdtemp), readdir: vi.fn(fs.readdir), rm: vi.fn(fs.rm), writeFile: vi.fn(fs.writeFile) };
+	return { ...fs, mkdir: vi.fn(fs.mkdir), mkdtemp: vi.fn(fs.mkdtemp), open: vi.fn(fs.open), readdir: vi.fn(fs.readdir), rm: vi.fn(fs.rm), writeFile: vi.fn(fs.writeFile) };
 });
+const fs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
 
 afterEach(async () => {
 	try { await sandbox.dispose(); }
@@ -70,7 +71,6 @@ describe("workspace-branch ExecutionWorld", () => {
 		const held = await open(a, "r"), initial = await held.stat({ bigint: true });
 		try {
 			const branch = await sandbox.fork({ cwd: root, driver, action: requiredAction("write", { path: "a", content: "after" }, root), execute: async ({ sandboxRoot, structure }) => {
-				const fs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
 				const projection = new ExecutionPathProjection({ sourceRoot: root, workspaceRoot: sandboxRoot });
 				const before = await structure.capture();
 				const bytes = new Map(await Promise.all([...before.entries].filter(([, entry]) => entry.kind === "file")
@@ -151,7 +151,6 @@ describe("workspace-branch ExecutionWorld", () => {
 	});
 
 	it("retains shared baseline work when a preparation owner cancels", async () => {
-		const fs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
 		for (const phase of ["repository", "baseline"]) for (const owner of ["none", "active", "cancelled"]) {
 			const root = await temporaryRoot(), controller = new AbortController();
 			let workspaces = 0, captures = 0;
@@ -193,7 +192,6 @@ describe("workspace-branch ExecutionWorld", () => {
 
 	it.each(["explicit", "idle", "idle-replaced"])("owns %s pool retirement through service disposal", async (retirement) => {
 		const root = await temporaryRoot();
-		const fs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
 		const first = new WorkspaceSandboxService();
 		const second = new WorkspaceSandboxService();
 		const firstWorld = first.createExecutionWorld({ driver: "git" });
@@ -263,7 +261,6 @@ describe("workspace-branch ExecutionWorld", () => {
 	});
 
 	it("retires every selected pool when another pool fails to close", async () => {
-		const fs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
 		const owner = new WorkspaceSandboxService(), pools: string[] = [], removed: string[] = [];
 		const roots = await Promise.all(["failed", "healthy", "retained"].map(() => temporaryRoot()));
 		vi.mocked(mkdtemp).mockImplementation(async (prefix, options) => {
@@ -458,7 +455,6 @@ describe("workspace-branch ExecutionWorld", () => {
 
 	it.each(["storage", "mount"])("owns partial OverlayFS %s preparation until every admitted allocation settles", async (phase) => {
 		const root = await temporaryRoot(), gate = gated(), fault = new Error("private allocation failed"), owned: string[] = [];
-		const fs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
 		const capability = vi.spyOn(LinuxOverlayfsCapabilityRegistry.prototype, "capability").mockResolvedValue({
 			available: true, binary: "unreachable-overlay-driver", fusermountBinary: "unreachable-unmount", fingerprint: "allocation-only", detail: "fixture" });
 		let action: Promise<unknown> | undefined, directory: ReturnType<typeof mkdir> | undefined, settled = false;
@@ -731,7 +727,6 @@ describe("workspace-branch ExecutionWorld", () => {
 	});
 
 	it("owns partial directory creation and permits fallback only after complete rollback", async () => {
-		const fs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
 		for (const fault of ["topology", "mkdir", "foreign"]) {
 			const root = await temporaryRoot(), template = await temporaryRoot();
 			const directory = path.join(root, "generated"), foreign = path.join(directory, "foreign.txt");
@@ -828,6 +823,16 @@ describe("workspace-branch ExecutionWorld", () => {
 				await chmod(target, 0o644);
 			}
 		}
+	});
+
+	it("declines an exclusive native write that another process created first", async () => {
+		const root = await temporaryRoot(), target = path.join(root, "value.txt");
+		vi.mocked(open).mockImplementation(async (file, flags, mode) => { if (flags === "wx") await fs.writeFile(target, "external"); return fs.open(file, flags, mode); });
+		try {
+			const error = await sandbox.commitDelta({ output: settlement("done"), changes: [{ ...fileTransition(root, "value.txt", undefined, "after"), operation: "write_contents" }] })
+				.then(() => undefined, (failure: unknown) => failure);
+			expect([isPoisonedEffectCommit(error), (error as { disposition?: string } | undefined)?.disposition, await readFile(target, "utf8")]).toEqual([false, "recoverable", "external"]);
+		} finally { vi.mocked(open).mockImplementation(fs.open); }
 	});
 
 	it.each([false, true])("drains parallel private staging before committing, failing or closing (failure=%s)", async (failure) => {
@@ -1074,7 +1079,6 @@ describe("workspace-branch ExecutionWorld", () => {
 
 	it("retires a stale prepared workspace once across competing warm-ups", async () => {
 		const root = await temporaryRoot(), gate = gated();
-		const fs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
 		const observations = vi.spyOn(ResourceVersionManager.prototype, "capture"), pending: Promise<unknown>[] = [];
 		const changes = vi.spyOn(ResourceVersionManager.prototype, "changesSince").mockReturnValue({ uncertain: true, paths: [] });
 		let heldRoot: string | undefined, removals = 0;
@@ -1116,7 +1120,6 @@ describe("workspace-branch ExecutionWorld", () => {
 
 	it.each(["none", "workspace", "registration"])("owns workspace removal and %s cleanup failure before returning", async (failure) => {
 		const root = await temporaryRoot(), gate = gated();
-		const fs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
 		await writeFile(path.join(root, "value.txt"), "before\n");
 		let owned: { processRoot: string; gitDirectory: string; dispose: () => Promise<void> } | undefined, settled = false;
 		const removed: string[] = [], fault = new Error("private removal failed");
@@ -1278,7 +1281,6 @@ describe("workspace-branch ExecutionWorld", () => {
 
 	it("drains admitted file requests and refuses cancelled or swallowed failures", async () => {
 		const root = await temporaryRoot();
-		const fs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
 		const target = path.join(root, "held.txt"), world = sandbox.createExecutionWorld();
 		try {
 			const controller = new AbortController(); controller.abort(new Error("cancelled"));

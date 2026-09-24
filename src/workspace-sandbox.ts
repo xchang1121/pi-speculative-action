@@ -610,10 +610,8 @@ async function commitSandboxExecution(
 				for (const change of orderSandboxChanges(changes)) {
 					await assertCommitTarget(change);
 					if (change.kind === "directory") {
-						if (!change.after) {
-							await rmdir(change.target);
-							applied.push(change);
-						} else if (!change.before) {
+						if (!change.after) { await rmdir(change.target); applied.push(change); }
+						else if (!change.before) {
 							await createParentDirectories(change.root, change.target, createdDirectories);
 							await mkdir(change.target, change.operation ? undefined : { mode: change.after.mode });
 							applied.push(change);
@@ -627,15 +625,14 @@ async function commitSandboxExecution(
 					}
 					if (change.object && !staged.has(change)) continue;
 					if (change.operation && !change.object) {
-						// Native writes are authoritative from their first possible effect, including mkdir.
-						applied.push(change);
+						// Native writes are authoritative from their first file effect; created parents still roll back.
 						await createParentDirectories(change.root, change.target, createdDirectories);
 						let descriptor = descriptors.get(change);
-						if (descriptor) await descriptor.truncate(0);
+						if (descriptor) { applied.push(change); await descriptor.truncate(0); }
 						else {
 							// Exclusive creation already gives an empty file; only existing files need truncation.
 							descriptor = await open(change.target, "wx", 0o666);
-							descriptors.set(change, descriptor);
+							descriptors.set(change, descriptor); applied.push(change);
 						}
 						await descriptor.writeFile(change.after!);
 						resourcesCommitted++;
