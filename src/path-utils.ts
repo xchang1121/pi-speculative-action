@@ -15,13 +15,17 @@ export function filesystemPathKey(value: string): string {
 	return slash(path.resolve(value));
 }
 
+/** Windows drive letters never distinguish case; directory names may, so they keep their exact spelling. */
+export function sameFilesystemPath(left: string, right: string): boolean {
+	const drive = (value: string) => process.platform === "win32" ? value.replace(/^[a-z](?=:)/u, (letter) => letter.toUpperCase()) : value;
+	return drive(left) === drive(right);
+}
+
 export function relativeFilesystemPath(root: string, target: string): string | undefined {
-	const resolvedRoot = path.resolve(root);
-	const resolvedTarget = path.resolve(target);
-	const relative = path.relative(resolvedRoot, resolvedTarget);
-	if (relative === "") return resolvedRoot === resolvedTarget ? "" : undefined;
+	const resolvedRoot = path.resolve(root), resolvedTarget = path.resolve(target), relative = path.relative(resolvedRoot, resolvedTarget);
+	if (relative === "") return sameFilesystemPath(resolvedRoot, resolvedTarget) ? "" : undefined;
 	if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return undefined;
-	return path.resolve(resolvedRoot, relative) === resolvedTarget ? relative : undefined;
+	return sameFilesystemPath(path.resolve(resolvedRoot, relative), resolvedTarget) ? relative : undefined;
 }
 
 export function containsFilesystemPath(root: string, target: string): boolean {
