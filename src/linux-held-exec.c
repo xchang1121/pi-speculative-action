@@ -34,6 +34,7 @@
 #include <sys/sysmacros.h>
 #include <sys/ptrace.h>
 #include <sys/prctl.h>
+#include <sys/resource.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/user.h>
@@ -752,6 +753,27 @@ static int image_dispatch(int argc, char **argv) {
 	fclose(file); file = NULL;
 	if (snprintf(invoked, sizeof(invoked), "%s/%s", fields[3], name) >= (int)sizeof(invoked) ||
 		snprintf(native, sizeof(native), "%s/%s", fields[4], name) >= (int)sizeof(native)) goto done;
+	/* The dispatcher returns here to run a bypass in place. Node reset every signal disposition (ignoring SIGPIPE and
+	 * SIGXFSZ), cleared the mask, raised the descriptor limit and may leave shared stdio non-blocking without its exit
+	 * reset: restore what this process received, then exec. */
+	unsigned long long ignored = 0, blocked = 0, limit; sigset_t mask; struct rlimit files; char recorded[96], tail;
+	unsigned status[3];
+	const char *received = getenv("PI_SPEC_NATIVE_STATE");
+	if (received) {
+		if (sscanf(received, "%llx:%llx:%llx:%x:%x:%x%c", &ignored, &blocked, &limit, &status[0], &status[1], &status[2], &tail) != 6 ||
+			getrlimit(RLIMIT_NOFILE, &files) < 0) goto done;
+		sigemptyset(&mask);
+		for (int number = 1; number <= 64; number++) {
+			if (number != SIGKILL && number != SIGSTOP) signal(number, ignored >> (number - 1) & 1 ? SIG_IGN : SIG_DFL);
+			if (blocked >> (number - 1) & 1) sigaddset(&mask, number);
+		}
+		for (int fd = 0; fd < 3; fd++) if (fcntl(fd, F_SETFL, (int)status[fd]) < 0) goto done;
+		files.rlim_cur = (rlim_t)limit;
+		if (setrlimit(RLIMIT_NOFILE, &files) < 0 || unsetenv("PI_SPEC_NATIVE_STATE") < 0 || sigprocmask(SIG_SETMASK, &mask, NULL) < 0) goto done;
+		execv(native, argv);
+		result = errno == ENOENT ? 127 : 126;
+		goto done;
+	}
 	int extra = has_unmodeled_descriptors(3);
 	if (extra < 0) goto done;
 	if (extra) {
@@ -768,6 +790,15 @@ static int image_dispatch(int argc, char **argv) {
 	command[4] = invoked;
 	command[5] = argv[0];
 	for (int index = 1; index < argc; index++) command[index + 5] = argv[index];
+	struct sigaction action;
+	if (sigprocmask(SIG_BLOCK, NULL, &mask) < 0 || getrlimit(RLIMIT_NOFILE, &files) < 0) goto done;
+	for (int number = 1; number <= 64; number++) {
+		if (sigismember(&mask, number) == 1) blocked |= 1ULL << (number - 1);
+		if (sigaction(number, NULL, &action) == 0 && action.sa_handler == SIG_IGN) ignored |= 1ULL << (number - 1);
+	}
+	for (int fd = 0; fd < 3; fd++) if ((int)(status[fd] = (unsigned)fcntl(fd, F_GETFL)) < 0) goto done;
+	snprintf(recorded, sizeof(recorded), "%llx:%llx:%llx:%x:%x:%x", ignored, blocked, (unsigned long long)files.rlim_cur, status[0], status[1], status[2]);
+	if (setenv("PI_SPEC_NATIVE_STATE", recorded, 1) < 0) goto done;
 	execv(command[0], command);
 	result = errno == ENOENT ? 127 : 126;
 	free(command);
