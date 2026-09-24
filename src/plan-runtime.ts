@@ -114,11 +114,7 @@ export class PredictionOpportunity {
 			prediction: this.identity,
 			observation: "observed",
 			actorAction: this.stateValue.actorAction,
-			match: Object.freeze({
-				matched: true,
-				relation: this.stateValue.relation,
-				adoption: freezeAdoption(adoption),
-			}),
+			match: Object.freeze({ matched: true, relation: this.stateValue.relation, adoption: freezeAdoption(adoption) }),
 		});
 	}
 
@@ -231,10 +227,10 @@ export class PlanRuntime {
 		return plan ? planSnapshot(plan) : undefined;
 	}
 
-	reserveRevision(proposalID: string): number | undefined {
+	reserveRevision(proposalID: string, minimum = 0): number | undefined {
 		const plan = this.plans.get(proposalID);
 		if (!plan) return undefined;
-		const revision = Math.max(plan.nextRevision, plan.revision + 1);
+		const revision = Math.max(plan.nextRevision, plan.revision + 1, minimum);
 		plan.nextRevision = revision + 1;
 		return revision;
 	}

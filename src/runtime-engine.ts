@@ -2115,6 +2115,7 @@ export function makeSpeculativeActionRuntime<
 								: executionDuration(settledCandidate),
 						order: settlement.actorAction.sequence,
 						signal: state.generation.signal,
+						reserveRevision: (proposalID, minimum) => state.session.plan.reserveRevision(proposalID, minimum) ?? minimum,
 					});
 					const target = state.decisionSequence + 1;
 					if (state.lifecycle !== "active" || !state.generation.active ||

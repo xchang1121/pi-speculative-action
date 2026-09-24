@@ -239,7 +239,7 @@ export function createPatternPlanSource({
 				upsert: planActions(next, context.store, data.schemaHashes, patternSettings.beamWidth, [{ actionID, condition: "execution_succeeded" }], actionID),
 			};
 		}),
-		observe: ({ data, settings, consumeInput, action, tool, concrete, output, durationMs, order, operations, signal }) => admit(settings, async (patternSettings) => {
+		observe: ({ data, settings, consumeInput, action, tool, concrete, output, durationMs, order, operations, signal, reserveRevision }) => admit(settings, async (patternSettings) => {
 			if (!patternSettings.enabled) return undefined;
 			const schemaHash = action?.schemaHash ?? data.schemaHashes[tool];
 			const parentHash = operations?.length && patternActionSemantics.actionKey(tool, concrete, schemaHash)?.hash;
@@ -265,24 +265,18 @@ export function createPatternPlanSource({
 			if (signal?.aborted) return undefined;
 			const store = await resolveStore(patternSettings);
 			const ordered = [...batch.entries()].sort(([left], [right]) => left - right).map(([, item]) => item);
-			const candidates = store.predictAfterBatch(
-				consumeInput.sessionID,
-				ordered,
-				data.schemaHashes,
-				patternSettings,
-			);
+			const candidates = store.predictAfterBatch(consumeInput.sessionID, ordered, data.schemaHashes, patternSettings);
 			const actions = planActions(candidates, store, data.schemaHashes, patternSettings.beamWidth);
 			// An observation can finish after its turn closes, or lose individual actions during admission.
 			const carried = { signature: patternPredictionSignature(candidates),
 				pending: new Set(actions.map((action) => action.feedback)), abandoned: false };
 			for (const action of actions) predictionBatches.set(action.feedback, carried);
 			carriedPredictions.set(consumeInput.sessionID, carried);
-			return {
-				id: `pattern:${consumeInput.turnID}`,
-				source: "pattern_aware",
-				revision: nextRevision(consumeInput.sessionID, consumeInput.turnID),
-				actions,
-			};
+			// Its own namespace never supersedes the turn's still-pending predictions; the runtime's revision covers continuations.
+			const id = `pattern:${consumeInput.turnID}:after`, minimum = nextRevision(consumeInput.sessionID, id);
+			const revision = reserveRevision?.(id, minimum) ?? minimum;
+			revisions.set(agentBatchKey(consumeInput.sessionID, id), revision);
+			return { id, source: "pattern_aware", revision, actions };
 		}),
 		onAdmitted: ({ feedback }) => {
 			if (lifecycle.sealed) return;

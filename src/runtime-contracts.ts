@@ -205,6 +205,8 @@ export interface SpeculativePlanSource<
 		readonly order: number;
 		/** Aborted once the turn closes: learning still applies, but its updates would be dropped. */
 		readonly signal?: AbortSignal;
+		/** A revision above `minimum` that no continuation of this proposal holds; `minimum` itself before it exists. */
+		readonly reserveRevision?: (proposalID: string, minimum: number) => number;
 	}) => MaybePromise<PlanUpdate | readonly PlanUpdate[] | undefined>;
 	/** Runs for every pending action accepted from an update, including retained identities. Binding can still reject it. */
 	readonly onAdmitted?: (input: PlanActionFeedback) => MaybePromise<void>;
