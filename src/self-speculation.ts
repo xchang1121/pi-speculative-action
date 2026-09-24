@@ -374,12 +374,14 @@ export class SelfSpeculationCoordinator {
 	observeActorOutput(event: AssistantMessageEvent): void {
 		const state = this.active;
 		if (!state || !state.settings.forkEnabled || state.settings.forkTransport !== "sidecar") return;
-		if (event.type === "toolcall_start" || event.type === "done" || event.type === "error") {
-			this.actorForkPlanSource.finishActorStream(state.turnID);
-			return;
-		}
+		if (event.type === "toolcall_start" || event.type === "done" || event.type === "error") return this.finishActorOutput();
 		const snapshot = this.actorForkPlanSource.observeActorDelta(state.turnID, event);
 		if (snapshot) this.scheduleActorProbe(state, snapshot);
+	}
+
+	/** Pi ends an Actor message with message_end, never a done update: a text-only answer leaves nothing to fork. */
+	finishActorOutput(): void {
+		if (this.active) this.actorForkPlanSource.finishActorStream(this.active.turnID);
 	}
 
 	private scheduleActorProbe(state: TurnState, snapshot?: ActorProbeSnapshot): void {
