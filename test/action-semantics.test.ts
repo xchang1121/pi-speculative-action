@@ -11,6 +11,7 @@ import {
 	BASH_TIMEOUT_ACTION_KEY_PROJECTOR,
 	buildActionKey,
 	buildPiActionKey,
+	GREP_LITERAL_ACTION_KEY_PROJECTOR,
 	KEYABLE_TOOLS,
 	OBSERVATION_ACTION_TOOLS,
 	PI_ACTION_SEMANTICS,
@@ -18,7 +19,7 @@ import {
 	UNBOUNDED_ACTION_TOOLS,
 	WORKSPACE_MUTATION_ACTION_TOOLS,
 } from "../src/action-semantics.ts";
-import { PI_BASH_TIMEOUT_PROJECTION_RULE } from "../src/pi-tool-invocation.ts";
+import { PI_BASH_TIMEOUT_PROJECTION_RULE, PI_GREP_LITERAL_PROJECTION_RULE } from "../src/pi-tool-invocation.ts";
 import {
 	RESOURCE_OBSERVATION_EFFECTS,
 	UNRESTRICTED_PROCESS_EFFECTS,
@@ -88,6 +89,24 @@ describe("ActionSemanticsRegistry", () => {
 		expect([passed, failed].map((output) => PI_BASH_TIMEOUT_PROJECTION_RULE.captureCoverage!(key(60), output))).toEqual([true, undefined]);
 		expect(await PI_BASH_TIMEOUT_PROJECTION_RULE.projectOutput!({ speculative: key(60), actor: key(120), output: passed, coverage: true,
 			keyMatch: { kind: "projected", projector: "bash.timeout", distance: 1 } })).toBe(passed);
+	});
+
+	it("filters a complete case-sensitive literal search into a search for any literal containing it", async () => {
+		const key = (pattern: string, options = {}) => buildPiActionKey("grep", { pattern, literal: true, path: "src", ...options }, "/workspace")!;
+		const match = (speculative: string, actor: string, options = {}) => actionKeyMatch(key(speculative), key(actor, options), [GREP_LITERAL_ACTION_KEY_PROJECTOR]);
+		expect(match("foo", "foobar", { limit: 5 })).toMatchObject({ kind: "projected", projector: "grep.literal", distance: 3 });
+		for (const [speculative, actor, options] of [["foobar", "foo", {}], ["foo", "foo\nbar", {}], ["foo", "Foobar", {}], ["foo", "foobar", { ignoreCase: true }],
+			["foo", "foobar", { context: 1 }], ["foo", "foobar", { glob: "*.ts" }], ["foo", "foobar", { literal: false }]] as const) expect(match(speculative, actor, options)).toBeUndefined();
+		const settle = (text: string, details?: unknown) => ({ result: { content: [{ type: "text" as const, text }], details }, isError: false });
+		expect([settle("a:1: foo"), settle("a:1: foo", { matchLimitReached: 100 }), { ...settle("a:1: foo"), isError: true }]
+			.map((output) => PI_GREP_LITERAL_PROJECTION_RULE.captureCoverage!(key("foo"), output))).toEqual([true, undefined, undefined]);
+		const project = (text: string, limit = 100) => PI_GREP_LITERAL_PROJECTION_RULE.projectOutput!({ speculative: key("foo"), actor: key("foobar", { limit }),
+			output: settle(text), coverage: true, keyMatch: { kind: "projected", projector: "grep.literal", distance: 3 } });
+		expect(await project("a.ts:1: foobar()\nb:2: c.ts:3: foo\nd.ts:4: foo")).toEqual(settle("a.ts:1: foobar()"));
+		expect(await project("d.ts:4: foo")).toEqual(settle("No matches found"));
+		expect(await project("No matches found")).toEqual(settle("No matches found"));
+		// Either split of this path could hold the match, and they disagree; at its limit the Actor would report truncation.
+		expect([await project("x:1: foobar.ts:2: foo"), await project("a.ts:1: foobar()", 1)]).toEqual([undefined, undefined]);
 	});
 
 	it("fails closed instead of folding unsupported numeric query views into valid keys", () => {
