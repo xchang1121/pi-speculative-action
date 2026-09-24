@@ -221,6 +221,21 @@ describe("speculative action host", () => {
 		}
 	});
 
+	it("splits one adoption among the sources that predicted it, whichever one executed it", async () => {
+		let now = 0;
+		vi.spyOn(performance, "now").mockImplementation(() => now);
+		const tool = createReadTool(await temporaryWorkspace());
+		const controller = createDrafterPlanSource({ sessionID: "session", complete: async () => { now += 100; return drafterCall({ path: "notes.txt" }); } });
+		await controller.source.propose({ startInput: { ...startInput(tool), sessionID: "session" }, data: { tools: new Map([["read", tool]]), schemaHashes: {} },
+			settings: { ...settings(), resourceCacheMaxEntries: 4, predictionTimeoutMs: 1000 }, definitions: [], candidateNames: ["read"], proposalIndex: 0, proposalCount: 1, signal: new AbortController().signal });
+		await controller.actorActionSettled({ sessionID: "session", turnID: "turn-1", candidate: { source: "self-speculation" } as never, settlement: {
+			provider: { kind: "speculative", timing: { executionAheadMs: 0, attemptLeadMs: 0, hitLatencyMs: 20, expectedActorMs: 420 } },
+			matchedPredictions: [{ source: "drafter" }, { source: "self-speculation" }] } as never });
+		controller.finishTurn("session", "turn-1");
+		await Promise.resolve();
+		expect(controller.snapshot()).toMatchObject({ samples: 1, expectedNetBenefitMs: 420 / 2 - 20 / 2 - 100 });
+	});
+
 	it("counts Drafter tokens of empty and failed requests when they are spent", async () => {
 		const cwd = await temporaryWorkspace(), tool = createReadTool(cwd), replies = [assistant([{ type: "text", text: "no tool" }], "stop"), assistant([], "error")];
 		const { host, events } = drafterHost("session", { cwd, complete: async () => replies.shift()!, getSettings: () => settings(2) });
