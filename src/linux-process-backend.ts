@@ -118,7 +118,7 @@ import { containsFilesystemPath as pathContains, relativeFilesystemPath, slash }
 const BACKEND_EPOCH = "pi-linux-process-instance-inputs";
 const POLICY_ID = "sandlock-virtual-root-transparent-exec";
 const LEAF_POLICY_ID = "sandlock-virtual-workspace-leaf";
-const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
+const MAX_REQUEST_BYTES = 4 * 1024 * 1024, LEARNED_LAUNCHES = 64;
 const MAX_CONTINUATION_BYTES = 65 * 1024 * 1024;
 const IO_FRONTIERS = new Map([[0, "read"], [1, "write"], [19, "readv"], [20, "writev"], [44, "sendto"], [45, "recvfrom"], [46, "sendmsg"], [47, "recvmsg"]]);
 const MAX_CAPTURE_BYTES = 512 * 1024 * 1024;
@@ -299,15 +299,15 @@ type ReadyProcessPlan = Exclude<ProcessReusePlan, { kind: "miss" }>;
 
 /** Linux-only process substrate. Unavailable dependencies remove the route instead of weakening it. */
 export class LinuxProcessReuseBackend {
-	private readonly observations = new AsyncLocalStorage<{ scope: ExecutionScope; sequence: number; closed: boolean;
-		learn: boolean; inputs?: (path: string) => Iterable<object>; bindings: Map<number, ProcessExecutionBinding>; computations: TimelineDependency[] }>();
+	private readonly observations = new AsyncLocalStorage<{ scope: ExecutionScope; sequence: number; closed: boolean; learn: boolean; learned: Set<string>;
+		inputs?: (path: string) => Iterable<object>; bindings: Map<number, ProcessExecutionBinding>; computations: TimelineDependency[] }>();
 
 	/** Keep actual completed launches and acknowledged adoptions in their enclosing native call's order. */
 	async observeBindings<Value>(scope: ExecutionScope, execute: () => Promise<Value>,
 		observe: (bindings: readonly ProcessExecutionBinding[], computations: readonly TimelineDependency[]) => void, learn = false,
 		inputs?: (path: string) => Iterable<object>): Promise<Value> {
 		const observation = { scope: snapshotExecutionScope(scope)!, sequence: 0, closed: false,
-			learn, inputs, bindings: new Map<number, ProcessExecutionBinding>(), computations: [] as TimelineDependency[] };
+			learn, learned: new Set<string>(), inputs, bindings: new Map<number, ProcessExecutionBinding>(), computations: [] as TimelineDependency[] };
 		try { return await this.observations.run(observation, execute); }
 		finally {
 			observation.closed = true;
@@ -1016,25 +1016,17 @@ export class LinuxProcessReuseBackend {
 		record("validationArtifactBytesRead", lookup.artifactBytesRead);
 	}
 
-	private async actorReplayMiss(
-		host: ProcessExecutor,
-		request: ProcessExecutionRequest,
-		timing?: ServiceTimingIdentity,
-	): Promise<ProcessExecutionResult> {
+	private async actorReplayMiss(host: ProcessExecutor, request: ProcessExecutionRequest, timing?: ServiceTimingIdentity): Promise<ProcessExecutionResult> {
 		this.addActor("wholeCommandMisses");
 		const started = performance.now();
 		try {
 			return await host.execute(request);
-		} finally {
-			if (timing && !request.signal?.aborted) {
-				this.processScheduler.observeActorService(timing, Math.max(0, performance.now() - started));
-			}
-		}
+		} finally { if (timing && !request.signal?.aborted) this.processScheduler.observeActorService(timing, Math.max(0, performance.now() - started)); }
 	}
 
 	private async decideHeldExec(process: HeldExecProcess, scope?: ExecutionScope): Promise<HeldExecDecision> {
 		const observation = this.observations.getStore();
-		const learning = observation?.learn && !observation.closed && sameScope(observation.scope, scope);
+		let learning = observation?.learn && !observation.closed && sameScope(observation.scope, scope);
 		const order = observation ? ++observation.sequence : 0;
 		const requestStarted = performance.now();
 		this.addActor("requests");
@@ -1048,6 +1040,12 @@ export class LinuxProcessReuseBackend {
 				// An acquisition hint lives in the existing bounded binding owner, never in a prediction or result cache.
 				this.handoffs.observe(sha256Digest(`queue-tracking:${sourceRoot}`), executablePath, scope!, { trackingOnly: true, sourceRoot }, 0);
 				this.addActor("misses"); return { kind: "continue" };
+			}
+			// A call learns each distinct launch once, and at most LEARNED_LAUNCHES of them: an exec-dense loop or build
+			// would otherwise pay a held inspection and a whole-executable digest on every exec.
+			if (learning) {
+				const launch = `${executablePath}\0${await readFile(`/proc/${process.pid}/cmdline`, "latin1")}`, learned = observation!.learned;
+				if (learning = learned.size < LEARNED_LAUNCHES && !learned.has(launch)) learned.add(launch);
 			}
 			const available = this.handoffs.mayHaveExecutable(executablePath) || await this.store.mayHaveCertificates(executablePath) ||
 				this.handoffs.mayHaveExecutable(executablePath);
