@@ -186,7 +186,7 @@ export async function captureFileDependency(
 			if (!physical) throw new Error(`alias_unmapped:${logical}`);
 			return lstat(physical, { bigint: true });
 		}));
-		if (content.stat.nlink !== BigInt(aliases.length) || states.some(state => !state.isFile() || !sameFilesystemIdentity(content.stat, state))) aliases = [];
+		if (content.stat.nlink !== BigInt(aliases.length) || states.some(state => !state.isFile() || !sameFilesystemIdentity(content.stat, state))) aliases = undefined; // Changed topology: a plain file entry.
 	}
 	return {
 		dependency: {
