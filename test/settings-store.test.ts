@@ -61,21 +61,27 @@ describe("extension-owned speculative settings", () => {
 		expect(store.effective()).toMatchObject({ enabled: true, candidateLimit: 6, draftModel: "openai/draft" });
 	});
 
-	it("recovers from malformed input and failed publication without poisoning future writes", async () => {
+	it("keeps malformed input, reports failed publication and persists only values the lower layer lacks", async () => {
 		const { agent, cwd } = await fixture();
 		const target = path.join(agent, "speculative-action.json");
-		await writeFile(target, "{broken", "utf8");
+		await writeFile(target, "﻿{broken", "utf8");
 		const store = new SpeculativeActionSettingsStore(cwd, agent);
 		await expect(store.load()).resolves.toBeUndefined();
 		expect(store.effective()).toBeUndefined();
+		store.setEffective({ enabled: false });
+		await expect(store.flush()).rejects.toThrow("not valid JSON");
+		expect(await readFile(target, "utf8")).toBe("﻿{broken");
 		await rm(target);
 		await mkdir(target);
 		store.setEffective({ enabled: false });
 		await expect(store.flush()).rejects.toThrow();
 		await rm(target, { recursive: true });
-		store.setEffective({ enabled: true });
+		store.setEffective({ enabled: true, candidateLimit: 2 }, { enabled: false, candidateLimit: 2 });
 		await store.flush();
 		expect(JSON.parse(await readFile(target, "utf8"))).toEqual({ enabled: true });
+		await writeFile(target, "﻿" + JSON.stringify({ enabled: false }));
+		await store.load();
+		expect(store.effective()).toEqual({ enabled: false });
 	});
 });
 

@@ -47,7 +47,7 @@ import type {
 import { normalizeSelfSpeculationSettings, type SelfSpeculationSettingsInput } from "./self-speculation.ts";
 import { makeSpeculativeActionRuntime } from "./runtime.ts";
 import { stableValueHash } from "./stable-value-hash.ts";
-import { booleanOr, nonNegativeInteger, positiveInteger } from "./setting-input.ts";
+import { booleanOr, positiveInteger } from "./setting-input.ts";
 import { immutableSnapshot, isImmutableSnapshot } from "./stable-json.ts";
 import { toolErrorSettlement, type ToolInvocation, type ToolSettlement } from "./tool-settlement.ts";
 import { ToolExecutionGateway, type ToolOperation } from "./tool-execution-gateway.ts";
@@ -76,7 +76,7 @@ export function normalizeSpeculativeAgentSettings(input: SpeculativeAgentSetting
 		maxConcurrentActions: clampCandidateLimit(input.maxConcurrentActions ?? DEFAULTS.maxConcurrentActions),
 		resourceCacheMaxEntries: positiveInteger(input.resourceCacheMaxEntries, DEFAULTS.resourceCacheMaxEntries),
 		resourceCacheMaxBytes: positiveInteger(input.resourceCacheMaxBytes, DEFAULTS.resourceCacheMaxBytes),
-		predictionTimeoutMs: nonNegativeInteger(input.predictionTimeoutMs, DEFAULTS.predictionTimeoutMs),
+		predictionTimeoutMs: positiveInteger(input.predictionTimeoutMs, DEFAULTS.predictionTimeoutMs),
 		patternAware: patternAwareSettings(input.patternAware ?? PATTERN_AWARE_DEFAULTS),
 		selfSpeculation: normalizeSelfSpeculationSettings(input.selfSpeculation),
 		tools: normalizeSpeculativeToolSelection(input.tools, allowed),

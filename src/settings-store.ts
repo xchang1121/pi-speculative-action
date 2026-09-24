@@ -29,6 +29,8 @@ export class SpeculativeActionSettingsStore {
 	private project: SettingsOverlay | undefined;
 	private scopeValue: SpeculativeSettingsScope = "global";
 	private writeQueue: Promise<void> = Promise.resolve();
+	/** Hand-edited files that failed to parse: ignored when read and never replaced by a save. */
+	private readonly unreadable = new Set<string>();
 
 	readonly cwd: string;
 	readonly agentDirectory: string;
@@ -40,8 +42,9 @@ export class SpeculativeActionSettingsStore {
 
 	/** An untrusted checkout cannot configure the extension; a trusted one still cannot redirect conversation or keys. */
 	async load(trusted = true): Promise<void> {
-		[this.global, this.project] = await Promise.all([readSettings(this.globalPath), trusted ? readSettings(this.projectPath).then(userScoped) : undefined]);
-		this.scopeValue = this.project ? "project" : "global";
+		const read = (file: string) => readSettings(file, this.unreadable);
+		[this.global, this.project] = await Promise.all([read(this.globalPath), trusted ? read(this.projectPath).then(userScoped) : undefined]);
+		this.scopeValue = this.project || this.unreadable.has(this.projectPath) ? "project" : "global";
 	}
 
 	get scope(): SpeculativeSettingsScope {
@@ -60,9 +63,11 @@ export class SpeculativeActionSettingsStore {
 		return applyOverlay(this.global, scope === "project" ? this.project : undefined);
 	}
 
-	setEffective(value: SpeculativeActionPackageSettings, inherited = this.editable("global")): void {
-		if (this.scopeValue === "project") this.project = userScoped(diffRecord(inherited as SettingsOverlay ?? {}, value as SettingsOverlay));
-		else this.global = structuredClone(value) as SettingsOverlay;
+	/** Each scope persists only its differences from the layer below: defaults for global, global for project. */
+	setEffective(value: SpeculativeActionPackageSettings, inherited = this.scopeValue === "project" ? this.editable("global") : undefined): void {
+		const overlay = diffRecord(inherited as SettingsOverlay ?? {}, value as SettingsOverlay);
+		if (this.scopeValue === "project") this.project = userScoped(overlay);
+		else this.global = overlay;
 		this.persistSelected();
 	}
 
@@ -75,7 +80,10 @@ export class SpeculativeActionSettingsStore {
 	private persistSelected(): void {
 		const snapshot = structuredClone(this.scopeValue === "project" ? this.project : this.global);
 		const target = this.scopeValue === "project" ? this.projectPath : this.globalPath;
-		this.writeQueue = this.writeQueue.catch(() => undefined).then(() => writeJsonFile(target, snapshot, 2));
+		this.writeQueue = this.writeQueue.catch(() => undefined).then(async () => {
+			if (this.unreadable.delete(target) && (await readSettings(target, this.unreadable), this.unreadable.has(target))) throw new Error(`${target} is not valid JSON; fix or remove it before saving`);
+			await writeJsonFile(target, snapshot, 2);
+		});
 		void this.writeQueue.catch(() => undefined);
 	}
 
@@ -92,12 +100,13 @@ export class SpeculativeActionSettingsStore {
 	}
 }
 
-async function readSettings(file: string): Promise<SettingsOverlay | undefined> {
+async function readSettings(file: string, unreadable: Set<string>): Promise<SettingsOverlay | undefined> {
 	try {
-		const parsed: unknown = JSON.parse(await readFile(file, "utf8"));
+		const parsed: unknown = JSON.parse((await readFile(file, "utf8")).replace(/^﻿/u, ""));
 		return isRecord(parsed) && Object.keys(parsed).length > 0 ? parsed : undefined;
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT" || error instanceof SyntaxError) return undefined;
+		if (error instanceof SyntaxError) return void unreadable.add(file);
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
 		throw error;
 	}
 }

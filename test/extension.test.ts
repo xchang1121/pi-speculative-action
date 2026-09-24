@@ -444,7 +444,7 @@ describe("zero-modification Pi extension", () => {
 		});
 		fixture.ui.input = async (title) =>
 			({
-				"Prediction wait limit (ms)": "0",
+				"Prediction wait limit (ms)": "1",
 				"Maximum Drafter output tokens (blank for provider default)": "",
 				"Live result memory (MiB)": "96",
 				"Reusable command history entries": "2048",
@@ -460,7 +460,7 @@ describe("zero-modification Pi extension", () => {
 		await fixture.commands.get("speculative-action")?.handler("", fixture.context as ExtensionCommandContext);
 
 		expect(fixture.store.effective()).toMatchObject({
-			predictionTimeoutMs: 0, drafterMaxDepth: 1,
+			predictionTimeoutMs: 1, drafterMaxDepth: 1,
 			resourceCacheMaxBytes: 96 * 1024 * 1024,
 			executionStoreMaxEntries: 2048,
 			executionStoreMaxBytes: 768 * 1024 * 1024,
