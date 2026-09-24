@@ -113,7 +113,6 @@ export function createDrafterPlanSource(input: {
 		prefix: string, depth = 0, dependsOn?: PlanAction["dependsOn"]) => {
 		signal.throwIfAborted();
 		gate.requestStarted(batch.utility);
-		const startedAt = performance.now();
 		let failed = false;
 		try {
 			const { options } = batch, forced = options.toolChoice === "required" ? { onPayload: forceToolChoice(options.onPayload) } : {};
@@ -134,7 +133,7 @@ export function createDrafterPlanSource(input: {
 			failed = !signal.aborted;
 			throw error;
 		} finally {
-			gate.requestSettled(batch.utility, performance.now() - startedAt, failed);
+			gate.requestSettled(batch.utility, failed);
 		}
 	};
 	const source: AgentPlanSource = {
@@ -231,10 +230,7 @@ export function createDrafterPlanSource(input: {
 			const utility = owner?.utility ?? (await batches.get(agentBatchKey(sessionID, turnID))?.ready.catch(() => undefined))?.utility;
 			if (utility) gate.creditAdoption(utility, settlement.provider.timing, sources.size);
 		},
-		finishSession: () => {
-			for (const key of batches.keys()) finishBatch(key);
-			gate.reset();
-		},
+		finishSession: () => { for (const key of batches.keys()) finishBatch(key); },
 	};
 }
 

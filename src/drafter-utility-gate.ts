@@ -1,10 +1,8 @@
 import { creditAdoption, BenefitGate, DEFAULT_BENEFIT_GATE_POLICY, type BenefitGatePolicy } from "./fork-benefit-gate.ts";
-import { nonNegativeFinite as metric } from "./number-utils.ts";
 import type { ActorHitTiming } from "./settlement.ts";
 
 export interface DrafterUtilityBatch {
 	readonly key: string;
-	readonly generation: number;
 	readonly policy: BenefitGatePolicy;
 	readonly allowed: boolean;
 	startedRequests: number;
@@ -22,10 +20,12 @@ export interface DrafterUtilityGateSnapshot {
 	readonly expectedNetBenefitMs?: number;
 }
 
-/** Batch-atomic action utility accounting over the shared rolling benefit policy. */
+/**
+ * Batch-atomic action utility over the shared rolling benefit policy. Drafter requests run beside the Actor, so only
+ * adoption latency is Actor-visible cost; request tokens are a separate budget. State spans prompts of one session.
+ */
 export class DrafterUtilityGate {
 	private readonly gate = new BenefitGate();
-	private generation = 0;
 	private skippedBatches = 0;
 	private latestKey?: string;
 
@@ -34,18 +34,7 @@ export class DrafterUtilityGate {
 		const decision = this.gate.decide(key, policy);
 		this.latestKey = key;
 		if (!decision.allowed) this.skippedBatches++;
-		return {
-			key,
-			generation: this.generation,
-			policy,
-			allowed: decision.allowed,
-			startedRequests: 0,
-			pendingRequests: 0,
-			costMs: 0,
-			benefitMs: 0,
-			failed: false,
-			finished: false,
-		};
+		return { key, policy, allowed: decision.allowed, startedRequests: 0, pendingRequests: 0, costMs: 0, benefitMs: 0, failed: false, finished: false };
 	}
 
 	requestStarted(batch: DrafterUtilityBatch): void {
@@ -53,9 +42,8 @@ export class DrafterUtilityGate {
 		batch.pendingRequests++;
 	}
 
-	requestSettled(batch: DrafterUtilityBatch, costMs: number, failed = false): void {
+	requestSettled(batch: DrafterUtilityBatch, failed = false): void {
 		batch.pendingRequests--;
-		batch.costMs += metric(costMs);
 		batch.failed ||= failed;
 		this.observe(batch);
 	}
@@ -81,22 +69,8 @@ export class DrafterUtilityGate {
 		};
 	}
 
-	reset(): void {
-		this.generation++;
-		this.gate.reset();
-		this.skippedBatches = 0;
-		this.latestKey = undefined;
-	}
-
 	private observe(batch: DrafterUtilityBatch): void {
-		if (
-			batch.generation !== this.generation ||
-			!batch.allowed ||
-			!batch.policy.enabled ||
-			!batch.finished ||
-			batch.startedRequests === 0 || batch.pendingRequests > 0
-		)
-			return;
+		if (!batch.allowed || !batch.policy.enabled || !batch.finished || batch.startedRequests === 0 || batch.pendingRequests > 0) return;
 		if (batch.update) batch.update(batch);
 		else batch.update = this.gate.observe(batch.key, batch, batch.policy);
 	}
