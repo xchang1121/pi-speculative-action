@@ -1369,6 +1369,19 @@ describe("structural speculative runtime", () => {
 		expect(dispose).toHaveBeenCalledOnce();
 	});
 
+	it("aborts the observation signal of a closing turn so sources skip dropped predictions", async () => {
+		const gate = deferred<void>(), aborted: boolean[] = [];
+		const { runtime } = harness({ source: planSource({ propose: () => undefined,
+			observe: async ({ signal }) => { if (!aborted.length) await gate.promise; aborted.push(Boolean(signal?.aborted)); return undefined; } }) });
+		try {
+			await runtime.startTurn(start("turn"));
+			for (const id of ["first", "second"]) await runFallback(runtime, { ...call("turn"), id });
+			const closing = runtime.finishTurn(call("turn"));
+			gate.resolve(); await closing;
+			expect(aborted).toEqual([true, true]);
+		} finally { await runtime.dispose(); }
+	});
+
 	it("keeps running work through an unbounded native call and adopts it after validation", async () => {
 		const started = deferred<void>(), release = deferred<void>();
 		const { runtime, executions } = harness({ actionKey: (tool, args) => buildPiActionKey(tool, args, process.cwd()),

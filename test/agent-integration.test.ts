@@ -1247,6 +1247,19 @@ describe("speculative action host", () => {
 		} finally { await controller.dispose(); await lease.release(); }
 	});
 
+	it("records a closing turn's observation without predicting from it", async () => {
+		const cwd = await temporaryWorkspace(), tool = createReadTool(cwd), patternAware = patternAwareSettings({ enabled: true, multiStepEnabled: true });
+		const store = new PatternAwareStore(patternAware, undefined, patternAwareActionSemantics(PI_ACTION_SEMANTICS, cwd)), predict = vi.spyOn(store, "predictAfterBatch");
+		const request = patternRequest(tool, patternAware, "session", { read: "schema" });
+		const controller = createPatternPlanSource({ sessionID: "session", cwd, store, actionSemantics: PI_ACTION_SEMANTICS, projectionRules: [] });
+		try {
+			for (const signal of [AbortSignal.abort(), new AbortController().signal]) await controller.source.observe!({ ...request, signal,
+				consumeInput: { sessionID: "session", turnID: request.startInput.turnID, tool: "read", args: { path: "a.txt" }, tools: [tool] },
+				tool: "read", concrete: { path: "a.txt" }, output: { result: textResult("a"), isError: false }, durationMs: 1, order: 0 });
+			expect(predict).toHaveBeenCalledOnce();
+		} finally { await controller.dispose(); }
+	});
+
 	it.each([false, true])("retires failed internal bindings without training misses or discarding a newer observation (recurring=%s)", async (recurring) => {
 		const cwd = await temporaryWorkspace(), tool = createReadTool(cwd);
 		const patternAware = patternAwareSettings({ enabled: true, multiStepEnabled: false, beamWidth: 4 });
