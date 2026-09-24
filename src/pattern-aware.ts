@@ -561,8 +561,7 @@ export class PatternAwareStore {
 		this.ensureIndex();
 		for (const { pattern, context } of this.trie.matching(history, this.contextStarts(history))) {
 			const patternID = pattern.id;
-			if (continuation.visitedPatternIDs.includes(patternID) || !structurallyEligible(pattern, settings))
-				continue;
+			if (continuation.visitedPatternIDs.includes(patternID) || !structurallyEligible(pattern, settings)) continue;
 			const supportingSessions = this.patternSupportSessions.get(patternID);
 			if (
 				activeSessionID !== undefined &&
@@ -2279,9 +2278,7 @@ function numericRecord(value: unknown): Record<string, number> | undefined {
 }
 
 function mutablePools(eventsValue: ReadonlyArray<unknown>, pools: ReadonlyArray<unknown>): PatternPool[] {
-	const events = eventsValue.map((item) =>
-		isPersistedEvent(item) ? (structuredClone(item) as PatternAwareEvent) : undefined,
-	);
+	const events = eventsValue.map((item) => isPersistedEvent(item) ? (structuredClone(item) as PatternAwareEvent) : undefined);
 	return pools.flatMap((value) => {
 		const record = asRecord(value);
 		if (!record || !Array.isArray(record.samples) || typeof record.key !== "string" ||
