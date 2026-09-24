@@ -298,6 +298,15 @@ describe("SpeculationScheduler", () => {
 		}
 	});
 
+	it("keeps a long action's forecast and elapsed time above a short-command timing class", () => {
+		const scheduler = new SpeculationScheduler<object>(), ls = { tool: "bash", executionFingerprint: "linux-world", actionKeyHash: "ls" };
+		for (const duration of [202, 204, 200, 206]) scheduler.observeSpeculativeService(ls, duration);
+		for (const duration of [20.8, 20.1, 20.1, 20.1]) scheduler.observeActorService({ ...ls, actionKeyHash: "git-status" }, duration);
+		const npmTest = { ...ls, actionKeyHash: "npm-test" }, running = { state: "running" as const, elapsedMs: 616 };
+		expect(joinDecision(scheduler, npmTest, { ...running, expectedSpeculativeDurationMs: 2000 })).toMatchObject({ allowed: true, expectedRemainingMs: 1384, waitBudgetMs: 1755 });
+		expect(joinDecision(scheduler, npmTest, { ...running, expectedSpeculativeDurationMs: undefined })).toMatchObject({ allowed: true, waitBudgetMs: 591 });
+	});
+
 	it("bounds an uncalibrated join while wider timing classes transfer across exact actions", () => {
 		const scheduler = new SpeculationScheduler<object>({
 			candidateJoinPolicy: { warmupWaitMs: 17 },

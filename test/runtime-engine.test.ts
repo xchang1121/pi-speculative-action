@@ -633,6 +633,18 @@ describe("structural speculative runtime", () => {
 		await runtime.finishTurn({ ...call("turn"), terminal: true });
 	});
 
+	it("waits for an unmeasured run up to the Actor's own cost rather than a placeholder duration", async () => {
+		const started = deferred<void>(), { runtime } = harness({ source: planSource({ propose: ({ startInput }) => startInput.turnID === "cold" ? plan("cold") : undefined }),
+			execute: async () => { started.resolve(); await new Promise((resolve) => setTimeout(resolve, 150)); return "cold"; } });
+		try {
+			await runtime.startTurn(start("calibration"));
+			await runFallback(runtime, call("calibration"), 1000);
+			await runtime.finishTurn({ ...call("calibration"), terminal: false });
+			await runtime.startTurn(start("cold")); await started.promise;
+			expect((await runtime.prepareActorCall(call("cold")))?.output).toBe("cold");
+		} finally { await runtime.dispose(); }
+	});
+
 	it("bounds an uncalibrated in-flight join and falls back without cancelling the learning run", async () => {
 		let enabled = false;
 		const gate = gated();
