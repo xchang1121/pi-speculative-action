@@ -105,11 +105,7 @@ if [[ "$sdk_source_kind" == vendored ]]; then
 fi
 
 if [[ -z "$tt_bin" ]]; then
-    if [[ -x /usr/bin/tt ]]; then
-        tt_bin=/usr/bin/tt
-    else
-        tt_bin="$(command -v tt || true)"
-    fi
+    if [[ -x /usr/bin/tt ]]; then tt_bin=/usr/bin/tt; else tt_bin="$(command -v tt || true)"; fi
 fi
 [[ -n "$tt_bin" && -x "$tt_bin" ]] || die "the current ThinkThread tt binary is unavailable"
 
@@ -144,7 +140,7 @@ rollback_and_cleanup() {
         for target in "${creations[@]}"; do rm -rf -- "$target" || failed=true; done
     fi
     if [[ "$failed" == true ]]; then
-        printf 'Rollback incomplete; recovery files retained at %s\\n' "$transaction_root" >&2
+        printf 'Rollback incomplete; recovery files retained at %s\n' "$transaction_root" >&2
         exit 1
     fi
     rm -rf -- "$transaction_root"
@@ -192,8 +188,10 @@ speculative_version="$(tar -xOf "$speculative_archive" package/package.json | no
         "@earendil-works/pi-coding-agent@$speculative_version"
 )
 
-install -m 0644 "$package_root/.thinkthread/speculative-action.json" \
-    "$payload_root/config/speculative-action.json"
+# Global TUI settings live in this config directory: carry them forward and seed defaults only on first install.
+config_source="$install_root/config/speculative-action.json"
+[[ -f "$config_source" ]] || config_source="$package_root/.thinkthread/speculative-action.json"
+install -m 0644 "$config_source" "$payload_root/config/speculative-action.json"
 
 sdk_entry="$payload_root/runtime/node_modules/@thinkthread/agent-posix/dist/index.js"
 runner_entry="$payload_root/runtime/node_modules/@earendil-works/pi-speculative-action/dist/thinkthread/tool-runner.js"
