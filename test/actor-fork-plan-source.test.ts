@@ -50,6 +50,10 @@ describe("actor fork plan source", () => {
 		fork.publish("turn", [{ id: "batch", calls: [{ id: "0:fork", index: 0, tool: "read", input: { path: "a" } }, { id: "1:fork", index: 1, tool: "grep", input: {} }], evidence: [] }]);
 		const plans = await fork.source.propose({ startInput: { turnID: "turn" }, data: {}, candidateNames: ["read", "grep"], signal } as never) as unknown as readonly { actions: { id: string; feedback: unknown }[] }[];
 		expect(plans[0]!.actions.map(({ id, feedback }) => fork.source.continuationBatch!({ proposalID: "p", actionID: id, feedback }))).toEqual([["0:fork", "1:fork"], ["0:fork", "1:fork"]]);
+		fork.startTurn("mixed");
+		fork.publish("mixed", [{ id: "batch", calls: [{ id: "0:fork", index: 0, tool: "read", input: { path: "a" } }, { id: "1:fork", index: 1, tool: "bash", input: {} }], evidence: [] }]);
+		const [mixed] = await fork.source.propose({ startInput: { turnID: "mixed" }, data: {}, candidateNames: ["read"], signal } as never) as unknown as readonly { actions: { id: string; feedback: unknown }[] }[];
+		expect(mixed!.actions.map(({ id, feedback }) => [id, fork.source.continuationBatch!({ proposalID: "p", actionID: id, feedback })])).toEqual([["0:fork", undefined]]);
 	});
 
 	it("retries at a finished thought or sentence ahead of the fixed cadence", () => {
