@@ -123,9 +123,7 @@ export class ActionSemanticsRegistry {
 			this.definitionsByTool.set(tool, definition);
 			for (const projector of definition.projectors ?? []) {
 				const existing = this.projectorsByID.get(projector.id);
-				if (existing && projectorSources.get(existing) !== projectorSources.get(projector)) {
-					throw new Error(`conflicting action projector ${projector.id}`);
-				}
+				if (existing && projectorSources.get(existing) !== projectorSources.get(projector)) throw new Error(`conflicting action projector ${projector.id}`);
 				this.projectorsByID.set(projector.id, projector);
 			}
 		}
@@ -137,9 +135,7 @@ export class ActionSemanticsRegistry {
 	}
 
 	toolNames(effect?: ActionEffect): readonly string[] {
-		return [...this.definitionsByTool.values()]
-			.filter((definition) => effect === undefined || definition.effect === effect)
-			.map((definition) => definition.tool);
+		return [...this.definitionsByTool.values()].filter((definition) => effect === undefined || definition.effect === effect).map((definition) => definition.tool);
 	}
 
 	effect(action: string | ActionKey): ActionEffect | undefined {
@@ -221,9 +217,20 @@ export const BASH_TIMEOUT_ACTION_KEY_PROJECTOR: ActionKeyProjector = ownActionKe
 	canShareInFlight: bashTimeoutCovers,
 });
 
+/** A complete literal search, filtered by line, answers a search for any literal containing its own. */
+export const GREP_LITERAL_ACTION_KEY_PROJECTOR: ActionKeyProjector = ownActionKeyProjector({
+	id: "grep.literal",
+	partition: grepLiteralPartition,
+	project: (speculative, actor) => {
+		const found = speculative.input.pattern, sought = actor.input.pattern, partition = grepLiteralPartition(speculative);
+		return partition !== undefined && partition === grepLiteralPartition(actor) && typeof found === "string" && typeof sought === "string" &&
+			sought.includes(found) ? { action: actor, distance: sought.length - found.length } : undefined;
+	},
+});
+
 export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry(([
 	{ tool: "read", effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS, resourceScope: "content", projectors: [READ_RANGE_ACTION_KEY_PROJECTOR] },
-	{ tool: "grep", effect: "unbounded", requirements: HOST_PROCESS_EFFECTS },
+	{ tool: "grep", effect: "unbounded", requirements: HOST_PROCESS_EFFECTS, projectors: [GREP_LITERAL_ACTION_KEY_PROJECTOR] },
 	{ tool: "find", effect: "unbounded", requirements: HOST_PROCESS_EFFECTS },
 	{ tool: "ls", effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS, resourceScope: "entries" },
 	{ tool: "bash", effect: "unbounded", requirements: UNRESTRICTED_PROCESS_EFFECTS, projectors: [BASH_TIMEOUT_ACTION_KEY_PROJECTOR] },
@@ -279,49 +286,28 @@ export function buildPiActionKey(tool: string, input: unknown, cwd: string, sche
 	return PI_ACTION_SEMANTICS.buildKey(tool, input, cwd, schemaHash);
 }
 
-export function actionKeyMatches(
-	speculative: ActionKey,
-	actor: ActionKey,
-	projectors: readonly ActionKeyProjector[] = [],
-): boolean {
+export function actionKeyMatches(speculative: ActionKey, actor: ActionKey, projectors: readonly ActionKeyProjector[] = []): boolean {
 	return actionKeyMatch(speculative, actor, projectors) !== undefined;
 }
 
 /** K(a_s) covers K(a) without relying on completed-output coverage. */
-export function actionKeyCovers(
-	speculative: ActionKey,
-	actor: ActionKey,
-	projectors: readonly ActionKeyProjector[] = [],
-): boolean {
+export function actionKeyCovers(speculative: ActionKey, actor: ActionKey, projectors: readonly ActionKeyProjector[] = []): boolean {
 	return actionKeyMatch(speculative, actor, projectors, true) !== undefined;
 }
 
-/** Lookup relation only; adoption still requires realized output/input coverage and branch evidence. */
-export function actionKeyMatch(
-	speculative: ActionKey,
-	actor: ActionKey,
-	projectors: readonly ActionKeyProjector[] = [],
-	/** Prediction matching requires request containment, not merely overlapping reusable inputs. */
-	requireCoverage = false,
-): ActionKeyMatch | undefined {
+/** Lookup relation only; adoption still requires realized output/input coverage and branch evidence.
+ * Prediction matching sets requireCoverage: it needs request containment, not merely overlapping reusable inputs. */
+export function actionKeyMatch(speculative: ActionKey, actor: ActionKey, projectors: readonly ActionKeyProjector[] = [], requireCoverage = false): ActionKeyMatch | undefined {
 	if (speculative.key === actor.key) return { kind: "exact", distance: 0 };
-	if (
-		speculative.tool !== actor.tool ||
-		speculative.semanticsEpoch !== actor.semanticsEpoch ||
-		speculative.schemaHash !== actor.schemaHash ||
-		speculative.executionFingerprint !== actor.executionFingerprint
-	) {
-		return undefined;
-	}
+	if (speculative.tool !== actor.tool || speculative.semanticsEpoch !== actor.semanticsEpoch ||
+		speculative.schemaHash !== actor.schemaHash || speculative.executionFingerprint !== actor.executionFingerprint) return undefined;
 	let best: ActionKeyMatch | undefined;
 	for (const projector of projectors) {
 		let projected: ProjectedActionKey | undefined;
 		try {
 			if (requireCoverage && projector.canShareInFlight?.(speculative, actor) !== true) continue;
 			projected = projector.project(speculative, actor);
-		} catch {
-			continue;
-		}
+		} catch { continue; }
 		if (!projected || projected.action.key !== actor.key) continue;
 		if (!Number.isFinite(projected.distance) || projected.distance < 0) continue;
 		if (best && best.distance <= projected.distance) continue;
@@ -331,37 +317,22 @@ export function actionKeyMatch(
 }
 
 /** Explain why K(a_s) cannot satisfy K(a) without exposing either action's input. */
-export function actionKeyMismatchReason(
-	speculative: ActionKey,
-	actor: ActionKey,
-	projectors: readonly ActionKeyProjector[] = [],
-): ActionKeyMismatchReason | undefined {
+export function actionKeyMismatchReason(speculative: ActionKey, actor: ActionKey, projectors: readonly ActionKeyProjector[] = []): ActionKeyMismatchReason | undefined {
 	if (actionKeyMatch(speculative, actor, projectors)) return undefined;
 	if (speculative.tool !== actor.tool) return "different_tool";
 	if (speculative.semanticsEpoch !== actor.semanticsEpoch) return "different_semantics";
 	if (speculative.schemaHash !== actor.schemaHash) return "different_schema";
 	if (speculative.executionFingerprint !== actor.executionFingerprint) return "different_executor";
-
 	const speculativePartitions = new Set(actionKeyProjectionPartitions(speculative, projectors));
-	if (actionKeyProjectionPartitions(actor, projectors).some((partition) => speculativePartitions.has(partition))) {
-		return "projection_not_applicable";
-	}
-	return "different_core";
+	return actionKeyProjectionPartitions(actor, projectors).some((partition) => speculativePartitions.has(partition)) ? "projection_not_applicable" : "different_core";
 }
 
 /** Projection partitions used only as an indexed lookup optimization. */
-export function actionKeyProjectionPartitions(
-	action: ActionKey,
-	projectors: readonly ActionKeyProjector[],
-): readonly string[] {
+export function actionKeyProjectionPartitions(action: ActionKey, projectors: readonly ActionKeyProjector[]): readonly string[] {
 	const partitions = new Set<string>();
 	for (const projector of projectors) {
 		let partition: string | undefined;
-		try {
-			partition = projector.partition(action);
-		} catch {
-			continue;
-		}
+		try { partition = projector.partition(action); } catch { continue; }
 		if (partition !== undefined) partitions.add(JSON.stringify([projector.id, partition]));
 	}
 	return [...partitions];
@@ -377,16 +348,9 @@ export function readActionRange(action: ActionKey): ReadActionRange | undefined 
 }
 
 export function readRangesShareInFlight(speculative: ActionKey, actor: ActionKey): boolean {
-	const speculativeRange = readActionRange(speculative);
-	const actorRange = readActionRange(actor);
-	return (
-		!!speculativeRange &&
-		!!actorRange &&
-		!(actor.input.limit === undefined && speculative.input.limit !== undefined) &&
-		readProjectionPartition(speculative) === readProjectionPartition(actor) &&
-		speculativeRange.offset <= actorRange.offset &&
-		speculativeRange.end >= actorRange.end
-	);
+	const speculativeRange = readActionRange(speculative), actorRange = readActionRange(actor);
+	return !!speculativeRange && !!actorRange && !(actor.input.limit === undefined && speculative.input.limit !== undefined) &&
+		readProjectionPartition(speculative) === readProjectionPartition(actor) && speculativeRange.offset <= actorRange.offset && speculativeRange.end >= actorRange.end;
 }
 
 export function normalizeRelativeRoot(value: unknown, cwd: string): string | undefined {
@@ -460,6 +424,14 @@ function bashTimeoutPartition(action: ActionKey): string | undefined {
 		action.executionFingerprint, action.resources, Object.entries(action.input).filter(([name]) => name !== "timeout")]) : undefined;
 }
 
+/** Everything but the pattern and limit. rg matches within one line's bytes, so a case fold, context, line break or U+FFFD never projects. */
+function grepLiteralPartition(action: ActionKey): string | undefined {
+	const { pattern, literal, ignoreCase, context } = action.input;
+	return action.tool === "grep" && literal === true && ignoreCase === false && context === 0 && typeof pattern === "string" && /^[^\r\n�]+$/u.test(pattern)
+		? stableStringify([action.semanticsEpoch, action.schemaHash, action.executionFingerprint, action.resources,
+			Object.entries(action.input).filter(([name]) => name !== "pattern" && name !== "limit")]) : undefined;
+}
+
 function bashTimeoutCovers(speculative: ActionKey, actor: ActionKey): boolean {
 	const limit = (action: ActionKey) => typeof action.input.timeout === "number" ? action.input.timeout : Number.POSITIVE_INFINITY;
 	return bashTimeoutPartition(speculative) !== undefined && bashTimeoutPartition(speculative) === bashTimeoutPartition(actor) && limit(actor) >= limit(speculative);
@@ -494,32 +466,17 @@ function normalizeDefinition(source: ActionSemanticsDefinition): ActionSemantics
 }
 
 function assertDefinitionCoherence(definition: ActionSemanticsDefinition): void {
+	const has = (capability: EffectRequirements["capabilities"][number]) => definition.requirements.capabilities.includes(capability);
 	if (definition.effect === "observation") {
-		if (definition.resourceScope === undefined) {
-			throw new Error(`observation action ${definition.tool} requires resource evidence`);
-		}
-		if (!definition.requirements.capabilities.includes("validation.resource_snapshot")) {
-			throw new Error(`observation action ${definition.tool} requires snapshot-validation capability`);
-		}
+		if (definition.resourceScope === undefined) throw new Error(`observation action ${definition.tool} requires resource evidence`);
+		if (!has("validation.resource_snapshot")) throw new Error(`observation action ${definition.tool} requires snapshot-validation capability`);
 		return;
 	}
-	if (definition.resourceScope !== undefined) {
-		throw new Error(`non-observation action ${definition.tool} cannot declare resource evidence`);
-	}
-	if (
-		definition.effect === "workspace_mutation" &&
-		(!definition.requirements.capabilities.includes("filesystem.write") ||
-			!definition.requirements.capabilities.includes("invocation.workspace_path"))
-	) {
+	if (definition.resourceScope !== undefined) throw new Error(`non-observation action ${definition.tool} cannot declare resource evidence`);
+	if (definition.effect === "workspace_mutation" && (!has("filesystem.write") || !has("invocation.workspace_path")))
 		throw new Error(`workspace mutation ${definition.tool} requires path-mutation capabilities`);
-	}
-	if (
-		definition.effect === "unbounded" &&
-		(!definition.requirements.capabilities.includes("invocation.process") ||
-			!definition.requirements.capabilities.includes("output.gate"))
-	) {
+	if (definition.effect === "unbounded" && (!has("invocation.process") || !has("output.gate")))
 		throw new Error(`unbounded action ${definition.tool} requires process and external-output capabilities`);
-	}
 }
 
 const require = createRequire(import.meta.url);

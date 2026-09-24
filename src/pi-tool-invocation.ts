@@ -4,7 +4,7 @@ import {
 	getAgentDir, getShellConfig, VERSION, type ExtensionContext, type ToolsOptions,
 } from "@earendil-works/pi-coding-agent";
 import type { ToolFilesystemOperations, ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
-import { BASH_TIMEOUT_ACTION_KEY_PROJECTOR, PI_ACTION_SEMANTICS, resolvePiToolPath, type ActionSemanticsDefinition } from "./action-semantics.ts";
+import { BASH_TIMEOUT_ACTION_KEY_PROJECTOR, GREP_LITERAL_ACTION_KEY_PROJECTOR, PI_ACTION_SEMANTICS, resolvePiToolPath, type ActionSemanticsDefinition } from "./action-semantics.ts";
 import type { ActionProjectionRule } from "./action-key-projection.ts";
 import { asRecord } from "./stable-json.ts";
 import { RESOURCE_OBSERVATION_EFFECTS } from "./effect-model.ts";
@@ -137,6 +137,29 @@ export const PI_BASH_TIMEOUT_PROJECTION_RULE: ActionProjectionRule<ToolSettlemen
 	...BASH_TIMEOUT_ACTION_KEY_PROJECTOR,
 	captureCoverage: (action, output) => action.tool === "bash" && !output.isError ? true : undefined,
 	projectOutput: ({ output }) => output.isError ? undefined : output,
+};
+
+/** Pi prints each match of a complete literal search once, as `path:line: text`; the matches of a longer literal are a subset of those lines. */
+export const PI_GREP_LITERAL_PROJECTION_RULE: ActionProjectionRule<ToolSettlement> = {
+	...GREP_LITERAL_ACTION_KEY_PROJECTOR,
+	// Pi reports a match limit, byte limit or cut line in details: only a result without any covers a refinement.
+	captureCoverage: (action, output) => action.tool === "grep" && !output.isError && output.result.details === undefined ? true : undefined,
+	projectOutput: ({ speculative, actor, output }) => {
+		const [content, ...rest] = output.result.content, found = String(speculative.input.pattern), sought = String(actor.input.pattern);
+		if (output.isError || output.result.details !== undefined || rest.length || content?.type !== "text") return undefined;
+		if (content.text === "No matches found") return output;
+		const kept: string[] = [];
+		for (const line of content.text.split("\n")) {
+			// A path may itself contain `:N: `: every split whose text holds the found literal must agree.
+			const verdicts = new Set([...line.matchAll(/:\d+: /g)].map((split) => line.slice(split.index + split[0].length))
+				.filter((text) => text.includes(found)).map((text) => text.includes(sought)));
+			if (verdicts.size !== 1) return undefined;
+			if (verdicts.has(true)) kept.push(line);
+		}
+		// At its limit the Actor's own search stops early and says so.
+		if (kept.length >= Number(actor.input.limit)) return undefined;
+		return { result: { ...output.result, content: [{ type: "text", text: kept.length ? kept.join("\n") : "No matches found" }] }, isError: false };
+	},
 };
 
 /** Retain stock write poststates; edit normalization and queuing stay in Pi. */

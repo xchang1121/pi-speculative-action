@@ -123,23 +123,16 @@ describe("Pi read range projection", () => {
 	});
 
 	it("does not capture missing coverage, tool errors, or non-read outputs", () => {
-		const read = readKey("notes.txt", 1, 2);
-		const grep = buildPiActionKey("grep", { pattern: "TODO", path: "." }, cwd);
-		expect(PI_READ_RANGE_PROJECTION_RULE.captureCoverage(read, settlement())).toBeUndefined();
-		expect(PI_READ_RANGE_PROJECTION_RULE.captureCoverage(read, coveredSettlement(["one", "two"], {}, true))).toBeUndefined();
-		expect(grep).toBeDefined();
-		if (grep) expect(PI_READ_RANGE_PROJECTION_RULE.captureCoverage(grep, coveredSettlement(["one", "two"]))).toBeUndefined();
+		const read = readKey("notes.txt", 1, 2), grep = buildPiActionKey("grep", { pattern: "TODO", path: "." }, cwd)!;
+		expect(([[read, settlement()], [read, coveredSettlement(["one", "two"], {}, true)], [grep, coveredSettlement(["one", "two"])]] as const)
+			.map(([action, output]) => PI_READ_RANGE_PROJECTION_RULE.captureCoverage(action, output))).toEqual([undefined, undefined, undefined]);
 	});
 
 	it("keeps different resources and grep/find actions outside the read relation", () => {
-		const read = readKey("notes.txt", 1, 10);
-		expect(actionKeyMatch(read, readKey("other.txt", 2, 2), [PI_READ_RANGE_PROJECTION_RULE])).toBeUndefined();
+		expect(actionKeyMatch(readKey("notes.txt", 1, 10), readKey("other.txt", 2, 2), [PI_READ_RANGE_PROJECTION_RULE])).toBeUndefined();
 		for (const tool of ["grep", "find"] as const) {
-			const speculative = buildPiActionKey(tool, { path: ".", pattern: "*.ts", limit: 10 }, cwd);
-			const actor = buildPiActionKey(tool, { path: ".", pattern: "*.ts", limit: 2 }, cwd);
-			expect(speculative).toBeDefined();
-			expect(actor).toBeDefined();
-			if (speculative && actor) expect(actionKeyMatch(speculative, actor, [PI_READ_RANGE_PROJECTION_RULE])).toBeUndefined();
+			const key = (limit: number) => buildPiActionKey(tool, { path: ".", pattern: "*.ts", limit }, cwd)!;
+			expect(actionKeyMatch(key(10), key(2), [PI_READ_RANGE_PROJECTION_RULE])).toBeUndefined();
 		}
 	});
 });
