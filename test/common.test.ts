@@ -69,21 +69,10 @@ describe("speculative action common", () => {
 		const otherCwd = buildPiActionKey("bash", { command: "npm test", timeout: 30 }, "/workspace/b");
 		const write = buildPiActionKey("write", { path: "src/out.ts", content: "one\n" }, "/workspace");
 		const otherWrite = buildPiActionKey("write", { path: "src/out.ts", content: "two\n" }, "/workspace");
-		const edit = buildPiActionKey(
-			"edit",
-			{ path: "src/out.ts", edits: [{ oldText: "one", newText: "two" }] },
-			"/workspace",
-		);
-		const sameEdit = buildPiActionKey(
-			"edit",
-			{ path: "src/out.ts", edits: [{ newText: "two", oldText: "one" }] },
-			"/workspace",
-		);
+		const edit = buildPiActionKey("edit", { path: "src/out.ts", edits: [{ oldText: "one", newText: "two" }] }, "/workspace");
+		const sameEdit = buildPiActionKey("edit", { path: "src/out.ts", edits: [{ newText: "two", oldText: "one" }] }, "/workspace");
 
-		expect(bash).toMatchObject({
-			tool: "bash",
-			resources: [path.resolve("/workspace/a").replaceAll("\\", "/")],
-		});
+		expect(bash).toMatchObject({ tool: "bash", resources: [path.resolve("/workspace/a").replaceAll("\\", "/")] });
 		expect(bash?.key).not.toBe(otherCwd?.key);
 		expect(write).toMatchObject({ tool: "write", resources: ["src/out.ts"] });
 		expect(write?.key).not.toBe(otherWrite?.key);
@@ -201,22 +190,10 @@ describe("speculative action common", () => {
 				);
 			},
 		};
-		const speculative = buildActionKey({
-			tool: "custom",
-			resources: ["set"],
-			input: { namespace: "items", values: ["a", "b", "c"] },
-		});
-		const actor = buildActionKey({
-			tool: "custom",
-			resources: ["set"],
-			input: { namespace: "items", values: ["b", "c"] },
-		});
+		const speculative = buildActionKey({ tool: "custom", resources: ["set"], input: { namespace: "items", values: ["a", "b", "c"] } });
+		const actor = buildActionKey({ tool: "custom", resources: ["set"], input: { namespace: "items", values: ["b", "c"] } });
 
-		expect(actionKeyMatch(speculative, actor, [projector])).toEqual({
-			kind: "projected",
-			projector: "custom.subset",
-			distance: 1,
-		});
+		expect(actionKeyMatch(speculative, actor, [projector])).toEqual({ kind: "projected", projector: "custom.subset", distance: 1 });
 		expect(actionKeyCovers(speculative, actor, [projector])).toBe(true);
 		const unguarded: ActionKeyProjector = {
 			id: "unguarded",
