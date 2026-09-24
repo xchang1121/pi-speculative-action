@@ -288,14 +288,14 @@ class PredictiveContextTrie {
 		node.patterns.add(pattern);
 	}
 
-	*matching(history: ReadonlyArray<PatternAwareEvent>) {
+	*matching(history: ReadonlyArray<PatternAwareEvent>, starts?: ReadonlySet<number>) {
 		let node = this.root;
 		for (let index = history.length - 1; index >= 0; index--) {
 			const token = trieToken(signature(history[index]!));
 			const child = node.children.get(token);
 			if (!child) break;
 			node = child;
-			if (!node.patterns.size) continue;
+			if (!node.patterns.size || starts?.has(index) === false) continue;
 			const context = history.slice(index);
 			// Trie edges already match tool/outcome/operation; output shapes retain wildcard semantics.
 			const shapes = context.map((event) => signature(event).outputShape);
@@ -555,7 +555,7 @@ export class PatternAwareStore {
 			}>
 		>();
 		this.ensureIndex();
-		for (const { pattern, context } of this.trie.matching(history)) {
+		for (const { pattern, context } of this.trie.matching(history, this.contextStarts(history))) {
 			const patternID = pattern.id;
 			if (continuation.visitedPatternIDs.includes(patternID) || !structurallyEligible(pattern, settings))
 				continue;
@@ -917,10 +917,17 @@ export class PatternAwareStore {
 			const maxLength = Math.min(this.settings.maxContextLength, contextEnd);
 			for (let length = 1; length <= maxLength; length++) {
 				const start = batches[contextEnd - length]!;
-				if (end - start > this.settings.maxContextLength) break;
-				yield { context: history.slice(start, end), gap };
+				if (end - start <= this.settings.maxContextLength) yield { context: history.slice(start, end), gap };
+				else if (length === 1) yield { context: history.slice(end - this.settings.maxContextLength, end), gap };
+				if (end - start >= this.settings.maxContextLength) break;
 			}
 		}
+	}
+
+	/** A final batch wider than a context matches only from its newest calls, as learning truncates it; a narrower one keeps suffix matching. */
+	private contextStarts(history: ReadonlyArray<PatternAwareEvent>): ReadonlySet<number> | undefined {
+		const width = history.length - (actionBatchStarts(history).at(-1) ?? 0);
+		return width > this.settings.maxContextLength ? new Set([history.length - this.settings.maxContextLength]) : undefined;
 	}
 
 	private actionInputCovers(
@@ -1167,7 +1174,7 @@ export class PatternAwareStore {
 		const triggerSequence = history.at(-1)?.sequence;
 		if (triggerSequence === undefined) return;
 		this.ensureIndex();
-		for (const { pattern, context } of this.trie.matching(history)) {
+		for (const { pattern, context } of this.trie.matching(history, this.contextStarts(history))) {
 			if (!structurallyEligible(pattern, this.settings)) continue;
 			if (pending.some((item) => item.patternID === pattern.id && item.triggerSequence === triggerSequence)) continue;
 			pending.push({
