@@ -79,11 +79,6 @@ export function probabilityInput(title: string, options: NumericInputOptions = {
 	return numericInput(title, (value) => value >= 0 && value <= 1, `${title} must be between 0 and 1.`, options);
 }
 
-export function optionalPositiveIntegerInput(title: string): SettingInputDescriptor<number | undefined> {
-	const required = positiveIntegerInput(title);
-	return settingInput(title, (value) => (value === undefined ? "" : required.format(value)), (input) => (input.trim() === "" ? { ok: true, value: undefined } : required.parse(input)));
-}
-
 export function nonEmptyTextInput(title: string): SettingInputDescriptor<string> {
 	return settingInput(title, String, (input) => {
 		const value = input.trim();

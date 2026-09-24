@@ -1,4 +1,4 @@
-import { clampProbability, nonNegativeFinite } from "./number-utils.ts";
+import { clampProbability, finiteNumber, nonNegativeFinite } from "./number-utils.ts";
 import { hash as cryptoHash } from "node:crypto";
 import { writeJsonFile } from "./filesystem-evidence.ts";
 import fs from "node:fs/promises";
@@ -10,7 +10,7 @@ import { patternSessionBudgets, type PatternPendingValidation, type PatternRecur
 import { containsLogicalPath, relativeFilesystemPath } from "./path-utils.ts";
 import { PpmCountTrie, type PpmCountTrieRow, type PpmProbabilityEstimate } from "./ppm-count-trie.ts";
 import type { PredictionSettlement, ResolutionStage } from "./settlement.ts";
-import { asRecord, stableEqual as sameValue, stableStringify } from "./stable-json.ts";
+import { asRecord, isObject, stableEqual as sameValue, stableStringify } from "./stable-json.ts";
 import { booleanOr, nonNegativeInteger, positiveInteger, probability as probabilitySetting, settingsParser } from "./setting-input.ts";
 
 export type PatternAwareSettings = Readonly<typeof patternAwareDefaults>;
@@ -2340,13 +2340,13 @@ function mutablePattern(value: PatternAwarePattern): MutablePattern | undefined 
 		...(value.targetSchemaHash ? { targetSchemaHash: value.targetSchemaHash } : {}),
 		gapCounts,
 		gapLastSeen,
-		occurrences: finite(value.occurrences),
-		replayMatches: finite(value.replayMatches),
+		occurrences: finiteNumber(value.occurrences) ?? 0,
+		replayMatches: finiteNumber(value.replayMatches) ?? 0,
 		historicalOpportunities: Math.max(1, value.historicalOpportunities),
 		historicalMatches: value.historicalMatches,
 		feedback,
-		averageDurationMs: finite(value.averageDurationMs),
-		lastSeenSequence: finite(value.lastSeenSequence),
+		averageDurationMs: finiteNumber(value.averageDurationMs) ?? 0,
+		lastSeenSequence: finiteNumber(value.lastSeenSequence) ?? 0,
 	});
 	return { ...pattern, dependencies: analyzeBindings(pattern.bindings).dependencies };
 }
@@ -2565,16 +2565,8 @@ function hash(value: string) {
 	return cryptoHash("sha256", value).slice(0, 32);
 }
 
-function isObject(value: unknown): value is object {
-	return value !== null && typeof value === "object";
-}
-
 function probability(pattern: Pick<MutablePattern, "historicalMatches" | "historicalOpportunities">) {
 	return Math.max(0, Math.min(1, pattern.historicalMatches / Math.max(1, pattern.historicalOpportunities)));
-}
-
-function finite(value: unknown) {
-	return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
 function isFiniteNumber(value: unknown): value is number {

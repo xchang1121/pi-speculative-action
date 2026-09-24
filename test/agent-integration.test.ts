@@ -210,6 +210,8 @@ describe("speculative action host", () => {
 						...await tool.execute("oracle", { path: "notes.txt", offset, limit: 1 }), role: "toolResult", toolCallId: `call-${offset}`, isError: false }))));
 					const reasoning: ThinkingLevel | undefined = supported && requested !== "off" ? requested : undefined;
 					expect(requests.map((request) => request[2])).toMatchObject([{ reasoning, maxTokens: 128, toolChoice: reasoning ? "auto" : "required" }, { reasoning, maxTokens: 128, toolChoice: "auto" }]);
+					expect(await Promise.all(requests.map((request) => request[2]!.onPayload?.({ tools: [] }, { ...model("draft"), api: "anthropic-messages" }))))
+						.toEqual([reasoning ? undefined : { tools: [], tool_choice: { type: "any" } }, undefined]);
 					await host.finishTurn("turn-1", true);
 					expect(complete).toHaveBeenCalledTimes(2);
 					expect(events.filter((event) => event.type === "source_request" && event.request.request.kind === "continuation")).toHaveLength(1);

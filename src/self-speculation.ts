@@ -19,7 +19,7 @@ import type { ActionKey } from "./action-semantics.ts";
 import type { ActorActionSettlement } from "./settlement.ts";
 import { EvidenceLedger } from "./self-speculation-evidence.ts";
 import { asRecord as record, isRecord, stableStringify } from "./stable-json.ts";
-import { nonNegativeFinite, nonNegativeCount } from "./number-utils.ts";
+import { finiteNumber, nonNegativeFinite, nonNegativeCount } from "./number-utils.ts";
 import { booleanOr, nonNegativeNumber, positiveInteger, probability, settingsParser } from "./setting-input.ts";
 
 export type SelfSpeculationForkTransport = "provider" | "sidecar";
@@ -341,9 +341,9 @@ export class SelfSpeculationCoordinator {
 			if (!existing.provenance.some((item) => item.proposalID === candidate.proposalID && item.actionID === candidate.actionID))
 				existing.provenance.push({ proposalID: candidate.proposalID, actionID: candidate.actionID });
 			for (const field of ["depth", "horizon"] as const)
-				existing[field] = Math.min(existing[field], metric(candidate[field], 0));
+				existing[field] = Math.min(existing[field], finiteNumber(candidate[field]) ?? 0);
 			for (const field of ["conditionalProbability", "empiricalProbability", "expectedLatencyBenefitMs", "expectedDurationMs"] as const)
-				existing[field] = Math.max(existing[field], metric(candidate[field], 0));
+				existing[field] = Math.max(existing[field], finiteNumber(candidate[field]) ?? 0);
 			existing.latestDecisionSequence = Math.max(existing.latestDecisionSequence, candidate.latestDecisionSequence);
 			return existing;
 		} else {
@@ -358,13 +358,13 @@ export class SelfSpeculationCoordinator {
 				provenance: [{ proposalID: candidate.proposalID, actionID: candidate.actionID }],
 				sequence: this.candidateSequence++,
 				expectedDecisionSequence: candidate.expectedDecisionSequence,
-				depth: metric(candidate.depth, 0),
-				horizon: metric(candidate.horizon, 0),
+				depth: finiteNumber(candidate.depth) ?? 0,
+				horizon: finiteNumber(candidate.horizon) ?? 0,
 				latestDecisionSequence: candidate.latestDecisionSequence,
-				conditionalProbability: metric(candidate.conditionalProbability, 0),
-				empiricalProbability: metric(candidate.empiricalProbability, 0),
-				expectedLatencyBenefitMs: metric(candidate.expectedLatencyBenefitMs, 0),
-				expectedDurationMs: metric(candidate.expectedDurationMs, 0),
+				conditionalProbability: finiteNumber(candidate.conditionalProbability) ?? 0,
+				empiricalProbability: finiteNumber(candidate.empiricalProbability) ?? 0,
+				expectedLatencyBenefitMs: finiteNumber(candidate.expectedLatencyBenefitMs) ?? 0,
+				expectedDurationMs: finiteNumber(candidate.expectedDurationMs) ?? 0,
 			};
 			candidates.set(predictedAction.key, record);
 			return record;
@@ -1102,10 +1102,6 @@ function requiredVerificationInteger(value: unknown, field: string, positive = f
 	return number;
 }
 
-function metric(value: number | undefined, fallback: number): number {
-	return typeof value === "number" && Number.isFinite(value) ? value : fallback;
-}
-
 function httpPath(value: unknown, fallback: string): string {
 	const selected = nonEmptyString(value);
 	return selected?.startsWith("/") ? selected : fallback;
@@ -1129,10 +1125,6 @@ function nonEmptyString(value: unknown): string | undefined {
 
 function array(value: unknown): readonly unknown[] {
 	return Array.isArray(value) ? value : [];
-}
-
-function finiteNumber(value: unknown): number | undefined {
-	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 function actionIdentity(key: string): string {

@@ -1,4 +1,5 @@
 import type { ActorHitTiming } from "./settlement.ts";
+import { nonNegativeFinite as metric } from "./number-utils.ts";
 
 export interface BenefitGatePolicy extends Readonly<typeof benefitGateDefaults> {}
 
@@ -125,10 +126,6 @@ export class BenefitGate {
 		}
 		return state;
 	}
-}
-
-export function metric(value: number): number {
-	return Number.isFinite(value) ? Math.max(0, value) : 0;
 }
 
 function mean(values: GateState["samples"]): number | undefined {

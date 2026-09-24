@@ -12,8 +12,8 @@ export interface DrafterToolDefinition {
 export interface DrafterRequestSettings {
 	/** Output-informed successor actions retained after the first Drafter action. */
 	readonly drafterMaxDepth: number;
-	/** Optional hard output cap for each one-action Drafter request; omitted uses the provider default. */
-	readonly drafterMaxTokens?: number;
+	/** Output cap for each Drafter request: one proposed tool batch never needs the Actor's answer budget. */
+	readonly drafterMaxTokens: number;
 	/** Number of leading Drafter requests sent at temperature zero. */
 	readonly drafterDeterministicCandidates: number;
 	/** Inclusive temperature range stratified across the remaining requests. */
@@ -23,6 +23,7 @@ export interface DrafterRequestSettings {
 
 const DRAFTER_DEFAULTS: DrafterRequestSettings = {
 	drafterMaxDepth: 1,
+	drafterMaxTokens: 4096,
 	drafterDeterministicCandidates: 1,
 	drafterTemperatureMin: 0.7,
 	drafterTemperatureMax: 0.7,
@@ -68,10 +69,9 @@ export function normalizeDrafterRequestSettings(value: unknown): DrafterRequestS
 	const input = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
 	const lower = nonNegativeNumber(input.drafterTemperatureMin, DEFAULTS.drafterTemperatureMin);
 	const upper = nonNegativeNumber(input.drafterTemperatureMax, DEFAULTS.drafterTemperatureMax);
-	const maxTokens = positiveInteger(input.drafterMaxTokens, undefined);
 	return {
 		drafterMaxDepth: nonNegativeInteger(input.drafterMaxDepth, DEFAULTS.drafterMaxDepth),
-		...(maxTokens ? { drafterMaxTokens: maxTokens } : {}),
+		drafterMaxTokens: positiveInteger(input.drafterMaxTokens, DEFAULTS.drafterMaxTokens),
 		drafterDeterministicCandidates: nonNegativeInteger(
 			input.drafterDeterministicCandidates,
 			DEFAULTS.drafterDeterministicCandidates,

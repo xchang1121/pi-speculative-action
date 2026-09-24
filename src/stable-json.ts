@@ -132,6 +132,6 @@ function isArrayIndex(value: string) {
 	return Number.isInteger(index) && index >= 0 && index < 0xffff_ffff && String(index) === value;
 }
 
-function isObject(value: unknown): value is object {
+export function isObject(value: unknown): value is object {
 	return value !== null && typeof value === "object";
 }
