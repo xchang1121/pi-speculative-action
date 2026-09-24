@@ -909,11 +909,9 @@ export class PatternAwareStore {
 			if (!this.write && !this.dirty) return;
 			this.write ??= Promise.resolve().then(async () => {
 				this.dirty = false;
-				await writeJsonFile(target, {
-					patterns: this.snapshot(),
-					...this.persistedLearningState(),
-					sequenceCounts: this.sequenceModel.snapshot(this.settings.maxPatterns),
-				} satisfies PersistedState);
+				// Learned events quote tool inputs and outputs: keep them owner-readable only.
+				await writeJsonFile(target, { patterns: this.snapshot(), ...this.persistedLearningState(),
+					sequenceCounts: this.sequenceModel.snapshot(this.settings.maxPatterns) } satisfies PersistedState, undefined, 0o600);
 			}).catch((error) => { this.dirty = true; throw error; })
 				.finally(() => { this.write = undefined; });
 			await this.write;
