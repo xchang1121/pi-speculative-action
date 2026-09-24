@@ -259,16 +259,19 @@ describe("SpeculationScheduler", () => {
 		expect(run(1, 256).slice(-8).every((decision) => decision.allowed)).toBe(true);
 	});
 
-	it.each(["loss", "hidden", "slow-producer", "cancelled", "cancelled-no-forecast", "unknown-clock", "other-action", "no-forecast", "actor"] as const)("aligns producer launch with the expected Actor decision: %s", (mode) => {
+	it.each(["loss", "hidden", "costly-adoption", "slow-producer", "cancelled", "cancelled-no-forecast", "unknown-clock", "other-action", "no-forecast", "actor"] as const)("aligns producer launch with the expected Actor decision: %s", (mode) => {
 		const scheduler = new SpeculationScheduler<object>(), job = {};
 		const identity = { tool: "read", executionFingerprint: "reader", actionKeyHash: "image" };
 		for (const duration of [1000, 2000]) scheduler.observeActorService(identity, duration);
 		if (mode === "slow-producer") for (const duration of [1000, 1500, 4000]) scheduler.observeSpeculativeService(identity, duration);
+		const adoptionIdentity = { ...identity, operation: "route" }; // The Actor's join pays this too, so launch must see it.
+		if (mode === "costly-adoption") for (const duration of [4000, 5000]) scheduler.observeAdoption(adoptionIdentity, duration);
 		const cancelled = mode === "cancelled" || mode === "cancelled-no-forecast";
 		if (cancelled) for (const duration of [4000, 3000]) scheduler.observeSpeculativeService(identity, duration, "cancelled");
 		if (mode !== "unknown-clock") scheduler.observeActorTiming(100, 1100);
-		const hidden = mode === "hidden" || mode === "slow-producer" || cancelled, blocked = mode === "loss" || mode === "slow-producer" || cancelled;
-		const request = forecast({ ...identity, expectedDurationMs: mode.endsWith("no-forecast") ? undefined : 1500,
+		const hidden = mode === "hidden" || mode === "costly-adoption" || mode === "slow-producer" || cancelled;
+		const blocked = mode === "loss" || mode === "costly-adoption" || mode === "slow-producer" || cancelled;
+		const request = forecast({ ...identity, adoptionIdentity, expectedDurationMs: mode.endsWith("no-forecast") ? undefined : 1500,
 			actionKeyHash: mode === "other-action" ? "unmeasured" : identity.actionKeyHash,
 			actorPhase: { kind: hidden ? "cycle" : "decision", elapsedMs: 0 }, decisionBatchesUntilCall: hidden ? 2 : 1 });
 		const admission = scheduler.admit(job, [request], 1, mode === "actor" ? "actor" : "producer");

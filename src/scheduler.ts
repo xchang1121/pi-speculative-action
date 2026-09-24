@@ -17,6 +17,8 @@ export interface PredictionForecast extends ServiceTimingIdentity {
 	readonly background?: boolean;
 	/** Dependencies have settled and this action is their immediate zero-horizon successor. */
 	readonly dependenciesResolved?: boolean;
+	/** Adopting this action's own result on its planned route: launch weighs the cost the Actor's join will. */
+	readonly adoptionIdentity?: ServiceTimingIdentity;
 }
 
 export interface ScheduledWork {
@@ -377,7 +379,7 @@ export class SpeculationScheduler<Job extends object> {
 		if (!this.actorServiceTimes.get(key)?.count || forecast.expectedDurationMs === undefined &&
 			this.speculativeServiceTimes.get(key)?.estimate(0.9, "upper") === undefined) return true;
 		return this.assessCandidateJoin({
-			identity: forecast,
+			identity: forecast, adoptionIdentity: forecast.adoptionIdentity,
 			state: "queued",
 			expectedSpeculativeDurationMs: expectedDurationMs,
 			leadTimeMs: runway,

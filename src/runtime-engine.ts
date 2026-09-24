@@ -116,9 +116,7 @@ function forecastFor(
 		criticalPathMs: node.criticalPathMs,
 		...(node.action.expectedLatencyBenefitMs !== undefined ? { expectedLatencyBenefitMs: node.action.expectedLatencyBenefitMs } : {}),
 		...(node.action.background ? { background: true } : {}),
-		...((node.action.dependsOn?.length ?? 0) > 0 && (node.action.horizon ?? 0) <= 0
-			? { dependenciesResolved: true }
-			: {}),
+		...((node.action.dependsOn?.length ?? 0) > 0 && (node.action.horizon ?? 0) <= 0 ? { dependenciesResolved: true } : {}),
 	};
 }
 
@@ -365,6 +363,13 @@ function maybe<T>(value: T | undefined): T[] {
 
 function actionTimingIdentity(action: ActionKey): ServiceTimingIdentity {
 	return { tool: action.tool, executionFingerprint: action.executionFingerprint, actionKeyHash: action.hash };
+}
+
+/** The producer/consumer pair on one route and match; a retained result view is its own operation. */
+function adoptionTimingIdentity(actor: ActionKey, { key, route }: { readonly key: ActionKey; readonly route: SpeculativeExecutionRoute },
+	match: string, retained = false): ServiceTimingIdentity {
+	return { ...actionTimingIdentity(actor), actionKeyHash: JSON.stringify([key.hash, actor.hash]),
+		operation: JSON.stringify([route.backend, route.fingerprint, route.scope, route.isolation, route.reuse, match, ...(retained ? ["retained"] : [])]) };
 }
 
 interface PlanActionContext<StartInput, StateData> extends RuntimeTurnContext<StartInput, StateData> {
@@ -818,9 +823,7 @@ export function makeSpeculativeActionRuntime<
 	};
 
 	const releaseUnusedSourceSlot = (session: Session, slot: SourceRequestSlot): void => {
-		if (!slot.pending && slot.owners.size === 0) {
-			releaseSourceSlot(session, slot, cause("control", "source_slot_unused"));
-		}
+		if (!slot.pending && slot.owners.size === 0) releaseSourceSlot(session, slot, cause("control", "source_slot_unused"));
 	};
 
 	const releaseSourceRequest = (session: Session, slot: SourceRequestSlot): void => { slot.pending--; releaseUnusedSourceSlot(session, slot); };
@@ -1428,9 +1431,7 @@ export function makeSpeculativeActionRuntime<
 
 	const previewActorCall = (input: ConsumeInput, signal?: AbortSignal): Promise<void> => {
 		const state = sessionStates.get(input.sessionID)?.turns.get(input.turnID);
-		if (!state || state.lifecycle !== "active" || signal?.aborted || masterDisabled()) {
-			return Promise.resolve();
-		}
+		if (!state || state.lifecycle !== "active" || signal?.aborted || masterDisabled()) return Promise.resolve();
 		const actualCall = adapter.actual(input);
 		if (!actualCall.id) return state.session.lifecycle.track(promoteActorCall(state, input, actualCall, undefined, signal));
 		const existing = state.actorPreviews.get(actualCall.id);
@@ -1621,14 +1622,8 @@ export function makeSpeculativeActionRuntime<
 		for (const choice of ranked) {
 			const candidate = choice.candidate;
 			const executionAtDecision = candidate.work.execution;
-			const actorIdentity = actionTimingIdentity(actualKey), route = candidate.route;
-			const adoptionIdentity = {
-				...actorIdentity,
-				actionKeyHash: JSON.stringify([candidate.key.hash, actualKey.hash]),
-				operation: JSON.stringify([route.backend, route.fingerprint, route.scope, route.isolation, route.reuse,
-					choice.match.kind === "projected" ? choice.match.projector : choice.match.kind,
-					...(candidate.resultViews?.has(actualKey.key) ? ["retained"] : [])]),
-			};
+			const actorIdentity = actionTimingIdentity(actualKey), adoptionIdentity = adoptionTimingIdentity(actualKey, candidate,
+				choice.match.kind === "projected" ? choice.match.projector : choice.match.kind, candidate.resultViews?.has(actualKey.key));
 			// Equivalent ready choices share this Actor decision, including its recovery probe.
 			const readyKey = executionAtDecision.status === "succeeded" ? JSON.stringify(adoptionIdentity) : undefined;
 			// Only a source's own forecast is evidence; the scheduler's placeholder or class blend would pose as one.
@@ -1669,7 +1664,8 @@ export function makeSpeculativeActionRuntime<
 			const attemptStartedAt = performance.now();
 			let inputs: ReturnType<typeof borrowCandidateInputs> | undefined;
 			let projection: ProjectionResult<Output> | undefined;
-			let waitMs = 0;
+			// Only attempts that began adoption work sample its cost; deadline, authorization and abort exits cost nearly nothing.
+			let waitMs = 0, adopting = false;
 			try {
 				if (candidate.work.execution.status === "queued") {
 					preemptForActor(state.session, state.settings, matchingCandidates);
@@ -1718,6 +1714,7 @@ export function makeSpeculativeActionRuntime<
 				// Evaluate sealed data first, then prove freshness once immediately before commit.
 				if (choice.match.kind !== "exact" && branch.inputSource && !candidate.resultViews?.has(actualKey.key))
 					inputs = borrowCandidateInputs(state.session, candidate, `inputs:${actorAction.identity.id}`);
+				adopting = true;
 				projection = await projectOutput(
 					candidate,
 					actualKey,
@@ -1812,7 +1809,7 @@ export function makeSpeculativeActionRuntime<
 				if (projection?.ok) releaseProjectionResource(state.sessionID, projection.resource);
 				inputs?.dispose();
 				reservation.release();
-				state.session.scheduler.observeAdoption(adoptionIdentity, Math.max(0, performance.now() - attemptStartedAt - waitMs));
+				if (adopting && !signal?.aborted) state.session.scheduler.observeAdoption(adoptionIdentity, Math.max(0, performance.now() - attemptStartedAt - waitMs));
 			}
 		}
 	};
@@ -1908,9 +1905,7 @@ export function makeSpeculativeActionRuntime<
 				if (!opportunity) return [];
 				return [{ node, opportunity }];
 			});
-			if (!previewCandidateID) {
-				await Promise.all(matchingPredictions.map(({ node }) => promoteForActor(state.session, node)));
-			}
+			if (!previewCandidateID) await Promise.all(matchingPredictions.map(({ node }) => promoteForActor(state.session, node)));
 			const ranked = rankCandidates(state.session, actualKey, previewCandidateID);
 			const blockedPrediction = matchingPredictions.find(
 				({ node }) => node.execution.status === "execution_blocked" || node.execution.status === "preparing",
@@ -1956,9 +1951,7 @@ export function makeSpeculativeActionRuntime<
 			}
 
 			abandonActorPreview(state, preview, actorAction.fallback.cause);
-			const adoption = actorAction.deferToFallback(
-				matchingPredictions.map(({ opportunity }) => opportunity.identity),
-			);
+			const adoption = actorAction.deferToFallback(matchingPredictions.map(({ opportunity }) => opportunity.identity));
 			if (adoption) confirmPredictions(state.session, matchingPredictions, identity, adoption);
 			const effect = semantics.effect(actualKey);
 			preemptForActor(state.session, state.settings);
@@ -2360,9 +2353,10 @@ export function makeSpeculativeActionRuntime<
 		session: Session,
 		candidate: Candidate,
 	): readonly PredictionForecast[] => {
-		const nodes = session.plan.consumers(candidate.id);
-		const actorPhase = actorPhaseFor(session);
-		if (nodes.length) return nodes.map((node) => forecastFor(node, session.decisionSequence, actorPhase));
+		const nodes = session.plan.consumers(candidate.id), actorPhase = actorPhaseFor(session);
+		const adoptionIdentity = adoptionTimingIdentity(candidate.key, candidate, "exact");
+		if (nodes.length) return nodes.map((node) => ({ ...forecastFor(node, session.decisionSequence, actorPhase),
+			...(node.actionKey?.hash === candidate.key.hash ? { adoptionIdentity } : {}) }));
 		if (!candidate.previews?.size && reservationAvailable(candidate.work.reservation)) return [];
 		return [
 			{
@@ -2370,7 +2364,7 @@ export function makeSpeculativeActionRuntime<
 				executionFingerprint: candidate.key.executionFingerprint,
 				actionKeyHash: candidate.key.hash,
 				expectedDurationMs: candidate.expectedDurationMs,
-				decisionBatchesUntilCall: 0,
+				decisionBatchesUntilCall: 0, adoptionIdentity,
 				...(actorPhase ? { actorPhase } : {}),
 			},
 		];
@@ -2747,9 +2741,7 @@ export function makeSpeculativeActionRuntime<
 	const settingsChanged = async (settings: SpeculativeActionSettings): Promise<void> => {
 		masterEnabled = settings.enabled;
 		if (settings.enabled) return;
-		await Promise.all(
-			[...sessionStates.keys()].map((sessionID) => disableSession(sessionID)),
-		);
+		await Promise.all([...sessionStates.keys()].map((sessionID) => disableSession(sessionID)));
 	};
 
 	const disableSession = async (sessionID: SessionID): Promise<void> => {
