@@ -107,6 +107,10 @@ describe("ActionSemanticsRegistry", () => {
 		expect(await project("No matches found")).toEqual(settle("No matches found"));
 		// Either split of this path could hold the match, and they disagree; at its limit the Actor would report truncation.
 		expect([await project("x:1: foobar.ts:2: foo"), await project("a.ts:1: foobar()", 1)]).toEqual([undefined, undefined]);
+		const folded = (pattern: string) => key(pattern, { ignoreCase: true });
+		expect([actionKeyMatch(folded("foo"), folded("FooBar"), [GREP_LITERAL_ACTION_KEY_PROJECTOR])?.kind, actionKeyMatch(folded("é"), folded("éa"), [GREP_LITERAL_ACTION_KEY_PROJECTOR])]).toEqual(["projected", undefined]);
+		expect(await PI_GREP_LITERAL_PROJECTION_RULE.projectOutput!({ speculative: folded("foo"), actor: folded("FooBar"), output: settle("a.ts:1: fooBAR\nb.ts:2: FOO\nc.ts:3: FOO.bar"),
+			coverage: true, keyMatch: { kind: "projected", projector: "grep.literal", distance: 3 } })).toEqual(settle("a.ts:1: fooBAR"));
 	});
 
 	it("fails closed instead of folding unsupported numeric query views into valid keys", () => {
