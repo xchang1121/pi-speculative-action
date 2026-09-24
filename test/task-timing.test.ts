@@ -21,16 +21,18 @@ describe("single-run serialized counterfactual timing", () => {
 
 	it.each([
 		{ name: "input reuse with native service history", start: 100, end: 200, actor: [], tools: [[110, 130]],
-			adoption: { hitLatencyMs: 25, expectedActorMs: 80 }, expected: { estimatedSavingsMs: 55 } },
-		{ name: "input reuse without native service history", start: 100, end: 200, actor: [], tools: [[110, 130]],
-			adoption: { hitLatencyMs: 25 }, expected: { estimatedSavingsMs: 0 } },
+			adoption: { hitLatencyMs: 25, expectedNativeMs: 80 }, expected: { estimatedSavingsMs: 55 } },
+		{ name: "input reuse slower than its own computation", start: 100, end: 200, actor: [], tools: [[110, 130]],
+			adoption: { hitLatencyMs: 25 }, expected: { estimatedSavingsMs: -5 } },
+		{ name: "parallel native batch", start: 0, end: 100, actor: [[0, 40]], tools: [[40, 100], [40, 90], [40, 70]],
+			expected: { toolExecutionMs: 140, serializedMs: 100, hiddenLatencyMs: 0, estimatedSavingsMs: 0 } },
 		{ name: "already serial", start: 0, end: 300, actor: [[0, 100], [200, 300]], tools: [[100, 200]],
 			expected: { endToEndMs: 300, nonToolMs: 200, toolExecutionMs: 100, serializedMs: 300, hiddenLatencyMs: 0 } },
 		{ name: "tool overlaps Actor generation", start: 0, end: 100, actor: [[0, 100]], tools: [[10, 60]],
 			expected: { endToEndMs: 100, nonToolMs: 100, toolExecutionMs: 50, serializedMs: 150, hiddenLatencyMs: 50 } },
 		{ name: "independent overlapping tools", start: 0, end: 200, actor: [[10, 90]], tools: [[40, 120], [70, 150]],
 			expected: { endToEndMs: 200, actorPhaseMs: 80, orchestrationMs: 60, nonToolMs: 140, toolExecutionMs: 160,
-				serializedMs: 300, hiddenLatencyMs: 100, authoritativeToolCount: 2 } },
+				serializedMs: 250, hiddenLatencyMs: 50, authoritativeToolCount: 2 } },
 		{ name: "previous task's cached execution", start: 100, end: 200, actor: [[100, 200]], tools: [[80, 130]],
 			expected: { endToEndMs: 100, toolExecutionMs: 0, serializedMs: 100, hiddenLatencyMs: 0 } },
 		{ name: "clip and union Actor phases", start: 100, end: 200, actor: [[50, 160], [140, 250]], tools: [],
@@ -55,15 +57,17 @@ describe("single-run serialized counterfactual timing", () => {
 		expect(Reflect.set(first, "completedAt", 1000)).toBe(false);
 		timeline.recordActor(50, 190);
 		for (const interval of [first, first, second, new TimelineInterval(80, 130)]) timeline.recordTool(interval);
-		expect(timeline.measure(150)).toMatchObject({ authoritativeToolCount: 2, toolExecutionMs: 60, hiddenLatencyMs: 60 });
+		expect(timeline.measure(150)).toMatchObject({ authoritativeToolCount: 2, toolExecutionMs: 60, hiddenLatencyMs: 30 });
 		// A retained computation may be adopted later than a more recent one.
 		timeline.recordTool(new TimelineInterval(118, 155));
-		expect(timeline.measure(200)).toMatchObject({ authoritativeToolCount: 3, toolExecutionMs: 117, hiddenLatencyMs: 117 });
+		expect(timeline.measure(200)).toMatchObject({ authoritativeToolCount: 3, toolExecutionMs: 117, hiddenLatencyMs: 42 });
 		const nextTask = new TaskTimeline(200);
 		nextTask.recordTool(first);
 		expect(nextTask.measure(300)).toMatchObject({ authoritativeToolCount: 0, toolExecutionMs: 0, hiddenLatencyMs: 0 });
 		for (const hitLatencyMs of [5, 10, 100]) nextTask.recordTool(first, { hitLatencyMs });
-		expect(nextTask.measure(300)).toMatchObject({ endToEndMs: 100, estimatedSavingsMs: 65, hiddenLatencyMs: 0 });
+		expect(nextTask.measure(300)).toMatchObject({ endToEndMs: 100, estimatedSavingsMs: 5, hiddenLatencyMs: 0 });
+		nextTask.recordOverhead(8);
+		expect(nextTask.measure(300).estimatedSavingsMs).toBe(-3);
 		expect(new TimelineInterval(Number.NaN, -1)).toEqual({ startedAt: 0, completedAt: 0 });
 	});
 

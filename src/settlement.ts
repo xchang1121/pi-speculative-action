@@ -138,6 +138,8 @@ export interface ActorHitTiming {
 	readonly hitLatencyMs: number;
 	/** Historical fallback-service estimate, absent without samples; not a no-speculation baseline. */
 	readonly expectedActorMs?: number;
+	/** Historical native execution without capture or settlement: the reference for estimated savings. */
+	readonly expectedNativeMs?: number;
 }
 
 export type ActorActionProvider =

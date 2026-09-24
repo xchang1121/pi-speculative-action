@@ -174,14 +174,14 @@ describe("SpeculationScheduler", () => {
 		const identity = { tool: "bash", executionFingerprint: "linux-world", actionKeyHash: "producer" };
 		const actorIdentity = { ...identity, actionKeyHash: "consumer" };
 		const exact = { ...actorIdentity, operation: "route:exact" }, inputs = { ...actorIdentity, operation: "route:inputs" };
-		scheduler.observeActorService(identity, 380);
+		scheduler.observeActorService(identity, 380, 300);
 		scheduler.observeAdoption(identity, 70);
 		for (const duration of [40, 50, 90]) scheduler.observeSpeculativeService(identity, duration);
 		for (const duration of [100, 110, 120, 130]) scheduler.observeActorService(actorIdentity, duration);
 		for (const duration of [5, 10, 15, 20]) scheduler.observeAdoption(exact, duration);
 		for (const duration of [150, 160, 180, 200]) scheduler.observeAdoption(inputs, duration);
 		expect(scheduler.evaluate([forecast({ ...identity, expectedDurationMs: 1 })]).expectedDurationMs).toBe(50);
-		expect(joinDecision(scheduler, identity)).toMatchObject({ expectedRemainingMs: 90, expectedActorMs: 380, expectedAdoptionMs: 70 });
+		expect(joinDecision(scheduler, identity)).toMatchObject({ expectedRemainingMs: 90, expectedActorMs: 380, expectedNativeMs: 300, expectedAdoptionMs: 70 });
 		for (const [adoptionIdentity, expectedAdoptionMs] of [[exact, 20], [inputs, 200]] as const) {
 			expect(joinDecision(scheduler, identity, { actorIdentity, adoptionIdentity, state: "succeeded" })).toMatchObject({
 				allowed: expectedAdoptionMs < 100, expectedActorMs: 100, expectedAdoptionMs, expectedNetBenefitMs: 100 - expectedAdoptionMs,

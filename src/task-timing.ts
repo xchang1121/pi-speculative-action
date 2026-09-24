@@ -37,8 +37,8 @@ export interface SpeculativeTaskTiming extends ReturnType<TaskTimeline["measure"
 /** Retains scalar endpoints; counting never owns Actor identities, results or retired computations. */
 export class TaskTimeline {
 	private readonly actorPhases: number[] = [];
-	private readonly authoritativeTools: { readonly startedAt: number; readonly endpoints: readonly number[] }[] = [];
-	private readonly computations = new WeakSet<TimelineInterval>();
+	private readonly authoritativeTools: { readonly startedAt: number; readonly endpoints: readonly number[]; native: boolean }[] = [];
+	private readonly computations = new WeakMap<TimelineInterval, { native: boolean }>();
 	private estimatedSavingsMs = 0;
 	readonly startedAt: number;
 
@@ -49,9 +49,10 @@ export class TaskTimeline {
 	}
 
 	/** Call once per settled Actor operation; adoption includes its actual waiting and validation time. */
-	recordTool(interval: TimelineInterval, adoption?: { readonly hitLatencyMs: number; readonly expectedActorMs?: number }): void {
+	recordTool(interval: TimelineInterval, adoption?: { readonly hitLatencyMs: number; readonly expectedNativeMs?: number }): void {
 		const costs = new Map<TimelineInterval, number>();
-		const visit = (computation: TimelineInterval): number => {
+		// Only a native Actor execution stays native; adopted and reused computations ran ahead of their callers.
+		const visit = (computation: TimelineInterval, native: boolean): number => {
 			const cached = costs.get(computation);
 			if (cached !== undefined) return cached;
 			const inputs = dependencies.get(computation) ?? [];
@@ -59,48 +60,45 @@ export class TaskTimeline {
 				startedAt: Math.max(computation.startedAt, part.startedAt),
 				completedAt: Math.min(computation.completedAt, part.completedAt),
 			})).filter(part => part.completedAt > part.startedAt));
-			if (!this.computations.has(computation)) {
-				this.computations.add(computation);
-				this.authoritativeTools.push({ startedAt: computation.startedAt, endpoints: exclusiveEndpoints(computation, shared.flat()) });
+			const known = this.computations.get(computation);
+			if (known) known.native &&= native;
+			else {
+				const tool = { startedAt: computation.startedAt, endpoints: exclusiveEndpoints(computation, shared.flat()), native };
+				this.computations.set(computation, tool);
+				this.authoritativeTools.push(tool);
 			}
 			const cost = computation.completedAt - computation.startedAt
-				+ inputs.reduce((total, input) => total + nonNegativeDifference(Math.max(visit(input.computation), metric(input.expectedActorMs)), unionDuration(input.shared ?? [])), 0);
+				+ inputs.reduce((total, input) => total + nonNegativeDifference(Math.max(visit(input.computation, false), metric(input.expectedActorMs)), unionDuration(input.shared ?? [])), 0);
 			costs.set(computation, cost);
 			return cost;
 		};
-		const serialMs = visit(interval);
+		const serialMs = visit(interval, !adoption);
 		// Per-call credit includes retained work from earlier tasks. Native parents already include child waits.
-		const referenceMs = Math.max(serialMs, metric(adoption?.expectedActorMs));
+		// Adoption is measured against native execution history when there is any; a slower hit is a loss.
+		const referenceMs = adoption?.expectedNativeMs ?? serialMs;
 		const actualMs = adoption ? metric(adoption.hitLatencyMs) : interval.completedAt - interval.startedAt;
-		this.estimatedSavingsMs += nonNegativeDifference(referenceMs, actualMs);
+		this.estimatedSavingsMs += nonNegativeDifference(referenceMs, actualMs) - nonNegativeDifference(actualMs, referenceMs);
+	}
+
+	/** Speculation's own time on a native Actor call's path. */
+	recordOverhead(durationMs: number): void {
+		this.estimatedSavingsMs -= metric(durationMs);
 	}
 
 	measure(endedAt: number) {
 		const startedAt = this.startedAt, completedAt = Math.max(startedAt, metric(endedAt));
 		const actorPhases = clipped(this.actorPhases, startedAt, completedAt);
 		const computations = this.authoritativeTools.filter(tool => tool.startedAt >= startedAt)
-			.map(tool => clipped(tool.endpoints, startedAt, completedAt)).filter(parts => parts.length);
-		const authoritativeTools = computations.flat();
-		const endToEndMs = completedAt - startedAt;
-		const actorPhaseMs = unionDuration(actorPhases);
-		const toolExecutionMs = authoritativeTools.reduce((total, interval) => total + interval.completedAt - interval.startedAt, 0);
-		const coveredMs = unionDuration([...actorPhases, ...authoritativeTools]);
-		const orchestrationMs = Math.max(0, endToEndMs - coveredMs);
-		const measuredNonToolMs = actorPhaseMs + orchestrationMs;
-		const hiddenLatencyMs = nonNegativeDifference(measuredNonToolMs + toolExecutionMs, endToEndMs);
+			.map(tool => ({ native: tool.native, parts: clipped(tool.endpoints, startedAt, completedAt) })).filter(tool => tool.parts.length);
+		const authoritativeTools = computations.flatMap(tool => tool.parts);
+		const nativeTools = computations.flatMap(tool => tool.native ? tool.parts : []);
+		const endToEndMs = completedAt - startedAt, actorPhaseMs = unionDuration(actorPhases), toolExecutionMs = duration(authoritativeTools);
+		const orchestrationMs = Math.max(0, endToEndMs - unionDuration([...actorPhases, ...authoritativeTools])), nonToolMs = actorPhaseMs + orchestrationMs;
+		// Native calls overlapping each other (a parallel batch) would overlap without speculation: count their union.
+		const hiddenLatencyMs = nonNegativeDifference(nonToolMs + toolExecutionMs - duration(nativeTools) + unionDuration(nativeTools), endToEndMs);
 		const serializedMs = endToEndMs + hiddenLatencyMs;
-		const nonToolMs = Math.max(0, serializedMs - toolExecutionMs);
-		return Object.freeze({
-			startedAt,
-			completedAt,
-			endToEndMs,
-			nonToolMs,
-			actorPhaseMs,
-			orchestrationMs,
-			toolExecutionMs,
-			serializedMs,
-			hiddenLatencyMs,
-			/** Optimistic avoided service time, not a measured no-speculation counterfactual. */
+		return Object.freeze({ startedAt, completedAt, endToEndMs, nonToolMs, actorPhaseMs, orchestrationMs, toolExecutionMs, serializedMs, hiddenLatencyMs,
+			/** Signed avoided service time against native history, net of speculation's own cost on native calls. */
 			estimatedSavingsMs: this.estimatedSavingsMs,
 			/** Distinct accepted computations with exclusive time in this task, not Actor call count. */
 			authoritativeToolCount: computations.length,
@@ -135,6 +133,10 @@ function clipped(endpoints: readonly number[], startedAt: number, completedAt: n
 		if (end > clippedStart) intervals.push({ startedAt: clippedStart, completedAt: end });
 	}
 	return intervals;
+}
+
+function duration(intervals: readonly TimelineInterval[]): number {
+	return intervals.reduce((total, interval) => total + interval.completedAt - interval.startedAt, 0);
 }
 
 function unionDuration(intervals: readonly TimelineInterval[]): number {

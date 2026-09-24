@@ -75,6 +75,8 @@ export interface CandidateJoinDecision {
 	readonly expectedRemainingMs: number;
 	readonly expectedAdoptionMs: number;
 	readonly expectedActorMs?: number;
+	/** Median native execution without capture or settlement: the no-speculation reference for savings. */
+	readonly expectedNativeMs?: number;
 	readonly expectedNetBenefitMs?: number;
 }
 
@@ -142,6 +144,7 @@ export class SpeculationScheduler<Job extends object> {
 	private readonly entries = new Map<Job, SchedulerEntry<Job>>();
 	private readonly speculativeServiceTimes = new BoundedRecencyMap<string, SampleWindow>(1024);
 	private readonly actorServiceTimes = new BoundedRecencyMap<string, SampleWindow>(1024);
+	private readonly nativeServiceTimes = new BoundedRecencyMap<string, SampleWindow>(1024);
 	private readonly adoptionTimes = new BoundedRecencyMap<string, SampleWindow>(1024);
 	private readonly actorDecisionDurations = new SampleWindow();
 	private readonly actorCycles = new SampleWindow();
@@ -287,8 +290,10 @@ export class SpeculationScheduler<Job extends object> {
 		}
 	}
 
-	observeActorService(identity: ServiceTimingIdentity, durationMs: number): void {
+	/** Fallback service includes optional capture and settlement, which only the join comparison should see. */
+	observeActorService(identity: ServiceTimingIdentity, durationMs: number, nativeMs = durationMs): void {
 		this.observeTiming(this.actorServiceTimes, identity, durationMs);
+		this.observeTiming(this.nativeServiceTimes, identity, nativeMs);
 	}
 
 	observeAdoption(identity: ServiceTimingIdentity, durationMs: number): void {
@@ -304,6 +309,7 @@ export class SpeculationScheduler<Job extends object> {
 		const speculative = this.timingEstimate(this.speculativeServiceTimes, request.identity, 0.9, "upper");
 		const actor = this.timingEstimate(this.actorServiceTimes, request.actorIdentity ?? request.identity, 0.25);
 		const adoption = this.timingEstimate(this.adoptionTimes, request.adoptionIdentity ?? request.identity, 0.75, "upper");
+		const native = this.timingEstimate(this.nativeServiceTimes, request.actorIdentity ?? request.identity, 0.5);
 		const expectedActorMs = actor?.value;
 		const expectedSpeculativeMs =
 			speculative?.value ?? positive(request.expectedSpeculativeDurationMs, expectedActorMs ?? 1);
@@ -322,6 +328,7 @@ export class SpeculationScheduler<Job extends object> {
 			expectedRemainingMs,
 			expectedAdoptionMs,
 			...(expectedActorMs === undefined ? {} : { expectedActorMs }),
+			...(native === undefined ? {} : { expectedNativeMs: native.value }),
 			...(expectedNetBenefitMs === undefined ? {} : { expectedNetBenefitMs }),
 		};
 
@@ -341,20 +348,12 @@ export class SpeculationScheduler<Job extends object> {
 
 		if (expectedActorMs === undefined) {
 			const waitBudgetMs = policy.uncalibratedWaitMs ?? Number.POSITIVE_INFINITY;
-			return {
-				allowed: waitBudgetMs > 0,
-				reason: "warmup_probe",
-				waitBudgetMs,
-				...base,
-			};
+			return { allowed: waitBudgetMs > 0, reason: "warmup_probe", waitBudgetMs, ...base };
 		}
 		if (expectedNetBenefitMs === undefined || expectedNetBenefitMs < policy.minNetBenefitMs) {
 			return { allowed: false, reason: "fallback_faster", waitBudgetMs: 0, ...base };
 		}
-		const actorDeadlineMs = Math.max(
-			0,
-			expectedActorMs - expectedAdoptionMs - policy.minNetBenefitMs,
-		);
+		const actorDeadlineMs = Math.max(0, expectedActorMs - expectedAdoptionMs - policy.minNetBenefitMs);
 		const estimatedDeadlineMs = !speculative && request.expectedSpeculativeDurationMs === undefined
 			? actorDeadlineMs : expectedRemainingMs * policy.durationSlack + policy.warmupWaitMs;
 		const waitBudgetMs = Math.min(actorDeadlineMs, estimatedDeadlineMs);
@@ -363,12 +362,7 @@ export class SpeculationScheduler<Job extends object> {
 		if (waitBudgetMs <= 0 || uncalibratedOverrun && !speculative.window.allowProbe()) {
 			return { allowed: false, reason: uncalibratedOverrun ? "warmup_probe" : "fallback_faster", waitBudgetMs: 0, ...base };
 		}
-		return {
-			allowed: true,
-			reason: speculative?.samples ? "profitable" : "warmup_probe",
-			waitBudgetMs,
-			...base,
-		};
+		return { allowed: true, reason: speculative?.samples ? "profitable" : "warmup_probe", waitBudgetMs, ...base };
 	}
 
 	snapshot(): readonly { readonly job: Job; readonly work: ScheduledWork }[] {
