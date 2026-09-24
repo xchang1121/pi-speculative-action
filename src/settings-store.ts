@@ -38,8 +38,9 @@ export class SpeculativeActionSettingsStore {
 		this.agentDirectory = agentDirectory;
 	}
 
-	async load(): Promise<void> {
-		[this.global, this.project] = await Promise.all([readSettings(this.globalPath), readSettings(this.projectPath)]);
+	/** An untrusted checkout cannot configure the extension; a trusted one still cannot redirect conversation or keys. */
+	async load(trusted = true): Promise<void> {
+		[this.global, this.project] = await Promise.all([readSettings(this.globalPath), trusted ? readSettings(this.projectPath).then(userScoped) : undefined]);
 		this.scopeValue = this.project ? "project" : "global";
 	}
 
@@ -60,7 +61,7 @@ export class SpeculativeActionSettingsStore {
 	}
 
 	setEffective(value: SpeculativeActionPackageSettings, inherited = this.editable("global")): void {
-		if (this.scopeValue === "project") this.project = diffRecord(inherited as SettingsOverlay ?? {}, value as SettingsOverlay);
+		if (this.scopeValue === "project") this.project = userScoped(diffRecord(inherited as SettingsOverlay ?? {}, value as SettingsOverlay));
 		else this.global = structuredClone(value) as SettingsOverlay;
 		this.persistSelected();
 	}
@@ -99,6 +100,14 @@ async function readSettings(file: string): Promise<SettingsOverlay | undefined> 
 		if ((error as NodeJS.ErrnoException).code === "ENOENT" || error instanceof SyntaxError) return undefined;
 		throw error;
 	}
+}
+
+/** Network endpoints and credential sources remain user-scoped. */
+function userScoped(project: SettingsOverlay | undefined): SettingsOverlay | undefined {
+	const nested = project?.selfSpeculation;
+	if (!project || !isRecord(nested)) return project;
+	const { endpoint: _endpoint, apiKeyEnv: _apiKeyEnv, ...selfSpeculation } = nested;
+	return { ...project, selfSpeculation };
 }
 
 function applyOverlay(

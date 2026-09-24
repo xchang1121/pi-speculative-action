@@ -333,7 +333,7 @@ async function installController(
 	const recentEvents: string[] = [];
 	const settingsStore =
 		dependencies.createSettingsStore?.(context.cwd) ?? new SpeculativeActionSettingsStore(context.cwd);
-	await settingsStore.load();
+	await settingsStore.load(context.isProjectTrusted());
 	let currentSettings = normalizeSpeculativeActionSettings(settingsStore.effective());
 	let currentMetrics: SpeculativeTraceSummary = emptySpeculativeTraceSummary({
 		cacheCapacity: currentSettings.resourceCacheMaxEntries, cacheByteCapacity: currentSettings.resourceCacheMaxBytes,
