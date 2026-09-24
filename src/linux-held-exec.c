@@ -2347,10 +2347,10 @@ static int actor_decision(struct decision_job *job) {
 		&image_bytes, &physical_length, &source_length) != 8 || code > 256 || (code == 256) != (image_bytes != 0) ||
 		image_bytes > IMAGE_BYTES + sizeof(struct image_header) + MAX_LINE || physical_length >= PATH_MAX || source_length >= PATH_MAX ||
 		(!image_bytes && (physical_length || source_length)) ||
-		job->count > MAX_OUTPUT_EVENTS || total > MAX_OUTPUT_BYTES || job->position_count > MAX_POSITIONS || job->resource_count > 1024) return -1;
+		job->count > MAX_OUTPUT_EVENTS || total > MAX_OUTPUT_BYTES || job->position_count > MAX_POSITIONS || job->resource_count > 1024) goto decline;
 	if (job->position_count) {
 		job->positions = calloc(job->position_count, sizeof(*job->positions));
-		if (!job->positions) return -1;
+		if (!job->positions) goto decline;
 		for (unsigned index = 0; index < job->position_count; index++) {
 			job->positions[index].duplicate = -1; job->positions[index].writer = -1;
 		}
@@ -2377,24 +2377,24 @@ static int actor_decision(struct decision_job *job) {
 		}
 		if (path_length) {
 			position->path = calloc((size_t)path_length + 1, 1);
-			if (!position->path || transfer(connection, position->path, path_length, 0) < 0) return -1;
+			if (!position->path || transfer(connection, position->path, path_length, 0) < 0) goto decline;
 			if (*position->path != '/' || strlen(position->path) != path_length) goto decline;
 			received += path_length;
 		}
 		if (position->content_length > 0) {
 			position->content = malloc((size_t)position->content_length);
-			if (!position->content || transfer(connection, position->content, (size_t)position->content_length, 0) < 0) return -1;
+			if (!position->content || transfer(connection, position->content, (size_t)position->content_length, 0) < 0) goto decline;
 		}
 		if (position->content_length >= 0) received += (size_t)position->content_length;
 	}
 	job->events = calloc(job->count + job->resource_count + 1, sizeof(*job->events));
-	if (!job->events) return -1;
+	if (!job->events) goto decline;
 	for (unsigned index = 0; index < job->resource_count + job->count; index++) {
 		size_t length, requested = 0;
 		unsigned fd, kind = 0;
 		if (read_line(connection, line, sizeof(line)) < 0 || (index < job->resource_count
 			? sscanf(line, "Q %u %u %zu %zu", &kind, &fd, &length, &requested) != 4 || kind > 13 || length > MAX_INPUT_BYTES || requested > MAX_INPUT_BYTES || (kind == 2 && requested < length)
-			: sscanf(line, "O %u %zu", &fd, &length) != 2 || (fd != 1 && fd != 2)) || length > total - received) return -1;
+			: sscanf(line, "O %u %zu", &fd, &length) != 2 || (fd != 1 && fd != 2)) || length > total - received) goto decline;
 		struct output_event *event = &job->events[index];
 		event->fd = fd; event->kind = kind;
 		event->length = length; event->requested = requested;
@@ -2403,9 +2403,9 @@ static int actor_decision(struct decision_job *job) {
 			pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
 			job->outputs[fd] = open_tracee_output(job, fd);
 			pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
-			if (job->outputs[fd] < 0) return -1;
+			if (job->outputs[fd] < 0) goto decline;
 		}
-		if (length && (!(event->data = malloc(length)) || transfer(connection, event->data, length, 0) < 0)) return -1;
+		if (length && (!(event->data = malloc(length)) || transfer(connection, event->data, length, 0) < 0)) goto decline;
 		received += length;
 	}
 	if (image_bytes) {
@@ -2413,12 +2413,12 @@ static int actor_decision(struct decision_job *job) {
 		job->image = image_new();
 		if (!job->image || !(job->image->allocation = malloc(image_bytes)) ||
 			transfer(connection, physical_root, physical_length, 0) < 0 || transfer(connection, source_root, source_length, 0) < 0 ||
-			transfer(connection, job->image->allocation, image_bytes, 0) < 0) return -1;
+			transfer(connection, job->image->allocation, image_bytes, 0) < 0) goto decline;
 		if (*physical_root != '/' || *source_root != '/' || strlen(physical_root) != physical_length || strlen(source_root) != source_length ||
 			image_load(job, image_bytes, physical_root, source_root) < 0) goto decline;
 		received += image_bytes + physical_length + source_length;
 	}
-	if (received != total) return -1;
+	if (received != total) goto decline;
 	for (unsigned index = 0; index < job->position_count; index++) {
 		struct file_position *position = &job->positions[index];
 		pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
