@@ -389,6 +389,7 @@ export function createSpeculativeActionHost(
 		onCandidateMaterialized: options.onCandidateMaterialized,
 		onActorActionMaterialized: options.onActorActionMaterialized,
 		onActorActionSettled: async (feedback) => {
+			patternPlans.actorActionSettled(feedback);
 			await drafterPlans.actorActionSettled(feedback);
 			await options.onActorActionSettled?.(feedback);
 		},
