@@ -224,7 +224,8 @@ interface DispatcherRequest {
 	readonly context: ProcessExecutionContext;
 }
 
-type OutputRoute = readonly [1 | 2, 1 | 2];
+/** The outlet each target output uses; 0 discards into /dev/null. */
+type OutputRoute = readonly [0 | 1 | 2, 0 | 1 | 2];
 type RequestEligibility = { readonly route: OutputRoute } | { readonly reason: string };
 type ProcessArguments = Pick<DispatcherRequest, "argv0" | "args" | "cwd" | "environment"> & {
 	readonly closeStdin?: boolean; readonly resources?: ProcessResourceGraph; readonly outputPipes?: readonly [boolean, boolean];
@@ -1383,6 +1384,8 @@ export class LinuxProcessReuseBackend {
 					return () => { release(); return suspended; };
 				} } : {}),
 			});
+			// Replays write each event to the target's own descriptor, whichever outlet this route gave it.
+			outcome = { ...outcome, output: outcome.output.map(event => ({ ...event, fd: outputRoute[0] === event.fd ? 1 : 2 })) };
 			const observedProcessMs = continuation ? continuation.computation.completedAt - continuation.computation.startedAt : Math.max(0, performance.now() - processStarted);
 			releaseInputs();
 			try {
@@ -2139,17 +2142,9 @@ function directoryState(state: Extract<WorkspaceEffectState, { kind: "directory"
 	return { entriesDigest: state.entriesDigest, mode: state.mode, uid: state.uid, gid: state.gid };
 }
 
-function loadOutputEvents(
-	artifacts: VerifiedArtifactClosure,
-	journal: readonly OrderedEffectEvent[],
-): readonly BufferedOutput[] {
-	const output: BufferedOutput[] = [];
-	for (const event of journal) {
-		if (event.kind !== "output") continue;
-		const data = artifacts.read(event.data);
-		output.push({ fd: event.fd, data });
-	}
-	return output;
+/** Output events carry the target's own descriptor. */
+function loadOutputEvents(artifacts: VerifiedArtifactClosure, journal: readonly OrderedEffectEvent[]): readonly BufferedOutput[] {
+	return journal.flatMap(event => event.kind === "output" ? [{ fd: event.fd, data: artifacts.read(event.data) }] : []);
 }
 
 function wireOutput(output: readonly BufferedOutput[]): readonly { readonly fd: 1 | 2; readonly data: string }[] {
@@ -2593,19 +2588,12 @@ function parseDispatcherRequest(body: string): DispatcherRequest | undefined {
 	}
 }
 
-function materializeDispatcherRequest(
-	session: ActiveSession,
-	request: DispatcherRequest,
-): DispatcherRequest | undefined {
+function materializeDispatcherRequest(session: ActiveSession, request: DispatcherRequest): DispatcherRequest | undefined {
 	const cwd = session.projection.toPhysical(request.cwd);
 	return cwd ? { ...request, cwd } : undefined;
 }
 
-async function eligibleRequest(
-	session: ActiveSession,
-	request: DispatcherRequest,
-	expectedContext: ProcessExecutionContext,
-): Promise<RequestEligibility> {
+async function eligibleRequest(session: ActiveSession, request: DispatcherRequest, expectedContext: ProcessExecutionContext): Promise<RequestEligibility> {
 	if (!validProcessContext(request.context)) return { reason: "process_context_unsupported" };
 	if (!pathContains(session.workspace.sandboxRoot, request.cwd)) return { reason: "cwd_outside_workspace" };
 	if (request.args.length > 4096) return { reason: "argument_count_limit" };
@@ -2613,9 +2601,10 @@ async function eligibleRequest(
 	const endpoints = session.topLevelOutputEndpoints;
 	if (!endpoints) return { reason: "output_endpoint_capture_missing" };
 	if (request.context.outputEndpoints.some((endpoint) => !endpoint)) return { reason: "request_output_endpoint_missing" };
-	const routeOf = (endpoint: string): 0 | 1 | 2 => endpoint === endpoints[0] ? 1 : endpoint === endpoints[1] ? 2 : 0;
+	// The launch key below still checks a discarded descriptor's type and flags.
+	const routeOf = (endpoint: string) => endpoint === endpoints[0] ? 1 : endpoint === endpoints[1] ? 2 : endpoint === "/dev/null" ? 0 : undefined;
 	const route = [routeOf(request.context.outputEndpoints[0]), routeOf(request.context.outputEndpoints[1])] as const;
-	if (!route[0] || !route[1]) return { reason: `output_endpoint_mismatch:${JSON.stringify({ expected: endpoints, observed: request.context.outputEndpoints })}` };
+	if (route[0] === undefined || route[1] === undefined) return { reason: `output_endpoint_mismatch:${JSON.stringify({ expected: endpoints, observed: request.context.outputEndpoints })}` };
 	const outputRoute: OutputRoute = [route[0], route[1]];
 	const context = routedProcessContext(expectedContext, outputRoute);
 	if (request.context.launchKey !== context.launchKey) return { reason: "launch_key_mismatch" };

@@ -1,5 +1,5 @@
 // @ts-check
-import { fstatSync, readFileSync, readlinkSync, statSync } from "node:fs";
+import { closeSync, fstatSync, openSync, readFileSync, readlinkSync, statSync } from "node:fs";
 import { readFile, readlink, stat } from "node:fs/promises";
 
 /** @typedef {import("./provenance-certificate.js").InheritedFileDescriptor["type"]} DescriptorType */
@@ -62,7 +62,8 @@ export async function captureProcessContext(pid, inheritedDescriptors, regularDe
 			if (proof && type !== (proof.type ?? "regular")) throw new Error(`held descriptor ${fd} changed type`);
 			return {
 				fd, endpoint, type,
-				identity: proof ? `ofd:${proof.alias}` : `${metadata.dev}:${metadata.ino}`,
+				// Unproven null devices share one identity: a sandbox may serve its own /dev/null inode.
+				identity: proof ? `ofd:${proof.alias}` : type === "device" && endpoint === "/dev/null" ? "/dev/null" : `${metadata.dev}:${metadata.ino}`,
 				...((type === "pipe" || type === "socket") && proof ? { queue: `${metadata.dev}:${metadata.ino}` } : {}),
 				flags: Number.parseInt(flags, 8) & ~0o2000000,
 			};
@@ -97,12 +98,9 @@ export async function captureProcessContext(pid, inheritedDescriptors, regularDe
 		descriptors: descriptors.map(({ endpoint, identity, ...descriptor }) => {
 			if (!aliases.has(identity)) aliases.set(identity, aliases.size);
 			if (descriptor.queue && !queues.has(descriptor.queue)) queues.set(descriptor.queue, descriptor.fd);
-			return {
-				fd: descriptor.fd, type: descriptor.type, flags: descriptor.flags,
-				alias: aliases.get(identity),
-				...(descriptor.queue ? { queue: queues.get(descriptor.queue) } : {}),
-				...(descriptor.type === "device" ? { endpoint } : {}),
-			};
+			// routedProcessContext reproduces this key order, including its /dev/null discard outlet.
+			return { fd: descriptor.fd, type: descriptor.type, flags: descriptor.flags, alias: aliases.get(identity),
+				...(descriptor.queue ? { queue: queues.get(descriptor.queue) } : {}), ...(descriptor.type === "device" ? { endpoint } : {}) };
 		}),
 	};
 	return {
@@ -114,42 +112,42 @@ export async function captureProcessContext(pid, inheritedDescriptors, regularDe
 	};
 }
 
-/** @param {ProcessExecutionContext} context @param {readonly [1 | 2, 1 | 2]} route @param {boolean} closeStdin @param {ProcessExecutionContext["regularDescriptors"]} [regularDescriptors] @param {readonly [boolean, boolean]} [outputPipes] @returns {ProcessExecutionContext} */
+/** @param {ProcessExecutionContext} context @param {readonly [0 | 1 | 2, 0 | 1 | 2]} route 0 discards into /dev/null @param {boolean} closeStdin @param {ProcessExecutionContext["regularDescriptors"]} [regularDescriptors] @param {readonly [boolean, boolean]} [outputPipes] @returns {ProcessExecutionContext} */
 export function routedProcessContext(context, route, closeStdin = false, regularDescriptors, outputPipes) {
 	const semantic = JSON.parse(context.key);
 	if (!semantic.credentials || !semantic.signals ||
 		![semantic.signals.blocked, semantic.signals.ignored].every(value => typeof value === "string" && /^[0-9a-f]+$/i.test(value)) ||
 		!Array.isArray(semantic.descriptors) || semantic.descriptors.length !== 3) throw new Error("invalid probed execution context");
+	/** @param {0 | 1 | 2} outlet */
+	const output = outlet => outlet ? semantic.descriptors[outlet] : { fd: 0, type: "device", flags: discardFlags(), alias: 0, endpoint: "/dev/null" };
+	// Aliases number identities by first use; as in capture, every unproven null device shares one.
+	/** @param {{ type?: string, endpoint?: string }} descriptor @param {unknown} identity */
+	const identity = (descriptor, identity) => descriptor.type === "device" && descriptor.endpoint === "/dev/null" ? "/dev/null" : identity;
 	const descriptors = [
-		closeStdin ? { fd: 0, type: "closed", flags: 0, alias: 0 } : semantic.descriptors[0],
-		{ ...semantic.descriptors[route[0]], fd: 1, alias: 1 },
-		{ ...semantic.descriptors[route[1]], fd: 2, alias: route[0] === route[1] ? 1 : 2 },
+		closeStdin ? { fd: 0, type: "closed", flags: 0, alias: 0 } : { ...semantic.descriptors[0], alias: identity(semantic.descriptors[0], 0) },
+		{ ...output(route[0]), fd: 1, alias: identity(output(route[0]), `outlet:${route[0]}`) },
+		{ ...output(route[1]), fd: 2, alias: identity(output(route[1]), `outlet:${route[1]}`) },
 	];
 	for (let index = 0; index < 2; index++) if (outputPipes?.[index]) Object.assign(descriptors[index + 1], { type: "pipe", flags: 1 });
-	if (regularDescriptors?.length) {
-		for (const descriptor of regularDescriptors) {
-			const entry = { fd: descriptor.fd, type: descriptor.type ?? "regular", flags: descriptor.flags, alias: `ofd:${descriptor.alias}`,
-				...(descriptor.type === "pipe" || descriptor.type === "socket" ? { queue: descriptor.image } : {}) };
-			if (descriptor.fd === 0) descriptors[0] = entry;
-			else if (descriptor.fd > 2) descriptors.push(entry);
-			else throw new Error("inherited output descriptor cannot use buffered routing");
-		}
-		const aliases = new Map();
-		for (const descriptor of descriptors) {
-			if (!aliases.has(descriptor.alias)) aliases.set(descriptor.alias, aliases.size);
-			descriptor.alias = aliases.get(descriptor.alias);
-		}
+	for (const descriptor of regularDescriptors ?? []) {
+		const entry = { fd: descriptor.fd, type: descriptor.type ?? "regular", flags: descriptor.flags, alias: `ofd:${descriptor.alias}`,
+			...(descriptor.type === "pipe" || descriptor.type === "socket" ? { queue: descriptor.image } : {}) };
+		if (descriptor.fd === 0) descriptors[0] = entry;
+		else if (descriptor.fd > 2) descriptors.push(entry);
+		else throw new Error("inherited output descriptor cannot use buffered routing");
+	}
+	const aliases = new Map();
+	for (const descriptor of descriptors) {
+		if (!aliases.has(descriptor.alias)) aliases.set(descriptor.alias, aliases.size);
+		descriptor.alias = aliases.get(descriptor.alias);
 	}
 	// libuv resets the signal mask and dispositions for every spawned target.
-	const signals = {
-		blocked: semantic.signals.blocked.replace(/[0-9a-f]/gi, "0"),
-		ignored: semantic.signals.ignored.replace(/[0-9a-f]/gi, "0"),
-	};
+	const signals = { blocked: semantic.signals.blocked.replace(/[0-9a-f]/gi, "0"), ignored: semantic.signals.ignored.replace(/[0-9a-f]/gi, "0") };
 	return {
 		...context,
 		...contextKeys({ ...semantic, executionDomain: "ptrace", signals, descriptors }),
 		descriptorTypes: [regularDescriptors?.find(({ fd }) => fd === 0)?.type ?? (regularDescriptors?.some(({ fd }) => fd === 0) ? "regular" : closeStdin ? "closed" : context.descriptorTypes[0]),
-			outputPipes?.[0] ? "pipe" : context.descriptorTypes[route[0]], outputPipes?.[1] ? "pipe" : context.descriptorTypes[route[1]]],
+			outputPipes?.[0] ? "pipe" : route[0] ? context.descriptorTypes[route[0]] : "device", outputPipes?.[1] ? "pipe" : route[1] ? context.descriptorTypes[route[1]] : "device"],
 		...(regularDescriptors?.length ? { regularDescriptors } : {}),
 	};
 }
@@ -157,39 +155,44 @@ export function routedProcessContext(context, route, closeStdin = false, regular
 /** @param {unknown} value @returns {value is ProcessExecutionContext} */
 export function validProcessContext(value) {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-	const context = /** @type {Partial<ProcessExecutionContext>} */ (value);
+	const context = /** @type {Partial<ProcessExecutionContext>} */ (value), types = context.descriptorTypes;
 	return typeof context.key === "string" && context.key.length > 0 && context.key.length <= 64 * 1024 &&
 		typeof context.launchKey === "string" && context.launchKey.length > 0 && context.launchKey.length <= 64 * 1024 &&
 		typeof context.umask === "number" && Number.isSafeInteger(context.umask) && context.umask >= 0 && context.umask <= 0o777 &&
-		Array.isArray(context.descriptorTypes) && context.descriptorTypes.length === 3 &&
-		(["device", "closed"].includes(context.descriptorTypes[0]) ||
-			(["regular", "null", "directory", "pipe", "socket", "eventfd"].includes(context.descriptorTypes[0]) && context.regularDescriptors?.some(({ fd }) => fd === 0) === true)) && ["pipe", "socket"].includes(context.descriptorTypes[1]) &&
-		["pipe", "socket"].includes(context.descriptorTypes[2]) &&
+		Array.isArray(types) && types.length === 3 && (["device", "closed"].includes(types[0]) ||
+			(["regular", "null", "directory", "pipe", "socket", "eventfd"].includes(types[0]) && context.regularDescriptors?.some(({ fd }) => fd === 0) === true)) &&
 		Array.isArray(context.outputEndpoints) && context.outputEndpoints.length === 2 &&
-		context.outputEndpoints.every(endpoint => typeof endpoint === "string" && endpoint.length <= 4096);
+		// Output reaches a stream, or is discarded into /dev/null.
+		context.outputEndpoints.every((endpoint, index) => typeof endpoint === "string" && endpoint.length <= 4096 &&
+			(["pipe", "socket"].includes(types[index + 1]) || types[index + 1] === "device" && endpoint === "/dev/null"));
+}
+
+/** @type {number | undefined} */
+let nullOutputFlags;
+/** Status flags of a write-only /dev/null, as `2>/dev/null` and the dispatcher's discard route open it. */
+function discardFlags() {
+	if (nullOutputFlags === undefined) {
+		const fd = openSync("/dev/null", "w");
+		let flags;
+		try { flags = /^flags:\s*([0-7]+)/m.exec(readFileSync(`/proc/self/fdinfo/${fd}`, "utf8"))?.[1]; } finally { closeSync(fd); }
+		if (!flags) throw new Error("null device flags unavailable");
+		nullOutputFlags = Number.parseInt(flags, 8) & ~0o2000000;
+	}
+	return nullOutputFlags;
 }
 
 /** @param {number | "self"} pid @param {number} fd */
 function descriptorTarget(pid, fd) {
 	const target = `/proc/${pid}/fd/${fd}`;
 	if (pid !== "self") return readlink(target);
-	try {
-		return readlinkSync(target);
-	} catch {
-		return undefined; // The broker rejects missing output endpoints and preserves native fallback.
-	}
+	// The broker rejects missing output endpoints and preserves native fallback.
+	try { return readlinkSync(target); } catch { return undefined; }
 }
 
 /** @param {{ credentials: Record<string, unknown>, [key: string]: unknown }} semantic */
 function contextKeys(semantic) {
-	return {
-		key: JSON.stringify(semantic),
-		launchKey: JSON.stringify({
-			...semantic,
-			credentials: { ...semantic.credentials, groups: "broker-preserved" },
-			signals: "broker-normalized",
-		}),
-	};
+	const launch = { ...semantic, credentials: { ...semantic.credentials, groups: "broker-preserved" }, signals: "broker-normalized" };
+	return { key: JSON.stringify(semantic), launchKey: JSON.stringify(launch) };
 }
 
 /** @param {string} value */

@@ -171,7 +171,7 @@ export function descriptorEffects(graph: ProcessResourceGraph, report: readonly 
 export interface HeldExecSnapshot {
 	readonly executable: string;
 	/** Actual output aliasing, usable for another isolated launch after context revalidation. */
-	readonly outputRoute?: readonly [1 | 2, 1 | 2];
+	readonly outputRoute?: readonly [0 | 1 | 2, 0 | 1 | 2];
 	readonly outputPipes?: readonly [boolean, boolean];
 	readonly argv: readonly string[];
 	readonly cwd: string;
@@ -469,9 +469,10 @@ export async function inspectHeldExecProcess(pid: number, executable: string, de
 		if (separator < 1 || Object.hasOwn(environment, entry.slice(0, separator))) throw new Error("held process environment is not canonical");
 		environment[entry.slice(0, separator)] = entry.slice(separator + 1);
 	}
+	const [output, error] = context.outputEndpoints;
 	return {
-		executable,
-		outputRoute: context.outputEndpoints[0] === context.outputEndpoints[1] ? [1, 1] : [1, 2],
+		executable, // A discarded stream stays discarded; a merged one keeps one outlet.
+		outputRoute: [output === "/dev/null" ? 0 : 1, error === "/dev/null" ? 0 : error === output ? 1 : 2],
 		outputPipes: [context.descriptorTypes[1] === "pipe", context.descriptorTypes[2] === "pipe"],
 		argv, cwd, environment, context,
 	};
