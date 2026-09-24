@@ -32,12 +32,7 @@ export function straceCommand(
 
 export type ObservedProcessPath =
 	| { readonly path: string; readonly role: DependencyRole }
-	| {
-			readonly path: string;
-			readonly role: "metadata";
-			readonly followSymlinks: boolean;
-			readonly digest: Sha256Digest;
-	  };
+	| { readonly path: string; readonly role: "metadata"; readonly followSymlinks: boolean; readonly digest: Sha256Digest };
 
 export interface StraceObservation {
 	readonly complete: boolean;
@@ -577,15 +572,7 @@ export async function observeStrace(
 	}
 	const target = path.posix.resolve(executablePath);
 	const root = selectTraceRoot(files, target);
-	if ("reason" in root) {
-		return {
-			complete: false,
-			paths: [],
-			taints: ["trace_incomplete"],
-			tracedProcesses: 0,
-			incompleteReasons: [root.reason],
-		};
-	}
+	if ("reason" in root) return { complete: false, paths: [], taints: ["trace_incomplete"], tracedProcesses: 0, incompleteReasons: [root.reason] };
 
 	const byPID = new Map(files.map((file) => [file.pid, file]));
 	const selected = new Map<number, TraceProcess>([[root.file.pid, {
@@ -642,12 +629,7 @@ export async function observeStrace(
 			taints.add("mutable_input");
 			incompleteReasons.add(`metadata_changed:${observedPath}`);
 		}
-		metadata.set(identity, {
-			path: observedPath,
-			role: "metadata",
-			followSymlinks,
-			digest,
-		});
+		metadata.set(identity, { path: observedPath, role: "metadata", followSymlinks, digest });
 	};
 	for (const [pid, { file, start, cwd: initial, fs }] of selected) {
 		// -ff files cannot order another task's chdir against this task's pathname lookup.
@@ -716,27 +698,31 @@ export async function observeStrace(
 				taints.add("unsupported_syscall");
 				incompleteReasons.add(`filesystem_semantics:${syscall}:${pid}`);
 			}
-			if (MODELED_METADATA_SYSCALLS.has(syscall) && syscallSucceeded(line)) {
+			const [structure, flags] = MODELED_METADATA_SYSCALLS.get(syscall) ?? [];
+			if (structure && syscallSucceeded(line)) {
 				// A recreated null device has the same I/O semantics, but may have a different device-node inode.
 				if (/<char 1:3>>$/.test(line.args[0] ?? "")) { taints.add("descriptor_observation"); continue; }
-				const metadataPaths = syscallPaths(line, syscall, cwd);
-				const digest = statObservationDigest(line.args[syscall === "newfstatat" ? 2 : 1] ?? "");
+				const metadataPaths = syscallPaths(line, syscall, cwd) ?? [];
+				const digest = statObservationDigest(line.args[structure] ?? "");
 				if (!metadataPaths.length || !digest) {
-					if (syscall === "fstat" && descriptorTarget(line)) taints.add("descriptor_observation");
+					// fstat, or an empty *at name, of a pipe or socket
+					if (descriptorTarget(line) && !quotedArgument(line.args[1])) taints.add("descriptor_observation");
 					else {
 						taints.add("unsupported_syscall");
 						incompleteReasons.add(`unparsed_metadata:${syscall}:${pid}`);
 					}
 				}
 				if (digest) {
-					const followSymlinks = syscall !== "lstat" && !(syscall === "newfstatat" && /\bAT_SYMLINK_NOFOLLOW\b/.test(line.args[3] ?? ""));
+					const followSymlinks = syscall !== "lstat" && !(flags && /\bAT_SYMLINK_NOFOLLOW\b/.test(line.args[flags] ?? ""));
 					for (const observed of metadataPaths) observeMetadata(observed, followSymlinks, digest);
 				}
 				continue;
 			}
 			if (!PATH_ARGUMENTS[syscall]) continue;
 			const role: DependencyRole = syscall === "execve" || syscall === "execveat" ? "executable" : "input";
-			for (const observed of syscallPaths(line, syscall, cwd)) {
+			const observedPaths = syscallPaths(line, syscall, cwd);
+			if (!observedPaths) { complete = false; incompleteReasons.add(`unresolved_pathname:${syscall}:${pid}`); }
+			for (const observed of observedPaths ?? []) {
 				if (paths.get(observed) !== "executable") paths.set(observed, role);
 			}
 			if ((syscall === "chdir" || syscall === "fchdir") && syscallSucceeded(line)) {
@@ -784,24 +770,25 @@ function continuationCall(line: TraceLine, initial: boolean): boolean {
 	if (call === "mmap") return (line.args[3] ?? "").split("|").every(flag => /^(?:MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED|MAP_DENYWRITE|MAP_STACK)$/.test(flag));
 	if (call === "madvise") return line.args[2] === "MADV_DONTNEED";
 	if (call === "arch_prctl") return /^ARCH_(?:SET|GET)_(?:FS|GS)$/.test(line.args[0] ?? "");
-	return /^(?:read|pread64|readv|write|writev|pwrite64|lseek|open|openat|access|faccessat|newfstatat|fstat|stat|lstat|readlink|readlinkat|brk|mprotect|munmap|set_tid_address|set_robust_list|rseq|prlimit64|getrandom|rt_sigaction|rt_sigprocmask|sigaltstack|dup|poll|ppoll|select|pselect6|sendto|recvfrom|sendmsg|recvmsg|shutdown|flock|rename|renameat|renameat2|unlink|unlinkat|link|linkat|mkdir|mkdirat|rmdir|chmod|fchmod|fchmodat|truncate|ftruncate)$/.test(call);
+	return /^(?:read|pread64|readv|write|writev|pwrite64|lseek|open|openat|access|faccessat|newfstatat|fstat|stat|lstat|statx|readlink|readlinkat|brk|mprotect|munmap|set_tid_address|set_robust_list|rseq|prlimit64|getrandom|rt_sigaction|rt_sigprocmask|sigaltstack|dup|poll|ppoll|select|pselect6|sendto|recvfrom|sendmsg|recvmsg|shutdown|flock|rename|renameat|renameat2|unlink|unlinkat|link|linkat|mkdir|mkdirat|rmdir|chmod|fchmod|fchmodat|truncate|ftruncate)$/.test(call);
 }
 
-/** Kernel argument positions own pathname identity; each *at operand has its own directory binding. */
-const PATH_ARGUMENTS: Readonly<Record<string, readonly (readonly [pathname: number | undefined, dirfd?: number, descriptorPath?: "NULL" | '""'])[]>> = Object.fromEntries(([
+/** Kernel argument positions own pathname identity; each *at operand has its own directory binding.
+ * An empty or NULL name of an operand that accepts AT_EMPTY_PATH names its descriptor. */
+const PATH_ARGUMENTS: Readonly<Record<string, readonly (readonly [pathname: number | undefined, dirfd?: number, descriptorPath?: true])[]>> = Object.fromEntries(([
 	["access chdir chmod chown creat execve getxattr lgetxattr listxattr llistxattr mkdir mknod open readlink removexattr lremovexattr rmdir setxattr lsetxattr truncate unlink utime utimes stat lstat statfs", [[0]]],
 	["rename link mount", [[0], [1]]],
 	["symlink", [[1]]],
-	["execveat faccessat faccessat2 fchmodat fchownat mkdirat mknodat openat openat2 readlinkat unlinkat statx", [[1, 0]]],
-	["newfstatat", [[1, 0, '""']]],
-	["utimensat", [[1, 0, "NULL"]]],
-	["renameat renameat2 linkat", [[1, 0], [3, 2]]],
+	["faccessat fchmodat mkdirat mknodat openat openat2 unlinkat", [[1, 0]]],
+	["execveat faccessat2 fchownat newfstatat readlinkat statx utimensat", [[1, 0, true]]],
+	["renameat renameat2", [[1, 0], [3, 2]]],
+	["linkat", [[1, 0, true], [3, 2]]],
 	["symlinkat", [[2, 1]]],
 	["fchdir fstat fstatfs", [[undefined, 0]]],
 ] as const).flatMap(([names, positions]) => names.split(" ").map((name) => [name, positions])));
 
-const MODELED_METADATA_SYSCALLS = new Set(["stat", "lstat", "fstat", "newfstatat"]);
-const UNMODELED_METADATA_SYSCALLS = new Set(["statx", "statfs", "fstatfs", "getdents", "getdents64"]);
+const MODELED_METADATA_SYSCALLS = new Map<string, readonly [structure: number, flags?: number]>([["stat", [1]], ["lstat", [1]], ["fstat", [1]], ["newfstatat", [2, 3]], ["statx", [4, 2]]]);
+const UNMODELED_METADATA_SYSCALLS = new Set(["statfs", "fstatfs", "getdents", "getdents64"]);
 
 /** Persistent metadata not represented by the typed workspace transaction must never be replayed. */
 const UNMODELED_FILE_SEMANTICS_SYSCALLS = new Set([
@@ -984,18 +971,19 @@ function processLimitDenied(line: TraceLine, syscall: string): boolean {
 	return ["clone", "clone3", "fork", "vfork"].includes(syscall) && /^-1 EAGAIN\b/.test(line.result);
 }
 
-function syscallPaths(line: TraceLine, syscall: string, cwd: string): readonly string[] {
-	return (PATH_ARGUMENTS[syscall] ?? []).flatMap(([pathname, dirfd, descriptorPath]) => {
+function syscallPaths(line: TraceLine, syscall: string, cwd: string): readonly string[] | undefined {
+	const paths = (PATH_ARGUMENTS[syscall] ?? []).map(([pathname, dirfd, descriptorPath]) => {
 		const descriptor = dirfd === undefined ? undefined : line.args[dirfd];
-		if (pathname === undefined || (descriptorPath !== undefined && line.args[pathname] === descriptorPath)) {
+		if (pathname === undefined || descriptorPath && /^(?:""|NULL)$/.test(line.args[pathname] ?? "")) {
 			const target = absoluteDescriptorPath(descriptor); return target ? [target] : [];
 		}
 		const value = quotedArgument(line.args[pathname]);
 		if (value?.startsWith("/")) return [walkedPath(value)]; // Absolute names ignore dirfd, even an invalid one.
 		const base = dirfd === undefined || descriptor === "AT_FDCWD" || descriptor === "-100" ? cwd : absoluteDescriptorPath(descriptor);
-		if (!value || !base) throw new Error(`unresolved_pathname:${syscall}:${pathname}`);
-		return [walkedPath(`${base}/${value}`)];
+		// Without a name or a directory, a failed call looked nothing up and a successful one is unresolved.
+		return value && base ? [walkedPath(`${base}/${value}`)] : syscallSucceeded(line) ? undefined : [];
 	});
+	return paths.includes(undefined) ? undefined : paths.flat() as string[];
 }
 
 /** Keep `..`: only a walk over the recorded tree knows whether it leaves a symlinked directory. */
@@ -1014,21 +1002,13 @@ function descriptorTarget(line: TraceLine): boolean {
 	return Boolean(target && !target.startsWith("/"));
 }
 
-const STAT_MODE_BITS: Readonly<Record<string, bigint>> = {
-	S_IFSOCK: 0o140000n,
-	S_IFLNK: 0o120000n,
-	S_IFREG: 0o100000n,
-	S_IFBLK: 0o060000n,
-	S_IFDIR: 0o040000n,
-	S_IFCHR: 0o020000n,
-	S_IFIFO: 0o010000n,
-	S_ISUID: 0o004000n,
-	S_ISGID: 0o002000n,
-	S_ISVTX: 0o001000n,
-};
+const STAT_MODE_BITS: Readonly<Record<string, bigint>> = { S_IFSOCK: 0o140000n, S_IFLNK: 0o120000n, S_IFREG: 0o100000n, S_IFBLK: 0o060000n,
+	S_IFDIR: 0o040000n, S_IFCHR: 0o020000n, S_IFIFO: 0o010000n, S_ISUID: 0o004000n, S_ISGID: 0o002000n, S_ISVTX: 0o001000n };
 
-/** Normalize the successful kernel stat structure printed by strace -v. */
-function statObservationDigest(line: string): Sha256Digest | undefined {
+/** Normalize the successful kernel stat structure printed by strace -v; statx prints the same fields under its own names. */
+function statObservationDigest(structure: string): Sha256Digest | undefined {
+	const line = structure.replace(/\bstx_(r?dev)_major=(\w+), stx_\1_minor=(\w+)/g, "st_$1=makedev($2, $3)")
+		.replace(/\bstx_([amc]time)=\{tv_sec=(-?\d+), tv_nsec=(\d+)\}/g, "st_$1=$2, st_$1_nsec=$3").replace(/\bstx_/g, "st_");
 	const field = (name: string): bigint | undefined => parseInteger(new RegExp(`\\b${name}=(-?(?:0x[0-9a-f]+|0[0-7]+|[0-9]+))`, "i").exec(line)?.[1]);
 	const device = (name: string): bigint | undefined => {
 		const match = new RegExp(`\\b${name}=makedev\\(([^,]+),\\s*([^\\)]+)\\)`).exec(line);
