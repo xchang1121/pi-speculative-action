@@ -6,7 +6,7 @@ import path from "node:path";
 import { setImmediate as watcherTurn } from "node:timers/promises";
 import { type ActionKey, type ActionSemanticsRegistry, PI_ACTION_SEMANTICS, type ResourceDependencyScope } from "./action-semantics.ts";
 import { type StableFilesystemCapture, captureFilesystemEntry, captureStableFile, FILESYSTEM_CONCURRENCY, mapFilesystem, sameFilesystemIdentity, walkFilesystemPath } from "./filesystem-evidence.ts";
-import { containsFilesystemPath, filesystemPathKey } from "./path-utils.ts";
+import { containsFilesystemPath, filesystemPathKey, relativeFilesystemPath } from "./path-utils.ts";
 import type { ToolFilesystemOperations, ToolFilesystemStat } from "./tool-settlement.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
 
@@ -676,14 +676,12 @@ export class ResourceVersionManager {
 	}
 
 	changesSince(token: ResourceVersionToken): ResourceChangeSet {
-		if (token.manager !== this || token.root !== this.root || !token.watching || !this.reliable) {
-			return { uncertain: true, paths: [] };
-		}
+		if (token.manager !== this || token.root !== this.root || !token.watching || !this.reliable) return { uncertain: true, paths: [] };
 		const oldest = this.events[0]?.epoch ?? this.epoch;
-		if (token.epoch < oldest && this.events.length >= MAX_EVENT_HISTORY) {
-			return { uncertain: true, paths: [] };
-		}
-		const events = this.events.filter((event) => event.epoch > token.epoch);
+		if (token.epoch < oldest && this.events.length >= MAX_EVENT_HISTORY) return { uncertain: true, paths: [] };
+		// Excluded segments (a workspace's .git) are never snapshotted: their churn is no change to prepare for.
+		const events = this.events.filter((event) => event.epoch > token.epoch &&
+			!relativeFilesystemPath(this.root, event.path)?.split(/[\\/]/u).some((segment) => this.snapshotExcludes.has(segment)));
 		return { uncertain: events.some((event) => event.type === "unknown"), paths: [...new Set(events.map((event) => event.path))] };
 	}
 
@@ -753,10 +751,7 @@ export function resourceDependencies(
 	const definition = actionSemantics.definition(action);
 	const scope = definition ? definition.resourceScope : "content";
 	if (scope === undefined || scope === "captured_inputs") return [];
-	return action.resources.map((resource) => ({
-		path: path.resolve(root, resource),
-		scope,
-	}));
+	return action.resources.map((resource) => ({ path: path.resolve(root, resource), scope }));
 }
 
 export async function captureResourceVersion(
@@ -1183,10 +1178,7 @@ function missingResource(error: unknown): boolean {
 function releaseOnce<Result>(release: () => Result): () => Result | undefined {
 	let released = false;
 	let result: Result | undefined;
-	return () => {
-		if (!released) { released = true; result = release(); }
-		return result;
-	};
+	return () => { if (!released) { released = true; result = release(); } return result; };
 }
 
 const priorityIO = new AsyncLocalStorage<true>();

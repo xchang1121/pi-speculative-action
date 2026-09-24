@@ -298,6 +298,12 @@ describe("speculative action resource versions", () => {
 					expect(await manager.validate(token)).toMatchObject({ expired: true, bytesRead: 0, filesRead: 0 });
 					expect((await manager.seal(token)).expired).toBe(true);
 				}
+				if (watch) {
+					await fs.mkdir(path.join(root, ".git")); await fs.writeFile(path.join(root, ".git", "index"), "staged");
+					if (!snapshotExcludes.length) await vi.waitFor(() => expect(manager.changesSince(token).paths).toContain(path.join(root, ".git", "index")));
+					await fs.writeFile(path.join(root, "value.txt"), "last"); await vi.waitFor(() => expect(manager.changesSince(token).paths).toContain(path.join(root, "value.txt")));
+					expect(manager.changesSince(token).paths.some((changed) => changed.includes(".git"))).toBe(!snapshotExcludes.length);
+				}
 				expect(reads).not.toHaveBeenCalled();
 				await token.release(); await token.release(); expect(idle).toHaveBeenCalledTimes(1);
 			} finally { reads.mockRestore(); await token.release(); manager.close(); }
