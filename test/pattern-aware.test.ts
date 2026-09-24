@@ -430,6 +430,7 @@ describe("PatternAware", () => {
 		await first.flush();
 
 		const raw = await fs.readFile(file, "utf8");
+		if (process.platform !== "win32") expect((await fs.stat(file)).mode & 0o777).toBe(0o600);
 		expect(raw).not.toContain('"history"');
 		const persisted = JSON.parse(raw);
 		expect(Object.keys(persisted).sort()).toEqual(["events", "patterns", "pools", "sequenceCounts"]);
