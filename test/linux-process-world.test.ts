@@ -164,7 +164,6 @@ int main(int argc, char **argv) {
 			for (const name of ["worker", "launch"]) await compileBenchmarkHelper(fixture.workspace, { source: `${name}.c`, output: name, arguments: ["-pthread"] });
 			await commitBenchmarkFixture(fixture.workspace, "Live process continuation");
 			const route = await fixture.prepareActorReplay();
-			if (!("executor" in route)) throw new Error(route.detail);
 			const tools = [fixture.tool], events: SpeculativeActionEvent<string>[] = [], scope = { sessionID: "live", turnID: "seed" };
 			const settings = patternAwareSettings({ enabled: true, multiStepEnabled: false, beamWidth: 4 });
 			const patternStore = new PatternAwareStore(settings, undefined, patternAwareActionSemantics(PI_ACTION_SEMANTICS, fixture.workspace));
@@ -241,7 +240,6 @@ int main(void) { char b[1024]; return syscall(SYS_getdents64, 4, b, sizeof(b)) <
 			await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker" });
 			await commitBenchmarkFixture(fixture.workspace, "Native resource input bridge"); await prepareLinuxProcessReuse(fixture);
 			const route = await fixture.prepareActorReplay();
-			if (!("executor" in route)) throw new Error(route.detail);
 			const tools = [fixture.tool, createReadTool(fixture.workspace), createGrepTool(fixture.workspace), createLsTool(fixture.workspace), createFindTool(fixture.workspace)], events: SpeculativeActionEvent<string>[] = [];
 			host = createSpeculativeActionHost("native-inputs", { cwd: fixture.workspace, complete: async () => { throw new Error("no inference"); },
 				getSettings: () => ({ enabled: true, drafterEnabled: false, tools: tools.map(tool => tool.name), resourceCacheMaxEntries: 8,
@@ -560,7 +558,6 @@ int main(int argc, char **argv) {
 				"export BOUND_SECRET='private value'; " + (launcher ? "exec fd-launch parent" : "printf 'parent\\n'; exec -a bound-name worker 'private argument'") +
 				(mode === "native-merged" ? " 2>&1" : mode === "native-closed-input" ? " 0<&-" : "");
 			const route = await fixture.prepareActorReplay(!native);
-			if (!("executor" in route)) throw new Error(route.detail);
 			const invocation = resolvePiToolInvocation("bash", { command: "exit 92" }, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath })!.process!;
 			let binding: ProcessExecutionBinding | undefined;
 			if (!native) {
@@ -826,7 +823,6 @@ int main(int argc,char **argv) {
 			await prepareLinuxProcessReuse(fixture);
 			const scope = { sessionID: "fd-binding", turnID: "recorded" }, later = { ...scope, turnID: "prepared" };
 			const route = await fixture.prepareActorReplay();
-			if (!("executor" in route)) throw new Error(route.detail);
 			const command = memory ? "fd-memory parent" : `exec 3<${writable ? ">" : ""}input.txt; exec 4<&3; exec 8<${locks ? ">" : ""}${hardlink ? "alias.txt" : "input.txt"}; IFS= read -r -N 1 discard <&3; IFS= read -r -N 1 discard <&8; ` +
 				(mode === "unlinked" ? "rm input.txt; " : "") +
 				(locks ? "locker init; " : "") + `printf 'parent\\n'; worker; IFS= read -r -N 1 a <&4; IFS= read -r -N 1 b <&8; printf 'tail:%s:%s\\n' "$a" "$b"` + (locks ? "; locker check" : "");
@@ -942,7 +938,6 @@ static int take(int length,int peek,int truncated,char expected) {
 			await commitBenchmarkFixture(fixture.workspace, "Packet resource graph"); await prepareLinuxProcessReuse(fixture);
 			const scope = { sessionID: "packet-binding", turnID: "seed" }, later = { ...scope, turnID: "prepared" };
 			const route = await fixture.prepareActorReplay();
-			if (!("executor" in route)) throw new Error(route.detail);
 			const command = "fd-launch parent";
 			const execute = async (scope: { sessionID: string; turnID: string }, command: string) => {
 				let output = ""; const result = await route.executor.execute({ command, cwd: fixture.workspace, environment: fixture.environment, scope,
@@ -2291,7 +2286,6 @@ int main(int argc, char **argv) {
 			if (mode !== "rename") {
 				expect(branch.output.result.content).toEqual([{ type: "text", text: instanceInput ? expect.stringMatching(/^\d+\n$/) : "U" }]);
 				const route = await fixture.prepareActorReplay(true);
-				if (!("executor" in route)) throw new Error(route.detail);
 				let output = "";
 				await route.executor.execute({ command: ": changed-parent; probe", cwd: workspace, environment: fixture.environment,
 					scope: { sessionID: "benchmark", turnID: "later" }, onData: data => { output += data.toString(); } });

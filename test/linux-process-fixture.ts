@@ -115,7 +115,7 @@ export async function createLinuxProcessBenchmark(
 		prepareActorReplay: (refresh?: boolean) => backend.prepareActorReplay(adaptProcessToolOperations(localOperations), {
 			sourceRoot: workspace, invocation: () => undefined, held: { realShell: shellPath,
 				executor: shellPath => adaptProcessToolOperations(createLocalBashOperations({ shellPath })) },
-		}, refresh),
+		}, refresh).then(route => "executor" in route ? route : Promise.reject(new Error(route.detail))),
 		dispose: async () => {
 			if (disposed) return;
 			disposed = true;

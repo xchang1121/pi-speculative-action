@@ -46,7 +46,6 @@ export class CapturedFilesystemObject {
 	private readonly handle: FileHandle;
 	private readonly capture: StableFilesystemCapture;
 	constructor(handle: FileHandle, capture: StableFilesystemCapture) { this.handle = handle; this.capture = capture; }
-	get bytes(): number { return this.capture.content?.byteLength ?? 0; }
 	borrow<T>(consume: (capture: StableFilesystemCapture, handle: FileHandle) => Promise<T>): Promise<T> {
 		return this.lifetime.admit(() => consume(this.capture, this.handle));
 	}
