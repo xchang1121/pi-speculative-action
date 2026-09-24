@@ -44,6 +44,14 @@ describe("actor fork plan source", () => {
 		expect(source.probeSignal("turn-2")?.aborted).toBe(true);
 	});
 
+	it("declares its whole batch so peers continue from every forked call", async () => {
+		const fork = createActorForkPlanSource(), signal = new AbortController().signal;
+		fork.startTurn("turn");
+		fork.publish("turn", [{ id: "batch", calls: [{ id: "0:fork", index: 0, tool: "read", input: { path: "a" } }, { id: "1:fork", index: 1, tool: "grep", input: {} }], evidence: [] }]);
+		const plans = await fork.source.propose({ startInput: { turnID: "turn" }, data: {}, candidateNames: ["read", "grep"], signal } as never) as unknown as readonly { actions: { id: string; feedback: unknown }[] }[];
+		expect(plans[0]!.actions.map(({ id, feedback }) => fork.source.continuationBatch!({ proposalID: "p", actionID: id, feedback }))).toEqual([["0:fork", "1:fork"], ["0:fork", "1:fork"]]);
+	});
+
 	it("bounds retries and only probes a newer Actor snapshot", () => {
 		const source = createActorForkPlanSource({ maxAttempts: 2, retryStreamUpdates: 2 });
 		const delta = { type: "text_delta" as const, contentIndex: 0, delta: "x", partial: undefined as never };

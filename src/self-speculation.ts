@@ -650,17 +650,11 @@ export class SelfSpeculationCoordinator {
 		const actionProbability = this.actionEvidence.probability(
 			[...candidate.sources].map((source) => actionEvidenceContext(state, candidate.tool, source)),
 		);
-		return {
-			decoderProbability,
-			actionProbability,
-			jointProbability: decoderProbability * actionProbability,
-		};
+		return { decoderProbability, actionProbability, jointProbability: decoderProbability * actionProbability };
 	}
 
 	private recordReceipt(receipt: unknown, state: TurnState, fork: boolean): ForkReceiptOutcome | undefined {
-		if (!isRecord(receipt)) {
-			return fork ? { committed: false, batches: [] } : undefined;
-		}
+		if (!isRecord(receipt)) return fork ? { committed: false, batches: [] } : undefined;
 		this.counters.candidateReceipts++;
 		this.counters.submittedDraftTokens += nonNegativeCount(receipt.draft_token_count);
 		this.counters.acceptedDraftTokens += nonNegativeCount(receipt.accepted_token_count);
