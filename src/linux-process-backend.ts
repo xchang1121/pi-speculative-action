@@ -2343,7 +2343,6 @@ function sandboxPolicyArguments(
 		"--fs-read",
 		"/",
 		...writablePaths.flatMap((target) => ["--fs-write", target]),
-		...mounts.filter((mount) => !mount.readOnly).flatMap((mount) => ["--fs-write", mount.virtualPath]),
 		...[...STABLE_SANDBOX_DEVICES].flatMap((target) => ["--fs-write", target]),
 		...deniedPaths.flatMap((target) => ["--fs-deny", target]),
 		"--time-start",
