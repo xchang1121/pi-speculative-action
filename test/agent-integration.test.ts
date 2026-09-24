@@ -1263,9 +1263,9 @@ describe("speculative action host", () => {
 		const controller = createPatternPlanSource({ sessionID: "session", cwd, store, actionSemantics: PI_ACTION_SEMANTICS, projectionRules: [] });
 		const text = 'src/a.ts(10,5): error TS2322\n    at run (test/b.test.ts:12:5)\n  File "e.py", line 3\nsee https://example.com/c.js, e.g. 1.2.3 x.y';
 		await controller.source.observe!({ ...request, consumeInput: { sessionID: "session", turnID: request.startInput.turnID, tool: "bash", args: { command: "npm test" }, tools: [tool] },
-			tool: "bash", concrete: { command: "npm test" }, output: { result: textResult(text), isError: true }, durationMs: 1, order: 0 });
+			tool: "bash", concrete: { command: "sed -n 1,5p lib/f.ts" }, output: { result: textResult(text), isError: true }, durationMs: 1, order: 0 });
 		controller.turnFinished(request.startInput, request.settings, false); await controller.dispose();
-		expect(store.recent("session")[0]?.outputPaths).toEqual(["e.py", "src/a.ts", "test/b.test.ts"]);
+		expect(store.recent("session")[0]?.outputPaths).toEqual(["e.py", "lib/f.ts", "src/a.ts", "test/b.test.ts"]);
 	});
 
 	it("records a closing turn's observation without predicting from it", async () => {

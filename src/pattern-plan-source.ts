@@ -436,8 +436,8 @@ function extractOutputPaths(
 	if ((tool !== "find" && tool !== "grep" && tool !== "bash") || !result) return undefined;
 	const searchRoot = typeof actionInput.path === "string" && actionInput.path ? actionInput.path : ".";
 	const text = result.content.flatMap((item) => item.type === "text" ? [item.text] : []).join("\n");
-	if (tool === "bash") {
-		const named = [...text.matchAll(RUN_OUTPUT_PATH)].flatMap((match) => match[2] || /[\\/]/u.test(match[1]!) ? [match[1]!] : []);
+	if (tool === "bash") { // The files a command names as it runs, and those its output reports.
+		const named = [...`${actionInput.command}\n${text}`.matchAll(RUN_OUTPUT_PATH)].flatMap((match) => match[2] || /[\\/]/u.test(match[1]!) ? [match[1]!] : []);
 		return named.length ? [...new Set(named)].slice(0, 32) : undefined;
 	}
 	const paths = text
