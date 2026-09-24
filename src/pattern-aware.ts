@@ -771,9 +771,7 @@ export class PatternAwareStore {
 		for (const item of values) {
 			massByTool.set(item.action.tool, (massByTool.get(item.action.tool) ?? 0) + item.mass);
 		}
-		const provenTools = new Set(
-			values.filter((item) => item.count >= settings.minOccurrences).map((item) => item.action.tool),
-		);
+		const provenTools = new Set(values.filter((item) => item.count >= settings.minOccurrences).map((item) => item.action.tool));
 		// The final beam ranks merged contextual and recurrent support using the same settled evidence.
 		const candidates = values.filter((item) => provenTools.has(item.action.tool) && !continuation.visitedPatternIDs.includes(item.patternID));
 		return candidates.map((item) => {
@@ -899,8 +897,7 @@ export class PatternAwareStore {
 		const action = this.resolveActionKey(event.tool, event.input, event.schemaHash);
 		if (!action) return;
 		const existing = session.recurrentActions.get(action.key);
-		const durationMs =
-			event.outcome === "success" && Number.isFinite(event.durationMs) ? Math.max(0, event.durationMs) : 0;
+		const durationMs = event.outcome === "success" && Number.isFinite(event.durationMs) ? Math.max(0, event.durationMs) : 0;
 		if (existing) {
 			const decay = recencyWeight(existing.lastSeenSequence, event.sequence, this.settings.decayHalfLifeEvents);
 			existing.count = Math.min(Number.MAX_SAFE_INTEGER, existing.count + 1);
@@ -1026,8 +1023,7 @@ export class PatternAwareStore {
 		const sample = { context, target, gap };
 		pool.samples.push(sample);
 		const sampleLimit = patternPoolSampleLimit(this.settings);
-		const removed =
-			pool.samples.length > sampleLimit ? pool.samples.splice(0, pool.samples.length - sampleLimit) : [];
+		const removed = pool.samples.length > sampleLimit ? pool.samples.splice(0, pool.samples.length - sampleLimit) : [];
 		this.pools.set(poolKey, pool);
 		this.addControlOpportunities(pool, removed, -1);
 		this.addControlOpportunities(pool, [sample], 1);
@@ -1047,8 +1043,7 @@ export class PatternAwareStore {
 		const constantSupport = bindingEvidenceThreshold(this.settings);
 		const candidates = new Map<string, Record<string, PatternAwareBinding>>();
 		const remember = (bindings: Record<string, PatternAwareBinding> | undefined) => {
-			if (!bindings || (!firstRecurrenceProbe &&
-				!hasSufficientBindingProvenance(bindings, pool.samples, constantSupport))) return;
+			if (!bindings || (!firstRecurrenceProbe && !hasSufficientBindingProvenance(bindings, pool.samples, constantSupport))) return;
 			candidates.set(stableStringify(bindingMapStructure(bindings)), bindings);
 		};
 		for (const patternID of pool.patternIDs ?? []) remember(this.patterns.get(patternID)?.bindings);
@@ -1185,8 +1180,7 @@ export class PatternAwareStore {
 		this.ensureIndex();
 		for (const { pattern, context } of this.trie.matching(history)) {
 			if (!structurallyEligible(pattern, this.settings)) continue;
-			if (pending.some((item) => item.patternID === pattern.id && item.triggerSequence === triggerSequence))
-				continue;
+			if (pending.some((item) => item.patternID === pattern.id && item.triggerSequence === triggerSequence)) continue;
 			pending.push({
 				patternID: pattern.id,
 				triggerSequence,
@@ -1724,8 +1718,7 @@ class PatternBindingAnalysis {
 	*leaves(value: unknown, segments: PatternAwarePath = []): Generator<readonly [PatternAwarePath, unknown], undefined> {
 		if (!isObject(value)) { yield [segments, value]; return; }
 		const array = Array.isArray(value);
-		const entries: Array<[string | number, unknown]> = array
-			? value.map((item, index) => [index, item]) : Object.entries(value);
+		const entries: Array<[string | number, unknown]> = array ? value.map((item, index) => [index, item]) : Object.entries(value);
 		if (!entries.length) yield [segments, this.memo(value, "empty-leaf", () => array ? [] : {})];
 		for (const entry of entries) if (entry) yield* this.leaves(entry[1], [...segments, entry[0]]);
 	}
@@ -1819,8 +1812,7 @@ function* collectionBindings(
 	targetIsPath: boolean,
 ): Generator<PatternAwareBinding, undefined> {
 	for (const item of items) {
-		if (targetIsPath && typeof target === "string" && !isPathSource(field, [...item.path, ...item.itemPath], target))
-			continue;
+		if (targetIsPath && typeof target === "string" && !isPathSource(field, [...item.path, ...item.itemPath], target)) continue;
 		yield { type: "each", relativeEvent, field, path: item.path, itemPath: item.itemPath };
 	}
 }
@@ -1947,11 +1939,7 @@ function isPathSource(field: "input" | "output" | "outputPaths", sourcePath: Pat
 	if (field === "outputPaths") return true;
 	if (!value.length || /[\r\n"'|&<>]/.test(value)) return false;
 	const key = String(sourcePath.at(-1) ?? "").toLowerCase();
-	if (
-		field === "output" &&
-		["content", "diff", "message", "output", "preview", "stderr", "stdout", "text"].includes(key)
-	)
-		return false;
+	if (field === "output" && ["content", "diff", "message", "output", "preview", "stderr", "stdout", "text"].includes(key)) return false;
 	return (
 		key.includes("path") ||
 		key.includes("file") ||
@@ -2070,11 +2058,7 @@ function groupGapTiming(patterns: ReadonlyArray<MutablePattern>, settings: Patte
 		covered += weight;
 		if (covered >= target) { horizon = gap; break; }
 	}
-	return {
-		horizon,
-		latestHorizon,
-		gapCoverage: total <= 0 ? 0 : Math.max(0, Math.min(1, covered / total)),
-	};
+	return { horizon, latestHorizon, gapCoverage: total <= 0 ? 0 : Math.max(0, Math.min(1, covered / total)) };
 }
 
 function ownBatch(inputs: ReadonlyArray<PatternAwareEventInput>, sessionID?: string) {
@@ -2128,11 +2112,7 @@ function signature(event: PatternAwareEvent): PatternAwareEventSignature {
 }
 
 function signatureToken(value: PatternAwareEventSignature) {
-	return JSON.stringify({
-		...(value.operation ? { operation: value.operation } : {}),
-		outcome: value.outcome,
-		tool: value.tool,
-	});
+	return JSON.stringify({ ...(value.operation ? { operation: value.operation } : {}), outcome: value.outcome, tool: value.tool });
 }
 
 function trieToken(value: PatternAwareEventSignature) {
@@ -2171,8 +2151,7 @@ function backoffProbability(
 	const byLength = new Map<number, MutablePattern>();
 	for (const pattern of patterns) {
 		const current = byLength.get(pattern.context.length);
-		if (!current || current.historicalOpportunities < pattern.historicalOpportunities)
-			byLength.set(pattern.context.length, pattern);
+		if (!current || current.historicalOpportunities < pattern.historicalOpportunities) byLength.set(pattern.context.length, pattern);
 	}
 	let estimate = 0.5;
 	const gaps = contexts ? [...new Set(patterns.flatMap((pattern) =>
@@ -2187,10 +2166,7 @@ function backoffProbability(
 		}
 		const weight = recencyWeight(pattern.lastSeenSequence, clock, halfLife);
 		const feedback = feedbackEvidence(pattern, clock, halfLife);
-		const opportunities = Math.max(
-			1,
-			pattern.historicalOpportunities * weight + feedback.matched + feedback.mismatched,
-		);
+		const opportunities = Math.max(1, pattern.historicalOpportunities * weight + feedback.matched + feedback.mismatched);
 		const matches = Math.min(opportunities, pattern.historicalMatches * weight + feedback.matched);
 		const local = matches / opportunities;
 		const escapeProbability = 1 / (opportunities + 1);

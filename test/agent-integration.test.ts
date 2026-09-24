@@ -1300,8 +1300,8 @@ describe("speculative action host", () => {
 			slowMs = 12;
 			expect(await proposed()).toMatchObject({ operation: slow, expectedDurationMs: 22 });
 			expect(internal.expectedDurationMs).toBe(18); // Issued plans keep their admission estimate.
-			const snapshot = store.snapshot(), prediction = { id: "internal", source: "pattern_aware", proposalID: internal.proposalID, actionID: internal.id };
 			await controller.source.onIssued!(internal);
+			const snapshot = store.snapshot(), prediction = { id: "internal", source: "pattern_aware", proposalID: internal.proposalID, actionID: internal.id };
 			const settle = (stage: "matching" | "execution") => controller.source.onSettled!({ ...internal,
 				settlement: { prediction, observation: "unobserved", cause: { stage, code: stage === "matching" ? "operation_not_observed" : "candidate_failed" } } });
 			await settle("matching");
@@ -1317,6 +1317,22 @@ describe("speculative action host", () => {
 			expect(store.snapshot()).toEqual(snapshot);
 			await controller.finishSession();
 			expect(await proposed()).toBeUndefined();
+		} finally { await controller.dispose(); }
+	});
+
+	it("issues a parent's operation choices once and credits its pattern only with an observed adoption", async () => {
+		const store = new PatternAwareStore(patternAwareSettings({ enabled: true })), issued = vi.spyOn(store, "issued"), settled = vi.spyOn(store, "settled");
+		const controller = createPatternPlanSource({ sessionID: "session", cwd: await temporaryWorkspace(), store, actionSemantics: PI_ACTION_SEMANTICS, projectionRules: [] });
+		const continuation = { history: [], visitedPatternIDs: [], pathProbability: 1 }, prediction = { id: "p", source: "pattern_aware", proposalID: "p", actionID: "slow" };
+		const [slow, fast] = ["slow", "fast"].map(key => ({ proposalID: "p", actionID: key, feedback: { store, continuation, patternIDs: ["parent"], operation: { key } } }));
+		try {
+			for (const choice of [slow!, fast!]) await controller.source.onIssued!(choice);
+			expect(issued.mock.calls).toEqual([[continuation], ["parent"]]);
+			await controller.source.onSettled!({ ...fast!, settlement: { prediction, observation: "unobserved", cause: { stage: "matching", code: "operation_not_observed" } } });
+			expect(settled).not.toHaveBeenCalled(); // Absence of an OS observation is no miss.
+			await controller.source.onSettled!({ ...slow!, settlement: { prediction, observation: "observed", actorAction: { id: "child", sequence: 0, turnID: "t" },
+				match: { matched: true, adoption: { status: "adopted", candidateID: "c" } } } as never });
+			expect(settled.mock.calls.map(([support]) => support)).toEqual([continuation, "parent"]);
 		} finally { await controller.dispose(); }
 	});
 
