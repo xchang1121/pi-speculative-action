@@ -425,17 +425,21 @@ function patternPlanAction(
 	};
 }
 
+/** Files a run's text names as compilers, test runners and stack traces print them: with a directory, or with a line after them. */
+const RUN_OUTPUT_PATH = /(?<![\w.@/\\:-])((?:[A-Za-z]:)?[\w.@-]{0,128}(?:[\\/][\w.@-]{1,128}){0,16}\.[A-Za-z]\w{0,9})(:\d|\(\d|",? line \d)?/gu;
+
 function extractOutputPaths(
 	tool: string,
 	actionInput: Readonly<Record<string, unknown>>,
 	result: AgentToolResult<unknown> | undefined,
 ): readonly string[] | undefined {
-	if ((tool !== "find" && tool !== "grep") || !result) return undefined;
+	if ((tool !== "find" && tool !== "grep" && tool !== "bash") || !result) return undefined;
 	const searchRoot = typeof actionInput.path === "string" && actionInput.path ? actionInput.path : ".";
-	const text = result.content
-		.filter((item): item is Extract<(typeof result.content)[number], { type: "text" }> => item.type === "text")
-		.map((item) => item.text)
-		.join("\n");
+	const text = result.content.flatMap((item) => item.type === "text" ? [item.text] : []).join("\n");
+	if (tool === "bash") {
+		const named = [...text.matchAll(RUN_OUTPUT_PATH)].flatMap((match) => match[2] || /[\\/]/u.test(match[1]!) ? [match[1]!] : []);
+		return named.length ? [...new Set(named)].slice(0, 32) : undefined;
+	}
 	const paths = text
 		.split(/\r?\n/)
 		.map((line) => {

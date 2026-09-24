@@ -1242,6 +1242,17 @@ describe("speculative action host", () => {
 		} finally { await controller.dispose(); await lease.release(); }
 	});
 
+	it("names the files a Bash run reports so PatternAware can bind the next call to them", async () => {
+		const cwd = await temporaryWorkspace(), tool = createBashTool(cwd), patternAware = patternAwareSettings({ enabled: true, multiStepEnabled: false });
+		const store = new PatternAwareStore(patternAware, undefined, patternAwareActionSemantics(PI_ACTION_SEMANTICS, cwd)), request = patternRequest(tool, patternAware);
+		const controller = createPatternPlanSource({ sessionID: "session", cwd, store, actionSemantics: PI_ACTION_SEMANTICS, projectionRules: [] });
+		const text = 'src/a.ts(10,5): error TS2322\n    at run (test/b.test.ts:12:5)\n  File "e.py", line 3\nsee https://example.com/c.js, e.g. 1.2.3 x.y';
+		await controller.source.observe!({ ...request, consumeInput: { sessionID: "session", turnID: request.startInput.turnID, tool: "bash", args: { command: "npm test" }, tools: [tool] },
+			tool: "bash", concrete: { command: "npm test" }, output: { result: textResult(text), isError: true }, durationMs: 1, order: 0 });
+		controller.turnFinished(request.startInput, request.settings, false); await controller.dispose();
+		expect(store.recent("session")[0]?.outputPaths).toEqual(["e.py", "src/a.ts", "test/b.test.ts"]);
+	});
+
 	it("records a closing turn's observation without predicting from it", async () => {
 		const cwd = await temporaryWorkspace(), tool = createReadTool(cwd), patternAware = patternAwareSettings({ enabled: true, multiStepEnabled: true });
 		const store = new PatternAwareStore(patternAware, undefined, patternAwareActionSemantics(PI_ACTION_SEMANTICS, cwd)), predict = vi.spyOn(store, "predictAfterBatch");
@@ -1652,10 +1663,7 @@ describe("speculative action host", () => {
 			if (actionSourceEnabled) await waitFor(() => prepare.mock.calls.length > 0);
 			expect(prepare.mock.calls.length > 0).toBe(actionSourceEnabled);
 		};
-		const finishTurn = async (turnID: string) => {
-			await host.finishTurn(turnID);
-			coordinator.endTurn();
-		};
+		const finishTurn = async (turnID: string) => { await host.finishTurn(turnID); coordinator.endTurn(); };
 
 		await triggerFork("fork-hit");
 		try {
@@ -1666,9 +1674,7 @@ describe("speculative action host", () => {
 		await waitFor(
 			() => materialized.filter((candidate) => candidate.turnID === "fork-hit" && candidate.source === "self-speculation").length === 2,
 		);
-		const forkBatch = materialized.filter(
-			(candidate) => candidate.turnID === "fork-hit" && candidate.source === "self-speculation",
-		);
+		const forkBatch = materialized.filter((candidate) => candidate.turnID === "fork-hit" && candidate.source === "self-speculation");
 		expect(new Set(forkBatch.map((candidate) => candidate.proposalID)).size).toBe(1);
 		expect(forkBatch.map((candidate) => candidate.actionID)).toEqual(["0:fork", "1:fork"]);
 		const hit = await host.execute({
@@ -1693,9 +1699,7 @@ describe("speculative action host", () => {
 		forkPath = "wrong.txt";
 		await triggerFork("fork-miss");
 		await waitFor(() =>
-			events.some(
-				(event) => event.type === "candidate" && event.turnID === "fork-miss" && event.state.status === "succeeded",
-			),
+			events.some((event) => event.type === "candidate" && event.turnID === "fork-miss" && event.state.status === "succeeded"),
 		);
 		const missed = vi.fn(async () => textResult("actor-miss.txt"));
 		expect((await host.execute({
@@ -1714,13 +1718,9 @@ describe("speculative action host", () => {
 		await waitFor(() => coordinator.snapshot().forkCompletions === 3);
 		expect(events.some((event) => event.type === "candidate" && event.turnID === "fork-low-confidence")).toBe(false);
 		coordinator.observeActorOutput({ type: "done", reason: "stop", message: assistant([], "stop") });
-		await waitFor(() =>
-			events.some((event) => event.type === "source_request" && event.turnID === "fork-low-confidence"),
-		);
+		await waitFor(() => events.some((event) => event.type === "source_request" && event.turnID === "fork-low-confidence"));
 		await finishTurn("fork-low-confidence");
-		const lowConfidenceRequests = events.filter(
-			(event) => event.type === "source_request" && event.turnID === "fork-low-confidence",
-		);
+		const lowConfidenceRequests = events.filter((event) => event.type === "source_request" && event.turnID === "fork-low-confidence");
 		expect(lowConfidenceRequests).toHaveLength(1);
 		expect(lowConfidenceRequests[0]).toMatchObject({ request: { settlement: { status: "empty" } } });
 
@@ -1750,10 +1750,7 @@ describe("speculative action host", () => {
 		const world = toolRuntimeWorld(), prepare = vi.fn(async (_input: { signal?: AbortSignal }) => {
 			if (warms && prepare.mock.calls.length === 1) { await gate.wait(); }
 		});
-		const getDraftOptions = vi.fn(async () => {
-			if (phase === "options") { await gate.wait(); }
-			return {};
-		});
+		const getDraftOptions = vi.fn(async () => { if (phase === "options") { await gate.wait(); } return {}; });
 		const draftModel = vi.fn(async () => {
 			if (phase === "model") { await gate.wait(); }
 			return phase === "context" ? { ...model("short"), contextWindow: 32, maxTokens: 16 } : model("draft");
