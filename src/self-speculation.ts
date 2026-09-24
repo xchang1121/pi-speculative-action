@@ -510,9 +510,7 @@ export class SelfSpeculationCoordinator {
 			}])));
 		}
 		if (!state?.requestID) return;
-		const pending = [state.flushTask, state.forkTask].filter(
-			(task): task is Promise<void> => task !== undefined,
-		);
+		const pending = [state.flushTask, state.forkTask].filter((task): task is Promise<void> => task !== undefined);
 		const cleanup = Promise.allSettled(pending)
 			.then(() =>
 				this.post(
@@ -532,12 +530,8 @@ export class SelfSpeculationCoordinator {
 		const snapshot = {
 			...this.counters,
 			...(this.active?.requestID ? { actorRequestID: this.active.requestID } : {}),
-			...(this.lastResolvedActorProfile
-				? { resolvedActorProfile: this.lastResolvedActorProfile }
-				: {}),
-			...(this.lastProfileResolutionSource
-				? { profileResolutionSource: this.lastProfileResolutionSource }
-				: {}),
+			...(this.lastResolvedActorProfile ? { resolvedActorProfile: this.lastResolvedActorProfile } : {}),
+			...(this.lastProfileResolutionSource ? { profileResolutionSource: this.lastProfileResolutionSource } : {}),
 			bufferedCandidates:
 				(this.active?.candidates.size ?? 0) +
 				[...this.pendingCandidates.values()].reduce((total, candidates) => total + candidates.size, 0),
@@ -545,13 +539,9 @@ export class SelfSpeculationCoordinator {
 				? { verifiedDraftAcceptanceRate: this.counters.verifiedAcceptedDraftTokens / this.counters.verifiedDraftTokens }
 				: {}),
 			...(this.lastVerification ? { lastVerification: this.lastVerification } : {}),
-			...(this.counters.forkLogprobTokens > 0
-				? { forkMeanLogprob: this.totalForkLogprob / this.counters.forkLogprobTokens }
-				: {}),
+			...(this.counters.forkLogprobTokens > 0 ? { forkMeanLogprob: this.totalForkLogprob / this.counters.forkLogprobTokens } : {}),
 			forkGateSamples: gate?.samples ?? 0,
-			...(gate?.expectedNetBenefitMs === undefined
-				? {}
-				: { forkGateExpectedNetBenefitMs: gate.expectedNetBenefitMs }),
+			...(gate?.expectedNetBenefitMs === undefined ? {} : { forkGateExpectedNetBenefitMs: gate.expectedNetBenefitMs }),
 			decoderEvidenceContexts: decoderEvidence.contexts,
 			decoderVerificationSteps: decoderEvidence.observations,
 			actionEvidenceContexts: actionEvidence.contexts,
@@ -590,9 +580,7 @@ export class SelfSpeculationCoordinator {
 				for (const tool of state.reportedCandidates.get(candidateID)?.tools ?? []) tools.add(tool);
 			}
 			if (!tools.size) continue;
-			const sources = step.sources.length
-				? step.sources
-				: [...new Set(records.flatMap((candidate) => [...candidate.sources]))];
+			const sources = step.sources.length ? step.sources : [...new Set(records.flatMap((candidate) => [...candidate.sources]))];
 			for (const tool of tools) {
 				for (const source of sources) {
 					this.decoderEvidence.observe(decoderEvidenceContext(state, tool, source), step.draftedTokens, step.acceptedTokens);
@@ -970,9 +958,7 @@ function parseVerificationOutcome(
 		if (acceptedTokens > draftedTokens || acceptedTokens + rejectedTokens !== draftedTokens)
 			throw new Error("self-speculation verification step token counts are inconsistent");
 		const candidateIndex = optionalVerificationInteger(step.candidate_index, "candidate_index") ?? index;
-		const candidateID = step.candidate_id === undefined || step.candidate_id === null
-			? undefined
-			: nonEmptyString(step.candidate_id);
+		const candidateID = step.candidate_id === undefined || step.candidate_id === null ? undefined : nonEmptyString(step.candidate_id);
 		if (step.candidate_id !== undefined && step.candidate_id !== null && !candidateID)
 			throw new Error("self-speculation verification candidate_id must be a non-empty string");
 		const candidateIDs = [...new Set([
@@ -1019,14 +1005,8 @@ function parseVerificationOutcome(
 			rejectedTokens !== stepRejectedTokens)
 	)
 		throw new Error("self-speculation verification totals do not match its steps");
-	const unresolvedProposals = optionalVerificationInteger(
-		verification.unresolved_proposals,
-		"unresolved_proposals",
-	) ?? 0;
-	const unresolvedDraftTokens = optionalVerificationInteger(
-		verification.unresolved_draft_tokens,
-		"unresolved_draft_tokens",
-	) ?? 0;
+	const unresolvedProposals = optionalVerificationInteger(verification.unresolved_proposals, "unresolved_proposals") ?? 0;
+	const unresolvedDraftTokens = optionalVerificationInteger(verification.unresolved_draft_tokens, "unresolved_draft_tokens") ?? 0;
 	const meanAcceptanceLength = optionalVerificationNumber(
 		verification.mean_acceptance_length,
 		"mean_acceptance_length",
@@ -1104,10 +1084,7 @@ function parsedSidecarActionCall(value: unknown, fallbackIndex: number) {
 	const input = record(call?.arguments);
 	if (!tool || !input) return undefined;
 	const observedIndex = finiteNumber(call?.index);
-	const index =
-		observedIndex !== undefined && Number.isSafeInteger(observedIndex) && observedIndex >= 0
-			? observedIndex
-			: fallbackIndex;
+	const index = observedIndex !== undefined && Number.isSafeInteger(observedIndex) && observedIndex >= 0 ? observedIndex : fallbackIndex;
 	const callID = nonEmptyString(call?.call_id);
 	const format = nonEmptyString(call?.format);
 	return {
