@@ -43,8 +43,6 @@ export interface BenefitDecision {
 	readonly expectedNetBenefitMs?: number;
 }
 
-export interface BenefitGateSnapshot extends ReturnType<BenefitGate["snapshot"]> {}
-
 interface GateState {
 	readonly samples: Array<{ netBenefit: number | undefined; failed: boolean }>;
 	priorFailures: number;

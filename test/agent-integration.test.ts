@@ -1042,9 +1042,7 @@ describe("speculative action host", () => {
 				if (mode === "binding-error") throw problem;
 				return invocation;
 			});
-			const tool: AgentTool<typeof bashSchema> = {
-				name: "bash", label: "bash", description: "bash", parameters: bashSchema, execute: actor,
-			};
+			const tool: AgentTool<typeof bashSchema> = { name: "bash", label: "bash", description: "bash", parameters: bashSchema, execute: actor };
 			const host = createSpeculativeActionHost("session", {
 				cwd, getSettings: () => ({ ...settings(), drafterEnabled: false, tools: ["bash"] }),
 				complete: async () => { throw new Error("prediction disabled"); },
@@ -1560,16 +1558,8 @@ describe("speculative action host", () => {
 				),
 			),
 		});
-		const tool: AgentTool<typeof readSchema> = {
-			name: "read",
-			label: "read",
-			description: "read",
-			parameters: readSchema,
-			execute: async (_id, input) => {
-				await new Promise((resolve) => setTimeout(resolve, 80));
-				return textResult(input.path);
-			},
-		};
+		const tool: AgentTool<typeof readSchema> = { name: "read", label: "read", description: "read", parameters: readSchema,
+			execute: async (_id, input) => { await new Promise((resolve) => setTimeout(resolve, 80)); return textResult(input.path); } };
 		const host = createSpeculativeActionHost("session", {
 			cwd,
 			getSettings: () => ({
@@ -1856,20 +1846,8 @@ async function patternRebaseFixture() {
 			durationMs: 10,
 		});
 	}
-	const grepTool: AgentTool<typeof grepSchema> = {
-		name: "grep",
-		label: "grep",
-		description: "grep",
-		parameters: grepSchema,
-		execute: async () => textResult("notes.txt:1:one"),
-	};
-	const readTool: AgentTool<typeof readSchema> = {
-		name: "read",
-		label: "read",
-		description: "read",
-		parameters: readSchema,
-		execute: async () => textResult("one"),
-	};
+	const grepTool: AgentTool<typeof grepSchema> = { name: "grep", label: "grep", description: "grep", parameters: grepSchema, execute: async () => textResult("notes.txt:1:one") };
+	const readTool: AgentTool<typeof readSchema> = { name: "read", label: "read", description: "read", parameters: readSchema, execute: async () => textResult("one") };
 	const materialized: MaterializedSpeculativeCandidate<string>[] = [];
 	return { cwd, patternSettings, patternStore, grepTool, readTool, materialized };
 }

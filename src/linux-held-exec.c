@@ -2591,6 +2591,37 @@ static void release_process(struct traced_process **processes, pid_t pid, struct
 	}
 }
 
+/* Stop and detach every remaining tracee: native Bash returns with its shell and PTRACE_O_EXITKILL would kill them. */
+static int release_tracees(struct traced_process **processes, struct descriptor_domain *domain, int descriptors) {
+	for (struct traced_process *item = *processes; item; item = item->next) {
+		if (item->historical || (descriptors && item->stopped && !item->listening)) continue; /* Already in a ptrace-stop. */
+		item->stopped = 0;
+		if (ptrace(PTRACE_INTERRUPT, item->pid, 0, 0) < 0 && errno != ESRCH) return -1;
+	}
+	for (int status;;) {
+		struct traced_process *item = *processes;
+		while (item && (item->historical || item->stopped)) item = item->next;
+		if (!item) break;
+		pid_t pid = waitpid(-1, &status, __WALL);
+		if (pid < 0) { if (errno == EINTR) continue; if (errno != ECHILD) return -1; break; }
+		for (item = *processes; item && (item->pid != pid || item->historical);) item = item->next;
+		if (WIFEXITED(status) || WIFSIGNALED(status)) { if (item) release_process(processes, pid, domain); continue; }
+		if (!item) { if (track_process(processes, pid) < 0) return -1; item = *processes; }
+		unsigned event = (unsigned)status >> 16; unsigned long child;
+		/* A fork racing the interrupt attaches a child that must be detached too. */
+		if ((event == PTRACE_EVENT_FORK || event == PTRACE_EVENT_VFORK || event == PTRACE_EVENT_CLONE) && ptrace(PTRACE_GETEVENTMSG, pid, 0, &child) == 0) {
+			struct traced_process *known = *processes;
+			while (known && known->pid != (pid_t)child) known = known->next;
+			if (!known && track_process(processes, (pid_t)child) < 0) return -1;
+		}
+		item->stopped = 1;
+		if (!event && WSTOPSIG(status) != SIGTRAP) item->delivered = WSTOPSIG(status);
+	}
+	for (struct traced_process *item = *processes; item; item = item->next)
+		if (!item->historical && ptrace(PTRACE_DETACH, item->pid, 0, item->delivered) < 0 && errno != ESRCH) return -1;
+	return 0;
+}
+
 static int trace(char **command, const char *socket_path, const char *token, const char *execution_id,
 	int skip, unsigned skip_code, int descriptors) {
 	struct descriptor_domain domain = {.enabled = descriptors == 1};
@@ -2686,6 +2717,11 @@ static int trace(char **command, const char *socket_path, const char *token, con
 					item->stopped = 0; item->delivered = 0; item->listening = 0;
 				}
 			}
+		}
+		if (root_status >= 0 && !barrier) {
+			int busy = 0;
+			for (struct traced_process *item = processes; item; item = item->next) busy |= item->job != NULL;
+			if (!busy) { if (release_tracees(&processes, &domain, descriptors) < 0) goto fatal; break; }
 		}
 		pid_t pid = waitpid(-1, &status, __WALL | WNOHANG | __WNOTHREAD);
 		if (pid < 0) {
