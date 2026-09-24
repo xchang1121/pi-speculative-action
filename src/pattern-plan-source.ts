@@ -239,7 +239,7 @@ export function createPatternPlanSource({
 				upsert: planActions(next, context.store, data.schemaHashes, patternSettings.beamWidth, [{ actionID, condition: "execution_succeeded" }], actionID),
 			};
 		}),
-		observe: ({ data, settings, consumeInput, action, tool, concrete, output, durationMs, order, operations }) => admit(settings, async (patternSettings) => {
+		observe: ({ data, settings, consumeInput, action, tool, concrete, output, durationMs, order, operations, signal }) => admit(settings, async (patternSettings) => {
 			if (!patternSettings.enabled) return undefined;
 			const schemaHash = action?.schemaHash ?? data.schemaHashes[tool];
 			const parentHash = operations?.length && patternActionSemantics.actionKey(tool, concrete, schemaHash)?.hash;
@@ -259,8 +259,10 @@ export function createPatternPlanSource({
 			};
 			batch.set(order, event);
 			authoritativeBatches.set(key, batch);
-			if (!patternSettings.multiStepEnabled) return undefined;
+			// A closing turn drops these updates and the next turn predicts afresh: never hold turn closure for them.
+			if (!patternSettings.multiStepEnabled || signal?.aborted) return undefined;
 			await analysisTail;
+			if (signal?.aborted) return undefined;
 			const store = await resolveStore(patternSettings);
 			const ordered = [...batch.entries()].sort(([left], [right]) => left - right).map(([, item]) => item);
 			const candidates = store.predictAfterBatch(

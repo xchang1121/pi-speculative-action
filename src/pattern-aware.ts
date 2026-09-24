@@ -483,16 +483,7 @@ export class PatternAwareStore {
 	) {
 		if (!predictionSettings.enabled) return [];
 		const history = this.sessions.get(sessionID)?.history ?? [];
-		return this.predictHistory(
-			history,
-			schemaHashes,
-			{
-				history,
-				visitedPatternIDs: [],
-				pathProbability: 1,
-			},
-			predictionSettings,
-		);
+		return this.predictHistory(history, schemaHashes, { history, visitedPatternIDs: [], pathProbability: 1 }, predictionSettings);
 	}
 
 	predictAfterBatch(
@@ -685,13 +676,7 @@ export class PatternAwareStore {
 			}] as const;
 		}));
 		// Session frequency supports another Actor opportunity, not a transition from hypothetical output.
-		for (const recurrent of authoritative ? this.recurrentPredictions(
-			activeSessionID,
-			schemaHashes,
-			estimatePpm,
-			continuation,
-			settings,
-		) : []) {
+		for (const recurrent of authoritative ? this.recurrentPredictions(activeSessionID, schemaHashes, estimatePpm, continuation, settings) : []) {
 			const existing = predictions.get(recurrent.actionIdentity);
 			if (!existing) {
 				predictions.set(recurrent.actionIdentity, recurrent);
@@ -1009,12 +994,7 @@ export class PatternAwareStore {
 		if (targetTool !== sample.target.tool) return false;
 		let actor = this.observedActionKeys.get(sample.target);
 		if (actor === undefined && !this.observedActionKeys.has(sample.target)) {
-			actor =
-				this.resolveActionKey(
-					sample.target.tool,
-					sample.target.input,
-					sample.target.schemaHash ?? targetSchemaHash,
-				) ?? null;
+			actor = this.resolveActionKey(sample.target.tool, sample.target.input, sample.target.schemaHash ?? targetSchemaHash) ?? null;
 			this.observedActionKeys.set(sample.target, actor);
 		}
 		return this.bindingAnalysis.applyWeightedBindings(bindings, sample.context).some(({ input }) => {
@@ -1088,13 +1068,7 @@ export class PatternAwareStore {
 		};
 		for (const patternID of pool.patternIDs ?? []) remember(this.patterns.get(patternID)?.bindings);
 		remember(this.bindingAnalysis.inferBindings(context, target.input));
-		remember(
-			this.bindingAnalysis.inferBindingsFromSamples(
-				pool.samples,
-				constantSupport,
-				this.actionSemantics !== undefined,
-			),
-		);
+		remember(this.bindingAnalysis.inferBindingsFromSamples(pool.samples, constantSupport, this.actionSemantics !== undefined));
 
 		const retained = new Set<string>();
 		for (const candidate of candidates.values()) {
@@ -1200,14 +1174,7 @@ export class PatternAwareStore {
 			if (!pattern) continue;
 			const matched = events.some((event) =>
 				item.expectedInputs.some((expectedInput) =>
-					this.actionInputCovers(
-						pattern.targetTool,
-						expectedInput,
-						pattern.targetSchemaHash,
-						event.tool,
-						event.input,
-						event.schemaHash,
-					),
+					this.actionInputCovers(pattern.targetTool, expectedInput, pattern.targetSchemaHash, event.tool, event.input, event.schemaHash),
 				),
 			);
 			if (matched) {

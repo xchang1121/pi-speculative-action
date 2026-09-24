@@ -203,6 +203,8 @@ export interface SpeculativePlanSource<
 		readonly operations?: readonly ExecutionOperationBinding[];
 		readonly durationMs: number;
 		readonly order: number;
+		/** Aborted once the turn closes: learning still applies, but its updates would be dropped. */
+		readonly signal?: AbortSignal;
 	}) => MaybePromise<PlanUpdate | readonly PlanUpdate[] | undefined>;
 	/** Runs for every pending action accepted from an update, including retained identities. Binding can still reject it. */
 	readonly onAdmitted?: (input: PlanActionFeedback) => MaybePromise<void>;

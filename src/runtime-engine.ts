@@ -2126,6 +2126,7 @@ export function makeSpeculativeActionRuntime<
 								? settlement.provider.durationMs
 								: executionDuration(settledCandidate),
 						order: settlement.actorAction.sequence,
+						signal: state.generation.signal,
 					});
 					const target = state.decisionSequence + 1;
 					if (state.lifecycle !== "active" || !state.generation.active ||
