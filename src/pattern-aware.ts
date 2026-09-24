@@ -668,14 +668,8 @@ export class PatternAwareStore {
 				predictions.set(recurrent.actionIdentity, recurrent);
 				continue;
 			}
-			const preferred =
-				recurrent.background !== existing.background
-					? recurrent.background
-						? existing
-						: recurrent
-					: recurrent.expectedLatencyBenefitMs > existing.expectedLatencyBenefitMs
-						? recurrent
-						: existing;
+			const preferred = recurrent.background !== existing.background ? (recurrent.background ? existing : recurrent)
+				: recurrent.expectedLatencyBenefitMs > existing.expectedLatencyBenefitMs ? recurrent : existing;
 			predictions.set(recurrent.actionIdentity, {
 				...preferred,
 				recurrentFeedback: recurrent.recurrentFeedback,
@@ -988,9 +982,7 @@ export class PatternAwareStore {
 
 	private minimizeProjectedBindings(bindings: Readonly<Record<string, PatternAwareBinding>>, pool: PatternPool) {
 		const supportingSamples = (candidate: Readonly<Record<string, PatternAwareBinding>>) =>
-			pool.samples.filter((sample) =>
-				this.bindingsCoverSample(candidate, pool.targetTool, pool.targetSchemaHash, sample),
-			);
+			pool.samples.filter((sample) => this.bindingsCoverSample(candidate, pool.targetTool, pool.targetSchemaHash, sample));
 		if (!this.actionSemantics) return { bindings, support: supportingSamples(bindings) };
 		const minimized = { ...bindings };
 		let support = supportingSamples(minimized);
@@ -1211,15 +1203,19 @@ export class PatternAwareStore {
 	}
 
 	private trimPools() {
-		const limit = Math.max(1, Math.floor(this.settings.maxPatterns * 2));
-		if (this.pools.size <= limit) return;
-		const evicted = [...this.pools.values()]
-			.sort((left, right) => left.samples.length - right.samples.length)
-			.slice(0, this.pools.size - limit);
-		for (const pool of evicted) {
+		if (this.pools.size <= Math.max(1, this.settings.maxPatterns)) return;
+		for (const pool of this.rankedPools().slice(Math.max(1, this.settings.maxPatterns))) {
 			this.pools.delete(pool.key);
 			this.addControlOpportunities(pool, pool.samples, -1);
+			this.retirePoolPatterns(pool, new Set()); // No pattern outlives the samples that support it.
 		}
+	}
+
+	/** Memory keeps exactly the pools the file does: recency-weighted support, so a new relation can displace stale ones. */
+	private rankedPools(): PatternPool[] {
+		const last = (pool: PatternPool) => pool.samples.at(-1)?.target.sequence ?? Number.NEGATIVE_INFINITY;
+		return [...this.pools.values()].map((pool) => [pool, pool.samples.length * recencyWeight(last(pool), this.clock, this.settings.decayHalfLifeEvents)] as const)
+			.sort(([left, leftScore], [right, rightScore]) => rightScore - leftScore || last(right) - last(left)).map(([pool]) => pool);
 	}
 
 	private trimPatterns() {
@@ -1263,12 +1259,7 @@ export class PatternAwareStore {
 			eventIDs.set(key, id);
 			return id;
 		};
-		const pools = [...this.pools.values()]
-			.sort(
-				(left, right) =>
-					(right.samples.at(-1)?.target.sequence ?? 0) - (left.samples.at(-1)?.target.sequence ?? 0) ||
-					right.samples.length - left.samples.length,
-			)
+		const pools = this.rankedPools()
 			.slice(0, this.settings.maxPatterns)
 			.map(
 				(pool): PersistedPatternPool => ({
@@ -2003,18 +1994,9 @@ function withPath(
 ): Record<string, unknown> {
 	const update = (current: unknown, index: number): Record<string, unknown> | unknown[] => {
 		const segment = segments[index]!;
-		const container: Record<string, unknown> | unknown[] =
-			typeof segment === "number"
-				? Array.isArray(current)
-					? [...current]
-					: []
-				: asRecord(current)
-					? { ...(current as Record<string, unknown>) }
-					: {};
-		const child =
-			index === segments.length - 1
-				? value
-				: update((current as Record<string | number, unknown> | undefined)?.[segment], index + 1);
+		const container: Record<string, unknown> | unknown[] = typeof segment === "number" ? (Array.isArray(current) ? [...current] : [])
+			: asRecord(current) ? { ...(current as Record<string, unknown>) } : {};
+		const child = index === segments.length - 1 ? value : update((current as Record<string | number, unknown> | undefined)?.[segment], index + 1);
 		if (typeof segment === "number") (container as unknown[])[segment] = child;
 		else (container as Record<string, unknown>)[segment] = child;
 		return container;
