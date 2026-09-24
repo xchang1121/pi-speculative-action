@@ -1327,7 +1327,10 @@ export function makeSpeculativeActionRuntime<
 		const inputs = candidate.owner.draft.type === "tool_call" && candidate.route.reuse === "shared_result" && !candidateWorld(candidate)
 			? borrowCandidateInputs(session, candidate, `inputs:prediction:${candidate.id}`) : undefined;
 		try {
-			const parent = candidateWorld(candidate);
+			const parent = candidateWorld(candidate), owner = candidate.owner.startInput;
+			// A root fork outliving its turn runs in the live turn's scope: its own turn's snapshots and handoffs are closed.
+			const live = parent || session.turns.get(owner.turnID)?.lifecycle === "active" ? undefined
+				: [...session.turns.values()].find((turn) => turn.lifecycle === "active")?.startInput;
 			candidate.acceptOperationScope = scope => {
 				const turn = session.turns.get(scope.turnID);
 				if (session.lifecycle.sealed || masterDisabled() || scope.sessionID !== session.id ||
@@ -1349,7 +1352,7 @@ export function makeSpeculativeActionRuntime<
 				}
 			};
 			branch = await adapter.executeCandidate({
-				startInput: candidate.owner.startInput,
+				startInput: live ?? owner,
 				data: candidate.owner.data,
 				candidate: candidate.owner.draft,
 				tool: candidate.key.tool,
@@ -1896,11 +1899,7 @@ export function makeSpeculativeActionRuntime<
 				return Object.freeze(prepared);
 			}
 
-			matchingPredictions = predictionMatches(
-				state.session,
-				actualKey,
-				state.decisionSequence,
-			).flatMap(({ node, relation }) => {
+			matchingPredictions = predictionMatches(state.session, actualKey, state.decisionSequence).flatMap(({ node, relation }) => {
 				const opportunity = state.session.plan.claimMatch(node.proposalID, node.action.id, identity, relation);
 				if (!opportunity) return [];
 				return [{ node, opportunity }];
@@ -2102,9 +2101,7 @@ export function makeSpeculativeActionRuntime<
 						...observation,
 						operations: operations ?? (settledCandidate && candidateBranch(settledCandidate)?.operations),
 						durationMs:
-							settlement.provider.kind === "actor"
-								? settlement.provider.durationMs
-								: executionDuration(settledCandidate),
+							settlement.provider.kind === "actor" ? settlement.provider.durationMs : executionDuration(settledCandidate),
 						order: settlement.actorAction.sequence,
 						signal: state.generation.signal,
 						reserveRevision: (proposalID, minimum) => state.session.plan.reserveRevision(proposalID, minimum) ?? minimum,
@@ -2705,9 +2702,7 @@ export function makeSpeculativeActionRuntime<
 		session.turns.clear();
 
 		for (const candidate of candidateStore.values(session.id)) {
-			if (!terminal || candidate.work.reservation.kind === "exclusive") {
-				discardCandidate(session, candidate, planFailure);
-			}
+			if (!terminal || candidate.work.reservation.kind === "exclusive") discardCandidate(session, candidate, planFailure);
 		}
 		if (terminal) {
 			queueTaskEvent(session, turnID, performance.now());
@@ -2779,9 +2774,7 @@ export function makeSpeculativeActionRuntime<
 			deferredPlanActions: planNodes.filter((node) => node.execution.status === "deferred" || node.execution.status === "preparing").length,
 			activePlanActions: planNodes.filter(
 				(node) =>
-					node.execution.status === "scheduled" ||
-					node.execution.status === "queued" ||
-					node.execution.status === "running",
+					node.execution.status === "scheduled" || node.execution.status === "queued" || node.execution.status === "running",
 			).length,
 			executionBlockedPlanActions: planNodes.filter((node) => node.execution.status === "execution_blocked").length,
 			blockedPlanActions: planNodes.filter((node) => node.readiness === "blocked").length,
