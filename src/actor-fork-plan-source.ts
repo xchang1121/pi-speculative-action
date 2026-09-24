@@ -39,9 +39,11 @@ export interface ActorProbeSchedule {
 	readonly maxAttempts: number;
 	/** Non-empty Actor stream updates required between sidecar retries. */
 	readonly retryStreamUpdates: number;
+	/** Fewer updates suffice at a sentence end; a finished thought needs one. */
+	readonly boundaryStreamUpdates: number;
 }
 
-export const ACTOR_PROBE_SCHEDULE: ActorProbeSchedule = Object.freeze({ maxAttempts: 5, retryStreamUpdates: 50 });
+export const ACTOR_PROBE_SCHEDULE: ActorProbeSchedule = Object.freeze({ maxAttempts: 5, retryStreamUpdates: 50, boundaryStreamUpdates: 10 });
 
 interface PendingFork {
 	readonly promise: Promise<readonly ActorForkActionBatch[]>;
@@ -56,6 +58,7 @@ interface PendingFork {
 	requestBound: boolean;
 	attempts: number;
 	lastProbeOutputChunks: number;
+	retryAt: number;
 	probeInFlight: boolean;
 	settled: boolean;
 }
@@ -122,6 +125,7 @@ export class ActorForkPlanSource {
 			requestBound: false,
 			attempts: 0,
 			lastProbeOutputChunks: 0,
+			retryAt: 1,
 			probeInFlight: false,
 			settled: false,
 		});
@@ -135,11 +139,17 @@ export class ActorForkPlanSource {
 	observeActorDelta(turnID: string, event: AssistantMessageEvent): ActorProbeSnapshot | undefined {
 		const pending = this.pending.get(turnID);
 		if (!pending || pending.settled || !pending.requestBound) return undefined;
-		if ((event.type !== "text_delta" && event.type !== "thinking_delta") || !event.delta) return undefined;
-		if (event.type === "text_delta") pending.content += event.delta;
-		else pending.reasoning += event.delta;
-		pending.generatedText += event.delta;
-		pending.outputChunks++;
+		// A finished thought or sentence is where the next call is most decided: retry there, ahead of the fixed cadence.
+		const retrySooner = (updates: number) => { pending.retryAt = Math.min(pending.retryAt, pending.lastProbeOutputChunks + updates); };
+		if (event.type === "thinking_end") retrySooner(1);
+		else if ((event.type !== "text_delta" && event.type !== "thinking_delta") || !event.delta) return undefined;
+		else {
+			if (event.type === "text_delta") pending.content += event.delta;
+			else pending.reasoning += event.delta;
+			pending.generatedText += event.delta;
+			pending.outputChunks++;
+			if (/[.!?\n\u3002\uff01\uff1f]\s*$/u.test(event.delta)) retrySooner(this.schedule.boundaryStreamUpdates);
+		}
 		return this.claimProbe(pending);
 	}
 
@@ -161,12 +171,12 @@ export class ActorForkPlanSource {
 			pending.probeInFlight ||
 			!pending.requestBound ||
 			pending.attempts >= this.schedule.maxAttempts ||
-			pending.outputChunks <
-				pending.lastProbeOutputChunks + (pending.attempts === 0 ? 1 : this.schedule.retryStreamUpdates)
+			pending.outputChunks < pending.retryAt
 		)
 			return undefined;
 		pending.probeInFlight = true;
 		pending.lastProbeOutputChunks = pending.outputChunks;
+		pending.retryAt = pending.outputChunks + this.schedule.retryStreamUpdates;
 		pending.attempts++;
 		return {
 			attempt: pending.attempts,

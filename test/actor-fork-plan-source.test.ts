@@ -52,6 +52,19 @@ describe("actor fork plan source", () => {
 		expect(plans[0]!.actions.map(({ id, feedback }) => fork.source.continuationBatch!({ proposalID: "p", actionID: id, feedback }))).toEqual([["0:fork", "1:fork"], ["0:fork", "1:fork"]]);
 	});
 
+	it("retries at a finished thought or sentence ahead of the fixed cadence", () => {
+		const source = createActorForkPlanSource({ retryStreamUpdates: 50, boundaryStreamUpdates: 3 });
+		const delta = (type: "text_delta" | "thinking_delta", text: string) => ({ type, contentIndex: 0, delta: text, partial: undefined as never });
+		source.startTurn("turn"); source.bindActorRequest("turn");
+		expect(source.observeActorDelta("turn", delta("thinking_delta", "Plan"))?.attempt).toBe(1);
+		source.finishProbe("turn");
+		expect(source.observeActorDelta("turn", delta("thinking_delta", " first."))).toBeUndefined(); // Too soon even for a sentence end.
+		expect(source.observeActorDelta("turn", { type: "thinking_end", contentIndex: 0, content: "", partial: undefined as never })?.attempt).toBe(2);
+		source.finishProbe("turn");
+		for (const text of [" I", " will", " read"]) expect(source.observeActorDelta("turn", delta("text_delta", text))).toBeUndefined();
+		expect(source.observeActorDelta("turn", delta("text_delta", " it.\n"))?.attempt).toBe(3);
+	});
+
 	it("bounds retries and only probes a newer Actor snapshot", () => {
 		const source = createActorForkPlanSource({ maxAttempts: 2, retryStreamUpdates: 2 });
 		const delta = { type: "text_delta" as const, contentIndex: 0, delta: "x", partial: undefined as never };
