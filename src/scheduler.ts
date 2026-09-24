@@ -110,10 +110,7 @@ export async function waitForCandidate<T>(
 		const aborted = () => finish(() => resolve({ status: "aborted" }));
 		signal?.addEventListener("abort", aborted, { once: true });
 		if (bounded) timer = setTimeout(() => finish(() => resolve({ status: "deadline" })), Math.max(0, waitBudgetMs));
-		void promise.then(
-			(value) => finish(() => resolve({ status: "completed", value })),
-			(error) => finish(() => reject(error)),
-		);
+		void promise.then((value) => finish(() => resolve({ status: "completed", value })), (error) => finish(() => reject(error)));
 	});
 }
 
@@ -205,9 +202,7 @@ export class SpeculationScheduler<Job extends object> {
 		const remaining = [...this.entries.values()];
 		const victims: Job[] = [];
 		while (!fitsResourceBudget(remaining, resourceUnits, capacity)) {
-			const victim = remaining
-				.filter((entry) => canPreempt(entry.job))
-				.sort(compareVictim)[0];
+			const victim = remaining .filter((entry) => canPreempt(entry.job)) .sort(compareVictim)[0];
 			if (!victim) break;
 			remaining.splice(remaining.indexOf(victim), 1);
 			victims.push(victim.job);
@@ -241,10 +236,7 @@ export class SpeculationScheduler<Job extends object> {
 			background: remaining > 0,
 		});
 		// Missing slots leave the numerical forecast indeterminate.
-		if (remaining) {
-			work.expectedDurationMs = work.resourceUnits = work.decisionBatchesUntilCall =
-				work.criticalPathMs = work.priorityMs = NaN;
-		}
+		if (remaining) work.expectedDurationMs = work.resourceUnits = work.decisionBatchesUntilCall = work.criticalPathMs = work.priorityMs = NaN;
 		return work;
 	}
 
@@ -310,17 +302,17 @@ export class SpeculationScheduler<Job extends object> {
 		const actor = this.timingEstimate(this.actorServiceTimes, request.actorIdentity ?? request.identity, 0.25);
 		const adoption = this.timingEstimate(this.adoptionTimes, request.adoptionIdentity ?? request.identity, 0.75, "upper");
 		const native = this.timingEstimate(this.nativeServiceTimes, request.actorIdentity ?? request.identity, 0.5);
-		const expectedActorMs = actor?.value;
-		const expectedSpeculativeMs =
-			speculative?.value ?? positive(request.expectedSpeculativeDurationMs, expectedActorMs ?? 1);
-		const elapsedMs = request.state === "running" ? finite(request.elapsedMs) : 0;
+		const elapsedMs = request.state === "running" ? finite(request.elapsedMs) : 0, forecastMs = finite(request.expectedSpeculativeDurationMs);
+		// A tool's timing class mixes short and long commands (ls and npm test): it may raise this action's own forecast or
+		// elapsed time, never shorten them, and for the same action without exact Actor evidence native takes about as long.
+		const sameAction = request.actorIdentity?.actionKeyHash === undefined || request.actorIdentity.actionKeyHash === request.identity.actionKeyHash;
+		const expectedSpeculativeMs = speculative?.exact ? speculative.value
+			: Math.max(forecastMs || (sameAction ? actor?.value ?? 0 : 0), speculative?.value ?? 0, elapsedMs) || actor?.value || 1;
+		const expectedActorMs = actor && !actor.exact && sameAction ? Math.max(actor.value, expectedSpeculativeMs) : actor?.value;
 		const expectedRemainingMs =
 			request.state === "succeeded" ? 0 : Math.max(0, expectedSpeculativeMs - elapsedMs - finite(request.leadTimeMs));
 		const expectedAdoptionMs = adoption?.value ?? 0;
-		const expectedNetBenefitMs =
-			expectedActorMs === undefined
-				? undefined
-				: expectedActorMs - expectedRemainingMs - expectedAdoptionMs;
+		const expectedNetBenefitMs = expectedActorMs === undefined ? undefined : expectedActorMs - expectedRemainingMs - expectedAdoptionMs;
 		const base = {
 			speculativeSamples: speculative?.samples ?? 0,
 			actorSamples: actor?.samples ?? 0,
@@ -350,12 +342,17 @@ export class SpeculationScheduler<Job extends object> {
 			const waitBudgetMs = policy.uncalibratedWaitMs ?? Number.POSITIVE_INFINITY;
 			return { allowed: waitBudgetMs > 0, reason: "warmup_probe", waitBudgetMs, ...base };
 		}
+		const actorDeadlineMs = Math.max(0, expectedActorMs - expectedAdoptionMs - policy.minNetBenefitMs);
+		// Nothing is known about this run itself: probe it for at most what falling back would cost.
+		if (!speculative && !forecastMs) {
+			const waitBudgetMs = Math.min(policy.uncalibratedWaitMs ?? Number.POSITIVE_INFINITY, actorDeadlineMs);
+			return { allowed: waitBudgetMs > 0, reason: "warmup_probe", waitBudgetMs, ...base };
+		}
 		if (expectedNetBenefitMs === undefined || expectedNetBenefitMs < policy.minNetBenefitMs) {
 			return { allowed: false, reason: "fallback_faster", waitBudgetMs: 0, ...base };
 		}
-		const actorDeadlineMs = Math.max(0, expectedActorMs - expectedAdoptionMs - policy.minNetBenefitMs);
-		const estimatedDeadlineMs = !speculative && request.expectedSpeculativeDurationMs === undefined
-			? actorDeadlineMs : expectedRemainingMs * policy.durationSlack + policy.warmupWaitMs;
+		// Without exact samples or a forecast, waiting up to about the work already done bounds the loss either way.
+		const estimatedDeadlineMs = speculative?.exact || forecastMs ? expectedRemainingMs * policy.durationSlack + policy.warmupWaitMs : actorDeadlineMs;
 		const waitBudgetMs = Math.min(actorDeadlineMs, estimatedDeadlineMs);
 		// A cancelled run supplies no completion sample. Passing that floor does not mean this run is nearly done.
 		const uncalibratedOverrun = speculative?.samples === 0 && request.state === "running" && elapsedMs >= expectedSpeculativeMs;
@@ -366,9 +363,7 @@ export class SpeculationScheduler<Job extends object> {
 	}
 
 	snapshot(): readonly { readonly job: Job; readonly work: ScheduledWork }[] {
-		return [...this.entries.values()]
-			.sort((left, right) => left.sequence - right.sequence)
-			.map(({ job, work }) => ({ job, work }));
+		return [...this.entries.values()] .sort((left, right) => left.sequence - right.sequence) .map(({ job, work }) => ({ job, work }));
 	}
 
 	/** With exact Actor evidence and a known cost, avoid launching work its consumer would reject. */
@@ -402,11 +397,7 @@ export class SpeculationScheduler<Job extends object> {
 	}
 
 	private duration(forecast: PredictionForecast, quantile = 0.5): number | undefined {
-		const observed = this.timingEstimate(
-			this.speculativeServiceTimes,
-			forecast,
-			quantile,
-		)?.value;
+		const observed = this.timingEstimate(this.speculativeServiceTimes, forecast, quantile)?.value;
 		// A source's action-specific estimate remains a lower bound. Wider timing classes can
 		// conservatively raise scheduling cost, but must not make an explicitly long action look short.
 		return Math.max(finite(forecast.expectedDurationMs), observed ?? 0) || undefined;

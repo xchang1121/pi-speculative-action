@@ -1208,10 +1208,7 @@ export function makeSpeculativeActionRuntime<
 			return;
 		}
 		if (
-			parent &&
-			(route.reuse === "shared_result" ||
-				!candidateBranch(parent)?.checkpoint ||
-				!sameSpeculativeExecutionRoute(parent.route, route))
+			parent && (route.reuse === "shared_result" || !candidateBranch(parent)?.checkpoint || !sameSpeculativeExecutionRoute(parent.route, route))
 		) {
 			session.plan.defer(node.proposalID, node.action.id);
 			return;
@@ -1641,16 +1638,14 @@ export function makeSpeculativeActionRuntime<
 			};
 			// Equivalent ready choices share this Actor decision, including its recovery probe.
 			const readyKey = executionAtDecision.status === "succeeded" ? JSON.stringify(adoptionIdentity) : undefined;
+			// Only a source's own forecast is evidence; the scheduler's placeholder or class blend would pose as one.
+			const forecastMs = Math.max(0, ...state.session.plan.consumers(candidate.id).map((node) => finiteMetric(node.action.expectedDurationMs)));
 			const join = (readyKey ? readyJoins.get(readyKey) : undefined) ?? state.session.scheduler.assessCandidateJoin({
 				identity: actionTimingIdentity(candidate.key),
 				actorIdentity, adoptionIdentity,
 				state:
-					executionAtDecision.status === "succeeded"
-						? "succeeded"
-						: executionAtDecision.status === "running"
-							? "running"
-							: "queued",
-				expectedSpeculativeDurationMs: candidate.expectedDurationMs,
+					executionAtDecision.status === "succeeded" ? "succeeded" : executionAtDecision.status === "running" ? "running" : "queued",
+				...(forecastMs ? { expectedSpeculativeDurationMs: forecastMs } : {}),
 				...(executionAtDecision.status === "running"
 					? { elapsedMs: Math.max(0, performance.now() - executionAtDecision.startedAt) }
 					: {}),
@@ -1705,11 +1700,7 @@ export function makeSpeculativeActionRuntime<
 					actorAction.rejectCandidate(
 						candidate.id,
 						choice.match,
-						cause(
-							"matching",
-							"candidate_join_deadline",
-							JSON.stringify({ waitBudgetMs: join.waitBudgetMs, reason: join.reason }),
-						),
+						cause("matching", "candidate_join_deadline", JSON.stringify({ waitBudgetMs: join.waitBudgetMs, reason: join.reason })),
 					);
 					continue;
 				}
@@ -1961,10 +1952,7 @@ export function makeSpeculativeActionRuntime<
 					selected.candidate,
 					selected.output,
 					"actor_adopted",
-					{
-						key: actualKey,
-						input: asConcreteInput(actualCall.input) ?? actualKey.input,
-					},
+					{ key: actualKey, input: asConcreteInput(actualCall.input) ?? actualKey.input },
 				);
 				confirmPredictions(state.session, matchingPredictions, identity, adoption);
 				queueActorSettlement(state, input, actualCall, actorAction, selected.output, selected);
@@ -2790,10 +2778,7 @@ export function makeSpeculativeActionRuntime<
 			activeTurns: selectedSessions.reduce((total, session) => total + session.turns.size, 0),
 			exclusiveCandidates: candidates.filter((candidate) => candidate.work.reservation.kind === "exclusive").length,
 			sharedCandidates: candidates.filter((candidate) => candidate.work.reservation.kind === "shared").length,
-			pendingPredictions: selectedSessions.reduce(
-				(total, session) => total + session.pendingSourceRequests + session.pendingAdmissions,
-				0,
-			),
+			pendingPredictions: selectedSessions.reduce((total, session) => total + session.pendingSourceRequests + session.pendingAdmissions, 0),
 			deferredPlanActions: planNodes.filter((node) => node.execution.status === "deferred" || node.execution.status === "preparing").length,
 			activePlanActions: planNodes.filter(
 				(node) =>
