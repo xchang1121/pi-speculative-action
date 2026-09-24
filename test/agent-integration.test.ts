@@ -1252,6 +1252,11 @@ describe("speculative action host", () => {
 				consumeInput: { sessionID: "session", turnID: request.startInput.turnID, tool: "read", args: { path: "a.txt" }, tools: [tool] },
 				tool: "read", concrete: { path: "a.txt" }, output: { result: textResult("a"), isError: false }, durationMs: 1, order: 0 });
 			expect(predict).toHaveBeenCalledOnce();
+			const reserveRevision = vi.fn(() => 7), id = `pattern:${request.startInput.turnID}:after`;
+			expect(await controller.source.observe!({ ...request, reserveRevision, consumeInput: { sessionID: "session", turnID: request.startInput.turnID, tool: "read",
+				args: { path: "a.txt" }, tools: [tool] }, tool: "read", concrete: { path: "a.txt" }, output: { result: textResult("a"), isError: false }, durationMs: 1, order: 1 }))
+				.toMatchObject({ id, revision: 7 }); // Never the turn-start proposal's ID, nor a revision a continuation holds.
+			expect(reserveRevision).toHaveBeenCalledWith(id, 1); // Above the revision the earlier observation used.
 		} finally { await controller.dispose(); }
 	});
 
