@@ -4,25 +4,11 @@ import type { BigIntStats } from "node:fs";
 import { sameFilesystemIdentity, type StableFilesystemCapture } from "./filesystem-evidence.ts";
 import type { ActionKey, ActionSemanticsRegistry } from "./action-semantics.ts";
 import { PI_ACTION_SEMANTICS } from "./action-semantics.ts";
-import type {
-	ExecutionWorld,
-	ExecutionScope,
-	ExecutionOperationAdoption,
-	WorldBranch,
-	WorldCheckpoint,
-	WorldResultCapture,
-} from "./execution-world.ts";
+import type { ExecutionWorld, ExecutionScope, ExecutionOperationAdoption, WorldBranch, WorldCheckpoint, WorldResultCapture } from "./execution-world.ts";
+import { effectCommitFailure } from "./effect-transaction.ts";
 import { effectCapabilitiesCover, RESOURCE_OBSERVATION_EFFECTS, WORKSPACE_PATH_MUTATION_EFFECTS } from "./effect-model.ts";
-import {
-	captureResourceVersion,
-	invalidateResourceInputs,
-	type ResourceReadView,
-	type ResourceInput,
-	type ResourceObservation,
-	type ResourceVersionToken,
-	releaseResourceVersion,
-	validateResourceVersion,
-} from "./resource-version.ts";
+import { captureResourceVersion, invalidateResourceInputs, releaseResourceVersion, validateResourceVersion,
+	type ResourceReadView, type ResourceInput, type ResourceObservation, type ResourceVersionToken } from "./resource-version.ts";
 import { cause } from "./settlement.ts";
 import type { ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
 
@@ -330,7 +316,8 @@ function resourceSnapshotBranch(
 			} finally { if (!transferred) await dispose(); }
 		} } : {}),
 		commit: async () => {
-			if (inputsOnly) throw new Error("input_only_branch");
+			// Nothing was applied: an input-only branch can only be declined, never poison the Actor call.
+			if (inputsOnly) throw effectCommitFailure(new Error("input_only_branch"), "recoverable");
 			if (!owned) throw new Error("resource snapshot is disposed");
 			return output;
 		},

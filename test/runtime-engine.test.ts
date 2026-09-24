@@ -1498,6 +1498,18 @@ describe("structural speculative runtime", () => {
 		for (const dispose of queryDisposals) expect(dispose).toHaveBeenCalledOnce();
 	});
 
+	it("recomputes a proofless retained query instead of committing an input-only branch", async () => {
+		const reconstruct = vi.fn<NonNullable<WorldBranch<string>["reconstruct"]>>(async ({ args }) => ({ dispose: vi.fn(), output: String((args as { offset: number }).offset), capturedBytes: 4096, validate: async () => validResource() }));
+		const { runtime, ready } = harness({ source: planSource({ propose: () => plan("inputs", { path: "input", offset: 1, limit: 1 }) }),
+			settings: () => ({ ...settings, resourceCacheMaxEntries: 2, resourceCacheMaxBytes: 4096 }),
+			execute: () => ({ ...world("1"), inputsOnly: true as const, commit: () => Promise.reject(new Error("input_only_branch")), reconstruct, inputResources: [{ path: "/workspace/input" }] }) });
+		try {
+			await runtime.startTurn(start("first")); await ready.promise;
+			for (const id of ["query", "repeat"]) expect((await runtime.prepareActorCall({ ...call("first", { path: "input", offset: 2, limit: 1 }), id }))?.output).toBe("2");
+			expect(reconstruct).toHaveBeenCalledTimes(2);
+		} finally { await runtime.dispose(); }
+	});
+
 	it("keeps an Actor query proof alive while its cached view is evicted", async () => {
 		const gate = gated(), releases: ReturnType<typeof vi.fn>[] = [];
 		let validating = false;
