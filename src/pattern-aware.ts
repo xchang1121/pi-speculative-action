@@ -91,7 +91,7 @@ export type PatternAwareBinding = (
 	  }
 	| {
 			readonly type: "transform";
-			readonly operation: "dirname" | "basename" | "normalize_path";
+			readonly operation: PathTransform;
 			readonly source: PatternAwareBinding;
 	  }
 	| {
@@ -113,6 +113,10 @@ export type PatternAwareBinding = (
 ) & {
 	readonly variantCounts?: Readonly<Record<string, number>>;
 };
+
+/** `stem` and `strip_extension` cut a name at its first dot after any leading ones, rewriting src/a.ts into src/a.test.ts or spec/a_spec.rb. */
+const PATH_TRANSFORMS = ["dirname", "basename", "normalize_path", "stem", "strip_extension"] as const;
+type PathTransform = typeof PATH_TRANSFORMS[number];
 
 export type PatternAwarePattern = Readonly<Omit<MutablePattern, "context" | "bindings" | "dependencies" | "gapCounts" | "gapLastSeen" | "feedback">> & {
 	readonly context: ReadonlyArray<PatternAwareEventSignature>;
@@ -1616,30 +1620,24 @@ class PatternBindingAnalysis {
 					const pathSource = typeof source === "string" && isPathSource(field, sourcePath, source);
 					if (sameValue(source, target) && (!targetIsPath || pathSource)) yield direct;
 					if (typeof source !== "string" || typeof target !== "string") continue;
-					const sources: Array<{ readonly binding: PatternAwareBinding; readonly value: string }> = [
-						{ binding: direct, value: source },
-					];
+					// A path target templates only a rewrite of another file's name; other targets never template a bare name.
+					const sources: Array<{ readonly binding: PatternAwareBinding; readonly value: string }> = targetIsPath ? [] : [{ binding: direct, value: source }];
 					if (pathSource) {
 						if (pathSources.length < MAX_PATH_SOURCES) pathSources.push({ binding: direct, value: source });
-						for (const operation of ["dirname", "basename", "normalize_path"] as const) {
+						const renamed = transform("strip_extension", source) !== source;
+						for (const operation of PATH_TRANSFORMS) {
 							const transformed: PatternAwareBinding = { type: "transform", operation, source: direct };
-							const value = transform(operation, source);
+							const value = transform(operation, source), rewrite = operation === "stem" || operation === "strip_extension";
 							if (value === target) yield transformed;
-							if (operation !== "basename") sources.push({ binding: transformed, value });
-							if (pathSources.length < MAX_PATH_SOURCES) pathSources.push({ binding: transformed, value });
+							if (targetIsPath ? rewrite && renamed : operation !== "basename" && operation !== "stem") sources.push({ binding: transformed, value });
+							if (!rewrite && pathSources.length < MAX_PATH_SOURCES) pathSources.push({ binding: transformed, value });
 						}
 					}
-					if (targetIsPath) continue;
 					for (const { binding, value } of sources) {
-						if (value.length < 3) continue;
-						const offset = target.indexOf(value);
-						if (offset < 0) continue;
-						yield {
-							type: "template",
-							source: binding,
-							prefix: target.slice(0, offset),
-							suffix: target.slice(offset + value.length),
-						};
+						const offset = value.length < 3 ? -1 : target.indexOf(value), suffix = target.slice(offset + value.length);
+						// A rewritten path keeps its directory and renames only the file's tail.
+						if (offset < 0 || targetIsPath && (/[\\/]/u.test(suffix) || offset > 0 && binding.type === "transform" && binding.operation === "strip_extension")) continue;
+						yield { type: "template", source: binding, prefix: target.slice(0, offset), suffix };
 					}
 				}
 			}
@@ -1946,10 +1944,12 @@ function isPathSource(field: "input" | "output" | "outputPaths", sourcePath: Pat
 	);
 }
 
-function transform(operation: "dirname" | "basename" | "normalize_path", value: string) {
+function transform(operation: PathTransform, value: string) {
 	if (operation === "dirname") return path.dirname(value);
 	if (operation === "basename") return path.basename(value);
-	return path.normalize(value).replaceAll("\\", "/");
+	if (operation === "normalize_path") return path.normalize(value).replaceAll("\\", "/");
+	const name = path.basename(value), stem = name.replace(/^(\.*[^.]+)\..*$/u, "$1");
+	return operation === "stem" ? stem : value.slice(0, value.length - name.length) + stem;
 }
 
 const PATH_OPERATION_CACHE_LIMIT = 128;
@@ -2382,7 +2382,7 @@ function isPatternAwareBinding(value: unknown, depth = 0): value is PatternAware
 		case "each":
 			return eventSource() && isPatternAwarePath(record.itemPath);
 		case "transform":
-			return ["dirname", "basename", "normalize_path"].includes(String(record.operation)) && source();
+			return (PATH_TRANSFORMS as readonly string[]).includes(String(record.operation)) && source();
 		case "coalesce":
 			return (
 				Array.isArray(record.sources) &&
