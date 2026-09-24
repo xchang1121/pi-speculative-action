@@ -1138,7 +1138,8 @@ int main(int argc,char **argv) {
 				expect(await executor.execute(`exec '${compat}'`)).toEqual({ exitCode: 7 });
 				expect(decide).not.toHaveBeenCalled();
 			}
-			for (const [redirection, route] of [["", [1, 2]], ["2>&1", [1, 1]], ["3>&1", undefined], ["0<&-", [1, 2]], ["1>/dev/null", undefined]] as const) {
+			for (const [redirection, route] of [["", [1, 2]], ["2>&1", [1, 1]], ["3>&1", undefined], ["0<&-", [1, 2]], ["1>/dev/null", [0, 2]], ["2>&1 1>/dev/null", [0, 2]],
+				["&>/dev/null", [0, 0]], ["2>>/dev/null", [1, 0]], ["1>&-", undefined]] as const) {
 				let inspected = 0;
 				let inspection: ReturnType<typeof inspectHeldExecProcess> | undefined;
 				const inspecting = held({ decide: async ({ pid }) => {
@@ -1863,8 +1864,10 @@ int main(void) {
 				": > \"$1/$self\"", "while [ ! -e \"$1/$other\" ]; do :; done",
 			].join("\n"));
 			await chmod(path.join(fixture.workspace, "barrier-worker"), 0o755);
-			await writeFile(path.join(fixture.workspace, "redirect-worker"), "#!/bin/sh\nprintf 'redirected\\n'\n");
-			await chmod(path.join(fixture.workspace, "redirect-worker"), 0o755);
+			for (const [name, script] of [["redirect-worker", "printf 'redirected\\n'"], ["route-worker", "printf 'out\\n'; printf 'err\\n' >&2"]]) {
+				await writeFile(path.join(fixture.workspace, name), `#!/bin/sh\n${script}\n`);
+				await chmod(path.join(fixture.workspace, name), 0o755);
+			}
 			await writeFile(path.join(fixture.workspace, "fd-check.c"), "#include <fcntl.h>\nint main(void) {\n\tint mask = 0;\n\tfor (int fd = 0; fd < 3; fd++) if (fcntl(fd, F_GETFD) >= 0) mask |= 1 << fd;\n\treturn mask;\n}\n");
 			await compileBenchmarkHelper(fixture.workspace, { source: "fd-check.c", output: "fd-check" });
 			const streamProbes = ["", "0<&-", "1>&-", "2>&-", "0<&- 1>&- 2>&-", "3>&1"].map((redirection) =>
@@ -1882,13 +1885,14 @@ int main(void) {
 			branch = await forkReusableBash(fixture, {
 				label: "concurrency",
 				command: "set -e; /bin/bash -c '(/bin/sleep 0.05; echo x > escaped.txt) 2>/dev/null & exit 0'; /usr/bin/printf 'trace-root-fallback\\n'; mkdir barrier; barrier-worker barrier & first=$!; barrier-worker barrier & second=$!; wait \"$first\"; wait \"$second\"; redirect-worker | { read line; printf '%s\\n' \"$line\" > redirected.txt; printf '%s\\n' \"$line\"; }; " +
-					"/usr/bin/printf 'file-fallback\\n' > redirected-file.txt; /usr/bin/cat < redirected-file.txt; printf 'pipe-fallback\\n' | /usr/bin/cat; " + streamProbes + "; printf '%32768s:end' ''",
+					"route-worker 2>/dev/null; route-worker 2>&1 1>/dev/null; /usr/bin/printf 'file-fallback\\n' > redirected-file.txt; /usr/bin/cat < redirected-file.txt; printf 'pipe-fallback\\n' | /usr/bin/cat; " + streamProbes + "; printf '%32768s:end' ''",
 				actionNamespace: "process-concurrency-test",
 				executionFingerprint,
 			});
 			expect(branch.output.isError, JSON.stringify({ output: branch.output, metrics: fixture.backend.metrics() })).toBe(false);
 			const text = branch.output.result.content[0];
-			expect(text?.type === "text" && text.text).toBe("trace-root-fallback\nredirected\nfile-fallback\npipe-fallback\nfds:7\nfds:6\nfds:5\nfds:3\nfds:0\nfds:7\n" + " ".repeat(32768) + ":end");
+			// Discarded streams route into /dev/null; the stderr kept by `2>&1 1>/dev/null` still reaches stdout.
+			expect(text?.type === "text" && text.text).toBe("trace-root-fallback\nredirected\nout\nerr\nfile-fallback\npipe-fallback\nfds:7\nfds:6\nfds:5\nfds:3\nfds:0\nfds:7\n" + " ".repeat(32768) + ":end");
 			const nextCapture = await vi.mocked(captures[1]!.finish).mock.results[0]!.value;
 			expect({ allocationFailed, aborts: vi.mocked(captures[0]!.abort).mock.calls.length, nextComplete: nextCapture.complete },
 				nextCapture.complete ? undefined : nextCapture.reason).toEqual({ allocationFailed: true, aborts: 1, nextComplete: true });

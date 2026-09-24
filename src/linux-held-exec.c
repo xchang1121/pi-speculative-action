@@ -3190,14 +3190,16 @@ int main(int argc, char **argv) {
 	if (dispatched >= 0) return dispatched;
 	if (argc >= 2 && (!strcmp(argv[1], "--exec") || !strcmp(argv[1], "--exec-closed-input") || !strcmp(argv[1], "--exec-fds"))) {
 		int descriptors = !strcmp(argv[1], "--exec-fds");
-		if (argc < (descriptors ? 7 : 5) || strspn(argv[2], "12") != 2 ||
+		if (argc < (descriptors ? 7 : 5) || strspn(argv[2], "012") != 2 ||
 			(strlen(argv[2]) != 2 && (!descriptors || strlen(argv[2]) != 4 || strspn(argv[2] + 2, "ps") != 2 ||
 				(argv[2][0] == argv[2][1] && argv[2][2] != argv[2][3])))) return 64;
-		/* Save stdout's source before changing either endpoint, including swapped routes. */
-		int output = fcntl(argv[2][0] - '0', F_DUPFD_CLOEXEC, 3);
+		/* Save stdout's source before changing either endpoint, including swapped routes.
+		 * Route 0 discards into /dev/null; Node fills vacant stdio, so the device opens above it. */
+		int discard = memchr(argv[2], '0', 2) ? open("/dev/null", O_WRONLY | O_CLOEXEC) : -1;
+		int output = fcntl(argv[2][0] == '0' ? discard : argv[2][0] - '0', F_DUPFD_CLOEXEC, 3);
 		if (output < 0) return 70;
-		int routed = dup2(argv[2][1] - '0', 2) >= 0 && dup2(output, 1) >= 0;
-		close(output);
+		int routed = dup2(argv[2][1] == '0' ? discard : argv[2][1] - '0', 2) >= 0 && dup2(output, 1) >= 0;
+		close(output); close(discard);
 		if (!routed) return 70;
 		/* Close only at the native outlet: Node and the sandbox launcher may fill vacant stdio. */
 		if (!strcmp(argv[1], "--exec-closed-input") && close(0) < 0 && errno != EBADF) return 70;
