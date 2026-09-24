@@ -1034,11 +1034,11 @@ static int take(int length,int peek,int truncated,char expected) {
 			await expect(LinuxHeldExecBoundary.open({ storeRoot: root, binary })).rejects.toBe(permissions);
 			expect(await filesystem.readdir(root)).toEqual(retained);
 			const completed = path.join(root, "descendant-completed"), pidFile = path.join(root, "descendant-pid");
-			const command = `/usr/bin/setsid /bin/sh -c 'echo $$ > ${pidFile}; sleep 0.1; echo done > ${completed}' </dev/null >/dev/null 2>&1 & exit 7`;
-			expect(childProcess.spawnSync(binary, ["/bin/bash", "-c", command]).status).toBe(7);
-			expect(await readFile(completed, "utf8"), "parent exit must drain detached descendants").toBe("done\n");
+			const command = `/usr/bin/setsid /bin/sh -c 'echo $$ > ${pidFile}; sleep 1; echo done > ${completed}' </dev/null >/dev/null 2>&1 & exit 7`;
+			expect(childProcess.spawnSync(binary, ["/bin/bash", "-c", command], { timeout: 900 }).status, "the shell returns without its detached descendants").toBe(7);
+			await expect.poll(() => readFile(completed, "utf8").catch(() => ""), { timeout: 5000 }).toBe("done\n"); // Released, not killed with the tracer.
 			await rm(pidFile);
-			const tracer = childProcess.spawn(binary, ["/bin/bash", "-c", command.replace("sleep 0.1", "sleep 10").replace("exit 7", "wait")]);
+			const tracer = childProcess.spawn(binary, ["/bin/bash", "-c", command.replace("sleep 1", "sleep 10").replace("exit 7", "wait")]);
 			const stopped = new Promise<void>((resolve) => tracer.once("close", () => resolve()));
 			let pid = 0;
 			try {

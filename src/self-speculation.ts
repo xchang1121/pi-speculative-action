@@ -111,8 +111,6 @@ export function normalizeSelfSpeculationSettings(value: unknown): SelfSpeculatio
 
 export interface SelfSpeculationCoordinatorSnapshot extends ReturnType<SelfSpeculationCoordinator["snapshot"]> {}
 
-export interface SelfSpeculationVerificationStep extends Readonly<SelfSpeculationVerificationOutcome["steps"][number]> {}
-
 export interface SelfSpeculationVerificationOutcome extends ReturnType<typeof parseVerificationOutcome> {}
 
 export interface SelfSpeculationCoordinatorOptions {
@@ -296,10 +294,6 @@ export class SelfSpeculationCoordinator {
 		// Only the runtime exposing the control plane accepts these fields; hosted APIs reject unknown ones.
 		return originOf(state.model.baseUrl) === originOf(settings.endpoint)
 			? providerPayload(payload, settings, state.requestID, this.actorForkPlanSource.schedule) : payload;
-	}
-
-	actorRequestID(): string | undefined {
-		return this.active?.requestID;
 	}
 
 	addCandidate(candidate: MaterializedSpeculativeCandidate<string>): void {

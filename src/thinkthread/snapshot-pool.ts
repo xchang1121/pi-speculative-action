@@ -63,10 +63,6 @@ export class SnapshotLease {
 		return this.resource.id;
 	}
 
-	get logicalBytes(): number {
-		return this.resource.logicalBytes;
-	}
-
 	retain(): SnapshotLease {
 		return this.resource.retain();
 	}
@@ -199,10 +195,6 @@ export class ThinkThreadSnapshotPool {
 			await Promise.allSettled([...this.resources.values()].map((resource) => resource.cleanup()));
 		}
 		await this.durable.drainCleanup();
-	}
-
-	resourceCount(): number {
-		return this.resources.size;
 	}
 
 	private async createBase(): Promise<SnapshotLease> {

@@ -117,7 +117,6 @@ function harness<SessionID = string>(input: Partial<Pick<TestAdapter<SessionID>,
 		signal: AbortSignal,
 		parentWorld?: WorldBranch<string>,
 	) => unknown | Promise<unknown>;
-	readonly expired?: () => boolean | Promise<boolean>;
 	readonly capture?: () => unknown | Promise<unknown>;
 	readonly validate?: (version: unknown) => ResourceValidation;
 	readonly projection?: ActionProjectionRule<string>;
@@ -147,20 +146,7 @@ function harness<SessionID = string>(input: Partial<Pick<TestAdapter<SessionID>,
 			if (isWorldBranch(executed)) return executed;
 			return world((executed as string | undefined) ?? "speculative", {
 				executionFingerprint: action.executionFingerprint,
-				...(route.isolation === "resource_snapshot"
-					? {
-							validate: async () =>
-								input.validate
-									? input.validate(version)
-									: (await input.expired?.())
-										? {
-												status: "stale" as const,
-												cause: cause("freshness", "resource_changed"),
-												metrics: zeroValidationMetrics(),
-											}
-										: validResource(),
-						}
-					: {}),
+				...(route.isolation === "resource_snapshot" ? { validate: async () => input.validate ? input.validate(version) : validResource() } : {}),
 			});
 		}),
 		projectionRules: input.projection ? [input.projection] : [],
@@ -578,7 +564,7 @@ describe("structural speculative runtime", () => {
 		});
 		const { runtime, events, summary, ready: candidateReady } = harness({
 			source,
-			expired: () => true,
+			validate: () => ({ status: "stale", cause: cause("freshness", "resource_changed"), metrics: zeroValidationMetrics() }),
 			actionKey,
 		});
 		await runtime.startTurn(start("turn"));
