@@ -1,4 +1,4 @@
-import { lstat, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { expect, test } from "vitest";
 import {
@@ -60,10 +60,12 @@ int main(int argc, char **argv) {
 }
 `);
 		await compileBenchmarkHelper(workspace, { source: "worker.c", output: "worker" });
+		await mkdir(path.join(workspace, "d", "e"), { recursive: true });
+		await Promise.all([writeFile(path.join(workspace, "data.txt"), "v1\n"), writeFile(path.join(workspace, "d", "data.txt"), "nested\n"),
+			symlink("data.txt", path.join(workspace, "data.link")), symlink("d/e", path.join(workspace, "sub"))]);
 		await commitBenchmarkFixture(workspace, "Pi Held Exec Qualification");
 		const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
 		const route = await fixture.prepareActorReplay();
-		if (!("executor" in route)) throw new Error(route.detail);
 		const produce = (command: string) => forkReusableBash(fixture, {
 			label: "producer", command, actionNamespace: "held-production", executionFingerprint,
 		});
@@ -84,6 +86,8 @@ int main(int argc, char **argv) {
 			{ name: "security", command: "worker unused probe", expected: "nnp:0\n" },
 			{ name: "inode", command: "worker unused inode", expected: (await lstat(path.join(workspace, "input.txt"), { bigint: true })).ino.toString(16).padStart(16, "0") + "\n" },
 			{ name: "descriptor", command: descriptor, expected: "descriptor-ok", file: "descriptor.txt" },
+			{ name: "link", command: "head -n 1 data.link", expected: "v2\n" },
+			{ name: "dotdot", command: "head -n 1 sub/../data.txt", expected: "nested\n" },
 		];
 		for (const scenario of cases) {
 			const before = backend.metrics();
@@ -111,7 +115,7 @@ int main(int argc, char **argv) {
 						expect(produced.wholeCommandPublished).toBe(0);
 					}
 					if (scenario.name === "disposed") await branch.dispose();
-					if (scenario.name === "stale") await writeFile(path.join(workspace, "input.txt"), "after\n");
+					if (scenario.name === "stale" || scenario.name === "link") await writeFile(path.join(workspace, scenario.name === "stale" ? "input.txt" : "data.txt"), scenario.name === "stale" ? "after\n" : "v2\n");
 				}
 				const result = await actor(`printf 'actor-parent\\n'; ${scenario.command}`, "benchmark", scenario.name !== "descriptor");
 				expect(result.output, scenario.name).toBe(`actor-parent\n${scenario.expected}`);

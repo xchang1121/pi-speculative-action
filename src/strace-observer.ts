@@ -936,7 +936,7 @@ function tracedCwd(line: TraceLine, cwd: string | undefined): string | undefined
 	if (line.name === "fchdir") return absoluteDescriptorPath(line.args[0]);
 	if (line.name !== "chdir") return cwd;
 	const target = quotedStrings(line)[0];
-	return target ? tracedPath(target, cwd) : undefined;
+	return target && (target.startsWith("/") || cwd) ? walkedPath(target.startsWith("/") ? target : `${cwd}/${target}`) : undefined;
 }
 
 function tracedPath(target: string, cwd: string | undefined): string | undefined {
@@ -991,11 +991,16 @@ function syscallPaths(line: TraceLine, syscall: string, cwd: string): readonly s
 			const target = absoluteDescriptorPath(descriptor); return target ? [target] : [];
 		}
 		const value = quotedArgument(line.args[pathname]);
-		if (value?.startsWith("/")) return [path.posix.normalize(value)]; // Absolute names ignore dirfd, even an invalid one.
+		if (value?.startsWith("/")) return [walkedPath(value)]; // Absolute names ignore dirfd, even an invalid one.
 		const base = dirfd === undefined || descriptor === "AT_FDCWD" || descriptor === "-100" ? cwd : absoluteDescriptorPath(descriptor);
 		if (!value || !base) throw new Error(`unresolved_pathname:${syscall}:${pathname}`);
-		return [path.posix.resolve(base, value)];
+		return [walkedPath(`${base}/${value}`)];
 	});
+}
+
+/** Keep `..`: only a walk over the recorded tree knows whether it leaves a symlinked directory. */
+function walkedPath(value: string): string {
+	return `/${value.split("/").filter((segment) => segment && segment !== ".").join("/")}`;
 }
 
 function absoluteDescriptorPath(descriptor: string | undefined): string | undefined {

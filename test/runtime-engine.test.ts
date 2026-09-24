@@ -86,29 +86,6 @@ function plan(proposalID: string, input: Record<string, unknown> = { path: "READ
 	};
 }
 
-function futureReadSource(
-	options: {
-		readonly latestHorizon?: number;
-		readonly expectedDurationMs?: number;
-		readonly subsequent?: "empty" | "placeholder";
-	} = {},
-): Source {
-	const { subsequent = "empty", ...action } = options;
-	return planSource({
-		propose: ({ startInput }) =>
-			startInput.turnID === "turn-1"
-				? {
-						...plan("future", { path: "future.ts" }),
-						actions: [
-							readAction("next", { path: "future.ts" }, { horizon: 0, ...action }),
-						],
-					}
-				: subsequent === "placeholder"
-					? plan(`empty:${startInput.turnID}`, {})
-					: { id: `empty:${startInput.turnID}`, source: "source", revision: 0, actions: [] },
-	});
-}
-
 function childPlanUpdate(
 	context: { readonly proposalID: string; readonly actionID: string; readonly revision: number },
 	id: string,
@@ -1731,7 +1708,9 @@ describe("structural speculative runtime", () => {
 		const started = barrier(), gate = barrier(), commits = vi.fn();
 		const settlements: PredictionSettlement[] = [];
 		const { runtime, ready } = harness({
-			source: { ...futureReadSource({ latestHorizon: 1, expectedDurationMs: 10, subsequent: "placeholder" }),
+			source: { ...planSource({ propose: ({ startInput }) => startInput.turnID === "turn-1"
+				? { ...plan("future", { path: "future.ts" }), actions: [readAction("next", { path: "future.ts" }, { horizon: 0, latestHorizon: 1, expectedDurationMs: 10 })] }
+				: plan(`empty:${startInput.turnID}`, {}) }),
 				onSettled: ({ settlement }) => { settlements.push(settlement); } },
 			execute: async () => {
 				const captured = version, output = `future:${++executions}`;

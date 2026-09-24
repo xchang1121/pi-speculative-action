@@ -1303,7 +1303,7 @@ export class LinuxProcessReuseBackend {
 					const relative = relativeFilesystemPath(session.sourceRoot, changed);
 					if (relative === undefined || session.deniedPaths.some(denied => pathContains(denied, changed))) continue;
 					inputs ??= new Set((await observeStrace(tracePrefix, logicalExecutable, logicalCwd, { previewBytes: 1024 * 1024 }))
-						.paths.filter(observed => observed.role === "input").map(observed => observed.path));
+						.paths.filter(observed => observed.role === "input").map(observed => path.resolve(observed.path)));
 					if (!inputs.has(changed)) continue;
 					const before = await transaction.readBefore(slash(relative), MAX_REQUEST_BYTES);
 					if (!before) continue;
@@ -1454,7 +1454,7 @@ export class LinuxProcessReuseBackend {
 				const taints = new Set<ProvenanceTaint>(observation.taints);
 				// Private images preserve FD/OFD relations, but cannot also represent an independently accessed pathname.
 				if (inputs.some(descriptor => !descriptorImages.get(descriptor.image)?.workspace && descriptor.sourcePath && observation.paths.some(observed =>
-					observed.path === descriptor.sourcePath || observed.role !== "metadata" && pathContains(observed.path, descriptor.sourcePath!)))) {
+					path.resolve(observed.path) === descriptor.sourcePath || observed.role !== "metadata" && pathContains(observed.path, descriptor.sourcePath!)))) {
 					taints.add("untracked_fd");
 				}
 				for (const taint of evidence.taints) taints.add(taint);
@@ -1984,15 +1984,33 @@ async function captureDependencies(
 		dependencies.set(identity, dependency);
 	};
 
+	// Kernel pathname walk over the baseline: links are recorded and expanded in place and `..` leaves the directory
+	// actually reached. Sandlock collapses `..` first, so another result means the sandbox read another object.
+	const walk = async (logical: string, follow: boolean) => {
+		const pending = logical.split("/").filter(Boolean), links: string[] = [];
+		let current = "/";
+		for (let segment = pending.shift(); segment !== undefined; segment = pending.shift()) {
+			if (segment === "..") { current = path.posix.dirname(current); continue; }
+			const next = path.posix.join(current, segment), physical = pathContains(session.sourceRoot, next) ? session.projection.toPhysical(next) : undefined;
+			const entry = physical ? await before(physical) : undefined;
+			if (entry?.kind === "file" && pending.length) return undefined; // Native ENOTDIR; lexical collapse would continue.
+			if (entry?.kind !== "symlink" || !pending.length && !follow) { current = next; continue; }
+			if (links.push(next) > 40) return undefined;
+			pending.unshift(...entry.target.split("/").filter(Boolean));
+			if (entry.target.startsWith("/")) current = "/";
+		}
+		return { path: current, links };
+	};
 	const interposed = new Set(session.interposition.executables.map(([target]) => path.resolve(target)));
 	for (const item of observed) {
-		const observedPath = path.resolve(item.path);
-		if (interposed.has(observedPath)) continue;
-		if (session.deniedPaths.some((denied) => pathContains(denied, observedPath))) {
-			taints.add("escaped_sandbox");
-			incompleteReasons.add(`denied:${observedPath}`);
-			continue;
+		const follow = item.role !== "metadata" || item.followSymlinks, walked = await walk(item.path, follow);
+		if (!walked || walked.path !== (item.path.split("/").includes("..") ? (await walk(path.posix.normalize(item.path), follow))?.path : walked.path)) {
+			add(undefined, `pathname_walk:${item.path}`); continue;
 		}
+		for (const link of item.role === "metadata" ? [] : walked.links) add(await workspaceDependency(session.projection.toPhysical(link)!, link, "input"));
+		const observedPath = item.role === "metadata" ? path.resolve(item.path) : walked.path;
+		if (interposed.has(observedPath)) continue;
+		if (session.deniedPaths.some((denied) => pathContains(denied, observedPath))) { taints.add("escaped_sandbox"); incompleteReasons.add(`denied:${observedPath}`); continue; }
 		const physical = pathContains(session.sourceRoot, observedPath)
 			? (session.projection.toPhysical(observedPath) ?? observedPath)
 			: observedPath;
@@ -2013,11 +2031,7 @@ async function captureDependencies(
 		try {
 			const captured = await captureHostPath(physical, item.role);
 			if (captured) for (const dependency of captured) add(dependency);
-			else {
-				complete = false;
-				taints.add("mutable_input");
-				incompleteReasons.add(`mutable:${physical}`);
-			}
+			else { taints.add("mutable_input"); add(undefined, `mutable:${physical}`); }
 		} catch (error) {
 			complete = false;
 			taints.add("trace_incomplete");
