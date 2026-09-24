@@ -195,7 +195,7 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 		const snapshot = { coldEntries: 0, hotEntries: 0, coldBytes: 0, hotBytes: 0 };
 		for (const { entry, result } of this.scopes.get(scope)?.entries.values() ?? []) {
 			if (result) { snapshot[result.segment === "hot" ? "hotEntries" : "coldEntries"]++;
-				snapshot[result.segment === "hot" ? "hotBytes" : "coldBytes"] += entryBytes(entry); }
+				snapshot[result.segment === "hot" ? "hotBytes" : "coldBytes"] += finiteValue(entry.estimatedBytes); }
 		}
 		return snapshot;
 	}
@@ -284,7 +284,7 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 		scope: Scope, entries: readonly Entry[], limits: ResultCacheLimits,
 		retire: (record: IndexedEntry<Entry>) => void, canRetire: (entry: Entry) => boolean = () => true,
 	): Entry[] {
-		let count = entries.length, bytes = entries.reduce((total, entry) => total + entryBytes(entry), 0);
+		let count = entries.length, bytes = entries.reduce((total, entry) => total + finiteValue(entry.estimatedBytes), 0);
 		const maxEntries = finiteLimit(limits.maxEntries), maxBytes = finiteLimit(limits.maxBytes);
 		const withinBudget = () => count <= maxEntries && bytes <= maxBytes;
 		if (withinBudget()) return [];
@@ -300,7 +300,7 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 		for (const { entry, indexed, evidence } of ranked) {
 			if (withinBudget()) break;
 			if (!canRetire(entry) || this.record(scope, entry) !== indexed || indexed?.result !== evidence) continue;
-			retired.push(entry); count--; bytes -= entryBytes(entry); retire(indexed);
+			retired.push(entry); count--; bytes -= finiteValue(entry.estimatedBytes); retire(indexed);
 		}
 		return retired;
 	}
@@ -365,6 +365,3 @@ function finiteFraction(value: number): number {
 	return Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0.8;
 }
 
-function entryBytes(entry: CandidateStoreEntry): number {
-	return Number.isFinite(entry.estimatedBytes) ? Math.max(0, entry.estimatedBytes) : 0;
-}
