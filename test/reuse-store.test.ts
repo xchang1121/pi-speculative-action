@@ -12,10 +12,7 @@ import { ToolExecutionGateway } from "../src/tool-execution-gateway.ts";
 vi.mock("node:fs/promises", { spy: true });
 
 const { create: temporaryRoot, dispose } = temporaryDirectories("pi-reuse-store-");
-const PRODUCER = {
-	observer: SPECULATIVE_PRODUCER.observer,
-	execution: { authority: "actor" as const },
-};
+const PRODUCER = { observer: SPECULATIVE_PRODUCER.observer, execution: { authority: "actor" as const } };
 
 afterEach(dispose);
 
@@ -115,10 +112,7 @@ describe("persistent provenance store", () => {
 
 		if (phase !== "held") await expect(collection).rejects.toBe(failure);
 		const collected = phase !== "held" ? await store.gc() : await collection;
-		expect(collected).toMatchObject({
-			removedCertificates: 1,
-			removedArtifacts: phase === "delete_failure" ? 0 : 1,
-		});
+		expect(collected).toMatchObject({ removedCertificates: 1, removedArtifacts: phase === "delete_failure" ? 0 : 1 });
 		expect(await store.stats()).toMatchObject({ certificates: 1, artifacts: 2, orphanArtifacts: 1 });
 		const graced = new ProvenanceCertificateStore(root, { maxCertificates: 1, maxBytes: 1024 * 1024, gcIntervalMs: 0, orphanGraceMs: 60_000 });
 		await utimes(artifactPaths[1]!, 1, 1); await graced.artifacts.put("orphan");
@@ -142,6 +136,20 @@ describe("persistent provenance store", () => {
 			try { expect(await store.mayHaveCertificates(partition)).toBe(true); } finally { unavailable.mockRestore(); }
 		}
 		expect(closure?.read(secondArtifact).toString("utf8")).toBe("second");
+	});
+
+	it("retains certificates carrying only the taints their publisher accepted", async () => {
+		const root = await temporaryRoot(), options = { maxCertificates: 4, maxBytes: 1024 * 1024, gcIntervalMs: 0, orphanGraceMs: 0 };
+		const confined = new ProvenanceCertificateStore(root, { ...options, acceptedTaints: ["confinement_observation"] });
+		const data = await confined.artifacts.put("confined output");
+		const certificate = processCertificate(processPrototype(), { producer: PRODUCER, createdAt: 1, dependencyCertificate: { complete: true, dependencies: [],
+			taints: ["confinement_observation"] }, result: { replayProfile: "buffered_noninteractive", journal: [{ sequence: 0, kind: "output", fd: 1, data }], exit: { kind: "code", code: 0 } } });
+		expect(await confined.put(certificate)).toBe(true);
+		await confined.gc();
+		expect([await confined.get(certificate.id), await confined.stats(true)]).toMatchObject([certificate, { certificates: 1, orphanArtifacts: 0 }]);
+		const strict = new ProvenanceCertificateStore(root, options); // A store accepting no taint collects it.
+		await strict.gc();
+		expect(await strict.get(certificate.id)).toBeUndefined();
 	});
 
 	it("rejects a certificate whose effect bundle is absent from the CAS", async () => {
