@@ -6,7 +6,7 @@ import { temporaryDirectories } from "./filesystem.ts";
 import { testModel as model } from "./model.ts";
 import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { fauxAssistantMessage, type AssistantMessage, type SimpleStreamOptions, type ThinkingLevel } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, type AssistantMessage, type Context, type SimpleStreamOptions, type ThinkingLevel } from "@earendil-works/pi-ai";
 import { createBashTool, createEditTool, createFindTool, createGrepTool, createLsTool, createReadTool, createWriteTool } from "@earendil-works/pi-coding-agent";
 import { createThinkThreadExecutionWorld } from "../src/thinkthread/execution-world.ts";
 import { withThinkThreadProfileLifecycle } from "../src/thinkthread/profile-extension.ts";
@@ -223,6 +223,21 @@ describe("speculative action host", () => {
 		expect(proposal.actions).toMatchObject([{ tool: "read", input: { path: "a.txt" } }]);
 		expect(controller.source.continueOn({ actionID: proposal.actions[0]!.id, feedback: proposal.actions[0]!.feedback,
 			output: { result: { content: [], details: {} }, isError: false }, trigger: "execution_succeeded" })).toBe(false);
+	});
+
+	it("rolls a peer's executed batch out as a Drafter continuation that depends on it", async () => {
+		const tool = createReadTool(await temporaryWorkspace()), contexts: Context[] = [];
+		const controller = createDrafterPlanSource({ sessionID: "session", complete: async (_model, context) => { contexts.push(context); return drafterCall({ path: `${contexts.length}.txt` }); } });
+		const request = { startInput: { ...startInput(tool), sessionID: "session" }, data: { tools: new Map([["read", tool]]), schemaHashes: {} },
+			settings: { ...settings(), resourceCacheMaxEntries: 4, predictionTimeoutMs: 1000 }, definitions: [], candidateNames: ["read"], proposalIndex: 0, proposalCount: 1, signal: new AbortController().signal };
+		await controller.source.propose(request);
+		const identity = { id: "fork-call", proposalID: "self-speculation:turn-1:batch", actionID: "0:fork" }, input = { path: "fork.txt" };
+		const update = await controller.source.continueFrom!({ ...request, batch: [{ identity: identity as never, candidate: { id: "c", key: PI_ACTION_SEMANTICS.buildKey("read", input, "/")!,
+			tool: "read", input }, output: { result: { content: [{ type: "text", text: "forked" }], details: {} }, isError: false } }] });
+		expect(update).toMatchObject({ source: "drafter", actions: [{ tool: "read", input: { path: "2.txt" }, depth: 1,
+			dependsOn: [{ proposalID: identity.proposalID, actionID: "0:fork", identity: "fork-call", condition: "execution_succeeded" }] }] });
+		expect(contexts[1]!.messages.slice(-2)).toMatchObject([{ role: "assistant", content: [{ type: "toolCall", name: "read", arguments: input }] },
+			{ role: "toolResult", toolName: "read", content: [{ type: "text", text: "forked" }] }]);
 	});
 
 	it("splits one adoption among the sources that predicted it, whichever one executed it", async () => {

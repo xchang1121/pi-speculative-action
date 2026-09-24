@@ -86,9 +86,7 @@ const ROOT_SETTING_INPUTS = {
 const SELF_SPECULATION_INPUTS = {
 	endpoint: settingInput("Control service URL", String, (input) => {
 		const value = input.trim();
-		return /^https?:\/\/[^\s]+$/u.test(value)
-			? { ok: true, value }
-			: { ok: false, error: "Endpoint must be an absolute HTTP(S) URL." };
+		return /^https?:\/\/[^\s]+$/u.test(value) ? { ok: true, value } : { ok: false, error: "Endpoint must be an absolute HTTP(S) URL." };
 	}),
 	forkActionMinConfidence: probabilityInput("Minimum tool-name confidence"),
 	forkGateMinSamples: positiveIntegerInput("Benefit-gate warm-up samples"),
@@ -112,12 +110,8 @@ const SELF_SPECULATION_INPUTS = {
 const PATTERN_SETTING_INPUTS = {
 	maxContextLength: positiveIntegerInput("Previous actions used as context"),
 	maxFutureGap: nonNegativeIntegerInput("Maximum skipped Actor decisions"),
-	futureGapCoverage: probabilityInput("Early-prediction coverage (0-1)", {
-		error: "Early-prediction coverage must be between 0 and 1.",
-	}),
-	decayHalfLifeEvents: positiveIntegerInput("History half-life (events)", {
-		error: "Pattern half-life must be a positive integer.",
-	}),
+	futureGapCoverage: probabilityInput("Early-prediction coverage (0-1)", { error: "Early-prediction coverage must be between 0 and 1." }),
+	decayHalfLifeEvents: positiveIntegerInput("History half-life (events)", { error: "Pattern half-life must be a positive integer." }),
 	minOccurrences: positiveIntegerInput("Uses required before learning a pattern"),
 	maxPatterns: positiveIntegerInput("Stored pattern limit"),
 	beamWidth: positiveIntegerInput("Alternatives retained per tool"),
@@ -294,8 +288,7 @@ async function installController(
 	let turnSequence = 0;
 	let turnTools: readonly AgentTool[] = [];
 	const recentEvents: string[] = [];
-	const settingsStore =
-		dependencies.createSettingsStore?.(context.cwd) ?? new SpeculativeActionSettingsStore(context.cwd);
+	const settingsStore = dependencies.createSettingsStore?.(context.cwd) ?? new SpeculativeActionSettingsStore(context.cwd);
 	await settingsStore.load(context.isProjectTrusted());
 	let currentSettings = normalizeSpeculativeActionSettings(settingsStore.effective());
 	let currentMetrics: SpeculativeTraceSummary = emptySpeculativeTraceSummary({
@@ -332,9 +325,7 @@ async function installController(
 		cwd: context.cwd,
 		autoResizeImages: piToolSettings.autoResizeImages,
 	}) ?? [];
-	const processBackend = new LinuxProcessReuseBackend({
-		storeRoot: path.join(getAgentDir(), "speculative-action", "process-reuse"),
-	});
+	const processBackend = new LinuxProcessReuseBackend({ storeRoot: path.join(getAgentDir(), "speculative-action", "process-reuse") });
 	const shell = getShellConfig(piToolSettings.shellPath);
 	const actorReplayEnabled = () => currentSettings.enabled;
 	const rawProcessExecutor = adaptProcessToolOperations(createLocalBashOperations({ shellPath: shell.shell }));
@@ -413,9 +404,7 @@ async function installController(
 			return false;
 		}),
 	);
-	const agentTools = new Map(
-		[...baseDefinitions].map(([name, definition]) => [name, toAgentTool(definition, () => latestContext)]),
-	);
+	const agentTools = new Map([...baseDefinitions].map(([name, definition]) => [name, toAgentTool(definition, () => latestContext)]));
 	const toolCapabilities = () => resolveToolCapabilities(
 		currentSettings, baseDefinitions.keys(), toolConflicts, executionRoutes(),
 		closedSearchEnabled() ? search?.profile?.invocations : undefined,
@@ -424,10 +413,7 @@ async function installController(
 	const visibleMetrics = (): SpeculativeActionMetrics => ({ ...currentMetrics, actorProcessReuse: processBackend.actorMetrics() });
 	function renderFooter(): void {
 		if (!ui) return;
-		ui.setStatus(
-			STATUS_KEY,
-			formatSpeculativeFooter(settings(), visibleMetrics(), executionRoutes(), toolConflicts.size),
-		);
+		ui.setStatus(STATUS_KEY, formatSpeculativeFooter(settings(), visibleMetrics(), executionRoutes(), toolConflicts.size));
 	}
 	const host = (dependencies.createHost ?? createSpeculativeActionHost)(sessionID, {
 		cwd: context.cwd,
@@ -575,9 +561,7 @@ async function installController(
 		previewActorCall: (tool: string, callID: string, input: unknown, signal?: AbortSignal) => {
 			const turnID = currentTurnID;
 			if (!turnID || !baseDefinitions.has(tool)) return;
-			void recoverSpeculation(() =>
-				host.previewActorCall({ turnID, id: callID, tool, args: input, tools: turnTools }, signal),
-			);
+			void recoverSpeculation(() => host.previewActorCall({ turnID, id: callID, tool, args: input, tools: turnTools }, signal));
 		},
 		previewActorTool: (tool: string, signal?: AbortSignal) => {
 			const turnID = currentTurnID;
@@ -716,9 +700,7 @@ function piShellEnvironment(context: ExtensionContext): Readonly<Record<string, 
 }
 
 function loadPiToolSettings(context: ExtensionContext): PiToolSettings {
-	const settings = SettingsManager.create(context.cwd, getAgentDir(), {
-		projectTrusted: context.isProjectTrusted(),
-	});
+	const settings = SettingsManager.create(context.cwd, getAgentDir(), { projectTrusted: context.isProjectTrusted() });
 	const shellPath = settings.getShellPath();
 	const shellCommandPrefix = settings.getShellCommandPrefix();
 	return {
@@ -991,10 +973,7 @@ function openSchedulingAndCache(ctx: ExtensionContext, controller: SpeculativeAc
 		for (const [label, operation] of [["Reclaim", "gc"], ["Clear", "clear"]] as const) actions.set(`${label} reusable command history`, async () => {
 			if (operation === "clear" && !(await ctx.ui.confirm("Clear reusable command history?", "Delete all reusable command results and file effects? This cannot be undone."))) return;
 			const report = await recoverSpeculation(() => controller.maintainExecutionStorage(operation));
-			ctx.ui.notify(
-				report?.text ?? "Reusable command history maintenance failed.",
-				report && !report.failed ? "info" : "warning",
-			);
+			ctx.ui.notify(report?.text ?? "Reusable command history maintenance failed.", report && !report.failed ? "info" : "warning");
 		});
 		return actions;
 	});
@@ -1222,11 +1201,7 @@ export function formatSpeculativeActionEvent(event: SpeculativeActionEvent<strin
 			parts.push(formatTaskTiming(event.timing));
 			break;
 		case "source_request":
-			parts.push(
-				event.request.request.source,
-				event.request.settlement.status,
-				formatDuration(event.request.durationMs),
-			);
+			parts.push(event.request.request.source, event.request.settlement.status, formatDuration(event.request.durationMs));
 			break;
 		case "operation_prediction":
 		case "prediction": {
@@ -1386,12 +1361,7 @@ function resolveToolCapabilities(
 				observe.state,
 				...(tool === "bash" && actorProcessReplay ? [processRouteCapability(actorProcessReplay.state)] : []),
 			]);
-			return [tool, {
-				predict: settings.tools.includes(tool) ? "on" : "off",
-				replay,
-				observe: observe.state,
-				fork: fork.state,
-			}];
+			return [tool, { predict: settings.tools.includes(tool) ? "on" : "off", replay, observe: observe.state, fork: fork.state }];
 		}),
 	);
 }
@@ -1408,10 +1378,7 @@ function toolPolicyCounts(
 	settings: EffectiveSpeculativeActionSettings,
 	registered: ReadonlySet<string>,
 ): { readonly enabled: number; readonly available: number } {
-	return {
-		enabled: predictionTools(settings, registered).length,
-		available: registered.size,
-	};
+	return { enabled: predictionTools(settings, registered).length, available: registered.size };
 }
 
 function bestCapabilityState(states: readonly ExecutionWorldHealthState[]): ExecutionWorldHealthState {
@@ -1419,9 +1386,7 @@ function bestCapabilityState(states: readonly ExecutionWorldHealthState[]): Exec
 }
 
 function processRouteCapability(state: ProcessRouteSnapshot["state"]): ExecutionWorldHealthState {
-	return state === "ready" || state === "degraded"
-		? "ready"
-		: state === "idle" || state === "probing" ? "registered" : "unavailable";
+	return state === "ready" || state === "degraded" ? "ready" : state === "idle" || state === "probing" ? "registered" : "unavailable";
 }
 
 function searchExecutionLabel(mode: string): string {

@@ -184,6 +184,7 @@ export interface SpeculativePlanSource<
 			readonly output: Output;
 		}[];
 		readonly signal: AbortSignal;
+		readonly reportDraftTokens?: (tokens: number) => void;
 	}) => MaybePromise<PlanUpdate | readonly PlanUpdate[] | undefined>;
 	/** Collect/filter execution feedback before a continuation consumes request capacity. */
 	readonly continueOn?: readonly ("execution_succeeded" | "actor_adopted")[] | ((input: {
