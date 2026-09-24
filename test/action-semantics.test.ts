@@ -81,7 +81,9 @@ describe("ActionSemanticsRegistry", () => {
 		const key = (timeout?: number, command = "npm test") => buildPiActionKey("bash", { command, ...(timeout === undefined ? {} : { timeout }) }, "/workspace")!;
 		const match = (speculative?: number, actor?: number) => actionKeyMatch(key(speculative), key(actor), [BASH_TIMEOUT_ACTION_KEY_PROJECTOR])?.kind;
 		expect([match(60, 120), match(60, undefined), match(120, 60), match(undefined, 60), match(undefined, undefined)]).toEqual(["projected", "projected", undefined, undefined, "exact"]);
-		expect(actionKeyMatch(key(60), key(120, "npm run build"), [BASH_TIMEOUT_ACTION_KEY_PROJECTOR])).toBeUndefined();
+		const operation = (identity: string) => buildActionKey({ ...key(), input: { operation: identity } });
+		for (const [left, right] of [[key(60), key(120, "npm run build")], [operation("launch"), operation("worker")]] as const)
+			expect(actionKeyMatch(left, right, [BASH_TIMEOUT_ACTION_KEY_PROJECTOR])).toBeUndefined();
 		const passed = { result: { content: [{ type: "text" as const, text: "pass" }], details: undefined }, isError: false }, failed = { ...passed, isError: true };
 		expect([passed, failed].map((output) => PI_BASH_TIMEOUT_PROJECTION_RULE.captureCoverage!(key(60), output))).toEqual([true, undefined]);
 		expect(await PI_BASH_TIMEOUT_PROJECTION_RULE.projectOutput!({ speculative: key(60), actor: key(120), output: passed, coverage: true,
