@@ -225,13 +225,16 @@ export function formatSpeculativeActionStatus(input: {
 			? [`Bash work reused inside speculative branches: ${formatProcessWorkReuse(metrics.processReuse)}`]
 			: []),
 		`Predictions: ${formatRatio(metrics.predictionsMatched, metrics.predictionsObserved)} matched; ${formatRatio(metrics.predictionsAdopted, metrics.predictionsMatched)} adopted; unobserved: ${metrics.predictionsSettled - metrics.predictionsObserved}`,
+		`Predictions by source (matched/observed, adopted): ${tallySummary(metrics.predictionsBySource, ([observed = 0, matched = 0, adopted = 0]) => `${matched}/${observed}, ${adopted}`)}`,
+		`Tool calls reused by tool: ${tallySummary(metrics.actorActionsByTool, ([actions = 0, reused = 0]) => `${reused}/${actions}`)}`,
+		...(metrics.lastSourceFailure ? [`Last prediction source failure: ${metrics.lastSourceFailure}`] : []),
 		`Prediction rejections after match: ${countSummary(metrics.predictionRejectedAfterMatch)}`,
 		`Actor candidate rejections: ${countSummary(metrics.actorCandidateRejections)}`,
 		`Candidates: ${metrics.candidateStarted} started; ${metrics.candidateSucceeded} succeeded; ${metrics.candidateFailed} failed; ${metrics.candidateCancelled} cancelled`,
 		metrics.tasks > 0
-			? `Task timing (${metrics.tasks} completed): ${formatTaskTiming(metrics)}. Estimated savings are optimistic, not a measured no-speculation comparison.`
+			? `Task timing (${metrics.tasks} completed): ${formatTaskTiming(metrics)}. Estimated savings are signed estimates against native history, not a measured no-speculation comparison.`
 			: "Task timing: n/a (no completed task); serialized overlap and speedup are not reported as 0.",
-		`Drafter tokens (input + output, every request): ${metrics.totalDraftTokens}`,
+		`Drafter tokens (input + output, every request): ${metrics.totalDraftTokens}${metrics.estimatedSavingsMs > 0 ? `; ${Math.round(metrics.totalDraftTokens * 1000 / metrics.estimatedSavingsMs)} per estimated second saved` : ""}`,
 		`Live speculative results: ${cache.resultEntries}/${cache.cacheCapacity}, ${formatBytes(cache.resultBytes)}/${formatBytes(cache.cacheByteCapacity ?? 0)}; cold: ${cache.cacheCold}; hot: ${cache.cacheHot}; jobs: ${cache.inFlightJobs}; branches: ${cache.branchEntries} (${formatBytes(cache.branchBytes)})`,
 	].join("\n");
 }
@@ -1565,6 +1568,10 @@ function capabilityTable(tools: ReadonlyMap<string, ToolCapabilityRow>): string 
 	const table = [["Tool", "Predict", "Replay", "Observe", "Fork"], ...rows];
 	const widths = table[0]!.map((_, column) => Math.max(...table.map((row) => row[column]!.length)));
 	return table.map((row) => row.map((cell, column) => cell.padEnd(widths[column]!)).join("  ").trimEnd()).join("\n");
+}
+
+function tallySummary(counts: Readonly<Record<string, readonly number[]>>, format: (counts: readonly number[]) => string): string {
+	return Object.entries(counts).map(([key, value]) => `${key} ${format(value)}`).join("; ") || "none";
 }
 
 function countSummary(counts: Readonly<Record<string, number>>): string {
