@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants, type BigIntStats, type Stats } from "node:fs";
 import { access, chmod, copyFile, type FileHandle, link, lstat, mkdir, mkdtemp, open, readdir, rename, rm, rmdir, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -208,10 +208,7 @@ function regularStructureTransitions(
 			paths.push(relativePath);
 			continue;
 		}
-		if (
-			(previous === undefined || previous.kind === "directory") &&
-			(current === undefined || current.kind === "directory")
-		) {
+		if ((previous === undefined || previous.kind === "directory") && (current === undefined || current.kind === "directory")) {
 			continue;
 		}
 		return { complete: false, reason: `unsupported_workspace_transition:${relativePath}` };
@@ -317,11 +314,7 @@ export class WorkspaceSandboxService {
 		return await forkSandboxWorkspaceFor(this.state, options);
 	}
 
-	async withWorkspace<T>(
-		cwd: string,
-		run: (workspace: SandboxWorkspaceContext) => Promise<T>,
-		gitBinary = "git",
-	): Promise<T> {
+	async withWorkspace<T>(cwd: string, run: (workspace: SandboxWorkspaceContext) => Promise<T>, gitBinary = "git"): Promise<T> {
 		assertWorkspaceSandboxOpen(this.state);
 		return await withPrivateSandboxWorkspace(this.state, cwd, gitBinary, "git", {}, run);
 	}
@@ -380,21 +373,14 @@ async function resolveWorkspaceDriver(
 		const resolved = treeEntries >= AUTO_OVERLAY_MIN_TREE_ENTRIES
 			? overlay
 			: { driver: "git", fingerprint: GIT_WORKSPACE_FINGERPRINT } as const;
-		repository.autoDriverDecision = {
-			commit,
-			capabilityFingerprint: capability.fingerprint,
-			resolved,
-		};
+		repository.autoDriverDecision = { commit, capabilityFingerprint: capability.fingerprint, resolved };
 		return resolved;
 	} finally {
 		if (ownedRepository) releaseSandboxRepository(ownedRepository);
 	}
 }
 
-function createWorkspaceSandboxFor(
-	state: WorkspaceSandboxState,
-	options: WorkspaceSandboxOptions,
-): SpeculativeAgentExecutionWorld {
+function createWorkspaceSandboxFor(state: WorkspaceSandboxState, options: WorkspaceSandboxOptions): SpeculativeAgentExecutionWorld {
 	// Generic mutation routes have no workspace root at fingerprint time. Their short, targeted
 	// branches retain Git unless OverlayFS was explicitly requested; Linux process routes can make
 	// the exact baseline-qualified auto decision from their invocation context.
@@ -726,14 +712,7 @@ async function forkSandboxWorkspaceFor(
 		parent,
 		preparation,
 	);
-	return workspaceBranch(
-		snapshot,
-		sourceRoot,
-		options.action,
-		state,
-		parent,
-		options.validate,
-	);
+	return workspaceBranch(snapshot, sourceRoot, options.action, state, parent, options.validate);
 }
 
 async function prepareSandboxWorkspaceFor(
@@ -756,10 +735,7 @@ async function prepareSandboxWorkspaceFor(
 		throwIfAborted(options.signal);
 		if (resolved.driver === "overlayfs") {
 			const overlay = await acquireOverlayBaseline(repository, baseline);
-			try {
-				throwIfAborted(options.signal);
-				await overlayBaselineStructure(overlay);
-			} finally {
+			try { throwIfAborted(options.signal); await overlayBaselineStructure(overlay); } finally {
 				releaseOverlayBaseline(overlay);
 			}
 		} else await ensurePreparedSandbox(repository, baseline, options.signal);
@@ -868,11 +844,7 @@ async function executeMutation(
 						await mkdir(await physical(target), { recursive: true });
 					}),
 				}, context);
-			} finally {
-				await lifetime.close(() => {});
-				if (failure) throw failure.error;
-				context.signal.throwIfAborted();
-			}
+			} finally { await lifetime.close(() => {}); if (failure) throw failure.error; context.signal.throwIfAborted(); }
 			for (const [key, change] of changes) {
 				if (change.kind === "directory" && !change.validationOnly) record(key, {
 					...change, after: await readSandboxDirectoryState(await physical(change.target)),
@@ -973,11 +945,7 @@ async function createPrivateSandboxWorkspace(
 			const transactionClockPath = path.join(prepared.processRoot, "workspace-transaction.clock");
 			openTransactionClock = () => {
 				const noFollow = typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0;
-				return open(
-					transactionClockPath,
-					fsConstants.O_WRONLY | fsConstants.O_CREAT | noFollow,
-					0o600,
-				);
+				return open(transactionClockPath, fsConstants.O_WRONLY | fsConstants.O_CREAT | noFollow, 0o600);
 			};
 			transactionClockLinks = 1;
 			transactionClockRoots = Object.freeze([prepared.sandboxRoot, prepared.processRoot]);
@@ -1030,10 +998,7 @@ async function createPrivateSandboxWorkspace(
 }
 
 async function createGitWorkspaceTransactionDriver(workspace: PrivateSandboxWorkspace): Promise<WorkspaceTransactionDriver> {
-	interface Capture {
-		contaminated: boolean;
-		readonly before?: WorkspaceStructureSnapshot;
-	}
+	interface Capture { contaminated: boolean; readonly before?: WorkspaceStructureSnapshot; }
 	const { pool: { git }, commit, sandboxRoot, openTransactionClock: openClock,
 		transactionClockLinks: expectedClockLinks, transactionClockRoots: clockRoots } = workspace;
 	let lastStructure = await workspace.structure.capture();
@@ -1185,10 +1150,7 @@ async function createGitWorkspaceTransactionDriver(workspace: PrivateSandboxWork
 	async function synchronizeFrontier(current: WorkspaceStructureSnapshot): Promise<void> {
 		const transitions = regularStructureTransitions(lastStructure, current);
 		lastStructure = current;
-		if (!transitions.complete) {
-			poisonReason = transitions.reason;
-			return;
-		}
+		if (!transitions.complete) { poisonReason = transitions.reason; return; }
 		await captureTransitions(transitions.paths, current, false);
 	}
 
@@ -1259,10 +1221,7 @@ async function acquireSandboxRepository(
 		if (state.repositories.get(key) === pending) state.repositories.delete(key);
 		return acquireSandboxRepository(state, sourceRoot, gitBinary);
 	}
-	if (repository.idleTimer) {
-		clearTimeout(repository.idleTimer);
-		repository.idleTimer = undefined;
-	}
+	if (repository.idleTimer) { clearTimeout(repository.idleTimer); repository.idleTimer = undefined; }
 	repository.active++;
 	return repository;
 }
@@ -1288,17 +1247,14 @@ async function createSandboxRepository(
 			gitBinary,
 			git,
 			index: bindGit(gitBinary, sourceRoot, ["--git-dir", repository, "--work-tree", sourceRoot]),
-			versions: new ResourceVersionManager(sourceRoot, { snapshotExcludes: SNAPSHOT_EXCLUDES }),
+			versions: new ResourceVersionManager(sourceRoot, { snapshotExcludes: SNAPSHOT_EXCLUDES, gitObjects: true }),
 			active: 0,
 			idleWaiters: new Set(),
 			lock: Promise.resolve(),
 			overlayBaselines: new Map(),
 			quarantined: false,
 		};
-	} catch (error) {
-		await rm(parent, { recursive: true, force: true });
-		throw error;
-	}
+	} catch (error) { await rm(parent, { recursive: true, force: true }); throw error; }
 }
 
 async function acquireSandboxBaseline(
@@ -1321,7 +1277,7 @@ async function acquireSandboxBaseline(
 				if (!version.expired && !paths.length) return baseline;
 			}
 		}
-		for (let attempt = 0; attempt < 3; attempt++) {
+		for (let attempt = 0, rebuild = false; attempt < 3; attempt++) {
 			// Preparation owns immutable bytes, not source freshness. Actual allocations capture exact
 			// evidence; borrowed process preparations validate their observed inputs and effects at adoption.
 			const version = await repository.versions.capture([{ path: repository.sourceRoot, scope: warmup ? "tree_entries" : "tree_content" }]);
@@ -1334,16 +1290,18 @@ async function acquireSandboxBaseline(
 						return relative;
 					});
 				});
-				// Events and Git stat data can both miss changes. A changed baseline owns a fresh index.
-				await repository.index(["read-tree", "--empty"]);
-				await repository.index(["add", "-f", "-A", "--", ...snapshotPathspecs()]);
+				// Events and Git stat data can both miss changes: a changed baseline stages the captured objects, or owns a fresh index.
+				if (rebuild || !baseline || !(await stageTreeObjects(repository, version))) {
+					await repository.index(["read-tree", "--empty"]);
+					await repository.index(["add", "-f", "-A", "--", ...snapshotPathspecs()]);
+				}
 				const tree = (await repository.index(["write-tree"])).toString("utf8").trim();
 				// Baselines are independent snapshots: a parent chain would keep every replaced copy reachable.
 				const commit = tree === baseline?.tree && JSON.stringify(aliases) === JSON.stringify(baseline.aliases) ? baseline.commit
 					: (await repository.git(["commit-tree", tree, "-m", "speculative baseline"], { environment: SANDBOX_AUTHOR_ENVIRONMENT })).toString("utf8").trim();
 				if (!warmup && (await repository.versions.validate(version)).expired) continue;
 				// An ABA during staging can restore captured source bytes after Git copied different bytes.
-				if (!warmup && (await sandboxIndexChanges(repository)).length) continue;
+				if (!warmup && (await sandboxIndexChanges(repository)).length) { rebuild = true; continue; }
 				if (commit !== baseline?.commit) await repository.git(["update-ref", "refs/heads/baseline", commit]);
 				if (commit !== baseline?.commit && Date.now() >= (repository.prunedAt ?? 0) + SANDBOX_PRUNE_INTERVAL_MS) {
 					repository.prunedAt = Date.now(); // The grace keeps objects that concurrent workspace staging has not referenced yet.
@@ -1360,23 +1318,52 @@ async function acquireSandboxBaseline(
 	});
 }
 
+/**
+ * Stage only what differs from the previous baseline's index, by the Git objects the exact capture hashed from the same bytes.
+ * Whatever `add -f -A` might stage otherwise (a gitlink, a Windows link, bytes that moved on since capture) rebuilds instead.
+ */
+async function stageTreeObjects(repository: PooledGitRepository, version: ResourceVersionToken): Promise<boolean> {
+	if (!version.treeObjects) return false;
+	const staged = new Map((await repository.index(["ls-files", "-s", "-z"])).toString("utf8").split("\0").flatMap((record) => {
+		const match = /^(\d{6}) ([0-9a-f]{40}) \d\t(.+)$/su.exec(record);
+		return match ? [[match[3]!, { mode: match[1]!, blob: match[2]! }] as const] : [];
+	}));
+	const desired = new Map<string, { readonly mode: string; readonly blob: string; readonly link?: string }>();
+	for (const [target, object] of version.treeObjects) {
+		const relative = relativeFilesystemPath(repository.sourceRoot, target), name = relative && slash(relative);
+		if (!name || isSnapshotExcluded(name)) continue;
+		if (object.link !== undefined && process.platform === "win32" || name.includes("\n")) return false;
+		desired.set(name, object.link !== undefined ? { mode: "120000", blob: gitBlobID(Buffer.from(object.link)), link: object.link }
+			: { mode: process.platform === "win32" ? staged.get(name)?.mode ?? "100644" : object.mode & 0o100 ? "100755" : "100644", blob: object.blob });
+	}
+	if ([...staged.values()].some((entry) => entry.mode === "160000")) return false;
+	const changed = [...desired].filter(([name, entry]) => staged.get(name)?.mode !== entry.mode || staged.get(name)?.blob !== entry.blob);
+	const files = changed.flatMap(([name, entry]) => entry.link === undefined ? [name] : []);
+	const written = files.length ? (await repository.index(["hash-object", "-w", "--no-filters", "--stdin-paths"], { input: Buffer.from(`${files.join("\n")}\n`) }))
+		.toString("utf8").trim().split("\n") : [];
+	if (written.some((blob, index) => blob !== desired.get(files[index]!)!.blob)) return false;
+	for (const [, { link }] of changed) if (link !== undefined) await repository.index(["hash-object", "-w", "--stdin"], { input: Buffer.from(link) });
+	const updates = [...changed.map(([name, entry]) => `${entry.mode} ${entry.blob}\t${name}\0`),
+		...[...staged.keys()].filter((name) => !desired.has(name)).map((name) => `0 ${"0".repeat(40)}\t${name}\0`)];
+	if (updates.length) await repository.index(["update-index", "-z", "--index-info"], { input: Buffer.from(updates.join("")) });
+	return true;
+}
+
+function gitBlobID(bytes: Buffer): string {
+	return createHash("sha1").update(`blob ${bytes.length}\0`).update(bytes).digest("hex");
+}
+
 async function ensurePreparedSandbox(repository: PooledGitRepository, baseline: NonNullable<PooledGitRepository["baseline"]>, signal?: AbortSignal): Promise<void> {
 	const { commit } = baseline;
 	const existing = repository.prepared;
-	if (existing?.commit === commit) {
-		await existing.workspace;
-		return;
-	}
+	if (existing?.commit === commit) { await existing.workspace; return; }
 	const stale = await takePreparedSandbox(repository);
 	await stale?.dispose();
 	throwIfAborted(signal);
 	const pending = repository.prepared ??= { commit, workspace: attachSandboxWorkspace(repository, baseline) };
 	try {
 		await pending.workspace;
-	} catch (error) {
-		if (repository.prepared === pending) repository.prepared = undefined;
-		throw error;
-	}
+	} catch (error) { if (repository.prepared === pending) repository.prepared = undefined; throw error; }
 }
 
 async function takePreparedSandbox(
@@ -2200,7 +2187,7 @@ function bindGit(
 	prefix: readonly string[] = [],
 ) {
 	const bound = [...prefix];
-	return (input: readonly string[], options: { cwd?: string; environment?: Readonly<Record<string, string>>; maxBuffer?: number } = {}): Promise<Buffer> => new Promise((resolve, reject) => {
+	return (input: readonly string[], options: { cwd?: string; environment?: Readonly<Record<string, string>>; maxBuffer?: number; input?: Buffer } = {}): Promise<Buffer> => new Promise((resolve, reject) => {
 		const args = [...bound, ...input];
 		execFile(
 			command,
@@ -2229,6 +2216,6 @@ function bindGit(
 				}
 				resolve(Buffer.from(stdout));
 			},
-		);
+		).stdin?.end(options.input);
 	});
 }

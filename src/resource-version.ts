@@ -35,14 +35,15 @@ export type ResourceVersionValidation = ResourceValidationMetrics & {
 	readonly changed?: readonly string[];
 };
 
-export type ResourceChangeSet = {
-	readonly uncertain: boolean;
-	readonly paths: ReadonlyArray<string>;
-};
+export type ResourceChangeSet = { readonly uncertain: boolean; readonly paths: ReadonlyArray<string>; };
+
+/** A captured tree entry as Git stages it: a regular file's object id, or a symbolic link's target. */
+export type TreeObject = { readonly mode: number; readonly blob: string; readonly link?: never } | { readonly mode: number; readonly link: string; readonly blob?: never };
 
 export type ResourceVersionToken = {
 	readonly root: string;
 	readonly physicalRoot: string;
+	readonly treeObjects?: ReadonlyMap<string, TreeObject>;
 	readonly observations: ReadonlyMap<string, ResourceObservation>;
 	readonly epoch: number;
 	readonly watching: boolean;
@@ -494,11 +495,7 @@ function resourceCovers(entry: CapturedResource | undefined, scope: ResourceDepe
 		(scope === "content" && entry.type === "file" && entry.content !== undefined));
 }
 
-type ResourceEvent = {
-	readonly epoch: number;
-	readonly path: string;
-	readonly type: "change" | "rename" | "unknown";
-};
+type ResourceEvent = { readonly epoch: number; readonly path: string; readonly type: "change" | "rename" | "unknown"; };
 
 const MAX_EVENT_HISTORY = 4096;
 
@@ -513,15 +510,19 @@ export class ResourceVersionManager {
 	private open = true;
 	readonly root: string;
 	private readonly snapshotExcludes: ReadonlySet<string>;
+	private readonly gitObjects: boolean;
 	private readonly onIdle?: () => void;
 
 	constructor(root: string, options: {
 		readonly watch?: boolean; readonly onIdle?: () => void;
 		/** Private snapshot entries only; filtered tokens cannot authorize input views or host execution windows. */
 		readonly snapshotExcludes?: readonly string[];
+		/** Tree captures also name each file's Git object, from the same bytes their fingerprint read. */
+		readonly gitObjects?: boolean;
 	} = {}) {
 		this.root = root;
 		this.snapshotExcludes = new Set(options.snapshotExcludes);
+		this.gitObjects = options.gitObjects === true;
 		this.onIdle = options.onIdle;
 		if (options.watch === false) this.ready = Promise.resolve();
 	}
@@ -574,6 +575,7 @@ export class ResourceVersionManager {
 		if (!this.open) throw new Error("resource_version_manager_closed");
 		if (this.snapshotExcludes.size && retainBytes !== undefined) throw new Error("resource_filtered_snapshot_not_readable");
 		const observations = new Map<string, ResourceDependency & { fingerprint: string; stamp?: string }>();
+		const treeObjects = this.gitObjects && dependencies?.some((dependency) => dependency.scope === "tree_content") ? new Map<string, TreeObject>() : undefined;
 		let precise: ReturnType<ResourceVersionManager["acquirePreciseWatches"]> | undefined;
 		this.references++;
 		let view: ResourceReadView | undefined;
@@ -594,7 +596,7 @@ export class ResourceVersionManager {
 				if (!normalized.length) return;
 				if (observing && this.reliable) precise = this.acquirePreciseWatches(normalized);
 				for (const observation of await fingerprintDependencies(normalized, physicalRoot, this.snapshotExcludes, view,
-					observing && !this.snapshotExcludes.size ? { root: this.root, observations } : undefined, providedInputs)) observations.set(dependencyKey(observation), observation);
+					observing && !this.snapshotExcludes.size ? { root: this.root, observations } : undefined, providedInputs, treeObjects)) observations.set(dependencyKey(observation), observation);
 			};
 			const boundary = { path: this.root, scope: "resolution" as const }, boundaryKey = dependencyKey(boundary);
 			view = retainBytes === undefined ? undefined : new ResourceReadView(retainBytes, dependencies ? undefined : (dependency) => capture([dependency]),
@@ -617,12 +619,9 @@ export class ResourceVersionManager {
 			return {
 				root: this.root, physicalRoot, observations, epoch: this.epoch,
 				watching: Boolean(observing && this.reliable), preciseContent: Object.freeze(precise?.paths ?? []),
-				manager: this, ...(retained ? { view: retained, inputView: new WeakRef(retained) } : {}), release,
+				manager: this, ...(retained ? { view: retained, inputView: new WeakRef(retained) } : {}), ...(treeObjects ? { treeObjects } : {}), release,
 			};
-		} catch (error) {
-			await release();
-			throw error;
-		}
+		} catch (error) { await release(); throw error; }
 	}
 
 	/** Adoption waits on these few checks, so their I/O never queues behind a whole-tree scan's waiters. */
@@ -709,11 +708,7 @@ export class ResourceVersionManager {
 		)) {
 			const key = filesystemPathKey(target);
 			const existing = this.preciseWatches.get(key);
-			if (existing) {
-				existing.references++;
-				paths.push(target);
-				continue;
-			}
+			if (existing) { existing.references++; paths.push(target); continue; }
 			try {
 				const watcher = watch(target, (event) => this.changed(target, event));
 				watcher.on("error", () => { this.reliable = false; this.changed(target, "unknown"); });
@@ -743,11 +738,7 @@ export class ResourceVersionManager {
 
 const managers = new Map<string, ResourceVersionManager>();
 
-export function resourceDependencies(
-	action: ActionKey,
-	root: string,
-	actionSemantics: ActionSemanticsRegistry = PI_ACTION_SEMANTICS,
-) {
+export function resourceDependencies(action: ActionKey, root: string, actionSemantics: ActionSemanticsRegistry = PI_ACTION_SEMANTICS) {
 	const definition = actionSemantics.definition(action);
 	const scope = definition ? definition.resourceScope : "content";
 	if (scope === undefined || scope === "captured_inputs") return [];
@@ -835,10 +826,7 @@ export function isResourceVersionToken(value: unknown): value is ResourceVersion
 	);
 }
 
-export function closeResourceVersionManagers() {
-	for (const manager of managers.values()) manager.close();
-	managers.clear();
-}
+export function closeResourceVersionManagers() { for (const manager of managers.values()) manager.close(); managers.clear(); }
 
 function normalizeDependencies(root: string, dependencies: ReadonlyArray<ResourceDependency>) {
 	const result = new Map<string, ResourceDependency>();
@@ -872,12 +860,7 @@ function affects(dependency: ResourceDependency, event: ResourceEvent, preciseCo
 	return true;
 }
 
-type FingerprintResult = {
-	readonly value: unknown;
-	readonly stamp: string;
-	readonly bytesRead: number;
-	readonly filesRead: number;
-};
+type FingerprintResult = { readonly value: unknown; readonly stamp: string; readonly bytesRead: number; readonly filesRead: number; };
 
 function fingerprintFile(content: StableFilesystemCapture) {
 	return { value: { type: "file", mode: Number(content.stat.mode), size: content.bytesRead, hash: content.hash,
@@ -898,8 +881,9 @@ async function fingerprintDependencies(
 	dependencies: ReadonlyArray<ResourceDependency>, realRoot: string, excludes: ReadonlySet<string>, view?: ResourceReadView,
 	bindings?: { readonly root: string; readonly observations: Map<string, ResourceDependency & { fingerprint: string; stamp?: string }> },
 	providedInputs?: ReadonlyMap<string, ResourceInput>,
+	treeObjects?: Map<string, TreeObject>,
 ) {
-	const files = new Map<string, Promise<FingerprintResult>>(), nearestExisting = missingResourceResolver(realRoot);
+	const files = new Map<string, Promise<FingerprintResult & { readonly blob?: string }>>(), nearestExisting = missingResourceResolver(realRoot);
 	const aliases = new Map<string, Map<string, { paths: Set<string>; links: number }>>();
 	const entries = new Map<string, ReturnType<typeof captureFilesystemEntry>>();
 	const capture = (target: string) => {
@@ -987,6 +971,7 @@ async function fingerprintDependencies(
 			});
 			const followed = source === undefined ? undefined : await fingerprintPath(source, scope, dependency, new Set(ancestors).add(identity), descend);
 			view?.capture(target, { type: "alias", target: source && filesystemPathKey(source), link: link!, realPath: realTarget, dependency });
+			if (scope === "tree_content") treeObjects?.set(target, { mode: Number(info.mode), link: link! });
 			return {
 				value: { type: "symlink", link, mode: Number(info.mode), resolved: identity, target: followed?.value },
 				stamp: digest(["symlink", link, statStamp(info), links, followed?.stamp]),
@@ -1001,7 +986,12 @@ async function fingerprintDependencies(
 		}
 		if (info.isFile()) {
 			const key = JSON.stringify([filesystemPathKey(target), identity, statStamp(info), String(info.uid), String(info.gid)]), existing = files.get(key);
-			if (existing) return { ...await existing, bytesRead: 0, filesRead: 0 };
+			const staged = async (result: Promise<FingerprintResult & { readonly blob?: string }>) => {
+				const { blob, ...fingerprint } = await result;
+				if (blob) treeObjects?.set(target, { mode: Number(info.mode), blob });
+				return fingerprint;
+			};
+			if (existing) return { ...await staged(existing), bytesRead: 0, filesRead: 0 };
 			const pending = (async () => {
 				// Join only concurrent reads of this identity; settled captures never authorize a later read.
 				const provided = supplied instanceof Uint8Array ? supplied : undefined;
@@ -1011,7 +1001,7 @@ async function fingerprintDependencies(
 				// Supplied bytes own data, never a host observation window; adoption validates them exactly.
 				const content: StableFilesystemCapture = bytes ? { content: bytes, bytesRead: bytes.length, hash: hash("sha256", bytes), stat: info, realPath: realTarget }
 					: await fingerprintIO(() => captureStableFile(target, retain ? Number(info.size) : undefined, retain, {
-						stat: info, realPath: realTarget, retainObject: retain && view!.canRetainObject }));
+						stat: info, realPath: realTarget, retainObject: retain && view!.canRetainObject, gitBlob: scope === "tree_content" && treeObjects !== undefined }));
 				assertInside(realRoot, content.realPath);
 				view?.capture(target, { type: "file", content: content.content,
 					object: content.object ?? (bytes && retain && view!.canRetainObject ? null : undefined),
@@ -1020,10 +1010,11 @@ async function fingerprintDependencies(
 					...fingerprintFile(content),
 					bytesRead: bytes || content.shared ? 0 : content.bytesRead,
 					filesRead: bytes || content.shared ? 0 : 1,
+					...(content.blob ? { blob: content.blob } : {}),
 				};
 			})().finally(() => files.delete(key));
 			files.set(key, pending);
-			return pending;
+			return staged(pending);
 		}
 		if (!info.isDirectory() || scope === "content") {
 			throw new Error(`unsupported_resource_type:${specialFileType(info)}:${target}`);
@@ -1065,10 +1056,7 @@ async function fingerprintBinding(dependency: ResourceDependency) {
 	try {
 		const { info, link } = await fingerprintIO(() => captureFilesystemEntry(dependency.path, "identity"));
 		stamp = digest([statStamp(info), link]);
-	} catch (error) {
-		if (!missingResource(error)) throw error;
-		stamp = errorCode(error);
-	}
+	} catch (error) { if (!missingResource(error)) throw error; stamp = errorCode(error); }
 	return { ...dependency, fingerprint: "binding", stamp, bytesRead: 0, filesRead: 0 };
 }
 
@@ -1170,10 +1158,7 @@ function errorCode(error: unknown) {
 	return error && typeof error === "object" && "code" in error ? String(error.code) : "unknown";
 }
 
-function missingResource(error: unknown): boolean {
-	const code = errorCode(error);
-	return code === "ENOENT" || code === "ENOTDIR";
-}
+function missingResource(error: unknown): boolean { const code = errorCode(error); return code === "ENOENT" || code === "ENOTDIR"; }
 
 function releaseOnce<Result>(release: () => Result): () => Result | undefined {
 	let released = false;
@@ -1189,10 +1174,6 @@ export const fingerprintIO = (() => {
 		if (active < FILESYSTEM_CONCURRENCY) active++;
 		else await new Promise<void>((resolve) => (priorityIO.getStore() ? priority : waiting).push(resolve));
 		try { return await task(); }
-		finally {
-			const next = priority.shift() ?? waiting.shift();
-			if (next) next();
-			else active--;
-		}
+		finally { const next = priority.shift() ?? waiting.shift(); if (next) next(); else active--; }
 	};
 })();

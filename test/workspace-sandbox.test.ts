@@ -1084,6 +1084,24 @@ describe("workspace-branch ExecutionWorld", () => {
 		} finally { captures.mockRestore(); validations.mockRestore(); }
 	});
 
+	it("stages a changed baseline from its captured objects, and rebuilds when bytes moved on after capture", async () => {
+		const root = await temporaryRoot();
+		await mkdir(path.join(root, "sub")); await writeFile(path.join(root, "a.txt"), "a\n"); await writeFile(path.join(root, "sub", "b.txt"), "b\n");
+		const snapshot = () => sandbox.withWorkspace(root, async ({ sandboxRoot }) => Promise.all(["a.txt", "sub/b.txt", "d.txt"]
+			.map((name) => readFile(path.join(sandboxRoot, name), "utf8").catch(() => null))));
+		expect(await snapshot()).toEqual(["a\n", "b\n", null]);
+		await writeFile(path.join(root, "a.txt"), "a2\n"); await rm(path.join(root, "sub", "b.txt")); await writeFile(path.join(root, "d.txt"), "d\n");
+		expect(await snapshot()).toEqual(["a2\n", null, "d\n"]);
+		const capture = ResourceVersionManager.prototype.capture;
+		const captures = vi.spyOn(ResourceVersionManager.prototype, "capture").mockImplementationOnce(async function (this: ResourceVersionManager, ...args) {
+			const token = await capture.apply(this, args); await writeFile(path.join(root, "a.txt"), "a3\n"); return token;
+		});
+		try {
+			await writeFile(path.join(root, "d.txt"), "d2\n");
+			expect(await snapshot()).toEqual(["a3\n", null, "d2\n"]);
+		} finally { captures.mockRestore(); }
+	});
+
 	it("retires a stale prepared workspace once across competing warm-ups", async () => {
 		const root = await temporaryRoot(), gate = gated();
 		const observations = vi.spyOn(ResourceVersionManager.prototype, "capture"), pending: Promise<unknown>[] = [];
