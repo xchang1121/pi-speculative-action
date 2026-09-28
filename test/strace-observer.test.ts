@@ -51,6 +51,15 @@ describe("strace provenance decoder", () => {
 				await fs.writeFile(`${prefix}.100`, ['execve("/usr/bin/git", ["git", "status"], 0x0) = 0', lock, `+++ exited with ${exit} +++`].join("\n"));
 				expect((await observeStrace(prefix, "/usr/bin/git", "/work")).taints.includes("confinement_observation"), `exit ${exit}`).toBe(tainted);
 			}
+			// Runtime start-up (libuv): capabilities, io_uring, stdio probes and flags on its own pipe reveal nothing of the host.
+			await fs.writeFile(`${prefix}.100`, ['execve("/usr/bin/node", ["node", "-p", "1"], 0x0) = 0', "pipe2([3<pipe:[5]>, 4<pipe:[5]>], O_CLOEXEC) = 0",
+				"capget({version=_LINUX_CAPABILITY_VERSION_3, pid=100}, {effective=0, permitted=0, inheritable=0}) = 0",
+				"io_uring_setup(256, {flags=IORING_SETUP_NO_SQARRAY}) = -1 EPERM (Operation not permitted)", "fcntl(0</dev/null<char 1:3>>, F_GETFL) = 0x8000 (flags O_RDONLY)",
+				'getsockopt(1<UNIX-STREAM:[21->20,"/out/1"]>, SOL_SOCKET, SO_TYPE, [1], [4]) = 0', "fcntl(3<pipe:[5]>, F_SETFL, O_RDONLY|O_NONBLOCK) = 0",
+				"+++ exited with 0 +++"].join("\n"));
+			const runtime = (outputEndpoints?: readonly string[]) => observeStrace(prefix, "/usr/bin/node", "/work", outputEndpoints ? { outputEndpoints } : {});
+			expect((await runtime(["socket:[21]"])).taints).toEqual(["clock", "random"]);
+			expect((await runtime()).taints).toContain("network");
 			// ls -l asks an NSS cache first: a refused local socket is only a path the Actor's host must lack too.
 			const nss = ["socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0) = 3<UNIX-STREAM:[9]>",
 				'connect(3<UNIX-STREAM:[9]>, {sa_family=AF_UNIX, sun_path="/var/run/nscd/socket"}, 110) = -1 EACCES (Permission denied)'];

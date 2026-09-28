@@ -11,11 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runThinkThreadTool } from "../src/thinkthread/tool-runner.ts";
 import { ActionSemanticsRegistry, buildPiActionKey } from "../src/action-semantics.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
-import {
-	effectCapabilitiesCover,
-	UNRESTRICTED_PROCESS_EFFECTS,
-	WORKSPACE_PATH_MUTATION_EFFECTS,
-} from "../src/effect-model.ts";
+import { effectCapabilitiesCover, UNRESTRICTED_PROCESS_EFFECTS, WORKSPACE_PATH_MUTATION_EFFECTS } from "../src/effect-model.ts";
 import type { ToolInvocation, ToolSettlement } from "../src/tool-settlement.ts";
 import { LinuxOverlayfsCapabilityRegistry, linuxOverlayfsCapability } from "../src/linux-overlayfs.ts";
 import { advanceFilesystemClock, captureStableFile } from "../src/filesystem-evidence.ts";
@@ -24,11 +20,7 @@ import { deferredWorkspaceTransactionDriver } from "../src/workspace-transaction
 import { ResourceVersionManager } from "../src/resource-version.ts";
 import { isPoisonedEffectCommit } from "../src/effect-transaction.ts";
 import { ToolExecutionGateway } from "../src/tool-execution-gateway.ts";
-import {
-	readSandboxDirectoryState,
-	WorkspaceSandboxService,
-	type SandboxFileChange,
-} from "../src/workspace-sandbox.ts";
+import { readSandboxDirectoryState, WorkspaceSandboxService, type SandboxFileChange } from "../src/workspace-sandbox.ts";
 
 const writeTool = createWriteTool(process.cwd());
 const editTool = createEditTool(process.cwd());
@@ -42,10 +34,7 @@ vi.mock("node:fs/promises", async (original) => {
 });
 const fs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
 
-afterEach(async () => {
-	try { await sandbox.dispose(); }
-	finally { await disposeRoots(); }
-});
+afterEach(async () => { try { await sandbox.dispose(); } finally { await disposeRoots(); } });
 
 describe("workspace-branch ExecutionWorld", () => {
 	it("shares write/edit contents with aliases and speculative descendant checkpoints", async () => {
@@ -171,10 +160,7 @@ describe("workspace-branch ExecutionWorld", () => {
 
 	it.each(["external", "factory"])("joins one driver cleanup after %s retirement during construction", async (retirement) => {
 		const gate = gated(), begin = vi.fn(), dispose = vi.fn(gate.wait);
-		const create = vi.fn(async () => {
-			if (retirement === "factory") void owner.dispose();
-			return { begin, dispose };
-		});
+		const create = vi.fn(async () => { if (retirement === "factory") void owner.dispose(); return { begin, dispose }; });
 		const owner = deferredWorkspaceTransactionDriver(create);
 		const waiting = Promise.allSettled([owner.begin(), owner.begin()]);
 		if (retirement === "external") void owner.dispose();
@@ -860,10 +846,7 @@ describe("workspace-branch ExecutionWorld", () => {
 				expect((await observer.readFile()).toString(), fault).toBe(expected);
 				expect(await readFile(target, "utf8"), fault).toBe(expected);
 				if (fault === "hardlink") expect(await readFile(path.join(root, "alias.txt"), "utf8")).toBe("after");
-			} finally {
-				vi.restoreAllMocks(); await observer.close(); await gateway.dispose();
-				await chmod(target, 0o644);
-			}
+			} finally { vi.restoreAllMocks(); await observer.close(); await gateway.dispose(); await chmod(target, 0o644); }
 		}
 	});
 
@@ -971,10 +954,7 @@ describe("workspace-branch ExecutionWorld", () => {
 		let executions = 0;
 		const countingTool = {
 			...writeTool,
-			execute: async (...args: Parameters<typeof writeTool.execute>) => {
-				executions++;
-				return writeTool.execute(...args);
-			},
+			execute: async (...args: Parameters<typeof writeTool.execute>) => { executions++; return writeTool.execute(...args); },
 		};
 		const execute = (args: { path: string; content: string }) => route === "native"
 			? sandbox.createExecutionWorld().speculation.execute(context(root, "write", countingTool, args))
@@ -1293,10 +1273,7 @@ describe("workspace-branch ExecutionWorld", () => {
 				await vi.runAllTimersAsync();
 				await assertion;
 			}
-		} finally {
-			wallClock.mockRestore();
-			vi.useRealTimers();
-		}
+		} finally { wallClock.mockRestore(); vi.useRealTimers(); }
 	});
 
 	it("marks unsupported inode transitions incomplete without undoing the operation", async ({ skip }) => {

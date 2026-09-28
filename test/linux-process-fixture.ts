@@ -7,10 +7,7 @@ import { deferred } from "./async.ts";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { createBashTool, createLocalBashOperations } from "@earendil-works/pi-coding-agent";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
-import {
-	LinuxProcessReuseBackend,
-	type LinuxProcessReuseMetrics,
-} from "../src/linux-process-backend.ts";
+import { LinuxProcessReuseBackend, type LinuxProcessReuseMetrics } from "../src/linux-process-backend.ts";
 import { createLinuxProcessExecutionWorld } from "../src/linux-process-world.ts";
 import { PI_OPERATION_TOOLS, resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { adaptProcessToolOperations, ProcessExecutionCoordinator } from "../src/process-execution.ts";
@@ -142,11 +139,7 @@ export async function prepareLinuxProcessReuse(
 		: undefined;
 	await fixture.world.speculation.prepare?.({ cwd: fixture.workspace });
 	const backendFingerprint = await fixture.backend.fingerprint();
-	return {
-		executionFingerprint: workspaceFingerprint
-			? `${backendFingerprint}:${workspaceFingerprint}`
-			: backendFingerprint,
-	};
+	return { executionFingerprint: workspaceFingerprint ? `${backendFingerprint}:${workspaceFingerprint}` : backendFingerprint };
 }
 
 export interface ReusableBashInput {
@@ -187,19 +180,11 @@ export async function compileBenchmarkHelper(
 	workspace: string,
 	input: { readonly source: string; readonly output: string; readonly arguments?: readonly string[] },
 ): Promise<void> {
-	await commandOutput(
-		"cc",
-		["-O2", "-Wall", "-Wextra", ...(input.arguments ?? []), "-o", input.output, input.source],
-		workspace,
-	);
+	await commandOutput("cc", ["-O2", "-Wall", "-Wextra", ...(input.arguments ?? []), "-o", input.output, input.source], workspace);
 	await access(path.join(workspace, input.output));
 }
 
-export async function commitBenchmarkFixture(
-	workspace: string,
-	name: string,
-	paths: readonly string[] = ["."],
-): Promise<void> {
+export async function commitBenchmarkFixture(workspace: string, name: string, paths: readonly string[] = ["."]): Promise<void> {
 	await commandOutput("git", ["init", "--quiet"], workspace);
 	await commandOutput("git", ["config", "user.name", name], workspace);
 	await commandOutput("git", ["config", "user.email", "benchmark@localhost"], workspace);

@@ -67,6 +67,8 @@ export interface StraceObservationOptions {
 	/** Exact kernel entry/cookie images served by the existing syscall broker. */
 	readonly inheritedDirectoryImages?: readonly string[];
 	readonly inheritedStreams?: readonly string[];
+	/** The capture sockets serving the traced command's output (`socket:[inode]`): naming them reveals no outside peer. */
+	readonly outputEndpoints?: readonly string[];
 	readonly inheritedHandles?: readonly { readonly fd: number; readonly installed?: false; readonly description?: number; readonly inode: string; readonly flags: number; readonly outside: number; readonly queuedBytes?: number; readonly queueData?: Buffer; readonly packet?: boolean; readonly messages?: readonly import("./linux-held-exec.ts").QueueMessage[] }[];
 }
 
@@ -598,7 +600,7 @@ export async function observeStrace(
 	const images = new Map<number, string>(); // Each process's program, inherited across a fork until it execs.
 	const statFields = new Map<number, readonly FilesystemObservationField[] | undefined>();
 	const opened = new Map<number, Set<number>>(); // Descriptors a process opened itself, whose status flags it chose.
-	const refusedIndexLocks = new Set<number>();
+	const refusedIndexLocks = new Set<number>(), ownPipes = new Set<string>(); // Pipes the traced processes created, by inode.
 	const { journal: resourceJournal, handled: streamCalls, retained, finalHandles } = options.inheritedHandles?.length || options.inheritedStreams?.length
 		? resourceTransitions(selected, root.file.pid, options) : { journal: [], handled: new Set<TraceLine>(), retained: [], finalHandles: [] };
 	const interposedExecutables = new Map((options.interposedExecutables ?? []).map(([intercepted, original]) => [path.posix.resolve(intercepted), path.posix.resolve(original)]));
@@ -625,8 +627,12 @@ export async function observeStrace(
 			if (spawned && images.has(pid)) { images.set(spawned, images.get(pid)!); statFields.set(spawned, statFields.get(pid)); }
 			if (spawned) opened.set(spawned, new Set(opened.get(pid)));
 			const own = opened.get(pid) ?? opened.set(pid, new Set()).get(pid)!, result = Number.parseInt(line.result ?? "", 10);
+			// Files and pipes the traced processes created stay private to them, through duplication and inheritance.
 			if (/^(?:open|openat|openat2|creat)$/.test(line.name) && Number.isSafeInteger(result) && result >= 0) own.add(result);
-			else if (line.name === "close") own.delete(Number.parseInt(line.args[0] ?? "", 10));
+			else if (/^pipe2?$/.test(line.name) && result === 0) for (const pipe of (line.args[0] ?? "").matchAll(/<pipe:\[(\d+)\]>/g)) ownPipes.add(pipe[1]!);
+			else if (/^dup[23]?$|^fcntl(?:64)?$/.test(line.name) && (line.name.startsWith("dup") || /^F_DUPFD/.test(line.args[1] ?? "")) && Number.isSafeInteger(result) && result >= 0) {
+				if (own.has(Number.parseInt(line.args[0] ?? "", 10))) own.add(result); else own.delete(result);
+			} else if (line.name === "close") own.delete(Number.parseInt(line.args[0] ?? "", 10));
 			if (line.failure) { complete = false; incompleteReasons.add(line.failure); continue; }
 			const syscall = line.name;
 			if (!syscall) continue;
@@ -645,7 +651,9 @@ export async function observeStrace(
 			// pathname dependency, validated absent where the Actor runs.
 			const refused = syscall === "connect" && /^-1 (?:ENOENT|ECONNREFUSED|EACCES)\b/.test(line.result) ? /\bsun_path="(\/[^"]+)"/.exec(line.args[1] ?? "")?.[1] : undefined;
 			if (refused) { if (!paths.has(refused)) paths.set(refused, "input"); continue; }
-			if (NETWORK_SYSCALLS.has(syscall) && !nonSocketQuery(line) && !streamCall && !(syscall === "socket" && /^AF_UNIX\b/.test(line.args[0] ?? ""))) taints.add("network");
+			const output = !!options.outputEndpoints?.includes(`socket:[${/^\d+<UNIX-STREAM:\[(\d+)/.exec(line.args[0] ?? "")?.[1]}]`);
+			const outputQuery = output && /^(?:getsockname|getpeername|getsockopt)$/.test(syscall);
+			if (NETWORK_SYSCALLS.has(syscall) && !nonSocketQuery(line) && !streamCall && !outputQuery && !(syscall === "socket" && /^AF_UNIX\b/.test(line.args[0] ?? ""))) taints.add("network");
 			if (IPC_SYSCALLS.has(syscall)) taints.add("ipc");
 			// Descriptor-local state is internal; reproduced OFD flags are sealed with their final offsets.
 			// Locks, leases, async notifications and owners require additional effect evidence.
@@ -655,9 +663,11 @@ export async function observeStrace(
 				if (/^F_(?:OFD_)?(?:GETLK|SETLK|SETLKW)(?:64)?$/.test(command)) { if (!streamCall) taints.add("ipc"); }
 				else if (!/^F_(?:GETFD|SETFD|DUPFD|DUPFD_CLOEXEC)$/.test(command) &&
 					// A descriptor this process opened reports the flags it chose; an inherited one's flags need evidence.
-					!(command === "F_GETFL" && own.has(Number.parseInt(line.args[0] ?? "", 10))) && !((command === "F_GETFL" || command === "F_SETFL" && syscallSucceeded(line) &&
+					// Standard streams' status flags are part of the pinned execution context.
+					!(command === "F_GETFL" && (own.has(Number.parseInt(line.args[0] ?? "", 10)) || /^[012]</.test(line.args[0] ?? ""))) && !((command === "F_GETFL" || command === "F_SETFL" && syscallSucceeded(line) &&
 						(line.args[2] ?? "").split("|").every(flag => /^(?:O_(?:RDONLY|WRONLY|RDWR|APPEND|NONBLOCK|NDELAY|LARGEFILE|DIRECTORY|DSYNC|SYNC|NOFOLLOW)|0)$/.test(flag))) &&
-						(options.inheritedFileImages?.includes(absoluteDescriptorPath(line.args[0]) ?? /^\d+<(pipe:\[\d+\])>$/.exec(line.args[0] ?? "")?.[1] ?? "") || stream)))
+						(options.inheritedFileImages?.includes(absoluteDescriptorPath(line.args[0]) ?? /^\d+<(pipe:\[\d+\])>$/.exec(line.args[0] ?? "")?.[1] ?? "") || stream || output ||
+							own.has(Number.parseInt(line.args[0] ?? "", 10)) || ownPipes.has(/^\d+<pipe:\[(\d+)\]>$/.exec(line.args[0] ?? "")?.[1] ?? ""))))
 					taints.add("unsupported_syscall");
 			}
 			// git refreshes its index's stat cache when it can, and reports the same without it (the repository is read-only
@@ -665,7 +675,11 @@ export async function observeStrace(
 			if (images.get(pid) === "git" && /^open(?:at)?$/.test(syscall) && /\/index\.lock"?$/.test(quotedStrings(line).at(-1) ?? "") && confinementDenied(line)) {
 				refusedIndexLocks.add(pid); continue;
 			}
-			if (CONFINEMENT_SENSITIVE_SYSCALLS.has(syscall) || prctlConfinementSensitive(line, syscall) || confinementDenied(line) || processLimitDenied(line, syscall)) {
+			// An unprivileged process holds no capabilities, sandboxed or not (the observer runs as the Actor's user).
+			const noCapabilities = syscall === "capget" && process.getuid?.() !== 0 && /\{effective=0, permitted=0, inheritable=0\}\) = 0$/.test(`${line.args.join(", ")}) = ${line.result}`);
+			// A refused io_uring leaves libuv on epoll and its thread pool: the same results, every file call traced.
+			if (syscall === "io_uring_setup" && /^-1 EPERM\b/.test(line.result)) continue;
+			if (!noCapabilities && (CONFINEMENT_SENSITIVE_SYSCALLS.has(syscall) || prctlConfinementSensitive(line, syscall) || confinementDenied(line) || processLimitDenied(line, syscall))) {
 				taints.add("confinement_observation");
 			}
 			if (

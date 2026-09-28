@@ -286,11 +286,7 @@ describe("PlanRuntime", () => {
 		const actor = { id: "actor", sequence: 99, decisionSequence: 7, turnID: "turn" } as const;
 		const opportunity = plan.claimMatch("plan", "critical", actor, { kind: "exact", distance: 0 })!;
 		plan.confirm(opportunity, actor, { status: "adopted", candidateID: "candidate" });
-		expect(plan.get("plan", "child")).toMatchObject({
-			earliestDecisionSeq: 8,
-			expectedDecisionSeq: 8,
-			latestDecisionSeq: 9,
-		});
+		expect(plan.get("plan", "child")).toMatchObject({ earliestDecisionSeq: 8, expectedDecisionSeq: 8, latestDecisionSeq: 9 });
 		expect(plan.get("plan", "leaf")).toMatchObject({ earliestDecisionSeq: 9, expectedDecisionSeq: 9, latestDecisionSeq: 12, criticalPathMs: 1 });
 		const revisedChild = { ...child, horizon: 2, latestHorizon: 4, expectedDurationMs: 3.5 };
 		expect(plan.apply({ proposalID: "plan", source: "source", revision: 3, upsert: [revisedChild] }, 4))
@@ -361,12 +357,7 @@ describe("PlanRuntime", () => {
 		const relation = { kind: "exact", distance: 0 } as const;
 		const original = plan.claimMatch("plan", "target", actor, relation)!;
 		const update = plan.apply(
-			{
-				proposalID: "plan",
-				source: "source",
-				revision: 2,
-				upsert: [action(root, { input: { path: "new.ts" } })],
-			},
+			{ proposalID: "plan", source: "source", revision: 2, upsert: [action(root, { input: { path: "new.ts" } })] },
 			1,
 		);
 
@@ -403,15 +394,6 @@ function proposal(actions: readonly PlanAction[]): PlanProposal {
 	return { id: "plan", source: "source", revision: 1, actions };
 }
 
-function action(
-	id: string,
-	options: Partial<Omit<PlanAction, "id" | "type" | "tool">> = {},
-): PlanAction {
-	return {
-		id,
-		type: "tool_call",
-		tool: "read",
-		...options,
-		input: options.input ?? { path: `${id}.ts` },
-	};
+function action(id: string, options: Partial<Omit<PlanAction, "id" | "type" | "tool">> = {}): PlanAction {
+	return { id, type: "tool_call", tool: "read", ...options, input: options.input ?? { path: `${id}.ts` } };
 }
