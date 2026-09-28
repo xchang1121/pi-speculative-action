@@ -100,6 +100,7 @@ describe("strace provenance decoder", () => {
 			expect(observation, name).toMatchObject({ complete: true, taints: ["clock", "random"], incompleteReasons: [] });
 			expect(observation.paths, name).toContainEqual({ path: target, role: "metadata", followSymlinks: true, digest: STAT_DIGEST });
 		}
+		expect((await observe({ 100: [EXEC, "fstat(3</memfd:mounts (deleted)>, " + STAT + ") = 0"] })).taints).toEqual(["clock", "descriptor_observation", "random"]);
 		const failed = await observe({ 100: [EXEC, 'newfstatat(AT_FDCWD, "/work/result=0", 0xabc, 0) = -1 ENOENT (No such file or directory)'] });
 		expect(failed).toMatchObject({ complete: true, taints: ["clock", "random"], incompleteReasons: [] });
 		expect(failed.paths).toContainEqual({ path: "/work/result=0", role: "input" });
