@@ -19,7 +19,7 @@ import {
 	UNBOUNDED_ACTION_TOOLS,
 	WORKSPACE_MUTATION_ACTION_TOOLS,
 } from "../src/action-semantics.ts";
-import { PI_BASH_TIMEOUT_PROJECTION_RULE, PI_GREP_LITERAL_PROJECTION_RULE } from "../src/pi-tool-invocation.ts";
+import { PI_BASH_TIMEOUT_PROJECTION_RULE, PI_GREP_LITERAL_PROJECTION_RULE, piToolErrorSettlement } from "../src/pi-tool-invocation.ts";
 import {
 	RESOURCE_OBSERVATION_EFFECTS,
 	UNRESTRICTED_PROCESS_EFFECTS,
@@ -111,6 +111,12 @@ describe("ActionSemanticsRegistry", () => {
 		expect([actionKeyMatch(folded("foo"), folded("FooBar"), [GREP_LITERAL_ACTION_KEY_PROJECTOR])?.kind, actionKeyMatch(folded("é"), folded("éa"), [GREP_LITERAL_ACTION_KEY_PROJECTOR])]).toEqual(["projected", undefined]);
 		expect(await PI_GREP_LITERAL_PROJECTION_RULE.projectOutput!({ speculative: folded("foo"), actor: folded("FooBar"), output: settle("a.ts:1: fooBAR\nb.ts:2: FOO\nc.ts:3: FOO.bar"),
 			coverage: true, keyMatch: { kind: "projected", projector: "grep.literal", distance: 3 } })).toEqual(settle("a.ts:1: fooBAR"));
+	});
+
+	it("keeps the exit code Pi's bash appends to a completed failing command only", () => {
+		expect([new Error("out\n\nCommand exited with code 2"), new Error("Command exited with code 7"), new Error("out\n\nCommand timed out after 5 seconds"),
+			new Error("x Command exited with code 2"), "Command exited with code 2"].map((error) => piToolErrorSettlement("bash", error).exitCode)).toEqual([2, 7, undefined, undefined, undefined]);
+		expect(piToolErrorSettlement("grep", new Error("Command exited with code 2"))).not.toHaveProperty("exitCode");
 	});
 
 	it("fails closed instead of folding unsupported numeric query views into valid keys", () => {

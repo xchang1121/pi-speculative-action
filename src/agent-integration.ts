@@ -32,7 +32,7 @@ import {
 	patternAwareSettings,
 } from "./pattern-aware.ts";
 import { createPatternPlanSource } from "./pattern-plan-source.ts";
-import { PI_BASH_TIMEOUT_PROJECTION_RULE, PI_GREP_LITERAL_PROJECTION_RULE } from "./pi-tool-invocation.ts";
+import { PI_BASH_TIMEOUT_PROJECTION_RULE, PI_GREP_LITERAL_PROJECTION_RULE, piToolErrorSettlement } from "./pi-tool-invocation.ts";
 import type { TimelineDependency } from "./task-timing.ts";
 import type {
 	CandidatePreflight,
@@ -50,7 +50,7 @@ import { makeSpeculativeActionRuntime } from "./runtime.ts";
 import { stableValueHash } from "./stable-value-hash.ts";
 import { booleanOr, positiveInteger } from "./setting-input.ts";
 import { immutableSnapshot, isImmutableSnapshot } from "./stable-json.ts";
-import { toolErrorSettlement, type ToolInvocation, type ToolSettlement } from "./tool-settlement.ts";
+import type { ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
 import { ToolExecutionGateway, type ToolOperation } from "./tool-execution-gateway.ts";
 
 const ACTOR_OPERATION = Symbol("actor-operation");
@@ -453,8 +453,9 @@ export function createSpeculativeActionHost(
 							},
 							settled: async (settlement) => {
 								if (!prepared) return;
+								// The Actor's own failed command carries its exit code, as a speculative one does.
 								const output = settlement.status === "succeeded"
-									? { result: settlement.output, isError: false } : toolErrorSettlement(settlement.error);
+									? { result: settlement.output, isError: false } : piToolErrorSettlement(input.tool, settlement.error);
 								await (operations ? prepared.settle(settlement.toolExecution, output, operations)
 									: prepared.settle(settlement.toolExecution, output));
 							},

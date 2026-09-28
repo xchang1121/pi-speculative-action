@@ -3,7 +3,7 @@ import {
 	createWriteToolDefinition, createGrepToolDefinition, createFindToolDefinition, createLsToolDefinition,
 	getAgentDir, getShellConfig, VERSION, type ExtensionContext, type ToolsOptions,
 } from "@earendil-works/pi-coding-agent";
-import type { ToolFilesystemOperations, ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
+import { toolErrorSettlement, type ToolFilesystemOperations, type ToolInvocation, type ToolSettlement } from "./tool-settlement.ts";
 import { BASH_TIMEOUT_ACTION_KEY_PROJECTOR, GREP_LITERAL_ACTION_KEY_PROJECTOR, grepLiteralMatches, PI_ACTION_SEMANTICS, resolvePiToolPath, type ActionSemanticsDefinition } from "./action-semantics.ts";
 import type { ActionProjectionRule } from "./action-key-projection.ts";
 import { asRecord } from "./stable-json.ts";
@@ -108,27 +108,12 @@ export function resolvePiToolInvocation(
 	if (typeof record.command !== "string") return undefined;
 	const shell = getShellConfig(options.shellPath);
 	const executor = "pi.bash.local";
-	const commandTransport = shell.commandTransport ?? "argv";
+	const shared = { cwd: options.cwd, environment: options.environment, shell: shell.shell, shellArgs: [...shell.args], commandTransport: shell.commandTransport ?? "argv" };
 	return {
 		executor,
-		identity: {
-			executor,
-			cwd: options.cwd,
-			environment: options.environment,
-			shell: shell.shell,
-			shellArgs: [...shell.args],
-			commandTransport,
-			...(options.shellCommandPrefix ? { commandPrefix: options.shellCommandPrefix } : {}),
-		},
-		process: {
-			command: options.shellCommandPrefix ? `${options.shellCommandPrefix}\n${record.command}` : record.command,
-			cwd: options.cwd,
-			environment: options.environment,
-			shell: shell.shell,
-			shellArgs: [...shell.args],
-			commandTransport,
-			...(typeof record.timeout === "number" ? { timeout: record.timeout } : {}),
-		},
+		identity: { executor, ...shared, ...(options.shellCommandPrefix ? { commandPrefix: options.shellCommandPrefix } : {}) },
+		process: { ...shared, command: options.shellCommandPrefix ? `${options.shellCommandPrefix}\n${record.command}` : record.command,
+			...(typeof record.timeout === "number" ? { timeout: record.timeout } : {}) },
 	};
 }
 
@@ -161,6 +146,12 @@ export const PI_GREP_LITERAL_PROJECTION_RULE: ActionProjectionRule<ToolSettlemen
 		return { result: { ...output.result, content: [{ type: "text", text: kept.length ? kept.join("\n") : "No matches found" }] }, isError: false };
 	},
 };
+
+/** Pi's bash throws once a completed command exits non-zero, appending this status last (aborts and timeouts append others). */
+export function piToolErrorSettlement(tool: string, error: unknown): ToolSettlement {
+	const code = tool === "bash" && error instanceof Error ? /(?:^|\n\n)Command exited with code (\d+)$/.exec(error.message)?.[1] : undefined;
+	return code === undefined ? toolErrorSettlement(error) : { ...toolErrorSettlement(error), exitCode: Number(code) };
+}
 
 /** Retain stock write poststates; edit normalization and queuing stay in Pi. */
 function captureActorWrites(execute: NonNullable<ToolInvocation["filesystem"]>, root: string): Pick<ToolInvocation, "authoritative" | "captureInputs"> {
