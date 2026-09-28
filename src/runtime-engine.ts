@@ -1311,6 +1311,12 @@ export function makeSpeculativeActionRuntime<
 			}
 			session.scheduler.observeSpeculativeService(actionTimingIdentity(candidate.key), completedAt - startedAt);
 			candidateStore.settle(session.id, candidate, candidate.work.reservation.kind === "shared", branch.reconstruct ? branch.inputResources : undefined);
+			// An exclusive result waits for its own adoption; meanwhile the unchanged bytes it read can answer other reads.
+			const budget = cacheLimits(candidate.owner.settings), preimages = candidate.work.reservation.kind === "exclusive" && budget.maxEntries > 0 && budget.maxBytes > 0
+				? await branch.takeReadInputs?.(budget.maxBytes).catch(() => undefined) : undefined;
+			if (preimages) await promoteAuthoritativeResult(session, candidate.owner, () => candidateStore.has(session.id, candidate), candidate.key, preimages.output, 0,
+				new TimelineInterval(startedAt, completedAt), { route: { ...candidate.route, backend: preimages.backend, isolation: "resource_snapshot", reuse: "shared_result" },
+					seal: () => preimages, dispose: preimages.dispose });
 			queueCandidateContinuations(session, session.plan.consumers(candidate.id), candidate, output, "execution_succeeded");
 			trimResults(session, candidate.owner.settings);
 			queueCandidateEvent(session, candidate);
@@ -1693,7 +1699,7 @@ export function makeSpeculativeActionRuntime<
 					const budget = cacheLimits(state.settings);
 					if (branch.takeCommittedInputs && budget.maxEntries > 0 && budget.maxBytes > 0) {
 						const inputs = await branch.takeCommittedInputs(budget.maxBytes).catch(() => undefined);
-						if (inputs) await promoteAuthoritativeResult(state, candidate.key, inputs.output, 0, execution.toolExecution, {
+						if (inputs) await promoteAuthoritativeResult(state.session, state, () => state.lifecycle === "active", candidate.key, inputs.output, 0, execution.toolExecution, {
 							route: { ...candidate.route, backend: inputs.backend, isolation: "resource_snapshot", reuse: "shared_result" },
 							seal: () => inputs, dispose: inputs.dispose,
 						});
@@ -1884,7 +1890,9 @@ export function makeSpeculativeActionRuntime<
 	};
 
 	const promoteAuthoritativeResult = async (
-		state: Turn,
+		session: Session,
+		context: RuntimeTurnContext<StartInput, StateData>,
+		active: () => boolean,
 		action: ActionKey,
 		output: Output,
 		durationMs: number,
@@ -1894,11 +1902,11 @@ export function makeSpeculativeActionRuntime<
 		let branch: WorldBranch<Output> | undefined;
 		try {
 			branch = await capture.seal(output);
-		} catch { state.session.lifecycle.release(capture); return; }
+		} catch { session.lifecycle.release(capture); return; }
 		let retained = false;
 		try {
-			if (state.lifecycle !== "active" || state.session.lifecycle.sealed || masterDisabled()) return;
-			const candidate = createCandidate(state.session, state,
+			if (!active() || session.lifecycle.sealed || masterDisabled()) return;
+			const candidate = createCandidate(session, context,
 				{ type: "tool_call", tool: action.tool, input: action.input, source: "actor_result" }, {
 				origin: "actor_result",
 				key: action,
@@ -1912,13 +1920,13 @@ export function makeSpeculativeActionRuntime<
 			if (!candidate.work.succeed(branch, toolExecution, durationMs)) return;
 			const rejected = adapter.rejectCandidateOutput?.({ output, candidate: publicCandidate(candidate) });
 			if (rejected) return;
-			candidateStore.settle(state.sessionID, candidate, true, branch.reconstruct ? branch.inputResources : undefined);
+			candidateStore.settle(session.id, candidate, true, branch.reconstruct ? branch.inputResources : undefined);
 			retained = true;
-			trimResults(state.session, state.settings);
+			trimResults(session, context.settings);
 		} catch {
 			// Optional cache promotion cannot alter an already completed Actor result.
 		} finally {
-			if (!retained) state.session.lifecycle.release(branch);
+			if (!retained) session.lifecycle.release(branch);
 		}
 	};
 
@@ -1944,7 +1952,7 @@ export function makeSpeculativeActionRuntime<
 		// Authoritative feedback must enter the settlement queue before optional cache work can yield.
 		queueActorSettlement(state, input, actualCall, actorAction, output, undefined, operations);
 		if (capture && key && output !== undefined && !outputIsError(output)) {
-			await promoteAuthoritativeResult(state, key, output, durationMs, execution, capture);
+			await promoteAuthoritativeResult(state.session, state, () => state.lifecycle === "active", key, output, durationMs, execution, capture);
 		} else if (capture) {
 			state.session.lifecycle.release(capture);
 		}

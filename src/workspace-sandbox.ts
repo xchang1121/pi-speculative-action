@@ -435,7 +435,7 @@ function workspaceBranch(
 	workspaceCheckpoints.set(checkpoint, { token: checkpoint, sourceRoot, parent, changes });
 	let commitMetrics: WorldCommitMetrics | undefined, commitPromise: Promise<ToolSettlement> | undefined;
 	const inputs = new Map<string, ResourceInput>();
-	let disposed = false, transferred: ReturnType<NonNullable<WorldBranch<ToolSettlement>["takeCommittedInputs"]>> | undefined;
+	let disposed = false, readInputs = false, transferred: ReturnType<NonNullable<WorldBranch<ToolSettlement>["takeCommittedInputs"]>> | undefined;
 	return {
 		backend, checkpoint, output: snapshot.output, validate,
 		resources: Object.freeze([...new Set(changes.filter((change) => !change.validationOnly).map((change) => change.resource))]),
@@ -448,6 +448,17 @@ function workspaceBranch(
 			if (disposed) inputs.clear();
 			return output;
 		}),
+		takeReadInputs: async (maxBytes) => {
+			// Every file this branch read keeps its pre-image until commit; each serves reads while it stays unchanged.
+			const preimages = new Map<string, ResourceInput>(changes.flatMap((change) => change.kind !== "directory" && change.before && !change.aliases ? [[change.target, change.before]] : []));
+			if (disposed || commitPromise || readInputs || !preimages.size) return undefined;
+			readInputs = true;
+			const inputs = await createCommittedResourceInputs(snapshot.output, action, sourceRoot, preimages, maxBytes).catch(() => undefined);
+			// Stamped only now: each file must still hold the bytes it was read with, or the owner would vouch for stale ones.
+			const current = inputs && await Promise.all([...preimages].map(async ([target, before]) => sameOptionalBytes((await readRegularState(target))?.content, before as Uint8Array)));
+			if (inputs && current?.every(Boolean)) return inputs;
+			await inputs?.dispose(); return undefined;
+		},
 		takeCommittedInputs: async (maxBytes) => {
 			if (disposed || !commitMetrics || transferred) return undefined;
 			return transferred = (async () => {

@@ -179,7 +179,7 @@ function sealEffectTransaction<Output>(attempt: MutableEffectTransactionAttempt,
 		computationDependencies: branch.computationDependencies && Object.freeze([...branch.computationDependencies]),
 		validate: validateAndCommit ?? branch.validate?.bind(branch), reconstruct: branch.reconstruct?.bind(branch),
 		commit: branch.commit.bind(branch), dispose: branch.dispose.bind(branch),
-		takeCommittedInputs: branch.takeCommittedInputs?.bind(branch),
+		takeCommittedInputs: branch.takeCommittedInputs?.bind(branch), takeReadInputs: branch.takeReadInputs?.bind(branch),
 	});
 	let validation: ResourceValidation | undefined, validationPromise: Promise<ResourceValidation> | undefined;
 	let commitPromise: Promise<Output> | undefined, cleanupPromise: Promise<void> | undefined;
