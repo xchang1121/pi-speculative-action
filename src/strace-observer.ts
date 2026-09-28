@@ -488,20 +488,12 @@ function selectTraceRoot(files: readonly TraceFile[], target: string): TraceRoot
 	if (roots.length !== 1) return { reason: `trace_root_ambiguous:${roots.map(({ pid }) => pid).sort().join(",")}` };
 
 	const depth = new Map<number, number>([[roots[0]!.pid, 0]]);
-	for (const [pid, level] of depth) {
-		for (const child of children.get(pid) ?? []) {
-			if (!depth.has(child)) depth.set(child, level + 1);
-		}
-	}
+	for (const [pid, level] of depth) for (const child of children.get(pid) ?? []) if (!depth.has(child)) depth.set(child, level + 1);
 	const candidates: Array<TraceRoot & { readonly depth: number }> = [];
 	for (const file of files) {
 		const processDepth = depth.get(file.pid);
 		if (processDepth === undefined) continue;
-		const start = file.lines.findIndex((line) => {
-			if (!successfulExec(line)) return false;
-			const executable = quotedStrings(line)[0];
-			return executable !== undefined && path.posix.resolve(executable) === target;
-		});
+		const start = file.lines.findIndex((line) => successfulExec(line) && quotedStrings(line)[0] !== undefined && path.posix.resolve(quotedStrings(line)[0]!) === target);
 		if (start >= 0) candidates.push({ file, start, depth: processDepth });
 	}
 	if (!candidates.length) return { reason: "target_exec_not_found" };
@@ -599,11 +591,7 @@ export async function observeStrace(
 			const child = spawnedPID(line);
 			if (!child || selected.has(child)) continue;
 			const childFile = byPID.get(child);
-			if (!childFile) {
-				complete = false;
-				incompleteReasons.add(`child_trace_missing:${child}`);
-				continue;
-			}
+			if (!childFile) { complete = false; incompleteReasons.add(`child_trace_missing:${child}`); continue; }
 			const shared = sharesFilesystem(line);
 			if (shared === undefined) { complete = false; incompleteReasons.add(`clone_flags_unparsed:${pid}`); }
 			if (shared !== false) process.fs.shared = true;
@@ -645,12 +633,7 @@ export async function observeStrace(
 			if (ignoredSegments.get(pid)?.some(([from, to]) => index >= from && index < to)) continue;
 			const line = file.lines[index]!;
 			if (!line) continue;
-			const traceFailure = line.failure;
-			if (traceFailure) {
-				complete = false;
-				incompleteReasons.add(traceFailure);
-				continue;
-			}
+			if (line.failure) { complete = false; incompleteReasons.add(line.failure); continue; }
 			const syscall = line.name;
 			if (!syscall) continue;
 			if (options.frozen && !continuationCall(line, index === start)) {
@@ -689,8 +672,18 @@ export async function observeStrace(
 			) {
 				taints.add("unsupported_syscall");
 			}
-			const directoryImage = /^(getdents|getdents64)$/.test(syscall) && options.inheritedDirectoryImages?.includes(absoluteDescriptorPath(line.args[0]) ?? "");
-			if (UNMODELED_METADATA_SYSCALLS.has(syscall) && (syscallSucceeded(line) ? !directoryImage : directoryImage)) {
+			// A host filesystem's statistics vary over time like the clock, whose taint every trace carries; the sandbox's own
+			// filesystem does not stand in for the workspace's.
+			if (/^f?statfs$/.test(syscall) && semanticRoots.length) {
+				const target = syscall === "statfs" ? syscallPaths(line, syscall, cwd)?.[0] : absoluteDescriptorPath(line.args[0]);
+				if (target && !semanticRoots.some((root) => containsLogicalPath(root, target))) continue;
+			}
+			const listed = /^getdents(?:64)?$/.test(syscall) ? absoluteDescriptorPath(line.args[0]) : undefined;
+			const directoryImage = !!listed && !!options.inheritedDirectoryImages?.includes(listed);
+			// A listed directory's entry set is its dependency; readdir order and d_ino are volatile identity, as a descriptor's is.
+			const listing = !!listed && !directoryImage && syscallSucceeded(line);
+			if (listing) { taints.add("descriptor_observation"); if (paths.get(listed!) !== "executable") paths.set(listed!, "input"); }
+			if (UNMODELED_METADATA_SYSCALLS.has(syscall) && !listing && (syscallSucceeded(line) ? !directoryImage : directoryImage)) {
 				taints.add("unsupported_syscall");
 				incompleteReasons.add(`unmodeled_metadata:${syscall}:${pid}`);
 			}
@@ -738,26 +731,18 @@ export async function observeStrace(
 		complete,
 		...(options.inheritedHandles || options.inheritedStreams ? { resourceJournal: resourceJournal.sort((a, b) => a.order - b.order).map(({ order, ...event }) => event), retainedDescriptions: retained,
 			...(options.frozen ? { finalHandles } : {}) } : {}),
-		paths: Object.freeze(
-			[
-				...[...paths].map(([observedPath, role]) => ({ path: observedPath, role: sharedObjectRole(observedPath, role) })),
-				...metadata.values(),
-			]
-				.sort((left, right) =>
-					`${left.role}:${left.role === "metadata" ? left.followSymlinks : ""}:${left.path}`.localeCompare(
-						`${right.role}:${right.role === "metadata" ? right.followSymlinks : ""}:${right.path}`,
-					),
-				),
-		),
+		paths: Object.freeze([...[...paths].map(([observedPath, role]) => ({ path: observedPath, role: sharedObjectRole(observedPath, role) })), ...metadata.values()]
+			.sort((left, right) => pathOrder(left).localeCompare(pathOrder(right)))),
 		taints: Object.freeze([...taints].sort()),
-		tracedProcesses: [...selected].filter(([pid, { file, start }]) =>
-			file.lines.slice(start).some((_, offset) =>
-				!ignoredSegments.get(pid)?.some(([from, to]) => start + offset >= from && start + offset < to),
-			),
-		).length,
+		tracedProcesses: [...selected].filter(([pid, { file, start }]) => file.lines.slice(start)
+			.some((_, offset) => !ignoredSegments.get(pid)?.some(([from, to]) => start + offset >= from && start + offset < to))).length,
 		incompleteReasons: Object.freeze([...incompleteReasons].sort()),
 		...(resumedInterpositions.length ? { resumedInterpositions } : {}),
 	};
+}
+
+function pathOrder(item: ObservedProcessPath): string {
+	return `${item.role}:${item.role === "metadata" ? item.followSymlinks : ""}:${item.path}`;
 }
 
 /** State retained across the frontier must be in the image or the common resource
