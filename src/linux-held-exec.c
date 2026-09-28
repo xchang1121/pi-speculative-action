@@ -757,7 +757,9 @@ static int image_dispatch(int argc, char **argv) {
 	 * SIGXFSZ), cleared the mask, raised the descriptor limit and may leave shared stdio non-blocking without its exit
 	 * reset: restore what this process received, then exec. */
 	unsigned long long ignored = 0, blocked = 0, limit; sigset_t mask; struct rlimit files; char recorded[96], tail;
-	unsigned status[3];
+	unsigned status[3]; int extra;
+	char **spare = calloc((size_t)argc + 3, sizeof(*spare)); /* a sandbox grows argv here to run a script's interpreter */
+	if (!spare || !memcpy(spare, argv, (size_t)argc * sizeof(*argv))) goto done;
 	const char *received = getenv("PI_SPEC_NATIVE_STATE");
 	if (received) {
 		if (sscanf(received, "%llx:%llx:%llx:%x:%x:%x%c", &ignored, &blocked, &limit, &status[0], &status[1], &status[2], &tail) != 6 ||
@@ -770,14 +772,10 @@ static int image_dispatch(int argc, char **argv) {
 		for (int fd = 0; fd < 3; fd++) if (fcntl(fd, F_SETFL, (int)status[fd]) < 0) goto done;
 		files.rlim_cur = (rlim_t)limit;
 		if (setrlimit(RLIMIT_NOFILE, &files) < 0 || unsetenv("PI_SPEC_NATIVE_STATE") < 0 || sigprocmask(SIG_SETMASK, &mask, NULL) < 0) goto done;
-		execv(native, argv);
-		result = errno == ENOENT ? 127 : 126;
-		goto done;
 	}
-	int extra = has_unmodeled_descriptors(3);
-	if (extra < 0) goto done;
+	if ((extra = received ? 1 : has_unmodeled_descriptors(3)) < 0) goto done;
 	if (extra) {
-		execv(native, argv);
+		execv(native, spare);
 		result = errno == ENOENT ? 127 : 126;
 		goto done;
 	}
@@ -3246,7 +3244,7 @@ int main(int argc, char **argv) {
 		}
 		char *executable = argv[4];
 		argv[4] = argv[3];
-		execv(executable, argv + 4);
+		execv(executable, memmove(argv + 2, argv + 4, (size_t)(argc - 3) * sizeof(*argv))); /* two spare slots, as in image_dispatch */
 		return errno == ENOENT ? 127 : 126;
 	}
 	if (argc == 2 && !strcmp(argv[1], "--probe-clean-fds")) {
