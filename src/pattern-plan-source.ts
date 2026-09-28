@@ -9,6 +9,7 @@ import {
 	acquirePatternAwareStore,
 	PATTERN_AWARE_DEFAULTS,
 	asPatternAwareRuntimeContext,
+	type OutputLocation,
 	type PatternAwareCandidate,
 	type PatternAwareEventInput,
 	type PatternAwareRuntimeContext,
@@ -123,7 +124,7 @@ export function createPatternPlanSource({
 	};
 	const eventData = (tool: string, input: Readonly<Record<string, unknown>>, output: ToolSettlement | undefined, durationMs: number) => ({
 		tool, input: structuredClone(input), outcome: output?.isError ? "failure" as const : "success" as const,
-		...projectPatternAwareObservation(output?.result, extractOutputPaths(tool, input, output?.result), cwd),
+		...projectPatternAwareObservation(output?.result, extractOutputPaths(tool, input, output?.result), cwd, extractOutputLocations(tool, input, output?.result)),
 		durationMs,
 		...(typeof input.operation === "string" ? { operation: input.operation } : {}),
 	});
@@ -417,7 +418,22 @@ function patternPlanAction(
 }
 
 /** Files a run's text names as compilers, test runners and stack traces print them: with a directory, or with a line after them. */
+const RUN_OUTPUT_LOCATION = /(?<![\w.@/\\:-])((?:[A-Za-z]:)?[\w.@-]{0,128}(?:[\\/][\w.@-]{1,128}){0,16}\.[A-Za-z]\w{0,9})(?::(\d+)|\((\d+)|",? line (\d+))/gu;
 const RUN_OUTPUT_PATH = /(?<![\w.@/\\:-])((?:[A-Za-z]:)?[\w.@-]{0,128}(?:[\\/][\w.@-]{1,128}){0,16}\.[A-Za-z]\w{0,9})(:\d|\(\d|",? line \d)?/gu;
+
+/** `path:line` facts: grep's matches, and a command's reported locations (compiler errors, stack traces, test failures). */
+function extractOutputLocations(tool: string, actionInput: Readonly<Record<string, unknown>>, result: AgentToolResult<unknown> | undefined): OutputLocation[] {
+	if ((tool !== "grep" && tool !== "bash") || !result) return [];
+	const text = result.content.flatMap((item) => item.type === "text" ? [item.text] : []).join("\n");
+	const searchRoot = typeof actionInput.path === "string" && actionInput.path ? actionInput.path : ".";
+	const located = tool === "grep" ? [...text.matchAll(/^(.+?):(\d+)(?::\d+)?:/gmu)] : [...text.matchAll(RUN_OUTPUT_LOCATION)];
+	return located.slice(0, 256).flatMap(([, file, ...lines]) => {
+		const line = lines.find(Boolean);
+		const number = Number(line);
+		if (!file || !Number.isSafeInteger(number) || number < 1) return [];
+		return [{ path: tool === "bash" || path.isAbsolute(file) ? file : path.basename(searchRoot) === file ? searchRoot : path.join(searchRoot, file), line: number }];
+	});
+}
 
 function extractOutputPaths(
 	tool: string,
