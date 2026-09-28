@@ -3,7 +3,7 @@ import { temporaryDirectories } from "./filesystem.ts";
 import { processPrototype, processCertificate } from "./process-fixture.ts";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { validateTransferredProcessEvidence } from "../src/linux-process-backend.ts";
+import { imageInterpreter, validateTransferredProcessEvidence } from "../src/linux-process-backend.ts";
 import { descriptorEffects, type ProcessResourceGraph } from "../src/linux-held-exec.ts";
 import {
 	createExecPrototype,
@@ -39,6 +39,18 @@ describe("process provenance certificates", () => {
 		const observed = await validateDynamicDependencyCertificate(certificate.dependencyCertificate, { resolvePath }); // The planner keys stale observations too.
 		expect(observed.status === "stale" ? processStrongKey(certificate.weakKey, { complete: true, dependencies: observed.dependencies, taints: [] }) : observed.status).toMatch(/^sha256:/);
 	});
+	it("names the interpreter the kernel opens for a script or an ELF image", async () => {
+		const root = await workspace(), elf = Buffer.alloc(160), loader = "/lib64/ld-linux-x86-64.so.2\0";
+		elf.writeUInt32BE(0x7f454c46, 0); elf[4] = 2; elf[5] = 1; elf.writeBigUInt64LE(64n, 32); elf.writeUInt16LE(56, 54); elf.writeUInt16LE(1, 56);
+		elf.writeUInt32LE(3, 64); elf.writeBigUInt64LE(120n, 72); elf.writeBigUInt64LE(BigInt(loader.length), 96); elf.write(loader, 120, "latin1");
+		for (const [name, content, expected] of [["env", "#!/usr/bin/env node\n", "/usr/bin/env"], ["spaced", "#! /bin/sh -e", "/bin/sh"],
+			["elf", elf, "/lib64/ld-linux-x86-64.so.2"], ["static", elf.subarray(0, 64), undefined], ["text", "echo\n", undefined]] as const) {
+			await writeFile(path.join(root, name), content);
+			expect(await imageInterpreter(path.join(root, name)), name).toBe(expected);
+		}
+		expect(await imageInterpreter(path.join(root, "missing"))).toBeUndefined();
+	});
+
 	it("shares queue consumption across independent OFDs while retaining independent flags", () => {
 		const graph: ProcessResourceGraph = { handles: [0, 3, 8].map(fd => ({ fd, description: fd === 3 ? 0 : fd })),
 			descriptions: { 0: { object: 0, flags: 0 }, 8: { object: 0, flags: 32768 } },
