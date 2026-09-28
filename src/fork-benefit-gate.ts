@@ -3,14 +3,7 @@ import { nonNegativeFinite as metric } from "./number-utils.ts";
 
 export interface BenefitGatePolicy extends Readonly<typeof benefitGateDefaults> {}
 
-const benefitGateDefaults = {
-	enabled: true,
-	minSamples: 4,
-	windowSize: 4,
-	minNetBenefitMs: 25,
-	probeInterval: 4,
-	failureThreshold: 2,
-};
+const benefitGateDefaults = { enabled: true, minSamples: 4, windowSize: 4, minNetBenefitMs: 25, probeInterval: 4, failureThreshold: 2 };
 
 export const DEFAULT_BENEFIT_GATE_POLICY: BenefitGatePolicy = Object.freeze(benefitGateDefaults);
 
@@ -58,10 +51,7 @@ export class BenefitGate {
 	decide(key: string, policy: BenefitGatePolicy): BenefitDecision {
 		const state = this.state(key);
 		const expected = mean(state.samples);
-		const base = {
-			samples: state.samples.length,
-			...(expected === undefined ? {} : { expectedNetBenefitMs: expected }),
-		};
+		const base = { samples: state.samples.length, ...(expected === undefined ? {} : { expectedNetBenefitMs: expected }) };
 		if (!policy.enabled) return { allowed: true, reason: "disabled", ...base };
 		const failing = consecutiveFailures(state) >= policy.failureThreshold;
 		if (!failing) {
@@ -76,11 +66,7 @@ export class BenefitGate {
 		return { allowed: false, reason: failing ? "failure_circuit" : "negative_utility", ...base };
 	}
 
-	observe(
-		key: string,
-		observation: BenefitObservation,
-		policy: BenefitGatePolicy,
-	): (observation: BenefitObservation) => void {
+	observe(key: string, observation: BenefitObservation, policy: BenefitGatePolicy): (observation: BenefitObservation) => void {
 		const state = this.state(key);
 		const sample: GateState["samples"][number] = { netBenefit: undefined, failed: false };
 		state.samples.push(sample);
@@ -116,12 +102,7 @@ export class BenefitGate {
 	private state(key: string): GateState {
 		let state = this.states.get(key);
 		if (!state) {
-			state = {
-				samples: [],
-				priorFailures: 0,
-				suppressedSinceProbe: 0,
-				totalSuppressed: 0,
-			};
+			state = { samples: [], priorFailures: 0, suppressedSinceProbe: 0, totalSuppressed: 0 };
 			this.states.set(key, state);
 		}
 		return state;

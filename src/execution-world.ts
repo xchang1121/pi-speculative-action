@@ -140,6 +140,8 @@ export interface WorldBranch<Output> {
 	readonly inputsOnly?: true;
 	/** Transfer one input owner after a successful commit; the receiver owns its cleanup. */
 	readonly takeCommittedInputs?: (maxBytes: number) => Promise<(WorldBranch<Output> & { readonly inputsOnly: true }) | undefined>;
+	/** Before any commit, the unchanged bytes an exclusive branch read, as an independent input owner (at most once). */
+	readonly takeReadInputs?: (maxBytes: number) => Promise<(WorldBranch<Output> & { readonly inputsOnly: true }) | undefined>;
 	/** May evaluate the current action instead of only the source executor. Still requires query evidence. */
 	readonly reconstructionScope?: "current_action";
 	/** Captured persistent-effect bytes, excluding the serialized tool output. */

@@ -14,10 +14,7 @@ export type PpmProbabilityEstimate = {
 	readonly escapeMass: number;
 };
 
-type TargetCount = {
-	count: number;
-	lastSeen: number;
-};
+type TargetCount = { count: number; lastSeen: number; };
 
 type CountNode = {
 	readonly children: Map<string, CountNode>;
@@ -151,10 +148,7 @@ export class PpmCountTrie {
 	trim(maxContexts: number): void {
 		const limit = Math.max(1, Math.floor(maxContexts));
 		if (this.size <= limit) return;
-		if (!Number.isFinite(limit)) {
-			this.restore(this.snapshot(limit));
-			return;
-		}
+		if (!Number.isFinite(limit)) { this.restore(this.snapshot(limit)); return; }
 		const discarded = new Set(this.rankedContexts().slice(limit).map((item) => item.node));
 		const prune = (current: CountNode): void => {
 			if (discarded.has(current)) {
@@ -212,10 +206,7 @@ export class PpmCountTrie {
 		}
 		const previous = current.targets.get(target);
 		const nextCount = safeCount((previous?.count ?? 0) + count);
-		current.targets.set(target, {
-			count: nextCount,
-			lastSeen: Math.max(previous?.lastSeen ?? 0, lastSeen),
-		});
+		current.targets.set(target, { count: nextCount, lastSeen: Math.max(previous?.lastSeen ?? 0, lastSeen) });
 		current.total = safeTotal(current.total + nextCount - (previous?.count ?? 0));
 		current.lastSeen = Math.max(current.lastSeen, lastSeen);
 		if (wasEmpty) this.populatedContexts++;

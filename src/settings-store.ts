@@ -6,10 +6,7 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { SpeculativeAgentSettingsInput } from "./agent-integration.ts";
 import { isRecord } from "./stable-json.ts";
 
-export interface ExecutionRoutingSettings {
-	readonly primary?: boolean;
-	readonly nativeFallback?: boolean;
-}
+export interface ExecutionRoutingSettings { readonly primary?: boolean; readonly nativeFallback?: boolean; }
 
 export interface SpeculativeActionPackageSettings extends SpeculativeAgentSettingsInput {
 	readonly draftModel?: string;
@@ -35,10 +32,7 @@ export class SpeculativeActionSettingsStore {
 	readonly cwd: string;
 	readonly agentDirectory: string;
 
-	constructor(cwd: string, agentDirectory = getAgentDir()) {
-		this.cwd = cwd;
-		this.agentDirectory = agentDirectory;
-	}
+	constructor(cwd: string, agentDirectory = getAgentDir()) { this.cwd = cwd; this.agentDirectory = agentDirectory; }
 
 	/** An untrusted checkout cannot configure the extension; a trusted one still cannot redirect conversation or keys. */
 	async load(trusted = true): Promise<void> {
@@ -71,11 +65,7 @@ export class SpeculativeActionSettingsStore {
 		this.persistSelected();
 	}
 
-	clear(): void {
-		if (this.scopeValue === "project") this.project = undefined;
-		else this.global = undefined;
-		this.persistSelected();
-	}
+	clear(): void { if (this.scopeValue === "project") this.project = undefined; else this.global = undefined; this.persistSelected(); }
 
 	private persistSelected(): void {
 		const snapshot = structuredClone(this.scopeValue === "project" ? this.project : this.global);
@@ -119,10 +109,7 @@ function userScoped(project: SettingsOverlay | undefined): SettingsOverlay | und
 	return { ...project, selfSpeculation };
 }
 
-function applyOverlay(
-	base: SettingsOverlay | undefined,
-	overlay: SettingsOverlay | undefined,
-): SettingsOverlay | undefined {
+function applyOverlay(base: SettingsOverlay | undefined, overlay: SettingsOverlay | undefined): SettingsOverlay | undefined {
 	if (!base && !overlay) return undefined;
 	const result: SettingsOverlay = structuredClone(base) ?? {};
 	for (const [key, value] of Object.entries(overlay ?? {})) {
@@ -144,10 +131,7 @@ function diffRecord(base: SettingsOverlay, target: SettingsOverlay): SettingsOve
 	for (const key of new Set([...Object.keys(base), ...Object.keys(target)])) {
 		const baseHas = Object.hasOwn(base, key);
 		const targetHas = Object.hasOwn(target, key);
-		if (!targetHas) {
-			if (baseHas) result[key] = null;
-			continue;
-		}
+		if (!targetHas) { if (baseHas) result[key] = null; continue; }
 		const before = base[key];
 		const after = target[key];
 		if (isDeepStrictEqual(before, after)) continue;

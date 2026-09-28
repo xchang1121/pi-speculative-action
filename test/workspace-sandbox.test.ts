@@ -82,6 +82,23 @@ describe("workspace-branch ExecutionWorld", () => {
 		await expect(outlet!.writeFile!(file, "late")).rejects.toThrow("execution lifetime is closed");
 	});
 
+	it("answers reads from an unadopted edit's unchanged pre-image, never a changed one", async () => {
+		const root = await temporaryRoot(), file = path.join(root, "a.txt"), world = sandbox.createExecutionWorld();
+		await writeFile(file, "one two\n");
+		const edit = () => world.speculation.execute(context(root, "edit", editTool, { path: "a.txt", edits: [{ oldText: "two", newText: "three" }] }));
+		const branch = await edit(), inputs = await branch.takeReadInputs!(1 << 20);
+		const readArgs = { path: "a.txt" };
+		const query = await inputs!.reconstruct!({ action: { ...buildPiActionKey("read", readArgs, root)!, executionContext: resolvePiToolInvocation("read", readArgs, { cwd: root, environment: {} }) },
+			args: readArgs, callID: "read", signal: new AbortController().signal });
+		expect([inputs!.inputsOnly, query!.output.result.content]).toEqual([true, [{ type: "text", text: "one two\n" }]]);
+		expect(await branch.takeReadInputs!(1 << 20)).toBeUndefined();
+		await query!.dispose?.(); await inputs!.dispose(); await branch.dispose();
+		const stale = await edit();
+		await writeFile(file, "one two!\n");
+		expect(await stale.takeReadInputs!(1 << 20)).toBeUndefined();
+		await stale.dispose();
+	});
+
 	it("keeps other spellings of its private .git out of the view on case-insensitive volumes", async ({ skip }) => {
 		if (process.platform !== "win32" && process.platform !== "darwin") return skip("case-sensitive volume");
 		const root = await temporaryRoot(), world = sandbox.createExecutionWorld({ driver: "git" });

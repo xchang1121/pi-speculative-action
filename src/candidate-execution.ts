@@ -5,12 +5,7 @@ import { TimelineInterval } from "./task-timing.ts";
 export type CandidateExecutionState<Output> =
 	| { readonly status: "queued" }
 	| { readonly status: "running"; readonly startedAt: number }
-	| {
-			readonly status: "succeeded";
-			readonly output: Output;
-			readonly toolExecution: TimelineInterval;
-			readonly executionMs: number;
-	  }
+	| { readonly status: "succeeded"; readonly output: Output; readonly toolExecution: TimelineInterval; readonly executionMs: number; }
 	| {
 			readonly status: "failed" | "cancelled";
 			readonly cause: ResolutionCause;
@@ -21,11 +16,7 @@ export type CandidateExecutionState<Output> =
 
 export type CandidateReservation =
 	| { readonly kind: "shared"; readonly owners: readonly string[] }
-	| {
-			readonly kind: "exclusive";
-			readonly status: "available" | "reserved" | "consumed";
-			readonly turnID?: string;
-	  };
+	| { readonly kind: "exclusive"; readonly status: "available" | "reserved" | "consumed"; readonly turnID?: string; };
 
 export type CandidateExecutionSettlement<Output> = Extract<
 	CandidateExecutionState<Output>,
@@ -105,10 +96,7 @@ export class CandidateExecution<Output> {
 		const reservation = this.reservationValue;
 		if (reservation.kind === "shared") {
 			if (reservation.owners.includes(owner)) return undefined;
-			this.reservationValue = Object.freeze({
-				kind: "shared",
-				owners: Object.freeze([...reservation.owners, owner]),
-			});
+			this.reservationValue = Object.freeze({ kind: "shared", owners: Object.freeze([...reservation.owners, owner]) });
 		} else {
 			if (reservation.status !== "available") return undefined;
 			this.reservationValue = Object.freeze({ kind: "exclusive", status: "reserved", turnID: owner });

@@ -1,12 +1,7 @@
 import { nonNegativeCount as finiteCount } from "./number-utils.ts";
 import { nonNegativeNumber } from "./setting-input.ts";
 import { errorDetail } from "./error-utils.ts";
-import type {
-	ResolutionCause,
-	SettledSourceRequest,
-	SourceRequestIdentity,
-	SourceRequestSettlement,
-} from "./settlement.ts";
+import type { ResolutionCause, SettledSourceRequest, SourceRequestIdentity, SourceRequestSettlement } from "./settlement.ts";
 import { cause } from "./settlement.ts";
 import { waitForCandidate } from "./scheduler.ts";
 
@@ -69,14 +64,8 @@ export async function runSourceRequest<Value>(input: {
 	// Produced proposals can leave preparation in flight until their generation closes.
 	const signal = AbortSignal.any([input.generation.signal, controller.signal]);
 	const producer = Promise.resolve()
-		.then(() => {
-			signal.throwIfAborted();
-			return input.produce(signal);
-		})
-		.then(
-			(value) => ({ kind: "produced" as const, value }),
-			(error) => ({ kind: "error" as const, error }),
-		);
+		.then(() => { signal.throwIfAborted(); return input.produce(signal); })
+		.then((value) => ({ kind: "produced" as const, value }), (error) => ({ kind: "error" as const, error }));
 
 	const waited = await waitForCandidate(producer, input.generation.signal, nonNegativeNumber(input.timeoutMs, undefined));
 	if (waited.status === "deadline") {
@@ -93,17 +82,10 @@ export async function runSourceRequest<Value>(input: {
 	} catch (error) {
 		return failed("result_error", error);
 	}
-	return {
-		...finish(proposalCount > 0 ? { status: "produced", proposalCount } : { status: "empty" }),
-		value: outcome.value,
-	};
+	return { ...finish(proposalCount > 0 ? { status: "produced", proposalCount } : { status: "empty" }), value: outcome.value };
 }
 
-function result(
-	request: SourceRequestIdentity,
-	startedAt: number,
-	settlement: SourceRequestSettlement,
-): SettledSourceRequest {
+function result(request: SourceRequestIdentity, startedAt: number, settlement: SourceRequestSettlement): SettledSourceRequest {
 	return Object.freeze({
 		request: Object.freeze({ ...request }),
 		startedAt,

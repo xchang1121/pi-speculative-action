@@ -18,12 +18,7 @@ import { positiveInteger, nonNegativeInteger } from "./setting-input.ts";
 export type ActionEffect = "observation" | "workspace_mutation" | "unbounded";
 export type ResourceDependencyScope = "content" | "entries" | "tree_entries" | "tree_content";
 
-export interface ReadActionRange {
-	readonly path: string;
-	readonly offset: number;
-	readonly limit: number;
-	readonly end: number;
-}
+export interface ReadActionRange { readonly path: string; readonly offset: number; readonly limit: number; readonly end: number; }
 
 export interface ActionKey {
 	readonly key: string;
@@ -61,10 +56,7 @@ export interface ActionKeyProjector {
 	readonly canShareInFlight?: (speculative: ActionKey, actor: ActionKey) => boolean;
 }
 
-export interface ExactActionKeyMatch {
-	readonly kind: "exact";
-	readonly distance: 0;
-}
+export interface ExactActionKeyMatch { readonly kind: "exact"; readonly distance: 0; }
 
 export interface ProjectedActionKeyMatch {
 	/** A lossless result projection may satisfy the Actor action if execution and adoption later succeed. */
@@ -74,10 +66,7 @@ export interface ProjectedActionKeyMatch {
 }
 
 /** Resource retrieval is not action equivalence or a correct prediction. */
-export interface ResourceInputMatch {
-	readonly kind: "inputs";
-	readonly distance: number;
-}
+export interface ResourceInputMatch { readonly kind: "inputs"; readonly distance: number; }
 
 export type ActionKeyMatch = ExactActionKeyMatch | ProjectedActionKeyMatch | ResourceInputMatch;
 
@@ -89,10 +78,7 @@ export type ActionKeyMismatchReason =
 	| "different_core"
 	| "projection_not_applicable";
 
-export interface CanonicalAction {
-	readonly input: Readonly<Record<string, unknown>>;
-	readonly resources: readonly string[];
-}
+export interface CanonicalAction { readonly input: Readonly<Record<string, unknown>>; readonly resources: readonly string[]; }
 
 export interface ActionSemanticsDefinition {
 	readonly tool: string;
@@ -508,9 +494,6 @@ function validOptionalInteger(value: unknown, minimum: number): boolean {
 
 function fastHash(value: string): string {
 	let hash = 0x811c9dc5;
-	for (let index = 0; index < value.length; index++) {
-		hash ^= value.charCodeAt(index);
-		hash = Math.imul(hash, 0x01000193);
-	}
+	for (let index = 0; index < value.length; index++) { hash ^= value.charCodeAt(index); hash = Math.imul(hash, 0x01000193); }
 	return (hash >>> 0).toString(16).padStart(8, "0");
 }
