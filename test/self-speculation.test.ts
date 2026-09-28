@@ -423,6 +423,24 @@ describe("self-speculation control plane", () => {
 		);
 	});
 
+	it("forks through the Drafter from the Actor's reasoning when no control plane exists", async () => {
+		const actorForkPlans = createActorForkPlanSource({ maxAttempts: 1 }), requests: CapturedRequest[] = [], drafted: unknown[] = [];
+		const settings = enabledSettings({ forkTransport: "drafter" });
+		const coordinator = new SelfSpeculationCoordinator({ settings: () => settings, actorForkPlanSource: actorForkPlans,
+			fetch: async (input) => { requests.push({ path: String(input), body: {} }); return Response.json({}); },
+			draftFork: async (input) => { drafted.push({ reasoning: input.reasoning, content: input.content }); return [{ tool: "read", input: { path: "a.ts" } }]; } });
+		coordinator.startTurn("turn-1", model("http://127.0.0.1:8000/v1"), context(), 1);
+		const pending = actorForkPlans.waitForBatches("turn-1", new AbortController().signal);
+		// Even at the control plane's own origin, a Drafter fork leaves the Actor's request as it is.
+		expect(coordinator.decorateActorPayload({ prompt: "P" })).toEqual({ prompt: "P" });
+		coordinator.observeActorOutput(delta("thinking_delta", "I should read a.ts"));
+		expect((await pending).flatMap((batch) => batch.calls.map(({ tool, input }) => ({ tool, input })))).toEqual([{ tool: "read", input: { path: "a.ts" } }]);
+		// No control-plane request, candidate registration or payload decoration reaches a hosted API.
+		coordinator.addCandidate(candidate("drafter", "k", "h", "read", { path: "a.ts" }, 0.9));
+		await coordinator.dispose();
+		expect({ drafted, requests, completions: coordinator.snapshot().forkCompletions }).toEqual({ drafted: [{ reasoning: "I should read a.ts", content: "" }], requests: [], completions: 1 });
+	});
+
 	it("deduplicates valid sidecar batches while preserving their calls and candidate evidence", async () => {
 		const candidate = {
 			candidate_ids: ["fork-candidate"], sources: ["self-speculation", "drafter"],

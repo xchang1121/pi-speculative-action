@@ -67,6 +67,7 @@ const { values } = parseArgs({
 		"drafter-disabled": { type: "boolean", default: false },
 		"speculation-disabled": { type: "boolean", default: false },
 		"pattern-aware": { type: "boolean", default: false },
+		"self-speculation": { type: "boolean", default: false },
 		"prepare-only": { type: "boolean", default: false },
 	},
 	strict: true,
@@ -101,6 +102,7 @@ const options = {
 	drafterEnabled: !(values["drafter-disabled"] ?? false),
 	speculationEnabled: !values["speculation-disabled"],
 	patternAware: values["pattern-aware"] ?? false,
+	selfSpeculation: values["self-speculation"] ?? false,
 	prepareOnly: values["prepare-only"] ?? false,
 } as const;
 if (options.drafterTemperatureMin > options.drafterTemperatureMax) {
@@ -173,7 +175,8 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		...(input.drafterMaxTokens !== undefined ? { drafterMaxTokens: input.drafterMaxTokens } : {}),
 		drafterDeterministicCandidates: input.drafterDeterministicCandidates, drafterTemperatureMin: input.drafterTemperatureMin,
 		drafterTemperatureMax: input.drafterTemperatureMax, candidateLimit: input.candidateLimit, maxConcurrentActions: input.maxConcurrentActions,
-		predictionTimeoutMs: input.timeoutMs, patternAware: { enabled: input.patternAware }, draftModel: `${input.drafter.provider}/${input.drafter.id}`,
+		predictionTimeoutMs: input.timeoutMs, patternAware: { enabled: input.patternAware },
+		...(input.selfSpeculation ? { selfSpeculation: { enabled: true, forkTransport: "drafter" } } : {}), draftModel: `${input.drafter.provider}/${input.drafter.id}`,
 	}));
 	process.env.PI_CODING_AGENT_DIR = agentDir;
 	// The Actor's shell inherits this environment: credentials move into Pi's in-memory store first.

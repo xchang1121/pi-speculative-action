@@ -238,7 +238,7 @@ export function createSpeculativeActionHost(
 					selfSpeculation.enabled &&
 					selfSpeculation.forkEnabled &&
 					selfSpeculation.forkActionEnabled &&
-					selfSpeculation.forkTransport === "sidecar",
+					selfSpeculation.forkTransport !== "provider",
 			},
 		};
 	};

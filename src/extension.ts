@@ -14,10 +14,9 @@ import {
 } from "./action-semantics.ts";
 import { ActorStreamPreviewTracker } from "./actor-stream-preview.ts";
 import { createResourceSnapshotExecutionWorld, type AgentExecutionWorld } from "./agent-execution-world.ts";
-import { createSpeculativeActionHost, normalizeSpeculativeAgentSettings } from "./agent-integration.ts";
-import {
-	clampCandidateLimit,
-} from "./common.ts";
+import { createSpeculativeActionHost, normalizeSpeculativeAgentSettings, type CreateSpeculativeActionHostOptions } from "./agent-integration.ts";
+import { forceToolChoice } from "./drafter-plan-source.ts";
+import { clampCandidateLimit, DEFAULTS } from "./common.ts";
 import type { DrafterUtilityGateSnapshot } from "./drafter-utility-gate.ts";
 import type { PatternAwareSettings } from "./pattern-aware.ts";
 import { createClosedSearchProfile, createPiToolDefinitions, PI_CLOSED_SEARCH_TOOLS, PI_OPERATION_TOOLS, resolvePiToolInvocation, type PiToolDefinition } from "./pi-tool-invocation.ts";
@@ -43,16 +42,8 @@ import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
 import { nonEmptyTextInput, nonNegativeIntegerInput, nonNegativeNumberInput, optionalTextInput,
 	positiveIntegerInput, positiveInteger, probabilityInput, settingInput, type SettingInputDescriptor } from "./setting-input.ts";
 import { errorMessage } from "./error-utils.ts";
-import {
-	SelfSpeculationCoordinator,
-	type SelfSpeculationCoordinatorSnapshot,
-	type SelfSpeculationSettings,
-} from "./self-speculation.ts";
-import {
-	type SpeculativeActionPackageSettings,
-	SpeculativeActionSettingsStore,
-	type SpeculativeSettingsScope,
-} from "./settings-store.ts";
+import { SelfSpeculationCoordinator, type SelfSpeculationCoordinatorSnapshot, type SelfSpeculationSettings } from "./self-speculation.ts";
+import { type SpeculativeActionPackageSettings, SpeculativeActionSettingsStore, type SpeculativeSettingsScope } from "./settings-store.ts";
 import { emptySpeculativeTraceSummary, reduceSpeculativeTrace, type SpeculativeTraceSummary } from "./trace-summary.ts";
 import { resolvePatternWorkspaceIdentity } from "./workspace-identity.ts";
 import { WorkspaceSandboxService } from "./workspace-sandbox.ts";
@@ -193,7 +184,7 @@ export function formatSpeculativeActionStatus(input: {
 		`Storage policy: ${settings.resourceCacheMaxEntries} live results/${formatBytes(settings.resourceCacheMaxBytes)}; ${settings.executionStoreMaxEntries} reusable commands/${formatBytes(settings.executionStoreMaxBytes)}`,
 		`Prediction wait limit: ${formatDuration(settings.predictionTimeoutMs)}`,
 		`Learned patterns: ${settings.patternAware.enabled ? "On" : "Off"}; follow-up steps: ${settings.patternAware.multiStepEnabled ? "On" : "Off"} (alternatives/tool ${settings.patternAware.beamWidth}, depth ${settings.patternAware.maxPredictionDepth}, learn after ${settings.patternAware.minOccurrences}, gap ${settings.patternAware.maxFutureGap}, coverage ${formatPercent(settings.patternAware.futureGapCoverage)}, half-life ${settings.patternAware.decayHalfLifeEvents})`,
-		`Actor probe: ${self.enabled && self.forkEnabled ? `On (${self.forkTransport})` : "Off"}; target verification ${self.enabled ? "On" : "Off"}; early tool execution ${self.enabled && self.forkTransport === "sidecar" && self.forkEnabled && self.forkActionEnabled ? `On (tool-name confidence ≥${formatPercent(self.forkActionMinConfidence)})` : "Off"}; benefit control ${self.forkGateEnabled ? `On (${self.forkGateWindowSize} samples, ≥${formatDuration(self.forkGateMinNetBenefitMs)} net)` : "Off"}; ${self.maxCandidates} candidates × ${self.maxDraftTokens} draft tokens; Actor Profile=${self.actorProfile}; ${self.draftFormat} (${syntaxSettingLabel(self.draftBoundary)} boundary); ${self.forkTransport === "sidecar" ? self.endpoint : "provider-integrated"}`,
+		`Actor probe: ${self.enabled && self.forkEnabled ? `On (${self.forkTransport})` : "Off"}; target verification ${self.enabled ? "On" : "Off"}; early tool execution ${self.enabled && self.forkTransport !== "provider" && self.forkEnabled && self.forkActionEnabled ? self.forkTransport === "drafter" ? "On (Drafter)" : `On (tool-name confidence ≥${formatPercent(self.forkActionMinConfidence)})` : "Off"}; benefit control ${self.forkGateEnabled ? `On (${self.forkGateWindowSize} samples, ≥${formatDuration(self.forkGateMinNetBenefitMs)} net)` : "Off"}; ${self.maxCandidates} candidates × ${self.maxDraftTokens} draft tokens; Actor Profile=${self.actorProfile}; ${self.draftFormat} (${syntaxSettingLabel(self.draftBoundary)} boundary); ${self.forkTransport === "sidecar" ? self.endpoint : FORK_TRANSPORT_LABELS[self.forkTransport]}`,
 		`Prediction tools: ${toolsSummary(settings.tools)}`,
 		`Execution routing: unified ${settings.executionRouting.primary ? "On" : "Off"}; native fallback ${settings.executionRouting.nativeFallback ? "On" : "Off"}; Actor always available`,
 		`Search execution when enabled: ${searchExecutionLabel(settings.searchExecution)}`,
@@ -308,12 +299,32 @@ async function installController(
 		const previous = search; search = undefined;
 		await previous?.ready.then((profile) => profile?.pool.dispose());
 	};
+	// Registry completion takes raw per-API options; Drafter options are simple (reasoning levels) like the Actor's.
+	const completeDraft: CreateSpeculativeActionHostOptions["complete"] = (model, llmContext, options) => providerRequest.run("drafter", async () => {
+		const registry = latestContext.modelRegistry, provider = registry.getProvider(model.provider), auth = await registry.getApiKeyAndHeaders(model);
+		if (!provider || !auth.ok) throw new Error(auth.ok ? `Unknown provider: ${model.provider}` : auth.error);
+		return provider.streamSimple({ ...model, baseUrl: auth.baseUrl ?? model.baseUrl }, llmContext, { ...options, apiKey: options?.apiKey ?? auth.apiKey,
+			headers: { ...auth.headers, ...options?.headers }, env: { ...auth.env, ...options?.env } }).result();
+	});
+	const draftModelFor = (actorModel: Model<Api>) => {
+		const reference = settings().draftModel, model = reference ? findExactModelReferenceMatch(reference, latestContext.modelRegistry.getAvailable()) : actorModel;
+		if (!model && reference !== unavailableDraftModel) ui?.notify(`Drafter model ${reference} is unavailable; drafting with the active model.`, "warning");
+		unavailableDraftModel = model ? undefined : reference;
+		return model ?? actorModel;
+	};
 	const selfSpeculation = new SelfSpeculationCoordinator({
 		settings: () => {
 			const configured = settings().selfSpeculation;
 			return settings().enabled ? configured : { ...configured, enabled: false };
 		},
 		...(dependencies.selfSpeculationFetch ? { fetch: dependencies.selfSpeculationFetch } : {}),
+		// Without reasoning, the Drafter must answer with the calls the Actor's own reasoning is heading for.
+		draftFork: async ({ model, context: actorContext, reasoning, content, signal }) => {
+			const message = await completeDraft(draftModelFor(model), { ...actorContext, messages: [...actorContext.messages, { role: "user", timestamp: Date.now(),
+				content: `The assistant has begun its next reply. Its reasoning so far:\n<reasoning>\n${reasoning}\n</reasoning>${content ? `\nIts reply so far:\n${content}` : ""}\nCall exactly the tool or tools it is about to call next, with the arguments it will use.` }] },
+				{ signal, maxTokens: settings().drafterMaxTokens ?? DEFAULTS.drafterMaxTokens, onPayload: forceToolChoice(undefined) });
+			return message.content.flatMap((item) => item.type === "toolCall" ? [{ tool: item.name, input: item.arguments }] : []);
+		},
 	});
 	const [piToolSettings, patternWorkspaceIdentity] = await Promise.all([
 		loadPiToolSettings(context),
@@ -416,19 +427,8 @@ async function installController(
 	const host = (dependencies.createHost ?? createSpeculativeActionHost)(sessionID, {
 		cwd: context.cwd,
 		getSettings: runtimeSettings,
-		// Registry completion takes raw per-API options; Drafter options are simple (reasoning levels) like the Actor's.
-		complete: (model, llmContext, options) => providerRequest.run("drafter", async () => {
-			const registry = latestContext.modelRegistry, provider = registry.getProvider(model.provider), auth = await registry.getApiKeyAndHeaders(model);
-			if (!provider || !auth.ok) throw new Error(auth.ok ? `Unknown provider: ${model.provider}` : auth.error);
-			return provider.streamSimple({ ...model, baseUrl: auth.baseUrl ?? model.baseUrl }, llmContext, { ...options, apiKey: options?.apiKey ?? auth.apiKey,
-				headers: { ...auth.headers, ...options?.headers }, env: { ...auth.env, ...options?.env } }).result();
-		}),
-		draftModel: (actorModel) => {
-			const reference = settings().draftModel, model = reference ? findExactModelReferenceMatch(reference, latestContext.modelRegistry.getAvailable()) : actorModel;
-			if (!model && reference !== unavailableDraftModel) ui?.notify(`Drafter model ${reference} is unavailable; drafting with the active model.`, "warning");
-			unavailableDraftModel = model ? undefined : reference;
-			return model ?? actorModel;
-		},
+		complete: completeDraft,
+		draftModel: draftModelFor,
 		preflight: ({ toolName }) =>
 			latestContext.isProjectTrusted() && baseDefinitions.has(toolName) && pi.getActiveTools().includes(toolName),
 		resolveInvocation: async (tool, input) => {
@@ -872,20 +872,18 @@ function openActorForkSettings(
 			const active = self.enabled && self.forkEnabled;
 			actions.set(`Actor probe prediction: ${active ? "On" : "Off"}`, () => save({ ...self, enabled: active ? self.enabled : true, forkEnabled: !active }));
 			actions.set("Advanced settings › integration, decoding, verification, benefit control", () => openActorForkSettings(ctx, controller, "advanced"));
-			if (self.forkTransport === "sidecar") {
-				actions.set(...toggle("forkActionEnabled", "Use forked calls for tool pre-execution"));
-				if (self.forkActionEnabled) actions.set(...input("forkActionMinConfidence", undefined, formatPercent));
-			}
+			if (self.forkTransport !== "provider") actions.set(...toggle("forkActionEnabled", "Use forked calls for tool pre-execution"));
+			if (self.forkTransport === "sidecar" && self.forkActionEnabled) actions.set(...input("forkActionMinConfidence", undefined, formatPercent));
 		} else if (menu === "advanced") {
-			actions.set(`Integration and authentication › ${self.forkTransport === "provider" ? "Provider-integrated" : "Sidecar service"}`, () => openActorForkSettings(ctx, controller, "integration"));
+			actions.set(`Integration and authentication › ${FORK_TRANSPORT_LABELS[self.forkTransport]}`, () => openActorForkSettings(ctx, controller, "integration"));
 			actions.set(`Fork decoding › ${self.forkDecoder}, ${self.forkMaxTokens} tokens`, () => openActorForkSettings(ctx, controller, "fork"));
 			actions.set(`Target verification › ${self.maxCandidates} candidates × ${self.maxDraftTokens} tokens`, () => openActorForkSettings(ctx, controller, "target"));
 			actions.set(`Benefit control › ${self.forkGateEnabled ? "Adaptive pause on" : "Always fork"}`, () => openActorForkSettings(ctx, controller, "benefit"));
 		} else if (menu === "integration") {
-			actions.set(`Integration: ${self.forkTransport === "provider" ? "Provider-integrated" : "Sidecar service"}`, async () => {
-				const selected = await ctx.ui.select("Actor probe integration", ["Provider-integrated", "Sidecar service", BACK]);
-				if (selected === "Provider-integrated" || selected === "Sidecar service")
-					await save({ ...self, forkTransport: selected === "Provider-integrated" ? "provider" : "sidecar" });
+			actions.set(`Integration: ${FORK_TRANSPORT_LABELS[self.forkTransport]}`, async () => {
+				const selected = await ctx.ui.select("Actor probe integration", [...Object.values(FORK_TRANSPORT_LABELS), BACK]);
+				const transport = Object.entries(FORK_TRANSPORT_LABELS).find(([, label]) => label === selected)?.[0] as SelfSpeculationSettings["forkTransport"] | undefined;
+				if (transport) await save({ ...self, forkTransport: transport });
 			});
 			if (self.forkTransport === "sidecar") {
 				actions.set(...input("endpoint"));
@@ -1313,6 +1311,8 @@ function syntaxSettingLabel(value: string): string {
 function formatDrafterGateStatus(enabled: boolean, gate: DrafterUtilityGateSnapshot): string {
 	return `Action Drafter gate: ${enabled ? "On" : "Off"}; ${gate.skippedBatches} batches skipped, ${gate.samples} samples${gate.expectedNetBenefitMs === undefined ? ", benefit unmeasured" : `, ${formatDuration(gate.expectedNetBenefitMs)} budget estimate`}`;
 }
+
+const FORK_TRANSPORT_LABELS: Readonly<Record<SelfSpeculationSettings["forkTransport"], string>> = { provider: "Provider-integrated", sidecar: "Sidecar service", drafter: "Drafter reads Actor reasoning" };
 
 function formatSelfSpeculationStatus(bridge: SelfSpeculationCoordinatorSnapshot): string {
 	return [

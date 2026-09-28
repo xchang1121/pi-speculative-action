@@ -229,7 +229,7 @@ export function createDrafterPlanSource(input: {
 }
 
 /** Simple streams drop toolChoice for most APIs; spell a forced call on the final payload where the API has one. */
-function forceToolChoice(inherited: SimpleStreamOptions["onPayload"]): SimpleStreamOptions["onPayload"] {
+export function forceToolChoice(inherited: SimpleStreamOptions["onPayload"]): SimpleStreamOptions["onPayload"] {
 	return async (payload, model) => {
 		const next = (await inherited?.(payload, model)) ?? payload, forced = FORCED_TOOL_CHOICE[model.api];
 		return forced && next && typeof next === "object" && "tools" in next ? { ...next, tool_choice: forced } : next;
