@@ -1,6 +1,6 @@
 import { open, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
-import { repeatableExecutions, type TracedExecution } from "./deterministic-tools.ts";
+import { repeatableExecutions, SHELLS, type TracedExecution } from "./deterministic-tools.ts";
 import { containsLogicalPath } from "./path-utils.ts";
 import {
 	type DependencyRole,
@@ -595,6 +595,7 @@ export async function observeStrace(
 	// A complete transcript therefore permits only the existing one-shot transfer, never proof
 	// that this process can be repeated. Do not infer unused inputs from their absence here.
 	const taints = new Set<ProvenanceTaint>(["clock", "random"]), executions: TracedExecution[] = [], listingPIDs = new Set<number>();
+	const images = new Map<number, string>(); // Each process's program, inherited across a fork until it execs.
 	const { journal: resourceJournal, handled: streamCalls, retained, finalHandles } = options.inheritedHandles?.length || options.inheritedStreams?.length
 		? resourceTransitions(selected, root.file.pid, options) : { journal: [], handled: new Set<TraceLine>(), retained: [], finalHandles: [] };
 	const interposedExecutables = new Map((options.interposedExecutables ?? []).map(([intercepted, original]) => [path.posix.resolve(intercepted), path.posix.resolve(original)]));
@@ -618,6 +619,8 @@ export async function observeStrace(
 			if (ignoredSegments.get(pid)?.some(([from, to]) => index >= from && index < to)) continue;
 			const line = file.lines[index]!;
 			if (!line) continue;
+			const spawned = spawnedPID(line);
+			if (spawned && images.has(pid)) images.set(spawned, images.get(pid)!);
 			if (line.failure) { complete = false; incompleteReasons.add(line.failure); continue; }
 			const syscall = line.name;
 			if (!syscall) continue;
@@ -682,19 +685,22 @@ export async function observeStrace(
 				// A recreated null device has the same I/O semantics, but may have a different device-node inode.
 				if (/<char 1:3>>$/.test(line.args[0] ?? "")) { taints.add("descriptor_observation"); continue; }
 				const metadataPaths = syscallPaths(line, syscall, cwd) ?? [];
-				const observed = statObservationDigest(line.args[structure] ?? "");
+				// A directory descriptor's identity serves traversal (ls and fts track loops by it); printed metadata comes from path stats.
+				const directoryHandle = (syscall === "fstat" || !quotedArgument(line.args[1])) && /\bstx?_mode=S_IFDIR\b/.test(line.args[structure] ?? "");
+				const observed = statObservationDigest(line.args[structure] ?? "", directoryHandle ? ["mode"] : undefined);
 				if (!metadataPaths.length || !observed) {
 					// fstat, or an empty *at name, of a pipe or socket
 					if (descriptorTarget(line) && !quotedArgument(line.args[1])) taints.add("descriptor_observation");
 					else { taints.add("unsupported_syscall"); incompleteReasons.add(`unparsed_metadata:${syscall}:${pid}`); }
 				}
-				if (observed) {
+				// A shell stats directories only to validate $PWD: their sandbox identity never reaches its output.
+				if (observed && observed.fields?.length !== 0 && !(SHELLS.has(images.get(pid) ?? "") && /\bstx?_mode=S_IFDIR\b/.test(line.args[structure] ?? ""))) {
 					const followSymlinks = syscall !== "lstat" && !(flags && /\bAT_SYMLINK_NOFOLLOW\b/.test(line.args[flags] ?? ""));
 					for (const metadataPath of metadataPaths) observeMetadata(metadataPath, followSymlinks, observed);
 				}
 				continue;
 			}
-			if (successfulExec(line)) executions.push(tracedExecution(pid, line, cwd));
+			if (successfulExec(line)) { const execution = tracedExecution(pid, line, cwd); executions.push(execution); images.set(pid, path.posix.basename(execution.path ?? "")); }
 			if (!PATH_ARGUMENTS[syscall]) continue;
 			const role: DependencyRole = syscall === "execve" || syscall === "execveat" ? "executable" : "input";
 			const observedPaths = syscallPaths(line, syscall, cwd);
@@ -832,7 +838,13 @@ function ignoredProcessSegments(selected: ReadonlyMap<number, TraceProcess>, int
 			break;
 		}
 	}
+	// The dispatcher's own threads (libuv probes io_uring, which the sandbox denies) belong to its ignored segment.
+	for (const [pid, segments] of ignored) if (!fullyIgnored.has(pid)) for (const [from, to] of segments) for (const line of selected.get(pid)!.file.lines.slice(from, to)) {
+		const child = spawnedPID(line);
+		if (child && !fullyIgnored.has(child)) fullyIgnored.set(child, 0);
+	}
 	for (const [pid, start] of fullyIgnored) {
+		if (start === 0 && !ignored.has(pid)) ignored.set(pid, [[0, selected.get(pid)?.file.lines.length ?? Number.POSITIVE_INFINITY]]);
 		const file = selected.get(pid)?.file;
 		if (!file) continue;
 		for (const line of file.lines.slice(start)) {
@@ -946,16 +958,16 @@ const STAT_MODE_BITS: Readonly<Record<string, bigint>> = { S_IFSOCK: 0o140000n, 
 /** Normalize the successful kernel stat structure printed by strace -v; statx prints the same fields under its own names. */
 type StatObservation = { readonly digest: Sha256Digest; readonly fields?: readonly FilesystemObservationField[] };
 
-/** statx fills what its mask reports; the rest are unobserved. dev, rdev and blksize are always filled; fields outside the
- * stat structure are ignored, and an unknown flag leaves every field required. */
+/** statx fills what its mask reports and a caller reads only what it asked for; fields outside the stat structure are
+ * ignored, and an unknown flag leaves every field required. */
 const STATX_FIELD_MASKS: Readonly<Record<string, readonly FilesystemObservationField[]>> = { STATX_TYPE: ["mode"], STATX_MODE: ["mode"],
 	STATX_NLINK: ["nlink"], STATX_UID: ["uid"], STATX_GID: ["gid"], STATX_ATIME: [], STATX_MTIME: ["mtimeNs"], STATX_CTIME: ["ctimeNs"],
 	STATX_INO: ["ino"], STATX_SIZE: ["size"], STATX_BLOCKS: ["blocks"], STATX_BASIC_STATS: FILESYSTEM_OBSERVATION_FIELDS, STATX_ALL: FILESYSTEM_OBSERVATION_FIELDS,
 	...Object.fromEntries(["MNT_ID", "MNT_ID_UNIQUE", "BTIME", "DIOALIGN", "DIO_READ_ALIGN", "SUBVOL", "WRITE_ATOMIC"].map((flag) => [`STATX_${flag}`, []])) };
 
-function statObservationDigest(structure: string): StatObservation | undefined {
+function statObservationDigest(structure: string, only?: readonly FilesystemObservationField[]): StatObservation | undefined {
 	const flags = /\bstx_mask=([A-Z_|0-9x]+)/.exec(structure)?.[1]?.split("|");
-	const mask = flags?.every((flag) => STATX_FIELD_MASKS[flag]) ? flags.flatMap((flag) => STATX_FIELD_MASKS[flag]!) : undefined;
+	const mask = only ?? (flags?.every((flag) => STATX_FIELD_MASKS[flag]) ? flags.flatMap((flag) => STATX_FIELD_MASKS[flag]!) : undefined);
 	const line = structure.replace(/\bstx_(r?dev)_major=(\w+), stx_\1_minor=(\w+)/g, "st_$1=makedev($2, $3)")
 		.replace(/\bstx_([amc]time)=\{tv_sec=(-?\d+), tv_nsec=(\d+)\}/g, "st_$1=$2, st_$1_nsec=$3").replace(/\bstx_/g, "st_");
 	const field = (name: string): bigint | undefined => parseInteger(new RegExp(`\\b${name}=(-?(?:0x[0-9a-f]+|0[0-7]+|[0-9]+))`, "i").exec(line)?.[1]);
@@ -989,7 +1001,7 @@ function statObservationDigest(structure: string): StatObservation | undefined {
 		mtimeNs: time("st_mtime"),
 		ctimeNs: time("st_ctime"),
 	};
-	const fields = mask && FILESYSTEM_OBSERVATION_FIELDS.filter((field) => ["dev", "rdev", "blksize", ...mask].includes(field));
+	const fields = mask && FILESYSTEM_OBSERVATION_FIELDS.filter((field) => mask.includes(field));
 	if (fields && fields.length < FILESYSTEM_OBSERVATION_FIELDS.length) {
 		return fields.every((field) => evidence[field] !== undefined) ? { digest: filesystemObservationDigest(evidence, fields), fields } : undefined;
 	}

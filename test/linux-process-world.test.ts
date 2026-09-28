@@ -651,8 +651,9 @@ int main(int argc, char **argv) {
 			const suffix = mode === "native-merged" ? "stderr\n" : "";
 			expect((await host.execute(call("seed", command), undefined, seedFallback)).content).toEqual([{ type: "text", text: `parent\nafter\n${suffix}` }]);
 			await host.finishTurn("seed");
-			expect(seedFallback).toHaveBeenCalledOnce(); // The whole Bash metadata proof remains rejected; the child can still be adopted.
-			expect(fixture.backend.actorMetrics().hits, JSON.stringify({ actor: fixture.backend.actorMetrics(), producer: fixture.backend.metrics() })).toBe(native ? 0 : 1);
+			// The previewed whole Bash command is adopted outright once its evidence validates; a native run still binds its child.
+			expect(seedFallback).toHaveBeenCalledTimes(native ? 1 : 0);
+			expect(fixture.backend.actorMetrics().hits, JSON.stringify({ actor: fixture.backend.actorMetrics(), producer: fixture.backend.metrics() })).toBe(0);
 			binding ??= fixture.backend.executionBindings(later).at(-1);
 			expect(binding, "a real native miss must retain its launch without publishing a result").toBeDefined();
 			let retainedOperation: ExecutionOperationBinding | undefined;
@@ -1675,10 +1676,7 @@ int main(void) {
 				gate.release();
 				await Promise.all([closing, concurrent, running]);
 			} finally { gate.release(); await Promise.allSettled([closing, running]); }
-		} finally {
-			await boundary.close();
-			await rm(root, { recursive: true, force: true });
-		}
+		} finally { await boundary.close(); await rm(root, { recursive: true, force: true }); }
 	});
 	test("resumes a child in place once its recent nested runs were cheap", async ({ skip }) => {
 		if (process.platform !== "linux") return skip("Linux only");
@@ -2115,8 +2113,8 @@ int main(void) {
 				await expect(validateTransferredProcessEvidence(publishing.mock.calls[0]![0].dependencyCertificate)).resolves.toMatchObject({ status: "valid" });
 				expect(lastError).toContain(`nested_publish:${error.message}`);
 				expect(detail).toMatchObject({ certificateID: publishing.mock.calls[0]![0].id, complete: true, taints: ["clock", "random"] });
-				// The parent's independent directory identity proof must still reject this private root.
-				expect(validation).toMatchObject({ status: "stale", cause: { code: "process_dependency_changed", detail: fixture.workspace } });
+				// Only the nested publication failed; the shell's own $PWD checks never tie the parent to the private root's identity.
+				expect(validation).toMatchObject({ status: "valid" });
 				expect((await fixture.backend.store.stats()).certificates).toBe(0);
 			} else {
 				expect(validation?.status).toBe("indeterminate");
@@ -2248,11 +2246,7 @@ int main(void) {
 
 Command exited with code 3` }] } }); }
 			finally { await failed.dispose(); }
-		} finally {
-			await world.dispose?.();
-			registry.dispose();
-			await rm(root, { recursive: true, force: true });
-		}
+		} finally { await world.dispose?.(); registry.dispose(); await rm(root, { recursive: true, force: true }); }
 	});
 
 	test.for(["rename", "posix-lock", "ofd-lock", "flock", "rdtsc", "auxv-random"] as const)("rejects reuse when isolated resource semantics differ from native (%s)", { timeout: 20_000 }, async (mode, { skip }) => {

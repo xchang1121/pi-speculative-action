@@ -1880,10 +1880,7 @@ async function sourceDirectoryChanges(
 	return Object.freeze(changes);
 }
 
-function transactionDependencySource(
-	snapshot: WorkspaceStructureSnapshot,
-	effects: WorkspaceTransactionDiff,
-) {
+function transactionDependencySource(snapshot: WorkspaceStructureSnapshot, effects: WorkspaceTransactionDiff) {
 	if (!effects.complete) throw new Error(`workspace effects are incomplete: ${effects.reason}`);
 	const deltas = new Map(effects.effects.flatMap(({ relativePath, change }) =>
 		change.kind === "directory" ? [] : [[relativePath, change] as const]));
@@ -1946,11 +1943,7 @@ async function captureDependencies(
 	const incompleteReasons = new Set<string>();
 	let complete = true;
 	const add = (dependency: DynamicDependency | undefined, reason = "dependency_unavailable") => {
-		if (!dependency) {
-			complete = false;
-			incompleteReasons.add(reason);
-			return;
-		}
+		if (!dependency) { complete = false; incompleteReasons.add(reason); return; }
 		const identity = dynamicDependencyIdentity(dependency);
 		const existing = dependencies.get(identity);
 		if (
@@ -1988,12 +1981,16 @@ async function captureDependencies(
 			add(undefined, `pathname_walk:${item.path}`); continue;
 		}
 		for (const link of item.role === "metadata" ? [] : walked.links) add(await workspaceDependency(session.projection.toPhysical(link)!, link, "input"));
-		const observedPath = item.role === "metadata" ? path.resolve(item.path) : walked.path;
-		if (interposed.has(observedPath)) continue;
+		const resolved = item.role === "metadata" ? path.resolve(item.path) : walked.path;
+		if (interposed.has(resolved)) continue;
+		// A native image resumed in place runs from its shadow, a read-only mount of the original directory.
+		const shadow = session.interposition.directories.find((directory) => pathContains(directory.shadow, resolved));
+		const observedPath = shadow ? path.join(shadow.source, path.relative(shadow.shadow, resolved)) : resolved;
 		if (session.deniedPaths.some((denied) => pathContains(denied, observedPath))) { taints.add("escaped_sandbox"); incompleteReasons.add(`denied:${observedPath}`); continue; }
 		const physical = pathContains(session.sourceRoot, observedPath)
 			? (session.projection.toPhysical(observedPath) ?? observedPath)
 			: observedPath;
+		if (KERNEL_CONFIGURATION.has(observedPath)) continue; // Changes only with the kernel's own configuration, like the clock.
 		if (item.role === "metadata") {
 			add({
 				kind: "metadata",
@@ -2025,17 +2022,14 @@ async function captureDependencies(
 	}
 	for (const effect of effects) {
 		const physical = session.projection.toPhysical(effect.logicalPath);
-		if (!physical) {
-			complete = false;
-			incompleteReasons.add(`effect_unmapped:${effect.logicalPath}`);
-			continue;
-		}
+		if (!physical) { complete = false; incompleteReasons.add(`effect_unmapped:${effect.logicalPath}`); continue; }
 		add(await workspaceDependency(physical, effect.logicalPath, "input"));
 	}
 	return { complete, dependencies: [...dependencies.values()], taints: [...taints], incompleteReasons: [...incompleteReasons] };
 }
 
 const STABLE_SANDBOX_DEVICES = new Set(["/dev/null", "/dev/tty", "/dev/zero", "/dev/full"]);
+const KERNEL_CONFIGURATION = new Set(["/proc/filesystems", "/proc/mounts"]);
 const SAME_CONFINEMENT_TAINTS = ["confinement_observation"] as const;
 
 function workspaceMetadataExclusions(session: ActiveSession, target: string): readonly string[] | undefined {
@@ -2048,13 +2042,14 @@ async function captureHostPath(
 ): Promise<readonly DynamicDependency[] | undefined> {
 	const dependencies: DynamicDependency[] = [];
 	for await (const { path: current, info, link, terminal } of walkFilesystemPath(path.resolve(physicalPath))) {
-		if (["/proc", "/sys", "/dev", "/run", "/tmp", "/var/tmp", "/home"].some((root) => pathContains(root, current))) return undefined;
+		if (["/proc", "/sys", "/dev", "/run", "/tmp", "/var/tmp"].some((root) => pathContains(root, current))) return undefined;
 		if (!info) {
 			const absence = await captureAbsenceDependency(current, slash(current), true);
 			if (!absence) throw new Error("host dependency changed during capture");
 			return [...dependencies, absence];
 		}
-		if (info.uid !== 0n || (link === undefined && (info.mode & 0o022n) !== 0n)) return undefined;
+		// Root's files, and this user's own outside the workspace (a PATH through ~/.local or nvm), validate exactly; no one else may write them.
+		if (info.uid !== 0n && info.uid !== BigInt(process.getuid?.() ?? -1) || (link === undefined && (info.mode & 0o022n) !== 0n)) return undefined;
 		if (link !== undefined) dependencies.push({ kind: "symlink", path: slash(current), target: link, targetDigest: sha256Digest(Buffer.from(link, "utf8")) });
 		else if (terminal && info.isFile()) dependencies.push((await captureFileDependency(current, slash(current), role, { includeMetadata: true })).dependency);
 		else if (terminal && info.isDirectory()) dependencies.push(await captureDirectoryDependency(current, slash(current), true));
@@ -2104,10 +2099,7 @@ async function replayFilesystemEffects(
 		});
 	}
 	if (!changes.length) return;
-	await owner.commitDelta({
-		output: { result: { content: [], details: {} }, isError: false },
-		changes,
-	});
+	await owner.commitDelta({ output: { result: { content: [], details: {} }, isError: false }, changes });
 }
 
 /** Whole commands and held children publish the same ordered, content-addressed result format. */
@@ -2182,21 +2174,13 @@ async function createProcessInterposition(input: {
 		seenTargets.add(logicalDirectory);
 		const projected = input.projection.toPhysical(logicalDirectory) ?? logicalDirectory;
 		let source: string;
-		try {
-			source = await realpath(projected);
-			if (!(await lstat(source)).isDirectory()) continue;
-		} catch {
+		try { source = await realpath(projected); if (!(await lstat(source)).isDirectory()) continue; } catch {
 			continue;
 		}
 		const index = directories.length.toString().padStart(3, "0");
 		const shadow = path.join(shadowRoot, index);
 		if ([logicalDirectory, source, shadow, process.execPath, dispatcher].some((value) => /[\r\n]/.test(value))) continue;
-		directories.push({
-			source,
-			target: logicalDirectory,
-			shadow,
-			view: path.join(viewRoot, index),
-		});
+		directories.push({ source, target: logicalDirectory, shadow, view: path.join(viewRoot, index) });
 	}
 	const configurationPath = path.join(root, "configuration.json");
 	input.signal?.throwIfAborted();
@@ -2464,10 +2448,7 @@ async function runSpawn(
 		let timeout: ReturnType<typeof setTimeout> | undefined;
 		let timedOut = false;
 		if (options.timeoutSeconds !== undefined) {
-			timeout = setTimeout(() => {
-				timedOut = true;
-				terminate();
-			}, Math.max(1, options.timeoutSeconds * 1000));
+			timeout = setTimeout(() => { timedOut = true; terminate(); }, Math.max(1, options.timeoutSeconds * 1000));
 		}
 		const completed = new Promise<{ readonly code: number | null; readonly signal: NodeJS.Signals | null }>(
 			(resolve, reject) => {
@@ -2483,11 +2464,7 @@ async function runSpawn(
 			if (options.signal?.aborted) throw new Error("aborted");
 			if (timedOut) throw new Error(`timeout:${options.timeoutSeconds}`);
 			return { ...result, output };
-		} catch (error) {
-			terminate();
-			await completed.catch(() => undefined);
-			throw error;
-		} finally {
+		} catch (error) { terminate(); await completed.catch(() => undefined); throw error; } finally {
 			if (timeout) clearTimeout(timeout);
 			options.signal?.removeEventListener("abort", onAbort);
 			await releaseControl?.();

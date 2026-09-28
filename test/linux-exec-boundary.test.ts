@@ -111,7 +111,7 @@ int main(int argc, char **argv) {
 					if (scenario.name === "descriptor") {
 						expect(textOutput(branch.output.result)).toBe("descriptor-ok");
 						const validation = await branch.validate?.();
-						expect(validation?.status).toBe("indeterminate");
+						expect(validation?.status).toBe("valid"); // A one-shot transfer: the clock read by date keeps it out of history.
 						expect(produced.wholeCommandPublished).toBe(0);
 					}
 					if (scenario.name === "disposed") await branch.dispose();
