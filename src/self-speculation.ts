@@ -1,19 +1,8 @@
 import { hash, randomUUID } from "node:crypto";
 import { errorMessage } from "./error-utils.ts";
 import type { Api, AssistantMessageEvent, Context, Model } from "@earendil-works/pi-ai";
-import {
-	DEFAULT_BENEFIT_GATE_POLICY,
-	creditAdoption, BenefitGate,
-	type BenefitGatePolicy,
-} from "./fork-benefit-gate.ts";
-import {
-	createActorForkPlanSource,
-	type ActorProbeSchedule,
-	type ActorProbeSnapshot,
-	type ActorForkActionBatch,
-	type ActorForkActionEvidence,
-	type ActorForkPlanSource,
-} from "./actor-fork-plan-source.ts";
+import { DEFAULT_BENEFIT_GATE_POLICY, creditAdoption, BenefitGate, type BenefitGatePolicy } from "./fork-benefit-gate.ts";
+import { createActorForkPlanSource, type ActorProbeSchedule, type ActorProbeSnapshot, type ActorForkActionBatch, type ActorForkActionCall, type ActorForkActionEvidence, type ActorForkPlanSource } from "./actor-fork-plan-source.ts";
 import type { MaterializedSpeculativeCandidate, PredictionFeedback } from "./runtime.ts";
 import type { ActionKey } from "./action-semantics.ts";
 import type { ActorActionSettlement } from "./settlement.ts";
@@ -22,7 +11,8 @@ import { asRecord as record, isRecord, stableStringify } from "./stable-json.ts"
 import { finiteNumber, nonNegativeFinite, nonNegativeCount } from "./number-utils.ts";
 import { booleanOr, nonNegativeNumber, positiveInteger, probability, settingsParser } from "./setting-input.ts";
 
-export type SelfSpeculationForkTransport = "provider" | "sidecar";
+/** A hosted API cannot fork the Actor's decode: `drafter` has the Drafter read the Actor's reasoning so far instead. */
+export type SelfSpeculationForkTransport = "provider" | "sidecar" | "drafter";
 
 export interface SelfSpeculationSettingsInput extends Partial<SelfSpeculationSettings> {}
 
@@ -87,7 +77,7 @@ const parseSettings = settingsParser(selfSpeculationDefaults, {
 	forkEnabled: booleanOr,
 	forkActionEnabled: booleanOr,
 	forkActionMinConfidence: probability,
-	forkTransport: (value) => value === "sidecar" ? "sidecar" : "provider",
+	forkTransport: (value) => value === "sidecar" || value === "drafter" ? value : "provider",
 	forkMaxTokens: positiveInteger,
 	forkTemperature: nonNegativeNumber,
 	forkDecoder: textOr,
@@ -118,6 +108,8 @@ export interface SelfSpeculationCoordinatorOptions {
 	readonly fetch?: typeof globalThis.fetch;
 	readonly requestID?: () => string;
 	readonly actorForkPlanSource?: ActorForkPlanSource;
+	readonly draftFork?: (input: { readonly model: Model<Api>; readonly context: Context; readonly reasoning: string; readonly content: string;
+		readonly signal: AbortSignal }) => Promise<readonly Pick<ActorForkActionCall, "tool" | "input">[]>;
 }
 
 interface TurnState {
@@ -125,6 +117,7 @@ interface TurnState {
 	readonly decisionSequence: number;
 	readonly model: Model<Api>;
 	readonly context: ReturnType<typeof contextPayload>;
+	readonly actorContext: Context;
 	readonly settings: SelfSpeculationSettings;
 	readonly candidates: Map<string, CandidateRecord>;
 	requestID?: string;
@@ -147,10 +140,7 @@ interface TurnState {
 	gateSampleRecorded: boolean;
 }
 
-interface ReportedCandidate {
-	readonly sources: Set<string>;
-	readonly tools: Set<string>;
-}
+interface ReportedCandidate { readonly sources: Set<string>; readonly tools: Set<string>; }
 
 interface CandidateRecord {
 	readonly id: string;
@@ -178,10 +168,7 @@ interface CandidateCalibration {
 	readonly jointProbability: number;
 }
 
-interface ForkReceiptOutcome {
-	readonly committed: boolean;
-	readonly batches: readonly ActorForkActionBatch[];
-}
+interface ForkReceiptOutcome { readonly committed: boolean; readonly batches: readonly ActorForkActionBatch[]; }
 
 /**
  * Request-scoped decoder-feedback coordinator for a SPORK-capable engine.
@@ -192,6 +179,7 @@ export class SelfSpeculationCoordinator {
 	private readonly fetch: typeof globalThis.fetch;
 	private readonly requestID: () => string;
 	readonly actorForkPlanSource: ActorForkPlanSource;
+	private readonly draftFork: SelfSpeculationCoordinatorOptions["draftFork"];
 	private readonly forkGate = new BenefitGate();
 	private readonly decoderEvidence = new EvidenceLedger(4, 2);
 	private readonly actionEvidence = new EvidenceLedger(2, 1);
@@ -239,6 +227,7 @@ export class SelfSpeculationCoordinator {
 		this.fetch = options.fetch ?? globalThis.fetch;
 		this.requestID = options.requestID ?? randomUUID;
 		this.actorForkPlanSource = options.actorForkPlanSource ?? createActorForkPlanSource();
+		this.draftFork = options.draftFork;
 	}
 
 	startTurn(turnID: string, model: Model<Api>, context: Context, decisionSequence: number): void {
@@ -261,6 +250,7 @@ export class SelfSpeculationCoordinator {
 			decisionSequence,
 			model,
 			context: contextPayload(context),
+			actorContext: context,
 			settings,
 			candidates,
 			requestBound: false,
@@ -292,7 +282,7 @@ export class SelfSpeculationCoordinator {
 		this.actorForkPlanSource.bindActorRequest(state.turnID);
 		this.scheduleFlush(state);
 		// Only the runtime exposing the control plane accepts these fields; hosted APIs reject unknown ones.
-		return originOf(state.model.baseUrl) === originOf(settings.endpoint)
+		return settings.forkTransport !== "drafter" && originOf(state.model.baseUrl) === originOf(settings.endpoint)
 			? providerPayload(payload, settings, state.requestID, this.actorForkPlanSource.schedule) : payload;
 	}
 
@@ -373,7 +363,7 @@ export class SelfSpeculationCoordinator {
 
 	observeActorOutput(event: AssistantMessageEvent): void {
 		const state = this.active;
-		if (!state || !state.settings.forkEnabled || state.settings.forkTransport !== "sidecar") return;
+		if (!state || !state.settings.forkEnabled || state.settings.forkTransport === "provider") return;
 		if (event.type === "toolcall_start" || event.type === "done" || event.type === "error") return this.finishActorOutput();
 		const snapshot = this.actorForkPlanSource.observeActorDelta(state.turnID, event);
 		if (snapshot) this.scheduleActorProbe(state, snapshot);
@@ -385,7 +375,7 @@ export class SelfSpeculationCoordinator {
 	}
 
 	private scheduleActorProbe(state: TurnState, snapshot?: ActorProbeSnapshot): void {
-		if (state.ended || state.forkTask || !state.requestID) return;
+		if (state.ended || state.forkTask || !state.requestID && state.settings.forkTransport !== "drafter") return;
 		const probe = snapshot ?? this.actorForkPlanSource.claimPendingProbe(state.turnID);
 		if (!probe) return;
 		const settings = state.settings;
@@ -401,7 +391,7 @@ export class SelfSpeculationCoordinator {
 		}
 		this.counters.forkRequests++;
 		const probeStartedAt = performance.now(), signal = this.actorForkPlanSource.startProbe(state.turnID);
-		const task = this.post(
+		const task = (settings.forkTransport === "drafter" ? this.draftedFork(state, probe, signal) : this.post(
 			settings.forkPath,
 			{
 				version: 1,
@@ -420,10 +410,9 @@ export class SelfSpeculationCoordinator {
 			},
 			settings,
 			signal,
-		)
+		).then((receipt) => this.recordReceipt(receipt, state, true)))
 			.finally(() => { state.forkBusyMs = (state.forkBusyMs ?? 0) + performance.now() - probeStartedAt; })
-			.then((receipt) => {
-				const outcome = this.recordReceipt(receipt, state, true);
+			.then((outcome) => {
 				const exhausted = this.actorForkPlanSource.finishProbe(state.turnID);
 				if (settings.forkActionEnabled && !outcome?.committed && !exhausted) return;
 				this.actorForkPlanSource.publish(state.turnID, state.settings.forkActionEnabled ? outcome?.batches ?? [] : []);
@@ -447,6 +436,17 @@ export class SelfSpeculationCoordinator {
 			});
 		state.forkTask = task;
 		this.track(task);
+	}
+
+	/** The Drafter reads the Actor's reasoning so far and names the calls it expects next; no logprobs gate them. */
+	private async draftedFork(state: TurnState, probe: ActorProbeSnapshot, signal?: AbortSignal): Promise<ForkReceiptOutcome> {
+		if (!this.draftFork) throw new Error("self-speculation Drafter fork is not configured");
+		const calls = await this.draftFork({ model: state.model, context: state.actorContext, reasoning: probe.reasoning, content: probe.content,
+			signal: signal ?? AbortSignal.any([]) });
+		this.counters.forkCompletions++;
+		const batches = calls.length ? [{ id: sidecarActionBatchID(stableStringify(calls)), calls: calls.map((call, index) => ({ id: `${index}:fork`, index, ...call })),
+			evidence: [{ candidateIDs: [], sources: ["self-speculation"], provenance: [], actionIdentities: [], draftTokenCount: 0 }] }] : [];
+		return { committed: batches.length > 0, batches };
 	}
 
 	/** Observe the authoritative Actor action regardless of fork completion order. */
@@ -509,15 +509,11 @@ export class SelfSpeculationCoordinator {
 				provenance: candidate.provenance.map((item) => ({ ...item })),
 			}])));
 		}
-		if (!state?.requestID) return;
+		if (!state?.requestID || state.settings.forkTransport === "drafter") return;
 		const pending = [state.flushTask, state.forkTask].filter((task): task is Promise<void> => task !== undefined);
 		const cleanup = Promise.allSettled(pending)
 			.then(() =>
-				this.post(
-					state.settings.clearPath,
-					{ version: 1, request_id: state.requestID },
-					state.settings,
-				),
+				this.post(state.settings.clearPath, { version: 1, request_id: state.requestID }, state.settings),
 			)
 			.then((receipt) => this.recordVerification(receipt, state));
 		this.track(cleanup);
@@ -566,10 +562,7 @@ export class SelfSpeculationCoordinator {
 			this.counters.unresolvedDraftTokens += outcome.unresolvedDraftTokens;
 			this.lastVerification = outcome;
 			this.observeVerificationEvidence(state, outcome);
-		} catch (error) {
-			this.counters.failures++;
-			this.lastFailure = errorMessage(error);
-		}
+		} catch (error) { this.counters.failures++; this.lastFailure = errorMessage(error); }
 	}
 
 	private observeVerificationEvidence(state: TurnState, outcome: SelfSpeculationVerificationOutcome): void {
@@ -595,7 +588,7 @@ export class SelfSpeculationCoordinator {
 	}
 
 	private scheduleFlush(state: TurnState): void {
-		if (!state.requestID || state.flushTask) return;
+		if (!state.requestID || state.flushTask || state.settings.forkTransport === "drafter") return;
 		state.flushTask = this.flush(state).finally(() => {
 			state.flushTask = undefined;
 			if (state.dirty && state.requestID && this.active === state) this.scheduleFlush(state);
@@ -760,10 +753,7 @@ export class SelfSpeculationCoordinator {
 			if (!response.ok) throw new Error(`self-speculation control plane returned HTTP ${response.status}`);
 			return response.status === 204 ? undefined : await response.json().catch(() => undefined);
 		} catch (error) {
-			if (!externalSignal?.aborted) {
-				this.counters.failures++;
-				this.lastFailure = errorMessage(error);
-			}
+			if (!externalSignal?.aborted) { this.counters.failures++; this.lastFailure = errorMessage(error); }
 			throw error;
 		} finally {
 			clearTimeout(timeout);
@@ -906,13 +896,7 @@ function contextPayload(context: Context) {
 	};
 }
 
-function cloneSerializable(value: unknown): unknown {
-	try {
-		return structuredClone(value);
-	} catch {
-		return undefined;
-	}
-}
+function cloneSerializable(value: unknown): unknown { try { return structuredClone(value); } catch { return undefined; } }
 
 function modelPayload(model: Model<Api>): Readonly<Record<string, unknown>> {
 	return { provider: model.provider, api: model.api, id: model.id };
@@ -1087,13 +1071,7 @@ function parsedSidecarActionCall(value: unknown, fallbackIndex: number) {
 	const index = observedIndex !== undefined && Number.isSafeInteger(observedIndex) && observedIndex >= 0 ? observedIndex : fallbackIndex;
 	const callID = nonEmptyString(call?.call_id);
 	const format = nonEmptyString(call?.format);
-	return {
-		index,
-		...(callID ? { callID } : {}),
-		...(format ? { format } : {}),
-		tool,
-		input: structuredClone(input),
-	};
+	return { index, ...(callID ? { callID } : {}), ...(format ? { format } : {}), tool, input: structuredClone(input) };
 }
 
 function sidecarActionBatchID(fingerprint: string): string {

@@ -55,7 +55,7 @@ npm run bench:suite -- --suite swe_diverse --repeats 3 --label speculative
 
 运行经 Pi SDK 加载已安装的扩展（Pi 默认工具与系统提示、Linux 进程复用、沙箱与快照路线），设置写入运行专属 agent 目录；Linux 路线需在 WSL/Linux 中运行并提供 `PI_SPEC_SANDLOCK`/`PI_SPEC_HELD_EXEC`/`PI_SPEC_STRACE`。`bench:suite -- --paired` 对每个实例与重复交替先后运行开/关两臂，报告 `pairedRatio`（关的实际总耗时 / 开的实际总耗时，可 < 1）及各臂汇总。
 
-常用开关：`--drafter-disabled` 关闭 Drafter，`--drafter-max-depth 0` 关闭续推，`--pattern-aware --pattern-state <目录>` 启用并持久化模式学习。共享模式状态不共享工作区文件；默认最多 128 轮，达到上限属于未完成。
+常用开关：`--drafter-disabled` 关闭 Drafter，`--drafter-max-depth 0` 关闭续推，`--pattern-aware --pattern-state <目录>` 启用并持久化模式学习，`--self-speculation` 启用经 Drafter 读取 Actor 推理的 fork（`forkTransport: "drafter"`）。共享模式状态不共享工作区文件；默认最多 128 轮，达到上限属于未完成。
 
 ## 计时与验收规则
 
