@@ -8,10 +8,7 @@ export interface PredictionForecast extends ServiceTimingIdentity {
 	readonly expectedDurationMs?: number;
 	readonly resourceDemand?: number;
 	readonly decisionBatchesUntilCall?: number;
-	readonly actorPhase?: {
-		readonly kind: "decision" | "cycle";
-		readonly elapsedMs: number;
-	};
+	readonly actorPhase?: { readonly kind: "decision" | "cycle"; readonly elapsedMs: number; };
 	readonly criticalPathMs?: number;
 	readonly expectedLatencyBenefitMs?: number;
 	readonly background?: boolean;
@@ -93,10 +90,7 @@ export async function waitForCandidate<T>(
 	signal?: AbortSignal,
 	waitBudgetMs?: number,
 ): Promise<CandidateWaitResult<T>> {
-	if (signal?.aborted) {
-		void promise.catch(() => undefined);
-		return { status: "aborted" };
-	}
+	if (signal?.aborted) { void promise.catch(() => undefined); return { status: "aborted" }; }
 	const bounded = waitBudgetMs !== undefined && Number.isFinite(waitBudgetMs);
 	if (!signal && !bounded) return { status: "completed", value: await promise };
 	return new Promise((resolve, reject) => {
@@ -132,11 +126,7 @@ export type WorldCompatibilityDecision =
 			readonly detail?: string;
 	  };
 
-interface SchedulerEntry<Job> {
-	readonly job: Job;
-	work: ScheduledWork;
-	readonly sequence: number;
-}
+interface SchedulerEntry<Job> { readonly job: Job; work: ScheduledWork; readonly sequence: number; }
 
 /** Owns forecast aggregation, timing observations, capacity, and preemption. */
 export class SpeculationScheduler<Job extends object> {
@@ -144,6 +134,8 @@ export class SpeculationScheduler<Job extends object> {
 	private readonly speculativeServiceTimes = new BoundedRecencyMap<string, SampleWindow>(1024);
 	private readonly actorServiceTimes = new BoundedRecencyMap<string, SampleWindow>(1024);
 	private readonly nativeServiceTimes = new BoundedRecencyMap<string, SampleWindow>(1024);
+	/** Per timing class: how much longer the same action takes speculatively than natively (sandbox and observation). */
+	private readonly speculativeOverheads = new BoundedRecencyMap<string, SampleWindow>(256);
 	private readonly adoptionTimes = new BoundedRecencyMap<string, SampleWindow>(1024);
 	private readonly actorDecisionDurations = new SampleWindow();
 	private readonly actorCycles = new SampleWindow();
@@ -253,20 +245,11 @@ export class SpeculationScheduler<Job extends object> {
 		return Math.max(0, availableMs - duration - finite(safetyMarginMs));
 	}
 
-	assessCompatibility(
-		evidence: WorldCompatibilityEvidence,
-		actorExecutionFingerprint: string,
-	): WorldCompatibilityDecision {
+	assessCompatibility(evidence: WorldCompatibilityEvidence, actorExecutionFingerprint: string): WorldCompatibilityDecision {
 		if (evidence.status !== "compatible") {
-			return {
-				compatible: false,
-				code: evidence.status === "incompatible" ? "backend_incompatible" : "backend_indeterminate",
-				detail: evidence.detail ?? evidence.code,
-			};
+			return { compatible: false, code: evidence.status === "incompatible" ? "backend_incompatible" : "backend_indeterminate", detail: evidence.detail ?? evidence.code };
 		}
-		return evidence.executionFingerprint === actorExecutionFingerprint
-			? { compatible: true }
-			: { compatible: false, code: "execution_fingerprint_changed" };
+		return evidence.executionFingerprint === actorExecutionFingerprint ? { compatible: true } : { compatible: false, code: "execution_fingerprint_changed" };
 	}
 
 	observeActorTiming(decisionDurationMs: number, cycleDurationMs?: number): void {
@@ -277,7 +260,7 @@ export class SpeculationScheduler<Job extends object> {
 
 	/** Cancelled work supplies an exact-action duration floor, never a successful service sample. */
 	observeSpeculativeService(identity: ServiceTimingIdentity, durationMs: number, failed: boolean | "cancelled" = false): void {
-		if (!failed) this.observeTiming(this.speculativeServiceTimes, identity, durationMs);
+		if (!failed) { this.observeTiming(this.speculativeServiceTimes, identity, durationMs); this.observeOverhead(identity); }
 		else if (identity.actionKeyHash) {
 			// Failed attempts cannot stand in for successful service or affect unrelated actions in the timing class.
 			const key = timingKeys(identity)[0]!, samples = this.speculativeServiceTimes.get(key) ?? new SampleWindow();
@@ -291,6 +274,14 @@ export class SpeculationScheduler<Job extends object> {
 	observeActorService(identity: ServiceTimingIdentity, durationMs: number, nativeMs = durationMs): void {
 		this.observeTiming(this.actorServiceTimes, identity, durationMs);
 		this.observeTiming(this.nativeServiceTimes, identity, nativeMs);
+		this.observeOverhead(identity);
+	}
+
+	private observeOverhead(identity: ServiceTimingIdentity): void {
+		const [action] = timingKeys(identity);
+		const speculative = this.speculativeServiceTimes.get(action!)?.estimate(0.5), native = this.nativeServiceTimes.get(action!)?.estimate(0.5);
+		if (identity.actionKeyHash && speculative !== undefined && native !== undefined)
+			this.observeTiming(this.speculativeOverheads, { ...identity, actionKeyHash: undefined }, Math.max(0.001, speculative - native));
 	}
 
 	observeAdoption(identity: ServiceTimingIdentity, durationMs: number): void {
@@ -313,7 +304,10 @@ export class SpeculationScheduler<Job extends object> {
 		const sameAction = request.actorIdentity?.actionKeyHash === undefined || request.actorIdentity.actionKeyHash === request.identity.actionKeyHash;
 		const expectedSpeculativeMs = speculative?.exact ? speculative.value
 			: Math.max(forecastMs || (sameAction ? actor?.value ?? 0 : 0), speculative?.value ?? 0, elapsedMs) || actor?.value || 1;
-		const expectedActorMs = actor && !actor.exact && sameAction ? Math.max(actor.value, expectedSpeculativeMs) : actor?.value;
+		// Without its own Actor samples, a fallback is judged among class samples this run could still match natively (net of overhead).
+		const overheadMs = this.speculativeOverheads.get(timingKeys(request.identity).at(-1)!)?.estimate(0.5) ?? 0;
+		const classFallbackMs = actor && !actor.exact && sameAction ? actor.window.estimate(0.5, "lower", elapsedMs - overheadMs) : undefined;
+		const expectedActorMs = classFallbackMs ?? (actor && !actor.exact && sameAction ? Math.max(actor.value, expectedSpeculativeMs) : actor?.value);
 		const expectedRemainingMs =
 			request.state === "succeeded" ? 0 : Math.max(0, expectedSpeculativeMs - elapsedMs - finite(request.leadTimeMs));
 		const expectedAdoptionMs = adoption?.value ?? 0;
@@ -434,12 +428,7 @@ export class SpeculationScheduler<Job extends object> {
 	}
 }
 
-interface TimingEstimate {
-	readonly value: number;
-	readonly samples: number;
-	readonly window: SampleWindow;
-	readonly exact: boolean;
-}
+interface TimingEstimate { readonly value: number; readonly samples: number; readonly window: SampleWindow; readonly exact: boolean; }
 
 class SampleWindow {
 	private readonly values: number[] = [];
@@ -491,9 +480,12 @@ class SampleWindow {
 		return true;
 	}
 
-	estimate(value: number, selection: QuantileSelection = "lower"): number | undefined {
-		if (!this.values.length) return this.lowerBound || undefined;
-		const sorted = this.sortedValues ??= [...this.values].sort((left, right) => left - right);
+	/** `above` restricts the quantile to longer samples, and has no estimate when none is longer. */
+	estimate(value: number, selection: QuantileSelection = "lower", above?: number): number | undefined {
+		if (!this.values.length) return above === undefined ? this.lowerBound || undefined : undefined;
+		const all = this.sortedValues ??= [...this.values].sort((left, right) => left - right);
+		const sorted = above === undefined ? all : all.filter((sample) => sample > above);
+		if (!sorted.length) return undefined;
 		const index = (sorted.length - 1) * Math.max(0, Math.min(1, value));
 		return Math.max(this.lowerBound, sorted[selection === "upper" ? Math.ceil(index) : Math.floor(index)]!);
 	}
