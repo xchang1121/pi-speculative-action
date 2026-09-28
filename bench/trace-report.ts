@@ -15,6 +15,7 @@ export function benchmarkTraceReport<SessionID>(
 	const native = actors.flatMap((event) => event.settlement.provider.kind === "actor"
 		? [{ tool: event.settlement.tool, origin: event.settlement.provider.origin }] : []);
 	const actorActionTrace = actors.map((event) => ({
+		id: event.settlement.actorAction.id,
 		turnID: event.turnID,
 		sequence: event.settlement.actorAction.sequence,
 		tool: event.settlement.tool,
