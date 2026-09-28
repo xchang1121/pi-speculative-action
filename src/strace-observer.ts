@@ -864,9 +864,7 @@ function tracedExecution(pid: number, line: TraceLine, cwd: string): TracedExecu
 		const image = line.name === "execve" ? quotedArgument(line.args[0]) : undefined, argv = line.args[line.name === "execve" ? 1 : 2] ?? "";
 		return { pid, ...(image ? { path: tracedPath(image, cwd) } : {}),
 			argv: /^\[.*\]$/su.test(argv) ? [...argv.matchAll(/"((?:\\.|[^"\\])*)"/g)].map((match) => decodeCString(match[1]!)) : [] };
-	} catch {
-		return { pid, argv: [] }; // Undecodable arguments prove nothing.
-	}
+	} catch { return { pid, argv: [] }; } // Undecodable arguments prove nothing.
 }
 
 function successfulExec(line: TraceLine): boolean {
@@ -938,7 +936,7 @@ function absoluteDescriptorPath(descriptor: string | undefined): string | undefi
 /** Non-path descriptors, and memfds such as Sandlock's virtual /proc/mounts (its content comes from the opened path), are
  * already typed in the process key, but their kernel identity is volatile. */
 function descriptorTarget(line: TraceLine): boolean {
-	const target = /^\d+<(.+)>$/.exec(line.args[0] ?? "")?.[1];
+	const target = /^\d+<(.+)>(?:\(deleted\))?$/.exec(line.args[0] ?? "")?.[1]; // strace marks an unlinked memfd after its bracket
 	return Boolean(target && (!target.startsWith("/") || target.startsWith("/memfd:")));
 }
 
