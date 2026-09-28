@@ -748,6 +748,7 @@ export class LinuxProcessReuseBackend {
 				const after = await session.workspace.structure.capture();
 				const observation = await observeStrace(tracePrefix, session.invocation.shell, logicalCwd, {
 					interposedExecutables: session.interposition.executables,
+					...(session.topLevelOutputEndpoints ? { outputEndpoints: session.topLevelOutputEndpoints } : {}),
 					guardFilesystemSemanticsWithin: [session.workspace.sandboxRoot, session.sourceRoot],
 				});
 				session.topLevelCapture = { before, after, observation };
@@ -2011,7 +2012,7 @@ async function captureDependencies(
 		if (KERNEL_CONFIGURATION.has(observedPath)) continue; // Changes only with the kernel's own configuration, like the clock.
 		// A process reading its own state, or the host's CPU and cgroup limits, observes this one run like the clock or its pid.
 		if (/^\/proc\/(?:self|thread-self|\d+)(?:\/|$)/.test(observedPath)) { taints.add("pid_observation"); continue; }
-		if (/^\/sys\/(?:devices\/system\/cpu|fs\/cgroup)(?:\/|$)/.test(observedPath)) { taints.add("clock"); continue; }
+		if (/^\/sys\/(?:devices\/system\/cpu|fs\/cgroup)(?:\/|$)|^\/proc\/(?:meminfo|version|version_signature|cpuinfo|stat|loadavg|uptime)$/.test(observedPath)) { taints.add("clock"); continue; }
 		if (item.role === "metadata") {
 			add({
 				kind: "metadata",
