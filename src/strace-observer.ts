@@ -1,6 +1,6 @@
 import { open, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
-import { repeatableExecutions, SHELLS, type TracedExecution } from "./deterministic-tools.ts";
+import { DEVICE_BLIND, repeatableExecutions, SHELLS, type TracedExecution } from "./deterministic-tools.ts";
 import { containsLogicalPath } from "./path-utils.ts";
 import {
 	type DependencyRole,
@@ -595,6 +595,7 @@ export async function observeStrace(
 	// that this process can be repeated. Do not infer unused inputs from their absence here.
 	const taints = new Set<ProvenanceTaint>(["clock", "random"]), executions: TracedExecution[] = [], listingPIDs = new Set<number>();
 	const images = new Map<number, string>(); // Each process's program, inherited across a fork until it execs.
+	const deviceBlind = new Set<number>();
 	const { journal: resourceJournal, handled: streamCalls, retained, finalHandles } = options.inheritedHandles?.length || options.inheritedStreams?.length
 		? resourceTransitions(selected, root.file.pid, options) : { journal: [], handled: new Set<TraceLine>(), retained: [], finalHandles: [] };
 	const interposedExecutables = new Map((options.interposedExecutables ?? []).map(([intercepted, original]) => [path.posix.resolve(intercepted), path.posix.resolve(original)]));
@@ -618,7 +619,7 @@ export async function observeStrace(
 			const line = file.lines[index]!;
 			if (!line) continue;
 			const spawned = spawnedPID(line);
-			if (spawned && images.has(pid)) images.set(spawned, images.get(pid)!);
+			if (spawned && images.has(pid)) { images.set(spawned, images.get(pid)!); if (deviceBlind.has(pid)) deviceBlind.add(spawned); }
 			if (line.failure) { complete = false; incompleteReasons.add(line.failure); continue; }
 			const syscall = line.name;
 			if (!syscall) continue;
@@ -685,7 +686,9 @@ export async function observeStrace(
 				const metadataPaths = syscallPaths(line, syscall, cwd) ?? [];
 				// A directory descriptor's identity serves traversal (ls and fts track loops by it); printed metadata comes from path stats.
 				const directoryHandle = (syscall === "fstat" || !quotedArgument(line.args[1])) && /\bstx?_mode=S_IFDIR\b/.test(line.args[structure] ?? "");
-				const observed = statObservationDigest(line.args[structure] ?? "", directoryHandle ? ["mode"] : undefined);
+				// The sandbox serves the workspace from another device; a device-blind program's workspace stats never show it.
+				const blind = deviceBlind.has(pid) && metadataPaths.length > 0 && metadataPaths.every((target) => semanticRoots.some((root) => containsLogicalPath(root, target)));
+				const observed = statObservationDigest(line.args[structure] ?? "", directoryHandle ? ["mode"] : undefined, blind);
 				if (!metadataPaths.length || !observed) {
 					// fstat, or an empty *at name, of a pipe or socket
 					if (descriptorTarget(line) && !quotedArgument(line.args[1])) taints.add("descriptor_observation");
@@ -698,7 +701,11 @@ export async function observeStrace(
 				}
 				continue;
 			}
-			if (successfulExec(line)) { const execution = tracedExecution(pid, line, cwd); executions.push(execution); images.set(pid, path.posix.basename(execution.path ?? "")); }
+			if (successfulExec(line)) {
+				const execution = tracedExecution(pid, line, cwd), image = path.posix.basename(execution.path ?? "");
+				executions.push(execution); images.set(pid, image);
+				if (DEVICE_BLIND.has(image) && !execution.argv.some((argument) => argument.includes("%D"))) deviceBlind.add(pid); else deviceBlind.delete(pid);
+			}
 			if (!PATH_ARGUMENTS[syscall]) continue;
 			const role: DependencyRole = syscall === "execve" || syscall === "execveat" ? "executable" : "input";
 			const observedPaths = syscallPaths(line, syscall, cwd);
@@ -956,9 +963,10 @@ const STATX_FIELD_MASKS: Readonly<Record<string, readonly FilesystemObservationF
 	STATX_INO: ["ino"], STATX_SIZE: ["size"], STATX_BLOCKS: ["blocks"], STATX_BASIC_STATS: FILESYSTEM_OBSERVATION_FIELDS, STATX_ALL: FILESYSTEM_OBSERVATION_FIELDS,
 	...Object.fromEntries(["MNT_ID", "MNT_ID_UNIQUE", "BTIME", "DIOALIGN", "DIO_READ_ALIGN", "SUBVOL", "WRITE_ATOMIC"].map((flag) => [`STATX_${flag}`, []])) };
 
-function statObservationDigest(structure: string, only?: readonly FilesystemObservationField[]): StatObservation | undefined {
+function statObservationDigest(structure: string, only?: readonly FilesystemObservationField[], withoutDevice = false): StatObservation | undefined {
 	const flags = /\bstx_mask=([A-Z_|0-9x]+)/.exec(structure)?.[1]?.split("|");
-	const mask = only ?? (flags?.every((flag) => STATX_FIELD_MASKS[flag]) ? flags.flatMap((flag) => STATX_FIELD_MASKS[flag]!) : undefined);
+	const requested = only ?? (flags?.every((flag) => STATX_FIELD_MASKS[flag]) ? flags.flatMap((flag) => STATX_FIELD_MASKS[flag]!) : undefined);
+	const mask = withoutDevice ? (requested ?? FILESYSTEM_OBSERVATION_FIELDS).filter((field) => field !== "dev") : requested;
 	const line = structure.replace(/\bstx_(r?dev)_major=(\w+), stx_\1_minor=(\w+)/g, "st_$1=makedev($2, $3)")
 		.replace(/\bstx_([amc]time)=\{tv_sec=(-?\d+), tv_nsec=(\d+)\}/g, "st_$1=$2, st_$1_nsec=$3").replace(/\bstx_/g, "st_");
 	const field = (name: string): bigint | undefined => parseInteger(new RegExp(`\\b${name}=(-?(?:0x[0-9a-f]+|0[0-7]+|[0-9]+))`, "i").exec(line)?.[1]);

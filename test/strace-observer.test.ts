@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, test } from "vitest";
-import { filesystemObservationDigest } from "../src/provenance-certificate.ts";
+import { FILESYSTEM_OBSERVATION_FIELDS, filesystemObservationDigest } from "../src/provenance-certificate.ts";
 import { observeStrace, straceCommand, type StraceObservationOptions } from "../src/strace-observer.ts";
 
 const EXEC = 'execve("/usr/bin/example", ["example"], 0x0) = 0';
@@ -27,6 +27,20 @@ async function observe(processes: Record<number, readonly string[]>, options?: S
 }
 
 describe("strace provenance decoder", () => {
+	test("leaves the sandbox's device out of a device-blind program's workspace stats", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-device-blind-")), prefix = path.join(root, "process");
+		const run = async (argv: readonly string[], target: string) => {
+			await fs.writeFile(`${prefix}.100`, [`execve("/usr/bin/${argv[0]}", [${argv.map((item) => `"${item}"`).join(", ")}], 0x0) = 0`,
+				`newfstatat(AT_FDCWD, "${target}", ${STAT}, AT_SYMLINK_NOFOLLOW) = 0`, "+++ exited with 0 +++"].join("\n"));
+			return (await observeStrace(prefix, `/usr/bin/${argv[0]}`, "/work", { guardFilesystemSemanticsWithin: ["/work"] })).paths.find((item) => item.role === "metadata");
+		};
+		try {
+			expect(await run(["ls", "-la"], "/work/a.txt")).toMatchObject({ path: "/work/a.txt", fields: FILESYSTEM_OBSERVATION_FIELDS.filter((field) => field !== "dev") });
+			for (const [argv, target] of [[["stat", "a.txt"], "/work/a.txt"], [["ls", "-la"], "/etc/hosts"], [["find", ".", "-printf", "%D %p"], "/work/a.txt"]] as const)
+				expect(await run(argv, target)).toSatisfy((item?: { path: string; fields?: unknown }) => item?.path === target && item.fields === undefined);
+		} finally { await fs.rm(root, { recursive: true, force: true }); }
+	});
+
 	test("replays across turns only a transcript of whitelisted system tools that cannot pass on the clock, randomness or readdir order", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-repeatable-")), prefix = path.join(root, "process");
 		const exec = (image: string, ...argv: string[]) => `execve("${image}", ${JSON.stringify([path.posix.basename(image), ...argv])}, 0x0) = 0`;

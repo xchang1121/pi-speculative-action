@@ -24,6 +24,10 @@ const TOOLS: Readonly<Record<string, ToolRule>> = {
 		subcommands: new Set(["status", "diff", "log", "show", "rev-parse", "ls-files", "branch", "grep", "blame", "cat-file"]) },
 };
 export const SHELLS: ReadonlySet<string> = new Set(["bash", "sh", "dash"]);
+/** Programs that never print a device number and compare one only within the tree they walk: a sandbox's other
+ * device for the workspace cannot reach their output (find, unless its -printf asks for %D). */
+export const DEVICE_BLIND: ReadonlySet<string> = new Set([...SHELLS, ...Object.keys(TOOLS).filter((name) => name !== "env"), "ls", "git", "find", "make", "rg",
+	"awk", "gawk", "mawk", "sort", "xargs", "cp", "mv", "rm", "ln", "mkdir", "rmdir", "touch", "chmod"]);
 /** Shell text that reads what differs between runs: special parameters, time formats, the time keyword and job pids. */
 const VOLATILE_SHELL = /\$\{?(?:RANDOM|SRANDOM|BASHPID|SECONDS|EPOCHSECONDS|EPOCHREALTIME|PPID|\$|!)(?![A-Za-z0-9_])|%\(|(?:^|[\s;&|(])(?:times?|jobs)(?=[\s;&|)]|$)/;
 
