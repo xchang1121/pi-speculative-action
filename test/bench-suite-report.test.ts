@@ -74,7 +74,7 @@ describe("ablation suite report", () => {
 		const fail = (phase: string) => { phases.push(phase); throw new Error(`${phase} failed`); };
 		vi.resetModules();
 		vi.doMock("node:fs/promises", () => ({
-			mkdir: async () => {}, mkdtemp: async () => path.resolve("offline-task"), stat: async () => ({}),
+			mkdir: async () => {}, mkdtemp: async () => path.resolve("offline-task"), stat: async () => ({}), readFile: async () => { throw new Error("ENOENT"); },
 			writeFile: async (file: string, data: string) => { files.set(file, data); },
 		}));
 		vi.doMock("node:child_process", () => ({ execFile: (_file: string, args: string[], _options: unknown,

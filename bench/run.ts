@@ -1,7 +1,7 @@
 import { safeName } from "./suite-report.ts";
 import { benchmarkTraceReport } from "./trace-report.ts";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -127,8 +127,8 @@ if (options.prepareOnly) {
 }
 
 async function prepareTask(input: BenchmarkOptions) {
-	const row = await datasetRow(input.instance);
 	await Promise.all([mkdir(input.repoCache, { recursive: true }), mkdir(input.runRoot, { recursive: true })]);
+	const row = await datasetRow(input.instance, path.join(input.repoCache, "claw-swe-bench-lite.json"));
 	const cache = path.join(input.repoCache, `${safeName(row.repo)}.git`);
 	if (!(await exists(cache))) {
 		await command("git", ["init", "--bare", cache]);
@@ -352,10 +352,14 @@ function benchmarkShellEnvironment(): Record<string, string> {
 	);
 }
 
-async function datasetRow(instanceID: string): Promise<DatasetRow> {
-	const response = await fetch(DATASET_ROWS);
-	if (!response.ok) throw new Error(`Dataset request failed with HTTP ${response.status}`);
-	const value: unknown = await response.json();
+/** The dataset rows are fetched once per repository cache: every run of a suite reads the same rows. */
+async function datasetRow(instanceID: string, cache: string): Promise<DatasetRow> {
+	let value: unknown = await readFile(cache, "utf8").then(JSON.parse, () => undefined);
+	if (!value) {
+		const response = await fetch(DATASET_ROWS);
+		if (!response.ok) throw new Error(`Dataset request failed with HTTP ${response.status}`);
+		await writeFile(cache, JSON.stringify(value = await response.json()));
+	}
 	if (!value || typeof value !== "object" || !("rows" in value) || !Array.isArray(value.rows)) {
 		throw new Error("Dataset response has no rows");
 	}
@@ -370,16 +374,7 @@ async function datasetRow(instanceID: string): Promise<DatasetRow> {
 function validDatasetRow(value: unknown): DatasetRow | undefined {
 	if (!value || typeof value !== "object") return undefined;
 	const row = value as Partial<Record<keyof DatasetRow, unknown>>;
-	for (const key of [
-		"instance_id",
-		"repo",
-		"base_commit",
-		"patch",
-		"test_patch",
-		"problem_statement",
-		"language",
-		"source_dataset",
-	] as const) {
+	for (const key of ["instance_id", "repo", "base_commit", "patch", "test_patch", "problem_statement", "language", "source_dataset"] as const) {
 		if (typeof row[key] !== "string") return undefined;
 	}
 	for (const key of ["FAIL_TO_PASS", "PASS_TO_PASS"] as const) {
