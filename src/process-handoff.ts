@@ -1,4 +1,4 @@
-import { snapshotExecutionScope, type ExecutionScope, type ExecutionOperationAdoption } from "./execution-world.ts";
+import { SALVAGE_MS, snapshotExecutionScope, type ExecutionScope, type ExecutionOperationAdoption } from "./execution-world.ts";
 import { EffectCommitFailure, effectCommitFailure } from "./effect-transaction.ts";
 import type { ProcessProvenanceCertificate, Sha256Digest } from "./provenance-certificate.ts";
 import { immutableSnapshot, isImmutableSnapshot, stableEqual } from "./stable-json.ts";
@@ -9,17 +9,18 @@ export class ProcessHandoffOwnership {
 	private state: "available" | "partial" | "whole" = "available";
 	private transfer?: { readonly apply: WeakRef<() => Promise<unknown>>; readonly result: Promise<unknown> };
 	private readonly observer?: WeakRef<(adoption: ExecutionOperationAdoption) => void>;
-	private readonly scopeOwner?: WeakRef<(scope: ExecutionScope) => boolean>;
+	private readonly scopeOwner?: WeakRef<(scope: ExecutionScope, salvage?: boolean) => boolean>;
 
-	constructor(observer?: (adoption: ExecutionOperationAdoption) => void, acceptScope?: (scope: ExecutionScope) => boolean) {
+	constructor(observer?: (adoption: ExecutionOperationAdoption) => void, acceptScope?: (scope: ExecutionScope, salvage?: boolean) => boolean) {
 		if (observer) this.observer = new WeakRef(observer);
 		if (acceptScope) this.scopeOwner = new WeakRef(acceptScope);
 	}
 
-	/** A live plan consumer may own this one-shot computation beyond its production turn. */
-	acceptsScope(producer: ExecutionScope | undefined, consumer: ExecutionScope | undefined): boolean {
+	/** A live plan consumer may own this one-shot computation beyond its production turn; so may, while its owner still
+	 * speculates, a later Actor call of the same launch when the result is complete and recent (`salvage`). */
+	acceptsScope(producer: ExecutionScope | undefined, consumer: ExecutionScope | undefined, salvage = false): boolean {
 		if (!producer || !consumer || producer.sessionID !== consumer.sessionID) return false;
-		return sameScope(producer, consumer) || this.scopeOwner?.deref()?.(consumer) === true;
+		return sameScope(producer, consumer) || this.scopeOwner?.deref()?.(consumer, salvage) === true;
 	}
 
 	/** Observational only; a retained certificate must not keep an expired runtime alive. */
@@ -81,6 +82,7 @@ interface HandoffRecord extends ProcessHandoff {
 	readonly executablePath: string;
 	readonly settle: () => void;
 	continuation?: ProcessContinuation;
+	completedAt?: number;
 }
 
 export type ProcessHandoffAcquisition<Plan> =
@@ -216,7 +218,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 				if (state.status !== "completed" || !state.candidate || considered.has(record)) return [];
 					const oneShot = state.candidate.dependencyCertificate.taints.length > 0 || !!state.candidate.result.continuation;
 					if (state.candidate.result.continuation && !record.continuation) return [];
-				return oneShot && (!record.ownership.acceptsScope(record.scope, scope) || record.ownership.wholeClaimed)
+				return oneShot && (!this.transferable(record, scope, request.role) || record.ownership.wholeClaimed)
 					? [] : [{ record, state, candidate: state.candidate, oneShot }];
 			});
 			if (completed.length) {
@@ -224,7 +226,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 				const selected = completed.find(({ candidate }) => candidate === plan?.certificate);
 				for (const { record, candidate } of selected ? [selected] : completed) considered.set(record, candidate.id);
 				if (plan && selected && selected.record.state === selected.state && this.byKey.get(request.key)?.has(selected.record) &&
-					(!selected.oneShot || (selected.record.ownership.acceptsScope(selected.record.scope, scope) && selected.record.ownership.claimChild()))) {
+					(!selected.oneShot || (this.transferable(selected.record, scope, request.role) && selected.record.ownership.claimChild()))) {
 					// Retain bounded launch parameters without granting another transfer of this result.
 					if (selected.oneShot) selected.record.state = { ...selected.state, status: "retained" };
 					const continuation = selected.record.continuation;
@@ -272,6 +274,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 			(continuation.image.length !== candidate!.result.continuation!.imageBytes || continuation.image.length > this.maxRetainedBytes)) return false;
 		if (continuation) { record.continuation = continuation; this.retainedBytes += continuation.image.length; }
 		record.state = { status: "completed", ...(candidate ? { candidate } : {}) };
+		record.completedAt = performance.now();
 		this.completedCount++;
 		if (candidate) record.computation = continuation?.computation ?? new TimelineInterval(record.startedAt, performance.now());
 		record.settle();
@@ -293,6 +296,11 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		}
 		this.byKey.clear();
 		this.completedCount = 0;
+	}
+
+	/** Validated like history and used at most once; a suspended image never leaves its consumer's scope. */
+	private transferable(record: HandoffRecord, scope: ExecutionScope | undefined, role: "producer" | "actor"): boolean {
+		return record.ownership.acceptsScope(record.scope, scope, role === "actor" && !record.continuation && performance.now() - record.completedAt! <= SALVAGE_MS);
 	}
 
 	private reserve(key: Sha256Digest, executablePath: string, ownership: ProcessHandoffOwnership, scope?: ExecutionScope): HandoffRecord {

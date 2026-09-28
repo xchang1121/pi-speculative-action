@@ -11,7 +11,7 @@ import { errorDetail } from "./error-utils.ts";
 import { diagnosticAction } from "./diagnostics.ts";
 import { effectCommitFailure, isPoisonedEffectCommit } from "./effect-transaction.ts";
 import type { CandidateEventDescriptor, CandidateExecutionProjection } from "./events.ts";
-import { type ExecutionOperationAdoption, type ExecutionOperationBinding, type ExecutionScope, type SpeculativeExecutionRoute, sameSpeculativeExecutionRoute, validateWorldBranch, type WorldBranch } from "./execution-world.ts";
+import { SALVAGE_MS, type ExecutionOperationAdoption, type ExecutionOperationBinding, type ExecutionScope, type SpeculativeExecutionRoute, sameSpeculativeExecutionRoute, validateWorldBranch, type WorldBranch } from "./execution-world.ts";
 import type { PlanUpdate } from "./plan-proposal.ts";
 import { PlanRuntime, type PlanRuntimeNode, type PredictionOpportunity } from "./plan-runtime.ts";
 import { BoundedEventQueue, PostSettlementQueue } from "./post-settlement.ts";
@@ -410,7 +410,7 @@ interface CandidateRecord<Output, StartInput = unknown, StateData = unknown> {
 	resultViews?: Map<string, { readonly output: Output; readonly bytes: number; readonly execution: TimelineInterval; readonly inputs?: boolean; readonly compatibility?: WorldBranch<Output>["compatibility"]; readonly validate?: WorldBranch<Output>["validate"]; readonly resource?: ProjectionResource; readonly capturedBytes?: number; readonly requiresQueryValidation?: true }>;
 	previews?: Set<ActorPreviewRecord>;
 	onOperationAdopted?: (adoption: ExecutionOperationAdoption) => void;
-	acceptOperationScope?: (scope: ExecutionScope) => boolean;
+	acceptOperationScope?: (scope: ExecutionScope, salvage?: boolean) => boolean;
 	validationMs: number;
 	validationBytes: number;
 	validationFiles: number;
@@ -449,6 +449,8 @@ interface SessionState<SessionID, Output, StartInput, StateData> {
 	pendingSourceRequests: number;
 	pendingAdmissions: number;
 	pendingLaunch?: Promise<void>;
+	/** Scope policies a process handoff holds weakly, kept for salvage while the session lives. */
+	readonly salvageScopes: Map<object, number>;
 }
 
 interface TurnState<SessionID, Output, StartInput, StateData> extends RuntimeTurnContext<StartInput, StateData> {
@@ -580,6 +582,7 @@ export function makeSpeculativeActionRuntime<
 			sourceRequestSequence: 0,
 			pendingSourceRequests: 0,
 			pendingAdmissions: 0,
+			salvageScopes: new Map(),
 		};
 		sessionStates.set(sessionID, created);
 		return created;
@@ -1262,13 +1265,17 @@ export function makeSpeculativeActionRuntime<
 			// A root fork outliving its turn runs in the live turn's scope: its own turn's snapshots and handoffs are closed.
 			const live = parent || session.turns.get(owner.turnID)?.lifecycle === "active" ? undefined
 				: [...session.turns.values()].find((turn) => turn.lifecycle === "active")?.startInput;
-			candidate.acceptOperationScope = scope => {
+			candidate.acceptOperationScope = (scope, salvage) => {
 				const turn = session.turns.get(scope.turnID);
-				if (session.lifecycle.sealed || masterDisabled() || scope.sessionID !== session.id ||
-					turn?.lifecycle !== "active" || candidate.work.controller.signal.aborted || !candidateStore.has(session.id, candidate)) return false;
+				if (session.lifecycle.sealed || masterDisabled() || scope.sessionID !== session.id || turn?.lifecycle !== "active") return false;
+				// A completed child its prediction left unused serves the Actor's later call of the same launch.
+				if (salvage) return true;
+				if (candidate.work.controller.signal.aborted || !candidateStore.has(session.id, candidate)) return false;
 				return session.plan.matchable(turn.decisionSequence).some(node =>
 					"candidateID" in node.execution && node.execution.candidateID === candidate.id);
 			};
+			for (const [policy, at] of session.salvageScopes) if (startedAt - at > SALVAGE_MS) session.salvageScopes.delete(policy);
+			session.salvageScopes.set(candidate.acceptOperationScope, startedAt);
 			if (candidate.owner.draft.type === "operation") candidate.onOperationAdopted = adoption => {
 				const turn = session.turns.get(adoption.scope.turnID);
 				if (session.lifecycle.sealed || session.id !== adoption.scope.sessionID || !turn ||

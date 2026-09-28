@@ -41,12 +41,13 @@ describe("strace provenance decoder", () => {
 				[["find", ".", "-newer", "b"], withoutDevice], [["bash", "-c", "true"], withoutDevice], [["git", "status"], withoutDevice], [["python3", "x.py"], withoutDevice]] as const)
 				expect((await fields(argv)).fields, argv.join(" ")).toEqual(all.filter((field) => (expected as readonly string[]).includes(field)));
 			const directory = `newfstatat(AT_FDCWD, "/work/src", ${STAT.replace("S_IFREG", "S_IFDIR")}, 0) = 0`;
-			expect((await run(["git", "status"], "/work/a.txt", [directory])).paths.find((item) => item.path === "/work/src")).toMatchObject({ fields: ["mode"] });
+			for (const image of ["git", "node"]) expect((await run([image, "x"], "/work/a.txt", [directory])).paths.find((item) => item.path === "/work/src")).toMatchObject({ fields: ["mode", "uid", "gid"] });
 			for (const [argv, target] of [[["stat", "a.txt"], "/work/a.txt"], [["cat", "hosts"], "/etc/hosts"], [["find", ".", "-printf", "%D %p"], "/work/a.txt"]] as const)
 				expect((await fields(argv, target)).fields, argv.join(" ")).toBeUndefined();
 			const flags = "fcntl(4</work>, F_GETFL) = 0x38800 (flags O_RDONLY|O_NONBLOCK|O_LARGEFILE|O_NOFOLLOW|O_DIRECTORY)";
 			expect((await run(["find", "."], "/work/a.txt", ['openat(AT_FDCWD, ".", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = 4</work>', flags])).taints).not.toContain("unsupported_syscall");
 			expect((await run(["find", "."], "/work/a.txt", [flags])).taints).toContain("unsupported_syscall");
+			expect((await run(["python3", "x.py"], "/work/a.txt", ['ioctl(3</work/x.py>, FIOCLEX) = 0'])).taints).not.toContain("unsupported_syscall");
 			// A read-only repository refuses git's index lock: harmless to a git that still succeeds (status), not to one that fails (add).
 			const lock = 'openat(AT_FDCWD, "/work/.git/index.lock", O_RDWR|O_CREAT|O_EXCL|O_CLOEXEC, 0666) = -1 EACCES (Permission denied)';
 			for (const [exit, tainted] of [[0, false], [128, true]] as const) {

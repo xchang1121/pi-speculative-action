@@ -256,7 +256,7 @@ export interface SpeculativeActionRuntimeAdapter<
 		/** Sealed input owners leased until execution settles; the backend must retain any derived proof. */
 		readonly inputs?: (path: string) => Iterable<object>;
 		readonly onOperationAdopted?: (adoption: ExecutionOperationAdoption) => void;
-		readonly acceptOperationScope?: (scope: ExecutionScope) => boolean;
+		readonly acceptOperationScope?: (scope: ExecutionScope, salvage?: boolean) => boolean;
 	}) => MaybePromise<WorldBranch<Output>>;
 	readonly projectionRules?: readonly ActionProjectionRule<Output>[];
 	readonly rejectCandidateOutput?: (input: {

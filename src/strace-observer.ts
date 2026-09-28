@@ -1,6 +1,6 @@
 import { open, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
-import { FILESYSTEM_TYPE_BLIND, hostStatFields, repeatableExecutions, SHELLS, workspaceStatFields, type TracedExecution } from "./deterministic-tools.ts";
+import { directoryStatFields, FILESYSTEM_TYPE_BLIND, hostStatFields, repeatableExecutions, SHELLS, workspaceStatFields, type TracedExecution } from "./deterministic-tools.ts";
 import { containsLogicalPath } from "./path-utils.ts";
 import {
 	type DependencyRole,
@@ -716,11 +716,11 @@ export async function observeStrace(
 				if (/<char 1:3>>$/.test(line.args[0] ?? "")) { taints.add("descriptor_observation"); continue; }
 				const metadataPaths = syscallPaths(line, syscall, cwd) ?? [];
 				// A directory descriptor's identity serves traversal (ls and fts track loops by it); printed metadata comes from path stats.
-				// git's untracked cache trusts a directory's times only to skip a listing it records anyway.
-				const directory = /\bstx?_mode=S_IFDIR\b/.test(line.args[structure] ?? ""), directoryHandle = directory && (syscall === "fstat" || !quotedArgument(line.args[1]) || images.get(pid) === "git");
+				const directory = /\bstx?_mode=S_IFDIR\b/.test(line.args[structure] ?? ""), directoryHandle = directory && (syscall === "fstat" || !quotedArgument(line.args[1]));
 				// Only the fields a program reveals of a workspace file are its dependency (see workspaceStatFields).
 				const workspace = metadataPaths.length > 0 && metadataPaths.every((target) => semanticRoots.some((root) => containsLogicalPath(root, target)));
-				const observed = statObservationDigest(line.args[structure] ?? "", directoryHandle ? ["mode"] : undefined, workspace ? statFields.get(pid) : hostStatFields(images.get(pid) ?? ""));
+				const fields = workspace ? statFields.get(pid) : hostStatFields(images.get(pid) ?? "");
+				const observed = statObservationDigest(line.args[structure] ?? "", directoryHandle ? ["mode"] : undefined, directory ? directoryStatFields(images.get(pid) ?? "", fields, workspace) : fields);
 				if (!metadataPaths.length || !observed) {
 					// fstat, or an empty *at name, of a pipe or socket
 					if (descriptorTarget(line) && !quotedArgument(line.args[1])) taints.add("descriptor_observation");
@@ -814,7 +814,8 @@ const UNMODELED_MUTATING_IOCTL = /\b(?:FICLONE|FICLONERANGE|FIDEDUPERANGE|FS_IOC
 const DRIVER_SEMANTIC_GAP_RESULT = /^-1\s+(?:EXDEV|EOPNOTSUPP|ENOTSUP|ENOSYS)\b/;
 
 function unmodeledFileIoctl(line: TraceLine): boolean {
-	if (!syscallSucceeded(line)) return false;
+	// Close-on-exec is the descriptor's own flag, like F_SETFD (Python sets it on every file it opens).
+	if (!syscallSucceeded(line) || /^FIO(?:N?CLEX)$/.test(line.args[1] ?? "")) return false;
 	return UNMODELED_MUTATING_IOCTL.test(line.args[1] ?? "") || absoluteDescriptorPath(line.args[0]) !== undefined;
 }
 

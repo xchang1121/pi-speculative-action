@@ -61,7 +61,7 @@ index 96309ec..dfe4024 100644
          if policy.workdir.is_none() {
              return Err(anyhow!("--dry-run requires --workdir"));
 diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/src/chroot/dispatch.rs
-index 6e4ab93..f7b3f64 100644
+index 6e4ab93..4d2106e 100644
 --- a/crates/sandlock-core/src/chroot/dispatch.rs
 +++ b/crates/sandlock-core/src/chroot/dispatch.rs
 @@ -76,6 +76,11 @@ pub(crate) struct ChrootCtx<'a> {
@@ -470,6 +470,17 @@ index 6e4ab93..f7b3f64 100644
      };
      let child_fd = unsafe {
          libc::ioctl(
+@@ -1087,8 +1270,8 @@ pub(crate) async fn handle_chroot_exec(
+     // the path buffer (see rewrite_exec_path_to_fd). Force-writes past
+     // read-only page protections: the child commonly passes a .rodata path
+     // literal to execve, which process_vm_writev can't overwrite. No length
+-    // guard needed — execve replaces the address space on success, so a write
+-    // past the original buffer is harmless.
++    // guard needed: execve replaces the address space on success, and a vfork
++    // child's parent is held stopped until its original bytes are restored.
+     if crate::seccomp::notif::rewrite_exec_path_to_fd(
+         notif_fd, notif.id, notif.pid, path_ptr, argv_ptr, envp_ptr, child_fd,
+     )
 @@ -1726,7 +1909,7 @@ pub(crate) async fn handle_chroot_readlink(
  
      let target = match std::fs::read_link(&host_path) {
@@ -828,7 +839,7 @@ index 3673d84..dfe2b2f 100644
                  virtual_hostname: None,
                  has_http_acl: false,
 diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/src/seccomp/notif.rs
-index abcd92c..dc978d0 100644
+index abcd92c..2205a81 100644
 --- a/crates/sandlock-core/src/seccomp/notif.rs
 +++ b/crates/sandlock-core/src/seccomp/notif.rs
 @@ -787,6 +787,11 @@ pub struct NotifPolicy {
@@ -962,7 +973,7 @@ index abcd92c..dc978d0 100644
                  relocate(&mut buf, &mut relocated, read, p)?;
                  grew = true;
              }
-@@ -1382,19 +1423,62 @@ fn plan_exec_rewrite(
+@@ -1382,19 +1423,133 @@ fn plan_exec_rewrite(
      }
  
      let end = path_ptr + buf.len() as u64;
@@ -1021,21 +1032,92 @@ index abcd92c..dc978d0 100644
 +}
 +
 +fn apply_exec_rewrite(notif_fd: RawFd, id: u64, pid: u32, path_ptr: u64, argv_ptr: u64, plan: ExecRewritePlan) -> Result<(), NotifError> {
-+    write_child_mem_force(notif_fd, id, pid, path_ptr, &plan.buf)?;
-+    for (slot, new_ptr) in plan.patches {
-+        write_child_mem_force(notif_fd, id, pid, slot, &new_ptr.to_ne_bytes())?;
++    let mut writes = vec![(path_ptr, plan.buf)];
++    writes.extend(plan.patches.into_iter().map(|(slot, new_ptr)| (slot, new_ptr.to_ne_bytes().to_vec())));
++    writes.extend(plan.scratch);
++    writes.extend(plan.argv.map(|argv| (argv_ptr, argv)));
++    // A vfork/posix_spawn child runs in its parent's memory, which exec leaves to the parent rather than replacing:
++    // keep the parent from running while that memory holds the rewrite, and put its bytes back once the child left.
++    let parent = vfork_parent(pid);
++    let mut saved = Vec::new();
++    if let Some(parent) = parent {
++        stop_process(parent).map_err(NotifError::ChildMemoryWrite)?;
++        for (addr, bytes) in &writes {
++            match read_child_mem(notif_fd, id, pid, *addr, bytes.len()) {
++                Ok(original) => saved.push((*addr, original)),
++                Err(error) => { resume_process(parent); return Err(error); }
++            }
++        }
 +    }
-+    if let Some((start, bytes)) = plan.scratch {
-+        write_child_mem_force(notif_fd, id, pid, start, &bytes)?;
++    for (addr, bytes) in &writes {
++        if let Err(error) = write_child_mem_force(notif_fd, id, pid, *addr, bytes) {
++            if let Some(parent) = parent { restore_memory(parent, &saved); resume_process(parent); }
++            return Err(error);
++        }
 +    }
-+    if let Some(argv) = plan.argv {
-+        write_child_mem_force(notif_fd, id, pid, argv_ptr, &argv)?;
++    if let Some(parent) = parent {
++        std::thread::spawn(move || {
++            // The kernel reads the rewrite after Continue; exec then gives the child its own memory (or the child exits).
++            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
++            while shares_memory(pid, parent) && std::time::Instant::now() < deadline {
++                std::thread::sleep(std::time::Duration::from_micros(200));
++            }
++            restore_memory(parent, &saved);
++            resume_process(parent);
++        });
 +    }
 +    Ok(())
++}
++
++/// The process whose address space `pid` runs in: a vfork or posix_spawn child's parent until the child execs.
++fn vfork_parent(pid: u32) -> Option<u32> {
++    let status = std::fs::read_to_string(format!("/proc/{}/status", pid)).ok()?;
++    let parent: u32 = status.lines().find_map(|line| line.strip_prefix("PPid:"))?.trim().parse().ok()?;
++    (parent != std::process::id() && shares_memory(pid, parent)).then_some(parent)
++}
++
++fn shares_memory(pid: u32, other: u32) -> bool {
++    const KCMP_VM: libc::c_long = 1;
++    unsafe { libc::syscall(libc::SYS_kcmp, pid as libc::c_long, other as libc::c_long, KCMP_VM, 0 as libc::c_long, 0 as libc::c_long) == 0 }
++}
++
++/// Stop every thread of `pid` that could run user code. The vfork waiter sits in an uninterruptible wait (`D`) and
++/// meets the pending stop before it returns to user space.
++fn stop_process(pid: u32) -> io::Result<()> {
++    if unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) } != 0 {
++        return Err(io::Error::last_os_error());
++    }
++    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
++    loop {
++        let running = std::fs::read_dir(format!("/proc/{}/task", pid))?.filter_map(Result::ok).any(|task| {
++            std::fs::read_to_string(task.path().join("stat"))
++                .ok()
++                .and_then(|stat| stat.rsplit_once(") ").and_then(|(_, rest)| rest.bytes().next()))
++                .is_some_and(|state| !matches!(state, b'T' | b't' | b'D' | b'Z' | b'X'))
++        });
++        if !running {
++            return Ok(());
++        }
++        if std::time::Instant::now() >= deadline {
++            resume_process(pid);
++            return Err(io::Error::from(io::ErrorKind::TimedOut));
++        }
++        std::thread::sleep(std::time::Duration::from_micros(100));
++    }
++}
++
++fn resume_process(pid: u32) {
++    unsafe { libc::kill(pid as libc::pid_t, libc::SIGCONT) };
++}
++
++fn restore_memory(pid: u32, saved: &[(u64, Vec<u8>)]) {
++    for (addr, bytes) in saved {
++        let _ = write_child_mem_proc(pid, *addr, bytes);
++    }
  }
  
  /// Rewrite an execve/execveat path argument to `/proc/self/fd/<child_fd>`,
-@@ -1436,12 +1520,38 @@ pub(crate) fn rewrite_exec_path_to_fd(
+@@ -1436,12 +1591,38 @@ pub(crate) fn rewrite_exec_path_to_fd(
  ) -> Result<(), NotifError> {
      let fd_path = format!("/proc/self/fd/{}\0", child_fd);
      let mut read = |addr: u64, len: usize| read_child_mem(notif_fd, id, pid, addr, len);
@@ -1079,7 +1161,7 @@ index abcd92c..dc978d0 100644
  }
  
  // ============================================================
-@@ -2585,6 +2695,16 @@ mod tests {
+@@ -2585,6 +2766,16 @@ mod tests {
          path_ptr: u64,
          argv_ptr: u64,
          envp_ptr: u64,
@@ -1096,7 +1178,7 @@ index abcd92c..dc978d0 100644
      ) -> Result<ExecRewritePlan, NotifError> {
          let mut read = |addr: u64, len: usize| {
              let off = addr
-@@ -2595,7 +2715,58 @@ mod tests {
+@@ -2595,7 +2786,58 @@ mod tests {
                  .map(|s| s.to_vec())
                  .ok_or_else(|| NotifError::Supervisor("read past fake memory".into()))
          };

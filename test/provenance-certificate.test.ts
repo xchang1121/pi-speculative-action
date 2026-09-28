@@ -151,6 +151,9 @@ describe("process provenance certificates", () => {
 
 		expect(processWeakKey(first)).not.toBe(processWeakKey(second));
 		expect(processWeakKey(first)).toBe(processWeakKey(prototype(Object.fromEntries(Object.entries(environment).reverse()))));
+		// A shell's nesting level and previous directory reach only shells and environment printers.
+		for (const [executablePath, same] of [["/bin/tool", true], ["/bin/bash", false], ["/usr/bin/env", false]] as const)
+			expect(processWeakKey(processPrototype({ executablePath, environment: { SHLVL: "0" } })) === processWeakKey(processPrototype({ executablePath, environment: { SHLVL: "1", OLDPWD: "/w" } }))).toBe(same);
 		expect(first.environment.map((entry) => entry.name)).toEqual(["MODE", "SECRET", "Z", "_", "e\u0301", "z", "\u00e9"]);
 		expect(JSON.stringify(first)).not.toContain("alpha");
 		expect(JSON.stringify(first)).not.toContain("--compile");

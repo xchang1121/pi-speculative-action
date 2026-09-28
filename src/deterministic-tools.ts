@@ -53,6 +53,14 @@ export function workspaceStatFields(image: string, argv: readonly string[]): rea
 	return ["stat", "df", "du", "mountpoint", "findmnt"].includes(image) ? undefined : WITHOUT_DEVICE;
 }
 
+/** Programs that print a directory's own times, size or link count. Any other stats a directory for its type, owner and (on
+ * the host) identity: realpath, module lookup and git's untracked cache; what it lists is a dependency of its own. */
+const DIRECTORY_METADATA_READERS = new Set(["ls", "find", "stat", "du", "tree"]);
+export function directoryStatFields(image: string, fields: readonly FilesystemObservationField[] | undefined, workspace: boolean) {
+	return DIRECTORY_METADATA_READERS.has(image) ? fields : (fields ?? FILESYSTEM_OBSERVATION_FIELDS)
+		.filter((field) => ["mode", "uid", "gid", ...workspace ? [] : ["dev", "ino"]].includes(field));
+}
+
 /** The stat fields git reads of a directory outside the workspace while it discovers the repository: its device (the
  * filesystem boundary), owner (safe.directory) and type; never the times or link count its siblings change. */
 export function hostStatFields(image: string): readonly FilesystemObservationField[] | undefined {
