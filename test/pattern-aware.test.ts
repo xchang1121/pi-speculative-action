@@ -409,6 +409,22 @@ describe("PatternAware", () => {
 		expect(store.predict("probe").map((candidate) => candidate.input)).toContainEqual({ path: "lib/zeta.test.ts" });
 	});
 
+	test("reads around the line a search reported, pairing each location's path with its own line", () => {
+		const store = patternStore({}, undefined, piActionSemantics());
+		const located = (file: string, line: number) => ({ outputLocations: [{ path: "src/other.ts", line: 900 }, { path: file, line }] });
+		for (const [name, line] of [["alpha", 2310], ["beta", 3575], ["gamma", 5200]] as const) {
+			store.observe(input(name, "grep", { pattern: name }, located(`src/${name}.ts`, line)));
+			store.observe(input(name, "read", { path: `src/${name}.ts`, offset: line - 20, limit: 60 }));
+			store.finishSession(name);
+		}
+		store.observe(input("probe", "grep", { pattern: "zeta" }, located("lib/zeta.ts", 4242)));
+		const reads = store.predict("probe").filter((candidate) => candidate.tool === "read").map((candidate) => candidate.input);
+		// A whole-file read already covers any range: the window binds only past the default limit, and the limit is projected away.
+		expect(reads).toContainEqual({ path: "lib/zeta.ts", offset: 4242 });
+		expect(reads).not.toContainEqual(expect.objectContaining({ path: "lib/zeta.ts", offset: 900 }));
+		expect(projectPatternAwareObservation(undefined, [], "/w", [{ path: "/w/a.ts", line: 3 }, { path: "a.ts", line: 3 }])).toEqual({ outputLocations: [{ path: "a.ts", line: 3 }] });
+	});
+
 	test("lets recent gap behavior replace stale high-volume history", () => {
 		const store = patternStore({ maxFutureGap: 8, futureGapCoverage: 0.9, decayHalfLifeEvents: 10 });
 		acceptPattern(store, { "0": 1000, "3": 10 }, {

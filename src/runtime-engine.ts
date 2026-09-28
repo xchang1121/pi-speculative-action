@@ -59,10 +59,7 @@ import { TaskTimeline, TimelineInterval } from "./task-timing.ts";
 class CandidateFailure extends Error {
 	readonly failure: ResolutionCause;
 
-	constructor(failure: ResolutionCause) {
-		super(failure.detail ?? failure.code);
-		this.failure = failure;
-	}
+	constructor(failure: ResolutionCause) { super(failure.detail ?? failure.code); this.failure = failure; }
 }
 
 function asUpdates(value: PlanUpdate | readonly PlanUpdate[] | undefined): readonly PlanUpdate[] {
@@ -316,10 +313,7 @@ function candidateCacheValue<Output>(candidate: CandidateRecord<Output>, evidenc
 
 function executionDuration<Output>(
 	candidate: CandidateRecord<Output> | undefined,
-): number {
-	const execution = candidate?.work.execution;
-	return execution && "executionMs" in execution ? execution.executionMs : 0;
-}
+): number { const execution = candidate?.work.execution; return execution && "executionMs" in execution ? execution.executionMs : 0; }
 
 function estimateValueBytes(value: unknown, seen = new WeakSet<object>()): number {
 	if (value === null || value === undefined) return 0;
@@ -402,10 +396,7 @@ interface CandidateRecord<Output, StartInput = unknown, StateData = unknown> {
 	readonly work: CandidateExecution<WorldBranch<Output>>;
 	readonly worldParent?: CandidateRecord<Output, StartInput, StateData>;
 	actorAdopted: boolean;
-	readonly owner: RuntimeTurnContext<StartInput, StateData> & {
-		readonly draft: SpeculativeDraftCandidate;
-		readonly index: number;
-	};
+	readonly owner: RuntimeTurnContext<StartInput, StateData> & { readonly draft: SpeculativeDraftCandidate; readonly index: number; };
 	readonly createdAt: number;
 	readonly attemptStartedAt: number;
 	readonly predictionLatencyMs: number;
@@ -432,11 +423,7 @@ type ActorPreviewState =
 	| { readonly status: "candidate"; readonly candidateID: string; readonly ownership: "existing" | "preview" }
 	| { readonly status: "cancelled" };
 
-interface ActorPreviewRecord {
-	readonly actionKey: Promise<ActionKey | undefined>;
-	task: Promise<void>;
-	state: ActorPreviewState;
-}
+interface ActorPreviewRecord { readonly actionKey: Promise<ActionKey | undefined>; task: Promise<void>; state: ActorPreviewState; }
 
 interface SessionState<SessionID, Output, StartInput, StateData> {
 	readonly id: SessionID;
@@ -483,15 +470,9 @@ interface TurnState<SessionID, Output, StartInput, StateData> extends RuntimeTur
 	lifecycle: "active" | "closing" | "finished";
 }
 
-interface ClaimedPrediction {
-	readonly node: PlanRuntimeNode;
-	readonly opportunity: PredictionOpportunity;
-}
+interface ClaimedPrediction { readonly node: PlanRuntimeNode; readonly opportunity: PredictionOpportunity; }
 
-interface ProjectionResource {
-	readonly dispose: () => void | Promise<void>;
-	references: number;
-}
+interface ProjectionResource { readonly dispose: () => void | Promise<void>; references: number; }
 
 type ProjectionResult<Output> =
 	| { readonly ok: true; readonly output: Output; readonly execution?: TimelineInterval; readonly inputs?: boolean; readonly compatibility?: WorldBranch<Output>["compatibility"]; readonly validate?: WorldBranch<Output>["validate"]; readonly capturedBytes?: number; readonly requiresQueryValidation?: true; readonly resource?: ProjectionResource }
@@ -514,12 +495,7 @@ export function makeSpeculativeActionRuntime<
 	type Candidate = CandidateRecord<Output, StartInput, StateData>;
 	type Session = SessionState<SessionID, Output, StartInput, StateData>;
 	type Turn = TurnState<SessionID, Output, StartInput, StateData>;
-	type TurnClosure = {
-		readonly state: Turn;
-		readonly completedAt: number;
-		readonly terminal: boolean;
-		readonly notifyHost: boolean;
-	};
+	type TurnClosure = { readonly state: Turn; readonly completedAt: number; readonly terminal: boolean; readonly notifyHost: boolean; };
 	type SessionClosureMode = "terminal" | "disabled" | "disposed";
 	type ActorSelectionInput = {
 		readonly state: Turn;
@@ -715,10 +691,7 @@ export function makeSpeculativeActionRuntime<
 
 	const startTurn = async (input: StartInput, signal?: AbortSignal): Promise<void> => {
 		const settings = await adapter.settings();
-		if (!settings.enabled || masterDisabled()) {
-			await disableSession(input.sessionID);
-			return;
-		}
+		if (!settings.enabled || masterDisabled()) { await disableSession(input.sessionID); return; }
 		if (signal?.aborted) return;
 		const definitions = adapter.definitions(input);
 		const names = candidateToolNames(settings, semantics);
@@ -790,10 +763,7 @@ export function makeSpeculativeActionRuntime<
 			slot.request.targetDecisionSequence === targetDecisionSequence &&
 			(slot.request.kind === "observation") === (requestKind === "observation"));
 		const observed = requestKind === "observation" && slots.find((slot) => slot.request.turnID === turnID);
-		if (observed) {
-			observed.pending++;
-			return observed;
-		}
+		if (observed) { observed.pending++; return observed; }
 		if (slots.length >= limit) return undefined;
 		const slot: SourceRequestSlot = {
 			request: { source, turnID, index: session.sourceRequestSequence++, kind: requestKind, targetDecisionSequence },
@@ -975,10 +945,7 @@ export function makeSpeculativeActionRuntime<
 					continuationSlots: new Set(),
 					continuationTail: Promise.resolve(),
 				});
-			} else {
-				context.feedback = action.feedback;
-				context.draft = planActionDraft(node);
-			}
+			} else { context.feedback = action.feedback; context.draft = planActionDraft(node); }
 			for (const notify of [issued ? source.onIssued : undefined, source.onAdmitted]) {
 				if (notify) session.effects.enqueue(() => notify.call(source, {
 					proposalID: node.identity.proposalID, actionID: node.identity.actionID, feedback: action.feedback,
@@ -995,10 +962,7 @@ export function makeSpeculativeActionRuntime<
 		| { readonly ok: false; readonly cause: ResolutionCause }
 	> => {
 		let route: SpeculativeExecutionRoute | undefined;
-		try {
-			const { callID, index, ...request } = input;
-			route = await adapter.resolveExecution(request);
-		} catch {
+		try { const { callID, index, ...request } = input; route = await adapter.resolveExecution(request); } catch {
 			route = undefined;
 		}
 		if (input.signal.aborted) return { ok: false, cause: cause("source", "generation_expired") };
@@ -1032,19 +996,10 @@ export function makeSpeculativeActionRuntime<
 		} catch {
 			predictedAction = undefined;
 		}
-		if (context.admissionSignal.aborted) {
-			failUnlaunchable(session, node, cause("source", "generation_expired"));
-			return;
-		}
-		if (!predictedAction) {
-			failUnlaunchable(session, node, cause("matching", "action_not_keyable"));
-			return;
-		}
+		if (context.admissionSignal.aborted) { failUnlaunchable(session, node, cause("source", "generation_expired")); return; }
+		if (!predictedAction) { failUnlaunchable(session, node, cause("matching", "action_not_keyable")); return; }
 		const executionInput = asConcreteInput(predictedAction.input);
-		if (!executionInput) {
-			failUnlaunchable(session, node, cause("matching", "action_not_keyable"));
-			return;
-		}
+		if (!executionInput) { failUnlaunchable(session, node, cause("matching", "action_not_keyable")); return; }
 		if (!session.plan.bindActionKey(node.identity, predictedAction)) return;
 		// Binding owns schema validation and argument preparation; raw proposals cannot win the race.
 		const slot = context.sourceSlot;
@@ -1174,31 +1129,16 @@ export function makeSpeculativeActionRuntime<
 	const launchNode = (session: Session, node: PlanRuntimeNode): Promise<void> => session.lifecycle.track(Promise.resolve().then(async () => {
 		const current = session.plan.get(node.proposalID, node.action.id);
 		if (session.lifecycle.sealed || current?.identity.id !== node.identity.id || current.predictionState.status === "settled") return;
-		if (!node.actionKey) {
-			session.plan.defer(node.proposalID, node.action.id);
-			return;
-		}
+		if (!node.actionKey) { session.plan.defer(node.proposalID, node.action.id); return; }
 		const context = session.actionContexts.get(node.identity.id);
-		if (!context) {
-			failUnlaunchable(session, node, cause("plan", "context_missing"));
-			return;
-		}
+		if (!context) { failUnlaunchable(session, node, cause("plan", "context_missing")); return; }
 		const route = context.executionRoute;
-		if (!route) {
-			failUnlaunchable(session, node, cause("plan", "execution_route_missing"));
-			return;
-		}
+		if (!route) { failUnlaunchable(session, node, cause("plan", "execution_route_missing")); return; }
 		const parent = dependencyWorld(session, node);
-		if (parent === null) {
-			failUnlaunchable(session, node, cause("plan", "incompatible_parent_worlds"));
-			return;
-		}
+		if (parent === null) { failUnlaunchable(session, node, cause("plan", "incompatible_parent_worlds")); return; }
 		if (
 			parent && (route.reuse === "shared_result" || !candidateBranch(parent)?.checkpoint || !sameSpeculativeExecutionRoute(parent.route, route))
-		) {
-			session.plan.defer(node.proposalID, node.action.id);
-			return;
-		}
+		) { session.plan.defer(node.proposalID, node.action.id); return; }
 		await admitCandidate(session, { key: node.actionKey, route, worldParent: parent, kind: node.action.type }, () => {
 			const scheduled = session.scheduler.evaluate([
 				forecastFor(node, session.decisionSequence, actorPhaseFor(session)),
@@ -1390,11 +1330,7 @@ export function makeSpeculativeActionRuntime<
 				session.scheduler.observeSpeculativeService(actionTimingIdentity(candidate.key), completedAt - startedAt, true);
 			removeCandidate(session.id, candidate);
 			if (settled) queueCandidateEvent(session, candidate);
-		} finally {
-			inputs?.dispose();
-			session.scheduler.complete(candidate);
-			dispatchReady(session);
-		}
+		} finally { inputs?.dispose(); session.scheduler.complete(candidate); dispatchReady(session); }
 	};
 
 	const previewActorTool = async (
@@ -1527,11 +1463,7 @@ export function makeSpeculativeActionRuntime<
 		});
 	};
 
-	const abandonActorPreview = (
-		state: Turn,
-		record: ActorPreviewRecord | undefined,
-		failure: ResolutionCause,
-	): void => {
+	const abandonActorPreview = (state: Turn, record: ActorPreviewRecord | undefined, failure: ResolutionCause): void => {
 		if (!record) return;
 		const current = record.state;
 		record.state = { status: "cancelled" };
@@ -1586,10 +1518,7 @@ export function makeSpeculativeActionRuntime<
 			masterDisabled() ||
 			!state.actorActions.has(actorAction) ||
 			!actorAction.capture(capture)
-		) {
-			state.session.lifecycle.release(capture);
-			return;
-		}
+		) { state.session.lifecycle.release(capture); return; }
 		return capture;
 	};
 
@@ -1665,10 +1594,7 @@ export function makeSpeculativeActionRuntime<
 				}
 				const authorization = await authorize(state, input.consumeInput, actualKey, actualCall, candidate, signal);
 				if (stopCandidate(candidate)) break;
-				if (authorization) {
-					actorAction.rejectCandidate(candidate.id, choice.match, authorization);
-					continue;
-				}
+				if (authorization) { actorAction.rejectCandidate(candidate.id, choice.match, authorization); continue; }
 				const waitStartedAt = performance.now();
 				const waiting = await waitForCandidate(candidate.work.completion, signal, join.reason === "ready" ? undefined : join.waitBudgetMs);
 				waitMs = performance.now() - waitStartedAt;
@@ -1716,10 +1642,7 @@ export function makeSpeculativeActionRuntime<
 						signal: signal ?? state.generation.signal, inputs: inputs?.lookup },
 				);
 				if (stopCandidate(candidate)) break;
-				if (!projection.ok) {
-					actorAction.rejectCandidate(candidate.id, choice.match, projection.cause);
-					continue;
-				}
+				if (!projection.ok) { actorAction.rejectCandidate(candidate.id, choice.match, projection.cause); continue; }
 				const compatibility = sourceCompatibility ?? state.session.scheduler.assessCompatibility(
 					projection.compatibility ?? branch.compatibility, actualKey.executionFingerprint);
 				if (!compatibility.compatible) {
@@ -1814,10 +1737,7 @@ export function makeSpeculativeActionRuntime<
 		const actualCall = adapter.actual(input);
 		let preview = actualCall.id ? state.actorPreviews.get(actualCall.id) : undefined;
 		if (actualCall.id) state.actorPreviews.delete(actualCall.id);
-		if (preview?.state.status === "pending") {
-			preview.state = { status: "cancelled" };
-			preview = undefined;
-		}
+		if (preview?.state.status === "pending") { preview.state = { status: "cancelled" }; preview = undefined; }
 		const previewCandidateID = preview?.state.status === "candidate" ? preview.state.candidateID : undefined;
 		expireSourceHorizon(state.session, state.decisionSequence, cause("control", "actor_action_arrived"));
 		closeActorPhase(state, actorArrivedAt);
@@ -1972,10 +1892,7 @@ export function makeSpeculativeActionRuntime<
 		let branch: WorldBranch<Output> | undefined;
 		try {
 			branch = await capture.seal(output);
-		} catch {
-			state.session.lifecycle.release(capture);
-			return;
-		}
+		} catch { state.session.lifecycle.release(capture); return; }
 		let retained = false;
 		try {
 			if (state.lifecycle !== "active" || state.session.lifecycle.sealed || masterDisabled()) return;
@@ -2018,10 +1935,7 @@ export function makeSpeculativeActionRuntime<
 		const settlementStartedAt = performance.now();
 		const capture = actorAction.takeCapture();
 		const settlement = actorAction.settleActor(toolExecution, outputIsError(output));
-		if (!settlement) {
-			state.session.lifecycle.release(capture);
-			return;
-		}
+		if (!settlement) { state.session.lifecycle.release(capture); return; }
 		const execution = settlement.provider.toolExecution, durationMs = execution.completedAt - execution.startedAt;
 		const key = actorAction.actionKey;
 		if (key) reconcileAuthoritativeEffects(state.session, key);
@@ -2130,10 +2044,7 @@ export function makeSpeculativeActionRuntime<
 				settleUnobserved(state.session, node, cause("matching", "operation_not_observed"));
 				continue;
 			}
-			if (!observation) {
-				settleUnobserved(state.session, node, cause("matching", "actor_action_not_keyable"));
-				continue;
-			}
+			if (!observation) { settleUnobserved(state.session, node, cause("matching", "actor_action_not_keyable")); continue; }
 			const settlement = state.session.plan.miss(node.proposalID, node.action.id, observation);
 			if (settlement) predictionSettled(state.session, node, settlement);
 		}
@@ -2185,11 +2096,7 @@ export function makeSpeculativeActionRuntime<
 		output: Output,
 		trigger: "execution_succeeded" | "actor_adopted",
 		adoptedAction?: AdoptedAction,
-	): void => {
-		for (const node of nodes) {
-			queueContinuation(session, node, candidate, output, trigger, adoptedAction);
-		}
-	};
+	): void => { for (const node of nodes) { queueContinuation(session, node, candidate, output, trigger, adoptedAction); } };
 
 	const queueContinuation = (
 		session: Session,
@@ -2335,10 +2242,7 @@ export function makeSpeculativeActionRuntime<
 		return ([...parents].find((candidate) => [...parents].every((parent) => parent === candidate || descendsFrom(candidate, parent))) ?? null);
 	};
 
-	const forecastsForCandidate = (
-		session: Session,
-		candidate: Candidate,
-	): readonly PredictionForecast[] => {
+	const forecastsForCandidate = (session: Session, candidate: Candidate): readonly PredictionForecast[] => {
 		const nodes = session.plan.consumers(candidate.id), actorPhase = actorPhaseFor(session);
 		const adoptionIdentity = adoptionTimingIdentity(candidate.key, candidate, "exact");
 		if (nodes.length) return nodes.map((node) => ({ ...forecastFor(node, session.decisionSequence, actorPhase),
@@ -2391,11 +2295,7 @@ export function makeSpeculativeActionRuntime<
 		}
 	};
 
-	const rankCandidates = (
-		session: Session,
-		action: ActionKey,
-		preferred?: string,
-	) => {
+	const rankCandidates = (session: Session, action: ActionKey, preferred?: string) => {
 		const now = performance.now();
 		const choices = candidateStore.lookup(session.id, action, (candidate) => candidate.work.execution.status !== "succeeded", semantics.effect(action) === "observation")
 			.flatMap(({ entry: candidate, match }) => {
@@ -2491,17 +2391,9 @@ export function makeSpeculativeActionRuntime<
 	/** Admitted work whose executor has not returned its units yet, after cancellation or completion. */
 	const draining = (candidate: Candidate): boolean => candidate.work.execution.status !== "running";
 
-	const discardCandidate = (
-		session: Session,
-		candidate: Candidate,
-		failure: ResolutionCause,
-		dispatch = true,
-	): void => {
+	const discardCandidate = (session: Session, candidate: Candidate, failure: ResolutionCause, dispatch = true): void => {
 		const state = candidate.work.execution;
-		if (state.status !== "queued" && state.status !== "running") {
-			removeCandidate(session.id, candidate);
-			return;
-		}
+		if (state.status !== "queued" && state.status !== "running") { removeCandidate(session.id, candidate); return; }
 		const startedAt = state.status === "running" ? state.startedAt : performance.now();
 		const completedAt = performance.now();
 		const settled = candidate.work.cancel(failure, completedAt, Math.max(0, completedAt - startedAt));
