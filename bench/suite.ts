@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
-import { summarizePairs, summarizeSuite, type SuiteBenchmarkRun, type SuiteBenchmarkSummary } from "./suite-report.ts";
+import { safeName, summarizePairs, summarizeSuite, type SuiteBenchmarkRun, type SuiteBenchmarkSummary } from "./suite-report.ts";
 
 type SuiteFile = Readonly<Record<string, readonly string[]>>;
 
@@ -135,8 +135,4 @@ function execute(file: string, args: readonly string[]): Promise<void> {
 			else reject(new Error(`Benchmark runner exited with ${signal ?? code}`));
 		});
 	});
-}
-
-function safeName(value: string): string {
-	return value.replaceAll(/[^A-Za-z0-9._-]/g, "_");
 }

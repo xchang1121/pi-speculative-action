@@ -22,6 +22,8 @@ export function benchmarkTraceReport<SessionID>(
 		provider: event.settlement.provider.kind,
 		matchedPredictionSources: [...new Set(event.settlement.matchedPredictions.map((prediction) => prediction.source))],
 		...(event.candidate ? { candidateSource: event.candidate.source, predictedAction: event.candidate.predictedAction } : {}),
+		rejections: event.settlement.rejections.map(({ cause }) => cause.detail ? `${cause.code}:${cause.detail}` : cause.code),
+		...(event.settlement.provider.kind === "actor" ? { nativeMs: event.settlement.provider.durationMs } : {}),
 	}));
 	const predictionsBySource: Record<string, { settled: number; observed: number; matched: number; adopted: number }> = {};
 	for (const settlement of predictions) {
