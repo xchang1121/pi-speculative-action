@@ -593,8 +593,8 @@ export class PatternAwareStore {
 			const empiricalProbability = clampProbability(continuation.pathProbability * conditionalProbability);
 			const mapperComplexity = Math.min(...ordered.map((item) => analyzeBindings(item.pattern.bindings).complexity));
 			const mapperConfidence = totalWeight / (totalWeight + mapperComplexity);
-			const expectedLatencyBenefitMs =
-				empiricalProbability * adoptionProbability * mapperConfidence * Math.max(1, Math.max(0, expectedDurationMs));
+			const evidence = evidenceConfidence(replayProbability, totalWeight);
+			const expectedLatencyBenefitMs = empiricalProbability * adoptionProbability * mapperConfidence * evidence * Math.max(1, Math.max(0, expectedDurationMs));
 			const background = patterns.every((pattern) => {
 				const feedback = feedbackEvidence(pattern, this.clock, settings.decayHalfLifeEvents);
 				return pattern.occurrences < settings.minOccurrences || feedback.mismatched > feedback.matched;
@@ -622,6 +622,7 @@ export class PatternAwareStore {
 				expectedDurationMs,
 				ppmEstimate,
 				mapperConfidence,
+				evidenceConfidence: evidence,
 				expectedLatencyBenefitMs,
 			}] as const;
 		}));
@@ -656,7 +657,7 @@ export class PatternAwareStore {
 			const beamRank = count + 1;
 			emittedPerTool.set(prediction.tool, beamRank);
 			const { input, dependencies, background, context, recurrentFeedback, ppmEstimate,
-				mapperConfidence, variantProbability, gapCoverage, replayProbability, ...candidate } = prediction;
+				mapperConfidence, evidenceConfidence: evidence, variantProbability, gapCoverage, replayProbability, ...candidate } = prediction;
 			const { type: _type, actionIdentity: _identity, supportingPatternIDs, ...diagnostic } = candidate;
 			const nextContinuation: PatternAwareContinuation = {
 				history: continuationHistory ??= structuredClone(history),
@@ -685,6 +686,7 @@ export class PatternAwareStore {
 						ppmEvidence: ppmEstimate?.evidence,
 						ppmEscapeMass: ppmEstimate?.escapeMass,
 						mapperConfidence,
+						evidenceConfidence: evidence,
 						variantProbability,
 						background: background === true,
 						beamRank,
@@ -735,8 +737,8 @@ export class PatternAwareStore {
 			const expectedDurationMs = item.weightedDurationMs / item.weightedCount;
 			const ppmEstimate = estimatePpm(item.action.tool);
 			const adoptionProbability = patternAdoptionProbability([item], this.clock, settings.decayHalfLifeEvents);
-			const expectedLatencyBenefitMs =
-				empiricalProbability * adoptionProbability * (ppmEstimate?.probability ?? 1) * Math.max(1, expectedDurationMs);
+			const confidence = evidenceConfidence(conditionalProbability, item.weightedCount);
+			const expectedLatencyBenefitMs = empiricalProbability * adoptionProbability * (ppmEstimate?.probability ?? 1) * confidence * Math.max(1, expectedDurationMs);
 			return {
 				background: item.count < settings.minOccurrences || evidence.mismatched > evidence.matched,
 				recurrentFeedback: item.feedback,
@@ -759,6 +761,7 @@ export class PatternAwareStore {
 				expectedDurationMs,
 				ppmEstimate,
 				mapperConfidence: 1,
+				evidenceConfidence: confidence,
 				expectedLatencyBenefitMs,
 			};
 		});
@@ -2111,6 +2114,14 @@ function backoffProbability(
 		estimate = local * (1 - escapeProbability) + estimate * escapeProbability;
 	}
 	return Math.max(0, Math.min(1, estimate));
+}
+
+/** How far thin evidence discounts a calibrated rate when ranking work: its one-sided 90% Wilson lower bound over the rate.
+ * Probabilities stay calibrated; only the value that orders speculation prefers the better-tested of two equal rates. */
+function evidenceConfidence(rate: number, opportunities: number) {
+	if (!(rate > 0) || !(opportunities > 0)) return 0;
+	const z2 = 1.2816 ** 2, lower = (rate + z2 / (2 * opportunities) - Math.sqrt(z2 * (rate * (1 - rate) / opportunities + z2 / (4 * opportunities ** 2)))) / (1 + z2 / opportunities);
+	return Math.min(1, Math.max(0, lower) / rate);
 }
 
 function patternRank(pattern: MutablePattern, clock: number, halfLife: number) {

@@ -1,11 +1,7 @@
 import { gated, deferred, nextTurn } from "./async.ts";
 import { testBranch } from "./branch.ts";
 import { describe, expect, it, vi } from "vitest";
-import {
-	effectCommitFailure,
-	type EffectTransaction,
-	EffectTransactionCoordinator,
-} from "../src/effect-transaction.ts";
+import { effectCommitFailure, type EffectTransaction, EffectTransactionCoordinator } from "../src/effect-transaction.ts";
 import type { SpeculativeExecutionRoute, WorldBranch } from "../src/execution-world.ts";
 import { buildPiActionKey } from "../src/action-semantics.ts";
 
@@ -287,10 +283,7 @@ describe("EffectTransactionCoordinator", () => {
 				args: {}, callID: "actor", signal: new AbortController().signal });
 			expect(rebuilt?.output).toEqual(expected); expect(!!rebuilt?.validate).toBe(!captured);
 			Object.assign(query, { validate: replaced, dispose: replaced });
-			if (!captured) {
-				expect((await rebuilt?.validate?.())?.status).toBe("valid");
-				expect(attempt.state).toBe("sealed");
-			}
+			if (!captured) { expect((await rebuilt?.validate?.())?.status).toBe("valid"); expect(attempt.state).toBe("sealed"); }
 			await rebuilt?.dispose?.(); await rebuilt?.dispose?.();
 			if (!captured) expect((await rebuilt?.validate?.())?.status).toBe("indeterminate");
 			await expect(transaction.commit()).rejects.toThrow("requires successful validation");
@@ -310,10 +303,7 @@ describe("EffectTransactionCoordinator", () => {
 
 function branch(overrides: Partial<WorldBranch<string>> = {}): WorldBranch<string> {
 	const output = overrides.output ?? "sealed";
-	return {
-		...testBranch(output, { executionFingerprint: "executor" }),
-		...overrides,
-	};
+	return { ...testBranch(output, { executionFingerprint: "executor" }), ...overrides };
 }
 
 function metrics() {

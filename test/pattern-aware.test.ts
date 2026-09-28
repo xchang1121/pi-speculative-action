@@ -289,7 +289,7 @@ describe("PatternAware", () => {
 		expect(afterFreshnessRejection.expectedLatencyBenefitMs / afterFreshnessRejection.expectedDurationMs).toBeCloseTo(
 			afterFreshnessRejection.empiricalProbability *
 				afterFreshnessRejection.adoptionProbability *
-				diagnostic.mapperConfidence,
+				diagnostic.mapperConfidence * diagnostic.evidenceConfidence,
 		);
 		store.settled("attributed", rejectedSettlement("freshness", "resource_changed"));
 		const afterRepeatedRejection = store.predict("probe").find((item) => item.patternID === "attributed")!;

@@ -3,11 +3,7 @@ import { READ_RANGE_ACTION_KEY_PROJECTOR } from "../src/action-key-projection.ts
 import { type ActionKey, actionKeyCovers, buildPiActionKey } from "../src/action-semantics.ts";
 import { CandidateStore, speculativeCacheValue } from "../src/candidate-stores.ts";
 
-interface Entry {
-	readonly id: string;
-	readonly key: ReturnType<typeof key>;
-	readonly estimatedBytes: number;
-}
+interface Entry { readonly id: string; readonly key: ReturnType<typeof key>; readonly estimatedBytes: number; }
 
 describe("CandidateStore", () => {
 	it("indexes owned inputs across tools only after sealing and retires their lookup with the owner", () => {
@@ -101,11 +97,7 @@ describe("CandidateStore", () => {
 		const compatible = store.getOrCreate("one", requested.key, () => requested, (existing) =>
 			actionKeyCovers(existing.key, requested.key, [READ_RANGE_ACTION_KEY_PROJECTOR]),
 		);
-		expect(compatible).toMatchObject({
-			entry: tight,
-			inserted: false,
-			match: { kind: "projected", projector: "read.range" },
-		});
+		expect(compatible).toMatchObject({ entry: tight, inserted: false, match: { kind: "projected", projector: "read.range" } });
 		expect(store.getOrCreate("one", tight.key, () => entry("duplicate", "a.ts", 80, 60))).toMatchObject({
 			entry: tight,
 			inserted: false,
@@ -250,13 +242,7 @@ describe("candidate retention", () => {
 	});
 
 	it("decays proven reuse value while keeping validation and projection costs honest", () => {
-		const base = {
-			executionMs: 100,
-			expectedValidationMs: 10,
-			expectedProjectionMs: 5,
-			bytes: 4_096,
-			insertedAt: 0,
-		};
+		const base = { executionMs: 100, expectedValidationMs: 10, expectedProjectionMs: 5, bytes: 4_096, insertedAt: 0 };
 		const freshHot = speculativeCacheValue({ ...base, actorHits: 1, lastActorHitAt: 0 }, 0, 1_000);
 		const agedHot = speculativeCacheValue({ ...base, actorHits: 1, lastActorHitAt: 0 }, 1_000, 1_000);
 		const freshCold = speculativeCacheValue({ ...base, actorHits: 0 }, 0, 1_000);
