@@ -716,7 +716,8 @@ export async function observeStrace(
 				if (/<char 1:3>>$/.test(line.args[0] ?? "")) { taints.add("descriptor_observation"); continue; }
 				const metadataPaths = syscallPaths(line, syscall, cwd) ?? [];
 				// A directory descriptor's identity serves traversal (ls and fts track loops by it); printed metadata comes from path stats.
-				const directoryHandle = (syscall === "fstat" || !quotedArgument(line.args[1])) && /\bstx?_mode=S_IFDIR\b/.test(line.args[structure] ?? "");
+				// git's untracked cache trusts a directory's times only to skip a listing it records anyway.
+				const directory = /\bstx?_mode=S_IFDIR\b/.test(line.args[structure] ?? ""), directoryHandle = directory && (syscall === "fstat" || !quotedArgument(line.args[1]) || images.get(pid) === "git");
 				// Only the fields a program reveals of a workspace file are its dependency (see workspaceStatFields).
 				const workspace = metadataPaths.length > 0 && metadataPaths.every((target) => semanticRoots.some((root) => containsLogicalPath(root, target)));
 				const observed = statObservationDigest(line.args[structure] ?? "", directoryHandle ? ["mode"] : undefined, workspace ? statFields.get(pid) : hostStatFields(images.get(pid) ?? ""));
@@ -726,7 +727,7 @@ export async function observeStrace(
 					else { taints.add("unsupported_syscall"); incompleteReasons.add(`unparsed_metadata:${syscall}:${pid}`); }
 				}
 				// A shell stats directories only to validate $PWD: their sandbox identity never reaches its output.
-				if (observed && observed.fields?.length !== 0 && !(SHELLS.has(images.get(pid) ?? "") && /\bstx?_mode=S_IFDIR\b/.test(line.args[structure] ?? ""))) {
+				if (observed && observed.fields?.length !== 0 && !(SHELLS.has(images.get(pid) ?? "") && directory)) {
 					const followSymlinks = syscall !== "lstat" && !(flags && /\bAT_SYMLINK_NOFOLLOW\b/.test(line.args[flags] ?? ""));
 					for (const metadataPath of metadataPaths) observeMetadata(metadataPath, followSymlinks, observed);
 				}

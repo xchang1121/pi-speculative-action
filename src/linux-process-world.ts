@@ -26,7 +26,8 @@ export function createLinuxProcessExecutionWorld(
 	const workspaceSandbox = options.workspaceSandbox ?? new WorkspaceSandboxService();
 	const ownsWorkspaceSandbox = options.workspaceSandbox === undefined;
 	const { gitBinary, driver, overlayfsBinary, fusermountBinary } = options;
-	const workspaceOptions = { gitBinary, driver, overlayfsBinary, fusermountBinary };
+	// Processes observe their inputs' times and inodes: an overlay over the workspace itself shows the Actor's own.
+	const workspaceOptions = { gitBinary, driver, overlayfsBinary, fusermountBinary, liveLower: true };
 	const roots = new Set<string>();
 	const operations = new WeakMap<ExecutionOperationBinding, { readonly binding: WeakRef<ProcessExecutionBinding>; readonly permissionKey: string }>();
 	const operationOverheads = new WeakMap<ProcessExecutionBinding, number>();

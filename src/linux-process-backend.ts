@@ -1975,8 +1975,9 @@ async function captureDependencies(
 		for (let segment = pending.shift(); segment !== undefined; segment = pending.shift()) {
 			if (segment === "..") { current = path.posix.dirname(current); continue; }
 			const next = path.posix.join(current, segment);
-			// The repository is the workspace's own, mounted read-only: the host walk captures it.
-			if (session.gitDirectory && pathContains(session.gitDirectory, next)) return { path: path.posix.join(next, ...pending), links };
+			// The repository is the workspace's own, mounted read-only (also when reached through the overlay): the host walk captures it.
+			const repository = session.projection.isWorkspacePhysical(next) ? session.projection.toLogical(next) : next;
+			if (session.gitDirectory && pathContains(session.gitDirectory, repository)) return { path: path.posix.join(repository, ...pending), links };
 			const physical = pathContains(session.sourceRoot, next) ? session.projection.toPhysical(next) : undefined;
 			const entry = physical ? await before(physical) : undefined;
 			if (entry?.kind === "file" && pending.length) return undefined; // Native ENOTDIR; lexical collapse would continue.
@@ -2077,7 +2078,8 @@ async function captureHostPath(
 		if (info.uid !== 0n && info.uid !== BigInt(process.getuid?.() ?? -1) || (link === undefined && (info.mode & 0o022n) !== 0n)) return undefined;
 		if (link !== undefined) dependencies.push({ kind: "symlink", path: slash(current), target: link, targetDigest: sha256Digest(Buffer.from(link, "utf8")) });
 		else if (terminal && info.isFile()) dependencies.push((await captureFileDependency(current, slash(current), role, { includeMetadata: true })).dependency);
-		else if (terminal && info.isDirectory()) dependencies.push(await captureDirectoryDependency(current, slash(current), true));
+		// A listing reveals names; a program that stats the directory records that metadata on its own.
+		else if (terminal && info.isDirectory()) dependencies.push(await captureDirectoryDependency(current, slash(current)));
 		else if (!info.isFile() && !info.isDirectory()) throw new Error("unsupported host dependency");
 	}
 	return dependencies;

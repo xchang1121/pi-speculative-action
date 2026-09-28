@@ -26,7 +26,7 @@ const TOOLS: Readonly<Record<string, ToolRule>> = {
 };
 export const SHELLS: ReadonlySet<string> = new Set(["bash", "sh", "dash"]);
 /** Programs whose output is a function of file contents: they stat a file only for its type, size hints or same-file checks. */
-const CONTENT_READERS = new Set([...Object.keys(TOOLS).filter((name) => !["env", "test", "[", "ls", "find"].includes(name)), "rg", "awk", "gawk", "mawk"]);
+const CONTENT_READERS = new Set([...Object.keys(TOOLS).filter((name) => !["env", "test", "[", "ls", "find", "git"].includes(name)), "rg", "awk", "gawk", "mawk"]);
 const WITHOUT_DEVICE = FILESYSTEM_OBSERVATION_FIELDS.filter((field) => field !== "dev");
 /** find predicates that read metadata beyond a file's type, with the fields they read; any other listing predicate reads all. */
 const FIND_FIELDS: ReadonlyArray<readonly [RegExp, readonly FilesystemObservationField[]]> = [[/^-(?:size|empty)$/, ["size"]], [/^-perm$/, ["mode"]],
@@ -37,7 +37,7 @@ const FIND_FIELDS: ReadonlyArray<readonly [RegExp, readonly FilesystemObservatio
  * and a snapshot's inode numbers and times differ: only what the program reveals is a dependency. Undefined keeps every field.
  */
 export function workspaceStatFields(image: string, argv: readonly string[]): readonly FilesystemObservationField[] | undefined {
-	if (CONTENT_READERS.has(image) || image === "git") return ["mode"];
+	if (CONTENT_READERS.has(image)) return ["mode"];
 	if (image === "find") {
 		const fields = new Set<FilesystemObservationField>(["mode"]);
 		if (argv.some((argument) => argument.includes("%D"))) return undefined;
@@ -48,7 +48,9 @@ export function workspaceStatFields(image: string, argv: readonly string[]): rea
 		return [...fields];
 	}
 	if (image === "ls") return argv.slice(1).some((argument) => /^-[a-zA-Z]*[lgonsiStcu]|^--(?:full-time|size|inode|sort|time)/.test(argument)) ? WITHOUT_DEVICE : ["mode"];
-	return SHELLS.has(image) || ["test", "[", "make", "xargs", "cp", "mv", "rm", "ln", "mkdir", "rmdir", "touch", "chmod"].includes(image) ? WITHOUT_DEVICE : undefined;
+	// The overlay serves the workspace from its own device and otherwise shows each file's own identity: only programs
+	// that print device numbers keep them. git trusts an index entry whose stat still matches without reading the file.
+	return ["stat", "df", "du", "mountpoint", "findmnt"].includes(image) ? undefined : WITHOUT_DEVICE;
 }
 
 /** The stat fields git reads of a directory outside the workspace while it discovers the repository: its device (the
