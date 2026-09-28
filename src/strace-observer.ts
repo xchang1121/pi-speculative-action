@@ -29,7 +29,8 @@ export function straceCommand(
 	streams = false,
 	continuation = false,
 ): readonly string[] {
-	return [strace, "--kill-on-exit", streams ? "-f" : "-ff", "-q", "-yy", "-v", "-s", "65535", "-e", continuation ? "trace=all" : SYSCALL_FILTER + (streams ? ",read,write,readv,writev,close,close_range,dup,dup2,dup3,eventfd,eventfd2,sendfile,vmsplice,poll,ppoll,select,pselect6,epoll_create,epoll_create1,epoll_ctl,epoll_wait,epoll_pwait,epoll_pwait2" : ""), "-o", streams ? `${tracePrefix}.stream` : tracePrefix, ...command];
+	// The command runs under a sandbox launcher whose supervisor threads would otherwise pay a ptrace stop per call they serve.
+	return [strace, "--kill-on-exit", "--trace-children-only", streams ? "-f" : "-ff", "-q", "-yy", "-v", "-s", "65535", "-e", continuation ? "trace=all" : SYSCALL_FILTER + (streams ? ",read,write,readv,writev,close,close_range,dup,dup2,dup3,eventfd,eventfd2,sendfile,vmsplice,poll,ppoll,select,pselect6,epoll_create,epoll_create1,epoll_ctl,epoll_wait,epoll_pwait,epoll_pwait2" : ""), "-o", streams ? `${tracePrefix}.stream` : tracePrefix, ...command];
 }
 
 export type ObservedProcessPath =

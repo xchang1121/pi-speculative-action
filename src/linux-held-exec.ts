@@ -693,10 +693,7 @@ async function write(socket: net.Socket, data: Buffer): Promise<void> {
 export function listenUnixSocket(server: net.Server, socketPath: string): Promise<void> {
 	return new Promise((resolve, reject) => {
 		server.once("error", reject);
-		server.listen(socketPath, () => {
-			server.off("error", reject);
-			resolve();
-		});
+		server.listen(socketPath, () => { server.off("error", reject); resolve(); });
 	});
 }
 
