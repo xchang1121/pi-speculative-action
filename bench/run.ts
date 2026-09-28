@@ -67,6 +67,7 @@ const { values } = parseArgs({
 		"self-speculation": { type: "boolean", default: false },
 		"drafter-pattern-hints": { type: "boolean", default: false },
 		"prepare-only": { type: "boolean", default: false },
+		"keep-session": { type: "boolean", default: false },
 	},
 	strict: true,
 });
@@ -81,13 +82,8 @@ const options = {
 	drafter: model(values.drafter ?? "deepseek/deepseek-v4-flash"),
 	drafterMaxDepth: nonNegativeInteger(values["drafter-max-depth"], "--drafter-max-depth"),
 	candidateLimit: positiveInteger(values["candidate-limit"], "--candidate-limit"),
-	...(values["drafter-max-tokens"] !== undefined
-		? { drafterMaxTokens: positiveInteger(values["drafter-max-tokens"], "--drafter-max-tokens") }
-		: {}),
-	drafterDeterministicCandidates: nonNegativeInteger(
-		values["drafter-deterministic-candidates"],
-		"--drafter-deterministic-candidates",
-	),
+	...(values["drafter-max-tokens"] !== undefined ? { drafterMaxTokens: positiveInteger(values["drafter-max-tokens"], "--drafter-max-tokens") } : {}),
+	drafterDeterministicCandidates: nonNegativeInteger(values["drafter-deterministic-candidates"], "--drafter-deterministic-candidates"),
 	drafterTemperatureMin: nonNegativeNumber(values["drafter-temperature-min"], "--drafter-temperature-min"),
 	drafterTemperatureMax: nonNegativeNumber(values["drafter-temperature-max"], "--drafter-temperature-max"),
 	maxConcurrentActions: positiveInteger(values["max-concurrent-actions"], "--max-concurrent-actions"),
@@ -103,6 +99,7 @@ const options = {
 	selfSpeculation: values["self-speculation"] ?? false,
 	drafterPatternHints: values["drafter-pattern-hints"] ?? false,
 	prepareOnly: values["prepare-only"] ?? false,
+	keepSession: values["keep-session"] ?? false,
 } as const;
 if (options.drafterTemperatureMin > options.drafterTemperatureMax) {
 	throw new Error("--drafter-temperature-min must not exceed --drafter-temperature-max");
@@ -196,11 +193,12 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		}),
 	});
 	const settingsManager = SettingsManager.inMemory({}, { projectTrusted: true });
+	const sessionManager = SessionManager.inMemory(task.workspace);
 	const resourceLoader = new DefaultResourceLoader({ cwd: task.workspace, agentDir, settingsManager, noExtensions: true, extensionFactories: [extension] });
 	await resourceLoader.reload();
 	const { session } = await createAgentSession({
 		cwd: task.workspace, agentDir, model: input.actor, modelRuntime: await ModelRuntime.create({ credentials, modelsPath: null, refreshOnCreate: false }), thinkingLevel: "high", resourceLoader, settingsManager,
-		tools: ["read", "grep", "find", "ls", "bash", "edit", "write"], sessionManager: SessionManager.inMemory(task.workspace),
+		tools: ["read", "grep", "find", "ls", "bash", "edit", "write"], sessionManager,
 	});
 	await session.bindExtensions({ mode: "print" });
 	let turns = 0;
@@ -235,7 +233,10 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		}
 	}
 	const taskCompletedAt = performance.now();
-	const actorActions = Object.values(actorActionsByTool).reduce((sum, count) => sum + count, 0);
+	// The Actor's transcript, calls with their results, for offline replay (bench/pattern-replay.ts).
+	if (input.keepSession && input.output) await writeFile(input.output.replace(/(\.json)?$/, ".session.jsonl"),
+		[sessionManager.getHeader(), ...sessionManager.getEntries()].map((entry) => JSON.stringify(entry)).join("\n"));
+	const actorActions =Object.values(actorActionsByTool).reduce((sum, count) => sum + count, 0);
 	const summary = summarizeSpeculativeTrace(events);
 	const { candidateStartTrace, actorActionTrace, ...dimensions } = benchmarkTraceReport(events, actorActionsByTool, input.speculationEnabled);
 	const actualEndToEndMs = taskCompletedAt - taskStartedAt;
