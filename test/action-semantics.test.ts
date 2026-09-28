@@ -20,11 +20,7 @@ import {
 	WORKSPACE_MUTATION_ACTION_TOOLS,
 } from "../src/action-semantics.ts";
 import { PI_BASH_TIMEOUT_PROJECTION_RULE, PI_GREP_LITERAL_PROJECTION_RULE, piToolErrorSettlement } from "../src/pi-tool-invocation.ts";
-import {
-	RESOURCE_OBSERVATION_EFFECTS,
-	UNRESTRICTED_PROCESS_EFFECTS,
-	WORKSPACE_PATH_MUTATION_EFFECTS,
-} from "../src/effect-model.ts";
+import { RESOURCE_OBSERVATION_EFFECTS, UNRESTRICTED_PROCESS_EFFECTS, WORKSPACE_PATH_MUTATION_EFFECTS } from "../src/effect-model.ts";
 
 describe("ActionSemanticsRegistry", () => {
 	it("defines K(a), resource evidence, and effects without choosing an execution backend", () => {
@@ -233,10 +229,7 @@ describe("ActionSemanticsRegistry", () => {
 				"malformed",
 				"malformed",
 				() =>
-					({ input: {}, resources: [42] }) as unknown as {
-						input: Record<string, never>;
-						resources: string[];
-					},
+					({ input: {}, resources: [42] }) as unknown as { input: Record<string, never>; resources: string[]; },
 			),
 		]);
 
@@ -297,24 +290,11 @@ function resourceDefinition(
 	epoch: string,
 	canonicalize: ActionSemanticsDefinition["canonicalize"],
 ): ActionSemanticsDefinition {
-	return {
-		tool,
-		epoch,
-		effect: "observation",
-		requirements: RESOURCE_OBSERVATION_EFFECTS,
-		resourceScope: "content",
-		canonicalize,
-	};
+	return { tool, epoch, effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS, resourceScope: "content", canonicalize };
 }
 
 function canonicalEmpty() {
 	return { input: {}, resources: ["."] };
 }
 
-function projector(id: string): ActionKeyProjector {
-	return {
-		id,
-		partition: () => undefined,
-		project: () => undefined,
-	};
-}
+function projector(id: string): ActionKeyProjector { return { id, partition: () => undefined, project: () => undefined, }; }

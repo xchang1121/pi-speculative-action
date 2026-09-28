@@ -14,12 +14,7 @@ function readKey(path: string, offset?: number, limit?: number) {
 
 function coverage(
 	lines: readonly string[],
-	options: {
-		readonly startLine?: number;
-		readonly totalLines?: number;
-		readonly maxLines?: number;
-		readonly maxBytes?: number;
-	} = {},
+	options: { readonly startLine?: number; readonly totalLines?: number; readonly maxLines?: number; readonly maxBytes?: number; } = {},
 ): ReadRangeCoverage {
 	const startLine = options.startLine ?? 1;
 	const totalLines = options.totalLines ?? startLine + lines.length - 1;
@@ -44,19 +39,11 @@ function settlement(snapshot?: unknown, text = "speculative output", isError = f
 	};
 }
 
-function coveredSettlement(
-	lines: readonly string[],
-	options: Parameters<typeof coverage>[1] = {},
-	isError = false,
-): ToolSettlement {
+function coveredSettlement(lines: readonly string[], options: Parameters<typeof coverage>[1] = {}, isError = false): ToolSettlement {
 	return settlement(coverage(lines, options), lines.join("\n"), isError);
 }
 
-async function project(
-	speculative: ReturnType<typeof readKey>,
-	actor: ReturnType<typeof readKey>,
-	output: ToolSettlement,
-) {
+async function project(speculative: ReturnType<typeof readKey>, actor: ReturnType<typeof readKey>, output: ToolSettlement) {
 	const keyMatch = actionKeyMatch(speculative, actor, [PI_READ_RANGE_PROJECTION_RULE]);
 	if (keyMatch?.kind !== "projected") throw new Error("Expected a projected read-key match");
 	const realizedCoverage = PI_READ_RANGE_PROJECTION_RULE.captureCoverage(speculative, output);
