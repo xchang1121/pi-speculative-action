@@ -90,6 +90,8 @@ export type PatternAwareBinding = (
 	| { readonly type: "transform"; readonly operation: PathTransform; readonly source: PatternAwareBinding; }
 	| { readonly type: "coalesce"; readonly sources: ReadonlyArray<PatternAwareBinding>; }
 	| { readonly type: "template"; readonly source: PatternAwareBinding; readonly prefix: string; readonly suffix: string; }
+	/** Two values spliced into literal text, `parts[0] + first + parts[1] + second + parts[2]` (`pytest <file>::<test>`). */
+	| { readonly type: "splice"; readonly sources: readonly [PatternAwareBinding, PatternAwareBinding]; readonly parts: readonly [string, string, string]; }
 	/** A line the source reports, matching a target within `tolerance` lines: a read's window around a reported location. */
 	| { readonly type: "near"; readonly source: PatternAwareBinding; readonly tolerance: number; }
 	| {
@@ -1552,6 +1554,7 @@ class PatternBindingAnalysis {
 		targetIsLine = false,
 	): Generator<PatternAwareBinding, undefined> {
 		const pathSources: Array<{ readonly binding: PatternAwareBinding; readonly value: string }> = [];
+		const spliceSources: Array<{ readonly binding: PatternAwareBinding; readonly value: string }> = [];
 		const targetKey = stableStringify(target);
 		for (const [relativeEvent, field, value] of reverseContextFields(context)) {
 			const indexed = includeComposites ? undefined : this.valueIndex(value).get(targetKey);
@@ -1588,6 +1591,7 @@ class PatternBindingAnalysis {
 							if (!rewrite && pathSources.length < MAX_PATH_SOURCES) pathSources.push({ binding: transformed, value });
 						}
 					}
+					if (!targetIsPath && spliceSources.length < MAX_PATH_SOURCES && source.length >= 3 && target.includes(source)) spliceSources.push({ binding: direct, value: source });
 					for (const { binding, value } of sources) {
 						const offset = value.length < 3 ? -1 : target.indexOf(value), suffix = target.slice(offset + value.length);
 						// A rewritten path keeps its directory and renames only the file's tail.
@@ -1597,6 +1601,12 @@ class PatternBindingAnalysis {
 				}
 			}
 			if (field !== "outputLocations") yield* collections();
+		}
+		if (typeof target === "string") for (const first of spliceSources) for (const second of spliceSources) {
+			const at = target.indexOf(first.value), next = target.indexOf(second.value, at + first.value.length);
+			if (first === second || next < 0) continue;
+			yield { type: "splice", sources: [first.binding, second.binding],
+				parts: [target.slice(0, at), target.slice(at + first.value.length, next), target.slice(next + second.value.length)] };
 		}
 		if (includeComposites && targetIsPath && typeof target === "string") {
 			const normalizedTarget = normalizePath(target);
@@ -1649,6 +1659,9 @@ class PatternBindingAnalysis {
 					typeof leftValue === "string" && typeof rightValue === "string" ? [joinPath(leftValue, rightValue)] : [],
 				),
 			);
+		} else if (binding.type === "splice") {
+			const [first, second] = binding.sources.map((source) => this.bindingValues(source, context).filter((value) => typeof value === "string"));
+			values = first!.flatMap((left) => second!.map((right) => `${binding.parts[0]}${left}${binding.parts[1]}${right}${binding.parts[2]}`));
 		} else if (binding.type === "template" || binding.type === "transform") {
 			values = this.bindingValues(binding.source, context).flatMap((value) =>
 				typeof value === "string" ? [binding.type === "template"
@@ -1863,7 +1876,7 @@ function analyzeBindings(bindings: Readonly<Record<string, PatternAwareBinding>>
 				field: node.field, path: node.path, ...(node.type === "each" ? { itemPath: node.itemPath } : {}) });
 			else {
 				analysis.complexity++;
-				if (node.type === "coalesce") node.sources.forEach(visit);
+				if (node.type === "coalesce" || node.type === "splice") node.sources.forEach(visit);
 				else if (node.type === "join") { visit(node.left); visit(node.right); }
 				else visit(node.source);
 			}
@@ -2319,6 +2332,9 @@ function isPatternAwareBinding(value: unknown, depth = 0): value is PatternAware
 			);
 		case "template":
 			return typeof record.prefix === "string" && typeof record.suffix === "string" && source();
+		case "splice":
+			return Array.isArray(record.sources) && record.sources.length === 2 && record.sources.every((item) => isPatternAwareBinding(item, depth + 1)) &&
+				Array.isArray(record.parts) && record.parts.length === 3 && record.parts.every((part) => typeof part === "string");
 		case "near":
 			return typeof record.tolerance === "number" && record.tolerance >= 0 && record.tolerance <= NEAR_LINE_TOLERANCE && source();
 		case "join":

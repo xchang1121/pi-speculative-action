@@ -445,6 +445,17 @@ describe("PatternAware", () => {
 			.toEqual({ type: "event", relativeEvent: -1, field: "output", path: ["main"] });
 	});
 
+	test("splices two earlier values into one command", () => {
+		const store = patternStore();
+		for (const name of ["alpha", "beta", "gamma"]) {
+			store.observe(input(name, "grep", { pattern: `test_${name}`, path: `tests/${name}_spec.py` }));
+			store.observe(input(name, "bash", { command: `pytest tests/${name}_spec.py::test_${name} -q` }));
+			store.finishSession(name);
+		}
+		store.observe(input("probe", "grep", { pattern: "test_zeta", path: "suite/zeta_spec.py" }));
+		expect(store.predict("probe").map((candidate) => candidate.input)).toContainEqual({ command: "pytest suite/zeta_spec.py::test_zeta -q" });
+	});
+
 	test("lets recent gap behavior replace stale high-volume history", () => {
 		const store = patternStore({ maxFutureGap: 8, futureGapCoverage: 0.9, decayHalfLifeEvents: 10 });
 		acceptPattern(store, { "0": 1000, "3": 10 }, {

@@ -6,24 +6,11 @@ import { isMissing } from "./error-utils.ts";
 import type { StableFilesystemCapture } from "./filesystem-evidence.ts";
 import { FILESYSTEM_CONCURRENCY, mapFilesystem } from "./filesystem-evidence.ts";
 import type { DynamicDependency, FilesystemTypeEvidence, Sha256Digest } from "./provenance-certificate.ts";
-import {
-	digestObject,
-	filesystemEntryType,
-	filesystemMetadataDigest,
-	sha256Digest,
-} from "./provenance-certificate.ts";
-import type {
-	WorkspaceStructureEntry,
-	WorkspaceStructureSnapshot,
-	WorkspaceTreeEntry,
-} from "./workspace-state.ts";
+import { digestObject, filesystemEntryType, filesystemMetadataDigest, sha256Digest } from "./provenance-certificate.ts";
+import type { WorkspaceStructureEntry, WorkspaceStructureSnapshot, WorkspaceTreeEntry } from "./workspace-state.ts";
 import { orderWorkspaceChanges, type WorkspaceRegularDelta } from "./workspace-transaction.ts";
 
-export type {
-	WorkspaceStructureEntry,
-	WorkspaceStructureSnapshot,
-	WorkspaceTreeEntry,
-} from "./workspace-state.ts";
+export type { WorkspaceStructureEntry, WorkspaceStructureSnapshot, WorkspaceTreeEntry } from "./workspace-state.ts";
 
 export interface ExecutionPathProjectionOptions {
 	readonly sourceRoot: string;
@@ -68,10 +55,7 @@ export class ExecutionPathProjection {
 	}
 }
 
-export interface WorkspaceStructureCaptureOptions {
-	readonly maxFiles?: number;
-	readonly exclude?: readonly string[];
-}
+export interface WorkspaceStructureCaptureOptions { readonly maxFiles?: number; readonly exclude?: readonly string[]; }
 
 /** Capture inode and directory semantics without reading regular-file contents. */
 export async function captureWorkspaceStructure(
@@ -131,10 +115,7 @@ export async function captureWorkspaceStructureEntry(
 	let stat: BigIntStats;
 	try {
 		stat = await lstat(target, { bigint: true });
-	} catch (error) {
-		if (isMissing(error)) return undefined;
-		throw error;
-	}
+	} catch (error) { if (isMissing(error)) return undefined; throw error; }
 	return captureExistingWorkspaceStructureEntry(target, stat, excludeEntries);
 }
 
@@ -147,12 +128,7 @@ async function captureExistingWorkspaceStructureEntry(
 	const change = { changeDigest: statChangeDigest(stat), changeTimeMs: statMilliseconds(stat, "ctime") };
 	if (stat.isSymbolicLink()) {
 		const linkTarget = await readlink(target);
-		return {
-			kind: "symlink",
-			target: linkTarget,
-			targetDigest: sha256Digest(Buffer.from(linkTarget, "utf8")),
-			...change,
-		};
+		return { kind: "symlink", target: linkTarget, targetDigest: sha256Digest(Buffer.from(linkTarget, "utf8")), ...change };
 	}
 	if (stat.isDirectory()) {
 		const excluded = new Set(excludeEntries);
@@ -180,11 +156,7 @@ async function captureExistingWorkspaceStructureEntry(
 			ownership: `${stat.uid}:${stat.gid}:${stat.mode & 0o7000n}`,
 		};
 	}
-	return {
-		kind: "unsupported",
-		type: filesystemEntryType(stat),
-		...change,
-	};
+	return { kind: "unsupported", type: filesystemEntryType(stat), ...change };
 }
 
 /** Validated transaction changes, ordered for replay without copying or hashing their bytes. */
@@ -342,10 +314,7 @@ export function snapshotDependency(
 	entry: WorkspaceTreeEntry | undefined,
 	parent: WorkspaceTreeEntry | undefined,
 	role: Extract<DynamicDependency, { kind: "file" }>["role"] = "input",
-	options: {
-		readonly excludedEntries?: readonly string[];
-		readonly parentExcludedEntries?: readonly string[];
-	} = {},
+	options: { readonly excludedEntries?: readonly string[]; readonly parentExcludedEntries?: readonly string[]; } = {},
 ): DynamicDependency | undefined {
 	if (!entry) {
 		return {
@@ -384,10 +353,7 @@ export function snapshotDependency(
 	}
 }
 
-function sameStructureEntry(
-	left: WorkspaceStructureEntry | undefined,
-	right: WorkspaceStructureEntry | undefined,
-): boolean {
+function sameStructureEntry(left: WorkspaceStructureEntry | undefined, right: WorkspaceStructureEntry | undefined): boolean {
 	if (!left || !right || left.kind !== right.kind) return left === right;
 	switch (left.kind) {
 		case "file": {
@@ -415,11 +381,7 @@ function changedRootMetadata(
 }
 
 export function directoryEntriesDigest(entries: readonly (FilesystemTypeEvidence & { readonly name: string })[]): Sha256Digest {
-	return digestObject(
-		entries
-			.map((entry) => `${filesystemEntryType(entry)}\0${entry.name}`)
-			.sort(),
-	);
+	return digestObject(entries .map((entry) => `${filesystemEntryType(entry)}\0${entry.name}`) .sort());
 }
 
 /** Kernel-maintained identity/change fields detect writes without making timestamps replay semantics. */
