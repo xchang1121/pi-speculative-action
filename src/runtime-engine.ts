@@ -4,11 +4,7 @@ import type { ActionKey, ActionKeyMatch } from "./action-semantics.ts";
 import { actionKeyCovers, actionKeyMatch, PI_ACTION_SEMANTICS } from "./action-semantics.ts";
 import { ActorAction, type ActorCandidateSelection } from "./actor-action.ts";
 import { CandidateExecution, type CandidateReservation } from "./candidate-execution.ts";
-import {
-	CandidateStore,
-	type ResultCacheEvidence,
-	speculativeCacheValue,
-} from "./candidate-stores.ts";
+import { CandidateStore, type ResultCacheEvidence, speculativeCacheValue } from "./candidate-stores.ts";
 import { candidateToolNames, clampCandidateLimit, DEFAULTS, type DrafterToolDefinition } from "./common.ts";
 import { nonNegativeFinite as finiteMetric, positiveCount } from "./number-utils.ts";
 import { errorDetail } from "./error-utils.ts";
@@ -158,10 +154,7 @@ function publicCandidate<Output>(
 	};
 }
 
-function predictionCandidate<Output>(
-	candidate: CandidateRecord<Output>,
-	node: PlanRuntimeNode,
-): SpeculativeCandidate {
+function predictionCandidate<Output>(candidate: CandidateRecord<Output>, node: PlanRuntimeNode): SpeculativeCandidate {
 	return {
 		...publicCandidate(candidate),
 		source: node.source,
@@ -304,11 +297,7 @@ function candidateExecutionProjection<Output>(
 	return { ...state };
 }
 
-function candidateCacheValue<Output>(
-	candidate: CandidateRecord<Output>,
-	evidence: ResultCacheEvidence,
-	now: number,
-): number {
+function candidateCacheValue<Output>(candidate: CandidateRecord<Output>, evidence: ResultCacheEvidence, now: number): number {
 	const execution = candidate.work.execution;
 	const reuseSamples = Math.max(1, evidence.actorHits);
 	return speculativeCacheValue(

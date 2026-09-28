@@ -208,7 +208,8 @@ export class SpeculationScheduler<Job extends object> {
 	}
 
 	evaluate(forecasts: readonly PredictionForecast[]): ScheduledWork {
-		let remaining = forecasts.length;
+		// Sources predicting the same work are independent chances of its use: their probabilistic benefits combine noisy-OR.
+		let remaining = forecasts.length, missed = 1, reachMs = 0;
 		const work = forecasts.reduce((work, forecast) => {
 			remaining--;
 			const expectedDurationMs = this.duration(forecast) ?? 1;
@@ -220,8 +221,12 @@ export class SpeculationScheduler<Job extends object> {
 			work.resourceUnits = Math.max(work.resourceUnits, units(forecast.resourceDemand));
 			work.decisionBatchesUntilCall = Math.min(work.decisionBatchesUntilCall, sequence(forecast.decisionBatchesUntilCall));
 			work.criticalPathMs = Math.max(work.criticalPathMs, criticalPathMs);
-			work.priorityMs = Math.max(work.priorityMs, forecast.expectedLatencyBenefitMs === undefined
-				? criticalPathMs : finite(forecast.expectedLatencyBenefitMs) * runwayScale);
+			if (forecast.expectedLatencyBenefitMs === undefined) work.priorityMs = Math.max(work.priorityMs, criticalPathMs);
+			else {
+				missed *= 1 - Math.min(1, finite(forecast.expectedLatencyBenefitMs) / benefitDurationMs);
+				reachMs = Math.max(reachMs, benefitDurationMs * runwayScale);
+				work.priorityMs = Math.max(work.priorityMs, (1 - missed) * reachMs);
+			}
 			work.background = forecast.background === true && work.background;
 			return work;
 		}, {
