@@ -30,6 +30,8 @@ const selfSpeculationDefaults = {
 	candidatePath: "/self-speculation/candidates",
 	forkPath: "/self-speculation/fork",
 	clearPath: "/self-speculation/clear",
+	/** Optional declaration of what the control plane serves (client side only; not yet verified against a vLLM sidecar). */
+	capabilitiesPath: "/self-speculation/capabilities",
 	timeoutMs: 2_000,
 	maxCandidates: 8,
 	maxDraftTokens: 28,
@@ -68,6 +70,7 @@ const parseSettings = settingsParser(selfSpeculationDefaults, {
 	candidatePath: httpPath,
 	forkPath: httpPath,
 	clearPath: httpPath,
+	capabilitiesPath: httpPath,
 	timeoutMs: positiveInteger,
 	maxCandidates: positiveInteger,
 	maxDraftTokens: positiveInteger,
@@ -140,6 +143,9 @@ interface TurnState {
 	gateSampleRecorded: boolean;
 }
 
+/** Unknown until declared; a declaration serves only the kinds it lists as true. */
+type ControlPlaneCapabilities = Partial<Record<"fork" | "candidates" | "logprobs" | "provider", boolean>>;
+
 interface ReportedCandidate { readonly sources: Set<string>; readonly tools: Set<string>; }
 
 interface CandidateRecord {
@@ -180,6 +186,8 @@ export class SelfSpeculationCoordinator {
 	private readonly requestID: () => string;
 	readonly actorForkPlanSource: ActorForkPlanSource;
 	private readonly draftFork: SelfSpeculationCoordinatorOptions["draftFork"];
+	/** Per endpoint; a control plane without the declaration keeps serving everything, as before negotiation existed. */
+	private readonly capabilities = new Map<string, ControlPlaneCapabilities>();
 	private readonly forkGate = new BenefitGate();
 	private readonly decoderEvidence = new EvidenceLedger(4, 2);
 	private readonly actionEvidence = new EvidenceLedger(2, 1);
@@ -268,6 +276,7 @@ export class SelfSpeculationCoordinator {
 		};
 		this.actorForkPlanSource.startTurn(turnID);
 		this.latestGateKey = modelKey(model);
+		if (settings.forkTransport !== "drafter" && !this.capabilities.has(settings.endpoint)) this.negotiate(settings);
 	}
 
 	/** Bind exactly one authoritative Actor provider request to the current speculative turn. */
@@ -282,7 +291,7 @@ export class SelfSpeculationCoordinator {
 		this.actorForkPlanSource.bindActorRequest(state.turnID);
 		this.scheduleFlush(state);
 		// Only the runtime exposing the control plane accepts these fields; hosted APIs reject unknown ones.
-		return settings.forkTransport !== "drafter" && originOf(state.model.baseUrl) === originOf(settings.endpoint)
+		return settings.forkTransport !== "drafter" && this.capabilities.get(settings.endpoint)?.provider !== false && originOf(state.model.baseUrl) === originOf(settings.endpoint)
 			? providerPayload(payload, settings, state.requestID, this.actorForkPlanSource.schedule) : payload;
 	}
 
@@ -304,10 +313,7 @@ export class SelfSpeculationCoordinator {
 				state.forkCandidateKeys.add(record.key);
 				this.counters.forkCandidates++;
 			}
-			if (
-				[...record.sources].some((source) => source !== "self-speculation") &&
-				!state.agreedForkKeys.has(record.key)
-			) {
+			if ([...record.sources].some((source) => source !== "self-speculation") && !state.agreedForkKeys.has(record.key)) {
 				state.agreedForkKeys.add(record.key);
 				this.counters.forkAgreements++;
 			}
@@ -378,7 +384,11 @@ export class SelfSpeculationCoordinator {
 		if (state.ended || state.forkTask || !state.requestID && state.settings.forkTransport !== "drafter") return;
 		const probe = snapshot ?? this.actorForkPlanSource.claimPendingProbe(state.turnID);
 		if (!probe) return;
-		const settings = state.settings;
+		const settings = state.settings, served = settings.forkTransport === "drafter" ? undefined : this.capabilities.get(settings.endpoint);
+		if (served?.fork === false || served?.logprobs === false && requiresForkLogprobs(settings)) {
+			this.actorForkPlanSource.publish(state.turnID, []);
+			return;
+		}
 		if (probe.attempt === 1) {
 			const gateDecision = this.forkGate.decide(state.gateKey, forkGatePolicy(settings));
 			if (!gateDecision.allowed) {
@@ -422,10 +432,7 @@ export class SelfSpeculationCoordinator {
 			.catch((error: unknown) => {
 				this.actorForkPlanSource.finishProbe(state.turnID);
 				this.actorForkPlanSource.publish(state.turnID, []);
-				if (signal?.aborted) {
-					this.finalizeGateSample(state);
-					return;
-				}
+				if (signal?.aborted) { this.finalizeGateSample(state); return; }
 				state.forkFailed = true;
 				this.finalizeGateSample(state);
 				throw error;
@@ -494,11 +501,7 @@ export class SelfSpeculationCoordinator {
 
 	private closeActive(preserveForRetry: boolean): void {
 		const state = this.active;
-		if (state) {
-			state.ended = true;
-			this.finalizeGateSample(state);
-			this.actorForkPlanSource.closeTurn(state.turnID);
-		}
+		if (state) { state.ended = true; this.finalizeGateSample(state); this.actorForkPlanSource.closeTurn(state.turnID); }
 		this.active = undefined;
 		if (state && preserveForRetry && state.candidates.size) {
 			// The active decision owns its bundle exclusively; outstanding submissions keep the old snapshot.
@@ -582,13 +585,10 @@ export class SelfSpeculationCoordinator {
 		}
 	}
 
-	async dispose(): Promise<void> {
-		this.reset();
-		while (this.background.size) await Promise.allSettled([...this.background]);
-	}
+	async dispose(): Promise<void> { this.reset(); while (this.background.size) await Promise.allSettled([...this.background]); }
 
 	private scheduleFlush(state: TurnState): void {
-		if (!state.requestID || state.flushTask || state.settings.forkTransport === "drafter") return;
+		if (!state.requestID || state.flushTask || state.settings.forkTransport === "drafter" || this.capabilities.get(state.settings.endpoint)?.candidates === false) return;
 		state.flushTask = this.flush(state).finally(() => {
 			state.flushTask = undefined;
 			if (state.dirty && state.requestID && this.active === state) this.scheduleFlush(state);
@@ -730,6 +730,18 @@ export class SelfSpeculationCoordinator {
 		);
 	}
 
+	/** Ask once which requests the endpoint serves; any failure leaves the legacy behavior (everything is attempted). */
+	private negotiate(settings: SelfSpeculationSettings): void {
+		this.capabilities.set(settings.endpoint, {});
+		const task = this.fetch(`${settings.endpoint}${settings.capabilitiesPath}`, { signal: AbortSignal.timeout(settings.timeoutMs) })
+			.then(async (response) => {
+				const declared = response.ok ? record(record(await response.json())?.capabilities) : undefined;
+				if (declared) this.capabilities.set(settings.endpoint, Object.fromEntries((["fork", "candidates", "logprobs", "provider"] as const)
+					.map((name) => [name, declared[name] === true])));
+			}).catch(() => undefined);
+		this.track(task);
+	}
+
 	private async post(
 		path: string,
 		payload: Readonly<Record<string, unknown>>,
@@ -743,10 +755,7 @@ export class SelfSpeculationCoordinator {
 			const apiKey = settings.apiKeyEnv ? process.env[settings.apiKeyEnv] : undefined;
 			const response = await this.fetch(`${settings.endpoint}${path}`, {
 				method: "POST",
-				headers: {
-					"content-type": "application/json",
-					...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
-				},
+				headers: { "content-type": "application/json", ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}) },
 				body: JSON.stringify(payload),
 				signal,
 			});
@@ -864,10 +873,7 @@ function candidatePayload(candidate: CandidateRecord, calibration: CandidateCali
 	};
 }
 
-function rankedCandidates(
-	candidates: Iterable<CandidateRecord>,
-	calibration: (candidate: CandidateRecord) => CandidateCalibration,
-) {
+function rankedCandidates(candidates: Iterable<CandidateRecord>, calibration: (candidate: CandidateRecord) => CandidateCalibration) {
 	return [...candidates]
 		.map((candidate) => ({ candidate, calibration: calibration(candidate) }))
 		.sort(
