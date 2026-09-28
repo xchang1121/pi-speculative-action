@@ -41,7 +41,7 @@ describe("strace provenance decoder", () => {
 		try {
 			expect(await run("cat a | grep x", [[exec("/usr/bin/cat", "a")], [exec("/usr/bin/grep", "x")]])).toEqual([]);
 			expect(await run("ls src && git -C /work status", [[exec("/usr/bin/ls", "src"), listing], [exec("/usr/bin/git", "-C", "/work", "status")]])).toEqual([]);
-			for (const [script, children, roots] of [["echo $RANDOM", []], ["find . -mmin 5", [[exec("/usr/bin/find", ".", "-mmin", "5")]]],
+			for (const [script, children, roots] of [["echo $RANDOM", []], ["true & jobs -l", []], ["find . -mmin 5", [[exec("/usr/bin/find", ".", "-mmin", "5")]]],
 				["./cat a", [[exec("/work/cat", "a")]]], ["grep -r x src", [[exec("/usr/bin/grep", "-r", "x", "src"), listing]]],
 				["git commit -m x", [[exec("/usr/bin/git", "commit", "-m", "x")]]], ["cat a", [[exec("/usr/bin/cat", "a")]], []]] as const)
 				expect(await run(script, children, roots), script).toEqual(expect.arrayContaining(["clock", "random"]));

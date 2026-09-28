@@ -24,8 +24,8 @@ const TOOLS: Readonly<Record<string, ToolRule>> = {
 		subcommands: new Set(["status", "diff", "log", "show", "rev-parse", "ls-files", "branch", "grep", "blame", "cat-file"]) },
 };
 const SHELLS = new Set(["bash", "sh", "dash"]);
-/** Shell text that reads what differs between runs: special parameters, time formats and the time keyword. */
-const VOLATILE_SHELL = /\$\{?(?:RANDOM|SRANDOM|BASHPID|SECONDS|EPOCHSECONDS|EPOCHREALTIME|PPID|\$|!)(?![A-Za-z0-9_])|%\(|(?:^|[\s;&|(])times?(?=[\s;&|)]|$)/;
+/** Shell text that reads what differs between runs: special parameters, time formats, the time keyword and job pids. */
+const VOLATILE_SHELL = /\$\{?(?:RANDOM|SRANDOM|BASHPID|SECONDS|EPOCHSECONDS|EPOCHREALTIME|PPID|\$|!)(?![A-Za-z0-9_])|%\(|(?:^|[\s;&|(])(?:times?|jobs)(?=[\s;&|)]|$)/;
 
 export interface TracedExecution {
 	readonly pid: number;
