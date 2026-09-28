@@ -3,13 +3,7 @@ import { isDeepStrictEqual } from "node:util";
 import { immutableSnapshot, isImmutableSnapshot } from "./stable-json.ts";
 import type { ActionKey, ActionKeyMatch } from "./action-semantics.ts";
 import type { CandidateExecution } from "./candidate-execution.ts";
-import type {
-	MaterializedPlan,
-	PlanAction,
-	PlanActionDependency,
-	PlanActionDependencyCondition,
-	PlanUpdate,
-} from "./plan-proposal.ts";
+import type { MaterializedPlan, PlanAction, PlanActionDependency, PlanActionDependencyCondition, PlanUpdate } from "./plan-proposal.ts";
 import type {
 	ActorActionIdentity,
 	PlanActionIdentity,
@@ -27,11 +21,7 @@ type PlanNodeExecution =
 
 export type PredictionOpportunityState =
 	| { readonly status: "pending" }
-	| {
-			readonly status: "matching";
-			readonly actorAction: ActorActionIdentity;
-			readonly relation: ActionKeyMatch;
-	  }
+	| { readonly status: "matching"; readonly actorAction: ActorActionIdentity; readonly relation: ActionKeyMatch; }
 	| { readonly status: "settled"; readonly settlement: PredictionSettlement };
 
 export type PlanNodeReadiness = "ready" | "waiting" | "blocked" | "settled";
@@ -155,11 +145,7 @@ type PlanExecutionOwner = Pick<CandidateExecution<unknown>, "execution" | "compl
 
 type MutableNodeExecution =
 	| PlanNodeExecution
-	| {
-			readonly status: "attached";
-			readonly candidateID: string;
-			readonly owner: PlanExecutionOwner;
-	  };
+	| { readonly status: "attached"; readonly candidateID: string; readonly owner: PlanExecutionOwner; };
 
 type MutableNode = {
 	identity: PlanActionIdentity;
@@ -469,10 +455,7 @@ export class PlanRuntime {
 		};
 	}
 
-	private mutable(
-		proposalID: string,
-		actionID: string,
-	): { readonly plan: MutablePlan; readonly node: MutableNode } | undefined {
+	private mutable(proposalID: string, actionID: string): { readonly plan: MutablePlan; readonly node: MutableNode } | undefined {
 		const plan = this.plans.get(proposalID);
 		const node = plan?.nodes.get(actionID);
 		return plan && node ? { plan, node } : undefined;
@@ -577,13 +560,7 @@ export class PlanRuntime {
 	}
 }
 
-function newNode(
-	proposalID: string,
-	source: string,
-	revision: number,
-	action: PlanAction,
-	anchorDecisionSeq: number,
-): MutableNode {
+function newNode(proposalID: string, source: string, revision: number, action: PlanAction, anchorDecisionSeq: number): MutableNode {
 	const identity: PlanActionIdentity = Object.freeze({
 		...(action.type === "operation" ? { kind: "operation" as const } : {}),
 		id: planNodeID(source, proposalID, action.id, revision),

@@ -37,16 +37,9 @@ const FILESYSTEM_OBSERVATION_FIELDS = [
 ] as const;
 export type FilesystemObservationEvidence = { readonly [Field in typeof FILESYSTEM_OBSERVATION_FIELDS[number]]: bigint };
 
-export interface ArtifactReference {
-	readonly digest: Sha256Digest;
-	readonly size: number;
-}
+export interface ArtifactReference { readonly digest: Sha256Digest; readonly size: number; }
 
-export interface SemanticEnvironmentEntry {
-	readonly name: string;
-	readonly present: boolean;
-	readonly valueDigest?: Sha256Digest;
-}
+export interface SemanticEnvironmentEntry { readonly name: string; readonly present: boolean; readonly valueDigest?: Sha256Digest; }
 
 export interface InheritedFileDescriptor {
 	readonly fd: number;
@@ -78,11 +71,7 @@ export interface ExecPrototype {
 	readonly environmentComplete: true;
 	readonly umask: number;
 	readonly processContextDigest: Sha256Digest;
-	readonly stdin: {
-		readonly type: "closed" | "bytes";
-		readonly digest?: Sha256Digest;
-		readonly eof: boolean;
-	};
+	readonly stdin: { readonly type: "closed" | "bytes"; readonly digest?: Sha256Digest; readonly eof: boolean; };
 	readonly fileDescriptorTableComplete: true;
 	readonly inheritedFDs: readonly InheritedFileDescriptor[];
 	readonly platformFingerprint: string;
@@ -90,18 +79,12 @@ export interface ExecPrototype {
 
 /** How the producer established evidence; deliberately excluded from semantic process identity. */
 export interface ProcessProducerProof {
-	readonly observer: {
-		readonly provider: string;
-		readonly fingerprint: Sha256Digest;
-	};
+	readonly observer: { readonly provider: string; readonly fingerprint: Sha256Digest; };
 	readonly execution:
 		| { readonly authority: "actor" }
 		| {
 				readonly authority: "speculative";
-				readonly confinement: {
-					readonly provider: string;
-					readonly fingerprint: Sha256Digest;
-				};
+				readonly confinement: { readonly provider: string; readonly fingerprint: Sha256Digest; };
 		  };
 }
 
@@ -131,12 +114,7 @@ export type DynamicDependency =
 			readonly parentEntriesDigest?: Sha256Digest;
 			readonly parentExcludedEntries?: readonly string[];
 	  }
-	| {
-			readonly kind: "symlink";
-			readonly path: string;
-			readonly target: string;
-			readonly targetDigest: Sha256Digest;
-	  }
+	| { readonly kind: "symlink"; readonly path: string; readonly target: string; readonly targetDigest: Sha256Digest; }
 	| {
 			/** Exact successful stat(2) result; content equality alone cannot prove this observation. */
 			readonly kind: "metadata";
@@ -144,12 +122,7 @@ export type DynamicDependency =
 			readonly followSymlinks: boolean;
 			readonly digest: Sha256Digest;
 	  }
-	| {
-			readonly kind: "fd";
-			readonly fd: number;
-			readonly contentDigest: Sha256Digest;
-			readonly eof: boolean;
-	  };
+	| { readonly kind: "fd"; readonly fd: number; readonly contentDigest: Sha256Digest; readonly eof: boolean; };
 
 export type ProvenanceTaint =
 	| "network"
@@ -288,10 +261,7 @@ export function dependencyPathsetKey(certificate: DynamicDependencyCertificate):
 	);
 }
 
-export function processStrongKey(
-	weakKey: Sha256Digest,
-	certificate: DynamicDependencyCertificate,
-): Sha256Digest {
+export function processStrongKey(weakKey: Sha256Digest, certificate: DynamicDependencyCertificate): Sha256Digest {
 	return digestObject({ weakKey, dependencies: normalizeDependencies(certificate.dependencies) });
 }
 
@@ -315,15 +285,7 @@ export function sealProcessCertificate(input: {
 	const weakKey = digestObject({ prototype });
 	const strongKey = digestObject({ weakKey, dependencies: dependencyCertificate.dependencies });
 	const createdAt = finiteTimestamp(input.createdAt ?? Date.now());
-	const body = {
-		weakKey,
-		strongKey,
-		prototype,
-		producer,
-		dependencyCertificate,
-		result,
-		createdAt,
-	};
+	const body = { weakKey, strongKey, prototype, producer, dependencyCertificate, result, createdAt };
 	return deepFreeze({ ...body, id: certificateContentKey(body) });
 }
 
@@ -347,11 +309,7 @@ export function parseProcessCertificate(value: unknown): ProcessProvenanceCertif
 			result: candidate.result,
 			createdAt: candidate.createdAt,
 		});
-		if (
-			sealed.id !== candidate.id ||
-			sealed.weakKey !== candidate.weakKey ||
-			sealed.strongKey !== candidate.strongKey
-		) {
+		if (sealed.id !== candidate.id || sealed.weakKey !== candidate.weakKey || sealed.strongKey !== candidate.strongKey) {
 			return undefined;
 		}
 		return sealed;
@@ -551,18 +509,12 @@ function normalizeProducerProof(proof: ProcessProducerProof): ProcessProducerPro
 	if (proof.execution.authority === "actor") {
 		return deepFreeze({ observer: { ...proof.observer }, execution: { authority: "actor" } });
 	}
-	if (
-		!validProvider(proof.execution.confinement?.provider) ||
-		!isSha256Digest(proof.execution.confinement?.fingerprint)
-	) {
+	if (!validProvider(proof.execution.confinement?.provider) || !isSha256Digest(proof.execution.confinement?.fingerprint)) {
 		throw new Error("speculative process producer requires confinement proof");
 	}
 	return deepFreeze({
 		observer: { ...proof.observer },
-		execution: {
-			authority: "speculative",
-			confinement: { ...proof.execution.confinement },
-		},
+		execution: { authority: "speculative", confinement: { ...proof.execution.confinement } },
 	});
 }
 
@@ -665,10 +617,7 @@ function normalizeResult(result: ProcessResultRecord, prototype: ExecPrototype):
 		!Number.isSafeInteger(result.continuation.imageBytes) || result.continuation.imageBytes <= 0 || result.continuation.imageBytes > 65 * 1024 * 1024))
 		throw new Error("invalid process continuation");
 	if (!result.continuation && !result.exit) throw new Error("process has neither exit nor continuation");
-	if (
-		result.observedProcessMs !== undefined &&
-		(!Number.isFinite(result.observedProcessMs) || result.observedProcessMs < 0)
-	) {
+	if (result.observedProcessMs !== undefined && (!Number.isFinite(result.observedProcessMs) || result.observedProcessMs < 0)) {
 		throw new Error("invalid observed process duration");
 	}
 	const journal = [...result.journal]
@@ -742,18 +691,12 @@ function normalizeResult(result: ProcessResultRecord, prototype: ExecPrototype):
 	});
 }
 
-function normalizeWorkspaceEffectState(
-	state: WorkspaceEffectState,
-	artifactSizes: Map<Sha256Digest, number>,
-): WorkspaceEffectState {
+function normalizeWorkspaceEffectState(state: WorkspaceEffectState, artifactSizes: Map<Sha256Digest, number>): WorkspaceEffectState {
 	if (state.kind === "absent") return { kind: "absent" };
 	if (!Number.isSafeInteger(state.mode) || state.mode < 0 || state.mode > 0o777) {
 		throw new Error("invalid workspace effect mode");
 	}
-	if (state.kind === "file") {
-		validateArtifact(state.data, artifactSizes);
-		return { ...state, data: { ...state.data } };
-	}
+	if (state.kind === "file") { validateArtifact(state.data, artifactSizes); return { ...state, data: { ...state.data } }; }
 	if (
 		!isSha256Digest(state.entriesDigest) ||
 		!Number.isSafeInteger(state.uid) ||
