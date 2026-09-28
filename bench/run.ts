@@ -1,3 +1,4 @@
+import { safeName } from "./suite-report.ts";
 import { benchmarkTraceReport } from "./trace-report.ts";
 import { execFile } from "node:child_process";
 import { mkdtemp, mkdir, stat, writeFile } from "node:fs/promises";
@@ -441,10 +442,6 @@ function nonNegativeNumber(value: string | undefined, option: string): number {
 function required(value: string | undefined, option: string): string {
 	if (!value?.trim()) throw new Error(`${option} is required`);
 	return value.trim();
-}
-
-function safeName(value: string): string {
-	return value.replaceAll(/[^A-Za-z0-9._-]/g, "_");
 }
 
 async function exists(value: string): Promise<boolean> {

@@ -78,6 +78,10 @@ export function summarizePairs(runs: readonly SuiteBenchmarkRun[]) {
 	};
 }
 
+export function safeName(value: string): string {
+	return value.replaceAll(/[^A-Za-z0-9._-]/g, "_");
+}
+
 function hasTiming(run: SuiteBenchmarkRun): run is MeasuredRun {
 	return !!run.summary && Number.isFinite(run.summary.actualEndToEndMs) && run.summary.actualEndToEndMs > 0 &&
 		Number.isFinite(run.summary.serializedCounterfactualMs) && run.summary.serializedCounterfactualMs >= 0;
