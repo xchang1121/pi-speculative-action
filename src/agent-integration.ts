@@ -14,19 +14,10 @@ import {
 import type { AgentConsumeInput, AgentStartInput, AgentStateData } from "./agent-runtime-types.ts";
 import { definitionSchemaHashes } from "./agent-runtime-types.ts";
 import type { ActorForkPlanSource } from "./actor-fork-plan-source.ts";
-import type {
-	ExecutionWorldDiagnosticSnapshot,
-	ExecutionOperationBinding,
-	SpeculativeExecutionRoute,
-} from "./execution-world.ts";
+import type { ExecutionWorldDiagnosticSnapshot, ExecutionOperationBinding, SpeculativeExecutionRoute } from "./execution-world.ts";
 import type { DrafterUtilityGateSnapshot } from "./drafter-utility-gate.ts";
 import { createDrafterPlanSource } from "./drafter-plan-source.ts";
-import {
-	PATTERN_AWARE_DEFAULTS,
-	type PatternAwareSettings,
-	type PatternAwareStore,
-	patternAwareSettings,
-} from "./pattern-aware.ts";
+import { PATTERN_AWARE_DEFAULTS, type PatternAwareSettings, type PatternAwareStore, patternAwareSettings } from "./pattern-aware.ts";
 import { createPatternPlanSource } from "./pattern-plan-source.ts";
 import { PI_BASH_TIMEOUT_PROJECTION_RULE, PI_GREP_LITERAL_PROJECTION_RULE, piToolErrorSettlement } from "./pi-tool-invocation.ts";
 import type { TimelineDependency } from "./task-timing.ts";
@@ -97,10 +88,7 @@ export interface CreateSpeculativeActionHostOptions extends Omit<Parameters<type
 	/** Runtime settings. The feature remains disabled when omitted. */
 	readonly getSettings?: () => SpeculativeAgentSettingsInput | Promise<SpeculativeAgentSettingsInput>;
 	/** Bind the concrete executor used by both speculative and Actor calls; rejection fails this invocation. */
-	readonly resolveInvocation?: (
-		tool: string,
-		input: unknown,
-	) => ToolInvocation | undefined | Promise<ToolInvocation | undefined>;
+	readonly resolveInvocation?: (tool: string, input: unknown) => ToolInvocation | undefined | Promise<ToolInvocation | undefined>;
 	/**
 	 * Non-interactive permission and policy check for speculative execution.
 	 * Candidates are rejected when this callback is absent.
@@ -155,10 +143,7 @@ export interface SpeculativeActionHost {
 		refresh?: boolean,
 	) => Promise<readonly ExecutionWorldDiagnosticSnapshot[]>;
 	readonly startTurn: (input: Omit<AgentStartInput, "sessionID">, signal?: AbortSignal) => Promise<void>;
-	readonly previewActorTool: (
-		input: { readonly turnID: string; readonly tool: string },
-		signal?: AbortSignal,
-	) => Promise<void>;
+	readonly previewActorTool: (input: { readonly turnID: string; readonly tool: string }, signal?: AbortSignal) => Promise<void>;
 	/** Raw streamed arguments; preparation is provisional and never binds the final Actor call. */
 	readonly previewActorCall: (input: Omit<AgentConsumeInput, "sessionID">, signal?: AbortSignal) => Promise<void>;
 	/** One tool outlet: reuse lookup, Actor fallback, timing, and settlement reporting. */
@@ -188,10 +173,7 @@ export { patternPlanActionID } from "./pattern-plan-source.ts";
 /**
  * Build source-neutral speculative plan execution for a host. The host owns lifecycle and tool interception.
  */
-export function createSpeculativeActionHost(
-	sessionID: string,
-	options: CreateSpeculativeActionHostOptions,
-): SpeculativeActionHost {
+export function createSpeculativeActionHost(sessionID: string, options: CreateSpeculativeActionHostOptions): SpeculativeActionHost {
 	const actionSemantics = options.actionSemantics ?? PI_ACTION_SEMANTICS;
 	const projectionRules = resolveActionProjectionRules([...options.projectionRules ?? [], PI_BASH_TIMEOUT_PROJECTION_RULE, PI_GREP_LITERAL_PROJECTION_RULE], actionSemantics);
 	const executionWorlds = [...new Set(options.executionWorlds ?? [])];
@@ -305,10 +287,7 @@ export function createSpeculativeActionHost(
 				if (bind) return (await bind()).action;
 				tool = call.tools.find((candidate) => candidate.name === toolName);
 				validated = call[RAW_ACTOR_CALL] ? tool && prepareToolArguments(tool, input) : immutableSnapshot(input);
-			} else {
-				tool = context.data.tools.get(toolName);
-				validated = tool && prepareToolArguments(tool, input);
-			}
+			} else { tool = context.data.tools.get(toolName); validated = tool && prepareToolArguments(tool, input); }
 			if (!tool || validated === undefined) return undefined;
 			const schemaHash =
 				context.type === "consume" ? stableValueHash(tool.parameters ?? null) : context.data.schemaHashes[toolName];
@@ -463,23 +442,14 @@ export function createSpeculativeActionHost(
 		drafterGateSnapshot: drafterPlans.snapshot,
 		finishTurn: async (turnID, terminal = false) => {
 			await runtime.finishTurn({ sessionID, turnID, tool: "", args: {}, tools: [], terminal });
-			if (terminal) {
-				drafterPlans.finishSession();
-				await patternPlans.finishSession();
-			}
+			if (terminal) { drafterPlans.finishSession(); await patternPlans.finishSession(); }
 		},
 		dispose: async () => {
 			try {
 				await runtime.disposeSession(sessionID);
 				drafterPlans.finishSession();
 				await patternPlans.finishSession();
-			} finally {
-				try {
-					await patternPlans.dispose();
-				} finally {
-					await executionGateway.dispose();
-				}
-			}
+			} finally { try { await patternPlans.dispose(); } finally { await executionGateway.dispose(); } }
 		},
 	};
 }
