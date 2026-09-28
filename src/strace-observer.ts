@@ -701,10 +701,7 @@ export async function observeStrace(
 				if (!metadataPaths.length || !digest) {
 					// fstat, or an empty *at name, of a pipe or socket
 					if (descriptorTarget(line) && !quotedArgument(line.args[1])) taints.add("descriptor_observation");
-					else {
-						taints.add("unsupported_syscall");
-						incompleteReasons.add(`unparsed_metadata:${syscall}:${pid}`);
-					}
+					else { taints.add("unsupported_syscall"); incompleteReasons.add(`unparsed_metadata:${syscall}:${pid}`); }
 				}
 				if (digest) {
 					const followSymlinks = syscall !== "lstat" && !(flags && /\bAT_SYMLINK_NOFOLLOW\b/.test(line.args[flags] ?? ""));
@@ -946,10 +943,11 @@ function absoluteDescriptorPath(descriptor: string | undefined): string | undefi
 	return target?.startsWith("/") && !target.endsWith(" (deleted)") ? path.posix.normalize(decodeCString(target)) : undefined;
 }
 
-/** Non-path descriptors are already typed in the process key, but their kernel identity is volatile. */
+/** Non-path descriptors, and memfds such as Sandlock's virtual /proc/mounts (its content comes from the opened path), are
+ * already typed in the process key, but their kernel identity is volatile. */
 function descriptorTarget(line: TraceLine): boolean {
 	const target = /^\d+<(.+)>$/.exec(line.args[0] ?? "")?.[1];
-	return Boolean(target && !target.startsWith("/"));
+	return Boolean(target && (!target.startsWith("/") || target.startsWith("/memfd:")));
 }
 
 const STAT_MODE_BITS: Readonly<Record<string, bigint>> = { S_IFSOCK: 0o140000n, S_IFLNK: 0o120000n, S_IFREG: 0o100000n, S_IFBLK: 0o060000n,
