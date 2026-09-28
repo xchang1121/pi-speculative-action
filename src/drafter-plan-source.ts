@@ -80,6 +80,9 @@ export function createDrafterPlanSource(input: {
 }): DrafterPlanSourceController {
 	const batches = new Map<string, DrafterPreparation>();
 	const gate = new DrafterUtilityGate();
+	// Beta(1, 1) posterior of how often the Actor made each tool's predicted call, from this session's observed settlements.
+	const calibration = new Map<string, { observed: number; matched: number }>();
+	const hitProbability = (tool: string) => ((calibration.get(tool)?.matched ?? 0) + 1) / ((calibration.get(tool)?.observed ?? 0) + 2);
 	const finishBatch = (key: string) => {
 		const batch = batches.get(key);
 		batches.delete(key);
@@ -105,7 +108,7 @@ export function createDrafterPlanSource(input: {
 			const feedback: DrafterPlanFeedback = { ...batch, kind: "drafter_plan", message, depth,
 				calls: new Map(kept.map((call, index) => [`${prefix}:${index}`, call])), results: new Map(), claimed: kept.length < calls.length };
 			return { actions: [...feedback.calls].map(([id, call]): PlanAction => ({
-				id, type: "tool_call", tool: call.name, input: widenReadGuess(call.name, call.arguments), depth, feedback, dependsOn,
+				id, type: "tool_call", tool: call.name, input: widenReadGuess(call.name, call.arguments), depth, feedback, dependsOn, empiricalProbability: hitProbability(call.name),
 				diagnostic: JSON.stringify({ toolCallID: call.id, tool: call.name, input: call.arguments }, null, 2),
 			})) };
 		} catch (error) {
@@ -117,6 +120,13 @@ export function createDrafterPlanSource(input: {
 	};
 	const source: AgentPlanSource = {
 		id: "drafter",
+		onSettled: ({ actionID, feedback, settlement }) => {
+			const tool = asDrafterPlanFeedback(feedback)?.calls.get(actionID)?.name;
+			if (!tool || settlement.observation !== "observed") return;
+			const counts = calibration.get(tool) ?? calibration.set(tool, { observed: 0, matched: 0 }).get(tool)!;
+			counts.observed++;
+			counts.matched += Number(settlement.match.matched);
+		},
 		enabled: (settings) => settings.drafterEnabled ?? DEFAULTS.drafterEnabled,
 		timeoutMs: (settings) => settings.predictionTimeoutMs,
 		requestLifetime: "actor_decision",

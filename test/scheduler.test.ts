@@ -107,6 +107,14 @@ describe("SpeculationScheduler", () => {
 		expect(scheduler.admit({}, [forecast({ resourceDemand: 2 })], 1).admitted).toBe(false);
 	});
 
+	it("weighs a model source's work by its calibrated hit probability unless it states a benefit", () => {
+		const scheduler = new SpeculationScheduler<object>(), base = { expectedDurationMs: 100, criticalPathMs: 100 };
+		expect(scheduler.evaluate([forecast(base)]).priorityMs).toBe(100);
+		expect(scheduler.evaluate([forecast({ ...base, hitProbability: 0.25 })]).priorityMs).toBe(25);
+		expect(scheduler.evaluate([forecast({ ...base, hitProbability: 0.25, expectedLatencyBenefitMs: 60 })]).priorityMs).toBe(60);
+		expect(scheduler.evaluate([forecast({ ...base, hitProbability: 0.5 }), forecast({ ...base, hitProbability: 0.5 })]).priorityMs).toBe(75);
+	});
+
 	it("defers future work only from observed Actor timing and known service cost", () => {
 		const scheduler = new SpeculationScheduler<object>();
 		const future = forecast({ tool: "bash", decisionBatchesUntilCall: 2,

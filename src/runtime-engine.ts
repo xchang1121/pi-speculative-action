@@ -108,6 +108,7 @@ function forecastFor(
 		...(actorPhase ? { actorPhase } : {}),
 		criticalPathMs: node.criticalPathMs,
 		...(node.action.expectedLatencyBenefitMs !== undefined ? { expectedLatencyBenefitMs: node.action.expectedLatencyBenefitMs } : {}),
+		...(node.action.empiricalProbability !== undefined ? { hitProbability: node.action.empiricalProbability } : {}),
 		...(node.action.background ? { background: true } : {}),
 		...((node.action.dependsOn?.length ?? 0) > 0 && (node.action.horizon ?? 0) <= 0 ? { dependenciesResolved: true } : {}),
 	};
