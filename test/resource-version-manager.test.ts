@@ -247,18 +247,12 @@ describe("speculative action resource versions", () => {
 				if (change === "unchanged") await directories.create(); // Shared ancestor noise must not change this fixture's expected outcome.
 				if (change === "ancestor") await fs.mkdir(path.join(parent, "unrelated"));
 				if (change === "sibling") await fs.writeFile(path.join(root, "sibling"), "B");
-				if (change === "restore") {
-					await fs.writeFile(file, "A");
-					await fs.utimes(file, new Date(), new Date(Date.now() + 5_000));
-				}
+				if (change === "restore") { await fs.writeFile(file, "A"); await fs.utimes(file, new Date(), new Date(Date.now() + 5_000)); }
 				if (change === "replace" || change === "entries") {
 					const temporary = path.join(root, "temporary.txt");
 					await fs.writeFile(temporary, "A");
 					if (change === "replace") await fs.rename(temporary, file);
-					else {
-						await fs.rm(temporary);
-						await fs.utimes(root, new Date(), new Date(Date.now() + 5_000));
-					}
+					else { await fs.rm(temporary); await fs.utimes(root, new Date(), new Date(Date.now() + 5_000)); }
 				}
 				token.view!.seal();
 				expect((await manager.validate(token)).expired, change).toBe(change === "write" || change === "kind");
@@ -995,6 +989,19 @@ describe("speculative action resource versions", () => {
 			gate.release();
 			expect(await owner).toMatchObject({ hash, bytesRead: payload.length });
 		} finally { gate.release(); open.mockRestore(); }
+	});
+
+	test("reuses an executable digest only once its file's last change is older than the racy margin", async () => {
+		const root = await workspace({ image: "old" }), file = path.join(root, "image"), opened = vi.spyOn(fs, "open"), now = Date.now();
+		const digest = (value: string) => `sha256:${createHash("sha256").update(value).digest("hex")}`;
+		try {
+			expect([await hashExecutableFile(file), await hashExecutableFile(file), opened.mock.calls.length >= 2]).toEqual([digest("old"), digest("old"), true]); // Taken just after the change.
+			const clock = vi.spyOn(Date, "now").mockReturnValue(now + 5000);
+			await hashExecutableFile(file); opened.mockClear(); clock.mockRestore();
+			expect([await hashExecutableFile(file), opened.mock.calls.length]).toEqual([digest("old"), 0]);
+			await fs.writeFile(file, "newer"); // A rewrite changes the identity the digest was stored under.
+			expect(await hashExecutableFile(file)).toBe(digest("newer"));
+		} finally { opened.mockRestore(); }
 	});
 
 	test.runIf(process.platform === "linux")("distinguishes pinned images from pathname snapshots after alias targets change", async () => {

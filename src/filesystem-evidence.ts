@@ -9,10 +9,7 @@ const IDENTITY_FIELDS = ["dev", "ino", "mode", "nlink", "uid", "gid", "rdev", "s
 export const FILESYSTEM_CONCURRENCY = 12;
 
 /** Bound independent filesystem work and drain every admitted operation before propagating failure. */
-export async function mapFilesystem<Input, Output>(
-	values: ReadonlyArray<Input>,
-	run: (value: Input) => Promise<Output>,
-) {
+export async function mapFilesystem<Input, Output>(values: ReadonlyArray<Input>, run: (value: Input) => Promise<Output>) {
 	const output: Output[] = [];
 	let cursor = 0;
 	const pending = Array.from({ length: Math.min(FILESYSTEM_CONCURRENCY, values.length) }, async () => {
@@ -97,10 +94,18 @@ export function captureStableFile(
 }
 
 /** Follow executable aliases (including /proc/PID/exe), then hash the complete pinned image. */
-export async function hashExecutableFile(target: string, observation?: {
-	readonly pinned: () => void; readonly signal: AbortSignal;
-}): Promise<`sha256:${string}`> {
-	return `sha256:${(await captureFile(target, Infinity, false, false, undefined, observation)).hash}`;
+/** Executable digests only (workspace captures stay exact), by kernel identity and change times. An entry is trusted once the file's
+ * last change precedes its digest by 2 s, so a same-size rewrite inside one coarse timestamp tick cannot reuse it (the racy-git rule). */
+const executableDigests = new Map<string, { readonly digest: `sha256:${string}`; readonly takenAtMs: number }>();
+const executableIdentity = (stat: BigIntStats) => `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+
+export async function hashExecutableFile(target: string, observation?: { readonly pinned: () => void; readonly signal: AbortSignal }): Promise<`sha256:${string}`> {
+	const current = await fs.stat(target, { bigint: true }), cached = executableDigests.get(executableIdentity(current));
+	if (cached && cached.takenAtMs - Number((current.mtimeNs > current.ctimeNs ? current.mtimeNs : current.ctimeNs) / 1_000_000n) >= 2000) { observation?.pinned(); return cached.digest; }
+	const takenAtMs = Date.now(), capture = await captureFile(target, Infinity, false, false, undefined, observation), digest = `sha256:${capture.hash}` as const;
+	executableDigests.set(executableIdentity(capture.stat), { digest, takenAtMs });
+	if (executableDigests.size > 256) executableDigests.delete(executableDigests.keys().next().value!);
+	return digest;
 }
 
 /** Read a held descriptor through a separate OFD, preserving its shared position. */
@@ -132,14 +137,8 @@ export async function captureHeldDirectory(pid: number, fd: number, content: Buf
 	} catch (error) { await handle.close(); throw error; }
 }
 
-async function captureFile(
-	target: string,
-	maxBytes: number,
-	retainContent: boolean,
-	verifyPath: boolean,
-	observed?: Partial<Pick<StableFilesystemCapture, "stat" | "realPath">> & { readonly retainObject?: boolean },
-	observation?: { readonly pinned: () => void; readonly signal: AbortSignal },
-): Promise<StableFilesystemCapture> {
+async function captureFile(target: string, maxBytes: number, retainContent: boolean, verifyPath: boolean,
+	observed?: Partial<Pick<StableFilesystemCapture, "stat" | "realPath">> & { readonly retainObject?: boolean }, observation?: { readonly pinned: () => void; readonly signal: AbortSignal }): Promise<StableFilesystemCapture> {
 	// O_PATH pins even executable aliases without admitting I/O on a raced-in FIFO or device.
 	let binding = process.platform === "linux" && (process.arch === "x64" || process.arch === "arm64")
 		? await fs.open(target, 0x200000 | (verifyPath ? constants.O_NOFOLLOW : 0)) : undefined;
@@ -213,20 +212,14 @@ export async function captureFilesystemEntry(target: string, read?: "directory" 
 }
 
 /** Resolve link targets component by component, retaining each stable namespace observation. */
-export async function* walkFilesystemPath(target: string, options: {
-	readonly start?: string;
-	readonly followFinal?: boolean;
-	readonly capture?: typeof captureFilesystemEntry;
-} = {}) {
+export async function* walkFilesystemPath(target: string, options: { readonly start?: string; readonly followFinal?: boolean; readonly capture?: typeof captureFilesystemEntry } = {}) {
 	const start = options.start ?? path.parse(target).root;
 	let current = start, links = 0;
 	const pending = target.slice(start.length).split(path.sep).filter(Boolean);
 	for (;;) {
 		let captured: Awaited<ReturnType<typeof captureFilesystemEntry>> | undefined;
 		try { captured = await (options.capture ?? captureFilesystemEntry)(current); }
-		catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-		}
+		catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
 		const { info, link } = captured ?? {}, terminal = pending.length === 0 && (link === undefined || options.followFinal === false);
 		if (links && (!info || terminal)) {
 			// Magic links name kernel handles; their displayed pathname need not identify that object.
