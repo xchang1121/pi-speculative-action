@@ -402,12 +402,7 @@ function patchFiles(patch: string): string[] {
 	];
 }
 
-function lines(value: string): string[] {
-	return value
-		.split(/\r?\n/)
-		.map((line) => line.trim())
-		.filter(Boolean);
-}
+function lines(value: string): string[] { return value .split(/\r?\n/) .map((line) => line.trim()) .filter(Boolean); }
 
 function increment(counts: Record<string, number>, key: string): void {
 	counts[key] = (counts[key] ?? 0) + 1;
