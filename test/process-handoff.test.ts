@@ -72,6 +72,17 @@ describe("ProcessHandoffRegistry", () => {
 		await expect(fixture.ownership.commit(async () => "whole")).rejects.toMatchObject({ disposition: "recoverable" });
 		fixture.registry.dispose();
 	});
+	it("lets a later Actor call salvage a completed one-shot result once, never a producer", async () => {
+		const acceptScope = vi.fn((_scope: typeof SCOPE, salvage?: boolean) => salvage === true);
+		const fixture = await producer(true, undefined, 0, SCOPE, new ProcessHandoffOwnership(undefined, acceptScope));
+		await fixture.publish();
+		await expect(fixture.registry.acquire({ key: fixture.key, scope: OTHER_SCOPE, role: "producer", ownership: new ProcessHandoffOwnership(), lookup: livePlan,
+			executablePath: fixture.certificate.prototype.executablePath })).resolves.toMatchObject({ kind: "work" });
+		await expect(fixture.actor(undefined, async () => "miss", OTHER_SCOPE)).resolves.toMatchObject({ kind: "hit", producer: fixture.work });
+		await expect(fixture.actor(undefined, async () => "miss", OTHER_SCOPE)).resolves.toMatchObject({ kind: "miss" });
+		expect(acceptScope).toHaveBeenCalledWith(OTHER_SCOPE, true);
+		fixture.registry.dispose();
+	});
 	it("owns bounded launch bindings without persisting secrets or granting result adoption", async () => {
 		for (const source of ["sealed", "consumed", "native"]) for (const revoke of ["clear", "count", "bytes", "dispose"] as const) {
 			const consumed = source === "consumed", native = source === "native";

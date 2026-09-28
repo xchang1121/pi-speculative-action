@@ -6,22 +6,7 @@ import { randomBytes } from "node:crypto";
 import { once } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
 import { constants as fsConstants } from "node:fs";
-import {
-	access,
-	chmod,
-	copyFile,
-	link,
-	lstat,
-	mkdir,
-	mkdtemp,
-	open,
-	readFile,
-	readdir,
-	realpath,
-	rm,
-	stat,
-	writeFile,
-} from "node:fs/promises";
+import { access, chmod, copyFile, link, lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -29,72 +14,23 @@ import { finished } from "node:stream/promises";
 import { errorMessage, isMissing as missing } from "./error-utils.ts";
 import { stableEqual } from "./stable-json.ts";
 import { TimelineInterval, type TimelineDependency } from "./task-timing.ts";
-import {
-	createExecPrototype,
-	digestObject,
-	dynamicDependencyIdentity,
-	type DynamicDependency,
-	type DynamicDependencyCertificate,
-	type ExecPrototype,
-	type ExitOutcome,
-	filesystemObservationDigest,
-	type OrderedEffectEvent,
-	type OFDPosition,
-	type ProcessProducerProof,
-	type ProcessProvenanceCertificate,
-	type ProcessResultRecord,
-	processWeakKey,
-	type ProvenanceTaint,
-	sealProcessCertificate,
-	sha256Digest,
-	type Sha256Digest,
-	type WorkspaceEffectState,
-} from "./provenance-certificate.ts";
-import {
-	captureAbsenceDependency,
-	captureDirectoryDependency,
-	captureFileDependency,
-	validateDynamicDependencyCertificate,
-} from "./provenance-validation.ts";
-import {
-	diffWorkspaceStructures,
-	ExecutionPathProjection,
-	hydrateWorkspaceFileEntry,
-	snapshotDependency,
-	type WorkspaceStructureSnapshot,
-	type WorkspaceTransactionDiff,
-	type WorkspaceTreeEntry,
-} from "./process-observation.ts";
-import {
-	definedProcessEnvironment,
-	type PreparedProcessExecutionRoute,
-	type ProcessExecutionRequest,
-	type ProcessExecutionResult,
-	type ProcessExecutor,
-} from "./process-execution.ts";
+import { createExecPrototype, digestObject, dynamicDependencyIdentity, type DynamicDependency, type DynamicDependencyCertificate, type ExecPrototype,
+	type ExitOutcome, filesystemObservationDigest, type OrderedEffectEvent, type OFDPosition, type ProcessProducerProof,
+	type ProcessProvenanceCertificate, type ProcessResultRecord, processWeakKey, type ProvenanceTaint, sealProcessCertificate, sha256Digest,
+	type Sha256Digest, type WorkspaceEffectState } from "./provenance-certificate.ts";
+import { captureAbsenceDependency, captureDirectoryDependency, captureFileDependency,
+	validateDynamicDependencyCertificate } from "./provenance-validation.ts";
+import { diffWorkspaceStructures, ExecutionPathProjection, hydrateWorkspaceFileEntry, snapshotDependency, type WorkspaceStructureSnapshot,
+	type WorkspaceTransactionDiff, type WorkspaceTreeEntry } from "./process-observation.ts";
+import { definedProcessEnvironment, type PreparedProcessExecutionRoute, type ProcessExecutionRequest, type ProcessExecutionResult,
+	type ProcessExecutor } from "./process-execution.ts";
 import { isPoisonedEffectCommit } from "./effect-transaction.ts";
 import { resolveHostExecutable } from "./executable-path.ts";
 import { assertNoSymlinkPath, captureStableFile, hashExecutableFile, mapFilesystem, sameFilesystemIdentity, walkFilesystemPath } from "./filesystem-evidence.ts";
-import {
-	captureHeldDescriptorInputs,
-	inspectHeldExecProcess,
-	LinuxHeldExecBoundary,
-	listenUnixSocket,
-	resolveLinuxExecHelper,
-	type HeldExecDecision,
-	type HeldExecProcess,
-	type HeldExecSnapshot,
-	descriptorInputs, descriptorEffects,
-	type ProcessResourceGraph,
-} from "./linux-held-exec.ts";
-import {
-	emptyWorldReuseMetrics,
-	snapshotExecutionScope,
-	type ExecutionScope,
-	type ExecutionOperationAdoption,
-	type ExecutionWorldStorageControl,
-	type WorldReuseMetrics,
-} from "./execution-world.ts";
+import { captureHeldDescriptorInputs, inspectHeldExecProcess, LinuxHeldExecBoundary, listenUnixSocket, resolveLinuxExecHelper, type HeldExecDecision,
+	type HeldExecProcess, type HeldExecSnapshot, descriptorInputs, descriptorEffects, type ProcessResourceGraph } from "./linux-held-exec.ts";
+import { emptyWorldReuseMetrics, snapshotExecutionScope, type ExecutionScope, type ExecutionOperationAdoption, type ExecutionWorldStorageControl,
+	type WorldReuseMetrics } from "./execution-world.ts";
 import { type ProcessReusePlan, ProcessReusePlanner } from "./reuse-planner.ts";
 import { ProvenanceCertificateStore, type ProvenanceStoreOptions, type VerifiedArtifactClosure } from "./reuse-store.ts";
 import { SpeculationScheduler, type ServiceTimingIdentity, waitForCandidate } from "./scheduler.ts";
@@ -102,15 +38,8 @@ import { observeStrace, straceCommand, type ObservedProcessPath, type StraceObse
 import type { ToolProcessInvocation } from "./tool-settlement.ts";
 import type { ResourceValidation } from "./settlement.ts";
 import { ProcessHandoffOwnership, ProcessHandoffRegistry, sameScope, type ProcessContinuation, type ProcessExecutionBinding, type ProcessHandoff, type ProcessHandoffLookup } from "./process-handoff.ts";
-import {
-	WorkspaceSandboxService,
-	readSandboxDirectoryState,
-	sameSandboxState,
-	type SandboxDirectoryChange,
-	type SandboxFileChange,
-	type SandboxWorkspaceChange,
-	type SandboxWorkspaceContext,
-} from "./workspace-sandbox.ts";
+import { WorkspaceSandboxService, readSandboxDirectoryState, sameSandboxState, type SandboxDirectoryChange, type SandboxFileChange,
+	type SandboxWorkspaceChange, type SandboxWorkspaceContext } from "./workspace-sandbox.ts";
 import { containsFilesystemPath as pathContains, relativeFilesystemPath, slash } from "./path-utils.ts";
 
 const BACKEND_EPOCH = "pi-linux-process-instance-inputs";
@@ -506,7 +435,7 @@ export class LinuxProcessReuseBackend {
 		readonly scope?: ExecutionScope;
 		readonly signal?: AbortSignal;
 		readonly onOperationAdopted?: (adoption: ExecutionOperationAdoption) => void;
-		readonly acceptOperationScope?: (scope: ExecutionScope) => boolean;
+		readonly acceptOperationScope?: (scope: ExecutionScope, salvage?: boolean) => boolean;
 	}): Promise<LinuxProcessSession> {
 		return this.withProducer(() => this.createSession(input));
 	}
@@ -1333,7 +1262,10 @@ export class LinuxProcessReuseBackend {
 			const processStarted = performance.now();
 			const clockOffset = Number(process.hrtime.bigint()) / 1e6 - performance.now();
 			stage = "execution";
+			let outputEndpoints: readonly [string, string] | undefined;
 			outcome = await runSpawn(ready.strace, [...(live ? [`--handoff-fd=${inheritedFiles.length + 3}`, `--handoff-library=${ready.imageLibrary}`, `--handoff-image=${imagePath}`] : []), ...command.slice(1)], {
+				// The child writes to (and may query) these sockets; their identity lets its observation recognize them.
+				onOutputEndpoints: (endpoints) => { outputEndpoints = endpoints; },
 				cwd: request.cwd,
 				environment: request.environment,
 				signal: AbortSignal.any([session.signal, work.signal]),
@@ -1389,7 +1321,7 @@ export class LinuxProcessReuseBackend {
 				const captures = [
 					transaction.finish(),
 					observeStrace(tracePrefix, logicalExecutable, session.projection.toLogical(request.cwd), {
-						...(frozen ? { frozen } : {}),
+						...(frozen ? { frozen } : {}), ...(outputEndpoints ? { outputEndpoints } : {}),
 						guardFilesystemSemanticsWithin: [session.workspace.sandboxRoot, session.sourceRoot],
 						inheritedDirectoryImages: directoryImages.flatMap(([physical]) => [physical, session.projection.toLogical(physical)]),
 						inheritedFileImages: [...descriptorImages.values()].flatMap(image => [image.logical, image.physical])
