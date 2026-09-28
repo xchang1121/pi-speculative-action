@@ -1,10 +1,5 @@
 import type { SpeculativeExecution, SpeculativeExecutionRoute, WorldExecutionMetrics } from "./execution-world.ts";
-import type {
-	ActorActionSettlement,
-	PredictionSettlement,
-	ResolutionCause,
-	SettledSourceRequest,
-} from "./settlement.ts";
+import type { ActorActionSettlement, PredictionSettlement, ResolutionCause, SettledSourceRequest } from "./settlement.ts";
 import type { SpeculativeTaskTiming } from "./task-timing.ts";
 
 export interface SpeculativeCacheSnapshot {
@@ -31,10 +26,7 @@ export interface CandidateEventDescriptor {
 	readonly actionKeyHash: string;
 	readonly execution: SpeculativeExecution;
 	readonly route?: SpeculativeExecutionRoute;
-	readonly world?: {
-		readonly backend: string;
-		readonly executionMetrics: WorldExecutionMetrics;
-	};
+	readonly world?: { readonly backend: string; readonly executionMetrics: WorldExecutionMetrics; };
 	readonly source: string;
 	readonly depth: number;
 	readonly predictedAction: string;
@@ -53,12 +45,7 @@ export interface CandidateEventDescriptor {
 
 export type CandidateExecutionProjection =
 	| { readonly status: "running"; readonly startedAt: number }
-	| {
-			readonly status: "succeeded";
-			readonly startedAt: number;
-			readonly completedAt: number;
-			readonly executionMs: number;
-	  }
+	| { readonly status: "succeeded"; readonly startedAt: number; readonly completedAt: number; readonly executionMs: number; }
 	| {
 			readonly status: "failed" | "cancelled";
 			readonly cause: ResolutionCause;
@@ -76,23 +63,14 @@ interface EventEnvelope<SessionID> {
 
 /** Immutable observability projections. Policy and learning never consume this stream. */
 export type SpeculativeActionEvent<SessionID> =
-	| (EventEnvelope<SessionID> & {
-			readonly type: "task";
-			readonly timing: SpeculativeTaskTiming;
-	  })
+	| (EventEnvelope<SessionID> & { readonly type: "task"; readonly timing: SpeculativeTaskTiming; })
 	| (EventEnvelope<SessionID> & {
 			readonly type: "source_request";
 			readonly request: SettledSourceRequest;
 			readonly totalDraftTokens: number;
 	  })
-	| (EventEnvelope<SessionID> & {
-			readonly type: "prediction";
-			readonly settlement: PredictionSettlement;
-	  })
-	| (EventEnvelope<SessionID> & {
-			readonly type: "operation_prediction";
-			readonly settlement: PredictionSettlement;
-	  })
+	| (EventEnvelope<SessionID> & { readonly type: "prediction"; readonly settlement: PredictionSettlement; })
+	| (EventEnvelope<SessionID> & { readonly type: "operation_prediction"; readonly settlement: PredictionSettlement; })
 	| (EventEnvelope<SessionID> & {
 			readonly type: "candidate";
 			readonly candidate: CandidateEventDescriptor;

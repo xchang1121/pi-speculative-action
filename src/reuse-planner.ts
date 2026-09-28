@@ -97,10 +97,7 @@ export class ProcessReusePlanner {
 			filesRead: 0, bytesRead: 0, artifactsLoaded: 0, artifactBytesRead: 0,
 		};
 		const lookup = (): ProcessReuseLookupMetrics =>
-			Object.freeze({
-				...metrics,
-				durationMs: Math.max(0, performance.now() - startedAt),
-			});
+			Object.freeze({ ...metrics, durationMs: Math.max(0, performance.now() - startedAt) });
 		const weakKey = request.weakKey;
 		if (!isSha256Digest(weakKey)) throw new Error("invalid process weak key");
 		const live = request.live ? [request.live.certificate].flat().filter(candidate => candidate.weakKey === weakKey) : [];
@@ -121,10 +118,7 @@ export class ProcessReusePlanner {
 				reasons.add("producer_guarantee_incompatible");
 				continue;
 			}
-			if (!certificateReplayable(certificate, acceptedTaints)) {
-				reasons.add("certificate_tainted");
-				continue;
-			}
+			if (!certificateReplayable(certificate, acceptedTaints)) { reasons.add("certificate_tainted"); continue; }
 			if (!contractCompatible(request.contract, certificate) || certificate.result.continuation && !live.includes(certificate)) {
 				reasons.add("observation_contract_incompatible");
 				continue;
@@ -145,24 +139,14 @@ export class ProcessReusePlanner {
 			);
 			metrics.filesRead += observation.filesRead;
 			metrics.bytesRead += observation.bytesRead;
-			if (observation.status === "indeterminate") {
-				reasons.add("validation_indeterminate");
-				continue;
-			}
+			if (observation.status === "indeterminate") { reasons.add("validation_indeterminate"); continue; }
 			if (observation.status === "stale") {
 				for (const changed of observation.changed) changedDependencies.add(changed);
 			}
-			const current: DynamicDependencyCertificate = {
-				complete: true,
-				dependencies: observation.dependencies,
-				taints: [],
-			};
+			const current: DynamicDependencyCertificate = { complete: true, dependencies: observation.dependencies, taints: [] };
 			const strongKey = processStrongKey(weakKey, current);
 			const matching = grouped.filter((certificate) => certificate.strongKey === strongKey);
-			if (!matching.length) {
-				reasons.add("dependency_changed");
-				continue;
-			}
+			if (!matching.length) { reasons.add("dependency_changed"); continue; }
 			const validation: Extract<ProvenanceValidation, { status: "valid" }> = {
 				status: "valid",
 				strongKey,
@@ -173,10 +157,7 @@ export class ProcessReusePlanner {
 			};
 			for (const certificate of matching) {
 				const artifacts = await this.store.artifacts.load(referencedArtifacts(certificate));
-				if (!artifacts) {
-					reasons.add("artifact_missing");
-					continue;
-				}
+				if (!artifacts) { reasons.add("artifact_missing"); continue; }
 				metrics.artifactsLoaded += artifacts.artifacts;
 				metrics.artifactBytesRead += artifacts.bytes;
 				return {
@@ -211,10 +192,7 @@ export class ProcessReusePlanner {
 	}
 }
 
-function contractCompatible(
-	contract: ReplayObservationContract,
-	certificate: ProcessProvenanceCertificate,
-): boolean {
+function contractCompatible(contract: ReplayObservationContract, certificate: ProcessProvenanceCertificate): boolean {
 	if (!contract.orderedJournal || !contract.transactionalEffects) return false;
 	if (contract.sink !== "buffered") return false;
 	if (certificate.result.continuation && (!contract.continuation || certificate.dependencyCertificate.taints.some(

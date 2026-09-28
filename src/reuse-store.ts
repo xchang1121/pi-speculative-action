@@ -16,10 +16,7 @@ import { stableStringify } from "./stable-json.ts";
 import { nonNegativeNumber, positiveInteger } from "./setting-input.ts";
 import { hasErrorCode, isMissing as missing } from "./error-utils.ts";
 
-export interface ProvenanceStoreLimits {
-	readonly maxCertificates: number;
-	readonly maxBytes: number;
-}
+export interface ProvenanceStoreLimits { readonly maxCertificates: number; readonly maxBytes: number; }
 
 export interface ProvenanceStoreOptions extends Partial<ProvenanceStoreLimits> {
 	readonly gcIntervalMs?: number;
@@ -178,10 +175,7 @@ export class ProvenanceCertificateStore {
 			await publishImmutable(this.weakReferencePath(owned), new Uint8Array());
 			return published;
 		});
-		if (Date.now() >= this.gcDueAt) {
-			this.gcDueAt = Date.now() + this.gcIntervalMs;
-			await this.gc().catch(() => undefined);
-		}
+		if (Date.now() >= this.gcDueAt) { this.gcDueAt = Date.now() + this.gcIntervalMs; await this.gc().catch(() => undefined); }
 		return published;
 	}
 
@@ -204,10 +198,7 @@ export class ProvenanceCertificateStore {
 		const directory = this.weakIndexDirectory(weakKey, executablePath);
 		try {
 			names = await readdir(directory);
-		} catch (error) {
-			if (missing(error)) return [];
-			throw error;
-		}
+		} catch (error) { if (missing(error)) return []; throw error; }
 		const certificates: ProcessProvenanceCertificate[] = [];
 		for (const name of names) {
 			const match = /^([0-9a-f]{64})\.ref$/.exec(name);
@@ -356,11 +347,7 @@ export class ProvenanceCertificateStore {
 	}
 }
 
-interface StoredFile {
-	readonly path: string;
-	readonly bytes: number;
-	readonly modifiedAt: number;
-}
+interface StoredFile { readonly path: string; readonly bytes: number; readonly modifiedAt: number; }
 
 interface StoredCertificateFile extends StoredFile {
 	readonly certificate: ProcessProvenanceCertificate | undefined;
@@ -392,10 +379,7 @@ async function filesUnder(root: string): Promise<readonly string[]> {
 		return (await readdir(root, { recursive: true, withFileTypes: true }))
 			.filter((entry) => entry.isFile())
 			.map((entry) => path.join(entry.parentPath, entry.name));
-	} catch (error) {
-		if (missing(error)) return [];
-		throw error;
-	}
+	} catch (error) { if (missing(error)) return []; throw error; }
 }
 
 async function publishImmutable(target: string, bytes: Uint8Array): Promise<boolean> {
@@ -405,10 +389,7 @@ async function publishImmutable(target: string, bytes: Uint8Array): Promise<bool
 	const file = await open(temporary, "wx");
 	try {
 		try { await writeFile(file, bytes); } finally { await file.close(); }
-		try {
-			await link(temporary, target);
-			return true;
-		} catch (error) {
+		try { await link(temporary, target); return true; } catch (error) {
 			if (!hasErrorCode(error, "EEXIST")) throw error;
 			const renewed = new Date(); // An existing object is referenced again: its orphan grace restarts now.
 			await utimes(target, renewed, renewed);

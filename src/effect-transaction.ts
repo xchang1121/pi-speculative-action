@@ -24,12 +24,7 @@ export class EffectCommitFailure extends Error {
 	readonly disposition: EffectCommitDisposition;
 	readonly resolutionCause?: ResolutionCause;
 
-	constructor(
-		disposition: EffectCommitDisposition,
-		message: string,
-		cause: unknown,
-		resolutionCause?: ResolutionCause,
-	) {
+	constructor(disposition: EffectCommitDisposition, message: string, cause: unknown, resolutionCause?: ResolutionCause) {
 		super(message, { cause });
 		this.name = "EffectCommitFailure";
 		this.disposition = disposition;
@@ -54,11 +49,7 @@ export function isPoisonedEffectCommit(
 	return error instanceof EffectCommitFailure && error.disposition === "poisoned";
 }
 
-export interface EffectTransactionDescriptor {
-	readonly tool: string;
-	readonly callID?: string;
-	readonly route: SpeculativeExecutionRoute;
-}
+export interface EffectTransactionDescriptor { readonly tool: string; readonly callID?: string; readonly route: SpeculativeExecutionRoute; }
 
 /** Mutable only to the coordinator that issued it; callers receive a read-only lifecycle view. */
 export interface EffectTransactionAttempt {
@@ -109,17 +100,11 @@ export class EffectTransactionCoordinator<Output> {
 			const branch = await executor();
 			this.transition(owned, "executing", "sealing");
 			return await this.seal(owned, branch);
-		} catch (error) {
-			owned.stateValue = "failed";
-			throw error;
-		}
+		} catch (error) { owned.stateValue = "failed"; throw error; }
 	}
 
 	/** Wrap a pre-execution authoritative capture in the same transaction lifecycle. */
-	capture(
-		attempt: EffectTransactionAttempt,
-		capture: WorldResultCapture<Output>,
-	): WorldResultCapture<Output> {
+	capture(attempt: EffectTransactionAttempt, capture: WorldResultCapture<Output>): WorldResultCapture<Output> {
 		const owned = this.owned(attempt);
 		let consumed = false;
 		const inputsOnly = capture.inputsOnly;
@@ -137,11 +122,7 @@ export class EffectTransactionCoordinator<Output> {
 						throw new Error("input_only_capture_required");
 					}
 					return await this.seal(owned, branch);
-				} catch (error) {
-					owned.stateValue = "failed";
-					await capture.dispose();
-					throw error;
-				}
+				} catch (error) { owned.stateValue = "failed"; await capture.dispose(); throw error; }
 			},
 			dispose: async () => {
 				if (consumed) return;
@@ -156,18 +137,12 @@ export class EffectTransactionCoordinator<Output> {
 		});
 	}
 
-	private async seal(
-		attempt: MutableEffectTransactionAttempt,
-		branch: WorldBranch<Output>,
-	): Promise<EffectTransaction<Output>> {
+	private async seal(attempt: MutableEffectTransactionAttempt, branch: WorldBranch<Output>): Promise<EffectTransaction<Output>> {
 		try {
 			const transaction = sealEffectTransaction(attempt, branch);
 			this.transition(attempt, "sealing", "sealed");
 			return transaction;
-		} catch (error) {
-			try { await branch.dispose(); } catch { /* Preserve the sealing failure. */ }
-			throw error;
-		}
+		} catch (error) { try { await branch.dispose(); } catch { /* Preserve the sealing failure. */ } throw error; }
 	}
 
 	private owned(attempt: EffectTransactionAttempt): MutableEffectTransactionAttempt {

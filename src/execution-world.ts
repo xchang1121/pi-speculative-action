@@ -1,9 +1,5 @@
 import type { ActionEffect, ActionKey } from "./action-semantics.ts";
-import {
-	effectCapabilitiesCover,
-	type EffectCapabilities,
-	type EffectRequirements,
-} from "./effect-model.ts";
+import { effectCapabilitiesCover, type EffectCapabilities, type EffectRequirements } from "./effect-model.ts";
 import { cause, type ResourceValidation, zeroValidationMetrics } from "./settlement.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
 import { errorMessage as errorDetail } from "./error-utils.ts";
@@ -16,10 +12,7 @@ export type WorldReuseStrategy = "shared_result" | "exclusive_branch";
 export type ExecutionWorldScope = "runtime" | "fallback";
 
 /** Logical session and turn for execution ownership, separate from reusable action identity. */
-export interface ExecutionScope {
-	readonly sessionID: string;
-	readonly turnID: string;
-}
+export interface ExecutionScope { readonly sessionID: string; readonly turnID: string; }
 
 export function snapshotExecutionScope(scope: ExecutionScope | undefined): ExecutionScope | undefined {
 	return scope ? Object.freeze({ sessionID: scope.sessionID, turnID: scope.turnID }) : undefined;
@@ -45,10 +38,7 @@ export interface SpeculativeExecutionRoute {
 	readonly fingerprint: string;
 }
 
-export function sameSpeculativeExecutionRoute(
-	left: SpeculativeExecutionRoute,
-	right: SpeculativeExecutionRoute,
-): boolean {
+export function sameSpeculativeExecutionRoute(left: SpeculativeExecutionRoute, right: SpeculativeExecutionRoute): boolean {
 	return (
 		left.isolation === right.isolation &&
 		left.reuse === right.reuse &&
@@ -98,25 +88,11 @@ export interface WorldCommitMetrics {
 
 /** Backend-issued evidence; policy decides whether it matches the Actor world. */
 export type WorldCompatibilityEvidence =
-	| {
-			readonly status: "compatible";
-			readonly backend: string;
-			readonly executionFingerprint: string;
-	  }
-	| {
-			readonly status: "incompatible" | "indeterminate";
-			readonly backend: string;
-			readonly code: string;
-			readonly detail?: string;
-	  };
+	| { readonly status: "compatible"; readonly backend: string; readonly executionFingerprint: string; }
+	| { readonly status: "incompatible" | "indeterminate"; readonly backend: string; readonly code: string; readonly detail?: string; };
 
 /** Immutable execution state from which a later speculative action may derive. */
-export interface WorldCheckpoint {
-	readonly backend: string;
-	readonly id: string;
-	readonly lineage: string;
-	readonly depth: number;
-}
+export interface WorldCheckpoint { readonly backend: string; readonly id: string; readonly lineage: string; readonly depth: number; }
 
 /** Opaque backend-issued capability for an internal unit; the enclosing action still owns permission. */
 export interface ExecutionOperationBinding {
@@ -233,10 +209,7 @@ export interface CapturedExecutionWorldResult<Output> {
 	readonly capture: WorldResultCapture<Output>;
 }
 
-export interface ExecutionWorldPreparation {
-	readonly cwd: string;
-	readonly signal?: AbortSignal;
-}
+export interface ExecutionWorldPreparation { readonly cwd: string; readonly signal?: AbortSignal; }
 
 export type ExecutionWorldHealthState = "registered" | "ready" | "unavailable";
 
