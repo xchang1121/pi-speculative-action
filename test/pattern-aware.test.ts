@@ -11,6 +11,7 @@ import {
 	patternAwareActionSemantics,
 	applyBindings,
 	applyBindingsVariants,
+	failureClass,
 	inferBindings,
 	PATTERN_AWARE_DEFAULTS,
 	PatternAwareStore,
@@ -423,6 +424,25 @@ describe("PatternAware", () => {
 		expect(reads).toContainEqual({ path: "lib/zeta.ts", offset: 4242 });
 		expect(reads).not.toContainEqual(expect.objectContaining({ path: "lib/zeta.ts", offset: 900 }));
 		expect(projectPatternAwareObservation(undefined, [], "/w", [{ path: "/w/a.ts", line: 3 }, { path: "a.ts", line: 3 }])).toEqual({ outputLocations: [{ path: "a.ts", line: 3 }] });
+	});
+
+	test("guards what follows a failure by its kind and binds keys of a small JSON result", () => {
+		expect([failureClass("TypeError: x is not a function\n\nCommand exited with code 1"), failureClass("sh: foo: command not found"), failureClass("")])
+			.toEqual(["exit:1 TypeError", "command not found", "failed"]);
+		const store = patternStore();
+		for (const name of ["alpha", "beta", "gamma", "delta"]) {
+			store.observe(input(name, "bash", { command: "npm test" }, { outcome: "failure", errorClass: "exit:1 TypeError" }));
+			store.observe(input(name, "read", { path: "src/index.ts" }));
+			store.finishSession(name);
+		}
+		store.observe(input("other", "bash", { command: "npm test" }, { outcome: "failure", errorClass: "command not found" }));
+		expect(store.predict("other").some((candidate) => candidate.tool === "read")).toBe(false);
+		store.observe(input("same", "bash", { command: "npm test" }, { outcome: "failure", errorClass: "exit:1 TypeError" }));
+		expect(store.predict("same").map((candidate) => candidate.input)).toContainEqual({ path: "src/index.ts" });
+		const manifest = projectPatternAwareObservation({ content: [{ type: "text", text: '{"main": "lib/index.js", "scripts": {"test": "jest"}}' }], details: {} });
+		expect(manifest.output).toEqual({ main: "lib/index.js", scripts: { test: "jest" } });
+		expect(inferBindings([event("manifest", "read", { path: "package.json" }, manifest)], { path: "lib/index.js" })['["path"]'])
+			.toEqual({ type: "event", relativeEvent: -1, field: "output", path: ["main"] });
 	});
 
 	test("lets recent gap behavior replace stale high-volume history", () => {
