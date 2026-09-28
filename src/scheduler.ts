@@ -11,6 +11,8 @@ export interface PredictionForecast extends ServiceTimingIdentity {
 	readonly actorPhase?: { readonly kind: "decision" | "cycle"; readonly elapsedMs: number; };
 	readonly criticalPathMs?: number;
 	readonly expectedLatencyBenefitMs?: number;
+	/** A model source's calibrated chance the Actor makes this call; without a benefit estimate it scales the work's value. */
+	readonly hitProbability?: number;
 	readonly background?: boolean;
 	/** Dependencies have settled and this action is their immediate zero-horizon successor. */
 	readonly dependenciesResolved?: boolean;
@@ -221,9 +223,10 @@ export class SpeculationScheduler<Job extends object> {
 			work.resourceUnits = Math.max(work.resourceUnits, units(forecast.resourceDemand));
 			work.decisionBatchesUntilCall = Math.min(work.decisionBatchesUntilCall, sequence(forecast.decisionBatchesUntilCall));
 			work.criticalPathMs = Math.max(work.criticalPathMs, criticalPathMs);
-			if (forecast.expectedLatencyBenefitMs === undefined) work.priorityMs = Math.max(work.priorityMs, criticalPathMs);
+			const benefitMs = forecast.expectedLatencyBenefitMs ?? (forecast.hitProbability === undefined ? undefined : forecast.hitProbability * benefitDurationMs);
+			if (benefitMs === undefined) work.priorityMs = Math.max(work.priorityMs, criticalPathMs);
 			else {
-				missed *= 1 - Math.min(1, finite(forecast.expectedLatencyBenefitMs) / benefitDurationMs);
+				missed *= 1 - Math.min(1, finite(benefitMs) / benefitDurationMs);
 				reachMs = Math.max(reachMs, benefitDurationMs * runwayScale);
 				work.priorityMs = Math.max(work.priorityMs, (1 - missed) * reachMs);
 			}

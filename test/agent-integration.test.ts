@@ -232,6 +232,22 @@ describe("speculative action host", () => {
 			output: { result: { content: [], details: {} }, isError: false }, trigger: "execution_succeeded" })).toBe(false);
 	});
 
+	it("calibrates each Drafter call's hit probability from the tool's observed settlements", async () => {
+		const tool = createReadTool(await temporaryWorkspace()), controller = createDrafterPlanSource({ sessionID: "session", complete: async () => drafterCall({ path: "a.txt" }) });
+		const propose = async (turnID: string) => {
+			const proposal = await controller.source.propose({ startInput: { ...startInput(tool), sessionID: "session", turnID }, data: { tools: new Map([["read", tool]]), schemaHashes: {} },
+				settings: { ...settings(), resourceCacheMaxEntries: 4, predictionTimeoutMs: 1000 }, definitions: [], candidateNames: ["read"], proposalIndex: 0, proposalCount: 1, signal: new AbortController().signal });
+			if (!proposal || Array.isArray(proposal) || !("actions" in proposal)) throw new Error("missing proposal");
+			return proposal.actions[0]!;
+		};
+		const first = await propose("t1");
+		expect(first.empiricalProbability).toBe(0.5);
+		for (const matched of [false, false, true]) await controller.source.onSettled!({ proposalID: "p", actionID: first.id, feedback: first.feedback,
+			settlement: { prediction: {} as never, observation: "observed", actorAction: {} as never, match: matched ? { matched: true } as never : { matched: false } } });
+		await controller.source.onSettled!({ proposalID: "p", actionID: first.id, feedback: first.feedback, settlement: { prediction: {} as never, observation: "unobserved", cause: {} as never } });
+		expect((await propose("t2")).empiricalProbability).toBe(0.4);
+	});
+
 	it("shows the Drafter PatternAware's expected calls after the Actor's history only when enabled", async () => {
 		const tool = createReadTool(await temporaryWorkspace());
 		for (const enabled of [false, true]) {

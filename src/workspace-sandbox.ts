@@ -1366,10 +1366,7 @@ async function ensurePreparedSandbox(repository: PooledGitRepository, baseline: 
 	} catch (error) { if (repository.prepared === pending) repository.prepared = undefined; throw error; }
 }
 
-async function takePreparedSandbox(
-	repository: PooledGitRepository,
-	commit?: string,
-): Promise<PreparedGitWorkspace | undefined> {
+async function takePreparedSandbox(repository: PooledGitRepository, commit?: string): Promise<PreparedGitWorkspace | undefined> {
 	const pending = repository.prepared;
 	if (!pending) return undefined;
 	// Claim the slot before waiting: execution, replacement and shutdown cannot retire the same workspace.
@@ -1486,10 +1483,7 @@ function withWorkspaceLock<T>(owner: { lock: Promise<void> }, run: () => Promise
 
 function releaseSandboxRepository(repository: PooledGitRepository): void {
 	repository.active = Math.max(0, repository.active - 1);
-	if (repository.active === 0) {
-		for (const resolve of repository.idleWaiters) resolve();
-		repository.idleWaiters.clear();
-	}
+	if (repository.active === 0) { for (const resolve of repository.idleWaiters) resolve(); repository.idleWaiters.clear(); }
 	if (repository.quarantined || repository.disposal || repository.active > 0 || repository.idleTimer) return;
 	repository.idleTimer = setTimeout(() => {
 		// A sealed service owns the final pool sweep; keep its registration until that sweep.
@@ -1510,27 +1504,18 @@ function quarantineSandboxRepository(repository: PooledGitRepository): void {
 	repository.quarantined = true;
 	const key = `${filesystemPathKey(repository.sourceRoot)}\0${repository.gitBinary}`;
 	if (repository.owner.repositories.get(key) === repository.registration) repository.owner.repositories.delete(key);
-	if (repository.idleTimer) {
-		clearTimeout(repository.idleTimer);
-		repository.idleTimer = undefined;
-	}
+	if (repository.idleTimer) { clearTimeout(repository.idleTimer); repository.idleTimer = undefined; }
 	repository.baseline?.version.release();
 	repository.baseline = undefined;
 	repository.versions.close();
 	releaseSandboxRepository(repository);
 }
 
-function closeWorkspaceSandboxPoolsFor(
-	state: WorkspaceSandboxState,
-	roots?: readonly string[],
-): Promise<void> {
+function closeWorkspaceSandboxPoolsFor(state: WorkspaceSandboxState, roots?: readonly string[]): Promise<void> {
 	return state.lifetime.run(() => closeWorkspaceSandboxPoolsNow(state, roots));
 }
 
-async function closeWorkspaceSandboxPoolsNow(
-	state: WorkspaceSandboxState,
-	roots?: readonly string[],
-): Promise<void> {
+async function closeWorkspaceSandboxPoolsNow(state: WorkspaceSandboxState, roots?: readonly string[]): Promise<void> {
 	const rootKeys = roots ? new Set(roots.map(filesystemPathKey)) : undefined;
 	const pending = [...state.repositories.entries()].filter(([key]) => {
 		if (!rootKeys) return true;
@@ -1597,10 +1582,7 @@ async function withPrivateSandboxWorkspace<T>(
 	preparation?: SandboxPreparation,
 ): Promise<T> {
 	const workspace = await createPrivateSandboxWorkspace(state, cwd, gitBinary, driver, overlayOptions, preparation);
-	try {
-		if (checkpoint) await materializeCheckpoint(workspace, checkpoint);
-		return await run(workspace);
-	} finally {
+	try { if (checkpoint) await materializeCheckpoint(workspace, checkpoint); return await run(workspace); } finally {
 		await workspace.dispose();
 	}
 }
@@ -1675,15 +1657,9 @@ async function collectGitChangeResources(workspace: PrivateSandboxWorkspace): Pr
 	return Object.freeze([...new Set([...parseNullList(tracked), ...parseNullList(untracked)])]);
 }
 
-interface OverlayStructureRemoval {
-	readonly resource: string;
-	readonly descendantsOnly: boolean;
-}
+interface OverlayStructureRemoval { readonly resource: string; readonly descendantsOnly: boolean; }
 
-interface OverlayStructureFrontier {
-	readonly refresh: ReadonlySet<string>;
-	readonly removals: readonly OverlayStructureRemoval[];
-}
+interface OverlayStructureFrontier { readonly refresh: ReadonlySet<string>; readonly removals: readonly OverlayStructureRemoval[]; }
 
 type OverlayUpperEntry =
 	| { readonly kind: "opaque" | "directory" | "whiteout"; readonly resource: string }
@@ -1717,10 +1693,7 @@ async function captureOverlayWorkspaceStructure(
 	for (const resource of [...frontier.refresh].sort(comparePathDepth)) {
 		const target = resource ? path.resolve(workspace.sandboxRoot, resource) : workspace.sandboxRoot;
 		if (!containsFilesystemPath(workspace.sandboxRoot, target)) throw new Error(`OverlayFS frontier escapes workspace: ${resource}`);
-		const entry = await captureWorkspaceStructureEntry(
-			target,
-			resource ? [] : workspace.observationExcludes,
-		);
+		const entry = await captureWorkspaceStructureEntry(target, resource ? [] : workspace.observationExcludes);
 		if (entry) entries.set(resource, entry);
 		else entries.delete(resource);
 	}
@@ -1763,10 +1736,7 @@ async function walkOverlayUpper(
 	const visit = async (directory: string, relativeDirectory: string): Promise<void> => {
 		for (const child of await readdir(directory, { withFileTypes: true })) {
 			if (++entries > WORKSPACE_TRANSACTION_MAX_FILES) throw new Error(`OverlayFS ${journal} exceeds file limit`);
-			if (child.name === ".wh..wh..opq") {
-				await observe({ kind: "opaque", resource: relativeDirectory });
-				continue;
-			}
+			if (child.name === ".wh..wh..opq") { await observe({ kind: "opaque", resource: relativeDirectory }); continue; }
 			if (child.name.startsWith(".wh.")) {
 				throw new Error(`unsupported OverlayFS whiteout encoding: ${child.name}`);
 			}
@@ -1858,10 +1828,7 @@ async function readGitTreeRegularState(
 	if (!hash) throw new Error(`invalid Git transaction blob: ${resource}`);
 	const content = await git(["cat-file", "blob", hash], { maxBuffer: Math.max(1, Math.min(WORKSPACE_TRANSACTION_MAX_BYTES, maxBytes) + 1) });
 	if (content.byteLength > maxBytes) throw new Error(`Git transaction blob exceeds capture limit: ${resource}`);
-	return {
-		content,
-		mode: process.platform === "win32" ? 0 : mode === "100755" ? 0o755 : 0o644,
-	};
+	return { content, mode: process.platform === "win32" ? 0 : mode === "100755" ? 0o755 : 0o644 };
 }
 
 
@@ -1898,10 +1865,7 @@ async function readRegularState(target: string, maxBytes = Number.POSITIVE_INFIN
 	try {
 		const captured = await captureStableFile(target, maxBytes, true);
 		return { content: captured.content!, mode: process.platform === "win32" ? 0 : Number(captured.stat.mode & 0o777n), identity: captured.stat };
-	} catch (error) {
-		if (isMissing(error)) return undefined;
-		throw error;
-	}
+	} catch (error) { if (isMissing(error)) return undefined; throw error; }
 }
 
 /** Capture a directory without following links and reject concurrent namespace changes. */
@@ -1911,10 +1875,7 @@ export async function readSandboxDirectoryState(target: string, captureNames?: (
 		if (!entries) throw new Error(`sandbox resource is not a real directory: ${target}`);
 		captureNames?.(entries.map(entry => entry.name));
 		return { entriesDigest: directoryEntriesDigest(entries), mode: Number(info.mode & 0o777n), uid: Number(info.uid), gid: Number(info.gid) };
-	} catch (error) {
-		if (isMissing(error)) return undefined;
-		throw error;
-	}
+	} catch (error) { if (isMissing(error)) return undefined; throw error; }
 }
 
 
@@ -1928,10 +1889,7 @@ export function sameSandboxState(
 	return left.entriesDigest === right.entriesDigest && left.mode === right.mode && left.uid === right.uid && left.gid === right.gid;
 }
 
-function sameSandboxBaseline(
-	current: RegularFileState | SandboxDirectoryState | undefined,
-	change: SandboxWorkspaceChange,
-): boolean {
+function sameSandboxBaseline(current: RegularFileState | SandboxDirectoryState | undefined, change: SandboxWorkspaceChange): boolean {
 	if (change.kind === "directory" && change.validationOnly) return Boolean(current) === Boolean(change.before);
 	return sameSandboxState(current, change.kind === "directory" ? change.before : change.before === undefined
 		? undefined : { content: change.before, mode: change.beforeMode ?? 0 });
@@ -1962,10 +1920,7 @@ function ownSandboxChanges(changes: readonly SandboxWorkspaceChange[]): SandboxW
 	for (const change of changes) {
 		const key = filesystemPathKey(change.target);
 		const previous = result.get(key);
-		if (!previous) {
-			result.set(key, change);
-			continue;
-		}
+		if (!previous) { result.set(key, change); continue; }
 		if (
 			filesystemPathKey(previous.root) !== filesystemPathKey(change.root) ||
 			(previous.kind === "directory") !== (change.kind === "directory") || previous.validationOnly !== change.validationOnly ||
@@ -2074,19 +2029,12 @@ function isExecutableMode(mode: number): boolean {
 
 async function atomicWrite(target: string, content: Uint8Array, mode: number | undefined, sourceRoot: string) {
 	const temporary = await stageAtomicWrite(content, mode, sourceRoot);
-	try {
-		await createParentDirectories(sourceRoot, target);
-		await replaceFile(temporary, target, mode);
-	} finally {
+	try { await createParentDirectories(sourceRoot, target); await replaceFile(temporary, target, mode); } finally {
 		await rm(temporary, { force: true }).catch(() => undefined);
 	}
 }
 
-async function stageAtomicWrite(
-	content: Uint8Array,
-	mode: number | undefined,
-	stagingDirectory: string,
-): Promise<string> {
+async function stageAtomicWrite(content: Uint8Array, mode: number | undefined, stagingDirectory: string): Promise<string> {
 	await mkdir(stagingDirectory, { recursive: true });
 	const temporary = path.join(stagingDirectory, `${SANDBOX_STAGING_FILE_PREFIX}${randomUUID()}.tmp`);
 	const fileMode = process.platform === "win32" ? undefined : mode;
@@ -2115,10 +2063,7 @@ async function createParentDirectories(sourceRoot: string, target: string, creat
 	let current = root;
 	for (const segment of relative.split(path.sep).filter(Boolean)) {
 		current = path.join(current, segment);
-		try {
-			await mkdir(current);
-			created?.push(current);
-		} catch (error) {
+		try { await mkdir(current); created?.push(current); } catch (error) {
 			if (!hasErrorCode(error, "EEXIST")) throw error;
 			const info = await lstat(current);
 			if (info.isSymbolicLink() || !info.isDirectory()) {
@@ -2158,11 +2103,7 @@ function commitLockTargets(changes: readonly SandboxWorkspaceChange[]): string[]
 	);
 }
 
-function withCommitLocks<T>(
-	targets: readonly string[],
-	run: () => Promise<T>,
-	index = 0,
-): Promise<T> {
+function withCommitLocks<T>(targets: readonly string[], run: () => Promise<T>, index = 0): Promise<T> {
 	const target = targets[index];
 	return target ? withFileMutationQueue(target, () => withCommitLocks(targets, run, index + 1)) : run();
 }
@@ -2172,20 +2113,10 @@ function sameOptionalBytes(left: Uint8Array | undefined, right: Uint8Array | und
 	return Buffer.compare(left, right) === 0;
 }
 
-function parseNullList(value: Uint8Array): string[] {
-	return value
-		.toString()
-		.split("\0")
-		.filter(Boolean)
-		.map((item) => slash(item));
-}
+function parseNullList(value: Uint8Array): string[] { return value .toString() .split("\0") .filter(Boolean) .map((item) => slash(item)); }
 
 /** The existing process owner binds each private repository/index once, preserving per-call cwd and limits. */
-function bindGit(
-	command: string,
-	cwd: string,
-	prefix: readonly string[] = [],
-) {
+function bindGit(command: string, cwd: string, prefix: readonly string[] = []) {
 	const bound = [...prefix];
 	return (input: readonly string[], options: { cwd?: string; environment?: Readonly<Record<string, string>>; maxBuffer?: number; input?: Buffer } = {}): Promise<Buffer> => new Promise((resolve, reject) => {
 		const args = [...bound, ...input];
