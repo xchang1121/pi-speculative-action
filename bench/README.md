@@ -51,7 +51,9 @@ npm run bench:ablation -- --instance axios__axios-5316 --label baseline --specul
 npm run bench:suite -- --suite swe_diverse --repeats 3 --label speculative
 ```
 
-`--prepare-only` 只准备数据集和 checkout。套件见 `suite.json`；`--output-root` 指定产物目录，默认使用系统临时目录。密钥只从环境读取，不写入录制或报告。测试工作区、录制和报告使用后清理，只保留必要结论和未解决失败的最小证据。
+`--prepare-only` 只准备数据集和 checkout。套件见 `suite.json`；`--output-root` 指定产物目录，默认使用系统临时目录。密钥只从环境读取，移入 Pi 的内存凭据后从进程环境删除（Actor 的 shell 读不到），不写入录制或报告。测试工作区、录制和报告使用后清理，只保留必要结论和未解决失败的最小证据。
+
+运行经 Pi SDK 加载已安装的扩展（Pi 默认工具与系统提示、Linux 进程复用、沙箱与快照路线），设置写入运行专属 agent 目录；Linux 路线需在 WSL/Linux 中运行并提供 `PI_SPEC_SANDLOCK`/`PI_SPEC_HELD_EXEC`/`PI_SPEC_STRACE`。`bench:suite -- --paired` 对每个实例与重复交替先后运行开/关两臂，报告 `pairedRatio`（关的实际总耗时 / 开的实际总耗时，可 < 1）及各臂汇总。
 
 常用开关：`--drafter-disabled` 关闭 Drafter，`--drafter-max-depth 0` 关闭续推，`--pattern-aware --pattern-state <目录>` 启用并持久化模式学习。共享模式状态不共享工作区文件；默认最多 128 轮，达到上限属于未完成。
 

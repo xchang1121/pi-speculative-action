@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
 	nearestRank,
 	type SuiteBenchmarkRun,
+	summarizePairs,
 	summarizeSuite,
 } from "../bench/suite-report.ts";
 
@@ -80,31 +81,20 @@ describe("ablation suite report", () => {
 			callback: (error: null, stdout: string, stderr: string) => void) => {
 			callback(null, args.includes("--name-only") ? "src/file.ts\n" : "commit", "");
 		} }));
-		vi.doMock("@earendil-works/pi-agent-core", () => ({ Agent: class {
-			state = { messages: [{ role: "assistant", usage: {
-				cost: { total: 2 }, totalTokens: 13, input: 10, output: 3, cacheRead: 0, cacheWrite: 0,
-			} }] };
-			prompt: () => Promise<never>;
-			constructor(input: { streamFn: () => Promise<unknown> }) {
-				this.prompt = async () => { await input.streamFn(); return fail("prompt"); };
-			}
-			subscribe() {}
-		} }));
 		vi.doMock("@earendil-works/pi-ai/compat", () => ({
-			getProviders: () => ["offline"], getModels: () => [{ provider: "offline", id: "model" }], streamSimple: () => ({}),
+			getProviders: () => ["offline"], getModels: () => [{ provider: "offline", id: "model" }],
 		}));
-		vi.doMock("@earendil-works/pi-coding-agent", () => ({ VERSION: "0.84.1", ...Object.fromEntries(
-			["Read", "Write", "Edit", "Ls", "Bash", "Find", "Grep"].flatMap(name => ["", "Definition"].map(suffix =>
-				[`create${name}Tool${suffix}`, () => ({ name: name.toLowerCase() })])),
-		) }));
-		vi.doMock("../src/agent-integration.ts", () => ({ createSpeculativeActionHost: () => ({
-			startTurn: async () => {}, finishTurn: () => fail("finishTurn"), dispose: () => fail("hostDispose"),
-		}) }));
-		vi.doMock("../src/agent-execution-world.ts", () => ({ createResourceSnapshotExecutionWorld: () => ({}) }));
-		vi.doMock("../src/workspace-sandbox.ts", () => ({ WorkspaceSandboxService: class {
-			createExecutionWorld() { return {}; }
-			dispose() { return fail("workspaceDispose"); }
-		} }));
+		vi.doMock("@earendil-works/pi-coding-agent", () => ({
+			createAgentSession: async () => ({ session: {
+				messages: [{ role: "assistant", usage: { cost: { total: 2 }, totalTokens: 13, input: 10, output: 3, cacheRead: 0, cacheWrite: 0 } }],
+				state: {}, subscribe() {}, bindExtensions: async () => {}, prompt: async () => fail("prompt"),
+				extensionRunner: { emit: async () => fail("shutdown") }, dispose: () => fail("dispose"),
+			} }),
+			DefaultResourceLoader: class { async reload() {} }, ModelRuntime: { create: async () => ({}) },
+			SessionManager: { inMemory: () => ({}) }, SettingsManager: { inMemory: () => ({}) },
+		}));
+		vi.doMock("../src/agent-integration.ts", () => ({ createSpeculativeActionHost: () => ({}) }));
+		vi.doMock("../src/extension.ts", () => ({ createSpeculativeActionExtension: () => ({}) }));
 		vi.stubGlobal("fetch", async () => ({ ok: true, json: async () => ({ rows: [{ row: {
 			instance_id: "offline", repo: "offline/repo", base_commit: "commit", patch: "diff --git a/src/file.ts b/src/file.ts",
 			test_patch: "", problem_statement: "offline", language: "TypeScript", source_dataset: "offline",
@@ -115,7 +105,7 @@ describe("ablation suite report", () => {
 			"--drafter", "offline/model", "--drafter-max-depth", "2", "--output", "offline-result.json"];
 		try {
 			await expect(import("../bench/run.ts")).rejects.toThrow("Benchmark failed:");
-			expect(phases).toEqual(["prompt", "finishTurn", "hostDispose", "workspaceDispose"]);
+			expect(phases).toEqual(["prompt", "shutdown", "dispose"]);
 			const { metadata, summary } = JSON.parse(files.get(path.resolve("offline-result.json"))!);
 			expect(metadata).toMatchObject({ actor: "offline/model", drafter: "offline/model", drafterMaxDepth: 2 });
 			for (const key of ["repoCache", "runRoot", "output", "prepareOnly"]) expect(metadata).not.toHaveProperty(key);
@@ -127,9 +117,8 @@ describe("ablation suite report", () => {
 		} finally {
 			process.argv = originalArgv; stdout.mockRestore(); vi.unstubAllGlobals();
 			vi.doUnmock("node:fs/promises"); vi.doUnmock("node:child_process");
-			vi.doUnmock("@earendil-works/pi-agent-core"); vi.doUnmock("@earendil-works/pi-ai/compat");
-			vi.doUnmock("@earendil-works/pi-coding-agent"); vi.doUnmock("../src/agent-integration.ts");
-			vi.doUnmock("../src/agent-execution-world.ts"); vi.doUnmock("../src/workspace-sandbox.ts"); vi.resetModules();
+			vi.doUnmock("@earendil-works/pi-ai/compat"); vi.doUnmock("@earendil-works/pi-coding-agent");
+			vi.doUnmock("../src/agent-integration.ts"); vi.doUnmock("../src/extension.ts"); vi.resetModules();
 		}
 	});
 
@@ -193,6 +182,13 @@ describe("ablation suite report", () => {
 				reasons: ["timed_out", "patch_not_clean", "no_changed_files", "no_gold_file_overlap"],
 			},
 		]);
+	});
+
+	it("pairs speculation on and off per instance and repeat, including a slower speculative arm", () => {
+		const report = summarizePairs([{ ...run("a", 1, { actualEndToEndMs: 80 }), arm: "on" }, { ...run("a", 1, { actualEndToEndMs: 100 }), arm: "off" },
+			{ ...run("a", 2, { actualEndToEndMs: 120 }), arm: "on" }, { ...run("a", 2, { actualEndToEndMs: 100 }), arm: "off" }, { ...run("b", 1, {}), arm: "on" }]);
+		expect(report).toMatchObject({ pairedRatio: 1, pairedRatioP50: 100 / 120, on: { runs: 3 }, off: { runs: 2 } });
+		expect(report.pairs.map((pair) => pair.ratio)).toEqual([1.25, 100 / 120]);
 	});
 
 	it("retains repeats in nearest-rank p95 and total-time ratios", () => {
