@@ -1970,7 +1970,8 @@ int main(void) {
 							.toEqual({ ownedAtClose: true, sharedClose: true, socketRemoved: false });
 						releaseCapture();
 					}
-					await expect(running).rejects.toThrow("top-level workspace capture is missing");
+					// The seal names why nothing completed: the unfinished execution's own error.
+					await expect(running).rejects.toThrow(failure === "spawn" ? "missing-executable ENOENT" : "aborted");
 				} finally {
 					releaseCapture();
 					if (nested?.pid && nested.exitCode === null && nested.signalCode === null) try { kill(-nested.pid, "SIGKILL"); } catch { /* Already reaped. */ }
