@@ -7,10 +7,7 @@ import type { PlanAction, PlanProposal, PlanUpdate } from "./plan-proposal.ts";
 import type { ActorActionIdentity, ActorActionSettlement, PlanActionIdentity, PredictionSettlement } from "./settlement.ts";
 import type { TimelineInterval } from "./task-timing.ts";
 
-export type {
-	SpeculativeActionEvent,
-	SpeculativeCacheSnapshot,
-} from "./events.ts";
+export type { SpeculativeActionEvent, SpeculativeCacheSnapshot } from "./events.ts";
 
 export interface SpeculativeActionSettings {
 	readonly enabled: boolean;
@@ -115,11 +112,7 @@ export interface PredictionFeedback<SessionID> {
 /** The concrete Actor action represented by an `actor_adopted` continuation output. */
 export type AdoptedAction = Pick<SpeculativeCandidate, "key" | "input">;
 
-export interface TurnInput<SessionID> {
-	readonly sessionID: SessionID;
-	readonly turnID: string;
-	readonly terminal?: boolean;
-}
+export interface TurnInput<SessionID> { readonly sessionID: SessionID; readonly turnID: string; readonly terminal?: boolean; }
 
 type MaybePromise<T> = T | Promise<T>;
 
@@ -218,17 +211,9 @@ export interface SpeculativePlanSource<
 	readonly flush?: () => MaybePromise<void>;
 }
 
-interface PlanActionFeedback {
-	readonly proposalID: string;
-	readonly actionID: string;
-	readonly feedback: unknown;
-}
+interface PlanActionFeedback { readonly proposalID: string; readonly actionID: string; readonly feedback: unknown; }
 
-export interface ActualToolCall {
-	readonly id?: string;
-	readonly tool: string;
-	readonly input: unknown;
-}
+export interface ActualToolCall { readonly id?: string; readonly tool: string; readonly input: unknown; }
 
 export interface SpeculativeActionRuntimeAdapter<
 	SessionID,
