@@ -3,12 +3,7 @@ import { temporaryDirectories } from "./filesystem.ts";
 import { processPrototype as basePrototype, processCertificate } from "./process-fixture.ts";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import {
-	processWeakKey,
-	referencedArtifacts,
-	sha256Digest,
-	type ProcessProvenanceCertificate,
-} from "../src/provenance-certificate.ts";
+import { processWeakKey, referencedArtifacts, sha256Digest, type ProcessProvenanceCertificate } from "../src/provenance-certificate.ts";
 import { ProcessHandoffOwnership, ProcessHandoffRegistry } from "../src/process-handoff.ts";
 import { captureFileDependency } from "../src/provenance-validation.ts";
 import { ProcessReusePlanner } from "../src/reuse-planner.ts";
@@ -40,11 +35,7 @@ describe("ProcessReusePlanner", () => {
 		}
 		const plan = await planner.plan(request);
 
-		expect(plan).toMatchObject({
-			kind: "completed_replay",
-			source: "l2",
-			certificate: { id: fixture.certificate.id },
-		});
+		expect(plan).toMatchObject({ kind: "completed_replay", source: "l2", certificate: { id: fixture.certificate.id } });
 		// Parent Bash text is intentionally absent from ExecPrototype/WeakKey.
 		expect(JSON.stringify(fixture.prototype)).not.toContain("parent-wrapper");
 		expect(await planner.plan({
@@ -80,10 +71,7 @@ describe("ProcessReusePlanner", () => {
 		const fixture = await fixtureWithCertificate(true);
 		const get = vi.spyOn(fixture.store.artifacts, "get");
 		const plan = await fixture.planner.plan(fixture.request);
-		expect(plan).toMatchObject({
-			kind: "completed_replay",
-			lookup: { artifactsLoaded: 2, artifactBytesRead: 14 },
-		});
+		expect(plan).toMatchObject({ kind: "completed_replay", lookup: { artifactsLoaded: 2, artifactBytesRead: 14 } });
 		if (plan.kind !== "completed_replay") throw new Error("expected completed replay");
 		const references = plan.certificate.result.journal.flatMap((event) =>
 			event.kind === "output"
@@ -91,10 +79,7 @@ describe("ProcessReusePlanner", () => {
 				: [event.before, event.after].flatMap((state) => (state.kind === "file" ? [state.data] : [])),
 		);
 		expect(get).toHaveBeenCalledTimes(2);
-		for (const reference of references) {
-			plan.artifacts.read(reference);
-			plan.artifacts.read(reference);
-		}
+		for (const reference of references) { plan.artifacts.read(reference); plan.artifacts.read(reference); }
 		expect(get).toHaveBeenCalledTimes(2);
 	});
 
@@ -224,10 +209,4 @@ function processPrototype() {
 	});
 }
 
-function contract() {
-	return {
-		sink: "buffered" as const,
-		orderedJournal: true,
-		transactionalEffects: true,
-	};
-}
+function contract() { return { sink: "buffered" as const, orderedJournal: true, transactionalEffects: true, }; }

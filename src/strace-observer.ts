@@ -1,6 +1,6 @@
 import { open, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
-import { FILESYSTEM_TYPE_BLIND, repeatableExecutions, SHELLS, workspaceStatFields, type TracedExecution } from "./deterministic-tools.ts";
+import { FILESYSTEM_TYPE_BLIND, hostStatFields, repeatableExecutions, SHELLS, workspaceStatFields, type TracedExecution } from "./deterministic-tools.ts";
 import { containsLogicalPath } from "./path-utils.ts";
 import {
 	type DependencyRole,
@@ -70,7 +70,7 @@ export interface StraceObservationOptions {
 	readonly inheritedHandles?: readonly { readonly fd: number; readonly installed?: false; readonly description?: number; readonly inode: string; readonly flags: number; readonly outside: number; readonly queuedBytes?: number; readonly queueData?: Buffer; readonly packet?: boolean; readonly messages?: readonly import("./linux-held-exec.ts").QueueMessage[] }[];
 }
 
-interface TraceFile { readonly pid: number; readonly lines: readonly TraceLine[]; readonly terminated: boolean; }
+interface TraceFile { readonly pid: number; readonly lines: readonly TraceLine[]; readonly terminated: boolean; readonly exitCode?: number; }
 
 type TraceRoot = { readonly file: TraceFile; readonly start: number };
 interface TraceProcess extends TraceRoot { readonly cwd: string | undefined; readonly fs: { shared: boolean; changed: boolean }; }
@@ -550,8 +550,9 @@ export async function observeStrace(
 				if (frontier) { group.lines.pop(); group.order?.pop(); }
 				if (group.lines.some(line => /^--- /.test(line))) frontier = false;
 			}
-			files.push({ pid, lines: reassembleSyscalls(group.lines, pid, group.order),
-				terminated: /^\+\+\+ (?:exited with \d+|killed by SIG[A-Z0-9]+(?: \(core dumped\))?) \+\+\+\s*$/.test(group.lines.filter(line => line.trim()).at(-1) ?? "") });
+			const last = group.lines.filter(line => line.trim()).at(-1) ?? "", exited = /^\+\+\+ exited with (\d+) \+\+\+\s*$/.exec(last)?.[1];
+			files.push({ pid, lines: reassembleSyscalls(group.lines, pid, group.order), ...(exited === undefined ? {} : { exitCode: Number(exited) }),
+				terminated: exited !== undefined || /^\+\+\+ killed by SIG[A-Z0-9]+(?: \(core dumped\))? \+\+\+\s*$/.test(last) });
 		}
 	}
 	const target = path.posix.resolve(executablePath);
@@ -597,6 +598,7 @@ export async function observeStrace(
 	const images = new Map<number, string>(); // Each process's program, inherited across a fork until it execs.
 	const statFields = new Map<number, readonly FilesystemObservationField[] | undefined>();
 	const opened = new Map<number, Set<number>>(); // Descriptors a process opened itself, whose status flags it chose.
+	const refusedIndexLocks = new Set<number>();
 	const { journal: resourceJournal, handled: streamCalls, retained, finalHandles } = options.inheritedHandles?.length || options.inheritedStreams?.length
 		? resourceTransitions(selected, root.file.pid, options) : { journal: [], handled: new Set<TraceLine>(), retained: [], finalHandles: [] };
 	const interposedExecutables = new Map((options.interposedExecutables ?? []).map(([intercepted, original]) => [path.posix.resolve(intercepted), path.posix.resolve(original)]));
@@ -658,6 +660,11 @@ export async function observeStrace(
 						(options.inheritedFileImages?.includes(absoluteDescriptorPath(line.args[0]) ?? /^\d+<(pipe:\[\d+\])>$/.exec(line.args[0] ?? "")?.[1] ?? "") || stream)))
 					taints.add("unsupported_syscall");
 			}
+			// git refreshes its index's stat cache when it can, and reports the same without it (the repository is read-only
+			// here); a git that needed the lock (add, commit, stash) fails instead, and its refusal stays a confinement observation.
+			if (images.get(pid) === "git" && /^open(?:at)?$/.test(syscall) && /\/index\.lock"?$/.test(quotedStrings(line).at(-1) ?? "") && confinementDenied(line)) {
+				refusedIndexLocks.add(pid); continue;
+			}
 			if (CONFINEMENT_SENSITIVE_SYSCALLS.has(syscall) || prctlConfinementSensitive(line, syscall) || confinementDenied(line) || processLimitDenied(line, syscall)) {
 				taints.add("confinement_observation");
 			}
@@ -698,7 +705,7 @@ export async function observeStrace(
 				const directoryHandle = (syscall === "fstat" || !quotedArgument(line.args[1])) && /\bstx?_mode=S_IFDIR\b/.test(line.args[structure] ?? "");
 				// Only the fields a program reveals of a workspace file are its dependency (see workspaceStatFields).
 				const workspace = metadataPaths.length > 0 && metadataPaths.every((target) => semanticRoots.some((root) => containsLogicalPath(root, target)));
-				const observed = statObservationDigest(line.args[structure] ?? "", directoryHandle ? ["mode"] : undefined, workspace ? statFields.get(pid) : undefined);
+				const observed = statObservationDigest(line.args[structure] ?? "", directoryHandle ? ["mode"] : undefined, workspace ? statFields.get(pid) : hostStatFields(images.get(pid) ?? ""));
 				if (!metadataPaths.length || !observed) {
 					// fstat, or an empty *at name, of a pipe or socket
 					if (descriptorTarget(line) && !quotedArgument(line.args[1])) taints.add("descriptor_observation");
@@ -730,6 +737,7 @@ export async function observeStrace(
 			}
 		}
 	}
+	for (const pid of refusedIndexLocks) if (selected.get(pid)?.file.exitCode !== 0) taints.add("confinement_observation");
 	if (!complete) taints.add("trace_incomplete");
 	// Chosen tools cannot pass their one-shot inputs on to output: the transcript may be replayed across turns.
 	else if (repeatableExecutions(executions, listingPIDs, semanticRoots)) for (const taint of ONE_SHOT_TAINTS) taints.delete(taint);

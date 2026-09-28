@@ -16,17 +16,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createSpeculativeActionHost, type CreateSpeculativeActionHostOptions, type SpeculativeActionHost } from "../src/agent-integration.ts";
 import type { SpeculativeAgentExecutionWorld } from "../src/agent-execution-world.ts";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
-import {
-	RESOURCE_OBSERVATION_EFFECTS,
-	UNRESTRICTED_PROCESS_EFFECTS,
-	WORKSPACE_PATH_MUTATION_EFFECTS,
-} from "../src/effect-model.ts";
+import { RESOURCE_OBSERVATION_EFFECTS, UNRESTRICTED_PROCESS_EFFECTS, WORKSPACE_PATH_MUTATION_EFFECTS } from "../src/effect-model.ts";
 import { ExecutionWorldRouter, type ExecutionWorldDiagnosticSnapshot } from "../src/execution-world.ts";
-import {
-	createSpeculativeActionExtension,
-	formatSpeculativeActionEvent,
-	type SpeculativeSettingsStore,
-} from "../src/extension.ts";
+import { createSpeculativeActionExtension, formatSpeculativeActionEvent, type SpeculativeSettingsStore } from "../src/extension.ts";
 import { LinuxProcessReuseBackend } from "../src/linux-process-backend.ts";
 import type { ProcessExecutionRequest } from "../src/process-execution.ts";
 import * as piTools from "../src/pi-tool-invocation.ts";
@@ -205,10 +197,7 @@ describe("zero-modification Pi extension", () => {
 			await fixture.emit("session_shutdown");
 			expect(closeHost).toHaveBeenCalledOnce();
 			expect(dispose).toHaveBeenCalledTimes(3);
-		} finally {
-			await fixture.emit("session_shutdown");
-			prepare.mockRestore(); definitions.mockRestore(); vi.unstubAllEnvs();
-		}
+		} finally { await fixture.emit("session_shutdown"); prepare.mockRestore(); definitions.mockRestore(); vi.unstubAllEnvs(); }
 	});
 
 	it.each(["starting", "retiring", "ready", "rejected", "thrown"] as const)("owns session installation and every admitted refresh through shutdown (%s)", async (state) => {
@@ -477,11 +466,7 @@ describe("zero-modification Pi extension", () => {
 			resourceCacheMaxBytes: 96 * 1024 * 1024,
 			executionStoreMaxEntries: 2048,
 			executionStoreMaxBytes: 768 * 1024 * 1024,
-			selfSpeculation: {
-				endpoint: "http://127.0.0.1:8000",
-				forkTransport: "sidecar",
-				forkActionMinConfidence: 0.75,
-			},
+			selfSpeculation: { endpoint: "http://127.0.0.1:8000", forkTransport: "sidecar", forkActionMinConfidence: 0.75 },
 			patternAware: { futureGapCoverage: 0.8, enabled: false, multiStepEnabled: false },
 		});
 		expect(clearConfirmations).toBe(2);
@@ -502,10 +487,7 @@ describe("zero-modification Pi extension", () => {
 		expect(fixture.ui.notify).toHaveBeenCalledWith("Reusable command history cleared: 2 entries, 3 artifacts, 4 KiB.", "info");
 		expect(fixture.ui.notify).toHaveBeenCalledWith("Endpoint must be an absolute HTTP(S) URL.", "warning");
 		expect(menus.get("Actor probe")).toEqual(
-			expect.arrayContaining([
-				"Use forked calls for tool pre-execution: On",
-				"Minimum tool-name confidence: 75%",
-			]),
+			expect.arrayContaining(["Use forked calls for tool pre-execution: On", "Minimum tool-name confidence: 75%"]),
 		);
 	});
 });
@@ -605,10 +587,7 @@ async function createFixture(options: FixtureOptions = {}) {
 	} as unknown as ExtensionAPI;
 	const createExecutionWorlds = vi.fn(() => options.executionWorlds ?? []);
 	const factory = createSpeculativeActionExtension({
-		createHost: (_sessionID, configured) => {
-			hostOptions = configured;
-			return host;
-		},
+		createHost: (_sessionID, configured) => { hostOptions = configured; return host; },
 		createSettingsStore: () => store,
 		...(options.defaultExecutionWorlds ? {} : { createExecutionWorlds }),
 	});
