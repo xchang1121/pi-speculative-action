@@ -40,11 +40,7 @@ export type PatternAwareActionSemantics = {
 	/** Equal namespaces promise the same canonicalization and projection contract, including captured inputs. */
 	readonly namespace: string;
 	/** Deterministic K(a) projection for one namespace; repeated inputs may be memoized. */
-	readonly actionKey: (
-		tool: string,
-		input: Readonly<Record<string, unknown>>,
-		schemaHash?: string,
-	) => ActionKey | undefined;
+	readonly actionKey: (tool: string, input: Readonly<Record<string, unknown>>, schemaHash?: string) => ActionKey | undefined;
 	readonly projectors?: readonly ActionKeyProjector[];
 };
 
@@ -85,25 +81,10 @@ export type PatternAwareDependency = {
 export type PatternAwareBinding = (
 	| (Omit<PatternAwareDependencySource, "itemPath"> & { readonly type: "event" })
 	| (Required<PatternAwareDependencySource> & { readonly type: "each" })
-	| {
-			readonly type: "constant";
-			readonly value: unknown;
-	  }
-	| {
-			readonly type: "transform";
-			readonly operation: PathTransform;
-			readonly source: PatternAwareBinding;
-	  }
-	| {
-			readonly type: "coalesce";
-			readonly sources: ReadonlyArray<PatternAwareBinding>;
-	  }
-	| {
-			readonly type: "template";
-			readonly source: PatternAwareBinding;
-			readonly prefix: string;
-			readonly suffix: string;
-	  }
+	| { readonly type: "constant"; readonly value: unknown; }
+	| { readonly type: "transform"; readonly operation: PathTransform; readonly source: PatternAwareBinding; }
+	| { readonly type: "coalesce"; readonly sources: ReadonlyArray<PatternAwareBinding>; }
+	| { readonly type: "template"; readonly source: PatternAwareBinding; readonly prefix: string; readonly suffix: string; }
 	| {
 			readonly type: "join";
 			readonly operation: "join_path";
@@ -163,15 +144,9 @@ export type PatternAwareContinuation = {
 	readonly pathProbability: number;
 };
 
-export type PatternAwareRuntimeContext = {
-	readonly store: PatternAwareStore;
-	readonly continuation: PatternAwareContinuation;
-};
+export type PatternAwareRuntimeContext = { readonly store: PatternAwareStore; readonly continuation: PatternAwareContinuation; };
 
-export type PatternAwareObservation = {
-	readonly output?: unknown;
-	readonly outputPaths?: ReadonlyArray<string>;
-};
+export type PatternAwareObservation = { readonly output?: unknown; readonly outputPaths?: ReadonlyArray<string>; };
 
 type MutablePattern = {
 	id: string;
@@ -198,11 +173,7 @@ type MutablePatternFeedback = PatternFeedbackCounters & {
 	unobserved: Record<string, number>;
 };
 
-type PersistedPatternSample = {
-	readonly context: ReadonlyArray<number>;
-	readonly target: number;
-	readonly gap: number;
-};
+type PersistedPatternSample = { readonly context: ReadonlyArray<number>; readonly target: number; readonly gap: number; };
 
 type PersistedPatternPool = Omit<PatternPool, "samples"> & {
 	readonly samples: ReadonlyArray<PersistedPatternSample>;
@@ -215,11 +186,7 @@ type PersistedState = {
 	readonly sequenceCounts: ReadonlyArray<PpmCountTrieRow>;
 };
 
-type PatternSample = {
-	readonly context: ReadonlyArray<PatternAwareEvent>;
-	readonly target: PatternAwareEvent;
-	readonly gap: number;
-};
+type PatternSample = { readonly context: ReadonlyArray<PatternAwareEvent>; readonly target: PatternAwareEvent; readonly gap: number; };
 
 type PatternPool = {
 	readonly key: string;
@@ -231,10 +198,7 @@ type PatternPool = {
 	patternIDs?: string[];
 };
 
-type TrieNode = {
-	readonly children: Map<string, TrieNode>;
-	readonly patterns: Set<MutablePattern>;
-};
+type TrieNode = { readonly children: Map<string, TrieNode>; readonly patterns: Set<MutablePattern>; };
 
 const patternAwareDefaults = {
 	enabled: true,
@@ -334,11 +298,7 @@ export class PatternAwareStore {
 	private readonly persistenceFile?: string;
 	private readonly actionSemantics?: PatternAwareActionSemantics;
 
-	constructor(
-		settings: PatternAwareSettings,
-		persistenceFile?: string,
-		actionSemantics?: PatternAwareActionSemantics,
-	) {
+	constructor(settings: PatternAwareSettings, persistenceFile?: string, actionSemantics?: PatternAwareActionSemantics) {
 		settings = { ...settings };
 		this.settings = settings;
 		this.sessionBudgets = patternSessionBudgets(settings.maxPatterns);
@@ -444,10 +404,7 @@ export class PatternAwareStore {
 
 	finishSession(sessionID: string) {
 		const session = this.sessions.get(sessionID);
-		if (session) {
-			this.sessions.delete(sessionID);
-			this.finishSessionState(session);
-		}
+		if (session) { this.sessions.delete(sessionID); this.finishSessionState(session); }
 		this.persist();
 	}
 
@@ -552,11 +509,7 @@ export class PatternAwareStore {
 		const activeSessionID = history.at(-1)?.sessionID;
 		const groups = new Map<
 			string,
-			Array<{
-				readonly pattern: MutablePattern;
-				readonly input: Record<string, unknown>;
-				variantProbability: number;
-			}>
+			Array<{ readonly pattern: MutablePattern; readonly input: Record<string, unknown>; variantProbability: number; }>
 		>();
 		this.ensureIndex();
 		for (const { pattern, context } of this.trie.matching(history, this.contextStarts(history))) {
@@ -664,10 +617,7 @@ export class PatternAwareStore {
 		// Session frequency supports another Actor opportunity, not a transition from hypothetical output.
 		for (const recurrent of authoritative ? this.recurrentPredictions(activeSessionID, schemaHashes, estimatePpm, continuation, settings) : []) {
 			const existing = predictions.get(recurrent.actionIdentity);
-			if (!existing) {
-				predictions.set(recurrent.actionIdentity, recurrent);
-				continue;
-			}
+			if (!existing) { predictions.set(recurrent.actionIdentity, recurrent); continue; }
 			const preferred = recurrent.background !== existing.background ? (recurrent.background ? existing : recurrent)
 				: recurrent.expectedLatencyBenefitMs > existing.expectedLatencyBenefitMs ? recurrent : existing;
 			predictions.set(recurrent.actionIdentity, {
@@ -754,10 +704,7 @@ export class PatternAwareStore {
 			return current === undefined || current === item.action.schemaHash;
 		}).map((item) => {
 			let feedback = this.recurrentFeedback.get(item);
-			if (!feedback) {
-				feedback = emptyPatternFeedback(this.clock);
-				this.recurrentFeedback.set(item, feedback);
-			}
+			if (!feedback) { feedback = emptyPatternFeedback(this.clock); this.recurrentFeedback.set(item, feedback); }
 			return { ...item, feedback, patternID: `action-backoff:${hash(item.action.key)}`,
 				mass: item.weightedCount * recencyWeight(item.lastSeenSequence, this.clock, settings.decayHalfLifeEvents) };
 		});
@@ -864,10 +811,7 @@ export class PatternAwareStore {
 		const target = this.persistenceFile;
 		if (!target || !this.loaded) return;
 		while (true) {
-			if (this.persistTimer) {
-				clearTimeout(this.persistTimer);
-				this.persistTimer = undefined;
-			}
+			if (this.persistTimer) { clearTimeout(this.persistTimer); this.persistTimer = undefined; }
 			if (!this.write && !this.dirty) return;
 			this.write ??= Promise.resolve().then(async () => {
 				this.dirty = false;
@@ -1034,10 +978,7 @@ export class PatternAwareStore {
 					(this.patterns.get(patternID)?.occurrences ?? this.settings.minOccurrences) <
 					this.settings.minOccurrences,
 			);
-		if (pool.samples.length < this.settings.minOccurrences && !probationary) {
-			this.retirePoolPatterns(pool, new Set());
-			return;
-		}
+		if (pool.samples.length < this.settings.minOccurrences && !probationary) { this.retirePoolPatterns(pool, new Set()); return; }
 		const minimumSupport = probationary ? pool.samples.length : this.settings.minOccurrences;
 		const constantSupport = bindingEvidenceThreshold(this.settings);
 		const candidates = new Map<string, Record<string, PatternAwareBinding>>();
@@ -1086,10 +1027,7 @@ export class PatternAwareStore {
 			}
 			observed.averageDurationMs /= Math.max(1, support.length);
 			const existing = this.patterns.get(id);
-			if (existing) {
-				Object.assign(existing, observed);
-				continue;
-			}
+			if (existing) { Object.assign(existing, observed); continue; }
 			this.patterns.set(id, {
 				id,
 				context: signatures,
@@ -1124,10 +1062,7 @@ export class PatternAwareStore {
 	}
 
 	private retirePoolPatterns(pool: PatternPool, retained: ReadonlySet<string>) {
-		for (const patternID of pool.patternIDs ?? []) {
-			if (retained.has(patternID)) continue;
-			this.removePattern(patternID);
-		}
+		for (const patternID of pool.patternIDs ?? []) { if (retained.has(patternID)) continue; this.removePattern(patternID); }
 		pool.patternIDs = [...retained];
 	}
 
@@ -1140,10 +1075,7 @@ export class PatternAwareStore {
 		}
 	}
 
-	private resolvePendingBatch(
-		session: PatternSessionState<PatternAwareEvent>,
-		events: ReadonlyArray<PatternAwareEvent>,
-	) {
+	private resolvePendingBatch(session: PatternSessionState<PatternAwareEvent>, events: ReadonlyArray<PatternAwareEvent>) {
 		const pending = session.pending;
 		if (!pending?.length) return;
 		const remaining: PatternPendingValidation[] = [];
@@ -1155,24 +1087,15 @@ export class PatternAwareStore {
 					this.actionInputCovers(pattern.targetTool, expectedInput, pattern.targetSchemaHash, event.tool, event.input, event.schemaHash),
 				),
 			);
-			if (matched) {
-				this.recordValidation(item.patternID, true);
-				continue;
-			}
-			if (item.remaining <= 0) {
-				this.recordValidation(item.patternID, false);
-				continue;
-			}
+			if (matched) { this.recordValidation(item.patternID, true); continue; }
+			if (item.remaining <= 0) { this.recordValidation(item.patternID, false); continue; }
 			item.remaining--;
 			remaining.push(item);
 		}
 		session.pending = remaining;
 	}
 
-	private startPending(
-		session: PatternSessionState<PatternAwareEvent>,
-		history: ReadonlyArray<PatternAwareEvent>,
-	) {
+	private startPending(session: PatternSessionState<PatternAwareEvent>, history: ReadonlyArray<PatternAwareEvent>) {
 		const pending = [...session.pending];
 		const triggerSequence = history.at(-1)?.sequence;
 		if (triggerSequence === undefined) return;
@@ -1282,15 +1205,9 @@ export class PatternAwareStore {
 	}
 }
 
-type PooledPatternAwareStore = {
-	readonly store: Promise<PatternAwareStore>;
-	references: number;
-};
+type PooledPatternAwareStore = { readonly store: Promise<PatternAwareStore>; references: number; };
 
-export type PatternAwareStoreLease = {
-	readonly store: PatternAwareStore;
-	readonly release: () => Promise<void>;
-};
+export type PatternAwareStoreLease = { readonly store: PatternAwareStore; readonly release: () => Promise<void>; };
 
 const stores = new Map<string, PooledPatternAwareStore>();
 
@@ -1449,10 +1366,7 @@ class PatternBindingAnalysis {
 		});
 	}
 
-	inferBindings(
-		context: ReadonlyArray<PatternAwareEvent>,
-		target: Record<string, unknown>,
-	): Record<string, PatternAwareBinding> {
+	inferBindings(context: ReadonlyArray<PatternAwareEvent>, target: Record<string, unknown>): Record<string, PatternAwareBinding> {
 		const bindings: Record<string, PatternAwareBinding> = {};
 		for (const [targetPath, value] of this.leaves(target)) {
 			const key = encodePath(targetPath);
@@ -1474,10 +1388,7 @@ class PatternBindingAnalysis {
 		}
 		for (const [encodedPath, targetPath] of [...targetPaths].sort(([left], [right]) => left.localeCompare(right))) {
 			const targets = samples.map((sample) => getPath(sample.target.input, targetPath));
-			if (targets.some((value) => value === MISSING)) {
-				if (allowProjectedOmissions) continue;
-				return;
-			}
+			if (targets.some((value) => value === MISSING)) { if (allowProjectedOmissions) continue; return; }
 			const firstTarget = targets[0];
 			const constant = targets.every((value) => sameValue(value, firstTarget));
 			if (constant && !requiresProvenance(targetPath, firstTarget)) {
@@ -1513,10 +1424,7 @@ class PatternBindingAnalysis {
 			if (!selected && constant && stablePayloadConstant(samples, constantSupport)) {
 				selected = { type: "constant", value: firstTarget };
 			}
-			if (!selected) {
-				if (allowProjectedOmissions) continue;
-				return;
-			}
+			if (!selected) { if (allowProjectedOmissions) continue; return; }
 			bindings[encodedPath] = selected;
 		}
 		return bindings;
@@ -1543,10 +1451,7 @@ class PatternBindingAnalysis {
 		bindings: Readonly<Record<string, PatternAwareBinding>>,
 		context: ReadonlyArray<PatternAwareEvent>,
 		limit = MAX_BINDING_VARIANTS,
-	): ReadonlyArray<{
-		readonly input: Record<string, unknown>;
-		readonly probability: number;
-	}> {
+	): ReadonlyArray<{ readonly input: Record<string, unknown>; readonly probability: number; }> {
 		let variants: Array<{ input: Record<string, unknown>; probability: number }> = [
 			{ input: {}, probability: 1 },
 		];
@@ -1820,10 +1725,7 @@ function structuredOutput(value: unknown): unknown {
 	if (
 		"details" in record &&
 		Array.isArray(record.content) &&
-		record.content.every((item) => {
-			const content = asRecord(item);
-			return !!content && typeof content.type === "string";
-		})
+		record.content.every((item) => { const content = asRecord(item); return !!content && typeof content.type === "string"; })
 	) {
 		// Empty details (a failed call's settlement) carry nothing; its text still names paths.
 		if (record.details !== undefined && Object.keys(asRecord(record.details) ?? { value: true }).length) return record.details;
@@ -1866,22 +1768,14 @@ function isPathField(key: string) {
 
 function* uniqueBy<Value>(values: Iterable<Value>, keyFor: (value: Value) => string): Generator<Value> {
 	const seen = new Set<string>();
-	for (const item of values) {
-		const key = keyFor(item);
-		if (seen.has(key)) continue;
-		seen.add(key);
-		yield item;
-	}
+	for (const item of values) { const key = keyFor(item); if (seen.has(key)) continue; seen.add(key); yield item; }
 }
 
 const bindingStructureKeys = new WeakMap<object, string>();
 
 function bindingStructureKey(binding: PatternAwareBinding): string {
 	let key = bindingStructureKeys.get(binding);
-	if (key === undefined) {
-		key = stableStringify(bindingStructure(binding));
-		bindingStructureKeys.set(binding, key);
-	}
+	if (key === undefined) { key = stableStringify(bindingStructure(binding)); bindingStructureKeys.set(binding, key); }
 	return key;
 }
 
@@ -1955,10 +1849,7 @@ const PATH_OPERATION_CACHE_LIMIT = 128;
 const normalizedPaths = new BoundedRecencyMap<string, string>(PATH_OPERATION_CACHE_LIMIT);
 const joinedPaths = new BoundedRecencyMap<string, string>(PATH_OPERATION_CACHE_LIMIT);
 
-function cachePathResult(cache: BoundedRecencyMap<string, string>, key: string, value: string) {
-	cache.set(key, value);
-	return value;
-}
+function cachePathResult(cache: BoundedRecencyMap<string, string>, key: string, value: string) { cache.set(key, value); return value; }
 
 function joinPath(left: string, right: string) {
 	const key = `${left.length}:${left}${right}`;
@@ -1990,11 +1881,7 @@ function getPath(value: unknown, segments: PatternAwarePath): unknown {
 	return current;
 }
 
-function withPath(
-	target: Readonly<Record<string, unknown>>,
-	segments: PatternAwarePath,
-	value: unknown,
-): Record<string, unknown> {
+function withPath(target: Readonly<Record<string, unknown>>, segments: PatternAwarePath, value: unknown): Record<string, unknown> {
 	const update = (current: unknown, index: number): Record<string, unknown> | unknown[] => {
 		const segment = segments[index]!;
 		const container: Record<string, unknown> | unknown[] = typeof segment === "number" ? (Array.isArray(current) ? [...current] : [])
@@ -2039,10 +1926,7 @@ function groupGapTiming(patterns: ReadonlyArray<MutablePattern>, settings: Patte
 	const target = total * settings.futureGapCoverage;
 	const latestHorizon = gaps.at(-1)?.[0] ?? 0;
 	let horizon = latestHorizon, covered = 0;
-	for (const [gap, weight] of gaps) {
-		covered += weight;
-		if (covered >= target) { horizon = gap; break; }
-	}
+	for (const [gap, weight] of gaps) { covered += weight; if (covered >= target) { horizon = gap; break; } }
 	return { horizon, latestHorizon, gapCoverage: total <= 0 ? 0 : Math.max(0, Math.min(1, covered / total)) };
 }
 
@@ -2111,14 +1995,8 @@ function semanticOutputShape(value: unknown) {
 		if (
 			(typeof item === "string" || typeof item === "number" || typeof item === "boolean") &&
 			(key === "kind" || key === "operation" || key === "status" || key === "type")
-		) {
-			discriminants.push(`${key}:${item}`);
-			return;
-		}
-		if (Array.isArray(item)) {
-			if (item.length) visit(item[0], key, depth + 1);
-			return;
-		}
+		) { discriminants.push(`${key}:${item}`); return; }
+		if (Array.isArray(item)) { if (item.length) visit(item[0], key, depth + 1); return; }
 		const record = asRecord(item);
 		if (record) for (const [name, child] of Object.entries(record)) visit(child, name, depth + 1);
 	};
@@ -2250,12 +2128,7 @@ function mutablePattern(value: PatternAwarePattern): MutablePattern | undefined 
 
 function emptyPatternFeedback(sequence: number): MutablePatternFeedback {
 	const counters = Object.fromEntries(PATTERN_FEEDBACK_COUNTERS.map((key) => [key, 0])) as PatternFeedbackCounters;
-	return {
-		...counters,
-		rejectedAfterMatch: {},
-		unobserved: {},
-		sequence: Math.max(0, sequence),
-	};
+	return { ...counters, rejectedAfterMatch: {}, unobserved: {}, sequence: Math.max(0, sequence) };
 }
 
 function mutablePatternFeedback(value: unknown): MutablePatternFeedback | undefined {
@@ -2264,11 +2137,7 @@ function mutablePatternFeedback(value: unknown): MutablePatternFeedback | undefi
 	const unobserved = numericRecord(feedback?.unobserved);
 	const counters = numericRecord(Object.fromEntries(PATTERN_FEEDBACK_COUNTERS.map((key) => [key, feedback?.[key]]))) as PatternFeedbackCounters | undefined;
 	if (!rejectedAfterMatch || !unobserved || !counters) return;
-	return {
-		...counters,
-		rejectedAfterMatch: rejectedAfterMatch as Partial<Record<ResolutionStage, number>>,
-		unobserved,
-	};
+	return { ...counters, rejectedAfterMatch: rejectedAfterMatch as Partial<Record<ResolutionStage, number>>, unobserved };
 }
 
 function numericRecord(value: unknown): Record<string, number> | undefined {
@@ -2440,10 +2309,7 @@ function parsePath(value: string): PatternAwarePath | undefined {
 		const result = isPatternAwarePath(parsed) ? parsed : null;
 		parsedPaths.set(value, result);
 		return result ?? undefined;
-	} catch {
-		parsedPaths.set(value, null);
-		return undefined;
-	}
+	} catch { parsedPaths.set(value, null); return undefined; }
 }
 
 function uniqueStrings(values: ReadonlyArray<string>) {
