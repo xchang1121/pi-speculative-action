@@ -307,6 +307,11 @@ describe("SpeculationScheduler", () => {
 		expect(joinDecision(scheduler, npmTest, { ...running, expectedSpeculativeDurationMs: undefined })).toMatchObject({ allowed: true, waitBudgetMs: 591 });
 	});
 
+	it("combines independent sources' probabilistic benefits for the same work noisy-OR", () => {
+		const scheduler = new SpeculationScheduler<object>(), half = forecast({ expectedDurationMs: 100, expectedLatencyBenefitMs: 50 });
+		expect([scheduler.evaluate([half]).priorityMs, scheduler.evaluate([half, half]).priorityMs, scheduler.evaluate([half, forecast({ expectedDurationMs: 100 })]).priorityMs]).toEqual([50, 75, 100]);
+	});
+
 	it("judges a new action's fallback among class samples it could still match, net of the learned sandbox overhead", () => {
 		const scheduler = new SpeculationScheduler<object>(), bash = { tool: "bash", executionFingerprint: "linux-world" };
 		for (const [action, native] of [["ls", 20], ["cat", 30], ["git", 40], ["find-root", 510_000]] as const) {
