@@ -140,10 +140,7 @@ describe("SpeculationScheduler", () => {
 		scheduler.admit(likelyShort, [forecast({ expectedDurationMs: 50, expectedLatencyBenefitMs: 40 })], 2);
 
 		expect(scheduler.preemptFor(1, 2)).toEqual([unlikelyLong]);
-		expect(scheduler.evaluate([forecast({ expectedDurationMs: 50 })])).toMatchObject({
-			criticalPathMs: 50,
-			priorityMs: 50,
-		});
+		expect(scheduler.evaluate([forecast({ expectedDurationMs: 50 })])).toMatchObject({ criticalPathMs: 50, priorityMs: 50 });
 	});
 
 	it("caps expected benefit by observed Actor runway without inventing cold-start timing", () => {
@@ -308,6 +305,17 @@ describe("SpeculationScheduler", () => {
 		const npmTest = { ...ls, actionKeyHash: "npm-test" }, running = { state: "running" as const, elapsedMs: 616 };
 		expect(joinDecision(scheduler, npmTest, { ...running, expectedSpeculativeDurationMs: 2000 })).toMatchObject({ allowed: true, expectedRemainingMs: 1384, waitBudgetMs: 1755 });
 		expect(joinDecision(scheduler, npmTest, { ...running, expectedSpeculativeDurationMs: undefined })).toMatchObject({ allowed: true, waitBudgetMs: 591 });
+	});
+
+	it("judges a new action's fallback among class samples it could still match, net of the learned sandbox overhead", () => {
+		const scheduler = new SpeculationScheduler<object>(), bash = { tool: "bash", executionFingerprint: "linux-world" };
+		for (const [action, native] of [["ls", 20], ["cat", 30], ["git", 40], ["find-root", 510_000]] as const) {
+			scheduler.observeSpeculativeService({ ...bash, actionKeyHash: action }, native + 250);
+			scheduler.observeActorService({ ...bash, actionKeyHash: action }, native);
+		}
+		const fresh = { ...bash, actionKeyHash: "grep" }, running = { expectedSpeculativeDurationMs: undefined };
+		expect(joinDecision(scheduler, fresh, { ...running, elapsedMs: 50 })).toMatchObject({ allowed: false, reason: "fallback_faster", expectedActorMs: 30, waitBudgetMs: 0 });
+		expect(joinDecision(scheduler, fresh, { ...running, elapsedMs: 400_000 })).toMatchObject({ allowed: true, expectedActorMs: 510_000 });
 	});
 
 	it("bounds an uncalibrated join while wider timing classes transfer across exact actions", () => {
