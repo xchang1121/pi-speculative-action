@@ -187,11 +187,9 @@ export const READ_RANGE_ACTION_KEY_PROJECTOR: ActionKeyProjector = ownActionKeyP
 	id: "read.range",
 	partition: readProjectionPartition,
 	project: (speculative, actor) => {
-		const speculativeRange = readActionRange(speculative);
-		const actorRange = readActionRange(actor);
+		const speculativeRange = readActionRange(speculative), actorRange = readActionRange(actor);
 		if (!speculativeRange || !actorRange) return undefined;
-		if (readProjectionPartition(speculative) !== readProjectionPartition(actor)) return undefined;
-		if (speculativeRange.limit === 0 || speculativeRange.offset > actorRange.offset || actorRange.offset > speculativeRange.end + 1) return undefined;
+		if (readProjectionPartition(speculative) !== readProjectionPartition(actor) || speculativeRange.limit === 0 || speculativeRange.offset > actorRange.offset || actorRange.offset > speculativeRange.end + 1) return undefined;
 		return { action: actor, distance: actorRange.offset - speculativeRange.offset + Math.abs(speculativeRange.end - actorRange.end) };
 	},
 	canShareInFlight: readRangesShareInFlight,
@@ -420,10 +418,11 @@ function bashTimeoutPartition(action: ActionKey): string | undefined {
 		action.executionFingerprint, action.resources, Object.entries(action.input).filter(([name]) => name !== "timeout")]) : undefined;
 }
 
-/** Everything but the pattern and limit. rg matches within one line's bytes: context, a line break, U+FFFD or a non-ASCII case fold never projects. */
+/** Everything but the pattern and limit. rg matches within one line's bytes: context, a line break, U+FFFD or a non-ASCII case fold never projects.
+ * A regex of only word characters, spaces and hyphens matches as its literal does. */
 function grepLiteralPartition(action: ActionKey): string | undefined {
 	const { pattern, literal, ignoreCase, context } = action.input;
-	return action.tool === "grep" && literal === true && context === 0 && typeof pattern === "string" && (ignoreCase ? /^[\x20-\x7e]+$/ : /^[^\r\n�]+$/u).test(pattern)
+	return action.tool === "grep" && (literal === true || typeof pattern === "string" && /^[\w -]+$/.test(pattern)) && context === 0 && typeof pattern === "string" && (ignoreCase ? /^[\x20-\x7e]+$/ : /^[^\r\n�]+$/u).test(pattern)
 		? stableStringify([action.semanticsEpoch, action.schemaHash, action.executionFingerprint, action.resources,
 			Object.entries(action.input).filter(([name]) => name !== "pattern" && name !== "limit")]) : undefined;
 }
@@ -435,8 +434,7 @@ function bashTimeoutCovers(speculative: ActionKey, actor: ActionKey): boolean {
 
 function readProjectionPartition(action: ActionKey): string | undefined {
 	const range = readActionRange(action);
-	if (!range) return undefined;
-	return JSON.stringify([ action.semanticsEpoch, action.schemaHash, action.executionFingerprint, action.resources, range.path]);
+	return range && JSON.stringify([action.semanticsEpoch, action.schemaHash, action.executionFingerprint, action.resources, range.path]);
 }
 
 /** Capture rule slots once; retain source identity only for conflicting-registration checks. */
