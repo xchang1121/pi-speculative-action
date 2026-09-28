@@ -27,12 +27,26 @@ async function observe(processes: Record<number, readonly string[]>, options?: S
 }
 
 describe("strace provenance decoder", () => {
-	test("accepts directory enumeration only with its exact broker image and successful result", async () => {
+	test("accepts directory enumeration with its exact broker image, or as an entry-set dependency with volatile order", async () => {
 		for (const syscall of ["getdents", "getdents64"]) for (const configured of [false, true]) for (const failed of [false, true]) {
 			const observation = await observe({ 100: [EXEC, `${syscall}(10</work/anchor>, [], 512) = ${failed ? "-1 EINVAL (Invalid argument)" : "0"}`] }, {
 				inheritedDirectoryImages: configured ? ["/work/anchor"] : [],
 			});
-			expect(observation.taints.includes("unsupported_syscall"), `${syscall}:${configured}:${failed}`).toBe(configured === failed);
+			const listing = !configured && !failed, label = `${syscall}:${configured}:${failed}`;
+			expect([observation.taints.includes("unsupported_syscall"), observation.taints.includes("descriptor_observation")], label).toEqual([configured && failed, listing]);
+			expect(observation.paths.some(({ path, role }) => path === "/work/anchor" && role === "input"), label).toBe(listing);
+		}
+		// Only a descriptor with a pathname names the directory whose entries were read.
+		expect((await observe({ 100: [EXEC, "getdents64(10<pipe:[7]>, [], 512) = 0"] })).taints).toContain("unsupported_syscall");
+	});
+
+	test("treats host filesystem statistics as time-varying input, but not the sandbox's workspace filesystem", async () => {
+		const STATFS = "{f_type=SYSFS_MAGIC, f_bsize=4096, f_blocks=0, f_bfree=0, f_bavail=0, f_files=0, f_ffree=0, f_fsid={val=[0x1, 0x2]}, f_namelen=255, f_frsize=4096, f_flags=ST_VALID}";
+		for (const [line, roots, allowed] of [[`statfs("/sys/fs/selinux", ${STATFS}) = 0`, ["/work"], true], ['statfs("/sys/fs/selinux", 0x7ffd) = -1 ENOENT (No such file or directory)', ["/work"], true],
+			[`fstatfs(3</usr/lib>, ${STATFS}) = 0`, ["/work"], true], [`statfs("sub", ${STATFS}) = 0`, ["/work"], false], [`fstatfs(3</work/src>, ${STATFS}) = 0`, ["/work"], false],
+			[`statfs("/sys/fs/selinux", ${STATFS}) = 0`, [], false]] as const) {
+			const observation = await observe({ 100: [EXEC, line] }, { guardFilesystemSemanticsWithin: [...roots] });
+			expect([observation.taints.includes("unsupported_syscall"), observation.paths.length], line).toEqual([!allowed && !line.includes("ENOENT"), allowed ? 1 : 2]);
 		}
 	});
 	test("releases stream references after aliases, copied tables and shared tables close", async () => {
