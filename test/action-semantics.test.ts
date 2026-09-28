@@ -97,6 +97,8 @@ describe("ActionSemanticsRegistry", () => {
 		expect(match("foo", "foobar", { limit: 5 })).toMatchObject({ kind: "projected", projector: "grep.literal", distance: 3 });
 		for (const [speculative, actor, options] of [["foobar", "foo", {}], ["foo", "foo\nbar", {}], ["foo", "Foobar", {}], ["foo", "foobar", { ignoreCase: true }],
 			["foo", "foobar", { context: 1 }], ["foo", "foobar", { glob: "*.ts" }], ["foo", "foobar", { literal: false }]] as const) expect(match(speculative, actor, options)).toBeUndefined();
+		const regex = (pattern: string) => key(pattern, { literal: false }); // Word characters, spaces and hyphens have no regex meaning.
+		expect([actionKeyMatch(regex("is Form"), regex("is Form-Data"), [GREP_LITERAL_ACTION_KEY_PROJECTOR])?.kind, actionKeyMatch(regex("is."), regex("is.x"), [GREP_LITERAL_ACTION_KEY_PROJECTOR])]).toEqual(["projected", undefined]);
 		const settle = (text: string, details?: unknown) => ({ result: { content: [{ type: "text" as const, text }], details }, isError: false });
 		expect([settle("a:1: foo"), settle("a:1: foo", { matchLimitReached: 100 }), { ...settle("a:1: foo"), isError: true }]
 			.map((output) => PI_GREP_LITERAL_PROJECTION_RULE.captureCoverage!(key("foo"), output))).toEqual([true, undefined, undefined]);
