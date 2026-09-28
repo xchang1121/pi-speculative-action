@@ -1994,6 +1994,9 @@ async function captureDependencies(
 			? (session.projection.toPhysical(observedPath) ?? observedPath)
 			: observedPath;
 		if (KERNEL_CONFIGURATION.has(observedPath)) continue; // Changes only with the kernel's own configuration, like the clock.
+		// A process reading its own state, or the host's CPU and cgroup limits, observes this one run like the clock or its pid.
+		if (/^\/proc\/(?:self|thread-self|\d+)(?:\/|$)/.test(observedPath)) { taints.add("pid_observation"); continue; }
+		if (/^\/sys\/(?:devices\/system\/cpu|fs\/cgroup)(?:\/|$)/.test(observedPath)) { taints.add("clock"); continue; }
 		if (item.role === "metadata") {
 			add({
 				kind: "metadata",
@@ -2046,7 +2049,8 @@ async function captureHostPath(
 ): Promise<readonly DynamicDependency[] | undefined> {
 	const dependencies: DynamicDependency[] = [];
 	for await (const { path: current, info, link, terminal } of walkFilesystemPath(path.resolve(physicalPath))) {
-		if (["/proc", "/sys", "/dev", "/run", "/tmp", "/var/tmp"].some((root) => pathContains(root, current))) return undefined;
+		// A runtime socket's absence validates exactly; what exists under these roots changes without a trace.
+		if (["/proc", "/sys", "/dev", "/run", "/tmp", "/var/tmp"].some((root) => pathContains(root, current)) && (!pathContains("/run", current) || info && terminal)) return undefined;
 		if (!info) {
 			const absence = await captureAbsenceDependency(current, slash(current), true);
 			if (!absence) throw new Error("host dependency changed during capture");

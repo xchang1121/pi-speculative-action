@@ -1,4 +1,5 @@
 import path from "node:path";
+import { FILESYSTEM_OBSERVATION_FIELDS, type FilesystemObservationField } from "./provenance-certificate.ts";
 
 interface ToolRule {
 	/** Orders a directory listing itself, so readdir order never reaches its output. */
@@ -24,10 +25,34 @@ const TOOLS: Readonly<Record<string, ToolRule>> = {
 		subcommands: new Set(["status", "diff", "log", "show", "rev-parse", "ls-files", "branch", "grep", "blame", "cat-file"]) },
 };
 export const SHELLS: ReadonlySet<string> = new Set(["bash", "sh", "dash"]);
-/** Programs that never print a device number and compare one only within the tree they walk: a sandbox's other
- * device for the workspace cannot reach their output (find, unless its -printf asks for %D). */
-export const DEVICE_BLIND: ReadonlySet<string> = new Set([...SHELLS, ...Object.keys(TOOLS).filter((name) => name !== "env"), "ls", "git", "find", "make", "rg",
-	"awk", "gawk", "mawk", "sort", "xargs", "cp", "mv", "rm", "ln", "mkdir", "rmdir", "touch", "chmod"]);
+/** Programs whose output is a function of file contents: they stat a file only for its type, size hints or same-file checks. */
+const CONTENT_READERS = new Set([...Object.keys(TOOLS).filter((name) => !["env", "test", "[", "ls", "find"].includes(name)), "rg", "awk", "gawk", "mawk"]);
+const WITHOUT_DEVICE = FILESYSTEM_OBSERVATION_FIELDS.filter((field) => field !== "dev");
+/** find predicates that read metadata beyond a file's type, with the fields they read; any other listing predicate reads all. */
+const FIND_FIELDS: ReadonlyArray<readonly [RegExp, readonly FilesystemObservationField[]]> = [[/^-(?:size|empty)$/, ["size"]], [/^-perm$/, ["mode"]],
+	[/^-(?:user|group|uid|gid|nouser|nogroup)$/, ["uid", "gid"]], [/^-links$/, ["nlink"]], [/^-(?:inum|samefile)$/, ["ino"]]];
+
+/**
+ * The stat fields of a workspace file that can reach a program's output. A sandbox serves the workspace from another device,
+ * and a snapshot's inode numbers and times differ: only what the program reveals is a dependency. Undefined keeps every field.
+ */
+export function workspaceStatFields(image: string, argv: readonly string[]): readonly FilesystemObservationField[] | undefined {
+	if (CONTENT_READERS.has(image) || image === "git") return ["mode"];
+	if (image === "find") {
+		const fields = new Set<FilesystemObservationField>(["mode"]);
+		if (argv.some((argument) => argument.includes("%D"))) return undefined;
+		for (const argument of argv.slice(1)) {
+			if (/^-(?:[acm](?:min|time)|used|newer\w*|f?printf|f?ls)$/.test(argument)) return WITHOUT_DEVICE;
+			for (const [predicate, read] of FIND_FIELDS) if (predicate.test(argument)) for (const field of read) fields.add(field);
+		}
+		return [...fields];
+	}
+	if (image === "ls") return argv.slice(1).some((argument) => /^-[a-zA-Z]*[lgonsiStcu]|^--(?:full-time|size|inode|sort|time)/.test(argument)) ? WITHOUT_DEVICE : ["mode"];
+	return SHELLS.has(image) || ["test", "[", "make", "xargs", "cp", "mv", "rm", "ln", "mkdir", "rmdir", "touch", "chmod"].includes(image) ? WITHOUT_DEVICE : undefined;
+}
+
+/** Walkers whose output never depends on the filesystem type fts reads to pick its traversal. */
+export const FILESYSTEM_TYPE_BLIND: ReadonlySet<string> = new Set(["find", "rm", "grep", "egrep", "fgrep"]);
 /** Shell text that reads what differs between runs: special parameters, time formats, the time keyword and job pids. */
 const VOLATILE_SHELL = /\$\{?(?:RANDOM|SRANDOM|BASHPID|SECONDS|EPOCHSECONDS|EPOCHREALTIME|PPID|\$|!)(?![A-Za-z0-9_])|%\(|(?:^|[\s;&|(])(?:times?|jobs)(?=[\s;&|)]|$)/;
 

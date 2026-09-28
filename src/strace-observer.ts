@@ -1,6 +1,6 @@
 import { open, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
-import { DEVICE_BLIND, repeatableExecutions, SHELLS, type TracedExecution } from "./deterministic-tools.ts";
+import { FILESYSTEM_TYPE_BLIND, repeatableExecutions, SHELLS, workspaceStatFields, type TracedExecution } from "./deterministic-tools.ts";
 import { containsLogicalPath } from "./path-utils.ts";
 import {
 	type DependencyRole,
@@ -595,7 +595,8 @@ export async function observeStrace(
 	// that this process can be repeated. Do not infer unused inputs from their absence here.
 	const taints = new Set<ProvenanceTaint>(["clock", "random"]), executions: TracedExecution[] = [], listingPIDs = new Set<number>();
 	const images = new Map<number, string>(); // Each process's program, inherited across a fork until it execs.
-	const deviceBlind = new Set<number>();
+	const statFields = new Map<number, readonly FilesystemObservationField[] | undefined>();
+	const opened = new Map<number, Set<number>>(); // Descriptors a process opened itself, whose status flags it chose.
 	const { journal: resourceJournal, handled: streamCalls, retained, finalHandles } = options.inheritedHandles?.length || options.inheritedStreams?.length
 		? resourceTransitions(selected, root.file.pid, options) : { journal: [], handled: new Set<TraceLine>(), retained: [], finalHandles: [] };
 	const interposedExecutables = new Map((options.interposedExecutables ?? []).map(([intercepted, original]) => [path.posix.resolve(intercepted), path.posix.resolve(original)]));
@@ -619,7 +620,11 @@ export async function observeStrace(
 			const line = file.lines[index]!;
 			if (!line) continue;
 			const spawned = spawnedPID(line);
-			if (spawned && images.has(pid)) { images.set(spawned, images.get(pid)!); if (deviceBlind.has(pid)) deviceBlind.add(spawned); }
+			if (spawned && images.has(pid)) { images.set(spawned, images.get(pid)!); statFields.set(spawned, statFields.get(pid)); }
+			if (spawned) opened.set(spawned, new Set(opened.get(pid)));
+			const own = opened.get(pid) ?? opened.set(pid, new Set()).get(pid)!, result = Number.parseInt(line.result ?? "", 10);
+			if (/^(?:open|openat|openat2|creat)$/.test(line.name) && Number.isSafeInteger(result) && result >= 0) own.add(result);
+			else if (line.name === "close") own.delete(Number.parseInt(line.args[0] ?? "", 10));
 			if (line.failure) { complete = false; incompleteReasons.add(line.failure); continue; }
 			const syscall = line.name;
 			if (!syscall) continue;
@@ -634,7 +639,11 @@ export async function observeStrace(
 			const streamCall = streamCalls.has(line);
 			if (stream && /^(?:read|write|readv|writev|sendto|recvfrom|sendfile|vmsplice)$/.test(syscall) && !streamCall) taints.add("unsupported_syscall");
 			if (options.inheritedStreams?.length && /^(?:poll|ppoll|select|pselect6|epoll_.*)$/.test(syscall) && !streamCall) taints.add("unsupported_syscall");
-			if (NETWORK_SYSCALLS.has(syscall) && !nonSocketQuery(line) && !streamCall) taints.add("network");
+			// A local socket reaches another process only once connected: a refused path (an NSS cache that is absent here) is a
+			// pathname dependency, validated absent where the Actor runs.
+			const refused = syscall === "connect" && /^-1 (?:ENOENT|ECONNREFUSED|EACCES)\b/.test(line.result) ? /\bsun_path="(\/[^"]+)"/.exec(line.args[1] ?? "")?.[1] : undefined;
+			if (refused) { if (!paths.has(refused)) paths.set(refused, "input"); continue; }
+			if (NETWORK_SYSCALLS.has(syscall) && !nonSocketQuery(line) && !streamCall && !(syscall === "socket" && /^AF_UNIX\b/.test(line.args[0] ?? ""))) taints.add("network");
 			if (IPC_SYSCALLS.has(syscall)) taints.add("ipc");
 			// Descriptor-local state is internal; reproduced OFD flags are sealed with their final offsets.
 			// Locks, leases, async notifications and owners require additional effect evidence.
@@ -643,7 +652,8 @@ export async function observeStrace(
 				const command = line.args[1] ?? "";
 				if (/^F_(?:OFD_)?(?:GETLK|SETLK|SETLKW)(?:64)?$/.test(command)) { if (!streamCall) taints.add("ipc"); }
 				else if (!/^F_(?:GETFD|SETFD|DUPFD|DUPFD_CLOEXEC)$/.test(command) &&
-					!((command === "F_GETFL" || command === "F_SETFL" && syscallSucceeded(line) &&
+					// A descriptor this process opened reports the flags it chose; an inherited one's flags need evidence.
+					!(command === "F_GETFL" && own.has(Number.parseInt(line.args[0] ?? "", 10))) && !((command === "F_GETFL" || command === "F_SETFL" && syscallSucceeded(line) &&
 						(line.args[2] ?? "").split("|").every(flag => /^(?:O_(?:RDONLY|WRONLY|RDWR|APPEND|NONBLOCK|NDELAY|LARGEFILE|DIRECTORY|DSYNC|SYNC|NOFOLLOW)|0)$/.test(flag))) &&
 						(options.inheritedFileImages?.includes(absoluteDescriptorPath(line.args[0]) ?? /^\d+<(pipe:\[\d+\])>$/.exec(line.args[0] ?? "")?.[1] ?? "") || stream)))
 					taints.add("unsupported_syscall");
@@ -663,7 +673,7 @@ export async function observeStrace(
 			// filesystem does not stand in for the workspace's.
 			if (/^f?statfs$/.test(syscall) && semanticRoots.length) {
 				const target = syscall === "statfs" ? syscallPaths(line, syscall, cwd)?.[0] : absoluteDescriptorPath(line.args[0]);
-				if (target && !semanticRoots.some((root) => containsLogicalPath(root, target))) continue;
+				if (target && (!semanticRoots.some((root) => containsLogicalPath(root, target)) || FILESYSTEM_TYPE_BLIND.has(images.get(pid) ?? ""))) continue;
 			}
 			const listed = /^getdents(?:64)?$/.test(syscall) ? absoluteDescriptorPath(line.args[0]) : undefined;
 			const directoryImage = !!listed && !!options.inheritedDirectoryImages?.includes(listed);
@@ -686,9 +696,9 @@ export async function observeStrace(
 				const metadataPaths = syscallPaths(line, syscall, cwd) ?? [];
 				// A directory descriptor's identity serves traversal (ls and fts track loops by it); printed metadata comes from path stats.
 				const directoryHandle = (syscall === "fstat" || !quotedArgument(line.args[1])) && /\bstx?_mode=S_IFDIR\b/.test(line.args[structure] ?? "");
-				// The sandbox serves the workspace from another device; a device-blind program's workspace stats never show it.
-				const blind = deviceBlind.has(pid) && metadataPaths.length > 0 && metadataPaths.every((target) => semanticRoots.some((root) => containsLogicalPath(root, target)));
-				const observed = statObservationDigest(line.args[structure] ?? "", directoryHandle ? ["mode"] : undefined, blind);
+				// Only the fields a program reveals of a workspace file are its dependency (see workspaceStatFields).
+				const workspace = metadataPaths.length > 0 && metadataPaths.every((target) => semanticRoots.some((root) => containsLogicalPath(root, target)));
+				const observed = statObservationDigest(line.args[structure] ?? "", directoryHandle ? ["mode"] : undefined, workspace ? statFields.get(pid) : undefined);
 				if (!metadataPaths.length || !observed) {
 					// fstat, or an empty *at name, of a pipe or socket
 					if (descriptorTarget(line) && !quotedArgument(line.args[1])) taints.add("descriptor_observation");
@@ -704,7 +714,7 @@ export async function observeStrace(
 			if (successfulExec(line)) {
 				const execution = tracedExecution(pid, line, cwd), image = path.posix.basename(execution.path ?? "");
 				executions.push(execution); images.set(pid, image);
-				if (DEVICE_BLIND.has(image) && !execution.argv.some((argument) => argument.includes("%D"))) deviceBlind.add(pid); else deviceBlind.delete(pid);
+				statFields.set(pid, workspaceStatFields(image, execution.argv));
 			}
 			if (!PATH_ARGUMENTS[syscall]) continue;
 			const role: DependencyRole = syscall === "execve" || syscall === "execveat" ? "executable" : "input";
@@ -963,10 +973,10 @@ const STATX_FIELD_MASKS: Readonly<Record<string, readonly FilesystemObservationF
 	STATX_INO: ["ino"], STATX_SIZE: ["size"], STATX_BLOCKS: ["blocks"], STATX_BASIC_STATS: FILESYSTEM_OBSERVATION_FIELDS, STATX_ALL: FILESYSTEM_OBSERVATION_FIELDS,
 	...Object.fromEntries(["MNT_ID", "MNT_ID_UNIQUE", "BTIME", "DIOALIGN", "DIO_READ_ALIGN", "SUBVOL", "WRITE_ATOMIC"].map((flag) => [`STATX_${flag}`, []])) };
 
-function statObservationDigest(structure: string, only?: readonly FilesystemObservationField[], withoutDevice = false): StatObservation | undefined {
+function statObservationDigest(structure: string, only?: readonly FilesystemObservationField[], revealed?: readonly FilesystemObservationField[]): StatObservation | undefined {
 	const flags = /\bstx_mask=([A-Z_|0-9x]+)/.exec(structure)?.[1]?.split("|");
 	const requested = only ?? (flags?.every((flag) => STATX_FIELD_MASKS[flag]) ? flags.flatMap((flag) => STATX_FIELD_MASKS[flag]!) : undefined);
-	const mask = withoutDevice ? (requested ?? FILESYSTEM_OBSERVATION_FIELDS).filter((field) => field !== "dev") : requested;
+	const mask = revealed ? (requested ?? FILESYSTEM_OBSERVATION_FIELDS).filter((field) => revealed.includes(field)) : requested;
 	const line = structure.replace(/\bstx_(r?dev)_major=(\w+), stx_\1_minor=(\w+)/g, "st_$1=makedev($2, $3)")
 		.replace(/\bstx_([amc]time)=\{tv_sec=(-?\d+), tv_nsec=(\d+)\}/g, "st_$1=$2, st_$1_nsec=$3").replace(/\bstx_/g, "st_");
 	const field = (name: string): bigint | undefined => parseInteger(new RegExp(`\\b${name}=(-?(?:0x[0-9a-f]+|0[0-7]+|[0-9]+))`, "i").exec(line)?.[1]);

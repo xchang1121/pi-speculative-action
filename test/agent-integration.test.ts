@@ -26,11 +26,7 @@ import { toolErrorSettlement, type ToolInvocation, type ToolSettlement } from ".
 import { summarizeSpeculativeTrace } from "../src/trace-summary.ts";
 import { ResourceVersionManager } from "../src/resource-version.ts";
 import { WorkspaceSandboxService } from "../src/workspace-sandbox.ts";
-import {
-	normalizeSelfSpeculationSettings,
-	SELF_SPECULATION_DEFAULTS,
-	SelfSpeculationCoordinator,
-} from "../src/self-speculation.ts";
+import { normalizeSelfSpeculationSettings, SELF_SPECULATION_DEFAULTS, SelfSpeculationCoordinator } from "../src/self-speculation.ts";
 
 const directories = temporaryDirectories("pi-spec-host-");
 const readSchema = Type.Object({ path: Type.String(), offset: Type.Optional(Type.Number()), limit: Type.Optional(Type.Number()) });
@@ -451,10 +447,7 @@ describe("speculative action host", () => {
 						{ turnID, id: `actor-${toolName}`, tool: toolName, args, tools: [tool] },
 						undefined,
 						actorExecution,
-					).then((value) => {
-						settled = true;
-						return value;
-					});
+					).then((value) => { settled = true; return value; });
 					if (phase === "running") {
 						await nextTurn();
 						expect(settled, `${toolName} should join its running candidate`).toBe(false);
@@ -505,10 +498,7 @@ describe("speculative action host", () => {
 					await host.startTurn(startInput(tool, `${turnID}:without-predictions`));
 					await host.finishTurn(`${turnID}:without-predictions`, true);
 					expect(prepareWorld).not.toHaveBeenCalled();
-				} finally {
-					release();
-					await host.dispose();
-				}
+				} finally { release(); await host.dispose(); }
 			}
 		}
 	});
@@ -1483,10 +1473,7 @@ describe("speculative action host", () => {
 		const load = PatternAwareStore.prototype.load;
 		const observer = vi.spyOn(PatternAwareStore.prototype, "load").mockImplementation(async function (this: PatternAwareStore) {
 			stores.push(this);
-			if (stores.length === 2) {
-				await loading.wait();
-				if (phase.includes("load failure")) throw new Error("load failed");
-			}
+			if (stores.length === 2) { await loading.wait(); if (phase.includes("load failure")) throw new Error("load failed"); }
 			return load.call(this);
 		});
 		const controller = createPatternPlanSource({ sessionID: "session", cwd, stateDirectory: cwd,
@@ -1710,10 +1697,7 @@ describe("speculative action host", () => {
 			executionWorlds: [{ ...world, speculation: { ...world.speculation, prepare } }],
 			onTurnStarted: ({ turnID, actorModel, context, decisionSequence }) =>
 				coordinator.startTurn(turnID, actorModel, context, decisionSequence),
-			onCandidateMaterialized: (candidate) => {
-				materialized.push(candidate);
-				coordinator.addCandidate(candidate);
-			},
+			onCandidateMaterialized: (candidate) => { materialized.push(candidate); coordinator.addCandidate(candidate); },
 			onActorActionMaterialized: ({ action }) => coordinator.observeActorAction(action),
 			onActorActionSettled: ({ settlement }) => coordinator.observeActorSettlement(settlement),
 			onPredictionSettled: (feedback) => coordinator.observePredictionSettlement(feedback),
@@ -1941,10 +1925,7 @@ async function patternRebaseFixture() {
 	const cwd = await temporaryWorkspace();
 	const patternSettings = { ...PATTERN_AWARE_DEFAULTS, minOccurrences: 2, multiStepEnabled: true };
 	const patternStore = new PatternAwareStore(patternSettings);
-	for (const [trainingSession, filePath] of [
-		["training-a", "alpha.txt"],
-		["training-b", "beta.txt"],
-	] as const) {
+	for (const [trainingSession, filePath] of [["training-a", "alpha.txt"], ["training-b", "beta.txt"]] as const) {
 		patternStore.observe({
 			sessionID: trainingSession,
 			turnID: `${trainingSession}:scan`,
