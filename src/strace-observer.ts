@@ -1,5 +1,6 @@
 import { open, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
+import { repeatableExecutions, type TracedExecution } from "./deterministic-tools.ts";
 import { containsLogicalPath } from "./path-utils.ts";
 import {
 	type DependencyRole,
@@ -69,17 +70,10 @@ export interface StraceObservationOptions {
 	readonly inheritedHandles?: readonly { readonly fd: number; readonly installed?: false; readonly description?: number; readonly inode: string; readonly flags: number; readonly outside: number; readonly queuedBytes?: number; readonly queueData?: Buffer; readonly packet?: boolean; readonly messages?: readonly import("./linux-held-exec.ts").QueueMessage[] }[];
 }
 
-interface TraceFile {
-	readonly pid: number;
-	readonly lines: readonly TraceLine[];
-	readonly terminated: boolean;
-}
+interface TraceFile { readonly pid: number; readonly lines: readonly TraceLine[]; readonly terminated: boolean; }
 
 type TraceRoot = { readonly file: TraceFile; readonly start: number };
-interface TraceProcess extends TraceRoot {
-	readonly cwd: string | undefined;
-	readonly fs: { shared: boolean; changed: boolean };
-}
+interface TraceProcess extends TraceRoot { readonly cwd: string | undefined; readonly fs: { shared: boolean; changed: boolean }; }
 interface TraceLine {
 	readonly order?: number;
 	readonly name: string;
@@ -127,10 +121,7 @@ function parseTraceLine(line: string): TraceLine {
 		}
 		if (")]}".includes(character)) {
 			if (stack.pop() !== character) return failure;
-		} else if (character === "," && !stack.length) {
-			args.push(line.slice(start, index).trim());
-			start = index + 1;
-		}
+		} else if (character === "," && !stack.length) { args.push(line.slice(start, index).trim()); start = index + 1; }
 	}
 	return failure;
 }
@@ -147,10 +138,7 @@ function reassembleSyscalls(lines: readonly string[], pid: number, order?: reado
 			continue;
 		}
 		const resumed = /^\s*<\.\.\.\s*([a-zA-Z0-9_]+) resumed>(.*)$/.exec(line);
-		if (!resumed) {
-			append(line);
-			continue;
-		}
+		if (!resumed) { append(line); continue; }
 		const name = resumed[1]!;
 		const queue = pending.get(name);
 		const prefix = queue?.shift();
@@ -605,7 +593,7 @@ export async function observeStrace(
 	// Native instructions and ELF startup state expose clock/random inputs without a syscall.
 	// A complete transcript therefore permits only the existing one-shot transfer, never proof
 	// that this process can be repeated. Do not infer unused inputs from their absence here.
-	const taints = new Set<ProvenanceTaint>(["clock", "random"]);
+	const taints = new Set<ProvenanceTaint>(["clock", "random"]), executions: TracedExecution[] = [], listingPIDs = new Set<number>();
 	const { journal: resourceJournal, handled: streamCalls, retained, finalHandles } = options.inheritedHandles?.length || options.inheritedStreams?.length
 		? resourceTransitions(selected, root.file.pid, options) : { journal: [], handled: new Set<TraceLine>(), retained: [], finalHandles: [] };
 	const interposedExecutables = new Map((options.interposedExecutables ?? []).map(([intercepted, original]) => [path.posix.resolve(intercepted), path.posix.resolve(original)]));
@@ -624,11 +612,7 @@ export async function observeStrace(
 		// -ff files cannot order another task's chdir against this task's pathname lookup.
 		if (fs.changed) { complete = false; incompleteReasons.add("shared_cwd_mutation"); continue; }
 		let cwd = initial;
-		if (!cwd) {
-			complete = false;
-			incompleteReasons.add(`cwd_unknown:${pid}`);
-			cwd = path.posix.resolve(initialCwd);
-		}
+		if (!cwd) { complete = false; incompleteReasons.add(`cwd_unknown:${pid}`); cwd = path.posix.resolve(initialCwd); }
 		for (let index = start; index < file.lines.length; index++) {
 			if (ignoredSegments.get(pid)?.some(([from, to]) => index >= from && index < to)) continue;
 			const line = file.lines[index]!;
@@ -682,7 +666,7 @@ export async function observeStrace(
 			const directoryImage = !!listed && !!options.inheritedDirectoryImages?.includes(listed);
 			// A listed directory's entry set is its dependency; readdir order and d_ino are volatile identity, as a descriptor's is.
 			const listing = !!listed && !directoryImage && syscallSucceeded(line);
-			if (listing) { taints.add("descriptor_observation"); if (paths.get(listed!) !== "executable") paths.set(listed!, "input"); }
+			if (listing) { taints.add("descriptor_observation"); listingPIDs.add(pid); if (paths.get(listed!) !== "executable") paths.set(listed!, "input"); }
 			if (UNMODELED_METADATA_SYSCALLS.has(syscall) && !listing && (syscallSucceeded(line) ? !directoryImage : directoryImage)) {
 				taints.add("unsupported_syscall");
 				incompleteReasons.add(`unmodeled_metadata:${syscall}:${pid}`);
@@ -709,6 +693,7 @@ export async function observeStrace(
 				}
 				continue;
 			}
+			if (successfulExec(line)) executions.push(tracedExecution(pid, line, cwd));
 			if (!PATH_ARGUMENTS[syscall]) continue;
 			const role: DependencyRole = syscall === "execve" || syscall === "execveat" ? "executable" : "input";
 			const observedPaths = syscallPaths(line, syscall, cwd);
@@ -724,6 +709,8 @@ export async function observeStrace(
 		}
 	}
 	if (!complete) taints.add("trace_incomplete");
+	// Chosen tools cannot pass their one-shot inputs on to output: the transcript may be replayed across turns.
+	else if (repeatableExecutions(executions, listingPIDs, semanticRoots)) for (const taint of ONE_SHOT_TAINTS) taints.delete(taint);
 	return {
 		complete,
 		...(options.inheritedHandles || options.inheritedStreams ? { resourceJournal: resourceJournal.sort((a, b) => a.order - b.order).map(({ order, ...event }) => event), retainedDescriptions: retained,
@@ -786,18 +773,10 @@ function unmodeledFileIoctl(line: TraceLine): boolean {
 	return UNMODELED_MUTATING_IOCTL.test(line.args[1] ?? "") || absoluteDescriptorPath(line.args[0]) !== undefined;
 }
 
-function workspaceDriverSemanticGap(
-	line: TraceLine,
-	syscall: string,
-	cwd: string,
-	roots: readonly string[],
-): boolean {
+function workspaceDriverSemanticGap(line: TraceLine, syscall: string, cwd: string, roots: readonly string[]): boolean {
 	if (!DRIVER_SEMANTIC_GAP_RESULT.test(line.result)) return false;
 	const referenced = new Set(syscallPaths(line, syscall, cwd));
-	for (const argument of line.args) {
-		const target = absoluteDescriptorPath(argument);
-		if (target) referenced.add(target);
-	}
+	for (const argument of line.args) { const target = absoluteDescriptorPath(argument); if (target) referenced.add(target); }
 	return [...referenced].some((candidate) => roots.some((root) => containsLogicalPath(root, candidate)));
 }
 
@@ -875,6 +854,18 @@ function tracedCwd(line: TraceLine, cwd: string | undefined): string | undefined
 
 function tracedPath(target: string, cwd: string | undefined): string | undefined {
 	return path.posix.isAbsolute(target) ? path.posix.resolve(target) : cwd ? path.posix.resolve(cwd, target) : undefined;
+}
+
+const ONE_SHOT_TAINTS: readonly ProvenanceTaint[] = ["clock", "random", "pid_observation", "descriptor_observation"];
+
+function tracedExecution(pid: number, line: TraceLine, cwd: string): TracedExecution {
+	try {
+		const image = line.name === "execve" ? quotedArgument(line.args[0]) : undefined, argv = line.args[line.name === "execve" ? 1 : 2] ?? "";
+		return { pid, ...(image ? { path: tracedPath(image, cwd) } : {}),
+			argv: /^\[.*\]$/su.test(argv) ? [...argv.matchAll(/"((?:\\.|[^"\\])*)"/g)].map((match) => decodeCString(match[1]!)) : [] };
+	} catch {
+		return { pid, argv: [] }; // Undecodable arguments prove nothing.
+	}
 }
 
 function successfulExec(line: TraceLine): boolean {

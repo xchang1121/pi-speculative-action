@@ -27,6 +27,26 @@ async function observe(processes: Record<number, readonly string[]>, options?: S
 }
 
 describe("strace provenance decoder", () => {
+	test("replays across turns only a transcript of whitelisted system tools that cannot pass on the clock, randomness or readdir order", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-repeatable-")), prefix = path.join(root, "process");
+		const exec = (image: string, ...argv: string[]) => `execve("${image}", ${JSON.stringify([path.posix.basename(image), ...argv])}, 0x0) = 0`;
+		const run = async (script: string, children: readonly (readonly string[])[], roots: readonly string[] = ["/work"]) => {
+			await fs.rm(root, { recursive: true, force: true }); await fs.mkdir(root);
+			await fs.writeFile(`${prefix}.100`, [exec("/bin/bash", "-c", script), "getpid() = 100",
+				...children.map((_, index) => `clone(child_stack=NULL, flags=SIGCHLD) = ${101 + index}`), "+++ exited with 0 +++"].join("\n"));
+			for (const [index, lines] of children.entries()) await fs.writeFile(`${prefix}.${101 + index}`, [...lines, "+++ exited with 0 +++"].join("\n"));
+			return (await observeStrace(prefix, "/bin/bash", "/work", { guardFilesystemSemanticsWithin: roots })).taints;
+		};
+		const listing = "getdents64(3</work/src>, [], 512) = 0";
+		try {
+			expect(await run("cat a | grep x", [[exec("/usr/bin/cat", "a")], [exec("/usr/bin/grep", "x")]])).toEqual([]);
+			expect(await run("ls src && git -C /work status", [[exec("/usr/bin/ls", "src"), listing], [exec("/usr/bin/git", "-C", "/work", "status")]])).toEqual([]);
+			for (const [script, children, roots] of [["echo $RANDOM", []], ["find . -mmin 5", [[exec("/usr/bin/find", ".", "-mmin", "5")]]],
+				["./cat a", [[exec("/work/cat", "a")]]], ["grep -r x src", [[exec("/usr/bin/grep", "-r", "x", "src"), listing]]],
+				["git commit -m x", [[exec("/usr/bin/git", "commit", "-m", "x")]]], ["cat a", [[exec("/usr/bin/cat", "a")]], []]] as const)
+				expect(await run(script, children, roots), script).toEqual(expect.arrayContaining(["clock", "random"]));
+		} finally { await fs.rm(root, { recursive: true, force: true }); }
+	});
 	test("accepts directory enumeration with its exact broker image, or as an entry-set dependency with volatile order", async () => {
 		for (const syscall of ["getdents", "getdents64"]) for (const configured of [false, true]) for (const failed of [false, true]) {
 			const observation = await observe({ 100: [EXEC, `${syscall}(10</work/anchor>, [], 512) = ${failed ? "-1 EINVAL (Invalid argument)" : "0"}`] }, {
