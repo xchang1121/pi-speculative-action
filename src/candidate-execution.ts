@@ -136,12 +136,7 @@ export class CandidateExecution<Output> {
 		};
 	}
 
-	private finish(
-		status: "failed" | "cancelled",
-		cause: ResolutionCause,
-		completedAt: number,
-		executionMs: number,
-	): boolean {
+	private finish(status: "failed" | "cancelled", cause: ResolutionCause, completedAt: number, executionMs: number): boolean {
 		if (this.executionValue.status !== "queued" && this.executionValue.status !== "running") return false;
 		const startedAt = this.executionValue.status === "running" ? this.executionValue.startedAt : undefined;
 		const settlement: CandidateExecutionSettlement<Output> = Object.freeze({

@@ -19,6 +19,7 @@ import {
 	readdir,
 	realpath,
 	rm,
+	stat,
 	writeFile,
 } from "node:fs/promises";
 import net from "node:net";
@@ -307,6 +308,8 @@ export class LinuxProcessReuseBackend {
 	private readonly processScheduler = new SpeculationScheduler<object>();
 	/** Recent traced run times of nested children by executable, the longest kept: a cheap child never repays its own sandbox. */
 	private readonly childRunMs = new BoundedRecencyMap<string, readonly number[]>(512);
+	/** Executable entries of a PATH directory, by the directory's identity and the exclusions (see createProcessInterposition). */
+	private readonly executableEntries = new BoundedRecencyMap<string, readonly string[]>(64);
 	private readonly counters: MutableLinuxProcessReuseMetrics = { ...emptyWorldReuseMetrics() };
 	private readonly actorCounters: MutableLinuxProcessReuseMetrics = { ...emptyWorldReuseMetrics() };
 	private readonly replayWorkspace = new WorkspaceSandboxService();
@@ -570,6 +573,7 @@ export class LinuxProcessReuseBackend {
 					socketPath,
 					dispatcherBinary: ready.dispatcher,
 					excludedExecutables: [input.invocation.shell, process.execPath, ready.dispatcher, ready.sandlock, ready.strace],
+					executableEntries: this.executableEntries,
 				}).then(interposition => {
 					session.signal?.throwIfAborted();
 					session.interposition = interposition;
@@ -2154,6 +2158,7 @@ async function createProcessInterposition(input: {
 	readonly socketPath: string;
 	readonly dispatcherBinary: string;
 	readonly excludedExecutables: readonly string[];
+	readonly executableEntries: BoundedRecencyMap<string, readonly string[]>;
 }) {
 	const root = path.join(input.privateRoot, "process-interposition");
 	const viewRoot = path.join(root, "views");
@@ -2213,8 +2218,11 @@ async function createProcessInterposition(input: {
 				{ mode: 0o600 },
 			);
 		}
-		let entries: string[];
+		let entries: string[], identity: string;
 		try {
+			// Adding, removing or renaming an entry changes the directory's times; a stale list only leaves a new entry native.
+			const info = await stat(source, { bigint: true });
+			identity = [source, info.dev, info.ino, info.mtimeNs, info.ctimeNs, ...[...excluded].sort()].join("\0");
 			entries = await readdir(source);
 		} catch {
 			continue;
@@ -2223,20 +2231,26 @@ async function createProcessInterposition(input: {
 		// executables) stays native as a whole rather than overflow ARG_MAX.
 		const bytes = aliases.reduce((sum, { target, view }) => sum + entries.reduce((total, name) => total + 2 * name.length + target.length + view.length + 16, 0), 0);
 		if ((mountBytes += bytes) > MAX_INTERPOSED_MOUNT_BYTES) { mountBytes -= bytes; continue; }
-		// Each physical entry is probed once; aliases retain independent exec-only mappings.
+		// Each physical entry is probed once per directory state; aliases retain independent exec-only mappings.
 		// Bound preparation and settle every alias link before capturing directory evidence.
-		await mapFilesystem(entries, async (name) => {
+		let executableNames = input.executableEntries.get(identity);
+		if (!executableNames) {
+			const probed: string[] = [];
+			await mapFilesystem(entries, async (name) => {
+				input.signal?.throwIfAborted();
+				if (!name || name === ".pi-spec-dispatch" || name.includes("/") || name.includes("\0")) return;
+				const sourceEntry = path.join(source, name);
+				try {
+					const resolved = await realpath(sourceEntry);
+					if ((await lstat(resolved)).isFile() && !excluded.has(resolved)) { await access(sourceEntry, fsConstants.X_OK); probed.push(name); }
+				} catch {
+					// Unproved entries remain visible through the original directory.
+				}
+			});
+			input.executableEntries.set(identity, executableNames = probed);
+		}
+		await mapFilesystem(executableNames, async (name) => {
 			input.signal?.throwIfAborted();
-			if (!name || name === ".pi-spec-dispatch" || name.includes("/") || name.includes("\0")) return;
-			const sourceEntry = path.join(source, name);
-			try {
-				const resolved = await realpath(sourceEntry);
-				const resolvedStat = await lstat(resolved);
-				if (!resolvedStat.isFile() || excluded.has(resolved)) return;
-				await access(sourceEntry, fsConstants.X_OK);
-			} catch {
-				return; // Unproved entries remain visible through the original directory.
-			}
 			for (const directory of aliases) {
 				const viewEntry = path.join(directory.view, name);
 				try {

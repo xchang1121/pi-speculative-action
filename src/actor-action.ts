@@ -96,11 +96,7 @@ export class ActorAction<Candidate extends { readonly id: string } = { readonly 
 			return false;
 		}
 		this.rejections.push(
-			Object.freeze({
-				candidateID,
-				match: Object.freeze({ ...match }),
-				cause: Object.freeze({ ...failure }),
-			}),
+			Object.freeze({ candidateID, match: Object.freeze({ ...match }), cause: Object.freeze({ ...failure }) }),
 		);
 		return this.setFallback(failure, candidateID);
 	}
@@ -148,17 +144,11 @@ export class ActorAction<Candidate extends { readonly id: string } = { readonly 
 	): PredictionAdoption | undefined {
 		if (this.stateValue.status !== "matching") return undefined;
 		if (fallback) this.setFallback(fallback);
-		this.stateValue = Object.freeze({
-			status: "awaiting_fallback",
-			matchedPredictions: freezePredictions(matchedPredictions),
-		});
+		this.stateValue = Object.freeze({ status: "awaiting_fallback", matchedPredictions: freezePredictions(matchedPredictions) });
 		return { status: "rejected", ...this.fallbackValue };
 	}
 
-	settleActor(
-		execution: TimelineInterval,
-		isError: boolean,
-	): ActorActionSettlement | undefined {
+	settleActor(execution: TimelineInterval, isError: boolean): ActorActionSettlement | undefined {
 		if (this.stateValue.status !== "awaiting_fallback") return undefined;
 		const toolExecution = TimelineInterval.from(execution);
 		const duration = toolExecution.completedAt - toolExecution.startedAt;
