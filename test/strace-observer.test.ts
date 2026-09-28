@@ -148,12 +148,24 @@ describe("strace provenance decoder", () => {
 			{ path: "/work/link", role: "metadata", followSymlinks: false, digest: STAT_DIGEST }, { path: "/work/file.txt", role: "metadata", followSymlinks: true, digest: STAT_DIGEST }]);
 		// ls asks only for the type: its observation covers the fields the mask reports, beside a full stat of the same path.
 		const partial = (mask: string) => `statx(AT_FDCWD</work>, "file.txt", AT_STATX_SYNC_AS_STAT, STATX_MODE, ${STATX.replace("STATX_BASIC_STATS|STATX_MNT_ID", mask).replace(/, stx_[mc]time=\{[^}]+\}/g, "")}) = 0`;
-		const fields = ["dev", "mode", "rdev", "blksize"] as const;
+		const fields = ["mode"] as const;
 		expect((await observe({ 100: [EXEC, partial("STATX_TYPE|STATX_MODE|STATX_MNT_ID"), `newfstatat(AT_FDCWD, "/work/file.txt", ${STAT}, 0) = 0`] })).paths).toEqual([
 			{ path: "/usr/bin/example", role: "executable" },
-			{ path: "/work/file.txt", role: "metadata", followSymlinks: true, fields, digest: filesystemObservationDigest({ dev: 1n, mode: 0o100644n, rdev: 0n, blksize: 4096n }, fields) },
+			{ path: "/work/file.txt", role: "metadata", followSymlinks: true, fields, digest: filesystemObservationDigest({ mode: 0o100644n }, fields) },
 			{ path: "/work/file.txt", role: "metadata", followSymlinks: true, digest: STAT_DIGEST }]);
 		expect((await observe({ 100: [EXEC, partial("STATX_TYPE|0x40000")] })).incompleteReasons).toEqual(["unparsed_metadata:statx:100"]);
+	});
+
+	test("keeps a directory handle's identity and a shell's $PWD checks out of metadata dependencies", async () => {
+		const directory = STAT.replace("S_IFREG|0644", "S_IFDIR|0755");
+		expect((await observe({ 100: [EXEC, `fstat(3</work/src>, ${directory}) = 0`] })).paths).toContainEqual(
+			{ path: "/work/src", role: "metadata", followSymlinks: true, fields: ["mode"], digest: filesystemObservationDigest({ mode: 0o40755n }, ["mode"]) });
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-shell-stat-")), prefix = path.join(root, "process");
+		try {
+			await fs.writeFile(`${prefix}.100`, ['execve("/bin/bash", ["bash", "-c", "true"], 0x0) = 0', `newfstatat(AT_FDCWD, ".", ${directory}, 0) = 0`,
+				`newfstatat(AT_FDCWD, "a.txt", ${STAT}, 0) = 0`, "+++ exited with 0 +++"].join("\n"));
+			expect((await observeStrace(prefix, "/bin/bash", "/work")).paths.filter((item) => item.role === "metadata").map((item) => item.path)).toEqual(["/work/a.txt"]);
+		} finally { await fs.rm(root, { recursive: true, force: true }); }
 	});
 
 	test("binds reassembled descendants to copied or proven-stable shared cwd contexts", async () => {

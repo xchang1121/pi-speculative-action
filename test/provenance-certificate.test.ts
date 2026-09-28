@@ -40,7 +40,7 @@ describe("process provenance certificates", () => {
 		expect(observed.status === "stale" ? processStrongKey(certificate.weakKey, { complete: true, dependencies: observed.dependencies, taints: [] }) : observed.status).toMatch(/^sha256:/);
 	});
 	it("validates a partial metadata observation on exactly its fields", async () => {
-		const root = await workspace(), target = path.join(root, "partial.txt"), fields = ["dev", "mode", "rdev", "blksize"] as const;
+		const root = await workspace(), target = path.join(root, "partial.txt"), fields = ["mode"] as const;
 		await writeFile(target, "a");
 		const dependency = await captureMetadataDependency(target, "/workspace/partial.txt", true, fields);
 		const validate = () => validateDynamicDependencyCertificate({ complete: true, dependencies: [dependency], taints: [] }, { resolvePath: () => target });

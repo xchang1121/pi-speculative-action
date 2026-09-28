@@ -23,7 +23,7 @@ const TOOLS: Readonly<Record<string, ToolRule>> = {
 	git: { sortsListings: true, rejected: /^--(?:relative-date|date=relative|since|until|after|before|min-age|max-age)\b/,
 		subcommands: new Set(["status", "diff", "log", "show", "rev-parse", "ls-files", "branch", "grep", "blame", "cat-file"]) },
 };
-const SHELLS = new Set(["bash", "sh", "dash"]);
+export const SHELLS: ReadonlySet<string> = new Set(["bash", "sh", "dash"]);
 /** Shell text that reads what differs between runs: special parameters, time formats, the time keyword and job pids. */
 const VOLATILE_SHELL = /\$\{?(?:RANDOM|SRANDOM|BASHPID|SECONDS|EPOCHSECONDS|EPOCHREALTIME|PPID|\$|!)(?![A-Za-z0-9_])|%\(|(?:^|[\s;&|(])(?:times?|jobs)(?=[\s;&|)]|$)/;
 
