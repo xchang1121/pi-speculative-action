@@ -64,6 +64,24 @@ describe("workspace-branch ExecutionWorld", () => {
 			} finally { await child.dispose(); }
 		} finally { await branch.dispose(); }
 	});
+	it("edits in memory over the workspace itself, committing only unchanged inputs and refusing late requests", async () => {
+		const root = await temporaryRoot(), file = path.join(root, "a.txt"), world = sandbox.createExecutionWorld();
+		await writeFile(file, "one two\n");
+		const edit = () => world.speculation.execute(context(root, "edit", editTool, { path: "a.txt", edits: [{ oldText: "two", newText: "three" }] }));
+		const branch = await edit();
+		expect([await readFile(file, "utf8"), branch.resources, await readdir(root)]).toEqual(["one two\n", ["a.txt"], ["a.txt"]]);
+		await branch.commit(); await branch.dispose();
+		expect(await readFile(file, "utf8")).toBe("one three\n");
+		await writeFile(file, "one two\n");
+		const stale = await edit();
+		await writeFile(file, "one two!\n");
+		await expect(stale.commit()).rejects.toThrow("resource changed before commit");
+		expect(await readFile(file, "utf8")).toBe("one two!\n");
+		let outlet: Parameters<NonNullable<ToolInvocation["filesystem"]>>[0] | undefined;
+		await world.speculation.execute(boundContext(root, async (view) => { outlet = view; return settlement("done"); }));
+		await expect(outlet!.writeFile!(file, "late")).rejects.toThrow("execution lifetime is closed");
+	});
+
 	it("keeps other spellings of its private .git out of the view on case-insensitive volumes", async ({ skip }) => {
 		if (process.platform !== "win32" && process.platform !== "darwin") return skip("case-sensitive volume");
 		const root = await temporaryRoot(), world = sandbox.createExecutionWorld({ driver: "git" });
@@ -599,7 +617,7 @@ describe("workspace-branch ExecutionWorld", () => {
 		const input = path.join(root, "input.txt"), target = path.join(root, "output.txt");
 		const directory = path.join(root, "readable"); await mkdir(directory);
 		await writeFile(path.join(directory, "keep"), "");
-		const world = sandbox.createExecutionWorld();
+		const world = sandbox.createExecutionWorld({ inPlaceMutations: false });
 		const changesSince = ResourceVersionManager.prototype.changesSince;
 		let delayed = false;
 		const notifications = vi.spyOn(ResourceVersionManager.prototype, "changesSince").mockImplementation(function (this: ResourceVersionManager, token) {
@@ -1307,7 +1325,7 @@ describe("workspace-branch ExecutionWorld", () => {
 
 	it("drains admitted file requests and refuses cancelled or swallowed failures", async () => {
 		const root = await temporaryRoot();
-		const target = path.join(root, "held.txt"), world = sandbox.createExecutionWorld();
+		const target = path.join(root, "held.txt"), world = sandbox.createExecutionWorld({ inPlaceMutations: false });
 		try {
 			const controller = new AbortController(); controller.abort(new Error("cancelled"));
 			await expect(sandbox.prepare(root, { signal: controller.signal })).rejects.toThrow("cancelled");

@@ -16,11 +16,7 @@ export type ResolutionStage =
 	| "control";
 
 /** Machine-readable classification. Human diagnostics never participate in policy. */
-export interface ResolutionCause {
-	readonly stage: ResolutionStage;
-	readonly code: string;
-	readonly detail?: string;
-}
+export interface ResolutionCause { readonly stage: ResolutionStage; readonly code: string; readonly detail?: string; }
 
 export interface ValidationMetrics {
 	readonly durationMs: number;
@@ -65,22 +61,11 @@ export interface ActorActionIdentity {
 }
 
 export type PredictionAdoption =
-	| {
-			readonly status: "adopted";
-			readonly candidateID: string;
-	  }
-	| {
-			readonly status: "rejected";
-			readonly candidateID?: string;
-			readonly cause: ResolutionCause;
-	  };
+	| { readonly status: "adopted"; readonly candidateID: string; }
+	| { readonly status: "rejected"; readonly candidateID?: string; readonly cause: ResolutionCause; };
 
 export type PredictionSettlement =
-	| {
-			readonly prediction: PredictionIdentity;
-			readonly observation: "unobserved";
-			readonly cause: ResolutionCause;
-	  }
+	| { readonly prediction: PredictionIdentity; readonly observation: "unobserved"; readonly cause: ResolutionCause; }
 	| {
 			readonly prediction: PredictionIdentity;
 			readonly observation: "observed";
@@ -91,11 +76,7 @@ export type PredictionSettlement =
 			readonly prediction: PredictionIdentity;
 			readonly observation: "observed";
 			readonly actorAction: ActorActionIdentity;
-			readonly match: {
-				readonly matched: true;
-				readonly relation: ActionKeyMatch;
-				readonly adoption: PredictionAdoption;
-			};
+			readonly match: { readonly matched: true; readonly relation: ActionKeyMatch; readonly adoption: PredictionAdoption; };
 	  };
 
 export type SourceRequestSettlement =
@@ -125,11 +106,7 @@ export interface SettledSourceRequest {
 	readonly draftTokens?: number;
 }
 
-export interface CandidateRejection {
-	readonly candidateID: string;
-	readonly match: ActionKeyMatch;
-	readonly cause: ResolutionCause;
-}
+export interface CandidateRejection { readonly candidateID: string; readonly match: ActionKeyMatch; readonly cause: ResolutionCause; }
 
 export interface ActorHitTiming {
 	/** Work completed before Actor interception, capped by execution duration. */

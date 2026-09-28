@@ -92,6 +92,8 @@ export interface WorkspaceSandboxOptions extends LinuxOverlayfsOptions {
 	readonly gitBinary?: string;
 	/** Auto is portable Git unless a trace-guarded runtime explicitly qualifies a COW driver. */
 	readonly driver?: WorkspaceSandboxDriver;
+	/** Root edits and writes run in memory over the workspace itself (default); false always allocates a private workspace. */
+	readonly inPlaceMutations?: boolean;
 }
 
 export interface SandboxWorkspaceContext {
@@ -756,6 +758,8 @@ async function executeMutation(
 	const execute = (context.action.executionContext as ToolInvocation | undefined)?.filesystem;
 	if (!execute) throw new Error("Workspace execution requires an explicitly bound filesystem operation");
 	const sourceRoot = path.resolve(context.cwd);
+	// A root edit or write needs no private workspace; linked files (their alias namespace) and chained actions still take one.
+	if (!context.parentCheckpoint && options.inPlaceMutations !== false) try { return await executeInMemory(state, context, execute); } catch (error) { if (error !== LINKED_INPUT) throw error; }
 	return forkSandboxWorkspaceFor(state, {
 		cwd: sourceRoot,
 		action: context.action,
@@ -857,6 +861,87 @@ async function executeMutation(
 			return { output, changes: [...changes.values()] };
 		},
 	}, capturedWorkspaceInputs);
+}
+
+const LINKED_INPUT = new Error("linked workspace input");
+
+/** Reads the workspace in place and holds writes in memory: the same captured changes, committed and checked alike. */
+async function executeInMemory(state: WorkspaceSandboxState, context: SpeculativeToolExecutionContext,
+	execute: NonNullable<ToolInvocation["filesystem"]>): Promise<WorldBranch<ToolSettlement>> {
+	const sourceRoot = path.resolve(context.cwd), started = performance.now();
+	const changes = new Map<string, SandboxWorkspaceChange>(), written = new Map<string, Buffer>(), lifetime = new RuntimeLifecycleLane();
+	let bytes = 0, failure: { error: unknown } | undefined;
+	// A request the tool swallowed still fails the run; requests after it returns are refused.
+	const track = <T>(run: () => Promise<T>): Promise<T> => lifetime.admit(async () => {
+		try { context.signal.throwIfAborted(); return await run(); } catch (error) { failure ??= { error }; throw error; }
+	});
+	const record = (key: string, change: SandboxWorkspaceChange) => {
+		const retained = bytes - sandboxChangeBytes(changes.get(key)) + sandboxChangeBytes(change);
+		if (retained > WORKSPACE_TRANSACTION_MAX_BYTES || (!changes.has(key) && changes.size >= WORKSPACE_TRANSACTION_MAX_FILES))
+			throw new Error("Workspace operation exceeds its capture budget");
+		changes.set(key, change); bytes = retained;
+	};
+	const located = async (logical: string) => {
+		const relative = relativeFilesystemPath(sourceRoot, logical);
+		if (relative === undefined || isSnapshotExcluded(slash(relative))) throw new Error("Filesystem operation is outside the workspace view");
+		const target = path.resolve(sourceRoot, relative);
+		await assertNoSymlinkPath(sourceRoot, target);
+		context.signal.throwIfAborted();
+		return { target, key: filesystemPathKey(target), resource: slash(relative) };
+	};
+	const fileInput = async (logical: string) => {
+		const { target, key, resource } = await located(logical), previous = changes.get(key);
+		if (previous?.kind === "directory") throw new Error("Workspace file input changed type");
+		if (previous) return { target, key, captured: previous };
+		const before = await readRegularState(target, WORKSPACE_TRANSACTION_MAX_BYTES);
+		if (before?.identity && before.identity.nlink > 1n) throw LINKED_INPUT;
+		const captured: SandboxFileChange = { root: sourceRoot, target, resource, validationOnly: true, before: before?.content, beforeMode: before?.mode };
+		record(key, captured);
+		return { target, key, captured };
+	};
+	const directoryInput = async (logical: string) => {
+		const { target, key, resource } = await located(logical), previous = changes.get(key);
+		if (previous && previous.kind !== "directory") throw new Error("Workspace directory input changed type");
+		if (previous) return previous.before ?? previous.after;
+		const before = await readSandboxDirectoryState(target);
+		// Only existence decides a native mkdir's commit and its later check.
+		record(key, { root: sourceRoot, target, resource, kind: "directory", before, ...(before ? { validationOnly: true } : {
+			operation: "mkdir", after: { entriesDigest: directoryEntriesDigest([]), mode: 0o755, uid: 0, gid: 0 } }) });
+		return before;
+	};
+	let output: ToolSettlement;
+	try {
+		output = await execute({
+			readFile: (logical, limit) => track(async () => {
+				const { key, captured } = await fileInput(logical), content = written.get(key) ?? captured.before;
+				if (content === undefined) throw new Error("Workspace input does not exist");
+				assertExistingInputPolicy(captured);
+				return Buffer.from(content.subarray(0, limit));
+			}),
+			access: (logical, writable) => track(async () => {
+				const { target, key } = await located(logical), known = changes.get(key), mode = fsConstants.R_OK | (writable ? fsConstants.W_OK : 0);
+				await ((known ? known.kind === "directory" : (await lstat(target)).isDirectory()) ? directoryInput(logical) : fileInput(logical));
+				const captured = changes.get(key)!;
+				assertExistingInputPolicy(captured);
+				await access(target, mode);
+				if (captured.before !== undefined) record(key, { ...captured, accessMode: (captured.accessMode ?? 0) | mode });
+			}),
+			writeFile: (logical, content) => track(async () => {
+				const { key, captured } = await fileInput(logical);
+				record(key, { ...captured, accessMode: changes.get(key)?.accessMode, validationOnly: undefined, after: Buffer.from(content), operation: "write_contents" });
+				written.set(key, Buffer.from(content));
+			}),
+			mkdir: (logical) => track(async () => {
+				for (let directory = path.resolve(logical); ; directory = path.dirname(directory)) {
+					if (await directoryInput(directory) || directory === sourceRoot) break;
+				}
+			}),
+		}, context);
+	} finally { await lifetime.close(() => {}); }
+	if (failure) throw failure.error;
+	context.signal.throwIfAborted();
+	const snapshot = { output, changes: ownSandboxChanges([...changes.values()]), executionMetrics: { setupMs: 0, captureMs: Math.max(0, performance.now() - started) } };
+	return workspaceBranch(snapshot, sourceRoot, context.action, state);
 }
 
 async function createPrivateSandboxWorkspace(

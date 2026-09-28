@@ -1,16 +1,7 @@
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import {
-	lstat,
-	mkdir,
-	mkdtemp,
-	open,
-	readFile,
-	rm,
-	writeFile,
-	type FileHandle,
-} from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, open, readFile, rm, writeFile, type FileHandle } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { BoundedRecencyMap } from "./bounded-recency-map.ts";
@@ -31,10 +22,7 @@ const DEFAULT_NEGATIVE_CACHE_TTL_MS = 30_000;
 // asm-generic/fcntl.h: __O_TMPFILE (020000000) | O_DIRECTORY (00200000).
 const LINUX_O_TMPFILE = 0o20200000;
 
-export interface LinuxOverlayfsOptions {
-	readonly overlayfsBinary?: string;
-	readonly fusermountBinary?: string;
-}
+export interface LinuxOverlayfsOptions { readonly overlayfsBinary?: string; readonly fusermountBinary?: string; }
 
 export type LinuxOverlayfsCapability =
 	| {
@@ -44,10 +32,7 @@ export type LinuxOverlayfsCapability =
 			readonly fingerprint: string;
 			readonly detail: string;
 	  }
-	| {
-			readonly available: false;
-			readonly detail: string;
-	  };
+	| { readonly available: false; readonly detail: string; };
 
 export interface LinuxOverlayfsMount {
 	readonly root: string;
@@ -58,10 +43,7 @@ export interface LinuxOverlayfsMount {
 
 /** The backing directories must remain alive because a FUSE mount could not be proven closed. */
 export class LinuxOverlayfsUnsafeCleanupError extends Error {
-	constructor(message: string, cause: unknown) {
-		super(message, { cause });
-		this.name = "LinuxOverlayfsUnsafeCleanupError";
-	}
+	constructor(message: string, cause: unknown) { super(message, { cause }); this.name = "LinuxOverlayfsUnsafeCleanupError"; }
 }
 
 /** Open an unnamed regular inode in private backing storage without exposing a control path. */
@@ -77,10 +59,7 @@ interface ResolvedOverlayfs {
 	readonly kernel: string;
 }
 
-interface LinuxOverlayfsCapabilityCacheEntry {
-	readonly pending: Promise<LinuxOverlayfsCapability>;
-	expiresAt?: number;
-}
+interface LinuxOverlayfsCapabilityCacheEntry { readonly pending: Promise<LinuxOverlayfsCapability>; expiresAt?: number; }
 
 export interface LinuxOverlayfsCapabilityRegistryOptions {
 	readonly requestCapacity?: number;
@@ -126,10 +105,7 @@ export class LinuxOverlayfsCapabilityRegistry {
 		if (this.disposed || this.disabledDetail) return;
 		const key = availableCapabilityKey(capability);
 		const disabled = `fuse-overlayfs driver disabled: ${detail}`;
-		if (this.degraded.has(key)) {
-			this.degraded.set(key, disabled);
-			return;
-		}
+		if (this.degraded.has(key)) { this.degraded.set(key, disabled); return; }
 		if (this.degraded.size >= this.degradedCapacity) {
 			this.disabledDetail = `fuse-overlayfs registry disabled after ${this.degradedCapacity + 1} driver degradations`;
 			this.requests.clear();
@@ -223,13 +199,7 @@ export async function mountLinuxOverlayfs(input: {
 	const root = path.join(input.privateRoot, "workspace");
 	await mapFilesystem([upperRoot, workRoot, root], (directory) => mkdir(directory, { recursive: true }));
 	const [lower, upper, work] = await Promise.all([lstat(input.lowerRoot), lstat(upperRoot), lstat(workRoot)]);
-	if (
-		!lower.isDirectory() ||
-		!upper.isDirectory() ||
-		!work.isDirectory() ||
-		lower.dev !== upper.dev ||
-		upper.dev !== work.dev
-	) {
+	if (!lower.isDirectory() || !upper.isDirectory() || !work.isDirectory() || lower.dev !== upper.dev || upper.dev !== work.dev) {
 		throw new Error("OverlayFS lower, upper, and work roots must share one backing filesystem");
 	}
 	return startLinuxOverlayfs({
@@ -389,12 +359,7 @@ async function startLinuxOverlayfs(input: {
 	for (const value of [input.lowerRoot, input.upperRoot, input.workRoot]) assertOverlayOptionPath(value);
 	const child = spawn(
 		input.binary,
-		[
-			"-f",
-			"-o",
-			`clone_fd,lowerdir=${input.lowerRoot},upperdir=${input.upperRoot},workdir=${input.workRoot}`,
-			input.root,
-		],
+		["-f", "-o", `clone_fd,lowerdir=${input.lowerRoot},upperdir=${input.upperRoot},workdir=${input.workRoot}`, input.root],
 		{ stdio: ["pipe", "pipe", "pipe"] },
 	);
 	let processError: Error | undefined;
@@ -444,10 +409,7 @@ async function startLinuxOverlayfs(input: {
 						() => diagnostics,
 					);
 					if (degraded) input.onDegraded?.(degraded);
-				} catch (error) {
-					input.onDegraded?.(`unsafe unmount failure: ${errorMessage(error)}`);
-					throw error;
-				}
+				} catch (error) { input.onDegraded?.(`unsafe unmount failure: ${errorMessage(error)}`); throw error; }
 			})();
 			return closed;
 		},
@@ -487,10 +449,7 @@ async function closeMount(
 	if (await mountedAsFuseOverlayfs(mountRoot)) {
 		try {
 			await execText(fusermountBinary, ["-u", mountRoot]);
-		} catch (error) {
-			unmountError = error;
-			child.kill("SIGKILL");
-		}
+		} catch (error) { unmountError = error; child.kill("SIGKILL"); }
 	}
 	child.stdin.end();
 	const waitForClose = () => waitForCandidate(processClosed, undefined, OVERLAY_EXIT_TIMEOUT_MS);
@@ -556,10 +515,7 @@ async function resolveOverlayfs(options: LinuxOverlayfsOptions): Promise<Resolve
 		[path.join(os.homedir(), ".local", "bin", "fuse-overlayfs")],
 	);
 	const fusermountBinary = await resolveHostExecutable(options.fusermountBinary, "fusermount3", [], ["fusermount"]);
-	const [version, kernel] = await Promise.all([
-		execText(binary, ["--version"]),
-		readFile("/proc/sys/kernel/osrelease", "utf8"),
-	]);
+	const [version, kernel] = await Promise.all([execText(binary, ["--version"]), readFile("/proc/sys/kernel/osrelease", "utf8")]);
 	return { binary, fusermountBinary, version, kernel };
 }
 
@@ -587,10 +543,7 @@ function execText(executable: string, args: readonly string[]): Promise<string> 
 }
 
 async function expectMissing(target: string): Promise<void> {
-	try {
-		await lstat(target);
-		throw new Error(`expected path to be absent: ${target}`);
-	} catch (error) {
+	try { await lstat(target); throw new Error(`expected path to be absent: ${target}`); } catch (error) {
 		if (isMissing(error)) return;
 		throw error;
 	}
