@@ -32,6 +32,8 @@ export type PatternAwareEventInput = {
 	readonly outputPaths?: ReadonlyArray<string>;
 	/** Typed `path:line` facts a result reports (grep matches, compiler and test locations). */
 	readonly outputLocations?: ReadonlyArray<OutputLocation>;
+	/** A failure's exit code and error kind (`exit:1 TypeError`): a guard telling apart what follows different failures. */
+	readonly errorClass?: string;
 	readonly durationMs: number;
 	readonly operation?: string;
 	readonly schemaHash?: string;
@@ -1319,6 +1321,13 @@ export function asPatternAwareRuntimeContext(value: unknown): PatternAwareRuntim
 	return value as PatternAwareRuntimeContext;
 }
 
+/** What kind of failure a failed call reports: its exit code and the first recognizable error kind. */
+export function failureClass(text: string): string {
+	const exit = /exited with code (\d+)/u.exec(text)?.[1];
+	const kind = /\b([A-Z]\w*(?:Error|Exception))\b|\b(E[A-Z]{3,}):|(command not found)|(No such file or directory)|(Permission denied)|\b(FAIL)\b/u.exec(text)?.slice(1).find(Boolean);
+	return [exit === undefined ? "" : `exit:${exit}`, kind ?? ""].filter(Boolean).join(" ") || "failed";
+}
+
 export function projectPatternAwareObservation(
 	output: unknown,
 	outputPaths: ReadonlyArray<string> = [],
@@ -1771,6 +1780,9 @@ function structuredOutput(value: unknown): unknown {
 	) {
 		// Empty details (a failed call's settlement) carry nothing; its text still names paths.
 		if (record.details !== undefined && Object.keys(asRecord(record.details) ?? { value: true }).length) return record.details;
+		// A small JSON document (a manifest, a command's --json report) keeps its keys as bindable facts.
+		const texts = record.content.flatMap((item) => asRecord(item)?.type === "text" ? [String(asRecord(item)!.text)] : []), whole = texts.join("\n").trim();
+		if (texts.length === 1 && whole.length <= 65_536 && /^[[{]/u.test(whole)) try { const parsed: unknown = JSON.parse(whole); if (isObject(parsed)) return parsed; } catch { /* Not JSON. */ }
 		const values = uniqueStrings(
 			record.content.flatMap((item) => {
 				const content = asRecord(item);
@@ -2019,7 +2031,7 @@ const signatureCache = new WeakMap<PatternAwareEvent, PatternAwareEventSignature
 function signature(event: PatternAwareEvent): PatternAwareEventSignature {
 	const cached = signatureCache.get(event);
 	if (cached) return cached;
-	const outputShape = semanticOutputShape(event.output);
+	const outputShape = semanticOutputShape(event.output, event.errorClass);
 	const value = {
 		tool: event.tool,
 		outcome: event.outcome,
@@ -2038,8 +2050,8 @@ function trieToken(value: PatternAwareEventSignature) {
 	return JSON.stringify([value.tool, value.outcome, value.operation ?? null]);
 }
 
-function semanticOutputShape(value: unknown) {
-	const discriminants: string[] = [];
+function semanticOutputShape(value: unknown, errorClass?: string) {
+	const discriminants: string[] = errorClass ? [`error:${errorClass}`] : [];
 	const visit = (item: unknown, key = "", depth = 0) => {
 		if (depth > 4) return;
 		if (

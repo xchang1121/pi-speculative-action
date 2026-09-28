@@ -20,6 +20,7 @@ import {
 	patternAwareAnalyzerKey,
 	patternAwareRuntimeContext,
 	patternAwareSettings,
+	failureClass,
 	projectPatternAwareObservation,
 } from "./pattern-aware.ts";
 import type { PlanAction } from "./plan-proposal.ts";
@@ -125,6 +126,7 @@ export function createPatternPlanSource({
 	const eventData = (tool: string, input: Readonly<Record<string, unknown>>, output: ToolSettlement | undefined, durationMs: number) => ({
 		tool, input: structuredClone(input), outcome: output?.isError ? "failure" as const : "success" as const,
 		...projectPatternAwareObservation(output?.result, extractOutputPaths(tool, input, output?.result), cwd, extractOutputLocations(tool, input, output?.result)),
+		...(output?.isError ? { errorClass: failureClass(output.result.content.flatMap((item) => item.type === "text" ? [item.text] : []).join("\n")) } : {}),
 		durationMs,
 		...(typeof input.operation === "string" ? { operation: input.operation } : {}),
 	});

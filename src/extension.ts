@@ -149,10 +149,7 @@ export interface SpeculativeActionExtensionDependencies {
 	readonly selfSpeculationFetch?: typeof globalThis.fetch;
 }
 
-export interface SpeculativeActionExecutionWorldContext {
-	readonly cwd: string;
-	readonly autoResizeImages: boolean;
-}
+export interface SpeculativeActionExecutionWorldContext { readonly cwd: string; readonly autoResizeImages: boolean; }
 
 export function normalizeSpeculativeActionSettings(
 	input: SpeculativeActionPackageSettings | undefined,
@@ -521,14 +518,8 @@ async function installController(
 			));
 			await settingsStore.flush(); // Applied for this session either way; callers report whether it was saved.
 		},
-		attachUI: (nextUI: ExtensionUIContext) => {
-			ui = nextUI;
-			renderFooter();
-		},
-		detachUI: () => {
-			ui?.setStatus(STATUS_KEY, undefined);
-			ui = undefined;
-		},
+		attachUI: (nextUI: ExtensionUIContext) => { ui = nextUI; renderFooter(); },
+		detachUI: () => { ui?.setStatus(STATUS_KEY, undefined); ui = undefined; },
 		startTurn: async (messages: AgentMessage[], nextContext: ExtensionContext) => {
 			latestContext = nextContext;
 			const model = nextContext.model;
@@ -573,10 +564,7 @@ async function installController(
 		finishTurn: async (terminal = false) => {
 			const turnID = currentTurnID ?? (terminal ? lastTurnID : undefined);
 			if (!turnID) return;
-			if (currentTurnID) {
-				currentTurnID = undefined;
-				lastTurnID = turnID;
-			}
+			if (currentTurnID) { currentTurnID = undefined; lastTurnID = turnID; }
 			await recoverSpeculation(() => host.finishTurn(turnID, terminal));
 			if (terminal) selfSpeculation.reset();
 			else selfSpeculation.endTurn();
@@ -637,11 +625,7 @@ async function recoverSpeculation<T>(operation: () => Promise<T>): Promise<T | u
 	}
 }
 
-interface PiToolSettings {
-	readonly shellPath?: string;
-	readonly shellCommandPrefix?: string;
-	readonly autoResizeImages: boolean;
-}
+interface PiToolSettings { readonly shellPath?: string; readonly shellCommandPrefix?: string; readonly autoResizeImages: boolean; }
 
 function speculativeToolDefinition(base: PiToolDefinition, controller: SpeculativeActionController): ToolDefinition {
 	return {
@@ -689,10 +673,7 @@ function piShellEnvironment(context: ExtensionContext): Readonly<Record<string, 
 	environment.PI_SESSION_ID = context.sessionManager.getSessionId();
 	const sessionFile = context.sessionManager.getSessionFile();
 	if (sessionFile) environment.PI_SESSION_FILE = sessionFile;
-	if (context.model) {
-		environment.PI_PROVIDER = context.model.provider;
-		environment.PI_MODEL = context.model.id;
-	}
+	if (context.model) { environment.PI_PROVIDER = context.model.provider; environment.PI_MODEL = context.model.id; }
 	if (context.thinkingLevel) environment.PI_REASONING_LEVEL = context.thinkingLevel;
 	return definedProcessEnvironment(environment);
 }
@@ -713,10 +694,7 @@ async function runCommand(
 	ctx: ExtensionCommandContext,
 	controller: SpeculativeActionController | undefined,
 ): Promise<void> {
-	if (!controller) {
-		ctx.ui.notify("Speculative action runtime is unavailable.", "error");
-		return;
-	}
+	if (!controller) { ctx.ui.notify("Speculative action runtime is unavailable.", "error"); return; }
 	const command = args.trim().toLowerCase();
 	if (command === "on" || command === "off") {
 		const saved = await controller.setSettings({ ...controller.editableSettings(), enabled: command === "on" }).then(() => "", (error: unknown) => ` (not saved: ${errorMessage(error)})`);
@@ -728,19 +706,13 @@ async function runCommand(
 		ctx.ui.notify("Active speculative action settings reset.", "info");
 		return;
 	}
-	if (command === "events") {
-		showRecentEvents(ctx, controller);
-		return;
-	}
+	if (command === "events") { showRecentEvents(ctx, controller); return; }
 	if (command === "status" || (command === "" && ctx.mode !== "tui")) {
 		await recoverSpeculation(() => controller.refreshExecutionDiagnostics(true));
 		ctx.ui.notify(controller.statusText(), controller.settings().enabled ? "info" : "warning");
 		return;
 	}
-	if (command) {
-		ctx.ui.notify("Usage: /speculative-action [on|off|status|events|reset]", "warning");
-		return;
-	}
+	if (command) { ctx.ui.notify("Usage: /speculative-action [on|off|status|events|reset]", "warning"); return; }
 	await openSettings(ctx, controller);
 }
 
@@ -948,10 +920,7 @@ function openPatternAwareSettings(
 			input("decayHalfLifeEvents", "History half-life", value => `${value} events`),
 			input("minOccurrences", "Uses before learning a pattern"),
 			input("maxPatterns"),
-		] : [
-			input("beamWidth"),
-			input("maxPredictionDepth"),
-		]);
+		] : [input("beamWidth"), input("maxPredictionDepth")]);
 	});
 }
 
@@ -1070,10 +1039,7 @@ function editToolPolicy(
 			const capability = capabilities.get(tool);
 			const staged = capability ? { ...capability, predict: selected ? "on" as const : "off" as const } : undefined;
 			return [`${selected ? "[x]" : "[ ]"} ${tool} · ${capabilityRowLabel(staged)}`, async () => {
-				if (!supported) {
-					ctx.ui.notify(`${tool} has no speculative action semantics.`, "warning");
-					return;
-				}
+				if (!supported) { ctx.ui.notify(`${tool} has no speculative action semantics.`, "warning"); return; }
 				if (!selected && !registered.has(tool)) {
 					const conflict = conflicts.get(tool);
 					ctx.ui.notify(
@@ -1158,10 +1124,7 @@ async function editDraftModel(
 	const choice = await ctx.ui.select("Drafter model", [active, ...providerLabels.keys(), CUSTOM_MODEL, BACK]);
 	if (!choice || choice === BACK) return;
 	const { draftModel: _previousDraftModel, ...baseSettings } = settings;
-	if (choice === active) {
-		await controller.setSettings(baseSettings);
-		return;
-	}
+	if (choice === active) { await controller.setSettings(baseSettings); return; }
 	if (choice === CUSTOM_MODEL) {
 		const value = await ctx.ui.input("Custom drafter model", "provider/model");
 		if (value === undefined) return;
@@ -1365,10 +1328,7 @@ function resolveToolCapabilities(
 	);
 }
 
-function predictionTools(
-	settings: EffectiveSpeculativeActionSettings,
-	registered: Iterable<string>,
-): readonly string[] {
+function predictionTools(settings: EffectiveSpeculativeActionSettings, registered: Iterable<string>): readonly string[] {
 	const available = new Set(registered);
 	return [...new Set(settings.tools)].filter((tool) => available.has(tool));
 }
@@ -1460,10 +1420,7 @@ function formatSpeculativeFooter(
 	].join(" · ");
 }
 
-function executionWorldSummary(
-	tools: ReadonlyMap<string, ToolCapabilityRow>,
-	routes: ExecutionRoutesSnapshot,
-): string {
+function executionWorldSummary(tools: ReadonlyMap<string, ToolCapabilityRow>, routes: ExecutionRoutesSnapshot): string {
 	const { worlds, actorProcessReplay } = routes;
 	if (!worlds.length && !actorProcessReplay) return "Execution capabilities: unavailable";
 	return [
@@ -1583,8 +1540,5 @@ function formatActorProcessFooter(reuse: WorldReuseMetrics): string {
 	const hits = reuse.hits + reuse.wholeCommandHits;
 	const requests = reuse.requests + reuse.wholeCommandRequests;
 	const workMs = reuse.reusedProcessMs + reuse.wholeCommandReusedProcessMs;
-	return [
-		`${formatRatio(hits, requests)} reused`,
-		workMs > 0 ? `${formatDuration(workMs)} work` : "",
-	].filter(Boolean).join(" · ");
+	return [`${formatRatio(hits, requests)} reused`, workMs > 0 ? `${formatDuration(workMs)} work` : ""].filter(Boolean).join(" · ");
 }
