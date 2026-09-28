@@ -11,11 +11,7 @@ import {
 	normalizeDrafterRequestSettings,
 	normalizeSpeculativeToolSelection,
 } from "./common.ts";
-import type {
-	AgentConsumeInput,
-	AgentStartInput,
-	AgentStateData,
-} from "./agent-runtime-types.ts";
+import type { AgentConsumeInput, AgentStartInput, AgentStateData } from "./agent-runtime-types.ts";
 import { definitionSchemaHashes } from "./agent-runtime-types.ts";
 import type { ActorForkPlanSource } from "./actor-fork-plan-source.ts";
 import type {
@@ -226,12 +222,12 @@ export function createSpeculativeActionHost(
 	};
 	const resolveSettings = async (): Promise<SpeculativeActionSettings> => {
 		const { patternAware, selfSpeculation, drafterGateEnabled, drafterMaxDepth, drafterMaxTokens,
-			drafterDeterministicCandidates, drafterTemperatureMin, drafterTemperatureMax, ...policy } =
+			drafterDeterministicCandidates, drafterTemperatureMin, drafterTemperatureMax, drafterPatternHints, ...policy } =
 			normalizeSpeculativeAgentSettings(await options.getSettings?.(), actionSemantics.toolNames());
 		return {
 			...policy,
 			sourceConfig: {
-				drafterMaxDepth, drafterMaxTokens, drafterDeterministicCandidates, drafterTemperatureMin, drafterTemperatureMax,
+				drafterMaxDepth, drafterMaxTokens, drafterDeterministicCandidates, drafterTemperatureMin, drafterTemperatureMax, drafterPatternHints,
 				drafterGateEnabled, patternAware,
 				actorForkActionEnabled:
 					options.actorForkPlanSource !== undefined &&
@@ -247,6 +243,7 @@ export function createSpeculativeActionHost(
 		draftModel: options.draftModel,
 		getDraftOptions: options.getDraftOptions,
 		complete: options.complete,
+		patternHints: (hint) => patternPlans.hints(hint),
 	});
 	const patternPlans = createPatternPlanSource({
 		sessionID,

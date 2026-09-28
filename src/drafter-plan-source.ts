@@ -5,7 +5,7 @@ import { clampCandidateLimit, DEFAULTS, drafterRequestTemperature, normalizeDraf
 import { DrafterUtilityGate, type DrafterUtilityBatch, type DrafterUtilityGateSnapshot } from "./drafter-utility-gate.ts";
 import { agentBatchKey, type AgentPlanSource, type DraftModelSelection, type DraftOptionsContext } from "./agent-runtime-types.ts";
 import type { PlanAction, PlanProposal } from "./plan-proposal.ts";
-import type { ActorActionFeedback } from "./runtime.ts";
+import type { ActorActionFeedback, SpeculativeActionSettings } from "./runtime.ts";
 import { stableValueHash } from "./stable-value-hash.ts";
 
 interface DrafterBatch {
@@ -75,6 +75,8 @@ export function createDrafterPlanSource(input: {
 	readonly getDraftOptions?: (context: DraftOptionsContext) => SimpleStreamOptions | Promise<SimpleStreamOptions>;
 	/** Provider completion used by the drafter. */
 	readonly complete: (model: Model<Api>, context: Context, options?: SimpleStreamOptions) => Promise<AssistantMessage>;
+	readonly patternHints?: (input: { readonly sessionID: string; readonly schemaHashes: Readonly<Record<string, string>>; readonly settings: SpeculativeActionSettings })
+		=> Promise<readonly { readonly tool: string; readonly input: Readonly<Record<string, unknown>> }[]>;
 }): DrafterPlanSourceController {
 	const batches = new Map<string, DrafterPreparation>();
 	const gate = new DrafterUtilityGate();
@@ -148,7 +150,12 @@ export function createDrafterPlanSource(input: {
 				const tools = new Set(candidateNames.filter((name) => data.tools.has(name)));
 				if (!tools.size) return undefined;
 				batch = new DrafterPreparation(async (signal) => {
-					const { draftModel, getDraftOptions } = input, { actorModel, actorOptions, context } = startInput;
+					const { draftModel, getDraftOptions } = input, { actorModel, actorOptions } = startInput;
+					// Hints trail the Actor's history, so the cached prefix the Drafter shares with the Actor stays intact.
+					const hints = drafter.drafterPatternHints ? await input.patternHints?.({ sessionID: startInput.sessionID, schemaHashes: data.schemaHashes, settings }) : undefined;
+					const context: Context = hints?.length ? { ...startInput.context, messages: [...startInput.context.messages, { role: "user", timestamp: Date.now(),
+						content: `(Speculation hint, not from the user.) Calls that followed similar steps in this workspace:\n${hints.map((hint) => `- ${hint.tool} ${JSON.stringify(hint.input)}`).join("\n")}` }] }
+						: startInput.context;
 					const model = (typeof draftModel === "function" ? await draftModel(actorModel) : draftModel) ?? actorModel;
 					if (signal.aborted) return undefined;
 					const utility = gate.start(JSON.stringify([model.provider, model.api, model.baseUrl, model.id]), settings.sourceConfig?.drafterGateEnabled !== false);
