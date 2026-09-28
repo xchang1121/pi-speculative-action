@@ -1,5 +1,5 @@
 import { BoundedRecencyMap } from "./bounded-recency-map.ts";
-import { routedProcessContext, validProcessContext, type ProcessExecutionContext } from "./process-context.mjs";
+import { processContextFromRaw, routedProcessContext, validProcessContext, type ProcessExecutionContext, type RawProcessContext } from "./process-context.mjs";
 import { execFile, spawn } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomBytes } from "node:crypto";
@@ -25,7 +25,6 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { finished } from "node:stream/promises";
-import { fileURLToPath } from "node:url";
 import { errorMessage, isMissing as missing } from "./error-utils.ts";
 import { stableEqual } from "./stable-json.ts";
 import { TimelineInterval, type TimelineDependency } from "./task-timing.ts";
@@ -738,7 +737,7 @@ export class LinuxProcessReuseBackend {
 			try {
 				const after = await session.workspace.structure.capture();
 				const observation = await observeStrace(tracePrefix, session.invocation.shell, logicalCwd, {
-					interposedExecutables: session.interposition.executables, interpositionInterpreter: process.execPath,
+					interposedExecutables: session.interposition.executables,
 					guardFilesystemSemanticsWithin: [session.workspace.sandboxRoot, session.sourceRoot],
 				});
 				session.topLevelCapture = { before, after, observation };
@@ -814,11 +813,11 @@ export class LinuxProcessReuseBackend {
 		socket.once("error", () => undefined);
 		socket.once("end", () => {
 			const pending = Promise.resolve().then(() => this.handleWireRequest(session, body))
-				.then((response) => { socket.end(JSON.stringify(response)); })
+				.then((response) => { socket.end(wireResponse(response)); })
 				.catch((error) => {
 					this.setError(session, errorMessage(error));
 					session.incompleteReasons.add(`broker:${errorMessage(error)}`);
-					socket.end(JSON.stringify({ kind: "failed" }));
+					socket.end("f\n");
 				}).finally(() => { session.pending.delete(pending); });
 			session.pending.add(pending);
 		});
@@ -2161,7 +2160,6 @@ async function createProcessInterposition(input: {
 	const shadowRoot = path.join(root, "originals");
 	await Promise.all([mkdir(viewRoot, { recursive: true }), mkdir(shadowRoot, { recursive: true })]);
 	const launcher = path.join(root, "dispatcher");
-	const dispatcher = fileURLToPath(new URL("./process-dispatcher.mjs", import.meta.url));
 	await copyFile(input.dispatcherBinary, launcher);
 	await chmod(launcher, 0o755);
 	const directories: InterposedDirectory[] = [];
@@ -2179,17 +2177,13 @@ async function createProcessInterposition(input: {
 		}
 		const index = directories.length.toString().padStart(3, "0");
 		const shadow = path.join(shadowRoot, index);
-		if ([logicalDirectory, source, shadow, process.execPath, dispatcher].some((value) => /[\r\n]/.test(value))) continue;
+		if ([logicalDirectory, source, shadow].some((value) => /[\r\n]/.test(value))) continue;
 		directories.push({ source, target: logicalDirectory, shadow, view: path.join(viewRoot, index) });
 	}
-	const configurationPath = path.join(root, "configuration.json");
+	const configurationPath = path.join(root, "configuration");
 	input.signal?.throwIfAborted();
-	const configuration = {
-		socketPath: input.socketPath,
-		token: input.token,
-		directories: directories.map(({ target, view, shadow }) => ({ target, view, shadow })),
-	};
-	await writeFile(configurationPath, JSON.stringify(configuration), { mode: 0o600 });
+	if (/[\r\n]/.test(input.socketPath + input.token + configurationPath)) throw new Error("dispatcher configuration cannot hold a line break");
+	await writeFile(configurationPath, `${input.socketPath}\n${input.token}\n`, { mode: 0o600 });
 
 	const excluded = new Set<string>();
 	for (const candidate of input.excludedExecutables) {
@@ -2215,7 +2209,7 @@ async function createProcessInterposition(input: {
 			await Promise.all([mkdir(directory.shadow, { recursive: true }), mkdir(directory.view, { recursive: true })]);
 			await writeFile(
 				path.join(directory.view, ".pi-spec-dispatch"),
-				["PI_SPEC_DISPATCH", process.execPath, dispatcher, configurationPath, directory.target, directory.shadow, ""].join("\n"),
+				["PI_SPEC_DISPATCH", configurationPath, directory.target, directory.shadow, ""].join("\n"),
 				{ mode: 0o600 },
 			);
 		}
@@ -2366,8 +2360,7 @@ async function probeExecutionContext(input: {
 		"--exec",
 		"12",
 		"pi-context-probe",
-		process.execPath,
-		fileURLToPath(new URL("./process-dispatcher.mjs", import.meta.url)),
+		input.dispatcher,
 		"--probe-context",
 		input.logicalRoot,
 		path.join(input.logicalRoot, "script-position"),
@@ -2375,7 +2368,7 @@ async function probeExecutionContext(input: {
 	const outcome = await runSpawn(input.strace, command.slice(1), { cwd: input.physicalRoot, environment: definedProcessEnvironment(process.env) });
 	if (outcome.signal || outcome.code !== 0) throw new Error("process execution context probe failed");
 	const stdout = Buffer.concat(outcome.output.filter(({ fd }) => fd === 1).map(({ data }) => data)).toString();
-	const parsed: unknown = JSON.parse(stdout);
+	const parsed = processContextFromRaw(JSON.parse(stdout) as RawProcessContext);
 	if (!validProcessContext(parsed)) throw new Error("process execution context probe returned invalid data");
 	return parsed;
 }
@@ -2506,11 +2499,20 @@ async function acquireOutputChannels(signal?: AbortSignal) {
 	} catch (error) { await dispose(); throw error; }
 }
 
+/** The native launcher's framing: output as "o<fd> <length>\n<bytes>", then "x <code>", "s <signal number>" or "b" (bypass in place). */
+function wireResponse(response: DispatcherResponse): Buffer {
+	const frames = (response.output ?? []).flatMap(({ fd, data }) => [Buffer.from(`o${fd} ${Buffer.byteLength(data, "base64")}\n`), Buffer.from(data, "base64")]);
+	const exit = response.exit, end = response.kind === "bypass" ? "b" : exit?.kind === "signal" ? `s ${exit.signal}` : `x ${exit?.kind === "code" ? exit.code : 125}`;
+	return Buffer.concat([...frames, Buffer.from(`${end}\n`)]);
+}
+
 function parseDispatcherRequest(body: string): DispatcherRequest | undefined {
 	try {
 		const value: unknown = JSON.parse(body.trim());
 		if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-		const request = value as Partial<DispatcherRequest>;
+		const reported = value as Partial<Omit<DispatcherRequest, "context"> & { context: RawProcessContext }>;
+		// The launcher reports its standard streams as the kernel shows them; the broker derives the context.
+		const request = { ...reported, context: processContextFromRaw(reported.context!) } as Partial<DispatcherRequest>;
 		const text = (field: unknown) => typeof field === "string" && !field.includes("\0");
 		return typeof request.token === "string" && typeof request.name === "string" && text(request.invokedPath) && text(request.argv0) &&
 			request.argv0!.length <= 1024 * 1024 && Array.isArray(request.args) && request.args.every(text) && typeof request.cwd === "string" &&

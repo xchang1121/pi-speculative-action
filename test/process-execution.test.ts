@@ -1,37 +1,35 @@
 import { gated, deferred as barrier } from "./async.ts";
 import { execFile } from "node:child_process";
-import { writeFile } from "node:fs/promises";
+import { copyFile, mkdir, writeFile } from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { processContextFromRaw, type RawProcessContext } from "../src/process-context.mjs";
 import { temporaryDirectories } from "./filesystem.ts";
 import { describe, expect, test, vi } from "vitest";
 import { ProcessExecutionCoordinator, type PreparedProcessExecutionRoute, type ProcessExecutor } from "../src/process-execution.ts";
 
 describe("ProcessExecutionCoordinator", () => {
-	test.runIf(process.platform === "linux")("dispatches only explicit broker outcomes and refuses failed or malformed replies", async () => {
+	test.runIf(process.platform === "linux" && process.env.PI_SPEC_HELD_EXEC)("dispatches only explicit broker outcomes and refuses failed or malformed replies", async () => {
 		const directories = temporaryDirectories("pi-dispatch-"), root = await directories.create();
-		const socketPath = path.join(root, "broker"), configuration = path.join(root, "config.json");
+		const socketPath = path.join(root, "broker"), configuration = path.join(root, "configuration"), view = path.join(root, "view"), shadow = path.join(root, "shadow");
 		try {
-			await writeFile(configuration, JSON.stringify({ socketPath, token: "owned", directories: [] }));
-			for (const response of [null, { kind: "failed" }, { kind: "unknown" }, { kind: "bypass" },
-				{ kind: "bypass", executable: process.execPath },
-				{ kind: "hit", output: [{ fd: 1, data: Buffer.from("replayed").toString("base64") }], exit: { kind: "code", code: 0 } }]) {
+			await Promise.all([mkdir(view), mkdir(shadow), writeFile(configuration, `${socketPath}\nowned\n`)]);
+			await Promise.all([copyFile(process.env.PI_SPEC_HELD_EXEC!, path.join(view, "tool")), writeFile(path.join(shadow, "tool"), "#!/bin/sh\nprintf native\n", { mode: 0o755 }),
+				writeFile(path.join(view, ".pi-spec-dispatch"), `PI_SPEC_DISPATCH\n${configuration}\n/usr/bin\n${shadow}\n`, { mode: 0o600 })]);
+			for (const [response, expected] of [["", ""], ["f\n", ""], ["q\n", ""], ["o1 8\nreplay", ""], ["b\n", "native"], ["o1 8\nreplayedx 0\n", "replayed"]]) {
 				let received: Record<string, unknown> | undefined;
 				const server = net.createServer({ allowHalfOpen: true }, socket => {
 					let body = ""; socket.setEncoding("utf8").on("data", chunk => { body += chunk; });
-					socket.on("end", () => { received = JSON.parse(body); socket.end(JSON.stringify(response)); });
+					socket.on("end", () => { received = JSON.parse(body); socket.end(response); });
 				});
 				await new Promise<void>(resolve => server.listen(socketPath, resolve));
 				try {
-					const result = await promisify(execFile)(process.execPath, [fileURLToPath(new URL("../src/process-dispatcher.mjs", import.meta.url)),
-						"--native-dispatch", configuration, process.execPath, process.execPath, "-e", "process.stdout.write('native')"], { cwd: root })
+					const result = await promisify(execFile)(path.join(view, "tool"), ["-x"], { cwd: root })
 						.then(value => ({ ...value, code: 0 }), error => ({ code: error.code, stdout: error.stdout }));
-					const expected = response?.kind === "hit" ? "replayed" : response?.kind === "bypass" && response.executable ? "native" : "";
 					expect(result).toMatchObject({ code: expected ? 0 : 125, stdout: expected });
-					expect(received?.token).toBe("owned");
-					expect(Object.keys(received!).sort()).toEqual(["args", "argv0", "context", "cwd", "environment", "invokedPath", "name", "token"]);
+					expect(received).toMatchObject({ token: "owned", name: "tool", invokedPath: "/usr/bin/tool", args: ["-x"], cwd: root });
+					expect(processContextFromRaw(received!.context as RawProcessContext)).toMatchObject({ descriptorTypes: ["socket", "socket", "socket"] });
 				} finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); }
 			}
 		} finally { await directories.dispose(); }

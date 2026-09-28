@@ -3,6 +3,7 @@
 import { createHash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import { access, chmod, copyFile, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
@@ -60,11 +61,7 @@ async function installSandlock() {
 	} catch {
 		// Install the pinned source revision below.
 	}
-	if (installedMatches) {
-		await qualifySandlock(sandlock);
-		console.log(`Speculative Bash producer ready: ${sandlock}`);
-		return;
-	}
+	if (installedMatches) { await qualifySandlock(sandlock); console.log(`Speculative Bash producer ready: ${sandlock}`); return; }
 	const cargo = await executable([path.join(os.homedir(), ".cargo", "bin", "cargo"), "cargo"]).catch(() => {
 		throw new Error("Rust stable is required to build Sandlock. Install it from https://rustup.rs and retry.");
 	});
@@ -120,12 +117,13 @@ async function qualifySandlock(binary) {
 		await run(binary, ["run", "--chroot", "/", "--fs-read", "/", "--exec-mount", `/bin/false:${image}`, "--", "/bin/false"], 42);
 		await copyFile(heldExec, image);
 		await chmod(image, 0o755);
-		await writeFile(
-			path.join(view, ".pi-spec-dispatch"),
-			["PI_SPEC_DISPATCH", "/bin/true", "/bin/true", "/dev/null", "/bin", "/bin", ""].join("\n"),
-			{ mode: 0o600 },
-		);
-		await run(binary, ["run", "--chroot", "/", "--fs-read", "/", "--exec-mount", `/bin/false:${image}`, "--", "/bin/false"]);
+		// The launcher reaches a broker from inside the sandbox, which answers with a zero exit in place of /bin/false.
+		const configuration = path.join(root, "configuration"), broker = net.createServer({ allowHalfOpen: true }, socket => socket.resume().on("end", () => socket.end("x 0\n")));
+		await writeFile(configuration, `${path.join(root, "broker")}\ntoken\n`);
+		await writeFile(path.join(view, ".pi-spec-dispatch"), `PI_SPEC_DISPATCH\n${configuration}\n/bin\n/bin\n`, { mode: 0o600 });
+		await new Promise(resolve => broker.listen(path.join(root, "broker"), resolve));
+		try { await run(binary, ["run", "--chroot", "/", "--fs-read", "/", "--fs-write", path.join(root, "broker"), "--exec-mount", `/bin/false:${image}`, "--", "/bin/false"]); }
+		finally { broker.close(); }
 	} finally {
 		await rm(root, { recursive: true, force: true });
 	}
@@ -229,14 +227,7 @@ async function installFuseOverlayfs() {
 
 async function executable(candidates) {
 	for (const candidate of candidates) {
-		if (candidate.includes(path.sep)) {
-			try {
-				await access(candidate);
-				return candidate;
-			} catch {
-				continue;
-			}
-		}
+		if (candidate.includes(path.sep)) { try { await access(candidate); return candidate; } catch { continue; } }
 		for (const directory of (process.env.PATH ?? "").split(path.delimiter)) {
 			if (!directory) continue;
 			const target = path.join(directory, candidate);

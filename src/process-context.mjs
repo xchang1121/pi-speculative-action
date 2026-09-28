@@ -1,5 +1,5 @@
 // @ts-check
-import { closeSync, fstatSync, openSync, readFileSync, readlinkSync, statSync } from "node:fs";
+import { closeSync, openSync, readFileSync } from "node:fs";
 import { readFile, readlink, stat } from "node:fs/promises";
 
 /** @typedef {import("./provenance-certificate.js").InheritedFileDescriptor["type"]} DescriptorType */
@@ -11,13 +11,15 @@ import { readFile, readlink, stat } from "node:fs/promises";
  * readonly regularDescriptors?: readonly (Pick<HeldFileDescriptor, "fd" | "alias" | "flags" | "offset" | "type"> & { readonly image?: number })[]
  * }} ProcessExecutionContext */
 
+/** @typedef {Record<"dev" | "ino" | "mode" | "uid" | "gid" | "rdev", string>} RawStat */
+/** @typedef {{ readonly status: string, readonly limits: string, readonly processStat: string, readonly shell: RawStat,
+ * readonly descriptors: readonly { readonly fd: number, readonly stat: RawStat, readonly endpoint?: string, readonly fdinfo: string }[] }} RawProcessContext */
+
 /**
- * Read the same kernel context for a stopped Actor image and the isolated dispatcher.
- * The caller owns the inherited table: ptrace observes it after exec; the native dispatcher
- * verifies it before Node opens its private descriptors. Endpoint aliases below describe
+ * Read the same kernel context for a stopped Actor image as the native launcher reports for itself (processContextFromRaw).
+ * The caller owns the inherited table: ptrace observes it after exec. Endpoint aliases below describe
  * buffered stdio routing, not general open-file-description identity.
- * Capture does not authorize reuse: the dispatcher reports unsupported streams for native fallback.
- * @param {number | "self"} pid
+ * @param {number} pid
  * @param {readonly string[]} inheritedDescriptors
  * @param {readonly HeldFileDescriptor[]} [regularDescriptors] Native OFD evidence held for this inspection.
  * @returns {Promise<ProcessExecutionContext>}
@@ -30,46 +32,53 @@ export async function captureProcessContext(pid, inheritedDescriptors, regularDe
 		throw new Error("held process has unmodeled inherited descriptors");
 	}
 	const root = `/proc/${pid}`;
-	// Keep the dispatcher on its original synchronous path; remote inspection stays nonblocking.
-	const statPath = pid === "self" ? statSync : stat;
-	/** @param {string} target */
-	const text = target => pid === "self" ? readFileSync(target, "utf8") : readFile(target, "utf8");
+	/** @param {import("node:fs").BigIntStats} metadata @returns {RawStat} */
+	const fields = metadata => /** @type {RawStat} */ (Object.fromEntries(["dev", "ino", "mode", "uid", "gid", "rdev"].map(name =>
+		[name, String(metadata[/** @type {keyof typeof metadata} */ (name)])])));
 	const [status, limits, processStat, shell, descriptors] = await Promise.all([
-		text(`${root}/status`),
-		text(`${root}/limits`),
-		text(`${root}/stat`),
-		statPath("/bin/sh", { bigint: true }),
-		Promise.all([...new Set([0, ...inheritedDescriptors.map(Number)])].sort((a, b) => a - b).map(async fd => {
-			if (fd === 0 && !inheritedDescriptors.includes("0")) return {
-				fd, endpoint: undefined, type: /** @type {DescriptorType} */ ("closed"), identity: "closed:0", flags: 0, queue: undefined,
-			};
-			const [metadata, endpoint, info] = await Promise.all([
-				// Inside the sandbox inspect the inherited handle, without resolving its proc magic link.
-				pid === "self" ? fstatSync(fd, { bigint: true }) : stat(`${root}/fd/${fd}`, { bigint: true }),
-				descriptorTarget(pid, fd),
-				text(`${root}/fdinfo/${fd}`),
-			]);
-			const flags = /^flags:\s*([0-7]+)/m.exec(info)?.[1];
-			if (!flags) throw new Error(`held descriptor ${fd} flags unavailable`);
-			const proof = regularDescriptors?.find(descriptor => descriptor.fd === fd);
-			/** @type {DescriptorType} */
-			const type = endpoint === "anon_inode:[eventfd]" ? "eventfd" : metadata.isFile() ? "regular" : metadata.isDirectory() ? "directory" : metadata.isFIFO() ? "pipe" : metadata.isSocket() ? "socket" :
-				metadata.isCharacterDevice() ? (proof?.type === "null" && metadata.rdev === 259n ? "null" : endpoint?.startsWith("/dev/pts/") ? "tty" : "device") : "other";
-			if ((["regular", "null", "directory", "eventfd"].includes(type) || (type === "pipe" || type === "socket") && proof) && pid !== "self" && (!proof || proof.device !== String(metadata.dev) || proof.inode !== String(metadata.ino) ||
-				proof.flags !== (Number.parseInt(flags, 8) & ~0o2000000) || String(proof.offset) !== /^pos:\s*(\d+)/m.exec(info)?.[1])) {
-				throw new Error(`held descriptor ${fd} lacks matching native OFD evidence`);
-			}
-			if (proof && type !== (proof.type ?? "regular")) throw new Error(`held descriptor ${fd} changed type`);
-			return {
-				fd, endpoint, type,
-				// Unproven null devices share one identity: a sandbox may serve its own /dev/null inode.
-				identity: proof ? `ofd:${proof.alias}` : type === "device" && endpoint === "/dev/null" ? "/dev/null" : `${metadata.dev}:${metadata.ino}`,
-				...((type === "pipe" || type === "socket") && proof ? { queue: `${metadata.dev}:${metadata.ino}` } : {}),
-				flags: Number.parseInt(flags, 8) & ~0o2000000,
-			};
+		readFile(`${root}/status`, "utf8"), readFile(`${root}/limits`, "utf8"), readFile(`${root}/stat`, "utf8"), stat("/bin/sh", { bigint: true }),
+		Promise.all([...new Set(inheritedDescriptors.map(Number))].sort((a, b) => a - b).map(async fd => {
+			const [metadata, endpoint, fdinfo] = await Promise.all([stat(`${root}/fd/${fd}`, { bigint: true }), readlink(`${root}/fd/${fd}`), readFile(`${root}/fdinfo/${fd}`, "utf8")]);
+			return { fd, stat: fields(metadata), endpoint, fdinfo };
 		})),
 	]);
+	return processContextFromRaw({ status, limits, processStat, shell: fields(shell), descriptors }, regularDescriptors ?? []);
+}
+
+/**
+ * A context from what a process reported, fd 0 closed when absent. With `regularDescriptors` (held evidence), every
+ * regular, null, directory or eventfd stream and every proven queue must match its native OFD proof.
+ * Capture does not authorize reuse: the broker bypasses unsupported streams for native fallback.
+ * @param {RawProcessContext} raw
+ * @param {readonly HeldFileDescriptor[]} [regularDescriptors]
+ * @returns {ProcessExecutionContext}
+ */
+export function processContextFromRaw({ status, limits, processStat, shell, descriptors: reported }, regularDescriptors) {
+	if (!reported.every(({ fd }, index) => Number.isSafeInteger(fd) && fd >= 0 && (index === 0 || fd > reported[index - 1].fd))) throw new Error("invalid reported descriptors");
+	const descriptors = [...(reported[0]?.fd === 0 ? [] : [undefined]), ...reported].map(item => {
+		if (!item) return { fd: 0, endpoint: undefined, type: /** @type {DescriptorType} */ ("closed"), identity: "closed:0", flags: 0, queue: undefined };
+		const { fd, stat: metadata, endpoint, fdinfo: info } = item, format = BigInt(metadata.mode) & 0o170000n;
+		const flags = /^flags:\s*([0-7]+)/m.exec(info)?.[1];
+		if (!flags) throw new Error(`held descriptor ${fd} flags unavailable`);
+		const proof = regularDescriptors?.find(descriptor => descriptor.fd === fd);
+		/** @type {DescriptorType} */
+		const type = endpoint === "anon_inode:[eventfd]" ? "eventfd" : format === 0o100000n ? "regular" : format === 0o040000n ? "directory" : format === 0o010000n ? "pipe" : format === 0o140000n ? "socket" :
+			format === 0o020000n ? (proof?.type === "null" && BigInt(metadata.rdev) === 259n ? "null" : endpoint?.startsWith("/dev/pts/") ? "tty" : "device") : "other";
+		if ((["regular", "null", "directory", "eventfd"].includes(type) || (type === "pipe" || type === "socket") && proof) && regularDescriptors && (!proof || proof.device !== metadata.dev || proof.inode !== metadata.ino ||
+			proof.flags !== (Number.parseInt(flags, 8) & ~0o2000000) || String(proof.offset) !== /^pos:\s*(\d+)/m.exec(info)?.[1])) {
+			throw new Error(`held descriptor ${fd} lacks matching native OFD evidence`);
+		}
+		if (proof && type !== (proof.type ?? "regular")) throw new Error(`held descriptor ${fd} changed type`);
+		return {
+			fd, endpoint, type,
+			// Unproven null devices share one identity: a sandbox may serve its own /dev/null inode.
+			identity: proof ? `ofd:${proof.alias}` : type === "device" && endpoint === "/dev/null" ? "/dev/null" : `${metadata.dev}:${metadata.ino}`,
+			...((type === "pipe" || type === "socket") && proof ? { queue: `${metadata.dev}:${metadata.ino}` } : {}),
+			flags: Number.parseInt(flags, 8) & ~0o2000000,
+		};
+	});
 	const [input, output, error] = descriptors;
+	if (!output || output.fd !== 1 || !error || error.fd !== 2) throw new Error("reported process lacks its output streams");
 	/** @param {string} name */
 	const field = name => {
 		const value = new RegExp(`^${name}:\\s*(.*)$`, "m").exec(status)?.[1];
@@ -88,8 +97,7 @@ export async function captureProcessContext(pid, inheritedDescriptors, regularDe
 		executionDomain: "ptrace",
 		rlimits: limits.split("\n").slice(1).map(line => line.trim().split(/\s{2,}/).slice(0, 2)),
 		credentials: { uid: uid[0], euid: uid[1], gid: gid[0], egid: gid[1], groups },
-		systemMetadata: Object.fromEntries(["dev", "ino", "mode", "uid", "gid", "rdev"].map(name =>
-			[name, String(shell[/** @type {keyof typeof shell} */ (name)])])),
+		systemMetadata: Object.fromEntries(["dev", "ino", "mode", "uid", "gid", "rdev"].map(name => [name, String(shell[/** @type {keyof RawStat} */ (name)])])),
 		signals: { blocked: field("SigBlk"), ignored: field("SigIgn") },
 		scheduling: {
 			nice: Number(processStat.slice(processStat.lastIndexOf(") ") + 2).trim().split(/\s+/)[16]),
@@ -179,14 +187,6 @@ function discardFlags() {
 		nullOutputFlags = Number.parseInt(flags, 8) & ~0o2000000;
 	}
 	return nullOutputFlags;
-}
-
-/** @param {number | "self"} pid @param {number} fd */
-function descriptorTarget(pid, fd) {
-	const target = `/proc/${pid}/fd/${fd}`;
-	if (pid !== "self") return readlink(target);
-	// The broker rejects missing output endpoints and preserves native fallback.
-	try { return readlinkSync(target); } catch { return undefined; }
 }
 
 /** @param {{ credentials: Record<string, unknown>, [key: string]: unknown }} semantic */

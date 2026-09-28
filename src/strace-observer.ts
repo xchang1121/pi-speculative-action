@@ -56,8 +56,6 @@ export interface StraceObservationOptions {
 	readonly frozen?: { readonly pid: number; readonly fd: number; readonly syscall: string; readonly bytes: number };
 	/** Intercepted path to native target; a later exec of the target in the same process proves descriptor-preserving bypass. */
 	readonly interposedExecutables?: readonly (readonly [intercepted: string, original: string])[];
-	/** The dispatcher's interpreter, which may run between an intercepted exec and its in-place native exec. */
-	readonly interpositionInterpreter?: string;
 	/**
 	 * Workspace roots whose driver-specific unsupported errors must invalidate adoption. This keeps
 	 * a COW substrate from changing a command result when the Actor filesystem supports the syscall.
@@ -600,8 +598,7 @@ export async function observeStrace(
 		? resourceTransitions(selected, root.file.pid, options) : { journal: [], handled: new Set<TraceLine>(), retained: [], finalHandles: [] };
 	const interposedExecutables = new Map((options.interposedExecutables ?? []).map(([intercepted, original]) => [path.posix.resolve(intercepted), path.posix.resolve(original)]));
 	const semanticRoots = (options.guardFilesystemSemanticsWithin ?? []).map((value) => path.posix.resolve(value));
-	const { ignored: ignoredSegments, resumed: resumedInterpositions } = ignoredProcessSegments(selected, interposedExecutables,
-		options.interpositionInterpreter && path.posix.resolve(options.interpositionInterpreter));
+	const { ignored: ignoredSegments, resumed: resumedInterpositions } = ignoredProcessSegments(selected, interposedExecutables);
 	const observeMetadata = (observedPath: string, followSymlinks: boolean, { digest, fields }: StatObservation) => {
 		const identity = `metadata:${followSymlinks}:${fields?.join(",") ?? ""}:${observedPath}`;
 		if (metadata.get(identity)?.digest !== undefined && metadata.get(identity)?.digest !== digest) {
@@ -803,7 +800,7 @@ function resourceLimitMutation(line: TraceLine, syscall: string): boolean {
 	return syscall === "setrlimit" || (syscall === "prlimit64" && line.args[2] !== "NULL");
 }
 
-function ignoredProcessSegments(selected: ReadonlyMap<number, TraceProcess>, interposedExecutables: ReadonlyMap<string, string>, interpreter?: string) {
+function ignoredProcessSegments(selected: ReadonlyMap<number, TraceProcess>, interposedExecutables: ReadonlyMap<string, string>) {
 	const ignored = new Map<number, Array<readonly [number, number]>>(), resumed = new Set<number>();
 	if (!interposedExecutables.size) return { ignored, resumed: [] };
 	const fullyIgnored = new Map<number, number>();
@@ -816,18 +813,11 @@ function ignoredProcessSegments(selected: ReadonlyMap<number, TraceProcess>, int
 			const executable = quotedStrings(line)[0];
 			const original = executable && interposedExecutables.get(tracedPath(executable, cwd) ?? "");
 			if (!original) continue;
-			let resumedAt = -1, resumedExecutable: string | undefined, resumedCwd = cwd;
-			for (let candidateIndex = index + 1; candidateIndex < file.lines.length; candidateIndex++) {
-				const candidate = file.lines[candidateIndex]!;
-				resumedCwd = tracedCwd(candidate, resumedCwd);
-				if (!successfulExec(candidate)) continue;
-				resumedAt = candidateIndex;
-				const target = quotedStrings(candidate)[0];
-				resumedExecutable = target && tracedPath(target, resumedCwd);
-				// An in-place bypass passes through the dispatcher's interpreter and the launcher at an intercepted path.
-				if (resumedExecutable !== interpreter && !interposedExecutables.has(resumedExecutable ?? "")) break;
-			}
-			if (resumedExecutable === original) {
+			// An in-place bypass: the launcher at the intercepted path next execs the original image, by its absolute path.
+			let resumedAt = index + 1;
+			while (resumedAt < file.lines.length && !successfulExec(file.lines[resumedAt]!)) resumedAt++;
+			const target = resumedAt < file.lines.length ? quotedStrings(file.lines[resumedAt]!)[0] : undefined;
+			if (target && tracedPath(target, cwd) === original) {
 				(ignored.get(pid) ?? ignored.set(pid, []).get(pid)!).push([index, resumedAt]);
 				resumed.add(pid);
 				index = resumedAt - 1;
@@ -838,7 +828,7 @@ function ignoredProcessSegments(selected: ReadonlyMap<number, TraceProcess>, int
 			break;
 		}
 	}
-	// The dispatcher's own threads (libuv probes io_uring, which the sandbox denies) belong to its ignored segment.
+	// Anything the launcher spawned while it was dispatching belongs to its ignored segment.
 	for (const [pid, segments] of ignored) if (!fullyIgnored.has(pid)) for (const [from, to] of segments) for (const line of selected.get(pid)!.file.lines.slice(from, to)) {
 		const child = spawnedPID(line);
 		if (child && !fullyIgnored.has(child)) fullyIgnored.set(child, 0);
