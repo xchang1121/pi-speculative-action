@@ -1,3 +1,4 @@
+import { BoundedRecencyMap } from "./bounded-recency-map.ts";
 import { routedProcessContext, validProcessContext, type ProcessExecutionContext } from "./process-context.mjs";
 import { execFile, spawn } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -94,11 +95,7 @@ import {
 	type WorldReuseMetrics,
 } from "./execution-world.ts";
 import { type ProcessReusePlan, ProcessReusePlanner } from "./reuse-planner.ts";
-import {
-	ProvenanceCertificateStore,
-	type ProvenanceStoreOptions,
-	type VerifiedArtifactClosure,
-} from "./reuse-store.ts";
+import { ProvenanceCertificateStore, type ProvenanceStoreOptions, type VerifiedArtifactClosure } from "./reuse-store.ts";
 import { SpeculationScheduler, type ServiceTimingIdentity, waitForCandidate } from "./scheduler.ts";
 import { observeStrace, straceCommand, type ObservedProcessPath, type StraceObservation } from "./strace-observer.ts";
 import type { ToolProcessInvocation } from "./tool-settlement.ts";
@@ -118,7 +115,7 @@ import { containsFilesystemPath as pathContains, relativeFilesystemPath, slash }
 const BACKEND_EPOCH = "pi-linux-process-instance-inputs";
 const POLICY_ID = "sandlock-virtual-root-transparent-exec";
 const LEAF_POLICY_ID = "sandlock-virtual-workspace-leaf";
-const MAX_REQUEST_BYTES = 4 * 1024 * 1024, LEARNED_LAUNCHES = 64, MAX_INTERPOSED_MOUNT_BYTES = 512 * 1024;
+const MAX_REQUEST_BYTES = 4 * 1024 * 1024, LEARNED_LAUNCHES = 64, MAX_INTERPOSED_MOUNT_BYTES = 512 * 1024, CHEAP_CHILD_MS = 500;
 const MAX_CONTINUATION_BYTES = 65 * 1024 * 1024;
 const IO_FRONTIERS = new Map([[0, "read"], [1, "write"], [19, "readv"], [20, "writev"], [44, "sendto"], [45, "recvfrom"], [46, "sendmsg"], [47, "recvmsg"]]);
 const MAX_CAPTURE_BYTES = 512 * 1024 * 1024;
@@ -135,6 +132,8 @@ export interface LinuxProcessBackendOptions {
 	readonly heldExecBinary?: string;
 	/** Additional host paths that speculative processes must never read. */
 	readonly deniedPaths?: readonly string[];
+	/** A nested child whose recent traced runs all took less resumes in place instead of in its own sandbox (0 disables). */
+	readonly cheapChildMs?: number;
 }
 
 export interface CompletedProcessReplayOptions {
@@ -199,11 +198,7 @@ interface InterposedDirectory { readonly source: string; readonly target: string
 
 interface SandboxMount { readonly virtualPath: string; readonly hostPath: string; readonly readOnly: boolean; }
 
-interface ExecMount {
-	readonly virtualPath: string;
-	readonly hostPath: string;
-	readonly alias?: true;
-}
+interface ExecMount { readonly virtualPath: string; readonly hostPath: string; readonly alias?: true; }
 
 interface DispatcherRequest {
 	readonly token: string;
@@ -231,10 +226,7 @@ type BoundProcessInvocation = ProcessArguments & {
 	readonly producer?: ProcessProducerProof;
 };
 
-interface BufferedOutput {
-	readonly fd: 1 | 2;
-	readonly data: Buffer;
-}
+interface BufferedOutput { readonly fd: 1 | 2; readonly data: Buffer; }
 
 interface DispatcherResponse {
 	readonly kind: "hit" | "executed" | "bypass" | "suspended";
@@ -268,11 +260,7 @@ interface ActiveSession {
 	readonly bypasses: [pid: number, reason: string][];
 	readonly metrics: MutableLinuxProcessReuseMetrics;
 	topLevelCapture?: TopLevelCapture;
-	topLevelExecution?: {
-		readonly prototype: ExecPrototype;
-		readonly outcome: SpawnOutcome;
-		readonly observedProcessMs: number;
-	};
+	topLevelExecution?: { readonly prototype: ExecPrototype; readonly outcome: SpawnOutcome; readonly observedProcessMs: number; };
 	topLevelEvidence?: DynamicDependencyCertificate;
 	topLevelOutputEndpoints?: readonly [string, string];
 	sealPromise?: Promise<readonly SandboxWorkspaceChange[]>;
@@ -285,11 +273,7 @@ interface TopLevelCapture {
 	readonly observation: StraceObservation;
 }
 
-interface SpawnOutcome {
-	readonly code: number | null;
-	readonly signal: NodeJS.Signals | null;
-	readonly output: readonly BufferedOutput[];
-}
+interface SpawnOutcome { readonly code: number | null; readonly signal: NodeJS.Signals | null; readonly output: readonly BufferedOutput[]; }
 
 type ReadyProcessPlan = Exclude<ProcessReusePlan, { kind: "miss" }>;
 
@@ -322,6 +306,8 @@ export class LinuxProcessReuseBackend {
 	private disposed = false;
 	private readonly handoffs: ProcessHandoffRegistry<BoundProcessInvocation | { readonly trackingOnly: true; readonly sourceRoot: string }>;
 	private readonly processScheduler = new SpeculationScheduler<object>();
+	/** Recent traced run times of nested children by executable, the longest kept: a cheap child never repays its own sandbox. */
+	private readonly childRunMs = new BoundedRecencyMap<string, readonly number[]>(512);
 	private readonly counters: MutableLinuxProcessReuseMetrics = { ...emptyWorldReuseMetrics() };
 	private readonly actorCounters: MutableLinuxProcessReuseMetrics = { ...emptyWorldReuseMetrics() };
 	private readonly replayWorkspace = new WorkspaceSandboxService();
@@ -857,7 +843,7 @@ export class LinuxProcessReuseBackend {
 			return { kind: "bypass", executable };
 		}
 		const { argv0, args, cwd, environment } = request;
-		return this.executeRequest(session, { argv0, args, cwd, environment }, executable, eligibility.route, requestID);
+		return this.executeRequest(session, { argv0, args, cwd, environment }, executable, eligibility.route, requestID, undefined, undefined, request.pid);
 	}
 
 	private async executeBinding(session: ActiveSession, binding: ProcessExecutionBinding) {
@@ -880,7 +866,7 @@ export class LinuxProcessReuseBackend {
 
 	private async executeRequest(session: ActiveSession, request: ProcessArguments, executable: string, outputRoute: OutputRoute,
 		requestID: number, prototype?: ExecPrototype,
-		captureWorkspace?: (capture: Omit<TopLevelCapture, "observation">) => void): Promise<DispatcherResponse> {
+		captureWorkspace?: (capture: Omit<TopLevelCapture, "observation">) => void, inPlace?: number): Promise<DispatcherResponse> {
 		prototype ??= await this.prototype(session, request, executable, outputRoute);
 		const weakKey = processWeakKey(prototype);
 		const acquired = await this.acquireProcessResult(
@@ -901,6 +887,12 @@ export class LinuxProcessReuseBackend {
 		if (!acquired.work) throw new Error("process work reservation failed");
 		this.add(session, "misses");
 		try {
+			// Without a result to reuse, a child whose recent runs were all cheap resumes in place within its parent's trace.
+			if (inPlace !== undefined && Math.max(...this.childRunMs.get(prototype.executablePath) ?? [Infinity]) < (this.options.cheapChildMs ?? CHEAP_CHILD_MS)) {
+				this.add(session, "bypasses");
+				session.bypasses.push([inPlace, `broker_bypass:${path.posix.basename(prototype.executablePath)}:cheap_child`]);
+				return { kind: "bypass", executable };
+			}
 			return await this.executeAndPublish(session, request, executable, prototype, weakKey, outputRoute, acquired.work, requestID, captureWorkspace);
 		} finally {
 			this.handoffs.complete(weakKey, acquired.work);
@@ -1047,19 +1039,13 @@ export class LinuxProcessReuseBackend {
 			}
 			const available = this.handoffs.mayHaveExecutable(executablePath) || await this.store.mayHaveCertificates(executablePath) ||
 				this.handoffs.mayHaveExecutable(executablePath);
-			if (!learning && !available) {
-				this.addActor("misses");
-				return { kind: "continue" };
-			}
+			if (!learning && !available) { this.addActor("misses"); return { kind: "continue" }; }
 			const inspected = await inspectHeldExecProcess(process.pid, executable, process.descriptors);
 			const resources = process.descriptors?.length
 				? await captureHeldDescriptorInputs(process.pid, process.descriptors, Math.min(MAX_REQUEST_BYTES / 2, this.store.limits.maxBytes),
 					sensitivePaths(this.options.storeRoot, this.options.deniedPaths), observation?.closed ? undefined : observation?.inputs, process.tracerPid, sourceRoot) : undefined;
 			const snapshot = { ...inspected, ...(resources ? { resources } : {}) };
-			if (!pathContains(sourceRoot, snapshot.cwd)) {
-				this.addActor("bypasses");
-				return { kind: "continue" };
-			}
+			if (!pathContains(sourceRoot, snapshot.cwd)) { this.addActor("bypasses"); return { kind: "continue" }; }
 			const observe = (prototype: ExecPrototype, durationMs: number) => {
 				const weakKey = processWeakKey(prototype);
 				this.processScheduler.observeActorService(processTimingIdentity(prototype, weakKey), durationMs);
@@ -1383,6 +1369,7 @@ export class LinuxProcessReuseBackend {
 			// Replays write each event to the target's own descriptor, whichever outlet this route gave it.
 			outcome = { ...outcome, output: outcome.output.map(event => ({ ...event, fd: outputRoute[0] === event.fd ? 1 : 2 })) };
 			const observedProcessMs = continuation ? continuation.computation.completedAt - continuation.computation.startedAt : Math.max(0, performance.now() - processStarted);
+			if (!continuation) this.childRunMs.set(prototype.executablePath, [observedProcessMs, ...this.childRunMs.get(prototype.executablePath) ?? []].slice(0, 8));
 			releaseInputs();
 			try {
 				if (suspensionAttempted && !continuation) throw new Error("private process suspension was not sealed");
@@ -1508,10 +1495,7 @@ export class LinuxProcessReuseBackend {
 				const certificate = sealProcessCertificate({ prototype, producer: session.nestedProducer, dependencyCertificate, result });
 				certificateID = certificate.id;
 				session.nestedEvidence.push(certificate.dependencyCertificate);
-				if (taints.size) {
-					this.add(session, "tainted");
-					this.setError(session, `tainted:${[...taints].join(",")}`);
-				}
+				if (taints.size) { this.add(session, "tainted"); this.setError(session, `tainted:${[...taints].join(",")}`); }
 				stage = "handoff_registration";
 				if (await this.handoffs.publish(
 					weakKey,
@@ -1585,13 +1569,7 @@ export class LinuxProcessReuseBackend {
 		const add = (metric: CountedReuseMetric) => session ? this.add(session, metric) : this.addActor(metric);
 		add("hits");
 		if (joined) add("joinedHits");
-		add(
-			producer && scope
-				? sameScope(producer, scope)
-					? "sameTurnHits"
-					: "crossTurnHits"
-				: "unattributedHits",
-		);
+		add(producer && scope ? sameScope(producer, scope) ? "sameTurnHits" : "crossTurnHits" : "unattributedHits");
 	}
 
 	private setError(session: ActiveSession, detail: string): void {
@@ -1599,10 +1577,7 @@ export class LinuxProcessReuseBackend {
 		session.metrics.lastError = detail;
 	}
 
-	private setActorError(detail: string): void {
-		this.counters.lastError = detail;
-		this.actorCounters.lastError = detail;
-	}
+	private setActorError(detail: string): void { this.counters.lastError = detail; this.actorCounters.lastError = detail; }
 
 	private async resolveRequestedExecutable(session: ActiveSession, request: DispatcherRequest): Promise<string> {
 		if (!request.name || request.name.includes("/") || request.name.includes("\0")) throw new Error("invalid executable name");

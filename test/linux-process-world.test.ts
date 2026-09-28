@@ -39,6 +39,7 @@ import {
 	forkReusableBash,
 	prepareLinuxProcessReuse,
 	holdProcessPublication,
+	textOutput,
 } from "./linux-process-fixture.ts";
 
 vi.mock("node:child_process", { spy: true });
@@ -1679,6 +1680,23 @@ int main(void) {
 			await rm(root, { recursive: true, force: true });
 		}
 	});
+	test("resumes a child in place once its recent nested runs were cheap", async ({ skip }) => {
+		if (process.platform !== "linux") return skip("Linux only");
+		const fixture = await createLinuxProcessBenchmark("pi-cheap-child-", undefined, { cheapChildMs: 60_000 });
+		try {
+			for (const name of ["a.txt", "b.txt"]) await writeFile(path.join(fixture.workspace, name), `${name}\n`);
+			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
+			const run = async (label: string, name: string) => {
+				const before = fixture.backend.metrics(), branch = await forkReusableBash(fixture, { label, command: `cat ${name} | cat`, actionNamespace: "cheap-child", executionFingerprint });
+				try { return { text: textOutput(branch.output.result), bypasses: fixture.backend.metrics().bypasses - before.bypasses }; }
+				finally { await branch.dispose?.(); }
+			};
+			// The first cat learns its run time in its own sandbox; a different cat then needs none.
+			expect(await run("learn", "a.txt")).toMatchObject({ text: "a.txt\n" });
+			expect(await run("cheap", "b.txt")).toEqual({ text: "b.txt\n", bypasses: 2 });
+		} finally { await fixture.dispose(); }
+	});
+
 	test("defers empty replay, retains later evidence and drains lazy preparation before refresh", async ({ skip }) => {
 		if (process.platform !== "linux") return skip("Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-process-admission-");

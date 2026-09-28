@@ -52,6 +52,7 @@ export function holdProcessPublication(backend: LinuxProcessReuseBackend) {
 export async function createLinuxProcessBenchmark(
 	rootPrefix: string,
 	workspaceDriver?: WorkspaceSandboxDriver,
+	backendOptions: { readonly cheapChildMs?: number } = {},
 ) {
 	if (process.platform !== "linux") throw new Error("Run this benchmark inside Linux or WSL 2");
 	const root = await mkdtemp(path.join(os.tmpdir(), rootPrefix));
@@ -66,8 +67,9 @@ export async function createLinuxProcessBenchmark(
 		LANG: "C.UTF-8",
 	});
 	const localOperations = createLocalBashOperations({ shellPath });
+	// Fixture children are cheap stand-ins for the expensive children nested reuse serves.
 	const backend = new LinuxProcessReuseBackend({
-		storeRoot,
+		storeRoot, cheapChildMs: 0, ...backendOptions,
 		...(process.env.PI_SPEC_SANDLOCK ? { sandlockBinary: process.env.PI_SPEC_SANDLOCK } : {}),
 		...(process.env.PI_SPEC_HELD_EXEC ? { heldExecBinary: process.env.PI_SPEC_HELD_EXEC } : {}),
 		...(process.env.PI_SPEC_STRACE ? { straceBinary: process.env.PI_SPEC_STRACE } : {}),
