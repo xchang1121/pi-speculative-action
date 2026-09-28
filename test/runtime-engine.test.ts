@@ -5,11 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 import { type ActionProjectionRule, READ_RANGE_ACTION_KEY_PROJECTOR } from "../src/action-key-projection.ts";
 import { buildPiActionKey, PI_ACTION_SEMANTICS, type ActionKey } from "../src/action-semantics.ts";
 import { EffectTransactionCoordinator, effectCommitFailure } from "../src/effect-transaction.ts";
-import {
-	emptyWorldReuseMetrics,
-	type SpeculativeExecutionRoute,
-	type WorldBranch,
-} from "../src/execution-world.ts";
+import { emptyWorldReuseMetrics, type SpeculativeExecutionRoute, type WorldBranch } from "../src/execution-world.ts";
 import type {
 	MaterializedSpeculativeCandidate,
 	PreparedActorCall,
@@ -25,10 +21,7 @@ import { ToolExecutionGateway } from "../src/tool-execution-gateway.ts";
 import { cause, type PredictionSettlement, type ResourceValidation, zeroValidationMetrics } from "../src/settlement.ts";
 import { emptySpeculativeTraceSummary, reduceSpeculativeTrace, summarizeSpeculativeTrace } from "../src/trace-summary.ts";
 
-interface Start<SessionID = string> {
-	readonly sessionID: SessionID;
-	readonly turnID: string;
-}
+interface Start<SessionID = string> { readonly sessionID: SessionID; readonly turnID: string; }
 
 interface Call<SessionID = string> extends Start<SessionID> {
 	readonly id?: string;
@@ -69,11 +62,7 @@ function planSource(source: Omit<Source, "id" | "enabled"> & Partial<Pick<Source
 	return { id: "source", enabled: () => true, ...source };
 }
 
-function readAction<Input>(
-	id: string,
-	input: Input,
-	options: Partial<Omit<PlanAction, "id" | "type" | "tool" | "input">> = {},
-) {
+function readAction<Input>(id: string, input: Input, options: Partial<Omit<PlanAction, "id" | "type" | "tool" | "input">> = {}) {
 	return { id, type: "tool_call" as const, tool: "read", ...options, input };
 }
 
@@ -480,10 +469,7 @@ describe("structural speculative runtime", () => {
 		let turnID = "parallel-admission";
 		try {
 			await runtime.startTurn(start(turnID), caller.signal);
-			if (observation) {
-				const seed = call(turnID, { path: "seed.ts" });
-				await runFallback(runtime, seed, 1, "Actor");
-			}
+			if (observation) { const seed = call(turnID, { path: "seed.ts" }); await runFallback(runtime, seed, 1, "Actor"); }
 			await slow.entered; await independentStarted.promise;
 			if (revised) {
 				expect(keyed).toContain("replacement.ts"); await replacementReady.promise;
@@ -523,10 +509,7 @@ describe("structural speculative runtime", () => {
 				expect(executed).not.toContain("slow.ts");
 				expect(runtime.inspect().pendingPredictions).toBe(0);
 			}
-		} finally {
-			slow.release();
-			await runtime.finishTurn({ ...call(turnID), terminal: true }); await runtime.dispose();
-		}
+		} finally { slow.release(); await runtime.finishTurn({ ...call(turnID), terminal: true }); await runtime.dispose(); }
 		const settlements = events.filter(event => event.type === "prediction").map(event => event.settlement);
 		expect(new Set(settlements.map(settlement => settlement.prediction.id)).size).toBe(settlements.length);
 		if (revised) expect(settlements.filter(s => s.prediction.proposalID === "proposal:0" && s.observation === "observed"))
@@ -835,10 +818,7 @@ describe("structural speculative runtime", () => {
 						entered.arrive();
 						await entered.promise;
 						if (proposalIndex === 0) return mode === "empty" ? undefined : plan("first", { path: "first.ts" });
-						if (proposalIndex === 1) {
-							await winner.promise;
-							return plan("winner");
-						}
+						if (proposalIndex === 1) { await winner.promise; return plan("winner"); }
 						return new Promise<undefined>((resolve) => signal.addEventListener("abort", () => resolve(undefined), { once: true }));
 					},
 				}),
@@ -869,11 +849,7 @@ describe("structural speculative runtime", () => {
 				expect(events).toContainEqual(expect.objectContaining({ type: "source_request",
 					request: expect.objectContaining({ request: expect.objectContaining({ index: 2 }),
 						settlement: expect.objectContaining({ status: "aborted", cause: expect.objectContaining({ code: "proposal_race_lost" }) }) }) }));
-			} finally {
-				winner.arrive();
-				binding.arrive();
-				await runtime.dispose();
-			}
+			} finally { winner.arrive(); binding.arrive(); await runtime.dispose(); }
 		}
 	});
 
@@ -962,10 +938,7 @@ describe("structural speculative runtime", () => {
 		});
 		const { runtime, events, executions: executionCount } = harness({
 			source,
-			preflightCandidate: async () => {
-				await admission.wait();
-				return { ok: true };
-			},
+			preflightCandidate: async () => { await admission.wait(); return { ok: true }; },
 			onEvent: (event) => {
 				if (event.type === "source_request") requestsSettled.arrive();
 			},
@@ -1622,10 +1595,7 @@ describe("structural speculative runtime", () => {
 				expect(actor).toHaveBeenCalledTimes(phase === "input" ? 0 : 1);
 				expect(committed).toHaveBeenCalledTimes(phase === "input" ? 1 : 0);
 			}
-		} finally {
-			gate.release(); await Promise.all([preparation, closing]);
-			await runtime.dispose(); await gateway.dispose();
-		}
+		} finally { gate.release(); await Promise.all([preparation, closing]); await runtime.dispose(); await gateway.dispose(); }
 		expect(disposed).toHaveBeenCalledOnce(); expect(runtime.inspect().sharedCandidates).toBe(0);
 	});
 
@@ -1814,10 +1784,7 @@ describe("structural speculative runtime", () => {
 			const previewCall = call(turnID, { path: "preview.ts" });
 			const preview = runtime.previewActorCall(previewCall);
 			await gate.entered;
-			if (settlePreview === true) {
-				gate.release();
-				await preview;
-			}
+			if (settlePreview === true) { gate.release(); await preview; }
 			executor = "actor";
 			const actorCall = { ...previewCall, input: { path: formalPath } };
 			const consumed = settlePreview === "next-event"
@@ -2318,17 +2285,11 @@ describe("structural speculative runtime", () => {
 		const executed: string[] = [];
 		const source = planSource({
 			proposalCount: () => 1,
-			propose: () => {
-				proposals++;
-				return plan("cross-turn", { path: "parent.ts" });
-			},
+			propose: () => { proposals++; return plan("cross-turn", { path: "parent.ts" }); },
 			continue: async ({ proposalID, actionID, revision, candidate, trigger }) => {
 				if (String(candidate.input.path) !== "parent.ts") return undefined;
 				continuations.push(trigger);
-				if (trigger === "execution_succeeded") {
-					await gate.wait();
-					if (phase === "retry") return undefined;
-				}
+				if (trigger === "execution_succeeded") { await gate.wait(); if (phase === "retry") return undefined; }
 				const child = trigger === "execution_succeeded" ? "child" : "late-child";
 				return childPlanUpdate({ proposalID, actionID, revision }, child, `${child}.ts`);
 			},
@@ -2364,10 +2325,7 @@ describe("structural speculative runtime", () => {
 				await runtime.startTurn(start("child-turn"));
 				expect(proposals).toBe(1);
 				if (retained) { gate.release(); await childReady.promise; }
-				else {
-					const unrelated = call("child-turn", { path: "other.ts" });
-					await runFallback(runtime, unrelated);
-				}
+				else { const unrelated = call("child-turn", { path: "other.ts" }); await runFallback(runtime, unrelated); }
 			}
 			await nextTurn();
 			expect(continuations).toEqual(["execution_succeeded", ...(phase === "retry" ? ["actor_adopted"] : [])]);
@@ -2404,10 +2362,7 @@ describe("structural speculative runtime", () => {
 				}
 				return { ok: true };
 			},
-			execute: (_tool, input) => {
-				executed.push(String(input.path));
-				return `${String(input.path)}:output`;
-			},
+			execute: (_tool, input) => { executed.push(String(input.path)); return `${String(input.path)}:output`; },
 			onEvent: childReady.observe,
 		});
 

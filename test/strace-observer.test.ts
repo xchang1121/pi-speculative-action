@@ -27,17 +27,30 @@ async function observe(processes: Record<number, readonly string[]>, options?: S
 }
 
 describe("strace provenance decoder", () => {
-	test("leaves the sandbox's device out of a device-blind program's workspace stats", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-device-blind-")), prefix = path.join(root, "process");
-		const run = async (argv: readonly string[], target: string) => {
+	test("records only the workspace stat fields a program reveals, and flags it read of descriptors it opened", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-stat-fields-")), prefix = path.join(root, "process");
+		const run = async (argv: readonly string[], target: string, extra: readonly string[] = []) => {
 			await fs.writeFile(`${prefix}.100`, [`execve("/usr/bin/${argv[0]}", [${argv.map((item) => `"${item}"`).join(", ")}], 0x0) = 0`,
-				`newfstatat(AT_FDCWD, "${target}", ${STAT}, AT_SYMLINK_NOFOLLOW) = 0`, "+++ exited with 0 +++"].join("\n"));
-			return (await observeStrace(prefix, `/usr/bin/${argv[0]}`, "/work", { guardFilesystemSemanticsWithin: ["/work"] })).paths.find((item) => item.role === "metadata");
+				`newfstatat(AT_FDCWD, "${target}", ${STAT}, AT_SYMLINK_NOFOLLOW) = 0`, ...extra, "+++ exited with 0 +++"].join("\n"));
+			return observeStrace(prefix, `/usr/bin/${argv[0]}`, "/work", { guardFilesystemSemanticsWithin: ["/work"] });
 		};
+		const fields = async (argv: readonly string[], target = "/work/a.txt") => (await run(argv, target)).paths.find((item) => item.role === "metadata")!;
 		try {
-			expect(await run(["ls", "-la"], "/work/a.txt")).toMatchObject({ path: "/work/a.txt", fields: FILESYSTEM_OBSERVATION_FIELDS.filter((field) => field !== "dev") });
-			for (const [argv, target] of [[["stat", "a.txt"], "/work/a.txt"], [["ls", "-la"], "/etc/hosts"], [["find", ".", "-printf", "%D %p"], "/work/a.txt"]] as const)
-				expect(await run(argv, target)).toSatisfy((item?: { path: string; fields?: unknown }) => item?.path === target && item.fields === undefined);
+			const all = FILESYSTEM_OBSERVATION_FIELDS, withoutDevice = all.filter((field) => field !== "dev");
+			for (const [argv, expected] of [[["cat", "a.txt"], ["mode"]], [["ls"], ["mode"]], [["ls", "-la"], withoutDevice], [["find", ".", "-size", "+1k"], ["mode", "size"]],
+				[["find", ".", "-newer", "b"], withoutDevice], [["bash", "-c", "true"], withoutDevice]] as const)
+				expect((await fields(argv)).fields, argv.join(" ")).toEqual(all.filter((field) => (expected as readonly string[]).includes(field)));
+			for (const [argv, target] of [[["stat", "a.txt"], "/work/a.txt"], [["cat", "hosts"], "/etc/hosts"], [["find", ".", "-printf", "%D %p"], "/work/a.txt"]] as const)
+				expect((await fields(argv, target)).fields, argv.join(" ")).toBeUndefined();
+			const flags = "fcntl(4</work>, F_GETFL) = 0x38800 (flags O_RDONLY|O_NONBLOCK|O_LARGEFILE|O_NOFOLLOW|O_DIRECTORY)";
+			expect((await run(["find", "."], "/work/a.txt", ['openat(AT_FDCWD, ".", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = 4</work>', flags])).taints).not.toContain("unsupported_syscall");
+			expect((await run(["find", "."], "/work/a.txt", [flags])).taints).toContain("unsupported_syscall");
+			// ls -l asks an NSS cache first: a refused local socket is only a path the Actor's host must lack too.
+			const nss = ["socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0) = 3<UNIX-STREAM:[9]>",
+				'connect(3<UNIX-STREAM:[9]>, {sa_family=AF_UNIX, sun_path="/var/run/nscd/socket"}, 110) = -1 EACCES (Permission denied)'];
+			const refused = await run(["ls", "-la"], "/work/a.txt", nss);
+			expect([refused.taints, refused.paths]).toEqual([[], expect.arrayContaining([{ path: "/var/run/nscd/socket", role: "input" }])]);
+			expect((await run(["ls", "-la"], "/work/a.txt", [nss[0]!, nss[1]!.replace("-1 EACCES (Permission denied)", "0")])).taints).toContain("network");
 		} finally { await fs.rm(root, { recursive: true, force: true }); }
 	});
 
@@ -308,7 +321,8 @@ describe("strace provenance decoder", () => {
 			['prctl(PR_SET_NAME, "worker socket(AF_UNIX) = -1 EPERM") = 0', []],
 			['prlimit64(0, RLIMIT_STACK, NULL, {rlim_cur=8388608, rlim_max=RLIM64_INFINITY}) = 0', []],
 			['setrlimit(RLIMIT_CORE, {rlim_cur=0, rlim_max=0}) = 0', ["unsupported_syscall"]],
-			['socket(AF_UNIX, SOCK_STREAM, 0) = 3<UNIX-STREAM:[1->2]>', ["network"]],
+			['socket(AF_UNIX, SOCK_STREAM, 0) = 3<UNIX-STREAM:[1->2]>', []],
+			['socket(AF_INET, SOCK_STREAM, IPPROTO_TCP) = 3<TCP:[4]>', ["network"]],
 			['getsockname(1, {sa_family=AF_UNIX, sun_path="/private/output"}, [110 => 18]) = 0', ["network"]],
 			['getpeername(1, {sa_family=AF_UNIX}, [110 => 2]) = 0', ["network"]],
 			['getpeername(0</dev/null<char 1:3>>, 0x123, [16]) = -1 ENOTSOCK (Socket operation on non-socket)', []],
