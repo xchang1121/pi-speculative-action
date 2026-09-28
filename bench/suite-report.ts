@@ -22,6 +22,7 @@ export interface SuiteBenchmarkSummary {
 export interface SuiteBenchmarkRun {
 	readonly instance: string;
 	readonly repeat: number;
+	readonly arm?: "on" | "off";
 	readonly output: string;
 	readonly implementationCommit?: string;
 	readonly summary?: SuiteBenchmarkSummary;
@@ -57,6 +58,23 @@ export function summarizeSuite(runs: readonly SuiteBenchmarkRun[]) {
 				return [instance, values.length ? pooled(values) : null];
 			}),
 		),
+	};
+}
+
+/** Speculation on versus off on the same instance and repeat: the ratio is measured, so it may fall below 1. */
+export function summarizePairs(runs: readonly SuiteBenchmarkRun[]) {
+	const on = runs.filter((run) => run.arm === "on"), off = runs.filter((run) => run.arm === "off");
+	const pairs = on.filter(hasTiming).flatMap((run) => {
+		const other = off.find((candidate) => candidate.instance === run.instance && candidate.repeat === run.repeat);
+		return other && hasTiming(other) ? [{ instance: run.instance, repeat: run.repeat, onMs: run.summary.actualEndToEndMs, offMs: other.summary.actualEndToEndMs }] : [];
+	});
+	const onMs = pairs.reduce((total, pair) => total + pair.onMs, 0), offMs = pairs.reduce((total, pair) => total + pair.offMs, 0);
+	return {
+		pairs: pairs.map((pair) => ({ ...pair, ratio: pair.offMs / pair.onMs })),
+		pairedRatio: pairs.length ? offMs / onMs : undefined,
+		pairedRatioP50: nearestRank(pairs.map((pair) => pair.offMs / pair.onMs), 0.5),
+		on: summarizeSuite(on),
+		off: summarizeSuite(off),
 	};
 }
 

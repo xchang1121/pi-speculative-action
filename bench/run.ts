@@ -5,27 +5,14 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { parseArgs } from "node:util";
-import { Agent, type AgentMessage, type AgentTool } from "@earendil-works/pi-agent-core";
-import { type Api, type AssistantMessage, type Model } from "@earendil-works/pi-ai";
-import { getModels, getProviders, streamSimple } from "@earendil-works/pi-ai/compat";
-import {
-	createBashTool,
-	createEditTool,
-	createFindTool,
-	createGrepTool,
-	createLsTool,
-	createReadTool,
-	createWriteTool,
-} from "@earendil-works/pi-coding-agent";
-import { createSpeculativeActionHost, type SpeculativeAgentSettingsInput } from "../src/agent-integration.ts";
-import { createResourceSnapshotExecutionWorld } from "../src/agent-execution-world.ts";
-import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
-import { ActorStreamPreviewTracker } from "../src/actor-stream-preview.ts";
+import { type Api, type AssistantMessage, type CredentialStore, type Model } from "@earendil-works/pi-ai";
+import { getModels, getProviders } from "@earendil-works/pi-ai/compat";
+import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { createSpeculativeActionHost } from "../src/agent-integration.ts";
 import { DEFAULTS } from "../src/common.ts";
-import { PI_OPERATION_TOOLS, resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
+import { createSpeculativeActionExtension } from "../src/extension.ts";
 import type { SpeculativeActionEvent } from "../src/runtime.ts";
 import { summarizeSpeculativeTrace } from "../src/trace-summary.ts";
-import { WorkspaceSandboxService } from "../src/workspace-sandbox.ts";
 
 const DATASET_ROWS =
 	"https://datasets-server.huggingface.co/rows?dataset=TokenRhythm%2FClaw-SWE-Bench&config=lite&split=test&offset=0&length=100";
@@ -47,6 +34,8 @@ type PreparedTask = Readonly<Awaited<ReturnType<typeof prepareTask>>>;
 
 type BenchmarkOptions = Readonly<typeof options>;
 
+const SECRET_VARIABLE = /(?:API_KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)/i;
+
 interface CommandResult {
 	readonly stdout: string;
 	readonly stderr: string;
@@ -57,8 +46,6 @@ const { values } = parseArgs({
 		instance: { type: "string" },
 		label: { type: "string", default: "baseline" },
 		actor: { type: "string", default: "deepseek/deepseek-v4-pro" },
-		"actor-max-tokens": { type: "string", default: "8192" },
-		"actor-temperature": { type: "string", default: "0" },
 		drafter: { type: "string", default: "deepseek/deepseek-v4-flash" },
 		"drafter-max-depth": { type: "string", default: String(DEFAULTS.drafterMaxDepth) },
 		"candidate-limit": { type: "string", default: String(DEFAULTS.candidateLimit) },
@@ -91,8 +78,6 @@ const options = {
 	instance,
 	label: values.label ?? "baseline",
 	actor: model(values.actor ?? "deepseek/deepseek-v4-pro"),
-	actorMaxTokens: positiveInteger(values["actor-max-tokens"], "--actor-max-tokens"),
-	actorTemperature: nonNegativeNumber(values["actor-temperature"], "--actor-temperature"),
 	drafter: model(values.drafter ?? "deepseek/deepseek-v4-flash"),
 	drafterMaxDepth: nonNegativeInteger(values["drafter-max-depth"], "--drafter-max-depth"),
 	candidateLimit: positiveInteger(values["candidate-limit"], "--candidate-limit"),
@@ -172,150 +157,60 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	const implementationCommit = (await command("git", ["rev-parse", "HEAD"], process.cwd())).stdout.trim();
 	const taskStartedAt = performance.now();
 	const events: SpeculativeActionEvent<string>[] = [];
-	const rawActorToolExecutions: Record<string, number> = {};
-	const shellEnvironment = benchmarkShellEnvironment();
-	const tools = [
-		createReadTool(task.workspace),
-		createGrepTool(task.workspace),
-		createFindTool(task.workspace),
-		createLsTool(task.workspace),
-		createBashTool(task.workspace, {
-			exposeSessionEnvironment: false,
-			spawnHook: (context) => ({ ...context, env: shellEnvironment }),
-		}),
-		createEditTool(task.workspace),
-		createWriteTool(task.workspace),
-	];
-	const workspaceSandbox = new WorkspaceSandboxService(), sandbox = workspaceSandbox.createExecutionWorld();
-	const resolveInvocation = (tool: string, args: unknown) =>
-		resolvePiToolInvocation(tool, args, { cwd: task.workspace, environment: shellEnvironment });
 	const drafterPredictionTrace: Array<{
 		readonly requestSessionID?: string;
 		readonly stopReason: string;
 		readonly usage: AssistantMessage["usage"];
 		readonly calls: readonly { readonly tool: string; readonly input: unknown }[];
 	}> = [];
-	const settings: SpeculativeAgentSettingsInput = {
-		enabled: input.speculationEnabled,
-		drafterEnabled: input.drafterEnabled,
-		drafterMaxDepth: input.drafterMaxDepth,
-		drafterMaxTokens: input.drafterMaxTokens,
-		drafterDeterministicCandidates: input.drafterDeterministicCandidates,
-		drafterTemperatureMin: input.drafterTemperatureMin,
-		drafterTemperatureMax: input.drafterTemperatureMax,
-		candidateLimit: input.candidateLimit,
-		maxConcurrentActions: input.maxConcurrentActions,
-		predictionTimeoutMs: input.timeoutMs,
-		patternAware: { enabled: input.patternAware },
-		tools: ["read", "grep", "find", "ls", "bash", "edit", "write"],
+	// The installed extension owns every route (Linux process reuse, sandbox, snapshots); a shared state directory
+	// persists its pattern and command history across runs, as a user's agent directory does.
+	const agentDir = input.patternState ?? path.join(task.runDirectory, "agent");
+	await mkdir(agentDir, { recursive: true });
+	await writeFile(path.join(agentDir, "speculative-action.json"), JSON.stringify({
+		enabled: input.speculationEnabled, drafterEnabled: input.drafterEnabled, drafterMaxDepth: input.drafterMaxDepth,
+		...(input.drafterMaxTokens !== undefined ? { drafterMaxTokens: input.drafterMaxTokens } : {}),
+		drafterDeterministicCandidates: input.drafterDeterministicCandidates, drafterTemperatureMin: input.drafterTemperatureMin,
+		drafterTemperatureMax: input.drafterTemperatureMax, candidateLimit: input.candidateLimit, maxConcurrentActions: input.maxConcurrentActions,
+		predictionTimeoutMs: input.timeoutMs, patternAware: { enabled: input.patternAware }, draftModel: `${input.drafter.provider}/${input.drafter.id}`,
+	}));
+	process.env.PI_CODING_AGENT_DIR = agentDir;
+	// The Actor's shell inherits this environment: credentials move into Pi's in-memory store first.
+	const key = process.env.DEEPSEEK_API_KEY, credentials: CredentialStore = {
+		read: async (provider) => provider === "deepseek" && key ? { type: "api_key", key } : undefined,
+		list: async () => key ? [{ providerId: "deepseek", type: "api_key" }] : [],
+		modify: (provider) => credentials.read(provider), delete: async () => {},
 	};
-	const sessionID = `${input.label}:${task.row.instance_id}:${Date.now()}`;
-	const host = createSpeculativeActionHost(sessionID, {
-		cwd: task.workspace,
-		getSettings: () => settings,
-		draftModel: input.drafter,
-		getDraftOptions: ({ signal }) => ({ signal }),
-		complete: async (draftModel, context, streamOptions) => {
-			const message = await streamSimple(draftModel, context, streamOptions).result();
-			const calls = message.content.filter((item) => item.type === "toolCall");
-			drafterPredictionTrace.push({
-				...(streamOptions?.sessionId ? { requestSessionID: streamOptions.sessionId } : {}),
-				stopReason: message.stopReason,
-				usage: message.usage,
-				calls: calls.map((call) => ({ tool: call.name, input: call.arguments })),
-			});
-			return message;
-		},
-		preflight: () => true,
-		resolveInvocation,
-		executionWorlds: [sandbox, createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, {
-			tools: PI_OPERATION_TOOLS.resources, maxBytes: () => DEFAULTS.resourceCacheMaxBytes,
-		})],
-		patternStateDirectory: input.patternState ?? path.join(task.runDirectory, "patterns"),
-		...(input.patternState
-			? { patternWorkspaceIdentity: path.join(input.repoCache, "pattern-workspaces", safeName(task.row.repo)) }
-			: {}),
-		onEvent: (event) => {
-			events.push(event);
-		},
-	});
-	let currentTurnID: string | undefined;
-	let lastTurnID: string | undefined;
-	let turnSequence = 0;
-	const actorStream = new ActorStreamPreviewTracker();
-	const actorActionsByTool: Record<string, number> = {};
-	const actorTools = tools.map(
-		(base): AgentTool => ({
-			...base,
-			execute: async (callID, args, signal, onUpdate) => {
-				const turnID = currentTurnID;
-				if (!turnID) throw new Error("Actor tool executed outside an active turn");
-				increment(actorActionsByTool, base.name);
-				return host.execute(
-					{ turnID, id: callID, tool: base.name, args, tools }, signal,
-					(operation) => {
-						increment(rawActorToolExecutions, base.name);
-						return base.execute(callID, operation.input as never, operation.signal, onUpdate as never);
-					},
-				);
+	for (const name of Object.keys(process.env)) if (SECRET_VARIABLE.test(name)) delete process.env[name];
+	const extension = createSpeculativeActionExtension({
+		createHost: (id, options) => createSpeculativeActionHost(id, {
+			...options,
+			complete: async (draftModel, context, streamOptions) => {
+				const message = await options.complete(draftModel, context, streamOptions);
+				drafterPredictionTrace.push({
+					...(streamOptions?.sessionId ? { requestSessionID: streamOptions.sessionId } : {}),
+					stopReason: message.stopReason,
+					usage: message.usage,
+					calls: message.content.flatMap((item) => item.type === "toolCall" ? [{ tool: item.name, input: item.arguments }] : []),
+				});
+				return message;
 			},
+			onEvent: (event) => { events.push(event); options.onEvent?.(event); },
 		}),
-	);
-	const agent = new Agent({
-		streamFn: async (actorModel, context, streamOptions) => {
-			actorStream.clear();
-			currentTurnID = `turn-${++turnSequence}`;
-			lastTurnID = currentTurnID;
-			await host.startTurn(
-				{ turnID: currentTurnID, actorModel, context: { ...context, tools }, actorOptions: streamOptions, tools },
-				streamOptions?.signal,
-			);
-			return streamSimple(actorModel, context, {
-				...streamOptions,
-				temperature: input.actorTemperature,
-				maxTokens: input.actorMaxTokens,
-			});
-		},
-		sessionId: sessionID,
-		shouldStopAfterTurn: () => turnSequence >= input.maxTurns,
-		initialState: {
-			model: input.actor,
-			thinkingLevel: "high",
-			systemPrompt:
-				"You are a coding agent working directly in the current repository. Inspect the relevant implementation and tests, reproduce the reported issue when practical, implement the smallest complete fix, and run focused validation. Use tools instead of guessing. Do not merely describe a patch: edit the workspace.",
-			tools: actorTools,
-		},
 	});
-	const prompt: AgentMessage = {
-		role: "user",
-		content: `${task.row.problem_statement}\n\nWork in the checked-out repository and finish the implementation. Do not use network access to look up the answer.`,
-		timestamp: Date.now(),
-	};
-	agent.subscribe(async (event, signal) => {
-		if (event.type === "message_update") {
-			for (const preview of actorStream.observe(event.assistantMessageEvent)) {
-				if (!currentTurnID) continue;
-				if (preview.type === "tool") {
-					void host.previewActorTool({ turnID: currentTurnID, tool: preview.tool }, signal).catch(() => {});
-				} else {
-					void host.previewActorCall(
-						{
-							turnID: currentTurnID,
-							id: preview.call.id,
-							tool: preview.call.name,
-							args: preview.call.arguments,
-							tools,
-						},
-						signal,
-					).catch(() => {});
-				}
-			}
-		}
-		if (event.type === "turn_end" && currentTurnID) {
-			const turnID = currentTurnID;
-			currentTurnID = undefined;
-			await host.finishTurn(turnID, false);
-		}
+	const settingsManager = SettingsManager.inMemory({}, { projectTrusted: true });
+	const resourceLoader = new DefaultResourceLoader({ cwd: task.workspace, agentDir, settingsManager, noExtensions: true, extensionFactories: [extension] });
+	await resourceLoader.reload();
+	const { session } = await createAgentSession({
+		cwd: task.workspace, agentDir, model: input.actor, modelRuntime: await ModelRuntime.create({ credentials, modelsPath: null, refreshOnCreate: false }), thinkingLevel: "high", resourceLoader, settingsManager,
+		tools: ["read", "grep", "find", "ls", "bash", "edit", "write"], sessionManager: SessionManager.inMemory(task.workspace),
+	});
+	await session.bindExtensions({ mode: "print" });
+	let turns = 0;
+	const actorActionsByTool: Record<string, number> = {};
+	session.subscribe((event) => {
+		if (event.type === "tool_execution_start") increment(actorActionsByTool, event.toolName);
+		if (event.type === "turn_end" && ++turns >= input.maxTurns) void session.abort();
 	});
 
 	const agentStartedAt = performance.now();
@@ -324,13 +219,12 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	let timedOut = false;
 	const timeout = setTimeout(() => {
 		timedOut = true;
-		agent.abort();
+		void session.abort();
 	}, input.timeoutMs);
 	for (const [phase, operation] of [
-		["prompt", () => agent.prompt(prompt)],
-		["finishTurn", () => lastTurnID ? host.finishTurn(lastTurnID, true) : undefined],
-		["hostDispose", () => host.dispose()],
-		["workspaceDispose", () => workspaceSandbox.dispose()],
+		["prompt", () => session.prompt(`${task.row.problem_statement}\n\nWork in the checked-out repository and finish the implementation. Do not use network access to look up the answer.`)],
+		["shutdown", () => session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" })],
+		["dispose", () => session.dispose()],
 	] as const) {
 		try {
 			await operation();
@@ -350,7 +244,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	const hiddenLatencyMs = summary.hiddenLatencyMs;
 	const serializedCounterfactualMs = actualEndToEndMs + hiddenLatencyMs;
 	const nonToolMs = Math.max(0, serializedCounterfactualMs - summary.toolExecutionMs);
-	const actorUsage = summarizeUsage(agent.state.messages.filter((message) => message.role === "assistant"));
+	const actorUsage = summarizeUsage(session.messages.filter((message) => message.role === "assistant"));
 	const drafterUsage = summarizeUsage(drafterPredictionTrace);
 	const changedFiles = lines((await command("git", ["-C", task.workspace, "diff", "--name-only"])).stdout);
 	const goldFiles = patchFiles(task.row.patch);
@@ -362,7 +256,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		patchClean = false;
 	}
 	const coveredGoldFiles = goldFiles.filter((file) => changedFiles.includes(file));
-	const turnLimitReached = turnSequence >= input.maxTurns;
+	const turnLimitReached = turns >= input.maxTurns;
 	const { actor, drafter, repoCache, runRoot, output, prepareOnly, ...configuration } = input;
 	return {
 		metadata: {
@@ -375,16 +269,9 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			sourceDataset: task.row.source_dataset,
 			actor: `${actor.provider}/${actor.id}`,
 			drafter: `${drafter.provider}/${drafter.id}`,
-			timingScope: "setup, Agent prompt, terminal settlement, host and workspace disposal",
+			timingScope: "setup, Agent prompt, terminal settlement, extension shutdown",
 			patternState: input.patternState ?? "isolated-per-run",
-			executionBoundary: {
-				priority: ["runtime_sandbox", "local_fallback", "actor_fallback"],
-				local: {
-					observation: "resource_version",
-					workspaceMutation: "git_worktree",
-					unbounded: "unavailable",
-				},
-			},
+			executionBoundary: "installed extension routes",
 			workspace: task.workspace,
 		},
 		summary: {
@@ -417,12 +304,11 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			drafterOutputTokens: drafterUsage.outputTokens,
 			drafterCacheReadTokens: drafterUsage.cacheReadTokens,
 			drafterCacheWriteTokens: drafterUsage.cacheWriteTokens,
-			turns: turnSequence,
+			turns,
 			turnLimitReached,
 			timedOut,
-			agentError: agent.state.errorMessage,
+			agentError: session.state.errorMessage,
 			benchmarkErrors,
-			rawActorToolExecutions,
 			changedFiles,
 			goldFiles,
 			testPatchFiles,
@@ -434,7 +320,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			patchCandidate:
 				!timedOut &&
 				!turnLimitReached &&
-				!agent.state.errorMessage &&
+				!session.state.errorMessage &&
 				!Object.keys(benchmarkErrors).length &&
 				patchClean &&
 				changedFiles.length > 0 &&
@@ -460,7 +346,7 @@ function benchmarkShellEnvironment(): Record<string, string> {
 	return Object.fromEntries(
 		Object.entries(process.env).filter(
 			(entry): entry is [string, string] =>
-				entry[1] !== undefined && !/(?:API_KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)/i.test(entry[0]),
+				entry[1] !== undefined && !SECRET_VARIABLE.test(entry[0]),
 		),
 	);
 }

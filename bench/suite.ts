@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
-import { summarizeSuite, type SuiteBenchmarkRun, type SuiteBenchmarkSummary } from "./suite-report.ts";
+import { summarizePairs, summarizeSuite, type SuiteBenchmarkRun, type SuiteBenchmarkSummary } from "./suite-report.ts";
 
 type SuiteFile = Readonly<Record<string, readonly string[]>>;
 
@@ -18,7 +18,7 @@ const parsed = parseSuiteArguments(process.argv.slice(2));
 const suites = validateSuites(JSON.parse(await readFile(path.join(directory, "suite.json"), "utf8")));
 const instances = suites[parsed.suite];
 if (!instances) throw new Error(`Unknown suite ${parsed.suite}; expected ${Object.keys(suites).join(", ")}`);
-for (const option of ["--instance", "--output", "--prepare-only"]) {
+for (const option of ["--instance", "--output", "--prepare-only", ...(parsed.paired ? ["--speculation-disabled"] : [])]) {
 	if (hasOption(parsed.forwarded, option)) throw new Error(`${option} is controlled by the suite runner`);
 }
 
@@ -33,13 +33,15 @@ await mkdir(outputRoot, { recursive: true });
 
 try {
 	for (let repeat = 1; repeat <= parsed.repeats; repeat++) {
-		for (const instance of instances) {
-			const output = path.join(outputRoot, `repeat-${repeat}`, `${safeName(instance)}.json`);
-			let run: SuiteBenchmarkRun = { instance, repeat, output };
+		// Paired runs alternate which arm goes first, so drift in the provider or machine does not favor one arm.
+		for (const instance of instances) for (const arm of parsed.paired ? (repeat % 2 ? ["on", "off"] as const : ["off", "on"] as const) : [undefined]) {
+			const output = path.join(outputRoot, `repeat-${repeat}`, `${safeName(instance)}${arm ? `.${arm}` : ""}.json`);
+			let run: SuiteBenchmarkRun = { instance, repeat, output, ...(arm ? { arm } : {}) };
 			try {
 				await mkdir(path.dirname(output), { recursive: true });
 				await writeFile(output, "", { flag: "wx" }); // Only this attempt may supply the result, including after failure.
-				const failed = await execute(process.execPath, [tsx, runner, ...parsed.forwarded, "--instance", instance, "--output", output])
+				const failed = await execute(process.execPath, [tsx, runner, ...parsed.forwarded, ...(arm === "off" ? ["--speculation-disabled"] : []),
+					"--instance", instance, "--output", output])
 					.then(() => undefined, (error: unknown) => ({ error }));
 				try {
 					const result = validateResult(JSON.parse(await readFile(output, "utf8")), output);
@@ -59,10 +61,10 @@ try {
 } finally {
 	const report = {
 		metadata: {
-			suite: parsed.suite, label, repeats: parsed.repeats, instances, forwardedArguments: parsed.forwarded,
+			suite: parsed.suite, label, repeats: parsed.repeats, paired: parsed.paired, instances, forwardedArguments: parsed.forwarded,
 		},
-		...summarizeSuite(runs),
-		runOutputs: runs.map(({ instance, repeat, output }) => ({ instance, repeat, output })),
+		...(parsed.paired ? summarizePairs(runs) : summarizeSuite(runs)),
+		runOutputs: runs.map(({ instance, repeat, arm, output }) => ({ instance, repeat, arm, output })),
 	};
 	const reportFile = path.join(outputRoot, "suite-result.json");
 	await writeFile(reportFile, `${JSON.stringify(report, null, 2)}\n`, "utf8");
@@ -76,7 +78,8 @@ function parseSuiteArguments(args: readonly string[]) {
 	const repeats = Number(repeatsValue);
 	if (!Number.isSafeInteger(repeats) || repeats <= 0) throw new Error("--repeats must be a positive integer");
 	const outputRoot = takeOption(forwarded, "--output-root");
-	return { suite, repeats, outputRoot, forwarded };
+	const paired = forwarded.includes("--paired");
+	return { suite, repeats, outputRoot, paired, forwarded: forwarded.filter((argument) => argument !== "--paired") };
 }
 
 function takeOption(args: string[], name: string): string | undefined {
