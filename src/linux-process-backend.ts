@@ -118,7 +118,7 @@ import { containsFilesystemPath as pathContains, relativeFilesystemPath, slash }
 const BACKEND_EPOCH = "pi-linux-process-instance-inputs";
 const POLICY_ID = "sandlock-virtual-root-transparent-exec";
 const LEAF_POLICY_ID = "sandlock-virtual-workspace-leaf";
-const MAX_REQUEST_BYTES = 4 * 1024 * 1024, LEARNED_LAUNCHES = 64;
+const MAX_REQUEST_BYTES = 4 * 1024 * 1024, LEARNED_LAUNCHES = 64, MAX_INTERPOSED_MOUNT_BYTES = 512 * 1024;
 const MAX_CONTINUATION_BYTES = 65 * 1024 * 1024;
 const IO_FRONTIERS = new Map([[0, "read"], [1, "write"], [19, "readv"], [20, "writev"], [44, "sendto"], [45, "recvfrom"], [46, "sendmsg"], [47, "recvmsg"]]);
 const MAX_CAPTURE_BYTES = 512 * 1024 * 1024;
@@ -195,18 +195,9 @@ interface ReadyBackend {
 	readonly imageLibrary?: string;
 }
 
-interface InterposedDirectory {
-	readonly source: string;
-	readonly target: string;
-	readonly shadow: string;
-	readonly view: string;
-}
+interface InterposedDirectory { readonly source: string; readonly target: string; readonly shadow: string; readonly view: string; }
 
-interface SandboxMount {
-	readonly virtualPath: string;
-	readonly hostPath: string;
-	readonly readOnly: boolean;
-}
+interface SandboxMount { readonly virtualPath: string; readonly hostPath: string; readonly readOnly: boolean; }
 
 interface ExecMount {
 	readonly virtualPath: string;
@@ -2258,6 +2249,7 @@ async function createProcessInterposition(input: {
 		aliases.push(directory);
 		sources.set(directory.source, aliases);
 	}
+	let mountBytes = 0;
 	for (const [source, aliases] of sources) {
 		for (const directory of aliases) {
 			input.signal?.throwIfAborted();
@@ -2274,6 +2266,10 @@ async function createProcessInterposition(input: {
 		} catch {
 			continue;
 		}
+		// Each mapping is a sandbox argument: a directory past the budget (a WSL PATH carries thousands of Windows
+		// executables) stays native as a whole rather than overflow ARG_MAX.
+		const bytes = aliases.reduce((sum, { target, view }) => sum + entries.reduce((total, name) => total + 2 * name.length + target.length + view.length + 16, 0), 0);
+		if ((mountBytes += bytes) > MAX_INTERPOSED_MOUNT_BYTES) { mountBytes -= bytes; continue; }
 		// Each physical entry is probed once; aliases retain independent exec-only mappings.
 		// Bound preparation and settle every alias link before capturing directory evidence.
 		await mapFilesystem(entries, async (name) => {
