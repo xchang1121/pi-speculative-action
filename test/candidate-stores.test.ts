@@ -187,6 +187,15 @@ describe("CandidateStore", () => {
 });
 
 describe("candidate retention", () => {
+	it("evicts first from an owner above its fair byte share, whatever the other owners' values", () => {
+		const cache = new CandidateStore<string, Entry>([], (item) => item.id.startsWith("flood") ? 100 : 1, Date.now, (item) => item.id.split(":")[0]!);
+		const flood = Array.from({ length: 6 }, (_, index) => entry(`flood:${index}`, `f${index}.ts`, 1, 20, 10));
+		const actor = [entry("actor:0", "a0.ts", 1, 20, 10), entry("actor:1", "a1.ts", 1, 20, 10)];
+		for (const item of [...actor, ...flood]) cache.settle("one", item);
+		expect(cache.trim("one", { maxEntries: 100, maxBytes: 60 })).toEqual(flood.slice(0, 2));
+		expect(cache.values("one")).toEqual(expect.arrayContaining(actor));
+	});
+
 	it("retains scoped freshness and reuse evidence through bounded cache pressure", () => {
 		for (const copies of [1, 170]) {
 			let scores = 0;

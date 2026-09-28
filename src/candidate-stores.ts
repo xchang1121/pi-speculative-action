@@ -39,16 +39,20 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 	private readonly projectors: readonly ActionKeyProjector[];
 	private readonly score: (entry: Entry, evidence: ResultCacheEvidence, now: number) => number;
 	private readonly now: () => number;
+	private readonly owner: (entry: Entry) => string;
 	private sequence = 0;
 
 	constructor(
 		projectors: readonly ActionKeyProjector[] = [],
 		score: (entry: Entry, evidence: ResultCacheEvidence, now: number) => number = () => 0,
 		now: () => number = Date.now,
+		/** Who produced an entry (the Actor, or a prediction source): under pressure an owner above its fair byte share yields first. */
+		owner: (entry: Entry) => string = () => "",
 	) {
 		this.projectors = projectors.map(ownActionKeyProjector);
 		this.score = score;
 		this.now = now;
+		this.owner = owner;
 	}
 
 	insert(scope: Scope, entry: Entry): Entry | undefined {
@@ -288,14 +292,15 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 		const maxEntries = finiteLimit(limits.maxEntries), maxBytes = finiteLimit(limits.maxBytes);
 		const withinBudget = () => count <= maxEntries && bytes <= maxBytes;
 		if (withinBudget()) return [];
-		const now = this.now(), ranked = [];
+		const now = this.now(), ranked = [], owned = new Map<string, number>();
+		for (const entry of entries) owned.set(this.owner(entry), (owned.get(this.owner(entry)) ?? 0) + finiteValue(entry.estimatedBytes));
+		const share = Math.min(maxBytes, bytes) / owned.size;
 		for (const entry of entries) {
 			const indexed = this.record(scope, entry), evidence = indexed?.result;
-			if (evidence && canRetire(entry)) ranked.push({
-				entry, indexed, evidence, hot: Number(evidence.segment === "hot"), value: finiteValue(this.score(entry, { ...evidence }, now)),
-			});
+			if (evidence && canRetire(entry)) ranked.push({ entry, indexed, evidence, hot: Number(evidence.segment === "hot"),
+				within: Number(owned.get(this.owner(entry))! <= share), value: finiteValue(this.score(entry, { ...evidence }, now)) });
 		}
-		ranked.sort((left, right) => left.hot - right.hot || left.value - right.value);
+		ranked.sort((left, right) => left.hot - right.hot || left.within - right.within || left.value - right.value);
 		const retired: Entry[] = [];
 		for (const { entry, indexed, evidence } of ranked) {
 			if (withinBudget()) break;

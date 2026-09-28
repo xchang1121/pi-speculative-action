@@ -519,7 +519,8 @@ export function makeSpeculativeActionRuntime<
 		sourcesByID.set(source.id, source);
 	}
 	const projectionRules = resolveActionProjectionRules(adapter.projectionRules ?? [], semantics);
-	const candidateStore = new CandidateStore<SessionID, Candidate>(projectionRules, candidateCacheValue);
+	const candidateStore = new CandidateStore<SessionID, Candidate>(projectionRules, candidateCacheValue, Date.now,
+		(candidate) => candidate.origin === "prediction" ? candidate.owner.draft.source ?? "prediction" : "actor");
 	const releaseProjectionResource = (sessionID: SessionID, resource?: ProjectionResource) => {
 		if (resource && --resource.references === 0) sessionStates.get(sessionID)?.lifecycle.release(resource);
 	};
