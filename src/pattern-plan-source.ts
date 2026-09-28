@@ -1,7 +1,7 @@
 import path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ActionProjectionRule } from "./action-key-projection.ts";
-import type { ActionSemanticsRegistry } from "./action-semantics.ts";
+import { type ActionSemanticsRegistry, widenReadGuess } from "./action-semantics.ts";
 import { BoundedRecencyMap } from "./bounded-recency-map.ts";
 import type { ExecutionOperationBinding } from "./execution-world.ts";
 import {
@@ -410,7 +410,7 @@ function patternPlanAction(
 		id,
 		type: "tool_call",
 		tool: candidate.tool,
-		input: candidate.input,
+		input: widenReadGuess(candidate.tool, candidate.input),
 		diagnostic: candidate.diagnostic,
 		horizon: candidate.horizon,
 		latestHorizon: candidate.latestHorizon,
