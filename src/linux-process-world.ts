@@ -2,19 +2,12 @@ import path from "node:path";
 import type { ActionKey } from "./action-semantics.ts";
 import type { SpeculativeAgentExecutionWorld } from "./agent-execution-world.ts";
 import { UNRESTRICTED_PROCESS_EFFECTS } from "./effect-model.ts";
-import {
-	LinuxProcessReuseBackend,
-	type LinuxProcessBackendOptions,
-	type LinuxProcessSession,
-} from "./linux-process-backend.ts";
+import { LinuxProcessReuseBackend, type LinuxProcessBackendOptions, type LinuxProcessSession } from "./linux-process-backend.ts";
 import { ProcessExecutionCoordinator } from "./process-execution.ts";
 import type { ProcessExecutionBinding } from "./process-handoff.ts";
 import type { ExecutionOperationBinding } from "./execution-world.ts";
 import { toolErrorSettlement, type ToolInvocation } from "./tool-settlement.ts";
-import {
-	WorkspaceSandboxService,
-	type WorkspaceSandboxOptions,
-} from "./workspace-sandbox.ts";
+import { WorkspaceSandboxService, type WorkspaceSandboxOptions } from "./workspace-sandbox.ts";
 
 export interface LinuxProcessExecutionWorldOptions extends LinuxProcessBackendOptions, WorkspaceSandboxOptions {
 	readonly coordinator: ProcessExecutionCoordinator;
@@ -134,7 +127,7 @@ export function createLinuxProcessExecutionWorld(
 			const sourceRoot = path.resolve(context.cwd);
 			roots.add(sourceRoot);
 			const selected = operation && qualifiedDrivers.get(sourceRoot) || await qualify(sourceRoot);
-			let session: LinuxProcessSession | undefined;
+			let session: LinuxProcessSession | undefined, unfinished: unknown;
 			const branch = await workspaceSandbox.fork({
 				cwd: sourceRoot,
 				action: context.action,
@@ -153,6 +146,7 @@ export function createLinuxProcessExecutionWorld(
 							},
 				afterCapture: async (_workspace, capture) => {
 					if (!session) throw new Error("process evidence sealer is missing");
+					if (unfinished !== undefined) throw unfinished; // Nothing ran to completion to seal: keep the cause.
 					return session.seal(capture.changes);
 				},
 				execute: async (workspace) => {
@@ -182,7 +176,8 @@ export function createLinuxProcessExecutionWorld(
 						return { result, isError: false };
 					} catch (error) {
 						// A command that ran to completion and exited non-zero failed on its own terms, unlike a timeout, abort or backend fault.
-						return launches === 1 && typeof exitCode === "number" && exitCode !== 0 ? { ...toolErrorSettlement(error), exitCode } : toolErrorSettlement(error);
+						if (launches === 1 && typeof exitCode === "number" && exitCode !== 0) return { ...toolErrorSettlement(error), exitCode };
+						unfinished = error; return toolErrorSettlement(error);
 					} finally {
 						await session.close();
 					}
