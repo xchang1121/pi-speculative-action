@@ -1864,8 +1864,10 @@ int main(void) {
 				": > \"$1/$self\"", "while [ ! -e \"$1/$other\" ]; do :; done",
 			].join("\n"));
 			await chmod(path.join(fixture.workspace, "barrier-worker"), 0o755);
-			for (const [name, script] of [["redirect-worker", "printf 'redirected\\n'"], ["route-worker", "printf 'out\\n'; printf 'err\\n' >&2"]]) {
-				await writeFile(path.join(fixture.workspace, name), `#!/bin/sh\n${script}\n`);
+			// Scripts keep their own path as $0 and resolve relative modules, directly or through a bypass's shadow.
+			for (const [name, script] of [["redirect-worker", "#!/bin/sh\nprintf 'redirected %s\\n' \"$0\""], ["route-worker", "#!/bin/sh\nprintf 'out\\n'; printf 'err\\n' >&2"],
+				["bin.js", "#!/usr/bin/env node\nconsole.log(require('./lib.js'));"], ["lib.js", "module.exports = 'lib';"]]) {
+				await writeFile(path.join(fixture.workspace, name), `${script}\n`);
 				await chmod(path.join(fixture.workspace, name), 0o755);
 			}
 			await writeFile(path.join(fixture.workspace, "fd-check.c"), "#include <fcntl.h>\nint main(void) {\n\tint mask = 0;\n\tfor (int fd = 0; fd < 3; fd++) if (fcntl(fd, F_GETFD) >= 0) mask |= 1 << fd;\n\treturn mask;\n}\n");
@@ -1885,14 +1887,14 @@ int main(void) {
 			branch = await forkReusableBash(fixture, {
 				label: "concurrency",
 				command: "set -e; /bin/bash -c '(/bin/sleep 0.05; echo x > escaped.txt) 2>/dev/null & exit 0'; /usr/bin/printf 'trace-root-fallback\\n'; mkdir barrier; barrier-worker barrier & first=$!; barrier-worker barrier & second=$!; wait \"$first\"; wait \"$second\"; redirect-worker | { read line; printf '%s\\n' \"$line\" > redirected.txt; printf '%s\\n' \"$line\"; }; " +
-					"route-worker 2>/dev/null; route-worker 2>&1 1>/dev/null; /usr/bin/printf 'file-fallback\\n' > redirected-file.txt; /usr/bin/cat < redirected-file.txt; printf 'pipe-fallback\\n' | /usr/bin/cat; " + streamProbes + "; printf '%32768s:end' ''",
+					"route-worker 2>/dev/null; route-worker 2>&1 1>/dev/null; ./bin.js; /usr/bin/printf 'file-fallback\\n' > redirected-file.txt; /usr/bin/cat < redirected-file.txt; printf 'pipe-fallback\\n' | /usr/bin/cat; " + streamProbes + "; printf '%32768s:end' ''",
 				actionNamespace: "process-concurrency-test",
 				executionFingerprint,
 			});
 			expect(branch.output.isError, JSON.stringify({ output: branch.output, metrics: fixture.backend.metrics() })).toBe(false);
 			const text = branch.output.result.content[0];
 			// Discarded streams route into /dev/null; the stderr kept by `2>&1 1>/dev/null` still reaches stdout.
-			expect(text?.type === "text" && text.text).toBe("trace-root-fallback\nredirected\nout\nerr\nfile-fallback\npipe-fallback\nfds:7\nfds:6\nfds:5\nfds:3\nfds:0\nfds:7\n" + " ".repeat(32768) + ":end");
+			expect(text?.type === "text" && text.text).toBe(`trace-root-fallback\nredirected ${path.join(fixture.workspace, "redirect-worker")}\nout\nerr\nlib\nfile-fallback\npipe-fallback\nfds:7\nfds:6\nfds:5\nfds:3\nfds:0\nfds:7\n` + " ".repeat(32768) + ":end");
 			const nextCapture = await vi.mocked(captures[1]!.finish).mock.results[0]!.value;
 			expect({ allocationFailed, aborts: vi.mocked(captures[0]!.abort).mock.calls.length, nextComplete: nextCapture.complete },
 				nextCapture.complete ? undefined : nextCapture.reason).toEqual({ allocationFailed: true, aborts: 1, nextComplete: true });

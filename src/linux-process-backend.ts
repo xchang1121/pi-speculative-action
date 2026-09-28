@@ -211,6 +211,7 @@ interface SandboxMount {
 interface ExecMount {
 	readonly virtualPath: string;
 	readonly hostPath: string;
+	readonly alias?: true;
 }
 
 interface DispatcherRequest {
@@ -2289,7 +2290,8 @@ async function createProcessInterposition(input: {
 	]);
 	return {
 		mounts,
-		execMounts: Object.freeze(execMounts),
+		// A native image run from a shadow is its intercepted original: scripts are opened and named there.
+		execMounts: Object.freeze([...execMounts, ...directories.map(({ shadow, target }) => ({ virtualPath: shadow, hostPath: target, alias: true as const }))]),
 		directories: Object.freeze(directories),
 		executables: Object.freeze(executables),
 		dependencies: Object.freeze(dependencies),
@@ -2308,9 +2310,7 @@ function sandboxArguments(input: {
 }): readonly string[] {
 	return [
 		input.ready.sandlock,
-		...sandboxPolicyArguments(
-			input.cwd, input.deniedPaths, input.writablePaths, input.mounts, input.execMounts,
-		),
+		...sandboxPolicyArguments(input.cwd, input.deniedPaths, input.writablePaths, input.mounts, input.execMounts),
 		...(input.timeoutSeconds !== undefined ? ["--timeout", String(Math.max(1, Math.ceil(input.timeoutSeconds)))] : []),
 		"--",
 		...input.command,
@@ -2329,7 +2329,7 @@ function sandboxPolicyArguments(
 		"--chroot",
 		"/",
 		...mounts.flatMap((mount) => ["--fs-mount", sandboxMountArgument(mount)]),
-		...execMounts.flatMap((mount) => ["--exec-mount", execMountArgument(mount)]),
+		...execMounts.flatMap((mount) => [mount.alias ? "--exec-alias" : "--exec-mount", execMountArgument(mount)]),
 		"--fs-read",
 		"/",
 		...writablePaths.flatMap((target) => ["--fs-write", target]),
