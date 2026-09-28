@@ -50,6 +50,8 @@ export function benchmarkTraceReport<SessionID>(
 		actorFallbacksByTool: countBy(native.filter((event) => event.origin !== "preview"), (event) => event.tool,
 			speculationEnabled ? {} : { ...actorActionsByTool }),
 		actorPreviewsByTool: countBy(native.filter((event) => event.origin === "preview"), (event) => event.tool),
+		candidateFailures: events.flatMap((event) => event.type === "candidate" && event.state.status === "failed" ? [{ turnID: event.turnID, source: event.candidate.source,
+			tool: event.candidate.tool, cause: event.state.cause.detail ? `${event.state.cause.code}:${event.state.cause.detail}` : event.state.cause.code }] : []),
 		candidateStartTrace: candidates.map((event) => ({ turnID: event.turnID, source: event.candidate.source,
 			tool: event.candidate.tool, depth: event.candidate.depth, action: event.candidate.predictedAction })),
 		actorActionTrace,
