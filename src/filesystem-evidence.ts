@@ -13,10 +13,7 @@ export async function mapFilesystem<Input, Output>(values: ReadonlyArray<Input>,
 	const output: Output[] = [];
 	let cursor = 0;
 	const pending = Array.from({ length: Math.min(FILESYSTEM_CONCURRENCY, values.length) }, async () => {
-		while (cursor < values.length) {
-			const index = cursor++;
-			output[index] = await run(values[index]);
-		}
+		while (cursor < values.length) { const index = cursor++; output[index] = await run(values[index]); }
 	});
 	try { await Promise.all(pending); }
 	catch (error) { cursor = values.length; await Promise.allSettled(pending); throw error; }
@@ -35,6 +32,8 @@ export type StableFilesystemCapture = {
 	readonly shared?: true;
 	/** Optional real open file description, owned by the input version rather than its pathname. */
 	readonly object?: CapturedFilesystemObject;
+	/** Git's object id for exactly these bytes, when the caller stages them. */
+	readonly blob?: string;
 };
 
 /** A content version and its kernel object share one revocable borrowing lifetime. */
@@ -51,10 +50,7 @@ export class CapturedFilesystemObject {
 	}
 }
 
-export function sameFilesystemIdentity(
-	left: BigIntStats,
-	right: BigIntStats,
-): boolean {
+export function sameFilesystemIdentity(left: BigIntStats, right: BigIntStats): boolean {
 	return IDENTITY_FIELDS.every((field) => left[field] === right[field]);
 }
 
@@ -88,7 +84,7 @@ export function captureStableFile(
 	target: string,
 	maxBytes = Number.POSITIVE_INFINITY,
 	retainContent = false,
-	observed?: Pick<StableFilesystemCapture, "stat" | "realPath"> & { readonly retainObject?: boolean },
+	observed?: Pick<StableFilesystemCapture, "stat" | "realPath"> & { readonly retainObject?: boolean; readonly gitBlob?: boolean },
 ): Promise<StableFilesystemCapture> {
 	return captureFile(target, maxBytes, retainContent, true, observed);
 }
@@ -138,7 +134,7 @@ export async function captureHeldDirectory(pid: number, fd: number, content: Buf
 }
 
 async function captureFile(target: string, maxBytes: number, retainContent: boolean, verifyPath: boolean,
-	observed?: Partial<Pick<StableFilesystemCapture, "stat" | "realPath">> & { readonly retainObject?: boolean }, observation?: { readonly pinned: () => void; readonly signal: AbortSignal }): Promise<StableFilesystemCapture> {
+	observed?: Partial<Pick<StableFilesystemCapture, "stat" | "realPath">> & { readonly retainObject?: boolean; readonly gitBlob?: boolean }, observation?: { readonly pinned: () => void; readonly signal: AbortSignal }): Promise<StableFilesystemCapture> {
 	// O_PATH pins even executable aliases without admitting I/O on a raced-in FIFO or device.
 	let binding = process.platform === "linux" && (process.arch === "x64" || process.arch === "arm64")
 		? await fs.open(target, 0x200000 | (verifyPath ? constants.O_NOFOLLOW : 0)) : undefined;
@@ -159,7 +155,7 @@ async function captureFile(target: string, maxBytes: number, retainContent: bool
 		observation?.signal.throwIfAborted();
 		// Never borrow another capture's ongoing read: bytes read before this stat can predate a same-size rewrite
 		// that coarse timestamps leave with the same identity.
-		const captured = await readFileContents(handle, before, maxBytes, retainContent, () => observation?.signal.throwIfAborted());
+		const captured = await readFileContents(handle, before, maxBytes, retainContent, () => observation?.signal.throwIfAborted(), observed?.gitBlob);
 		observation?.signal.throwIfAborted();
 		const after = captured.stat;
 		if (verifyPath) {
@@ -178,8 +174,8 @@ async function captureFile(target: string, maxBytes: number, retainContent: bool
 	}
 }
 
-async function readFileContents(handle: FileHandle, before: BigIntStats, maxBytes: number, retainContent: boolean, check?: () => void) {
-	const hash = createHash("sha256");
+async function readFileContents(handle: FileHandle, before: BigIntStats, maxBytes: number, retainContent: boolean, check?: () => void, gitBlob = false) {
+	const hash = createHash("sha256"), blob = gitBlob ? createHash("sha1").update(`blob ${before.size}\0`) : undefined;
 	const content = retainContent ? Buffer.allocUnsafe(Number(before.size)) : undefined;
 	const buffer = Buffer.allocUnsafe(content ? 1 : Math.max(1, Math.min(Number(before.size), 1024 * 1024)));
 	let bytesRead = 0;
@@ -191,14 +187,14 @@ async function readFileContents(handle: FileHandle, before: BigIntStats, maxByte
 		bytesRead += size;
 		if (bytesRead > maxBytes) throw new Error(`file_too_large:${bytesRead}`);
 		if (bytesRead > Number(before.size)) throw new Error("file_changed_during_capture");
-		hash.update(chunk.subarray(0, size));
+		hash.update(chunk.subarray(0, size)); blob?.update(chunk.subarray(0, size));
 	}
 	const after = await handle.stat({ bigint: true });
 	check?.();
 	if (bytesRead !== Number(before.size) || !sameFilesystemIdentity(before, after)) {
 		throw new Error("file_changed_during_capture");
 	}
-	return { hash: hash.digest("hex"), bytesRead, stat: after, ...(content ? { content } : {}) };
+	return { hash: hash.digest("hex"), bytesRead, stat: after, ...(content ? { content } : {}), ...(blob ? { blob: blob.digest("hex") } : {}) };
 }
 
 /** Own a directory listing or link target together with its stable entry identity. */
@@ -249,10 +245,7 @@ export async function assertNoSymlinkPath(root: string, target: string): Promise
 	if (!containsFilesystemPath(resolvedRoot, resolvedTarget)) throw new Error(`sandbox path escapes workspace: ${resolvedTarget}`);
 	for await (const entry of walkFilesystemPath(resolvedTarget, { start: resolvedRoot })) {
 		const first = entry.path === resolvedRoot, info = entry.info;
-		if (!info) {
-			if (first) throw new Error(`sandbox workspace root does not exist: ${resolvedRoot}`);
-			break;
-		}
+		if (!info) { if (first) throw new Error(`sandbox workspace root does not exist: ${resolvedRoot}`); break; }
 		if (first && (info.isSymbolicLink() || !info.isDirectory())) throw new Error("sandbox workspace root must be a real directory");
 		if (info.isSymbolicLink()) throw new Error(`sandbox path contains symlink: ${slash(path.relative(resolvedRoot, entry.path))}`);
 		if (!info.isFile() && !info.isDirectory()) throw new Error("sandbox path contains a special file");
