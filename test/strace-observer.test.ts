@@ -38,8 +38,10 @@ describe("strace provenance decoder", () => {
 		try {
 			const all = FILESYSTEM_OBSERVATION_FIELDS, withoutDevice = all.filter((field) => field !== "dev");
 			for (const [argv, expected] of [[["cat", "a.txt"], ["mode"]], [["ls"], ["mode"]], [["ls", "-la"], withoutDevice], [["find", ".", "-size", "+1k"], ["mode", "size"]],
-				[["find", ".", "-newer", "b"], withoutDevice], [["bash", "-c", "true"], withoutDevice]] as const)
+				[["find", ".", "-newer", "b"], withoutDevice], [["bash", "-c", "true"], withoutDevice], [["git", "status"], withoutDevice], [["python3", "x.py"], withoutDevice]] as const)
 				expect((await fields(argv)).fields, argv.join(" ")).toEqual(all.filter((field) => (expected as readonly string[]).includes(field)));
+			const directory = `newfstatat(AT_FDCWD, "/work/src", ${STAT.replace("S_IFREG", "S_IFDIR")}, 0) = 0`;
+			expect((await run(["git", "status"], "/work/a.txt", [directory])).paths.find((item) => item.path === "/work/src")).toMatchObject({ fields: ["mode"] });
 			for (const [argv, target] of [[["stat", "a.txt"], "/work/a.txt"], [["cat", "hosts"], "/etc/hosts"], [["find", ".", "-printf", "%D %p"], "/work/a.txt"]] as const)
 				expect((await fields(argv, target)).fields, argv.join(" ")).toBeUndefined();
 			const flags = "fcntl(4</work>, F_GETFL) = 0x38800 (flags O_RDONLY|O_NONBLOCK|O_LARGEFILE|O_NOFOLLOW|O_DIRECTORY)";
