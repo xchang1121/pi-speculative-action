@@ -1939,6 +1939,27 @@ function transactionDependencySource(
 	};
 }
 
+/** binfmt_script's interpreter (the first word after `#!`) or a little-endian ELF64's PT_INTERP. */
+export async function imageInterpreter(file: string): Promise<string | undefined> {
+	const handle = await open(file, "r").catch(() => undefined);
+	try {
+		const head = Buffer.alloc(256), read = handle ? (await handle.read(head, 0, 256, 0)).bytesRead : 0;
+		if (head.subarray(0, 2).toString("latin1") === "#!") return /^[ \t]*([^ \t\n\0]+)/.exec(head.subarray(2, read).toString("latin1"))?.[1];
+		if (read < 64 || head.readUInt32BE(0) !== 0x7f454c46 || head[4] !== 2 || head[5] !== 1) return undefined;
+		const offset = Number(head.readBigUInt64LE(32)), size = head.readUInt16LE(54), count = Math.min(head.readUInt16LE(56), 64);
+		const table = Buffer.alloc(size * count);
+		await handle!.read(table, 0, table.length, offset);
+		for (let entry = 0; size >= 56 && entry < count; entry++) {
+			if (table.readUInt32LE(entry * size) !== 3) continue;
+			const name = Buffer.alloc(Math.min(Number(table.readBigUInt64LE(entry * size + 32)), 4096));
+			await handle!.read(name, 0, name.length, Number(table.readBigUInt64LE(entry * size + 8)));
+			return name.toString("latin1").split("\0")[0] || undefined;
+		}
+	} finally {
+		await handle?.close();
+	}
+}
+
 async function captureDependencies(
 	session: ActiveSession,
 	before: ReturnType<typeof transactionDependencySource>,
@@ -1994,7 +2015,8 @@ async function captureDependencies(
 		return { path: current, links };
 	};
 	const interposed = new Set(session.interposition.executables.map(([target]) => path.resolve(target)));
-	for (const item of observed) {
+	const pending = [...observed], seenImages = new Set<string>();
+	for (let item = pending.shift(); item; item = pending.shift()) {
 		const follow = item.role !== "metadata" || item.followSymlinks, walked = await walk(item.path, follow);
 		if (!walked || walked.path !== (item.path.split("/").includes("..") ? (await walk(path.posix.normalize(item.path), follow))?.path : walked.path)) {
 			add(undefined, `pathname_walk:${item.path}`); continue;
@@ -2016,6 +2038,10 @@ async function captureDependencies(
 			continue;
 		}
 		if (STABLE_SANDBOX_DEVICES.has(observedPath)) continue;
+		// The kernel itself opens a script's interpreter and an ELF's loader, which no traced syscall names.
+		const interpreter = item.role === "executable" && seenImages.size < 16 && !seenImages.has(physical) && seenImages.add(physical)
+			? await imageInterpreter(physical) : undefined;
+		if (interpreter?.startsWith("/")) pending.push({ path: interpreter, role: "executable" });
 		if (session.projection.isWorkspacePhysical(physical)) {
 			add(await workspaceDependency(physical, session.projection.toLogical(physical), item.role));
 			continue;
@@ -2329,7 +2355,7 @@ function sandboxPolicyArguments(
 		"--chroot",
 		"/",
 		...mounts.flatMap((mount) => ["--fs-mount", sandboxMountArgument(mount)]),
-		...execMounts.flatMap((mount) => [mount.alias ? "--exec-alias" : "--exec-mount", execMountArgument(mount)]),
+		...execMounts.flatMap((mount) => [mount.alias ? "--exec-alias" : "--exec-mount", sandboxMountArgument(mount)]),
 		"--fs-read",
 		"/",
 		...writablePaths.flatMap((target) => ["--fs-write", target]),
@@ -2360,18 +2386,12 @@ function uniqueSandboxMounts(mounts: readonly SandboxMount[]): readonly SandboxM
 	);
 }
 
-function sandboxMountArgument(mount: SandboxMount): string {
+/** A filesystem mount names its access; an exec mount or alias only its image. */
+function sandboxMountArgument(mount: SandboxMount | ExecMount): string {
 	if (!path.isAbsolute(mount.virtualPath) || !path.isAbsolute(mount.hostPath) || [mount.virtualPath, mount.hostPath].some((value) => value.includes(":"))) {
 		throw new Error(`Sandlock mount cannot represent ${mount.virtualPath}:${mount.hostPath}`);
 	}
-	return `${mount.virtualPath}:${mount.hostPath}:${mount.readOnly ? "ro" : "rw"}`;
-}
-
-function execMountArgument(mount: ExecMount): string {
-	if (!path.isAbsolute(mount.virtualPath) || !path.isAbsolute(mount.hostPath) || [mount.virtualPath, mount.hostPath].some((value) => value.includes(":"))) {
-		throw new Error(`Sandlock exec mount cannot represent ${mount.virtualPath}:${mount.hostPath}`);
-	}
-	return `${mount.virtualPath}:${mount.hostPath}`;
+	return `${mount.virtualPath}:${mount.hostPath}${"readOnly" in mount ? (mount.readOnly ? ":ro" : ":rw") : ""}`;
 }
 
 async function probeExecutionContext(input: {
@@ -2384,9 +2404,7 @@ async function probeExecutionContext(input: {
 	await writeFile(path.join(input.physicalRoot, "script-position"), "#!/bin/sh\nexit 42\n", { mode: 0o700 });
 	const command = straceCommand(input.strace, path.join(input.physicalRoot, "context"), [
 		input.sandlock,
-		...sandboxPolicyArguments(input.logicalRoot, [], [input.physicalRoot], [
-			{ virtualPath: input.logicalRoot, hostPath: input.physicalRoot, readOnly: false },
-		], []),
+		...sandboxPolicyArguments(input.logicalRoot, [], [input.physicalRoot], [{ virtualPath: input.logicalRoot, hostPath: input.physicalRoot, readOnly: false }], []),
 		"--",
 		input.dispatcher,
 		"--exec",
@@ -2398,11 +2416,7 @@ async function probeExecutionContext(input: {
 		input.logicalRoot,
 		path.join(input.logicalRoot, "script-position"),
 	]);
-	const outcome = await runSpawn(
-		input.strace,
-		command.slice(1),
-		{ cwd: input.physicalRoot, environment: definedProcessEnvironment(process.env) },
-	);
+	const outcome = await runSpawn(input.strace, command.slice(1), { cwd: input.physicalRoot, environment: definedProcessEnvironment(process.env) });
 	if (outcome.signal || outcome.code !== 0) throw new Error("process execution context probe failed");
 	const stdout = Buffer.concat(outcome.output.filter(({ fd }) => fd === 1).map(({ data }) => data)).toString();
 	const parsed: unknown = JSON.parse(stdout);
@@ -2410,32 +2424,15 @@ async function probeExecutionContext(input: {
 	return parsed;
 }
 
-function speculativeProducerProof(
-	ready: ReadyBackend,
-	deniedPaths: readonly string[],
-	policy = POLICY_ID,
-): ProcessProducerProof {
+function speculativeProducerProof(ready: ReadyBackend, deniedPaths: readonly string[], policy = POLICY_ID): ProcessProducerProof {
 	return Object.freeze({
 		observer: { provider: "strace", fingerprint: ready.observerFingerprint },
-		execution: {
-			authority: "speculative",
-			confinement: {
-				provider: "sandlock",
-				fingerprint: digestObject({ policy, deniedPaths }),
-			},
-		},
+		execution: { authority: "speculative", confinement: { provider: "sandlock", fingerprint: digestObject({ policy, deniedPaths }) } },
 	} satisfies ProcessProducerProof);
 }
 
 function compatibleProducer(expected: ProcessProducerProof, candidate: ProcessProducerProof): boolean {
-	return (
-		expected.observer.provider === candidate.observer.provider &&
-		expected.observer.fingerprint === candidate.observer.fingerprint &&
-		expected.execution.authority === "speculative" &&
-		candidate.execution.authority === "speculative" &&
-		expected.execution.confinement.provider === candidate.execution.confinement.provider &&
-		expected.execution.confinement.fingerprint === candidate.execution.confinement.fingerprint
-	);
+	return expected.execution.authority === "speculative" && stableEqual(expected, candidate);
 }
 
 async function runSpawn(
@@ -2604,13 +2601,8 @@ function shellArguments(invocation: ToolProcessInvocation, command: string): str
 	return invocation.commandTransport === "argv" ? [...invocation.shellArgs, command] : [...invocation.shellArgs];
 }
 
-async function topLevelProcessPrototype(
-	invocation: ToolProcessInvocation,
-	request: ProcessExecutionRequest,
-	environment: Readonly<Record<string, string>>,
-	projection: ExecutionPathProjection,
-	platformFingerprint: Sha256Digest,
-): Promise<ExecPrototype> {
+async function topLevelProcessPrototype(invocation: ToolProcessInvocation, request: ProcessExecutionRequest, environment: Readonly<Record<string, string>>,
+	projection: ExecutionPathProjection, platformFingerprint: Sha256Digest): Promise<ExecPrototype> {
 	const argv = [invocation.shell, ...invocation.shellArgs];
 	if (invocation.commandTransport === "argv") argv.push(request.command);
 	return createExecPrototype({
@@ -2628,10 +2620,7 @@ async function topLevelProcessPrototype(
 			scheduler: { cpuCount: os.availableParallelism(), timeout: request.timeout ?? null },
 			signals: "node-default",
 		}),
-		stdin:
-			invocation.commandTransport === "stdin"
-				? { type: "bytes", digest: sha256Digest(request.command), eof: true }
-				: { type: "closed", eof: true },
+		stdin: invocation.commandTransport === "stdin" ? { type: "bytes", digest: sha256Digest(request.command), eof: true } : { type: "closed", eof: true },
 		fileDescriptorTableComplete: true,
 		inheritedFDs: [
 			{ fd: 0, type: invocation.commandTransport === "stdin" ? "pipe" : "device", flagsDigest: digestObject({ mode: "read" }), eof: true },
@@ -2643,17 +2632,9 @@ async function topLevelProcessPrototype(
 }
 
 function actorReplayProducer(producer: ProcessProducerProof, deniedPaths: readonly string[]): boolean {
-	if (producer.observer.provider !== "strace" || producer.observer.fingerprint !== digestObject({ epoch: BACKEND_EPOCH })) {
-		return false;
-	}
-	if (producer.execution.authority === "actor") return true;
-	const confinement = producer.execution.confinement;
-	return (
-		confinement.provider === "sandlock" &&
-		[POLICY_ID, LEAF_POLICY_ID].some(
-			(policy) => confinement.fingerprint === digestObject({ policy, deniedPaths }),
-		)
-	);
+	if (producer.observer.provider !== "strace" || producer.observer.fingerprint !== digestObject({ epoch: BACKEND_EPOCH })) return false;
+	const confinement = producer.execution.authority === "actor" ? undefined : producer.execution.confinement;
+	return !confinement || confinement.provider === "sandlock" && [POLICY_ID, LEAF_POLICY_ID].some((policy) => confinement.fingerprint === digestObject({ policy, deniedPaths }));
 }
 
 function execText(executable: string, args: readonly string[]): Promise<string> {
@@ -2680,13 +2661,9 @@ function randomToken(): string {
 
 function assertInvocationMatches(invocation: ToolProcessInvocation, request: ProcessExecutionRequest): void {
 	if (request.command !== invocation.command) throw new Error("process command differs from the action execution context");
-	if (path.resolve(request.cwd) !== path.resolve(invocation.cwd)) {
-		throw new Error("process cwd differs from the action execution context");
-	}
+	if (path.resolve(request.cwd) !== path.resolve(invocation.cwd)) throw new Error("process cwd differs from the action execution context");
 	if (request.timeout !== invocation.timeout) throw new Error("process timeout differs from the action execution context");
-	if (!stableEqual(definedProcessEnvironment(request.environment), invocation.environment)) {
-		throw new Error("process environment differs from the action execution context");
-	}
+	if (!stableEqual(definedProcessEnvironment(request.environment), invocation.environment)) throw new Error("process environment differs from the action execution context");
 }
 
 export async function validateTransferredProcessEvidence(
