@@ -204,10 +204,7 @@ export type HeldExecDecision =
 	  } & ({ readonly exitCode: number; readonly continuation?: never } |
 		{ readonly exitCode?: never; readonly continuation: { readonly image: Buffer; readonly physicalRoot: string } }));
 
-export interface LinuxHeldExecOptions {
-	readonly storeRoot: string;
-	readonly binary?: string;
-}
+export interface LinuxHeldExecOptions { readonly storeRoot: string; readonly binary?: string; }
 
 interface ActiveExecution {
 	sequence: number;

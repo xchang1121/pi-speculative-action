@@ -245,13 +245,12 @@ describe("strace provenance decoder", () => {
 
 	test("cuts dispatcher subtrees but resumes provenance at a descriptor-preserving native exec", async () => {
 		const native = ['execve("/private/original/tool", ["tool"], 0x0) = 0', 'openat(AT_FDCWD, "/work/input", O_RDONLY) = 4'];
-		const inPlace = ['execve("/usr/bin/node", ["node"], 0x0) = 0', "socket(AF_INET, SOCK_STREAM, IPPROTO_IP) = 3", 'execve("/usr/bin/tool", ["tool"], 0x0) = 0', ...native];
-		for (const [lines, interpreter, bypass] of [[native, undefined, true], [inPlace, "/usr/bin/node", true], // Directly, or back through the dispatcher.
-			[["socket(AF_INET, SOCK_STREAM, IPPROTO_IP) = 3"], undefined, false], [inPlace, undefined, false], [inPlace, "/usr/bin/python3", false]] as const) {
+		const detour = ['execve("/usr/bin/node", ["node"], 0x0) = 0', "socket(AF_INET, SOCK_STREAM, IPPROTO_IP) = 3", ...native];
+		for (const [lines, bypass] of [[native, true], [["socket(AF_INET, SOCK_STREAM, IPPROTO_IP) = 3"], false], [detour, false]] as const) {
 			const observation = await observe({
 				300: [EXEC, 'chdir("/usr/bin") = 0', "clone(child_stack=NULL, flags=SIGCHLD) = 301"],
 				301: ['execve("./tool", ["tool"], 0x0) = 0', "getpid() = 301", 'openat(AT_FDCWD, "/private/launcher", O_RDONLY) = 4', ...lines],
-			}, { interposedExecutables: [["/usr/bin/tool", "/private/original/tool"]], ...(interpreter ? { interpositionInterpreter: interpreter } : {}) });
+			}, { interposedExecutables: [["/usr/bin/tool", "/private/original/tool"]] });
 			expect(observation).toMatchObject({ complete: true, taints: ["clock", "random"] });
 			expect(observation.paths).not.toContainEqual({ path: "/usr/bin/tool", role: "executable" });
 			expect(observation.paths).not.toContainEqual({ path: "/private/launcher", role: "input" });

@@ -682,7 +682,7 @@ static char *take_env(const char *name) {
 }
 
 static int has_unmodeled_descriptors(int minimum) {
-	/* Node fills closed standard streams; bypass before it changes the inherited table. */
+	/* A closed standard stream would be filled by the first file opened; bypass before any is. */
 	for (int fd = 0; fd < 3; fd++) {
 		if (fcntl(fd, F_GETFD) < 0) return errno == EBADF ? 1 : -1;
 	}
@@ -727,6 +727,148 @@ static int mapped_image(char *image, size_t capacity) {
 	return result;
 }
 
+/* The broker decodes a request as UTF-8, as it decoded Node's strings. */
+static void json_bytes(FILE *out, const char *value, size_t length) {
+	fputc('"', out);
+	for (size_t index = 0; index < length; index++) {
+		unsigned char byte = (unsigned char)value[index];
+		if (byte == '"' || byte == '\\') fprintf(out, "\\%c", byte);
+		else if (byte < 0x20) fprintf(out, "\\u%04x", byte);
+		else fputc(byte, out);
+	}
+	fputc('"', out);
+}
+
+static int json_file(FILE *out, const char *path) {
+	char buffer[32768];
+	ssize_t length = 0, moved = 0;
+	int fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0) return -1;
+	while (length < (ssize_t)sizeof(buffer) && ((moved = read(fd, buffer + length, sizeof(buffer) - (size_t)length)) > 0 || (moved < 0 && errno == EINTR)))
+		if (moved > 0) length += moved;
+	close(fd);
+	if (moved < 0 || length == (ssize_t)sizeof(buffer)) return -1;
+	json_bytes(out, buffer, (size_t)length);
+	return 0;
+}
+
+/* The fields Node's bigint stat reports, encoded as libuv does. */
+static int json_stat(FILE *out, int directory, const char *path, int flags) {
+	struct statx state;
+	if (statx(directory, path, flags, STATX_BASIC_STATS, &state) < 0) return -1;
+	return fprintf(out, "{\"dev\":\"%llu\",\"ino\":\"%llu\",\"mode\":\"%u\",\"uid\":\"%u\",\"gid\":\"%u\",\"rdev\":\"%llu\"}",
+		(unsigned long long)makedev(state.stx_dev_major, state.stx_dev_minor), (unsigned long long)state.stx_ino, state.stx_mode,
+		state.stx_uid, state.stx_gid, (unsigned long long)makedev(state.stx_rdev_major, state.stx_rdev_minor)) < 0 ? -1 : 0;
+}
+
+/* The kernel's view of this process for processContextFromRaw; standard streams only, fd 0 possibly closed. */
+static int raw_context(FILE *out) {
+	char path[64], target[PATH_MAX];
+	if (fputs("{\"status\":", out) < 0 || json_file(out, "/proc/self/status") < 0 || fputs(",\"limits\":", out) < 0 ||
+		json_file(out, "/proc/self/limits") < 0 || fputs(",\"processStat\":", out) < 0 || json_file(out, "/proc/self/stat") < 0 ||
+		fputs(",\"shell\":", out) < 0 || json_stat(out, AT_FDCWD, "/bin/sh", 0) < 0 || fputs(",\"descriptors\":[", out) < 0) return -1;
+	for (int fd = 0, listed = 0; fd < 3; fd++) {
+		if (fcntl(fd, F_GETFD) < 0) { if (fd == 0 && errno == EBADF) continue; return -1; }
+		if (fprintf(out, "%s{\"fd\":%d,\"stat\":", listed++ ? "," : "", fd) < 0 ||
+			json_stat(out, fd, "", AT_EMPTY_PATH) < 0) return -1;
+		snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
+		ssize_t length = readlink(path, target, sizeof(target));
+		if (length > 0 && length < (ssize_t)sizeof(target)) { fputs(",\"endpoint\":", out); json_bytes(out, target, (size_t)length); }
+		snprintf(path, sizeof(path), "/proc/self/fdinfo/%d", fd);
+		if (fputs(",\"fdinfo\":", out) < 0 || json_file(out, path) < 0 || fputc('}', out) < 0) return -1;
+	}
+	return fputs("]}", out) < 0 || ferror(out) ? -1 : 0;
+}
+
+static int broker_request(FILE *out, const char *token, const char *invoked, int argc, char **argv) {
+	char cwd[PATH_MAX];
+	if (!getcwd(cwd, sizeof(cwd))) return -1;
+	const char *strings[] = { "{\"token\":", token, ",\"name\":", strrchr(invoked, '/') + 1, ",\"invokedPath\":", invoked, ",\"argv0\":", argv[0], ",\"cwd\":", cwd };
+	for (unsigned index = 0; index < sizeof(strings) / sizeof(*strings); index += 2) { fputs(strings[index], out); json_bytes(out, strings[index + 1], strlen(strings[index + 1])); }
+	fputs(",\"args\":[", out);
+	for (int index = 1; index < argc; index++) { if (index > 1) fputc(',', out); json_bytes(out, argv[index], strlen(argv[index])); }
+	fputs("],\"environment\":{", out);
+	int first = 1;
+	for (char **entry = environ; *entry; entry++) {
+		char *equals = strchr(*entry, '=');
+		if (!equals || equals == *entry) continue;
+		if (!first) fputc(',', out);
+		first = 0;
+		json_bytes(out, *entry, (size_t)(equals - *entry)); fputc(':', out); json_bytes(out, equals + 1, strlen(equals + 1));
+	}
+	fprintf(out, "},\"pid\":%d,\"context\":", (int)getpid());
+	return raw_context(out) < 0 || fputc('}', out) < 0 || ferror(out) ? -1 : 0;
+}
+
+static int broker_exchange(const char *socket_path, const char *request, size_t length, FILE *response) {
+	struct sockaddr_un address = { .sun_family = AF_UNIX };
+	if (strlen(socket_path) >= sizeof(address.sun_path)) return -1;
+	strcpy(address.sun_path, socket_path);
+	int connection = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0), result = -1;
+	if (connection < 0) return -1;
+	if (connect(connection, (struct sockaddr *)&address, sizeof(address)) < 0) goto done;
+	while (length) {
+		ssize_t sent = send(connection, request, length, MSG_NOSIGNAL);
+		if (sent < 0 && errno == EINTR) continue;
+		if (sent <= 0) goto done;
+		request += sent; length -= (size_t)sent;
+	}
+	if (shutdown(connection, SHUT_WR) < 0) goto done;
+	char buffer[65536];
+	ssize_t moved;
+	while ((moved = read(connection, buffer, sizeof(buffer))) > 0 || (moved < 0 && errno == EINTR))
+		if (moved > 0 && fwrite(buffer, 1, (size_t)moved, response) != (size_t)moved) goto done;
+	result = moved == 0 ? 0 : -1;
+done:
+	close(connection);
+	return result;
+}
+
+/* Frames "o<fd> <length>\n<bytes>" replay output; a last line "x <code>", "s <signal>" or "b" (bypass) ends it. */
+static int broker_reply(const char *at, const char *end) {
+	while (at < end) {
+		const char *newline = memchr(at, '\n', (size_t)(end - at));
+		int fd, value, consumed = -1;
+		unsigned long long length;
+		if (!newline) return -1;
+		if (sscanf(at, "o%d %llu%n", &fd, &length, &consumed) == 2 && at + consumed == newline && (fd == 1 || fd == 2) &&
+			length <= (unsigned long long)(end - newline - 1)) {
+			if (transfer(fd, (void *)(newline + 1), (size_t)length, 1) < 0) return -1;
+			at = newline + 1 + length;
+			continue;
+		}
+		if (newline + 1 != end) return -1;
+		if (newline == at + 1 && *at == 'b') return -2;
+		if (sscanf(at, "x %d%n", &value, &consumed) == 1 && at + consumed == newline && value >= 0 && value <= 255) return value;
+		if (sscanf(at, "s %d%n", &value, &consumed) != 1 || at + consumed != newline || value <= 0 || value >= NSIG) return -1;
+		sigset_t mask;
+		sigemptyset(&mask); sigaddset(&mask, value);
+		signal(value, SIG_DFL); sigprocmask(SIG_UNBLOCK, &mask, NULL); raise(value);
+		return 128 + value;
+	}
+	return -1;
+}
+
+/* Ask the broker: the exit status of a reused or brokered run, or -2 to run the native image in this traced process. */
+static int broker_dispatch(const char *configuration, const char *invoked, int argc, char **argv) {
+	char socket_path[PATH_MAX], token[256], *request = NULL, *response = NULL;
+	size_t request_size = 0, response_size = 0;
+	int result = -1;
+	FILE *file = fopen(configuration, "re"), *out = NULL, *in = NULL;
+	if (!file || !fgets(socket_path, sizeof(socket_path), file) || !fgets(token, sizeof(token), file)) goto done;
+	socket_path[strcspn(socket_path, "\n")] = token[strcspn(token, "\n")] = 0;
+	if (!(out = open_memstream(&request, &request_size))) goto done;
+	int written = broker_request(out, token, invoked, argc, argv);
+	if (fclose(out) != 0 || written < 0 || !(in = open_memstream(&response, &response_size))) goto done;
+	written = broker_exchange(socket_path, request, request_size, in);
+	if (fclose(in) == 0 && written == 0) result = broker_reply(response, response + response_size);
+done:
+	if (file) fclose(file);
+	free(request); free(response);
+	if (result == -1) { dprintf(2, "%s: broker unavailable; refusing unobserved execution\n", strrchr(invoked, '/') + 1); result = 125; }
+	return result;
+}
+
 /* An exec-only hardlink retains the target's argv[0]; its read-only sidecar supplies routing. */
 static int image_dispatch(int argc, char **argv) {
 	char image[PATH_MAX], sidecar[PATH_MAX], invoked[PATH_MAX], native[PATH_MAX];
@@ -739,11 +881,11 @@ static int image_dispatch(int argc, char **argv) {
 	FILE *file = fopen(sidecar, "re");
 	if (!file) return errno == ENOENT ? -1 : 70;
 	struct stat state;
-	char *line = NULL, *fields[5] = {0};
+	char *line = NULL, *fields[3] = {0};
 	size_t capacity = 0;
-	int result = 70;
+	int result = 70, extra;
 	if (fstat(fileno(file), &state) < 0 || !S_ISREG(state.st_mode) || state.st_uid != geteuid() || (state.st_mode & 022)) goto done;
-	for (unsigned index = 0; index < 6; index++) {
+	for (unsigned index = 0; index < 4; index++) {
 		if (getline(&line, &capacity, file) < 0) goto done;
 		line[strcspn(line, "\r\n")] = 0;
 		if (index == 0) {
@@ -751,60 +893,37 @@ static int image_dispatch(int argc, char **argv) {
 		} else if (*line != '/' || !(fields[index - 1] = strdup(line))) goto done;
 	}
 	fclose(file); file = NULL;
-	if (snprintf(invoked, sizeof(invoked), "%s/%s", fields[3], name) >= (int)sizeof(invoked) ||
-		snprintf(native, sizeof(native), "%s/%s", fields[4], name) >= (int)sizeof(native)) goto done;
-	/* The dispatcher returns here to run a bypass in place. Node reset every signal disposition (ignoring SIGPIPE and
-	 * SIGXFSZ), cleared the mask, raised the descriptor limit and may leave shared stdio non-blocking without its exit
-	 * reset: restore what this process received, then exec. */
-	unsigned long long ignored = 0, blocked = 0, limit; sigset_t mask; struct rlimit files; char recorded[96], tail;
-	unsigned status[3]; int extra;
+	if (snprintf(invoked, sizeof(invoked), "%s/%s", fields[1], name) >= (int)sizeof(invoked) ||
+		snprintf(native, sizeof(native), "%s/%s", fields[2], name) >= (int)sizeof(native)) goto done;
 	char **spare = calloc((size_t)argc + 3, sizeof(*spare)); /* a sandbox grows argv here to run a script's interpreter */
-	if (!spare || !memcpy(spare, argv, (size_t)argc * sizeof(*argv))) goto done;
-	const char *received = getenv("PI_SPEC_NATIVE_STATE");
-	if (received) {
-		if (sscanf(received, "%llx:%llx:%llx:%x:%x:%x%c", &ignored, &blocked, &limit, &status[0], &status[1], &status[2], &tail) != 6 ||
-			getrlimit(RLIMIT_NOFILE, &files) < 0) goto done;
-		sigemptyset(&mask);
-		for (int number = 1; number <= 64; number++) {
-			if (number != SIGKILL && number != SIGSTOP) signal(number, ignored >> (number - 1) & 1 ? SIG_IGN : SIG_DFL);
-			if (blocked >> (number - 1) & 1) sigaddset(&mask, number);
-		}
-		for (int fd = 0; fd < 3; fd++) if (fcntl(fd, F_SETFL, (int)status[fd]) < 0) goto done;
-		files.rlim_cur = (rlim_t)limit;
-		if (setrlimit(RLIMIT_NOFILE, &files) < 0 || unsetenv("PI_SPEC_NATIVE_STATE") < 0 || sigprocmask(SIG_SETMASK, &mask, NULL) < 0) goto done;
-	}
-	if ((extra = received ? 1 : has_unmodeled_descriptors(3)) < 0) goto done;
-	if (extra) {
+	if (!spare || !memcpy(spare, argv, (size_t)argc * sizeof(*argv)) || (extra = has_unmodeled_descriptors(3)) < 0) goto done;
+	/* A bypass runs the native image in place, with everything this process received. */
+	if (extra || (result = broker_dispatch(fields[0], invoked, argc, argv)) == -2) {
 		execv(native, spare);
 		result = errno == ENOENT ? 127 : 126;
-		goto done;
 	}
-	char **command = calloc((size_t)argc + 6, sizeof(*command));
-	if (!command) goto done;
-	command[0] = fields[0];
-	command[1] = fields[1];
-	command[2] = "--native-dispatch";
-	command[3] = fields[2];
-	command[4] = invoked;
-	command[5] = argv[0];
-	for (int index = 1; index < argc; index++) command[index + 5] = argv[index];
-	struct sigaction action;
-	if (sigprocmask(SIG_BLOCK, NULL, &mask) < 0 || getrlimit(RLIMIT_NOFILE, &files) < 0) goto done;
-	for (int number = 1; number <= 64; number++) {
-		if (sigismember(&mask, number) == 1) blocked |= 1ULL << (number - 1);
-		if (sigaction(number, NULL, &action) == 0 && action.sa_handler == SIG_IGN) ignored |= 1ULL << (number - 1);
-	}
-	for (int fd = 0; fd < 3; fd++) if ((int)(status[fd] = (unsigned)fcntl(fd, F_GETFL)) < 0) goto done;
-	snprintf(recorded, sizeof(recorded), "%llx:%llx:%llx:%x:%x:%x", ignored, blocked, (unsigned long long)files.rlim_cur, status[0], status[1], status[2]);
-	if (setenv("PI_SPEC_NATIVE_STATE", recorded, 1) < 0) goto done;
-	execv(command[0], command);
-	result = errno == ENOENT ? 127 : 126;
-	free(command);
 done:
 	if (file) fclose(file);
 	free(line);
-	for (unsigned index = 0; index < 5; index++) free(fields[index]);
+	for (unsigned index = 0; index < 3; index++) free(fields[index]);
 	return result;
+}
+
+/* The sandbox's context as a nested request reports it, once a script's read position is shown preserved. */
+static int probe_context(const char *root, const char *script) {
+	char cwd[PATH_MAX], *text = NULL;
+	size_t size = 0;
+	int status;
+	if (!getcwd(cwd, sizeof(cwd)) || strcmp(cwd, root)) return 70;
+	pid_t child = fork();
+	if (child == 0) { execl(script, script, (char *)NULL); _exit(127); }
+	if (child < 0 || waitpid(child, &status, 0) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 42) return 71;
+	FILE *out = open_memstream(&text, &size);
+	int valid = out && raw_context(out) == 0;
+	if (out && fclose(out) != 0) valid = 0;
+	valid = valid && transfer(1, text, size, 1) == 0;
+	free(text);
+	return valid ? 0 : 70;
 }
 
 static int duplicate_tracee_fd(struct decision_job *job, unsigned fd) {
@@ -3247,6 +3366,7 @@ int main(int argc, char **argv) {
 		execv(executable, memmove(argv + 2, argv + 4, (size_t)(argc - 3) * sizeof(*argv))); /* two spare slots, as in image_dispatch */
 		return errno == ENOENT ? 127 : 126;
 	}
+	if (argc == 4 && !strcmp(argv[1], "--probe-context")) return probe_context(argv[2], argv[3]);
 	if (argc == 2 && !strcmp(argv[1], "--probe-clean-fds")) {
 		int extra = has_unmodeled_descriptors(3);
 		return extra < 0 ? 70 : extra ? 65 : 0;
