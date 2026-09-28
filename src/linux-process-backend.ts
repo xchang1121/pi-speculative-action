@@ -1977,7 +1977,7 @@ async function captureDependencies(
 		return { path: current, links };
 	};
 	const interposed = new Set(session.interposition.executables.map(([target]) => path.resolve(target)));
-	const pending = [...observed], seenImages = new Set<string>();
+	const pending = [...observed], seenImages = new Set<string>(), hostPaths = new Map<string, { physical: string; role: Exclude<ObservedProcessPath["role"], "metadata"> }>();
 	for (let item = pending.shift(); item; item = pending.shift()) {
 		const follow = item.role !== "metadata" || item.followSymlinks, walked = await walk(item.path, follow);
 		if (!walked || walked.path !== (item.path.split("/").includes("..") ? (await walk(path.posix.normalize(item.path), follow))?.path : walked.path)) {
@@ -2013,16 +2013,17 @@ async function captureDependencies(
 			add(await workspaceDependency(physical, session.projection.toLogical(physical), item.role));
 			continue;
 		}
-		try {
-			const captured = await captureHostPath(physical, item.role);
-			if (captured) for (const dependency of captured) add(dependency);
-			else { taints.add("mutable_input"); add(undefined, `mutable:${physical}`); }
-		} catch (error) {
-			complete = false;
-			taints.add("trace_incomplete");
-			incompleteReasons.add(`capture:${physical}:${errorMessage(error)}`);
-		}
+		hostPaths.set(`${item.role}\0${physical}`, { physical, role: item.role });
 	}
+	// Host files are independent of each other and of the workspace: capture them concurrently, add them in trace order.
+	const hostCaptures = await mapFilesystem([...hostPaths.values()], ({ physical, role }) =>
+		captureHostPath(physical, role).then(value => ({ value }), (error: unknown) => ({ error })));
+	[...hostPaths.values()].forEach(({ physical }, index) => {
+		const captured = hostCaptures[index]!;
+		if ("error" in captured) { complete = false; taints.add("trace_incomplete"); incompleteReasons.add(`capture:${physical}:${errorMessage(captured.error)}`); }
+		else if (captured.value) for (const dependency of captured.value) add(dependency);
+		else { taints.add("mutable_input"); add(undefined, `mutable:${physical}`); }
+	});
 	for (const effect of effects) {
 		const physical = session.projection.toPhysical(effect.logicalPath);
 		if (!physical) { complete = false; incompleteReasons.add(`effect_unmapped:${effect.logicalPath}`); continue; }
