@@ -8,7 +8,7 @@ import { createPatternPlanSource } from "../src/pattern-plan-source.ts";
 
 type Call = { readonly id: string; readonly tool: string; readonly input: Record<string, unknown> };
 type Result = { readonly content: unknown[]; readonly details: unknown; readonly isError: boolean };
-type Prediction = { readonly type: string; readonly tool: string; readonly input: Record<string, unknown>; readonly feedback?: unknown };
+type Prediction = { readonly type: string; readonly tool: string; readonly input: Record<string, unknown>; readonly feedback?: unknown; readonly expectedLatencyBenefitMs?: number };
 type Counts = { actual: number; covered: number; predicted: number; hits: number };
 
 const sessions = process.argv.slice(2).map((file) => {
@@ -29,7 +29,7 @@ const tools = ["read", "grep", "find", "ls", "bash", "edit", "write"];
 const settings = patternAwareSettings({ enabled: true, multiStepEnabled: true });
 const runtimeSettings = { enabled: true, tools, sourceConfig: { patternAware: settings } } as never;
 const data = { tools: new Map(tools.map((name) => [name, { name, parameters: {} }])), schemaHashes: Object.fromEntries(tools.map((name) => [name, "schema"])) };
-const totals: Counts & { decisions: number } = { decisions: 0, actual: 0, covered: 0, predicted: 0, hits: 0 }, byTool: Record<string, Counts> = {};
+const totals = { decisions: 0, actual: 0, covered: 0, predicted: 0, hits: 0, top4: 0, top4Hits: 0, top4Covered: 0 }, byTool: Record<string, Counts> = {};
 const count = (tool: string) => byTool[tool] ??= { actual: 0, covered: 0, predicted: 0, hits: 0 };
 let turn = 0;
 for (const [index, { cwd, batches, results }] of sessions.entries()) {
@@ -44,14 +44,16 @@ for (const [index, { cwd, batches, results }] of sessions.entries()) {
 		startInput = { sessionID, turnID: `turn-${++turn}`, tools: [], actorModel: {}, context: { systemPrompt: "", messages: [], tools: [] } };
 		controller.turnStarted(startInput as never, runtimeSettings);
 		const proposal = await controller.source.propose(request(startInput) as never);
-		const predictions = [...carried, ...(proposal && "actions" in proposal ? proposal.actions as readonly Prediction[] : [])].filter((action) => action.type === "tool_call");
-		const actual = batch.map((call) => key(call.tool, call.input)), covered = new Set<number>();
+		const predictions = [...carried, ...(proposal && "actions" in proposal ? proposal.actions as readonly Prediction[] : [])].filter((action) => action.type === "tool_call")
+			.sort((left, right) => (right.expectedLatencyBenefitMs ?? 0) - (left.expectedLatencyBenefitMs ?? 0)); // The scheduler's value order.
+		const actual = batch.map((call) => key(call.tool, call.input)), covered = new Set<number>(), top4 = new Set<number>();
 		totals.decisions++;
-		for (const prediction of predictions) {
+		for (const [rank, prediction] of predictions.entries()) {
 			const predicted = key(prediction.tool, prediction.input);
 			const hit = actual.findIndex((action) => predicted && action && (predicted.key === action.key || actionKeyCovers(predicted, action, rules)));
 			totals.predicted++; count(prediction.tool).predicted++;
 			if (hit >= 0) { totals.hits++; count(prediction.tool).hits++; covered.add(hit); }
+			if (rank < 4) { totals.top4++; if (hit >= 0) { totals.top4Hits++; top4.add(hit); } }
 			if (!prediction.feedback) continue;
 			// The runtime's feedback: each issued prediction settles as matched and adopted, or observed but unmatched.
 			const identity = { proposalID: "p", actionID: "a", feedback: prediction.feedback };
@@ -59,6 +61,7 @@ for (const [index, { cwd, batches, results }] of sessions.entries()) {
 			await controller.source.onSettled?.({ ...identity, settlement: { prediction: { id: "p", source: "pattern_aware", proposalID: "p", actionID: "a" }, observation: "observed",
 				actorAction: { id: "actor", sequence: 0, turnID: `turn-${turn}` }, match: hit >= 0 ? { matched: true, relation: { kind: "exact", distance: 0 }, adoption: { status: "adopted", candidateID: "c" } } : { matched: false } } } as never);
 		}
+		totals.top4Covered += top4.size;
 		for (const [order, call] of batch.entries()) {
 			totals.actual++; count(call.tool).actual++;
 			if (covered.has(order)) { totals.covered++; count(call.tool).covered++; }
@@ -77,4 +80,5 @@ for (const [index, { cwd, batches, results }] of sessions.entries()) {
 }
 const percent = (part: number, whole: number) => whole ? `${(100 * part / whole).toFixed(1)}%` : "-";
 console.log(JSON.stringify({ ...totals, precision: percent(totals.hits, totals.predicted), recall: percent(totals.covered, totals.actual),
+	top4Precision: percent(totals.top4Hits, totals.top4), top4Recall: percent(totals.top4Covered, totals.actual),
 	byTool: Object.fromEntries(Object.entries(byTool).map(([tool, counts]) => [tool, { ...counts, precision: percent(counts.hits, counts.predicted), recall: percent(counts.covered, counts.actual) }])) }, null, 1));

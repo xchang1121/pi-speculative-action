@@ -1,9 +1,6 @@
 import type { Sha256Digest } from "./provenance-certificate.ts";
 
-interface WorkspaceEntryChange {
-	readonly changeDigest: Sha256Digest;
-	readonly changeTimeMs: number;
-}
+interface WorkspaceEntryChange { readonly changeDigest: Sha256Digest; readonly changeTimeMs: number; }
 
 export type WorkspaceTreeEntry = WorkspaceEntryChange & (
 	| {
@@ -29,15 +26,8 @@ export type WorkspaceTreeEntry = WorkspaceEntryChange & (
 			readonly uid: number;
 			readonly gid: number;
 	  }
-	| {
-			readonly kind: "symlink";
-			readonly target: string;
-			readonly targetDigest: Sha256Digest;
-	  }
-	| {
-			readonly kind: "unsupported";
-			readonly type: string;
-	  });
+	| { readonly kind: "symlink"; readonly target: string; readonly targetDigest: Sha256Digest; }
+	| { readonly kind: "unsupported"; readonly type: string; });
 
 export type WorkspaceStructureEntry =
 	| Omit<Extract<WorkspaceTreeEntry, { readonly kind: "file" }>, "digest">
