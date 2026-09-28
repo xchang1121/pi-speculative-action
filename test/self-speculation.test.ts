@@ -37,23 +37,13 @@ describe("self-speculation control plane", () => {
 		});
 		expect(normalizeSelfSpeculationSettings({ forkActionMinConfidence: 0 }).forkActionMinConfidence).toBe(0);
 		expect(
-			normalizeSelfSpeculationSettings({
-				draftBoundary: "[TOOLS]",
-				forkForcedPrefix: "[TOOLS] name=",
-			}),
+			normalizeSelfSpeculationSettings({ draftBoundary: "[TOOLS]", forkForcedPrefix: "[TOOLS] name=" }),
 		).toMatchObject({ draftBoundary: "[TOOLS]", forkForcedPrefix: "[TOOLS] name=" });
-		expect(
-			normalizeSelfSpeculationSettings({
-				actorProfile: " qwen35_xml ",
-			}),
-		).toMatchObject({
+		expect(normalizeSelfSpeculationSettings({ actorProfile: " qwen35_xml ", })).toMatchObject({
 			actorProfile: "qwen35_xml",
 			draftFormat: "auto",
 		});
-		expect(normalizeSelfSpeculationSettings({})).toMatchObject({
-			actorProfile: "tagged_json",
-			draftFormat: "auto",
-		});
+		expect(normalizeSelfSpeculationSettings({})).toMatchObject({ actorProfile: "tagged_json", draftFormat: "auto" });
 	});
 
 	it.each([false, true])("buffers an ordered Actor bundle while preserving predicted identity (covering=%s)", async (covering) => {
@@ -73,10 +63,7 @@ describe("self-speculation control plane", () => {
 		expect(requests).toHaveLength(0);
 		const actorPayload = coordinator.decorateActorPayload({ model: "actor" }) as Record<string, unknown>;
 		expect(actorPayload).toEqual(
-			expect.objectContaining({
-				request_id: "actor-request",
-				self_speculation: expect.objectContaining({ fork: false }),
-			}),
+			expect.objectContaining({ request_id: "actor-request", self_speculation: expect.objectContaining({ fork: false }) }),
 		);
 		expect(actorPayload.self_speculation).not.toHaveProperty("role");
 		await coordinator.dispose();
@@ -330,10 +317,7 @@ describe("self-speculation control plane", () => {
 		const bundles = requests.filter((request) => request.path === SELF_SPECULATION_DEFAULTS.candidatePath);
 		expect(bundles).toHaveLength(verified ? 2 : 1);
 		const selected = (verified ? bundles.at(-1) : bundles[0])!.body.candidates;
-		expect(selected.map((item: Record<string, any>) => item.sources)).toEqual([
-			["pattern-aware"],
-			["drafter"],
-		]);
+		expect(selected.map((item: Record<string, any>) => item.sources)).toEqual([["pattern-aware"], ["drafter"]]);
 		const score = verified ? "decoder_acceptance_probability" : "action_adoption_probability";
 		expect(selected[0].score[score]).toBeGreaterThan(selected[1].score[score]);
 		expect(selected.map((item: Record<string, any>) => [item.score.conditional_probability, item.score.empirical_probability]))
@@ -393,16 +377,8 @@ describe("self-speculation control plane", () => {
 		expect(forks[0]?.body).toMatchObject({
 			request_id: "actor-request",
 			context: { provider_payload: { model: "actor", prompt: "PROMPT" } },
-			snapshot: {
-				generated_text: "reason",
-				content: "",
-				reasoning: "reason",
-				chunk_count: 1,
-			},
-			options: {
-				actor_profile: "tagged_json",
-				decoder: "auto",
-			},
+			snapshot: { generated_text: "reason", content: "", reasoning: "reason", chunk_count: 1 },
+			options: { actor_profile: "tagged_json", decoder: "auto" },
 		});
 		expect(forks[0]?.body.options).not.toHaveProperty("draft_format");
 		expect(forks[0]?.body.options).not.toHaveProperty("forced_prefix");
@@ -421,6 +397,25 @@ describe("self-speculation control plane", () => {
 				forkMeanLogprob: -0.03,
 			}),
 		);
+	});
+
+	it("withholds the request kinds a control plane declares it does not serve", async () => {
+		for (const [capabilities, forks] of [[{ fork: false, candidates: true, provider: true }, 0], [{ fork: true, logprobs: false }, 0], [{ fork: true, logprobs: true }, 1]] as const) {
+			const paths: string[] = [], actorForkPlans = createActorForkPlanSource({ maxAttempts: 1 }), settings = enabledSettings({ forkTransport: "sidecar" });
+			const coordinator = new SelfSpeculationCoordinator({ settings: () => settings, actorForkPlanSource: actorForkPlans, requestID: () => "actor-request",
+				fetch: async (input) => { const target = new URL(String(input)).pathname; paths.push(target);
+					return Response.json(target === settings.capabilitiesPath ? { capabilities } : target === settings.forkPath ? forkReceipt("read", { path: "a" }) : {}); } });
+			coordinator.startTurn("turn-1", model(), context(), 1);
+			await vi.waitFor(() => expect(paths).toContain(settings.capabilitiesPath));
+			await new Promise((resolve) => setTimeout(resolve, 10)); // The declaration applies once its response is read.
+			const pending = actorForkPlans.waitForBatches("turn-1", new AbortController().signal);
+			coordinator.addCandidate(candidate("drafter", "k", "h", "read", { path: "a" }, 0.9));
+			coordinator.decorateActorPayload({ prompt: "P" });
+			coordinator.observeActorOutput(delta("text_delta", "x"));
+			await pending; await coordinator.dispose();
+			expect(paths.filter((target) => target === settings.forkPath), JSON.stringify(capabilities)).toHaveLength(forks);
+			expect(paths.includes(settings.candidatePath)).toBe("candidates" in capabilities);
+		}
 	});
 
 	it("forks through the Drafter from the Actor's reasoning when no control plane exists", async () => {
@@ -491,10 +486,7 @@ describe("self-speculation control plane", () => {
 		["above-one", { token_count: 2, mean: -0.03, tool_name: { minimum_probability: 1.01 } }, false],
 		["infinite", { token_count: 2, mean: -0.03, tool_name: { minimum_probability: Number.POSITIVE_INFINITY } }, false],
 	])("applies the fork confidence gate to %s evidence", async (_label, logprobs, admitted) => {
-		const { actions, coordinator } = await forkActionFixture(
-			{},
-			forkReceipt("read", { path: "not-executed.txt" }, logprobs),
-		);
+		const { actions, coordinator } = await forkActionFixture({}, forkReceipt("read", { path: "not-executed.txt" }, logprobs));
 
 		expect(actions).toEqual(admitted ? [{ tool: "read", input: { path: "not-executed.txt" } }] : []);
 		await coordinator.dispose();
@@ -671,10 +663,7 @@ describe("self-speculation control plane", () => {
 	});
 });
 
-interface CapturedRequest {
-	readonly path: string;
-	readonly body: Record<string, any>;
-}
+interface CapturedRequest { readonly path: string; readonly body: Record<string, any>; }
 
 function coordinatorFixture(
 	requests: CapturedRequest[],
@@ -689,10 +678,7 @@ function coordinatorFixture(
 		requestID: () => requestIDs.shift() ?? "unexpected-request",
 		actorForkPlanSource,
 		fetch: async (input, init) => {
-			const request = {
-				path: new URL(String(input)).pathname,
-				body: JSON.parse(String(init?.body)),
-			};
+			const request = { path: new URL(String(input)).pathname, body: JSON.parse(String(init?.body)) };
 			requests.push(request);
 			const result = await response?.(request, init);
 			return result instanceof Response ? result : Response.json(result ?? { ok: true });
@@ -798,16 +784,7 @@ function predictionFeedback(source: string, adopted: boolean, sequence: number):
 }
 
 function action(key: string, hash: string, tool: string, input: Record<string, unknown>): ActionKey {
-	return {
-		key,
-		hash,
-		tool,
-		input,
-		resources: [],
-		semanticsEpoch: "test",
-		schemaHash: "schema",
-		executionFingerprint: "executor",
-	};
+	return { key, hash, tool, input, resources: [], semanticsEpoch: "test", schemaHash: "schema", executionFingerprint: "executor" };
 }
 
 function model(baseUrl = "http://127.0.0.1:8000/v1") {
