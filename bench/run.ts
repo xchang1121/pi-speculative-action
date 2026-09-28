@@ -37,10 +37,7 @@ type BenchmarkOptions = Readonly<typeof options>;
 
 const SECRET_VARIABLE = /(?:API_KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)/i;
 
-interface CommandResult {
-	readonly stdout: string;
-	readonly stderr: string;
-}
+interface CommandResult { readonly stdout: string; readonly stderr: string; }
 
 const { values } = parseArgs({
 	options: {
@@ -207,9 +204,10 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	});
 	await session.bindExtensions({ mode: "print" });
 	let turns = 0;
-	const actorActionsByTool: Record<string, number> = {};
+	const actorActionsByTool: Record<string, number> = {}, toolWallMs = new Map<string, number>();
 	session.subscribe((event) => {
-		if (event.type === "tool_execution_start") increment(actorActionsByTool, event.toolName);
+		if (event.type === "tool_execution_start") { increment(actorActionsByTool, event.toolName); toolWallMs.set(event.toolCallId, -performance.now()); }
+		if (event.type === "tool_execution_end") toolWallMs.set(event.toolCallId, performance.now() + (toolWallMs.get(event.toolCallId) ?? 0));
 		if (event.type === "turn_end" && ++turns >= input.maxTurns) void session.abort();
 	});
 
@@ -329,7 +327,8 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		traces: {
 			drafterPredictions: drafterPredictionTrace,
 			candidateStarts: candidateStartTrace,
-			actorActions: actorActionTrace,
+			// The Actor's wall time per call, beside its native service time, shows speculation's cost on its path.
+			actorActions: actorActionTrace.map((action) => ({ ...action, wallMs: toolWallMs.get(action.id) })),
 		},
 	};
 }
@@ -433,14 +432,7 @@ function required(value: string | undefined, option: string): string {
 	return value.trim();
 }
 
-async function exists(value: string): Promise<boolean> {
-	try {
-		await stat(value);
-		return true;
-	} catch {
-		return false;
-	}
-}
+async function exists(value: string): Promise<boolean> { try { await stat(value); return true; } catch { return false; } }
 
 function command(file: string, args: readonly string[], cwd?: string): Promise<CommandResult> {
 	return new Promise((resolve, reject) => {
