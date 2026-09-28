@@ -51,6 +51,12 @@ export function workspaceStatFields(image: string, argv: readonly string[]): rea
 	return SHELLS.has(image) || ["test", "[", "make", "xargs", "cp", "mv", "rm", "ln", "mkdir", "rmdir", "touch", "chmod"].includes(image) ? WITHOUT_DEVICE : undefined;
 }
 
+/** The stat fields git reads of a directory outside the workspace while it discovers the repository: its device (the
+ * filesystem boundary), owner (safe.directory) and type; never the times or link count its siblings change. */
+export function hostStatFields(image: string): readonly FilesystemObservationField[] | undefined {
+	return image === "git" ? ["dev", "mode", "uid", "gid"] : undefined;
+}
+
 /** Walkers whose output never depends on the filesystem type fts reads to pick its traversal. */
 export const FILESYSTEM_TYPE_BLIND: ReadonlySet<string> = new Set(["find", "rm", "grep", "egrep", "fgrep"]);
 /** Shell text that reads what differs between runs: special parameters, time formats, the time keyword and job pids. */

@@ -37,6 +37,7 @@ import {
 	type DynamicDependencyCertificate,
 	type ExecPrototype,
 	type ExitOutcome,
+	filesystemObservationDigest,
 	type OrderedEffectEvent,
 	type OFDPosition,
 	type ProcessProducerProof,
@@ -240,6 +241,8 @@ interface ActiveSession {
 	readonly token: string;
 	readonly ownership: ProcessHandoffOwnership;
 	readonly sourceRoot: string;
+	/** The workspace's own repository, shown read-only in place of the snapshot's: git reads what the Actor's git reads. */
+	readonly gitDirectory?: string;
 	readonly workspace: SandboxWorkspaceContext;
 	readonly invocation: ToolProcessInvocation;
 	readonly scope?: ExecutionScope;
@@ -529,9 +532,11 @@ export class LinuxProcessReuseBackend {
 		const nestedProducer = speculativeProducerProof(ready, deniedPaths, LEAF_POLICY_ID);
 		const controller = new AbortController();
 		const server = net.createServer({ allowHalfOpen: true }, (socket) => this.serve(session, socket));
+		const gitDirectory = await lstat(path.join(sourceRoot, ".git")).then((info) => info.isDirectory() ? path.join(sourceRoot, ".git") : undefined, () => undefined);
 		const session: ActiveSession = {
 			token,
 			sourceRoot,
+			...(gitDirectory ? { gitDirectory } : {}),
 			workspace: input.workspace,
 			invocation: input.invocation,
 			scope: snapshotExecutionScope(input.scope),
@@ -562,6 +567,7 @@ export class LinuxProcessReuseBackend {
 				session.signal?.throwIfAborted();
 				// A bound operation already names its executable; only enclosing tools need PATH interception.
 				if (kind === "tool") await (dispatch ??= createProcessInterposition({
+					gitDirectory,
 					privateRoot: input.workspace.processRoot,
 					pathValue: originalPath,
 					projection,
@@ -1308,7 +1314,8 @@ export class LinuxProcessReuseBackend {
 					session.deniedPaths,
 					[session.workspace.sandboxRoot, ...(descriptorReportPath ? [descriptorReportPath] : []),
 						...[...descriptorImages.values()].filter(image => !image.workspace).map(image => image.physical)],
-					[{ virtualPath: session.sourceRoot, hostPath: session.workspace.sandboxRoot, readOnly: false }],
+					[{ virtualPath: session.sourceRoot, hostPath: session.workspace.sandboxRoot, readOnly: false },
+						...(session.gitDirectory ? [{ virtualPath: session.gitDirectory, hostPath: session.gitDirectory, readOnly: true }] : [])],
 					[],
 				),
 				...inheritedFiles.flatMap((_, index) => ["--preserve-fd", String(index + 3)]),
@@ -1966,7 +1973,10 @@ async function captureDependencies(
 		let current = "/";
 		for (let segment = pending.shift(); segment !== undefined; segment = pending.shift()) {
 			if (segment === "..") { current = path.posix.dirname(current); continue; }
-			const next = path.posix.join(current, segment), physical = pathContains(session.sourceRoot, next) ? session.projection.toPhysical(next) : undefined;
+			const next = path.posix.join(current, segment);
+			// The repository is the workspace's own, mounted read-only: the host walk captures it.
+			if (session.gitDirectory && pathContains(session.gitDirectory, next)) return { path: path.posix.join(next, ...pending), links };
+			const physical = pathContains(session.sourceRoot, next) ? session.projection.toPhysical(next) : undefined;
 			const entry = physical ? await before(physical) : undefined;
 			if (entry?.kind === "file" && pending.length) return undefined; // Native ENOTDIR; lexical collapse would continue.
 			if (entry?.kind !== "symlink" || !pending.length && !follow) { current = next; continue; }
@@ -1990,9 +2000,14 @@ async function captureDependencies(
 		const shadow = session.interposition.directories.find((directory) => pathContains(directory.shadow, resolved));
 		const observedPath = shadow ? path.join(shadow.source, path.relative(shadow.shadow, resolved)) : resolved;
 		if (session.deniedPaths.some((denied) => pathContains(denied, observedPath))) { taints.add("escaped_sandbox"); incompleteReasons.add(`denied:${observedPath}`); continue; }
-		const physical = pathContains(session.sourceRoot, observedPath)
+		const physical = pathContains(session.sourceRoot, observedPath) && !(session.gitDirectory && pathContains(session.gitDirectory, observedPath))
 			? (session.projection.toPhysical(observedPath) ?? observedPath)
 			: observedPath;
+		// A loose object or pack is named by its content: its presence and size stand for its bytes.
+		if (session.gitDirectory && item.role !== "metadata" && CONTENT_ADDRESSED_GIT.test(path.relative(session.gitDirectory, physical))) {
+			const info = await lstat(physical, { bigint: true }).catch(() => undefined);
+			if (info?.isFile()) { add({ kind: "metadata", path: slash(physical), followSymlinks: false, fields: ["mode", "size"], digest: filesystemObservationDigest(info, ["mode", "size"]) }); continue; }
+		}
 		if (KERNEL_CONFIGURATION.has(observedPath)) continue; // Changes only with the kernel's own configuration, like the clock.
 		// A process reading its own state, or the host's CPU and cgroup limits, observes this one run like the clock or its pid.
 		if (/^\/proc\/(?:self|thread-self|\d+)(?:\/|$)/.test(observedPath)) { taints.add("pid_observation"); continue; }
@@ -2036,6 +2051,7 @@ async function captureDependencies(
 }
 
 const STABLE_SANDBOX_DEVICES = new Set(["/dev/null", "/dev/tty", "/dev/zero", "/dev/full"]);
+const CONTENT_ADDRESSED_GIT = /^objects\/(?:[0-9a-f]{2}\/[0-9a-f]{38}(?:[0-9a-f]{24})?|pack\/pack-[0-9a-f]{40}(?:[0-9a-f]{24})?\.(?:pack|idx|rev|bitmap))$/;
 const KERNEL_CONFIGURATION = new Set(["/proc/filesystems", "/proc/mounts"]);
 const SAME_CONFINEMENT_TAINTS = ["confinement_observation"] as const;
 
@@ -2052,7 +2068,7 @@ async function captureHostPath(
 		// A runtime socket's absence validates exactly; what exists under these roots changes without a trace.
 		if (["/proc", "/sys", "/dev", "/run", "/tmp", "/var/tmp"].some((root) => pathContains(root, current)) && (!pathContains("/run", current) || info && terminal)) return undefined;
 		if (!info) {
-			const absence = await captureAbsenceDependency(current, slash(current), true);
+			const absence = await captureAbsenceDependency(current, slash(current), false); // A case-sensitive lookup proves itself; siblings may come and go.
 			if (!absence) throw new Error("host dependency changed during capture");
 			return [...dependencies, absence];
 		}
@@ -2152,6 +2168,7 @@ function wireOutput(output: readonly BufferedOutput[]): readonly { readonly fd: 
 }
 
 async function createProcessInterposition(input: {
+	readonly gitDirectory?: string;
 	readonly privateRoot: string;
 	readonly pathValue: string;
 	readonly projection: ExecutionPathProjection;
@@ -2282,6 +2299,7 @@ async function createProcessInterposition(input: {
 	const mounts = uniqueSandboxMounts([
 		...directories.map(({ shadow, source }) => ({ virtualPath: shadow, hostPath: source, readOnly: true })),
 		{ virtualPath: input.sourceRoot, hostPath: input.workspaceRoot, readOnly: false },
+		...(input.gitDirectory ? [{ virtualPath: input.gitDirectory, hostPath: input.gitDirectory, readOnly: true }] : []),
 	]);
 	return {
 		mounts,

@@ -45,6 +45,12 @@ describe("strace provenance decoder", () => {
 			const flags = "fcntl(4</work>, F_GETFL) = 0x38800 (flags O_RDONLY|O_NONBLOCK|O_LARGEFILE|O_NOFOLLOW|O_DIRECTORY)";
 			expect((await run(["find", "."], "/work/a.txt", ['openat(AT_FDCWD, ".", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = 4</work>', flags])).taints).not.toContain("unsupported_syscall");
 			expect((await run(["find", "."], "/work/a.txt", [flags])).taints).toContain("unsupported_syscall");
+			// A read-only repository refuses git's index lock: harmless to a git that still succeeds (status), not to one that fails (add).
+			const lock = 'openat(AT_FDCWD, "/work/.git/index.lock", O_RDWR|O_CREAT|O_EXCL|O_CLOEXEC, 0666) = -1 EACCES (Permission denied)';
+			for (const [exit, tainted] of [[0, false], [128, true]] as const) {
+				await fs.writeFile(`${prefix}.100`, ['execve("/usr/bin/git", ["git", "status"], 0x0) = 0', lock, `+++ exited with ${exit} +++`].join("\n"));
+				expect((await observeStrace(prefix, "/usr/bin/git", "/work")).taints.includes("confinement_observation"), `exit ${exit}`).toBe(tainted);
+			}
 			// ls -l asks an NSS cache first: a refused local socket is only a path the Actor's host must lack too.
 			const nss = ["socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0) = 3<UNIX-STREAM:[9]>",
 				'connect(3<UNIX-STREAM:[9]>, {sa_family=AF_UNIX, sun_path="/var/run/nscd/socket"}, 110) = -1 EACCES (Permission denied)'];

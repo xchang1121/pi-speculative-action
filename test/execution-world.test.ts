@@ -1,10 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { testBranch } from "./branch.ts";
-import {
-	buildPiActionKey,
-	KEYABLE_TOOLS,
-	PI_ACTION_SEMANTICS,
-} from "../src/action-semantics.ts";
+import { buildPiActionKey, KEYABLE_TOOLS, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import {
 	type EffectCapabilities,
 	RESOURCE_OBSERVATION_EFFECTS,
@@ -12,11 +8,7 @@ import {
 	WORKSPACE_PATH_MUTATION_EFFECTS,
 } from "../src/effect-model.ts";
 import type { ExecutionWorld, ExecutionWorldDiagnosticSnapshot, SpeculativeExecution } from "../src/execution-world.ts";
-import {
-	executionCapabilityStatus,
-	ExecutionWorldRouter,
-	sameSpeculativeExecutionRoute,
-} from "../src/execution-world.ts";
+import { executionCapabilityStatus, ExecutionWorldRouter, sameSpeculativeExecutionRoute } from "../src/execution-world.ts";
 
 type BaseTestWorld = ExecutionWorld<{ readonly value: string }, string>;
 type TestWorld = BaseTestWorld & { readonly speculation: NonNullable<BaseTestWorld["speculation"]> };
@@ -66,19 +58,11 @@ describe("ExecutionWorldRouter", () => {
 		const unavailableBase = runtime("unavailable");
 		const unavailable = {
 			...unavailableBase,
-			speculation: {
-				...unavailableBase.speculation,
-				prepare: vi.fn(async () => {
-					throw new Error("unavailable");
-				}),
-			},
+			speculation: { ...unavailableBase.speculation, prepare: vi.fn(async () => { throw new Error("unavailable"); }) },
 		};
 		const resource = fallback("resource", "resource_snapshot", "all");
 		const router = new ExecutionWorldRouter([unavailable, resource, resource]);
-		const route = await router.resolve(
-			{ effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS },
-			preparation,
-		);
+		const route = await router.resolve({ effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS }, preparation);
 
 		expect(route).toMatchObject({ backend: "resource", scope: "fallback" });
 		expect(unavailable.speculation.prepare).toHaveBeenCalledOnce();
@@ -89,16 +73,8 @@ describe("ExecutionWorldRouter", () => {
 		expect(route && sameSpeculativeExecutionRoute(route, { ...route, fingerprint: "changed" })).toBe(false);
 		expect(await router.diagnostics(preparation)).toEqual(
 			expect.arrayContaining([
-				expect.objectContaining({
-					id: "unavailable",
-					state: "unavailable",
-					detail: "unavailable",
-				}),
-				expect.objectContaining({
-					id: "resource",
-					state: "ready",
-					detail: "Route prepared successfully",
-				}),
+				expect.objectContaining({ id: "unavailable", state: "unavailable", detail: "unavailable" }),
+				expect.objectContaining({ id: "resource", state: "ready", detail: "Route prepared successfully" }),
 			]),
 		);
 		const failures = [new Error("runtime cleanup failed"), new Error("resource cleanup failed")];
@@ -124,17 +100,11 @@ describe("ExecutionWorldRouter", () => {
 		}));
 		const resource: TestWorld = {
 			...resourceBase,
-			observation: {
-				capabilities: RESOURCE_OBSERVATION_EFFECTS.capabilities,
-				capture,
-			},
+			observation: { capabilities: RESOURCE_OBSERVATION_EFFECTS.capabilities, capture },
 		};
 		const runtimeBase = runtime("runtime");
 		const prepare = vi.fn(async () => {});
-		const runtimeWithoutCapture = {
-			...runtimeBase,
-			speculation: { ...runtimeBase.speculation, prepare },
-		};
+		const runtimeWithoutCapture = { ...runtimeBase, speculation: { ...runtimeBase.speculation, prepare } };
 		const router = new ExecutionWorldRouter([runtimeWithoutCapture, resource]);
 
 		const captured = await router.captureAuthoritativeResult(
@@ -219,10 +189,7 @@ describe("ExecutionWorldRouter", () => {
 		expect(await router.captureAuthoritativeResult(request, preparation, { value: "actor" })).toBeDefined();
 		const diagnostics = await router.diagnostics(preparation);
 		expect(diagnostics).toEqual([
-			expect.objectContaining({
-				state: "unavailable",
-				observation: expect.objectContaining({ state: "ready" }),
-			}),
+			expect.objectContaining({ state: "unavailable", observation: expect.objectContaining({ state: "ready" }) }),
 		]);
 		expect(executionCapabilityStatus(request.requirements, diagnostics).state).toBe("unavailable");
 		expect(executionCapabilityStatus(request.requirements, diagnostics, "observation").state).toBe("ready");
@@ -280,17 +247,11 @@ describe("ExecutionWorldRouter", () => {
 
 function toolStatuses(worlds: readonly ExecutionWorldDiagnosticSnapshot[]): Record<string, string> {
 	return Object.fromEntries(
-		KEYABLE_TOOLS.map((tool) => [
-			tool,
-			executionCapabilityStatus(PI_ACTION_SEMANTICS.requirements(tool)!, worlds).state,
-		]),
+		KEYABLE_TOOLS.map((tool) => [tool, executionCapabilityStatus(PI_ACTION_SEMANTICS.requirements(tool)!, worlds).state]),
 	);
 }
 
-function platformWorlds(
-	processState: "ready" | "unavailable",
-	processDetail: string,
-): readonly ExecutionWorldDiagnosticSnapshot[] {
+function platformWorlds(processState: "ready" | "unavailable", processDetail: string): readonly ExecutionWorldDiagnosticSnapshot[] {
 	return [
 		diagnostic(
 			"linux_process_reuse",
@@ -334,20 +295,11 @@ function runtime(id: string): TestWorld {
 	return world(id, "runtime", "runtime_sandbox", "all");
 }
 
-function fallback(
-	id: string,
-	isolation: Exclude<SpeculativeExecution, "runtime_sandbox">,
-	capabilities: EffectCapabilities,
-): TestWorld {
+function fallback(id: string, isolation: Exclude<SpeculativeExecution, "runtime_sandbox">, capabilities: EffectCapabilities): TestWorld {
 	return world(id, "fallback", isolation, capabilities);
 }
 
-function world(
-	id: string,
-	scope: TestWorld["scope"],
-	isolation: TestWorld["isolation"],
-	capabilities: EffectCapabilities,
-): TestWorld {
+function world(id: string, scope: TestWorld["scope"], isolation: TestWorld["isolation"], capabilities: EffectCapabilities): TestWorld {
 	const dispose = vi.fn(async () => {});
 	return {
 		id,
