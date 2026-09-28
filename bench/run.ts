@@ -137,16 +137,10 @@ async function prepareTask(input: BenchmarkOptions) {
 		await command("git", ["-C", cache, "remote", "add", "origin", `https://github.com/${row.repo}.git`]);
 		await command("git", ["-C", cache, "config", "core.longpaths", "true"]);
 	}
+	// A cached base commit needs no network; the checkout below still pins the exact commit.
 	const benchmarkRef = `refs/bench/${safeName(row.instance_id)}`;
-	await command("git", [
-		"-C",
-		cache,
-		"fetch",
-		"--force",
-		"--depth=1",
-		"origin",
-		`+${row.base_commit}:${benchmarkRef}`,
-	]);
+	await command("git", ["-C", cache, "rev-parse", "--verify", "--quiet", `${benchmarkRef}^{commit}`]).catch(() =>
+		command("git", ["-C", cache, "fetch", "--force", "--depth=1", "origin", `+${row.base_commit}:${benchmarkRef}`]));
 	const runDirectory = await mkdtemp(path.join(input.runRoot, `${safeName(row.instance_id)}-`));
 	const workspace = path.join(runDirectory, "workspace");
 	await command("git", ["clone", "--no-checkout", cache, workspace]);
