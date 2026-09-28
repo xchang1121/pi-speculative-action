@@ -2034,6 +2034,7 @@ async function captureDependencies(
 				path: session.projection.isWorkspacePhysical(physical) ? session.projection.toLogical(physical) : slash(physical),
 				followSymlinks: item.followSymlinks,
 				digest: item.digest,
+				...(item.fields ? { fields: item.fields } : {}),
 			});
 			continue;
 		}

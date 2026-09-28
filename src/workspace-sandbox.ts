@@ -8,12 +8,7 @@ import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { containsFilesystemPath, filesystemPathKey, relativeFilesystemPath, slash } from "./path-utils.ts";
 import { errorMessage, hasErrorCode, isMissing } from "./error-utils.ts";
 import { createCommittedResourceInputs, type SpeculativeAgentExecutionWorld, type SpeculativeToolExecutionContext } from "./agent-execution-world.ts";
-import type {
-	WorldBranch,
-	WorldCheckpoint,
-	WorldCommitMetrics,
-	WorldExecutionMetrics,
-} from "./execution-world.ts";
+import type { WorldBranch, WorldCheckpoint, WorldCommitMetrics, WorldExecutionMetrics } from "./execution-world.ts";
 import { advanceFilesystemClock, assertNoSymlinkPath, captureFilesystemEntry, captureStableFile, mapFilesystem, sameFilesystemIdentity } from "./filesystem-evidence.ts";
 import { WORKSPACE_PATH_MUTATION_EFFECTS } from "./effect-model.ts";
 import { effectCommitFailure } from "./effect-transaction.ts";
@@ -83,16 +78,9 @@ export interface SandboxDirectoryChange extends SandboxChangeTarget {
 
 export type SandboxWorkspaceChange = SandboxFileChange | SandboxDirectoryChange;
 
-interface RegularFileState {
-	readonly content: Uint8Array;
-	readonly mode: number;
-	readonly identity?: BigIntStats;
-}
+interface RegularFileState { readonly content: Uint8Array; readonly mode: number; readonly identity?: BigIntStats; }
 
-export interface SandboxExecutionDelta {
-	readonly output: ToolSettlement;
-	readonly changes: readonly SandboxWorkspaceChange[];
-}
+export interface SandboxExecutionDelta { readonly output: ToolSettlement; readonly changes: readonly SandboxWorkspaceChange[]; }
 
 interface WorkspaceExecutionSnapshot extends SandboxExecutionDelta {
 	readonly executionMetrics: WorldExecutionMetrics;
@@ -196,10 +184,7 @@ interface PreparedGitWorkspace {
 	readonly dispose: () => Promise<void>;
 }
 
-interface SharedOverlayBaseline extends PreparedGitWorkspace {
-	structure?: Promise<WorkspaceStructureSnapshot>;
-	active: number;
-}
+interface SharedOverlayBaseline extends PreparedGitWorkspace { structure?: Promise<WorkspaceStructureSnapshot>; active: number; }
 
 interface AutoWorkspaceDriverDecision {
 	readonly commit: string;
@@ -234,10 +219,7 @@ function regularStructureTransitions(
 	return { complete: true, paths: Object.freeze(paths) };
 }
 
-function sameChangeIdentity(
-	left: WorkspaceStructureEntry | undefined,
-	right: WorkspaceStructureEntry | undefined,
-): boolean {
+function sameChangeIdentity(left: WorkspaceStructureEntry | undefined, right: WorkspaceStructureEntry | undefined): boolean {
 	return left === right || (!!left && !!right && left.kind === right.kind && left.changeDigest === right.changeDigest);
 }
 
@@ -280,10 +262,7 @@ interface WorkspaceCheckpoint {
 // Checkpoints expose identity only; their owned bytes stay inside this backend.
 const workspaceCheckpoints = new WeakMap<WorldCheckpoint, WorkspaceCheckpoint>();
 
-function resolveWorkspaceCheckpoint(
-	checkpoint: WorldCheckpoint | undefined,
-	sourceRoot: string,
-): WorkspaceCheckpoint | undefined {
+function resolveWorkspaceCheckpoint(checkpoint: WorldCheckpoint | undefined, sourceRoot: string): WorkspaceCheckpoint | undefined {
 	if (checkpoint === undefined) return undefined;
 	const owned = workspaceCheckpoints.get(checkpoint);
 	if (!owned) throw new Error("Execution world checkpoint belongs to another backend.");
@@ -293,10 +272,7 @@ function resolveWorkspaceCheckpoint(
 	return owned;
 }
 
-export interface QualifiedWorkspaceSandboxDriver {
-	readonly driver: Exclude<WorkspaceSandboxDriver, "auto">;
-	readonly fingerprint: string;
-}
+export interface QualifiedWorkspaceSandboxDriver { readonly driver: Exclude<WorkspaceSandboxDriver, "auto">; readonly fingerprint: string; }
 
 // Preparation owns no additional handles. A retired/replaced pool cannot lend its old snapshot.
 const preparedWorkspaceBaselines = new WeakMap<QualifiedWorkspaceSandboxDriver, {
@@ -321,10 +297,7 @@ export class WorkspaceSandboxService {
 		return (await resolveWorkspaceDriver(this.state, options, sourceRoot)).fingerprint;
 	}
 
-	async qualify(
-		options: WorkspaceSandboxOptions,
-		sourceRoot: string,
-	): Promise<QualifiedWorkspaceSandboxDriver> {
+	async qualify(options: WorkspaceSandboxOptions, sourceRoot: string): Promise<QualifiedWorkspaceSandboxDriver> {
 		assertWorkspaceSandboxOpen(this.state);
 		return await resolveWorkspaceDriver(this.state, options, sourceRoot);
 	}

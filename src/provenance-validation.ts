@@ -8,6 +8,7 @@ import {
 	type DynamicDependencyCertificate,
 	filesystemMetadataDigest,
 	filesystemObservationDigest,
+	type FilesystemObservationField,
 	type ProcessProvenanceCertificate,
 	processStrongKey,
 	type ProvenanceTaint,
@@ -26,20 +27,14 @@ export interface ProvenanceValidationContext {
 }
 
 export type DynamicDependencyValidation = (
-	| {
-			readonly status: "valid";
-			readonly dependencies: readonly DynamicDependency[];
-	  }
+	| { readonly status: "valid"; readonly dependencies: readonly DynamicDependency[]; }
 	| {
 			readonly status: "stale";
 			readonly changed: readonly string[];
 			/** Current evidence, when the original observation shape could still be captured. */
 			readonly dependencies: readonly DynamicDependency[];
 	  }
-	| {
-			readonly status: "indeterminate";
-			readonly reason: string;
-	  }
+	| { readonly status: "indeterminate"; readonly reason: string; }
 ) & { readonly filesRead: number; readonly bytesRead: number; readonly durationMs: number };
 
 export type ProvenanceValidation =
@@ -132,7 +127,7 @@ export async function validateDynamicDependencyCertificate(
 						observed = await captureSymlinkDependency(physicalPath, expected.path);
 						break;
 					case "metadata":
-						observed = await captureMetadataDependency(physicalPath, expected.path, expected.followSymlinks);
+						observed = await captureMetadataDependency(physicalPath, expected.path, expected.followSymlinks, expected.fields);
 						break;
 				}
 			}
@@ -141,10 +136,7 @@ export async function validateDynamicDependencyCertificate(
 				changed.push(expected.kind === "fd" ? `fd:${expected.fd}` : expected.path);
 			}
 		} catch (error) {
-			if (missing(error)) {
-				changed.push(expected.kind === "fd" ? `fd:${expected.fd}` : expected.path);
-				continue;
-			}
+			if (missing(error)) { changed.push(expected.kind === "fd" ? `fd:${expected.fd}` : expected.path); continue; }
 			return indeterminate(`validation_error:${expected.kind === "fd" ? expected.fd : expected.path}:${errorMessage(error)}`);
 		}
 	}
@@ -160,14 +152,10 @@ export async function captureMetadataDependency(
 	physicalPath: string,
 	logicalPath: string,
 	followSymlinks: boolean,
+	fields?: readonly FilesystemObservationField[],
 ): Promise<Extract<DynamicDependency, { kind: "metadata" }>> {
 	const observed = await (followSymlinks ? stat : lstat)(physicalPath, { bigint: true });
-	return {
-		kind: "metadata",
-		path: logicalPath,
-		followSymlinks,
-		digest: filesystemObservationDigest(observed),
-	};
+	return { kind: "metadata", path: logicalPath, followSymlinks, digest: filesystemObservationDigest(observed, fields), ...(fields ? { fields } : {}) };
 }
 
 export async function captureFileDependency(
@@ -226,10 +214,7 @@ export async function captureAbsenceDependency(
 	captureParent = true,
 	parentExcludedEntries: readonly string[] = [],
 ): Promise<Extract<DynamicDependency, { kind: "absence" }> | undefined> {
-	try {
-		await lstat(physicalPath);
-		return undefined;
-	} catch (error) {
+	try { await lstat(physicalPath); return undefined; } catch (error) {
 		if (!missing(error)) throw error;
 	}
 	if (!captureParent) return { kind: "absence", path: logicalPath };

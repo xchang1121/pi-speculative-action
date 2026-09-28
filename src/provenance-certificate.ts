@@ -32,10 +32,10 @@ export interface FilesystemMetadataEvidence {
 	readonly isSymbolicLink: () => boolean;
 }
 
-const FILESYSTEM_OBSERVATION_FIELDS = [
-	"dev", "ino", "mode", "nlink", "uid", "gid", "rdev", "size", "blksize", "blocks", "atimeNs", "mtimeNs", "ctimeNs",
-] as const;
-export type FilesystemObservationEvidence = { readonly [Field in typeof FILESYSTEM_OBSERVATION_FIELDS[number]]: bigint };
+/** Reading a file moves its access time under relatime, so an observation never proves one (RU3). */
+export const FILESYSTEM_OBSERVATION_FIELDS = ["dev", "ino", "mode", "nlink", "uid", "gid", "rdev", "size", "blksize", "blocks", "mtimeNs", "ctimeNs"] as const;
+export type FilesystemObservationField = typeof FILESYSTEM_OBSERVATION_FIELDS[number];
+export type FilesystemObservationEvidence = { readonly [Field in FilesystemObservationField]: bigint };
 
 export interface ArtifactReference { readonly digest: Sha256Digest; readonly size: number; }
 
@@ -121,6 +121,8 @@ export type DynamicDependency =
 			readonly path: string;
 			readonly followSymlinks: boolean;
 			readonly digest: Sha256Digest;
+			/** The fields a partial statx reported, in declaration order; absent means all of them. */
+			readonly fields?: readonly FilesystemObservationField[];
 	  }
 	| { readonly kind: "fd"; readonly fd: number; readonly contentDigest: Sha256Digest; readonly eof: boolean; };
 
@@ -253,7 +255,7 @@ export function dependencyPathsetKey(certificate: DynamicDependencyCertificate):
 				case "symlink":
 					return { kind: dependency.kind, path: dependency.path };
 				case "metadata":
-					return { kind: dependency.kind, path: dependency.path, followSymlinks: dependency.followSymlinks };
+					return { kind: dependency.kind, path: dependency.path, followSymlinks: dependency.followSymlinks, ...(dependency.fields ? { fields: dependency.fields } : {}) };
 				case "fd":
 					return { kind: dependency.kind, fd: dependency.fd };
 			}
@@ -396,8 +398,8 @@ export function filesystemMetadataDigest(stat: FilesystemMetadataEvidence): Sha2
 	});
 }
 
-export function filesystemObservationDigest(stat: FilesystemObservationEvidence): Sha256Digest {
-	return digestObject(Object.fromEntries(FILESYSTEM_OBSERVATION_FIELDS.map((field) => [field, String(stat[field])])));
+export function filesystemObservationDigest(stat: Partial<FilesystemObservationEvidence>, fields: readonly FilesystemObservationField[] = FILESYSTEM_OBSERVATION_FIELDS): Sha256Digest {
+	return digestObject(Object.fromEntries(fields.map((field) => [field, String(stat[field])])));
 }
 
 export function isSha256Digest(value: unknown): value is Sha256Digest {
@@ -544,7 +546,7 @@ function normalizeDependencies(dependencies: readonly DynamicDependency[]): Dyna
 export function dynamicDependencyIdentity(dependency: DynamicDependency): string {
 	if (dependency.kind === "fd") return `fd:${dependency.fd}`;
 	return dependency.kind === "metadata"
-		? `${dependency.kind}:${dependency.followSymlinks ? "follow" : "nofollow"}:${dependency.path}`
+		? `${dependency.kind}:${dependency.followSymlinks ? "follow" : "nofollow"}:${dependency.fields ? `${dependency.fields.join(",")}:` : ""}${dependency.path}`
 		: `${dependency.kind}:${dependency.path}`;
 }
 
@@ -592,7 +594,8 @@ function validateDependency(dependency: DynamicDependency): void {
 			}
 			break;
 		case "metadata":
-			if (typeof dependency.followSymlinks !== "boolean" || !isSha256Digest(dependency.digest)) {
+			if (typeof dependency.followSymlinks !== "boolean" || !isSha256Digest(dependency.digest) || dependency.fields !== undefined && (!Array.isArray(dependency.fields) ||
+				!dependency.fields.length || dependency.fields.join() !== FILESYSTEM_OBSERVATION_FIELDS.filter((field) => dependency.fields!.includes(field)).join())) {
 				throw new Error("invalid metadata dependency");
 			}
 			break;

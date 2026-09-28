@@ -4,7 +4,8 @@ import { repeatableExecutions, type TracedExecution } from "./deterministic-tool
 import { containsLogicalPath } from "./path-utils.ts";
 import {
 	type DependencyRole,
-	type FilesystemObservationEvidence,
+	FILESYSTEM_OBSERVATION_FIELDS,
+	type FilesystemObservationField,
 	filesystemObservationDigest,
 	type ProvenanceTaint,
 	type Sha256Digest,
@@ -33,7 +34,7 @@ export function straceCommand(
 
 export type ObservedProcessPath =
 	| { readonly path: string; readonly role: DependencyRole }
-	| { readonly path: string; readonly role: "metadata"; readonly followSymlinks: boolean; readonly digest: Sha256Digest };
+	| { readonly path: string; readonly role: "metadata"; readonly followSymlinks: boolean; readonly digest: Sha256Digest; readonly fields?: readonly FilesystemObservationField[] };
 
 export interface StraceObservation {
 	readonly complete: boolean;
@@ -600,13 +601,13 @@ export async function observeStrace(
 	const semanticRoots = (options.guardFilesystemSemanticsWithin ?? []).map((value) => path.posix.resolve(value));
 	const { ignored: ignoredSegments, resumed: resumedInterpositions } = ignoredProcessSegments(selected, interposedExecutables,
 		options.interpositionInterpreter && path.posix.resolve(options.interpositionInterpreter));
-	const observeMetadata = (observedPath: string, followSymlinks: boolean, digest: Sha256Digest) => {
-		const identity = `metadata:${followSymlinks}:${observedPath}`;
+	const observeMetadata = (observedPath: string, followSymlinks: boolean, { digest, fields }: StatObservation) => {
+		const identity = `metadata:${followSymlinks}:${fields?.join(",") ?? ""}:${observedPath}`;
 		if (metadata.get(identity)?.digest !== undefined && metadata.get(identity)?.digest !== digest) {
 			taints.add("mutable_input");
 			incompleteReasons.add(`metadata_changed:${observedPath}`);
 		}
-		metadata.set(identity, { path: observedPath, role: "metadata", followSymlinks, digest });
+		metadata.set(identity, { path: observedPath, role: "metadata", followSymlinks, digest, ...(fields ? { fields } : {}) });
 	};
 	for (const [pid, { file, start, cwd: initial, fs }] of selected) {
 		// -ff files cannot order another task's chdir against this task's pathname lookup.
@@ -681,15 +682,15 @@ export async function observeStrace(
 				// A recreated null device has the same I/O semantics, but may have a different device-node inode.
 				if (/<char 1:3>>$/.test(line.args[0] ?? "")) { taints.add("descriptor_observation"); continue; }
 				const metadataPaths = syscallPaths(line, syscall, cwd) ?? [];
-				const digest = statObservationDigest(line.args[structure] ?? "");
-				if (!metadataPaths.length || !digest) {
+				const observed = statObservationDigest(line.args[structure] ?? "");
+				if (!metadataPaths.length || !observed) {
 					// fstat, or an empty *at name, of a pipe or socket
 					if (descriptorTarget(line) && !quotedArgument(line.args[1])) taints.add("descriptor_observation");
 					else { taints.add("unsupported_syscall"); incompleteReasons.add(`unparsed_metadata:${syscall}:${pid}`); }
 				}
-				if (digest) {
+				if (observed) {
 					const followSymlinks = syscall !== "lstat" && !(flags && /\bAT_SYMLINK_NOFOLLOW\b/.test(line.args[flags] ?? ""));
-					for (const observed of metadataPaths) observeMetadata(observed, followSymlinks, digest);
+					for (const metadataPath of metadataPaths) observeMetadata(metadataPath, followSymlinks, observed);
 				}
 				continue;
 			}
@@ -945,7 +946,18 @@ const STAT_MODE_BITS: Readonly<Record<string, bigint>> = { S_IFSOCK: 0o140000n, 
 	S_IFDIR: 0o040000n, S_IFCHR: 0o020000n, S_IFIFO: 0o010000n, S_ISUID: 0o004000n, S_ISGID: 0o002000n, S_ISVTX: 0o001000n };
 
 /** Normalize the successful kernel stat structure printed by strace -v; statx prints the same fields under its own names. */
-function statObservationDigest(structure: string): Sha256Digest | undefined {
+type StatObservation = { readonly digest: Sha256Digest; readonly fields?: readonly FilesystemObservationField[] };
+
+/** statx fills what its mask reports; the rest are unobserved. dev, rdev and blksize are always filled; fields outside the
+ * stat structure are ignored, and an unknown flag leaves every field required. */
+const STATX_FIELD_MASKS: Readonly<Record<string, readonly FilesystemObservationField[]>> = { STATX_TYPE: ["mode"], STATX_MODE: ["mode"],
+	STATX_NLINK: ["nlink"], STATX_UID: ["uid"], STATX_GID: ["gid"], STATX_ATIME: [], STATX_MTIME: ["mtimeNs"], STATX_CTIME: ["ctimeNs"],
+	STATX_INO: ["ino"], STATX_SIZE: ["size"], STATX_BLOCKS: ["blocks"], STATX_BASIC_STATS: FILESYSTEM_OBSERVATION_FIELDS, STATX_ALL: FILESYSTEM_OBSERVATION_FIELDS,
+	...Object.fromEntries(["MNT_ID", "MNT_ID_UNIQUE", "BTIME", "DIOALIGN", "DIO_READ_ALIGN", "SUBVOL", "WRITE_ATOMIC"].map((flag) => [`STATX_${flag}`, []])) };
+
+function statObservationDigest(structure: string): StatObservation | undefined {
+	const flags = /\bstx_mask=([A-Z_|0-9x]+)/.exec(structure)?.[1]?.split("|");
+	const mask = flags?.every((flag) => STATX_FIELD_MASKS[flag]) ? flags.flatMap((flag) => STATX_FIELD_MASKS[flag]!) : undefined;
 	const line = structure.replace(/\bstx_(r?dev)_major=(\w+), stx_\1_minor=(\w+)/g, "st_$1=makedev($2, $3)")
 		.replace(/\bstx_([amc]time)=\{tv_sec=(-?\d+), tv_nsec=(\d+)\}/g, "st_$1=$2, st_$1_nsec=$3").replace(/\bstx_/g, "st_");
 	const field = (name: string): bigint | undefined => parseInteger(new RegExp(`\\b${name}=(-?(?:0x[0-9a-f]+|0[0-7]+|[0-9]+))`, "i").exec(line)?.[1]);
@@ -976,12 +988,15 @@ function statObservationDigest(structure: string): Sha256Digest | undefined {
 		size: field("st_size"),
 		blksize: field("st_blksize"),
 		blocks: field("st_blocks"),
-		atimeNs: time("st_atime"),
 		mtimeNs: time("st_mtime"),
 		ctimeNs: time("st_ctime"),
 	};
+	const fields = mask && FILESYSTEM_OBSERVATION_FIELDS.filter((field) => ["dev", "rdev", "blksize", ...mask].includes(field));
+	if (fields && fields.length < FILESYSTEM_OBSERVATION_FIELDS.length) {
+		return fields.every((field) => evidence[field] !== undefined) ? { digest: filesystemObservationDigest(evidence, fields), fields } : undefined;
+	}
 	if (Object.values(evidence).some((value) => value === undefined)) return undefined;
-	return filesystemObservationDigest(evidence as FilesystemObservationEvidence);
+	return { digest: filesystemObservationDigest(evidence) };
 }
 
 function parseInteger(value: string | undefined): bigint | undefined {
