@@ -3,11 +3,7 @@ import type { SpeculativeActionSettings } from "./runtime-contracts.ts";
 import { positiveCount } from "./number-utils.ts";
 import { nonNegativeInteger, nonNegativeNumber, positiveInteger } from "./setting-input.ts";
 
-export interface DrafterToolDefinition {
-	readonly name: string;
-	readonly description?: string;
-	readonly inputSchema?: unknown;
-}
+export interface DrafterToolDefinition { readonly name: string; readonly description?: string; readonly inputSchema?: unknown; }
 
 export interface DrafterRequestSettings {
 	/** Output-informed successor actions retained after the first Drafter action. */
@@ -19,6 +15,8 @@ export interface DrafterRequestSettings {
 	/** Inclusive temperature range stratified across the remaining requests. */
 	readonly drafterTemperatureMin: number;
 	readonly drafterTemperatureMax: number;
+	/** Show the Drafter the calls PatternAware expects next (for A/B; off by default). */
+	readonly drafterPatternHints: boolean;
 }
 
 const DRAFTER_DEFAULTS: DrafterRequestSettings = {
@@ -27,6 +25,7 @@ const DRAFTER_DEFAULTS: DrafterRequestSettings = {
 	drafterDeterministicCandidates: 1,
 	drafterTemperatureMin: 0.7,
 	drafterTemperatureMax: 0.7,
+	drafterPatternHints: false,
 };
 
 export const DEFAULTS = {
@@ -55,10 +54,7 @@ export function candidateToolNames(
 }
 
 /** Only omitted selection defaults to allowed tools; malformed input disables prediction. */
-export function normalizeSpeculativeToolSelection(
-	value: unknown,
-	allowed: readonly string[] = KEYABLE_TOOLS,
-): readonly string[] {
+export function normalizeSpeculativeToolSelection(value: unknown, allowed: readonly string[] = KEYABLE_TOOLS): readonly string[] {
 	const items = value === undefined ? allowed : value;
 	if (!Array.isArray(items) || !items.every((item): item is string => typeof item === "string")) return [];
 	const allowedSet = new Set(allowed);
@@ -78,15 +74,12 @@ export function normalizeDrafterRequestSettings(value: unknown): DrafterRequestS
 		),
 		drafterTemperatureMin: Math.min(lower, upper),
 		drafterTemperatureMax: Math.max(lower, upper),
+		drafterPatternHints: input.drafterPatternHints === true,
 	};
 }
 
 /** Stratify non-deterministic requests across the configured range for any proposal count. */
-export function drafterRequestTemperature(
-	proposalIndex: number,
-	proposalCount: number,
-	settings: DrafterRequestSettings,
-): number {
+export function drafterRequestTemperature(proposalIndex: number, proposalCount: number, settings: DrafterRequestSettings): number {
 	const count = clampCandidateLimit(proposalCount);
 	const index = Math.max(0, Math.min(count - 1, Math.floor(proposalIndex)));
 	const deterministic = Math.min(count, settings.drafterDeterministicCandidates);

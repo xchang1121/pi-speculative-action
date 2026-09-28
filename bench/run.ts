@@ -68,6 +68,7 @@ const { values } = parseArgs({
 		"speculation-disabled": { type: "boolean", default: false },
 		"pattern-aware": { type: "boolean", default: false },
 		"self-speculation": { type: "boolean", default: false },
+		"drafter-pattern-hints": { type: "boolean", default: false },
 		"prepare-only": { type: "boolean", default: false },
 	},
 	strict: true,
@@ -103,6 +104,7 @@ const options = {
 	speculationEnabled: !values["speculation-disabled"],
 	patternAware: values["pattern-aware"] ?? false,
 	selfSpeculation: values["self-speculation"] ?? false,
+	drafterPatternHints: values["drafter-pattern-hints"] ?? false,
 	prepareOnly: values["prepare-only"] ?? false,
 } as const;
 if (options.drafterTemperatureMin > options.drafterTemperatureMax) {
@@ -167,7 +169,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	await writeFile(path.join(agentDir, "speculative-action.json"), JSON.stringify({
 		enabled: input.speculationEnabled, drafterEnabled: input.drafterEnabled, drafterMaxDepth: input.drafterMaxDepth,
 		...(input.drafterMaxTokens !== undefined ? { drafterMaxTokens: input.drafterMaxTokens } : {}),
-		drafterDeterministicCandidates: input.drafterDeterministicCandidates, drafterTemperatureMin: input.drafterTemperatureMin,
+		drafterDeterministicCandidates: input.drafterDeterministicCandidates, drafterTemperatureMin: input.drafterTemperatureMin, drafterPatternHints: input.drafterPatternHints,
 		drafterTemperatureMax: input.drafterTemperatureMax, candidateLimit: input.candidateLimit, maxConcurrentActions: input.maxConcurrentActions,
 		predictionTimeoutMs: input.timeoutMs, patternAware: { enabled: input.patternAware },
 		...(input.selfSpeculation ? { selfSpeculation: { enabled: true, forkTransport: "drafter" } } : {}), draftModel: `${input.drafter.provider}/${input.drafter.id}`,

@@ -232,6 +232,21 @@ describe("speculative action host", () => {
 			output: { result: { content: [], details: {} }, isError: false }, trigger: "execution_succeeded" })).toBe(false);
 	});
 
+	it("shows the Drafter PatternAware's expected calls after the Actor's history only when enabled", async () => {
+		const tool = createReadTool(await temporaryWorkspace());
+		for (const enabled of [false, true]) {
+			const contexts: Context[] = [], asked: unknown[] = [];
+			const controller = createDrafterPlanSource({ sessionID: "session", complete: async (_model, context) => { contexts.push(context); return drafterCall({ path: "a.txt" }); },
+				patternHints: async ({ sessionID }) => { asked.push(sessionID); return [{ tool: "read", input: { path: "a.txt" } }]; } });
+			const input = { ...startInput(tool), sessionID: "session" };
+			await controller.source.propose({ startInput: input, data: { tools: new Map([["read", tool]]), schemaHashes: {} }, definitions: [], candidateNames: ["read"],
+				settings: { ...settings(), resourceCacheMaxEntries: 4, predictionTimeoutMs: 1000, sourceConfig: { drafterPatternHints: enabled } }, proposalIndex: 0, proposalCount: 1, signal: new AbortController().signal });
+			expect(contexts[0]!.messages.slice(0, input.context.messages.length)).toEqual(input.context.messages);
+			expect([asked, contexts[0]!.messages.length - input.context.messages.length]).toEqual(enabled ? [["session"], 1] : [[], 0]);
+			if (enabled) expect(contexts[0]!.messages.at(-1)).toMatchObject({ role: "user", content: expect.stringContaining('- read {"path":"a.txt"}') });
+		}
+	});
+
 	it("rolls a peer's executed batch out as a Drafter continuation that depends on it", async () => {
 		const tool = createReadTool(await temporaryWorkspace()), contexts: Context[] = [];
 		const controller = createDrafterPlanSource({ sessionID: "session", complete: async (_model, context) => { contexts.push(context); return drafterCall({ path: `${contexts.length}.txt` }); } });

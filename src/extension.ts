@@ -839,6 +839,7 @@ function openDrafterSettings(ctx: ExtensionContext, controller: SpeculativeActio
 			[`Advanced settings › sampling, follow-up steps, cost control`, () => openDrafterSettings(ctx, controller, true)],
 		] : [
 			toggle("drafterGateEnabled", "Pause drafts on estimated negative utility"),
+			toggle("drafterPatternHints", "Show PatternAware's expected calls"),
 			input("drafterMaxDepth", "Follow-up tool steps"),
 			input("drafterMaxTokens", "Maximum output tokens"),
 			input("drafterDeterministicCandidates", "Temperature-0 candidates"),

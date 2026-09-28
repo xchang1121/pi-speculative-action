@@ -54,6 +54,7 @@ describe("speculative action common", () => {
 				drafterDeterministicCandidates: -1,
 				drafterTemperatureMin: 2,
 				drafterTemperatureMax: 0.5,
+				drafterPatternHints: "yes",
 			}),
 		).toEqual({
 			drafterMaxDepth: DEFAULTS.drafterMaxDepth,
@@ -61,6 +62,7 @@ describe("speculative action common", () => {
 			drafterDeterministicCandidates: DEFAULTS.drafterDeterministicCandidates,
 			drafterTemperatureMin: 0.5,
 			drafterTemperatureMax: 2,
+			drafterPatternHints: false,
 		});
 	});
 
@@ -195,24 +197,14 @@ describe("speculative action common", () => {
 
 		expect(actionKeyMatch(speculative, actor, [projector])).toEqual({ kind: "projected", projector: "custom.subset", distance: 1 });
 		expect(actionKeyCovers(speculative, actor, [projector])).toBe(true);
-		const unguarded: ActionKeyProjector = {
-			id: "unguarded",
-			partition: projector.partition,
-			project: projector.project,
-		};
+		const unguarded: ActionKeyProjector = { id: "unguarded", partition: projector.partition, project: projector.project };
 		expect(actionKeyCovers(speculative, actor, [unguarded])).toBe(false);
 		expect(
 			actionKeyCovers(speculative, actor, [{ ...projector, id: "guarded", canShareInFlight: () => false }]),
 		).toBe(false);
 		expect(
 			actionKeyCovers(speculative, actor, [
-				{
-					...projector,
-					id: "throwing-guard",
-					canShareInFlight: () => {
-						throw new Error("coverage failed");
-					},
-				},
+				{ ...projector, id: "throwing-guard", canShareInFlight: () => { throw new Error("coverage failed"); } },
 			]),
 		).toBe(false);
 		const broken: ActionKeyProjector = {

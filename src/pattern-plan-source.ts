@@ -4,11 +4,7 @@ import type { ActionProjectionRule } from "./action-key-projection.ts";
 import { type ActionSemanticsRegistry, widenReadGuess } from "./action-semantics.ts";
 import { BoundedRecencyMap } from "./bounded-recency-map.ts";
 import type { ExecutionOperationBinding } from "./execution-world.ts";
-import {
-	agentBatchKey,
-	type AgentPlanSource,
-	type AgentStartInput,
-} from "./agent-runtime-types.ts";
+import { agentBatchKey, type AgentPlanSource, type AgentStartInput } from "./agent-runtime-types.ts";
 import {
 	acquirePatternAwareStore,
 	PATTERN_AWARE_DEFAULTS,
@@ -42,12 +38,11 @@ type CarriedPrediction = { readonly signature: string; readonly pending: Set<Pat
 export interface PatternPlanSourceController {
 	readonly source: AgentPlanSource;
 	readonly turnStarted: (startInput: AgentStartInput, settings: SpeculativeActionSettings) => void;
-	readonly turnFinished: (
-		startInput: AgentStartInput,
-		settings: SpeculativeActionSettings,
-		terminal: boolean,
-	) => void;
+	readonly turnFinished: (startInput: AgentStartInput, settings: SpeculativeActionSettings, terminal: boolean) => void;
 	readonly actorActionSettled: (feedback: ActorActionFeedback<string>) => void;
+	/** The calls PatternAware expects next, without proposing them. */
+	readonly hints: (input: { readonly sessionID: string; readonly schemaHashes: Readonly<Record<string, string>>; readonly settings: SpeculativeActionSettings })
+		=> Promise<readonly { readonly tool: string; readonly input: Readonly<Record<string, unknown>> }[]>;
 	readonly finishSession: () => Promise<void>;
 	readonly dispose: () => Promise<void>;
 }
@@ -317,10 +312,7 @@ export function createPatternPlanSource({
 		revisions.delete(key);
 		if (terminal) carriedPredictions.delete(startInput.sessionID);
 		const patternSettings = settings.enabled ? sourceSettings(settings) : undefined;
-		if (!patternSettings?.enabled || lifecycle.sealed) {
-			carriedPredictions.delete(startInput.sessionID);
-			return;
-		}
+		if (!patternSettings?.enabled || lifecycle.sealed) { carriedPredictions.delete(startInput.sessionID); return; }
 		// Only a completed turn contributes its authoritative batch; entry discards any stale batch.
 		const events = terminal !== undefined && batch?.size
 			? [...batch.entries()].sort(([left], [right]) => left - right).map(([, event]) => event)
@@ -339,6 +331,8 @@ export function createPatternPlanSource({
 	};
 	return {
 		source,
+		hints: ({ sessionID, schemaHashes, settings }) => admit(settings, async (patternSettings) => !patternSettings.enabled ? []
+			: (await resolveStore(patternSettings)).predict(sessionID, schemaHashes, patternSettings).slice(0, 4).map(({ tool, input }) => ({ tool, input }))),
 		turnStarted: observeTurn,
 		turnFinished: observeTurn,
 		// Serving the Actor is recorded before the owning prediction settles, which credits it even when unmatched.
@@ -384,10 +378,7 @@ function patternPredictionSignature(candidates: readonly PatternAwareCandidate[]
 	);
 }
 
-function clearAuthoritativeSession(
-	batches: Map<string, Map<number, PatternAwareEventInput>>,
-	sessionID: string,
-): void {
+function clearAuthoritativeSession(batches: Map<string, Map<number, PatternAwareEventInput>>, sessionID: string): void {
 	for (const [key, batch] of batches) {
 		if (batch.values().next().value?.sessionID === sessionID) batches.delete(key);
 	}
