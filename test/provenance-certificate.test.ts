@@ -1,4 +1,4 @@
-import { link, mkdir, symlink, unlink, writeFile } from "node:fs/promises";
+import { chmod, link, mkdir, symlink, unlink, writeFile } from "node:fs/promises";
 import { temporaryDirectories } from "./filesystem.ts";
 import { processPrototype, processCertificate } from "./process-fixture.ts";
 import path from "node:path";
@@ -39,6 +39,17 @@ describe("process provenance certificates", () => {
 		const observed = await validateDynamicDependencyCertificate(certificate.dependencyCertificate, { resolvePath }); // The planner keys stale observations too.
 		expect(observed.status === "stale" ? processStrongKey(certificate.weakKey, { complete: true, dependencies: observed.dependencies, taints: [] }) : observed.status).toMatch(/^sha256:/);
 	});
+	it("validates a partial metadata observation on exactly its fields", async () => {
+		const root = await workspace(), target = path.join(root, "partial.txt"), fields = ["dev", "mode", "rdev", "blksize"] as const;
+		await writeFile(target, "a");
+		const dependency = await captureMetadataDependency(target, "/workspace/partial.txt", true, fields);
+		const validate = () => validateDynamicDependencyCertificate({ complete: true, dependencies: [dependency], taints: [] }, { resolvePath: () => target });
+		await writeFile(target, "longer content");
+		expect((await validate()).status).toBe("valid");
+		await chmod(target, 0o600);
+		expect((await validate()).status).toBe(process.platform === "win32" ? "valid" : "stale");
+	});
+
 	it("names the interpreter the kernel opens for a script or an ELF image", async () => {
 		const root = await workspace(), elf = Buffer.alloc(160), loader = "/lib64/ld-linux-x86-64.so.2\0";
 		elf.writeUInt32BE(0x7f454c46, 0); elf[4] = 2; elf[5] = 1; elf.writeBigUInt64LE(64n, 32); elf.writeUInt16LE(56, 54); elf.writeUInt16LE(1, 56);

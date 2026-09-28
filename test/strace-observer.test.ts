@@ -10,7 +10,7 @@ const STAT = "{st_dev=makedev(0, 1), st_ino=42, st_mode=S_IFREG|0644, st_nlink=1
 const STAT_DIGEST = filesystemObservationDigest({
 	dev: 1n, ino: 42n, mode: 0o100644n, nlink: 1n, uid: 0n, gid: 0n, rdev: 0n,
 	size: 4n, blksize: 4096n, blocks: 8n,
-	atimeNs: 10_000_000_001n, mtimeNs: 11_000_000_002n, ctimeNs: 12_000_000_003n,
+	mtimeNs: 11_000_000_002n, ctimeNs: 12_000_000_003n,
 });
 
 /** Owns a complete per-PID transcript, including its filesystem lifetime. */
@@ -145,6 +145,14 @@ describe("strace provenance decoder", () => {
 		expect(observation.paths).toEqual([{ path: "/usr/bin/example", role: "executable" },
 			...["/work/alias", "/work/anonymous", "/work/missing.txt", "/work/named"].map(path => ({ path, role: "input" })),
 			{ path: "/work/link", role: "metadata", followSymlinks: false, digest: STAT_DIGEST }, { path: "/work/file.txt", role: "metadata", followSymlinks: true, digest: STAT_DIGEST }]);
+		// ls asks only for the type: its observation covers the fields the mask reports, beside a full stat of the same path.
+		const partial = (mask: string) => `statx(AT_FDCWD</work>, "file.txt", AT_STATX_SYNC_AS_STAT, STATX_MODE, ${STATX.replace("STATX_BASIC_STATS|STATX_MNT_ID", mask).replace(/, stx_[mc]time=\{[^}]+\}/g, "")}) = 0`;
+		const fields = ["dev", "mode", "rdev", "blksize"] as const;
+		expect((await observe({ 100: [EXEC, partial("STATX_TYPE|STATX_MODE|STATX_MNT_ID"), `newfstatat(AT_FDCWD, "/work/file.txt", ${STAT}, 0) = 0`] })).paths).toEqual([
+			{ path: "/usr/bin/example", role: "executable" },
+			{ path: "/work/file.txt", role: "metadata", followSymlinks: true, fields, digest: filesystemObservationDigest({ dev: 1n, mode: 0o100644n, rdev: 0n, blksize: 4096n }, fields) },
+			{ path: "/work/file.txt", role: "metadata", followSymlinks: true, digest: STAT_DIGEST }]);
+		expect((await observe({ 100: [EXEC, partial("STATX_TYPE|0x40000")] })).incompleteReasons).toEqual(["unparsed_metadata:statx:100"]);
 	});
 
 	test("binds reassembled descendants to copied or proven-stable shared cwd contexts", async () => {
