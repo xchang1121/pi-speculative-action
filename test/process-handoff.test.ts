@@ -4,11 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import { type ProcessHandoff, ProcessHandoffOwnership, ProcessHandoffRegistry } from "../src/process-handoff.ts";
 import { effectCommitFailure } from "../src/effect-transaction.ts";
 import { TimelineInterval } from "../src/task-timing.ts";
-import {
-	sha256Digest as digest,
-	type ProcessProvenanceCertificate,
-	type Sha256Digest,
-} from "../src/provenance-certificate.ts";
+import { sha256Digest as digest, type ProcessProvenanceCertificate, type Sha256Digest } from "../src/provenance-certificate.ts";
 
 const SCOPE = { sessionID: "session", turnID: "turn" };
 const OTHER_SCOPE = { sessionID: "session", turnID: "other" };
@@ -228,10 +224,7 @@ describe("ProcessHandoffRegistry", () => {
 			expect(fixture.registry.mayHaveExecutable("/unrelated/executable")).toBe(false);
 			const persistenceStarted = deferred<void>();
 			const persistence = deferred<boolean>();
-			const publishing = fixture.publish(() => {
-				persistenceStarted.resolve();
-				return persistence.promise;
-			});
+			const publishing = fixture.publish(() => { persistenceStarted.resolve(); return persistence.promise; });
 			await persistenceStarted.promise;
 			expect(fixture.registry.hasResults).toBe(true);
 
@@ -241,10 +234,7 @@ describe("ProcessHandoffRegistry", () => {
 			expect(fixture.registry.hasResults).toBe(true);
 			expect(lookup.mock.calls).toEqual([[[fixture.certificate]]]);
 
-			if (failure) {
-				persistence.reject(failure);
-				await expect(publishing).rejects.toBe(failure);
-			} else {
+			if (failure) { persistence.reject(failure); await expect(publishing).rejects.toBe(failure); } else {
 				persistence.resolve(stored!);
 				await expect(publishing).resolves.toBe(stored);
 			}

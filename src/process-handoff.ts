@@ -27,11 +27,7 @@ export class ProcessHandoffOwnership {
 
 	get wholeClaimed(): boolean { return this.state === "whole"; }
 
-	claimChild(): boolean {
-		if (this.wholeClaimed) return false;
-		this.state = "partial";
-		return true;
-	}
+	claimChild(): boolean { if (this.wholeClaimed) return false; this.state = "partial"; return true; }
 
 	async commit<T>(apply: () => Promise<T>): Promise<T> {
 		if (this.transfer?.apply.deref() === apply) return this.transfer.result as Promise<T>;
@@ -61,11 +57,7 @@ export interface ProcessHandoff {
 	readonly suspend?: (signal?: AbortSignal) => Promise<void>;
 }
 
-export interface ProcessContinuation {
-	readonly image: Buffer;
-	readonly physicalRoot: string;
-	readonly computation: TimelineInterval;
-}
+export interface ProcessContinuation { readonly image: Buffer; readonly physicalRoot: string; readonly computation: TimelineInterval; }
 
 /** In-memory capability for another isolated execution, never a proof of result equivalence. */
 export interface ProcessExecutionBinding {
@@ -107,10 +99,7 @@ type AcquireOptions<Plan> = {
 	readonly lookup: ProcessHandoffLookup<Plan>;
 } & (
 	| { readonly role: "producer"; readonly ownership: ProcessHandoffOwnership; readonly executablePath: string }
-	| {
-			readonly role: "actor";
-			readonly waitForRunning: (handoff: ProcessHandoff) => Promise<"completed" | "miss" | "rejected">;
-	  }
+	| { readonly role: "actor"; readonly waitForRunning: (handoff: ProcessHandoff) => Promise<"completed" | "miss" | "rejected">; }
 );
 
 /** Owns process evidence selection and the scope of one-shot transfers. */
@@ -190,10 +179,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 	}
 
 	/** Conservative availability hint; scope, ownership and evidence still decide acquisition. */
-	get hasResults(): boolean {
-		for (const record of this.records()) if (record.state.status !== "retained") return true;
-		return false;
-	}
+	get hasResults(): boolean { for (const record of this.records()) if (record.state.status !== "retained") return true; return false; }
 
 	/** Retrieval hint for both running and completed records; it grants no adoption authority. */
 	mayHaveExecutable(executablePath: string): boolean {

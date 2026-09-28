@@ -74,6 +74,12 @@ describe("ActionSemanticsRegistry", () => {
 		expect(Object.isFrozen(implicit?.resources)).toBe(true);
 	});
 
+	it("keys a command that first enters its own working directory as the bare command", () => {
+		const cwd = path.resolve("/workspace").replaceAll("\\", "/"), key = (command: string) => buildPiActionKey("bash", { command }, cwd)!.key;
+		for (const entering of [`cd ${cwd} && git diff`, `cd "${cwd}/"; git diff`, `  cd '${cwd}' &&  git diff`]) expect(key(entering)).toBe(key("git diff"));
+		for (const other of [`cd ${cwd}/sub && git diff`, `cd ${cwd}x && git diff`, `cd ${cwd}`]) expect(key(other)).not.toBe(key("git diff"));
+	});
+
 	it("projects a finished Bash command onto any longer or absent timeout", async () => {
 		const key = (timeout?: number, command = "npm test") => buildPiActionKey("bash", { command, ...(timeout === undefined ? {} : { timeout }) }, "/workspace")!;
 		const match = (speculative?: number, actor?: number) => actionKeyMatch(key(speculative), key(actor), [BASH_TIMEOUT_ACTION_KEY_PROJECTOR])?.kind;
