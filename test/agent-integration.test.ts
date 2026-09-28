@@ -12,7 +12,7 @@ import { createThinkThreadExecutionWorld } from "../src/thinkthread/execution-wo
 import { withThinkThreadProfileLifecycle } from "../src/thinkthread/profile-extension.ts";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ActionSemanticsRegistry, buildPiActionKey, KEYABLE_TOOLS, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
+import { ActionSemanticsRegistry, buildPiActionKey, KEYABLE_TOOLS, PI_ACTION_SEMANTICS, widenReadGuess } from "../src/action-semantics.ts";
 import { borrowResourceObject, createResourceSnapshotExecutionWorld, type SpeculativeAgentExecutionWorld } from "../src/agent-execution-world.ts";
 import { createSpeculativeActionHost, type CreateSpeculativeActionHostOptions } from "../src/agent-integration.ts";
 import { createDrafterPlanSource } from "../src/drafter-plan-source.ts";
@@ -173,10 +173,17 @@ describe("speculative action host", () => {
 		}
 	});
 
+	it("widens a model's guessed read window on both sides, within the default read length", () => {
+		expect([{ path: "a", offset: 280, limit: 120 }, { path: "a", offset: 50 }, { path: "a", limit: 10 }, { path: "a" }].map((input) => widenReadGuess("read", input)))
+			.toEqual([{ path: "a", offset: 80, limit: 520 }, { path: "a", offset: 1, limit: 2000 }, { path: "a", offset: 1, limit: 210 }, { path: "a" }]);
+		expect(widenReadGuess("grep", { path: "a", limit: 10 })).toEqual({ path: "a", limit: 10 });
+	});
+
 	it("continues complete Drafter batches once within one request slot, preserving reasoning and ordered results", async () => {
 		const cwd = await temporaryWorkspace(), tool = createReadTool(cwd);
+		for (const offset of [1, 2, 3]) await writeFile(path.join(cwd, `notes-${offset}.txt`), `note ${offset}`);
 		const message = assistant([{ type: "thinking", thinking: "fixture reasoning", thinkingSignature: "signature" },
-			...[1, 2, 3].map((offset) => ({ type: "toolCall" as const, id: `call-${offset}`, name: "read", arguments: { path: "notes.txt", offset, limit: 1 } }))], "toolUse");
+			...[1, 2, 3].map((offset) => ({ type: "toolCall" as const, id: `call-${offset}`, name: "read", arguments: { path: `notes-${offset}.txt` } }))], "toolUse");
 		for (const requested of [undefined, "off", "minimal", "low", "medium", "high", "xhigh", "max"] as const) {
 			for (const supported of [true, false]) {
 				const options: SimpleStreamOptions = Object.freeze({ reasoning: requested === "off" ? undefined : requested ?? "high", maxTokens: 1 });
@@ -187,7 +194,7 @@ describe("speculative action host", () => {
 					...(requested === undefined ? {} : { getDraftOptions: () => options }),
 					getSettings: () => ({ ...settings(), drafterMaxTokens: 128, drafterMaxDepth: 1, maxConcurrentActions: supported ? 1 : 3 }),
 					executionWorlds: [mockRuntimeWorld(async (context) => {
-						const offset = Number((context.args as { offset: number }).offset);
+						const offset = Number(/\d/.exec((context.args as { path: string }).path)![0]);
 						if (!supported && offset < 3) await finished[offset]!.promise;
 						const result = await tool.execute(context.callID, context.args as never);
 						order.push(offset); finished[offset - 1]!.resolve(); return { result, isError: false };
@@ -200,7 +207,7 @@ describe("speculative action host", () => {
 					const requests = complete.mock.calls;
 					expect(requests[1]![1].messages[0]).toEqual(message);
 					expect(requests[1]![1].messages.slice(1)).toMatchObject(await Promise.all([1, 2, 3].map(async (offset) => ({
-						...await tool.execute("oracle", { path: "notes.txt", offset, limit: 1 }), role: "toolResult", toolCallId: `call-${offset}`, isError: false }))));
+						...await tool.execute("oracle", { path: `notes-${offset}.txt` }), role: "toolResult", toolCallId: `call-${offset}`, isError: false }))));
 					const reasoning: ThinkingLevel | undefined = supported && requested !== "off" ? requested : undefined;
 					expect(requests.map((request) => request[2])).toMatchObject([{ reasoning, maxTokens: 128, toolChoice: reasoning ? "auto" : "required" }, { reasoning, maxTokens: 128, toolChoice: "auto" }]);
 					expect(await Promise.all(requests.map((request) => request[2]!.onPayload?.({ tools: [] }, { ...model("draft"), api: "anthropic-messages" }))))

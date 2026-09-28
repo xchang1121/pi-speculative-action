@@ -1,34 +1,9 @@
-import {
-	calculateContextTokens,
-	estimateContextTokens,
-	type AgentToolCall,
-} from "@earendil-works/pi-agent-core";
-import {
-	clampThinkingLevel,
-	type Api,
-	type AssistantMessage,
-	type Context,
-	type Model,
-	type SimpleStreamOptions,
-	type ToolResultMessage,
-} from "@earendil-works/pi-ai";
-import {
-	clampCandidateLimit,
-	DEFAULTS,
-	drafterRequestTemperature,
-	normalizeDrafterRequestSettings,
-} from "./common.ts";
-import {
-	DrafterUtilityGate,
-	type DrafterUtilityBatch,
-	type DrafterUtilityGateSnapshot,
-} from "./drafter-utility-gate.ts";
-import {
-	agentBatchKey,
-	type AgentPlanSource,
-	type DraftModelSelection,
-	type DraftOptionsContext,
-} from "./agent-runtime-types.ts";
+import { widenReadGuess } from "./action-semantics.ts";
+import { calculateContextTokens, estimateContextTokens, type AgentToolCall } from "@earendil-works/pi-agent-core";
+import { clampThinkingLevel, type Api, type AssistantMessage, type Context, type Model, type SimpleStreamOptions, type ToolResultMessage } from "@earendil-works/pi-ai";
+import { clampCandidateLimit, DEFAULTS, drafterRequestTemperature, normalizeDrafterRequestSettings } from "./common.ts";
+import { DrafterUtilityGate, type DrafterUtilityBatch, type DrafterUtilityGateSnapshot } from "./drafter-utility-gate.ts";
+import { agentBatchKey, type AgentPlanSource, type DraftModelSelection, type DraftOptionsContext } from "./agent-runtime-types.ts";
 import type { PlanAction, PlanProposal } from "./plan-proposal.ts";
 import type { ActorActionFeedback } from "./runtime.ts";
 import { stableValueHash } from "./stable-value-hash.ts";
@@ -128,7 +103,7 @@ export function createDrafterPlanSource(input: {
 			const feedback: DrafterPlanFeedback = { ...batch, kind: "drafter_plan", message, depth,
 				calls: new Map(kept.map((call, index) => [`${prefix}:${index}`, call])), results: new Map(), claimed: kept.length < calls.length };
 			return { actions: [...feedback.calls].map(([id, call]): PlanAction => ({
-				id, type: "tool_call", tool: call.name, input: call.arguments, depth, feedback, dependsOn,
+				id, type: "tool_call", tool: call.name, input: widenReadGuess(call.name, call.arguments), depth, feedback, dependsOn,
 				diagnostic: JSON.stringify({ toolCallID: call.id, tool: call.name, input: call.arguments }, null, 2),
 			})) };
 		} catch (error) {

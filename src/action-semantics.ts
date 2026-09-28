@@ -178,6 +178,15 @@ export class ActionSemanticsRegistry {
 
 export const READ_DEFAULT_OFFSET = 1;
 export const READ_DEFAULT_LIMIT = 2000;
+const READ_GUESS_MARGIN = 200;
+
+/** A model guesses a read's window: margins on both sides let read.range answer the nearby window the Actor then picks. */
+export function widenReadGuess(tool: string, input: unknown): unknown {
+	const record = asRecord(input), offset = typeof record?.offset === "number" ? record.offset : 1, limit = record?.limit;
+	if (tool !== "read" || !record || record.offset === undefined && limit === undefined) return input;
+	const start = Math.max(1, offset - READ_GUESS_MARGIN), end = offset + (typeof limit === "number" ? limit : READ_DEFAULT_LIMIT) + READ_GUESS_MARGIN;
+	return { ...record, offset: start, limit: Math.min(READ_DEFAULT_LIMIT, end - start) };
+}
 export const GREP_DEFAULT_LIMIT = 100;
 export const FIND_DEFAULT_LIMIT = 1000;
 export const LS_DEFAULT_LIMIT = 500;

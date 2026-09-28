@@ -1,3 +1,4 @@
+import { widenReadGuess } from "./action-semantics.ts";
 import type { AgentPlanSource } from "./agent-runtime-types.ts";
 import type { AssistantMessageEvent } from "@earendil-works/pi-ai";
 
@@ -97,7 +98,7 @@ export class ActorForkPlanSource {
 				// As for a Drafter batch, the predictable calls of a mixed batch stay; no peer continues from a partial one.
 				const kept = batch.calls.filter((call) => allowed.has(call.tool)), whole = kept.length === batch.calls.length;
 				return kept.length ? [{ id: `self-speculation:${startInput.turnID}:${batch.id}`, source: "self-speculation", revision: 0,
-					actions: kept.map((call) => ({ id: call.id, type: "tool_call" as const, tool: call.tool, input: call.input,
+					actions: kept.map((call) => ({ id: call.id, type: "tool_call" as const, tool: call.tool, input: widenReadGuess(call.tool, call.input),
 						feedback: { batchID: batch.id, ...(whole ? { batchCalls: kept.map(({ id }) => id) } : {}), callID: call.id, callIndex: call.index, evidence: batch.evidence } })) }] : [];
 			});
 		},
