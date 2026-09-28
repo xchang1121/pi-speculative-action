@@ -1,3 +1,15 @@
+--- a/src/defs.h
++++ b/src/defs.h
+@@ -267,6 +267,9 @@ struct inject_opts {
+ struct tcb {
+ 	int flags;		/* See below for TCB_ values */
+ 	int pid;		/* If 0, this tcb is free */
++	unsigned long handoff_tid;
++	unsigned int handoff_tid_value, handoff_tid_state;
++	uint64_t handoff_started, handoff_entered;
+ 	int qual_flg;		/* qual_flags[scno] or DEFAULT_QUAL_FLAGS + RAW */
+ # if SUPPORTED_PERSONALITIES > 1
+ 	unsigned int currpers;	/* Personality at the time of scno update */
 --- a/src/strace.c
 +++ b/src/strace.c
 @@ -27,6 +27,10 @@
@@ -11,11 +23,31 @@
  
  #include "kill_save_errno.h"
  #include "exitkill.h"
-@@ -2231,6 +2235,110 @@
+@@ -2231,6 +2235,130 @@ add_path_trace(struct pathtrace *pt, const char *path)
   * Don't want main() to inline us and defeat the reason
   * we have a separate function.
   */
 +static int handoff_fd = -1;
++static bool children_only;
++static int thread_group(int pid)
++{
++    char path[64], line[256];
++    int tgid = 0;
++    snprintf(path, sizeof(path), "/proc/%d/status", pid);
++    FILE *status = fopen(path, "re");
++    if (!status) return 0;
++    while (fgets(line, sizeof(line), status) && sscanf(line, "Tgid: %d", &tgid) != 1) {}
++    fclose(status);
++    return tgid;
++}
++/* A clone, fork or vfork that just returned a new process rather than a thread. */
++static bool started_process(struct tcb *tcp)
++{
++    static const char *const names[] = { "clone", "clone3", "fork", "vfork" };
++    for (size_t i = 0; tcp->s_ent && tcp->u_rval > 0 && i < ARRAY_SIZE(names); i++)
++        if (!strcmp(tcp->s_ent->sys_name, names[i])) return thread_group((int)tcp->u_rval) == tcp->u_rval;
++    return false;
++}
 +static const char *handoff_library, *handoff_image;
 +static int (*handoff_capture)(pid_t, const char *, unsigned long);
 +static int (*handoff_frontier)(long);
@@ -122,17 +154,18 @@
  static void ATTRIBUTE_NOINLINE
  init(int argc, char *argv[])
  {
-@@ -2364,6 +2472,9 @@
+@@ -2364,6 +2492,10 @@ init(int argc, char *argv[])
  		{ "help",		no_argument,	   0, 'h' },
  		{ "instruction-pointer", no_argument,      0, 'i' },
  		{ "interruptible",	required_argument, 0, 'I' },
 +		{ "handoff-fd", required_argument, 0, 0x4000 },
 +        { "handoff-library", required_argument, 0, 0x4001 },
 +        { "handoff-image", required_argument, 0, 0x4002 },
++        { "trace-children-only", no_argument, 0, 0x4003 },
  		{ "kill-on-exit",	no_argument,	   0, GETOPT_KILL_ON_EXIT },
  		{ "stack-trace" ,	optional_argument, 0, GETOPT_STACK },
  		{ "stack-traces" ,	optional_argument, 0, GETOPT_STACK },
-@@ -2564,6 +2675,13 @@
+@@ -2564,6 +2696,14 @@ init(int argc, char *argv[])
  					  "by this build of strace");
  #endif
  			break;
@@ -143,10 +176,11 @@
 +            break;
 +        case 0x4001: handoff_library = optarg; break;
 +        case 0x4002: handoff_image = optarg; break;
++        case 0x4003: children_only = true; break;
  		case GETOPT_KILL_ON_EXIT:
  			opt_kill_on_exit = true;
  			break;
-@@ -3007,6 +3125,9 @@
+@@ -3007,6 +3147,9 @@ init(int argc, char *argv[])
  
  	debug_msg("ptrace_setoptions = %#x", ptrace_setoptions);
  	test_ptrace_seize();
@@ -156,7 +190,32 @@
  	test_ptrace_get_syscall_info();
  
  	/*
-@@ -3588,6 +3709,7 @@
+@@ -3288,6 +3431,12 @@ static struct tcb *
+ maybe_allocate_tcb(const int pid, int status)
+ {
+ 	if (!WIFSTOPPED(status)) {
++		if (children_only && pid == strace_child) {
++			/* The detached launcher still reports its own exit. */
++			exit_code = WIFSIGNALED(status) ? 0x100 | WTERMSIG(status) : WEXITSTATUS(status);
++			strace_child = 0;
++			return NULL;
++		}
+ 		if (detach_on_execve && pid == strace_child) {
+ 			/* example: strace -bexecve sh -c 'exec true' */
+ 			strace_child = 0;
+@@ -3304,6 +3453,11 @@ maybe_allocate_tcb(const int pid, int status)
+ 		return NULL;
+ 	}
+ 	if (followfork) {
++		/* The launcher's threads (a sandbox supervisor) run untraced. */
++		if (children_only && strace_child && thread_group(pid) == strace_child) {
++			if (ptrace(PTRACE_DETACH, pid, 0, 0) < 0 && errno != ESRCH) perror_msg_and_die("detach launcher thread");
++			return NULL;
++		}
+ 		/* We assume it's a fork/vfork/clone child */
+ 		struct tcb *tcp = alloctcb(pid);
+ 		after_successful_attach(tcp, post_attach_sigstop);
+@@ -3588,6 +3742,7 @@ tcb_wait_tab_check_size(const size_t size)
  static const struct tcb_wait_data *
  next_event(void)
  {
@@ -164,7 +223,7 @@
  	if (interrupted)
  		return NULL;
  
-@@ -3913,6 +4035,26 @@
+@@ -3913,6 +4068,26 @@ dispatch_event(const struct tcb_wait_data *wd)
  	 * around union wait fixed by glibc commit glibc-2.24~391
  	 */
  	int status = wd ? wd->status : 0;
@@ -191,7 +250,7 @@
  
  	if (current_tcp && has_seccomp_filter(current_tcp))
  		restart_op = seccomp_filter_restart_operator(current_tcp);
-@@ -3951,6 +4093,8 @@
+@@ -3951,6 +4126,8 @@ dispatch_event(const struct tcb_wait_data *wd)
  		ATTRIBUTE_FALLTHROUGH;
  
  	case TE_SYSCALL_STOP:
@@ -200,7 +259,19 @@
  		if (trace_syscall(current_tcp, &restart_sig) < 0) {
  			/*
  			 * ptrace() failed in trace_syscall().
-@@ -4034,6 +4178,9 @@
+@@ -3965,6 +4142,11 @@ dispatch_event(const struct tcb_wait_data *wd)
+ 			 */
+ 			return true;
+ 		}
++		/* Once the launcher has recorded the command's start, it runs untraced too. */
++		if (children_only && current_tcp->pid == strace_child && entering(current_tcp) && started_process(current_tcp)) {
++			detach(current_tcp);
++			return true;
++		}
+ 		if (has_seccomp_filter(current_tcp)) {
+ 			/*
+ 			 * Syscall and seccomp stops can happen in different
+@@ -4034,6 +4216,9 @@ dispatch_event(const struct tcb_wait_data *wd)
  		return true;
  
  	case TE_STOP_BEFORE_EXECVE:
@@ -210,7 +281,7 @@
  		/* The syscall succeeded, clear the flag.  */
  		current_tcp->flags &= ~TCB_CHECK_EXEC_SYSCALL;
  		/*
-@@ -4231,6 +4378,14 @@
+@@ -4231,6 +4416,14 @@ main(int argc, char *argv[])
  {
  	setlocale(LC_ALL, "");
  	init(argc, argv);
@@ -225,15 +296,3 @@
  
  	exit_code = !nprocs;
  
---- a/src/defs.h
-+++ b/src/defs.h
-@@ -267,6 +267,9 @@
- struct tcb {
- 	int flags;		/* See below for TCB_ values */
- 	int pid;		/* If 0, this tcb is free */
-+	unsigned long handoff_tid;
-+	unsigned int handoff_tid_value, handoff_tid_state;
-+	uint64_t handoff_started, handoff_entered;
- 	int qual_flg;		/* qual_flags[scno] or DEFAULT_QUAL_FLAGS + RAW */
- # if SUPPORTED_PERSONALITIES > 1
- 	unsigned int currpers;	/* Personality at the time of scno update */
