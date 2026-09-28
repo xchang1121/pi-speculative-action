@@ -1827,7 +1827,7 @@ async function sealSessionEvidence(
 	if (!capture) {
 		session.incompleteReasons.add("top_capture_missing");
 		session.topLevelEvidence ??= { complete: false, dependencies: [], taints: ["trace_incomplete"] };
-		throw new Error("top-level workspace capture is missing");
+		throw new Error(`top-level workspace capture is missing: ${[...session.incompleteReasons].filter((reason) => reason.startsWith("top_capture:")).join("; ") || "not run"}`);
 	}
 	// A bypass that did not resume in place ran outside the top-level trace.
 	for (const [pid, reason] of session.bypasses) if (!capture.observation.resumedInterpositions?.includes(pid)) session.incompleteReasons.add(reason);
