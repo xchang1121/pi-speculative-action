@@ -40,7 +40,7 @@ export class TaskTimeline {
 	private readonly authoritativeTools: { readonly startedAt: number; readonly endpoints: readonly number[]; native: boolean }[] = [];
 	private readonly computations = new WeakMap<TimelineInterval, { native: boolean }>();
 	private estimatedSavingsMs = 0;
-	private optimisticSavingsMs = 0;
+	private savingsMs = 0;
 	private toolWaitMs = 0;
 	readonly startedAt: number;
 
@@ -80,8 +80,8 @@ export class TaskTimeline {
 		const referenceMs = adoption?.expectedNativeMs ?? serialMs;
 		const actualMs = adoption ? metric(adoption.hitLatencyMs) : interval.completedAt - interval.startedAt;
 		this.estimatedSavingsMs += nonNegativeDifference(referenceMs, actualMs) - nonNegativeDifference(actualMs, referenceMs);
-		// Upper bound: the larger of the computation and the Actor's expected service is avoided, and speculation is charged nothing.
-		this.optimisticSavingsMs += nonNegativeDifference(Math.max(serialMs, metric(adoption?.expectedActorMs)), actualMs);
+		// Each call saves the larger of its computation and the Actor's expected service, less what the Actor actually waited.
+		this.savingsMs += nonNegativeDifference(Math.max(serialMs, metric(adoption?.expectedActorMs)), actualMs);
 		this.toolWaitMs += actualMs;
 	}
 
@@ -105,8 +105,8 @@ export class TaskTimeline {
 		return Object.freeze({ startedAt, completedAt, endToEndMs, nonToolMs, actorPhaseMs, orchestrationMs, toolExecutionMs, serializedMs, hiddenLatencyMs,
 			/** Signed avoided service time against native history, net of speculation's own cost on native calls. */
 			estimatedSavingsMs: this.estimatedSavingsMs,
-			/** Upper bound of avoided service time: never negative, not a measured no-speculation counterfactual. */
-			optimisticSavingsMs: this.optimisticSavingsMs,
+			/** Service time the Actor did not wait for: never negative. */
+			savingsMs: this.savingsMs,
 			/** The Actor's own wait on its tool calls: native service, or adoption latency. */
 			toolWaitMs: this.toolWaitMs,
 			/** Distinct accepted computations with exclusive time in this task, not Actor call count. */

@@ -285,7 +285,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			authoritativeToolMs: summary.toolExecutionMs,
 			accelerationRatio: actualEndToEndMs > 0 ? serializedCounterfactualMs / actualEndToEndMs : 1,
 			estimatedSavingsMs: summary.estimatedSavingsMs,
-			optimisticAccelerationRatio: actualEndToEndMs > 0 ? 1 + summary.optimisticSavingsMs / actualEndToEndMs : undefined,
+			savingsAccelerationRatio: actualEndToEndMs > 0 ? 1 + summary.savingsMs / actualEndToEndMs : undefined,
 			netAccelerationRatio: actualEndToEndMs > 0 ? 1 + summary.estimatedSavingsMs / actualEndToEndMs : undefined,
 			actorActions,
 			actorActionsByTool,
