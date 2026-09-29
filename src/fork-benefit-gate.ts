@@ -42,6 +42,8 @@ interface GateState {
 	priorFailures: number;
 	suppressedSinceProbe: number;
 	totalSuppressed: number;
+	/** Each probe into a still-unprofitable window doubles the wait for the next (at most 8x); profit resets it. */
+	backoff: number;
 }
 
 /** Key-scoped rolling utility gate with bounded exploration and a failure circuit. */
@@ -56,10 +58,10 @@ export class BenefitGate {
 		const failing = consecutiveFailures(state) >= policy.failureThreshold;
 		if (!failing) {
 			if (state.samples.length < policy.minSamples || expected === undefined) return { allowed: true, reason: "warmup", ...base };
-			if (expected >= policy.minNetBenefitMs) return { allowed: true, reason: "profitable", ...base };
+			if (expected >= policy.minNetBenefitMs) { state.backoff = 1; return { allowed: true, reason: "profitable", ...base }; }
 		}
-		if (++state.suppressedSinceProbe >= policy.probeInterval) {
-			state.suppressedSinceProbe = 0;
+		if (++state.suppressedSinceProbe >= policy.probeInterval * state.backoff) {
+			state.suppressedSinceProbe = 0; state.backoff = Math.min(8, state.backoff * 2);
 			return { allowed: true, reason: failing ? "failure_probe" : "utility_probe", ...base };
 		}
 		state.totalSuppressed++;
@@ -86,12 +88,8 @@ export class BenefitGate {
 	snapshot(key: string) {
 		const state = this.state(key);
 		const expected = mean(state.samples);
-		const snapshot = {
-			samples: state.samples.length,
-			...(expected === undefined ? {} : { expectedNetBenefitMs: expected }),
-			consecutiveFailures: consecutiveFailures(state),
-			suppressedDecisions: state.totalSuppressed,
-		};
+		const snapshot = { samples: state.samples.length, ...(expected === undefined ? {} : { expectedNetBenefitMs: expected }),
+			consecutiveFailures: consecutiveFailures(state), suppressedDecisions: state.totalSuppressed };
 		return snapshot as Readonly<typeof snapshot>;
 	}
 
@@ -102,7 +100,7 @@ export class BenefitGate {
 	private state(key: string): GateState {
 		let state = this.states.get(key);
 		if (!state) {
-			state = { samples: [], priorFailures: 0, suppressedSinceProbe: 0, totalSuppressed: 0 };
+			state = { samples: [], priorFailures: 0, suppressedSinceProbe: 0, totalSuppressed: 0, backoff: 1 };
 			this.states.set(key, state);
 		}
 		return state;

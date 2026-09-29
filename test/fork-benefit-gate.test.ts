@@ -47,12 +47,11 @@ describe("fork benefit gate", () => {
 	it("periodically probes negative utility and an unhealthy endpoint", () => {
 		const gate = new BenefitGate();
 		for (let index = 0; index < 4; index++) gate.observe("utility", sample(100, 0), POLICY);
-		expect([1, 2, 3, 4].map(() => gate.decide("utility", POLICY).reason)).toEqual([
-			"negative_utility",
-			"negative_utility",
-			"negative_utility",
-			"utility_probe",
-		]);
+		const probes = () => Array.from({ length: 32 }, () => gate.decide("utility", POLICY).reason).flatMap((reason, index) => reason === "utility_probe" ? [index + 1] : []);
+		expect(probes()).toEqual([4, 12, 28]); // A probe into a still-negative window doubles the next wait.
+		gate.observe("utility", sample(0, 1000), POLICY); gate.decide("utility", POLICY); // Profit restores the first interval.
+		for (let index = 0; index < 4; index++) gate.observe("utility", sample(100, 0), POLICY);
+		expect(probes().slice(0, 1)).toEqual([4]);
 
 		const update = gate.observe("failure", sample(50, 0), POLICY);
 		update({ ...sample(50, 0), failed: true });
