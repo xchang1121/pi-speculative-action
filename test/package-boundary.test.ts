@@ -100,7 +100,7 @@ success=true`, "journal", root, fault]).then(() => true, () => false);
 			if (mode === "dead") { await closures[0]; await nextTurn(); pool!.prepare(); expect(children).toHaveLength(2); }
 			if (mode !== "unused") {
 				await pool!.run("actor", async () => ({ result: { content: [], details: undefined }, isError: false }));
-				expect(children).toHaveLength(mode === "dead" ? 2 : 1); // Preparing capacity is claimable, not locked behind readiness.
+				expect(children).toHaveLength(mode === "dead" ? 3 : 2); // Preparing capacity is claimable, and the borrowed producer is replaced.
 			}
 		} finally {
 			await pool?.dispose(); fork.mockRestore(); readFile?.mockRestore(); syncBuiltinESMExports();
