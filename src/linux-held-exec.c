@@ -123,7 +123,7 @@ struct decision_job {
 
 struct traced_process {
 	pid_t pid;
-	int fd, armed, stopped, pending, delivered, listening, historical, awaiting_parent;
+	int fd, armed, stopped, pending, delivered, listening, historical, awaiting_parent, vforking;
 	struct decision_job *job;
 	struct traced_process *next;
 	struct descriptor_table *table;
@@ -2883,7 +2883,8 @@ static int trace(char **command, const char *socket_path, const char *token, con
 				if (item->pending && !item->historical) { barrier = item->pid; break; }
 			int ready = 1;
 			for (struct traced_process *item = processes; item; item = item->next) {
-				if (item->historical || item->stopped) continue;
+				/* Between its vfork event and VFORK_DONE a parent runs nothing: it cannot stop, and needs not. */
+				if (item->historical || item->stopped || item->vforking) continue;
 				ready = 0;
 				if (barrier && ptrace(PTRACE_INTERRUPT, item->pid, 0, 0) < 0 && errno != ESRCH && errno != EIO) goto fatal;
 			}
@@ -2946,6 +2947,7 @@ static int trace(char **command, const char *socket_path, const char *token, con
 			current->awaiting_parent = descriptors && event == PTRACE_EVENT_STOP;
 		}
 		current->stopped = 1;
+		if (event == PTRACE_EVENT_VFORK || event == PTRACE_EVENT_VFORK_DONE) current->vforking = event == PTRACE_EVENT_VFORK;
 		if (descriptors && delivered == (SIGTRAP | 0x80)) {
 			if (observe_descriptor_syscall(current, &domain) < 0) goto fatal;
 			delivered = 0;
