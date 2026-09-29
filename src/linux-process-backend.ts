@@ -701,10 +701,7 @@ export class LinuxProcessReuseBackend {
 		return { exitCode: outcome.signal ? null : outcome.code };
 	}
 
-	private async seal(
-		session: ActiveSession,
-		changes: readonly SandboxWorkspaceChange[],
-	): Promise<readonly SandboxWorkspaceChange[]> {
+	private async seal(session: ActiveSession, changes: readonly SandboxWorkspaceChange[]): Promise<readonly SandboxWorkspaceChange[]> {
 		const refined = await sealSessionEvidence(session, changes);
 		try {
 			await this.publishTopLevel(session, refined);
@@ -986,7 +983,10 @@ export class LinuxProcessReuseBackend {
 			}
 			const available = this.handoffs.mayHaveExecutable(executablePath) || await this.store.mayHaveCertificates(executablePath) ||
 				this.handoffs.mayHaveExecutable(executablePath);
-			if (!learning && !available) { this.addActor("misses"); return { kind: "continue" }; }
+			// Already learned in this call with nothing to adopt: a producer appearing later in the call is not worth an exec's round trip.
+			// Once this call learns no new launch, only the executable decides.
+			if (!learning && !available) { this.addActor("misses"); return { kind: "continue",
+				repeat: observation && !observation.closed && observation.learned.size < LEARNED_LAUNCHES ? "launch" : "executable" }; }
 			const inspected = await inspectHeldExecProcess(process.pid, executable, process.descriptors);
 			const resources = process.descriptors?.length
 				? await captureHeldDescriptorInputs(process.pid, process.descriptors, Math.min(MAX_REQUEST_BYTES / 2, this.store.limits.maxBytes),
@@ -1373,12 +1373,7 @@ export class LinuxProcessReuseBackend {
 				stage = "workspace_effects";
 				const effects = diffWorkspaceStructures(before, after, delta.changes, session.projection);
 				stage = "dependencies";
-				const evidence = await captureDependencies(
-					session,
-					transactionDependencySource(before, effects),
-					observation.paths,
-					effects.effects,
-				);
+				const evidence = await captureDependencies(session, transactionDependencySource(before, effects), observation.paths, effects.effects);
 				if (evidence.incompleteReasons.length) {
 					this.setError(session, `evidence:${evidence.incompleteReasons.join(",")}`);
 				}
@@ -1563,12 +1558,7 @@ export class LinuxProcessReuseBackend {
 		throw new Error(`executable not found: ${request.name}`);
 	}
 
-	private async prototype(
-		session: ActiveSession,
-		request: ProcessArguments,
-		executable: string,
-		outputRoute: OutputRoute,
-	): Promise<ExecPrototype> {
+	private async prototype(session: ActiveSession, request: ProcessArguments, executable: string, outputRoute: OutputRoute): Promise<ExecPrototype> {
 		const [executableDigest, ready] = await Promise.all([hashExecutableFile(executable), this.resolveReady()]);
 		return bufferedProcessPrototype({
 			executable,
@@ -1736,10 +1726,7 @@ function processTimingIdentity(prototype: ExecPrototype, weakKey: Sha256Digest):
 	};
 }
 
-async function sealSessionEvidence(
-	session: ActiveSession,
-	changes: readonly SandboxWorkspaceChange[],
-): Promise<readonly SandboxWorkspaceChange[]> {
+async function sealSessionEvidence(session: ActiveSession, changes: readonly SandboxWorkspaceChange[]): Promise<readonly SandboxWorkspaceChange[]> {
 	const capture = session.topLevelCapture;
 	if (!capture) {
 		session.incompleteReasons.add("top_capture_missing");
@@ -2592,10 +2579,7 @@ export async function validateTransferredProcessEvidence(
 		};
 	}
 	const blockingTaints = evidence.taints.filter((taint) => !TRANSFERRED_INPUT_TAINTS.has(taint));
-	const validation = await validateDynamicDependencyCertificate(
-		{ ...evidence, taints: blockingTaints },
-		{ maxFileBytes: MAX_CAPTURE_BYTES },
-	);
+	const validation = await validateDynamicDependencyCertificate({ ...evidence, taints: blockingTaints }, { maxFileBytes: MAX_CAPTURE_BYTES });
 	const metrics = {
 		durationMs: validation.durationMs,
 		bytesRead: validation.bytesRead,

@@ -1785,7 +1785,7 @@ int main(void) { char path[32] = "/bin/true\\0intact"; char *args[] = {path, 0};
 			let work: ProcessHandoff | undefined;
 			const history = vi.spyOn(fixture.backend.store, "mayHaveCertificates");
 			try {
-				await expect(inspect()).resolves.toEqual({ kind: "continue" }); expect(scan).not.toHaveBeenCalled();
+				await expect(inspect()).resolves.toEqual({ kind: "continue", repeat: "executable" }); expect(scan).not.toHaveBeenCalled();
 				history.mockImplementationOnce(async () => {
 					const result = await handoffs.acquire({ key, executablePath: executable, role: "producer",
 						ownership: new ProcessHandoffOwnership(), lookup: async () => undefined });

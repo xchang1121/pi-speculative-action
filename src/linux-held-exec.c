@@ -132,7 +132,25 @@ struct traced_process {
 	long syscall;
 	unsigned long arguments[6];
 	int descriptor_count, descriptors[MAX_HANDLES], internal_message;
+	uint64_t launch, image; /* The exec image's identity with its argv, and alone: what the decider let run for the rest of this call. */
 };
+
+/* A launch is its executable's inode and its exact argv: FNV-1a over both, 0 when unreadable; `image` gets the inode's alone. */
+static uint64_t launch_key(pid_t pid, uint64_t *image_key) {
+	char path[64], argv[8192]; struct stat image;
+	snprintf(path, sizeof(path), "/proc/%ld/exe", (long)pid);
+	*image_key = 0;
+	if (stat(path, &image) < 0) return 0;
+	snprintf(path, sizeof(path), "/proc/%ld/cmdline", (long)pid);
+	int fd = open(path, O_RDONLY | O_CLOEXEC); if (fd < 0) return 0;
+	ssize_t length = read(fd, argv, sizeof(argv)); close(fd);
+	if (length <= 0 || length == (ssize_t)sizeof(argv)) return 0; /* A truncated argv cannot name its launch. */
+	uint64_t hash = 1469598103934665603ULL, parts[2] = {image.st_dev, image.st_ino};
+	for (size_t index = 0; index < sizeof(parts); index++) hash = (hash ^ ((unsigned char *)parts)[index]) * 1099511628211ULL;
+	*image_key = hash ? hash : 1;
+	for (ssize_t index = 0; index < length; index++) hash = (hash ^ (unsigned char)argv[index]) * 1099511628211ULL;
+	return hash ? hash : 1;
+}
 
 static int replace_with_exit(pid_t pid, unsigned code) {
 #if defined(__x86_64__)
@@ -2500,6 +2518,8 @@ static int actor_decision(struct decision_job *job) {
 	free(descriptors); job->context = NULL;
 	if (!sent || read_line(connection, line, sizeof(line)) < 0) return -1;
 	if (!strcmp(line, "C")) return -1;
+	if (!strcmp(line, "c")) return -3; /* Continue, and this launch again in this call without asking. */
+	if (!strcmp(line, "e")) return -4; /* Continue, and this executable with any argv. */
 	if (!strcmp(line, "F")) return -2;
 	if (!strcmp(line, "O")) return connection;
 	if (sscanf(line, "P %u %u %zu %u %u %zu %u %u", &code, &job->count, &total, &job->position_count, &job->resource_count,
@@ -2812,7 +2832,8 @@ static int trace(char **command, const char *socket_path, const char *token, con
 	}
 	close(gate[1]);
 	int status = 0, root_status = -1;
-	unsigned exec_events = 0;
+	unsigned exec_events = 0, allowed_count = 0;
+	uint64_t allowed[256];
 	struct traced_process *processes = NULL;
 	domain.processes = &processes;
 	struct pollfd *polling = NULL;
@@ -2846,6 +2867,8 @@ static int trace(char **command, const char *socket_path, const char *token, con
 				pthread_join(job->thread, NULL);
 				int result = job->result;
 				if (result >= 0) { item->fd = result; job->connection = -1; }
+				uint64_t key = result == -3 ? item->launch : result == -4 ? item->image : 0;
+				if (key && allowed_count < sizeof(allowed) / sizeof(*allowed)) allowed[allowed_count++] = key;
 				free_job(job); item->job = NULL; item->armed = 0;
 				if (result == -2) goto fatal;
 				if (descriptors) { item->pending = 0; if (barrier == item->pid) barrier = 0; }
@@ -2981,6 +3004,10 @@ static int trace(char **command, const char *socket_path, const char *token, con
 						item->stopped = 1;
 					}
 					if (descriptors) { item->pending = 1; goto held; }
+					unsigned known = 0;
+					if ((item->launch = launch_key(pid, &item->image)))
+						while (known < allowed_count && allowed[known] != item->launch && allowed[known] != item->image) known++;
+					if (known < allowed_count) break; /* Allowed earlier in this call: native, as a declined decision. */
 					if (start_decision(item, socket_path, token, execution_id, NULL) == 0) goto held;
 					break;
 				}

@@ -89,11 +89,7 @@ function definedFields<T, K extends keyof T>(value: T, keys: readonly K[]): Part
 	return result;
 }
 
-function forecastFor(
-	node: PlanRuntimeNode,
-	decisionSequence: number,
-	actorPhase?: PredictionForecast["actorPhase"],
-): PredictionForecast {
+function forecastFor(node: PlanRuntimeNode, decisionSequence: number, actorPhase?: PredictionForecast["actorPhase"]): PredictionForecast {
 	return {
 		tool: node.action.tool,
 		...(node.actionKey ? { executionFingerprint: node.actionKey.executionFingerprint, actionKeyHash: node.actionKey.hash } : {}),
@@ -2395,11 +2391,7 @@ export function makeSpeculativeActionRuntime<
 		if (promoted.status === "scheduled") await launchNode(session, promoted.node);
 	};
 
-	const preemptForActor = (
-		session: Session,
-		settings: SpeculativeActionSettings,
-		protectedCandidates: readonly Candidate[] = [],
-	): void => {
+	const preemptForActor = (session: Session, settings: SpeculativeActionSettings, protectedCandidates: readonly Candidate[] = []): void => {
 		for (const candidate of session.scheduler.preemptFor(
 			1,
 			concurrentLimit(settings),
@@ -2732,12 +2724,7 @@ export function makeSpeculativeActionRuntime<
 		});
 	};
 
-	const queueSourceRequestEvent = (
-		session: Session,
-		turnID: string,
-		settings: SpeculativeActionSettings,
-		result: SettledSourceRequest,
-	): void => {
+	const queueSourceRequestEvent = (session: Session, turnID: string, settings: SpeculativeActionSettings, result: SettledSourceRequest): void => {
 		if (adapter.onEvent) session.events.enqueue({
 			type: "source_request", ...eventEnvelope(session, turnID, settings),
 			request: { request: result.request, startedAt: result.startedAt, durationMs: result.durationMs, settlement: result.settlement,

@@ -181,7 +181,8 @@ export interface HeldExecSnapshot {
 }
 
 export type HeldExecDecision =
-	| { readonly kind: "continue"; readonly observeCompletion?: (durationMs: number | undefined) => void | Promise<void> }
+	/** `repeat`: the same launch, or the same executable with any argv, may run natively for the rest of this call without asking again. */
+	| { readonly kind: "continue"; readonly repeat?: "launch" | "executable"; readonly observeCompletion?: (durationMs: number | undefined) => void | Promise<void> }
 	| ({
 			readonly kind: "replay";
 			readonly output: readonly { readonly fd: 1 | 2; readonly data: Buffer }[];
@@ -349,7 +350,7 @@ export class LinuxHeldExecBoundary {
 				...(request.trackQueues ? { trackQueues: true as const } : {}),
 			});
 			if (decision.kind === "continue") {
-				if (!decision.observeCompletion) return void socket.end("C\n");
+				if (!decision.observeCompletion) return void socket.end(decision.repeat === "executable" ? "e\n" : decision.repeat ? "c\n" : "C\n");
 				await observeCompletion(socket, decision.observeCompletion);
 				return;
 			}

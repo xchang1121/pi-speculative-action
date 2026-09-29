@@ -55,11 +55,7 @@ export function sameFilesystemIdentity(left: BigIntStats, right: BigIntStats): b
 }
 
 /** Fence workspace timestamps with a private descriptor; elapsed budgets must not use wall time. */
-export async function advanceFilesystemClock(
-	clock: FileHandle,
-	boundary: number,
-	identity: Pick<Stats, "dev" | "ino" | "nlink">,
-): Promise<void> {
+export async function advanceFilesystemClock(clock: FileHandle, boundary: number, identity: Pick<Stats, "dev" | "ino" | "nlink">): Promise<void> {
 	const deadline = performance.now() + 100;
 	const stamp = async () => {
 		const current = await clock.stat();
@@ -91,32 +87,37 @@ export function captureStableFile(
 
 /** File digests by kernel identity and change times (userspace cannot set a ctime). An entry is trusted once the file's last change
  * precedes its digest by 2 s, so a same-size rewrite inside one coarse timestamp tick cannot reuse it (the racy-git rule). */
-const fileDigests = new Map<string, { readonly digest: `sha256:${string}`; readonly takenAtMs: number }>();
+const fileDigests = new Map<string, { readonly hash: string; readonly blob?: string; readonly takenAtMs: number }>();
 const fileIdentity = (stat: BigIntStats) => `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
-const trustedDigest = (stat: BigIntStats) => {
-	const cached = fileDigests.get(fileIdentity(stat));
-	return cached && cached.takenAtMs - Number((stat.mtimeNs > stat.ctimeNs ? stat.mtimeNs : stat.ctimeNs) / 1_000_000n) >= 2000 ? cached.digest : undefined;
-};
-const rememberDigest = (stat: BigIntStats, hash: string, takenAtMs: number) => {
-	fileDigests.set(fileIdentity(stat), { digest: `sha256:${hash}`, takenAtMs });
-	if (fileDigests.size > 4096) fileDigests.delete(fileDigests.keys().next().value!);
-};
+
+/** A capture standing for re-reading this file, by its identity (`blob` also needs its git object id). */
+export function cachedCapture(stat: BigIntStats, realPath: string, blob = false): StableFilesystemCapture | undefined {
+	const cached = stat.isFile() ? fileDigests.get(fileIdentity(stat)) : undefined;
+	if (!cached || blob && !cached.blob || cached.takenAtMs - Number((stat.mtimeNs > stat.ctimeNs ? stat.mtimeNs : stat.ctimeNs) / 1_000_000n) < 2000) return undefined;
+	return { hash: cached.hash, bytesRead: Number(stat.size), realPath, stat, shared: true, ...(cached.blob ? { blob: cached.blob } : {}) };
+}
+
+/** `takenAtMs`: when the read began. */
+export function rememberCapture(capture: StableFilesystemCapture, takenAtMs: number): void {
+	fileDigests.set(fileIdentity(capture.stat), { hash: capture.hash, ...(capture.blob ? { blob: capture.blob } : {}), takenAtMs });
+	if (fileDigests.size > 65536) fileDigests.delete(fileDigests.keys().next().value!);
+}
 
 /** Follow executable aliases (including /proc/PID/exe), then hash the complete pinned image. */
 export async function hashExecutableFile(target: string, observation?: { readonly pinned: () => void; readonly signal: AbortSignal }): Promise<`sha256:${string}`> {
-	const cached = trustedDigest(await fs.stat(target, { bigint: true }));
-	if (cached) { observation?.pinned(); return cached; }
+	const cached = cachedCapture(await fs.stat(target, { bigint: true }), target);
+	if (cached) { observation?.pinned(); return `sha256:${cached.hash}`; }
 	const takenAtMs = Date.now(), capture = await captureFile(target, Infinity, false, false, undefined, observation);
-	rememberDigest(capture.stat, capture.hash, takenAtMs);
+	rememberCapture(capture, takenAtMs);
 	return `sha256:${capture.hash}`;
 }
 
 /** A dependency's content digest: an unchanged file validates by its identity (a runtime's image and libraries on every reuse). */
 export async function captureFileDigest(target: string, maxBytes = Number.POSITIVE_INFINITY): Promise<StableFilesystemCapture> {
-	const stat = await fs.stat(target, { bigint: true }), cached = stat.isFile() && Number(stat.size) <= maxBytes ? trustedDigest(stat) : undefined;
-	if (cached) return { hash: cached.slice("sha256:".length), bytesRead: Number(stat.size), realPath: target, stat, shared: true };
+	const stat = await fs.stat(target, { bigint: true }), cached = Number(stat.size) <= maxBytes ? cachedCapture(stat, target) : undefined;
+	if (cached) return cached;
 	const takenAtMs = Date.now(), capture = await captureStableFile(target, maxBytes);
-	rememberDigest(capture.stat, capture.hash, takenAtMs);
+	rememberCapture(capture, takenAtMs);
 	return capture;
 }
 
