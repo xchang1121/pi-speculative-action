@@ -5,13 +5,8 @@ import type { AgentMessage, AgentTool, AgentToolResult, AgentToolUpdateCallback 
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { convertToLlm, createLocalBashOperations, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, type ExtensionFactory,
 	type ExtensionUIContext, getAgentDir, getShellConfig, SettingsManager, type SourceInfo, type ToolDefinition } from "@earendil-works/pi-coding-agent";
-import {
-	KEYABLE_TOOLS,
-	OBSERVATION_ACTION_TOOLS,
-	PI_ACTION_SEMANTICS,
-	UNBOUNDED_ACTION_TOOLS,
-	WORKSPACE_MUTATION_ACTION_TOOLS,
-} from "./action-semantics.ts";
+import { KEYABLE_TOOLS, OBSERVATION_ACTION_TOOLS, PI_ACTION_SEMANTICS, UNBOUNDED_ACTION_TOOLS,
+	WORKSPACE_MUTATION_ACTION_TOOLS } from "./action-semantics.ts";
 import { ActorStreamPreviewTracker } from "./actor-stream-preview.ts";
 import { createResourceSnapshotExecutionWorld, type AgentExecutionWorld } from "./agent-execution-world.ts";
 import { createSpeculativeActionHost, normalizeSpeculativeAgentSettings, type CreateSpeculativeActionHostOptions } from "./agent-integration.ts";
@@ -23,19 +18,10 @@ import { createClosedSearchProfile, createPiToolDefinitions, PI_CLOSED_SEARCH_TO
 import type { ToolInvocation } from "./tool-settlement.ts";
 import { LinuxProcessReuseBackend } from "./linux-process-backend.ts";
 import { createLinuxProcessExecutionWorld } from "./linux-process-world.ts";
-import {
-	executionCapabilityStatus,
-	type ExecutionWorldDiagnosticSnapshot,
-	type ExecutionWorldHealthState,
-	type SpeculativeExecution,
-	type WorldReuseMetrics,
-} from "./execution-world.ts";
-import {
-	adaptProcessToolOperations,
-	definedProcessEnvironment,
-	ProcessExecutionCoordinator,
-	type ProcessRouteSnapshot,
-} from "./process-execution.ts";
+import { executionCapabilityStatus, type ExecutionWorldDiagnosticSnapshot, type ExecutionWorldHealthState, type SpeculativeExecution,
+	type WorldReuseMetrics } from "./execution-world.ts";
+import { adaptProcessToolOperations, definedProcessEnvironment, ProcessExecutionCoordinator,
+	type ProcessRouteSnapshot } from "./process-execution.ts";
 import { DEFAULT_PROVENANCE_STORE_LIMITS } from "./reuse-store.ts";
 import type { SpeculativeActionEvent } from "./runtime.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
@@ -1468,18 +1454,19 @@ function countSummary(counts: Readonly<Record<string, number>>): string {
 	return entries.length > 0 ? entries.map(([key, count]) => `${key}=${count}`).join(", ") : "none";
 }
 
-type TimingSummary = Pick<SpeculativeTraceSummary, "endToEndMs" | "estimatedSavingsMs" | "optimisticSavingsMs" | "hiddenLatencyMs" | "toolExecutionMs">;
+type TimingSummary = Pick<SpeculativeTraceSummary, "endToEndMs" | "estimatedSavingsMs" | "optimisticSavingsMs" | "hiddenLatencyMs" | "toolExecutionMs" | "toolWaitMs">;
 
 function formatTaskTiming(timing: TimingSummary): string {
 	const net = timing.estimatedSavingsMs;
 	return `${formatDuration(timing.endToEndMs)} wall; ${formatDuration(timing.optimisticSavingsMs)} optimistic savings (net ${net < 0 ? "-" : ""}${formatDuration(Math.abs(net))}); ${formatSpeedups(timing)}; ${formatDuration(timing.hiddenLatencyMs)} of ${formatDuration(timing.toolExecutionMs)} tool time hidden`;
 }
 
-/** The optimistic estimate leads, as the TUI has always shown it; the signed net estimate follows. */
+/** The upper-bound estimate leads, as the TUI has always shown it; the signed net estimate follows. Tool time speed up is the
+ * Actor's tool wait with each hit's avoided service restored, over the wait it actually had. */
 function formatSpeedups(timing: TimingSummary): string {
 	const percent = (savings: number) => timing.endToEndMs > 0 && Number.isFinite(savings) ? `${savings < 0 ? "" : "+"}${(100 * savings / timing.endToEndMs).toFixed(1)}%` : "n/a";
-	const toolPercent = timing.toolExecutionMs > 0 && Number.isFinite(timing.hiddenLatencyMs) ? `${(100 * timing.hiddenLatencyMs / timing.toolExecutionMs).toFixed(1)}%` : "n/a";
-	return `End-to-End SpeedUp ${percent(timing.optimisticSavingsMs)} (net ${percent(timing.estimatedSavingsMs)}); Tool time speed up ${toolPercent}`;
+	const tool = timing.toolWaitMs > 0 && Number.isFinite(timing.optimisticSavingsMs) ? `${((timing.toolWaitMs + timing.optimisticSavingsMs) / timing.toolWaitMs).toFixed(2)}x` : "n/a";
+	return `End-to-End SpeedUp ${percent(timing.optimisticSavingsMs)} (net ${percent(timing.estimatedSavingsMs)}); Tool time speed up ${tool}`;
 }
 
 function formatDuration(ms: number): string {
