@@ -70,11 +70,7 @@ function plan(proposalID: string, input: Record<string, unknown> = { path: "READ
 	return { id: proposalID, source: "source", revision: 0, actions: [readAction("next", input, { feedback: proposalID })] };
 }
 
-function childPlanUpdate(
-	context: { readonly proposalID: string; readonly actionID: string; readonly revision: number },
-	id: string,
-	path: string,
-) {
+function childPlanUpdate(context: { readonly proposalID: string; readonly actionID: string; readonly revision: number }, id: string, path: string) {
 	return {
 		proposalID: context.proposalID,
 		source: "source",
@@ -604,6 +600,19 @@ describe("structural speculative runtime", () => {
 		} finally { await runtime.dispose(); }
 	});
 
+	it("learns Actor operations only while adopted operations repay the tracing, probing ever more rarely", async () => {
+		const { runtime } = harness({ source: planSource({ propose: () => undefined, observesOperations: true, observe: () => undefined }), execute: async () => "unused" });
+		try {
+			await runtime.startTurn(start("learning"));
+			const learned: number[] = [];
+			for (let index = 0; index < 16; index++) {
+				const prepared = await runtime.prepareActorCall({ ...call("learning", { path: `f${index}` }), id: `call:${index}` });
+				learned.push(Number(prepared?.observeOperations === true)); await prepared?.settle(simulatedExecution(10), "actor");
+			}
+			expect(learned.join("")).toBe("1111000100000001");
+		} finally { await runtime.dispose(); }
+	});
+
 	it("bounds an uncalibrated in-flight join and falls back without cancelling the learning run", async () => {
 		let enabled = false;
 		const gate = gated();
@@ -632,11 +641,7 @@ describe("structural speculative runtime", () => {
 		await candidateReady.promise;
 		await prepared?.settle(simulatedExecution(100), "actor");
 		await runtime.finishTurn({ ...call("prediction"), terminal: false });
-		expect(
-			events.find(
-				(event) => event.type === "actor_action" && event.turnID === "prediction",
-			),
-		).toMatchObject({ settlement: { provider: { kind: "actor" }, rejections: [{ cause: { code: "candidate_join_deadline" } }] } });
+		expect(events.find((event) => event.type === "actor_action" && event.turnID === "prediction")).toMatchObject({ settlement: { provider: { kind: "actor" }, rejections: [{ cause: { code: "candidate_join_deadline" } }] } });
 		expect(adoption).not.toHaveBeenCalled(); adoption.mockRestore(); // A deadline exit began no adoption work to sample.
 		enabled = false;
 		await runtime.startTurn(start("retained"));
@@ -2264,15 +2269,9 @@ describe("structural speculative runtime", () => {
 		await runtime.finishTurn({ ...parent, terminal: false });
 
 		await runtime.startTurn(start("next-decision"));
-		expect(
-			(await runtime.prepareActorCall({ ...sameBatchChild, turnID: "next-decision", id: "next-decision-child" }))?.output,
-		).toBe("child.ts:output");
+		expect((await runtime.prepareActorCall({ ...sameBatchChild, turnID: "next-decision", id: "next-decision-child" }))?.output).toBe("child.ts:output");
 		await runtime.finishTurn({ ...sameBatchChild, turnID: "next-decision", terminal: true });
-		expect(
-			settlements.map((settlement) =>
-				settlement.observation === "observed" ? settlement.actorAction.decisionSequence : undefined,
-			),
-		).toEqual([1, 2]);
+		expect(settlements.map((settlement) => settlement.observation === "observed" ? settlement.actorAction.decisionSequence : undefined)).toEqual([1, 2]);
 	});
 
 	it.each(["retained", "retry", "expired", "replaced", "terminal"] as const)("keeps queued continuation authority %s across plan and turn boundaries", async (phase) => {
@@ -2381,11 +2380,8 @@ describe("structural speculative runtime", () => {
 			expect((await runtime.prepareActorCall(call("target", { path: "late.ts" })))?.output).toBe("late.ts:output");
 			await runtime.finishTurn({ ...call("target"), terminal: true });
 			expect(executed).toEqual(["parent.ts", "late.ts"]);
-			expect(
-				events
-					.filter((event) => event.type === "prediction")
-					.map((event) => (event.settlement.observation === "observed" ? event.settlement.match.matched : undefined)),
-			).toEqual([false, true]);
+			expect(events.filter((event) => event.type === "prediction")
+				.map((event) => (event.settlement.observation === "observed" ? event.settlement.match.matched : undefined))).toEqual([false, true]);
 			expect(summarizeSpeculativeTrace(events)).toMatchObject({ predictionsSettled: 2, predictionsObserved: 2,
 				predictionsMatched: 1, predictionsAdopted: 1, predictionPrecision: 1 / 2, adoptionYield: 1,
 				actorActions: 2, speculativeHits: 1, actorFallbacks: 1, hitRate: 1 / 2 });

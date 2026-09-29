@@ -10,6 +10,7 @@ import { nonNegativeFinite as finiteMetric, positiveCount } from "./number-utils
 import { errorDetail } from "./error-utils.ts";
 import { diagnosticAction } from "./diagnostics.ts";
 import { effectCommitFailure, isPoisonedEffectCommit } from "./effect-transaction.ts";
+import { BenefitGate, DEFAULT_BENEFIT_GATE_POLICY } from "./fork-benefit-gate.ts";
 import type { CandidateEventDescriptor, CandidateExecutionProjection } from "./events.ts";
 import { SALVAGE_MS, type ExecutionOperationAdoption, type ExecutionOperationBinding, type ExecutionScope, type SpeculativeExecutionRoute, sameSpeculativeExecutionRoute, validateWorldBranch, type WorldBranch } from "./execution-world.ts";
 import type { PlanUpdate } from "./plan-proposal.ts";
@@ -167,11 +168,8 @@ function candidateBranch<Output>(
 	return execution.status === "succeeded" ? execution.output : undefined;
 }
 
-function captureCoverage<Output>(
-	action: ActionKey,
-	output: Output,
-	rules: readonly ActionProjectionRule<Output>[],
-): readonly ActionProjectionCoverage[] {
+function captureCoverage<Output>(action: ActionKey, output: Output,
+	rules: readonly ActionProjectionRule<Output>[]): readonly ActionProjectionCoverage[] {
 	return rules.flatMap((rule) => {
 		try {
 			const value = rule.captureCoverage?.(action, output);
@@ -182,13 +180,9 @@ function captureCoverage<Output>(
 	});
 }
 
-async function projectOutput<Output>(
-	candidate: CandidateRecord<Output>,
-	actor: ActionKey,
-	match: ActionKeyMatch,
+async function projectOutput<Output>(candidate: CandidateRecord<Output>, actor: ActionKey, match: ActionKeyMatch,
 	rules: readonly ActionProjectionRule<Output>[],
-	request: Parameters<NonNullable<WorldBranch<Output>["reconstruct"]>>[0],
-): Promise<ProjectionResult<Output>> {
+	request: Parameters<NonNullable<WorldBranch<Output>["reconstruct"]>>[0]): Promise<ProjectionResult<Output>> {
 	const branch = candidateBranch(candidate)!;
 	if ((branch.inputsOnly || candidate.outputStale) && match.kind !== "inputs") return { ok: false, cause: cause("projection", "input_only_branch") };
 	if (match.kind === "exact") return { ok: true, output: branch.output };
@@ -444,6 +438,8 @@ interface SessionState<SessionID, Output, StartInput, StateData> {
 	pendingLaunch?: Promise<void>;
 	/** Scope policies a process handoff holds weakly, kept for salvage while the session lives. */
 	readonly salvageScopes: Map<object, number>;
+	/** Learning an Actor call's operations traces each of its system calls: kept up while adopted operations repay it. */
+	readonly operationLearning: { readonly gate: BenefitGate; sample?: { costMs: number; benefitMs: number; update: (value: { costMs: number; benefitMs: number }) => void } };
 }
 
 interface TurnState<SessionID, Output, StartInput, StateData> extends RuntimeTurnContext<StartInput, StateData> {
@@ -576,6 +572,7 @@ export function makeSpeculativeActionRuntime<
 			pendingSourceRequests: 0,
 			pendingAdmissions: 0,
 			salvageScopes: new Map(),
+			operationLearning: { gate: new BenefitGate() },
 		};
 		sessionStates.set(sessionID, created);
 		return created;
@@ -1276,6 +1273,8 @@ export function makeSpeculativeActionRuntime<
 				const actorAction: ActorActionIdentity = { id: adoption.id, kind: "operation", sequence: adoption.sequence,
 					decisionSequence: turn.decisionSequence, turnID: turn.turnID };
 				candidate.actorAdopted = true;
+				const learned = session.operationLearning.sample;
+				if (learned) { learned.benefitMs += finiteMetric(candidate.owner.draft.operation?.executionMs); learned.update(learned); }
 				for (const node of session.plan.consumers(candidate.id)) {
 					const opportunity = session.plan.claimMatch(node.proposalID, node.action.id, actorAction, { kind: "exact", distance: 0 });
 					const settled = opportunity && session.plan.confirm(opportunity, actorAction, { status: "adopted", candidateID: candidate.id });
@@ -1790,7 +1789,8 @@ export function makeSpeculativeActionRuntime<
 		let capturePreparationMs = 0;
 		let captureInputSource: object | undefined;
 		const prepared: PreparedActorCall<Output> & { output?: Output } = {
-			observeOperations: state.settings.enabled && sources.some(source => source.observesOperations && source.observe && source.enabled(state.settings)),
+			observeOperations: state.settings.enabled && sources.some(source => source.observesOperations && source.observe && source.enabled(state.settings)) &&
+				learnOperations(state.session),
 			withInputs: async execute => {
 				const inputs = borrowCandidateInputs(state.session, undefined, `inputs:actor:${identity.id}`);
 				try { return await execute(function* (target) {
@@ -1832,9 +1832,7 @@ export function makeSpeculativeActionRuntime<
 			});
 			if (!previewCandidateID) await Promise.all(matchingPredictions.map(({ node }) => promoteForActor(state.session, node)));
 			const ranked = rankCandidates(state.session, actualKey, previewCandidateID);
-			const blockedPrediction = matchingPredictions.find(
-				({ node }) => node.execution.status === "execution_blocked" || node.execution.status === "preparing",
-			)?.node;
+			const blockedPrediction = matchingPredictions.find(({ node }) => node.execution.status === "execution_blocked" || node.execution.status === "preparing")?.node;
 			actorAction.setFallback(
 				blockedPrediction?.execution.status === "execution_blocked"
 					? blockedPrediction.execution.cause
@@ -1896,6 +1894,12 @@ export function makeSpeculativeActionRuntime<
 			const adoption = actorAction.deferToFallback(matchingPredictions.map(({ opportunity }) => opportunity.identity));
 			if (adoption) confirmPredictions(state.session, matchingPredictions, identity, adoption);
 		}
+	};
+
+	const learnOperations = ({ operationLearning: learning }: Session): boolean => {
+		if (!learning.gate.decide("operations", DEFAULT_BENEFIT_GATE_POLICY).allowed) return false;
+		const sample = { costMs: 0, benefitMs: 0 };
+		return !!(learning.sample = { ...sample, update: learning.gate.observe("operations", sample, DEFAULT_BENEFIT_GATE_POLICY) });
 	};
 
 	const promoteAuthoritativeResult = async (
