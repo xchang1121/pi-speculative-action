@@ -151,7 +151,8 @@ interface PooledGitRepository {
 	active: number;
 	readonly idleWaiters: Set<() => void>;
 	lock: Promise<void>;
-	prepared?: { readonly commit: string; readonly workspace: Promise<PreparedGitWorkspace> };
+	/** A checked-out baseline: its commit and hard-link groups (Git trees record neither the groups nor their absence). */
+	prepared?: { readonly commit: string; readonly aliases: string; readonly workspace: Promise<PreparedGitWorkspace> };
 	readonly overlayBaselines: Map<string, Promise<SharedOverlayBaseline>>;
 	autoDriverDecision?: AutoWorkspaceDriverDecision;
 	/** Unsafe live-mount storage is detached from allocation and retained for OS-level recovery. */
@@ -1013,7 +1014,13 @@ async function createPrivateSandboxWorkspace(
 			// A live lower may sit on another filesystem; its files' own identities, checked on every read, fence it instead.
 			transactionClockRoots = Object.freeze([...liveBase ? [] : [sharedBaseline.sandboxRoot], mounted.upperRoot, mounted.workRoot]);
 		} else {
-			const prepared = (await takePreparedSandbox(pool, commit)) ?? (await attachSandboxWorkspace(pool, baseline));
+			const aliases = JSON.stringify(baseline.aliases);
+			const prepared = (await takePreparedSandbox(pool, commit, aliases)) ?? (await attachSandboxWorkspace(pool, baseline));
+			// The next speculated action's checkout (the whole tree, ignored dependencies included) runs while this one does.
+			if ((overlayOptions as Partial<SandboxWorkspaceBranchOptions>).action && !pool.prepared && !pool.disposal && !pool.quarantined) {
+				const next = pool.prepared = { commit, aliases, workspace: attachSandboxWorkspace(pool, baseline) };
+				void next.workspace.catch(() => { if (pool.prepared === next) pool.prepared = undefined; });
+			}
 			attached = prepared;
 			sandboxRoot = prepared.sandboxRoot;
 			processRoot = prepared.processRoot;
@@ -1253,10 +1260,7 @@ async function createGitWorkspaceTransactionDriver(workspace: PrivateSandboxWork
 				entry?.kind === "file"
 					? await readRegularState(
 							path.resolve(sandboxRoot, relativePath),
-							Math.min(
-								WORKSPACE_TRANSACTION_MAX_BYTES - afterBytes,
-								WORKSPACE_TRANSACTION_MAX_BYTES - unchangedBytes,
-							),
+							Math.min(WORKSPACE_TRANSACTION_MAX_BYTES - afterBytes, WORKSPACE_TRANSACTION_MAX_BYTES - unchangedBytes),
 						)
 					: undefined;
 			if (captureBefore) afterBytes += current?.content.byteLength ?? 0;
@@ -1276,11 +1280,7 @@ async function createGitWorkspaceTransactionDriver(workspace: PrivateSandboxWork
 	return { begin, dispose };
 }
 
-async function acquireSandboxRepository(
-	state: WorkspaceSandboxState,
-	sourceRoot: string,
-	gitBinary: string,
-): Promise<PooledGitRepository> {
+async function acquireSandboxRepository(state: WorkspaceSandboxState, sourceRoot: string, gitBinary: string): Promise<PooledGitRepository> {
 	assertWorkspaceSandboxOpen(state);
 	const key = `${filesystemPathKey(sourceRoot)}\0${gitBinary}`;
 	let pending = state.repositories.get(key);
@@ -1302,11 +1302,7 @@ async function acquireSandboxRepository(
 	return repository;
 }
 
-async function createSandboxRepository(
-	owner: WorkspaceSandboxState,
-	sourceRoot: string,
-	gitBinary: string,
-): Promise<PooledGitRepository> {
+async function createSandboxRepository(owner: WorkspaceSandboxState, sourceRoot: string, gitBinary: string): Promise<PooledGitRepository> {
 	const parent = await mkdtemp(path.join(os.tmpdir(), "pi-speculative-action-pool-"));
 	const repository = path.join(parent, "snapshot.git");
 	const git = bindGit(gitBinary, parent, ["--git-dir", repository]);
@@ -1333,10 +1329,7 @@ async function createSandboxRepository(
 	} catch (error) { await rm(parent, { recursive: true, force: true }); throw error; }
 }
 
-async function acquireSandboxBaseline(
-	repository: PooledGitRepository,
-	warmup = false,
-): Promise<NonNullable<PooledGitRepository["baseline"]>> {
+async function acquireSandboxBaseline(repository: PooledGitRepository, warmup = false): Promise<NonNullable<PooledGitRepository["baseline"]>> {
 	// The pool owns this shared baseline; callers cancel before private workspace allocation.
 	return withWorkspaceLock(repository, async () => {
 		const baseline = repository.baseline;
@@ -1430,26 +1423,26 @@ function gitBlobID(bytes: Buffer): string {
 }
 
 async function ensurePreparedSandbox(repository: PooledGitRepository, baseline: NonNullable<PooledGitRepository["baseline"]>, signal?: AbortSignal): Promise<void> {
-	const { commit } = baseline;
+	const { commit } = baseline, aliases = JSON.stringify(baseline.aliases);
 	const existing = repository.prepared;
-	if (existing?.commit === commit) { await existing.workspace; return; }
+	if (existing?.commit === commit && existing.aliases === aliases) { await existing.workspace; return; }
 	const stale = await takePreparedSandbox(repository);
 	await stale?.dispose();
 	throwIfAborted(signal);
-	const pending = repository.prepared ??= { commit, workspace: attachSandboxWorkspace(repository, baseline) };
+	const pending = repository.prepared ??= { commit, aliases, workspace: attachSandboxWorkspace(repository, baseline) };
 	try {
 		await pending.workspace;
 	} catch (error) { if (repository.prepared === pending) repository.prepared = undefined; throw error; }
 }
 
-async function takePreparedSandbox(repository: PooledGitRepository, commit?: string): Promise<PreparedGitWorkspace | undefined> {
+async function takePreparedSandbox(repository: PooledGitRepository, commit?: string, aliases?: string): Promise<PreparedGitWorkspace | undefined> {
 	const pending = repository.prepared;
 	if (!pending) return undefined;
 	// Claim the slot before waiting: execution, replacement and shutdown cannot retire the same workspace.
 	repository.prepared = undefined;
 	try {
 		const prepared = await pending.workspace;
-		if (commit === undefined || prepared.commit === commit) return prepared;
+		if (commit === undefined || prepared.commit === commit && (aliases === undefined || pending.aliases === aliases)) return prepared;
 		await prepared.dispose();
 	} catch {
 		// A failed or stale warm-up falls back to a fresh per-action workspace.
@@ -1803,11 +1796,7 @@ async function inspectOverlayStructureFrontier(upperRoot: string): Promise<Overl
 	return { refresh, removals: Object.freeze(removals) };
 }
 
-async function walkOverlayUpper(
-	upperRoot: string,
-	journal: string,
-	observe: (entry: OverlayUpperEntry) => void | Promise<void>,
-): Promise<void> {
+async function walkOverlayUpper(upperRoot: string, journal: string, observe: (entry: OverlayUpperEntry) => void | Promise<void>): Promise<void> {
 	let entries = 0;
 	const visit = async (directory: string, relativeDirectory: string): Promise<void> => {
 		for (const child of await readdir(directory, { withFileTypes: true })) {

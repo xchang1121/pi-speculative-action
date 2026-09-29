@@ -45,6 +45,8 @@ const { values } = parseArgs({
 		label: { type: "string", default: "baseline" },
 		actor: { type: "string", default: "deepseek/deepseek-v4-pro" },
 		drafter: { type: "string", default: "deepseek/deepseek-v4-flash" },
+		// Every model request goes through this endpoint instead (a pi-llm-tape recorder or replayer).
+		"model-base-url": { type: "string" },
 		"drafter-max-depth": { type: "string", default: String(DEFAULTS.drafterMaxDepth) },
 		"candidate-limit": { type: "string", default: String(DEFAULTS.candidateLimit) },
 		"drafter-max-tokens": { type: "string" },
@@ -391,7 +393,7 @@ function model(value: string): Model<Api> {
 	const modelID = value.slice(separator + 1);
 	const resolved = getModels(provider).find((candidate) => candidate.id === modelID);
 	if (!resolved) throw new Error(`Unknown model ${value}`);
-	return resolved;
+	return values["model-base-url"] ? { ...resolved, baseUrl: values["model-base-url"] } : resolved;
 }
 
 function patchFiles(patch: string): string[] {
