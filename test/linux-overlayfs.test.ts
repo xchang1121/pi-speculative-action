@@ -3,11 +3,7 @@ import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import {
-	LinuxOverlayfsCapabilityRegistry,
-	linuxOverlayfsCapability,
-	mountLinuxOverlayfs,
-} from "../src/linux-overlayfs.ts";
+import { LinuxOverlayfsCapabilityRegistry, linuxOverlayfsCapability, mountLinuxOverlayfs } from "../src/linux-overlayfs.ts";
 
 describe("Linux OverlayFS workspace substrate", () => {
 	it("bounds request aliases and releases lifecycle-owned capability state", async () => {

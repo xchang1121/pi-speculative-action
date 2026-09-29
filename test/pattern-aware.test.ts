@@ -1423,6 +1423,19 @@ describe("PatternAware", () => {
 		expect(after?.historicalMatches).toBe(pattern.historicalMatches + 1);
 	});
 
+	test("reads what the Actor just edited or listed before any pattern is learned, at a rate its outcomes move", () => {
+		const store = patternStore({}, undefined, piActionSemantics());
+		store.observe(input("s", "read", { path: "src/c.ts" }, { turnID: "earlier" }));
+		store.observe(input("s", "grep", { pattern: "x" }, { outputLocations: [{ path: "src/b.ts", line: 3 }, { path: "src/c.ts", line: 1 }] }));
+		store.observe(input("s", "edit", { path: "src/a.ts" }));
+		const structural = () => store.predict("s").filter(item => item.patternID.startsWith("structural:"));
+		expect(structural().map(item => [item.patternID, item.input.path])).toEqual(
+			[["structural:edited", "src/a.ts"], ["structural:listed", "src/b.ts"], ["structural:reread", "src/c.ts"]]);
+		const [edited] = structural(), before = edited!.conditionalProbability;
+		for (let index = 0; index < 3; index++) { store.issued(edited!.continuation); store.settled(edited!.continuation, unmatchedSettlement()); }
+		expect(structural()[0]!.conditionalProbability).toBeLessThan(before);
+	});
+
 	test("bounds derived state by recency and releases finished sessions", () => {
 		const cache = new BoundedRecencyMap<string, number | null>(2);
 		cache.set("first", null);
@@ -1433,7 +1446,7 @@ describe("PatternAware", () => {
 
 		const recurrent = patternStore({ maxPatterns: 2 }, undefined, piActionSemantics());
 		for (const filePath of ["one", "two", "one", "three"]) recurrent.observe(input("recurrent", "read", { path: filePath }));
-		expect(recurrent.predict("recurrent").map(item => item.input.path).sort()).toEqual(["one", "three"]);
+		expect(recurrent.predict("recurrent").filter(item => item.patternID.startsWith("action-backoff:")).map(item => item.input.path).sort()).toEqual(["one", "three"]);
 
 		const pending = patternStore({ maxPatterns: 2, maxFutureGap: 8 });
 		const bounded = acceptPattern(pending, { "5": 10 }, { bindings: collectionBindings() });

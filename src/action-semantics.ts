@@ -2,14 +2,8 @@ import path from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { relativeFilesystemPath, sameFilesystemPath, slash } from "./path-utils.ts";
-import {
-	type EffectRequirements,
-	normalizeEffectRequirements,
-	effectRequirements,
-	RESOURCE_OBSERVATION_EFFECTS,
-	UNRESTRICTED_PROCESS_EFFECTS,
-	WORKSPACE_PATH_MUTATION_EFFECTS,
-} from "./effect-model.ts";
+import { type EffectRequirements, normalizeEffectRequirements, effectRequirements, RESOURCE_OBSERVATION_EFFECTS, UNRESTRICTED_PROCESS_EFFECTS,
+	WORKSPACE_PATH_MUTATION_EFFECTS } from "./effect-model.ts";
 import { asRecord, immutableSnapshot, isImmutableSnapshot, stableStringify } from "./stable-json.ts";
 import { finiteNumber } from "./number-utils.ts";
 import { positiveInteger, nonNegativeInteger } from "./setting-input.ts";

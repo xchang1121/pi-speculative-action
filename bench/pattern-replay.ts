@@ -7,20 +7,23 @@ import { PatternAwareStore, patternAwareActionSemantics, patternAwareSettings } 
 import { createPatternPlanSource } from "../src/pattern-plan-source.ts";
 
 type Call = { readonly id: string; readonly tool: string; readonly input: Record<string, unknown> };
-type Result = { readonly content: unknown[]; readonly details: unknown; readonly isError: boolean };
+type Result = { readonly content: unknown[]; readonly details: unknown; readonly isError: boolean; readonly durationMs: number };
 type Prediction = { readonly type: string; readonly tool: string; readonly input: Record<string, unknown>; readonly feedback?: unknown; readonly expectedLatencyBenefitMs?: number };
-type Counts = { actual: number; covered: number; predicted: number; hits: number };
+type Counts = { actual: number; covered: number; predicted: number; hits: number; toolMs: number; top4Ms: number };
 
 const sessions = process.argv.slice(2).map((file) => {
 	const records = readFileSync(file, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
 	const batches: Call[][] = [], results = new Map<string, Result>();
-	for (const { message } of records) {
+	let decidedAt = 0; // A result's time since its batch was decided: the call's service time (a batch shares its slowest).
+	for (const { message, timestamp } of records) {
 		if (message?.role === "assistant") {
+			decidedAt = Date.parse(timestamp);
 			const calls = (message.content as { type: string; id: string; name: string; arguments: Record<string, unknown> }[])
 				.filter((block) => block.type === "toolCall").map((block) => ({ id: block.id, tool: block.name, input: block.arguments }));
 			if (calls.length) batches.push(calls);
 		} else if (message?.role === "toolResult") {
-			results.set(message.toolCallId, { content: message.content, details: message.details, isError: message.isError === true });
+			results.set(message.toolCallId, { content: message.content, details: message.details, isError: message.isError === true,
+				durationMs: Math.max(1, Date.parse(timestamp) - decidedAt) });
 		}
 	}
 	return { cwd: String(records.find((record) => record.type === "session")?.cwd ?? process.cwd()), batches, results };
@@ -29,8 +32,8 @@ const tools = ["read", "grep", "find", "ls", "bash", "edit", "write"];
 const settings = patternAwareSettings({ enabled: true, multiStepEnabled: true });
 const runtimeSettings = { enabled: true, tools, sourceConfig: { patternAware: settings } } as never;
 const data = { tools: new Map(tools.map((name) => [name, { name, parameters: {} }])), schemaHashes: Object.fromEntries(tools.map((name) => [name, "schema"])) };
-const totals = { decisions: 0, actual: 0, covered: 0, predicted: 0, hits: 0, top4: 0, top4Hits: 0, top4Covered: 0 }, byTool: Record<string, Counts> = {};
-const count = (tool: string) => byTool[tool] ??= { actual: 0, covered: 0, predicted: 0, hits: 0 };
+const totals = { decisions: 0, actual: 0, covered: 0, predicted: 0, hits: 0, top4: 0, top4Hits: 0, top4Covered: 0, toolMs: 0, top4Ms: 0 }, byTool: Record<string, Counts> = {};
+const count = (tool: string) => byTool[tool] ??= { actual: 0, covered: 0, predicted: 0, hits: 0, toolMs: 0, top4Ms: 0 };
 let turn = 0;
 for (const [index, { cwd, batches, results }] of sessions.entries()) {
 	const rules = [READ_RANGE_ACTION_KEY_PROJECTOR], sessionID = `session-${index}`;
@@ -65,10 +68,12 @@ for (const [index, { cwd, batches, results }] of sessions.entries()) {
 		for (const [order, call] of batch.entries()) {
 			totals.actual++; count(call.tool).actual++;
 			if (covered.has(order)) { totals.covered++; count(call.tool).covered++; }
-			const result = results.get(call.id) ?? { content: [], details: undefined, isError: false };
+			const result = results.get(call.id) ?? { content: [], details: undefined, isError: false, durationMs: 1 };
+			totals.toolMs += result.durationMs; count(call.tool).toolMs += result.durationMs;
+			if (top4.has(order)) { totals.top4Ms += result.durationMs; count(call.tool).top4Ms += result.durationMs; }
 			const update = await controller.source.observe!({ ...request(startInput), consumeInput: { sessionID, turnID: `turn-${turn}`, tool: call.tool, args: call.input, tools: [] },
 				action: key(call.tool, call.input), tool: call.tool, concrete: call.input, output: { result: { content: result.content, details: result.details }, isError: result.isError },
-				durationMs: 100, order } as never);
+				durationMs: result.durationMs, order } as never);
 			if (update && "actions" in update) carried = (update.actions as readonly Prediction[]).filter((action) => action.type === "tool_call");
 		}
 		controller.turnFinished(startInput as never, runtimeSettings, false);
@@ -80,5 +85,5 @@ for (const [index, { cwd, batches, results }] of sessions.entries()) {
 }
 const percent = (part: number, whole: number) => whole ? `${(100 * part / whole).toFixed(1)}%` : "-";
 console.log(JSON.stringify({ ...totals, precision: percent(totals.hits, totals.predicted), recall: percent(totals.covered, totals.actual),
-	top4Precision: percent(totals.top4Hits, totals.top4), top4Recall: percent(totals.top4Covered, totals.actual),
-	byTool: Object.fromEntries(Object.entries(byTool).map(([tool, counts]) => [tool, { ...counts, precision: percent(counts.hits, counts.predicted), recall: percent(counts.covered, counts.actual) }])) }, null, 1));
+	top4Precision: percent(totals.top4Hits, totals.top4), top4Recall: percent(totals.top4Covered, totals.actual), top4ToolTime: percent(totals.top4Ms, totals.toolMs),
+	byTool: Object.fromEntries(Object.entries(byTool).map(([tool, counts]) => [tool, { ...counts, precision: percent(counts.hits, counts.predicted), recall: percent(counts.covered, counts.actual), top4ToolTime: percent(counts.top4Ms, counts.toolMs) }])) }, null, 1));

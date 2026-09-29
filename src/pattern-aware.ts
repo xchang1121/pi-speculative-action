@@ -295,6 +295,7 @@ export class PatternAwareStore {
 	private readonly sessionBudgets: ReturnType<typeof patternSessionBudgets>;
 	private readonly observedActionKeys = new WeakMap<PatternAwareEvent, ActionKey | null>();
 	private readonly recurrentFeedback = new WeakMap<PatternRecurrentAction | PatternAwareContinuation, MutablePatternFeedback>();
+	private readonly structuralFeedback = new Map<string, MutablePatternFeedback>();
 	private readonly resolvedActionKeys: BoundedRecencyMap<string, ActionKey | null>;
 	private readonly patternSupportSessions = new Map<string, ReadonlySet<string>>();
 	private trie = new PredictiveContextTrie();
@@ -639,6 +640,9 @@ export class PatternAwareStore {
 				supportingPatternIDs: [...new Set([...existing.supportingPatternIDs, ...recurrent.supportingPatternIDs])],
 			});
 		}
+		// Learned support, when there is any, speaks for an action; the built-in relations only add the ones nothing learned yet.
+		for (const structural of authoritative ? this.structuralReads(history, schemaHashes, continuation, settings) : [])
+			if (!predictions.has(structural.actionIdentity)) predictions.set(structural.actionIdentity, structural);
 		const ranked = [...predictions.values()].sort((left, right) =>
 			Number(left.background) - Number(right.background) ||
 			right.expectedLatencyBenefitMs - left.expectedLatencyBenefitMs ||
@@ -764,6 +768,53 @@ export class PatternAwareStore {
 				evidenceConfidence: confidence,
 				expectedLatencyBenefitMs,
 			};
+		});
+	}
+
+	/**
+	 * What the Actor reads next from what it just did, before any pattern is learned: the file it just edited, the files the last
+	 * batch listed and it has not read, then the files it read most recently. Each relation keeps its own rate in this store, starting
+	 * from its prior (measured over real sessions) and moved by every settled prediction.
+	 */
+	private structuralReads(
+		history: ReadonlyArray<PatternAwareEvent>,
+		schemaHashes: Readonly<Record<string, string>>,
+		continuation: PatternAwareContinuation,
+		settings: PatternAwareSettings,
+	) {
+		const last = history.at(-1);
+		if (!last) return [];
+		const batch = history.filter((event) => event.turnID === last.turnID && event.sessionID === last.sessionID);
+		const reads = history.filter((event) => event.tool === "read" && typeof event.input.path === "string");
+		const durationMs = reads.reduce((total, event) => total + event.durationMs, 0) / Math.max(1, reads.length);
+		const identity = (target: string) => this.resolveActionKey("read", { path: target }, schemaHashes.read)?.key;
+		const read = new Set(reads.map((event) => identity(String(event.input.path))));
+		const ranked: Array<readonly [kind: string, target: string, prior: number]> = [];
+		for (const event of [...batch].reverse()) if ((event.tool === "edit" || event.tool === "write") && typeof event.input.path === "string") ranked.push(["edited", event.input.path, 0.35]);
+		const listed = batch.filter((event) => event.tool !== "read").flatMap((event) => [...(event.outputLocations ?? []).map(({ path }) => path), ...event.outputPaths ?? []]);
+		for (const [index, target] of [...new Set(listed)].filter((target) => !read.has(identity(target))).slice(0, 8).entries()) ranked.push(["listed", target, 0.2 / (index + 1)]);
+		for (const [index, event] of [...reads].reverse().slice(0, 4).entries()) ranked.push(["reread", String(event.input.path), 0.15 / (index + 1)]);
+		const seen = new Set<string>();
+		return ranked.flatMap(([kind, target, prior]) => {
+			const key = identity(target);
+			if (!key || seen.has(key)) return [];
+			seen.add(key);
+			let feedback = this.structuralFeedback.get(kind);
+			if (!feedback) this.structuralFeedback.set(kind, feedback = emptyPatternFeedback(this.clock));
+			const evidence = feedbackEvidence({ feedback }, this.clock, settings.decayHalfLifeEvents), weight = 4;
+			const conditionalProbability = clampProbability((prior * weight + evidence.matched) / (weight + evidence.matched + evidence.mismatched));
+			const empiricalProbability = clampProbability(continuation.pathProbability * conditionalProbability);
+			const adoptionProbability = patternAdoptionProbability([{ feedback }], this.clock, settings.decayHalfLifeEvents);
+			const patternID = `structural:${kind}`;
+			if (continuation.visitedPatternIDs.includes(patternID)) return [];
+			return [{
+				background: false, recurrentFeedback: feedback, actionIdentity: hash(JSON.stringify({ actionKey: key, type: "tool_call" })),
+				type: "tool_call" as const, tool: "read", input: { path: target }, patternID, supportingPatternIDs: [] as string[],
+				context: [] as PatternAwareEventSignature[], dependencies: [] as PatternAwareDependency[], horizon: 0, latestHorizon: 0, gapCoverage: 1,
+				replayProbability: conditionalProbability, variantProbability: 1, conditionalProbability, empiricalProbability, adoptionProbability,
+				expectedDurationMs: durationMs, ppmEstimate: undefined, mapperConfidence: 1, evidenceConfidence: 1,
+				expectedLatencyBenefitMs: empiricalProbability * adoptionProbability * Math.max(1, durationMs),
+			}];
 		});
 	}
 

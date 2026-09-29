@@ -1,13 +1,8 @@
 import { deferred } from "./async.ts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_BENEFIT_GATE_POLICY } from "../src/fork-benefit-gate.ts";
-import {
-	type CandidateJoinRequest,
-	type PredictionForecast,
-	type ServiceTimingIdentity,
-	SpeculationScheduler,
-	waitForCandidate,
-} from "../src/scheduler.ts";
+import { type CandidateJoinRequest, type PredictionForecast, type ServiceTimingIdentity, SpeculationScheduler,
+	waitForCandidate } from "../src/scheduler.ts";
 
 afterEach(() => vi.useRealTimers());
 
