@@ -690,12 +690,11 @@ async function prepareSandboxWorkspaceFor(state: WorkspaceSandboxState, cwd: str
 		throwIfAborted(options.signal);
 		const baseline = await acquireSandboxBaseline(repository, true);
 		throwIfAborted(options.signal);
-		if (resolved.driver === "overlayfs") {
+		if (resolved.driver !== "overlayfs") await ensurePreparedSandbox(repository, baseline, options.signal);
+		else if (!(options.liveLower && await captureLiveBase(repository, baseline.version))) {
 			const overlay = await acquireOverlayBaseline(repository, baseline);
-			try { throwIfAborted(options.signal); await overlayBaselineStructure(overlay); } finally {
-				releaseOverlayBaseline(overlay);
-			}
-		} else await ensurePreparedSandbox(repository, baseline, options.signal);
+			try { throwIfAborted(options.signal); await overlayBaselineStructure(overlay); } finally { releaseOverlayBaseline(overlay); }
+		}
 		throwIfAborted(options.signal);
 		const prepared = Object.freeze({ ...resolved });
 		preparedWorkspaceBaselines.set(prepared, { repository, baseline });
@@ -938,8 +937,9 @@ async function createPrivateSandboxWorkspace(state: WorkspaceSandboxState, cwd: 
 		const observationExcludes: readonly string[] = SNAPSHOT_EXCLUDES;
 		let liveBase: WorkspaceStructureSnapshot | undefined;
 		if (driver === "overlayfs") {
-			sharedBaseline = await acquireOverlayBaseline(pool, baseline);
 			liveBase = (overlayOptions as WorkspaceSandboxOptions).liveLower ? await captureLiveBase(pool, baseline.version) : undefined;
+			// A live lower is the workspace itself: only a snapshot lower needs the baseline checked out.
+			if (!liveBase) sharedBaseline = await acquireOverlayBaseline(pool, baseline);
 			overlayStorageRoot = await mkdtemp(path.join(pool.parent, "overlay-storage-"));
 			processRoot = path.join(overlayStorageRoot, "process");
 			await mkdir(processRoot);
@@ -950,13 +950,13 @@ async function createPrivateSandboxWorkspace(state: WorkspaceSandboxState, cwd: 
 					for (let parent = path.dirname(name); parent !== "."; parent = path.dirname(parent)) directories.add(parent);
 					await mkdir(path.dirname(path.join(upper, name)), { recursive: true });
 				}
-				await copyFile(path.join(sharedBaseline.sandboxRoot, aliases[0]!), path.join(upper, aliases[0]!), fsConstants.COPYFILE_FICLONE);
+				await copyFile(path.join(sharedBaseline!.sandboxRoot, aliases[0]!), path.join(upper, aliases[0]!), fsConstants.COPYFILE_FICLONE);
 				for (const alias of aliases.slice(1)) await link(path.join(upper, aliases[0]!), path.join(upper, alias));
 			}
 			for (const directory of [...directories].sort((a, b) => b.length - a.length))
-				await chmod(path.join(upper, directory), (await lstat(path.join(sharedBaseline.sandboxRoot, directory))).mode & 0o777);
+				await chmod(path.join(upper, directory), (await lstat(path.join(sharedBaseline!.sandboxRoot, directory))).mode & 0o777);
 			const mounted = await mountLinuxOverlayfs({
-				lowerRoot: liveBase ? sourceRoot : sharedBaseline.sandboxRoot,
+				lowerRoot: liveBase ? sourceRoot : sharedBaseline!.sandboxRoot,
 				privateRoot: overlayStorageRoot,
 				options: overlayOptions,
 				capabilityRegistry: state.overlayfsCapabilities,
@@ -964,11 +964,11 @@ async function createPrivateSandboxWorkspace(state: WorkspaceSandboxState, cwd: 
 			overlay = mounted;
 			overlayDevice = String((await lstat(mounted.root, { bigint: true })).dev);
 			sandboxRoot = mounted.root;
-			gitDirectory = sharedBaseline.gitDirectory;
+			gitDirectory = sharedBaseline?.gitDirectory ?? path.join(overlayStorageRoot, "no-index"); // OverlayFS journals its own changes.
 			openTransactionClock = () => openLinuxAnonymousWorkspaceFile(mounted.upperRoot);
 			transactionClockLinks = 0;
 			// A live lower may sit on another filesystem; its files' own identities, checked on every read, fence it instead.
-			transactionClockRoots = Object.freeze([...liveBase ? [] : [sharedBaseline.sandboxRoot], mounted.upperRoot, mounted.workRoot]);
+			transactionClockRoots = Object.freeze([...liveBase ? [] : [sharedBaseline!.sandboxRoot], mounted.upperRoot, mounted.workRoot]);
 		} else {
 			const aliases = JSON.stringify(baseline.aliases);
 			const prepared = (await takePreparedSandbox(pool, commit, aliases)) ?? (await attachSandboxWorkspace(pool, baseline));
@@ -996,8 +996,8 @@ async function createPrivateSandboxWorkspace(state: WorkspaceSandboxState, cwd: 
 						exclude: workspace.observationExcludes,
 					});
 				}
-				if (!workspace.sharedBaseline) throw new Error("OverlayFS shared baseline is unavailable");
-				return (liveBase ? Promise.resolve(liveBase) : overlayBaselineStructure(workspace.sharedBaseline)).then((baseline) =>
+				if (!liveBase && !workspace.sharedBaseline) throw new Error("OverlayFS shared baseline is unavailable");
+				return (liveBase ? Promise.resolve(liveBase) : overlayBaselineStructure(workspace.sharedBaseline!)).then((baseline) =>
 					captureOverlayWorkspaceStructure(workspace, baseline, overlayDevice!),
 				);
 			},
@@ -1272,9 +1272,7 @@ async function acquireSandboxBaseline(repository: PooledGitRepository, warmup = 
 			// A preparation owns an immutable namespace. Borrowers prove the captured alias set at adoption.
 			if (warmup && !(await sandboxIndexChanges(repository)).length) return baseline;
 			if (!warmup && [...baseline.version.observations.values()].some(entry => entry.scope === "tree_content")) {
-				const [version, paths] = await Promise.all([
-					repository.versions.validate(baseline.version), sandboxIndexChanges(repository),
-				]);
+				const [version, paths] = await Promise.all([repository.versions.validate(baseline.version), sandboxIndexChanges(repository)]);
 				if (!version.expired && !paths.length) return baseline;
 			}
 		}
@@ -1292,8 +1290,9 @@ async function acquireSandboxBaseline(repository: PooledGitRepository, warmup = 
 					});
 				});
 				// Events and Git stat data can both miss changes: a changed baseline stages the captured objects, or owns a fresh index.
+				// A preparation proves nothing (adoption checks what it read), so it keeps the index and lets Git's stat check stage.
 				if (rebuild || !baseline || !(await stageTreeObjects(repository, version))) {
-					await repository.index(["read-tree", "--empty"]);
+					if (rebuild || !baseline || !warmup) await repository.index(["read-tree", "--empty"]);
 					await repository.index(["add", "-f", "-A", "--", ...snapshotPathspecs()]);
 				}
 				const tree = (await repository.index(["write-tree"])).toString("utf8").trim();
