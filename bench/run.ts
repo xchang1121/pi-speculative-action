@@ -12,6 +12,7 @@ import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager
 import { createSpeculativeActionHost } from "../src/agent-integration.ts";
 import { DEFAULTS } from "../src/common.ts";
 import { createSpeculativeActionExtension } from "../src/extension.ts";
+import { LinuxProcessReuseBackend } from "../src/linux-process-backend.ts";
 import type { SpeculativeActionEvent } from "../src/runtime.ts";
 import { summarizeSpeculativeTrace } from "../src/trace-summary.ts";
 
@@ -50,10 +51,7 @@ const { values } = parseArgs({
 		"drafter-max-depth": { type: "string", default: String(DEFAULTS.drafterMaxDepth) },
 		"candidate-limit": { type: "string", default: String(DEFAULTS.candidateLimit) },
 		"drafter-max-tokens": { type: "string" },
-		"drafter-deterministic-candidates": {
-			type: "string",
-			default: String(DEFAULTS.drafterDeterministicCandidates),
-		},
+		"drafter-deterministic-candidates": { type: "string", default: String(DEFAULTS.drafterDeterministicCandidates) },
 		"drafter-temperature-min": { type: "string", default: String(DEFAULTS.drafterTemperatureMin) },
 		"drafter-temperature-max": { type: "string", default: String(DEFAULTS.drafterTemperatureMax) },
 		"max-concurrent-actions": { type: "string", default: String(DEFAULTS.maxConcurrentActions) },
@@ -253,12 +251,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	const changedFiles = lines((await command("git", ["-C", task.workspace, "diff", "--name-only"])).stdout);
 	const goldFiles = patchFiles(task.row.patch);
 	const testPatchFiles = patchFiles(task.row.test_patch);
-	let patchClean = true;
-	try {
-		await command("git", ["-C", task.workspace, "diff", "--check"]);
-	} catch {
-		patchClean = false;
-	}
+	const patchClean = await command("git", ["-C", task.workspace, "diff", "--check"]).then(() => true, () => false);
 	const coveredGoldFiles = goldFiles.filter((file) => changedFiles.includes(file));
 	const turnLimitReached = turns >= input.maxTurns;
 	const { actor, drafter, repoCache, runRoot, output, prepareOnly, ...configuration } = input;
@@ -276,6 +269,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			timingScope: "setup, Agent prompt, terminal settlement, extension shutdown",
 			patternState: input.patternState ?? "isolated-per-run",
 			executionBoundary: "installed extension routes",
+			processBackend: await processBackendReadiness(),
 			workspace: task.workspace,
 		},
 		summary: {
@@ -400,13 +394,7 @@ function model(value: string): Model<Api> {
 }
 
 function patchFiles(patch: string): string[] {
-	return [
-		...new Set(
-			patch
-				.split(/\r?\n/)
-				.flatMap((line) => (line.startsWith("diff --git a/") ? [line.slice("diff --git a/".length).split(" b/")[0]!] : [])),
-		),
-	];
+	return [...new Set(patch.split(/\r?\n/).flatMap((line) => (line.startsWith("diff --git a/") ? [line.slice("diff --git a/".length).split(" b/")[0]!] : [])))];
 }
 
 function lines(value: string): string[] { return value .split(/\r?\n/) .map((line) => line.trim()) .filter(Boolean); }
@@ -450,4 +438,11 @@ function command(file: string, args: readonly string[], cwd?: string): Promise<C
 			resolve({ stdout, stderr });
 		});
 	});
+}
+
+/** Bash speculation runs only where the installed helpers pass their own check: a run records whether its routes had them. */
+async function processBackendReadiness() {
+	if (process.platform !== "linux") return { state: "unsupported" };
+	const { state, detail } = await new LinuxProcessReuseBackend({ storeRoot: path.join(os.tmpdir(), "pi-bench-backend-check") }).check();
+	return { state, detail };
 }
