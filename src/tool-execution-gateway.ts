@@ -4,22 +4,10 @@ import type { ToolInvocation } from "./tool-settlement.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
 const REUSED_FAILURE = Symbol("reused tool failure");
 import { TimelineInterval, type TimelineDependency } from "./task-timing.ts";
-import {
-	EffectTransactionCoordinator,
-	type EffectTransaction,
-	isPoisonedEffectCommit,
-} from "./effect-transaction.ts";
-import {
-	type CapturedExecutionWorldResult,
-	type ExecutionWorldDiagnosticSnapshot,
-	type ExecutionWorldDiagnosticsContext,
-	ExecutionWorldRouter,
-	type ExecutionWorld,
-	type ExecutionWorldPreparation,
-	type ExecutionOperationBinding,
-	type ExecutionScope,
-	type SpeculativeExecutionRoute,
-} from "./execution-world.ts";
+import { EffectTransactionCoordinator, type EffectTransaction, isPoisonedEffectCommit } from "./effect-transaction.ts";
+import { type CapturedExecutionWorldResult, type ExecutionWorldDiagnosticSnapshot, type ExecutionWorldDiagnosticsContext, ExecutionWorldRouter,
+	type ExecutionWorld, type ExecutionWorldPreparation, type ExecutionOperationBinding, type ExecutionScope,
+	type SpeculativeExecutionRoute } from "./execution-world.ts";
 
 /**
  * Source-neutral description of one concrete tool operation.

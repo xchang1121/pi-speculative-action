@@ -5,19 +5,9 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { imageInterpreter, validateTransferredProcessEvidence } from "../src/linux-process-backend.ts";
 import { descriptorEffects, type ProcessResourceGraph } from "../src/linux-held-exec.ts";
-import {
-	createExecPrototype,
-	dependencyPathsetKey,
-	type DynamicDependency,
-	type OrderedEffectEvent,
-	type ProcessResourceEffects,
-	parseProcessCertificate,
-	processStrongKey,
-	processWeakKey,
-	referencedArtifacts,
-	type ProvenanceTaint,
-	sha256Digest,
-} from "../src/provenance-certificate.ts";
+import { createExecPrototype, dependencyPathsetKey, type DynamicDependency, type OrderedEffectEvent, type ProcessResourceEffects,
+	parseProcessCertificate, processStrongKey, processWeakKey, referencedArtifacts, type ProvenanceTaint,
+	sha256Digest } from "../src/provenance-certificate.ts";
 import { captureAbsenceDependency, captureDirectoryDependency, captureFileDependency, captureMetadataDependency,
 	captureSymlinkDependency, validateDynamicDependencyCertificate, validateProcessCertificate } from "../src/provenance-validation.ts";
 

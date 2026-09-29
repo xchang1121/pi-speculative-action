@@ -14,17 +14,8 @@ import { captureHeldDescriptorInputs } from "../src/linux-held-exec.ts";
 import { captureStableFile, hashExecutableFile } from "../src/filesystem-evidence.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { runThinkThreadTool } from "../src/thinkthread/tool-runner.ts";
-import {
-	captureResourceVersion,
-	invalidateResourceInputs,
-	closeResourceVersionManagers,
-	fingerprintIO,
-	ResourceVersionManager,
-	type ResourceVersionToken,
-	type ResourceInput,
-	releaseResourceVersion,
-	resourceDependencies,
-} from "../src/resource-version.ts";
+import { captureResourceVersion, invalidateResourceInputs, closeResourceVersionManagers, fingerprintIO, ResourceVersionManager,
+	type ResourceVersionToken, type ResourceInput, releaseResourceVersion, resourceDependencies } from "../src/resource-version.ts";
 
 const directories = temporaryDirectories("pi-resource-version-", path.join(process.cwd(), "test"));
 const execFileAsync = promisify(execFile);

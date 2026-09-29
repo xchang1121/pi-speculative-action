@@ -6,18 +6,8 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import { READ_RANGE_ACTION_KEY_PROJECTOR } from "../src/action-key-projection.ts";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { BoundedRecencyMap } from "../src/bounded-recency-map.ts";
-import {
-	acquirePatternAwareStore,
-	patternAwareActionSemantics,
-	applyBindings,
-	applyBindingsVariants,
-	failureClass,
-	inferBindings,
-	PATTERN_AWARE_DEFAULTS,
-	PatternAwareStore,
-	patternAwareSettings,
-	projectPatternAwareObservation,
-} from "../src/pattern-aware.ts";
+import { acquirePatternAwareStore, patternAwareActionSemantics, applyBindings, applyBindingsVariants, failureClass, inferBindings,
+	PATTERN_AWARE_DEFAULTS, PatternAwareStore, patternAwareSettings, projectPatternAwareObservation } from "../src/pattern-aware.ts";
 import { adoptedSettlement, rejectedSettlement, unmatchedSettlement, unobservedSettlement } from "./prediction.ts";
 
 const directories = temporaryDirectories("pi-pattern-");

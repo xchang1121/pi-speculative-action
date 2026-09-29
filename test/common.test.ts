@@ -1,24 +1,10 @@
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { READ_RANGE_ACTION_KEY_PROJECTOR } from "../src/action-key-projection.ts";
-import {
-	type ActionKeyProjector,
-	actionKeyCovers,
-	actionKeyMatch,
-	actionKeyMatches,
-	actionKeyMismatchReason,
-	actionKeyProjectionPartitions,
-	buildActionKey,
-	buildPiActionKey,
-	inferredActionEffect,
-} from "../src/action-semantics.ts";
-import {
-	clampCandidateLimit,
-	DEFAULTS,
-	drafterRequestTemperature,
-	normalizeDrafterRequestSettings,
-	normalizeSpeculativeToolSelection,
-} from "../src/common.ts";
+import { type ActionKeyProjector, actionKeyCovers, actionKeyMatch, actionKeyMatches, actionKeyMismatchReason, actionKeyProjectionPartitions,
+	buildActionKey, buildPiActionKey, inferredActionEffect } from "../src/action-semantics.ts";
+import { clampCandidateLimit, DEFAULTS, drafterRequestTemperature, normalizeDrafterRequestSettings,
+	normalizeSpeculativeToolSelection } from "../src/common.ts";
 import { candidateToolNames } from "../src/runtime.ts";
 
 describe("speculative action common", () => {

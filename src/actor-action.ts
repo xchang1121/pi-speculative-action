@@ -1,17 +1,8 @@
 import { nonNegativeFinite as finite } from "./number-utils.ts";
 import type { ActionKey, ActionKeyMatch } from "./action-semantics.ts";
 import type { AuthoritativeResultCapture } from "./runtime-contracts.ts";
-import {
-	cause,
-	type ActorActionIdentity,
-	type ActorActionProvider,
-	type ActorActionSettlement,
-	type ActorHitTiming,
-	type CandidateRejection,
-	type PredictionAdoption,
-	type PredictionIdentity,
-	type ResolutionCause,
-} from "./settlement.ts";
+import { cause, type ActorActionIdentity, type ActorActionProvider, type ActorActionSettlement, type ActorHitTiming, type CandidateRejection,
+	type PredictionAdoption, type PredictionIdentity, type ResolutionCause } from "./settlement.ts";
 import { TimelineInterval } from "./task-timing.ts";
 
 export interface ActorCandidateSelection<Candidate extends { readonly id: string }, Output> {

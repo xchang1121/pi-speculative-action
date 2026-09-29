@@ -411,6 +411,8 @@ interface CandidateRecord<Output, StartInput = unknown, StateData = unknown> {
 	previews?: Set<ActorPreviewRecord>;
 	onOperationAdopted?: (adoption: ExecutionOperationAdoption) => void;
 	acceptOperationScope?: (scope: ExecutionScope, salvage?: boolean) => boolean;
+	/** Left running after its prediction settled: its process results stay salvageable. */
+	salvaging?: boolean;
 	validationMs: number;
 	validationBytes: number;
 	validationFiles: number;
@@ -1327,8 +1329,8 @@ export function makeSpeculativeActionRuntime<
 			queueCandidateContinuations(session, session.plan.consumers(candidate.id), candidate, output, "execution_succeeded");
 			trimResults(session, candidate.owner.settings);
 			queueCandidateEvent(session, candidate);
-			if (candidate.owner.draft.type === "operation" && candidate.actorAdopted)
-				retireUndemandedCandidate(session, candidate, cause("retention", "operation_adopted"));
+			if (candidate.owner.draft.type === "operation" && candidate.actorAdopted || candidate.salvaging)
+				retireUndemandedCandidate(session, candidate, cause("retention", candidate.salvaging ? "prediction_horizon_settled" : "operation_adopted"));
 		} catch (error) {
 			if (candidate.work.execution.status !== "succeeded") await session.lifecycle.release(branch);
 			const failure =
@@ -1493,6 +1495,15 @@ export function makeSpeculativeActionRuntime<
 	const retireUndemandedCandidate = (session: Session, candidate: Candidate, failure: ResolutionCause): void => {
 		if (!reservationAvailable(candidate.work.reservation) || candidate.previews?.size || session.plan.consumers(candidate.id).length) return;
 		if (candidate.owner.draft.type === "operation" && candidate.actorAdopted && candidate.work.execution.status === "running") return;
+		// Process work the Actor may still call (another parent, a later turn) finishes if it can within the salvage window.
+		const state = candidate.work.execution;
+		if (state.status === "running" && candidate.owner.draft.type === "tool_call" && candidate.route.isolation === "runtime_sandbox" && candidate.acceptOperationScope &&
+			performance.now() - state.startedAt + candidate.expectedDurationMs < SALVAGE_MS) {
+			// An estimate can be wrong (a server never exits): the window bounds the work as well as its result.
+			if (!candidate.salvaging) setTimeout(() => { if (candidate.work.execution.status === "running") discardCandidate(session, candidate, failure); },
+				SALVAGE_MS - (performance.now() - state.startedAt)).unref?.();
+			candidate.salvaging = true; return;
+		}
 		if (candidate.work.execution.status === "queued" || candidate.work.reservation.kind === "exclusive" ||
 			(candidate.origin === "actor_preview" && !candidate.actorAdopted)) discardCandidate(session, candidate, failure, false);
 	};

@@ -1,24 +1,9 @@
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { resourceDependencies } from "../src/resource-version.ts";
-import {
-	type ActionKeyProjector,
-	type ActionSemanticsDefinition,
-	ActionSemanticsRegistry,
-	actionKeyCovers,
-	actionKeyMatch,
-	actionKeyMismatchReason,
-	BASH_TIMEOUT_ACTION_KEY_PROJECTOR,
-	buildActionKey,
-	buildPiActionKey,
-	GREP_LITERAL_ACTION_KEY_PROJECTOR,
-	KEYABLE_TOOLS,
-	OBSERVATION_ACTION_TOOLS,
-	PI_ACTION_SEMANTICS,
-	READ_RANGE_ACTION_KEY_PROJECTOR,
-	UNBOUNDED_ACTION_TOOLS,
-	WORKSPACE_MUTATION_ACTION_TOOLS,
-} from "../src/action-semantics.ts";
+import { type ActionKeyProjector, type ActionSemanticsDefinition, ActionSemanticsRegistry, actionKeyCovers, actionKeyMatch, actionKeyMismatchReason,
+	BASH_TIMEOUT_ACTION_KEY_PROJECTOR, buildActionKey, buildPiActionKey, GREP_LITERAL_ACTION_KEY_PROJECTOR, KEYABLE_TOOLS, OBSERVATION_ACTION_TOOLS,
+	PI_ACTION_SEMANTICS, READ_RANGE_ACTION_KEY_PROJECTOR, UNBOUNDED_ACTION_TOOLS, WORKSPACE_MUTATION_ACTION_TOOLS } from "../src/action-semantics.ts";
 import { PI_BASH_TIMEOUT_PROJECTION_RULE, PI_GREP_LITERAL_PROJECTION_RULE, piToolErrorSettlement } from "../src/pi-tool-invocation.ts";
 import { RESOURCE_OBSERVATION_EFFECTS, UNRESTRICTED_PROCESS_EFFECTS, WORKSPACE_PATH_MUTATION_EFFECTS } from "../src/effect-model.ts";
 
