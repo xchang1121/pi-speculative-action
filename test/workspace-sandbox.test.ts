@@ -53,6 +53,29 @@ describe("workspace-branch ExecutionWorld", () => {
 			} finally { await child.dispose(); }
 		} finally { await branch.dispose(); }
 	});
+	it("resets a returned filesystem-tool worktree to its baseline for the next actions", async () => {
+		const root = await temporaryRoot(), world = sandbox.createExecutionWorld({ inPlaceMutations: false }), at = (name: string) => path.join(root, name);
+		await writeFile(at("a"), "base\n"); await writeFile(at("b"), "linked\n"); await link(at("b"), at("c"));
+		vi.mocked(mkdtemp).mockClear();
+		await (await world.speculation.execute(boundContext(root, async (view) => {
+			for (const name of ["a", "b", "dir/new"]) { if (name === "dir/new") await view.mkdir!(at("dir")); await view.writeFile!(at(name), "first\n"); }
+			return settlement("first");
+		}))).dispose();
+		const { prepared } = await Reflect.get(sandbox, "state").repositories.values().next().value;
+		await expect(stat(path.join((await prepared.workspace).sandboxRoot, "dir"))).rejects.toThrow(); // Reset in place, created paths gone.
+		for (let round = 0; round < 2; round++) {
+			const next = await world.speculation.execute(boundContext(root, async (view) => {
+				return settlement((await Promise.all(["a", "b", "c"].map(async (name) => (await view.readFile(at(name))).toString()))).join(""));
+			}));
+			await expect(next.commit()).resolves.toEqual(settlement("base\nlinked\nlinked\n")); await next.dispose();
+		}
+		await rm(at("c")); await writeFile(at("c"), "linked\n"); // The source unlinks equal bytes: Git alone would keep the old link.
+		await sandbox.withWorkspace(root, async ({ sandboxRoot }) => {
+			const [b, c] = await Promise.all(["b", "c"].map(name => stat(path.join(sandboxRoot, name), { bigint: true })));
+			expect(b.ino).not.toBe(c.ino);
+		});
+		expect(vi.mocked(mkdtemp).mock.calls.filter(([prefix]) => String(prefix).endsWith(`${path.sep}action-`))).toHaveLength(1);
+	});
 	it("edits in memory over the workspace itself, committing only unchanged inputs and refusing late requests", async () => {
 		const root = await temporaryRoot(), file = path.join(root, "a.txt"), world = sandbox.createExecutionWorld();
 		await writeFile(file, "one two\n");
@@ -1150,7 +1173,8 @@ describe("workspace-branch ExecutionWorld", () => {
 			await third;
 			expect(observations).toHaveBeenCalledTimes(1); // Immutable preparation remains reusable; adoption proves its inputs.
 			gate.release(); await Promise.all(pending);
-			expect(removals).toBe(1);
+			const owned = [repository.spare?.workspace, await repository.prepared?.workspace].filter(item => item?.processRoot === heldRoot);
+			expect(removals + owned.length).toBe(1); // Retired once: removed, or kept for reset.
 			expect(await sandbox.withWorkspace(root, ({ sandboxRoot }) => readFile(path.join(sandboxRoot, "value.txt"), "utf8")))
 				.toBe("after\n");
 		} finally {
