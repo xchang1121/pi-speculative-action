@@ -24,11 +24,11 @@ export class ClosedSearchProcessPool {
 	async run(role, operation, signal) {
 		assert.ok(!this.#retirement && (role === "actor" || role === "producer"), "search pool retired or invalid role");
 		signal?.throwIfAborted();
-		// Actor use reserves borrowed producer capacity; predictions leave that reservation available.
+		// Actor use borrows idle producer capacity and replaces it at once: a reconstructing adoption never forks on its path.
 		const idleRole = role === "actor" && !this.#idle.has(role) && this.#idle.has("producer") ? "producer" : role;
 		const worker = this.#idle.get(idleRole) ?? this.#launch(idleRole), controller = new AbortController();
 		const executionSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
-		this.#idle.delete(idleRole);
+		this.#idle.delete(idleRole); if (idleRole !== role) this.#launch(idleRole);
 		const execution = Promise.resolve().then(() => { executionSignal.throwIfAborted(); return operation(worker, executionSignal); });
 		const lease = { role, execution, controller };
 		this.#workers.set(worker, lease);
