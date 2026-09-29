@@ -242,6 +242,7 @@ export class LinuxProcessReuseBackend {
 	private readonly childRunMs = new BoundedRecencyMap<string, readonly number[]>(512);
 	/** Executable entries of a PATH directory, by the directory's identity and the exclusions (see createProcessInterposition). */
 	private readonly executableEntries = new BoundedRecencyMap<string, readonly string[]>(64);
+	private sharedInterposition?: SharedInterposition;
 	private readonly counters: MutableLinuxProcessReuseMetrics = { ...emptyWorldReuseMetrics() };
 	private readonly actorCounters: MutableLinuxProcessReuseMetrics = { ...emptyWorldReuseMetrics() };
 	private readonly replayWorkspace = new WorkspaceSandboxService();
@@ -509,6 +510,12 @@ export class LinuxProcessReuseBackend {
 					dispatcherBinary: ready.dispatcher,
 					excludedExecutables: [input.invocation.shell, process.execPath, ready.dispatcher, ready.sandlock, ready.strace],
 					executableEntries: this.executableEntries,
+					shared: this.sharedInterposition ??= { views: new BoundedRecencyMap(64), root: mkdtemp(path.join(os.tmpdir(), "pi-spec-interposition-")).then(async (shared) => {
+						await mkdir(path.join(shared, "session"));
+						await copyFile(ready.dispatcher, path.join(shared, "dispatcher"));
+						await chmod(path.join(shared, "dispatcher"), 0o755);
+						return shared;
+					}) },
 				}).then(interposition => {
 					session.signal?.throwIfAborted();
 					session.interposition = interposition;
@@ -546,7 +553,8 @@ export class LinuxProcessReuseBackend {
 		if (this.disposal) return this.disposal;
 		this.disposed = true;
 		this.handoffs.dispose();
-		return this.disposal = this.resetActorReplay().finally(() => this.replayWorkspace.dispose());
+		const shared = this.sharedInterposition?.root.then((root) => rm(root, { recursive: true, force: true }), () => undefined);
+		return this.disposal = this.resetActorReplay().finally(() => Promise.all([this.replayWorkspace.dispose(), shared]));
 	}
 
 	private async resolveReady(): Promise<ReadyBackend> {
@@ -2102,6 +2110,14 @@ function wireOutput(output: readonly BufferedOutput[]): readonly { readonly fd: 
 	return output.map((event) => ({ fd: event.fd, data: event.data.toString("base64") }));
 }
 
+/** Exec-only views of PATH directories outside the workspace, shared by every session: one per directory state. A session supplies
+ * its broker through `session/`, the fixed path every view's sidecar names, mounted over from its private root. */
+interface SharedInterposition {
+	readonly root: Promise<string>;
+	readonly views: BoundedRecencyMap<string, Promise<InterposedView | undefined>>;
+}
+interface InterposedView { readonly view: string; readonly shadow: string; readonly names: readonly string[]; readonly dependency: DynamicDependency }
+
 async function createProcessInterposition(input: {
 	readonly gitDirectory?: string;
 	readonly privateRoot: string;
@@ -2116,82 +2132,26 @@ async function createProcessInterposition(input: {
 	readonly dispatcherBinary: string;
 	readonly excludedExecutables: readonly string[];
 	readonly executableEntries: BoundedRecencyMap<string, readonly string[]>;
+	readonly shared: SharedInterposition;
 }) {
-	const root = path.join(input.privateRoot, "process-interposition");
-	const viewRoot = path.join(root, "views");
-	const shadowRoot = path.join(root, "originals");
-	await Promise.all([mkdir(viewRoot, { recursive: true }), mkdir(shadowRoot, { recursive: true })]);
-	const launcher = path.join(root, "dispatcher");
-	await copyFile(input.dispatcherBinary, launcher);
-	await chmod(launcher, 0o755);
-	const directories: InterposedDirectory[] = [];
-	const seenTargets = new Set<string>();
-	for (const rawDirectory of input.pathValue.split(path.delimiter)) {
-		input.signal?.throwIfAborted();
-		if (!rawDirectory || !path.isAbsolute(rawDirectory)) continue;
-		const logicalDirectory = path.resolve(rawDirectory);
-		if (seenTargets.has(logicalDirectory)) continue;
-		seenTargets.add(logicalDirectory);
-		const projected = input.projection.toPhysical(logicalDirectory) ?? logicalDirectory;
-		let source: string;
-		try { source = await realpath(projected); if (!(await lstat(source)).isDirectory()) continue; } catch {
-			continue;
-		}
-		const index = directories.length.toString().padStart(3, "0");
-		const shadow = path.join(shadowRoot, index);
-		if ([logicalDirectory, source, shadow].some((value) => /[\r\n]/.test(value))) continue;
-		directories.push({ source, target: logicalDirectory, shadow, view: path.join(viewRoot, index) });
-	}
+	const shared = await input.shared.root, root = path.join(input.privateRoot, "process-interposition");
+	await mkdir(root, { recursive: true });
 	const configurationPath = path.join(root, "configuration");
 	input.signal?.throwIfAborted();
-	if (/[\r\n]/.test(input.socketPath + input.token + configurationPath)) throw new Error("dispatcher configuration cannot hold a line break");
+	if (/[\r\n]/.test(input.socketPath + input.token + shared)) throw new Error("dispatcher configuration cannot hold a line break");
 	await writeFile(configurationPath, `${input.socketPath}\n${input.token}\n`, { mode: 0o600 });
-
-	const excluded = new Set<string>();
-	for (const candidate of input.excludedExecutables) {
-		try {
-			excluded.add(await realpath(candidate));
-		} catch {
-			// A missing exclusion cannot be executed.
-		}
-	}
-	const executables: Array<readonly [string, string]> = [];
-	const execMounts: ExecMount[] = [];
-	const dependencies: DynamicDependency[] = [];
-	const sources = new Map<string, InterposedDirectory[]>();
-	for (const directory of directories) {
-		const aliases = sources.get(directory.source) ?? [];
-		aliases.push(directory);
-		sources.set(directory.source, aliases);
-	}
-	let mountBytes = 0;
-	for (const [source, aliases] of sources) {
-		for (const directory of aliases) {
-			input.signal?.throwIfAborted();
-			await Promise.all([mkdir(directory.shadow, { recursive: true }), mkdir(directory.view, { recursive: true })]);
-			await writeFile(
-				path.join(directory.view, ".pi-spec-dispatch"),
-				["PI_SPEC_DISPATCH", configurationPath, directory.target, directory.shadow, ""].join("\n"),
-				{ mode: 0o600 },
-			);
-		}
-		let entries: string[], identity: string;
-		try {
-			// Adding, removing or renaming an entry changes the directory's times; a stale list only leaves a new entry native.
-			const info = await stat(source, { bigint: true });
-			identity = [source, info.dev, info.ino, info.mtimeNs, info.ctimeNs, ...[...excluded].sort()].join("\0");
-			entries = await readdir(source);
-		} catch {
-			continue;
-		}
-		// Each mapping is a sandbox argument: a directory past the budget (a WSL PATH carries thousands of Windows
-		// executables) stays native as a whole rather than overflow ARG_MAX.
-		const bytes = aliases.reduce((sum, { target, view }) => sum + entries.reduce((total, name) => total + 2 * name.length + target.length + view.length + 16, 0), 0);
-		if ((mountBytes += bytes) > MAX_INTERPOSED_MOUNT_BYTES) { mountBytes -= bytes; continue; }
-		// Each physical entry is probed once per directory state; aliases retain independent exec-only mappings.
-		// Bound preparation and settle every alias link before capturing directory evidence.
-		let executableNames = input.executableEntries.get(identity);
-		if (!executableNames) {
+	const excluded = [...new Set(await Promise.all(input.excludedExecutables.map(candidate => realpath(candidate).catch(() => undefined))))]
+		.filter((candidate): candidate is string => candidate !== undefined).sort(); // A missing exclusion cannot be executed.
+	const directories: InterposedDirectory[] = [], executables: Array<readonly [string, string]> = [], execMounts: ExecMount[] = [];
+	const dependencies: DynamicDependency[] = [], seenTargets = new Set<string>();
+	let mountBytes = 0, local = 0;
+	// Each view is a directory of hard links to one dispatcher copy, a sidecar naming its routing, and the shadow its natives run from.
+	const build = async (view: string, shadow: string, source: string, target: string, entries: readonly string[], identity: string, launcher: string) => {
+		await Promise.all([mkdir(shadow, { recursive: true }), mkdir(view, { recursive: true })]);
+		await writeFile(path.join(view, ".pi-spec-dispatch"), ["PI_SPEC_DISPATCH", path.join(shared, "session", "configuration"), target, shadow, ""].join("\n"), { mode: 0o600 });
+		// Each physical entry is probed once per directory state.
+		let names = input.executableEntries.get(identity);
+		if (!names) {
 			const probed: string[] = [];
 			await mapFilesystem(entries, async (name) => {
 				input.signal?.throwIfAborted();
@@ -2199,40 +2159,71 @@ async function createProcessInterposition(input: {
 				const sourceEntry = path.join(source, name);
 				try {
 					const resolved = await realpath(sourceEntry);
-					if ((await lstat(resolved)).isFile() && !excluded.has(resolved)) { await access(sourceEntry, fsConstants.X_OK); probed.push(name); }
+					if ((await lstat(resolved)).isFile() && !excluded.includes(resolved)) { await access(sourceEntry, fsConstants.X_OK); probed.push(name); }
 				} catch {
 					// Unproved entries remain visible through the original directory.
 				}
 			});
-			input.executableEntries.set(identity, executableNames = probed);
+			input.executableEntries.set(identity, names = probed);
 		}
-		await mapFilesystem(executableNames, async (name) => {
-			input.signal?.throwIfAborted();
-			for (const directory of aliases) {
-				const viewEntry = path.join(directory.view, name);
-				try {
-					await link(launcher, viewEntry);
-					const intercepted = path.join(directory.target, name);
-					executables.push([intercepted, path.join(directory.shadow, name)]);
-					executables.push([viewEntry, path.join(directory.shadow, name)]);
-					execMounts.push({ virtualPath: intercepted, hostPath: viewEntry });
-				} catch {
-					// One unavailable view cannot suppress another alias's mapping.
-				}
-			}
-		});
+		const linked: string[] = [];
+		await mapFilesystem(names, async (name) => { await link(launcher, path.join(view, name)).then(() => linked.push(name), () => undefined); });
+		const dependency = await captureDirectoryDependency(source, input.projection.isWorkspacePhysical(source) ? input.projection.toLogical(source) : slash(source), true,
+			path.resolve(source) === path.resolve(input.workspaceRoot) ? input.workspaceExcludes : []);
+		return { view, shadow, names: linked, dependency };
+	};
+	for (const rawDirectory of input.pathValue.split(path.delimiter)) {
 		input.signal?.throwIfAborted();
-		dependencies.push(
-			await captureDirectoryDependency(
-				source,
-				input.projection.isWorkspacePhysical(source) ? input.projection.toLogical(source) : slash(source),
-				true,
-				path.resolve(source) === path.resolve(input.workspaceRoot) ? input.workspaceExcludes : [],
-			),
-		);
+		if (!rawDirectory || !path.isAbsolute(rawDirectory)) continue;
+		const target = path.resolve(rawDirectory);
+		if (seenTargets.has(target)) continue;
+		seenTargets.add(target);
+		const projected = input.projection.toPhysical(target) ?? target;
+		let source: string, entries: string[], identity: string;
+		try {
+			source = await realpath(projected);
+			// Adding, removing or renaming an entry changes the directory's times; a stale list only leaves a new entry native.
+			const info = await stat(source, { bigint: true });
+			if (!info.isDirectory()) continue;
+			// Aliases of one directory share its probe; each keeps its own view.
+			identity = [source, info.dev, info.ino, info.mtimeNs, info.ctimeNs, ...excluded].join("\0");
+			entries = await readdir(source);
+		} catch {
+			continue;
+		}
+		if ([target, source].some((value) => /[\r\n]/.test(value))) continue;
+		// Each mapping is a sandbox argument: a directory past the budget (a WSL PATH carries thousands of Windows
+		// executables) stays native as a whole rather than overflow ARG_MAX.
+		const bytes = entries.reduce((total, name) => total + 2 * name.length + target.length + shared.length + 96, 0);
+		if ((mountBytes += bytes) > MAX_INTERPOSED_MOUNT_BYTES) { mountBytes -= bytes; continue; }
+		let interposed: InterposedView | undefined;
+		if (input.projection.isWorkspacePhysical(source)) {
+			// A directory inside this workspace sandbox is this session's own.
+			const index = String(local++).padStart(3, "0"), launcher = path.join(root, "dispatcher");
+			if (local === 1) { await copyFile(input.dispatcherBinary, launcher); await chmod(launcher, 0o755); }
+			interposed = await build(path.join(root, "views", index), path.join(root, "originals", index), source, target, entries, identity, launcher);
+		} else {
+			const key = sha256Digest(`${target}\0${identity}`).slice("sha256:".length, "sha256:".length + 32);
+			let pending = input.shared.views.get(key);
+			if (!pending) {
+				pending = build(path.join(shared, "views", key), path.join(shared, "originals", key), source, target, entries, identity, path.join(shared, "dispatcher"))
+					.catch(() => undefined);
+				input.shared.views.set(key, pending);
+			}
+			interposed = await pending;
+		}
+		if (!interposed) continue;
+		directories.push({ source, target, shadow: interposed.shadow, view: interposed.view });
+		dependencies.push(interposed.dependency);
+		for (const name of interposed.names) {
+			const intercepted = path.join(target, name), viewEntry = path.join(interposed.view, name), native = path.join(interposed.shadow, name);
+			executables.push([intercepted, native], [viewEntry, native]);
+			execMounts.push({ virtualPath: intercepted, hostPath: viewEntry });
+		}
 	}
 	const mounts = uniqueSandboxMounts([
 		...directories.map(({ shadow, source }) => ({ virtualPath: shadow, hostPath: source, readOnly: true })),
+		{ virtualPath: path.join(shared, "session"), hostPath: root, readOnly: true },
 		{ virtualPath: input.sourceRoot, hostPath: input.workspaceRoot, readOnly: false },
 		...(input.gitDirectory ? [{ virtualPath: input.gitDirectory, hostPath: input.gitDirectory, readOnly: true }] : []),
 	]);
