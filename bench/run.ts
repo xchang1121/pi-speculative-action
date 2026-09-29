@@ -61,6 +61,8 @@ const { values } = parseArgs({
 		"timeout-ms": { type: "string", default: "900000" },
 		"repo-cache": { type: "string" },
 		"run-root": { type: "string" },
+		// A fixed run directory name: a replayed tape needs the recorded working directory, which the system prompt names.
+		"run-name": { type: "string" },
 		output: { type: "string" },
 		"pattern-state": { type: "string" },
 		"drafter-disabled": { type: "boolean", default: false },
@@ -139,7 +141,8 @@ async function prepareTask(input: BenchmarkOptions) {
 	const benchmarkRef = `refs/bench/${safeName(row.instance_id)}`;
 	await command("git", ["-C", cache, "rev-parse", "--verify", "--quiet", `${benchmarkRef}^{commit}`]).catch(() =>
 		command("git", ["-C", cache, "fetch", "--force", "--depth=1", "origin", `+${row.base_commit}:${benchmarkRef}`]));
-	const runDirectory = await mkdtemp(path.join(input.runRoot, `${safeName(row.instance_id)}-`));
+	const runDirectory = values["run-name"] ? path.join(input.runRoot, safeName(values["run-name"])) : await mkdtemp(path.join(input.runRoot, `${safeName(row.instance_id)}-`));
+	if (values["run-name"]) await mkdir(runDirectory); // Fails on an existing directory rather than reuse its contents.
 	const workspace = path.join(runDirectory, "workspace");
 	await command("git", ["clone", "--no-checkout", cache, workspace]);
 	await command("git", ["-C", workspace, "config", "core.longpaths", "true"]);

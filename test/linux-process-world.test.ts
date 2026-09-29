@@ -43,6 +43,9 @@ describe("Linux process ExecutionWorld", () => {
 		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-live-process-");
 		let host: ReturnType<typeof createSpeculativeActionHost> | undefined;
+		// Join admission is the scheduler's timing policy, tested on its own: under load it may prefer native, which is not what this tests.
+		const assess = SpeculationScheduler.prototype.assessCandidateJoin, admitted = vi.spyOn(SpeculationScheduler.prototype, "assessCandidateJoin")
+			.mockImplementation(function (this: SpeculationScheduler<object>, request) { const decision = assess.call(this, request); return request.state === "running" ? { ...decision, allowed: true } : decision; });
 		try {
 			await prepareLinuxProcessReuse(fixture);
 			if (!(await Reflect.get(fixture.backend, "ready")).imageLibrary) return skip("native process image capture is unavailable");
@@ -213,7 +216,7 @@ int main(int argc, char **argv) {
 			await expect.poll(() => existsSync(`/proc/${privatePid}`), { timeout: 5_000 }).toBe(false); // Retirement kills asynchronously, as for cancel.
 			if (resumed) expect(events.filter(event => event.type === "operation_prediction"), diagnostic()).toContainEqual(expect.objectContaining({ settlement: expect.objectContaining({
 				observation: "observed", match: expect.objectContaining({ matched: true, adoption: expect.objectContaining({ status: "adopted" }) }) }) }));
-		} finally { await host?.dispose(); await fixture.dispose(); }
+		} finally { admitted.mockRestore(); await host?.dispose(); await fixture.dispose(); }
 	});
 
 	test("transfers native Bash FD inputs to filesystem tools across turns with exact invalidation", { timeout: 30_000 }, async ({ skip }) => {
