@@ -42,7 +42,8 @@ export interface ServiceTimingIdentity {
 export interface CandidateJoinPolicy {
 	/** Required estimated Actor critical-path saving before waiting for unfinished work. */
 	readonly minNetBenefitMs: number;
-	/** Initial Actor wait cap; omission preserves eager adoption while a route learns. */
+	/** Actor wait cap before any Actor service of the route is known (default: the warm-up allowance). Waiting without bound
+	 * adopts every such result, so the native service is never sampled and the route never learns that it was faster. */
 	readonly uncalibratedWaitMs?: number;
 	/** Uncertainty allowance added to the estimated remaining-time deadline during warm-up. */
 	readonly warmupWaitMs: number;
@@ -346,7 +347,7 @@ export class SpeculationScheduler<Job extends object> {
 		}
 
 		if (expectedActorMs === undefined) {
-			const waitBudgetMs = policy.uncalibratedWaitMs ?? Number.POSITIVE_INFINITY;
+			const waitBudgetMs = policy.uncalibratedWaitMs ?? policy.warmupWaitMs;
 			return { allowed: waitBudgetMs > 0, reason: "warmup_probe", waitBudgetMs, ...base };
 		}
 		const actorDeadlineMs = Math.max(0, expectedActorMs - expectedAdoptionMs - policy.minNetBenefitMs);
