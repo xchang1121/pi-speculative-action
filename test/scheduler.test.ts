@@ -327,15 +327,13 @@ describe("SpeculationScheduler", () => {
 	});
 
 	it("bounds an uncalibrated join while wider timing classes transfer across exact actions", () => {
-		const scheduler = new SpeculationScheduler<object>({
-			candidateJoinPolicy: { warmupWaitMs: 17 },
-		});
+		const scheduler = new SpeculationScheduler<object>({ candidateJoinPolicy: { warmupWaitMs: 17 } });
 		const first = { tool: "bash", executionFingerprint: "linux-world", actionKeyHash: "parent-a" };
 		const second = { ...first, actionKeyHash: "parent-b" };
 		expect(joinDecision(scheduler, first)).toMatchObject({
 			allowed: true,
 			reason: "warmup_probe",
-			waitBudgetMs: Number.POSITIVE_INFINITY,
+			waitBudgetMs: 17, // No Actor service yet: wait only the warm-up allowance, then sample the native run.
 			actorSamples: 0,
 		});
 		scheduler.observeActorService(first, 100);
