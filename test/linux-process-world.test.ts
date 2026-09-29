@@ -657,10 +657,8 @@ int main(int argc, char **argv) {
 				const repeatedScope = { ...scope, turnID }; let output = "";
 				const previousMs = binding!.executionMs;
 				const action = PI_ACTION_SEMANTICS.buildKey("bash", { command }, fixture.workspace, "binding")!;
-				await fixture.world.observeOperations!({ action, scope: repeatedScope, learn: true }, () => route.executor.execute({
-					command: command.replace("parent", turnID), cwd: fixture.workspace, environment: fixture.environment,
-					scope: repeatedScope, onData: data => { output += data.toString(); },
-				}), bindings => { retainedOperation ??= bindings.find(item => item.identity === binding!.key); });
+				await fixture.world.observeOperations!({ action, scope: repeatedScope, learn: true }, () => route.executor.execute({ command: command.replace("parent", turnID),
+					cwd: fixture.workspace, environment: fixture.environment, scope: repeatedScope, onData: data => { output += data.toString(); } }), bindings => { retainedOperation ??= bindings.find(item => item.identity === binding!.key); });
 				expect(binding!.executionMs).not.toBe(previousMs);
 				expect(retainedOperation).toMatchObject({ executionMs: binding!.executionMs, expectedDurationMs: binding!.executionMs });
 				expect(output).toBe(`${turnID}\nafter\n`);
@@ -1127,6 +1125,14 @@ int main(int argc,char **argv) {
 				const executor = held({ descriptors: true, decide: async () => ({ kind: "continue" }) });
 				expect(await executor.execute(`exec './packet-capture' ${type}`)).toEqual({ exitCode: 0 });
 			}
+			// A vfork parent cannot stop until its child execs: a sibling's exec decision must not wait for it (cargo build scripts hung).
+			await writeFile(path.join(root, "spawner.c"), `#include <sys/syscall.h>\n#include <sys/wait.h>\n#include <time.h>\n#include <unistd.h>
+int main(void) { int status; struct timespec pause = {0, 300000000}; pid_t sibling = fork(), child;
+	if (!sibling) { usleep(50000); execl("/bin/true", "true", (char *)0); _exit(1); }
+	if (!(child = vfork())) { syscall(SYS_nanosleep, &pause, 0); execl("/bin/true", "true", (char *)0); _exit(1); }
+	return waitpid(child, &status, 0) != child || status || waitpid(sibling, &status, 0) != sibling || status; }\n`);
+			await compileBenchmarkHelper(root, { source: "spawner.c", output: "spawner" });
+			expect(await held({ descriptors: true, decide: async () => ({ kind: "continue" }) }).execute("exec ./spawner")).toEqual({ exitCode: 0 });
 			const compat = path.join(root, "compat32");
 			await writeFile(`${compat}.s`, ".global _start\n_start: movl $1, %eax; movl $7, %ebx; int $0x80\n");
 			execFileSync("cc", ["-nostdlib", "-m32", "-static", `${compat}.s`, "-o", compat]);
@@ -1714,15 +1720,9 @@ int main(void) { char path[32] = "/bin/true\\0intact"; char *args[] = {path, 0};
 		});
 		const planner = vi.spyOn(fixture.backend.planner, "plan");
 		const observed = vi.spyOn(SpeculationScheduler.prototype, "observeActorService");
-		const admission = vi.spyOn(SpeculationScheduler.prototype, "assessCandidateJoin").mockReturnValue({
-			allowed: false, reason: "fallback_faster", waitBudgetMs: 0,
-			speculativeSamples: 1, actorSamples: 1, adoptionSamples: 1,
-			expectedRemainingMs: 0, expectedAdoptionMs: 100,
-			expectedActorMs: 10, expectedNetBenefitMs: -90,
-		});
-		const processInvocation = resolvePiToolInvocation("bash", { command: ":" }, {
-			cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath,
-		})!.process!;
+		const admission = vi.spyOn(SpeculationScheduler.prototype, "assessCandidateJoin").mockReturnValue({ allowed: false, reason: "fallback_faster", waitBudgetMs: 0,
+			speculativeSamples: 1, actorSamples: 1, adoptionSamples: 1, expectedRemainingMs: 0, expectedAdoptionMs: 100, expectedActorMs: 10, expectedNetBenefitMs: -90 });
+		const processInvocation = resolvePiToolInvocation("bash", { command: ":" }, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath })!.process!;
 		const invocation = vi.fn(() => processInvocation);
 		const coordinator = new ProcessExecutionCoordinator(host, {
 			enabled: () => true,
@@ -2212,10 +2212,7 @@ int main(void) { char path[32] = "/bin/true\\0intact"; char *args[] = {path, 0};
 		const binding = registry.observe(sha256Digest("cost"), "/worker", scope, null, 10)!;
 		const close = vi.fn(async (workspace: string) => { ownedAtClose = existsSync(workspace); });
 		vi.spyOn(backend, "open").mockImplementation(async ({ workspace }) => ({
-			ownership,
-			executeBinding: async () => { throw new Error("unexpected process binding"); },
-			executionBindings: () => [binding],
-			computationDependencies: () => [],
+			ownership, executeBinding: async () => { throw new Error("unexpected process binding"); }, executionBindings: () => [binding], computationDependencies: () => [],
 			executor: { execute: async (request) => { payload = `opaque bytes: ${workspace.sandboxRoot}`; request.onData(Buffer.from(payload)); return { exitCode: exit }; } },
 			metrics: emptyWorldReuseMetrics, seal: async () => [], close: () => close(workspace.sandboxRoot),
 			validate: async () => ({ status: "valid", metrics: { durationMs: 0, bytesRead: 0, filesRead: 0, mode: "exact" } }),
