@@ -4,10 +4,8 @@ import { formatThrownValue } from "@earendil-works/pi-ai";
 import { toolErrorSettlement } from "../src/tool-settlement.ts";
 import { qualifyStockTool, STOCK_TOOL_CASES } from "../bench/stock-tool-qualification.ts";
 import { runThinkThreadTool } from "../src/thinkthread/tool-runner.ts";
-import {
-	decodeThinkThreadToolRunnerRequest, decodeThinkThreadToolRunnerResponse,
-	encodeThinkThreadToolRunnerRequest, encodeThinkThreadToolRunnerResponse,
-} from "../src/thinkthread/tool-runner-protocol.ts";
+import { decodeThinkThreadToolRunnerRequest, decodeThinkThreadToolRunnerResponse,
+	encodeThinkThreadToolRunnerRequest, encodeThinkThreadToolRunnerResponse } from "../src/thinkthread/tool-runner-protocol.ts";
 
 vi.mock("node:fs/promises", { spy: true });
 

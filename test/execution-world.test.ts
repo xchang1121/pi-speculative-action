@@ -1,12 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { testBranch } from "./branch.ts";
 import { buildPiActionKey, KEYABLE_TOOLS, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
-import {
-	type EffectCapabilities,
-	RESOURCE_OBSERVATION_EFFECTS,
-	UNRESTRICTED_PROCESS_EFFECTS,
-	WORKSPACE_PATH_MUTATION_EFFECTS,
-} from "../src/effect-model.ts";
+import { type EffectCapabilities, RESOURCE_OBSERVATION_EFFECTS, UNRESTRICTED_PROCESS_EFFECTS,
+	WORKSPACE_PATH_MUTATION_EFFECTS } from "../src/effect-model.ts";
 import type { ExecutionWorld, ExecutionWorldDiagnosticSnapshot, SpeculativeExecution } from "../src/execution-world.ts";
 import { executionCapabilityStatus, ExecutionWorldRouter, sameSpeculativeExecutionRoute } from "../src/execution-world.ts";
 

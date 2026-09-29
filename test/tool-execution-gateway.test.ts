@@ -1,10 +1,7 @@
 import { gated, nextTurn } from "./async.ts";
 import { testBranch } from "./branch.ts";
 import { describe, expect, it, vi } from "vitest";
-import {
-	UNRESTRICTED_PROCESS_EFFECTS,
-	WORKSPACE_PATH_MUTATION_EFFECTS,
-} from "../src/effect-model.ts";
+import { UNRESTRICTED_PROCESS_EFFECTS, WORKSPACE_PATH_MUTATION_EFFECTS } from "../src/effect-model.ts";
 import type { ExecutionWorld } from "../src/execution-world.ts";
 import { effectCommitFailure } from "../src/effect-transaction.ts";
 import { ToolExecutionGateway, type ToolOperation, type AuthoritativeExecutionSettlement } from "../src/tool-execution-gateway.ts";

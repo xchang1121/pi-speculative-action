@@ -4,25 +4,15 @@ import os from "node:os";
 import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { createReadTool } from "@earendil-works/pi-coding-agent";
-import {
-	type AgentPosixClient,
-	parseFsPayloadId,
-	parseFsSnapshotId,
-	parseRequestId,
-	parseThinkThreadId,
-} from "@thinkthread/agent-posix";
+import { type AgentPosixClient, parseFsPayloadId, parseFsSnapshotId, parseRequestId, parseThinkThreadId } from "@thinkthread/agent-posix";
 import { describe, expect, it, vi } from "vitest";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { resolvePiToolInvocation, type PiToolInvocationOptions } from "../src/pi-tool-invocation.ts";
 import { stableValueHash } from "../src/stable-value-hash.ts";
 import { createResourceSnapshotExecutionWorld, type SpeculativeAgentExecutionWorld } from "../src/agent-execution-world.ts";
 import { EffectCommitFailure, EffectTransactionCoordinator } from "../src/effect-transaction.ts";
-import {
-	effectCapabilitiesCover,
-	RESOURCE_OBSERVATION_EFFECTS,
-	UNRESTRICTED_PROCESS_EFFECTS,
-	WORKSPACE_PATH_MUTATION_EFFECTS,
-} from "../src/effect-model.ts";
+import { effectCapabilitiesCover, RESOURCE_OBSERVATION_EFFECTS, UNRESTRICTED_PROCESS_EFFECTS,
+	WORKSPACE_PATH_MUTATION_EFFECTS } from "../src/effect-model.ts";
 import { ExecutionWorldRouter } from "../src/execution-world.ts";
 import { ThinkThreadDurableError } from "../src/thinkthread/errors.ts";
 import { createThinkThreadExecutionWorld } from "../src/thinkthread/execution-world.ts";

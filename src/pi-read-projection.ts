@@ -1,18 +1,8 @@
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import {
-	DEFAULT_MAX_BYTES,
-	DEFAULT_MAX_LINES,
-	formatSize,
-	type ReadToolDetails,
-	type ReadToolInput,
-	truncateHead,
-} from "@earendil-works/pi-coding-agent";
-import {
-	type ActionProjectionRule,
-	READ_RANGE_ACTION_KEY_PROJECTOR,
-	READ_RANGE_COVERAGE_DETAILS_KEY,
-	type ReadRangeCoverage,
-} from "./action-key-projection.ts";
+import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, type ReadToolDetails, type ReadToolInput,
+	truncateHead } from "@earendil-works/pi-coding-agent";
+import { type ActionProjectionRule, READ_RANGE_ACTION_KEY_PROJECTOR, READ_RANGE_COVERAGE_DETAILS_KEY,
+	type ReadRangeCoverage } from "./action-key-projection.ts";
 import { readActionRange } from "./action-semantics.ts";
 import { asRecord } from "./stable-json.ts";
 import type { ToolSettlement } from "./tool-settlement.ts";

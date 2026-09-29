@@ -4,13 +4,8 @@ import { validateToolArguments } from "@earendil-works/pi-ai";
 import { type ActionProjectionRule, resolveActionProjectionRules } from "./action-key-projection.ts";
 import { buildActionKey, type ActionKey, type ActionSemanticsRegistry, PI_ACTION_SEMANTICS } from "./action-semantics.ts";
 import { createResourceSnapshotExecutionWorld, type AgentExecutionWorld } from "./agent-execution-world.ts";
-import {
-	clampCandidateLimit,
-	DEFAULTS,
-	type DrafterRequestSettings,
-	normalizeDrafterRequestSettings,
-	normalizeSpeculativeToolSelection,
-} from "./common.ts";
+import { clampCandidateLimit, DEFAULTS, type DrafterRequestSettings, normalizeDrafterRequestSettings,
+	normalizeSpeculativeToolSelection } from "./common.ts";
 import type { AgentConsumeInput, AgentStartInput, AgentStateData } from "./agent-runtime-types.ts";
 import { definitionSchemaHashes } from "./agent-runtime-types.ts";
 import type { ActorForkPlanSource } from "./actor-fork-plan-source.ts";

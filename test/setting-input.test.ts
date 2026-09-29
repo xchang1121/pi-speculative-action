@@ -1,13 +1,6 @@
 import { describe, expect, it } from "vitest";
-import {
-	nonEmptyTextInput,
-	nonNegativeIntegerInput,
-	nonNegativeNumberInput,
-	optionalTextInput,
-	positiveIntegerInput,
-	probabilityInput,
-	nonNegativeInteger, nonNegativeNumber, positiveInteger, probability,
-} from "../src/setting-input.ts";
+import { nonEmptyTextInput, nonNegativeIntegerInput, nonNegativeNumberInput, optionalTextInput, positiveIntegerInput, probabilityInput,
+	nonNegativeInteger, nonNegativeNumber, positiveInteger, probability } from "../src/setting-input.ts";
 
 describe("typed setting input", () => {
 	it("enforces integer and numeric domains at their boundaries", () => {

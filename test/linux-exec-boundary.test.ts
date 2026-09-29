@@ -1,10 +1,8 @@
 import { lstat, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { expect, test } from "vitest";
-import {
-	commitBenchmarkFixture, compileBenchmarkHelper, createLinuxProcessBenchmark,
-	forkReusableBash, holdProcessPublication, metricDelta, prepareLinuxProcessReuse, textOutput,
-} from "./linux-process-fixture.ts";
+import { commitBenchmarkFixture, compileBenchmarkHelper, createLinuxProcessBenchmark,
+	forkReusableBash, holdProcessPublication, metricDelta, prepareLinuxProcessReuse, textOutput } from "./linux-process-fixture.ts";
 
 test("preserves held-child output, effects and one-shot authority across parent commands", { timeout: 30_000 }, async ({ skip }) => {
 	if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");

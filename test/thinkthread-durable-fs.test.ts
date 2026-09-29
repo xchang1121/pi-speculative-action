@@ -3,14 +3,8 @@ import { getEventListeners } from "node:events";
 import { createServer, type Socket } from "node:net";
 import os from "node:os";
 import path from "node:path";
-import {
-	type AgentPosixClient,
-	ClientConfig, MAX_CONTROL_FRAME_BYTES, SensitiveRequestFrame,
-	parseFsPayloadId,
-	parseFsSnapshotId,
-	parseThinkThreadId,
-	TransportError,
-} from "@thinkthread/agent-posix";
+import { type AgentPosixClient, ClientConfig, MAX_CONTROL_FRAME_BYTES, SensitiveRequestFrame, parseFsPayloadId, parseFsSnapshotId,
+	parseThinkThreadId, TransportError } from "@thinkthread/agent-posix";
 import { describe, expect, it, vi } from "vitest";
 import { DurableFsExecutor } from "../src/thinkthread/durable-fs.ts";
 import { ThinkThreadRecoveryRequiredError } from "../src/thinkthread/errors.ts";

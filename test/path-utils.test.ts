@@ -1,11 +1,6 @@
 import path from "node:path";
 import { describe, expect, test } from "vitest";
-import {
-	containsFilesystemPath,
-	containsLogicalPath,
-	filesystemPathKey,
-	relativeFilesystemPath,
-} from "../src/path-utils.ts";
+import { containsFilesystemPath, containsLogicalPath, filesystemPathKey, relativeFilesystemPath } from "../src/path-utils.ts";
 
 describe("filesystem path policy", () => {
 	const root = path.resolve("workspace");

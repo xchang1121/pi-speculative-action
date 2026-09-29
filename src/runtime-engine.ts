@@ -34,13 +34,8 @@ import type {
 	SpeculativePlanSource,
 	SpeculativeRuntimeInspection, TurnInput,
 } from "./runtime-contracts.ts";
-import {
-	type CandidateJoinDecision,
-	type PredictionForecast,
-	type ServiceTimingIdentity,
-	SpeculationScheduler,
-	waitForCandidate,
-} from "./scheduler.ts";
+import { type CandidateJoinDecision, type PredictionForecast, type ServiceTimingIdentity, SpeculationScheduler,
+	waitForCandidate } from "./scheduler.ts";
 import type {
 	ActorActionIdentity,
 	PlanActionIdentity,

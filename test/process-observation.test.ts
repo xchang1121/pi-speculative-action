@@ -3,13 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, test } from "vitest";
 import { captureStableFile } from "../src/filesystem-evidence.ts";
-import {
-	captureWorkspaceStructure,
-	diffWorkspaceStructures,
-	ExecutionPathProjection,
-	hydrateWorkspaceFileEntry,
-	snapshotDependency,
-} from "../src/process-observation.ts";
+import { captureWorkspaceStructure, diffWorkspaceStructures, ExecutionPathProjection, hydrateWorkspaceFileEntry,
+	snapshotDependency } from "../src/process-observation.ts";
 
 describe("process observation", () => {
 	test("joins content-free structure snapshots with an authoritative regular-file delta", async ({ onTestFinished }) => {

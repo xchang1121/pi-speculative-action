@@ -1,10 +1,5 @@
 import { describe, expect, it } from "vitest";
-import {
-	effectCapabilitiesCover,
-	effectRequirements,
-	UNRESTRICTED_PROCESS_EFFECTS,
-	WORKSPACE_PATH_MUTATION_EFFECTS,
-} from "../src/effect-model.ts";
+import { effectCapabilitiesCover, effectRequirements, UNRESTRICTED_PROCESS_EFFECTS, WORKSPACE_PATH_MUTATION_EFFECTS } from "../src/effect-model.ts";
 
 describe("effect capability model", () => {
 	it("matches backends by guarantee inclusion without observing tool names", () => {

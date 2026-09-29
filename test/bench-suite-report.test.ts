@@ -1,12 +1,7 @@
 import { EventEmitter } from "node:events";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import {
-	nearestRank,
-	type SuiteBenchmarkRun,
-	summarizePairs,
-	summarizeSuite,
-} from "../bench/suite-report.ts";
+import { nearestRank, type SuiteBenchmarkRun, summarizePairs, summarizeSuite } from "../bench/suite-report.ts";
 
 describe("ablation suite report", () => {
 	it.each([

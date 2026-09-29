@@ -3,10 +3,8 @@ import { lstat, mkdir, mkdtemp, readFile, readdir, readlink, rm, writeFile } fro
 import os from "node:os";
 import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import {
-	createEditToolDefinition, createFindToolDefinition, createGrepToolDefinition,
-	createLsToolDefinition, createReadToolDefinition, createWriteToolDefinition,
-} from "@earendil-works/pi-coding-agent";
+import { createEditToolDefinition, createFindToolDefinition, createGrepToolDefinition,
+	createLsToolDefinition, createReadToolDefinition, createWriteToolDefinition } from "@earendil-works/pi-coding-agent";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { createResourceSnapshotExecutionWorld, type SpeculativeToolExecutionContext } from "../src/agent-execution-world.ts";
 import { isPoisonedEffectCommit } from "../src/effect-transaction.ts";
@@ -14,10 +12,8 @@ import { slash } from "../src/path-utils.ts";
 import { PI_OPERATION_TOOLS, resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { stableValueHash } from "../src/stable-value-hash.ts";
 import { runThinkThreadTool } from "../src/thinkthread/tool-runner.ts";
-import {
-	decodeThinkThreadToolRunnerResponse, encodeThinkThreadToolRunnerResponse,
-	type ThinkThreadToolName,
-} from "../src/thinkthread/tool-runner-protocol.ts";
+import { decodeThinkThreadToolRunnerResponse, encodeThinkThreadToolRunnerResponse,
+	type ThinkThreadToolName } from "../src/thinkthread/tool-runner-protocol.ts";
 import { ToolExecutionGateway } from "../src/tool-execution-gateway.ts";
 import { toolErrorSettlement, type ToolSettlement } from "../src/tool-settlement.ts";
 import { WorkspaceSandboxService } from "../src/workspace-sandbox.ts";

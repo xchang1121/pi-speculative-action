@@ -1,10 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { DrafterUtilityGate } from "../src/drafter-utility-gate.ts";
-import {
-	BenefitGate,
-	DEFAULT_BENEFIT_GATE_POLICY as POLICY,
-	type BenefitObservation,
-} from "../src/fork-benefit-gate.ts";
+import { BenefitGate, DEFAULT_BENEFIT_GATE_POLICY as POLICY, type BenefitObservation } from "../src/fork-benefit-gate.ts";
 
 describe("fork benefit gate", () => {
 	it("keeps censored hit benefit unknown and charges only Actor-visible adoption latency", () => {

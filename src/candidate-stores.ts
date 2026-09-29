@@ -2,10 +2,8 @@ import { nonNegativeCount as finiteLimit, nonNegativeFinite as finiteValue } fro
 import { filesystemPathKey } from "./path-utils.ts";
 import path from "node:path";
 import type { WorldBranch } from "./execution-world.ts";
-import {
-	type ActionKey, type ActionKeyMatch, type ActionKeyProjector,
-	actionKeyMatch, actionKeyProjectionPartitions, ownActionKeyProjector,
-} from "./action-semantics.ts";
+import { type ActionKey, type ActionKeyMatch, type ActionKeyProjector,
+	actionKeyMatch, actionKeyProjectionPartitions, ownActionKeyProjector } from "./action-semantics.ts";
 
 export interface CandidateStoreEntry {
 	readonly id: string;

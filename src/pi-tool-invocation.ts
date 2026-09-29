@@ -1,8 +1,6 @@
-import {
-	createReadToolDefinition, createBashToolDefinition, createEditToolDefinition,
+import { createReadToolDefinition, createBashToolDefinition, createEditToolDefinition,
 	createWriteToolDefinition, createGrepToolDefinition, createFindToolDefinition, createLsToolDefinition,
-	getAgentDir, getShellConfig, VERSION, type ExtensionContext, type ToolsOptions,
-} from "@earendil-works/pi-coding-agent";
+	getAgentDir, getShellConfig, VERSION, type ExtensionContext, type ToolsOptions } from "@earendil-works/pi-coding-agent";
 import { toolErrorSettlement, type ToolFilesystemOperations, type ToolInvocation, type ToolSettlement } from "./tool-settlement.ts";
 import { BASH_TIMEOUT_ACTION_KEY_PROJECTOR, GREP_LITERAL_ACTION_KEY_PROJECTOR, grepLiteralMatches, PI_ACTION_SEMANTICS, resolvePiToolPath, type ActionSemanticsDefinition } from "./action-semantics.ts";
 import type { ActionProjectionRule } from "./action-key-projection.ts";

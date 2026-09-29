@@ -6,12 +6,8 @@ import { describe, expect, it, vi } from "vitest";
 import type { ActionKey } from "../src/action-semantics.ts";
 import type { MaterializedSpeculativeCandidate, PredictionFeedback } from "../src/runtime.ts";
 import { createActorForkPlanSource } from "../src/actor-fork-plan-source.ts";
-import {
-	normalizeSelfSpeculationSettings,
-	SELF_SPECULATION_DEFAULTS,
-	SelfSpeculationCoordinator,
-	type SelfSpeculationSettings,
-} from "../src/self-speculation.ts";
+import { normalizeSelfSpeculationSettings, SELF_SPECULATION_DEFAULTS, SelfSpeculationCoordinator,
+	type SelfSpeculationSettings } from "../src/self-speculation.ts";
 
 describe("self-speculation control plane", () => {
 	it("normalizes opt-in settings without weakening bounded defaults", () => {

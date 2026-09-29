@@ -5,13 +5,8 @@ import { temporaryDirectories } from "./filesystem.ts";
 import { testModel } from "./model.ts";
 import path from "node:path";
 
-import {
-	type ExtensionAPI,
-	type ExtensionCommandContext,
-	type ExtensionContext,
-	type SourceInfo,
-	type ToolDefinition,
-} from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, type SourceInfo,
+	type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createSpeculativeActionHost, type CreateSpeculativeActionHostOptions, type SpeculativeActionHost } from "../src/agent-integration.ts";
 import type { SpeculativeAgentExecutionWorld } from "../src/agent-execution-world.ts";
