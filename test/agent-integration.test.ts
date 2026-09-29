@@ -59,14 +59,7 @@ function drafterCall(input: Record<string, unknown>, name = "read", id = "draft-
 }
 
 function settings(candidateLimit = 1) {
-	return {
-		enabled: true,
-		drafterEnabled: true,
-		candidateLimit,
-		maxConcurrentActions: candidateLimit,
-		tools: ["read"],
-		patternAware: { enabled: false },
-	};
+	return { enabled: true, drafterEnabled: true, candidateLimit, maxConcurrentActions: candidateLimit, tools: ["read"], patternAware: { enabled: false } };
 }
 
 function drafterHost(sessionID: string, options: CreateSpeculativeActionHostOptions) {
@@ -79,21 +72,11 @@ function drafterHost(sessionID: string, options: CreateSpeculativeActionHostOpti
 }
 
 function startInput(tool: AgentTool, turnID = "turn-1") {
-	return {
-		turnID,
-		actorModel: model("actor"),
-		context: { systemPrompt: "system", messages: [], tools: [tool] },
-		actorOptions: undefined,
-		tools: [tool],
-	};
+	return { turnID, actorModel: model("actor"), context: { systemPrompt: "system", messages: [], tools: [tool] }, actorOptions: undefined, tools: [tool] };
 }
 
-function patternRequest(
-	tool: AgentTool,
-	patternAware: ReturnType<typeof patternAwareSettings>,
-	sessionID = "session",
-	schemaHashes: Readonly<Record<string, string>> = {},
-) {
+function patternRequest(tool: AgentTool, patternAware: ReturnType<typeof patternAwareSettings>, sessionID = "session",
+	schemaHashes: Readonly<Record<string, string>> = {}) {
 	return {
 		startInput: { ...startInput(tool), sessionID },
 		data: { tools: new Map([["read", tool]]), schemaHashes },
@@ -1207,6 +1190,18 @@ describe("speculative action host", () => {
 			} finally { await host.dispose(); }
 			expect(disposed).toHaveBeenCalledOnce();
 		}
+	});
+
+	it("binds a redundant-cd prediction to the command its candidate runs", async () => {
+		const cwd = await temporaryWorkspace(), ran = deferred<string>(), tool = createBashTool(cwd);
+		const { host } = drafterHost("cd", { cwd, getSettings: () => ({ ...settings(), drafterGateEnabled: false, drafterMaxDepth: 0, tools: ["bash"] }),
+			complete: async () => drafterCall({ command: `cd ${cwd.replaceAll("\\", "/")} && echo hi` }, "bash", "draft"),
+			resolveInvocation: (name, input) => resolvePiToolInvocation(name, input, { cwd, environment: {} }),
+			executionWorlds: [mockRuntimeWorld(context => {
+				ran.resolve(`${(context.args as { command: string }).command} | ${(context.action.executionContext as ToolInvocation).process?.command}`);
+				return { result: textResult("hi\n"), isError: false };
+			})] });
+		try { await host.startTurn(startInput(tool as never)); expect(await ran.promise).toBe("echo hi | echo hi"); } finally { await host.dispose(); }
 	});
 
 	it.each(["running", "completed"].flatMap((phase) =>
