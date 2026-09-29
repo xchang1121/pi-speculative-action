@@ -82,10 +82,10 @@ describe("zero-modification Pi extension", () => {
 		expect(fixture.settle).not.toHaveBeenCalled();
 	});
 
-	it("leads task timing with the optimistic gain and keeps the signed net estimate beside it", () => {
-		const timing = { endToEndMs: 1000, optimisticSavingsMs: 300, estimatedSavingsMs: -50, hiddenLatencyMs: 100, toolExecutionMs: 400, toolWaitMs: 100 };
+	it("leads task timing with the savings and keeps the signed net value beside it", () => {
+		const timing = { endToEndMs: 1000, savingsMs: 300, estimatedSavingsMs: -50, hiddenLatencyMs: 100, toolExecutionMs: 400, toolWaitMs: 100 };
 		expect(formatSpeculativeActionEvent({ type: "task", sessionID: "s", turnID: "t", timing } as never)).toContain(
-			"1s wall; 300ms optimistic savings (net -50ms); End-to-End SpeedUp +30.0% (net -5.0%); Tool time speed up 4.00x; 100ms of 400ms tool time hidden");
+			"1s wall; 300ms saved (net -50ms); End-to-End SpeedUp +30.0% (net -5.0%); Tool time speed up 4.00x; 100ms of 400ms tool time hidden");
 	});
 
 	it("sends Drafter requests as simple options through the provider with registry auth", async () => {
