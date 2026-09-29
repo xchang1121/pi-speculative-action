@@ -745,13 +745,8 @@ export function resourceDependencies(action: ActionKey, root: string, actionSema
 	return action.resources.map((resource) => ({ path: path.resolve(root, resource), scope }));
 }
 
-export async function captureResourceVersion(
-	action: ActionKey | undefined,
-	root: string,
-	actionSemantics: ActionSemanticsRegistry = PI_ACTION_SEMANTICS,
-	retainBytes?: number,
-	providedInputs?: ReadonlyMap<string, ResourceInput>,
-) {
+export async function captureResourceVersion(action: ActionKey | undefined, root: string,
+	actionSemantics: ActionSemanticsRegistry = PI_ACTION_SEMANTICS, retainBytes?: number, providedInputs?: ReadonlyMap<string, ResourceInput>) {
 	const dependencies = providedInputs ? [...providedInputs].map(([path, input]): ResourceDependency => ({ path,
 		scope: input && !(input instanceof Uint8Array) ? input.names ? "names" : "type" : "content" }))
 		: action ? resourceDependencies(action, root, actionSemantics) : undefined;
@@ -927,6 +922,8 @@ async function fingerprintDependencies(
 		dependency: string,
 		ancestors: ReadonlySet<string> = new Set(),
 		descend = true,
+		/** A walked directory's real path: a child that is no link resolves to its entry there, with no window to re-check. */
+		parentReal?: string,
 	): Promise<FingerprintResult> {
 		let captured: Awaited<ReturnType<typeof captureFilesystemEntry>>;
 		try {
@@ -948,9 +945,10 @@ async function fingerprintDependencies(
 		if (providedInputs && !(supplied instanceof Uint8Array ? info.isFile() : supplied && info.isDirectory()))
 			throw new Error(supplied instanceof Uint8Array ? "resource_input_not_regular" : "resource_input_type_changed");
 		const realTarget = info.isSymbolicLink()
-			? path.join(await fingerprintIO(() => fs.realpath(path.dirname(target))), path.basename(target))
-			: await fingerprintIO(() => fs.realpath(target));
-		assertInside(realRoot, realTarget);
+			? path.join(parentReal ?? await fingerprintIO(() => fs.realpath(path.dirname(target))), path.basename(target))
+			: parentReal === undefined ? await fingerprintIO(() => fs.realpath(target)) : path.join(parentReal, path.basename(target));
+		// An entry name joined to a walked directory stays where the directory was proven to be.
+		if (parentReal === undefined) assertInside(realRoot, realTarget);
 		const identity = filesystemPathKey(realTarget);
 		const grouping = aliases.get(dependency);
 		if (grouping && info.isFile() && info.nlink > 1n) {
@@ -982,7 +980,7 @@ async function fingerprintDependencies(
 		if (["stat", "type", "entry"].includes(scope) || (scope === "entries" && !descend) || (["names", "entries", "tree_entries"].includes(scope) && !info.isDirectory())) {
 			view?.capture(target, { type: info.isDirectory() ? "directory" : info.isFile() ? "file" : "special", realPath: realTarget, dependency,
 				...(scope === "stat" && info.isFile() ? { size: Number(info.size) } : {}) });
-			return stableEntry(target, info, identity, scope);
+			return stableEntry(target, info, identity, scope, parentReal !== undefined);
 		}
 		if (info.isFile()) {
 			const key = JSON.stringify([filesystemPathKey(target), identity, statStamp(info), String(info.uid), String(info.gid)]), existing = files.get(key);
@@ -1030,7 +1028,7 @@ async function fingerprintDependencies(
 		const selected = excludes.size && (scope === "tree_content" || scope === "tree_entries") ? entries.filter((entry) => !excludes.has(entry.name)) : entries;
 		const descendants = new Set(ancestors).add(identity);
 		const children = scope === "names" ? [] : await mapFilesystem([...selected].sort((left, right) => left.name.localeCompare(right.name)), async (entry) => {
-			const child = await fingerprintPath(path.join(target, entry.name), scope, dependency, descendants, scope !== "entries");
+			const child = await fingerprintPath(path.join(target, entry.name), scope, dependency, descendants, scope !== "entries", realTarget);
 			return { name: entry.name, ...child };
 		});
 		const [afterEntries, after] = await Promise.all([
@@ -1063,8 +1061,8 @@ async function fingerprintBinding(dependency: ResourceDependency) {
 	return { ...dependency, fingerprint: "binding", stamp, bytesRead: 0, filesRead: 0 };
 }
 
-async function stableEntry(target: string, before: BigIntStats, resolved: string, scope: ResourceDependency["scope"]): Promise<FingerprintResult> {
-	const after = await fingerprintIO(() => fs.lstat(target, { bigint: true }));
+async function stableEntry(target: string, before: BigIntStats, resolved: string, scope: ResourceDependency["scope"], settled = false): Promise<FingerprintResult> {
+	const after = settled ? before : await fingerprintIO(() => fs.lstat(target, { bigint: true }));
 	if (!sameFilesystemIdentity(before, after)) {
 		throw new Error(`resource_file_changed:${target}`);
 	}
@@ -1133,12 +1131,8 @@ function assertInside(realRoot: string, target: string): void {
 	if (!containsFilesystemPath(realRoot, target)) throw new Error(`resource_symlink_escapes_workspace:${target}`);
 }
 
-function validation(
-	started: number,
-	reason?: string,
-	mode: ResourceValidationMetrics["mode"] = "exact",
-	observed: ReadonlyArray<Pick<ResourceValidationMetrics, "bytesRead" | "filesRead">> = [],
-): ResourceVersionValidation {
+function validation(started: number, reason?: string, mode: ResourceValidationMetrics["mode"] = "exact",
+	observed: ReadonlyArray<Pick<ResourceValidationMetrics, "bytesRead" | "filesRead">> = []): ResourceVersionValidation {
 	return {
 		expired: reason !== undefined, ...(reason === undefined ? {} : { reason }),
 		durationMs: Math.max(0, performance.now() - started), mode,
