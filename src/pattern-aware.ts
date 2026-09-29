@@ -439,11 +439,7 @@ export class PatternAwareStore {
 		return true;
 	}
 
-	predict(
-		sessionID: string,
-		schemaHashes: Readonly<Record<string, string>> = {},
-		predictionSettings: PatternAwareSettings = this.settings,
-	) {
+	predict(sessionID: string, schemaHashes: Readonly<Record<string, string>> = {}, predictionSettings: PatternAwareSettings = this.settings) {
 		if (!predictionSettings.enabled) return [];
 		const history = this.sessions.get(sessionID)?.history ?? [];
 		return this.predictHistory(history, schemaHashes, { history, visitedPatternIDs: [], pathProbability: 1 }, predictionSettings);
@@ -538,11 +534,7 @@ export class PatternAwareStore {
 				continue;
 			if (pattern.targetSchemaHash && schemaHashes[pattern.targetTool] !== pattern.targetSchemaHash) continue;
 			for (const applied of this.bindingAnalysis.applyWeightedBindings(pattern.bindings, context)) {
-				const action = this.resolveActionKey(
-					pattern.targetTool,
-					applied.input,
-					pattern.targetSchemaHash ?? schemaHashes[pattern.targetTool],
-				);
+				const action = this.resolveActionKey(pattern.targetTool, applied.input, pattern.targetSchemaHash ?? schemaHashes[pattern.targetTool]);
 				const identity = action
 					? JSON.stringify({ actionKey: action.key, type: "tool_call" })
 					: stableStringify({ type: "tool_call", tool: pattern.targetTool, input: applied.input });
@@ -1738,10 +1730,7 @@ class PatternBindingAnalysis {
 	}
 }
 
-export function inferBindings(
-	context: ReadonlyArray<PatternAwareEvent>,
-	target: Record<string, unknown>,
-): Record<string, PatternAwareBinding> {
+export function inferBindings(context: ReadonlyArray<PatternAwareEvent>, target: Record<string, unknown>): Record<string, PatternAwareBinding> {
 	return new PatternBindingAnalysis().inferBindings(context, target);
 }
 
@@ -2325,12 +2314,7 @@ function isNonNegativeInteger(value: unknown): value is number {
 	return Number.isSafeInteger(value) && (value as number) >= 0;
 }
 
-function patternPoolKey(
-	context: ReadonlyArray<PatternAwareEventSignature>,
-	targetTool: string,
-	targetSchemaHash: string | undefined,
-	gap: number,
-) {
+function patternPoolKey(context: ReadonlyArray<PatternAwareEventSignature>, targetTool: string, targetSchemaHash: string | undefined, gap: number) {
 	return hash(stableStringify({ context, targetTool, targetSchemaHash, gap }));
 }
 

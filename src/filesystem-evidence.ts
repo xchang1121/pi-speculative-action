@@ -56,7 +56,7 @@ export function sameFilesystemIdentity(left: BigIntStats, right: BigIntStats): b
 
 /** Fence workspace timestamps with a private descriptor; elapsed budgets must not use wall time. */
 export async function advanceFilesystemClock(clock: FileHandle, boundary: number, identity: Pick<Stats, "dev" | "ino" | "nlink">): Promise<void> {
-	const deadline = performance.now() + 100;
+	let deadline: number | undefined;
 	const stamp = async () => {
 		const current = await clock.stat();
 		if (!current.isFile() || current.dev !== identity.dev || current.ino !== identity.ino || current.nlink !== identity.nlink) {
@@ -70,6 +70,8 @@ export async function advanceFilesystemClock(clock: FileHandle, boundary: number
 		await clock.write(`${sequence}\n`, 0, "utf8");
 		const current = await stamp();
 		if (current > boundary) return;
+		// A host that stepped its clock back (WSL resynchronizing) leaves the boundary ahead: wait out that gap, within 2 s.
+		deadline ??= performance.now() + Math.min(2000, Math.max(100, boundary - current + 100));
 		if (performance.now() >= deadline) throw new Error(`filesystem change clock did not advance: boundary=${boundary}, clock=${current}`);
 		await new Promise<void>((resolve) => setTimeout(resolve, 1));
 	}
