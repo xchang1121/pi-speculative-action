@@ -1,20 +1,6 @@
-import {
-	certificateReplayable,
-	dependencyPathsetKey,
-	type DynamicDependencyCertificate,
-	isSha256Digest,
-	type ProcessProducerProof,
-	processStrongKey,
-	type ProcessProvenanceCertificate,
-	type ProvenanceTaint,
-	referencedArtifacts,
-	type Sha256Digest,
-} from "./provenance-certificate.ts";
-import {
-	type ProvenanceValidation,
-	type ProvenanceValidationContext,
-	validateDynamicDependencyCertificate,
-} from "./provenance-validation.ts";
+import { certificateReplayable, dependencyPathsetKey, type DynamicDependencyCertificate, isSha256Digest, type ProcessProducerProof, processStrongKey,
+	type ProcessProvenanceCertificate, type ProvenanceTaint, referencedArtifacts, type Sha256Digest } from "./provenance-certificate.ts";
+import { type ProvenanceValidation, type ProvenanceValidationContext, validateDynamicDependencyCertificate } from "./provenance-validation.ts";
 import { ProvenanceCertificateStore, type VerifiedArtifactClosure } from "./reuse-store.ts";
 
 export interface ReplayObservationContract {

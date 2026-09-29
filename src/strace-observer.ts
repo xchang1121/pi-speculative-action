@@ -2,15 +2,8 @@ import { open, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { directoryStatFields, FILESYSTEM_TYPE_BLIND, hostStatFields, repeatableExecutions, SHELLS, workspaceStatFields, type TracedExecution } from "./deterministic-tools.ts";
 import { containsLogicalPath } from "./path-utils.ts";
-import {
-	type DependencyRole,
-	FILESYSTEM_OBSERVATION_FIELDS,
-	type FilesystemObservationField,
-	filesystemObservationDigest,
-	type ProvenanceTaint,
-	type Sha256Digest,
-	type ResourceTransitionKind,
-} from "./provenance-certificate.ts";
+import { type DependencyRole, FILESYSTEM_OBSERVATION_FIELDS, type FilesystemObservationField, filesystemObservationDigest, type ProvenanceTaint,
+	type Sha256Digest, type ResourceTransitionKind } from "./provenance-certificate.ts";
 
 const CONFINEMENT_SENSITIVE_SYSCALLS = new Set([
 	"seccomp", "capget", "capset", "mount", "umount2", "pivot_root", "swapon", "swapoff", "reboot",

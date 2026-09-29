@@ -1,20 +1,11 @@
 import { directoryEntriesDigest } from "./process-observation.ts";
 import { lstat, stat } from "node:fs/promises";
 import path from "node:path";
-import { captureFilesystemEntry, captureStableFile, sameFilesystemIdentity } from "./filesystem-evidence.ts";
+import { captureFileDigest, captureFilesystemEntry, sameFilesystemIdentity } from "./filesystem-evidence.ts";
 import { errorMessage, isMissing as missing } from "./error-utils.ts";
-import {
-	type DynamicDependency,
-	type DynamicDependencyCertificate,
-	filesystemMetadataDigest,
-	filesystemObservationDigest,
-	type FilesystemObservationField,
-	type ProcessProvenanceCertificate,
-	processStrongKey,
-	type ProvenanceTaint,
-	sha256Digest,
-	type Sha256Digest,
-} from "./provenance-certificate.ts";
+import { type DynamicDependency, type DynamicDependencyCertificate, filesystemMetadataDigest, filesystemObservationDigest,
+	type FilesystemObservationField, type ProcessProvenanceCertificate, processStrongKey, type ProvenanceTaint, sha256Digest,
+	type Sha256Digest } from "./provenance-certificate.ts";
 
 export interface ProvenanceValidationContext {
 	/** Map a stable logical path from the certificate into the current physical execution world. */
@@ -166,7 +157,7 @@ export async function captureFileDependency(
 		readonly resolvePath?: ProvenanceValidationContext["resolvePath"] } = {},
 ): Promise<{ readonly dependency: Extract<DynamicDependency, { kind: "file" }>; readonly bytesRead: number; readonly filesRead: number }> {
 	const maxBytes = finiteLimit(options.maxFileBytes ?? Number.POSITIVE_INFINITY);
-	const content = await captureStableFile(physicalPath, maxBytes);
+	const content = await captureFileDigest(physicalPath, maxBytes);
 	let aliases = options.aliases;
 	if (aliases) {
 		const states = await Promise.all(aliases.map(async logical => {

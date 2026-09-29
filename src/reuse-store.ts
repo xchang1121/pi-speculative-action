@@ -1,17 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { link, mkdir, open, readFile, readdir, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import path from "node:path";
-import {
-	type ArtifactReference,
-	certificateReplayable,
-	isSha256Digest,
-	parseProcessCertificate,
-	type ProcessProvenanceCertificate,
-	type ProvenanceTaint,
-	referencedArtifacts,
-	sha256Digest,
-	type Sha256Digest,
-} from "./provenance-certificate.ts";
+import { type ArtifactReference, certificateReplayable, isSha256Digest, parseProcessCertificate, type ProcessProvenanceCertificate,
+	type ProvenanceTaint, referencedArtifacts, sha256Digest, type Sha256Digest } from "./provenance-certificate.ts";
 import { stableStringify } from "./stable-json.ts";
 import { nonNegativeNumber, positiveInteger } from "./setting-input.ts";
 import { hasErrorCode, isMissing as missing } from "./error-utils.ts";

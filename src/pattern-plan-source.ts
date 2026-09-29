@@ -5,24 +5,10 @@ import { type ActionSemanticsRegistry, widenReadGuess, withoutWorkingDirectoryPr
 import { BoundedRecencyMap } from "./bounded-recency-map.ts";
 import type { ExecutionOperationBinding } from "./execution-world.ts";
 import { agentBatchKey, type AgentPlanSource, type AgentStartInput } from "./agent-runtime-types.ts";
-import {
-	acquirePatternAwareStore,
-	PATTERN_AWARE_DEFAULTS,
-	asPatternAwareRuntimeContext,
-	type OutputLocation,
-	type PatternAwareCandidate,
-	type PatternAwareEventInput,
-	type PatternAwareRuntimeContext,
-	type PatternAwareSettings,
-	type PatternAwareStore,
-	type PatternAwareStoreLease,
-	patternAwareActionSemantics,
-	patternAwareAnalyzerKey,
-	patternAwareRuntimeContext,
-	patternAwareSettings,
-	failureClass,
-	projectPatternAwareObservation,
-} from "./pattern-aware.ts";
+import { acquirePatternAwareStore, PATTERN_AWARE_DEFAULTS, asPatternAwareRuntimeContext, type OutputLocation, type PatternAwareCandidate,
+	type PatternAwareEventInput, type PatternAwareRuntimeContext, type PatternAwareSettings, type PatternAwareStore, type PatternAwareStoreLease,
+	patternAwareActionSemantics, patternAwareAnalyzerKey, patternAwareRuntimeContext, patternAwareSettings, failureClass,
+	projectPatternAwareObservation } from "./pattern-aware.ts";
 import type { PlanAction } from "./plan-proposal.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
 import type { ActorActionFeedback, SpeculativeActionSettings, SpeculativeCandidate } from "./runtime.ts";
