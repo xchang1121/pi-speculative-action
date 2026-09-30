@@ -307,6 +307,16 @@ describe("strace provenance decoder", () => {
 		}
 	});
 
+	test("keeps what the traced processes do among themselves out of their inputs", async () => {
+		const stat = (size: number) => `newfstatat(AT_FDCWD, "/work/out.o", ${STAT.replace("st_size=4", `st_size=${size}`)}, 0) = 0`;
+		const polls = ['poll([{fd=0</dev/null<char 1:3>>, events=0}, {fd=1<pipe:[7]>, events=0}], 2, 0) = 0 (Timeout)',
+			'pipe2([5<pipe:[9]>, 6<pipe:[9]>], O_CLOEXEC) = 0', 'poll([{fd=5<pipe:[9]>, events=POLLIN}], 1, -1) = 1 ([{fd=5, revents=POLLIN}])'];
+		const write = 'openat(AT_FDCWD, "/work/out.o", O_WRONLY|O_CREAT|O_TRUNC, 0644) = 3</work/out.o>';
+		for (const [lines, taints] of [[polls, []], [['poll([{fd=1<pipe:[7]>, events=POLLOUT}], 1, 0) = 1 ([{fd=1, revents=POLLOUT}])'], ["unsupported_syscall"]],
+			[[write, stat(4), stat(8)], []], [[stat(4), stat(8)], ["mutable_input"]]] as const)
+			expect((await observe({ 100: [EXEC, ...lines] }, { inheritedStreams: ["7"], guardFilesystemSemanticsWithin: ["/work"] })).taints, lines.join()).toEqual(["clock", "random", ...taints].sort());
+	});
+
 	test("classifies effects from syscall arguments and results, never embedded strings", async () => {
 		for (const operand of ["3</work/input>", "9</work/input>", "3</work/other>", "3<pipe:[7]>", "9<pipe:[7]>", "3<pipe:[8]>", "3", "3</work/input (deleted)>"]) {
 			const line = `fcntl(${operand}, F_GETFL) = 0x8000 (flags O_RDONLY|O_LARGEFILE)`;
@@ -324,6 +334,7 @@ describe("strace provenance decoder", () => {
 			['fcntl64(3</work/input>, F_OFD_GETLK, {l_type=F_WRLCK, l_pid=-1}) = 0', ["ipc"]],
 			['fcntl(3</work/input>, F_SETLK, {l_type=F_WRLCK}) = -1 EAGAIN (Resource temporarily unavailable)', ["ipc"]],
 			['flock(3</work/input>, LOCK_EX|LOCK_NB) = 0', ["ipc"]],
+			['flock(3</work/input>, LOCK_EX) = 0', []],
 			['fcntl(1<pipe:[7]>, F_SETFL, O_WRONLY|O_NONBLOCK) = 0', ["unsupported_syscall"]],
 			['fcntl(3</work/input>, F_SETFL, O_RDONLY|O_NONBLOCK|O_APPEND|O_LARGEFILE|O_DIRECTORY) = 0', []],
 			['fcntl(3</work/input>, F_SETFL, O_RDONLY) = 0', []],
@@ -339,6 +350,7 @@ describe("strace provenance decoder", () => {
 			['prctl(PR_SET_NAME, "worker socket(AF_UNIX) = -1 EPERM") = 0', []],
 			['prlimit64(0, RLIMIT_STACK, NULL, {rlim_cur=8388608, rlim_max=RLIM64_INFINITY}) = 0', []],
 			['setrlimit(RLIMIT_CORE, {rlim_cur=0, rlim_max=0}) = 0', ["unsupported_syscall"]],
+			['prlimit64(0, RLIMIT_STACK, {rlim_cur=65536*1024, rlim_max=RLIM64_INFINITY}, NULL) = 0', []],
 			['socket(AF_UNIX, SOCK_STREAM, 0) = 3<UNIX-STREAM:[1->2]>', []],
 			['socket(AF_INET, SOCK_STREAM, IPPROTO_TCP) = 3<TCP:[4]>', ["network"]],
 			['getsockname(1, {sa_family=AF_UNIX, sun_path="/private/output"}, [110 => 18]) = 0', ["network"]],

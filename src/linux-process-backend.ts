@@ -237,6 +237,7 @@ export class LinuxProcessReuseBackend {
 	private heldExec?: Promise<LinuxHeldExecBoundary>;
 	private disposed = false;
 	private readonly handoffs: ProcessHandoffRegistry<BoundProcessInvocation | { readonly trackingOnly: true; readonly sourceRoot: string }>;
+	private readonly actorExecutableDirectories = new Set<string>();
 	private readonly processScheduler = new SpeculationScheduler<object>();
 	/** Recent traced run times of nested children by executable, the longest kept: a cheap child never repays its own sandbox. */
 	private readonly childRunMs = new BoundedRecencyMap<string, readonly number[]>(512);
@@ -499,7 +500,8 @@ export class LinuxProcessReuseBackend {
 				if (kind === "tool") await (dispatch ??= createProcessInterposition({
 					gitDirectory,
 					privateRoot: input.workspace.processRoot,
-					pathValue: originalPath,
+					// Where the Actor's own children run from is intercepted too: a build tool execs its compiler by absolute path.
+					pathValue: [originalPath, ...this.actorExecutableDirectories].join(path.delimiter),
 					projection,
 					sourceRoot,
 					workspaceRoot: input.workspace.sandboxRoot,
@@ -900,54 +902,27 @@ export class LinuxProcessReuseBackend {
 
 	private async plan(
 		weakKey: Sha256Digest,
-		executablePath: string,
-		projection: ExecutionPathProjection,
-		acceptProducer: (producer: ProcessProducerProof) => boolean,
-		session?: ActiveSession,
-		live?: readonly ProcessProvenanceCertificate[],
-		excludedCertificates?: ReadonlySet<Sha256Digest>,
-		continuation = false,
+		executablePath: string, projection: ExecutionPathProjection, acceptProducer: (producer: ProcessProducerProof) => boolean,
+		session?: ActiveSession, live?: readonly ProcessProvenanceCertificate[], excludedCertificates?: ReadonlySet<Sha256Digest>, continuation = false,
 	): Promise<ReadyProcessPlan | undefined> {
-		const plan = await this.planner.plan({
-			weakKey,
-			executablePath,
-			acceptProducer,
-			excludedCertificates,
-			contract: {
-				sink: "buffered",
-				orderedJournal: true,
-				transactionalEffects: true,
-				...(continuation ? { continuation: true as const } : {}),
-			},
-			validation: {
-				resolvePath: (logicalPath) => projection.toPhysical(logicalPath),
-				...(session ? { acceptedTaints: SAME_CONFINEMENT_TAINTS } : {}),
-			},
+		const plan = await this.planner.plan({ weakKey, executablePath, acceptProducer, excludedCertificates,
+			contract: { sink: "buffered", orderedJournal: true, transactionalEffects: true, ...(continuation ? { continuation: true as const } : {}) },
+			validation: { resolvePath: (logicalPath) => projection.toPhysical(logicalPath), ...(session ? { acceptedTaints: SAME_CONFINEMENT_TAINTS } : {}) },
 			...(live ? { live: { certificate: live, acceptedTaints: [...TRANSFERRED_INPUT_TAINTS] } } : {}),
 		});
 		this.recordLookup(plan.lookup, session);
 		if (plan.kind === "miss" && plan.lookup.candidateCertificates > 0) {
-			const detail = `reuse_miss:${plan.reasons.join(",")}${
-				plan.changedDependencies?.length ? `:${plan.changedDependencies.join(",")}` : ""
-			}`;
-			if (session) this.setError(session, detail);
-			else this.setActorError(`actor_${detail}`);
+			const detail = `reuse_miss:${plan.reasons.join(",")}${plan.changedDependencies?.length ? `:${plan.changedDependencies.join(",")}` : ""}`;
+			if (session) this.setError(session, detail); else this.setActorError(`actor_${detail}`);
 		}
 		return plan.kind !== "miss" ? plan : undefined;
 	}
 
 	private recordLookup(lookup: ProcessReusePlan["lookup"], session?: ActiveSession): void {
-		const record = (metric: CountedReuseMetric, value: number) => {
-			if (session) this.add(session, metric, value);
-			else this.addActor(metric, value);
-		};
-		record("validationMs", lookup.durationMs);
-		record("validationCandidates", lookup.candidateCertificates);
-		record("validationPathsets", lookup.pathsetsValidated);
-		record("validationFilesRead", lookup.filesRead);
-		record("validationBytesRead", lookup.bytesRead);
-		record("validationArtifactsLoaded", lookup.artifactsLoaded);
-		record("validationArtifactBytesRead", lookup.artifactBytesRead);
+		for (const [metric, value] of [["validationMs", lookup.durationMs], ["validationCandidates", lookup.candidateCertificates],
+			["validationPathsets", lookup.pathsetsValidated], ["validationFilesRead", lookup.filesRead], ["validationBytesRead", lookup.bytesRead],
+			["validationArtifactsLoaded", lookup.artifactsLoaded], ["validationArtifactBytesRead", lookup.artifactBytesRead]] as const) {
+			if (session) this.add(session, metric, value); else this.addActor(metric, value); }
 	}
 
 	private async actorReplayMiss(host: ProcessExecutor, request: ProcessExecutionRequest, timing?: ServiceTimingIdentity): Promise<ProcessExecutionResult> {
@@ -968,6 +943,7 @@ export class LinuxProcessReuseBackend {
 			process.signal?.throwIfAborted();
 			const sourceRoot = path.resolve(process.sourceRoot);
 			const executable = await realpath(`/proc/${process.pid}/exe`);
+			if (this.actorExecutableDirectories.size < 64) this.actorExecutableDirectories.add(path.dirname(executable));
 			const projection = new ExecutionPathProjection({ sourceRoot, workspaceRoot: sourceRoot });
 			const executablePath = projection.toLogical(executable);
 			if (learning && process.trackQueues) {
@@ -1023,30 +999,16 @@ export class LinuxProcessReuseBackend {
 					if (durationMs !== undefined && digest) observe(bufferedProcessPrototype(snapshot, projection, digest, platform), durationMs);
 				} };
 			}
-			const prototype = bufferedProcessPrototype(
-				snapshot, projection, await hashExecutableFile(`/proc/${process.pid}/exe`),
-				await this.resolvePlatformFingerprint(),
-			);
-			const weakKey = processWeakKey(prototype);
-			const timing = processTimingIdentity(prototype, weakKey);
-			const accepted = (producer: ProcessProducerProof) =>
-				actorReplayProducer(producer, sensitivePaths(this.options.storeRoot, this.options.deniedPaths));
-			const acquired = await this.acquireProcessResult(
-				weakKey,
-				(live, excluded) => this.plan(weakKey, executablePath, projection, accepted, undefined, live, excluded, true),
-				process.signal,
-				scope,
-				{ timing },
-			);
-			const plan = acquired.plan;
-			const continuation = acquired.continuation;
+			const prototype = bufferedProcessPrototype(snapshot, projection, await hashExecutableFile(`/proc/${process.pid}/exe`), await this.resolvePlatformFingerprint());
+			const weakKey = processWeakKey(prototype), timing = processTimingIdentity(prototype, weakKey);
+			const accepted = (producer: ProcessProducerProof) => actorReplayProducer(producer, sensitivePaths(this.options.storeRoot, this.options.deniedPaths));
+			const acquired = await this.acquireProcessResult(weakKey,
+				(live, excluded) => this.plan(weakKey, executablePath, projection, accepted, undefined, live, excluded, true), process.signal, scope, { timing });
+			const { plan, continuation } = acquired;
 			if (!plan || (plan.certificate.result.continuation ? !continuation || sha256Digest(continuation.image) !== plan.certificate.result.continuation.imageDigest :
 				plan.certificate.result.exit.kind !== "code")) {
 				this.addActor("misses");
-				return {
-					kind: "continue",
-					observeCompletion: durationMs => { if (durationMs !== undefined) observe(prototype, durationMs); },
-				};
+				return { kind: "continue", observeCompletion: durationMs => { if (durationMs !== undefined) observe(prototype, durationMs); } };
 			}
 			const output = loadOutputEvents(plan.artifacts, plan.certificate.result.journal);
 			return {
@@ -1937,9 +1899,11 @@ async function captureDependencies(
 			const info = await lstat(physical, { bigint: true }).catch(() => undefined);
 			if (info?.isFile()) { add({ kind: "metadata", path: slash(physical), followSymlinks: false, fields: ["mode", "size"], digest: filesystemObservationDigest(info, ["mode", "size"]) }); continue; }
 		}
-		if (KERNEL_CONFIGURATION.has(observedPath)) continue; // Changes only with the kernel's own configuration, like the clock.
+		if (KERNEL_CONFIGURATION.test(observedPath)) continue; // Changes only with the kernel's own configuration, like the clock.
 		// A process reading its own state, or the host's CPU and cgroup limits, observes this one run like the clock or its pid.
 		if (/^\/proc\/(?:self|thread-self|\d+)(?:\/|$)/.test(observedPath)) { taints.add("pid_observation"); continue; }
+		// Reopening an inherited descriptor reaches what that descriptor carries, like a jobserver pipe, not a host file.
+		if (/^\/dev\/fd\/\d+$/.test(observedPath)) { taints.add("descriptor_observation"); continue; }
 		if (/^\/sys\/(?:devices\/system\/cpu|fs\/cgroup)(?:\/|$)|^\/proc\/(?:meminfo|version|version_signature|cpuinfo|stat|loadavg|uptime)$/.test(observedPath)) { taints.add("clock"); continue; }
 		if (item.role === "metadata") {
 			add({
@@ -1981,7 +1945,8 @@ async function captureDependencies(
 
 const STABLE_SANDBOX_DEVICES = new Set(["/dev/null", "/dev/tty", "/dev/zero", "/dev/full"]);
 const CONTENT_ADDRESSED_GIT = /^objects\/(?:[0-9a-f]{2}\/[0-9a-f]{38}(?:[0-9a-f]{24})?|pack\/pack-[0-9a-f]{40}(?:[0-9a-f]{24})?\.(?:pack|idx|rev|bitmap))$/;
-const KERNEL_CONFIGURATION = new Set(["/proc/filesystems", "/proc/mounts"]);
+/** Also what memory allocators (jemalloc, glibc) read at startup to size their mappings. */
+const KERNEL_CONFIGURATION = /^\/proc\/(?:filesystems|mounts|sys\/vm\/overcommit_memory)$|^\/sys\/kernel\/mm\/transparent_hugepage\//;
 const SAME_CONFINEMENT_TAINTS = ["confinement_observation"] as const;
 
 function workspaceMetadataExclusions(session: ActiveSession, target: string): readonly string[] | undefined {
