@@ -2274,12 +2274,10 @@ async function privateChanges(storage: string, candidates?: Iterable<string>): P
 	const upper = path.join(storage, "writes", "upper"), stat = (target: string) => lstat(target).catch(() => undefined);
 	const deletions = (await readFile(path.join(storage, "writes", "deleted.log"), "utf8").catch(() => "")).split("\n").filter(Boolean)
 		.map(line => `/${line.replace(/\\(.)/g, (_, escaped: string) => escaped === "n" ? "\n" : escaped === "r" ? "\r" : escaped)}`);
-	const held: string[] = [];
-	const walk = async (host: string): Promise<void> => {
+	const held: string[] = [], changed: string[] = [], walk = async (host: string): Promise<void> => {
 		for (const name of await readdir(path.join(upper, host)).catch(() => [] as string[])) { held.push(path.posix.join(host, name)); await walk(path.posix.join(host, name)); }
 	};
 	if (!candidates) await walk("/");
-	const changed: string[] = [];
 	for (const host of new Set(candidates ? [...candidates].map(target => path.posix.resolve(target)) : [...held, ...deletions])) {
 		const [own, native] = await Promise.all([stat(path.join(upper, host)), stat(host)]);
 		const same = own && native && (own.isDirectory() ? native.isDirectory() : native.mode === own.mode && native.size === own.size && (own.isSymbolicLink()

@@ -740,7 +740,9 @@ export async function observeStrace(
 	}
 	for (const pid of refusedIndexLocks) if (selected.get(pid)?.file.exitCode !== 0) taints.add("confinement_observation");
 	// A workspace file the traced processes wrote changes under their own hands; its later state is their effect, not an input.
-	for (const observed of changedMetadata) if (!written.has(workspaceName(observed) ?? observed)) {
+	// What it wrote outside the workspace, and the directories holding those names, change by its own hand.
+	const touched = new Set([...external].flatMap(target => [target, path.posix.dirname(target)]));
+	for (const observed of changedMetadata) if (!written.has(workspaceName(observed) ?? observed) && !touched.has(observed)) {
 		taints.add("mutable_input"); incompleteReasons.add(`metadata_changed:${observed}`);
 	}
 	if (!complete) taints.add("trace_incomplete");
