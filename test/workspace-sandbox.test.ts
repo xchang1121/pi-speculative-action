@@ -1321,7 +1321,7 @@ describe("workspace-branch ExecutionWorld", () => {
 		await sandbox.withWorkspace(root, async (workspace) => {
 			const first = await workspace.transactions.begin();
 			const second = await workspace.transactions.begin();
-			await expect(first.readBefore!("value.txt", 64)).rejects.toThrow("unavailable");
+			for (const capture of [first, second]) expect(Buffer.from((await capture.readBefore!("value.txt", 64))!).toString("utf8")).toBe("base\n");
 			await writeFile(path.join(workspace.sandboxRoot, "value.txt"), "overlap\n", "utf8");
 			for (const delta of await Promise.all([first.finish(), second.finish()])) {
 				expect(delta).toMatchObject({ complete: false, changes: [], reason: "overlapping_workspace_transaction" });
@@ -1338,6 +1338,25 @@ describe("workspace-branch ExecutionWorld", () => {
 			}
 			expect(Buffer.from(recoveredDelta.changes[0]?.before ?? []).toString("utf8")).toBe("overlap\n");
 			expect(Buffer.from(recoveredDelta.changes[0]?.after ?? []).toString("utf8")).toBe("recovered\n");
+		});
+	});
+
+	it("attributes overlapping intervals by their writers' own paths and fails closed on anything foreign to them", async () => {
+		const root = await temporaryRoot();
+		await writeFile(path.join(root, "shared.txt"), "base\n", "utf8");
+		await sandbox.withWorkspace(root, async (workspace) => {
+			const write = (name: string, text: string) => writeFile(path.join(workspace.sandboxRoot, name), text, "utf8");
+			const own = (written: string[], observed: string[] = [], endedAt = Date.now()) => async () =>
+				({ written: new Set(written), observed: new Set(observed), endedAt, interfered: async () => false });
+			for (const [observed, late, reason] of [[[], false, undefined], [["b.txt"], false, "overlapping_workspace_input:b.txt"], [[], true, "overlapping_workspace_write:a.txt"]] as const) {
+				const [first, second] = [await workspace.transactions.begin(), await workspace.transactions.begin()];
+				await write("a.txt", "first\n"); await write("b.txt", "second\n");
+				const endedAt = Date.now();
+				if (late) { await new Promise(resolve => setTimeout(resolve, 20)); await write("a.txt", "later\n"); }
+				const [delta, other] = await Promise.all([first.finish(own(["a.txt"], [...observed], endedAt)), second.finish(own(["b.txt"]))]);
+				expect(delta, `${reason}: ${delta.complete ? "" : delta.reason}`).toMatchObject(reason ? { complete: false, reason } : { complete: true, changes: [{ relativePath: "a.txt" }] });
+				if (!reason) expect([delta.changes.length, other.complete ? other.changes.map(change => change.relativePath) : other.reason]).toEqual([1, ["b.txt"]]);
+			}
 		});
 	});
 

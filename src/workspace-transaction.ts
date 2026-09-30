@@ -50,8 +50,20 @@ export type WorkspaceTransactionDelta =
 export interface WorkspaceTransactionCapture {
 	/** Borrow a bounded copy of an active interval's original regular-file bytes. */
 	readonly readBefore?: (relativePath: string, maxBytes: number) => Promise<Uint8Array | undefined>;
-	readonly finish: () => Promise<WorkspaceTransactionDelta>;
+	/** An overlapped interval is attributed only by its writer's own account; without one it fails closed. */
+	readonly finish: (ownership?: () => Promise<WorkspaceTransactionOwnership | undefined>) => Promise<WorkspaceTransactionDelta>;
 	readonly abort: () => Promise<void>;
+}
+
+/** What one interval's writer did, from its own trace, in workspace-relative paths. */
+export interface WorkspaceTransactionOwnership {
+	readonly written: ReadonlySet<string>;
+	/** Paths it read, stat'ed, probed or listed. */
+	readonly observed: ReadonlySet<string>;
+	/** Wall-clock milliseconds by which all its processes had exited. */
+	readonly endedAt: number;
+	/** Whether another writer touched any of these paths while this interval ran, up to `until`. */
+	readonly interfered: (paths: ReadonlySet<string>, until: number) => Promise<boolean>;
 }
 
 /** Generic mutation journal installed by the concrete workspace implementation. */
