@@ -1696,10 +1696,10 @@ extern char **environ;\nstatic void *idle(void *unused) { (void)unused; pause();
 int main(void) { char path[32] = "/bin/true\\0intact"; char *args[] = {path, 0}; pid_t pid; pthread_t thread; int status;
 	return pthread_create(&thread, 0, idle, 0) || posix_spawn(&pid, path, 0, 0, args, environ) || waitpid(pid, &status, 0) != pid || puts(path + 10) < 0; }\n`);
 			await compileBenchmarkHelper(fixture.workspace, { source: "spawner.c", output: "spawner", arguments: ["-pthread"] });
-			// Created files take the open's mode under the process's umask; flock execs SHELL off its stack top; tar opens -C O_PATH.
-			const spawned = await forkReusableBash(fixture, { label: "spawn", command: "./spawner; umask 027; echo x > shared; cp /bin/true tool; mkdir made; stat -c '%a %n' shared tool made; " +
-				"SHELL=/bin/sh flock shared -c 'tar cf - tool | tar xf - -C made' && ls made", actionNamespace: "spawn", executionFingerprint });
-			try { expect(textOutput(spawned.output.result)).toBe("intact\n640 shared\n750 tool\n750 made\ntool\n"); } finally { await spawned.dispose?.(); }
+			// Created files take the open's mode under the process's umask; flock execs SHELL off its stack top; tar opens -C O_PATH; an orphan keeps its cwd.
+			const spawned = await forkReusableBash(fixture, { label: "spawn", actionNamespace: "spawn", executionFingerprint, command: "./spawner; umask 027; echo x > shared; cp /bin/true tool; mkdir made; " +
+				"stat -c '%a %n' shared tool made; SHELL=/bin/sh flock shared -c 'tar cf - tool | tar xf - -C made' && ls made; cd made && (echo orphan > kept &); for i in $(seq 100); do [ -s kept ] && break; sleep 0.05; done; cat kept; echo piped | cat /dev/stdin" });
+			try { expect(textOutput(spawned.output.result)).toBe("intact\n640 shared\n750 tool\n750 made\ntool\norphan\npiped\n"); } finally { await spawned.dispose?.(); }
 		} finally { await fixture.dispose(); }
 	});
 
@@ -1966,7 +1966,7 @@ int main(void) { int fds[2], status; char queue[8]; if (pipe(fds) || fds[0] != 3
 			});
 			branch = await forkReusableBash(fixture, {
 				label: "concurrency",
-				command: "set -e; /bin/bash -c '(/bin/sleep 0.05; echo x > escaped.txt) 2>/dev/null & exit 0'; /usr/bin/printf 'trace-root-fallback\\n'; mkdir barrier; barrier-worker barrier & first=$!; barrier-worker barrier & second=$!; wait \"$first\"; wait \"$second\"; redirect-worker | { read line; printf '%s\\n' \"$line\" > redirected.txt; printf '%s\\n' \"$line\"; }; " +
+				command: "set -e; /bin/bash -c '(/bin/sleep 0.05; echo x > escaped.txt) 2>/dev/null & exit 0'; until [ -e escaped.txt ]; do :; done; /usr/bin/printf 'trace-root-fallback\\n'; mkdir barrier; barrier-worker barrier & first=$!; barrier-worker barrier & second=$!; wait \"$first\"; wait \"$second\"; redirect-worker | { read line; printf '%s\\n' \"$line\" > redirected.txt; printf '%s\\n' \"$line\"; }; " +
 					"route-worker 2>/dev/null; route-worker 2>&1 1>/dev/null; ./bin.js; /usr/bin/printf 'file-fallback\\n' > redirected-file.txt; /usr/bin/cat < redirected-file.txt; printf 'pipe-fallback\\n' | /usr/bin/cat; " + streamProbes + "; printf '%32768s:end' ''",
 				actionNamespace: "process-concurrency-test",
 				executionFingerprint,
@@ -1985,7 +1985,7 @@ int main(void) { int fds[2], status; char queue[8]; if (pipe(fds) || fds[0] != 3
 			const validation = JSON.stringify(await branch.validate?.());
 			expect([validation.includes("broker_bypass:"), validation.includes("injected trace allocation failure")], validation)
 				.toEqual([typeof process.execve !== "function", true]);
-			expect(existsSync(path.join(fixture.workspace, "escaped.txt")), "an orphan outside the supervisor must not reach the source").toBe(false);
+			expect(existsSync(path.join(fixture.workspace, "escaped.txt")), "an orphan's write, adopted by the supervisor, stays in the sandbox").toBe(false);
 			await branch.dispose();
 			branch = undefined;
 			for (const failure of ["spawn", "abort", "nested-abort", "nested-seal", "session-close"] as const) {
