@@ -319,6 +319,13 @@ export class LinuxProcessReuseBackend {
 	actorMetrics(): LinuxProcessReuseMetrics { return Object.freeze({ ...this.actorCounters }); }
 
 	/** Scoped launches; sandbox bindings are still speculative until adopted. Raw parameters are never persisted. */
+	/** Whether a bound launch reads a queue only another process writes while it runs: alone, it runs only up to that input. */
+	fed(binding: ProcessExecutionBinding): boolean {
+		const invocation = this.handoffs.resolveBinding(binding, binding.scope), resources = invocation && "resources" in invocation ? invocation.resources : undefined;
+		return Object.entries(resources?.objects ?? {}).some(([image, object]) => object.queue?.producer === "live" &&
+			!Object.values(resources!.descriptions).some(description => description.object === Number(image) && (description.flags & 3) !== 0));
+	}
+
 	executionBindings(scope: ExecutionScope): readonly ProcessExecutionBinding[] {
 		return this.handoffs.bindings(scope).filter(binding => {
 			const invocation = this.handoffs.resolveBinding(binding, scope);
@@ -810,8 +817,12 @@ export class LinuxProcessReuseBackend {
 		const prototype = await this.prototype(session, request, executable, invocation.outputRoute);
 		if (processWeakKey(prototype) !== binding.key) throw new Error("bound process execution context changed");
 		this.add(session, "requests");
+		const observation = { complete: true, paths: [], taints: [], tracedProcesses: 0, incompleteReasons: [] }, before = await session.workspace.structure.capture();
 		const result = await this.executeRequest(session, request, executable, invocation.outputRoute, session.metrics.requests, prototype,
-			capture => { session.topLevelCapture = { ...capture, observation: { complete: true, paths: [], taints: [], tracedProcesses: 0, incompleteReasons: [] } }; });
+			capture => { session.topLevelCapture = { ...capture, observation }; });
+		// Only it and what it launched ran here: when its own transaction could not seal (what it launched overlapped it), the session's
+		// endpoints stand for its interval, and what it observed joins its launches' evidence.
+		if (result.kind !== "suspended") session.topLevelCapture ??= { before, after: await session.workspace.structure.capture(), observation };
 		return { output: (result.output ?? []).map(({ fd, data }) => ({ fd, data: Buffer.from(data, "base64") })),
 			...(result.kind === "suspended" ? { suspended: true as const } : { exit: result.exit! }) };
 	}
