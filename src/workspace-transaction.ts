@@ -26,6 +26,8 @@ export interface WorkspaceRegularDelta extends WorkspaceFileMutation {
 	readonly beforeMode?: number;
 	readonly afterMode?: number;
 	readonly afterModified?: string;
+	/** The identity that stands for the before bytes (see `settledIdentity`): an unchanged file proves its baseline by it. */
+	readonly beforeIdentity?: string;
 }
 
 export type WorkspaceTransactionDelta =

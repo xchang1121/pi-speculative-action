@@ -1767,6 +1767,7 @@ async function sealSessionEvidence(session: ActiveSession, changes: readonly San
 		after: change.after,
 		beforeMode: change.beforeMode,
 		afterMode: change.afterMode,
+		...(change.beforeIdentity ? { beforeIdentity: change.beforeIdentity } : {}),
 	}]);
 	const effects = diffWorkspaceStructures(capture.before, capture.after, regularDeltas, session.projection);
 	if (!effects.complete) {

@@ -1,7 +1,7 @@
 import { directoryEntriesDigest } from "./process-observation.ts";
 import { lstat, readFile, stat } from "node:fs/promises";
 import path from "node:path";
-import { captureFileDigest, captureFilesystemEntry, sameFilesystemIdentity } from "./filesystem-evidence.ts";
+import { captureFileDigest, captureFilesystemEntry, mapFilesystem, sameFilesystemIdentity } from "./filesystem-evidence.ts";
 import { errorMessage, isMissing as missing } from "./error-utils.ts";
 import { type DynamicDependency, type DynamicDependencyCertificate, filesystemMetadataDigest, filesystemObservationDigest,
 	type FilesystemObservationField, type ProcessProvenanceCertificate, processStrongKey, type ProvenanceTaint, sha256Digest,
@@ -71,71 +71,49 @@ export async function validateDynamicDependencyCertificate(
 
 	const current: DynamicDependency[] = [];
 	const changed: string[] = [];
-	for (const expected of structuredClone(certificate.dependencies)) {
+	// Independent observations: checked concurrently, settled in certificate order (the strong key hashes that order).
+	const expectations = structuredClone(certificate.dependencies), listings = new Map<string, ReturnType<typeof captureFilesystemEntry>>();
+	// Names missing from one directory, or its own entries, share one listing of it within a validation.
+	const list = (target: string) => listings.get(target) ?? listings.set(target, captureFilesystemEntry(target, "directory")).get(target)!;
+	const checks = await mapFilesystem(expectations, async (expected): Promise<{ observed?: DynamicDependency; missing?: true } | string> => {
 		try {
-			let observed: DynamicDependency | undefined;
 			if (expected.kind === "fd") {
 				const descriptor = context.fileDescriptors?.get(expected.fd);
-				if (!descriptor) return indeterminate(`fd_unavailable:${expected.fd}`);
-				observed = { kind: "fd", fd: expected.fd, ...descriptor };
-			} else {
-				const physicalPath = context.resolvePath ? context.resolvePath(expected.path) : path.isAbsolute(expected.path) ? path.resolve(expected.path) : undefined;
-				if (!physicalPath) return indeterminate(`path_unmapped:${expected.path}`);
-				switch (expected.kind) {
-					case "file": {
-						const captured = await captureFileDependency(physicalPath, expected.path, expected.role, {
-							includeMetadata: expected.metadataDigest !== undefined,
-							maxFileBytes: context.maxFileBytes,
-							aliases: expected.aliases, resolvePath: context.resolvePath,
-						});
-						filesRead += captured.filesRead;
-						bytesRead += captured.bytesRead;
-						observed = captured.dependency;
-						break;
-					}
-					case "directory":
-						observed = await captureDirectoryDependency(
-							physicalPath,
-							expected.path,
-							expected.metadataDigest !== undefined,
-							expected.excludedEntries,
-							expected.entriesDigest !== undefined,
-						);
-						break;
-					case "absence":
-						observed = await captureAbsenceDependency(
-							physicalPath,
-							expected.path,
-							expected.parentEntriesDigest !== undefined,
-							expected.parentExcludedEntries,
-						);
-						break;
-					case "symlink":
-						observed = await captureSymlinkDependency(physicalPath, expected.path);
-						break;
-					case "metadata":
-						observed = await captureMetadataDependency(physicalPath, expected.path, expected.followSymlinks, expected.fields);
-						break;
-					case "lock":
-						observed = await probeLock(physicalPath, expected.path, expected.exclusive);
-						break;
-				}
+				return descriptor ? { observed: { kind: "fd", fd: expected.fd, ...descriptor } } : `fd_unavailable:${expected.fd}`;
 			}
-			if (observed) current.push(observed);
-			if (!observed || OBSERVATION_FIELDS[expected.kind].some(field => Reflect.get(observed, field) !== Reflect.get(expected, field))) {
-				changed.push(expected.kind === "fd" ? `fd:${expected.fd}` : expected.path);
+			const physicalPath = context.resolvePath ? context.resolvePath(expected.path) : path.isAbsolute(expected.path) ? path.resolve(expected.path) : undefined;
+			if (!physicalPath) return `path_unmapped:${expected.path}`;
+			switch (expected.kind) {
+				case "file": {
+					const captured = await captureFileDependency(physicalPath, expected.path, expected.role, {
+						includeMetadata: expected.metadataDigest !== undefined, maxFileBytes: context.maxFileBytes, aliases: expected.aliases, resolvePath: context.resolvePath });
+					filesRead += captured.filesRead;
+					bytesRead += captured.bytesRead;
+					return { observed: captured.dependency };
+				}
+				case "directory": return { observed: await captureDirectoryDependency(physicalPath, expected.path, expected.metadataDigest !== undefined,
+					expected.excludedEntries, expected.entriesDigest !== undefined, list) };
+				case "absence": return { observed: await captureAbsenceDependency(physicalPath, expected.path, expected.parentEntriesDigest !== undefined,
+					expected.parentExcludedEntries, list) };
+				case "symlink": return { observed: await captureSymlinkDependency(physicalPath, expected.path) };
+				case "metadata": return { observed: await captureMetadataDependency(physicalPath, expected.path, expected.followSymlinks, expected.fields) };
+				case "lock": return { observed: await probeLock(physicalPath, expected.path, expected.exclusive) };
 			}
 		} catch (error) {
-			if (missing(error)) { changed.push(expected.kind === "fd" ? `fd:${expected.fd}` : expected.path); continue; }
-			return indeterminate(`validation_error:${expected.kind === "fd" ? expected.fd : expected.path}:${errorMessage(error)}`);
+			if (missing(error)) return { missing: true };
+			return `validation_error:${expected.kind === "fd" ? expected.fd : expected.path}:${errorMessage(error)}`;
+		}
+	});
+	for (const [index, check] of checks.entries()) {
+		if (typeof check === "string") return indeterminate(check);
+		const expected = expectations[index]!, { observed } = check;
+		if (observed) current.push(observed);
+		if (!observed || OBSERVATION_FIELDS[expected.kind].some(field => Reflect.get(observed, field) !== Reflect.get(expected, field))) {
+			changed.push(expected.kind === "fd" ? `fd:${expected.fd}` : expected.path);
 		}
 	}
 
-	return {
-		...(changed.length ? { status: "stale", changed: Object.freeze([...new Set(changed)]) } : { status: "valid" }),
-		dependencies: Object.freeze(current),
-		...metrics(),
-	};
+	return { ...(changed.length ? { status: "stale", changed: Object.freeze([...new Set(changed)]) } : { status: "valid" }), dependencies: Object.freeze(current), ...metrics() };
 }
 
 /** A lock still holds as a dependency while no one holds one it would conflict with: /proc/locks lists every flock, record and
@@ -196,6 +174,7 @@ export async function captureDirectoryDependency(
 	includeMetadata = false,
 	excludedEntries: readonly string[] = [],
 	listed = true,
+	list = (target: string) => captureFilesystemEntry(target, "directory"),
 ): Promise<Extract<DynamicDependency, { kind: "directory" }>> {
 	if (!listed) {
 		const info = await lstat(physicalPath, { bigint: true });
@@ -203,7 +182,7 @@ export async function captureDirectoryDependency(
 		return { kind: "directory", path: logicalPath, metadataDigest: filesystemMetadataDigest(info) };
 	}
 	const excluded = new Set(excludedEntries);
-	const { info, entries } = await captureFilesystemEntry(physicalPath, "directory");
+	const { info, entries } = await list(physicalPath);
 	if (!entries) throw new Error("not_directory");
 	return {
 		kind: "directory",
@@ -219,6 +198,7 @@ export async function captureAbsenceDependency(
 	logicalPath: string,
 	captureParent = true,
 	parentExcludedEntries: readonly string[] = [],
+	list?: Parameters<typeof captureDirectoryDependency>[5],
 ): Promise<Extract<DynamicDependency, { kind: "absence" }> | undefined> {
 	try { await lstat(physicalPath); return undefined; } catch (error) {
 		if (!missing(error)) throw error;
@@ -226,13 +206,8 @@ export async function captureAbsenceDependency(
 	if (!captureParent) return { kind: "absence", path: logicalPath };
 	const parentPhysical = path.dirname(physicalPath);
 	const parentLogical = path.posix.dirname(logicalPath.replaceAll("\\", "/"));
-	const parent = await captureDirectoryDependency(parentPhysical, parentLogical, false, parentExcludedEntries);
-	return {
-		kind: "absence",
-		path: logicalPath,
-		parentEntriesDigest: parent.entriesDigest,
-		...(parent.excludedEntries ? { parentExcludedEntries: parent.excludedEntries } : {}),
-	};
+	const parent = await captureDirectoryDependency(parentPhysical, parentLogical, false, parentExcludedEntries, true, list);
+	return { kind: "absence", path: logicalPath, parentEntriesDigest: parent.entriesDigest, ...(parent.excludedEntries ? { parentExcludedEntries: parent.excludedEntries } : {}) };
 }
 
 export async function captureSymlinkDependency(
