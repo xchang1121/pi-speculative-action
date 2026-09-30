@@ -1703,18 +1703,19 @@ int main(void) { char path[32] = "/bin/true\\0intact"; char *args[] = {path, 0};
 		if (process.platform !== "linux") return skip("Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-private-writes-"), outside = await mkdtemp(path.join(os.tmpdir(), "pi-private-outside-"));
 		try {
-			await writeFile(path.join(outside, "kept"), "old\n");
+			for (const name of ["kept", "stay"]) await writeFile(path.join(outside, name), "old\n");
 			await writeFile(path.join(fixture.workspace, "ext-writer"), "#!/bin/sh\nprintf 'g\\n' > \"$1\"\n", { mode: 0o755 });
 			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
 			const scratch = "t=$(mktemp -d) && echo t > $t/x && cat $t/x && rm -r $t", host = async (name: string) => readFile(path.join(outside, name), "utf8").catch(() => "absent");
-			// Written, replaced and scratch paths in one command: only the net changes commit, and only on adoption.
-			const branch = await forkReusableBash(fixture, { label: "commit", command: `mkdir ${outside}/d && echo private > ${outside}/d/f && echo new > ${outside}/kept && cat ${outside}/d/f && ${scratch}`,
-				actionNamespace: "private-writes", executionFingerprint });
+			// Written, replaced and scratch paths in one command: only the net changes commit, and only on adoption, with the times
+			// they were left. The directory holding them lists the host's entries with the branch's, and is the host's own.
+			const branch = await forkReusableBash(fixture, { label: "commit", command: `mkdir ${outside}/d && echo private > ${outside}/d/f && echo new > ${outside}/kept && cat ${outside}/d/f && ` +
+				`touch -d @981173106.123456789 ${outside}/d/f && echo $(ls -a ${outside}) $(stat -c %i ${outside}) && ${scratch}`, actionNamespace: "private-writes", executionFingerprint });
 			try {
-				expect(textOutput(branch.output.result)).toBe("private\nt\n");
+				expect(textOutput(branch.output.result)).toBe(`private\n. .. d kept stay ${(await stat(outside)).ino}\nt\n`);
 				expect([await host("d/f"), await host("kept")], "a private write must not reach the host before adoption").toEqual(["absent", "old\n"]);
 				await branch.commit();
-				expect([await host("d/f"), await host("kept")]).toEqual(["private\n", "new\n"]);
+				expect([await host("d/f"), await host("kept"), (await stat(path.join(outside, "d/f"), { bigint: true })).mtimeNs]).toEqual(["private\n", "new\n", 981173106123456789n]);
 			} finally { await branch.dispose?.(); }
 			// A host object someone changed meanwhile is no baseline: the Actor must run the command instead.
 			const raced = await forkReusableBash(fixture, { label: "raced", command: `echo again > ${outside}/kept`, actionNamespace: "private-writes", executionFingerprint });

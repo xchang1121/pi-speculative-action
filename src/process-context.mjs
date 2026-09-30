@@ -120,8 +120,17 @@ export function processContextFromRaw({ status, limits, processStat, shell, desc
 	};
 }
 
-/** @param {ProcessExecutionContext} context @param {readonly [0 | 1 | 2, 0 | 1 | 2]} route 0 discards into /dev/null @param {boolean} closeStdin @param {ProcessExecutionContext["regularDescriptors"]} [regularDescriptors] @param {readonly [boolean, boolean]} [outputPipes] @returns {ProcessExecutionContext} */
-export function routedProcessContext(context, route, closeStdin = false, regularDescriptors, outputPipes) {
+/** Status flags a launcher sets again on a target's routed outputs (its parent's own, like make's O_APPEND); the rest pin the stream. */
+const OUTPUT_STATUS_FLAGS = 0o2000 | 0o4000;
+
+/** The status flags of a context's standard outputs a launcher can set again, when either has one. @param {Pick<ProcessExecutionContext, "key">} context @returns {[number, number] | undefined} */
+export function outputStatusFlags(context) {
+	const [, output, error] = JSON.parse(context.key).descriptors, flags = /** @type {[number, number]} */ ([output.flags & OUTPUT_STATUS_FLAGS, error.flags & OUTPUT_STATUS_FLAGS]);
+	return flags.some(Boolean) ? flags : undefined;
+}
+
+/** @param {ProcessExecutionContext} context @param {readonly [0 | 1 | 2, 0 | 1 | 2]} route 0 discards into /dev/null @param {boolean} closeStdin @param {ProcessExecutionContext["regularDescriptors"]} [regularDescriptors] @param {readonly [boolean, boolean]} [outputPipes] @param {readonly [number, number]} [outputFlags] @returns {ProcessExecutionContext} */
+export function routedProcessContext(context, route, closeStdin = false, regularDescriptors, outputPipes, outputFlags) {
 	const semantic = JSON.parse(context.key);
 	if (!semantic.credentials || !semantic.signals ||
 		![semantic.signals.blocked, semantic.signals.ignored].every(value => typeof value === "string" && /^[0-9a-f]+$/i.test(value)) ||
@@ -136,7 +145,10 @@ export function routedProcessContext(context, route, closeStdin = false, regular
 		{ ...output(route[0]), fd: 1, alias: identity(output(route[0]), `outlet:${route[0]}`) },
 		{ ...output(route[1]), fd: 2, alias: identity(output(route[1]), `outlet:${route[1]}`) },
 	];
-	for (let index = 0; index < 2; index++) if (outputPipes?.[index]) Object.assign(descriptors[index + 1], { type: "pipe", flags: 1 });
+	for (let index = 0; index < 2; index++) {
+		if (outputPipes?.[index]) Object.assign(descriptors[index + 1], { type: "pipe", flags: 1 });
+		if (outputFlags) descriptors[index + 1].flags = descriptors[index + 1].flags & ~OUTPUT_STATUS_FLAGS | outputFlags[index] & OUTPUT_STATUS_FLAGS;
+	}
 	for (const descriptor of regularDescriptors ?? []) {
 		const entry = { fd: descriptor.fd, type: descriptor.type ?? "regular", flags: descriptor.flags, alias: `ofd:${descriptor.alias}`,
 			...(descriptor.type === "pipe" || descriptor.type === "socket" ? { queue: descriptor.image } : {}) };

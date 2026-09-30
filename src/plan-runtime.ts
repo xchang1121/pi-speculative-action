@@ -82,11 +82,7 @@ export class PredictionOpportunity {
 
 	claim(actorAction: ActorActionIdentity, relation: ActionKeyMatch): boolean {
 		if (this.stateValue.status !== "pending") return false;
-		this.stateValue = Object.freeze({
-			status: "matching",
-			actorAction: Object.freeze({ ...actorAction }),
-			relation: Object.freeze({ ...relation }),
-		});
+		this.stateValue = Object.freeze({ status: "matching", actorAction: Object.freeze({ ...actorAction }), relation: Object.freeze({ ...relation }) });
 		return true;
 	}
 
@@ -167,9 +163,7 @@ export class PlanRuntime {
 		const validated = captured ? { ok: true as const, actions: Object.freeze(offered) } : validateActions(offered);
 		if (!validated.ok) return { accepted: false, reason: validated.reason };
 		if (remove.some((id) => !validToken(id))) return { accepted: false, reason: "invalid_action" };
-		update = Object.freeze("actions" in update
-			? { ...update, actions: validated.actions }
-			: { ...update, upsert: validated.actions, remove: Object.freeze(remove) });
+		update = Object.freeze("actions" in update ? { ...update, actions: validated.actions } : { ...update, upsert: validated.actions, remove: Object.freeze(remove) });
 		capturedUpdates.add(update);
 		return { update };
 	}
@@ -187,8 +181,7 @@ export class PlanRuntime {
 		const actions = new Map(proposal ? [] : [...current!.nodes].map(([id, node]) => [id, node.action] as const));
 		if (!proposal) for (const id of owned.remove ?? []) actions.delete(id);
 		for (const action of upserted) actions.set(action.id, action);
-		const ordered = dependencyOrder(actions, (dependency) =>
-			dependency.proposalID !== id && this.parent(id, dependency) !== undefined);
+		const ordered = dependencyOrder(actions, (dependency) => dependency.proposalID !== id && this.parent(id, dependency) !== undefined);
 		if (!ordered) return { accepted: false, reason: "invalid_dependency" };
 		return this.commit({ id, source: owned.source, revision: owned.revision, actions, upserted, ordered, anchorDecisionSeq });
 	}
@@ -230,9 +223,7 @@ export class PlanRuntime {
 		let rearmed = false;
 		for (const { node } of this.mutableValues()) {
 			if (
-				!("candidateID" in node.execution) ||
-				node.execution.candidateID !== candidateID ||
-				node.opportunity.state.status !== "pending" ||
+				!("candidateID" in node.execution) || node.execution.candidateID !== candidateID || node.opportunity.state.status !== "pending" ||
 				!executionSettled(executionProjection(node.execution))
 			) {
 				continue;
@@ -263,9 +254,7 @@ export class PlanRuntime {
 		if (!node || (node.execution.status !== "deferred" && node.execution.status !== "scheduled")) return false;
 		const attachment = { status: "attached" as const, candidateID, owner };
 		node.execution = attachment;
-		void owner.completion.then(state => {
-			if (node.execution === attachment) node.execution = projectExecution(state, candidateID);
-		});
+		void owner.completion.then(state => { if (node.execution === attachment) node.execution = projectExecution(state, candidateID); });
 		return true;
 	}
 
@@ -332,8 +321,7 @@ export class PlanRuntime {
 	unsettled(): readonly PlanRuntimeNode[] { return this.select((node) => node.opportunity.state.status !== "settled"); }
 
 	consumers(candidateID: string): readonly PlanRuntimeNode[] {
-		return this.select((node) => node.opportunity.state.status !== "settled" &&
-			"candidateID" in node.execution && node.execution.candidateID === candidateID);
+		return this.select((node) => node.opportunity.state.status !== "settled" && "candidateID" in node.execution && node.execution.candidateID === candidateID);
 	}
 
 	due(settledDecisionSeq: number): readonly PlanRuntimeNode[] {
@@ -487,11 +475,7 @@ export class PlanRuntime {
 	}
 
 	private isMatchable(plan: MutablePlan, node: MutableNode, decisionSequence: number): boolean {
-		return (
-			node.opportunity.state.status === "pending" &&
-			node.earliestDecisionSeq <= decisionSequence &&
-			this.dependencyReadiness(plan, node) === "ready"
-		);
+		return (node.opportunity.state.status === "pending" && node.earliestDecisionSeq <= decisionSequence && this.dependencyReadiness(plan, node) === "ready");
 	}
 
 	private recompute(graph: PlanGraph): void {
@@ -568,9 +552,7 @@ function predictionAdopted(settlement: PredictionSettlement | undefined): boolea
 }
 
 function freezeAdoption(adoption: PredictionAdoption): PredictionAdoption {
-	return adoption.status === "adopted"
-		? Object.freeze({ ...adoption })
-		: Object.freeze({ ...adoption, cause: Object.freeze({ ...adoption.cause }) });
+	return adoption.status === "adopted" ? Object.freeze({ ...adoption }) : Object.freeze({ ...adoption, cause: Object.freeze({ ...adoption.cause }) });
 }
 
 function sameActorAction(left: ActorActionIdentity, right: ActorActionIdentity): boolean {
@@ -599,12 +581,7 @@ function projectExecution(state: PlanExecutionOwner["execution"], candidateID: s
 }
 
 function planSnapshot(plan: MutablePlan): MaterializedPlan {
-	return Object.freeze({
-		id: plan.id,
-		source: plan.source,
-		revision: plan.revision,
-		actions: Object.freeze([...plan.nodes.values()].map((node) => node.action)),
-	});
+	return Object.freeze({ id: plan.id, source: plan.source, revision: plan.revision, actions: Object.freeze([...plan.nodes.values()].map((node) => node.action)) });
 }
 
 function validateActions(actions: readonly PlanAction[]):
@@ -614,8 +591,7 @@ function validateActions(actions: readonly PlanAction[]):
 	const result = actions.map((source) => ({ ...source }));
 	const ids = new Set<string>();
 	for (const source of result) {
-		if (!validToken(source.id) || !validToken(source.tool) ||
-			(source.type !== "tool_call" && source.type !== "operation") ||
+		if (!validToken(source.id) || !validToken(source.tool) || (source.type !== "tool_call" && source.type !== "operation") ||
 			(source.type === "operation" ? !source.operation || !Object.isFrozen(source.operation) : source.operation !== undefined)) {
 			return { ok: false, reason: "invalid_action" };
 		}

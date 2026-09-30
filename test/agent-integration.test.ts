@@ -1383,6 +1383,32 @@ describe("speculative action host", () => {
 		} finally { await controller.dispose(); }
 	});
 
+	it("reruns the learned command whose operations an Actor edit left stale, for those operations, until their results hold", async () => {
+		const cwd = await temporaryWorkspace(), tool = createReadTool(cwd), patternAware = patternAwareSettings({ enabled: true, multiStepEnabled: false });
+		const store = new PatternAwareStore(patternAware, undefined, patternAwareActionSemantics(PI_ACTION_SEMANTICS, cwd));
+		const request = patternRequest(tool, patternAware, "session", { bash: "schema", write: "schema" }), build = { command: "make -s" };
+		const controller = createPatternPlanSource({ sessionID: "session", cwd, store, actionSemantics: PI_ACTION_SEMANTICS, projectionRules: [] });
+		let compiled = true;
+		const operation = (identity: string, executionMs: number, stale: () => boolean) => Object.freeze({ backend: "test", identity, executionMs,
+			expectedDurationMs: executionMs + 10, permissionHash: PI_ACTION_SEMANTICS.buildKey("bash", build, cwd, "schema")!.hash, available: true, stale: async () => stale() });
+		const observe = (name: string, concrete: Record<string, unknown>, extra: object = {}) => controller.source.observe!({ ...request,
+			action: PI_ACTION_SEMANTICS.buildKey(name, concrete, cwd, "schema")!, consumeInput: { sessionID: "session", turnID: request.startInput.turnID, tool: name, args: concrete, tools: [tool] },
+			tool: name, concrete, output: { result: textResult("done"), isError: false }, durationMs: 20, order: 0, ...extra });
+		try {
+			expect(await observe("bash", build, { operations: [operation("compile", 50, () => !compiled), operation("link", 30, () => false)] })).toBeUndefined();
+			compiled = false;
+			expect(await observe("write", { path: "a.c", content: "int x;" })).toMatchObject({ actions: [{ type: "tool_call", tool: "bash", input: build,
+				background: true, producesOperations: true, expectedLatencyBenefitMs: 50, expectedDurationMs: 60 }] });
+			compiled = true;
+			expect(await observe("write", { path: "notes.txt", content: "unrelated" })).toBeUndefined();
+			// A turn that closed before its edit's rerun was admitted leaves the rerun to the next turn's proposal.
+			compiled = false;
+			const closed = new AbortController(); closed.abort();
+			expect(await observe("write", { path: "a.c", content: "int y;" }, { signal: closed.signal })).toBeUndefined();
+			expect(await controller.source.propose(request)).toMatchObject({ actions: [{ tool: "bash", input: build, producesOperations: true }] });
+		} finally { await controller.dispose(); }
+	});
+
 	it("issues a parent's operation choices once and credits its pattern only with an observed adoption", async () => {
 		const store = new PatternAwareStore(patternAwareSettings({ enabled: true })), issued = vi.spyOn(store, "issued"), settled = vi.spyOn(store, "settled");
 		const controller = createPatternPlanSource({ sessionID: "session", cwd: await temporaryWorkspace(), store, actionSemantics: PI_ACTION_SEMANTICS, projectionRules: [] });

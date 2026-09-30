@@ -1,5 +1,5 @@
 import { BoundedRecencyMap } from "./bounded-recency-map.ts";
-import { processContextFromRaw, routedProcessContext, validProcessContext, type ProcessExecutionContext, type RawProcessContext } from "./process-context.mjs";
+import { outputStatusFlags, processContextFromRaw, routedProcessContext, validProcessContext, type ProcessExecutionContext, type RawProcessContext } from "./process-context.mjs";
 import { execFile, spawn } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomBytes } from "node:crypto";
@@ -149,11 +149,13 @@ interface DispatcherRequest {
 
 /** The outlet each target output uses; 0 discards into /dev/null. */
 type OutputRoute = readonly [0 | 1 | 2, 0 | 1 | 2];
-type RequestEligibility = { readonly route: OutputRoute; readonly outputPipes?: readonly [boolean, boolean] } | { readonly reason: string };
+type RequestEligibility = { readonly route: OutputRoute; readonly outputPipes?: readonly [boolean, boolean]; readonly outputFlags?: readonly [number, number] } | { readonly reason: string };
 /** A brokered run's net effect on an inherited pipe of one repeated byte, applied by the launcher to its own end. */
 type StreamSettlement = { readonly fd: number; readonly kind: "i" | "o"; readonly data: Buffer };
 type ProcessArguments = Pick<DispatcherRequest, "argv0" | "args" | "cwd" | "environment"> & {
 	readonly closeStdin?: boolean; readonly resources?: ProcessResourceGraph; readonly outputPipes?: readonly [boolean, boolean]; readonly streams?: true; // inherited pipes the launcher holds and settles
+	/** Status flags its parent set on its outputs, which its launcher sets again. */
+	readonly outputFlags?: readonly [number, number];
 };
 type BoundProcessInvocation = ProcessArguments & {
 	readonly sourceRoot: string;
@@ -319,6 +321,18 @@ export class LinuxProcessReuseBackend {
 			const invocation = this.handoffs.resolveBinding(binding, scope);
 			return invocation && !("trackingOnly" in invocation);
 		});
+	}
+
+	/** Whether a run of a learned launch would redo work: no result of it, this session's or stored, holds on the workspace now. */
+	async bindingStale(binding: ProcessExecutionBinding): Promise<boolean> {
+		const invocation = this.handoffs.resolveBinding(binding, binding.scope);
+		if (!invocation || "trackingOnly" in invocation) return true;
+		const projection = new ExecutionPathProjection({ sourceRoot: invocation.sourceRoot, workspaceRoot: invocation.sourceRoot });
+		for (const certificate of [...this.handoffs.results(binding.key, binding.scope), ...await this.store.findByWeakKey(binding.key, invocation.executable).catch(() => [])]) {
+			if ((await validateDynamicDependencyCertificate(certificate.dependencyCertificate, { resolvePath: (logical) => projection.toPhysical(logical),
+				acceptedTaints: [...TRANSFERRED_INPUT_TAINTS] }).catch(() => undefined))?.status === "valid") return false;
+		}
+		return true;
 	}
 
 	/** Keep possible publication visible through preparation, execution, and final evidence capture. */
@@ -776,7 +790,8 @@ export class LinuxProcessReuseBackend {
 		}
 		const { argv0, args, cwd, environment } = request;
 		return this.executeRequest(session, { argv0, args, cwd, environment, ...(typeof resources === "object" ? { resources, streams: true as const } : {}),
-			...(eligibility.outputPipes ? { outputPipes: eligibility.outputPipes } : {}) }, executable, eligibility.route, requestID, undefined, undefined, request.pid);
+			...(eligibility.outputPipes ? { outputPipes: eligibility.outputPipes } : {}), ...(eligibility.outputFlags ? { outputFlags: eligibility.outputFlags } : {}) },
+			executable, eligibility.route, requestID, undefined, undefined, request.pid);
 	}
 
 	/** A pipe of one repeated byte (a jobserver's tokens) ends as it began whatever order its bytes move in: only those are brokered. */
@@ -975,7 +990,7 @@ export class LinuxProcessReuseBackend {
 				const binding = this.handoffs.observe(weakKey, executablePath, scope!, {
 					argv0: snapshot.argv[0]!, args: snapshot.argv.slice(1), environment: snapshot.environment,
 					cwd: projection.toLogical(snapshot.cwd), executable: executablePath, sourceRoot, outputRoute: snapshot.outputRoute,
-					...(snapshot.outputPipes?.some(Boolean) ? { outputPipes: snapshot.outputPipes } : {}),
+					...(snapshot.outputPipes?.some(Boolean) ? { outputPipes: snapshot.outputPipes } : {}), ...(outputStatusFlags(snapshot.context) ? { outputFlags: outputStatusFlags(snapshot.context) } : {}),
 					...(snapshot.context.descriptorTypes[0] === "closed" ? { closeStdin: true } : {}),
 					...(resources ? { resources } : {}),
 				}, durationMs);
@@ -1051,7 +1066,8 @@ export class LinuxProcessReuseBackend {
 					this.recordHit(acquired.producer?.scope, acquired.joined, undefined, scope);
 					this.processScheduler.observeAdoption(timing, Math.max(0, performance.now() - requestStarted - acquired.waitedMs));
 					this.addActor("reusedProcessMs", plan.certificate.result.observedProcessMs ?? 0);
-					if (scope) acquired.producer?.ownership.adopted({ scope, id: process.id, sequence: process.sequence, operationIdentity: weakKey });
+					if (scope) acquired.producer?.ownership.adopted({ scope, id: process.id, sequence: process.sequence, operationIdentity: weakKey,
+						executionMs: plan.certificate.result.observedProcessMs ?? 0 });
 				},
 			};
 		} catch (error) {
@@ -1228,7 +1244,7 @@ export class LinuxProcessReuseBackend {
 				"--",
 				ready.dispatcher,
 				descriptorManifest ? "--exec-fds" : request.closeStdin ? "--exec-closed-input" : "--exec",
-				outputRoute.join("") + (outputPipes ? request.outputPipes!.map(pipe => pipe ? "p" : "s").join("") : ""),
+				outputRoute.join("") + (outputPipes ? request.outputPipes!.map(pipe => pipe ? "p" : "s").join("") : "") + (request.outputFlags ? `,${request.outputFlags.join(",")}` : ""),
 				...(descriptorManifest ? [descriptorManifest, descriptorReportPath!] : []),
 				request.argv0,
 				image,
@@ -1446,7 +1462,7 @@ export class LinuxProcessReuseBackend {
 						const binding = this.handoffs.bind(weakKey, work, {
 							argv0: request.argv0, args: request.args, environment: request.environment,
 							cwd: logicalCwd, executable: logicalExecutable, sourceRoot: session.sourceRoot, outputRoute, producer: session.nestedProducer,
-							...(request.outputPipes ? { outputPipes: request.outputPipes } : {}),
+							...(request.outputPipes ? { outputPipes: request.outputPipes } : {}), ...(request.outputFlags ? { outputFlags: request.outputFlags } : {}),
 							...(request.closeStdin ? { closeStdin: true } : {}),
 								...(request.resources ? { resources: request.resources } : {}),
 						});
@@ -1561,7 +1577,7 @@ export class LinuxProcessReuseBackend {
 			argv: [request.argv0, ...request.args],
 			cwd: request.cwd,
 			environment: request.environment,
-			context: routedProcessContext(ready.executionContext, outputRoute, request.closeStdin, descriptorInputs(request.resources).filter(input => input.installed !== false), request.outputPipes),
+			context: routedProcessContext(ready.executionContext, outputRoute, request.closeStdin, descriptorInputs(request.resources).filter(input => input.installed !== false), request.outputPipes, request.outputFlags),
 			...(request.resources ? { resources: request.resources } : {}),
 		}, session.projection, executableDigest, ready.platformFingerprint);
 	}
@@ -2591,11 +2607,11 @@ async function eligibleRequest(session: ActiveSession, request: DispatcherReques
 		: endpoint === endpoints[0] ? 1 : endpoint === endpoints[1] ? 2 : endpoint === "/dev/null" ? 0 : undefined;
 	const route = [routeOf(request.context.outputEndpoints[0], 1), routeOf(request.context.outputEndpoints[1], 2)] as const;
 	if (route[0] === undefined || route[1] === undefined) return { reason: `output_endpoint_mismatch:${JSON.stringify({ expected: endpoints, observed: request.context.outputEndpoints })}` };
-	const outputRoute: OutputRoute = [route[0], route[1]];
-	const context = routedProcessContext(expectedContext, outputRoute, false, undefined, pipes.some(Boolean) ? pipes : undefined);
+	const outputRoute: OutputRoute = [route[0], route[1]], outputFlags = outputStatusFlags(request.context);
+	const context = routedProcessContext(expectedContext, outputRoute, false, undefined, pipes.some(Boolean) ? pipes : undefined, outputFlags);
 	if (request.context.launchKey !== context.launchKey) return { reason: "launch_key_mismatch" };
 	if (request.context.umask !== context.umask) return { reason: "umask_mismatch" };
-	return { route: outputRoute, ...(pipes.some(Boolean) ? { outputPipes: pipes } : {}) };
+	return { route: outputRoute, ...(pipes.some(Boolean) ? { outputPipes: pipes } : {}), ...(outputFlags ? { outputFlags } : {}) };
 }
 
 function shellArguments(invocation: ToolProcessInvocation, command: string): string[] {
