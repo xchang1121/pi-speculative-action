@@ -93,8 +93,11 @@ export type PatternAwareBinding = (
 	| { readonly type: "transform"; readonly operation: PathTransform; readonly source: PatternAwareBinding; }
 	| { readonly type: "coalesce"; readonly sources: ReadonlyArray<PatternAwareBinding>; }
 	| { readonly type: "template"; readonly source: PatternAwareBinding; readonly prefix: string; readonly suffix: string; }
-	/** Two values spliced into literal text, `parts[0] + first + parts[1] + second + parts[2]` (`pytest <file>::<test>`). */
-	| { readonly type: "splice"; readonly sources: readonly [PatternAwareBinding, PatternAwareBinding]; readonly parts: readonly [string, string, string]; }
+	/** Two to four values spliced into literal text in order, `parts[0] + first + parts[1] + second + ...` (`pytest <file>::<test>`,
+	 * a command whose several arguments each come from earlier events). */
+	| { readonly type: "splice"; readonly sources: readonly PatternAwareBinding[]; readonly parts: readonly string[]; }
+	/** A path with its leading directories `from` replaced by `to`, the rest kept: lib/a/b.js → test/unit/a/b.js. */
+	| { readonly type: "rebase"; readonly source: PatternAwareBinding; readonly from: string; readonly to: string; }
 	/** A line the source reports, matching a target within `tolerance` lines: a read's window around a reported location. */
 	| { readonly type: "near"; readonly source: PatternAwareBinding; readonly tolerance: number; }
 	| {
@@ -234,20 +237,14 @@ const patternAwareDefaults = {
 export const PATTERN_AWARE_DEFAULTS: PatternAwareSettings = patternAwareDefaults;
 
 const parsePatternSettings = settingsParser(patternAwareDefaults, {
-	enabled: booleanOr,
-	multiStepEnabled: booleanOr,
-	maxContextLength: positiveInteger,
-	beamWidth: positiveInteger,
-	maxPredictionDepth: positiveInteger,
-	maxFutureGap: nonNegativeInteger,
-	futureGapCoverage: probabilitySetting,
-	decayHalfLifeEvents: positiveInteger,
-	minOccurrences: positiveInteger,
+	enabled: booleanOr, multiStepEnabled: booleanOr, maxContextLength: positiveInteger, beamWidth: positiveInteger, maxPredictionDepth: positiveInteger,
+	maxFutureGap: nonNegativeInteger, futureGapCoverage: probabilitySetting, decayHalfLifeEvents: positiveInteger, minOccurrences: positiveInteger,
 	maxPatterns: positiveInteger,
 });
 
 const MAX_BINDING_VARIANTS = 32;
 const MAX_PATH_SOURCES = 24;
+const MAX_SPLICE_SOURCES = 4;
 /** Within the ±200-line margin a predicted read gets (widenReadGuess), so the window still covers the Actor's range. */
 const NEAR_LINE_TOLERANCE = 150;
 // Bound crash-loss while amortizing full-state serialization across active tool loops.
@@ -597,29 +594,11 @@ export class PatternAwareStore {
 			});
 			const actionIdentity = hash(identity);
 			return [actionIdentity, {
-				background,
-				recurrentFeedback: undefined as MutablePatternFeedback | undefined,
-				actionIdentity,
-				type: "tool_call" as const,
-				tool: representative.pattern.targetTool,
-				input: representative.input,
-				patternID: representative.pattern.id,
-				supportingPatternIDs: patterns.map((pattern) => pattern.id),
-				context: representative.pattern.context,
-				dependencies: representative.pattern.dependencies,
-				horizon,
-				latestHorizon,
-				gapCoverage,
-				replayProbability,
-				variantProbability,
-				conditionalProbability,
-				empiricalProbability,
-				adoptionProbability,
-				expectedDurationMs,
-				ppmEstimate,
-				mapperConfidence,
-				evidenceConfidence: evidence,
-				expectedLatencyBenefitMs,
+				background, recurrentFeedback: undefined as MutablePatternFeedback | undefined, actionIdentity, type: "tool_call" as const,
+				tool: representative.pattern.targetTool, input: representative.input, patternID: representative.pattern.id,
+				supportingPatternIDs: patterns.map((pattern) => pattern.id), context: representative.pattern.context, dependencies: representative.pattern.dependencies,
+				horizon, latestHorizon, gapCoverage, replayProbability, variantProbability, conditionalProbability, empiricalProbability, adoptionProbability,
+				expectedDurationMs, ppmEstimate, mapperConfidence, evidenceConfidence: evidence, expectedLatencyBenefitMs,
 			}] as const;
 		}));
 		// Session frequency supports another Actor opportunity, not a transition from hypothetical output.
@@ -672,31 +651,12 @@ export class PatternAwareStore {
 				dependencies: structuredClone(dependencies),
 				continuation: nextContinuation,
 				depth: nextContinuation.visitedPatternIDs.length,
-				diagnostic: JSON.stringify(
-					{
-						...diagnostic,
-						source: "pattern_aware",
-						supportingPatterns: supportingPatternIDs,
-						context,
-						input,
-						replayProbability,
-						ppmProbability: ppmEstimate?.probability,
-						ppmOrder: ppmEstimate?.order,
-						ppmEvidence: ppmEstimate?.evidence,
-						ppmEscapeMass: ppmEstimate?.escapeMass,
-						mapperConfidence,
-						evidenceConfidence: evidence,
-						variantProbability,
-						background: background === true,
-						beamRank,
-						beamWidth: settings.beamWidth,
-						gapCoverage,
-						dependencies,
-						depth: nextContinuation.visitedPatternIDs.length,
-					},
-					null,
-					2,
-				),
+				diagnostic: JSON.stringify({
+					...diagnostic, source: "pattern_aware", supportingPatterns: supportingPatternIDs, context, input, replayProbability,
+					ppmProbability: ppmEstimate?.probability, ppmOrder: ppmEstimate?.order, ppmEvidence: ppmEstimate?.evidence, ppmEscapeMass: ppmEstimate?.escapeMass,
+					mapperConfidence, evidenceConfidence: evidence, variantProbability, background: background === true, beamRank, beamWidth: settings.beamWidth,
+					gapCoverage, dependencies, depth: nextContinuation.visitedPatternIDs.length,
+				}, null, 2),
 			});
 		}
 		return selected;
@@ -739,29 +699,11 @@ export class PatternAwareStore {
 			const confidence = evidenceConfidence(conditionalProbability, item.weightedCount);
 			const expectedLatencyBenefitMs = empiricalProbability * adoptionProbability * (ppmEstimate?.probability ?? 1) * confidence * Math.max(1, expectedDurationMs);
 			return {
-				background: item.count < settings.minOccurrences || evidence.mismatched > evidence.matched,
-				recurrentFeedback: item.feedback,
-				actionIdentity: hash(JSON.stringify({ actionKey: item.action.key, type: "tool_call" })),
-				type: "tool_call" as const,
-				tool: item.action.tool,
-				input: item.input,
-				patternID,
-				supportingPatternIDs: [] as string[],
-				context: [] as PatternAwareEventSignature[],
-				dependencies: [] as PatternAwareDependency[],
-				horizon: 0,
-				latestHorizon: 0,
-				gapCoverage: 1,
-				replayProbability: conditionalProbability,
-				variantProbability: 1,
-				conditionalProbability,
-				empiricalProbability,
-				adoptionProbability,
-				expectedDurationMs,
-				ppmEstimate,
-				mapperConfidence: 1,
-				evidenceConfidence: confidence,
-				expectedLatencyBenefitMs,
+				background: item.count < settings.minOccurrences || evidence.mismatched > evidence.matched, recurrentFeedback: item.feedback,
+				actionIdentity: hash(JSON.stringify({ actionKey: item.action.key, type: "tool_call" })), type: "tool_call" as const, tool: item.action.tool,
+				input: item.input, patternID, supportingPatternIDs: [] as string[], context: [] as PatternAwareEventSignature[], dependencies: [] as PatternAwareDependency[],
+				horizon: 0, latestHorizon: 0, gapCoverage: 1, replayProbability: conditionalProbability, variantProbability: 1, conditionalProbability,
+				empiricalProbability, adoptionProbability, expectedDurationMs, ppmEstimate, mapperConfidence: 1, evidenceConfidence: confidence, expectedLatencyBenefitMs,
 			};
 		});
 	}
@@ -903,14 +845,8 @@ export class PatternAwareStore {
 			existing.weightedDurationMs = Math.min(Number.MAX_VALUE / 2, existing.weightedDurationMs * decay + durationMs);
 			existing.lastSeenSequence = event.sequence;
 		} else {
-			session.recurrentActions.set(action.key, {
-				action,
-				input: structuredClone(event.input),
-				count: 1,
-				weightedCount: 1,
-				weightedDurationMs: durationMs,
-				lastSeenSequence: event.sequence,
-			});
+			session.recurrentActions.set(action.key, { action, input: structuredClone(event.input), count: 1, weightedCount: 1, weightedDurationMs: durationMs,
+				lastSeenSequence: event.sequence });
 		}
 	}
 
@@ -1604,7 +1540,7 @@ class PatternBindingAnalysis {
 	): Generator<PatternAwareBinding, undefined> {
 		const pathSources: Array<{ readonly binding: PatternAwareBinding; readonly value: string }> = [];
 		const spliceSources: Array<{ readonly binding: PatternAwareBinding; readonly value: string }> = [];
-		const targetKey = stableStringify(target);
+		const targetKey = stableStringify(target), tokens = includeComposites && !targetIsPath && typeof target === "string" ? pathTokens(target) : [];
 		for (const [relativeEvent, field, value] of reverseContextFields(context)) {
 			const indexed = includeComposites ? undefined : this.valueIndex(value).get(targetKey);
 			// A reported location binds by item, not position, so its path and line are applied together.
@@ -1631,6 +1567,16 @@ class PatternBindingAnalysis {
 					const sources: Array<{ readonly binding: PatternAwareBinding; readonly value: string }> = targetIsPath ? [] : [{ binding: direct, value: source }];
 					if (pathSource) {
 						if (pathSources.length < MAX_PATH_SOURCES) pathSources.push({ binding: direct, value: source });
+						// The same file name under other leading directories: a target path, or a path word of a command.
+						const moved = targetIsPath && typeof target === "string" ? rebaseBetween(source, target) : undefined;
+						if (moved) yield { type: "rebase", source: direct, ...moved };
+						for (const token of tokens) {
+							const shift = rebaseBetween(source, token);
+							if (!shift) continue;
+							const rebased: PatternAwareBinding = { type: "rebase", source: direct, ...shift };
+							sources.push({ binding: rebased, value: token });
+							if (spliceSources.length < MAX_PATH_SOURCES) spliceSources.push({ binding: rebased, value: token });
+						}
 						const renamed = transform("strip_extension", source) !== source;
 						for (const operation of PATH_TRANSFORMS) {
 							const transformed: PatternAwareBinding = { type: "transform", operation, source: direct };
@@ -1654,8 +1600,20 @@ class PatternBindingAnalysis {
 		if (typeof target === "string") for (const first of spliceSources) for (const second of spliceSources) {
 			const at = target.indexOf(first.value), next = target.indexOf(second.value, at + first.value.length);
 			if (first === second || next < 0) continue;
-			yield { type: "splice", sources: [first.binding, second.binding],
-				parts: [target.slice(0, at), target.slice(at + first.value.length, next), target.slice(next + second.value.length)] };
+			const chain = [first, second], positions = [at, next];
+			for (;;) {
+				yield { type: "splice", sources: chain.map(({ binding }) => binding),
+					parts: [target.slice(0, positions[0]), ...chain.map(({ value }, index) => target.slice(positions[index]! + value.length, positions[index + 1] ?? target.length))] };
+				// A longer chain takes the source found soonest after the last one.
+				const end = positions.at(-1)! + chain.at(-1)!.value.length;
+				let found = -1, following: typeof first | undefined;
+				for (const candidate of chain.length < MAX_SPLICE_SOURCES ? spliceSources : []) {
+					const offset = chain.includes(candidate) ? -1 : target.indexOf(candidate.value, end);
+					if (offset >= 0 && (found < 0 || offset < found)) { found = offset; following = candidate; }
+				}
+				if (!following) break;
+				chain.push(following); positions.push(found);
+			}
 		}
 		if (includeComposites && targetIsPath && typeof target === "string") {
 			const normalizedTarget = normalizePath(target);
@@ -1709,8 +1667,10 @@ class PatternBindingAnalysis {
 				),
 			);
 		} else if (binding.type === "splice") {
-			const [first, second] = binding.sources.map((source) => this.bindingValues(source, context).filter((value) => typeof value === "string"));
-			values = first!.flatMap((left) => second!.map((right) => `${binding.parts[0]}${left}${binding.parts[1]}${right}${binding.parts[2]}`));
+			values = binding.sources.reduce<string[]>((texts, source, index) => texts.flatMap((text) => this.bindingValues(source, context)
+				.flatMap((value) => typeof value === "string" ? [`${text}${value}${binding.parts[index + 1]}`] : [])), [binding.parts[0]!]);
+		} else if (binding.type === "rebase") {
+			values = this.bindingValues(binding.source, context).flatMap((value) => typeof value === "string" ? rebase(value, binding.from, binding.to) : []);
 		} else if (binding.type === "template" || binding.type === "transform") {
 			values = this.bindingValues(binding.source, context).flatMap((value) =>
 				typeof value === "string" ? [binding.type === "template"
@@ -1965,6 +1925,26 @@ const normalizedPaths = new BoundedRecencyMap<string, string>(PATH_OPERATION_CAC
 const joinedPaths = new BoundedRecencyMap<string, string>(PATH_OPERATION_CACHE_LIMIT);
 
 function cachePathResult(cache: BoundedRecencyMap<string, string>, key: string, value: string) { cache.set(key, value); return value; }
+
+/** The directory swap turning `source` into `target` when both end in the same file name (and possibly more segments). */
+function rebaseBetween(source: string, target: string): { from: string; to: string } | undefined {
+	const left = normalizePath(source).split("/"), right = normalizePath(target).split("/");
+	let shared = 0;
+	while (shared < left.length && shared < right.length && left[left.length - 1 - shared] === right[right.length - 1 - shared]) shared++;
+	const from = left.slice(0, left.length - shared).join("/"), to = right.slice(0, right.length - shared).join("/");
+	return shared && from !== to ? { from, to } : undefined;
+}
+
+/** A command's words that name a file under a directory, as written: a rebased source may stand for one of them. */
+function pathTokens(text: string): string[] {
+	return [...new Set(text.split(/[\s"'`=,;()<>|&]+/u).filter((token) => /\/[^/]*\.[A-Za-z]\w*$/u.test(token) && normalizePath(token) === token))].slice(0, MAX_PATH_SOURCES);
+}
+
+/** `value` under directory `from`, moved under `to`: nothing when it is not under `from`. */
+function rebase(value: string, from: string, to: string): string[] {
+	const normalized = normalizePath(value), rest = from ? normalized.startsWith(`${from}/`) ? normalized.slice(from.length + 1) : undefined : normalized;
+	return rest === undefined || !rest ? [] : [to ? `${to}/${rest}` : rest];
+}
 
 function joinPath(left: string, right: string) {
 	const key = `${left.length}:${left}${right}`;
@@ -2372,8 +2352,11 @@ function isPatternAwareBinding(value: unknown, depth = 0): value is PatternAware
 		case "template":
 			return typeof record.prefix === "string" && typeof record.suffix === "string" && source();
 		case "splice":
-			return Array.isArray(record.sources) && record.sources.length === 2 && record.sources.every((item) => isPatternAwareBinding(item, depth + 1)) &&
-				Array.isArray(record.parts) && record.parts.length === 3 && record.parts.every((part) => typeof part === "string");
+			return Array.isArray(record.sources) && record.sources.length >= 2 && record.sources.length <= MAX_SPLICE_SOURCES &&
+				record.sources.every((item) => isPatternAwareBinding(item, depth + 1)) &&
+				Array.isArray(record.parts) && record.parts.length === record.sources.length + 1 && record.parts.every((part) => typeof part === "string");
+		case "rebase":
+			return typeof record.from === "string" && typeof record.to === "string" && record.from !== record.to && source();
 		case "near":
 			return typeof record.tolerance === "number" && record.tolerance >= 0 && record.tolerance <= NEAR_LINE_TOLERANCE && source();
 		case "join":
