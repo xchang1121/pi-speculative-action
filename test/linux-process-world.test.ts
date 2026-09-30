@@ -1689,13 +1689,17 @@ int main(void) {
 			// The first cat learns its run time in its own sandbox; a different cat then needs none.
 			expect(await run("learn", "a.txt")).toMatchObject({ text: "a.txt\n" });
 			expect(await run("cheap", "b.txt")).toEqual({ text: "b.txt\n", bypasses: 2 });
-			// A posix_spawn child execs in its parent's memory: the sandbox's exec path rewrite must not survive in it.
-			await writeFile(path.join(fixture.workspace, "spawner.c"), `#include <spawn.h>\n#include <stdio.h>\n#include <sys/wait.h>\nextern char **environ;
-int main(void) { char path[32] = "/bin/true\\0intact"; char *args[] = {path, 0}; pid_t pid; int status;
-	return posix_spawn(&pid, path, 0, 0, args, environ) || waitpid(pid, &status, 0) != pid || puts(path + 10) < 0; }\n`);
-			await compileBenchmarkHelper(fixture.workspace, { source: "spawner.c", output: "spawner" });
-			const spawned = await forkReusableBash(fixture, { label: "spawn", command: "./spawner", actionNamespace: "spawn", executionFingerprint });
-			try { expect(textOutput(spawned.output.result)).toBe("intact\n"); } finally { await spawned.dispose?.(); }
+			// A posix_spawn child execs in its parent's memory: the sandbox's exec path rewrite must not survive in it, and a parent
+			// with other threads (one parked in the spawn, one idle) must still be held while it holds the rewrite.
+			await writeFile(path.join(fixture.workspace, "spawner.c"), `#include <pthread.h>\n#include <spawn.h>\n#include <stdio.h>\n#include <sys/wait.h>\n#include <unistd.h>
+extern char **environ;\nstatic void *idle(void *unused) { (void)unused; pause(); return 0; }
+int main(void) { char path[32] = "/bin/true\\0intact"; char *args[] = {path, 0}; pid_t pid; pthread_t thread; int status;
+	return pthread_create(&thread, 0, idle, 0) || posix_spawn(&pid, path, 0, 0, args, environ) || waitpid(pid, &status, 0) != pid || puts(path + 10) < 0; }\n`);
+			await compileBenchmarkHelper(fixture.workspace, { source: "spawner.c", output: "spawner", arguments: ["-pthread"] });
+			// A created file takes the open's own mode under the process's umask, not the sandbox supervisor's.
+			const spawned = await forkReusableBash(fixture, { label: "spawn", command: "./spawner; umask 027; echo x > shared; cp /bin/true tool; stat -c '%a %n' shared tool",
+				actionNamespace: "spawn", executionFingerprint });
+			try { expect(textOutput(spawned.output.result)).toBe("intact\n640 shared\n750 tool\n"); } finally { await spawned.dispose?.(); }
 		} finally { await fixture.dispose(); }
 	});
 
