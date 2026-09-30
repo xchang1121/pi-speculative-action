@@ -281,9 +281,7 @@ export class ResourceReadView {
 			const consumePrepared = async (cached: PreparedResource) => {
 				inherit(cached.origin === owner ? cached.dependencies : undefined);
 				const transferred = cached.proofs?.length && (!cached.retained || cached.destination !== owner);
-				if (transferred) {
-					for (const proof of this.acceptProofs!(cached.proofs!)) this.collectProofs?.set(proof.observations, proof);
-				}
+				if (transferred) { for (const proof of this.acceptProofs!(cached.proofs!)) this.collectProofs?.set(proof.observations, proof); }
 				const run = async () => {
 					this.assertComplete(); cached.destination.assertComplete();
 					const result = await consume(cached.value as Parameters<typeof consume>[0]);
@@ -390,10 +388,7 @@ export class ResourceReadView {
 		this.owner?.assertComplete(); if (this.failure) throw this.failure;
 		if (sealed && !this.sealed) throw new Error("resource_snapshot_not_sealed");
 	}
-	seal(): void {
-		if (this.pending) this.failure ??= new Error("resource_snapshot_capture_pending");
-		this.assertComplete(); this.sealed = true;
-	}
+	seal(): void { if (this.pending) this.failure ??= new Error("resource_snapshot_capture_pending"); this.assertComplete(); this.sealed = true; }
 	dispose(): void | Promise<void> {
 		if (!this.owner) { for (const entry of this.entries.values()) this.releaseObject(entry); this.entries.clear(); this.objectCount = 0; }
 		this.failure = new Error("resource_snapshot_disposed");
@@ -552,9 +547,7 @@ export class ResourceVersionManager {
 	}
 
 	/** Notification cursor for preparation; empty observations cannot validate or seal any resource. */
-	observeChanges(): Promise<ResourceVersionToken> {
-		return this.captureToken([]);
-	}
+	observeChanges(): Promise<ResourceVersionToken> { return this.captureToken([]); }
 
 	/** Own an evaluated query's evidence without keeping its input buffers or source branch alive. */
 	retain(token: ResourceVersionToken, metadataBytes?: number): ResourceVersionToken {
@@ -625,13 +618,9 @@ export class ResourceVersionManager {
 	}
 
 	/** Adoption waits on these few checks, so their I/O never queues behind a whole-tree scan's waiters. */
-	async validate(token: ResourceVersionToken): Promise<ResourceVersionValidation> {
-		return priorityIO.run(true, () => this.inspect(token, false));
-	}
+	async validate(token: ResourceVersionToken): Promise<ResourceVersionValidation> { return priorityIO.run(true, () => this.inspect(token, false)); }
 
-	async seal(token: ResourceVersionToken): Promise<ResourceVersionValidation> {
-		return this.inspect(token, true);
-	}
+	async seal(token: ResourceVersionToken): Promise<ResourceVersionValidation> { return this.inspect(token, true); }
 
 	private async inspect(token: ResourceVersionToken, sealing: boolean): Promise<ResourceVersionValidation> {
 		const started = performance.now();
@@ -782,9 +771,7 @@ export async function validateResourceVersion(token: unknown): Promise<ResourceV
 				group.observations.set(key, entry);
 			}
 		}
-		for (const group of groups.values()) {
-			const result = await group.manager.validate(group); checked.push(result);
-		}
+		for (const group of groups.values()) { const result = await group.manager.validate(group); checked.push(result); }
 		const expired = checked.find(result => result.expired);
 		if (expired) return { ...validation(started, expired.reason, "exact", checked), changed: [...new Set(checked.flatMap(result => result.changed ?? []))] };
 		for (const source of token as ResourceVersionToken[]) source.view?.assertComplete(true);
@@ -802,10 +789,7 @@ export function invalidateResourceInputs(tokens: readonly ResourceVersionToken[]
 	return [...new Set(tokens.flatMap(token => token.view?.invalidate(dependencies) ?? []))];
 }
 
-export function releaseResourceVersion(token: unknown): void | Promise<void> {
-	if (!isResourceVersionToken(token)) return;
-	return token.release();
-}
+export function releaseResourceVersion(token: unknown): void | Promise<void> { if (!isResourceVersionToken(token)) return; return token.release(); }
 
 export function isResourceVersionToken(value: unknown): value is ResourceVersionToken {
 	if (!value || typeof value !== "object") return false;
@@ -1123,9 +1107,7 @@ function statStamp(stat: BigIntStats): string {
 		.join(":");
 }
 
-function digest(value: unknown): string {
-	return hash("sha256", JSON.stringify(value));
-}
+function digest(value: unknown): string { return hash("sha256", JSON.stringify(value)); }
 
 function assertInside(realRoot: string, target: string): void {
 	if (!containsFilesystemPath(realRoot, target)) throw new Error(`resource_symlink_escapes_workspace:${target}`);
@@ -1146,9 +1128,7 @@ function sameValues<Value>(left: ReadonlyArray<Value>, right: ReadonlyArray<Valu
 }
 
 
-function errorCode(error: unknown) {
-	return error && typeof error === "object" && "code" in error ? String(error.code) : "unknown";
-}
+function errorCode(error: unknown) { return error && typeof error === "object" && "code" in error ? String(error.code) : "unknown"; }
 
 function missingResource(error: unknown): boolean { const code = errorCode(error); return code === "ENOENT" || code === "ENOTDIR"; }
 

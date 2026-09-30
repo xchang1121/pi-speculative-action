@@ -798,7 +798,41 @@ static int raw_context(FILE *out) {
 	return fputs("]}", out) < 0 || ferror(out) ? -1 : 0;
 }
 
-static int broker_request(FILE *out, const char *token, const char *invoked, int argc, char **argv) {
+/* Inherited pipes beyond stdio, as a brokered run's images: each end, its queue as seen now (never consumed) and its peers.
+ * Anything else stays unmodeled and the image runs native in place. */
+static int pipe_bytes(int fd, unsigned char **bytes, int *eof);
+static int own_pipe_descriptors(FILE *out) {
+	DIR *directory = opendir("/proc/self/fd");
+	if (!directory) return -1;
+	int fds[MAX_HANDLES], count = 0, scan = dirfd(directory), result = -1;
+	for (struct dirent *entry; (entry = readdir(directory));) {
+		char *end; long fd = strtol(entry->d_name, &end, 10);
+		if (!*entry->d_name || *end || fd < 3 || fd == scan) continue;
+		if (count == MAX_HANDLES) goto done;
+		fds[count++] = (int)fd;
+	}
+	for (int index = 0; index < count; index++) {
+		struct stat state, other_state; int flags = fcntl(fds[index], F_GETFL), capacity = fcntl(fds[index], F_GETPIPE_SZ), eof = 0, alias = fds[index], reader = -1;
+		unsigned char *bytes = NULL;
+		if (fstat(fds[index], &state) < 0 || !S_ISFIFO(state.st_mode) || flags < 0 || capacity <= 0) goto done;
+		for (int other = 0; other < index; other++) if (syscall(SYS_kcmp, getpid(), getpid(), KCMP_FILE, fds[index], fds[other]) == 0) { alias = fds[other]; break; }
+		/* The queue is read through an end this process already holds: reopening a writer for reading would widen its access. */
+		for (int other = 0; other < count && reader < 0; other++)
+			if ((fcntl(fds[other], F_GETFL) & O_ACCMODE) != O_WRONLY && fstat(fds[other], &other_state) == 0 && other_state.st_dev == state.st_dev && other_state.st_ino == state.st_ino) reader = fds[other];
+		int length = reader < 0 ? -1 : pipe_bytes(reader, &bytes, &eof);
+		if (length < 0) goto done;
+		fprintf(out, "%s{\"fd\":%d,\"alias\":%d,\"device\":\"%ju\",\"inode\":\"%ju\",\"flags\":%d,\"capacity\":%d,\"eof\":%s,\"queueHex\":\"",
+			index ? "," : "", fds[index], alias, (uintmax_t)state.st_dev, (uintmax_t)state.st_ino, flags, capacity, eof ? "true" : "false");
+		for (int byte = 0; byte < length; byte++) fprintf(out, "%02x", bytes[byte]);
+		fputs("\"}", out); free(bytes);
+	}
+	result = count;
+done:
+	closedir(directory);
+	return result;
+}
+
+static int broker_request(FILE *out, const char *token, const char *invoked, int argc, char **argv, const char *descriptors) {
 	char cwd[PATH_MAX];
 	if (!getcwd(cwd, sizeof(cwd))) return -1;
 	const char *strings[] = { "{\"token\":", token, ",\"name\":", strrchr(invoked, '/') + 1, ",\"invokedPath\":", invoked, ",\"argv0\":", argv[0], ",\"cwd\":", cwd };
@@ -814,7 +848,7 @@ static int broker_request(FILE *out, const char *token, const char *invoked, int
 		first = 0;
 		json_bytes(out, *entry, (size_t)(equals - *entry)); fputc(':', out); json_bytes(out, equals + 1, strlen(equals + 1));
 	}
-	fprintf(out, "},\"pid\":%d,\"context\":", (int)getpid());
+	fprintf(out, "},\"pid\":%d%s%s%s,\"context\":", (int)getpid(), descriptors ? ",\"descriptors\":[" : "", descriptors ? descriptors : "", descriptors ? "]" : "");
 	return raw_context(out) < 0 || fputc('}', out) < 0 || ferror(out) ? -1 : 0;
 }
 
@@ -855,6 +889,14 @@ static int broker_reply(const char *at, const char *end) {
 			at = newline + 1 + length;
 			continue;
 		}
+		/* A brokered run's net effect on an inherited pipe of one repeated byte: written, or read back and checked. */
+		int byte; long delta;
+		if (sscanf(at, "u%d %d %ld%n", &fd, &byte, &delta, &consumed) == 3 && at + consumed == newline && fd >= 3 && byte >= 0 && byte <= 255 && labs(delta) <= 65536) {
+			for (unsigned char token = (unsigned char)byte, seen; delta; delta += delta < 0 ? 1 : -1)
+				if (delta > 0 ? transfer(fd, &token, 1, 1) < 0 : transfer(fd, &seen, 1, 0) < 0 || seen != token) return -1;
+			at = newline + 1;
+			continue;
+		}
 		if (newline + 1 != end) return -1;
 		if (newline == at + 1 && *at == 'b') return -2;
 		if (sscanf(at, "x %d%n", &value, &consumed) == 1 && at + consumed == newline && value >= 0 && value <= 255) return value;
@@ -868,7 +910,7 @@ static int broker_reply(const char *at, const char *end) {
 }
 
 /* Ask the broker: the exit status of a reused or brokered run, or -2 to run the native image in this traced process. */
-static int broker_dispatch(const char *configuration, const char *invoked, int argc, char **argv) {
+static int broker_dispatch(const char *configuration, const char *invoked, int argc, char **argv, const char *descriptors) {
 	char socket_path[PATH_MAX], token[256], *request = NULL, *response = NULL;
 	size_t request_size = 0, response_size = 0;
 	int result = -1;
@@ -876,7 +918,7 @@ static int broker_dispatch(const char *configuration, const char *invoked, int a
 	if (!file || !fgets(socket_path, sizeof(socket_path), file) || !fgets(token, sizeof(token), file)) goto done;
 	socket_path[strcspn(socket_path, "\n")] = token[strcspn(token, "\n")] = 0;
 	if (!(out = open_memstream(&request, &request_size))) goto done;
-	int written = broker_request(out, token, invoked, argc, argv);
+	int written = broker_request(out, token, invoked, argc, argv, descriptors);
 	if (fclose(out) != 0 || written < 0 || !(in = open_memstream(&response, &response_size))) goto done;
 	written = broker_exchange(socket_path, request, request_size, in);
 	if (fclose(in) == 0 && written == 0) result = broker_reply(response, response + response_size);
@@ -915,11 +957,17 @@ static int image_dispatch(int argc, char **argv) {
 		snprintf(native, sizeof(native), "%s/%s", fields[2], name) >= (int)sizeof(native)) goto done;
 	char **spare = calloc((size_t)argc + 3, sizeof(*spare)); /* a sandbox grows argv here to run a script's interpreter */
 	if (!spare || !memcpy(spare, argv, (size_t)argc * sizeof(*argv)) || (extra = has_unmodeled_descriptors(3)) < 0) goto done;
+	char *pipes = NULL; size_t pipes_size = 0;
+	FILE *described = extra ? open_memstream(&pipes, &pipes_size) : NULL;
+	int modeled = described && own_pipe_descriptors(described) > 0;
+	if (described && fclose(described) != 0) modeled = 0;
 	/* A bypass runs the native image in place, with everything this process received. */
-	if (extra || (result = broker_dispatch(fields[0], invoked, argc, argv)) == -2) {
+	if ((extra && !modeled) || (result = broker_dispatch(fields[0], invoked, argc, argv, extra ? pipes : NULL)) == -2) {
+		free(pipes);
 		execv(native, spare);
 		result = errno == ENOENT ? 127 : 126;
 	}
+	free(pipes);
 done:
 	if (file) fclose(file);
 	free(line);
@@ -3386,9 +3434,9 @@ int main(int argc, char **argv) {
 		if (sigprocmask(SIG_SETMASK, &empty, NULL) < 0) return 70;
 		for (int number = 1; number < NSIG; number++) signal(number, SIG_DFL);
 		if (descriptors) {
-			char *executable = argv[6];
+			char *executable = argv[6], *manifest = argv[3], *report = argv[4];
 			argv[6] = argv[5];
-			return execute_descriptors(argv[3], argv[4], executable, argv + 6, argv[2]);
+			return execute_descriptors(manifest, report, executable, memmove(argv + 4, argv + 6, (size_t)(argc - 5) * sizeof(*argv)), argv[2]); /* two spare slots, as below */
 		}
 		char *executable = argv[4];
 		argv[4] = argv[3];

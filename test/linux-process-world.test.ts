@@ -1832,7 +1832,7 @@ int main(void) { char path[32] = "/bin/true\\0intact"; char *args[] = {path, 0};
 		}
 	});
 
-	test("owns output and capture lifetimes, preserves concurrency and rejects an internal pipe", async ({ skip }) => {
+	test("owns output and capture lifetimes, preserves concurrency and brokers an internal pipe", async ({ skip }) => {
 		if (process.platform !== "linux") return skip("Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-process-concurrency-");
 		const { readlink, readFile: readTrace, rm: removeFile, mkdtemp: allocateRoot } = await vi.importActual<typeof filesystem>("node:fs/promises");
@@ -1920,7 +1920,7 @@ int main(void) { char path[32] = "/bin/true\\0intact"; char *args[] = {path, 0};
 				nextCapture.complete ? undefined : nextCapture.reason).toEqual({ allocationFailed: true, aborts: 1, nextComplete: true });
 			expect(captures[0]!.finish).not.toHaveBeenCalled();
 			expect(branch.executionMetrics.reuse?.misses).toBeGreaterThanOrEqual(3);
-			expect(branch.executionMetrics.reuse?.bypasses).toBe(5); // Capture failure, internal pipeline and three unsupported stdio contexts.
+			expect(branch.executionMetrics.reuse?.bypasses).toBe(4); // Capture failure and three unsupported stdio contexts; a pipeline writer is brokered.
 			// With process.execve a bypass runs its native image in place, inside the top-level trace; the injected capture failure still escapes it.
 			const validation = JSON.stringify(await branch.validate?.());
 			expect([validation.includes("broker_bypass:"), validation.includes("injected trace allocation failure")], validation)

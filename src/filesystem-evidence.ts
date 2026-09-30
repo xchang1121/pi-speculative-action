@@ -45,9 +45,7 @@ export class CapturedFilesystemObject {
 	borrow<T>(consume: (capture: StableFilesystemCapture, handle: FileHandle) => Promise<T>): Promise<T> {
 		return this.lifetime.admit(() => consume(this.capture, this.handle));
 	}
-	dispose(): Promise<void> {
-		return this.lifetime.close(async () => { await this.lifetime.drain(); await this.handle.close(); });
-	}
+	dispose(): Promise<void> { return this.lifetime.close(async () => { await this.lifetime.drain(); await this.handle.close(); }); }
 }
 
 export function sameFilesystemIdentity(left: BigIntStats, right: BigIntStats): boolean {
@@ -210,9 +208,7 @@ async function readFileContents(handle: FileHandle, before: BigIntStats, maxByte
 	}
 	const after = await handle.stat({ bigint: true });
 	check?.();
-	if (bytesRead !== Number(before.size) || !sameFilesystemIdentity(before, after)) {
-		throw new Error("file_changed_during_capture");
-	}
+	if (bytesRead !== Number(before.size) || !sameFilesystemIdentity(before, after)) { throw new Error("file_changed_during_capture"); }
 	return { hash: hash.digest("hex"), bytesRead, stat: after, ...(content ? { content } : {}), ...(blob ? { blob: blob.digest("hex") } : {}) };
 }
 
