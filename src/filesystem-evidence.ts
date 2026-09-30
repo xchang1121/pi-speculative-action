@@ -261,6 +261,9 @@ export async function* walkFilesystemPath(target: string, options: { readonly st
 	}
 }
 
+/** Walks taken at one moment share the entries they pass: each is captured once. */
+export const sharedWalk = (walked = new Map<string, ReturnType<typeof captureFilesystemEntry>>()) => (target: string) => walked.get(target) ?? walked.set(target, captureFilesystemEntry(target)).get(target)!;
+
 export async function assertNoSymlinkPath(root: string, target: string, capture?: typeof captureFilesystemEntry): Promise<void> {
 	const resolvedRoot = path.resolve(root), resolvedTarget = path.resolve(target);
 	if (!containsFilesystemPath(resolvedRoot, resolvedTarget)) throw new Error(`sandbox path escapes workspace: ${resolvedTarget}`);

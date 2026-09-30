@@ -305,9 +305,7 @@ export class ProvenanceCertificateStore {
 	}
 
 	private exclusive<T>(operation: () => Promise<T>): Promise<T> {
-		const mutate = async () => {
-			try { return await operation(); } finally { this.statsValue = undefined; }
-		};
+		const mutate = async () => { try { return await operation(); } finally { this.statsValue = undefined; } };
 		const result = this.maintenance.then(mutate, mutate);
 		this.maintenance = result.then(() => undefined, () => undefined);
 		return result;

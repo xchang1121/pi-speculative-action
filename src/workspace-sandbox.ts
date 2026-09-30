@@ -10,7 +10,7 @@ import { errorMessage, hasErrorCode, isMissing } from "./error-utils.ts";
 import { createCommittedResourceInputs, type SpeculativeAgentExecutionWorld, type SpeculativeToolExecutionContext } from "./agent-execution-world.ts";
 import type { WorldBranch, WorldCheckpoint, WorldCommitMetrics, WorldExecutionMetrics } from "./execution-world.ts";
 import { advanceFilesystemClock, assertNoSymlinkPath, captureFilesystemEntry, captureStableFile, fileIdentity, mapFilesystem, sameFilesystemIdentity,
-	settledIdentity } from "./filesystem-evidence.ts";
+	settledIdentity, sharedWalk } from "./filesystem-evidence.ts";
 import { WORKSPACE_PATH_MUTATION_EFFECTS } from "./effect-model.ts";
 import { effectCommitFailure } from "./effect-transaction.ts";
 import type { WorkspaceFileMutation } from "./workspace-state.ts";
@@ -441,18 +441,14 @@ async function commitSandboxExecution(state: WorkspaceSandboxState, execution: S
 	const commit = withCommitLocks(
 		commitLockTargets(changes),
 		async () => {
-			const staged = new Map<SandboxFileChange, string>();
-			const descriptors = new Map<SandboxFileChange, FileHandle>();
+			const staged = new Map<SandboxFileChange, string>(), descriptors = new Map<SandboxFileChange, FileHandle>();
 			const baselines = new Map<SandboxWorkspaceChange, RegularFileState | SandboxDirectoryState | undefined>();
-			const applied: SandboxWorkspaceChange[] = [];
-			const createdDirectories: string[] = [];
+			const applied: SandboxWorkspaceChange[] = [], createdDirectories: string[] = [], parents = new Set<string>();
 			const objects = new Map<string, { source: SandboxFileChange; write?: SandboxFileChange; handle?: FileHandle; mode?: number }>();
-			let nativeStarted = false;
-			let bytesValidated = 0;
-			let validationMs = 0;
-			let resourcesCommitted = 0;
+			let nativeStarted = false, bytesValidated = 0, validationMs = 0, resourcesCommitted = 0;
 			try {
-				for (const change of changes) await assertCommitTarget(change);
+				// Nothing has moved yet: every target is checked at this one moment, over one walk of the directories they share.
+				const capture = sharedWalk(); await mapFilesystem(changes, change => assertCommitTarget(change, capture));
 				await mapFilesystem(changes, async (change) => {
 					if (!change.validationOnly && change.kind !== "directory" && !change.operation && !change.object && change.after !== undefined) {
 						staged.set(change, await stageAtomicWrite(change.after, change.afterMode, change.root));
@@ -543,7 +539,7 @@ async function commitSandboxExecution(state: WorkspaceSandboxState, execution: S
 					if (change.kind === "directory") {
 						if (!change.after) { await rmdir(change.target); applied.push(change); }
 						else if (!change.before) {
-							await createParentDirectories(change.root, change.target, createdDirectories);
+							await createParentDirectories(change.root, change.target, createdDirectories, parents);
 							await mkdir(change.target, change.operation ? undefined : { mode: change.after.mode });
 							applied.push(change);
 							if (!change.operation && process.platform !== "win32") await chmod(change.target, change.after.mode);
@@ -557,7 +553,7 @@ async function commitSandboxExecution(state: WorkspaceSandboxState, execution: S
 					if (change.object && !staged.has(change)) continue;
 					if (change.operation && !change.object) {
 						// Native writes are authoritative from their first file effect; created parents still roll back.
-						await createParentDirectories(change.root, change.target, createdDirectories);
+						await createParentDirectories(change.root, change.target, createdDirectories, parents);
 						let descriptor = descriptors.get(change);
 						if (descriptor) { applied.push(change); await descriptor.truncate(0); }
 						else {
@@ -572,7 +568,7 @@ async function commitSandboxExecution(state: WorkspaceSandboxState, execution: S
 					applied.push(change);
 					const temporary = staged.get(change);
 					if (temporary) {
-						await createParentDirectories(change.root, change.target, createdDirectories);
+						await createParentDirectories(change.root, change.target, createdDirectories, parents);
 						const mode = resolveCommitMode(baselines.get(change) as RegularFileState | undefined, change);
 						try { await replaceFile(temporary, change.target, mode); }
 						catch (error) {
@@ -1654,7 +1650,7 @@ async function collectSandboxChanges(workspace: PrivateSandboxWorkspace, frontie
 	const detected = frontier ?? (workspace.overlay ? await collectOverlayChangeResources(workspace) : await collectGitChangeResources(workspace));
 	const resources = [...new Set([...detected, ...(frontier ? [] : workspace.baselineFrontier.keys())])].filter((resource) => !isSnapshotExcluded(slash(resource))).sort();
 	// Changed files share their directories: each is walked once, and the files are read concurrently.
-	const walked = new Map<string, ReturnType<typeof captureFilesystemEntry>>(), capture = (target: string) => walked.get(target) ?? walked.set(target, captureFilesystemEntry(target)).get(target)!;
+	const capture = sharedWalk();
 	return (await mapFilesystem(resources, async (resource): Promise<readonly SandboxFileChange[]> => {
 		if (!resource || path.isAbsolute(resource) || resource.split("/").includes("..")) throw new Error(`invalid sandbox change path: ${resource}`);
 		const target = path.resolve(workspace.sourceRoot, resource), sandboxTarget = path.resolve(workspace.sandboxRoot, resource);
@@ -1858,7 +1854,7 @@ async function assertNoDirectoryLinks(root: string, relative: string): Promise<v
 	}
 }
 
-async function assertCommitTarget(change: SandboxWorkspaceChange): Promise<void> {
+async function assertCommitTarget(change: SandboxWorkspaceChange, capture?: typeof captureFilesystemEntry): Promise<void> {
 	const root = path.resolve(change.root);
 	const target = path.resolve(change.target);
 	if (!containsFilesystemPath(root, target) || (target === root && !change.validationOnly) || target !== path.resolve(root, change.resource) ||
@@ -1871,7 +1867,7 @@ async function assertCommitTarget(change: SandboxWorkspaceChange): Promise<void>
 	if (change.kind !== "directory") for (const name of [...(change.aliases ?? []), ...(change.object ? [change.object.path] : [])]) {
 		if (!path.isAbsolute(name) || !containsFilesystemPath(root, name) || path.resolve(name) === root) throw new Error("file object name escapes workspace");
 	}
-	await assertNoSymlinkPath(root, target);
+	await assertNoSymlinkPath(root, target, capture);
 }
 
 async function readRegularState(target: string, maxBytes = Number.POSITIVE_INFINITY): Promise<RegularFileState | undefined> {
@@ -2050,7 +2046,7 @@ async function stageAtomicWrite(content: Uint8Array, mode: number | undefined, s
 	return temporary;
 }
 
-async function createParentDirectories(sourceRoot: string, target: string, created?: string[]): Promise<void> {
+async function createParentDirectories(sourceRoot: string, target: string, created?: string[], ensured?: Set<string>): Promise<void> {
 	const root = path.resolve(sourceRoot);
 	const parent = path.dirname(path.resolve(target));
 	const relative = relativeFilesystemPath(root, parent);
@@ -2058,6 +2054,7 @@ async function createParentDirectories(sourceRoot: string, target: string, creat
 	let current = root;
 	for (const segment of relative.split(path.sep).filter(Boolean)) {
 		current = path.join(current, segment);
+		if (ensured?.has(current)) continue; // This commit made or found it real; each change's own path check precedes this.
 		try { await mkdir(current); created?.push(current); } catch (error) {
 			if (!hasErrorCode(error, "EEXIST")) throw error;
 			const info = await lstat(current);
@@ -2065,6 +2062,7 @@ async function createParentDirectories(sourceRoot: string, target: string, creat
 				throw new Error(`sandbox commit parent is not a real directory: ${current}`, { cause: error });
 			}
 		}
+		ensured?.add(current);
 	}
 }
 
