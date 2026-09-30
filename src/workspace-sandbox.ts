@@ -2072,12 +2072,19 @@ async function removeCreatedDirectories(directories: readonly string[]): Promise
 	}
 }
 
+let modifiedTimesHelper: string | undefined;
+/** A native helper that sets them all in one process (`--set-modified-times`, linux-held-exec.c). */
+export const useModifiedTimesHelper = (binary: string) => { modifiedTimesHelper = binary; };
+
 /** Give files back the modification times their producers left, which later readers may have observed. Node sets only
- * microseconds, so coreutils touch sets them on Linux, whose traces record them; elsewhere a file keeps its commit's time. */
+ * microseconds, so on Linux, whose traces record them, the helper or else coreutils touch sets them; elsewhere a file keeps its commit's time. */
 export async function restoreModifiedTimes(files: readonly (readonly [target: string, modified: string | undefined])[]): Promise<void> {
-	const times = files.flatMap(([target, modified]) => /^\d+$/.test(modified ?? "") ? [`@${modified!.padStart(10, "0").slice(0, -9)}.${modified!.slice(-9).padStart(9, "0")}`, target] : []);
-	for (let start = 0; process.platform === "linux" && start < times.length; start += 1024) await new Promise<void>((resolve, reject) => execFile("sh",
-		["-c", 'while [ $# -gt 0 ]; do touch -chm -d "$1" -- "$2" || exit; shift 2; done', "sh", ...times.slice(start, start + 1024)], error => error ? reject(error) : resolve()));
+	const times = files.flatMap(([target, modified]) => /^\d+$/.test(modified ?? "") ? [[modified!.padStart(10, "0").slice(0, -9), modified!.slice(-9).padStart(9, "0"), target]] : []);
+	if (process.platform === "linux" && modifiedTimesHelper && times.length) return new Promise<void>((resolve, reject) => execFile(modifiedTimesHelper!, ["--set-modified-times"],
+		error => error ? reject(error) : resolve()).stdin?.end(times.map(([seconds, nanoseconds, target]) => `${seconds} ${nanoseconds} ${target}\0`).join("")));
+	const pairs = times.flatMap(([seconds, nanoseconds, target]) => [`@${seconds}.${nanoseconds}`, target!]);
+	for (let start = 0; process.platform === "linux" && start < pairs.length; start += 1024) await new Promise<void>((resolve, reject) => execFile("sh",
+		["-c", 'while [ $# -gt 0 ]; do touch -chm -d "$1" -- "$2" || exit; shift 2; done', "sh", ...pairs.slice(start, start + 1024)], error => error ? reject(error) : resolve()));
 }
 
 async function replaceFile(temporary: string, target: string, mode?: number): Promise<void> {
