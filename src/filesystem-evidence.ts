@@ -88,13 +88,19 @@ export function captureStableFile(
 /** File digests by kernel identity and change times (userspace cannot set a ctime). An entry is trusted once the file's last change
  * precedes its digest by 2 s, so a same-size rewrite inside one coarse timestamp tick cannot reuse it (the racy-git rule). */
 const fileDigests = new Map<string, { readonly hash: string; readonly blob?: string; readonly takenAtMs: number }>();
-const fileIdentity = (stat: BigIntStats) => `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+export const fileIdentity = (stat: BigIntStats) => `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
 
 /** A capture standing for re-reading this file, by its identity (`blob` also needs its git object id). */
 export function cachedCapture(stat: BigIntStats, realPath: string, blob = false): StableFilesystemCapture | undefined {
 	const cached = stat.isFile() ? fileDigests.get(fileIdentity(stat)) : undefined;
-	if (!cached || blob && !cached.blob || cached.takenAtMs - Number((stat.mtimeNs > stat.ctimeNs ? stat.mtimeNs : stat.ctimeNs) / 1_000_000n) < 2000) return undefined;
+	if (!cached || blob && !cached.blob || !settledIdentity(stat, cached.takenAtMs)) return undefined;
 	return { hash: cached.hash, bytesRead: Number(stat.size), realPath, stat, shared: true, ...(cached.blob ? { blob: cached.blob } : {}) };
+}
+
+/** A file's identity, once its bytes were taken long enough after its last change to stand for them: a change within one
+ * coarse timestamp tick could keep a same-size rewrite's identity otherwise. */
+export function settledIdentity(stat: BigIntStats, takenAtMs: number): string | undefined {
+	return stat.isFile() && takenAtMs - Number((stat.mtimeNs > stat.ctimeNs ? stat.mtimeNs : stat.ctimeNs) / 1_000_000n) >= 2000 ? fileIdentity(stat) : undefined;
 }
 
 /** `takenAtMs`: when the read began. */

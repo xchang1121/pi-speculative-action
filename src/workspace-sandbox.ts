@@ -9,7 +9,8 @@ import { containsFilesystemPath, filesystemPathKey, relativeFilesystemPath, slas
 import { errorMessage, hasErrorCode, isMissing } from "./error-utils.ts";
 import { createCommittedResourceInputs, type SpeculativeAgentExecutionWorld, type SpeculativeToolExecutionContext } from "./agent-execution-world.ts";
 import type { WorldBranch, WorldCheckpoint, WorldCommitMetrics, WorldExecutionMetrics } from "./execution-world.ts";
-import { advanceFilesystemClock, assertNoSymlinkPath, captureFilesystemEntry, captureStableFile, mapFilesystem, sameFilesystemIdentity } from "./filesystem-evidence.ts";
+import { advanceFilesystemClock, assertNoSymlinkPath, captureFilesystemEntry, captureStableFile, fileIdentity, mapFilesystem, sameFilesystemIdentity,
+	settledIdentity } from "./filesystem-evidence.ts";
 import { WORKSPACE_PATH_MUTATION_EFFECTS } from "./effect-model.ts";
 import { effectCommitFailure } from "./effect-transaction.ts";
 import type { WorkspaceFileMutation } from "./workspace-state.ts";
@@ -41,6 +42,8 @@ export interface SandboxFileChange extends SandboxChangeTarget, WorkspaceFileMut
 	readonly beforeMode?: number;
 	readonly afterMode?: number;
 	readonly afterModified?: string;
+	/** The identity that stands for `before` (see `settledIdentity`): an unchanged file proves its baseline by it. */
+	readonly beforeIdentity?: string;
 }
 
 export interface SandboxDirectoryState {
@@ -60,7 +63,7 @@ export interface SandboxDirectoryChange extends SandboxChangeTarget {
 
 export type SandboxWorkspaceChange = SandboxFileChange | SandboxDirectoryChange;
 
-interface RegularFileState { readonly content: Uint8Array; readonly mode: number; readonly identity?: BigIntStats; }
+interface RegularFileState { readonly content: Uint8Array; readonly mode: number; readonly identity?: BigIntStats; readonly settled?: string; }
 
 export interface SandboxExecutionDelta { readonly output: ToolSettlement; readonly changes: readonly SandboxWorkspaceChange[]; }
 
@@ -458,7 +461,11 @@ async function commitSandboxExecution(state: WorkspaceSandboxState, execution: S
 				await restoreModifiedTimes([...staged].map(([change, temporary]) => [temporary, change.afterModified]));
 				const validationStarted = performance.now();
 				for (const change of changes) {
-					const current = change.kind === "directory" ? await readSandboxDirectoryState(change.target) : await readRegularState(change.target);
+					// A file whose identity still stands for the bytes this change replaces needs no rereading to prove them.
+					const unchanged = change.kind !== "directory" && change.beforeIdentity && change.before
+						? await lstat(change.target, { bigint: true }).then(info => fileIdentity(info) === change.beforeIdentity ? info : undefined, () => undefined) : undefined;
+					const current = unchanged ? { content: (change as SandboxFileChange).before!, mode: Number(unchanged.mode & 0o777n), identity: unchanged }
+						: change.kind === "directory" ? await readSandboxDirectoryState(change.target) : await readRegularState(change.target);
 					baselines.set(change, current);
 					if (change.kind !== "directory") bytesValidated += (current as RegularFileState | undefined)?.content.byteLength ?? 0;
 					if (!sameSandboxBaseline(current, change)) throw new Error(`resource changed before commit: ${change.resource}`);
@@ -1665,6 +1672,7 @@ async function collectSandboxChanges(workspace: PrivateSandboxWorkspace, frontie
 				beforeMode: before?.mode,
 				afterMode: after?.mode,
 				afterModified: after?.identity && String(after.identity.mtimeNs),
+				...(before?.settled ? { beforeIdentity: before.settled } : {}),
 			});
 		}
 	}
@@ -1826,9 +1834,9 @@ async function captureLiveBase(pool: PooledGitRepository): Promise<WorkspaceStru
 async function readLiveBase(base: WorkspaceStructureSnapshot, resource: string, maxBytes: number): Promise<RegularFileState | undefined> {
 	const entry = base.entries.get(resource);
 	if (entry?.kind !== "file") return undefined;
-	const captured = await captureStableFile(entry.contentPath ?? path.join(base.root, resource), maxBytes, true);
+	const takenAtMs = Date.now(), captured = await captureStableFile(entry.contentPath ?? path.join(base.root, resource), maxBytes, true);
 	if (!hydrateWorkspaceFileEntry(entry, captured)) throw new Error(`workspace changed since the sandbox started: ${resource}`);
-	return { content: captured.content!, mode: Number(captured.stat.mode & 0o777n) };
+	return { content: captured.content!, mode: Number(captured.stat.mode & 0o777n), settled: settledIdentity(captured.stat, takenAtMs) };
 }
 
 async function readGitTreeRegularState(git: ReturnType<typeof bindGit>, tree: string, resource: string,
@@ -1962,7 +1970,8 @@ function ownSandboxChanges(changes: readonly SandboxWorkspaceChange[]): SandboxW
 		) {
 			throw new Error(`inconsistent sandbox baseline: ${change.resource}`);
 		}
-		result.set(key, { ...changeFile, before: previousFile.before, beforeMode: previousFile.beforeMode, accessMode: (previous.accessMode ?? 0) | (change.accessMode ?? 0) });
+		result.set(key, { ...changeFile, before: previousFile.before, beforeMode: previousFile.beforeMode, beforeIdentity: previousFile.beforeIdentity,
+			accessMode: (previous.accessMode ?? 0) | (change.accessMode ?? 0) });
 	}
 	return [...result.values()].map((change): SandboxWorkspaceChange => {
 		const target = { root: path.resolve(change.root), target: path.resolve(change.target) };
