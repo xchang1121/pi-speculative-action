@@ -2,7 +2,7 @@ import { open, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { directoryStatFields, FILESYSTEM_TYPE_BLIND, hostStatFields, repeatableExecutions, SHELLS, workspaceStatFields, type TracedExecution } from "./deterministic-tools.ts";
 import { containsLogicalPath } from "./path-utils.ts";
-import { type DependencyRole, FILESYSTEM_OBSERVATION_FIELDS, type FilesystemObservationField, filesystemObservationDigest, type ProvenanceTaint,
+import { type DependencyRole, FILESYSTEM_OBSERVATION_FIELDS, type FilesystemObservationField, filesystemObservationDigest, ONE_SHOT_TAINTS, type ProvenanceTaint,
 	type Sha256Digest, type ResourceTransitionKind } from "./provenance-certificate.ts";
 
 const CONFINEMENT_SENSITIVE_SYSCALLS = new Set([
@@ -894,7 +894,6 @@ function tracedPath(target: string, cwd: string | undefined): string | undefined
 	return path.posix.isAbsolute(target) ? path.posix.resolve(target) : cwd ? path.posix.resolve(cwd, target) : undefined;
 }
 
-const ONE_SHOT_TAINTS: readonly ProvenanceTaint[] = ["clock", "random", "pid_observation", "descriptor_observation"];
 
 function tracedExecution(pid: number, line: TraceLine, cwd: string): TracedExecution {
 	try {

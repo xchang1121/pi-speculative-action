@@ -1,5 +1,5 @@
-import { certificateReplayable, dependencyPathsetKey, type DynamicDependencyCertificate, isSha256Digest, type ProcessProducerProof, processStrongKey,
-	type ProcessProvenanceCertificate, type ProvenanceTaint, referencedArtifacts, type Sha256Digest } from "./provenance-certificate.ts";
+import { certificateReplayable, dependencyPathsetKey, type DynamicDependencyCertificate, isSha256Digest, ONE_SHOT_TAINTS, type ProcessProducerProof, processStrongKey,
+	type ProcessProvenanceCertificate, type ProvenanceTaint, referencedArtifacts, sealProcessCertificate, type Sha256Digest } from "./provenance-certificate.ts";
 import { type ProvenanceValidation, type ProvenanceValidationContext, validateDynamicDependencyCertificate } from "./provenance-validation.ts";
 import { ProvenanceCertificateStore, type VerifiedArtifactClosure } from "./reuse-store.ts";
 
@@ -29,14 +29,8 @@ export interface ProcessReuseRequest {
 	};
 }
 
-export type ProcessReuseMissReason =
-	| "no_candidate_pathset"
-	| "certificate_tainted"
-	| "producer_guarantee_incompatible"
-	| "dependency_changed"
-	| "validation_indeterminate"
-	| "artifact_missing"
-	| "observation_contract_incompatible";
+export type ProcessReuseMissReason = "no_candidate_pathset" | "certificate_tainted" | "producer_guarantee_incompatible" | "dependency_changed"
+	| "validation_indeterminate" | "artifact_missing" | "observation_contract_incompatible";
 
 export interface ProcessReuseLookupMetrics {
 	readonly candidateCertificates: number;
@@ -72,38 +66,23 @@ export type ProcessReusePlan =
 export class ProcessReusePlanner {
 	private readonly store: ProvenanceCertificateStore;
 
-	constructor(options: { readonly store: ProvenanceCertificateStore }) {
-		this.store = options.store;
-	}
+	constructor(options: { readonly store: ProvenanceCertificateStore }) { this.store = options.store; }
 
 	async plan(request: ProcessReuseRequest): Promise<ProcessReusePlan> {
 		const startedAt = performance.now();
-		const metrics = {
-			candidateCertificates: 0, eligibleCertificates: 0, pathsetsValidated: 0,
-			filesRead: 0, bytesRead: 0, artifactsLoaded: 0, artifactBytesRead: 0,
-		};
-		const lookup = (): ProcessReuseLookupMetrics =>
-			Object.freeze({ ...metrics, durationMs: Math.max(0, performance.now() - startedAt) });
+		const metrics = { candidateCertificates: 0, eligibleCertificates: 0, pathsetsValidated: 0, filesRead: 0, bytesRead: 0, artifactsLoaded: 0, artifactBytesRead: 0 };
+		const lookup = (): ProcessReuseLookupMetrics => Object.freeze({ ...metrics, durationMs: Math.max(0, performance.now() - startedAt) });
 		const weakKey = request.weakKey;
 		if (!isSha256Digest(weakKey)) throw new Error("invalid process weak key");
 		const live = request.live ? [request.live.certificate].flat().filter(candidate => candidate.weakKey === weakKey) : [];
-		const acceptedTaints = [...new Set([
-			...(request.validation?.acceptedTaints ?? []),
-			...(live.length ? request.live!.acceptedTaints : []),
-		])];
+		const acceptedTaints = [...new Set([...(request.validation?.acceptedTaints ?? []), ...(live.length ? request.live!.acceptedTaints : [])])];
 		const certificates = live.length ? live : await this.store.findByWeakKey(weakKey, request.executablePath, request.excludedCertificates);
 		metrics.candidateCertificates = certificates.length;
-		if (!certificates.length) {
-			return { kind: "miss", weakKey, reasons: ["no_candidate_pathset"], lookup: lookup() };
-		}
-		const reasons = new Set<ProcessReuseMissReason>();
-		const changedDependencies = new Set<string>();
+		if (!certificates.length) return { kind: "miss", weakKey, reasons: ["no_candidate_pathset"], lookup: lookup() };
+		const reasons = new Set<ProcessReuseMissReason>(), changedDependencies = new Set<string>();
 		const pathsets = new Map<Sha256Digest, ProcessProvenanceCertificate[]>();
 		for (const certificate of certificates) {
-			if (request.acceptProducer && !request.acceptProducer(certificate.producer)) {
-				reasons.add("producer_guarantee_incompatible");
-				continue;
-			}
+			if (request.acceptProducer && !request.acceptProducer(certificate.producer)) { reasons.add("producer_guarantee_incompatible"); continue; }
 			if (!certificateReplayable(certificate, acceptedTaints)) { reasons.add("certificate_tainted"); continue; }
 			if (!contractCompatible(request.contract, certificate) || certificate.result.continuation && !live.includes(certificate)) {
 				reasons.add("observation_contract_incompatible");
@@ -111,70 +90,44 @@ export class ProcessReusePlanner {
 			}
 			metrics.eligibleCertificates++;
 			const pathset = dependencyPathsetKey(certificate.dependencyCertificate);
-			const grouped = pathsets.get(pathset);
-			if (grouped) grouped.push(certificate);
-			else pathsets.set(pathset, [certificate]);
+			pathsets.set(pathset, [...pathsets.get(pathset) ?? [], certificate]);
 		}
 
 		for (const grouped of pathsets.values()) {
-			const representative = grouped[0]!;
 			metrics.pathsetsValidated++;
-			const observation = await validateDynamicDependencyCertificate(
-				representative.dependencyCertificate,
-				{ ...request.validation, acceptedTaints },
-			);
+			const observation = await validateDynamicDependencyCertificate(grouped[0]!.dependencyCertificate, { ...request.validation, acceptedTaints });
 			metrics.filesRead += observation.filesRead;
 			metrics.bytesRead += observation.bytesRead;
 			if (observation.status === "indeterminate") { reasons.add("validation_indeterminate"); continue; }
-			if (observation.status === "stale") {
-				for (const changed of observation.changed) changedDependencies.add(changed);
-			}
+			if (observation.status === "stale") for (const changed of observation.changed) changedDependencies.add(changed);
 			const current: DynamicDependencyCertificate = { complete: true, dependencies: observation.dependencies, taints: [] };
 			const strongKey = processStrongKey(weakKey, current);
 			const matching = grouped.filter((certificate) => certificate.strongKey === strongKey);
 			if (!matching.length) { reasons.add("dependency_changed"); continue; }
-			const validation: Extract<ProvenanceValidation, { status: "valid" }> = {
-				status: "valid",
-				strongKey,
-				dependencies: observation.dependencies,
-				filesRead: observation.filesRead,
-				bytesRead: observation.bytesRead,
-				durationMs: observation.durationMs,
-			};
+			const { dependencies, filesRead, bytesRead, durationMs } = observation;
+			const validation: Extract<ProvenanceValidation, { status: "valid" }> = { status: "valid", strongKey, dependencies, filesRead, bytesRead, durationMs };
 			for (const certificate of matching) {
 				const artifacts = await this.store.artifacts.load(referencedArtifacts(certificate));
 				if (!artifacts) { reasons.add("artifact_missing"); continue; }
 				metrics.artifactsLoaded += artifacts.artifacts;
 				metrics.artifactBytesRead += artifacts.bytes;
-				return {
-					kind: certificate.result.continuation ? "running_resume" : "completed_replay",
-					source: live.length ? "live" : "l2",
-					weakKey,
-					certificate,
-					validation,
-					artifacts,
-					lookup: lookup(),
-				};
+				const kind = certificate.result.continuation ? "running_resume" : "completed_replay";
+				return { kind, source: live.length ? "live" : "l2", weakKey, certificate, validation, artifacts, lookup: lookup() };
 			}
 		}
-		return {
-			kind: "miss",
-			weakKey,
-			reasons: Object.freeze(reasons.size ? [...reasons] : ["no_candidate_pathset"]),
-			...(changedDependencies.size
-				? { changedDependencies: Object.freeze([...changedDependencies].sort()) }
-				: {}),
-			lookup: lookup(),
-		};
+		return { kind: "miss", weakKey, reasons: Object.freeze(reasons.size ? [...reasons] : ["no_candidate_pathset"]),
+			...(changedDependencies.size ? { changedDependencies: Object.freeze([...changedDependencies].sort()) } : {}), lookup: lookup() };
 	}
 
 	/** Publish unmatched replayable executions so useful work survives branch discard. */
-	async publishCompleted(
-		certificate: ProcessProvenanceCertificate,
-		acceptedTaints: readonly ProvenanceTaint[] = [],
-	): Promise<boolean> {
-		if (certificate.result.continuation || !certificateReplayable(certificate, acceptedTaints)) return false;
-		return this.store.put(certificate);
+	async publishCompleted(certificate: ProcessProvenanceCertificate, acceptedTaints: readonly ProvenanceTaint[] = [], witnessRepeats = false): Promise<boolean> {
+		if (certificate.result.continuation) return false;
+		if (certificateReplayable(certificate, acceptedTaints)) return this.store.put(certificate);
+		// Held back only by inputs every process may read: a second, distinct run of the same inputs producing the same result shows
+		// they never reached it, and the certificate is sealed again without them.
+		if (!witnessRepeats || !certificateReplayable(certificate, [...acceptedTaints, ...ONE_SHOT_TAINTS]) || !(await this.store.witness(certificate))) return false;
+		return this.store.put(sealProcessCertificate({ ...certificate, dependencyCertificate: { ...certificate.dependencyCertificate,
+			taints: certificate.dependencyCertificate.taints.filter((taint) => !ONE_SHOT_TAINTS.includes(taint)) } }));
 	}
 }
 
