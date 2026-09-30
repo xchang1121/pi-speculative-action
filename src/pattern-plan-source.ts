@@ -155,20 +155,18 @@ export function createPatternPlanSource({
 		});
 	};
 
-	/** Once the Actor changed the workspace, rerun the learned command with the most work its operations' results no longer
-	 * cover: a later call of any command that launches the same operations reuses their fresh results. */
+	/** Once the Actor changed the workspace, rerun the latest learned command whose operations' results no longer cover it, as
+	 * the Actor most often repeats it: a later call of any command that launches the same operations reuses their fresh results. */
 	const reruns = async (): Promise<PlanAction[]> => {
 		if (!workspaceChanged && !issuedRerun) return [];
-		workspaceChanged = false;
-		const commands = await Promise.all([...learnedCommands.values()].map(async (command) => {
+		workspaceChanged = false; issuedRerun = undefined;
+		for (const command of [...learnedCommands.values()].reverse()) {
 			const children = [...operationBindings.values()].filter(item => item.parentHash === command.parentHash && item.binding.available !== false);
-			const stale = await Promise.all(children.map(async ({ binding }) => await binding.stale?.() !== false ? binding.executionMs : 0));
-			return { command, children, staleMs: stale.reduce((total, ms) => total + ms, 0) };
-		}));
-		const chosen = commands.reduce<(typeof commands)[number] | undefined>((best, next) => next.staleMs > (best?.staleMs ?? 0) ? next : best, undefined);
-		issuedRerun = chosen && {};
-		return chosen ? [{ id: `rerun:${chosen.command.parentHash}`, type: "tool_call", tool: chosen.command.tool, input: chosen.command.input, horizon: 0, background: true,
-			producesOperations: true, expectedLatencyBenefitMs: chosen.staleMs, feedback: issuedRerun, expectedDurationMs: Math.max(...chosen.children.map(({ binding }) => binding.expectedDurationMs)) }] : [];
+			const staleMs = (await Promise.all(children.map(async ({ binding }) => await binding.stale?.() !== false ? binding.executionMs : 0))).reduce((total, ms) => total + ms, 0);
+			if (staleMs > 0) return [{ id: `rerun:${command.parentHash}`, type: "tool_call", tool: command.tool, input: command.input, horizon: 0, background: true, producesOperations: true,
+				expectedLatencyBenefitMs: staleMs, feedback: issuedRerun = {}, expectedDurationMs: Math.max(...children.map(({ binding }) => binding.expectedDurationMs)) }];
+		}
+		return [];
 	};
 
 	const source: AgentPlanSource = {
