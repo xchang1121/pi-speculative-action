@@ -26,7 +26,7 @@ import { definedProcessEnvironment, type PreparedProcessExecutionRoute, type Pro
 	type ProcessExecutor } from "./process-execution.ts";
 import { isPoisonedEffectCommit } from "./effect-transaction.ts";
 import { resolveHostExecutable } from "./executable-path.ts";
-import { assertNoSymlinkPath, captureFilesystemEntry, captureStableFile, hashExecutableFile, mapFilesystem, sameFilesystemIdentity, sharedWalk, walkFilesystemPath } from "./filesystem-evidence.ts";
+import { assertNoSymlinkPath, captureFilesystemEntry, captureStableFile, hashExecutableFile, mapFilesystem, rememberCapture, sameFilesystemIdentity, sharedWalk, walkFilesystemPath } from "./filesystem-evidence.ts";
 import { captureHeldDescriptorInputs, inspectHeldExecProcess, LinuxHeldExecBoundary, listenUnixSocket, resolveLinuxExecHelper, type HeldExecDecision,
 	type HeldExecProcess, type HeldExecSnapshot, descriptorInputs, descriptorEffects, inheritedTracer, type ProcessResourceGraph } from "./linux-held-exec.ts";
 import { emptyWorldReuseMetrics, snapshotExecutionScope, type ExecutionScope, type ExecutionOperationAdoption, type ExecutionWorldStorageControl,
@@ -1868,9 +1868,12 @@ async function captureDependencies(session: ActiveSession, snapshot: WorkspaceSt
 		if (!cached.has(relative)) cached.set(relative, (async () => {
 			const structure = snapshot.entries.get(relative);
 			if (!structure || structure.kind !== "file") return structure;
-			const content = deltas.get(relative)?.before ?? await captureStableFile(structure.contentPath ?? path.resolve(snapshot.root, relative), structure.size);
-			const hydrated = await hydrateWorkspaceFileEntry(structure, content);
+			const delta = deltas.get(relative), before = delta?.before, takenAtMs = Date.now();
+			const captured = before ? undefined : await captureStableFile(structure.contentPath ?? path.resolve(snapshot.root, relative), structure.size);
+			const hydrated = await hydrateWorkspaceFileEntry(structure, before ?? captured!);
 			if (!hydrated) throw new Error(`transaction baseline changed: ${relative}`);
+			// Its digest stands for the file again when an adoption validates it (see cachedCapture): bytes read under a settled identity stand for that.
+			if (captured || delta?.beforeIdentity) rememberCapture(captured ?? { identity: delta!.beforeIdentity!, hash: hydrated.digest.slice("sha256:".length) }, takenAtMs);
 			return hydrated;
 		})());
 		return cached.get(relative)!;

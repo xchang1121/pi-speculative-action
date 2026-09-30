@@ -104,9 +104,9 @@ export function settledIdentity(stat: BigIntStats, takenAtMs: number): string | 
 }
 const KERNEL_TICK_FILESYSTEMS = new Set([0xef53, 0x58465342, 0x9123683e, 0xf2f52010]), kernelTicks = new Map<bigint, boolean>();
 
-/** `takenAtMs`: when the read began. */
-export function rememberCapture(capture: StableFilesystemCapture, takenAtMs: number): void {
-	fileDigests.set(fileIdentity(capture.stat), { hash: capture.hash, ...(capture.blob ? { blob: capture.blob } : {}), takenAtMs });
+/** `takenAtMs`: when the read began. An identity string stands for bytes already hashed (see `settledIdentity`). */
+export function rememberCapture(capture: StableFilesystemCapture | { readonly identity: string; readonly hash: string; readonly blob?: undefined }, takenAtMs: number): void {
+	fileDigests.set("identity" in capture ? capture.identity : fileIdentity(capture.stat), { hash: capture.hash, ...(capture.blob ? { blob: capture.blob } : {}), takenAtMs });
 	if (fileDigests.size > 65536) fileDigests.delete(fileDigests.keys().next().value!);
 }
 
