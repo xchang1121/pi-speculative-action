@@ -124,6 +124,8 @@ interface ReadyBackend {
 }
 
 interface InterposedDirectory { readonly source: string; readonly target: string; readonly shadow: string; readonly view: string; }
+/** A PATH entry the dispatcher stands in for, and the file it reaches. */
+interface InterceptedExecutable { readonly intercepted: string; readonly view: string; readonly native: string; readonly file: string; }
 
 interface SandboxMount { readonly virtualPath: string; readonly hostPath: string; readonly readOnly: boolean; }
 
@@ -204,8 +206,6 @@ interface ActiveSession {
 	topLevelOutputEndpoints?: readonly [string, string];
 	/** Output sockets of running brokered children: their own children write there, and those bytes reach the child's capture. */
 	readonly nestedOutputEndpoints: Set<readonly [string, string]>;
-	/** Each exec interception with the image it reaches. */
-	interposedImages?: Promise<readonly (readonly [ExecMount, string | undefined])[]>;
 	sealPromise?: Promise<readonly SandboxWorkspaceChange[]>;
 	closing?: Promise<void>;
 }
@@ -253,7 +253,7 @@ export class LinuxProcessReuseBackend {
 	/** Recent traced run times of nested children by executable, the longest kept: a cheap child never repays its own sandbox. */
 	private readonly childRunMs = new BoundedRecencyMap<string, readonly number[]>(512);
 	/** Executable entries of a PATH directory, by the directory's identity and the exclusions (see createProcessInterposition). */
-	private readonly executableEntries = new BoundedRecencyMap<string, readonly string[]>(64);
+	private readonly executableEntries = new BoundedRecencyMap<string, readonly (readonly [name: string, file: string])[]>(64);
 	private sharedInterposition?: SharedInterposition;
 	private readonly counters: MutableLinuxProcessReuseMetrics = { ...emptyWorldReuseMetrics() };
 	private readonly actorCounters: MutableLinuxProcessReuseMetrics = { ...emptyWorldReuseMetrics() };
@@ -472,7 +472,7 @@ export class LinuxProcessReuseBackend {
 			invocation: input.invocation,
 			scope: snapshotExecutionScope(input.scope),
 			projection,
-			interposition: { mounts: [], execMounts: [], directories: [], executables: [], dependencies: [] },
+			interposition: { mounts: [], directories: [], entries: [], dependencies: [] },
 			originalPath,
 			deniedPaths,
 			producer,
@@ -649,7 +649,7 @@ export class LinuxProcessReuseBackend {
 			deniedPaths: session.deniedPaths,
 			writablePaths: [session.workspace.sandboxRoot, session.socketPath],
 			mounts: session.interposition.mounts,
-			execMounts: session.interposition.execMounts,
+			execMounts: interception(session.interposition).execMounts,
 			command: [session.invocation.shell, ...shellArguments(session.invocation, command)],
 			...(request.timeout !== undefined ? { timeoutSeconds: request.timeout } : {}),
 		});
@@ -677,7 +677,7 @@ export class LinuxProcessReuseBackend {
 			try {
 				const after = await session.workspace.structure.capture();
 				const observation = await observeStrace(tracePrefix, session.invocation.shell, logicalCwd, {
-					interposedExecutables: session.interposition.executables,
+					interposedExecutables: interception(session.interposition).executables,
 					...(session.topLevelOutputEndpoints ? { outputEndpoints: session.topLevelOutputEndpoints } : {}),
 					guardFilesystemSemanticsWithin: [session.workspace.sandboxRoot, session.sourceRoot],
 				});
@@ -1127,10 +1127,7 @@ export class LinuxProcessReuseBackend {
 			traceRoot = await mkdtemp(path.join(session.workspace.processRoot, "trace-"));
 			const tracePrefix = path.join(traceRoot, "process");
 			const logicalExecutable = session.projection.toLogical(executable);
-			// The child's own image is not intercepted in its sandbox: that would broker the child to itself.
-			const images = await (session.interposedImages ??= Promise.all(session.interposition.execMounts.map(async mount =>
-				[mount, mount.alias ? undefined : await realpath(mount.virtualPath).catch(() => undefined)] as const)));
-			const execMounts = images.flatMap(([mount, target]) => target === executable || mount.virtualPath === logicalExecutable ? [] : [mount]), image = logicalExecutable;
+			const { execMounts, executables: interposedExecutables } = interception(session.interposition, executable), image = logicalExecutable;
 			const logicalCwd = session.projection.toLogical(request.cwd);
 			let descriptorManifest: string | undefined, descriptorReportPath: string | undefined;
 			const directoryImages: Array<readonly [string, string]> = [];
@@ -1304,7 +1301,7 @@ export class LinuxProcessReuseBackend {
 				if (suspensionAttempted && !continuation) throw new Error("private process suspension was not sealed");
 				const descriptorOffsets = descriptorReport && inputs.length ? parseDescriptorOffsets(await descriptorReport.readFile(), inputs) : undefined;
 				transactionFinishing = true;
-				const observing = observeStrace(tracePrefix, image, session.projection.toLogical(request.cwd), { interposedExecutables: session.interposition.executables.filter(([intercepted]) => intercepted !== image),
+				const observing = observeStrace(tracePrefix, image, session.projection.toLogical(request.cwd), { interposedExecutables,
 						...(frozen ? { frozen } : {}), ...(outputEndpoints ? { outputEndpoints } : {}),
 						guardFilesystemSemanticsWithin: [session.workspace.sandboxRoot, session.sourceRoot],
 						inheritedDirectoryImages: directoryImages.flatMap(([physical]) => [physical, session.projection.toLogical(physical)]),
@@ -1902,7 +1899,7 @@ async function captureDependencies(
 		}
 		return { path: current, links };
 	};
-	const interposed = new Set(session.interposition.executables.map(([target]) => path.resolve(target)));
+	const interposed = new Set(session.interposition.entries.flatMap(entry => [path.resolve(entry.intercepted), path.resolve(entry.view)]));
 	const pending = [...observed], seenImages = new Set<string>(), hostPaths = new Map<string, { physical: string; role: Exclude<ObservedProcessPath["role"], "metadata"> }>();
 	for (let item = pending.shift(); item; item = pending.shift()) {
 		const follow = item.role !== "metadata" || item.followSymlinks, walked = await walk(item.path, follow);
@@ -2090,7 +2087,7 @@ function wireOutput(output: readonly BufferedOutput[]): readonly { readonly fd: 
 /** Exec-only views of PATH directories outside the workspace, shared by every session: one per directory state. A session supplies
  * its broker through `session/`, the fixed path every view's sidecar names, mounted over from its private root. */
 interface SharedInterposition { readonly root: Promise<string>; readonly views: BoundedRecencyMap<string, Promise<InterposedView | undefined>>; }
-interface InterposedView { readonly view: string; readonly shadow: string; readonly names: readonly string[]; readonly dependency: DynamicDependency }
+interface InterposedView { readonly view: string; readonly shadow: string; readonly names: readonly (readonly [name: string, file: string])[]; readonly dependency: DynamicDependency }
 
 async function createProcessInterposition(input: {
 	readonly gitDirectory?: string;
@@ -2105,7 +2102,7 @@ async function createProcessInterposition(input: {
 	readonly socketPath: string;
 	readonly dispatcherBinary: string;
 	readonly excludedExecutables: readonly string[];
-	readonly executableEntries: BoundedRecencyMap<string, readonly string[]>;
+	readonly executableEntries: BoundedRecencyMap<string, readonly (readonly [name: string, file: string])[]>;
 	readonly shared: SharedInterposition;
 }) {
 	const shared = await input.shared.root, root = path.join(input.privateRoot, "process-interposition");
@@ -2116,7 +2113,7 @@ async function createProcessInterposition(input: {
 	await writeFile(configurationPath, `${input.socketPath}\n${input.token}\n`, { mode: 0o600 });
 	const excluded = [...new Set(await Promise.all(input.excludedExecutables.map(candidate => realpath(candidate).catch(() => undefined))))]
 		.filter((candidate): candidate is string => candidate !== undefined).sort(); // A missing exclusion cannot be executed.
-	const directories: InterposedDirectory[] = [], executables: Array<readonly [string, string]> = [], execMounts: ExecMount[] = [];
+	const directories: InterposedDirectory[] = [], intercepts: InterceptedExecutable[] = [];
 	const dependencies: DynamicDependency[] = [], seenTargets = new Set<string>();
 	let mountBytes = 0, local = 0;
 	// Each view is a directory of hard links to one dispatcher copy, a sidecar naming its routing, and the shadow its natives run from.
@@ -2126,22 +2123,22 @@ async function createProcessInterposition(input: {
 		// Each physical entry is probed once per directory state.
 		let names = input.executableEntries.get(identity);
 		if (!names) {
-			const probed: string[] = [];
+			const probed: (readonly [string, string])[] = [];
 			await mapFilesystem(entries, async (name) => {
 				input.signal?.throwIfAborted();
 				if (!name || name === ".pi-spec-dispatch" || name.includes("/") || name.includes("\0")) return;
 				const sourceEntry = path.join(source, name);
 				try {
 					const resolved = await realpath(sourceEntry);
-					if ((await lstat(resolved)).isFile() && !excluded.includes(resolved)) { await access(sourceEntry, fsConstants.X_OK); probed.push(name); }
+					if ((await lstat(resolved)).isFile() && !excluded.includes(resolved)) { await access(sourceEntry, fsConstants.X_OK); probed.push([name, resolved]); }
 				} catch {
 					// Unproved entries remain visible through the original directory.
 				}
 			});
 			input.executableEntries.set(identity, names = probed);
 		}
-		const linked: string[] = [];
-		await mapFilesystem(names, async (name) => { await link(launcher, path.join(view, name)).then(() => linked.push(name), () => undefined); });
+		const linked: (readonly [string, string])[] = [];
+		await mapFilesystem(names, async (entry) => { await link(launcher, path.join(view, entry[0])).then(() => linked.push(entry), () => undefined); });
 		const dependency = await captureDirectoryDependency(source, input.projection.isWorkspacePhysical(source) ? input.projection.toLogical(source) : slash(source), true,
 			path.resolve(source) === path.resolve(input.workspaceRoot) ? input.workspaceExcludes : []);
 		return { view, shadow, names: linked, dependency };
@@ -2189,11 +2186,7 @@ async function createProcessInterposition(input: {
 		if (!interposed) continue;
 		directories.push({ source, target, shadow: interposed.shadow, view: interposed.view });
 		dependencies.push(interposed.dependency);
-		for (const name of interposed.names) {
-			const intercepted = path.join(target, name), viewEntry = path.join(interposed.view, name), native = path.join(interposed.shadow, name);
-			executables.push([intercepted, native], [viewEntry, native]);
-			execMounts.push({ virtualPath: intercepted, hostPath: viewEntry });
-		}
+		for (const [name, file] of interposed.names) intercepts.push({ intercepted: path.join(target, name), view: path.join(interposed.view, name), native: path.join(interposed.shadow, name), file });
 	}
 	const mounts = uniqueSandboxMounts([
 		...directories.map(({ shadow, source }) => ({ virtualPath: shadow, hostPath: source, readOnly: true })),
@@ -2203,12 +2196,21 @@ async function createProcessInterposition(input: {
 	]);
 	return {
 		mounts,
-		// A native image run from a shadow is its intercepted original: scripts are opened and named there.
-		execMounts: Object.freeze([...execMounts, ...directories.map(({ shadow, target }) => ({ virtualPath: shadow, hostPath: target, alias: true as const }))]),
 		directories: Object.freeze(directories),
-		executables: Object.freeze(executables),
+		entries: Object.freeze(intercepts),
 		dependencies: Object.freeze(dependencies),
 	};
+}
+
+/** What a process tree running `image` intercepts: every entry but the ones reaching `image`, which would broker it to itself.
+ * The sandbox mounts and the observer's table are both this one view. */
+function interception(interposition: ActiveSession["interposition"], image?: string) {
+	const entries = interposition.entries.filter(entry => entry.file !== image);
+	return {
+		// A native image run from a shadow is its intercepted original: scripts are opened and named there.
+		execMounts: [...entries.map(entry => ({ virtualPath: entry.intercepted, hostPath: entry.view })),
+			...interposition.directories.map(({ shadow, target }) => ({ virtualPath: shadow, hostPath: target, alias: true as const }))],
+		executables: entries.flatMap(entry => [[entry.intercepted, entry.native], [entry.view, entry.native]] as const) };
 }
 
 function sandboxArguments(input: {

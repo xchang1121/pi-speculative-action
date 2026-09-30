@@ -3108,16 +3108,17 @@ static void *relay_output(void *argument) {
 		if (count < 0 || transfer(relay->destination, bytes, (size_t)count, 1) < 0) return (void *)1;
 	}
 }
-static int execute_descriptors(const char *manifest, const char *report, char *executable, char **command, const char *route) {
+static int execute_descriptors(const char *manifest, const char *report, char *executable, char **command, const char *route, unsigned closed_input) {
 	struct file_position positions[MAX_POSITIONS];
 	struct output_relay relays[2] = {{.source = -1, .writer = -1, .destination = 1}, {.source = -1, .writer = -1, .destination = 2}};
 	char line[MAX_LINE];
-	unsigned count = 0, close_input = 0, journal = 0, initialized = 0, inherited = 3;
+	unsigned count = 0, close_input = closed_input, journal = 0, initialized = 0, inherited = 3;
 	int result = 70, minimum = 3, output = -1, root_status = -1;
-	FILE *input = fopen(manifest, "re");
-	if (!input) return result;
-	if (!fgets(line, sizeof(line), input) || sscanf(line, "INPUTS %u %u %u", &count, &close_input, &journal) != 3 ||
-		count > MAX_POSITIONS || close_input > 1 || journal > 1) goto done;
+	/* Without a manifest the run inherits nothing beyond its standard streams. */
+	FILE *input = manifest ? fopen(manifest, "re") : NULL;
+	if (manifest && !input) return result;
+	if (input && (!fgets(line, sizeof(line), input) || sscanf(line, "INPUTS %u %u %u", &count, &close_input, &journal) != 3 ||
+		count > MAX_POSITIONS || close_input > 1 || journal > 1)) goto done;
 	for (unsigned index = 0; index < count; index++) {
 		struct file_position *position = &positions[index];
 		*position = (struct file_position){.duplicate = -1, .writer = -1, .object = -1, .producer = -1}; initialized++;
@@ -3145,7 +3146,7 @@ static int execute_descriptors(const char *manifest, const char *report, char *e
 		if (position->descriptor >= minimum) minimum = position->descriptor + 1;
 		if (alias == position->descriptor && (position->flags & O_PATH)) inherited++;
 	}
-	while (fgets(line, sizeof(line), input)) {
+	while (input && fgets(line, sizeof(line), input)) {
 		int fd; struct queue_message message = {0};
 		if (*line == 'L') {
 			struct ofd_lock lock; int cursor;
@@ -3160,8 +3161,9 @@ static int execute_descriptors(const char *manifest, const char *report, char *e
 		if (index == count || positions[index].alias != (int)index || positions[index].stream < 4 || positions[index].stream > 5 ||
 			append_message(&positions[index].messages, &message) < 0) goto done;
 	}
-	if (ferror(input)) goto done;
-	fclose(input); input = NULL;
+	if (input && ferror(input)) goto done;
+	if (input) fclose(input);
+	input = NULL;
 	if (has_unmodeled_descriptors((int)inherited) != 0) goto done;
 	inherited = 3;
 	/* ADDFD cannot inject O_PATH; the sandbox preserves these caller-owned images. */
@@ -3306,11 +3308,13 @@ static int execute_descriptors(const char *manifest, const char *report, char *e
 		close(pair[0]); close(pair[1]);
 		if (relays[index].source < 0 || relays[index].writer < 0) goto done;
 	}
-	output = open(report, O_WRONLY | O_CLOEXEC | O_NOFOLLOW);
+	/* Nothing to settle after the run: it replaces this launcher, as a native exec would. */
+	int in_place = !count && !route[2];
+	if (!in_place) output = open(report, O_WRONLY | O_CLOEXEC | O_NOFOLLOW);
 	for (unsigned index = 0; index < count; index++) for (unsigned entry = 0; entry < positions[index].locks.count; entry++)
 		if (set_file_lock(positions[index].duplicate, positions[index].locks.entries[entry]) < 0) goto done;
-	if (output < 0 || prctl(PR_SET_CHILD_SUBREAPER, 1) < 0) goto done;
-	pid_t root = fork();
+	if (!in_place && (output < 0 || prctl(PR_SET_CHILD_SUBREAPER, 1) < 0)) goto done;
+	pid_t root = in_place ? 0 : fork();
 	if (root < 0) goto done;
 	if (!root) {
 		close(output);
@@ -3414,8 +3418,8 @@ int main(int argc, char **argv) {
 	int dispatched = image_dispatch(argc, argv);
 	if (dispatched >= 0) return dispatched;
 	if (argc >= 2 && (!strcmp(argv[1], "--exec") || !strcmp(argv[1], "--exec-closed-input") || !strcmp(argv[1], "--exec-fds"))) {
-		int descriptors = !strcmp(argv[1], "--exec-fds");
-		if (argc < (descriptors ? 7 : 5) || strspn(argv[2], "012") != 2 ||
+		int descriptors = !strcmp(argv[1], "--exec-fds"), name = descriptors ? 5 : 3;
+		if (argc < name + 2 || strspn(argv[2], "012") != 2 ||
 			(strlen(argv[2]) != 2 && (!descriptors || strlen(argv[2]) != 4 || strspn(argv[2] + 2, "ps") != 2 ||
 				(argv[2][0] == argv[2][1] && argv[2][2] != argv[2][3])))) return 64;
 		/* Save stdout's source before changing either endpoint, including swapped routes.
@@ -3426,22 +3430,16 @@ int main(int argc, char **argv) {
 		int routed = dup2(argv[2][1] == '0' ? discard : argv[2][1] - '0', 2) >= 0 && dup2(output, 1) >= 0;
 		close(output); close(discard);
 		if (!routed) return 70;
-		/* Close only at the native outlet: Node and the sandbox launcher may fill vacant stdio. */
-		if (!strcmp(argv[1], "--exec-closed-input") && close(0) < 0 && errno != EBADF) return 70;
 		/* Preserve the former libuv outlet's empty mask and default dispositions. */
 		sigset_t empty;
 		sigemptyset(&empty);
 		if (sigprocmask(SIG_SETMASK, &empty, NULL) < 0) return 70;
 		for (int number = 1; number < NSIG; number++) signal(number, SIG_DFL);
-		if (descriptors) {
-			char *executable = argv[6], *manifest = argv[3], *report = argv[4];
-			argv[6] = argv[5];
-			return execute_descriptors(manifest, report, executable, memmove(argv + 4, argv + 6, (size_t)(argc - 5) * sizeof(*argv)), argv[2]); /* two spare slots, as below */
-		}
-		char *executable = argv[4];
-		argv[4] = argv[3];
-		execv(executable, memmove(argv + 2, argv + 4, (size_t)(argc - 3) * sizeof(*argv))); /* two spare slots, as in image_dispatch */
-		return errno == ENOENT ? 127 : 126;
+		char *executable = argv[name + 1], *manifest = descriptors ? argv[3] : NULL, *report = descriptors ? argv[4] : NULL;
+		argv[name + 1] = argv[name];
+		/* Two spare slots after the command, as in image_dispatch: a script's exec is rewritten in place. */
+		return execute_descriptors(manifest, report, executable, memmove(argv + name - 1, argv + name + 1, (size_t)(argc - name) * sizeof(*argv)), argv[2],
+			!strcmp(argv[1], "--exec-closed-input"));
 	}
 	if (argc == 4 && !strcmp(argv[1], "--probe-context")) return probe_context(argv[2], argv[3]);
 	if (argc == 2 && !strcmp(argv[1], "--probe-clean-fds")) {
