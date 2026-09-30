@@ -596,11 +596,9 @@ export class LinuxProcessReuseBackend {
 			resolveHostExecutable(this.options.straceBinary, "strace", [path.join(os.homedir(), ".local", "bin", "pi-speculative-strace")]),
 			resolveLinuxExecHelper(this.options.heldExecBinary),
 		]);
-		const [sandlockCheck, sandlockVersion, straceVersion, platformFingerprint] = await Promise.all([
-			execText(sandlock, ["check"]),
-			execText(sandlock, ["--version"]),
-			execText(strace, ["-V"]),
-			this.resolvePlatformFingerprint(),
+		// The exact confinement and tracer builds, not their versions: a patched fix changes what their certificates mean.
+		const [sandlockCheck, sandlockBuild, straceBuild, platformFingerprint] = await Promise.all([
+			execText(sandlock, ["check"]), hashExecutableFile(sandlock), hashExecutableFile(strace), this.resolvePlatformFingerprint(),
 		]);
 		if (!sandlockCheck.includes("Status:         OK")) throw new Error("Sandlock kernel protections are unavailable");
 		// An older helper runs an unknown flag as a command, which fails.
@@ -623,8 +621,8 @@ export class LinuxProcessReuseBackend {
 		const fingerprint = digestObject({
 			epoch: BACKEND_EPOCH,
 			policy: POLICY_ID,
-			sandlock: sandlockVersion.trim(),
-			strace: straceVersion.split(/\r?\n/)[0]?.trim(),
+			sandlock: sandlockBuild,
+			strace: straceBuild,
 			platformFingerprint,
 			executionContext: sha256Digest(executionContext.key),
 			arch: process.arch,
