@@ -282,14 +282,8 @@ export class ProvenanceCertificateStore {
 	}
 
 	private async inventory(): Promise<StoreInventory> {
-		const scans = [
-			filesUnder(this.managedPath("certificates")),
-			filesUnder(path.join(this.artifacts.root, "sha256")),
-		] as const;
-		const [certificatePaths, artifactPaths] = await Promise.all(scans).catch(async (error) => {
-			await Promise.allSettled(scans);
-			throw error;
-		});
+		const scans = [filesUnder(this.managedPath("certificates")), filesUnder(path.join(this.artifacts.root, "sha256"))] as const;
+		const [certificatePaths, artifactPaths] = await Promise.all(scans).catch(async (error) => { await Promise.allSettled(scans); throw error; });
 		const certificates = (await Promise.all(certificatePaths.filter((target) => target.endsWith(".json")).map(async (target) => {
 			const bytes = await readFile(target).catch(() => undefined);
 			if (!bytes) return undefined;
