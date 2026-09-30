@@ -27,6 +27,24 @@ describe("ProcessReusePlanner", () => {
 		expect(await planner.plan({ ...request, live: undefined, contract: { ...request.contract, continuation: true } })).toMatchObject({ kind: "miss" });
 	});
 
+	it("makes a result repeatable once two distinct runs of its inputs agree, and never when they differ", async () => {
+		const root = await temporaryRoot(), store = new ProvenanceCertificateStore(root), planner = new ProcessReusePlanner({ store });
+		const output = await store.artifacts.put("out"), other = await store.artifacts.put("other");
+		const run = (createdAt: number, data = output, taints: ProcessProvenanceCertificate["dependencyCertificate"]["taints"] = ["clock", "pid_observation", "random"],
+			prototype = processPrototype()) => processCertificate(prototype, { createdAt, dependencyCertificate: { complete: true, dependencies: [], taints },
+			result: { replayProfile: "buffered_noninteractive", observedProcessMs: createdAt, journal: [{ sequence: 0, kind: "output", fd: 1, data }], exit: { kind: "code", code: 0 } } });
+		expect(await planner.publishCompleted(run(1), [], false)).toBe(false);
+		expect(await planner.publishCompleted(run(2), [], false)).toBe(false); // Off: no witness is taken.
+		expect(await planner.publishCompleted(run(3), [], true)).toBe(false); // The first witness only.
+		expect(await planner.publishCompleted(run(3), [], true)).toBe(false); // The same run again is no second witness.
+		expect(await planner.publishCompleted(run(4), [], true)).toBe(true);
+		const [published] = await store.findByWeakKey(run(4).weakKey, run(4).prototype.executablePath);
+		expect(published?.dependencyCertificate.taints).toEqual([]);
+		const argv = processPrototype({ argv: ["other"] });
+		for (const [createdAt, data] of [[5, output], [6, other], [7, other]] as const) expect(await planner.publishCompleted(run(createdAt, data, undefined, argv), [], true)).toBe(false);
+		for (const createdAt of [8, 9]) expect(await planner.publishCompleted(run(createdAt, output, ["clock", "network"], processPrototype({ argv: ["net"] })), [], true)).toBe(false);
+	});
+
 	it("reuses the same nested exec across different parent commands after strong validation", async () => {
 		const fixture = await fixtureWithCertificate();
 		const { planner, request } = fixture;
@@ -199,14 +217,9 @@ async function fixtureWithCertificate(
 	return { certificate: certificates[0]!, certificates, input, prototype, store, request, planner: new ProcessReusePlanner({ store }) };
 }
 
-function processPrototype() {
-	return basePrototype({
-		executablePath: "/usr/bin/compiler",
-		executableDigest: sha256Digest("compiler"),
-		argv: ["compiler", "input.txt"],
-		environment: { LANG: "C", PATH: "/usr/bin" },
-		platformFingerprint: "linux-x64",
-	});
+function processPrototype(overrides: Parameters<typeof basePrototype>[0] = {}) {
+	return basePrototype({ executablePath: "/usr/bin/compiler", executableDigest: sha256Digest("compiler"), argv: ["compiler", "input.txt"],
+		environment: { LANG: "C", PATH: "/usr/bin" }, platformFingerprint: "linux-x64", ...overrides });
 }
 
 function contract() { return { sink: "buffered" as const, orderedJournal: true, transactionalEffects: true, }; }

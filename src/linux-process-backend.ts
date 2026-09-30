@@ -15,7 +15,7 @@ import { errorMessage, isMissing as missing } from "./error-utils.ts";
 import { stableEqual } from "./stable-json.ts";
 import { TimelineInterval, type TimelineDependency } from "./task-timing.ts";
 import { createExecPrototype, digestObject, dynamicDependencyIdentity, type DynamicDependency, type DynamicDependencyCertificate, type ExecPrototype,
-	type ExitOutcome, filesystemObservationDigest, type OrderedEffectEvent, type OFDPosition, type ProcessProducerProof,
+	type ExitOutcome, filesystemObservationDigest, ONE_SHOT_TAINTS, type OrderedEffectEvent, type OFDPosition, type ProcessProducerProof,
 	type ProcessProvenanceCertificate, type ProcessResultRecord, processWeakKey, type ProvenanceTaint, sealProcessCertificate, sha256Digest,
 	type Sha256Digest, type WorkspaceEffectState } from "./provenance-certificate.ts";
 import { captureAbsenceDependency, captureDirectoryDependency, captureFileDependency,
@@ -50,13 +50,13 @@ const MAX_CONTINUATION_BYTES = 65 * 1024 * 1024;
 const IO_FRONTIERS = new Map([[0, "read"], [1, "write"], [19, "readv"], [20, "writev"], [44, "sendto"], [45, "recvfrom"], [46, "sendmsg"], [47, "recvmsg"]]);
 const MAX_CAPTURE_BYTES = 512 * 1024 * 1024;
 /** Native inputs consumed by this exact one-shot execution; they still prohibit any later replay. */
-const TRANSFERRED_INPUT_TAINTS = new Set<ProvenanceTaint>([
-	"clock", "random", "pid_observation", "descriptor_observation",
-]);
+const TRANSFERRED_INPUT_TAINTS = new Set<ProvenanceTaint>(ONE_SHOT_TAINTS);
 
 export interface LinuxProcessBackendOptions {
 	readonly storeRoot: string;
 	readonly store?: ProvenanceStoreOptions;
+	/** Whether two distinct runs agreeing on a result make it repeatable despite the one-shot inputs every process may read. */
+	readonly witnessRepeats?: () => boolean;
 	readonly sandlockBinary?: string;
 	readonly straceBinary?: string;
 	readonly heldExecBinary?: string;
@@ -745,7 +745,7 @@ export class LinuxProcessReuseBackend {
 			result: await captureProcessResult(this.store, execution.outcome, execution.observedProcessMs,
 				changes.map(change => ({ logicalPath: slash(path.resolve(session.sourceRoot, change.resource)), change }))),
 		});
-		if (await this.planner.publishCompleted(certificate, SAME_CONFINEMENT_TAINTS)) this.add(session, "wholeCommandPublished");
+		if (await this.planner.publishCompleted(certificate, SAME_CONFINEMENT_TAINTS, this.options.witnessRepeats?.())) this.add(session, "wholeCommandPublished");
 	}
 
 	private serve(session: ActiveSession, socket: net.Socket): void {
@@ -1458,7 +1458,7 @@ export class LinuxProcessReuseBackend {
 						});
 						if (binding) session.executionBindings.set(requestID, binding);
 						stage = "history_publication";
-						return this.planner.publishCompleted(certificate, SAME_CONFINEMENT_TAINTS).catch((error: unknown) => {
+						return this.planner.publishCompleted(certificate, SAME_CONFINEMENT_TAINTS, this.options.witnessRepeats?.()).catch((error: unknown) => {
 							// Optional history storage cannot invalidate already sealed execution evidence.
 							this.setError(session, `nested_publish:${failureDetail(error)}`);
 							return false;

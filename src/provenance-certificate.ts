@@ -348,6 +348,16 @@ export function referencedArtifacts(certificate: ProcessProvenanceCertificate): 
 	return [...unique.values()];
 }
 
+/** Inputs every process may read without a syscall or at will (the clock, randomness, its pid, a descriptor's identity):
+ * alone they allow one transfer of a result, and a result they never reached only after two runs agree. */
+export const ONE_SHOT_TAINTS: readonly ProvenanceTaint[] = ["clock", "random", "pid_observation", "descriptor_observation"];
+
+/** What a run produced, not how long it took: two runs with equal digests produced the same exit, output and effects. */
+export function processResultDigest(result: ProcessResultRecord): Sha256Digest {
+	const { observedProcessMs: _observed, ...produced } = result;
+	return digestObject(produced);
+}
+
 export function certificateReplayable(
 	certificate: ProcessProvenanceCertificate,
 	acceptedTaints: readonly ProvenanceTaint[] = [],
