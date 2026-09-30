@@ -6,7 +6,7 @@ import { randomBytes } from "node:crypto";
 import { once } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
 import { constants as fsConstants } from "node:fs";
-import { access, chmod, copyFile, link, lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { access, chmod, copyFile, link, lstat, mkdir, mkdtemp, open, readFile, readdir, readlink, realpath, rm, stat, writeFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -650,6 +650,7 @@ export class LinuxProcessReuseBackend {
 			writablePaths: [session.workspace.sandboxRoot, session.socketPath],
 			mounts: session.interposition.mounts,
 			execMounts: interception(session.interposition).execMounts,
+			privateWrites: path.join(session.workspace.processRoot, "private"),
 			command: [session.invocation.shell, ...shellArguments(session.invocation, command)],
 			...(request.timeout !== undefined ? { timeoutSeconds: request.timeout } : {}),
 		});
@@ -682,7 +683,7 @@ export class LinuxProcessReuseBackend {
 					guardFilesystemSemanticsWithin: [session.workspace.sandboxRoot, session.sourceRoot],
 				});
 				session.topLevelCapture = { before, after, observation };
-				for (const reason of observation.incompleteReasons) session.incompleteReasons.add(`top_trace:${reason}`);
+				for (const reason of [...observation.incompleteReasons, ...await privateChanges(path.join(session.workspace.processRoot, "private"))]) session.incompleteReasons.add(`top_trace:${reason}`);
 			} catch (error) {
 				session.incompleteReasons.add(`top_capture:${errorMessage(error)}`);
 				session.topLevelEvidence = { complete: false, dependencies: [], taints: ["trace_incomplete"] };
@@ -1225,7 +1226,7 @@ export class LinuxProcessReuseBackend {
 						...[...descriptorImages.values()].filter(image => !image.workspace).map(image => image.physical)],
 					[{ virtualPath: session.sourceRoot, hostPath: session.workspace.sandboxRoot, readOnly: false },
 						...(session.gitDirectory ? [{ virtualPath: session.gitDirectory, hostPath: session.gitDirectory, readOnly: true }] : []), ...session.interposition.mounts],
-					execMounts,
+					execMounts, path.join(session.workspace.processRoot, "private"),
 				),
 				...inheritedFiles.flatMap((_, index) => ["--preserve-fd", String(index + 3)]),
 				...directoryImages.flatMap(([directory, image]) => ["--directory-image", sandboxMountArgument({ virtualPath: directory, hostPath: image, readOnly: false })]),
@@ -1370,8 +1371,11 @@ export class LinuxProcessReuseBackend {
 				// A brokered descendant that did not resume in this trace ran outside it.
 				const traced = new Set((await readdir(traceRoot)).map(name => Number(/^process\.(\d+)$/.exec(name)?.[1])));
 				const escaped = session.bypasses.some(([pid]) => traced.has(pid) && !observation.resumedInterpositions?.includes(pid));
+				// A change it left outside the workspace is not an effect a replay reproduces.
+				const external = await privateChanges(path.join(session.workspace.processRoot, "private"), observation.external ?? []);
+				if (external.length) this.setError(session, `evidence:${external.join(",")}`);
 				dependencyCertificate = {
-					complete: observation.complete && evidence.complete && !escaped,
+					complete: observation.complete && evidence.complete && !escaped && !external.length,
 					dependencies: evidence.dependencies,
 					taints: [...taints],
 				};
@@ -2219,12 +2223,13 @@ function sandboxArguments(input: {
 	readonly writablePaths: readonly string[];
 	readonly mounts: readonly SandboxMount[];
 	readonly execMounts: readonly ExecMount[];
+	readonly privateWrites: string;
 	readonly command: readonly string[];
 	readonly timeoutSeconds?: number;
 }): readonly string[] {
 	return [
 		input.ready.sandlock,
-		...sandboxPolicyArguments(input.cwd, input.deniedPaths, input.writablePaths, input.mounts, input.execMounts),
+		...sandboxPolicyArguments(input.cwd, input.deniedPaths, input.writablePaths, input.mounts, input.execMounts, input.privateWrites),
 		...(input.timeoutSeconds !== undefined ? ["--timeout", String(Math.max(1, Math.ceil(input.timeoutSeconds)))] : []),
 		"--",
 		...input.command,
@@ -2237,11 +2242,14 @@ function sandboxPolicyArguments(
 	writablePaths: readonly string[],
 	mounts: readonly SandboxMount[],
 	execMounts: readonly ExecMount[],
+	privateWrites: string,
 ): readonly string[] {
 	return [
 		"run",
 		"--chroot",
 		"/",
+		// A write the host user could make but the policy does not grant lands in a private branch here, as it would succeed natively.
+		"--workdir", "/", "--fs-storage", privateWrites, "--fs-branch", "writes", "--on-exit", "keep", "--on-error", "keep",
 		...mounts.flatMap((mount) => ["--fs-mount", sandboxMountArgument(mount)]),
 		...execMounts.flatMap((mount) => [mount.alias ? "--exec-alias" : "--exec-mount", sandboxMountArgument(mount)]),
 		"--fs-read",
@@ -2258,6 +2266,28 @@ function sandboxPolicyArguments(
 		"--cwd",
 		cwd,
 	];
+}
+
+/** Net changes a session's private branch under `storage` holds against the host, at `candidates` or wherever it holds any:
+ * a copy that differs from the host object, a directory the host lacks, a deletion of something the host still has. */
+async function privateChanges(storage: string, candidates?: Iterable<string>): Promise<string[]> {
+	const upper = path.join(storage, "writes", "upper"), stat = (target: string) => lstat(target).catch(() => undefined);
+	const deletions = (await readFile(path.join(storage, "writes", "deleted.log"), "utf8").catch(() => "")).split("\n").filter(Boolean)
+		.map(line => `/${line.replace(/\\(.)/g, (_, escaped: string) => escaped === "n" ? "\n" : escaped === "r" ? "\r" : escaped)}`);
+	const held: string[] = [];
+	const walk = async (host: string): Promise<void> => {
+		for (const name of await readdir(path.join(upper, host)).catch(() => [] as string[])) { held.push(path.posix.join(host, name)); await walk(path.posix.join(host, name)); }
+	};
+	if (!candidates) await walk("/");
+	const changed: string[] = [];
+	for (const host of new Set(candidates ? [...candidates].map(target => path.posix.resolve(target)) : [...held, ...deletions])) {
+		const [own, native] = await Promise.all([stat(path.join(upper, host)), stat(host)]);
+		const same = own && native && (own.isDirectory() ? native.isDirectory() : native.mode === own.mode && native.size === own.size && (own.isSymbolicLink()
+			? await readlink(path.join(upper, host)) === await readlink(host) : (await readFile(path.join(upper, host))).equals(await readFile(host))));
+		const deleted = !own && native && deletions.some(entry => host === entry || host.startsWith(`${entry}/`));
+		if (own ? !same : deleted) changed.push(`external_write:${host}`);
+	}
+	return changed;
 }
 
 function uniqueSandboxMounts(mounts: readonly SandboxMount[]): readonly SandboxMount[] {
@@ -2292,7 +2322,7 @@ async function probeExecutionContext(input: {
 	await writeFile(path.join(input.physicalRoot, "script-position"), "#!/bin/sh\nexit 42\n", { mode: 0o700 });
 	const command = straceCommand(input.strace, path.join(input.physicalRoot, "context"), [
 		input.sandlock,
-		...sandboxPolicyArguments(input.logicalRoot, [], [input.physicalRoot], [{ virtualPath: input.logicalRoot, hostPath: input.physicalRoot, readOnly: false }], []),
+		...sandboxPolicyArguments(input.logicalRoot, [], [input.physicalRoot], [{ virtualPath: input.logicalRoot, hostPath: input.physicalRoot, readOnly: false }], [], path.join(input.physicalRoot, "private")),
 		"--",
 		input.dispatcher,
 		"--exec",

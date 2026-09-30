@@ -248,9 +248,7 @@ export class SelfSpeculationCoordinator {
 		}
 		this.acceptingCandidates = true;
 		this.latestStartedDecisionSequence = decisionSequence;
-		for (const target of this.pendingCandidates.keys()) {
-			if (target < decisionSequence) this.pendingCandidates.delete(target);
-		}
+		for (const target of this.pendingCandidates.keys()) if (target < decisionSequence) this.pendingCandidates.delete(target);
 		const candidates = this.pendingCandidates.get(decisionSequence) ?? new Map();
 		this.pendingCandidates.delete(decisionSequence);
 		this.active = {
@@ -572,9 +570,7 @@ export class SelfSpeculationCoordinator {
 		for (const step of outcome.steps) {
 			const records = [...state.candidates.values()].filter((candidate) => step.candidateIDs.includes(candidate.id));
 			const tools = new Set(records.map((candidate) => candidate.tool));
-			for (const candidateID of step.candidateIDs) {
-				for (const tool of state.reportedCandidates.get(candidateID)?.tools ?? []) tools.add(tool);
-			}
+			for (const candidateID of step.candidateIDs) for (const tool of state.reportedCandidates.get(candidateID)?.tools ?? []) tools.add(tool);
 			if (!tools.size) continue;
 			const sources = step.sources.length ? step.sources : [...new Set(records.flatMap((candidate) => [...candidate.sources]))];
 			for (const tool of tools) {

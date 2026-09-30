@@ -63,14 +63,10 @@ export async function validateDynamicDependencyCertificate(
 	let bytesRead = 0;
 	const metrics = () => ({ filesRead, bytesRead, durationMs: Math.max(0, performance.now() - startedAt) });
 	const indeterminate = (reason: string): DynamicDependencyValidation => ({ status: "indeterminate", reason, ...metrics() });
-	if (!certificate.complete) {
-		return indeterminate("trace_incomplete");
-	}
+	if (!certificate.complete) return indeterminate("trace_incomplete");
 	const acceptedTaints = new Set(context.acceptedTaints ?? []);
 	const blockingTaints = certificate.taints.filter((taint) => !acceptedTaints.has(taint));
-	if (blockingTaints.length) {
-		return indeterminate(`tainted:${blockingTaints.join(",")}`);
-	}
+	if (blockingTaints.length) return indeterminate(`tainted:${blockingTaints.join(",")}`);
 
 	const current: DynamicDependency[] = [];
 	const changed: string[] = [];

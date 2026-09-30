@@ -370,9 +370,7 @@ function patternPredictionSignature(candidates: readonly PatternAwareCandidate[]
 }
 
 function clearAuthoritativeSession(batches: Map<string, Map<number, PatternAwareEventInput>>, sessionID: string): void {
-	for (const [key, batch] of batches) {
-		if (batch.values().next().value?.sessionID === sessionID) batches.delete(key);
-	}
+	for (const [key, batch] of batches) if (batch.values().next().value?.sessionID === sessionID) batches.delete(key);
 }
 
 function asPatternPlanFeedback(value: unknown): PatternPlanFeedback | undefined {

@@ -62,9 +62,7 @@ export class ArtifactCAS {
 		const { digest, size } = reference;
 		if (!isSha256Digest(digest) || !Number.isSafeInteger(size) || size < 0) throw new Error("invalid artifact reference");
 		const bytes = await readOptional(this.artifactPath(digest));
-		if (bytes && (bytes.byteLength !== size || sha256Digest(bytes) !== digest)) {
-			throw new Error(`artifact integrity check failed for ${digest}`);
-		}
+		if (bytes && (bytes.byteLength !== size || sha256Digest(bytes) !== digest)) throw new Error(`artifact integrity check failed for ${digest}`);
 		return bytes;
 	}
 
@@ -76,9 +74,7 @@ export class ArtifactCAS {
 	async load(references: readonly ArtifactReference[]): Promise<VerifiedArtifactClosure | undefined> {
 		const sizes = new Map<Sha256Digest, number>();
 		for (const { digest, size } of references) {
-			if (sizes.has(digest) && sizes.get(digest) !== size) {
-				throw new Error(`conflicting artifact sizes for ${digest}`);
-			}
+			if (sizes.has(digest) && sizes.get(digest) !== size) throw new Error(`conflicting artifact sizes for ${digest}`);
 			sizes.set(digest, size);
 		}
 		const values = new Map<Sha256Digest, Buffer>();
@@ -93,9 +89,7 @@ export class ArtifactCAS {
 			read: ({ digest, size }: ArtifactReference): Buffer => {
 				if (!isSha256Digest(digest) || !Number.isSafeInteger(size) || size < 0) throw new Error("invalid artifact reference");
 				const value = values.get(digest);
-				if (!value || value.byteLength !== size) {
-					throw new Error(`artifact is outside the verified closure: ${digest}`);
-				}
+				if (!value || value.byteLength !== size) throw new Error(`artifact is outside the verified closure: ${digest}`);
 				return value;
 			},
 		});
@@ -158,9 +152,7 @@ export class ProvenanceCertificateStore {
 		if (!owned) throw new Error("invalid process provenance certificate");
 		const published = await this.exclusive(async () => {
 			for (const reference of referencedArtifacts(owned)) {
-				if (!(await this.artifacts.has(reference))) {
-					throw new Error(`certificate references missing artifact ${reference.digest}`);
-				}
+				if (!(await this.artifacts.has(reference))) throw new Error(`certificate references missing artifact ${reference.digest}`);
 			}
 			const published = await publishImmutable(this.certificatePath(owned.id), Buffer.from(stableStringify(owned), "utf8"));
 			if ((await this.get(owned.id))?.id !== owned.id) throw new Error("certificate publication failed");

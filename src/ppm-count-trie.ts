@@ -243,9 +243,7 @@ function validContext(value: unknown): value is readonly string[] {
 function countRow(value: unknown): PpmCountTrieRow | undefined {
 	if (!value || typeof value !== "object") return undefined;
 	const row = value as { context?: unknown; counts?: unknown; lastSeen?: unknown };
-	if (!validContext(row.context) || !row.counts || typeof row.counts !== "object" || Array.isArray(row.counts)) {
-		return undefined;
-	}
+	if (!validContext(row.context) || !row.counts || typeof row.counts !== "object" || Array.isArray(row.counts)) return undefined;
 	return {
 		context: row.context,
 		counts: row.counts as Record<string, number>,

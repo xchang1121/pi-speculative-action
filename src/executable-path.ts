@@ -9,9 +9,7 @@ export async function resolveHostExecutable(
 	fallbacks: readonly string[] = [],
 	alternateNames: readonly string[] = [],
 ): Promise<string> {
-	for (const candidate of [explicit, ...fallbacks]) {
-		if (candidate && await executable(candidate)) return realpath(candidate);
-	}
+	for (const candidate of [explicit, ...fallbacks]) if (candidate && await executable(candidate)) return realpath(candidate);
 	for (const executableName of [name, ...alternateNames]) {
 		for (const directory of (process.env.PATH ?? "").split(path.delimiter)) {
 			if (!directory) continue;
