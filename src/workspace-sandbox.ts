@@ -404,7 +404,7 @@ function workspaceBranch(snapshot: WorkspaceExecutionSnapshot, sourceRoot: strin
 		}),
 		takeReadInputs: async (maxBytes) => {
 			// Every file this branch read keeps its pre-image until commit; each serves reads while it stays unchanged.
-			const preimages = new Map<string, ResourceInput>(changes.flatMap((change) => change.kind !== "directory" && change.before && !change.aliases ? [[change.target, change.before]] : []));
+			const preimages = new Map<string, ResourceInput>(changes.flatMap((change) => change.kind !== "directory" && change.before && !change.aliases && textual(change.before) ? [[change.target, change.before]] : []));
 			if (disposed || commitPromise || readInputs || !preimages.size) return undefined;
 			readInputs = true;
 			const inputs = await createCommittedResourceInputs(snapshot.output, action, sourceRoot, preimages, maxBytes).catch(() => undefined);
@@ -617,7 +617,7 @@ async function commitSandboxExecution(state: WorkspaceSandboxState, execution: S
 				const failure = closed.find((result) => result.status === "rejected");
 				if (failure) throw effectCommitFailure(failure.reason, "poisoned", "native file descriptor cleanup failed; completion is unknown");
 			}
-			if (inputs) for (const change of changes) if (!change.validationOnly && (change.kind !== "directory" || !change.after))
+			if (inputs) for (const change of changes) if (!change.validationOnly && (change.kind === "directory" ? !change.after : textual(change.after)))
 				inputs.set(change.target, change.kind === "directory" ? null : change.after ?? null);
 			return { output: execution.output, metrics: {
 				durationMs: Math.max(0, performance.now() - started), validationMs, bytesValidated, resourcesValidated: changes.length, resourcesCommitted,
@@ -1929,6 +1929,9 @@ function assertExistingInputPolicy(change: SandboxWorkspaceChange): void {
 }
 
 
+
+/** Tool reads serve text: bytes holding a NUL among their first 8000 (git's binary test) are never kept as an input. */
+const textual = (content: Uint8Array | undefined) => !content?.subarray(0, 8000).includes(0);
 
 function sandboxChangeBytes(change: SandboxWorkspaceChange | undefined): number {
 	return !change || change.kind === "directory" ? 0 : (change.before?.byteLength ?? 0) + (change.after?.byteLength ?? 0);

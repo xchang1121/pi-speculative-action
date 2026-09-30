@@ -34,7 +34,7 @@ export function createLinuxProcessExecutionWorld(
 	const describeOperation = (binding: ProcessExecutionBinding, permission: ActionKey) => {
 		const reference = new WeakRef(binding);
 		const overheads = new WeakRef(operationOverheads);
-		const descriptor = Object.freeze({ backend: "linux_process_reuse", identity: binding.key, permissionHash: permission.hash,
+		const descriptor = Object.freeze({ backend: "linux_process_reuse", identity: binding.key, permissionHash: permission.hash, ...(backend.fed(binding) ? { fed: true as const } : {}),
 			get executionMs() { return reference.deref()?.executionMs ?? 0; },
 			get expectedDurationMs() {
 				const current = reference.deref();

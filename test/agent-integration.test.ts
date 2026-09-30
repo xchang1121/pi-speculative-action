@@ -1398,7 +1398,7 @@ describe("speculative action host", () => {
 			expect(await observe("bash", build, { operations: [operation("compile", 50, () => !compiled), operation("link", 30, () => false)] })).toBeUndefined();
 			compiled = false;
 			expect(await observe("write", { path: "a.c", content: "int x;" })).toMatchObject({ actions: [{ type: "tool_call", tool: "bash", input: build,
-				background: true, producesOperations: true, expectedLatencyBenefitMs: 50, expectedDurationMs: 60 }] });
+				producesOperations: true, expectedLatencyBenefitMs: 50, expectedDurationMs: 60 }] });
 			compiled = true;
 			expect(await observe("write", { path: "notes.txt", content: "unrelated" })).toBeUndefined();
 			// A turn that closed before its edit's rerun was admitted leaves the rerun to the next turn's proposal.

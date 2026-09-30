@@ -107,6 +107,8 @@ export interface ExecutionOperationBinding {
 	readonly expectedDurationMs: number;
 	/** Whether a run now would redo it: no result of it the backend holds is still valid for the workspace. */
 	readonly stale?: () => Promise<boolean>;
+	/** It reads what another process writes while it runs: alone, it runs only up to that input. */
+	readonly fed?: true;
 }
 
 /** Delivered only after the authoritative OS boundary confirms the internal result was consumed. */
