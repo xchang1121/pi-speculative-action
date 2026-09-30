@@ -2324,8 +2324,6 @@ function sandboxPolicyArguments(
 		...writablePaths.flatMap((target) => ["--fs-write", target]),
 		...[...STABLE_SANDBOX_DEVICES].flatMap((target) => ["--fs-write", target]),
 		...deniedPaths.flatMap((target) => ["--fs-deny", target]),
-		"--time-start",
-		new Date().toISOString(),
 		"--no-huge-pages",
 		"--no-coredump",
 		"--max-processes",
