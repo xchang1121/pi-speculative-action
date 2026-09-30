@@ -222,7 +222,7 @@ export function diffWorkspaceStructures(
 					change = { ...change, object: { path: projection.toLogical(path.join(after.root, anchor)), before: original !== undefined } };
 				}
 				const source = original === undefined ? undefined : before.entries.get(original);
-				if (source?.kind === "file" && (source.modified !== current.modified || !Buffer.from(byPath.get(anchor)!.before!).equals(Buffer.from(delta.after!)))) {
+				if (source?.kind === "file" && (source.modified !== current.modified || Buffer.compare(byPath.get(anchor)!.before!, delta.after!) !== 0)) {
 					change = { ...change, operation: "write_contents" };
 				}
 			}
