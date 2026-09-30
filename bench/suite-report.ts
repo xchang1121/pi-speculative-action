@@ -2,7 +2,6 @@ export interface SuiteBenchmarkSummary {
 	readonly actualEndToEndMs: number;
 	readonly serializedCounterfactualMs: number;
 	readonly hiddenLatencyMs: number;
-	readonly estimatedSavingsMs: number;
 	readonly savingsMs: number;
 	readonly executionAheadMs: number;
 	readonly actorActions: number;
@@ -99,7 +98,7 @@ function pooled(runs: readonly MeasuredRun[]) {
 	const serializedCounterfactualMs = sum(runs, "serializedCounterfactualMs");
 	const actorActions = sum(runs, "actorActions");
 	const speculativeHits = sum(runs, "speculativeHits");
-	const estimatedSavingsMs = sum(runs, "estimatedSavingsMs"), savingsMs = sum(runs, "savingsMs");
+	const savingsMs = sum(runs, "savingsMs");
 	return {
 		runs: runs.length,
 		instanceClusters: new Set(runs.map(run => run.instance)).size,
@@ -108,9 +107,8 @@ function pooled(runs: readonly MeasuredRun[]) {
 		actualEndToEndMeanMs: actualEndToEndMs / runs.length,
 		serializedCounterfactualMeanMs: serializedCounterfactualMs / runs.length,
 		accelerationRatio: serializedCounterfactualMs / actualEndToEndMs,
-		estimatedSavingsMs, savingsMs,
+		savingsMs,
 		savingsAccelerationRatio: 1 + savingsMs / actualEndToEndMs,
-		netAccelerationRatio: 1 + estimatedSavingsMs / actualEndToEndMs,
 		meanLatencyDifferenceMs: (actualEndToEndMs - serializedCounterfactualMs) / runs.length,
 		actualEndToEndP95Ms: nearestRank(runs.map((run) => run.summary.actualEndToEndMs), 0.95),
 		serializedCounterfactualP95Ms: nearestRank(runs.map((run) => run.summary.serializedCounterfactualMs), 0.95),

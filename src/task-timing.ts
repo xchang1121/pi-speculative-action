@@ -39,7 +39,6 @@ export class TaskTimeline {
 	private readonly actorPhases: number[] = [];
 	private readonly authoritativeTools: { readonly startedAt: number; readonly endpoints: readonly number[]; native: boolean }[] = [];
 	private readonly computations = new WeakMap<TimelineInterval, { native: boolean }>();
-	private estimatedSavingsMs = 0;
 	private savingsMs = 0;
 	private toolWaitMs = 0;
 	readonly startedAt: number;
@@ -51,7 +50,7 @@ export class TaskTimeline {
 	}
 
 	/** Call once per settled Actor operation; adoption includes its actual waiting and validation time. */
-	recordTool(interval: TimelineInterval, adoption?: { readonly hitLatencyMs: number; readonly expectedActorMs?: number; readonly expectedNativeMs?: number }): void {
+	recordTool(interval: TimelineInterval, adoption?: { readonly hitLatencyMs: number; readonly expectedActorMs?: number }): void {
 		const costs = new Map<TimelineInterval, number>();
 		// Only a native Actor execution stays native; adopted and reused computations ran ahead of their callers.
 		const visit = (computation: TimelineInterval, native: boolean): number => {
@@ -76,18 +75,10 @@ export class TaskTimeline {
 		};
 		const serialMs = visit(interval, !adoption);
 		// Per-call credit includes retained work from earlier tasks. Native parents already include child waits.
-		// Adoption is measured against native execution history when there is any; a slower hit is a loss.
-		const referenceMs = adoption?.expectedNativeMs ?? serialMs;
 		const actualMs = adoption ? metric(adoption.hitLatencyMs) : interval.completedAt - interval.startedAt;
-		this.estimatedSavingsMs += nonNegativeDifference(referenceMs, actualMs) - nonNegativeDifference(actualMs, referenceMs);
 		// Each call saves the larger of its computation and the Actor's expected service, less what the Actor actually waited.
 		this.savingsMs += nonNegativeDifference(Math.max(serialMs, metric(adoption?.expectedActorMs)), actualMs);
 		this.toolWaitMs += actualMs;
-	}
-
-	/** Speculation's own time on a native Actor call's path. */
-	recordOverhead(durationMs: number): void {
-		this.estimatedSavingsMs -= metric(durationMs);
 	}
 
 	measure(endedAt: number) {
@@ -103,8 +94,6 @@ export class TaskTimeline {
 		const hiddenLatencyMs = nonNegativeDifference(nonToolMs + toolExecutionMs - duration(nativeTools) + unionDuration(nativeTools), endToEndMs);
 		const serializedMs = endToEndMs + hiddenLatencyMs;
 		return Object.freeze({ startedAt, completedAt, endToEndMs, nonToolMs, actorPhaseMs, orchestrationMs, toolExecutionMs, serializedMs, hiddenLatencyMs,
-			/** Signed avoided service time against native history, net of speculation's own cost on native calls. */
-			estimatedSavingsMs: this.estimatedSavingsMs,
 			/** Service time the Actor did not wait for: never negative. */
 			savingsMs: this.savingsMs,
 			/** The Actor's own wait on its tool calls: native service, or adoption latency. */

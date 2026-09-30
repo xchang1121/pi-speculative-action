@@ -1,4 +1,4 @@
-import { finiteNumber, nonNegativeFinite as metric } from "./number-utils.ts";
+import { nonNegativeFinite as metric } from "./number-utils.ts";
 import type { SpeculativeActionEvent, SpeculativeCacheSnapshot } from "./events.ts";
 import { emptyWorldReuseMetrics, type WorldReuseMetrics } from "./execution-world.ts";
 import type { ResolutionCause } from "./settlement.ts";
@@ -34,7 +34,7 @@ export function emptySpeculativeTraceSummary(cache: SpeculativeCacheSnapshot | P
 		actorFallbacks: 0,
 		hitRate: 0,
 		actorCandidateRejections: {} as Readonly<Record<string, number>>,
-		tasks: 0, endToEndMs: 0, nonToolMs: 0, actorPhaseMs: 0, orchestrationMs: 0, toolExecutionMs: 0, serializedMs: 0, hiddenLatencyMs: 0, estimatedSavingsMs: 0, savingsMs: 0, toolWaitMs: 0,
+		tasks: 0, endToEndMs: 0, nonToolMs: 0, actorPhaseMs: 0, orchestrationMs: 0, toolExecutionMs: 0, serializedMs: 0, hiddenLatencyMs: 0, savingsMs: 0, toolWaitMs: 0,
 		speculativeExecutionMs: 0, actorExecutionMs: 0, executionAheadMs: 0, attemptLeadMs: 0, hitLatencyMs: 0, totalDraftTokens: 0,
 		processReuse: emptyWorldReuseMetrics(), // Inside speculative worlds, never the Actor route.
 		cache: cloneCache({ ...EMPTY_CACHE, ...cache }),
@@ -65,7 +65,6 @@ export function reduceSpeculativeTrace<SessionID>(
 			next.toolExecutionMs += metric(event.timing.toolExecutionMs);
 			next.serializedMs += metric(event.timing.serializedMs);
 			next.hiddenLatencyMs += metric(event.timing.hiddenLatencyMs);
-			next.estimatedSavingsMs += finiteNumber(event.timing.estimatedSavingsMs) ?? 0; // Signed: speculation can cost time.
 			next.savingsMs += metric(event.timing.savingsMs);
 			next.toolWaitMs += metric(event.timing.toolWaitMs);
 			break;
