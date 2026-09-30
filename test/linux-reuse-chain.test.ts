@@ -2,6 +2,7 @@
 // serves the predicted command, and how long the Actor waits. The scenario table takes minutes of CPU; run it with PI_SPEC_REUSE_CHAIN=1.
 import { execSync } from "node:child_process";
 import { writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { createWriteTool } from "@earendil-works/pi-coding-agent";
 import { expect, test } from "vitest";
@@ -38,7 +39,9 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
  * build step), a host over it with PatternAware alone, and one Actor step, a command or a write: prediction starts with it and
  * runs while the Actor model generates for `think` ms. */
 async function chainWorld(files: readonly (readonly [string, string])[], loops: string) {
-	const fixture = await createLinuxProcessBenchmark("pi-chain-", "overlayfs", { cheapChildMs: 50 }), { workspace } = fixture;
+	// Under the user's home, as a real workspace is: /tmp is each sandbox's own, so what a runtime observes of the workspace's parents
+	// there (Node's package.json probes) could never be validated.
+	const fixture = await createLinuxProcessBenchmark("pi-chain-", "overlayfs", { cheapChildMs: 50 }, path.join(os.homedir(), ".cache", "pi-speculative-action", "chain")), { workspace } = fixture;
 	try {
 		for (const [file, text] of [...files, [".gitignore", "slow\n"], ["slow.c", "#include <stdio.h>\nint main(int argc, char **argv) { FILE *f = fopen(argv[1], \"r\"); if (!f) return 1;" +
 			` unsigned long h = 5381; int c;\n while ((c = fgetc(f)) != EOF) h = h * 33 + c; fclose(f);\n for (volatile unsigned long i = 0; i < ${loops}ul; i++) h ^= i;` +

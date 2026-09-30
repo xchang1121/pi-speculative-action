@@ -50,9 +50,10 @@ export async function createLinuxProcessBenchmark(
 	rootPrefix: string,
 	workspaceDriver?: WorkspaceSandboxDriver,
 	backendOptions: { readonly cheapChildMs?: number } = {},
+	parent = os.tmpdir(),
 ) {
 	if (process.platform !== "linux") throw new Error("Run this benchmark inside Linux or WSL 2");
-	const root = await mkdtemp(path.join(os.tmpdir(), rootPrefix));
+	const root = await mkdtemp(path.join(await mkdir(parent, { recursive: true }).then(() => parent), rootPrefix));
 	const workspace = path.join(root, "workspace");
 	const storeRoot = path.join(root, "process-reuse");
 	await mkdir(workspace);
@@ -153,16 +154,9 @@ export interface ReusableBashInput {
 
 export async function forkReusableBash(fixture: Pick<LinuxProcessBenchmark, "world" | "tool" | "workspace" | "environment" | "shellPath">, input: ReusableBashInput) {
 	const args = { command: input.command };
-	const invocation = resolvePiToolInvocation("bash", args, {
-		cwd: fixture.workspace,
-		environment: fixture.environment,
-		shellPath: fixture.shellPath,
-	});
+	const invocation = resolvePiToolInvocation("bash", args, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath });
 	if (!invocation) throw new Error("Pi Bash invocation could not be materialized");
-	const action = PI_ACTION_SEMANTICS.buildKey("bash", args, fixture.workspace, input.actionNamespace, {
-		fingerprint: input.executionFingerprint,
-		context: invocation,
-	});
+	const action = PI_ACTION_SEMANTICS.buildKey("bash", args, fixture.workspace, input.actionNamespace, { fingerprint: input.executionFingerprint, context: invocation });
 	if (!action) throw new Error("Pi Bash action could not be keyed");
 	return fixture.world.speculation.execute({
 		cwd: fixture.workspace,
