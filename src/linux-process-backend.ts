@@ -200,11 +200,15 @@ interface ActiveSession {
 	readonly signal: AbortSignal;
 	readonly pending: Set<Promise<unknown>>;
 	readonly nestedEvidence: DynamicDependencyCertificate[];
+	/** Brokered runs whose effects overlapping siblings left unattributable: what they observed joins the command's own evidence. */
+	readonly foldedObservations: StraceObservation[];
 	readonly executionBindings: Map<number, ProcessExecutionBinding>;
 	readonly computations: TimelineDependency[];
 	readonly incompleteReasons: Set<string>;
 	/** Bypasses that exec their native image in place; the top-level trace must show each one resume. */
 	readonly bypasses: [pid: number, reason: string][];
+	/** Bypassed launches that resumed in place within a brokered run's trace, which that run's evidence covers. */
+	readonly resumed: Set<number>;
 	/** Nested executions whose workspace intervals may overlap: running ones by their live trace, settled ones by their writes. */
 	readonly writers: Set<SessionWriter>;
 	readonly metrics: MutableLinuxProcessReuseMetrics;
@@ -244,8 +248,7 @@ export class LinuxProcessReuseBackend {
 		try { return await this.observations.run(observation, execute); }
 		finally {
 			observation.closed = true;
-			try { observe([...observation.bindings].sort(([left], [right]) => left - right).map(([, binding]) => binding),
-				Object.freeze([...observation.computations])); }
+			try { observe([...observation.bindings].sort(([left], [right]) => left - right).map(([, binding]) => binding), Object.freeze([...observation.computations])); }
 			catch { /* Learning cannot replace the native result or error. */ }
 		}
 	}
@@ -346,8 +349,7 @@ export class LinuxProcessReuseBackend {
 	async prepareActorReplay(host: ProcessExecutor, options: ActorProcessReplayOptions, refresh = false): Promise<PreparedProcessExecutionRoute> {
 		if (process.platform !== "linux") return { state: "unavailable", detail: "Linux or WSL 2 required" };
 		let state: "degraded" | "ready" = "degraded";
-		let detail = options.held ? "Bash history; child handoff checked when evidence exists or on refresh"
-			: "matching whole Bash calls; this shell cannot hold child processes";
+		let detail = options.held ? "Bash history; child handoff checked when evidence exists or on refresh" : "matching whole Bash calls; this shell cannot hold child processes";
 		let prepared: Promise<ProcessExecutor> | undefined;
 		const prepare = async () => {
 			let executor = host;
@@ -415,13 +417,7 @@ export class LinuxProcessReuseBackend {
 					assertInvocationMatches(invocation, request);
 					const projection = new ExecutionPathProjection({ sourceRoot, workspaceRoot: sourceRoot });
 					const platformFingerprint = await this.resolvePlatformFingerprint();
-					const prototype = await topLevelProcessPrototype(
-						invocation,
-						request,
-						definedProcessEnvironment(request.environment),
-						projection,
-						platformFingerprint,
-					);
+					const prototype = await topLevelProcessPrototype(invocation, request, definedProcessEnvironment(request.environment), projection, platformFingerprint);
 					const weakKey = processWeakKey(prototype);
 					timing = processTimingIdentity(prototype, weakKey);
 					const admission = this.processScheduler.assessCandidateJoin({ identity: timing, state: "succeeded" });
@@ -498,7 +494,7 @@ export class LinuxProcessReuseBackend {
 			signal: AbortSignal.any([controller.signal, ...(input.signal ? [input.signal] : [])]),
 			pending: new Set<Promise<unknown>>(),
 			ownership: new ProcessHandoffOwnership(input.onOperationAdopted, input.acceptOperationScope),
-			nestedEvidence: [],
+			nestedEvidence: [], foldedObservations: [], resumed: new Set(),
 			executionBindings: new Map(),
 			computations: [],
 			incompleteReasons: new Set<string>(), bypasses: [], writers: new Set(), nestedOutputEndpoints: new Set(),
@@ -589,7 +585,7 @@ export class LinuxProcessReuseBackend {
 		await mkdir(this.options.storeRoot, { recursive: true, mode: 0o700 });
 		await chmod(this.options.storeRoot, 0o700);
 		const [sandlock, strace, dispatcher] = await Promise.all([
-			resolveHostExecutable(this.options.sandlockBinary, "pi-speculative-sandlock", [ path.join(os.homedir(), ".local", "bin", "pi-speculative-sandlock")]),
+			resolveHostExecutable(this.options.sandlockBinary, "pi-speculative-sandlock", [path.join(os.homedir(), ".local", "bin", "pi-speculative-sandlock")]),
 			resolveHostExecutable(this.options.straceBinary, "strace", [path.join(os.homedir(), ".local", "bin", "pi-speculative-strace")]),
 			resolveLinuxExecHelper(this.options.heldExecBinary),
 		]);
@@ -747,8 +743,7 @@ export class LinuxProcessReuseBackend {
 			prototype: execution.prototype,
 			producer: session.producer,
 			dependencyCertificate: evidence,
-			result: await captureProcessResult(this.store, execution.outcome, execution.observedProcessMs,
-				changes.map(change => ({ logicalPath: slash(change.target), change }))),
+			result: await captureProcessResult(this.store, execution.outcome, execution.observedProcessMs, changes.map(change => ({ logicalPath: slash(change.target), change }))),
 		});
 		if (await this.planner.publishCompleted(certificate, SAME_CONFINEMENT_TAINTS, this.options.witnessRepeats?.())) this.add(session, "wholeCommandPublished");
 	}
@@ -985,8 +980,7 @@ export class LinuxProcessReuseBackend {
 			const observe = (prototype: ExecPrototype, durationMs: number) => {
 				const weakKey = processWeakKey(prototype);
 				this.processScheduler.observeActorService(processTimingIdentity(prototype, weakKey), durationMs);
-				if (!learning || observation!.closed || process.signal?.aborted || !snapshot.outputRoute ||
-					observation!.bindings.size >= this.store.limits.maxCertificates) return;
+				if (!learning || observation!.closed || process.signal?.aborted || !snapshot.outputRoute || observation!.bindings.size >= this.store.limits.maxCertificates) return;
 				const binding = this.handoffs.observe(weakKey, executablePath, scope!, {
 					argv0: snapshot.argv[0]!, args: snapshot.argv.slice(1), environment: snapshot.environment,
 					cwd: projection.toLogical(snapshot.cwd), executable: executablePath, sourceRoot, outputRoute: snapshot.outputRoute,
@@ -1126,7 +1120,7 @@ export class LinuxProcessReuseBackend {
 		let outcome: SpawnOutcome | undefined;
 		let transactionFinishing = false;
 		let releaseInputs: (() => void) | undefined, inputCheck: Promise<boolean> | undefined;
-		let stage = "capture", dependencyCertificate: DynamicDependencyCertificate | undefined, certificateID: Sha256Digest | undefined;
+		let stage = "capture", dependencyCertificate: DynamicDependencyCertificate | undefined, certificateID: Sha256Digest | undefined, unattributed: StraceObservation | undefined;
 		let continuation: ProcessContinuation | undefined, frozen: { pid: number; fd: number; syscall: string; bytes: number } | undefined;
 		const executedStreams: { alias: number; kind: string; data: Buffer }[] = [];
 		let suspensionAttempted = false, writer: ActiveSession["writers"] extends Set<infer Writer> ? Writer | undefined : never;
@@ -1356,6 +1350,8 @@ export class LinuxProcessReuseBackend {
 						result.status === "rejected" ? [index === 0 ? "transaction_capture" : "trace_capture"] : []).join("+");
 					throw error;
 				});
+				own.written ??= observation.written ?? []; // What its launcher's trace answers for, whether or not its interval overlapped another.
+				for (const pid of observation.resumedInterpositions ?? []) session.resumed.add(pid);
 				if (continuation) continuation = { ...continuation, image: bindContinuationDescriptors(continuation.image, frozen!, inputs,
 					!!request.closeStdin, observation.finalHandles ?? [], descriptorOffsets!) };
 				// A destroyed OFD has no observable final position. If it escaped into a
@@ -1369,6 +1365,7 @@ export class LinuxProcessReuseBackend {
 				if (!delta.complete) {
 					stage = "transaction_capture";
 					this.setError(session, `transaction:${delta.reason}`);
+					unattributed = observation;
 					throw new Error(`workspace transaction is incomplete: ${delta.reason}`);
 				}
 				const { before, after } = delta;
@@ -1376,8 +1373,9 @@ export class LinuxProcessReuseBackend {
 				captureWorkspace?.({ before, after });
 				stage = "workspace_effects";
 				const effects = diffWorkspaceStructures(before, after, delta.changes, session.projection);
+				if (!effects.complete) unattributed = observation;
 				stage = "dependencies";
-				const evidence = await captureDependencies(session, transactionDependencySource(before, effects), observation.paths, effects.effects, observation);
+				const evidence = await captureDependencies(session, before, observation.paths, effects, observation);
 				if (evidence.incompleteReasons.length) this.setError(session, `evidence:${evidence.incompleteReasons.join(",")}`);
 				const taints = new Set<ProvenanceTaint>(observation.taints);
 				// Private images preserve FD/OFD relations, but cannot also represent an independently accessed pathname.
@@ -1482,7 +1480,9 @@ export class LinuxProcessReuseBackend {
 				// The process already ran. Certificate failure must never cause dispatcher fallback/re-execution.
 				const detail = failureDetail(error);
 				this.setError(session, `post_execution_capture:${detail}`);
-				session.incompleteReasons.add(`nested_capture:${detail}`);
+				// Its command captures the effects whole: what it observed joins the command's evidence, measured from the command's start.
+				if (unattributed?.complete && !unattributed.incompleteReasons.length && !continuation) session.foldedObservations.push(unattributed);
+				else session.incompleteReasons.add(`nested_capture:${detail}`);
 			}
 			if (continuation) return { kind: "suspended", weakKey };
 			const exit = exitOutcome(outcome);
@@ -1741,7 +1741,7 @@ async function sealSessionEvidence(session: ActiveSession, changes: readonly San
 		throw new Error(`top-level workspace capture is missing: ${[...session.incompleteReasons].filter((reason) => reason.startsWith("top_capture:")).join("; ") || "not run"}`);
 	}
 	// A bypass that did not resume in place ran outside the top-level trace.
-	for (const [pid, reason] of session.bypasses) if (!capture.observation.resumedInterpositions?.includes(pid)) session.incompleteReasons.add(reason);
+	for (const [pid, reason] of session.bypasses) if (!capture.observation.resumedInterpositions?.includes(pid) && !session.resumed.has(pid)) session.incompleteReasons.add(reason);
 	const frontier = [...new Set([...capture.before.entries.keys(), ...capture.after.entries.keys()])].filter(name => {
 		const before = capture.before.entries.get(name), after = capture.after.entries.get(name);
 		return name && (before?.kind === "file" || after?.kind === "file") && before?.changeDigest !== after?.changeDigest && !changes.some(change => path.normalize(change.resource) === name);
@@ -1765,26 +1765,21 @@ async function sealSessionEvidence(session: ActiveSession, changes: readonly San
 	}
 	const directoryChanges = await sourceDirectoryChanges(session, effects.effects);
 	try {
-		const evidence = await captureDependencies(
-			session,
-			transactionDependencySource(capture.before, effects),
-			capture.observation.paths,
-			effects.effects,
-			capture.observation,
-		);
+		const observed = [capture.observation, ...session.foldedObservations];
+		const evidence = await captureDependencies(session, capture.before, observed.flatMap(observation => observation.paths), effects, { external: observed.flatMap(observation => observation.external ?? []),
+			locks: observed.flatMap(observation => observation.locks ?? []), written: observed.flatMap(observation => observation.written ?? []) }, session.nestedEvidence);
 		for (const reason of evidence.incompleteReasons) session.incompleteReasons.add(`top_evidence:${reason}`);
 		session.topLevelEvidence = mergeDependencyEvidence(
 			[
 				{
-					complete: capture.observation.complete && evidence.complete,
+					complete: observed.every(observation => observation.complete) && evidence.complete,
 					dependencies: evidence.dependencies,
-					taints: [...new Set([...capture.observation.taints, ...evidence.taints])],
+					taints: [...new Set([...observed.flatMap(observation => observation.taints), ...evidence.taints])],
 				},
 				{ complete: true, dependencies: session.interposition.dependencies, taints: [] },
-				...session.nestedEvidence,
+				...evidence.runs,
 			],
 			session.incompleteReasons,
-			new Set(effects.effects.map((effect) => path.posix.dirname(effect.logicalPath.replaceAll("\\", "/")))),
 		);
 	} catch (error) {
 		session.incompleteReasons.add(`top_seal:${errorMessage(error)}`);
@@ -1826,25 +1821,6 @@ async function sourceDirectoryChanges(
 	return Object.freeze(changes);
 }
 
-function transactionDependencySource(snapshot: WorkspaceStructureSnapshot, effects: WorkspaceTransactionDiff) {
-	if (!effects.complete) throw new Error(`workspace effects are incomplete: ${effects.reason}`);
-	const deltas = new Map(effects.effects.flatMap(({ relativePath, change }) => change.kind === "directory" ? [] : [[relativePath, change] as const]));
-	const cached = new Map<string, Promise<WorkspaceTreeEntry | undefined>>();
-	return (physicalPath: string) => {
-		const relative = relativeFilesystemPath(snapshot.root, physicalPath);
-		if (relative === undefined) return Promise.reject(new Error(`workspace dependency escapes snapshot: ${physicalPath}`));
-		if (!cached.has(relative)) cached.set(relative, (async () => {
-			const structure = snapshot.entries.get(relative);
-			if (!structure || structure.kind !== "file") return structure;
-			const content = deltas.get(relative)?.before ?? await captureStableFile(structure.contentPath ?? path.resolve(snapshot.root, relative), structure.size);
-			const hydrated = hydrateWorkspaceFileEntry(structure, content);
-			if (!hydrated) throw new Error(`transaction baseline changed: ${relative}`);
-			return hydrated;
-		})());
-		return cached.get(relative)!;
-	};
-}
-
 /** binfmt_script's interpreter (the first word after `#!`) or a little-endian ELF64's PT_INTERP. */
 export async function imageInterpreter(file: string): Promise<string | undefined> {
 	const handle = await open(file, "r").catch(() => undefined);
@@ -1868,11 +1844,29 @@ export async function imageInterpreter(file: string): Promise<string | undefined
 
 async function captureDependencies(
 	session: ActiveSession,
-	before: ReturnType<typeof transactionDependencySource>,
+	snapshot: WorkspaceStructureSnapshot,
 	observed: readonly ObservedProcessPath[],
-	effects: readonly { readonly logicalPath: string }[],
+	effects: WorkspaceTransactionDiff,
 	{ external = [], locks = [], written = [] }: Pick<StraceObservation, "external" | "locks" | "written"> = {},
+	runs: readonly DynamicDependencyCertificate[] = [],
 ) {
+	if (!effects.complete) throw new Error(`workspace effects are incomplete: ${effects.reason}`);
+	// The workspace as the run found it: the structure it began with, and the bytes its own writes replaced.
+	const deltas = new Map(effects.effects.flatMap(({ relativePath, change }) => change.kind === "directory" ? [] : [[relativePath, change] as const]));
+	const cached = new Map<string, Promise<WorkspaceTreeEntry | undefined>>();
+	const before = (physicalPath: string) => {
+		const relative = relativeFilesystemPath(snapshot.root, physicalPath);
+		if (relative === undefined) return Promise.reject(new Error(`workspace dependency escapes snapshot: ${physicalPath}`));
+		if (!cached.has(relative)) cached.set(relative, (async () => {
+			const structure = snapshot.entries.get(relative);
+			if (!structure || structure.kind !== "file") return structure;
+			const content = deltas.get(relative)?.before ?? await captureStableFile(structure.contentPath ?? path.resolve(snapshot.root, relative), structure.size);
+			const hydrated = hydrateWorkspaceFileEntry(structure, content);
+			if (!hydrated) throw new Error(`transaction baseline changed: ${relative}`);
+			return hydrated;
+		})());
+		return cached.get(relative)!;
+	};
 	// A name it created itself depends only on having been free, not on everything else its directory held.
 	const created = new Set(written.map(name => path.resolve(session.workspace.sandboxRoot, name)));
 	const workspaceDependency = async (physical: string, logical: string, role: Exclude<ObservedProcessPath["role"], "metadata">, listed = true) => {
@@ -1894,6 +1888,21 @@ async function captureDependencies(
 		const existing = dependencies.get(identity);
 		if (existing?.kind === "file" && dependency.kind === "file" && (existing.role === "executable" || dependency.role !== "executable")) return;
 		dependencies.set(identity, dependency);
+	};
+	// A run saw the workspace through the command's earlier writes: where what it saw is not how the command found a path,
+	// the command depended on that path's state at its start.
+	const changed = new Set(effects.effects.map(effect => effect.logicalPath));
+	const atStart = async (dependency: DynamicDependency) => {
+		const physical = dependency.kind === "fd" ? undefined : session.projection.toPhysical(dependency.path);
+		const relative = physical && relativeFilesystemPath(snapshot.root, physical);
+		if (dependency.kind === "fd" || !physical || relative === undefined || session.workspace.observationExcludes.includes(relative.split(path.sep)[0]!)) return dependency;
+		const entry = snapshot.entries.get(relative), up = relativeFilesystemPath(snapshot.root, path.dirname(physical)), parent = up === undefined ? undefined : snapshot.entries.get(up);
+		const same = dependency.kind === "absence" ? !entry && (dependency.parentEntriesDigest === undefined || parent?.kind === "directory" && parent.entriesDigest === dependency.parentEntriesDigest)
+			: dependency.kind === "directory" ? entry?.kind === "directory" && entry.metadataDigest === dependency.metadataDigest && (dependency.entriesDigest ?? entry.entriesDigest) === entry.entriesDigest
+			: dependency.kind === "symlink" ? entry?.kind === "symlink" && entry.target === dependency.target
+			: dependency.kind === "lock" ? entry?.kind === "file"
+			: !changed.has(dependency.path) && (dependency.kind === "metadata" ? entry !== undefined : entry?.kind === "file" && entry.metadataDigest === dependency.metadataDigest);
+		return same ? dependency : workspaceDependency(physical, dependency.path, dependency.kind === "file" ? dependency.role : "input", dependency.kind === "directory" && !!dependency.entriesDigest);
 	};
 
 	// Kernel pathname walk over the baseline: links are recorded and expanded in place and `..` leaves the directory
@@ -1955,13 +1964,13 @@ async function captureDependencies(
 		if (/^\/sys\/(?:devices\/system\/cpu|fs\/cgroup)(?:\/|$)|^\/proc\/(?:meminfo|version|version_signature|cpuinfo|stat|loadavg|uptime)$/.test(observedPath)) { taints.add("clock"); continue; }
 		if (item.role === "metadata") {
 			if (created.has(path.resolve(physical))) continue; // Its own writes set what it saw of them.
-			add({
+			add(await atStart({
 				kind: "metadata",
 				path: session.projection.isWorkspacePhysical(physical) ? session.projection.toLogical(physical) : slash(physical),
 				followSymlinks: item.followSymlinks,
 				digest: item.digest,
 				...(item.fields ? { fields: item.fields } : {}),
-			});
+			}));
 			continue;
 		}
 		if (STABLE_SANDBOX_DEVICES.has(observedPath)) continue;
@@ -1984,12 +1993,14 @@ async function captureDependencies(
 		else if (captured.value) for (const dependency of captured.value) add(dependency);
 		else { taints.add("mutable_input"); add(undefined, `mutable:${physical}`); }
 	});
-	for (const effect of effects) {
+	for (const effect of effects.effects) {
 		const physical = session.projection.toPhysical(effect.logicalPath);
 		if (!physical) { complete = false; incompleteReasons.add(`effect_unmapped:${effect.logicalPath}`); continue; }
 		add(await workspaceDependency(physical, effect.logicalPath, "input"));
 	}
-	return { complete, dependencies: [...dependencies.values()], taints: [...taints], incompleteReasons: [...incompleteReasons] };
+	const rebased = await mapFilesystem(runs, async run =>
+		({ ...run, dependencies: (await mapFilesystem(run.dependencies, atStart)).flatMap(dependency => dependency ?? (add(undefined, "start_state_unavailable"), [])) }));
+	return { complete, dependencies: [...dependencies.values()], taints: [...taints], incompleteReasons: [...incompleteReasons], runs: rebased };
 }
 
 const STABLE_SANDBOX_DEVICES = new Set(["/dev/null", "/dev/tty", "/dev/zero", "/dev/full"]);
@@ -2682,19 +2693,13 @@ export async function validateTransferredProcessEvidence(
 	incompleteReasons: Iterable<string> = [],
 ): Promise<ResourceValidation> {
 	if (!evidence) {
-		return {
-			status: "indeterminate",
-			cause: { stage: "freshness", code: "process_evidence_missing" },
-			metrics: { durationMs: 0, bytesRead: 0, filesRead: 0, mode: "exact" },
-		};
+		return { status: "indeterminate", cause: { stage: "freshness", code: "process_evidence_missing" }, metrics: { durationMs: 0, bytesRead: 0, filesRead: 0, mode: "exact" } };
 	}
 	const blockingTaints = evidence.taints.filter((taint) => !TRANSFERRED_INPUT_TAINTS.has(taint));
 	const validation = await validateDynamicDependencyCertificate({ ...evidence, taints: blockingTaints }, { maxFileBytes: MAX_CAPTURE_BYTES });
 	const metrics = { durationMs: validation.durationMs, bytesRead: validation.bytesRead, filesRead: validation.filesRead, mode: "exact" as const };
 	if (validation.status === "valid") return { status: "valid", metrics };
-	if (validation.status === "stale") {
-		return { status: "stale", cause: { stage: "freshness", code: "process_dependency_changed", detail: validation.changed.join(",") }, metrics };
-	}
+	if (validation.status === "stale") return { status: "stale", cause: { stage: "freshness", code: "process_dependency_changed", detail: validation.changed.join(",") }, metrics };
 	return {
 		status: "indeterminate",
 		cause: { stage: "freshness", code: "process_provenance_indeterminate", detail: [validation.reason, ...incompleteReasons].join(",") },
@@ -2702,11 +2707,7 @@ export async function validateTransferredProcessEvidence(
 	};
 }
 
-function mergeDependencyEvidence(
-	certificates: readonly DynamicDependencyCertificate[],
-	incompleteReasons: Set<string>,
-	mutatedDirectories: ReadonlySet<string> = new Set(),
-): DynamicDependencyCertificate {
+function mergeDependencyEvidence(certificates: readonly DynamicDependencyCertificate[], incompleteReasons: Set<string>): DynamicDependencyCertificate {
 	const dependencies = new Map<string, DynamicDependency>();
 	const taints = new Set<ProvenanceTaint>();
 	let complete = certificates.length > 0;
@@ -2727,7 +2728,6 @@ function mergeDependencyEvidence(
 			if (existing?.kind === dependency.kind && (dependency.kind === "directory" || dependency.kind === "absence") && Object.entries(dependency).every(([key, value]) =>
 				!(key in existing) || stableEqual(Reflect.get(existing, key), value))) { dependencies.set(identity, { ...existing, ...dependency }); continue; }
 			if (existing && !stableEqual(existing, dependency)) {
-				if (dependency.kind === "directory" && mutatedDirectories.has(dependency.path.replaceAll("\\", "/"))) continue;
 				complete = false;
 				incompleteReasons.add(`dependency_changed_during_execution:${identity}`);
 				continue;

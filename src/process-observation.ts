@@ -225,8 +225,7 @@ export function diffWorkspaceStructures(
 					change = { ...change, object: { path: projection.toLogical(path.join(after.root, anchor)), before: original !== undefined } };
 				}
 				const source = original === undefined ? undefined : before.entries.get(original);
-				if (source?.kind === "file" &&
-					(source.modified !== current.modified || !Buffer.from(byPath.get(anchor)!.before!).equals(Buffer.from(delta.after!)))) {
+				if (source?.kind === "file" && (source.modified !== current.modified || !Buffer.from(byPath.get(anchor)!.before!).equals(Buffer.from(delta.after!)))) {
 					change = { ...change, operation: "write_contents" };
 				}
 			}
@@ -310,9 +309,7 @@ export function snapshotDependency(
 			kind: "absence",
 			path: logicalPath,
 			...(parent?.kind === "directory" ? { parentEntriesDigest: parent.entriesDigest } : {}),
-			...(parent?.kind === "directory" && options.parentExcludedEntries?.length
-				? { parentExcludedEntries: Object.freeze([...options.parentExcludedEntries].sort()) }
-				: {}),
+			...(parent?.kind === "directory" && options.parentExcludedEntries?.length ? { parentExcludedEntries: Object.freeze([...options.parentExcludedEntries].sort()) } : {}),
 		};
 	}
 	switch (entry.kind) {

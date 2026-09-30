@@ -1717,6 +1717,9 @@ int main(void) { char path[32] = "/bin/true\\0intact"; char *args[] = {path, 0};
 				await branch.commit();
 				expect([await host("d/f"), await host("kept"), (await stat(path.join(outside, "d/f"), { bigint: true })).mtimeNs]).toEqual(["private\n", "new\n", 981173106123456789n]);
 			} finally { await branch.dispose?.(); }
+			// A child that read another's scratch file saw the command's own doing: the command stands on the workspace as it found it.
+			const scratched = await forkReusableBash(fixture, { label: "scratch", command: "mkdir w && echo t > w/x && cat w/x && rm -r w", actionNamespace: "private-writes", executionFingerprint });
+			try { expect([textOutput(scratched.output.result), await scratched.validate?.()]).toMatchObject(["t\n", { status: "valid" }]); } finally { await scratched.dispose?.(); }
 			// A host object someone changed meanwhile is no baseline: the Actor must run the command instead.
 			const raced = await forkReusableBash(fixture, { label: "raced", command: `echo again > ${outside}/kept`, actionNamespace: "private-writes", executionFingerprint });
 			try {
