@@ -44,8 +44,8 @@ import { WorkspaceSandboxService, readSandboxDirectoryState, restoreModifiedTime
 import { containsFilesystemPath as pathContains, relativeFilesystemPath, slash } from "./path-utils.ts";
 
 const BACKEND_EPOCH = "pi-linux-process-instance-inputs";
-const POLICY_ID = "sandlock-virtual-root-transparent-exec";
-const LEAF_POLICY_ID = "sandlock-virtual-workspace-leaf";
+const POLICY_ID = "sandlock-virtual-root-transparent-exec-creation-mode";
+const LEAF_POLICY_ID = "sandlock-virtual-workspace-leaf-creation-mode";
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024, LEARNED_LAUNCHES = 64, MAX_INTERPOSED_MOUNT_BYTES = 512 * 1024, CHEAP_CHILD_MS = 500;
 const MAX_CONTINUATION_BYTES = 65 * 1024 * 1024;
 const IO_FRONTIERS = new Map([[0, "read"], [1, "write"], [19, "readv"], [20, "writev"], [44, "sendto"], [45, "recvfrom"], [46, "sendmsg"], [47, "recvmsg"]]);
