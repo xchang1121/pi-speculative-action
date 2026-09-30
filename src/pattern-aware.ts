@@ -56,8 +56,7 @@ export function patternAwareActionSemantics(
 	cwd = path.resolve(cwd);
 	const rules = Object.freeze(projectors.map(ownActionKeyProjector));
 	return Object.freeze({
-		namespace: stableStringify([cwd,
-			[...registry.toolNames()].sort().map(tool => [tool, registry.definition(tool)!.epoch]), rules.map(rule => rule.id).sort()]),
+		namespace: stableStringify([cwd, [...registry.toolNames()].sort().map(tool => [tool, registry.definition(tool)!.epoch]), rules.map(rule => rule.id).sort()]),
 		actionKey: (tool: string, input: Readonly<Record<string, unknown>>, schemaHash?: string) => registry.buildKey(tool, input, cwd, schemaHash),
 		projectors: rules,
 		...(exists ? { exists } : {}),
@@ -321,8 +320,7 @@ export class PatternAwareStore {
 		this.sequenceModel = new PpmCountTrie(settings.maxContextLength);
 		this.persistenceFile = persistenceFile;
 		this.portableFile = portableFile;
-		this.actionSemantics = actionSemantics && { ...actionSemantics,
-			projectors: actionSemantics.projectors?.map(ownActionKeyProjector) };
+		this.actionSemantics = actionSemantics && { ...actionSemantics, projectors: actionSemantics.projectors?.map(ownActionKeyProjector) };
 	}
 
 	async load() {
@@ -466,13 +464,7 @@ export class PatternAwareStore {
 			),
 		);
 		this.trimSessionHistory(history);
-		return this.predictHistory(
-			history,
-			schemaHashes,
-			{ history, visitedPatternIDs: [], pathProbability: 1, ...seed },
-			predictionSettings,
-			seed === undefined,
-		);
+		return this.predictHistory(history, schemaHashes, { history, visitedPatternIDs: [], pathProbability: 1, ...seed }, predictionSettings, seed === undefined);
 	}
 
 	continue(
@@ -483,21 +475,13 @@ export class PatternAwareStore {
 		predictionSettings: PatternAwareSettings = this.settings,
 	) {
 		if (!predictionSettings.enabled) return [];
-		const event: PatternAwareEvent = {
-			...input,
-			sequence: (continuation.history.at(-1)?.sequence ?? this.clock) + 1,
-			learnTarget: false,
-		};
+		const event: PatternAwareEvent = { ...input, sequence: (continuation.history.at(-1)?.sequence ?? this.clock) + 1, learnTarget: false };
 		const history = structuredClone([...continuation.history, event]);
 		this.trimSessionHistory(history);
 		return this.predictHistory(
 			history,
 			schemaHashes,
-			{
-				history,
-				visitedPatternIDs: continuation.visitedPatternIDs,
-				pathProbability: parentConfirmed ? 1 : continuation.pathProbability,
-			},
+			{ history, visitedPatternIDs: continuation.visitedPatternIDs, pathProbability: parentConfirmed ? 1 : continuation.pathProbability },
 			predictionSettings,
 			parentConfirmed,
 		);
@@ -512,10 +496,7 @@ export class PatternAwareStore {
 	) {
 		if (continuation.visitedPatternIDs.length >= settings.maxPredictionDepth) return [];
 		const activeSessionID = history.at(-1)?.sessionID;
-		const groups = new Map<
-			string,
-			Array<{ readonly pattern: MutablePattern; readonly input: Record<string, unknown>; variantProbability: number; }>
-		>();
+		const groups = new Map< string, Array<{ readonly pattern: MutablePattern; readonly input: Record<string, unknown>; variantProbability: number; }> >();
 		this.ensureIndex();
 		for (const { pattern, context } of this.trie.matching(history, this.contextStarts(history))) {
 			const patternID = pattern.id;
@@ -539,8 +520,7 @@ export class PatternAwareStore {
 		}
 		let ppmEstimates: ReadonlyMap<string, PpmProbabilityEstimate> | undefined;
 		const estimatePpm = (tool: string) => (ppmEstimates ??=
-			this.sequenceModel.distribution(history.map((event) => signatureToken(signature(event))),
-				this.clock, settings.decayHalfLifeEvents)).get(tool);
+			this.sequenceModel.distribution(history.map((event) => signatureToken(signature(event))), this.clock, settings.decayHalfLifeEvents)).get(tool);
 		const contextEvidence = new Map<number, Map<string, number>>();
 		for (const group of groups.values()) for (const { pattern } of group) {
 			const gaps = contextEvidence.get(pattern.context.length) ?? new Map<string, number>();
@@ -551,11 +531,7 @@ export class PatternAwareStore {
 			contextEvidence.set(pattern.context.length, gaps);
 		}
 		const predictions = new Map([...groups.entries()].map(([identity, group]) => {
-			const ordered = group.sort(
-				(left, right) =>
-					right.pattern.context.length - left.pattern.context.length ||
-					right.pattern.occurrences - left.pattern.occurrences,
-			);
+			const ordered = group.sort((left, right) => right.pattern.context.length - left.pattern.context.length || right.pattern.occurrences - left.pattern.occurrences);
 			const representative = ordered[0]!;
 			const patterns = ordered.map((item) => item.pattern);
 			const { horizon, latestHorizon, gapCoverage } = groupGapTiming(patterns, settings, this.clock);
@@ -609,8 +585,7 @@ export class PatternAwareStore {
 		for (const structural of authoritative ? this.structuralReads(history, schemaHashes, continuation, settings) : [])
 			if (!predictions.has(structural.actionIdentity)) predictions.set(structural.actionIdentity, structural);
 		const ranked = [...predictions.values()].filter((prediction) => this.readable(prediction, history, schemaHashes.read)).sort((left, right) =>
-			Number(left.background) - Number(right.background) ||
-			right.expectedLatencyBenefitMs - left.expectedLatencyBenefitMs ||
+			Number(left.background) - Number(right.background) || right.expectedLatencyBenefitMs - left.expectedLatencyBenefitMs ||
 			right.empiricalProbability - left.empiricalProbability ||
 			right.conditionalProbability - left.conditionalProbability ||
 			left.horizon - right.horizon ||

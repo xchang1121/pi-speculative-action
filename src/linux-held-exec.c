@@ -3416,6 +3416,21 @@ done:
 	return result;
 }
 
+/* `touch -chm -d @SECONDS.NANOSECONDS PATH` for every "SECONDS NANOSECONDS PATH\0" record on stdin, in one process. */
+static int set_modified_times(void) {
+	char *record = NULL, *end = NULL;
+	size_t capacity = 0;
+	int status = 0;
+	while (!status && getdelim(&record, &capacity, 0, stdin) > 0) {
+		struct timespec times[2] = { { .tv_nsec = UTIME_OMIT }, { .tv_sec = (time_t)strtoll(record, &end, 10) } };
+		times[1].tv_nsec = *end == ' ' ? strtol(end + 1, &end, 10) : -1;
+		if (*end != ' ' || times[1].tv_nsec < 0 || times[1].tv_nsec > 999999999) status = 64;
+		else if (utimensat(AT_FDCWD, end + 1, times, AT_SYMLINK_NOFOLLOW) && errno != ENOENT) status = 1;
+	}
+	free(record);
+	return status;
+}
+
 int main(int argc, char **argv) {
 	int dispatched = image_dispatch(argc, argv);
 	if (dispatched >= 0) return dispatched;
@@ -3447,6 +3462,7 @@ int main(int argc, char **argv) {
 			!strcmp(argv[1], "--exec-closed-input"), output_flags);
 	}
 	if (argc == 4 && !strcmp(argv[1], "--probe-context")) return probe_context(argv[2], argv[3]);
+	if (argc == 2 && !strcmp(argv[1], "--set-modified-times")) return set_modified_times();
 	if (argc == 2 && !strcmp(argv[1], "--probe-clean-fds")) {
 		int extra = has_unmodeled_descriptors(3);
 		return extra < 0 ? 70 : extra ? 65 : 0;

@@ -39,7 +39,7 @@ import type { WorkspaceTransactionOwnership } from "./workspace-transaction.ts";
 import type { ToolProcessInvocation } from "./tool-settlement.ts";
 import type { ResourceValidation } from "./settlement.ts";
 import { ProcessHandoffOwnership, ProcessHandoffRegistry, sameScope, type ProcessContinuation, type ProcessExecutionBinding, type ProcessHandoff, type ProcessHandoffLookup } from "./process-handoff.ts";
-import { WorkspaceSandboxService, readSandboxDirectoryState, restoreModifiedTimes, sameSandboxState, type SandboxDirectoryChange, type SandboxFileChange,
+import { WorkspaceSandboxService, readSandboxDirectoryState, restoreModifiedTimes, sameSandboxState, useModifiedTimesHelper, type SandboxDirectoryChange, type SandboxFileChange,
 	type SandboxWorkspaceChange, type SandboxWorkspaceContext } from "./workspace-sandbox.ts";
 import { containsFilesystemPath as pathContains, relativeFilesystemPath, slash } from "./path-utils.ts";
 
@@ -603,6 +603,8 @@ export class LinuxProcessReuseBackend {
 			this.resolvePlatformFingerprint(),
 		]);
 		if (!sandlockCheck.includes("Status:         OK")) throw new Error("Sandlock kernel protections are unavailable");
+		// An older helper runs an unknown flag as a command, which fails.
+		if (await new Promise<boolean>(resolve => execFile(dispatcher, ["--set-modified-times"], error => resolve(!error)).stdin?.end())) useModifiedTimesHelper(dispatcher);
 		const imageLibrary = await execText(strace, ["--kill-on-exit", "-f", "-q", "-e", "trace=none", "-o", "/dev/null",
 			`--handoff-library=${dispatcher}.so`, "--handoff-image=/dev/null", "--", "/bin/true"])
 			.then(() => `${dispatcher}.so`, () => undefined);
