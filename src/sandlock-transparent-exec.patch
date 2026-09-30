@@ -77,7 +77,7 @@ index 96309ec..8d6fb8d 100644
          if policy.workdir.is_none() {
              return Err(anyhow!("--dry-run requires --workdir"));
 diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/src/chroot/dispatch.rs
-index 6e4ab93..fd2193b 100644
+index 6e4ab93..3d42f20 100644
 --- a/crates/sandlock-core/src/chroot/dispatch.rs
 +++ b/crates/sandlock-core/src/chroot/dispatch.rs
 @@ -76,9 +76,29 @@ pub(crate) struct ChrootCtx<'a> {
@@ -880,17 +880,18 @@ index 6e4ab93..fd2193b 100644
          Ok(p) => p,
          Err(a) => return a,
      };
-@@ -1940,18 +2254,70 @@ pub(crate) async fn handle_chroot_xattr(
+@@ -1940,18 +2254,101 @@ pub(crate) async fn handle_chroot_xattr(
  // ============================================================
  
  pub(crate) async fn handle_chroot_getdents(
 -    _notif: &SeccompNotif,
 -    _chroot_state: &Arc<Mutex<ChrootState>>,
-+    notif: &SeccompNotif,
-+    chroot_state: &Arc<Mutex<ChrootState>>,
-     _cow_state: &Arc<Mutex<CowState>>,
+-    _cow_state: &Arc<Mutex<CowState>>,
 -    _notif_fd: RawFd,
 -    _ctx: &ChrootCtx<'_>,
++    notif: &SeccompNotif,
++    chroot_state: &Arc<Mutex<ChrootState>>,
++    cow_state: &Arc<Mutex<CowState>>,
 +    notif_fd: RawFd,
 +    ctx: &ChrootCtx<'_>,
  ) -> NotifAction {
@@ -901,7 +902,7 @@ index 6e4ab93..fd2193b 100644
 -    // time, not at directory listing time.
 -    NotifAction::Continue
 +    use std::os::unix::fs::MetadataExt;
-+    if ctx.directory_images.is_empty() { return NotifAction::Continue; }
++    if ctx.directory_images.is_empty() && !ctx.private_writes { return NotifAction::Continue; }
 +    // getdents and seek share the OFD cursor, including dup and fork aliases.
 +    let _cursor_guard = chroot_state.lock().await;
 +    let pin = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, notif.data.args[0] as i32) {
@@ -913,7 +914,9 @@ index 6e4ab93..fd2193b 100644
 +        let named = std::fs::metadata(directory).ok()?;
 +        (named.dev() == state.st_dev && named.ino() == state.st_ino).then_some(bytes)
 +    });
-+    let Some(image) = image else { return NotifAction::Continue; };
++    // A directory the private branch holds entries in lists them over the host's.
++    let merged = if image.is_some() || !ctx.private_writes { None } else { merged_listing(cow_state, pin.as_raw_fd(), &state).await };
++    let Some(image) = image.map(Vec::as_slice).or(merged.as_deref()) else { return NotifAction::Continue; };
 +    if unsafe { libc::fcntl(pin.as_raw_fd(), libc::F_GETFL) } & libc::O_PATH != 0 { return NotifAction::Errno(libc::EBADF); }
 +    if notif.data.nr as i64 == libc::SYS_lseek {
 +        let position = unsafe { libc::lseek(pin.as_raw_fd(), notif.data.args[1] as i64, notif.data.args[2] as i32) };
@@ -958,10 +961,80 @@ index 6e4ab93..fd2193b 100644
 +    if write_child_mem(notif_fd, notif.id, notif.pid, notif.data.args[1], &output).is_err() { return NotifAction::Errno(libc::EFAULT); }
 +    if unsafe { libc::lseek(pin.as_raw_fd(), next, libc::SEEK_SET) } != next { return NotifAction::Errno(libc::EIO); }
 +    NotifAction::ReturnValue(used as i64)
++}
++
++/// The listing of the directory `fd` names when the private branch holds entries in it: its own entry, its parent's,
++/// then each merged name, as getdents64 records keyed by their position.
++async fn merged_listing(cow_state: &Arc<Mutex<CowState>>, fd: RawFd, state: &libc::stat) -> Option<Vec<u8>> {
++    use std::os::unix::fs::MetadataExt;
++    let target = std::fs::read_link(format!("/proc/self/fd/{}", fd)).ok()?;
++    let target = target.to_string_lossy().into_owned();
++    let cs = cow_state.lock().await;
++    let cow = cs.branch.as_ref()?;
++    let rel = match target.strip_prefix(cow.upper_dir().to_str()?) {
++        Some(rest) => rest.trim_start_matches('/').to_string(),
++        None if cow.matches(&target) => cow.safe_rel(&target)?,
++        None => return None,
++    };
++    let entries = cow.merged_entries(&rel)?;
++    let parent = std::fs::symlink_metadata(Path::new(&target).parent().unwrap_or(Path::new("/"))).map_or(state.st_ino, |m| m.ino());
++    let mut image = Vec::new();
++    let own = [(".".to_string(), state.st_ino, libc::DT_DIR), ("..".to_string(), parent, libc::DT_DIR)];
++    for (position, (name, ino, kind)) in own.into_iter().chain(entries).enumerate() {
++        let (start, size) = (image.len(), (19 + name.len() + 1 + 7) & !7);
++        image.resize(start + size, 0);
++        image[start..start + 8].copy_from_slice(&ino.to_le_bytes());
++        image[start + 8..start + 16].copy_from_slice(&(position as i64 + 1).to_le_bytes());
++        image[start + 16..start + 18].copy_from_slice(&(size as u16).to_le_bytes());
++        image[start + 18] = kind;
++        image[start + 19..start + 19 + name.len()].copy_from_slice(name.as_bytes());
++    }
++    Some(image)
  }
  
  // ============================================================
-@@ -2152,9 +2518,9 @@ pub(crate) async fn handle_chroot_utimensat(
+@@ -2092,12 +2489,38 @@ pub(crate) async fn handle_chroot_statfs(
+         None => return NotifAction::Continue,
+     };
+ 
+-    let (host_path, _) = match resolve_chroot_path_existing(notif, libc::AT_FDCWD as i64, &path, ctx) {
++    let (host_path, virtual_path) = match resolve_chroot_path_existing(notif, libc::AT_FDCWD as i64, &path, ctx) {
+         Some(r) => r,
+         None => return NotifAction::Errno(libc::ENOENT),
+     };
++    write_statfs(notif, notif_fd, statfsbuf_addr, &viewed_filesystem(ctx, &host_path, &virtual_path))
++}
+ 
+-    let c_path = match path_cstr(&host_path, libc::ENOENT) {
++/// The path whose filesystem a native run would see: a mount's own filesystem stands in for the tree its virtual path names.
++fn viewed_filesystem(ctx: &ChrootCtx<'_>, host_path: &Path, virtual_path: &Path) -> PathBuf {
++    if !ctx.is_mounted(virtual_path) {
++        return host_path.to_path_buf();
++    }
++    virtual_path.ancestors().find(|ancestor| ancestor.exists()).unwrap_or(host_path).to_path_buf()
++}
++
++/// fstatfs of a descriptor on a mounted path, answered for its virtual path; any other descriptor is the kernel's to answer.
++pub(crate) async fn handle_chroot_fstatfs(
++    notif: &SeccompNotif,
++    _chroot_state: &Arc<Mutex<ChrootState>>,
++    _cow_state: &Arc<Mutex<CowState>>,
++    notif_fd: RawFd,
++    ctx: &ChrootCtx<'_>,
++) -> NotifAction {
++    let Ok(host_path) = std::fs::read_link(format!("/proc/{}/fd/{}", notif.pid, notif.data.args[0] as i32)) else { return NotifAction::Continue };
++    match ctx.host_to_virtual(&host_path).filter(|virtual_path| host_path.is_absolute() && ctx.is_mounted(virtual_path)) {
++        Some(virtual_path) => write_statfs(notif, notif_fd, notif.data.args[1], &viewed_filesystem(ctx, &host_path, &virtual_path)),
++        None => NotifAction::Continue,
++    }
++}
++
++fn write_statfs(notif: &SeccompNotif, notif_fd: RawFd, statfsbuf_addr: u64, target: &Path) -> NotifAction {
++    let c_path = match path_cstr(target, libc::ENOENT) {
+         Ok(c) => c,
+         Err(a) => return a,
+     };
+@@ -2152,9 +2575,9 @@ pub(crate) async fn handle_chroot_utimensat(
          Some(r) => r,
          None => return NotifAction::Errno(libc::EACCES),
      };
@@ -973,7 +1046,7 @@ index 6e4ab93..fd2193b 100644
          Ok(p) => p,
          Err(a) => return a,
      };
-@@ -2482,6 +2848,9 @@ mod mount_ro_tests {
+@@ -2482,6 +2905,9 @@ mod mount_ro_tests {
              denied: &[],
              mounts,
              mount_ro,
@@ -1051,7 +1124,7 @@ index f796767..d448105 100644
  
      #[test]
 diff --git a/crates/sandlock-core/src/cow/deletions.rs b/crates/sandlock-core/src/cow/deletions.rs
-index f96622d..4a2567f 100644
+index f96622d..6e8c060 100644
 --- a/crates/sandlock-core/src/cow/deletions.rs
 +++ b/crates/sandlock-core/src/cow/deletions.rs
 @@ -22,6 +22,23 @@ use std::path::Path;
@@ -1103,18 +1176,29 @@ index f96622d..4a2567f 100644
      }
  
      /// Record `rel` as deleted. Idempotent; the log line and its fdatasync
-@@ -125,17 +149,23 @@ impl DeletionSet {
+@@ -125,17 +149,32 @@ impl DeletionSet {
      /// True when `rel` or any ancestor directory of it has been deleted.
      /// Matching is per path component: "d" covers "d/x" but never "d2".
      pub fn covers(&self, rel: &str) -> bool {
 -        if self.entries.contains(rel) {
-+        if covered(&self.entries, rel) {
-             return true;
-         }
+-            return true;
+-        }
 -        let mut end = rel.len();
 -        while let Some(i) = rel[..end].rfind('/') {
 -            if self.entries.contains(&rel[..i]) {
 -                return true;
++        covered(&self.entries, rel) || self.shared(|entries| covered(entries, rel))
++    }
++
++    /// True when a deletion lies below `rel` ("" or "." being the root): a listing of it leaves those names out.
++    pub fn below(&self, rel: &str) -> bool {
++        let prefix = if rel.is_empty() || rel == "." { String::new() } else { format!("{}/", rel) };
++        let under = |entries: &BTreeSet<String>| entries.range(prefix.clone()..).next().is_some_and(|entry| entry.starts_with(&prefix));
++        under(&self.entries) || self.shared(under)
++    }
++
++    /// Apply `test` to the deletions other sandboxes shared, read up to their log's last whole line.
++    fn shared(&self, test: impl Fn(&BTreeSet<String>) -> bool) -> bool {
 +        let Some(shared) = &self.shared else { return false };
 +        let Ok(mut guard) = shared.lock() else { return false };
 +        let (path, offset, entries) = &mut *guard;
@@ -1130,12 +1214,12 @@ index f96622d..4a2567f 100644
 -            end = i;
          }
 -        false
-+        covered(entries, rel)
++        test(entries)
      }
  
      pub fn iter(&self) -> impl Iterator<Item = &str> {
 diff --git a/crates/sandlock-core/src/cow/seccomp.rs b/crates/sandlock-core/src/cow/seccomp.rs
-index 9bab5df..dd8ac33 100644
+index 9bab5df..a97e5c0 100644
 --- a/crates/sandlock-core/src/cow/seccomp.rs
 +++ b/crates/sandlock-core/src/cow/seccomp.rs
 @@ -598,6 +598,8 @@ pub struct SeccompCowBranch {
@@ -1211,7 +1295,95 @@ index 9bab5df..dd8ac33 100644
      }
  
      /// Check if a path has been modified or deleted in the COW layer.
-@@ -1439,7 +1478,8 @@ impl SeccompCowBranch {
+@@ -806,7 +845,7 @@ impl SeccompCowBranch {
+         }
+ 
+         if let Some(p) = parent_rel(rel_path) {
+-            let _ = crate::sys::fs::mkdirp_in_root(&self.upper, p, 0o755);
++            let _ = self.mkdirp_upper(p);
+         }
+ 
+         // A whiteout covers this path: the lower entry is logically gone, so
+@@ -953,6 +992,11 @@ impl SeccompCowBranch {
+         std::io::copy(&mut src, &mut dst)?;
+         if let Ok(meta) = src.metadata() {
+             let _ = dst.set_permissions(meta.permissions());
++            // The copy keeps its source's times, as an overlayfs copy-up does:
++            // opening a file for writing leaves them alone natively.
++            if let (Ok(accessed), Ok(modified)) = (meta.accessed(), meta.modified()) {
++                let _ = dst.set_times(fs::FileTimes::new().set_accessed(accessed).set_modified(modified));
++            }
+         }
+         Ok(())
+     }
+@@ -1043,11 +1087,37 @@ impl SeccompCowBranch {
+     /// Resolve a read path: upper if modified, else lower.
+     pub fn resolve_read(&self, rel_path: &str) -> PathBuf {
+         let upper_file = self.upper.join(rel_path);
+-        if upper_file.exists() || upper_file.is_symlink() {
++        let lower_file = self.workdir.join(rel_path);
++        // A directory the branch holds only for its entries is the one below, as its fd and inode are natively,
++        // until the run changes its permissions.
++        let directory = |path: &Path| fs::symlink_metadata(path).ok().filter(|m| m.is_dir()).map(|m| std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o7777);
++        if (upper_file.exists() || upper_file.is_symlink())
++            && (directory(&upper_file).is_none() || directory(&upper_file) != directory(&lower_file) || self.deleted.covers(rel_path))
++        {
+             upper_file
+         } else {
+-            self.workdir.join(rel_path)
++            lower_file
++        }
++    }
++
++    /// Create `rel` and its missing ancestors in the upper, each with the permissions of the host directory it
++    /// stands over, so a directory the branch holds only for its entries presents the one below.
++    fn mkdirp_upper(&self, rel: &str) -> Result<(), i32> {
++        let mut prefix = String::new();
++        for comp in rel.split('/').filter(|c| !c.is_empty() && *c != ".") {
++            if !prefix.is_empty() {
++                prefix.push('/');
++            }
++            prefix.push_str(comp);
++            let below = crate::sys::fs::statat_in_root(&self.workdir, &prefix, false).ok().filter(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR);
++            let mode = below.map_or(0o755, |st| st.st_mode & 0o7777);
++            match crate::sys::fs::mkdir_in_root(&self.upper, &prefix, mode) {
++                Ok(()) if below.is_some() => crate::sys::fs::chmod_in_root(&self.upper, &prefix, mode)?,
++                Ok(()) | Err(libc::EEXIST) => {}
++                Err(e) => return Err(e),
++            }
+         }
++        Ok(())
+     }
+ 
+     // ---- Syscall handlers (called by cow::dispatch) ----
+@@ -1304,7 +1374,7 @@ impl SeccompCowBranch {
+         };
+         self.check_quota(4096)?; // directory metadata
+         self.has_changes = true;
+-        let ok = crate::sys::fs::mkdirp_in_root(&self.upper, &rel, 0o755).is_ok();
++        let ok = self.mkdirp_upper(&rel).is_ok();
+         if ok {
+             self.disk_used += 4096;
+         }
+@@ -1336,7 +1406,7 @@ impl SeccompCowBranch {
+         // Ensure the parent directory exists in the upper layer before creating
+         // the node (mirrors handle_symlink; parent may only exist in lower).
+         if let Some(p) = parent_rel(&rel) {
+-            let _ = crate::sys::fs::mkdirp_in_root(&self.upper, p, 0o755);
++            let _ = self.mkdirp_upper(p);
+         }
+         let ok = crate::sys::fs::mknod_in_root(&self.upper, &rel, mode, dev).is_ok();
+         if ok {
+@@ -1399,7 +1469,7 @@ impl SeccompCowBranch {
+         }
+         self.copy_up_tree(&old_rel)?;
+         if let Some(p) = parent_rel(&new_rel) {
+-            let _ = crate::sys::fs::mkdirp_in_root(&self.upper, p, 0o755);
++            let _ = self.mkdirp_upper(p);
+         }
+         if crate::sys::fs::renameat_in_root(&self.upper, &old_rel, &new_rel).is_err() {
+             return Ok(false);
+@@ -1439,13 +1509,14 @@ impl SeccompCowBranch {
              Some(r) => r,
              None => return Ok(false),
          };
@@ -1221,6 +1393,70 @@ index 9bab5df..dd8ac33 100644
              return Ok(false);
          }
          self.check_quota(256)?;
+         self.has_changes = true;
+         if let Some(p) = parent_rel(&rel) {
+-            let _ = crate::sys::fs::mkdirp_in_root(&self.upper, p, 0o755);
++            let _ = self.mkdirp_upper(p);
+         }
+         let ok = crate::sys::fs::symlinkat_in_root(&self.upper, &rel, target).is_ok();
+         if ok {
+@@ -1480,7 +1551,7 @@ impl SeccompCowBranch {
+         }
+         let _ = self.ensure_cow_copy(&old_rel)?;
+         if let Some(p) = parent_rel(&new_rel) {
+-            let _ = crate::sys::fs::mkdirp_in_root(&self.upper, p, 0o755);
++            let _ = self.mkdirp_upper(p);
+         }
+         Ok(crate::sys::fs::linkat_in_root(&self.upper, &old_rel, &new_rel).is_ok())
+     }
+@@ -1628,6 +1699,23 @@ impl SeccompCowBranch {
+         Ok(result)
+     }
+ 
++    /// What a listing of `rel` presents when the branch holds anything directly in it: each name with the inode
++    /// and type of what `resolve_read` presents for it.
++    pub fn merged_entries(&self, rel: &str) -> Option<Vec<(String, u64, u8)>> {
++        use std::os::unix::fs::{FileTypeExt, MetadataExt};
++        if !self.upper.join(rel).is_dir() && !self.deleted.below(rel) {
++            return None;
++        }
++        let child = |name: &str| if rel.is_empty() || rel == "." { name.to_string() } else { format!("{}/{}", rel, name) };
++        Some(self.list_merged_dir(rel).into_iter().filter_map(|name| {
++            let meta = fs::symlink_metadata(self.resolve_read(&child(&name))).ok()?;
++            let kind = meta.file_type();
++            let dt = if kind.is_dir() { libc::DT_DIR } else if kind.is_symlink() { libc::DT_LNK } else if kind.is_fifo() { libc::DT_FIFO }
++                else if kind.is_socket() { libc::DT_SOCK } else if kind.is_char_device() { libc::DT_CHR } else if kind.is_block_device() { libc::DT_BLK } else { libc::DT_REG };
++            Some((name, meta.ino(), dt))
++        }).collect())
++    }
++
+     /// List merged directory entries (upper + lower - deleted).
+     pub fn list_merged_dir(&self, rel_path: &str) -> Vec<String> {
+         let lower_dir = self.workdir.join(rel_path);
+@@ -2135,9 +2223,9 @@ impl SeccompCowBranch {
+                 // the mode the child asked for. The create mode below only
+                 // applies to a destination that does not exist yet, and never to
+                 // one being truncated, so the mode has to be set explicitly.
+-                let src_mode = src
+-                    .metadata()
+-                    .ok()
++                let src_meta = src.metadata().ok();
++                let src_mode = src_meta
++                    .as_ref()
+                     .map(|m| std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o7777);
+                 let dst_fd = crate::sys::fs::openat2_in_root(
+                     &self.workdir,
+@@ -2155,6 +2243,10 @@ impl SeccompCowBranch {
+                     dst.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(mode))
+                         .map_err(|e| BranchError::Operation(format!("chmod: {}", e)))?;
+                 }
++                // The run's modification time, as its own write left it.
++                if let Some(modified) = src_meta.and_then(|m| m.modified().ok()) {
++                    let _ = dst.set_times(fs::FileTimes::new().set_modified(modified));
++                }
+                 // The merged bytes, before the directory entry that names them.
+                 // The tail below fsyncs each destination directory but the file
+                 // itself was never synced, and the successful tail then removes
 diff --git a/crates/sandlock-core/src/resolved.rs b/crates/sandlock-core/src/resolved.rs
 index 634755e..38fd708 100644
 --- a/crates/sandlock-core/src/resolved.rs
@@ -1475,7 +1711,7 @@ index 6eaa211..db70c1e 100644
              in_child_main: None,
              clean_env: self.clean_env,
 diff --git a/crates/sandlock-core/src/seccomp/dispatch.rs b/crates/sandlock-core/src/seccomp/dispatch.rs
-index 3673d84..c9044ea 100644
+index 3673d84..96624f9 100644
 --- a/crates/sandlock-core/src/seccomp/dispatch.rs
 +++ b/crates/sandlock-core/src/seccomp/dispatch.rs
 @@ -546,7 +546,8 @@ pub(crate) fn build_dispatch_table(
@@ -1496,7 +1732,16 @@ index 3673d84..c9044ea 100644
      if let Some(getdents) = arch::sys_getdents() {
          getdents_nrs.push(getdents);
      }
-@@ -1140,12 +1142,16 @@ mod handler_tests {
+@@ -973,6 +975,8 @@ fn register_chroot_handlers(
+         crate::chroot::dispatch::handle_chroot_getcwd));
+     table.register(libc::SYS_statfs as i64, chroot_handler!(policy,
+         crate::chroot::dispatch::handle_chroot_statfs));
++    table.register(libc::SYS_fstatfs as i64, chroot_handler!(policy,
++        crate::chroot::dispatch::handle_chroot_fstatfs));
+     table.register(libc::SYS_utimensat as i64, chroot_handler!(policy,
+         crate::chroot::dispatch::handle_chroot_utimensat));
+ 
+@@ -1140,12 +1144,16 @@ mod handler_tests {
                  argv_safety_required: false,
                  port_remap: false,
                  cow_enabled: false,
@@ -1923,10 +2168,18 @@ index abcd92c..79b19bc 100644
  
      #[test]
 diff --git a/crates/sandlock-core/src/seccomp_plan.rs b/crates/sandlock-core/src/seccomp_plan.rs
-index 03fc456..f2efc5c 100644
+index 03fc456..d03d36f 100644
 --- a/crates/sandlock-core/src/seccomp_plan.rs
 +++ b/crates/sandlock-core/src/seccomp_plan.rs
-@@ -415,6 +415,7 @@ pub(crate) fn notif_syscalls_resolved(resolved: &ResolvedSandbox) -> Vec<u32> {
+@@ -209,6 +209,7 @@ fn chroot_path_syscalls() -> Vec<i64> {
+         libc::SYS_fchdir,
+         libc::SYS_getcwd,
+         libc::SYS_statfs,
++        libc::SYS_fstatfs,
+         libc::SYS_utimensat,
+         // xattr family (path-based): must be mediated so that paths under an
+         // fs_mount/chroot resolve to the real backing file rather than the
+@@ -415,6 +416,7 @@ pub(crate) fn notif_syscalls_resolved(resolved: &ResolvedSandbox) -> Vec<u32> {
      // Chroot path interception
      if features.chroot {
          nrs.extend(&chroot_path_syscalls());

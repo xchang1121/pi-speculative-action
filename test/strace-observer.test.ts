@@ -37,9 +37,12 @@ describe("strace provenance decoder", () => {
 		const fields = async (argv: readonly string[], target = "/work/a.txt") => (await run(argv, target)).paths.find((item) => item.role === "metadata")!;
 		try {
 			const all = FILESYSTEM_OBSERVATION_FIELDS, withoutDevice = all.filter((field) => field !== "dev");
+			// A replay recreates a file's bytes, mode and times, never its identity: a program not known to print it sees that once.
+			const withoutIdentity = all.filter((field) => !["dev", "ino", "blksize", "blocks", "ctimeNs"].includes(field));
 			for (const [argv, expected] of [[["cat", "a.txt"], ["mode"]], [["ls"], ["mode"]], [["ls", "-la"], withoutDevice], [["find", ".", "-size", "+1k"], ["mode", "size"]],
-				[["find", ".", "-newer", "b"], withoutDevice], [["bash", "-c", "true"], withoutDevice], [["git", "status"], withoutDevice], [["python3", "x.py"], withoutDevice]] as const)
+				[["find", ".", "-newer", "b"], withoutDevice], [["bash", "-c", "true"], withoutIdentity], [["git", "status"], withoutIdentity], [["python3", "x.py"], withoutIdentity]] as const)
 				expect((await fields(argv)).fields, argv.join(" ")).toEqual(all.filter((field) => (expected as readonly string[]).includes(field)));
+			expect((await run(["python3", "x.py"], "/work/a.txt")).taints).toContain("descriptor_observation");
 			const directory = `newfstatat(AT_FDCWD, "/work/src", ${STAT.replace("S_IFREG", "S_IFDIR")}, 0) = 0`;
 			for (const image of ["git", "node"]) expect((await run([image, "x"], "/work/a.txt", [directory])).paths.find((item) => item.path === "/work/src")).toMatchObject({ fields: ["mode", "uid", "gid"] });
 			for (const [argv, target] of [[["stat", "a.txt"], "/work/a.txt"], [["cat", "hosts"], "/etc/hosts"], [["find", ".", "-printf", "%D %p"], "/work/a.txt"]] as const)
@@ -105,14 +108,27 @@ describe("strace provenance decoder", () => {
 		expect((await observe({ 100: [EXEC, "getdents64(10<pipe:[7]>, [], 512) = 0"] })).taints).toContain("unsupported_syscall");
 	});
 
-	test("treats host filesystem statistics as time-varying input, but not the sandbox's workspace filesystem", async () => {
+	test("treats filesystem statistics as time-varying input, the workspace's included: the sandbox reports what a native run sees", async () => {
 		const STATFS = "{f_type=SYSFS_MAGIC, f_bsize=4096, f_blocks=0, f_bfree=0, f_bavail=0, f_files=0, f_ffree=0, f_fsid={val=[0x1, 0x2]}, f_namelen=255, f_frsize=4096, f_flags=ST_VALID}";
-		for (const [line, roots, allowed] of [[`statfs("/sys/fs/selinux", ${STATFS}) = 0`, ["/work"], true], ['statfs("/sys/fs/selinux", 0x7ffd) = -1 ENOENT (No such file or directory)', ["/work"], true],
-			[`fstatfs(3</usr/lib>, ${STATFS}) = 0`, ["/work"], true], [`statfs("sub", ${STATFS}) = 0`, ["/work"], false], [`fstatfs(3</work/src>, ${STATFS}) = 0`, ["/work"], false],
-			[`statfs("/sys/fs/selinux", ${STATFS}) = 0`, [], false]] as const) {
-			const observation = await observe({ 100: [EXEC, line] }, { guardFilesystemSemanticsWithin: [...roots] });
-			expect([observation.taints.includes("unsupported_syscall"), observation.paths.length], line).toEqual([!allowed && !line.includes("ENOENT"), allowed ? 1 : 2]);
+		for (const line of [`statfs("/sys/fs/selinux", ${STATFS}) = 0`, 'statfs("/sys/fs/selinux", 0x7ffd) = -1 ENOENT (No such file or directory)', `fstatfs(3</usr/lib>, ${STATFS}) = 0`,
+			`statfs("sub", ${STATFS}) = 0`, `fstatfs(3</work/src>, ${STATFS}) = 0`]) {
+			const observation = await observe({ 100: [EXEC, line] }, { guardFilesystemSemanticsWithin: ["/work"] });
+			expect([observation.taints.includes("unsupported_syscall"), observation.paths.length], line).toEqual([false, 1]);
 		}
+	});
+
+	test("models a lock taken without waiting, a time set on a written file, the directories it listed and a private copy's host path", async () => {
+		const observation = await observe({ 100: [EXEC, 'flock(3</work/input>, LOCK_SH|LOCK_NB) = 0', 'fcntl(5</work/input>, F_GETLK, {l_type=F_UNLCK}) = 0',
+			'fcntl(4</upper/home/db>, F_SETLK, {l_type=F_WRLCK, l_whence=SEEK_SET, l_start=1, l_len=1}) = 0', 'fcntl(4</upper/home/db>, F_SETLK, {l_type=F_UNLCK}) = 0',
+			'fcntl(4</upper/home/db>, F_SETLKW, {l_type=F_RDLCK}) = 0', 'openat(AT_FDCWD, "/work/output", O_WRONLY|O_CREAT|O_TRUNC, 0644) = 6</work/output>',
+			'utimensat(6</work/output>, NULL, [UTIME_OMIT, {tv_sec=1, tv_nsec=2}], 0) = 0', 'readlink("/work/dir", 0x1, 1023) = -1 EINVAL (Invalid argument)',
+			'getdents64(7</work/listed>, [], 32768) = 0', 'rmdir("/work/full") = -1 ENOTEMPTY (Directory not empty)'] }, { privateUpper: "/upper", guardFilesystemSemanticsWithin: ["/work"] });
+		expect([observation.taints, observation.locks, observation.written]).toEqual([["clock", "descriptor_observation", "random"],
+			[{ path: "/work/input", exclusive: true }, { path: "/home/db", exclusive: true }], ["output"]]);
+		expect(observation.paths).toEqual(expect.arrayContaining([{ path: "/work/dir", role: "input" }, { path: "/work/listed", role: "input", listed: true },
+			{ path: "/work/full", role: "input", listed: true }]));
+		// A time set on what the tree did not write reaches no effect.
+		expect((await observe({ 100: [EXEC, 'utimensat(AT_FDCWD, "/work/dir", NULL, 0) = 0'] })).taints).toContain("unsupported_syscall");
 	});
 	test("releases stream references after aliases, copied tables and shared tables close", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-stream-lifetime-")), prefix = path.join(root, "process");
@@ -313,7 +329,7 @@ describe("strace provenance decoder", () => {
 			'pipe2([5<pipe:[9]>, 6<pipe:[9]>], O_CLOEXEC) = 0', 'poll([{fd=5<pipe:[9]>, events=POLLIN}], 1, -1) = 1 ([{fd=5, revents=POLLIN}])'];
 		const write = 'openat(AT_FDCWD, "/work/out.o", O_WRONLY|O_CREAT|O_TRUNC, 0644) = 3</work/out.o>';
 		for (const [lines, taints] of [[polls, []], [['poll([{fd=1<pipe:[7]>, events=POLLOUT}], 1, 0) = 1 ([{fd=1, revents=POLLOUT}])'], ["unsupported_syscall"]],
-			[[write, stat(4), stat(8)], []], [[stat(4), stat(8)], ["mutable_input"]]] as const)
+			[[write, stat(4), stat(8)], ["descriptor_observation"]], [[stat(4), stat(8)], ["descriptor_observation", "mutable_input"]]] as const)
 			expect((await observe({ 100: [EXEC, ...lines] }, { inheritedStreams: ["7"], guardFilesystemSemanticsWithin: ["/work"] })).taints, lines.join()).toEqual(["clock", "random", ...taints].sort());
 	});
 
@@ -330,10 +346,11 @@ describe("strace provenance decoder", () => {
 			['pipe2([3, 4], O_DIRECT|O_CLOEXEC) = 0', ["unsupported_syscall"]],
 			['splice(3<pipe:[7]>, NULL, 4<pipe:[8]>, NULL, 1, 0) = 1', ["unsupported_syscall"]],
 			['tee(3<pipe:[7]>, 4<pipe:[8]>, 1, 0) = 1', ["unsupported_syscall"]],
-			['fcntl(3</work/input>, F_GETLK, {l_type=F_UNLCK, l_whence=SEEK_SET, l_start=0, l_len=0}) = 0', ["ipc"]],
+			['fcntl(3</work/input>, F_GETLK, {l_type=F_UNLCK, l_whence=SEEK_SET, l_start=0, l_len=0}) = 0', []],
 			['fcntl64(3</work/input>, F_OFD_GETLK, {l_type=F_WRLCK, l_pid=-1}) = 0', ["ipc"]],
 			['fcntl(3</work/input>, F_SETLK, {l_type=F_WRLCK}) = -1 EAGAIN (Resource temporarily unavailable)', ["ipc"]],
-			['flock(3</work/input>, LOCK_EX|LOCK_NB) = 0', ["ipc"]],
+			['flock(3</work/input>, LOCK_EX|LOCK_NB) = 0', []],
+			['flock(3</work/input>, LOCK_EX|LOCK_NB) = -1 EWOULDBLOCK (Resource temporarily unavailable)', ["ipc"]],
 			['flock(3</work/input>, LOCK_EX) = 0', []],
 			['fcntl(1<pipe:[7]>, F_SETFL, O_WRONLY|O_NONBLOCK) = 0', ["unsupported_syscall"]],
 			['fcntl(3</work/input>, F_SETFL, O_RDONLY|O_NONBLOCK|O_APPEND|O_LARGEFILE|O_DIRECTORY) = 0', []],

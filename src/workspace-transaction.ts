@@ -13,8 +13,7 @@ export function orderWorkspaceChanges<Value>(
 	return values.map(value => {
 		const { change, depth, key } = order(value);
 		const removed = change.after === undefined;
-		return { value, key, depth: removed ? -depth : depth,
-			phase: change.kind === "directory" ? (removed ? 1 : 2) : (removed ? 0 : 3) };
+		return { value, key, depth: removed ? -depth : depth, phase: change.kind === "directory" ? (removed ? 1 : 2) : (removed ? 0 : 3) };
 	}).sort((left, right) => left.phase - right.phase || left.depth - right.depth || left.key.localeCompare(right.key))
 		.map(({ value }) => value);
 }
@@ -26,6 +25,7 @@ export interface WorkspaceRegularDelta extends WorkspaceFileMutation {
 	readonly after?: Uint8Array;
 	readonly beforeMode?: number;
 	readonly afterMode?: number;
+	readonly afterModified?: string;
 }
 
 export type WorkspaceTransactionDelta =
@@ -58,8 +58,8 @@ export interface WorkspaceTransactionCapture {
 /** What one interval's writer did, from its own trace, in workspace-relative paths. */
 export interface WorkspaceTransactionOwnership {
 	readonly written: ReadonlySet<string>;
-	/** Paths it read, stat'ed, probed or listed. */
-	readonly observed: ReadonlySet<string>;
+	/** Paths it read, stat'ed, probed or listed, each with the wall-clock milliseconds it last did. */
+	readonly observed: ReadonlyMap<string, number>;
 	/** Wall-clock milliseconds by which all its processes had exited. */
 	readonly endedAt: number;
 	/** Whether another writer touched any of these paths while this interval ran, up to `until`. */

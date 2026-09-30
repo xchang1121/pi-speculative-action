@@ -216,7 +216,7 @@ export function diffWorkspaceStructures(
 		if (delta) {
 			const reason = regularDeltaFailure(relativePath, previous, current, delta);
 			if (reason) return { effects: [], complete: false, reason };
-			let change: WorkspaceRegularDelta = delta;
+			let change: WorkspaceRegularDelta = current?.kind === "file" ? { ...delta, afterModified: current.modified } : delta;
 			if (previous?.kind === "file" && previous.aliases) change = { ...change, aliases: previous.aliases.map(name => projection.toLogical(name)).sort() };
 			if (current?.kind === "file" && current.object) {
 				const original = originals.get(current.object), anchor = original ?? results.get(current.object)!;
@@ -303,7 +303,7 @@ export function snapshotDependency(
 	entry: WorkspaceTreeEntry | undefined,
 	parent: WorkspaceTreeEntry | undefined,
 	role: Extract<DynamicDependency, { kind: "file" }>["role"] = "input",
-	options: { readonly excludedEntries?: readonly string[]; readonly parentExcludedEntries?: readonly string[]; } = {},
+	options: { readonly excludedEntries?: readonly string[]; readonly parentExcludedEntries?: readonly string[]; readonly listed?: boolean } = {},
 ): DynamicDependency | undefined {
 	if (!entry) {
 		return {
@@ -326,14 +326,13 @@ export function snapshotDependency(
 				...(entry.aliases ? { aliases: entry.aliases } : {}),
 			};
 		case "directory":
+			if (options.listed === false) return { kind: "directory", path: logicalPath, metadataDigest: entry.metadataDigest };
 			return {
 				kind: "directory",
 				path: logicalPath,
 				entriesDigest: entry.entriesDigest,
 				metadataDigest: entry.metadataDigest,
-				...(options.excludedEntries?.length
-					? { excludedEntries: Object.freeze([...options.excludedEntries].sort()) }
-					: {}),
+				...(options.excludedEntries?.length ? { excludedEntries: Object.freeze([...options.excludedEntries].sort()) } : {}),
 			};
 		case "symlink":
 			return { kind: "symlink", path: logicalPath, target: entry.target, targetDigest: entry.targetDigest };
@@ -370,7 +369,7 @@ function changedRootMetadata(
 }
 
 export function directoryEntriesDigest(entries: readonly (FilesystemTypeEvidence & { readonly name: string })[]): Sha256Digest {
-	return digestObject(entries .map((entry) => `${filesystemEntryType(entry)}\0${entry.name}`) .sort());
+	return digestObject(entries .map((entry) => `${filesystemEntryType(entry)}\0${entry.name}`).sort());
 }
 
 /** Kernel-maintained identity/change fields detect writes without making timestamps replay semantics. */
