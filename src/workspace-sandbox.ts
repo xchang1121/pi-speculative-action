@@ -590,18 +590,20 @@ async function commitSandboxExecution(state: WorkspaceSandboxState, execution: S
 					.map(change => [change.target, [] as string[]]));
 				if (inputs) for (const change of changes) if (!change.validationOnly && change.after)
 					createdEntries.get(path.dirname(change.target))?.push(path.basename(change.target));
-				for (const change of changes) {
-					if (change.validationOnly || change.kind !== "directory" || !change.after) continue;
-					if (!(await sameDirectoryAfter(change.target, change, inputs && (names => {
-						names ??= createdEntries.get(change.target);
-						const bytes = names?.reduce((sum, name) => sum + name.length * 2 + 16, 0) ?? 0;
-						const retain = directoryBytes + bytes <= WORKSPACE_TRANSACTION_MAX_BYTES;
-						if (retain) directoryBytes += bytes;
-						inputs.set(change.target, { names: retain ? names : undefined });
-					})))) {
-						throw new Error(`directory changed while committing: ${change.resource}`);
-					}
-				}
+				// Directories are read at once; what their listings retain is decided in order.
+				const directories = changes.filter((change): change is SandboxDirectoryChange => !change.validationOnly && change.kind === "directory" && !!change.after);
+				const listed = await mapFilesystem(directories, async change => {
+					let listing: { names?: readonly string[] } | undefined;
+					return { same: await sameDirectoryAfter(change.target, change, inputs && (names => { listing = { names: names ?? createdEntries.get(change.target) }; })), listing };
+				});
+				directories.forEach((change, index) => {
+					const { same, listing } = listed[index]!;
+					if (!same) throw new Error(`directory changed while committing: ${change.resource}`);
+					if (!inputs || !listing) return;
+					const bytes = listing.names?.reduce((sum, name) => sum + name.length * 2 + 16, 0) ?? 0, retain = directoryBytes + bytes <= WORKSPACE_TRANSACTION_MAX_BYTES;
+					if (retain) directoryBytes += bytes;
+					inputs.set(change.target, { names: retain ? listing.names : undefined });
+				});
 			} catch (error) {
 				inputs?.clear();
 				if (nativeStarted || applied.some((change) => change.kind !== "directory" && (change.operation || change.aliases))) {
