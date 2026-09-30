@@ -1697,9 +1697,9 @@ int main(void) { char path[32] = "/bin/true\\0intact"; char *args[] = {path, 0};
 	return pthread_create(&thread, 0, idle, 0) || posix_spawn(&pid, path, 0, 0, args, environ) || waitpid(pid, &status, 0) != pid || puts(path + 10) < 0; }\n`);
 			await compileBenchmarkHelper(fixture.workspace, { source: "spawner.c", output: "spawner", arguments: ["-pthread"] });
 			// A created file takes the open's own mode under the process's umask, not the sandbox supervisor's.
-			const spawned = await forkReusableBash(fixture, { label: "spawn", command: "./spawner; umask 027; echo x > shared; cp /bin/true tool; stat -c '%a %n' shared tool",
+			const spawned = await forkReusableBash(fixture, { label: "spawn", command: "./spawner; umask 027; echo x > shared; cp /bin/true tool; mkdir made; stat -c '%a %n' shared tool made",
 				actionNamespace: "spawn", executionFingerprint });
-			try { expect(textOutput(spawned.output.result)).toBe("intact\n640 shared\n750 tool\n"); } finally { await spawned.dispose?.(); }
+			try { expect(textOutput(spawned.output.result)).toBe("intact\n640 shared\n750 tool\n750 made\n"); } finally { await spawned.dispose?.(); }
 		} finally { await fixture.dispose(); }
 	});
 
