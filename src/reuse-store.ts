@@ -49,7 +49,7 @@ export class ArtifactCAS {
 	}
 
 	async put(value: string | Uint8Array): Promise<ArtifactReference> {
-		const bytes = typeof value === "string" ? Buffer.from(value, "utf8") : Buffer.from(value);
+		const bytes = typeof value === "string" ? Buffer.from(value, "utf8") : value;
 		const digest = sha256Digest(bytes);
 		const target = this.artifactPath(digest);
 		await publishImmutable(target, bytes);
@@ -66,8 +66,11 @@ export class ArtifactCAS {
 		return bytes;
 	}
 
+	/** Present at its size: content-addressed objects are published whole and checked when read for use. */
 	async has(reference: ArtifactReference): Promise<boolean> {
-		return (await this.get(reference)) !== undefined;
+		if (!isSha256Digest(reference.digest)) throw new Error("invalid artifact reference");
+		const info = await stat(this.artifactPath(reference.digest)).catch((error): undefined => { if (!missing(error)) throw error; });
+		return info?.isFile() === true && info.size === reference.size;
 	}
 
 	/** Load and integrity-check a complete effect closure before any replay side effect begins. */

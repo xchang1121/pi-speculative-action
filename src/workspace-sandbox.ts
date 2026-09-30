@@ -119,6 +119,8 @@ interface PrivateSandboxWorkspace extends SandboxWorkspaceContext {
 	readonly baselineFrontier: Map<string, RegularFileState | undefined>;
 	/** A resource's state in the lower layer the workspace started from. */
 	readonly readBase: (resource: string, maxBytes: number) => Promise<RegularFileState | undefined>;
+	/** A live lower's structure as the workspace started from it, in place of a baseline commit. */
+	readonly liveBase?: WorkspaceStructureSnapshot;
 	readonly openTransactionClock: () => Promise<FileHandle>;
 	readonly transactionClockLinks: 0 | 1;
 	/** Native roots whose timestamp domain is projected through the workspace view. */
@@ -641,8 +643,7 @@ async function forkSandboxWorkspaceFor(state: WorkspaceSandboxState, options: Sa
 			const captured = "output" in result ? result : { output: result, changes: await collectSandboxChanges(workspace) };
 			const changes = ownSandboxChanges((await options.afterCapture?.(workspace, captured)) ?? captured.changes);
 			if (workspace.recycle && "output" in result) { workspace.recycle.written.push(...writtenPaths(changes)); workspace.recycle.settled = true; }
-			return { output: captured.output, changes,
-				executionMetrics: { setupMs, captureMs: Math.max(0, performance.now() - captureStarted), ...options.executionMetrics?.() } };
+			return { output: captured.output, changes, executionMetrics: { setupMs, captureMs: Math.max(0, performance.now() - captureStarted), ...options.executionMetrics?.() } };
 		},
 		parent, preparation);
 	return workspaceBranch(snapshot, sourceRoot, options.action, state, parent, options.validate);
@@ -659,16 +660,17 @@ async function prepareSandboxWorkspaceFor(state: WorkspaceSandboxState, cwd: str
 		throwIfAborted(options.signal);
 		const resolved = await resolveWorkspaceDriver(state, options.driver === "overlayfs" ? options : { ...options, driver: "git" }, sourceRoot, repository);
 		throwIfAborted(options.signal);
-		const baseline = await acquireSandboxBaseline(repository, true);
+		const live = resolved.driver === "overlayfs" && options.liveLower && await captureLiveBase(repository);
+		const baseline = live ? undefined : await acquireSandboxBaseline(repository, true);
 		throwIfAborted(options.signal);
-		if (resolved.driver !== "overlayfs") await ensurePreparedSandbox(repository, baseline, options.signal);
-		else if (!(options.liveLower && await captureLiveBase(repository, baseline.version))) {
+		if (resolved.driver !== "overlayfs") await ensurePreparedSandbox(repository, baseline!, options.signal);
+		else if (baseline) {
 			const overlay = await acquireOverlayBaseline(repository, baseline);
 			try { throwIfAborted(options.signal); await overlayBaselineStructure(overlay); } finally { releaseOverlayBaseline(overlay); }
 		}
 		throwIfAborted(options.signal);
 		const prepared = Object.freeze({ ...resolved });
-		preparedWorkspaceBaselines.set(prepared, { repository, baseline });
+		if (baseline) preparedWorkspaceBaselines.set(prepared, { repository, baseline });
 		return prepared;
 	} finally {
 		releaseSandboxRepository(repository);
@@ -756,8 +758,7 @@ async function executeMutation(state: WorkspaceSandboxState, context: Speculativ
 					writeFile: (target, content) => track(async () => {
 						const { file, key, captured } = await fileInput(target);
 						// Even an equal-content native write performs permission checks and touches the inode.
-						record(key, { ...captured, accessMode: changes.get(key)?.accessMode, validationOnly: undefined,
-							after: Buffer.from(content), operation: "write_contents" });
+						record(key, { ...captured, accessMode: changes.get(key)?.accessMode, validationOnly: undefined, after: Buffer.from(content), operation: "write_contents" });
 						await writeFile(file, content, "utf8");
 					}),
 					mkdir: (target) => track(async () => {
@@ -770,9 +771,7 @@ async function executeMutation(state: WorkspaceSandboxState, context: Speculativ
 				}, context);
 			} finally { await lifetime.close(() => {}); if (failure) throw failure.error; context.signal.throwIfAborted(); }
 			for (const [key, change] of changes) {
-				if (change.kind === "directory" && !change.validationOnly) record(key, {
-					...change, after: await readSandboxDirectoryState(await physical(change.target)),
-				});
+				if (change.kind === "directory" && !change.validationOnly) record(key, { ...change, after: await readSandboxDirectoryState(await physical(change.target)) });
 				else if (change.kind !== "directory" && !change.validationOnly &&
 					!sameOptionalBytes((await readRegularState(await physical(change.target)))?.content, change.after)) {
 					throw new Error("Workspace writes did not settle to their declared bytes");
@@ -873,7 +872,7 @@ async function createPrivateSandboxWorkspace(state: WorkspaceSandboxState, cwd: 
 	let attached: PreparedGitWorkspace | undefined;
 	let sharedBaseline: SharedOverlayBaseline | undefined;
 	let overlay: LinuxOverlayfsMount | undefined;
-	let overlayStorageRoot: string | undefined;
+	let overlayStorageRoot: string | undefined, cursor: ResourceVersionToken | undefined;
 	let workspace!: PrivateSandboxWorkspace;
 	let disposal: Promise<void> | undefined;
 	const dispose = (unsafe = false): Promise<void> => disposal ??= (async () => {
@@ -890,22 +889,24 @@ async function createPrivateSandboxWorkspace(state: WorkspaceSandboxState, cwd: 
 			} else await attached?.dispose().catch((error) => failures.push(error));
 			if (overlayStorageRoot) { await rm(overlayStorageRoot, { recursive: true, force: true }).catch((error) => failures.push(error)); }
 			if (sharedBaseline) releaseOverlayBaseline(sharedBaseline);
+			cursor?.release();
 			releaseSandboxRepository(pool);
 		}
 		if (failures.length) throw new AggregateError(failures, "sandbox workspace cleanup failed");
 	})();
 	try {
 		const prepared = typeof preparation === "object" ? preparedWorkspaceBaselines.get(preparation) : undefined;
-		const baseline = prepared?.repository === pool && typeof preparation === "object" && preparation.driver === driver
-			? prepared.baseline : await acquireSandboxBaseline(pool, preparation === capturedWorkspaceInputs);
+		// A live lower is the workspace itself: what changed since now stands in for a baseline of its bytes.
+		cursor = driver === "overlayfs" && (overlayOptions as WorkspaceSandboxOptions).liveLower ? await pool.versions.observeChanges() : undefined;
+		const liveBase = cursor && await captureLiveBase(pool);
+		const baseline = liveBase ? { commit: "", tree: "", version: cursor!, aliases: [] } : prepared?.repository === pool && typeof preparation === "object" &&
+			preparation.driver === driver ? prepared.baseline : await acquireSandboxBaseline(pool, preparation === capturedWorkspaceInputs);
 		const { commit } = baseline;
 		let sandboxRoot: string, processRoot: string, gitDirectory: string, openTransactionClock: () => Promise<FileHandle>;
 		let transactionClockLinks: 0 | 1, transactionClockRoots: readonly string[], overlayDevice: string | undefined;
 		const observationExcludes: readonly string[] = SNAPSHOT_EXCLUDES;
-		let liveBase: WorkspaceStructureSnapshot | undefined;
 		if (driver === "overlayfs") {
-			liveBase = (overlayOptions as WorkspaceSandboxOptions).liveLower ? await captureLiveBase(pool, baseline.version) : undefined;
-			// A live lower is the workspace itself: only a snapshot lower needs the baseline checked out.
+			// Only a snapshot lower needs the baseline checked out.
 			if (!liveBase) sharedBaseline = await acquireOverlayBaseline(pool, baseline);
 			overlayStorageRoot = await mkdtemp(path.join(pool.parent, "overlay-storage-"));
 			processRoot = path.join(overlayStorageRoot, "process");
@@ -929,12 +930,7 @@ async function createPrivateSandboxWorkspace(state: WorkspaceSandboxState, cwd: 
 				await chmod(path.join(upper, directory), (await lstat(path.join(lowerRoot, directory))).mode & 0o777);
 				await copyTimes(directory);
 			}
-			const mounted = await mountLinuxOverlayfs({
-				lowerRoot,
-				privateRoot: overlayStorageRoot,
-				options: overlayOptions,
-				capabilityRegistry: state.overlayfsCapabilities,
-			});
+			const mounted = await mountLinuxOverlayfs({ lowerRoot, privateRoot: overlayStorageRoot, options: overlayOptions, capabilityRegistry: state.overlayfsCapabilities });
 			overlay = mounted;
 			// FUSE overlays count a file's links by the names they have loaded: list each alias's directory before anything stats one.
 			for (const directory of new Set(aliasGroups.flat().map(name => path.dirname(name)))) await readdir(path.join(mounted.root, directory));
@@ -977,6 +973,7 @@ async function createPrivateSandboxWorkspace(state: WorkspaceSandboxState, cwd: 
 			sourceChanges: () => pool.versions.changesSince(baseline.version),
 			indexGit: bindGit(gitBinary, sandboxRoot, ["--git-dir", gitDirectory, "--work-tree", sandboxRoot]),
 			readBase: liveBase ? (resource, maxBytes) => readLiveBase(liveBase!, resource, maxBytes) : (resource, maxBytes) => readGitTreeRegularState(pool.git, commit, resource, maxBytes),
+			...(liveBase ? { liveBase } : {}),
 			openTransactionClock, transactionClockLinks, transactionClockRoots, dispose,
 			...(overlay ? { overlay } : {}),
 			...(sharedBaseline ? { sharedBaseline } : {}),
@@ -1196,9 +1193,7 @@ async function createGitWorkspaceTransactionDriver(workspace: PrivateSandboxWork
 		await advanceFilesystemClock(clock.handle, boundary, clock.identity);
 	}
 
-	const abort = (capture: Capture): Promise<void> => withWorkspaceLock(lock, async () => {
-		if (active.delete(capture)) for (const other of active) other.contaminated = true;
-	});
+	const abort = (capture: Capture): Promise<void> => withWorkspaceLock(lock, async () => { if (active.delete(capture)) for (const other of active) other.contaminated = true; });
 
 	const dispose = (): Promise<void> => withWorkspaceLock(lock, async () => {
 		for (const capture of active) capture.contaminated = true;
@@ -1647,8 +1642,7 @@ async function materializeCheckpoint(workspace: PrivateSandboxWorkspace, checkpo
 
 async function collectSandboxChanges(workspace: PrivateSandboxWorkspace, frontier?: readonly string[]): Promise<readonly SandboxFileChange[]> {
 	const detected = frontier ?? (workspace.overlay ? await collectOverlayChangeResources(workspace) : await collectGitChangeResources(workspace));
-	const resources = [...new Set([...detected, ...(frontier ? [] : workspace.baselineFrontier.keys())])].filter((resource) => !isSnapshotExcluded(slash(resource)))
-		.sort();
+	const resources = [...new Set([...detected, ...(frontier ? [] : workspace.baselineFrontier.keys())])].filter((resource) => !isSnapshotExcluded(slash(resource))).sort();
 	const changes: SandboxFileChange[] = [];
 	for (const resource of resources) {
 		if (!resource || path.isAbsolute(resource) || resource.split("/").includes("..")) throw new Error(`invalid sandbox change path: ${resource}`);
@@ -1792,9 +1786,10 @@ async function collectOverlayChangeResources(
 	if (!workspace.overlay) throw new Error("OverlayFS change journal is unavailable");
 	const resources = new Set<string>();
 	const addBaselineSubtree = async (resource: string) => {
-		const prefix = resource || ".";
-		const tree = await workspace.pool.git(["ls-tree", "-r", "-z", "--full-tree", workspace.commit, "--", prefix], { environment: { GIT_OPTIONAL_LOCKS: "0" } });
-		for (const record of parseNullList(tree)) {
+		const prefix = resource || ".", within = resource ? `${path.normalize(resource)}${path.sep}` : "";
+		const tree = workspace.liveBase ? [...workspace.liveBase.entries].flatMap(([name, entry]) => entry.kind !== "directory" && name.startsWith(within) ? [`\t${slash(name)}`] : [])
+			: parseNullList(await workspace.pool.git(["ls-tree", "-r", "-z", "--full-tree", workspace.commit, "--", prefix], { environment: { GIT_OPTIONAL_LOCKS: "0" } }));
+		for (const record of tree) {
 			const separator = record.indexOf("\t");
 			if (separator === -1) throw new Error(`invalid Git subtree entry: ${resource}`);
 			const candidate = record.slice(separator + 1);
@@ -1814,14 +1809,16 @@ async function collectOverlayChangeResources(
 
 /** The workspace's own structure for a live lower; undefined keeps the snapshot (copy-up splits hard links, and a
  * truncated walk cannot vouch for what it skipped). */
-async function captureLiveBase(pool: PooledGitRepository, version: ResourceVersionToken): Promise<WorkspaceStructureSnapshot | undefined> {
+async function captureLiveBase(pool: PooledGitRepository): Promise<WorkspaceStructureSnapshot | undefined> {
 	const cached = pool.liveBase, changes = cached && pool.versions.changesSince(cached.version);
 	if (cached && changes && !changes.uncertain && !changes.paths.length) return cached.structure;
+	const version = await pool.versions.observeChanges();
 	const structure = await captureWorkspaceStructure(pool.sourceRoot, { maxFiles: WORKSPACE_TRANSACTION_MAX_FILES, exclude: SNAPSHOT_EXCLUDES });
-	if (!structure.complete) return undefined;
+	if (!structure.complete) { version.release(); return undefined; }
 	const live = Object.freeze({ ...structure, entries: new Map([...structure.entries].map(([resource, entry]) =>
 		[resource, entry.kind === "file" ? { ...entry, contentPath: path.join(pool.sourceRoot, resource) } : entry])) });
-	pool.liveBase = { version, structure: live };
+	if (pool.liveBase !== cached) version.release();
+	else { cached?.version.release(); pool.liveBase = { version, structure: live }; }
 	return live;
 }
 
