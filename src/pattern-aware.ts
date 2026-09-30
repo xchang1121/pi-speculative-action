@@ -1147,10 +1147,7 @@ export class PatternAwareStore {
 		if (!this.persistenceFile || !this.loaded) return;
 		this.dirty = true;
 		if (this.persistTimer) return;
-		this.persistTimer = setTimeout(() => {
-			this.persistTimer = undefined;
-			void this.flush().catch(() => undefined);
-		}, PERSIST_CHECKPOINT_INTERVAL_MS);
+		this.persistTimer = setTimeout(() => { this.persistTimer = undefined; void this.flush().catch(() => undefined); }, PERSIST_CHECKPOINT_INTERVAL_MS);
 		this.persistTimer.unref?.();
 	}
 
@@ -1170,8 +1167,7 @@ export class PatternAwareStore {
 			eventIDs.set(key, id);
 			return id;
 		};
-		const pools = this.rankedPools()
-			.slice(0, this.settings.maxPatterns)
+		const pools = this.rankedPools().slice(0, this.settings.maxPatterns)
 			.map(
 				(pool): PersistedPatternPool => ({
 					...pool,
