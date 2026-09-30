@@ -115,11 +115,7 @@ export async function waitForCandidate<T>(
 
 export type SchedulerAdmission =
 	| { readonly admitted: true; readonly work: ScheduledWork }
-	| {
-			readonly admitted: false;
-			readonly work: ScheduledWork;
-			readonly reason: "budget_exhausted" | "not_profitable" | "failure_circuit";
-	  };
+	| { readonly admitted: false; readonly work: ScheduledWork; readonly reason: "budget_exhausted" | "not_profitable" | "failure_circuit"; };
 
 export type WorldCompatibilityDecision =
 	| { readonly compatible: true }
@@ -187,9 +183,7 @@ export class SpeculationScheduler<Job extends object> {
 		return entry.work;
 	}
 
-	complete(job: Job): boolean {
-		return this.entries.delete(job);
-	}
+	complete(job: Job): boolean { return this.entries.delete(job); }
 
 	/** Choose cancellation victims; only their executor completion returns physical capacity. */
 	preemptFor(
@@ -293,9 +287,7 @@ export class SpeculationScheduler<Job extends object> {
 			this.observeTiming(this.speculativeOverheads, { ...identity, actionKeyHash: undefined }, Math.max(0.001, speculative - native));
 	}
 
-	observeAdoption(identity: ServiceTimingIdentity, durationMs: number): void {
-		this.observeTiming(this.adoptionTimes, identity, durationMs);
-	}
+	observeAdoption(identity: ServiceTimingIdentity, durationMs: number): void { this.observeTiming(this.adoptionTimes, identity, durationMs); }
 
 	/**
 	 * Decide whether the Actor should adopt speculative work. A rejected candidate keeps
@@ -444,14 +436,9 @@ class SampleWindow {
 	private lowerBound = 0;
 	private sortedValues?: number[];
 	private suppressedSinceProbe = 0;
-	private failures?: {
-		readonly count: number;
-		readonly decisions: WeakMap<object, { readonly sequence: number; readonly allowed: boolean }>;
-	};
+	private failures?: { readonly count: number; readonly decisions: WeakMap<object, { readonly sequence: number; readonly allowed: boolean }>; };
 
-	get count(): number {
-		return this.values.length;
-	}
+	get count(): number { return this.values.length; }
 
 	observe(value: number): void {
 		this.failures = undefined;
@@ -466,10 +453,7 @@ class SampleWindow {
 
 	observeLowerBound(value: number): void { this.lowerBound = Math.max(this.lowerBound, finite(value)); }
 
-	observeFailure(): void {
-		this.failures = { count: (this.failures?.count ?? 0) + 1, decisions: new WeakMap() };
-		this.suppressedSinceProbe = 0;
-	}
+	observeFailure(): void { this.failures = { count: (this.failures?.count ?? 0) + 1, decisions: new WeakMap() }; this.suppressedSinceProbe = 0; }
 
 	/** Dispatch repeats do not consume probes; retained work can probe again after the next Actor decision. */
 	allowExecution(job: object, sequence: number): boolean {

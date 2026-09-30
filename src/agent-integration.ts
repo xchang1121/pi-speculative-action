@@ -88,9 +88,7 @@ export interface CreateSpeculativeActionHostOptions extends Omit<Parameters<type
 	 * Non-interactive permission and policy check for speculative execution.
 	 * Candidates are rejected when this callback is absent.
 	 */
-	readonly preflight?: (
-		context: SpeculativeAgentPreflightContext,
-	) => boolean | CandidatePreflight | Promise<boolean | CandidatePreflight>;
+	readonly preflight?: (context: SpeculativeAgentPreflightContext) => boolean | CandidatePreflight | Promise<boolean | CandidatePreflight>;
 	/** Canonical K(a), projection, and resource-version semantics for this host. */
 	readonly actionSemantics?: ActionSemanticsRegistry;
 	/** Lossless Π rules; each rule owns key relation, realized coverage, and output reconstruction. */
@@ -134,9 +132,7 @@ export interface SpeculativeActionHost {
 		AgentConsumeInput,
 		AgentConsumeInput
 	>;
-	readonly executionWorldDiagnostics: (
-		refresh?: boolean,
-	) => Promise<readonly ExecutionWorldDiagnosticSnapshot[]>;
+	readonly executionWorldDiagnostics: (refresh?: boolean) => Promise<readonly ExecutionWorldDiagnosticSnapshot[]>;
 	readonly startTurn: (input: Omit<AgentStartInput, "sessionID">, signal?: AbortSignal) => Promise<void>;
 	readonly previewActorTool: (input: { readonly turnID: string; readonly tool: string }, signal?: AbortSignal) => Promise<void>;
 	/** Raw streamed arguments; preparation is provisional and never binds the final Actor call. */
@@ -271,9 +267,7 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 				void Promise.all(names.filter((name) => input.tools.some((tool) => tool.name === name))
 					.map((tool) => resolveExecutionRoute(tool, signal))).catch(() => {});
 			},
-			schemaHashes: definitionSchemaHashes(
-				input.tools.map((tool) => ({ name: tool.name, inputSchema: tool.parameters })),
-			),
+			schemaHashes: definitionSchemaHashes(input.tools.map((tool) => ({ name: tool.name, inputSchema: tool.parameters }))),
 		}),
 		actionKey: async (toolName, input, context) => {
 			let tool: AgentTool | undefined;

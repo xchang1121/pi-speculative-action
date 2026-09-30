@@ -334,9 +334,7 @@ export class LinuxHeldExecBoundary {
 			const request = parseRequest(await readLine(socket));
 			active = request?.token === this.token ? this.active.get(request.execution) : undefined;
 			active?.pending.add(pending);
-			if (!request || !active || !(await heldBy(request.pid, request.tracer, this.shellPath))) {
-				return void socket.end("C\n");
-			}
+			if (!request || !active || !(await heldBy(request.pid, request.tracer, this.shellPath))) { return void socket.end("C\n"); }
 			active.signal?.throwIfAborted();
 			const decision = await active.decide({
 				id: `${request.execution}:${++active.sequence}`,
@@ -395,9 +393,7 @@ export class LinuxHeldExecBoundary {
 				await write(socket, Buffer.from(`O ${event.fd} ${event.data.length}\n`));
 				await write(socket, event.data);
 			}
-			if (continuation) {
-				await write(socket, physicalRoot); await write(socket, sourceRoot); await write(socket, continuation.image);
-			}
+			if (continuation) { await write(socket, physicalRoot); await write(socket, sourceRoot); await write(socket, continuation.image); }
 			const acknowledgement = await readLine(socket);
 			if (acknowledgement === "N") { prepared = false; return void socket.end(); }
 			if (acknowledgement !== "A") throw new Error("held-exec adoption was not acknowledged");
@@ -662,10 +658,7 @@ async function readLine(socket: net.Socket): Promise<string> {
 			socket.off("close", onEnd);
 			socket.off("error", onError);
 		};
-		const finish = (error?: unknown, value?: string) => {
-			cleanup();
-			error ? reject(error) : resolve(value ?? "");
-		};
+		const finish = (error?: unknown, value?: string) => { cleanup(); error ? reject(error) : resolve(value ?? ""); };
 		const onData = (chunk: Buffer) => {
 			body += chunk.toString("utf8");
 			const newline = body.indexOf("\n");

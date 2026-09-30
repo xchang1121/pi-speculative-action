@@ -80,10 +80,7 @@ export class ProcessExecutionCoordinator {
 		return this.actorDiagnostics();
 	}
 
-	async dispose(): Promise<void> {
-		this.disposed = true;
-		await this.resetActorRoute();
-	}
+	async dispose(): Promise<void> { this.disposed = true; await this.resetActorRoute(); }
 
 	/** Bind an executor to exactly one tool execution and every async child it creates. */
 	runWith<Value>(executor: ProcessExecutor, operation: () => Promise<Value>): Promise<Value> {

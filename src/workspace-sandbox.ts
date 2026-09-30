@@ -1137,10 +1137,12 @@ async function createGitWorkspaceTransactionDriver(workspace: PrivateSandboxWork
 		const { after, capturedAt, paths } = settled, before = capture.before!, owned = await ownership!().catch(() => undefined);
 		const incomplete = (reason: string) => ({ complete: false, changes: [], reason, before, after });
 		if (!owned) return incomplete("overlapping_workspace_transaction");
-		for (const foreign of [...capture.racing, ...paths.filter(resource => !owned.written.has(resource))]) {
+		// What lies under a directory it made or moved in (a session directory renamed on completion) is its own too.
+		const mine = (resource: string): boolean => owned.written.has(resource) || resource.includes("/") && mine(path.posix.dirname(resource));
+		for (const foreign of [...capture.racing, ...paths.filter(resource => !mine(resource))]) {
 			if (owned.observed.has(foreign) || owned.observed.has(path.dirname(foreign).replace(/^\.$/, ""))) return incomplete(`overlapping_workspace_input:${foreign}`);
 		}
-		const own = paths.filter(resource => owned.written.has(resource));
+		const own = paths.filter(mine);
 		const late = own.find(resource => Math.floor(after.entries.get(resource)?.changeTimeMs ?? -Infinity) > owned.endedAt);
 		if (late !== undefined) return incomplete(`overlapping_workspace_write:${late}`);
 		if (own.length && await owned.interfered(new Set(own), capturedAt)) return incomplete("overlapping_workspace_write");
@@ -1165,7 +1167,7 @@ async function createGitWorkspaceTransactionDriver(workspace: PrivateSandboxWork
 		// Directories this interval made or removed are its own too; everything else stays as it began.
 		for (const name of new Set([...before.entries.keys(), ...after.entries.keys()])) {
 			const entry = after.entries.get(name), previous = before.entries.get(name);
-			if (!owned.written.has(name) || (entry ?? previous)?.kind !== "directory") continue;
+			if (!mine(name) || (entry ?? previous)?.kind !== "directory") continue;
 			if (entry) entries.set(name, entry); else entries.delete(name);
 		}
 		return { complete: true, changes, before, after: workspaceStructureSnapshot(after.root, entries, after.complete) };

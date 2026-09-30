@@ -140,13 +140,18 @@ interface DispatcherRequest {
 	readonly context: ProcessExecutionContext;
 	/** Present when a bypass will exec the native image in place of this process. */
 	readonly pid?: number;
+	/** Inherited pipes beyond stdio as the launcher sees them now: each end, and its queue unconsumed. */
+	readonly descriptors?: readonly { readonly fd: number; readonly alias: number; readonly device: string; readonly inode: string; readonly flags: number;
+		readonly capacity: number; readonly eof: boolean; readonly queueHex: string }[];
 }
 
 /** The outlet each target output uses; 0 discards into /dev/null. */
 type OutputRoute = readonly [0 | 1 | 2, 0 | 1 | 2];
-type RequestEligibility = { readonly route: OutputRoute } | { readonly reason: string };
+type RequestEligibility = { readonly route: OutputRoute; readonly outputPipes?: readonly [boolean, boolean] } | { readonly reason: string };
+/** A brokered run's net effect on an inherited pipe of one repeated byte, applied by the launcher to its own end. */
+type StreamDelta = { readonly fd: number; readonly byte: number; readonly delta: number };
 type ProcessArguments = Pick<DispatcherRequest, "argv0" | "args" | "cwd" | "environment"> & {
-	readonly closeStdin?: boolean; readonly resources?: ProcessResourceGraph; readonly outputPipes?: readonly [boolean, boolean];
+	readonly closeStdin?: boolean; readonly resources?: ProcessResourceGraph; readonly outputPipes?: readonly [boolean, boolean]; readonly streams?: true; // inherited pipes settled by net deltas
 };
 type BoundProcessInvocation = ProcessArguments & {
 	readonly sourceRoot: string;
@@ -163,6 +168,7 @@ interface DispatcherResponse {
 	readonly output?: readonly { readonly fd: 1 | 2; readonly data: string }[];
 	readonly exit?: ExitOutcome;
 	readonly weakKey?: Sha256Digest;
+	readonly streams?: readonly StreamDelta[];
 }
 
 interface ActiveSession {
@@ -198,6 +204,8 @@ interface ActiveSession {
 	topLevelOutputEndpoints?: readonly [string, string];
 	/** Output sockets of running brokered children: their own children write there, and those bytes reach the child's capture. */
 	readonly nestedOutputEndpoints: Set<readonly [string, string]>;
+	/** Each exec interception with the image it reaches. */
+	interposedImages?: Promise<readonly (readonly [ExecMount, string | undefined])[]>;
 	sealPromise?: Promise<readonly SandboxWorkspaceChange[]>;
 	closing?: Promise<void>;
 }
@@ -334,7 +342,8 @@ export class LinuxProcessReuseBackend {
 							const invocation = this.handoffs.resolveBinding(binding, request.scope);
 							if (invocation && ("trackingOnly" in invocation || invocation.resources?.handles.length) && invocation.sourceRoot === path.resolve(options.sourceRoot)) return true;
 						}
-						return this.observations.getStore()?.learn ? "inspect" : false;
+						// A speculative producer may hold an inherited-pipe result: its launch identity includes those descriptors.
+						return this.observations.getStore()?.learn || this.hasLiveResults ? "inspect" : false;
 					},
 					decide: (process) => this.decideHeldExec(process, process.scope),
 				}, host);
@@ -762,7 +771,8 @@ export class LinuxProcessReuseBackend {
 		const requestID = session.metrics.requests;
 		const ready = await this.resolveReady();
 		const executable = await this.resolveRequestedExecutable(session, request);
-		const eligibility = await eligibleRequest(session, request, ready.executionContext);
+		const resources = request.descriptors && await this.inheritedPipes(request).catch((error: unknown) => `inherited_pipes:${errorMessage(error)}`);
+		const eligibility = typeof resources === "string" ? { reason: resources } : await eligibleRequest(session, request, ready.executionContext);
 		if ("reason" in eligibility) {
 			this.add(session, "bypasses");
 			const reason = `broker_bypass:${request.name}:${eligibility.reason}`;
@@ -771,7 +781,19 @@ export class LinuxProcessReuseBackend {
 			return { kind: "bypass", executable };
 		}
 		const { argv0, args, cwd, environment } = request;
-		return this.executeRequest(session, { argv0, args, cwd, environment }, executable, eligibility.route, requestID, undefined, undefined, request.pid);
+		return this.executeRequest(session, { argv0, args, cwd, environment, ...(typeof resources === "object" ? { resources, streams: true as const } : {}),
+			...(eligibility.outputPipes ? { outputPipes: eligibility.outputPipes } : {}) }, executable, eligibility.route, requestID, undefined, undefined, request.pid);
+	}
+
+	/** A pipe of one repeated byte (a jobserver's tokens) ends as it began whatever order its bytes move in: only those are brokered. */
+	private async inheritedPipes(request: DispatcherRequest): Promise<ProcessResourceGraph> {
+		// Only a pipe it both reads and writes, as a jobserver's clients do: a producer elsewhere could leave a snapshot waiting forever.
+		const ends = (inode: string, access: number) => request.descriptors!.some(entry => entry.inode === inode && (entry.flags & 3) === access);
+		if (request.pid === undefined || request.descriptors!.some(({ inode, queueHex }) => new Set(queueHex.match(/../g)).size > 1 || !ends(inode, 0) || !ends(inode, 1)))
+			throw new Error("not_uniform");
+		return captureHeldDescriptorInputs(request.pid, request.descriptors!.map(({ fd, alias, device, inode, flags, capacity, eof, queueHex }) =>
+			({ fd, alias, device, inode, flags, capacity, eof, queueHex, type: "pipe" as const, offset: 0, owned: false, outside: 3 })),
+		Math.min(MAX_REQUEST_BYTES / 2, this.store.limits.maxBytes), sensitivePaths(this.options.storeRoot, this.options.deniedPaths));
 	}
 
 	private async executeBinding(session: ActiveSession, binding: ProcessExecutionBinding) {
@@ -806,7 +828,7 @@ export class LinuxProcessReuseBackend {
 		);
 		if (acquired.plan?.kind === "completed_replay") {
 			const before = captureWorkspace ? await session.workspace.structure.capture() : undefined;
-			const result = await this.replay(session, acquired.plan, weakKey, acquired);
+			const result = await this.replay(session, acquired.plan, weakKey, acquired, request.streams && descriptorInputs(request.resources!));
 			if (before) captureWorkspace!({ before, after: await session.workspace.structure.capture() });
 			const binding = acquired.producer?.binding;
 			if (binding && this.handoffs.resolveBinding(binding, session.scope)) session.executionBindings.set(requestID, binding);
@@ -1051,6 +1073,7 @@ export class LinuxProcessReuseBackend {
 		plan: Extract<ProcessReusePlan, { kind: "completed_replay" }>,
 		weakKey: Sha256Digest,
 		acquired: { readonly joined: boolean; readonly producer?: ProcessHandoff; readonly waiting?: readonly TimelineInterval[] },
+		inputs?: ReturnType<typeof descriptorInputs>,
 	): Promise<DispatcherResponse> {
 		const started = performance.now();
 		let replayed = false;
@@ -1062,7 +1085,9 @@ export class LinuxProcessReuseBackend {
 			this.recordHit(acquired.producer?.scope, acquired.joined, session);
 			session.computations.push(reusedComputation(certificate.result, started, acquired));
 			replayed = true;
-			return { kind: "hit", weakKey, output, exit: certificate.result.exit };
+			const streams = inputs && streamDeltas(inputs, (certificate.result.resources?.transitions ?? []).map(event => ({ alias: event.id, kind: event.kind, data: artifacts.read(event.data) })));
+			if (inputs && !streams) return { kind: "hit", weakKey, output: [], exit: { kind: "code", code: 125 } };
+			return { kind: "hit", weakKey, output, exit: certificate.result.exit, ...(streams?.length ? { streams } : {}) };
 		} finally {
 			this.add(session, "replayMs", Math.max(0, performance.now() - started));
 			const observed = plan.certificate.result.observedProcessMs;
@@ -1092,6 +1117,7 @@ export class LinuxProcessReuseBackend {
 		let releaseInputs: (() => void) | undefined, inputCheck: Promise<boolean> | undefined;
 		let stage = "capture", dependencyCertificate: DynamicDependencyCertificate | undefined, certificateID: Sha256Digest | undefined;
 		let continuation: ProcessContinuation | undefined, frozen: { pid: number; fd: number; syscall: string; bytes: number } | undefined;
+		const executedStreams: { alias: number; kind: string; data: Buffer }[] = [];
 		let suspensionAttempted = false, writer: ActiveSession["writers"] extends Set<infer Writer> ? Writer | undefined : never;
 		const failureDetail = (error: unknown) => `${errorMessage(error)}; process=${JSON.stringify({
 			stage, requestID, weakKey, scope: session.scope, workspace: session.workspace.sandboxRoot,
@@ -1101,8 +1127,10 @@ export class LinuxProcessReuseBackend {
 			traceRoot = await mkdtemp(path.join(session.workspace.processRoot, "trace-"));
 			const tracePrefix = path.join(traceRoot, "process");
 			const logicalExecutable = session.projection.toLogical(executable);
-			// The child's own image runs native: intercepting it again would broker the child to itself.
-			const image = session.interposition.executables.find(([intercepted]) => intercepted === logicalExecutable)?.[1] ?? logicalExecutable;
+			// The child's own image is not intercepted in its sandbox: that would broker the child to itself.
+			const images = await (session.interposedImages ??= Promise.all(session.interposition.execMounts.map(async mount =>
+				[mount, mount.alias ? undefined : await realpath(mount.virtualPath).catch(() => undefined)] as const)));
+			const execMounts = images.flatMap(([mount, target]) => target === executable || mount.virtualPath === logicalExecutable ? [] : [mount]), image = logicalExecutable;
 			const logicalCwd = session.projection.toLogical(request.cwd);
 			let descriptorManifest: string | undefined, descriptorReportPath: string | undefined;
 			const directoryImages: Array<readonly [string, string]> = [];
@@ -1201,7 +1229,7 @@ export class LinuxProcessReuseBackend {
 						...[...descriptorImages.values()].filter(image => !image.workspace).map(image => image.physical)],
 					[{ virtualPath: session.sourceRoot, hostPath: session.workspace.sandboxRoot, readOnly: false },
 						...(session.gitDirectory ? [{ virtualPath: session.gitDirectory, hostPath: session.gitDirectory, readOnly: true }] : []), ...session.interposition.mounts],
-					session.interposition.execMounts,
+					execMounts,
 				),
 				...inheritedFiles.flatMap((_, index) => ["--preserve-fd", String(index + 3)]),
 				...directoryImages.flatMap(([directory, image]) => ["--directory-image", sandboxMountArgument({ virtualPath: directory, hostPath: image, readOnly: false })]),
@@ -1276,7 +1304,7 @@ export class LinuxProcessReuseBackend {
 				if (suspensionAttempted && !continuation) throw new Error("private process suspension was not sealed");
 				const descriptorOffsets = descriptorReport && inputs.length ? parseDescriptorOffsets(await descriptorReport.readFile(), inputs) : undefined;
 				transactionFinishing = true;
-				const observing = observeStrace(tracePrefix, image, session.projection.toLogical(request.cwd), { interposedExecutables: session.interposition.executables,
+				const observing = observeStrace(tracePrefix, image, session.projection.toLogical(request.cwd), { interposedExecutables: session.interposition.executables.filter(([intercepted]) => intercepted !== image),
 						...(frozen ? { frozen } : {}), ...(outputEndpoints ? { outputEndpoints } : {}),
 						guardFilesystemSemanticsWithin: [session.workspace.sandboxRoot, session.sourceRoot],
 						inheritedDirectoryImages: directoryImages.flatMap(([physical]) => [physical, session.projection.toLogical(physical)]),
@@ -1395,6 +1423,7 @@ export class LinuxProcessReuseBackend {
 						(event.description !== undefined ? input.alias === event.description : event.kind === "produce" ? (input.flags & 3) !== 0 :
 							!["consume", "peek"].includes(event.kind) || (input.flags & 3) !== 1));
 					if (!input) throw new Error("unbound stream transition");
+					executedStreams.push({ alias: input.alias, kind: event.kind, data: event.data });
 					transitions.push({ id: input.alias, kind: event.kind, data: await this.store.artifacts.put(event.data), ...(event.requested !== undefined ? { requested: event.requested } : {}) });
 				}
 				const { exit, ...prefixResult } = baseResult;
@@ -1439,7 +1468,9 @@ export class LinuxProcessReuseBackend {
 			}
 			if (continuation) return { kind: "suspended", weakKey };
 			const exit = exitOutcome(outcome);
-			return { kind: "executed", weakKey, output: wireOutput(outcome.output), exit };
+			const streams = request.streams && streamDeltas(descriptorInputs(request.resources!), [...executedStreams]);
+			if (streams === undefined && request.streams) return { kind: "executed", weakKey, output: [], exit: { kind: "code", code: 125 } };
+			return { kind: "executed", weakKey, output: wireOutput(outcome.output), exit, ...(streams?.length ? { streams } : {}) };
 		} catch (error) {
 			if (stage !== "capture" || captureWorkspace || session.signal.aborted || work.signal.aborted) throw error;
 			const detail = failureDetail(error);
@@ -2406,7 +2437,29 @@ async function acquireOutputChannels(signal?: AbortSignal) {
 function wireResponse(response: DispatcherResponse): Buffer {
 	const frames = (response.output ?? []).flatMap(({ fd, data }) => [Buffer.from(`o${fd} ${Buffer.byteLength(data, "base64")}\n`), Buffer.from(data, "base64")]);
 	const exit = response.exit, end = response.kind === "bypass" ? "b" : exit?.kind === "signal" ? `s ${exit.signal}` : `x ${exit?.kind === "code" ? exit.code : 125}`;
-	return Buffer.concat([...frames, Buffer.from(`${end}\n`)]);
+	return Buffer.concat([...frames, ...(response.streams ?? []).map(({ fd, byte, delta }) => Buffer.from(`u${fd} ${byte} ${delta}\n`)), Buffer.from(`${end}\n`)]);
+}
+
+/** Net bytes a run moved through each inherited pipe, applied at the end that can: undefined when not one repeated byte. */
+function streamDeltas(inputs: ReturnType<typeof descriptorInputs>, events: readonly { readonly alias: number; readonly kind: string; readonly data: Buffer }[]): StreamDelta[] | undefined {
+	const net = new Map<number, { delta: number; bytes: Set<number> }>();
+	for (const input of inputs) if (input.type === "pipe") {
+		const entry = net.get(input.image) ?? net.set(input.image, { delta: 0, bytes: new Set() }).get(input.image)!;
+		for (const byte of Buffer.from(input.content ?? "", "base64")) entry.bytes.add(byte);
+	}
+	for (const { alias, kind, data } of events) {
+		const image = inputs.find(input => input.alias === alias)?.image, entry = image === undefined ? undefined : net.get(image);
+		if (kind === "release" || kind === "peek") continue; else if (!entry || kind !== "produce" && kind !== "consume") return undefined;
+		entry.delta += kind === "produce" ? data.length : -data.length;
+		for (const byte of data) entry.bytes.add(byte);
+	}
+	const deltas: StreamDelta[] = [];
+	for (const [image, { delta, bytes }] of net) {
+		if (bytes.size > 1) return undefined;
+		const end = delta && inputs.find(input => input.image === image && input.installed !== false && (input.flags & 3) === (delta > 0 ? 1 : 0));
+		if (delta && !end) return undefined; else if (end) deltas.push({ fd: end.fd, byte: [...bytes][0]!, delta });
+	}
+	return deltas;
 }
 
 function parseDispatcherRequest(body: string): DispatcherRequest | undefined {
@@ -2420,6 +2473,9 @@ function parseDispatcherRequest(body: string): DispatcherRequest | undefined {
 		return typeof request.token === "string" && typeof request.name === "string" && text(request.invokedPath) && text(request.argv0) &&
 			request.argv0!.length <= 1024 * 1024 && Array.isArray(request.args) && request.args.every(text) && typeof request.cwd === "string" &&
 			!!request.environment && typeof request.environment === "object" && (request.pid === undefined || Number.isSafeInteger(request.pid) && request.pid > 0) &&
+			(request.descriptors === undefined || Array.isArray(request.descriptors) && request.descriptors.length <= 64 && request.descriptors.every(entry => entry &&
+				[entry.fd, entry.alias, entry.flags, entry.capacity].every(Number.isSafeInteger) && entry.fd > 2 && typeof entry.eof === "boolean" &&
+				[entry.device, entry.inode].every(value => typeof value === "string" && /^\d+$/.test(value)) && typeof entry.queueHex === "string" && /^(?:[0-9a-f]{2})*$/.test(entry.queueHex))) &&
 			Object.entries(request.environment).every(([name, value]) => name.length > 0 && !name.includes("=") && text(name) && text(value))
 			? request as DispatcherRequest : undefined;
 	} catch {
@@ -2442,14 +2498,17 @@ async function eligibleRequest(session: ActiveSession, request: DispatcherReques
 	// The launch key below still checks a discarded descriptor's type and flags. Both outlets belong to one captured process.
 	const endpoints = [session.topLevelOutputEndpoints, ...session.nestedOutputEndpoints].find(pair =>
 		request.context.outputEndpoints.every(endpoint => pair.includes(endpoint) || endpoint === "/dev/null")) ?? session.topLevelOutputEndpoints;
-	const routeOf = (endpoint: string) => endpoint === endpoints[0] ? 1 : endpoint === endpoints[1] ? 2 : endpoint === "/dev/null" ? 0 : undefined;
-	const route = [routeOf(request.context.outputEndpoints[0]), routeOf(request.context.outputEndpoints[1])] as const;
+	// A pipe another traced process reads (a build tool's compiler output) keeps its descriptor: the launcher writes there.
+	const pipes = request.context.outputEndpoints.map(endpoint => /^pipe:\[\d+\]$/.test(endpoint) && !endpoints.includes(endpoint)) as [boolean, boolean];
+	const routeOf = (endpoint: string, fd: 1 | 2) => pipes[fd - 1] ? fd === 2 && endpoint === request.context.outputEndpoints[0] ? 1 : fd
+		: endpoint === endpoints[0] ? 1 : endpoint === endpoints[1] ? 2 : endpoint === "/dev/null" ? 0 : undefined;
+	const route = [routeOf(request.context.outputEndpoints[0], 1), routeOf(request.context.outputEndpoints[1], 2)] as const;
 	if (route[0] === undefined || route[1] === undefined) return { reason: `output_endpoint_mismatch:${JSON.stringify({ expected: endpoints, observed: request.context.outputEndpoints })}` };
 	const outputRoute: OutputRoute = [route[0], route[1]];
-	const context = routedProcessContext(expectedContext, outputRoute);
+	const context = routedProcessContext(expectedContext, outputRoute, false, undefined, pipes.some(Boolean) ? pipes : undefined);
 	if (request.context.launchKey !== context.launchKey) return { reason: "launch_key_mismatch" };
 	if (request.context.umask !== context.umask) return { reason: "umask_mismatch" };
-	return { route: outputRoute };
+	return { route: outputRoute, ...(pipes.some(Boolean) ? { outputPipes: pipes } : {}) };
 }
 
 function shellArguments(invocation: ToolProcessInvocation, command: string): string[] {
