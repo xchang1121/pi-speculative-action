@@ -40,12 +40,14 @@ describe("strace provenance decoder", () => {
 			// A replay recreates a file's bytes, mode and times, never its identity: a program not known to print it sees that once.
 			const withoutIdentity = all.filter((field) => !["dev", "ino", "blksize", "blocks", "ctimeNs"].includes(field));
 			for (const [argv, expected] of [[["cat", "a.txt"], ["mode"]], [["ls"], ["mode"]], [["ls", "-la"], withoutDevice], [["find", ".", "-size", "+1k"], ["mode", "size"]],
-				[["find", ".", "-newer", "b"], withoutDevice], [["bash", "-c", "true"], withoutIdentity], [["git", "status"], withoutIdentity], [["python3", "x.py"], withoutIdentity]] as const)
+				[["find", ".", "-newer", "b"], withoutDevice], [["bash", "-c", "true"], withoutIdentity], [["git", "status"], withoutIdentity], [["python3", "x.py"], withoutIdentity],
+				[["stat", "-c", "%s %i", "a.txt"], ["mode", "size", "ino"]], [["stat", "--format=%Y", "a.txt"], ["mode", "mtimeNs"]], [["stat", "-c%a", "a.txt"], ["mode"]]] as const)
 				expect((await fields(argv)).fields, argv.join(" ")).toEqual(all.filter((field) => (expected as readonly string[]).includes(field)));
 			expect((await run(["python3", "x.py"], "/work/a.txt")).taints).toContain("descriptor_observation");
 			const directory = `newfstatat(AT_FDCWD, "/work/src", ${STAT.replace("S_IFREG", "S_IFDIR")}, 0) = 0`;
 			for (const image of ["git", "node"]) expect((await run([image, "x"], "/work/a.txt", [directory])).paths.find((item) => item.path === "/work/src")).toMatchObject({ fields: ["mode", "uid", "gid"] });
-			for (const [argv, target] of [[["stat", "a.txt"], "/work/a.txt"], [["cat", "hosts"], "/etc/hosts"], [["find", ".", "-printf", "%D %p"], "/work/a.txt"]] as const)
+			for (const [argv, target] of [[["stat", "a.txt"], "/work/a.txt"], [["stat", "-c", "%X", "a.txt"], "/work/a.txt"], [["stat", "-t", "-c", "%s", "a.txt"], "/work/a.txt"],
+				[["cat", "hosts"], "/etc/hosts"], [["find", ".", "-printf", "%D %p"], "/work/a.txt"]] as const)
 				expect((await fields(argv, target)).fields, argv.join(" ")).toBeUndefined();
 			const flags = "fcntl(4</work>, F_GETFL) = 0x38800 (flags O_RDONLY|O_NONBLOCK|O_LARGEFILE|O_NOFOLLOW|O_DIRECTORY)";
 			expect((await run(["find", "."], "/work/a.txt", ['openat(AT_FDCWD, ".", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = 4</work>', flags])).taints).not.toContain("unsupported_syscall");

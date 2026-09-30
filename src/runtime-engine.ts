@@ -170,15 +170,9 @@ function candidateBranch<Output>(
 	return execution.status === "succeeded" ? execution.output : undefined;
 }
 
-function captureCoverage<Output>(action: ActionKey, output: Output,
-	rules: readonly ActionProjectionRule<Output>[]): readonly ActionProjectionCoverage[] {
+function captureCoverage<Output>(action: ActionKey, output: Output, rules: readonly ActionProjectionRule<Output>[]): readonly ActionProjectionCoverage[] {
 	return rules.flatMap((rule) => {
-		try {
-			const value = rule.captureCoverage?.(action, output);
-			return value === undefined ? [] : [{ rule: rule.id, value: cloneSharedData(value) }];
-		} catch {
-			return [];
-		}
+		try { const value = rule.captureCoverage?.(action, output); return value === undefined ? [] : [{ rule: rule.id, value: cloneSharedData(value) }]; } catch { return []; }
 	});
 }
 
@@ -1063,16 +1057,9 @@ export function makeSpeculativeActionRuntime<
 			if (!context?.executionRoute) continue;
 			const forecast = forecastFor(node, session.decisionSequence, actorPhase);
 			const delay = session.scheduler.launchDelay(forecast);
-			if (delay <= 0) {
-				const promoted = session.plan.promote(node.proposalID, node.action.id);
-				if (promoted.status === "scheduled") immediate.push(promoted.node);
-				continue;
-			}
-			const timer = setTimeout(() => {
-				session.launchTimers.delete(node.prediction.id);
-				const promoted = session.plan.promote(node.proposalID, node.action.id);
-				if (promoted.status === "scheduled") void launchNode(session, promoted.node);
-			}, delay);
+			if (delay <= 0) { const promoted = session.plan.promote(node.proposalID, node.action.id); if (promoted.status === "scheduled") immediate.push(promoted.node); continue; }
+			const timer = setTimeout(() => { session.launchTimers.delete(node.prediction.id);
+				const promoted = session.plan.promote(node.proposalID, node.action.id); if (promoted.status === "scheduled") void launchNode(session, promoted.node); }, delay);
 			session.launchTimers.set(node.prediction.id, timer);
 		}
 		const foreground = immediate.filter((node) => !node.action.background);
