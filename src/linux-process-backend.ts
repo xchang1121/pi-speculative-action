@@ -34,7 +34,8 @@ import { emptyWorldReuseMetrics, snapshotExecutionScope, type ExecutionScope, ty
 import { type ProcessReusePlan, ProcessReusePlanner } from "./reuse-planner.ts";
 import { ProvenanceCertificateStore, type ProvenanceStoreOptions, type VerifiedArtifactClosure } from "./reuse-store.ts";
 import { SpeculationScheduler, type ServiceTimingIdentity, waitForCandidate } from "./scheduler.ts";
-import { observeStrace, straceCommand, type ObservedProcessPath, type StraceObservation } from "./strace-observer.ts";
+import { observeStrace, straceCommand, tracedWrites, type ObservedProcessPath, type StraceObservation, type TracedWrite, writesWithin } from "./strace-observer.ts";
+import type { WorkspaceTransactionOwnership } from "./workspace-transaction.ts";
 import type { ToolProcessInvocation } from "./tool-settlement.ts";
 import type { ResourceValidation } from "./settlement.ts";
 import { ProcessHandoffOwnership, ProcessHandoffRegistry, sameScope, type ProcessContinuation, type ProcessExecutionBinding, type ProcessHandoff, type ProcessHandoffLookup } from "./process-handoff.ts";
@@ -89,9 +90,7 @@ export interface LinuxProcessBackendStatus {
 
 export type LinuxProcessReuseMetrics = WorldReuseMetrics;
 type CountedReuseMetric = Exclude<keyof WorldReuseMetrics, "lastError">;
-type MutableLinuxProcessReuseMetrics = { -readonly [Key in CountedReuseMetric]: number } & {
-	lastError?: string;
-};
+type MutableLinuxProcessReuseMetrics = { -readonly [Key in CountedReuseMetric]: number } & { lastError?: string; };
 
 export interface LinuxProcessSession {
 	readonly executor: ProcessExecutor;
@@ -190,11 +189,15 @@ interface ActiveSession {
 	readonly incompleteReasons: Set<string>;
 	/** Bypasses that exec their native image in place; the top-level trace must show each one resume. */
 	readonly bypasses: [pid: number, reason: string][];
+	/** Nested executions whose workspace intervals may overlap: running ones by their live trace, settled ones by their writes. */
+	readonly writers: Set<{ readonly startedAt: number; endedAt?: number; readonly tracePrefix: string; writes?: readonly TracedWrite[]; settled?: true }>;
 	readonly metrics: MutableLinuxProcessReuseMetrics;
 	topLevelCapture?: TopLevelCapture;
 	topLevelExecution?: { readonly prototype: ExecPrototype; readonly outcome: SpawnOutcome; readonly observedProcessMs: number; };
 	topLevelEvidence?: DynamicDependencyCertificate;
 	topLevelOutputEndpoints?: readonly [string, string];
+	/** Output sockets of running brokered children: their own children write there, and those bytes reach the child's capture. */
+	readonly nestedOutputEndpoints: Set<readonly [string, string]>;
 	sealPromise?: Promise<readonly SandboxWorkspaceChange[]>;
 	closing?: Promise<void>;
 }
@@ -263,11 +266,7 @@ export class LinuxProcessReuseBackend {
 			maintain: async (operation) => {
 				this.handoffs.clearCompleted();
 				const result = await (operation === "gc" ? this.store.gc() : this.store.clear());
-				return {
-					removedEntries: result.removedCertificates,
-					removedArtifacts: result.removedArtifacts,
-					removedBytes: result.removedBytes,
-				};
+				return { removedEntries: result.removedCertificates, removedArtifacts: result.removedArtifacts, removedBytes: result.removedBytes };
 			},
 		};
 	}
@@ -290,19 +289,13 @@ export class LinuxProcessReuseBackend {
 		}
 	}
 
-	async fingerprint(): Promise<string> {
-		return (await this.resolveReady()).fingerprint;
-	}
+	async fingerprint(): Promise<string> { return (await this.resolveReady()).fingerprint; }
 
 	/** Aggregate backend counters retained for qualification and low-level diagnostics. */
-	metrics(): LinuxProcessReuseMetrics {
-		return Object.freeze({ ...this.counters });
-	}
+	metrics(): LinuxProcessReuseMetrics { return Object.freeze({ ...this.counters }); }
 
 	/** Actor-path counters, excluding child reuse performed inside speculative worlds. */
-	actorMetrics(): LinuxProcessReuseMetrics {
-		return Object.freeze({ ...this.actorCounters });
-	}
+	actorMetrics(): LinuxProcessReuseMetrics { return Object.freeze({ ...this.actorCounters }); }
 
 	/** Scoped launches; sandbox bindings are still speculative until adopted. Raw parameters are never persisted. */
 	executionBindings(scope: ExecutionScope): readonly ProcessExecutionBinding[] {
@@ -318,9 +311,7 @@ export class LinuxProcessReuseBackend {
 		try { return await run(); } finally { this.producers--; }
 	}
 
-	private get hasLiveResults(): boolean {
-		return this.producers > 0 || this.handoffs.hasResults;
-	}
+	private get hasLiveResults(): boolean { return this.producers > 0 || this.handoffs.hasResults; }
 
 	async prepareActorReplay(host: ProcessExecutor, options: ActorProcessReplayOptions, refresh = false): Promise<PreparedProcessExecutionRoute> {
 		if (process.platform !== "linux") return { state: "unavailable", detail: "Linux or WSL 2 required" };
@@ -484,7 +475,7 @@ export class LinuxProcessReuseBackend {
 			nestedEvidence: [],
 			executionBindings: new Map(),
 			computations: [],
-			incompleteReasons: new Set<string>(), bypasses: [],
+			incompleteReasons: new Set<string>(), bypasses: [], writers: new Set(), nestedOutputEndpoints: new Set(),
 			metrics: { ...emptyWorldReuseMetrics() },
 		};
 		this.producers++;
@@ -535,10 +526,7 @@ export class LinuxProcessReuseBackend {
 			executor: { execute: (request) => execute("tool", () => this.executeTopLevel(session, request)) },
 			executeBinding: (binding) => execute("operation", () => this.executeBinding(session, binding)),
 			metrics: () => Object.freeze({ ...session.metrics }),
-			seal: (changes) => {
-				session.sealPromise ??= this.withProducer(() => this.seal(session, changes));
-				return session.sealPromise;
-			},
+			seal: (changes) => { session.sealPromise ??= this.withProducer(() => this.seal(session, changes)); return session.sealPromise; },
 			validate: () => validateTransferredProcessEvidence(session.topLevelEvidence, session.incompleteReasons),
 			close: () => session.closing ??= Promise.resolve().then(async () => {
 				controller.abort(new Error("Linux process session closed"));
@@ -634,9 +622,7 @@ export class LinuxProcessReuseBackend {
 		const environment = definedProcessEnvironment(request.environment);
 		const command = request.command;
 		const logicalCwd = session.projection.toLogical(physicalCwd);
-		const prototype = await topLevelProcessPrototype(
-			session.invocation, request, environment, session.projection, ready.platformFingerprint,
-		);
+		const prototype = await topLevelProcessPrototype(session.invocation, request, environment, session.projection, ready.platformFingerprint);
 		this.add(session, "wholeCommandRequests");
 		const plan = await this.plan(
 			processWeakKey(prototype),
@@ -678,11 +664,7 @@ export class LinuxProcessReuseBackend {
 					onOutput: (event) => request.onData(event.data),
 				},
 			);
-			session.topLevelExecution = {
-				prototype,
-				outcome,
-				observedProcessMs: Math.max(0, performance.now() - processStarted),
-			};
+			session.topLevelExecution = { prototype, outcome, observedProcessMs: Math.max(0, performance.now() - processStarted) };
 			try {
 				const after = await session.workspace.structure.capture();
 				const observation = await observeStrace(tracePrefix, session.invocation.shell, logicalCwd, {
@@ -1110,7 +1092,7 @@ export class LinuxProcessReuseBackend {
 		let releaseInputs: (() => void) | undefined, inputCheck: Promise<boolean> | undefined;
 		let stage = "capture", dependencyCertificate: DynamicDependencyCertificate | undefined, certificateID: Sha256Digest | undefined;
 		let continuation: ProcessContinuation | undefined, frozen: { pid: number; fd: number; syscall: string; bytes: number } | undefined;
-		let suspensionAttempted = false;
+		let suspensionAttempted = false, writer: ActiveSession["writers"] extends Set<infer Writer> ? Writer | undefined : never;
 		const failureDetail = (error: unknown) => `${errorMessage(error)}; process=${JSON.stringify({
 			stage, requestID, weakKey, scope: session.scope, workspace: session.workspace.sandboxRoot,
 			executable: prototype.executablePath, certificateID, complete: dependencyCertificate?.complete, taints: dependencyCertificate?.taints,
@@ -1119,6 +1101,8 @@ export class LinuxProcessReuseBackend {
 			traceRoot = await mkdtemp(path.join(session.workspace.processRoot, "trace-"));
 			const tracePrefix = path.join(traceRoot, "process");
 			const logicalExecutable = session.projection.toLogical(executable);
+			// The child's own image runs native: intercepting it again would broker the child to itself.
+			const image = session.interposition.executables.find(([intercepted]) => intercepted === logicalExecutable)?.[1] ?? logicalExecutable;
 			const logicalCwd = session.projection.toLogical(request.cwd);
 			let descriptorManifest: string | undefined, descriptorReportPath: string | undefined;
 			const directoryImages: Array<readonly [string, string]> = [];
@@ -1188,7 +1172,7 @@ export class LinuxProcessReuseBackend {
 				for (const changed of changes.paths) {
 					const relative = relativeFilesystemPath(session.sourceRoot, changed);
 					if (relative === undefined || session.deniedPaths.some(denied => pathContains(denied, changed))) continue;
-					inputs ??= new Set((await observeStrace(tracePrefix, logicalExecutable, logicalCwd, { previewBytes: 1024 * 1024 }))
+					inputs ??= new Set((await observeStrace(tracePrefix, image, logicalCwd, { previewBytes: 1024 * 1024 }))
 						.paths.filter(observed => observed.role === "input").map(observed => path.resolve(observed.path)));
 					if (!inputs.has(changed)) continue;
 					const before = await transaction.readBefore(slash(relative), MAX_REQUEST_BYTES);
@@ -1209,14 +1193,15 @@ export class LinuxProcessReuseBackend {
 			const imagePath = path.join(traceRoot, "continuation");
 			const command = straceCommand(ready.strace, tracePrefix, [
 				ready.sandlock,
+				// A nested child's own children are brokered as the top level's are: a build tool's compilers run in its trace otherwise.
 				...sandboxPolicyArguments(
 					logicalCwd,
 					session.deniedPaths,
-					[session.workspace.sandboxRoot, ...(descriptorReportPath ? [descriptorReportPath] : []),
+					[session.workspace.sandboxRoot, session.socketPath, ...(descriptorReportPath ? [descriptorReportPath] : []),
 						...[...descriptorImages.values()].filter(image => !image.workspace).map(image => image.physical)],
 					[{ virtualPath: session.sourceRoot, hostPath: session.workspace.sandboxRoot, readOnly: false },
-						...(session.gitDirectory ? [{ virtualPath: session.gitDirectory, hostPath: session.gitDirectory, readOnly: true }] : [])],
-					[],
+						...(session.gitDirectory ? [{ virtualPath: session.gitDirectory, hostPath: session.gitDirectory, readOnly: true }] : []), ...session.interposition.mounts],
+					session.interposition.execMounts,
 				),
 				...inheritedFiles.flatMap((_, index) => ["--preserve-fd", String(index + 3)]),
 				...directoryImages.flatMap(([directory, image]) => ["--directory-image", sandboxMountArgument({ virtualPath: directory, hostPath: image, readOnly: false })]),
@@ -1226,16 +1211,17 @@ export class LinuxProcessReuseBackend {
 				outputRoute.join("") + (outputPipes ? request.outputPipes!.map(pipe => pipe ? "p" : "s").join("") : ""),
 				...(descriptorManifest ? [descriptorManifest, descriptorReportPath!] : []),
 				request.argv0,
-				logicalExecutable,
+				image,
 				...request.args,
 			], resourceJournal, live);
 			const processStarted = performance.now();
+			session.writers.add(writer = { startedAt: Date.now(), tracePrefix });
 			const clockOffset = Number(process.hrtime.bigint()) / 1e6 - performance.now();
 			stage = "execution";
 			let outputEndpoints: readonly [string, string] | undefined;
 			outcome = await runSpawn(ready.strace, [...(live ? [`--handoff-fd=${inheritedFiles.length + 3}`, `--handoff-library=${ready.imageLibrary}`, `--handoff-image=${imagePath}`] : []), ...command.slice(1)], {
 				// The child writes to (and may query) these sockets; their identity lets its observation recognize them.
-				onOutputEndpoints: (endpoints) => { outputEndpoints = endpoints; },
+				onOutputEndpoints: (endpoints) => { session.nestedOutputEndpoints.add(outputEndpoints = endpoints); },
 				cwd: request.cwd,
 				environment: request.environment,
 				signal: AbortSignal.any([session.signal, work.signal]),
@@ -1279,6 +1265,8 @@ export class LinuxProcessReuseBackend {
 					return () => { release(); return suspended; };
 				} } : {}),
 			});
+			writer.endedAt = Date.now();
+			if (outputEndpoints) session.nestedOutputEndpoints.delete(outputEndpoints);
 			// Replays write each event to the target's own descriptor, whichever outlet this route gave it.
 			outcome = { ...outcome, output: outcome.output.map(event => ({ ...event, fd: outputRoute[0] === event.fd ? 1 : 2 })) };
 			const observedProcessMs = continuation ? continuation.computation.completedAt - continuation.computation.startedAt : Math.max(0, performance.now() - processStarted);
@@ -1288,9 +1276,7 @@ export class LinuxProcessReuseBackend {
 				if (suspensionAttempted && !continuation) throw new Error("private process suspension was not sealed");
 				const descriptorOffsets = descriptorReport && inputs.length ? parseDescriptorOffsets(await descriptorReport.readFile(), inputs) : undefined;
 				transactionFinishing = true;
-				const captures = [
-					transaction.finish(),
-					observeStrace(tracePrefix, logicalExecutable, session.projection.toLogical(request.cwd), {
+				const observing = observeStrace(tracePrefix, image, session.projection.toLogical(request.cwd), { interposedExecutables: session.interposition.executables,
 						...(frozen ? { frozen } : {}), ...(outputEndpoints ? { outputEndpoints } : {}),
 						guardFilesystemSemanticsWithin: [session.workspace.sandboxRoot, session.sourceRoot],
 						inheritedDirectoryImages: directoryImages.flatMap(([physical]) => [physical, session.projection.toLogical(physical)]),
@@ -1306,8 +1292,20 @@ export class LinuxProcessReuseBackend {
 							return [{ fd: input.fd, installed: input.installed, description: input.alias, inode: streamIdentity(position), flags: input.flags, outside: input.outside ?? object.queue?.outside ?? 3, packet: !!object.socket && (object.socket.type ?? 1) !== 1,
 								queuedBytes: object.queue?.bytes, ...(object.queue && input.fd === input.image ? { queueData: Buffer.from(object.content!, "base64"), messages: object.queue.messages } : {}) }];
 						}) : undefined,
-					}),
-				] as const;
+					});
+				const roots = [session.workspace.sandboxRoot, session.sourceRoot], own = writer!;
+				const named = (target: string) => roots.flatMap(root => pathContains(root, target) ? [slash(path.relative(root, target))] : [])[0];
+				// An inherited writable workspace file is written outside any path the trace names.
+				const ownership = async (): Promise<WorkspaceTransactionOwnership | undefined> => inputs.some(input => !input.type && (input.flags & 3) !== 0) ? undefined : observing.then(observation => ({
+					written: new Set(observation.written), observed: new Set(observation.paths.flatMap(({ path: target }) => named(target) ?? [])), endedAt: own.endedAt!,
+					interfered: async (paths, until) => {
+						const targets = new Set([...paths].flatMap(name => roots.map(root => path.posix.join(root, name))));
+						for (const other of session.writers) if (other !== own && other.startedAt <= until && (other.endedAt ?? Infinity) >= own.startedAt &&
+							writesWithin(other.writes ?? await tracedWrites(other.tracePrefix), targets, own.startedAt, until)) return true;
+						return false;
+					},
+				}));
+				const captures = [transaction.finish(ownership), observing] as const;
 				const [delta, observation] = await Promise.all(captures).catch(async (error: unknown) => {
 					// Both captures own live workspace/trace resources until they settle.
 					stage = (await Promise.allSettled(captures)).flatMap((result, index) =>
@@ -1347,8 +1345,11 @@ export class LinuxProcessReuseBackend {
 				}
 				for (const taint of evidence.taints) taints.add(taint);
 				if (!observation.complete) taints.add("trace_incomplete");
+				// A brokered descendant that did not resume in this trace ran outside it.
+				const traced = new Set((await readdir(traceRoot)).map(name => Number(/^process\.(\d+)$/.exec(name)?.[1])));
+				const escaped = session.bypasses.some(([pid]) => traced.has(pid) && !observation.resumedInterpositions?.includes(pid));
 				dependencyCertificate = {
-					complete: observation.complete && evidence.complete,
+					complete: observation.complete && evidence.complete && !escaped,
 					dependencies: evidence.dependencies,
 					taints: [...taints],
 				};
@@ -1454,6 +1455,11 @@ export class LinuxProcessReuseBackend {
 			this.add(session, "executionMs", durationMs);
 			if (outcome) this.processScheduler.observeSpeculativeService(processTimingIdentity(prototype, weakKey), durationMs);
 			if (!transactionFinishing) await transaction.abort().catch(() => undefined);
+			if (writer) {
+				writer.writes ??= await tracedWrites(writer.tracePrefix).catch(() => [{ at: writer!.startedAt, opened: true }]);
+				writer.settled = true;
+				if ([...session.writers].every(other => other.settled)) session.writers.clear();
+			}
 			if (traceRoot) await rm(traceRoot, { recursive: true, force: true }).catch(() => undefined);
 		}
 	}
@@ -1463,10 +1469,7 @@ export class LinuxProcessReuseBackend {
 		session.metrics[metric] += value;
 	}
 
-	private addActor(metric: CountedReuseMetric, value = 1): void {
-		this.counters[metric] += value;
-		this.actorCounters[metric] += value;
-	}
+	private addActor(metric: CountedReuseMetric, value = 1): void { this.counters[metric] += value; this.actorCounters[metric] += value; }
 
 	private recordHit(
 		producer: ExecutionScope | undefined,
@@ -1480,10 +1483,7 @@ export class LinuxProcessReuseBackend {
 		add(producer && scope ? sameScope(producer, scope) ? "sameTurnHits" : "crossTurnHits" : "unattributedHits");
 	}
 
-	private setError(session: ActiveSession, detail: string): void {
-		this.counters.lastError = detail;
-		session.metrics.lastError = detail;
-	}
+	private setError(session: ActiveSession, detail: string): void { this.counters.lastError = detail; session.metrics.lastError = detail; }
 
 	private setActorError(detail: string): void { this.counters.lastError = detail; this.actorCounters.lastError = detail; }
 
@@ -1547,9 +1547,7 @@ function bufferedProcessPrototype(
 		executableDigest,
 		argv: snapshot.argv.map((value) => projection.normalizeValue(value)),
 		logicalCwd: projection.toLogical(snapshot.cwd),
-		environment: Object.fromEntries(
-			Object.entries(snapshot.environment).map(([name, value]) => [name, projection.normalizeValue(value)]),
-		),
+		environment: Object.fromEntries(Object.entries(snapshot.environment).map(([name, value]) => [name, projection.normalizeValue(value)])),
 		umask: context.umask,
 		processContextDigest: sha256Digest(context.key),
 		stdin: input ? { type: "bytes", digest: input.contentDigest, eof: snapshot.resources!.objects[input.image]!.queue?.eof ?? true } : { type: "closed", eof: true },
@@ -2064,10 +2062,7 @@ function wireOutput(output: readonly BufferedOutput[]): readonly { readonly fd: 
 
 /** Exec-only views of PATH directories outside the workspace, shared by every session: one per directory state. A session supplies
  * its broker through `session/`, the fixed path every view's sidecar names, mounted over from its private root. */
-interface SharedInterposition {
-	readonly root: Promise<string>;
-	readonly views: BoundedRecencyMap<string, Promise<InterposedView | undefined>>;
-}
+interface SharedInterposition { readonly root: Promise<string>; readonly views: BoundedRecencyMap<string, Promise<InterposedView | undefined>>; }
 interface InterposedView { readonly view: string; readonly shadow: string; readonly names: readonly string[]; readonly dependency: DynamicDependency }
 
 async function createProcessInterposition(input: {
@@ -2343,14 +2338,7 @@ async function runSpawn(
 		}));
 		void drained.catch(() => undefined);
 		if (options.stdin) child.stdin?.end(options.stdin);
-		const terminate = () => {
-			if (!child.pid) return;
-			try {
-				process.kill(-child.pid, "SIGKILL");
-			} catch {
-				child.kill("SIGKILL");
-			}
-		};
+		const terminate = () => { if (!child.pid) return; try { process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); } };
 		const onAbort = () => terminate();
 		options.signal?.addEventListener("abort", onAbort, { once: true });
 		let timeout: ReturnType<typeof setTimeout> | undefined;
@@ -2449,10 +2437,11 @@ async function eligibleRequest(session: ActiveSession, request: DispatcherReques
 	if (!pathContains(session.workspace.sandboxRoot, request.cwd)) return { reason: "cwd_outside_workspace" };
 	if (request.args.length > 4096) return { reason: "argument_count_limit" };
 	if (request.args.reduce((sum, value) => sum + Buffer.byteLength(value), 0) > 1024 * 1024) return { reason: "argument_bytes_limit" };
-	const endpoints = session.topLevelOutputEndpoints;
-	if (!endpoints) return { reason: "output_endpoint_capture_missing" };
+	if (!session.topLevelOutputEndpoints) return { reason: "output_endpoint_capture_missing" };
 	if (request.context.outputEndpoints.some((endpoint) => !endpoint)) return { reason: "request_output_endpoint_missing" };
-	// The launch key below still checks a discarded descriptor's type and flags.
+	// The launch key below still checks a discarded descriptor's type and flags. Both outlets belong to one captured process.
+	const endpoints = [session.topLevelOutputEndpoints, ...session.nestedOutputEndpoints].find(pair =>
+		request.context.outputEndpoints.every(endpoint => pair.includes(endpoint) || endpoint === "/dev/null")) ?? session.topLevelOutputEndpoints;
 	const routeOf = (endpoint: string) => endpoint === endpoints[0] ? 1 : endpoint === endpoints[1] ? 2 : endpoint === "/dev/null" ? 0 : undefined;
 	const route = [routeOf(request.context.outputEndpoints[0]), routeOf(request.context.outputEndpoints[1])] as const;
 	if (route[0] === undefined || route[1] === undefined) return { reason: `output_endpoint_mismatch:${JSON.stringify({ expected: endpoints, observed: request.context.outputEndpoints })}` };
@@ -2512,18 +2501,14 @@ function execText(executable: string, args: readonly string[]): Promise<string> 
 	});
 }
 
-function closeServer(server: net.Server): Promise<void> {
-	return new Promise((resolve) => server.close(() => resolve()));
-}
+function closeServer(server: net.Server): Promise<void> { return new Promise((resolve) => server.close(() => resolve())); }
 
 function exitOutcome(outcome: SpawnOutcome): ExitOutcome {
 	if (!outcome.signal) return { kind: "code", code: outcome.code ?? 125 };
 	return { kind: "signal", signal: os.constants.signals[outcome.signal] ?? 9, coreDumped: false };
 }
 
-function randomToken(): string {
-	return randomBytes(32).toString("hex");
-}
+function randomToken(): string { return randomBytes(32).toString("hex"); }
 
 function assertInvocationMatches(invocation: ToolProcessInvocation, request: ProcessExecutionRequest): void {
 	if (request.command !== invocation.command) throw new Error("process command differs from the action execution context");
@@ -2545,27 +2530,14 @@ export async function validateTransferredProcessEvidence(
 	}
 	const blockingTaints = evidence.taints.filter((taint) => !TRANSFERRED_INPUT_TAINTS.has(taint));
 	const validation = await validateDynamicDependencyCertificate({ ...evidence, taints: blockingTaints }, { maxFileBytes: MAX_CAPTURE_BYTES });
-	const metrics = {
-		durationMs: validation.durationMs,
-		bytesRead: validation.bytesRead,
-		filesRead: validation.filesRead,
-		mode: "exact" as const,
-	};
+	const metrics = { durationMs: validation.durationMs, bytesRead: validation.bytesRead, filesRead: validation.filesRead, mode: "exact" as const };
 	if (validation.status === "valid") return { status: "valid", metrics };
 	if (validation.status === "stale") {
-		return {
-			status: "stale",
-			cause: { stage: "freshness", code: "process_dependency_changed", detail: validation.changed.join(",") },
-			metrics,
-		};
+		return { status: "stale", cause: { stage: "freshness", code: "process_dependency_changed", detail: validation.changed.join(",") }, metrics };
 	}
 	return {
 		status: "indeterminate",
-		cause: {
-			stage: "freshness",
-			code: "process_provenance_indeterminate",
-			detail: [validation.reason, ...incompleteReasons].join(","),
-		},
+		cause: { stage: "freshness", code: "process_provenance_indeterminate", detail: [validation.reason, ...incompleteReasons].join(",") },
 		metrics,
 	};
 }

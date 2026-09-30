@@ -114,10 +114,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 	private completedCount = 0;
 	private disposed = false;
 
-	constructor(maxCompleted: number, maxRetainedBytes = 0) {
-		this.maxCompleted = maxCompleted;
-		this.maxRetainedBytes = maxRetainedBytes;
-	}
+	constructor(maxCompleted: number, maxRetainedBytes = 0) { this.maxCompleted = maxCompleted; this.maxRetainedBytes = maxRetainedBytes; }
 
 	configure(maxCompleted: number, maxRetainedBytes = this.maxRetainedBytes): void {
 		this.maxCompleted = maxCompleted;
@@ -283,9 +280,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		return true;
 	}
 
-	clearCompleted(): void {
-		this.trim(0);
-	}
+	clearCompleted(): void { this.trim(0); }
 
 	dispose(): void {
 		this.disposed = true;
@@ -327,9 +322,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		return record;
 	}
 
-	private *records(): IterableIterator<HandoffRecord> {
-		for (const records of this.byKey.values()) yield* records.values();
-	}
+	private *records(): IterableIterator<HandoffRecord> { for (const records of this.byKey.values()) yield* records.values(); }
 
 	private remove(record: HandoffRecord): void {
 		this.revokeBinding(record);

@@ -23,7 +23,7 @@ export function straceCommand(
 	continuation = false,
 ): readonly string[] {
 	// The command runs under a sandbox launcher whose supervisor threads would otherwise pay a ptrace stop per call they serve.
-	return [strace, "--kill-on-exit", "--trace-children-only", streams ? "-f" : "-ff", "-q", "-yy", "-v", "-s", "65535", "-e", continuation ? "trace=all" : SYSCALL_FILTER + (streams ? ",read,write,readv,writev,close,close_range,dup,dup2,dup3,eventfd,eventfd2,sendfile,vmsplice,poll,ppoll,select,pselect6,epoll_create,epoll_create1,epoll_ctl,epoll_wait,epoll_pwait,epoll_pwait2" : ""), "-o", streams ? `${tracePrefix}.stream` : tracePrefix, ...command];
+	return [strace, "--kill-on-exit", "--trace-children-only", streams ? "-f" : "-ff", "-q", "-ttt", "-yy", "-v", "-s", "65535", "-e", continuation ? "trace=all" : SYSCALL_FILTER + (streams ? ",read,write,readv,writev,close,close_range,dup,dup2,dup3,eventfd,eventfd2,sendfile,vmsplice,poll,ppoll,select,pselect6,epoll_create,epoll_create1,epoll_ctl,epoll_wait,epoll_pwait,epoll_pwait2" : ""), "-o", streams ? `${tracePrefix}.stream` : tracePrefix, ...command];
 }
 
 export type ObservedProcessPath =
@@ -41,6 +41,8 @@ export interface StraceObservation {
 	readonly finalHandles?: readonly { readonly fd: number; readonly description?: number; readonly cloexec: boolean }[];
 	/** Processes whose every intercepted exec resumed at its native image in place. */
 	readonly resumedInterpositions?: readonly number[];
+	/** Workspace paths, relative to it, the traced processes created, removed, renamed or opened to write. */
+	readonly written?: readonly string[];
 }
 
 export interface StraceObservationOptions {
@@ -79,6 +81,9 @@ interface TraceLine {
 const TRACE_DELIMITERS: Readonly<Record<string, string>> = { "(": ")", "[": "]", "{": "}", "<": ">" };
 
 /** Delimit once: quoted paths and descriptor annotations are data, never syscall syntax. */
+/** -ttt stamps each record with its wall-clock start, which orders overlapping workspace writers. */
+const untimed = (line: string) => line.replace(/^\d+\.\d+ /, "");
+
 function parseTraceLine(line: string): TraceLine {
 	if (/^\+\+\+ (?:exited with \d+|killed by SIG[A-Z0-9]+(?: \(core dumped\))?) \+\+\+\s*$/.test(line)) return { name: "terminated", args: [], result: "0" };
 	const head = /^\s*([a-zA-Z0-9_]+)\(/.exec(line);
@@ -227,10 +232,7 @@ function resourceTransitions(processes: ReadonlyMap<number, TraceProcess>, root:
 			const data = Buffer.alloc(12); data.writeUInt32LE(requested); data.writeUInt32LE(returned, 4); data.writeUInt32LE(projection, 8); emit(handle, "ready", data);
 		};
 		const stream = endpoint(line.args[0]), syscall = line.name;
-		if (stream?.inode.startsWith("file:")) {
-			const operation = fileLockTransition(line);
-			if (operation) emit(stream, "lock", operation);
-		}
+		if (stream?.inode.startsWith("file:")) { const operation = fileLockTransition(line); if (operation) emit(stream, "lock", operation); }
 		if (stream && !stream.inode.startsWith("file:")) {
 			const counter = stream.inode.startsWith("eventfd:");
 			const flags = line.args[3] ?? "";
@@ -529,13 +531,13 @@ export async function observeStrace(
 			} finally { await handle.close(); }
 		}
 		const groups = new Map<number, { lines: string[]; order?: number[] }>();
-		if (!ordered) groups.set(pid, { lines: contents.split(/\r?\n/) });
+		if (!ordered) groups.set(pid, { lines: contents.split(/\r?\n/).map(untimed) });
 		else for (const [order, line] of contents.split(/\r?\n/).entries()) {
 			if (!line.trim()) continue;
 			const match = /^(\d+)\s+(.*)$/.exec(line);
 			if (!match) throw new Error("invalid ordered trace record");
 			const process = Number(match[1]), group = groups.get(process) ?? { lines: [], order: [] };
-			group.lines.push(match[2]!); group.order!.push(order); groups.set(process, group);
+			group.lines.push(untimed(match[2]!)); group.order!.push(order); groups.set(process, group);
 		}
 		for (const [pid, group] of groups) {
 			if (options.frozen?.pid === pid) {
@@ -623,9 +625,7 @@ export async function observeStrace(
 			if (options.frozen && !continuationCall(line, index === start)) {
 				complete = false; incompleteReasons.add(`continuation_state:${syscall}`);
 			}
-			if (syscall === "getpid" || syscall === "getppid" || syscall === "getsid" || syscall === "getpgid") {
-				taints.add("pid_observation");
-			}
+			if (syscall === "getpid" || syscall === "getppid" || syscall === "getsid" || syscall === "getpgid") { taints.add("pid_observation"); }
 			const endpoint = /^\d+<(?:pipe|UNIX(?:-[A-Z]+)?):\[(\d+)(?:->\d+)?\]>$/.exec(line.args[0] ?? "")?.[1];
 			const stream = endpoint && options.inheritedStreams?.includes(endpoint) || options.inheritedStreams?.some(inode => inode.startsWith("eventfd:")) && /^\d+<anon_inode:\[eventfd\]>$/.test(line.args[0] ?? "");
 			const streamCall = streamCalls.has(line);
@@ -728,9 +728,7 @@ export async function observeStrace(
 			const role: DependencyRole = syscall === "execve" || syscall === "execveat" ? "executable" : "input";
 			const observedPaths = syscallPaths(line, syscall, cwd);
 			if (!observedPaths) { complete = false; incompleteReasons.add(`unresolved_pathname:${syscall}:${pid}`); }
-			for (const observed of observedPaths ?? []) {
-				if (paths.get(observed) !== "executable") paths.set(observed, role);
-			}
+			for (const observed of observedPaths ?? []) { if (paths.get(observed) !== "executable") paths.set(observed, role); }
 			if ((syscall === "chdir" || syscall === "fchdir") && syscallSucceeded(line)) {
 				const changed = tracedCwd(line, cwd);
 				if (changed) cwd = changed;
@@ -756,7 +754,7 @@ export async function observeStrace(
 		tracedProcesses: [...selected].filter(([pid, { file, start }]) => file.lines.slice(start)
 			.some((_, offset) => !ignoredSegments.get(pid)?.some(([from, to]) => start + offset >= from && start + offset < to))).length,
 		incompleteReasons: Object.freeze([...incompleteReasons].sort()),
-		...(resumedInterpositions.length ? { resumedInterpositions } : {}),
+		...(resumedInterpositions.length ? { resumedInterpositions } : {}), written: [...written].map(name => name.slice(2)).sort(),
 	};
 }
 
@@ -840,6 +838,27 @@ function internalPoll(line: TraceLine, ownPipes: ReadonlySet<string>): boolean {
 	return entries.length > 0 && entries.every(([, target, events]) => events === "0" || ownPipes.has(/^<pipe:\[(\d+)\]>$/.exec(target ?? "")?.[1] ?? ""));
 }
 
+/** A traced execution's workspace writes so far (it may still run), stamped in wall-clock ms; an unresolvable name is undefined. */
+export interface TracedWrite { readonly paths?: readonly string[]; readonly at: number; readonly opened: boolean }
+
+export async function tracedWrites(tracePrefix: string): Promise<readonly TracedWrite[]> {
+	const prefix = `${path.basename(tracePrefix)}.`, writes: TracedWrite[] = [];
+	for (const name of await readdir(path.dirname(tracePrefix)).catch(() => [] as string[])) {
+		if (name.startsWith(prefix)) for (const record of (await readFile(path.join(path.dirname(tracePrefix), name), "utf8").catch(() => "")).split("\n")) {
+			const stamped = /^(?:\d+ )?(\d+\.\d+) (.*)$/.exec(record), line = stamped && parseTraceLine(stamped[2]!);
+			if (!line || !syscallSucceeded(line) || !writesPath(line)) continue;
+			const paths = syscallPaths(line, line.name, "");
+			writes.push({ ...(paths?.every(target => target.startsWith("/")) ? { paths } : {}), at: Number(stamped[1]) * 1000, opened: /^open(?:at2?)?$/.test(line.name) });
+		}
+	}
+	return writes;
+}
+
+/** Whether writes reached `targets` within [since, until], or held one open to write by `until`. An unresolvable write counts. */
+export function writesWithin(writes: readonly TracedWrite[], targets: ReadonlySet<string>, since: number, until: number): boolean {
+	return writes.some(({ paths, at, opened }) => at <= until && (opened || at >= since) && (!paths || paths.some(target => targets.has(target))));
+}
+
 function writesPath(line: TraceLine): boolean {
 	return /^(?:creat|truncate|rename|renameat2?|link|linkat|symlink|symlinkat|mknod|mknodat|unlink|unlinkat|mkdir|mkdirat|rmdir)$/.test(line.name) ||
 		/^open(?:at2?)?$/.test(line.name) && /\bO_(?:WRONLY|RDWR|CREAT|TRUNC)\b/.test(line.args.join(" "));
@@ -913,9 +932,7 @@ function tracedExecution(pid: number, line: TraceLine, cwd: string): TracedExecu
 	} catch { return { pid, argv: [] }; } // Undecodable arguments prove nothing.
 }
 
-function successfulExec(line: TraceLine): boolean {
-	return (line.name === "execve" || line.name === "execveat") && syscallSucceeded(line);
-}
+function successfulExec(line: TraceLine): boolean { return (line.name === "execve" || line.name === "execveat") && syscallSucceeded(line); }
 
 function spawnedPID(line: TraceLine): number | undefined {
 	if (!["clone", "clone3", "fork", "vfork"].includes(line.name)) return undefined;
@@ -938,13 +955,9 @@ function sharesFilesystem(line: TraceLine): boolean | undefined {
 	return shared;
 }
 
-function syscallSucceeded(line: TraceLine): boolean {
-	return /^(?:0x[0-9a-f]+|[0-9]+)(?:\b|<)/i.test(line.result);
-}
+function syscallSucceeded(line: TraceLine): boolean { return /^(?:0x[0-9a-f]+|[0-9]+)(?:\b|<)/i.test(line.result); }
 
-function confinementDenied(line: TraceLine): boolean {
-	return /^-1 (?:EACCES|EPERM)\b/.test(line.result);
-}
+function confinementDenied(line: TraceLine): boolean { return /^-1 (?:EACCES|EPERM)\b/.test(line.result); }
 
 function prctlConfinementSensitive(line: TraceLine, syscall: string): boolean {
 	return syscall === "prctl" && !/^PR_SET_(?:NAME|VMA)\b/.test(line.args[0] ?? "");

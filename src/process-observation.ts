@@ -12,11 +12,7 @@ import { orderWorkspaceChanges, type WorkspaceRegularDelta } from "./workspace-t
 
 export type { WorkspaceStructureEntry, WorkspaceStructureSnapshot, WorkspaceTreeEntry } from "./workspace-state.ts";
 
-export interface ExecutionPathProjectionOptions {
-	readonly sourceRoot: string;
-	readonly workspaceRoot: string;
-	readonly privateRoot?: string;
-}
+export interface ExecutionPathProjectionOptions { readonly sourceRoot: string; readonly workspaceRoot: string; readonly privateRoot?: string; }
 
 /** Stable logical paths keep certificates independent of disposable worktree names. */
 export class ExecutionPathProjection {
@@ -50,9 +46,7 @@ export class ExecutionPathProjection {
 		return slash(normalized);
 	}
 
-	isWorkspacePhysical(physicalPath: string): boolean {
-		return containsFilesystemPath(this.workspaceRoot, physicalPath);
-	}
+	isWorkspacePhysical(physicalPath: string): boolean { return containsFilesystemPath(this.workspaceRoot, physicalPath); }
 }
 
 export interface WorkspaceStructureCaptureOptions { readonly maxFiles?: number; readonly exclude?: readonly string[]; }
@@ -116,9 +110,7 @@ export async function captureWorkspaceStructureEntry(
 	excludeEntries: readonly string[] = [],
 ): Promise<WorkspaceStructureEntry | undefined> {
 	let stat: BigIntStats;
-	try {
-		stat = await lstat(target, { bigint: true });
-	} catch (error) { if (isMissing(error)) return undefined; throw error; }
+	try { stat = await lstat(target, { bigint: true }); } catch (error) { if (isMissing(error)) return undefined; throw error; }
 	return captureExistingWorkspaceStructureEntry(target, stat, excludeEntries);
 }
 
