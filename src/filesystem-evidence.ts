@@ -80,7 +80,7 @@ export function captureStableFile(
 	target: string,
 	maxBytes = Number.POSITIVE_INFINITY,
 	retainContent = false,
-	observed?: Pick<StableFilesystemCapture, "stat" | "realPath"> & { readonly retainObject?: boolean; readonly gitBlob?: boolean },
+	observed?: Parameters<typeof captureFile>[4], // Without a digest when only the bytes and their identity are kept.
 ): Promise<StableFilesystemCapture> {
 	return captureFile(target, maxBytes, retainContent, true, observed);
 }
@@ -157,14 +157,13 @@ export async function captureHeldDirectory(pid: number, fd: number, content: Buf
 }
 
 async function captureFile(target: string, maxBytes: number, retainContent: boolean, verifyPath: boolean,
-	observed?: Partial<Pick<StableFilesystemCapture, "stat" | "realPath">> & { readonly retainObject?: boolean; readonly gitBlob?: boolean }, observation?: { readonly pinned: () => void; readonly signal: AbortSignal }): Promise<StableFilesystemCapture> {
+	observed?: Partial<Pick<StableFilesystemCapture, "stat" | "realPath">> & { readonly retainObject?: boolean; readonly gitBlob?: boolean; readonly digest?: false }, observation?: { readonly pinned: () => void; readonly signal: AbortSignal }): Promise<StableFilesystemCapture> {
 	// O_PATH pins even executable aliases without admitting I/O on a raced-in FIFO or device.
 	let binding = process.platform === "linux" && (process.arch === "x64" || process.arch === "arm64")
 		? await fs.open(target, 0x200000 | (verifyPath ? constants.O_NOFOLLOW : 0)) : undefined;
 	let handle: FileHandle | undefined;
 	try {
-		const before = binding ? await binding.stat({ bigint: true })
-			: observed?.stat ?? await (verifyPath ? fs.lstat : fs.stat)(target, { bigint: true });
+		const before = binding ? await binding.stat({ bigint: true }) : observed?.stat ?? await (verifyPath ? fs.lstat : fs.stat)(target, { bigint: true });
 		if (!before.isFile()) throw new Error("not_regular_file");
 		if (observed?.stat && !sameFilesystemIdentity(observed.stat, before)) throw new Error("file_changed_during_capture");
 		const beforePath = verifyPath ? observed?.realPath ?? await fs.realpath(target) : target;
@@ -176,7 +175,7 @@ async function captureFile(target: string, maxBytes: number, retainContent: bool
 		observation?.signal.throwIfAborted();
 		// Never borrow another capture's ongoing read: bytes read before this stat can predate a same-size rewrite
 		// that coarse timestamps leave with the same identity.
-		const captured = await readFileContents(handle, before, maxBytes, retainContent, () => observation?.signal.throwIfAborted(), observed?.gitBlob);
+		const captured = await readFileContents(handle, before, maxBytes, retainContent, () => observation?.signal.throwIfAborted(), observed?.gitBlob, observed?.digest);
 		observation?.signal.throwIfAborted();
 		const after = captured.stat;
 		if (verifyPath) {
@@ -195,8 +194,8 @@ async function captureFile(target: string, maxBytes: number, retainContent: bool
 	}
 }
 
-async function readFileContents(handle: FileHandle, before: BigIntStats, maxBytes: number, retainContent: boolean, check?: () => void, gitBlob = false) {
-	const hash = createHash("sha256"), blob = gitBlob ? createHash("sha1").update(`blob ${before.size}\0`) : undefined;
+async function readFileContents(handle: FileHandle, before: BigIntStats, maxBytes: number, retainContent: boolean, check?: () => void, gitBlob = false, digest = true) {
+	const hash = digest ? createHash("sha256") : undefined, blob = gitBlob ? createHash("sha1").update(`blob ${before.size}\0`) : undefined;
 	const content = retainContent ? Buffer.allocUnsafe(Number(before.size)) : undefined;
 	const buffer = Buffer.allocUnsafe(content ? 1 : Math.max(1, Math.min(Number(before.size), 1024 * 1024)));
 	let bytesRead = 0;
@@ -208,12 +207,12 @@ async function readFileContents(handle: FileHandle, before: BigIntStats, maxByte
 		bytesRead += size;
 		if (bytesRead > maxBytes) throw new Error(`file_too_large:${bytesRead}`);
 		if (bytesRead > Number(before.size)) throw new Error("file_changed_during_capture");
-		hash.update(chunk.subarray(0, size)); blob?.update(chunk.subarray(0, size));
+		hash?.update(chunk.subarray(0, size)); blob?.update(chunk.subarray(0, size));
 	}
 	const after = await handle.stat({ bigint: true });
 	check?.();
 	if (bytesRead !== Number(before.size) || !sameFilesystemIdentity(before, after)) { throw new Error("file_changed_during_capture"); }
-	return { hash: hash.digest("hex"), bytesRead, stat: after, ...(content ? { content } : {}), ...(blob ? { blob: blob.digest("hex") } : {}) };
+	return { hash: hash?.digest("hex") ?? "", bytesRead, stat: after, ...(content ? { content } : {}), ...(blob ? { blob: blob.digest("hex") } : {}) };
 }
 
 /** Own a directory listing or link target together with its stable entry identity. */

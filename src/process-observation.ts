@@ -52,10 +52,7 @@ export class ExecutionPathProjection {
 export interface WorkspaceStructureCaptureOptions { readonly maxFiles?: number; readonly exclude?: readonly string[]; }
 
 /** Capture inode and directory semantics without reading regular-file contents. */
-export async function captureWorkspaceStructure(
-	root: string,
-	options: WorkspaceStructureCaptureOptions = {},
-): Promise<WorkspaceStructureSnapshot> {
+export async function captureWorkspaceStructure(root: string, options: WorkspaceStructureCaptureOptions = {}): Promise<WorkspaceStructureSnapshot> {
 	const absoluteRoot = path.resolve(root);
 	const entries = new Map<string, WorkspaceStructureEntry>();
 	const excludes = new Set(options.exclude ?? [".git"]);
@@ -377,7 +374,7 @@ function statMilliseconds(stat: Stats | BigIntStats, field: "ctime" | "mtime"): 
 	return Number((ns - remainder) / 1_000_000_000n) * 1_000 + Number(remainder) / 1_000_000;
 }
 
-function statChangeDigest(stat: Stats | BigIntStats): Sha256Digest {
+export function statChangeDigest(stat: Stats | BigIntStats): Sha256Digest {
 	return digestObject({
 		dev: Number(stat.dev),
 		ino: Number(stat.ino),
