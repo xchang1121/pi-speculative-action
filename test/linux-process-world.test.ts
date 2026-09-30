@@ -1698,8 +1698,8 @@ int main(void) { char path[32] = "/bin/true\\0intact"; char *args[] = {path, 0};
 			await compileBenchmarkHelper(fixture.workspace, { source: "spawner.c", output: "spawner", arguments: ["-pthread"] });
 			// Created files take the open's mode under the process's umask; flock execs SHELL off its stack top; tar opens -C O_PATH; an orphan keeps its cwd.
 			const spawned = await forkReusableBash(fixture, { label: "spawn", actionNamespace: "spawn", executionFingerprint, command: "./spawner; umask 027; echo x > shared; cp /bin/true tool; mkdir made; " +
-				"stat -c '%a %n' shared tool made; SHELL=/bin/sh flock shared -c 'tar cf - tool | tar xf - -C made' && ls made; cd made && (echo orphan > kept &); for i in $(seq 100); do [ -s kept ] && break; sleep 0.05; done; cat kept; echo piped | cat /dev/stdin; cat /proc/self/comm; [ -x ../shared ] || echo not-x" });
-			try { expect(textOutput(spawned.output.result)).toBe("intact\n640 shared\n750 tool\n750 made\ntool\norphan\npiped\ncat\nnot-x\n"); } finally { await spawned.dispose?.(); }
+				"stat -c '%a %n' shared tool made; SHELL=/bin/sh flock shared -c 'tar cf - tool | tar xf - -C made' && ls made; cd made && (echo orphan > kept &); for i in $(seq 100); do [ -s kept ] && break; sleep 0.05; done; cat kept; echo piped | cat /dev/stdin; cat /proc/self/comm; [ -x ../shared ] || echo not-x; hostname" });
+			try { expect(textOutput(spawned.output.result)).toBe(`intact\n640 shared\n750 tool\n750 made\ntool\norphan\npiped\ncat\nnot-x\n${os.hostname()}\n`); } finally { await spawned.dispose?.(); }
 		} finally { await fixture.dispose(); }
 	});
 
