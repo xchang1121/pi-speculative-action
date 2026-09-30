@@ -1867,7 +1867,7 @@ async function captureDependencies(session: ActiveSession, snapshot: WorkspaceSt
 			const structure = snapshot.entries.get(relative);
 			if (!structure || structure.kind !== "file") return structure;
 			const content = deltas.get(relative)?.before ?? await captureStableFile(structure.contentPath ?? path.resolve(snapshot.root, relative), structure.size);
-			const hydrated = hydrateWorkspaceFileEntry(structure, content);
+			const hydrated = await hydrateWorkspaceFileEntry(structure, content);
 			if (!hydrated) throw new Error(`transaction baseline changed: ${relative}`);
 			return hydrated;
 		})());

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { link, mkdir, open, readFile, readdir, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { type ArtifactReference, certificateReplayable, isSha256Digest, parseProcessCertificate, processResultDigest, type ProcessProvenanceCertificate,
-	type ProvenanceTaint, referencedArtifacts, sha256Digest, type Sha256Digest } from "./provenance-certificate.ts";
+	type ProvenanceTaint, referencedArtifacts, sha256Digest, sha256DigestAsync, type Sha256Digest } from "./provenance-certificate.ts";
 import { writeJsonFile } from "./filesystem-evidence.ts";
 import { stableStringify } from "./stable-json.ts";
 import { nonNegativeNumber, positiveInteger } from "./setting-input.ts";
@@ -31,10 +31,7 @@ export interface ProvenanceStoreGCResult {
 	readonly removedBytes: number;
 }
 
-export const DEFAULT_PROVENANCE_STORE_LIMITS: ProvenanceStoreLimits = Object.freeze({
-	maxCertificates: 4_096,
-	maxBytes: 2 * 1024 * 1024 * 1024,
-});
+export const DEFAULT_PROVENANCE_STORE_LIMITS: ProvenanceStoreLimits = Object.freeze({ maxCertificates: 4_096, maxBytes: 2 * 1024 * 1024 * 1024 });
 
 const DEFAULT_GC_INTERVAL_MS = 5 * 60_000;
 const DEFAULT_ORPHAN_GRACE_MS = 5 * 60_000;
@@ -50,11 +47,10 @@ export class ArtifactCAS {
 
 	async put(value: string | Uint8Array): Promise<ArtifactReference> {
 		const bytes = typeof value === "string" ? Buffer.from(value, "utf8") : value;
-		const digest = sha256Digest(bytes);
-		const target = this.artifactPath(digest);
-		await publishImmutable(target, bytes);
-		const reference = Object.freeze({ digest, size: bytes.byteLength });
-		if (!(await this.has(reference))) throw new Error(`artifact publication failed for ${digest}`);
+		const reference = Object.freeze({ digest: await sha256DigestAsync(bytes), size: bytes.byteLength }), target = this.artifactPath(reference.digest);
+		// A present object at its size holds these bytes already (see has): renewing it replaces writing them again.
+		if (!(await this.has(reference) && await renew(target))) await publishImmutable(target, bytes);
+		if (!(await this.has(reference))) throw new Error(`artifact publication failed for ${reference.digest}`);
 		return reference;
 	}
 
@@ -62,7 +58,7 @@ export class ArtifactCAS {
 		const { digest, size } = reference;
 		if (!isSha256Digest(digest) || !Number.isSafeInteger(size) || size < 0) throw new Error("invalid artifact reference");
 		const bytes = await readOptional(this.artifactPath(digest));
-		if (bytes && (bytes.byteLength !== size || sha256Digest(bytes) !== digest)) throw new Error(`artifact integrity check failed for ${digest}`);
+		if (bytes && (bytes.byteLength !== size || await sha256DigestAsync(bytes) !== digest)) throw new Error(`artifact integrity check failed for ${digest}`);
 		return bytes;
 	}
 
@@ -241,9 +237,7 @@ export class ProvenanceCertificateStore {
 			const tomb = path.join(this.root, `.clear-${randomUUID()}`);
 			await mkdir(tomb);
 			for (const segment of STORE_SEGMENTS) {
-				await rename(this.managedPath(segment), path.join(tomb, segment)).catch((error) => {
-					if (!missing(error)) throw error;
-				});
+				await rename(this.managedPath(segment), path.join(tomb, segment)).catch((error) => { if (!missing(error)) throw error; });
 			}
 			await rm(tomb, { recursive: true, force: true });
 			return { removedCertificates: before.certificates, removedArtifacts: before.artifacts, removedBytes: before.totalBytes };
@@ -256,9 +250,7 @@ export class ProvenanceCertificateStore {
 		const retained = new Set<Sha256Digest>();
 		const retainedArtifacts = new Set<Sha256Digest>();
 		let retainedBytes = 0;
-		for (const record of [...inventory.certificates].sort(
-			(left, right) => (right.certificate?.createdAt ?? 0) - (left.certificate?.createdAt ?? 0),
-		)) {
+		for (const record of [...inventory.certificates].sort((left, right) => (right.certificate?.createdAt ?? 0) - (left.certificate?.createdAt ?? 0))) {
 			const certificate = record.certificate;
 			if (!certificate || !certificateReplayable(certificate, this.acceptedTaints)) continue;
 			const references = referencedArtifacts(certificate);
@@ -395,14 +387,16 @@ async function publishImmutable(target: string, bytes: Uint8Array): Promise<bool
 		try { await writeFile(file, bytes); } finally { await file.close(); }
 		try { await link(temporary, target); return true; } catch (error) {
 			if (!hasErrorCode(error, "EEXIST")) throw error;
-			const renewed = new Date(); // An existing object is referenced again: its orphan grace restarts now.
-			await utimes(target, renewed, renewed);
+			await renew(target);
 			return false;
 		}
 	} finally {
 		await rm(temporary, { force: true });
 	}
 }
+
+/** An existing object is referenced again: its orphan grace restarts now. False when it is gone. */
+const renew = (target: string, now = new Date()) => utimes(target, now, now).then(() => true, (error): false => { if (!missing(error)) throw error; return false; });
 
 function readOptional(target: string) {
 	return readFile(target).catch((error): undefined => { if (!missing(error)) throw error; });

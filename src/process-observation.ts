@@ -6,7 +6,7 @@ import { isMissing } from "./error-utils.ts";
 import type { StableFilesystemCapture } from "./filesystem-evidence.ts";
 import { FILESYSTEM_CONCURRENCY, mapFilesystem } from "./filesystem-evidence.ts";
 import type { DynamicDependency, FilesystemTypeEvidence, Sha256Digest } from "./provenance-certificate.ts";
-import { digestObject, filesystemEntryType, filesystemMetadataDigest, sha256Digest } from "./provenance-certificate.ts";
+import { digestObject, filesystemEntryType, filesystemMetadataDigest, sha256Digest, sha256DigestAsync } from "./provenance-certificate.ts";
 import type { WorkspaceStructureEntry, WorkspaceStructureSnapshot, WorkspaceTreeEntry } from "./workspace-state.ts";
 import { orderWorkspaceChanges, type WorkspaceRegularDelta } from "./workspace-transaction.ts";
 
@@ -260,15 +260,13 @@ export function diffWorkspaceStructures(
 	};
 }
 
-export function hydrateWorkspaceFileEntry(
-	entry: Extract<WorkspaceStructureEntry, { readonly kind: "file" }>,
-	content: Uint8Array | StableFilesystemCapture,
-): Extract<WorkspaceTreeEntry, { readonly kind: "file" }> | undefined {
+export async function hydrateWorkspaceFileEntry(entry: Extract<WorkspaceStructureEntry, { readonly kind: "file" }>,
+	content: Uint8Array | StableFilesystemCapture): Promise<Extract<WorkspaceTreeEntry, { readonly kind: "file" }> | undefined> {
 	if ("hash" in content) {
 		if (statChangeDigest(content.stat) !== entry.changeDigest) return undefined;
 		return { ...entry, digest: `sha256:${content.hash}` };
 	}
-	return content.byteLength === entry.size ? { ...entry, digest: sha256Digest(content) } : undefined;
+	return content.byteLength === entry.size ? { ...entry, digest: await sha256DigestAsync(content) } : undefined;
 }
 
 function regularDeltaFailure(
