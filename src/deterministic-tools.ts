@@ -34,6 +34,10 @@ export const WITHOUT_IDENTITY = FILESYSTEM_OBSERVATION_FIELDS.filter((field) => 
 /** find predicates that read metadata beyond a file's type, with the fields they read; any other listing predicate reads all. */
 const FIND_FIELDS: ReadonlyArray<readonly [RegExp, readonly FilesystemObservationField[]]> = [[/^-(?:size|empty)$/, ["size"]], [/^-perm$/, ["mode"]],
 	[/^-(?:user|group|uid|gid|nouser|nogroup)$/, ["uid", "gid"]], [/^-links$/, ["nlink"]], [/^-(?:inum|samefile)$/, ["ino"]]];
+/** The fields each of stat's format directives prints; any other directive, its default and terse output and file system mode print more. */
+const STAT_DIRECTIVES: Readonly<Record<string, readonly FilesystemObservationField[]>> = Object.fromEntries(([["aAfF", ["mode"]], ["s", ["size"]], ["b", ["blocks"]],
+	["o", ["blksize"]], ["h", ["nlink"]], ["i", ["ino"]], ["dDm", ["dev"]], ["uU", ["uid"]], ["gG", ["gid"]], ["yY", ["mtimeNs"]], ["zZ", ["ctimeNs"]], ["tT", ["rdev"]],
+	["nNB%", []]] as const).flatMap(([directives, fields]) => [...directives].map((directive) => [directive, fields])));
 
 /**
  * The stat fields of a workspace file that can reach a program's output. A sandbox serves the workspace from another device,
@@ -51,8 +55,15 @@ export function workspaceStatFields(image: string, argv: readonly string[]): rea
 		return [...fields];
 	}
 	if (image === "ls") return argv.slice(1).some((argument) => /^-[a-zA-Z]*[lgonsiStcu]|^--(?:full-time|size|inode|sort|time)/.test(argument)) ? WITHOUT_DEVICE : ["mode"];
+	if (image === "stat") {
+		const at = argv.findIndex((argument) => /^(?:-c|--format|--printf)(?:=|$)|^-c./.test(argument)), option = argv[at] ?? "";
+		const format = at < 0 || argv.some((argument) => /^(?:-[a-zA-Z]*[ft]|--file-system|--terse)$/.test(argument)) ? undefined
+			: /^-c./.test(option) ? option.slice(2) : option.includes("=") ? option.slice(option.indexOf("=") + 1) : argv[at + 1];
+		const read = format === undefined ? [undefined] : [...format.matchAll(/%[-#+ 0-9.']*(.)/g)].map(([, directive]) => STAT_DIRECTIVES[directive!]);
+		return read.every(Boolean) ? FILESYSTEM_OBSERVATION_FIELDS.filter((field) => field === "mode" || read.some((fields) => fields!.includes(field))) : undefined;
+	}
 	// Programs that print device numbers keep every field; a stat cache like git's still keys on the size and time a replay keeps.
-	return ["stat", "df", "du", "mountpoint", "findmnt"].includes(image) ? undefined : WITHOUT_IDENTITY;
+	return ["df", "du", "mountpoint", "findmnt"].includes(image) ? undefined : WITHOUT_IDENTITY;
 }
 
 /** Programs that print a directory's own times, size or link count. Any other stats a directory for its type, owner and (on
