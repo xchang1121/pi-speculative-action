@@ -569,7 +569,7 @@ describe("workspace-branch ExecutionWorld", () => {
 					for (const [resource, entry] of snapshot.entries) {
 						if (entry.kind !== "file") continue;
 						const bytes = await captureStableFile(entry.contentPath ?? path.join(snapshot.root, resource));
-						expect(hydrateWorkspaceFileEntry(entry, bytes), resource).toMatchObject({ kind: "file" });
+						expect(await hydrateWorkspaceFileEntry(entry, bytes), resource).toMatchObject({ kind: "file" });
 					}
 				}
 				expect((await readdir(workspace.sandboxRoot)).some((entry) => entry.startsWith(".pi-speculative-"))).toBe(false);

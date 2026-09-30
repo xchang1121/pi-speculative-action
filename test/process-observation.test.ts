@@ -48,9 +48,9 @@ describe("process observation", () => {
 		expect(diff.effects).toHaveLength(1);
 		expect(diff.effects[0]).toMatchObject({ logicalPath: projection.toLogical(target), relativePath: "value.bin" });
 		expect(diff.effects[0]?.change).toMatchObject({ ...delta, operation: "write_contents", object: { path: projection.toLogical(target), before: true } });
-		const input = hydrateWorkspaceFileEntry(beforeEntry, beforeBytes);
-		expect(hydrateWorkspaceFileEntry(beforeEntry, captured)).toEqual(input);
-		expect(hydrateWorkspaceFileEntry(beforeEntry, await captureStableFile(target))).toBeUndefined();
+		const input = await hydrateWorkspaceFileEntry(beforeEntry, beforeBytes);
+		expect(await hydrateWorkspaceFileEntry(beforeEntry, captured)).toEqual(input);
+		expect(await hydrateWorkspaceFileEntry(beforeEntry, await captureStableFile(target))).toBeUndefined();
 		expect(input).toMatchObject({ kind: "file", size: beforeBytes.byteLength });
 		const parentEntry = before.entries.get("");
 		if (parentEntry?.kind !== "directory") throw new Error("workspace root structure missing");
