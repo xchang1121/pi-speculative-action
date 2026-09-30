@@ -373,12 +373,8 @@ export class SpeculationScheduler<Job extends object> {
 		const key = timingKeys(forecast)[0]!;
 		if (!this.actorServiceTimes.get(key)?.count || forecast.expectedDurationMs === undefined &&
 			this.speculativeServiceTimes.get(key)?.estimate(0.9, "upper") === undefined) return true;
-		return this.assessCandidateJoin({
-			identity: forecast, adoptionIdentity: forecast.adoptionIdentity,
-			state: "queued",
-			expectedSpeculativeDurationMs: expectedDurationMs,
-			leadTimeMs: runway,
-		}).allowed;
+		return this.assessCandidateJoin({ identity: forecast, adoptionIdentity: forecast.adoptionIdentity, state: "queued",
+			expectedSpeculativeDurationMs: expectedDurationMs, leadTimeMs: runway }).allowed;
 	}
 
 	private actorRunway(forecast: PredictionForecast, phase = forecast.actorPhase): number | undefined {
@@ -403,11 +399,7 @@ export class SpeculationScheduler<Job extends object> {
 		return Math.max(finite(forecast.expectedDurationMs), observed ?? 0) || undefined;
 	}
 
-	private observeTiming(
-		windows: BoundedRecencyMap<string, SampleWindow>,
-		identity: ServiceTimingIdentity,
-		durationMs: number,
-	): void {
+	private observeTiming(windows: BoundedRecencyMap<string, SampleWindow>, identity: ServiceTimingIdentity, durationMs: number): void {
 		for (const key of timingKeys(identity)) {
 			const samples = windows.get(key) ?? new SampleWindow();
 			samples.observe(durationMs);
@@ -415,12 +407,7 @@ export class SpeculationScheduler<Job extends object> {
 		}
 	}
 
-	private timingEstimate(
-		windows: BoundedRecencyMap<string, SampleWindow>,
-		identity: ServiceTimingIdentity,
-		quantile: number,
-		selection: QuantileSelection = "lower",
-	): TimingEstimate | undefined {
+	private timingEstimate(windows: BoundedRecencyMap<string, SampleWindow>, identity: ServiceTimingIdentity, quantile: number, selection: QuantileSelection = "lower"): TimingEstimate | undefined {
 		for (const [index, key] of timingKeys(identity).entries()) {
 			const window = windows.get(key), value = window?.estimate(quantile, selection);
 			if (value !== undefined) return { value, samples: window!.count, window: window!, exact: Boolean(identity.actionKeyHash) && index === 0 };
@@ -493,13 +480,8 @@ function timingKeys(identity: ServiceTimingIdentity): readonly string[] {
 }
 
 function compareVictim<Job>(left: SchedulerEntry<Job>, right: SchedulerEntry<Job>): number {
-	return (
-		Number(right.work.background) - Number(left.work.background) ||
-		right.work.decisionBatchesUntilCall - left.work.decisionBatchesUntilCall ||
-		left.work.priorityMs - right.work.priorityMs ||
-		left.work.criticalPathMs - right.work.criticalPathMs ||
-		right.sequence - left.sequence
-	);
+	return Number(right.work.background) - Number(left.work.background) || right.work.decisionBatchesUntilCall - left.work.decisionBatchesUntilCall ||
+		left.work.priorityMs - right.work.priorityMs || left.work.criticalPathMs - right.work.criticalPathMs || right.sequence - left.sequence;
 }
 
 function positive(value: number | undefined, fallback: number): number {
