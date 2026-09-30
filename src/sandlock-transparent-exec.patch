@@ -1224,6 +1224,24 @@ index f796767..d448105 100644
      }
  
      #[test]
+diff --git a/crates/sandlock-core/src/context.rs b/crates/sandlock-core/src/context.rs
+index 1ee2513..d5dd95e 100644
+--- a/crates/sandlock-core/src/context.rs
++++ b/crates/sandlock-core/src/context.rs
+@@ -415,7 +415,12 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
+     // cwd controls where the child starts; workdir is only for COW
+     let effective_cwd = if let Some(ref cwd) = sandbox.cwd {
+         if let Some(ref chroot_root) = sandbox.chroot {
+-            Some(chroot_root.join(cwd.strip_prefix("/").unwrap_or(cwd)))
++            // A mounted directory lives at the mount's host place (the deepest mount serving it): one only the mount holds,
++            // such as a directory a parent run made in a merged view, exists nowhere under the root.
++            let mounted = crate::chroot::resolve::resolve_chroot_mounts(&sandbox.fs_mount).into_iter()
++                .filter_map(|(virtual_path, host)| cwd.strip_prefix(&virtual_path).ok().map(|rest| (virtual_path.as_os_str().len(), host.join(rest))))
++                .max_by_key(|(depth, _)| *depth).map(|(_, host)| host);
++            Some(mounted.unwrap_or_else(|| chroot_root.join(cwd.strip_prefix("/").unwrap_or(cwd))))
+         } else {
+             Some(cwd.clone())
+         }
 diff --git a/crates/sandlock-core/src/cow/deletions.rs b/crates/sandlock-core/src/cow/deletions.rs
 index f96622d..6e8c060 100644
 --- a/crates/sandlock-core/src/cow/deletions.rs
@@ -2010,7 +2028,7 @@ index 3673d84..96624f9 100644
                  virtual_hostname: None,
                  has_http_acl: false,
 diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/src/seccomp/notif.rs
-index abcd92c..8ed153c 100644
+index abcd92c..b816a7e 100644
 --- a/crates/sandlock-core/src/seccomp/notif.rs
 +++ b/crates/sandlock-core/src/seccomp/notif.rs
 @@ -514,6 +514,13 @@ pub(crate) struct OpenArgs {
@@ -2048,44 +2066,93 @@ index abcd92c..8ed153c 100644
      pub deterministic_dirs: bool,
      pub virtual_hostname: Option<String>,
      pub has_http_acl: bool,
-@@ -1219,6 +1233,10 @@ struct ExecRewritePlan {
+@@ -937,10 +951,11 @@ fn inject_failure_resp(id: u64) -> SeccompNotifResp {
+ /// The ioctl return value is the fd number assigned in the child process.
+ /// After this call, no additional SECCOMP_IOCTL_NOTIF_SEND is needed.
+ fn inject_fd_and_send(fd: RawFd, id: u64, srcfd: RawFd, newfd_flags: u32) -> io::Result<i32> {
++    let readable = readable_in_place_of_path_fd(srcfd)?;
+     let addfd = SeccompNotifAddfd {
+         id,
+         flags: SECCOMP_ADDFD_FLAG_SEND,
+-        srcfd: srcfd as u32,
++        srcfd: readable.as_ref().map_or(srcfd, |readable| readable.as_raw_fd()) as u32,
+         newfd: 0,   // ignored when SECCOMP_ADDFD_FLAG_SETFD is not set
+         newfd_flags,
+     };
+@@ -954,6 +969,26 @@ fn inject_fd_and_send(fd: RawFd, id: u64, srcfd: RawFd, newfd_flags: u32) -> io:
+     }
+ }
+ 
++/// ADDFD takes the file with fget, which refuses O_PATH ones: the nearest the kernel lets a supervisor hand over is
++/// the same object opened for reading (not blocking on a FIFO or device), which fails as reading it would.
++fn readable_in_place_of_path_fd(fd: RawFd) -> io::Result<Option<OwnedFd>> {
++    use std::os::unix::io::FromRawFd;
++    if unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_PATH == 0 {
++        return Ok(None);
++    }
++    let mut state: libc::stat = unsafe { std::mem::zeroed() };
++    if unsafe { libc::fstat(fd, &mut state) } != 0 {
++        return Err(io::Error::last_os_error());
++    }
++    let plain = matches!(state.st_mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFDIR);
++    let flags = libc::O_RDONLY | libc::O_NOCTTY | libc::O_CLOEXEC | if plain { 0 } else { libc::O_NONBLOCK };
++    let link = std::ffi::CString::new(format!("/proc/self/fd/{fd}")).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
++    match unsafe { libc::open(link.as_ptr(), flags) } {
++        -1 => Err(io::Error::last_os_error()),
++        reopened => Ok(Some(unsafe { OwnedFd::from_raw_fd(reopened) })),
++    }
++}
++
+ /// Inject a file descriptor into the child process (without responding).
+ /// ioctl(fd, SECCOMP_IOCTL_NOTIF_ADDFD, &addfd)
+ fn inject_fd(fd: RawFd, id: u64, srcfd: RawFd, targetfd: i32) -> io::Result<()> {
+@@ -1214,11 +1249,15 @@ const EXEC_MAX_PTR_ENTRIES: usize = 1 << 20;
+ /// child, plus the relocation buffer being assembled for it.
+ struct ExecRewritePlan {
+     /// Bytes to write at the path pointer: the fd path, then every
+-    /// relocated string, all NUL-terminated.
++    /// relocated string not set below the stack, all NUL-terminated.
+     buf: Vec<u8>,
      /// Pointer-slot patches: (slot address in the argv/envp array,
      /// relocated string address).
      patches: Vec<(u64, u64)>,
 +    /// A script exec's whole replacement argv array, written at the argv pointer.
 +    argv: Option<Vec<u8>>,
-+    /// A script exec's prefix strings and where they go: below the caller's stack pointer.
++    /// Strings set below the caller's stack pointer (a script's prefix, relocated strings) and where they start.
 +    scratch: Option<(u64, Vec<u8>)>,
  }
  
  /// Read a NULL-terminated pointer array (argv or envp) from child memory.
-@@ -1313,6 +1331,12 @@ fn read_exec_cstr(
+@@ -1313,6 +1352,13 @@ fn read_exec_cstr(
  ///   downward so each gap segment is read once, and once a NUL is seen every
  ///   lower string is known to terminate before the window.
  ///
-+/// With `script`, argv[0] is replaced by that prefix (binfmt_script's
-+/// `interpreter [argument] filename`): the prefix strings go just below the
-+/// given stack address, which must be mapped and clear of everything the kernel
-+/// reads, and the whole argv array is rewritten in place, so strings under the
-+/// longer array are relocated as well.
++/// With `below`, relocated strings go just below that stack address instead,
++/// which must be mapped and clear of everything the kernel reads, so the fd
++/// path is all that lands on the caller's strings. A prefix there replaces
++/// argv[0] (binfmt_script's `interpreter [argument] filename`), and the whole
++/// argv array is rewritten in place, so strings under the longer array are
++/// relocated as well.
 +///
  /// Fails if the argv/envp pointer arrays themselves fall inside the final
  /// window: the kernel reads those arrays after we return, and they cannot be
  /// moved because their addresses live in syscall registers.
-@@ -1322,17 +1346,40 @@ fn plan_exec_rewrite(
+@@ -1322,57 +1368,85 @@ fn plan_exec_rewrite(
      fd_path: &[u8],
      argv_ptr: u64,
      envp_ptr: u64,
-+    script: Option<(&[Vec<u8>], u64)>,
++    below: Option<(&[Vec<u8>], u64)>,
  ) -> Result<ExecRewritePlan, NotifError> {
      let argv = read_exec_ptr_array(read, argv_ptr)?;
      let envp = read_exec_ptr_array(read, envp_ptr)?;
 -    let slots: Vec<(u64, u64)> = argv
-+    if script.is_some() && argv_ptr == 0 {
++    let (strings, top) = below.unwrap_or_default();
++    let script = !strings.is_empty();
++    if script && argv_ptr == 0 {
 +        return Err(NotifError::Supervisor("a script exec needs an argv array to rewrite".into()));
 +    }
 +    // A script exec drops argv[0] for its prefix, so that string need not survive.
-+    let dropped = usize::from(script.is_some() && !argv.is_empty());
++    let dropped = usize::from(script && !argv.is_empty());
 +    let argv_slots: Vec<(u64, u64)> = argv
          .iter()
          .enumerate()
@@ -2099,22 +2166,31 @@ index abcd92c..8ed153c 100644
          .collect();
  
      let mut buf = fd_path.to_vec();
-+    let (strings, top) = script.unwrap_or_default();
-+    let scratch_len = strings.iter().map(|s| s.len() as u64 + 1).sum::<u64>();
-+    let scratch_start = top.saturating_sub(scratch_len) & !7;
++    // Below the stack, a string's address is its offset there until the whole set is placed.
 +    let mut prefix = Vec::new();
 +    let mut scratch = Vec::new();
 +    for s in strings {
-+        prefix.push(scratch_start + scratch.len() as u64);
++        prefix.push(scratch.len() as u64);
 +        scratch.extend_from_slice(s);
 +        scratch.push(0);
 +    }
 +    // The rewritten argv array: the prefix, the kept arguments, then NULL.
-+    let argv_window = script.map(|_| (argv_ptr, argv_ptr + 8 * (prefix.len() + argv_slots.len() + 1) as u64));
++    let argv_window = script.then(|| (argv_ptr, argv_ptr + 8 * (prefix.len() + argv_slots.len() + 1) as u64));
      let mut relocated: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
      let relocate = |buf: &mut Vec<u8>,
++                        scratch: &mut Vec<u8>,
                          relocated: &mut std::collections::BTreeMap<u64, u64>,
-@@ -1346,32 +1393,35 @@ fn plan_exec_rewrite(
+                         read: &mut dyn FnMut(u64, usize) -> Result<Vec<u8>, NotifError>,
+                         ptr: u64|
+      -> Result<(), NotifError> {
+         let s = read_exec_cstr(&mut |a, l| read(a, l), ptr)?;
+-        relocated.insert(ptr, path_ptr + buf.len() as u64);
+-        buf.extend_from_slice(&s);
+-        buf.push(0);
++        let (target, base) = if below.is_some() { (scratch, 0) } else { (buf, path_ptr) };
++        relocated.insert(ptr, base + target.len() as u64);
++        target.extend_from_slice(&s);
++        target.push(0);
          Ok(())
      };
  
@@ -2135,20 +2211,20 @@ index abcd92c..8ed153c 100644
 -        if seg.contains(&0) {
 -            break;
 +    for start in std::iter::once(path_ptr).chain(argv_window.map(|(start, _)| start)) {
-+        let mut below: Vec<u64> = slots
++        let mut reaching: Vec<u64> = slots
 +            .iter()
 +            .map(|&(_, p)| p)
 +            .filter(|&p| p < start && start - p < EXEC_MAX_ARG_STRLEN as u64 && !relocated.contains_key(&p))
 +            .collect();
-+        below.sort_unstable();
-+        below.dedup();
++        reaching.sort_unstable();
++        reaching.dedup();
 +        let mut nul_free_from = start;
-+        for &p in below.iter().rev() {
++        for &p in reaching.iter().rev() {
 +            let seg = read_exec_range(read, p, (nul_free_from - p) as usize)?;
 +            if seg.contains(&0) {
 +                break;
 +            }
-+            relocate(&mut buf, &mut relocated, read, p)?;
++            relocate(&mut buf, &mut scratch, &mut relocated, read, p)?;
 +            nul_free_from = p;
          }
 -        relocate(&mut buf, &mut relocated, read, p)?;
@@ -2162,12 +2238,14 @@ index abcd92c..8ed153c 100644
          let mut grew = false;
          for &(_, p) in &slots {
 -            if !relocated.contains_key(&p) && p >= path_ptr && p < end {
+-                relocate(&mut buf, &mut relocated, read, p)?;
 +            let inside = (p >= path_ptr && p < end) || argv_window.is_some_and(|(start, stop)| p >= start && p < stop);
 +            if !relocated.contains_key(&p) && inside {
-                 relocate(&mut buf, &mut relocated, read, p)?;
++                relocate(&mut buf, &mut scratch, &mut relocated, read, p)?;
                  grew = true;
              }
-@@ -1382,19 +1432,140 @@ fn plan_exec_rewrite(
+         }
+@@ -1382,19 +1456,151 @@ fn plan_exec_rewrite(
      }
  
      let end = path_ptr + buf.len() as u64;
@@ -2187,11 +2265,15 @@ index abcd92c..8ed153c 100644
 +            "execve argv/envp pointer array overlaps the path rewrite window".into(),
 +        ));
 +    }
-+    if script.is_some() {
++    let start = top.saturating_sub(scratch.len() as u64) & !7;
++    for address in prefix.iter_mut().chain(relocated.values_mut()) {
++        *address += start;
++    }
++    if !scratch.is_empty() {
 +        // The scratch must be mapped, and clear of every window, array and string the kernel reads.
-+        let scratch_window = (scratch_start, scratch_start + scratch.len() as u64);
-+        read_exec_range(read, scratch_start, scratch.len())?;
-+        let mut clear = scratch_start != 0
++        let scratch_window = (start, start + scratch.len() as u64);
++        read_exec_range(read, start, scratch.len())?;
++        let mut clear = start != 0
 +            && !meets(path_ptr, end - path_ptr, scratch_window)
 +            && !meets(argv_ptr, argv_len, scratch_window)
 +            && !meets(envp_ptr, envp_len, scratch_window);
@@ -2201,7 +2283,7 @@ index abcd92c..8ed153c 100644
 +            }
 +        }
 +        if !clear {
-+            return Err(NotifError::Supervisor("script prefix scratch overlaps exec arguments".into()));
++            return Err(NotifError::Supervisor("strings set below the stack overlap exec arguments".into()));
          }
      }
  
@@ -2211,9 +2293,9 @@ index abcd92c..8ed153c 100644
 -        .collect();
 -    Ok(ExecRewritePlan { buf, patches })
 +    let moved = |p: u64| relocated.get(&p).copied();
-+    let patched = if script.is_some() { &slots[argv_slots.len()..] } else { &slots[..] };
++    let patched = if script { &slots[argv_slots.len()..] } else { &slots[..] };
 +    let patches = patched.iter().filter_map(|&(slot, p)| moved(p).map(|np| (slot, np))).collect();
-+    let argv = script.map(|_| {
++    let argv = script.then(|| {
 +        prefix
 +            .iter()
 +            .copied()
@@ -2222,7 +2304,14 @@ index abcd92c..8ed153c 100644
 +            .flat_map(u64::to_ne_bytes)
 +            .collect()
 +    });
-+    Ok(ExecRewritePlan { buf, patches, argv, scratch: script.map(|_| (scratch_start, scratch)) })
++    Ok(ExecRewritePlan { buf, patches, argv, scratch: (!scratch.is_empty()).then_some((start, scratch)) })
++}
++
++/// The stack pointer of `pid` stopped in a syscall (the second-to-last field of /proc/PID/syscall): below it, past
++/// the red zone, nothing is live.
++fn syscall_stack_pointer(pid: u32) -> Option<u64> {
++    let state = std::fs::read_to_string(format!("/proc/{pid}/syscall")).ok()?;
++    u64::from_str_radix(state.split_whitespace().rev().nth(1)?.trim_start_matches("0x"), 16).ok().filter(|&sp| sp > 8192)
 +}
 +
 +fn apply_exec_rewrite(notif_fd: RawFd, id: u64, pid: u32, path_ptr: u64, argv_ptr: u64, plan: ExecRewritePlan) -> Result<(), NotifError> {
@@ -2318,7 +2407,7 @@ index abcd92c..8ed153c 100644
  }
  
  /// Rewrite an execve/execveat path argument to `/proc/self/fd/<child_fd>`,
-@@ -1436,12 +1607,38 @@ pub(crate) fn rewrite_exec_path_to_fd(
+@@ -1436,12 +1642,42 @@ pub(crate) fn rewrite_exec_path_to_fd(
  ) -> Result<(), NotifError> {
      let fd_path = format!("/proc/self/fd/{}\0", child_fd);
      let mut read = |addr: u64, len: usize| read_child_mem(notif_fd, id, pid, addr, len);
@@ -2326,7 +2415,15 @@ index abcd92c..8ed153c 100644
 -    write_child_mem_force(notif_fd, id, pid, path_ptr, &plan.buf)?;
 -    for (slot, new_ptr) in plan.patches {
 -        write_child_mem_force(notif_fd, id, pid, slot, &new_ptr.to_ne_bytes())?;
-+    let plan = plan_exec_rewrite(&mut read, path_ptr, fd_path.as_bytes(), argv_ptr, envp_ptr, None)?;
++    // Relocated strings follow the fd path unless that runs off the path's mapping (a path high on the stack, as in
++    // the environment); they then go below the stack pointer.
++    let plan = match plan_exec_rewrite(&mut read, path_ptr, fd_path.as_bytes(), argv_ptr, envp_ptr, None) {
++        Ok(plan) if read_exec_range(&mut read, path_ptr, plan.buf.len()).is_ok() => plan,
++        in_place => match syscall_stack_pointer(pid) {
++            Some(sp) => plan_exec_rewrite(&mut read, path_ptr, fd_path.as_bytes(), argv_ptr, envp_ptr, Some((&[], sp - 4096))).or(in_place)?,
++            None => in_place?,
++        },
++    };
 +    apply_exec_rewrite(notif_fd, id, pid, path_ptr, argv_ptr, plan)
 +}
 +
@@ -2347,11 +2444,7 @@ index abcd92c..8ed153c 100644
 +) -> Result<bool, NotifError> {
 +    let fd_path = format!("/proc/self/fd/{}\0", child_fd);
 +    let mut read = |addr: u64, len: usize| read_child_mem(notif_fd, id, pid, addr, len);
-+    // The caller is stopped in execve: below its stack pointer, past the red zone, nothing is live.
-+    let sp = std::fs::read_to_string(format!("/proc/{pid}/syscall")).ok().and_then(|state| {
-+        u64::from_str_radix(state.split_whitespace().rev().nth(1)?.trim_start_matches("0x"), 16).ok()
-+    });
-+    let Some(sp) = sp.filter(|&sp| sp > 8192) else {
++    let Some(sp) = syscall_stack_pointer(pid) else {
 +        return Ok(false);
 +    };
 +    match plan_exec_rewrite(&mut read, path_ptr, fd_path.as_bytes(), argv_ptr, envp_ptr, Some((prefix, sp - 4096))) {
@@ -2362,7 +2455,7 @@ index abcd92c..8ed153c 100644
  }
  
  // ============================================================
-@@ -2585,6 +2782,16 @@ mod tests {
+@@ -2585,6 +2821,16 @@ mod tests {
          path_ptr: u64,
          argv_ptr: u64,
          envp_ptr: u64,
@@ -2375,16 +2468,16 @@ index abcd92c..8ed153c 100644
 +        path_ptr: u64,
 +        argv_ptr: u64,
 +        envp_ptr: u64,
-+        script: Option<(&[Vec<u8>], u64)>,
++        below: Option<(&[Vec<u8>], u64)>,
      ) -> Result<ExecRewritePlan, NotifError> {
          let mut read = |addr: u64, len: usize| {
              let off = addr
-@@ -2595,7 +2802,58 @@ mod tests {
+@@ -2595,7 +2841,74 @@ mod tests {
                  .map(|s| s.to_vec())
                  .ok_or_else(|| NotifError::Supervisor("read past fake memory".into()))
          };
 -        plan_exec_rewrite(&mut read, path_ptr, FD, argv_ptr, envp_ptr)
-+        plan_exec_rewrite(&mut read, path_ptr, FD, argv_ptr, envp_ptr, script)
++        plan_exec_rewrite(&mut read, path_ptr, FD, argv_ptr, envp_ptr, below)
 +    }
 +
 +    fn words(ptrs: &[u64]) -> Vec<u8> {
@@ -2416,13 +2509,29 @@ index abcd92c..8ed153c 100644
 +        put_ptrs(&mut mem, FAKE_BASE + 0x900, &[FAKE_BASE + 0x810]);
 +        let prefix = [b"/usr/bin/env".to_vec(), b"node".to_vec(), b"./s".to_vec()];
 +        let p = plan_with(&mem, FAKE_BASE, FAKE_BASE + 0x800, FAKE_BASE + 0x900, Some((&prefix, FAKE_BASE + 0xF00))).unwrap();
-+        assert_eq!(p.buf, [FD, b"K=V\0".as_slice()].concat());
-+        assert_eq!(p.patches, vec![(FAKE_BASE + 0x900, FAKE_BASE + 16)]);
-+        assert_eq!(p.argv, Some(words(&[FAKE_BASE + 0xEE8, FAKE_BASE + 0xEF5, FAKE_BASE + 0xEFA, 0])));
++        assert_eq!(p.buf, FD);
++        assert_eq!(p.scratch, Some((FAKE_BASE + 0xEE0, b"/usr/bin/env\0node\0./s\0K=V\0".to_vec())));
++        assert_eq!(p.patches, vec![(FAKE_BASE + 0x900, FAKE_BASE + 0xEF6)]);
++        assert_eq!(p.argv, Some(words(&[FAKE_BASE + 0xEE0, FAKE_BASE + 0xEED, FAKE_BASE + 0xEF2, 0])));
 +        // The scratch below the stack pointer may not cover a string the kernel still reads.
 +        put(&mut mem, FAKE_BASE + 0xEF0, b"B=W\0");
 +        put_ptrs(&mut mem, FAKE_BASE + 0x900, &[FAKE_BASE + 0x810, FAKE_BASE + 0xEF0]);
 +        assert!(plan_with(&mem, FAKE_BASE, FAKE_BASE + 0x800, FAKE_BASE + 0x900, Some((&prefix, FAKE_BASE + 0xF00))).is_err());
++    }
++
++    #[test]
++    fn exec_rewrite_below_the_stack_writes_only_the_fd_path_over_the_strings() {
++        // flock execs getenv("SHELL") as path and argv[0]: the tail of an environment string high on the stack.
++        let mut mem = vec![0u8; 4096];
++        put(&mut mem, FAKE_BASE + 0x100, b"SHELL=/bin/sh\0A=1\0");
++        put_ptrs(&mut mem, FAKE_BASE + 0x800, &[FAKE_BASE + 0x100, FAKE_BASE + 0x10E]);
++        put_ptrs(&mut mem, FAKE_BASE + 0x900, &[FAKE_BASE + 0x106]);
++        let p = plan_with(&mem, FAKE_BASE + 0x106, FAKE_BASE + 0x900, FAKE_BASE + 0x800, Some((&[], FAKE_BASE + 0xF00))).unwrap();
++        assert_eq!(p.buf, FD);
++        assert_eq!(p.scratch, Some((FAKE_BASE + 0xEE0, b"SHELL=/bin/sh\0/bin/sh\0A=1\0".to_vec())));
++        let moved = vec![(FAKE_BASE + 0x900, FAKE_BASE + 0xEEE), (FAKE_BASE + 0x800, FAKE_BASE + 0xEE0), (FAKE_BASE + 0x808, FAKE_BASE + 0xEF6)];
++        assert_eq!(p.patches, moved);
++        assert_eq!(p.argv, None);
 +    }
 +
 +    #[test]
@@ -2439,6 +2548,26 @@ index abcd92c..8ed153c 100644
      }
  
      #[test]
+@@ -2712,6 +3025,19 @@ mod tests {
+         assert!(p.patches.is_empty());
+     }
+ 
++    #[test]
++    fn o_path_fds_are_handed_over_opened_for_reading() {
++        use std::os::unix::io::{AsRawFd, OwnedFd};
++        let dir = std::ffi::CString::new(std::env::temp_dir().into_os_string().into_encoded_bytes()).unwrap();
++        let path_fd = unsafe { OwnedFd::from_raw_fd(libc::open(dir.as_ptr(), libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)) };
++        let readable = readable_in_place_of_path_fd(path_fd.as_raw_fd()).unwrap().expect("an O_PATH fd is replaced");
++        assert_eq!(unsafe { libc::fcntl(readable.as_raw_fd(), libc::F_GETFL) } & libc::O_PATH, 0);
++        let (mut a, mut b): (libc::stat, libc::stat) = unsafe { (std::mem::zeroed(), std::mem::zeroed()) };
++        unsafe { (libc::fstat(path_fd.as_raw_fd(), &mut a), libc::fstat(readable.as_raw_fd(), &mut b)) };
++        assert_eq!((a.st_dev, a.st_ino), (b.st_dev, b.st_ino));
++        assert!(readable_in_place_of_path_fd(readable.as_raw_fd()).unwrap().is_none());
++    }
++
+     #[test]
+     fn inject_failure_response_denies_not_continues() {
+         // When fd injection fails, the supervisor must fail closed: deny the
 diff --git a/crates/sandlock-core/src/seccomp_plan.rs b/crates/sandlock-core/src/seccomp_plan.rs
 index 03fc456..d03d36f 100644
 --- a/crates/sandlock-core/src/seccomp_plan.rs
