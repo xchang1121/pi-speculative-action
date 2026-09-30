@@ -10,6 +10,114 @@
  	int qual_flg;		/* qual_flags[scno] or DEFAULT_QUAL_FLAGS + RAW */
  # if SUPPORTED_PERSONALITIES > 1
  	unsigned int currpers;	/* Personality at the time of scno update */
+@@ -857,6 +860,9 @@ getfdpath(struct tcb *tcp, int fd, char *buf, unsigned bufsize)
+ 	return getfdpath_pid(tcp->pid, fd, buf, bufsize, NULL);
+ }
+ 
++/* Whether read and write data on a descriptor naming a filesystem path is left out. */
++extern bool elide_path_data;
++
+ extern unsigned long getfdinode(struct tcb *, int);
+ extern enum sock_proto getfdproto(struct tcb *, int);
+ 
+--- a/src/io.c
++++ b/src/io.c
+@@ -13,6 +13,23 @@
+ #include <fcntl.h>
+ #include <sys/uio.h>
+ 
++/* File bytes are captured from the filesystem itself; a stream's are only in the trace. */
++static bool
++path_data_elided(struct tcb *tcp, const kernel_ulong_t fd)
++{
++	char path[PATH_MAX + 1];
++	return elide_path_data && getfdpath(tcp, (int) fd, path, sizeof(path)) > 0 && path[0] == '/';
++}
++
++static void
++print_fd_data(struct tcb *tcp, const kernel_ulong_t fd, const kernel_ulong_t addr, const kernel_ulong_t len)
++{
++	if (len && path_data_elided(tcp, fd))
++		tprints_string("\"\"...");
++	else
++		printstrn(tcp, addr, len);
++}
++
+ SYS_FUNC(read)
+ {
+ 	if (entering(tcp)) {
+@@ -24,7 +41,7 @@ SYS_FUNC(read)
+ 		if (syserror(tcp))
+ 			printaddr(tcp->u_arg[1]);
+ 		else
+-			printstrn(tcp, tcp->u_arg[1], tcp->u_rval);
++			print_fd_data(tcp, tcp->u_arg[0], tcp->u_arg[1], tcp->u_rval);
+ 		tprint_arg_next();
+ 
+ 		/* count */
+@@ -40,7 +57,7 @@ SYS_FUNC(write)
+ 	tprint_arg_next();
+ 
+ 	/* buf */
+-	printstrn(tcp, tcp->u_arg[1], tcp->u_arg[2]);
++	print_fd_data(tcp, tcp->u_arg[0], tcp->u_arg[1], tcp->u_arg[2]);
+ 	tprint_arg_next();
+ 
+ 	/* count */
+@@ -155,7 +172,7 @@ SYS_FUNC(readv)
+ 	} else {
+ 		/* iov */
+ 		tprint_iov_upto(tcp, tcp->u_arg[2], tcp->u_arg[1], tcp->u_rval,
+-				syserror(tcp) ? iov_decode_addr
++				syserror(tcp) || path_data_elided(tcp, tcp->u_arg[0]) ? iov_decode_addr
+ 					      : iov_decode_str,
+ 				NULL);
+ 		tprint_arg_next();
+@@ -173,7 +190,7 @@ SYS_FUNC(writev)
+ 	tprint_arg_next();
+ 
+ 	/* iov */
+-	tprint_iov(tcp, tcp->u_arg[2], tcp->u_arg[1], iov_decode_str);
++	tprint_iov(tcp, tcp->u_arg[2], tcp->u_arg[1], path_data_elided(tcp, tcp->u_arg[0]) ? iov_decode_addr : iov_decode_str);
+ 	tprint_arg_next();
+ 
+ 	/* iovcnt */
+@@ -193,7 +210,7 @@ SYS_FUNC(pread)
+ 		if (syserror(tcp))
+ 			printaddr(tcp->u_arg[1]);
+ 		else
+-			printstrn(tcp, tcp->u_arg[1], tcp->u_rval);
++			print_fd_data(tcp, tcp->u_arg[0], tcp->u_arg[1], tcp->u_rval);
+ 		tprint_arg_next();
+ 
+ 		/* count */
+@@ -213,7 +230,7 @@ SYS_FUNC(pwrite)
+ 	tprint_arg_next();
+ 
+ 	/* buf */
+-	printstrn(tcp, tcp->u_arg[1], tcp->u_arg[2]);
++	print_fd_data(tcp, tcp->u_arg[0], tcp->u_arg[1], tcp->u_arg[2]);
+ 	tprint_arg_next();
+ 
+ 	/* count */
+@@ -257,7 +274,7 @@ do_preadv(struct tcb *tcp, const int flags_arg)
+ 
+ 		/* iov */
+ 		tprint_iov_upto(tcp, len, tcp->u_arg[1], tcp->u_rval,
+-				syserror(tcp) ? iov_decode_addr
++				syserror(tcp) || path_data_elided(tcp, tcp->u_arg[0]) ? iov_decode_addr
+ 					      : iov_decode_str,
+ 				NULL);
+ 		tprint_arg_next();
+@@ -295,7 +312,7 @@ do_pwritev(struct tcb *tcp, const int flags_arg)
+ 	tprint_arg_next();
+ 
+ 	/* iov */
+-	tprint_iov(tcp, len, tcp->u_arg[1], iov_decode_str);
++	tprint_iov(tcp, len, tcp->u_arg[1], path_data_elided(tcp, tcp->u_arg[0]) ? iov_decode_addr : iov_decode_str);
+ 	tprint_arg_next();
+ 
+ 	/* iovcnt */
 --- a/src/strace.c
 +++ b/src/strace.c
 @@ -27,6 +27,10 @@
@@ -23,12 +131,13 @@
  
  #include "kill_save_errno.h"
  #include "exitkill.h"
-@@ -2231,6 +2235,130 @@ add_path_trace(struct pathtrace *pt, const char *path)
+@@ -2231,6 +2235,131 @@ add_path_trace(struct pathtrace *pt, const char *path)
   * Don't want main() to inline us and defeat the reason
   * we have a separate function.
   */
 +static int handoff_fd = -1;
 +static bool children_only;
++bool elide_path_data;
 +static int thread_group(int pid)
 +{
 +    char path[64], line[256];
@@ -154,7 +263,7 @@
  static void ATTRIBUTE_NOINLINE
  init(int argc, char *argv[])
  {
-@@ -2364,6 +2492,10 @@ init(int argc, char *argv[])
+@@ -2364,6 +2493,11 @@ init(int argc, char *argv[])
  		{ "help",		no_argument,	   0, 'h' },
  		{ "instruction-pointer", no_argument,      0, 'i' },
  		{ "interruptible",	required_argument, 0, 'I' },
@@ -162,10 +271,11 @@
 +        { "handoff-library", required_argument, 0, 0x4001 },
 +        { "handoff-image", required_argument, 0, 0x4002 },
 +        { "trace-children-only", no_argument, 0, 0x4003 },
++        { "elide-path-data", no_argument, 0, 0x4004 },
  		{ "kill-on-exit",	no_argument,	   0, GETOPT_KILL_ON_EXIT },
  		{ "stack-trace" ,	optional_argument, 0, GETOPT_STACK },
  		{ "stack-traces" ,	optional_argument, 0, GETOPT_STACK },
-@@ -2564,6 +2696,14 @@ init(int argc, char *argv[])
+@@ -2564,6 +2698,15 @@ init(int argc, char *argv[])
  					  "by this build of strace");
  #endif
  			break;
@@ -177,10 +287,11 @@
 +        case 0x4001: handoff_library = optarg; break;
 +        case 0x4002: handoff_image = optarg; break;
 +        case 0x4003: children_only = true; break;
++        case 0x4004: elide_path_data = true; break;
  		case GETOPT_KILL_ON_EXIT:
  			opt_kill_on_exit = true;
  			break;
-@@ -3007,6 +3147,9 @@ init(int argc, char *argv[])
+@@ -3007,6 +3150,9 @@ init(int argc, char *argv[])
  
  	debug_msg("ptrace_setoptions = %#x", ptrace_setoptions);
  	test_ptrace_seize();
@@ -190,7 +301,7 @@
  	test_ptrace_get_syscall_info();
  
  	/*
-@@ -3288,6 +3431,12 @@ static struct tcb *
+@@ -3288,6 +3434,12 @@ static struct tcb *
  maybe_allocate_tcb(const int pid, int status)
  {
  	if (!WIFSTOPPED(status)) {
@@ -203,7 +314,7 @@
  		if (detach_on_execve && pid == strace_child) {
  			/* example: strace -bexecve sh -c 'exec true' */
  			strace_child = 0;
-@@ -3304,6 +3453,11 @@ maybe_allocate_tcb(const int pid, int status)
+@@ -3304,6 +3456,11 @@ maybe_allocate_tcb(const int pid, int status)
  		return NULL;
  	}
  	if (followfork) {
@@ -215,7 +326,7 @@
  		/* We assume it's a fork/vfork/clone child */
  		struct tcb *tcp = alloctcb(pid);
  		after_successful_attach(tcp, post_attach_sigstop);
-@@ -3588,6 +3742,7 @@ tcb_wait_tab_check_size(const size_t size)
+@@ -3588,6 +3745,7 @@ tcb_wait_tab_check_size(const size_t size)
  static const struct tcb_wait_data *
  next_event(void)
  {
@@ -223,7 +334,7 @@
  	if (interrupted)
  		return NULL;
  
-@@ -3913,6 +4068,26 @@ dispatch_event(const struct tcb_wait_data *wd)
+@@ -3913,6 +4071,26 @@ dispatch_event(const struct tcb_wait_data *wd)
  	 * around union wait fixed by glibc commit glibc-2.24~391
  	 */
  	int status = wd ? wd->status : 0;
@@ -250,7 +361,7 @@
  
  	if (current_tcp && has_seccomp_filter(current_tcp))
  		restart_op = seccomp_filter_restart_operator(current_tcp);
-@@ -3951,6 +4126,8 @@ dispatch_event(const struct tcb_wait_data *wd)
+@@ -3951,6 +4129,8 @@ dispatch_event(const struct tcb_wait_data *wd)
  		ATTRIBUTE_FALLTHROUGH;
  
  	case TE_SYSCALL_STOP:
@@ -259,7 +370,7 @@
  		if (trace_syscall(current_tcp, &restart_sig) < 0) {
  			/*
  			 * ptrace() failed in trace_syscall().
-@@ -3965,6 +4142,11 @@ dispatch_event(const struct tcb_wait_data *wd)
+@@ -3965,6 +4145,11 @@ dispatch_event(const struct tcb_wait_data *wd)
  			 */
  			return true;
  		}
@@ -271,7 +382,7 @@
  		if (has_seccomp_filter(current_tcp)) {
  			/*
  			 * Syscall and seccomp stops can happen in different
-@@ -4034,6 +4216,9 @@ dispatch_event(const struct tcb_wait_data *wd)
+@@ -4034,6 +4219,9 @@ dispatch_event(const struct tcb_wait_data *wd)
  		return true;
  
  	case TE_STOP_BEFORE_EXECVE:
@@ -281,7 +392,7 @@
  		/* The syscall succeeded, clear the flag.  */
  		current_tcp->flags &= ~TCB_CHECK_EXEC_SYSCALL;
  		/*
-@@ -4231,6 +4416,14 @@ main(int argc, char *argv[])
+@@ -4231,6 +4419,14 @@ main(int argc, char *argv[])
  {
  	setlocale(LC_ALL, "");
  	init(argc, argv);
