@@ -95,7 +95,7 @@ tt pi-speculative-action
 
 可选入口 `./thinkthread-extension` 使用随包固定的 Agent POSIX SDK。安装器选项见 `--help`；TUI 的 Ready 仅说明连接和路线准备成功。
 
-Linux x86_64 alpha4 的 `read/ls/edit` 有采纳验证；新文件 `write` 的异步路径解析存在 `EACCES` 差异，会拒绝候选并由 Actor 执行。写入权限/身份、嵌套进程跟踪及其他平台的完整资格仍未完成。`fs.run` 继承 Profile 网络策略，不虚拟时间或随机数；快照相等不能授权任意 Bash 或原生搜索复用。
+Linux x86_64 alpha8（RPM 0.1.0-22）以本地脚本化模型验证：`read/edit/write`（含新文件）经 `fs.run` 投机并被采纳，采纳前的外部改动以 `thinkthread_dependency_changed` 拒绝候选、由 Actor 执行。Runtime 以 ptrace 监管 Agent 进程树，进程后端与 held-exec 无法再跟踪其子进程，Bash 只剩整条调用的历史复用；WSL 中 Linux 的 `pi` 须先于 Windows PATH 被找到。`fs.run` 继承 Profile 网络策略，不虚拟时间或随机数；快照相等不能授权任意 Bash 或原生搜索复用。
 
 ## 复用与安全边界
 

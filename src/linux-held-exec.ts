@@ -253,7 +253,7 @@ export class LinuxHeldExecBoundary {
 		if (process.platform !== "linux" || process.arch !== "x64") throw new Error("x86-64 Linux required");
 		const binary = await resolveLinuxExecHelper(options.binary);
 		const probe = await execute(binary, ["--skip-code", "42", "/bin/sh", "-c", "exec /bin/true"]);
-		if (probe.code !== 42 || probe.signal) throw new Error("held-exec functional probe failed");
+		if (probe.code !== 42 || probe.signal) throw new Error(`held-exec functional probe failed${await inheritedTracer()}`);
 		await mkdir(options.storeRoot, { recursive: true, mode: 0o700 });
 		await chmod(options.storeRoot, 0o700);
 		const candidate = path.join(options.storeRoot, `held-${process.pid}-${randomBytes(6).toString("hex")}.sock`);
@@ -633,6 +633,12 @@ function validDescriptors(descriptors: WireRequest["descriptors"]): boolean {
 		reachable.add(right);
 	}
 	return descriptors.every(descriptor => reachable.has(descriptor.alias));
+}
+
+/** A tracer already on this process (a ThinkThread Runtime, a debugger) follows its children and holds their only ptrace slot. */
+export async function inheritedTracer(): Promise<string> {
+	const tracer = /^TracerPid:\s*([1-9]\d*)$/m.exec(await readFile("/proc/self/status", "utf8").catch(() => ""))?.[1];
+	return tracer ? `: processes here are already traced by pid ${tracer}` : "";
 }
 
 async function heldBy(pid: number, tracer: number, binary: string): Promise<boolean> {
