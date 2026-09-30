@@ -943,11 +943,7 @@ export class PatternAwareStore {
 		const firstRecurrenceProbe = gap === 0 && context.length === 1 && pool.samples.length === 1;
 		const probationary =
 			firstRecurrenceProbe ||
-			(pool.patternIDs ?? []).some(
-				(patternID) =>
-					(this.patterns.get(patternID)?.occurrences ?? this.settings.minOccurrences) <
-					this.settings.minOccurrences,
-			);
+			(pool.patternIDs ?? []).some((patternID) => (this.patterns.get(patternID)?.occurrences ?? this.settings.minOccurrences) < this.settings.minOccurrences);
 		if (pool.samples.length < this.settings.minOccurrences && !probationary) { this.retirePoolPatterns(pool, new Set()); return; }
 		const minimumSupport = probationary ? pool.samples.length : this.settings.minOccurrences;
 		const constantSupport = bindingEvidenceThreshold(this.settings);
