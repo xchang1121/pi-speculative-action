@@ -1391,21 +1391,6 @@ describe("structural speculative runtime", () => {
 		} finally { await runtime.dispose(); }
 	});
 
-	it("charges a native call's matching, capture and settlement time as negative savings", async () => {
-		let now = 100;
-		const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
-		const { runtime, events } = harness({ source: { id: "none", enabled: () => false, propose: () => undefined },
-			captureAuthoritativeResult: ({ action }) => { now += 3; return { route: RESOURCE_ROUTE, dispose: () => {},
-				seal: (output) => { now += 4; return world(output, { executionFingerprint: action.executionFingerprint }); } }; } });
-		try {
-			const actor = call("turn"); await runtime.startTurn(actor);
-			const prepared = await runtime.prepareActorCall(actor);
-			now += 10; await prepared?.settle(new TimelineInterval(now - 10, now), "actor");
-			await runtime.finishTurn({ ...actor, terminal: true });
-			expect(events.find((event) => event.type === "task")?.timing).toMatchObject({ toolExecutionMs: 10, estimatedSavingsMs: -7 });
-		} finally { await runtime.dispose(); clock.mockRestore(); }
-	});
-
 	it.each([0, 40])("calibrates loss and recovery per Actor call across competing cached results with %ims capture", async (captureMs) => {
 		let now = 1, cost = 20;
 		const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
@@ -1508,9 +1493,7 @@ describe("structural speculative runtime", () => {
 			await runtime.finishTurn({ ...call("next-task"), terminal: true });
 			expect(reconstruct).toHaveBeenCalledTimes(evaluations + (unretained ? 1 : 0));
 			expect(events.filter((event) => event.type === "task").at(-1)?.timing).toMatchObject({
-				toolExecutionMs: unretained ? 20 : 0, authoritativeToolCount: unretained ? 1 : 0, hiddenLatencyMs: 0,
-				estimatedSavingsMs: unretained ? -3 : learned ? 2 : 17,
-			});
+				toolExecutionMs: unretained ? 20 : 0, authoritativeToolCount: unretained ? 1 : 0, hiddenLatencyMs: 0 });
 		} finally { await runtime.dispose(); clock.mockRestore(); admission.mockRestore(); }
 		expect(disposed).toHaveBeenCalledOnce(); expect(runtime.inspect().sharedCandidates).toBe(0);
 		for (const dispose of queryDisposals) expect(dispose).toHaveBeenCalledOnce();

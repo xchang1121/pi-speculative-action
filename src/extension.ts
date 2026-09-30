@@ -186,9 +186,9 @@ export function formatSpeculativeActionStatus(input: {
 		`Actor candidate rejections: ${countSummary(metrics.actorCandidateRejections)}`,
 		`Candidates: ${metrics.candidateStarted} started; ${metrics.candidateSucceeded} succeeded; ${metrics.candidateFailed} failed; ${metrics.candidateCancelled} cancelled`,
 		metrics.tasks > 0
-			? `Task timing (${metrics.tasks} completed): ${formatTaskTiming(metrics)}. Savings credit each hit with the larger of its computation and the expected Actor time; net savings are signed against native history and include speculation's cost.`
+			? `Task timing (${metrics.tasks} completed): ${formatTaskTiming(metrics)}. Savings credit each hit with the larger of its computation and the expected Actor time.`
 			: "Task timing: n/a (no completed task); serialized overlap and speedup are not reported as 0.",
-		`Drafter tokens (input + output, every request): ${metrics.totalDraftTokens}${metrics.estimatedSavingsMs > 0 ? `; ${Math.round(metrics.totalDraftTokens * 1000 / metrics.estimatedSavingsMs)} per net second saved` : ""}`,
+		`Drafter tokens (input + output, every request): ${metrics.totalDraftTokens}${metrics.savingsMs > 0 ? `; ${Math.round(metrics.totalDraftTokens * 1000 / metrics.savingsMs)} per second saved` : ""}`,
 		`Live speculative results: ${cache.resultEntries}/${cache.cacheCapacity}, ${formatBytes(cache.resultBytes)}/${formatBytes(cache.cacheByteCapacity ?? 0)}; cold: ${cache.cacheCold}; hot: ${cache.cacheHot}; jobs: ${cache.inFlightJobs}; branches: ${cache.branchEntries} (${formatBytes(cache.branchBytes)})`,
 	].join("\n");
 }
@@ -1454,19 +1454,18 @@ function countSummary(counts: Readonly<Record<string, number>>): string {
 	return entries.length > 0 ? entries.map(([key, count]) => `${key}=${count}`).join(", ") : "none";
 }
 
-type TimingSummary = Pick<SpeculativeTraceSummary, "endToEndMs" | "estimatedSavingsMs" | "savingsMs" | "hiddenLatencyMs" | "toolExecutionMs" | "toolWaitMs">;
+type TimingSummary = Pick<SpeculativeTraceSummary, "endToEndMs" | "savingsMs" | "hiddenLatencyMs" | "toolExecutionMs" | "toolWaitMs">;
 
 function formatTaskTiming(timing: TimingSummary): string {
-	const net = timing.estimatedSavingsMs;
-	return `${formatDuration(timing.endToEndMs)} wall; ${formatDuration(timing.savingsMs)} saved (net ${net < 0 ? "-" : ""}${formatDuration(Math.abs(net))}); ${formatSpeedups(timing)}; ${formatDuration(timing.hiddenLatencyMs)} of ${formatDuration(timing.toolExecutionMs)} tool time hidden`;
+	return `${formatDuration(timing.endToEndMs)} wall; ${formatDuration(timing.savingsMs)} saved; ${formatSpeedups(timing)}; ${formatDuration(timing.hiddenLatencyMs)} of ${formatDuration(timing.toolExecutionMs)} tool time hidden`;
 }
 
-/** End-to-end speed up leads, as the TUI has always shown it, with the signed net value beside it. Tool time speed up is the
- * Actor's tool wait with each hit's avoided service restored, over the wait it actually had. */
+/** End-to-end speed up leads, as the TUI has always shown it. Tool time speed up is the Actor's tool wait with each hit's avoided
+ * service restored, over the wait it actually had. */
 function formatSpeedups(timing: TimingSummary): string {
-	const percent = (savings: number) => timing.endToEndMs > 0 && Number.isFinite(savings) ? `${savings < 0 ? "" : "+"}${(100 * savings / timing.endToEndMs).toFixed(1)}%` : "n/a";
+	const percent = (savings: number) => timing.endToEndMs > 0 && Number.isFinite(savings) ? `+${(100 * savings / timing.endToEndMs).toFixed(1)}%` : "n/a";
 	const tool = timing.toolWaitMs > 0 && Number.isFinite(timing.savingsMs) ? `${((timing.toolWaitMs + timing.savingsMs) / timing.toolWaitMs).toFixed(2)}x` : "n/a";
-	return `End-to-End SpeedUp ${percent(timing.savingsMs)} (net ${percent(timing.estimatedSavingsMs)}); Tool time speed up ${tool}`;
+	return `End-to-End SpeedUp ${percent(timing.savingsMs)}; Tool time speed up ${tool}`;
 }
 
 function formatDuration(ms: number): string {

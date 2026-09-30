@@ -7,27 +7,25 @@ describe("single-run serialized counterfactual timing", () => {
 		timeline.recordTool(new TimelineInterval(100, 170, [{ computation: child, shared: [
 			new TimelineInterval(105, 140), new TimelineInterval(130, 150),
 		] }]));
-		expect(timeline.measure(170)).toMatchObject({ estimatedSavingsMs: 85, savingsMs: 85, hiddenLatencyMs: 0, toolWaitMs: 70 });
+		expect(timeline.measure(170)).toMatchObject({ savingsMs: 85, hiddenLatencyMs: 0, toolWaitMs: 70 });
 		const parallel = new TaskTimeline(0), children = [new TimelineInterval(20, 60), new TimelineInterval(40, 80)];
 		parallel.recordTool(new TimelineInterval(10, 90, children.map(computation => ({ computation, shared: [computation] }))));
-		expect(parallel.measure(100).estimatedSavingsMs).toBe(0);
+		expect(parallel.measure(100).savingsMs).toBe(0);
 		const adoption = new TimelineInterval(80, 90);
 		parallel.recordTool(new TimelineInterval(80, 100, [{ computation: adoption, shared: [adoption], expectedActorMs: 60 }]));
-		expect(parallel.measure(100).estimatedSavingsMs).toBe(50);
+		expect(parallel.measure(100).savingsMs).toBe(50);
 		const repeated = new TaskTimeline(100);
 		repeated.recordTool(new TimelineInterval(100, 170, [{ computation: child }, { computation: child }]));
-		expect(repeated.measure(170).estimatedSavingsMs).toBe(260);
+		expect(repeated.measure(170).savingsMs).toBe(260);
 	});
 
 	it.each([
-		{ name: "input reuse with native service history", start: 100, end: 200, actor: [], tools: [[110, 130]],
-			adoption: { hitLatencyMs: 25, expectedNativeMs: 80 }, expected: { estimatedSavingsMs: 55 } },
 		{ name: "input reuse slower than its own computation", start: 100, end: 200, actor: [], tools: [[110, 130]],
-			adoption: { hitLatencyMs: 25 }, expected: { estimatedSavingsMs: -5, savingsMs: 0 } },
-		{ name: "hit slower than native history but quicker than the Actor's expected call", start: 100, end: 200, actor: [], tools: [[110, 130]],
-			adoption: { hitLatencyMs: 25, expectedActorMs: 90, expectedNativeMs: 20 }, expected: { estimatedSavingsMs: -5, savingsMs: 65, toolWaitMs: 25 } },
+			adoption: { hitLatencyMs: 25 }, expected: { savingsMs: 0 } },
+		{ name: "hit quicker than the Actor's expected call", start: 100, end: 200, actor: [], tools: [[110, 130]],
+			adoption: { hitLatencyMs: 25, expectedActorMs: 90 }, expected: { savingsMs: 65, toolWaitMs: 25 } },
 		{ name: "parallel native batch", start: 0, end: 100, actor: [[0, 40]], tools: [[40, 100], [40, 90], [40, 70]],
-			expected: { toolExecutionMs: 140, serializedMs: 100, hiddenLatencyMs: 0, estimatedSavingsMs: 0 } },
+			expected: { toolExecutionMs: 140, serializedMs: 100, hiddenLatencyMs: 0, savingsMs: 0 } },
 		{ name: "already serial", start: 0, end: 300, actor: [[0, 100], [200, 300]], tools: [[100, 200]],
 			expected: { endToEndMs: 300, nonToolMs: 200, toolExecutionMs: 100, serializedMs: 300, hiddenLatencyMs: 0 } },
 		{ name: "tool overlaps Actor generation", start: 0, end: 100, actor: [[0, 100]], tools: [[10, 60]],
@@ -67,9 +65,7 @@ describe("single-run serialized counterfactual timing", () => {
 		nextTask.recordTool(first);
 		expect(nextTask.measure(300)).toMatchObject({ authoritativeToolCount: 0, toolExecutionMs: 0, hiddenLatencyMs: 0 });
 		for (const hitLatencyMs of [5, 10, 100]) nextTask.recordTool(first, { hitLatencyMs });
-		expect(nextTask.measure(300)).toMatchObject({ endToEndMs: 100, estimatedSavingsMs: 5, hiddenLatencyMs: 0 });
-		nextTask.recordOverhead(8);
-		expect(nextTask.measure(300).estimatedSavingsMs).toBe(-3);
+		expect(nextTask.measure(300)).toMatchObject({ endToEndMs: 100, hiddenLatencyMs: 0 });
 		expect(new TimelineInterval(Number.NaN, -1)).toEqual({ startedAt: 0, completedAt: 0 });
 	});
 

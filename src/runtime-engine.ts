@@ -1798,7 +1798,7 @@ export function makeSpeculativeActionRuntime<
 				}); } finally { inputs.dispose(); }
 			},
 			settle: (toolExecution, output, operations) => state.session.lifecycle.track(
-				settleActorCall(state, input, actualCall, actorAction, output, capturePreparationMs, toolExecution, operations && Object.freeze([...operations]), actorArrivedAt)),
+				settleActorCall(state, input, actualCall, actorAction, output, capturePreparationMs, toolExecution, operations && Object.freeze([...operations]))),
 		};
 		const onActorActionMaterialized = adapter.onActorActionMaterialized;
 		if (actualKey && onActorActionMaterialized) {
@@ -1952,7 +1952,6 @@ export function makeSpeculativeActionRuntime<
 		capturePreparationMs: number,
 		toolExecution: TimelineInterval,
 		operations?: readonly ExecutionOperationBinding[],
-		actorArrivedAt = toolExecution.startedAt,
 	): Promise<void> => {
 		if (!state.actorActions.delete(actorAction)) return;
 		const settlementStartedAt = performance.now();
@@ -1972,8 +1971,6 @@ export function makeSpeculativeActionRuntime<
 		// Compare complete alternatives; optional capture waits belong to the native path, not the native reference.
 		const settledMs = Math.max(0, performance.now() - settlementStartedAt);
 		if (key) state.session.scheduler.observeActorService(actionTimingIdentity(key), durationMs + capturePreparationMs + settledMs, durationMs);
-		// Matching, failed joins, capture and settlement are what speculation cost this native call.
-		state.session.timeline?.recordOverhead(toolExecution.startedAt - actorArrivedAt + settledMs);
 	};
 
 	const queueActorSettlement = (
