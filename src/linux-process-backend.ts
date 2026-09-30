@@ -34,7 +34,7 @@ import { emptyWorldReuseMetrics, snapshotExecutionScope, type ExecutionScope, ty
 import { type ProcessReusePlan, ProcessReusePlanner } from "./reuse-planner.ts";
 import { ProvenanceCertificateStore, type ProvenanceStoreOptions, type VerifiedArtifactClosure } from "./reuse-store.ts";
 import { SpeculationScheduler, type ServiceTimingIdentity, waitForCandidate } from "./scheduler.ts";
-import { observeStrace, straceCommand, tracedObservations, tracedWrites, type ObservedProcessPath, type StraceObservation, type TracedWrite, writesWithin } from "./strace-observer.ts";
+import { observeStrace, straceCommand, traceTail, type ObservedProcessPath, type StraceObservation, type TraceTail, type TracedWrite, writesWithin } from "./strace-observer.ts";
 import type { WorkspaceTransactionOwnership } from "./workspace-transaction.ts";
 import type { ToolProcessInvocation } from "./tool-settlement.ts";
 import type { ResourceValidation } from "./settlement.ts";
@@ -177,7 +177,7 @@ interface DispatcherResponse {
 
 /** A brokered run writing into a session's workspace: its launcher's pid and, once known, what it and the runs brokered from its tree wrote. */
 interface SessionWriter {
-	readonly startedAt: number; endedAt?: number; readonly tracePrefix: string; writes?: readonly TracedWrite[]; settled?: true;
+	readonly startedAt: number; endedAt?: number; readonly tracePrefix: string; writes?: readonly TracedWrite[]; tail?: TraceTail; settled?: true;
 	readonly pid?: number; written?: readonly string[]; descendants?: readonly SessionWriter[];
 }
 
@@ -1340,7 +1340,7 @@ export class LinuxProcessReuseBackend {
 				const ownership = async (): Promise<WorkspaceTransactionOwnership | undefined> => inputs.some(input => !input.type && (input.flags & 3) !== 0) ? undefined : observing.then(async observation => {
 					// When it last looked at each workspace name; one the trace cannot place counts as seen at its end.
 					const looked = new Map<string, number>();
-					for (const [target, at] of await tracedObservations(tracePrefix)) { const name = named(target); if (name !== undefined) looked.set(name, Math.max(looked.get(name) ?? 0, at)); }
+					for (const [target, at] of (await (own.tail ??= traceTail(tracePrefix)).read()).seen) { const name = named(target); if (name !== undefined) looked.set(name, Math.max(looked.get(name) ?? 0, at)); }
 					// A run brokered from its own tree, which its trace holds as a launcher, wrote on its behalf.
 					const traced = new Set(observation.pids);
 					const children = [...session.writers].filter(other => other !== own && other.pid !== undefined && traced.has(other.pid));
@@ -1350,7 +1350,7 @@ export class LinuxProcessReuseBackend {
 					interfered: async (paths, until) => {
 						const targets = new Set([...paths].flatMap(name => roots.map(root => path.posix.join(root, name))));
 						for (const other of session.writers) if (other !== own && !descendants.includes(other) && other.startedAt <= until && (other.endedAt ?? Infinity) >= own.startedAt &&
-							writesWithin(other.writes ?? await tracedWrites(other.tracePrefix), targets, own.startedAt, until)) return true;
+							writesWithin(other.writes ?? (await (other.tail ??= traceTail(other.tracePrefix)).read()).writes, targets, own.startedAt, until)) return true;
 						return false;
 					},
 				}; });
@@ -1519,7 +1519,7 @@ export class LinuxProcessReuseBackend {
 			if (outcome) this.processScheduler.observeSpeculativeService(processTimingIdentity(prototype, weakKey), durationMs);
 			if (!transactionFinishing) await transaction.abort().catch(() => undefined);
 			if (writer) {
-				writer.writes ??= await tracedWrites(writer.tracePrefix).catch(() => [{ at: writer!.startedAt, opened: true }]);
+				writer.writes ??= await (writer.tail ??= traceTail(writer.tracePrefix)).read().then(tail => tail.writes, () => [{ at: writer!.startedAt, opened: true }]);
 				writer.settled = true;
 				if ([...session.writers].every(other => other.settled)) session.writers.clear();
 			}

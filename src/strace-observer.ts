@@ -89,9 +89,9 @@ interface TraceLine {
 	readonly result: string;
 	readonly failure?: string;
 }
-const TRACE_DELIMITERS: Readonly<Record<string, string>> = { "(": ")", "[": "]", "{": "}", "<": ">" };
+const TRACE_DELIMITERS: Readonly<Record<string, string>> = { "(": ")", "[": "]", "{": "}", "<": ">" }, QUOTED_RUN = /(?:[^"\\]|\\.)+/ys, ANNOTATION_RUN = /(?:[^<>\\]|\\.)+/ys, PLAIN_RUN = /[^"\\()[\]{}<>,/]+/y;
 
-/** Delimit once: quoted paths and descriptor annotations are data, never syscall syntax. */
+/** Delimit once: quoted paths and descriptor annotations are data, never syscall syntax; what means nothing where it stands is passed whole. */
 /** -ttt stamps each record with its wall-clock start, which orders overlapping workspace writers. */
 const untimed = (line: string) => line.replace(/^\d+\.\d+ /, "");
 
@@ -108,6 +108,9 @@ function parseTraceLine(line: string): TraceLine {
 		const character = line[index]!;
 		const context = stack.at(-1);
 		if (character === "\\" && (quoted || context?.endsWith(">"))) { index++; continue; }
+		const run = quoted ? QUOTED_RUN : context?.endsWith(">") ? ANNOTATION_RUN : PLAIN_RUN;
+		run.lastIndex = index;
+		if (run.test(line)) index = run.lastIndex - 1;
 		if (quoted) { if (character === '"') quoted = false; continue; }
 		// -yy sockets use -> for peers; filesystem paths escape literal angle brackets.
 		if (context?.endsWith(">")) {
@@ -116,7 +119,7 @@ function parseTraceLine(line: string): TraceLine {
 			continue;
 		}
 		if (character === '"') { quoted = true; continue; }
-		if (line.startsWith("/*", index)) {
+		if (character === "/" && line[index + 1] === "*") {
 			const end = line.indexOf("*/", index + 2);
 			if (end < 0) return failure;
 			index = end + 1;
@@ -142,7 +145,7 @@ function reassembleSyscalls(lines: readonly string[], pid: number, order?: reado
 	const complete: TraceLine[] = [];
 	for (const [index, line] of lines.entries()) {
 		const append = (text: string, sequence = order?.[index]) => complete.push({ ...parseTraceLine(text), ...(sequence !== undefined ? { order: sequence } : {}) });
-		const unfinished = /^\s*([a-zA-Z0-9_]+)\(.*\s<unfinished \.\.\.>\s*$/.exec(line);
+		const unfinished = line.includes("<unfinished ...>") ? /^\s*([a-zA-Z0-9_]+)\(.*\s<unfinished \.\.\.>\s*$/.exec(line) : null;
 		if (unfinished) {
 			const name = unfinished[1]!;
 			(pending.get(name) ?? pending.set(name, []).get(name)!).push({ text: line.replace(/\s*<unfinished \.\.\.>\s*$/, ""), order: order?.[index] });
@@ -527,20 +530,9 @@ export async function observeStrace(
 		const ordered = name === `${prefix}stream`;
 		if (options.frozen && !ordered) throw new Error("continuation requires one ordered trace");
 		if (!ordered && (!Number.isSafeInteger(pid) || pid <= 0)) continue;
-		const target = path.join(directory, name);
-		let contents: string;
-		if (remaining === undefined) contents = await readFile(target, "utf8");
-		else {
-			const handle = await open(target, "r");
-			try {
-				const info = await handle.stat();
-				if (!info.isFile()) throw new Error("trace is not a regular file");
-				const buffer = Buffer.allocUnsafe(Math.min(remaining, info.size));
-				const { bytesRead } = await handle.read(buffer);
-				remaining -= bytesRead;
-				contents = buffer.toString("utf8", 0, bytesRead);
-			} finally { await handle.close(); }
-		}
+		const target = path.join(directory, name), bytes = remaining === undefined ? await readFile(target) : await readTrace(target, 0, remaining);
+		if (remaining !== undefined) remaining -= bytes.length;
+		let contents = bytes.toString("utf8");
 		if (options.privateUpper) contents = contents.replaceAll(`<${options.privateUpper}/`, "</");
 		const groups = new Map<number, { lines: string[]; order?: number[] }>();
 		if (!ordered) groups.set(pid, { lines: contents.split(/\r?\n/).map(untimed) });
@@ -868,31 +860,39 @@ function internalPoll(line: TraceLine, ownPipes: ReadonlySet<string>): boolean {
 /** A traced execution's workspace writes so far (it may still run), stamped in wall-clock ms; an unresolvable name is undefined. */
 export interface TracedWrite { readonly paths?: readonly string[]; readonly at: number; readonly opened: boolean }
 
-export async function tracedWrites(tracePrefix: string): Promise<readonly TracedWrite[]> {
-	const prefix = `${path.basename(tracePrefix)}.`, writes: TracedWrite[] = [];
-	for (const name of await readdir(path.dirname(tracePrefix)).catch(() => [] as string[])) {
-		if (name.startsWith(prefix)) for (const record of (await readFile(path.join(path.dirname(tracePrefix), name), "utf8").catch(() => "")).split("\n")) {
-			const stamped = /^(?:\d+ )?(\d+\.\d+) (.*)$/.exec(record), line = stamped && parseTraceLine(stamped[2]!);
-			if (!line || !syscallSucceeded(line) || !writesPath(line)) continue;
-			const paths = syscallPaths(line, line.name, "");
-			writes.push({ ...(paths?.every(target => target.startsWith("/")) ? { paths } : {}), at: Number(stamped[1]) * 1000, opened: /^open(?:at2?)?$/.test(line.name) });
-		}
-	}
-	return writes;
+/** A trace file's bytes from `offset`, at most `limit` of them. */
+async function readTrace(file: string, offset: number, limit = Number.POSITIVE_INFINITY): Promise<Buffer> {
+	const handle = await open(file, "r");
+	try {
+		const info = await handle.stat();
+		if (!info.isFile()) throw new Error("trace is not a regular file");
+		const buffer = Buffer.allocUnsafe(Math.max(0, Math.min(limit, info.size - offset)));
+		return buffer.subarray(0, (await handle.read(buffer, 0, buffer.length, offset)).bytesRead);
+	} finally { await handle.close(); }
 }
 
-/** When a trace last named each absolute path, by name or through a descriptor, in wall-clock milliseconds; a failed lookup names one too. */
-export async function tracedObservations(tracePrefix: string): Promise<ReadonlyMap<string, number>> {
-	const prefix = `${path.basename(tracePrefix)}.`, seen = new Map<string, number>();
-	for (const name of await readdir(path.dirname(tracePrefix)).catch(() => [] as string[])) {
-		if (name.startsWith(prefix)) for (const record of (await readFile(path.join(path.dirname(tracePrefix), name), "utf8").catch(() => "")).split("\n")) {
-			const stamped = /^(?:\d+ )?(\d+\.\d+) (.*)$/.exec(record), line = stamped && parseTraceLine(stamped[2]!);
-			if (line) for (const target of [...syscallPaths(line, line.name, "") ?? [], ...line.args.flatMap(arg => absoluteDescriptorPath(arg) ?? [])]) {
-				if (target.startsWith("/")) seen.set(target, Math.max(seen.get(target) ?? 0, Number(stamped[1]) * 1000));
+/** A trace read as it grows, each record parsed once however often it is asked: its writes so far, and when it last named each absolute path
+ * (by name or through a descriptor; a failed lookup names one too), in wall-clock milliseconds. */
+export interface TraceTail { readonly writes: readonly TracedWrite[]; readonly seen: ReadonlyMap<string, number>; read(): Promise<TraceTail> }
+
+export function traceTail(tracePrefix: string): TraceTail {
+	const directory = path.dirname(tracePrefix), prefix = `${path.basename(tracePrefix)}.`, writes: TracedWrite[] = [], seen = new Map<string, number>(), offsets = new Map<string, number>();
+	let reading: Promise<unknown> = Promise.resolve();
+	const advance = async () => {
+		for (const name of (await readdir(directory).catch(() => [] as string[])).filter(name => name.startsWith(prefix))) {
+			// A record strace is still writing waits for its newline.
+			const offset = offsets.get(name) ?? 0, bytes = await readTrace(path.join(directory, name), offset).catch(() => Buffer.alloc(0)), complete = bytes.lastIndexOf(10) + 1;
+			offsets.set(name, offset + complete);
+			for (const record of bytes.toString("utf8", 0, complete).split("\n")) {
+				const stamped = /^(?:\d+ )?(\d+\.\d+) (.*)$/.exec(record), line = stamped && parseTraceLine(stamped[2]!);
+				if (!line) continue;
+				const at = Number(stamped[1]) * 1000, paths = syscallPaths(line, line.name, "");
+				if (syscallSucceeded(line) && writesPath(line)) writes.push({ ...(paths?.every(target => target.startsWith("/")) ? { paths } : {}), at, opened: /^open(?:at2?)?$/.test(line.name) });
+				for (const target of [...paths ?? [], ...line.args.flatMap(arg => absoluteDescriptorPath(arg) ?? [])]) if (target.startsWith("/")) seen.set(target, Math.max(seen.get(target) ?? 0, at));
 			}
 		}
-	}
-	return seen;
+	};
+	return { writes, seen, read() { const next = reading.then(advance); reading = next.catch(() => undefined); return next.then(() => this); } };
 }
 
 /** Whether writes reached `targets` within [since, until], or held one open to write by `until`. An unresolvable write counts. */
