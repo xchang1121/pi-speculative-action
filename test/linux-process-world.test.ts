@@ -1705,6 +1705,23 @@ int main(void) { char path[32] = "/bin/true\\0intact"; char *args[] = {path, 0};
 		} finally { await fixture.dispose(); }
 	});
 
+	test("writes privately where its user natively could, and names only the net changes it left", async ({ skip }) => {
+		if (process.platform !== "linux") return skip("Linux only");
+		const fixture = await createLinuxProcessBenchmark("pi-private-writes-"), outside = await mkdtemp(path.join(os.tmpdir(), "pi-private-outside-"));
+		try {
+			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
+			const scratch = "t=$(mktemp -d) && echo t > $t/x && cat $t/x && rm -r $t";
+			for (const [label, command, external] of [["external", `echo private > ${outside}/f && cat ${outside}/f && ${scratch}`, true], ["scratch", scratch, false]] as const) {
+				const branch = await forkReusableBash(fixture, { label, command, actionNamespace: "private-writes", executionFingerprint });
+				try {
+					expect(textOutput(branch.output.result)).toBe(external ? "private\nt\n" : "t\n");
+					expect(JSON.stringify(await branch.validate?.()).includes(`external_write:${outside}/f`)).toBe(external);
+				} finally { await branch.dispose?.(); }
+			}
+			expect(existsSync(path.join(outside, "f")), "a private write must not reach the host").toBe(false);
+		} finally { await fixture.dispose(); await rm(outside, { recursive: true, force: true }); }
+	});
+
 	test("settles a brokered child's inherited pipe as the child left its queue, executed and replayed", async ({ skip }) => {
 		if (process.platform !== "linux") return skip("Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-pipe-settle-");

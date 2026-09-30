@@ -2470,9 +2470,7 @@ export function makeSpeculativeActionRuntime<
 	};
 
 	const pruneActionContexts = (session: Session): void => {
-		for (const [id, context] of session.actionContexts) {
-			if (context.opportunity.state.status !== "matching") releaseActionContext(session, id);
-		}
+		for (const [id, context] of session.actionContexts) if (context.opportunity.state.status !== "matching") releaseActionContext(session, id);
 	};
 
 	const resetTaskTimeline = (session: Session): void => { session.timeline = undefined; session.lastActorArrivedAt = undefined; };

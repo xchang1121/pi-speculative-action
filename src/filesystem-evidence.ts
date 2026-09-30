@@ -162,9 +162,7 @@ async function captureFile(target: string, maxBytes: number, retainContent: bool
 		if (!before.isFile()) throw new Error("not_regular_file");
 		if (observed?.stat && !sameFilesystemIdentity(observed.stat, before)) throw new Error("file_changed_during_capture");
 		const beforePath = verifyPath ? observed?.realPath ?? await fs.realpath(target) : target;
-		if (Number.isFinite(maxBytes) && before.size > BigInt(Math.floor(maxBytes))) {
-			throw new Error(`file_too_large:${before.size}`);
-		}
+		if (Number.isFinite(maxBytes) && before.size > BigInt(Math.floor(maxBytes))) throw new Error(`file_too_large:${before.size}`);
 		handle = await fs.open(binding ? `/proc/self/fd/${binding.fd}` : target,
 			constants.O_RDONLY | (binding || !verifyPath ? 0 : constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
 		if (!sameFilesystemIdentity(before, await handle.stat({ bigint: true }))) throw new Error("file_changed_during_capture");

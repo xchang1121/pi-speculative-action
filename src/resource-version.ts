@@ -811,9 +811,7 @@ function normalizeDependencies(root: string, dependencies: ReadonlyArray<Resourc
 	const result = new Map<string, ResourceDependency>();
 	for (const dependency of dependencies) {
 		const absolute = path.resolve(root, dependency.path);
-		if (!containsFilesystemPath(root, absolute)) {
-			throw new Error(`resource dependency escapes workspace: ${dependency.path}`);
-		}
+		if (!containsFilesystemPath(root, absolute)) throw new Error(`resource dependency escapes workspace: ${dependency.path}`);
 		const normalized = { path: absolute, scope: dependency.scope };
 		result.set(dependencyKey(normalized), normalized);
 	}
@@ -1001,9 +999,7 @@ async function fingerprintDependencies(
 			files.set(key, pending);
 			return staged(pending);
 		}
-		if (!info.isDirectory() || scope === "content") {
-			throw new Error(`unsupported_resource_type:${specialFileType(info)}:${target}`);
-		}
+		if (!info.isDirectory() || scope === "content") throw new Error(`unsupported_resource_type:${specialFileType(info)}:${target}`);
 		if (supplied && !(supplied instanceof Uint8Array) && supplied.names) {
 			view?.capture(target, { type: "directory", entries: supplied.names, realPath: realTarget, dependency, ...directoryObjectSlot(supplied.names, view) });
 			return { ...fingerprintDirectory(info, realTarget, supplied.names), bytesRead: 0, filesRead: 0 };
@@ -1047,9 +1043,7 @@ async function fingerprintBinding(dependency: ResourceDependency) {
 
 async function stableEntry(target: string, before: BigIntStats, resolved: string, scope: ResourceDependency["scope"], settled = false): Promise<FingerprintResult> {
 	const after = settled ? before : await fingerprintIO(() => fs.lstat(target, { bigint: true }));
-	if (!sameFilesystemIdentity(before, after)) {
-		throw new Error(`resource_file_changed:${target}`);
-	}
+	if (!sameFilesystemIdentity(before, after)) throw new Error(`resource_file_changed:${target}`);
 	return {
 		value: { type: specialFileType(after), mode: Number(after.mode), resolved, size: scope === "stat" && after.isFile() ? Number(after.size) : undefined },
 		stamp: digest([statStamp(after), resolved]),

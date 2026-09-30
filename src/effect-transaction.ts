@@ -156,9 +156,7 @@ export class EffectTransactionCoordinator<Output> {
 		expected: EffectTransactionState,
 		next: EffectTransactionState,
 	): void {
-		if (attempt.stateValue !== expected) {
-			throw new Error(`effect transaction ${attempt.id} is ${attempt.stateValue}, expected ${expected}`);
-		}
+		if (attempt.stateValue !== expected) throw new Error(`effect transaction ${attempt.id} is ${attempt.stateValue}, expected ${expected}`);
 		attempt.stateValue = next;
 	}
 }

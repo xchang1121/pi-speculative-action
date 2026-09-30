@@ -231,9 +231,7 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 			for (;;) {
 				const keys = depth ? [inputPartition(current, true)] : [inputPartition(current), inputPartition(current, true)];
 				for (const key of keys) {
-					for (const indexed of state.partitions.get(key) ?? []) {
-						inputs.set(indexed, Math.min(inputs.get(indexed) ?? depth, depth));
-					}
+					for (const indexed of state.partitions.get(key) ?? []) inputs.set(indexed, Math.min(inputs.get(indexed) ?? depth, depth));
 				}
 				const parent = path.dirname(current); if (parent === current) break;
 				current = parent; depth++;

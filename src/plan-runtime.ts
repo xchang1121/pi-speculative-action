@@ -97,9 +97,7 @@ export class PredictionOpportunity {
 	}
 
 	confirm(actorAction: ActorActionIdentity, adoption: PredictionAdoption): PredictionSettlement | undefined {
-		if (this.stateValue.status !== "matching" || !sameActorAction(this.stateValue.actorAction, actorAction)) {
-			return undefined;
-		}
+		if (this.stateValue.status !== "matching" || !sameActorAction(this.stateValue.actorAction, actorAction)) return undefined;
 		return this.finish({
 			prediction: this.identity,
 			observation: "observed",
@@ -418,9 +416,7 @@ export class PlanRuntime {
 			if (dependency.proposalID) connected.add(this.plans.get(dependency.proposalID)!.graph);
 		}
 		const graph: PlanGraph = { plans: new Set(), ordered: [] };
-		for (const previous of connected) for (const plan of previous.plans) {
-			if (plan !== current) graph.plans.add(plan);
-		}
+		for (const previous of connected) for (const plan of previous.plans) if (plan !== current) graph.plans.add(plan);
 		const next: MutablePlan = {
 			id: input.id,
 			source: input.source,

@@ -1180,9 +1180,7 @@ export function formatSpeculativeActionEvent(event: SpeculativeActionEvent<strin
 			} else if (event.state.status === "succeeded") {
 				parts.push(formatDuration(event.state.executionMs));
 				const reuse = event.candidate.world?.executionMetrics.reuse;
-				if (reuse && hasProcessReuse(reuse)) {
-					parts.push(`Bash branch work ${formatProcessWorkReuse(reuse)}`);
-				}
+				if (reuse && hasProcessReuse(reuse)) parts.push(`Bash branch work ${formatProcessWorkReuse(reuse)}`);
 			} else {
 				parts.push(causeSummary(event.state.cause), formatDuration(event.state.executionMs));
 			}

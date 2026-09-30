@@ -672,9 +672,7 @@ export class PatternAwareStore {
 				mass: item.weightedCount * recencyWeight(item.lastSeenSequence, this.clock, settings.decayHalfLifeEvents) };
 		});
 		const massByTool = new Map<string, number>();
-		for (const item of values) {
-			massByTool.set(item.action.tool, (massByTool.get(item.action.tool) ?? 0) + item.mass);
-		}
+		for (const item of values) massByTool.set(item.action.tool, (massByTool.get(item.action.tool) ?? 0) + item.mass);
 		const provenTools = new Set(values.filter((item) => item.count >= settings.minOccurrences).map((item) => item.action.tool));
 		// The final beam ranks merged contextual and recurrent support using the same settled evidence.
 		const candidates = values.filter((item) => provenTools.has(item.action.tool) && !continuation.visitedPatternIDs.includes(item.patternID));
@@ -1448,9 +1446,7 @@ class PatternBindingAnalysis {
 				if (replay === samples.length) break;
 			}
 			if (selected) selected = this.withObservedVariantCounts(selected, samples, targets);
-			if (!selected && constant && stablePayloadConstant(samples, constantSupport)) {
-				selected = { type: "constant", value: firstTarget };
-			}
+			if (!selected && constant && stablePayloadConstant(samples, constantSupport)) selected = { type: "constant", value: firstTarget };
 			if (!selected) { if (allowProjectedOmissions) continue; return; }
 			bindings[encodedPath] = selected;
 		}

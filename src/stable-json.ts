@@ -63,9 +63,7 @@ export function cloneSharedData<Value>(value: Value): Value {
 		seen.set(item, owned);
 		for (const key of Reflect.ownKeys(item)) {
 			const property = Object.getOwnPropertyDescriptor(item, key)!;
-			if (!("value" in property) || (!property.enumerable && !(array && key === "length"))) {
-				throw new Error("shared_output_not_data");
-			}
+			if (!("value" in property) || (!property.enumerable && !(array && key === "length"))) throw new Error("shared_output_not_data");
 			if (array && key === "length") continue;
 			Object.defineProperty(owned, key, { value: copy(property.value), enumerable: true, writable: true, configurable: true });
 		}
@@ -79,9 +77,7 @@ function equalObject(left: object, right: object): boolean {
 	const rightArray = Array.isArray(right);
 	if (leftArray || rightArray) {
 		if (!leftArray || !rightArray || left.length !== right.length) return false;
-		for (let index = 0; index < left.length; index++) {
-			if (!equalSlot(left[index], right[index], true)) return false;
-		}
+		for (let index = 0; index < left.length; index++) if (!equalSlot(left[index], right[index], true)) return false;
 		return true;
 	}
 	const leftRecord = left as Record<string, unknown>;

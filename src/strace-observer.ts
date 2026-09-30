@@ -43,6 +43,8 @@ export interface StraceObservation {
 	readonly resumedInterpositions?: readonly number[];
 	/** Workspace paths, relative to it, the traced processes created, removed, renamed or opened to write. */
 	readonly written?: readonly string[];
+	/** Paths outside the workspace it wrote, which a private branch took. */
+	readonly external?: readonly string[];
 }
 
 export interface StraceObservationOptions {
@@ -588,7 +590,7 @@ export async function observeStrace(
 	const opened = new Map<number, Set<number>>(); // Descriptors a process opened itself, whose status flags it chose.
 	const refusedIndexLocks = new Set<number>(), ownPipes = new Set<string>(); // Pipes the traced processes created, by inode.
 	// The semantic roots are one workspace seen from the sandbox and from its source: name a file by its place in it.
-	const changedMetadata = new Set<string>(), written = new Set<string>(), workspaceName = (target: string) =>
+	const changedMetadata = new Set<string>(), written = new Set<string>(), external = new Set<string>(), workspaceName = (target: string) =>
 		semanticRoots.flatMap((root) => containsLogicalPath(root, target) ? [`//${path.posix.relative(root, target)}`] : [])[0];
 	const { journal: resourceJournal, handled: streamCalls, retained, finalHandles } = options.inheritedHandles?.length || options.inheritedStreams?.length
 		? resourceTransitions(selected, root.file.pid, options) : { journal: [], handled: new Set<TraceLine>(), retained: [], finalHandles: [] };
@@ -695,7 +697,7 @@ export async function observeStrace(
 				taints.add("unsupported_syscall");
 				incompleteReasons.add(`filesystem_semantics:${syscall}:${pid}`);
 			}
-			if (syscallSucceeded(line) && writesPath(line)) for (const name of (syscallPaths(line, syscall, cwd) ?? []).map(workspaceName)) if (name) written.add(name);
+			if (syscallSucceeded(line) && writesPath(line)) for (const target of syscallPaths(line, syscall, cwd) ?? []) { const name = workspaceName(target); if (name) written.add(name); else external.add(target); }
 			const [structure, flags] = MODELED_METADATA_SYSCALLS.get(syscall) ?? [];
 			if (structure && syscallSucceeded(line)) {
 				// A recreated null device has the same I/O semantics, but may have a different device-node inode.
@@ -754,7 +756,7 @@ export async function observeStrace(
 		tracedProcesses: [...selected].filter(([pid, { file, start }]) => file.lines.slice(start)
 			.some((_, offset) => !ignoredSegments.get(pid)?.some(([from, to]) => start + offset >= from && start + offset < to))).length,
 		incompleteReasons: Object.freeze([...incompleteReasons].sort()),
-		...(resumedInterpositions.length ? { resumedInterpositions } : {}), written: [...written].map(name => name.slice(2)).sort(),
+		...(resumedInterpositions.length ? { resumedInterpositions } : {}), written: [...written].map(name => name.slice(2)).sort(), external: [...external].sort(),
 	};
 }
 

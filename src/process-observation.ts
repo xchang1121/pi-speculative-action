@@ -286,21 +286,15 @@ function regularDeltaFailure(
 	} else {
 		if (previous?.kind !== "file") return `delta_before_type:${relativePath}`;
 		if (previous.links > 1 && previous.aliases?.length !== previous.links) return `unproven_aliases:${relativePath}`;
-		if (delta.beforeMode !== undefined && delta.beforeMode !== previous.mode) {
-			return `delta_before_mode:${relativePath}`;
-		}
+		if (delta.beforeMode !== undefined && delta.beforeMode !== previous.mode) return `delta_before_mode:${relativePath}`;
 		if (delta.before.byteLength !== previous.size) return `delta_before_size:${relativePath}`;
 	}
 
-	if (delta.after === undefined) {
-		return delta.before === undefined || current !== undefined ? `delta_delete_shape:${relativePath}` : undefined;
-	}
+	if (delta.after === undefined) return delta.before === undefined || current !== undefined ? `delta_delete_shape:${relativePath}` : undefined;
 	if (current?.kind !== "file") return `delta_after_type:${relativePath}`;
 	if (previous?.kind === "file" && previous.ownership !== current.ownership) return `unsupported_file_ownership:${relativePath}`;
 	if (current.links > 1 && current.aliases?.length !== current.links) return `unproven_aliases:${relativePath}`;
-	if (delta.afterMode !== undefined && delta.afterMode !== current.mode) {
-		return `delta_after_mode:${relativePath}`;
-	}
+	if (delta.afterMode !== undefined && delta.afterMode !== current.mode) return `delta_after_mode:${relativePath}`;
 	if (delta.after.byteLength !== current.size) return `delta_after_size:${relativePath}`;
 }
 
