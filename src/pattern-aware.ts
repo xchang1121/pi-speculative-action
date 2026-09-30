@@ -1027,8 +1027,7 @@ export class PatternAwareStore {
 		if (this.patterns.delete(patternID)) this.indexDirty = true;
 		this.patternSupportSessions.delete(patternID);
 		for (const session of this.sessions.values()) {
-			if (session.pending.some(item => item.patternID === patternID))
-				session.pending = session.pending.filter(item => item.patternID !== patternID);
+			if (session.pending.some(item => item.patternID === patternID)) session.pending = session.pending.filter(item => item.patternID !== patternID);
 		}
 	}
 
@@ -1111,8 +1110,7 @@ export class PatternAwareStore {
 		const evicted = [...this.patterns.values()]
 			.sort(
 				(left, right) =>
-					patternRank(left, this.clock, this.settings.decayHalfLifeEvents) -
-						patternRank(right, this.clock, this.settings.decayHalfLifeEvents) ||
+					patternRank(left, this.clock, this.settings.decayHalfLifeEvents) - patternRank(right, this.clock, this.settings.decayHalfLifeEvents) ||
 					left.lastSeenSequence - right.lastSeenSequence,
 			)
 			.slice(0, this.patterns.size - limit);
