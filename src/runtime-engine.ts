@@ -2310,7 +2310,7 @@ export function makeSpeculativeActionRuntime<
 		if (dispatch) dispatchReady(session);
 	};
 
-	const invalidateCandidates = (session: Session, candidates: Iterable<Candidate>, failure: ResolutionCause, retainInputs = false): void => {
+	const invalidateCandidates = (session: Session, candidates: Iterable<Candidate>, failure: ResolutionCause, retainInputs = false, dispatch = true): void => {
 		let invalidated = false;
 		for (const candidate of new Set(candidates)) {
 			if (candidateStore.get(session.id, candidate.id) !== candidate) continue;
@@ -2328,7 +2328,7 @@ export function makeSpeculativeActionRuntime<
 			session.plan.rearmExecution(candidate.id);
 			invalidated = true;
 		}
-		if (invalidated) dispatchReady(session);
+		if (invalidated && dispatch) dispatchReady(session);
 	};
 
 	const reconcileStores = async (state: Turn): Promise<void> => {
@@ -2385,7 +2385,8 @@ export function makeSpeculativeActionRuntime<
 				}
 			}
 		}
-		invalidateCandidates(session, [...invalid].filter((candidate) => reservationAvailable(candidate.work.reservation)), cause("freshness", "authoritative_resource_changed"));
+		// The Actor's settlement relaunches what still has a future; relaunched now, work for the decision it settles would only be retired.
+		invalidateCandidates(session, [...invalid].filter((candidate) => reservationAvailable(candidate.work.reservation)), cause("freshness", "authoritative_resource_changed"), false, false);
 		if (revalidate.length) trackSourceTask(session, (async () => {
 			for (const candidate of revalidate) {
 				if (session.lifecycle.sealed || !reservationAvailable(candidate.work.reservation) || !candidateStore.has(session.id, candidate)) continue;
