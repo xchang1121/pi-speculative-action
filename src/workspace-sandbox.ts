@@ -1706,13 +1706,12 @@ async function captureOverlayWorkspaceStructure(workspace: PrivateSandboxWorkspa
 			}
 		}
 	}
-	for (const resource of [...frontier.refresh].sort(comparePathDepth)) {
+	const refresh = [...frontier.refresh].sort(comparePathDepth), refreshed = await mapFilesystem(refresh, resource => {
 		const target = resource ? path.resolve(workspace.sandboxRoot, resource) : workspace.sandboxRoot;
 		if (!containsFilesystemPath(workspace.sandboxRoot, target)) throw new Error(`OverlayFS frontier escapes workspace: ${resource}`);
-		const entry = await captureWorkspaceStructureEntry(target, resource ? [] : workspace.observationExcludes);
-		if (entry) entries.set(resource, entry);
-		else entries.delete(resource);
-	}
+		return captureWorkspaceStructureEntry(target, resource ? [] : workspace.observationExcludes);
+	});
+	refresh.forEach((resource, index) => { const entry = refreshed[index]; if (entry) entries.set(resource, entry); else entries.delete(resource); });
 	const files = Math.max(0, entries.size - 1);
 	return workspaceStructureSnapshot(workspace.sandboxRoot, entries, baseline.complete && files <= WORKSPACE_TRANSACTION_MAX_FILES);
 }
@@ -1739,24 +1738,22 @@ async function inspectOverlayStructureFrontier(upperRoot: string): Promise<Overl
 async function walkOverlayUpper(upperRoot: string, journal: string, observe: (entry: OverlayUpperEntry) => void | Promise<void>): Promise<void> {
 	let entries = 0;
 	const visit = async (directory: string, relativeDirectory: string): Promise<void> => {
+		const subdirectories: (readonly [string, string])[] = [];
 		for (const child of await readdir(directory, { withFileTypes: true })) {
 			if (++entries > WORKSPACE_TRANSACTION_MAX_FILES) throw new Error(`OverlayFS ${journal} exceeds file limit`);
 			if (child.name === ".wh..wh..opq") { await observe({ kind: "opaque", resource: relativeDirectory }); continue; }
 			if (child.name.startsWith(".wh.")) throw new Error(`unsupported OverlayFS whiteout encoding: ${child.name}`);
 			const resource = slash(relativeDirectory ? path.join(relativeDirectory, child.name) : child.name);
 			if (isSnapshotExcluded(resource)) continue;
+			// The entry's own type decides; only a whiteout's device number needs its inode.
 			const target = path.join(directory, child.name);
-			const stats = await lstat(target);
-			if (stats.isDirectory()) {
-				await observe({ kind: "directory", resource });
-				await visit(target, resource);
-			} else if (stats.isCharacterDevice()) {
-				if (stats.rdev !== 0) throw new Error(`unsupported OverlayFS device entry: ${resource}`);
+			if (child.isDirectory()) { await observe({ kind: "directory", resource }); subdirectories.push([target, resource]); }
+			else if (child.isCharacterDevice()) {
+				if ((await lstat(target)).rdev !== 0) throw new Error(`unsupported OverlayFS device entry: ${resource}`);
 				await observe({ kind: "whiteout", resource });
-			} else {
-				await observe({ kind: "leaf", resource, regular: stats.isFile() });
-			}
+			} else await observe({ kind: "leaf", resource, regular: child.isFile() });
 		}
+		await Promise.all(subdirectories.map(([target, resource]) => visit(target, resource))); // Sibling directories are read concurrently.
 	};
 	await visit(upperRoot, "");
 }
