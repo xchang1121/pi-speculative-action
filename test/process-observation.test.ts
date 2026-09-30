@@ -4,9 +4,15 @@ import path from "node:path";
 import { describe, expect, test } from "vitest";
 import { captureStableFile } from "../src/filesystem-evidence.ts";
 import { captureWorkspaceStructure, diffWorkspaceStructures, ExecutionPathProjection, hydrateWorkspaceFileEntry,
-	snapshotDependency } from "../src/process-observation.ts";
+	snapshotDependency, workspaceStructureSnapshot } from "../src/process-observation.ts";
 
 describe("process observation", () => {
+	test("trusts the most links any name of an object reports, as a FUSE overlay reports each name's own", () => {
+		const snapshot = (...links: number[]) => workspaceStructureSnapshot("/w", new Map(links.map((count, index) => [`n${index}`, { kind: "file", object: "1:9", links: count } as never])), true);
+		expect([snapshot(1, 2).complete, snapshot(2).complete, snapshot(1, 2, 2).complete]).toEqual([true, false, false]);
+		expect([snapshot(1, 2).entries.get("n0"), snapshot(1, 1).entries.get("n0")]).toMatchObject([{ aliases: [path.join("/w", "n0"), path.join("/w", "n1")] }, { links: 1 }]);
+		expect(snapshot(1, 1).entries.get("n0")).not.toHaveProperty("aliases");
+	});
 	test("joins content-free structure snapshots with an authoritative regular-file delta", async ({ onTestFinished }) => {
 		const { source, workspace, projection } = await observationWorkspace("structure", onTestFinished);
 		const target = path.join(workspace, "value.bin");

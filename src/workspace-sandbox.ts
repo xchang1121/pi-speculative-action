@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants, type BigIntStats, type Stats } from "node:fs";
-import { access, chmod, copyFile, type FileHandle, link, lstat, mkdir, mkdtemp, open, readdir, rename, rm, rmdir, unlink, writeFile } from "node:fs/promises";
+import { access, chmod, copyFile, type FileHandle, link, lstat, mkdir, mkdtemp, open, readdir, rename, rm, rmdir, unlink, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
@@ -943,30 +943,38 @@ async function createPrivateSandboxWorkspace(state: WorkspaceSandboxState, cwd: 
 			overlayStorageRoot = await mkdtemp(path.join(pool.parent, "overlay-storage-"));
 			processRoot = path.join(overlayStorageRoot, "process");
 			await mkdir(processRoot);
-			// Lower-layer copy-up can split hardlinks. Materialize only shared objects in the private upper layer.
-			const upper = path.join(overlayStorageRoot, "upper"), directories = new Set<string>();
-			for (const aliases of liveBase ? [] : baseline.aliases) {
+			// Lower-layer copy-up can split hardlinks. Materialize only shared objects in the private upper layer, with the times
+			// the lower shows: build tools compare them.
+			const upper = path.join(overlayStorageRoot, "upper"), directories = new Set<string>(), lowerRoot = liveBase ? sourceRoot : sharedBaseline!.sandboxRoot;
+			const aliasGroups = liveBase ? [...new Map([...liveBase.entries.values()].flatMap(entry => entry.kind === "file" && entry.aliases
+				? [[entry.aliases.join("\0"), entry.aliases.map(name => path.relative(liveBase!.root, name))] as const] : [])).values()] : baseline.aliases;
+			const copyTimes = async (relative: string) => { const { atime, mtime } = await lstat(path.join(lowerRoot, relative)); await utimes(path.join(upper, relative), atime, mtime); };
+			for (const aliases of aliasGroups) {
 				for (const name of aliases) {
 					for (let parent = path.dirname(name); parent !== "."; parent = path.dirname(parent)) directories.add(parent);
 					await mkdir(path.dirname(path.join(upper, name)), { recursive: true });
 				}
-				await copyFile(path.join(sharedBaseline!.sandboxRoot, aliases[0]!), path.join(upper, aliases[0]!), fsConstants.COPYFILE_FICLONE);
+				await copyFile(path.join(lowerRoot, aliases[0]!), path.join(upper, aliases[0]!), fsConstants.COPYFILE_FICLONE);
+				await copyTimes(aliases[0]!);
 				for (const alias of aliases.slice(1)) await link(path.join(upper, aliases[0]!), path.join(upper, alias));
 			}
-			for (const directory of [...directories].sort((a, b) => b.length - a.length))
-				await chmod(path.join(upper, directory), (await lstat(path.join(sharedBaseline!.sandboxRoot, directory))).mode & 0o777);
+			for (const directory of [...directories].sort((a, b) => b.length - a.length)) {
+				await chmod(path.join(upper, directory), (await lstat(path.join(lowerRoot, directory))).mode & 0o777);
+				await copyTimes(directory);
+			}
 			const mounted = await mountLinuxOverlayfs({
-				lowerRoot: liveBase ? sourceRoot : sharedBaseline!.sandboxRoot,
+				lowerRoot,
 				privateRoot: overlayStorageRoot,
 				options: overlayOptions,
 				capabilityRegistry: state.overlayfsCapabilities,
 			});
 			overlay = mounted;
+			// FUSE overlays count a file's links by the names they have loaded: list each alias's directory before anything stats one.
+			for (const directory of new Set(aliasGroups.flat().map(name => path.dirname(name)))) await readdir(path.join(mounted.root, directory));
 			overlayDevice = String((await lstat(mounted.root, { bigint: true })).dev);
 			sandboxRoot = mounted.root;
 			gitDirectory = sharedBaseline?.gitDirectory ?? path.join(overlayStorageRoot, "no-index"); // OverlayFS journals its own changes.
-			openTransactionClock = () => openLinuxAnonymousWorkspaceFile(mounted.upperRoot);
-			transactionClockLinks = 0;
+			openTransactionClock = () => openLinuxAnonymousWorkspaceFile(mounted.upperRoot); transactionClockLinks = 0;
 			// A live lower may sit on another filesystem; its files' own identities, checked on every read, fence it instead.
 			transactionClockRoots = Object.freeze([...liveBase ? [] : [sharedBaseline!.sandboxRoot], mounted.upperRoot, mounted.workRoot]);
 		} else {
@@ -976,14 +984,10 @@ async function createPrivateSandboxWorkspace(state: WorkspaceSandboxState, cwd: 
 			// a filesystem-tool worktree is itself reset for the next one when it returns.
 			if ((overlayOptions as Partial<SandboxWorkspaceBranchOptions>).action && preparation !== capturedWorkspaceInputs) prepareNextSandbox(pool, baseline);
 			attached = prepared;
-			sandboxRoot = prepared.sandboxRoot;
-			processRoot = prepared.processRoot;
-			gitDirectory = prepared.gitDirectory;
+			({ sandboxRoot, processRoot, gitDirectory } = prepared);
 			const transactionClockPath = path.join(prepared.processRoot, "workspace-transaction.clock");
-			openTransactionClock = () => {
-				const noFollow = typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0;
-				return open(transactionClockPath, fsConstants.O_WRONLY | fsConstants.O_CREAT | noFollow, 0o600);
-			};
+			const noFollow = typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0;
+			openTransactionClock = () => open(transactionClockPath, fsConstants.O_WRONLY | fsConstants.O_CREAT | noFollow, 0o600);
 			transactionClockLinks = 1;
 			transactionClockRoots = Object.freeze([prepared.sandboxRoot, prepared.processRoot]);
 		}
@@ -1829,7 +1833,7 @@ async function captureLiveBase(pool: PooledGitRepository, version: ResourceVersi
 	const cached = pool.liveBase, changes = cached && pool.versions.changesSince(cached.version);
 	if (cached && changes && !changes.uncertain && !changes.paths.length) return cached.structure;
 	const structure = await captureWorkspaceStructure(pool.sourceRoot, { maxFiles: WORKSPACE_TRANSACTION_MAX_FILES, exclude: SNAPSHOT_EXCLUDES });
-	if (!structure.complete || [...structure.entries.values()].some((entry) => entry.kind === "file" && entry.aliases?.length)) return undefined;
+	if (!structure.complete) return undefined;
 	const live = Object.freeze({ ...structure, entries: new Map([...structure.entries].map(([resource, entry]) =>
 		[resource, entry.kind === "file" ? { ...entry, contentPath: path.join(pool.sourceRoot, resource) } : entry])) });
 	pool.liveBase = { version, structure: live };

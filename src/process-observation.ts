@@ -93,14 +93,17 @@ export async function captureWorkspaceStructure(
 /** Resolve namespace aliases in the same captured structure, including layered mutation frontiers. */
 export function workspaceStructureSnapshot(root: string, entries: Map<string, WorkspaceStructureEntry>, complete: boolean): WorkspaceStructureSnapshot {
 	const objects = new Map<string, string[]>();
-	for (const [name, entry] of entries) if (entry.kind === "file" && entry.links > 1 && entry.object) {
+	for (const [name, entry] of entries) if (entry.kind === "file" && entry.object) {
 		const aliases = objects.get(entry.object) ?? []; aliases.push(name); objects.set(entry.object, aliases);
 	}
 	for (const names of objects.values()) {
+		// A FUSE overlay reports each name's own link count: one below the names found sharing its object is stale, not a hidden name.
+		const links = Math.max(...names.map(name => (entries.get(name) as Extract<WorkspaceStructureEntry, { kind: "file" }>).links));
+		if (links < 2) continue;
+		if (links !== names.length) complete = false;
 		const aliases = Object.freeze(names.map(name => path.join(root, name)).sort());
 		for (const name of names) {
 			const entry = entries.get(name)! as Extract<WorkspaceStructureEntry, { kind: "file" }>;
-			if (entry.links !== names.length) complete = false;
 			entries.set(name, { ...entry, aliases });
 		}
 	}
