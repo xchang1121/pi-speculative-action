@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, test } from "vitest";
 import { FILESYSTEM_OBSERVATION_FIELDS, filesystemObservationDigest } from "../src/provenance-certificate.ts";
-import { observeStrace, straceCommand, type StraceObservationOptions } from "../src/strace-observer.ts";
+import { observeStrace, straceCommand, traceTail, type StraceObservationOptions } from "../src/strace-observer.ts";
 
 const EXEC = 'execve("/usr/bin/example", ["example"], 0x0) = 0';
 const STAT = "{st_dev=makedev(0, 1), st_ino=42, st_mode=S_IFREG|0644, st_nlink=1, st_uid=0, st_gid=0, st_rdev=0, st_size=4, st_blksize=4096, st_blocks=8, st_atime=10, st_atime_nsec=1, st_mtime=11, st_mtime_nsec=2, st_ctime=12, st_ctime_nsec=3}";
@@ -235,7 +235,6 @@ describe("strace provenance decoder", () => {
 			['renameat2(AT_FDCWD, "/work/absolute", -1, "/work/replaced", RENAME_NOREPLACE) = 0', ["/work/absolute", "/work/replaced"]],
 			['linkat(7</work/c>, "original", 8</work/d>, "linked", 0) = 0', ["/work/c/original", "/work/d/linked"]],
 			['symlinkat("literal-not-an-input", 9</work/e>, "alias") = 0', ["/work/e/alias"]],
-			['openat(AT_FDCWD</work/recorded>, "anchor", O_RDONLY) = 3', ["/work/recorded/anchor"]],
 		]);
 		for (const [spawn, mutation, complete, parentMutation = ""] of [
 			["fork()", 'chdir("child") = 0', true],
@@ -256,7 +255,8 @@ describe("strace provenance decoder", () => {
 					"socket(AF_INET, SOCK_STREAM, IPPROTO_IP <unfinished ...>", "<... socket resumed>) = 4"],
 				600: [EXEC, mutation,
 					'newfstatat(AT_FDCWD, "relative.dat", ' + STAT + ", 0) = 0",
-					'newfstatat(5</work/other>, "link", ' + STAT + ", AT_SYMLINK_NOFOLLOW) = 0", ...calls.keys()],
+					// strace names AT_FDCWD by the kernel's cwd, which a sandbox serving chdir never moves: the traced cwd stands.
+					'newfstatat(5</work/other>, "link", ' + STAT + ", AT_SYMLINK_NOFOLLOW) = 0", 'openat(AT_FDCWD</work/kernel>, "anchor", O_RDONLY) = 3', ...calls.keys()],
 			});
 			expect(observation, spawn + mutation + parentMutation).toMatchObject({ complete, tracedProcesses: 2,
 				incompleteReasons: complete ? [] : [spawn.includes("UNKNOWN") ? "clone_flags_unparsed:700" : "shared_cwd_mutation"] });
@@ -264,12 +264,21 @@ describe("strace provenance decoder", () => {
 			const childCwd = mutation.endsWith("= 0") ? "/work/final/child" : "/work/final";
 			expect(observation.taints).toEqual(["clock", "network", "random"]);
 			expect(observation.paths).toEqual(expect.arrayContaining([
-				...[...calls.values(), ["/work/final", "/work/final/input", "/work/input.txt"]].flat().map((path) => ({ path, role: "input" })),
+				...[...calls.values(), ["/work/final", "/work/final/input", "/work/input.txt", childCwd + "/anchor"]].flat().map((path) => ({ path, role: "input" })),
 				{ path: childCwd + "/relative.dat", role: "metadata", followSymlinks: true, digest: STAT_DIGEST },
 				{ path: "/work/other/link", role: "metadata", followSymlinks: false, digest: STAT_DIGEST },
 			]));
-			expect(observation.paths.some(({ path }) => /literal-not-an-input|\/child\/child/.test(path))).toBe(false);
+			expect(observation.paths.some(({ path }) => /literal-not-an-input|\/child\/child|kernel/.test(path))).toBe(false);
 		}
+	});
+
+	test("tails each process's writes against the cwd it followed through chdir and forks", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-strace-tail-")), prefix = path.join(root, "process"), write = (at: number, name: string) => `${at}.0 openat(AT_FDCWD</work>, "${name}", O_WRONLY|O_CREAT, 0644) = 3\n`;
+		try { // The first process moved before it forked; one whose fork is not on record yet names nothing it can place.
+			await Promise.all(Object.entries({ 100: '1.0 chdir("/work/sub") = 0\n2.0 clone(child_stack=NULL, flags=SIGCHLD) = 200\n' + write(5, "own"), 200: write(3, "out") + write(4, "../up"), 300: write(6, "stray") })
+				.map(([pid, text]) => fs.writeFile(`${prefix}.${pid}`, text)));
+			expect((await traceTail(prefix, "/work").read()).writes.map(({ paths }) => paths)).toEqual([["/work/sub/out"], ["/work/sub/../up"], ["/work/sub/own"], undefined]);
+		} finally { await fs.rm(root, { recursive: true, force: true }); }
 	});
 
 	test("fails closed on missing process evidence or malformed syntax", async () => {

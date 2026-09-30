@@ -871,25 +871,33 @@ async function readTrace(file: string, offset: number, limit = Number.POSITIVE_I
 	} finally { await handle.close(); }
 }
 
-/** A trace read as it grows, each record parsed once however often it is asked: its writes so far, and when it last named each absolute path
- * (by name or through a descriptor; a failed lookup names one too), in wall-clock milliseconds. */
+/** A trace read as it grows, each record parsed once however often it is asked: its writes so far, and when it last named each absolute path (by name, through a
+ * descriptor, or against the cwd its process followed from `cwd`, unknown until its fork is on record; a failed lookup names one too), in wall-clock milliseconds. */
 export interface TraceTail { readonly writes: readonly TracedWrite[]; readonly seen: ReadonlyMap<string, number>; read(): Promise<TraceTail> }
 
-export function traceTail(tracePrefix: string): TraceTail {
-	const directory = path.dirname(tracePrefix), prefix = `${path.basename(tracePrefix)}.`, writes: TracedWrite[] = [], seen = new Map<string, number>(), offsets = new Map<string, number>();
-	let reading: Promise<unknown> = Promise.resolve();
+export function traceTail(tracePrefix: string, cwd: string): TraceTail {
+	const directory = path.dirname(tracePrefix), prefix = `${path.basename(tracePrefix)}.`, writes: TracedWrite[] = [], seen = new Map<string, number>(), offsets = new Map<string, number>(),
+		cwds = new Map<number, { cwd?: string }>(); // One process's cwd, or several's a fork let share it.
+	let reading: Promise<unknown> = Promise.resolve(), root: number | undefined;
 	const advance = async () => {
+		const records: Array<{ readonly pid: number; readonly at: number; readonly line: TraceLine }> = [];
 		for (const name of (await readdir(directory).catch(() => [] as string[])).filter(name => name.startsWith(prefix))) {
-			// A record strace is still writing waits for its newline.
+			// A record strace is still writing waits for its newline; a clock stepped back must not reorder a process's own.
 			const offset = offsets.get(name) ?? 0, bytes = await readTrace(path.join(directory, name), offset).catch(() => Buffer.alloc(0)), complete = bytes.lastIndexOf(10) + 1;
 			offsets.set(name, offset + complete);
+			let last = 0;
 			for (const record of bytes.toString("utf8", 0, complete).split("\n")) {
-				const stamped = /^(?:\d+ )?(\d+\.\d+) (.*)$/.exec(record), line = stamped && parseTraceLine(stamped[2]!);
-				if (!line) continue;
-				const at = Number(stamped[1]) * 1000, paths = syscallPaths(line, line.name, "");
-				if (syscallSucceeded(line) && writesPath(line)) writes.push({ ...(paths?.every(target => target.startsWith("/")) ? { paths } : {}), at, opened: /^open(?:at2?)?$/.test(line.name) });
-				for (const target of [...paths ?? [], ...line.args.flatMap(arg => absoluteDescriptorPath(arg) ?? [])]) if (target.startsWith("/")) seen.set(target, Math.max(seen.get(target) ?? 0, at));
+				const stamped = /^(?:(\d+) +)?(\d+\.\d+) (.*)$/.exec(record), line = stamped && parseTraceLine(stamped[3]!);
+				if (line) records.push({ pid: Number(stamped[1] ?? name.slice(prefix.length)), at: last = Math.max(last, Number(stamped[2]) * 1000), line });
 			}
+		}
+		records.sort((a, b) => a.at - b.at); root ??= records[0]?.pid; // A fork precedes its child's records, a chdir the forks after it; the first is the root's.
+		for (const { pid, at, line } of records) {
+			const process = cwds.get(pid) ?? (pid === root ? cwds.set(pid, { cwd }).get(pid) : undefined), paths = syscallPaths(line, line.name, process?.cwd ?? ""), child = spawnedPID(line);
+			if (syscallSucceeded(line) && writesPath(line)) writes.push({ ...(paths?.every(target => target.startsWith("/")) ? { paths } : {}), at, opened: /^open(?:at2?)?$/.test(line.name) });
+			for (const target of [...paths ?? [], ...line.args.flatMap(arg => absoluteDescriptorPath(arg) ?? [])]) if (target.startsWith("/")) seen.set(target, Math.max(seen.get(target) ?? 0, at));
+			if (process) process.cwd = tracedCwd(line, process.cwd);
+			if (child && !cwds.has(child)) { const shared = sharesFilesystem(line); cwds.set(child, shared && process ? process : { cwd: shared === false ? process?.cwd : undefined }); }
 		}
 	};
 	return { writes, seen, read() { const next = reading.then(advance); reading = next.catch(() => undefined); return next.then(() => this); } };
@@ -1010,13 +1018,14 @@ function processLimitDenied(line: TraceLine, syscall: string): boolean {
 
 function syscallPaths(line: TraceLine, syscall: string, cwd: string): readonly string[] | undefined {
 	const paths = (PATH_ARGUMENTS[syscall] ?? []).map(([pathname, dirfd, descriptorPath]) => {
-		const descriptor = dirfd === undefined ? undefined : line.args[dirfd];
+		// strace names AT_FDCWD by the kernel's cwd, which a sandbox serving chdir itself never moves: the traced cwd is the process's.
+		const descriptor = dirfd === undefined ? undefined : line.args[dirfd], current = dirfd === undefined || /^(?:AT_FDCWD|-100)(?:<|$)/.test(descriptor ?? "");
 		if (pathname === undefined || descriptorPath && /^(?:""|NULL)$/.test(line.args[pathname] ?? "")) {
-			const target = absoluteDescriptorPath(descriptor); return target ? [target] : [];
+			const target = current ? cwd : absoluteDescriptorPath(descriptor); return target ? [target] : current ? undefined : [];
 		}
 		const value = quotedArgument(line.args[pathname]);
 		if (value?.startsWith("/")) return [walkedPath(value)]; // Absolute names ignore dirfd, even an invalid one.
-		const base = dirfd === undefined || descriptor === "AT_FDCWD" || descriptor === "-100" ? cwd : absoluteDescriptorPath(descriptor);
+		const base = current ? cwd : absoluteDescriptorPath(descriptor);
 		// Without a name or a directory, a failed call looked nothing up and a successful one is unresolved.
 		return value && base ? [walkedPath(`${base}/${value}`)] : syscallSucceeded(line) ? undefined : [];
 	});
@@ -1029,7 +1038,7 @@ function walkedPath(value: string): string {
 }
 
 function absoluteDescriptorPath(descriptor: string | undefined): string | undefined {
-	const target = /^(?:\d+|AT_FDCWD)<(.+)>$/.exec(descriptor?.trim() ?? "")?.[1]?.replace(/<[^<>]*>$/, "");
+	const target = /^\d+<(.+)>$/.exec(descriptor?.trim() ?? "")?.[1]?.replace(/<[^<>]*>$/, "");
 	return target?.startsWith("/") && !target.endsWith(" (deleted)") ? path.posix.normalize(decodeCString(target)) : undefined;
 }
 
