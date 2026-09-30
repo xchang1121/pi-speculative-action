@@ -883,18 +883,16 @@ static int broker_reply(const char *at, const char *end) {
 		int fd, value, consumed = -1;
 		unsigned long long length;
 		if (!newline) return -1;
-		if (sscanf(at, "o%d %llu%n", &fd, &length, &consumed) == 2 && at + consumed == newline && (fd == 1 || fd == 2) &&
+		/* A brokered run's settled effect on a descriptor this launcher holds: bytes it wrote (o), or read and must find there (i). */
+		char kind = *at;
+		if ((kind == 'o' || kind == 'i') && sscanf(at + 1, "%d %llu%n", &fd, &length, &consumed) == 2 && at + 1 + consumed == newline && fd >= 1 &&
 			length <= (unsigned long long)(end - newline - 1)) {
-			if (transfer(fd, (void *)(newline + 1), (size_t)length, 1) < 0) return -1;
+			for (size_t offset = 0; kind == 'i' && offset < length; offset++) {
+				unsigned char seen;
+				if (transfer(fd, &seen, 1, 0) < 0 || seen != (unsigned char)newline[1 + offset]) return -1;
+			}
+			if (kind == 'o' && transfer(fd, (void *)(newline + 1), (size_t)length, 1) < 0) return -1;
 			at = newline + 1 + length;
-			continue;
-		}
-		/* A brokered run's net effect on an inherited pipe of one repeated byte: written, or read back and checked. */
-		int byte; long delta;
-		if (sscanf(at, "u%d %d %ld%n", &fd, &byte, &delta, &consumed) == 3 && at + consumed == newline && fd >= 3 && byte >= 0 && byte <= 255 && labs(delta) <= 65536) {
-			for (unsigned char token = (unsigned char)byte, seen; delta; delta += delta < 0 ? 1 : -1)
-				if (delta > 0 ? transfer(fd, &token, 1, 1) < 0 : transfer(fd, &seen, 1, 0) < 0 || seen != token) return -1;
-			at = newline + 1;
 			continue;
 		}
 		if (newline + 1 != end) return -1;

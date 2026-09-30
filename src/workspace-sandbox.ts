@@ -467,9 +467,7 @@ async function commitSandboxExecution(state: WorkspaceSandboxState, execution: S
 							: await readRegularState(change.target);
 					baselines.set(change, current);
 					if (change.kind !== "directory") bytesValidated += (current as RegularFileState | undefined)?.content.byteLength ?? 0;
-					if (!sameSandboxBaseline(current, change)) {
-						throw new Error(`resource changed before commit: ${change.resource}`);
-					}
+					if (!sameSandboxBaseline(current, change)) throw new Error(`resource changed before commit: ${change.resource}`);
 					if (change.accessMode) await access(change.target, change.accessMode);
 					if (change.kind !== "directory" && change.aliases) {
 						const identity = (current as RegularFileState | undefined)?.identity;
@@ -1673,9 +1671,7 @@ async function collectSandboxChanges(workspace: PrivateSandboxWorkspace, frontie
 		.sort();
 	const changes: SandboxFileChange[] = [];
 	for (const resource of resources) {
-		if (!resource || path.isAbsolute(resource) || resource.split("/").includes("..")) {
-			throw new Error(`invalid sandbox change path: ${resource}`);
-		}
+		if (!resource || path.isAbsolute(resource) || resource.split("/").includes("..")) throw new Error(`invalid sandbox change path: ${resource}`);
 		const target = path.resolve(workspace.sourceRoot, resource);
 		const sandboxTarget = path.resolve(workspace.sandboxRoot, resource);
 		if (!containsFilesystemPath(workspace.sourceRoot, target) || !containsFilesystemPath(workspace.sandboxRoot, sandboxTarget)) {
@@ -1767,9 +1763,7 @@ async function inspectOverlayStructureFrontier(upperRoot: string): Promise<Overl
 			addAncestors(entry.resource, entry.kind === "opaque");
 			return;
 		}
-		if (entry.kind === "leaf" && !entry.regular) {
-			throw new Error(`unsupported OverlayFS upper inode: ${entry.resource}`);
-		}
+		if (entry.kind === "leaf" && !entry.regular) throw new Error(`unsupported OverlayFS upper inode: ${entry.resource}`);
 		addAncestors(entry.resource, true);
 	});
 	return { refresh, removals: Object.freeze(removals) };
@@ -1781,9 +1775,7 @@ async function walkOverlayUpper(upperRoot: string, journal: string, observe: (en
 		for (const child of await readdir(directory, { withFileTypes: true })) {
 			if (++entries > WORKSPACE_TRANSACTION_MAX_FILES) throw new Error(`OverlayFS ${journal} exceeds file limit`);
 			if (child.name === ".wh..wh..opq") { await observe({ kind: "opaque", resource: relativeDirectory }); continue; }
-			if (child.name.startsWith(".wh.")) {
-				throw new Error(`unsupported OverlayFS whiteout encoding: ${child.name}`);
-			}
+			if (child.name.startsWith(".wh.")) throw new Error(`unsupported OverlayFS whiteout encoding: ${child.name}`);
 			const resource = slash(relativeDirectory ? path.join(relativeDirectory, child.name) : child.name);
 			if (isSnapshotExcluded(resource)) continue;
 			const target = path.join(directory, child.name);
@@ -1980,9 +1972,7 @@ function ownSandboxChanges(changes: readonly SandboxWorkspaceChange[]): SandboxW
 			throw new Error(`inconsistent sandbox baseline: ${change.resource}`);
 		}
 		if (previous.kind === "directory" && change.kind === "directory") {
-			if (!sameSandboxState(previous.before, change.before)) {
-				throw new Error(`inconsistent sandbox baseline: ${change.resource}`);
-			}
+			if (!sameSandboxState(previous.before, change.before)) throw new Error(`inconsistent sandbox baseline: ${change.resource}`);
 			result.set(key, { ...change, before: previous.before, accessMode: (previous.accessMode ?? 0) | (change.accessMode ?? 0) });
 			continue;
 		}
@@ -2044,9 +2034,7 @@ async function restoreChanges(
 				change.kind === "directory"
 					? await readSandboxDirectoryState(change.target)
 					: await readRegularState(change.target);
-			if (!sameSandboxState(current, baseline)) {
-				throw new Error(`sandbox rollback did not restore: ${change.resource}`);
-			}
+			if (!sameSandboxState(current, baseline)) throw new Error(`sandbox rollback did not restore: ${change.resource}`);
 		} catch (error) {
 			errors.push(error);
 		}
@@ -2096,9 +2084,7 @@ async function createParentDirectories(sourceRoot: string, target: string, creat
 	const root = path.resolve(sourceRoot);
 	const parent = path.dirname(path.resolve(target));
 	const relative = relativeFilesystemPath(root, parent);
-	if (relative === undefined) {
-		throw new Error(`sandbox commit path escapes workspace: ${target}`);
-	}
+	if (relative === undefined) throw new Error(`sandbox commit path escapes workspace: ${target}`);
 	let current = root;
 	for (const segment of relative.split(path.sep).filter(Boolean)) {
 		current = path.join(current, segment);
