@@ -113,13 +113,7 @@ describe("PatternAware", () => {
 		const context = [
 			event("one", "inspect", { left: "Alpha", right: "Beta", short: "xy" }),
 		];
-		const target = {
-			normalized: "alpha",
-			command: "run Alpha now",
-			joined: "Alpha:Beta",
-			query: "pre-xy-post",
-			filePath: "out/Alpha.txt",
-		};
+		const target = { normalized: "alpha", command: "run Alpha now", joined: "Alpha:Beta", query: "pre-xy-post", filePath: "out/Alpha.txt" };
 		const bindings = inferBindings(context, target);
 
 		expect(bindings).toMatchObject({
@@ -288,16 +282,7 @@ describe("PatternAware", () => {
 
 		const pattern = store.snapshot().find((item) => item.id === "attributed");
 		expect(pattern?.adoptionProbability).toBeCloseTo(0.5);
-		expect(pattern).toMatchObject({
-			feedback: {
-				issued: 4,
-				observed: 4,
-				matched: 3,
-				adopted: 1,
-				rejectedAfterMatch: { freshness: 2 },
-				unobserved: { "source:timeout": 1 },
-			},
-		});
+		expect(pattern).toMatchObject({ feedback: { issued: 4, observed: 4, matched: 3, adopted: 1, rejectedAfterMatch: { freshness: 2 }, unobserved: { "source:timeout": 1 } } });
 		for (let index = 0; index < 4; index++)
 			store.observe(input(`decay-${index}`, "lsp", { operation: "symbols" }));
 		expect(
@@ -429,6 +414,24 @@ describe("PatternAware", () => {
 		}
 		store.observe(input("probe", "grep", { pattern: "test_zeta", path: "suite/zeta_spec.py" }));
 		expect(store.predict("probe").map((candidate) => candidate.input)).toContainEqual({ command: "pytest suite/zeta_spec.py::test_zeta -q" });
+	});
+
+	test("shares workspace-free patterns with another workspace, never one that names a workspace path", async () => {
+		const root = await directories.create(), shared = path.join(root, "portable.json");
+		const learner = new PatternAwareStore(settings(), path.join(root, "a.json"), undefined, shared);
+		await learner.load();
+		for (const [name, directory] of [["alpha", "adapters"], ["beta", "core"], ["gamma", "helpers"]]) for (const prefix of ["npx mocha", "cd /work/a && npm test --"]) {
+			learner.observe(input(`${prefix}${name}`, "edit", { path: `lib/${directory}/${name}.js` }));
+			learner.observe(input(`${prefix}${name}`, "bash", { command: `${prefix} test/unit/${directory}/${name}.js --exit` }));
+			learner.finishSession(`${prefix}${name}`);
+		}
+		await learner.flush();
+		const other = new PatternAwareStore(settings(), path.join(root, "b.json"), undefined, shared);
+		await other.load();
+		other.observe(input("probe", "edit", { path: "lib/platform/zeta.js" }));
+		const commands = other.predict("probe").map((candidate) => candidate.input.command);
+		expect(commands).toContain("npx mocha test/unit/platform/zeta.js --exit");
+		expect(commands.filter((command) => String(command).startsWith("cd "))).toEqual([]);
 	});
 
 	test("moves an edited file under another root inside a command, and splices more than two values", () => {
