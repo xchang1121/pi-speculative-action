@@ -86,7 +86,7 @@ export function captureStableFile(
 }
 
 /** File digests by kernel identity and change times (userspace cannot set a ctime). An entry is trusted once the file's last change
- * precedes its digest by 2 s, so a same-size rewrite inside one coarse timestamp tick cannot reuse it (the racy-git rule). */
+ * precedes its digest by more than one timestamp tick, so a same-size rewrite inside that tick cannot reuse it (the racy-git rule). */
 const fileDigests = new Map<string, { readonly hash: string; readonly blob?: string; readonly takenAtMs: number }>();
 export const fileIdentity = (stat: BigIntStats) => `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
 
@@ -97,11 +97,12 @@ export function cachedCapture(stat: BigIntStats, realPath: string, blob = false)
 	return { hash: cached.hash, bytesRead: Number(stat.size), realPath, stat, shared: true, ...(cached.blob ? { blob: cached.blob } : {}) };
 }
 
-/** A file's identity, once its bytes were taken long enough after its last change to stand for them: a change within one
- * coarse timestamp tick could keep a same-size rewrite's identity otherwise. */
+/** A file's identity, once its bytes were taken more than one timestamp tick after its last change (a same-size rewrite within it keeps it):
+ * the kernel's (at most 10 ms) on a block device's ext4, XFS, Btrfs or F2FS volume; 2 s elsewhere (network, FUSE, FAT, reusable device numbers). */
 export function settledIdentity(stat: BigIntStats, takenAtMs: number): string | undefined {
-	return stat.isFile() && takenAtMs - Number((stat.mtimeNs > stat.ctimeNs ? stat.mtimeNs : stat.ctimeNs) / 1_000_000n) >= 2000 ? fileIdentity(stat) : undefined;
+	return stat.isFile() && takenAtMs - Number((stat.mtimeNs > stat.ctimeNs ? stat.mtimeNs : stat.ctimeNs) / 1_000_000n) >= (kernelTicks.get(stat.dev) ? 100 : 2000) ? fileIdentity(stat) : undefined;
 }
+const KERNEL_TICK_FILESYSTEMS = new Set([0xef53, 0x58465342, 0x9123683e, 0xf2f52010]), kernelTicks = new Map<bigint, boolean>();
 
 /** `takenAtMs`: when the read began. */
 export function rememberCapture(capture: StableFilesystemCapture, takenAtMs: number): void {
@@ -165,6 +166,8 @@ async function captureFile(target: string, maxBytes: number, retainContent: bool
 	try {
 		const before = binding ? await binding.stat({ bigint: true }) : observed?.stat ?? await (verifyPath ? fs.lstat : fs.stat)(target, { bigint: true });
 		if (!before.isFile()) throw new Error("not_regular_file");
+		if (binding && ((before.dev >> 8n & 0xfffn) | (before.dev >> 32n & ~0xfffn)) && !kernelTicks.has(before.dev)) // A major number: not a reusable anonymous one.
+			kernelTicks.set(before.dev, KERNEL_TICK_FILESYSTEMS.has((await fs.statfs(`/proc/self/fd/${binding.fd}`)).type));
 		if (observed?.stat && !sameFilesystemIdentity(observed.stat, before)) throw new Error("file_changed_during_capture");
 		const beforePath = verifyPath ? observed?.realPath ?? await fs.realpath(target) : target;
 		if (Number.isFinite(maxBytes) && before.size > BigInt(Math.floor(maxBytes))) throw new Error(`file_too_large:${before.size}`);
