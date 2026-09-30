@@ -186,7 +186,7 @@ describe("faux LLM speculative action end to end", () => {
 		for (let index = 0; index < 256; index++) store.observeTurn();
 		observe("read", { path: "old.txt" });
 		for (let index = 0; index < 3; index++) observe(tool, fresh);
-		store.observe({ sessionID, turnID: "context-marker", tool: "write", input: { path: "marker.txt", content: "marker" },
+		store.observe({ sessionID, turnID: "context-marker", tool: "bash", input: { command: "true" },
 			outcome: "success", durationMs: 1, learnTarget: false });
 		const result = await runAgent({
 			cwd, sessionID, patternStore: store,
