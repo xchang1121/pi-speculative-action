@@ -1705,20 +1705,38 @@ int main(void) { char path[32] = "/bin/true\\0intact"; char *args[] = {path, 0};
 		} finally { await fixture.dispose(); }
 	});
 
-	test("writes privately where its user natively could, and names only the net changes it left", async ({ skip }) => {
+	test("commits what it wrote outside the workspace on adoption, over the host state it replaced", async ({ skip }) => {
 		if (process.platform !== "linux") return skip("Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-private-writes-"), outside = await mkdtemp(path.join(os.tmpdir(), "pi-private-outside-"));
 		try {
+			await writeFile(path.join(outside, "kept"), "old\n");
+			await writeFile(path.join(fixture.workspace, "ext-writer"), "#!/bin/sh\nprintf 'g\\n' > \"$1\"\n", { mode: 0o755 });
 			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
-			const scratch = "t=$(mktemp -d) && echo t > $t/x && cat $t/x && rm -r $t";
-			for (const [label, command, external] of [["external", `echo private > ${outside}/f && cat ${outside}/f && ${scratch}`, true], ["scratch", scratch, false]] as const) {
-				const branch = await forkReusableBash(fixture, { label, command, actionNamespace: "private-writes", executionFingerprint });
+			const scratch = "t=$(mktemp -d) && echo t > $t/x && cat $t/x && rm -r $t", host = async (name: string) => readFile(path.join(outside, name), "utf8").catch(() => "absent");
+			// Written, replaced and scratch paths in one command: only the net changes commit, and only on adoption.
+			const branch = await forkReusableBash(fixture, { label: "commit", command: `mkdir ${outside}/d && echo private > ${outside}/d/f && echo new > ${outside}/kept && cat ${outside}/d/f && ${scratch}`,
+				actionNamespace: "private-writes", executionFingerprint });
+			try {
+				expect(textOutput(branch.output.result)).toBe("private\nt\n");
+				expect([await host("d/f"), await host("kept")], "a private write must not reach the host before adoption").toEqual(["absent", "old\n"]);
+				await branch.commit();
+				expect([await host("d/f"), await host("kept")]).toEqual(["private\n", "new\n"]);
+			} finally { await branch.dispose?.(); }
+			// A host object someone changed meanwhile is no baseline: the Actor must run the command instead.
+			const raced = await forkReusableBash(fixture, { label: "raced", command: `echo again > ${outside}/kept`, actionNamespace: "private-writes", executionFingerprint });
+			try {
+				await writeFile(path.join(outside, "kept"), "raced\n");
+				await expect(raced.commit()).rejects.toThrow();
+				expect(await host("kept")).toBe("raced\n");
+			} finally { await raced.dispose?.(); }
+			// A replayed child's write outside lands in the session's branch, where its successors read it, and commits on adoption.
+			for (const label of ["learned", "replayed"]) {
+				const before = fixture.backend.metrics(), child = await forkReusableBash(fixture, { label, command: `ext-writer ${outside}/g && cat ${outside}/g`, actionNamespace: "private-writes", executionFingerprint });
 				try {
-					expect(textOutput(branch.output.result)).toBe(external ? "private\nt\n" : "t\n");
-					expect(JSON.stringify(await branch.validate?.()).includes(`external_write:${outside}/f`)).toBe(external);
-				} finally { await branch.dispose?.(); }
+					expect([textOutput(child.output.result), await host("g"), fixture.backend.metrics().hits > before.hits], JSON.stringify(fixture.backend.metrics())).toEqual(["g\n", "absent", label === "replayed"]);
+					if (label === "replayed") { await child.commit(); expect(await host("g")).toBe("g\n"); }
+				} finally { await child.dispose?.(); }
 			}
-			expect(existsSync(path.join(outside, "f")), "a private write must not reach the host").toBe(false);
 		} finally { await fixture.dispose(); await rm(outside, { recursive: true, force: true }); }
 	});
 
