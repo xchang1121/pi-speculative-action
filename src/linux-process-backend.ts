@@ -26,7 +26,7 @@ import { definedProcessEnvironment, type PreparedProcessExecutionRoute, type Pro
 	type ProcessExecutor } from "./process-execution.ts";
 import { isPoisonedEffectCommit } from "./effect-transaction.ts";
 import { resolveHostExecutable } from "./executable-path.ts";
-import { assertNoSymlinkPath, captureStableFile, hashExecutableFile, mapFilesystem, sameFilesystemIdentity, walkFilesystemPath } from "./filesystem-evidence.ts";
+import { assertNoSymlinkPath, captureFilesystemEntry, captureStableFile, hashExecutableFile, mapFilesystem, sameFilesystemIdentity, walkFilesystemPath } from "./filesystem-evidence.ts";
 import { captureHeldDescriptorInputs, inspectHeldExecProcess, LinuxHeldExecBoundary, listenUnixSocket, resolveLinuxExecHelper, type HeldExecDecision,
 	type HeldExecProcess, type HeldExecSnapshot, descriptorInputs, descriptorEffects, inheritedTracer, type ProcessResourceGraph } from "./linux-held-exec.ts";
 import { emptyWorldReuseMetrics, snapshotExecutionScope, type ExecutionScope, type ExecutionOperationAdoption, type ExecutionWorldStorageControl,
@@ -1854,14 +1854,8 @@ export async function imageInterpreter(file: string): Promise<string | undefined
 	}
 }
 
-async function captureDependencies(
-	session: ActiveSession,
-	snapshot: WorkspaceStructureSnapshot,
-	observed: readonly ObservedProcessPath[],
-	effects: WorkspaceTransactionDiff,
-	{ external = [], locks = [], written = [] }: Pick<StraceObservation, "external" | "locks" | "written"> = {},
-	runs: readonly DynamicDependencyCertificate[] = [],
-) {
+async function captureDependencies(session: ActiveSession, snapshot: WorkspaceStructureSnapshot, observed: readonly ObservedProcessPath[], effects: WorkspaceTransactionDiff,
+	{ external = [], locks = [], written = [] }: Pick<StraceObservation, "external" | "locks" | "written"> = {}, runs: readonly DynamicDependencyCertificate[] = []) {
 	if (!effects.complete) throw new Error(`workspace effects are incomplete: ${effects.reason}`);
 	// The workspace as the run found it: the structure it began with, and the bytes its own writes replaced.
 	const deltas = new Map(effects.effects.flatMap(({ relativePath, change }) => change.kind === "directory" ? [] : [[relativePath, change] as const]));
@@ -1996,9 +1990,10 @@ async function captureDependencies(
 		}
 		hostPaths.set(`${item.role}\0${physical}`, { physical, role: item.role, listed: !!item.listed });
 	}
-	// Host files are independent of each other and of the workspace: capture them concurrently, add them in trace order.
+	// Host files are independent of each other and of the workspace: capture them concurrently (walking what they share once), add them in trace order.
+	const walked = new Map<string, ReturnType<typeof captureFilesystemEntry>>(), capture = (target: string) => walked.get(target) ?? walked.set(target, captureFilesystemEntry(target)).get(target)!;
 	const hostCaptures = await mapFilesystem([...hostPaths.values()], ({ physical, role, listed }) =>
-		captureHostPath(physical, role, listed).then(value => ({ value }), (error: unknown) => ({ error })));
+		captureHostPath(physical, role, listed, capture).then(value => ({ value }), (error: unknown) => ({ error })));
 	[...hostPaths.values()].forEach(({ physical }, index) => {
 		const captured = hostCaptures[index]!;
 		if ("error" in captured) { complete = false; taints.add("trace_incomplete"); incompleteReasons.add(`capture:${physical}:${errorMessage(captured.error)}`); }
@@ -2025,13 +2020,10 @@ function workspaceMetadataExclusions(session: ActiveSession, target: string): re
 	return path.resolve(target) === path.resolve(session.workspace.sandboxRoot) ? session.workspace.observationExcludes : undefined;
 }
 
-async function captureHostPath(
-	physicalPath: string,
-	role: Exclude<ObservedProcessPath["role"], "metadata">,
-	listed: boolean,
-): Promise<readonly DynamicDependency[] | undefined> {
+async function captureHostPath(physicalPath: string, role: Exclude<ObservedProcessPath["role"], "metadata">, listed: boolean,
+	capture?: (target: string) => ReturnType<typeof captureFilesystemEntry>): Promise<readonly DynamicDependency[] | undefined> {
 	const dependencies: DynamicDependency[] = [];
-	for await (const { path: current, info, link, terminal } of walkFilesystemPath(path.resolve(physicalPath))) {
+	for await (const { path: current, info, link, terminal } of walkFilesystemPath(path.resolve(physicalPath), capture ? { capture } : {})) {
 		// A runtime socket's absence validates exactly; what exists under these roots changes without a trace.
 		if (["/proc", "/sys", "/dev", "/run", "/tmp", "/var/tmp"].some((root) => pathContains(root, current)) && (!pathContains("/run", current) || info && terminal)) return undefined;
 		if (!info) {
