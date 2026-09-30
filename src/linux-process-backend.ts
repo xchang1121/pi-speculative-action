@@ -6,7 +6,7 @@ import { randomBytes } from "node:crypto";
 import { once } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
 import { constants as fsConstants } from "node:fs";
-import { access, chmod, copyFile, link, lstat, mkdir, mkdtemp, open, readFile, readdir, readlink, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { access, chmod, copyFile, link, lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -207,6 +207,8 @@ interface ActiveSession {
 	/** Output sockets of running brokered children: their own children write there, and those bytes reach the child's capture. */
 	readonly nestedOutputEndpoints: Set<readonly [string, string]>;
 	sealPromise?: Promise<readonly SandboxWorkspaceChange[]>;
+	/** When the top level started writing into the session's private branch. */
+	privateSince?: number;
 	closing?: Promise<void>;
 }
 
@@ -655,6 +657,7 @@ export class LinuxProcessReuseBackend {
 			...(request.timeout !== undefined ? { timeoutSeconds: request.timeout } : {}),
 		});
 		const before = await session.workspace.structure.capture();
+		session.privateSince ??= Date.now();
 		const traceRoot = await mkdtemp(path.join(session.workspace.processRoot, "top-trace-"));
 		const tracePrefix = path.join(traceRoot, "process");
 		const traced = straceCommand(ready.strace, tracePrefix, sandbox);
@@ -683,7 +686,7 @@ export class LinuxProcessReuseBackend {
 					guardFilesystemSemanticsWithin: [session.workspace.sandboxRoot, session.sourceRoot],
 				});
 				session.topLevelCapture = { before, after, observation };
-				for (const reason of [...observation.incompleteReasons, ...await privateChanges(path.join(session.workspace.processRoot, "private"))]) session.incompleteReasons.add(`top_trace:${reason}`);
+				for (const reason of observation.incompleteReasons) session.incompleteReasons.add(`top_trace:${reason}`);
 			} catch (error) {
 				session.incompleteReasons.add(`top_capture:${errorMessage(error)}`);
 				session.topLevelEvidence = { complete: false, dependencies: [], taints: ["trace_incomplete"] };
@@ -696,7 +699,10 @@ export class LinuxProcessReuseBackend {
 	}
 
 	private async seal(session: ActiveSession, changes: readonly SandboxWorkspaceChange[]): Promise<readonly SandboxWorkspaceChange[]> {
-		const refined = await sealSessionEvidence(session, changes);
+		const external = await privateCommits(path.join(session.workspace.processRoot, "private"), session.privateSince ?? 0);
+		// Adopting without them would leave the host unlike the native run: the Actor runs it instead.
+		if (external.unrepresentable.length) throw new Error(`unrepresentable writes outside the workspace: ${external.unrepresentable.join(",")}`);
+		const refined = [...await sealSessionEvidence(session, changes), ...external.changes];
 		try {
 			await this.publishTopLevel(session, refined);
 		} catch (error) {
@@ -712,7 +718,8 @@ export class LinuxProcessReuseBackend {
 	): Promise<{ exitCode: number | null }> {
 		const replayStarted = performance.now();
 		const before = await session.workspace.structure.capture();
-		await replayFilesystemEffects(this.replayWorkspace, plan.artifacts, plan.certificate.result.journal, session.projection, session.workspace.sandboxRoot);
+		await replayFilesystemEffects(this.replayWorkspace, plan.artifacts, plan.certificate.result.journal, session.projection, session.workspace.sandboxRoot,
+			path.join(session.workspace.processRoot, "private"));
 		const after = await session.workspace.structure.capture();
 		session.nestedEvidence.push(plan.certificate.dependencyCertificate);
 		session.topLevelCapture = {
@@ -737,7 +744,7 @@ export class LinuxProcessReuseBackend {
 			producer: session.producer,
 			dependencyCertificate: evidence,
 			result: await captureProcessResult(this.store, execution.outcome, execution.observedProcessMs,
-				changes.map(change => ({ logicalPath: slash(path.resolve(session.sourceRoot, change.resource)), change }))),
+				changes.map(change => ({ logicalPath: slash(change.target), change }))),
 		});
 		if (await this.planner.publishCompleted(certificate, SAME_CONFINEMENT_TAINTS, this.options.witnessRepeats?.())) this.add(session, "wholeCommandPublished");
 	}
@@ -1080,7 +1087,8 @@ export class LinuxProcessReuseBackend {
 		try {
 			const { artifacts, certificate } = plan;
 			const output = wireOutput(loadOutputEvents(artifacts, certificate.result.journal));
-			await replayFilesystemEffects(this.replayWorkspace, artifacts, certificate.result.journal, session.projection, session.workspace.sandboxRoot);
+			await replayFilesystemEffects(this.replayWorkspace, artifacts, certificate.result.journal, session.projection, session.workspace.sandboxRoot,
+				path.join(session.workspace.processRoot, "private"));
 			session.nestedEvidence.push(certificate.dependencyCertificate);
 			this.recordHit(acquired.producer?.scope, acquired.joined, session);
 			session.computations.push(reusedComputation(certificate.result, started, acquired));
@@ -1358,7 +1366,7 @@ export class LinuxProcessReuseBackend {
 				stage = "workspace_effects";
 				const effects = diffWorkspaceStructures(before, after, delta.changes, session.projection);
 				stage = "dependencies";
-				const evidence = await captureDependencies(session, transactionDependencySource(before, effects), observation.paths, effects.effects);
+				const evidence = await captureDependencies(session, transactionDependencySource(before, effects), observation.paths, effects.effects, observation.external);
 				if (evidence.incompleteReasons.length) this.setError(session, `evidence:${evidence.incompleteReasons.join(",")}`);
 				const taints = new Set<ProvenanceTaint>(observation.taints);
 				// Private images preserve FD/OFD relations, but cannot also represent an independently accessed pathname.
@@ -1371,16 +1379,17 @@ export class LinuxProcessReuseBackend {
 				// A brokered descendant that did not resume in this trace ran outside it.
 				const traced = new Set((await readdir(traceRoot)).map(name => Number(/^process\.(\d+)$/.exec(name)?.[1])));
 				const escaped = session.bypasses.some(([pid]) => traced.has(pid) && !observation.resumedInterpositions?.includes(pid));
-				// A change it left outside the workspace is not an effect a replay reproduces.
-				const external = await privateChanges(path.join(session.workspace.processRoot, "private"), observation.external ?? []);
-				if (external.length) this.setError(session, `evidence:${external.join(",")}`);
+				// What it left outside the workspace commits with its workspace effects; a change no baseline can stand for does not replay.
+				const external = await privateCommits(path.join(session.workspace.processRoot, "private"), own.startedAt, observation.external ?? []);
+				if (external.unrepresentable.length) this.setError(session, `evidence:${external.unrepresentable.join(",")}`);
 				dependencyCertificate = {
-					complete: observation.complete && evidence.complete && !escaped && !external.length,
+					complete: observation.complete && evidence.complete && !escaped && !external.unrepresentable.length,
 					dependencies: evidence.dependencies,
 					taints: [...taints],
 				};
 				stage = "artifacts";
-				const baseResult = await captureProcessResult(this.store, outcome, observedProcessMs, effects.effects);
+				const baseResult = await captureProcessResult(this.store, outcome, observedProcessMs,
+					[...effects.effects, ...external.changes.map(change => ({ logicalPath: slash(change.target), change }))]);
 				const finalObjects = new Map([...after.entries].flatMap(([name, entry]) => entry.kind === "file" && entry.object ? [[entry.object, name] as const] : []));
 				if (descriptorOffsets) for (const position of descriptorOffsets) {
 					const input = inputs.find(({ fd }) => fd === position.fd)!;
@@ -1752,6 +1761,7 @@ async function sealSessionEvidence(session: ActiveSession, changes: readonly San
 			transactionDependencySource(capture.before, effects),
 			capture.observation.paths,
 			effects.effects,
+			capture.observation.external,
 		);
 		for (const reason of evidence.incompleteReasons) session.incompleteReasons.add(`top_evidence:${reason}`);
 		session.topLevelEvidence = mergeDependencyEvidence(
@@ -1853,6 +1863,7 @@ async function captureDependencies(
 	before: ReturnType<typeof transactionDependencySource>,
 	observed: readonly ObservedProcessPath[],
 	effects: readonly { readonly logicalPath: string }[],
+	ownWrites: readonly string[] = [],
 ) {
 	const workspaceDependency = async (physical: string, logical: string, role: Exclude<ObservedProcessPath["role"], "metadata">) => {
 		const [entry, parent] = await Promise.all([before(physical),
@@ -1903,6 +1914,7 @@ async function captureDependencies(
 		return { path: current, links };
 	};
 	const interposed = new Set(session.interposition.entries.flatMap(entry => [path.resolve(entry.intercepted), path.resolve(entry.view)]));
+	const own = new Set(ownWrites.flatMap(target => [path.resolve(target), path.dirname(path.resolve(target))]));
 	const pending = [...observed], seenImages = new Set<string>(), hostPaths = new Map<string, { physical: string; role: Exclude<ObservedProcessPath["role"], "metadata"> }>();
 	for (let item = pending.shift(); item; item = pending.shift()) {
 		const follow = item.role !== "metadata" || item.followSymlinks, walked = await walk(item.path, follow);
@@ -1925,6 +1937,8 @@ async function captureDependencies(
 			if (info?.isFile()) { add({ kind: "metadata", path: slash(physical), followSymlinks: false, fields: ["mode", "size"], digest: filesystemObservationDigest(info, ["mode", "size"]) }); continue; }
 		}
 		if (KERNEL_CONFIGURATION.test(observedPath)) continue; // Changes only with the kernel's own configuration, like the clock.
+		// What it wrote outside the workspace, and the directories holding those names, rest on its effects' baselines.
+		if (own.has(physical)) continue;
 		// A process reading its own state, or the host's CPU and cgroup limits, observes this one run like the clock or its pid.
 		if (/^\/proc\/(?:self|thread-self|\d+)(?:\/|$)/.test(observedPath)) { taints.add("pid_observation"); continue; }
 		// Reopening an inherited descriptor reaches what that descriptor carries, like a jobserver pipe, not a host file.
@@ -2009,21 +2023,22 @@ async function replayFilesystemEffects(
 	journal: readonly OrderedEffectEvent[],
 	projection: ExecutionPathProjection,
 	workspaceRoot: string,
+	privateStorage?: string,
 ): Promise<void> {
 	const changes: SandboxWorkspaceChange[] = [];
 	for (const event of journal) {
 		if (event.kind === "output") continue;
-		const target = projection.toPhysical(event.path);
-		if (!target || !pathContains(workspaceRoot, target) || target === path.resolve(workspaceRoot)) {
+		const target = projection.toPhysical(event.path), inside = !!target && pathContains(workspaceRoot, target);
+		if (!target || target === path.resolve(workspaceRoot) || !inside && pathContains(projection.sourceRoot, target)) {
 			throw new Error(`replay effect escapes workspace: ${event.path}`);
 		}
-		const resource = slash(path.relative(workspaceRoot, target));
+		const root = inside ? workspaceRoot : await hostRoot(target), resource = slash(path.relative(root, target));
 		if (event.before.kind === "directory" || event.after.kind === "directory") {
 			if (event.before.kind !== "absent" && event.before.kind !== "directory") throw new Error(`unsupported replay type change: ${event.path}`);
 			if (event.after.kind !== "absent" && event.after.kind !== "directory") throw new Error(`unsupported replay type change: ${event.path}`);
 			changes.push({
 				kind: "directory",
-				root: workspaceRoot,
+				root,
 				target,
 				resource,
 				...(event.before.kind === "directory" ? { before: directoryState(event.before) } : {}),
@@ -2032,7 +2047,7 @@ async function replayFilesystemEffects(
 			continue;
 		}
 		changes.push({
-			root: workspaceRoot,
+			root,
 			target,
 			resource,
 			...(event.operation ? { operation: event.operation } : {}),
@@ -2042,8 +2057,39 @@ async function replayFilesystemEffects(
 			...(event.after.kind === "file" ? { after: artifacts.read(event.after.data), afterMode: event.after.mode } : {}),
 		});
 	}
-	if (!changes.length) return;
-	await owner.commitDelta({ output: { result: { content: [], details: {} }, isError: false }, changes });
+	// Inside a speculative session, what lies outside the workspace belongs to its private branch until adoption.
+	const external = privateStorage ? changes.filter(change => !pathContains(workspaceRoot, change.target)) : [];
+	if (external.length) await privateReplay(privateStorage!, external);
+	if (changes.length > external.length) await owner.commitDelta({ output: { result: { content: [], details: {} }, isError: false }, changes: changes.filter(change => !external.includes(change)) });
+}
+
+/** Apply changes in a session's private branch as its sandboxes would have: over the merged view's state, into its upper
+ * directory, a removal of a host object as a whiteout its sandboxes read. */
+async function privateReplay(storage: string, changes: readonly SandboxWorkspaceChange[]): Promise<void> {
+	const { upper, log, deleted } = await privateBranch(storage);
+	const merged = async (target: string) => (await lstat(path.join(upper, target)).then(() => path.join(upper, target), () => undefined)) ?? (deleted(target) ? undefined : target);
+	for (const change of changes) {
+		const current = await merged(change.target);
+		const state = current === undefined ? undefined : change.kind === "directory" ? await readSandboxDirectoryState(current)
+			: await readFile(current).then(async content => ({ content, mode: Number((await lstat(current)).mode) & 0o7777 }), () => undefined);
+		if (!sameSandboxState(state, change.kind === "directory" ? change.before : change.before && { content: change.before, mode: change.beforeMode! })) {
+			throw new Error(`resource changed before replay: ${change.target}`);
+		}
+	}
+	for (const change of changes) {
+		const copy = path.join(upper, change.target);
+		if (change.kind === "directory" ? change.after : change.after !== undefined) {
+			await mkdir(path.dirname(copy), { recursive: true });
+			if (change.kind === "directory") await mkdir(copy, { recursive: true });
+			else { await writeFile(copy, change.after!); await chmod(copy, change.afterMode ?? 0o644); }
+			continue;
+		}
+		await rm(copy, { recursive: true, force: true });
+		if (await lstat(change.target).then(() => true, () => false)) {
+			await mkdir(path.dirname(log), { recursive: true });
+			await writeFile(log, `${change.target.slice(1).replace(/[\\\n\r]/g, char => char === "\n" ? "\\n" : char === "\r" ? "\\r" : "\\\\")}\n`, { flag: "a" });
+		}
+	}
 }
 
 /** Whole commands and held children publish the same ordered, content-addressed result format. */
@@ -2268,24 +2314,45 @@ function sandboxPolicyArguments(
 	];
 }
 
-/** Net changes a session's private branch under `storage` holds against the host, at `candidates` or wherever it holds any:
- * a copy that differs from the host object, a directory the host lacks, a deletion of something the host still has. */
-async function privateChanges(storage: string, candidates?: Iterable<string>): Promise<string[]> {
-	const upper = path.join(storage, "writes", "upper"), stat = (target: string) => lstat(target).catch(() => undefined);
-	const deletions = (await readFile(path.join(storage, "writes", "deleted.log"), "utf8").catch(() => "")).split("\n").filter(Boolean)
+/** A session's private branch under `storage`: its upper directory, its whiteout log and the host paths that log hides. */
+async function privateBranch(storage: string) {
+	const upper = path.join(storage, "writes", "upper"), log = path.join(storage, "writes", "deleted.log");
+	const deletions = (await readFile(log, "utf8").catch(() => "")).split("\n").filter(Boolean)
 		.map(line => `/${line.replace(/\\(.)/g, (_, escaped: string) => escaped === "n" ? "\n" : escaped === "r" ? "\r" : escaped)}`);
-	const held: string[] = [], changed: string[] = [], walk = async (host: string): Promise<void> => {
+	return { upper, log, deletions, deleted: (target: string) => deletions.some(entry => target === entry || target.startsWith(`${entry}/`)) };
+}
+
+/** The nearest directory above `target` the host holds: where a change outside the workspace stages and commits. */
+async function hostRoot(target: string): Promise<string> {
+	for (let directory = path.dirname(target); ; directory = path.dirname(directory)) {
+		if ((await lstat(directory).catch(() => undefined))?.isDirectory() || directory === path.dirname(directory)) return directory;
+	}
+}
+
+/** A session's private branch under `storage` as changes against the host, at `candidates` or wherever it differs: a copy that
+ * differs from the host object, a directory the host lacks, a deletion of something the host holds. Each stands over the host
+ * state it replaces, which only holds as a baseline for an object no one changed since `since`; anything else is unrepresentable. */
+async function privateCommits(storage: string, since: number, candidates?: Iterable<string>) {
+	const { upper, deletions, deleted } = await privateBranch(storage), stat = (target: string) => lstat(target).catch(() => undefined);
+	const held: string[] = [], changes: SandboxWorkspaceChange[] = [], unrepresentable: string[] = [], walk = async (host: string): Promise<void> => {
 		for (const name of await readdir(path.join(upper, host)).catch(() => [] as string[])) { held.push(path.posix.join(host, name)); await walk(path.posix.join(host, name)); }
 	};
 	if (!candidates) await walk("/");
-	for (const host of new Set(candidates ? [...candidates].map(target => path.posix.resolve(target)) : [...held, ...deletions])) {
-		const [own, native] = await Promise.all([stat(path.join(upper, host)), stat(host)]);
-		const same = own && native && (own.isDirectory() ? native.isDirectory() : native.mode === own.mode && native.size === own.size && (own.isSymbolicLink()
-			? await readlink(path.join(upper, host)) === await readlink(host) : (await readFile(path.join(upper, host))).equals(await readFile(host))));
-		const deleted = !own && native && deletions.some(entry => host === entry || host.startsWith(`${entry}/`));
-		if (own ? !same : deleted) changed.push(`external_write:${host}`);
+	for (const target of new Set(candidates ? [...candidates].map(name => path.posix.resolve(name)) : [...held, ...deletions])) {
+		const copy = path.join(upper, target), [own, native] = await Promise.all([stat(copy), stat(target)]);
+		if (!own && !(native && deleted(target)) || own?.isDirectory() && native?.isDirectory()) continue;
+		const file = async (at: string, info?: Awaited<ReturnType<typeof stat>>) => info?.isFile() ? { content: await readFile(at), mode: Number(info.mode) & 0o7777 } : undefined;
+		const [after, before] = await Promise.all([file(copy, own), file(target, native)]);
+		if (after && before && Buffer.from(after.content).equals(before.content) && after.mode === before.mode) continue;
+		if (native && native.ctimeMs > since || own && !own.isFile() && !own.isDirectory() || native && !native.isFile() && !native.isDirectory()) {
+			unrepresentable.push(`external_write:${target}`); continue;
+		}
+		const root = await hostRoot(target), resource = slash(path.relative(root, target));
+		changes.push(own?.isDirectory() || native?.isDirectory()
+			? { kind: "directory", root, target, resource, ...(native ? { before: (await readSandboxDirectoryState(target))! } : {}), ...(own ? { operation: "mkdir" as const, after: (await readSandboxDirectoryState(copy))! } : {}) }
+			: { root, target, resource, ...(before ? { before: before.content, beforeMode: before.mode } : {}), ...(after ? { after: after.content, afterMode: after.mode } : {}) });
 	}
-	return changed;
+	return { changes, unrepresentable };
 }
 
 function uniqueSandboxMounts(mounts: readonly SandboxMount[]): readonly SandboxMount[] {

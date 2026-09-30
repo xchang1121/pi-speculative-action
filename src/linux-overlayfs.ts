@@ -25,13 +25,7 @@ const LINUX_O_TMPFILE = 0o20200000;
 export interface LinuxOverlayfsOptions { readonly overlayfsBinary?: string; readonly fusermountBinary?: string; }
 
 export type LinuxOverlayfsCapability =
-	| {
-			readonly available: true;
-			readonly binary: string;
-			readonly fusermountBinary: string;
-			readonly fingerprint: string;
-			readonly detail: string;
-	  }
+	| { readonly available: true; readonly binary: string; readonly fusermountBinary: string; readonly fingerprint: string; readonly detail: string; }
 	| { readonly available: false; readonly detail: string; };
 
 export interface LinuxOverlayfsMount {
@@ -52,12 +46,7 @@ export async function openLinuxAnonymousWorkspaceFile(root: string): Promise<Fil
 	return open(root, fsConstants.O_WRONLY | LINUX_O_TMPFILE, 0o600);
 }
 
-interface ResolvedOverlayfs {
-	readonly binary: string;
-	readonly fusermountBinary: string;
-	readonly version: string;
-	readonly kernel: string;
-}
+interface ResolvedOverlayfs { readonly binary: string; readonly fusermountBinary: string; readonly version: string; readonly kernel: string; }
 
 interface LinuxOverlayfsCapabilityCacheEntry { readonly pending: Promise<LinuxOverlayfsCapability>; expiresAt?: number; }
 
@@ -126,22 +115,12 @@ export class LinuxOverlayfsCapabilityRegistry {
 		};
 	}
 
-	dispose(): void {
-		if (this.disposed) return;
-		this.disposed = true;
-		this.requests.clear();
-		this.resolved.clear();
-		this.degraded.clear();
-	}
+	dispose(): void { if (this.disposed) return; this.disposed = true; this.requests.clear(); this.resolved.clear(); this.degraded.clear(); }
 
 	private async resolveCapability(options: LinuxOverlayfsOptions): Promise<LinuxOverlayfsCapability> {
 		if (process.platform !== "linux") return { available: false, detail: "Linux host required for OverlayFS" };
 		let resolved: ResolvedOverlayfs;
-		try {
-			resolved = await resolveOverlayfs(options);
-		} catch (error) {
-			return { available: false, detail: errorMessage(error) };
-		}
+		try { resolved = await resolveOverlayfs(options); } catch (error) { return { available: false, detail: errorMessage(error) }; }
 		return this.memoized(this.resolved, resolvedCapabilityKey(resolved), () => probeLinuxOverlayfs(resolved));
 	}
 
@@ -164,12 +143,8 @@ export class LinuxOverlayfsCapabilityRegistry {
 		const entry: LinuxOverlayfsCapabilityCacheEntry = { pending: Promise.resolve().then(load) };
 		cache.set(key, entry);
 		void entry.pending.then(
-			(capability) => {
-				if (!capability.available) entry.expiresAt = Date.now() + this.negativeTtlMs;
-			},
-			() => {
-				entry.expiresAt = Date.now() + this.negativeTtlMs;
-			},
+			(capability) => { if (!capability.available) entry.expiresAt = Date.now() + this.negativeTtlMs; },
+			() => { entry.expiresAt = Date.now() + this.negativeTtlMs; },
 		);
 		return entry.pending;
 	}
@@ -209,9 +184,7 @@ export async function mountLinuxOverlayfs(input: {
 		upperRoot,
 		workRoot,
 		root,
-		onDegraded: (detail) => {
-			capabilityRegistry.markDegraded(capability, detail);
-		},
+		onDegraded: (detail) => { capabilityRegistry.markDegraded(capability, detail); },
 	});
 }
 
@@ -241,9 +214,7 @@ async function probeLinuxOverlayfs(resolved: ResolvedOverlayfs): Promise<LinuxOv
 			upperRoot,
 			workRoot,
 			root,
-			onDegraded: (detail) => {
-				degradedDetail = detail;
-			},
+			onDegraded: (detail) => { degradedDetail = detail; },
 		});
 		if ((await readFile(path.join(root, "copy-up.txt"), "utf8")) !== `${marker}\n`) {
 			throw new Error("OverlayFS lower view did not preserve file content");
@@ -310,12 +281,7 @@ async function probeLinuxOverlayfs(resolved: ResolvedOverlayfs): Promise<LinuxOv
 		if (!(await lstat(path.join(upperRoot, "replaced", ".wh..wh..opq"))).isFile()) {
 			throw new Error("OverlayFS opaque-directory encoding is unsupported");
 		}
-		const fingerprint = [
-			OVERLAY_OPTIONS_EPOCH,
-			process.arch,
-			resolved.kernel.trim(),
-			resolved.version.trim().replaceAll(/\s+/g, " "),
-		].join(":");
+		const fingerprint = [OVERLAY_OPTIONS_EPOCH, process.arch, resolved.kernel.trim(), resolved.version.trim().replaceAll(/\s+/g, " ")].join(":");
 		outcome = {
 			available: true,
 			binary: resolved.binary,
@@ -395,13 +361,7 @@ async function startLinuxOverlayfs(input: {
 		close: () => {
 			closed ??= (async () => {
 				try {
-					const degraded = await closeMount(
-						child,
-						processClosed,
-						input.fusermountBinary,
-						input.root,
-						() => diagnostics,
-					);
+					const degraded = await closeMount(child, processClosed, input.fusermountBinary, input.root, () => diagnostics);
 					if (degraded) input.onDegraded?.(degraded);
 				} catch (error) { input.onDegraded?.(`unsafe unmount failure: ${errorMessage(error)}`); throw error; }
 			})();
@@ -439,9 +399,7 @@ async function closeMount(
 	let unmountError: unknown;
 	let recoveryUnmountError: unknown;
 	if (await mountedAsFuseOverlayfs(mountRoot)) {
-		try {
-			await execText(fusermountBinary, ["-u", mountRoot]);
-		} catch (error) { unmountError = error; child.kill("SIGKILL"); }
+		try { await execText(fusermountBinary, ["-u", mountRoot]); } catch (error) { unmountError = error; child.kill("SIGKILL"); }
 	}
 	child.stdin.end();
 	const waitForClose = () => waitForCandidate(processClosed, undefined, OVERLAY_EXIT_TIMEOUT_MS);
@@ -451,11 +409,7 @@ async function closeMount(
 		processShutdownDegraded = (await waitForClose()).status !== "completed";
 	}
 	if (unmountError && (await mountedAsFuseOverlayfs(mountRoot))) {
-		try {
-			await execText(fusermountBinary, ["-u", mountRoot]);
-		} catch (error) {
-			recoveryUnmountError = error;
-		}
+		try { await execText(fusermountBinary, ["-u", mountRoot]); } catch (error) { recoveryUnmountError = error; }
 	}
 	if (!(await waitForUnmount(mountRoot))) {
 		const normalFailure = unmountError ? `; normal unmount failed: ${errorMessage(unmountError)}` : "";

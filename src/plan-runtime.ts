@@ -74,17 +74,11 @@ export class PredictionOpportunity {
 	readonly identity: PredictionIdentity;
 	private stateValue: PredictionOpportunityState = { status: "pending" };
 
-	constructor(identity: PredictionIdentity) {
-		this.identity = Object.freeze({ ...identity });
-	}
+	constructor(identity: PredictionIdentity) { this.identity = Object.freeze({ ...identity }); }
 
-	get state(): PredictionOpportunityState {
-		return this.stateValue;
-	}
+	get state(): PredictionOpportunityState { return this.stateValue; }
 
-	get settlement(): PredictionSettlement | undefined {
-		return this.stateValue.status === "settled" ? this.stateValue.settlement : undefined;
-	}
+	get settlement(): PredictionSettlement | undefined { return this.stateValue.status === "settled" ? this.stateValue.settlement : undefined; }
 
 	claim(actorAction: ActorActionIdentity, relation: ActionKeyMatch): boolean {
 		if (this.stateValue.status !== "pending") return false;
@@ -128,14 +122,7 @@ export class PredictionOpportunity {
 	}
 }
 
-type MutablePlan = {
-	id: string;
-	source: string;
-	revision: number;
-	nextRevision: number;
-	nodes: Map<string, MutableNode>;
-	graph: PlanGraph;
-};
+type MutablePlan = { id: string; source: string; revision: number; nextRevision: number; nodes: Map<string, MutableNode>; graph: PlanGraph; };
 
 type PlanGraph = { readonly plans: Set<MutablePlan>; ordered: readonly MutableNode[] };
 
@@ -206,10 +193,7 @@ export class PlanRuntime {
 		return this.commit({ id, source: owned.source, revision: owned.revision, actions, upserted, ordered, anchorDecisionSeq });
 	}
 
-	plan(proposalID: string): MaterializedPlan | undefined {
-		const plan = this.plans.get(proposalID);
-		return plan ? planSnapshot(plan) : undefined;
-	}
+	plan(proposalID: string): MaterializedPlan | undefined { const plan = this.plans.get(proposalID); return plan ? planSnapshot(plan) : undefined; }
 
 	reserveRevision(proposalID: string, minimum = 0): number | undefined {
 		const plan = this.plans.get(proposalID);
@@ -336,22 +320,16 @@ export class PlanRuntime {
 		return this.mutable(proposalID, actionID)?.node.opportunity;
 	}
 
-	values(): readonly PlanRuntimeNode[] {
-		return this.select();
-	}
+	values(): readonly PlanRuntimeNode[] { return this.select(); }
 
-	pending(): readonly PlanRuntimeNode[] {
-		return this.select((node) => node.opportunity.state.status === "pending");
-	}
+	pending(): readonly PlanRuntimeNode[] { return this.select((node) => node.opportunity.state.status === "pending"); }
 
 	matchable(decisionSequence: number): readonly PlanRuntimeNode[] {
 		const sequence = Math.max(0, Math.floor(decisionSequence));
 		return this.select((node, plan) => this.isMatchable(plan, node, sequence));
 	}
 
-	unsettled(): readonly PlanRuntimeNode[] {
-		return this.select((node) => node.opportunity.state.status !== "settled");
-	}
+	unsettled(): readonly PlanRuntimeNode[] { return this.select((node) => node.opportunity.state.status !== "settled"); }
 
 	consumers(candidateID: string): readonly PlanRuntimeNode[] {
 		return this.select((node) => node.opportunity.state.status !== "settled" &&
@@ -362,13 +340,9 @@ export class PlanRuntime {
 		return this.select((node) => node.opportunity.state.status === "pending" && node.latestDecisionSeq <= settledDecisionSeq);
 	}
 
-	drainBlocked(): readonly PlanRuntimeNode[] {
-		return this.select((node) => node.opportunity.state.status !== "settled", "blocked");
-	}
+	drainBlocked(): readonly PlanRuntimeNode[] { return this.select((node) => node.opportunity.state.status !== "settled", "blocked"); }
 
-	clear(): void {
-		this.plans.clear();
-	}
+	clear(): void { this.plans.clear(); }
 
 	private commit(input: {
 		readonly id: string;
@@ -391,12 +365,7 @@ export class PlanRuntime {
 		const removed = current ? [...current.nodes.keys()].filter((id) => !input.actions.has(id)) : [];
 		const retiredIDs = new Set([...removed, ...replaced]);
 		const retired: PlanRuntimeNode[] = [];
-		if (current) {
-			for (const id of retiredIDs) {
-				const node = current.nodes.get(id);
-				if (node) retired.push(this.snapshot(current, node));
-			}
-		}
+		if (current) { for (const id of retiredIDs) { const node = current.nodes.get(id); if (node) retired.push(this.snapshot(current, node)); } }
 
 		const anchor = sequence(input.anchorDecisionSeq);
 		const nodes = new Map<string, MutableNode>();
@@ -592,11 +561,7 @@ function dependencyReadiness(node: MutableNode, condition: PlanActionDependencyC
 function predictionMatched(settlement: PredictionSettlement | undefined): settlement is Extract<
 	PredictionSettlement,
 	{ readonly observation: "observed" }
-> & {
-	readonly match: { readonly matched: true };
-} {
-	return settlement?.observation === "observed" && settlement.match.matched;
-}
+> & { readonly match: { readonly matched: true }; } { return settlement?.observation === "observed" && settlement.match.matched; }
 
 function predictionAdopted(settlement: PredictionSettlement | undefined): boolean {
 	return predictionMatched(settlement) && settlement.match.adoption.status === "adopted";
@@ -642,9 +607,7 @@ function planSnapshot(plan: MutablePlan): MaterializedPlan {
 	});
 }
 
-function validateActions(
-	actions: readonly PlanAction[],
-):
+function validateActions(actions: readonly PlanAction[]):
 	| { readonly ok: true; readonly actions: readonly PlanAction[] }
 	| { readonly ok: false; readonly reason: "duplicate_action" | "invalid_action" | "invalid_dependency" } {
 	// Capture scheduling records before cloning input graphs, which may invoke producer accessors.
@@ -719,26 +682,14 @@ function planNodeID(source: string, proposalID: string, actionID: string, revisi
 	return JSON.stringify([source, proposalID, actionID, revision]);
 }
 
-function horizon(action: PlanAction): number {
-	return sequence(action.horizon ?? 0);
-}
+function horizon(action: PlanAction): number { return sequence(action.horizon ?? 0); }
 
-function latestHorizon(action: PlanAction): number {
-	return Math.max(horizon(action), sequence(action.latestHorizon ?? action.horizon ?? 0));
-}
+function latestHorizon(action: PlanAction): number { return Math.max(horizon(action), sequence(action.latestHorizon ?? action.horizon ?? 0)); }
 
-function actorDecisionSequence(action: ActorActionIdentity): number {
-	return sequence(action.decisionSequence ?? action.sequence);
-}
+function actorDecisionSequence(action: ActorActionIdentity): number { return sequence(action.decisionSequence ?? action.sequence); }
 
-function validIdentity(proposalID: string, source: string): boolean {
-	return validToken(proposalID) && validToken(source);
-}
+function validIdentity(proposalID: string, source: string): boolean { return validToken(proposalID) && validToken(source); }
 
-function validToken(value: string): boolean {
-	return typeof value === "string" && value.length > 0 && value.trim() === value;
-}
+function validToken(value: string): boolean { return typeof value === "string" && value.length > 0 && value.trim() === value; }
 
-function validRevision(value: number): boolean {
-	return Number.isSafeInteger(value) && value >= 0;
-}
+function validRevision(value: number): boolean { return Number.isSafeInteger(value) && value >= 0; }
