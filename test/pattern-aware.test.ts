@@ -431,6 +431,28 @@ describe("PatternAware", () => {
 		expect(store.predict("probe").map((candidate) => candidate.input)).toContainEqual({ command: "pytest suite/zeta_spec.py::test_zeta -q" });
 	});
 
+	test("moves an edited file under another root inside a command, and splices more than two values", () => {
+		const store = patternStore();
+		for (const [name, directory] of [["alpha", "adapters"], ["beta", "core"], ["gamma", "helpers"]]) {
+			store.observe(input(name, "edit", { path: `lib/${directory}/${name}.js` }));
+			store.observe(input(name, "bash", { command: `npx mocha test/unit/${directory}/${name}.js --timeout 30000 --exit` }));
+			store.finishSession(name);
+		}
+		store.observe(input("probe", "edit", { path: "lib/platform/zeta.js" }));
+		expect(store.predict("probe").map((candidate) => candidate.input)).toContainEqual({ command: "npx mocha test/unit/platform/zeta.js --timeout 30000 --exit" });
+		const spliced = patternStore();
+		for (const [name, crate] of [["alpha", "copy"], ["beta", "move"], ["gamma", "link"]]) {
+			spliced.observe(input(name, "read", { path: `src/uu/${crate}/src/main.rs` }));
+			spliced.observe(input(name, "grep", { pattern: `test_${name}`, path: `tests/test_${crate}.rs` }));
+			spliced.observe(input(name, "bash", { command: `cargo test --manifest src/uu/${crate}/src/main.rs --test tests/test_${crate}.rs test_${name} -- --exact` }));
+			spliced.finishSession(name);
+		}
+		spliced.observe(input("probe", "read", { path: "src/uu/remove/src/main.rs" }));
+		spliced.observe(input("probe", "grep", { pattern: "test_zeta", path: "tests/test_remove.rs" }));
+		expect(spliced.predict("probe").map((candidate) => candidate.input))
+			.toContainEqual({ command: "cargo test --manifest src/uu/remove/src/main.rs --test tests/test_remove.rs test_zeta -- --exact" });
+	});
+
 	test("lets recent gap behavior replace stale high-volume history", () => {
 		const store = patternStore({ maxFutureGap: 8, futureGapCoverage: 0.9, decayHalfLifeEvents: 10 });
 		acceptPattern(store, { "0": 1000, "3": 10 }, {
@@ -1603,34 +1625,13 @@ function constantBindings(input: Readonly<Record<string, unknown>>): ValidatedPa
 
 function collectionBindings(variantCounts?: Readonly<Record<string, number>>, field = "filePath"): ValidatedPattern["bindings"] {
 	return {
-		[JSON.stringify([field])]: {
-			type: "each",
-			relativeEvent: -1,
-			field: "output",
-			path: ["results"],
-			itemPath: ["path"],
-			...(variantCounts ? { variantCounts } : {}),
-		},
+		[JSON.stringify([field])]: { type: "each", relativeEvent: -1, field: "output", path: ["results"], itemPath: ["path"], ...(variantCounts ? { variantCounts } : {}) },
 	};
 }
 
-function patternFeedback(
-	overrides: Partial<ValidatedPattern["feedback"]> = {},
-): ValidatedPattern["feedback"] {
-	return {
-		issued: 0,
-		observed: 0,
-		matched: 0,
-		adopted: 0,
-		rejectedAfterMatch: {},
-		unobserved: {},
-		recentMatchedWeight: 0,
-		recentMismatchedWeight: 0,
-		recentAdoptedWeight: 0,
-		recentRejectedWeight: 0,
-		sequence: 1,
-		...overrides,
-	};
+function patternFeedback(overrides: Partial<ValidatedPattern["feedback"]> = {}): ValidatedPattern["feedback"] {
+	return { issued: 0, observed: 0, matched: 0, adopted: 0, rejectedAfterMatch: {}, unobserved: {}, recentMatchedWeight: 0, recentMismatchedWeight: 0,
+		recentAdoptedWeight: 0, recentRejectedWeight: 0, sequence: 1, ...overrides };
 }
 
 function input(
