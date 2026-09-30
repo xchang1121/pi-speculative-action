@@ -16,7 +16,7 @@ import { effectCommitFailure } from "./effect-transaction.ts";
 import type { WorkspaceFileMutation } from "./workspace-state.ts";
 import { LinuxOverlayfsCapabilityRegistry, LinuxOverlayfsUnsafeCleanupError, mountLinuxOverlayfs, openLinuxAnonymousWorkspaceFile,
 	type LinuxOverlayfsMount, type LinuxOverlayfsOptions } from "./linux-overlayfs.ts";
-import { captureWorkspaceStructure, captureWorkspaceStructureEntry, hydrateWorkspaceFileEntry, workspaceStructureSnapshot, directoryEntriesDigest,
+import { captureWorkspaceStructure, captureWorkspaceStructureEntry, statChangeDigest, workspaceStructureSnapshot, directoryEntriesDigest,
 	type WorkspaceStructureEntry, type WorkspaceStructureSnapshot } from "./process-observation.ts";
 import { ResourceVersionManager, type ResourceChangeSet, type ResourceVersionToken, type ResourceInput } from "./resource-version.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
@@ -1005,8 +1005,12 @@ async function createGitWorkspaceTransactionDriver(workspace: PrivateSandboxWork
 		readonly frontier: ReadonlyMap<string, RegularFileState | undefined>; readonly unknown: ReadonlySet<string>; readonly racing: readonly string[];
 	}
 	const { sandboxRoot, openTransactionClock: openClock, transactionClockLinks: expectedClockLinks, transactionClockRoots: clockRoots } = workspace;
-	let lastStructure = await workspace.structure.capture();
-	const captureStructure = workspace.structure.capture, frontier = new Map(workspace.baselineFrontier);
+	// Another process linking or removing a file can leave one capture short of its names, or without a name it listed: capture again.
+	const captureStructure = async (attempt = 1): Promise<WorkspaceStructureSnapshot> => {
+		const last = attempt >= WORKSPACE_TRANSACTION_STABILITY_ATTEMPTS, snapshot = await workspace.structure.capture().catch((error: unknown) => { if (last || !isMissing(error)) throw error; });
+		return snapshot && (snapshot.complete || last) ? snapshot : captureStructure(attempt + 1);
+	}, frontier = new Map(workspace.baselineFrontier);
+	let lastStructure = await captureStructure();
 	let retainedBytes = [...frontier.values()].reduce((total, state) => total + (state?.content.byteLength ?? 0), 0);
 	const active = new Set<Capture>(), lock = { lock: Promise.resolve() }, unknown = new Set<string>(); // Bytes last seen while others wrote.
 	let poisonReason = lastStructure.complete ? undefined : "workspace_structure_limit";
@@ -1146,8 +1150,8 @@ async function createGitWorkspaceTransactionDriver(workspace: PrivateSandboxWork
 				const entry = after.entries.get(relativePath);
 				let current: RegularFileState | undefined;
 				if (entry?.kind === "file") {
-					const captured = await captureStableFile(path.resolve(sandboxRoot, relativePath), WORKSPACE_TRANSACTION_MAX_BYTES, true);
-					if (!hydrateWorkspaceFileEntry(entry, captured)) return incomplete(`overlapping_workspace_write:${relativePath}`);
+					const captured = await captureStableFile(path.resolve(sandboxRoot, relativePath), WORKSPACE_TRANSACTION_MAX_BYTES, true, { digest: false });
+					if (statChangeDigest(captured.stat) !== entry.changeDigest) return incomplete(`overlapping_workspace_write:${relativePath}`);
 					current = { content: captured.content!, mode: Number(captured.stat.mode & 0o777n) };
 					entries.set(relativePath, entry);
 				} else entries.delete(relativePath);
@@ -1220,19 +1224,18 @@ async function createGitWorkspaceTransactionDriver(workspace: PrivateSandboxWork
 	}
 
 	async function captureTransitions(paths: readonly string[], after: WorkspaceStructureSnapshot, captureBefore = true): Promise<readonly WorkspaceRegularDelta[]> {
+		// The lock and overlap rejection keep this frontier unchanged, and each file the size its snapshot took, throughout the interval: read those at once.
+		const sizes = paths.map(relativePath => { const entry = after.entries.get(relativePath); return entry?.kind === "file" ? entry.size : undefined; });
+		if (sizes.reduce<number>((total, size) => total + (size ?? 0), 0) > WORKSPACE_TRANSACTION_MAX_BYTES) throw new Error("workspace transaction after-state exceeds capture limit");
+		const currents = await mapFilesystem([...paths.keys()], async index => sizes[index] === undefined ? undefined : readRegularState(path.resolve(sandboxRoot, paths[index]!), sizes[index]));
 		const changes: WorkspaceRegularDelta[] = [];
-		let beforeBytes = 0, afterBytes = 0;
-		for (const relativePath of paths) {
-			// The lock and overlap rejection keep this frontier unchanged throughout the interval.
-			const previous = !captureBefore ? undefined
-				: frontier.has(relativePath) ? frontier.get(relativePath) : await workspace.readBase(relativePath, WORKSPACE_TRANSACTION_MAX_BYTES - beforeBytes);
+		let beforeBytes = 0;
+		for (const [index, relativePath] of paths.entries()) {
+			const previous = !captureBefore ? undefined : frontier.has(relativePath) ? frontier.get(relativePath) : await workspace.readBase(relativePath, WORKSPACE_TRANSACTION_MAX_BYTES - beforeBytes);
 			beforeBytes += previous?.content.byteLength ?? 0;
 			if (beforeBytes > WORKSPACE_TRANSACTION_MAX_BYTES) throw new Error("workspace transaction before-state exceeds capture limit");
-			const entry = after.entries.get(relativePath);
-			const unchangedBytes = retainedBytes - (frontier.get(relativePath)?.content.byteLength ?? 0);
-			const current = entry?.kind === "file" ? await readRegularState(path.resolve(sandboxRoot, relativePath),
-				Math.min(WORKSPACE_TRANSACTION_MAX_BYTES - afterBytes, WORKSPACE_TRANSACTION_MAX_BYTES - unchangedBytes)) : undefined;
-			if (captureBefore) afterBytes += current?.content.byteLength ?? 0;
+			const current = currents[index], unchangedBytes = retainedBytes - (frontier.get(relativePath)?.content.byteLength ?? 0);
+			if (unchangedBytes + (current?.content.byteLength ?? 0) > WORKSPACE_TRANSACTION_MAX_BYTES) throw new Error("workspace transaction after-state exceeds capture limit");
 			retainedBytes = unchangedBytes + (current?.content.byteLength ?? 0);
 			frontier.set(relativePath, current);
 			if (captureBefore) changes.push({ relativePath, ...(previous ? { before: previous.content, beforeMode: previous.mode } : {}),
@@ -1834,8 +1837,8 @@ async function captureLiveBase(pool: PooledGitRepository): Promise<WorkspaceStru
 async function readLiveBase(base: WorkspaceStructureSnapshot, resource: string, maxBytes: number): Promise<RegularFileState | undefined> {
 	const entry = base.entries.get(resource);
 	if (entry?.kind !== "file") return undefined;
-	const takenAtMs = Date.now(), captured = await captureStableFile(entry.contentPath ?? path.join(base.root, resource), maxBytes, true);
-	if (!hydrateWorkspaceFileEntry(entry, captured)) throw new Error(`workspace changed since the sandbox started: ${resource}`);
+	const takenAtMs = Date.now(), captured = await captureStableFile(entry.contentPath ?? path.join(base.root, resource), maxBytes, true, { digest: false });
+	if (statChangeDigest(captured.stat) !== entry.changeDigest) throw new Error(`workspace changed since the sandbox started: ${resource}`);
 	return { content: captured.content!, mode: Number(captured.stat.mode & 0o777n), settled: settledIdentity(captured.stat, takenAtMs) };
 }
 
@@ -1888,7 +1891,7 @@ async function assertCommitTarget(change: SandboxWorkspaceChange): Promise<void>
 
 async function readRegularState(target: string, maxBytes = Number.POSITIVE_INFINITY): Promise<RegularFileState | undefined> {
 	try {
-		const captured = await captureStableFile(target, maxBytes, true);
+		const captured = await captureStableFile(target, maxBytes, true, { digest: false });
 		return { content: captured.content!, mode: process.platform === "win32" ? 0 : Number(captured.stat.mode & 0o777n), identity: captured.stat };
 	} catch (error) { if (isMissing(error)) return undefined; throw error; }
 }
