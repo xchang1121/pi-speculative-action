@@ -77,7 +77,7 @@ index 96309ec..8d6fb8d 100644
          if policy.workdir.is_none() {
              return Err(anyhow!("--dry-run requires --workdir"));
 diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/src/chroot/dispatch.rs
-index 6e4ab93..b9d2468 100644
+index 6e4ab93..55f9e85 100644
 --- a/crates/sandlock-core/src/chroot/dispatch.rs
 +++ b/crates/sandlock-core/src/chroot/dispatch.rs
 @@ -59,7 +59,7 @@ use crate::chroot::resolve::{
@@ -1052,7 +1052,35 @@ index 6e4ab93..b9d2468 100644
          return exec_on_host(|p| unsafe { libc::truncate(p, length) }, &host_path);
      }
  
-@@ -1716,7 +2139,12 @@ pub(crate) async fn handle_chroot_readlink(
+@@ -1496,7 +1919,8 @@ pub(crate) async fn handle_chroot_stat(
+     ctx: &ChrootCtx<'_>,
+ ) -> NotifAction {
+     let nr = notif.data.nr as i64;
+-    let flags = notif.data.args[3];
++    // faccessat has no flags argument: its fourth register is whatever the caller left there.
++    let flags = if nr == libc::SYS_faccessat { 0 } else { notif.data.args[3] };
+ 
+     // AT_EMPTY_PATH: fstat(fd, &statbuf) — the fd already points to the
+     // correct file (injected by the chroot handler or inherited). Let the
+@@ -1521,11 +1945,15 @@ pub(crate) async fn handle_chroot_stat(
+         Err(a) => return a,
+     };
+ 
++    // The kernel judges the requested permissions on the object the view resolves to; this supervisor runs as the caller.
+     if nr == libc::SYS_faccessat || nr == crate::arch::SYS_FACCESSAT2 {
+-        return if real_path.exists() || real_path.is_symlink() {
++        let mode = notif.data.args[2] as libc::c_int & (libc::R_OK | libc::W_OK | libc::X_OK);
++        let at = flags as libc::c_int & (libc::AT_EACCESS | libc::AT_SYMLINK_NOFOLLOW);
++        let c_path = match path_cstr(&real_path, libc::EINVAL) { Ok(c) => c, Err(a) => return a };
++        return if unsafe { libc::faccessat(libc::AT_FDCWD, c_path.as_ptr(), mode, at) } == 0 {
+             NotifAction::ReturnValue(0)
+         } else {
+-            NotifAction::Errno(libc::ENOENT)
++            NotifAction::Errno(last_errno(libc::EACCES))
+         };
+     }
+ 
+@@ -1716,7 +2144,12 @@ pub(crate) async fn handle_chroot_readlink(
              if cow.matches(&host_str) {
                  let target = match cow.handle_readlink(&host_str) {
                      Some(t) => t,
@@ -1066,7 +1094,7 @@ index 6e4ab93..b9d2468 100644
                  };
                  drop(cs);
                  return write_target(target.as_bytes());
-@@ -1726,7 +2154,7 @@ pub(crate) async fn handle_chroot_readlink(
+@@ -1726,7 +2159,7 @@ pub(crate) async fn handle_chroot_readlink(
  
      let target = match std::fs::read_link(&host_path) {
          Ok(t) => t,
@@ -1075,7 +1103,7 @@ index 6e4ab93..b9d2468 100644
      };
  
      // Strip chroot/mount prefix from absolute targets
-@@ -1861,12 +2289,12 @@ pub(crate) async fn handle_chroot_xattr(
+@@ -1861,12 +2294,12 @@ pub(crate) async fn handle_chroot_xattr(
          };
  
      let writing = matches!(op, XattrOp::Set | XattrOp::Remove);
@@ -1090,7 +1118,7 @@ index 6e4ab93..b9d2468 100644
          Ok(p) => p,
          Err(a) => return a,
      };
-@@ -1940,18 +2368,101 @@ pub(crate) async fn handle_chroot_xattr(
+@@ -1940,18 +2373,101 @@ pub(crate) async fn handle_chroot_xattr(
  // ============================================================
  
  pub(crate) async fn handle_chroot_getdents(
@@ -1203,7 +1231,7 @@ index 6e4ab93..b9d2468 100644
  }
  
  // ============================================================
-@@ -2043,6 +2554,20 @@ pub(crate) async fn handle_chroot_fchdir(
+@@ -2043,6 +2559,20 @@ pub(crate) async fn handle_chroot_fchdir(
      NotifAction::Continue
  }
  
@@ -1224,7 +1252,7 @@ index 6e4ab93..b9d2468 100644
  // ============================================================
  // getcwd handler
  // ============================================================
-@@ -2092,12 +2617,38 @@ pub(crate) async fn handle_chroot_statfs(
+@@ -2092,12 +2622,38 @@ pub(crate) async fn handle_chroot_statfs(
          None => return NotifAction::Continue,
      };
  
@@ -1235,8 +1263,7 @@ index 6e4ab93..b9d2468 100644
      };
 +    write_statfs(notif, notif_fd, statfsbuf_addr, &viewed_filesystem(ctx, &host_path, &virtual_path))
 +}
- 
--    let c_path = match path_cstr(&host_path, libc::ENOENT) {
++
 +/// The path whose filesystem a native run would see: a mount's own filesystem stands in for the tree its virtual path names.
 +fn viewed_filesystem(ctx: &ChrootCtx<'_>, host_path: &Path, virtual_path: &Path) -> PathBuf {
 +    if !ctx.is_mounted(virtual_path) {
@@ -1244,7 +1271,8 @@ index 6e4ab93..b9d2468 100644
 +    }
 +    virtual_path.ancestors().find(|ancestor| ancestor.exists()).unwrap_or(host_path).to_path_buf()
 +}
-+
+ 
+-    let c_path = match path_cstr(&host_path, libc::ENOENT) {
 +/// fstatfs of a descriptor on a mounted path, answered for its virtual path; any other descriptor is the kernel's to answer.
 +pub(crate) async fn handle_chroot_fstatfs(
 +    notif: &SeccompNotif,
@@ -1265,7 +1293,7 @@ index 6e4ab93..b9d2468 100644
          Ok(c) => c,
          Err(a) => return a,
      };
-@@ -2152,9 +2703,9 @@ pub(crate) async fn handle_chroot_utimensat(
+@@ -2152,9 +2708,9 @@ pub(crate) async fn handle_chroot_utimensat(
          Some(r) => r,
          None => return NotifAction::Errno(libc::EACCES),
      };
@@ -1277,7 +1305,18 @@ index 6e4ab93..b9d2468 100644
          Ok(p) => p,
          Err(a) => return a,
      };
-@@ -2476,12 +3027,17 @@ mod mount_ro_tests {
+@@ -2263,8 +2819,8 @@ pub(crate) async fn handle_chroot_legacy_access(
+     let mut synth = notif_with_args(notif, [
+         libc::AT_FDCWD as u64,
+         notif.data.args[0], // path
+-        0,                  // statbuf (unused for faccessat path)
+-        0,                  // flags
++        notif.data.args[1], // mode
++        0,
+         0, 0,
+     ]);
+     synth.data.nr = libc::SYS_faccessat as i32;
+@@ -2476,12 +3032,17 @@ mod mount_ro_tests {
          processes: &'a Arc<ProcessIndex>,
      ) -> ChrootCtx<'a> {
          ChrootCtx {
