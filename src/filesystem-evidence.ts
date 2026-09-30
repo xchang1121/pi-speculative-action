@@ -258,10 +258,10 @@ export async function* walkFilesystemPath(target: string, options: { readonly st
 	}
 }
 
-export async function assertNoSymlinkPath(root: string, target: string): Promise<void> {
+export async function assertNoSymlinkPath(root: string, target: string, capture?: typeof captureFilesystemEntry): Promise<void> {
 	const resolvedRoot = path.resolve(root), resolvedTarget = path.resolve(target);
 	if (!containsFilesystemPath(resolvedRoot, resolvedTarget)) throw new Error(`sandbox path escapes workspace: ${resolvedTarget}`);
-	for await (const entry of walkFilesystemPath(resolvedTarget, { start: resolvedRoot })) {
+	for await (const entry of walkFilesystemPath(resolvedTarget, { start: resolvedRoot, ...(capture ? { capture } : {}) })) {
 		const first = entry.path === resolvedRoot, info = entry.info;
 		if (!info) { if (first) throw new Error(`sandbox workspace root does not exist: ${resolvedRoot}`); break; }
 		if (first && (info.isSymbolicLink() || !info.isDirectory())) throw new Error("sandbox workspace root must be a real directory");

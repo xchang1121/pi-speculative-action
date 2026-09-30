@@ -1653,33 +1653,18 @@ async function materializeCheckpoint(workspace: PrivateSandboxWorkspace, checkpo
 async function collectSandboxChanges(workspace: PrivateSandboxWorkspace, frontier?: readonly string[]): Promise<readonly SandboxFileChange[]> {
 	const detected = frontier ?? (workspace.overlay ? await collectOverlayChangeResources(workspace) : await collectGitChangeResources(workspace));
 	const resources = [...new Set([...detected, ...(frontier ? [] : workspace.baselineFrontier.keys())])].filter((resource) => !isSnapshotExcluded(slash(resource))).sort();
-	const changes: SandboxFileChange[] = [];
-	for (const resource of resources) {
+	// Changed files share their directories: each is walked once, and the files are read concurrently.
+	const walked = new Map<string, ReturnType<typeof captureFilesystemEntry>>(), capture = (target: string) => walked.get(target) ?? walked.set(target, captureFilesystemEntry(target)).get(target)!;
+	return (await mapFilesystem(resources, async (resource): Promise<readonly SandboxFileChange[]> => {
 		if (!resource || path.isAbsolute(resource) || resource.split("/").includes("..")) throw new Error(`invalid sandbox change path: ${resource}`);
-		const target = path.resolve(workspace.sourceRoot, resource);
-		const sandboxTarget = path.resolve(workspace.sandboxRoot, resource);
-		if (!containsFilesystemPath(workspace.sourceRoot, target) || !containsFilesystemPath(workspace.sandboxRoot, sandboxTarget)) {
-			throw new Error(`sandbox change escapes workspace: ${resource}`);
-		}
-		await assertNoSymlinkPath(workspace.sourceRoot, target);
-		await assertNoSymlinkPath(workspace.sandboxRoot, sandboxTarget);
-		const before = workspace.baselineFrontier.has(resource) ? workspace.baselineFrontier.get(resource) : await workspace.readBase(resource, 64 * 1024 * 1024);
-		const after = await readRegularState(sandboxTarget);
-		if (frontier || !sameSandboxState(before, after)) {
-			changes.push({
-				root: workspace.sourceRoot,
-				target,
-				resource,
-				before: before?.content,
-				after: after?.content,
-				beforeMode: before?.mode,
-				afterMode: after?.mode,
-				afterModified: after?.identity && String(after.identity.mtimeNs),
-				...(before?.settled ? { beforeIdentity: before.settled } : {}),
-			});
-		}
-	}
-	return changes;
+		const target = path.resolve(workspace.sourceRoot, resource), sandboxTarget = path.resolve(workspace.sandboxRoot, resource);
+		if (!containsFilesystemPath(workspace.sourceRoot, target) || !containsFilesystemPath(workspace.sandboxRoot, sandboxTarget)) throw new Error(`sandbox change escapes workspace: ${resource}`);
+		await Promise.all([assertNoSymlinkPath(workspace.sourceRoot, target, capture), assertNoSymlinkPath(workspace.sandboxRoot, sandboxTarget, capture)]);
+		const [before, after] = await Promise.all([workspace.baselineFrontier.has(resource) ? workspace.baselineFrontier.get(resource)
+			: workspace.readBase(resource, 64 * 1024 * 1024), readRegularState(sandboxTarget)]);
+		return frontier || !sameSandboxState(before, after) ? [{ root: workspace.sourceRoot, target, resource, before: before?.content, after: after?.content, beforeMode: before?.mode,
+			afterMode: after?.mode, afterModified: after?.identity && String(after.identity.mtimeNs), ...(before?.settled ? { beforeIdentity: before.settled } : {}) }] : [];
+	})).flat();
 }
 
 async function collectGitChangeResources(workspace: PrivateSandboxWorkspace): Promise<readonly string[]> {
