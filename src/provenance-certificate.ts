@@ -317,9 +317,7 @@ export function parseProcessCertificate(value: unknown): ProcessProvenanceCertif
 			result: candidate.result,
 			createdAt: candidate.createdAt,
 		});
-		if (sealed.id !== candidate.id || sealed.weakKey !== candidate.weakKey || sealed.strongKey !== candidate.strongKey) {
-			return undefined;
-		}
+		if (sealed.id !== candidate.id || sealed.weakKey !== candidate.weakKey || sealed.strongKey !== candidate.strongKey) return undefined;
 		return sealed;
 	} catch {
 		return undefined;
@@ -437,9 +435,7 @@ function normalizePrototype(input: ExecPrototype): ExecPrototype {
 	if (!validLogicalPath(executablePath) || !validLogicalPath(logicalCwd) || typeof platformFingerprint !== "string" || !platformFingerprint) {
 		throw new Error("process prototype identity is incomplete");
 	}
-	if (!Number.isSafeInteger(umask) || umask < 0 || umask > 0o777) {
-		throw new Error("process prototype umask is invalid");
-	}
+	if (!Number.isSafeInteger(umask) || umask < 0 || umask > 0o777) throw new Error("process prototype umask is invalid");
 	for (const digest of [executableDigest, argvDigest, processContextDigest]) {
 		if (!isSha256Digest(digest)) throw new Error("process prototype contains an invalid digest");
 	}
@@ -524,9 +520,7 @@ function normalizeProducerProof(proof: ProcessProducerProof): ProcessProducerPro
 	) {
 		throw new Error("process producer proof is incomplete");
 	}
-	if (proof.execution.authority === "actor") {
-		return deepFreeze({ observer: { ...proof.observer }, execution: { authority: "actor" } });
-	}
+	if (proof.execution.authority === "actor") return deepFreeze({ observer: { ...proof.observer }, execution: { authority: "actor" } });
 	if (!validProvider(proof.execution.confinement?.provider) || !isSha256Digest(proof.execution.confinement?.fingerprint)) {
 		throw new Error("speculative process producer requires confinement proof");
 	}
@@ -712,9 +706,7 @@ function normalizeResult(result: ProcessResultRecord, prototype: ExecPrototype):
 
 function normalizeWorkspaceEffectState(state: WorkspaceEffectState, artifactSizes: Map<Sha256Digest, number>): WorkspaceEffectState {
 	if (state.kind === "absent") return { kind: "absent" };
-	if (!Number.isSafeInteger(state.mode) || state.mode < 0 || state.mode > 0o777) {
-		throw new Error("invalid workspace effect mode");
-	}
+	if (!Number.isSafeInteger(state.mode) || state.mode < 0 || state.mode > 0o777) throw new Error("invalid workspace effect mode");
 	if (state.kind === "file") { validateArtifact(state.data, artifactSizes); return { ...state, data: { ...state.data } }; }
 	if (
 		!isSha256Digest(state.entriesDigest) ||
@@ -733,9 +725,7 @@ function validateArtifact(reference: ArtifactReference, sizes: Map<Sha256Digest,
 		throw new Error("invalid effect artifact");
 	}
 	const previousSize = sizes.get(reference.digest);
-	if (previousSize !== undefined && previousSize !== reference.size) {
-		throw new Error("conflicting effect artifact sizes");
-	}
+	if (previousSize !== undefined && previousSize !== reference.size) throw new Error("conflicting effect artifact sizes");
 	sizes.set(reference.digest, reference.size);
 }
 

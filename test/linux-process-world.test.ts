@@ -1705,6 +1705,30 @@ int main(void) { char path[32] = "/bin/true\\0intact"; char *args[] = {path, 0};
 		} finally { await fixture.dispose(); }
 	});
 
+	test("settles a brokered child's inherited pipe as the child left its queue, executed and replayed", async ({ skip }) => {
+		if (process.platform !== "linux") return skip("Linux only");
+		const fixture = await createLinuxProcessBenchmark("pi-pipe-settle-");
+		try {
+			await writeFile(path.join(fixture.workspace, "pipe-child.c"), "#include <unistd.h>\nint main(void) { char byte; return read(3, &byte, 1) != 1 || byte != 'a' || write(4, \"cX\", 2) != 2; }\n");
+			// Both ends reach the child; the parent reads what the queue holds once it exits.
+			await writeFile(path.join(fixture.workspace, "piper.c"), `#include <stdio.h>\n#include <sys/wait.h>\n#include <unistd.h>
+int main(void) { int fds[2], status; char queue[8]; if (pipe(fds) || fds[0] != 3 || write(4, "ab", 2) != 2) return 90; pid_t child = fork();
+	if (!child) { execlp("pipe-child", "pipe-child", (char *)0); _exit(91); }
+	if (waitpid(child, &status, 0) != child || status) return 92; close(4); ssize_t length = read(3, queue, sizeof(queue));
+	return length < 0 || printf("%.*s\\n", (int)length, queue) < 0; }\n`);
+			for (const name of ["pipe-child", "piper"]) await compileBenchmarkHelper(fixture.workspace, { source: `${name}.c`, output: name });
+			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
+			for (const label of ["executed", "replayed"]) {
+				const before = fixture.backend.metrics(), branch = await forkReusableBash(fixture, { label, command: "./piper", actionNamespace: "pipe-settle", executionFingerprint });
+				try {
+					const after = fixture.backend.metrics();
+					expect({ text: textOutput(branch.output.result), bypasses: after.bypasses - before.bypasses, hits: after.hits > before.hits }, JSON.stringify(after))
+						.toEqual({ text: "bcX\n", bypasses: 0, hits: label === "replayed" });
+				} finally { await branch.dispose?.(); }
+			}
+		} finally { await fixture.dispose(); }
+	});
+
 	test("defers empty replay, retains later evidence and drains lazy preparation before refresh", async ({ skip }) => {
 		if (process.platform !== "linux") return skip("Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-process-admission-");

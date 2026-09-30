@@ -151,9 +151,9 @@ interface DispatcherRequest {
 type OutputRoute = readonly [0 | 1 | 2, 0 | 1 | 2];
 type RequestEligibility = { readonly route: OutputRoute; readonly outputPipes?: readonly [boolean, boolean] } | { readonly reason: string };
 /** A brokered run's net effect on an inherited pipe of one repeated byte, applied by the launcher to its own end. */
-type StreamDelta = { readonly fd: number; readonly byte: number; readonly delta: number };
+type StreamSettlement = { readonly fd: number; readonly kind: "i" | "o"; readonly data: Buffer };
 type ProcessArguments = Pick<DispatcherRequest, "argv0" | "args" | "cwd" | "environment"> & {
-	readonly closeStdin?: boolean; readonly resources?: ProcessResourceGraph; readonly outputPipes?: readonly [boolean, boolean]; readonly streams?: true; // inherited pipes settled by net deltas
+	readonly closeStdin?: boolean; readonly resources?: ProcessResourceGraph; readonly outputPipes?: readonly [boolean, boolean]; readonly streams?: true; // inherited pipes the launcher holds and settles
 };
 type BoundProcessInvocation = ProcessArguments & {
 	readonly sourceRoot: string;
@@ -170,7 +170,7 @@ interface DispatcherResponse {
 	readonly output?: readonly { readonly fd: 1 | 2; readonly data: string }[];
 	readonly exit?: ExitOutcome;
 	readonly weakKey?: Sha256Digest;
-	readonly streams?: readonly StreamDelta[];
+	readonly streams?: readonly StreamSettlement[];
 }
 
 interface ActiveSession {
@@ -787,10 +787,9 @@ export class LinuxProcessReuseBackend {
 
 	/** A pipe of one repeated byte (a jobserver's tokens) ends as it began whatever order its bytes move in: only those are brokered. */
 	private async inheritedPipes(request: DispatcherRequest): Promise<ProcessResourceGraph> {
-		// Only a pipe it both reads and writes, as a jobserver's clients do: a producer elsewhere could leave a snapshot waiting forever.
+		// A read past the snapshot is answered only by the run's own writer: without one, a writer elsewhere would leave it waiting forever.
 		const ends = (inode: string, access: number) => request.descriptors!.some(entry => entry.inode === inode && (entry.flags & 3) === access);
-		if (request.pid === undefined || request.descriptors!.some(({ inode, queueHex }) => new Set(queueHex.match(/../g)).size > 1 || !ends(inode, 0) || !ends(inode, 1)))
-			throw new Error("not_uniform");
+		if (request.pid === undefined || request.descriptors!.some(({ inode }) => !ends(inode, 0) || !ends(inode, 1))) throw new Error("writer_outside_run");
 		return captureHeldDescriptorInputs(request.pid, request.descriptors!.map(({ fd, alias, device, inode, flags, capacity, eof, queueHex }) =>
 			({ fd, alias, device, inode, flags, capacity, eof, queueHex, type: "pipe" as const, offset: 0, owned: false, outside: 3 })),
 		Math.min(MAX_REQUEST_BYTES / 2, this.store.limits.maxBytes), sensitivePaths(this.options.storeRoot, this.options.deniedPaths));
@@ -1085,7 +1084,7 @@ export class LinuxProcessReuseBackend {
 			this.recordHit(acquired.producer?.scope, acquired.joined, session);
 			session.computations.push(reusedComputation(certificate.result, started, acquired));
 			replayed = true;
-			const streams = inputs && streamDeltas(inputs, (certificate.result.resources?.transitions ?? []).map(event => ({ alias: event.id, kind: event.kind, data: artifacts.read(event.data) })));
+			const streams = inputs && streamSettlement(inputs, (certificate.result.resources?.transitions ?? []).map(event => ({ alias: event.id, kind: event.kind, data: artifacts.read(event.data) })));
 			if (inputs && !streams) return { kind: "hit", weakKey, output: [], exit: { kind: "code", code: 125 } };
 			return { kind: "hit", weakKey, output, exit: certificate.result.exit, ...(streams?.length ? { streams } : {}) };
 		} finally {
@@ -1463,7 +1462,7 @@ export class LinuxProcessReuseBackend {
 			}
 			if (continuation) return { kind: "suspended", weakKey };
 			const exit = exitOutcome(outcome);
-			const streams = request.streams && streamDeltas(descriptorInputs(request.resources!), [...executedStreams]);
+			const streams = request.streams && streamSettlement(descriptorInputs(request.resources!), [...executedStreams]);
 			if (streams === undefined && request.streams) return { kind: "executed", weakKey, output: [], exit: { kind: "code", code: 125 } };
 			return { kind: "executed", weakKey, output: wireOutput(outcome.output), exit, ...(streams?.length ? { streams } : {}) };
 		} catch (error) {
@@ -2435,29 +2434,30 @@ async function acquireOutputChannels(signal?: AbortSignal) {
 function wireResponse(response: DispatcherResponse): Buffer {
 	const frames = (response.output ?? []).flatMap(({ fd, data }) => [Buffer.from(`o${fd} ${Buffer.byteLength(data, "base64")}\n`), Buffer.from(data, "base64")]);
 	const exit = response.exit, end = response.kind === "bypass" ? "b" : exit?.kind === "signal" ? `s ${exit.signal}` : `x ${exit?.kind === "code" ? exit.code : 125}`;
-	return Buffer.concat([...frames, ...(response.streams ?? []).map(({ fd, byte, delta }) => Buffer.from(`u${fd} ${byte} ${delta}\n`)), Buffer.from(`${end}\n`)]);
+	return Buffer.concat([...frames, ...(response.streams ?? []).flatMap(({ fd, kind, data }) => [Buffer.from(`${kind}${fd} ${data.length}\n`), data]), Buffer.from(`${end}\n`)]);
 }
 
-/** Net bytes a run moved through each inherited pipe, applied at the end that can: undefined when not one repeated byte. */
-function streamDeltas(inputs: ReturnType<typeof descriptorInputs>, events: readonly { readonly alias: number; readonly kind: string; readonly data: Buffer }[]): StreamDelta[] | undefined {
-	const net = new Map<number, { delta: number; bytes: Set<number> }>();
-	for (const input of inputs) if (input.type === "pipe") {
-		const entry = net.get(input.image) ?? net.set(input.image, { delta: 0, bytes: new Set() }).get(input.image)!;
-		for (const byte of Buffer.from(input.content ?? "", "base64")) entry.bytes.add(byte);
-	}
+/** The launcher's settlement of each inherited pipe: read back the shortest queue prefix, then write the suffix, that leave the queue as
+ * the run left it. A queue of one repeated byte (a jobserver's tokens) usually needs neither. Undefined when the run did more than a queue can. */
+function streamSettlement(inputs: ReturnType<typeof descriptorInputs>, events: readonly { readonly alias: number; readonly kind: string; readonly data: Buffer }[]): StreamSettlement[] | undefined {
+	const queues = new Map<number, { readonly initial: Buffer; queue: Buffer }>();
+	for (const input of inputs) if (input.type === "pipe" && !queues.has(input.image)) queues.set(input.image, { initial: Buffer.from(input.content ?? "", "base64"), queue: Buffer.from(input.content ?? "", "base64") });
 	for (const { alias, kind, data } of events) {
-		const image = inputs.find(input => input.alias === alias)?.image, entry = image === undefined ? undefined : net.get(image);
-		if (kind === "release" || kind === "peek") continue; else if (!entry || kind !== "produce" && kind !== "consume") return undefined;
-		entry.delta += kind === "produce" ? data.length : -data.length;
-		for (const byte of data) entry.bytes.add(byte);
+		const image = inputs.find(input => input.alias === alias)?.image, state = image === undefined ? undefined : queues.get(image);
+		if (kind === "release" || kind === "peek") continue; else if (!state || kind !== "produce" && kind !== "consume") return undefined;
+		if (kind === "consume" && !state.queue.subarray(0, data.length).equals(data)) return undefined;
+		state.queue = kind === "produce" ? Buffer.concat([state.queue, data]) : state.queue.subarray(data.length);
 	}
-	const deltas: StreamDelta[] = [];
-	for (const [image, { delta, bytes }] of net) {
-		if (bytes.size > 1) return undefined;
-		const end = delta && inputs.find(input => input.image === image && input.installed !== false && (input.flags & 3) === (delta > 0 ? 1 : 0));
-		if (delta && !end) return undefined; else if (end) deltas.push({ fd: end.fd, byte: [...bytes][0]!, delta });
+	const settlement: StreamSettlement[] = [];
+	for (const [image, { initial, queue }] of queues) {
+		let read = 0;
+		while (!queue.subarray(0, initial.length - read).equals(initial.subarray(read))) read++;
+		const written = queue.subarray(initial.length - read), end = (access: number) => inputs.find(input => input.image === image && input.installed !== false && (input.flags & 3) === access);
+		if (read && !end(0) || written.length && !end(1)) return undefined;
+		if (read) settlement.push({ fd: end(0)!.fd, kind: "i", data: initial.subarray(0, read) });
+		if (written.length) settlement.push({ fd: end(1)!.fd, kind: "o", data: written });
 	}
-	return deltas;
+	return settlement;
 }
 
 function parseDispatcherRequest(body: string): DispatcherRequest | undefined {
