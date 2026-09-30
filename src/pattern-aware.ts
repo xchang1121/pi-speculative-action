@@ -959,17 +959,8 @@ export class PatternAwareStore {
 		const retained = new Set<string>();
 		for (const candidate of candidates.values()) {
 			const { bindings, support } = this.minimizeProjectedBindings(candidate, pool);
-			if (support.length < minimumSupport || (!firstRecurrenceProbe &&
-				!hasSufficientBindingProvenance(bindings, support, constantSupport))) continue;
-			const id = hash(
-				stableStringify({
-					context: signatures,
-					targetTool: target.tool,
-					bindings: bindingMapStructure(bindings),
-					targetSchemaHash: target.schemaHash,
-					gap,
-				}),
-			);
+			if (support.length < minimumSupport || (!firstRecurrenceProbe && !hasSufficientBindingProvenance(bindings, support, constantSupport))) continue;
+			const id = hash(stableStringify({ context: signatures, targetTool: target.tool, bindings: bindingMapStructure(bindings), targetSchemaHash: target.schemaHash, gap }));
 			if (retained.has(id)) continue;
 			retained.add(id);
 			const { dependencies } = analyzeBindings(bindings);

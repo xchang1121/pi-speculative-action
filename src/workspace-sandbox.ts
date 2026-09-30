@@ -1140,19 +1140,23 @@ async function createGitWorkspaceTransactionDriver(workspace: PrivateSandboxWork
 		if (own.length && await owned.interfered(new Set(own), capturedAt)) return incomplete("overlapping_workspace_write");
 		const changes: WorkspaceRegularDelta[] = [], entries = new Map(before.entries);
 		try {
-			for (const relativePath of own) {
-				if (capture.unknown.has(relativePath) && before.entries.get(relativePath)?.kind === "file") return incomplete(`overlapping_workspace_before:${relativePath}`);
+			// Its own paths' endpoints are independent reads; they are judged in order, the first that fails deciding.
+			const endpoints = await mapFilesystem(own, async (relativePath): Promise<string | { readonly previous?: RegularFileState; readonly current?: RegularFileState }> => {
+				if (capture.unknown.has(relativePath) && before.entries.get(relativePath)?.kind === "file") return `overlapping_workspace_before:${relativePath}`;
 				// Bytes last seen stand for a file only while it was there when this interval began.
 				const previous = before.entries.get(relativePath)?.kind !== "file" ? undefined
 					: capture.frontier.has(relativePath) ? capture.frontier.get(relativePath) : await workspace.readBase(relativePath, WORKSPACE_TRANSACTION_MAX_BYTES);
 				const entry = after.entries.get(relativePath);
-				let current: RegularFileState | undefined;
-				if (entry?.kind === "file") {
-					const captured = await captureStableFile(path.resolve(sandboxRoot, relativePath), WORKSPACE_TRANSACTION_MAX_BYTES, true, { digest: false });
-					if (statChangeDigest(captured.stat) !== entry.changeDigest) return incomplete(`overlapping_workspace_write:${relativePath}`);
-					current = { content: captured.content!, mode: Number(captured.stat.mode & 0o777n) };
-					entries.set(relativePath, entry);
-				} else entries.delete(relativePath);
+				if (entry?.kind !== "file") return { previous };
+				const captured = await captureStableFile(path.resolve(sandboxRoot, relativePath), WORKSPACE_TRANSACTION_MAX_BYTES, true, { digest: false });
+				return statChangeDigest(captured.stat) !== entry.changeDigest ? `overlapping_workspace_write:${relativePath}`
+					: { previous, current: { content: captured.content!, mode: Number(captured.stat.mode & 0o777n) } };
+			});
+			for (const [index, relativePath] of own.entries()) {
+				const endpoint = endpoints[index]!;
+				if (typeof endpoint === "string") return incomplete(endpoint);
+				const { previous, current } = endpoint;
+				if (current) entries.set(relativePath, after.entries.get(relativePath)!); else entries.delete(relativePath);
 				changes.push({ relativePath, ...(previous ? { before: previous.content, beforeMode: previous.mode } : {}),
 					...(current ? { after: current.content, afterMode: current.mode } : {}) });
 			}
