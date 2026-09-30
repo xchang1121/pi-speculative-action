@@ -274,9 +274,7 @@ describe("workspace-branch ExecutionWorld", () => {
 			await expect(firstWorld.speculation.prepare?.({ cwd: root, signal })).rejects.toBe(failure);
 			await firstSibling.speculation.prepare?.({ cwd: root, signal });
 			expect(observations).toHaveBeenCalledTimes(4); // Failed warm-up does not poison retry.
-			const abandoned = await firstWorld.speculation.execute(
-				context(root, "write", writeTool, { path: "value.txt", content: "abandoned\n" }),
-			);
+			const abandoned = await firstWorld.speculation.execute(context(root, "write", writeTool, { path: "value.txt", content: "abandoned\n" }));
 
 			vi.mocked(rm).mockImplementation(async (target, options) => {
 				if (path.dirname(String(target)) === path.resolve(os.tmpdir()) && path.basename(String(target)).startsWith("pi-speculative-action-pool-")) {
@@ -478,9 +476,7 @@ describe("workspace-branch ExecutionWorld", () => {
 			},
 			afterCapture: async (workspace, capture) => {
 				const change = capture.changes[0];
-				if (!change || change.kind === "directory" || !change.before || !change.after) {
-					throw new Error("captured change missing");
-				}
+				if (!change || change.kind === "directory" || !change.before || !change.after) throw new Error("captured change missing");
 				observed = {
 					content: await readFile(path.join(workspace.sandboxRoot, "value.txt"), "utf8"),
 					before: Buffer.from(change.before).toString("utf8"),
@@ -558,9 +554,7 @@ describe("workspace-branch ExecutionWorld", () => {
 			action: requiredAction("write", { path: "changed.txt", content: "after\n" }, root),
 			execute: async (workspace) => {
 				const capture = await workspace.transactions.begin();
-				expect(await readdir(workspace.sandboxRoot)).not.toContain(
-					".pi-speculative-runtime.tmp",
-				);
+				expect(await readdir(workspace.sandboxRoot)).not.toContain(".pi-speculative-runtime.tmp");
 				await Promise.all([
 					writeFile(path.join(workspace.sandboxRoot, "changed.txt"), "after\n", "utf8"),
 					writeFile(path.join(workspace.sandboxRoot, "created.txt"), "created\n", "utf8"),
@@ -578,19 +572,11 @@ describe("workspace-branch ExecutionWorld", () => {
 						expect(hydrateWorkspaceFileEntry(entry, bytes), resource).toMatchObject({ kind: "file" });
 					}
 				}
-				expect((await readdir(workspace.sandboxRoot)).some((entry) => entry.startsWith(".pi-speculative-"))).toBe(
-					false,
-				);
+				expect((await readdir(workspace.sandboxRoot)).some((entry) => entry.startsWith(".pi-speculative-"))).toBe(false);
 				return settlement("overlay");
 			},
 		});
-		expect(branch.resources).toEqual([
-			"changed.txt",
-			"created.txt",
-			"deleted.txt",
-			"replaced/created.txt",
-			"replaced/lower.txt",
-		]);
+		expect(branch.resources).toEqual([ "changed.txt", "created.txt", "deleted.txt", "replaced/created.txt", "replaced/lower.txt"]);
 		await branch.commit();
 		expect(await readFile(path.join(root, "changed.txt"), "utf8")).toBe("after\n");
 		expect(await readFile(path.join(root, "created.txt"), "utf8")).toBe("created\n");
@@ -723,10 +709,7 @@ describe("workspace-branch ExecutionWorld", () => {
 			parentCheckpoint: parent.checkpoint, execute: async () => settlement("unused"),
 		})).rejects.toThrow("another workspace");
 		const childArgs = { path: "lineage.txt", edits: [{ oldText: "parent", newText: "child" }] };
-		const child = await world.speculation.execute({
-			...context(root, "edit", editTool, childArgs),
-			parentCheckpoint: parent.checkpoint,
-		});
+		const child = await world.speculation.execute({ ...context(root, "edit", editTool, childArgs), parentCheckpoint: parent.checkpoint });
 
 		expect(child.checkpoint?.lineage).toBe(lineage);
 		expect(child.checkpoint?.depth).toBe(1);
@@ -819,11 +802,7 @@ describe("workspace-branch ExecutionWorld", () => {
 		const target = path.join(inner, "value.txt");
 		await mkdir(inner, { recursive: true });
 		await writeFile(target, "remove me\n");
-		const [outerBefore, innerBefore, fileBefore] = await Promise.all([
-			readSandboxDirectoryState(outer),
-			readSandboxDirectoryState(inner),
-			stat(target),
-		]);
+		const [outerBefore, innerBefore, fileBefore] = await Promise.all([ readSandboxDirectoryState(outer), readSandboxDirectoryState(inner), stat(target)]);
 		if (!outerBefore || !innerBefore) throw new Error("directory baseline missing");
 		await sandbox.commitDelta({
 			output: settlement("deleted"),
@@ -958,9 +937,7 @@ describe("workspace-branch ExecutionWorld", () => {
 		const retirement = sandbox.dispose();
 		expect(sandbox.dispose()).toBe(retirement);
 		await expect(sandbox.commitDelta(deltas[0]!)).rejects.toThrow("service is disposed");
-		expect(
-			await Promise.race([retirement.then(() => true), new Promise<false>((resolve) => setImmediate(() => resolve(false)))]),
-		).toBe(false);
+		expect(await Promise.race([retirement.then(() => true), new Promise<false>((resolve) => setImmediate(() => resolve(false)))])).toBe(false);
 		gate.release();
 		const results = await pending;
 		await Promise.all([blocker, retirement]);
@@ -1152,10 +1129,7 @@ describe("workspace-branch ExecutionWorld", () => {
 			}
 			return directory;
 		});
-		vi.mocked(rm).mockImplementation(async (target, options) => {
-			if (String(target) === heldRoot) removals++;
-			return fs.rm(target, options);
-		});
+		vi.mocked(rm).mockImplementation(async (target, options) => { if (String(target) === heldRoot) removals++; return fs.rm(target, options); });
 		try {
 			await writeFile(path.join(root, "value.txt"), "before\n");
 			pending.push(sandbox.prepare(root, { driver: "git" }));
@@ -1175,8 +1149,7 @@ describe("workspace-branch ExecutionWorld", () => {
 			gate.release(); await Promise.all(pending);
 			const owned = [repository.spare?.workspace, await repository.prepared?.workspace].filter(item => item?.processRoot === heldRoot);
 			expect(removals + owned.length).toBe(1); // Retired once: removed, or kept for reset.
-			expect(await sandbox.withWorkspace(root, ({ sandboxRoot }) => readFile(path.join(sandboxRoot, "value.txt"), "utf8")))
-				.toBe("after\n");
+			expect(await sandbox.withWorkspace(root, ({ sandboxRoot }) => readFile(path.join(sandboxRoot, "value.txt"), "utf8"))).toBe("after\n");
 		} finally {
 			gate.release(); await Promise.allSettled(pending); observations.mockRestore(); changes.mockRestore();
 			vi.mocked(mkdtemp).mockImplementation(fs.mkdtemp); vi.mocked(rm).mockImplementation(fs.rm);
@@ -1346,14 +1319,18 @@ describe("workspace-branch ExecutionWorld", () => {
 		await writeFile(path.join(root, "shared.txt"), "base\n", "utf8");
 		await sandbox.withWorkspace(root, async (workspace) => {
 			const write = (name: string, text: string) => writeFile(path.join(workspace.sandboxRoot, name), text, "utf8");
-			const own = (written: string[], observed: string[] = [], endedAt = Date.now()) => async () =>
-				({ written: new Set(written), observed: new Set(observed), endedAt, interfered: async () => false });
-			for (const [observed, late, reason] of [[[], false, undefined], [["b.txt"], false, "overlapping_workspace_input:b.txt"], [[], true, "overlapping_workspace_write:a.txt"]] as const) {
+			const own = (written: string[], observed: [string, number][] = [], endedAt = Date.now()) => async () =>
+				({ written: new Set(written), observed: new Map(observed), endedAt, interfered: async () => false });
+			// A look at the foreign name, or at its directory, before the foreign write saw none of it; one after it did.
+			for (const [observed, late, reason] of [[[], false, undefined], [["b.txt"], false, "overlapping_workspace_input:b.txt"], [["b.txt", "early"], false, undefined],
+				[["", "early"], false, undefined], [[""], false, "overlapping_workspace_input:b.txt"], [[], true, "overlapping_workspace_write:a.txt"]] as const) {
 				const [first, second] = [await workspace.transactions.begin(), await workspace.transactions.begin()];
+				const early = Date.now() - 50;
 				await write("a.txt", "first\n"); await write("b.txt", "second\n");
 				const endedAt = Date.now();
 				if (late) { await new Promise(resolve => setTimeout(resolve, 20)); await write("a.txt", "later\n"); }
-				const [delta, other] = await Promise.all([first.finish(own(["a.txt"], [...observed], endedAt)), second.finish(own(["b.txt"]))]);
+				const looked: [string, number][] = observed.length ? [[observed[0]!, observed[1] === "early" ? early : endedAt]] : [];
+				const [delta, other] = await Promise.all([first.finish(own(["a.txt"], looked, endedAt)), second.finish(own(["b.txt"]))]);
 				expect(delta, `${reason}: ${delta.complete ? "" : delta.reason}`).toMatchObject(reason ? { complete: false, reason } : { complete: true, changes: [{ relativePath: "a.txt" }] });
 				if (!reason) expect([delta.changes.length, other.complete ? other.changes.map(change => change.relativePath) : other.reason]).toEqual([1, ["b.txt"]]);
 			}
@@ -1462,9 +1439,7 @@ async function completesWithin(operation: Promise<void>, timeoutMs: number): Pro
 	try {
 		await Promise.race([
 			operation,
-			new Promise<never>((_resolve, reject) => {
-				timer = setTimeout(() => reject(new Error("workspace pool shutdown timed out")), timeoutMs);
-			}),
+			new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error("workspace pool shutdown timed out")), timeoutMs); }),
 		]);
 	} finally {
 		if (timer) clearTimeout(timer);

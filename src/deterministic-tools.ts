@@ -28,6 +28,9 @@ export const SHELLS: ReadonlySet<string> = new Set(["bash", "sh", "dash"]);
 /** Programs whose output is a function of file contents: they stat a file only for its type, size hints or same-file checks. */
 const CONTENT_READERS = new Set([...Object.keys(TOOLS).filter((name) => !["env", "test", "[", "ls", "find", "git"].includes(name)), "rg", "awk", "gawk", "mawk"]);
 const WITHOUT_DEVICE = FILESYSTEM_OBSERVATION_FIELDS.filter((field) => field !== "dev");
+/** A replay recreates a file's bytes, mode, owner and times; its device, inode, change time and allocation are new each time it is
+ * written, so a program that is not known to print them sees them once, as it sees a descriptor's identity. */
+export const WITHOUT_IDENTITY = FILESYSTEM_OBSERVATION_FIELDS.filter((field) => !["dev", "ino", "blksize", "blocks", "ctimeNs"].includes(field));
 /** find predicates that read metadata beyond a file's type, with the fields they read; any other listing predicate reads all. */
 const FIND_FIELDS: ReadonlyArray<readonly [RegExp, readonly FilesystemObservationField[]]> = [[/^-(?:size|empty)$/, ["size"]], [/^-perm$/, ["mode"]],
 	[/^-(?:user|group|uid|gid|nouser|nogroup)$/, ["uid", "gid"]], [/^-links$/, ["nlink"]], [/^-(?:inum|samefile)$/, ["ino"]]];
@@ -48,9 +51,8 @@ export function workspaceStatFields(image: string, argv: readonly string[]): rea
 		return [...fields];
 	}
 	if (image === "ls") return argv.slice(1).some((argument) => /^-[a-zA-Z]*[lgonsiStcu]|^--(?:full-time|size|inode|sort|time)/.test(argument)) ? WITHOUT_DEVICE : ["mode"];
-	// The overlay serves the workspace from its own device and otherwise shows each file's own identity: only programs
-	// that print device numbers keep them. git trusts an index entry whose stat still matches without reading the file.
-	return ["stat", "df", "du", "mountpoint", "findmnt"].includes(image) ? undefined : WITHOUT_DEVICE;
+	// Programs that print device numbers keep every field; a stat cache like git's still keys on the size and time a replay keeps.
+	return ["stat", "df", "du", "mountpoint", "findmnt"].includes(image) ? undefined : WITHOUT_IDENTITY;
 }
 
 /** Programs that print a directory's own times, size or link count. Any other stats a directory for its type, owner and (on
@@ -67,8 +69,6 @@ export function hostStatFields(image: string): readonly FilesystemObservationFie
 	return image === "git" ? ["dev", "mode", "uid", "gid"] : undefined;
 }
 
-/** Walkers whose output never depends on the filesystem type fts reads to pick its traversal. */
-export const FILESYSTEM_TYPE_BLIND: ReadonlySet<string> = new Set(["find", "rm", "grep", "egrep", "fgrep"]);
 /** Shell text that reads what differs between runs: special parameters, time formats, the time keyword and job pids. */
 const VOLATILE_SHELL = /\$\{?(?:RANDOM|SRANDOM|BASHPID|SECONDS|EPOCHSECONDS|EPOCHREALTIME|PPID|\$|!)(?![A-Za-z0-9_])|%\(|(?:^|[\s;&|(])(?:times?|jobs)(?=[\s;&|)]|$)/;
 

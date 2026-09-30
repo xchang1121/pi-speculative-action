@@ -1,6 +1,6 @@
 import { open, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
-import { directoryStatFields, FILESYSTEM_TYPE_BLIND, hostStatFields, repeatableExecutions, SHELLS, workspaceStatFields, type TracedExecution } from "./deterministic-tools.ts";
+import { directoryStatFields, hostStatFields, repeatableExecutions, SHELLS, WITHOUT_IDENTITY, workspaceStatFields, type TracedExecution } from "./deterministic-tools.ts";
 import { containsLogicalPath } from "./path-utils.ts";
 import { type DependencyRole, FILESYSTEM_OBSERVATION_FIELDS, type FilesystemObservationField, filesystemObservationDigest, ONE_SHOT_TAINTS, type ProvenanceTaint,
 	type Sha256Digest, type ResourceTransitionKind } from "./provenance-certificate.ts";
@@ -27,7 +27,8 @@ export function straceCommand(
 }
 
 export type ObservedProcessPath =
-	| { readonly path: string; readonly role: DependencyRole }
+	/** `listed` when its entries reached the run: it read them, or a removal or rename found some. */
+	| { readonly path: string; readonly role: DependencyRole; readonly listed?: true }
 	| { readonly path: string; readonly role: "metadata"; readonly followSymlinks: boolean; readonly digest: Sha256Digest; readonly fields?: readonly FilesystemObservationField[] };
 
 export interface StraceObservation {
@@ -35,6 +36,8 @@ export interface StraceObservation {
 	readonly paths: readonly ObservedProcessPath[];
 	readonly taints: readonly ProvenanceTaint[];
 	readonly tracedProcesses: number;
+	/** Every process its trace holds, a brokered run's launcher among them. */
+	readonly pids?: readonly number[];
 	readonly incompleteReasons: readonly string[];
 	readonly resourceJournal?: readonly { readonly inode: string; readonly description?: number; readonly kind: ResourceTransitionKind; readonly data: Buffer; readonly requested?: number }[];
 	readonly retainedDescriptions?: readonly number[];
@@ -45,9 +48,15 @@ export interface StraceObservation {
 	readonly written?: readonly string[];
 	/** Paths outside the workspace it wrote, which a private branch took. */
 	readonly external?: readonly string[];
+	/** Locks it took without waiting, or found free: each holds while no one else holds one. */
+	readonly locks?: readonly { readonly path: string; readonly exclusive: boolean }[];
 }
 
 export interface StraceObservationOptions {
+	/** The workspace names a run brokered from a traced launcher pid wrote, its own brokered runs included. */
+	readonly brokeredWrites?: (pid: number) => readonly string[] | undefined;
+	/** The session's private branch, where a descriptor on a copy shows the copy: it stands for the host path it shadows. */
+	readonly privateUpper?: string;
 	/** Bounded prefix lookup for running work; its evidence is always incomplete. */
 	readonly previewBytes?: number;
 	/** An owned tracer flushed this exact byte boundary while the target was stopped in restartable I/O. */
@@ -532,6 +541,7 @@ export async function observeStrace(
 				contents = buffer.toString("utf8", 0, bytesRead);
 			} finally { await handle.close(); }
 		}
+		if (options.privateUpper) contents = contents.replaceAll(`<${options.privateUpper}/`, "</");
 		const groups = new Map<number, { lines: string[]; order?: number[] }>();
 		if (!ordered) groups.set(pid, { lines: contents.split(/\r?\n/).map(untimed) });
 		else for (const [order, line] of contents.split(/\r?\n/).entries()) {
@@ -581,7 +591,7 @@ export async function observeStrace(
 	}
 	if (options.frozen && selected.size !== 1) { complete = false; incompleteReasons.add("continuation_process_tree"); }
 
-	const paths = new Map<string, DependencyRole>(), metadata = new Map<string, Extract<ObservedProcessPath, { role: "metadata" }>>();
+	const paths = new Map<string, DependencyRole>(), listedPaths = new Set<string>(), metadata = new Map<string, Extract<ObservedProcessPath, { role: "metadata" }>>();
 	// Native instructions and ELF startup state expose clock/random inputs without a syscall.
 	// A complete transcript therefore permits only the existing one-shot transfer, never proof
 	// that this process can be repeated. Do not infer unused inputs from their absence here.
@@ -590,7 +600,7 @@ export async function observeStrace(
 	const opened = new Map<number, Set<number>>(); // Descriptors a process opened itself, whose status flags it chose.
 	const refusedIndexLocks = new Set<number>(), ownPipes = new Set<string>(); // Pipes the traced processes created, by inode.
 	// The semantic roots are one workspace seen from the sandbox and from its source: name a file by its place in it.
-	const changedMetadata = new Set<string>(), written = new Set<string>(), external = new Set<string>(), workspaceName = (target: string) =>
+	const locks = new Map<string, boolean>(), changedMetadata = new Set<string>(), written = new Set<string>(), writable = new Set<string>(), external = new Set<string>(), workspaceName = (target: string) =>
 		semanticRoots.flatMap((root) => containsLogicalPath(root, target) ? [`//${path.posix.relative(root, target)}`] : [])[0];
 	const { journal: resourceJournal, handled: streamCalls, retained, finalHandles } = options.inheritedHandles?.length || options.inheritedStreams?.length
 		? resourceTransitions(selected, root.file.pid, options) : { journal: [], handled: new Set<TraceLine>(), retained: [], finalHandles: [] };
@@ -616,8 +626,9 @@ export async function observeStrace(
 			if (spawned) opened.set(spawned, new Set(opened.get(pid)));
 			const own = opened.get(pid) ?? opened.set(pid, new Set()).get(pid)!, result = Number.parseInt(line.result ?? "", 10);
 			// Files and pipes the traced processes created stay private to them, through duplication and inheritance.
-			if (/^(?:open|openat|openat2|creat)$/.test(line.name) && Number.isSafeInteger(result) && result >= 0) own.add(result);
+			if (/^(?:open|openat|openat2|creat)$/.test(line.name) && Number.isSafeInteger(result) && result >= 0) { own.add(result); if (writesPath(line)) writable.add(absoluteDescriptorPath(line.result) ?? ""); }
 			else if (/^pipe2?$/.test(line.name) && result === 0) for (const pipe of (line.args[0] ?? "").matchAll(/<pipe:\[(\d+)\]>/g)) ownPipes.add(pipe[1]!);
+			else if (line.name === "socketpair" && result === 0) for (const end of (line.args[3] ?? "").matchAll(/<UNIX(?:-[A-Z]+)?:\[(\d+)/g)) ownPipes.add(end[1]!);
 			else if (/^dup[23]?$|^fcntl(?:64)?$/.test(line.name) && (line.name.startsWith("dup") || /^F_DUPFD/.test(line.args[1] ?? "")) && Number.isSafeInteger(result) && result >= 0) {
 				if (own.has(Number.parseInt(line.args[0] ?? "", 10))) own.add(result); else own.delete(result);
 			} else if (line.name === "close") own.delete(Number.parseInt(line.args[0] ?? "", 10));
@@ -639,16 +650,23 @@ export async function observeStrace(
 			if (refused) { if (!paths.has(refused)) paths.set(refused, "input"); continue; }
 			const output = !!options.outputEndpoints?.includes(`socket:[${/^\d+<UNIX-STREAM:\[(\d+)/.exec(line.args[0] ?? "")?.[1]}]`);
 			const outputQuery = output && /^(?:getsockname|getpeername|getsockopt)$/.test(syscall);
-			if (NETWORK_SYSCALLS.has(syscall) && !nonSocketQuery(line) && !streamCall && !outputQuery && !(syscall === "socket" && /^AF_UNIX\b/.test(line.args[0] ?? ""))) taints.add("network");
+			// A local socket or socketpair the tree made reaches no one else, as its pipes do not.
+			if (NETWORK_SYSCALLS.has(syscall) && !nonSocketQuery(line) && !streamCall && !outputQuery && !(/^socket(?:pair)?$/.test(syscall) && /^AF_UNIX\b/.test(line.args[0] ?? "")) &&
+				!(endpoint && ownPipes.has(endpoint))) taints.add("network");
 			if (IPC_SYSCALLS.has(syscall)) taints.add("ipc");
-			// Descriptor-local state is internal; reproduced OFD flags are sealed with their final offsets.
-			// Locks, leases, async notifications and owners require additional effect evidence.
-			// A lock taken by waiting ends the same way natively, however long another holder keeps it; only a try can fail.
-			if (syscall === "flock" && !streamCall && /\bLOCK_NB\b/.test(line.args[1] ?? "")) taints.add("ipc");
-			if (syscall === "fcntl" || syscall === "fcntl64") {
+			// Descriptor-local state is internal; reproduced OFD flags are sealed with their final offsets. A lock taken without waiting,
+			// or a query that found the range free, depends only on no one else holding one, which a replay probes; a refusal, or a
+			// holder found, saw another. One taken by waiting ends the same way natively, however long it waited; a release reveals nothing.
+			const record = /^fcntl(?:64)?$/.test(syscall) ? /^F_(?:OFD_)?(GETLK|SETLK|SETLKW)(?:64)?$/.exec(line.args[1] ?? "")?.[1] : undefined;
+			const lock = syscall === "flock" ? /\bLOCK_NB\b/.test(line.args[1] ?? "") && /\bLOCK_(SH|EX)\b/.exec(line.args[1] ?? "")?.[1]
+				: record && record !== "SETLKW" && /\bl_type=F_(RD|WR|UN)LCK\b/.exec(line.args[2] ?? "")?.[1], locked = absoluteDescriptorPath(line.args[0]);
+			if (lock && !streamCall && (record === "GETLK" || lock !== "UN")) {
+				if (locked && syscallSucceeded(line) && (record === "GETLK") === (lock === "UN")) locks.set(locked, locks.get(locked) || lock !== "SH" && lock !== "RD");
+				else taints.add("ipc");
+			}
+			if (/^fcntl(?:64)?$/.test(syscall) && !record) {
 				const command = line.args[1] ?? "";
-				if (/^F_(?:OFD_)?(?:GETLK|SETLK|SETLKW)(?:64)?$/.test(command)) { if (!streamCall) taints.add("ipc"); }
-				else if (!/^F_(?:GETFD|SETFD|DUPFD|DUPFD_CLOEXEC)$/.test(command) &&
+				if (!/^F_(?:GETFD|SETFD|DUPFD|DUPFD_CLOEXEC)$/.test(command) &&
 					// A descriptor this process opened reports the flags it chose; an inherited one's flags need evidence.
 					// Standard streams' status flags are part of the pinned execution context.
 					!(command === "F_GETFL" && (own.has(Number.parseInt(line.args[0] ?? "", 10)) || /^[012]</.test(line.args[0] ?? ""))) && !((command === "F_GETFL" || command === "F_SETFL" && syscallSucceeded(line) &&
@@ -669,25 +687,23 @@ export async function observeStrace(
 			if (!noCapabilities && (CONFINEMENT_SENSITIVE_SYSCALLS.has(syscall) || prctlConfinementSensitive(line, syscall) || confinementDenied(line) || processLimitDenied(line, syscall))) {
 				taints.add("confinement_observation");
 			}
+			// A time set on a file the tree opened for writing reaches its effects, which carry each file's modification time.
+			if (/^(?:utime|utimes|utimensat|futimesat)$/.test(syscall) && !(syscallPaths(line, syscall, cwd) ?? [""]).every(target => writable.has(target))) taints.add("unsupported_syscall");
 			if (
-				resourceLimitMutation(line, syscall) ||
-				UNMODELED_FILE_SEMANTICS_SYSCALLS.has(syscall) && !streamCall ||
+				resourceLimitMutation(line, syscall) || UNMODELED_FILE_SEMANTICS_SYSCALLS.has(syscall) && !streamCall ||
 				(syscall === "pipe2" && /O_DIRECT|O_EXCL/.test(line.args[1] ?? "")) ||
 				(syscall === "ioctl" && unmodeledFileIoctl(line))
 			) {
 				taints.add("unsupported_syscall");
 			}
-			// A host filesystem's statistics vary over time like the clock, whose taint every trace carries; the sandbox's own
-			// filesystem does not stand in for the workspace's.
-			if (/^f?statfs$/.test(syscall) && semanticRoots.length) {
-				const target = syscall === "statfs" ? syscallPaths(line, syscall, cwd)?.[0] : absoluteDescriptorPath(line.args[0]);
-				if (target && (!semanticRoots.some((root) => containsLogicalPath(root, target)) || FILESYSTEM_TYPE_BLIND.has(images.get(pid) ?? ""))) continue;
-			}
+			// A filesystem's statistics vary over time like the clock, whose taint every trace carries; the sandbox reports the one a
+			// native run sees, the workspace's own included.
+			if (/^f?statfs$/.test(syscall)) continue;
 			const listed = /^getdents(?:64)?$/.test(syscall) ? absoluteDescriptorPath(line.args[0]) : undefined;
 			const directoryImage = !!listed && !!options.inheritedDirectoryImages?.includes(listed);
 			// A listed directory's entry set is its dependency; readdir order and d_ino are volatile identity, as a descriptor's is.
 			const listing = !!listed && !directoryImage && syscallSucceeded(line);
-			if (listing) { taints.add("descriptor_observation"); listingPIDs.add(pid); if (paths.get(listed!) !== "executable") paths.set(listed!, "input"); }
+			if (listing) { taints.add("descriptor_observation"); listingPIDs.add(pid); listedPaths.add(listed!); if (paths.get(listed!) !== "executable") paths.set(listed!, "input"); }
 			if (UNMODELED_METADATA_SYSCALLS.has(syscall) && !listing && (syscallSucceeded(line) ? !directoryImage : directoryImage)) {
 				taints.add("unsupported_syscall");
 				incompleteReasons.add(`unmodeled_metadata:${syscall}:${pid}`);
@@ -708,6 +724,7 @@ export async function observeStrace(
 				// Only the fields a program reveals of a workspace file are its dependency (see workspaceStatFields).
 				const workspace = metadataPaths.length > 0 && metadataPaths.every((target) => semanticRoots.some((root) => containsLogicalPath(root, target)));
 				const fields = workspace ? statFields.get(pid) : hostStatFields(images.get(pid) ?? "");
+				if (workspace && fields === WITHOUT_IDENTITY && !directory) taints.add("descriptor_observation");
 				const observed = statObservationDigest(line.args[structure] ?? "", directoryHandle ? ["mode"] : undefined, directory ? directoryStatFields(images.get(pid) ?? "", fields, workspace) : fields);
 				if (!metadataPaths.length || !observed) {
 					// fstat, or an empty *at name, of a pipe or socket
@@ -730,7 +747,8 @@ export async function observeStrace(
 			const role: DependencyRole = syscall === "execve" || syscall === "execveat" ? "executable" : "input";
 			const observedPaths = syscallPaths(line, syscall, cwd);
 			if (!observedPaths) { complete = false; incompleteReasons.add(`unresolved_pathname:${syscall}:${pid}`); }
-			for (const observed of observedPaths ?? []) { if (paths.get(observed) !== "executable") paths.set(observed, role); }
+			const nonEmpty = /^(?:rmdir|unlinkat|rename(?:at2?)?)$/.test(syscall) && /^-1 (?:ENOTEMPTY|EEXIST)\b/.test(line.result);
+			for (const observed of observedPaths ?? []) { if (paths.get(observed) !== "executable") paths.set(observed, role); if (nonEmpty) listedPaths.add(observed); }
 			if ((syscall === "chdir" || syscall === "fchdir") && syscallSucceeded(line)) {
 				const changed = tracedCwd(line, cwd);
 				if (changed) cwd = changed;
@@ -740,6 +758,8 @@ export async function observeStrace(
 	}
 	for (const pid of refusedIndexLocks) if (selected.get(pid)?.file.exitCode !== 0) taints.add("confinement_observation");
 	// A workspace file the traced processes wrote changes under their own hands; its later state is their effect, not an input.
+	// A run brokered from its tree, whose launcher the trace holds, wrote on its behalf.
+	for (const pid of selected.keys()) for (const name of options.brokeredWrites?.(pid) ?? []) written.add(`//${name}`);
 	// What it wrote outside the workspace, and the directories holding those names, change by its own hand.
 	const touched = new Set([...external].flatMap(target => [target, path.posix.dirname(target)]));
 	for (const observed of changedMetadata) if (!written.has(workspaceName(observed) ?? observed) && !touched.has(observed)) {
@@ -752,13 +772,16 @@ export async function observeStrace(
 		complete,
 		...(options.inheritedHandles || options.inheritedStreams ? { resourceJournal: resourceJournal.sort((a, b) => a.order - b.order).map(({ order, ...event }) => event), retainedDescriptions: retained,
 			...(options.frozen ? { finalHandles } : {}) } : {}),
-		paths: Object.freeze([...[...paths].map(([observedPath, role]) => ({ path: observedPath, role: sharedObjectRole(observedPath, role) })), ...metadata.values()]
+		paths: Object.freeze([...[...paths].map(([observedPath, role]) => ({ path: observedPath, role: sharedObjectRole(observedPath, role),
+			...(listedPaths.has(observedPath) ? { listed: true as const } : {}) })), ...metadata.values()]
 			.sort((left, right) => pathOrder(left).localeCompare(pathOrder(right)))),
 		taints: Object.freeze([...taints].sort()),
+		pids: [...selected.keys()],
 		tracedProcesses: [...selected].filter(([pid, { file, start }]) => file.lines.slice(start)
 			.some((_, offset) => !ignoredSegments.get(pid)?.some(([from, to]) => start + offset >= from && start + offset < to))).length,
 		incompleteReasons: Object.freeze([...incompleteReasons].sort()),
 		...(resumedInterpositions.length ? { resumedInterpositions } : {}), written: [...written].map(name => name.slice(2)).sort(), external: [...external].sort(),
+		locks: [...locks].map(([target, exclusive]) => ({ path: target, exclusive })),
 	};
 }
 
@@ -796,11 +819,11 @@ const PATH_ARGUMENTS: Readonly<Record<string, readonly (readonly [pathname: numb
 ] as const).flatMap(([names, positions]) => names.split(" ").map((name) => [name, positions])));
 
 const MODELED_METADATA_SYSCALLS = new Map<string, readonly [structure: number, flags?: number]>([["stat", [1]], ["lstat", [1]], ["fstat", [1]], ["newfstatat", [2, 3]], ["statx", [4, 2]]]);
-const UNMODELED_METADATA_SYSCALLS = new Set(["statfs", "fstatfs", "getdents", "getdents64"]);
+const UNMODELED_METADATA_SYSCALLS = new Set(["getdents", "getdents64"]);
 
 /** Persistent metadata not represented by the typed workspace transaction must never be replayed. */
-const UNMODELED_FILE_SEMANTICS_SYSCALLS = new Set(["fallocate", "splice", "tee", "fgetxattr", "flistxattr", "fremovexattr", "fsetxattr", "futimesat",
-	"getxattr", "lgetxattr", "listxattr", "llistxattr", "lremovexattr", "lsetxattr", "removexattr", "setxattr", "utime", "utimensat", "utimes"]);
+const UNMODELED_FILE_SEMANTICS_SYSCALLS = new Set(["fallocate", "splice", "tee", "fgetxattr", "flistxattr", "fremovexattr", "fsetxattr",
+	"getxattr", "lgetxattr", "listxattr", "llistxattr", "lremovexattr", "lsetxattr", "removexattr", "setxattr"]);
 
 const UNMODELED_MUTATING_IOCTL = /\b(?:FICLONE|FICLONERANGE|FIDEDUPERANGE|FS_IOC_SETFLAGS|FS_IOC_SETVERSION|FS_IOC_FSSETXATTR)\b/;
 const DRIVER_SEMANTIC_GAP_RESULT = /^-1\s+(?:EXDEV|EOPNOTSUPP|ENOTSUP|ENOSYS)\b/;
@@ -858,13 +881,27 @@ export async function tracedWrites(tracePrefix: string): Promise<readonly Traced
 	return writes;
 }
 
+/** When a trace last named each absolute path, by name or through a descriptor, in wall-clock milliseconds; a failed lookup names one too. */
+export async function tracedObservations(tracePrefix: string): Promise<ReadonlyMap<string, number>> {
+	const prefix = `${path.basename(tracePrefix)}.`, seen = new Map<string, number>();
+	for (const name of await readdir(path.dirname(tracePrefix)).catch(() => [] as string[])) {
+		if (name.startsWith(prefix)) for (const record of (await readFile(path.join(path.dirname(tracePrefix), name), "utf8").catch(() => "")).split("\n")) {
+			const stamped = /^(?:\d+ )?(\d+\.\d+) (.*)$/.exec(record), line = stamped && parseTraceLine(stamped[2]!);
+			if (line) for (const target of [...syscallPaths(line, line.name, "") ?? [], ...line.args.flatMap(arg => absoluteDescriptorPath(arg) ?? [])]) {
+				if (target.startsWith("/")) seen.set(target, Math.max(seen.get(target) ?? 0, Number(stamped[1]) * 1000));
+			}
+		}
+	}
+	return seen;
+}
+
 /** Whether writes reached `targets` within [since, until], or held one open to write by `until`. An unresolvable write counts. */
 export function writesWithin(writes: readonly TracedWrite[], targets: ReadonlySet<string>, since: number, until: number): boolean {
 	return writes.some(({ paths, at, opened }) => at <= until && (opened || at >= since) && (!paths || paths.some(target => targets.has(target))));
 }
 
 function writesPath(line: TraceLine): boolean {
-	return /^(?:creat|truncate|rename|renameat2?|link|linkat|symlink|symlinkat|mknod|mknodat|unlink|unlinkat|mkdir|mkdirat|rmdir)$/.test(line.name) ||
+	return /^(?:creat|truncate|rename|renameat2?|link|linkat|symlink|symlinkat|mknod|mknodat|unlink|unlinkat|mkdir|mkdirat|rmdir|utimes?|utimensat|futimesat)$/.test(line.name) ||
 		/^open(?:at2?)?$/.test(line.name) && /\bO_(?:WRONLY|RDWR|CREAT|TRUNC)\b/.test(line.args.join(" "));
 }
 
@@ -1079,16 +1116,11 @@ function parseInteger(value: string | undefined): bigint | undefined {
 
 /** Linux's userspace-compatible new_encode_dev layout. */
 function linuxDevice(major: bigint, minor: bigint): bigint {
-	return ((major & 0xfffn) << 8n) |
-		(minor & 0xffn) |
-		((minor & ~0xffn) << 12n) |
-		((major & ~0xfffn) << 32n);
+	return ((major & 0xfffn) << 8n) | (minor & 0xffn) | ((minor & ~0xffn) << 12n) | ((major & ~0xfffn) << 32n);
 }
 
 function quotedStrings(line: TraceLine): string[] {
-	return line.args.flatMap((argument) => {
-		const value = quotedArgument(argument); return value === undefined ? [] : [value];
-	});
+	return line.args.flatMap((argument) => { const value = quotedArgument(argument); return value === undefined ? [] : [value]; });
 }
 
 function quotedArgument(argument: string | undefined): string | undefined {

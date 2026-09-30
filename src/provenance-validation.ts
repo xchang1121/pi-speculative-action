@@ -1,5 +1,5 @@
 import { directoryEntriesDigest } from "./process-observation.ts";
-import { lstat, stat } from "node:fs/promises";
+import { lstat, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { captureFileDigest, captureFilesystemEntry, sameFilesystemIdentity } from "./filesystem-evidence.ts";
 import { errorMessage, isMissing as missing } from "./error-utils.ts";
@@ -39,6 +39,7 @@ const OBSERVATION_FIELDS = {
 	symlink: ["targetDigest", "target"],
 	metadata: ["digest"],
 	fd: ["contentDigest", "eof"],
+	lock: ["exclusive"],
 } satisfies { [Kind in DynamicDependency["kind"]]: readonly (keyof Extract<DynamicDependency, { kind: Kind }>)[] };
 
 export async function validateProcessCertificate(
@@ -78,9 +79,7 @@ export async function validateDynamicDependencyCertificate(
 				if (!descriptor) return indeterminate(`fd_unavailable:${expected.fd}`);
 				observed = { kind: "fd", fd: expected.fd, ...descriptor };
 			} else {
-				const physicalPath = context.resolvePath
-					? context.resolvePath(expected.path)
-					: path.isAbsolute(expected.path) ? path.resolve(expected.path) : undefined;
+				const physicalPath = context.resolvePath ? context.resolvePath(expected.path) : path.isAbsolute(expected.path) ? path.resolve(expected.path) : undefined;
 				if (!physicalPath) return indeterminate(`path_unmapped:${expected.path}`);
 				switch (expected.kind) {
 					case "file": {
@@ -100,6 +99,7 @@ export async function validateDynamicDependencyCertificate(
 							expected.path,
 							expected.metadataDigest !== undefined,
 							expected.excludedEntries,
+							expected.entriesDigest !== undefined,
 						);
 						break;
 					case "absence":
@@ -115,6 +115,9 @@ export async function validateDynamicDependencyCertificate(
 						break;
 					case "metadata":
 						observed = await captureMetadataDependency(physicalPath, expected.path, expected.followSymlinks, expected.fields);
+						break;
+					case "lock":
+						observed = await probeLock(physicalPath, expected.path, expected.exclusive);
 						break;
 				}
 			}
@@ -133,6 +136,16 @@ export async function validateDynamicDependencyCertificate(
 		dependencies: Object.freeze(current),
 		...metrics(),
 	};
+}
+
+/** A lock still holds as a dependency while no one holds one it would conflict with: /proc/locks lists every flock, record and
+ * open-file lock by device and inode. A missing file is gone, not made. */
+async function probeLock(physicalPath: string, logicalPath: string, exclusive: boolean): Promise<Extract<DynamicDependency, { kind: "lock" }> | undefined> {
+	const info = await lstat(physicalPath, { bigint: true }), { dev } = info, hex = (value: bigint) => value.toString(16).padStart(2, "0");
+	const object = `${hex(dev >> 8n & 0xfffn | dev >> 32n & ~0xfffn)}:${hex(dev & 0xffn | dev >> 12n & ~0xffn)}:${info.ino}`;
+	const held = (await readFile("/proc/locks", "utf8")).split("\n").some(line => { const [, access, locked] = /^\d+:\s+\w+\s+\w+\s+(READ|WRITE)\s+\S+\s+(\S+)\s/.exec(line) ?? [];
+		return locked === object && (exclusive || access === "WRITE"); });
+	return info.isFile() && !held ? { kind: "lock", path: logicalPath, exclusive } : undefined;
 }
 
 export async function captureMetadataDependency(
@@ -182,7 +195,13 @@ export async function captureDirectoryDependency(
 	logicalPath: string,
 	includeMetadata = false,
 	excludedEntries: readonly string[] = [],
+	listed = true,
 ): Promise<Extract<DynamicDependency, { kind: "directory" }>> {
+	if (!listed) {
+		const info = await lstat(physicalPath, { bigint: true });
+		if (!info.isDirectory()) throw new Error("not_directory");
+		return { kind: "directory", path: logicalPath, metadataDigest: filesystemMetadataDigest(info) };
+	}
 	const excluded = new Set(excludedEntries);
 	const { info, entries } = await captureFilesystemEntry(physicalPath, "directory");
 	if (!entries) throw new Error("not_directory");

@@ -40,6 +40,7 @@ export interface SandboxFileChange extends SandboxChangeTarget, WorkspaceFileMut
 	readonly after?: Uint8Array;
 	readonly beforeMode?: number;
 	readonly afterMode?: number;
+	readonly afterModified?: string;
 }
 
 export interface SandboxDirectoryState {
@@ -243,9 +244,7 @@ function resolveWorkspaceCheckpoint(checkpoint: WorldCheckpoint | undefined, sou
 	if (checkpoint === undefined) return undefined;
 	const owned = workspaceCheckpoints.get(checkpoint);
 	if (!owned) throw new Error("Execution world checkpoint belongs to another backend.");
-	if (filesystemPathKey(owned.sourceRoot) !== filesystemPathKey(sourceRoot)) {
-		throw new Error("Execution world checkpoint belongs to another workspace.");
-	}
+	if (filesystemPathKey(owned.sourceRoot) !== filesystemPathKey(sourceRoot)) throw new Error("Execution world checkpoint belongs to another workspace.");
 	return owned;
 }
 
@@ -331,9 +330,7 @@ async function resolveWorkspaceDriver(state: WorkspaceSandboxState, options: Wor
 	if (requested === "overlayfs") return overlay;
 	if (!sourceRoot) return { driver: "git", fingerprint: GIT_WORKSPACE_FINGERPRINT };
 
-	const ownedRepository = acquiredRepository
-		? undefined
-		: await acquireSandboxRepository(state, path.resolve(sourceRoot), options.gitBinary ?? "git");
+	const ownedRepository = acquiredRepository ? undefined : await acquireSandboxRepository(state, path.resolve(sourceRoot), options.gitBinary ?? "git");
 	const repository = acquiredRepository ?? ownedRepository;
 	if (!repository) throw new Error("workspace repository is unavailable");
 	try {
@@ -342,9 +339,7 @@ async function resolveWorkspaceDriver(state: WorkspaceSandboxState, options: Wor
 		const cached = repository.autoDriverDecision;
 		if (cached?.commit === commit && cached.capabilityFingerprint === capability.fingerprint) { return cached.resolved; }
 		const treeEntries = parseNullList(await repository.git(["ls-tree", "-r", "-z", "--name-only", commit])).length;
-		const resolved = treeEntries >= AUTO_OVERLAY_MIN_TREE_ENTRIES
-			? overlay
-			: { driver: "git", fingerprint: GIT_WORKSPACE_FINGERPRINT } as const;
+		const resolved = treeEntries >= AUTO_OVERLAY_MIN_TREE_ENTRIES ? overlay : { driver: "git", fingerprint: GIT_WORKSPACE_FINGERPRINT } as const;
 		repository.autoDriverDecision = { commit, capabilityFingerprint: capability.fingerprint, resolved };
 		return resolved;
 	} finally {
@@ -356,8 +351,7 @@ function createWorkspaceSandboxFor(state: WorkspaceSandboxState, options: Worksp
 	// Generic mutation routes have no workspace root at fingerprint time. Their short, targeted
 	// branches retain Git unless OverlayFS was explicitly requested; Linux process routes can make
 	// the exact baseline-qualified auto decision from their invocation context.
-	const resolvedOptions: WorkspaceSandboxOptions =
-		options.driver === "overlayfs" ? options : { ...options, driver: "git" };
+	const resolvedOptions: WorkspaceSandboxOptions = options.driver === "overlayfs" ? options : { ...options, driver: "git" };
 	const roots = new Set<string>();
 	return {
 		id: "git_worktree",
@@ -459,12 +453,10 @@ async function commitSandboxExecution(state: WorkspaceSandboxState, execution: S
 						staged.set(change, await stageAtomicWrite(change.after, change.afterMode, change.root));
 					}
 				});
+				await restoreModifiedTimes([...staged].map(([change, temporary]) => [temporary, change.afterModified]));
 				const validationStarted = performance.now();
 				for (const change of changes) {
-					const current =
-						change.kind === "directory"
-							? await readSandboxDirectoryState(change.target)
-							: await readRegularState(change.target);
+					const current = change.kind === "directory" ? await readSandboxDirectoryState(change.target) : await readRegularState(change.target);
 					baselines.set(change, current);
 					if (change.kind !== "directory") bytesValidated += (current as RegularFileState | undefined)?.content.byteLength ?? 0;
 					if (!sameSandboxBaseline(current, change)) throw new Error(`resource changed before commit: ${change.resource}`);
@@ -585,6 +577,7 @@ async function commitSandboxExecution(state: WorkspaceSandboxState, execution: S
 					}
 					resourcesCommitted++;
 				}
+				await restoreModifiedTimes(changes.flatMap(change => change.kind !== "directory" && change.operation ? [[change.target, change.afterModified] as const] : []));
 				let directoryBytes = 0;
 				const createdEntries = new Map((inputs ? changes : []).filter(change => change.kind === "directory" && change.operation && change.after)
 					.map(change => [change.target, [] as string[]]));
@@ -664,9 +657,7 @@ async function prepareSandboxWorkspaceFor(state: WorkspaceSandboxState, cwd: str
 	const repository = await acquireSandboxRepository(state, sourceRoot, options.gitBinary ?? "git");
 	try {
 		throwIfAborted(options.signal);
-		const resolved = await resolveWorkspaceDriver(
-			state, options.driver === "overlayfs" ? options : { ...options, driver: "git" }, sourceRoot, repository,
-		);
+		const resolved = await resolveWorkspaceDriver(state, options.driver === "overlayfs" ? options : { ...options, driver: "git" }, sourceRoot, repository);
 		throwIfAborted(options.signal);
 		const baseline = await acquireSandboxBaseline(repository, true);
 		throwIfAborted(options.signal);
@@ -714,8 +705,7 @@ async function executeMutation(state: WorkspaceSandboxState, context: Speculativ
 				const relative = relativeFilesystemPath(sourceRoot, logical);
 				if (relative === undefined || isSnapshotExcluded(slash(relative))) throw new Error("Filesystem operation is outside the workspace view");
 				const target = path.resolve(workspace.sandboxRoot, relative);
-				await Promise.all([assertNoSymlinkPath(sourceRoot, path.resolve(sourceRoot, relative)),
-					assertNoSymlinkPath(workspace.sandboxRoot, target)]);
+				await Promise.all([assertNoSymlinkPath(sourceRoot, path.resolve(sourceRoot, relative)), assertNoSymlinkPath(workspace.sandboxRoot, target)]);
 				return target;
 			};
 			const targetRecord = (target: string) => ({ root: sourceRoot, target, resource: slash(path.relative(sourceRoot, target)) });
@@ -743,8 +733,7 @@ async function executeMutation(state: WorkspaceSandboxState, context: Speculativ
 				const file = await physical(target), before = await readSandboxDirectoryState(file), key = filesystemPathKey(target);
 				const previous = changes.get(key);
 				if (previous && previous.kind !== "directory") throw new Error("Workspace directory input changed type");
-				if (!previous) record(key, { ...targetRecord(target), kind: "directory", before,
-					...(before ? { validationOnly: true } : { operation: "mkdir" }) });
+				if (!previous) record(key, { ...targetRecord(target), kind: "directory", before, ...(before ? { validationOnly: true } : { operation: "mkdir" }) });
 				return { file, before, key };
 			};
 			let output: ToolSettlement;
@@ -973,10 +962,7 @@ async function createPrivateSandboxWorkspace(state: WorkspaceSandboxState, cwd: 
 		const structure: WorkspaceStructureDriver = {
 			capture: () => {
 				if (!workspace.overlay) {
-					return captureWorkspaceStructure(workspace.sandboxRoot, {
-						maxFiles: WORKSPACE_TRANSACTION_MAX_FILES,
-						exclude: workspace.observationExcludes,
-					});
+					return captureWorkspaceStructure(workspace.sandboxRoot, { maxFiles: WORKSPACE_TRANSACTION_MAX_FILES, exclude: workspace.observationExcludes });
 				}
 				if (!liveBase && !workspace.sharedBaseline) throw new Error("OverlayFS shared baseline is unavailable");
 				return (liveBase ? Promise.resolve(liveBase) : overlayBaselineStructure(workspace.sharedBaseline!)).then((baseline) =>
@@ -1014,8 +1000,7 @@ async function createGitWorkspaceTransactionDriver(workspace: PrivateSandboxWork
 		contaminated: boolean; overlapped: boolean; readonly before?: WorkspaceStructureSnapshot;
 		readonly frontier: ReadonlyMap<string, RegularFileState | undefined>; readonly unknown: ReadonlySet<string>; readonly racing: readonly string[];
 	}
-	const { sandboxRoot, openTransactionClock: openClock,
-		transactionClockLinks: expectedClockLinks, transactionClockRoots: clockRoots } = workspace;
+	const { sandboxRoot, openTransactionClock: openClock, transactionClockLinks: expectedClockLinks, transactionClockRoots: clockRoots } = workspace;
 	let lastStructure = await workspace.structure.capture();
 	const captureStructure = workspace.structure.capture, frontier = new Map(workspace.baselineFrontier);
 	let retainedBytes = [...frontier.values()].reduce((total, state) => total + (state?.content.byteLength ?? 0), 0);
@@ -1137,8 +1122,11 @@ async function createGitWorkspaceTransactionDriver(workspace: PrivateSandboxWork
 		if (!owned) return incomplete("overlapping_workspace_transaction");
 		// What lies under a directory it made or moved in (a session directory renamed on completion) is its own too.
 		const mine = (resource: string): boolean => owned.written.has(resource) || resource.includes("/") && mine(path.posix.dirname(resource));
+		// A foreign change reaches what it saw only if it came no later than its last look at the name or at the directory holding it.
+		const seen = (resource: string) => Math.max(owned.observed.get(resource) ?? -Infinity, owned.observed.get(path.dirname(resource).replace(/^\.$/, "")) ?? -Infinity);
 		for (const foreign of [...capture.racing, ...paths.filter(resource => !mine(resource))]) {
-			if (owned.observed.has(foreign) || owned.observed.has(path.dirname(foreign).replace(/^\.$/, ""))) return incomplete(`overlapping_workspace_input:${foreign}`);
+			const changed = capture.racing.includes(foreign) ? undefined : after.entries.get(foreign)?.changeTimeMs;
+			if (seen(foreign) > -Infinity && (changed === undefined || Math.floor(changed) <= seen(foreign))) return incomplete(`overlapping_workspace_input:${foreign}`);
 		}
 		const own = paths.filter(mine);
 		const late = own.find(resource => Math.floor(after.entries.get(resource)?.changeTimeMs ?? -Infinity) > owned.endedAt);
@@ -1148,8 +1136,9 @@ async function createGitWorkspaceTransactionDriver(workspace: PrivateSandboxWork
 		try {
 			for (const relativePath of own) {
 				if (capture.unknown.has(relativePath) && before.entries.get(relativePath)?.kind === "file") return incomplete(`overlapping_workspace_before:${relativePath}`);
-				const previous = capture.frontier.has(relativePath) ? capture.frontier.get(relativePath)
-					: before.entries.get(relativePath)?.kind === "file" ? await workspace.readBase(relativePath, WORKSPACE_TRANSACTION_MAX_BYTES) : undefined;
+				// Bytes last seen stand for a file only while it was there when this interval began.
+				const previous = before.entries.get(relativePath)?.kind !== "file" ? undefined
+					: capture.frontier.has(relativePath) ? capture.frontier.get(relativePath) : await workspace.readBase(relativePath, WORKSPACE_TRANSACTION_MAX_BYTES);
 				const entry = after.entries.get(relativePath);
 				let current: RegularFileState | undefined;
 				if (entry?.kind === "file") {
@@ -1260,9 +1249,7 @@ async function acquireSandboxRepository(state: WorkspaceSandboxState, sourceRoot
 	if (!pending) {
 		pending = createSandboxRepository(state, sourceRoot, gitBinary);
 		state.repositories.set(key, pending);
-		void pending.catch(() => {
-			if (state.repositories.get(key) === pending) state.repositories.delete(key);
-		});
+		void pending.catch(() => { if (state.repositories.get(key) === pending) state.repositories.delete(key); });
 	}
 	const repository = await pending;
 	repository.registration ??= pending;
@@ -1425,8 +1412,7 @@ async function attachSandboxWorkspace(repository: PooledGitRepository, baseline:
 		await repository.git(["worktree", "add", "--detach", sandboxRoot, commit], { cwd: processRoot });
 		await linkSandboxAliases(sandboxRoot, aliases);
 		const gitDirectory = (await bindGit(repository.gitBinary, sandboxRoot, ["-C", sandboxRoot])(["rev-parse", "--absolute-git-dir"])).toString("utf8").trim();
-		if (!path.isAbsolute(gitDirectory)
-			|| filesystemPathKey(path.dirname(processRoot)) !== filesystemPathKey(repository.parent)
+		if (!path.isAbsolute(gitDirectory) || filesystemPathKey(path.dirname(processRoot)) !== filesystemPathKey(repository.parent)
 			|| filesystemPathKey(path.dirname(gitDirectory)) !== filesystemPathKey(path.join(repository.parent, "snapshot.git", "worktrees"))) {
 			throw new Error("private Git workspace ownership is unavailable");
 		}
@@ -1504,9 +1490,7 @@ async function acquireOverlayBaseline(
 			pending = attachSandboxWorkspace(repository, snapshot, path.join(repository.parent, `overlay-baseline-${commit}`))
 				.then(workspace => ({ ...workspace, active: 0 }));
 			repository.overlayBaselines.set(commit, pending);
-			void pending.catch(() => {
-				if (repository.overlayBaselines.get(commit) === pending) repository.overlayBaselines.delete(commit);
-			});
+			void pending.catch(() => { if (repository.overlayBaselines.get(commit) === pending) repository.overlayBaselines.delete(commit); });
 		}
 		const baseline = await pending;
 		baseline.active++;
@@ -1534,8 +1518,7 @@ async function sandboxIndexChanges(repository: PooledGitRepository): Promise<str
 		repository.index(["diff", "--name-only", "--no-renames", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none", "-z", "--"]),
 		repository.index(["ls-files", "--others", "-z", "--"]),
 	]);
-	return [...new Set([...parseNullList(tracked), ...parseNullList(untracked)])]
-		.filter((file) => !isSnapshotExcluded(slash(file)))
+	return [...new Set([...parseNullList(tracked), ...parseNullList(untracked)])].filter((file) => !isSnapshotExcluded(slash(file)))
 		.map((file) => path.resolve(repository.sourceRoot, file));
 }
 
@@ -1663,11 +1646,8 @@ async function materializeCheckpoint(workspace: PrivateSandboxWorkspace, checkpo
 }
 
 async function collectSandboxChanges(workspace: PrivateSandboxWorkspace, frontier?: readonly string[]): Promise<readonly SandboxFileChange[]> {
-	const detected = frontier ?? (workspace.overlay
-		? await collectOverlayChangeResources(workspace)
-		: await collectGitChangeResources(workspace));
-	const resources = [...new Set([...detected, ...(frontier ? [] : workspace.baselineFrontier.keys())])]
-		.filter((resource) => !isSnapshotExcluded(slash(resource)))
+	const detected = frontier ?? (workspace.overlay ? await collectOverlayChangeResources(workspace) : await collectGitChangeResources(workspace));
+	const resources = [...new Set([...detected, ...(frontier ? [] : workspace.baselineFrontier.keys())])].filter((resource) => !isSnapshotExcluded(slash(resource)))
 		.sort();
 	const changes: SandboxFileChange[] = [];
 	for (const resource of resources) {
@@ -1690,6 +1670,7 @@ async function collectSandboxChanges(workspace: PrivateSandboxWorkspace, frontie
 				after: after?.content,
 				beforeMode: before?.mode,
 				afterMode: after?.mode,
+				afterModified: after?.identity && String(after.identity.mtimeNs),
 			});
 		}
 	}
@@ -1812,10 +1793,7 @@ async function collectOverlayChangeResources(
 	const resources = new Set<string>();
 	const addBaselineSubtree = async (resource: string) => {
 		const prefix = resource || ".";
-		const tree = await workspace.pool.git(
-			["ls-tree", "-r", "-z", "--full-tree", workspace.commit, "--", prefix],
-			{ environment: { GIT_OPTIONAL_LOCKS: "0" } },
-		);
+		const tree = await workspace.pool.git(["ls-tree", "-r", "-z", "--full-tree", workspace.commit, "--", prefix], { environment: { GIT_OPTIONAL_LOCKS: "0" } });
 		for (const record of parseNullList(tree)) {
 			const separator = record.indexOf("\t");
 			if (separator === -1) throw new Error(`invalid Git subtree entry: ${resource}`);
@@ -1980,9 +1958,7 @@ function ownSandboxChanges(changes: readonly SandboxWorkspaceChange[]): SandboxW
 		const changeFile = change as SandboxFileChange;
 		if (
 			!sameOptionalBytes(previousFile.before, changeFile.before) ||
-			(previousFile.beforeMode !== undefined &&
-				changeFile.beforeMode !== undefined &&
-				!sameExecutableMode(previousFile.beforeMode, changeFile.beforeMode))
+			(previousFile.beforeMode !== undefined && changeFile.beforeMode !== undefined && !sameExecutableMode(previousFile.beforeMode, changeFile.beforeMode))
 		) {
 			throw new Error(`inconsistent sandbox baseline: ${change.resource}`);
 		}
@@ -2030,10 +2006,7 @@ async function restoreChanges(
 	for (const change of changes) {
 		try {
 			const baseline = baselines.get(change);
-			const current =
-				change.kind === "directory"
-					? await readSandboxDirectoryState(change.target)
-					: await readRegularState(change.target);
+			const current = change.kind === "directory" ? await readSandboxDirectoryState(change.target) : await readRegularState(change.target);
 			if (!sameSandboxState(current, baseline)) throw new Error(`sandbox rollback did not restore: ${change.resource}`);
 		} catch (error) {
 			errors.push(error);
@@ -2104,6 +2077,14 @@ async function removeCreatedDirectories(directories: readonly string[]): Promise
 	}
 }
 
+/** Give files back the modification times their producers left, which later readers may have observed. Node sets only
+ * microseconds, so coreutils touch sets them on Linux, whose traces record them; elsewhere a file keeps its commit's time. */
+export async function restoreModifiedTimes(files: readonly (readonly [target: string, modified: string | undefined])[]): Promise<void> {
+	const times = files.flatMap(([target, modified]) => /^\d+$/.test(modified ?? "") ? [`@${modified!.padStart(10, "0").slice(0, -9)}.${modified!.slice(-9).padStart(9, "0")}`, target] : []);
+	for (let start = 0; process.platform === "linux" && start < times.length; start += 1024) await new Promise<void>((resolve, reject) => execFile("sh",
+		["-c", 'while [ $# -gt 0 ]; do touch -chm -d "$1" -- "$2" || exit; shift 2; done', "sh", ...times.slice(start, start + 1024)], error => error ? reject(error) : resolve()));
+}
+
 async function replaceFile(temporary: string, target: string, mode?: number): Promise<void> {
 	await rename(temporary, target);
 	if (mode !== undefined && process.platform !== "win32") await chmod(target, mode);
@@ -2134,7 +2115,7 @@ function sameOptionalBytes(left: Uint8Array | undefined, right: Uint8Array | und
 	return Buffer.compare(left, right) === 0;
 }
 
-function parseNullList(value: Uint8Array): string[] { return value .toString() .split("\0") .filter(Boolean) .map((item) => slash(item)); }
+function parseNullList(value: Uint8Array): string[] { return value.toString().split("\0").filter(Boolean).map((item) => slash(item)); }
 
 /** The existing process owner binds each private repository/index once, preserving per-call cwd and limits. */
 function bindGit(command: string, cwd: string, prefix: readonly string[] = []) {
