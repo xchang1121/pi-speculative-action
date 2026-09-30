@@ -49,8 +49,8 @@ PI_SPECULATIVE_ACTION_CONFIG_DIR = "${HOME}/.local/share/pi-speculative-action/c
 [environment.child]
 PI_SPECULATIVE_ACTION_CONFIG_DIR = "${HOME}/.local/share/pi-speculative-action/config"
 
-# Pi stock-tool children inherit this policy. Bash speculation is delegated to the
-# downstream native Linux process world, which owns its stronger process evidence.
+# Pi stock-tool children inherit this policy. The Runtime ptrace-supervises this process tree, so the
+# native Linux process world cannot trace Bash here; Bash reuse is limited to whole-call history.
 [environment.network]
 mode = "all"
 

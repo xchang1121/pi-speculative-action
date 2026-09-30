@@ -28,7 +28,7 @@ import { isPoisonedEffectCommit } from "./effect-transaction.ts";
 import { resolveHostExecutable } from "./executable-path.ts";
 import { assertNoSymlinkPath, captureStableFile, hashExecutableFile, mapFilesystem, sameFilesystemIdentity, walkFilesystemPath } from "./filesystem-evidence.ts";
 import { captureHeldDescriptorInputs, inspectHeldExecProcess, LinuxHeldExecBoundary, listenUnixSocket, resolveLinuxExecHelper, type HeldExecDecision,
-	type HeldExecProcess, type HeldExecSnapshot, descriptorInputs, descriptorEffects, type ProcessResourceGraph } from "./linux-held-exec.ts";
+	type HeldExecProcess, type HeldExecSnapshot, descriptorInputs, descriptorEffects, inheritedTracer, type ProcessResourceGraph } from "./linux-held-exec.ts";
 import { emptyWorldReuseMetrics, snapshotExecutionScope, type ExecutionScope, type ExecutionOperationAdoption, type ExecutionWorldStorageControl,
 	type WorldReuseMetrics } from "./execution-world.ts";
 import { type ProcessReusePlan, ProcessReusePlanner } from "./reuse-planner.ts";
@@ -1362,9 +1362,7 @@ export class LinuxProcessReuseBackend {
 				const effects = diffWorkspaceStructures(before, after, delta.changes, session.projection);
 				stage = "dependencies";
 				const evidence = await captureDependencies(session, transactionDependencySource(before, effects), observation.paths, effects.effects);
-				if (evidence.incompleteReasons.length) {
-					this.setError(session, `evidence:${evidence.incompleteReasons.join(",")}`);
-				}
+				if (evidence.incompleteReasons.length) this.setError(session, `evidence:${evidence.incompleteReasons.join(",")}`);
 				const taints = new Set<ProvenanceTaint>(observation.taints);
 				// Private images preserve FD/OFD relations, but cannot also represent an independently accessed pathname.
 				if (inputs.some(descriptor => !descriptorImages.get(descriptor.image)?.workspace && descriptor.sourcePath && observation.paths.some(observed =>
@@ -1816,9 +1814,7 @@ function transactionDependencySource(snapshot: WorkspaceStructureSnapshot, effec
 	const cached = new Map<string, Promise<WorkspaceTreeEntry | undefined>>();
 	return (physicalPath: string) => {
 		const relative = relativeFilesystemPath(snapshot.root, physicalPath);
-		if (relative === undefined) {
-			return Promise.reject(new Error(`workspace dependency escapes snapshot: ${physicalPath}`));
-		}
+		if (relative === undefined) return Promise.reject(new Error(`workspace dependency escapes snapshot: ${physicalPath}`));
 		if (!cached.has(relative)) cached.set(relative, (async () => {
 			const structure = snapshot.entries.get(relative);
 			if (!structure || structure.kind !== "file") return structure;
@@ -2307,7 +2303,7 @@ async function probeExecutionContext(input: {
 		path.join(input.logicalRoot, "script-position"),
 	]);
 	const outcome = await runSpawn(input.strace, command.slice(1), { cwd: input.physicalRoot, environment: definedProcessEnvironment(process.env) });
-	if (outcome.signal || outcome.code !== 0) throw new Error("process execution context probe failed");
+	if (outcome.signal || outcome.code !== 0) throw new Error(`process execution context probe failed${await inheritedTracer()}`);
 	const stdout = Buffer.concat(outcome.output.filter(({ fd }) => fd === 1).map(({ data }) => data)).toString();
 	const parsed = processContextFromRaw(JSON.parse(stdout) as RawProcessContext);
 	if (!validProcessContext(parsed)) throw new Error("process execution context probe returned invalid data");

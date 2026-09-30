@@ -263,9 +263,7 @@ async function probeLinuxOverlayfs(resolved: ResolvedOverlayfs): Promise<LinuxOv
 		if ((await readFile(path.join(lowerRoot, "copy-up.txt"), "utf8")) !== `${marker}\n`) {
 			throw new Error("OverlayFS mutated its immutable lower directory");
 		}
-		if ((await readFile(path.join(root, "copy-up.txt"), "utf8")) !== "changed\n") {
-			throw new Error("OverlayFS copy-up was not visible");
-		}
+		if ((await readFile(path.join(root, "copy-up.txt"), "utf8")) !== "changed\n") throw new Error("OverlayFS copy-up was not visible");
 		const copiedIdentity = await lstat(path.join(root, "copy-up.txt"), { bigint: true });
 		if (copiedIdentity.dev !== mountedIdentity.dev || copiedIdentity.ino !== mountedIdentity.ino) throw new Error("OverlayFS copy-up changed object identity");
 		const clock = await openLinuxAnonymousWorkspaceFile(upperRoot);
@@ -308,9 +306,7 @@ async function probeLinuxOverlayfs(resolved: ResolvedOverlayfs): Promise<LinuxOv
 		}
 		await expectMissing(path.join(root, "whiteout.txt"));
 		const whiteout = await lstat(path.join(upperRoot, "whiteout.txt"));
-		if (!whiteout.isCharacterDevice() || whiteout.rdev !== 0) {
-			throw new Error("OverlayFS whiteout encoding is unsupported");
-		}
+		if (!whiteout.isCharacterDevice() || whiteout.rdev !== 0) throw new Error("OverlayFS whiteout encoding is unsupported");
 		if (!(await lstat(path.join(upperRoot, "replaced", ".wh..wh..opq"))).isFile()) {
 			throw new Error("OverlayFS opaque-directory encoding is unsupported");
 		}
@@ -339,9 +335,7 @@ async function probeLinuxOverlayfs(resolved: ResolvedOverlayfs): Promise<LinuxOv
 				outcome = { available: false, detail: `fuse-overlayfs probe cleanup failed: ${errorMessage(error)}` };
 			}
 		}
-		if (degradedDetail) {
-			outcome = { available: false, detail: `fuse-overlayfs probe cleanup degraded: ${degradedDetail}` };
-		}
+		if (degradedDetail) outcome = { available: false, detail: `fuse-overlayfs probe cleanup degraded: ${degradedDetail}` };
 		if (safeToRemove) await rm(probeRoot, { recursive: true, force: true }).catch(() => undefined);
 	}
 	return outcome;
@@ -426,9 +420,7 @@ async function waitForMount(
 	for (;;) {
 		if (await mountedAsFuseOverlayfs(mountRoot)) return;
 		const failure = processError();
-		if (failure) {
-			throw new Error(`fuse-overlayfs failed before mount was ready: ${errorMessage(failure)}; ${diagnostics().trim()}`);
-		}
+		if (failure) throw new Error(`fuse-overlayfs failed before mount was ready: ${errorMessage(failure)}; ${diagnostics().trim()}`);
 		if (child.exitCode !== null || child.signalCode !== null) {
 			throw new Error(`fuse-overlayfs exited before mount was ready: ${diagnostics().trim()}`);
 		}
@@ -550,7 +542,5 @@ async function expectMissing(target: string): Promise<void> {
 }
 
 function assertOverlayOptionPath(value: string): void {
-	if (!path.isAbsolute(value) || /[,\n\r\0:]/.test(value)) {
-		throw new Error(`OverlayFS path cannot be encoded safely: ${value}`);
-	}
+	if (!path.isAbsolute(value) || /[,\n\r\0:]/.test(value)) throw new Error(`OverlayFS path cannot be encoded safely: ${value}`);
 }
