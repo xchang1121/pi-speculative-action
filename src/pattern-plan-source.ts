@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ActionProjectionRule } from "./action-key-projection.ts";
@@ -47,7 +48,7 @@ export function createPatternPlanSource({
 	readonly store?: PatternAwareStore | Promise<PatternAwareStore>;
 }): PatternPlanSourceController {
 	cwd = path.resolve(cwd);
-	const patternActionSemantics = patternAwareActionSemantics(actionSemantics, cwd, projectionRules);
+	const patternActionSemantics = patternAwareActionSemantics(actionSemantics, cwd, projectionRules, existsSync);
 	let openedStore: { readonly key: string; readonly lease: Promise<PatternAwareStoreLease> } | undefined;
 	const ownedStores = new Map<string, Promise<PatternAwareStoreLease>>();
 	const lifecycle = new RuntimeLifecycleLane();

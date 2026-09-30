@@ -608,10 +608,7 @@ describe("PatternAware", () => {
 
 	test("enforces the configured context bound while learning, restoring, and registering patterns", async () => {
 		const file = await patternFile();
-		const long = validatedGapPattern(
-			{ "0": 2 },
-			{ context: [ { tool: "grep", outcome: "success" }, { tool: "read", outcome: "success" }, ] },
-		);
+		const long = validatedGapPattern({ "0": 2 }, { context: [ { tool: "grep", outcome: "success" }, { tool: "read", outcome: "success" }, ] });
 		await fs.writeFile(file, JSON.stringify({ patterns: [long], events: [], pools: [], sequenceCounts: [] }));
 
 		const store = patternStore({ maxContextLength: 1 }, file);
@@ -1434,6 +1431,13 @@ describe("PatternAware", () => {
 		const [edited] = structural(), before = edited!.conditionalProbability;
 		for (let index = 0; index < 3; index++) { store.issued(edited!.continuation); store.settled(edited!.continuation, unmatchedSettlement()); }
 		expect(structural()[0]!.conditionalProbability).toBeLessThan(before);
+		// A listed name with no file behind it never runs; one written on this path first still reads.
+		for (const [written, paths] of [[false, ["src/d.ts"]], [true, ["src/b.ts", "src/d.ts"]]] as const) {
+			const present = patternStore({}, undefined, patternAwareActionSemantics(PI_ACTION_SEMANTICS, "/workspace", [], (target) => !target.endsWith("b.ts")));
+			present.observe(input("s", "grep", { pattern: "x" }, { outputLocations: [{ path: "src/b.ts", line: 3 }, { path: "src/d.ts", line: 1 }] }));
+			if (written) present.observe(input("s", "write", { path: "src/b.ts" }));
+			expect(present.predict("s").filter(item => item.patternID.startsWith("structural:")).map(item => item.input.path)).toEqual(paths);
+		}
 	});
 
 	test("bounds derived state by recency and releases finished sessions", () => {
@@ -1494,11 +1498,8 @@ describe("PatternAware", () => {
 	});
 });
 
-function observeBatchTransition(
-	store: PatternAwareStore,
-	sessionID: string,
-	targets: ReadonlyArray<{ readonly tool: string; readonly input: Record<string, unknown> }>,
-) {
+function observeBatchTransition(store: PatternAwareStore, sessionID: string,
+	targets: ReadonlyArray<{ readonly tool: string; readonly input: Record<string, unknown> }>) {
 	store.observeBatch([input(sessionID, "inspect", { scope: "src" }, { turnID: `${sessionID}:context`, })]);
 	store.observeBatch(targets.map((target) => input(sessionID, target.tool, target.input, { turnID: `${sessionID}:targets`, ...target })));
 	store.finishSession(sessionID);
@@ -1549,11 +1550,7 @@ function trainResultReads(store: PatternAwareStore, sessionID: string, results: 
 	for (const filePath of reads) store.observe(input(sessionID, "read", { filePath }));
 }
 
-function patternStore(
-	overrides: Parameters<typeof settings>[0] = {},
-	file?: string,
-	semantics?: ConstructorParameters<typeof PatternAwareStore>[2],
-) {
+function patternStore(overrides: Parameters<typeof settings>[0] = {}, file?: string, semantics?: ConstructorParameters<typeof PatternAwareStore>[2]) {
 	return new PatternAwareStore(settings(overrides), file, semantics);
 }
 
@@ -1591,11 +1588,8 @@ function validatedGapPattern(gapCounts: Readonly<Record<string, number>>, overri
 	};
 }
 
-function acceptPattern(
-	store: PatternAwareStore,
-	gapCounts: Readonly<Record<string, number>>,
-	overrides: Partial<ValidatedPattern> = {},
-): ValidatedPattern {
+function acceptPattern(store: PatternAwareStore, gapCounts: Readonly<Record<string, number>>,
+	overrides: Partial<ValidatedPattern> = {}): ValidatedPattern {
 	const pattern = validatedGapPattern(gapCounts, overrides);
 	expect(store.registerValidatedPattern(pattern)).toBe(true);
 	return pattern;

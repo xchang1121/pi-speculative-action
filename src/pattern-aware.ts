@@ -46,10 +46,12 @@ export type PatternAwareActionSemantics = {
 	/** Deterministic K(a) projection for one namespace; repeated inputs may be memoized. */
 	readonly actionKey: (tool: string, input: Readonly<Record<string, unknown>>, schemaHash?: string) => ActionKey | undefined;
 	readonly projectors?: readonly ActionKeyProjector[];
+	/** Whether a workspace file exists now: a read prediction of a missing one never runs. Omitted, every read stays a candidate. */
+	readonly exists?: (target: string) => boolean;
 };
 
 export function patternAwareActionSemantics(
-	registry: ActionSemanticsRegistry, cwd: string, projectors: readonly ActionKeyProjector[] = [],
+	registry: ActionSemanticsRegistry, cwd: string, projectors: readonly ActionKeyProjector[] = [], exists?: (target: string) => boolean,
 ): PatternAwareActionSemantics {
 	cwd = path.resolve(cwd);
 	const rules = Object.freeze(projectors.map(ownActionKeyProjector));
@@ -58,6 +60,7 @@ export function patternAwareActionSemantics(
 			[...registry.toolNames()].sort().map(tool => [tool, registry.definition(tool)!.epoch]), rules.map(rule => rule.id).sort()]),
 		actionKey: (tool: string, input: Readonly<Record<string, unknown>>, schemaHash?: string) => registry.buildKey(tool, input, cwd, schemaHash),
 		projectors: rules,
+		...(exists ? { exists } : {}),
 	});
 }
 
@@ -635,7 +638,7 @@ export class PatternAwareStore {
 		// Learned support, when there is any, speaks for an action; the built-in relations only add the ones nothing learned yet.
 		for (const structural of authoritative ? this.structuralReads(history, schemaHashes, continuation, settings) : [])
 			if (!predictions.has(structural.actionIdentity)) predictions.set(structural.actionIdentity, structural);
-		const ranked = [...predictions.values()].sort((left, right) =>
+		const ranked = [...predictions.values()].filter((prediction) => this.readable(prediction, history, schemaHashes.read)).sort((left, right) =>
 			Number(left.background) - Number(right.background) ||
 			right.expectedLatencyBenefitMs - left.expectedLatencyBenefitMs ||
 			right.empiricalProbability - left.empiricalProbability ||
@@ -947,6 +950,14 @@ export class PatternAwareStore {
 		const actor = this.resolveActionKey(actorTool, actorInput, actorSchemaHash);
 		if (!speculative || !actor) return sameValue(speculativeInput, actorInput);
 		return actionKeyCovers(speculative, actor, this.actionSemantics?.projectors ?? []);
+	}
+
+	/** A read of a file that is not there, nor written earlier on this path, cannot run, let alone match: it would only take the place of one that could. */
+	private readable({ tool, input }: { readonly tool: string; readonly input: Readonly<Record<string, unknown>> }, history: ReadonlyArray<PatternAwareEvent>, schemaHash?: string) {
+		const exists = this.actionSemantics?.exists, key = exists && tool === "read" ? this.resolveActionKey(tool, input, schemaHash) : undefined, root = key?.resourceRoot;
+		if (!exists || !root || !key.resources[0]) return true;
+		const target = path.resolve(root, key.resources[0]);
+		return exists(target) || history.some((event) => (event.tool === "write" || event.tool === "edit") && typeof event.input.path === "string" && path.resolve(root, event.input.path) === target);
 	}
 
 	private resolveActionKey(tool: string, input: Readonly<Record<string, unknown>>, schemaHash: string | undefined) {
@@ -1269,12 +1280,8 @@ export type PatternAwareStoreLease = { readonly store: PatternAwareStore; readon
 
 const stores = new Map<string, PooledPatternAwareStore>();
 
-export async function acquirePatternAwareStore(
-	workspace: string,
-	settings: PatternAwareSettings,
-	stateDirectory?: string,
-	actionSemantics?: PatternAwareActionSemantics,
-): Promise<PatternAwareStoreLease> {
+export async function acquirePatternAwareStore(workspace: string, settings: PatternAwareSettings, stateDirectory?: string,
+	actionSemantics?: PatternAwareActionSemantics): Promise<PatternAwareStoreLease> {
 	settings = { ...settings };
 	actionSemantics = actionSemantics && { ...actionSemantics };
 	const analyzerKey = patternAwareAnalyzerKey(settings);
@@ -1376,12 +1383,8 @@ export function failureClass(text: string): string {
 	return [exit === undefined ? "" : `exit:${exit}`, kind ?? ""].filter(Boolean).join(" ") || "failed";
 }
 
-export function projectPatternAwareObservation(
-	output: unknown,
-	outputPaths: ReadonlyArray<string> = [],
-	resourceRoot?: string,
-	outputLocations: ReadonlyArray<OutputLocation> = [],
-): PatternAwareObservation {
+export function projectPatternAwareObservation(output: unknown, outputPaths: ReadonlyArray<string> = [], resourceRoot?: string,
+	outputLocations: ReadonlyArray<OutputLocation> = []): PatternAwareObservation {
 	const locations = [...uniqueBy(outputLocations.map(({ path, line }) => ({ path: normalizeResourcePath(path, resourceRoot), line })), stableStringify)]
 		.slice(0, PATTERN_VALUE_MAX_ITEMS);
 	const paths = outputPaths.map(item => normalizeResourcePath(item, resourceRoot));
@@ -1734,11 +1737,8 @@ export function inferBindings(context: ReadonlyArray<PatternAwareEvent>, target:
 	return new PatternBindingAnalysis().inferBindings(context, target);
 }
 
-export function applyBindingsVariants(
-	bindings: Readonly<Record<string, PatternAwareBinding>>,
-	context: ReadonlyArray<PatternAwareEvent>,
-	limit = MAX_BINDING_VARIANTS,
-): ReadonlyArray<Record<string, unknown>> {
+export function applyBindingsVariants(bindings: Readonly<Record<string, PatternAwareBinding>>, context: ReadonlyArray<PatternAwareEvent>,
+	limit = MAX_BINDING_VARIANTS): ReadonlyArray<Record<string, unknown>> {
 	return new PatternBindingAnalysis().applyWeightedBindings(bindings, context, limit).map(({ input }) => input);
 }
 
@@ -1768,11 +1768,8 @@ function stablePayloadConstant(samples: ReadonlyArray<PatternSample>, minimum: n
 	return new Set(samples.map((sample) => `${sample.target.sessionID}:${sample.target.turnID}`)).size >= minimum;
 }
 
-function hasSufficientBindingProvenance(
-	bindings: Readonly<Record<string, PatternAwareBinding>>,
-	samples: ReadonlyArray<PatternSample>,
-	minimum: number,
-) {
+function hasSufficientBindingProvenance(bindings: Readonly<Record<string, PatternAwareBinding>>, samples: ReadonlyArray<PatternSample>,
+	minimum: number) {
 	return Object.entries(bindings).every(([encodedPath, binding]) => {
 		if (binding.type !== "constant") return true;
 		const targetPath = decodePath(encodedPath);
@@ -2123,12 +2120,8 @@ function semanticOutputShape(value: unknown, errorClass?: string) {
 	return hash(stableStringify(discriminants.sort()));
 }
 
-function backoffProbability(
-	patterns: ReadonlyArray<MutablePattern>,
-	clock: number,
-	halfLife: number,
-	contexts?: ReadonlyMap<number, ReadonlyMap<string, number>>,
-) {
+function backoffProbability(patterns: ReadonlyArray<MutablePattern>, clock: number, halfLife: number,
+	contexts?: ReadonlyMap<number, ReadonlyMap<string, number>>) {
 	const byLength = new Map<number, MutablePattern>();
 	for (const pattern of patterns) {
 		const current = byLength.get(pattern.context.length);
