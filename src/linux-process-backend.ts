@@ -26,7 +26,7 @@ import { definedProcessEnvironment, type PreparedProcessExecutionRoute, type Pro
 	type ProcessExecutor } from "./process-execution.ts";
 import { isPoisonedEffectCommit } from "./effect-transaction.ts";
 import { resolveHostExecutable } from "./executable-path.ts";
-import { assertNoSymlinkPath, captureFilesystemEntry, captureStableFile, hashExecutableFile, mapFilesystem, sameFilesystemIdentity, walkFilesystemPath } from "./filesystem-evidence.ts";
+import { assertNoSymlinkPath, captureFilesystemEntry, captureStableFile, hashExecutableFile, mapFilesystem, sameFilesystemIdentity, sharedWalk, walkFilesystemPath } from "./filesystem-evidence.ts";
 import { captureHeldDescriptorInputs, inspectHeldExecProcess, LinuxHeldExecBoundary, listenUnixSocket, resolveLinuxExecHelper, type HeldExecDecision,
 	type HeldExecProcess, type HeldExecSnapshot, descriptorInputs, descriptorEffects, inheritedTracer, type ProcessResourceGraph } from "./linux-held-exec.ts";
 import { emptyWorldReuseMetrics, snapshotExecutionScope, type ExecutionScope, type ExecutionOperationAdoption, type ExecutionWorldStorageControl,
@@ -1991,7 +1991,7 @@ async function captureDependencies(session: ActiveSession, snapshot: WorkspaceSt
 		hostPaths.set(`${item.role}\0${physical}`, { physical, role: item.role, listed: !!item.listed });
 	}
 	// Host files are independent of each other and of the workspace: capture them concurrently (walking what they share once), add them in trace order.
-	const walked = new Map<string, ReturnType<typeof captureFilesystemEntry>>(), capture = (target: string) => walked.get(target) ?? walked.set(target, captureFilesystemEntry(target)).get(target)!;
+	const capture = sharedWalk();
 	const hostCaptures = await mapFilesystem([...hostPaths.values()], ({ physical, role, listed }) =>
 		captureHostPath(physical, role, listed, capture).then(value => ({ value }), (error: unknown) => ({ error })));
 	[...hostPaths.values()].forEach(({ physical }, index) => {
