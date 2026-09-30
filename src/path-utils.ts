@@ -1,8 +1,6 @@
 import path from "node:path";
 
-export function slash(value: string): string {
-	return path.sep === "/" ? value : value.replaceAll(path.sep, "/");
-}
+export const slash = (value: string): string => path.sep === "/" ? value : value.replaceAll(path.sep, "/");
 
 /** Normalize a logical resource without folding case. */
 export function normalizeLogicalPath(value: string): string {
@@ -21,16 +19,18 @@ export function sameFilesystemPath(left: string, right: string): boolean {
 	return drive(left) === drive(right);
 }
 
+/** An absolute POSIX path without an empty, `.` or `..` segment or a trailing slash: between two, containment is a prefix. */
+const NORMALIZED_ABSOLUTE = /^(?:\/(?!\.{1,2}(?:\/|$))[^/]+)+$/;
+
 export function relativeFilesystemPath(root: string, target: string): string | undefined {
+	if (path.sep === "/" && NORMALIZED_ABSOLUTE.test(root) && NORMALIZED_ABSOLUTE.test(target)) return target === root ? "" : target.startsWith(`${root}/`) ? target.slice(root.length + 1) : undefined;
 	const resolvedRoot = path.resolve(root), resolvedTarget = path.resolve(target), relative = path.relative(resolvedRoot, resolvedTarget);
 	if (relative === "") return sameFilesystemPath(resolvedRoot, resolvedTarget) ? "" : undefined;
 	if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return undefined;
 	return sameFilesystemPath(path.resolve(resolvedRoot, relative), resolvedTarget) ? relative : undefined;
 }
 
-export function containsFilesystemPath(root: string, target: string): boolean {
-	return relativeFilesystemPath(root, target) !== undefined;
-}
+export const containsFilesystemPath = (root: string, target: string): boolean => relativeFilesystemPath(root, target) !== undefined;
 
 export function containsLogicalPath(root: string, target: string): boolean {
 	const relative = path.posix.relative(normalizeLogicalPath(root), normalizeLogicalPath(target));
