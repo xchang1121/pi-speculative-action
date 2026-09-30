@@ -43,10 +43,7 @@ export interface SpeculativeExecutionRoute {
 
 export function sameSpeculativeExecutionRoute(left: SpeculativeExecutionRoute, right: SpeculativeExecutionRoute): boolean {
 	return (
-		left.isolation === right.isolation &&
-		left.reuse === right.reuse &&
-		left.scope === right.scope &&
-		left.backend === right.backend &&
+		left.isolation === right.isolation && left.reuse === right.reuse && left.scope === right.scope && left.backend === right.backend &&
 		left.fingerprint === right.fingerprint
 	);
 }
@@ -108,6 +105,8 @@ export interface ExecutionOperationBinding {
 	readonly executionMs: number;
 	/** Isolated service estimate, including observed preparation and capture. */
 	readonly expectedDurationMs: number;
+	/** Whether a run now would redo it: no result of it the backend holds is still valid for the workspace. */
+	readonly stale?: () => Promise<boolean>;
 }
 
 /** Delivered only after the authoritative OS boundary confirms the internal result was consumed. */
@@ -116,6 +115,8 @@ export interface ExecutionOperationAdoption {
 	readonly id: string;
 	readonly sequence: number;
 	readonly operationIdentity: string;
+	/** What producing the adopted result took, which the adopting call did not spend. */
+	readonly executionMs?: number;
 }
 
 /**
@@ -285,20 +286,11 @@ export function executionCapabilityStatus(
 		worlds.flatMap((world) => {
 			if (world.scope !== scope) return [];
 			const diagnostic = operation === "speculation" ? world : world.observation;
-			return diagnostic && supportsTool(diagnostic, tool) && effectCapabilitiesCover(diagnostic.capabilities, requirements)
-				? [{ ...world, ...diagnostic }]
-				: [];
+			return diagnostic && supportsTool(diagnostic, tool) && effectCapabilitiesCover(diagnostic.capabilities, requirements) ? [{ ...world, ...diagnostic }] : [];
 		}),
 	);
-	const primary =
-		candidates.find((world) => world.state === "ready") ??
-		candidates.find((world) => world.state === "registered") ??
-		candidates[0];
-	return Object.freeze({
-		state: primary?.state ?? "unavailable",
-		...(primary ? { primary } : {}),
-		candidates: Object.freeze(candidates),
-	});
+	const primary = candidates.find((world) => world.state === "ready") ?? candidates.find((world) => world.state === "registered") ?? candidates[0];
+	return Object.freeze({ state: primary?.state ?? "unavailable", ...(primary ? { primary } : {}), candidates: Object.freeze(candidates) });
 }
 
 export interface ExecutionWorldOperation {
@@ -445,21 +437,9 @@ export class ExecutionWorldRouter<Context, Output> {
 								state: "unavailable" as const,
 								detail: "Pre-execution disabled by routing policy",
 							}
-					: {
-							capabilities: Object.freeze([]),
-							state: "unavailable" as const,
-							detail: "Speculative execution is not provided",
-						};
-				const observation = world.observation
-					? await this.diagnose(world.id, "observation", world.observation, input)
-					: undefined;
-				return Object.freeze({
-					id: world.id,
-					scope: world.scope,
-					isolation: world.isolation,
-					...speculation,
-					...(observation ? { observation } : {}),
-				});
+					: { capabilities: Object.freeze([]), state: "unavailable" as const, detail: "Speculative execution is not provided" };
+				const observation = world.observation ? await this.diagnose(world.id, "observation", world.observation, input) : undefined;
+				return Object.freeze({ id: world.id, scope: world.scope, isolation: world.isolation, ...speculation, ...(observation ? { observation } : {}) });
 			}),
 		));
 	}
@@ -538,11 +518,7 @@ export class ExecutionWorldRouter<Context, Output> {
 		return Object.freeze({
 			capabilities: operation.capabilities,
 			...(operation.tools ? { tools: Object.freeze([...operation.tools]) } : {}),
-			...(report ??
-				(route?.cwd === input.cwd ? route : undefined) ?? {
-					state: "registered",
-					detail: "Registered; availability is checked during route preparation",
-				}),
+			...(report ?? (route?.cwd === input.cwd ? route : undefined) ?? { state: "registered", detail: "Registered; availability is checked during route preparation" }),
 		});
 	}
 

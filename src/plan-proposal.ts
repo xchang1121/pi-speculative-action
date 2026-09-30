@@ -30,6 +30,8 @@ export interface PlanAction {
 	readonly expectedLatencyBenefitMs?: number;
 	/** Uses only otherwise-idle speculative capacity and yields first under contention. */
 	readonly background?: boolean;
+	/** Run for the internal operations it leaves later calls rather than for its own result: no Actor call is expected to join it. */
+	readonly producesOperations?: true;
 	readonly resourceDemand?: number;
 	readonly depth?: number;
 	readonly dependsOn?: readonly PlanActionDependency[];

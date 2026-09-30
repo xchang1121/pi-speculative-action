@@ -3106,7 +3106,7 @@ static void *relay_output(void *argument) {
 		if (count < 0 || transfer(relay->destination, bytes, (size_t)count, 1) < 0) return (void *)1;
 	}
 }
-static int execute_descriptors(const char *manifest, const char *report, char *executable, char **command, const char *route, unsigned closed_input) {
+static int execute_descriptors(const char *manifest, const char *report, char *executable, char **command, const char *route, unsigned closed_input, const int *output_flags) {
 	struct file_position positions[MAX_POSITIONS];
 	struct output_relay relays[2] = {{.source = -1, .writer = -1, .destination = 1}, {.source = -1, .writer = -1, .destination = 2}};
 	char line[MAX_LINE];
@@ -3323,6 +3323,10 @@ static int execute_descriptors(const char *manifest, const char *report, char *e
 		if (relays[0].writer >= 0 && route[0] == route[1] && dup2(1, 2) < 0) _exit(70);
 		for (unsigned index = 0; index < 2; index++) { close(relays[index].source); close(relays[index].writer); }
 		for (unsigned index = 0; index < count; index++) { close(positions[index].duplicate); close(positions[index].producer); }
+		for (int fd = 1; fd <= 2; fd++) {
+			int flags = output_flags[fd - 1] < 0 ? 0 : fcntl(fd, F_GETFL);
+			if (flags < 0 || (output_flags[fd - 1] >= 0 && fcntl(fd, F_SETFL, (flags & ~(O_APPEND | O_NONBLOCK)) | (output_flags[fd - 1] & (O_APPEND | O_NONBLOCK))) < 0)) _exit(70);
+		}
 		execv(executable, command);
 		_exit(errno == ENOENT ? 127 : 126);
 	}
@@ -3416,7 +3420,10 @@ int main(int argc, char **argv) {
 	int dispatched = image_dispatch(argc, argv);
 	if (dispatched >= 0) return dispatched;
 	if (argc >= 2 && (!strcmp(argv[1], "--exec") || !strcmp(argv[1], "--exec-closed-input") || !strcmp(argv[1], "--exec-fds"))) {
-		int descriptors = !strcmp(argv[1], "--exec-fds"), name = descriptors ? 5 : 3;
+		int descriptors = !strcmp(argv[1], "--exec-fds"), name = descriptors ? 5 : 3, output_flags[2] = {-1, -1};
+		/* ",<stdout>,<stderr>": status flags the target's outputs carry natively, its parent's own (make's O_APPEND). */
+		char *suffix = argc > 2 ? strchr(argv[2], ',') : NULL;
+		if (suffix && (*suffix++ = 0, sscanf(suffix, "%d,%d", &output_flags[0], &output_flags[1]) != 2 || output_flags[0] < 0 || output_flags[1] < 0)) return 64;
 		if (argc < name + 2 || strspn(argv[2], "012") != 2 ||
 			(strlen(argv[2]) != 2 && (!descriptors || strlen(argv[2]) != 4 || strspn(argv[2] + 2, "ps") != 2 ||
 				(argv[2][0] == argv[2][1] && argv[2][2] != argv[2][3])))) return 64;
@@ -3437,7 +3444,7 @@ int main(int argc, char **argv) {
 		argv[name + 1] = argv[name];
 		/* Two spare slots after the command, as in image_dispatch: a script's exec is rewritten in place. */
 		return execute_descriptors(manifest, report, executable, memmove(argv + name - 1, argv + name + 1, (size_t)(argc - name) * sizeof(*argv)), argv[2],
-			!strcmp(argv[1], "--exec-closed-input"));
+			!strcmp(argv[1], "--exec-closed-input"), output_flags);
 	}
 	if (argc == 4 && !strcmp(argv[1], "--probe-context")) return probe_context(argv[2], argv[3]);
 	if (argc == 2 && !strcmp(argv[1], "--probe-clean-fds")) {

@@ -59,10 +59,12 @@ export function createPatternPlanSource({
 	const issuedParents = new WeakSet<object>();
 	// Capabilities stay in this session; the persisted Pattern store receives only real tool batches.
 	const operationBindings = new BoundedRecencyMap<string, ObservedOperation>(PATTERN_AWARE_DEFAULTS.maxPatterns);
+	// The Actor's latest commands whose operations it learned: a workspace change since, or a rerun the runtime has not admitted, reruns one.
+	const learnedCommands = new BoundedRecencyMap<string, { readonly parentHash: string; readonly tool: string; readonly input: Readonly<Record<string, unknown>> }>(4);
+	let workspaceChanged = false, issuedRerun: object | undefined;
 	let analysisTail: Promise<void> = Promise.resolve();
 
-	const sourceSettings = (settings: SpeculativeActionSettings): PatternAwareSettings =>
-		patternAwareSettings(settings.sourceConfig?.patternAware);
+	const sourceSettings = (settings: SpeculativeActionSettings): PatternAwareSettings => patternAwareSettings(settings.sourceConfig?.patternAware);
 	const admit = <Value>(settings: SpeculativeActionSettings,
 		operation: (settings: PatternAwareSettings) => Promise<Value>): Promise<Value> => {
 		try {
@@ -86,8 +88,7 @@ export function createPatternPlanSource({
 			const opening = { key: configurationKey, lease: Promise.resolve().then(async () => {
 				if (previous) await previous.lease.then(({ store }) => store.finishSession(sessionID))
 					.catch(() => undefined); // Failed loading cannot poison the next analyzer.
-				return retained ?? acquirePatternAwareStore(workspaceIdentity ?? cwd, patternSettings,
-					stateDirectory, patternActionSemantics);
+				return retained ?? acquirePatternAwareStore(workspaceIdentity ?? cwd, patternSettings, stateDirectory, patternActionSemantics);
 			}) };
 			// Predictions retain their analyzer for late feedback, including after returning to this configuration.
 			if (!retained) ownedStores.set(configurationKey, opening.lease);
@@ -154,6 +155,22 @@ export function createPatternPlanSource({
 		});
 	};
 
+	/** Once the Actor changed the workspace, rerun the learned command with the most work its operations' results no longer
+	 * cover: a later call of any command that launches the same operations reuses their fresh results. */
+	const reruns = async (): Promise<PlanAction[]> => {
+		if (!workspaceChanged && !issuedRerun) return [];
+		workspaceChanged = false;
+		const commands = await Promise.all([...learnedCommands.values()].map(async (command) => {
+			const children = [...operationBindings.values()].filter(item => item.parentHash === command.parentHash && item.binding.available !== false);
+			const stale = await Promise.all(children.map(async ({ binding }) => await binding.stale?.() !== false ? binding.executionMs : 0));
+			return { command, children, staleMs: stale.reduce((total, ms) => total + ms, 0) };
+		}));
+		const chosen = commands.reduce<(typeof commands)[number] | undefined>((best, next) => next.staleMs > (best?.staleMs ?? 0) ? next : best, undefined);
+		issuedRerun = chosen && {};
+		return chosen ? [{ id: `rerun:${chosen.command.parentHash}`, type: "tool_call", tool: chosen.command.tool, input: chosen.command.input, horizon: 0, background: true,
+			producesOperations: true, expectedLatencyBenefitMs: chosen.staleMs, feedback: issuedRerun, expectedDurationMs: Math.max(...chosen.children.map(({ binding }) => binding.expectedDurationMs)) }] : [];
+	};
+
 	const source: AgentPlanSource = {
 		id: "pattern_aware",
 		enabled: (settings) => !lifecycle.sealed && sourceSettings(settings).enabled,
@@ -168,15 +185,12 @@ export function createPatternPlanSource({
 			if (signal.aborted) return undefined;
 			const candidates = store.predict(startInput.sessionID, data.schemaHashes, patternSettings);
 			const signature = patternPredictionSignature(candidates);
-			const carried = carriedPredictions.get(startInput.sessionID);
+			const carried = carriedPredictions.get(startInput.sessionID), rerun = await reruns();
 			carriedPredictions.delete(startInput.sessionID);
-			if (!candidates.length || carried?.signature === signature && !carried.pending.size && !carried.abandoned) return undefined;
-			return {
-				id: `pattern:${startInput.turnID}`,
-				source: "pattern_aware",
-				revision: nextRevision(startInput.sessionID, startInput.turnID),
-				actions: planActions(candidates, store, data.schemaHashes, patternSettings.beamWidth),
-			};
+			const repeated = !candidates.length || carried?.signature === signature && !carried.pending.size && !carried.abandoned;
+			if (repeated && !rerun.length) return undefined;
+			return { id: `pattern:${startInput.turnID}`, source: "pattern_aware", revision: nextRevision(startInput.sessionID, startInput.turnID),
+				actions: [...repeated ? [] : planActions(candidates, store, data.schemaHashes, patternSettings.beamWidth), ...rerun] };
 		}),
 		continueFrom: ({ startInput, data, settings, batch, signal }) => admit(settings, async (patternSettings) => {
 			await analysisTail;
@@ -235,7 +249,9 @@ export function createPatternPlanSource({
 				if (binding.available === false || binding.permissionHash !== action?.hash) continue;
 				const key = `${parentHash}:${binding.backend}:${binding.identity}`;
 				operationBindings.set(key, { key, parentHash, binding });
+				learnedCommands.set(parentHash, { parentHash, tool, input: structuredClone(concrete) });
 			}
+			if (actionSemantics.toolNames("workspace_mutation").includes(tool)) workspaceChanged = true;
 			const key = agentBatchKey(consumeInput.sessionID, consumeInput.turnID);
 			const batch = authoritativeBatches.get(key) ?? new Map();
 			const event: PatternAwareEventInput = {
@@ -247,19 +263,23 @@ export function createPatternPlanSource({
 			};
 			batch.set(order, event);
 			authoritativeBatches.set(key, batch);
-			// A closing turn drops these updates and the next turn predicts afresh: never hold turn closure for them.
-			if (!patternSettings.multiStepEnabled || signal?.aborted) return undefined;
-			await analysisTail;
-			if (signal?.aborted) return undefined;
-			const store = await resolveStore(patternSettings);
-			const ordered = [...batch.entries()].sort(([left], [right]) => left - right).map(([, item]) => item);
-			const candidates = store.predictAfterBatch(consumeInput.sessionID, ordered, data.schemaHashes, patternSettings);
-			const actions = planActions(candidates, store, data.schemaHashes, patternSettings.beamWidth);
-			// An observation can finish after its turn closes, or lose individual actions during admission.
-			const carried = { signature: patternPredictionSignature(candidates),
-				pending: new Set(actions.map((action) => action.feedback)), abandoned: false };
-			for (const action of actions) predictionBatches.set(action.feedback, carried);
-			carriedPredictions.set(consumeInput.sessionID, carried);
+			// A closing turn drops these updates and the next turn predicts afresh (a rerun then goes with it): never hold turn closure for them.
+			const rerun = signal?.aborted ? [] : await reruns();
+			if (!patternSettings.multiStepEnabled && !rerun.length || signal?.aborted) return undefined;
+			let actions = rerun;
+			if (patternSettings.multiStepEnabled) {
+				await analysisTail;
+				if (signal?.aborted) return undefined;
+				const store = await resolveStore(patternSettings);
+				const ordered = [...batch.entries()].sort(([left], [right]) => left - right).map(([, item]) => item);
+				const candidates = store.predictAfterBatch(consumeInput.sessionID, ordered, data.schemaHashes, patternSettings);
+				const predicted = planActions(candidates, store, data.schemaHashes, patternSettings.beamWidth);
+				// An observation can finish after its turn closes, or lose individual actions during admission.
+				const carried = { signature: patternPredictionSignature(candidates), pending: new Set(predicted.map((action) => action.feedback)), abandoned: false };
+				for (const action of predicted) predictionBatches.set(action.feedback, carried);
+				carriedPredictions.set(consumeInput.sessionID, carried);
+				actions = [...predicted, ...rerun];
+			}
 			// Its own namespace never supersedes the turn's still-pending predictions; the runtime's revision covers continuations.
 			const id = `pattern:${consumeInput.turnID}:after`, minimum = nextRevision(consumeInput.sessionID, id);
 			const revision = reserveRevision?.(id, minimum) ?? minimum;
@@ -268,6 +288,7 @@ export function createPatternPlanSource({
 		}),
 		onAdmitted: ({ feedback }) => {
 			if (lifecycle.sealed) return;
+			if (feedback === issuedRerun) issuedRerun = undefined;
 			const context = asPatternPlanFeedback(feedback);
 			if (context) predictionBatches.get(context)?.pending.delete(context);
 		},
@@ -305,11 +326,8 @@ export function createPatternPlanSource({
 		const patternSettings = settings.enabled ? sourceSettings(settings) : undefined;
 		if (!patternSettings?.enabled || lifecycle.sealed) { carriedPredictions.delete(startInput.sessionID); return; }
 		// Only a completed turn contributes its authoritative batch; entry discards any stale batch.
-		const events = terminal !== undefined && batch?.size
-			? [...batch.entries()].sort(([left], [right]) => left - right).map(([, event]) => event)
-			: [];
-		analysisTail = analysisTail
-			.then(() => new Promise<void>(setImmediate))
+		const events = terminal !== undefined && batch?.size ? [...batch.entries()].sort(([left], [right]) => left - right).map(([, event]) => event) : [];
+		analysisTail = analysisTail.then(() => new Promise<void>(setImmediate))
 			.then(async () => {
 				const store = await resolveStore(patternSettings);
 				if (events.length) store.observeBatch(events);
@@ -363,8 +381,7 @@ export function patternPlanActionID(actionIdentity: string, parentActionID = "ro
 
 function patternPredictionSignature(candidates: readonly PatternAwareCandidate[]): string {
 	return JSON.stringify(
-		candidates
-			.map((candidate) => [candidate.actionIdentity, candidate.horizon, candidate.latestHorizon] as const)
+		candidates.map((candidate) => [candidate.actionIdentity, candidate.horizon, candidate.latestHorizon] as const)
 			.sort(([left], [right]) => left.localeCompare(right)),
 	);
 }
@@ -437,8 +454,7 @@ function extractOutputPaths(
 			.flatMap((match) => match[2] || /[\\/]/u.test(match[1]!) ? [diff ? match[1]!.replace(/^[ab]\//u, "") : match[1]!] : []);
 		return named.length ? [...new Set(named)].slice(0, 32) : undefined;
 	}
-	const paths = text
-		.split(/\r?\n/)
+	const paths = text.split(/\r?\n/)
 		.map((line) => {
 			const trimmed = line.trim();
 			if (!trimmed || trimmed.startsWith("[") || /^No files found\b/.test(trimmed)) return undefined;

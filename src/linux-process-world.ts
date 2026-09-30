@@ -40,7 +40,8 @@ export function createLinuxProcessExecutionWorld(
 				const current = reference.deref();
 				return current ? (overheads.deref()?.get(current) ?? 0) + current.executionMs : 0;
 			},
-			get available() { return reference.deref()?.available ?? false; } });
+			get available() { return reference.deref()?.available ?? false; },
+			stale: () => { const current = reference.deref(); return current ? backend.bindingStale(current) : Promise.resolve(true); } });
 		operations.set(descriptor, { binding: reference, permissionKey: permission.key });
 		return descriptor;
 	};
@@ -48,8 +49,7 @@ export function createLinuxProcessExecutionWorld(
 		const operation = (action.executionContext as ToolInvocation | undefined)?.operation;
 		if (!operation) return undefined;
 		const issued = operations.get(operation.binding), binding = issued?.binding.deref();
-		if (!binding?.available || operation.permission.key !== issued?.permissionKey)
-			throw new Error("internal process binding is unavailable");
+		if (!binding?.available || operation.permission.key !== issued?.permissionKey) throw new Error("internal process binding is unavailable");
 		return binding;
 	};
 	const qualifiedDrivers = new Map<string, Awaited<ReturnType<WorkspaceSandboxService["qualify"]>>>();
@@ -78,15 +78,12 @@ export function createLinuxProcessExecutionWorld(
 				if (request.action) operationFor(request.action);
 				const [processFingerprint, workspaceFingerprint] = await Promise.all([
 					backend.fingerprint(),
-					invocation?.cwd
-						? qualify(invocation.cwd).then((selected) => selected.fingerprint)
-						: workspaceSandbox.fingerprint(workspaceOptions),
+					invocation?.cwd ? qualify(invocation.cwd).then((selected) => selected.fingerprint) : workspaceSandbox.fingerprint(workspaceOptions),
 				]);
 				return `${processFingerprint}:${workspaceFingerprint}`;
 			},
 			diagnostics: async ({ cwd, refresh }) => {
-				if (!refresh && !backendChecked)
-					return { state: "registered" as const, detail: "Checked on first process fork" };
+				if (!refresh && !backendChecked) return { state: "registered" as const, detail: "Checked on first process fork" };
 				backendChecked = true;
 				const [status, store] = await Promise.all([backend.check(refresh), backend.store.stats(refresh)]);
 				const storage = {
@@ -113,11 +110,7 @@ export function createLinuxProcessExecutionWorld(
 				if (status.state !== "ready") throw new Error(status.detail);
 				roots.add(path.resolve(cwd));
 				const selected = await qualify(cwd);
-				const prepared = await workspaceSandbox.prepare(cwd, {
-					...workspaceOptions,
-					driver: selected.driver,
-					...(signal ? { signal } : {}),
-				});
+				const prepared = await workspaceSandbox.prepare(cwd, { ...workspaceOptions, driver: selected.driver, ...(signal ? { signal } : {}) });
 				qualifiedDrivers.set(path.resolve(cwd), prepared);
 			},
 			execute: (context) => backend.withProducer(async () => {
@@ -157,7 +150,7 @@ export function createLinuxProcessExecutionWorld(
 						invocation,
 						...(context.executionScope ? { scope: context.executionScope } : {}),
 						signal: context.signal,
-						onOperationAdopted: operation ? context.onOperationAdopted : undefined,
+						onOperationAdopted: context.onOperationAdopted,
 						acceptOperationScope: context.acceptOperationScope,
 					});
 					const executor = session.executor;
@@ -220,10 +213,7 @@ function processInvocation(value: unknown): ToolInvocation["process"] | undefine
 	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
 	const processValue = (value as ToolInvocation).process;
 	if (
-		!processValue ||
-		typeof processValue.command !== "string" ||
-		typeof processValue.cwd !== "string" ||
-		typeof processValue.shell !== "string" ||
+		!processValue || typeof processValue.command !== "string" || typeof processValue.cwd !== "string" || typeof processValue.shell !== "string" ||
 		!Array.isArray(processValue.shellArgs) ||
 		(processValue.commandTransport !== "argv" && processValue.commandTransport !== "stdin")
 	) {

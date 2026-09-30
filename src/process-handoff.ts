@@ -125,8 +125,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 	/** Keep secrets only with their existing handoff owner; the returned capability contains no raw arguments. */
 	bind(key: Sha256Digest, handoff: ProcessHandoff, invocation: Invocation): ProcessExecutionBinding | undefined {
 		const record = this.byKey.get(key)?.get(handoff);
-		if (!record || record.state.status === "running" || record.state.candidate?.weakKey !== key ||
-			!record.state.candidate.dependencyCertificate.complete) return;
+		if (!record || record.state.status === "running" || record.state.candidate?.weakKey !== key || !record.state.candidate.dependencyCertificate.complete) return;
 		return this.retainBinding(key, record, invocation, record.state.candidate.result.observedProcessMs ?? 0);
 	}
 
@@ -166,6 +165,12 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		this.retainedBytes += bytes;
 		this.trim();
 		return this.invocations.has(binding) ? binding : undefined;
+	}
+
+	/** Results of `key` this session produced, newest first: what a run of it could still reuse, never an adoption. */
+	results(key: Sha256Digest, scope: ExecutionScope): readonly ProcessProvenanceCertificate[] {
+		return [...this.byKey.get(key)?.values() ?? []].reverse().flatMap(record =>
+			record.state.status !== "running" && record.state.candidate && record.scope?.sessionID === scope.sessionID ? [record.state.candidate] : []);
 	}
 
 	bindings(scope: ExecutionScope): readonly ProcessExecutionBinding[] {
