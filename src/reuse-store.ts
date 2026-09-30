@@ -357,16 +357,13 @@ function inventoryStats(inventory: StoreInventory, limits: ProvenanceStoreLimits
 		orphanArtifacts: [...inventory.artifacts.keys()].filter((digest) => !referenced.has(digest)).length,
 		totalBytes: certificateBytes + artifactBytes,
 		overBudget:
-			inventory.certificates.length > limits.maxCertificates ||
-			certificateBytes + artifactBytes > limits.maxBytes,
+			inventory.certificates.length > limits.maxCertificates || certificateBytes + artifactBytes > limits.maxBytes,
 	});
 }
 
 async function filesUnder(root: string): Promise<readonly string[]> {
 	try {
-		return (await readdir(root, { recursive: true, withFileTypes: true }))
-			.filter((entry) => entry.isFile())
-			.map((entry) => path.join(entry.parentPath, entry.name));
+		return (await readdir(root, { recursive: true, withFileTypes: true })).filter((entry) => entry.isFile()).map((entry) => path.join(entry.parentPath, entry.name));
 	} catch (error) { if (missing(error)) return []; throw error; }
 }
 

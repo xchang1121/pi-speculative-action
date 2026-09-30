@@ -454,9 +454,10 @@ async function commitSandboxExecution(state: WorkspaceSandboxState, execution: S
 						staged.set(change, await stageAtomicWrite(change.after, change.afterMode, change.root));
 					}
 				});
-				await restoreModifiedTimes([...staged].map(([change, temporary]) => [temporary, change.afterModified]));
-				const validationStarted = performance.now();
-				for (const change of changes) {
+				// The staged files take their times while every target is checked, concurrently; nothing moves before both finish.
+				const timed = restoreModifiedTimes([...staged].map(([change, temporary]) => [temporary, change.afterModified])), validationStarted = performance.now();
+				timed.catch(() => undefined);
+				await mapFilesystem(changes, async (change) => {
 					// A file whose identity still stands for the bytes this change replaces needs no rereading to prove them.
 					const unchanged = change.kind !== "directory" && change.beforeIdentity && change.before
 						? await lstat(change.target, { bigint: true }).then(info => fileIdentity(info) === change.beforeIdentity ? info : undefined, () => undefined) : undefined;
@@ -486,7 +487,8 @@ async function commitSandboxExecution(state: WorkspaceSandboxState, execution: S
 							}
 						}
 					}
-				}
+				});
+				await timed;
 				for (const change of changes) if (change.kind !== "directory" && change.object) {
 					const reference = change.object, key = `${Number(reference.before)}:${reference.path}`;
 					const source = changes.find(candidate => candidate.target === reference.path);
