@@ -1,3 +1,4 @@
+import { BoundedRecencyMap } from "./bounded-recency-map.ts";
 import { widenReadGuess } from "./action-semantics.ts";
 import { calculateContextTokens, estimateContextTokens, type AgentToolCall } from "@earendil-works/pi-agent-core";
 import { clampThinkingLevel, type Api, type AssistantMessage, type Context, type Model, type SimpleStreamOptions, type ToolResultMessage } from "@earendil-works/pi-ai";
@@ -14,6 +15,7 @@ interface DrafterBatch {
 	readonly options: SimpleStreamOptions & { readonly toolChoice?: "auto" | "required" };
 	readonly utility: DrafterUtilityBatch;
 	readonly tools: ReadonlySet<string>;
+	readonly schemaHashes: Readonly<Record<string, string>>;
 }
 
 interface DrafterPlanFeedback extends DrafterBatch {
@@ -80,9 +82,14 @@ export function createDrafterPlanSource(input: {
 }): DrafterPlanSourceController {
 	const batches = new Map<string, DrafterPreparation>();
 	const gate = new DrafterUtilityGate();
-	// Beta(1, 1) posterior of how often the Actor made each tool's predicted call, from this session's observed settlements.
-	const calibration = new Map<string, { observed: number; matched: number }>();
-	const hitProbability = (tool: string) => ((calibration.get(tool)?.matched ?? 0) + 1) / ((calibration.get(tool)?.observed ?? 0) + 2);
+	// Separate Beta(1, 1) estimates for matching and adoption, scoped to the model and tool contract.
+	const calibration = new BoundedRecencyMap<string, { observed: number; matched: number; eligible: number; adopted: number }>(128);
+	const calibrationKey = (batch: DrafterBatch, tool: string) => JSON.stringify([batch.utility.key, tool, batch.schemaHashes[tool]]);
+	const probabilities = (batch: DrafterBatch, tool: string) => {
+		const counts = calibration.get(calibrationKey(batch, tool));
+		return { empiricalProbability: ((counts?.matched ?? 0) + 1) / ((counts?.observed ?? 0) + 2),
+			adoptionProbability: ((counts?.adopted ?? 0) + 1) / ((counts?.eligible ?? 0) + 2) };
+	};
 	const finishBatch = (key: string) => {
 		const batch = batches.get(key);
 		batches.delete(key);
@@ -108,7 +115,7 @@ export function createDrafterPlanSource(input: {
 			const feedback: DrafterPlanFeedback = { ...batch, kind: "drafter_plan", message, depth,
 				calls: new Map(kept.map((call, index) => [`${prefix}:${index}`, call])), results: new Map(), claimed: kept.length < calls.length };
 			return { actions: [...feedback.calls].map(([id, call]): PlanAction => ({
-				id, type: "tool_call", tool: call.name, input: widenReadGuess(call.name, call.arguments), depth, feedback, dependsOn, empiricalProbability: hitProbability(call.name),
+				id, type: "tool_call", tool: call.name, input: widenReadGuess(call.name, call.arguments), depth, feedback, dependsOn, ...probabilities(batch, call.name),
 				diagnostic: JSON.stringify({ toolCallID: call.id, tool: call.name, input: call.arguments }, null, 2),
 			})) };
 		} catch (error) {
@@ -121,11 +128,20 @@ export function createDrafterPlanSource(input: {
 	const source: AgentPlanSource = {
 		id: "drafter",
 		onSettled: ({ actionID, feedback, settlement }) => {
-			const tool = asDrafterPlanFeedback(feedback)?.calls.get(actionID)?.name;
-			if (!tool || settlement.observation !== "observed") return;
-			const counts = calibration.get(tool) ?? calibration.set(tool, { observed: 0, matched: 0 }).get(tool)!;
+			const batch = asDrafterPlanFeedback(feedback), tool = batch?.calls.get(actionID)?.name;
+			if (!batch || !tool || settlement.observation !== "observed") return;
+			const key = calibrationKey(batch, tool);
+			let counts = calibration.get(key);
+			if (!counts) { counts = { observed: 0, matched: 0, eligible: 0, adopted: 0 }; calibration.set(key, counts); }
 			counts.observed++;
 			counts.matched += Number(settlement.match.matched);
+			if (settlement.match.matched) {
+				const adoption = settlement.match.adoption;
+				// Deliberate Actor calibration supplies timing evidence, not evidence that this result was unusable.
+				if (adoption.status === "rejected" && adoption.cause.code === "candidate_calibration_sample") return;
+				counts.eligible++;
+				counts.adopted += Number(adoption.status === "adopted");
+			}
 		},
 		enabled: (settings) => settings.drafterEnabled ?? DEFAULTS.drafterEnabled,
 		timeoutMs: (settings) => settings.predictionTimeoutMs,
@@ -175,7 +191,7 @@ export function createDrafterPlanSource(input: {
 					// Inherit transport options, while the Drafter owns its reasoning and output budget.
 					const { maxTokens: _actorMaxTokens, reasoning: requestedReasoning, ...requestOptions } = configuredDraftOptions ?? {};
 					const reasoning = clampThinkingLevel(model, getDraftOptions ? requestedReasoning ?? "off" : "off");
-					return { model, context, options: { ...requestOptions, reasoning: reasoning === "off" ? undefined : reasoning }, utility, tools };
+					return { model, context, options: { ...requestOptions, reasoning: reasoning === "off" ? undefined : reasoning }, utility, tools, schemaHashes: { ...data.schemaHashes } };
 				});
 				batches.set(batchKey, batch);
 			}
