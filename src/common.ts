@@ -10,6 +10,9 @@ export interface DrafterRequestSettings {
 	readonly drafterMaxDepth: number;
 	/** Output cap for each Drafter request: one proposed tool batch never needs the Actor's answer budget. */
 	readonly drafterMaxTokens: number;
+	/** Cumulative request and input/output token budgets for one user task. */
+	readonly drafterTaskMaxRequests: number;
+	readonly drafterTaskMaxTokens: number;
 	/** Number of leading Drafter requests sent at temperature zero. */
 	readonly drafterDeterministicCandidates: number;
 	/** Inclusive temperature range stratified across the remaining requests. */
@@ -22,6 +25,8 @@ export interface DrafterRequestSettings {
 const DRAFTER_DEFAULTS: DrafterRequestSettings = {
 	drafterMaxDepth: 1,
 	drafterMaxTokens: 4096,
+	drafterTaskMaxRequests: 32,
+	drafterTaskMaxTokens: 262_144,
 	drafterDeterministicCandidates: 1,
 	drafterTemperatureMin: 0.7,
 	drafterTemperatureMax: 0.7,
@@ -68,6 +73,8 @@ export function normalizeDrafterRequestSettings(value: unknown): DrafterRequestS
 	return {
 		drafterMaxDepth: nonNegativeInteger(input.drafterMaxDepth, DEFAULTS.drafterMaxDepth),
 		drafterMaxTokens: positiveInteger(input.drafterMaxTokens, DEFAULTS.drafterMaxTokens),
+		drafterTaskMaxRequests: positiveInteger(input.drafterTaskMaxRequests, DEFAULTS.drafterTaskMaxRequests),
+		drafterTaskMaxTokens: positiveInteger(input.drafterTaskMaxTokens, DEFAULTS.drafterTaskMaxTokens),
 		drafterDeterministicCandidates: nonNegativeInteger(
 			input.drafterDeterministicCandidates,
 			DEFAULTS.drafterDeterministicCandidates,

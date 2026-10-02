@@ -1,8 +1,9 @@
 import { BoundedRecencyMap } from "./bounded-recency-map.ts";
 import { widenReadGuess } from "./action-semantics.ts";
-import { calculateContextTokens, estimateContextTokens, type AgentToolCall } from "@earendil-works/pi-agent-core";
+import { calculateContextTokens, type AgentToolCall } from "@earendil-works/pi-agent-core";
 import { clampThinkingLevel, type Api, type AssistantMessage, type Context, type Model, type SimpleStreamOptions, type ToolResultMessage } from "@earendil-works/pi-ai";
-import { clampCandidateLimit, DEFAULTS, drafterRequestTemperature, normalizeDrafterRequestSettings } from "./common.ts";
+import { clampCandidateLimit, DEFAULTS, drafterRequestTemperature, normalizeDrafterRequestSettings, type DrafterRequestSettings } from "./common.ts";
+import { DrafterTaskBudget, drafterInputTokens, type DrafterBudgetSnapshot } from "./drafter-budget.ts";
 import { DrafterUtilityGate, type DrafterUtilityBatch, type DrafterUtilityGateSnapshot } from "./drafter-utility-gate.ts";
 import { agentBatchKey, type AgentPlanSource, type DraftModelSelection, type DraftOptionsContext } from "./agent-runtime-types.ts";
 import type { PlanAction, PlanProposal } from "./plan-proposal.ts";
@@ -14,8 +15,10 @@ interface DrafterBatch {
 	readonly context: Context;
 	readonly options: SimpleStreamOptions & { readonly toolChoice?: "auto" | "required" };
 	readonly utility: DrafterUtilityBatch;
+	readonly budgetPolicy: DrafterRequestSettings;
 	readonly tools: ReadonlySet<string>;
 	readonly schemaHashes: Readonly<Record<string, string>>;
+	readonly prepareExecution?: () => void;
 	readonly expansion: { readonly key: string; readonly stages: Map<string, DrafterUtilityBatch>; finished: boolean };
 	readonly marginalUtilities?: readonly DrafterUtilityBatch[];
 }
@@ -65,7 +68,7 @@ class DrafterPreparation {
 
 export interface DrafterPlanSourceController {
 	readonly source: AgentPlanSource;
-	readonly snapshot: () => DrafterUtilityGateSnapshot;
+	readonly snapshot: () => DrafterUtilityGateSnapshot & { readonly budget: DrafterBudgetSnapshot };
 	readonly finishTurn: (sessionID: string, turnID: string) => void;
 	readonly actorActionSettled: (feedback: ActorActionFeedback<string>) => Promise<void>;
 	readonly finishSession: () => void;
@@ -79,10 +82,13 @@ export function createDrafterPlanSource(input: {
 	readonly getDraftOptions?: (context: DraftOptionsContext) => SimpleStreamOptions | Promise<SimpleStreamOptions>;
 	/** Provider completion used by the drafter. */
 	readonly complete: (model: Model<Api>, context: Context, options?: SimpleStreamOptions) => Promise<AssistantMessage>;
+	/** Share this ledger with other model Drafter requests in the same user task. */
+	readonly drafterBudget?: DrafterTaskBudget;
 	readonly patternHints?: (input: { readonly sessionID: string; readonly schemaHashes: Readonly<Record<string, string>>; readonly settings: SpeculativeActionSettings })
 		=> Promise<readonly { readonly tool: string; readonly input: Readonly<Record<string, unknown>> }[]>;
 }): DrafterPlanSourceController {
 	const batches = new Map<string, DrafterPreparation>();
+	const budget = input.drafterBudget ?? new DrafterTaskBudget();
 	const gate = new DrafterUtilityGate();
 	const expansionGate = new DrafterUtilityGate();
 	// Separate Beta(1, 1) estimates for matching and adoption, scoped to the model and tool contract.
@@ -119,13 +125,17 @@ export function createDrafterPlanSource(input: {
 				batch.expansion.stages.set(stage, marginal);
 			}
 			if (!marginal.allowed) return undefined;
-			expansionGate.requestStarted(marginal);
 		}
-		gate.requestStarted(batch.utility);
-		let failed = false;
+		let failed = false, started = false;
 		try {
 			const { options } = batch, forced = options.toolChoice === "required" ? { onPayload: forceToolChoice(options.onPayload) } : {};
-			const message = await input.complete(batch.model, batch.context, { ...options, ...forced, signal });
+			const message = await budget.run({ model: batch.model, context: batch.context, options: { ...options, ...forced, signal },
+				policy: batch.budgetPolicy, complete: input.complete, started: () => {
+					if (!batch.utility.startedRequests) batch.prepareExecution?.();
+					started = true; gate.requestStarted(batch.utility);
+					if (marginal) expansionGate.requestStarted(marginal);
+				} });
+			if (!message) return undefined;
 			report?.(calculateContextTokens(message.usage));
 			if (message.stopReason === "error" || message.stopReason === "aborted")
 				throw new Error(message.errorMessage ?? `Drafter stopped with ${message.stopReason}`);
@@ -144,8 +154,10 @@ export function createDrafterPlanSource(input: {
 			failed = !signal.aborted;
 			throw error;
 		} finally {
-			gate.requestSettled(batch.utility, failed);
-			if (marginal) expansionGate.requestSettled(marginal, failed);
+			if (started) {
+				gate.requestSettled(batch.utility, failed);
+				if (marginal) expansionGate.requestSettled(marginal, failed);
+			}
 		}
 	};
 	const source: AgentPlanSource = {
@@ -193,6 +205,7 @@ export function createDrafterPlanSource(input: {
 		propose: async ({ startInput, data, candidateNames, proposalIndex, proposalCount, signal, settings, reportDraftTokens }): Promise<PlanProposal | undefined> => {
 			if (signal.aborted) return undefined;
 			const drafter = normalizeDrafterRequestSettings(settings.sourceConfig);
+			if (!budget.available(drafter)) return undefined;
 			const batchKey = agentBatchKey(startInput.sessionID, startInput.turnID);
 			let batch = batches.get(batchKey);
 			if (!batch) {
@@ -215,7 +228,8 @@ export function createDrafterPlanSource(input: {
 					const { maxTokens: _actorMaxTokens, reasoning: requestedReasoning, ...requestOptions } = configuredDraftOptions ?? {};
 					const reasoning = clampThinkingLevel(model, getDraftOptions ? requestedReasoning ?? "off" : "off");
 					const schemaHashes = { ...data.schemaHashes };
-					return { model, context, options: { ...requestOptions, reasoning: reasoning === "off" ? undefined : reasoning }, utility, tools, schemaHashes,
+					return { model, context, options: { ...requestOptions, reasoning: reasoning === "off" ? undefined : reasoning }, utility, budgetPolicy: drafter, tools, schemaHashes,
+						prepareExecution: () => data.prepareExecution?.(candidateNames, signal),
 						expansion: { key: JSON.stringify([utility.key, Object.entries(schemaHashes).sort(([a], [b]) => a.localeCompare(b))]), stages: new Map(), finished: false } };
 				});
 				batches.set(batchKey, batch);
@@ -231,12 +245,11 @@ export function createDrafterPlanSource(input: {
 					sessionId: prepared.options.sessionId ?? input.sessionID,
 					cacheRetention: prepared.options.cacheRetention ?? "short",
 				};
-				if (!prepared.utility.startedRequests) data.prepareExecution?.(candidateNames, batch.signal);
 				const draft = await completeDraft({ ...prepared, options: draftOptions }, signal, reportDraftTokens, String(proposalIndex), 0, undefined, proposalIndex);
 				return draft && { id: `drafter:${startInput.turnID}:${proposalIndex}`, source: "drafter", revision: 0, ...draft };
 			});
 		},
-		continue: async ({ proposalID, revision, feedback, signal, reportDraftTokens }) => {
+		continue: async ({ proposalID, revision, feedback, signal, reportDraftTokens, settings }) => {
 			const previous = asDrafterPlanFeedback(feedback);
 			if (!previous || signal.aborted || previous.claimed || previous.results.size !== previous.calls.size) return undefined;
 			previous.claimed = true;
@@ -247,7 +260,7 @@ export function createDrafterPlanSource(input: {
 			};
 			const options = { ...previous.options, toolChoice: "auto" as const };
 			if (!drafterContextFits(previous.model, context, options.maxTokens)) return undefined;
-			const draft = await completeDraft({ ...previous, context, options }, signal, reportDraftTokens, `rollout:${revision}`, previous.depth + 1,
+			const draft = await completeDraft({ ...previous, context, options, budgetPolicy: normalizeDrafterRequestSettings(settings.sourceConfig) }, signal, reportDraftTokens, `rollout:${revision}`, previous.depth + 1,
 				[...previous.calls.keys()].map((actionID) => ({ actionID, condition: "execution_succeeded" })));
 			return draft && { proposalID, source: "drafter", revision, upsert: draft.actions };
 		},
@@ -264,7 +277,7 @@ export function createDrafterPlanSource(input: {
 			const options = { ...prepared.options, temperature: drafterRequestTemperature(0, 1, drafter), maxTokens: drafter.drafterMaxTokens, toolChoice: "auto" as const };
 			if (!drafterContextFits(prepared.model, context, options.maxTokens)) return undefined;
 			const id = `drafter:peer:${stableValueHash(peers.map(({ identity }) => identity.id))}`;
-			const draft = await completeDraft({ ...prepared, context, options }, signal, reportDraftTokens, id, 1, peers.map(({ identity }) =>
+			const draft = await completeDraft({ ...prepared, context, options, budgetPolicy: drafter }, signal, reportDraftTokens, id, 1, peers.map(({ identity }) =>
 				({ proposalID: identity.proposalID, actionID: identity.actionID, identity: identity.id, condition: "execution_succeeded" as const })));
 			return draft && { id, source: "drafter", revision: 0, actions: draft.actions };
 		},
@@ -272,7 +285,7 @@ export function createDrafterPlanSource(input: {
 
 	return {
 		source,
-		snapshot: () => gate.snapshot(),
+		snapshot: () => ({ ...gate.snapshot(), budget: budget.snapshot() }),
 		finishTurn: (sessionID, turnID) => finishBatch(agentBatchKey(sessionID, turnID)),
 		actorActionSettled: async ({ settlement, candidate, candidateFeedback, sessionID, turnID }) => {
 			const sources = new Set(settlement.matchedPredictions.map((prediction) => prediction.source));
@@ -284,7 +297,7 @@ export function createDrafterPlanSource(input: {
 			// Descendants credit the extra root/depth that made them possible, once per stage and Actor settlement.
 			for (const marginal of owner?.marginalUtilities ?? []) expansionGate.creditAdoption(marginal, settlement.provider.timing, sources.size);
 		},
-		finishSession: () => { for (const key of batches.keys()) finishBatch(key); },
+		finishSession: () => { for (const key of batches.keys()) finishBatch(key); budget.finishTask(); },
 	};
 }
 
@@ -300,13 +313,8 @@ const FORCED_TOOL_CHOICE: Readonly<Record<string, unknown>> = { "anthropic-messa
 
 /** Preserve the Actor-visible history whole; a shorter Drafter skips instead of compacting it. */
 function drafterContextFits(model: Model<Api>, context: Context, maxTokens: number | undefined): boolean {
-	const estimate = estimateContextTokens(context.messages);
-	const staticPrompt =
-		estimate.lastUsageIndex === null
-			? Math.ceil(((context.systemPrompt?.length ?? 0) + JSON.stringify(context.tools ?? []).length) / 4)
-			: 0;
 	const output = Math.min(maxTokens ?? model.maxTokens, model.maxTokens);
-	return estimate.tokens + staticPrompt + output <= model.contextWindow;
+	return drafterInputTokens(context) + output <= model.contextWindow;
 }
 
 function asDrafterPlanFeedback(value: unknown): DrafterPlanFeedback | undefined {
