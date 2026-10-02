@@ -1,5 +1,5 @@
-import { certificateReplayable, dependencyPathsetKey, type DynamicDependencyCertificate, isSha256Digest, ONE_SHOT_TAINTS, type ProcessProducerProof, processStrongKey,
-	type ProcessProvenanceCertificate, type ProvenanceTaint, referencedArtifacts, sealProcessCertificate, type Sha256Digest } from "./provenance-certificate.ts";
+import { certificateReplayable, dependencyPathsetKey, type DynamicDependencyCertificate, isSha256Digest, type ProcessProducerProof, processStrongKey,
+	type ProcessProvenanceCertificate, type ProvenanceTaint, referencedArtifacts, type Sha256Digest } from "./provenance-certificate.ts";
 import { type ProvenanceValidation, type ProvenanceValidationContext, validateDynamicDependencyCertificate } from "./provenance-validation.ts";
 import { ProvenanceCertificateStore, type VerifiedArtifactClosure } from "./reuse-store.ts";
 
@@ -120,14 +120,8 @@ export class ProcessReusePlanner {
 	}
 
 	/** Publish unmatched replayable executions so useful work survives branch discard. */
-	async publishCompleted(certificate: ProcessProvenanceCertificate, acceptedTaints: readonly ProvenanceTaint[] = [], witnessRepeats = false): Promise<boolean> {
-		if (certificate.result.continuation) return false;
-		if (certificateReplayable(certificate, acceptedTaints)) return this.store.put(certificate);
-		// Held back only by inputs every process may read: a second, distinct run of the same inputs producing the same result shows
-		// they never reached it, and the certificate is sealed again without them.
-		if (!witnessRepeats || !certificateReplayable(certificate, [...acceptedTaints, ...ONE_SHOT_TAINTS]) || !(await this.store.witness(certificate))) return false;
-		return this.store.put(sealProcessCertificate({ ...certificate, dependencyCertificate: { ...certificate.dependencyCertificate,
-			taints: certificate.dependencyCertificate.taints.filter((taint) => !ONE_SHOT_TAINTS.includes(taint)) } }));
+	async publishCompleted(certificate: ProcessProvenanceCertificate, acceptedTaints: readonly ProvenanceTaint[] = []): Promise<boolean> {
+		return !certificate.result.continuation && certificateReplayable(certificate, acceptedTaints) && this.store.put(certificate);
 	}
 }
 

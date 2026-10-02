@@ -12,8 +12,6 @@ export interface SpeculativeActionPackageSettings extends SpeculativeAgentSettin
 	readonly draftModel?: string;
 	readonly executionStoreMaxEntries?: number;
 	readonly executionStoreMaxBytes?: number;
-	/** Repeat a command's stored result once two distinct runs of the same inputs agree on it (default on). */
-	readonly executionRepeatByWitness?: boolean;
 	readonly executionRouting?: ExecutionRoutingSettings;
 	/** Explicit Actor and speculative search semantics; native Pi remains the default. */
 	readonly searchExecution?: "native" | "captured";

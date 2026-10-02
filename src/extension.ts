@@ -146,7 +146,6 @@ export function normalizeSpeculativeActionSettings(
 		...(typeof input?.draftModel === "string" && input.draftModel.trim() ? { draftModel: input.draftModel.trim() } : {}),
 		executionStoreMaxEntries: positiveInteger(input?.executionStoreMaxEntries, DEFAULT_PROVENANCE_STORE_LIMITS.maxCertificates),
 		executionStoreMaxBytes: positiveInteger(input?.executionStoreMaxBytes, DEFAULT_PROVENANCE_STORE_LIMITS.maxBytes),
-		executionRepeatByWitness: input?.executionRepeatByWitness !== false,
 		executionRouting: { primary: input?.executionRouting?.primary !== false, nativeFallback: input?.executionRouting?.nativeFallback !== false },
 	} as const;
 }
@@ -318,8 +317,7 @@ async function installController(
 		cwd: context.cwd,
 		autoResizeImages: piToolSettings.autoResizeImages,
 	}) ?? [];
-	const processBackend = new LinuxProcessReuseBackend({ storeRoot: path.join(getAgentDir(), "speculative-action", "process-reuse"),
-		witnessRepeats: () => currentSettings.executionRepeatByWitness });
+	const processBackend = new LinuxProcessReuseBackend({ storeRoot: path.join(getAgentDir(), "speculative-action", "process-reuse") });
 	const shell = getShellConfig(piToolSettings.shellPath);
 	const actorReplayEnabled = () => currentSettings.enabled;
 	const rawProcessExecutor = adaptProcessToolOperations(createLocalBashOperations({ shellPath: shell.shell }));
@@ -915,7 +913,7 @@ function openPatternAwareSettings(
 function openSchedulingAndCache(ctx: ExtensionContext, controller: SpeculativeActionController): Promise<void> {
 	return runActionMenuLoop(ctx, "Scheduling and storage", () => {
 		const settings = controller.settings();
-		const { input, toggle } = settingActions(ctx, settings, ROOT_SETTING_INPUTS, controller.setSettings);
+		const { input } = settingActions(ctx, settings, ROOT_SETTING_INPUTS, controller.setSettings);
 		const actions = new Map<string, MenuAction>([
 			input("maxConcurrentActions"),
 			input("predictionTimeoutMs", "Prediction wait limit", formatDuration),
@@ -923,7 +921,6 @@ function openSchedulingAndCache(ctx: ExtensionContext, controller: SpeculativeAc
 			input("resourceCacheMaxBytes", "Live result memory", formatBytes),
 			input("executionStoreMaxEntries"),
 			input("executionStoreMaxBytes", "Reusable command history memory", formatBytes),
-			toggle("executionRepeatByWitness", "Repeat a command's result once two runs agree"),
 		]);
 		for (const [label, operation] of [["Reclaim", "gc"], ["Clear", "clear"]] as const) actions.set(`${label} reusable command history`, async () => {
 			if (operation === "clear" && !(await ctx.ui.confirm("Clear reusable command history?", "Delete all reusable command results and file effects? This cannot be undone."))) return;

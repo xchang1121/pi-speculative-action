@@ -59,8 +59,6 @@ const TRANSFERRED_INPUT_TAINTS = new Set<ProvenanceTaint>(ONE_SHOT_TAINTS);
 export interface LinuxProcessBackendOptions {
 	readonly storeRoot: string;
 	readonly store?: ProvenanceStoreOptions;
-	/** Whether two distinct runs agreeing on a result make it repeatable despite the one-shot inputs every process may read. */
-	readonly witnessRepeats?: () => boolean;
 	readonly sandlockBinary?: string;
 	readonly straceBinary?: string;
 	readonly heldExecBinary?: string;
@@ -755,7 +753,7 @@ export class LinuxProcessReuseBackend {
 			dependencyCertificate: evidence,
 			result: await captureProcessResult(this.store, execution.outcome, execution.observedProcessMs, changes.map(change => ({ logicalPath: slash(change.target), change }))),
 		});
-		if (await this.planner.publishCompleted(certificate, SAME_CONFINEMENT_TAINTS, this.options.witnessRepeats?.())) this.add(session, "wholeCommandPublished");
+		if (await this.planner.publishCompleted(certificate, SAME_CONFINEMENT_TAINTS)) this.add(session, "wholeCommandPublished");
 	}
 
 	private serve(session: ActiveSession, socket: net.Socket): void {
@@ -1480,7 +1478,7 @@ export class LinuxProcessReuseBackend {
 						});
 						if (binding) session.executionBindings.set(requestID, binding);
 						stage = "history_publication";
-						return this.planner.publishCompleted(certificate, SAME_CONFINEMENT_TAINTS, this.options.witnessRepeats?.()).catch((error: unknown) => {
+						return this.planner.publishCompleted(certificate, SAME_CONFINEMENT_TAINTS).catch((error: unknown) => {
 							// Optional history storage cannot invalidate already sealed execution evidence.
 							this.setError(session, `nested_publish:${failureDetail(error)}`);
 							return false;
