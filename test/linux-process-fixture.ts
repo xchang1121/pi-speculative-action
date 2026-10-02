@@ -66,12 +66,7 @@ export async function createLinuxProcessBenchmark(
 	});
 	const localOperations = createLocalBashOperations({ shellPath });
 	// Fixture children are cheap stand-ins for the expensive children nested reuse serves.
-	const backend = new LinuxProcessReuseBackend({
-		storeRoot, cheapChildMs: 0, ...backendOptions,
-		...(process.env.PI_SPEC_SANDLOCK ? { sandlockBinary: process.env.PI_SPEC_SANDLOCK } : {}),
-		...(process.env.PI_SPEC_HELD_EXEC ? { heldExecBinary: process.env.PI_SPEC_HELD_EXEC } : {}),
-		...(process.env.PI_SPEC_STRACE ? { straceBinary: process.env.PI_SPEC_STRACE } : {}),
-	});
+	const backend = new LinuxProcessReuseBackend({ storeRoot, cheapChildMs: 0, ...backendOptions });
 	const coordinator = new ProcessExecutionCoordinator(
 		backend.completedReplayExecutor(adaptProcessToolOperations(localOperations), {
 			sourceRoot: workspace,
