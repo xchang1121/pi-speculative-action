@@ -2290,7 +2290,7 @@ export function makeSpeculativeActionRuntime<
 	const defaultResourceDemand = (session: Session, action: ActionKey | string, route?: SpeculativeExecutionRoute): number => {
 		const definition = semantics.definition(action);
 		const heavy = (route && route.isolation !== "resource_snapshot") || !definition || definition.effect === "unbounded" ||
-			definition.resourceScope === "tree_entries" || definition.resourceScope === "tree_content";
+			definition.resourceScope === "tree_entries" || definition.resourceScope === "tree_content" || definition.resourceScope === "captured_inputs";
 		return Math.min(concurrentLimit(session.settings), heavy ? 2 : 1);
 	};
 
