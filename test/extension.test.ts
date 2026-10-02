@@ -78,7 +78,7 @@ describe("zero-modification Pi extension", () => {
 	});
 
 	it("reports serialized counterfactual speedup independently of per-hit service credits", () => {
-		const timing = { endToEndMs: 1000, serializedMs: 1100, savingsMs: 300, hiddenLatencyMs: 100, toolExecutionMs: 400, toolWaitMs: 100 };
+		const timing = { endToEndMs: 1000, serializedMs: 1100, hiddenLatencyMs: 100, toolExecutionMs: 400 };
 		expect(formatSpeculativeActionEvent({ type: "task", sessionID: "s", turnID: "t", timing } as never)).toContain(
 			"1s wall; 1.1s serialized; End-to-End SpeedUp 1.10x; 100ms of 400ms tool time hidden");
 		for (const [wall, serial, ratio] of [[1000, 800, "0.80x"], [0, 0, "n/a"], [1000, NaN, "n/a"]] as const)

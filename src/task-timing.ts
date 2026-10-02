@@ -2,8 +2,6 @@ import { nonNegativeFinite as metric } from "./number-utils.ts";
 
 export interface TimelineDependency {
 	readonly computation: TimelineInterval;
-	/** Existing native-service evidence when the retained result has no original interval. */
-	readonly expectedActorMs?: number;
 	/** Parts already included in the enclosing execution, or spent waiting for this computation. */
 	readonly shared?: readonly TimelineInterval[];
 }
@@ -20,7 +18,6 @@ export class TimelineInterval {
 		this.completedAt = Math.max(this.startedAt, metric(completedAt));
 		if (inputs.length) dependencies.set(this, Object.freeze(inputs.map(input => Object.freeze({
 			computation: TimelineInterval.from(input.computation),
-			...(input.expectedActorMs === undefined ? {} : { expectedActorMs: metric(input.expectedActorMs) }),
 			shared: Object.freeze((input.shared ?? []).map(TimelineInterval.from)),
 		}))));
 		Object.freeze(this);
@@ -39,8 +36,6 @@ export class TaskTimeline {
 	private readonly actorPhases: number[] = [];
 	private readonly authoritativeTools: { readonly startedAt: number; readonly endpoints: readonly number[]; native: boolean }[] = [];
 	private readonly computations = new WeakMap<TimelineInterval, { native: boolean }>();
-	private savingsMs = 0;
-	private toolWaitMs = 0;
 	readonly startedAt: number;
 
 	constructor(startedAt: number) { this.startedAt = metric(startedAt); }
@@ -49,13 +44,13 @@ export class TaskTimeline {
 		this.actorPhases.push(startedAt, completedAt);
 	}
 
-	/** Call once per settled Actor operation; adoption includes its actual waiting and validation time. */
-	recordTool(interval: TimelineInterval, adoption?: { readonly hitLatencyMs: number; readonly expectedActorMs?: number }): void {
-		const costs = new Map<TimelineInterval, number>();
+	/** Register accepted computations once; native parallel calls retain their overlap. */
+	recordTool(interval: TimelineInterval, adopted = false): void {
+		const visited = new Set<TimelineInterval>();
 		// Only a native Actor execution stays native; adopted and reused computations ran ahead of their callers.
-		const visit = (computation: TimelineInterval, native: boolean): number => {
-			const cached = costs.get(computation);
-			if (cached !== undefined) return cached;
+		const visit = (computation: TimelineInterval, native: boolean): void => {
+			if (visited.has(computation)) return;
+			visited.add(computation);
 			const inputs = dependencies.get(computation) ?? [];
 			const shared = inputs.map(({ computation, shared }) => (shared ?? []).map(part => ({
 				startedAt: Math.max(computation.startedAt, part.startedAt),
@@ -68,17 +63,9 @@ export class TaskTimeline {
 				this.computations.set(computation, tool);
 				this.authoritativeTools.push(tool);
 			}
-			const cost = computation.completedAt - computation.startedAt
-				+ inputs.reduce((total, input) => total + nonNegativeDifference(Math.max(visit(input.computation, false), metric(input.expectedActorMs)), unionDuration(input.shared ?? [])), 0);
-			costs.set(computation, cost);
-			return cost;
+			for (const input of inputs) visit(input.computation, false);
 		};
-		const serialMs = visit(interval, !adoption);
-		// Per-call credit includes retained work from earlier tasks. Native parents already include child waits.
-		const actualMs = adoption ? metric(adoption.hitLatencyMs) : interval.completedAt - interval.startedAt;
-		// Each call saves the larger of its computation and the Actor's expected service, less what the Actor actually waited.
-		this.savingsMs += nonNegativeDifference(Math.max(serialMs, metric(adoption?.expectedActorMs)), actualMs);
-		this.toolWaitMs += actualMs;
+		visit(interval, !adopted);
 	}
 
 	measure(endedAt: number) {
@@ -94,10 +81,6 @@ export class TaskTimeline {
 		const hiddenLatencyMs = nonNegativeDifference(nonToolMs + toolExecutionMs - duration(nativeTools) + unionDuration(nativeTools), endToEndMs);
 		const serializedMs = endToEndMs + hiddenLatencyMs;
 		return Object.freeze({ startedAt, completedAt, endToEndMs, nonToolMs, actorPhaseMs, orchestrationMs, toolExecutionMs, serializedMs, hiddenLatencyMs,
-			/** Service time the Actor did not wait for: never negative. */
-			savingsMs: this.savingsMs,
-			/** The Actor's own wait on its tool calls: native service, or adoption latency. */
-			toolWaitMs: this.toolWaitMs,
 			/** Distinct accepted computations with exclusive time in this task, not Actor call count. */
 			authoritativeToolCount: computations.length,
 		});
