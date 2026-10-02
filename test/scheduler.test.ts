@@ -106,6 +106,9 @@ describe("SpeculationScheduler", () => {
 		const scheduler = new SpeculationScheduler<object>(), base = { expectedDurationMs: 100, criticalPathMs: 100 };
 		expect(scheduler.evaluate([forecast(base)]).priorityMs).toBe(100);
 		expect(scheduler.evaluate([forecast({ ...base, hitProbability: 0.25 })]).priorityMs).toBe(25);
+		expect(scheduler.evaluate([forecast({ ...base, hitProbability: 0.5, adoptionProbability: 0.2 })]).priorityMs).toBeCloseTo(10);
+		expect(scheduler.evaluate([forecast({ ...base, hitProbability: 0.5, adoptionProbability: 0 })]).priorityMs).toBe(0);
+		expect(scheduler.evaluate([forecast({ ...base, hitProbability: 0.5, adoptionProbability: 0.2, expectedLatencyBenefitMs: 60 })]).priorityMs).toBe(60);
 		expect(scheduler.evaluate([forecast({ ...base, hitProbability: 0.25, expectedLatencyBenefitMs: 60 })]).priorityMs).toBe(60);
 		expect(scheduler.evaluate([forecast({ ...base, hitProbability: 0.5 }), forecast({ ...base, hitProbability: 0.5 })]).priorityMs).toBe(50);
 		expect(scheduler.evaluate([forecast({ ...base, hitProbability: 0.5 }), forecast({ ...base, hitProbability: 0.5, decisionBatchesUntilCall: 2 })]).priorityMs).toBe(75);

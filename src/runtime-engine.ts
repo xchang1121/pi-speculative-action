@@ -103,6 +103,7 @@ function forecastFor(node: PlanRuntimeNode, decisionSequence: number, actorPhase
 		criticalPathMs: node.criticalPathMs,
 		...(node.action.expectedLatencyBenefitMs !== undefined ? { expectedLatencyBenefitMs: node.action.expectedLatencyBenefitMs } : {}),
 		...(node.action.empiricalProbability !== undefined ? { hitProbability: node.action.empiricalProbability } : {}),
+		...(node.action.adoptionProbability !== undefined ? { adoptionProbability: node.action.adoptionProbability } : {}),
 		...(node.action.background ? { background: true } : {}),
 		...((node.action.dependsOn?.length ?? 0) > 0 && (node.action.horizon ?? 0) <= 0 ? { dependenciesResolved: true } : {}),
 	};
@@ -121,7 +122,7 @@ function planActionDraft(node: PlanRuntimeNode): SpeculativeDraftCandidate {
 		feedback: node.action.feedback,
 		...(node.action.dependsOn ? { dependsOn: node.action.dependsOn } : {}),
 		...definedFields(node.action, [
-			"horizon", "latestHorizon", "empiricalProbability", "conditionalProbability",
+			"horizon", "latestHorizon", "empiricalProbability", "adoptionProbability", "conditionalProbability",
 			"expectedDurationMs", "expectedLatencyBenefitMs", "resourceDemand", "depth", "producesOperations",
 		]),
 	};
@@ -151,6 +152,7 @@ function predictionCandidate<Output>(candidate: CandidateRecord<Output>, node: P
 		...publicCandidate(candidate),
 		source: node.source,
 		empiricalProbability: node.action.empiricalProbability,
+		adoptionProbability: node.action.adoptionProbability,
 		conditionalProbability: node.action.conditionalProbability,
 		depth: node.action.depth,
 		planDependencies: node.action.dependsOn,
@@ -995,7 +997,7 @@ export function makeSpeculativeActionRuntime<
 					input: structuredClone(concrete),
 					predictedAction,
 					executionAction: predictedAction,
-					...definedFields(node.action, ["depth", "horizon", "conditionalProbability", "empiricalProbability", "expectedLatencyBenefitMs", "expectedDurationMs"]),
+					...definedFields(node.action, ["depth", "horizon", "conditionalProbability", "empiricalProbability", "adoptionProbability", "expectedLatencyBenefitMs", "expectedDurationMs"]),
 				}),
 			);
 		}

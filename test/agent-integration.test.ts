@@ -1,3 +1,4 @@
+import { adoptedSettlement, rejectedSettlement, unmatchedSettlement, unobservedSettlement } from "./prediction.ts";
 import { textResult } from "./result.ts";
 import { gated, deferred, nextTurn } from "./async.ts";
 import { testBranch } from "./branch.ts";
@@ -223,9 +224,38 @@ describe("speculative action host", () => {
 		const first = await propose("t1");
 		expect(first.empiricalProbability).toBe(0.5);
 		for (const matched of [false, false, true]) await controller.source.onSettled!({ proposalID: "p", actionID: first.id, feedback: first.feedback,
-			settlement: { prediction: {} as never, observation: "observed", actorAction: {} as never, match: matched ? { matched: true } as never : { matched: false } } });
+			settlement: matched ? adoptedSettlement() : unmatchedSettlement() });
 		await controller.source.onSettled!({ proposalID: "p", actionID: first.id, feedback: first.feedback, settlement: { prediction: {} as never, observation: "unobserved", cause: {} as never } });
 		expect((await propose("t2")).empiricalProbability).toBe(0.4);
+	});
+
+	it.each(["adopted", "rejected"] as const)("calibrates final Drafter adoption separately from matching (%s)", async outcome => {
+		const tool = createReadTool(await temporaryWorkspace());
+		let selectedModel = model("draft"), schema = "schema-a", sequence = 0;
+		const controller = createDrafterPlanSource({ sessionID: "calibration", draftModel: () => selectedModel, complete: async () => drafterCall({ path: "a.txt" }) });
+		const propose = async () => {
+			const proposal = await controller.source.propose({ startInput: { ...startInput(tool), sessionID: "calibration", turnID: `turn-${sequence++}` },
+				data: { tools: new Map([["read", tool]]), schemaHashes: { read: schema } }, settings: { ...settings(), resourceCacheMaxEntries: 4, predictionTimeoutMs: 1000 },
+				definitions: [], candidateNames: ["read"], proposalIndex: 0, proposalCount: 1, signal: new AbortController().signal });
+			if (!proposal || Array.isArray(proposal) || !("actions" in proposal)) throw new Error("missing proposal");
+			return proposal.actions[0]!;
+		};
+		try {
+			const first = await propose(); expect(first).toMatchObject({ empiricalProbability: 0.5, adoptionProbability: 0.5 });
+			const feedback = { proposalID: "p", actionID: first.id, feedback: first.feedback };
+			for (let index = 0; index < 4; index++) await controller.source.onSettled!({ ...feedback,
+				settlement: outcome === "adopted" ? adoptedSettlement() : rejectedSettlement("freshness", "input_changed") });
+			const learned = await propose();
+			expect(learned.empiricalProbability).toBeCloseTo(5 / 6);
+			expect(learned.adoptionProbability).toBeCloseTo(outcome === "adopted" ? 5 / 6 : 1 / 6);
+			await controller.source.onSettled!({ ...feedback, settlement: rejectedSettlement("matching", "candidate_calibration_sample") });
+			expect((await propose()).adoptionProbability).toBe(learned.adoptionProbability);
+			await controller.source.onSettled!({ ...feedback, settlement: unobservedSettlement("control", "cancelled") });
+			expect((await propose()).adoptionProbability).toBe(learned.adoptionProbability);
+			schema = "schema-b"; expect(await propose()).toMatchObject({ empiricalProbability: 0.5, adoptionProbability: 0.5 });
+			schema = "schema-a"; selectedModel = model("different-model");
+			expect(await propose()).toMatchObject({ empiricalProbability: 0.5, adoptionProbability: 0.5 });
+		} finally { controller.finishSession(); }
 	});
 
 	it("shows the Drafter PatternAware's expected calls after the Actor's history only when enabled", async () => {

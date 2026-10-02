@@ -42,6 +42,7 @@ export interface SpeculativeCandidate {
 	readonly work?: { readonly execution?: { readonly executionMs?: number } };
 	readonly source?: string;
 	readonly empiricalProbability?: number;
+	readonly adoptionProbability?: number;
 	readonly conditionalProbability?: number;
 	readonly depth?: number;
 	readonly planDependencies?: PlanAction["dependsOn"];
@@ -74,6 +75,7 @@ export interface MaterializedSpeculativeCandidate<SessionID> {
 	readonly horizon?: number;
 	readonly conditionalProbability?: number;
 	readonly empiricalProbability?: number;
+	readonly adoptionProbability?: number;
 	readonly expectedLatencyBenefitMs?: number;
 	readonly expectedDurationMs?: number;
 }

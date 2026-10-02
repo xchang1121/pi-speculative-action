@@ -13,6 +13,7 @@ export interface PredictionForecast extends ServiceTimingIdentity {
 	readonly expectedLatencyBenefitMs?: number;
 	/** A model source's calibrated chance the Actor makes this call; without a benefit estimate it scales the work's value. */
 	readonly hitProbability?: number;
+	readonly adoptionProbability?: number;
 	readonly background?: boolean;
 	/** Dependencies have settled and this action is their immediate zero-horizon successor. */
 	readonly dependenciesResolved?: boolean;
@@ -219,7 +220,7 @@ export class SpeculationScheduler<Job extends object> {
 			work.resourceUnits = Math.max(work.resourceUnits, units(forecast.resourceDemand));
 			work.decisionBatchesUntilCall = Math.min(work.decisionBatchesUntilCall, sequence(forecast.decisionBatchesUntilCall));
 			work.criticalPathMs = Math.max(work.criticalPathMs, criticalPathMs);
-			const benefitMs = forecast.expectedLatencyBenefitMs ?? (forecast.hitProbability === undefined ? undefined : forecast.hitProbability * benefitDurationMs);
+			const benefitMs = forecast.expectedLatencyBenefitMs ?? (forecast.hitProbability === undefined ? undefined : forecast.hitProbability * (forecast.adoptionProbability ?? 1) * benefitDurationMs);
 			if (benefitMs === undefined) work.priorityMs = Math.max(work.priorityMs, criticalPathMs);
 			else {
 				const key = JSON.stringify([timingKeys(forecast)[0], sequence(forecast.decisionBatchesUntilCall)]);
