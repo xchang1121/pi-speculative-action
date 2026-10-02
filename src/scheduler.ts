@@ -205,8 +205,9 @@ export class SpeculationScheduler<Job extends object> {
 	}
 
 	evaluate(forecasts: readonly PredictionForecast[]): ScheduledWork {
-		// Sources predicting the same work are independent chances of its use: their probabilistic benefits combine noisy-OR.
-		let remaining = forecasts.length, missed = 1, reachMs = 0;
+		// Predictions of the same action in the same Actor batch share one chance of use.
+		const opportunities = new Map<string, { benefitMs: number; reachMs: number }>();
+		let remaining = forecasts.length;
 		const work = forecasts.reduce((work, forecast) => {
 			remaining--;
 			const expectedDurationMs = this.duration(forecast) ?? 1;
@@ -221,9 +222,11 @@ export class SpeculationScheduler<Job extends object> {
 			const benefitMs = forecast.expectedLatencyBenefitMs ?? (forecast.hitProbability === undefined ? undefined : forecast.hitProbability * benefitDurationMs);
 			if (benefitMs === undefined) work.priorityMs = Math.max(work.priorityMs, criticalPathMs);
 			else {
-				missed *= 1 - Math.min(1, finite(benefitMs) / benefitDurationMs);
-				reachMs = Math.max(reachMs, benefitDurationMs * runwayScale);
-				work.priorityMs = Math.max(work.priorityMs, (1 - missed) * reachMs);
+				const key = JSON.stringify([timingKeys(forecast)[0], sequence(forecast.decisionBatchesUntilCall)]);
+				const opportunity = opportunities.get(key) ?? { benefitMs: 0, reachMs: 0 };
+				opportunity.benefitMs = Math.max(opportunity.benefitMs, Math.min(benefitDurationMs, finite(benefitMs)) * runwayScale);
+				opportunity.reachMs = Math.max(opportunity.reachMs, benefitDurationMs * runwayScale);
+				opportunities.set(key, opportunity);
 			}
 			work.background = forecast.background === true && work.background;
 			return work;
@@ -235,6 +238,14 @@ export class SpeculationScheduler<Job extends object> {
 			priorityMs: 0,
 			background: remaining > 0,
 		});
+		// Distinct opportunities can use the same result; merge their bounded values without mixing one source's
+		// probability with another source's longer duration. Duplicate evidence never increases a group's value.
+		let reachMs = 0, missed = 1;
+		for (const opportunity of opportunities.values()) reachMs = Math.max(reachMs, opportunity.reachMs);
+		if (reachMs > 0) {
+			for (const opportunity of opportunities.values()) missed *= 1 - opportunity.benefitMs / reachMs;
+			work.priorityMs = Math.max(work.priorityMs, (1 - missed) * reachMs);
+		}
 		// Missing slots leave the numerical forecast indeterminate.
 		if (remaining) work.expectedDurationMs = work.resourceUnits = work.decisionBatchesUntilCall = work.criticalPathMs = work.priorityMs = NaN;
 		return work;
