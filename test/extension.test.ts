@@ -75,6 +75,14 @@ describe("zero-modification Pi extension", () => {
 		expect(result.content).toEqual([{ type: "text", text: "cached" }]);
 		expect(fixture.host.runtime.prepareActorCall).toHaveBeenCalledOnce();
 		expect(fixture.settle).not.toHaveBeenCalled();
+		await fixture.emit("turn_end");
+		await fixture.emit("agent_end"); // Pi can retry an API error, compact, or run a queued continuation.
+		expect(fixture.host.finishTurn).toHaveBeenCalledTimes(1);
+		expect(fixture.host.finishTurn).toHaveBeenLastCalledWith("turn_1", false);
+		await fixture.emit("context", { messages: [] });
+		await fixture.emit("turn_end");
+		await fixture.emit("agent_settled");
+		expect(fixture.host.finishTurn).toHaveBeenLastCalledWith("turn_2", true);
 	});
 
 	it("reports serialized counterfactual speedup independently of per-hit service credits", () => {
