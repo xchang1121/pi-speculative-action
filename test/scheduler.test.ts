@@ -107,7 +107,21 @@ describe("SpeculationScheduler", () => {
 		expect(scheduler.evaluate([forecast(base)]).priorityMs).toBe(100);
 		expect(scheduler.evaluate([forecast({ ...base, hitProbability: 0.25 })]).priorityMs).toBe(25);
 		expect(scheduler.evaluate([forecast({ ...base, hitProbability: 0.25, expectedLatencyBenefitMs: 60 })]).priorityMs).toBe(60);
-		expect(scheduler.evaluate([forecast({ ...base, hitProbability: 0.5 }), forecast({ ...base, hitProbability: 0.5 })]).priorityMs).toBe(75);
+		expect(scheduler.evaluate([forecast({ ...base, hitProbability: 0.5 }), forecast({ ...base, hitProbability: 0.5 })]).priorityMs).toBe(50);
+		expect(scheduler.evaluate([forecast({ ...base, hitProbability: 0.5 }), forecast({ ...base, hitProbability: 0.5, decisionBatchesUntilCall: 2 })]).priorityMs).toBe(75);
+	});
+
+	it("does not count correlated forecasts as independent evidence or transfer their probabilities to longer work", () => {
+		const scheduler = new SpeculationScheduler<object>();
+		const base = { tool: "read", actionKeyHash: "query", expectedDurationMs: 100, hitProbability: 0.8 };
+		for (const count of [1, 2, 128]) expect(scheduler.evaluate(Array.from({ length: count }, () => forecast(base))).priorityMs).toBe(80);
+		const different = [forecast({ ...base, expectedDurationMs: 20 }), forecast({ ...base, hitProbability: 0.2 })];
+		for (const rows of [different, [...different].reverse()]) expect(scheduler.evaluate(rows).priorityMs).toBeCloseTo(20);
+		const future = forecast({ ...base, decisionBatchesUntilCall: 2 });
+		expect(scheduler.evaluate([forecast(base), future]).priorityMs).toBeCloseTo(96);
+		expect(scheduler.evaluate([forecast(base), forecast({ ...base, actionKeyHash: "other-query" })]).priorityMs).toBeCloseTo(96);
+		const independent = [different[0]!, { ...different[1]!, actionKeyHash: "other-query" }];
+		expect(scheduler.evaluate(independent).priorityMs).toBeCloseTo(32.8);
 	});
 
 	it("defers future work only from observed Actor timing and known service cost", () => {
@@ -310,9 +324,9 @@ describe("SpeculationScheduler", () => {
 		expect(joinDecision(scheduler, npmTest, { ...running, expectedSpeculativeDurationMs: undefined })).toMatchObject({ allowed: true, waitBudgetMs: 591 });
 	});
 
-	it("combines independent sources' probabilistic benefits for the same work noisy-OR", () => {
+	it("combines distinct Actor opportunities without duplicating correlated source evidence", () => {
 		const scheduler = new SpeculationScheduler<object>(), half = forecast({ expectedDurationMs: 100, expectedLatencyBenefitMs: 50 });
-		expect([scheduler.evaluate([half]).priorityMs, scheduler.evaluate([half, half]).priorityMs, scheduler.evaluate([half, forecast({ expectedDurationMs: 100 })]).priorityMs]).toEqual([50, 75, 100]);
+		expect([scheduler.evaluate([half]).priorityMs, scheduler.evaluate([half, { ...half, decisionBatchesUntilCall: 2 }]).priorityMs, scheduler.evaluate([half, forecast({ expectedDurationMs: 100 })]).priorityMs]).toEqual([50, 75, 100]);
 	});
 
 	it("judges a new action's fallback among class samples it could still match, net of the learned sandbox overhead", () => {
