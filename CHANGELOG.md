@@ -3,6 +3,7 @@
 ## 当前版本
 
 - 修复 Bash 动作身份错误移除 `cd`、未知程序元数据依赖遗漏、用户目录同名程序套用系统工具规则，以及相对时间输出被持久复用的问题。证据绑定校验实现内容，旧证明失效；不再以两次输出相同为依据清除 clock/random/PID/descriptor 不确定性，一次性进程移交保留。TUI 与基准报告统一使用反事实串行耗时除以实际耗时。
+- 原生 stat、fstat、newfstatat 和 statx 按挂载所代表的文件系统返回设备号，FD 查询先固定原 open file description；完整元数据验证下恢复 OverlayFS 上修改后的构建复用。系统工具通过已封存的执行别名恢复身份，任意同名程序仍不适用其规则。
 - 退役 `bench:tape` 离线相似度分析命令及其 SSE 解析、上下文配对和专用测试；完整运行报告继续记录实际采纳、usage、失败和耗时。原始录制保留在仓库外，代码不另行迁移。
 - 删除未执行预测的“潜在节省”统计链路：`ExecutionBlockedTiming`、对应结算与汇总字段、Runtime 提前量扫描及 UI 推算；`ActorAction.deferToFallback` 的第二参数直接接收回退原因。保留执行阻塞状态、原因、匹配结算和完整任务实际重叠计时。模型 benchmark 删除重复逐工具耗时及可从原始 Drafter 记录还原的三组计数，保留真实调用计数、完整任务时延、失败记录与原始预测。
 - 工作区事务的前态同步与后态捕获共用文件状态更新，增量维护保留字节数，省去重复遍历。删除 `WorldReuseMetrics` 中六个 `actorTimed*` / `actorBaselineMs` 及对应 `wholeCommandActor*` 估算字段和状态栏推算；完整任务计时、进程命中记录与调度学习保留。
