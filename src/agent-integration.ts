@@ -10,7 +10,6 @@ import type { AgentConsumeInput, AgentStartInput, AgentStateData } from "./agent
 import { definitionSchemaHashes } from "./agent-runtime-types.ts";
 import type { ActorForkPlanSource } from "./actor-fork-plan-source.ts";
 import type { ExecutionWorldDiagnosticSnapshot, ExecutionOperationBinding, SpeculativeExecutionRoute } from "./execution-world.ts";
-import type { DrafterUtilityGateSnapshot } from "./drafter-utility-gate.ts";
 import { createDrafterPlanSource } from "./drafter-plan-source.ts";
 import { PATTERN_AWARE_DEFAULTS, type PatternAwareSettings, type PatternAwareStore, patternAwareSettings } from "./pattern-aware.ts";
 import { createPatternPlanSource } from "./pattern-plan-source.ts";
@@ -157,7 +156,7 @@ export interface SpeculativeToolExecutionInput {
 	readonly tools: readonly AgentTool[];
 }
 
-export type ActionDrafterGateSnapshot = DrafterUtilityGateSnapshot;
+export type ActionDrafterGateSnapshot = ReturnType<ReturnType<typeof createDrafterPlanSource>["snapshot"]>;
 
 export { patternPlanActionID } from "./pattern-plan-source.ts";
 
@@ -194,13 +193,13 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 			: undefined;
 	};
 	const resolveSettings = async (): Promise<SpeculativeActionSettings> => {
-		const { patternAware, selfSpeculation, drafterGateEnabled, drafterMaxDepth, drafterMaxTokens,
+		const { patternAware, selfSpeculation, drafterGateEnabled, drafterMaxDepth, drafterMaxTokens, drafterTaskMaxRequests, drafterTaskMaxTokens,
 			drafterDeterministicCandidates, drafterTemperatureMin, drafterTemperatureMax, drafterPatternHints, ...policy } =
 			normalizeSpeculativeAgentSettings(await options.getSettings?.(), actionSemantics.toolNames());
 		return {
 			...policy,
 			sourceConfig: {
-				drafterMaxDepth, drafterMaxTokens, drafterDeterministicCandidates, drafterTemperatureMin, drafterTemperatureMax, drafterPatternHints,
+				drafterMaxDepth, drafterMaxTokens, drafterTaskMaxRequests, drafterTaskMaxTokens, drafterDeterministicCandidates, drafterTemperatureMin, drafterTemperatureMax, drafterPatternHints,
 				drafterGateEnabled, patternAware,
 				actorForkActionEnabled:
 					options.actorForkPlanSource !== undefined &&
@@ -216,6 +215,7 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 		draftModel: options.draftModel,
 		getDraftOptions: options.getDraftOptions,
 		complete: options.complete,
+		drafterBudget: options.drafterBudget,
 		patternHints: (hint) => patternPlans.hints(hint),
 	});
 	const patternPlans = createPatternPlanSource({

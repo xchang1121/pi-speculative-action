@@ -45,6 +45,8 @@ describe("speculative action common", () => {
 		).toEqual({
 			drafterMaxDepth: DEFAULTS.drafterMaxDepth,
 			drafterMaxTokens: DEFAULTS.drafterMaxTokens,
+			drafterTaskMaxRequests: DEFAULTS.drafterTaskMaxRequests,
+			drafterTaskMaxTokens: DEFAULTS.drafterTaskMaxTokens,
 			drafterDeterministicCandidates: DEFAULTS.drafterDeterministicCandidates,
 			drafterTemperatureMin: 0.5,
 			drafterTemperatureMax: 2,

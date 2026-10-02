@@ -9,10 +9,10 @@ import { KEYABLE_TOOLS, OBSERVATION_ACTION_TOOLS, PI_ACTION_SEMANTICS, UNBOUNDED
 	WORKSPACE_MUTATION_ACTION_TOOLS } from "./action-semantics.ts";
 import { ActorStreamPreviewTracker } from "./actor-stream-preview.ts";
 import { createResourceSnapshotExecutionWorld, type AgentExecutionWorld } from "./agent-execution-world.ts";
-import { createSpeculativeActionHost, normalizeSpeculativeAgentSettings, type CreateSpeculativeActionHostOptions } from "./agent-integration.ts";
+import { createSpeculativeActionHost, normalizeSpeculativeAgentSettings, type ActionDrafterGateSnapshot, type CreateSpeculativeActionHostOptions } from "./agent-integration.ts";
+import { DrafterTaskBudget } from "./drafter-budget.ts";
 import { forceToolChoice } from "./drafter-plan-source.ts";
-import { clampCandidateLimit, DEFAULTS } from "./common.ts";
-import type { DrafterUtilityGateSnapshot } from "./drafter-utility-gate.ts";
+import { clampCandidateLimit } from "./common.ts";
 import type { PatternAwareSettings } from "./pattern-aware.ts";
 import { createClosedSearchProfile, createPiToolDefinitions, PI_CLOSED_SEARCH_TOOLS, PI_OPERATION_TOOLS, resolvePiToolInvocation, type PiToolDefinition } from "./pi-tool-invocation.ts";
 import type { ToolInvocation } from "./tool-settlement.ts";
@@ -56,6 +56,8 @@ const ROOT_SETTING_INPUTS = {
 	executionStoreMaxBytes: mebibyteInput("Reusable command history memory"),
 	predictionTimeoutMs: positiveIntegerInput("Prediction wait limit (ms)"),
 	drafterMaxTokens: positiveIntegerInput("Maximum Drafter output tokens"),
+	drafterTaskMaxRequests: positiveIntegerInput("Maximum Drafter requests per task"),
+	drafterTaskMaxTokens: positiveIntegerInput("Maximum Drafter input/output tokens per task"),
 	drafterMaxDepth: nonNegativeIntegerInput("Drafter follow-up tool steps"),
 	drafterDeterministicCandidates: nonNegativeIntegerInput("Temperature-0 Drafter candidates"),
 } satisfies Partial<SettingInputDescriptors<EffectiveSpeculativeActionSettings, keyof EffectiveSpeculativeActionSettings>>;
@@ -162,7 +164,7 @@ export function formatSpeculativeActionStatus(input: {
 		`Model Drafter: ${settings.drafterEnabled ? "On" : "Off"}`,
 		`Drafter model: ${settings.draftModel ?? "active model"}`,
 		`Candidate requests per Actor decision: ${settings.candidateLimit}`,
-		`Model Drafter policy: ${settings.drafterMaxDepth} follow-up steps; ${settings.drafterMaxTokens} tokens; ${settings.drafterDeterministicCandidates} temperature-0 candidates; sampling ${formatNumber(settings.drafterTemperatureMin)}-${formatNumber(settings.drafterTemperatureMax)}`,
+		`Model Drafter policy: ${settings.drafterMaxDepth} follow-up steps; ${settings.drafterMaxTokens} output tokens per request; ${settings.drafterTaskMaxRequests} requests / ${settings.drafterTaskMaxTokens} input+output tokens per task; ${settings.drafterDeterministicCandidates} temperature-0 candidates; sampling ${formatNumber(settings.drafterTemperatureMin)}-${formatNumber(settings.drafterTemperatureMax)}`,
 		`Simultaneous speculative tools: ${settings.maxConcurrentActions}`,
 		`Storage policy: ${settings.resourceCacheMaxEntries} live results/${formatBytes(settings.resourceCacheMaxBytes)}; ${settings.executionStoreMaxEntries} reusable commands/${formatBytes(settings.executionStoreMaxBytes)}`,
 		`Prediction wait limit: ${formatDuration(settings.predictionTimeoutMs)}`,
@@ -267,6 +269,7 @@ async function installController(
 		cacheCapacity: currentSettings.resourceCacheMaxEntries, cacheByteCapacity: currentSettings.resourceCacheMaxBytes,
 	});
 	const settings = () => currentSettings;
+	const drafterBudget = new DrafterTaskBudget();
 	const lifecycle = new RuntimeLifecycleLane();
 	type SearchProfile = Awaited<ReturnType<typeof createClosedSearchProfile>>;
 	type SearchRoute = { ready: Promise<SearchProfile | undefined>; profile?: SearchProfile };
@@ -303,10 +306,10 @@ async function installController(
 		...(dependencies.selfSpeculationFetch ? { fetch: dependencies.selfSpeculationFetch } : {}),
 		// Without reasoning, the Drafter must answer with the calls the Actor's own reasoning is heading for.
 		draftFork: async ({ model, context: actorContext, reasoning, content, signal }) => {
-			const message = await completeDraft(draftModelFor(model), { ...actorContext, messages: [...actorContext.messages, { role: "user", timestamp: Date.now(),
+			const message = await drafterBudget.run({ model: draftModelFor(model), context: { ...actorContext, messages: [...actorContext.messages, { role: "user", timestamp: Date.now(),
 				content: `The assistant has begun its next reply. Its reasoning so far:\n<reasoning>\n${reasoning}\n</reasoning>${content ? `\nIts reply so far:\n${content}` : ""}\nCall exactly the tool or tools it is about to call next, with the arguments it will use.` }] },
-				{ signal, maxTokens: settings().drafterMaxTokens ?? DEFAULTS.drafterMaxTokens, onPayload: forceToolChoice(undefined) });
-			return message.content.flatMap((item) => item.type === "toolCall" ? [{ tool: item.name, input: item.arguments }] : []);
+				options: { signal, maxTokens: settings().drafterMaxTokens, onPayload: forceToolChoice(undefined) }, policy: settings(), complete: completeDraft });
+			return message?.content.flatMap((item) => item.type === "toolCall" ? [{ tool: item.name, input: item.arguments }] : []) ?? [];
 		},
 	});
 	const [piToolSettings, patternWorkspaceIdentity] = await Promise.all([
@@ -411,6 +414,7 @@ async function installController(
 		cwd: context.cwd,
 		getSettings: runtimeSettings,
 		complete: completeDraft,
+		drafterBudget,
 		draftModel: draftModelFor,
 		preflight: ({ toolName }) =>
 			latestContext.isProjectTrusted() && baseDefinitions.has(toolName) && pi.getActiveTools().includes(toolName),
@@ -800,6 +804,8 @@ function openDrafterSettings(ctx: ExtensionContext, controller: SpeculativeActio
 			toggle("drafterPatternHints", "Show PatternAware's expected calls"),
 			input("drafterMaxDepth", "Follow-up tool steps"),
 			input("drafterMaxTokens", "Maximum output tokens"),
+			input("drafterTaskMaxRequests", "Requests per task"),
+			input("drafterTaskMaxTokens", "Input/output tokens per task"),
 			input("drafterDeterministicCandidates", "Temperature-0 candidates"),
 			[`Sampling temperature: ${formatNumber(settings.drafterTemperatureMin)}-${formatNumber(settings.drafterTemperatureMax)}`, () => editDrafterTemperatureRange(ctx, controller, settings)],
 		]);
@@ -1256,8 +1262,9 @@ function syntaxSettingLabel(value: string): string {
 	return value === "auto" ? "automatic" : value;
 }
 
-function formatDrafterGateStatus(enabled: boolean, gate: DrafterUtilityGateSnapshot): string {
-	return `Action Drafter gate: ${enabled ? "On" : "Off"}; ${gate.skippedBatches} batches skipped, ${gate.samples} samples${gate.expectedNetBenefitMs === undefined ? ", benefit unmeasured" : `, ${formatDuration(gate.expectedNetBenefitMs)} budget estimate`}`;
+function formatDrafterGateStatus(enabled: boolean, gate: ActionDrafterGateSnapshot): string {
+	const budget = gate.budget;
+	return `Action Drafter gate: ${enabled ? "On" : "Off"}; ${gate.skippedBatches} batches skipped, ${gate.samples} samples${gate.expectedNetBenefitMs === undefined ? ", benefit unmeasured" : `, ${formatDuration(gate.expectedNetBenefitMs)} budget estimate`}; task budget: ${budget.requests} requests, ${budget.reportedTokens} reported + ${budget.unreportedTokens} estimated without usage + ${budget.reservedTokens} reserved tokens, ${budget.skippedRequests} requests skipped`;
 }
 
 const FORK_TRANSPORT_LABELS: Readonly<Record<SelfSpeculationSettings["forkTransport"], string>> = { provider: "Provider-integrated", sidecar: "Sidecar service", drafter: "Drafter reads Actor reasoning" };
