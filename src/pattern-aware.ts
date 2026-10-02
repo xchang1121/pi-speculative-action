@@ -214,32 +214,26 @@ type PatternPool = {
 
 type TrieNode = { readonly children: Map<string, TrieNode>; readonly patterns: Set<MutablePattern>; };
 
-const patternAwareDefaults = {
-	enabled: true,
+const { defaults: patternAwareDefaults, parse: parsePatternSettings } = settingsParser({
+	enabled: [true, booleanOr],
 	/** Admit future-gap/preparation candidates and expand completed predictions into a multi-step frontier. */
-	multiStepEnabled: true,
-	maxContextLength: 4,
+	multiStepEnabled: [true, booleanOr],
+	maxContextLength: [4, positiveInteger],
 	/** Maximum competing concrete actions retained per tool at each PatternAware frontier. */
-	beamWidth: 4,
+	beamWidth: [4, positiveInteger],
 	/** Maximum number of recursively predicted actions on one branch. */
-	maxPredictionDepth: 6,
-	maxFutureGap: 2,
+	maxPredictionDepth: [6, positiveInteger],
+	maxFutureGap: [2, nonNegativeInteger],
 	/** Weighted future-gap quantile used as the expected launch horizon; the deadline keeps full observed support. */
-	futureGapCoverage: 0.25,
-	decayHalfLifeEvents: 2048,
+	futureGapCoverage: [0.25, probabilitySetting],
+	decayHalfLifeEvents: [2048, positiveInteger],
 	/** Support required to promote a relation after its single bounded first-recurrence probe. */
-	minOccurrences: 2,
+	minOccurrences: [2, positiveInteger],
 	/** Minimum historical replay precision required for a concrete argument mapper. */
-	maxPatterns: 4096,
-};
+	maxPatterns: [4096, positiveInteger],
+});
 
 export const PATTERN_AWARE_DEFAULTS: PatternAwareSettings = patternAwareDefaults;
-
-const parsePatternSettings = settingsParser(patternAwareDefaults, {
-	enabled: booleanOr, multiStepEnabled: booleanOr, maxContextLength: positiveInteger, beamWidth: positiveInteger, maxPredictionDepth: positiveInteger,
-	maxFutureGap: nonNegativeInteger, futureGapCoverage: probabilitySetting, decayHalfLifeEvents: positiveInteger, minOccurrences: positiveInteger,
-	maxPatterns: positiveInteger,
-});
 
 const MAX_BINDING_VARIANTS = 32;
 const MAX_PATH_SOURCES = 24;

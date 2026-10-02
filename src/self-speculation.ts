@@ -21,78 +21,47 @@ export interface SelfSpeculationSettings extends Readonly<typeof selfSpeculation
 	readonly apiKeyEnv?: string;
 }
 
-const selfSpeculationDefaults = {
-	enabled: false,
+const { defaults: selfSpeculationDefaults, parse: parseSettings } = settingsParser({
+	enabled: [false, booleanOr],
 	/** Trusted control-plane endpoint exposed by the inference runtime. */
-	endpoint: "http://127.0.0.1:8000",
+	endpoint: ["http://127.0.0.1:8000", (value, fallback) => (nonEmptyString(value) ?? fallback).replace(/\/+$/u, "")],
 	/** Top-level field carrying the stable request ID in provider payloads. */
-	requestIDField: "request_id",
-	candidatePath: "/self-speculation/candidates",
-	forkPath: "/self-speculation/fork",
-	clearPath: "/self-speculation/clear",
+	requestIDField: ["request_id", textOr],
+	candidatePath: ["/self-speculation/candidates", httpPath],
+	forkPath: ["/self-speculation/fork", httpPath],
+	clearPath: ["/self-speculation/clear", httpPath],
 	/** Optional declaration of what the control plane serves (client side only; not yet verified against a vLLM sidecar). */
-	capabilitiesPath: "/self-speculation/capabilities",
-	timeoutMs: 2_000,
-	maxCandidates: 8,
-	maxDraftTokens: 28,
+	capabilitiesPath: ["/self-speculation/capabilities", httpPath],
+	timeoutMs: [2_000, positiveInteger],
+	maxCandidates: [8, positiveInteger],
+	maxDraftTokens: [28, positiveInteger],
 	/** Actor tool-call protocol Profile; D3 serialization always follows this Profile. */
-	actorProfile: "tagged_json",
+	actorProfile: ["tagged_json", textOr],
 	/** Tool-call body format used when concrete K(a) candidates are tokenized. */
-	draftFormat: "auto",
+	draftFormat: ["auto", textOr],
 	/** Exact target-model boundary preceding a boundary-relative action draft. */
-	draftBoundary: "auto",
-	forkEnabled: true,
+	draftBoundary: ["auto", textOr],
+	forkEnabled: [true, booleanOr],
 	/** Admit complete sidecar fork tool calls to the ordinary speculative-action runtime. */
-	forkActionEnabled: true,
+	forkActionEnabled: [true, booleanOr],
 	/** Minimum SPORK selected-token top-1 probability required for action execution. */
-	forkActionMinConfidence: 0.9,
-	forkTransport: "provider" as SelfSpeculationForkTransport,
-	forkMaxTokens: 128,
-	forkTemperature: 0,
-	forkDecoder: "auto",
-	forkForcedPrefix: "auto",
+	forkActionMinConfidence: [0.9, probability],
+	forkTransport: ["provider" as SelfSpeculationForkTransport, (value) => value === "sidecar" || value === "drafter" ? value : "provider"],
+	forkMaxTokens: [128, positiveInteger],
+	forkTemperature: [0, nonNegativeNumber],
+	forkDecoder: ["auto", textOr],
+	forkForcedPrefix: ["auto", textOr],
 	/** Require a capable engine to expose token logprobs to its SPORK fork. */
-	requireLogprobs: false,
-	forkGateEnabled: DEFAULT_BENEFIT_GATE_POLICY.enabled,
-	forkGateMinSamples: DEFAULT_BENEFIT_GATE_POLICY.minSamples,
-	forkGateWindowSize: DEFAULT_BENEFIT_GATE_POLICY.windowSize,
-	forkGateMinNetBenefitMs: DEFAULT_BENEFIT_GATE_POLICY.minNetBenefitMs,
-	forkGateProbeInterval: DEFAULT_BENEFIT_GATE_POLICY.probeInterval,
-	forkGateFailureThreshold: DEFAULT_BENEFIT_GATE_POLICY.failureThreshold,
-};
+	requireLogprobs: [false, booleanOr],
+	forkGateEnabled: [DEFAULT_BENEFIT_GATE_POLICY.enabled, booleanOr],
+	forkGateMinSamples: [DEFAULT_BENEFIT_GATE_POLICY.minSamples, positiveInteger],
+	forkGateWindowSize: [DEFAULT_BENEFIT_GATE_POLICY.windowSize, positiveInteger],
+	forkGateMinNetBenefitMs: [DEFAULT_BENEFIT_GATE_POLICY.minNetBenefitMs, nonNegativeNumber],
+	forkGateProbeInterval: [DEFAULT_BENEFIT_GATE_POLICY.probeInterval, positiveInteger],
+	forkGateFailureThreshold: [DEFAULT_BENEFIT_GATE_POLICY.failureThreshold, positiveInteger],
+});
 
 export const SELF_SPECULATION_DEFAULTS: SelfSpeculationSettings = Object.freeze(selfSpeculationDefaults);
-
-const parseSettings = settingsParser(selfSpeculationDefaults, {
-	enabled: booleanOr,
-	endpoint: (value, fallback) => (nonEmptyString(value) ?? fallback).replace(/\/+$/u, ""),
-	requestIDField: textOr,
-	candidatePath: httpPath,
-	forkPath: httpPath,
-	clearPath: httpPath,
-	capabilitiesPath: httpPath,
-	timeoutMs: positiveInteger,
-	maxCandidates: positiveInteger,
-	maxDraftTokens: positiveInteger,
-	actorProfile: textOr,
-	draftFormat: textOr,
-	draftBoundary: textOr,
-	forkEnabled: booleanOr,
-	forkActionEnabled: booleanOr,
-	forkActionMinConfidence: probability,
-	forkTransport: (value) => value === "sidecar" || value === "drafter" ? value : "provider",
-	forkMaxTokens: positiveInteger,
-	forkTemperature: nonNegativeNumber,
-	forkDecoder: textOr,
-	forkForcedPrefix: textOr,
-	requireLogprobs: booleanOr,
-	forkGateEnabled: booleanOr,
-	forkGateMinSamples: positiveInteger,
-	forkGateWindowSize: positiveInteger,
-	forkGateMinNetBenefitMs: nonNegativeNumber,
-	forkGateProbeInterval: positiveInteger,
-	forkGateFailureThreshold: positiveInteger,
-});
 
 export function normalizeSelfSpeculationSettings(value: unknown): SelfSpeculationSettings {
 	const input = isRecord(value) ? value : {};
@@ -820,14 +789,7 @@ function forkPayload(settings: SelfSpeculationSettings) {
 }
 
 function forkGatePayload(settings: SelfSpeculationSettings): Readonly<Record<string, unknown>> {
-	return {
-		enabled: settings.forkGateEnabled,
-		min_samples: settings.forkGateMinSamples,
-		window_size: settings.forkGateWindowSize,
-		min_net_benefit_ms: settings.forkGateMinNetBenefitMs,
-		probe_interval: settings.forkGateProbeInterval,
-		failure_threshold: settings.forkGateFailureThreshold,
-	};
+	return Object.fromEntries(Object.entries(forkGatePolicy(settings)).map(([key, value]) => [key.replace(/[A-Z]/g, letter => `_${letter.toLowerCase()}`), value]));
 }
 
 function forkGatePolicy(settings: SelfSpeculationSettings): BenefitGatePolicy {
