@@ -1192,16 +1192,17 @@ describe("speculative action host", () => {
 		}
 	});
 
-	it("binds a redundant-cd prediction to the command its candidate runs", async () => {
+	it("preserves a prediction's cd in its bound invocation and execution", async () => {
 		const cwd = await temporaryWorkspace(), ran = deferred<string>(), tool = createBashTool(cwd);
+		const command = `cd ${cwd.replaceAll("\\", "/")} && echo hi`;
 		const { host } = drafterHost("cd", { cwd, getSettings: () => ({ ...settings(), drafterGateEnabled: false, drafterMaxDepth: 0, tools: ["bash"] }),
-			complete: async () => drafterCall({ command: `cd ${cwd.replaceAll("\\", "/")} && echo hi` }, "bash", "draft"),
+			complete: async () => drafterCall({ command }, "bash", "draft"),
 			resolveInvocation: (name, input) => resolvePiToolInvocation(name, input, { cwd, environment: {} }),
 			executionWorlds: [mockRuntimeWorld(context => {
 				ran.resolve(`${(context.args as { command: string }).command} | ${(context.action.executionContext as ToolInvocation).process?.command}`);
 				return { result: textResult("hi\n"), isError: false };
 			})] });
-		try { await host.startTurn(startInput(tool as never)); expect(await ran.promise).toBe("echo hi | echo hi"); } finally { await host.dispose(); }
+		try { await host.startTurn(startInput(tool as never)); expect(await ran.promise).toBe(`${command} | ${command}`); } finally { await host.dispose(); }
 	});
 
 	it.each(["running", "completed"].flatMap((phase) =>
