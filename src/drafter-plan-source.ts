@@ -91,13 +91,14 @@ export function createDrafterPlanSource(input: {
 	const budget = input.drafterBudget ?? new DrafterTaskBudget();
 	const gate = new DrafterUtilityGate();
 	const expansionGate = new DrafterUtilityGate();
-	// Separate Beta(1, 1) estimates for matching and adoption, scoped to the model and tool contract.
-	const calibration = new BoundedRecencyMap<string, { observed: number; matched: number; eligible: number; adopted: number }>(128);
+	// Separate Beta(1, 1) estimates over the latest 32 eligible outcomes per model and tool contract.
+	const calibration = new BoundedRecencyMap<string, { matches: number[]; adoptions: number[] }>(128);
 	const calibrationKey = (batch: DrafterBatch, tool: string) => JSON.stringify([batch.utility.key, tool, batch.schemaHashes[tool]]);
+	const probability = (samples: readonly number[] = []) => (samples.reduce((sum, value) => sum + value, 0) + 1) / (samples.length + 2);
+	const observe = (samples: number[], outcome: boolean) => { samples.push(Number(outcome)); if (samples.length > 32) samples.shift(); };
 	const probabilities = (batch: DrafterBatch, tool: string) => {
-		const counts = calibration.get(calibrationKey(batch, tool));
-		return { empiricalProbability: ((counts?.matched ?? 0) + 1) / ((counts?.observed ?? 0) + 2),
-			adoptionProbability: ((counts?.adopted ?? 0) + 1) / ((counts?.eligible ?? 0) + 2) };
+		const samples = calibration.get(calibrationKey(batch, tool));
+		return { empiricalProbability: probability(samples?.matches), adoptionProbability: probability(samples?.adoptions) };
 	};
 	const finishBatch = (key: string) => {
 		const batch = batches.get(key);
@@ -166,16 +167,14 @@ export function createDrafterPlanSource(input: {
 			const batch = asDrafterPlanFeedback(feedback), tool = batch?.calls.get(actionID)?.name;
 			if (!batch || !tool || settlement.observation !== "observed") return;
 			const key = calibrationKey(batch, tool);
-			let counts = calibration.get(key);
-			if (!counts) { counts = { observed: 0, matched: 0, eligible: 0, adopted: 0 }; calibration.set(key, counts); }
-			counts.observed++;
-			counts.matched += Number(settlement.match.matched);
+			let samples = calibration.get(key);
+			if (!samples) { samples = { matches: [], adoptions: [] }; calibration.set(key, samples); }
+			observe(samples.matches, settlement.match.matched);
 			if (settlement.match.matched) {
 				const adoption = settlement.match.adoption;
 				// Deliberate Actor calibration supplies timing evidence, not evidence that this result was unusable.
 				if (adoption.status === "rejected" && adoption.cause.code === "candidate_calibration_sample") return;
-				counts.eligible++;
-				counts.adopted += Number(adoption.status === "adopted");
+				observe(samples.adoptions, adoption.status === "adopted");
 			}
 		},
 		enabled: (settings) => settings.drafterEnabled ?? DEFAULTS.drafterEnabled,
