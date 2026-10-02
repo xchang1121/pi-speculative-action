@@ -382,7 +382,7 @@ interface CandidateRecord<Output, StartInput = unknown, StateData = unknown> {
 	estimatedBytes: number;
 	projectionCoverage: readonly ActionProjectionCoverage[];
 	outputStale?: boolean;
-	resultViews?: Map<string, { readonly output: Output; readonly bytes: number; readonly execution: TimelineInterval; readonly inputs?: boolean; readonly compatibility?: WorldBranch<Output>["compatibility"]; readonly validate?: WorldBranch<Output>["validate"]; readonly resource?: ProjectionResource; readonly capturedBytes?: number; readonly requiresQueryValidation?: true }>;
+	resultViews?: Map<string, RetainedResultView<Output>>;
 	previews?: Set<ActorPreviewRecord>;
 	onOperationAdopted?: (adoption: ExecutionOperationAdoption) => void;
 	/** The Actor adopted the whole of it, not only its operations. */
@@ -462,6 +462,11 @@ type ProjectionResult<Output> =
 	| { readonly ok: true; readonly output: Output; readonly execution?: TimelineInterval; readonly inputs?: boolean; readonly compatibility?: WorldBranch<Output>["compatibility"]; readonly validate?: WorldBranch<Output>["validate"]; readonly capturedBytes?: number; readonly requiresQueryValidation?: true; readonly resource?: ProjectionResource }
 	| { readonly ok: false; readonly cause: ResolutionCause };
 
+type RetainedResultView<Output> = Omit<Extract<ProjectionResult<Output>, { ok: true }>, "ok" | "execution"> & {
+	readonly bytes: number;
+	readonly execution: TimelineInterval;
+};
+
 const RUNTIME_EVENT_QUEUE_CAPACITY = 256;
 
 /** Structural runtime: plans own predictions, candidates own execution, ActorAction owns adoption. */
@@ -508,6 +513,18 @@ export function makeSpeculativeActionRuntime<
 		if (resource && --resource.references === 0) sessionStates.get(sessionID)?.lifecycle.release(resource);
 	};
 
+	/** One mutation owns a view's storage, budget, lookup membership, and proof reference. */
+	function setResultView(sessionID: SessionID, candidate: Candidate, key: string, view?: RetainedResultView<Output>): void {
+		const previous = candidate.resultViews?.get(key);
+		if (previous === view) return;
+		if (view?.resource) view.resource.references++;
+		if (view) (candidate.resultViews ??= new Map()).set(key, view);
+		else candidate.resultViews?.delete(key);
+		candidate.estimatedBytes += (view?.bytes ?? 0) - (previous?.bytes ?? 0);
+		candidateStore.indexView(sessionID, candidate, key, view !== undefined);
+		releaseProjectionResource(sessionID, previous?.resource);
+	}
+
 	/** Memoized queries share their sealed candidate's proof, retention budget, and lifetime. */
 	function retainResultView(
 		sessionID: SessionID, candidate: Candidate, action: ActionKey, projection: Extract<ProjectionResult<Output>, { ok: true }>,
@@ -517,19 +534,12 @@ export function makeSpeculativeActionRuntime<
 		try {
 			const owned = cloneSharedData(projection.output), outputBytes = estimateValueBytes(owned) + action.key.length * 2 + 64;
 			let bytes = outputBytes + finiteMetric(projection.capturedBytes), validate = projection.validate, resource = projection.resource;
-			const views = candidate.resultViews ??= new Map();
 			if (!projection.requiresQueryValidation && candidate.estimatedBytes + bytes > cacheByteLimit(settings)) { bytes = outputBytes; validate = undefined; resource = undefined; }
-			while (views.size && (views.size >= cacheEntryLimit(settings) || candidate.estimatedBytes + bytes > cacheByteLimit(settings))) {
-				const [key, previous] = views.entries().next().value!;
-				views.delete(key); candidate.estimatedBytes -= previous.bytes;
-				releaseProjectionResource(sessionID, previous.resource);
-				candidateStore.indexView(sessionID, candidate, key, false);
-			}
+			while (candidate.resultViews?.size && (candidate.resultViews.size >= cacheEntryLimit(settings) || candidate.estimatedBytes + bytes > cacheByteLimit(settings)))
+				setResultView(sessionID, candidate, candidate.resultViews.keys().next().value!);
 			if (candidate.estimatedBytes + bytes <= cacheByteLimit(settings)) {
-				if (resource) resource.references++;
-				views.set(action.key, { output: owned, bytes, execution: projection.execution, inputs: projection.inputs, compatibility: projection.compatibility, validate, resource,
-					capturedBytes: bytes - outputBytes, requiresQueryValidation: projection.requiresQueryValidation }); candidate.estimatedBytes += bytes;
-				candidateStore.indexView(sessionID, candidate, action.key, true);
+				setResultView(sessionID, candidate, action.key, { output: owned, bytes, execution: projection.execution, inputs: projection.inputs, compatibility: projection.compatibility, validate, resource,
+					capturedBytes: bytes - outputBytes, requiresQueryValidation: projection.requiresQueryValidation });
 				return true;
 			}
 		} catch { /* Optional retention cannot alter an already committed result. */ }
@@ -573,8 +583,7 @@ export function makeSpeculativeActionRuntime<
 
 	const removeCandidate = (sessionID: SessionID, candidate: Candidate): void => {
 		candidateStore.delete(sessionID, candidate);
-		for (const view of candidate.resultViews?.values() ?? []) releaseProjectionResource(sessionID, view.resource);
-		candidate.resultViews?.clear();
+		for (const key of candidate.resultViews?.keys() ?? []) setResultView(sessionID, candidate, key);
 		sessionStates.get(sessionID)?.lifecycle.release(candidateBranch(candidate));
 	};
 
@@ -1589,10 +1598,7 @@ export function makeSpeculativeActionRuntime<
 				if (stopCandidate(candidate)) break;
 				if (validation.status !== "valid") {
 					if (validation.status === "stale") {
-						const retained = candidate.resultViews?.get(actualKey.key);
-						if (retained) { candidate.resultViews!.delete(actualKey.key); candidate.estimatedBytes -= retained.bytes;
-							releaseProjectionResource(state.sessionID, retained.resource);
-							candidateStore.indexView(state.sessionID, candidate, actualKey.key, false); }
+						setResultView(state.sessionID, candidate, actualKey.key);
 						// A query may borrow another owner; its failure does not revoke this owner's other inputs.
 						if (!projection.validate) invalidateCandidates(state.session, [candidate], validation.cause, true);
 						if (validation.reconstruct && !rebuilt.has(candidate) && branch.reconstructionScope === "current_action" && branch.reconstruct &&
@@ -2306,11 +2312,7 @@ export function makeSpeculativeActionRuntime<
 				branch?.reconstructionScope === "current_action" && branch.inputSource && branch.reconstruct) {
 				candidate.outputStale = true;
 				// Independent query proofs survive; views backed only by the old output proof do not.
-				for (const [key, view] of candidate.resultViews ?? []) if (!view.validate) {
-					candidate.resultViews!.delete(key); candidate.estimatedBytes -= view.bytes;
-					releaseProjectionResource(session.id, view.resource);
-					candidateStore.indexView(session.id, candidate, key, false);
-				}
+				for (const [key, view] of candidate.resultViews ?? []) if (!view.validate) setResultView(session.id, candidate, key);
 			} else discardCandidate(session, candidate, failure, false);
 			session.plan.rearmExecution(candidate.id);
 			invalidated = true;
