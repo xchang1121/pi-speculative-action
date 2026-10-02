@@ -79,6 +79,8 @@ describe("workspace-branch ExecutionWorld", () => {
 	it("edits in memory over the workspace itself, committing only unchanged inputs and refusing late requests", async () => {
 		const root = await temporaryRoot(), file = path.join(root, "a.txt"), world = sandbox.createExecutionWorld();
 		await writeFile(file, "one two\n");
+		await world.speculation.prepare?.({ cwd: root });
+		expect(Reflect.get(sandbox, "state").repositories.size).toBe(0);
 		const edit = () => world.speculation.execute(context(root, "edit", editTool, { path: "a.txt", edits: [{ oldText: "two", newText: "three" }] }));
 		const branch = await edit();
 		expect([await readFile(file, "utf8"), branch.resources, await readdir(root)]).toEqual(["one two\n", ["a.txt"], ["a.txt"]]);
@@ -92,6 +94,7 @@ describe("workspace-branch ExecutionWorld", () => {
 		let outlet: Parameters<NonNullable<ToolInvocation["filesystem"]>>[0] | undefined;
 		await world.speculation.execute(boundContext(root, async (view) => { outlet = view; return settlement("done"); }));
 		await expect(outlet!.writeFile!(file, "late")).rejects.toThrow("execution lifetime is closed");
+		expect(Reflect.get(sandbox, "state").repositories.size).toBe(0);
 	});
 
 	it("answers reads from an unadopted edit's unchanged pre-image, never a changed one", async () => {
@@ -245,9 +248,9 @@ describe("workspace-branch ExecutionWorld", () => {
 		const root = await temporaryRoot();
 		const first = new WorkspaceSandboxService();
 		const second = new WorkspaceSandboxService();
-		const firstWorld = first.createExecutionWorld({ driver: "git" });
-		const firstSibling = first.createExecutionWorld({ driver: "git" });
-		const secondWorld = second.createExecutionWorld({ driver: "git" });
+		const firstWorld = first.createExecutionWorld({ driver: "git", inPlaceMutations: false });
+		const firstSibling = first.createExecutionWorld({ driver: "git", inPlaceMutations: false });
+		const secondWorld = second.createExecutionWorld({ driver: "git", inPlaceMutations: false });
 		const signal = new AbortController().signal, observations = vi.spyOn(ResourceVersionManager.prototype, "capture");
 		const changes = vi.spyOn(ResourceVersionManager.prototype, "changesSince");
 		const gate = gated(), schedule = globalThis.setTimeout;
