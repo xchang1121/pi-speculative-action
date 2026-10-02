@@ -1127,8 +1127,7 @@ export class LinuxProcessReuseBackend {
 		const started = performance.now();
 		const transaction = await session.workspace.transactions.begin();
 		let traceRoot: string | undefined;
-		let descriptorReport: Awaited<ReturnType<typeof open>> | undefined;
-		const inheritedFiles: Awaited<ReturnType<typeof open>>[] = [];
+		let descriptors: ReturnType<typeof createProcessDescriptorCapture> | undefined;
 		let outcome: SpawnOutcome | undefined;
 		let transactionFinishing = false;
 		let releaseInputs: (() => void) | undefined, inputCheck: Promise<boolean> | undefined;
@@ -1146,9 +1145,8 @@ export class LinuxProcessReuseBackend {
 			const logicalExecutable = session.projection.toLogical(executable);
 			const { execMounts, executables: interposedExecutables } = interception(session.interposition, executable), image = logicalExecutable;
 			const logicalCwd = session.projection.toLogical(request.cwd);
-			let descriptorManifest: string | undefined, descriptorReportPath: string | undefined;
-			const directoryImages: Array<readonly [string, string]> = [];
-			const inputs = descriptorInputs(request.resources);
+			descriptors = createProcessDescriptorCapture(session, traceRoot, request);
+			const { inputs, descriptorManifest, descriptorReportPath, descriptorImages, directoryImages, inheritedFiles } = descriptors;
 			const outputPipes = request.outputPipes?.some(Boolean);
 			const live = !!captureWorkspace && !!ready.imageLibrary && inputs.every(input => input.installed !== false) &&
 				inputs.some(input => input.type === "eventfd" || (input.type === "pipe" || input.type === "socket") && !request.resources!.objects[input.image]!.queue!.eof);
@@ -1157,56 +1155,7 @@ export class LinuxProcessReuseBackend {
 				const input = inputs.find(input => input.fd === position.fd)!;
 				return !input.type ? `file:${position.inode}` : input.type === "eventfd" ? `eventfd:${input.image}` : position.inode;
 			};
-			const descriptorImages = new Map<number, { physical: string; logical: string; workspace: boolean; state: import("node:fs").BigIntStats }>();
-			if (inputs.length || outputPipes) {
-				descriptorManifest = path.join(traceRoot, "fd-inputs");
-				descriptorReportPath = path.join(traceRoot, "fd-offsets");
-				descriptorReport = await open(descriptorReportPath, "wx+", 0o600);
-				let manifest = `INPUTS ${inputs.length} ${Number(!!request.closeStdin)} ${Number(resourceJournal)}\n`;
-				for (const descriptor of inputs) {
-					if (descriptor.fd === descriptor.image && descriptor.type !== "null") {
-						const workspace = !!descriptor.sourcePath && pathContains(session.sourceRoot, descriptor.sourcePath);
-						const physical = workspace ? session.projection.toPhysical(descriptor.sourcePath!)! : path.join(traceRoot, `fd-${descriptor.image}`);
-						let state: import("node:fs").BigIntStats;
-						if (descriptor.type === "directory") {
-							if (!workspace) throw new Error("inherited directory is outside the workspace");
-							await assertNoSymlinkPath(session.workspace.sandboxRoot, physical);
-							state = await lstat(physical, { bigint: true });
-							if (!state.isDirectory()) throw new Error("inherited directory predecessor changed");
-							if (descriptor.content !== undefined) {
-								const raw = path.join(traceRoot, `directory-${descriptor.image}`);
-								await writeFile(raw, Buffer.from(descriptor.content, "base64"), { flag: "wx", mode: 0o600 });
-								directoryImages.push([physical, raw]);
-							}
-						} else if (workspace) {
-							await assertNoSymlinkPath(session.workspace.sandboxRoot, physical);
-							const captured = await captureStableFile(physical, MAX_REQUEST_BYTES);
-							if (`sha256:${captured.hash}` !== descriptor.contentDigest || captured.stat.nlink !== BigInt(descriptor.sourceAliases?.length ?? 1)) throw new Error("inherited FD predecessor changed");
-							for (const alias of descriptor.sourceAliases ?? []) {
-								const target = session.projection.toPhysical(alias)!;
-								await assertNoSymlinkPath(session.workspace.sandboxRoot, target);
-								if (!sameFilesystemIdentity(captured.stat, await lstat(target, { bigint: true }))) throw new Error("inherited FD alias changed");
-							}
-							state = captured.stat;
-						} else {
-							await writeFile(physical, Buffer.from(descriptor.content!, "base64"), { flag: "wx", mode: 0o600 });
-							state = await lstat(physical, { bigint: true });
-						}
-						descriptorImages.set(descriptor.image, { physical, logical: workspace ? descriptor.sourcePath! : physical, workspace, state });
-					}
-					const image = descriptor.fd === descriptor.alias ? descriptor.type === "null" ? "/dev/null" : descriptorImages.get(descriptor.image)!.logical : "";
-					if (descriptor.fd === descriptor.alias && (descriptor.flags & 0x200000 /* O_PATH */))
-						inheritedFiles.push(await open(descriptor.type === "null" ? "/dev/null" : descriptorImages.get(descriptor.image)!.physical, descriptor.flags));
-					const object = request.resources!.objects[descriptor.image]!;
-					const stream = object.counter ? 6 : object.socket ? object.socket.peer.connected ? 4 : 5 : object.queue ? (descriptor.flags & 3) === 1 ? 3 : object.queue.eof ? 1 : 2 : 0;
-					manifest += `${descriptor.fd} ${descriptor.alias} ${descriptor.flags} ${descriptor.offset} ${Buffer.byteLength(image)} ${stream} ${object.queue?.capacity ?? 0} ${object.socket?.shutdown ?? 0} ${object.socket?.peer.shutdown ?? 0} ${object.socket?.peer.object ?? -1} ${descriptor.outside ?? object.queue?.outside ?? 3} ${Number(descriptor.installed !== false)} ${object.socket ? object.socket.type ?? 1 : 0}\n${image}\n`;
-				}
-				for (const [image, object] of Object.entries(request.resources?.objects ?? {})) for (const message of object.queue?.messages ?? [])
-					manifest += `M ${image} ${message.start} ${message.end} ${message.rights.length} ${message.rights.join(" ")}\n`;
-				for (const descriptor of inputs) if (descriptor.fd === descriptor.alias) for (const lock of descriptor.locks ?? [])
-					manifest += `L ${descriptor.fd} ${lock.kind} ${lock.type} ${lock.start} ${lock.length}\n`;
-				await writeFile(descriptorManifest, manifest, { flag: "wx", mode: 0o600 });
-			}
+			await descriptors.prepare(resourceJournal);
 			const changedInput = async () => {
 				const changes = session.workspace.sourceChanges?.();
 				if (!changes?.paths.length || !transaction.readBefore) return false;
@@ -1316,7 +1265,7 @@ export class LinuxProcessReuseBackend {
 			releaseInputs();
 			try {
 				if (suspensionAttempted && !continuation) throw new Error("private process suspension was not sealed");
-				const descriptorOffsets = descriptorReport && inputs.length ? parseDescriptorOffsets(await descriptorReport.readFile(), inputs) : undefined;
+				const descriptorOffsets = await descriptors.readPositions();
 				transactionFinishing = true;
 				const observing = observeStrace(tracePrefix, image, session.projection.toLogical(request.cwd), { interposedExecutables, brokeredWrites: pid => brokeredWrites(session, pid, writer), privateUpper: privateUpper(session),
 						...(frozen ? { frozen } : {}), ...(outputEndpoints ? { outputEndpoints } : {}),
@@ -1411,49 +1360,7 @@ export class LinuxProcessReuseBackend {
 				stage = "artifacts";
 				const baseResult = await captureProcessResult(this.store, outcome, observedProcessMs,
 					[...effects.effects, ...external.changes.map(change => ({ logicalPath: slash(change.target), change }))]);
-				const finalObjects = new Map([...after.entries].flatMap(([name, entry]) => entry.kind === "file" && entry.object ? [[entry.object, name] as const] : []));
-				if (descriptorOffsets) for (const position of descriptorOffsets) {
-					const input = inputs.find(({ fd }) => fd === position.fd)!;
-					if (input.type === "null" || input.type === "pipe" || input.type === "socket" || input.type === "eventfd" || input.fd !== input.image) continue;
-					const image = descriptorImages.get(input.image)!;
-					const finalName = image.workspace && !input.type ? finalObjects.get(`${image.state.dev}:${position.inode}`) : undefined;
-					if (position.detached) {
-						const final = position.detached;
-						if (final.mode !== image.state.mode || final.uid !== image.state.uid || final.gid !== image.state.gid ||
-							!effects.complete) throw new Error("detached file object transition is incomplete");
-						if (!finalName) {
-							if (sha256Digest(final.content) !== input.contentDigest || final.modified !== image.state.mtimeNs) position.content = await this.store.artifacts.put(final.content);
-							continue;
-						}
-						const event = baseResult.journal.find(event => event.kind === "workspace" && event.path === session.projection.toLogical(path.join(after.root, finalName)));
-						if (sha256Digest(final.content) !== (event?.kind === "workspace" && event.after.kind === "file" ? event.after.data.digest : input.contentDigest)) throw new Error("file object and remaining aliases diverged");
-					}
-					const physical = finalName ? path.join(after.root, finalName) : image.physical;
-					const current = await lstat(physical, { bigint: true });
-					// Sandlock exposes the source filesystem's device; the journal names the private backing device.
-					let device = current.dev;
-					if (image.workspace) {
-						let logical = finalName ? session.projection.toLogical(physical) : image.logical;
-						for (;;) {
-							try { device = (await stat(logical, { bigint: true })).dev; break; }
-							catch (error) { if (!missing(error) || path.dirname(logical) === logical) throw error; logical = path.dirname(logical); }
-						}
-					}
-					if ((input.type === "directory" ? !current.isDirectory() : !current.isFile()) || String(device) !== position.device || current.dev !== image.state.dev || String(current.ino) !== position.inode ||
-						current.mode !== image.state.mode || current.uid !== image.state.uid || current.gid !== image.state.gid)
-						throw new Error("inherited FD namespace changed during execution");
-					if (input.type === "directory" && !sameFilesystemIdentity(current, image.state)) throw new Error("inherited directory changed during enumeration");
-					// The common workspace object transaction owns every named inode write and namespace edge.
-					if (image.workspace && !input.type) {
-						if (!finalName || !effects.complete) throw new Error("inherited file object transition is incomplete");
-						continue;
-					}
-					if (input.type === "directory" || sameFilesystemIdentity(current, image.state)) continue;
-					const captured = await captureStableFile(physical, MAX_REQUEST_BYTES, true);
-					if (`sha256:${captured.hash}` !== input.contentDigest || current.mtimeNs !== image.state.mtimeNs) {
-						position.content = await this.store.artifacts.put(captured.content!);
-					} else throw new Error("unmodeled inherited FD metadata effect");
-				}
+				await descriptors.captureFileEffects(this.store, descriptorOffsets, after, effects.complete, baseResult.journal);
 				const transitions: NonNullable<import("./provenance-certificate.ts").ProcessResourceEffects["transitions"]>[number][] = [];
 				for (const event of observation.resourceJournal ?? []) {
 					const input = inputs.find(input => streamIdentity(descriptorOffsets!.find(position => position.fd === input.fd)!) === event.inode &&
@@ -1507,7 +1414,7 @@ export class LinuxProcessReuseBackend {
 			}
 			if (continuation) return { kind: "suspended", weakKey };
 			const exit = exitOutcome(outcome);
-			const streams = request.streams && streamSettlement(descriptorInputs(request.resources!), [...executedStreams]);
+			const streams = request.streams && streamSettlement(inputs, executedStreams);
 			if (streams === undefined && request.streams) {
 				this.setError(session, "stream_settlement_unrepresentable");
 				return { kind: "executed", weakKey, output: [], exit: { kind: "code", code: 125 } };
@@ -1521,7 +1428,7 @@ export class LinuxProcessReuseBackend {
 			session.incompleteReasons.add(`broker:${detail}`);
 			return { kind: "bypass", executable };
 		} finally {
-			try { await Promise.all([descriptorReport?.close(), ...inheritedFiles.map(file => file.close())]); } catch (error) { this.setError(session, `descriptor_report_close:${errorMessage(error)}`); }
+			try { await descriptors?.close(); } catch (error) { this.setError(session, `descriptor_report_close:${errorMessage(error)}`); }
 			releaseInputs?.();
 			await inputCheck;
 			const durationMs = Math.max(0, performance.now() - started);
@@ -1602,6 +1509,123 @@ export class LinuxProcessReuseBackend {
 			...(request.resources ? { resources: request.resources } : {}),
 		}, session.projection, executableDigest, ready.platformFingerprint);
 	}
+}
+
+/** Owns inherited descriptor images, their final proofs, and every handle opened during preparation. */
+function createProcessDescriptorCapture(session: ActiveSession, traceRoot: string, request: ProcessArguments) {
+	const inputs = descriptorInputs(request.resources);
+	const needsReport = inputs.length > 0 || request.outputPipes?.some(Boolean);
+	const descriptorManifest = needsReport ? path.join(traceRoot, "fd-inputs") : undefined;
+	const descriptorReportPath = needsReport ? path.join(traceRoot, "fd-offsets") : undefined;
+	const descriptorImages = new Map<number, { physical: string; logical: string; workspace: boolean; state: import("node:fs").BigIntStats }>();
+	const directoryImages: Array<readonly [string, string]> = [];
+	const inheritedFiles: Awaited<ReturnType<typeof open>>[] = [];
+	let descriptorReport: Awaited<ReturnType<typeof open>> | undefined;
+	return {
+		inputs, descriptorManifest, descriptorReportPath, descriptorImages, directoryImages, inheritedFiles,
+		async prepare(resourceJournal: boolean): Promise<void> {
+			if (!descriptorManifest || !descriptorReportPath) return;
+			descriptorReport = await open(descriptorReportPath, "wx+", 0o600);
+			let manifest = `INPUTS ${inputs.length} ${Number(!!request.closeStdin)} ${Number(resourceJournal)}\n`;
+			for (const descriptor of inputs) {
+				if (descriptor.fd === descriptor.image && descriptor.type !== "null") {
+					const workspace = !!descriptor.sourcePath && pathContains(session.sourceRoot, descriptor.sourcePath);
+					const physical = workspace ? session.projection.toPhysical(descriptor.sourcePath!)! : path.join(traceRoot, `fd-${descriptor.image}`);
+					let state: import("node:fs").BigIntStats;
+					if (descriptor.type === "directory") {
+						if (!workspace) throw new Error("inherited directory is outside the workspace");
+						await assertNoSymlinkPath(session.workspace.sandboxRoot, physical);
+						state = await lstat(physical, { bigint: true });
+						if (!state.isDirectory()) throw new Error("inherited directory predecessor changed");
+						if (descriptor.content !== undefined) {
+							const raw = path.join(traceRoot, `directory-${descriptor.image}`);
+							await writeFile(raw, Buffer.from(descriptor.content, "base64"), { flag: "wx", mode: 0o600 });
+							directoryImages.push([physical, raw]);
+						}
+					} else if (workspace) {
+						await assertNoSymlinkPath(session.workspace.sandboxRoot, physical);
+						const captured = await captureStableFile(physical, MAX_REQUEST_BYTES);
+						if (`sha256:${captured.hash}` !== descriptor.contentDigest || captured.stat.nlink !== BigInt(descriptor.sourceAliases?.length ?? 1)) throw new Error("inherited FD predecessor changed");
+						for (const alias of descriptor.sourceAliases ?? []) {
+							const target = session.projection.toPhysical(alias)!;
+							await assertNoSymlinkPath(session.workspace.sandboxRoot, target);
+							if (!sameFilesystemIdentity(captured.stat, await lstat(target, { bigint: true }))) throw new Error("inherited FD alias changed");
+						}
+						state = captured.stat;
+					} else {
+						await writeFile(physical, Buffer.from(descriptor.content!, "base64"), { flag: "wx", mode: 0o600 });
+						state = await lstat(physical, { bigint: true });
+					}
+					descriptorImages.set(descriptor.image, { physical, logical: workspace ? descriptor.sourcePath! : physical, workspace, state });
+				}
+				const image = descriptor.fd === descriptor.alias ? descriptor.type === "null" ? "/dev/null" : descriptorImages.get(descriptor.image)!.logical : "";
+				if (descriptor.fd === descriptor.alias && (descriptor.flags & 0x200000 /* O_PATH */))
+					inheritedFiles.push(await open(descriptor.type === "null" ? "/dev/null" : descriptorImages.get(descriptor.image)!.physical, descriptor.flags));
+				const object = request.resources!.objects[descriptor.image]!;
+				const stream = object.counter ? 6 : object.socket ? object.socket.peer.connected ? 4 : 5 : object.queue ? (descriptor.flags & 3) === 1 ? 3 : object.queue.eof ? 1 : 2 : 0;
+				manifest += `${descriptor.fd} ${descriptor.alias} ${descriptor.flags} ${descriptor.offset} ${Buffer.byteLength(image)} ${stream} ${object.queue?.capacity ?? 0} ${object.socket?.shutdown ?? 0} ${object.socket?.peer.shutdown ?? 0} ${object.socket?.peer.object ?? -1} ${descriptor.outside ?? object.queue?.outside ?? 3} ${Number(descriptor.installed !== false)} ${object.socket ? object.socket.type ?? 1 : 0}\n${image}\n`;
+			}
+			for (const [image, object] of Object.entries(request.resources?.objects ?? {})) for (const message of object.queue?.messages ?? [])
+				manifest += `M ${image} ${message.start} ${message.end} ${message.rights.length} ${message.rights.join(" ")}\n`;
+			for (const descriptor of inputs) if (descriptor.fd === descriptor.alias) for (const lock of descriptor.locks ?? [])
+				manifest += `L ${descriptor.fd} ${lock.kind} ${lock.type} ${lock.start} ${lock.length}\n`;
+			await writeFile(descriptorManifest, manifest, { flag: "wx", mode: 0o600 });
+		},
+		async readPositions() {
+			return descriptorReport && inputs.length ? parseDescriptorOffsets(await descriptorReport.readFile(), inputs) : undefined;
+		},
+		async captureFileEffects(store: ProvenanceCertificateStore, descriptorOffsets: ReturnType<typeof parseDescriptorOffsets> | undefined,
+			after: WorkspaceStructureSnapshot, effectsComplete: boolean, journal: readonly OrderedEffectEvent[]): Promise<void> {
+			const finalObjects = new Map([...after.entries].flatMap(([name, entry]) => entry.kind === "file" && entry.object ? [[entry.object, name] as const] : []));
+			if (descriptorOffsets) for (const position of descriptorOffsets) {
+				const input = inputs.find(({ fd }) => fd === position.fd)!;
+				if (input.type === "null" || input.type === "pipe" || input.type === "socket" || input.type === "eventfd" || input.fd !== input.image) continue;
+				const image = descriptorImages.get(input.image)!;
+				const finalName = image.workspace && !input.type ? finalObjects.get(`${image.state.dev}:${position.inode}`) : undefined;
+				if (position.detached) {
+					const final = position.detached;
+					if (final.mode !== image.state.mode || final.uid !== image.state.uid || final.gid !== image.state.gid ||
+						!effectsComplete) throw new Error("detached file object transition is incomplete");
+					if (!finalName) {
+						if (sha256Digest(final.content) !== input.contentDigest || final.modified !== image.state.mtimeNs) position.content = await store.artifacts.put(final.content);
+						continue;
+					}
+					const event = journal.find(event => event.kind === "workspace" && event.path === session.projection.toLogical(path.join(after.root, finalName)));
+					if (sha256Digest(final.content) !== (event?.kind === "workspace" && event.after.kind === "file" ? event.after.data.digest : input.contentDigest)) throw new Error("file object and remaining aliases diverged");
+				}
+				const physical = finalName ? path.join(after.root, finalName) : image.physical;
+				const current = await lstat(physical, { bigint: true });
+				// Sandlock exposes the source filesystem's device; the journal names the private backing device.
+				let device = current.dev;
+				if (image.workspace) {
+					let logical = finalName ? session.projection.toLogical(physical) : image.logical;
+					for (;;) {
+						try { device = (await stat(logical, { bigint: true })).dev; break; }
+						catch (error) { if (!missing(error) || path.dirname(logical) === logical) throw error; logical = path.dirname(logical); }
+					}
+				}
+				if ((input.type === "directory" ? !current.isDirectory() : !current.isFile()) || String(device) !== position.device || current.dev !== image.state.dev || String(current.ino) !== position.inode ||
+					current.mode !== image.state.mode || current.uid !== image.state.uid || current.gid !== image.state.gid)
+					throw new Error("inherited FD namespace changed during execution");
+				if (input.type === "directory" && !sameFilesystemIdentity(current, image.state)) throw new Error("inherited directory changed during enumeration");
+				// The common workspace object transaction owns every named inode write and namespace edge.
+				if (image.workspace && !input.type) {
+					if (!finalName || !effectsComplete) throw new Error("inherited file object transition is incomplete");
+					continue;
+				}
+				if (input.type === "directory" || sameFilesystemIdentity(current, image.state)) continue;
+				const captured = await captureStableFile(physical, MAX_REQUEST_BYTES, true);
+				if (`sha256:${captured.hash}` !== input.contentDigest || current.mtimeNs !== image.state.mtimeNs) {
+					position.content = await store.artifacts.put(captured.content!);
+				} else throw new Error("unmodeled inherited FD metadata effect");
+			}
+		},
+		async close(): Promise<void> {
+			const results = await Promise.allSettled([descriptorReport?.close(), ...inheritedFiles.map(file => file.close())]);
+			const failed = results.find(result => result.status === "rejected");
+			if (failed?.status === "rejected") throw failed.reason;
+		},
+	};
 }
 
 function bufferedProcessPrototype(
