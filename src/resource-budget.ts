@@ -1,4 +1,4 @@
-import { positiveCount as units } from "./number-utils.ts";
+import { nonNegativeCount as units } from "./number-utils.ts";
 
 /** Every admitted execution keeps its capacity until physical completion. */
 export function fitsResourceBudget(
