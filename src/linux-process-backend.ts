@@ -276,7 +276,8 @@ export class LinuxProcessReuseBackend {
 	private producers = 0;
 
 	constructor(options: LinuxProcessBackendOptions) {
-		this.options = options;
+		this.options = { sandlockBinary: process.env.PI_SPEC_SANDLOCK, straceBinary: process.env.PI_SPEC_STRACE,
+			heldExecBinary: process.env.PI_SPEC_HELD_EXEC, ...options };
 		this.store = new ProvenanceCertificateStore(options.storeRoot, { ...options.store, acceptedTaints: SAME_CONFINEMENT_TAINTS });
 		this.planner = new ProcessReusePlanner({ store: this.store });
 		this.handoffs = new ProcessHandoffRegistry(this.store.limits.maxCertificates, Math.min(MAX_CONTINUATION_BYTES, this.store.limits.maxBytes));
