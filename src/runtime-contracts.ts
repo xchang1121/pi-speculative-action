@@ -314,6 +314,8 @@ export interface PreparedActorCall<Output> {
 }
 
 export interface SpeculativeActionRuntime<SessionID, Output, StartInput, ConsumeInput, FinishInput> {
+	/** Measure the complete authoritative call against its originating task, including errors and fallback. */
+	readonly trackActorTool: <Value>(sessionID: SessionID, execute: () => Promise<Value>) => Promise<Value>;
 	readonly startTurn: (input: StartInput, signal?: AbortSignal) => Promise<void>;
 	/** Streamed Actor tool identity: prioritize complete predictions for that tool without matching them. */
 	readonly previewActorTool: (

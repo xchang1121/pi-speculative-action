@@ -11,6 +11,7 @@ import { ActorStreamPreviewTracker } from "./actor-stream-preview.ts";
 import { createResourceSnapshotExecutionWorld, type AgentExecutionWorld } from "./agent-execution-world.ts";
 import { createSpeculativeActionHost, normalizeSpeculativeAgentSettings, type ActionDrafterGateSnapshot, type CreateSpeculativeActionHostOptions } from "./agent-integration.ts";
 import { DrafterTaskBudget } from "./drafter-budget.ts";
+import { toolSpeedup } from "./task-timing.ts";
 import { forceToolChoice } from "./drafter-plan-source.ts";
 import { clampCandidateLimit } from "./common.ts";
 import type { PatternAwareSettings } from "./pattern-aware.ts";
@@ -190,8 +191,8 @@ export function formatSpeculativeActionStatus(input: {
 		`Actor candidate rejections: ${countSummary(metrics.actorCandidateRejections)}`,
 		`Candidates: ${metrics.candidateStarted} started; ${metrics.candidateSucceeded} succeeded; ${metrics.candidateFailed} failed; ${metrics.candidateCancelled} cancelled`,
 		metrics.tasks > 0
-			? `Task timing (${metrics.tasks} completed): ${formatTaskTiming(metrics)}. Speedup is the same-run serialized counterfactual divided by wall time.`
-			: "Task timing: n/a (no completed task); serialized overlap and speedup are not reported as 0.",
+			? `Tool timing (${metrics.tasks} completed tasks): ${formatTaskTiming(metrics)}.`
+			: "Tool timing: n/a (no completed task).",
 		`Prediction Drafter tokens (input + output): ${metrics.totalDraftTokens}${metrics.hiddenLatencyMs > 0 ? `; ${Math.round(metrics.totalDraftTokens * 1000 / metrics.hiddenLatencyMs)} per second hidden` : ""}`,
 		`Live speculative results: ${cache.resultEntries}/${cache.cacheCapacity}, ${formatBytes(cache.resultBytes)}/${formatBytes(cache.cacheByteCapacity ?? 0)}; cold: ${cache.cacheCold}; hot: ${cache.cacheHot}; jobs: ${cache.inFlightJobs}; branches: ${cache.branchEntries} (${formatBytes(cache.branchBytes)})`,
 	].join("\n");
@@ -1404,7 +1405,7 @@ function formatSpeculativeFooter(
 	const storedBytes = storageWorlds.reduce((total, world) => total + (world.storage?.bytes ?? 0), 0);
 	return [
 		"spec: on",
-		metrics.tasks > 0 ? `${formatSpeedup(metrics)}; ${formatDuration(metrics.endToEndMs)} wall` : "End-to-End SpeedUp n/a",
+		metrics.tasks > 0 ? `${formatSpeedup(metrics)}; ${formatDuration(metrics.hiddenLatencyMs)} hidden` : "Tool SpeedUp n/a",
 		`tools reused ${formatRatio(metrics.speculativeHits, metrics.actorActions)}`,
 		...(hasProcessReuse(reuse) ? [`Bash Actor ${formatActorProcessFooter(reuse)}`] : []),
 		`live results ${metrics.cache.resultEntries}/${metrics.cache.cacheCapacity} (${formatBytes(metrics.cache.resultBytes)})`,
@@ -1463,16 +1464,15 @@ function countSummary(counts: Readonly<Record<string, number>>): string {
 	return entries.length > 0 ? entries.map(([key, count]) => `${key}=${count}`).join(", ") : "none";
 }
 
-type TimingSummary = Pick<SpeculativeTraceSummary, "endToEndMs" | "serializedMs" | "hiddenLatencyMs" | "toolExecutionMs">;
+type TimingSummary = Pick<SpeculativeTraceSummary, "toolWaitMs" | "hiddenLatencyMs">;
 
 function formatTaskTiming(timing: TimingSummary): string {
-	return `${formatDuration(timing.endToEndMs)} wall; ${formatDuration(timing.serializedMs)} serialized; ${formatSpeedup(timing)}; ${formatDuration(timing.hiddenLatencyMs)} of ${formatDuration(timing.toolExecutionMs)} tool time hidden`;
+	return `${formatSpeedup(timing)}; ${formatDuration(timing.hiddenLatencyMs)} hidden; ${formatDuration(timing.toolWaitMs)} tool wait`;
 }
 
 function formatSpeedup(timing: TimingSummary): string {
-	const ratio = timing.endToEndMs > 0 && Number.isFinite(timing.endToEndMs) && Number.isFinite(timing.serializedMs)
-		? `${(timing.serializedMs / timing.endToEndMs).toFixed(2)}x` : "n/a";
-	return `End-to-End SpeedUp ${ratio}`;
+	const ratio = toolSpeedup(timing);
+	return `Tool SpeedUp ${ratio === null ? "n/a" : `${ratio.toFixed(2)}x`}`;
 }
 
 function formatDuration(ms: number): string {

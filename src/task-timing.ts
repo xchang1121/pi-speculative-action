@@ -31,9 +31,16 @@ export class TimelineInterval {
 
 export interface SpeculativeTaskTiming extends ReturnType<TaskTimeline["measure"]> {}
 
+export function toolSpeedup(timing: { readonly toolWaitMs: number; readonly hiddenLatencyMs: number }): number | null {
+	const { toolWaitMs, hiddenLatencyMs } = timing;
+	return toolWaitMs > 0 && Number.isFinite(toolWaitMs + hiddenLatencyMs) && hiddenLatencyMs >= 0
+		? (toolWaitMs + hiddenLatencyMs) / toolWaitMs : null;
+}
+
 /** Retains scalar endpoints; counting never owns Actor identities, results or retired computations. */
 export class TaskTimeline {
 	private readonly actorPhases: number[] = [];
+	private readonly toolWaits: number[] = [];
 	private readonly authoritativeTools: { readonly startedAt: number; readonly endpoints: readonly number[]; native: boolean }[] = [];
 	private readonly computations = new WeakMap<TimelineInterval, { native: boolean }>();
 	readonly startedAt: number;
@@ -42,6 +49,12 @@ export class TaskTimeline {
 
 	recordActor(startedAt: number, completedAt: number): void {
 		this.actorPhases.push(startedAt, completedAt);
+	}
+
+	/** Full Actor wait, including preparation, adoption, fallback and settlement; unfinished calls clip at task end. */
+	startToolWait(startedAt: number): (completedAt: number) => void {
+		const end = this.toolWaits.push(startedAt, Number.MAX_VALUE) - 1;
+		return completedAt => { this.toolWaits[end] = Math.min(this.toolWaits[end]!, metric(completedAt)); };
 	}
 
 	/** Register accepted computations once; native parallel calls retain their overlap. */
@@ -79,8 +92,8 @@ export class TaskTimeline {
 		const orchestrationMs = Math.max(0, endToEndMs - unionDuration([...actorPhases, ...authoritativeTools])), nonToolMs = actorPhaseMs + orchestrationMs;
 		// Native calls overlapping each other (a parallel batch) would overlap without speculation: count their union.
 		const hiddenLatencyMs = nonNegativeDifference(nonToolMs + toolExecutionMs - duration(nativeTools) + unionDuration(nativeTools), endToEndMs);
-		const serializedMs = endToEndMs + hiddenLatencyMs;
-		return Object.freeze({ startedAt, completedAt, endToEndMs, nonToolMs, actorPhaseMs, orchestrationMs, toolExecutionMs, serializedMs, hiddenLatencyMs,
+		const toolWaitMs = unionDuration(clipped(this.toolWaits, startedAt, completedAt));
+		return Object.freeze({ startedAt, completedAt, endToEndMs, nonToolMs, actorPhaseMs, orchestrationMs, toolExecutionMs, toolWaitMs, hiddenLatencyMs,
 			/** Distinct accepted computations with exclusive time in this task, not Actor call count. */
 			authoritativeToolCount: computations.length,
 		});

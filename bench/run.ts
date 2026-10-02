@@ -16,6 +16,7 @@ import type { DrafterTaskBudget } from "../src/drafter-budget.ts";
 import { LinuxProcessReuseBackend } from "../src/linux-process-backend.ts";
 import type { SpeculativeActionEvent } from "../src/runtime.ts";
 import { summarizeSpeculativeTrace } from "../src/trace-summary.ts";
+import { TaskTimeline, toolSpeedup } from "../src/task-timing.ts";
 
 const DATASET_ROWS =
 	"https://datasets-server.huggingface.co/rows?dataset=TokenRhythm%2FClaw-SWE-Bench&config=lite&split=test&offset=0&length=100";
@@ -216,10 +217,18 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	});
 	await session.bindExtensions({ mode: "print" });
 	let turns = 0;
-	const actorActionsByTool: Record<string, number> = {}, toolWallMs = new Map<string, number>();
+	const actorActionsByTool: Record<string, number> = {}, toolTimeline = new TaskTimeline(taskStartedAt);
+	const toolWaits = new Map<string, { startedAt: number; completedAt?: number; finish: (completedAt: number) => void }>();
 	session.subscribe((event) => {
-		if (event.type === "tool_execution_start") { increment(actorActionsByTool, event.toolName); toolWallMs.set(event.toolCallId, -performance.now()); }
-		if (event.type === "tool_execution_end") toolWallMs.set(event.toolCallId, performance.now() + (toolWallMs.get(event.toolCallId) ?? 0));
+		if (event.type === "tool_execution_start") {
+			increment(actorActionsByTool, event.toolName);
+			const startedAt = performance.now();
+			toolWaits.set(event.toolCallId, { startedAt, finish: toolTimeline.startToolWait(startedAt) });
+		}
+		if (event.type === "tool_execution_end") {
+			const wait = toolWaits.get(event.toolCallId);
+			if (wait) wait.finish(wait.completedAt = performance.now());
+		}
 		if (event.type === "turn_end" && ++turns >= input.maxTurns) void session.abort();
 	});
 
@@ -255,8 +264,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	const { candidateStartTrace, actorActionTrace, ...dimensions } = benchmarkTraceReport(events, actorActionsByTool, input.speculationEnabled);
 	const actualEndToEndMs = taskCompletedAt - taskStartedAt;
 	const hiddenLatencyMs = summary.hiddenLatencyMs;
-	const serializedCounterfactualMs = actualEndToEndMs + hiddenLatencyMs;
-	const nonToolMs = Math.max(0, serializedCounterfactualMs - summary.toolExecutionMs);
+	const toolWaitMs = toolTimeline.measure(taskCompletedAt).toolWaitMs;
 	const actorUsage = summarizeUsage(session.messages.filter((message) => message.role === "assistant"));
 	const drafterUsage = summarizeUsage(drafterPredictionTrace);
 	const changedFiles = lines((await command("git", ["-C", task.workspace, "diff", "--name-only"])).stdout);
@@ -290,10 +298,8 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			setupMs: agentStartedAt - taskStartedAt,
 			agentPromptMs: agentCompletedAt - agentStartedAt,
 			teardownMs: taskCompletedAt - agentCompletedAt,
-			serializedCounterfactualMs,
-			nonToolMs,
-			authoritativeToolMs: summary.toolExecutionMs,
-			accelerationRatio: actualEndToEndMs > 0 ? serializedCounterfactualMs / actualEndToEndMs : 1,
+			toolWaitMs,
+			toolSpeedup: toolSpeedup({ toolWaitMs, hiddenLatencyMs }),
 			actorActions,
 			actorActionsByTool,
 			actorFallbacks: input.speculationEnabled ? summary.actorFallbacks : actorActions,
@@ -338,7 +344,11 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			drafterPredictions: drafterPredictionTrace,
 			candidateStarts: candidateStartTrace,
 			// The Actor's wall time per call, beside its native service time, shows speculation's cost on its path.
-			actorActions: actorActionTrace.map((action) => ({ ...action, wallMs: toolWallMs.get(action.id) })),
+			actorActions: actorActionTrace.map((action) => {
+				const wait = toolWaits.get(action.id);
+				return { ...action, wallMs: wait?.completedAt === undefined ? undefined : wait.completedAt - wait.startedAt };
+			}),
+			toolWaits: [...toolWaits].map(([id, { startedAt, completedAt }]) => ({ id, startedAt, completedAt })),
 		},
 	};
 }

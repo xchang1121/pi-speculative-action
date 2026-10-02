@@ -57,7 +57,7 @@ npm run bench:suite -- --suite swe_diverse --repeats 3 --label speculative
 
 `--prepare-only` 只准备数据集和 checkout。套件见 `suite.json`；`--output-root` 指定产物目录，默认使用系统临时目录。密钥只从环境读取，移入 Pi 的内存凭据后从进程环境删除（Actor 的 shell 读不到），不写入录制或报告。测试工作区、录制和报告使用后清理，只保留必要结论和未解决失败的最小证据。
 
-运行经 Pi SDK 加载已安装的扩展（Pi 默认工具与系统提示、Linux 进程复用、沙箱与快照路线），设置写入运行专属 agent 目录；Linux 路线需在 WSL/Linux 中运行并提供 `PI_SPEC_SANDLOCK`/`PI_SPEC_HELD_EXEC`/`PI_SPEC_STRACE`。`bench:suite -- --paired` 对每个实例与重复交替先后运行开/关两臂，报告 `pairedRatio`（关的实际总耗时 / 开的实际总耗时，可 < 1）及各臂汇总。
+运行经 Pi SDK 加载已安装的扩展（Pi 默认工具与系统提示、Linux 进程复用、沙箱与快照路线），设置写入运行专属 agent 目录；Linux 路线需在 WSL/Linux 中运行并提供 `PI_SPEC_SANDLOCK`/`PI_SPEC_HELD_EXEC`/`PI_SPEC_STRACE`。`bench:suite -- --paired` 对每个实例与重复交替先后运行开/关两臂，报告 `pairedToolSpeedup`（关的工具等待总时长 / 开的工具等待总时长，可 < 1）及各臂汇总。
 
 常用开关：`--drafter-disabled` 关闭 Drafter，`--drafter-max-depth 0` 关闭续推，`--pattern-aware --pattern-state <目录>` 启用并持久化模式学习，`--self-speculation` 启用经 Drafter 读取 Actor 推理的 fork（`forkTransport: "drafter"`），`--drafter-pattern-hints` 让 Drafter 看到 PatternAware 预期的调用（A/B）。共享模式状态不共享工作区文件；默认最多 128 轮，达到上限属于未完成。
 
@@ -72,11 +72,11 @@ npm run bench:suite -- --suite swe_diverse --repeats 3 --label speculative
 | Actor 资源争用与内部进程接管 | `test/runtime-engine.test.ts`、`test/linux-process-world.test.ts` | 并发与跨轮资源预留、物理回收、当前调用的内部计算保留与一次采纳 |
 | 自然修改与验证任务 | `bench:suite -- --suite swe_smoke --paired` | 最终回复、补丁、数据集指定测试、完整计时和实测 token/费用 |
 
-汇总时保留低命中、失败、超时及较慢样本，分别报告同次运行加速比、端到端均值/P95、命中率、token 和任务正确性。构造的模型时序、组件资格和单个真实任务分别报告。
+汇总时保留低命中、失败、超时及较慢样本，分别报告工具加速比、累计掩盖时延、工具等待均值/P95、命中率、token 和任务正确性。构造的模型时序、组件资格和单个真实任务分别报告。
 
 ## 计时与验收规则
 
-主加速比为同次运行的 `serializedCounterfactualMs / actualEndToEndMs`。反事实保留实际开销，仅移除权威计算重叠并去重；无重叠 1×，有重叠大于 1×，不另跑真实 Actor 串行基线。独立开关、原生/Host 和相邻版本对照只用于成本归因。
+工具加速比为 `(toolWaitMs + hiddenLatencyMs) / toolWaitMs`。工具等待按 Actor 调用起止区间取并集，包含准备、验证、采纳、回退和结算；模型思考时间不进入分母。掩盖时延仅计已采纳计算，去重共享子区间，并保留原生并行性；没有工具等待时比值为 `null`。不计算端到端加速比。
 
 任务计时从 Host/工具初始化前到终态结算和回收完成，包含准备、预测、执行、验证、采纳、拒绝与清理。数据集下载、checkout 和最终补丁检查在计时外。完整 Host 返回与内部 `hitLatencyMs` 分开；running 接管还需区分接入、剩余执行与完成后交付。
 
@@ -86,5 +86,5 @@ npm run bench:suite -- --suite swe_diverse --repeats 3 --label speculative
 
 模型报告的 `patchCandidate` 仅标记已结束、补丁干净且文件有交集的运行；正确性仍需数据集的 `FAIL_TO_PASS`/`PASS_TO_PASS`。prompt 或回收抛错时，单次报告保留计时、usage 和各阶段的 `benchmarkErrors`，写出后以失败状态退出。套件保留本次 runner 失败前写出的报告和原始退出错误，停止后续任务；已有单次输出不会被覆盖，无法读取的 summary 不补造计时。
 
-套件总表与分任务表均纳入所有有完整计时的样本，包括失败和慢样本；加速比为总反事实串行耗时除以总实际耗时，同时报告均值、P95 和样本数。缺失或无效计时单列为 `unmeasuredRuns`，失败原因保留在 `invalidRuns`。这些反事实汇总不证明因果提速或任务正确性。
+套件总表与分任务表均纳入所有有完整工具计时的样本，包括失败和慢样本；先累计工具等待和掩盖时延，再计算工具加速比，同时报告均值、P95 和样本数。缺失或无效计时单列为 `unmeasuredRuns`，失败原因保留在 `invalidRuns`。工具加速比不证明任务正确性或端到端净收益。
 冻结的 [既有发布资格说明](./results/release-qualification-2026-09-03.md) 仅对应其原版本，不代表当前代码已再次验收。
