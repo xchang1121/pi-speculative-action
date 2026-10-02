@@ -1,9 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { link, mkdir, open, readFile, readdir, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { type ArtifactReference, certificateReplayable, isSha256Digest, parseProcessCertificate, processResultDigest, type ProcessProvenanceCertificate,
+import { type ArtifactReference, certificateReplayable, isSha256Digest, parseProcessCertificate, type ProcessProvenanceCertificate,
 	type ProvenanceTaint, referencedArtifacts, sha256Digest, sha256DigestAsync, type Sha256Digest } from "./provenance-certificate.ts";
-import { writeJsonFile } from "./filesystem-evidence.ts";
 import { stableStringify } from "./stable-json.ts";
 import { nonNegativeNumber, positiveInteger } from "./setting-input.ts";
 import { hasErrorCode, isMissing as missing } from "./error-utils.ts";
@@ -35,7 +34,7 @@ export const DEFAULT_PROVENANCE_STORE_LIMITS: ProvenanceStoreLimits = Object.fre
 
 const DEFAULT_GC_INTERVAL_MS = 5 * 60_000;
 const DEFAULT_ORPHAN_GRACE_MS = 5 * 60_000;
-const STORE_SEGMENTS = ["indexes", "certificates", "cas", "witnesses.json"] as const;
+const STORE_SEGMENTS = ["indexes", "certificates", "cas"] as const;
 
 /** Immutable content-addressed effect storage; it never stores decoded Runtime result objects. */
 export class ArtifactCAS {
@@ -160,23 +159,6 @@ export class ProvenanceCertificateStore {
 		});
 		if (Date.now() >= this.gcDueAt) { this.gcDueAt = Date.now() + this.gcIntervalMs; await this.gc().catch(() => undefined); }
 		return published;
-	}
-
-	/**
-	 * One run of a certificate's exact inputs. True when an earlier, distinct run of them (sealed at another time: equal results
-	 * share one content id) produced the same result; a different result marks the inputs as reaching what differs between runs, for good.
-	 */
-	witness(certificate: ProcessProvenanceCertificate): Promise<boolean> {
-		return this.exclusive(async () => {
-			const file = this.managedPath("witnesses.json"), digest = processResultDigest(certificate.result);
-			const witnesses: Record<string, { digest: string; at: number }> = await readFile(file, "utf8").then((text) => JSON.parse(text), () => ({}));
-			const seen = witnesses[certificate.strongKey], agreed = seen?.digest === digest && seen.at !== certificate.createdAt;
-			delete witnesses[certificate.strongKey]; // Most recent last: the oldest go first.
-			witnesses[certificate.strongKey] = !seen || seen.digest === digest ? { digest, at: seen?.at ?? certificate.createdAt } : { digest: "differs", at: certificate.createdAt };
-			const kept = Object.entries(witnesses).slice(-4 * this.limits.maxCertificates);
-			await writeJsonFile(file, Object.fromEntries(kept), undefined, 0o600);
-			return agreed;
-		});
 	}
 
 	async get(id: Sha256Digest): Promise<ProcessProvenanceCertificate | undefined> {
