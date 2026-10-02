@@ -71,6 +71,7 @@ const { values } = parseArgs({
 		"self-speculation": { type: "boolean", default: false },
 		"drafter-pattern-hints": { type: "boolean", default: false },
 		"prepare-only": { type: "boolean", default: false },
+		"prepared-run": { type: "string" },
 		"keep-session": { type: "boolean", default: false },
 	},
 	strict: true,
@@ -120,6 +121,7 @@ if (options.prepareOnly) {
 	if (!process.env.DEEPSEEK_API_KEY && (options.actor.provider === "deepseek" || options.drafter.provider === "deepseek")) {
 		throw new Error("DEEPSEEK_API_KEY is required for DeepSeek benchmark models");
 	}
+	if (values["prepared-run"]) await writeFile(path.join(prepared.runDirectory, "benchmark-started"), options.instance, { flag: "wx" });
 	const result = await runTask(prepared, options);
 	const output = options.output ?? path.join(prepared.runDirectory, "result.json");
 	await mkdir(path.dirname(output), { recursive: true });
@@ -133,6 +135,13 @@ if (options.prepareOnly) {
 async function prepareTask(input: BenchmarkOptions) {
 	await Promise.all([mkdir(input.repoCache, { recursive: true }), mkdir(input.runRoot, { recursive: true })]);
 	const row = await datasetRow(input.instance, path.join(input.repoCache, "claw-swe-bench-lite.json"));
+	if (values["prepared-run"]) {
+		const runDirectory = path.resolve(values["prepared-run"]), workspace = path.join(runDirectory, "workspace");
+		const head = (await command("git", ["rev-parse", "HEAD"], workspace)).stdout.trim();
+		if (head !== row.base_commit || (await command("git", ["status", "--porcelain"], workspace)).stdout.trim())
+			throw new Error("Prepared workspace must be clean at the dataset base commit; install dependencies before starting");
+		return { row, runDirectory, workspace };
+	}
 	const cache = path.join(input.repoCache, `${safeName(row.repo)}.git`);
 	if (!(await exists(cache))) {
 		await command("git", ["init", "--bare", cache]);

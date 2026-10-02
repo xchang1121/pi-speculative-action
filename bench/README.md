@@ -47,10 +47,13 @@ npm run bench:overlay-probe
 
 ```sh
 npm run bench:ablation -- --instance axios__axios-5316 --prepare-only
+npm run bench:ablation -- --instance axios__axios-5316 --prepared-run /path/to/prepared-run --label prepared
 npm run bench:ablation -- --instance axios__axios-5316 --label baseline --speculation-disabled
 npm run bench:suite -- --suite swe_smoke --paired --repeats 1 --max-turns 32 --timeout-ms 360000 --label validation
 npm run bench:suite -- --suite swe_diverse --repeats 3 --label speculative
 ```
+
+先用 `--prepare-only` 准备源码，在返回的工作区安装依赖，再用 `--prepared-run` 指定其上一级运行目录。入口要求源码仍处于数据集基线且无未提交改动，每个已准备目录只启动一次模型任务；安装时间不计入任务时钟。质量验证应在任务结束后用独立副本应用数据集测试，分别检查原始基线和模型补丁。
 
 `--prepare-only` 只准备数据集和 checkout。套件见 `suite.json`；`--output-root` 指定产物目录，默认使用系统临时目录。密钥只从环境读取，移入 Pi 的内存凭据后从进程环境删除（Actor 的 shell 读不到），不写入录制或报告。测试工作区、录制和报告使用后清理，只保留必要结论和未解决失败的最小证据。
 
