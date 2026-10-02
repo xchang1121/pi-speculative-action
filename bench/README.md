@@ -86,6 +86,5 @@ npm run bench:suite -- --suite swe_diverse --repeats 3 --label speculative
 
 模型报告的 `patchCandidate` 仅标记已结束、补丁干净且文件有交集的运行；正确性仍需数据集的 `FAIL_TO_PASS`/`PASS_TO_PASS`。prompt 或回收抛错时，单次报告保留计时、usage 和各阶段的 `benchmarkErrors`，写出后以失败状态退出。套件保留本次 runner 失败前写出的报告和原始退出错误，停止后续任务；已有单次输出不会被覆盖，无法读取的 summary 不补造计时。
 
-套件总表与分任务表均纳入所有有完整计时的样本，包括失败和慢样本；加速比为总反事实串行耗时除以总实际耗时，同时报告均值、P95 和样本数。缺失或无效计时单列为 `unmeasuredRuns`，失败原因保留在 `invalidRuns`；补丁成功数量不再决定计时样本。报告不再生成 bootstrap 置信区间，这些反事实汇总不证明因果提速或任务正确性。
-
+套件总表与分任务表均纳入所有有完整计时的样本，包括失败和慢样本；加速比为总反事实串行耗时除以总实际耗时，同时报告均值、P95 和样本数。缺失或无效计时单列为 `unmeasuredRuns`，失败原因保留在 `invalidRuns`。这些反事实汇总不证明因果提速或任务正确性。
 冻结的 [既有发布资格说明](./results/release-qualification-2026-09-03.md) 仅对应其原版本，不代表当前代码已再次验收。
