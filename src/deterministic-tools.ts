@@ -19,18 +19,15 @@ const TOOLS: Readonly<Record<string, ToolRule>> = {
 		.map((name) => [name, {}])),
 	sort: { rejected: /^(?:-[a-zA-Z]*R|--random-)/ },
 	xargs: { rejected: /^(?:-P|--max-procs)/ },
-	ls: { sortsListings: true, rejected: /^(?:-[a-zA-Z]*[fU]|--sort=none)/ },
+	ls: { sortsListings: true, rejected: /^(?:-[a-zA-Z]*[fUlgon]|--sort=none|--format=(?:long|verbose))/ },
 	find: { rejected: /^-(?:[acm](?:min|time)|used|newer[aBcmt]t|f?printf|f?ls)$/ },
 	git: { sortsListings: true, rejected: /^--(?:relative-date|date=relative|since|until|after|before|min-age|max-age)\b/,
-		subcommands: new Set(["status", "diff", "log", "show", "rev-parse", "ls-files", "branch", "grep", "blame", "cat-file"]) },
+		subcommands: new Set(["status", "diff", "rev-parse", "ls-files", "grep", "cat-file"]) },
 };
 export const SHELLS: ReadonlySet<string> = new Set(["bash", "sh", "dash"]);
 /** Programs whose output is a function of file contents: they stat a file only for its type, size hints or same-file checks. */
 const CONTENT_READERS = new Set([...Object.keys(TOOLS).filter((name) => !["env", "test", "[", "ls", "find", "git"].includes(name)), "rg", "awk", "gawk", "mawk"]);
 const WITHOUT_DEVICE = FILESYSTEM_OBSERVATION_FIELDS.filter((field) => field !== "dev");
-/** A replay recreates a file's bytes, mode, owner and times; its device, inode, change time and allocation are new each time it is
- * written, so a program that is not known to print them sees them once, as it sees a descriptor's identity. */
-export const WITHOUT_IDENTITY = FILESYSTEM_OBSERVATION_FIELDS.filter((field) => !["dev", "ino", "blksize", "blocks", "ctimeNs"].includes(field));
 /** find predicates that read metadata beyond a file's type, with the fields they read; any other listing predicate reads all. */
 const FIND_FIELDS: ReadonlyArray<readonly [RegExp, readonly FilesystemObservationField[]]> = [[/^-(?:size|empty)$/, ["size"]], [/^-perm$/, ["mode"]],
 	[/^-(?:user|group|uid|gid|nouser|nogroup)$/, ["uid", "gid"]], [/^-links$/, ["nlink"]], [/^-(?:inum|samefile)$/, ["ino"]]];
@@ -62,15 +59,15 @@ export function workspaceStatFields(image: string, argv: readonly string[]): rea
 		const read = format === undefined ? [undefined] : [...format.matchAll(/%[-#+ 0-9.']*(.)/g)].map(([, directive]) => STAT_DIRECTIVES[directive!]);
 		return read.every(Boolean) ? FILESYSTEM_OBSERVATION_FIELDS.filter((field) => field === "mode" || read.some((fields) => fields!.includes(field))) : undefined;
 	}
-	// Programs that print device numbers keep every field; a stat cache like git's still keys on the size and time a replay keeps.
-	return ["df", "du", "mountpoint", "findmnt"].includes(image) ? undefined : WITHOUT_IDENTITY;
+	// du needs device and inode to distinguish hard links from different files with equal sizes and link counts.
+	if (image === "du") return argv.some((argument) => argument.startsWith("--time")) ? undefined : ["mode", "dev", "ino", "nlink", "size", "blocks"];
+	return image === "git" ? FILESYSTEM_OBSERVATION_FIELDS.filter((field) => !["dev", "ino", "blksize", "blocks", "ctimeNs"].includes(field)) : undefined;
 }
 
-/** Programs that print a directory's own times, size or link count. Any other stats a directory for its type, owner and (on
- * the host) identity: realpath, module lookup and git's untracked cache; what it lists is a dependency of its own. */
+/** Directory traversal contracts apply only to known readers; unknown programs may reveal every field. */
 const DIRECTORY_METADATA_READERS = new Set(["ls", "find", "stat", "du", "tree"]);
 export function directoryStatFields(image: string, fields: readonly FilesystemObservationField[] | undefined, workspace: boolean) {
-	return DIRECTORY_METADATA_READERS.has(image) ? fields : (fields ?? FILESYSTEM_OBSERVATION_FIELDS)
+	return image !== "git" && !CONTENT_READERS.has(image) && !SHELLS.has(image) || DIRECTORY_METADATA_READERS.has(image) ? fields : (fields ?? FILESYSTEM_OBSERVATION_FIELDS)
 		.filter((field) => ["mode", "uid", "gid", ...workspace ? [] : ["dev", "ino"]].includes(field));
 }
 
@@ -89,6 +86,11 @@ export interface TracedExecution {
 	readonly argv: readonly string[];
 }
 
+/** Contracts apply to the platform's system tools, never a user executable sharing their basename. */
+export function systemToolName(image: string | undefined, workspaceRoots: readonly string[]): string {
+	return image && /^\/(?:usr\/)?bin\/[^/]+$/.test(image) && !workspaceRoots.some(root => image === root || image.startsWith(`${root}/`)) ? path.posix.basename(image) : "";
+}
+
 /** Whether a complete transcript ran only system tools whose output cannot depend on the one-shot inputs they read. */
 export function repeatableExecutions(executions: readonly TracedExecution[], listingPIDs: ReadonlySet<number>, workspaceRoots: readonly string[]): boolean {
 	if (!workspaceRoots.length || !executions.length) return false;
@@ -96,7 +98,7 @@ export function repeatableExecutions(executions: readonly TracedExecution[], lis
 	for (const { pid, path: image, argv } of executions) {
 		// A workspace file named like a tool is user code.
 		if (!image || !path.posix.isAbsolute(image) || workspaceRoots.some((root) => image === root || image.startsWith(`${root}/`))) return false;
-		const name = path.posix.basename(image), rule = TOOLS[name], script = argv.indexOf("-c");
+		const name = systemToolName(image, workspaceRoots), rule = TOOLS[name], script = argv.indexOf("-c");
 		if (SHELLS.has(name) ? script < 1 || script + 1 >= argv.length || VOLATILE_SHELL.test(argv[script + 1]!)
 			: !rule || argv.slice(1).some((argument) => rule.rejected?.test(argument)) || rule.subcommands && !rule.subcommands.has(gitSubcommand(argv) ?? "")) return false;
 		names.set(pid, [...(names.get(pid) ?? []), name]);
