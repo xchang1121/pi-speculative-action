@@ -64,7 +64,7 @@ export interface CandidateJoinRequest {
 	readonly leadTimeMs?: number;
 }
 
-type CandidateJoinReason = "ready" | "warmup_probe" | "profitable" | "fallback_faster";
+type CandidateJoinReason = "ready" | "warmup_probe" | "calibration_probe" | "profitable" | "fallback_faster";
 
 export interface CandidateJoinDecision {
 	readonly allowed: boolean;
@@ -336,6 +336,10 @@ export class SpeculationScheduler<Job extends object> {
 		};
 
 		if (request.state === "succeeded") {
+			// Repeated ready hits censor the Actor alternative. One ordinary fallback supplies its first sample;
+			// no speculative effects have been committed and no completed Actor call is executed twice.
+			if (!actor && adoption?.exact && adoption.samples >= DEFAULT_BENEFIT_GATE_POLICY.minSamples)
+				return { allowed: false, reason: "calibration_probe", waitBudgetMs: 0, ...base };
 			// Repeated loss must sample the alternative; cached hits cannot grow Actor evidence.
 			if (
 				actor?.exact && adoption?.exact &&

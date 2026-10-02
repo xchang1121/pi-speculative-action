@@ -27,6 +27,8 @@ export type BenefitDecisionReason =
 	| "profitable"
 	| "utility_probe"
 	| "failure_probe"
+	| "calibration_probe"
+	| "benefit_unmeasured"
 	| "negative_utility"
 	| "failure_circuit";
 
@@ -39,6 +41,7 @@ export interface BenefitDecision {
 
 interface GateState {
 	readonly samples: Array<{ netBenefit: number | undefined; failed: boolean }>;
+	observations: number;
 	priorFailures: number;
 	suppressedSinceProbe: number;
 	totalSuppressed: number;
@@ -57,21 +60,22 @@ export class BenefitGate {
 		if (!policy.enabled) return { allowed: true, reason: "disabled", ...base };
 		const failing = consecutiveFailures(state) >= policy.failureThreshold;
 		if (!failing) {
-			if (state.samples.length < policy.minSamples || expected === undefined) return { allowed: true, reason: "warmup", ...base };
-			if (expected >= policy.minNetBenefitMs) { state.backoff = 1; return { allowed: true, reason: "profitable", ...base }; }
+			if (state.observations < policy.minSamples) return { allowed: true, reason: "warmup", ...base };
+			if (expected !== undefined && expected >= policy.minNetBenefitMs) { state.backoff = 1; return { allowed: true, reason: "profitable", ...base }; }
 		}
 		if (++state.suppressedSinceProbe >= policy.probeInterval * state.backoff) {
 			state.suppressedSinceProbe = 0; state.backoff = Math.min(8, state.backoff * 2);
-			return { allowed: true, reason: failing ? "failure_probe" : "utility_probe", ...base };
+			return { allowed: true, reason: failing ? "failure_probe" : expected === undefined ? "calibration_probe" : "utility_probe", ...base };
 		}
 		state.totalSuppressed++;
-		return { allowed: false, reason: failing ? "failure_circuit" : "negative_utility", ...base };
+		return { allowed: false, reason: failing ? "failure_circuit" : expected === undefined ? "benefit_unmeasured" : "negative_utility", ...base };
 	}
 
 	observe(key: string, observation: BenefitObservation, policy: BenefitGatePolicy): (observation: BenefitObservation) => void {
 		const state = this.state(key);
 		const sample: GateState["samples"][number] = { netBenefit: undefined, failed: false };
 		state.samples.push(sample);
+		state.observations++;
 		// Late lineage costs/benefits amend one retained sample, never append another observation.
 		const update = (value: BenefitObservation) => {
 			if (this.states.get(key) !== state || !state.samples.includes(sample)) return;
@@ -100,7 +104,7 @@ export class BenefitGate {
 	private state(key: string): GateState {
 		let state = this.states.get(key);
 		if (!state) {
-			state = { samples: [], priorFailures: 0, suppressedSinceProbe: 0, totalSuppressed: 0, backoff: 1 };
+			state = { samples: [], observations: 0, priorFailures: 0, suppressedSinceProbe: 0, totalSuppressed: 0, backoff: 1 };
 			this.states.set(key, state);
 		}
 		return state;

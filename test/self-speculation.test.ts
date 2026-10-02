@@ -527,7 +527,7 @@ describe("self-speculation control plane", () => {
 		await coordinator.dispose();
 	});
 
-	it("keeps censored adoptions eligible and gates measured negative forks after warm-up", async () => {
+	it("bounds censored adoptions and measured negative forks after warm-up", async () => {
 		for (const expectedActorMs of [undefined, 0]) {
 			const coordinator = coordinatorFixture([], { forkTransport: "sidecar" },
 				Array.from({ length: 5 }, (_, index) => `actor-${index + 1}`),
@@ -551,7 +551,7 @@ describe("self-speculation control plane", () => {
 			coordinator.decorateActorPayload({ prompt: "P" });
 			coordinator.observeActorOutput(delta("thinking_delta", "reason"));
 			await vi.waitFor(() => expect(coordinator.snapshot()).toMatchObject({
-				forkRequests: expectedActorMs === undefined ? 5 : 4, forkGateSkips: expectedActorMs === undefined ? 0 : 1, forkGateSamples: 4,
+				forkRequests: 4, forkGateSkips: 1, forkGateSamples: 4,
 			}));
 			await coordinator.dispose();
 		}
