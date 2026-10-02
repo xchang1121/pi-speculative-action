@@ -367,6 +367,8 @@ function createWorkspaceSandboxFor(state: WorkspaceSandboxState, options: Worksp
 			},
 			prepare: async ({ cwd, signal }) => {
 				assertWorkspaceSandboxOpen(state);
+				throwIfAborted(signal);
+				if (resolvedOptions.inPlaceMutations !== false) return;
 				roots.add(path.resolve(cwd));
 				await prepareSandboxWorkspaceFor(state, cwd, { ...resolvedOptions, signal });
 			},
