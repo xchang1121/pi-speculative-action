@@ -77,7 +77,7 @@ index 96309ec..8d6fb8d 100644
          if policy.workdir.is_none() {
              return Err(anyhow!("--dry-run requires --workdir"));
 diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/src/chroot/dispatch.rs
-index 6e4ab93..55f9e85 100644
+index 6e4ab93..6fbe0e2 100644
 --- a/crates/sandlock-core/src/chroot/dispatch.rs
 +++ b/crates/sandlock-core/src/chroot/dispatch.rs
 @@ -59,7 +59,7 @@ use crate::chroot::resolve::{
@@ -1052,7 +1052,24 @@ index 6e4ab93..55f9e85 100644
          return exec_on_host(|p| unsafe { libc::truncate(p, length) }, &host_path);
      }
  
-@@ -1496,7 +1919,8 @@ pub(crate) async fn handle_chroot_stat(
+@@ -1449,7 +1872,7 @@ pub(crate) async fn handle_chroot_write(
+ // ============================================================
+
+ /// Pack struct stat and write to child buffer.
+-fn stat_and_write(notif: &SeccompNotif, notif_fd: RawFd, path: &Path) -> NotifAction {
++fn stat_and_write(notif: &SeccompNotif, notif_fd: RawFd, path: &Path, device: Option<u64>) -> NotifAction {
+     let statbuf_addr = notif.data.args[2];
+     let flags = notif.data.args[3];
+     let follow = (flags & libc::AT_SYMLINK_NOFOLLOW as u64) == 0;
+@@ -1476,6 +1899,7 @@ fn stat_and_write(notif: &SeccompNotif, notif_fd: RawFd, path: &Path) -> NotifAc
+         return NotifAction::Errno(last_errno(libc::ENOENT));
+     }
+
++    if let Some(device) = device { st.st_dev = device; }
+     let bytes = unsafe {
+         std::slice::from_raw_parts(
+             &st as *const libc::stat as *const u8,
+@@ -1496,13 +1920,13 @@ pub(crate) async fn handle_chroot_stat(
      ctx: &ChrootCtx<'_>,
  ) -> NotifAction {
      let nr = notif.data.nr as i64;
@@ -1060,9 +1077,19 @@ index 6e4ab93..55f9e85 100644
 +    // faccessat has no flags argument: its fourth register is whatever the caller left there.
 +    let flags = if nr == libc::SYS_faccessat { 0 } else { notif.data.args[3] };
  
-     // AT_EMPTY_PATH: fstat(fd, &statbuf) — the fd already points to the
-     // correct file (injected by the chroot handler or inherited). Let the
-@@ -1521,11 +1945,15 @@ pub(crate) async fn handle_chroot_stat(
+-    // AT_EMPTY_PATH: fstat(fd, &statbuf) — the fd already points to the
+-    // correct file (injected by the chroot handler or inherited). Let the
+-    // kernel stat it directly.
+-    if (flags & libc::AT_EMPTY_PATH as u64) != 0 {
+-        return NotifAction::Continue;
++    // An empty name observes the held object, including its virtual filesystem device.
++    if nr == libc::SYS_newfstatat && (flags & libc::AT_EMPTY_PATH as u64) != 0
++        && (notif.data.args[1] == 0 || read_path(notif, notif.data.args[1], notif_fd).as_deref() == Some("")) {
++        return handle_chroot_fstat(notif, _chroot_state, cow_state, notif_fd, ctx).await;
+     }
+
+     let resolved = if (flags & libc::AT_SYMLINK_NOFOLLOW as u64) != 0 {
+@@ -1521,15 +1945,44 @@ pub(crate) async fn handle_chroot_stat(
          Err(a) => return a,
      };
  
@@ -1080,7 +1107,85 @@ index 6e4ab93..55f9e85 100644
          };
      }
  
-@@ -1716,7 +2144,12 @@ pub(crate) async fn handle_chroot_readlink(
+-    stat_and_write(notif, notif_fd, &real_path)
++    stat_and_write(notif, notif_fd, &real_path, mounted_device(ctx, &host_path, &vp, flags & libc::AT_SYMLINK_NOFOLLOW as u64 == 0))
++}
++
++/// The mounted tree represents its source filesystem; FUSE's transport device is not a program input.
++fn mounted_device(ctx: &ChrootCtx<'_>, host: &Path, virtual_path: &Path, follow: bool) -> Option<u64> {
++    use std::os::unix::fs::MetadataExt;
++    if !ctx.is_mounted(virtual_path) { return None; }
++    let path = viewed_filesystem(ctx, host, virtual_path);
++    (if follow { std::fs::metadata(path) } else { std::fs::symlink_metadata(path) }).ok().map(|state| state.dev())
++}
++
++/// Pin the same open file description before resolving its mount, so close/reuse of the caller's fd cannot redirect the stat.
++pub(crate) async fn handle_chroot_fstat(
++    notif: &SeccompNotif,
++    _chroot_state: &Arc<Mutex<ChrootState>>,
++    _cow_state: &Arc<Mutex<CowState>>,
++    notif_fd: RawFd,
++    ctx: &ChrootCtx<'_>,
++) -> NotifAction {
++    if notif.data.nr as i64 != libc::SYS_fstat && notif.data.args[3] & !(libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW | libc::AT_NO_AUTOMOUNT) as u64 != 0 { return NotifAction::Continue; }
++    let Ok(pin) = crate::seccomp::notif::dup_fd_from_pid(notif.pid, notif.data.args[0] as i32) else { return NotifAction::Continue };
++    let held_path = PathBuf::from(format!("/proc/self/fd/{}", pin.as_raw_fd()));
++    let device = std::fs::read_link(&held_path).ok().and_then(|host| ctx.host_to_virtual(&host).and_then(|vp| mounted_device(ctx, &host, &vp, true)));
++    if device.is_none() { return NotifAction::Continue; }
++    let target = notif.data.args[if notif.data.nr as i64 == libc::SYS_fstat { 1 } else { 2 }];
++    stat_and_write(&notif_with_args(notif, [0, 0, target, 0, 0, 0]), notif_fd, &held_path, device)
+ }
+
+ // ============================================================
+@@ -1547,11 +2000,13 @@ pub(crate) async fn handle_chroot_statx(
+     let path_ptr = notif.data.args[1];
+     let flags = notif.data.args[2] as i32;
+     let mask = notif.data.args[3] as u32;
+-    let statxbuf_addr = notif.data.args[4];
+
+-    // AT_EMPTY_PATH: stat the fd directly, no chroot path resolution needed.
+-    if (flags & libc::AT_EMPTY_PATH) != 0 {
+-        return NotifAction::Continue;
++    if (flags & libc::AT_EMPTY_PATH) != 0 && (path_ptr == 0 || read_path(notif, path_ptr, notif_fd).as_deref() == Some("")) {
++        let Ok(pin) = crate::seccomp::notif::dup_fd_from_pid(notif.pid, dirfd as i32) else { return NotifAction::Continue };
++        let held_path = PathBuf::from(format!("/proc/self/fd/{}", pin.as_raw_fd()));
++        let device = std::fs::read_link(&held_path).ok().and_then(|host| ctx.host_to_virtual(&host).and_then(|vp| mounted_device(ctx, &host, &vp, true)));
++        if device.is_none() { return NotifAction::Continue; }
++        return statx_and_write(notif, notif_fd, &held_path, flags & !(libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW), mask, device);
+     }
+
+     let path = match read_path(notif, path_ptr, notif_fd) {
+@@ -1575,19 +2030,25 @@ pub(crate) async fn handle_chroot_statx(
+         Err(a) => return a,
+     };
+
+-    let c_path = match path_cstr(&real_path, libc::ENOENT) {
++    statx_and_write(notif, notif_fd, &real_path, flags, mask, mounted_device(ctx, &host_path, &vp, flags & libc::AT_SYMLINK_NOFOLLOW == 0))
++}
++
++fn statx_and_write(notif: &SeccompNotif, notif_fd: RawFd, path: &Path, flags: i32, mask: u32, device: Option<u64>) -> NotifAction {
++    let c_path = match path_cstr(path, libc::ENOENT) {
+         Ok(c) => c,
+         Err(a) => return a,
+     };
+-    let mut stx_buf = vec![0u8; 256];
++    let mut state: libc::statx = unsafe { std::mem::zeroed() };
+     let ret = unsafe {
+-        libc::syscall(libc::SYS_statx, libc::AT_FDCWD, c_path.as_ptr(), flags, mask, stx_buf.as_mut_ptr())
++        libc::syscall(libc::SYS_statx, libc::AT_FDCWD, c_path.as_ptr(), flags, mask, &mut state)
+     };
+     if ret < 0 {
+         return NotifAction::Errno(last_errno(libc::ENOENT));
+     }
+
+-    if write_child_mem(notif_fd, notif.id, notif.pid, statxbuf_addr, &stx_buf).is_err() {
++    if let Some(device) = device { state.stx_dev_major = libc::major(device); state.stx_dev_minor = libc::minor(device); }
++    let bytes = unsafe { std::slice::from_raw_parts(&state as *const libc::statx as *const u8, std::mem::size_of::<libc::statx>()) };
++    if write_child_mem(notif_fd, notif.id, notif.pid, notif.data.args[4], bytes).is_err() {
+         return NotifAction::Continue;
+     }
+     NotifAction::ReturnValue(0)
+@@ -1716,7 +2177,12 @@ pub(crate) async fn handle_chroot_readlink(
              if cow.matches(&host_str) {
                  let target = match cow.handle_readlink(&host_str) {
                      Some(t) => t,
@@ -1094,7 +1199,7 @@ index 6e4ab93..55f9e85 100644
                  };
                  drop(cs);
                  return write_target(target.as_bytes());
-@@ -1726,7 +2159,7 @@ pub(crate) async fn handle_chroot_readlink(
+@@ -1726,7 +2192,7 @@ pub(crate) async fn handle_chroot_readlink(
  
      let target = match std::fs::read_link(&host_path) {
          Ok(t) => t,
@@ -1103,7 +1208,7 @@ index 6e4ab93..55f9e85 100644
      };
  
      // Strip chroot/mount prefix from absolute targets
-@@ -1861,12 +2294,12 @@ pub(crate) async fn handle_chroot_xattr(
+@@ -1861,12 +2327,12 @@ pub(crate) async fn handle_chroot_xattr(
          };
  
      let writing = matches!(op, XattrOp::Set | XattrOp::Remove);
@@ -1118,7 +1223,7 @@ index 6e4ab93..55f9e85 100644
          Ok(p) => p,
          Err(a) => return a,
      };
-@@ -1940,18 +2373,101 @@ pub(crate) async fn handle_chroot_xattr(
+@@ -1940,18 +2406,101 @@ pub(crate) async fn handle_chroot_xattr(
  // ============================================================
  
  pub(crate) async fn handle_chroot_getdents(
@@ -1231,7 +1336,7 @@ index 6e4ab93..55f9e85 100644
  }
  
  // ============================================================
-@@ -2043,6 +2559,20 @@ pub(crate) async fn handle_chroot_fchdir(
+@@ -2043,6 +2592,20 @@ pub(crate) async fn handle_chroot_fchdir(
      NotifAction::Continue
  }
  
@@ -1252,7 +1357,7 @@ index 6e4ab93..55f9e85 100644
  // ============================================================
  // getcwd handler
  // ============================================================
-@@ -2092,12 +2622,38 @@ pub(crate) async fn handle_chroot_statfs(
+@@ -2092,12 +2655,38 @@ pub(crate) async fn handle_chroot_statfs(
          None => return NotifAction::Continue,
      };
  
@@ -1293,7 +1398,7 @@ index 6e4ab93..55f9e85 100644
          Ok(c) => c,
          Err(a) => return a,
      };
-@@ -2152,9 +2708,9 @@ pub(crate) async fn handle_chroot_utimensat(
+@@ -2152,9 +2741,9 @@ pub(crate) async fn handle_chroot_utimensat(
          Some(r) => r,
          None => return NotifAction::Errno(libc::EACCES),
      };
@@ -1305,7 +1410,7 @@ index 6e4ab93..55f9e85 100644
          Ok(p) => p,
          Err(a) => return a,
      };
-@@ -2263,8 +2819,8 @@ pub(crate) async fn handle_chroot_legacy_access(
+@@ -2263,8 +2852,8 @@ pub(crate) async fn handle_chroot_legacy_access(
      let mut synth = notif_with_args(notif, [
          libc::AT_FDCWD as u64,
          notif.data.args[0], // path
@@ -1316,7 +1421,7 @@ index 6e4ab93..55f9e85 100644
          0, 0,
      ]);
      synth.data.nr = libc::SYS_faccessat as i32;
-@@ -2476,12 +3032,17 @@ mod mount_ro_tests {
+@@ -2476,12 +3065,17 @@ mod mount_ro_tests {
          processes: &'a Arc<ProcessIndex>,
      ) -> ChrootCtx<'a> {
          ChrootCtx {
@@ -2224,7 +2329,7 @@ index 6eaa211..db70c1e 100644
              in_child_main: None,
              clean_env: self.clean_env,
 diff --git a/crates/sandlock-core/src/seccomp/dispatch.rs b/crates/sandlock-core/src/seccomp/dispatch.rs
-index 3673d84..36df2cd 100644
+index 3673d84..b7ad08b 100644
 --- a/crates/sandlock-core/src/seccomp/dispatch.rs
 +++ b/crates/sandlock-core/src/seccomp/dispatch.rs
 @@ -546,7 +546,8 @@ pub(crate) fn build_dispatch_table(
@@ -2237,7 +2342,17 @@ index 3673d84..36df2cd 100644
          register_cow_handlers(&mut table, ctx);
      }
  
-@@ -956,6 +957,7 @@ fn register_chroot_handlers(
+@@ -928,6 +929,9 @@ fn register_chroot_handlers(
+             crate::chroot::dispatch::handle_chroot_stat));
+     }
+
++    table.register(libc::SYS_fstat, chroot_handler!(policy,
++        crate::chroot::dispatch::handle_chroot_fstat));
++
+     // Legacy stat
+     if let Some(nr) = arch::sys_stat() {
+         table.register(nr, chroot_handler!(policy,
+@@ -956,6 +960,7 @@ fn register_chroot_handlers(
  
      // getdents
      let mut getdents_nrs = vec![libc::SYS_getdents64];
@@ -2245,7 +2360,7 @@ index 3673d84..36df2cd 100644
      if let Some(getdents) = arch::sys_getdents() {
          getdents_nrs.push(getdents);
      }
-@@ -969,10 +971,14 @@ fn register_chroot_handlers(
+@@ -969,10 +974,14 @@ fn register_chroot_handlers(
          crate::chroot::dispatch::handle_chroot_chdir));
      table.register(libc::SYS_fchdir as i64, chroot_handler!(policy,
          crate::chroot::dispatch::handle_chroot_fchdir));
@@ -2260,7 +2375,7 @@ index 3673d84..36df2cd 100644
      table.register(libc::SYS_utimensat as i64, chroot_handler!(policy,
          crate::chroot::dispatch::handle_chroot_utimensat));
  
-@@ -1140,12 +1146,16 @@ mod handler_tests {
+@@ -1140,12 +1149,16 @@ mod handler_tests {
                  argv_safety_required: false,
                  port_remap: false,
                  cow_enabled: false,
@@ -2945,10 +3060,18 @@ index 0b4a2c4..9143915 100644
      fn a_child_copies_the_parent_cwd_instead_of_sharing_it() {
          // fork(2) copies fs_struct: the child starts where the parent stood,
 diff --git a/crates/sandlock-core/src/seccomp_plan.rs b/crates/sandlock-core/src/seccomp_plan.rs
-index 03fc456..fb09bbd 100644
+index 03fc456..b4dea0f 100644
 --- a/crates/sandlock-core/src/seccomp_plan.rs
 +++ b/crates/sandlock-core/src/seccomp_plan.rs
-@@ -207,8 +207,12 @@ fn chroot_path_syscalls() -> Vec<i64> {
+@@ -146,6 +146,7 @@ fn cow_path_syscalls() -> Vec<i64> {
+         libc::SYS_truncate,
+         libc::SYS_utimensat,
+         libc::SYS_newfstatat,
++        libc::SYS_fstat,
+         libc::SYS_statx,
+         libc::SYS_faccessat,
+         arch::SYS_FACCESSAT2,
+@@ -207,8 +208,12 @@ fn chroot_path_syscalls() -> Vec<i64> {
          // later relative path resolves against, so the supervisor has to
          // see it to keep its own notion in step.
          libc::SYS_fchdir,
@@ -2961,7 +3084,7 @@ index 03fc456..fb09bbd 100644
          libc::SYS_utimensat,
          // xattr family (path-based): must be mediated so that paths under an
          // fs_mount/chroot resolve to the real backing file rather than the
-@@ -415,6 +419,7 @@ pub(crate) fn notif_syscalls_resolved(resolved: &ResolvedSandbox) -> Vec<u32> {
+@@ -415,6 +420,7 @@ pub(crate) fn notif_syscalls_resolved(resolved: &ResolvedSandbox) -> Vec<u32> {
      // Chroot path interception
      if features.chroot {
          nrs.extend(&chroot_path_syscalls());

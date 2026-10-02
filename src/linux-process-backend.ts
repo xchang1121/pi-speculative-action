@@ -1416,7 +1416,7 @@ export class LinuxProcessReuseBackend {
 					const input = inputs.find(({ fd }) => fd === position.fd)!;
 					if (input.type === "null" || input.type === "pipe" || input.type === "socket" || input.type === "eventfd" || input.fd !== input.image) continue;
 					const image = descriptorImages.get(input.image)!;
-					const finalName = image.workspace && !input.type ? finalObjects.get(`${position.device}:${position.inode}`) : undefined;
+					const finalName = image.workspace && !input.type ? finalObjects.get(`${image.state.dev}:${position.inode}`) : undefined;
 					if (position.detached) {
 						const final = position.detached;
 						if (final.mode !== image.state.mode || final.uid !== image.state.uid || final.gid !== image.state.gid ||
@@ -1430,7 +1430,16 @@ export class LinuxProcessReuseBackend {
 					}
 					const physical = finalName ? path.join(after.root, finalName) : image.physical;
 					const current = await lstat(physical, { bigint: true });
-					if ((input.type === "directory" ? !current.isDirectory() : !current.isFile()) || String(current.dev) !== position.device || String(current.ino) !== position.inode ||
+					// Sandlock exposes the source filesystem's device; the journal names the private backing device.
+					let device = current.dev;
+					if (image.workspace) {
+						let logical = finalName ? session.projection.toLogical(physical) : image.logical;
+						for (;;) {
+							try { device = (await stat(logical, { bigint: true })).dev; break; }
+							catch (error) { if (!missing(error) || path.dirname(logical) === logical) throw error; logical = path.dirname(logical); }
+						}
+					}
+					if ((input.type === "directory" ? !current.isDirectory() : !current.isFile()) || String(device) !== position.device || current.dev !== image.state.dev || String(current.ino) !== position.inode ||
 						current.mode !== image.state.mode || current.uid !== image.state.uid || current.gid !== image.state.gid)
 						throw new Error("inherited FD namespace changed during execution");
 					if (input.type === "directory" && !sameFilesystemIdentity(current, image.state)) throw new Error("inherited directory changed during enumeration");

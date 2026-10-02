@@ -2401,45 +2401,71 @@ int main(int argc, char **argv) {
 		}
 	});
 });
-test('keeps volatile outputs and all unknown-program metadata out of durable reuse', { timeout: 120000 }, async ({ skip }) => {
-  if (process.platform !== 'linux' || process.arch !== 'x64') return skip('x86-64 Linux only');
-  const fixture = await createLinuxProcessBenchmark('pi-claude-native-review-', 'overlayfs', {}, os.homedir());
-  const findings: unknown[] = [];
-  try {
-    const bin = path.join(fixture.root, 'host-bin'); await mkdir(bin);
-    await writeFile(path.join(bin, 'pid.c'), '#include <stdio.h>\n#include <unistd.h>\nint main(void) { printf("%ld\\n", (long)getpid()); return 0; }\n');
-    await compileBenchmarkHelper(bin, { source: 'pid.c', output: 'cat' });
-    await writeFile(path.join(fixture.workspace, 'README'), 'review fixture\n');
-    await commitBenchmarkFixture(fixture.workspace, 'review');
-    const stamp = `${Math.floor(Date.now() / 1000) - 30} +0000`;
-    execFileSync('git', ['commit', '--amend', '--no-edit', '--date', stamp], { cwd: fixture.workspace, env: { ...process.env, GIT_COMMITTER_DATE: stamp } });
-    const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
-    for (const [label, command] of [['named-cat', `${bin}/cat`], ['relative-date', 'git log -1 --format=%cr']] as const) {
-      const runs: { output: string; hits: number }[] = [];
-      for (let index = 0; index < 2; index++) {
-        const before = fixture.backend.metrics().wholeCommandHits;
-        const branch = await forkReusableBash(fixture, { command, label, executionFingerprint, actionNamespace: 'review' });
-        try { runs.push({ output: textOutput(branch.output.result), hits: fixture.backend.metrics().wholeCommandHits - before }); }
-        finally { await branch.dispose?.(); }
-        if (label === 'relative-date' && index === 0) await new Promise(resolve => setTimeout(resolve, 1500));
-      }
-      const native = execFileSync('/bin/bash', ['-c', command], { cwd: fixture.workspace, env: { ...fixture.environment }, encoding: 'utf8' });
-      expect(runs[1]!.hits, label).toBe(0);
-      if (label === 'named-cat') expect(runs[0]!.output).not.toBe(runs[1]!.output);
-      findings.push({ label, runs, native });
-    }
-    const inodeCommand = `python3 -c 'import os; print(os.stat("README").st_ino)'`;
-    const inodeBranch = await forkReusableBash(fixture, { command: inodeCommand, label: 'inode', executionFingerprint, actionNamespace: 'review' });
-    try {
-      const output = textOutput(inodeBranch.output.result), before = await inodeBranch.validate?.();
-      execFileSync('python3', ['-c', 'import os; p="README"; s=os.stat(p); b=open(p,"rb").read(); q=p+".swap"; open(q,"wb").write(b); os.chmod(q,s.st_mode & 0o7777); os.utime(q, ns=(s.st_atime_ns,s.st_mtime_ns)); os.replace(q,p)'], { cwd: fixture.workspace });
-      const after = await inodeBranch.validate?.();
-      const native = execFileSync('/bin/bash', ['-c', inodeCommand], { cwd: fixture.workspace, env: { ...fixture.environment }, encoding: 'utf8' });
-      expect(output).not.toBe(native);
-      expect(after?.status).not.toBe('valid');
-      findings.push({ label: 'metadata-inode', output, before, after, native });
-    } finally { await inodeBranch.dispose?.(); }
-    console.log('REVIEW_EVIDENCE ' + JSON.stringify(findings));
-    expect(findings).toHaveLength(3);
-  } finally { await fixture.dispose(); }
+test("preserves native metadata across stat families and rejects volatile or changed results", { timeout: 120_000 }, async ({ skip }) => {
+	if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
+	const fixture = await createLinuxProcessBenchmark("pi-native-metadata-", "overlayfs", {}, os.homedir());
+	try {
+		const bin = path.join(fixture.root, "host-bin"); await mkdir(bin);
+		await writeFile(path.join(bin, "pid.c"), '#include <stdio.h>\n#include <unistd.h>\nint main(void) { printf("%ld\\n", (long)getpid()); return 0; }\n');
+		await compileBenchmarkHelper(bin, { source: "pid.c", output: "cat" });
+		await writeFile(path.join(fixture.workspace, "README"), "metadata fixture\n");
+		await writeFile(path.join(fixture.workspace, "metadata.c"), String.raw`#define _GNU_SOURCE
+#include <fcntl.h>
+#include <stdio.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/sysmacros.h>
+#include <unistd.h>
+static void emit(struct stat *s) { printf("%llu %llu %lld %o\n", (unsigned long long)s->st_dev, (unsigned long long)s->st_ino, (long long)s->st_size, s->st_mode); }
+int main(int argc, char **argv) {
+	const char *name = argc > 1 ? argv[1] : "README";
+	struct stat s; struct statx x; int fd = open(name, O_RDONLY);
+	if (fd < 0) { perror("open"); return 1; }
+	if (stat(name, &s)) { perror("stat"); return 1; } emit(&s);
+	if (lstat(name, &s)) return 2; emit(&s);
+	if (syscall(SYS_newfstatat, AT_FDCWD, name, &s, AT_EMPTY_PATH)) return 3; emit(&s);
+	if (syscall(SYS_newfstatat, fd, "", &s, AT_EMPTY_PATH)) return 4; emit(&s);
+	if (syscall(SYS_fstat, fd, &s)) return 5; emit(&s);
+	for (int mode = 0; mode < 3; mode++) {
+		if (statx(mode == 1 ? fd : AT_FDCWD, mode == 1 ? "" : name, mode == 1 ? AT_EMPTY_PATH : mode == 2 ? AT_SYMLINK_NOFOLLOW : 0, STATX_BASIC_STATS, &x)) return 6;
+		printf("%llu %llu %lld %o\n", (unsigned long long)makedev(x.stx_dev_major, x.stx_dev_minor), (unsigned long long)x.stx_ino, (long long)x.stx_size, x.stx_mode);
+	}
+	return close(fd);
+}
+`);
+		await compileBenchmarkHelper(fixture.workspace, { source: "metadata.c", output: "metadata" });
+		await filesystem.symlink("README", path.join(fixture.workspace, "metadata-link"));
+		await commitBenchmarkFixture(fixture.workspace, "metadata");
+		const stamp = `${Math.floor(Date.now() / 1000) - 30} +0000`;
+		execFileSync("git", ["commit", "--amend", "--no-edit", "--date", stamp], { cwd: fixture.workspace, env: { ...process.env, GIT_COMMITTER_DATE: stamp } });
+		const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
+		let turn = 0;
+		const produce = (command: string) => forkReusableBash(fixture, { command, label: "metadata", executionFingerprint, actionNamespace: "metadata",
+			executionScope: { sessionID: "metadata", turnID: String(turn++) } });
+		const native = (command: string) => execFileSync("/bin/bash", ["-c", command], { cwd: fixture.workspace, env: { ...fixture.environment }, encoding: "utf8" });
+		const linked = await produce("./metadata metadata-link");
+		try { expect(linked.output.isError, textOutput(linked.output.result)).toBe(false); expect(textOutput(linked.output.result)).toBe(native("./metadata metadata-link")); }
+		finally { await linked.dispose?.(); }
+		const branch = await produce("./metadata");
+		try {
+			expect(branch.output.isError).toBe(false);
+			expect(textOutput(branch.output.result)).toBe(native("./metadata"));
+			expect((await branch.validate?.())?.status).toBe("valid");
+			execFileSync("python3", ["-c", 'import os; p="README"; s=os.stat(p); b=open(p,"rb").read(); q=p+".swap"; open(q,"wb").write(b); os.chmod(q,s.st_mode & 0o7777); os.utime(q, ns=(s.st_atime_ns,s.st_mtime_ns)); os.replace(q,p)'], { cwd: fixture.workspace });
+			expect(textOutput(branch.output.result)).not.toBe(native("./metadata"));
+			expect((await branch.validate?.())?.status).toBe("stale");
+		} finally { await branch.dispose?.(); }
+		for (const command of [`${bin}/cat`, "git log -1 --format=%cr"]) {
+			const outputs: string[] = [];
+			const before = fixture.backend.metrics().wholeCommandHits;
+			for (let index = 0; index < 2; index++) {
+				const candidate = await produce(command);
+				try { expect(candidate.output.isError).toBe(false); outputs.push(textOutput(candidate.output.result)); }
+				finally { await candidate.dispose?.(); }
+				if (command.startsWith("git") && index === 0) await new Promise(resolve => setTimeout(resolve, 1500));
+			}
+			expect(fixture.backend.metrics().wholeCommandHits - before, command).toBe(0);
+			expect(outputs[0], command).not.toBe(outputs[1]);
+		}
+	} finally { await fixture.dispose(); }
 });
