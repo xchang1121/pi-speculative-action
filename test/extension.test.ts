@@ -93,6 +93,10 @@ describe("zero-modification Pi extension", () => {
 		await expect(fixture.drafterComplete(testModel("mock"), { messages: [] }, { reasoning: "low", headers: { b: "2" } })).resolves.toBe(message);
 		expect(streamSimple).toHaveBeenCalledWith({ ...testModel("mock"), baseUrl: "http://proxy" }, { messages: [] },
 			{ reasoning: "low", apiKey: "key", headers: { a: "1", b: "2" }, env: {} });
+		expect(fixture.onDrafterResponse).toHaveBeenCalledWith(message, undefined);
+		fixture.onDrafterResponse.mockImplementationOnce(() => { throw new Error("report unavailable"); });
+		await expect(fixture.drafterComplete(testModel("mock"), { messages: [] }, { sessionId: "actor-probe" })).resolves.toBe(message);
+		expect(fixture.onDrafterResponse).toHaveBeenLastCalledWith(message, "actor-probe");
 	});
 
 	it("warns once per unavailable Drafter model while drafting with the active model", async () => {
@@ -583,7 +587,9 @@ async function createFixture(options: FixtureOptions = {}) {
 			})),
 	} as unknown as ExtensionAPI;
 	const createExecutionWorlds = vi.fn(() => options.executionWorlds ?? []);
+	const onDrafterResponse = vi.fn();
 	const factory = createSpeculativeActionExtension({
+		onDrafterResponse,
 		createHost: (_sessionID, configured) => { hostOptions = configured; return host; },
 		createSettingsStore: () => store,
 		...(options.defaultExecutionWorlds ? {} : { createExecutionWorlds }),
@@ -593,7 +599,7 @@ async function createFixture(options: FixtureOptions = {}) {
 		for (const handler of handlers.get(event) ?? []) await handler(payload as never, context);
 	};
 	return {
-		actorTools, baseTools, commands, context, createExecutionWorlds, customTools, cwd, emit, handlers, host, settle,
+		actorTools, baseTools, commands, context, createExecutionWorlds, customTools, cwd, emit, handlers, host, settle, onDrafterResponse,
 		executionWorlds: () => hostOptions?.executionWorlds ?? [],
 		drafterComplete: (...args: Parameters<CreateSpeculativeActionHostOptions["complete"]>) => hostOptions!.complete(...args),
 		drafterModel: (actor: ReturnType<typeof testModel>) => (hostOptions!.draftModel as (actor: unknown) => unknown)(actor),

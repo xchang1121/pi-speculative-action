@@ -12,6 +12,7 @@ import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager
 import { createSpeculativeActionHost } from "../src/agent-integration.ts";
 import { DEFAULTS } from "../src/common.ts";
 import { createSpeculativeActionExtension } from "../src/extension.ts";
+import type { DrafterTaskBudget } from "../src/drafter-budget.ts";
 import { LinuxProcessReuseBackend } from "../src/linux-process-backend.ts";
 import type { SpeculativeActionEvent } from "../src/runtime.ts";
 import { summarizeSpeculativeTrace } from "../src/trace-summary.ts";
@@ -194,21 +195,16 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		modify: (provider) => credentials.read(provider), delete: async () => {},
 	};
 	for (const name of Object.keys(process.env)) if (SECRET_VARIABLE.test(name)) delete process.env[name];
+	let drafterBudget: DrafterTaskBudget | undefined;
 	const extension = createSpeculativeActionExtension({
-		createHost: (id, options) => createSpeculativeActionHost(id, {
-			...options,
-			complete: async (draftModel, context, streamOptions) => {
-				const message = await options.complete(draftModel, context, streamOptions);
-				drafterPredictionTrace.push({
-					...(streamOptions?.sessionId ? { requestSessionID: streamOptions.sessionId } : {}),
-					stopReason: message.stopReason,
-					usage: message.usage,
-					calls: message.content.flatMap((item) => item.type === "toolCall" ? [{ tool: item.name, input: item.arguments }] : []),
-				});
-				return message;
-			},
-			onEvent: (event) => { events.push(event); options.onEvent?.(event); },
+		onDrafterResponse: (message, requestSessionID) => drafterPredictionTrace.push({
+			...(requestSessionID ? { requestSessionID } : {}), stopReason: message.stopReason, usage: message.usage,
+			calls: message.content.flatMap((item) => item.type === "toolCall" ? [{ tool: item.name, input: item.arguments }] : []),
 		}),
+		createHost: (id, options) => {
+			drafterBudget = options.drafterBudget;
+			return createSpeculativeActionHost(id, { ...options, onEvent: (event) => { events.push(event); options.onEvent?.(event); } });
+		},
 	});
 	const settingsManager = SettingsManager.inMemory({}, { projectTrusted: true });
 	const sessionManager = SessionManager.inMemory(task.workspace);
@@ -304,6 +300,8 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			hitRate: actorActions ? summary.speculativeHits / actorActions : 0,
 			actorCost: actorUsage.cost,
 			drafterCost: drafterUsage.cost,
+			drafterUsageScope: "all_responses_including_actor_probes",
+			drafterBudget: drafterBudget?.snapshot(),
 			actorTokens: actorUsage.tokens,
 			drafterTokens: drafterUsage.tokens,
 			actorInputTokens: actorUsage.inputTokens,

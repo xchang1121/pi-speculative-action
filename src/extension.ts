@@ -2,7 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import type { AgentMessage, AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@earendil-works/pi-agent-core";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import type { Api, AssistantMessage, Model } from "@earendil-works/pi-ai";
 import { convertToLlm, createLocalBashOperations, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, type ExtensionFactory,
 	type ExtensionUIContext, getAgentDir, getShellConfig, SettingsManager, type SourceInfo, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { KEYABLE_TOOLS, OBSERVATION_ACTION_TOOLS, PI_ACTION_SEMANTICS, UNBOUNDED_ACTION_TOOLS,
@@ -135,6 +135,8 @@ export interface SpeculativeActionExtensionDependencies {
 	readonly createSettingsStore?: (cwd: string) => SpeculativeSettingsStore;
 	readonly createWorkspaceSandboxService?: () => WorkspaceSandboxService;
 	readonly selfSpeculationFetch?: typeof globalThis.fetch;
+	/** Observes every Drafter response, including Actor probes, without receiving credentials. */
+	readonly onDrafterResponse?: (message: AssistantMessage, requestSessionID?: string) => void;
 }
 
 export interface SpeculativeActionExecutionWorldContext { readonly cwd: string; readonly autoResizeImages: boolean; }
@@ -190,7 +192,7 @@ export function formatSpeculativeActionStatus(input: {
 		metrics.tasks > 0
 			? `Task timing (${metrics.tasks} completed): ${formatTaskTiming(metrics)}. Speedup is the same-run serialized counterfactual divided by wall time.`
 			: "Task timing: n/a (no completed task); serialized overlap and speedup are not reported as 0.",
-		`Drafter tokens (input + output, every request): ${metrics.totalDraftTokens}${metrics.hiddenLatencyMs > 0 ? `; ${Math.round(metrics.totalDraftTokens * 1000 / metrics.hiddenLatencyMs)} per second hidden` : ""}`,
+		`Prediction Drafter tokens (input + output): ${metrics.totalDraftTokens}${metrics.hiddenLatencyMs > 0 ? `; ${Math.round(metrics.totalDraftTokens * 1000 / metrics.hiddenLatencyMs)} per second hidden` : ""}`,
 		`Live speculative results: ${cache.resultEntries}/${cache.cacheCapacity}, ${formatBytes(cache.resultBytes)}/${formatBytes(cache.cacheByteCapacity ?? 0)}; cold: ${cache.cacheCold}; hot: ${cache.cacheHot}; jobs: ${cache.inFlightJobs}; branches: ${cache.branchEntries} (${formatBytes(cache.branchBytes)})`,
 	].join("\n");
 }
@@ -289,8 +291,10 @@ async function installController(
 	const completeDraft: CreateSpeculativeActionHostOptions["complete"] = (model, llmContext, options) => providerRequest.run("drafter", async () => {
 		const registry = latestContext.modelRegistry, provider = registry.getProvider(model.provider), auth = await registry.getApiKeyAndHeaders(model);
 		if (!provider || !auth.ok) throw new Error(auth.ok ? `Unknown provider: ${model.provider}` : auth.error);
-		return provider.streamSimple({ ...model, baseUrl: auth.baseUrl ?? model.baseUrl }, llmContext, { ...options, apiKey: options?.apiKey ?? auth.apiKey,
+		const message = await provider.streamSimple({ ...model, baseUrl: auth.baseUrl ?? model.baseUrl }, llmContext, { ...options, apiKey: options?.apiKey ?? auth.apiKey,
 			headers: { ...auth.headers, ...options?.headers }, env: { ...auth.env, ...options?.env } }).result();
+		try { dependencies.onDrafterResponse?.(message, options?.sessionId); } catch { /* Reporting cannot change inference. */ }
+		return message;
 	});
 	const draftModelFor = (actorModel: Model<Api>) => {
 		const reference = settings().draftModel, model = reference ? findExactModelReferenceMatch(reference, latestContext.modelRegistry.getAvailable()) : actorModel;

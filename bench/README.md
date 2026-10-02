@@ -61,6 +61,8 @@ npm run bench:suite -- --suite swe_diverse --repeats 3 --label speculative
 
 常用开关：`--drafter-disabled` 关闭 Drafter，`--drafter-max-depth 0` 关闭续推，`--pattern-aware --pattern-state <目录>` 启用并持久化模式学习，`--self-speculation` 启用经 Drafter 读取 Actor 推理的 fork（`forkTransport: "drafter"`），`--drafter-pattern-hints` 让 Drafter 看到 PatternAware 预期的调用（A/B）。共享模式状态不共享工作区文件；默认最多 128 轮，达到上限属于未完成。
 
+`--drafter-task-max-requests` 和 `--drafter-task-max-tokens` 约束整个任务的预测、续推和 Actor 探测。报告的 Drafter usage 与费用包含全部收到的响应；`drafterBudget` 另外列出缺少 usage 的预留，无法据此声称精确账单。普通来源的预测 token 统计与这份完整请求统计分开。
+
 每次调度策略变更至少覆盖以下矩阵；`swe_smoke` 只运行 Axios FormData 修复任务，用于限制首次真实模型验证的范围。完整自然任务结论仍需扩大到多实例、多次重复。
 
 | 场景 | 入口 | 验收内容 |
