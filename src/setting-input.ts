@@ -21,15 +21,16 @@ export function booleanOr(value: unknown, fallback: boolean): boolean {
 
 /** Every stored field declares its parser; unknown fields never enter the normalized result. */
 export function settingsParser<Settings extends Record<string, unknown>>(
-	defaults: Settings,
-	parsers: { readonly [Key in keyof Settings]: (value: unknown, fallback: Settings[Key]) => Settings[Key] },
-): (input: Readonly<Record<string, unknown>> | undefined) => Settings {
-	const keys = Object.keys(defaults) as Array<Extract<keyof Settings, string>>;
-	return (input) => {
+	fields: { readonly [Key in keyof Settings]: readonly [Settings[Key], (value: unknown, fallback: Settings[Key]) => Settings[Key]] },
+) {
+	const keys = Object.keys(fields) as Array<Extract<keyof Settings, string>>;
+	const defaults = Object.fromEntries(keys.map(key => [key, fields[key][0]])) as Settings;
+	const parse = (input?: Readonly<Record<string, unknown>>): Settings => {
 		const result = {} as Settings;
-		for (const key of keys) result[key] = parsers[key](input?.[key], defaults[key]);
+		for (const key of keys) result[key] = fields[key][1](input?.[key], defaults[key]);
 		return result;
 	};
+	return { defaults, parse };
 }
 
 export type SettingInputResult<T> =

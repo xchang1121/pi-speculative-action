@@ -951,8 +951,7 @@ describe("structural speculative runtime", () => {
 				authoritativeToolCount: reusable && !fallback ? 1 : 2,
 				toolExecutionMs: fallback ? 6 : reusable ? 4 : 10,
 			});
-			expect(summary()).toMatchObject({ tasks: 1, endToEndMs: now - 100, toolExecutionMs: fallback ? 6 : reusable ? 4 : 10,
-				nonToolMs: reusable ? 52 : 58, hiddenLatencyMs: reusable ? 0 : 6,
+			expect(summary()).toMatchObject({ tasks: 1, toolExecutionMs: fallback ? 6 : reusable ? 4 : 10, hiddenLatencyMs: reusable ? 0 : 6,
 				speculativeExecutionMs: reusable ? 0 : 6, actorExecutionMs: fallback ? 6 : 4 });
 		} finally { await runtime.dispose(); clock.mockRestore(); }
 	});

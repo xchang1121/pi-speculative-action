@@ -17,17 +17,12 @@ export interface ThinkThreadToolRunnerRequest {
 	readonly modelSupportsImages: boolean;
 }
 
-interface ThinkThreadToolRunnerResponse {
-	readonly settlement: {
-		readonly result: {
-			readonly content: AgentToolResult<unknown>["content"];
-			readonly details: unknown;
-		};
-		readonly isError: boolean;
-	};
-}
-
 const TOOL_NAMES = new Set<string>(THINKTHREAD_TOOL_NAMES);
+
+function decodeJSON(bytes: Uint8Array, error: string) {
+	try { return asRecord(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes))); }
+	catch { throw new Error(error); }
+}
 
 export function encodeThinkThreadToolRunnerRequest(request: ThinkThreadToolRunnerRequest): Uint8Array {
 	const bytes = new TextEncoder().encode(JSON.stringify(request));
@@ -41,13 +36,7 @@ export function decodeThinkThreadToolRunnerRequest(bytes: Uint8Array): ThinkThre
 	if (bytes.byteLength > THINKTHREAD_TOOL_RUNNER_MAX_REQUEST_BYTES) {
 		throw new Error("ThinkThread tool runner request exceeds 1 MiB");
 	}
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
-	} catch {
-		throw new Error("ThinkThread tool runner request is not valid UTF-8 JSON");
-	}
-	const record = asRecord(parsed);
+	const record = decodeJSON(bytes, "ThinkThread tool runner request is not valid UTF-8 JSON");
 	if (!record || typeof record.tool !== "string" || !TOOL_NAMES.has(record.tool)) {
 		throw new Error("ThinkThread tool runner request tool is unsupported");
 	}
@@ -67,7 +56,7 @@ export function decodeThinkThreadToolRunnerRequest(bytes: Uint8Array): ThinkThre
 }
 
 export function encodeThinkThreadToolRunnerResponse(settlement: ToolSettlement): string {
-	const response: ThinkThreadToolRunnerResponse = {
+	const response = {
 		settlement: {
 			result: {
 				content: settlement.result.content,
@@ -96,13 +85,7 @@ export function decodeThinkThreadToolRunnerResponse(stdout: Uint8Array): ToolSet
 	if (!Number.isSafeInteger(declaredBytes) || declaredBytes !== payload.byteLength || digest(payload) !== match[2]) {
 		throw new Error("ThinkThread tool runner response integrity check failed");
 	}
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(payload));
-	} catch {
-		throw new Error("ThinkThread tool runner response payload is invalid");
-	}
-	const response = asRecord(parsed);
+	const response = decodeJSON(payload, "ThinkThread tool runner response payload is invalid");
 	const settlement = asRecord(response?.settlement);
 	const result = asRecord(settlement?.result);
 	if (

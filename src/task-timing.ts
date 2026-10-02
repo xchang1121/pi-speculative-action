@@ -88,12 +88,12 @@ export class TaskTimeline {
 			.map(tool => ({ native: tool.native, parts: clipped(tool.endpoints, startedAt, completedAt) })).filter(tool => tool.parts.length);
 		const authoritativeTools = computations.flatMap(tool => tool.parts);
 		const nativeTools = computations.flatMap(tool => tool.native ? tool.parts : []);
-		const endToEndMs = completedAt - startedAt, actorPhaseMs = unionDuration(actorPhases), toolExecutionMs = duration(authoritativeTools);
-		const orchestrationMs = Math.max(0, endToEndMs - unionDuration([...actorPhases, ...authoritativeTools])), nonToolMs = actorPhaseMs + orchestrationMs;
+		const toolExecutionMs = duration(authoritativeTools);
 		// Native calls overlapping each other (a parallel batch) would overlap without speculation: count their union.
-		const hiddenLatencyMs = nonNegativeDifference(nonToolMs + toolExecutionMs - duration(nativeTools) + unionDuration(nativeTools), endToEndMs);
+		const hiddenLatencyMs = nonNegativeDifference(unionDuration(actorPhases) + toolExecutionMs - duration(nativeTools) + unionDuration(nativeTools),
+			unionDuration([...actorPhases, ...authoritativeTools]));
 		const toolWaitMs = unionDuration(clipped(this.toolWaits, startedAt, completedAt));
-		return Object.freeze({ startedAt, completedAt, endToEndMs, nonToolMs, actorPhaseMs, orchestrationMs, toolExecutionMs, toolWaitMs, hiddenLatencyMs,
+		return Object.freeze({ startedAt, completedAt, toolExecutionMs, toolWaitMs, hiddenLatencyMs,
 			/** Distinct accepted computations with exclusive time in this task, not Actor call count. */
 			authoritativeToolCount: computations.length,
 		});

@@ -110,22 +110,8 @@ function forecastFor(node: PlanRuntimeNode, decisionSequence: number, actorPhase
 }
 
 function planActionDraft(node: PlanRuntimeNode): SpeculativeDraftCandidate {
-	return {
-		type: node.action.type,
-		...(node.action.operation ? { operation: node.action.operation } : {}),
-		tool: node.action.tool,
-		input: node.action.input,
-		...(node.action.diagnostic ? { diagnostic: node.action.diagnostic } : {}),
-		source: node.source,
-		proposalID: node.proposalID,
-		actionID: node.action.id,
-		feedback: node.action.feedback,
-		...(node.action.dependsOn ? { dependsOn: node.action.dependsOn } : {}),
-		...definedFields(node.action, [
-			"horizon", "latestHorizon", "empiricalProbability", "adoptionProbability", "conditionalProbability",
-			"expectedDurationMs", "expectedLatencyBenefitMs", "resourceDemand", "depth", "producesOperations",
-		]),
-	};
+	const { id, background: _background, ...draft } = node.action;
+	return { ...draft, source: node.source, proposalID: node.proposalID, actionID: id };
 }
 
 function asConcreteInput(value: unknown): Record<string, unknown> | undefined {

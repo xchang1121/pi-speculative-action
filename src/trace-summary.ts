@@ -34,7 +34,7 @@ export function emptySpeculativeTraceSummary(cache: SpeculativeCacheSnapshot | P
 		actorFallbacks: 0,
 		hitRate: 0,
 		actorCandidateRejections: {} as Readonly<Record<string, number>>,
-		tasks: 0, endToEndMs: 0, nonToolMs: 0, actorPhaseMs: 0, orchestrationMs: 0, toolExecutionMs: 0, toolWaitMs: 0, hiddenLatencyMs: 0,
+		tasks: 0, toolExecutionMs: 0, toolWaitMs: 0, hiddenLatencyMs: 0,
 		speculativeExecutionMs: 0, actorExecutionMs: 0, executionAheadMs: 0, attemptLeadMs: 0, hitLatencyMs: 0, totalDraftTokens: 0,
 		processReuse: emptyWorldReuseMetrics(), // Inside speculative worlds, never the Actor route.
 		cache: cloneCache({ ...EMPTY_CACHE, ...cache }),
@@ -58,10 +58,6 @@ export function reduceSpeculativeTrace<SessionID>(
 			break;
 		case "task":
 			next.tasks++;
-			next.endToEndMs += metric(event.timing.endToEndMs);
-			next.nonToolMs += metric(event.timing.nonToolMs);
-			next.actorPhaseMs += metric(event.timing.actorPhaseMs);
-			next.orchestrationMs += metric(event.timing.orchestrationMs);
 			next.toolExecutionMs += metric(event.timing.toolExecutionMs);
 			next.toolWaitMs += metric(event.timing.toolWaitMs);
 			next.hiddenLatencyMs += metric(event.timing.hiddenLatencyMs);

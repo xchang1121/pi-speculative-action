@@ -1,37 +1,28 @@
 import { KEYABLE_TOOLS, type ActionSemanticsRegistry, PI_ACTION_SEMANTICS } from "./action-semantics.ts";
 import type { SpeculativeActionSettings } from "./runtime-contracts.ts";
 import { positiveCount } from "./number-utils.ts";
-import { nonNegativeInteger, nonNegativeNumber, positiveInteger } from "./setting-input.ts";
+import { booleanOr, nonNegativeInteger, nonNegativeNumber, positiveInteger, settingsParser } from "./setting-input.ts";
 
 export interface DrafterToolDefinition { readonly name: string; readonly description?: string; readonly inputSchema?: unknown; }
 
-export interface DrafterRequestSettings {
-	/** Output-informed successor actions retained after the first Drafter action. */
-	readonly drafterMaxDepth: number;
-	/** Output cap for each Drafter request: one proposed tool batch never needs the Actor's answer budget. */
-	readonly drafterMaxTokens: number;
-	/** Cumulative request and input/output token budgets for one user task. */
-	readonly drafterTaskMaxRequests: number;
-	readonly drafterTaskMaxTokens: number;
-	/** Number of leading Drafter requests sent at temperature zero. */
-	readonly drafterDeterministicCandidates: number;
-	/** Inclusive temperature range stratified across the remaining requests. */
-	readonly drafterTemperatureMin: number;
-	readonly drafterTemperatureMax: number;
-	/** Show the Drafter the calls PatternAware expects next (for A/B; off by default). */
-	readonly drafterPatternHints: boolean;
-}
+export type DrafterRequestSettings = Readonly<typeof DRAFTER_DEFAULTS>;
 
-const DRAFTER_DEFAULTS: DrafterRequestSettings = {
-	drafterMaxDepth: 1,
-	drafterMaxTokens: 4096,
-	drafterTaskMaxRequests: 32,
-	drafterTaskMaxTokens: 262_144,
-	drafterDeterministicCandidates: 1,
-	drafterTemperatureMin: 0.7,
-	drafterTemperatureMax: 0.7,
-	drafterPatternHints: false,
-};
+const { defaults: DRAFTER_DEFAULTS, parse: parseDrafterSettings } = settingsParser({
+	/** Output-informed successor actions retained after the first Drafter action. */
+	drafterMaxDepth: [1, nonNegativeInteger],
+	/** Output cap for each Drafter request: one proposed tool batch never needs the Actor's answer budget. */
+	drafterMaxTokens: [4096, positiveInteger],
+	/** Cumulative request and input/output token budgets for one user task. */
+	drafterTaskMaxRequests: [32, positiveInteger],
+	drafterTaskMaxTokens: [262_144, positiveInteger],
+	/** Number of leading Drafter requests sent at temperature zero. */
+	drafterDeterministicCandidates: [1, nonNegativeInteger],
+	/** Inclusive temperature range stratified across the remaining requests. */
+	drafterTemperatureMin: [0.7, nonNegativeNumber],
+	drafterTemperatureMax: [0.7, nonNegativeNumber],
+	/** Show the Drafter the calls PatternAware expects next (for A/B; off by default). */
+	drafterPatternHints: [false, booleanOr],
+});
 
 export const DEFAULTS = {
 	enabled: false,
@@ -67,22 +58,9 @@ export function normalizeSpeculativeToolSelection(value: unknown, allowed: reado
 }
 
 export function normalizeDrafterRequestSettings(value: unknown): DrafterRequestSettings {
-	const input = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
-	const lower = nonNegativeNumber(input.drafterTemperatureMin, DEFAULTS.drafterTemperatureMin);
-	const upper = nonNegativeNumber(input.drafterTemperatureMax, DEFAULTS.drafterTemperatureMax);
-	return {
-		drafterMaxDepth: nonNegativeInteger(input.drafterMaxDepth, DEFAULTS.drafterMaxDepth),
-		drafterMaxTokens: positiveInteger(input.drafterMaxTokens, DEFAULTS.drafterMaxTokens),
-		drafterTaskMaxRequests: positiveInteger(input.drafterTaskMaxRequests, DEFAULTS.drafterTaskMaxRequests),
-		drafterTaskMaxTokens: positiveInteger(input.drafterTaskMaxTokens, DEFAULTS.drafterTaskMaxTokens),
-		drafterDeterministicCandidates: nonNegativeInteger(
-			input.drafterDeterministicCandidates,
-			DEFAULTS.drafterDeterministicCandidates,
-		),
-		drafterTemperatureMin: Math.min(lower, upper),
-		drafterTemperatureMax: Math.max(lower, upper),
-		drafterPatternHints: input.drafterPatternHints === true,
-	};
+	const result = parseDrafterSettings(value && typeof value === "object" ? value as Record<string, unknown> : undefined);
+	const lower = result.drafterTemperatureMin, upper = result.drafterTemperatureMax;
+	return { ...result, drafterTemperatureMin: Math.min(lower, upper), drafterTemperatureMax: Math.max(lower, upper) };
 }
 
 /** Stratify non-deterministic requests across the configured range for any proposal count. */

@@ -50,7 +50,8 @@ describe("faux LLM speculative action end to end", () => {
 		const phases = result.events.filter((event) => event.type === "candidate").map((event) => event.state.status);
 		expect(phases).toEqual(calls.slice(0, 4).flatMap(() => ["running", "succeeded"]));
 		expect(result.summary.toolWaitMs).toBeGreaterThan(0);
-		expect(result.summary.toolWaitMs).toBeLessThanOrEqual(result.summary.endToEndMs);
+		const task = result.events.find(event => event.type === "task")!.timing;
+		expect(result.summary.toolWaitMs).toBeLessThanOrEqual(task.completedAt - task.startedAt);
 		expect(result.summary.hiddenLatencyMs).toBeGreaterThanOrEqual(0);
 	});
 
