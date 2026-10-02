@@ -163,6 +163,22 @@ function call(turnID: string, input: Record<string, unknown> = { path: "README.m
 }
 
 describe("structural speculative runtime", () => {
+	it("calibrates a repeatedly adopted result with one Actor execution and then resumes reuse", async () => {
+		const { runtime, ready, events, executions } = harness({ source: planSource({ propose: () => plan("calibration") }) });
+		try {
+			await runtime.startTurn(start("turn")); await ready.promise;
+			for (let index = 0; index < 4; index++) expect((await runtime.prepareActorCall({ ...call("turn"), id: `hit-${index}` }))?.output).toBe("speculative");
+			await runFallback(runtime, { ...call("turn"), id: "calibration" }, 100, "speculative");
+			for (let index = 0; index < 4; index++) expect((await runtime.prepareActorCall({ ...call("turn"), id: `measured-${index}` }))?.output).toBe("speculative");
+			await runtime.finishTurn({ ...call("turn"), terminal: true });
+			const actions = events.filter(event => event.type === "actor_action");
+			expect(actions.filter(event => event.settlement.provider.kind === "actor")).toHaveLength(1);
+			expect(actions.find(event => event.settlement.actorAction.id === "calibration")?.settlement.rejections)
+				.toMatchObject([{ cause: { code: "candidate_calibration_sample" } }]);
+			expect(executions()).toBe(1);
+		} finally { await runtime.dispose(); }
+	});
+
 	it.each(["same", "next", "unused"])("separates internal execution, matching and continuation in the %s turn even when an adapter collides keys", async mode => {
 		const binding = Object.freeze({ backend: "process", identity: "child", permissionHash: "parent", executionMs: 2, expectedDurationMs: 3 });
 		const complete = vi.fn(), materialized = vi.fn(), continuation = vi.fn(), settled = vi.fn();

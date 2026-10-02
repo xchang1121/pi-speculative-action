@@ -1519,8 +1519,9 @@ export function makeSpeculativeActionRuntime<
 					choice.match,
 					cause(
 						"matching",
-						"candidate_join_not_profitable",
+						join.reason === "calibration_probe" ? "candidate_calibration_sample" : "candidate_join_not_profitable",
 						JSON.stringify({
+							reason: join.reason,
 							expectedRemainingMs: join.expectedRemainingMs,
 							expectedAdoptionMs: join.expectedAdoptionMs,
 							expectedActorMs: join.expectedActorMs,

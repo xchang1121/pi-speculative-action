@@ -183,6 +183,20 @@ describe("SpeculationScheduler", () => {
 		expect(scheduler.evaluate([withoutPhase]).priorityMs).toBe(240);
 	});
 
+	it("samples the Actor alternative after repeated ready hits with unknown benefit, then uses the measured service", () => {
+		const scheduler = new SpeculationScheduler<object>(), identity = { tool: "read", actionKeyHash: "query" };
+		for (let index = 0; index < DEFAULT_BENEFIT_GATE_POLICY.minSamples; index++) {
+			expect(joinDecision(scheduler, identity, { state: "succeeded" })).toMatchObject({ allowed: true, reason: "ready" });
+			scheduler.observeAdoption(identity, 20);
+		}
+		const calibration = joinDecision(scheduler, identity, { state: "succeeded" });
+		expect(calibration).toMatchObject({ allowed: false, reason: "calibration_probe", actorSamples: 0 });
+		expect(calibration.expectedNetBenefitMs).toBeUndefined();
+		scheduler.observeActorService(identity, 120);
+		for (let index = 0; index < 12; index++) expect(joinDecision(scheduler, identity, { state: "succeeded" }))
+			.toMatchObject({ allowed: true, reason: "ready", expectedNetBenefitMs: 100 });
+	});
+
 	it("separates producer, consumer, and adoption work while retaining exact/class quantiles and bounded history", () => {
 		const scheduler = new SpeculationScheduler<object>();
 		const identity = { tool: "bash", executionFingerprint: "linux-world", actionKeyHash: "producer" };

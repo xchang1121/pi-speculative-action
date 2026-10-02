@@ -20,15 +20,32 @@ describe("fork benefit gate", () => {
 				expect(gate.snapshot().samples).toBe(index + 1);
 				expect(gate.snapshot().expectedNetBenefitMs).toBe(expectedActorMs === undefined ? undefined : expectedActorMs - 100);
 			}
-			expect(gate.start("drafter", true).allowed).toBe(expectedActorMs !== 50);
+			expect(gate.start("drafter", true).allowed).toBe(expectedActorMs === 300);
 			if (expectedActorMs === undefined) {
-				for (let index = 0; index < 4; index++) {
+				for (let index = 0, probes = 0; index < 128 && probes < 4; index++) {
 					const missed = gate.start("drafter", true);
+					if (!missed.allowed) continue;
+					probes++;
 					gate.requestStarted(missed); gate.requestSettled(missed); gate.finish(missed);
 				}
 				expect(gate.start("drafter", true).allowed).toBe(false);
 			}
 		}
+	});
+
+	it.each([1, 4])("bounds unknown-benefit exploration with a %i-sample window and recovers from late evidence", windowSize => {
+		const gate = new BenefitGate(), policy = { ...POLICY, windowSize }, decisions = [];
+		const updates: ReturnType<BenefitGate["observe"]>[] = [];
+		for (let index = 0; index < 40; index++) {
+			const decision = gate.decide("unknown", policy); decisions.push(decision);
+			if (decision.allowed) updates.push(gate.observe("unknown", { costMs: 20 }, policy));
+		}
+		expect(decisions.filter(decision => decision.reason === "warmup")).toHaveLength(4);
+		expect(decisions.filter(decision => decision.allowed)).toHaveLength(7);
+		expect(decisions.filter(decision => decision.reason === "calibration_probe")).toHaveLength(3);
+		expect(gate.snapshot("unknown").expectedNetBenefitMs).toBeUndefined();
+		for (const update of updates) update({ costMs: 20, benefitMs: 120 });
+		expect(gate.decide("unknown", policy)).toMatchObject({ allowed: true, reason: "profitable", expectedNetBenefitMs: 100 });
 	});
 
 	it("keeps profitable forks and suppresses a negative rolling window", () => {

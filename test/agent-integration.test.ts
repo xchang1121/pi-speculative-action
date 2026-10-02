@@ -15,6 +15,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActionSemanticsRegistry, buildPiActionKey, KEYABLE_TOOLS, PI_ACTION_SEMANTICS, widenReadGuess } from "../src/action-semantics.ts";
 import { borrowResourceObject, createResourceSnapshotExecutionWorld, type SpeculativeAgentExecutionWorld } from "../src/agent-execution-world.ts";
 import { createSpeculativeActionHost, type CreateSpeculativeActionHostOptions } from "../src/agent-integration.ts";
+import { SpeculationScheduler } from "../src/scheduler.ts";
 import { createDrafterPlanSource } from "../src/drafter-plan-source.ts";
 import { patternAwareActionSemantics, acquirePatternAwareStore, PATTERN_AWARE_DEFAULTS, PatternAwareStore, patternAwareSettings } from "../src/pattern-aware.ts";
 import { createPatternPlanSource } from "../src/pattern-plan-source.ts";
@@ -561,6 +562,12 @@ describe("speculative action host", () => {
 	});
 
 	it.for([false, true])("owns composed query proofs across turns and source retirement (oversized=%s)", async (oversized, { skip }) => {
+		// This fixture exercises repeated proof ownership; Actor calibration has its own end-to-end case.
+		const assessJoin = SpeculationScheduler.prototype.assessCandidateJoin;
+		vi.spyOn(SpeculationScheduler.prototype, "assessCandidateJoin").mockImplementation(function (this: SpeculationScheduler<object>, request) {
+			const decision = assessJoin.call(this, request);
+			return decision.reason === "calibration_probe" ? { ...decision, allowed: true, reason: "ready" } : decision;
+		});
 		const cwd = await temporaryWorkspace(), profile = await createClosedSearchProfile(cwd);
 		if (!profile.invocations.has("grep")) { await profile.pool.dispose(); return skip("qualified rg is unavailable"); }
 		await writeFile(path.join(cwd, ".ignore"), "# shared selection rules\n");
