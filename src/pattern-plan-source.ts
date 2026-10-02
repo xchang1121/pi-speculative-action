@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ActionProjectionRule } from "./action-key-projection.ts";
-import { type ActionSemanticsRegistry, widenReadGuess, withoutWorkingDirectoryPrefix } from "./action-semantics.ts";
+import { type ActionSemanticsRegistry, widenReadGuess } from "./action-semantics.ts";
 import { BoundedRecencyMap } from "./bounded-recency-map.ts";
 import type { ExecutionOperationBinding } from "./execution-world.ts";
 import { agentBatchKey, type AgentPlanSource, type AgentStartInput } from "./agent-runtime-types.ts";
@@ -112,8 +112,7 @@ export function createPatternPlanSource({
 		if (failure) throw failure.reason;
 	};
 	const eventData = (tool: string, input: Readonly<Record<string, unknown>>, output: ToolSettlement | undefined, durationMs: number) => ({
-		// A command that first enters the workspace is the same command in every session.
-		tool, input: tool === "bash" && typeof input.command === "string" ? { ...structuredClone(input), command: withoutWorkingDirectoryPrefix(input.command, cwd) } : structuredClone(input), outcome: output?.isError ? "failure" as const : "success" as const,
+		tool, input: structuredClone(input), outcome: output?.isError ? "failure" as const : "success" as const,
 		...projectPatternAwareObservation(output?.result, extractOutputPaths(tool, input, output?.result), cwd, extractOutputLocations(tool, input, output?.result)),
 		...(output?.isError ? { errorClass: failureClass(output.result.content.flatMap((item) => item.type === "text" ? [item.text] : []).join("\n")) } : {}),
 		durationMs,

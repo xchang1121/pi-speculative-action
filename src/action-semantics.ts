@@ -354,19 +354,13 @@ export function normalizeReadLimit(value: unknown): number {
 	return limit === undefined ? READ_DEFAULT_LIMIT : Math.max(0, Math.floor(limit));
 }
 
-/** `cd <cwd> && command` (or `;`) in the shell's own directory: the cd always succeeds and prints nothing, so it is the command. */
-export function withoutWorkingDirectoryPrefix(command: string, cwd: string): string {
-	const directory = slash(path.resolve(cwd)).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-	return command.replace(new RegExp(`^\\s*cd\\s+(["']?)${directory}/?\\1\\s*(?:&&|;)\\s*(?=\\S)`), "");
-}
-
 function canonicalPiAction(tool: string, input: unknown, cwd: string): CanonicalAction | undefined {
 	const record = asRecord(input);
 	if (!record) return undefined;
 	if (tool === "bash") {
 		if (typeof record.command !== "string") return undefined;
 		const resource = slash(path.resolve(cwd));
-		return { resources: [resource], input: { command: withoutWorkingDirectoryPrefix(record.command, resource), cwd: resource,
+		return { resources: [resource], input: { command: record.command, cwd: resource,
 			...(finiteNumber(record.timeout) !== undefined ? { timeout: record.timeout } : {}) } };
 	}
 	const query = tool === "grep" || tool === "find" || tool === "ls";

@@ -1,4 +1,5 @@
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
 import { resourceDependencies } from "../src/resource-version.ts";
 import { type ActionKeyProjector, type ActionSemanticsDefinition, ActionSemanticsRegistry, actionKeyCovers, actionKeyMatch, actionKeyMismatchReason,
@@ -59,10 +60,17 @@ describe("ActionSemanticsRegistry", () => {
 		expect(Object.isFrozen(implicit?.resources)).toBe(true);
 	});
 
-	it("keys a command that first enters its own working directory as the bare command", () => {
-		const cwd = path.resolve("/workspace").replaceAll("\\", "/"), key = (command: string) => buildPiActionKey("bash", { command }, cwd)!.key;
-		for (const entering of [`cd ${cwd} && git diff`, `cd "${cwd}/"; git diff`, `  cd '${cwd}' &&  git diff`]) expect(key(entering)).toBe(key("git diff"));
-		for (const other of [`cd ${cwd}/sub && git diff`, `cd ${cwd}x && git diff`, `cd ${cwd}`]) expect(key(other)).not.toBe(key("git diff"));
+	it("preserves cd's observable shell state in keys and executable inputs", () => {
+		const cwd = process.cwd().replaceAll("\\", "/"), command = 'printf "%s" "$OLDPWD"';
+		const key = (command: string) => buildPiActionKey("bash", { command }, cwd)!;
+		for (const entering of [`cd "${cwd}" && ${command}`, `cd '${cwd}/'; ${command}`]) {
+			expect(key(entering).key).not.toBe(key(command).key);
+			expect(key(entering).input.command).toBe(entering);
+			if (process.platform === "linux") {
+				const run = (script: string) => execFileSync("/bin/bash", ["--noprofile", "--norc", "-c", script], { cwd, env: { ...process.env, OLDPWD: "/" }, encoding: "utf8" });
+				expect(run(command)).toBe("/"); expect(run(entering)).toBe(cwd);
+			}
+		}
 	});
 
 	it("projects a finished Bash command onto any longer or absent timeout", async () => {
