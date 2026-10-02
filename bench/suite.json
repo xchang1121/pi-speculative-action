@@ -1,4 +1,7 @@
 {
+	"swe_smoke": [
+		"axios__axios-5316"
+	],
 	"swe_js": [
 		"axios__axios-5316",
 		"preactjs__preact-2896",

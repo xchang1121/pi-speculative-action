@@ -48,6 +48,7 @@ npm run bench:overlay-probe
 ```sh
 npm run bench:ablation -- --instance axios__axios-5316 --prepare-only
 npm run bench:ablation -- --instance axios__axios-5316 --label baseline --speculation-disabled
+npm run bench:suite -- --suite swe_smoke --paired --repeats 1 --max-turns 32 --timeout-ms 360000 --label validation
 npm run bench:suite -- --suite swe_diverse --repeats 3 --label speculative
 ```
 
@@ -56,6 +57,17 @@ npm run bench:suite -- --suite swe_diverse --repeats 3 --label speculative
 运行经 Pi SDK 加载已安装的扩展（Pi 默认工具与系统提示、Linux 进程复用、沙箱与快照路线），设置写入运行专属 agent 目录；Linux 路线需在 WSL/Linux 中运行并提供 `PI_SPEC_SANDLOCK`/`PI_SPEC_HELD_EXEC`/`PI_SPEC_STRACE`。`bench:suite -- --paired` 对每个实例与重复交替先后运行开/关两臂，报告 `pairedRatio`（关的实际总耗时 / 开的实际总耗时，可 < 1）及各臂汇总。
 
 常用开关：`--drafter-disabled` 关闭 Drafter，`--drafter-max-depth 0` 关闭续推，`--pattern-aware --pattern-state <目录>` 启用并持久化模式学习，`--self-speculation` 启用经 Drafter 读取 Actor 推理的 fork（`forkTransport: "drafter"`），`--drafter-pattern-hints` 让 Drafter 看到 PatternAware 预期的调用（A/B）。共享模式状态不共享工作区文件；默认最多 128 轮，达到上限属于未完成。
+
+每次调度策略变更至少覆盖以下矩阵；`swe_smoke` 只运行 Axios FormData 修复任务，用于限制首次真实模型验证的范围。完整自然任务结论仍需扩大到多实例、多次重复。
+
+| 场景 | 入口 | 验收内容 |
+| --- | --- | --- |
+| 搜索密集与输入频繁变化 | `bench/portable-kernel.mjs`、`bench/grep-captured-qualification.mjs` | 逐步输出、输入变化后的回退或重算、取消与关闭 |
+| 多步、低命中和未知收益 | `test/faux-llm-e2e.test.ts`、`test/drafter-adaptation.test.ts` | 完整 Agent 任务、有限探索、额外候选与续推层的收缩和恢复、延迟反馈 |
+| Actor 资源争用与内部进程接管 | `test/runtime-engine.test.ts`、`test/linux-process-world.test.ts` | 并发与跨轮资源预留、物理回收、当前调用的内部计算保留与一次采纳 |
+| 自然修改与验证任务 | `bench:suite -- --suite swe_smoke --paired` | 最终回复、补丁、数据集指定测试、完整计时和实测 token/费用 |
+
+汇总时保留低命中、失败、超时及较慢样本，分别报告同次运行加速比、端到端均值/P95、命中率、token 和任务正确性。构造的模型时序、组件资格和单个真实任务分别报告。
 
 ## 计时与验收规则
 

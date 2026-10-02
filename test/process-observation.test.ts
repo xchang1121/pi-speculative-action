@@ -50,6 +50,8 @@ describe("process observation", () => {
 		expect(diff.effects[0]?.change).toMatchObject({ ...delta, operation: "write_contents", object: { path: projection.toLogical(target), before: true } });
 		const input = await hydrateWorkspaceFileEntry(beforeEntry, beforeBytes);
 		expect(await hydrateWorkspaceFileEntry(beforeEntry, captured)).toEqual(input);
+		// Force an observable identity change for this rejection check, independently of timestamp resolution.
+		await fs.appendFile(target, "changed-size");
 		expect(await hydrateWorkspaceFileEntry(beforeEntry, await captureStableFile(target))).toBeUndefined();
 		expect(input).toMatchObject({ kind: "file", size: beforeBytes.byteLength });
 		const parentEntry = before.entries.get("");
