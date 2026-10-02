@@ -1091,6 +1091,21 @@ describe("structural speculative runtime", () => {
 		} finally { gates.forEach(gate => gate.release()); await runtime.dispose(); }
 	});
 
+	it("holds a retired turn's native reservation until its actual execution settles", async () => {
+		const bound = barrier(), executed: string[] = [];
+		const { runtime, ready } = harness({ settings: () => ({ ...settings, maxConcurrentActions: 1 }),
+			source: planSource({ propose: ({ startInput }) => startInput.turnID === "next" ? plan("next", { path: "next.ts" }) : undefined }),
+			onCandidateMaterialized: () => bound.arrive(), execute: async (_tool, input) => { executed.push(String(input.path)); return "next"; } });
+		try {
+			await runtime.startTurn(start("old"));
+			const actor = await runtime.prepareActorCall(call("old", { path: "actor.ts" }));
+			await runtime.finishTurn(call("old")); await runtime.startTurn(start("next"));
+			await bound.promise; await nextTurn(); await nextTurn(); expect(executed).toEqual([]);
+			await actor!.settle(simulatedExecution(10), "actor"); await ready.promise;
+			expect(executed).toEqual(["next.ts"]);
+		} finally { await runtime.dispose(); }
+	});
+
 	it("holds speculative capacity through cancellation and cleanup, but never queues the actual Actor behind it", async () => {
 		for (const mode of ["producer", "preview", "queued", "running"] as const) {
 			const executed: string[] = [], aborted: string[] = [];

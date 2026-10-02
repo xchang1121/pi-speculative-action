@@ -1173,7 +1173,7 @@ export function makeSpeculativeActionRuntime<
 				work,
 				candidate.previews?.size ? undefined : actionTimingIdentity(candidate.key),
 			);
-			if (!admission.admitted && admission.reason === "budget_exhausted" && !work.background) {
+			if (!admission.admitted && admission.reason === "budget_exhausted" && !work.background && work.resourceUnits <= speculativeCapacity(session)) {
 				for (const victim of session.scheduler.preemptFor(
 					admission.work.resourceUnits,
 					speculativeCapacity(session),
@@ -2306,7 +2306,10 @@ export function makeSpeculativeActionRuntime<
 		for (const candidate of session.scheduler.preemptFor(
 			protectedCandidates.length ? Math.max(...protectedCandidates.map(candidate => defaultResourceDemand(session, candidate.key, candidate.route))) : 0,
 			speculativeCapacity(session),
-			(candidate) => candidate.work.execution.status === "running" && !protectedCandidates.includes(candidate) && reservationAvailable(candidate.work.reservation),
+			(candidate) => candidate.work.execution.status === "running" && !protectedCandidates.includes(candidate) && reservationAvailable(candidate.work.reservation) &&
+				// An imminent internal computation can serve this Actor inside its native fallback; its OS join happens later.
+				!((candidate.owner.draft.type === "operation" || candidate.owner.draft.producesOperations) && session.plan.consumers(candidate.id)
+					.some(node => node.expectedDecisionSeq <= session.decisionSequence && node.latestDecisionSeq >= session.decisionSequence)),
 			draining,
 		)) {
 			discardCandidate(session, candidate, cause("admission", "preempted_by_actor"));
