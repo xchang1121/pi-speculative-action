@@ -823,11 +823,14 @@ describe("speculative action host", () => {
 				await writeFile(file, "three changed\n");
 				if (successor) expect((await successor.validate!()).status).toBe("stale");
 				expect(await host.execute({ ...call, id: "changed-" + name }, undefined, actor)).toEqual(await current());
-				expect(actor).toHaveBeenCalledTimes(calls + 1);
+				const provider = events.filter(event => event.type === "actor_action").at(-1)!.settlement.provider;
+				if (provider.kind === "speculative") expect(provider.match.kind).toBe("inputs"); // Rebuild from validated inputs; never deliver the stale exact result.
+				const nativeCalls = calls + Number(provider.kind === "actor");
+				expect(actor).toHaveBeenCalledTimes(nativeCalls);
 				await writeFile(file, original);
 				if (coverage !== "prepared") {
 					expect(await host.execute({ ...call, id: "restored-" + name }, undefined, actor)).toEqual(await current());
-					expect(actor).toHaveBeenCalledTimes(calls + 1);
+					expect(actor).toHaveBeenCalledTimes(nativeCalls);
 				}
 			}
 			await host.finishTurn(call.turnID, true);

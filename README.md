@@ -29,7 +29,7 @@ pi -e /absolute/path/to/pi-speculative-action
 
 默认最多两个 Drafter 请求竞争首个有效提案，仍在运行的同伴会被取消；更大的候选宽度增加模型请求成本。一个响应中的工具批次保持完整，整批结果反馈后才续推。`drafterMaxDepth: 0` 关闭 Drafter 自身续推；配置的宽度和深度均为上限，各额外候选与续推层分别依据实际采纳收益收缩、低频探测和恢复。收益门控默认开启：Drafter 请求与 Actor 并行，只把采纳延迟计为成本，模型 token 单独计量；取消的落败请求也进入该层收益样本，延迟采纳可修正原样本。工具列表只限制预测，不改变 Actor 的正常工具权限。
 
-Drafter 每个用户任务默认最多发起 `drafterTaskMaxRequests: 32` 次请求、使用 `drafterTaskMaxTokens: 262144` 个输入与输出 token；并发候选、续推与 Drafter 模式的 Actor 探测共用预算，普通工具轮次不重置。发请求前预留估算输入与输出上限，最后一笔可缩小输出额度；返回 usage 后按实际量结算，没有 usage 的失败或取消保留预留额。输入估算与服务端计费可能不同，因此 token 预算控制后续请求，不是账单硬上限。任务结束后下一次用户任务重新计额，历史效用学习保留；TUI 可配置上限并查看已报告、缺失 usage 和在途预留。
+Drafter 每个用户任务默认最多发起 `drafterTaskMaxRequests: 32` 次请求、使用 `drafterTaskMaxTokens: 262144` 个输入与输出 token；并发候选、续推与 Drafter 模式的 Actor 探测共用预算，普通工具轮次、自动重试及压缩续跑不重置。发请求前预留估算输入与输出上限，最后一笔可缩小输出额度；返回 usage 后按实际量结算，没有 usage 的失败或取消保留预留额。输入估算与服务端计费可能不同，因此 token 预算控制后续请求，不是账单硬上限。任务确实结束（Pi `agent_settled`）后下一次用户任务重新计额，历史效用学习保留；TUI 可配置上限并查看已报告、缺失 usage 和在途预留。
 
 模型与工具契约分别维护最近 32 个可观察预测的匹配记录，以及最近 32 个已匹配预测的采纳记录，使用 Beta(1, 1) 先验。滑出窗口的旧记录不再影响概率；未观察预测和主动校准回退分别不进入匹配统计和采纳统计。
 
@@ -103,7 +103,7 @@ tt pi-speculative-action
 
 可选入口 `./thinkthread-extension` 使用随包固定的 Agent POSIX SDK。安装器选项见 `--help`；TUI 的 Ready 仅说明连接和路线准备成功。
 
-Linux x86_64 alpha8（RPM 0.1.0-22）以本地脚本化模型验证：`read/edit/write`（含新文件）经 `fs.run` 投机并被采纳，采纳前的外部改动以 `thinkthread_dependency_changed` 拒绝候选、由 Actor 执行。Runtime 以 ptrace 监管 Agent 进程树，进程后端与 held-exec 无法再跟踪其子进程，Bash 只剩整条调用的历史复用；WSL 中 Linux 的 `pi` 须先于 Windows PATH 被找到。`fs.run` 继承 Profile 网络策略，不虚拟时间或随机数；快照相等不能授权任意 Bash 或原生搜索复用。
+该 Profile 面向 Linux x86-64，为 `read/ls/edit/write` 提供隔离执行；默认配置的原生 `bash/grep/find` 回退到 Actor。Runtime 以 ptrace 监管 Agent，不能嵌套使用进程后端或 held-exec；`fs.run` 不虚拟时间或随机数，快照相等不足以授权任意 Bash 或原生搜索复用。WSL 中应让 Linux 的 `pi` 先于 Windows PATH 被找到。
 
 ## 复用与安全边界
 
