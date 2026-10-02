@@ -229,7 +229,7 @@ export function createSpeculativeActionExtension(
 		});
 		pi.on("message_end", (event) => { if (event.message.role === "assistant") controller?.finishActorOutput(); });
 		pi.on("turn_end", async () => { await controller?.finishTurn(false); });
-		pi.on("agent_end", async () => { await controller?.finishTurn(true); });
+		pi.on("agent_settled", async () => { await controller?.finishTurn(true); });
 		pi.on("session_shutdown", (_event, ctx) => sessions.run(async () => {
 			ctx.ui.setStatus(STATUS_KEY, undefined);
 			const current = controller;
