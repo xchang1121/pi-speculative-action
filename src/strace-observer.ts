@@ -598,6 +598,7 @@ export async function observeStrace(
 		? resourceTransitions(selected, root.file.pid, options) : { journal: [], handled: new Set<TraceLine>(), retained: [], finalHandles: [] };
 	const interposedExecutables = new Map((options.interposedExecutables ?? []).map(([intercepted, original]) => [path.posix.resolve(intercepted), path.posix.resolve(original)]));
 	const semanticRoots = (options.guardFilesystemSemanticsWithin ?? []).map((value) => path.posix.resolve(value));
+	const systemAliases = new Map([...interposedExecutables].flatMap(([original, shadow]) => systemToolName(original, semanticRoots) ? [[shadow, original] as const] : []));
 	const { ignored: ignoredSegments, resumed: resumedInterpositions } = ignoredProcessSegments(selected, interposedExecutables);
 	const observeMetadata = (observedPath: string, followSymlinks: boolean, { digest, fields }: StatObservation) => {
 		const identity = `metadata:${followSymlinks}:${fields?.join(",") ?? ""}:${observedPath}`;
@@ -731,7 +732,8 @@ export async function observeStrace(
 				continue;
 			}
 			if (successfulExec(line)) {
-				const execution = tracedExecution(pid, line, cwd), image = systemToolName(execution.path, semanticRoots);
+				const traced = tracedExecution(pid, line, cwd), execution = { ...traced, path: systemAliases.get(traced.path ?? "") ?? traced.path };
+				const image = systemToolName(execution.path, semanticRoots);
 				executions.push(execution); images.set(pid, image);
 				statFields.set(pid, workspaceStatFields(image, execution.argv));
 			}

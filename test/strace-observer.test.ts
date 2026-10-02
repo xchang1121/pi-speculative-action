@@ -82,16 +82,18 @@ describe("strace provenance decoder", () => {
 	test("replays across turns only a transcript of whitelisted system tools that cannot pass on the clock, randomness or readdir order", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-repeatable-")), prefix = path.join(root, "process");
 		const exec = (image: string, ...argv: string[]) => `execve("${image}", ${JSON.stringify([path.posix.basename(image), ...argv])}, 0x0) = 0`;
-		const run = async (script: string, children: readonly (readonly string[])[], roots: readonly string[] = ["/work"]) => {
+		const run = async (script: string, children: readonly (readonly string[])[], roots: readonly string[] = ["/work"], interposedExecutables?: StraceObservationOptions["interposedExecutables"]) => {
 			await fs.rm(root, { recursive: true, force: true }); await fs.mkdir(root);
 			await fs.writeFile(`${prefix}.100`, [exec("/bin/bash", "-c", script), "getpid() = 100",
 				...children.map((_, index) => `clone(child_stack=NULL, flags=SIGCHLD) = ${101 + index}`), "+++ exited with 0 +++"].join("\n"));
 			for (const [index, lines] of children.entries()) await fs.writeFile(`${prefix}.${101 + index}`, [...lines, "+++ exited with 0 +++"].join("\n"));
-			return (await observeStrace(prefix, "/bin/bash", "/work", { guardFilesystemSemanticsWithin: roots })).taints;
+			return (await observeStrace(prefix, "/bin/bash", "/work", { guardFilesystemSemanticsWithin: roots, interposedExecutables })).taints;
 		};
 		const listing = "getdents64(3</work/src>, [], 512) = 0";
 		try {
 			expect(await run("cat a | grep x", [[exec("/usr/bin/cat", "a")], [exec("/usr/bin/grep", "x")]])).toEqual([]);
+			expect(await run("cat a", [[exec("/shadow/cat", "a")]], ["/work"], [["/usr/bin/cat", "/shadow/cat"]])).toEqual([]);
+			expect(await run("cat a", [[exec("/shadow/cat", "a")]], ["/work"], [["/home/user/cat", "/shadow/cat"]])).toContain("clock");
 			expect(await run("ls src && git -C /work status", [[exec("/usr/bin/ls", "src"), listing], [exec("/usr/bin/git", "-C", "/work", "status")]])).toEqual([]);
 			for (const [script, children, roots] of [["echo $RANDOM", []], ["true & jobs -l", []], ["find . -mmin 5", [[exec("/usr/bin/find", ".", "-mmin", "5")]]],
 				["./cat a", [[exec("/work/cat", "a")]]], ["/home/user/cat", [[exec("/home/user/cat")]]], ["grep -r x src", [[exec("/usr/bin/grep", "-r", "x", "src"), listing]]],
