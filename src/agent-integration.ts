@@ -371,7 +371,7 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 		startTurn: (input, signal) => runtime.startTurn({ ...input, sessionID }, signal),
 		previewActorTool: (input, signal) => runtime.previewActorTool({ ...input, sessionID }, signal),
 		previewActorCall: (input, signal) => runtime.previewActorCall({ ...input, sessionID, [RAW_ACTOR_CALL]: true } as BoundActorCall, signal),
-		execute: (input, signal, executor) => {
+		execute: (input, signal, executor) => runtime.trackActorTool(sessionID, async () => {
 			const operation: ToolOperation = {
 				tool: input.tool,
 				input: immutableSnapshot(input.args),
@@ -428,7 +428,7 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 						}
 					: {}),
 			});
-		},
+		}),
 		drafterGateSnapshot: drafterPlans.snapshot,
 		finishTurn: async (turnID, terminal = false) => {
 			await runtime.finishTurn({ sessionID, turnID, tool: "", args: {}, tools: [], terminal });

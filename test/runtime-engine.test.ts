@@ -874,6 +874,23 @@ describe("structural speculative runtime", () => {
 		}
 	});
 
+	it("keeps failed and late Actor tool waits in the originating task", async () => {
+		let now = 100;
+		const clock = vi.spyOn(performance, "now").mockImplementation(() => now), gate = barrier();
+		const { runtime, events } = harness({ source: planSource({ propose: () => undefined }) });
+		try {
+			await runtime.startTurn(call("old"));
+			const pending = runtime.trackActorTool("session", async () => { await gate.promise; throw new Error("late failure"); });
+			const failure = expect(pending).rejects.toThrow("late failure");
+			now = 150; await runtime.finishTurn({ ...call("old"), terminal: true });
+			now = 200; await runtime.startTurn(call("new"));
+			await expect(runtime.trackActorTool("session", async () => { now += 5; throw new Error("current failure"); })).rejects.toThrow("current failure");
+			now = 300; gate.arrive(); await failure;
+			await runtime.finishTurn({ ...call("new"), terminal: true });
+			expect(events.filter(event => event.type === "task").map(event => event.timing.toolWaitMs)).toEqual([50, 5]);
+		} finally { gate.arrive(); await runtime.dispose(); clock.mockRestore(); }
+	});
+
 	it.each(["same", "alternate", "stale-before", "stale-after", "incompatible", "indeterminate", "exclusive", "denied"] as const)(
 		"recalls sealed Actor observations with compatibility, freshness and authorization: %s", async (mode) => {
 		let version = 1, captures = 0, seals = 0, now = 100;
@@ -935,7 +952,7 @@ describe("structural speculative runtime", () => {
 				toolExecutionMs: fallback ? 6 : reusable ? 4 : 10,
 			});
 			expect(summary()).toMatchObject({ tasks: 1, endToEndMs: now - 100, toolExecutionMs: fallback ? 6 : reusable ? 4 : 10,
-				nonToolMs: reusable ? 52 : 58, serializedMs: now - 100 + (reusable ? 0 : 6), hiddenLatencyMs: reusable ? 0 : 6,
+				nonToolMs: reusable ? 52 : 58, hiddenLatencyMs: reusable ? 0 : 6,
 				speculativeExecutionMs: reusable ? 0 : 6, actorExecutionMs: fallback ? 6 : 4 });
 		} finally { await runtime.dispose(); clock.mockRestore(); }
 	});

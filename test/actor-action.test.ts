@@ -87,7 +87,7 @@ describe("ActorAction", () => {
 		expect(action.settlement?.provider.toolExecution).toBe(execution);
 		timeline.recordActor(0, 100); timeline.recordActor(220, 500);
 		timeline.recordTool(action.settlement!.provider.toolExecution);
-		expect(timeline.measure(500)).toMatchObject({ serializedMs: 500, toolExecutionMs: 120, hiddenLatencyMs: 0 });
+		expect(timeline.measure(500)).toMatchObject({ toolExecutionMs: 120, hiddenLatencyMs: 0 });
 	});
 });
 

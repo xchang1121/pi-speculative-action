@@ -2630,6 +2630,10 @@ export function makeSpeculativeActionRuntime<
 	};
 
 	return {
+		trackActorTool: async (sessionID, execute) => {
+			const finish = sessionStates.get(sessionID)?.timeline?.startToolWait(performance.now());
+			try { return await execute(); } finally { finish?.(performance.now()); }
+		},
 		startTurn,
 		previewActorTool,
 		previewActorCall,

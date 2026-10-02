@@ -1,6 +1,8 @@
+import { toolSpeedup } from "../src/task-timing.ts";
+
 export interface SuiteBenchmarkSummary {
 	readonly actualEndToEndMs: number;
-	readonly serializedCounterfactualMs: number;
+	readonly toolWaitMs: number;
 	readonly hiddenLatencyMs: number;
 	readonly executionAheadMs: number;
 	readonly actorActions: number;
@@ -43,7 +45,7 @@ export function summarizeSuite(runs: readonly SuiteBenchmarkRun[]) {
 		allRunsScreenedIn: runs.length > 0 && invalidRuns.length === 0,
 		statistics: {
 			primaryEstimator: "ratio_of_means",
-			baseline: "same_run_serialized_counterfactual",
+			baseline: "same_run_tool_wait_plus_hidden_latency",
 			samplePolicy: "all_measured_runs",
 		},
 		unmeasuredRuns: runs.length - measured.length,
@@ -59,18 +61,17 @@ export function summarizeSuite(runs: readonly SuiteBenchmarkRun[]) {
 	};
 }
 
-/** Speculation on versus off on the same instance and repeat: the ratio is measured, so it may fall below 1. */
+/** Paired tool wait comparison; independent runs may be slower with speculation. */
 export function summarizePairs(runs: readonly SuiteBenchmarkRun[]) {
 	const on = runs.filter((run) => run.arm === "on"), off = runs.filter((run) => run.arm === "off");
 	const pairs = on.filter(hasTiming).flatMap((run) => {
 		const other = off.find((candidate) => candidate.instance === run.instance && candidate.repeat === run.repeat);
-		return other && hasTiming(other) ? [{ instance: run.instance, repeat: run.repeat, onMs: run.summary.actualEndToEndMs, offMs: other.summary.actualEndToEndMs }] : [];
+		return other && hasTiming(other) ? [{ instance: run.instance, repeat: run.repeat, onToolWaitMs: run.summary.toolWaitMs, offToolWaitMs: other.summary.toolWaitMs }] : [];
 	});
-	const onMs = pairs.reduce((total, pair) => total + pair.onMs, 0), offMs = pairs.reduce((total, pair) => total + pair.offMs, 0);
+	const onMs = pairs.reduce((total, pair) => total + pair.onToolWaitMs, 0), offMs = pairs.reduce((total, pair) => total + pair.offToolWaitMs, 0);
 	return {
-		pairs: pairs.map((pair) => ({ ...pair, ratio: pair.offMs / pair.onMs })),
-		pairedRatio: pairs.length ? offMs / onMs : undefined,
-		pairedRatioP50: nearestRank(pairs.map((pair) => pair.offMs / pair.onMs), 0.5),
+		pairs,
+		pairedToolSpeedup: onMs > 0 ? offMs / onMs : null,
 		on: summarizeSuite(on),
 		off: summarizeSuite(off),
 	};
@@ -81,8 +82,8 @@ export function safeName(value: string): string {
 }
 
 function hasTiming(run: SuiteBenchmarkRun): run is MeasuredRun {
-	return !!run.summary && Number.isFinite(run.summary.actualEndToEndMs) && run.summary.actualEndToEndMs > 0 &&
-		Number.isFinite(run.summary.serializedCounterfactualMs) && run.summary.serializedCounterfactualMs >= 0;
+	return !!run.summary && Number.isFinite(run.summary.toolWaitMs) && run.summary.toolWaitMs >= 0 &&
+		Number.isFinite(run.summary.hiddenLatencyMs) && run.summary.hiddenLatencyMs >= 0;
 }
 
 export function nearestRank(values: readonly number[], percentile: number): number | undefined {
@@ -94,21 +95,20 @@ export function nearestRank(values: readonly number[], percentile: number): numb
 
 function pooled(runs: readonly MeasuredRun[]) {
 	const actualEndToEndMs = sum(runs, "actualEndToEndMs");
-	const serializedCounterfactualMs = sum(runs, "serializedCounterfactualMs");
+	const toolWaitMs = sum(runs, "toolWaitMs"), hiddenLatencyMs = sum(runs, "hiddenLatencyMs");
 	const actorActions = sum(runs, "actorActions");
 	const speculativeHits = sum(runs, "speculativeHits");
 	return {
 		runs: runs.length,
 		instanceClusters: new Set(runs.map(run => run.instance)).size,
 		actualEndToEndMs,
-		serializedCounterfactualMs,
 		actualEndToEndMeanMs: actualEndToEndMs / runs.length,
-		serializedCounterfactualMeanMs: serializedCounterfactualMs / runs.length,
-		accelerationRatio: serializedCounterfactualMs / actualEndToEndMs,
-		meanLatencyDifferenceMs: (actualEndToEndMs - serializedCounterfactualMs) / runs.length,
 		actualEndToEndP95Ms: nearestRank(runs.map((run) => run.summary.actualEndToEndMs), 0.95),
-		serializedCounterfactualP95Ms: nearestRank(runs.map((run) => run.summary.serializedCounterfactualMs), 0.95),
-		hiddenLatencyMs: sum(runs, "hiddenLatencyMs"),
+		toolWaitMs,
+		toolWaitMeanMs: toolWaitMs / runs.length,
+		toolWaitP95Ms: nearestRank(runs.map((run) => run.summary.toolWaitMs), 0.95),
+		toolSpeedup: toolSpeedup({ toolWaitMs, hiddenLatencyMs }),
+		hiddenLatencyMs,
 		executionAheadMs: sum(runs, "executionAheadMs"),
 		actorActions,
 		speculativeHits,

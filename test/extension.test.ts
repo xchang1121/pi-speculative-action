@@ -85,12 +85,12 @@ describe("zero-modification Pi extension", () => {
 		expect(fixture.host.finishTurn).toHaveBeenLastCalledWith("turn_2", true);
 	});
 
-	it("reports serialized counterfactual speedup independently of per-hit service credits", () => {
-		const timing = { endToEndMs: 1000, serializedMs: 1100, hiddenLatencyMs: 100, toolExecutionMs: 400 };
+	it("reports tool speedup and total hidden latency without model time in the denominator", () => {
+		const timing = { toolWaitMs: 400, hiddenLatencyMs: 100 };
 		expect(formatSpeculativeActionEvent({ type: "task", sessionID: "s", turnID: "t", timing } as never)).toContain(
-			"1s wall; 1.1s serialized; End-to-End SpeedUp 1.10x; 100ms of 400ms tool time hidden");
-		for (const [wall, serial, ratio] of [[1000, 800, "0.80x"], [0, 0, "n/a"], [1000, NaN, "n/a"]] as const)
-			expect(formatSpeculativeActionEvent({ type: "task", sessionID: "s", turnID: "t", timing: { ...timing, endToEndMs: wall, serializedMs: serial } } as never)).toContain(`End-to-End SpeedUp ${ratio}`);
+			"Tool SpeedUp 1.25x; 100ms hidden; 400ms tool wait");
+		for (const [wait, hidden, ratio] of [[1000, 0, "1.00x"], [0, 0, "n/a"], [1000, NaN, "n/a"]] as const)
+			expect(formatSpeculativeActionEvent({ type: "task", sessionID: "s", turnID: "t", timing: { toolWaitMs: wait, hiddenLatencyMs: hidden } } as never)).toContain(`Tool SpeedUp ${ratio}`);
 	});
 
 	it("sends Drafter requests as simple options through the provider with registry auth", async () => {
