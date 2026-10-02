@@ -1076,13 +1076,15 @@ describe("structural speculative runtime", () => {
 		} finally { drained.resolve(); await runtime.dispose(); }
 	});
 
-	it("charges process worlds more capacity while preserving explicit producer demand", async () => {
+	it.each(["process", "captured_inputs", "tree_entries", "tree_content"] as const)("charges %s more capacity while preserving explicit producer demand", async mode => {
 		const executed: string[] = [], gates = [gated(), gated(), gated()];
 		const { runtime } = harness({ settings: () => ({ ...settings, maxConcurrentActions: 3 }),
 			source: planSource({ propose: () => ({ id: "weighted", source: "source", revision: 0,
 				actions: [readAction("0", { path: "0" }, { expectedLatencyBenefitMs: 3 }),
 					readAction("1", { path: "1" }, { expectedLatencyBenefitMs: 2, resourceDemand: 1 }), readAction("2", { path: "2" })] }) }),
-			resolveExecution: () => ({ ...RESOURCE_ROUTE, isolation: "runtime_sandbox" }),
+			resolveExecution: () => ({ ...RESOURCE_ROUTE, isolation: mode === "process" ? "runtime_sandbox" : "resource_snapshot" }),
+			actionKey: (tool, args) => PI_ACTION_SEMANTICS.buildKey(tool, args, "/workspace", "", mode === "process" ? undefined : {
+				fingerprint: "captured-scan", semantics: { ...PI_ACTION_SEMANTICS.definition(tool)!, resourceScope: mode } }),
 			execute: async (_tool, input) => { const index = Number(input.path); executed.push(String(index)); await gates[index]!.wait(); return String(index); } });
 		try {
 			await runtime.startTurn(start("turn")); await gates[0]!.entered; await gates[1]!.entered; await nextTurn();
