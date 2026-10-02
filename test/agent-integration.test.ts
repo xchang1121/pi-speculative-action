@@ -252,6 +252,13 @@ describe("speculative action host", () => {
 			expect((await propose()).adoptionProbability).toBe(learned.adoptionProbability);
 			await controller.source.onSettled!({ ...feedback, settlement: unobservedSettlement("control", "cancelled") });
 			expect((await propose()).adoptionProbability).toBe(learned.adoptionProbability);
+			for (let index = 0; index < 32; index++) await controller.source.onSettled!({ ...feedback,
+				settlement: outcome === "adopted" ? rejectedSettlement("freshness", "input_changed") : adoptedSettlement() });
+			const changed = await propose();
+			expect(changed.empiricalProbability).toBeCloseTo(33 / 34);
+			expect(changed.adoptionProbability).toBeCloseTo(outcome === "adopted" ? 1 / 34 : 33 / 34);
+			for (let index = 0; index < 32; index++) await controller.source.onSettled!({ ...feedback, settlement: unmatchedSettlement() });
+			expect(await propose()).toMatchObject({ empiricalProbability: 1 / 34, adoptionProbability: changed.adoptionProbability });
 			schema = "schema-b"; expect(await propose()).toMatchObject({ empiricalProbability: 0.5, adoptionProbability: 0.5 });
 			schema = "schema-a"; selectedModel = model("different-model");
 			expect(await propose()).toMatchObject({ empiricalProbability: 0.5, adoptionProbability: 0.5 });
