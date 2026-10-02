@@ -1,6 +1,6 @@
 import { open, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
-import { directoryStatFields, hostStatFields, repeatableExecutions, SHELLS, WITHOUT_IDENTITY, workspaceStatFields, type TracedExecution } from "./deterministic-tools.ts";
+import { directoryStatFields, hostStatFields, repeatableExecutions, SHELLS, systemToolName, workspaceStatFields, type TracedExecution } from "./deterministic-tools.ts";
 import { containsLogicalPath } from "./path-utils.ts";
 import { type DependencyRole, FILESYSTEM_OBSERVATION_FIELDS, type FilesystemObservationField, filesystemObservationDigest, ONE_SHOT_TAINTS, type ProvenanceTaint,
 	type Sha256Digest, type ResourceTransitionKind } from "./provenance-certificate.ts";
@@ -716,8 +716,8 @@ export async function observeStrace(
 				// Only the fields a program reveals of a workspace file are its dependency (see workspaceStatFields).
 				const workspace = metadataPaths.length > 0 && metadataPaths.every((target) => semanticRoots.some((root) => containsLogicalPath(root, target)));
 				const fields = workspace ? statFields.get(pid) : hostStatFields(images.get(pid) ?? "");
-				if (workspace && fields === WITHOUT_IDENTITY && !directory) taints.add("descriptor_observation");
-				const observed = statObservationDigest(line.args[structure] ?? "", directoryHandle ? ["mode"] : undefined, directory ? directoryStatFields(images.get(pid) ?? "", fields, workspace) : fields);
+				if (workspace && fields === undefined) taints.add("descriptor_observation");
+				const observed = statObservationDigest(line.args[structure] ?? "", directoryHandle && fields !== undefined ? ["mode"] : undefined, directory ? directoryStatFields(images.get(pid) ?? "", fields, workspace) : fields);
 				if (!metadataPaths.length || !observed) {
 					// fstat, or an empty *at name, of a pipe or socket
 					if (descriptorTarget(line) && !quotedArgument(line.args[1])) taints.add("descriptor_observation");
@@ -731,7 +731,7 @@ export async function observeStrace(
 				continue;
 			}
 			if (successfulExec(line)) {
-				const execution = tracedExecution(pid, line, cwd), image = path.posix.basename(execution.path ?? "");
+				const execution = tracedExecution(pid, line, cwd), image = systemToolName(execution.path, semanticRoots);
 				executions.push(execution); images.set(pid, image);
 				statFields.set(pid, workspaceStatFields(image, execution.argv));
 			}

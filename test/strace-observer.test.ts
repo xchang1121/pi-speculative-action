@@ -37,15 +37,16 @@ describe("strace provenance decoder", () => {
 		const fields = async (argv: readonly string[], target = "/work/a.txt") => (await run(argv, target)).paths.find((item) => item.role === "metadata")!;
 		try {
 			const all = FILESYSTEM_OBSERVATION_FIELDS, withoutDevice = all.filter((field) => field !== "dev");
-			// A replay recreates a file's bytes, mode and times, never its identity: a program not known to print it sees that once.
+			// Only git's stat cache has this contract; arbitrary programs can print every field.
 			const withoutIdentity = all.filter((field) => !["dev", "ino", "blksize", "blocks", "ctimeNs"].includes(field));
 			for (const [argv, expected] of [[["cat", "a.txt"], ["mode"]], [["ls"], ["mode"]], [["ls", "-la"], withoutDevice], [["find", ".", "-size", "+1k"], ["mode", "size"]],
-				[["find", ".", "-newer", "b"], withoutDevice], [["bash", "-c", "true"], withoutIdentity], [["git", "status"], withoutIdentity], [["python3", "x.py"], withoutIdentity],
+				[["find", ".", "-newer", "b"], withoutDevice], [["git", "status"], withoutIdentity], [["du", "-s", "."], ["mode", "dev", "ino", "nlink", "size", "blocks"]],
 				[["stat", "-c", "%s %i", "a.txt"], ["mode", "size", "ino"]], [["stat", "--format=%Y", "a.txt"], ["mode", "mtimeNs"]], [["stat", "-c%a", "a.txt"], ["mode"]]] as const)
 				expect((await fields(argv)).fields, argv.join(" ")).toEqual(all.filter((field) => (expected as readonly string[]).includes(field)));
-			expect((await run(["python3", "x.py"], "/work/a.txt")).taints).toContain("descriptor_observation");
+			for (const argv of [["python3", "x.py"], ["bash", "-c", "true"]]) expect((await fields(argv)).fields).toBeUndefined();
 			const directory = `newfstatat(AT_FDCWD, "/work/src", ${STAT.replace("S_IFREG", "S_IFDIR")}, 0) = 0`;
-			for (const image of ["git", "node"]) expect((await run([image, "x"], "/work/a.txt", [directory])).paths.find((item) => item.path === "/work/src")).toMatchObject({ fields: ["mode", "uid", "gid"] });
+			expect((await run(["git", "status"], "/work/a.txt", [directory])).paths.find((item) => item.path === "/work/src")).toMatchObject({ fields: ["mode", "uid", "gid"] });
+			expect((await run(["node", "x"], "/work/a.txt", [directory])).paths.find((item) => item.path === "/work/src")).not.toHaveProperty("fields");
 			for (const [argv, target] of [[["stat", "a.txt"], "/work/a.txt"], [["stat", "-c", "%X", "a.txt"], "/work/a.txt"], [["stat", "-t", "-c", "%s", "a.txt"], "/work/a.txt"],
 				[["cat", "hosts"], "/etc/hosts"], [["find", ".", "-printf", "%D %p"], "/work/a.txt"]] as const)
 				expect((await fields(argv, target)).fields, argv.join(" ")).toBeUndefined();
@@ -72,7 +73,8 @@ describe("strace provenance decoder", () => {
 			const nss = ["socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0) = 3<UNIX-STREAM:[9]>",
 				'connect(3<UNIX-STREAM:[9]>, {sa_family=AF_UNIX, sun_path="/var/run/nscd/socket"}, 110) = -1 EACCES (Permission denied)'];
 			const refused = await run(["ls", "-la"], "/work/a.txt", nss);
-			expect([refused.taints, refused.paths]).toEqual([[], expect.arrayContaining([{ path: "/var/run/nscd/socket", role: "input" }])]);
+			expect(refused.taints).toEqual(["clock", "random"]);
+			expect(refused.paths).toContainEqual({ path: "/var/run/nscd/socket", role: "input" });
 			expect((await run(["ls", "-la"], "/work/a.txt", [nss[0]!, nss[1]!.replace("-1 EACCES (Permission denied)", "0")])).taints).toContain("network");
 		} finally { await fs.rm(root, { recursive: true, force: true }); }
 	});
@@ -92,7 +94,9 @@ describe("strace provenance decoder", () => {
 			expect(await run("cat a | grep x", [[exec("/usr/bin/cat", "a")], [exec("/usr/bin/grep", "x")]])).toEqual([]);
 			expect(await run("ls src && git -C /work status", [[exec("/usr/bin/ls", "src"), listing], [exec("/usr/bin/git", "-C", "/work", "status")]])).toEqual([]);
 			for (const [script, children, roots] of [["echo $RANDOM", []], ["true & jobs -l", []], ["find . -mmin 5", [[exec("/usr/bin/find", ".", "-mmin", "5")]]],
-				["./cat a", [[exec("/work/cat", "a")]]], ["grep -r x src", [[exec("/usr/bin/grep", "-r", "x", "src"), listing]]],
+				["./cat a", [[exec("/work/cat", "a")]]], ["/home/user/cat", [[exec("/home/user/cat")]]], ["grep -r x src", [[exec("/usr/bin/grep", "-r", "x", "src"), listing]]],
+				["git log -1 --format=%cr", [[exec("/usr/bin/git", "log", "-1", "--format=%cr")]]],
+				["git log", [[exec("/usr/bin/git", "log")]]], ["ls -l", [[exec("/usr/bin/ls", "-l")]]],
 				["git commit -m x", [[exec("/usr/bin/git", "commit", "-m", "x")]]], ["cat a", [[exec("/usr/bin/cat", "a")]], []]] as const)
 				expect(await run(script, children, roots), script).toEqual(expect.arrayContaining(["clock", "random"]));
 		} finally { await fs.rm(root, { recursive: true, force: true }); }
@@ -219,10 +223,11 @@ describe("strace provenance decoder", () => {
 		expect((await observe({ 100: [EXEC, partial("STATX_TYPE|0x40000")] })).incompleteReasons).toEqual(["unparsed_metadata:statx:100"]);
 	});
 
-	test("keeps a directory handle's identity and a shell's $PWD checks out of metadata dependencies", async () => {
+	test("retains unknown programs' directory handle metadata and isolates the system shell's PWD contract", async () => {
 		const directory = STAT.replace("S_IFREG|0644", "S_IFDIR|0755");
 		expect((await observe({ 100: [EXEC, `fstat(3</work/src>, ${directory}) = 0`] })).paths).toContainEqual(
-			{ path: "/work/src", role: "metadata", followSymlinks: true, fields: ["mode"], digest: filesystemObservationDigest({ mode: 0o40755n }, ["mode"]) });
+			{ path: "/work/src", role: "metadata", followSymlinks: true, digest: filesystemObservationDigest({ dev: 1n, ino: 42n, mode: 0o40755n, nlink: 1n, uid: 0n, gid: 0n,
+				rdev: 0n, size: 4n, blksize: 4096n, blocks: 8n, mtimeNs: 11_000_000_002n, ctimeNs: 12_000_000_003n }) });
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-shell-stat-")), prefix = path.join(root, "process");
 		try {
 			await fs.writeFile(`${prefix}.100`, ['execve("/bin/bash", ["bash", "-c", "true"], 0x0) = 0', `newfstatat(AT_FDCWD, ".", ${directory}, 0) = 0`,

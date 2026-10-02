@@ -7,6 +7,7 @@ import { once } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
 import { constants as fsConstants } from "node:fs";
 import { access, chmod, copyFile, link, lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -43,7 +44,9 @@ import { WorkspaceSandboxService, readSandboxDirectoryState, restoreModifiedTime
 	type SandboxWorkspaceChange, type SandboxWorkspaceContext } from "./workspace-sandbox.ts";
 import { containsFilesystemPath as pathContains, relativeFilesystemPath, slash } from "./path-utils.ts";
 
-const BACKEND_EPOCH = "pi-linux-process-instance-inputs";
+// Certificates are meaningful only under the implementation that collected and authorized their proof.
+const OBSERVER_FINGERPRINT = digestObject(["linux-process-backend", "strace-observer", "deterministic-tools", "reuse-planner", "reuse-store", "provenance-certificate", "provenance-validation"]
+	.map(name => sha256Digest(readFileSync(new URL(`./${name}.${import.meta.url.endsWith(".ts") ? "ts" : "js"}`, import.meta.url)))));
 const POLICY_ID = "sandlock-virtual-root-transparent-exec-creation-mode";
 const LEAF_POLICY_ID = "sandlock-virtual-workspace-leaf-creation-mode";
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024, LEARNED_LAUNCHES = 64, MAX_INTERPOSED_MOUNT_BYTES = 512 * 1024, CHEAP_CHILD_MS = 500;
@@ -617,9 +620,9 @@ export class LinuxProcessReuseBackend {
 			await rm(mountProbe, { recursive: true, force: true });
 		}
 		if (!executionContext) throw new Error("process execution context probe failed");
-		const observerFingerprint = digestObject({ epoch: BACKEND_EPOCH });
+		const observerFingerprint = OBSERVER_FINGERPRINT;
 		const fingerprint = digestObject({
-			epoch: BACKEND_EPOCH,
+			observerFingerprint,
 			policy: POLICY_ID,
 			sandlock: sandlockBuild,
 			strace: straceBuild,
@@ -2663,7 +2666,7 @@ async function topLevelProcessPrototype(invocation: ToolProcessInvocation, reque
 }
 
 function actorReplayProducer(producer: ProcessProducerProof, deniedPaths: readonly string[]): boolean {
-	if (producer.observer.provider !== "strace" || producer.observer.fingerprint !== digestObject({ epoch: BACKEND_EPOCH })) return false;
+	if (producer.observer.provider !== "strace" || producer.observer.fingerprint !== OBSERVER_FINGERPRINT) return false;
 	const confinement = producer.execution.authority === "actor" ? undefined : producer.execution.confinement;
 	return !confinement || confinement.provider === "sandlock" && [POLICY_ID, LEAF_POLICY_ID].some((policy) => confinement.fingerprint === digestObject({ policy, deniedPaths }));
 }
