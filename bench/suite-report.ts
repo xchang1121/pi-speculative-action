@@ -108,7 +108,6 @@ function pooled(runs: readonly MeasuredRun[]) {
 		serializedCounterfactualMeanMs: serializedCounterfactualMs / runs.length,
 		accelerationRatio: serializedCounterfactualMs / actualEndToEndMs,
 		savingsMs,
-		savingsAccelerationRatio: 1 + savingsMs / actualEndToEndMs,
 		meanLatencyDifferenceMs: (actualEndToEndMs - serializedCounterfactualMs) / runs.length,
 		actualEndToEndP95Ms: nearestRank(runs.map((run) => run.summary.actualEndToEndMs), 0.95),
 		serializedCounterfactualP95Ms: nearestRank(runs.map((run) => run.summary.serializedCounterfactualMs), 0.95),

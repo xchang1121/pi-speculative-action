@@ -77,10 +77,12 @@ describe("zero-modification Pi extension", () => {
 		expect(fixture.settle).not.toHaveBeenCalled();
 	});
 
-	it("leads task timing with the savings", () => {
-		const timing = { endToEndMs: 1000, savingsMs: 300, hiddenLatencyMs: 100, toolExecutionMs: 400, toolWaitMs: 100 };
+	it("reports serialized counterfactual speedup independently of per-hit service credits", () => {
+		const timing = { endToEndMs: 1000, serializedMs: 1100, savingsMs: 300, hiddenLatencyMs: 100, toolExecutionMs: 400, toolWaitMs: 100 };
 		expect(formatSpeculativeActionEvent({ type: "task", sessionID: "s", turnID: "t", timing } as never)).toContain(
-			"1s wall; 300ms saved; End-to-End SpeedUp +30.0%; Tool time speed up 4.00x; 100ms of 400ms tool time hidden");
+			"1s wall; 1.1s serialized; End-to-End SpeedUp 1.10x; 100ms of 400ms tool time hidden");
+		for (const [wall, serial, ratio] of [[1000, 800, "0.80x"], [0, 0, "n/a"], [1000, NaN, "n/a"]] as const)
+			expect(formatSpeculativeActionEvent({ type: "task", sessionID: "s", turnID: "t", timing: { ...timing, endToEndMs: wall, serializedMs: serial } } as never)).toContain(`End-to-End SpeedUp ${ratio}`);
 	});
 
 	it("sends Drafter requests as simple options through the provider with registry auth", async () => {

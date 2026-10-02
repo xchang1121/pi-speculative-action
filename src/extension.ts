@@ -186,9 +186,9 @@ export function formatSpeculativeActionStatus(input: {
 		`Actor candidate rejections: ${countSummary(metrics.actorCandidateRejections)}`,
 		`Candidates: ${metrics.candidateStarted} started; ${metrics.candidateSucceeded} succeeded; ${metrics.candidateFailed} failed; ${metrics.candidateCancelled} cancelled`,
 		metrics.tasks > 0
-			? `Task timing (${metrics.tasks} completed): ${formatTaskTiming(metrics)}. Savings credit each hit with the larger of its computation and the expected Actor time.`
+			? `Task timing (${metrics.tasks} completed): ${formatTaskTiming(metrics)}. Speedup is the same-run serialized counterfactual divided by wall time.`
 			: "Task timing: n/a (no completed task); serialized overlap and speedup are not reported as 0.",
-		`Drafter tokens (input + output, every request): ${metrics.totalDraftTokens}${metrics.savingsMs > 0 ? `; ${Math.round(metrics.totalDraftTokens * 1000 / metrics.savingsMs)} per second saved` : ""}`,
+		`Drafter tokens (input + output, every request): ${metrics.totalDraftTokens}${metrics.hiddenLatencyMs > 0 ? `; ${Math.round(metrics.totalDraftTokens * 1000 / metrics.hiddenLatencyMs)} per second hidden` : ""}`,
 		`Live speculative results: ${cache.resultEntries}/${cache.cacheCapacity}, ${formatBytes(cache.resultBytes)}/${formatBytes(cache.cacheByteCapacity ?? 0)}; cold: ${cache.cacheCold}; hot: ${cache.cacheHot}; jobs: ${cache.inFlightJobs}; branches: ${cache.branchEntries} (${formatBytes(cache.branchBytes)})`,
 	].join("\n");
 }
@@ -1393,7 +1393,7 @@ function formatSpeculativeFooter(
 	const storedBytes = storageWorlds.reduce((total, world) => total + (world.storage?.bytes ?? 0), 0);
 	return [
 		"spec: on",
-		metrics.tasks > 0 ? `${formatSpeedups(metrics)}; ${formatDuration(metrics.endToEndMs)} wall` : "End-to-End SpeedUp n/a; Tool time speed up n/a",
+		metrics.tasks > 0 ? `${formatSpeedup(metrics)}; ${formatDuration(metrics.endToEndMs)} wall` : "End-to-End SpeedUp n/a",
 		`tools reused ${formatRatio(metrics.speculativeHits, metrics.actorActions)}`,
 		...(hasProcessReuse(reuse) ? [`Bash Actor ${formatActorProcessFooter(reuse)}`] : []),
 		`live results ${metrics.cache.resultEntries}/${metrics.cache.cacheCapacity} (${formatBytes(metrics.cache.resultBytes)})`,
@@ -1452,18 +1452,16 @@ function countSummary(counts: Readonly<Record<string, number>>): string {
 	return entries.length > 0 ? entries.map(([key, count]) => `${key}=${count}`).join(", ") : "none";
 }
 
-type TimingSummary = Pick<SpeculativeTraceSummary, "endToEndMs" | "savingsMs" | "hiddenLatencyMs" | "toolExecutionMs" | "toolWaitMs">;
+type TimingSummary = Pick<SpeculativeTraceSummary, "endToEndMs" | "serializedMs" | "hiddenLatencyMs" | "toolExecutionMs">;
 
 function formatTaskTiming(timing: TimingSummary): string {
-	return `${formatDuration(timing.endToEndMs)} wall; ${formatDuration(timing.savingsMs)} saved; ${formatSpeedups(timing)}; ${formatDuration(timing.hiddenLatencyMs)} of ${formatDuration(timing.toolExecutionMs)} tool time hidden`;
+	return `${formatDuration(timing.endToEndMs)} wall; ${formatDuration(timing.serializedMs)} serialized; ${formatSpeedup(timing)}; ${formatDuration(timing.hiddenLatencyMs)} of ${formatDuration(timing.toolExecutionMs)} tool time hidden`;
 }
 
-/** End-to-end speed up leads, as the TUI has always shown it. Tool time speed up is the Actor's tool wait with each hit's avoided
- * service restored, over the wait it actually had. */
-function formatSpeedups(timing: TimingSummary): string {
-	const percent = (savings: number) => timing.endToEndMs > 0 && Number.isFinite(savings) ? `+${(100 * savings / timing.endToEndMs).toFixed(1)}%` : "n/a";
-	const tool = timing.toolWaitMs > 0 && Number.isFinite(timing.savingsMs) ? `${((timing.toolWaitMs + timing.savingsMs) / timing.toolWaitMs).toFixed(2)}x` : "n/a";
-	return `End-to-End SpeedUp ${percent(timing.savingsMs)}; Tool time speed up ${tool}`;
+function formatSpeedup(timing: TimingSummary): string {
+	const ratio = timing.endToEndMs > 0 && Number.isFinite(timing.endToEndMs) && Number.isFinite(timing.serializedMs)
+		? `${(timing.serializedMs / timing.endToEndMs).toFixed(2)}x` : "n/a";
+	return `End-to-End SpeedUp ${ratio}`;
 }
 
 function formatDuration(ms: number): string {

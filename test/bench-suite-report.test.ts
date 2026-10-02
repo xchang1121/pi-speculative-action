@@ -200,7 +200,6 @@ describe("ablation suite report", () => {
 		expect(report.pooled).toMatchObject({
 			instanceClusters: 2,
 			accelerationRatio: 2,
-			savingsAccelerationRatio: 1.3,
 			actualEndToEndP95Ms: 20,
 			serializedCounterfactualP95Ms: 40,
 		});
@@ -214,7 +213,7 @@ describe("ablation suite report", () => {
 			run("missing", 1, { actualEndToEndMs: invalid }),
 		]);
 		expect(report.pooled?.accelerationRatio).toBeCloseTo(401 / 800.5, 12);
-		expect(report.pooled?.savingsAccelerationRatio).toBe(1);
+		expect(report.pooled).not.toHaveProperty("savingsAccelerationRatio");
 		expect(report.pooled?.meanLatencyDifferenceMs).toBeCloseTo(399.5 / 3, 12);
 		expect(report).toMatchObject({ runs: 4, unmeasuredRuns: 1, pooled: { runs: 3 }, byInstance: { missing: null },
 			invalidRuns: [{ instance: "missing", reasons: ["unavailable_timing"] }] });
