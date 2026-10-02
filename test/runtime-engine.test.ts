@@ -1054,6 +1054,43 @@ describe("structural speculative runtime", () => {
 		} finally { release.resolve(); await runtime.dispose(); }
 	});
 
+	it.each([1, 2])("preserves %s Actor reservations through speculative cancellation and refill", async capacity => {
+		const executed: string[] = [], drained = deferred<void>();
+		const { runtime } = harness({ settings: () => ({ ...settings, maxConcurrentActions: capacity }),
+			source: planSource({ propose: () => ({ id: "future", source: "source", revision: 0,
+				actions: Array.from({ length: 4 }, (_, index) => readAction(String(index), { path: `future-${index}.ts` }, { horizon: 2 })) }) }),
+			execute: async (_tool, input, signal) => {
+				executed.push(String(input.path));
+				await new Promise(resolve => signal.addEventListener("abort", resolve, { once: true }));
+				await drained.promise; return "cancelled";
+			} });
+		try {
+			await runtime.startTurn(start("turn")); await vi.waitFor(() => expect(executed).toHaveLength(capacity));
+			const actors = await Promise.all(Array.from({ length: capacity }, (_, index) => runtime.prepareActorCall(call("turn", { path: `actor-${index}.ts` }))));
+			drained.resolve(); await nextTurn(); await nextTurn();
+			expect(executed, "cleanup cannot refill slots occupied by native Actor calls").toHaveLength(capacity);
+			for (const [index, actor] of actors.entries()) {
+				await actor!.settle(simulatedExecution(10), "actor");
+				await vi.waitFor(() => expect(executed).toHaveLength(capacity + index + 1));
+			}
+		} finally { drained.resolve(); await runtime.dispose(); }
+	});
+
+	it("charges process worlds more capacity while preserving explicit producer demand", async () => {
+		const executed: string[] = [], gates = [gated(), gated(), gated()];
+		const { runtime } = harness({ settings: () => ({ ...settings, maxConcurrentActions: 3 }),
+			source: planSource({ propose: () => ({ id: "weighted", source: "source", revision: 0,
+				actions: [readAction("0", { path: "0" }, { expectedLatencyBenefitMs: 3 }),
+					readAction("1", { path: "1" }, { expectedLatencyBenefitMs: 2, resourceDemand: 1 }), readAction("2", { path: "2" })] }) }),
+			resolveExecution: () => ({ ...RESOURCE_ROUTE, isolation: "runtime_sandbox" }),
+			execute: async (_tool, input) => { const index = Number(input.path); executed.push(String(index)); await gates[index]!.wait(); return String(index); } });
+		try {
+			await runtime.startTurn(start("turn")); await gates[0]!.entered; await gates[1]!.entered; await nextTurn();
+			expect(executed).toEqual(["0", "1"]);
+			gates[0]!.release(); await gates[2]!.entered; expect(executed).toEqual(["0", "1", "2"]);
+		} finally { gates.forEach(gate => gate.release()); await runtime.dispose(); }
+	});
+
 	it("holds speculative capacity through cancellation and cleanup, but never queues the actual Actor behind it", async () => {
 		for (const mode of ["producer", "preview", "queued", "running"] as const) {
 			const executed: string[] = [], aborted: string[] = [];

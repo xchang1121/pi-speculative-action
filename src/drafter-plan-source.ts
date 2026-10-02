@@ -16,6 +16,8 @@ interface DrafterBatch {
 	readonly utility: DrafterUtilityBatch;
 	readonly tools: ReadonlySet<string>;
 	readonly schemaHashes: Readonly<Record<string, string>>;
+	readonly expansion: { readonly key: string; readonly stages: Map<string, DrafterUtilityBatch>; finished: boolean };
+	readonly marginalUtilities?: readonly DrafterUtilityBatch[];
 }
 
 interface DrafterPlanFeedback extends DrafterBatch {
@@ -82,6 +84,7 @@ export function createDrafterPlanSource(input: {
 }): DrafterPlanSourceController {
 	const batches = new Map<string, DrafterPreparation>();
 	const gate = new DrafterUtilityGate();
+	const expansionGate = new DrafterUtilityGate();
 	// Separate Beta(1, 1) estimates for matching and adoption, scoped to the model and tool contract.
 	const calibration = new BoundedRecencyMap<string, { observed: number; matched: number; eligible: number; adopted: number }>(128);
 	const calibrationKey = (batch: DrafterBatch, tool: string) => JSON.stringify([batch.utility.key, tool, batch.schemaHashes[tool]]);
@@ -95,11 +98,29 @@ export function createDrafterPlanSource(input: {
 		batches.delete(key);
 		batch?.dispose();
 		// Model/auth failures are already represented by source request events.
-		void batch?.ready.then((value) => { if (value) gate.finish(value.utility); }).catch(() => {});
+		void batch?.ready.then((value) => {
+			if (!value) return;
+			gate.finish(value.utility);
+			value.expansion.finished = true;
+			for (const utility of value.expansion.stages.values()) expansionGate.finish(utility);
+		}).catch(() => {});
 	};
 	const completeDraft = async (batch: DrafterBatch, signal: AbortSignal, report: ((tokens: number) => void) | undefined,
-		prefix: string, depth = 0, dependsOn?: PlanAction["dependsOn"]) => {
+		prefix: string, depth = 0, dependsOn?: PlanAction["dependsOn"], width = 0) => {
 		signal.throwIfAborted();
+		// Each additional width/depth spends its own exploration budget and must repay itself through adoption.
+		const stage = depth > 0 ? `depth:${depth}` : width > 0 ? `width:${width}` : undefined;
+		let marginal: DrafterUtilityBatch | undefined;
+		if (stage) {
+			marginal = batch.expansion.stages.get(stage);
+			if (!marginal) {
+				marginal = expansionGate.start(JSON.stringify([batch.expansion.key, stage]), batch.utility.policy.enabled);
+				marginal.finished = batch.expansion.finished;
+				batch.expansion.stages.set(stage, marginal);
+			}
+			if (!marginal.allowed) return undefined;
+			expansionGate.requestStarted(marginal);
+		}
 		gate.requestStarted(batch.utility);
 		let failed = false;
 		try {
@@ -112,7 +133,8 @@ export function createDrafterPlanSource(input: {
 			// Calls to tools outside the prediction list drop out; the partial batch can no longer be continued as a whole.
 			const kept = calls.filter((call) => batch.tools.has(call.name));
 			if (!kept.length || new Set(calls.map((call) => call.id)).size !== calls.length) return undefined;
-			const feedback: DrafterPlanFeedback = { ...batch, kind: "drafter_plan", message, depth,
+			const marginalUtilities = [...new Set([...(batch.marginalUtilities ?? []), ...(marginal ? [marginal] : [])])];
+			const feedback: DrafterPlanFeedback = { ...batch, marginalUtilities, kind: "drafter_plan", message, depth,
 				calls: new Map(kept.map((call, index) => [`${prefix}:${index}`, call])), results: new Map(), claimed: kept.length < calls.length };
 			return { actions: [...feedback.calls].map(([id, call]): PlanAction => ({
 				id, type: "tool_call", tool: call.name, input: widenReadGuess(call.name, call.arguments), depth, feedback, dependsOn, ...probabilities(batch, call.name),
@@ -123,6 +145,7 @@ export function createDrafterPlanSource(input: {
 			throw error;
 		} finally {
 			gate.requestSettled(batch.utility, failed);
+			if (marginal) expansionGate.requestSettled(marginal, failed);
 		}
 	};
 	const source: AgentPlanSource = {
@@ -191,7 +214,9 @@ export function createDrafterPlanSource(input: {
 					// Inherit transport options, while the Drafter owns its reasoning and output budget.
 					const { maxTokens: _actorMaxTokens, reasoning: requestedReasoning, ...requestOptions } = configuredDraftOptions ?? {};
 					const reasoning = clampThinkingLevel(model, getDraftOptions ? requestedReasoning ?? "off" : "off");
-					return { model, context, options: { ...requestOptions, reasoning: reasoning === "off" ? undefined : reasoning }, utility, tools, schemaHashes: { ...data.schemaHashes } };
+					const schemaHashes = { ...data.schemaHashes };
+					return { model, context, options: { ...requestOptions, reasoning: reasoning === "off" ? undefined : reasoning }, utility, tools, schemaHashes,
+						expansion: { key: JSON.stringify([utility.key, Object.entries(schemaHashes).sort(([a], [b]) => a.localeCompare(b))]), stages: new Map(), finished: false } };
 				});
 				batches.set(batchKey, batch);
 			}
@@ -207,7 +232,7 @@ export function createDrafterPlanSource(input: {
 					cacheRetention: prepared.options.cacheRetention ?? "short",
 				};
 				if (!prepared.utility.startedRequests) data.prepareExecution?.(candidateNames, batch.signal);
-				const draft = await completeDraft({ ...prepared, options: draftOptions }, signal, reportDraftTokens, String(proposalIndex));
+				const draft = await completeDraft({ ...prepared, options: draftOptions }, signal, reportDraftTokens, String(proposalIndex), 0, undefined, proposalIndex);
 				return draft && { id: `drafter:${startInput.turnID}:${proposalIndex}`, source: "drafter", revision: 0, ...draft };
 			});
 		},
@@ -256,6 +281,8 @@ export function createDrafterPlanSource(input: {
 			const owner = candidate?.source === "drafter" ? asDrafterPlanFeedback(candidateFeedback) : undefined;
 			const utility = owner?.utility ?? (await batches.get(agentBatchKey(sessionID, turnID))?.ready.catch(() => undefined))?.utility;
 			if (utility) gate.creditAdoption(utility, settlement.provider.timing, sources.size);
+			// Descendants credit the extra root/depth that made them possible, once per stage and Actor settlement.
+			for (const marginal of owner?.marginalUtilities ?? []) expansionGate.creditAdoption(marginal, settlement.provider.timing, sources.size);
 		},
 		finishSession: () => { for (const key of batches.keys()) finishBatch(key); },
 	};

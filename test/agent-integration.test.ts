@@ -173,7 +173,7 @@ describe("speculative action host", () => {
 				const { host, events } = drafterHost("session", { cwd, complete,
 					draftModel: { ...model("draft"), reasoning: supported, thinkingLevelMap: { xhigh: "high", max: "max" } },
 					...(requested === undefined ? {} : { getDraftOptions: () => options }),
-					getSettings: () => ({ ...settings(), drafterMaxTokens: 128, drafterMaxDepth: 1, maxConcurrentActions: supported ? 1 : 3 }),
+					getSettings: () => ({ ...settings(), drafterMaxTokens: 128, drafterMaxDepth: 1, maxConcurrentActions: supported ? 1 : 6 }),
 					executionWorlds: [mockRuntimeWorld(async (context) => {
 						const offset = Number(/\d/.exec((context.args as { path: string }).path)![0]);
 						if (!supported && offset < 3) await finished[offset]!.promise;
