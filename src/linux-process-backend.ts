@@ -440,7 +440,7 @@ export class LinuxProcessReuseBackend {
 					const hitLatencyMs = Math.max(0, performance.now() - requestStarted);
 					const observation = this.observations.getStore();
 					if (observation && !observation.closed && sameScope(observation.scope, request.scope))
-						observation.computations.push(reusedComputation(plan.certificate.result, requestStarted));
+						observation.computations.push(reusedComputation(requestStarted));
 					this.addActor("wholeCommandReplayMs", Math.max(0, performance.now() - replayStarted));
 					this.addActor("wholeCommandReusedProcessMs", plan.certificate.result.observedProcessMs ?? 0);
 					this.addActor("wholeCommandHits");
@@ -739,7 +739,7 @@ export class LinuxProcessReuseBackend {
 		this.add(session, "wholeCommandReplayMs", Math.max(0, performance.now() - replayStarted));
 		this.add(session, "wholeCommandReusedProcessMs", plan.certificate.result.observedProcessMs ?? 0);
 		this.add(session, "wholeCommandHits");
-		session.computations.push(reusedComputation(plan.certificate.result, replayStarted));
+		session.computations.push(reusedComputation(replayStarted));
 		return { exitCode: plan.certificate.result.exit?.kind === "code" ? plan.certificate.result.exit.code : null };
 	}
 
@@ -1067,7 +1067,7 @@ export class LinuxProcessReuseBackend {
 					if (observation && !observation.closed && sameScope(observation.scope, scope)) {
 						if (binding && this.handoffs.resolveBinding(binding, scope) && observation.bindings.size < this.store.limits.maxCertificates)
 							observation.bindings.set(order, binding);
-						observation.computations.push(reusedComputation(plan.certificate.result, requestStarted, acquired));
+						observation.computations.push(reusedComputation(requestStarted, acquired));
 					}
 					this.recordHit(acquired.producer?.scope, acquired.joined, undefined, scope);
 					this.processScheduler.observeAdoption(timing, Math.max(0, performance.now() - requestStarted - acquired.waitedMs));
@@ -1099,7 +1099,7 @@ export class LinuxProcessReuseBackend {
 				path.join(session.workspace.processRoot, "private"));
 			session.nestedEvidence.push(certificate.dependencyCertificate);
 			this.recordHit(acquired.producer?.scope, acquired.joined, session);
-			session.computations.push(reusedComputation(certificate.result, started, acquired));
+		session.computations.push(reusedComputation(started, acquired));
 			replayed = true;
 			const streams = inputs && streamSettlement(inputs, (certificate.result.resources?.transitions ?? []).map(event => ({ alias: event.id, kind: event.kind, data: artifacts.read(event.data) })));
 			if (inputs && !streams) return { kind: "hit", weakKey, output: [], exit: { kind: "code", code: 125 } };
@@ -1733,11 +1733,11 @@ function parseDescriptorOffsets(report: Buffer, inputs: ReturnType<typeof descri
 	return positions;
 }
 
-function reusedComputation(result: ProcessResultRecord, startedAt: number,
+function reusedComputation(startedAt: number,
 	acquired?: { readonly producer?: ProcessHandoff; readonly waiting?: readonly TimelineInterval[] }): TimelineDependency {
 	if (acquired?.producer?.computation) return { computation: acquired.producer.computation, shared: acquired.waiting };
 	const computation = new TimelineInterval(startedAt, performance.now());
-	return { computation, shared: [computation], expectedActorMs: result.observedProcessMs };
+	return { computation, shared: [computation] };
 }
 
 function processTimingIdentity(prototype: ExecPrototype, weakKey: Sha256Digest): ServiceTimingIdentity {
