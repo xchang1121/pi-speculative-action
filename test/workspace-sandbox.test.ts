@@ -1327,10 +1327,11 @@ describe("workspace-branch ExecutionWorld", () => {
 				const [first, second] = [await workspace.transactions.begin(), await workspace.transactions.begin()];
 				const early = Date.now() - 50;
 				await write("a.txt", "first\n"); await write("b.txt", "second\n");
-				const endedAt = Date.now();
+				// Synthetic trace times share the filesystem clock; Windows' Date.now() can lag its ctime.
+				const endedAt = Math.max(Date.now(), ...await Promise.all(["a.txt", "b.txt"].map(async name => Math.ceil((await stat(path.join(workspace.sandboxRoot, name))).ctimeMs))));
 				if (late) { await new Promise(resolve => setTimeout(resolve, 20)); await write("a.txt", "later\n"); }
 				const looked: [string, number][] = observed.length ? [[observed[0]!, observed[1] === "early" ? early : endedAt]] : [];
-				const [delta, other] = await Promise.all([first.finish(own(["a.txt"], looked, endedAt)), second.finish(own(["b.txt"]))]);
+				const [delta, other] = await Promise.all([first.finish(own(["a.txt"], looked, endedAt)), second.finish(own(["b.txt"], [], endedAt))]);
 				expect(delta, `${reason}: ${delta.complete ? "" : delta.reason}`).toMatchObject(reason ? { complete: false, reason } : { complete: true, changes: [{ relativePath: "a.txt" }] });
 				if (!reason) expect([delta.changes.length, other.complete ? other.changes.map(change => change.relativePath) : other.reason]).toEqual([1, ["b.txt"]]);
 			}
