@@ -23,7 +23,6 @@ import {
 import {
 	type ExecutionWorldRequest,
 	type WorldBranch,
-	type WorldCommitMetrics,
 } from "../execution-world.ts";
 import { effectCommitFailure } from "../effect-transaction.ts";
 import { assertNoSymlinkPath } from "../filesystem-evidence.ts";
@@ -202,7 +201,6 @@ async function forkThinkThreadWorld(
 	autoResizeImages: boolean,
 	snapshotInputs: boolean,
 ): Promise<WorldBranch<ToolSettlement>> {
-	const setupStarted = performance.now();
 	const tool = toolName(context.toolName);
 	const settings = runnerSettings(context.action, autoResizeImages, context.cwd);
 	const dependencies = actionDependencies(context);
@@ -226,7 +224,7 @@ async function forkThinkThreadWorld(
 			if (inputs) return thinkThreadWorldBranch({
 				output: inputs.output, source: source.lease, lineage: source.lineage, depth: source.depth,
 				resources: context.action.resources, capturedBytes: 0,
-				setupMs: inputs.setupFinishedAt - setupStarted, captureMs: inputs.captureMs, nativeInputs: inputs.version,
+				nativeInputs: inputs.version,
 				executionFingerprint: context.action.executionFingerprint, ...world, dependencies,
 			});
 		}
@@ -258,7 +256,6 @@ async function forkThinkThreadWorld(
 		const resources = target
 			? await changedResources(world.client, source.lease.id, target.id)
 			: [...context.action.resources];
-		const setupMs = Math.max(0, performance.now() - setupStarted - run.metrics.executeMs - run.metrics.sealMs);
 		return thinkThreadWorldBranch({
 			output,
 			source: source.lease,
@@ -267,8 +264,6 @@ async function forkThinkThreadWorld(
 			depth: source.depth,
 			resources,
 			capturedBytes: Math.max(0, run.changedBytes ?? 0),
-			setupMs,
-			captureMs: run.metrics.sealMs,
 			executionFingerprint: context.action.executionFingerprint,
 			client: world.client,
 			durable: world.durable,
@@ -289,8 +284,6 @@ interface ThinkThreadBranchInput {
 	readonly depth: number;
 	readonly resources: readonly string[];
 	readonly capturedBytes: number;
-	readonly setupMs: number;
-	readonly captureMs: number;
 	readonly executionFingerprint: string;
 	readonly client: AgentPosixClient;
 	readonly durable: DurableFsExecutor;
@@ -301,7 +294,7 @@ interface ThinkThreadBranchInput {
 
 function thinkThreadWorldBranch(input: ThinkThreadBranchInput): WorldBranch<ToolSettlement> {
 	const { output, source, target, client, durable, pool, dependencies, nativeInputs } = input;
-	let metrics: WorldCommitMetrics | undefined, commitPromise: Promise<ToolSettlement> | undefined;
+	let commitPromise: Promise<ToolSettlement> | undefined;
 	let validating: Promise<ResourceValidation> | undefined, disposal: Promise<void> | undefined, disposed = false;
 	const nativeCause = async () => {
 		try { if (nativeInputs) await assertInputAuthority(nativeInputs); }
@@ -325,7 +318,6 @@ function thinkThreadWorldBranch(input: ThinkThreadBranchInput): WorldBranch<Tool
 		return pending.finally(() => { if (validating === pending) validating = undefined; });
 	};
 	async function commitOnce(onValidation?: (validation: ResourceValidation) => void): Promise<ToolSettlement> {
-		const started = performance.now();
 		try {
 			if (!target) {
 				const validation = await validate();
@@ -338,27 +330,13 @@ function thinkThreadWorldBranch(input: ThinkThreadBranchInput): WorldBranch<Tool
 						validation.cause,
 					);
 				}
-				metrics = {
-					durationMs: Math.max(0, performance.now() - started),
-					validationMs: validation.metrics.durationMs,
-					bytesValidated: validation.metrics.bytesRead,
-					resourcesValidated: validation.metrics.filesRead,
-					resourcesCommitted: 0,
-				};
 			} else {
-				const apply = await durable.apply({
+				await durable.apply({
 					baseSnapshotId: source.id,
 					targetSnapshotId: target.id,
 					dependencies: [...dependencies],
 					policyId: "safe_content_v1",
 				});
-				metrics = {
-					durationMs: Math.max(0, performance.now() - started),
-					validationMs: 0,
-					bytesValidated: 0,
-					resourcesValidated: dependencies.length,
-					resourcesCommitted: apply.changedPaths,
-				};
 				await pool.invalidate();
 			}
 			return output;
@@ -377,9 +355,8 @@ function thinkThreadWorldBranch(input: ThinkThreadBranchInput): WorldBranch<Tool
 	return {
 		output, backend: WORLD_ID, resources: Object.freeze([...input.resources]), capturedBytes: input.capturedBytes,
 		checkpoint: pool.checkpoint(target ?? source, input.lineage, input.depth + 1),
-		executionMetrics: Object.freeze({ setupMs: input.setupMs, captureMs: input.captureMs }),
+		executionMetrics: Object.freeze({}),
 		compatibility: Object.freeze({ status: "compatible", backend: WORLD_ID, executionFingerprint: input.executionFingerprint }),
-		get commitMetrics() { return metrics; },
 		validate,
 		validateAndCommit: target ? undefined : async () => {
 			if (commitPromise) {
@@ -469,11 +446,9 @@ async function captureSnapshotInputs(world: PreparedWorld, context: SpeculativeT
 		const execute = resolvePiToolInvocation(request.tool, request.args, { cwd: context.cwd, environment: {},
 			autoResizeImages: request.autoResizeImages, modelSupportsImages: request.modelSupportsImages })?.filesystem;
 		if (!execute) throw new Error("ThinkThread input execution requires its qualified stock Pi version");
-		const setupFinishedAt = performance.now();
 		let output: ToolSettlement;
 		try { output = await execute(view, { ...request, signal: context.signal }); }
 		catch (error) { output = toolErrorSettlement(error); }
-		const captureStarted = performance.now();
 		context.signal.throwIfAborted(); view.seal();
 		await assertInputAuthority(version);
 		const frame = Buffer.from(encodeThinkThreadToolRunnerResponse(output));
@@ -481,7 +456,7 @@ async function captureSnapshotInputs(world: PreparedWorld, context: SpeculativeT
 		context.signal.throwIfAborted();
 		output = decodeThinkThreadToolRunnerResponse(frame);
 		retained = true;
-		return { output, setupFinishedAt, captureMs: performance.now() - captureStarted, version };
+		return { output, version };
 	} finally {
 		await view?.dispose();
 		if (!retained) await version.release();

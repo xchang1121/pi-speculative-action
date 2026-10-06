@@ -70,20 +70,8 @@ export function emptyWorldReuseMetrics(): WorldReuseMetrics {
 }
 
 export interface WorldExecutionMetrics {
-	/** Time spent materializing an isolated world before the tool could start. */
-	readonly setupMs?: number;
-	/** Time spent sealing observable persistent effects after the tool completed. */
-	readonly captureMs?: number;
 	/** Validated result reuse performed by the world while executing the action. */
 	readonly reuse?: WorldReuseMetrics;
-}
-
-export interface WorldCommitMetrics {
-	readonly durationMs: number;
-	readonly validationMs: number;
-	readonly bytesValidated: number;
-	readonly resourcesValidated: number;
-	readonly resourcesCommitted: number;
 }
 
 /** Backend-issued evidence; policy decides whether it matches the Actor world. */
@@ -154,7 +142,6 @@ export interface WorldBranch<Output> {
 	readonly capturedBytes: number;
 	readonly executionMetrics: WorldExecutionMetrics;
 	readonly compatibility: WorldCompatibilityEvidence;
-	readonly commitMetrics?: WorldCommitMetrics;
 	/** Required for shared results; exclusive branches may instead prove conflicts atomically at commit. */
 	readonly validate?: () => Promise<ResourceValidation>;
 	/** Shared observations only: prove freshness and complete the effect-free backend commit together.

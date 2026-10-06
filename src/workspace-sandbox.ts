@@ -8,7 +8,7 @@ import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { containsFilesystemPath, filesystemPathKey, relativeFilesystemPath, slash } from "./path-utils.ts";
 import { errorMessage, hasErrorCode, isMissing } from "./error-utils.ts";
 import { createCommittedResourceInputs, type SpeculativeAgentExecutionWorld, type SpeculativeToolExecutionContext } from "./agent-execution-world.ts";
-import type { WorldBranch, WorldCheckpoint, WorldCommitMetrics, WorldExecutionMetrics } from "./execution-world.ts";
+import type { WorldBranch, WorldCheckpoint, WorldExecutionMetrics } from "./execution-world.ts";
 import { advanceFilesystemClock, assertNoSymlinkPath, captureFilesystemEntry, captureStableFile, fileIdentity, mapFilesystem, sameFilesystemIdentity,
 	settledIdentity, sharedWalk } from "./filesystem-evidence.ts";
 import { WORKSPACE_PATH_MUTATION_EFFECTS } from "./effect-model.ts";
@@ -305,7 +305,7 @@ export class WorkspaceSandboxService {
 
 	async commitDelta(delta: SandboxExecutionDelta): Promise<ToolSettlement> {
 		assertWorkspaceSandboxOpen(this.state);
-		return (await commitSandboxExecution(this.state, { output: delta.output, changes: ownSandboxChanges(delta.changes) })).output;
+		return commitSandboxExecution(this.state, { output: delta.output, changes: ownSandboxChanges(delta.changes) });
 	}
 
 	closePools(roots?: readonly string[]): Promise<void> { return closeWorkspaceSandboxPoolsFor(this.state, roots); }
@@ -388,7 +388,7 @@ function workspaceBranch(snapshot: WorkspaceExecutionSnapshot, sourceRoot: strin
 	const { changes } = snapshot, { executionFingerprint } = action, backend = "git_worktree", id = randomUUID();
 	const checkpoint = Object.freeze({ backend, id, lineage: parent?.token.lineage ?? id, depth: (parent?.token.depth ?? -1) + 1 });
 	workspaceCheckpoints.set(checkpoint, { token: checkpoint, sourceRoot, parent, changes });
-	let commitMetrics: WorldCommitMetrics | undefined, commitPromise: Promise<ToolSettlement> | undefined;
+	let committed = false, commitPromise: Promise<ToolSettlement> | undefined;
 	const inputs = new Map<string, ResourceInput>();
 	let disposed = false, readInputs = false, transferred: ReturnType<NonNullable<WorldBranch<ToolSettlement>["takeCommittedInputs"]>> | undefined;
 	return {
@@ -397,8 +397,7 @@ function workspaceBranch(snapshot: WorkspaceExecutionSnapshot, sourceRoot: strin
 		capturedBytes: changes.reduce((total, change) => total + sandboxChangeBytes(change), 0),
 		executionMetrics: Object.freeze({ ...snapshot.executionMetrics }),
 		compatibility: Object.freeze({ status: "compatible" as const, backend, executionFingerprint }),
-		get commitMetrics() { return commitMetrics; },
-		commit: () => commitPromise ??= commitSandboxExecution(owner, snapshot, inputs).then(({ output, metrics }) => { commitMetrics = metrics; if (disposed) inputs.clear(); return output; }),
+		commit: () => commitPromise ??= commitSandboxExecution(owner, snapshot, inputs).then(output => { committed = true; if (disposed) inputs.clear(); return output; }),
 		takeReadInputs: async (maxBytes) => {
 			// Every file this branch read keeps its pre-image until commit; each serves reads while it stays unchanged.
 			const preimages = new Map<string, ResourceInput>(changes.flatMap((change) => change.kind !== "directory" && change.before && !change.aliases && textual(change.before) ? [[change.target, change.before]] : []));
@@ -411,7 +410,7 @@ function workspaceBranch(snapshot: WorkspaceExecutionSnapshot, sourceRoot: strin
 			await inputs?.dispose(); return undefined;
 		},
 		takeCommittedInputs: async (maxBytes) => {
-			if (disposed || !commitMetrics || transferred) return undefined;
+			if (disposed || !committed || transferred) return undefined;
 			return transferred = (async () => {
 				if (!inputs.size) return undefined;
 				try {
@@ -426,9 +425,8 @@ function workspaceBranch(snapshot: WorkspaceExecutionSnapshot, sourceRoot: strin
 }
 
 async function commitSandboxExecution(state: WorkspaceSandboxState, execution: SandboxExecutionDelta,
-	inputs?: Map<string, ResourceInput>): Promise<{ readonly output: ToolSettlement; readonly metrics: WorldCommitMetrics }> {
+	inputs?: Map<string, ResourceInput>): Promise<ToolSettlement> {
 	assertWorkspaceSandboxOpen(state);
-	const started = performance.now();
 	const { changes } = execution;
 	const commit = withCommitLocks(
 		commitLockTargets(changes),
@@ -437,7 +435,7 @@ async function commitSandboxExecution(state: WorkspaceSandboxState, execution: S
 			const baselines = new Map<SandboxWorkspaceChange, RegularFileState | SandboxDirectoryState | undefined>();
 			const applied: SandboxWorkspaceChange[] = [], createdDirectories: string[] = [], parents = new Set<string>();
 			const objects = new Map<string, { source: SandboxFileChange; write?: SandboxFileChange; handle?: FileHandle; mode?: number }>();
-			let nativeStarted = false, bytesValidated = 0, validationMs = 0, resourcesCommitted = 0;
+			let nativeStarted = false;
 			try {
 				// Nothing has moved yet: every target is checked at this one moment, over one walk of the directories they share.
 				const capture = sharedWalk(); await mapFilesystem(changes, change => assertCommitTarget(change, capture));
@@ -447,7 +445,7 @@ async function commitSandboxExecution(state: WorkspaceSandboxState, execution: S
 					}
 				});
 				// The staged files take their times while every target is checked, concurrently; nothing moves before both finish.
-				const timed = restoreModifiedTimes([...staged].map(([change, temporary]) => [temporary, change.afterModified])), validationStarted = performance.now();
+				const timed = restoreModifiedTimes([...staged].map(([change, temporary]) => [temporary, change.afterModified]));
 				timed.catch(() => undefined);
 				await mapFilesystem(changes, async (change) => {
 					// A file whose identity still stands for the bytes this change replaces needs no rereading to prove them.
@@ -456,7 +454,6 @@ async function commitSandboxExecution(state: WorkspaceSandboxState, execution: S
 					const current = unchanged ? { content: (change as SandboxFileChange).before!, mode: Number(unchanged.mode & 0o777n), identity: unchanged }
 						: change.kind === "directory" ? await readSandboxDirectoryState(change.target) : await readRegularState(change.target);
 					baselines.set(change, current);
-					if (change.kind !== "directory") bytesValidated += (current as RegularFileState | undefined)?.content.byteLength ?? 0;
 					if (!sameSandboxBaseline(current, change)) throw new Error(`resource changed before commit: ${change.resource}`);
 					if (change.accessMode) await access(change.target, change.accessMode);
 					if (change.kind !== "directory" && change.aliases) {
@@ -506,7 +503,6 @@ async function commitSandboxExecution(state: WorkspaceSandboxState, execution: S
 					const identity = await group.handle.stat({ bigint: true });
 					if (!before.identity || identity.nlink !== BigInt(group.source.aliases?.length ?? 1) || !sameFilesystemIdentity(before.identity, identity)) throw new Error("file object predecessor changed");
 				}
-				validationMs = Math.max(0, performance.now() - validationStarted);
 				// Pin every source name before any destination is removed or replaced; cycles use the same transaction.
 				for (const change of changes) if (change.kind !== "directory" && change.object) {
 					const reference = change.object, group = objects.get(`${Number(reference.before)}:${reference.path}`)!;
@@ -526,7 +522,6 @@ async function commitSandboxExecution(state: WorkspaceSandboxState, execution: S
 					nativeStarted = true;
 					if (group.write) { await group.handle!.truncate(0); await group.handle!.writeFile(group.write.after!); }
 					if (group.mode !== undefined && process.platform !== "win32") await group.handle!.chmod(group.mode);
-					resourcesCommitted++;
 				}
 				for (const change of orderSandboxChanges(changes)) {
 					await assertCommitTarget(change);
@@ -541,7 +536,6 @@ async function commitSandboxExecution(state: WorkspaceSandboxState, execution: S
 							await chmod(change.target, change.after.mode);
 							applied.push(change);
 						}
-						resourcesCommitted++;
 						continue;
 					}
 					if (change.object && !staged.has(change)) continue;
@@ -556,7 +550,6 @@ async function commitSandboxExecution(state: WorkspaceSandboxState, execution: S
 							descriptors.set(change, descriptor); applied.push(change);
 						}
 						await descriptor.writeFile(change.after!);
-						resourcesCommitted++;
 						continue;
 					}
 					applied.push(change);
@@ -574,7 +567,6 @@ async function commitSandboxExecution(state: WorkspaceSandboxState, execution: S
 					} else {
 						await rm(change.target, { force: true });
 					}
-					resourcesCommitted++;
 				}
 				await restoreModifiedTimes(changes.flatMap(change => change.kind !== "directory" && change.operation ? [[change.target, change.afterModified] as const] : []));
 				let directoryBytes = 0;
@@ -620,9 +612,7 @@ async function commitSandboxExecution(state: WorkspaceSandboxState, execution: S
 			}
 			if (inputs) for (const change of changes) if (!change.validationOnly && (change.kind === "directory" ? !change.after : textual(change.after)))
 				inputs.set(change.target, change.kind === "directory" ? null : change.after ?? null);
-			return { output: execution.output, metrics: {
-				durationMs: Math.max(0, performance.now() - started), validationMs, bytesValidated, resourcesValidated: changes.length, resourcesCommitted,
-			} };
+			return execution.output;
 		},
 	);
 	return state.lifetime.track(commit);
@@ -633,16 +623,13 @@ async function forkSandboxWorkspaceFor(state: WorkspaceSandboxState, options: Sa
 	const sourceRoot = path.resolve(options.cwd);
 	const parent = resolveWorkspaceCheckpoint(options.parentCheckpoint, sourceRoot);
 	const resolvedDriver = await resolveWorkspaceDriver(state, options.driver === "auto" || options.driver === undefined ? { ...options, driver: "git" } : options);
-	const setupStarted = performance.now();
 	const snapshot = await withPrivateSandboxWorkspace(state, sourceRoot, options.gitBinary ?? "git", resolvedDriver.driver, options,
 		async (workspace) => {
-			const setupMs = Math.max(0, performance.now() - setupStarted);
 			const result = await options.execute(workspace);
-			const captureStarted = performance.now();
 			const captured = "output" in result ? result : { output: result, changes: await collectSandboxChanges(workspace) };
 			const changes = ownSandboxChanges((await options.afterCapture?.(workspace, captured)) ?? captured.changes);
 			if (workspace.recycle && "output" in result) { workspace.recycle.written.push(...writtenPaths(changes)); workspace.recycle.settled = true; }
-			return { output: captured.output, changes, executionMetrics: { setupMs, captureMs: Math.max(0, performance.now() - captureStarted), ...options.executionMetrics?.() } };
+			return { output: captured.output, changes, executionMetrics: { ...options.executionMetrics?.() } };
 		},
 		parent, preparation);
 	return workspaceBranch(snapshot, sourceRoot, options.action, state, parent, options.validate);
@@ -696,7 +683,7 @@ const LINKED_INPUT = new Error("linked workspace input");
 /** Both substrates capture the same operation delta; only a private workspace performs speculative writes. */
 async function executeFilesystemMutation(context: SpeculativeToolExecutionContext, execute: NonNullable<ToolInvocation["filesystem"]>,
 	workspace?: SandboxWorkspaceContext): Promise<WorkspaceExecutionSnapshot> {
-	const sourceRoot = path.resolve(context.cwd), started = performance.now();
+	const sourceRoot = path.resolve(context.cwd);
 	const changes = new Map<string, SandboxWorkspaceChange>(), lifetime = new RuntimeLifecycleLane();
 	let bytes = 0, failure: { error: unknown } | undefined, namespace: Promise<WorkspaceStructureSnapshot> | undefined;
 	// A request the tool swallowed still fails the run; requests after it returns are refused.
@@ -785,7 +772,7 @@ async function executeFilesystemMutation(context: SpeculativeToolExecutionContex
 		}
 	}
 	const captured = [...changes.values()];
-	return { output, changes: workspace ? captured : ownSandboxChanges(captured), executionMetrics: { setupMs: 0, captureMs: Math.max(0, performance.now() - started) } };
+	return { output, changes: workspace ? captured : ownSandboxChanges(captured), executionMetrics: {} };
 }
 
 async function createPrivateSandboxWorkspace(state: WorkspaceSandboxState, cwd: string, gitBinary: string,

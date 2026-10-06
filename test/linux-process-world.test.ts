@@ -2294,7 +2294,6 @@ int main(void) { int fds[2], status; char queue[8]; if (pipe(fds) || fds[0] != 3
 				expect(operation.expectedDurationMs).toBeCloseTo(preparedMs + 20);
 				await expect(branch.commit()).resolves.toEqual(branch.output);
 				await expect(branch.commit()).resolves.toEqual(branch.output);
-				expect(branch.commitMetrics).toBeDefined();
 				expect(ownership.claimChild()).toBe(false);
 
 			}
