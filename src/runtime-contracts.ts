@@ -189,7 +189,7 @@ export interface SpeculativePlanSource<
 		readonly trigger: "execution_succeeded" | "actor_adopted";
 	}) => boolean);
 	/** Request scoped OS launch observations; this grants neither execution nor result-reuse authority. */
-	readonly observesOperations?: boolean;
+	readonly observesOperations?: (action: ActionKey) => boolean;
 	readonly observe?: (input: RuntimeTurnContext<StartInput, StateData> & {
 		readonly consumeInput: ConsumeInput;
 		readonly action?: ActionKey;
@@ -301,7 +301,6 @@ export interface SpeculativeRuntimeInspection {
 	readonly blockedPlanActions: number;
 	readonly pendingTelemetryEvents: number;
 	readonly droppedTelemetryEvents: number;
-	readonly oldestTelemetryEventMs: number;
 }
 
 /** One execution owns its reuse result and exactly-once fallback settlement, independent of caller IDs. */

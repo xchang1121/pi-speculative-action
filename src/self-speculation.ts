@@ -189,7 +189,6 @@ export class SelfSpeculationCoordinator {
 		forkLogprobTokens: 0,
 		forkGateSkips: 0,
 		forkActionAdoptions: 0,
-		forkExecutionAheadMs: 0,
 		failures: 0,
 	};
 	private lastVerification?: SelfSpeculationVerificationOutcome;
@@ -440,7 +439,6 @@ export class SelfSpeculationCoordinator {
 		if (!matchedSources.has("self-speculation") || settlement.provider.kind !== "speculative") return;
 		const shares = matchedSources.size;
 		creditAdoption(state.forkUtility, settlement.provider.timing, shares);
-		this.counters.forkExecutionAheadMs += settlement.provider.timing.executionAheadMs / shares;
 		this.counters.forkActionAdoptions++;
 	}
 

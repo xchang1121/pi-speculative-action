@@ -244,7 +244,6 @@ function run(instance: string, repeat: number, overrides: Partial<SuiteBenchmark
 			actualEndToEndMs: 1,
 			toolWaitMs: 1,
 			hiddenLatencyMs: 0,
-			executionAheadMs: 0,
 			actorActions: 1,
 			speculativeHits: 0,
 			actorCost: 0,

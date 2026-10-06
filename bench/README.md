@@ -76,7 +76,7 @@ npm run bench:suite -- --suite swe_diverse --repeats 3 --label speculative
 
 ## 计时与验收规则
 
-工具加速比为 `(toolWaitMs + hiddenLatencyMs) / toolWaitMs`。工具等待按 Actor 调用起止区间取并集，包含准备、验证、采纳、回退和结算；模型思考时间不进入分母。掩盖时延仅计已采纳计算，去重共享子区间，并保留原生并行性；没有工具等待时比值为 `null`。不计算端到端加速比。
+工具加速比为 `(toolWaitMs + hiddenLatencyMs) / toolWaitMs`。工具等待按 Actor 调用起止区间取并集，包含准备、验证、采纳、回退和结算；模型思考时间不进入分母。累计工具节省时延按同次执行的串行反事实计算，包含实际消费的部分进程、跨工具输入、预处理及跨轮保留工作，去重计算身份和共享子区间，并保留原生并行性；没有工具等待时比值为 `null`。
 
 任务计时从 Host/工具初始化前到终态结算和回收完成，包含准备、预测、执行、验证、采纳、拒绝与清理。数据集下载、checkout 和最终补丁检查在计时外。完整 Host 返回与内部 `hitLatencyMs` 分开；running 接管还需区分接入、剩余执行与完成后交付。
 

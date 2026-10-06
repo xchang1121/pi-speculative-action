@@ -134,15 +134,13 @@ export class ToolExecutionGateway<Context, Output> {
 				}
 			}
 			const startedAt = performance.now();
-			let outcome: AuthoritativeExecutionOutcome<AuthoritativeOutput>;
-			try {
-				outcome = { status: "succeeded", output: await executor(operation) };
-			} catch (error) {
-				outcome = { status: "failed", error };
-			}
+			const { output: outcome, dependencies } = await TimelineInterval.collect(async (): Promise<AuthoritativeExecutionOutcome<AuthoritativeOutput>> => {
+				try { return { status: "succeeded", output: await executor(operation) }; }
+				catch (error) { return { status: "failed", error }; }
+			});
 			const completedAt = performance.now();
 			let toolExecution: TimelineInterval;
-			try { toolExecution = new TimelineInterval(startedAt, completedAt, hooks.computationDependencies?.()); }
+			try { toolExecution = new TimelineInterval(startedAt, completedAt, [...dependencies, ...hooks.computationDependencies?.() ?? []]); }
 			catch { toolExecution = new TimelineInterval(startedAt, completedAt); } // Accounting cannot replace the Actor outcome.
 			const settlement = Object.freeze({ ...outcome, toolExecution, durationMs: toolExecution.completedAt - toolExecution.startedAt });
 			try { await hooks.settled?.(settlement); }

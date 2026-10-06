@@ -16,7 +16,7 @@ describe("fork benefit gate", () => {
 				expect(gate.snapshot().samples).toBe(index);
 				gate.requestSettled(batch);
 				gate.requestStarted(batch); gate.requestSettled(batch); // A late continuation runs beside the Actor.
-				gate.creditAdoption(batch, { executionAheadMs: 10000, attemptLeadMs: 20000, hitLatencyMs: 100, expectedActorMs });
+				gate.creditAdoption(batch, { hitLatencyMs: 100, expectedActorMs });
 				expect(gate.snapshot().samples).toBe(index + 1);
 				expect(gate.snapshot().expectedNetBenefitMs).toBe(expectedActorMs === undefined ? undefined : expectedActorMs - 100);
 			}

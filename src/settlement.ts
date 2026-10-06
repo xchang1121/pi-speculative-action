@@ -109,16 +109,10 @@ export interface SettledSourceRequest {
 export interface CandidateRejection { readonly candidateID: string; readonly match: ActionKeyMatch; readonly cause: ResolutionCause; }
 
 export interface ActorHitTiming {
-	/** Work completed before Actor interception, capped by execution duration. */
-	readonly executionAheadMs: number;
-	/** Execution-owning source request to Actor interception. */
-	readonly attemptLeadMs: number;
 	/** Actor interception through adoption and result retention; session cleanup is separate. */
 	readonly hitLatencyMs: number;
 	/** Historical fallback-service estimate, absent without samples; not a no-speculation baseline. */
 	readonly expectedActorMs?: number;
-	/** Historical native execution without capture or settlement: the reference for estimated savings. */
-	readonly expectedNativeMs?: number;
 }
 
 export type ActorActionProvider =

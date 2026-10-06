@@ -719,7 +719,9 @@ int main(int argc, char **argv) {
 			for (const clock of [timeline, laterTask]) clock.recordTool(execution);
 			expect(timeline.measure(execution.completedAt).authoritativeToolCount,
 				JSON.stringify({ execution, metrics: fixture.backend.actorMetrics(), producer: fixture.backend.metrics(), bindings: fixture.backend.executionBindings(later), operations: events.filter(event => event.type === "operation_prediction") })).toBe(stalePreparation ? 1 : 2);
-			expect(laterTask.measure(execution.completedAt)).toMatchObject({ authoritativeToolCount: 1, hiddenLatencyMs: 0 });
+			expect(laterTask.measure(execution.completedAt).authoritativeToolCount).toBe(stalePreparation ? 1 : 2);
+			expect(laterTask.measure(execution.completedAt).hiddenLatencyMs).toBeGreaterThanOrEqual(0);
+			if (!stalePreparation) expect(laterTask.measure(execution.completedAt).hiddenLatencyMs).toBeGreaterThan(0);
 			expect(events.filter(event => event.type === "operation_prediction").filter(event => !launcher || stalePreparation || event.settlement.observation === "observed")).toMatchObject(Array.from({ length: launcher && stalePreparation ? 2 : 1 }, () => ({ settlement: stalePreparation ? { observation: "unobserved" } : {
 				prediction: { source: "pattern_aware", kind: "operation" }, observation: "observed", match: { matched: true, adoption: { status: "adopted" } },
 			} })));

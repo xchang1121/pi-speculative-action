@@ -4,7 +4,6 @@ export interface SuiteBenchmarkSummary {
 	readonly actualEndToEndMs: number;
 	readonly toolWaitMs: number;
 	readonly hiddenLatencyMs: number;
-	readonly executionAheadMs: number;
 	readonly actorActions: number;
 	readonly speculativeHits: number;
 	readonly actorCost: number;
@@ -109,7 +108,6 @@ function pooled(runs: readonly MeasuredRun[]) {
 		toolWaitP95Ms: nearestRank(runs.map((run) => run.summary.toolWaitMs), 0.95),
 		toolSpeedup: toolSpeedup({ toolWaitMs, hiddenLatencyMs }),
 		hiddenLatencyMs,
-		executionAheadMs: sum(runs, "executionAheadMs"),
 		actorActions,
 		speculativeHits,
 		hitRate: actorActions > 0 ? speculativeHits / actorActions : 0,

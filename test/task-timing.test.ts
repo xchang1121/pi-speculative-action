@@ -19,15 +19,15 @@ describe("accepted computation overlap and Actor tool wait", () => {
 		for (const hiddenLatencyMs of [-1, NaN, Infinity]) expect(toolSpeedup({ toolWaitMs: 50, hiddenLatencyMs })).toBeNull();
 	});
 
-	it("excludes previous-task computations even when multiple dependencies share them", () => {
+	it("credits consumed work from before this task while deduplicating shared dependencies", () => {
 		const child = new TimelineInterval(20, 150), timeline = new TaskTimeline(100);
 		timeline.recordTool(new TimelineInterval(100, 170, [{ computation: child, shared: [
 			new TimelineInterval(105, 140), new TimelineInterval(130, 150),
 		] }]));
-		expect(timeline.measure(170)).toMatchObject({ toolExecutionMs: 25, hiddenLatencyMs: 0, authoritativeToolCount: 1 });
+		expect(timeline.measure(170)).toMatchObject({ toolExecutionMs: 155, hiddenLatencyMs: 85, authoritativeToolCount: 2 });
 		const repeated = new TaskTimeline(100);
 		repeated.recordTool(new TimelineInterval(100, 170, [{ computation: child }, { computation: child }]));
-		expect(repeated.measure(170)).toMatchObject({ toolExecutionMs: 70, authoritativeToolCount: 1 });
+		expect(repeated.measure(170)).toMatchObject({ toolExecutionMs: 200, hiddenLatencyMs: 130, authoritativeToolCount: 2 });
 	});
 
 	it.each([
@@ -74,8 +74,50 @@ describe("accepted computation overlap and Actor tool wait", () => {
 		nextTask.recordTool(first);
 		expect(nextTask.measure(300)).toMatchObject({ authoritativeToolCount: 0, toolExecutionMs: 0, hiddenLatencyMs: 0 });
 		for (let repeat = 0; repeat < 3; repeat++) nextTask.recordTool(first, true);
-		expect(nextTask.measure(300)).toMatchObject({ hiddenLatencyMs: 0 });
+		expect(nextTask.measure(300)).toMatchObject({ authoritativeToolCount: 1, toolExecutionMs: 40, hiddenLatencyMs: 40 });
 		expect(new TimelineInterval(Number.NaN, -1)).toEqual({ startedAt: 0, completedAt: 0 });
+	});
+
+	it("isolates concurrent evaluations and excludes rejected input work from their callers", async () => {
+		const used = new TimelineInterval(10, 30), rejected = new TimelineInterval(30, 90);
+		const [left, right] = await Promise.all([used, rejected].map(computation => TimelineInterval.collect(async () => {
+			await TimelineInterval.collect(() => { TimelineInterval.use(rejected); throw new Error("invalid proof"); }).catch(() => {});
+			await Promise.resolve(); TimelineInterval.use(computation); TimelineInterval.use(computation);
+		})));
+		for (const [evaluation, saved] of [[left, 20], [right, 60]] as const) {
+			const timeline = new TaskTimeline(100);
+			timeline.startToolWait(100)(110);
+			timeline.recordTool(new TimelineInterval(100, 110, evaluation.dependencies));
+			expect(timeline.measure(110)).toMatchObject({ hiddenLatencyMs: saved, toolWaitMs: 10, authoritativeToolCount: 2 });
+		}
+	});
+
+	it.each([false, true])("deduplicates a retained process artifact and its live partial computation (live first=%s)", liveFirst => {
+		const live = TimelineInterval.retained("process", 40, new TimelineInterval(10, 50));
+		const cached = TimelineInterval.retained("process", 40), other = TimelineInterval.retained("other", 5);
+		const timeline = new TaskTimeline(100);
+		timeline.startToolWait(100)(110);
+		timeline.recordTool(new TimelineInterval(100, 110, (liveFirst ? [live, cached, cached, other] : [cached, live, other]).map(computation => ({ computation }))));
+		expect(timeline.measure(110)).toMatchObject({ hiddenLatencyMs: 45, toolExecutionMs: 55, authoritativeToolCount: 3 });
+		expect(toolSpeedup(timeline.measure(110))).toBe(5.5);
+	});
+
+	it.each([false, true])("counts captured work once across whole and partial reuse while retaining native parallelism (adopted=%s)", async adopted => {
+		const captured = await TimelineInterval.collect(() => [new TimelineInterval(20, 60), new TimelineInterval(40, 80)].map(TimelineInterval.own));
+		const parent = new TimelineInterval(10, 90, captured.dependencies);
+		const borrowed = await TimelineInterval.collect(() => captured.output.forEach(TimelineInterval.use));
+		const query = new TimelineInterval(100, 110, borrowed.dependencies), timeline = new TaskTimeline(0);
+		timeline.recordActor(0, 10);
+		for (const childFirst of [false, true]) {
+			const measured = new TaskTimeline(0);
+			if (adopted) measured.recordActor(0, 100);
+			for (const computation of childFirst ? [query, parent] : [parent, query]) measured.recordTool(computation, computation === parent && adopted);
+			expect(measured.measure(110)).toMatchObject({ toolExecutionMs: 90, hiddenLatencyMs: adopted ? 80 : 0, authoritativeToolCount: 2 });
+			measured.recordTool(new TimelineInterval(115, 120, [{ computation: TimelineInterval.retained("external", 7) }]));
+			expect(measured.measure(120).hiddenLatencyMs).toBe((adopted ? 80 : 0) + 7);
+		}
+		timeline.recordTool(query);
+		expect(timeline.measure(110)).toMatchObject({ toolExecutionMs: 90, hiddenLatencyMs: 20, authoritativeToolCount: 3 });
 	});
 
 	it("accounts for accepted child computations without counting enclosing work or joining waits twice", () => {
@@ -89,7 +131,7 @@ describe("accepted computation overlap and Actor tool wait", () => {
 		const timeline = new TaskTimeline(0);
 		timeline.recordActor(0, 100);
 		timeline.recordTool(native);
-		timeline.recordTool(child);
+		timeline.recordTool(child, true);
 		expect(timeline.measure(170)).toMatchObject({ toolExecutionMs: 155, hiddenLatencyMs: 85,
 			authoritativeToolCount: 2 });
 		const serialChild = new TimelineInterval(100, 150), serial = new TaskTimeline(0);
@@ -102,7 +144,7 @@ describe("accepted computation overlap and Actor tool wait", () => {
 			const parent = new TimelineInterval(10, 90, [left, right].map(computation => ({ computation, shared: [computation] })));
 			const wholeAndPartial = new TaskTimeline(0);
 			wholeAndPartial.recordActor(0, 100);
-			for (const interval of childFirst ? [left, right, parent] : [parent, left, right]) wholeAndPartial.recordTool(interval);
+			for (const interval of childFirst ? [left, right, parent] : [parent, left, right]) wholeAndPartial.recordTool(interval, true);
 			// Two distinct overlapping children retain their identities; the parent contributes only its remaining 20 ms.
 			expect(wholeAndPartial.measure(100)).toMatchObject({ toolExecutionMs: 100, hiddenLatencyMs: 100, authoritativeToolCount: 3 });
 		}

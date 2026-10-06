@@ -1,39 +1,5 @@
 export type PostSettlementFailureHandler = (error: unknown) => void;
 
-export interface BoundedEventQueueSnapshot {
-	readonly capacity: number;
-	readonly pending: number;
-	readonly dropped: number;
-	readonly oldestPendingMs: number;
-}
-
-/** Ordered, failure-isolated work that must never extend the Actor settlement barrier. */
-export class PostSettlementQueue {
-	private readonly queue: BoundedEventQueue<() => void | Promise<void>>;
-
-	constructor(onFailure: PostSettlementFailureHandler = () => {}) {
-		// Learning is lossless; defer invocation so enqueue never enters a producer callback.
-		this.queue = new BoundedEventQueue(Number.MAX_SAFE_INTEGER, task => Promise.resolve().then(task), onFailure);
-	}
-
-	enqueue(task: () => void | Promise<void>): boolean {
-		return this.queue.enqueue(task);
-	}
-
-	flush(): Promise<void> {
-		return this.queue.flush();
-	}
-
-	close(): Promise<void> {
-		return this.queue.close();
-	}
-}
-
-interface PendingEvent<Event> {
-	readonly value: Event;
-	readonly enqueuedAt: number;
-}
-
 /**
  * Failure-isolated, bounded delivery for optional observers.
  *
@@ -44,7 +10,7 @@ export class BoundedEventQueue<Event> {
 	private readonly capacityValue: number;
 	private readonly deliver: (event: Event) => void | Promise<void>;
 	private readonly onFailure: PostSettlementFailureHandler;
-	private readonly pending = new Set<PendingEvent<Event>>();
+	private readonly pending = new Set<{ readonly value: Event }>();
 	private readonly idleWaiters = new Set<() => void>();
 	private active = false;
 	private closed = false;
@@ -67,18 +33,16 @@ export class BoundedEventQueue<Event> {
 			this.droppedValue++;
 			return false;
 		}
-		this.pending.add({ value: event, enqueuedAt: performance.now() });
+		this.pending.add({ value: event });
 		if (!this.active) void this.drain();
 		return true;
 	}
 
-	snapshot(now = performance.now()): BoundedEventQueueSnapshot {
-		const oldest = this.pending.values().next().value?.enqueuedAt;
+	snapshot() {
 		return Object.freeze({
 			capacity: this.capacityValue,
 			pending: this.pending.size,
 			dropped: this.droppedValue,
-			oldestPendingMs: oldest === undefined ? 0 : Math.max(0, now - oldest),
 		});
 	}
 
@@ -115,5 +79,13 @@ export class BoundedEventQueue<Event> {
 			for (const resolve of this.idleWaiters) resolve();
 			this.idleWaiters.clear();
 		}
+	}
+}
+
+/** Ordered, failure-isolated work that must never extend the Actor settlement barrier. */
+export class PostSettlementQueue extends BoundedEventQueue<() => void | Promise<void>> {
+	constructor(onFailure: PostSettlementFailureHandler = () => {}) {
+		// Learning is lossless; defer invocation so enqueue never enters a producer callback.
+		super(Number.MAX_SAFE_INTEGER, task => Promise.resolve().then(task), onFailure);
 	}
 }

@@ -26,7 +26,7 @@ describe("ActorAction", () => {
 				identity, tool: "read", actionKey, fallback: cause("matching", "no_candidate"),
 			});
 			const selection = { candidate: { id: "fresh" }, match: exact, output: "value",
-				timing: { executionAheadMs: 40, attemptLeadMs: 55, hitLatencyMs: 3 }, toolExecution: { startedAt: 10, completedAt: 50 } };
+				timing: { hitLatencyMs: 3 }, toolExecution: { startedAt: 10, completedAt: 50 } };
 			expect(action.rejectCandidate("stale", exact, cause("freshness", "resource_changed"))).toBe(true);
 			expect(action.select({ ...selection, candidate: { id: "stale" } })).toBe(false);
 			expect(action.select(selection)).toBe(true);
@@ -43,8 +43,8 @@ describe("ActorAction", () => {
 			expect(summarizeSpeculativeTrace([{ type: "actor_action", settlement: settled!, actualAction: "read README.md",
 				sessionID: "session", turnID: identity.turnID, timestamp: 0, cache: emptySpeculativeTraceSummary().cache,
 			}])).toMatchObject(provider === "speculative"
-				? { executionAheadMs: 40, attemptLeadMs: 55, hitLatencyMs: 3, actorExecutionMs: 0 }
-				: { executionAheadMs: 0, attemptLeadMs: 0, hitLatencyMs: 0, actorExecutionMs: 40, actorPreviews: 1 });
+				? { hitLatencyMs: 3, speculativeHits: 1, actorPreviews: 0 }
+				: { hitLatencyMs: 0, speculativeHits: 0, actorPreviews: 1 });
 			expect(settled).toMatchObject({ actorAction: identity, matchedPredictions: [{ id: "prediction", source: "pattern" }],
 				rejections: [{ candidateID: "stale", cause: { stage: "freshness" } }], provider: { candidateID: "fresh",
 					...(provider === "preview" ? { kind: "actor", origin: "preview", durationMs: 40 } : { kind: "speculative", match: exact }) } });
@@ -109,16 +109,17 @@ describe("ordered delivery", () => {
 		for (const event of [1, 2, 3, 4]) expect(enqueue(event)).toBe(true);
 		expect(delivered).toEqual(kind === "settlement" ? [] : [1]);
 		expect(enqueue(5)).toBe(kind === "settlement");
-		if (queue instanceof BoundedEventQueue) expect(queue.snapshot()).toMatchObject({ capacity: 4, pending: 4, dropped: 1 });
+		expect(queue.snapshot()).toEqual(kind === "settlement" ? { capacity: Number.MAX_SAFE_INTEGER, pending: 5, dropped: 0 }
+			: { capacity: 4, pending: 4, dropped: 1 });
 
 		const flushing = [queue.flush(), queue.flush()];
 		release(); await Promise.all(flushing);
 		const expected = [1, 2, 3, 4, ...(kind === "settlement" ? [5] : []), 6, 7];
 		expect(delivered).toEqual(expected);
 		expect(failures).toHaveBeenCalledOnce();
-		if (queue instanceof BoundedEventQueue) expect(queue.snapshot()).toMatchObject({ pending: 0, dropped: 1, oldestPendingMs: 0 });
-		expect(enqueue(8)).toBe(true); await queue.flush();
-		expect(delivered).toEqual([...expected, 8]);
+		expect(queue.snapshot()).toMatchObject({ pending: 0, dropped: kind === "settlement" ? 0 : 1 });
+		for (const event of [8, 8]) expect(enqueue(event)).toBe(true); await queue.flush();
+		expect(delivered).toEqual([...expected, 8, 8]);
 		await queue.close();
 		expect(enqueue(9)).toBe(false);
 	});

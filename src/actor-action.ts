@@ -168,11 +168,8 @@ export class ActorAction<Candidate extends { readonly id: string } = { readonly 
 
 function normalizeTiming(timing: ActorHitTiming): ActorHitTiming {
 	return Object.freeze({
-		executionAheadMs: finite(timing.executionAheadMs),
-		attemptLeadMs: finite(timing.attemptLeadMs),
 		hitLatencyMs: finite(timing.hitLatencyMs),
 		...(Number.isFinite(timing.expectedActorMs) ? { expectedActorMs: finite(timing.expectedActorMs) } : {}),
-		...(Number.isFinite(timing.expectedNativeMs) ? { expectedNativeMs: finite(timing.expectedNativeMs) } : {}),
 	});
 }
 

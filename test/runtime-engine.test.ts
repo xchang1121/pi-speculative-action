@@ -164,12 +164,12 @@ function call(turnID: string, input: Record<string, unknown> = { path: "README.m
 
 describe("structural speculative runtime", () => {
 	it("calibrates a repeatedly adopted result with one Actor execution and then resumes reuse", async () => {
-		const { runtime, ready, events, executions } = harness({ source: planSource({ propose: () => plan("calibration") }) });
+		const { runtime, ready, events, executions } = harness({ source: planSource({ propose: () => plan("calibration"), observesOperations: () => true, observe: () => undefined }) });
 		try {
 			await runtime.startTurn(start("turn")); await ready.promise;
-			for (let index = 0; index < 4; index++) expect((await runtime.prepareActorCall({ ...call("turn"), id: `hit-${index}` }))?.output).toBe("speculative");
+			for (let index = 0; index < 4; index++) expect(await runtime.prepareActorCall({ ...call("turn"), id: `hit-${index}` })).toMatchObject({ output: "speculative", observeOperations: false });
 			await runFallback(runtime, { ...call("turn"), id: "calibration" }, 100, "speculative");
-			for (let index = 0; index < 4; index++) expect((await runtime.prepareActorCall({ ...call("turn"), id: `measured-${index}` }))?.output).toBe("speculative");
+			for (let index = 0; index < 4; index++) expect(await runtime.prepareActorCall({ ...call("turn"), id: `measured-${index}` })).toMatchObject({ output: "speculative", observeOperations: false });
 			await runtime.finishTurn({ ...call("turn"), terminal: true });
 			const actions = events.filter(event => event.type === "actor_action");
 			expect(actions.filter(event => event.settlement.provider.kind === "actor")).toHaveLength(1);
@@ -569,15 +569,12 @@ describe("structural speculative runtime", () => {
 		expect(predictionEvents).toHaveLength(1);
 		expect(predictionEvents[0]!.type === "prediction" && predictionEvents[0]!.settlement).toBe(settlements[0]);
 		expect(actionKey).toHaveBeenCalledTimes(2);
-		expect(events.find((event) => event.type === "candidate")).toMatchObject({
-			candidate: { draftTokens: 3, totalDraftTokens: 3 },
+		expect(events.find((event) => event.type === "source_request")).toMatchObject({
+			request: { draftTokens: 3 }, totalDraftTokens: 3,
 		});
 		expect(summary()).toMatchObject({ predictionsSettled: 1, predictionsObserved: 1, predictionsMatched: 1, predictionsAdopted: 0,
 			predictionPrecision: 1, adoptionYield: 0, predictionRejectedAfterMatch: { "freshness:resource_changed": 1 },
-			actorActions: 1, speculativeHits: 0, actorFallbacks: 1, actorExecutionMs: 4, totalDraftTokens: 3 });
-		const invalidTiming = events.map(event => event.type === "candidate" && event.state.status === "succeeded"
-			? { ...event, state: { ...event.state, executionMs: Number.NaN } } : event);
-		expect(summarizeSpeculativeTrace(invalidTiming).speculativeExecutionMs).toBe(0);
+			actorActions: 1, speculativeHits: 0, actorFallbacks: 1, totalDraftTokens: 3 });
 	});
 
 	it("waits for an in-flight candidate to capture its resource baseline before validation", async () => {
@@ -616,13 +613,16 @@ describe("structural speculative runtime", () => {
 		} finally { await runtime.dispose(); }
 	});
 
-	it("learns Actor operations only while adopted operations repay the tracing, probing ever more rarely", async () => {
-		const { runtime } = harness({ source: planSource({ propose: () => undefined, observesOperations: true, observe: () => undefined }), execute: async () => "unused" });
+	it("spends operation learning probes only on native calls the source can observe", async () => {
+		const { runtime } = harness({ source: planSource({ propose: () => undefined,
+			observesOperations: action => action.tool === "bash", observe: () => undefined }), execute: async () => "unused" });
 		try {
 			await runtime.startTurn(start("learning"));
 			const learned: number[] = [];
 			for (let index = 0; index < 16; index++) {
-				const prepared = await runtime.prepareActorCall({ ...call("learning", { path: `f${index}` }), id: `call:${index}` });
+				const passive = await runtime.prepareActorCall({ ...call("learning", { path: `f${index}` }), id: `read:${index}` });
+				expect(passive?.observeOperations).toBe(false); await passive?.settle(simulatedExecution(2), "read");
+				const prepared = await runtime.prepareActorCall({ ...call("learning", { command: `worker ${index}` }), tool: "bash", id: `call:${index}` });
 				learned.push(Number(prepared?.observeOperations === true)); await prepared?.settle(simulatedExecution(10), "actor");
 			}
 			expect(learned.join("")).toBe("1111000100000001");
@@ -635,7 +635,7 @@ describe("structural speculative runtime", () => {
 		const source = planSource({
 			enabled: () => enabled,
 			propose: () => plan("bounded-join"),
-			observesOperations: true,
+			observesOperations: () => true,
 			observe: () => undefined,
 		});
 		const { runtime, events, ready: candidateReady } = harness({ source, execute: async () => { await gate.wait(); return "learned"; } });
@@ -951,8 +951,7 @@ describe("structural speculative runtime", () => {
 				authoritativeToolCount: reusable && !fallback ? 1 : 2,
 				toolExecutionMs: fallback ? 6 : reusable ? 4 : 10,
 			});
-			expect(summary()).toMatchObject({ tasks: 1, toolExecutionMs: fallback ? 6 : reusable ? 4 : 10, hiddenLatencyMs: reusable ? 0 : 6,
-				speculativeExecutionMs: reusable ? 0 : 6, actorExecutionMs: fallback ? 6 : 4 });
+			expect(summary()).toMatchObject({ tasks: 1, toolExecutionMs: fallback ? 6 : reusable ? 4 : 10, hiddenLatencyMs: reusable ? 0 : 6 });
 		} finally { await runtime.dispose(); clock.mockRestore(); }
 	});
 
@@ -1579,7 +1578,7 @@ describe("structural speculative runtime", () => {
 			await runtime.finishTurn({ ...call("next-task"), terminal: true });
 			expect(reconstruct).toHaveBeenCalledTimes(evaluations + (unretained ? 1 : 0));
 			expect(events.filter((event) => event.type === "task").at(-1)?.timing).toMatchObject({
-				toolExecutionMs: unretained ? 20 : 0, authoritativeToolCount: unretained ? 1 : 0, hiddenLatencyMs: 0 });
+				toolExecutionMs: 20, authoritativeToolCount: 1, hiddenLatencyMs: unretained ? 0 : 20 });
 		} finally { await runtime.dispose(); clock.mockRestore(); admission.mockRestore(); }
 		expect(disposed).toHaveBeenCalledOnce(); expect(runtime.inspect().sharedCandidates).toBe(0);
 		for (const dispose of queryDisposals) expect(dispose).toHaveBeenCalledOnce();

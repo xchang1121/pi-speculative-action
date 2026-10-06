@@ -13,6 +13,7 @@ import { borrowResourceObject, createCommittedResourceInputs, createResourceSnap
 import { captureHeldDescriptorInputs } from "../src/linux-held-exec.ts";
 import { captureStableFile, hashExecutableFile } from "../src/filesystem-evidence.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
+import { TaskTimeline, TimelineInterval } from "../src/task-timing.ts";
 import { runThinkThreadTool } from "../src/thinkthread/tool-runner.ts";
 import { captureResourceVersion, invalidateResourceInputs, closeResourceVersionManagers, fingerprintIO, ResourceVersionManager,
 	type ResourceVersionToken, type ResourceInput, releaseResourceVersion, resourceDependencies } from "../src/resource-version.ts";
@@ -416,9 +417,12 @@ describe("speculative action resource versions", () => {
 	test.each([false, true])("owns prepared inputs with their original evidence and sealed byte budget (exhausted=%s)", async (exhausted) => {
 		const root = await workspace({ "value.txt": "A", unused: "B", "inside/other": "C" }), file = path.join(root, "value.txt");
 		const manager = new ResourceVersionManager(root, { watch: false }), token = await manager.capture(undefined, 65536), view = token.view!;
+		let now = 100;
+		const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
 		const binding = {}, dispose = vi.fn(), build = vi.fn(async (inputs: import("../src/tool-settlement.ts").ToolFilesystemOperations) => {
 			const value = (await inputs.readFile(file)).toString();
 			expect(await inputs.exists!(path.join(root, "missing"))).toBe(false);
+			now += 20;
 			return { value, bytes: exhausted ? 65536 : 1, dispose };
 		});
 		try {
@@ -427,7 +431,12 @@ describe("speculative action resource versions", () => {
 			view.seal(); const bytes = view.bytes;
 			let dependencies: ReadonlySet<string> | undefined;
 			const query = () => view.evaluate(v => v.prepare(binding, "selection", build, async value => value), observed => { dependencies = observed; });
-			expect(await query()).toBe("A"); expect(build).toHaveBeenCalledTimes(exhausted ? 2 : 1);
+			now += 100;
+			const startedAt = now, evaluated = await TimelineInterval.collect(query), timeline = new TaskTimeline(startedAt);
+			expect(evaluated.output).toBe("A"); expect(build).toHaveBeenCalledTimes(exhausted ? 2 : 1);
+			now += 5; timeline.startToolWait(startedAt)(now);
+			timeline.recordTool(new TimelineInterval(startedAt, now, evaluated.dependencies));
+			expect(timeline.measure(now)).toMatchObject({ hiddenLatencyMs: exhausted ? 0 : 20, toolWaitMs: exhausted ? 25 : 5 });
 			expect(dispose).toHaveBeenCalledTimes(exhausted ? 2 : 0); expect(view.bytes).toBe(bytes);
 			expect(dependencies?.size).toBeGreaterThan(0);
 			const scoped = { ...token, observations: new Map([...token.observations].filter(([key]) => dependencies!.has(key))) };
@@ -443,7 +452,7 @@ describe("speculative action resource versions", () => {
 			await view.evaluate(v => v.prepare({}, "selection", build, async value => value)); // A different binding must rebuild and release.
 			expect(build).toHaveBeenCalledTimes(exhausted ? 5 : 3);
 			expect(dispose).toHaveBeenCalledTimes(exhausted ? 4 : 1); expect(view.bytes).toBe(bytes);
-		} finally { await token.release(); manager.close(); }
+		} finally { await token.release(); manager.close(); clock.mockRestore(); }
 		expect(dispose).toHaveBeenCalledTimes(exhausted ? 4 : 2);
 	});
 

@@ -176,7 +176,7 @@ export function formatSpeculativeActionStatus(input: {
 		`Prediction tools: ${toolsSummary(settings.tools)}`,
 		`Execution routing: unified ${settings.executionRouting.primary ? "On" : "Off"}; native fallback ${settings.executionRouting.nativeFallback ? "On" : "Off"}; Actor always available`,
 		`Search execution when enabled: ${searchExecutionLabel(settings.searchExecution)}`,
-		`Tool calls reused: ${formatRatio(metrics.speculativeHits, metrics.actorActions)}; ${metrics.exactReuseHits} exact, ${metrics.partialResultReuseHits} partial, ${metrics.inputReuseHits} inputs; ${formatDuration(metrics.executionAheadMs)} ready early, ${formatDuration(metrics.hitLatencyMs)} wait after match`,
+		`Tool calls reused: ${formatRatio(metrics.speculativeHits, metrics.actorActions)}; ${metrics.exactReuseHits} exact, ${metrics.partialResultReuseHits} partial, ${metrics.inputReuseHits} inputs; ${formatDuration(metrics.hitLatencyMs)} wait after match`,
 		...(hasProcessReuse(metrics.actorProcessReuse)
 			? [`Bash Actor reuse: ${formatActorProcessReuse(metrics.actorProcessReuse)}`]
 			: []),
@@ -193,7 +193,7 @@ export function formatSpeculativeActionStatus(input: {
 		metrics.tasks > 0
 			? `Tool timing (${metrics.tasks} completed tasks): ${formatTaskTiming(metrics)}.`
 			: "Tool timing: n/a (no completed task).",
-		`Prediction Drafter tokens (input + output): ${metrics.totalDraftTokens}${metrics.hiddenLatencyMs > 0 ? `; ${Math.round(metrics.totalDraftTokens * 1000 / metrics.hiddenLatencyMs)} per second hidden` : ""}`,
+		`Prediction Drafter tokens (input + output): ${metrics.totalDraftTokens}${metrics.hiddenLatencyMs > 0 ? `; ${Math.round(metrics.totalDraftTokens * 1000 / metrics.hiddenLatencyMs)} per second of tool time saved` : ""}`,
 		`Live speculative results: ${cache.resultEntries}/${cache.cacheCapacity}, ${formatBytes(cache.resultBytes)}/${formatBytes(cache.cacheByteCapacity ?? 0)}; cold: ${cache.cacheCold}; hot: ${cache.cacheHot}; jobs: ${cache.inFlightJobs}; branches: ${cache.branchEntries} (${formatBytes(cache.branchBytes)})`,
 	].join("\n");
 }
@@ -1176,9 +1176,7 @@ export function formatSpeculativeActionEvent(event: SpeculativeActionEvent<strin
 				`candidate ${compactEventText(event.candidate.id)}`,
 				event.candidate.tool,
 				event.candidate.source,
-				route
-					? `${route.backend}/${executionRouteKind(route.isolation)}/${route.reuse}`
-					: `${event.candidate.world?.backend ?? "unknown backend"}/${executionRouteKind(event.candidate.execution)}`,
+				`${route.backend}/${executionRouteKind(route.isolation)}/${route.reuse}`,
 				event.state.status,
 			);
 			if (event.state.status === "running") {
@@ -1204,9 +1202,7 @@ export function formatSpeculativeActionEvent(event: SpeculativeActionEvent<strin
 				const match = event.settlement.provider.match;
 				parts.push(
 					match.kind === "projected" ? `partial-result reuse (${match.projector})` : match.kind === "inputs" ? "sealed-input reuse" : "exact-action reuse",
-					`${formatDuration(event.settlement.provider.timing.executionAheadMs)} ahead`,
 					`${formatDuration(event.settlement.provider.timing.hitLatencyMs)} hit latency`,
-					`${formatDuration(event.settlement.provider.timing.attemptLeadMs)} attempt lead`,
 				);
 			} else {
 				parts.push(
@@ -1405,7 +1401,7 @@ function formatSpeculativeFooter(
 	const storedBytes = storageWorlds.reduce((total, world) => total + (world.storage?.bytes ?? 0), 0);
 	return [
 		"spec: on",
-		metrics.tasks > 0 ? `${formatSpeedup(metrics)}; ${formatDuration(metrics.hiddenLatencyMs)} hidden` : "Tool SpeedUp n/a",
+		metrics.tasks > 0 ? `${formatSpeedup(metrics)}; ${formatDuration(metrics.hiddenLatencyMs)} tool time saved` : "Tool SpeedUp n/a",
 		`tools reused ${formatRatio(metrics.speculativeHits, metrics.actorActions)}`,
 		...(hasProcessReuse(reuse) ? [`Bash Actor ${formatActorProcessFooter(reuse)}`] : []),
 		`live results ${metrics.cache.resultEntries}/${metrics.cache.cacheCapacity} (${formatBytes(metrics.cache.resultBytes)})`,
@@ -1467,7 +1463,7 @@ function countSummary(counts: Readonly<Record<string, number>>): string {
 type TimingSummary = Pick<SpeculativeTraceSummary, "toolWaitMs" | "hiddenLatencyMs">;
 
 function formatTaskTiming(timing: TimingSummary): string {
-	return `${formatSpeedup(timing)}; ${formatDuration(timing.hiddenLatencyMs)} hidden; ${formatDuration(timing.toolWaitMs)} tool wait`;
+	return `${formatSpeedup(timing)}; ${formatDuration(timing.hiddenLatencyMs)} tool time saved; ${formatDuration(timing.toolWaitMs)} tool wait`;
 }
 
 function formatSpeedup(timing: TimingSummary): string {

@@ -9,6 +9,7 @@ import { type StableFilesystemCapture, cachedCapture, captureFilesystemEntry, ca
 import { containsFilesystemPath, filesystemPathKey, relativeFilesystemPath } from "./path-utils.ts";
 import type { ToolFilesystemOperations, ToolFilesystemStat } from "./tool-settlement.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
+import { TimelineInterval } from "./task-timing.ts";
 
 export type ResourceDependency = {
 	readonly path: string;
@@ -63,7 +64,8 @@ type CapturedResource = (
 	| { readonly type: "alias"; readonly target?: string; readonly link: string }
 	| { readonly type: "special" }
 	| { readonly type: "missing" }) & { readonly realPath?: string; readonly dependency?: string; readonly metadataDependency?: string;
-		readonly object?: StableFilesystemCapture["object"] | null; readonly objectBytes?: number };
+		readonly object?: StableFilesystemCapture["object"] | null; readonly objectBytes?: number;
+		readonly computation?: TimelineInterval; readonly metadataComputation?: TimelineInterval };
 
 type ResourceInputSource = {
 	readonly view: ResourceReadView;
@@ -71,6 +73,7 @@ type ResourceInputSource = {
 };
 type ResourceInputLookup = (target: string) => Iterable<ResourceInputSource>;
 type PreparedResource = {
+	computation?: TimelineInterval;
 	value?: unknown; readonly dispose: () => void | Promise<void>;
 	readonly resource?: string;
 	dependencies?: ReadonlySet<string>; readonly boundary?: { readonly root: string; readonly physicalRoot: string };
@@ -134,7 +137,7 @@ export class ResourceReadView {
 			if (!dependency || !observations.has(dependency)) break;
 			retained ??= new ResourceReadView(maxBytes, undefined,
 				this.boundary?.dependency && observations.has(this.boundary.dependency) ? this.boundary : undefined);
-			retained.capture(target, entry.type === "alias" ? entry : { type: entry.type, realPath: entry.realPath, dependency,
+			retained.capture(target, entry.type === "alias" ? entry : { type: entry.type, realPath: entry.realPath, dependency, computation: entry.metadataComputation, metadataComputation: entry.metadataComputation,
 				...(entry.type === "file" ? { size: entry.size ?? entry.content?.length } : {}) });
 			if (!retained.retained) { void retained.dispose(); return undefined; }
 			target = entry.type === "alias" ? entry.target : undefined;
@@ -154,8 +157,8 @@ export class ResourceReadView {
 			if (entry.object !== undefined) this.objectCount--;
 			const dependency = entry.metadataDependency;
 			if (dependency && !dependencies.has(dependency) && entry.type !== "alias") {
-				const bytes = Buffer.byteLength(target) + Buffer.byteLength(entry.realPath ?? "") + Buffer.byteLength(dependency) * 2 + 64;
-				this.entries.set(target, { type: entry.type, realPath: entry.realPath, dependency, metadataDependency: dependency, bytes });
+				const bytes = Buffer.byteLength(target) + Buffer.byteLength(entry.realPath ?? "") + Buffer.byteLength(dependency) * 2 + 64 + (entry.metadataComputation ? 32 : 0);
+				this.entries.set(target, { type: entry.type, realPath: entry.realPath, dependency, metadataDependency: dependency, computation: entry.metadataComputation, metadataComputation: entry.metadataComputation, bytes });
 				this.capturedBytes -= entry.bytes - bytes;
 			} else { this.entries.delete(target); this.capturedBytes -= entry.bytes; removed.push(target); }
 		}
@@ -189,13 +192,14 @@ export class ResourceReadView {
 		const sameMetadata = previous?.type === entry.type && previous?.realPath === entry.realPath && entry.type !== "alias";
 		const metadataDependency = /^(entry|type|stat):/.test(entry.dependency ?? "") ? entry.dependency
 			: sameMetadata ? previous?.metadataDependency : undefined;
+		const metadataComputation = entry.metadataComputation ?? (metadataDependency === entry.dependency ? entry.computation : sameMetadata ? previous?.metadataComputation : undefined);
 		// Overlapping scopes enrich one input view; a metadata observation cannot erase its payload.
 		const redundant = (entry.type === "file" && previous?.type === "file" && entry.content === undefined && (previous.content !== undefined || entry.size === undefined)) ||
 			(entry.type === "directory" && previous?.type === "directory" && entry.entries === undefined);
-		let retained = redundant && !sameMetadata ? previous! : { ...(redundant ? previous! : entry), metadataDependency };
+		let retained = redundant && !sameMetadata ? previous! : { ...(redundant ? previous! : entry), metadataDependency, metadataComputation };
 		const objectBytes = retained.object !== undefined ? 256 + (retained.objectBytes ?? 0) : 0;
 		let bytes = Buffer.byteLength(key) + Buffer.byteLength(retained.realPath ?? "") + Buffer.byteLength(retained.dependency ?? "") +
-			Buffer.byteLength(retained.metadataDependency ?? "") + 64 + objectBytes + (retained.type === "file" ? retained.content?.length ?? 0 : retained.type === "directory"
+			Buffer.byteLength(retained.metadataDependency ?? "") + 64 + objectBytes + 32 * (Number(!!retained.computation) + Number(!!retained.metadataComputation && retained.metadataComputation !== retained.computation)) + (retained.type === "file" ? retained.content?.length ?? 0 : retained.type === "directory"
 				? retained.entries?.reduce((sum, name) => sum + Buffer.byteLength(name) + 16, 0) ?? 0
 				: retained.type === "alias" ? Buffer.byteLength(retained.target ?? "") + Buffer.byteLength(retained.link) : 0);
 		if (retained.object !== undefined && (this.bytes + bytes - (previous?.bytes ?? 0) - reservedBytes > this.maxBytes ||
@@ -228,8 +232,15 @@ export class ResourceReadView {
 	/** A process borrows the same captured kernel object without inheriting the tool's OFD offset. */
 	async borrowObject<T>(target: string, consume: (capture: StableFilesystemCapture, handle: FileHandle) => Promise<T>): Promise<T | undefined> {
 		this.assertComplete();
-		const entry = this.sealed ? await this.get(target, this.entry(target).entry?.type === "directory" ? "names" : "content") : this.entries.get(filesystemPathKey(target));
-		return entry?.object?.borrow(consume);
+		const evaluation = await TimelineInterval.collect(async () => {
+			const entry = this.sealed ? await this.get(target, this.entry(target).entry?.type === "directory" ? "names" : "content") : this.entries.get(filesystemPathKey(target));
+			const result = await entry?.object?.borrow(consume);
+			if (result !== undefined) TimelineInterval.use(entry?.computation);
+			return result;
+		});
+		if (evaluation.output !== undefined) for (const { computation, owned } of evaluation.dependencies)
+			if (owned) TimelineInterval.own(computation); else TimelineInterval.use(computation);
+		return evaluation.output;
 	}
 	/** Fill a pre-budgeted pin slot only with independently read, byte-identical input.
 	 * Supplied write/edit bytes alone never create kernel-object evidence. */
@@ -244,7 +255,7 @@ export class ResourceReadView {
 		if (entry?.object !== null || (entry.type === "file" ? !capture.stat.isFile() || !entry.content?.equals(capture.content)
 			: entry.type !== "directory" || !capture.stat.isDirectory() || capture.bytesRead > (entry.objectBytes ?? 0) ||
 				!entry.entries || !capture.entries || !sameValues(entry.entries, capture.entries))) return false;
-		this.entries.set(key, { ...entry, ...(entry.type === "file" ? { content: capture.content } : { entries: capture.entries }), object: capture.object });
+		this.entries.set(key, { ...entry, ...(entry.type === "file" ? { content: capture.content } : { entries: capture.entries }), object: capture.object, computation: capture.computation });
 		return true;
 	}
 	access = async (target: string): Promise<void> => {
@@ -285,6 +296,7 @@ export class ResourceReadView {
 				const run = async () => {
 					this.assertComplete(); cached.destination.assertComplete();
 					const result = await consume(cached.value as Parameters<typeof consume>[0]);
+					TimelineInterval.use(cached.computation);
 					this.assertComplete(); if (!transferred && !(this.acceptProofs && cached.origin === owner && cached.dependencies)) cached.destination.assertComplete(); return result;
 				};
 				return cached.destination === owner ? run() : cached.destination.prepared!.lifetime.admit(run);
@@ -308,7 +320,7 @@ export class ResourceReadView {
 				this.assertComplete(); return result;
 			}
 			let resource: Awaited<ReturnType<typeof build>> | undefined;
-			let bytes = 0;
+			let bytes = 0, computationBytes = 32;
 			let decline!: () => void;
 			let composed: (() => void) | undefined;
 			const name = target && filesystemPathKey(target);
@@ -327,7 +339,10 @@ export class ResourceReadView {
 				await this.borrow(async view => {
 					const foreign = view.onForeignInputs; view.onForeignInputs = transferable => { if (transferable) composed?.(); else decline(); foreign?.(transferable); };
 					view.collectProofs = this.acceptProofs ? new Map() : undefined;
-					resource = await build(view); pending.shareable = !view.foreignInputs;
+					const startedAt = performance.now(), evaluation = await TimelineInterval.collect(() => build(view));
+					resource = evaluation.output; pending.computation = TimelineInterval.own(new TimelineInterval(startedAt, performance.now(), evaluation.dependencies));
+					computationBytes += evaluation.dependencies.length * 96;
+					pending.shareable = !view.foreignInputs;
 					if (pending.shareable && view.collectProofs?.size) {
 						pending.proofs = [];
 						for (const proof of view.collectProofs.values()) pending.proofs.push(proof.manager.retain({ ...proof, view: undefined }));
@@ -335,7 +350,7 @@ export class ResourceReadView {
 				}, observed => { pending.dependencies = observed; });
 				if (!resource) throw new Error("resource_preparation_missing");
 				pending.value = resource.value;
-				bytes = resource.bytes + (key.length + (name?.length ?? 0)) * 2 + 192 + [...pending.dependencies ?? []].reduce((sum, name) => sum + name.length * 2 + 64, 0);
+				bytes = resource.bytes + computationBytes + (key.length + (name?.length ?? 0)) * 2 + 192 + [...pending.dependencies ?? []].reduce((sum, name) => sum + name.length * 2 + 64, 0);
 				for (const proof of pending.proofs ?? []) for (const [key, entry] of proof.observations)
 					bytes += (key.length + entry.path.length + entry.fingerprint.length + (entry.stamp?.length ?? 0)) * 2 + 128;
 				if (!Number.isSafeInteger(resource.bytes) || resource.bytes < 0) throw new Error("resource_snapshot_budget_invalid");
@@ -421,7 +436,10 @@ export class ResourceReadView {
 			finally { if (this.pending === pending) this.pending = undefined; }
 		}
 		const { entry, resolved } = this.entry(target, scope !== "entry", scope);
-		if (resourceCovers(entry, scope)) return entry!;
+		if (resourceCovers(entry, scope)) {
+			TimelineInterval.use(["stat", "type", "entry"].includes(scope) ? entry?.metadataComputation : entry?.computation);
+			return entry!;
+		}
 		// The local alias proof owns this translation; the source owns the resolved resource.
 		for (const query of resolved === filesystemPathKey(target) ? [target] : [resolved, target]) for (const source of this.lookup?.(query) ?? []) {
 			if (source.view.entries === this.entries || !source.view.retained) continue;
@@ -471,6 +489,7 @@ export class ResourceReadView {
 	private observe(entry: CapturedResource | undefined, scope?: ResourceDependency["scope"]): CapturedResource | undefined {
 		if (this.owner && this.boundary && entry?.realPath && (entry.type !== "alias" || scope === "entry") &&
 			!containsFilesystemPath(this.boundary.physicalRoot, entry.realPath)) this.unproven(entry.realPath);
+		if (entry?.type === "alias") TimelineInterval.use(entry.computation);
 		if (entry && this.dependencies) {
 			const dependency = entry.type !== "alias" && (scope === "type" || scope === "entry" || (scope === "stat" && entry.type !== "file"))
 				? entry.metadataDependency ?? entry.dependency : entry.dependency;
@@ -599,7 +618,7 @@ export class ResourceVersionManager {
 						!(content.stat.isDirectory() ? content.entries : content.stat.isFile())) return;
 					const dependency = { path: target, scope: content.entries ? "names" as const : "content" as const }, key = dependencyKey(dependency);
 					view!.capture(target, { ...(content.entries ? { type: "directory" as const, entries: content.entries, objectBytes: content.bytesRead }
-						: { type: "file" as const, content: content.content }), object: content.object, realPath: content.realPath, dependency: key });
+						: { type: "file" as const, content: content.content }), object: content.object, computation: content.computation, realPath: content.realPath, dependency: key });
 					const { value, stamp } = content.entries ? fingerprintDirectory(content.stat, content.realPath, content.entries) : fingerprintFile(content);
 					observations.set(key, { ...dependency, stamp, fingerprint: digest({ path: filesystemPathKey(target), scope: dependency.scope, value }) });
 				});
@@ -907,6 +926,7 @@ async function fingerprintDependencies(
 		/** A walked directory's real path: a child that is no link resolves to its entry there, with no window to re-check. */
 		parentReal?: string,
 	): Promise<FingerprintResult> {
+		const startedAt = performance.now();
 		let captured: Awaited<ReturnType<typeof captureFilesystemEntry>>;
 		try {
 			captured = await captureEntry(target, scope);
@@ -914,7 +934,7 @@ async function fingerprintDependencies(
 			if (!missingResource(error)) throw error;
 			if (providedInputs && providedInputs.get(filesystemPathKey(target)) !== null) throw error;
 			const nearest = await nearestExisting(target);
-			view?.capture(target, { type: "missing", realPath: nearest.realPath, dependency });
+			view?.capture(target, { type: "missing", realPath: nearest.realPath, dependency, computation: TimelineInterval.own(new TimelineInterval(startedAt, performance.now())) });
 			return {
 				value: { exists: false, error: errorCode(error), resolved: nearest.realPath },
 				stamp: digest([filesystemPathKey(target), nearest.fingerprint]),
@@ -950,7 +970,7 @@ async function fingerprintDependencies(
 				}
 			});
 			const followed = source === undefined ? undefined : await fingerprintPath(source, scope, dependency, new Set(ancestors).add(identity), descend);
-			view?.capture(target, { type: "alias", target: source && filesystemPathKey(source), link: link!, realPath: realTarget, dependency });
+			view?.capture(target, { type: "alias", target: source && filesystemPathKey(source), link: link!, realPath: realTarget, dependency, computation: captured.computation });
 			if (scope === "tree_content") treeObjects?.set(target, { mode: Number(info.mode), link: link! });
 			return {
 				value: { type: "symlink", link, mode: Number(info.mode), resolved: identity, target: followed?.value },
@@ -960,7 +980,7 @@ async function fingerprintDependencies(
 			};
 		}
 		if (["stat", "type", "entry"].includes(scope) || (scope === "entries" && !descend) || (["names", "entries", "tree_entries"].includes(scope) && !info.isDirectory())) {
-			view?.capture(target, { type: info.isDirectory() ? "directory" : info.isFile() ? "file" : "special", realPath: realTarget, dependency,
+			view?.capture(target, { type: info.isDirectory() ? "directory" : info.isFile() ? "file" : "special", realPath: realTarget, dependency, computation: captured.computation,
 				...(scope === "stat" && info.isFile() ? { size: Number(info.size) } : {}) });
 			return stableEntry(target, info, identity, scope, parentReal !== undefined);
 		}
@@ -986,7 +1006,7 @@ async function fingerprintDependencies(
 						stat: info, realPath: realTarget, retainObject: retain && view!.canRetainObject, gitBlob }));
 				if (!bytes && !content.shared) rememberCapture(content, takenAtMs);
 				assertInside(realRoot, content.realPath);
-				view?.capture(target, { type: "file", content: content.content,
+				view?.capture(target, { type: "file", content: content.content, computation: content.computation, metadataComputation: captured.computation,
 					object: content.object ?? (bytes && retain && view!.canRetainObject ? null : undefined),
 					realPath: content.realPath, dependency }, retain ? provided?.byteLength ?? Number(info.size) : 0);
 				return {
@@ -1004,7 +1024,8 @@ async function fingerprintDependencies(
 			view?.capture(target, { type: "directory", entries: supplied.names, realPath: realTarget, dependency, ...directoryObjectSlot(supplied.names, view) });
 			return { ...fingerprintDirectory(info, realTarget, supplied.names), bytesRead: 0, filesRead: 0 };
 		}
-		const entries = await fingerprintIO(() => fs.readdir(target, { withFileTypes: true }));
+		const enumerationStarted = performance.now(), entries = await fingerprintIO(() => fs.readdir(target, { withFileTypes: true }));
+		const computation = TimelineInterval.own(new TimelineInterval(enumerationStarted, performance.now()));
 		const selected = excludes.size && (scope === "tree_content" || scope === "tree_entries") ? entries.filter((entry) => !excludes.has(entry.name)) : entries;
 		const descendants = new Set(ancestors).add(identity);
 		const children = scope === "names" ? [] : await mapFilesystem([...selected].sort((left, right) => left.name.localeCompare(right.name)), async (entry) => {
@@ -1023,7 +1044,7 @@ async function fingerprintDependencies(
 			throw new Error(`resource_directory_changed:${target}`);
 		}
 		const names = selected.map(entry => entry.name);
-		view?.capture(target, { type: "directory", entries: names, realPath: realTarget, dependency, ...directoryObjectSlot(names, view) });
+		view?.capture(target, { type: "directory", entries: names, realPath: realTarget, dependency, computation, metadataComputation: captured.computation, ...directoryObjectSlot(names, view) });
 		return {
 			...fingerprintDirectory(after, realTarget, names, children),
 			bytesRead: children.reduce((total, child) => total + child.bytesRead, 0),

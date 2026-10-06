@@ -541,7 +541,7 @@ describe("self-speculation control plane", () => {
 					actorAction: { id: `actor-${decision}`, sequence: decision, turnID: `turn-${decision}` }, tool: "read", rejections: [],
 					matchedPredictions: [predictionFeedback("self-speculation", true, decision).settlement.prediction],
 					provider: { kind: "speculative", candidateID: "candidate", match: { kind: "exact", distance: 0 },
-						timing: { executionAheadMs: 10000, attemptLeadMs: 20000, hitLatencyMs: 100, expectedActorMs },
+						timing: { hitLatencyMs: 100, expectedActorMs },
 						toolExecution: { startedAt: 0, completedAt: 10000 } },
 				});
 				coordinator.endTurn();
