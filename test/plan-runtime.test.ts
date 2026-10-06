@@ -17,7 +17,7 @@ describe("PlanRuntime", () => {
 		expect(plan.get("plan", "after")).toMatchObject({ expectedDecisionSeq: 1, readiness: "waiting" });
 		const execution = new CandidateExecution<string>("exclusive");
 		plan.attachExecution("plan", "prepare", "process", execution);
-		execution.start(0); execution.fail(cause("execution", "binding_expired"), 2, 2);
+		execution.start(0); execution.fail(cause("execution", "binding_expired"), 2);
 		expect(plan.get("plan", "after")).toMatchObject({ expectedDecisionSeq: 1, readiness: "ready" });
 		const original = plan.get("plan", "prepare")!.identity;
 		expect(plan.apply({ ...proposal([{ ...prepare, operation: Object.freeze({ ...operation }) }, after]), revision: 2 }, 0)).toMatchObject({ accepted: true });
@@ -68,7 +68,7 @@ describe("PlanRuntime", () => {
 		expect(plan.promote("plan", "future").status).toBe("scheduled");
 		const execution = new CandidateExecution<string>("shared");
 		plan.attachExecution("plan", "future", "candidate", execution);
-		execution.cancel(cause("admission", "scheduler_preempted"), 1, 0);
+		execution.cancel(cause("admission", "scheduler_preempted"), 0);
 
 		expect(plan.get("plan", "future")).toMatchObject({
 			earliestDecisionSeq: 5,
@@ -82,7 +82,7 @@ describe("PlanRuntime", () => {
 		expect(plan.get("plan", "future")!.execution).toEqual({ status: "deferred" });
 		const retry = new CandidateExecution<string>("shared");
 		plan.attachExecution("plan", "future", "retry", retry);
-		retry.cancel(cause("freshness", "resource_changed"), 2, 0);
+		retry.cancel(cause("freshness", "resource_changed"), 0);
 		expect(plan.due(6)).toEqual([]);
 		expect(plan.due(7).map((node) => node.action.id)).toEqual(["future"]);
 		const actor = { id: "actor", sequence: 7, turnID: "turn" } as const;
@@ -220,7 +220,7 @@ describe("PlanRuntime", () => {
 			execution.start(0);
 			expect(plan.launchable()).toEqual([]);
 			if (status === "succeeded") execution.succeed("output", new TimelineInterval(0, 1), 1);
-			else execution[status === "failed" ? "fail" : "cancel"](cause("execution", "tool_failed"), 1, 1);
+			else execution[status === "failed" ? "fail" : "cancel"](cause("execution", "tool_failed"), 1);
 			if (drained) {
 				await execution.completion;
 				Object.defineProperty(execution, "execution", { get() { throw new Error("retired execution was read"); } });

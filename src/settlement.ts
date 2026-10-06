@@ -99,7 +99,6 @@ export interface SourceRequestIdentity {
 
 export interface SettledSourceRequest {
 	readonly request: SourceRequestIdentity;
-	readonly startedAt: number;
 	readonly durationMs: number;
 	readonly settlement: SourceRequestSettlement;
 	/** Provider tokens reported by the time the request settled. */
