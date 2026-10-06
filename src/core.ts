@@ -52,7 +52,6 @@ export {
 	sameSpeculativeExecutionRoute,
 	type WorldBranch,
 	type WorldCheckpoint,
-	type WorldCommitMetrics,
 	type WorldCompatibilityEvidence,
 	type WorldExecutionMetrics,
 	type WorldReuseMetrics,

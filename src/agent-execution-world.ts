@@ -52,13 +52,11 @@ export function createResourceSnapshotExecutionWorld(
 	const capture = async (context: SpeculativeToolExecutionContext, retainBytes?: number, onDemand = false,
 		inputsOnly = false): Promise<WorldResultCapture<ToolSettlement> & { readonly view?: ResourceReadView }> => {
 		if (!onDemand && !canObserve) throw new Error("Windows path binding stamps cannot certify host execution windows");
-		const setupStarted = performance.now();
 		const root = onDemand ? (context.action.executionContext as ToolInvocation | undefined)?.filesystemRoot ?? context.cwd : context.cwd;
 		let version: ResourceVersionToken | undefined = await captureResourceVersion(onDemand ? undefined : context.action, root, actionSemantics, retainBytes);
 		const inputSource = inputsOnly ? Object.freeze({}) : undefined;
 		if (inputSource) resourceVersions.set(inputSource, { versions: [version], executionFingerprint: context.action.executionFingerprint });
 		let disposal: void | Promise<void>;
-		const setupMs = Math.max(0, performance.now() - setupStarted);
 		return {
 			view: version.view,
 			...(inputsOnly ? { inputsOnly: true as const, inputSource } : {}),
@@ -75,7 +73,7 @@ export function createResourceSnapshotExecutionWorld(
 						const validation = await owned.manager.seal(owned);
 						if (validation.expired) throw new Error(validation.reason ?? "resource observation window changed");
 					}
-					return resourceSnapshotBranch(output, [owned], context.action, setupMs, actionSemantics, inputsOnly);
+					return resourceSnapshotBranch(output, [owned], context.action, actionSemantics, inputsOnly);
 				} catch (error) {
 					await releaseResourceVersion(owned);
 					throw error;
@@ -137,7 +135,7 @@ export function createResourceSnapshotExecutionWorld(
 							if (proof !== version) retained.push(proof);
 							owned.push(proof); bytes += proof.view?.bytes ?? 0;
 						}
-						const branch = resourceSnapshotBranch(query.output, owned, context.action, 0, actionSemantics);
+						const branch = resourceSnapshotBranch(query.output, owned, context.action, actionSemantics);
 						captured = undefined; retained.length = 0;
 						return branch;
 					} catch {
@@ -242,12 +240,12 @@ export async function createCommittedResourceInputs(
 	const version = await captureResourceVersion(undefined, root, PI_ACTION_SEMANTICS, maxBytes, inputs);
 	try {
 		if (!version.view) throw new Error("resource_snapshot_budget_exceeded");
-		return Object.assign(resourceSnapshotBranch(output, [version], action, 0, PI_ACTION_SEMANTICS, true), { inputsOnly: true as const });
+		return Object.assign(resourceSnapshotBranch(output, [version], action, PI_ACTION_SEMANTICS, true), { inputsOnly: true as const });
 	} catch (error) { await version.release(); throw error; }
 }
 
 function resourceSnapshotBranch(
-	output: ToolSettlement, versions: readonly ResourceVersionToken[], action: ActionKey, setupMs: number, semantics: ActionSemanticsRegistry,
+	output: ToolSettlement, versions: readonly ResourceVersionToken[], action: ActionKey, semantics: ActionSemanticsRegistry,
 	inputsOnly = false,
 ): WorldBranch<ToolSettlement> {
 	const version = versions[0]!;
@@ -286,7 +284,7 @@ function resourceSnapshotBranch(
 		inputResources,
 		reconstructionScope: "current_action",
 		get capturedBytes() { return versions.reduce((bytes, token) => bytes + (token.view?.bytes ?? 0), proofBytes); },
-		executionMetrics: Object.freeze({ setupMs }),
+		executionMetrics: Object.freeze({}),
 		compatibility: Object.freeze({ status: "compatible", backend: "resource_version", executionFingerprint }),
 		validate: () => validate(owned),
 		...(version.view ? { reconstruct: async (request: Parameters<NonNullable<WorldBranch<ToolSettlement>["reconstruct"]>>[0]) => {

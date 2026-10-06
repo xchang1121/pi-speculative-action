@@ -224,8 +224,6 @@ function sealEffectTransaction<Output>(attempt: MutableEffectTransactionAttempt,
 		get latestValidation() { return validation; },
 		get output() { return shared ? cloneSharedData(sealed.output) : sealed.output; },
 		get capturedBytes() { return retainedBytes ? retainedBytes() : sealed.capturedBytes; },
-		// Commit telemetry is produced later, unlike sealed execution/compatibility evidence.
-		get commitMetrics() { return immutableSnapshot(branch.commitMetrics); },
 		takeCommittedInputs: sealed.takeCommittedInputs ? async (maxBytes) => {
 			if (cleanupPromise || attempt.stateValue !== "committed" || inputTransfer) return undefined;
 			return inputTransfer = Promise.resolve().then(() => sealed.takeCommittedInputs!(maxBytes)).then(async inputs => {

@@ -183,7 +183,6 @@ describe("ThinkThread execution world", () => {
 			policyId: "safe_content_v1",
 			dependencies: [{ path: "generated.txt", scope: "content" }],
 		});
-		expect(branch.commitMetrics?.resourcesCommitted).toBe(1);
 		await branch.dispose();
 		await world.finishTurn("turn");
 		await world.dispose?.();

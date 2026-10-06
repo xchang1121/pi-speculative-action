@@ -403,7 +403,6 @@ describe("workspace-branch ExecutionWorld", () => {
 			const first = branch.commit();
 			expect(branch.commit()).toBe(first);
 			await first;
-			expect(branch.commitMetrics).toMatchObject({ resourcesCommitted: initial === undefined ? 2 : 1 });
 			expect(await readFile(target)).toEqual(expectedBytes);
 			const inputs = await branch.takeCommittedInputs!(8192);
 			expect(inputs?.inputsOnly).toBe(true); expect(await branch.takeCommittedInputs!(8192)).toBeUndefined();
@@ -676,11 +675,10 @@ describe("workspace-branch ExecutionWorld", () => {
 				if (changed && (!permissionChange || permissionDenied)) {
 					if (permissionDenied) await expect(commit).rejects.toThrow();
 					else await expect(commit).rejects.toThrow(`resource changed before commit: ${path.basename(changed)}`);
-					expect(branch.commitMetrics).toBeUndefined();
+					expect(await branch.takeCommittedInputs!(8192)).toBeUndefined();
 					expect(await readFile(target, "utf8")).toBe(changed === target ? "actor\n" : "before\n");
 				} else {
 					await expect(commit).resolves.toEqual(settlement("base\n"));
-					expect(branch.commitMetrics).toMatchObject({ resourcesCommitted: 1, resourcesValidated: 3 });
 					const after = await stat(input, { bigint: true });
 					expect([after.ino, after.mtimeNs]).toEqual([before.ino, before.mtimeNs]);
 					if (!changed) expect(after.ctimeNs).toBe(before.ctimeNs);
