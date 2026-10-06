@@ -78,8 +78,6 @@ export interface CandidateJoinDecision {
 	readonly expectedRemainingMs: number;
 	readonly expectedAdoptionMs: number;
 	readonly expectedActorMs?: number;
-	/** Median native execution without capture or settlement: the no-speculation reference for savings. */
-	readonly expectedNativeMs?: number;
 	readonly expectedNetBenefitMs?: number;
 }
 
@@ -310,7 +308,6 @@ export class SpeculationScheduler<Job extends object> {
 		const speculative = this.timingEstimate(this.speculativeServiceTimes, request.identity, 0.9, "upper");
 		const actor = this.timingEstimate(this.actorServiceTimes, request.actorIdentity ?? request.identity, 0.25);
 		const adoption = this.timingEstimate(this.adoptionTimes, request.adoptionIdentity ?? request.identity, 0.75, "upper");
-		const native = this.timingEstimate(this.nativeServiceTimes, request.actorIdentity ?? request.identity, 0.5);
 		const elapsedMs = request.state === "running" ? finite(request.elapsedMs) : 0, forecastMs = finite(request.expectedSpeculativeDurationMs);
 		// A tool's timing class mixes short and long commands (ls and npm test): it may raise this action's own forecast or
 		// elapsed time, never shorten them, and for the same action without exact Actor evidence native takes about as long.
@@ -332,7 +329,6 @@ export class SpeculationScheduler<Job extends object> {
 			expectedRemainingMs,
 			expectedAdoptionMs,
 			...(expectedActorMs === undefined ? {} : { expectedActorMs }),
-			...(native === undefined ? {} : { expectedNativeMs: native.value }),
 			...(expectedNetBenefitMs === undefined ? {} : { expectedNetBenefitMs }),
 		};
 

@@ -88,7 +88,7 @@ describe("zero-modification Pi extension", () => {
 	it("reports tool speedup and total hidden latency without model time in the denominator", () => {
 		const timing = { toolWaitMs: 400, hiddenLatencyMs: 100 };
 		expect(formatSpeculativeActionEvent({ type: "task", sessionID: "s", turnID: "t", timing } as never)).toContain(
-			"Tool SpeedUp 1.25x; 100ms hidden; 400ms tool wait");
+			"Tool SpeedUp 1.25x; 100ms tool time saved; 400ms tool wait");
 		for (const [wait, hidden, ratio] of [[1000, 0, "1.00x"], [0, 0, "n/a"], [1000, NaN, "n/a"]] as const)
 			expect(formatSpeculativeActionEvent({ type: "task", sessionID: "s", turnID: "t", timing: { toolWaitMs: wait, hiddenLatencyMs: hidden } } as never)).toContain(`Tool SpeedUp ${ratio}`);
 	});

@@ -317,7 +317,7 @@ describe("speculative action host", () => {
 		await controller.source.propose({ startInput: { ...startInput(tool), sessionID: "session" }, data: { tools: new Map([["read", tool]]), schemaHashes: {} },
 			settings: { ...settings(), resourceCacheMaxEntries: 4, predictionTimeoutMs: 1000 }, definitions: [], candidateNames: ["read"], proposalIndex: 0, proposalCount: 1, signal: new AbortController().signal });
 		await controller.actorActionSettled({ sessionID: "session", turnID: "turn-1", candidate: { source: "self-speculation" } as never, settlement: {
-			provider: { kind: "speculative", timing: { executionAheadMs: 0, attemptLeadMs: 0, hitLatencyMs: 20, expectedActorMs: 420 } },
+			provider: { kind: "speculative", timing: { hitLatencyMs: 20, expectedActorMs: 420 } },
 			matchedPredictions: [{ source: "drafter" }, { source: "self-speculation" }] } as never });
 		controller.finishTurn("session", "turn-1");
 		await Promise.resolve();
@@ -678,6 +678,7 @@ describe("speculative action host", () => {
 			expect(findActor).not.toHaveBeenCalled();
 			await host.finishTurn(call.turnID, true);
 			expect(summarizeSpeculativeTrace(events)).toMatchObject({ inputReuseHits: 8, exactReuseHits: 0, predictionsMatched: 0 });
+			expect(summarizeSpeculativeTrace(events).hiddenLatencyMs, "consumed cross-tool inputs and preparations save work without an exact tool hit").toBeGreaterThan(0);
 		} finally { await host.dispose(); await profile.pool.dispose(); }
 	});
 
@@ -1443,6 +1444,8 @@ describe("speculative action host", () => {
 			action: PI_ACTION_SEMANTICS.buildKey(name, concrete, cwd, "schema")!, consumeInput: { sessionID: "session", turnID: request.startInput.turnID, tool: name, args: concrete, tools: [tool] },
 			tool: name, concrete, output: { result: textResult("done"), isError: false }, durationMs: 20, order: 0, ...extra });
 		try {
+			for (const [name, args, expected] of [["bash", build, true], ["read", { path: "a.c" }, false]] as const)
+				expect(controller.source.observesOperations?.(PI_ACTION_SEMANTICS.buildKey(name, args, cwd, "schema")!)).toBe(expected);
 			expect(await observe("bash", build, { operations: [operation("compile", 50, () => !compiled), operation("link", 30, () => false)] })).toBeUndefined();
 			compiled = false;
 			expect(await observe("write", { path: "a.c", content: "int x;" })).toMatchObject({ actions: [{ type: "tool_call", tool: "bash", input: build,
@@ -1751,7 +1754,7 @@ describe("speculative action host", () => {
 			),
 		});
 		const tool: AgentTool<typeof readSchema> = { name: "read", label: "read", description: "read", parameters: readSchema,
-			execute: async (_id, input) => { await new Promise((resolve) => setTimeout(resolve, 80)); return textResult(input.path); } };
+			execute: async (_id, input) => textResult(input.path) };
 		const host = createSpeculativeActionHost("session", {
 			cwd,
 			getSettings: () => ({ ...settings(1), drafterEnabled: false, maxConcurrentActions: 2, selfSpeculation: selfSettings() }),
@@ -1807,12 +1810,7 @@ describe("speculative action host", () => {
 		expect(hit.content).toEqual([{ type: "text", text: "notes.txt" }]);
 		await waitFor(() => events.some((event) => event.type === "actor_action" && event.turnID === "fork-hit"));
 		const adopted = events.find((event) => event.type === "actor_action" && event.turnID === "fork-hit");
-		expect(adopted).toMatchObject({ candidate: { source: "self-speculation" } });
-		expect(
-			adopted?.type === "actor_action" && adopted.settlement.provider.kind === "speculative"
-				? adopted.settlement.provider.timing.executionAheadMs
-				: 0,
-		).toBeGreaterThan(50);
+		expect(adopted).toMatchObject({ candidate: { source: "self-speculation" }, settlement: { provider: { kind: "speculative" } } });
 		expect(events.filter((event) => event.type === "source_request" && event.turnID === "fork-hit")).toHaveLength(1);
 		await finishTurn("fork-hit");
 
@@ -1852,7 +1850,6 @@ describe("speculative action host", () => {
 		expect(events.some((event) => event.type === "candidate" && event.turnID === "fork-disabled")).toBe(false);
 		await finishTurn("fork-disabled");
 		expect(coordinator.snapshot().forkActionAdoptions).toBe(1);
-		expect(coordinator.snapshot().forkExecutionAheadMs).toBeGreaterThan(50);
 		await host.dispose();
 		await coordinator.dispose();
 	}, 5_000);

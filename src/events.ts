@@ -1,4 +1,4 @@
-import type { SpeculativeExecution, SpeculativeExecutionRoute, WorldExecutionMetrics } from "./execution-world.ts";
+import type { SpeculativeExecutionRoute, WorldExecutionMetrics } from "./execution-world.ts";
 import type { ActorActionSettlement, PredictionSettlement, ResolutionCause, SettledSourceRequest } from "./settlement.ts";
 import type { SpeculativeTaskTiming } from "./task-timing.ts";
 
@@ -14,8 +14,6 @@ export interface SpeculativeCacheSnapshot {
 	readonly branchBytes: number;
 	readonly exclusiveCandidates: number;
 	readonly sharedCandidates: number;
-	readonly cacheTools: readonly string[];
-	readonly cacheExecutions: readonly SpeculativeExecution[];
 }
 
 export interface CandidateEventDescriptor {
@@ -23,24 +21,11 @@ export interface CandidateEventDescriptor {
 	readonly id: string;
 	readonly origin: "prediction" | "actor_preview" | "actor_result";
 	readonly tool: string;
-	readonly actionKeyHash: string;
-	readonly execution: SpeculativeExecution;
-	readonly route?: SpeculativeExecutionRoute;
+	readonly route: SpeculativeExecutionRoute;
 	readonly world?: { readonly backend: string; readonly executionMetrics: WorldExecutionMetrics; };
 	readonly source: string;
 	readonly depth: number;
 	readonly predictedAction: string;
-	readonly predictionLatencyMs: number;
-	readonly draftTokens: number;
-	readonly totalDraftTokens: number;
-	readonly expectedDurationMs: number;
-	readonly estimatedBytes: number;
-	readonly validation: {
-		readonly durationMs: number;
-		readonly bytesRead: number;
-		readonly filesRead: number;
-		readonly mode?: "watcher" | "exact";
-	};
 }
 
 export type CandidateExecutionProjection =
@@ -80,6 +65,5 @@ export type SpeculativeActionEvent<SessionID> =
 			readonly type: "actor_action";
 			readonly settlement: ActorActionSettlement;
 			readonly actualAction: string;
-			readonly execution?: SpeculativeExecution;
 			readonly candidate?: CandidateEventDescriptor;
 	  });

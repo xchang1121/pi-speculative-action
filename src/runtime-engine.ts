@@ -193,11 +193,12 @@ async function projectOutput<Output>(candidate: CandidateRecord<Output>, actor: 
 			coverage: cloneSharedData(coverage.value),
 			keyMatch: match,
 		})) : undefined;
-		rebuilt = projected === undefined ? await reconstruct?.(request) : undefined;
+		const evaluation = projected === undefined ? await TimelineInterval.collect(() => reconstruct?.(request)) : undefined;
+		rebuilt = evaluation?.output;
 		if ((rebuilt?.requiresQueryValidation || candidate.outputStale) && !rebuilt?.validate) return { ok: false, cause: cause("projection", "query_proof_missing") };
 		if (rebuilt) projected = rebuilt.output;
 		if (projected === undefined) return { ok: false, cause: cause("projection", "view_not_covered") };
-		const execution = new TimelineInterval(startedAt, performance.now());
+		const execution = new TimelineInterval(startedAt, performance.now(), evaluation?.dependencies);
 		candidate.projectionMs += Math.max(0, execution.completedAt - execution.startedAt);
 		const resource = rebuilt?.dispose ? { dispose: rebuilt.dispose.bind(rebuilt), references: 1 } : undefined;
 		transferred = true;
@@ -234,22 +235,9 @@ function candidateEventDescriptor<Output>(
 		origin: candidate.origin,
 		...(candidate.owner.draft.type === "operation" ? { kind: "operation" as const } : {}),
 		tool: candidate.key.tool,
-		actionKeyHash: candidate.key.hash,
-		execution: candidate.route.isolation,
 		route: candidate.route,
 		...(branch ? { world: { backend: branch.backend, executionMetrics: branch.executionMetrics } } : {}),
 		predictedAction: diagnosticAction(candidate.key.tool, candidate.key.input, candidate.key),
-		predictionLatencyMs: candidate.predictionLatencyMs,
-		draftTokens: candidate.draftTokens,
-		totalDraftTokens: candidate.totalDraftTokens,
-		expectedDurationMs: candidate.expectedDurationMs,
-		estimatedBytes: candidate.estimatedBytes,
-		validation: {
-			durationMs: candidate.validationMs,
-			bytesRead: candidate.validationBytes,
-			filesRead: candidate.validationFiles,
-			...(candidate.validationMode ? { mode: candidate.validationMode } : {}),
-		},
 	};
 }
 
@@ -323,10 +311,6 @@ interface PlanActionContext<StartInput, StateData> extends RuntimeTurnContext<St
 	readonly identity: PlanActionIdentity;
 	readonly opportunity: PredictionOpportunity;
 	feedback: unknown;
-	readonly attemptStartedAt: number;
-	readonly predictionLatencyMs: number;
-	readonly draftTokens: number;
-	readonly totalDraftTokens: number;
 	draft: SpeculativeDraftCandidate;
 	readonly admissionSignal: AbortSignal;
 	readonly admissionController: AbortController;
@@ -362,10 +346,6 @@ interface CandidateRecord<Output, StartInput = unknown, StateData = unknown> {
 	actorAdopted: boolean;
 	readonly owner: RuntimeTurnContext<StartInput, StateData> & { readonly draft: SpeculativeDraftCandidate; readonly index: number; };
 	readonly createdAt: number;
-	readonly attemptStartedAt: number;
-	readonly predictionLatencyMs: number;
-	readonly draftTokens: number;
-	readonly totalDraftTokens: number;
 	expectedDurationMs: number;
 	estimatedBytes: number;
 	projectionCoverage: readonly ActionProjectionCoverage[];
@@ -379,9 +359,6 @@ interface CandidateRecord<Output, StartInput = unknown, StateData = unknown> {
 	/** Left running after its prediction settled: its process results stay salvageable. */
 	salvaging?: boolean;
 	validationMs: number;
-	validationBytes: number;
-	validationFiles: number;
-	validationMode?: "watcher" | "exact";
 	admissionValidation?: Promise<ResourceValidation>;
 	projectionMs: number;
 }
@@ -601,8 +578,8 @@ export function makeSpeculativeActionRuntime<
 		session: Session,
 		context: RuntimeTurnContext<StartInput, StateData>,
 		draft: SpeculativeDraftCandidate,
-		input: Pick<Candidate, "origin" | "key" | "route" | "attemptStartedAt" | "expectedDurationMs"> & Partial<Pick<Candidate,
-			"worldParent" | "predictionLatencyMs" | "draftTokens" | "totalDraftTokens" | "estimatedBytes" | "projectionCoverage">>,
+		input: Pick<Candidate, "origin" | "key" | "route" | "expectedDurationMs"> & Partial<Pick<Candidate,
+			"worldParent" | "estimatedBytes" | "projectionCoverage">>,
 	): Candidate => {
 		const sequence = ++session.candidateSequence;
 		let resultBytes = input.estimatedBytes ?? 0;
@@ -612,13 +589,8 @@ export function makeSpeculativeActionRuntime<
 			actorAdopted: input.origin === "actor_result",
 			owner: { ...turnContext(context), draft, index: sequence - 1 },
 			createdAt: Date.now(),
-			predictionLatencyMs: 0,
-			draftTokens: 0,
-			totalDraftTokens: session.tokenTotal,
 			projectionCoverage: [],
 			validationMs: 0,
-			validationBytes: 0,
-			validationFiles: 0,
 			projectionMs: 0,
 			...input,
 			get estimatedBytes() { return resultBytes + (candidateBranch(candidate)?.capturedBytes ?? 0); },
@@ -845,7 +817,7 @@ export function makeSpeculativeActionRuntime<
 			try {
 				queueSourceRequestEvent(session, slot.request.turnID, scope.settings, request);
 				if (request.settlement.status === "produced" && request.value !== undefined && session.sourceSlots.has(slot) && slot.generation.active) {
-					await admitUpdates(scope, source, request.value, request);
+					await admitUpdates(scope, source, request.value);
 				}
 			} finally {
 				releaseSourceRequest(session, slot);
@@ -857,7 +829,6 @@ export function makeSpeculativeActionRuntime<
 		scope: PlanAdmissionScope<SessionID, Output, StartInput, StateData>,
 		source: Source,
 		updates: PlanUpdate | readonly PlanUpdate[] | undefined,
-		request?: SettledSourceRequest,
 	): Promise<void> => {
 		const { session } = scope;
 		if (session.lifecycle.sealed || !scope.slot.generation.active) return;
@@ -868,7 +839,7 @@ export function makeSpeculativeActionRuntime<
 			try {
 				// Capture the batch before binding callbacks can mutate producer input.
 				await Promise.resolve();
-				await applyUpdate(scope, source, captured.update, request);
+				await applyUpdate(scope, source, captured.update);
 			} finally {
 				session.pendingAdmissions--;
 			}
@@ -879,7 +850,6 @@ export function makeSpeculativeActionRuntime<
 		scope: PlanAdmissionScope<SessionID, Output, StartInput, StateData>,
 		source: Source,
 		update: PlanUpdate,
-		request?: SettledSourceRequest,
 	): Promise<void> => {
 		const { session } = scope;
 		if (session.lifecycle.sealed || !scope.slot.generation.active) return;
@@ -901,10 +871,6 @@ export function makeSpeculativeActionRuntime<
 					opportunity: session.plan.opportunity(node.proposalID, node.action.id)!,
 					feedback: action.feedback,
 					...turnContext(scope),
-					attemptStartedAt: request?.startedAt ?? performance.now(),
-					predictionLatencyMs: request?.durationMs ?? 0,
-					draftTokens: request?.draftTokens ?? 0,
-					totalDraftTokens: session.tokenTotal,
 					draft: planActionDraft(node),
 					admissionSignal: AbortSignal.any([scope.slot.generation.signal, admissionController.signal]),
 					admissionController,
@@ -1092,10 +1058,6 @@ export function makeSpeculativeActionRuntime<
 				key: node.actionKey!,
 				route,
 				...(parent ? { worldParent: parent } : {}),
-				attemptStartedAt: context.attemptStartedAt,
-				predictionLatencyMs: context.predictionLatencyMs,
-				draftTokens: context.draftTokens,
-				totalDraftTokens: context.totalDraftTokens,
 				expectedDurationMs: scheduled.expectedDurationMs,
 			});
 		}, () => {
@@ -1229,7 +1191,7 @@ export function makeSpeculativeActionRuntime<
 					if (settled) predictionSettled(session, node, settled);
 				}
 			};
-			branch = await adapter.executeCandidate({
+			const evaluation = await TimelineInterval.collect(() => adapter.executeCandidate({
 				startInput: live ?? owner,
 				data: candidate.owner.data,
 				candidate: candidate.owner.draft,
@@ -1244,7 +1206,8 @@ export function makeSpeculativeActionRuntime<
 				onOperationAdopted: candidate.onOperationAdopted,
 				acceptOperationScope: candidate.acceptOperationScope,
 				...(parent ? { parentWorld: candidateBranch(parent)! } : {}),
-			});
+			}));
+			branch = evaluation.output;
 			inputs?.dispose(); // The returned branch owns its proof before cache admission can evict sources.
 			const output = branch.output;
 			const rejected = adapter.rejectCandidateOutput?.({ output, candidate: publicCandidate(candidate) });
@@ -1252,7 +1215,7 @@ export function makeSpeculativeActionRuntime<
 			candidate.projectionCoverage = captureCoverage(candidate.key, output, projectionRules);
 			candidate.estimatedBytes = estimateValueBytes(output) + inputIndexBytes(branch);
 			const completedAt = performance.now();
-			if (!candidate.work.succeed(branch, new TimelineInterval(startedAt, completedAt, branch.computationDependencies), completedAt - startedAt)) {
+			if (!candidate.work.succeed(branch, new TimelineInterval(startedAt, completedAt, [...evaluation.dependencies, ...branch.computationDependencies ?? []]), completedAt - startedAt)) {
 				await session.lifecycle.release(branch);
 				return;
 			}
@@ -1326,7 +1289,6 @@ export function makeSpeculativeActionRuntime<
 		record: ActorPreviewRecord | undefined,
 		signal?: AbortSignal,
 	): Promise<void> => {
-		const attemptStartedAt = performance.now();
 		const active = () =>
 			!signal?.aborted && record?.state.status !== "cancelled" && state.lifecycle === "active" && state.session.turns.get(state.turnID) === state && !masterDisabled();
 		const action = await (record?.actionKey ?? actorActionKey(input, actualCall));
@@ -1398,7 +1360,6 @@ export function makeSpeculativeActionRuntime<
 				origin: "actor_preview",
 				key: action,
 				route,
-				attemptStartedAt,
 				expectedDurationMs: scheduled.expectedDurationMs,
 			});
 		}, active, (candidate, created) => {
@@ -1633,10 +1594,8 @@ export function makeSpeculativeActionRuntime<
 				}
 				// Re-evaluating inputs adopts this query's computation, not the source tool's unused output work.
 				const toolExecution = projection.inputs ? projection.execution! : execution.toolExecution;
-				const timing = { executionAheadMs: Math.max(0, Math.min(toolExecution.completedAt, actorArrivedAt) - toolExecution.startedAt),
-					attemptLeadMs: Math.max(0, actorArrivedAt - candidate.attemptStartedAt), hitLatencyMs: Math.max(0, performance.now() - actorArrivedAt),
-					...(join.expectedActorMs === undefined ? {} : { expectedActorMs: join.expectedActorMs }),
-					...(join.expectedNativeMs === undefined ? {} : { expectedNativeMs: join.expectedNativeMs }) };
+				const timing = { hitLatencyMs: Math.max(0, performance.now() - actorArrivedAt),
+					...(join.expectedActorMs === undefined ? {} : { expectedActorMs: join.expectedActorMs }) };
 				candidate.onAdopted?.(timing);
 				actorAction.select({
 					candidate,
@@ -1691,11 +1650,10 @@ export function makeSpeculativeActionRuntime<
 		const identity = actorAction.identity;
 		state.actorActions.add(actorAction);
 		state.actorObservation ??= actualKey ? identity : null;
-		let capturePreparationMs = 0;
+		let capturePreparationMs = 0, observeOperations = false;
 		let captureInputSource: object | undefined;
 		const prepared: PreparedActorCall<Output> & { output?: Output } = {
-			observeOperations: state.settings.enabled && sources.some(source => source.observesOperations && source.observe && source.enabled(state.settings)) &&
-				learnOperations(state.session),
+			get observeOperations() { return observeOperations; },
 			withInputs: async execute => {
 				const inputs = borrowCandidateInputs(state.session, undefined, `inputs:actor:${identity.id}`);
 				try { return await execute(function* (target) { yield* inputs.lookup(target); if (captureInputSource) yield captureInputSource; }); } finally { inputs.dispose(); }
@@ -1779,6 +1737,8 @@ export function makeSpeculativeActionRuntime<
 			const adoption = actorAction.deferToFallback(matchingPredictions.map(({ opportunity }) => opportunity.identity));
 			if (adoption) confirmPredictions(state.session, matchingPredictions, identity, adoption);
 			const effect = semantics.effect(actualKey);
+			observeOperations = state.settings.enabled && sources.some(source => source.observe && source.enabled(state.settings) && source.observesOperations?.(actualKey)) &&
+				learnOperations(state.session);
 			preemptForActor(state.session);
 			state.session.effects.enqueue(() => dispatchReady(state.session));
 			if (adapter.captureAuthoritativeResult && (effect === "observation" || effect === "workspace_mutation" || prepared.observeOperations)) {
@@ -1825,7 +1785,6 @@ export function makeSpeculativeActionRuntime<
 				origin: "actor_result",
 				key: action,
 				route: capture.route,
-				attemptStartedAt: toolExecution.startedAt,
 				expectedDurationMs: durationMs,
 					estimatedBytes: estimateValueBytes(output) + inputIndexBytes(branch),
 				projectionCoverage: captureCoverage(action, output, projectionRules),
@@ -1896,7 +1855,6 @@ export function makeSpeculativeActionRuntime<
 			...eventEnvelope(state.session, state.turnID, state.settings),
 			settlement,
 			actualAction: diagnosticAction(actorAction.tool, actualCall.input, key),
-			...(settledCandidate ? { execution: settledCandidate.route.isolation } : {}),
 			...(settledCandidateDescriptor ? { candidate: settledCandidateDescriptor } : {}),
 		} : undefined;
 		state.session.effects.enqueue(() => adapter.onActorActionSettled?.({
@@ -2165,7 +2123,7 @@ export function makeSpeculativeActionRuntime<
 
 	const validateCandidate = async (candidate: Candidate, validate?: WorldBranch<Output>["validate"]): Promise<ResourceValidation> => {
 		const validation = await validateWorldBranch(validate ? { validate } : candidateBranch(candidate), candidate.route.reuse);
-		recordValidation(candidate, validation);
+		candidate.validationMs += finiteMetric(validation.metrics.durationMs);
 		return validation;
 	};
 
@@ -2552,7 +2510,6 @@ export function makeSpeculativeActionRuntime<
 			blockedPlanActions: planNodes.filter((node) => node.readiness === "blocked").length,
 			pendingTelemetryEvents: telemetry.reduce((total, item) => total + item.pending, 0),
 			droppedTelemetryEvents: telemetry.reduce((total, item) => total + item.dropped, 0),
-			oldestTelemetryEventMs: telemetry.reduce((oldest, item) => Math.max(oldest, item.oldestPendingMs), 0),
 		};
 	};
 
@@ -2578,8 +2535,6 @@ export function makeSpeculativeActionRuntime<
 			branchBytes,
 			exclusiveCandidates,
 			sharedCandidates: candidates.length - exclusiveCandidates,
-			cacheTools: [...new Set(candidates.map((candidate) => candidate.key.tool))].sort(),
-			cacheExecutions: [...new Set(candidates.map((candidate) => candidate.route.isolation))].sort(),
 		};
 	};
 
@@ -2633,11 +2588,4 @@ export function makeSpeculativeActionRuntime<
 		dispose,
 		inspect,
 	};
-
-	function recordValidation(candidate: Candidate, validation: ResourceValidation): void {
-		candidate.validationMs += finiteMetric(validation.metrics.durationMs);
-		candidate.validationBytes += finiteMetric(validation.metrics.bytesRead);
-		candidate.validationFiles += finiteMetric(validation.metrics.filesRead);
-		candidate.validationMode = validation.metrics.mode;
-	}
 }

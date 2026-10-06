@@ -7,7 +7,7 @@ export type SpeculativeTraceSummary = Readonly<ReturnType<typeof emptySpeculativ
 
 const EMPTY_CACHE: SpeculativeCacheSnapshot = {
 	cacheCapacity: 0, cacheByteCapacity: 0, cacheCold: 0, cacheHot: 0, inFlightJobs: 0, resultEntries: 0, resultBytes: 0,
-	branchEntries: 0, branchBytes: 0, exclusiveCandidates: 0, sharedCandidates: 0, cacheTools: [], cacheExecutions: [],
+	branchEntries: 0, branchBytes: 0, exclusiveCandidates: 0, sharedCandidates: 0,
 };
 
 export function emptySpeculativeTraceSummary(cache: SpeculativeCacheSnapshot | Pick<SpeculativeCacheSnapshot, "cacheCapacity" | "cacheByteCapacity"> = EMPTY_CACHE) {
@@ -35,9 +35,9 @@ export function emptySpeculativeTraceSummary(cache: SpeculativeCacheSnapshot | P
 		hitRate: 0,
 		actorCandidateRejections: {} as Readonly<Record<string, number>>,
 		tasks: 0, toolExecutionMs: 0, toolWaitMs: 0, hiddenLatencyMs: 0,
-		speculativeExecutionMs: 0, actorExecutionMs: 0, executionAheadMs: 0, attemptLeadMs: 0, hitLatencyMs: 0, totalDraftTokens: 0,
+		hitLatencyMs: 0, totalDraftTokens: 0,
 		processReuse: emptyWorldReuseMetrics(), // Inside speculative worlds, never the Actor route.
-		cache: cloneCache({ ...EMPTY_CACHE, ...cache }),
+		cache: { ...EMPTY_CACHE, ...cache },
 	};
 }
 
@@ -48,7 +48,7 @@ export function reduceSpeculativeTrace<SessionID>(
 ): SpeculativeTraceSummary {
 	const next = {
 		...current,
-		cache: cloneCache(event.cache),
+		cache: { ...event.cache },
 	};
 	switch (event.type) {
 		case "operation_prediction":
@@ -88,10 +88,8 @@ export function reduceSpeculativeTrace<SessionID>(
 			break;
 		}
 		case "candidate":
-			next.totalDraftTokens = Math.max(next.totalDraftTokens, metric(event.candidate.totalDraftTokens));
 			if (event.state.status === "running") next.candidateStarted++;
 			else {
-				if (event.candidate.origin === "prediction") next.speculativeExecutionMs += metric(event.state.executionMs);
 				if (event.state.status === "succeeded") {
 					next.candidateSucceeded++;
 					const reuse = event.candidate.world?.executionMetrics.reuse;
@@ -123,11 +121,8 @@ export function reduceSpeculativeTrace<SessionID>(
 					next.partialResultReuseByProjector = increment(current.partialResultReuseByProjector, match.projector);
 				} else if (match.kind === "inputs") next.inputReuseHits++;
 				else next.exactReuseHits++;
-				next.executionAheadMs += metric(event.settlement.provider.timing.executionAheadMs);
-				next.attemptLeadMs += metric(event.settlement.provider.timing.attemptLeadMs);
 				next.hitLatencyMs += metric(event.settlement.provider.timing.hitLatencyMs);
 			} else {
-				next.actorExecutionMs += metric(event.settlement.provider.durationMs);
 				if (event.settlement.provider.origin === "preview") {
 					next.actorPreviews++;
 				} else {
@@ -155,10 +150,6 @@ function addReuseMetrics(left: WorldReuseMetrics, right: WorldReuseMetrics): Wor
 		else merged[key] = metric(Number(merged[key])) + metric(Number(value));
 	}
 	return merged as unknown as WorldReuseMetrics;
-}
-
-function cloneCache(cache: SpeculativeCacheSnapshot): SpeculativeCacheSnapshot {
-	return { ...cache, cacheTools: [...cache.cacheTools], cacheExecutions: [...cache.cacheExecutions] };
 }
 
 function causeKey(cause: ResolutionCause): string {

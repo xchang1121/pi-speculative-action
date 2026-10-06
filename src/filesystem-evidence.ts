@@ -4,6 +4,7 @@ import fs, { type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { containsFilesystemPath, slash } from "./path-utils.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
+import { TimelineInterval } from "./task-timing.ts";
 
 const IDENTITY_FIELDS = ["dev", "ino", "mode", "nlink", "uid", "gid", "rdev", "size", "mtimeNs", "ctimeNs"] as const;
 export const FILESYSTEM_CONCURRENCY = 12;
@@ -21,6 +22,7 @@ export async function mapFilesystem<Input, Output>(values: ReadonlyArray<Input>,
 }
 
 export type StableFilesystemCapture = {
+	readonly computation?: TimelineInterval;
 	readonly hash: string;
 	readonly bytesRead: number;
 	readonly realPath: string;
@@ -135,6 +137,7 @@ export function captureHeldFile(pid: number, fd: number, maxBytes: number, retai
 
 /** Import the helper's complete getdents64 image without enumerating the directory again. */
 export async function captureHeldDirectory(pid: number, fd: number, content: Buffer, stat: BigIntStats, realPath: string): Promise<StableFilesystemCapture> {
+	const startedAt = performance.now();
 	const names: Buffer[] = [];
 	for (let offset = 0; offset < content.length;) {
 		if (content.length - offset < 24) throw new Error("invalid_directory_image");
@@ -152,13 +155,14 @@ export async function captureHeldDirectory(pid: number, fd: number, content: Buf
 	try {
 		if (!sameFilesystemIdentity(stat, await handle.stat({ bigint: true })) ||
 			!sameFilesystemIdentity(stat, await fs.stat(realPath, { bigint: true }))) throw new Error("directory_changed_during_capture");
-		const capture = { content, entries, stat, realPath, bytesRead: content.length, hash: createHash("sha256").update(content).digest("hex") };
+		const capture = { content, entries, stat, realPath, bytesRead: content.length, hash: createHash("sha256").update(content).digest("hex"), computation: TimelineInterval.own(new TimelineInterval(startedAt, performance.now())) };
 		return { ...capture, object: new CapturedFilesystemObject(handle, capture) };
 	} catch (error) { await handle.close(); throw error; }
 }
 
 async function captureFile(target: string, maxBytes: number, retainContent: boolean, verifyPath: boolean,
 	observed?: Partial<Pick<StableFilesystemCapture, "stat" | "realPath">> & { readonly retainObject?: boolean; readonly gitBlob?: boolean; readonly digest?: false }, observation?: { readonly pinned: () => void; readonly signal: AbortSignal }): Promise<StableFilesystemCapture> {
+	const startedAt = performance.now();
 	// O_PATH pins even executable aliases without admitting I/O on a raced-in FIFO or device.
 	let binding = process.platform === "linux" && (process.arch === "x64" || process.arch === "arm64")
 		? await fs.open(target, 0x200000 | (verifyPath ? constants.O_NOFOLLOW : 0)) : undefined;
@@ -185,7 +189,7 @@ async function captureFile(target: string, maxBytes: number, retainContent: bool
 			const [afterPath, pathStat] = await Promise.all([fs.realpath(target), fs.lstat(target, { bigint: true })]);
 			if (beforePath !== afterPath || !sameFilesystemIdentity(after, pathStat)) throw new Error("file_changed_during_capture");
 		}
-		const result = { ...captured, realPath: beforePath };
+		const result = { ...captured, realPath: beforePath, computation: TimelineInterval.own(new TimelineInterval(startedAt, performance.now())) };
 		if (observed?.retainObject && retainContent && binding) {
 			await handle.close(); handle = undefined;
 			const object = new CapturedFilesystemObject(binding, result); binding = undefined;
@@ -220,12 +224,13 @@ async function readFileContents(handle: FileHandle, before: BigIntStats, maxByte
 
 /** Own a directory listing or link target together with its stable entry identity. */
 export async function captureFilesystemEntry(target: string, read?: "directory" | "identity") {
+	const startedAt = performance.now();
 	const before = await fs.lstat(target, { bigint: true });
 	const link = before.isSymbolicLink() ? await fs.readlink(target) : undefined;
 	const entries = read === "directory" && before.isDirectory() ? await fs.readdir(target, { withFileTypes: true }) : undefined;
 	const info = link !== undefined || read !== undefined ? await fs.lstat(target, { bigint: true }) : before;
 	if (!sameFilesystemIdentity(before, info)) throw new Error(`${link !== undefined ? "symlink" : "directory"}_changed_during_capture`);
-	return { info, link, entries };
+	return { info, link, entries, computation: TimelineInterval.own(new TimelineInterval(startedAt, performance.now())) };
 }
 
 /** Resolve link targets component by component, retaining each stable namespace observation. */
