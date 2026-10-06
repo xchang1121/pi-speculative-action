@@ -54,7 +54,9 @@ export async function runSourceRequest<Value>(input: {
 	readonly count: (value: Value) => number;
 }): Promise<SourceRequestResult<Value>> {
 	const startedAt = performance.now();
-	const finish = (settlement: SourceRequestSettlement) => result(input.request, startedAt, settlement);
+	const finish = (settlement: SourceRequestSettlement): SettledSourceRequest => Object.freeze({
+		request: Object.freeze({ ...input.request }), durationMs: Math.max(0, performance.now() - startedAt), settlement: Object.freeze(settlement),
+	});
 	const aborted = () => finish({ status: "aborted", cause: cause("source",
 		input.generation.expiration?.code ?? "generation_expired", input.generation.expiration?.detail) });
 	const failed = (code: string, error: unknown) => finish({ status: "error", cause: cause("source", code, errorDetail(error)) });
@@ -83,13 +85,4 @@ export async function runSourceRequest<Value>(input: {
 		return failed("result_error", error);
 	}
 	return { ...finish(proposalCount > 0 ? { status: "produced", proposalCount } : { status: "empty" }), value: outcome.value };
-}
-
-function result(request: SourceRequestIdentity, startedAt: number, settlement: SourceRequestSettlement): SettledSourceRequest {
-	return Object.freeze({
-		request: Object.freeze({ ...request }),
-		startedAt,
-		durationMs: Math.max(0, performance.now() - startedAt),
-		settlement: Object.freeze(settlement),
-	});
 }

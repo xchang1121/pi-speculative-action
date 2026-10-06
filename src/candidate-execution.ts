@@ -9,8 +9,6 @@ export type CandidateExecutionState<Output> =
 	| {
 			readonly status: "failed" | "cancelled";
 			readonly cause: ResolutionCause;
-			readonly startedAt?: number;
-			readonly completedAt: number;
 			readonly executionMs: number;
 	  };
 
@@ -81,12 +79,12 @@ export class CandidateExecution<Output> {
 		return true;
 	}
 
-	fail(cause: ResolutionCause, completedAt: number, executionMs: number): boolean {
-		return this.finish("failed", cause, completedAt, executionMs);
+	fail(cause: ResolutionCause, executionMs: number): boolean {
+		return this.finish("failed", cause, executionMs);
 	}
 
-	cancel(cause: ResolutionCause, completedAt: number, executionMs: number): boolean {
-		const changed = this.finish("cancelled", cause, completedAt, executionMs);
+	cancel(cause: ResolutionCause, executionMs: number): boolean {
+		const changed = this.finish("cancelled", cause, executionMs);
 		if (changed) this.controller.abort(cause);
 		return changed;
 	}
@@ -124,14 +122,11 @@ export class CandidateExecution<Output> {
 		};
 	}
 
-	private finish(status: "failed" | "cancelled", cause: ResolutionCause, completedAt: number, executionMs: number): boolean {
+	private finish(status: "failed" | "cancelled", cause: ResolutionCause, executionMs: number): boolean {
 		if (this.executionValue.status !== "queued" && this.executionValue.status !== "running") return false;
-		const startedAt = this.executionValue.status === "running" ? this.executionValue.startedAt : undefined;
 		const settlement: CandidateExecutionSettlement<Output> = Object.freeze({
 			status,
 			cause: Object.freeze({ ...cause }),
-			...(startedAt !== undefined ? { startedAt } : {}),
-			completedAt: metric(completedAt),
 			executionMs: metric(executionMs),
 		});
 		this.executionValue = settlement;

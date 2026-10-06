@@ -5,7 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 import { type ActionProjectionRule, READ_RANGE_ACTION_KEY_PROJECTOR } from "../src/action-key-projection.ts";
 import { buildPiActionKey, PI_ACTION_SEMANTICS, type ActionKey } from "../src/action-semantics.ts";
 import { EffectTransactionCoordinator, effectCommitFailure } from "../src/effect-transaction.ts";
-import { emptyWorldReuseMetrics, type SpeculativeExecutionRoute, type WorldBranch } from "../src/execution-world.ts";
+import { SALVAGE_MS, emptyWorldReuseMetrics, type SpeculativeExecutionRoute, type WorldBranch } from "../src/execution-world.ts";
 import type {
 	MaterializedSpeculativeCandidate,
 	PreparedActorCall,
@@ -1451,17 +1451,41 @@ describe("structural speculative runtime", () => {
 		} finally { await runtime.dispose(); }
 	});
 
-	it("keeps running work through an unbounded native call and adopts it after validation", async () => {
+	it.each(["adopt", "salvage", "cancel"])("keeps running work through an unbounded native call until %s", async mode => {
 		const started = deferred<void>(), release = deferred<void>();
-		const { runtime, executions } = harness({ actionKey: (tool, args) => buildPiActionKey(tool, args, process.cwd()),
-			source: planSource({ propose: () => plan("read") }), execute: async () => { started.resolve(); await release.promise; } });
+		const timers = vi.spyOn(globalThis, "setTimeout"), cleared = vi.spyOn(globalThis, "clearTimeout"), disposed = vi.fn();
+		let acceptScope: Parameters<TestAdapter["executeCandidate"]>[0]["acceptOperationScope"];
+		const { runtime, ready } = harness({ actionKey: (tool, args) => buildPiActionKey(tool, args, process.cwd()),
+			resolveExecution: ({ tool }) => tool === "read" ? mode === "adopt" ? RESOURCE_ROUTE : { ...MUTATION_ROUTE, isolation: "runtime_sandbox" } : undefined,
+			source: planSource({ propose: ({ startInput }) => startInput.turnID === "turn" ? plan("read") : undefined }),
+			executeCandidate: async ({ acceptOperationScope }) => {
+				acceptScope = acceptOperationScope; started.resolve(); await release.promise;
+				return world("speculative", { validate: async () => validResource(), onDispose: disposed });
+			} });
 		try {
 			await runtime.startTurn(start("turn")); await started.promise;
 			await runFallback(runtime, { ...call("turn"), id: "native", tool: "bash", input: { command: "git status" } });
-			release.resolve();
-			expect((await runtime.prepareActorCall(call("turn")))?.output).toBe("speculative");
-			expect(executions()).toBe(1);
-		} finally { await runtime.dispose(); }
+			if (mode === "adopt") {
+				release.resolve(); expect((await runtime.prepareActorCall(call("turn")))?.output).toBe("speculative");
+			} else {
+				await runtime.finishTurn(call("turn")); await runtime.startTurn(start("next"));
+				const index = timers.mock.calls.findIndex(([, delay]) => Number(delay) > SALVAGE_MS / 2);
+				expect(index).toBeGreaterThanOrEqual(0);
+				const timer = timers.mock.results[index]!.value;
+				expect(cleared).not.toHaveBeenCalledWith(timer);
+				if (mode === "cancel") {
+					const closing = runtime.settingsChanged({ ...settings, enabled: false });
+					await nextTurn(); expect(cleared).toHaveBeenCalledWith(timer); release.resolve(); await closing;
+				} else {
+					release.resolve(); await ready.promise;
+					expect(cleared).toHaveBeenCalledWith(timer);
+					expect(acceptScope!(start("next"))).toBe(false);
+					expect(acceptScope!(start("next"), true)).toBe(true);
+					expect(acceptScope!(start("turn"), true)).toBe(false);
+				}
+			}
+		} finally { release.resolve(); await runtime.dispose(); timers.mockRestore(); cleared.mockRestore(); }
+		expect(disposed).toHaveBeenCalledOnce();
 	});
 
 	it.each([false, true])("re-validates finished exclusive work off the Actor path after an unbounded native call (stale=%s)", async (stale) => {

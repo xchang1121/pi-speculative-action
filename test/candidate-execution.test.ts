@@ -56,15 +56,15 @@ describe("CandidateExecution", () => {
 	it("settles failure and cancellation exactly once", async () => {
 		const failed = new CandidateExecution<string>("shared");
 		const failure = cause("execution", "tool_failed");
-		expect(failed.fail(failure, 8, 0)).toBe(true);
+		expect(failed.fail(failure, 0)).toBe(true);
 		expect(failed.acquire("actor")).toBeUndefined();
-		expect(failed.cancel(cause("control", "late_cancel"), 9, 0)).toBe(false);
+		expect(failed.cancel(cause("control", "late_cancel"), 0)).toBe(false);
 		await expect(failed.completion).resolves.toMatchObject({ status: "failed", cause: failure });
 
 		const cancelled = new CandidateExecution<string>("shared");
 		const cancellation = cause("control", "turn_aborted");
 		expect(cancelled.start(3)).toBe(true);
-		expect(cancelled.cancel(cancellation, 7, 4)).toBe(true);
+		expect(cancelled.cancel(cancellation, 4)).toBe(true);
 		expect(cancelled.controller.signal.aborted).toBe(true);
 		expect(cancelled.acquire("actor")).toBeUndefined();
 		expect(cancelled.succeed("late", new TimelineInterval(3, 9), 6)).toBe(false);

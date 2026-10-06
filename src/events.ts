@@ -1,5 +1,6 @@
+import type { CandidateExecutionState } from "./candidate-execution.ts";
 import type { SpeculativeExecutionRoute, WorldExecutionMetrics } from "./execution-world.ts";
-import type { ActorActionSettlement, PredictionSettlement, ResolutionCause, SettledSourceRequest } from "./settlement.ts";
+import type { ActorActionSettlement, PredictionSettlement, SettledSourceRequest } from "./settlement.ts";
 import type { SpeculativeTaskTiming } from "./task-timing.ts";
 
 export interface SpeculativeCacheSnapshot {
@@ -29,15 +30,9 @@ export interface CandidateEventDescriptor {
 }
 
 export type CandidateExecutionProjection =
-	| { readonly status: "running"; readonly startedAt: number }
-	| { readonly status: "succeeded"; readonly startedAt: number; readonly completedAt: number; readonly executionMs: number; }
-	| {
-			readonly status: "failed" | "cancelled";
-			readonly cause: ResolutionCause;
-			readonly startedAt?: number;
-			readonly completedAt: number;
-			readonly executionMs: number;
-	  };
+	| { readonly status: "running" }
+	| { readonly status: "succeeded"; readonly executionMs: number; }
+	| Extract<CandidateExecutionState<never>, { readonly status: "failed" | "cancelled" }>;
 
 interface EventEnvelope<SessionID> {
 	readonly sessionID: SessionID;
