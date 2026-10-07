@@ -1,5 +1,6 @@
 import { deferred } from "./async.ts";
 import { testModel } from "./model.ts";
+import { forkReceipt as forkBatchReceipt } from "./fork.ts";
 import { createHash } from "node:crypto";
 import type { AssistantMessageEvent, Context } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
@@ -432,7 +433,7 @@ describe("self-speculation control plane", () => {
 		expect({ drafted, requests, completions: coordinator.snapshot().forkCompletions }).toEqual({ drafted: [{ reasoning: "I should read a.ts", content: "" }], requests: [], completions: 1 });
 	});
 
-	it("deduplicates valid sidecar batches while preserving their calls and candidate evidence", async () => {
+	it("deduplicates valid sidecar calls after confidence checks and counts every receipt", async () => {
 		const candidate = {
 			candidate_ids: ["fork-candidate"], sources: ["self-speculation", "drafter"],
 			provenance: [{ proposalID: "p", actionID: "a" }], action_identities: [{ predicted_action_id: "predicted" }],
@@ -444,7 +445,7 @@ describe("self-speculation control plane", () => {
 			fork: { total_ms: 25, logprobs: { token_count: 2, mean: Math.log(0.96), minimum: Math.log(0.96),
 				tool_name: { token_count: 1, matched_calls: 1, minimum_probability: 0.96 } } },
 		};
-		const receipt = { details: { bundle: { candidates: [
+		const receipt = forkBatchReceipt([
 			candidate, candidate,
 			{ sources: ["self-speculation"], tool_calls: [{ name: "read", arguments: "bad" }] },
 			{ sources: ["self-speculation"], tool_calls: [
@@ -452,7 +453,7 @@ describe("self-speculation control plane", () => {
 			] },
 			{ sources: ["drafter"], tool_calls: [{ name: "read", arguments: { path: "ignored.txt" } }] },
 			{ sources: ["self-speculation"], tool_calls: [{ name: "write", arguments: { path: "b.txt" } }] },
-		] } } };
+		]);
 		const { actions, batches, coordinator } = await forkActionFixture({ forkActionMinConfidence: 0, maxCandidates: 2 }, receipt);
 		try {
 			expect(actions).toEqual([
@@ -464,13 +465,8 @@ describe("self-speculation control plane", () => {
 				{ id: "0:fork", index: 0, callID: "call-a", format: "structured", tool: "read", input: { path: "a.txt" } },
 				{ id: "1:fork", index: 1, tool: "read", input: { path: "b.txt" } },
 			]);
-			expect(batches[0]!.evidence).toHaveLength(2);
-			for (const evidence of batches[0]!.evidence) expect(evidence).toMatchObject({
-				candidateIDs: ["fork-candidate"], sources: ["self-speculation", "drafter"],
-				provenance: [{ proposalID: "p", actionID: "a" }], actionIdentities: [{ predicted_action_id: "predicted" }],
-				draftTokenCount: 18, score: { joint_speculation_probability: 0.72 }, fork: { total_ms: 25 },
-			});
-			expect(batches[0]!.evidence[0]!.confidence).toBeCloseTo(0.96);
+			expect(coordinator.snapshot()).toMatchObject({ forkRequests: 1, forkCompletions: 1, candidateReceipts: 1, forkLatencyMs: 50, forkLogprobTokens: 4 });
+			expect(coordinator.snapshot().forkMeanLogprob).toBeCloseTo(Math.log(0.96));
 		} finally { await coordinator.dispose(); }
 	});
 
@@ -700,25 +696,12 @@ function forkReceipt(
 	logprobs: unknown = { token_count: 2, mean: -0.03, tool_name: { minimum_probability: 0.95 } },
 	profile?: string,
 ): Record<string, unknown> {
-	return {
-		registered: true,
-		draft_token_count: 12,
-		accepted_token_count: 3,
-		details: {
-			bundle: {
-				candidates: [
-					{
-						sources: ["drafter", "self-speculation"],
-						...(profile
-							? { profile: { profile: { id: profile }, source: "explicit" } }
-							: {}),
-						tool_calls: [{ name: tool, arguments: input }],
-						fork: { total_ms: 25, logprobs },
-					},
-				],
-			},
-		},
-	};
+	return forkBatchReceipt([{
+		sources: ["drafter", "self-speculation"],
+		...(profile ? { profile: { profile: { id: profile }, source: "explicit" } } : {}),
+		tool_calls: [{ name: tool, arguments: input }],
+		fork: { total_ms: 25, logprobs },
+	}], { registered: true, draft_token_count: 12, accepted_token_count: 3 });
 }
 
 function enabledSettings(overrides: Partial<SelfSpeculationSettings>): SelfSpeculationSettings {

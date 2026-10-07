@@ -64,14 +64,6 @@ export interface ResourceInputMatch { readonly kind: "inputs"; readonly distance
 
 export type ActionKeyMatch = ExactActionKeyMatch | ProjectedActionKeyMatch | ResourceInputMatch;
 
-export type ActionKeyMismatchReason =
-	| "different_tool"
-	| "different_semantics"
-	| "different_schema"
-	| "different_executor"
-	| "different_core"
-	| "projection_not_applicable";
-
 export interface CanonicalAction { readonly input: Readonly<Record<string, unknown>>; readonly resources: readonly string[]; }
 
 export interface ActionSemanticsDefinition {
@@ -298,17 +290,6 @@ export function actionKeyMatch(speculative: ActionKey, actor: ActionKey, project
 		best = { kind: "projected", projector: projector.id, distance: projected.distance };
 	}
 	return best;
-}
-
-/** Explain why K(a_s) cannot satisfy K(a) without exposing either action's input. */
-export function actionKeyMismatchReason(speculative: ActionKey, actor: ActionKey, projectors: readonly ActionKeyProjector[] = []): ActionKeyMismatchReason | undefined {
-	if (actionKeyMatch(speculative, actor, projectors)) return undefined;
-	if (speculative.tool !== actor.tool) return "different_tool";
-	if (speculative.semanticsEpoch !== actor.semanticsEpoch) return "different_semantics";
-	if (speculative.schemaHash !== actor.schemaHash) return "different_schema";
-	if (speculative.executionFingerprint !== actor.executionFingerprint) return "different_executor";
-	const speculativePartitions = new Set(actionKeyProjectionPartitions(speculative, projectors));
-	return actionKeyProjectionPartitions(actor, projectors).some((partition) => speculativePartitions.has(partition)) ? "projection_not_applicable" : "different_core";
 }
 
 /** Projection partitions used only as an indexed lookup optimization. */

@@ -37,7 +37,7 @@ export type CandidateExecutionProjection =
 interface EventEnvelope<SessionID> {
 	readonly sessionID: SessionID;
 	readonly turnID: string;
-	readonly timestamp: number;
+	readonly timestamp: number; // Epoch milliseconds from performance.timeOrigin + performance.now().
 	readonly cache: SpeculativeCacheSnapshot;
 }
 
@@ -49,8 +49,8 @@ export type SpeculativeActionEvent<SessionID> =
 			readonly request: SettledSourceRequest;
 			readonly totalDraftTokens: number;
 	  })
-	| (EventEnvelope<SessionID> & { readonly type: "prediction"; readonly settlement: PredictionSettlement; })
-	| (EventEnvelope<SessionID> & { readonly type: "operation_prediction"; readonly settlement: PredictionSettlement; })
+	| (EventEnvelope<SessionID> & { readonly type: "prediction"; readonly settlement: PredictionSettlement; readonly tool?: string; readonly predictedAction?: string; })
+	| (EventEnvelope<SessionID> & { readonly type: "operation_prediction"; readonly settlement: PredictionSettlement; readonly tool?: string; readonly predictedAction?: string; })
 	| (EventEnvelope<SessionID> & {
 			readonly type: "candidate";
 			readonly candidate: CandidateEventDescriptor;

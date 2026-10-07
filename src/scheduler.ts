@@ -32,6 +32,7 @@ export interface ScheduledWork {
 
 export interface ServiceTimingIdentity {
 	readonly tool: string;
+	readonly semanticsEpoch?: string;
 	/** Stable execution environment shared by comparable service samples. */
 	readonly executionFingerprint?: string;
 	/** Exact K(a) or producer/consumer pair, before falling back to the wider timing class. */
@@ -43,8 +44,7 @@ export interface ServiceTimingIdentity {
 export interface CandidateJoinPolicy {
 	/** Required estimated Actor critical-path saving before waiting for unfinished work. */
 	readonly minNetBenefitMs: number;
-	/** Actor wait cap before any Actor service of the route is known (default: the warm-up allowance). Waiting without bound
-	 * adopts every such result, so the native service is never sampled and the route never learns that it was faster. */
+	/** Probe cap without Actor evidence, or with only class evidence and no action forecast (default: warm-up allowance). */
 	readonly uncalibratedWaitMs?: number;
 	/** Uncertainty allowance added to the estimated remaining-time deadline during warm-up. */
 	readonly warmupWaitMs: number;
@@ -300,8 +300,7 @@ export class SpeculationScheduler<Job extends object> {
 	observeAdoption(identity: ServiceTimingIdentity, durationMs: number): void { this.observeTiming(this.adoptionTimes, identity, durationMs); }
 
 	/**
-	 * Decide whether the Actor should adopt speculative work. A rejected candidate keeps
-	 * running until ordinary invalidation, so both sides of the comparison can continue learning.
+	 * Decide whether the Actor should adopt speculative work from comparable measured service and bounded cold probes.
 	 */
 	assessCandidateJoin(request: CandidateJoinRequest): CandidateJoinDecision {
 		const policy = this.candidateJoinPolicy;
@@ -309,6 +308,7 @@ export class SpeculationScheduler<Job extends object> {
 		const actor = this.timingEstimate(this.actorServiceTimes, request.actorIdentity ?? request.identity, 0.25);
 		const adoption = this.timingEstimate(this.adoptionTimes, request.adoptionIdentity ?? request.identity, 0.75, "upper");
 		const elapsedMs = request.state === "running" ? finite(request.elapsedMs) : 0, forecastMs = finite(request.expectedSpeculativeDurationMs);
+		const cold = !actor?.exact && !speculative?.exact && !forecastMs;
 		// A tool's timing class mixes short and long commands (ls and npm test): it may raise this action's own forecast or
 		// elapsed time, never shorten them, and for the same action without exact Actor evidence native takes about as long.
 		const sameAction = request.actorIdentity?.actionKeyHash === undefined || request.actorIdentity.actionKeyHash === request.identity.actionKeyHash;
@@ -355,23 +355,23 @@ export class SpeculationScheduler<Job extends object> {
 			return { allowed: waitBudgetMs > 0, reason: "warmup_probe", waitBudgetMs, ...base };
 		}
 		const actorDeadlineMs = Math.max(0, expectedActorMs - expectedAdoptionMs - policy.minNetBenefitMs);
-		// Nothing is known about this run itself: probe it for at most what falling back would cost.
+		// Exact Actor evidence can fund its unknown alternative; heterogeneous class samples only fund a cold probe.
 		if (!speculative && !forecastMs) {
-			const waitBudgetMs = Math.min(policy.uncalibratedWaitMs ?? Number.POSITIVE_INFINITY, actorDeadlineMs);
+			const waitBudgetMs = Math.min(policy.uncalibratedWaitMs ?? (cold ? policy.warmupWaitMs : Number.POSITIVE_INFINITY), actorDeadlineMs);
 			return { allowed: waitBudgetMs > 0, reason: "warmup_probe", waitBudgetMs, ...base };
 		}
 		if (expectedNetBenefitMs === undefined || expectedNetBenefitMs < policy.minNetBenefitMs) {
 			return { allowed: false, reason: "fallback_faster", waitBudgetMs: 0, ...base };
 		}
-		// Without exact samples or a forecast, waiting up to about the work already done bounds the loss either way.
-		const estimatedDeadlineMs = speculative?.exact || forecastMs ? expectedRemainingMs * policy.durationSlack + policy.warmupWaitMs : actorDeadlineMs;
+		const estimatedDeadlineMs = speculative?.exact || forecastMs ? expectedRemainingMs * policy.durationSlack + policy.warmupWaitMs
+			: cold ? policy.uncalibratedWaitMs ?? policy.warmupWaitMs : actorDeadlineMs;
 		const waitBudgetMs = Math.min(actorDeadlineMs, estimatedDeadlineMs);
 		// A cancelled run supplies no completion sample. Passing that floor does not mean this run is nearly done.
 		const uncalibratedOverrun = speculative?.samples === 0 && request.state === "running" && elapsedMs >= expectedSpeculativeMs;
 		if (waitBudgetMs <= 0 || uncalibratedOverrun && !speculative.window.allowProbe()) {
 			return { allowed: false, reason: uncalibratedOverrun ? "warmup_probe" : "fallback_faster", waitBudgetMs: 0, ...base };
 		}
-		return { allowed: true, reason: speculative?.samples ? "profitable" : "warmup_probe", waitBudgetMs, ...base };
+		return { allowed: true, reason: !cold && speculative?.samples ? "profitable" : "warmup_probe", waitBudgetMs, ...base };
 	}
 
 	snapshot(): readonly { readonly job: Job; readonly work: ScheduledWork }[] {
@@ -486,7 +486,7 @@ class SampleWindow {
 type QuantileSelection = "lower" | "upper";
 
 function timingKeys(identity: ServiceTimingIdentity): readonly string[] {
-	const group = [identity.tool, identity.executionFingerprint ?? "", identity.operation ?? ""];
+	const group = [identity.tool, identity.semanticsEpoch ?? "", identity.executionFingerprint ?? "", identity.operation ?? ""];
 	return [...(identity.actionKeyHash ? [JSON.stringify(["action", ...group, identity.actionKeyHash])] : []),
 		JSON.stringify(["class", ...group])];
 }

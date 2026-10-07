@@ -19,7 +19,6 @@ export interface PlanAction {
 	readonly operation?: ExecutionOperationBinding;
 	readonly tool: string;
 	readonly input: unknown;
-	readonly diagnostic?: string;
 	/** Expected Actor tool batches before this action; used to schedule execution. */
 	readonly horizon?: number;
 	/** Latest Actor tool batches before this prediction becomes a miss. Defaults to horizon. */

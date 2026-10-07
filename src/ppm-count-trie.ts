@@ -6,14 +6,6 @@ export type PpmCountTrieRow = {
 	readonly lastSeen: number;
 };
 
-export type PpmProbabilityEstimate = {
-	readonly probability: number;
-	/** Longest suffix order that contributed evidence for the target. */
-	readonly order: number;
-	readonly evidence: number;
-	readonly escapeMass: number;
-};
-
 type TargetCount = { count: number; lastSeen: number; };
 
 type CountNode = {
@@ -80,10 +72,10 @@ export class PpmCountTrie {
 	}
 
 	/** Compute the suffix evidence once for every competing target in this prediction frontier. */
-	distribution(history: readonly string[], sequence = 0, halfLife = 0): ReadonlyMap<string, PpmProbabilityEstimate> {
-		const estimates = new Map<string, PpmProbabilityEstimate>();
+	distribution(history: readonly string[], sequence = 0, halfLife = 0): ReadonlyMap<string, number> {
+		const estimates = new Map<string, number>();
 		if (this.root.total <= 0) return estimates;
-		const suffixNodes: Array<{ readonly node: CountNode; readonly order: number }> = [{ node: this.root, order: 0 }];
+		const suffixNodes: CountNode[] = [this.root];
 		let current = this.root;
 		for (let order = 1; order <= Math.min(history.length, this.order); order++) {
 			const token = history[history.length - order];
@@ -91,34 +83,26 @@ export class PpmCountTrie {
 			const child = current.children.get(token);
 			if (!child) break;
 			current = child;
-			if (current.total > 0) suffixNodes.push({ node: current, order });
+			if (current.total > 0) suffixNodes.push(current);
 		}
 		// PPM*: a shorter deterministic suffix has more evidence than its equally deterministic extensions.
-		const deterministic = suffixNodes.findIndex(({ node, order }) => order > 0 && node.targets.size === 1);
+		const deterministic = suffixNodes.findIndex((suffix, index) => index > 0 && suffix.targets.size === 1);
 		if (deterministic >= 0) suffixNodes.length = deterministic + 1;
 
 		let remaining = 1;
-		for (const item of suffixNodes.reverse()) {
-			const weighted = [...item.node.targets].map(([target, value]) => [target, decayedCount(value, sequence, halfLife)] as const);
+		for (const suffix of suffixNodes.reverse()) {
+			const weighted = [...suffix.targets].map(([target, value]) => [target, decayedCount(value, sequence, halfLife)] as const);
 			const total = weighted.reduce((sum, [, count]) => sum + count, 0);
 			const distinct = weighted.filter(([, count]) => count > 0).length;
 			if (total <= 0 || distinct <= 0) continue;
 			const denominator = total + distinct;
 			for (const [target, count] of weighted) {
 				if (count <= 0) continue;
-				const previous = estimates.get(target);
-				estimates.set(target, {
-					probability: (previous?.probability ?? 0) + remaining * (count / denominator),
-					order: previous?.order ?? item.order,
-					evidence: previous?.evidence ?? count,
-					escapeMass: 0,
-				});
+				estimates.set(target, (estimates.get(target) ?? 0) + remaining * (count / denominator));
 			}
 			remaining *= distinct / denominator;
 		}
-		for (const [target, estimate] of estimates) {
-			estimates.set(target, { ...estimate, probability: clampProbability(estimate.probability), escapeMass: clampProbability(remaining) });
-		}
+		for (const [target, probability] of estimates) estimates.set(target, clampProbability(probability));
 		return estimates;
 	}
 

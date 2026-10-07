@@ -13,7 +13,6 @@ import { advanceFilesystemClock, assertNoSymlinkPath, captureFilesystemEntry, ca
 	settledIdentity, sharedWalk } from "./filesystem-evidence.ts";
 import { WORKSPACE_PATH_MUTATION_EFFECTS } from "./effect-model.ts";
 import { effectCommitFailure } from "./effect-transaction.ts";
-import type { WorkspaceFileMutation } from "./workspace-state.ts";
 import { LinuxOverlayfsCapabilityRegistry, LinuxOverlayfsUnsafeCleanupError, mountLinuxOverlayfs, openLinuxAnonymousWorkspaceFile,
 	type LinuxOverlayfsMount, type LinuxOverlayfsOptions } from "./linux-overlayfs.ts";
 import { captureWorkspaceStructure, captureWorkspaceStructureEntry, statChangeDigest, workspaceStructureSnapshot, directoryEntriesDigest,
@@ -35,15 +34,8 @@ interface SandboxChangeTarget {
 	readonly accessMode?: number;
 }
 
-export interface SandboxFileChange extends SandboxChangeTarget, WorkspaceFileMutation {
+export interface SandboxFileChange extends SandboxChangeTarget, Omit<WorkspaceRegularDelta, "relativePath"> {
 	readonly kind?: "file";
-	readonly before?: Uint8Array;
-	readonly after?: Uint8Array;
-	readonly beforeMode?: number;
-	readonly afterMode?: number;
-	readonly afterModified?: string;
-	/** The identity that stands for `before` (see `settledIdentity`): an unchanged file proves its baseline by it. */
-	readonly beforeIdentity?: string;
 }
 
 export interface SandboxDirectoryState {
@@ -137,6 +129,8 @@ interface PrivateSandboxWorkspace extends SandboxWorkspaceContext {
 
 interface WorkspaceSandboxState {
 	readonly repositories: Map<string, Promise<PooledGitRepository>>;
+	/** Checkpoint identity and bytes belong to one service, including its sibling execution worlds. */
+	readonly checkpoints: WeakMap<WorldCheckpoint, WorkspaceCheckpoint>;
 	readonly lifetime: RuntimeLifecycleLane;
 	readonly overlayfsCapabilities: LinuxOverlayfsCapabilityRegistry;
 }
@@ -180,7 +174,7 @@ interface PreparedGitWorkspace {
 interface SharedOverlayBaseline extends PreparedGitWorkspace { structure?: Promise<WorkspaceStructureSnapshot>; active: number; }
 
 interface AutoWorkspaceDriverDecision {
-	readonly commit: string;
+	readonly baseline: string | WorkspaceStructureSnapshot;
 	readonly capabilityFingerprint: string;
 	readonly resolved: QualifiedWorkspaceSandboxDriver;
 }
@@ -240,14 +234,17 @@ interface WorkspaceCheckpoint {
 	readonly sourceRoot: string;
 	readonly parent?: WorkspaceCheckpoint;
 	readonly changes: readonly SandboxWorkspaceChange[];
+	committed: boolean;
 }
 
-// Checkpoints expose identity only; their owned bytes stay inside this backend.
-const workspaceCheckpoints = new WeakMap<WorldCheckpoint, WorkspaceCheckpoint>();
+function acceptsWorkspaceCheckpoint(state: WorkspaceSandboxState, checkpoint: WorldCheckpoint, cwd: string): boolean {
+	const owned = state.checkpoints.get(checkpoint);
+	return !state.lifetime.sealed && !!owned && filesystemPathKey(owned.sourceRoot) === filesystemPathKey(path.resolve(cwd));
+}
 
-function resolveWorkspaceCheckpoint(checkpoint: WorldCheckpoint | undefined, sourceRoot: string): WorkspaceCheckpoint | undefined {
+function resolveWorkspaceCheckpoint(state: WorkspaceSandboxState, checkpoint: WorldCheckpoint | undefined, sourceRoot: string): WorkspaceCheckpoint | undefined {
 	if (checkpoint === undefined) return undefined;
-	const owned = workspaceCheckpoints.get(checkpoint);
+	const owned = state.checkpoints.get(checkpoint);
 	if (!owned) throw new Error("Execution world checkpoint belongs to another backend.");
 	if (filesystemPathKey(owned.sourceRoot) !== filesystemPathKey(sourceRoot)) throw new Error("Execution world checkpoint belongs to another workspace.");
 	return owned;
@@ -269,6 +266,7 @@ type SandboxPreparation = QualifiedWorkspaceSandboxDriver | typeof capturedWorks
 export class WorkspaceSandboxService {
 	private readonly state: WorkspaceSandboxState = {
 		repositories: new Map(),
+		checkpoints: new WeakMap(),
 		lifetime: new RuntimeLifecycleLane(),
 		overlayfsCapabilities: new LinuxOverlayfsCapabilityRegistry(),
 	};
@@ -287,6 +285,8 @@ export class WorkspaceSandboxService {
 		assertWorkspaceSandboxOpen(this.state);
 		return createWorkspaceSandboxFor(this.state, options);
 	}
+
+	acceptsCheckpoint(checkpoint: WorldCheckpoint, cwd: string): boolean { return acceptsWorkspaceCheckpoint(this.state, checkpoint, cwd); }
 
 	async prepare(cwd: string, options: PrepareSandboxWorkspaceOptions = {}): Promise<QualifiedWorkspaceSandboxDriver> {
 		assertWorkspaceSandboxOpen(this.state);
@@ -339,13 +339,24 @@ async function resolveWorkspaceDriver(state: WorkspaceSandboxState, options: Wor
 	const repository = acquiredRepository ?? ownedRepository;
 	if (!repository) throw new Error("workspace repository is unavailable");
 	try {
-		// Driver choice is preparation; actual workspace allocation still validates the exact baseline.
-		const { commit } = await acquireSandboxBaseline(repository, true);
+		// Driver choice is preparation; actual workspace allocation still validates its captured inputs.
+		const captured = options.liveLower ? await captureLiveBase(repository) : undefined;
 		const cached = repository.autoDriverDecision;
-		if (cached?.commit === commit && cached.capabilityFingerprint === capability.fingerprint) { return cached.resolved; }
-		const treeEntries = parseNullList(await repository.git(["ls-tree", "-r", "-z", "--name-only", commit])).length;
+		if (captured && cached?.baseline === captured && cached.capabilityFingerprint === capability.fingerprint) return cached.resolved;
+		const entries = captured && [...captured.entries].filter(([resource]) => !isSnapshotExcluded(slash(resource)));
+		const live = entries?.every(([, entry]) => entry.kind !== "unsupported" && (entry.kind !== "file" ||
+			!entry.aliases?.some(alias => isSnapshotExcluded(slash(path.relative(repository.sourceRoot, alias)))))) ? captured : undefined;
+		const baseline = live ?? (await acquireSandboxBaseline(repository, true)).commit;
+		if (options.liveLower && !live) return { driver: "git", fingerprint: GIT_WORKSPACE_FINGERPRINT };
+		if (cached?.baseline === baseline && cached.capabilityFingerprint === capability.fingerprint) { return cached.resolved; }
+		// Structure captures link text only. Follow links with the same containment/cycle guards as Git baselines.
+		const links = live && entries!.flatMap(([resource, entry]) => entry.kind === "symlink"
+			? [{ path: path.join(repository.sourceRoot, resource), scope: "tree_entries" as const }] : []);
+		if (links?.length) await (await repository.versions.capture(links)).release();
+		const treeEntries = live ? entries!.filter(([, entry]) => entry.kind !== "directory").length
+			: parseNullList(await repository.git(["ls-tree", "-r", "-z", "--name-only", baseline as string])).length;
 		const resolved = treeEntries >= AUTO_OVERLAY_MIN_TREE_ENTRIES ? overlay : { driver: "git", fingerprint: GIT_WORKSPACE_FINGERPRINT } as const;
-		repository.autoDriverDecision = { commit, capabilityFingerprint: capability.fingerprint, resolved };
+		repository.autoDriverDecision = { baseline, capabilityFingerprint: capability.fingerprint, resolved };
 		return resolved;
 	} finally {
 		if (ownedRepository) releaseSandboxRepository(ownedRepository);
@@ -360,6 +371,7 @@ function createWorkspaceSandboxFor(state: WorkspaceSandboxState, options: Worksp
 	const roots = new Set<string>();
 	return { id: "git_worktree", scope: "fallback", isolation: "workspace_branch", speculation: {
 			capabilities: WORKSPACE_PATH_MUTATION_EFFECTS.capabilities,
+			acceptsCheckpoint: (checkpoint, cwd) => acceptsWorkspaceCheckpoint(state, checkpoint, cwd),
 			fingerprint: async ({ action }) => {
 				assertWorkspaceSandboxOpen(state);
 				if (action && !(action.executionContext as ToolInvocation | undefined)?.filesystem) throw new Error("Workspace execution requires an explicitly bound filesystem operation");
@@ -387,8 +399,9 @@ function workspaceBranch(snapshot: WorkspaceExecutionSnapshot, sourceRoot: strin
 	owner: WorkspaceSandboxState, parent?: WorkspaceCheckpoint, validate?: () => Promise<ResourceValidation>): WorldBranch<ToolSettlement> {
 	const { changes } = snapshot, { executionFingerprint } = action, backend = "git_worktree", id = randomUUID();
 	const checkpoint = Object.freeze({ backend, id, lineage: parent?.token.lineage ?? id, depth: (parent?.token.depth ?? -1) + 1 });
-	workspaceCheckpoints.set(checkpoint, { token: checkpoint, sourceRoot, parent, changes });
-	let committed = false, commitPromise: Promise<ToolSettlement> | undefined;
+	const retained = { token: checkpoint, sourceRoot, parent, changes, committed: false };
+	owner.checkpoints.set(checkpoint, retained);
+	let commitPromise: Promise<ToolSettlement> | undefined;
 	const inputs = new Map<string, ResourceInput>();
 	let disposed = false, readInputs = false, transferred: ReturnType<NonNullable<WorldBranch<ToolSettlement>["takeCommittedInputs"]>> | undefined;
 	return {
@@ -397,7 +410,7 @@ function workspaceBranch(snapshot: WorkspaceExecutionSnapshot, sourceRoot: strin
 		capturedBytes: changes.reduce((total, change) => total + sandboxChangeBytes(change), 0),
 		executionMetrics: Object.freeze({ ...snapshot.executionMetrics }),
 		compatibility: Object.freeze({ status: "compatible" as const, backend, executionFingerprint }),
-		commit: () => commitPromise ??= commitSandboxExecution(owner, snapshot, inputs).then(output => { committed = true; if (disposed) inputs.clear(); return output; }),
+		commit: () => commitPromise ??= commitSandboxExecution(owner, snapshot, inputs).then(output => { retained.committed = true; if (disposed) inputs.clear(); return output; }),
 		takeReadInputs: async (maxBytes) => {
 			// Every file this branch read keeps its pre-image until commit; each serves reads while it stays unchanged.
 			const preimages = new Map<string, ResourceInput>(changes.flatMap((change) => change.kind !== "directory" && change.before && !change.aliases && textual(change.before) ? [[change.target, change.before]] : []));
@@ -410,7 +423,7 @@ function workspaceBranch(snapshot: WorkspaceExecutionSnapshot, sourceRoot: strin
 			await inputs?.dispose(); return undefined;
 		},
 		takeCommittedInputs: async (maxBytes) => {
-			if (disposed || !committed || transferred) return undefined;
+			if (disposed || !retained.committed || transferred) return undefined;
 			return transferred = (async () => {
 				if (!inputs.size) return undefined;
 				try {
@@ -621,7 +634,7 @@ async function commitSandboxExecution(state: WorkspaceSandboxState, execution: S
 async function forkSandboxWorkspaceFor(state: WorkspaceSandboxState, options: SandboxWorkspaceBranchOptions,
 	preparation: SandboxPreparation | undefined = options.validate ? options.preparation : undefined): Promise<WorldBranch<ToolSettlement>> {
 	const sourceRoot = path.resolve(options.cwd);
-	const parent = resolveWorkspaceCheckpoint(options.parentCheckpoint, sourceRoot);
+	const parent = resolveWorkspaceCheckpoint(state, options.parentCheckpoint, sourceRoot);
 	const resolvedDriver = await resolveWorkspaceDriver(state, options.driver === "auto" || options.driver === undefined ? { ...options, driver: "git" } : options);
 	const snapshot = await withPrivateSandboxWorkspace(state, sourceRoot, options.gitBinary ?? "git", resolvedDriver.driver, options,
 		async (workspace) => {
@@ -1549,7 +1562,23 @@ async function withPrivateSandboxWorkspace<T>(state: WorkspaceSandboxState, cwd:
 async function materializeCheckpoint(workspace: PrivateSandboxWorkspace, checkpoint: WorkspaceCheckpoint): Promise<void> {
 	const lineage: WorkspaceCheckpoint[] = [];
 	for (let current: WorkspaceCheckpoint | undefined = checkpoint; current; current = current.parent) { lineage.push(current); }
-	for (const ancestor of lineage.reverse()) {
+	lineage.reverse();
+	// Allocation can finish after Actor adoption. Skip an adopted prefix only when this private baseline proves its final state.
+	let adopted = 0;
+	while (lineage[adopted]?.committed) adopted++;
+	for (; adopted; adopted--) {
+		const final = new Map(lineage.slice(0, adopted).flatMap(ancestor => ancestor.changes.filter(change => !change.validationOnly).map(change => [change.resource, change] as const)));
+		if ((await mapFilesystem([...final.values()], async change => {
+			const target = path.resolve(workspace.sandboxRoot, change.resource);
+			await assertNoSymlinkPath(workspace.sandboxRoot, target);
+			if (change.kind === "directory") return sameDirectoryAfter(target, change).catch(() => false);
+			if (change.object || change.aliases) return false;
+			const current = await readRegularState(target);
+			return sameSandboxState(current, change.after === undefined ? undefined : { content: change.after, mode: change.afterMode ?? change.beforeMode ?? 0 }) &&
+				(change.afterModified === undefined || String(current?.identity?.mtimeNs) === change.afterModified);
+		})).every(Boolean)) break;
+	}
+	for (const ancestor of lineage.slice(adopted)) {
 		const project = (name: string) => {
 			const relative = relativeFilesystemPath(ancestor.sourceRoot, name);
 			if (relative === undefined) throw new Error("checkpoint object escapes workspace");

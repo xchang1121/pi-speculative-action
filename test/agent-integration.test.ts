@@ -2,6 +2,7 @@ import { adoptedSettlement, rejectedSettlement, unmatchedSettlement, unobservedS
 import { textResult } from "./result.ts";
 import { gated, deferred, nextTurn } from "./async.ts";
 import { testBranch } from "./branch.ts";
+import { forkReceipt } from "./fork.ts";
 import fs, { writeFile } from "node:fs/promises";
 import { temporaryDirectories } from "./filesystem.ts";
 import { testModel as model } from "./model.ts";
@@ -18,9 +19,12 @@ import { borrowResourceObject, createResourceSnapshotExecutionWorld, type Specul
 import { createSpeculativeActionHost, type CreateSpeculativeActionHostOptions } from "../src/agent-integration.ts";
 import { SpeculationScheduler } from "../src/scheduler.ts";
 import { createDrafterPlanSource } from "../src/drafter-plan-source.ts";
+import { DrafterTaskBudget, type DrafterUtilityBatch } from "../src/drafter-budget.ts";
+import { PlanRuntime } from "../src/plan-runtime.ts";
+import { cause } from "../src/settlement.ts";
 import { patternAwareActionSemantics, acquirePatternAwareStore, PATTERN_AWARE_DEFAULTS, PatternAwareStore, patternAwareSettings } from "../src/pattern-aware.ts";
 import { createPatternPlanSource } from "../src/pattern-plan-source.ts";
-import { PI_READ_RANGE_PROJECTION_RULE, withPiProjectionCoverage } from "../src/pi-read-projection.ts";
+import { READ_RANGE_ACTION_KEY_PROJECTOR, type ActionProjectionRule } from "../src/action-key-projection.ts";
 import { createClosedSearchProfile, resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import type { MaterializedSpeculativeCandidate, SpeculativeActionEvent } from "../src/runtime.ts";
 import { createActorForkPlanSource } from "../src/actor-fork-plan-source.ts";
@@ -77,13 +81,13 @@ function startInput(tool: AgentTool, turnID = "turn-1") {
 	return { turnID, actorModel: model("actor"), context: { systemPrompt: "system", messages: [], tools: [tool] }, actorOptions: undefined, tools: [tool] };
 }
 
-function patternRequest(tool: AgentTool, patternAware: ReturnType<typeof patternAwareSettings>, sessionID = "session",
+function planRequest(tool: AgentTool, patternAware?: ReturnType<typeof patternAwareSettings>, sessionID = "session",
 	schemaHashes: Readonly<Record<string, string>> = {}) {
 	return {
 		startInput: { ...startInput(tool), sessionID },
-		data: { tools: new Map([["read", tool]]), schemaHashes },
+		data: { tools: new Map([[tool.name, tool]]), schemaHashes },
 		settings: { ...settings(), resourceCacheMaxEntries: 4, predictionTimeoutMs: 1000, sourceConfig: { patternAware } },
-		definitions: [], candidateNames: ["read"], proposalIndex: 0, proposalCount: 1, signal: new AbortController().signal,
+		definitions: [], candidateNames: [tool.name], proposalIndex: 0, proposalCount: 1, signal: new AbortController().signal,
 	};
 }
 
@@ -192,7 +196,7 @@ describe("speculative action host", () => {
 					const reasoning: ThinkingLevel | undefined = supported && requested !== "off" ? requested : undefined;
 					expect(requests.map((request) => request[2])).toMatchObject([{ reasoning, maxTokens: 128, toolChoice: reasoning ? "auto" : "required" }, { reasoning, maxTokens: 128, toolChoice: "auto" }]);
 					expect(await Promise.all(requests.map((request) => request[2]!.onPayload?.({ tools: [] }, { ...model("draft"), api: "anthropic-messages" }))))
-						.toEqual([reasoning ? undefined : { tools: [], tool_choice: { type: "any" } }, undefined]);
+						.toEqual([reasoning ? undefined : { tools: [], tool_choice: { type: "tool", name: "speculative_workflow" } }, undefined]);
 					await host.finishTurn("turn-1", true);
 					expect(complete).toHaveBeenCalledTimes(2);
 					expect(events.filter((event) => event.type === "source_request" && event.request.request.kind === "continuation")).toHaveLength(1);
@@ -202,45 +206,123 @@ describe("speculative action host", () => {
 		}
 	});
 
-	it("keeps the predictable calls of a mixed Drafter batch without continuing it", async () => {
+	it.each([false, true])("keeps a predictable prefix without crossing an unavailable workflow step (%s)", async workflow => {
 		const tool = createReadTool(await temporaryWorkspace()), controller = createDrafterPlanSource({ sessionID: "session", complete: async () => assistant([
-			{ type: "toolCall", id: "r", name: "read", arguments: { path: "a.txt" } }, { type: "toolCall", id: "b", name: "bash", arguments: { command: "ls" } }], "toolUse") });
-		const proposal = await controller.source.propose({ startInput: { ...startInput(tool), sessionID: "session" }, data: { tools: new Map([["read", tool]]), schemaHashes: {} },
-			settings: { ...settings(), resourceCacheMaxEntries: 4, predictionTimeoutMs: 1000 }, definitions: [], candidateNames: ["read"], proposalIndex: 0, proposalCount: 1, signal: new AbortController().signal });
+			...workflow ? [{ type: "toolCall" as const, id: "workflow", name: "speculative_workflow", arguments: { steps: [
+				{ tool: "read", input: { path: "a.txt" } }, { tool: "bash", input: { command: "opaque build" } }, { tool: "read", input: { path: "after.txt" } }] } }]
+				: [{ type: "toolCall" as const, id: "r", name: "read", arguments: { path: "a.txt" } }, { type: "toolCall" as const, id: "b", name: "bash", arguments: { command: "ls" } }]], "toolUse") });
+		const proposal = await controller.source.propose(planRequest(tool));
 		if (!proposal || Array.isArray(proposal) || !("actions" in proposal) || typeof controller.source.continueOn !== "function") throw new Error("missing proposal");
 		expect(proposal.actions).toMatchObject([{ tool: "read", input: { path: "a.txt" } }]);
 		expect(controller.source.continueOn({ actionID: proposal.actions[0]!.id, feedback: proposal.actions[0]!.feedback,
 			output: { result: { content: [], details: {} }, isError: false }, trigger: "execution_succeeded" })).toBe(false);
+		controller.finishSession();
 	});
 
-	it("calibrates each Drafter call's hit probability from the tool's observed settlements", async () => {
-		const tool = createReadTool(await temporaryWorkspace()), controller = createDrafterPlanSource({ sessionID: "session", complete: async () => drafterCall({ path: "a.txt" }) });
-		const propose = async (turnID: string) => {
-			const proposal = await controller.source.propose({ startInput: { ...startInput(tool), sessionID: "session", turnID }, data: { tools: new Map([["read", tool]]), schemaHashes: {} },
-				settings: { ...settings(), resourceCacheMaxEntries: 4, predictionTimeoutMs: 1000 }, definitions: [], candidateNames: ["read"], proposalIndex: 0, proposalCount: 1, signal: new AbortController().signal });
-			if (!proposal || Array.isArray(proposal) || !("actions" in proposal)) throw new Error("missing proposal");
-			return proposal.actions[0]!;
-		};
-		const first = await propose("t1");
-		expect(first.empiricalProbability).toBe(0.5);
-		for (const matched of [false, false, true]) await controller.source.onSettled!({ proposalID: "p", actionID: first.id, feedback: first.feedback,
-			settlement: matched ? adoptedSettlement() : unmatchedSettlement() });
-		await controller.source.onSettled!({ proposalID: "p", actionID: first.id, feedback: first.feedback, settlement: { prediction: {} as never, observation: "unobserved", cause: {} as never } });
-		expect((await propose("t2")).empiricalProbability).toBe(0.4);
+	it("plans ordered mutations and expensive successors in one response, continuing only from real outputs", async () => {
+		const cwd = await temporaryWorkspace(), tools: AgentTool[] = [createEditTool(cwd), createBashTool(cwd), createReadTool(cwd)], contexts: Context[] = [];
+		const budget = new DrafterTaskBudget(), previous = assistant([{ type: "text", text: "Update the files and validate." }], "stop");
+		previous.usage.input = 1399; previous.usage.totalTokens = 1400;
+		const context: Context = { systemPrompt: "Unchanged Actor instructions", messages: [{ role: "user", content: "Complete the task.", timestamp: 1 }, previous], tools };
+		const steps: { tool: string; input: Record<string, unknown> }[] = ["a.txt", "b.txt"].map(path => ({ tool: "edit", input: { path, edits: [{ oldText: "old", newText: "new" }] } }));
+		steps.push({ tool: "bash", input: { command: "opaque-compiler --verify" } });
+		const controller = createDrafterPlanSource({ sessionID: "workflow", drafterBudget: budget, complete: async (_model, actual, options) => {
+			contexts.push(actual);
+			if (contexts.length === 1) {
+				const schemaTokens = Math.ceil((JSON.stringify(actual.tools).length - JSON.stringify(tools).length) / 4);
+				const tailTokens = Math.ceil(String(actual.messages.at(-1)!.content).length / 4);
+				expect(schemaTokens).toBeGreaterThan(0); expect(tailTokens).toBeGreaterThan(0);
+				expect(options?.maxTokens).toBe(2400 - 1400 - schemaTokens - tailTokens);
+				expect(budget.snapshot().reservedTokens).toBe(2400);
+			}
+			return contexts.length === 1 ? drafterCall({ steps }, "speculative_workflow") : drafterCall({ command: "opaque-compiler real-result" }, "bash");
+		} });
+		const request = { ...planRequest(tools[0]!), startInput: { ...startInput(tools[0]!), context, tools, sessionID: "workflow" },
+			settings: { ...settings(), resourceCacheMaxEntries: 4, predictionTimeoutMs: 1000, sourceConfig: { drafterGateEnabled: false, drafterTaskMaxTokens: 2400 } },
+			data: { tools: new Map(tools.map(tool => [tool.name, tool])), schemaHashes: {} }, candidateNames: tools.map(tool => tool.name) };
+		try {
+			const proposal = await controller.source.propose(request);
+			if (!proposal || Array.isArray(proposal) || !("actions" in proposal) || typeof controller.source.continueOn !== "function") throw new Error("missing workflow");
+			expect(request.startInput.context.tools).toEqual(tools);
+			expect(contexts[0]!.systemPrompt).toBe(context.systemPrompt); expect(contexts[0]!.messages.slice(0, -1)).toEqual(context.messages);
+			expect(contexts[0]!.messages.at(-1)).toMatchObject({ role: "user", content: expect.stringContaining("Respond with exactly one speculative_workflow call.") });
+			expect(contexts[0]!.tools?.map(tool => tool.name)).toEqual(["speculative_workflow"]);
+			expect(contexts[0]!.tools![0]!.parameters).toEqual({ type: "object", required: ["steps"], properties: { steps: { type: "array", minItems: 1, maxItems: 4,
+				items: { anyOf: tools.map(tool => ({ type: "object", description: tool.description, required: ["tool", "input"],
+					properties: { tool: { type: "string", enum: [tool.name] }, input: tool.parameters } })) } } } });
+			expect(proposal.actions.map(action => [action.tool, action.depth, action.dependsOn?.map(parent => parent.actionID)]))
+				.toEqual([["edit", 0, undefined], ["edit", 1, [proposal.actions[0]!.id]], ["bash", 2, [proposal.actions[1]!.id]]]);
+			const plan = new PlanRuntime(); expect(plan.apply(proposal, 0).accepted).toBe(true);
+			expect(plan.launchable().map(node => node.action.tool)).toEqual(["edit"]);
+			plan.rejectExecution(plan.get(proposal.id, proposal.actions[0]!.id)!.identity, cause("execution", "test_failure"));
+			expect(plan.get(proposal.id, proposal.actions[1]!.id)?.readiness).toBe("blocked");
+			for (const [index, action] of proposal.actions.entries()) expect(controller.source.continueOn({ actionID: action.id, feedback: action.feedback,
+				trigger: "execution_succeeded", output: { result: textResult(`real-result-${index}`), isError: false } })).toBe(index === 2);
+			const last = proposal.actions[2]!;
+			await controller.source.continue!({ ...request, proposalID: proposal.id, actionID: last.id, feedback: last.feedback, revision: 1,
+				trigger: "execution_succeeded", output: { result: textResult("real-result-2"), isError: false }, candidate: {} as never });
+			expect(contexts[1]!.tools).toBe(tools);
+			expect(contexts[1]!.messages.slice(0, 2)).toEqual(context.messages);
+			expect(contexts[1]!.messages.slice(2).map(message => message.role)).toEqual(["assistant", "toolResult", "assistant", "toolResult", "assistant", "toolResult"]);
+			expect(contexts[1]!.messages.filter(message => message.role === "toolResult").map(message => message.content))
+				.toEqual([0, 1, 2].map(index => textResult(`real-result-${index}`).content));
+			await controller.source.propose({ ...request, startInput: { ...request.startInput, turnID: "single" },
+				settings: { ...request.settings, sourceConfig: { ...request.settings.sourceConfig, drafterMaxDepth: 0 } } });
+			expect(contexts[2]).toBe(context); expect(context.messages).toHaveLength(2);
+		} finally { controller.finishSession(); }
+	});
+
+	it.each([false, true])("adopts one isolated workflow ancestry across turns, including pending descendants (%s)", async pending => {
+		const cwd = await temporaryWorkspace(), sandbox = new WorkspaceSandboxService(), tools = [createWriteTool(cwd), createEditTool(cwd)], waiting = gated();
+		const steps = [{ tool: "write", input: { path: "notes.txt", content: "alpha\nbeta\n" } },
+			{ tool: "edit", input: { path: "notes.txt", edits: [{ oldText: "alpha", newText: "omega" }] } },
+			{ tool: "edit", input: { path: "notes.txt", edits: [{ oldText: "omega", newText: "final" }] } }];
+		let predict = true;
+		const complete = vi.fn(async () => drafterCall({ steps }, "speculative_workflow")), world = sandbox.createExecutionWorld({ driver: "git" });
+		const { host, events } = drafterHost("workflow-ancestry", { cwd, complete,
+			getSettings: () => ({ ...settings(), tools: tools.map(tool => tool.name), drafterEnabled: predict, drafterMaxDepth: 2, drafterGateEnabled: false }),
+			resolveInvocation: (name, input) => resolvePiToolInvocation(name, input, { cwd, environment: {} }),
+			executionWorlds: [{ ...world, speculation: { ...world.speculation, execute: async context => {
+				if (pending && context.action.tool === "edit") await waiting.wait();
+				return world.speculation.execute(context);
+			} } }] });
+		try {
+			await host.startTurn({ ...startInput(tools[0]!, "step-0"), tools });
+			const finished = () => expect.poll(() => events.flatMap(event => event.type === "candidate" && ["succeeded", "failed", "cancelled"].includes(event.state.status)
+				? [event.state] : []), { timeout: 5000 }).toMatchObject(Array.from({ length: 3 }, () => ({ status: "succeeded" })));
+			if (pending) await waiting.entered; else await finished();
+			expect(await fs.readFile(path.join(cwd, "notes.txt"), "utf8")).toBe("one\ntwo\nthree\nfour");
+			for (const [index, step] of steps.entries()) {
+				const turnID = `step-${index}`;
+				if (index) await host.startTurn({ ...startInput(tools[1]!, turnID), tools });
+				if (index === 1) { waiting.release(); await finished(); }
+				await host.execute({ turnID, id: turnID, tool: step.tool, args: step.input, tools }, undefined,
+					() => { throw new Error("prepared workflow must be adopted"); });
+				await host.finishTurn(turnID, index === 2); predict = false;
+			}
+			expect(await fs.readFile(path.join(cwd, "notes.txt"), "utf8")).toBe("final\nbeta\n");
+			expect(complete).toHaveBeenCalledOnce();
+		} finally { waiting.release(); await host.dispose(); await sandbox.dispose(); }
 	});
 
 	it.each(["adopted", "rejected"] as const)("calibrates final Drafter adoption separately from matching (%s)", async outcome => {
 		const tool = createReadTool(await temporaryWorkspace());
-		let selectedModel = model("draft"), schema = "schema-a", sequence = 0;
+		let selectedModel = model("draft"), schema = "match-only", sequence = 0;
 		const controller = createDrafterPlanSource({ sessionID: "calibration", draftModel: () => selectedModel, complete: async () => drafterCall({ path: "a.txt" }) });
 		const propose = async () => {
-			const proposal = await controller.source.propose({ startInput: { ...startInput(tool), sessionID: "calibration", turnID: `turn-${sequence++}` },
-				data: { tools: new Map([["read", tool]]), schemaHashes: { read: schema } }, settings: { ...settings(), resourceCacheMaxEntries: 4, predictionTimeoutMs: 1000 },
-				definitions: [], candidateNames: ["read"], proposalIndex: 0, proposalCount: 1, signal: new AbortController().signal });
+			const request = planRequest(tool, undefined, "calibration", { read: schema });
+			const proposal = await controller.source.propose({ ...request, settings: { ...request.settings, sourceConfig: { drafterGateEnabled: false } },
+				startInput: { ...startInput(tool, `turn-${sequence++}`), sessionID: "calibration" } });
 			if (!proposal || Array.isArray(proposal) || !("actions" in proposal)) throw new Error("missing proposal");
 			return proposal.actions[0]!;
 		};
 		try {
+			const sample = await propose(); expect(sample.empiricalProbability).toBe(0.5);
+			for (const matched of [false, false, true]) await controller.source.onSettled!({ proposalID: "p", actionID: sample.id, feedback: sample.feedback,
+				settlement: matched ? adoptedSettlement() : unmatchedSettlement() });
+			await controller.source.onSettled!({ proposalID: "p", actionID: sample.id, feedback: sample.feedback, settlement: unobservedSettlement("control", "cancelled") });
+			expect((await propose()).empiricalProbability).toBe(0.4);
+			schema = "schema-a";
 			const first = await propose(); expect(first).toMatchObject({ empiricalProbability: 0.5, adoptionProbability: 0.5 });
 			const feedback = { proposalID: "p", actionID: first.id, feedback: first.feedback };
 			for (let index = 0; index < 4; index++) await controller.source.onSettled!({ ...feedback,
@@ -265,33 +347,41 @@ describe("speculative action host", () => {
 		} finally { controller.finishSession(); }
 	});
 
-	it("shows the Drafter PatternAware's expected calls after the Actor's history only when enabled", async () => {
+	it("budgets from PatternAware forecasts while showing its expected calls only when enabled", async () => {
 		const tool = createReadTool(await temporaryWorkspace());
 		for (const enabled of [false, true]) {
 			const contexts: Context[] = [], asked: unknown[] = [];
+			let expectedLatencyBenefitMs = 5000;
 			const controller = createDrafterPlanSource({ sessionID: "session", complete: async (_model, context) => { contexts.push(context); return drafterCall({ path: "a.txt" }); },
-				patternHints: async ({ sessionID }) => { asked.push(sessionID); return [{ tool: "read", input: { path: "a.txt" } }]; } });
-			const input = { ...startInput(tool), sessionID: "session" };
-			await controller.source.propose({ startInput: input, data: { tools: new Map([["read", tool]]), schemaHashes: {} }, definitions: [], candidateNames: ["read"],
-				settings: { ...settings(), resourceCacheMaxEntries: 4, predictionTimeoutMs: 1000, sourceConfig: { drafterPatternHints: enabled } }, proposalIndex: 0, proposalCount: 1, signal: new AbortController().signal });
-			expect(contexts[0]!.messages.slice(0, input.context.messages.length)).toEqual(input.context.messages);
-			expect([asked, contexts[0]!.messages.length - input.context.messages.length]).toEqual(enabled ? [["session"], 1] : [[], 0]);
-			if (enabled) expect(contexts[0]!.messages.at(-1)).toMatchObject({ role: "user", content: expect.stringContaining('- read {"path":"a.txt"}') });
+				patternHints: async ({ sessionID }) => { asked.push(sessionID); return [{ tool: "read", input: { path: "a.txt" }, horizon: 0, expectedLatencyBenefitMs }]; } });
+			const request = planRequest(tool), { context } = request.startInput;
+			const propose = (turnID: string) => controller.source.propose({ ...request, startInput: { ...request.startInput, turnID },
+				settings: { ...request.settings, sourceConfig: { drafterPatternHints: enabled } } });
+			try {
+				await propose("cold"); await propose("valuable"); // The second root must justify its request before any adoption is known.
+				expectedLatencyBenefitMs = 5;
+				await expect(propose("cheap")).rejects.toMatchObject({ cause: { code: "drafter_negative_utility" } });
+				expect(asked).toEqual(["session", "session", "session"]); expect(contexts).toHaveLength(2);
+				for (const actual of contexts) {
+					expect(actual.messages.slice(0, context.messages.length)).toEqual(context.messages);
+					expect(actual.messages.length - context.messages.length).toBe(1 + Number(enabled));
+					if (enabled) expect(actual.messages.at(-2)).toMatchObject({ role: "user", content: expect.stringContaining('- read {"path":"a.txt"}') });
+				}
+			} finally { controller.finishSession(); }
 		}
 	});
 
 	it("rolls a peer's executed batch out as a Drafter continuation that depends on it", async () => {
 		const tool = createReadTool(await temporaryWorkspace()), contexts: Context[] = [];
 		const controller = createDrafterPlanSource({ sessionID: "session", complete: async (_model, context) => { contexts.push(context); return drafterCall({ path: `${contexts.length}.txt` }); } });
-		const request = { startInput: { ...startInput(tool), sessionID: "session" }, data: { tools: new Map([["read", tool]]), schemaHashes: {} },
-			settings: { ...settings(), resourceCacheMaxEntries: 4, predictionTimeoutMs: 1000 }, definitions: [], candidateNames: ["read"], proposalIndex: 0, proposalCount: 1, signal: new AbortController().signal };
+		const request = planRequest(tool);
 		await controller.source.propose(request);
 		const identity = { id: "fork-call", proposalID: "self-speculation:turn-1:batch", actionID: "0:fork" }, input = { path: "fork.txt" };
 		const update = await controller.source.continueFrom!({ ...request, batch: [{ identity: identity as never, candidate: { id: "c", key: PI_ACTION_SEMANTICS.buildKey("read", input, "/")!,
 			tool: "read", input }, output: { result: { content: [{ type: "text", text: "forked" }], details: {} }, isError: false } }] });
 		expect(update).toMatchObject({ source: "drafter", actions: [{ tool: "read", input: { path: "2.txt" }, depth: 1,
 			dependsOn: [{ proposalID: identity.proposalID, actionID: "0:fork", identity: "fork-call", condition: "execution_succeeded" }] }] });
-		expect(contexts[1]!.messages.slice(-2)).toMatchObject([{ role: "assistant", content: [{ type: "toolCall", name: "read", arguments: input }] },
+		expect(contexts[1]!.messages.slice(-3, -1)).toMatchObject([{ role: "assistant", content: [{ type: "toolCall", name: "read", arguments: input }] },
 			{ role: "toolResult", toolName: "read", content: [{ type: "text", text: "forked" }] }]);
 	});
 
@@ -309,24 +399,41 @@ describe("speculative action host", () => {
 		} finally { await host.dispose(); }
 	});
 
-	it("splits one adoption among the sources that predicted it, whichever one executed it", async () => {
-		let now = 0;
-		vi.spyOn(performance, "now").mockImplementation(() => now);
+	it.each([1, 2])("credits %i retained Drafter lineages when another source executes, preserving one total source share", async count => {
 		const tool = createReadTool(await temporaryWorkspace());
-		const controller = createDrafterPlanSource({ sessionID: "session", complete: async () => { now += 100; return drafterCall({ path: "notes.txt" }); } });
-		await controller.source.propose({ startInput: { ...startInput(tool), sessionID: "session" }, data: { tools: new Map([["read", tool]]), schemaHashes: {} },
-			settings: { ...settings(), resourceCacheMaxEntries: 4, predictionTimeoutMs: 1000 }, definitions: [], candidateNames: ["read"], proposalIndex: 0, proposalCount: 1, signal: new AbortController().signal });
-		await controller.actorActionSettled({ sessionID: "session", turnID: "turn-1", candidate: { source: "self-speculation" } as never, settlement: {
-			provider: { kind: "speculative", timing: { hitLatencyMs: 20, expectedActorMs: 420 } },
-			matchedPredictions: [{ source: "drafter" }, { source: "self-speculation" }] } as never });
-		controller.finishTurn("session", "turn-1");
-		await Promise.resolve();
-		expect(controller.snapshot()).toMatchObject({ samples: 1, expectedNetBenefitMs: 420 / 2 - 20 / 2 });
+		const controller = createDrafterPlanSource({ sessionID: "session", complete: async () => drafterCall({ path: "notes.txt" }) });
+		const propose = async (turnID: string) => {
+			const proposal = await controller.source.propose({ ...planRequest(tool, undefined, "session", { read: turnID }),
+				startInput: { ...startInput(tool, turnID), sessionID: "session" } });
+			if (!proposal || Array.isArray(proposal) || !("actions" in proposal)) throw new Error("missing proposal");
+			return proposal.actions[0]!;
+		};
+		const old: Awaited<ReturnType<typeof propose>>[] = [];
+		for (let index = 0; index < count; index++) { const turnID = `old-${index}`; old.push(await propose(turnID)); controller.finishTurn("session", turnID); }
+		const current = await propose("current"), utility = (action: typeof current) => (action.feedback as { utility: DrafterUtilityBatch }).utility;
+		const actorAction = (sequence: number) => ({ id: `actor-${sequence}`, sequence, turnID: "current" });
+		const stage = async (sequence: number) => {
+			const adoption = adoptedSettlement();
+			if (adoption.observation !== "observed") throw new Error("missing observed adoption");
+			for (const action of [...old, ...old]) await controller.source.onSettled!({ proposalID: "retained", actionID: action.id, feedback: action.feedback,
+				settlement: { ...adoption, actorAction: actorAction(sequence) } });
+		};
+		const settle = (sequence: number, preview = false) => controller.actorActionSettled({ sessionID: "session", turnID: "current",
+			candidate: { source: "pattern_aware" } as never, settlement: { actorAction: actorAction(sequence),
+				provider: { kind: preview ? "actor" : "speculative", timing: { hitLatencyMs: 20, expectedActorMs: 420 } },
+				matchedPredictions: [{ source: "drafter" }, { source: "pattern_aware" }] } as never });
+		try {
+			await stage(1); await settle(1); await settle(1); // Duplicate matches and callbacks cannot multiply a source's benefit.
+			await stage(2); await settle(2, true); await settle(2); // A preview drains staging without speculative credit.
+			await stage(3); controller.finishTurn("session", "current"); await settle(3); // Abandoned standalone staging is released.
+			for (const action of old) expect(utility(action)).toMatchObject({ benefitMs: 420 / 2 / count, costMs: 20 / 2 / count });
+			expect(utility(current)).toMatchObject({ benefitMs: 0, costMs: 0 });
+		} finally { controller.finishSession(); }
 	});
 
 	it("counts Drafter tokens of empty and failed requests when they are spent", async () => {
 		const cwd = await temporaryWorkspace(), tool = createReadTool(cwd), replies = [assistant([{ type: "text", text: "no tool" }], "stop"), assistant([], "error")];
-		const { host, events } = drafterHost("session", { cwd, complete: async () => replies.shift()!, getSettings: () => settings(2) });
+		const { host, events } = drafterHost("session", { cwd, complete: async () => replies.shift()!, getSettings: () => ({ ...settings(2), drafterGateEnabled: false }) });
 		try {
 			await host.startTurn(startInput(tool));
 			await waitFor(() => events.filter((event) => event.type === "source_request").length === 2);
@@ -341,10 +448,7 @@ describe("speculative action host", () => {
 		const tool = createReadTool(await temporaryWorkspace());
 		let reply = drafterCall({ path: "notes.txt" });
 		const controller = createDrafterPlanSource({ sessionID: "session", complete: async () => { now += 100; return reply; } });
-		const request = { startInput: { ...startInput(tool), sessionID: "session" },
-			data: { tools: new Map([["read", tool]]), schemaHashes: {}, prepareExecution },
-			settings: { ...settings(), resourceCacheMaxEntries: 4, predictionTimeoutMs: 1000 },
-			definitions: [], candidateNames: ["read"], proposalIndex: 0, proposalCount: 1, signal: new AbortController().signal };
+		const base = planRequest(tool), request = { ...base, data: { ...base.data, prepareExecution } };
 		const proposal = await controller.source.propose(request);
 		if (!proposal || Array.isArray(proposal) || !("actions" in proposal)) throw new Error("missing proposal");
 		controller.finishTurn("session", "turn-1");
@@ -362,15 +466,16 @@ describe("speculative action host", () => {
 		expect(prepareExecution).toHaveBeenCalledOnce();
 		for (let turn = 2; turn <= 5; turn++) {
 			const turnID = `turn-${turn}`;
-			const next = await controller.source.propose({ ...request, startInput: { ...request.startInput, turnID } });
-			expect(Boolean(next)).toBe(turn < 5);
-			expect(prepareExecution).toHaveBeenCalledTimes(Math.min(turn, 4));
+			const next = controller.source.propose({ ...request, startInput: { ...request.startInput, turnID } });
+			if (turn === 5) expect(await next).toBeDefined();
+			else await expect(next).rejects.toMatchObject({ cause: { code: "drafter_negative_utility" } });
+			expect(prepareExecution).toHaveBeenCalledTimes(turn === 5 ? 2 : 1);
 			controller.finishTurn("session", turnID);
 			await Promise.resolve();
 		}
-		expect(controller.snapshot().skippedBatches).toBe(1);
+		expect(controller.snapshot().skippedBatches).toBe(3);
 		controller.finishSession();
-		expect(controller.snapshot().samples).toBe(4); // Utility evidence spans the session's prompts.
+		expect(controller.snapshot().samples).toBe(2); // Utility evidence spans the session's prompts.
 		const valid = reply.content[0]!;
 		for (const [content, stopReason] of [
 			[[], "stop"], [[valid, valid], "toolUse"], [[], "error"], [[], "aborted"],
@@ -532,8 +637,10 @@ describe("speculative action host", () => {
 		const worldDisposed = vi.fn(), committed = vi.fn();
 		const actor = vi.fn(() => tool.execute("actor", args));
 		let offered: ToolSettlement | undefined;
-		const rule = { ...PI_READ_RANGE_PROJECTION_RULE, projectOutput: async (input: Parameters<typeof PI_READ_RANGE_PROJECTION_RULE.projectOutput>[0]) => {
-			offered ??= PI_READ_RANGE_PROJECTION_RULE.projectOutput(input);
+		const rule: ActionProjectionRule<ToolSettlement> = { ...READ_RANGE_ACTION_KEY_PROJECTOR,
+			captureCoverage: (_action, output) => (output.result.details as { query?: ToolSettlement } | undefined)?.query,
+			projectOutput: async ({ coverage }) => {
+			offered ??= coverage as ToolSettlement;
 			if (phase === "opaque" && offered) Object.setPrototypeOf(offered, { opaque: true });
 			entered.resolve();
 			if (phase === "closing") await release.promise;
@@ -541,8 +648,8 @@ describe("speculative action host", () => {
 		} };
 		const base = mockRuntimeWorld(async (context) => {
 			await new Promise<void>((resolve) => setTimeout(resolve, 5)); // Measured reusable work, not forced admission.
-			return { result: withPiProjectionCoverage("read", context.args,
-				await tool.execute(context.callID, context.args as never, context.signal)), isError: false };
+			const result = await tool.execute(context.callID, context.args as never, context.signal);
+			return { result: { ...result, details: { ...result.details, query: { result: expected, isError: false } } }, isError: false };
 		}, worldDisposed);
 		const world = { ...base, speculation: { ...base.speculation, execute: async (context: Parameters<typeof base.speculation.execute>[0]) => {
 			const branch = await base.speculation.execute(context);
@@ -587,8 +694,6 @@ describe("speculative action host", () => {
 				} });
 			}
 			if (!fallback) {
-				expect(rule.captureCoverage(PI_ACTION_SEMANTICS.buildKey("read", args, cwd)!, { result: first, isError: false }))
-					.toMatchObject({ startLine: 2, endLineExclusive: 3, totalLines: 4 });
 				await waitFor(() => events.some((event) => event.type === "actor_action"));
 				expect(events.find((event) => event.type === "actor_action")).toMatchObject({ settlement: {
 					provider: { kind: "speculative", match: { kind: "projected", projector: "read.range" } },
@@ -1103,7 +1208,7 @@ describe("speculative action host", () => {
 		let args = { path: "@notes.txt", offset: 1 };
 		const actor = vi.fn(async () => {
 			if (unstable) await writeFile(file, "B\nsecond");
-			const output = withPiProjectionCoverage("read", args, await tool.execute("read", args));
+			const output = await tool.execute("read", args);
 			if (unstable) await writeFile(file, "A\nsecond");
 			return output;
 		});
@@ -1301,20 +1406,21 @@ describe("speculative action host", () => {
 
 	it.each(["shared", "epoch", "directory", "projection"])("owns Pattern contracts and partitions %s learning", async (partition) => {
 		const cwd = await temporaryWorkspace(), tool = createReadTool(cwd), configuration = patternAwareSettings({ enabled: true });
+		const outputRule = { ...READ_RANGE_ACTION_KEY_PROJECTOR, projectOutput: () => undefined };
 		const canonicalize = vi.fn(PI_ACTION_SEMANTICS.definition("read")!.canonicalize);
 		const registry = (epoch: string) => new ActionSemanticsRegistry([{ ...PI_ACTION_SEMANTICS.definition("read")!, epoch, canonicalize }]);
 		const input = { sessionID: "first", cwd, stateDirectory: cwd, workspaceIdentity: cwd,
-			actionSemantics: registry("original.read"), projectionRules: [] as typeof PI_READ_RANGE_PROJECTION_RULE[] };
+			actionSemantics: registry("original.read"), projectionRules: [] as typeof outputRule[] };
 		const peer = { ...input, sessionID: "peer", cwd: partition === "directory" ? path.join(cwd, "nested") : cwd,
 			actionSemantics: registry(partition === "epoch" ? "peer.read" : "original.read"),
-			projectionRules: partition === "projection" ? [PI_READ_RANGE_PROJECTION_RULE] : [] };
+			projectionRules: partition === "projection" ? [outputRule] : [] };
 		const controllers = [createPatternPlanSource(input), createPatternPlanSource(peer)];
 		const predict = vi.spyOn(PatternAwareStore.prototype, "predict"), stores: PatternAwareStore[] = [];
 		Object.assign(input, { actionSemantics: registry("replaced.read"), cwd: path.join(cwd, "replaced") });
-		input.projectionRules.push(PI_READ_RANGE_PROJECTION_RULE);
+		input.projectionRules.push(outputRule);
 		try {
 			for (const [index, controller] of controllers.entries()) {
-				await controller.source.propose(patternRequest(tool, configuration, String(index)));
+				await controller.source.propose(planRequest(tool, configuration, String(index)));
 				stores.push(predict.mock.contexts.at(-1) as PatternAwareStore);
 			}
 			expect(stores[0] === stores[1]).toBe(partition === "shared");
@@ -1329,7 +1435,7 @@ describe("speculative action host", () => {
 	it("owns an admitted Pattern learning configuration and batch through immediate disposal", async () => {
 		const cwd = await temporaryWorkspace(), tool = createReadTool(cwd);
 		const patternAware = patternAwareSettings({ enabled: true, multiStepEnabled: false });
-		const lease = await patternStoreLease(cwd, patternAware), request = patternRequest(tool, patternAware, "session", { read: "schema" });
+		const lease = await patternStoreLease(cwd, patternAware), request = planRequest(tool, patternAware, "session", { read: "schema" });
 		const controller = createPatternPlanSource({ sessionID: "session", cwd, stateDirectory: cwd,
 			actionSemantics: PI_ACTION_SEMANTICS, projectionRules: [] });
 		try {
@@ -1345,7 +1451,7 @@ describe("speculative action host", () => {
 
 	it("names the files a Bash run reports so PatternAware can bind the next call to them", async () => {
 		const cwd = await temporaryWorkspace(), tool = createBashTool(cwd), patternAware = patternAwareSettings({ enabled: true, multiStepEnabled: false });
-		const store = new PatternAwareStore(patternAware, undefined, patternAwareActionSemantics(PI_ACTION_SEMANTICS, cwd)), request = patternRequest(tool, patternAware);
+		const store = new PatternAwareStore(patternAware, undefined, patternAwareActionSemantics(PI_ACTION_SEMANTICS, cwd)), request = planRequest(tool, patternAware);
 		const controller = createPatternPlanSource({ sessionID: "session", cwd, store, actionSemantics: PI_ACTION_SEMANTICS, projectionRules: [] });
 		const text = 'src/a.ts(10,5): error TS2322\n    at run (test/b.test.ts:12:5)\n  File "e.py", line 3\nsee https://example.com/c.js, e.g. 1.2.3 x.y\n--- a/g.ts\n+++ b/g.ts';
 		await controller.source.observe!({ ...request, consumeInput: { sessionID: "session", turnID: request.startInput.turnID, tool: "bash", args: { command: "npm test" }, tools: [tool] },
@@ -1357,7 +1463,7 @@ describe("speculative action host", () => {
 	it("records a closing turn's observation without predicting from it", async () => {
 		const cwd = await temporaryWorkspace(), tool = createReadTool(cwd), patternAware = patternAwareSettings({ enabled: true, multiStepEnabled: true });
 		const store = new PatternAwareStore(patternAware, undefined, patternAwareActionSemantics(PI_ACTION_SEMANTICS, cwd)), predict = vi.spyOn(store, "predictAfterBatch");
-		const request = patternRequest(tool, patternAware, "session", { read: "schema" });
+		const request = planRequest(tool, patternAware, "session", { read: "schema" });
 		const controller = createPatternPlanSource({ sessionID: "session", cwd, store, actionSemantics: PI_ACTION_SEMANTICS, projectionRules: [] });
 		try {
 			for (const signal of [AbortSignal.abort(), new AbortController().signal]) await controller.source.observe!({ ...request, signal,
@@ -1376,7 +1482,7 @@ describe("speculative action host", () => {
 		const cwd = await temporaryWorkspace(), tool = createReadTool(cwd);
 		const patternAware = patternAwareSettings({ enabled: true, multiStepEnabled: false, beamWidth: 4 });
 		const store = new PatternAwareStore(patternAware, undefined, patternAwareActionSemantics(PI_ACTION_SEMANTICS, cwd));
-		const request = patternRequest(tool, patternAware, "session", { read: "schema" });
+		const request = planRequest(tool, patternAware, "session", { read: "schema" });
 		const controller = createPatternPlanSource({ sessionID: "session", cwd, store, actionSemantics: PI_ACTION_SEMANTICS, projectionRules: [] });
 		const concrete = { path: "rare.txt" }, action = PI_ACTION_SEMANTICS.buildKey("read", concrete, cwd, "schema")!;
 		const binding = (identity: string, executionMs: number, permissionHash = action.hash, available = () => true) =>
@@ -1432,31 +1538,33 @@ describe("speculative action host", () => {
 		} finally { await controller.dispose(); }
 	});
 
-	it("reruns the learned command whose operations an Actor edit left stale, for those operations, until their results hold", async () => {
+	it.each(["captured_resources", "current_workspace", "live_input"] as const)("prepares stale learned work after an Actor edit (%s)", async preparation => {
 		const cwd = await temporaryWorkspace(), tool = createReadTool(cwd), patternAware = patternAwareSettings({ enabled: true, multiStepEnabled: false });
 		const store = new PatternAwareStore(patternAware, undefined, patternAwareActionSemantics(PI_ACTION_SEMANTICS, cwd));
-		const request = patternRequest(tool, patternAware, "session", { bash: "schema", write: "schema" }), build = { command: "make -s" };
+		const request = planRequest(tool, patternAware, "session", { bash: "schema", write: "schema" }), build = { command: "make -s" };
 		const controller = createPatternPlanSource({ sessionID: "session", cwd, store, actionSemantics: PI_ACTION_SEMANTICS, projectionRules: [] });
 		let compiled = true;
 		const operation = (identity: string, executionMs: number, stale: () => boolean) => Object.freeze({ backend: "test", identity, executionMs,
-			expectedDurationMs: executionMs + 10, permissionHash: PI_ACTION_SEMANTICS.buildKey("bash", build, cwd, "schema")!.hash, available: true, stale: async () => stale() });
+			expectedDurationMs: executionMs + 10, permissionHash: PI_ACTION_SEMANTICS.buildKey("bash", build, cwd, "schema")!.hash, available: true, stale: async () => stale(),
+			...(preparation === "captured_resources" ? {} : { preparation: "current_workspace" as const }), ...(preparation === "live_input" ? { fed: true as const } : {}) });
 		const observe = (name: string, concrete: Record<string, unknown>, extra: object = {}) => controller.source.observe!({ ...request,
 			action: PI_ACTION_SEMANTICS.buildKey(name, concrete, cwd, "schema")!, consumeInput: { sessionID: "session", turnID: request.startInput.turnID, tool: name, args: concrete, tools: [tool] },
 			tool: name, concrete, output: { result: textResult("done"), isError: false }, durationMs: 20, order: 0, ...extra });
 		try {
 			for (const [name, args, expected] of [["bash", build, true], ["read", { path: "a.c" }, false]] as const)
 				expect(controller.source.observesOperations?.(PI_ACTION_SEMANTICS.buildKey(name, args, cwd, "schema")!)).toBe(expected);
-			expect(await observe("bash", build, { operations: [operation("compile", 50, () => !compiled), operation("link", 30, () => false)] })).toBeUndefined();
+			const compile = operation("compile", 50, () => !compiled), current = preparation === "current_workspace";
+			expect(await observe("bash", build, { operations: [operation("scan", 20, () => !compiled), compile, operation("link", 30, () => false)] })).toBeUndefined();
 			compiled = false;
-			expect(await observe("write", { path: "a.c", content: "int x;" })).toMatchObject({ actions: [{ type: "tool_call", tool: "bash", input: build,
-				producesOperations: true, expectedLatencyBenefitMs: 50, expectedDurationMs: 60 }] });
+			expect(await observe("write", { path: "a.c", content: "int x;" })).toMatchObject({ actions: [{ type: current ? "operation" : "tool_call", tool: "bash", input: build,
+				...(current ? { operation: compile } : {}), producesOperations: true, expectedLatencyBenefitMs: current ? 50 : 70, expectedDurationMs: 60 }] });
 			compiled = true;
 			expect(await observe("write", { path: "notes.txt", content: "unrelated" })).toBeUndefined();
 			// A turn that closed before its edit's rerun was admitted leaves the rerun to the next turn's proposal.
 			compiled = false;
 			const closed = new AbortController(); closed.abort();
 			expect(await observe("write", { path: "a.c", content: "int y;" }, { signal: closed.signal })).toBeUndefined();
-			expect(await controller.source.propose(request)).toMatchObject({ actions: [{ tool: "bash", input: build, producesOperations: true }] });
+			expect(await controller.source.propose(request)).toMatchObject({ actions: [{ type: current ? "operation" : "tool_call", tool: "bash", input: build, producesOperations: true }] });
 		} finally { await controller.dispose(); }
 	});
 
@@ -1482,7 +1590,7 @@ describe("speculative action host", () => {
 		const bootstrap = await patternStoreLease(cwd, older), oldStore = bootstrap.store;
 		const controller = createPatternPlanSource({ sessionID: "probe", cwd, stateDirectory: cwd,
 			actionSemantics: PI_ACTION_SEMANTICS, projectionRules: [] });
-		const propose = (patternAware: typeof older) => controller.source.propose(patternRequest(tool, patternAware, "probe", { read: "schema" }));
+		const propose = (patternAware: typeof older) => controller.source.propose(planRequest(tool, patternAware, "probe", { read: "schema" }));
 		try {
 			for (let index = 0; index < 3; index++) {
 				const sessionID = `training-${index}`, file = `file-${index}.txt`;
@@ -1525,7 +1633,7 @@ describe("speculative action host", () => {
 		const patternAware = patternAwareSettings({ enabled: true }), store = new PatternAwareStore(patternAware);
 		const flush = vi.spyOn(store, "flush"), controller = createPatternPlanSource({ sessionID: "session", cwd, store: available.promise,
 			actionSemantics: PI_ACTION_SEMANTICS, projectionRules: [] });
-		const pending = Promise.resolve(controller.source.propose(patternRequest(tool, patternAware)));
+		const pending = Promise.resolve(controller.source.propose(planRequest(tool, patternAware)));
 		try {
 			await nextTurn();
 			let closed = false;
@@ -1551,7 +1659,7 @@ describe("speculative action host", () => {
 		const controller = createPatternPlanSource({ sessionID: "session", cwd, stateDirectory: cwd,
 			actionSemantics: PI_ACTION_SEMANTICS, projectionRules: [] });
 		const propose = (patternAware: typeof older) => {
-			const configuration = { ...patternAware }, pending = controller.source.propose(patternRequest(tool, configuration));
+			const configuration = { ...patternAware }, pending = controller.source.propose(planRequest(tool, configuration));
 			Object.assign(configuration, { enabled: false, maxContextLength: 99 });
 			return pending;
 		};
@@ -1701,8 +1809,6 @@ describe("speculative action host", () => {
 	it("turns one sidecar fork batch into safe parallel actions with real execution ahead", async () => {
 		const cwd = await temporaryWorkspace();
 		const permissionGate = gated();
-		await writeFile(path.join(cwd, "wrong.txt"), "wrong", "utf8");
-		await writeFile(path.join(cwd, "actor-miss.txt"), "actor", "utf8");
 		const events: SpeculativeActionEvent<string>[] = [];
 		const materialized: MaterializedSpeculativeCandidate<string>[] = [];
 		const actorForkPlans = createActorForkPlanSource();
@@ -1722,36 +1828,11 @@ describe("speculative action host", () => {
 			settings: selfSettings,
 			requestID: () => "actor-request",
 			actorForkPlanSource: actorForkPlans,
-			fetch: vi.fn(async (input) =>
-				Response.json(
-					new URL(String(input)).pathname === SELF_SPECULATION_DEFAULTS.forkPath
-						? {
-								details: {
-									bundle: {
-										candidates: [
-											{
-												candidate_ids: [`fork:${forkPath}`],
-												sources: ["self-speculation"],
-												tool_calls: [
-													{ name: "read", arguments: { path: forkPath }, index: 0 },
-													{ name: "read", arguments: { path: `${forkPath}.sibling` }, index: 1 },
-												],
-												fork: {
-												logprobs: {
-													token_count: 1,
-													mean: forkMinimumLogprob,
-													minimum: forkMinimumLogprob,
-													tool_name: { minimum_probability: Math.exp(forkMinimumLogprob) },
-												},
-												},
-											},
-										],
-									},
-								},
-							}
-						: {},
-				),
-			),
+			fetch: vi.fn(async input => Response.json(new URL(String(input)).pathname === SELF_SPECULATION_DEFAULTS.forkPath
+				? forkReceipt([{ candidate_ids: [`fork:${forkPath}`], sources: ["self-speculation"],
+					tool_calls: [forkPath, `${forkPath}.sibling`].map((path, index) => ({ name: "read", arguments: { path }, index })),
+					fork: { logprobs: { token_count: 1, mean: forkMinimumLogprob, minimum: forkMinimumLogprob,
+						tool_name: { minimum_probability: Math.exp(forkMinimumLogprob) } } } }]) : {})),
 		});
 		const tool: AgentTool<typeof readSchema> = { name: "read", label: "read", description: "read", parameters: readSchema,
 			execute: async (_id, input) => textResult(input.path) };
@@ -1787,6 +1868,9 @@ describe("speculative action host", () => {
 			expect(prepare.mock.calls.length > 0).toBe(actionSourceEnabled);
 		};
 		const finishTurn = async (turnID: string) => { await host.finishTurn(turnID); coordinator.endTurn(); };
+		const actorRead = (scenario: string, path: string, native: Parameters<typeof host.execute>[2]) => host.execute({
+			turnID: `fork-${scenario}`, id: `actor-${scenario}`, tool: "read", args: { path }, tools: [tool],
+		}, undefined, native);
 
 		await triggerFork("fork-hit");
 		try {
@@ -1800,13 +1884,7 @@ describe("speculative action host", () => {
 		const forkBatch = materialized.filter((candidate) => candidate.turnID === "fork-hit" && candidate.source === "self-speculation");
 		expect(new Set(forkBatch.map((candidate) => candidate.proposalID)).size).toBe(1);
 		expect(forkBatch.map((candidate) => candidate.actionID)).toEqual(["0:fork", "1:fork"]);
-		const hit = await host.execute({
-			turnID: "fork-hit",
-			id: "actor-hit",
-			tool: "read",
-			args: { path: "notes.txt" },
-			tools: [tool],
-		}, undefined, async () => { throw new Error("Unexpected Actor fallback"); });
+		const hit = await actorRead("hit", "notes.txt", async () => { throw new Error("Unexpected Actor fallback"); });
 		expect(hit.content).toEqual([{ type: "text", text: "notes.txt" }]);
 		await waitFor(() => events.some((event) => event.type === "actor_action" && event.turnID === "fork-hit"));
 		const adopted = events.find((event) => event.type === "actor_action" && event.turnID === "fork-hit");
@@ -1820,13 +1898,7 @@ describe("speculative action host", () => {
 			events.some((event) => event.type === "candidate" && event.turnID === "fork-miss" && event.state.status === "succeeded"),
 		);
 		const missed = vi.fn(async () => textResult("actor-miss.txt"));
-		expect((await host.execute({
-			turnID: "fork-miss",
-			id: "actor-miss",
-			tool: "read",
-			args: { path: "actor-miss.txt" },
-			tools: [tool],
-		}, undefined, missed)).content).toEqual([{ type: "text", text: "actor-miss.txt" }]);
+		expect((await actorRead("miss", "actor-miss.txt", missed)).content).toEqual([{ type: "text", text: "actor-miss.txt" }]);
 		expect(missed).toHaveBeenCalledOnce();
 		await finishTurn("fork-miss");
 
@@ -1916,7 +1988,7 @@ describe("speculative action host", () => {
 		const prepareExecution = vi.fn(), shared = createDrafterPlanSource({ sessionID: "shared", draftModel: selectModel, getDraftOptions: options, complete });
 		const propose = (owner: AbortController, proposalIndex: number, turnID = "turn-1") => shared.source.propose({
 			startInput: { ...startInput(tool, turnID), sessionID: "shared" },
-			settings: { ...settings(2), resourceCacheMaxEntries: 4, predictionTimeoutMs: 1000 },
+			settings: { ...settings(2), resourceCacheMaxEntries: 4, predictionTimeoutMs: 1000, sourceConfig: { drafterGateEnabled: false } },
 			data: { tools: new Map([["read", tool]]), schemaHashes: {}, prepareExecution }, definitions: [], candidateNames: ["read"],
 			proposalIndex, proposalCount: owners.length, signal: owner.signal,
 		});
@@ -1992,23 +2064,11 @@ async function patternRebaseFixture() {
 	const patternSettings = { ...PATTERN_AWARE_DEFAULTS, minOccurrences: 2, multiStepEnabled: true };
 	const patternStore = new PatternAwareStore(patternSettings);
 	for (const [trainingSession, filePath] of [["training-a", "alpha.txt"], ["training-b", "beta.txt"]] as const) {
-		patternStore.observe({
-			sessionID: trainingSession,
-			turnID: `${trainingSession}:scan`,
-			tool: "grep",
-			input: { pattern: "one", path: "." },
-			outcome: "success",
-			outputPaths: [filePath],
-			durationMs: 10,
-		});
-		patternStore.observe({
-			sessionID: trainingSession,
-			turnID: `${trainingSession}:read`,
-			tool: "read",
-			input: { path: filePath },
-			outcome: "success",
-			durationMs: 10,
-		});
+		for (const [step, tool, input, outputPaths] of [
+			["scan", "grep", { pattern: "one", path: "." }, [filePath]],
+			["read", "read", { path: filePath }, undefined],
+		] as const) patternStore.observe({ sessionID: trainingSession, turnID: `${trainingSession}:${step}`,
+			tool, input, outputPaths, outcome: "success", durationMs: 10 });
 	}
 	const grepTool: AgentTool<typeof grepSchema> = { name: "grep", label: "grep", description: "grep", parameters: grepSchema, execute: async () => textResult("notes.txt:1:one") };
 	const readTool: AgentTool<typeof readSchema> = { name: "read", label: "read", description: "read", parameters: readSchema, execute: async () => textResult("one") };
@@ -2016,10 +2076,4 @@ async function patternRebaseFixture() {
 	return { cwd, patternSettings, patternStore, grepTool, readTool, materialized };
 }
 
-async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
-	while (!predicate()) {
-		if (Date.now() >= deadline) throw new Error("timed out waiting for speculative runtime");
-		await new Promise((resolve) => setTimeout(resolve, 5));
-	}
-}
+const waitFor = (predicate: () => boolean) => vi.waitUntil(predicate, { timeout: 2_000, interval: 5 });

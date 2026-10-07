@@ -202,7 +202,7 @@ describe("SpeculationScheduler", () => {
 
 	it("separates producer, consumer, and adoption work while retaining exact/class quantiles and bounded history", () => {
 		const scheduler = new SpeculationScheduler<object>();
-		const identity = { tool: "bash", executionFingerprint: "linux-world", actionKeyHash: "producer" };
+		const identity = { tool: "bash", semanticsEpoch: "shell", executionFingerprint: "linux-world", actionKeyHash: "producer" };
 		const actorIdentity = { ...identity, actionKeyHash: "consumer" };
 		const exact = { ...actorIdentity, operation: "route:exact" }, inputs = { ...actorIdentity, operation: "route:inputs" };
 		scheduler.observeActorService(identity, 380, 300);
@@ -221,6 +221,7 @@ describe("SpeculationScheduler", () => {
 		expect(joinDecision(scheduler, identity, { actorIdentity, adoptionIdentity: exact })).toMatchObject({
 			allowed: false, expectedActorMs: 100, expectedRemainingMs: 90, expectedAdoptionMs: 20, expectedNetBenefitMs: -10,
 		});
+		expect(joinDecision(scheduler, { ...identity, semanticsEpoch: "shell:operation:process" })).toMatchObject({ actorSamples: 0, speculativeSamples: 0, adoptionSamples: 0 });
 		for (const [adoptionIdentity, expectedAdoptionMs] of [
 			[{ ...exact, actionKeyHash: "new pair" }, 20],
 			[{ ...inputs, actionKeyHash: "new pair" }, 200],
@@ -338,7 +339,7 @@ describe("SpeculationScheduler", () => {
 		for (const duration of [20.8, 20.1, 20.1, 20.1]) scheduler.observeActorService({ ...ls, actionKeyHash: "git-status" }, duration);
 		const npmTest = { ...ls, actionKeyHash: "npm-test" }, running = { state: "running" as const, elapsedMs: 616 };
 		expect(joinDecision(scheduler, npmTest, { ...running, expectedSpeculativeDurationMs: 2000 })).toMatchObject({ allowed: true, expectedRemainingMs: 1384, waitBudgetMs: 1755 });
-		expect(joinDecision(scheduler, npmTest, { ...running, expectedSpeculativeDurationMs: undefined })).toMatchObject({ allowed: true, waitBudgetMs: 591 });
+		expect(joinDecision(scheduler, npmTest, { ...running, expectedSpeculativeDurationMs: undefined })).toMatchObject({ allowed: true, reason: "warmup_probe", waitBudgetMs: 25 });
 	});
 
 	it("combines distinct Actor opportunities without duplicating correlated source evidence", () => {
@@ -369,6 +370,10 @@ describe("SpeculationScheduler", () => {
 		});
 		scheduler.observeActorService(first, 100);
 		expect(joinDecision(scheduler, first)).toMatchObject({ allowed: true, reason: "warmup_probe", waitBudgetMs: 18.25, expectedNetBenefitMs: 99 });
+		scheduler.observeActorService({ ...first, actionKeyHash: "slow" }, 10_000);
+		scheduler.observeSpeculativeService({ ...first, semanticsEpoch: "operation" }, 2_000);
+		expect(joinDecision(scheduler, second, { expectedSpeculativeDurationMs: undefined, elapsedMs: 50 })).toMatchObject({
+			allowed: true, reason: "warmup_probe", waitBudgetMs: 17, speculativeSamples: 0, actorSamples: 2 });
 
 		const cold = new SpeculationScheduler<object>({ candidateJoinPolicy: { uncalibratedWaitMs: 0 } });
 		for (const [duration, count] of [[900, 1], [900, 63], [450, 64], [1800, 64]] as const) {
@@ -376,6 +381,8 @@ describe("SpeculationScheduler", () => {
 			expect(joinDecision(cold, second)).toMatchObject({ allowed: false, reason: "warmup_probe", actorSamples: 0 });
 			expect(cold.evaluate([forecast({ ...second, expectedDurationMs: 200 })])).toMatchObject({ expectedDurationMs: duration });
 		}
+		cold.observeActorService(first, 10_000);
+		expect(joinDecision(cold, second, { expectedSpeculativeDurationMs: undefined })).toMatchObject({ allowed: false, waitBudgetMs: 0, actorSamples: 1 });
 	});
 
 	it("promotes shared work on foreground evidence and lets background work yield", () => {

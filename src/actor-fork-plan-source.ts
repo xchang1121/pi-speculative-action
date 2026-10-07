@@ -11,29 +11,13 @@ export interface ActorForkActionCall {
 	readonly input: Readonly<Record<string, unknown>>;
 }
 
-export interface ActorForkActionEvidence {
-	readonly candidateIDs: readonly string[];
-	readonly sources: readonly string[];
-	readonly provenance: readonly unknown[];
-	readonly actionIdentities: readonly unknown[];
-	readonly draftTokenCount: number;
-	readonly confidence?: number;
-	readonly score?: Readonly<Record<string, unknown>>;
-	readonly fork?: Readonly<Record<string, unknown>>;
-}
-
 export interface ActorForkActionBatch {
 	readonly id: string;
 	readonly calls: readonly ActorForkActionCall[];
-	readonly evidence: readonly ActorForkActionEvidence[];
 }
 
-export interface ActorProbeSnapshot {
+export interface ActorProbeSnapshot extends Readonly<Pick<PendingFork, "generatedText" | "content" | "reasoning" | "outputChunks">> {
 	readonly attempt: number;
-	readonly generatedText: string;
-	readonly content: string;
-	readonly reasoning: string;
-	readonly outputChunks: number;
 }
 
 export interface ActorProbeSchedule {
@@ -99,7 +83,7 @@ export class ActorForkPlanSource {
 				const kept = batch.calls.filter((call) => allowed.has(call.tool)), whole = kept.length === batch.calls.length;
 				return kept.length ? [{ id: `self-speculation:${startInput.turnID}:${batch.id}`, source: "self-speculation", revision: 0,
 					actions: kept.map((call) => ({ id: call.id, type: "tool_call" as const, tool: call.tool, input: widenReadGuess(call.tool, call.input),
-						feedback: { batchID: batch.id, ...(whole ? { batchCalls: kept.map(({ id }) => id) } : {}), callID: call.id, callIndex: call.index, evidence: batch.evidence } })) }] : [];
+						feedback: whole ? { batchCalls: kept.map(({ id }) => id) } : undefined })) }] : [];
 			});
 		},
 	};

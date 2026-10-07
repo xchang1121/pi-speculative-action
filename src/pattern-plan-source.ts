@@ -31,7 +31,7 @@ export interface PatternPlanSourceController {
 	readonly actorActionSettled: (feedback: ActorActionFeedback<string>) => void;
 	/** The calls PatternAware expects next, without proposing them. */
 	readonly hints: (input: { readonly sessionID: string; readonly schemaHashes: Readonly<Record<string, string>>; readonly settings: SpeculativeActionSettings })
-		=> Promise<readonly { readonly tool: string; readonly input: Readonly<Record<string, unknown>> }[]>;
+		=> Promise<readonly Pick<PatternAwareCandidate, "tool" | "input" | "horizon" | "expectedLatencyBenefitMs">[]>;
 	readonly finishSession: () => Promise<void>;
 	readonly dispose: () => Promise<void>;
 }
@@ -156,18 +156,22 @@ export function createPatternPlanSource({
 		});
 	};
 
-	/** Once the Actor changed the workspace, rerun the latest learned command whose operations' results no longer cover it, as
-	 * the Actor most often repeats it: a later call of any command that launches the same operations reuses their fresh results.
-	 * The rerun redoes those operations in the order they need; proposed apart, they would repeat its work before their inputs are ready. */
+	/** Prepare a stale native launch against the Actor's edited files, without repeating its parent's earlier setup.
+	 * Captured-resource launches keep their parent ordering. Every result still requires current dependency evidence at adoption. */
 	const reruns = async (): Promise<readonly [rerun: PlanAction[], apart: (action: PlanAction) => boolean]> => {
 		if (!workspaceChanged && !issuedRerun) return NO_RERUN;
 		workspaceChanged = false; issuedRerun = undefined;
 		for (const command of [...learnedCommands.values()].reverse()) {
 			const children = [...operationBindings.values()].filter(item => item.parentHash === command.parentHash && item.binding.available !== false);
-			const staleMs = (await Promise.all(children.map(async ({ binding }) => await binding.stale?.() !== false ? binding.executionMs : 0))).reduce((total, ms) => total + ms, 0);
-			if (staleMs > 0) return [[{ id: `rerun:${command.parentHash}`, type: "tool_call", tool: command.tool, input: command.input, horizon: 0, producesOperations: true,
-				expectedLatencyBenefitMs: staleMs, feedback: issuedRerun = {}, expectedDurationMs: Math.max(...children.map(({ binding }) => binding.expectedDurationMs)) }],
-				action => !children.some(({ binding }) => binding.identity === action.operation?.identity && !binding.fed)];
+			const stale = (await Promise.all(children.map(async ({ binding }) => binding.executionMs > 0 && await binding.stale?.() !== false ? binding : undefined)))
+				.filter((binding): binding is ExecutionOperationBinding => !!binding).sort((left, right) => right.executionMs - left.executionMs);
+			if (!stale.length) continue;
+			const operation = stale.find(binding => binding.preparation === "current_workspace" && !binding.fed);
+			return [[{ id: `rerun:${command.parentHash}`, type: operation ? "operation" : "tool_call", ...(operation ? { operation } : {}),
+				tool: command.tool, input: command.input, horizon: 0, producesOperations: true, feedback: issuedRerun = {},
+				expectedLatencyBenefitMs: operation?.executionMs ?? stale.reduce((total, binding) => total + binding.executionMs, 0),
+				expectedDurationMs: operation?.expectedDurationMs ?? Math.max(...children.map(({ binding }) => binding.expectedDurationMs)) }],
+				action => operation ? action.operation?.identity !== operation.identity : !children.some(({ binding }) => binding.identity === action.operation?.identity && !binding.fed)];
 		}
 		return NO_RERUN;
 	};
@@ -341,8 +345,11 @@ export function createPatternPlanSource({
 	};
 	return {
 		source,
-		hints: ({ sessionID, schemaHashes, settings }) => admit(settings, async (patternSettings) => !patternSettings.enabled ? []
-			: (await resolveStore(patternSettings)).predict(sessionID, schemaHashes, patternSettings).slice(0, 4).map(({ tool, input }) => ({ tool, input }))),
+		hints: ({ sessionID, schemaHashes, settings }) => admit(settings, async (patternSettings) => {
+			await analysisTail;
+			return !patternSettings.enabled ? [] : (await resolveStore(patternSettings)).predict(sessionID, schemaHashes, patternSettings)
+				.slice(0, 4).map(({ tool, input, horizon, expectedLatencyBenefitMs }) => ({ tool, input, horizon, expectedLatencyBenefitMs }));
+		}),
 		turnStarted: observeTurn,
 		turnFinished: observeTurn,
 		// Serving the Actor is recorded before the owning prediction settles, which credits it even when unmatched.
@@ -411,7 +418,6 @@ function patternPlanAction(
 		type: "tool_call",
 		tool: candidate.tool,
 		input: widenReadGuess(candidate.tool, candidate.input),
-		diagnostic: candidate.diagnostic,
 		horizon: candidate.horizon,
 		latestHorizon: candidate.latestHorizon,
 		empiricalProbability: candidate.empiricalProbability,

@@ -8,7 +8,7 @@ import { type ActionKey, type ActionKeyProjector, type ActionSemanticsRegistry, 
 import { BoundedRecencyMap } from "./bounded-recency-map.ts";
 import { patternSessionBudgets, type PatternPendingValidation, type PatternRecurrentAction, type PatternSessionState } from "./pattern-session-state.ts";
 import { containsLogicalPath, relativeFilesystemPath } from "./path-utils.ts";
-import { PpmCountTrie, type PpmCountTrieRow, type PpmProbabilityEstimate } from "./ppm-count-trie.ts";
+import { PpmCountTrie, type PpmCountTrieRow } from "./ppm-count-trie.ts";
 import type { PredictionSettlement, ResolutionStage } from "./settlement.ts";
 import { asRecord, isObject, stableEqual as sameValue, stableStringify } from "./stable-json.ts";
 import { booleanOr, nonNegativeInteger, positiveInteger, probability as probabilitySetting, settingsParser } from "./setting-input.ts";
@@ -149,7 +149,6 @@ export type PatternAwareCandidate = {
 	readonly dependencies: ReadonlyArray<PatternAwareDependency>;
 	readonly continuation: PatternAwareContinuation;
 	readonly depth: number;
-	readonly diagnostic: string;
 };
 
 export type PatternAwareContinuation = {
@@ -512,7 +511,7 @@ export class PatternAwareStore {
 				groups.set(identity, group);
 			}
 		}
-		let ppmEstimates: ReadonlyMap<string, PpmProbabilityEstimate> | undefined;
+		let ppmEstimates: ReadonlyMap<string, number> | undefined;
 		const estimatePpm = (tool: string) => (ppmEstimates ??=
 			this.sequenceModel.distribution(history.map((event) => signatureToken(signature(event))), this.clock, settings.decayHalfLifeEvents)).get(tool);
 		const contextEvidence = new Map<number, Map<string, number>>();
@@ -528,10 +527,8 @@ export class PatternAwareStore {
 			const ordered = group.sort((left, right) => right.pattern.context.length - left.pattern.context.length || right.pattern.occurrences - left.pattern.occurrences);
 			const representative = ordered[0]!;
 			const patterns = ordered.map((item) => item.pattern);
-			const { horizon, latestHorizon, gapCoverage } = groupGapTiming(patterns, settings, this.clock);
+			const { horizon, latestHorizon } = groupGapTiming(patterns, settings, this.clock);
 			const replayProbability = backoffProbability(patterns, this.clock, settings.decayHalfLifeEvents, contextEvidence);
-			const targetTool = representative.pattern.targetTool;
-			const ppmEstimate = estimatePpm(targetTool);
 			let totalWeight = 0, weightedVariants = 0, weightedDuration = 0;
 			for (const item of ordered) {
 				const occurrences = Math.max(1, item.pattern.occurrences);
@@ -557,9 +554,9 @@ export class PatternAwareStore {
 			return [actionIdentity, {
 				background, recurrentFeedback: undefined as MutablePatternFeedback | undefined, actionIdentity, type: "tool_call" as const,
 				tool: representative.pattern.targetTool, input: representative.input, patternID: representative.pattern.id,
-				supportingPatternIDs: patterns.map((pattern) => pattern.id), context: representative.pattern.context, dependencies: representative.pattern.dependencies,
-				horizon, latestHorizon, gapCoverage, replayProbability, variantProbability, conditionalProbability, empiricalProbability, adoptionProbability,
-				expectedDurationMs, ppmEstimate, mapperConfidence, evidenceConfidence: evidence, expectedLatencyBenefitMs,
+				supportingPatternIDs: patterns.map((pattern) => pattern.id), dependencies: representative.pattern.dependencies,
+				horizon, latestHorizon, conditionalProbability, empiricalProbability, adoptionProbability,
+				expectedDurationMs, expectedLatencyBenefitMs,
 			}] as const;
 		}));
 		// Session frequency supports another Actor opportunity, not a transition from hypothetical output.
@@ -592,11 +589,8 @@ export class PatternAwareStore {
 		for (const prediction of ranked) {
 			const count = emittedPerTool.get(prediction.tool) ?? 0;
 			if (count >= beamWidth) continue;
-			const beamRank = count + 1;
-			emittedPerTool.set(prediction.tool, beamRank);
-			const { input, dependencies, background, context, recurrentFeedback, ppmEstimate,
-				mapperConfidence, evidenceConfidence: evidence, variantProbability, gapCoverage, replayProbability, ...candidate } = prediction;
-			const { type: _type, actionIdentity: _identity, supportingPatternIDs, ...diagnostic } = candidate;
+			emittedPerTool.set(prediction.tool, count + 1);
+			const { input, dependencies, background, recurrentFeedback, ...candidate } = prediction;
 			const nextContinuation: PatternAwareContinuation = {
 				history: continuationHistory ??= structuredClone(history),
 				visitedPatternIDs: [...continuation.visitedPatternIDs, prediction.patternID],
@@ -611,12 +605,6 @@ export class PatternAwareStore {
 				dependencies: structuredClone(dependencies),
 				continuation: nextContinuation,
 				depth: nextContinuation.visitedPatternIDs.length,
-				diagnostic: JSON.stringify({
-					...diagnostic, source: "pattern_aware", supportingPatterns: supportingPatternIDs, context, input, replayProbability,
-					ppmProbability: ppmEstimate?.probability, ppmOrder: ppmEstimate?.order, ppmEvidence: ppmEstimate?.evidence, ppmEscapeMass: ppmEstimate?.escapeMass,
-					mapperConfidence, evidenceConfidence: evidence, variantProbability, background: background === true, beamRank, beamWidth: settings.beamWidth,
-					gapCoverage, dependencies, depth: nextContinuation.visitedPatternIDs.length,
-				}, null, 2),
 			});
 		}
 		return selected;
@@ -625,7 +613,7 @@ export class PatternAwareStore {
 	private recurrentPredictions(
 		sessionID: string | undefined,
 		schemaHashes: Readonly<Record<string, string>>,
-		estimatePpm: (tool: string) => PpmProbabilityEstimate | undefined,
+		estimatePpm: (tool: string) => number | undefined,
 		continuation: PatternAwareContinuation,
 		settings: PatternAwareSettings,
 	) {
@@ -652,16 +640,16 @@ export class PatternAwareStore {
 				(Math.max(mass, massByTool.get(item.action.tool) ?? 0) + evidence.matched + evidence.mismatched));
 			const empiricalProbability = clampProbability(continuation.pathProbability * conditionalProbability);
 			const expectedDurationMs = item.weightedDurationMs / item.weightedCount;
-			const ppmEstimate = estimatePpm(item.action.tool);
+			const ppmProbability = estimatePpm(item.action.tool);
 			const adoptionProbability = patternAdoptionProbability([item], this.clock, settings.decayHalfLifeEvents);
 			const confidence = evidenceConfidence(conditionalProbability, item.weightedCount);
-			const expectedLatencyBenefitMs = empiricalProbability * adoptionProbability * (ppmEstimate?.probability ?? 1) * confidence * Math.max(1, expectedDurationMs);
+			const expectedLatencyBenefitMs = empiricalProbability * adoptionProbability * (ppmProbability ?? 1) * confidence * Math.max(1, expectedDurationMs);
 			return {
 				background: item.count < settings.minOccurrences || evidence.mismatched > evidence.matched, recurrentFeedback: item.feedback,
 				actionIdentity: hash(JSON.stringify({ actionKey: item.action.key, type: "tool_call" })), type: "tool_call" as const, tool: item.action.tool,
-				input: item.input, patternID, supportingPatternIDs: [] as string[], context: [] as PatternAwareEventSignature[], dependencies: [] as PatternAwareDependency[],
-				horizon: 0, latestHorizon: 0, gapCoverage: 1, replayProbability: conditionalProbability, variantProbability: 1, conditionalProbability,
-				empiricalProbability, adoptionProbability, expectedDurationMs, ppmEstimate, mapperConfidence: 1, evidenceConfidence: confidence, expectedLatencyBenefitMs,
+				input: item.input, patternID, supportingPatternIDs: [] as string[], dependencies: [] as PatternAwareDependency[],
+				horizon: 0, latestHorizon: 0, conditionalProbability,
+				empiricalProbability, adoptionProbability, expectedDurationMs, expectedLatencyBenefitMs,
 			};
 		});
 	}
@@ -705,9 +693,8 @@ export class PatternAwareStore {
 			return [{
 				background: false, recurrentFeedback: feedback, actionIdentity: hash(JSON.stringify({ actionKey: key, type: "tool_call" })),
 				type: "tool_call" as const, tool: "read", input: { path: target }, patternID, supportingPatternIDs: [] as string[],
-				context: [] as PatternAwareEventSignature[], dependencies: [] as PatternAwareDependency[], horizon: 0, latestHorizon: 0, gapCoverage: 1,
-				replayProbability: conditionalProbability, variantProbability: 1, conditionalProbability, empiricalProbability, adoptionProbability,
-				expectedDurationMs: durationMs, ppmEstimate: undefined, mapperConfidence: 1, evidenceConfidence: 1,
+				dependencies: [] as PatternAwareDependency[], horizon: 0, latestHorizon: 0,
+				conditionalProbability, empiricalProbability, adoptionProbability, expectedDurationMs: durationMs,
 				expectedLatencyBenefitMs: empiricalProbability * adoptionProbability * Math.max(1, durationMs),
 			}];
 		});
@@ -1987,7 +1974,7 @@ function groupGapTiming(patterns: ReadonlyArray<MutablePattern>, settings: Patte
 	const latestHorizon = gaps.at(-1)?.[0] ?? 0;
 	let horizon = latestHorizon, covered = 0;
 	for (const [gap, weight] of gaps) { covered += weight; if (covered >= target) { horizon = gap; break; } }
-	return { horizon, latestHorizon, gapCoverage: total <= 0 ? 0 : Math.max(0, Math.min(1, covered / total)) };
+	return { horizon, latestHorizon };
 }
 
 function ownBatch(inputs: ReadonlyArray<PatternAwareEventInput>, sessionID?: string) {

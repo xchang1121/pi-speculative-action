@@ -9,7 +9,7 @@ export type DrafterRequestSettings = Readonly<typeof DRAFTER_DEFAULTS>;
 
 const { defaults: DRAFTER_DEFAULTS, parse: parseDrafterSettings } = settingsParser({
 	/** Output-informed successor actions retained after the first Drafter action. */
-	drafterMaxDepth: [1, nonNegativeInteger],
+	drafterMaxDepth: [3, nonNegativeInteger],
 	/** Output cap for each Drafter request: one proposed tool batch never needs the Actor's answer budget. */
 	drafterMaxTokens: [4096, positiveInteger],
 	/** Cumulative request and input/output token budgets for one user task. */
@@ -37,9 +37,7 @@ export const DEFAULTS = {
 	tools: KEYABLE_TOOLS,
 };
 
-export function clampCandidateLimit(value: unknown): number {
-	return positiveCount(value);
-}
+export const clampCandidateLimit = positiveCount;
 
 export function candidateToolNames(
 	settings: SpeculativeActionSettings,

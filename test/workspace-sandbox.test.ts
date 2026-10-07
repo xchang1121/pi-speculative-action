@@ -15,6 +15,7 @@ import { effectCapabilitiesCover, UNRESTRICTED_PROCESS_EFFECTS, WORKSPACE_PATH_M
 import type { ToolInvocation, ToolSettlement } from "../src/tool-settlement.ts";
 import { LinuxOverlayfsCapabilityRegistry, linuxOverlayfsCapability } from "../src/linux-overlayfs.ts";
 import { advanceFilesystemClock, captureStableFile } from "../src/filesystem-evidence.ts";
+import * as processObservation from "../src/process-observation.ts";
 import { diffWorkspaceStructures, ExecutionPathProjection, hydrateWorkspaceFileEntry } from "../src/process-observation.ts";
 import { deferredWorkspaceTransactionDriver } from "../src/workspace-transaction.ts";
 import { ResourceVersionManager } from "../src/resource-version.ts";
@@ -347,30 +348,60 @@ describe("workspace-branch ExecutionWorld", () => {
 		}
 	});
 
-	it("qualifies auto OverlayFS by the exact immutable baseline size", async ({ skip }) => {
+	it.for([false, true])("qualifies auto OverlayFS by current workspace size (live lower: %s)", async (liveLower, { skip }) => {
 		const overlay = await linuxOverlayfsCapability();
 		if (!overlay.available) return skip(overlay.detail);
-		const root = await temporaryRoot();
+		const root = await temporaryRoot(), options = { driver: "auto" as const, liveLower };
+		const fingerprint = () => sandbox.fingerprint(options, root);
+		const files = Array.from({ length: 260 }, (_, index) => ({ name: path.join(root, `${index.toString().padStart(4, "0")}.txt`), content: `${index}\n` }));
+		const write = ({ name, content }: typeof files[number]) => writeFile(name, content, "utf8");
 		await writeFile(path.join(root, "small.txt"), "small\n", "utf8");
-		expect(await sandbox.fingerprint({ driver: "auto" }, root)).toBe("git-worktree");
+		expect(await fingerprint()).toBe("git-worktree");
 		const validations = vi.spyOn(ResourceVersionManager.prototype, "validate");
 		try {
-			expect(await sandbox.fingerprint({ driver: "auto" }, root)).toBe("git-worktree");
+			expect(await fingerprint()).toBe("git-worktree");
 			expect(validations, "driver selection must not revalidate a quiet prepared tree").not.toHaveBeenCalled();
 		} finally { validations.mockRestore(); }
-		await Promise.all(
-			Array.from({ length: 100 }, (_value, index) =>
-				writeFile(path.join(root, `${index.toString().padStart(4, "0")}.txt`), `${index}\n`, "utf8"),
-			),
-		);
-		expect(await sandbox.fingerprint({ driver: "auto" }, root)).toBe("git-worktree");
-		await Promise.all(
-			Array.from({ length: 160 }, (_value, index) => {
-				const ordinal = index + 100;
-				return writeFile(path.join(root, `${ordinal.toString().padStart(4, "0")}.txt`), `${ordinal}\n`, "utf8");
-			}),
-		);
-		expect(await sandbox.fingerprint({ driver: "auto" }, root)).toMatch(/^linux-overlayfs:/);
+		await Promise.all(files.slice(0, 100).map(write));
+		await mkdir(path.join(root, "nested", ".git"), { recursive: true });
+		await Promise.all(Array.from({ length: 200 }, (_, index) => writeFile(path.join(root, "nested", ".git", `${index}`), "excluded")));
+		expect(await fingerprint()).toBe("git-worktree");
+		await Promise.all(files.slice(100).map(write));
+		expect(await fingerprint()).toMatch(/^linux-overlayfs:/);
+		const prepared = await sandbox.prepare(root, { ...options, driver: "overlayfs" });
+		await writeFile(path.join(root, "small.txt"), "changed\n");
+		const branch = await sandbox.fork({ ...options, ...prepared, cwd: root, action: requiredAction("read", { path: "small.txt" }, root),
+			execute: async ({ sandboxRoot }) => settlement(await readFile(path.join(sandboxRoot, "small.txt"), "utf8")) });
+		try { expect(branch.output).toEqual(settlement("changed\n")); } finally { await branch.dispose(); }
+		await Promise.all(files.slice(100).map(({ name }) => unlink(name)));
+		await nextTurn(); // Driver preparation reacts to delivered notifications; allocation still proves its own inputs.
+		expect(await fingerprint()).toBe("git-worktree");
+	});
+
+	it("keeps auto live-lower qualification within snapshot namespace boundaries", async ({ skip }) => {
+		const overlay = await linuxOverlayfsCapability();
+		if (!overlay.available) return skip(overlay.detail);
+		const root = await temporaryRoot(), outside = await temporaryRoot(), options = { driver: "auto" as const, liveLower: true };
+		const fingerprint = () => sandbox.fingerprint(options, root), target = path.join(root, "target"), alias = path.join(root, "alias");
+		await Promise.all(Array.from({ length: 256 }, (_, index) => writeFile(path.join(root, `${index}`), "x")));
+		await writeFile(target, "inside"); await symlink("target", alias); await symlink("alias", path.join(root, "chain"));
+		await link(target, path.join(root, "closed"));
+		expect(await fingerprint()).toMatch(/^linux-overlayfs:/);
+		const capture = vi.spyOn(processObservation, "captureWorkspaceStructure");
+		try {
+			await writeFile(target, "changed");
+			capture.mockResolvedValueOnce({ root, entries: new Map(), complete: false });
+			expect(await fingerprint()).toBe("git-worktree");
+		} finally { capture.mockRestore(); }
+		for (const destination of [path.join(outside, "missing"), "alias"]) {
+			await unlink(alias); await symlink(destination, alias);
+			await expect(fingerprint()).rejects.toThrow(/resource_symlink_escapes_workspace|symlink_cycle|ELOOP/);
+		}
+		await unlink(alias); await link(target, path.join(outside, "external"));
+		await expect(fingerprint()).rejects.toThrow("hardlink namespace is not closed");
+		await unlink(path.join(outside, "external")); await mkdir(path.join(root, "nested", ".git"), { recursive: true });
+		await link(target, path.join(root, "nested", ".git", "excluded"));
+		await expect(fingerprint()).rejects.toThrow(/hardlink namespace is not closed|hardlink escapes snapshot/);
 	});
 
 	it("binds stock file operations without invoking host functions or rewriting outputs", async () => {
@@ -694,31 +725,52 @@ describe("workspace-branch ExecutionWorld", () => {
 		}
 	});
 
-	it("materializes a parent checkpoint privately and commits ordered deltas", async () => {
+	it.each([false, true])("materializes only its service's parent checkpoint privately, including after adoption (%s)", async (adopted) => {
 		const root = await temporaryRoot();
 		const target = path.join(root, "lineage.txt");
 		await writeFile(target, "base\n", "utf8");
 		const world = sandbox.createExecutionWorld();
 		const parentArgs = { path: "lineage.txt", content: "parent\n" };
 		const parent = await world.speculation.execute(context(root, "write", writeTool, parentArgs));
+		const sibling = sandbox.createExecutionWorld({ inPlaceMutations: false }), foreign = new WorkspaceSandboxService();
+		const otherRoot = await temporaryRoot();
+		expect(sibling.speculation.acceptsCheckpoint?.(parent.checkpoint!, root)).toBe(true);
+		expect(sandbox.acceptsCheckpoint({ ...parent.checkpoint! }, root)).toBe(false);
+		expect(sandbox.acceptsCheckpoint(parent.checkpoint!, otherRoot)).toBe(false);
+		expect(foreign.acceptsCheckpoint(parent.checkpoint!, root)).toBe(false);
+		await expect(foreign.fork({ cwd: root, action: requiredAction("write", parentArgs, root),
+			parentCheckpoint: parent.checkpoint, execute: async () => settlement("unused"),
+		})).rejects.toThrow("another backend");
+		await foreign.dispose();
 		const lineage = parent.checkpoint!.lineage;
 		for (const field of ["id", "lineage", "depth"]) Reflect.set(parent.checkpoint!, field, "changed");
 		await expect(sandbox.fork({ cwd: root, action: requiredAction("write", parentArgs, root),
 			parentCheckpoint: { ...parent.checkpoint! }, execute: async () => settlement("unused"),
 		})).rejects.toThrow("another backend");
-		await expect(sandbox.fork({ cwd: await temporaryRoot(), action: requiredAction("write", parentArgs, root),
+		await expect(sandbox.fork({ cwd: otherRoot, action: requiredAction("write", parentArgs, root),
 			parentCheckpoint: parent.checkpoint, execute: async () => settlement("unused"),
 		})).rejects.toThrow("another workspace");
 		const childArgs = { path: "lineage.txt", edits: [{ oldText: "parent", newText: "child" }] };
-		const child = await world.speculation.execute({ ...context(root, "edit", editTool, childArgs), parentCheckpoint: parent.checkpoint });
+		if (adopted) await parent.commit();
+		const child = await sibling.speculation.execute({ ...context(root, "edit", editTool, childArgs), parentCheckpoint: parent.checkpoint });
 
 		expect(child.checkpoint?.lineage).toBe(lineage);
 		expect(child.checkpoint?.depth).toBe(1);
-		expect(await readFile(target, "utf8")).toBe("base\n");
+		expect(await readFile(target, "utf8")).toBe(adopted ? "parent\n" : "base\n");
 		await parent.commit();
 		expect(await readFile(target, "utf8")).toBe("parent\n");
 		await child.commit();
 		expect(await readFile(target, "utf8")).toBe("child\n");
+		const grandchild = await sibling.speculation.execute({ ...context(root, "edit", editTool,
+			{ path: "lineage.txt", edits: [{ oldText: "child", newText: "grandchild" }] }), parentCheckpoint: child.checkpoint });
+		expect(await readFile(target, "utf8")).toBe("child\n");
+		await grandchild.commit();
+		expect(await readFile(target, "utf8")).toBe("grandchild\n");
+		await writeFile(target, "external\n");
+		await expect(sibling.speculation.execute({ ...context(root, "edit", editTool, childArgs), parentCheckpoint: child.checkpoint }))
+			.rejects.toThrow("resource changed before commit");
+		await sandbox.dispose();
+		expect(sibling.speculation.acceptsCheckpoint?.(parent.checkpoint!, root)).toBe(false);
 	});
 
 	it("preserves native directory creation and rejects unproven self-observation", async () => {

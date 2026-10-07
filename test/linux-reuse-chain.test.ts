@@ -1,15 +1,17 @@
 // Constructed Actor sequences through the real host and Linux process world, PatternAware only (no model): which reuse path
 // serves the predicted command, and how long the Actor waits. The scenario table takes minutes of CPU; run it with PI_SPEC_REUSE_CHAIN=1.
 import { execSync } from "node:child_process";
-import { writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createWriteTool } from "@earendil-works/pi-coding-agent";
+import { fauxAssistantMessage, type AssistantMessage } from "@earendil-works/pi-ai";
 import { expect, test } from "vitest";
 import { createSpeculativeActionHost } from "../src/agent-integration.ts";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { PatternAwareStore, patternAwareActionSemantics, patternAwareSettings } from "../src/pattern-aware.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
+import type { SpeculativeActionEvent } from "../src/events.ts";
 import { testModel } from "./model.ts";
 import { commitBenchmarkFixture, compileBenchmarkHelper, createLinuxProcessBenchmark, prepareLinuxProcessReuse, textOutput } from "./linux-process-fixture.ts";
 
@@ -38,23 +40,24 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 /** A committed workspace holding `files` and `./slow` (`loops` rounds of CPU over a file's bytes: a stand-in for a test run or a
  * build step), a host over it with PatternAware alone, and one Actor step, a command or a write: prediction starts with it and
  * runs while the Actor model generates for `think` ms. */
-async function chainWorld(files: readonly (readonly [string, string])[], loops: string) {
+async function chainWorld(files: readonly (readonly [string, string])[], loops: string, draft?: () => Promise<AssistantMessage>) {
 	// Under the user's home, as a real workspace is: /tmp is each sandbox's own, so what a runtime observes of the workspace's parents
 	// there (Node's package.json probes) could never be validated.
 	const fixture = await createLinuxProcessBenchmark("pi-chain-", "overlayfs", { cheapChildMs: 50 }, path.join(os.homedir(), ".cache", "pi-speculative-action", "chain")), { workspace } = fixture;
 	try {
-		for (const [file, text] of [...files, [".gitignore", "slow\n"], ["slow.c", "#include <stdio.h>\nint main(int argc, char **argv) { FILE *f = fopen(argv[1], \"r\"); if (!f) return 1;" +
-			` unsigned long h = 5381; int c;\n while ((c = fgetc(f)) != EOF) h = h * 33 + c; fclose(f);\n for (volatile unsigned long i = 0; i < ${loops}ul; i++) h ^= i;` +
+		for (const [file, text] of [...files, [".gitignore", "slow\n"], ["slow.c", "#include <stdio.h>\n#include <fcntl.h>\n#include <unistd.h>\nint main(int argc, char **argv) { int f = open(argv[1], O_RDONLY); if (f < 0) return 1;" +
+			` unsigned long h = 5381; unsigned char c;\n while (read(f, &c, 1) == 1) h = h * 33 + c; close(f);\n for (volatile unsigned long i = 0; i < ${loops}ul; i++) h ^= i;` +
 			" printf(\"%s %lx\\n\", argv[1], h); return 0; }\n"]] as const) await writeFile(path.join(workspace, file), text);
 		await compileBenchmarkHelper(workspace, { source: "slow.c", output: "slow" });
 		await commitBenchmarkFixture(workspace, "chain");
 		await prepareLinuxProcessReuse(fixture);
 		const route = await fixture.prepareActorReplay(), writer = createWriteTool(workspace), tools = [fixture.tool, writer];
 		const settings = patternAwareSettings({ enabled: true, multiStepEnabled: false });
-		const host = createSpeculativeActionHost("chain", { cwd: workspace, complete: async () => { throw new Error("no inference"); },
+		const events: SpeculativeActionEvent<string>[] = [];
+		const host = createSpeculativeActionHost("chain", { cwd: workspace, complete: draft ?? (async () => { throw new Error("no inference"); }), onEvent: event => { events.push(event); },
 			patternStore: new PatternAwareStore(settings, undefined, patternAwareActionSemantics(PI_ACTION_SEMANTICS, workspace)),
-			getSettings: () => ({ enabled: true, drafterEnabled: false, candidateLimit: 4, maxConcurrentActions: 4, tools: ["bash"], patternAware: settings }),
-			preflight: () => true, executionWorlds: [fixture.world],
+			getSettings: () => ({ enabled: true, drafterEnabled: !!draft, drafterMaxDepth: 1, candidateLimit: draft ? 1 : 4, maxConcurrentActions: 4, tools: draft ? ["bash", "write"] : ["bash"], patternAware: settings }),
+			preflight: () => true, executionWorlds: [fixture.world, fixture.workspaceSandbox.createExecutionWorld()],
 			resolveInvocation: (tool, input) => resolvePiToolInvocation(tool, input, { cwd: workspace, environment: fixture.environment, shellPath: fixture.shellPath }) });
 		const step = async (turnID: string, call: string | { readonly path: string; readonly content: string }, think: number, during?: string) => {
 			await host.startTurn({ turnID, tools, actorModel: testModel("actor"), actorOptions: undefined, context: { systemPrompt: "chain", messages: [], tools } });
@@ -68,7 +71,7 @@ async function chainWorld(files: readonly (readonly [string, string])[], loops: 
 			await host.finishTurn(turnID);
 			return { ms, text: textOutput(result as never), hits: after.hits - before.hits, validationMs: after.validationMs - before.validationMs };
 		};
-		return { fixture, workspace, host, step };
+		return { fixture, workspace, host, step, tools, events };
 	} catch (error) { await fixture.dispose(); throw error; }
 }
 
@@ -95,12 +98,39 @@ test.skipIf(process.platform !== "linux" || !process.env.PI_SPEC_REUSE_CHAIN)("r
 	console.log(rows.join("\n"));
 });
 
-test.skipIf(process.platform !== "linux")("reruns a learned build after an Actor edit, so another command reuses the step it redid", { timeout: 120_000 }, async () => {
-	const { fixture, workspace, host, step } = await chainWorld([["a.txt", "alpha\n"], ["Makefile", "all:\n\t@./slow a.txt\n"]], "600000000");
+test.skipIf(process.platform !== "linux").for(["build", "current_workspace", "changed_after_preparation"] as const)("prepares learned work after an Actor edit (%s)", { timeout: 120_000 }, async mode => {
+	const { fixture, workspace, host, step, events } = await chainWorld([["a.txt", "alpha\n"], ["Makefile", "all:\n\t@./slow a.txt\n"]], "600000000");
 	try {
-		await step("build", "make -s", 0);
+		const command = mode === "build" ? "make -s all" : "./slow a.txt | tail -1";
+		await step("build", mode === "build" ? "make -s" : "cat > a.txt <<'EOF'\nalpha\nEOF\n./slow a.txt | tail -2", 0);
 		await step("edit", { path: "a.txt", content: "alpha\nbeta\n" }, 0);
-		const measured = await step("check", "make -s all", 3000);
-		expect([measured.text.trim(), measured.hits]).toEqual([execSync("make -s all", { cwd: workspace, encoding: "utf8" }).trim(), 1]);
+		const measured = await step("check", command, 3000, mode === "changed_after_preparation" ? "printf 'newest\\n' > a.txt" : undefined);
+		expect([measured.text.trim(), measured.hits], JSON.stringify({ events: events.filter(event => event.type === "candidate" || event.type === "operation_prediction"), metrics: fixture.backend.metrics() }))
+			.toEqual([execSync(command, { cwd: workspace, encoding: "utf8" }).trim(), Number(mode !== "changed_after_preparation")]);
+	} finally { await host.dispose(); await fixture.dispose(); }
+});
+
+test.skipIf(process.platform !== "linux")("prepares a process from a predicted mutation before either Actor call, then adopts across turns", { timeout: 30_000 }, async () => {
+	const steps = [{ tool: "write", input: { path: "a.txt", content: "next\n" } }, { tool: "bash", input: { command: "./slow a.txt" } }];
+	let requests = 0;
+	const { fixture, workspace, host, tools, events } = await chainWorld([["a.txt", "original\n"]], "600000000", async () => {
+		requests++;
+		return fauxAssistantMessage([{ type: "toolCall", id: "workflow", name: "speculative_workflow", arguments: { steps } }], { stopReason: "toolUse" });
+	});
+	const start = (turnID: string) => host.startTurn({ turnID, tools, actorModel: testModel("actor"), actorOptions: undefined, context: { messages: [], tools } });
+	try {
+		await start("write");
+		await expect.poll(() => events.filter(event => event.type === "candidate" && event.state.status === "succeeded"), { timeout: 15_000 }).toHaveLength(2);
+		expect(await readFile(path.join(workspace, "a.txt"), "utf8")).toBe("original\n");
+		for (const step of steps) {
+			if (step.tool === "bash") await start(step.tool);
+			const output = await host.execute({ turnID: step.tool, id: step.tool, tool: step.tool, args: step.input, tools }, undefined,
+				() => tools.find(tool => tool.name === step.tool)!.execute(step.tool, step.input as never));
+			if (step.tool === "bash") expect(textOutput(output as never).trim()).toBe(execSync(step.input.command!, { cwd: workspace, encoding: "utf8" }).trim());
+			await host.finishTurn(step.tool, step.tool === "bash");
+		}
+		const settled = events.filter(event => event.type === "actor_action").map(event => event.settlement);
+		expect(settled.map(event => event.provider.kind), JSON.stringify(settled)).toEqual(["speculative", "speculative"]);
+		expect(requests).toBe(1);
 	} finally { await host.dispose(); await fixture.dispose(); }
 });

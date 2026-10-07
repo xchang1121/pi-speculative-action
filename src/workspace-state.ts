@@ -36,8 +36,6 @@ export type WorkspaceStructureEntry =
 export interface WorkspaceStructureSnapshot {
 	readonly root: string;
 	readonly entries: ReadonlyMap<string, WorkspaceStructureEntry>;
-	readonly files: number;
-	readonly bytesRead: number;
 	readonly complete: boolean;
 }
 

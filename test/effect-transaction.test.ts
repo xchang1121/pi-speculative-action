@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import { effectCommitFailure, type EffectTransaction, EffectTransactionCoordinator } from "../src/effect-transaction.ts";
 import { emptyWorldReuseMetrics, type SpeculativeExecutionRoute, type WorldBranch } from "../src/execution-world.ts";
 import { buildPiActionKey } from "../src/action-semantics.ts";
+import { zeroValidationMetrics as metrics } from "../src/settlement.ts";
 
 const route: SpeculativeExecutionRoute = {
 	isolation: "runtime_sandbox",
@@ -172,7 +173,7 @@ describe("EffectTransactionCoordinator", () => {
 		const offeredRoute = { ...route, reuse: "shared_result" as SpeculativeExecutionRoute["reuse"] };
 		const capturedAttempt = coordinator.begin({ tool: "custom", route: offeredRoute });
 		offeredRoute.reuse = "exclusive_branch"; offeredRoute.fingerprint = "changed after begin";
-		const offeredProof = { status: "stale" as const, cause: { stage: "freshness" as const, code: "changed" }, metrics: metrics() };
+		const offeredProof = { status: "stale" as const, cause: { stage: "freshness" as const, code: "changed" }, metrics: { ...metrics() } };
 		const offeredBranch = branch({
 			validate: proof === "missing" ? undefined : async () => {
 				if (proof === "throws") throw new Error("no evidence");
@@ -302,8 +303,4 @@ describe("EffectTransactionCoordinator", () => {
 function branch(overrides: Partial<WorldBranch<string>> = {}): WorldBranch<string> {
 	const output = overrides.output ?? "sealed";
 	return { ...testBranch(output, { executionFingerprint: "executor" }), ...overrides };
-}
-
-function metrics() {
-	return { durationMs: 0, bytesRead: 0, filesRead: 0, mode: "exact" as const };
 }

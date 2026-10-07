@@ -1,23 +1,17 @@
 import { deferred } from "./async.ts";
 import { describe, expect, it, vi } from "vitest";
 import { ActorAction } from "../src/actor-action.ts";
+import { buildPiActionKey } from "../src/action-semantics.ts";
 import { BoundedEventQueue, PostSettlementQueue } from "../src/post-settlement.ts";
 import { cause } from "../src/settlement.ts";
 import { TaskTimeline, TimelineInterval } from "../src/task-timing.ts";
 import { emptySpeculativeTraceSummary, summarizeSpeculativeTrace } from "../src/trace-summary.ts";
 
-const identity = { id: "call-1", sequence: 7, turnID: "turn-1" } as const;
+const identity = { id: "call-1", sequence: 7, decisionSequence: 4, turnID: "turn-1" } as const;
+const envelope = { sessionID: "session", turnID: identity.turnID, timestamp: 0, cache: emptySpeculativeTraceSummary().cache };
 const exact = { kind: "exact", distance: 0 } as const;
-const actionKey = {
-	key: "key",
-	hash: "hash",
-	tool: "read",
-	input: { path: "file.ts" },
-	resources: ["file.ts"],
-	semanticsEpoch: "1",
-	schemaHash: "schema",
-	executionFingerprint: "executor",
-};
+const prediction = { id: "prediction", source: "pattern", proposalID: "plan", actionID: "next" };
+const actionKey = buildPiActionKey("read", { path: "file.ts" }, "/workspace", "schema")!;
 
 describe("ActorAction", () => {
 	it("owns candidate rejections and one authoritative provider", () => {
@@ -36,16 +30,14 @@ describe("ActorAction", () => {
 			expect(action.setFallback(cause("control", "late"))).toBe(false);
 			expect(action.deferToFallback()).toBeUndefined();
 			expect(action.settleActor(selection.toolExecution, false)).toBeUndefined();
-			expect(action.settleSelection([{ id: "prediction", source: "pattern", proposalID: "plan", actionID: "next" }], provider))
+			expect(action.settleSelection([prediction], provider))
 				.toEqual(provider === "preview" ? { status: "rejected", candidateID: "fresh", cause: cause("control", "actor_preview_provider") }
 					: { status: "adopted", candidateID: "fresh" });
 			const settled = action.settlement;
-			expect(summarizeSpeculativeTrace([{ type: "actor_action", settlement: settled!, actualAction: "read README.md",
-				sessionID: "session", turnID: identity.turnID, timestamp: 0, cache: emptySpeculativeTraceSummary().cache,
-			}])).toMatchObject(provider === "speculative"
+			expect(summarizeSpeculativeTrace([{ ...envelope, type: "actor_action", settlement: settled!, actualAction: "read file.ts" }])).toMatchObject(provider === "speculative"
 				? { hitLatencyMs: 3, speculativeHits: 1, actorPreviews: 0 }
 				: { hitLatencyMs: 0, speculativeHits: 0, actorPreviews: 1 });
-			expect(settled).toMatchObject({ actorAction: identity, matchedPredictions: [{ id: "prediction", source: "pattern" }],
+			expect(settled).toMatchObject({ actorAction: identity, matchedPredictions: [prediction],
 				rejections: [{ candidateID: "stale", cause: { stage: "freshness" } }], provider: { candidateID: "fresh",
 					...(provider === "preview" ? { kind: "actor", origin: "preview", durationMs: 40 } : { kind: "speculative", match: exact }) } });
 			for (const value of [settled?.provider, settled?.matchedPredictions, settled?.rejections[0]?.cause]) {
@@ -72,7 +64,7 @@ describe("ActorAction", () => {
 			expect(action.rejectCandidate("late", exact, cause("execution", "late"))).toBe(false);
 			expect(action.settleActor(execution, true)).toMatchObject({
 				rejections: mode === "rejected" ? [{ candidateID: "failed" }] : [],
-				provider: { kind: "actor", durationMs: 0, isError: true },
+				provider: { kind: "actor", durationMs: 0, isError: true, ...action.fallback },
 			});
 			expect(action.settleActor(execution, false)).toBeUndefined();
 		}
@@ -82,8 +74,8 @@ describe("ActorAction", () => {
 		const execution = new TimelineInterval(100, 220), timeline = new TaskTimeline(0);
 		const action = new ActorAction({ identity, tool: "bash", actionKey,
 			fallback: cause("execution", "isolation_unavailable") });
-		expect(action.deferToFallback()?.status).toBe("rejected");
-		expect(action.settleActor(execution, false)).toMatchObject({ provider: { kind: "actor", durationMs: 120 } });
+		expect(action.deferToFallback([prediction])?.status).toBe("rejected");
+		expect(action.settleActor(execution, false)).toMatchObject({ matchedPredictions: [prediction], provider: { kind: "actor", durationMs: 120 } });
 		expect(action.settlement?.provider.toolExecution).toBe(execution);
 		timeline.recordActor(0, 100); timeline.recordActor(220, 500);
 		timeline.recordTool(action.settlement!.provider.toolExecution);

@@ -268,13 +268,10 @@ describe("PatternAware", () => {
 		store.settled("attributed", unmatchedSettlement());
 		store.settled("attributed", rejectedSettlement("freshness", "resource_changed"));
 		const afterFreshnessRejection = store.predict("probe").find((item) => item.patternID === "attributed")!;
-		const diagnostic = JSON.parse(afterFreshnessRejection.diagnostic);
 		expect(afterFreshnessRejection.adoptionProbability).toBeCloseTo(0.5);
-		expect(afterFreshnessRejection.expectedLatencyBenefitMs / afterFreshnessRejection.expectedDurationMs).toBeCloseTo(
-			afterFreshnessRejection.empiricalProbability *
-				afterFreshnessRejection.adoptionProbability *
-				diagnostic.mapperConfidence * diagnostic.evidenceConfidence,
-		);
+		expect(afterFreshnessRejection.conditionalProbability).toBeCloseTo(13 / 16, 10);
+		// Five decayed samples, one constant-path mapper and half adoption: Wilson90(13/16, 5) * 5/12.
+		expect(afterFreshnessRejection.expectedLatencyBenefitMs / afterFreshnessRejection.expectedDurationMs).toBeCloseTo(0.21930122364212437, 10);
 		store.settled("attributed", rejectedSettlement("freshness", "resource_changed"));
 		const afterRepeatedRejection = store.predict("probe").find((item) => item.patternID === "attributed")!;
 		expect(afterRepeatedRejection.adoptionProbability).toBeCloseTo(1 / 3);
@@ -1167,9 +1164,6 @@ describe("PatternAware", () => {
 				{ path: "../outside.ts" },
 			]),
 		);
-		expect(
-			JSON.parse(reads.find((candidate) => candidate.input.offset === undefined)!.diagnostic).supportingPatterns,
-		).toEqual(expect.arrayContaining(["default-implicit", "default-offset-explicit"]));
 		expect(reads.find((candidate) => candidate.input.offset === undefined)?.supportingPatternIDs).toEqual(
 			expect.arrayContaining(["default-implicit", "default-offset-explicit"]),
 		);
@@ -1180,7 +1174,7 @@ describe("PatternAware", () => {
 
 	test("promotes canonical same-session actions beyond context only with authoritative, schema-compatible support", () => {
 		for (const mode of ["command", "path aliases", "stale schema", "non-learning"] as const) {
-			const config = settings({ maxContextLength: 1, maxFutureGap: 0, minOccurrences: 2 });
+			const config = settings({ maxContextLength: 1, maxFutureGap: 0, minOccurrences: 2, decayHalfLifeEvents: 2048 });
 			const store = new PatternAwareStore(config, undefined, piActionSemantics());
 			const tool = mode === "command" || mode === "non-learning" ? "bash" : "read";
 			const first = tool === "bash" ? { command: "npm test" } : { path: "src/a.ts" };
@@ -1194,9 +1188,10 @@ describe("PatternAware", () => {
 					.find((candidate) => candidate.patternID.startsWith("action-backoff:") && !candidate.background);
 				if (index === 0 || mode === "stale schema" || mode === "non-learning") expect(recurrent, mode).toBeUndefined();
 				else {
-					expect(recurrent, mode).toMatchObject({ tool, input: first, horizon: 0, latestHorizon: 0 });
+					expect(recurrent, mode).toMatchObject({ tool, input: first, horizon: 0, latestHorizon: 0, dependencies: [] });
 					expect(recurrent!.expectedDurationMs).toBeCloseTo(700 / (1 + 2 ** (-4 / config.decayHalfLifeEvents)), 10);
-					expect(JSON.parse(recurrent!.diagnostic)).toMatchObject({ context: [], mapperConfidence: 1 });
+					// No mapper penalty: 700 * PPM(tool) / (1 + 2^(-4/2048) + 1.2816^2).
+					expect(recurrent!.expectedLatencyBenefitMs).toBeCloseTo(mode === "command" ? 38.437531185154405 : 189.19021130729962, 10);
 					const patterns = new Set(store.snapshot().map((pattern) => pattern.id));
 					expect(recurrent!.supportingPatternIDs.every((id) => patterns.has(id))).toBe(true);
 					// Inspect demoted samples even when competing reads displace them from the default beam.
@@ -1306,7 +1301,6 @@ describe("PatternAware", () => {
 		expect(matches.map((candidate) => candidate.input)).toEqual(commands.slice(0, 2));
 		expect(matches.some((candidate) => candidate.background)).toBe(false);
 		expect(matches[0]?.supportingPatternIDs).toContain("contextual-bash-0");
-		expect(matches.map((candidate) => JSON.parse(candidate.diagnostic).beamRank)).toEqual([1, 2]);
 	});
 
 	test.each([false, true])("unlocks and retains a multi-step frontier (LLM boundaries=%s)", (turnBoundaries) => {

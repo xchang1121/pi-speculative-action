@@ -1,33 +1,26 @@
 import type { SpeculativeActionEvent } from "../src/events.ts";
 
+type TraceEvent<SessionID, Kind extends SpeculativeActionEvent<SessionID>["type"]> =
+	Omit<Extract<SpeculativeActionEvent<SessionID>, { readonly type: Kind }>, "cache" | "sessionID">;
+
 /** Keep benchmark dimensions and their chronological traces on the same event inventory. */
 export function benchmarkTraceReport<SessionID>(
 	events: readonly SpeculativeActionEvent<SessionID>[],
 	actorActionsByTool: Record<string, number>,
 	speculationEnabled: boolean,
 ) {
-	const requests = events.filter((event) => event.type === "source_request").map((event) => event.request.request);
-	const predictions = events.filter((event) => event.type === "prediction").map((event) => event.settlement);
-	const candidates = events.filter((event) => event.type === "candidate").filter((event) => event.state.status === "running");
+	const requests = events.filter((event) => event.type === "source_request");
+	const predictions = events.filter((event) => event.type === "prediction" || event.type === "operation_prediction");
+	const candidateEvents = events.filter((event) => event.type === "candidate");
+	const candidates = candidateEvents.filter((event) => event.state.status === "running");
 	const actors = events.filter((event) => event.type === "actor_action");
 	const hits = actors.flatMap((event) => event.settlement.provider.kind === "speculative"
 		? [{ event, provider: event.settlement.provider }] : []);
 	const native = actors.flatMap((event) => event.settlement.provider.kind === "actor"
 		? [{ tool: event.settlement.tool, origin: event.settlement.provider.origin }] : []);
-	const actorActionTrace = actors.map((event) => ({
-		id: event.settlement.actorAction.id,
-		turnID: event.turnID,
-		sequence: event.settlement.actorAction.sequence,
-		tool: event.settlement.tool,
-		action: event.actualAction,
-		provider: event.settlement.provider.kind,
-		matchedPredictionSources: [...new Set(event.settlement.matchedPredictions.map((prediction) => prediction.source))],
-		...(event.candidate ? { candidateSource: event.candidate.source, predictedAction: event.candidate.predictedAction } : {}),
-		rejections: event.settlement.rejections.map(({ cause }) => cause.detail ? `${cause.code}:${cause.detail}` : cause.code),
-		...(event.settlement.provider.kind === "actor" ? { nativeMs: event.settlement.provider.durationMs } : {}),
-	}));
 	const predictionsBySource: Record<string, { settled: number; observed: number; matched: number; adopted: number }> = {};
-	for (const settlement of predictions) {
+	for (const { type, settlement } of predictions) {
+		if (type !== "prediction") continue;
 		const counts = (predictionsBySource[settlement.prediction.source] ??= { settled: 0, observed: 0, matched: 0, adopted: 0 });
 		counts.settled++;
 		if (settlement.observation === "unobserved") continue;
@@ -38,8 +31,8 @@ export function benchmarkTraceReport<SessionID>(
 	}
 	return {
 		predictionsBySource,
-		sourceRequestKinds: countBy(requests, (request) => request.kind),
-		sourceRequestsBySource: countBy(requests, (request) => request.source),
+		sourceRequestKinds: countBy(requests, (event) => event.request.request.kind),
+		sourceRequestsBySource: countBy(requests, (event) => event.request.request.source),
 		candidateStartsBySource: countBy(candidates, (event) => event.candidate.source),
 		candidateStartsByTool: countBy(candidates, (event) => event.candidate.tool),
 		candidateStartsByDepth: countBy(candidates, (event) => String(event.candidate.depth)),
@@ -47,16 +40,21 @@ export function benchmarkTraceReport<SessionID>(
 		speculativeHitsByTool: countBy(hits, ({ event }) => event.settlement.tool),
 		speculativeHitsByRelation: countBy(hits, ({ provider }) => provider.match.kind === "projected" ? `projected:${provider.match.projector}` : provider.match.kind),
 		speculativeHitProvidersBySource: countBy(hits, ({ event }) => event.candidate?.source ?? "cache"),
-		actorActionMatchesByPredictionSource: countBy(actorActionTrace.flatMap((event) => event.matchedPredictionSources), (source) => source),
+		actorActionMatchesByPredictionSource: countBy(actors.flatMap(({ settlement }) => [...new Set(settlement.matchedPredictions.map(prediction => prediction.source))]), source => source),
 		actorFallbacksByTool: countBy(native.filter((event) => event.origin !== "preview"), (event) => event.tool,
 			speculationEnabled ? {} : { ...actorActionsByTool }),
 		actorPreviewsByTool: countBy(native.filter((event) => event.origin === "preview"), (event) => event.tool),
-		candidateFailures: events.flatMap((event) => event.type === "candidate" && event.state.status === "failed" ? [{ turnID: event.turnID, source: event.candidate.source,
-			tool: event.candidate.tool, cause: event.state.cause.detail ? `${event.state.cause.code}:${event.state.cause.detail}` : event.state.cause.code }] : []),
-		candidateStartTrace: candidates.map((event) => ({ turnID: event.turnID, source: event.candidate.source,
-			tool: event.candidate.tool, depth: event.candidate.depth, action: event.candidate.predictedAction })),
-		actorActionTrace,
+		sourceRequestTrace: traceEvents<SessionID, "source_request">(requests),
+		predictionTrace: traceEvents<SessionID, "prediction" | "operation_prediction">(predictions),
+		candidateTrace: traceEvents<SessionID, "candidate">(candidateEvents),
+		actorActionTrace: traceEvents<SessionID, "actor_action">(actors),
 	};
+}
+
+function traceEvents<SessionID, Kind extends SpeculativeActionEvent<SessionID>["type"]>(
+	events: readonly Extract<SpeculativeActionEvent<SessionID>, { readonly type: Kind }>[],
+): TraceEvent<SessionID, Kind>[] {
+	return events.map(({ cache: _cache, sessionID: _sessionID, ...event }) => event);
 }
 
 function countBy<Value>(values: readonly Value[], key: (value: Value) => string, counts: Record<string, number> = {}) {

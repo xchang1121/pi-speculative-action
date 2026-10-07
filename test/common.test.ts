@@ -1,7 +1,7 @@
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { READ_RANGE_ACTION_KEY_PROJECTOR } from "../src/action-key-projection.ts";
-import { type ActionKeyProjector, actionKeyCovers, actionKeyMatch, actionKeyMatches, actionKeyMismatchReason, actionKeyProjectionPartitions,
+import { actionKeyCovers, actionKeyMatch, actionKeyMatches, actionKeyProjectionPartitions,
 	buildActionKey, buildPiActionKey, inferredActionEffect } from "../src/action-semantics.ts";
 import { clampCandidateLimit, DEFAULTS, drafterRequestTemperature, normalizeDrafterRequestSettings,
 	normalizeSpeculativeToolSelection } from "../src/common.ts";
@@ -83,10 +83,18 @@ describe("speculative action common", () => {
 		expect(base.schemaHash).toBe("schema-a");
 	});
 
-	it("matches directed read coverage and classifies incompatible keys without exposing inputs", () => {
+	it("matches directed read coverage only inside the same execution contract", () => {
 		const projectors = [READ_RANGE_ACTION_KEY_PROJECTOR];
 		const read = (input: Record<string, unknown>, schema = "schema-a") =>
 			buildPiActionKey("read", { path: "src/runtime.ts", ...input }, "/workspace", schema)!;
+		const implicit = read({}), explicit = read({ offset: 1, limit: 2000 });
+		expect(implicit.key).not.toBe(explicit.key);
+		expect(actionKeyMatch(implicit, explicit, projectors)).toMatchObject({ kind: "projected", projector: "read.range" });
+		expect(implicit).toMatchObject({ tool: "read", semanticsEpoch: "pi.read", schemaHash: "schema-a", resources: ["src/runtime.ts"] });
+		expect(implicit.input).not.toHaveProperty("limit");
+		expect(explicit.input).toHaveProperty("limit", 2000);
+		expect(implicit.key).toContain('"semanticsEpoch":"pi.read"');
+		for (const value of [implicit, implicit.input, implicit.resources]) expect(Object.isFrozen(value)).toBe(true);
 		const broad = read({ offset: 100, limit: 160 }), narrow = read({ offset: 220, limit: 30 });
 		for (const [input, matches, covers] of [
 			[{ offset: 220, limit: 30 }, true, true],
@@ -100,23 +108,19 @@ describe("speculative action common", () => {
 		}
 		expect(actionKeyMatches(broad, narrow)).toBe(false);
 		expect(actionKeyMatches(narrow, narrow)).toBe(true);
+		expect(actionKeyCovers(read({}), read({ limit: 2 }), projectors)).toBe(true);
+		expect(actionKeyCovers(read({ limit: 2 }), read({}), projectors)).toBe(false);
 		expect(actionKeyMatch(broad, narrow, projectors)).toEqual({ kind: "projected", projector: "read.range", distance: 130 });
-		expect(actionKeyMismatchReason(broad, narrow, projectors)).toBeUndefined();
-		expect(actionKeyMismatchReason(narrow, narrow, projectors)).toBeUndefined();
-		expect(actionKeyMismatchReason(narrow, broad, projectors)).toBe("projection_not_applicable");
-		expect(actionKeyMismatchReason(narrow, broad)).toBe("different_core");
+		expect(actionKeyMatch(narrow, broad, projectors)).toBeUndefined();
 		expect(actionKeyProjectionPartitions(broad, projectors)).toEqual(actionKeyProjectionPartitions(narrow, projectors));
 		const otherPath = read({ path: "secret-name.ts", offset: 220, limit: 30 });
 		const otherSchema = read(narrow.input, "schema-b");
 		const otherExecutor = buildActionKey({ tool: "read", resources: narrow.resources, input: narrow.input,
 			schemaHash: "schema-a", semanticsEpoch: broad.semanticsEpoch, executionFingerprint: "other-executor" });
-		for (const [key, reason] of [
-			[otherPath, "different_core"], [otherSchema, "different_schema"], [otherExecutor, "different_executor"],
-			[buildPiActionKey("grep", { pattern: "private-pattern" }, "/workspace", "schema-a")!, "different_tool"],
-		] as const) expect(actionKeyMismatchReason(broad, key, projectors)).toBe(reason);
+		for (const key of [otherPath, otherSchema, otherExecutor, buildPiActionKey("grep", { pattern: "private-pattern" }, "/workspace", "schema-a")!])
+			expect(actionKeyMatch(broad, key, projectors)).toBeUndefined();
 		expect(actionKeyMatches(broad, otherSchema, projectors)).toBe(false);
 		expect(actionKeyProjectionPartitions(broad, projectors)).not.toEqual(actionKeyProjectionPartitions(otherSchema, projectors));
-		expect(JSON.stringify(actionKeyMismatchReason(broad, otherPath, projectors))).not.toContain("secret-name");
 		for (const tool of ["grep", "find"]) {
 			const wide = buildPiActionKey(tool, { pattern: "TODO", limit: 100 }, "/workspace", "schema-a")!;
 			const short = buildPiActionKey(tool, { pattern: "TODO", limit: 10 }, "/workspace", "schema-a")!;
@@ -128,16 +132,7 @@ describe("speculative action common", () => {
 
 	it("selects prediction tools independently from their execution route", () => {
 		expect(DEFAULTS.tools).toEqual(["read", "grep", "find", "ls", "bash", "write", "edit"]);
-		expect(
-			candidateToolNames({
-				enabled: true,
-				candidateLimit: 4,
-				maxConcurrentActions: 4,
-				resourceCacheMaxEntries: 8,
-				predictionTimeoutMs: 100,
-				tools: ["read", "bash", "write"],
-			}),
-		).toEqual(["read", "bash", "write"]);
+		expect(candidateToolNames({ ...DEFAULTS, enabled: true, tools: ["read", "bash", "write"] })).toEqual(["read", "bash", "write"]);
 		expect(inferredActionEffect("read")).toBe("observation");
 		expect(inferredActionEffect("bash")).toBe("unbounded");
 		expect(inferredActionEffect("edit")).toBe("workspace_mutation");
@@ -149,64 +144,5 @@ describe("speculative action common", () => {
 			expect(normalizeSpeculativeToolSelection(input)).toEqual([]);
 		}
 	});
-
-	it("defines equivalence through an injected projection without changing K(a)", () => {
-		const projector: ActionKeyProjector = {
-			id: "custom.subset",
-			partition: (action) =>
-				action.tool === "custom"
-					? JSON.stringify([action.schemaHash, action.resources, action.input.namespace])
-					: undefined,
-			project: (speculative, actor) => {
-				const speculativeValues = Array.isArray(speculative.input.values) ? speculative.input.values : undefined;
-				const actorValues = Array.isArray(actor.input.values) ? actor.input.values : undefined;
-				if (!speculativeValues || !actorValues) return undefined;
-				if (!actorValues.every((value) => speculativeValues.includes(value))) return undefined;
-				return {
-					action: buildActionKey({
-						tool: speculative.tool,
-						resources: speculative.resources,
-						schemaHash: speculative.schemaHash,
-						input: { ...speculative.input, values: actorValues },
-					}),
-					distance: speculativeValues.length - actorValues.length,
-				};
-			},
-			canShareInFlight: (speculative, actor) => {
-				const speculativeValues = Array.isArray(speculative.input.values) ? speculative.input.values : undefined;
-				const actorValues = Array.isArray(actor.input.values) ? actor.input.values : undefined;
-				return (
-					!!speculativeValues && !!actorValues && actorValues.every((value) => speculativeValues.includes(value))
-				);
-			},
-		};
-		const speculative = buildActionKey({ tool: "custom", resources: ["set"], input: { namespace: "items", values: ["a", "b", "c"] } });
-		const actor = buildActionKey({ tool: "custom", resources: ["set"], input: { namespace: "items", values: ["b", "c"] } });
-
-		expect(actionKeyMatch(speculative, actor, [projector])).toEqual({ kind: "projected", projector: "custom.subset", distance: 1 });
-		expect(actionKeyCovers(speculative, actor, [projector])).toBe(true);
-		const unguarded: ActionKeyProjector = { id: "unguarded", partition: projector.partition, project: projector.project };
-		expect(actionKeyCovers(speculative, actor, [unguarded])).toBe(false);
-		expect(
-			actionKeyCovers(speculative, actor, [{ ...projector, id: "guarded", canShareInFlight: () => false }]),
-		).toBe(false);
-		expect(
-			actionKeyCovers(speculative, actor, [
-				{ ...projector, id: "throwing-guard", canShareInFlight: () => { throw new Error("coverage failed"); } },
-			]),
-		).toBe(false);
-		const broken: ActionKeyProjector = {
-			id: "broken",
-			partition: () => {
-				throw new Error("partition failed");
-			},
-			project: () => {
-				throw new Error("projection failed");
-			},
-		};
-		expect(actionKeyMatch(speculative, actor, [broken])).toBeUndefined();
-		expect(actionKeyProjectionPartitions(speculative, [broken])).toEqual([]);
-	});
-
 
 });

@@ -2,7 +2,7 @@ import { hash, randomUUID } from "node:crypto";
 import { errorMessage } from "./error-utils.ts";
 import type { Api, AssistantMessageEvent, Context, Model } from "@earendil-works/pi-ai";
 import { DEFAULT_BENEFIT_GATE_POLICY, creditAdoption, BenefitGate, type BenefitGatePolicy } from "./fork-benefit-gate.ts";
-import { createActorForkPlanSource, type ActorProbeSchedule, type ActorProbeSnapshot, type ActorForkActionBatch, type ActorForkActionCall, type ActorForkActionEvidence, type ActorForkPlanSource } from "./actor-fork-plan-source.ts";
+import { createActorForkPlanSource, type ActorProbeSchedule, type ActorProbeSnapshot, type ActorForkActionBatch, type ActorForkActionCall, type ActorForkPlanSource } from "./actor-fork-plan-source.ts";
 import type { MaterializedSpeculativeCandidate, PredictionFeedback } from "./runtime.ts";
 import type { ActionKey } from "./action-semantics.ts";
 import type { ActorActionSettlement } from "./settlement.ts";
@@ -417,8 +417,7 @@ export class SelfSpeculationCoordinator {
 		const calls = await this.draftFork({ model: state.model, context: state.actorContext, reasoning: probe.reasoning, content: probe.content,
 			signal: signal ?? AbortSignal.any([]) });
 		this.counters.forkCompletions++;
-		const batches = calls.length ? [{ id: sidecarActionBatchID(stableStringify(calls)), calls: calls.map((call, index) => ({ id: `${index}:fork`, index, ...call })),
-			evidence: [{ candidateIDs: [], sources: ["self-speculation"], provenance: [], actionIdentities: [], draftTokenCount: 0 }] }] : [];
+		const batches = calls.length ? [{ id: sidecarActionBatchID(stableStringify(calls)), calls: calls.map((call, index) => ({ id: `${index}:fork`, index, ...call })) }] : [];
 		return { committed: batches.length > 0, batches };
 	}
 
@@ -647,27 +646,11 @@ export class SelfSpeculationCoordinator {
 			)
 				continue;
 			const fingerprint = stableStringify(calls);
-			const score = record(candidate.score);
-			const evidence: ActorForkActionEvidence = {
-				candidateIDs,
-				sources,
-				provenance: structuredClone(array(candidate.provenance)),
-				actionIdentities: structuredClone(array(candidate.action_identities)),
-				draftTokenCount: nonNegativeCount(candidate.draft_token_count),
-				...(confidence !== undefined ? { confidence } : {}),
-				...(score ? { score: structuredClone(score) } : {}),
-				...(forkObservation ? { fork: structuredClone(forkObservation) } : {}),
-			};
-			const existing = actionBatches.get(fingerprint);
-			if (existing) {
-				actionBatches.set(fingerprint, { ...existing, evidence: [...existing.evidence, evidence] });
-				continue;
-			}
+			if (actionBatches.has(fingerprint)) continue;
 			const batchID = sidecarActionBatchID(fingerprint);
 			actionBatches.set(fingerprint, {
 				id: batchID,
 				calls: calls.map((call, index) => ({ id: `${index}:fork`, ...call })),
-				evidence: [evidence],
 			});
 		}
 		if (!fork) return undefined;

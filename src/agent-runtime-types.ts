@@ -1,6 +1,6 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { Api, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
-import type { ActualToolCall, SpeculativePlanSource } from "./runtime.ts";
+import type { ActualToolCall, SpeculativePlanSource, TurnInput } from "./runtime.ts";
 import { stableValueHash } from "./stable-value-hash.ts";
 import type { ToolSettlement } from "./tool-settlement.ts";
 
@@ -15,21 +15,14 @@ export type DraftModelSelection =
 	| Model<Api>
 	| ((actorModel: Model<Api>) => Model<Api> | undefined | Promise<Model<Api> | undefined>);
 
-export interface AgentStartInput {
-	readonly sessionID: string;
-	readonly turnID: string;
-	readonly actorModel: Model<Api>;
+export interface AgentStartInput extends Pick<DraftOptionsContext, "actorModel" | "actorOptions">, Omit<TurnInput<string>, "terminal"> {
 	readonly context: Context;
-	readonly actorOptions: SimpleStreamOptions | undefined;
 	readonly tools: readonly AgentTool[];
 }
 
-export interface AgentConsumeInput extends Omit<ActualToolCall, "input"> {
-	readonly sessionID: string;
-	readonly turnID: string;
+export interface AgentConsumeInput extends Omit<ActualToolCall, "input">, TurnInput<string> {
 	readonly args: unknown;
 	readonly tools: readonly AgentTool[];
-	readonly terminal?: boolean;
 }
 
 export interface AgentStateData {

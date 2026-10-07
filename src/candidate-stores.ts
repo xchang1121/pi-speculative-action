@@ -318,14 +318,11 @@ export interface ResultCacheLimits {
 	readonly hotFraction?: number;
 }
 
-export interface SpeculativeCacheValueMetrics {
+export interface SpeculativeCacheValueMetrics extends Pick<ResultCacheEvidence, "actorHits" | "insertedAt" | "lastActorHitAt"> {
 	readonly executionMs: number;
 	readonly expectedValidationMs: number;
 	readonly expectedProjectionMs: number;
 	readonly bytes: number;
-	readonly actorHits: number;
-	readonly insertedAt: number;
-	readonly lastActorHitAt?: number;
 }
 
 const CACHE_HIT_HALF_LIFE_MS = 30 * 60 * 1000;
@@ -365,4 +362,3 @@ export interface ResultCacheSnapshot {
 function finiteFraction(value: number): number {
 	return Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0.8;
 }
-

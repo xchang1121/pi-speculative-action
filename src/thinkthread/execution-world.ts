@@ -244,10 +244,7 @@ async function forkThinkThreadWorld(
 		const expectedKey = await world.durable.runKeyWithInput(runParams, request);
 		const run = await world.durable.runWithInput(runParams, request, context.signal);
 		if (run.targetSnapshotId) {
-			target = world.pool.ownSnapshot({
-				snapshotId: run.targetSnapshotId,
-				logicalBytes: Math.max(0, run.changedBytes ?? 0),
-			});
+			target = world.pool.ownSnapshot(run.targetSnapshotId);
 		}
 		context.signal.throwIfAborted();
 		if (run.runKey !== expectedKey.runKey) throw new Error("ThinkThread fs.run returned an unexpected run key");

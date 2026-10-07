@@ -81,7 +81,7 @@ export type PredictionSettlement =
 
 export type SourceRequestSettlement =
 	| { readonly status: "produced"; readonly proposalCount: number }
-	| { readonly status: "empty" }
+	| { readonly status: "empty"; readonly cause?: ResolutionCause & { readonly stage: "source" } }
 	| { readonly status: "timeout"; readonly cause: ResolutionCause & { readonly stage: "source" } }
 	| { readonly status: "error"; readonly cause: ResolutionCause & { readonly stage: "source" } }
 	| { readonly status: "aborted"; readonly cause: ResolutionCause & { readonly stage: "source" } };
@@ -125,6 +125,8 @@ export type ActorActionProvider =
 	| {
 			readonly kind: "actor";
 			readonly origin: "fallback";
+			readonly cause: ResolutionCause;
+			readonly candidateID?: string;
 			readonly durationMs: number;
 			readonly isError: boolean;
 			readonly toolExecution: TimelineInterval;

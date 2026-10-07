@@ -29,7 +29,10 @@ describe("ExecutionWorldRouter", () => {
 	it("uses one runtime sandbox for every effect, then exact local fallbacks, then blocks", async () => {
 		const resource = fallback("resource", "resource_snapshot", RESOURCE_OBSERVATION_EFFECTS.capabilities);
 		const workspace = fallback("workspace", "workspace_branch", WORKSPACE_PATH_MUTATION_EFFECTS.capabilities);
-		const runtimeRouter = new ExecutionWorldRouter([resource, workspace, runtime("runtime")]);
+		const checkpoint = { backend: "parent", id: "parent", lineage: "parent", depth: 0 }, runtimeWorld = runtime("runtime");
+		const acceptsCheckpoint = vi.fn((value: unknown, cwd: string) => value === checkpoint && cwd === preparation.cwd);
+		const runtimeRouter = new ExecutionWorldRouter([resource, workspace,
+			{ ...runtimeWorld, speculation: { ...runtimeWorld.speculation, acceptsCheckpoint } }]);
 		const requests = [
 			{ effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS },
 			{ effect: "workspace_mutation", requirements: WORKSPACE_PATH_MUTATION_EFFECTS },
@@ -37,12 +40,20 @@ describe("ExecutionWorldRouter", () => {
 		] as const;
 
 		for (const request of requests) {
-			expect(await runtimeRouter.resolve(request, preparation)).toMatchObject({
+			const route = await runtimeRouter.resolve(request, preparation);
+			expect(route).toMatchObject({
 				backend: "runtime",
 				isolation: "runtime_sandbox",
 				reuse: request.effect === "observation" ? "shared_result" : "exclusive_branch",
 			});
+			expect(route?.acceptsCheckpoint?.(checkpoint)).toBe(request.effect === "observation" ? undefined : true);
+			expect(structuredClone(route)).not.toHaveProperty("acceptsCheckpoint");
+			expect({ ...route }).not.toHaveProperty("acceptsCheckpoint");
 		}
+		expect(acceptsCheckpoint).toHaveBeenCalledWith(checkpoint, preparation.cwd);
+		const retained = await runtimeRouter.resolve(requests[1], preparation);
+		await runtimeRouter.dispose();
+		expect(retained!.acceptsCheckpoint!(checkpoint)).toBe(false);
 
 		const localRouter = new ExecutionWorldRouter([workspace, resource]);
 		expect(await localRouter.resolve(requests[0], preparation)).toMatchObject({ backend: "resource" });
@@ -167,56 +178,39 @@ describe("ExecutionWorldRouter", () => {
 		expect(observations).toEqual([true, false, false, false]);
 	});
 
-	it("keeps an observation-only world off the speculative route", async () => {
+	it.each([false, true])("keeps observation authority independent from speculative tool scopes (%s)", async scoped => {
+		const { speculation, ...lifecycle } = fallback("observe", "resource_snapshot", RESOURCE_OBSERVATION_EFFECTS.capabilities);
 		const capture = vi.fn(async () => ({
 			seal: async (output: string) => testBranch(output, { backend: "observe", executionFingerprint: "executor" }),
 			dispose: () => {},
 		}));
-		const observationOnly: BaseTestWorld = {
-			id: "observe",
-			scope: "fallback",
-			isolation: "resource_snapshot",
-			observation: { capabilities: RESOURCE_OBSERVATION_EFFECTS.capabilities, capture },
+		const world: BaseTestWorld = {
+			...lifecycle,
+			...(scoped ? { speculation: { ...speculation, tools: ["read"] } } : {}),
+			observation: { capabilities: RESOURCE_OBSERVATION_EFFECTS.capabilities, ...(scoped ? { tools: ["grep"] } : {}), capture },
 		};
-		const router = new ExecutionWorldRouter([observationOnly]);
-		const request = { effect: "observation" as const, requirements: RESOURCE_OBSERVATION_EFFECTS };
-
-		expect(await router.resolve(request, preparation)).toBeUndefined();
-		expect(await router.captureAuthoritativeResult(request, preparation, { value: "actor" })).toBeDefined();
-		const diagnostics = await router.diagnostics(preparation);
-		expect(diagnostics).toEqual([
-			expect.objectContaining({ state: "unavailable", observation: expect.objectContaining({ state: "ready" }) }),
-		]);
-		expect(executionCapabilityStatus(request.requirements, diagnostics).state).toBe("unavailable");
-		expect(executionCapabilityStatus(request.requirements, diagnostics, "observation").state).toBe("ready");
-	});
-
-	it("applies provider tool scopes independently to speculation and observation", async () => {
-		const base = fallback("scoped", "resource_snapshot", RESOURCE_OBSERVATION_EFFECTS.capabilities);
-		const scoped: TestWorld = {
-			...base,
-			speculation: { ...base.speculation, tools: ["read"] },
-			observation: {
-				capabilities: RESOURCE_OBSERVATION_EFFECTS.capabilities,
-				tools: ["grep"],
-				capture: async () => ({ seal: async (output) => testBranch(output, { backend: "scoped", executionFingerprint: "executor" }), dispose: () => {} }),
-			},
-		};
-		const router = new ExecutionWorldRouter([scoped]);
-		const request = (tool: "read" | "grep") => ({
+		const router = new ExecutionWorldRouter([world]);
+		const request = (tool?: "read" | "grep") => ({
 			effect: "observation" as const,
 			requirements: RESOURCE_OBSERVATION_EFFECTS,
-			action: buildPiActionKey(tool, { path: ".", ...(tool === "grep" ? { pattern: "x" } : {}) }, "/workspace")!,
+			...(tool ? { action: buildPiActionKey(tool, { path: ".", ...(tool === "grep" ? { pattern: "x" } : {}) }, "/workspace")! } : {}),
 		});
-
-		expect(await router.resolve(request("read"), preparation)).toBeDefined();
-		expect(await router.resolve(request("grep"), preparation)).toBeUndefined();
-		expect(await router.captureAuthoritativeResult(request("read"), preparation, { value: "actor" })).toBeUndefined();
-		expect(await router.captureAuthoritativeResult(request("grep"), preparation, { value: "actor" })).toBeDefined();
+		if (scoped) {
+			expect(await router.resolve(request("read"), preparation)).toBeDefined();
+			expect(await router.resolve(request("grep"), preparation)).toBeUndefined();
+			expect(await router.captureAuthoritativeResult(request("read"), preparation, { value: "actor" })).toBeUndefined();
+			expect(await router.captureAuthoritativeResult(request("grep"), preparation, { value: "actor" })).toBeDefined();
+		} else {
+			expect(await router.resolve(request(), preparation)).toBeUndefined();
+			expect(await router.captureAuthoritativeResult(request(), preparation, { value: "actor" })).toBeDefined();
+		}
 		const diagnostics = await router.diagnostics(preparation);
-		expect(executionCapabilityStatus(RESOURCE_OBSERVATION_EFFECTS, diagnostics, "speculation", "grep").state)
+		expect(diagnostics).toEqual([
+			expect.objectContaining({ state: scoped ? "ready" : "unavailable", observation: expect.objectContaining({ state: "ready" }) }),
+		]);
+		expect(executionCapabilityStatus(RESOURCE_OBSERVATION_EFFECTS, diagnostics, "speculation", scoped ? "grep" : undefined).state)
 			.toBe("unavailable");
-		expect(executionCapabilityStatus(RESOURCE_OBSERVATION_EFFECTS, diagnostics, "observation", "grep").state)
+		expect(executionCapabilityStatus(RESOURCE_OBSERVATION_EFFECTS, diagnostics, "observation", scoped ? "grep" : undefined).state)
 			.toBe("ready");
 	});
 
@@ -233,9 +227,9 @@ describe("ExecutionWorldRouter", () => {
 	});
 
 	it("lets an injected all-effect runtime make every tool routable on any host", () => {
-		const worlds = [
+		const worlds: ExecutionWorldDiagnosticSnapshot[] = [
 			...platformWorlds("unavailable", "Linux host required"),
-			diagnostic("host_runtime", "runtime", "runtime_sandbox", "all", "ready", "host runtime ready"),
+			{ id: "host_runtime", scope: "runtime", isolation: "runtime_sandbox", capabilities: "all", state: "ready", detail: "host runtime ready" },
 		];
 		expect(new Set(Object.values(toolStatuses(worlds)))).toEqual(new Set(["ready"]));
 	});
@@ -249,42 +243,13 @@ function toolStatuses(worlds: readonly ExecutionWorldDiagnosticSnapshot[]): Reco
 
 function platformWorlds(processState: "ready" | "unavailable", processDetail: string): readonly ExecutionWorldDiagnosticSnapshot[] {
 	return [
-		diagnostic(
-			"linux_process_reuse",
-			"runtime",
-			"runtime_sandbox",
-			UNRESTRICTED_PROCESS_EFFECTS.capabilities,
-			processState,
-			processDetail,
-		),
-		diagnostic(
-			"git_worktree",
-			"fallback",
-			"workspace_branch",
-			WORKSPACE_PATH_MUTATION_EFFECTS.capabilities,
-			"registered",
-			"checked on first use",
-		),
-		diagnostic(
-			"resource_version",
-			"fallback",
-			"resource_snapshot",
-			RESOURCE_OBSERVATION_EFFECTS.capabilities,
-			"ready",
-			"resource validation ready",
-		),
+		{ id: "linux_process_reuse", scope: "runtime", isolation: "runtime_sandbox", capabilities: UNRESTRICTED_PROCESS_EFFECTS.capabilities,
+			state: processState, detail: processDetail },
+		{ id: "git_worktree", scope: "fallback", isolation: "workspace_branch", capabilities: WORKSPACE_PATH_MUTATION_EFFECTS.capabilities,
+			state: "registered", detail: "checked on first use" },
+		{ id: "resource_version", scope: "fallback", isolation: "resource_snapshot", capabilities: RESOURCE_OBSERVATION_EFFECTS.capabilities,
+			state: "ready", detail: "resource validation ready" },
 	];
-}
-
-function diagnostic(
-	id: string,
-	scope: ExecutionWorldDiagnosticSnapshot["scope"],
-	isolation: ExecutionWorldDiagnosticSnapshot["isolation"],
-	capabilities: EffectCapabilities,
-	state: ExecutionWorldDiagnosticSnapshot["state"],
-	detail: string,
-): ExecutionWorldDiagnosticSnapshot {
-	return { id, scope, isolation, capabilities, state, detail };
 }
 
 function runtime(id: string): TestWorld {
