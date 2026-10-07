@@ -128,15 +128,10 @@ type MutableNodeExecution =
 	| PlanNodeExecution
 	| { readonly status: "attached"; readonly candidateID: string; readonly owner: PlanExecutionOwner; };
 
-type MutableNode = {
-	identity: PlanActionIdentity;
-	action: PlanAction;
-	actionKey?: ActionKey;
-	anchorDecisionSeq: number;
-	earliestDecisionSeq: number;
-	expectedDecisionSeq: number;
-	latestDecisionSeq: number;
-	criticalPathMs: number;
+type PlanNodeFields = Pick<PlanRuntimeNode, "identity" | "action" | "actionKey" | "anchorDecisionSeq" |
+	"earliestDecisionSeq" | "expectedDecisionSeq" | "latestDecisionSeq" | "criticalPathMs">;
+
+type MutableNode = { -readonly [Key in keyof PlanNodeFields]: PlanNodeFields[Key] } & {
 	validDependencies: boolean;
 	execution: MutableNodeExecution;
 	opportunity: PredictionOpportunity;

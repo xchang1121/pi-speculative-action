@@ -1512,15 +1512,19 @@ describe("structural speculative runtime", () => {
 		} finally { await runtime.dispose(); }
 	});
 
-	it.each(["adopt", "salvage", "cancel", "orphan-preview", "owned-preview"])("retires unowned previews while retaining demanded or independently predicted work: %s", async mode => {
+	it.each(["adopt", "salvage", "cancel", "orphan-preview", "owned-preview", "operation-salvage", "operation-unavailable", "operation-unmeasured", "operation-expired", "operation-terminal"])("retires unowned previews while retaining demanded or independently predicted work: %s", async mode => {
 		const started = deferred<void>(), release = deferred<void>();
 		const timers = vi.spyOn(globalThis, "setTimeout"), cleared = vi.spyOn(globalThis, "clearTimeout"), disposed = vi.fn();
 		const admission = vi.spyOn(SpeculationScheduler.prototype, "assessCandidateJoin");
+		let available = true;
+		const binding = Object.freeze({ backend: "process", identity: "child", permissionHash: "parent", executionMs: mode === "operation-unmeasured" ? 0 : 2,
+			expectedDurationMs: 3, get available() { return available; } });
 		let acceptScope: Parameters<TestAdapter["executeCandidate"]>[0]["acceptOperationScope"];
 		let executionSignal: AbortSignal;
 		const { runtime, ready } = harness({ actionKey: (tool, args) => buildPiActionKey(tool, args, process.cwd()),
 			resolveExecution: ({ tool }) => tool === "read" ? mode === "adopt" ? RESOURCE_ROUTE : { ...MUTATION_ROUTE, isolation: "runtime_sandbox" } : undefined,
-			source: planSource({ propose: ({ startInput }) => startInput.turnID === "turn" && mode !== "orphan-preview" ? plan("read") : undefined }),
+			source: planSource({ propose: ({ startInput }) => startInput.turnID !== "turn" || mode === "orphan-preview" ? undefined : {
+				...plan("read"), ...(mode.startsWith("operation-") ? { actions: [{ ...readAction("child", { path: "README.md" }), type: "operation", operation: binding }] } : {}) } }),
 			executeCandidate: async ({ acceptOperationScope, signal }) => {
 				executionSignal = signal; signal.addEventListener("abort", () => release.resolve(), { once: true });
 				acceptScope = acceptOperationScope; started.resolve(); await release.promise;
@@ -1543,7 +1547,15 @@ describe("structural speculative runtime", () => {
 				await prepared!.settle(simulatedExecution(1), "actor");
 				return;
 			}
+			available = mode !== "operation-unavailable";
 			await runFallback(runtime, { ...call("turn"), id: "native", tool: "bash", input: { command: "git status" } });
+			if (mode === "operation-unavailable" || mode === "operation-unmeasured") {
+				expect(executionSignal!.aborted).toBe(false);
+				await runtime.finishTurn(call("turn"));
+				expect(executionSignal!.aborted).toBe(true);
+				expect(timers.mock.calls.some(([, delay]) => Number(delay) > SALVAGE_MS / 2)).toBe(false);
+				await vi.waitFor(() => expect(disposed).toHaveBeenCalledOnce()); return;
+			}
 			if (mode === "adopt") {
 				release.resolve(); expect((await runtime.prepareActorCall(call("turn")))?.output).toBe("speculative");
 			} else {
@@ -1552,9 +1564,17 @@ describe("structural speculative runtime", () => {
 				expect(index).toBeGreaterThanOrEqual(0);
 				const timer = timers.mock.results[index]!.value;
 				expect(cleared).not.toHaveBeenCalledWith(timer);
-				if (mode === "cancel") {
-					const closing = runtime.settingsChanged({ ...settings, enabled: false });
+				expect(executionSignal!.aborted).toBe(false);
+				expect(acceptScope!(start("next"))).toBe(false);
+				if (mode === "cancel" || mode === "operation-terminal") {
+					const closing = mode === "cancel" ? runtime.settingsChanged({ ...settings, enabled: false }) : runtime.finishTurn({ ...call("next"), terminal: true });
 					await nextTurn(); expect(cleared).toHaveBeenCalledWith(timer); release.resolve(); await closing;
+					expect(acceptScope!(start("next"), true)).toBe(false);
+				} else if (mode === "operation-expired") {
+					timers.mock.calls[index]![0]();
+					expect(executionSignal!.aborted).toBe(true);
+					await vi.waitFor(() => expect(disposed).toHaveBeenCalledOnce());
+					expect(cleared).toHaveBeenCalledWith(timer);
 				} else {
 					release.resolve(); await ready.promise;
 					expect(cleared).toHaveBeenCalledWith(timer);

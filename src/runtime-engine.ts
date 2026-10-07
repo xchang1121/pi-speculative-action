@@ -1371,8 +1371,9 @@ export function makeSpeculativeActionRuntime<
 		if (!reservationAvailable(candidate.work.reservation) || candidate.previews?.size || session.plan.consumers(candidate.id).length) return;
 		if (candidate.owner.draft.type === "operation" && candidate.actorAdopted && candidate.work.execution.status === "running") return;
 		// Independently predicted process work may still serve another parent; an abandoned Actor preview has no demand.
-		const state = candidate.work.execution;
-		if (state.status === "running" && candidate.origin !== "actor_preview" && candidate.owner.draft.type === "tool_call" && candidate.route.isolation === "runtime_sandbox" && candidate.acceptOperationScope &&
+		const state = candidate.work.execution, draft = candidate.owner.draft;
+		if (state.status === "running" && candidate.origin !== "actor_preview" && candidate.route.isolation === "runtime_sandbox" && candidate.acceptOperationScope &&
+			(draft.type === "tool_call" || draft.operation?.available === true && draft.operation.executionMs > 0) &&
 			performance.now() - state.startedAt + candidate.expectedDurationMs < SALVAGE_MS) {
 			// An estimate can be wrong (a server never exits): the window bounds the work as well as its result.
 			candidate.salvaging ??= setTimeout(() => { if (candidate.work.execution.status === "running") discardCandidate(session, candidate, failure); },
