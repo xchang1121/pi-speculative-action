@@ -590,7 +590,7 @@ export async function observeStrace(
 	const taints = new Set<ProvenanceTaint>(["clock", "random"]), executions: TracedExecution[] = [], listingPIDs = new Set<number>();
 	const images = new Map<number, string>(), statFields = new Map<number, readonly FilesystemObservationField[] | undefined>(); // A process's program, inherited across a fork until it execs.
 	const opened = new Map<number, Set<number>>(); // Descriptors a process opened itself, whose status flags it chose.
-	const refusedIndexLocks = new Set<number>(), ownPipes = new Set<string>(); // Pipes the traced processes created, by inode.
+	const refusedIndexLocks = new Set<number>(), ownPipes = new Set<string>(); // Pipes and socket pairs the traced processes created, by inode.
 	// The semantic roots are one workspace seen from the sandbox and from its source: name a file by its place in it.
 	const locks = new Map<string, boolean>(), changedMetadata = new Set<string>(), written = new Set<string>(), writable = new Set<string>(), external = new Set<string>(), workspaceName = (target: string) =>
 		semanticRoots.flatMap((root) => containsLogicalPath(root, target) ? [`//${path.posix.relative(root, target)}`] : [])[0];
@@ -643,9 +643,11 @@ export async function observeStrace(
 			if (refused) { if (!paths.has(refused)) paths.set(refused, "input"); continue; }
 			const output = !!options.outputEndpoints?.includes(`socket:[${/^\d+<UNIX-STREAM:\[(\d+)/.exec(line.args[0] ?? "")?.[1]}]`);
 			const outputQuery = output && /^(?:getsockname|getpeername|getsockopt)$/.test(syscall);
-			// A local socket or socketpair the tree made reaches no one else, as its pipes do not.
+			// Created pairs stay within the tree only while they neither open another connection nor send to another address.
+			const localCall = endpoint && ownPipes.has(endpoint) && (syscall === "sendto" ? line.args[4] === "NULL" && line.args[5] === "0"
+				: syscall === "sendmsg" ? streamMessage(line.args[1]) !== undefined : !/^(?:connect|bind|listen|accept|accept4|sendmmsg)$/.test(syscall));
 			if (NETWORK_SYSCALLS.has(syscall) && !nonSocketQuery(line) && !streamCall && !outputQuery && !(/^socket(?:pair)?$/.test(syscall) && /^AF_UNIX\b/.test(line.args[0] ?? "")) &&
-				!(endpoint && ownPipes.has(endpoint))) taints.add("network");
+				!localCall) taints.add("network");
 			if (IPC_SYSCALLS.has(syscall)) taints.add("ipc");
 			// Descriptor-local state is internal; reproduced OFD flags are sealed with their final offsets. A lock taken without waiting,
 			// or a query that found the range free, depends only on no one else holding one, which a replay probes; a refusal, or a
@@ -665,7 +667,7 @@ export async function observeStrace(
 					!(command === "F_GETFL" && (own.has(Number.parseInt(line.args[0] ?? "", 10)) || /^[012]</.test(line.args[0] ?? ""))) && !((command === "F_GETFL" || command === "F_SETFL" && syscallSucceeded(line) &&
 						(line.args[2] ?? "").split("|").every(flag => /^(?:O_(?:RDONLY|WRONLY|RDWR|APPEND|NONBLOCK|NDELAY|LARGEFILE|DIRECTORY|DSYNC|SYNC|NOFOLLOW)|0)$/.test(flag))) &&
 						(options.inheritedFileImages?.includes(absoluteDescriptorPath(line.args[0]) ?? /^\d+<(pipe:\[\d+\])>$/.exec(line.args[0] ?? "")?.[1] ?? "") || stream || output ||
-							own.has(Number.parseInt(line.args[0] ?? "", 10)) || ownPipes.has(/^\d+<pipe:\[(\d+)\]>$/.exec(line.args[0] ?? "")?.[1] ?? ""))))
+							own.has(Number.parseInt(line.args[0] ?? "", 10)) || ownPipes.has(endpoint ?? ""))))
 					taints.add("unsupported_syscall");
 			}
 			// git refreshes its index's stat cache when it can, and reports the same without it (the repository is read-only
