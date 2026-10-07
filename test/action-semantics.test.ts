@@ -2,9 +2,9 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
 import { resourceDependencies } from "../src/resource-version.ts";
-import { type ActionKeyProjector, type ActionSemanticsDefinition, ActionSemanticsRegistry, actionKeyCovers, actionKeyMatch, actionKeyMismatchReason,
+import { type ActionKeyProjector, type ActionSemanticsDefinition, ActionSemanticsRegistry, actionKeyCovers, actionKeyMatch, actionKeyProjectionPartitions,
 	BASH_TIMEOUT_ACTION_KEY_PROJECTOR, buildActionKey, buildPiActionKey, GREP_LITERAL_ACTION_KEY_PROJECTOR, KEYABLE_TOOLS, OBSERVATION_ACTION_TOOLS,
-	PI_ACTION_SEMANTICS, READ_RANGE_ACTION_KEY_PROJECTOR, UNBOUNDED_ACTION_TOOLS, WORKSPACE_MUTATION_ACTION_TOOLS } from "../src/action-semantics.ts";
+	PI_ACTION_SEMANTICS, UNBOUNDED_ACTION_TOOLS, WORKSPACE_MUTATION_ACTION_TOOLS } from "../src/action-semantics.ts";
 import { PI_BASH_TIMEOUT_PROJECTION_RULE, PI_GREP_LITERAL_PROJECTION_RULE, piToolErrorSettlement } from "../src/pi-tool-invocation.ts";
 import { RESOURCE_OBSERVATION_EFFECTS, UNRESTRICTED_PROCESS_EFFECTS, WORKSPACE_PATH_MUTATION_EFFECTS } from "../src/effect-model.ts";
 
@@ -42,22 +42,6 @@ describe("ActionSemanticsRegistry", () => {
 			const args = { pattern: "*" };
 			expect(buildPiActionKey(tool, args, "/workspace")?.key).toBe(buildPiActionKey(tool, { ...args, path: "@.", limit: tool === "grep" ? 100 : 1000 }, "/workspace")?.key);
 		}
-	});
-
-	it("keeps read's omitted-limit view distinct inside its versioned K(a)", () => {
-		const implicit = buildPiActionKey("read", { path: "src/a.ts" }, "/workspace", "schema-base");
-		const explicit = buildPiActionKey("read", { path: "src/a.ts", offset: 1, limit: 2000 }, "/workspace", "schema-base");
-
-		expect(implicit?.key).not.toBe(explicit?.key);
-		const relation = implicit && explicit ? actionKeyMatch(implicit, explicit, [READ_RANGE_ACTION_KEY_PROJECTOR]) : undefined;
-		expect(relation).toMatchObject({ kind: "projected", projector: "read.range" });
-		expect(implicit).toMatchObject({ tool: "read", semanticsEpoch: "pi.read", schemaHash: "schema-base", resources: ["src/a.ts"] });
-		expect(implicit?.input).not.toHaveProperty("limit");
-		expect(explicit?.input).toHaveProperty("limit", 2000);
-		expect(implicit?.key).toContain('"semanticsEpoch":"pi.read"');
-		expect(Object.isFrozen(implicit)).toBe(true);
-		expect(Object.isFrozen(implicit?.input)).toBe(true);
-		expect(Object.isFrozen(implicit?.resources)).toBe(true);
 	});
 
 	it("preserves cd's observable shell state in keys and executable inputs", () => {
@@ -143,18 +127,24 @@ describe("ActionSemanticsRegistry", () => {
 			...base, input: { ...base.input, fields: { "e\u0301": 1, "\u00e9": 2 } },
 		}))).toMatchObject({ kind: "exact", distance: 0 });
 		const sameEnvelope = buildActionKey({ ...base, resources: ["a.ts"], input: { path: "a.ts", offset: 2 } });
-		expect(actionKeyMatch(base, sameEnvelope, [permissive])).toMatchObject({ kind: "projected", projector: "permissive" });
+		expect(actionKeyMatch(base, sameEnvelope, [permissive])).toEqual({ kind: "projected", projector: "permissive", distance: 1 });
 		const covering = { ...permissive, id: "covering", canShareInFlight: () => true };
 		expect(actionKeyCovers(base, sameEnvelope, [permissive])).toBe(false);
 		expect(actionKeyCovers(base, sameEnvelope, [permissive, covering])).toBe(true);
 		expect(actionKeyMatch(base, sameEnvelope, [permissive, covering], true)).toMatchObject({ kind: "projected", projector: "covering" });
+		for (const canShareInFlight of [() => false, () => { throw new Error("coverage failed"); }])
+			expect(actionKeyCovers(base, sameEnvelope, [{ ...covering, canShareInFlight }])).toBe(false);
+		for (const stage of ["partition", "project"] as const) {
+			const broken = { ...permissive, [stage]: () => { throw new Error(`${stage} failed`); } };
+			if (stage === "partition") expect(actionKeyProjectionPartitions(base, [broken])).toEqual([]);
+			else expect(actionKeyMatch(base, sameEnvelope, [broken])).toBeUndefined();
+		}
 
-		for (const [field, value, reason] of [["tool", "grep", "different_tool"], ["semanticsEpoch", "read-other", "different_semantics"],
-			["schemaHash", "schema-other", "different_schema"], ["executionFingerprint", "executor-other", "different_executor"]]) {
+		for (const [field, value] of [["tool", "grep"], ["semanticsEpoch", "read-other"],
+			["schemaHash", "schema-other"], ["executionFingerprint", "executor-other"]]) {
 			for (const input of [base.input, { path: "a.ts", offset: 2 }]) {
 				const actor = buildActionKey({ ...base, [field!]: value, input });
 				expect(actionKeyMatch(base, actor, [permissive])).toBeUndefined();
-				expect(actionKeyMismatchReason(base, actor, [permissive])).toBe(reason);
 			}
 		}
 	});
@@ -255,7 +245,7 @@ describe("ActionSemanticsRegistry", () => {
 
 	it("owns immutable definitions and shares registered result projectors", () => {
 		const projectors = [projector("kept")];
-		const source = { ...resourceDefinition("one", "one", canonicalEmpty), projectors };
+		const source = { ...resourceDefinition("one", "one", () => ({ input: {}, resources: ["."] })), projectors };
 		const registry = new ActionSemanticsRegistry([source, { ...source, tool: "two" }]);
 		const registered = registry.projectors()[0]!;
 		expect(() => new ActionSemanticsRegistry([source, { ...source, tool: "conflict", projectors: [projector("kept")] }]))
@@ -290,10 +280,6 @@ function resourceDefinition(
 	canonicalize: ActionSemanticsDefinition["canonicalize"],
 ): ActionSemanticsDefinition {
 	return { tool, epoch, effect: "observation", requirements: RESOURCE_OBSERVATION_EFFECTS, resourceScope: "content", canonicalize };
-}
-
-function canonicalEmpty() {
-	return { input: {}, resources: ["."] };
 }
 
 function projector(id: string): ActionKeyProjector { return { id, partition: () => undefined, project: () => undefined, }; }

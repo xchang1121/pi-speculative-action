@@ -33,10 +33,7 @@ export class ActorAction<Candidate extends { readonly id: string } = { readonly 
 	private fallbackValue: { readonly cause: ResolutionCause; readonly candidateID?: string };
 	private resultCapture?: AuthoritativeResultCapture<Output>;
 
-	constructor(input: {
-		readonly identity: ActorActionIdentity;
-		readonly tool: string;
-		readonly actionKey?: ActionKey;
+	constructor(input: Pick<ActorAction<Candidate, Output>, "identity" | "tool" | "actionKey"> & {
 		readonly fallback: ResolutionCause;
 	}) {
 		this.identity = Object.freeze({ ...input.identity });
@@ -146,6 +143,7 @@ export class ActorAction<Candidate extends { readonly id: string } = { readonly 
 		return this.finish(Object.freeze({
 			kind: "actor",
 			origin: "fallback",
+			...this.fallbackValue,
 			durationMs: duration,
 			isError,
 			toolExecution,

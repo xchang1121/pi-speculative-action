@@ -39,6 +39,8 @@ export interface SpeculativeExecutionRoute {
 	readonly scope: ExecutionWorldScope;
 	readonly backend: string;
 	readonly fingerprint: string;
+	/** Backend-authenticated parent state this route can materialize; never a result-freshness proof. */
+	readonly acceptsCheckpoint?: (checkpoint: WorldCheckpoint) => boolean;
 }
 
 export function sameSpeculativeExecutionRoute(left: SpeculativeExecutionRoute, right: SpeculativeExecutionRoute): boolean {
@@ -97,6 +99,8 @@ export interface ExecutionOperationBinding {
 	readonly stale?: () => Promise<boolean>;
 	/** It reads what another process writes while it runs: alone, it runs only up to that input. */
 	readonly fed?: true;
+	/** Eligible to launch on current filesystem inputs without captured resources; not proof of parent independence or Actor freshness. */
+	readonly preparation?: "current_workspace";
 }
 
 /** Delivered only after the authoritative OS boundary confirms the internal result was consumed. */
@@ -239,24 +243,16 @@ export interface ExecutionWorldDiagnosticsContext extends ExecutionWorldPreparat
 	readonly refresh?: boolean;
 }
 
-/** Source-neutral world status consumed by hosts and UIs. */
-export interface ExecutionWorldDiagnosticSnapshot extends ExecutionWorldDiagnosticReport {
+/** Source-neutral world status; capabilities describe speculative execution, with observation reported separately below. */
+export interface ExecutionWorldDiagnosticSnapshot extends ExecutionWorldOperationDiagnostic {
 	readonly id: string;
 	readonly scope: ExecutionWorldScope;
 	readonly isolation: SpeculativeExecution;
-	/** Capabilities of speculative execution; observation reports its own capabilities below. */
-	readonly capabilities: EffectCapabilities;
-	/** Omitted means every tool whose effect contract is covered. */
-	readonly tools?: readonly string[];
 	/** Independently probed Actor-authorized observation, when the world provides it. */
 	readonly observation?: ExecutionWorldOperationDiagnostic;
 }
 
-export interface ExecutionWorldOperationDiagnostic extends ExecutionWorldDiagnosticReport {
-	readonly capabilities: EffectCapabilities;
-	/** Omitted means every tool whose effect contract is covered. */
-	readonly tools?: readonly string[];
-}
+export interface ExecutionWorldOperationDiagnostic extends ExecutionWorldDiagnosticReport, Pick<ExecutionWorldOperation, "capabilities" | "tools"> {}
 
 /** Fast, side-effect-free view of whether the registered worlds can route one effect contract. */
 export interface ExecutionCapabilityStatus {
@@ -285,7 +281,7 @@ export function executionCapabilityStatus(
 export interface ExecutionWorldOperation {
 	/** Atomic effects this operation can safely contain, observe, virtualize, or validate. */
 	readonly capabilities: EffectCapabilities;
-	/** Optional provider-native tool scope; effect capabilities remain the safety boundary. */
+	/** Optional provider-native tool scope; omitted means every covered tool, and effect capabilities remain the safety boundary. */
 	readonly tools?: readonly string[];
 	/** Stable identity of the concrete provider used for route-local reuse. */
 	readonly fingerprint?: (request: ExecutionWorldRequest) => string | Promise<string>;
@@ -298,6 +294,8 @@ export interface ExecutionWorldOperation {
 }
 
 export interface ExecutionWorldSpeculation<Context, Output> extends ExecutionWorldOperation {
+	/** Explicit ancestry interoperability across routes; implementations must authenticate the checkpoint and workspace. */
+	readonly acceptsCheckpoint?: (checkpoint: WorldCheckpoint, cwd: string) => boolean;
 	readonly execute: (context: Context) => Promise<WorldBranch<Output>>;
 }
 
@@ -463,13 +461,23 @@ export class ExecutionWorldRouter<Context, Output> {
 					const fingerprint = (await operation.fingerprint?.(request)) ?? `${world.id}:${world.isolation}`;
 					await operation.prepare?.(preparation);
 					this.observeRoute(world.id, kind, preparation.cwd, "ready", "Route prepared successfully");
-					const route = Object.freeze({
+					const acceptsCheckpoint = kind === "speculation" && request.effect !== "observation" && world.speculation?.acceptsCheckpoint;
+					const cwd = preparation.cwd;
+					const route: SpeculativeExecutionRoute = {
 						isolation: world.isolation,
 						reuse: request.effect === "observation" ? "shared_result" : "exclusive_branch",
 						scope,
 						backend: world.id,
 						fingerprint,
-					});
+					};
+					// Capability stays out of transaction snapshots, diagnostic serialization and copied routes.
+					if (acceptsCheckpoint) {
+						const owner = new WeakRef(acceptsCheckpoint), lifetime = new WeakRef(this.lifecycle);
+						Object.defineProperty(route, "acceptsCheckpoint", {
+							value: (checkpoint: WorldCheckpoint) => lifetime.deref()?.sealed === false && owner.deref()?.(checkpoint, cwd) === true,
+						});
+					}
+					Object.freeze(route);
 					const selection = select(world, route);
 					const selected = isPromiseLike(selection) ? await selection : selection;
 					if (selected !== undefined) return selected;

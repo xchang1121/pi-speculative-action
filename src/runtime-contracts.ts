@@ -4,10 +4,12 @@ import type { DrafterToolDefinition } from "./common.ts";
 import type { CandidateEventDescriptor, SpeculativeActionEvent } from "./events.ts";
 import type { ExecutionOperationAdoption, ExecutionOperationBinding, ExecutionScope, SpeculativeExecutionRoute, WorldBranch, WorldResultCapture } from "./execution-world.ts";
 import type { PlanAction, PlanProposal, PlanUpdate } from "./plan-proposal.ts";
-import type { ActorActionIdentity, ActorActionSettlement, PlanActionIdentity, PredictionSettlement } from "./settlement.ts";
+import type { ActorActionIdentity, ActorActionSettlement, PlanActionIdentity, PredictionSettlement, SettledSourceRequest } from "./settlement.ts";
 import type { TimelineInterval } from "./task-timing.ts";
 
 export type { SpeculativeActionEvent, SpeculativeCacheSnapshot } from "./events.ts";
+
+type TurnIdentity<SessionID> = Pick<TurnInput<SessionID>, "sessionID" | "turnID">;
 
 export interface SpeculativeActionSettings {
 	readonly enabled: boolean;
@@ -34,17 +36,12 @@ export type CandidatePreflight =
 	| { readonly ok: false; readonly reason: string; readonly detail?: string };
 
 /** Read-only execution view passed to host callbacks. Prediction facts are supplied separately. */
-export interface SpeculativeCandidate {
+export interface SpeculativeCandidate extends Pick<PlanAction, "tool" | "empiricalProbability" | "adoptionProbability" | "conditionalProbability" | "depth"> {
 	readonly id: string;
 	readonly key: ActionKey;
-	readonly tool: string;
 	readonly input: Readonly<Record<string, unknown>>;
 	readonly work?: { readonly execution?: { readonly executionMs?: number } };
 	readonly source?: string;
-	readonly empiricalProbability?: number;
-	readonly adoptionProbability?: number;
-	readonly conditionalProbability?: number;
-	readonly depth?: number;
 	readonly planDependencies?: PlanAction["dependsOn"];
 }
 
@@ -54,9 +51,8 @@ export interface AuthoritativeResultCapture<Output> extends WorldResultCapture<O
 }
 
 /** A validated, concrete prediction suitable for a target-model draft verifier. */
-export interface MaterializedSpeculativeCandidate<SessionID> {
-	readonly sessionID: SessionID;
-	readonly turnID: string;
+export interface MaterializedSpeculativeCandidate<SessionID> extends Pick<PlanAction,
+	"tool" | "depth" | "horizon" | "conditionalProbability" | "empiricalProbability" | "adoptionProbability" | "expectedLatencyBenefitMs" | "expectedDurationMs">, TurnIdentity<SessionID> {
 	/** Absolute Actor decision that this prediction is expected to match. */
 	readonly expectedDecisionSequence: number;
 	/** Last Actor decision for which the prediction may still be considered. */
@@ -64,36 +60,22 @@ export interface MaterializedSpeculativeCandidate<SessionID> {
 	readonly source: string;
 	readonly proposalID: string;
 	readonly actionID: string;
-	readonly tool: string;
 	/** Producer-facing arguments, before K(a) canonicalization or execution projection. */
 	readonly input: Readonly<Record<string, unknown>>;
 	/** Exact Actor-visible K(a) represented by the prediction and target-decoder draft. */
 	readonly predictedAction: ActionKey;
 	/** K(a) actually scheduled; it may cover the prediction through a lossless projection. */
 	readonly executionAction: ActionKey;
-	readonly depth?: number;
-	readonly horizon?: number;
-	readonly conditionalProbability?: number;
-	readonly empiricalProbability?: number;
-	readonly adoptionProbability?: number;
-	readonly expectedLatencyBenefitMs?: number;
-	readonly expectedDurationMs?: number;
 }
 
 /** The exact K(a) Runtime assigned to an authoritative Actor tool call. */
-export interface MaterializedActorAction<SessionID> {
-	readonly sessionID: SessionID;
-	readonly turnID: string;
+export interface MaterializedActorAction<SessionID> extends TurnIdentity<SessionID>, Pick<ActionKey, "tool" | "input"> {
 	readonly identity: ActorActionIdentity;
-	readonly tool: string;
-	readonly input: Readonly<Record<string, unknown>>;
 	readonly action: ActionKey;
 }
 
 /** Policy-facing authoritative settlement, kept separate from diagnostic events. */
-export interface ActorActionFeedback<SessionID> {
-	readonly sessionID: SessionID;
-	readonly turnID: string;
+export interface ActorActionFeedback<SessionID> extends TurnIdentity<SessionID> {
 	readonly action?: ActionKey;
 	readonly settlement: ActorActionSettlement;
 	/** Frozen candidate attribution supplied without routing policy through the event sink. */
@@ -103,9 +85,7 @@ export interface ActorActionFeedback<SessionID> {
 }
 
 /** Policy-facing prediction outcome with the tool context omitted from generic settlement identity. */
-export interface PredictionFeedback<SessionID> {
-	readonly sessionID: SessionID;
-	readonly turnID: string;
+export interface PredictionFeedback<SessionID> extends TurnIdentity<SessionID> {
 	readonly tool: string;
 	readonly action?: ActionKey;
 	readonly settlement: PredictionSettlement;
@@ -147,6 +127,8 @@ export interface SpeculativePlanSource<
 	readonly timeoutMs?: (settings: SpeculativeActionSettings) => number | undefined;
 	/** Stop requests that can only predict the next Actor decision once that decision arrives. */
 	readonly requestLifetime?: "actor_decision" | "turn";
+	/** Synchronous policy timing for still-owned requests; feedback cannot delay admission. */
+	readonly onRequestSettled?: (request: SettledSourceRequest) => void;
 	readonly multiStepEnabled?: (settings: SpeculativeActionSettings, feedback?: unknown) => boolean;
 	readonly proposalCount?: (settings: SpeculativeActionSettings) => number;
 	/** Admission policy for concurrent initial proposals targeting one Actor decision. */
@@ -265,19 +247,14 @@ export interface SpeculativeActionRuntimeAdapter<
 		readonly output: Output;
 		readonly candidate: SpeculativeCandidate;
 	}) => string | undefined;
-	readonly onTurnStarted?: (input: {
-		readonly startInput: StartInput;
+	readonly onTurnStarted?: (input: Pick<RuntimeTurnContext<StartInput, StateData>, "startInput" | "settings"> & {
 		readonly decisionSequence: number;
-		readonly settings: SpeculativeActionSettings;
 		readonly definitions: readonly DrafterToolDefinition[];
 		readonly candidateNames: readonly string[];
 		readonly signal?: AbortSignal;
 	}) => MaybePromise<void>;
-	readonly onTurnFinished?: (input: {
-		readonly startInput: StartInput;
-		readonly settings: SpeculativeActionSettings;
+	readonly onTurnFinished?: (input: Pick<RuntimeTurnContext<StartInput, StateData>, "startInput" | "settings"> & {
 		readonly terminal: boolean;
-		readonly durationMs: number;
 	}) => MaybePromise<void>;
 	/** Best-effort side channel; failures cannot affect candidate admission or Actor behavior. */
 	readonly onCandidateMaterialized?: (candidate: MaterializedSpeculativeCandidate<SessionID>) => MaybePromise<void>;
@@ -318,7 +295,7 @@ export interface SpeculativeActionRuntime<SessionID, Output, StartInput, Consume
 	readonly startTurn: (input: StartInput, signal?: AbortSignal) => Promise<void>;
 	/** Streamed Actor tool identity: prioritize complete predictions for that tool without matching them. */
 	readonly previewActorTool: (
-		input: { readonly sessionID: SessionID; readonly turnID: string; readonly tool: string },
+		input: TurnIdentity<SessionID> & { readonly tool: string },
 		signal?: AbortSignal,
 	) => Promise<void>;
 	/** Complete streamed Actor intent: prioritize matching work or start an isolated preview; never commit it. */

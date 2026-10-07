@@ -1,34 +1,35 @@
 import { describe, expect, it } from "vitest";
-import { DrafterUtilityGate } from "../src/drafter-utility-gate.ts";
+import { DrafterTaskBudget } from "../src/drafter-budget.ts";
+import { fauxAssistantMessage } from "@earendil-works/pi-ai";
+import { deferred } from "./async.ts";
+import { testModel } from "./model.ts";
 import { BenefitGate, DEFAULT_BENEFIT_GATE_POLICY as POLICY, type BenefitObservation } from "../src/fork-benefit-gate.ts";
 
 describe("fork benefit gate", () => {
-	it("keeps censored hit benefit unknown and charges only Actor-visible adoption latency", () => {
+	it("keeps censored hit benefit unknown and charges only Actor-visible adoption latency", async () => {
 		for (const expectedActorMs of [undefined, 50, 300]) {
-			const gate = new DrafterUtilityGate();
-			gate.finish(gate.start("drafter", true));
-			expect(gate.snapshot().samples).toBe(0);
-			for (let index = 0; index < 4; index++) {
-				const batch = gate.start("drafter", true);
-				expect(batch.allowed).toBe(true);
-				gate.requestStarted(batch); gate.requestStarted(batch);
-				gate.requestSettled(batch); gate.finish(batch);
-				expect(gate.snapshot().samples).toBe(index);
-				gate.requestSettled(batch);
-				gate.requestStarted(batch); gate.requestSettled(batch); // A late continuation runs beside the Actor.
-				gate.creditAdoption(batch, { hitLatencyMs: 100, expectedActorMs });
-				expect(gate.snapshot().samples).toBe(index + 1);
-				expect(gate.snapshot().expectedNetBenefitMs).toBe(expectedActorMs === undefined ? undefined : expectedActorMs - 100);
-			}
-			expect(gate.start("drafter", true).allowed).toBe(expectedActorMs === 300);
+			const budget = new DrafterTaskBudget(), batch = budget.start("drafter", true), pending = deferred<ReturnType<typeof fauxAssistantMessage>>();
+			batch.expectedBenefitMs = 1000; // Measured workflow hints may justify overlap before the final Actor outcome arrives.
+			const request = { model: testModel(), context: { messages: [] }, policy: { drafterTaskMaxRequests: 1000, drafterTaskMaxTokens: 1000000 },
+				options: { maxTokens: 80 }, complete: async () => fauxAssistantMessage([]) };
+			budget.finish(budget.start("unused", true)); expect(budget.utilitySnapshot().samples).toBe(0);
+			const first = budget.run({ ...request, utility: batch }), second = budget.run({ ...request, utility: batch, complete: () => pending.promise });
+			await first; budget.finish(batch); expect(batch.update).toBeUndefined();
+			await budget.run({ ...request, utility: batch }); // A continuation after turn closure runs beside the Actor.
+			pending.resolve(fauxAssistantMessage([])); await second;
+			budget.credit([batch], { hitLatencyMs: 100, expectedActorMs });
+			budget.start("drafter", true);
+			expect(budget.utilitySnapshot()).toMatchObject({ samples: 1, expectedNetBenefitMs: expectedActorMs === undefined ? undefined : expectedActorMs - 100 });
+			expect(batch.startedRequests).toBe(3); expect(batch.pendingRequests).toBe(0);
+			expect(Boolean(await budget.run({ ...request, utility: budget.start("drafter", true) }))).toBe(expectedActorMs === 300);
 			if (expectedActorMs === undefined) {
 				for (let index = 0, probes = 0; index < 128 && probes < 4; index++) {
-					const missed = gate.start("drafter", true);
-					if (!missed.allowed) continue;
+					const missed = budget.start("drafter", true);
+					if (!await budget.run({ ...request, utility: missed })) continue;
 					probes++;
-					gate.requestStarted(missed); gate.requestSettled(missed); gate.finish(missed);
+					budget.finish(missed);
 				}
-				expect(gate.start("drafter", true).allowed).toBe(false);
+				expect(await budget.run({ ...request, utility: budget.start("drafter", true) })).toBeUndefined();
 			}
 		}
 	});

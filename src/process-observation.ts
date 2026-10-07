@@ -98,7 +98,7 @@ export function workspaceStructureSnapshot(root: string, entries: Map<string, Wo
 			entries.set(name, { ...entry, aliases });
 		}
 	}
-	return Object.freeze({ root, entries, files: Math.max(0, entries.size - 1), bytesRead: 0, complete });
+	return Object.freeze({ root, entries, complete });
 }
 
 /** Capture one path without walking its descendants; used by typed mutation-frontier drivers. */

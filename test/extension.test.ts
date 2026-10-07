@@ -94,17 +94,24 @@ describe("zero-modification Pi extension", () => {
 	});
 
 	it("sends Drafter requests as simple options through the provider with registry auth", async () => {
-		const fixture = await createFixture(), message = { role: "assistant" }, streamSimple = vi.fn(() => ({ result: async () => message }));
+		const fixture = await createFixture(), message = { role: "assistant" }, payloads: unknown[] = [];
+		const payload = { tool_choice: "auto", tools: [{ function: { name: "read" } }], messages: [{ content: "private prompt" }] };
+		const selected = { ...payload, tool_choice: { type: "function", function: { name: "speculative_workflow" } }, tools: [...payload.tools, { name: "speculative_workflow" }] };
+		const onPayload = vi.fn(async () => selected), streamSimple = vi.fn((...[model, _context, options]: Parameters<CreateSpeculativeActionHostOptions["complete"]>) => ({
+			result: async () => { payloads.push((await options?.onPayload?.(payload, model)) ?? payload); return message; } }));
 		await fixture.emit("session_start");
 		Object.assign(fixture.context.modelRegistry, { getProvider: () => ({ streamSimple }),
 			getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "key", headers: { a: "1" }, baseUrl: "http://proxy" }) });
-		await expect(fixture.drafterComplete(testModel("mock"), { messages: [] }, { reasoning: "low", headers: { b: "2" } })).resolves.toBe(message);
+		await expect(fixture.drafterComplete(testModel("mock"), { messages: [] }, { reasoning: "low", headers: { b: "2" }, onPayload })).resolves.toBe(message);
 		expect(streamSimple).toHaveBeenCalledWith({ ...testModel("mock"), baseUrl: "http://proxy" }, { messages: [] },
-			{ reasoning: "low", apiKey: "key", headers: { a: "1", b: "2" }, env: {} });
-		expect(fixture.onDrafterResponse).toHaveBeenCalledWith(message, undefined);
+			{ reasoning: "low", apiKey: "key", headers: { a: "1", b: "2" }, env: {}, onPayload: expect.any(Function) });
+		expect(onPayload).toHaveBeenCalledWith(payload, { ...testModel("mock"), baseUrl: "http://proxy" });
+		expect(payloads[0]).toBe(selected);
+		expect(fixture.onDrafterResponse).toHaveBeenCalledWith(message, undefined, { toolChoice: selected.tool_choice, toolNames: ["read", "speculative_workflow"] });
 		fixture.onDrafterResponse.mockImplementationOnce(() => { throw new Error("report unavailable"); });
 		await expect(fixture.drafterComplete(testModel("mock"), { messages: [] }, { sessionId: "actor-probe" })).resolves.toBe(message);
-		expect(fixture.onDrafterResponse).toHaveBeenLastCalledWith(message, "actor-probe");
+		expect(payloads[1]).toBe(payload);
+		expect(fixture.onDrafterResponse).toHaveBeenLastCalledWith(message, "actor-probe", { toolChoice: "auto", toolNames: ["read"] });
 	});
 
 	it("warns once per unavailable Drafter model while drafting with the active model", async () => {
@@ -221,6 +228,7 @@ describe("zero-modification Pi extension", () => {
 			await actorGate.wait(); return { state: "unavailable", detail: "test route" };
 		});
 		const closeHost = vi.spyOn(fixture.host, "dispose");
+		fixture.onMetrics.mockImplementation(() => { throw new Error("report unavailable"); });
 		let refresh: Promise<unknown> | undefined, shutdown: Promise<void> | undefined;
 		try {
 			if (state !== "starting") await fixture.emit("session_start");
@@ -242,7 +250,7 @@ describe("zero-modification Pi extension", () => {
 				diagnostics: vi.mocked(fixture.host.executionWorldDiagnostics).mock.calls.length };
 			shutdown = fixture.emit("session_shutdown").then(() => { closed = true; });
 			await nextTurn();
-			const whileClosing = { closed, host: closeHost.mock.calls.length };
+			const whileClosing = { closed, host: closeHost.mock.calls.length, metrics: fixture.onMetrics.mock.calls.length };
 			searchGate.release();
 			await nextTurn();
 			if (state !== "starting" && state !== "retiring") expect({ refreshed, closed }).toEqual({ refreshed: false, closed: false });
@@ -250,7 +258,11 @@ describe("zero-modification Pi extension", () => {
 			await Promise.all([refresh, shutdown]);
 			const prepared = state === "starting" || state === "retiring" ? 1 : 2;
 			expect(whileSearchPending).toEqual({ refreshed: false, actor: prepared - 1, diagnostics: prepared });
-			expect(whileClosing).toEqual({ closed: false, host: state === "retiring" ? 1 : 0 });
+			expect(whileClosing).toEqual({ closed: false, host: 0, metrics: 0 });
+			expect(fixture.onMetrics.mock.calls.length).toBe(closeHost.mock.calls.length);
+			expect(fixture.onMetrics).toHaveBeenLastCalledWith(expect.objectContaining({ actorProcessReuse: expect.any(Object) }),
+				expect.objectContaining({ actorProcessReplay: state === "starting" ? { state: "idle", detail: "Checked on first Bash execution" }
+					: { state: "unavailable", detail: "test route" } }));
 			expect(prepare).toHaveBeenCalledTimes(prepared);
 			expect(profiles.map((profile) => profile.pool.dispose.mock.calls.length)).toEqual(Array(prepared).fill(1));
 		} finally {
@@ -471,7 +483,7 @@ describe("zero-modification Pi extension", () => {
 		await fixture.commands.get("speculative-action")?.handler("", fixture.context as ExtensionCommandContext);
 
 		expect(fixture.store.effective()).toMatchObject({
-			predictionTimeoutMs: 1, drafterMaxDepth: 1, drafterMaxTokens: 512,
+			predictionTimeoutMs: 1, drafterMaxDepth: 3, drafterMaxTokens: 512,
 			resourceCacheMaxBytes: 96 * 1024 * 1024,
 			executionStoreMaxEntries: 2048,
 			executionStoreMaxBytes: 768 * 1024 * 1024,
@@ -485,7 +497,7 @@ describe("zero-modification Pi extension", () => {
 		]));
 		expect(menus.get("Model Drafter")).not.toEqual(expect.arrayContaining([expect.stringMatching(/^Sampling temperature:/)]));
 		expect(menus.get("Model Drafter advanced")).toEqual(expect.arrayContaining([
-			"Pause drafts on estimated negative utility: On", "Follow-up tool steps: 1", "Maximum output tokens: 512",
+			"Pause drafts on estimated negative utility: On", "Follow-up tool steps: 3", "Maximum output tokens: 512",
 			"Temperature-0 candidates: 1", "Sampling temperature: 0.7-0.7",
 		]));
 		expect(configure).toHaveBeenLastCalledWith({ maxEntries: 2048, maxBytes: 768 * 1024 * 1024 });
@@ -595,9 +607,9 @@ async function createFixture(options: FixtureOptions = {}) {
 			})),
 	} as unknown as ExtensionAPI;
 	const createExecutionWorlds = vi.fn(() => options.executionWorlds ?? []);
-	const onDrafterResponse = vi.fn();
+	const onDrafterResponse = vi.fn(), onMetrics = vi.fn();
 	const factory = createSpeculativeActionExtension({
-		onDrafterResponse,
+		onDrafterResponse, onMetrics,
 		createHost: (_sessionID, configured) => { hostOptions = configured; return host; },
 		createSettingsStore: () => store,
 		...(options.defaultExecutionWorlds ? {} : { createExecutionWorlds }),
@@ -607,7 +619,7 @@ async function createFixture(options: FixtureOptions = {}) {
 		for (const handler of handlers.get(event) ?? []) await handler(payload as never, context);
 	};
 	return {
-		actorTools, baseTools, commands, context, createExecutionWorlds, customTools, cwd, emit, handlers, host, settle, onDrafterResponse,
+		actorTools, baseTools, commands, context, createExecutionWorlds, customTools, cwd, emit, handlers, host, settle, onDrafterResponse, onMetrics,
 		executionWorlds: () => hostOptions?.executionWorlds ?? [],
 		drafterComplete: (...args: Parameters<CreateSpeculativeActionHostOptions["complete"]>) => hostOptions!.complete(...args),
 		drafterModel: (actor: ReturnType<typeof testModel>) => (hostOptions!.draftModel as (actor: unknown) => unknown)(actor),

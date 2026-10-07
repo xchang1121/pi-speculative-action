@@ -34,7 +34,7 @@ export function createLinuxProcessExecutionWorld(
 	const describeOperation = (binding: ProcessExecutionBinding, permission: ActionKey) => {
 		const reference = new WeakRef(binding);
 		const overheads = new WeakRef(operationOverheads);
-		const descriptor = Object.freeze({ backend: "linux_process_reuse", identity: binding.key, permissionHash: permission.hash, ...(backend.fed(binding) ? { fed: true as const } : {}),
+		const descriptor = Object.freeze({ backend: "linux_process_reuse", identity: binding.key, permissionHash: permission.hash, ...backend.operationHints(binding),
 			get executionMs() { return reference.deref()?.executionMs ?? 0; },
 			get expectedDurationMs() {
 				const current = reference.deref();
@@ -71,6 +71,7 @@ export function createLinuxProcessExecutionWorld(
 		speculation: {
 			capabilities: UNRESTRICTED_PROCESS_EFFECTS.capabilities,
 			tools: options.tools,
+			acceptsCheckpoint: (checkpoint, cwd) => workspaceSandbox.acceptsCheckpoint(checkpoint, cwd),
 			fingerprint: async (request) => {
 				backendChecked = true;
 				const invocation = request.action ? processInvocation(request.action.executionContext) : undefined;

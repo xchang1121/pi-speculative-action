@@ -11,9 +11,8 @@ import { getModels, getProviders } from "@earendil-works/pi-ai/compat";
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { createSpeculativeActionHost } from "../src/agent-integration.ts";
 import { DEFAULTS } from "../src/common.ts";
-import { createSpeculativeActionExtension } from "../src/extension.ts";
+import { createSpeculativeActionExtension, type SpeculativeActionExtensionDependencies } from "../src/extension.ts";
 import type { DrafterTaskBudget } from "../src/drafter-budget.ts";
-import { LinuxProcessReuseBackend } from "../src/linux-process-backend.ts";
 import type { SpeculativeActionEvent } from "../src/runtime.ts";
 import { summarizeSpeculativeTrace } from "../src/trace-summary.ts";
 import { TaskTimeline, toolSpeedup } from "../src/task-timing.ts";
@@ -87,17 +86,17 @@ const options = {
 	label: values.label ?? "baseline",
 	actor: model(values.actor ?? "deepseek/deepseek-v4-pro"),
 	drafter: model(values.drafter ?? "deepseek/deepseek-v4-flash"),
-	drafterMaxDepth: nonNegativeInteger(values["drafter-max-depth"], "--drafter-max-depth"),
-	candidateLimit: positiveInteger(values["candidate-limit"], "--candidate-limit"),
-	...(values["drafter-max-tokens"] !== undefined ? { drafterMaxTokens: positiveInteger(values["drafter-max-tokens"], "--drafter-max-tokens") } : {}),
-	drafterTaskMaxRequests: positiveInteger(values["drafter-task-max-requests"], "--drafter-task-max-requests"),
-	drafterTaskMaxTokens: positiveInteger(values["drafter-task-max-tokens"], "--drafter-task-max-tokens"),
-	drafterDeterministicCandidates: nonNegativeInteger(values["drafter-deterministic-candidates"], "--drafter-deterministic-candidates"),
-	drafterTemperatureMin: nonNegativeNumber(values["drafter-temperature-min"], "--drafter-temperature-min"),
-	drafterTemperatureMax: nonNegativeNumber(values["drafter-temperature-max"], "--drafter-temperature-max"),
-	maxConcurrentActions: positiveInteger(values["max-concurrent-actions"], "--max-concurrent-actions"),
-	maxTurns: positiveInteger(values["max-turns"], "--max-turns"),
-	timeoutMs: positiveInteger(values["timeout-ms"], "--timeout-ms"),
+	drafterMaxDepth: numberOption("drafter-max-depth", "non-negative integer"),
+	candidateLimit: numberOption("candidate-limit"),
+	...(values["drafter-max-tokens"] !== undefined ? { drafterMaxTokens: numberOption("drafter-max-tokens") } : {}),
+	drafterTaskMaxRequests: numberOption("drafter-task-max-requests"),
+	drafterTaskMaxTokens: numberOption("drafter-task-max-tokens"),
+	drafterDeterministicCandidates: numberOption("drafter-deterministic-candidates", "non-negative integer"),
+	drafterTemperatureMin: numberOption("drafter-temperature-min", "non-negative number"),
+	drafterTemperatureMax: numberOption("drafter-temperature-max", "non-negative number"),
+	maxConcurrentActions: numberOption("max-concurrent-actions"),
+	maxTurns: numberOption("max-turns"),
+	timeoutMs: numberOption("timeout-ms"),
 	repoCache,
 	runRoot,
 	...(values.output ? { output: path.resolve(values.output) } : {}),
@@ -168,10 +167,9 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	const implementationCommit = (await command("git", ["rev-parse", "HEAD"], process.cwd())).stdout.trim();
 	const taskStartedAt = performance.now();
 	const events: SpeculativeActionEvent<string>[] = [];
-	const drafterPredictionTrace: Array<{
+	const drafterPredictionTrace: Array<Pick<AssistantMessage, "stopReason" | "model" | "responseModel" | "usage"> & {
 		readonly requestSessionID?: string;
-		readonly stopReason: string;
-		readonly usage: AssistantMessage["usage"];
+		readonly request?: Parameters<NonNullable<SpeculativeActionExtensionDependencies["onDrafterResponse"]>>[2];
 		readonly calls: readonly { readonly tool: string; readonly input: unknown }[];
 	}> = [];
 	// The installed extension owns every route (Linux process reuse, sandbox, snapshots); a shared state directory
@@ -197,9 +195,12 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	};
 	for (const name of Object.keys(process.env)) if (SECRET_VARIABLE.test(name)) delete process.env[name];
 	let drafterBudget: DrafterTaskBudget | undefined;
+	let finalMetrics: Parameters<NonNullable<SpeculativeActionExtensionDependencies["onMetrics"]>> | undefined;
 	const extension = createSpeculativeActionExtension({
-		onDrafterResponse: (message, requestSessionID) => drafterPredictionTrace.push({
-			...(requestSessionID ? { requestSessionID } : {}), stopReason: message.stopReason, usage: message.usage,
+		onMetrics: (metrics, routes) => { finalMetrics = [metrics, routes]; },
+		onDrafterResponse: (message, requestSessionID, request) => drafterPredictionTrace.push({
+			...(requestSessionID ? { requestSessionID } : {}), ...(request ? { request } : {}),
+			model: `${message.provider}/${message.model}`, responseModel: message.responseModel, stopReason: message.stopReason, usage: message.usage,
 			calls: message.content.flatMap((item) => item.type === "toolCall" ? [{ tool: item.name, input: item.arguments }] : []),
 		}),
 		createHost: (id, options) => {
@@ -211,8 +212,12 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	const sessionManager = SessionManager.inMemory(task.workspace);
 	const resourceLoader = new DefaultResourceLoader({ cwd: task.workspace, agentDir, settingsManager, noExtensions: true, extensionFactories: [extension] });
 	await resourceLoader.reload();
+	const modelRuntime = await ModelRuntime.create({ credentials, modelsPath: null, allowModelNetwork: false });
+	if (input.speculationEnabled && (input.drafterEnabled || input.selfSpeculation) &&
+		!modelRuntime.getAvailableSnapshot().some(model => model.provider === input.drafter.provider && model.id === input.drafter.id))
+		throw new Error(`Configured Drafter is unavailable: ${input.drafter.provider}/${input.drafter.id}`);
 	const { session } = await createAgentSession({
-		cwd: task.workspace, agentDir, model: input.actor, modelRuntime: await ModelRuntime.create({ credentials, modelsPath: null, refreshOnCreate: false }), thinkingLevel: "high", resourceLoader, settingsManager,
+		cwd: task.workspace, agentDir, model: input.actor, modelRuntime, thinkingLevel: "high", resourceLoader, settingsManager,
 		tools: ["read", "grep", "find", "ls", "bash", "edit", "write"], sessionManager,
 	});
 	await session.bindExtensions({ mode: "print" });
@@ -261,12 +266,8 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		[sessionManager.getHeader(), ...sessionManager.getEntries()].map((entry) => JSON.stringify(entry)).join("\n"));
 	const actorActions =Object.values(actorActionsByTool).reduce((sum, count) => sum + count, 0);
 	const summary = summarizeSpeculativeTrace(events);
-	const { candidateStartTrace, actorActionTrace, ...dimensions } = benchmarkTraceReport(events, actorActionsByTool, input.speculationEnabled);
-	const actualEndToEndMs = taskCompletedAt - taskStartedAt;
-	const hiddenLatencyMs = summary.hiddenLatencyMs;
+	const { sourceRequestTrace, predictionTrace, candidateTrace, actorActionTrace, ...dimensions } = benchmarkTraceReport(events, actorActionsByTool, input.speculationEnabled);
 	const toolWaitMs = toolTimeline.measure(taskCompletedAt).toolWaitMs;
-	const actorUsage = summarizeUsage(session.messages.filter((message) => message.role === "assistant"));
-	const drafterUsage = summarizeUsage(drafterPredictionTrace);
 	const changedFiles = lines((await command("git", ["-C", task.workspace, "diff", "--name-only"])).stdout);
 	const goldFiles = patchFiles(task.row.patch);
 	const testPatchFiles = patchFiles(task.row.test_patch);
@@ -286,38 +287,30 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			actor: `${actor.provider}/${actor.id}`,
 			drafter: `${drafter.provider}/${drafter.id}`,
 			timingScope: "setup, Agent prompt, terminal settlement, extension shutdown",
+			monotonicTimeOrigin: performance.timeOrigin,
 			patternState: input.patternState ?? "isolated-per-run",
 			executionBoundary: "installed extension routes",
-			processBackend: await processBackendReadiness(),
+			executionRoutes: finalMetrics ? { ...finalMetrics[1], primaryIDs: [...finalMetrics[1].primaryIDs] } : null,
 			workspace: task.workspace,
 		},
 		summary: {
 			...summary,
 			...dimensions,
-			actualEndToEndMs,
+			actorProcessReuse: finalMetrics?.[0].actorProcessReuse ?? null,
+			actualEndToEndMs: taskCompletedAt - taskStartedAt,
 			setupMs: agentStartedAt - taskStartedAt,
 			agentPromptMs: agentCompletedAt - agentStartedAt,
 			teardownMs: taskCompletedAt - agentCompletedAt,
 			toolWaitMs,
-			toolSpeedup: toolSpeedup({ toolWaitMs, hiddenLatencyMs }),
+			toolSpeedup: toolSpeedup({ toolWaitMs, hiddenLatencyMs: summary.hiddenLatencyMs }),
 			actorActions,
 			actorActionsByTool,
 			actorFallbacks: input.speculationEnabled ? summary.actorFallbacks : actorActions,
 			hitRate: actorActions ? summary.speculativeHits / actorActions : 0,
-			actorCost: actorUsage.cost,
-			drafterCost: drafterUsage.cost,
+			...summarizeUsage("actor", session.messages.filter((message) => message.role === "assistant")),
+			...summarizeUsage("drafter", drafterPredictionTrace),
 			drafterUsageScope: "all_responses_including_actor_probes",
 			drafterBudget: drafterBudget?.snapshot(),
-			actorTokens: actorUsage.tokens,
-			drafterTokens: drafterUsage.tokens,
-			actorInputTokens: actorUsage.inputTokens,
-			actorOutputTokens: actorUsage.outputTokens,
-			actorCacheReadTokens: actorUsage.cacheReadTokens,
-			actorCacheWriteTokens: actorUsage.cacheWriteTokens,
-			drafterInputTokens: drafterUsage.inputTokens,
-			drafterOutputTokens: drafterUsage.outputTokens,
-			drafterCacheReadTokens: drafterUsage.cacheReadTokens,
-			drafterCacheWriteTokens: drafterUsage.cacheWriteTokens,
 			turns,
 			turnLimitReached,
 			timedOut,
@@ -342,23 +335,28 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		},
 		traces: {
 			drafterPredictions: drafterPredictionTrace,
-			candidateStarts: candidateStartTrace,
+			sourceRequests: sourceRequestTrace,
+			predictions: predictionTrace,
+			candidates: candidateTrace,
 			// The Actor's wall time per call, beside its native service time, shows speculation's cost on its path.
 			actorActions: actorActionTrace.map((action) => {
-				const wait = toolWaits.get(action.id);
+				const wait = toolWaits.get(action.settlement.actorAction.id);
 				return { ...action, wallMs: wait?.completedAt === undefined ? undefined : wait.completedAt - wait.startedAt };
 			}),
-			toolWaits: [...toolWaits].map(([id, { startedAt, completedAt }]) => ({ id, startedAt, completedAt })),
+			// Event timestamps use epoch milliseconds; align the existing monotonic wait boundaries for joins.
+			toolWaits: [...toolWaits].map(([id, { startedAt, completedAt }]) => ({ id, startedAt: performance.timeOrigin + startedAt,
+				completedAt: completedAt === undefined ? undefined : performance.timeOrigin + completedAt })),
 		},
 	};
 }
 
-function summarizeUsage(messages: readonly { readonly usage: AssistantMessage["usage"] }[]) {
-	return messages.reduce((total, { usage }) => ({ cost: total.cost + usage.cost.total,
+function summarizeUsage(prefix: "actor" | "drafter", messages: readonly { readonly usage: AssistantMessage["usage"] }[]) {
+	const totals = messages.reduce((total, { usage }) => ({ cost: total.cost + usage.cost.total,
 		tokens: total.tokens + usage.totalTokens, inputTokens: total.inputTokens + usage.input,
 		outputTokens: total.outputTokens + usage.output, cacheReadTokens: total.cacheReadTokens + usage.cacheRead,
 		cacheWriteTokens: total.cacheWriteTokens + usage.cacheWrite,
 	}), { cost: 0, tokens: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 });
+	return Object.fromEntries(Object.entries(totals).map(([key, value]) => [`${prefix}${key[0]!.toUpperCase()}${key.slice(1)}`, value]));
 }
 
 function benchmarkShellEnvironment(): Record<string, string> {
@@ -423,21 +421,10 @@ function increment(counts: Record<string, number>, key: string): void {
 	counts[key] = (counts[key] ?? 0) + 1;
 }
 
-function positiveInteger(value: string | undefined, option: string): number {
-	const parsed = Number(value);
-	if (!Number.isInteger(parsed) || parsed <= 0) throw new Error(`${option} must be a positive integer`);
-	return parsed;
-}
-
-function nonNegativeInteger(value: string | undefined, option: string): number {
-	const parsed = Number(value);
-	if (!Number.isInteger(parsed) || parsed < 0) throw new Error(`${option} must be a non-negative integer`);
-	return parsed;
-}
-
-function nonNegativeNumber(value: string | undefined, option: string): number {
-	const parsed = Number(value);
-	if (!Number.isFinite(parsed) || parsed < 0) throw new Error(`${option} must be a non-negative number`);
+function numberOption(option: keyof typeof values, kind: "positive integer" | "non-negative integer" | "non-negative number" = "positive integer"): number {
+	const parsed = Number(values[option]);
+	if (!Number.isFinite(parsed) || (kind !== "non-negative number" && !Number.isInteger(parsed)) ||
+		(kind === "positive integer" ? parsed <= 0 : parsed < 0)) throw new Error(`--${option} must be a ${kind}`);
 	return parsed;
 }
 
@@ -458,11 +445,4 @@ function command(file: string, args: readonly string[], cwd?: string): Promise<C
 			resolve({ stdout, stderr });
 		});
 	});
-}
-
-/** Bash speculation runs only where the installed helpers pass their own check: a run records whether its routes had them. */
-async function processBackendReadiness() {
-	if (process.platform !== "linux") return { state: "unsupported" };
-	const { state, detail } = await new LinuxProcessReuseBackend({ storeRoot: path.join(os.tmpdir(), "pi-bench-backend-check") }).check();
-	return { state, detail };
 }

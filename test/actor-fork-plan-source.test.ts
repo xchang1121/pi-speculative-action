@@ -30,7 +30,6 @@ describe("actor fork plan source", () => {
 			{
 				id: "batch",
 				calls: [{ id: "call", index: 0, tool: "read", input }],
-				evidence: [],
 			},
 		]);
 		input.path = "changed.txt";
@@ -47,11 +46,11 @@ describe("actor fork plan source", () => {
 	it("declares its whole batch so peers continue from every forked call", async () => {
 		const fork = createActorForkPlanSource(), signal = new AbortController().signal;
 		fork.startTurn("turn");
-		fork.publish("turn", [{ id: "batch", calls: [{ id: "0:fork", index: 0, tool: "read", input: { path: "a" } }, { id: "1:fork", index: 1, tool: "grep", input: {} }], evidence: [] }]);
+		fork.publish("turn", [{ id: "batch", calls: [{ id: "0:fork", index: 0, tool: "read", input: { path: "a" } }, { id: "1:fork", index: 1, tool: "grep", input: {} }] }]);
 		const plans = await fork.source.propose({ startInput: { turnID: "turn" }, data: {}, candidateNames: ["read", "grep"], signal } as never) as unknown as readonly { actions: { id: string; feedback: unknown }[] }[];
 		expect(plans[0]!.actions.map(({ id, feedback }) => fork.source.continuationBatch!({ proposalID: "p", actionID: id, feedback }))).toEqual([["0:fork", "1:fork"], ["0:fork", "1:fork"]]);
 		fork.startTurn("mixed");
-		fork.publish("mixed", [{ id: "batch", calls: [{ id: "0:fork", index: 0, tool: "read", input: { path: "a" } }, { id: "1:fork", index: 1, tool: "bash", input: {} }], evidence: [] }]);
+		fork.publish("mixed", [{ id: "batch", calls: [{ id: "0:fork", index: 0, tool: "read", input: { path: "a" } }, { id: "1:fork", index: 1, tool: "bash", input: {} }] }]);
 		const [mixed] = await fork.source.propose({ startInput: { turnID: "mixed" }, data: {}, candidateNames: ["read"], signal } as never) as unknown as readonly { actions: { id: string; feedback: unknown }[] }[];
 		expect(mixed!.actions.map(({ id, feedback }) => [id, fork.source.continuationBatch!({ proposalID: "p", actionID: id, feedback })])).toEqual([["0:fork", undefined]]);
 	});

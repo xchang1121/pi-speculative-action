@@ -580,8 +580,18 @@ int main(int argc, char **argv) {
 				expect(JSON.stringify(binding)).not.toContain("private value");
 				await writeFile(path.join(fixture.workspace, "input.txt"), "after\n");
 				await expect(validateTransferredProcessEvidence(certificate!.dependencyCertificate)).resolves.toMatchObject({ status: "stale" });
+				const history = vi.spyOn(fixture.backend.store, "findByWeakKey").mockResolvedValue([certificate!]);
+				const validation = vi.spyOn(await import("../src/provenance-validation.ts"), "validateDynamicDependencyCertificate");
+				try {
+					for (const expected of [1, 2]) {
+						expect(await fixture.backend.bindingStale(binding!)).toBe(true);
+						expect(validation).toHaveBeenCalledTimes(expected); // The live/disk duplicate is checked once, afresh on the next call.
+					}
+				} finally { validation.mockRestore(); history.mockRestore(); }
 
+				let operationRoot = "";
 				await fixture.workspaceSandbox.withWorkspace(fixture.workspace, async workspace => {
+					operationRoot = workspace.processRoot;
 					const session = await fixture.backend.open({ sourceRoot: fixture.workspace, workspace, invocation, scope: later });
 					try {
 						const result = await session.executeBinding(binding!);
@@ -591,10 +601,10 @@ int main(int argc, char **argv) {
 						const validation = await session.validate();
 						expect(validation, JSON.stringify({ validation, metrics: session.metrics() })).toMatchObject({ status: "valid" });
 						await expect(session.executeBinding(binding!)).rejects.toThrow("already consumed");
-						expect(existsSync(path.join(workspace.processRoot, "process-interposition"))).toBe(false);
-						expect((await filesystem.readdir(workspace.processRoot)).filter(name => name.startsWith("broker-"))).toEqual([]);
 					} finally { await session.close(); }
+					expect((await filesystem.readdir(workspace.processRoot)).filter(name => name.startsWith("broker-"))).toEqual([]);
 				});
+				expect(existsSync(operationRoot)).toBe(false);
 
 				let output = "";
 				const result = await route.executor.execute({ command: command.replace("parent", "other-parent"), cwd: fixture.workspace,
@@ -652,6 +662,8 @@ int main(int argc, char **argv) {
 			expect(fixture.backend.actorMetrics().hits, JSON.stringify({ actor: fixture.backend.actorMetrics(), producer: fixture.backend.metrics() })).toBe(0);
 			binding ??= fixture.backend.executionBindings(later).at(-1);
 			expect(binding, "a real native miss must retain its launch without publishing a result").toBeDefined();
+			if (["completed", "native", "native-merged", "native-descriptors", "native-pipe-live"].includes(mode))
+				expect(fixture.backend.operationHints(binding!).preparation).toBe(mode === "native" || mode === "native-merged" ? "current_workspace" : undefined);
 			let retainedOperation: ExecutionOperationBinding | undefined;
 			if (mode === "native") for (const turnID of ["repeated-native-1", "repeated-native-2"]) {
 				const repeatedScope = { ...scope, turnID }; let output = "";
@@ -660,7 +672,7 @@ int main(int argc, char **argv) {
 				await fixture.world.observeOperations!({ action, scope: repeatedScope, learn: true }, () => route.executor.execute({ command: command.replace("parent", turnID),
 					cwd: fixture.workspace, environment: fixture.environment, scope: repeatedScope, onData: data => { output += data.toString(); } }), bindings => { retainedOperation ??= bindings.find(item => item.identity === binding!.key); });
 				expect(binding!.executionMs).not.toBe(previousMs);
-				expect(retainedOperation).toMatchObject({ executionMs: binding!.executionMs, expectedDurationMs: binding!.executionMs });
+				expect(retainedOperation).toMatchObject({ executionMs: binding!.executionMs, expectedDurationMs: binding!.executionMs, preparation: "current_workspace" });
 				expect(output).toBe(`${turnID}\nafter\n`);
 				expect(fixture.backend.executionBindings(later).filter(item => item.key === binding!.key)).toEqual([binding]);
 			}
@@ -1814,8 +1826,8 @@ int main(void) { int fds[2], status; char queue[8]; if (pipe(fds) || fds[0] != 3
 			expect(coordinator.actorDiagnostics().state).toBe("probing");
 			release(); await Promise.all([calls, refreshing]);
 			expect(held.execute).toHaveBeenCalledTimes(2); expect(invocation).toHaveBeenCalledTimes(2);
-			expect(planner).not.toHaveBeenCalled(); expect(admission).toHaveBeenCalledTimes(2);
-			expect(observed).toHaveBeenCalledTimes(2); expect(opening).toHaveBeenCalledTimes(2); expect(close).toHaveBeenCalledOnce();
+			expect(planner).not.toHaveBeenCalled(); expect(admission).not.toHaveBeenCalled();
+			expect(observed).not.toHaveBeenCalled(); expect(opening).toHaveBeenCalledTimes(2); expect(close).toHaveBeenCalledOnce();
 			expect(coordinator.actorDiagnostics().state).toBe("ready");
 			await invoke(); // Clearing evidence is rechecked even after the helper was initialized.
 			expect(host.execute).toHaveBeenCalledTimes(3); expect(invocation).toHaveBeenCalledTimes(2);
@@ -1880,6 +1892,10 @@ int main(void) { int fds[2], status; char queue[8]; if (pipe(fds) || fds[0] != 3
 				expect(held.execute, "outer evidence capture still owns possible publication").toHaveBeenCalledTimes(5);
 				captureGate.release(); await producing;
 			} finally { captureGate.release(); forking.mockRestore(); }
+			admission.mockRestore();
+			await invoke(); // A whole-shell certificate published after the empty lookup remains usable.
+			expect(fixture.backend.actorMetrics().wholeCommandHits).toBe(1);
+			expect(held.execute).toHaveBeenCalledTimes(5);
 			await fixture.backend.store.clear(); await invoke(); expect(host.execute).toHaveBeenCalledTimes(6);
 			opening.mockRejectedValueOnce(new Error("held-exec functional probe failed"));
 			await coordinator.refreshActorRoute();

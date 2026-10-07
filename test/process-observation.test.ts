@@ -21,7 +21,7 @@ describe("process observation", () => {
 		await fs.writeFile(target, beforeBytes);
 		await fs.mkdir(path.join(workspace, "nested"));
 		const limited = await captureWorkspaceStructure(workspace, { maxFiles: 1 });
-		expect([limited.complete, limited.files, limited.entries.size]).toEqual([false, 1, 2]);
+		expect([limited.complete, limited.entries.size]).toEqual([false, 2]);
 		const before = await captureWorkspaceStructure(workspace);
 		const captured = await captureStableFile(target);
 		await fs.writeFile(target, afterBytes);
@@ -30,8 +30,6 @@ describe("process observation", () => {
 		const afterEntry = after.entries.get("value.bin");
 		if (beforeEntry?.kind !== "file" || afterEntry?.kind !== "file") throw new Error("file structure missing");
 
-		expect(before.bytesRead).toBe(0);
-		expect(after.bytesRead).toBe(0);
 		expect("digest" in beforeEntry).toBe(false);
 		expect(beforeEntry.metadataDigest).toBe(afterEntry.metadataDigest);
 		// Same-size rapid rewrites can share observable timestamps on coarse-clock filesystems.

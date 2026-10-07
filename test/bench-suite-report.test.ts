@@ -2,6 +2,9 @@ import { EventEmitter } from "node:events";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { nearestRank, type SuiteBenchmarkRun, summarizePairs, summarizeSuite } from "../bench/suite-report.ts";
+import type { SpeculativeActionExtensionDependencies } from "../src/extension.ts";
+import { emptyWorldReuseMetrics } from "../src/execution-world.ts";
+import { emptySpeculativeTraceSummary } from "../src/trace-summary.ts";
 
 describe("ablation suite report", () => {
 	it.each([
@@ -64,9 +67,11 @@ describe("ablation suite report", () => {
 		}
 	});
 
-	it("retains prompt and every disposal failure with measured timing and usage", async () => {
+	it.each([false, true])("retains measured timing and usage through failures with final metrics %s", async reported => {
 		const originalArgv = process.argv, files = new Map<string, string>(), phases: string[] = [];
 		let now = 0, emit = (_event: unknown): void => {};
+		let reportMetrics = (): void => {};
+		const actorProcessReuse = { ...emptyWorldReuseMetrics(), requests: 2, hits: 1, wholeCommandRequests: 1 };
 		const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
 		const fail = (phase: string) => { phases.push(phase); throw new Error(`${phase} failed`); };
 		vi.resetModules();
@@ -91,13 +96,20 @@ describe("ablation suite report", () => {
 					now = 60; emit({ type: "tool_execution_end", toolCallId: "first" });
 					fail("prompt");
 				},
-				extensionRunner: { emit: async () => fail("shutdown") }, dispose: () => fail("dispose"),
+				extensionRunner: { emit: async () => { reportMetrics(); fail("shutdown"); } }, dispose: () => fail("dispose"),
 			} }),
-			DefaultResourceLoader: class { async reload() {} }, ModelRuntime: { create: async () => ({}) },
+			DefaultResourceLoader: class { async reload() {} }, ModelRuntime: { create: async ({ refreshOnCreate }: { refreshOnCreate?: boolean }) => ({
+				getAvailableSnapshot: () => refreshOnCreate === false ? [] : [{ provider: "offline", id: "model" }],
+			}) },
 			SessionManager: { inMemory: () => ({}) }, SettingsManager: { inMemory: () => ({}) },
 		}));
 		vi.doMock("../src/agent-integration.ts", () => ({ createSpeculativeActionHost: () => ({}) }));
-		vi.doMock("../src/extension.ts", () => ({ createSpeculativeActionExtension: () => ({}) }));
+		vi.doMock("../src/extension.ts", () => ({ createSpeculativeActionExtension: (options: SpeculativeActionExtensionDependencies) => {
+			reportMetrics = () => { if (reported) options.onMetrics?.({ ...emptySpeculativeTraceSummary(), actorProcessReuse }, {
+				worlds: [], primaryIDs: new Set(["linux_process"]), actorProcessReplay: { state: "ready", detail: "installed Actor route" },
+			}); };
+			return {};
+		} }));
 		vi.stubGlobal("fetch", async () => ({ ok: true, json: async () => ({ rows: [{ row: {
 			instance_id: "offline", repo: "offline/repo", base_commit: "commit", patch: "diff --git a/src/file.ts b/src/file.ts",
 			test_patch: "", problem_statement: "offline", language: "TypeScript", source_dataset: "offline",
@@ -109,8 +121,14 @@ describe("ablation suite report", () => {
 		try {
 			await expect(import("../bench/run.ts")).rejects.toThrow("Benchmark failed:");
 			expect(phases).toEqual(["prompt", "shutdown", "dispose"]);
-			const { metadata, summary } = JSON.parse(files.get(path.resolve("offline-result.json"))!);
-			expect(metadata).toMatchObject({ actor: "offline/model", drafter: "offline/model", drafterMaxDepth: 2 });
+			const { metadata, summary, traces } = JSON.parse(files.get(path.resolve("offline-result.json"))!);
+			expect(metadata).toMatchObject({ actor: "offline/model", drafter: "offline/model", drafterMaxDepth: 2, monotonicTimeOrigin: performance.timeOrigin });
+			expect(metadata.executionRoutes).toEqual(reported ? { worlds: [], primaryIDs: ["linux_process"],
+				actorProcessReplay: { state: "ready", detail: "installed Actor route" } } : null);
+			expect(summary.actorProcessReuse).toEqual(reported ? actorProcessReuse : null);
+			expect(summary.processReuse).toEqual(emptyWorldReuseMetrics());
+			expect(traces.toolWaits).toEqual([{ id: "first", startedAt: performance.timeOrigin + 10, completedAt: performance.timeOrigin + 60 },
+				{ id: "second", startedAt: performance.timeOrigin + 20, completedAt: performance.timeOrigin + 40 }]);
 			for (const key of ["repoCache", "runRoot", "output", "prepareOnly"]) expect(metadata).not.toHaveProperty(key);
 			expect(summary).toMatchObject({ patchCandidate: false, actorCost: 2, actorTokens: 13, toolWaitMs: 50, toolSpeedup: 1,
 				changedFiles: ["src/file.ts"], benchmarkErrors: Object.fromEntries(phases.map(phase => [phase, `Error: ${phase} failed`])),
@@ -125,7 +143,7 @@ describe("ablation suite report", () => {
 		}
 	});
 
-	it("includes slow failed tasks in timing while exposing every screening failure", () => {
+	it("includes repeated and slow failed tasks in timing while exposing every screening failure", () => {
 		const report = summarizeSuite([
 			run("task-a", 1, {
 				actualEndToEndMs: 100,
@@ -163,8 +181,11 @@ describe("ablation suite report", () => {
 			implementationCommits: ["commit"],
 			pooled: {
 				runs: 3,
+				instanceClusters: 2,
 				actualEndToEndMs: 1400,
+				actualEndToEndP95Ms: 1000,
 				toolWaitMs: 1400, hiddenLatencyMs: 50,
+				toolWaitP95Ms: 1000,
 				actualEndToEndMeanMs: 1400 / 3,
 				toolWaitMeanMs: 1400 / 3,
 				toolSpeedup: 1450 / 1400,
@@ -177,6 +198,7 @@ describe("ablation suite report", () => {
 				"task-b": { runs: 2, toolSpeedup: 1330 / 1300, hitRate: 0.1 },
 			},
 		});
+		expect(nearestRank([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 0.95)).toBe(10);
 		expect(report.invalidRuns).toEqual([
 			{
 				instance: "task-b",
@@ -192,25 +214,6 @@ describe("ablation suite report", () => {
 			{ ...run("a", 2, { toolWaitMs: 120 }), arm: "on" }, { ...run("a", 2, { toolWaitMs: 100 }), arm: "off" }, { ...run("b", 1, {}), arm: "on" }]);
 		expect(report).toMatchObject({ pairedToolSpeedup: 1, on: { runs: 3 }, off: { runs: 2 } });
 		expect(report.pairs).toEqual([{ instance: "a", repeat: 1, onToolWaitMs: 80, offToolWaitMs: 100 }, { instance: "a", repeat: 2, onToolWaitMs: 120, offToolWaitMs: 100 }]);
-	});
-
-	it("retains repeats in nearest-rank p95 and total-time ratios", () => {
-		const report = summarizeSuite(
-			[
-				run("task-a", 1, { actualEndToEndMs: 1000, toolWaitMs: 5, hiddenLatencyMs: 5 }),
-				run("task-a", 2, { actualEndToEndMs: 1000, toolWaitMs: 10, hiddenLatencyMs: 10 }),
-				run("task-b", 1, { actualEndToEndMs: 1000, toolWaitMs: 15, hiddenLatencyMs: 15 }),
-				run("task-b", 2, { actualEndToEndMs: 1000, toolWaitMs: 20, hiddenLatencyMs: 20 }),
-			],
-		);
-
-		expect(nearestRank([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 0.95)).toBe(10);
-		expect(report.pooled).toMatchObject({
-			instanceClusters: 2,
-			toolSpeedup: 2,
-			actualEndToEndP95Ms: 1000,
-			toolWaitP95Ms: 20,
-		});
 	});
 
 	it("retains zero-tool tasks without inventing a speedup", () => {

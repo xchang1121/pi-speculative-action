@@ -53,9 +53,9 @@ interface GateState {
 export class BenefitGate {
 	private readonly states = new Map<string, GateState>();
 
-	decide(key: string, policy: BenefitGatePolicy): BenefitDecision {
+	decide(key: string, policy: BenefitGatePolicy, forecastNetBenefitMs?: number): BenefitDecision {
 		const state = this.state(key);
-		const expected = mean(state.samples);
+		const expected = forecastNetBenefitMs ?? mean(state.samples);
 		const base = { samples: state.samples.length, ...(expected === undefined ? {} : { expectedNetBenefitMs: expected }) };
 		if (!policy.enabled) return { allowed: true, reason: "disabled", ...base };
 		const failing = consecutiveFailures(state) >= policy.failureThreshold;

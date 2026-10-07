@@ -2,10 +2,11 @@ import type { PlanAction } from "../src/plan-proposal.ts";
 import { gated, deferred, barrier, nextTurn } from "./async.ts";
 import { testBranch as world } from "./branch.ts";
 import { describe, expect, it, vi } from "vitest";
+import { benchmarkTraceReport } from "../bench/trace-report.ts";
 import { type ActionProjectionRule, READ_RANGE_ACTION_KEY_PROJECTOR } from "../src/action-key-projection.ts";
 import { buildPiActionKey, PI_ACTION_SEMANTICS, type ActionKey } from "../src/action-semantics.ts";
 import { EffectTransactionCoordinator, effectCommitFailure } from "../src/effect-transaction.ts";
-import { SALVAGE_MS, emptyWorldReuseMetrics, type SpeculativeExecutionRoute, type WorldBranch } from "../src/execution-world.ts";
+import { SALVAGE_MS, emptyWorldReuseMetrics, type ExecutionOperationBinding, type SpeculativeExecutionRoute, type WorldBranch } from "../src/execution-world.ts";
 import type {
 	MaterializedSpeculativeCandidate,
 	PreparedActorCall,
@@ -138,6 +139,19 @@ function harness<SessionID = string>(input: Partial<Pick<TestAdapter<SessionID>,
 	});
 	return { runtime, events, executions: () => executions, ready, summary: () => {
 		expect(summarizeSpeculativeTrace(events)).toEqual(liveSummary);
+		const report = benchmarkTraceReport(events, {}, true);
+		for (const [types, trace] of [
+			[["source_request"], report.sourceRequestTrace],
+			[["prediction", "operation_prediction"], report.predictionTrace],
+			[["candidate"], report.candidateTrace],
+			[["actor_action"], report.actorActionTrace],
+		] as const) {
+			expect(trace).toStrictEqual(events.filter(event => (types as readonly string[]).includes(event.type))
+				.map(({ cache: _cache, sessionID: _sessionID, ...event }) => event));
+		}
+		expect(Object.values(report.predictionsBySource).reduce((total, counts) => total + counts.settled, 0)).toBe(liveSummary.predictionsSettled);
+		expect(Object.fromEntries(Object.entries(report.predictionsBySource).filter(([, counts]) => counts.observed)
+			.map(([source, counts]) => [source, [counts.observed, counts.matched, counts.adopted]]))).toEqual(liveSummary.predictionsBySource);
 		return liveSummary;
 	} };
 }
@@ -529,15 +543,17 @@ describe("structural speculative runtime", () => {
 				match: { matched: true, adoption: { status: "adopted" } } }]);
 	});
 
-	it("settles matched and adopted as orthogonal facts exactly once", async () => {
+	it.each(["throw", "pending"])("settles matched and adopted exactly once despite %s request feedback", async (feedback) => {
 		const settlements: PredictionSettlement[] = [];
 		const issued = vi.fn(), admitted = vi.fn();
+		const requestSettled = vi.fn(() => { if (feedback === "throw") throw new Error("source policy failed"); return new Promise<void>(() => {}); });
 		const actionKey = vi.fn((tool: string, args: unknown) => buildPiActionKey(tool, args, "/workspace"));
 		const offered = plan("stale", {});
 		offered.actions[0]!.input = { path: "README.md" };
 		const source = planSource({
 			propose: ({ reportDraftTokens }) => { reportDraftTokens?.(3); return offered; },
 			onIssued: issued, onAdmitted: admitted,
+			onRequestSettled: requestSettled,
 			onSettled: ({ settlement }) => {
 				settlements.push(settlement);
 			},
@@ -572,6 +588,9 @@ describe("structural speculative runtime", () => {
 		expect(events.find((event) => event.type === "source_request")).toMatchObject({
 			request: { draftTokens: 3 }, totalDraftTokens: 3,
 		});
+		expect(requestSettled).toHaveBeenCalledOnce();
+		expect(requestSettled).toHaveBeenCalledWith(expect.objectContaining({ durationMs: expect.any(Number), draftTokens: 3,
+			request: expect.objectContaining({ kind: "proposal" }), settlement: { status: "produced", proposalCount: 1 } }));
 		expect(summary()).toMatchObject({ predictionsSettled: 1, predictionsObserved: 1, predictionsMatched: 1, predictionsAdopted: 0,
 			predictionPrecision: 1, adoptionYield: 0, predictionRejectedAfterMatch: { "freshness:resource_changed": 1 },
 			actorActions: 1, speculativeHits: 0, actorFallbacks: 1, totalDraftTokens: 3 });
@@ -613,19 +632,53 @@ describe("structural speculative runtime", () => {
 		} finally { await runtime.dispose(); }
 	});
 
-	it("spends operation learning probes only on native calls the source can observe", async () => {
-		const { runtime } = harness({ source: planSource({ propose: () => undefined,
-			observesOperations: action => action.tool === "bash", observe: () => undefined }), execute: async () => "unused" });
+	it("budgets learning by observable service and credits only the captured binding's distinct adoptions", async () => {
+		const binding: ExecutionOperationBinding = Object.freeze({ backend: "process", identity: "child", permissionHash: "parent", executionMs: 800, expectedDurationMs: 800 });
+		const bindings = [binding, Object.freeze({ ...binding })], receipts: NonNullable<Parameters<TestAdapter["executeCandidate"]>[0]["onOperationAdopted"]>[] = [];
+		const { runtime, events } = harness({ source: planSource({ propose: ({ startInput }) => startInput.turnID !== "reuse" ? undefined : {
+			...plan("reuse"), actions: bindings.map((operation, index) => ({ ...readAction(`child:${index}`, { path: `operation:${index}` }),
+				type: "operation" as const, operation, producesOperations: true as const })) },
+			observesOperations: action => action.tool === "bash", observe: () => undefined }),
+			executeCandidate: async ({ candidate, onOperationAdopted }) => {
+				receipts[bindings.indexOf(candidate.operation!)] = onOperationAdopted!;
+				return world("child", { validate: async () => validResource() });
+			} });
+		let index = 0, turnID = "learning";
+		const native = async (duration: number, operations?: typeof bindings) => {
+			const prepared = await runtime.prepareActorCall({ ...call(turnID, { command: `worker ${index}` }), tool: "bash", id: `call:${index++}` });
+			await prepared?.settle(simulatedExecution(duration), "actor", operations); return prepared?.observeOperations;
+		};
 		try {
 			await runtime.startTurn(start("learning"));
-			const learned: number[] = [];
-			for (let index = 0; index < 16; index++) {
-				const passive = await runtime.prepareActorCall({ ...call("learning", { path: `f${index}` }), id: `read:${index}` });
-				expect(passive?.observeOperations).toBe(false); await passive?.settle(simulatedExecution(2), "read");
-				const prepared = await runtime.prepareActorCall({ ...call("learning", { command: `worker ${index}` }), tool: "bash", id: `call:${index}` });
-				learned.push(Number(prepared?.observeOperations === true)); await prepared?.settle(simulatedExecution(10), "actor");
-			}
-			expect(learned.join("")).toBe("1111000100000001");
+			for (let probe = 0; probe < 4; probe++) expect(await native(10)).toBe(true);
+			expect(await native(1000, [binding])).toBe(true); // Cheap discovery did not spend the slow call's time budget.
+			const passive = await runtime.prepareActorCall({ ...call("learning", { path: "unobserved" }), id: "read" });
+			expect(passive?.observeOperations).toBe(false); await passive?.settle(simulatedExecution(10000), "read");
+			for (let probe = 0; probe < 3; probe++) expect(await native(1000)).toBe(false); // Untraced native service repays debt.
+			expect(await native(1000)).toBe(true); // A newer, unrelated capture must not own the earlier binding's benefit.
+			await runtime.finishTurn({ ...call(turnID), terminal: false });
+			await runtime.startTurn(start(turnID = "reuse"));
+			await expect.poll(() => receipts.filter(Boolean).length).toBe(2);
+			const receipt = { scope: start("reuse"), id: "consume", sequence: 1, operationIdentity: "child", executionMs: 800 };
+			receipts[1]!({ ...receipt, id: "unowned-consume" }); // Equal identity strings are not capture provenance.
+			receipts[0]!({ ...receipt, scope: { ...receipt.scope, sessionID: "other" } });
+			receipts[0]!({ ...receipt, operationIdentity: "other" });
+			expect(await native(0)).toBe(false);
+			receipts[0]!(receipt);
+			expect(await native(100)).toBe(true);
+			receipts[0]!({ ...receipt });
+			expect(await native(100)).toBe(true);
+			expect(await native(0)).toBe(false); // A duplicate receipt did not refill credit.
+			receipts[0]!({ ...receipt, id: "another-consume", sequence: 2 });
+			const pending = await Promise.all(Array.from({ length: 5 }, (_, probe) => runtime.prepareActorCall({
+				...call(turnID, { command: `parallel ${probe}` }), tool: "bash", id: `parallel:${probe}` })));
+			expect(pending.map(prepared => prepared?.observeOperations)).toEqual([true, true, true, true, false]);
+			for (const prepared of pending) await prepared?.settle(simulatedExecution(0), "actor");
+			await runtime.finishTurn({ ...call("reuse"), terminal: true });
+			expect(events.filter(event => event.type === "operation_prediction")).toMatchObject([
+				{ settlement: { match: { matched: true, adoption: { status: "adopted" } } } },
+				{ settlement: { match: { matched: true, adoption: { status: "adopted" } } } },
+			]);
 		} finally { await runtime.dispose(); }
 	});
 
@@ -874,21 +927,26 @@ describe("structural speculative runtime", () => {
 		}
 	});
 
-	it("keeps failed and late Actor tool waits in the originating task", async () => {
+	it("keeps failed and late Actor tool waits on one timeline despite wall-clock jumps", async () => {
 		let now = 100;
 		const clock = vi.spyOn(performance, "now").mockImplementation(() => now), gate = barrier();
-		const { runtime, events } = harness({ source: planSource({ propose: () => undefined }) });
+		const wallClock = vi.spyOn(Date, "now").mockReturnValue(performance.timeOrigin + 100_000);
+		const { runtime, events, summary } = harness({ source: planSource({ propose: () => undefined }) });
 		try {
 			await runtime.startTurn(call("old"));
 			const pending = runtime.trackActorTool("session", async () => { await gate.promise; throw new Error("late failure"); });
 			const failure = expect(pending).rejects.toThrow("late failure");
 			now = 150; await runtime.finishTurn({ ...call("old"), terminal: true });
+			wallClock.mockReturnValue(performance.timeOrigin - 100_000);
 			now = 200; await runtime.startTurn(call("new"));
 			await expect(runtime.trackActorTool("session", async () => { now += 5; throw new Error("current failure"); })).rejects.toThrow("current failure");
 			now = 300; gate.arrive(); await failure;
 			await runtime.finishTurn({ ...call("new"), terminal: true });
 			expect(events.filter(event => event.type === "task").map(event => event.timing.toolWaitMs)).toEqual([50, 5]);
-		} finally { gate.arrive(); await runtime.dispose(); clock.mockRestore(); }
+			expect(events.filter(event => event.type === "task").map(event => event.timestamp)).toEqual([150, 300].map(time => performance.timeOrigin + time));
+			expect(events.every(event => event.timestamp >= performance.timeOrigin + 100 && event.timestamp <= performance.timeOrigin + 300)).toBe(true);
+			summary();
+		} finally { gate.arrive(); await runtime.dispose(); clock.mockRestore(); wallClock.mockRestore(); }
 	});
 
 	it.each(["same", "alternate", "stale-before", "stale-after", "incompatible", "indeterminate", "exclusive", "denied"] as const)(
@@ -960,8 +1018,10 @@ describe("structural speculative runtime", () => {
 		const proposalsEntered = barrier(2);
 		const admission = gated();
 		const requestsSettled = barrier(2);
+		const requestSettled = vi.fn();
 		const source = planSource({
 			requestLifetime: "actor_decision",
+			onRequestSettled: requestSettled,
 			proposalCount: () => 2,
 			propose: ({ proposalIndex, signal }) => {
 				entered++;
@@ -990,6 +1050,7 @@ describe("structural speculative runtime", () => {
 		expect(events.filter((event) => event.type === "source_request" && event.request.settlement.status === "aborted")).toHaveLength(1);
 		await prepared?.settle(simulatedExecution(1), "actor");
 		await runtime.finishTurn({ ...call("turn"), terminal: true });
+		expect(requestSettled.mock.calls.map(([request]) => request.settlement.status)).toEqual(["produced"]);
 		expect(runtime.inspect().pendingPredictions).toBe(0);
 	});
 
@@ -1451,19 +1512,37 @@ describe("structural speculative runtime", () => {
 		} finally { await runtime.dispose(); }
 	});
 
-	it.each(["adopt", "salvage", "cancel"])("keeps running work through an unbounded native call until %s", async mode => {
+	it.each(["adopt", "salvage", "cancel", "orphan-preview", "owned-preview"])("retires unowned previews while retaining demanded or independently predicted work: %s", async mode => {
 		const started = deferred<void>(), release = deferred<void>();
 		const timers = vi.spyOn(globalThis, "setTimeout"), cleared = vi.spyOn(globalThis, "clearTimeout"), disposed = vi.fn();
+		const admission = vi.spyOn(SpeculationScheduler.prototype, "assessCandidateJoin");
 		let acceptScope: Parameters<TestAdapter["executeCandidate"]>[0]["acceptOperationScope"];
+		let executionSignal: AbortSignal;
 		const { runtime, ready } = harness({ actionKey: (tool, args) => buildPiActionKey(tool, args, process.cwd()),
 			resolveExecution: ({ tool }) => tool === "read" ? mode === "adopt" ? RESOURCE_ROUTE : { ...MUTATION_ROUTE, isolation: "runtime_sandbox" } : undefined,
-			source: planSource({ propose: ({ startInput }) => startInput.turnID === "turn" ? plan("read") : undefined }),
-			executeCandidate: async ({ acceptOperationScope }) => {
+			source: planSource({ propose: ({ startInput }) => startInput.turnID === "turn" && mode !== "orphan-preview" ? plan("read") : undefined }),
+			executeCandidate: async ({ acceptOperationScope, signal }) => {
+				executionSignal = signal; signal.addEventListener("abort", () => release.resolve(), { once: true });
 				acceptScope = acceptOperationScope; started.resolve(); await release.promise;
 				return world("speculative", { validate: async () => validResource(), onDispose: disposed });
 			} });
 		try {
-			await runtime.startTurn(start("turn")); await started.promise;
+			await runtime.startTurn(start("turn"));
+			if (mode === "orphan-preview") await runtime.previewActorCall(call("turn"));
+			await started.promise;
+			if (mode.endsWith("preview")) {
+				if (mode === "owned-preview") await runtime.previewActorCall(call("turn"));
+				else admission.mockReturnValueOnce({ allowed: false, reason: "fallback_faster", waitBudgetMs: 0,
+					speculativeSamples: 1, actorSamples: 1, adoptionSamples: 0, expectedRemainingMs: 10, expectedAdoptionMs: 0, expectedActorMs: 1 });
+				const prepared = await runtime.prepareActorCall(mode === "orphan-preview" ? call("turn") : { ...call("turn"), tool: "bash", input: { command: "git status" } });
+				expect(prepared?.output).toBeUndefined();
+				expect(executionSignal!.aborted).toBe(mode === "orphan-preview");
+				expect(timers.mock.calls.some(([, delay]) => Number(delay) > SALVAGE_MS / 2)).toBe(false);
+				if (mode === "orphan-preview") await vi.waitFor(() => expect(disposed).toHaveBeenCalledOnce());
+				else { expect(disposed).not.toHaveBeenCalled(); release.resolve(); await ready.promise; }
+				await prepared!.settle(simulatedExecution(1), "actor");
+				return;
+			}
 			await runFallback(runtime, { ...call("turn"), id: "native", tool: "bash", input: { command: "git status" } });
 			if (mode === "adopt") {
 				release.resolve(); expect((await runtime.prepareActorCall(call("turn")))?.output).toBe("speculative");
@@ -1484,8 +1563,10 @@ describe("structural speculative runtime", () => {
 					expect(acceptScope!(start("turn"), true)).toBe(false);
 				}
 			}
-		} finally { release.resolve(); await runtime.dispose(); timers.mockRestore(); cleared.mockRestore(); }
-		expect(disposed).toHaveBeenCalledOnce();
+		} finally {
+			release.resolve(); await runtime.dispose(); timers.mockRestore(); cleared.mockRestore(); admission.mockRestore();
+			expect(disposed).toHaveBeenCalledOnce();
+		}
 	});
 
 	it.each([false, true])("re-validates finished exclusive work off the Actor path after an unbounded native call (stale=%s)", async (stale) => {
@@ -1538,20 +1619,26 @@ describe("structural speculative runtime", () => {
 
 	it.each(["workspace_mutation", "unbounded"] as const)("skips input retrieval for a bound %s action while retaining exact results", async effect => {
 		const authorize = vi.fn(() => ({ ok: true as const })), reconstruct = vi.fn(async () => ({ output: "query" }));
+		const service = vi.spyOn(SpeculationScheduler.prototype, "observeActorService"), forecast = vi.spyOn(SpeculationScheduler.prototype, "evaluate");
 		const { runtime, ready } = harness({ source: planSource({ propose: () => plan("inputs", { path: "input", offset: 1, limit: 1 }) }),
 			actionKey: (tool, args) => PI_ACTION_SEMANTICS.buildKey(tool, args, "/workspace", "", (args as Record<string, unknown>).offset === 2 ? {
-				fingerprint: "bound", semantics: { ...PI_ACTION_SEMANTICS.definition("read")!, epoch: `bound.${effect}`, effect },
+				fingerprint: "bound", semantics: { ...PI_ACTION_SEMANTICS.definition("read")!, epoch: `bound.${effect}`, effect, resourceScope: undefined,
+					requirements: PI_ACTION_SEMANTICS.definition(effect === "workspace_mutation" ? "write" : "bash")!.requirements },
 			} : undefined), authorizeCandidate: authorize,
 			execute: () => ({ ...world("source", { validate: async () => validResource() }), reconstruct,
 				inputResources: [{ path: "/workspace/input" }], reconstructionScope: "current_action" as const }),
 		});
 		try {
 			await runtime.startTurn(start("turn")); await ready.promise;
-			expect((await runtime.prepareActorCall(call("turn", { path: "input", offset: 2, limit: 1 })))?.output).toBeUndefined();
+			const prepared = await runtime.prepareActorCall(call("turn", { path: "input", offset: 2, limit: 1 }));
+			expect(prepared?.output).toBeUndefined();
 			expect(authorize).not.toHaveBeenCalled(); expect(reconstruct).not.toHaveBeenCalled();
 			expect((await runtime.prepareActorCall({ ...call("turn", { path: "input", offset: 1, limit: 1 }), id: "exact" }))?.output).toBe("source");
 			expect(authorize).toHaveBeenCalledOnce(); expect(reconstruct).not.toHaveBeenCalled();
-		} finally { await runtime.dispose(); }
+			await prepared!.settle(simulatedExecution(10), "actor");
+			expect(service.mock.calls[0]![0]).toMatchObject({ semanticsEpoch: `bound.${effect}`, executionFingerprint: "bound" });
+			expect(new Set(forecast.mock.calls.flatMap(([forecasts]) => forecasts).filter(value => value.actionKeyHash).map(value => value.semanticsEpoch))).toEqual(new Set([PI_ACTION_SEMANTICS.definition("read")!.epoch]));
+		} finally { await runtime.dispose(); service.mockRestore(); forecast.mockRestore(); }
 	});
 
 	it.each([[2, 4096, 0, 2, 10], [1, 4096, 0, 3, 10], [2, 128, 0, 3, 10], [2, 4096, 4096, 2, 10], [2, 4096, 0, 2, 10000]])("bounds sealed query results by %i entries and %i bytes with %i proof bytes (%i evaluations, %ims source)", async (entries, bytes, proofBytes, evaluations, sourceMs) => {
@@ -1908,7 +1995,7 @@ describe("structural speculative runtime", () => {
 		const settlements: PredictionSettlement[] = [];
 		const filtered = mode.startsWith("feedback-");
 		let admissions = 0, proposals = 0, routes = 0, validations = 0, changed = false;
-		const { runtime, events, executions: executionCount } = harness({
+		const { runtime, events, summary, executions: executionCount } = harness({
 			source: planSource({ enabled: () => !dual, proposalCount: () => sourceCount,
 				continueOn: filtered ? () => { continued.arrive(); if (mode === "feedback-error") throw new Error("feedback failure"); return false; } : ["execution_succeeded"],
 				propose: async ({ startInput, proposalIndex }) => {
@@ -1997,6 +2084,7 @@ describe("structural speculative runtime", () => {
 				expect(events.find((event) => event.type === "task")).toMatchObject({ timing: { authoritativeToolCount: 2 } });
 			}
 			expect(executionCount()).toBe(distinct || mode === "prediction-first" ? 2 : 1);
+			summary();
 		} finally { proposalGate.release(); admissionGate.arrive(); executionGate.arrive(); validationGate.release(); lateProposal.release(); await runtime.dispose(); }
 		expect(disposed).toHaveBeenCalledTimes(executionCount());
 	});

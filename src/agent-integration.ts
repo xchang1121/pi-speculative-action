@@ -3,7 +3,7 @@ import type { Api, Context, Model } from "@earendil-works/pi-ai";
 import { validateToolArguments } from "@earendil-works/pi-ai";
 import { type ActionProjectionRule, resolveActionProjectionRules } from "./action-key-projection.ts";
 import { buildActionKey, type ActionKey, type ActionSemanticsRegistry, PI_ACTION_SEMANTICS } from "./action-semantics.ts";
-import { createResourceSnapshotExecutionWorld, type AgentExecutionWorld } from "./agent-execution-world.ts";
+import { createResourceSnapshotExecutionWorld, type AgentExecutionWorld, type SpeculativeToolExecutionContext } from "./agent-execution-world.ts";
 import { clampCandidateLimit, DEFAULTS, type DrafterRequestSettings, normalizeDrafterRequestSettings,
 	normalizeSpeculativeToolSelection } from "./common.ts";
 import type { AgentConsumeInput, AgentStartInput, AgentStateData } from "./agent-runtime-types.ts";
@@ -65,18 +65,15 @@ export function normalizeSpeculativeAgentSettings(input: SpeculativeAgentSetting
 	} as const;
 }
 
-export interface SpeculativeAgentPreflightContext {
-	readonly tool: AgentTool;
-	readonly toolName: string;
-	readonly args: unknown;
-	readonly action: ActionKey;
+export interface SpeculativeAgentPreflightContext extends Pick<SpeculativeToolExecutionContext, "tool" | "toolName" | "args" | "action" | "signal"> {
 	readonly route: SpeculativeExecutionRoute;
-	readonly signal: AbortSignal;
 }
 
 export type { DraftOptionsContext } from "./agent-runtime-types.ts";
 
 export interface CreateSpeculativeActionHostOptions extends Omit<Parameters<typeof createDrafterPlanSource>[0], "sessionID"> {
+	/** Canonical K(a), projection, and resource-version semantics for this host. */
+	readonly actionSemantics?: ActionSemanticsRegistry;
 	/** Workspace root used for action canonicalization and resource validation. */
 	readonly cwd: string;
 	/** Runtime settings. The feature remains disabled when omitted. */
@@ -88,8 +85,6 @@ export interface CreateSpeculativeActionHostOptions extends Omit<Parameters<type
 	 * Candidates are rejected when this callback is absent.
 	 */
 	readonly preflight?: (context: SpeculativeAgentPreflightContext) => boolean | CandidatePreflight | Promise<boolean | CandidatePreflight>;
-	/** Canonical K(a), projection, and resource-version semantics for this host. */
-	readonly actionSemantics?: ActionSemanticsRegistry;
 	/** Lossless Π rules; each rule owns key relation, realized coverage, and output reconstruction. */
 	readonly projectionRules?: readonly ActionProjectionRule<ToolSettlement>[];
 	/** Actor probe source shared with the decoder-feedback coordinator. */
@@ -211,11 +206,8 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 		};
 	};
 	const drafterPlans = createDrafterPlanSource({
+		...options,
 		sessionID,
-		draftModel: options.draftModel,
-		getDraftOptions: options.getDraftOptions,
-		complete: options.complete,
-		drafterBudget: options.drafterBudget,
 		patternHints: (hint) => patternPlans.hints(hint),
 	});
 	const patternPlans = createPatternPlanSource({
@@ -422,8 +414,7 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 								// The Actor's own failed command carries its exit code, as a speculative one does.
 								const output = settlement.status === "succeeded"
 									? { result: settlement.output, isError: false } : piToolErrorSettlement(input.tool, settlement.error);
-								await (operations ? prepared.settle(settlement.toolExecution, output, operations)
-									: prepared.settle(settlement.toolExecution, output));
+								await prepared.settle(settlement.toolExecution, output, operations);
 							},
 						}
 					: {}),

@@ -30,7 +30,7 @@ import { resolveHostExecutable } from "./executable-path.ts";
 import { assertNoSymlinkPath, captureFilesystemEntry, captureStableFile, hashExecutableFile, mapFilesystem, rememberCapture, sameFilesystemIdentity, sharedWalk, walkFilesystemPath } from "./filesystem-evidence.ts";
 import { captureHeldDescriptorInputs, inspectHeldExecProcess, LinuxHeldExecBoundary, listenUnixSocket, resolveLinuxExecHelper, type HeldExecDecision,
 	type HeldExecProcess, type HeldExecSnapshot, descriptorInputs, descriptorEffects, inheritedTracer, type ProcessResourceGraph } from "./linux-held-exec.ts";
-import { emptyWorldReuseMetrics, snapshotExecutionScope, type ExecutionScope, type ExecutionOperationAdoption, type ExecutionWorldStorageControl,
+import { emptyWorldReuseMetrics, snapshotExecutionScope, type ExecutionScope, type ExecutionOperationAdoption, type ExecutionOperationBinding, type ExecutionWorldStorageControl,
 	type WorldReuseMetrics } from "./execution-world.ts";
 import { type ProcessReusePlan, ProcessReusePlanner } from "./reuse-planner.ts";
 import { ProvenanceCertificateStore, type ProvenanceStoreOptions, type VerifiedArtifactClosure } from "./reuse-store.ts";
@@ -320,12 +320,14 @@ export class LinuxProcessReuseBackend {
 	/** Actor-path counters, excluding child reuse performed inside speculative worlds. */
 	actorMetrics(): LinuxProcessReuseMetrics { return Object.freeze({ ...this.actorCounters }); }
 
-	/** Scoped launches; sandbox bindings are still speculative until adopted. Raw parameters are never persisted. */
-	/** Whether a bound launch reads a queue only another process writes while it runs: alone, it runs only up to that input. */
-	fed(binding: ProcessExecutionBinding): boolean {
-		const invocation = this.handoffs.resolveBinding(binding, binding.scope), resources = invocation && "resources" in invocation ? invocation.resources : undefined;
-		return Object.entries(resources?.objects ?? {}).some(([image, object]) => object.queue?.producer === "live" &&
-			!Object.values(resources!.descriptions).some(description => description.object === Number(image) && (description.flags & 3) !== 0));
+	/** One captured input graph decides preparation: native filesystem reads can restart, live external queues need their producer. */
+	operationHints(binding: ProcessExecutionBinding): Pick<ExecutionOperationBinding, "fed" | "preparation"> {
+		const invocation = this.handoffs.resolveBinding(binding, binding.scope);
+		if (!invocation || "trackingOnly" in invocation) return {};
+		const resources = invocation.resources;
+		if (!resources) return invocation.producer ? {} : { preparation: "current_workspace" };
+		return Object.entries(resources.objects).some(([image, object]) => object.queue?.producer === "live" &&
+			!Object.values(resources.descriptions).some(description => description.object === Number(image) && (description.flags & 3) !== 0)) ? { fed: true } : {};
 	}
 
 	executionBindings(scope: ExecutionScope): readonly ProcessExecutionBinding[] {
@@ -340,7 +342,10 @@ export class LinuxProcessReuseBackend {
 		const invocation = this.handoffs.resolveBinding(binding, binding.scope);
 		if (!invocation || "trackingOnly" in invocation) return true;
 		const projection = new ExecutionPathProjection({ sourceRoot: invocation.sourceRoot, workspaceRoot: invocation.sourceRoot });
+		const checked = new Set<Sha256Digest>();
 		for (const certificate of [...this.handoffs.results(binding.key, binding.scope), ...await this.store.findByWeakKey(binding.key, invocation.executable).catch(() => [])]) {
+			if (checked.has(certificate.id)) continue;
+			checked.add(certificate.id);
 			if ((await validateDynamicDependencyCertificate(certificate.dependencyCertificate, { resolvePath: (logical) => projection.toPhysical(logical),
 				acceptedTaints: [...TRANSFERRED_INPUT_TAINTS] }).catch(() => undefined))?.status === "valid") return false;
 		}
@@ -422,7 +427,7 @@ export class LinuxProcessReuseBackend {
 				try {
 					request.signal?.throwIfAborted();
 					const invocation = options.invocation(request);
-					if (!invocation) return this.actorReplayMiss(host, request);
+					if (!invocation || !await this.store.mayHaveCertificates(invocation.shell)) return this.actorReplayMiss(host, request);
 					assertInvocationMatches(invocation, request);
 					const projection = new ExecutionPathProjection({ sourceRoot, workspaceRoot: sourceRoot });
 					const platformFingerprint = await this.resolvePlatformFingerprint();
@@ -518,8 +523,8 @@ export class LinuxProcessReuseBackend {
 			executionKind = kind;
 			const pending = Promise.resolve().then(async () => {
 				session.signal?.throwIfAborted();
-				// A bound operation already names its executable; only enclosing tools need PATH interception.
-				if (kind === "tool") await (dispatch ??= createProcessInterposition({
+				// Bound operations can launch reusable children too; interception excludes their own image below.
+				await (dispatch ??= createProcessInterposition({
 					gitDirectory,
 					privateRoot: input.workspace.processRoot,
 					// Where the Actor's own children run from is intercepted too: a build tool execs its compiler by absolute path.
@@ -1215,7 +1220,10 @@ export class LinuxProcessReuseBackend {
 			let outputEndpoints: readonly [string, string] | undefined;
 			outcome = await runSpawn(ready.strace, [...(live ? [`--handoff-fd=${inheritedFiles.length + 3}`, `--handoff-library=${ready.imageLibrary}`, `--handoff-image=${imagePath}`] : []), ...command.slice(1)], {
 				// The child writes to (and may query) these sockets; their identity lets its observation recognize them.
-				onOutputEndpoints: (endpoints) => { session.nestedOutputEndpoints.add(outputEndpoints = endpoints); },
+				onOutputEndpoints: (endpoints) => {
+					session.nestedOutputEndpoints.add(outputEndpoints = endpoints);
+					if (captureWorkspace) session.topLevelOutputEndpoints = endpoints;
+				},
 				cwd: request.cwd,
 				environment: request.environment,
 				signal: AbortSignal.any([session.signal, work.signal]),

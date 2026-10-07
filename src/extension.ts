@@ -29,6 +29,7 @@ import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
 import { nonEmptyTextInput, nonNegativeIntegerInput, nonNegativeNumberInput, optionalTextInput,
 	positiveIntegerInput, positiveInteger, probabilityInput, settingInput, type SettingInputDescriptor } from "./setting-input.ts";
 import { errorMessage } from "./error-utils.ts";
+import { asRecord } from "./stable-json.ts";
 import { SelfSpeculationCoordinator, type SelfSpeculationCoordinatorSnapshot, type SelfSpeculationSettings } from "./self-speculation.ts";
 import { type SpeculativeActionPackageSettings, SpeculativeActionSettingsStore, type SpeculativeSettingsScope } from "./settings-store.ts";
 import { emptySpeculativeTraceSummary, reduceSpeculativeTrace, type SpeculativeTraceSummary } from "./trace-summary.ts";
@@ -116,7 +117,7 @@ export type SpeculativeActionMetrics = SpeculativeTraceSummary & {
 
 type CapabilityState = "on" | "off" | ExecutionWorldHealthState;
 type ToolCapabilityRow = Readonly<Record<"predict" | "replay" | "observe" | "fork", CapabilityState>>;
-type ExecutionRoutesSnapshot = {
+export type ExecutionRoutesSnapshot = {
 	readonly worlds: readonly ExecutionWorldDiagnosticSnapshot[];
 	readonly actorProcessReplay?: ProcessRouteSnapshot;
 	readonly primaryIDs: ReadonlySet<string>;
@@ -137,7 +138,9 @@ export interface SpeculativeActionExtensionDependencies {
 	readonly createWorkspaceSandboxService?: () => WorkspaceSandboxService;
 	readonly selfSpeculationFetch?: typeof globalThis.fetch;
 	/** Observes every Drafter response, including Actor probes, without receiving credentials. */
-	readonly onDrafterResponse?: (message: AssistantMessage, requestSessionID?: string) => void;
+	readonly onDrafterResponse?: (message: AssistantMessage, requestSessionID?: string,
+		request?: { readonly toolChoice?: unknown; readonly toolNames: readonly string[] }) => void;
+	readonly onMetrics?: (metrics: SpeculativeActionMetrics, routes: ExecutionRoutesSnapshot) => void;
 }
 
 export interface SpeculativeActionExecutionWorldContext { readonly cwd: string; readonly autoResizeImages: boolean; }
@@ -292,9 +295,22 @@ async function installController(
 	const completeDraft: CreateSpeculativeActionHostOptions["complete"] = (model, llmContext, options) => providerRequest.run("drafter", async () => {
 		const registry = latestContext.modelRegistry, provider = registry.getProvider(model.provider), auth = await registry.getApiKeyAndHeaders(model);
 		if (!provider || !auth.ok) throw new Error(auth.ok ? `Unknown provider: ${model.provider}` : auth.error);
+		let request: Parameters<NonNullable<SpeculativeActionExtensionDependencies["onDrafterResponse"]>>[2];
 		const message = await provider.streamSimple({ ...model, baseUrl: auth.baseUrl ?? model.baseUrl }, llmContext, { ...options, apiKey: options?.apiKey ?? auth.apiKey,
+			onPayload: dependencies.onDrafterResponse ? async (payload, model) => {
+				const next = await options?.onPayload?.(payload, model);
+				try {
+					const selected = asRecord(next === undefined ? payload : next);
+					request = { ...(selected?.tool_choice === undefined ? {} : { toolChoice: selected.tool_choice }),
+						toolNames: Array.isArray(selected?.tools) ? selected.tools.flatMap(tool => {
+							const definition = asRecord(tool), name = asRecord(definition?.function)?.name ?? definition?.name;
+							return typeof name === "string" ? [name] : [];
+						}) : [] };
+				} catch { /* Diagnostics cannot change the provider payload. */ }
+				return next;
+			} : options?.onPayload,
 			headers: { ...auth.headers, ...options?.headers }, env: { ...auth.env, ...options?.env } }).result();
-		try { dependencies.onDrafterResponse?.(message, options?.sessionId); } catch { /* Reporting cannot change inference. */ }
+		try { dependencies.onDrafterResponse?.(message, options?.sessionId, request); } catch { /* Reporting cannot change inference. */ }
 		return message;
 	});
 	const draftModelFor = (actorModel: Model<Api>) => {
@@ -313,7 +329,7 @@ async function installController(
 		draftFork: async ({ model, context: actorContext, reasoning, content, signal }) => {
 			const message = await drafterBudget.run({ model: draftModelFor(model), context: { ...actorContext, messages: [...actorContext.messages, { role: "user", timestamp: Date.now(),
 				content: `The assistant has begun its next reply. Its reasoning so far:\n<reasoning>\n${reasoning}\n</reasoning>${content ? `\nIts reply so far:\n${content}` : ""}\nCall exactly the tool or tools it is about to call next, with the arguments it will use.` }] },
-				options: { signal, maxTokens: settings().drafterMaxTokens, onPayload: forceToolChoice(undefined) }, policy: settings(), complete: completeDraft });
+				options: { signal, maxTokens: settings().drafterMaxTokens, onPayload: forceToolChoice(undefined) }, policy: settings(), complete: completeDraft, marginal: true });
 			return message?.content.flatMap((item) => item.type === "toolCall" ? [{ tool: item.name, input: item.arguments }] : []) ?? [];
 		},
 	});
@@ -593,12 +609,18 @@ async function installController(
 		dispose: () => {
 			ui?.setStatus(STATUS_KEY, undefined);
 			ui = undefined;
-			return lifecycle.close(() => Promise.resolve().then(() => settingsStore.flush())
+			return lifecycle.close(async () => {
+				await lifecycle.drain();
+				const routes = executionRoutes();
+				return Promise.resolve().then(() => settingsStore.flush())
 				.finally(() => processCoordinator.dispose().catch(() => undefined))
 				.finally(() => host.dispose())
 				.finally(() => workspaceSandbox.dispose())
 				.finally(() => selfSpeculation.dispose())
-				.finally(resetSearch));
+				.finally(resetSearch).finally(() => {
+					try { dependencies.onMetrics?.(visibleMetrics(), routes); } catch { /* Reporting cannot change cleanup. */ }
+				});
+			});
 		},
 	} as const;
 	for (const definition of baseDefinitions.values())

@@ -5,43 +5,35 @@ import type { ResolutionCause, SettledSourceRequest, SourceRequestIdentity, Sour
 import { cause } from "./settlement.ts";
 import { waitForCandidate } from "./scheduler.ts";
 
-export interface SourceRequestResult<Value> extends SettledSourceRequest {
-	readonly value?: Value;
+/** A deliberate source admission decision; it produced no proposal and is not a provider failure. */
+export class SourceRequestSuppressed extends Error {
+	readonly cause: ResolutionCause & { readonly stage: "source" };
+	constructor(cause: SourceRequestSuppressed["cause"]) { super(cause.detail ?? cause.code); this.cause = Object.freeze({ ...cause }); }
 }
 
 /** Turn-scoped authority token. Expiration prevents late producer results from entering admission. */
 export class SourceGeneration {
-	readonly signal: AbortSignal;
 	private readonly controller = new AbortController();
-	private expiredCause?: ResolutionCause;
-	private detachParent?: () => void;
+	readonly signal: AbortSignal = this.controller.signal;
 
 	constructor(parent?: AbortSignal) {
-		this.signal = this.controller.signal;
 		if (!parent) return;
 		const abort = () => this.expire(cause("control", "turn_aborted"));
 		if (parent.aborted) abort();
-		else {
-			parent.addEventListener("abort", abort, { once: true });
-			this.detachParent = () => parent.removeEventListener("abort", abort);
-		}
+		else parent.addEventListener("abort", abort, { once: true, signal: this.signal });
 	}
 
 	get active(): boolean {
-		return !this.expiredCause;
+		return !this.signal.aborted;
 	}
 
 	get expiration(): ResolutionCause | undefined {
-		return this.expiredCause;
+		return this.signal.reason as ResolutionCause | undefined;
 	}
 
-	expire(expiration: ResolutionCause): boolean {
-		if (this.expiredCause) return false;
-		this.expiredCause = Object.freeze({ ...expiration });
-		this.detachParent?.();
-		this.detachParent = undefined;
-		this.controller.abort(this.expiredCause);
-		return true;
+	expire(expiration: ResolutionCause): void {
+		if (this.signal.aborted) return;
+		this.controller.abort(Object.freeze({ ...expiration }));
 	}
 }
 
@@ -52,7 +44,7 @@ export async function runSourceRequest<Value>(input: {
 	readonly timeoutMs?: number;
 	readonly produce: (signal: AbortSignal) => Value | Promise<Value>;
 	readonly count: (value: Value) => number;
-}): Promise<SourceRequestResult<Value>> {
+}): Promise<SettledSourceRequest & { readonly value?: Value }> {
 	const startedAt = performance.now();
 	const finish = (settlement: SourceRequestSettlement): SettledSourceRequest => Object.freeze({
 		request: Object.freeze({ ...input.request }), durationMs: Math.max(0, performance.now() - startedAt), settlement: Object.freeze(settlement),
@@ -77,7 +69,8 @@ export async function runSourceRequest<Value>(input: {
 	}
 	if (waited.status === "aborted" || !input.generation.active) return aborted();
 	const outcome = waited.value;
-	if (outcome.kind === "error") return failed("producer_error", outcome.error);
+	if (outcome.kind === "error") return outcome.error instanceof SourceRequestSuppressed
+		? finish({ status: "empty", cause: outcome.error.cause }) : failed("producer_error", outcome.error);
 	let proposalCount: number;
 	try {
 		proposalCount = finiteCount(input.count(outcome.value));
