@@ -64,7 +64,7 @@ export interface LinuxProcessBackendOptions {
 	readonly heldExecBinary?: string;
 	/** Additional host paths that speculative processes must never read. */
 	readonly deniedPaths?: readonly string[];
-	/** A nested child whose recent traced runs all took less resumes in place instead of in its own sandbox (0 disables). */
+	/** Child cost threshold: recent cheap runs and unknown pipeline writers can resume in place (0 disables cost-based bypass). */
 	readonly cheapChildMs?: number;
 }
 
@@ -489,7 +489,8 @@ export class LinuxProcessReuseBackend {
 		const producer = speculativeProducerProof(ready, deniedPaths, POLICY_ID);
 		const nestedProducer = speculativeProducerProof(ready, deniedPaths, LEAF_POLICY_ID);
 		const controller = new AbortController();
-		const server = net.createServer({ allowHalfOpen: true }, (socket) => this.serve(session, socket));
+		let executionKind: "tool" | "operation" | undefined;
+		const server = net.createServer({ allowHalfOpen: true }, (socket) => this.serve(session, socket, executionKind === "tool"));
 		const gitDirectory = await lstat(path.join(sourceRoot, ".git")).then((info) => info.isDirectory() ? path.join(sourceRoot, ".git") : undefined, () => undefined);
 		const session: ActiveSession = {
 			token,
@@ -515,7 +516,6 @@ export class LinuxProcessReuseBackend {
 			metrics: { ...emptyWorldReuseMetrics() },
 		};
 		this.producers++;
-		let executionKind: "tool" | "operation" | undefined;
 		let dispatch: Promise<void> | undefined;
 		const execute = <Value>(kind: NonNullable<typeof executionKind>, operation: () => Promise<Value>): Promise<Value> => {
 			if (session.closing || executionKind === "operation" || executionKind && executionKind !== kind)
@@ -762,13 +762,13 @@ export class LinuxProcessReuseBackend {
 		if (await this.planner.publishCompleted(certificate, SAME_CONFINEMENT_TAINTS)) this.add(session, "wholeCommandPublished");
 	}
 
-	private serve(session: ActiveSession, socket: net.Socket): void {
+	private serve(session: ActiveSession, socket: net.Socket, wholeTool: boolean): void {
 		let body = "";
 		socket.setEncoding("utf8");
 		socket.on("data", (chunk) => { body += chunk; if (Buffer.byteLength(body) > MAX_REQUEST_BYTES) socket.destroy(new Error("request too large")); });
 		socket.once("error", () => undefined);
 		socket.once("end", () => {
-			const pending = Promise.resolve().then(() => this.handleWireRequest(session, body)).then((response) => { socket.end(wireResponse(response)); })
+			const pending = Promise.resolve().then(() => this.handleWireRequest(session, body, wholeTool)).then((response) => { socket.end(wireResponse(response)); })
 				.catch((error) => {
 					this.setError(session, errorMessage(error));
 					session.incompleteReasons.add(`broker:${errorMessage(error)}`);
@@ -778,7 +778,7 @@ export class LinuxProcessReuseBackend {
 		});
 	}
 
-	private async handleWireRequest(session: ActiveSession, body: string): Promise<DispatcherResponse> {
+	private async handleWireRequest(session: ActiveSession, body: string, wholeTool: boolean): Promise<DispatcherResponse> {
 		const received = parseDispatcherRequest(body);
 		if (!received || received.token !== session.token || session.closing) throw new Error("invalid dispatcher request");
 		session.signal?.throwIfAborted();
@@ -789,7 +789,20 @@ export class LinuxProcessReuseBackend {
 		const ready = await this.resolveReady();
 		const executable = await this.resolveRequestedExecutable(session, request);
 		const resources = request.descriptors && await this.inheritedPipes(request).catch((error: unknown) => `inherited_pipes:${errorMessage(error)}`);
-		const eligibility = typeof resources === "string" ? { reason: resources } : await eligibleRequest(session, request, ready.executionContext);
+		let eligibility = typeof resources === "string" ? { reason: resources } : await eligibleRequest(session, request, ready.executionContext);
+		if (wholeTool && (this.options.cheapChildMs ?? CHEAP_CHILD_MS) > 0 && request.pid !== undefined && !("reason" in eligibility) && eligibility.outputPipes?.some(Boolean)) {
+			const logicalExecutable = session.projection.toLogical(executable);
+			const known = () => this.handoffs.mayHaveExecutable(logicalExecutable) ||
+				this.childRunMs.get(logicalExecutable)?.some(duration => duration >= (this.options.cheapChildMs ?? CHEAP_CHILD_MS)) ||
+				session.scope && this.handoffs.bindings(session.scope).some(binding => {
+					const bound = this.handoffs.resolveBinding(binding, session.scope);
+					return bound && !("trackingOnly" in bound) && bound.sourceRoot === session.sourceRoot && bound.executable === logicalExecutable;
+				});
+			// A cold pipeline stays in the enclosing trace with its original OFDs; useful children still justify a separate capture.
+			const cold = !known() && !await this.store.mayHaveCertificates(logicalExecutable) && !known();
+			session.signal.throwIfAborted();
+			if (cold) eligibility = { reason: "cold_piped_child" };
+		}
 		if ("reason" in eligibility) {
 			this.add(session, "bypasses");
 			const reason = `broker_bypass:${request.name}:${eligibility.reason}`;
