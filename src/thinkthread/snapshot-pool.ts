@@ -11,15 +11,17 @@ interface ActiveTurn {
 
 class SnapshotResource {
 	readonly id: FsSnapshotId;
+	readonly logicalBytes: number;
 	private readonly remove: (snapshotID: FsSnapshotId) => Promise<void>;
 	private references = 0;
 	private removal?: Promise<void>;
 
 	constructor(
-		snapshotID: FsSnapshotId,
+		view: { readonly snapshotId: FsSnapshotId; readonly logicalBytes: number },
 		remove: (snapshotID: FsSnapshotId) => Promise<void>,
 	) {
-		this.id = snapshotID;
+		this.id = view.snapshotId;
+		this.logicalBytes = view.logicalBytes;
 		this.remove = remove;
 	}
 
@@ -162,12 +164,12 @@ export class ThinkThreadSnapshotPool {
 		return new ThinkThreadCheckpoint(snapshot, lineage, depth, this.identity);
 	}
 
-	ownSnapshot(snapshotID: FsSnapshotId): SnapshotLease {
-		if (this.resources.has(snapshotID)) {
-			throw new Error(`ThinkThread snapshot ${snapshotID} is already owned by this execution world`);
+	ownSnapshot(view: { readonly snapshotId: FsSnapshotId; readonly logicalBytes: number }): SnapshotLease {
+		if (this.resources.has(view.snapshotId)) {
+			throw new Error(`ThinkThread snapshot ${view.snapshotId} is already owned by this execution world`);
 		}
-		const resource = new SnapshotResource(snapshotID, (id) => this.remove(id));
-		this.resources.set(snapshotID, resource);
+		const resource = new SnapshotResource(view, (snapshotID) => this.remove(snapshotID));
+		this.resources.set(view.snapshotId, resource);
 		return resource.retain();
 	}
 
@@ -196,7 +198,7 @@ export class ThinkThreadSnapshotPool {
 	}
 
 	private async createBase(): Promise<SnapshotLease> {
-		return this.ownSnapshot((await this.durable.snapshotCreate()).snapshotId);
+		return this.ownSnapshot(await this.durable.snapshotCreate());
 	}
 
 	private async finishActive(): Promise<void> {
