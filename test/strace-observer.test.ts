@@ -346,9 +346,30 @@ describe("strace provenance decoder", () => {
 		const polls = ['poll([{fd=0</dev/null<char 1:3>>, events=0}, {fd=1<pipe:[7]>, events=0}], 2, 0) = 0 (Timeout)',
 			'pipe2([5<pipe:[9]>, 6<pipe:[9]>], O_CLOEXEC) = 0', 'poll([{fd=5<pipe:[9]>, events=POLLIN}], 1, -1) = 1 ([{fd=5, revents=POLLIN}])'];
 		const write = 'openat(AT_FDCWD, "/work/out.o", O_WRONLY|O_CREAT|O_TRUNC, 0644) = 3</work/out.o>';
-		for (const [lines, taints] of [[polls, []], [['poll([{fd=1<pipe:[7]>, events=POLLOUT}], 1, 0) = 1 ([{fd=1, revents=POLLOUT}])'], ["unsupported_syscall"]],
-			[[write, stat(4), stat(8)], ["descriptor_observation"]], [[stat(4), stat(8)], ["descriptor_observation", "mutable_input"]]] as const)
-			expect((await observe({ 100: [EXEC, ...lines] }, { inheritedStreams: ["7"], guardFilesystemSemanticsWithin: ["/work"] })).taints, lines.join()).toEqual(["clock", "random", ...taints].sort());
+		const pair = 'socketpair(AF_UNIX, SOCK_STREAM, 0, [3<UNIX-STREAM:[11->12]>, 4<UNIX-STREAM:[12->11]>]) = 0';
+		const datagram = 'socketpair(AF_UNIX, SOCK_DGRAM, 0, [5<UNIX-DGRAM:[13->14]>, 6<UNIX-DGRAM:[14->13]>]) = 0';
+		const message = '{msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="x", iov_len=1}], msg_iovlen=1, msg_control=[{cmsg_len=20, cmsg_level=SOL_SOCKET, cmsg_type=SCM_RIGHTS, cmsg_data=[3<UNIX-STREAM:[11->12]>]}], msg_controllen=24, msg_flags=0}';
+		const addressed = message.replace('msg_name=NULL, msg_namelen=0', 'msg_name={sa_family=AF_UNIX, sun_path="/outside/socket"}, msg_namelen=110');
+		for (const [lines, taints, child] of [[polls, []], [['poll([{fd=1<pipe:[7]>, events=POLLOUT}], 1, 0) = 1 ([{fd=1, revents=POLLOUT}])'], ["unsupported_syscall"]],
+			[[write, stat(4), stat(8)], ["descriptor_observation"]], [[stat(4), stat(8)], ["descriptor_observation", "mutable_input"]],
+			[[pair, 'clone(child_stack=NULL, flags=SIGCHLD) = 101'], [], ['dup2(3<UNIX-STREAM:[11->12]>, 1) = 1<UNIX-STREAM:[11->12]>', 'fcntl(1<UNIX-STREAM:[11->12]>, F_SETFL, O_RDWR|O_NONBLOCK) = 0']],
+			[['fcntl(3<UNIX-STREAM:[11->12]>, F_SETFL, O_RDWR|O_NONBLOCK) = 0'], ["unsupported_syscall"]],
+			[[pair, 'fcntl(3<UNIX-STREAM:[15->16]>, F_SETFL, O_RDWR) = 0'], ["unsupported_syscall"]],
+			[[pair, 'fcntl(3<UNIX-STREAM:[11->12]>, F_SETFL, O_ASYNC) = 0'], ["unsupported_syscall"]],
+			[[pair, 'fcntl(3<UNIX-STREAM:[11->12]>, F_SETFL, O_NONBLOCK) = -1 EINVAL (Invalid argument)'], ["unsupported_syscall"]],
+			[[datagram, 'sendto(5<UNIX-DGRAM:[13->14]>, "x", 1, 0, NULL, 0) = 1'], []],
+			[[pair, datagram, `sendmsg(5<UNIX-DGRAM:[13->14]>, ${message}, 0) = 1`], []],
+			[[datagram, 'sendto(5<UNIX-DGRAM:[13->14]>, "x", 1, 0, {sa_family=AF_UNIX, sun_path="/outside/socket"}, 110) = 1'], ["network"]],
+			[[pair, datagram, `sendmsg(5<UNIX-DGRAM:[13->14]>, ${addressed}, 0) = 1`], ["network"]],
+			[[pair, datagram, `sendmsg(5<UNIX-DGRAM:[13->14]>, ${addressed.replace('iov_base="x", iov_len=1', 'iov_base="msg_name=NULL, msg_namelen=0", iov_len=28')}, 0) = 28`], ["network"]],
+			[[datagram, 'connect(5<UNIX-DGRAM:[13->14]>, {sa_family=AF_UNIX, sun_path="/outside/socket"}, 110) = 0'], ["network"]],
+			[[datagram, 'bind(5<UNIX-DGRAM:[13->14]>, {sa_family=AF_UNIX, sun_path="/outside/socket"}, 110) = 0'], ["network"]],
+			[[pair, datagram, `sendmmsg(5<UNIX-DGRAM:[13->14]>, [{msg_hdr=${message}, msg_len=1}], 1, 0) = 1`], ["network"]],
+		] as const) {
+			const traces: Record<number, readonly string[]> = { 100: [EXEC, ...lines] };
+			if (child) traces[101] = child;
+			expect((await observe(traces, { inheritedStreams: ["7"], guardFilesystemSemanticsWithin: ["/work"] })).taints, lines.join()).toEqual(["clock", "random", ...taints].sort());
+		}
 	});
 
 	test("classifies effects from syscall arguments and results, never embedded strings", async () => {

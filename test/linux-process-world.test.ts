@@ -406,6 +406,13 @@ ${enumerate ? `static int count_directory(int fd) {
 int main(int argc, char **argv) {
 	if (argc != 2 || strcmp(argv[0], "bound-name") || strcmp(argv[1], "private argument") ||
 		!getenv("BOUND_SECRET") || strcmp(getenv("BOUND_SECRET"), "private value")) return 71;
+	${mode === "native" ? `{ int pair[2], status; if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair)) return 201;
+	pid_t child = fork(); if (child < 0) return 202;
+	if (!child) _exit(fcntl(pair[0], F_SETFL, O_RDWR | O_NONBLOCK) ? 203 : 0);
+	if (waitpid(child, &status, 0) != child || status) return 204;
+	int flags = fcntl(pair[0], F_GETFL), peer = fcntl(pair[1], F_GETFL);
+	if (flags < 0 || peer < 0 || !(flags & O_NONBLOCK) || (peer & O_NONBLOCK) || close(pair[0]) || close(pair[1])) return 205;
+	}` : ""}
 	for (volatile unsigned long iteration = 0; iteration < ${running ? 500000000 : native ? 50000000 : 0}ul; ++iteration) {}
 	${orphan ? `{ if (fcntl(9, F_GETFD) != -1 || errno != EBADF || fcntl(15, F_GETFD) != -1 || errno != EBADF) return 187;
 	int received[7]; char byte;
