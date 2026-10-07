@@ -1702,21 +1702,32 @@ int main(void) {
 		try {
 			for (const name of ["a.txt", "b.txt"]) await writeFile(path.join(fixture.workspace, name), `${name}\n`);
 			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
-			const run = async (label: string, name: string) => {
-				const before = fixture.backend.metrics(), branch = await forkReusableBash(fixture, { label, command: `cat ${name} | cat`, actionNamespace: "cheap-child", executionFingerprint });
+			const run = async (label: string, command: string) => {
+				const before = fixture.backend.metrics(), branch = await forkReusableBash(fixture, { label, command, actionNamespace: "cheap-child", executionFingerprint });
 				try { return { text: textOutput(branch.output.result), bypasses: fixture.backend.metrics().bypasses - before.bypasses }; }
 				finally { await branch.dispose?.(); }
 			};
 			// The first cat learns its run time in its own sandbox; a different cat then needs none.
-			expect(await run("learn", "a.txt")).toMatchObject({ text: "a.txt\n" });
-			expect(await run("cheap", "b.txt")).toEqual({ text: "b.txt\n", bypasses: 2 });
+			expect(await run("learn", "cat a.txt")).toMatchObject({ text: "a.txt\n" });
+			expect(await run("cheap", "cat b.txt | cat")).toEqual({ text: "b.txt\n", bypasses: 2 });
 			// A posix_spawn child execs in its parent's memory: the sandbox's exec path rewrite must not survive in it, and a parent
 			// with other threads (one parked in the spawn, one idle) must still be held while it holds the rewrite.
-			await writeFile(path.join(fixture.workspace, "spawner.c"), `#include <pthread.h>\n#include <spawn.h>\n#include <stdio.h>\n#include <sys/wait.h>\n#include <unistd.h>
+			await writeFile(path.join(fixture.workspace, "spawner.c"), `#include <fcntl.h>\n#include <pthread.h>\n#include <spawn.h>\n#include <stdio.h>\n#include <sys/wait.h>\n#include <unistd.h>
 extern char **environ;\nstatic void *idle(void *unused) { (void)unused; pause(); return 0; }
-int main(void) { char path[32] = "/bin/true\\0intact"; char *args[] = {path, 0}; pid_t pid; pthread_t thread; int status;
+int main(int argc, char **argv) { if (argc == 2) { int flags = fcntl(1, F_GETFL); if (flags < 0) return 1;
+	if (argv[1][0] == 's') return fcntl(1, F_SETFL, flags | O_NONBLOCK) < 0;
+	return !(flags & O_NONBLOCK) || puts(argv[1]) < 0; }
+	char path[32] = "/bin/true\\0intact"; char *args[] = {path, 0}; pid_t pid; pthread_t thread; int status;
 	return pthread_create(&thread, 0, idle, 0) || posix_spawn(&pid, path, 0, 0, args, environ) || waitpid(pid, &status, 0) != pid || puts(path + 10) < 0; }\n`);
 			await compileBenchmarkHelper(fixture.workspace, { source: "spawner.c", output: "spawner", arguments: ["-pthread"] });
+			// Both execs share the subshell's writer OFD. A separate relay would hide the first exec's flag change from the second.
+			const before = fixture.backend.metrics(), cold = await forkReusableBash(fixture, { label: "cold-pipe", actionNamespace: "cold-pipe", executionFingerprint,
+				command: "set -o pipefail; (./spawner set && ./spawner cold) | cat" });
+			try {
+				const after = fixture.backend.metrics();
+				expect({ text: textOutput(cold.output.result), validation: await cold.validate?.(), misses: after.misses - before.misses,
+					published: after.published - before.published }, JSON.stringify(after)).toMatchObject({ text: "cold\n", validation: { status: "valid" }, misses: 0, published: 0 });
+			} finally { await cold.dispose(); }
 			// Created files take the open's mode under the process's umask; flock execs SHELL off its stack top; tar opens -C O_PATH; an orphan keeps its cwd.
 			const spawned = await forkReusableBash(fixture, { label: "spawn", actionNamespace: "spawn", executionFingerprint, command: "./spawner; umask 027; echo x > shared; cp /bin/true tool; mkdir made; " +
 				"stat -c '%a %n' shared tool made; SHELL=/bin/sh flock shared -c 'tar cf - tool | tar xf - -C made' && ls made; cd made && (echo orphan > kept &); for i in $(seq 100); do [ -s kept ] && break; sleep 0.05; done; cat kept; echo piped | cat /dev/stdin; cat /proc/self/comm; [ -x ../shared ] || echo not-x; hostname" });
