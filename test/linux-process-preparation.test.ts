@@ -45,7 +45,8 @@ describe("native preparation evidence", () => {
 	it("retires repeated tainted preparation without reviving it on identical measured launches", async () => {
 		const test = fixture();
 		try {
-			await expect(test.run()).rejects.toThrow("bound process preparation produced no reusable result");
+			test.session.metrics.lastError = "tainted:unsupported_syscall,mutable_input; syscalls:fcntl; dependency:mutable:/tmp/jest/input";
+			await expect(test.run()).rejects.toThrow("bound process preparation produced no reusable result: tainted:unsupported_syscall,mutable_input; syscalls:fcntl; dependency:mutable:/tmp/jest/input");
 			expect(test.binding.available).toBe(false);
 			for (let edit = 0; edit < 5; edit++) {
 				expect(test.observe()).toBe(test.binding);

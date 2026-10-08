@@ -923,7 +923,7 @@ export class LinuxProcessReuseBackend {
 			// Captured inputs, producer bindings and child seeds can prepare a later frontier without replaying this completed result.
 			// Keep this negative with its bounded launch owner; an arbitrary workspace edit does not prove it can now replay.
 			this.handoffs.retirePreparation(binding);
-			throw new Error("bound process preparation produced no reusable result");
+			throw new Error(`bound process preparation produced no reusable result${session.metrics.lastError ? `: ${session.metrics.lastError.slice(0, 4096)}` : ""}`);
 		}
 		// Only it and what it launched ran here: when its own transaction could not seal (what it launched overlapped it), the session's
 		// endpoints stand for its interval, and what it observed joins its launches' evidence.
@@ -1522,7 +1522,17 @@ export class LinuxProcessReuseBackend {
 				const certificate = sealProcessCertificate({ prototype, producer: session.nestedProducer, dependencyCertificate, result });
 				certificateID = certificate.id;
 				session.nestedEvidence.push(certificate.dependencyCertificate);
-				if (taints.size) { this.add(session, "tainted"); this.setError(session, `tainted:${[...taints].join(",")}`); }
+				if (taints.size) {
+					this.add(session, "tainted");
+					// Keep the capture's existing reasons beside its categories. Diagnostic text never changes sealed evidence.
+					const reasons = (stage: string, values: readonly string[]) => values.slice(0, 4).map(value => `${stage}:${value.slice(0, 512)}${value.length > 512 ? "…" : ""}`)
+						.concat(values.length > 4 ? [`${stage}:more_reasons`] : []);
+					const detail = [`tainted:${[...taints].join(",")}`,
+						...(observation.unsupportedSyscalls?.length ? [`syscalls:${observation.unsupportedSyscalls.join(",")}${observation.unsupportedSyscallsTruncated ? ",…" : ""}`] : []),
+						...reasons("trace", observation.incompleteReasons), ...reasons("dependency", evidence.incompleteReasons),
+						...reasons("external", external.unrepresentable)].join("; ");
+					this.setError(session, detail.length > 4096 ? `${detail.slice(0, 4095)}…` : detail);
+				}
 				stage = "handoff_registration";
 				if (await this.handoffs.publish(
 					weakKey,

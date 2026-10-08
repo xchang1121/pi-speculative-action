@@ -27,6 +27,26 @@ async function observe(processes: Record<number, readonly string[]>, options?: S
 }
 
 describe("strace provenance decoder", () => {
+	test("reports blocking syscall names without retaining arguments or changing completeness", async () => {
+		const blocked = await observe({ 100: [EXEC, 'fcntl(4</private/name>, F_GETLEASE) = 2',
+			'ioctl(3</private/name>, FS_IOC_SETFLAGS, [FS_NODUMP_FL]) = 0', 'fcntl(5</private/other>, F_GETLEASE) = 2'] });
+		expect(blocked).toMatchObject({ complete: true, taints: ["clock", "random", "unsupported_syscall"], incompleteReasons: [], unsupportedSyscalls: ["fcntl", "ioctl"] });
+		expect(blocked.unsupportedSyscallsTruncated).toBeUndefined();
+		expect(JSON.stringify(blocked.unsupportedSyscalls)).not.toMatch(/private|GETLEASE|NODUMP/);
+		const allowed = await observe({ 100: [EXEC, 'ioctl(3</private/name>, FIOCLEX) = 0', 'fcntl(4</private/name>, F_GETFD) = 0'] });
+		expect(allowed).toMatchObject({ complete: true, taints: ["clock", "random"], incompleteReasons: [] });
+		expect(allowed.unsupportedSyscalls).toBeUndefined();
+	});
+
+	test("bounds diagnostic syscall names while keeping the existing unsupported taint", async () => {
+		const names = ["fallocate", "splice", "tee", "fgetxattr", "flistxattr", "fremovexattr", "fsetxattr", "getxattr", "lgetxattr", "listxattr", "llistxattr", "lremovexattr", "lsetxattr", "removexattr", "setxattr"];
+		const observation = await observe({ 100: [EXEC, ...names.map(name => `${name}(3</work/input>, "user.field", NULL, 0) = 0`),
+			'fcntl(3</work/input>, F_GETLEASE) = 2', 'ioctl(3</work/input>, FS_IOC_SETFLAGS, [FS_NODUMP_FL]) = 0', 'setrlimit(RLIMIT_CORE, {rlim_cur=0, rlim_max=0}) = 0'] });
+		expect(observation.taints).toContain("unsupported_syscall");
+		expect(observation.unsupportedSyscalls).toEqual([...names, "fcntl"].sort());
+		expect(observation.unsupportedSyscallsTruncated).toBe(true);
+	});
+
 	test("records only the workspace stat fields a program reveals, and flags it read of descriptors it opened", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-stat-fields-")), prefix = path.join(root, "process");
 		const run = async (argv: readonly string[], target: string, extra: readonly string[] = []) => {
