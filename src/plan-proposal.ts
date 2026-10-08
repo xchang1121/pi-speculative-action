@@ -17,6 +17,8 @@ export interface PlanAction {
 	readonly type: "tool_call" | "operation";
 	/** Source-owned diagnostic label; never part of action identity, scheduling or reuse authority. */
 	readonly mode?: string;
+	/** Lightweight policy token retained with consumed computation; omit tool inputs, outputs and model context. */
+	readonly reuseFeedback?: unknown;
 	/** Internal work retains its backend capability and uses tool/input only as the permission anchor. */
 	readonly operation?: ExecutionOperationBinding;
 	readonly tool: string;

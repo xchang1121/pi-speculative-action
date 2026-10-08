@@ -11,11 +11,11 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import { buildActionKey, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { borrowResourceObject, createCommittedResourceInputs, createResourceSnapshotExecutionWorld } from "../src/agent-execution-world.ts";
 import { captureHeldDescriptorInputs } from "../src/linux-held-exec.ts";
-import { captureStableFile, hashExecutableFile } from "../src/filesystem-evidence.ts";
+import { CapturedFilesystemObject, captureStableFile, hashExecutableFile } from "../src/filesystem-evidence.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { TaskTimeline, TimelineInterval } from "../src/task-timing.ts";
 import { runThinkThreadTool } from "../src/thinkthread/tool-runner.ts";
-import { captureResourceVersion, observeResourceChanges, invalidateResourceInputs, closeResourceVersionManagers, fingerprintIO, ResourceVersionManager,
+import { captureResourceVersion, observeResourceChanges, invalidateResourceInputs, closeResourceVersionManagers, fingerprintIO, ResourceReadView, ResourceVersionManager,
 	type ResourceVersionToken, type ResourceInput, releaseResourceVersion, resourceDependencies } from "../src/resource-version.ts";
 
 const directories = temporaryDirectories("pi-resource-version-", path.join(process.cwd(), "test"));
@@ -435,7 +435,7 @@ describe("speculative action resource versions", () => {
 		const manager = new ResourceVersionManager(root, { watch: false }), token = await manager.capture(undefined, 65536), view = token.view!;
 		let now = 100;
 		const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
-		const binding = {}, dispose = vi.fn(), build = vi.fn(async (inputs: import("../src/tool-settlement.ts").ToolFilesystemOperations) => {
+		const binding = {}, dispose = vi.fn(() => { now += 30; }), build = vi.fn(async (inputs: import("../src/tool-settlement.ts").ToolFilesystemOperations) => {
 			const value = (await inputs.readFile(file)).toString();
 			expect(await inputs.exists!(path.join(root, "missing"))).toBe(false);
 			now += 20;
@@ -452,7 +452,8 @@ describe("speculative action resource versions", () => {
 			expect(evaluated.output).toBe("A"); expect(build).toHaveBeenCalledTimes(exhausted ? 2 : 1);
 			now += 5; timeline.startToolWait(startedAt)(now);
 			timeline.recordTool(new TimelineInterval(startedAt, now, evaluated.dependencies));
-			expect(timeline.measure(now)).toMatchObject({ hiddenLatencyMs: exhausted ? 0 : 20, toolWaitMs: exhausted ? 25 : 5 });
+			expect(timeline.measure(now)).toMatchObject({ actorComputeMs: exhausted ? 25 : 5, reusedExecutionMs: exhausted ? 0 : 20,
+				toolWaitMs: exhausted ? 55 : 5 });
 			expect(dispose).toHaveBeenCalledTimes(exhausted ? 2 : 0); expect(view.bytes).toBe(bytes);
 			expect(dependencies?.size).toBeGreaterThan(0);
 			const scoped = { ...token, observations: new Map([...token.observations].filter(([key]) => dependencies!.has(key))) };
@@ -470,6 +471,76 @@ describe("speculative action resource versions", () => {
 			expect(dispose).toHaveBeenCalledTimes(exhausted ? 4 : 1); expect(view.bytes).toBe(bytes);
 		} finally { await token.release(); manager.close(); clock.mockRestore(); }
 		expect(dispose).toHaveBeenCalledTimes(exhausted ? 4 : 2);
+	});
+
+	test("drops a rejected input source's receipt before accepting another source's proof", async () => {
+		const root = await workspace(), file = path.join(root, "value"), reader = new ResourceReadView(8192, undefined, { root, physicalRoot: root });
+		const sources = [new ResourceReadView(8192), new ResourceReadView(8192)];
+		for (const [index, view] of sources.entries()) {
+			view.capture(file, { type: "file", content: Buffer.from(index ? "accepted" : "rejected"), realPath: file,
+				dependency: "content:value", computation: new TimelineInterval(index ? 20 : 0, index ? 50 : 20) });
+			view.seal();
+		}
+		reader.seal();
+		let now = 100;
+		const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
+		const rejected = vi.fn(() => { now += 5; throw new Error("resource_input_proof_missing"); });
+		const accepted = vi.fn(() => { now += 3; });
+		try {
+			const evaluation = await TimelineInterval.collect(() => reader.evaluate(view => view.readFile(file), undefined, root,
+				() => sources.map((view, index) => ({ view, observed: index ? accepted : rejected }))));
+			expect(evaluation.output.toString()).toBe("accepted");
+			expect(rejected).toHaveBeenCalledOnce(); expect(accepted).toHaveBeenCalledOnce();
+			now += 2;
+			expect(new TaskTimeline(100).recordTool(new TimelineInterval(100, now, evaluation.dependencies)))
+				.toEqual({ actorComputeMs: 2, reusedExecutionMs: 30 });
+		} finally { clock.mockRestore(); await reader.dispose(); await Promise.all(sources.map(view => view.dispose())); }
+	});
+
+	test.each(["accepted", "declined", "failed"] as const)("keeps a pinned input's validation exclusion when its borrow is %s", async mode => {
+		const root = await workspace({ value: "A" }), file = path.join(root, "value"), view = new ResourceReadView(8192);
+		const capture = { ...await captureStableFile(file, 8192, true), computation: new TimelineInterval(10, 50) };
+		const handle = await fs.open(file, "r"), object = new CapturedFilesystemObject(handle, capture);
+		view.capture(file, { type: "file", content: capture.content!, realPath: file, dependency: "content:value", computation: capture.computation, object });
+		view.seal();
+		let now = 100;
+		const clock = vi.spyOn(performance, "now").mockImplementation(() => now), failure = new Error("pin rejected");
+		try {
+			const evaluation = await TimelineInterval.collect(async () => {
+				const pending = view.borrowObject(file, async () => {
+					const startedAt = now; now += 7; TimelineInterval.exclude(new TimelineInterval(startedAt, now));
+					if (mode === "failed") throw failure;
+					return mode === "accepted" ? capture.content : undefined;
+				});
+				if (mode === "failed") await expect(pending).rejects.toBe(failure);
+				else expect(await pending).toEqual(mode === "accepted" ? Buffer.from("A") : undefined);
+				now += 3;
+			});
+			expect(new TaskTimeline(100).recordTool(new TimelineInterval(100, now, evaluation.dependencies)))
+				.toEqual({ actorComputeMs: 3, reusedExecutionMs: mode === "accepted" ? 40 : 0 });
+		} finally { clock.mockRestore(); await view.dispose(); expect(handle.fd).toBe(-1); }
+	});
+
+	test("keeps fresh calculation unknown when a rejected preparation also borrowed existing work", async () => {
+		const root = await workspace(), file = path.join(root, "value"), view = new ResourceReadView(8192), binding = {};
+		view.capture(file, { type: "file", content: Buffer.from("A"), dependency: "content:value" });
+		let now = 100;
+		const clock = vi.spyOn(performance, "now").mockImplementation(() => now), failure = new Error("resource_input_proof_missing");
+		const build = async (inputs: import("../src/tool-settlement.ts").ToolFilesystemOperations) => {
+			const value = (await inputs.readFile(file)).toString(); now += 40; return { value, bytes: 1, dispose: () => {} };
+		};
+		try {
+			await view.prepare(binding, "parsed", build, async value => value); view.seal(); now = 200;
+			const evaluation = await TimelineInterval.collect(async () => {
+				await expect(view.evaluate(inputs => inputs.prepare({}, "derived", async inner => {
+					const value = await inner.prepare!(binding, "parsed", build, async value => value);
+					now += 20; return { value, bytes: 1, dispose: () => {} };
+				}, async value => value), () => { now += 5; throw failure; })).rejects.toBe(failure);
+				now += 3;
+			});
+			expect(new TaskTimeline(200).recordTool(new TimelineInterval(200, now, evaluation.dependencies)))
+				.toEqual({ actorComputeMs: undefined, reusedExecutionMs: 0 });
+		} finally { clock.mockRestore(); await view.dispose(); }
 	});
 
 	test.each(["content", "names"] as const)("retains only independently proven metadata after %s revocation", async scope => {
@@ -807,6 +878,49 @@ describe("speculative action resource versions", () => {
 			expect((await scopedManager.validate({ ...scoped, observations: new Map([...scoped.observations].filter(([, entry]) => entry.scope !== "resolution")) })).expired).toBe(false);
 			expect((await scopedManager.validate(scoped)).expired).toBe(true);
 		} finally { await scoped.release(); scopedManager.close(); }
+	});
+
+	test.each(["next-owner", "fresh-capture"] as const)("discards resource query receipts rejected during proof retention before %s", async mode => {
+		const root = await workspace({ value: "A" }), file = path.join(root, "value"), args = { path: "value" }, native = createReadTool(root);
+		const stock = resolvePiToolInvocation("read", args, { cwd: root, environment: {} })!, binding = {};
+		let now = 0, buildMs = 90;
+		const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
+		const invocation = { ...stock, filesystem: async (view: Parameters<NonNullable<typeof stock.filesystem>>[0]) => view.prepare!(binding, "parsed",
+			async inputs => { const value = (await inputs.readFile(file)).toString(); now += buildMs; return { value, bytes: 1, dispose: () => {} }; },
+			async value => { now += 4; return { result: { content: [{ type: "text" as const, text: value }], details: {} }, isError: false }; }) };
+		const action = PI_ACTION_SEMANTICS.buildKey("read", args, root, "", { fingerprint: "prepared-read", context: invocation })!;
+		const world = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: ["read"], maxBytes: () => 65536 });
+		const context = { cwd: root, tool: native, toolName: "read", args, action, callID: "read", signal: new AbortController().signal };
+		const branches: Awaited<ReturnType<NonNullable<typeof world.speculation>["execute"]>>[] = [];
+		let restore: (() => void) | undefined;
+		try {
+			branches.push(await world.speculation!.execute(context));
+			if (mode === "next-owner") { buildMs = 30; branches.push(await world.speculation!.execute(context)); }
+			buildMs = 90; now = 200;
+			const originalRetain = ResourceVersionManager.prototype.retain;
+			const released = vi.fn();
+			const retain = vi.spyOn(ResourceVersionManager.prototype, "retain").mockImplementationOnce(function (this: ResourceVersionManager, token, metadataBytes) {
+				now += 6;
+				const proof = originalRetain.call(this, token, metadataBytes);
+				return { ...proof,
+					// Fail after the branch has taken the proof reference, so fallback must also release it.
+					get view(): undefined { throw new Error("resource_version_owner_changed"); },
+					release: async () => { released(); now += 30; await proof.release(); },
+				};
+			});
+			restore = () => retain.mockRestore();
+			const evaluation = await TimelineInterval.collect(() => world.speculation!.execute({ ...context,
+				inputs: () => branches.map(branch => branch.inputSource!) }));
+			branches.push(evaluation.output);
+			expect(evaluation.output.output.result.content).toEqual([{ type: "text", text: "A" }]);
+			expect(retain).toHaveBeenCalledTimes(mode === "next-owner" ? 2 : 1);
+			expect(released).toHaveBeenCalledOnce();
+			expect(new TaskTimeline(200).recordTool(new TimelineInterval(200, now, evaluation.dependencies)))
+				.toEqual({ actorComputeMs: mode === "next-owner" ? 8 : 98, reusedExecutionMs: mode === "next-owner" ? 30 : 0 });
+			expect(await evaluation.output.validate!()).toMatchObject({ status: "valid" });
+			await fs.writeFile(file, "changed");
+			expect(await evaluation.output.validate!()).toMatchObject({ status: "stale" });
+		} finally { restore?.(); clock.mockRestore(); await Promise.all(branches.map(branch => branch.dispose())); }
 	});
 
 	test.each([false, true])("re-evaluates sealed bytes without expanding Actor observation authority (captured-only=%s)", async (capturedOnly) => {

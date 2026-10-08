@@ -2,6 +2,8 @@ import { EventEmitter } from "node:events";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { nearestRank, type SuiteBenchmarkRun, summarizePairs, summarizeSuite } from "../bench/suite-report.ts";
+import { parsePatternPresets } from "../bench/pattern-options.ts";
+import { PATTERN_AWARE_PRESETS } from "../src/pattern-aware-presets.ts";
 import type { SpeculativeActionExtensionDependencies } from "../src/extension.ts";
 import { emptyWorldReuseMetrics } from "../src/execution-world.ts";
 import { emptySpeculativeTraceSummary } from "../src/trace-summary.ts";
@@ -15,6 +17,7 @@ describe("ablation suite report", () => {
 		["existing-output", "EEXIST", false, 0],
 	] as const)("preserves completed and failed runs after a runner %s", async (failure, message, complete, exitCode) => {
 		const originalArgv = process.argv;
+		const presetArguments = complete ? ["--pattern-presets", "recheck-search,result-neighbors"] : ["--pattern-presets="];
 		const files = new Map<string, string>();
 		const previous = JSON.stringify({ metadata: { implementationCommit: "old" }, summary: run("failed", 1, {}).summary });
 		const failedOutput = path.resolve("offline-results", "repeat-1", "failed.json");
@@ -31,6 +34,7 @@ describe("ablation suite report", () => {
 			},
 		}));
 		vi.doMock("node:child_process", () => ({ spawn: (_file: string, args: string[]) => {
+			expect(args).toEqual(expect.arrayContaining(presetArguments));
 			const child = new EventEmitter();
 			const instance = args[args.indexOf("--instance") + 1]!;
 			const output = args[args.indexOf("--output") + 1]!;
@@ -46,7 +50,7 @@ describe("ablation suite report", () => {
 			return child;
 		} }));
 		const stdout = vi.spyOn(process.stdout, "write").mockReturnValue(true);
-		process.argv = [process.execPath, "suite.ts", "--suite", "offline", "--output-root", "offline-results"];
+		process.argv = [process.execPath, "suite.ts", "--suite", "offline", "--output-root", "offline-results", ...presetArguments];
 		try {
 			await expect(import("../bench/suite.ts")).rejects.toThrow(message);
 			expect(attempts).toBe(failure === "existing-output" ? 1 : 2);
@@ -117,12 +121,17 @@ describe("ablation suite report", () => {
 		} }] }) }));
 		const stdout = vi.spyOn(process.stdout, "write").mockReturnValue(true);
 		process.argv = [process.execPath, "run.ts", "--instance", "offline", "--actor", "offline/model",
-			"--drafter", "offline/model", "--drafter-max-depth", "2", "--output", "offline-result.json"];
+			"--drafter", "offline/model", "--drafter-max-depth", "2", "--output", "offline-result.json",
+			...(reported ? ["--pattern-aware", "--pattern-presets", "edited-file, reported-files,edited-file"] : [])];
 		try {
 			await expect(import("../bench/run.ts")).rejects.toThrow("Benchmark failed:");
 			expect(phases).toEqual(["prompt", "shutdown", "dispose"]);
 			const { metadata, summary, traces } = JSON.parse(files.get(path.resolve("offline-result.json"))!);
 			expect(metadata).toMatchObject({ actor: "offline/model", drafter: "offline/model", drafterMaxDepth: 2, monotonicTimeOrigin: performance.timeOrigin });
+			const configuration = JSON.parse(files.get(path.resolve("offline-task", "agent", "speculative-action.json"))!);
+			expect(configuration.patternAware).toEqual(reported ? { enabled: true, presets: ["reported-files", "edited-file"] } : { enabled: false });
+			if (reported) expect(metadata.patternPresets).toEqual(["reported-files", "edited-file"]);
+			else expect(metadata).not.toHaveProperty("patternPresets");
 			expect(metadata.executionRoutes).toEqual(reported ? { worlds: [], primaryIDs: ["linux_process"],
 				actorProcessReplay: { state: "ready", detail: "installed Actor route" } } : null);
 			expect(summary.actorProcessReuse).toEqual(reported ? actorProcessReuse : null);
@@ -130,7 +139,7 @@ describe("ablation suite report", () => {
 			expect(traces.toolWaits).toEqual([{ id: "first", startedAt: performance.timeOrigin + 10, completedAt: performance.timeOrigin + 60 },
 				{ id: "second", startedAt: performance.timeOrigin + 20, completedAt: performance.timeOrigin + 40 }]);
 			for (const key of ["repoCache", "runRoot", "output", "prepareOnly"]) expect(metadata).not.toHaveProperty(key);
-			expect(summary).toMatchObject({ patchCandidate: false, actorCost: 2, actorTokens: 13, toolWaitMs: 50, toolSpeedup: 1,
+			expect(summary).toMatchObject({ patchCandidate: false, actorCost: 2, actorTokens: 13, toolWaitMs: 50, toolSpeedup: null,
 				changedFiles: ["src/file.ts"], benchmarkErrors: Object.fromEntries(phases.map(phase => [phase, `Error: ${phase} failed`])),
 			});
 			expect(summary.actualEndToEndMs).toBeGreaterThanOrEqual(summary.agentPromptMs);
@@ -147,19 +156,19 @@ describe("ablation suite report", () => {
 		const report = summarizeSuite([
 			run("task-a", 1, {
 				actualEndToEndMs: 100,
-				toolWaitMs: 100, hiddenLatencyMs: 20,
+				toolWaitMs: 10, actorComputeMs: 100, reusedExecutionMs: 20,
 				actorActions: 10,
 				speculativeHits: 2,
 			}),
 			run("task-b", 1, {
 				actualEndToEndMs: 300,
-				toolWaitMs: 300, hiddenLatencyMs: 30,
+				toolWaitMs: 30, actorComputeMs: 300, reusedExecutionMs: 30,
 				actorActions: 30,
 				speculativeHits: 3,
 			}),
 			run("task-b", 2, {
 				actualEndToEndMs: 1000,
-				toolWaitMs: 1000, hiddenLatencyMs: 0,
+				toolWaitMs: 100, actorComputeMs: 1000, reusedExecutionMs: 0,
 				actorActions: 0,
 				patchCandidate: false,
 				timedOut: true,
@@ -175,7 +184,7 @@ describe("ablation suite report", () => {
 			allRunsScreenedIn: false,
 			statistics: {
 				primaryEstimator: "ratio_of_means",
-				baseline: "same_run_tool_wait_plus_hidden_latency",
+				baseline: "same_run_actor_compute_plus_gross_reused_execution",
 				samplePolicy: "all_measured_runs",
 			},
 			implementationCommits: ["commit"],
@@ -184,11 +193,12 @@ describe("ablation suite report", () => {
 				instanceClusters: 2,
 				actualEndToEndMs: 1400,
 				actualEndToEndP95Ms: 1000,
-				toolWaitMs: 1400, hiddenLatencyMs: 50,
-				toolWaitP95Ms: 1000,
+				toolWaitMs: 140, actorComputeMs: 1400, reusedExecutionMs: 50, baselineComputeMs: 1450,
+				toolWaitP95Ms: 100,
 				actualEndToEndMeanMs: 1400 / 3,
-				toolWaitMeanMs: 1400 / 3,
+				toolWaitMeanMs: 140 / 3,
 				toolSpeedup: 1450 / 1400,
+				fullyReused: false,
 				actorActions: 40,
 				speculativeHits: 5,
 				hitRate: 0.125,
@@ -212,28 +222,98 @@ describe("ablation suite report", () => {
 	it("pairs speculation on and off per instance and repeat, including a slower speculative arm", () => {
 		const report = summarizePairs([{ ...run("a", 1, { toolWaitMs: 80 }), arm: "on" }, { ...run("a", 1, { toolWaitMs: 100 }), arm: "off" },
 			{ ...run("a", 2, { toolWaitMs: 120 }), arm: "on" }, { ...run("a", 2, { toolWaitMs: 100 }), arm: "off" }, { ...run("b", 1, {}), arm: "on" }]);
-		expect(report).toMatchObject({ pairedToolSpeedup: 1, on: { runs: 3 }, off: { runs: 2 } });
+		expect(report).toMatchObject({ pairedToolWaitRatio: 1, on: { runs: 3 }, off: { runs: 2 } });
+		expect(report).not.toHaveProperty("pairedToolSpeedup");
 		expect(report.pairs).toEqual([{ instance: "a", repeat: 1, onToolWaitMs: 80, offToolWaitMs: 100 }, { instance: "a", repeat: 2, onToolWaitMs: 120, offToolWaitMs: 100 }]);
 	});
 
 	it("retains zero-tool tasks without inventing a speedup", () => {
-		const report = summarizeSuite([run("empty", 1, { toolWaitMs: 0 })]);
-		expect(report).toMatchObject({ unmeasuredRuns: 0, pooled: { toolSpeedup: null, hiddenLatencyMs: 0, toolWaitMs: 0 } });
+		const report = summarizeSuite([run("empty", 1, { toolWaitMs: 0, actorComputeMs: 0 })]);
+		expect(report).toMatchObject({ unmeasuredRuns: 0, pooled: { toolSpeedup: null, fullyReused: false, actorComputeMs: 0, reusedExecutionMs: 0, toolWaitMs: 0 } });
 		expect(report.pooled).not.toHaveProperty("accelerationRatio");
+	});
+
+	it("distinguishes fully reused computation from an empty task and pools amounts before dividing", () => {
+		const reused = run("reused", 1, { actorComputeMs: 0, reusedExecutionMs: 90, toolWaitMs: 12 });
+		const empty = run("empty", 1, { actorComputeMs: 0, reusedExecutionMs: 0, toolWaitMs: 0 });
+		expect(summarizeSuite([reused, empty])).toMatchObject({ unmeasuredRuns: 0,
+			pooled: { actorComputeMs: 0, reusedExecutionMs: 90, baselineComputeMs: 90, toolSpeedup: null, fullyReused: true },
+			byInstance: { empty: { toolSpeedup: null, fullyReused: false }, reused: { toolSpeedup: null, fullyReused: true } },
+		});
+		const mixed = summarizeSuite([reused, run("native", 1, { actorComputeMs: 10, reusedExecutionMs: 0, toolWaitMs: 99 })]);
+		expect(mixed.pooled).toMatchObject({ actorComputeMs: 10, reusedExecutionMs: 90, baselineComputeMs: 100, toolSpeedup: 10, fullyReused: false });
+	});
+
+	it("keeps legacy wait diagnostics separate from unavailable computation measurements", () => {
+		const legacy = { ...run("legacy", 1, { actorComputeMs: undefined, reusedExecutionMs: 50, toolWaitMs: 20 }), arm: "on" as const };
+		legacy.summary = { ...legacy.summary!, hiddenLatencyMs: 5000, maxReuseLeadMs: 60_000 } as NonNullable<SuiteBenchmarkRun["summary"]>;
+		const missingReuse = run("missing-reuse", 1, { actorComputeMs: 10, reusedExecutionMs: undefined });
+		const report = summarizeSuite([legacy, missingReuse, run("new", 1, { actorComputeMs: 10, reusedExecutionMs: 5 })]);
+		expect(report).toMatchObject({ unmeasuredRuns: 2, pooled: { runs: 1, toolSpeedup: 1.5 },
+			diagnostics: { toolWaitMeasuredRuns: 3, toolWaitMs: 22, toolWaitMeanMs: 22 / 3, toolWaitP95Ms: 20, reuseMeasuredRuns: 2, reusedExecutionMs: 55 },
+			byInstance: { legacy: null, "missing-reuse": null },
+			invalidRuns: [{ instance: "legacy", reasons: ["unavailable_timing"] }, { instance: "missing-reuse", reasons: ["unavailable_timing"] }],
+		});
+		const paired = summarizePairs([legacy,
+			{ ...run("legacy", 1, { actorComputeMs: undefined, reusedExecutionMs: undefined, toolWaitMs: 40 }), arm: "off" },
+		]);
+		expect(paired).toMatchObject({ pairedToolWaitRatio: 2, on: { unmeasuredRuns: 1 }, off: { unmeasuredRuns: 1 } });
+		expect(paired.on.pooled).toBeUndefined();
+		expect(paired.on.diagnostics).toMatchObject({ toolWaitMs: 20, reusedExecutionMs: 50 });
+	});
+
+	it("retains known gross reuse diagnostics while excluding incomplete evidence from the primary ratio", () => {
+		const report = summarizeSuite([run("partial-evidence", 1, { actorComputeMs: 10, reusedExecutionMs: 50, reusedExecutionIncomplete: true }),
+			run("complete", 1, { actorComputeMs: 10, reusedExecutionMs: 5 })]);
+		expect(report).toMatchObject({ unmeasuredRuns: 1, pooled: { runs: 1, toolSpeedup: 1.5 },
+			diagnostics: { reuseMeasuredRuns: 2, reusedExecutionMs: 55, reusedExecutionIncomplete: true },
+			byInstance: { "partial-evidence": null }, invalidRuns: [{ instance: "partial-evidence", reasons: ["unavailable_timing"] }] });
+	});
+
+	it.each([undefined, -1, NaN, Infinity])("does not substitute zero for unavailable reused computation %s", reusedExecutionMs => {
+		const report = summarizeSuite([run("unmeasured", 1, { reusedExecutionMs })]);
+		expect(report).toMatchObject({ unmeasuredRuns: 1, byInstance: { unmeasured: null } });
+		expect(report.pooled).toBeUndefined();
+		expect(report.diagnostics.reusedExecutionMs).toBeUndefined();
+	});
+
+	it("preserves valid primary computation when the independent raw wait diagnostic is unavailable", () => {
+		const report = summarizeSuite([run("compute", 1, { actorComputeMs: 20, reusedExecutionMs: 20, toolWaitMs: NaN })]);
+		expect(report).toMatchObject({ unmeasuredRuns: 0, pooled: { toolSpeedup: 2, toolWaitMeasuredRuns: 0 } });
+		expect(report.pooled?.toolWaitMs).toBeUndefined();
+		expect(report.pooled?.toolWaitP95Ms).toBeUndefined();
 	});
 
 	it.each([-1, NaN, Infinity])("weights unequal repeats and exposes unavailable timing %s", (invalid) => {
 		const report = summarizeSuite([
-			run("short", 1, { toolWaitMs: 0.5, hiddenLatencyMs: 0.5 }),
-			run("long", 1, { toolWaitMs: 200, hiddenLatencyMs: 100 }),
-			run("long", 2, { toolWaitMs: 600, hiddenLatencyMs: 300 }),
-			run("missing", 1, { toolWaitMs: invalid }),
+			run("short", 1, { toolWaitMs: 0.1, actorComputeMs: 0.5, reusedExecutionMs: 0.5 }),
+			run("long", 1, { toolWaitMs: 20, actorComputeMs: 200, reusedExecutionMs: 100 }),
+			run("long", 2, { toolWaitMs: 60, actorComputeMs: 600, reusedExecutionMs: 300 }),
+			run("missing", 1, { actorComputeMs: invalid }),
 		]);
 		expect(report.pooled?.toolSpeedup).toBeCloseTo(1201 / 800.5, 12);
 		expect(report.pooled).not.toHaveProperty("savingsAccelerationRatio");
-		expect(report.pooled?.hiddenLatencyMs).toBe(400.5);
+		expect(report.pooled).toMatchObject({ actorComputeMs: 800.5, reusedExecutionMs: 400.5, baselineComputeMs: 1201, toolWaitMs: 80.1 });
+		for (const obsolete of ["hiddenLatencyMs", "maxReuseLeadMs", "reuseLeadSamples"]) expect(report.pooled).not.toHaveProperty(obsolete);
 		expect(report).toMatchObject({ runs: 4, unmeasuredRuns: 1, pooled: { runs: 3 }, byInstance: { missing: null },
 			invalidRuns: [{ instance: "missing", reasons: ["unavailable_timing"] }] });
+	});
+});
+
+describe("benchmark preset selection", () => {
+	it("preserves omission and distinguishes an explicit empty selection", () => {
+		expect(parsePatternPresets(undefined)).toBeUndefined();
+		for (const value of ["", "  "]) expect(parsePatternPresets(value)).toEqual([]);
+	});
+
+	it("accepts all stable IDs, trims and deduplicates them in catalog order", () => {
+		const all = PATTERN_AWARE_PRESETS.map(preset => preset.id);
+		expect(parsePatternPresets(all.join(","))).toEqual(all);
+		expect(parsePatternPresets(" result-neighbors ,reported-files,result-neighbors ")).toEqual(["reported-files", "result-neighbors"]);
+	});
+
+	it.each(["unknown", "reported-files,unknown", "reported-files,", "all"])("rejects an unknown preset in %s", value => {
+		expect(() => parsePatternPresets(value)).toThrow("Unknown --pattern-presets ID");
 	});
 });
 
@@ -246,7 +326,8 @@ function run(instance: string, repeat: number, overrides: Partial<SuiteBenchmark
 		summary: {
 			actualEndToEndMs: 1,
 			toolWaitMs: 1,
-			hiddenLatencyMs: 0,
+			actorComputeMs: 1,
+			reusedExecutionMs: 0,
 			actorActions: 1,
 			speculativeHits: 0,
 			actorCost: 0,

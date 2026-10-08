@@ -180,9 +180,24 @@ export interface HeldExecSnapshot {
 	readonly resources?: ProcessResourceGraph;
 }
 
-export type HeldExecDecision =
+export interface HeldExecClock {
+	readonly startedAt: number;
+	readonly completedAt: number;
+}
+
+/** Same-process transport clocks; native completion exists only when the existing decision requested it. */
+export interface HeldExecTiming {
+	readonly requestedAt: number;
+	readonly completedAt: number;
+	readonly committedAt?: number;
+	readonly barrier: "none" | "inspection" | "descriptors";
+	readonly outcome: "continued" | "adopted" | "declined" | "failed";
+	readonly native?: HeldExecClock;
+}
+
+export type HeldExecDecision = { readonly observeTiming?: (timing: HeldExecTiming) => void } & (
 	/** `repeat`: the same launch, or the same executable with any argv, may run natively for the rest of this call without asking again. */
-	| { readonly kind: "continue"; readonly repeat?: "launch" | "executable"; readonly observeCompletion?: (durationMs: number | undefined) => void | Promise<void> }
+	| { readonly kind: "continue"; readonly repeat?: "launch" | "executable"; readonly observeCompletion?: (durationMs: number | undefined, clock?: HeldExecClock) => void | Promise<void> }
 	| ({
 			readonly kind: "replay";
 			readonly output: readonly { readonly fd: 1 | 2; readonly data: Buffer }[];
@@ -203,11 +218,12 @@ export type HeldExecDecision =
 			readonly commit: () => Promise<void>;
 			readonly adopted?: () => void;
 	  } & ({ readonly exitCode: number; readonly continuation?: never } |
-		{ readonly exitCode?: never; readonly continuation: { readonly image: Buffer; readonly physicalRoot: string } }));
+		{ readonly exitCode?: never; readonly continuation: { readonly image: Buffer; readonly physicalRoot: string } })));
 
 export interface LinuxHeldExecOptions { readonly storeRoot: string; readonly binary?: string; }
 
 interface ActiveExecution {
+	readonly barrier: HeldExecTiming["barrier"];
 	sequence: number;
 	readonly sourceRoot: string;
 	readonly scope?: ExecutionScope;
@@ -283,6 +299,7 @@ export class LinuxHeldExecBoundary {
 				const controller = new AbortController();
 				let finished!: () => void;
 				const active: ActiveExecution = {
+					barrier: descriptors === "inspect" ? "inspection" : descriptors ? "descriptors" : "none",
 					sequence: 0,
 					sourceRoot: options.sourceRoot,
 					scope: snapshotExecutionScope(request.scope),
@@ -326,8 +343,12 @@ export class LinuxHeldExecBoundary {
 	}
 
 	private async serve(socket: net.Socket): Promise<void> {
+		const requestedAt = performance.now();
 		let prepared = false;
 		let active: ActiveExecution | undefined;
+		let decision: HeldExecDecision | undefined, native: HeldExecClock | undefined;
+		let completedAt: number | undefined, committedAt: number | undefined;
+		let outcome: HeldExecTiming["outcome"] = "declined";
 		let release!: () => void;
 		const pending = new Promise<void>((resolve) => { release = resolve; });
 		try {
@@ -336,7 +357,7 @@ export class LinuxHeldExecBoundary {
 			active?.pending.add(pending);
 			if (!request || !active || !(await heldBy(request.pid, request.tracer, this.shellPath))) { return void socket.end("C\n"); }
 			active.signal?.throwIfAborted();
-			const decision = await active.decide({
+			decision = await active.decide({
 				id: `${request.execution}:${++active.sequence}`,
 				sequence: active.sequence,
 				pid: request.pid,
@@ -348,8 +369,10 @@ export class LinuxHeldExecBoundary {
 				...(request.trackQueues ? { trackQueues: true as const } : {}),
 			});
 			if (decision.kind === "continue") {
+				completedAt = performance.now(); outcome = "continued";
 				if (!decision.observeCompletion) return void socket.end(decision.repeat === "executable" ? "e\n" : decision.repeat ? "c\n" : "C\n");
-				await observeCompletion(socket, decision.observeCompletion);
+				native = await observeCompletion(socket, decision.observeCompletion);
+				if (native) completedAt = native.startedAt;
 				return;
 			}
 			const positions = decision.descriptorOffsets?.map(position => ({ ...position, afterFlags: position.afterFlags ?? position.flags })) ?? [];
@@ -399,37 +422,46 @@ export class LinuxHeldExecBoundary {
 			if (acknowledgement !== "A") throw new Error("held-exec adoption was not acknowledged");
 			active.signal?.throwIfAborted();
 			await decision.commit();
+			committedAt = performance.now();
 			await write(socket, Buffer.from("R\n"));
 			if ((await readLine(socket)) !== "D") throw new Error("held-exec adoption completion is unknown");
+			completedAt = performance.now(); outcome = "adopted";
 			try { decision.adopted?.(); } catch { /* Feedback cannot poison a completed handoff. */ }
 			socket.end();
 		} catch (error) {
+			completedAt ??= performance.now(); outcome = "failed";
 			if (active && (prepared || isPoisonedEffectCommit(error))) {
 				// The logical call, not just the held child, owns an irreversible handoff.
 				active.failure ??= effectCommitFailure(new Error("held-exec handoff failed", { cause: error }), "poisoned");
 			}
 			if (!socket.destroyed) socket.end(active?.failure ? "F\n" : "C\n");
 		} finally {
+			if (active && decision?.observeTiming) try {
+				decision.observeTiming({ requestedAt, completedAt: completedAt ?? performance.now(), barrier: active.barrier, outcome,
+					...(committedAt !== undefined ? { committedAt } : {}), ...(native ? { native } : {}) });
+			} catch { /* Timing evidence cannot replace the process outcome. */ }
 			active?.pending.delete(pending);
 			release();
 		}
 	}
 }
 
-async function observeCompletion(socket: net.Socket, observe: (durationMs: number | undefined) => void | Promise<void>): Promise<void> {
+async function observeCompletion(socket: net.Socket,
+	observe: (durationMs: number | undefined, clock?: HeldExecClock) => void | Promise<void>): Promise<HeldExecClock | undefined> {
 	const startedAt = performance.now();
-	let durationMs: number | undefined;
+	let clock: HeldExecClock | undefined;
 	try {
 		await write(socket, Buffer.from("O\n"));
-		if (await readLine(socket) === "D") durationMs = Math.max(0, performance.now() - startedAt);
+		if (await readLine(socket) === "D") clock = Object.freeze({ startedAt, completedAt: performance.now() });
 	} finally {
 		try {
-			await observe(durationMs);
+			await observe(clock && Math.max(0, clock.completedAt - clock.startedAt), clock);
 		} catch {
 			// Drain optional observation without replacing the already-authorized process outcome.
 		}
 		socket.end();
 	}
+	return clock;
 }
 
 /** Resolve the native helper shared by transparent dispatch and x86-64 Actor handoff. */

@@ -784,7 +784,7 @@ describe("speculative action host", () => {
 			expect(findActor).not.toHaveBeenCalled();
 			await host.finishTurn(call.turnID, true);
 			expect(summarizeSpeculativeTrace(events)).toMatchObject({ inputReuseHits: 8, exactReuseHits: 0, predictionsMatched: 0 });
-			expect(summarizeSpeculativeTrace(events).hiddenLatencyMs, "consumed cross-tool inputs and preparations save work without an exact tool hit").toBeGreaterThan(0);
+			expect(summarizeSpeculativeTrace(events).reusedExecutionMs, "consumed cross-tool inputs and preparations save work without an exact tool hit").toBeGreaterThan(0);
 		} finally { await host.dispose(); await profile.pool.dispose(); }
 	});
 

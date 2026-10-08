@@ -12,6 +12,8 @@ export interface ActorCandidateSelection<Candidate extends { readonly id: string
 	readonly timing: ActorHitTiming;
 	readonly toolExecution: TimelineInterval;
 	readonly projection?: TimelineInterval;
+	/** This projection already existed before the current Actor call; a fresh reconstruction has no receipt. */
+	readonly projectionReused?: true;
 }
 
 type ActorActionState<Candidate extends { readonly id: string }, Output> =

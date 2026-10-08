@@ -1,7 +1,7 @@
 import type { CandidateExecutionState } from "./candidate-execution.ts";
 import type { SpeculativeExecutionRoute, WorldExecutionMetrics } from "./execution-world.ts";
 import type { ActorActionSettlement, PredictionSettlement, SettledSourceRequest } from "./settlement.ts";
-import type { SpeculativeTaskTiming } from "./task-timing.ts";
+import type { SpeculativeTaskTiming, ToolComputationTiming } from "./task-timing.ts";
 
 export interface SpeculativeCacheSnapshot {
 	readonly cacheCapacity: number;
@@ -25,6 +25,7 @@ export interface CandidateEventDescriptor {
 	readonly route: SpeculativeExecutionRoute;
 	readonly world?: { readonly backend: string; readonly executionMetrics: WorldExecutionMetrics; };
 	readonly source: string;
+	readonly mode?: string;
 	readonly depth: number;
 	readonly predictedAction: string;
 }
@@ -49,8 +50,8 @@ export type SpeculativeActionEvent<SessionID> =
 			readonly request: SettledSourceRequest;
 			readonly totalDraftTokens: number;
 	  })
-	| (EventEnvelope<SessionID> & { readonly type: "prediction"; readonly settlement: PredictionSettlement; readonly tool?: string; readonly predictedAction?: string; })
-	| (EventEnvelope<SessionID> & { readonly type: "operation_prediction"; readonly settlement: PredictionSettlement; readonly tool?: string; readonly predictedAction?: string; })
+	| (EventEnvelope<SessionID> & { readonly type: "prediction"; readonly settlement: PredictionSettlement; readonly tool?: string; readonly predictedAction?: string; readonly mode?: string; })
+	| (EventEnvelope<SessionID> & { readonly type: "operation_prediction"; readonly settlement: PredictionSettlement; readonly tool?: string; readonly predictedAction?: string; readonly mode?: string; })
 	| (EventEnvelope<SessionID> & {
 			readonly type: "candidate";
 			readonly candidate: CandidateEventDescriptor;
@@ -61,4 +62,6 @@ export type SpeculativeActionEvent<SessionID> =
 			readonly settlement: ActorActionSettlement;
 			readonly actualAction: string;
 			readonly candidate?: CandidateEventDescriptor;
+			/** Actual accepted computation for this Actor call, including consumed preparations. */
+			readonly computation?: ToolComputationTiming;
 	  });

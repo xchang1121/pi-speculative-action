@@ -23,12 +23,12 @@ const readSchema = Type.Object({ path: Type.String() });
 afterEach(directories.dispose);
 
 describe("faux LLM speculative action end to end", () => {
-	it("bounds unmeasured warm-up across fragmented Actor and Drafter streams", async () => {
+	it("reuses completed results across fragmented Actor and Drafter streams", async () => {
 		const cwd = await workspace(), ready = Array.from({ length: 5 }, barrier);
 		const calls = ready.map((_, index) => fauxToolCall("read", { path: `${index}.txt` }));
 		await Promise.all(ready.map((_, index) => writeFile(path.join(cwd, `${index}.txt`), "one\ntwo\nthree\n")));
 		const result = await runAgent({
-			cwd, sessionID: "completed-hit", tools: [fileRead(cwd)], settings: { ...drafterSettings(), drafterMaxDepth: 0 },
+			cwd, sessionID: "completed-hit", tools: [fileRead(cwd)], settings: { ...drafterSettings(), drafterMaxDepth: 0, drafterGateEnabled: false },
 			actorTurns: [...calls.map((call, index) => turn([fauxThinking("inspect the file before answering"), call], ready[index]!.promise)), turn("done")],
 			draftTurns: [...calls.map((call) => turn(call)), turn("no tool")],
 			onEvent: (event) => {
@@ -37,22 +37,19 @@ describe("faux LLM speculative action end to end", () => {
 			},
 		});
 		expect(result.streamEvents).toEqual(expect.arrayContaining(["thinking_delta", "toolcall_delta"]));
-		expect(result.summary).toMatchObject({ tasks: 1, actorActions: 5, speculativeHits: 4, exactReuseHits: 4, actorFallbacks: 1,
-			sourceRequests: 6, sourceOutcomes: { produced: 4, empty: 2 }, predictionsBySource: { drafter: [4, 4, 4] }, actorActionsByTool: { read: [5, 4] },
-			predictionsSettled: 4, predictionsObserved: 4, predictionsMatched: 4, predictionsAdopted: 4, predictionPrecision: 1, adoptionYield: 1,
-			candidateStarted: 4, candidateSucceeded: 4, cache: { cacheHot: 4 } });
-		// Backends that capture the native fallback can retain one additional cold result.
-		expect(result.summary.cache.cacheCold).toBeLessThanOrEqual(1);
-		expect(result.summary.cache.resultEntries).toBe(4 + result.summary.cache.cacheCold);
+		expect(result.summary).toMatchObject({ tasks: 1, actorActions: 5, speculativeHits: 5, exactReuseHits: 5, actorFallbacks: 0,
+			sourceRequests: 6, sourceOutcomes: { produced: 5 }, predictionsBySource: { drafter: [5, 5, 5] }, actorActionsByTool: { read: [5, 5] },
+			predictionsSettled: 5, predictionsObserved: 5, predictionsMatched: 5, predictionsAdopted: 5, predictionPrecision: 1, adoptionYield: 1,
+			candidateStarted: 5, candidateSucceeded: 5, cache: { cacheHot: 5, cacheCold: 0, resultEntries: 5 } });
 		expect(result.executions).toEqual({ read: 5 });
-		expect(result.actorFallbacks).toEqual(["read"]);
+		expect(result.actorFallbacks).toEqual([]);
 		expect(result.outputs).toEqual(calls.map(() => textResult("one\ntwo\nthree\n")));
 		const phases = result.events.filter((event) => event.type === "candidate").map((event) => event.state.status);
-		expect(phases).toEqual(calls.slice(0, 4).flatMap(() => ["running", "succeeded"]));
+		expect(phases).toEqual(calls.flatMap(() => ["running", "succeeded"]));
 		expect(result.summary.toolWaitMs).toBeGreaterThan(0);
 		const task = result.events.find(event => event.type === "task")!.timing;
 		expect(result.summary.toolWaitMs).toBeLessThanOrEqual(task.completedAt - task.startedAt);
-		expect(result.summary.hiddenLatencyMs).toBeGreaterThanOrEqual(0);
+		expect(result.summary.reusedExecutionMs).toBeGreaterThanOrEqual(0);
 	});
 
 	it("joins a running parent and adopts its completed follow-up without re-execution", async () => {
@@ -92,6 +89,7 @@ describe("faux LLM speculative action end to end", () => {
 			expect(result.executions).toEqual({ read: 2 });
 			expect(result.actorFallbacks).toEqual(drafterMaxDepth ? [] : ["read"]);
 			expect(result.outputs).toEqual([textResult("one\ntwo\nthree\n"), textResult("target")]);
+			expect(result.summary.reusedExecutionMs).toBeGreaterThan(0);
 			expect(result.draftFeedback[0]).toMatchObject({ kind: "drafter_plan", utility: { benefitMs: undefined } });
 			if (drafterMaxDepth) expect(result.draftFeedback[1]).toMatchObject({ kind: "drafter_plan", depth: 1, utility: { benefitMs: undefined } });
 		}

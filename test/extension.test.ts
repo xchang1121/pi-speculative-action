@@ -87,12 +87,15 @@ describe("zero-modification Pi extension", () => {
 		expect(fixture.host.finishTurn).toHaveBeenLastCalledWith("turn_2", true);
 	});
 
-	it("reports tool speedup and total hidden latency without model time in the denominator", () => {
-		const timing = { toolWaitMs: 400, hiddenLatencyMs: 100 };
+	it("reports gross computation speedup without adoption or model time in the denominator", () => {
+		const timing = { toolWaitMs: 400, actorComputeMs: 80, reusedExecutionMs: 120 };
 		expect(formatSpeculativeActionEvent({ type: "task", sessionID: "s", turnID: "t", timing } as never)).toContain(
-			"Tool SpeedUp 1.25x; 100ms tool time saved; 400ms tool wait");
-		for (const [wait, hidden, ratio] of [[1000, 0, "1.00x"], [0, 0, "n/a"], [1000, NaN, "n/a"]] as const)
-			expect(formatSpeculativeActionEvent({ type: "task", sessionID: "s", turnID: "t", timing: { toolWaitMs: wait, hiddenLatencyMs: hidden } } as never)).toContain(`Tool SpeedUp ${ratio}`);
+			"Tool SpeedUp 2.50x; 120ms gross tool time saved; 80ms Actor computation");
+		for (const [actorComputeMs, reusedExecutionMs, ratio] of [[1000, 0, "1.00x"], [0, 0, "n/a"], [0, 1000, "fully reused"], [undefined, 1000, "n/a"], [1000, NaN, "n/a"]] as const)
+			expect(formatSpeculativeActionEvent({ type: "task", sessionID: "s", turnID: "t", timing: { actorComputeMs, reusedExecutionMs } } as never)).toContain(`Tool SpeedUp ${ratio}`);
+		for (const actorComputeMs of [0, 80]) expect(formatSpeculativeActionEvent({ type: "task", sessionID: "s", turnID: "t",
+			timing: { ...timing, actorComputeMs, reusedExecutionIncomplete: true } } as never)).toContain(
+			"Tool SpeedUp n/a; 120ms gross tool time saved (known lower bound)");
 	});
 
 	it("sends Drafter requests as simple options through the provider with registry auth", async () => {
@@ -469,7 +472,7 @@ describe("zero-modification Pi extension", () => {
 		const initial = await editModes([], ["Close"]);
 		expect(initial.get("Learned patterns")).toContain(selectedCount(4));
 		expect(initial.get("Prebuilt modes")?.filter(label => label.startsWith("[x]"))).toHaveLength(4);
-		expect(initial.get("Prebuilt modes")?.filter(label => label.startsWith("[ ]"))).toHaveLength(5);
+		expect(initial.get("Prebuilt modes")?.filter(label => label.startsWith("[ ]"))).toHaveLength(7);
 		const menus = await editModes([choice("reported-files", true), choice("edited-file", true),
 			choice("reported-lines", false), choice("companion-files", false)]);
 		expect(menus.get("Prebuilt modes")).toEqual(expect.arrayContaining([

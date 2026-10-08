@@ -51,7 +51,7 @@ import type {
 } from "./settlement.ts";
 import { cause } from "./settlement.ts";
 import { runSourceRequest, SourceGeneration } from "./source-request.ts";
-import { TaskTimeline, TimelineInterval } from "./task-timing.ts";
+import { TaskTimeline, TimelineInterval, type ComputationReuseShare } from "./task-timing.ts";
 
 class CandidateFailure extends Error {
 	readonly failure: ResolutionCause;
@@ -168,7 +168,7 @@ async function projectOutput<Output>(candidate: CandidateRecord<Output>, actor: 
 	if (retained && (retained.validate || !candidate.outputStale && !branch.inputsOnly)) {
 		const output = cloneSharedData(retained.output);
 		if (retained.resource) retained.resource.references++;
-		return { ok: true, ...retained, output };
+		return { ok: true, ...retained, output, reused: true };
 	}
 	const reconstruct = branch.reconstruct;
 	const rule = match.kind === "projected" ? rules.find((item) => item.id === match.projector) : undefined;
@@ -204,15 +204,6 @@ async function projectOutput<Output>(candidate: CandidateRecord<Output>, actor: 
 
 function callKey(turnID: string, callID: string): string { return JSON.stringify([turnID, callID]); }
 
-function closeActorPhase<SessionID, Output, StartInput, StateData>(
-	turn: TurnState<SessionID, Output, StartInput, StateData>,
-	completedAt: number,
-): void {
-	if (turn.actorPhaseCompletedAt !== undefined) return;
-	turn.actorPhaseCompletedAt = Math.max(turn.startedAt, completedAt);
-	turn.session.timeline?.recordActor(turn.startedAt, turn.actorPhaseCompletedAt);
-}
-
 function outputIsError(value: unknown): boolean {
 	return Boolean(value && typeof value === "object" && (value as { readonly isError?: unknown }).isError === true);
 }
@@ -223,6 +214,7 @@ function candidateEventDescriptor<Output>(
 	const branch = candidateBranch(candidate);
 	return {
 		source: candidate.owner.draft.source ?? "cache",
+		...(candidate.owner.draft.mode ? { mode: candidate.owner.draft.mode } : {}),
 		depth: candidate.owner.draft.depth ?? 0,
 		id: candidate.id,
 		origin: candidate.origin,
@@ -400,7 +392,6 @@ interface TurnState<SessionID, Output, StartInput, StateData> extends RuntimeTur
 	readonly actorPreviews: Map<string, ActorPreviewRecord>;
 	actorDecisionStartedAt: number;
 	actorArrivedAt?: number;
-	actorPhaseCompletedAt?: number;
 	lifecycle: "active" | "closing" | "finished";
 }
 
@@ -409,10 +400,10 @@ interface ClaimedPrediction { readonly node: PlanRuntimeNode; readonly opportuni
 interface ProjectionResource { readonly dispose: () => void | Promise<void>; references: number; }
 
 type ProjectionResult<Output> =
-	| { readonly ok: true; readonly output: Output; readonly execution?: TimelineInterval; readonly inputs?: boolean; readonly compatibility?: WorldBranch<Output>["compatibility"]; readonly validate?: WorldBranch<Output>["validate"]; readonly capturedBytes?: number; readonly requiresQueryValidation?: true; readonly resource?: ProjectionResource }
+	| { readonly ok: true; readonly output: Output; readonly execution?: TimelineInterval; readonly reused?: true; readonly inputs?: boolean; readonly compatibility?: WorldBranch<Output>["compatibility"]; readonly validate?: WorldBranch<Output>["validate"]; readonly capturedBytes?: number; readonly requiresQueryValidation?: true; readonly resource?: ProjectionResource }
 	| { readonly ok: false; readonly cause: ResolutionCause };
 
-type RetainedResultView<Output> = Omit<Extract<ProjectionResult<Output>, { ok: true }>, "ok" | "execution"> & {
+type RetainedResultView<Output> = Omit<Extract<ProjectionResult<Output>, { ok: true }>, "ok" | "execution" | "reused"> & {
 	readonly bytes: number;
 	readonly execution: TimelineInterval;
 };
@@ -1158,11 +1149,13 @@ export function makeSpeculativeActionRuntime<
 			const draft = candidate.owner.draft, learning = session.operationLearning;
 			const sample = { costMs: 0, benefitMs: 0 as number | undefined }, update = draft.producesOperations && learning.gate.observe("reruns", sample, DEFAULT_BENEFIT_GATE_POLICY);
 			if (update) candidate.onAdopted = timing => { creditAdoption(sample, timing); update(sample); };
-			const adopted = update || draft.type === "operation" ? new Set<string>() : undefined;
+			const adopted = update || draft.type === "operation" || candidate.origin === "prediction" ? new Set<string>() : undefined;
 			if (adopted) candidate.onOperationAdopted = adoption => {
 				const turn = session.turns.get(adoption.scope.turnID);
 				if (session.lifecycle.sealed || session.id !== adoption.scope.sessionID || !turn ||
 					draft.type === "operation" && draft.operation?.identity !== adoption.operationIdentity) return;
+				if (candidate.origin === "prediction" && adoption.computation?.reused)
+					TimelineInterval.producedBy(adoption.computation.computation, { source: draft.source ?? "cache", mode: draft.mode, feedback: draft.reuseFeedback });
 				const receipt = JSON.stringify([adoption.scope.turnID, adoption.id, adoption.sequence, adoption.operationIdentity]);
 				if (!adopted.has(receipt) && adopted.size < positiveCount(session.settings.resourceCacheMaxEntries)) {
 					adopted.add(receipt); // Saturate instead of evicting receipts that could otherwise be credited twice.
@@ -1197,24 +1190,29 @@ export function makeSpeculativeActionRuntime<
 				...(parent ? { parentWorld: candidateBranch(parent)! } : {}),
 			}));
 			branch = evaluation.output;
+			const disposeStartedAt = performance.now();
 			inputs?.dispose(); // The returned branch owns its proof before cache admission can evict sources.
+			const disposal = new TimelineInterval(disposeStartedAt, performance.now());
 			const output = branch.output;
 			const rejected = adapter.rejectCandidateOutput?.({ output, candidate: publicCandidate(candidate) });
 			if (rejected) throw new CandidateFailure(cause("execution", "output_rejected", rejected));
 			candidate.projectionCoverage = captureCoverage(candidate.key, output, projectionRules);
 			candidate.estimatedBytes = estimateValueBytes(output) + inputIndexBytes(branch);
 			const completedAt = performance.now();
-			if (!candidate.work.succeed(branch, new TimelineInterval(startedAt, completedAt, [...evaluation.dependencies, ...branch.computationDependencies ?? []]), completedAt - startedAt)) {
+			const computation = new TimelineInterval(startedAt, completedAt, [...evaluation.dependencies, ...branch.computationDependencies ?? [],
+				{ computation: disposal, overhead: true }]);
+			if (!candidate.work.succeed(branch, computation, completedAt - startedAt)) {
 				await session.lifecycle.release(branch);
 				return;
 			}
+			if (candidate.origin === "prediction") TimelineInterval.producedBy(computation, { source: draft.source ?? "cache", mode: draft.mode, feedback: draft.reuseFeedback });
 			session.scheduler.observeSpeculativeService(actionTimingIdentity(candidate.key), completedAt - startedAt);
 			candidateStore.settle(session.id, candidate, candidate.work.reservation.kind === "shared", branch.reconstruct ? branch.inputResources : undefined);
 			// An exclusive result waits for its own adoption; meanwhile the unchanged bytes it read can answer other reads.
 			const budget = cacheLimits(candidate.owner.settings), preimages = candidate.work.reservation.kind === "exclusive" && budget.maxEntries > 0 && budget.maxBytes > 0
 				? await branch.takeReadInputs?.(budget.maxBytes).catch(() => undefined) : undefined;
 			if (preimages) await promoteAuthoritativeResult(session, candidate.owner, () => candidateStore.has(session.id, candidate), candidate.key, preimages.output, 0,
-				new TimelineInterval(startedAt, completedAt), { route: { ...candidate.route, backend: preimages.backend, isolation: "resource_snapshot", reuse: "shared_result" },
+				computation, { route: { ...candidate.route, backend: preimages.backend, isolation: "resource_snapshot", reuse: "shared_result" },
 					seal: () => preimages, dispose: preimages.dispose });
 			for (const node of session.plan.consumers(candidate.id)) queueContinuation(session, node, candidate, output, "execution_succeeded");
 			trimResults(session, candidate.owner.settings);
@@ -1592,6 +1590,7 @@ export function makeSpeculativeActionRuntime<
 					timing,
 					toolExecution,
 					...(projection.execution ? { projection: projection.execution } : {}),
+					...(projection.reused ? { projectionReused: true } : {}),
 				});
 				break;
 			} finally {
@@ -1613,7 +1612,6 @@ export function makeSpeculativeActionRuntime<
 		if (preview?.state.status === "pending") { preview.state = { status: "cancelled" }; preview = undefined; }
 		const previewCandidateID = preview?.state.status === "candidate" ? preview.state.candidateID : undefined;
 		expireSourceHorizon(state.session, state.decisionSequence, cause("control", "actor_action_arrived"));
-		closeActorPhase(state, actorArrivedAt);
 		if (state.actorArrivedAt === undefined) {
 			state.actorArrivedAt = actorArrivedAt;
 			state.session.decisionSequence = Math.max(state.session.decisionSequence, state.decisionSequence);
@@ -1839,8 +1837,11 @@ export function makeSpeculativeActionRuntime<
 	): void => {
 		const settlement = actorAction.settlement;
 		if (!settlement) return;
-		state.session.timeline?.recordTool(settlement.provider.toolExecution, selection?.timing !== undefined);
-		if (selection?.projection && selection.projection !== settlement.provider.toolExecution) state.session.timeline?.recordTool(selection.projection);
+		let reusedComputations: readonly ComputationReuseShare[] | undefined;
+		const computation = state.session.timeline?.recordCall([
+			{ computation: settlement.provider.toolExecution, reused: !!selection && (selection.match.kind !== "inputs" || !!selection.projectionReused) },
+			...(selection?.projection ? [{ computation: selection.projection, reused: selection.projectionReused }] : []),
+		], shares => { reusedComputations = shares; });
 		const key = actorAction.actionKey;
 		const settledCandidate = selection?.candidate;
 		const settledCandidateDescriptor = settledCandidate && (adapter.onActorActionSettled || adapter.onEvent)
@@ -1850,6 +1851,7 @@ export function makeSpeculativeActionRuntime<
 			type: "actor_action",
 			...eventEnvelope(state.session, state.turnID, state.settings),
 			settlement,
+			...(computation ? { computation } : {}),
 			actualAction: diagnosticAction(actorAction.tool, actualCall.input, key),
 			...(settledCandidateDescriptor ? { candidate: settledCandidateDescriptor } : {}),
 		} : undefined;
@@ -1860,6 +1862,7 @@ export function makeSpeculativeActionRuntime<
 			settlement,
 			...(settledCandidateDescriptor ? { candidate: settledCandidateDescriptor } : {}),
 			candidateFeedback: settledCandidate?.owner.draft.feedback,
+			computation, reusedComputations,
 		}));
 		if (event) state.session.effects.enqueue(() => { state.session.events.enqueue(event); });
 		for (const source of sources) {
@@ -1927,6 +1930,7 @@ export function makeSpeculativeActionRuntime<
 			type: node.action.type === "operation" ? "operation_prediction" : "prediction",
 			...eventEnvelope(session, context.startInput.turnID, context.settings),
 			tool: node.action.tool, predictedAction: diagnosticAction(node.action.tool, node.action.input, node.actionKey),
+			...(node.action.mode ? { mode: node.action.mode } : {}),
 			settlement,
 		} : undefined;
 		if (adapter.onPredictionSettled) session.effects.enqueue(() => adapter.onPredictionSettled?.({
@@ -2346,7 +2350,6 @@ export function makeSpeculativeActionRuntime<
 		input: { readonly failure: ResolutionCause; readonly terminal: boolean; readonly notifyHost: boolean },
 	): TurnClosure | undefined => {
 		if (state.lifecycle !== "active") return undefined;
-		closeActorPhase(state, performance.now());
 		settlePredictionFrontier(state);
 		state.lifecycle = "closing";
 		state.generation.expire(input.failure);

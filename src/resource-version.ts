@@ -232,15 +232,12 @@ export class ResourceReadView {
 	/** A process borrows the same captured kernel object without inheriting the tool's OFD offset. */
 	async borrowObject<T>(target: string, consume: (capture: StableFilesystemCapture, handle: FileHandle) => Promise<T>): Promise<T | undefined> {
 		this.assertComplete();
-		const evaluation = await TimelineInterval.collect(async () => {
+		return collectResourceComputation(async () => {
 			const entry = this.sealed ? await this.get(target, this.entry(target).entry?.type === "directory" ? "names" : "content") : this.entries.get(filesystemPathKey(target));
 			const result = await entry?.object?.borrow(consume);
 			if (result !== undefined) TimelineInterval.use(entry?.computation);
 			return result;
-		});
-		if (evaluation.output !== undefined) for (const { computation, owned } of evaluation.dependencies)
-			if (owned) TimelineInterval.own(computation); else TimelineInterval.use(computation);
-		return evaluation.output;
+		}, result => result !== undefined);
 	}
 	/** Fill a pre-budgeted pin slot only with independently read, byte-identical input.
 	 * Supplied write/edit bytes alone never create kernel-object evidence. */
@@ -270,6 +267,7 @@ export class ResourceReadView {
 	}
 	/** Retain preparations only while capturing, so the sealed branch accounts for every owned byte. */
 	prepare: NonNullable<ToolFilesystemOperations["prepare"]> = (binding, key, build, consume, target) => {
+		const startedAt = performance.now();
 		this.assertComplete();
 		let owner: ResourceReadView = this;
 		while (owner.owner) owner = owner.owner;
@@ -284,10 +282,12 @@ export class ResourceReadView {
 				if (!dependencies) this.dependencies = undefined;
 				else if (this.dependencies) for (const dependency of dependencies) this.dependencies.add(dependency);
 			};
-			const release = (cached: PreparedResource) => {
+			const release = async (cached: PreparedResource) => {
 				if (--cached.borrowers || cached.retained && !cached.revoked) return;
 				if (prepared.bindings.get(binding)?.get(key) === cached) prepared.bindings.get(binding)!.delete(key);
-				return (cached.destination.prepared?.lifetime ?? prepared.lifetime).release(cached);
+				const startedAt = performance.now();
+				try { await (cached.destination.prepared?.lifetime ?? prepared.lifetime).release(cached); }
+				finally { TimelineInterval.exclude(new TimelineInterval(startedAt, performance.now())); }
 			};
 			const consumePrepared = async (cached: PreparedResource) => {
 				inherit(cached.origin === owner ? cached.dependencies : undefined);
@@ -295,9 +295,13 @@ export class ResourceReadView {
 				if (transferred) { for (const proof of this.acceptProofs!(cached.proofs!)) this.collectProofs?.set(proof.observations, proof); }
 				const run = async () => {
 					this.assertComplete(); cached.destination.assertComplete();
+					TimelineInterval.exclude(new TimelineInterval(startedAt, performance.now()));
 					const result = await consume(cached.value as Parameters<typeof consume>[0]);
+					const consumedAt = performance.now();
 					TimelineInterval.use(cached.computation);
-					this.assertComplete(); if (!transferred && !(this.acceptProofs && cached.origin === owner && cached.dependencies)) cached.destination.assertComplete(); return result;
+					try {
+						this.assertComplete(); if (!transferred && !(this.acceptProofs && cached.origin === owner && cached.dependencies)) cached.destination.assertComplete(); return result;
+					} finally { TimelineInterval.exclude(new TimelineInterval(consumedAt, performance.now())); }
 				};
 				return cached.destination === owner ? run() : cached.destination.prepared!.lifetime.admit(run);
 			};
@@ -375,29 +379,34 @@ export class ResourceReadView {
 	private async borrow<T>(operation: (view: ResourceReadView) => Promise<T>, observed?: (dependencies: ReadonlySet<string> | undefined) => void,
 		root?: string | { readonly root: string; readonly physicalRoot: string }, lookup = this.lookup, missing = this.missing,
 		acceptProofs = this.acceptProofs): Promise<T> {
-		this.assertComplete();
-		const view = new ResourceReadView(0);
-		view.entries = this.entries; view.owner = this; view.sealed = true; view.dependencies = new Set(); view.lookup = lookup; view.missing = missing;
-		view.onForeignInputs = this.onForeignInputs;
-		view.acceptProofs = acceptProofs; view.collectProofs = this.collectProofs;
-		try {
-			if (typeof root === "object") view.boundary = { root: root.root, physicalRoot: root.physicalRoot };
-			else if (root === undefined || this.boundary && filesystemPathKey(root) === filesystemPathKey(this.boundary.root)) {
-				view.boundary = this.boundary;
-				if (this.boundary?.dependency) view.dependencies.add(this.boundary.dependency);
-			} else if (filesystemPathKey(root) === filesystemPathKey(path.parse(root).root)) {
-				view.boundary = { root, physicalRoot: root };
-			} else {
-				const entry = await view.stat(root, "type");
-				if (!entry.isDirectory() || !entry.realPath) view.unproven(root);
-				view.boundary = { root, physicalRoot: entry.realPath! };
-			}
-			const output = await operation(view);
-			view.assertComplete();
-			this.foreignInputs ||= view.foreignInputs;
-			observed?.(view.dependencies);
-			return output;
-		} finally { view.dispose(); }
+		return collectResourceComputation(async () => {
+			this.assertComplete();
+			const view = new ResourceReadView(0);
+			view.entries = this.entries; view.owner = this; view.sealed = true; view.dependencies = new Set(); view.lookup = lookup; view.missing = missing;
+			view.onForeignInputs = this.onForeignInputs;
+			view.acceptProofs = acceptProofs; view.collectProofs = this.collectProofs;
+			try {
+				if (typeof root === "object") view.boundary = { root: root.root, physicalRoot: root.physicalRoot };
+				else if (root === undefined || this.boundary && filesystemPathKey(root) === filesystemPathKey(this.boundary.root)) {
+					view.boundary = this.boundary;
+					if (this.boundary?.dependency) view.dependencies.add(this.boundary.dependency);
+				} else if (filesystemPathKey(root) === filesystemPathKey(path.parse(root).root)) {
+					view.boundary = { root, physicalRoot: root };
+				} else {
+					const entry = await view.stat(root, "type");
+					if (!entry.isDirectory() || !entry.realPath) view.unproven(root);
+					view.boundary = { root, physicalRoot: entry.realPath! };
+				}
+				const output = await operation(view);
+				const checkedAt = performance.now();
+				try {
+					view.assertComplete();
+					this.foreignInputs ||= view.foreignInputs;
+					observed?.(view.dependencies);
+				} finally { TimelineInterval.exclude(new TimelineInterval(checkedAt, performance.now())); }
+				return output;
+			} finally { view.dispose(); }
+		});
 	}
 	assertComplete(sealed = false): void {
 		this.owner?.assertComplete(); if (this.failure) throw this.failure;
@@ -500,6 +509,23 @@ export class ResourceReadView {
 	private unproven(target: string): never {
 		throw (this.failure ??= new Error(`resource_access_unproven:${target}`));
 	}
+}
+
+/** Failed resource attempts keep overhead exclusions, never receipts for discarded inputs. */
+export async function collectResourceComputation<T>(operation: () => T | Promise<T>, accept: (value: T) => boolean = () => true): Promise<T> {
+	const evaluation = await TimelineInterval.collect(async () => {
+		try { return { ok: true as const, value: await operation() }; }
+		catch (error) { return { ok: false as const, error }; }
+	});
+	const accepted = evaluation.output.ok && accept(evaluation.output.value);
+	for (const { computation, owned, overhead, computeUncertain } of evaluation.dependencies) {
+		if (overhead) TimelineInterval.exclude(computation, computeUncertain);
+		else if (accepted) { if (owned) TimelineInterval.own(computation); else TimelineInterval.use(computation); }
+	}
+	// An abandoned fresh graph may contain both calculation and nested reuse; do not misreport its remainder as zero.
+	if (!accepted && evaluation.dependencies.some(input => input.owned)) TimelineInterval.exclude(new TimelineInterval(0, 0), true);
+	if (!evaluation.output.ok) throw evaluation.output.error;
+	return evaluation.output.value;
 }
 
 function resourceCovers(entry: CapturedResource | undefined, scope: ResourceDependency["scope"]): boolean {

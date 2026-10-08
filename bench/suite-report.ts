@@ -3,7 +3,10 @@ import { toolSpeedup } from "../src/task-timing.ts";
 export interface SuiteBenchmarkSummary {
 	readonly actualEndToEndMs: number;
 	readonly toolWaitMs: number;
-	readonly hiddenLatencyMs: number;
+	/** Absent in legacy or incomplete reports; raw tool wait is not a substitute. */
+	readonly actorComputeMs?: number;
+	readonly reusedExecutionMs?: number;
+	readonly reusedExecutionIncomplete?: true;
 	readonly actorActions: number;
 	readonly speculativeHits: number;
 	readonly actorCost: number;
@@ -28,10 +31,15 @@ export interface SuiteBenchmarkRun {
 	readonly error?: string;
 }
 
-type MeasuredRun = SuiteBenchmarkRun & { readonly summary: SuiteBenchmarkSummary };
+type MeasuredRun = SuiteBenchmarkRun & {
+	readonly summary: SuiteBenchmarkSummary & { readonly actorComputeMs: number; readonly reusedExecutionMs: number };
+};
+type ToolWaitRun = SuiteBenchmarkRun & { readonly summary: SuiteBenchmarkSummary };
 
 export function summarizeSuite(runs: readonly SuiteBenchmarkRun[]) {
 	const measured = runs.filter(hasTiming);
+	const toolWaits = runs.filter(hasToolWait).map(run => run.summary.toolWaitMs);
+	const reused = runs.flatMap(run => measuredValue(run.summary?.reusedExecutionMs));
 	const invalidRuns = runs.flatMap((run) => {
 		const reasons = [...(run.error ? ["runner_error"] : []), ...screeningFailures(run.summary)];
 		if (run.summary && !hasTiming(run)) reasons.push("unavailable_timing");
@@ -44,10 +52,18 @@ export function summarizeSuite(runs: readonly SuiteBenchmarkRun[]) {
 		allRunsScreenedIn: runs.length > 0 && invalidRuns.length === 0,
 		statistics: {
 			primaryEstimator: "ratio_of_means",
-			baseline: "same_run_tool_wait_plus_hidden_latency",
+			baseline: "same_run_actor_compute_plus_gross_reused_execution",
 			samplePolicy: "all_measured_runs",
 		},
 		unmeasuredRuns: runs.length - measured.length,
+		// Incomplete denominators must not hide known gross savings or actual waits.
+		diagnostics: {
+			toolWaitMeasuredRuns: toolWaits.length, toolWaitMs: total(toolWaits),
+			toolWaitMeanMs: toolWaits.length ? total(toolWaits)! / toolWaits.length : undefined,
+			toolWaitP95Ms: nearestRank(toolWaits, 0.95),
+			reuseMeasuredRuns: reused.length, reusedExecutionMs: total(reused),
+			reusedExecutionIncomplete: runs.some(run => run.summary?.reusedExecutionIncomplete) || undefined,
+		},
 		implementationCommits: [...new Set(runs.flatMap((run) => run.implementationCommit ? [run.implementationCommit] : []))],
 		invalidRuns,
 		pooled: measured.length ? pooled(measured) : undefined,
@@ -63,14 +79,14 @@ export function summarizeSuite(runs: readonly SuiteBenchmarkRun[]) {
 /** Paired tool wait comparison; independent runs may be slower with speculation. */
 export function summarizePairs(runs: readonly SuiteBenchmarkRun[]) {
 	const on = runs.filter((run) => run.arm === "on"), off = runs.filter((run) => run.arm === "off");
-	const pairs = on.filter(hasTiming).flatMap((run) => {
+	const pairs = on.filter(hasToolWait).flatMap((run) => {
 		const other = off.find((candidate) => candidate.instance === run.instance && candidate.repeat === run.repeat);
-		return other && hasTiming(other) ? [{ instance: run.instance, repeat: run.repeat, onToolWaitMs: run.summary.toolWaitMs, offToolWaitMs: other.summary.toolWaitMs }] : [];
+		return other && hasToolWait(other) ? [{ instance: run.instance, repeat: run.repeat, onToolWaitMs: run.summary.toolWaitMs, offToolWaitMs: other.summary.toolWaitMs }] : [];
 	});
 	const onMs = pairs.reduce((total, pair) => total + pair.onToolWaitMs, 0), offMs = pairs.reduce((total, pair) => total + pair.offToolWaitMs, 0);
 	return {
 		pairs,
-		pairedToolSpeedup: onMs > 0 ? offMs / onMs : null,
+		pairedToolWaitRatio: onMs > 0 ? offMs / onMs : null,
 		on: summarizeSuite(on),
 		off: summarizeSuite(off),
 	};
@@ -81,9 +97,19 @@ export function safeName(value: string): string {
 }
 
 function hasTiming(run: SuiteBenchmarkRun): run is MeasuredRun {
-	return !!run.summary && Number.isFinite(run.summary.toolWaitMs) && run.summary.toolWaitMs >= 0 &&
-		Number.isFinite(run.summary.hiddenLatencyMs) && run.summary.hiddenLatencyMs >= 0;
+	return !!run.summary && !run.summary.reusedExecutionIncomplete && measured(run.summary.actorComputeMs) && measured(run.summary.reusedExecutionMs);
 }
+
+function hasToolWait(run: SuiteBenchmarkRun): run is ToolWaitRun {
+	return !!run.summary && measured(run.summary.toolWaitMs);
+}
+
+function measured(value: unknown): value is number {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+function measuredValue(value: unknown): number[] { return measured(value) ? [value] : []; }
+function total(values: readonly number[]): number | undefined { return values.length ? values.reduce((sum, value) => sum + value, 0) : undefined; }
 
 export function nearestRank(values: readonly number[], percentile: number): number | undefined {
 	if (!values.length) return undefined;
@@ -94,7 +120,8 @@ export function nearestRank(values: readonly number[], percentile: number): numb
 
 function pooled(runs: readonly MeasuredRun[]) {
 	const actualEndToEndMs = sum(runs, "actualEndToEndMs");
-	const toolWaitMs = sum(runs, "toolWaitMs"), hiddenLatencyMs = sum(runs, "hiddenLatencyMs");
+	const actorComputeMs = sum(runs, "actorComputeMs"), reusedExecutionMs = sum(runs, "reusedExecutionMs");
+	const toolWaitRuns = runs.filter(hasToolWait), toolWaitMs = toolWaitRuns.length ? sum(toolWaitRuns, "toolWaitMs") : undefined;
 	const actorActions = sum(runs, "actorActions");
 	const speculativeHits = sum(runs, "speculativeHits");
 	return {
@@ -104,10 +131,14 @@ function pooled(runs: readonly MeasuredRun[]) {
 		actualEndToEndMeanMs: actualEndToEndMs / runs.length,
 		actualEndToEndP95Ms: nearestRank(runs.map((run) => run.summary.actualEndToEndMs), 0.95),
 		toolWaitMs,
-		toolWaitMeanMs: toolWaitMs / runs.length,
-		toolWaitP95Ms: nearestRank(runs.map((run) => run.summary.toolWaitMs), 0.95),
-		toolSpeedup: toolSpeedup({ toolWaitMs, hiddenLatencyMs }),
-		hiddenLatencyMs,
+		toolWaitMeasuredRuns: toolWaitRuns.length,
+		toolWaitMeanMs: toolWaitMs === undefined ? undefined : toolWaitMs / toolWaitRuns.length,
+		toolWaitP95Ms: nearestRank(toolWaitRuns.map((run) => run.summary.toolWaitMs), 0.95),
+		actorComputeMs,
+		reusedExecutionMs,
+		baselineComputeMs: actorComputeMs + reusedExecutionMs,
+		toolSpeedup: toolSpeedup({ actorComputeMs, reusedExecutionMs }),
+		fullyReused: actorComputeMs === 0 && reusedExecutionMs > 0,
 		actorActions,
 		speculativeHits,
 		hitRate: actorActions > 0 ? speculativeHits / actorActions : 0,
@@ -121,8 +152,8 @@ function sum(runs: readonly MeasuredRun[], key: NumericSummaryKey): number {
 }
 
 type NumericSummaryKey = {
-	[Key in keyof SuiteBenchmarkSummary]-?: SuiteBenchmarkSummary[Key] extends number ? Key : never;
-}[keyof SuiteBenchmarkSummary];
+	[Key in keyof MeasuredRun["summary"]]-?: MeasuredRun["summary"][Key] extends number ? Key : never;
+}[keyof MeasuredRun["summary"]];
 
 function screeningFailures(summary: SuiteBenchmarkSummary | undefined): string[] {
 	if (!summary) return ["unavailable_summary"];
