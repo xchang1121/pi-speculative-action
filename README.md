@@ -89,7 +89,7 @@ Drafter 每个用户任务默认最多 `drafterTaskMaxRequests: 32` 次请求、
 
 提前执行需要 Git、支持 `--kill-on-exit` 的 strace，以及通过行为探测的 Sandlock/Landlock/seccomp。跨父命令接管还需要 x86-64 Linux、合格 held-exec helper、ptrace 和相应描述符能力。
 
-需要安装后端时，先准备 Git、strace、C/Rust 工具链、make 和 tar，再显式运行：
+需要安装后端时，先准备 Git、strace、C/Rust 工具链、make 和 tar。在 Linux / WSL 2 的 TUI 打开 `/speculative-action → Tools & execution → Install / update Linux dependencies`，确认后会显示实时安装输出；取消会停止安装进程，已安装组件保留。结束后刷新能力检测，不改投机配置；重启 Pi 可加载更新后的 helper 并重新检测工作区驱动。系统依赖及 FUSE 的 `fusermount`、`/dev/fuse` 权限仍需自行准备，部分组件不可用会明确提示。也可在插件目录运行：
 
 ```sh
 npm run setup:linux

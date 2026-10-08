@@ -15,6 +15,7 @@ import { RESOURCE_OBSERVATION_EFFECTS, UNRESTRICTED_PROCESS_EFFECTS, WORKSPACE_P
 import { ExecutionWorldRouter, type ExecutionWorldDiagnosticSnapshot } from "../src/execution-world.ts";
 import { createSpeculativeActionExtension, formatSpeculativeActionEvent, normalizeSpeculativeActionSettings, type SpeculativeSettingsStore } from "../src/extension.ts";
 import { LinuxProcessReuseBackend } from "../src/linux-process-backend.ts";
+import * as linuxSetup from "../src/linux-setup.ts";
 import { PATTERN_AWARE_PRESETS, type PatternAwarePresetID } from "../src/pattern-aware.ts";
 import type { ProcessExecutionRequest } from "../src/process-execution.ts";
 import * as piTools from "../src/pi-tool-invocation.ts";
@@ -335,12 +336,13 @@ describe("zero-modification Pi extension", () => {
 
 	it("keeps tool execution policy hierarchical and explains the fallback boundary", async () => {
 		const fixture = await createFixture({ settings: { enabled: true, resourceCacheMaxEntries: 37 }, defaultExecutionWorlds: true });
+		const install = vi.spyOn(linuxSetup, "installLinuxDependencies").mockImplementation(async (_ctx, refresh) => { await refresh(); });
 		vi.mocked(fixture.host.executionWorldDiagnostics).mockResolvedValue(portableDiagnostics({
 			entries: 3, maxEntries: 32, bytes: 2048, maxBytes: 4096, orphanArtifacts: 1, overBudget: false,
 		}));
 		const menus = driveSettingsMenus(fixture, {
 			"Speculative action": ["Tools & execution", "Prediction sources", "Apply changes", "Status", "Enabled", "Discard changes", "Save settings to", "Close"],
-			"Tools & execution": ["Tool policy", "Execution routes", "Back"],
+			"Tools & execution": ["Tool policy", "Install / update Linux dependencies", "Execution routes", "Back"],
 			"Tool policy · [x] prediction on · [ ] prediction off": ["[x] bash", "Back"],
 			"Prediction sources": ["Actor probe", "Back"],
 			"Actor probe": ["Back"],
@@ -349,6 +351,7 @@ describe("zero-modification Pi extension", () => {
 		await fixture.emit("session_start");
 		const command = fixture.commands.get("speculative-action");
 		await command?.handler("", fixture.context as ExtensionCommandContext);
+		expect(install).toHaveBeenCalledWith(fixture.context, expect.any(Function));
 
 		expect(menus.get("Speculative action")).toEqual(
 			expect.arrayContaining([
