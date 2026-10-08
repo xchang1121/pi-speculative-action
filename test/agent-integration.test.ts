@@ -1594,6 +1594,85 @@ describe("speculative action host", () => {
 		} finally { failure.release(); await host.dispose(); }
 	});
 
+	it("prepares bounded measured native work after observed Bash writes, without rerunning unchanged or consumed work", async () => {
+		const cwd = await temporaryWorkspace(), tool = createReadTool(cwd), build = { command: "opaque-build" };
+		const patternAware = patternAwareSettings({ presets: ["recent-command"], beamWidth: 2, multiStepEnabled: false });
+		const store = new PatternAwareStore(patternAware, undefined, patternAwareActionSemantics(PI_ACTION_SEMANTICS, cwd));
+		const controller = createPatternPlanSource({ sessionID: "session", cwd, store, actionSemantics: PI_ACTION_SEMANTICS, projectionRules: [] });
+		const request = planRequest(tool, patternAware, "session", { bash: "schema" });
+		let stale = true, staleness: ReturnType<typeof gated> | undefined;
+		const cursor = gated(), observeChanges = ResourceVersionManager.prototype.observeChanges;
+		const observing = vi.spyOn(ResourceVersionManager.prototype, "observeChanges").mockImplementationOnce(async function (this: ResourceVersionManager) {
+			const token = await observeChanges.call(this); await cursor.wait(); return token;
+		});
+		const checked: string[] = [];
+		const operation = (identity: string, executionMs: number, options: Partial<ExecutionOperationBinding> = {}): ExecutionOperationBinding => ({
+			backend: "test", identity, executionMs, expectedDurationMs: executionMs + 10, available: true, preparation: "current_workspace",
+			permissionHash: PI_ACTION_SEMANTICS.buildKey("bash", build, cwd, "schema")!.hash,
+			stale: async () => { checked.push(identity); await staleness?.wait(); return stale; }, ...options,
+		});
+		const compile = operation("compile", 70), link = operation("link", 50);
+		const observe = (command = "opaque-step", extra: object = {}) => controller.source.observe!({ ...request,
+			action: PI_ACTION_SEMANTICS.buildKey("bash", { command }, cwd, "schema")!,
+			consumeInput: { sessionID: "session", turnID: request.startInput.turnID, tool: "bash", args: { command }, tools: [tool] },
+			tool: "bash", concrete: { command }, output: { result: textResult("done"), isError: false }, durationMs: 20, order: 0, ...extra });
+		const admit = async (value: Awaited<ReturnType<typeof observe>>) => {
+			if (!value || !("actions" in value)) throw new Error("missing native preparation");
+			expect(value.actions).toHaveLength(1); expect(value.actions[0]).toMatchObject({ type: "operation", operation: compile, input: build });
+			await controller.source.onAdmitted!({ proposalID: value.id, actionID: value.actions[0]!.id, feedback: value.actions[0]!.feedback });
+		};
+		try {
+			const learning = observe(build.command, { operations: [operation("fed", 1000, { fed: true }), operation("captured", 900, { preparation: undefined }),
+				operation("unknown", 800, { stale: undefined }), compile, link, operation("cheap", 20)] });
+			await cursor.entered;
+			controller.turnFinished(request.startInput, request.settings, false);
+			await controller.source.flush!();
+			expect(store.recent("session").map(event => event.input.command)).toContain(build.command);
+			cursor.release(); await learning; observing.mockRestore();
+			// A native observation may have no reusable certificate. Staleness alone never schedules another execution.
+			expect(await observe()).toBeUndefined(); expect(checked).toEqual([]);
+			await fs.mkdir(path.join(cwd, ".git")); await writeFile(path.join(cwd, ".git", "index"), "metadata");
+			expect(await observe()).toBeUndefined(); expect(checked).toEqual([]);
+			await writeFile(path.join(cwd, "notes.txt"), "Bash changed the source");
+			const writer = { ...operation("write-process", 10), permissionHash: PI_ACTION_SEMANTICS.buildKey("bash", { command: "opaque-step" }, cwd, "schema")!.hash };
+			await vi.waitFor(async () => { await admit(await observe("opaque-step", { operations: [writer] })); });
+			expect(checked).toEqual(["compile", "link"]);
+			expect(await observe()).toBeUndefined(); expect(checked).toHaveLength(2);
+			// Once the backend has a valid result, another changed file still cannot force a rerun.
+			stale = false; await writeFile(path.join(cwd, "notes.txt"), "unrelated change");
+			expect(await observe()).toBeUndefined(); expect(checked).toEqual(["compile", "link", "compile", "link", "write-process"]);
+			stale = true; expect(await observe()).toBeUndefined(); expect(checked).toHaveLength(5);
+			// A closing turn carries its actual change to the next proposal.
+			const closed = new AbortController(); closed.abort();
+			await writeFile(path.join(cwd, "notes.txt"), "next source");
+			expect(await observe("another-step", { signal: closed.signal })).toBeUndefined();
+			expect(await observe("read-step", { signal: closed.signal, tool: "read", concrete: { path: "notes.txt" },
+				action: PI_ACTION_SEMANTICS.buildKey("read", { path: "notes.txt" }, cwd)! })).toBeUndefined();
+			const carried = await controller.source.propose(request);
+			if (!carried || !("actions" in carried)) throw new Error("missing carried preparation");
+			await admit(carried);
+			request.settings.sourceConfig.patternAware = patternAwareSettings({ ...patternAware, presets: [] });
+			controller.source.enabled(request.settings);
+			await writeFile(path.join(cwd, "notes.txt"), "changed while disabled");
+			request.settings.sourceConfig.patternAware = patternAware;
+			expect(await controller.source.propose(request)).toBeUndefined();
+			expect(await observe()).toBeUndefined();
+			// Preserve the handoff when the original turn closes during backend staleness checking.
+			staleness = gated();
+			const closing = new AbortController();
+			await writeFile(path.join(cwd, "notes.txt"), "changed while checking");
+			const pending = observe("pending-step", { signal: closing.signal });
+			await staleness.entered;
+			closing.abort();
+			const following = controller.source.propose(request);
+			staleness.release();
+			expect(await pending).toBeUndefined();
+			const next = await following;
+			if (!next || !("actions" in next)) throw new Error("missing preparation after closing turn");
+			await admit(next);
+		} finally { cursor.release(); observing.mockRestore(); staleness?.release(); await controller.dispose(); }
+	});
+
 	it.each(["captured_resources", "current_workspace", "live_input"] as const)("prepares stale learned work after an Actor edit (%s)", async preparation => {
 		const cwd = await temporaryWorkspace(), tool = createReadTool(cwd), patternAware = patternAwareSettings({ enabled: true, multiStepEnabled: false });
 		const store = new PatternAwareStore(patternAware, undefined, patternAwareActionSemantics(PI_ACTION_SEMANTICS, cwd));

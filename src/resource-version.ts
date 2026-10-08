@@ -759,6 +759,13 @@ export async function captureResourceVersion(action: ActionKey | undefined, root
 		scope: input && !(input instanceof Uint8Array) ? input.names ? "names" : "type" : "content" }))
 		: action ? resourceDependencies(action, root, actionSemantics) : undefined;
 	if (dependencies?.length === 0 || (!dependencies && retainBytes === undefined)) throw new Error("resource_dependencies_unproven");
+	return resourceManager(root).capture(dependencies, retainBytes, providedInputs);
+}
+
+/** Shared notification cursor for preparation only; it cannot validate or seal an action's inputs. */
+export function observeResourceChanges(root: string): Promise<ResourceVersionToken> { return resourceManager(root).observeChanges(); }
+
+function resourceManager(root: string): ResourceVersionManager {
 	const normalized = path.resolve(root);
 	let manager = managers.get(normalized);
 	if (!manager) {
@@ -768,7 +775,7 @@ export async function captureResourceVersion(action: ActionKey | undefined, root
 		});
 		managers.set(normalized, manager);
 	}
-	return manager.capture(dependencies, retainBytes, providedInputs);
+	return manager;
 }
 
 export async function validateResourceVersion(token: unknown): Promise<ResourceVersionValidation> {

@@ -15,7 +15,7 @@ import { captureStableFile, hashExecutableFile } from "../src/filesystem-evidenc
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { TaskTimeline, TimelineInterval } from "../src/task-timing.ts";
 import { runThinkThreadTool } from "../src/thinkthread/tool-runner.ts";
-import { captureResourceVersion, invalidateResourceInputs, closeResourceVersionManagers, fingerprintIO, ResourceVersionManager,
+import { captureResourceVersion, observeResourceChanges, invalidateResourceInputs, closeResourceVersionManagers, fingerprintIO, ResourceVersionManager,
 	type ResourceVersionToken, type ResourceInput, releaseResourceVersion, resourceDependencies } from "../src/resource-version.ts";
 
 const directories = temporaryDirectories("pi-resource-version-", path.join(process.cwd(), "test"));
@@ -294,6 +294,22 @@ describe("speculative action resource versions", () => {
 				await token.release(); await token.release(); expect(idle).toHaveBeenCalledTimes(1);
 			} finally { reads.mockRestore(); await token.release(); manager.close(); }
 		}
+	});
+
+	test("shares preparation notifications with the resource owner and releases its last cursor", async () => {
+		const root = await workspace({ "value.txt": "before" }), action = PI_ACTION_SEMANTICS.buildKey("read", { path: "value.txt" }, root)!;
+		const cursor = await observeResourceChanges(root), content = await captureResourceVersion(action, root);
+		try {
+			expect(content.manager).toBe(cursor.manager);
+			expect(cursor.observations.size).toBe(0);
+			expect((await cursor.manager.validate(cursor)).expired).toBe(true);
+			await content.release();
+			await fs.writeFile(path.join(root, "value.txt"), "after");
+			await vi.waitFor(() => expect(cursor.manager.changesSince(cursor).paths).toContain(path.join(root, "value.txt")));
+			await cursor.release();
+			const next = await observeResourceChanges(root);
+			try { expect(next.manager).not.toBe(cursor.manager); } finally { await next.release(); }
+		} finally { await content.release(); await cursor.release(); }
 	});
 
 	test.each([true, false])("rechecks shared missing ancestors on every adoption (watch=%s)", async (watch) => {

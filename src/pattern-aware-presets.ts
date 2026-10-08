@@ -12,32 +12,38 @@ export const PATTERN_AWARE_PRESETS = Object.freeze([
 	Object.freeze({ id: "failure-edits", label: "Edits after failure", description: "After a failed call, inspect recently edited files that have not been read since.", defaultOff: true }),
 	Object.freeze({ id: "continue-read", label: "Continue reading", description: "Prepare the next page when a successful read reports more lines.", defaultOff: true }),
 	Object.freeze({ id: "retry-failed-command", label: "Retry failed command", description: "After an edit to a reported file, prepare a command the Actor previously ran and that failed.", defaultOff: true }),
+	Object.freeze({ id: "recheck-search", label: "Recheck search", description: "After editing a reported match, repeat the exact search the Actor ran.", defaultOff: true }),
+	Object.freeze({ id: "result-neighbors", label: "Result neighbors", description: "After reading one search result, read unread files from that same observed result.", defaultOff: true }),
 ] as const);
 
 export type PatternAwarePresetID = typeof PATTERN_AWARE_PRESETS[number]["id"];
-export type PatternPresetRead = { kind: string; input: { path: string } & Record<string, unknown>; prior: number };
+export type PatternPresetAction = {
+	kind: string; presetID: PatternAwarePresetID; tool: "read" | "grep"; input: Record<string, unknown>; prior: number;
+	durationMs?: number; schemaHash?: string;
+};
 
 /** Stateless suggestions from observed facts. The caller owns feedback, canonical coverage and admission. */
-export function patternPresetReads(
+export function patternPresetActions(
 	history: readonly PatternAwareEvent[],
 	presets: readonly PatternAwarePresetID[],
 	readIdentity: (target: string) => string | undefined,
-): PatternPresetRead[] {
+	actionIdentity: (event: PatternAwareEvent) => string | undefined,
+): PatternPresetAction[] {
 	const last = history.at(-1);
 	if (!last) return [];
 	const batch = history.filter(event => event.turnID === last.turnID && event.sessionID === last.sessionID);
 	const reads = history.filter(event => event.tool === "read" && typeof event.input.path === "string");
 	const read = new Set(reads.map(event => readIdentity(String(event.input.path))));
-	const ranked: PatternPresetRead[] = [];
+	const ranked: PatternPresetAction[] = [];
 	// Preserve the original three relations' order, bounds and priors.
 	if (presets.includes("edited-file")) for (const event of [...batch].reverse())
 		if ((event.tool === "edit" || event.tool === "write") && typeof event.input.path === "string")
-			ranked.push({ kind: "edited", input: { path: event.input.path }, prior: 0.35 });
+			ranked.push({ kind: "edited", presetID: "edited-file", tool: "read", input: { path: event.input.path }, prior: 0.35 });
 	const listed = batch.filter(event => event.tool !== "read").flatMap(event => [...(event.outputLocations ?? []).map(location => location.path), ...event.outputPaths ?? []]);
 	if (presets.includes("reported-files")) for (const [index, target] of [...new Set(listed)].filter(target => !read.has(readIdentity(target))).slice(0, 8).entries())
-		ranked.push({ kind: "listed", input: { path: target }, prior: 0.2 / (index + 1) });
+		ranked.push({ kind: "listed", presetID: "reported-files", tool: "read", input: { path: target }, prior: 0.2 / (index + 1) });
 	if (presets.includes("recent-reads")) for (const [index, event] of [...reads].reverse().slice(0, 4).entries())
-		ranked.push({ kind: "reread", input: { path: String(event.input.path) }, prior: 0.15 / (index + 1) });
+		ranked.push({ kind: "reread", presetID: "recent-reads", tool: "read", input: { path: String(event.input.path) }, prior: 0.15 / (index + 1) });
 
 	const scoped = history.filter(event => event.sessionID === last.sessionID);
 	const successfulReads = scoped.filter(event => event.tool === "read" && event.outcome === "success" && typeof event.input.path === "string");
@@ -52,7 +58,7 @@ export function patternPresetReads(
 			const previous = lines.get(identity) ?? [];
 			if (previous.some(line => Math.abs(line - location.line) <= 80)) continue;
 			previous.push(location.line); lines.set(identity, previous);
-			ranked.push({ kind: "reported-line", input: { path: location.path, offset: Math.max(1, location.line - 20), limit: 80 }, prior: 0.18 / ++count });
+			ranked.push({ kind: "reported-line", presetID: "reported-lines", tool: "read", input: { path: location.path, offset: Math.max(1, location.line - 20), limit: 80 }, prior: 0.18 / ++count });
 		}
 	}
 	if (presets.includes("companion-files")) {
@@ -76,7 +82,7 @@ export function patternPresetReads(
 			for (const [identity, target] of known) {
 				if (seen.size >= 2 || identity === anchor || seen.has(identity) || readSince(identity, event.sequence) || !companions(event.input.path, target)) continue;
 				seen.add(identity);
-				ranked.push({ kind: "companion", input: { path: target }, prior: 0.12 / seen.size });
+				ranked.push({ kind: "companion", presetID: "companion-files", tool: "read", input: { path: target }, prior: 0.12 / seen.size });
 			}
 		}
 	}
@@ -89,7 +95,7 @@ export function patternPresetReads(
 			const identity = readIdentity(event.input.path);
 			if (!identity || seen.has(identity) || readSince(identity, event.sequence)) continue;
 			seen.add(identity);
-			ranked.push({ kind: "failure-edit", input: { path: event.input.path }, prior: 0.15 / seen.size });
+			ranked.push({ kind: "failure-edit", presetID: "failure-edits", tool: "read", input: { path: event.input.path }, prior: 0.15 / seen.size });
 		}
 	}
 	if (presets.includes("continue-read")) {
@@ -105,11 +111,46 @@ export function patternPresetReads(
 			const next = offset + truncation.outputLines, identity = readIdentity(event.input.path);
 			if (!Number.isSafeInteger(next) || !identity || seen.has(identity) || readSince(identity, event.sequence)) continue;
 			seen.add(identity);
-			ranked.push({ kind: "continuation", input: { path: event.input.path, offset: next,
+			ranked.push({ kind: "continuation", presetID: "continue-read", tool: "read", input: { path: event.input.path, offset: next,
 				...(positiveInteger(event.input.limit) ? { limit: event.input.limit } : {}) }, prior: 0.15 / seen.size });
 		}
 	}
+	if (presets.includes("recheck-search")) {
+		for (const edit of [...batch].reverse()) {
+			if (edit.outcome !== "success" || !["edit", "write"].includes(edit.tool) || typeof edit.input.path !== "string") continue;
+			const edited = readIdentity(edit.input.path);
+			if (!edited) continue;
+			const search = [...scoped].reverse().find(event => event.sequence < edit.sequence && event.tool === "grep" &&
+				event.outcome === "success" && event.learnTarget !== false && reportedPaths(event).some(target => readIdentity(target) === edited));
+			if (!search) continue;
+			const identity = actionIdentity(search);
+			// Any real repeat after this edit consumes the opportunity, even when its result is a failure.
+			if (!identity || scoped.some(event => event.sequence > edit.sequence && event.tool === "grep" && actionIdentity(event) === identity)) continue;
+			ranked.push({ kind: "recheck-search", presetID: "recheck-search", tool: "grep", input: search.input,
+				prior: 0.2, durationMs: Number.isFinite(search.durationMs) ? Math.max(0, search.durationMs) : 0,
+				...(search.schemaHash === undefined ? {} : { schemaHash: search.schemaHash }) });
+			break;
+		}
+	}
+	if (presets.includes("result-neighbors")) {
+		const anchor = [...batch].reverse().find(event => event.tool === "read" && event.outcome === "success" && typeof event.input.path === "string");
+		const identity = anchor && readIdentity(String(anchor.input.path));
+		const group = identity && [...scoped].reverse().find(event => event.sequence < anchor!.sequence &&
+			event.outcome === "success" && ["find", "grep"].includes(event.tool) && reportedPaths(event).some(target => readIdentity(target) === identity));
+		const seen = new Set<string>();
+		if (group) for (const target of reportedPaths(group)) {
+			const peer = readIdentity(target);
+			if (!peer || peer === identity || seen.has(peer) || readSince(peer, -1)) continue;
+			seen.add(peer);
+			ranked.push({ kind: "result-neighbor", presetID: "result-neighbors", tool: "read", input: { path: target }, prior: 0.12 / seen.size });
+			if (seen.size === 2) break;
+		}
+	}
 	return ranked;
+}
+
+function reportedPaths(event: PatternAwareEvent): string[] {
+	return [...event.outputPaths ?? [], ...(event.outputLocations ?? []).map(location => location.path)].slice(0, 256);
 }
 
 function positiveInteger(value: unknown): value is number {

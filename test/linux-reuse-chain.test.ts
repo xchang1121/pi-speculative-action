@@ -98,15 +98,19 @@ test.skipIf(process.platform !== "linux" || !process.env.PI_SPEC_REUSE_CHAIN)("r
 	console.log(rows.join("\n"));
 });
 
-test.skipIf(process.platform !== "linux").for(["build", "current_workspace", "changed_after_preparation", "after_horizon", "changed_after_horizon"] as const)("prepares learned work after an Actor edit (%s)", { timeout: 120_000 }, async mode => {
+test.skipIf(process.platform !== "linux").for(["build", "current_workspace", "changed_after_preparation", "after_horizon", "changed_after_horizon", "bash_mutation", "bash_changed_after_preparation"] as const)("prepares learned work after an Actor edit (%s)", { timeout: 120_000 }, async mode => {
 	const { fixture, workspace, host, step, events } = await chainWorld([["a.txt", "alpha\n"], ["Makefile", "all:\n\t@./slow a.txt\n"]], "600000000");
-	const horizon = mode.endsWith("horizon"), stale = mode.startsWith("changed_"), worker = `./slow a.txt${horizon ? " identity" : ""}`;
+	const horizon = mode.endsWith("horizon"), stale = mode.includes("changed_"), bashMutation = mode.startsWith("bash_"), worker = `./slow a.txt${horizon ? " identity" : ""}`;
 	let publication: ReturnType<typeof holdProcessPublication> | undefined;
 	try {
 		const command = mode === "build" ? "make -s all" : `${worker} | tail -1${horizon ? `; ${worker} | tail -2` : ""}`;
 		await step("build", mode === "build" ? "make -s" : `cat > a.txt <<'EOF'\nalpha\nEOF\n${worker} | tail -2`, 0);
+		if (bashMutation) {
+			await step("unchanged", "printf unchanged", 0);
+			expect(events.some(event => event.type === "candidate" && event.candidate.kind === "operation")).toBe(false);
+		}
 		if (horizon) publication = holdProcessPublication(fixture.backend);
-		await step("edit", { path: "a.txt", content: "alpha\nbeta\n" }, 0);
+		await step("edit", bashMutation ? "printf 'alpha\\nbeta\\n' > a.txt" : { path: "a.txt", content: "alpha\nbeta\n" }, 0);
 		if (publication) {
 			await step("detour", "printf detour", () => expect.poll(publication!.reached, { timeout: 15_000 }).toBe(true));
 			const operation = events.filter(event => event.type === "candidate").find(event => event.candidate.kind === "operation")!.candidate.id;
@@ -117,7 +121,9 @@ test.skipIf(process.platform !== "linux").for(["build", "current_workspace", "ch
 			await expect.poll(states, { timeout: 15_000 }).toEqual(["running", "succeeded"]);
 		}
 		// A PID-observing child has a one-shot result: the second native exec must run even after the first reuses it.
-		const measured = await step("check", command, horizon ? 0 : 3000, stale ? "printf 'newest\\n' > a.txt" : undefined);
+		const measured = await step("check", command, bashMutation ? () => expect.poll(() => events.some(event => event.type === "candidate" &&
+			event.candidate.kind === "operation" && event.state.status === "succeeded"), { timeout: 15_000 }).toBe(true) : horizon ? 0 : 3000,
+			stale ? "printf 'newest\\n' > a.txt" : undefined);
 		expect([measured.text.trim(), measured.hits], JSON.stringify({ events: events.filter(event => event.type === "candidate" || event.type === "operation_prediction"), metrics: fixture.backend.metrics() }))
 			.toEqual([execSync(command, { cwd: workspace, encoding: "utf8" }).trim(), Number(!stale)]);
 	} finally { publication?.close(); await host.dispose(); await fixture.dispose(); }
