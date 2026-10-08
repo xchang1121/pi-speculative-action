@@ -90,8 +90,8 @@ describe("faux LLM speculative action end to end", () => {
 			expect(result.actorFallbacks).toEqual(drafterMaxDepth ? [] : ["read"]);
 			expect(result.outputs).toEqual([textResult("one\ntwo\nthree\n"), textResult("target")]);
 			expect(result.summary.reusedExecutionMs).toBeGreaterThan(0);
-			expect(result.draftFeedback[0]).toMatchObject({ kind: "drafter_plan", utility: { benefitMs: undefined } });
-			if (drafterMaxDepth) expect(result.draftFeedback[1]).toMatchObject({ kind: "drafter_plan", depth: 1, utility: { benefitMs: undefined } });
+			expect(result.draftFeedback[0]).toMatchObject({ kind: "drafter_plan", utility: { benefitMs: result.summary.reusedExecutionMs } });
+			if (drafterMaxDepth) expect(result.draftFeedback[1]).toMatchObject({ kind: "drafter_plan", depth: 1, utility: { benefitMs: result.summary.reusedExecutionMs } });
 		}
 	});
 

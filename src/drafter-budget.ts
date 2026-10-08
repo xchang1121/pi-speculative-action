@@ -1,8 +1,8 @@
 import { calculateContextTokens, estimateContextTokens } from "@earendil-works/pi-agent-core";
 import type { Api, AssistantMessage, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import type { DrafterRequestSettings } from "./common.ts";
-import { BenefitGate, creditAdoption, DEFAULT_BENEFIT_GATE_POLICY, type BenefitGatePolicy, type BenefitDecisionReason } from "./fork-benefit-gate.ts";
-import type { ActorHitTiming } from "./settlement.ts";
+import { BenefitGate, DEFAULT_BENEFIT_GATE_POLICY, type BenefitGatePolicy, type BenefitDecisionReason } from "./fork-benefit-gate.ts";
+import { nonNegativeFinite as metric } from "./number-utils.ts";
 import { stableValueHash } from "./stable-value-hash.ts";
 
 type BudgetPolicy = Pick<DrafterRequestSettings, "drafterTaskMaxRequests" | "drafterTaskMaxTokens">;
@@ -53,8 +53,13 @@ export class DrafterTaskBudget {
 		for (const batch of batches) { batch.finished = true; this.observe(batch); }
 	}
 
-	credit(batches: readonly DrafterUtilityBatch[], timing: ActorHitTiming, shares = 1): void {
-		for (const batch of new Set(batches)) { creditAdoption(batch, timing, shares); this.observe(batch); }
+	/** Only measured, consumed computation earns benefit; admission costs remain a separate value. */
+	credit(batches: readonly DrafterUtilityBatch[], timing: { readonly reusedExecutionMs: number; readonly costMs?: number }): void {
+		for (const batch of new Set(batches)) {
+			batch.benefitMs = (batch.benefitMs ?? 0) + metric(timing.reusedExecutionMs);
+			batch.costMs += metric(timing.costMs);
+			this.observe(batch);
+		}
 	}
 
 	utilitySnapshot() {

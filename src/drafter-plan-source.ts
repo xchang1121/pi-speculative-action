@@ -40,6 +40,12 @@ interface DrafterPlanFeedback extends DrafterBatch {
 	claimed: boolean;
 }
 
+/** Retained calculations need utility counters, never the prediction's model context or outputs. */
+interface DrafterUtilityFeedback {
+	readonly kind: "drafter_utility";
+	readonly utilities: readonly DrafterUtilityBatch[];
+}
+
 /** Shared preparation belongs to all live proposals, until the batch retires. */
 class DrafterPreparation {
 	private readonly controller = new AbortController();
@@ -90,7 +96,6 @@ export function createDrafterPlanSource(input: {
 	const batches = new Map<string, DrafterPreparation>();
 	const budget = input.drafterBudget ?? new DrafterTaskBudget();
 	let rootRequestMs = 0, costlyService = false;
-	const adoptedLineages = new Map<number, DrafterUtilityBatch[][]>();
 	const lineage = (batch: DrafterPlanFeedback) => [...new Set([batch.utility, ...batch.marginalUtilities ?? []])];
 	// Separate Beta(1, 1) estimates over the latest 32 eligible outcomes per model and tool contract.
 	const calibration = new BoundedRecencyMap<string, { matches: number[]; adoptions: number[] }>(128);
@@ -158,6 +163,8 @@ export function createDrafterPlanSource(input: {
 		}) : [calls];
 		if (groups.some(group => !group.length) || new Set(calls.map(call => call.id)).size !== calls.length) return undefined;
 		const marginalUtilities = [...new Set([...(batch.marginalUtilities ?? []), ...(marginal ? [marginal] : [])])];
+		const reuseFeedback: DrafterUtilityFeedback = Object.freeze({ kind: "drafter_utility",
+			utilities: Object.freeze([...new Set([batch.utility, ...marginalUtilities])]) });
 		const actions: PlanAction[] = [], predecessors: DrafterPlanFeedback[] = [];
 		for (const [index, group] of groups.entries()) {
 			const kept = group.filter(call => batch.tools.has(call.name));
@@ -168,7 +175,7 @@ export function createDrafterPlanSource(input: {
 				calls: new Map(kept.map((call, member) => [`${prefix}:${index}:${member}`, call])), results: new Map(),
 				claimed: kept.length < group.length || index < groups.length - 1 };
 			for (const [id, call] of feedback.calls) actions.push({ id, type: "tool_call", tool: call.name,
-				input: widenReadGuess(call.name, call.arguments), depth: feedback.depth, feedback, dependsOn, ...probabilities(batch, call.name) });
+				input: widenReadGuess(call.name, call.arguments), depth: feedback.depth, feedback, reuseFeedback, dependsOn, ...probabilities(batch, call.name) });
 			dependsOn = [...feedback.calls.keys()].map(actionID => ({ actionID, condition: "execution_succeeded" }));
 			predecessors.push(feedback);
 		}
@@ -192,11 +199,6 @@ export function createDrafterPlanSource(input: {
 				// Deliberate Actor calibration supplies timing evidence, not evidence that this result was unusable.
 				if (adoption.status === "rejected" && adoption.cause.code === "candidate_calibration_sample") return;
 				observe(samples.adoptions, adoption.status === "adopted");
-				if (adoption.status === "adopted") {
-					const lineages = adoptedLineages.get(settlement.actorAction.sequence) ?? [], utilities = lineage(batch);
-					if (!lineages.some(previous => previous.length === utilities.length && previous.every(utility => utilities.includes(utility)))) lineages.push(utilities);
-					adoptedLineages.set(settlement.actorAction.sequence, lineages);
-				}
 			}
 		},
 		enabled: (settings) => settings.drafterEnabled ?? DEFAULTS.drafterEnabled,
@@ -300,25 +302,30 @@ export function createDrafterPlanSource(input: {
 	return {
 		source,
 		snapshot: (): DrafterUtilitySnapshot & { readonly budget: DrafterBudgetSnapshot } => ({ ...budget.utilitySnapshot(), budget: budget.snapshot() }),
-		finishTurn: (sessionID: string, turnID: string) => { finishBatch(agentBatchKey(sessionID, turnID)); adoptedLineages.clear(); },
-		actorActionSettled: ({ sessionID, turnID, settlement, candidate, candidateFeedback }: ActorActionFeedback<string>) => {
+		finishTurn: (sessionID: string, turnID: string) => { finishBatch(agentBatchKey(sessionID, turnID)); },
+		actorActionSettled: ({ sessionID, turnID, settlement, candidate, candidateFeedback, reusedComputations }: ActorActionFeedback<string>) => {
 			const provider = settlement.provider;
 			// Actual service can justify one cold phase; it is neither a predicted saving nor mutation evidence.
 			if (batches.has(agentBatchKey(sessionID, turnID)) && rootRequestMs > 0 && provider.kind === "actor" && provider.origin === "fallback" &&
 				!provider.isError && Number.isFinite(provider.durationMs) && provider.durationMs > rootRequestMs + DEFAULT_BENEFIT_GATE_POLICY.minNetBenefitMs) costlyService = true;
-			const lineages = adoptedLineages.get(settlement.actorAction.sequence) ?? [];
-			adoptedLineages.delete(settlement.actorAction.sequence);
-			const sources = new Set(settlement.matchedPredictions.map((prediction) => prediction.source));
-			if (settlement.provider.kind !== "speculative" || !sources.has("drafter")) return;
-			// Every source that predicted the adopted call shares its credit, whichever one executed it.
+			const credits = new Map<DrafterUtilityBatch, { reusedExecutionMs: number; costMs: number }>();
+			const credit = (utility: DrafterUtilityBatch) => {
+				let value = credits.get(utility);
+				if (!value) credits.set(utility, value = { reusedExecutionMs: 0, costMs: 0 });
+				return value;
+			};
+			for (const share of reusedComputations ?? []) {
+				const producer = share.source === "drafter" ? asDrafterUtilityFeedback(share.feedback) : undefined;
+				if (!producer || !Number.isFinite(share.reusedExecutionMs) || share.reusedExecutionMs <= 0) continue;
+				// The timeline already deduplicated physical work; each shared ancestor receives its consumed parts once.
+				for (const utility of producer.utilities) credit(utility).reusedExecutionMs += share.reusedExecutionMs;
+			}
+			// A selected producer owns its measured adoption cost; predictions by other sources own neither its cost nor its benefit.
 			const owner = candidate?.source === "drafter" ? asDrafterPlanFeedback(candidateFeedback) : undefined;
-			if (!lineages.length && owner) lineages.push(lineage(owner));
-			// Split distinct forecasts' source share, aggregating shared ancestors exactly once.
-			const counts = new Map<DrafterUtilityBatch, number>();
-			for (const utilities of lineages) for (const utility of utilities) counts.set(utility, (counts.get(utility) ?? 0) + 1);
-			for (const [utility, count] of counts) budget.credit([utility], settlement.provider.timing, sources.size * lineages.length / count);
+			if (owner && provider.kind === "speculative") for (const utility of lineage(owner)) credit(utility).costMs += provider.timing.hitLatencyMs;
+			for (const [utility, timing] of credits) budget.credit([utility], timing);
 		},
-		finishSession: () => { for (const key of batches.keys()) finishBatch(key); adoptedLineages.clear(); rootRequestMs = 0; costlyService = false; budget.finishTask(); },
+		finishSession: () => { for (const key of batches.keys()) finishBatch(key); rootRequestMs = 0; costlyService = false; budget.finishTask(); },
 	};
 }
 
@@ -366,5 +373,11 @@ function drafterContextFits(model: Model<Api>, context: Context, maxTokens: numb
 function asDrafterPlanFeedback(value: unknown): DrafterPlanFeedback | undefined {
 	return value && typeof value === "object" && (value as { kind?: unknown }).kind === "drafter_plan"
 		? (value as DrafterPlanFeedback)
+		: undefined;
+}
+
+function asDrafterUtilityFeedback(value: unknown): DrafterUtilityFeedback | undefined {
+	return value && typeof value === "object" && (value as { kind?: unknown }).kind === "drafter_utility"
+		? (value as DrafterUtilityFeedback)
 		: undefined;
 }
