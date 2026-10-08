@@ -1,6 +1,6 @@
 import { textResult } from "./result.ts";
 import { deferred, gated, nextTurn } from "./async.ts";
-import { writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { temporaryDirectories } from "./filesystem.ts";
 import { testModel } from "./model.ts";
 import path from "node:path";
@@ -13,13 +13,14 @@ import type { SpeculativeAgentExecutionWorld } from "../src/agent-execution-worl
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { RESOURCE_OBSERVATION_EFFECTS, UNRESTRICTED_PROCESS_EFFECTS, WORKSPACE_PATH_MUTATION_EFFECTS } from "../src/effect-model.ts";
 import { ExecutionWorldRouter, type ExecutionWorldDiagnosticSnapshot } from "../src/execution-world.ts";
-import { createSpeculativeActionExtension, formatSpeculativeActionEvent, type SpeculativeSettingsStore } from "../src/extension.ts";
+import { createSpeculativeActionExtension, formatSpeculativeActionEvent, normalizeSpeculativeActionSettings, type SpeculativeSettingsStore } from "../src/extension.ts";
 import { LinuxProcessReuseBackend } from "../src/linux-process-backend.ts";
+import { PATTERN_AWARE_PRESETS, type PatternAwarePresetID } from "../src/pattern-aware.ts";
 import type { ProcessExecutionRequest } from "../src/process-execution.ts";
 import * as piTools from "../src/pi-tool-invocation.ts";
 import type { PiToolDefinition } from "../src/pi-tool-invocation.ts";
 import { SelfSpeculationCoordinator } from "../src/self-speculation.ts";
-import type { SpeculativeActionPackageSettings } from "../src/settings-store.ts";
+import { SpeculativeActionSettingsStore, type SpeculativeActionPackageSettings } from "../src/settings-store.ts";
 import type { ToolSettlement } from "../src/tool-settlement.ts";
 import { TimelineInterval } from "../src/task-timing.ts";
 
@@ -170,7 +171,7 @@ describe("zero-modification Pi extension", () => {
 			tool: "read", args: { path: "notes.txt" },
 		}), undefined);
 		if (mode === "cache") expect(fixture.settle).not.toHaveBeenCalled();
-		else expect(fixture.settle).toHaveBeenCalledWith(expect.any(TimelineInterval), { result, isError: false });
+		else expect(fixture.settle).toHaveBeenCalledWith(expect.any(TimelineInterval), { result, isError: false }, undefined);
 	});
 
 	it("binds only prepared searches, quietly retains native Actor otherwise, and retires on refresh or disable", async () => {
@@ -439,6 +440,82 @@ describe("zero-modification Pi extension", () => {
 		}
 	});
 
+	it("applies independent prebuilt modes, reopens saved selections, and discards cancelled changes", async () => {
+		const agentDirectory = await directories.create(), settingsPath = path.join(agentDirectory, "speculative-action.json");
+		await writeFile(settingsPath, JSON.stringify({ enabled: true, drafterEnabled: false, resourceCacheMaxEntries: 37,
+			patternAware: { multiStepEnabled: false, futureGapCoverage: 0.8 } }));
+		const fixture = await createFixture({ createSettingsStore: cwd => new SpeculativeActionSettingsStore(cwd, agentDirectory) });
+		await fixture.emit("session_start");
+		const choice = (id: PatternAwarePresetID, selected: boolean) => `[${selected ? "x" : " "}] ${PATTERN_AWARE_PRESETS.find(preset => preset.id === id)!.label}`;
+		const selectedCount = (count: number) => `Prebuilt modes › ${count}/${PATTERN_AWARE_PRESETS.length} selected`;
+		const editModes = async (choices: readonly string[], finish = ["Apply changes", "Close"]) => {
+			const menus = driveSettingsMenus(fixture, {
+				"Speculative action": ["Prediction sources", ...finish],
+				"Prediction sources": ["Learned patterns", "Back"],
+				"Learned patterns": ["Prebuilt modes", "Back"],
+				"Prebuilt modes": [...choices, "Back"],
+			});
+			await fixture.commands.get("speculative-action")?.handler("", fixture.context as ExtensionCommandContext);
+			return menus;
+		};
+		expect(await fixture.hostSettings()).toMatchObject({ patternAware: {
+			presets: ["reported-files", "edited-file", "recent-reads", "recent-command"],
+		} });
+		const initial = await editModes([], ["Close"]);
+		expect(initial.get("Learned patterns")).toContain(selectedCount(4));
+		expect(initial.get("Prebuilt modes")?.filter(label => label.startsWith("[x]"))).toHaveLength(4);
+		expect(initial.get("Prebuilt modes")?.filter(label => label.startsWith("[ ]"))).toHaveLength(5);
+		const menus = await editModes([choice("reported-files", true), choice("edited-file", true),
+			choice("reported-lines", false), choice("companion-files", false)]);
+		expect(menus.get("Prebuilt modes")).toEqual(expect.arrayContaining([
+			expect.stringContaining(choice("reported-files", false)), expect.stringContaining(choice("edited-file", false)),
+			expect.stringContaining(choice("recent-reads", true)), expect.stringContaining(choice("recent-command", true)),
+			expect.stringContaining(choice("reported-lines", true)), expect.stringContaining(choice("companion-files", true)),
+		]));
+		expect(menus.get("Learned patterns")).toContain(selectedCount(4));
+		const saved = await readFile(settingsPath, "utf8");
+		const reloaded = new SpeculativeActionSettingsStore(fixture.cwd, agentDirectory);
+		await reloaded.load();
+		expect(normalizeSpeculativeActionSettings(reloaded.effective())).toMatchObject({ enabled: true, drafterEnabled: false, resourceCacheMaxEntries: 37,
+			patternAware: { enabled: true, multiStepEnabled: false, futureGapCoverage: 0.8,
+				presets: ["recent-reads", "recent-command", "reported-lines", "companion-files"] } });
+
+		fixture.ui.confirm = vi.fn(async title => title === "Discard changes?");
+		await editModes([choice("reported-lines", true), choice("retry-failed-command", false)], ["Close"]);
+		expect(fixture.ui.confirm).toHaveBeenCalledWith("Discard changes?", "Close without applying the pending speculative-action changes?");
+		expect(await readFile(settingsPath, "utf8")).toBe(saved);
+		expect(fixture.store.effective()).toEqual(reloaded.effective());
+
+		const reopened = await editModes([choice("reported-lines", true), choice("edited-file", false)]);
+		expect(reopened.get("Prebuilt modes")).toEqual(expect.arrayContaining([
+			expect.stringContaining(choice("reported-lines", false)), expect.stringContaining(choice("companion-files", true)),
+			expect.stringContaining(choice("edited-file", true)), expect.stringContaining(choice("retry-failed-command", false)),
+		]));
+		await reloaded.load();
+		expect(normalizeSpeculativeActionSettings(reloaded.effective())).toMatchObject({ enabled: true, drafterEnabled: false, resourceCacheMaxEntries: 37,
+			patternAware: { enabled: true, multiStepEnabled: false, futureGapCoverage: 0.8,
+				presets: ["edited-file", "recent-reads", "recent-command", "companion-files"] } });
+		await editModes([choice("reported-lines", false)]);
+		await reloaded.load();
+		const restored = { patternAware: { presets: ["edited-file", "recent-reads", "recent-command", "reported-lines", "companion-files"] } };
+		expect(normalizeSpeculativeActionSettings(reloaded.effective())).toMatchObject(restored);
+		expect(await fixture.hostSettings()).toMatchObject(restored);
+	});
+
+	it("keeps prebuilt mode selections when restoring tuning defaults", async () => {
+		const fixture = await createFixture({ settings: { enabled: true, drafterEnabled: false,
+			patternAware: { enabled: false, multiStepEnabled: false,
+				presets: ["edited-file", "reported-lines", "retry-failed-command"], futureGapCoverage: 0.8 } } });
+		await fixture.emit("session_start");
+		driveSettingsMenus(fixture, { "Speculative action": ["Restore defaults", "Apply changes", "Status", "Close"] });
+		fixture.ui.confirm = async title => title === "Restore defaults?";
+		await fixture.commands.get("speculative-action")?.handler("", fixture.context as ExtensionCommandContext);
+		expect(fixture.store.effective()).toMatchObject({ enabled: true, drafterEnabled: false,
+			patternAware: { enabled: false, multiStepEnabled: false, presets: ["edited-file", "reported-lines", "retry-failed-command"] } });
+		expect(fixture.store.effective()?.patternAware?.futureGapCoverage).not.toBe(0.8);
+		expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining(`Prebuilt modes: 3/${PATTERN_AWARE_PRESETS.length} selected (inactive);`), "info");
+	});
+
 	it("binds typed inputs through the advanced hierarchy", async () => {
 		const configure = vi.fn();
 		const maintain = vi.fn(async () => ({ removedEntries: 2, removedArtifacts: 3, removedBytes: 4096 }));
@@ -528,6 +605,7 @@ interface FixtureOptions {
 	readonly executionWorlds?: readonly SpeculativeAgentExecutionWorld[];
 	readonly overriddenTools?: readonly string[];
 	readonly settings?: SpeculativeActionPackageSettings;
+	readonly createSettingsStore?: (cwd: string) => SpeculativeSettingsStore;
 }
 
 async function createFixture(options: FixtureOptions = {}) {
@@ -587,7 +665,7 @@ async function createFixture(options: FixtureOptions = {}) {
 		signal: undefined,
 		thinkingLevel: "off",
 	} as unknown as ExtensionContext;
-	const store = memorySettingsStore(options.settings);
+	const store = options.createSettingsStore?.(cwd) ?? memorySettingsStore(options.settings);
 	const pi = {
 		on: (event: string, handler: (event: never, context: ExtensionContext) => unknown) => {
 			handlers.set(event, [...(handlers.get(event) ?? []), handler]);

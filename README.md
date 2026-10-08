@@ -23,9 +23,31 @@ pi -e /absolute/path/to/pi-speculative-action
   "candidateLimit": 2,
   "drafterMaxDepth": 3,
   "tools": ["read", "ls", "write", "edit", "find", "grep", "bash"],
-  "patternAware": { "enabled": true, "multiStepEnabled": true }
+  "patternAware": {
+    "enabled": true,
+    "multiStepEnabled": true,
+    "presets": ["reported-files", "edited-file", "recent-reads", "recent-command"]
+  }
 }
 ```
+
+在 **Prediction sources → Learned patterns → Prebuilt modes** 可独立选择九种预建模式。原有四种默认开启，新增五种默认关闭；旧配置未写 `presets` 时仍选择原有四种，已有数组则保留其明确选择。选择后回到主菜单 **Apply changes** 保存，取消未应用的修改不会改变配置。**Restore defaults** 重置调优参数时保留模式选择。
+
+| 模式 | 配置 ID | 默认 | 预测依据 |
+| --- | --- | --- | --- |
+| Reported files | `reported-files` | 开 | 最新工具结果中报告、尚未读取的文件 |
+| Edited files | `edited-file` | 开 | Actor 刚编辑或写入的文件 |
+| Recent reads | `recent-reads` | 开 | 最近读过、可能再次读取的文件 |
+| Recent command | `recent-command` | 开 | 编辑后，针对 Actor 实际执行过的命令准备已失效的原生工作单元 |
+| Reported lines | `reported-lines` | 关 | 工具结果实际报告的文件与行号附近的读取窗口 |
+| Companion files | `companion-files` | 关 | 已观察到的同名源码与测试文件配对，不猜测新路径 |
+| Edits after failure | `failure-edits` | 关 | 失败后读取最近成功编辑、且编辑后尚未重新读取的文件 |
+| Continue reading | `continue-read` | 关 | 读取结果明确记录可继续的截断位置时，准备下一段内容 |
+| Retry failed command | `retry-failed-command` | 关 | 真实失败的 Bash 命令报告的文件被成功编辑后，在没有合格原生准备时原样准备该命令 |
+
+读取模式的先验概率按真实预测的匹配和采纳反馈校正；命令准备沿用实际耗时和采纳收益门控，不把预建规则记作已学习的成功历史。这些模式可用于提前准备可能的后续工作；实际收益取决于匹配、资源占用和验证结果。失败命令模式只使用实际执行过的原始命令与参数，不改写 shell 命令。
+
+显式设置 `"presets": []` 只关闭预建模式，已学习的模式和历史仍保留并继续使用；`patternAware.enabled: false` 关闭整个 PatternAware 预测来源，同时保留模式选择。新选择随下一轮预测配置生效，已启动的工作沿用原有生命周期。所有模式沿用原有收益、资源预算、隔离与采纳验证。
 
 默认最多两个 Drafter 请求竞争首个有效提案，取消仍在运行的同伴。Drafter 可在一次响应中预测已知参数的有序工作流程，在私有工作区中依次提前执行；需要未知工具结果时停下，取得真实结果后再续推。`drafterMaxDepth` 默认 3，设为 0 时只预测当前批次。普通工具批次保持完整，整批结果反馈后才续推。宽度与深度均为上限，收益门控会收缩无效请求并保留低频恢复探测；工具列表只限制预测，不改变 Actor 权限。
 

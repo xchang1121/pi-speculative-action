@@ -7,7 +7,7 @@ import { READ_RANGE_ACTION_KEY_PROJECTOR } from "../src/action-key-projection.ts
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { BoundedRecencyMap } from "../src/bounded-recency-map.ts";
 import { acquirePatternAwareStore, patternAwareActionSemantics, applyBindings, applyBindingsVariants, failureClass, inferBindings,
-	PATTERN_AWARE_DEFAULTS, PatternAwareStore, patternAwareSettings, projectPatternAwareObservation } from "../src/pattern-aware.ts";
+	PATTERN_AWARE_DEFAULTS, PatternAwareStore, patternAwareAnalyzerKey, patternAwareSettings, projectPatternAwareObservation } from "../src/pattern-aware.ts";
 import { adoptedSettlement, rejectedSettlement, unmatchedSettlement, unobservedSettlement } from "./prediction.ts";
 
 const directories = temporaryDirectories("pi-pattern-");
@@ -767,10 +767,18 @@ describe("PatternAware", () => {
 			beamWidth: PATTERN_AWARE_DEFAULTS.beamWidth,
 			maxPredictionDepth: PATTERN_AWARE_DEFAULTS.maxPredictionDepth,
 		});
+		expect(patternAwareSettings({}).presets).toEqual(["reported-files", "edited-file", "recent-reads", "recent-command"]);
+		for (const presets of [undefined, null, "reported-files", {}]) expect(patternAwareSettings({ presets }).presets).toEqual(PATTERN_AWARE_DEFAULTS.presets);
+		const selected = ["recent-command", "unknown", "reported-files", "recent-command", null], parsed = patternAwareSettings({ presets: selected });
+		selected.length = 0;
+		expect(parsed.presets).toEqual(["reported-files", "recent-command"]);
+		expect(Object.isFrozen(parsed.presets)).toBe(true);
+		expect(patternAwareSettings({ presets: [] }).presets).toEqual([]);
+		expect(patternAwareAnalyzerKey(parsed)).toBe(patternAwareAnalyzerKey(patternAwareSettings({ presets: [] })));
 	});
 
 	test("probes an adjacent transition once and preserves feedback until configured promotion", () => {
-		const store = patternStore({ minOccurrences: 3 });
+		const store = patternStore({ minOccurrences: 3, presets: [] });
 		trainGrepRead(store, "one", "src/a.ts");
 		expect(store.snapshot().find((item) => item.targetTool === "read")).toMatchObject({ occurrences: 1, feedback: { issued: 0 } });
 
@@ -1152,7 +1160,7 @@ describe("PatternAware", () => {
 			acceptPattern(store, { "0": 10 }, { id, bindings });
 		}
 
-		store.observe(input("dedupe", "grep", { pattern: "symbol" }));
+		store.observe(input("dedupe", "grep", { pattern: "symbol" }, { outputPaths: ["src/index.ts"] }));
 		const reads = store.predict("dedupe").filter((candidate) => candidate.tool === "read");
 
 		expect(reads).toHaveLength(4);
@@ -1189,6 +1197,7 @@ describe("PatternAware", () => {
 				if (index === 0 || mode === "stale schema" || mode === "non-learning") expect(recurrent, mode).toBeUndefined();
 				else {
 					expect(recurrent, mode).toMatchObject({ tool, input: first, horizon: 0, latestHorizon: 0, dependencies: [] });
+					expect(store.predict(mode, { [tool]: "schema-base" }, { ...config, presets: [] }).some(candidate => candidate.actionIdentity === recurrent!.actionIdentity)).toBe(true);
 					expect(recurrent!.expectedDurationMs).toBeCloseTo(700 / (1 + 2 ** (-4 / config.decayHalfLifeEvents)), 10);
 					// No mapper penalty: 700 * PPM(tool) / (1 + 2^(-4/2048) + 1.2816^2).
 					expect(recurrent!.expectedLatencyBenefitMs).toBeCloseTo(mode === "command" ? 38.437531185154405 : 189.19021130729962, 10);
@@ -1444,18 +1453,63 @@ describe("PatternAware", () => {
 		store.observe(input("s", "read", { path: "src/c.ts" }, { turnID: "earlier" }));
 		store.observe(input("s", "grep", { pattern: "x" }, { outputLocations: [{ path: "src/b.ts", line: 3 }, { path: "src/c.ts", line: 1 }] }));
 		store.observe(input("s", "edit", { path: "src/a.ts" }));
-		const structural = () => store.predict("s").filter(item => item.patternID.startsWith("structural:"));
+		const structural = (presets = PATTERN_AWARE_DEFAULTS.presets) => store.predict("s", {}, settings({ presets })).filter(item => item.patternID.startsWith("structural:"));
+		const learned = store.snapshot();
 		expect(structural().map(item => [item.patternID, item.input.path])).toEqual(
 			[["structural:edited", "src/a.ts"], ["structural:listed", "src/b.ts"], ["structural:reread", "src/c.ts"]]);
+		for (const [preset, targets] of [["edited-file", ["src/a.ts"]], ["reported-files", ["src/b.ts"]], ["recent-reads", ["src/c.ts"]], ["recent-command", []]] as const)
+			expect(structural([preset]).map(item => item.input.path)).toEqual(targets);
+		expect(structural([])).toEqual([]);
 		const [edited] = structural(), before = edited!.conditionalProbability;
+		expect(edited!.supportingPatternIDs).toEqual([]);
+		store.issued(edited!.continuation); store.settled(edited!.continuation, unobservedSettlement("control", "turn_closed"));
+		expect(structural()[0]!.conditionalProbability).toBe(before);
 		for (let index = 0; index < 3; index++) { store.issued(edited!.continuation); store.settled(edited!.continuation, unmatchedSettlement()); }
 		expect(structural()[0]!.conditionalProbability).toBeLessThan(before);
+		expect(structural([])).toEqual([]);
+		expect(structural(["edited-file"])[0]!.conditionalProbability).toBeLessThan(before);
+		expect(store.snapshot()).toEqual(learned);
 		// A listed name with no file behind it never runs; one written on this path first still reads.
 		for (const [written, paths] of [[false, ["src/d.ts"]], [true, ["src/b.ts", "src/d.ts"]]] as const) {
 			const present = patternStore({}, undefined, patternAwareActionSemantics(PI_ACTION_SEMANTICS, "/workspace", [], (target) => !target.endsWith("b.ts")));
 			present.observe(input("s", "grep", { pattern: "x" }, { outputLocations: [{ path: "src/b.ts", line: 3 }, { path: "src/d.ts", line: 1 }] }));
 			if (written) present.observe(input("s", "write", { path: "src/b.ts" }));
 			expect(present.predict("s").filter(item => item.patternID.startsWith("structural:")).map(item => item.input.path)).toEqual(paths);
+		}
+		const located = patternStore({ presets: ["reported-files", "reported-lines"] }, undefined,
+			patternAwareActionSemantics(PI_ACTION_SEMANTICS, "/workspace", [READ_RANGE_ACTION_KEY_PROJECTOR], target => !target.endsWith("missing.ts")));
+		located.observe(input("lines", "grep", {}, { outputLocations: [{ path: "src/large.ts", line: 5000 }, { path: "./src/large.ts", line: 5020 },
+			{ path: "src/large.ts", line: 20 }, { path: "src/missing.ts", line: 4000 }, { path: "../outside.ts", line: 5000 }] }));
+		const windows = located.predict("lines").filter(item => item.patternID.startsWith("structural:"));
+		expect(windows.map(item => item.input)).toEqual([{ path: "src/large.ts" }, { path: "src/large.ts", offset: 4980, limit: 80 }]);
+		expect(located.continue(windows[1]!.continuation, input("lines", "read", { path: "src/large.ts" })).some(item => item.patternID.startsWith("structural:"))).toBe(false);
+
+		for (const [source, companion] of [["src/a.ts", "src/a.test.ts"], ["src/OrderedSet.ts", "__tests__/OrderedSet.ts"],
+			["src/objects/Line.js", "test/unit/src/objects/Line.tests.js"], ["src/Foo.java", "src/FooTest.java"]]) {
+			const companions = patternStore({ presets: ["companion-files"] }, undefined, piActionSemantics());
+			companions.observe(input("companions", "find", {}, { outputPaths: [companion!, `other/${companion}`], turnID: "known" }));
+			companions.observe(input("companions", "edit", { path: source }));
+			expect(companions.predict("companions").filter(item => item.patternID === "structural:companion").map(item => item.input.path)).toEqual([companion]);
+		}
+		const failed = patternStore({ presets: ["failure-edits"] }, undefined, piActionSemantics());
+		failed.observe(input("failure", "edit", { path: "src/a.ts" }, { turnID: "edited" }));
+		failed.observe(input("failure", "bash", { command: "check" }, { outcome: "failure" }));
+		expect(failed.predict("failure").filter(item => item.patternID === "structural:failure-edit").map(item => item.input.path)).toEqual(["src/a.ts"]);
+		failed.observe(input("failure", "read", { path: "src/a.ts" }));
+		expect(failed.predict("failure").some(item => item.patternID === "structural:failure-edit")).toBe(false);
+
+		for (const [truncation, outcome, expected] of [
+			[{ truncated: true, outputLines: 2000, totalLines: 3000 }, "success", true],
+			[{ truncated: false, outputLines: 2000, totalLines: 3000 }, "success", false],
+			[{ truncated: true, outputLines: 0, totalLines: 3000 }, "success", false],
+			[{ truncated: true, outputLines: 2000, totalLines: 2000 }, "success", false],
+			[{ truncated: true, outputLines: 2000, totalLines: 3000, firstLineExceedsLimit: true }, "success", false],
+			[{ truncated: true, outputLines: 2000, totalLines: 3000 }, "failure", false],
+		] as const) {
+			const next = patternStore({ presets: ["continue-read"] }, undefined, piActionSemantics());
+			next.observe(input("page", "read", { path: "src/large.ts", offset: 100 }, { output: { truncation }, outcome }));
+			expect(next.predict("page").filter(item => item.patternID === "structural:continuation").map(item => item.input))
+				.toEqual(expected ? [{ path: "src/large.ts", offset: 2100 }] : []);
 		}
 	});
 
