@@ -237,6 +237,37 @@ describe("structural speculative runtime", () => {
 		} finally { gate.release(); await runtime.dispose(); }
 	});
 
+	it.each(["measured", "unknown", "blocked", "over-capacity", "retired-operation"] as const)("prioritizes a workflow prerequisite only for an eligible measured descendant (%s)", async mode => {
+		const gate = gated(), executed: string[] = [];
+		const { runtime, events } = harness({ settings: () => ({ ...settings, maxConcurrentActions: 1 }),
+			source: planSource({ propose: ({ startInput }) => startInput.turnID === "predict" ? { ...plan("workflow"), actions: [
+				readAction("independent", { path: "independent.ts" }, { empiricalProbability: 1, expectedDurationMs: 100 }),
+				readAction("prerequisite", { path: "prerequisite.ts" }, { empiricalProbability: 1, expectedDurationMs: 10 }),
+				{ id: "expensive", type: mode === "retired-operation" ? "operation" : "tool_call", tool: "bash", input: { command: "expensive-build" },
+					empiricalProbability: 0.5, adoptionProbability: 0.8,
+					...(mode === "over-capacity" ? { resourceDemand: 2 } : {}),
+					...(mode === "retired-operation" ? { operation: Object.freeze({ backend: "test", identity: "retired", permissionHash: "parent",
+						executionMs: 10_000, expectedDurationMs: 10_000, available: false }) } : {}),
+					dependsOn: [{ actionID: "prerequisite", condition: "execution_succeeded" }] },
+			] } : undefined }),
+			resolveExecution: () => RESOURCE_ROUTE,
+			preflightCandidate: ({ tool }) => mode === "blocked" && tool === "bash" ? { ok: false, reason: "policy_denied" } : { ok: true },
+			execute: async (_tool, input, signal) => {
+				executed.push(String(input.path));
+				if (signal.aborted) gate.release(); else signal.addEventListener("abort", gate.release, { once: true });
+				try { await gate.wait(); return "prepared"; } finally { signal.removeEventListener("abort", gate.release); }
+			},
+		});
+		try {
+			await runtime.startTurn(start("seed"));
+			if (mode !== "unknown") await runFallback(runtime, { ...call("seed"), tool: "bash", input: { command: "expensive-build" } }, 10_000);
+			await runtime.finishTurn(call("seed"));
+			await runtime.startTurn(start("predict")); await gate.entered;
+			expect(executed).toEqual([mode === "measured" ? "prerequisite.ts" : "independent.ts"]);
+			expect(events.filter(event => event.type === "actor_action").every(event => (event.computation?.reusedExecutionMs ?? 0) === 0)).toBe(true);
+		} finally { gate.release(); await runtime.dispose(); }
+	});
+
 	it("credits consumed operation receipts to their shared producer mode during native fallback", async () => {
 		const binding = Object.freeze({ backend: "process", identity: "child", permissionHash: "parent", executionMs: 40, expectedDurationMs: 40 });
 		const preparation = new TimelineInterval(0, 10);
