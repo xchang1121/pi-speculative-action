@@ -12,7 +12,7 @@ import { PpmCountTrie, type PpmCountTrieRow } from "./ppm-count-trie.ts";
 import type { PredictionSettlement, ResolutionStage } from "./settlement.ts";
 import { asRecord, isObject, stableEqual as sameValue, stableStringify } from "./stable-json.ts";
 import { booleanOr, nonNegativeInteger, positiveInteger, probability as probabilitySetting, settingsParser } from "./setting-input.ts";
-import { PATTERN_AWARE_PRESETS, patternPresetReads, type PatternAwarePresetID } from "./pattern-aware-presets.ts";
+import { PATTERN_AWARE_PRESETS, patternPresetActions, type PatternAwarePresetID } from "./pattern-aware-presets.ts";
 
 export { PATTERN_AWARE_PRESETS, type PatternAwarePresetID } from "./pattern-aware-presets.ts";
 
@@ -142,6 +142,8 @@ export type PatternAwareCandidate = {
 	readonly tool: string;
 	readonly input: Record<string, unknown>;
 	readonly patternID: string;
+	/** Selected built-in relation, when this candidate has no learned support yet. */
+	readonly presetID?: PatternAwarePresetID;
 	/** Canonical action identity; plan support adds the parent path while K(a) remains the execution identity. */
 	readonly actionIdentity: string;
 	readonly supportingPatternIDs: ReadonlyArray<string>;
@@ -582,10 +584,10 @@ export class PatternAwareStore {
 			});
 		}
 		// Learned support, when there is any, speaks for an action; the built-in relations only add the ones nothing learned yet.
-		for (const structural of authoritative ? this.structuralReads(history, schemaHashes, continuation, settings) : []) {
-			if (predictions.has(structural.actionIdentity) || [...predictions.values()].some(existing => existing.tool === "read" &&
-				this.actionInputCovers("read", widenReadGuess("read", existing.input) as Record<string, unknown>, schemaHashes.read,
-					"read", widenReadGuess("read", structural.input) as Record<string, unknown>, schemaHashes.read))) continue;
+		for (const structural of authoritative ? this.structuralPredictions(history, schemaHashes, continuation, settings) : []) {
+			if (predictions.has(structural.actionIdentity) || [...predictions.values()].some(existing => existing.tool === structural.tool &&
+				this.actionInputCovers(existing.tool, widenReadGuess(existing.tool, existing.input) as Record<string, unknown>, schemaHashes[existing.tool],
+					structural.tool, widenReadGuess(structural.tool, structural.input) as Record<string, unknown>, schemaHashes[structural.tool]))) continue;
 			predictions.set(structural.actionIdentity, structural);
 		}
 		const ranked = [...predictions.values()].filter((prediction) => this.readable(prediction, history, schemaHashes.read)).sort((left, right) =>
@@ -668,22 +670,23 @@ export class PatternAwareStore {
 	}
 
 	/**
-	 * What the Actor reads next from what it just did, before any pattern is learned: the file it just edited, the files the last
-	 * batch listed and it has not read, then the files it read most recently. Each selected relation keeps its own rate in this store,
+	 * Built-in relations use observed inputs and results before a pattern is learned. Each selected relation keeps its own rate,
 	 * starting from a prior and updated only by observed prediction outcomes.
 	 */
-	private structuralReads(
+	private structuralPredictions(
 		history: ReadonlyArray<PatternAwareEvent>,
 		schemaHashes: Readonly<Record<string, string>>,
 		continuation: PatternAwareContinuation,
 		settings: PatternAwareSettings,
 	) {
 		const reads = history.filter((event) => event.tool === "read" && typeof event.input.path === "string");
-		const durationMs = reads.reduce((total, event) => total + event.durationMs, 0) / Math.max(1, reads.length);
+		const readDurationMs = reads.reduce((total, event) => total + event.durationMs, 0) / Math.max(1, reads.length);
 		const identity = (target: string) => this.resolveActionKey("read", { path: target }, schemaHashes.read)?.key;
+		const actionIdentity = (event: PatternAwareEvent) => this.resolveActionKey(event.tool, event.input, event.schemaHash)?.key;
 		const seen = new Set<string>();
-		return patternPresetReads(history, settings.presets, identity).flatMap(({ kind, input, prior }) => {
-			const key = this.resolveActionKey("read", input, schemaHashes.read)?.key;
+		return patternPresetActions(history, settings.presets, identity, actionIdentity).flatMap(({ kind, presetID, tool, input, prior, durationMs = readDurationMs, schemaHash }) => {
+			if (tool === "grep" && schemaHash !== schemaHashes[tool]) return [];
+			const key = this.resolveActionKey(tool, input, schemaHashes[tool])?.key;
 			if (!key || seen.has(key)) return [];
 			seen.add(key);
 			let feedback = this.structuralFeedback.get(kind);
@@ -696,7 +699,7 @@ export class PatternAwareStore {
 			if (continuation.visitedPatternIDs.includes(patternID)) return [];
 			return [{
 				background: false, recurrentFeedback: feedback, actionIdentity: hash(JSON.stringify({ actionKey: key, type: "tool_call" })),
-				type: "tool_call" as const, tool: "read", input, patternID, supportingPatternIDs: [] as string[],
+				type: "tool_call" as const, tool, input, patternID, presetID, supportingPatternIDs: [] as string[],
 				dependencies: [] as PatternAwareDependency[], horizon: 0, latestHorizon: 0,
 				conditionalProbability, empiricalProbability, adoptionProbability, expectedDurationMs: durationMs,
 				expectedLatencyBenefitMs: empiricalProbability * adoptionProbability * Math.max(1, durationMs),

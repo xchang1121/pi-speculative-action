@@ -15,6 +15,8 @@ export interface PlanAction {
 	/** Stable within one proposal across revisions. */
 	readonly id: string;
 	readonly type: "tool_call" | "operation";
+	/** Source-owned diagnostic label; never part of action identity, scheduling or reuse authority. */
+	readonly mode?: string;
 	/** Internal work retains its backend capability and uses tool/input only as the permission anchor. */
 	readonly operation?: ExecutionOperationBinding;
 	readonly tool: string;
