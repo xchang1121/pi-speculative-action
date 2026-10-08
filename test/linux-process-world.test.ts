@@ -156,9 +156,9 @@ describe("Linux process ExecutionWorld", () => {
 		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-live-process-");
 		let host: ReturnType<typeof createSpeculativeActionHost> | undefined;
-		// Join admission is the scheduler's timing policy, tested on its own: under load it may prefer native, which is not what this tests.
+		// Timing policy is tested separately. Allow both admission and enough time to reach a safe frontier from active computation.
 		const assess = SpeculationScheduler.prototype.assessCandidateJoin, admitted = vi.spyOn(SpeculationScheduler.prototype, "assessCandidateJoin")
-			.mockImplementation(function (this: SpeculationScheduler<object>, request) { const decision = assess.call(this, request); return request.state === "running" ? { ...decision, allowed: true } : decision; });
+			.mockImplementation(function (this: SpeculationScheduler<object>, request) { const decision = assess.call(this, request); return request.state === "running" ? { ...decision, allowed: true, waitBudgetMs: 10_000 } : decision; });
 		try {
 			await prepareLinuxProcessReuse(fixture);
 			if (!(await Reflect.get(fixture.backend, "ready")).imageLibrary) return skip("native process image capture is unavailable");
@@ -246,14 +246,19 @@ int main(int argc, char **argv) {
  for (unsigned i = 0; i < 3; i++) if (pwrite(backing, "A", 1, i * 4096) != 1) return 61;` : ""}
  ${mode === "handles" ? `int backing = memfd_create("live-ofd", 0); if (backing < 0 || write(backing, "abcd", 4) != 4 || lseek(backing, 0, SEEK_SET)) return 61;
  char pathname[64]; snprintf(pathname, sizeof(pathname), "/proc/self/fd/%d", backing); int independent = open(pathname, O_RDONLY); if (independent < 0) return 61;` : ""}
+ // The prefix and parent endpoints must be stable before exec, independent of fork scheduling.
+ uint64_t counter = 1;
+ if (${mode === "eventfd" ? "write(in[1], &counter, 8) != 8" : `write(in[1], argv[1][0] == 'c' ? "D" : "A", 1) != 1`}) return 65;
+ int start[2]; if (pipe(start)) return 61;
  pid_t child = fork(); if (child < 0) return 62;
- if (!child) { int a = fcntl(in[0], F_DUPFD_CLOEXEC, 10), b = fcntl(ack[1], F_DUPFD_CLOEXEC, 10);
+ if (!child) { close(start[1]); char go; if (read(start[0], &go, 1) != 1 || close(start[0])) _exit(63);
+  int a = fcntl(in[0], F_DUPFD_CLOEXEC, 10), b = fcntl(ack[1], F_DUPFD_CLOEXEC, 10);
   if (a < 0 || b < 0 || dup2(a, 3) != 3 || dup2(b, 4) != 4) _exit(63);
   ${mode === "eof" ? "if (dup2(output[1], 1) != 1) _exit(63);" : ""}
   ${mode === "handles" ? "if (dup2(backing, 5) != 5 || dup2(5, 6) != 6 || dup2(independent, 7) != 7) _exit(63); close_range(8, ~0U, 0);" : mode === "mmap" ? "if (dup2(backing, 5) != 5) _exit(63); close_range(6, ~0U, 0);" : "close_range(5, ~0U, 0);"} execlp("worker", "worker", NULL); _exit(64); }
- close(in[0]); close(ack[1]); char ready; uint64_t counter = 1;
+ close(in[0]); close(ack[1]); char ready;
  ${mode === "eof" ? "close(output[1]);" : ""}
- if (${mode === "eventfd" ? "write(in[1], &counter, 8) != 8" : `write(in[1], argv[1][0] == 'c' ? "D" : "A", 1) != 1`}) return 65;
+ close(start[0]); if (write(start[1], "S", 1) != 1 || close(start[1])) return 65;
  ${mode === "writev" ? `char fill[4096]; unsigned used = 0; ssize_t size;
  while (used < sizeof(fill) && (size = read(ack[0], fill + used, sizeof(fill) - used)) > 0) used += size;
  if (used != sizeof(fill)) return 65; for (unsigned i = 0; i < used; i++) if (fill[i] != 'P') return 65;` : ""}
@@ -325,7 +330,7 @@ int main(int argc, char **argv) {
 			const resumed = mode !== "changed" && mode !== "identity" && mode !== "cancel";
 			expect(fixture.backend.actorMetrics().joinedHits, diagnostic()).toBe(Number(resumed));
 			if (resumed) expect(publishing.mock.calls.some(([, , certificate]) => certificate?.result.continuation), diagnostic()).toBe(true);
-			if (mode !== "cancel") await host.finishTurn("prepared");
+			if (mode !== "cancel") await host.finishTurn("prepared", true);
 			await expect.poll(() => existsSync(`/proc/${privatePid}`), { timeout: 5_000 }).toBe(false); // Retirement kills asynchronously, as for cancel.
 			if (resumed) expect(events.filter(event => event.type === "operation_prediction"), diagnostic()).toContainEqual(expect.objectContaining({ settlement: expect.objectContaining({
 				observation: "observed", match: expect.objectContaining({ matched: true, adoption: expect.objectContaining({ status: "adopted" }) }) }) }));
