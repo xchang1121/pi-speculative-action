@@ -7,6 +7,69 @@ import { PlanRuntime, type PlanRuntimeNode } from "../src/plan-runtime.ts";
 import { cause } from "../src/settlement.ts";
 
 describe("PlanRuntime", () => {
+	it.each(["forward", "reverse"] as const)("finds unique unfinished workflow prerequisites through a %s diamond", (order) => {
+		const plan = new PlanRuntime();
+		const actions = [action("root"), action("left", { dependsOn: [{ actionID: "root" }] }),
+			action("right", { dependsOn: [{ actionID: "root" }] }), action("leaf", {
+				dependsOn: [{ actionID: "left" }, { actionID: "right" }, { actionID: "left" }],
+			})];
+		plan.apply(proposal(order === "reverse" ? actions.reverse() : actions), 0);
+		const frontiers = plan.workflowFrontiers(() => true);
+		expect(Object.fromEntries(frontiers.map(({ node, prerequisites }) => [node.action.id, ids(prerequisites)])))
+			.toEqual({ left: ["root"], right: ["root"], leaf: ["root"] });
+		expect(Object.isFrozen(frontiers)).toBe(true);
+		for (const row of frontiers) { expect(Object.isFrozen(row)).toBe(true); expect(Object.isFrozen(row.prerequisites)).toBe(true); }
+		const execution = new CandidateExecution<string>("shared");
+		plan.attachExecution("plan", "root", "root-candidate", execution);
+		execution.start(0); execution.succeed("root-output", new TimelineInterval(0, 1), 1);
+		expect(plan.workflowFrontiers(() => true).map(({ node, prerequisites }) => [node.action.id, ids(prerequisites)]))
+			.toEqual([["leaf", ["left", "right"]]]);
+	});
+
+	it("collapses already shared physical prerequisites without merging independent executions", () => {
+		const plan = new PlanRuntime();
+		plan.apply(proposal([action("first"), action("second"), action("leaf", {
+			dependsOn: [{ actionID: "first" }, { actionID: "second" }],
+		})]), 0);
+		expect(ids(plan.workflowFrontiers(() => true)[0]!.prerequisites)).toEqual(["first", "second"]);
+		const execution = new CandidateExecution<string>("shared");
+		for (const id of ["first", "second"]) plan.attachExecution("plan", id, "one-candidate", execution);
+		execution.start(0);
+		expect(ids(plan.workflowFrontiers(() => true)[0]!.prerequisites)).toEqual(["first"]);
+	});
+
+	it.each(["ineligible-root", "ineligible-child", "failed-root", "failed-child", "settled-root", "settled-child", "adoption-wait"] as const)(
+		"excludes workflow value behind %s", (mode) => {
+			const plan = new PlanRuntime();
+			plan.apply(proposal([action("root"), action("child", {
+				dependsOn: [{ actionID: "root", condition: mode === "adoption-wait" ? "actor_adopted" : "execution_succeeded" }],
+			})]), 0);
+			if (mode.startsWith("failed-")) plan.rejectExecution(plan.get("plan", mode.slice(7))!.identity, cause("execution", "unavailable"));
+			if (mode.startsWith("settled-")) plan.opportunity("plan", mode.slice(8))!.unobserve(cause("control", "expired"));
+			if (mode === "adoption-wait") {
+				const execution = new CandidateExecution<string>("shared");
+				plan.attachExecution("plan", "root", "root-candidate", execution);
+				execution.start(0); execution.succeed("root-output", new TimelineInterval(0, 1), 1);
+			}
+			expect(plan.workflowFrontiers(node => mode !== `ineligible-${node.action.id}`)).toEqual([]);
+		},
+	);
+
+	it("follows identity-pinned cross-source prerequisites and ignores completed execution edges", () => {
+		const plan = new PlanRuntime();
+		plan.apply(proposal([action("root"), action("finished")]), 0);
+		const edges = ["root", "finished"].map(actionID => ({ proposalID: "plan", actionID,
+			identity: plan.get("plan", actionID)!.identity.id, condition: "execution_succeeded" as const }));
+		plan.apply({ id: "peer", source: "peer", revision: 1, actions: [action("leaf", { dependsOn: edges })] }, 0);
+		const execution = new CandidateExecution<string>("shared");
+		plan.attachExecution("plan", "finished", "finished-candidate", execution);
+		execution.start(0); execution.succeed("output", new TimelineInterval(0, 1), 1);
+		expect(plan.workflowFrontiers(() => true).map(({ node, prerequisites }) => [node.proposalID, node.action.id, ids(prerequisites)]))
+			.toEqual([["peer", "leaf", ["root"]]]);
+		plan.apply({ proposalID: "plan", source: "source", revision: 2, upsert: [action("root", { input: { path: "replacement" } })] }, 0);
+		expect(plan.workflowFrontiers(() => true)).toEqual([]);
+	});
+
 	it("keeps internal preparation within its Actor batch and pins capability identity", () => {
 		const plan = new PlanRuntime(), operation = Object.freeze({ backend: "process", identity: "exec", permissionHash: "parent",
 			executionMs: 2, expectedDurationMs: 3 });

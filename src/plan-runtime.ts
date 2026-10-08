@@ -306,6 +306,47 @@ export class PlanRuntime {
 
 	values(): readonly PlanRuntimeNode[] { return this.select(); }
 
+	/** The unfinished execution frontier that can unlock each pending descendant, without multiplying shared DAG paths. */
+	workflowFrontiers(eligible: (node: PlanRuntimeNode) => boolean): readonly {
+		readonly node: PlanRuntimeNode; readonly prerequisites: readonly PlanRuntimeNode[];
+	}[] {
+		const rows: { node: PlanRuntimeNode; prerequisites: readonly PlanRuntimeNode[] }[] = [];
+		const frontiers = new Map<MutableNode, ReadonlySet<MutableNode>>(), snapshots = new Map<MutableNode, PlanRuntimeNode>();
+		const graphs = new Set([...this.plans.values()].map(plan => plan.graph));
+		for (const graph of graphs) for (const node of graph.ordered) {
+			const plan = this.plans.get(node.identity.proposalID)!;
+			const snapshot = this.snapshot(plan, node), execution = snapshot.execution;
+			snapshots.set(node, snapshot);
+			if (snapshot.predictionState.status !== "pending" || executionSettled(execution) ||
+				execution.status === "execution_blocked" || !eligible(snapshot) || !node.validDependencies) continue;
+			const frontier = new Set<MutableNode>();
+			let unresolved = false, possible = true;
+			for (const dependency of node.action.dependsOn ?? []) {
+				const parent = this.parent(plan.id, dependency);
+				const state = parent ? dependencyReadiness(parent, dependency.condition) : "blocked";
+				if (state === "blocked") { possible = false; break; }
+				if (state === "ready") continue;
+				unresolved = true;
+				const inherited = parent && frontiers.get(parent);
+				// A completed prerequisite waiting for Actor adoption has no remaining execution to prioritize.
+				if (!inherited?.size) { possible = false; break; }
+				for (const prerequisite of inherited) frontier.add(prerequisite);
+			}
+			if (!possible) continue;
+			if (!unresolved) frontier.add(node);
+			frontiers.set(node, frontier);
+			if (!unresolved) continue;
+			const physical = new Map<string, PlanRuntimeNode>();
+			for (const prerequisite of frontier) {
+				const value = snapshots.get(prerequisite)!;
+				const key = "candidateID" in value.execution ? `candidate:${value.execution.candidateID}` : `node:${value.identity.id}`;
+				if (!physical.has(key)) physical.set(key, value);
+			}
+			rows.push({ node: snapshot, prerequisites: Object.freeze([...physical.values()]) });
+		}
+		return Object.freeze(rows.map(row => Object.freeze(row)));
+	}
+
 	pending(): readonly PlanRuntimeNode[] { return this.select((node) => node.opportunity.state.status === "pending"); }
 
 	matchable(decisionSequence: number): readonly PlanRuntimeNode[] {

@@ -11,6 +11,8 @@ export interface PredictionForecast extends ServiceTimingIdentity {
 	readonly actorPhase?: { readonly kind: "decision" | "cycle"; readonly elapsedMs: number; };
 	readonly criticalPathMs?: number;
 	readonly expectedLatencyBenefitMs?: number;
+	/** Measured value unlocked in later actions; runtime allocates each opportunity over its unfinished prerequisites. */
+	readonly downstreamBenefits?: readonly { readonly opportunity: string; readonly expectedBenefitMs: number }[];
 	/** A model source's calibrated chance the Actor makes this call; without a benefit estimate it scales the work's value. */
 	readonly hitProbability?: number;
 	readonly adoptionProbability?: number;
@@ -203,12 +205,24 @@ export class SpeculationScheduler<Job extends object> {
 		return victims;
 	}
 
+	/** Query existing service value without inventing cold benefits or changing admission state. */
+	measuredBenefitMs(forecast: PredictionForecast): number | undefined {
+		// Explicit source value already includes its own path, match and adoption calibration.
+		if (forecast.expectedLatencyBenefitMs !== undefined) return finite(forecast.expectedLatencyBenefitMs);
+		const native = this.timingEstimate(this.nativeServiceTimes, forecast, 0.5)?.value;
+		const probability = (value: number | undefined) => value === undefined ? 1 : Math.min(1, finite(value));
+		return native === undefined ? undefined : native * probability(forecast.hitProbability) * probability(forecast.adoptionProbability);
+	}
+
 	evaluate(forecasts: readonly PredictionForecast[]): ScheduledWork {
 		// Predictions of the same action in the same Actor batch share one chance of use.
 		const opportunities = new Map<string, { benefitMs: number; reachMs: number }>();
+		const downstream = new Map<string, number>();
 		let remaining = forecasts.length;
 		const work = forecasts.reduce((work, forecast) => {
 			remaining--;
+			for (const benefit of forecast.downstreamBenefits ?? []) if (benefit.opportunity)
+				downstream.set(benefit.opportunity, Math.max(downstream.get(benefit.opportunity) ?? 0, finite(benefit.expectedBenefitMs)));
 			const expectedDurationMs = this.duration(forecast) ?? 1;
 			const criticalPathMs = Math.max(expectedDurationMs, finite(forecast.criticalPathMs));
 			const runwayMs = this.actorRunway(forecast);
@@ -245,6 +259,8 @@ export class SpeculationScheduler<Job extends object> {
 			for (const opportunity of opportunities.values()) missed *= 1 - opportunity.benefitMs / reachMs;
 			work.priorityMs = Math.max(work.priorityMs, (1 - missed) * reachMs);
 		}
+		// This is ranking value only: prerequisites keep their own duration, capacity and join comparison.
+		for (const value of downstream.values()) work.priorityMs += value;
 		// Missing slots leave the numerical forecast indeterminate.
 		if (remaining) work.expectedDurationMs = work.resourceUnits = work.decisionBatchesUntilCall = work.criticalPathMs = work.priorityMs = NaN;
 		return work;

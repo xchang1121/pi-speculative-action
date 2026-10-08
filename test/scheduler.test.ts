@@ -114,6 +114,45 @@ describe("SpeculationScheduler", () => {
 		expect(scheduler.evaluate([forecast({ ...base, hitProbability: 0.5 }), forecast({ ...base, hitProbability: 0.5, decisionBatchesUntilCall: 2 })]).priorityMs).toBe(75);
 	});
 
+	it("queries measured action and timing-class value without inventing cold benefits or discounting source benefits twice", () => {
+		const scheduler = new SpeculationScheduler<object>();
+		const identity = { tool: "bash", semanticsEpoch: "shell", executionFingerprint: "world", actionKeyHash: "test" };
+		const value = forecast({ ...identity, hitProbability: 0.5, adoptionProbability: 0.2 });
+		expect(scheduler.measuredBenefitMs(value)).toBeUndefined();
+		scheduler.observeActorService(identity, 1_200, 1_000);
+		expect(scheduler.measuredBenefitMs(value)).toBe(100);
+		expect(scheduler.measuredBenefitMs({ ...value, expectedLatencyBenefitMs: 700 })).toBe(700);
+		const other = { ...value, actionKeyHash: "other-test" };
+		expect(scheduler.measuredBenefitMs(other)).toBe(100);
+		scheduler.observeActorService(other, 2_000);
+		expect(scheduler.measuredBenefitMs(other)).toBe(200);
+		expect(scheduler.measuredBenefitMs(value)).toBe(100);
+		for (const scope of [{ tool: "read" }, { semanticsEpoch: "changed" }, { executionFingerprint: "changed" }, { operation: "other" }])
+			expect(scheduler.measuredBenefitMs({ ...value, ...scope })).toBeUndefined();
+		for (const probability of [-1, NaN, Infinity, 0])
+			expect(scheduler.measuredBenefitMs({ ...value, hitProbability: probability })).toBe(0);
+		expect(scheduler.measuredBenefitMs({ ...value, hitProbability: 3, adoptionProbability: undefined })).toBe(1_000);
+		expect(scheduler.snapshot()).toEqual([]);
+	});
+
+	it("adds distinct downstream opportunities once while preserving prerequisite service cost and capacity", () => {
+		const scheduler = new SpeculationScheduler<object>();
+		const base = forecast({ expectedDurationMs: 10, criticalPathMs: 10, resourceDemand: 2, hitProbability: 0.5 });
+		const without = scheduler.evaluate([base]);
+		const shared = { opportunity: "future-call", expectedBenefitMs: 5_000 };
+		const withWorkflow = scheduler.evaluate([
+			{ ...base, downstreamBenefits: [shared, shared, { opportunity: "later-call", expectedBenefitMs: 30 }] },
+			{ ...base, downstreamBenefits: [{ ...shared, expectedBenefitMs: 4_000 }, { opportunity: "invalid", expectedBenefitMs: NaN }] },
+		]);
+		expect(withWorkflow).toEqual({ ...without, priorityMs: 5_035 });
+		const short = {}, independent = {}, enriched = { ...base, downstreamBenefits: [shared] };
+		expect(scheduler.admit(short, [enriched], 1)).toMatchObject({ admitted: false, reason: "budget_exhausted" });
+		expect(scheduler.admit(short, [enriched], 3).admitted).toBe(true);
+		expect(scheduler.admit(independent, [forecast({ expectedDurationMs: 100 })], 3).admitted).toBe(true);
+		expect(scheduler.preemptFor(1, 3)).toEqual([independent]);
+		expect(scheduler.snapshot().find(entry => entry.job === short)?.work).toMatchObject({ expectedDurationMs: 10, resourceUnits: 2 });
+	});
+
 	it("does not count correlated forecasts as independent evidence or transfer their probabilities to longer work", () => {
 		const scheduler = new SpeculationScheduler<object>();
 		const base = { tool: "read", actionKeyHash: "query", expectedDurationMs: 100, hitProbability: 0.8 };

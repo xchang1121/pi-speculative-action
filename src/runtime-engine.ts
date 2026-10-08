@@ -1071,9 +1071,14 @@ export function makeSpeculativeActionRuntime<
 	const launchCandidateBatch = (session: Session, preferred?: Candidate): void => {
 		// The streamed tool name only orders queued work; free capacity still launches the rest.
 		const hinted = (candidate: Candidate) => Number(pendingActorTurn(session)?.actorToolHints.has(candidate.key.tool) === true);
+		const downstream = workflowBenefits(session);
+		for (const { job } of session.scheduler.snapshot()) {
+			const forecasts = forecastsForCandidate(session, job, downstream);
+			if (forecasts.length) session.scheduler.refresh(job, forecasts);
+		}
 		const queued = (preferred ? [preferred] : candidateStore.pending(session.id)).filter((candidate) => candidate.work.execution.status === "queued")
 			.flatMap((candidate) => {
-				const forecasts = forecastsForCandidate(session, candidate);
+				const forecasts = forecastsForCandidate(session, candidate, downstream);
 				if (!forecasts.length) { retireUndemandedCandidate(session, candidate, cause("retention", "prediction_horizon_settled")); return []; }
 				return [{ candidate, forecasts, work: session.scheduler.evaluate(forecasts) }];
 			})
@@ -2101,10 +2106,36 @@ export function makeSpeculativeActionRuntime<
 		return ([...parents].find((candidate) => [...parents].every((parent) => parent === candidate || descendsFrom(candidate, parent))) ?? null);
 	};
 
-	const forecastsForCandidate = (session: Session, candidate: Candidate): readonly PredictionForecast[] => {
+	/** Value already measured for later bound actions can prioritize the unfinished work that unlocks them.
+	 * This is a scheduling forecast only; no computation receipt or producer duration includes descendants. */
+	const workflowBenefits = (session: Session): ReadonlyMap<string, NonNullable<PredictionForecast["downstreamBenefits"]>> => {
+		const byPrerequisite = new Map<string, { opportunity: string; expectedBenefitMs: number }[]>();
+		const actorPhase = actorPhaseFor(session);
+		for (const { node, prerequisites } of session.plan.workflowFrontiers(node => {
+			const context = session.actionContexts.get(node.identity.id);
+			if (!node.actionKey || !context?.executionRoute || context.admissionSignal.aborted || node.action.operation?.available === false) return false;
+			// Temporary occupancy can clear before this descendant runs; a demand beyond total configured capacity cannot.
+			return positiveCount(node.action.resourceDemand ?? defaultResourceDemand(session, node.actionKey, context.executionRoute)) <= concurrentLimit(session.settings);
+		})) {
+			const measured = session.scheduler.measuredBenefitMs(forecastFor(node, session.decisionSequence, actorPhase));
+			if (!measured || !Number.isFinite(measured)) continue;
+			const opportunity = JSON.stringify([actionTimingIdentity(node.actionKey!), node.expectedDecisionSeq]);
+			const value = { opportunity, expectedBenefitMs: measured / prerequisites.length };
+			for (const prerequisite of prerequisites) {
+				const values = byPrerequisite.get(prerequisite.identity.id) ?? [];
+				values.push(value);
+				byPrerequisite.set(prerequisite.identity.id, values);
+			}
+		}
+		return byPrerequisite;
+	};
+
+	const forecastsForCandidate = (session: Session, candidate: Candidate,
+		downstream = workflowBenefits(session)): readonly PredictionForecast[] => {
 		const nodes = session.plan.consumers(candidate.id), actorPhase = actorPhaseFor(session);
 		const adoptionIdentity = adoptionTimingIdentity(candidate.key, candidate, "exact");
 		if (nodes.length) return nodes.map((node) => ({ ...forecastFor(node, session.decisionSequence, actorPhase),
+			downstreamBenefits: downstream.get(node.identity.id),
 			resourceDemand: node.action.resourceDemand ?? defaultResourceDemand(session, candidate.key, candidate.route),
 			...(node.actionKey?.hash === candidate.key.hash ? { adoptionIdentity } : {}) }));
 		if (!candidate.previews?.size && reservationAvailable(candidate.work.reservation)) return [];
