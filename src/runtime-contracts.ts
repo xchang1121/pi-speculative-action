@@ -192,6 +192,14 @@ export interface SpeculativePlanSource<
 	/** Runs for every pending action accepted from an update, including retained identities. Binding can still reject it. */
 	readonly onAdmitted?: (input: PlanActionFeedback) => MaybePromise<void>;
 	readonly onIssued?: (input: PlanActionFeedback) => MaybePromise<void>;
+	/** Once per started physical execution, charged only to its owner, including failures and cancellations.
+	 * Uses settled execution time (cancellation stops at the abort request, excluding later cleanup).
+	 * Queued work that never starts and other predictions sharing its execution incur no additional cost. */
+	readonly onExecutionSettled?: (input: {
+		readonly reuseFeedback: unknown;
+		readonly status: "succeeded" | "failed" | "cancelled";
+		readonly executionMs: number;
+	}) => MaybePromise<void>;
 	readonly onSettled?: (input: PlanActionFeedback & {
 		readonly settlement: PredictionSettlement;
 	}) => MaybePromise<void>;

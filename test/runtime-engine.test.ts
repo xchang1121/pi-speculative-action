@@ -178,12 +178,12 @@ function call(turnID: string, input: Record<string, unknown> = { path: "README.m
 
 describe("structural speculative runtime", () => {
 	it("preserves each mode's prediction attribution while charging one shared execution to its owner", async () => {
-		const materialized = vi.fn();
+		const materialized = vi.fn(), production = vi.fn(), ownerFeedback = {}, supporterFeedback = {};
 		const { runtime, events, ready, executions } = harness({ onCandidateMaterialized: materialized,
 			source: planSource({ propose: () => [
-				{ ...plan("owner"), actions: [readAction("next", { path: "README.md" }, { mode: "reported-files" })] },
-				{ ...plan("supporter"), actions: [readAction("next", { path: "README.md" }, { mode: "result-neighbors" })] },
-			] }),
+				{ ...plan("owner"), actions: [readAction("next", { path: "README.md" }, { mode: "reported-files", reuseFeedback: ownerFeedback })] },
+				{ ...plan("supporter"), actions: [readAction("next", { path: "README.md" }, { mode: "result-neighbors", reuseFeedback: supporterFeedback })] },
+			], onExecutionSettled: production }),
 		});
 		try {
 			await runtime.startTurn(start("turn"));
@@ -196,6 +196,8 @@ describe("structural speculative runtime", () => {
 			const actor = events.find(event => event.type === "actor_action")!;
 			const predictions = events.filter(event => event.type === "prediction");
 			expect(executions()).toBe(1);
+			expect(production).toHaveBeenCalledExactlyOnceWith({ reuseFeedback: ownerFeedback, status: "succeeded",
+				executionMs: completed.state.status === "succeeded" ? completed.state.executionMs : -1 });
 			expect(candidates).toHaveLength(2);
 			expect(new Set(candidates.map(event => event.candidate.mode))).toEqual(new Set(["reported-files"]));
 			expect(predictions.map(event => event.mode).sort()).toEqual(["reported-files", "result-neighbors"]);
@@ -208,6 +210,31 @@ describe("structural speculative runtime", () => {
 				reusedExecutionMs: actor.computation!.reusedExecutionMs });
 			expect(modes["result-neighbors"]).toEqual({ observed: 1, matched: 1, adopted: 1, started: 0, productionMs: 0, reusedExecutionMs: 0 });
 		} finally { await runtime.dispose(); }
+	});
+
+	it.each(["failed", "cancelled"] as const)("charges %s physical work with diagnostics disabled, without charging unstarted work", async status => {
+		const gate = gated(), production = vi.fn(), reuseFeedback = {}, skippedFeedback = {};
+		const { runtime, executions, events } = harness({ onEvent: false, settings: () => ({ ...settings, maxConcurrentActions: 1 }),
+			source: planSource({ propose: () => ({ ...plan("production"), actions: [
+				readAction("started", { path: "README.md" }, { reuseFeedback }),
+				...(status === "cancelled" ? [readAction("queued", { path: "other.md" }, { reuseFeedback: skippedFeedback })] : []),
+			] }), onExecutionSettled: production }),
+			execute: async (_tool, _input, signal) => {
+				if (signal.aborted) gate.release();
+				else signal.addEventListener("abort", gate.release, { once: true });
+				try { await gate.wait(); throw new Error("execution failed"); }
+				finally { signal.removeEventListener("abort", gate.release); }
+			},
+		});
+		try {
+			await runtime.startTurn(start("turn")); await gate.entered;
+			if (status === "failed") { gate.release(); await expect.poll(() => production.mock.calls.length).toBe(1); }
+			await runtime.finishTurn({ ...call("turn"), terminal: true });
+			await runtime.dispose(); // Terminal turns need not wait for execution cleanup; disposal must drain its feedback.
+			expect(production).toHaveBeenCalledExactlyOnceWith({ reuseFeedback, status, executionMs: expect.any(Number) });
+			expect(production.mock.calls[0]![0].executionMs).toBeGreaterThanOrEqual(0);
+			expect(executions()).toBe(1); expect(events).toEqual([]);
+		} finally { gate.release(); await runtime.dispose(); }
 	});
 
 	it("credits consumed operation receipts to their shared producer mode during native fallback", async () => {

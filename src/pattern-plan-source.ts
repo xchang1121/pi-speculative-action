@@ -8,6 +8,7 @@ import type { ExecutionOperationBinding } from "./execution-world.ts";
 import { agentBatchKey, type AgentPlanSource, type AgentStartInput } from "./agent-runtime-types.ts";
 import { acquirePatternAwareStore, PATTERN_AWARE_DEFAULTS, asPatternAwareRuntimeContext, type OutputLocation, type PatternAwareCandidate,
 	type PatternAwareEventInput, type PatternAwareRuntimeContext, type PatternAwareSettings, type PatternAwareStore, type PatternAwareStoreLease,
+	type PatternAwareReuseFeedback,
 	patternAwareActionSemantics, patternAwareAnalyzerKey, patternAwareRuntimeContext, patternAwareSettings, failureClass,
 	projectPatternAwareObservation } from "./pattern-aware.ts";
 import type { PlanAction } from "./plan-proposal.ts";
@@ -197,7 +198,7 @@ export function createPatternPlanSource({
 
 	/** Prepare a stale native launch against the Actor's edited files, without repeating its parent's earlier setup.
 	 * Captured-resource launches keep their parent ordering. Every result still requires current dependency evidence at adoption. */
-	const prepareRerun = async (state: CommandRerunState | undefined, schemaHashes: Readonly<Record<string, string>>, operationLimit: number): Promise<readonly [rerun: PlanAction[], apart: (action: PlanAction) => boolean]> => {
+	const prepareRerun = async (state: CommandRerunState | undefined, schemaHashes: Readonly<Record<string, string>>, patternSettings: PatternAwareSettings): Promise<readonly [rerun: PlanAction[], apart: (action: PlanAction) => boolean]> => {
 		if (!state || state !== commandRerun || !state.workspaceChanged && !state.observedChange && !state.retry && !state.issued) return NO_RERUN;
 		const retry = state.retry;
 		const observedOnly = !state.workspaceChanged && !retry && (state.observedChange === true || state.issued?.observedOnly === true);
@@ -213,7 +214,7 @@ export function createPatternPlanSource({
 		for (const command of commands) {
 			if (!state.native && command !== retry || command.schemaHash !== schemaHashes[command.tool]) continue;
 			const children = [...operationBindings.values()].filter(item => item.parentHash === command.parentHash && item.binding.available !== false && (!observedOnly || currentOperation(item.binding)))
-				.sort((left, right) => right.binding.executionMs - left.binding.executionMs).slice(0, observedOnly ? operationLimit : undefined);
+				.sort((left, right) => right.binding.executionMs - left.binding.executionMs).slice(0, observedOnly ? patternSettings.beamWidth : undefined);
 			const stale = (await Promise.all(children.map(async ({ binding }) => {
 				const changed = binding.executionMs > 0 ? await binding.stale?.() : false;
 				return (observedOnly ? changed === true : changed !== false) ? binding : undefined;
@@ -224,24 +225,27 @@ export function createPatternPlanSource({
 			const fallback = command === retry && command.failure && !children.some(({ binding }) => binding.executionMs > 0);
 			if (!stale.length && !fallback) continue;
 			const operation = stale.find(binding => binding.preparation === "current_workspace" && !binding.fed);
+			const store = await resolveStore(patternSettings);
+			if (state !== commandRerun) return NO_RERUN;
 			if (command === retry) state.retry = command;
 			const mode = command === retry ? "retry-failed-command" : "recent-command";
+			const expectedDurationMs = fallback ? command.failure!.durationMs : operation?.expectedDurationMs ?? Math.max(...children.map(({ binding }) => binding.expectedDurationMs));
+			const priorBenefitMs = fallback ? command.failure!.durationMs * 0.25 : operation?.executionMs ?? stale.reduce((total, binding) => total + binding.executionMs, 0);
 			const feedback = state.issued = { observedOnly, presetID: mode };
 			if (operation) rerunOperations.set(feedback, children.find(item => item.binding === operation)!);
 			return [[{ id: `rerun:${command.parentHash}`, type: operation ? "operation" : "tool_call", ...(operation ? { operation } : {}),
-				tool: command.tool, input: command.input, horizon: 0, producesOperations: true, mode, feedback,
+				tool: command.tool, input: command.input, horizon: 0, producesOperations: true, mode, feedback, reuseFeedback: store.presetReuseFeedback(mode),
 				...(fallback ? { empiricalProbability: 0.25, conditionalProbability: 0.25 } : {}),
-				expectedLatencyBenefitMs: fallback ? command.failure!.durationMs * 0.25 : operation?.executionMs ?? stale.reduce((total, binding) => total + binding.executionMs, 0),
-				expectedDurationMs: fallback ? command.failure!.durationMs : operation?.expectedDurationMs ?? Math.max(...children.map(({ binding }) => binding.expectedDurationMs)) }],
+				expectedLatencyBenefitMs: store.presetExpectedBenefit(mode, priorBenefitMs, expectedDurationMs), expectedDurationMs }],
 				action => (action.type !== "tool_call" || patternActionSemantics.actionKey(action.tool, asRecord(action.input) ?? {}, schemaHashes[action.tool])?.hash !== command.parentHash) &&
 					(operation ? action.operation?.identity !== operation.identity : !children.some(({ binding }) => binding.identity === action.operation?.identity && !binding.fed))];
 		}
 		return NO_RERUN;
 	};
-	const reruns = async (state: CommandRerunState | undefined, schemaHashes: Readonly<Record<string, string>>, operationLimit: number) => {
+	const reruns = async (state: CommandRerunState | undefined, schemaHashes: Readonly<Record<string, string>>, patternSettings: PatternAwareSettings) => {
 		if (!state || state !== commandRerun) return NO_RERUN;
 		// A closing observation may still be checking staleness. Its next decision must see the issued result, not the cleared trigger.
-		const preparing = (state.preparing ?? Promise.resolve()).catch(() => {}).then(() => prepareRerun(state, schemaHashes, operationLimit));
+		const preparing = (state.preparing ?? Promise.resolve()).catch(() => {}).then(() => prepareRerun(state, schemaHashes, patternSettings));
 		state.preparing = preparing;
 		try { return await preparing; } finally { if (state.preparing === preparing) state.preparing = undefined; }
 	};
@@ -262,7 +266,7 @@ export function createPatternPlanSource({
 			const signature = patternPredictionSignature(candidates);
 			await rerunState?.changes;
 			if (signal.aborted) return undefined;
-			const carried = carriedPredictions.get(startInput.sessionID), prepared = await reruns(rerunState, data.schemaHashes, patternSettings.beamWidth);
+			const carried = carriedPredictions.get(startInput.sessionID), prepared = await reruns(rerunState, data.schemaHashes, patternSettings);
 			if (signal.aborted) return undefined;
 			const [rerun, apart] = rerunState === commandRerun ? prepared : NO_RERUN;
 			carriedPredictions.delete(startInput.sessionID);
@@ -357,7 +361,7 @@ export function createPatternPlanSource({
 			authoritativeBatches.set(key, batch);
 			await observeWorkspace(rerunState);
 			// A closing turn drops these updates and the next turn predicts afresh (a rerun then goes with it): never hold turn closure for them.
-			let [rerun, apart] = signal?.aborted ? NO_RERUN : await reruns(rerunState, data.schemaHashes, patternSettings.beamWidth);
+			let [rerun, apart] = signal?.aborted ? NO_RERUN : await reruns(rerunState, data.schemaHashes, patternSettings);
 			if (rerunState !== commandRerun) [rerun, apart] = NO_RERUN;
 			if (!patternSettings.multiStepEnabled && !rerun.length || signal?.aborted) return undefined;
 			let actions = rerun;
@@ -394,6 +398,13 @@ export function createPatternPlanSource({
 			if (!context || context.operation && issuedParents.has(context.continuation)) return;
 			issuedParents.add(context.continuation);
 			for (const support of [context.continuation, ...context.patternIDs]) context.store.issued(support);
+		},
+		onExecutionSettled: ({ reuseFeedback, executionMs }) => {
+			const utility = asPatternUtilityFeedback(reuseFeedback)?.utility;
+			if (!utility || !Number.isFinite(executionMs) || executionMs < 0) return;
+			// Runtime calls this once for the physical owner, including failed/cancelled runs, not for each prediction sharing it.
+			utility.productions++;
+			utility.productionMs += executionMs;
 		},
 		onSettled: ({ feedback, settlement }) => {
 			if (lifecycle.sealed) return;
@@ -444,8 +455,13 @@ export function createPatternPlanSource({
 		turnStarted: observeTurn,
 		turnFinished: observeTurn,
 		// Serving the Actor is recorded before the owning prediction settles, which credits it even when unmatched.
-		actorActionSettled: ({ settlement, candidateFeedback: feedback }) => {
+		actorActionSettled: ({ settlement, candidateFeedback: feedback, reusedComputations }) => {
 			if (settlement.provider.kind === "speculative" && asPatternPlanFeedback(feedback)) served.add(feedback as PatternPlanFeedback);
+			for (const share of reusedComputations ?? []) {
+				const utility = share.source === "pattern_aware" ? asPatternUtilityFeedback(share.feedback)?.utility : undefined;
+				if (utility && Number.isFinite(share.reusedExecutionMs) && share.reusedExecutionMs > 0)
+					utility.reusedExecutionMs += share.reusedExecutionMs;
+			}
 		},
 		finishSession: () => lifecycle.run(async () => {
 			await lifecycle.drain();
@@ -506,6 +522,13 @@ function asPatternPlanFeedback(value: unknown): PatternPlanFeedback | undefined 
 	return value as PatternPlanFeedback;
 }
 
+function asPatternUtilityFeedback(value: unknown): PatternAwareReuseFeedback | undefined {
+	const feedback = asRecord(value), utility = asRecord(feedback?.utility);
+	return feedback?.kind === "pattern_utility" && utility && ["productions", "productionMs", "reusedExecutionMs"]
+		.every(key => typeof utility[key] === "number" && Number.isFinite(utility[key]) && utility[key] >= 0)
+		? value as PatternAwareReuseFeedback : undefined;
+}
+
 function patternPlanAction(
 	candidate: PatternAwareCandidate,
 	store: PatternAwareStore,
@@ -517,6 +540,7 @@ function patternPlanAction(
 		type: "tool_call",
 		tool: candidate.tool,
 		...(candidate.presetID ? { mode: candidate.presetID } : {}),
+		...(candidate.presetID ? { reuseFeedback: store.presetReuseFeedback(candidate.presetID) } : {}),
 		input: widenReadGuess(candidate.tool, candidate.input),
 		horizon: candidate.horizon,
 		latestHorizon: candidate.latestHorizon,

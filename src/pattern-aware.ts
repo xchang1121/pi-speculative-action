@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { type ActionKey, type ActionKeyProjector, type ActionSemanticsRegistry, actionKeyCovers, ownActionKeyProjector, widenReadGuess } from "./action-semantics.ts";
 import { BoundedRecencyMap } from "./bounded-recency-map.ts";
+import { DEFAULT_BENEFIT_GATE_POLICY } from "./fork-benefit-gate.ts";
 import { patternSessionBudgets, type PatternPendingValidation, type PatternRecurrentAction, type PatternSessionState } from "./pattern-session-state.ts";
 import { containsLogicalPath, relativeFilesystemPath } from "./path-utils.ts";
 import { PpmCountTrie, type PpmCountTrieRow } from "./ppm-count-trie.ts";
@@ -193,7 +194,17 @@ type PatternFeedbackCounters = Record<typeof PATTERN_FEEDBACK_COUNTERS[number], 
 type MutablePatternFeedback = PatternFeedbackCounters & {
 	rejectedAfterMatch: Partial<Record<ResolutionStage, number>>;
 	unobserved: Record<string, number>;
+	utility?: PatternComputationUtility;
 };
+
+/** Retained computations keep only these counters, never a store, continuation or observed tool data. */
+interface PatternComputationUtility { productions: number; productionMs: number; reusedExecutionMs: number; }
+export interface PatternAwareReuseFeedback {
+	readonly kind: "pattern_utility";
+	readonly utility: PatternComputationUtility;
+}
+
+const STRUCTURAL_PRIOR_WEIGHT = 4;
 
 type PersistedPatternSample = { readonly context: ReadonlyArray<number>; readonly target: number; readonly gap: number; };
 
@@ -298,7 +309,7 @@ export class PatternAwareStore {
 	private readonly sessionBudgets: ReturnType<typeof patternSessionBudgets>;
 	private readonly observedActionKeys = new WeakMap<PatternAwareEvent, ActionKey | null>();
 	private readonly recurrentFeedback = new WeakMap<PatternRecurrentAction | PatternAwareContinuation, MutablePatternFeedback>();
-	private readonly structuralFeedback = new Map<string, MutablePatternFeedback>();
+	private readonly structuralFeedback = new Map<PatternAwarePresetID, MutablePatternFeedback>();
 	private readonly resolvedActionKeys: BoundedRecencyMap<string, ActionKey | null>;
 	private readonly patternSupportSessions = new Map<string, ReadonlySet<string>>();
 	private trie = new PredictiveContextTrie();
@@ -671,7 +682,7 @@ export class PatternAwareStore {
 
 	/**
 	 * Built-in relations use observed inputs and results before a pattern is learned. Each selected relation keeps its own rate,
-	 * starting from a prior and updated only by observed prediction outcomes.
+	 * starting from a prior; observed prediction outcomes and physically consumed work update separate evidence.
 	 */
 	private structuralPredictions(
 		history: ReadonlyArray<PatternAwareEvent>,
@@ -689,9 +700,8 @@ export class PatternAwareStore {
 			const key = this.resolveActionKey(tool, input, schemaHashes[tool])?.key;
 			if (!key || seen.has(key)) return [];
 			seen.add(key);
-			let feedback = this.structuralFeedback.get(kind);
-			if (!feedback) this.structuralFeedback.set(kind, feedback = emptyPatternFeedback(this.clock));
-			const evidence = feedbackEvidence({ feedback }, this.clock, settings.decayHalfLifeEvents), weight = 4;
+			const feedback = this.presetFeedback(presetID);
+			const evidence = feedbackEvidence({ feedback }, this.clock, settings.decayHalfLifeEvents), weight = STRUCTURAL_PRIOR_WEIGHT;
 			const conditionalProbability = clampProbability((prior * weight + evidence.matched) / (weight + evidence.matched + evidence.mismatched));
 			const empiricalProbability = clampProbability(continuation.pathProbability * conditionalProbability);
 			const adoptionProbability = patternAdoptionProbability([{ feedback }], this.clock, settings.decayHalfLifeEvents);
@@ -702,9 +712,33 @@ export class PatternAwareStore {
 				type: "tool_call" as const, tool, input, patternID, presetID, supportingPatternIDs: [] as string[],
 				dependencies: [] as PatternAwareDependency[], horizon: 0, latestHorizon: 0,
 				conditionalProbability, empiricalProbability, adoptionProbability, expectedDurationMs: durationMs,
-				expectedLatencyBenefitMs: empiricalProbability * adoptionProbability * Math.max(1, durationMs),
+				expectedLatencyBenefitMs: this.presetExpectedBenefit(presetID, empiricalProbability * adoptionProbability * Math.max(1, durationMs), durationMs),
 			}];
 		});
+	}
+
+	presetReuseFeedback(presetID: PatternAwarePresetID): PatternAwareReuseFeedback {
+		const feedback = this.presetFeedback(presetID);
+		return Object.freeze({ kind: "pattern_utility", utility: feedback.utility ??=
+			{ productions: 0, productionMs: 0, reusedExecutionMs: 0 } });
+	}
+
+	/** Gross reuse changes scheduling value, never the reported E/R or match/adoption probabilities. */
+	presetExpectedBenefit(presetID: PatternAwarePresetID, priorBenefitMs: number, durationMs: number): number {
+		const utility = this.structuralFeedback.get(presetID)?.utility;
+		if (!utility?.productions) return priorBenefitMs;
+		const duration = Math.max(1, nonNegativeFinite(durationMs)), prior = nonNegativeFinite(priorBenefitMs);
+		// Four representative executions regularize cold evidence. Repeated consumption may validly return more than production cost.
+		const measured = duration * (STRUCTURAL_PRIOR_WEIGHT * prior + utility.reusedExecutionMs) /
+			(STRUCTURAL_PRIOR_WEIGHT * duration + utility.productionMs);
+		// Keep the existing probe allowance as a positive ranking floor; this does not bypass admission or enable a disabled preset.
+		return Math.max(prior / DEFAULT_BENEFIT_GATE_POLICY.probeInterval, measured);
+	}
+
+	private presetFeedback(presetID: PatternAwarePresetID): MutablePatternFeedback {
+		let feedback = this.structuralFeedback.get(presetID);
+		if (!feedback) this.structuralFeedback.set(presetID, feedback = emptyPatternFeedback(this.clock));
+		return feedback;
 	}
 
 	/** Use a persisted pattern ID or the original candidate continuation for session backoff feedback. */

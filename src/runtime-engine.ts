@@ -1236,7 +1236,15 @@ export function makeSpeculativeActionRuntime<
 			}
 			removeCandidate(session.id, candidate);
 			if (settled) queueCandidateEvent(session, candidate);
-		} finally { clearTimeout(candidate.salvaging); inputs?.dispose(); session.scheduler.complete(candidate); dispatchReady(session); }
+		} finally {
+			const execution = candidate.work.execution, draft = candidate.owner.draft;
+			const source = candidate.origin === "prediction" ? sourcesByID.get(draft.source ?? "cache") : undefined;
+			if (source?.onExecutionSettled && execution.status !== "queued" && execution.status !== "running") {
+				const feedback = { reuseFeedback: draft.reuseFeedback, status: execution.status, executionMs: execution.executionMs };
+				session.effects.enqueue(() => source.onExecutionSettled?.(feedback));
+			}
+			clearTimeout(candidate.salvaging); inputs?.dispose(); session.scheduler.complete(candidate); dispatchReady(session);
+		}
 	};
 
 	const previewActorTool = async (
