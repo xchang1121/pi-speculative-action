@@ -11,6 +11,30 @@ const OTHER_SCOPE = { sessionID: "session", turnID: "other" };
 const livePlan = async (live?: readonly ProcessProvenanceCertificate[]) => live?.[0] && { certificate: live[0] };
 
 describe("ProcessHandoffRegistry", () => {
+	it("bounds retired preparation with its measured launch and preserves new contexts and result acquisition", async () => {
+		const registry = new ProcessHandoffRegistry<unknown>(8, 4096), key = digest("measured"), invocation = { argv: ["worker"], environment: { MODE: "before" } };
+		const observed = registry.observe(key, "/bin/worker", SCOPE, invocation, 6000)!;
+		registry.retirePreparation({ ...observed });
+		expect(observed.available).toBe(true); // A copied descriptor cannot change the owner.
+		registry.retirePreparation(observed);
+		expect(registry.resolveBinding(observed, SCOPE)).toBeUndefined();
+		expect(registry.observe(key, "/bin/worker", OTHER_SCOPE, invocation, 7000)).toBe(observed);
+		expect(observed).toMatchObject({ executionMs: 7000, available: false });
+		for (const context of [{ ...invocation, argv: ["worker", "new-input"] }, { ...invocation, environment: { MODE: "after" } },
+			{ ...invocation, descriptors: [{ fd: 3, identity: "new-ofd" }] }]) {
+			expect(registry.observe(key, "/bin/worker", SCOPE, context, 10)).toMatchObject({ available: true });
+		}
+		const fixture = await producer(false, registry);
+		await fixture.publish();
+		const resultBinding = registry.bind(fixture.key, fixture.work, invocation)!;
+		registry.retirePreparation(resultBinding);
+		await expect(fixture.actor()).resolves.toMatchObject({ kind: "hit" });
+		registry.clearCompleted();
+		expect(registry.observe(key, "/bin/worker", SCOPE, invocation, 6000)).toMatchObject({ available: true });
+		registry.dispose();
+		expect(observed.available).toBe(false);
+	});
+
 	it("publishes the original calculation graph once, excluding nested replay overhead", async () => {
 		const fixture = await producer();
 		const overhead = new TimelineInterval(20, 40), input = new TimelineInterval(200, 250);

@@ -1633,6 +1633,40 @@ describe("speculative action host", () => {
 		} finally { failure.release(); await host.dispose(); }
 	});
 
+	it("does not reprepare a retired native operation after repeated edits or identical observations", async () => {
+		const cwd = await temporaryWorkspace(), tool = createReadTool(cwd), build = { command: "measured-build" };
+		const patternAware = patternAwareSettings({ presets: ["recent-command"], multiStepEnabled: false });
+		const store = new PatternAwareStore(patternAware, undefined, patternAwareActionSemantics(PI_ACTION_SEMANTICS, cwd));
+		const controller = createPatternPlanSource({ sessionID: "session", cwd, store, actionSemantics: PI_ACTION_SEMANTICS, projectionRules: [] });
+		const request = planRequest(tool, patternAware, "session", { bash: "schema", write: "schema" });
+		let available = true;
+		const operation: ExecutionOperationBinding = { backend: "test", identity: "measured-context", executionMs: 6000, expectedDurationMs: 7000,
+			permissionHash: PI_ACTION_SEMANTICS.buildKey("bash", build, cwd, "schema")!.hash, preparation: "current_workspace",
+			get available() { return available; }, stale: async () => true };
+		const observe = (name: string, concrete: Record<string, unknown>, operations?: readonly ExecutionOperationBinding[]) => controller.source.observe!({ ...request,
+			action: PI_ACTION_SEMANTICS.buildKey(name, concrete, cwd, "schema")!, consumeInput: { sessionID: "session", turnID: request.startInput.turnID, tool: name, args: concrete, tools: [tool] },
+			tool: name, concrete, output: { result: textResult("done"), isError: false }, durationMs: 20, order: 0, operations });
+		try {
+			await observe("bash", build, [operation]);
+			const first = await observe("write", { path: "input.txt", content: "changed" });
+			if (!first || !("actions" in first)) throw new Error("missing initial native preparation");
+			const action = first.actions[0]!;
+			expect(action.operation).toBe(operation);
+			const feedback = { proposalID: first.id, actionID: action.id, feedback: action.feedback };
+			await controller.source.onAdmitted!(feedback);
+			available = false; // The backend's completed sealed evidence could not support any reuse.
+			await controller.source.onSettled!({ ...feedback, settlement: { prediction: { id: "prepared", source: "pattern_aware", proposalID: first.id, actionID: action.id },
+				observation: "unobserved", cause: { stage: "execution", code: "candidate_failed", detail: "bound process preparation produced no reusable result" } } });
+			for (let edit = 0; edit < 5; edit++) {
+				expect(await observe("bash", build, [operation])).toBeUndefined();
+				expect(await observe("write", { path: "input.txt", content: `edit-${edit}` })).toBeUndefined();
+			}
+			const changed = { ...operation, identity: "changed-launch-context", available: true };
+			await observe("bash", build, [changed]);
+			expect(await observe("write", { path: "input.txt", content: "new context" })).toMatchObject({ actions: [{ operation: changed }] });
+		} finally { await controller.dispose(); }
+	});
+
 	it("prepares bounded measured native work after observed Bash writes, without rerunning unchanged or consumed work", async () => {
 		const cwd = await temporaryWorkspace(), tool = createReadTool(cwd), build = { command: "opaque-build" };
 		const patternAware = patternAwareSettings({ presets: ["recent-command"], beamWidth: 2, multiStepEnabled: false });

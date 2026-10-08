@@ -107,7 +107,7 @@ type AcquireOptions<Plan> = {
 /** Owns process evidence selection and the scope of one-shot transfers. */
 export class ProcessHandoffRegistry<Invocation = never> {
 	private readonly byKey = new Map<Sha256Digest, Map<ProcessHandoff, HandoffRecord>>();
-	private readonly invocations = new WeakMap<ProcessExecutionBinding, { readonly value: Invocation; readonly bytes: number; executionMs: number }>();
+	private readonly invocations = new WeakMap<ProcessExecutionBinding, { readonly value: Invocation; readonly bytes: number; executionMs: number; preparationRetired?: true }>();
 	private maxCompleted: number;
 	private maxRetainedBytes: number;
 	private retainedBytes = 0;
@@ -159,7 +159,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		const owner = new WeakRef(this.invocations);
 		const binding = Object.freeze({ key, scope: record.scope,
 			get executionMs(): number { return owner.deref()?.get(this)?.executionMs ?? 0; },
-			get available(): boolean { return owner.deref()?.has(this) ?? false; } });
+			get available(): boolean { const invocation = owner.deref()?.get(this); return !!invocation && !invocation.preparationRetired; } });
 		this.invocations.set(binding, { value, bytes, executionMs });
 		record.binding = binding;
 		this.retainedBytes += bytes;
@@ -179,7 +179,14 @@ export class ProcessHandoffRegistry<Invocation = never> {
 
 	/** Copying a digest/descriptor cannot mint a capability. Revocation affects subsequent admissions. */
 	resolveBinding(binding: ProcessExecutionBinding, scope: ExecutionScope | undefined): Invocation | undefined {
-		return scope?.sessionID === binding.scope.sessionID ? this.invocations.get(binding)?.value : undefined;
+		return binding.available && scope?.sessionID === binding.scope.sessionID ? this.invocations.get(binding)?.value : undefined;
+	}
+
+	/** Keep a failed preparation with its bounded measured launch: another observation of that same launch does not prove reuse.
+	 * Different launch context and normal owner eviction can introduce a new capability; result acquisition is unchanged. */
+	retirePreparation(binding: ProcessExecutionBinding): void {
+		const invocation = this.invocations.get(binding);
+		if (invocation) invocation.preparationRetired = true;
 	}
 
 	/** Conservative availability hint; scope, ownership and evidence still decide acquisition. */

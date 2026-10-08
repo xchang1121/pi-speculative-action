@@ -15,7 +15,7 @@ import { finished } from "node:stream/promises";
 import { errorMessage, isMissing as missing } from "./error-utils.ts";
 import { stableEqual } from "./stable-json.ts";
 import { TimelineInterval, type TimelineDependency } from "./task-timing.ts";
-import { createExecPrototype, digestObject, dynamicDependencyIdentity, type DynamicDependency, type DynamicDependencyCertificate, type ExecPrototype,
+import { certificateReplayable, createExecPrototype, digestObject, dynamicDependencyIdentity, type DynamicDependency, type DynamicDependencyCertificate, type ExecPrototype,
 	type ExitOutcome, filesystemObservationDigest, ONE_SHOT_TAINTS, type OrderedEffectEvent, type OFDPosition, type ProcessProducerProof,
 	type ProcessProvenanceCertificate, type ProcessResultRecord, processWeakKey, type ProvenanceTaint, sealProcessCertificate, sha256Digest,
 	type Sha256Digest, type WorkspaceEffectState } from "./provenance-certificate.ts";
@@ -176,6 +176,8 @@ interface DispatcherResponse {
 	readonly exit?: ExitOutcome;
 	readonly weakKey?: Sha256Digest;
 	readonly streams?: readonly StreamSettlement[];
+	/** Present only after a sealed result was registered; independent of optional disk publication. */
+	readonly reusable?: boolean;
 }
 
 /** A brokered run writing into a session's workspace: its launcher's pid and, once known, what it and the runs brokered from its tree wrote. */
@@ -187,6 +189,8 @@ interface SessionWriter {
 interface ActiveSession {
 	readonly token: string;
 	readonly ownership: ProcessHandoffOwnership;
+	/** Completed reusable children and retained live frontiers produced by this preparation. */
+	preparedResults: number;
 	readonly sourceRoot: string;
 	/** The workspace's own repository, shown read-only in place of the snapshot's: git reads what the Actor's git reads. */
 	readonly gitDirectory?: string;
@@ -532,6 +536,7 @@ export class LinuxProcessReuseBackend {
 			signal: AbortSignal.any([controller.signal, ...(input.signal ? [input.signal] : [])]),
 			pending: new Set<Promise<unknown>>(),
 			ownership: new ProcessHandoffOwnership(input.onOperationAdopted, input.acceptOperationScope),
+			preparedResults: 0,
 			nestedEvidence: [], foldedObservations: [], resumed: new Set(),
 			executionBindings: new Map(),
 			computations: [],
@@ -906,10 +911,20 @@ export class LinuxProcessReuseBackend {
 		})
 			.catch(error => { recordProcessReplayOverhead(session, prototypeStartedAt); throw error; });
 		const { prototype, before } = captured.output, preparation = new TimelineInterval(prototypeStartedAt, performance.now(), captured.dependencies);
+		const requestsBefore = session.metrics.requests;
 		this.add(session, "requests");
 		const observation = { complete: true, paths: [], taints: [], tracedProcesses: 0, incompleteReasons: [] };
 		const result = await this.executeRequest(session, request, executable, invocation.outputRoute, session.metrics.requests, prototype,
 			capture => { session.topLevelCapture = { ...capture, observation }; }, undefined, preparation);
+		session.signal.throwIfAborted();
+		if (!invocation.producer && !invocation.resources && session.metrics.requests === requestsBefore + 1 &&
+			result.kind === "executed" && result.reusable === false && session.preparedResults === 0) {
+			// Only a standalone current-workspace launch is known to have produced nothing preparable here.
+			// Captured inputs, producer bindings and child seeds can prepare a later frontier without replaying this completed result.
+			// Keep this negative with its bounded launch owner; an arbitrary workspace edit does not prove it can now replay.
+			this.handoffs.retirePreparation(binding);
+			throw new Error("bound process preparation produced no reusable result");
+		}
 		// Only it and what it launched ran here: when its own transaction could not seal (what it launched overlapped it), the session's
 		// endpoints stand for its interval, and what it observed joins its launches' evidence.
 		if (result.kind !== "suspended") session.topLevelCapture ??= { before, after: await session.workspace.structure.capture(), observation };
@@ -1251,7 +1266,7 @@ export class LinuxProcessReuseBackend {
 		const transaction = await session.workspace.transactions.begin();
 		let traceRoot: string | undefined;
 		let descriptors: ReturnType<typeof createProcessDescriptorCapture> | undefined;
-		let outcome: SpawnOutcome | undefined;
+		let outcome: SpawnOutcome | undefined, reusable: boolean | undefined;
 		let transactionFinishing = false;
 		let releaseInputs: (() => void) | undefined, inputCheck: Promise<boolean> | undefined;
 		let stage = "capture", dependencyCertificate: DynamicDependencyCertificate | undefined, certificateID: Sha256Digest | undefined, unattributed: StraceObservation | undefined;
@@ -1535,6 +1550,7 @@ export class LinuxProcessReuseBackend {
 				)) {
 					this.add(session, "published");
 				}
+				reusable = this.recordPreparedResult(session, certificate);
 			} catch (error) {
 				// The process already ran. Certificate failure must never cause dispatcher fallback/re-execution.
 				const detail = failureDetail(error);
@@ -1550,7 +1566,8 @@ export class LinuxProcessReuseBackend {
 				this.setError(session, "stream_settlement_unrepresentable");
 				return { kind: "executed", weakKey, output: [], exit: { kind: "code", code: 125 } };
 			}
-			return { kind: "executed", weakKey, output: wireOutput(outcome.output), exit, ...(streams?.length ? { streams } : {}) };
+			return { kind: "executed", weakKey, output: wireOutput(outcome.output), exit, ...(streams?.length ? { streams } : {}),
+				...(reusable !== undefined ? { reusable } : {}) };
 		} catch (error) {
 			if (stage !== "capture" || captureWorkspace || session.signal.aborted || work.signal.aborted) throw error;
 			const detail = failureDetail(error);
@@ -1573,6 +1590,14 @@ export class LinuxProcessReuseBackend {
 			}
 			if (traceRoot) await rm(traceRoot, { recursive: true, force: true }).catch(() => undefined);
 		}
+	}
+
+	private recordPreparedResult(session: ActiveSession, certificate: ProcessProvenanceCertificate): boolean {
+		// A live one-shot result need not be publishable on disk. A retained continuation still owns its frontier;
+		// preparation feedback cannot replace the native contract and dependency checks at its eventual adoption.
+		const reusable = !!certificate.result.continuation || certificateReplayable(certificate, [...TRANSFERRED_INPUT_TAINTS, ...SAME_CONFINEMENT_TAINTS]);
+		if (reusable) session.preparedResults++;
+		return reusable;
 	}
 
 	private add(session: ActiveSession, metric: CountedReuseMetric, value = 1): void {
