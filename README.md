@@ -153,6 +153,8 @@ tt pi-speculative-action
 
 根入口只提供 Pi Host API；程序接入按需使用 `./core`、`./process-reuse`、`./pattern-aware`、`./extension` 等窄入口。自定义执行环境通过 Host 的 `executionWorlds` 注册，并由所属会话调用 `host.dispose()`；自定义工具未经明确绑定不会自动获得投机资格。
 
+各后端共用 `ExecutionWorld → WorldBranch → EffectTransaction`：Host 负责路由、Actor 回退与轮次生命周期，事务层负责采纳状态，`RuntimeLifecycleLane` 负责并发任务追踪、验证排队和关闭排空。后端按能力提供隔离执行、输入证明及效果提交；思程 Profile 只注册执行环境，无需单独包装 Host。可选的 `actorFallbackSettled()` 在 Actor 实际执行可能修改状态的动作后、后继动作启动前失效准备状态，`finishTurn(turnID)` 释放轮次准备；已封存分支保留各自的所有权。Windows 与 Linux/WSL 共用文件操作与工作区事务，Linux 进程证明和思程快照 API 保留各自的驱动实现。
+
 直接使用核心 Runtime 时，以 `disposeSession(sessionID)` 清理单个会话，以 `dispose()` 清理全部会话。
 
 计时使用 `TaskTimeline` 汇总每次已结算 Actor 调用实际消费的计算凭据，区间保留所属的单调时钟标识，避免进程重启后的坐标碰撞。Runtime 回退通过 `prepared.settle(toolExecution, output)` 结算；准备工作、子计算及其复用关系由已记录的 `TimelineInterval` 关联。

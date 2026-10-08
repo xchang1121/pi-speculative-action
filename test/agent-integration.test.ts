@@ -11,7 +11,6 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, type AssistantMessage, type Context, type SimpleStreamOptions, type ThinkingLevel } from "@earendil-works/pi-ai";
 import { createBashTool, createEditTool, createFindTool, createGrepTool, createLsTool, createReadTool, createWriteTool } from "@earendil-works/pi-coding-agent";
 import { createThinkThreadExecutionWorld } from "../src/thinkthread/execution-world.ts";
-import { withThinkThreadProfileLifecycle } from "../src/thinkthread/profile-extension.ts";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActionSemanticsRegistry, buildPiActionKey, KEYABLE_TOOLS, PI_ACTION_SEMANTICS, widenReadGuess } from "../src/action-semantics.ts";
@@ -1235,7 +1234,7 @@ describe("speculative action host", () => {
 		const clientFactory = vi.fn(() => { throw new Error("Actor observation must not initialize the SDK"); });
 		const world = createThinkThreadExecutionWorld({ clientFactory, runnerFingerprint: "test" });
 		let unstable = false;
-		const base = createSpeculativeActionHost("session", {
+		const host = createSpeculativeActionHost("session", {
 			cwd, getSettings: () => ({ enabled: true, drafterEnabled: false, tools, patternAware: { enabled: false } }),
 			complete: async () => { throw new Error("No model calls expected"); }, preflight: () => !unstable,
 			resolveInvocation: (name, input) => resolvePiToolInvocation(name, input, { cwd, environment: {} }),
@@ -1244,7 +1243,6 @@ describe("speculative action host", () => {
 				createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: ["read"], maxBytes: () => 4096 }),
 			],
 		});
-		const host = thinkthread ? withThinkThreadProfileLifecycle(base, world) : base;
 		let args = { path: "@notes.txt", offset: 1 };
 		const actor = vi.fn(async () => {
 			if (unstable) await writeFile(file, "B\nsecond");

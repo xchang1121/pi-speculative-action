@@ -86,6 +86,13 @@ export class TimelineInterval {
 		collecting.getStore()?.inputs?.set(computation, { overhead: true, ...(computeUncertain ? { computeUncertain: true } : {}) });
 	}
 
+	/** The same accounting boundary for validation, adoption and cleanup in every backend. */
+	static async overhead<T>(execute: () => T | Promise<T>): Promise<T> {
+		const startedAt = performance.now();
+		try { return await execute(); }
+		finally { TimelineInterval.exclude(new TimelineInterval(startedAt, performance.now())); }
+	}
+
 	/** Diagnostic provenance belongs to the physical producer; later consumers cannot replace it. */
 	static producedBy(computation: TimelineInterval, producer: ComputationProducer): void {
 		if (producers.has(computation)) return;

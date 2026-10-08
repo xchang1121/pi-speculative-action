@@ -32,6 +32,12 @@ export class RuntimeLifecycleLane {
 		return this.track(Promise.resolve().then(operation));
 	}
 
+	/** Fresh proofs run in order; closing waits for proofs already admitted to this lane. */
+	serialize<Value>(operation: () => Value | Promise<Value>): Promise<Value> {
+		if (this.sealed) return Promise.reject(new Error("execution lifetime is closed"));
+		return this.track(this.enqueue(operation));
+	}
+
 	track<Value>(task: Promise<Value>): Promise<Value> {
 		if (this.work.has(task)) return task;
 		this.work.add(task);
@@ -55,9 +61,9 @@ export class RuntimeLifecycleLane {
 		while (this.work.size) await Promise.allSettled(this.work);
 	}
 
-	private enqueue(operation: () => void | Promise<void>): Promise<void> {
+	private enqueue<Value>(operation: () => Value | Promise<Value>): Promise<Value> {
 		const task = this.tail.then(operation, operation);
-		this.tail = task.catch(() => {
+		this.tail = task.then(() => {}, () => {
 			// A failed lifecycle callback is visible to its caller but cannot poison later cleanup.
 		});
 		return task;
