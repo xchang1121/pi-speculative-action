@@ -12,7 +12,7 @@ import os from "node:os";
 import path from "node:path";
 import { createBashTool, createLocalBashOperations, createReadTool, createGrepTool, createLsTool, createFindTool, createWriteTool } from "@earendil-works/pi-coding-agent";
 import { describe, expect, test, vi } from "vitest";
-import { buildPiActionKey, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
+import { buildActionKey, buildPiActionKey, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { linuxOverlayfsCapability } from "../src/linux-overlayfs.ts";
 import { inspectHeldExecProcess, LinuxHeldExecBoundary, type HeldExecProcess } from "../src/linux-held-exec.ts";
 import { effectCommitFailure } from "../src/effect-transaction.ts";
@@ -1820,6 +1820,41 @@ int main(int argc, char **argv) { if (argc == 2) { int flags = fcntl(1, F_GETFL)
 					if (label === "replayed") { await child.commit(); expect(await host("g")).toBe("g\n"); }
 				} finally { await child.dispose?.(); }
 			}
+			// An independently prepared native operation has the same external-write baseline as a whole tool.
+			const args = { command: `/bin/sh -c 'printf "bound\\n" > "$1"' sh ${outside}/kept` };
+			const invocation = resolvePiToolInvocation("bash", args, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath })!;
+			const permission = PI_ACTION_SEMANTICS.buildKey("bash", args, fixture.workspace, "private-bound", { fingerprint: executionFingerprint, context: invocation })!;
+			const scope = { sessionID: "private-bound", turnID: "native" }, route = await fixture.prepareActorReplay();
+			let operation: ExecutionOperationBinding | undefined;
+			await fixture.world.observeOperations!({ action: permission, scope, learn: true }, () => route.executor.execute({
+				command: args.command, cwd: fixture.workspace, environment: fixture.environment, scope, onData: () => {},
+			}), bindings => { operation = bindings.at(-1); });
+			expect(await host("kept")).toBe("bound\n");
+			expect(operation).toMatchObject({ preparation: "current_workspace", permissionHash: permission.hash });
+			await writeFile(path.join(outside, "kept"), "old\n");
+			const definition = PI_ACTION_SEMANTICS.definition(permission)!, epoch = `${definition.epoch}:operation:${operation!.backend}`;
+			const action = buildActionKey({ ...permission, input: { operation: operation!.identity }, semanticsEpoch: epoch,
+				semantics: { ...definition, epoch, projectors: [] }, executionContext: { ...invocation, operation: { binding: operation!, permission } } });
+			const prepareBound = () => fixture.world.speculation.execute({ cwd: fixture.workspace, tool: fixture.tool, toolName: "bash", args, action,
+				callID: "private-bound", signal: new AbortController().signal, executionScope: scope });
+			const prepared = await prepareBound();
+			try {
+				expect(await host("kept")).toBe("old\n");
+				expect(await prepared.validate?.()).toMatchObject({ status: "valid" });
+			} finally { await prepared.dispose(); }
+			const open = fixture.backend.open.bind(fixture.backend);
+			const racing = vi.spyOn(fixture.backend, "open").mockImplementationOnce(async input => {
+				const session = await open(input);
+				return { ...session, executeBinding: async binding => {
+					const result = await session.executeBinding(binding);
+					await writeFile(path.join(outside, "kept"), "raced\n");
+					return result;
+				} };
+			});
+			try {
+				await expect(prepareBound()).rejects.toThrow(/unrepresentable writes outside the workspace.*external_write/);
+				expect(await host("kept")).toBe("raced\n");
+			} finally { racing.mockRestore(); }
 		} finally { await fixture.dispose(); await rm(outside, { recursive: true, force: true }); }
 	});
 
