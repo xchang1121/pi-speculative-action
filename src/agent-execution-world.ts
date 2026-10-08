@@ -128,8 +128,7 @@ export function createResourceSnapshotExecutionWorld(
 							const query = await evaluateResourceInputs(owner, context, actionSemantics, () => missing ??= captureResourceVersion(undefined,
 								(context.action.executionContext as ToolInvocation).filesystemRoot ?? context.cwd, actionSemantics, operations.maxBytes())
 								.then(token => captured = token), retained);
-							const checkedAt = performance.now();
-							try {
+							return TimelineInterval.overhead(() => {
 								let bytes = (query?.capturedBytes ?? 0) + (captured?.view?.bytes ?? 0);
 								if (!query || bytes > operations.maxBytes()) return undefined;
 								captured?.view?.seal();
@@ -142,16 +141,14 @@ export function createResourceSnapshotExecutionWorld(
 								const branch = resourceSnapshotBranch(query.output, owned, context.action, actionSemantics);
 								captured = undefined; retained.length = 0;
 								return branch;
-							} finally { TimelineInterval.exclude(new TimelineInterval(checkedAt, performance.now())); }
+							});
 						}, branch => branch !== undefined);
 						if (branch) return branch;
 					} catch {
 						context.signal.throwIfAborted();
 						// Unprovable or over-budget inputs fall back to the same bound capture executor.
 					} finally {
-						const startedAt = performance.now();
-						try { await Promise.allSettled(retained.map(releaseResourceVersion)); await captured?.release(); }
-						finally { TimelineInterval.exclude(new TimelineInterval(startedAt, performance.now())); }
+						await TimelineInterval.overhead(async () => { await Promise.allSettled(retained.map(releaseResourceVersion)); await captured?.release(); });
 					}
 				}
 				const owned = await capture(context, operations.maxBytes(), true);
@@ -161,9 +158,7 @@ export function createResourceSnapshotExecutionWorld(
 					context.signal.throwIfAborted();
 					return await owned.seal(output);
 				} finally {
-					const startedAt = performance.now();
-					try { await owned.dispose(); }
-					finally { TimelineInterval.exclude(new TimelineInterval(startedAt, performance.now())); }
+					await TimelineInterval.overhead(() => owned.dispose());
 				}
 			},
 		} } : {}),
@@ -178,14 +173,11 @@ export async function borrowResourceObject(sources: Iterable<object>, target: st
 	for (const source of sources) for (const version of resourceVersions.get(source)?.versions ?? []) {
 		if (!version.view?.retained) continue;
 		try {
-			const captured = await version.view.borrowObject(target, async (capture, handle) => {
-				const startedAt = performance.now();
-				try {
-					if (!capture.content || capture.bytesRead > maxBytes || !sameFilesystemIdentity(expected, capture.stat) ||
-						!sameFilesystemIdentity(capture.stat, await handle.stat({ bigint: true }))) return undefined;
-					return { ...capture, content: Buffer.from(capture.content), shared: true as const };
-				} finally { TimelineInterval.exclude(new TimelineInterval(startedAt, performance.now())); }
-			});
+			const captured = await version.view.borrowObject(target, (capture, handle) => TimelineInterval.overhead(async () => {
+				if (!capture.content || capture.bytesRead > maxBytes || !sameFilesystemIdentity(expected, capture.stat) ||
+					!sameFilesystemIdentity(capture.stat, await handle.stat({ bigint: true }))) return undefined;
+				return { ...capture, content: Buffer.from(capture.content), shared: true as const };
+			}));
 			if (captured) return captured;
 		} catch { /* Revocation or a different version leaves the normal FD capture authoritative. */ }
 	}
@@ -310,18 +302,13 @@ function resourceSnapshotBranch(
 			const retained: ResourceVersionToken[] = [];
 			let missing: Promise<ResourceVersionToken> | undefined, captured: ResourceVersionToken | undefined;
 			let released: Promise<void> | undefined, transferred = false;
-			const dispose = () => released ??= (async () => {
-				const startedAt = performance.now();
-				try { await Promise.allSettled(retained.splice(0).map(releaseResourceVersion)); }
-				finally { TimelineInterval.exclude(new TimelineInterval(startedAt, performance.now())); }
-			})();
+			const dispose = () => released ??= TimelineInterval.overhead(async () => { await Promise.allSettled(retained.splice(0).map(releaseResourceVersion)); });
 			try {
 				const query = await evaluateResourceInputs(owner, request, semantics, () => missing ??= captureResourceVersion(undefined,
 					(request.action.executionContext as ToolInvocation).filesystemRoot ?? version.root, semantics,
 					Math.max(0, version.view!.remainingBytes - versions.slice(1).reduce((bytes, token) => bytes + (token.view?.bytes ?? 0), 0)))
 					.then(token => { retained.push(token); return captured = token; }), retained);
-				const checkedAt = performance.now();
-				try {
+				return await TimelineInterval.overhead(() => {
 					if (!query) return undefined;
 					captured?.view?.seal();
 					// Borrowed data is already evaluated; only its selected evidence must outlive the source view.
@@ -335,7 +322,7 @@ function resourceSnapshotBranch(
 						...(retained.length ? { dispose } : {}),
 						compatibility: { status: "compatible" as const, backend: "resource_version", executionFingerprint: request.action.executionFingerprint } };
 					transferred = true; return result;
-				} finally { TimelineInterval.exclude(new TimelineInterval(checkedAt, performance.now())); }
+				});
 			} finally { if (!transferred) await dispose(); }
 		}, result => result !== undefined) } : {}),
 		commit: async () => {

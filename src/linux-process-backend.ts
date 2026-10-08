@@ -15,6 +15,7 @@ import { finished } from "node:stream/promises";
 import { errorMessage, isMissing as missing } from "./error-utils.ts";
 import { stableEqual } from "./stable-json.ts";
 import { TimelineInterval, type TimelineDependency } from "./task-timing.ts";
+import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
 import { certificateReplayable, createExecPrototype, digestObject, dynamicDependencyIdentity, type DynamicDependency, type DynamicDependencyCertificate, type ExecPrototype,
 	type ExitOutcome, filesystemObservationDigest, ONE_SHOT_TAINTS, type OrderedEffectEvent, type OFDPosition, type ProcessProducerProof,
 	type ProcessProvenanceCertificate, type ProcessResultRecord, processWeakKey, type ProvenanceTaint, sealProcessCertificate, sha256Digest,
@@ -207,7 +208,7 @@ interface ActiveSession {
 	readonly nestedProducer: ProcessProducerProof;
 	readonly socketPath: string;
 	readonly signal: AbortSignal;
-	readonly pending: Set<Promise<unknown>>;
+	readonly lifecycle: RuntimeLifecycleLane;
 	readonly nestedEvidence: DynamicDependencyCertificate[];
 	/** Brokered runs whose effects overlapping siblings left unattributable: what they observed joins the command's own evidence. */
 	readonly foldedObservations: StraceObservation[];
@@ -232,7 +233,6 @@ interface ActiveSession {
 	sealPromise?: Promise<readonly SandboxWorkspaceChange[]>;
 	/** When the top level started writing into the session's private branch. */
 	privateSince?: number;
-	closing?: Promise<void>;
 }
 
 interface TopLevelCapture {
@@ -536,7 +536,7 @@ export class LinuxProcessReuseBackend {
 			nestedProducer,
 			socketPath,
 			signal: AbortSignal.any([controller.signal, ...(input.signal ? [input.signal] : [])]),
-			pending: new Set<Promise<unknown>>(),
+			lifecycle: new RuntimeLifecycleLane(),
 			ownership: new ProcessHandoffOwnership(input.onOperationAdopted, input.acceptOperationScope),
 			preparedResults: 0,
 			closedInputFailures: 0,
@@ -549,10 +549,10 @@ export class LinuxProcessReuseBackend {
 		this.producers++;
 		let dispatch: Promise<void> | undefined;
 		const execute = <Value>(kind: NonNullable<typeof executionKind>, operation: () => Promise<Value>): Promise<Value> => {
-			if (session.closing || executionKind === "operation" || executionKind && executionKind !== kind)
+			if (session.lifecycle.sealed || executionKind === "operation" || executionKind && executionKind !== kind)
 				return Promise.reject(new Error("process session execution boundary is already consumed"));
 			executionKind = kind;
-			const pending = Promise.resolve().then(async () => {
+			return session.lifecycle.admit(async () => {
 				session.signal?.throwIfAborted();
 				const dispatchStartedAt = performance.now();
 				// Bound operations can launch reusable children too; interception excludes their own image below.
@@ -585,9 +585,7 @@ export class LinuxProcessReuseBackend {
 				}));
 				session.privateSince ??= Date.now();
 				return operation();
-			}).finally(() => { session.pending.delete(pending); });
-			session.pending.add(pending);
-			return pending;
+			});
 		};
 		const creation = new TimelineInterval(startedAt, performance.now(), [{ computation: new TimelineInterval(startedAt, readyAt), overhead: true }]);
 		return {
@@ -599,14 +597,16 @@ export class LinuxProcessReuseBackend {
 			metrics: () => Object.freeze({ ...session.metrics }),
 			seal: (changes) => { session.sealPromise ??= this.withProducer(() => this.seal(session, changes)); return session.sealPromise; },
 			validate: () => validateTransferredProcessEvidence(session.topLevelEvidence, session.incompleteReasons),
-			close: () => session.closing ??= Promise.resolve().then(async () => {
+			close: () => session.lifecycle.close(async () => {
 				controller.abort(new Error("Linux process session closed"));
-				await dispatch?.catch(() => undefined);
-				try { await closeServer(server); } finally {
-					await Promise.allSettled(session.pending);
-					await rm(socketPath, { force: true }).catch(() => undefined);
-				}
-			}).finally(() => { this.producers--; }),
+				try {
+					await dispatch?.catch(() => undefined);
+					try { await closeServer(server); } finally {
+						await session.lifecycle.drain();
+						await rm(socketPath, { force: true }).catch(() => undefined);
+					}
+				} finally { this.producers--; }
+			}),
 		};
 	}
 
@@ -698,7 +698,7 @@ export class LinuxProcessReuseBackend {
 
 	private async executeTopLevel(session: ActiveSession, request: ProcessExecutionRequest): Promise<{ exitCode: number | null }> {
 		const startedAt = performance.now();
-		if (session.closing) throw new Error("Linux process session is closed");
+		if (session.lifecycle.sealed) throw new Error("Linux process session is closed");
 		const signal = AbortSignal.any([session.signal, ...(request.signal ? [request.signal] : [])]);
 		signal?.throwIfAborted();
 		const ready = await this.resolveReady();
@@ -840,19 +840,18 @@ export class LinuxProcessReuseBackend {
 		socket.on("data", (chunk) => { body += chunk; if (Buffer.byteLength(body) > MAX_REQUEST_BYTES) socket.destroy(new Error("request too large")); });
 		socket.once("error", () => undefined);
 		socket.once("end", () => {
-			const pending = Promise.resolve().then(() => this.handleWireRequest(session, body, wholeTool)).then((response) => { socket.end(wireResponse(response)); })
+			void session.lifecycle.track(Promise.resolve().then(() => this.handleWireRequest(session, body, wholeTool)).then((response) => { socket.end(wireResponse(response)); })
 				.catch((error) => {
 					this.setError(session, errorMessage(error));
 					session.incompleteReasons.add(`broker:${errorMessage(error)}`);
 					socket.end("f\n");
-				}).finally(() => { session.pending.delete(pending); });
-			session.pending.add(pending);
+				}));
 		});
 	}
 
 	private async handleWireRequest(session: ActiveSession, body: string, wholeTool: boolean): Promise<DispatcherResponse> {
 		const received = parseDispatcherRequest(body);
-		if (!received || received.token !== session.token || session.closing) throw new Error("invalid dispatcher request");
+		if (!received || received.token !== session.token || session.lifecycle.sealed) throw new Error("invalid dispatcher request");
 		session.signal?.throwIfAborted();
 		const request = materializeDispatcherRequest(session, received);
 		if (!request) throw new Error("dispatcher cwd is unmapped");

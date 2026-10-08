@@ -318,6 +318,10 @@ interface ExecutionWorldLifecycle<Context, Output> {
 	/** Observe proven internal work inside exactly one native Actor call; never seals its whole result. */
 	readonly observeOperations?: <Value>(request: { readonly action: ActionKey; readonly scope: ExecutionScope; readonly learn?: boolean; readonly inputs?: (path: string) => Iterable<object> },
 		execute: () => Promise<Value>, observe: (bindings: readonly ExecutionOperationBinding[], computations?: readonly TimelineDependency[]) => void) => Promise<Value>;
+	/** Retire preparation invalidated by an Actor mutation before its successors may launch. */
+	readonly actorFallbackSettled?: () => Promise<void>;
+	/** Release turn-owned preparation; independently retained branches keep their own leases. */
+	readonly finishTurn?: (turnID: string) => Promise<void>;
 	/** Abort and drain backend-owned forks and branch cleanup before resolving. */
 	readonly dispose?: () => Promise<void>;
 }

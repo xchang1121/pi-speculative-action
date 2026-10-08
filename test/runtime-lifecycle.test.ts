@@ -3,6 +3,27 @@ import { describe, expect, it, vi } from "vitest";
 import { RuntimeLifecycleLane } from "../src/runtime-lifecycle.ts";
 
 describe("RuntimeLifecycleLane", () => {
+	it("closes after admitted serial proofs and concurrent borrowers, including a failed proof", async () => {
+		const lane = new RuntimeLifecycleLane(), order: string[] = [];
+		const proof = deferred(), borrower = deferred();
+		const first = lane.serialize(async () => { order.push("first"); await proof.promise; throw new Error("stale proof"); });
+		const failed = expect(first).rejects.toThrow("stale proof");
+		const second = lane.serialize(() => { order.push("second"); return 42; });
+		const parallel = lane.admit(() => borrower.promise);
+		let closed = false;
+		const closing = lane.close(async () => { await lane.drain(); order.push("closed"); }).then(() => { closed = true; });
+		try {
+			await expect(lane.serialize(() => order.push("late"))).rejects.toThrow("closed");
+			proof.resolve();
+			await failed;
+			expect(await second).toBe(42);
+			await nextTurn();
+			expect(closed).toBe(false);
+			expect(order).toEqual(["first", "second"]);
+		} finally { proof.resolve(); borrower.resolve(); await Promise.all([failed, second, parallel, closing]); }
+		expect(order).toEqual(["first", "second", "closed"]);
+	});
+
 	it("serializes reusable operations and contains a failed predecessor", async () => {
 		const order: number[] = [];
 		const lane = new RuntimeLifecycleLane();

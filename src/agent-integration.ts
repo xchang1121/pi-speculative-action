@@ -14,7 +14,7 @@ import { createDrafterPlanSource } from "./drafter-plan-source.ts";
 import { PATTERN_AWARE_DEFAULTS, type PatternAwareSettings, type PatternAwareStore, patternAwareSettings } from "./pattern-aware.ts";
 import { createPatternPlanSource } from "./pattern-plan-source.ts";
 import { PI_BASH_TIMEOUT_PROJECTION_RULE, PI_GREP_LITERAL_PROJECTION_RULE, piToolErrorSettlement } from "./pi-tool-invocation.ts";
-import type { TimelineDependency } from "./task-timing.ts";
+import { TimelineInterval, type TimelineDependency } from "./task-timing.ts";
 import type {
 	CandidatePreflight,
 	ActorActionFeedback,
@@ -398,7 +398,12 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 						if (bindings.length) (operations ??= []).push(...bindings);
 						if (dependencies) computations.push(...dependencies);
 					}, prepared?.observeOperations, inputs) : executor(bound);
-				return prepared?.withInputs ? prepared.withInputs(execute) : execute();
+				try { return await (prepared?.withInputs ? prepared.withInputs(execute) : execute()); }
+				finally {
+					if (actionSemantics.definition(bound.action ?? bound.tool)?.effect !== "observation") {
+						await TimelineInterval.overhead(() => Promise.allSettled(executionWorlds.map(async world => world.actorFallbackSettled?.())));
+					}
+				}
 			}, {
 				computationDependencies: () => computations,
 				...(actorCall
@@ -422,8 +427,14 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 		}),
 		drafterGateSnapshot: drafterPlans.snapshot,
 		finishTurn: async (turnID, terminal = false) => {
-			await runtime.finishTurn({ sessionID, turnID, tool: "", args: {}, tools: [], terminal });
-			if (terminal) { drafterPlans.finishSession(); await patternPlans.finishSession(); }
+			try {
+				await runtime.finishTurn({ sessionID, turnID, tool: "", args: {}, tools: [], terminal });
+				if (terminal) { drafterPlans.finishSession(); await patternPlans.finishSession(); }
+			} finally {
+				const closed = await Promise.allSettled(executionWorlds.map(async world => world.finishTurn?.(turnID)));
+				const failures = closed.flatMap(result => result.status === "rejected" ? [result.reason] : []);
+				if (failures.length) throw new AggregateError(failures, "Execution world turn cleanup failed");
+			}
 		},
 		dispose: async () => {
 			try {

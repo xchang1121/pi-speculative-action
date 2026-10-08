@@ -285,9 +285,7 @@ export class ResourceReadView {
 			const release = async (cached: PreparedResource) => {
 				if (--cached.borrowers || cached.retained && !cached.revoked) return;
 				if (prepared.bindings.get(binding)?.get(key) === cached) prepared.bindings.get(binding)!.delete(key);
-				const startedAt = performance.now();
-				try { await (cached.destination.prepared?.lifetime ?? prepared.lifetime).release(cached); }
-				finally { TimelineInterval.exclude(new TimelineInterval(startedAt, performance.now())); }
+				await TimelineInterval.overhead(() => (cached.destination.prepared?.lifetime ?? prepared.lifetime).release(cached));
 			};
 			const consumePrepared = async (cached: PreparedResource) => {
 				inherit(cached.origin === owner ? cached.dependencies : undefined);
@@ -297,11 +295,10 @@ export class ResourceReadView {
 					this.assertComplete(); cached.destination.assertComplete();
 					TimelineInterval.exclude(new TimelineInterval(startedAt, performance.now()));
 					const result = await consume(cached.value as Parameters<typeof consume>[0]);
-					const consumedAt = performance.now();
-					TimelineInterval.use(cached.computation);
-					try {
+					return TimelineInterval.overhead(() => {
+						TimelineInterval.use(cached.computation);
 						this.assertComplete(); if (!transferred && !(this.acceptProofs && cached.origin === owner && cached.dependencies)) cached.destination.assertComplete(); return result;
-					} finally { TimelineInterval.exclude(new TimelineInterval(consumedAt, performance.now())); }
+					});
 				};
 				return cached.destination === owner ? run() : cached.destination.prepared!.lifetime.admit(run);
 			};
@@ -398,12 +395,11 @@ export class ResourceReadView {
 					view.boundary = { root, physicalRoot: entry.realPath! };
 				}
 				const output = await operation(view);
-				const checkedAt = performance.now();
-				try {
+				await TimelineInterval.overhead(() => {
 					view.assertComplete();
 					this.foreignInputs ||= view.foreignInputs;
 					observed?.(view.dependencies);
-				} finally { TimelineInterval.exclude(new TimelineInterval(checkedAt, performance.now())); }
+				});
 				return output;
 			} finally { view.dispose(); }
 		});

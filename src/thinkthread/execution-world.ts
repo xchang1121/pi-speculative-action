@@ -28,7 +28,9 @@ import { effectCommitFailure } from "../effect-transaction.ts";
 import { assertNoSymlinkPath } from "../filesystem-evidence.ts";
 import { relativeFilesystemPath, slash } from "../path-utils.ts";
 import { ResourceReadView, ResourceVersionManager, resourceDependencies, type ResourceVersionToken } from "../resource-version.ts";
+import { RuntimeLifecycleLane } from "../runtime-lifecycle.ts";
 import { cause, type ResourceValidation } from "../settlement.ts";
+import { TimelineInterval } from "../task-timing.ts";
 import { toolErrorSettlement, type ToolSettlement } from "../tool-settlement.ts";
 import type { DurableFsExecutor } from "./durable-fs.ts";
 import { ThinkThreadDurableError } from "./errors.ts";
@@ -74,8 +76,7 @@ export function createThinkThreadExecutionWorld(
 	let prepared: Promise<PreparedWorld> | undefined;
 	let runnerFingerprint: Promise<string> | undefined;
 	const lifetime = new AbortController();
-	const pending = new Set<Promise<unknown>>();
-	let disposal: Promise<void> | undefined;
+	const operations = new RuntimeLifecycleLane();
 
 	const prepare = async (cwd: string): Promise<PreparedWorld> => {
 		lifetime.signal.throwIfAborted();
@@ -107,24 +108,6 @@ export function createThinkThreadExecutionWorld(
 			nodePath, settings.autoResizeImages, settings.modelSupportsImages,
 		])).join(":");
 	};
-	const execute = async <Result>(
-		context: SpeculativeToolExecutionContext,
-		operation: (world: PreparedWorld, context: SpeculativeToolExecutionContext) => Promise<Result>,
-	): Promise<Result> => {
-		const signal = AbortSignal.any([context.signal, lifetime.signal]);
-		signal.throwIfAborted();
-		const task = prepare(context.cwd).then((world) => {
-			signal.throwIfAborted();
-			return operation(world, { ...context, signal });
-		});
-		pending.add(task);
-		try {
-			return await task;
-		} finally {
-			pending.delete(task);
-		}
-	};
-
 	return {
 		id: WORLD_ID,
 		scope: "runtime",
@@ -144,8 +127,13 @@ export function createThinkThreadExecutionWorld(
 					detail: `ThinkThread ${snapshotInputs ? "sealed regular inputs; " : ""}fs.run: ${TOOL_NAMES.join(", ")}; ambient process tools require a complete process proof`,
 				};
 			},
-			execute: (context) => execute(context, (world, input) =>
-				forkThinkThreadWorld(world, input, runnerPath, nodePath, autoResizeImages, snapshotInputs)),
+			execute: (context) => operations.admit(async () => {
+				const signal = AbortSignal.any([context.signal, lifetime.signal]);
+				signal.throwIfAborted();
+				const world = await prepare(context.cwd);
+				signal.throwIfAborted();
+				return forkThinkThreadWorld(world, { ...context, signal }, runnerPath, nodePath, autoResizeImages, snapshotInputs);
+			}),
 		},
 		actorFallbackSettled: async () => {
 			const world = await prepared;
@@ -156,13 +144,12 @@ export function createThinkThreadExecutionWorld(
 			await world?.pool.finishTurn(turnID);
 		},
 		dispose: () => {
-			disposal ??= (async () => {
-				lifetime.abort();
-				await Promise.allSettled([...pending]);
+			lifetime.abort();
+			return operations.close(async () => {
+				await operations.drain();
 				const world = await prepared;
 				await world?.pool.dispose();
-			})();
-			return disposal;
+			});
 		},
 	};
 }
@@ -295,13 +282,13 @@ interface ThinkThreadBranchInput {
 function thinkThreadWorldBranch(input: ThinkThreadBranchInput): WorldBranch<ToolSettlement> {
 	const { output, source, target, client, durable, pool, dependencies, nativeInputs } = input;
 	let commitPromise: Promise<ToolSettlement> | undefined;
-	let validating: Promise<ResourceValidation> | undefined, disposal: Promise<void> | undefined, disposed = false;
+	const lifecycle = new RuntimeLifecycleLane();
 	const nativeCause = async () => {
 		try { if (nativeInputs) await assertInputAuthority(nativeInputs); }
 		catch (error) { return cause("freshness", "thinkthread_input_authority_changed", error instanceof Error ? error.message : String(error)); }
 		return undefined;
 	};
-	const validateOnce = async (): Promise<ResourceValidation> => {
+	const validate = (): Promise<ResourceValidation> => lifecycle.serialize(() => TimelineInterval.overhead(async () => {
 		const started = performance.now(), before = await nativeCause();
 		const result = before ? undefined : await client.fs.verify({ snapshotId: source.id, dependencies: [...dependencies] });
 		const changed = before ?? await nativeCause();
@@ -310,13 +297,7 @@ function thinkThreadWorldBranch(input: ThinkThreadBranchInput): WorldBranch<Tool
 		return changed || result?.status !== "matched"
 			? { status: "stale", cause: changed ?? cause("freshness", "thinkthread_dependency_changed"), metrics }
 			: { status: "valid", metrics };
-	};
-	const validate = (): Promise<ResourceValidation> => {
-		if (disposed) return Promise.reject(new Error("ThinkThread branch is disposed"));
-		const pending = Promise.resolve(validating).then(validateOnce, validateOnce);
-		validating = pending;
-		return pending.finally(() => { if (validating === pending) validating = undefined; });
-	};
+	}));
 	async function commitOnce(onValidation?: (validation: ResourceValidation) => void): Promise<ToolSettlement> {
 		try {
 			if (!target) {
@@ -363,9 +344,9 @@ function thinkThreadWorldBranch(input: ThinkThreadBranchInput): WorldBranch<Tool
 				await commitPromise;
 				return validate();
 			}
-			if (disposed) throw new Error("ThinkThread branch is disposed");
+			if (lifecycle.sealed) throw new Error("ThinkThread branch is disposed");
 			let validation: ResourceValidation | undefined;
-			const pending = commitOnce((proof) => { validation = proof; });
+			const pending = lifecycle.track(commitOnce((proof) => { validation = proof; }));
 			commitPromise = pending;
 			try { await pending; }
 			catch (error) {
@@ -376,14 +357,11 @@ function thinkThreadWorldBranch(input: ThinkThreadBranchInput): WorldBranch<Tool
 			}
 			return validation!;
 		},
-		commit: () => disposed ? Promise.reject(new Error("ThinkThread branch is disposed")) : (commitPromise ??= commitOnce()),
-		dispose: () => {
-			disposed = true;
-			return disposal ??= (async () => {
-				await Promise.allSettled([commitPromise, validating]);
-				await Promise.allSettled([target?.release(), source.release(), nativeInputs?.release()]);
-			})();
-		},
+		commit: () => lifecycle.sealed ? Promise.reject(new Error("ThinkThread branch is disposed")) : (commitPromise ??= lifecycle.track(commitOnce())),
+		dispose: () => lifecycle.close(async () => {
+			await lifecycle.drain();
+			await Promise.allSettled([target?.release(), source.release(), nativeInputs?.release()]);
+		}),
 	};
 }
 

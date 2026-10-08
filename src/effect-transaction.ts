@@ -2,6 +2,7 @@ import { type SpeculativeExecutionRoute, validateWorldBranch, type WorldBranch, 
 import { cause, type ResolutionCause, type ResourceValidation, zeroValidationMetrics } from "./settlement.ts";
 import { cloneSharedData, immutableSnapshot } from "./stable-json.ts";
 import { errorMessage } from "./error-utils.ts";
+import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
 
 export type EffectTransactionState =
 	| "begun"
@@ -180,32 +181,30 @@ function sealEffectTransaction<Output>(attempt: MutableEffectTransactionAttempt,
 		takeCommittedInputs: branch.takeCommittedInputs?.bind(branch), takeReadInputs: branch.takeReadInputs?.bind(branch),
 	});
 	let validation: ResourceValidation | undefined, validationPromise: Promise<ResourceValidation> | undefined;
-	let commitPromise: Promise<Output> | undefined, cleanupPromise: Promise<void> | undefined;
+	let commitPromise: Promise<Output> | undefined;
 	let inputTransfer: ReturnType<NonNullable<WorldBranch<Output>["takeCommittedInputs"]>> | undefined;
-	const reconstructions = new Set<ReturnType<NonNullable<WorldBranch<Output>["reconstruct"]>>>();
+	const lifecycle = new RuntimeLifecycleLane();
 	const queryResources = new Set<() => Promise<void>>();
 	const abort = (): Promise<void> => {
-		if (cleanupPromise) return cleanupPromise;
-		if (!["committed", "poisoned"].includes(attempt.stateValue) && !commitPromise) attempt.stateValue = "aborting";
-		cleanupPromise = (async () => {
+		if (!lifecycle.sealed && !["committed", "poisoned"].includes(attempt.stateValue) && !commitPromise) attempt.stateValue = "aborting";
+		return lifecycle.close(async () => {
 			try {
-				await Promise.allSettled([validationPromise, commitPromise, inputTransfer, ...reconstructions]);
+				await lifecycle.drain();
 				await Promise.allSettled([...queryResources].map(dispose => dispose()));
 				await sealed.dispose();
 			} finally {
 				if (!["committed", "poisoned"].includes(attempt.stateValue)) attempt.stateValue = "aborted";
 			}
-		})();
-		return cleanupPromise;
+		});
 	};
 	const validate = async (queryProof?: WorldBranch<Output>["validate"]): Promise<ResourceValidation> => {
 		// A reserved commit owns its proof window; a later validation must not reset that state.
-		if (!cleanupPromise && commitPromise && attempt.stateValue !== "committed") await Promise.allSettled([commitPromise]);
-		if (cleanupPromise || ["aborted", "aborting", "poisoned", "failed"].includes(attempt.stateValue)) {
+		if (!lifecycle.sealed && commitPromise && attempt.stateValue !== "committed") await Promise.allSettled([commitPromise]);
+		if (lifecycle.sealed || ["aborted", "aborting", "poisoned", "failed"].includes(attempt.stateValue)) {
 			return { status: "indeterminate", cause: cause("freshness", "transaction_unavailable"), metrics: zeroValidationMetrics() };
 		}
 		// Each request owns a fresh proof after its predecessors, never their earlier observation.
-		const pending = Promise.resolve(validationPromise).then(async () => {
+		const pending = lifecycle.serialize(async () => {
 			if (!queryProof && ["sealed", "validated"].includes(attempt.stateValue)) attempt.stateValue = "validating";
 			const result = await validateWorldBranch(queryProof ? { validate: queryProof } : sealed, attempt.descriptor.route.reuse);
 			// A query borrows the same lifetime and validation lane, but cannot authorize the source output.
@@ -225,15 +224,15 @@ function sealEffectTransaction<Output>(attempt: MutableEffectTransactionAttempt,
 		get output() { return shared ? cloneSharedData(sealed.output) : sealed.output; },
 		get capturedBytes() { return retainedBytes ? retainedBytes() : sealed.capturedBytes; },
 		takeCommittedInputs: sealed.takeCommittedInputs ? async (maxBytes) => {
-			if (cleanupPromise || attempt.stateValue !== "committed" || inputTransfer) return undefined;
-			return inputTransfer = Promise.resolve().then(() => sealed.takeCommittedInputs!(maxBytes)).then(async inputs => {
-				if (!cleanupPromise) return inputs;
+			if (lifecycle.sealed || attempt.stateValue !== "committed" || inputTransfer) return undefined;
+			return inputTransfer = lifecycle.track(Promise.resolve().then(() => sealed.takeCommittedInputs!(maxBytes)).then(async inputs => {
+				if (!lifecycle.sealed) return inputs;
 				await inputs?.dispose(); return undefined;
-			});
+			}));
 		} : undefined,
 		reconstruct: shared && sealed.reconstruct ? async (request) => {
 			// Borrowing sealed inputs grants no commit authority; freshness is checked after evaluation.
-			if (cleanupPromise || !["sealed", "validating", "validated", "committed"].includes(attempt.stateValue)) return undefined;
+			if (lifecycle.sealed || !["sealed", "validating", "validated", "committed"].includes(attempt.stateValue)) return undefined;
 			const task = Promise.resolve().then(() => sealed.reconstruct!(request)).then(async (result) => {
 				if (!result) return undefined;
 				// An atomic validation/commit callback retains its complete proof and effect ownership.
@@ -249,19 +248,18 @@ function sealEffectTransaction<Output>(attempt: MutableEffectTransactionAttempt,
 						...(release ? { dispose } : {}) });
 				} catch (error) { await dispose().catch(() => {}); throw error; }
 			});
-			reconstructions.add(task);
-			try { return await task; } finally { reconstructions.delete(task); }
+			return lifecycle.track(task);
 		} : undefined,
 		validate: () => validate(),
 		commit: async () => {
 			// An admitted effect keeps its original settlement, including during/after retirement.
 			if (commitPromise) return shared ? cloneSharedData(await commitPromise) : commitPromise;
-			if (cleanupPromise) throw effectCommitFailure(new Error("effect transaction resources are retired"), "recoverable");
+			if (lifecycle.sealed) throw effectCommitFailure(new Error("effect transaction resources are retired"), "recoverable");
 			if (!validationPromise && validation?.status !== "valid") {
 				throw new Error(`effect transaction ${attempt.id} requires successful validation before commit`);
 			}
 			// Reserve the entire validation → commit operation before yielding, not just its effect.
-			commitPromise = (async () => {
+			commitPromise = lifecycle.track((async () => {
 				try {
 					await validationPromise;
 					if (validation?.status !== "valid" || attempt.stateValue !== "validated") {
@@ -277,7 +275,7 @@ function sealEffectTransaction<Output>(attempt: MutableEffectTransactionAttempt,
 					attempt.stateValue = failure.disposition === "poisoned" ? "poisoned" : "failed";
 					throw failure;
 				}
-			})();
+			})());
 			return shared ? cloneSharedData(await commitPromise) : commitPromise;
 		},
 		abort, dispose: abort,
