@@ -1231,8 +1231,11 @@ export function makeSpeculativeActionRuntime<
 			const settled = candidate.work.controller.signal.aborted
 				? candidate.work.cancel(failure, executionMs)
 				: candidate.work.fail(failure, executionMs);
-			if (settled && candidate.work.execution.status === "failed")
+			if (settled && candidate.work.execution.status === "failed") {
 				session.scheduler.observeSpeculativeService(actionTimingIdentity(candidate.key), executionMs, true);
+				if (candidate.owner.draft.type === "operation") for (const node of session.plan.consumers(candidate.id))
+					settleUnobserved(session, node, failure);
+			}
 			removeCandidate(session.id, candidate);
 			if (settled) queueCandidateEvent(session, candidate);
 		} finally { clearTimeout(candidate.salvaging); inputs?.dispose(); session.scheduler.complete(candidate); dispatchReady(session); }

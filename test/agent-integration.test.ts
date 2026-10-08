@@ -21,6 +21,7 @@ import { SpeculationScheduler } from "../src/scheduler.ts";
 import { createDrafterPlanSource } from "../src/drafter-plan-source.ts";
 import { DrafterTaskBudget, type DrafterUtilityBatch } from "../src/drafter-budget.ts";
 import { PlanRuntime } from "../src/plan-runtime.ts";
+import type { ExecutionOperationBinding } from "../src/execution-world.ts";
 import { cause } from "../src/settlement.ts";
 import { patternAwareActionSemantics, acquirePatternAwareStore, PATTERN_AWARE_DEFAULTS, PatternAwareStore, patternAwareSettings } from "../src/pattern-aware.ts";
 import { createPatternPlanSource } from "../src/pattern-plan-source.ts";
@@ -1538,6 +1539,61 @@ describe("speculative action host", () => {
 		} finally { await controller.dispose(); }
 	});
 
+	it("retires a failed rerun through the runtime before the next Actor edit", async () => {
+		const cwd = await temporaryWorkspace(), writer = createWriteTool(cwd), failure = gated();
+		const tool: AgentTool<typeof bashSchema> = { name: "bash", label: "bash", description: "Fixture build", parameters: bashSchema,
+			execute: async () => textResult("built") };
+		const tools = [tool, writer], command = { command: "build" };
+		const patternAware = patternAwareSettings({ presets: ["recent-command"], multiStepEnabled: false });
+		const store = new PatternAwareStore(patternAware, undefined, patternAwareActionSemantics(PI_ACTION_SEMANTICS, cwd));
+		const settled = vi.spyOn(store, "settled"), attempted: ExecutionOperationBinding[] = [], events: SpeculativeActionEvent<string>[] = [];
+		let observed: readonly ExecutionOperationBinding[] = [];
+		const base = mockRuntimeWorld(async ({ action }) => {
+			const binding = (action.executionContext as ToolInvocation).operation!.binding;
+			attempted.push(binding);
+			if (attempted.length === 1) { await failure.wait(); throw new Error("operation evidence could not be sealed"); }
+			return { result: textResult("prepared"), isError: false };
+		});
+		const world: SpeculativeAgentExecutionWorld = { ...base, observeOperations: async ({ action }, execute, observe) => {
+			const output = await execute();
+			if (action.tool === "bash") {
+				observed = [500, 300].map(executionMs => Object.freeze({ backend: base.id, identity: `work-${executionMs}`,
+					permissionHash: action.hash, executionMs, expectedDurationMs: executionMs, preparation: "current_workspace" as const, stale: async () => true }));
+				observe(observed);
+			}
+			return output;
+		} };
+		const host = createSpeculativeActionHost("rerun-failure", { cwd, patternStore: store, executionWorlds: [world],
+			complete: async () => { throw new Error("unexpected inference"); }, preflight: () => true,
+			getSettings: () => ({ enabled: true, drafterEnabled: false, tools: ["bash"], patternAware }),
+			resolveInvocation: (name, input) => resolvePiToolInvocation(name, input, { cwd, environment: {} }),
+			onEvent: event => { events.push(event); },
+		});
+		const start = (turnID: string) => host.startTurn({ ...startInput(tool, turnID), tools });
+		const edit = async (turnID: string) => {
+			await start(turnID);
+			const args = { path: "notes.txt", content: turnID };
+			await host.execute({ turnID, id: turnID, tool: "write", args, tools }, undefined, () => writer.execute(turnID, args));
+		};
+		try {
+			await start("seed");
+			await host.execute({ turnID: "seed", id: "seed", tool: "bash", args: command, tools }, undefined, () => tool.execute("seed", command));
+			await host.finishTurn("seed");
+			await edit("first-edit");
+			await waitFor(() => attempted.length === 1);
+			expect(attempted[0]).toBe(observed[0]);
+			failure.release();
+			await waitFor(() => events.some(event => event.type === "operation_prediction" && event.settlement.observation === "unobserved" &&
+				event.settlement.cause.stage === "execution" && event.settlement.cause.code === "candidate_failed"));
+			await host.finishTurn("first-edit");
+			await edit("second-edit");
+			await waitFor(() => attempted.length === 2);
+			expect(attempted[1]).toBe(observed[1]);
+			expect(await fs.readFile(path.join(cwd, "notes.txt"), "utf8")).toBe("second-edit");
+			expect(settled).not.toHaveBeenCalled();
+		} finally { failure.release(); await host.dispose(); }
+	});
+
 	it.each(["captured_resources", "current_workspace", "live_input"] as const)("prepares stale learned work after an Actor edit (%s)", async preparation => {
 		const cwd = await temporaryWorkspace(), tool = createReadTool(cwd), patternAware = patternAwareSettings({ enabled: true, multiStepEnabled: false });
 		const store = new PatternAwareStore(patternAware, undefined, patternAwareActionSemantics(PI_ACTION_SEMANTICS, cwd));
@@ -1632,6 +1688,24 @@ describe("speculative action host", () => {
 			if (!native || !("actions" in native)) throw new Error("missing native proposal");
 			expect(native).toMatchObject({ actions: [{ type: current ? "operation" : "tool_call", input: exact, expectedLatencyBenefitMs: 50 }] });
 			expect(native.actions).toHaveLength(1);
+			if (current) {
+				const action = native.actions[0]!, feedback = { proposalID: native.id, actionID: action.id, feedback: action.feedback };
+				await controller.source.onAdmitted!(feedback);
+				const prediction = { id: "rerun", source: "pattern_aware", proposalID: native.id, actionID: action.id };
+				const settle = (stage: "control" | "matching" | "execution") => controller.source.onSettled!({ ...feedback,
+					settlement: { prediction, observation: "unobserved", cause: { stage,
+						code: stage === "control" ? "execution_aborted" : stage === "matching" ? "operation_not_observed" : "candidate_failed" } } });
+				for (const stage of ["control", "matching"] as const) {
+					await settle(stage);
+					expect(await observe("write", { path: "a.c", content: stage })).toMatchObject({ actions: [{ operation: owned }] });
+				}
+				const refreshed = Object.freeze({ ...owned });
+				await observe("bash", exact, { ...failure, operations: [refreshed] });
+				await settle("execution");
+				const next = await observe("write", { path: "a.c", content: "new observation" });
+				if (!next || !("actions" in next)) throw new Error("missing refreshed proposal");
+				expect(next.actions[0]!.operation).toBe(refreshed);
+			}
 		} finally { staleness?.release(); await controller.dispose(); }
 	});
 
