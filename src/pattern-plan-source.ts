@@ -63,6 +63,7 @@ export function createPatternPlanSource({
 	const carriedPredictions = new Map<string, CarriedPrediction>();
 	const predictionBatches = new WeakMap<PatternPlanFeedback, CarriedPrediction>(), served = new WeakSet<PatternPlanFeedback>();
 	const issuedParents = new WeakSet<object>();
+	const rerunOperations = new WeakMap<object, ObservedOperation>();
 	// Capabilities stay in this session; the persisted Pattern store receives only real tool batches.
 	const operationBindings = new BoundedRecencyMap<string, ObservedOperation>(PATTERN_AWARE_DEFAULTS.maxPatterns);
 	// Exact authoritative inputs stay session-local; the persisted history may shorten large payloads.
@@ -190,8 +191,10 @@ export function createPatternPlanSource({
 			if (!stale.length && !fallback) continue;
 			const operation = stale.find(binding => binding.preparation === "current_workspace" && !binding.fed);
 			if (command === retry) state.retry = command;
+			const feedback = state.issued = {};
+			if (operation) rerunOperations.set(feedback, children.find(item => item.binding === operation)!);
 			return [[{ id: `rerun:${command.parentHash}`, type: operation ? "operation" : "tool_call", ...(operation ? { operation } : {}),
-				tool: command.tool, input: command.input, horizon: 0, producesOperations: true, feedback: state.issued = {},
+				tool: command.tool, input: command.input, horizon: 0, producesOperations: true, feedback,
 				...(fallback ? { empiricalProbability: 0.25, conditionalProbability: 0.25 } : {}),
 				expectedLatencyBenefitMs: fallback ? command.failure!.durationMs * 0.25 : operation?.executionMs ?? stale.reduce((total, binding) => total + binding.executionMs, 0),
 				expectedDurationMs: fallback ? command.failure!.durationMs : operation?.expectedDurationMs ?? Math.max(...children.map(({ binding }) => binding.expectedDurationMs)) }],
@@ -349,12 +352,13 @@ export function createPatternPlanSource({
 		onSettled: ({ feedback, settlement }) => {
 			if (lifecycle.sealed) return;
 			const context = asPatternPlanFeedback(feedback);
+			const operation = context?.operation ?? rerunOperations.get(feedback as object);
 			const carried = context && predictionBatches.get(context);
 			if (carried && settlement.observation === "unobserved") carried.abandoned = true;
-			if (context?.operation) {
+			if (operation) {
 				// Execution failure retires this preparation hint; absence of an OS observation is not a negative example.
 				if (settlement.observation === "unobserved" && settlement.cause.stage === "execution" &&
-					operationBindings.get(context.operation.key) === context.operation) operationBindings.delete(context.operation.key);
+					operationBindings.get(operation.key) === operation) operationBindings.delete(operation.key);
 				if (settlement.observation === "unobserved") return; // An adopted child credits its parent pattern.
 			}
 			if (context) for (const support of [context.continuation, ...context.patternIDs]) context.store.settled(support, settlement, served.has(context));
