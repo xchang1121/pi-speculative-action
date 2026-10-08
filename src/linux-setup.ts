@@ -4,6 +4,20 @@ import { fileURLToPath } from "node:url";
 import { stripVTControlCharacters } from "node:util";
 import { BorderedLoader, createLocalBashOperations, type ExtensionContext, truncateToVisualLines } from "@earendil-works/pi-coding-agent";
 import { errorMessage } from "./error-utils.ts";
+import { inspectLinuxEnvironment } from "./linux-environment.ts";
+
+/** Show host prerequisites separately from the controller's authoritative runtime diagnostics. */
+export async function checkLinuxEnvironment(ctx: ExtensionContext, refresh: () => Promise<void>): Promise<void> {
+	if (process.platform !== "linux") {
+		ctx.ui.notify("Linux environment checks require Pi running inside Linux or WSL 2. Open this menu there.", "warning");
+		return;
+	}
+	if (!ctx.isIdle()) { ctx.ui.notify("Wait for the current task to finish before checking the Linux environment.", "warning"); return; }
+	const report = await inspectLinuxEnvironment();
+	ctx.ui.notify(report.text, report.warnings ? "warning" : "info");
+	if (!ctx.isIdle()) { ctx.ui.notify("The task is now running. Refresh execution diagnostics after it finishes.", "warning"); return; }
+	await refresh();
+}
 
 /** The installer and its native sources ship in src for both TypeScript and dist entry points. */
 export async function installLinuxDependencies(ctx: ExtensionContext, refresh: () => Promise<void>): Promise<void> {
@@ -15,10 +29,12 @@ export async function installLinuxDependencies(ctx: ExtensionContext, refresh: (
 		ctx.ui.notify("Wait for the current task to finish before installing Linux dependencies.", "warning");
 		return;
 	}
+	const report = await inspectLinuxEnvironment();
+	if (!ctx.isIdle()) { ctx.ui.notify("The task is now running. Retry installation after it finishes.", "warning"); return; }
 	if (!await ctx.ui.confirm("Install / update Linux dependencies?",
-		"Download and build the packaged Sandlock, process helpers and strace, plus optional fuse-overlayfs, in ~/.local/bin. " +
-		"Requires Git, C/Rust toolchains, make and tar; FUSE also needs fusermount and access to /dev/fuse. " +
-		"System packages and permissions are not changed. Building may take several minutes.")) return;
+		`${report.summary}\n\nDownload and build the packaged Sandlock, process helpers and strace, plus optional fuse-overlayfs, in ~/.local/bin. ` +
+		"Requires Git, C/Rust toolchains, make, tar and xz; FUSE also needs fusermount and access to /dev/fuse. " +
+		"Missing prerequisites may leave individual components unavailable. System packages and permissions are not changed. Building may take several minutes.")) return;
 	if (!ctx.isIdle()) { ctx.ui.notify("The task is now running. Retry installation after it finishes.", "warning"); return; }
 	const script = fileURLToPath(new URL("../src/setup-linux-process-backend.mjs", import.meta.url));
 	const quote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`;
@@ -55,7 +71,7 @@ export async function installLinuxDependencies(ctx: ExtensionContext, refresh: (
 		: result.failed ? "Linux dependency installation failed."
 		: partial ? "Installation finished with unavailable components." : "Linux dependency installation finished.";
 	const detail = result.output.trim().split("\n").slice(-14).join("\n");
-	ctx.ui.notify(`${status}\n${detail}\nRestart Pi to load updated helpers and recheck workspace drivers.`,
+	ctx.ui.notify(`${status}\n${detail}\nInstaller output describes installation checks; runtime qualification is reported separately. Restart Pi to load updated helpers and recheck workspace drivers.`,
 		result.cancelled ? "warning" : result.failed ? "error" : partial ? "warning" : "info");
 	await refresh();
 }

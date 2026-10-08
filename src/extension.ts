@@ -18,7 +18,7 @@ import { PATTERN_AWARE_PRESETS, type PatternAwareSettings } from "./pattern-awar
 import { createClosedSearchProfile, createPiToolDefinitions, PI_CLOSED_SEARCH_TOOLS, PI_OPERATION_TOOLS, resolvePiToolInvocation, type PiToolDefinition } from "./pi-tool-invocation.ts";
 import type { ToolInvocation } from "./tool-settlement.ts";
 import { LinuxProcessReuseBackend } from "./linux-process-backend.ts";
-import { installLinuxDependencies } from "./linux-setup.ts";
+import { checkLinuxEnvironment, installLinuxDependencies } from "./linux-setup.ts";
 import { createLinuxProcessExecutionWorld } from "./linux-process-world.ts";
 import { executionCapabilityStatus, type ExecutionWorldDiagnosticSnapshot, type ExecutionWorldHealthState, type SpeculativeExecution,
 	type WorldReuseMetrics } from "./execution-world.ts";
@@ -996,13 +996,15 @@ function openToolsAndExecution(
 	return runActionMenuLoop(ctx, "Tools & execution", () => {
 		const settings = editor.settings();
 		const policy = toolPolicyCounts(settings, controller.registeredTools());
+		const refresh = async () => {
+			await recoverSpeculation(() => controller.refreshExecutionDiagnostics(true));
+			ctx.ui.notify(executionWorldSummary(controller.toolCapabilities(), controller.executionRoutes()), "info");
+		};
 		return new Map<string, MenuAction>([
 			[`Tool policy › ${policy.enabled}/${policy.available} enabled for prediction`, () => editToolPolicy(ctx, editor, controller.registeredTools(), controller.toolConflicts())],
 			["Execution routes", () => openExecutionRoutes(ctx, editor, controller)],
-			["Install / update Linux dependencies", () => installLinuxDependencies(ctx, async () => {
-				await recoverSpeculation(() => controller.refreshExecutionDiagnostics(true));
-				ctx.ui.notify(executionWorldSummary(controller.toolCapabilities(), controller.executionRoutes()), "info");
-			})],
+			["Check Linux environment", () => checkLinuxEnvironment(ctx, refresh)],
+			["Install / update Linux dependencies", () => installLinuxDependencies(ctx, refresh)],
 		]);
 	});
 }
