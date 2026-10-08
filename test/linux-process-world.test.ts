@@ -39,6 +39,69 @@ vi.mock("node:child_process", { spy: true });
 vi.mock("node:fs/promises", { spy: true });
 
 describe("Linux process ExecutionWorld", () => {
+	test.for(["unusable", "one-shot", "descendant"] as const)("retires only native preparation without a reusable result (%s)", { timeout: 20_000 }, async (mode, { skip }) => {
+		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
+		const fixture = await createLinuxProcessBenchmark("pi-preparation-evidence-");
+		const publishing = vi.spyOn(fixture.backend.planner, "publishCompleted");
+		try {
+			await writeFile(path.join(fixture.workspace, "input.txt"), "prepared\n");
+			if (mode === "one-shot") {
+				await writeFile(path.join(fixture.workspace, "one-shot.c"), '#include <stdio.h>\n#include <unistd.h>\nint main(void) { usleep(20000); printf("prepared:%ld\\n", (long)getpid()); return 0; }\n');
+				await compileBenchmarkHelper(fixture.workspace, { source: "one-shot.c", output: "one-shot" });
+			}
+			await commitBenchmarkFixture(fixture.workspace, "Preparation evidence");
+			await prepareLinuxProcessReuse(fixture);
+			const route = await fixture.prepareActorReplay(), scope = { sessionID: "preparation-evidence", turnID: "native" };
+			// Changing a process limit is an existing unsupported syscall observation. Only this child changes its limit.
+			const script = 'i=0; while [ "$i" -lt 10000 ]; do i=$((i + 1)); done; ' +
+				(mode === "one-shot" ? "" : "ulimit -c 0; ") + (mode === "descendant" ? "/bin/cat input.txt; :" : 'printf "prepared\\n"');
+			const command = mode === "one-shot" ? "exec ./one-shot" : `exec /bin/sh -c '${script}'`;
+			const expectedOutput = mode === "one-shot" ? expect.stringMatching(/^prepared:\d+\n$/) : "prepared\n";
+			const handoffs = Reflect.get(fixture.backend, "handoffs") as ProcessHandoffRegistry<{ readonly args: readonly string[]; readonly executable: string }>;
+			let binding: ProcessExecutionBinding | undefined, output = "";
+			const observe = () => fixture.backend.observeBindings(scope, () => route.executor.execute({ command, cwd: fixture.workspace,
+				environment: fixture.environment, scope, onData: data => { output += data.toString(); } }), bindings => {
+				binding = bindings.find(candidate => {
+					const invocation = handoffs.resolveBinding(candidate, scope);
+					return mode === "one-shot" ? invocation?.executable.endsWith("/one-shot") : invocation?.args.includes(script);
+				}) ?? binding;
+			}, true);
+			await observe();
+			expect(output).toEqual(expectedOutput);
+			expect(binding, JSON.stringify(fixture.backend.actorMetrics())).toMatchObject({ available: true });
+			expect(fixture.backend.operationHints(binding!).preparation).toBe("current_workspace");
+			const invocation = resolvePiToolInvocation("bash", { command: "exit 97" }, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath })!.process!;
+			const prepare = () => fixture.workspaceSandbox.withWorkspace(fixture.workspace, async workspace => {
+				const session = await fixture.backend.open({ sourceRoot: fixture.workspace, workspace, invocation, scope: { ...scope, turnID: "prepared" } });
+				try {
+					const result = await session.executeBinding(binding!);
+					expect(result.exit).toEqual({ kind: "code", code: 0 });
+					expect(result.output.map(event => event.data.toString()).join("")).toEqual(expectedOutput);
+					if (mode === "descendant") expect(session.executionBindings().some(child => child.available && child.key !== binding!.key)).toBe(true);
+				} finally { await session.close(); }
+			});
+			if (mode === "unusable") {
+				await expect(prepare()).rejects.toThrow("bound process preparation produced no reusable result");
+				expect(binding!.available).toBe(false);
+				expect(fixture.backend.metrics().lastError).toContain("unsupported_syscall");
+				await writeFile(path.join(fixture.workspace, "input.txt"), "arbitrary edit\n");
+				output = ""; await observe(); // Ordinary Actor execution remains enabled; observation cannot restore rejected proof.
+				expect(output).toBe("prepared\n"); expect(binding!.available).toBe(false);
+				const requests = fixture.backend.metrics().requests;
+				await expect(prepare()).rejects.toThrow("binding is unavailable");
+				expect(fixture.backend.metrics().requests).toBe(requests);
+			} else {
+				await prepare();
+				expect(binding!.available).toBe(true);
+				if (mode === "one-shot") {
+					expect(fixture.backend.metrics().published).toBe(0);
+					expect(publishing.mock.calls.find(([certificate]) => certificate.weakKey === binding!.key)?.[0].dependencyCertificate.taints)
+						.toEqual(expect.arrayContaining(["clock", "random", "pid_observation"]));
+				}
+			}
+		} finally { publishing.mockRestore(); await fixture.dispose(); }
+	});
+
 	test.for([false, true])("prepares a failed command after its reported input is edited and validates before committing (stale=%s)", { timeout: 20_000 }, async (stale, { skip }) => {
 		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-failed-command-");
