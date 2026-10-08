@@ -39,6 +39,9 @@ export interface StraceObservation {
 	/** Every process its trace holds, a brokered run's launcher among them. */
 	readonly pids?: readonly number[];
 	readonly incompleteReasons: readonly string[];
+	/** Bounded diagnostic names only; never dependency evidence or a completeness condition. */
+	readonly unsupportedSyscalls?: readonly string[];
+	readonly unsupportedSyscallsTruncated?: true;
 	readonly resourceJournal?: readonly { readonly inode: string; readonly description?: number; readonly kind: ResourceTransitionKind; readonly data: Buffer; readonly requested?: number }[];
 	readonly retainedDescriptions?: readonly number[];
 	readonly finalHandles?: readonly { readonly fd: number; readonly description?: number; readonly cloexec: boolean }[];
@@ -588,6 +591,14 @@ export async function observeStrace(
 	// A complete transcript therefore permits only the existing one-shot transfer, never proof
 	// that this process can be repeated. Do not infer unused inputs from their absence here.
 	const taints = new Set<ProvenanceTaint>(["clock", "random"]), executions: TracedExecution[] = [], listingPIDs = new Set<number>();
+	const unsupportedSyscalls = new Set<string>();
+	let unsupportedSyscallsTruncated = false;
+	const unsupported = (syscall: string) => {
+		taints.add("unsupported_syscall");
+		const name = syscall.slice(0, 64);
+		if (unsupportedSyscalls.size < 16) unsupportedSyscalls.add(name);
+		else if (!unsupportedSyscalls.has(name)) unsupportedSyscallsTruncated = true;
+	};
 	const images = new Map<number, string>(), statFields = new Map<number, readonly FilesystemObservationField[] | undefined>(); // A process's program, inherited across a fork until it execs.
 	const opened = new Map<number, Set<number>>(); // Descriptors a process opened itself, whose status flags it chose.
 	const refusedIndexLocks = new Set<number>(), ownPipes = new Set<string>(); // Pipes and socket pairs the traced processes created, by inode.
@@ -635,8 +646,8 @@ export async function observeStrace(
 			const endpoint = /^\d+<(?:pipe|UNIX(?:-[A-Z]+)?):\[(\d+)(?:->\d+)?\]>$/.exec(line.args[0] ?? "")?.[1];
 			const stream = endpoint && options.inheritedStreams?.includes(endpoint) || options.inheritedStreams?.some(inode => inode.startsWith("eventfd:")) && /^\d+<anon_inode:\[eventfd\]>$/.test(line.args[0] ?? "");
 			const streamCall = streamCalls.has(line);
-			if (stream && /^(?:read|write|readv|writev|sendto|recvfrom|sendfile|vmsplice)$/.test(syscall) && !streamCall) taints.add("unsupported_syscall");
-			if (options.inheritedStreams?.length && /^(?:poll|ppoll|select|pselect6|epoll_.*)$/.test(syscall) && !streamCall && !internalPoll(line, ownPipes)) taints.add("unsupported_syscall");
+			if (stream && /^(?:read|write|readv|writev|sendto|recvfrom|sendfile|vmsplice)$/.test(syscall) && !streamCall) unsupported(syscall);
+			if (options.inheritedStreams?.length && /^(?:poll|ppoll|select|pselect6|epoll_.*)$/.test(syscall) && !streamCall && !internalPoll(line, ownPipes)) unsupported(syscall);
 			// A local socket reaches another process only once connected: a refused path (an NSS cache that is absent here) is a
 			// pathname dependency, validated absent where the Actor runs.
 			const refused = syscall === "connect" && /^-1 (?:ENOENT|ECONNREFUSED|EACCES)\b/.test(line.result) ? /\bsun_path="(\/[^"]+)"/.exec(line.args[1] ?? "")?.[1] : undefined;
@@ -668,7 +679,7 @@ export async function observeStrace(
 						(line.args[2] ?? "").split("|").every(flag => /^(?:O_(?:RDONLY|WRONLY|RDWR|APPEND|NONBLOCK|NDELAY|LARGEFILE|DIRECTORY|DSYNC|SYNC|NOFOLLOW)|0)$/.test(flag))) &&
 						(options.inheritedFileImages?.includes(absoluteDescriptorPath(line.args[0]) ?? /^\d+<(pipe:\[\d+\])>$/.exec(line.args[0] ?? "")?.[1] ?? "") || stream || output ||
 							own.has(Number.parseInt(line.args[0] ?? "", 10)) || ownPipes.has(endpoint ?? ""))))
-					taints.add("unsupported_syscall");
+					unsupported(syscall);
 			}
 			// git refreshes its index's stat cache when it can, and reports the same without it (the repository is read-only
 			// here); a git that needed the lock (add, commit, stash) fails instead, and its refusal stays a confinement observation.
@@ -683,13 +694,13 @@ export async function observeStrace(
 				taints.add("confinement_observation");
 			}
 			// A time set on a file the tree opened for writing reaches its effects, which carry each file's modification time.
-			if (/^(?:utime|utimes|utimensat|futimesat)$/.test(syscall) && !(syscallPaths(line, syscall, cwd) ?? [""]).every(target => writable.has(target))) taints.add("unsupported_syscall");
+			if (/^(?:utime|utimes|utimensat|futimesat)$/.test(syscall) && !(syscallPaths(line, syscall, cwd) ?? [""]).every(target => writable.has(target))) unsupported(syscall);
 			if (
 				resourceLimitMutation(line, syscall) || UNMODELED_FILE_SEMANTICS_SYSCALLS.has(syscall) && !streamCall ||
 				(syscall === "pipe2" && /O_DIRECT|O_EXCL/.test(line.args[1] ?? "")) ||
 				(syscall === "ioctl" && unmodeledFileIoctl(line))
 			) {
-				taints.add("unsupported_syscall");
+				unsupported(syscall);
 			}
 			// A filesystem's statistics vary over time like the clock, whose taint every trace carries; the sandbox reports the one a
 			// native run sees, the workspace's own included.
@@ -700,12 +711,12 @@ export async function observeStrace(
 			const listing = !!listed && !directoryImage && syscallSucceeded(line);
 			if (listing) { taints.add("descriptor_observation"); listingPIDs.add(pid); listedPaths.add(listed!); if (paths.get(listed!) !== "executable") paths.set(listed!, "input"); }
 			if (UNMODELED_METADATA_SYSCALLS.has(syscall) && !listing && (syscallSucceeded(line) ? !directoryImage : directoryImage)) {
-				taints.add("unsupported_syscall");
+				unsupported(syscall);
 				incompleteReasons.add(`unmodeled_metadata:${syscall}:${pid}`);
 			}
 			if (semanticRoots.length && workspaceDriverSemanticGap(line, syscall, cwd, semanticRoots)) {
 				complete = false;
-				taints.add("unsupported_syscall");
+				unsupported(syscall);
 				incompleteReasons.add(`filesystem_semantics:${syscall}:${pid}`);
 			}
 			if (syscallSucceeded(line) && writesPath(line)) for (const target of syscallPaths(line, syscall, cwd) ?? []) { const name = workspaceName(target); if (name) written.add(name); else external.add(target); }
@@ -724,7 +735,7 @@ export async function observeStrace(
 				if (!metadataPaths.length || !observed) {
 					// fstat, or an empty *at name, of a pipe or socket
 					if (descriptorTarget(line) && !quotedArgument(line.args[1])) taints.add("descriptor_observation");
-					else { taints.add("unsupported_syscall"); incompleteReasons.add(`unparsed_metadata:${syscall}:${pid}`); }
+					else { unsupported(syscall); incompleteReasons.add(`unparsed_metadata:${syscall}:${pid}`); }
 				}
 				// A shell stats directories only to validate $PWD: their sandbox identity never reaches its output.
 				if (observed && observed.fields?.length !== 0 && !(SHELLS.has(images.get(pid) ?? "") && directory)) {
@@ -776,6 +787,8 @@ export async function observeStrace(
 		tracedProcesses: [...selected].filter(([pid, { file, start }]) => file.lines.slice(start)
 			.some((_, offset) => !ignoredSegments.get(pid)?.some(([from, to]) => start + offset >= from && start + offset < to))).length,
 		incompleteReasons: Object.freeze([...incompleteReasons].sort()),
+		...(unsupportedSyscalls.size ? { unsupportedSyscalls: Object.freeze([...unsupportedSyscalls].sort()) } : {}),
+		...(unsupportedSyscallsTruncated ? { unsupportedSyscallsTruncated: true as const } : {}),
 		...(resumedInterpositions.length ? { resumedInterpositions } : {}), written: [...written].map(name => name.slice(2)).sort(), external: [...external].sort(),
 		locks: [...locks].map(([target, exclusive]) => ({ path: target, exclusive })),
 	};
