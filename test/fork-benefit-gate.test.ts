@@ -6,8 +6,8 @@ import { testModel } from "./model.ts";
 import { BenefitGate, DEFAULT_BENEFIT_GATE_POLICY as POLICY, type BenefitObservation } from "../src/fork-benefit-gate.ts";
 
 describe("fork benefit gate", () => {
-	it("keeps censored hit benefit unknown and charges only Actor-visible adoption latency", async () => {
-		for (const expectedActorMs of [undefined, 50, 300]) {
+	it("amends one request sample with measured reuse while charging adoption cost separately", async () => {
+		for (const reusedExecutionMs of [0, 50, 300]) {
 			const budget = new DrafterTaskBudget(), batch = budget.start("drafter", true), pending = deferred<ReturnType<typeof fauxAssistantMessage>>();
 			batch.expectedBenefitMs = 1000; // Measured workflow hints may justify overlap before the final Actor outcome arrives.
 			const request = { model: testModel(), context: { messages: [] }, policy: { drafterTaskMaxRequests: 1000, drafterTaskMaxTokens: 1000000 },
@@ -17,20 +17,12 @@ describe("fork benefit gate", () => {
 			await first; budget.finish(batch); expect(batch.update).toBeUndefined();
 			await budget.run({ ...request, utility: batch }); // A continuation after turn closure runs beside the Actor.
 			pending.resolve(fauxAssistantMessage([])); await second;
-			budget.credit([batch], { hitLatencyMs: 100, expectedActorMs });
+			budget.credit([batch, batch], { reusedExecutionMs, costMs: 100 });
 			budget.start("drafter", true);
-			expect(budget.utilitySnapshot()).toMatchObject({ samples: 1, expectedNetBenefitMs: expectedActorMs === undefined ? undefined : expectedActorMs - 100 });
+			expect(budget.utilitySnapshot()).toMatchObject({ samples: 1, expectedNetBenefitMs: reusedExecutionMs - 100 });
+			expect(batch).toMatchObject({ benefitMs: reusedExecutionMs, costMs: 100 });
 			expect(batch.startedRequests).toBe(3); expect(batch.pendingRequests).toBe(0);
-			expect(Boolean(await budget.run({ ...request, utility: budget.start("drafter", true) }))).toBe(expectedActorMs === 300);
-			if (expectedActorMs === undefined) {
-				for (let index = 0, probes = 0; index < 128 && probes < 4; index++) {
-					const missed = budget.start("drafter", true);
-					if (!await budget.run({ ...request, utility: missed })) continue;
-					probes++;
-					budget.finish(missed);
-				}
-				expect(await budget.run({ ...request, utility: budget.start("drafter", true) })).toBeUndefined();
-			}
+			expect(Boolean(await budget.run({ ...request, utility: budget.start("drafter", true) }))).toBe(reusedExecutionMs === 300);
 		}
 	});
 

@@ -18,6 +18,7 @@ import { ActionSemanticsRegistry, buildPiActionKey, KEYABLE_TOOLS, PI_ACTION_SEM
 import { borrowResourceObject, createResourceSnapshotExecutionWorld, type SpeculativeAgentExecutionWorld } from "../src/agent-execution-world.ts";
 import { createSpeculativeActionHost, type CreateSpeculativeActionHostOptions } from "../src/agent-integration.ts";
 import { SpeculationScheduler } from "../src/scheduler.ts";
+import { TimelineInterval } from "../src/task-timing.ts";
 import { createDrafterPlanSource } from "../src/drafter-plan-source.ts";
 import { DrafterTaskBudget, type DrafterUtilityBatch } from "../src/drafter-budget.ts";
 import { PlanRuntime } from "../src/plan-runtime.ts";
@@ -254,6 +255,11 @@ describe("speculative action host", () => {
 			expect(proposal.actions.map(action => [action.tool, action.depth, action.dependsOn?.map(parent => parent.actionID)]))
 				.toEqual([["edit", 0, undefined], ["edit", 1, [proposal.actions[0]!.id]], ["bash", 2, [proposal.actions[1]!.id]]]);
 			const plan = new PlanRuntime(); expect(plan.apply(proposal, 0).accepted).toBe(true);
+			const reuseFeedback = proposal.actions[0]!.reuseFeedback; expect(reuseFeedback).toBeDefined();
+			for (const action of proposal.actions) {
+				expect(action.reuseFeedback).toBe(reuseFeedback);
+				expect(plan.get(proposal.id, action.id)!.action.reuseFeedback).toBe(reuseFeedback);
+			}
 			expect(plan.launchable().map(node => node.action.tool)).toEqual(["edit"]);
 			plan.rejectExecution(plan.get(proposal.id, proposal.actions[0]!.id)!.identity, cause("execution", "test_failure"));
 			expect(plan.get(proposal.id, proposal.actions[1]!.id)?.readiness).toBe("blocked");
@@ -400,7 +406,7 @@ describe("speculative action host", () => {
 		} finally { await host.dispose(); }
 	});
 
-	it.each([1, 2])("credits %i retained Drafter lineages when another source executes, preserving one total source share", async count => {
+	it.each([1, 2])("does not credit %i matched Drafter lineages for another source's physical work", async count => {
 		const tool = createReadTool(await temporaryWorkspace());
 		const controller = createDrafterPlanSource({ sessionID: "session", complete: async () => drafterCall({ path: "notes.txt" }) });
 		const propose = async (turnID: string) => {
@@ -419,17 +425,50 @@ describe("speculative action host", () => {
 			for (const action of [...old, ...old]) await controller.source.onSettled!({ proposalID: "retained", actionID: action.id, feedback: action.feedback,
 				settlement: { ...adoption, actorAction: actorAction(sequence) } });
 		};
-		const settle = (sequence: number, preview = false) => controller.actorActionSettled({ sessionID: "session", turnID: "current",
-			candidate: { source: "pattern_aware" } as never, settlement: { actorAction: actorAction(sequence),
-				provider: { kind: preview ? "actor" : "speculative", timing: { hitLatencyMs: 20, expectedActorMs: 420 } },
+		const settle = (sequence: number) => controller.actorActionSettled({ sessionID: "session", turnID: "current",
+			candidate: { source: "pattern_aware" } as never, computation: { actorComputeMs: 0, reusedExecutionMs: 420 },
+			reusedComputations: [{ source: "pattern_aware", feedback: old[0]!.reuseFeedback, reusedExecutionMs: 420 }], settlement: { actorAction: actorAction(sequence),
+				provider: { kind: "speculative", timing: { hitLatencyMs: 20, expectedActorMs: 9000 } },
 				matchedPredictions: [{ source: "drafter" }, { source: "pattern_aware" }] } as never });
 		try {
-			await stage(1); await settle(1); await settle(1); // Duplicate matches and callbacks cannot multiply a source's benefit.
-			await stage(2); await settle(2, true); await settle(2); // A preview drains staging without speculative credit.
-			await stage(3); controller.finishTurn("session", "current"); await settle(3); // Abandoned standalone staging is released.
-			for (const action of old) expect(utility(action)).toMatchObject({ benefitMs: 420 / 2 / count, costMs: 20 / 2 / count });
+			await stage(1); await settle(1);
+			await stage(2); controller.finishTurn("session", "current"); await settle(2);
+			// A historical receipt without live producer feedback cannot be assigned by matching or Actor totals.
+			await controller.actorActionSettled({ sessionID: "session", turnID: "current", computation: { actorComputeMs: 10, reusedExecutionMs: 5000 },
+				settlement: { actorAction: actorAction(3), provider: { kind: "actor", origin: "fallback", durationMs: 10, isError: false },
+					matchedPredictions: [{ source: "drafter" }] } as never });
+			for (const action of old) expect(utility(action)).toMatchObject({ benefitMs: 0, costMs: 0 });
 			expect(utility(current)).toMatchObject({ benefitMs: 0, costMs: 0 });
 		} finally { controller.finishSession(); }
+	});
+
+	it("credits consumed Drafter preparation through Actor fallback receipts without counting unrelated work", async () => {
+		const cwd = await temporaryWorkspace(), tool = createReadTool(cwd), ready = deferred<void>();
+		let now = 1000, prepared: TimelineInterval | undefined;
+		vi.spyOn(performance, "now").mockImplementation(() => now);
+		const unrelated = new TimelineInterval(0, 200);
+		TimelineInterval.producedBy(unrelated, { source: "pattern_aware", mode: "reported-files", feedback: {} });
+		const { host, events } = drafterHost("partial-drafter", { cwd,
+			getSettings: () => ({ ...settings(), drafterMaxDepth: 0 }), complete: async () => drafterCall({ path: "notes.txt" }),
+			executionWorlds: [mockRuntimeWorld(async () => {
+				prepared = TimelineInterval.own(new TimelineInterval(now, now + 120)); now += 120;
+				return { result: textResult("prepared"), isError: false };
+			})], onEvent: event => { if (event.type === "candidate" && event.state.status === "succeeded") ready.resolve(); },
+		});
+		try {
+			await host.startTurn(startInput(tool)); await ready.promise;
+			for (const id of ["first", "second"]) await host.execute({ turnID: "turn-1", id, tool: "read", args: { path: `${id}.txt` }, tools: [tool] }, undefined, async () => {
+				TimelineInterval.use(prepared); TimelineInterval.use(prepared); TimelineInterval.use(unrelated); now += 40;
+				return textResult("used preparation");
+			});
+			await host.finishTurn("turn-1", true);
+			const actors = events.filter(event => event.type === "actor_action");
+			expect(actors).toHaveLength(2);
+			for (const actor of actors) expect(actor).toMatchObject({ settlement: { provider: { kind: "actor", origin: "fallback" } },
+				computation: { actorComputeMs: 40, reusedExecutionMs: 320 } });
+			expect(host.drafterGateSnapshot()).toMatchObject({ samples: 1, expectedNetBenefitMs: 240, budget: { requests: 1 } });
+			expect(JSON.stringify(actors)).not.toContain("drafter_plan");
+		} finally { await host.dispose(); }
 	});
 
 	it("counts Drafter tokens of empty and failed requests when they are spent", async () => {

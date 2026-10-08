@@ -2,7 +2,7 @@ import { createReadTool } from "@earendil-works/pi-coding-agent";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 import { createDrafterPlanSource } from "../src/drafter-plan-source.ts";
-import { DrafterTaskBudget, drafterInputTokens, drafterOpportunityKey } from "../src/drafter-budget.ts";
+import { DrafterTaskBudget, drafterInputTokens, drafterOpportunityKey, type DrafterUtilityBatch } from "../src/drafter-budget.ts";
 import { SourceRequestSuppressed } from "../src/source-request.ts";
 import type { PlanProposal, PlanUpdate } from "../src/plan-proposal.ts";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
@@ -88,7 +88,7 @@ describe("Drafter marginal request utility", () => {
 		const probes = [];
 		for (let index = 0; index < 4; index++) probes.push(Boolean(await budget.run({ ...request, utility: budget.start("model", true) })));
 		expect(probes).toEqual([false, false, false, true]);
-		budget.credit([first], { expectedActorMs: 5000, hitLatencyMs: 1 });
+		budget.credit([first], { reusedExecutionMs: 5000, costMs: 1 });
 		expect(await budget.run({ ...request, utility: budget.start("model", true) })).toBeDefined();
 	});
 
@@ -134,7 +134,7 @@ describe("Drafter marginal request utility", () => {
 		for (let index = 0; index < 2; index++) expect(await budget.run({ ...request, utility: budget.start("failing", true) })).toBeUndefined();
 		const recovery = budget.start("failing", true), success = { ...request, complete: async () => fauxAssistantMessage([]) };
 		expect(await budget.run({ ...success, utility: recovery })).toBeDefined(); // The fourth endpoint opportunity performs a real retry.
-		budget.credit([recovery], { expectedActorMs: 500, hitLatencyMs: 0 }); budget.finish(recovery);
+		budget.credit([recovery], { reusedExecutionMs: 500 }); budget.finish(recovery);
 		expect(await budget.run({ ...success, utility: budget.start("failing", true) })).toBeDefined();
 	});
 
@@ -297,17 +297,62 @@ describe("Drafter marginal request utility", () => {
 				if (dimension === "depth" && typeof controller.source.continueOn === "function") expect(controller.source.continueOn(nextStep)).toBe(true);
 				const extra = first(await draftValue(dimension === "width" ? controller.source.propose({ ...request, proposalIndex: 1 }) : controller.source.continue!(nextStep)));
 				extras.push(Boolean(extra));
-				const credit = async (feedback: unknown) => controller.actorActionSettled({ sessionID: "session", turnID: request.startInput.turnID,
-					candidate: { source: "drafter" } as never, candidateFeedback: feedback, settlement: {
-						actorAction: { id: `hit-${round}`, sequence: round * 2 + Number(feedback !== root!.feedback), turnID: request.startInput.turnID },
-						provider: { kind: "speculative", timing: { expectedActorMs: 500, hitLatencyMs: 0 } }, matchedPredictions: [{ source: "drafter" }] } as never });
-				await credit(root!.feedback); // The first request remains useful even while its expansion is wasted.
+				const credit = async (action: NonNullable<typeof root>) => controller.actorActionSettled({ sessionID: "session", turnID: request.startInput.turnID,
+					candidate: { source: "drafter" } as never, candidateFeedback: action.feedback,
+					reusedComputations: [{ source: "drafter", feedback: action.reuseFeedback, reusedExecutionMs: 500 }], settlement: {
+						actorAction: { id: `hit-${round}`, sequence: round * 2 + Number(action !== root), turnID: request.startInput.turnID },
+						provider: { kind: "speculative", timing: { hitLatencyMs: 0 } }, matchedPredictions: [{ source: "drafter" }] } as never });
+				await credit(root!); // The first request remains useful even while its expansion is wasted.
 				controller.finishTurn("session", request.startInput.turnID); await nextTurn();
-				if (recoveredAt) { expect(extra).toBeDefined(); await credit(extra!.feedback); }
-				else if (extra && extras.includes(false)) { await credit(extra.feedback); recoveredAt = round; } // Amend the closed recovery probe.
+				if (recoveredAt) { expect(extra).toBeDefined(); await credit(extra!); }
+				else if (extra && extras.includes(false)) { await credit(extra); recoveredAt = round; } // Amend the closed recovery probe.
 			}
 			expect(extras[0]).toBe(true); expect(extras).toContain(false); expect(recoveredAt).toBeGreaterThan(1);
 			expect(calls).toHaveLength(10 + extras.filter(Boolean).length);
+		} finally { controller.finishSession(); }
+	});
+
+	it("credits measured physical work to each shared ancestor once, including later partial fallback reuse", async () => {
+		const controller = createDrafterPlanSource({ sessionID: "session", complete: async () => readReply() });
+		const request = sourceRequest("producer", { drafterMaxDepth: 2, drafterGateEnabled: false });
+		const root = first(await controller.source.propose(request))!;
+		const expand = async (action: typeof root, revision: number) => {
+			const next = { ...continuation(request, action), revision };
+			if (typeof controller.source.continueOn !== "function") throw new Error("Missing Drafter continuation");
+			expect(controller.source.continueOn(next)).toBe(true);
+			return first(await controller.source.continue!(next))!;
+		};
+		try {
+			const child = await expand(root, 1), descendant = await expand(child, 2);
+			const lineage = (action: typeof root) => action.feedback as { utility: DrafterUtilityBatch; marginalUtilities?: readonly DrafterUtilityBatch[] };
+			const ancestors = [lineage(root).utility, ...lineage(descendant).marginalUtilities!];
+			expect(ancestors).toHaveLength(3);
+			for (const action of [root, child, descendant]) {
+				const token = action.reuseFeedback as { kind: string; utilities: readonly DrafterUtilityBatch[] };
+				expect(Object.keys(token)).toEqual(["kind", "utilities"]);
+				expect(token.kind).toBe("drafter_utility"); expect(Object.isFrozen(token)).toBe(true); expect(Object.isFrozen(token.utilities)).toBe(true);
+				expect(token.utilities).toEqual([...new Set([lineage(action).utility, ...lineage(action).marginalUtilities ?? []])]);
+			}
+			controller.finishTurn("session", "producer"); await nextTurn();
+			controller.actorActionSettled({ sessionID: "session", turnID: "consumer", candidate: { source: "drafter" } as never,
+				candidateFeedback: descendant.feedback, computation: { actorComputeMs: 0, reusedExecutionMs: 450 }, reusedComputations: [
+					{ source: "drafter", feedback: child.reuseFeedback, reusedExecutionMs: 100 },
+					{ source: "drafter", feedback: descendant.reuseFeedback, reusedExecutionMs: 60 },
+					{ source: "pattern_aware", feedback: descendant.reuseFeedback, reusedExecutionMs: 200 },
+					{ source: "drafter", feedback: descendant.feedback, reusedExecutionMs: 90 },
+				], settlement: { actorAction: { id: "whole", sequence: 1, turnID: "consumer" },
+					provider: { kind: "speculative", timing: { expectedActorMs: 90000, hitLatencyMs: 7 } },
+					matchedPredictions: [{ source: "drafter" }, { source: "drafter" }, { source: "pattern_aware" }] } as never });
+			expect(ancestors.map(({ benefitMs, costMs }) => ({ benefitMs, costMs }))).toEqual([
+				{ benefitMs: 160, costMs: 7 }, { benefitMs: 160, costMs: 7 }, { benefitMs: 60, costMs: 7 },
+			]);
+			controller.actorActionSettled({ sessionID: "session", turnID: "consumer", computation: { actorComputeMs: 40, reusedExecutionMs: 100 },
+				reusedComputations: [{ source: "drafter", feedback: child.reuseFeedback, reusedExecutionMs: 100 }],
+				settlement: { actorAction: { id: "partial", sequence: 2, turnID: "consumer" },
+					provider: { kind: "actor", origin: "fallback", durationMs: 40, isError: false }, matchedPredictions: [] } as never });
+			expect(ancestors.map(({ benefitMs, costMs }) => ({ benefitMs, costMs }))).toEqual([
+				{ benefitMs: 260, costMs: 7 }, { benefitMs: 260, costMs: 7 }, { benefitMs: 60, costMs: 7 },
+			]);
 		} finally { controller.finishSession(); }
 	});
 
@@ -326,8 +371,9 @@ describe("Drafter marginal request utility", () => {
 				const root = first(await controller.source.propose(request))!;
 				losing.push(Promise.resolve(controller.source.propose({ ...request, proposalIndex: 1 })).catch(() => undefined)); await nextTurn();
 				await controller.actorActionSettled({ sessionID: "session", turnID: request.startInput.turnID, candidate: { source: "drafter" } as never,
-					candidateFeedback: root.feedback, settlement: { actorAction: { id: request.startInput.turnID, sequence: calls, turnID: request.startInput.turnID },
-						provider: { kind: "speculative", timing: { expectedActorMs: 500, hitLatencyMs: 0 } },
+					candidateFeedback: root.feedback, reusedComputations: [{ source: "drafter", feedback: root.reuseFeedback, reusedExecutionMs: 500 }],
+					settlement: { actorAction: { id: request.startInput.turnID, sequence: calls, turnID: request.startInput.turnID },
+						provider: { kind: "speculative", timing: { hitLatencyMs: 0 } },
 						matchedPredictions: [{ source: "drafter" }] } as never });
 			}
 			for (const index of [3, 1, 2, 0]) { controller.finishTurn("session", requests[index]!.startInput.turnID); pending.get(index * 2 + 1)!.resolve(); }
