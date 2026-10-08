@@ -20,7 +20,7 @@ function fixture(certificate: ProcessProvenanceCertificate = unusable, source: "
 		prototype: (...args: unknown[]) => Promise<unknown>;
 		executeRequest: (...args: unknown[]) => Promise<unknown>;
 		executeBinding: (session: unknown, binding: ProcessExecutionBinding) => Promise<unknown>;
-		recordPreparedResult: (session: unknown, certificate: ProcessProvenanceCertificate) => boolean;
+		recordPreparedResult: (session: unknown, certificate: ProcessProvenanceCertificate, hasInputResources: boolean) => boolean;
 	};
 	const invocation = { sourceRoot: "/workspace", executable: "/bin/tool", cwd: "/workspace", argv0: "tool", args: [], environment: { MODE: "test" }, outputRoute: [1, 2],
 		...(source === "producer" ? { producer: SPECULATIVE_PRODUCER } : {}),
@@ -29,12 +29,12 @@ function fixture(certificate: ProcessProvenanceCertificate = unusable, source: "
 				queue: { eof: false, bytes: 6, capacity: 4096, producer: "live" } } } } } : {}) };
 	const observe = (next = prototype, context = invocation) => internal.handoffs.observe(processWeakKey(next), next.executablePath, scope, context, 6000)!;
 	const binding = observe(), controller = new AbortController();
-	const session = { sourceRoot: "/workspace", scope, nestedProducer: SPECULATIVE_PRODUCER, projection: { toPhysical: (value: string) => value }, preparedResults: 0,
+	const session = { sourceRoot: "/workspace", scope, nestedProducer: SPECULATIVE_PRODUCER, projection: { toPhysical: (value: string) => value }, preparedResults: 0, closedInputFailures: 0,
 		workspace: { structure: { capture: vi.fn(async () => ({})) } }, signal: controller.signal, computations: [], metrics: { ...emptyWorldReuseMetrics() } };
 	const describe = vi.spyOn(internal, "prototype").mockResolvedValue(prototype);
 	const execute = vi.spyOn(internal, "executeRequest").mockImplementation(async () => ({
 		kind: certificate.result.continuation ? "suspended" : "executed", exit: certificate.result.exit,
-		reusable: internal.recordPreparedResult(session, certificate),
+		reusable: internal.recordPreparedResult(session, certificate, source === "resources"),
 	}));
 	return { internal, invocation, observe, binding, controller, session, execute, describe,
 		run: (selected = binding) => internal.executeBinding(session, selected),
@@ -63,6 +63,38 @@ describe("native preparation evidence", () => {
 		} finally { test.close(); }
 	});
 
+	it.each([false, true])("retires closed-input parent and child failures only after both seal (incompleteChild=%s)", async incompleteChild => {
+		const test = fixture();
+		test.execute.mockImplementation(async () => {
+			test.session.metrics.requests++;
+			const child = incompleteChild ? processCertificate(prototype, { dependencyCertificate: { complete: false, dependencies: [], taints: [] } }) : unusable;
+			expect(test.internal.recordPreparedResult(test.session, child, false)).toBe(false);
+			return { kind: "executed", exit: { kind: "code", code: 0 }, reusable: test.internal.recordPreparedResult(test.session, unusable, false) };
+		});
+		try {
+			await expect(test.run()).rejects.toThrow("bound process preparation produced no reusable result");
+			expect(test.session.closedInputFailures).toBe(2);
+			expect(test.binding.available).toBe(false);
+			expect(test.observe()).toBe(test.binding);
+			await expect(test.run()).rejects.toThrow("binding is unavailable");
+			expect(test.execute).toHaveBeenCalledOnce();
+		} finally { test.close(); }
+	});
+
+	it("preserves a parent when an additional request has no sealed result", async () => {
+		const test = fixture();
+		test.execute.mockImplementation(async () => {
+			// Hits, bypasses and unsealed failures do not report a new sealed negative.
+			test.session.metrics.requests++;
+			return { kind: "executed", exit: { kind: "code", code: 0 }, reusable: test.internal.recordPreparedResult(test.session, unusable, false) };
+		});
+		try {
+			await expect(test.run()).resolves.toMatchObject({ exit: { code: 0 } });
+			expect(test.session.closedInputFailures).toBe(1);
+			expect(test.binding.available).toBe(true);
+		} finally { test.close(); }
+	});
+
 	it.each(["completed", "one-shot", "continuation", "nonzero"] as const)("preserves %s evidence independently of disk publication", async kind => {
 		const certificate = processCertificate(prototype, {
 			dependencyCertificate: { complete: true, dependencies: [], taints: kind === "one-shot" ? ONE_SHOT_TAINTS : [] },
@@ -84,8 +116,8 @@ describe("native preparation evidence", () => {
 		test.execute.mockImplementation(async () => {
 			test.internal.recordPreparedResult(test.session, processCertificate(prototype, continuation ? {
 				result: { replayProfile: "buffered_noninteractive", journal: [], continuation: { imageDigest: sha256Digest("frontier"), imageBytes: 8 } },
-			} : {}));
-			return { kind: "executed", exit: { kind: "code", code: 0 }, reusable: test.internal.recordPreparedResult(test.session, unusable) };
+			} : {}), false);
+			return { kind: "executed", exit: { kind: "code", code: 0 }, reusable: test.internal.recordPreparedResult(test.session, unusable, false) };
 		});
 		try { await expect(test.run()).resolves.toMatchObject({ exit: { code: 0 } }); expect(test.binding.available).toBe(true); }
 		finally { test.close(); }
@@ -109,13 +141,28 @@ describe("native preparation evidence", () => {
 		const test = fixture();
 		test.execute.mockImplementation(async () => {
 			test.session.metrics.requests++;
-			expect(test.internal.recordPreparedResult(test.session, seed)).toBe(false);
-			return { kind: "executed", exit: { kind: "code", code: 0 }, reusable: test.internal.recordPreparedResult(test.session, unusable) };
+			expect(test.internal.recordPreparedResult(test.session, seed, true)).toBe(false);
+			return { kind: "executed", exit: { kind: "code", code: 0 }, reusable: test.internal.recordPreparedResult(test.session, unusable, false) };
 		});
 		try {
 			await expect(test.run()).resolves.toMatchObject({ exit: { code: 0 } });
 			expect(test.binding.available).toBe(true);
 			expect(test.session.preparedResults).toBe(0);
+		} finally { test.close(); }
+	});
+
+	it("preserves a captured resource seed even when its eventual completed result is hard-tainted", async () => {
+		const test = fixture();
+		test.execute.mockImplementation(async () => {
+			test.session.metrics.requests++;
+			// An extra inherited live descriptor can support an earlier frontier even with stdin closed.
+			expect(test.internal.recordPreparedResult(test.session, unusable, true)).toBe(false);
+			return { kind: "executed", exit: { kind: "code", code: 0 }, reusable: test.internal.recordPreparedResult(test.session, unusable, false) };
+		});
+		try {
+			await expect(test.run()).resolves.toMatchObject({ exit: { code: 0 } });
+			expect(test.session.closedInputFailures).toBe(1);
+			expect(test.binding.available).toBe(true);
 		} finally { test.close(); }
 	});
 
