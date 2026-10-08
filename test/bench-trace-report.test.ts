@@ -90,4 +90,18 @@ describe("slow tool call diagnosis", () => {
 	it("does not fabricate elapsed waits or a coverage percentage for unfinished calls", () => {
 		expect(slowCallReport([], [{ id: "running", startedAt: 100 }])).toMatchObject({ measuredCalls: 0, slowCalls: 0, slowCallWaitFraction: null, calls: [] });
 	});
+
+	it("keeps a whole Actor preview distinct from computation reused inside fallback execution", () => {
+		const identity = { id: "preview", sequence: 1, turnID: "turn" };
+		const event: SpeculativeActionEvent<string> = {
+			sessionID: "session", turnID: "turn", timestamp: 1000, cache: emptySpeculativeTraceSummary().cache, type: "actor_action",
+			settlement: { actorAction: identity, tool: "read", matchedPredictions: [], rejections: [],
+				provider: { kind: "actor", origin: "preview", candidateID: "candidate", durationMs: 600, isError: false,
+					toolExecution: new TimelineInterval(0, 600) } },
+			actualAction: "read source", computation: { actorComputeMs: 0, reusedExecutionMs: 600 },
+		};
+		expect(slowCallReport([event], [{ id: "preview", startedAt: 0, completedAt: 700 }]).calls[0]).toMatchObject({
+			partialReuse: false, actor: { computation: { actorComputeMs: 0, reusedExecutionMs: 600 } },
+		});
+	});
 });
