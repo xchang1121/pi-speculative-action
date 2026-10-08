@@ -5,7 +5,7 @@ import type { CandidateEventDescriptor, SpeculativeActionEvent } from "./events.
 import type { ExecutionOperationAdoption, ExecutionOperationBinding, ExecutionScope, SpeculativeExecutionRoute, WorldBranch, WorldResultCapture } from "./execution-world.ts";
 import type { PlanAction, PlanProposal, PlanUpdate } from "./plan-proposal.ts";
 import type { ActorActionIdentity, ActorActionSettlement, PlanActionIdentity, PredictionSettlement, SettledSourceRequest } from "./settlement.ts";
-import type { TimelineInterval } from "./task-timing.ts";
+import type { ComputationReuseShare, TimelineInterval, ToolComputationTiming } from "./task-timing.ts";
 
 export type { SpeculativeActionEvent, SpeculativeCacheSnapshot } from "./events.ts";
 
@@ -82,6 +82,9 @@ export interface ActorActionFeedback<SessionID> extends TurnIdentity<SessionID> 
 	readonly candidate?: CandidateEventDescriptor;
 	/** Opaque producer-owned feedback of the execution owner, including cross-turn cache adoption. */
 	readonly candidateFeedback?: unknown;
+	readonly computation?: ToolComputationTiming;
+	/** Measured consumption attributed to live physical producers, including partial Actor fallback reuse. */
+	readonly reusedComputations?: readonly ComputationReuseShare[];
 }
 
 /** Policy-facing prediction outcome with the tool context omitted from generic settlement identity. */

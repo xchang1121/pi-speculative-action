@@ -64,3 +64,38 @@ function countBy<Value>(values: readonly Value[], key: (value: Value) => string,
 	}
 	return counts;
 }
+
+/** Wall-clock ranking for diagnosis, independent of the computation speedup denominator. */
+export function slowCallReport<SessionID>(events: readonly SpeculativeActionEvent<SessionID>[],
+	waits: readonly { readonly id: string; readonly startedAt: number; readonly completedAt?: number }[], thresholdMs = 500) {
+	const measured = waits.flatMap(wait => wait.completedAt !== undefined && Number.isFinite(wait.startedAt + wait.completedAt) && wait.completedAt >= wait.startedAt
+		? [{ ...wait, wallMs: wait.completedAt - wait.startedAt }] : []);
+	const slow = measured.filter(wait => wait.wallMs >= thresholdMs).sort((left, right) => right.wallMs - left.wallMs);
+	const calls = slow.map(wait => {
+		const actors = events.filter((event): event is Extract<SpeculativeActionEvent<SessionID>, { readonly type: "actor_action" }> =>
+			event.type === "actor_action" && event.settlement.actorAction.id === wait.id);
+		if (actors.length !== 1) return { ...wait, diagnosis: actors.length ? "settlement_ambiguous" as const : "settlement_unavailable" as const };
+		const actor = actors[0]!;
+		const { settlement, computation } = actor, identity = settlement.actorAction;
+		const predictions = events.filter(event => event.type === "prediction" || event.type === "operation_prediction").filter(event => event.sessionID === actor.sessionID &&
+			event.settlement.observation === "observed" && event.settlement.actorAction.id === identity.id && event.settlement.actorAction.kind === identity.kind &&
+			event.settlement.actorAction.sequence === identity.sequence && event.settlement.actorAction.turnID === identity.turnID);
+		const candidateIDs = new Set(settlement.rejections.map(rejection => rejection.candidateID));
+		if (settlement.provider.candidateID) candidateIDs.add(settlement.provider.candidateID);
+		for (const event of predictions) if (event.settlement.observation === "observed" && event.settlement.match.matched && event.settlement.match.adoption.candidateID)
+			candidateIDs.add(event.settlement.match.adoption.candidateID);
+		return {
+			...wait, diagnosis: "recorded_settlement" as const,
+			actor: traceEvents([actor])[0]!,
+			partialReuse: settlement.provider.kind === "actor" && (computation?.reusedExecutionMs ?? 0) > 0,
+			// These requests target the same decision; their outcomes are context, not proof of why this command missed.
+			sourceRequestsForDecision: traceEvents(events.filter(event => event.type === "source_request" && event.sessionID === actor.sessionID &&
+				event.request.request.targetDecisionSequence === (identity.decisionSequence ?? identity.sequence))),
+			predictions: traceEvents(predictions),
+			candidates: traceEvents(events.filter(event => event.type === "candidate" && event.sessionID === actor.sessionID && candidateIDs.has(event.candidate.id))),
+		};
+	});
+	const summedCallWaitMs = measured.reduce((sum, wait) => sum + wait.wallMs, 0), summedSlowCallWaitMs = slow.reduce((sum, wait) => sum + wait.wallMs, 0);
+	return { thresholdMs, measuredCalls: measured.length, slowCalls: calls.length, summedCallWaitMs, summedSlowCallWaitMs,
+		slowCallWaitFraction: summedCallWaitMs > 0 ? summedSlowCallWaitMs / summedCallWaitMs : null, calls };
+}

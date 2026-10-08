@@ -3,7 +3,7 @@ import { processPrototype, processCertificate as sealFixture } from "./process-f
 import { describe, expect, it, vi } from "vitest";
 import { type ProcessHandoff, ProcessHandoffOwnership, ProcessHandoffRegistry } from "../src/process-handoff.ts";
 import { effectCommitFailure } from "../src/effect-transaction.ts";
-import { TimelineInterval } from "../src/task-timing.ts";
+import { TaskTimeline, TimelineInterval } from "../src/task-timing.ts";
 import { sha256Digest as digest, type ProcessProvenanceCertificate, type Sha256Digest } from "../src/provenance-certificate.ts";
 
 const SCOPE = { sessionID: "session", turnID: "turn" };
@@ -11,6 +11,20 @@ const OTHER_SCOPE = { sessionID: "session", turnID: "other" };
 const livePlan = async (live?: readonly ProcessProvenanceCertificate[]) => live?.[0] && { certificate: live[0] };
 
 describe("ProcessHandoffRegistry", () => {
+	it("publishes the original calculation graph once, excluding nested replay overhead", async () => {
+		const fixture = await producer();
+		const overhead = new TimelineInterval(20, 40), input = new TimelineInterval(200, 250);
+		const computation = new TimelineInterval(10, 110, [{ computation: overhead, overhead: true }, { computation: input, reused: true }]);
+		await fixture.registry.publish(fixture.key, fixture.work, fixture.certificate, async () => false, undefined, computation);
+		expect(fixture.work.computation).toBe(computation);
+		const receipt = await fixture.actor();
+		expect(receipt).toMatchObject({ kind: "hit", producer: { computation } });
+		expect(new TaskTimeline(0).recordTool(fixture.work.computation!, true)).toMatchObject({ actorComputeMs: 0, reusedExecutionMs: 130 });
+		expect(fixture.registry.complete(fixture.key, fixture.work, fixture.certificate)).toBe(false);
+		expect(fixture.work.computation).toBe(computation);
+		fixture.registry.dispose();
+	});
+
 	it("owns continuation memory once, within scope and the common retention budget", async () => {
 		for (const revoke of ["consume", "clear", "budget", "dispose"]) {
 			const fixture = await producer(false, new ProcessHandoffRegistry<unknown>(8, 100));

@@ -10,12 +10,39 @@ import { createExecPrototype, dependencyPathsetKey, type DynamicDependency, type
 	sha256Digest } from "../src/provenance-certificate.ts";
 import { captureAbsenceDependency, captureDirectoryDependency, captureFileDependency, captureMetadataDependency,
 	captureSymlinkDependency, validateDynamicDependencyCertificate, validateProcessCertificate } from "../src/provenance-validation.ts";
+import { TaskTimeline, TimelineInterval } from "../src/task-timing.ts";
 
 const { create: workspace, dispose } = temporaryDirectories("pi-provenance-");
 
 afterEach(dispose);
 
 describe("process provenance certificates", () => {
+	it("retains calculation graphs without changing execution identity", () => {
+		const input = new TimelineInterval(200, 250), overhead = new TimelineInterval(20, 40);
+		const original = new TimelineInterval(10, 110, [{ computation: overhead, overhead: true }, { computation: input, reused: true }]);
+		const computation = TimelineInterval.serialize(original);
+		expect(computation).toBeDefined();
+		const plain = processCertificate(prototype()), measured = processCertificate(prototype(), {
+			result: { ...plain.result, observedProcessMs: 999, computation },
+		});
+		expect(measured.id).toBe(plain.id);
+		const parsed = parseProcessCertificate(JSON.parse(JSON.stringify(measured)))!;
+		expect(parsed).toBeDefined();
+		expect(parsed.result.computation).toEqual(computation);
+		expect(Object.isFrozen(parsed.result.computation)).toBe(true);
+		const restored = TimelineInterval.restore(parsed.result.computation)!;
+		expect(new TaskTimeline(0).recordTool(restored, true)).toMatchObject({ actorComputeMs: 0, reusedExecutionMs: 130 });
+	});
+
+	it("ignores malformed accounting metadata without changing valid replay evidence", () => {
+		const plain = processCertificate(prototype());
+		for (const computation of [null, "invalid", { version: 999, root: "bad", nodes: [] }]) {
+			const parsed = parseProcessCertificate({ ...plain, result: { ...plain.result, computation } });
+			expect(parsed?.id).toBe(plain.id);
+			expect(parsed?.result.computation).toBeUndefined();
+		}
+	});
+
 	it("invalidates a byte-identical change of file aliases", async () => {
 		const root = await workspace(), resolvePath = (logical: string) => path.join(root, path.posix.relative("/workspace", logical));
 		for (const name of ["a", "c"]) await writeFile(path.join(root, name), "same");

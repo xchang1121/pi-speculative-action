@@ -57,7 +57,7 @@ npm run bench:suite -- --suite swe_diverse --repeats 3 --label speculative
 
 `--prepare-only` 只准备数据集和 checkout。套件见 `suite.json`；`--output-root` 指定产物目录，默认使用系统临时目录。密钥只从环境读取，移入 Pi 的内存凭据后从进程环境删除（Actor 的 shell 读不到），不写入录制或报告。测试工作区、录制和报告使用后清理，只保留必要结论和未解决失败的最小证据。
 
-运行经 Pi SDK 加载已安装的扩展（Pi 默认工具与系统提示、Linux 进程复用、沙箱与快照路线），设置写入运行专属 agent 目录；Linux 路线需在 WSL/Linux 中运行并提供 `PI_SPEC_SANDLOCK`/`PI_SPEC_HELD_EXEC`/`PI_SPEC_STRACE`。`bench:suite -- --paired` 对每个实例与重复交替先后运行开/关两臂，报告 `pairedToolSpeedup`（关的工具等待总时长 / 开的工具等待总时长，可 < 1）及各臂汇总。
+运行经 Pi SDK 加载已安装的扩展（Pi 默认工具与系统提示、Linux 进程复用、沙箱与快照路线），设置写入运行专属 agent 目录；Linux 路线需在 WSL/Linux 中运行并提供 `PI_SPEC_SANDLOCK`/`PI_SPEC_HELD_EXEC`/`PI_SPEC_STRACE`。`bench:suite -- --paired` 对每个实例与重复交替先后运行开/关两臂，报告 `pairedToolWaitRatio`（关的工具等待总时长 / 开的工具等待总时长，可 < 1）及各臂汇总。该配对等待比是原始延迟诊断，与计算加速比 `toolSpeedup` 分开。
 
 常用开关：`--drafter-disabled` 关闭 Drafter，`--drafter-max-depth 0` 关闭续推，`--pattern-aware --pattern-state <目录>` 启用并持久化模式学习，`--self-speculation` 启用经 Drafter 读取 Actor 推理的 fork（`forkTransport: "drafter"`），`--drafter-pattern-hints` 让 Drafter 看到 PatternAware 预期的调用（A/B）。共享模式状态不共享工作区文件；默认最多 128 轮，达到上限属于未完成。
 
@@ -72,19 +72,25 @@ npm run bench:suite -- --suite swe_diverse --repeats 3 --label speculative
 | Actor 资源争用与内部进程接管 | `test/runtime-engine.test.ts`、`test/linux-process-world.test.ts` | 并发与跨轮资源预留、物理回收、当前调用的内部计算保留与一次采纳 |
 | 自然修改与验证任务 | `bench:suite -- --suite swe_smoke --paired` | 最终回复、补丁、数据集指定测试、完整计时和实测 token/费用 |
 
-汇总时保留低命中、失败、超时及较慢样本，分别报告工具加速比、累计掩盖时延、工具等待均值/P95、命中率、token 和任务正确性。构造的模型时序、组件资格和单个真实任务分别报告。
+汇总时保留低命中、失败、超时及较慢样本，分别报告工具加速比、累计剩余计算与毛复用计算耗时、工具等待均值/P95、命中率、token 和任务正确性。构造的模型时序、组件资格和单个真实任务分别报告。
 
 ## 计时与验收规则
 
-工具加速比为 `(toolWaitMs + hiddenLatencyMs) / toolWaitMs`。工具等待按 Actor 调用起止区间取并集，包含准备、验证、采纳、回退和结算；模型思考时间不进入分母。累计工具节省时延按同次执行的串行反事实计算，包含实际消费的部分进程、跨工具输入、预处理及跨轮保留工作，去重计算身份和共享子区间，并保留原生并行性；没有工具等待时比值为 `null`。
+工具加速比为 `(E + R) / E`：`E = actorComputeMs` 是 Actor 当前调用剩余的实际计算耗时，不包含验证、采纳和交付；`R = reusedExecutionMs` 是当前调用实际消费的复用计算在首次执行时记录的毛耗时。整条结果、部分进程、跨工具输入、准备及跨轮保留工作均可贡献 R；同一调用按计算身份去重，同次原始执行的父子区间取并集，不计未消费的兄弟进程，独立的后续调用再次复用时再次记账。计算来源随证书保留；只有未分离开销的历史进程耗时不能充当计算收益。来源缺失、无效或超出记录上限时保留其他已知贡献，并设置 `reusedExecutionIncomplete`，表示收益下界。记录完整、E 为零且 R 为正时报告 `fullyReused`，比值为 `null`；E 未知、复用记录不完整或 E、R 均为零时比值也为 `null`，界面显示 `n/a`。
+
+`toolWaitMs` 仅作原始延迟诊断，按 Actor 调用起止区间取并集，包含准备、验证、采纳、回退和结算；它不包含模型思考时间，也不作为计算加速比的分母。
+
+关闭投机的基线运行目前只有 SDK 工具事件；这些事件的区间包含验证、交付和排队，无法分离实际计算，因此 E 记为未知、R 记为零，计算加速比为 `null`。其原始工具等待仍可用于 `pairedToolWaitRatio`。
 
 任务计时从 Host/工具初始化前到终态结算和回收完成，包含准备、预测、执行、验证、采纳、拒绝与清理。数据集下载、checkout 和最终补丁检查在计时外。完整 Host 返回与内部 `hitLatencyMs` 分开；running 接管还需区分接入、剩余执行与完成后交付。
 
 未执行的预测只报告阻塞和匹配事实，不推算潜在节省。`traces` 的来源请求、预测、候选和 Actor 调用保留原事件结构，仅移除 `cache`/`sessionID`；通过 turn、decision、prediction 和 candidate ID 关联，预算或门控拒绝保存在来源请求的 `empty.cause`。事件和工具等待端点使用 epoch 毫秒；`provider.toolExecution` 的单调端点加 `metadata.monotonicTimeOrigin` 后可对齐。报告复用这些既有计时，不额外采集工具计时或可由记录还原的汇总。
 
+`traces.slowCalls` 将等待至少 500ms 的调用按实际等待时长排序，连接唯一 Actor 结算、预测与候选记录，并标出部分复用。同一决策的来源请求作为上下文保留，其预算结果不自动当作该调用的失配原因；调用 ID 重复时明确标记归因不确定。`summary.slowCallCoverage` 报告慢调用占全部已完成调用等待总和的比例，这个诊断总和不等于并行等待区间的并集。
+
 正确性先于计时：核对完整输入输出、后续模型 payload、thinking、工具批次、预算、usage、逐步文件效果、最终回复、单次执行及零残留。Pattern 按各自实际批次顺序进入真实 Store，不随意重排以掩盖差异。保留较慢、失败和未命中样本，不将组件或构造时序推广为自然任务收益。
 
 模型报告的 `patchCandidate` 仅标记已结束、补丁干净且文件有交集的运行；正确性仍需数据集的 `FAIL_TO_PASS`/`PASS_TO_PASS`。prompt 或回收抛错时，单次报告保留计时、usage 和各阶段的 `benchmarkErrors`，写出后以失败状态退出。套件保留本次 runner 失败前写出的报告和原始退出错误，停止后续任务；已有单次输出不会被覆盖，无法读取的 summary 不补造计时。
 
-套件总表与分任务表均纳入所有有完整工具计时的样本，包括失败和慢样本；先累计工具等待和掩盖时延，再计算工具加速比，同时报告均值、P95 和样本数。缺失或无效计时单列为 `unmeasuredRuns`，失败原因保留在 `invalidRuns`。工具加速比不证明任务正确性或端到端净收益。
+套件总表与分任务表均纳入所有有完整 E、R 测量的样本，包括失败和慢样本；先分别累计 E、R，再计算工具加速比，同时报告均值、P95 和样本数。缺失、无效或不完整 E、R 的样本不进入主要加速比汇总，单列为 `unmeasuredRuns`；`diagnostics` 仍累计所有已知毛收益和原始等待，收益下界标志不会丢失，失败原因保留在 `invalidRuns`。工具加速比不证明任务正确性或端到端净收益。
 冻结的 [既有发布资格说明](./results/release-qualification-2026-09-03.md) 仅对应其原版本，不代表当前代码已再次验收。

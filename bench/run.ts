@@ -1,5 +1,6 @@
 import { safeName } from "./suite-report.ts";
-import { benchmarkTraceReport } from "./trace-report.ts";
+import { parsePatternPresets } from "./pattern-options.ts";
+import { benchmarkTraceReport, slowCallReport } from "./trace-report.ts";
 import { execFile } from "node:child_process";
 import { mkdtemp, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -66,6 +67,7 @@ const { values } = parseArgs({
 		"run-name": { type: "string" },
 		output: { type: "string" },
 		"pattern-state": { type: "string" },
+		"pattern-presets": { type: "string" },
 		"drafter-disabled": { type: "boolean", default: false },
 		"speculation-disabled": { type: "boolean", default: false },
 		"pattern-aware": { type: "boolean", default: false },
@@ -104,6 +106,7 @@ const options = {
 	drafterEnabled: !(values["drafter-disabled"] ?? false),
 	speculationEnabled: !values["speculation-disabled"],
 	patternAware: values["pattern-aware"] ?? false,
+	patternPresets: parsePatternPresets(values["pattern-presets"]),
 	selfSpeculation: values["self-speculation"] ?? false,
 	drafterPatternHints: values["drafter-pattern-hints"] ?? false,
 	prepareOnly: values["prepare-only"] ?? false,
@@ -183,7 +186,8 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		drafterTaskMaxTokens: input.drafterTaskMaxTokens,
 		drafterDeterministicCandidates: input.drafterDeterministicCandidates, drafterTemperatureMin: input.drafterTemperatureMin, drafterPatternHints: input.drafterPatternHints,
 		drafterTemperatureMax: input.drafterTemperatureMax, candidateLimit: input.candidateLimit, maxConcurrentActions: input.maxConcurrentActions,
-		predictionTimeoutMs: input.timeoutMs, patternAware: { enabled: input.patternAware },
+		predictionTimeoutMs: input.timeoutMs, patternAware: { enabled: input.patternAware,
+			...(input.patternPresets !== undefined ? { presets: input.patternPresets } : {}) },
 		...(input.selfSpeculation ? { selfSpeculation: { enabled: true, forkTransport: "drafter" } } : {}), draftModel: `${input.drafter.provider}/${input.drafter.id}`,
 	}));
 	process.env.PI_CODING_AGENT_DIR = agentDir;
@@ -232,7 +236,9 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		}
 		if (event.type === "tool_execution_end") {
 			const wait = toolWaits.get(event.toolCallId);
-			if (wait) wait.finish(wait.completedAt = performance.now());
+			if (wait && wait.completedAt === undefined) {
+				wait.finish(wait.completedAt = performance.now());
+			}
 		}
 		if (event.type === "turn_end" && ++turns >= input.maxTurns) void session.abort();
 	});
@@ -268,6 +274,13 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	const summary = summarizeSpeculativeTrace(events);
 	const { sourceRequestTrace, predictionTrace, candidateTrace, actorActionTrace, ...dimensions } = benchmarkTraceReport(events, actorActionsByTool, input.speculationEnabled);
 	const toolWaitMs = toolTimeline.measure(taskCompletedAt).toolWaitMs;
+	const waitTrace = [...toolWaits].map(([id, { startedAt, completedAt }]) => ({ id, startedAt: performance.timeOrigin + startedAt,
+		completedAt: completedAt === undefined ? undefined : performance.timeOrigin + completedAt }));
+	const { calls: slowCalls, ...slowCallCoverage } = slowCallReport(events, waitTrace);
+	const computation = input.speculationEnabled
+		? { actorComputeMs: summary.tasks ? summary.actorComputeMs : undefined, reusedExecutionMs: summary.tasks ? summary.reusedExecutionMs : undefined,
+			reusedExecutionIncomplete: summary.reusedExecutionIncomplete }
+		: { actorComputeMs: undefined, reusedExecutionMs: 0 }; // SDK events include preparation and delivery; only raw waits are measured here.
 	const changedFiles = lines((await command("git", ["-C", task.workspace, "diff", "--name-only"])).stdout);
 	const goldFiles = patchFiles(task.row.patch);
 	const testPatchFiles = patchFiles(task.row.test_patch);
@@ -288,6 +301,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			drafter: `${drafter.provider}/${drafter.id}`,
 			timingScope: "setup, Agent prompt, terminal settlement, extension shutdown",
 			monotonicTimeOrigin: performance.timeOrigin,
+			timingModel: "actor_compute_gross_v1",
 			patternState: input.patternState ?? "isolated-per-run",
 			executionBoundary: "installed extension routes",
 			executionRoutes: finalMetrics ? { ...finalMetrics[1], primaryIDs: [...finalMetrics[1].primaryIDs] } : null,
@@ -302,7 +316,12 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			agentPromptMs: agentCompletedAt - agentStartedAt,
 			teardownMs: taskCompletedAt - agentCompletedAt,
 			toolWaitMs,
-			toolSpeedup: toolSpeedup({ toolWaitMs, hiddenLatencyMs: summary.hiddenLatencyMs }),
+			slowCallCoverage,
+			actorComputeMs: computation.actorComputeMs,
+			reusedExecutionMs: computation.reusedExecutionMs,
+			reusedExecutionIncomplete: computation.reusedExecutionIncomplete,
+			toolSpeedup: computation.reusedExecutionMs === undefined ? null : toolSpeedup({ ...computation, reusedExecutionMs: computation.reusedExecutionMs }),
+			fullyReused: !computation.reusedExecutionIncomplete && computation.actorComputeMs === 0 && (computation.reusedExecutionMs ?? 0) > 0,
 			actorActions,
 			actorActionsByTool,
 			actorFallbacks: input.speculationEnabled ? summary.actorFallbacks : actorActions,
@@ -344,8 +363,8 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 				return { ...action, wallMs: wait?.completedAt === undefined ? undefined : wait.completedAt - wait.startedAt };
 			}),
 			// Event timestamps use epoch milliseconds; align the existing monotonic wait boundaries for joins.
-			toolWaits: [...toolWaits].map(([id, { startedAt, completedAt }]) => ({ id, startedAt: performance.timeOrigin + startedAt,
-				completedAt: completedAt === undefined ? undefined : performance.timeOrigin + completedAt })),
+			toolWaits: waitTrace,
+			slowCalls,
 		},
 	};
 }

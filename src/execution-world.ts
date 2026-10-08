@@ -111,6 +111,8 @@ export interface ExecutionOperationAdoption {
 	readonly operationIdentity: string;
 	/** What producing the adopted result took, which the adopting call did not spend. */
 	readonly executionMs?: number;
+	/** The exact successful-consumption receipt also passed to authoritative computation accounting. */
+	readonly computation?: TimelineDependency;
 }
 
 /**

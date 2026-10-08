@@ -5,6 +5,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { safeName, summarizePairs, summarizeSuite, type SuiteBenchmarkRun, type SuiteBenchmarkSummary } from "./suite-report.ts";
+import { parsePatternPresets } from "./pattern-options.ts";
 
 type SuiteFile = Readonly<Record<string, readonly string[]>>;
 
@@ -20,6 +21,11 @@ const instances = suites[parsed.suite];
 if (!instances) throw new Error(`Unknown suite ${parsed.suite}; expected ${Object.keys(suites).join(", ")}`);
 for (const option of ["--instance", "--output", "--prepare-only", ...(parsed.paired ? ["--speculation-disabled"] : [])]) {
 	if (hasOption(parsed.forwarded, option)) throw new Error(`${option} is controlled by the suite runner`);
+}
+if (hasOption(parsed.forwarded, "--pattern-presets")) {
+	const selection = optionValue(parsed.forwarded, "--pattern-presets");
+	if (selection === undefined || selection.startsWith("--")) throw new Error("--pattern-presets requires a value");
+	parsePatternPresets(selection); // Validate before creating outputs; forward the explicit selection unchanged to every arm.
 }
 
 const label = optionValue(parsed.forwarded, "--label") ?? "baseline";

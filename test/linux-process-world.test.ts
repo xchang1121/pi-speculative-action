@@ -14,7 +14,7 @@ import { createBashTool, createLocalBashOperations, createReadTool, createGrepTo
 import { describe, expect, test, vi } from "vitest";
 import { buildActionKey, buildPiActionKey, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { linuxOverlayfsCapability } from "../src/linux-overlayfs.ts";
-import { inspectHeldExecProcess, LinuxHeldExecBoundary, type HeldExecProcess } from "../src/linux-held-exec.ts";
+import { inspectHeldExecProcess, LinuxHeldExecBoundary, type HeldExecProcess, type HeldExecTiming } from "../src/linux-held-exec.ts";
 import { effectCommitFailure } from "../src/effect-transaction.ts";
 import { LinuxProcessReuseBackend, validateTransferredProcessEvidence } from "../src/linux-process-backend.ts";
 import { ProcessHandoffOwnership, ProcessHandoffRegistry, type ProcessHandoff, type ProcessExecutionBinding } from "../src/process-handoff.ts";
@@ -786,11 +786,11 @@ int main(int argc, char **argv) {
 				.find(event => event.turnID === "prepared")!.settlement.provider.toolExecution;
 			const timeline = new TaskTimeline(0), laterTask = new TaskTimeline(execution.startedAt);
 			for (const clock of [timeline, laterTask]) clock.recordTool(execution);
-			expect(timeline.measure(execution.completedAt).authoritativeToolCount,
-				JSON.stringify({ execution, metrics: fixture.backend.actorMetrics(), producer: fixture.backend.metrics(), bindings: fixture.backend.executionBindings(later), operations: events.filter(event => event.type === "operation_prediction") })).toBe(stalePreparation ? 1 : 2);
-			expect(laterTask.measure(execution.completedAt).authoritativeToolCount).toBe(stalePreparation ? 1 : 2);
-			expect(laterTask.measure(execution.completedAt).hiddenLatencyMs).toBeGreaterThanOrEqual(0);
-			if (!stalePreparation) expect(laterTask.measure(execution.completedAt).hiddenLatencyMs).toBeGreaterThan(0);
+			const timing = timeline.measure(execution.completedAt);
+			expect(laterTask.measure(execution.completedAt).reusedExecutionMs).toBe(timing.reusedExecutionMs);
+			if (stalePreparation) expect(timing.reusedExecutionMs).toBe(0);
+			else expect(timing.reusedExecutionMs,
+				JSON.stringify({ execution, metrics: fixture.backend.actorMetrics(), producer: fixture.backend.metrics(), bindings: fixture.backend.executionBindings(later), operations: events.filter(event => event.type === "operation_prediction") })).toBeGreaterThan(0);
 			expect(events.filter(event => event.type === "operation_prediction").filter(event => !launcher || stalePreparation || event.settlement.observation === "observed")).toMatchObject(Array.from({ length: launcher && stalePreparation ? 2 : 1 }, () => ({ settlement: stalePreparation ? { observation: "unobserved" } : {
 				prediction: { source: "pattern_aware", kind: "operation" }, observation: "observed", match: { matched: true, adoption: { status: "adopted" } },
 			} })));
@@ -1643,10 +1643,12 @@ int main(void) {
 			}
 			for (const killed of [false, true]) {
 				const waiting = deferred(), nativeDone = deferred();
+				const timings: HeldExecTiming[] = [];
 				let callbacks = 0, observed = 0, closed = 0, heldPid = 0;
 				const concurrent = held({ decide: async process => {
 					if (++callbacks === 1) { heldPid = process.pid; await waiting.promise; }
-					return { kind: "continue", observeCompletion: async durationMs => {
+					return { kind: "continue", observeTiming: timing => { timings.push(timing); }, observeCompletion: async (durationMs, clock) => {
+						expect(clock ? clock.completedAt - clock.startedAt : undefined).toBe(durationMs);
 						await nextTurn(); closed++; if (durationMs !== undefined) observed++;
 					} };
 				} }, { execute: request => native.execute(request).finally(nativeDone.resolve) });
@@ -1659,6 +1661,12 @@ int main(void) {
 					if (killed) { process.kill(heldPid, "SIGKILL"); await nativeDone.promise; }
 					waiting.resolve(); expect(await siblings).toEqual({ exitCode: 0 }); expect(observed).toBe(killed ? 1 : 2);
 					expect(closed, "native return must drain both successful and interrupted observations").toBe(2);
+					expect(timings).toHaveLength(2);
+					for (const timing of timings) {
+						expect(timing.barrier).toBe("none");
+						expect(timing.completedAt).toBeGreaterThanOrEqual(timing.requestedAt);
+						if (timing.native) expect(timing.completedAt).toBe(timing.native.startedAt);
+					}
 				} finally { waiting.resolve(); await Promise.allSettled([siblings]); }
 			}
 			const threaded = path.join(root, "thread-exec");
@@ -1701,6 +1709,7 @@ int main(void) {
 				const scope = { sessionID: "session", turnID: "original" };
 				const nativeDone = deferred();
 				const adopted = vi.fn(() => { throw new Error("advisory feedback failed"); });
+				const observeTiming = vi.fn<(timing: HeldExecTiming) => void>();
 				let heldPid = 0;
 				const commit = vi.fn(async () => {
 					if (disposition === "killed") { process.kill(heldPid, "SIGKILL"); await nativeDone.promise; }
@@ -1710,7 +1719,7 @@ int main(void) {
 					expect(actorContext.getStore()).toBe("original");
 					expect(process.id).toMatch(/^[a-f0-9]{48}:1$/); expect(process.sequence).toBe(1);
 					execIDs.add(process.id);
-					heldPid = process.pid; return { kind: "replay" as const, output: [], exitCode: 0, commit, adopted };
+					heldPid = process.pid; return { kind: "replay" as const, output: [], exitCode: 0, commit, adopted, observeTiming };
 				});
 				const executor = held({ decide }, { execute: request => native.execute(request).finally(nativeDone.resolve) });
 				const run = actorContext.run("original", () => executor.execute(`/bin/true; printf continued > '${after}'`, { scope }));
@@ -1724,6 +1733,14 @@ int main(void) {
 				}
 				expect(commit).toHaveBeenCalledOnce();
 				expect(adopted).toHaveBeenCalledTimes(disposition ? 0 : 1);
+				expect(observeTiming).toHaveBeenCalledOnce();
+				const timing = observeTiming.mock.calls[0]![0];
+				expect(timing).toMatchObject({ barrier: "none", outcome: disposition ? "failed" : "adopted" });
+				expect(timing.native).toBeUndefined();
+				if (!disposition) {
+					expect(timing.committedAt).toBeGreaterThanOrEqual(timing.requestedAt);
+					expect(timing.completedAt).toBeGreaterThanOrEqual(timing.committedAt!);
+				}
 				expect(decide).toHaveBeenCalledOnce();
 				expect(decide.mock.calls[0]![0].scope).toEqual({ sessionID: "session", turnID: "original" });
 				expect(Object.isFrozen(decide.mock.calls[0]![0].scope)).toBe(true);

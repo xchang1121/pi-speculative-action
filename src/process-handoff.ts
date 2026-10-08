@@ -264,12 +264,14 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		candidate: ProcessProvenanceCertificate,
 		persist: () => Promise<boolean>,
 		continuation?: ProcessContinuation,
+		computation?: TimelineInterval,
 	): Promise<boolean> {
-		if (!this.complete(key, handoff, candidate, continuation)) throw new Error("process handoff is no longer running");
+		if (!this.complete(key, handoff, candidate, continuation, computation)) throw new Error("process handoff is no longer running");
 		return persist();
 	}
 
-	complete(key: Sha256Digest, handoff: ProcessHandoff, candidate?: ProcessProvenanceCertificate, continuation?: ProcessContinuation): boolean {
+	complete(key: Sha256Digest, handoff: ProcessHandoff, candidate?: ProcessProvenanceCertificate, continuation?: ProcessContinuation,
+		computation?: TimelineInterval): boolean {
 		const record = this.byKey.get(key)?.get(handoff);
 		if (!record || record.state.status !== "running") return false;
 		if (!!candidate?.result.continuation !== !!continuation || continuation &&
@@ -278,7 +280,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		record.state = { status: "completed", ...(candidate ? { candidate } : {}) };
 		record.completedAt = performance.now();
 		this.completedCount++;
-		if (candidate) record.computation = continuation?.computation ?? new TimelineInterval(record.startedAt, performance.now());
+		if (candidate) record.computation = computation ?? continuation?.computation ?? new TimelineInterval(record.startedAt, performance.now());
 		record.settle();
 		if (!candidate || !record.scope) this.remove(record);
 		else this.trim();

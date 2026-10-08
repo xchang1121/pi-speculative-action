@@ -29,7 +29,7 @@ import { isPoisonedEffectCommit } from "./effect-transaction.ts";
 import { resolveHostExecutable } from "./executable-path.ts";
 import { assertNoSymlinkPath, captureFilesystemEntry, captureStableFile, hashExecutableFile, mapFilesystem, rememberCapture, sameFilesystemIdentity, sharedWalk, walkFilesystemPath } from "./filesystem-evidence.ts";
 import { captureHeldDescriptorInputs, inspectHeldExecProcess, LinuxHeldExecBoundary, listenUnixSocket, resolveLinuxExecHelper, type HeldExecDecision,
-	type HeldExecProcess, type HeldExecSnapshot, descriptorInputs, descriptorEffects, inheritedTracer, type ProcessResourceGraph } from "./linux-held-exec.ts";
+	type HeldExecProcess, type HeldExecSnapshot, type HeldExecTiming, type HeldExecClock, descriptorInputs, descriptorEffects, inheritedTracer, type ProcessResourceGraph } from "./linux-held-exec.ts";
 import { emptyWorldReuseMetrics, snapshotExecutionScope, type ExecutionScope, type ExecutionOperationAdoption, type ExecutionOperationBinding, type ExecutionWorldStorageControl,
 	type WorldReuseMetrics } from "./execution-world.ts";
 import { type ProcessReusePlan, ProcessReusePlanner } from "./reuse-planner.ts";
@@ -53,6 +53,8 @@ const MAX_REQUEST_BYTES = 4 * 1024 * 1024, LEARNED_LAUNCHES = 64, MAX_INTERPOSED
 const MAX_CONTINUATION_BYTES = 65 * 1024 * 1024;
 const IO_FRONTIERS = new Map([[0, "read"], [1, "write"], [19, "readv"], [20, "writev"], [44, "sendto"], [45, "recvfrom"], [46, "sendmsg"], [47, "recvmsg"]]);
 const MAX_CAPTURE_BYTES = 512 * 1024 * 1024;
+/** The consumer launcher places a dependency inside its existing traced parent; metadata owns neither one. */
+const processDependencyPIDs = new WeakMap<TimelineDependency, number>();
 /** Native inputs consumed by this exact one-shot execution; they still prohibit any later replay. */
 const TRANSFERRED_INPUT_TAINTS = new Set<ProvenanceTaint>(ONE_SHOT_TAINTS);
 
@@ -205,6 +207,8 @@ interface ActiveSession {
 	readonly foldedObservations: StraceObservation[];
 	readonly executionBindings: Map<number, ProcessExecutionBinding>;
 	readonly computations: TimelineDependency[];
+	/** One physical session setup, shared by every result that depended on it. */
+	preparation?: TimelineDependency;
 	readonly incompleteReasons: Set<string>;
 	/** Bypasses that exec their native image in place; the top-level trace must show each one resume. */
 	readonly bypasses: [pid: number, reason: string][];
@@ -214,7 +218,7 @@ interface ActiveSession {
 	readonly writers: Set<SessionWriter>;
 	readonly metrics: MutableLinuxProcessReuseMetrics;
 	topLevelCapture?: TopLevelCapture;
-	topLevelExecution?: { readonly prototype: ExecPrototype; readonly outcome: SpawnOutcome; readonly observedProcessMs: number; };
+	topLevelExecution?: { readonly prototype: ExecPrototype; readonly outcome: SpawnOutcome; readonly observedProcessMs: number; readonly startedAt: number; };
 	topLevelEvidence?: DynamicDependencyCertificate;
 	topLevelOutputEndpoints?: readonly [string, string];
 	/** Output sockets of running brokered children: their own children write there, and those bytes reach the child's capture. */
@@ -235,21 +239,26 @@ interface SpawnOutcome { readonly code: number | null; readonly signal: NodeJS.S
 
 type ReadyProcessPlan = Exclude<ProcessReusePlan, { kind: "miss" }>;
 
+type ActorHeldTiming = HeldExecTiming & { readonly pid: number; readonly sequence: number };
+
 /** Linux-only process substrate. Unavailable dependencies remove the route instead of weakening it. */
 export class LinuxProcessReuseBackend {
 	private readonly observations = new AsyncLocalStorage<{ scope: ExecutionScope; sequence: number; closed: boolean; learn: boolean; learned: Set<string>;
-		inputs?: (path: string) => Iterable<object>; bindings: Map<number, ProcessExecutionBinding>; computations: TimelineDependency[] }>();
+		inputs?: (path: string) => Iterable<object>; bindings: Map<number, ProcessExecutionBinding>; computations: TimelineDependency[];
+		heldTimings: ActorHeldTiming[]; timingOverflow?: HeldExecClock }>();
 
 	/** Keep actual completed launches and acknowledged adoptions in their enclosing native call's order. */
 	async observeBindings<Value>(scope: ExecutionScope, execute: () => Promise<Value>,
 		observe: (bindings: readonly ProcessExecutionBinding[], computations: readonly TimelineDependency[]) => void, learn = false,
 		inputs?: (path: string) => Iterable<object>): Promise<Value> {
 		const observation = { scope: snapshotExecutionScope(scope)!, sequence: 0, closed: false,
-			learn, learned: new Set<string>(), inputs, bindings: new Map<number, ProcessExecutionBinding>(), computations: [] as TimelineDependency[] };
+			learn, learned: new Set<string>(), inputs, bindings: new Map<number, ProcessExecutionBinding>(), computations: [] as TimelineDependency[],
+			heldTimings: [] as ActorHeldTiming[], timingOverflow: undefined as HeldExecClock | undefined };
 		try { return await this.observations.run(observation, execute); }
 		finally {
 			observation.closed = true;
-			try { observe([...observation.bindings].sort(([left], [right]) => left - right).map(([, binding]) => binding), Object.freeze([...observation.computations])); }
+			try { observe([...observation.bindings].sort(([left], [right]) => left - right).map(([, binding]) => binding),
+				Object.freeze([...observation.computations, ...actorHeldComputations(observation.heldTimings, observation.timingOverflow)])); }
 			catch { /* Learning cannot replace the native result or error. */ }
 		}
 	}
@@ -346,8 +355,9 @@ export class LinuxProcessReuseBackend {
 		for (const certificate of [...this.handoffs.results(binding.key, binding.scope), ...await this.store.findByWeakKey(binding.key, invocation.executable).catch(() => [])]) {
 			if (checked.has(certificate.id)) continue;
 			checked.add(certificate.id);
-			if ((await validateDynamicDependencyCertificate(certificate.dependencyCertificate, { resolvePath: (logical) => projection.toPhysical(logical),
-				acceptedTaints: [...TRANSFERRED_INPUT_TAINTS] }).catch(() => undefined))?.status === "valid") return false;
+			const validation = await TimelineInterval.collect(() => validateDynamicDependencyCertificate(certificate.dependencyCertificate, { resolvePath: (logical) => projection.toPhysical(logical),
+				acceptedTaints: [...TRANSFERRED_INPUT_TAINTS] })).then(result => result.output, () => undefined);
+			if (validation?.status === "valid") return false;
 		}
 		return true;
 	}
@@ -424,25 +434,35 @@ export class LinuxProcessReuseBackend {
 				this.addActor("wholeCommandRequests");
 				let committed = false;
 				let timing: ServiceTimingIdentity | undefined;
+				let overheadRecorded = false;
+				const recordOverhead = () => {
+					if (overheadRecorded) return;
+					overheadRecorded = true;
+					const observation = this.observations.getStore();
+					if (observation && !observation.closed && sameScope(observation.scope, request.scope))
+						observation.computations.push({ computation: new TimelineInterval(requestStarted, performance.now()), overhead: true });
+				};
+				const miss = () => { recordOverhead(); return this.actorReplayMiss(host, request, timing); };
 				try {
 					request.signal?.throwIfAborted();
 					const invocation = options.invocation(request);
-					if (!invocation || !await this.store.mayHaveCertificates(invocation.shell)) return this.actorReplayMiss(host, request);
+					if (!invocation || !await this.store.mayHaveCertificates(invocation.shell)) return miss();
 					assertInvocationMatches(invocation, request);
 					const projection = new ExecutionPathProjection({ sourceRoot, workspaceRoot: sourceRoot });
 					const platformFingerprint = await this.resolvePlatformFingerprint();
-					const prototype = await topLevelProcessPrototype(invocation, request, definedProcessEnvironment(request.environment), projection, platformFingerprint);
+					const prototype = (await TimelineInterval.collect(() => topLevelProcessPrototype(invocation, request, definedProcessEnvironment(request.environment), projection, platformFingerprint))).output;
 					const weakKey = processWeakKey(prototype);
 					timing = processTimingIdentity(prototype, weakKey);
 					const admission = this.processScheduler.assessCandidateJoin({ identity: timing, state: "succeeded" });
-					if (!admission.allowed) return this.actorReplayMiss(host, request, timing);
+					if (!admission.allowed) return miss();
 					const plan = await this.plan(weakKey, prototype.executablePath, projection, acceptProducer);
-					if (!plan?.certificate.result.exit) return this.actorReplayMiss(host, request, timing);
+					if (!plan?.certificate.result.exit) return miss();
 					request.signal?.throwIfAborted();
 					const replayStarted = performance.now();
 					await replayFilesystemEffects(this.replayWorkspace, plan.artifacts, plan.certificate.result.journal, projection, sourceRoot);
 					committed = true;
 					for (const event of loadOutputEvents(plan.artifacts, plan.certificate.result.journal)) request.onData(event.data);
+					recordOverhead();
 					const hitLatencyMs = Math.max(0, performance.now() - requestStarted);
 					const observation = this.observations.getStore();
 					if (observation && !observation.closed && sameScope(observation.scope, request.scope))
@@ -453,9 +473,10 @@ export class LinuxProcessReuseBackend {
 					this.processScheduler.observeAdoption(timing, hitLatencyMs);
 					return { exitCode: plan.certificate.result.exit.kind === "code" ? plan.certificate.result.exit.code : null };
 				} catch (error) {
+					recordOverhead();
 					this.setActorError(`actor_replay:${errorMessage(error)}`);
 					if (committed || isPoisonedEffectCommit(error)) throw error;
-					return this.actorReplayMiss(host, request, timing);
+					return miss();
 				}
 			},
 		};
@@ -474,8 +495,10 @@ export class LinuxProcessReuseBackend {
 	}
 
 	private async createSession(input: Parameters<LinuxProcessReuseBackend["open"]>[0]): Promise<LinuxProcessSession> {
+		const startedAt = performance.now();
 		if (this.disposed) throw new Error("Linux process backend is disposed");
-		const ready = await this.resolveReady();
+		const ready = (await TimelineInterval.collect(() => this.resolveReady())).output;
+		const readyAt = performance.now();
 		input.signal?.throwIfAborted();
 		const sourceRoot = path.resolve(input.sourceRoot);
 		const projection = new ExecutionPathProjection({ sourceRoot, workspaceRoot: input.workspace.sandboxRoot, privateRoot: input.workspace.processRoot });
@@ -523,6 +546,7 @@ export class LinuxProcessReuseBackend {
 			executionKind = kind;
 			const pending = Promise.resolve().then(async () => {
 				session.signal?.throwIfAborted();
+				const dispatchStartedAt = performance.now();
 				// Bound operations can launch reusable children too; interception excludes their own image below.
 				await (dispatch ??= createProcessInterposition({
 					gitDirectory,
@@ -545,10 +569,11 @@ export class LinuxProcessReuseBackend {
 						await chmod(path.join(shared, "dispatcher"), 0o755);
 						return shared;
 					}) },
-				}).then(interposition => {
+				}).then(async interposition => {
 					session.signal?.throwIfAborted();
 					session.interposition = interposition;
-					return listenUnixSocket(server, socketPath);
+					await listenUnixSocket(server, socketPath);
+					this.recordSessionPreparation(session, creation, new TimelineInterval(dispatchStartedAt, performance.now()));
 				}));
 				session.privateSince ??= Date.now();
 				return operation();
@@ -556,6 +581,7 @@ export class LinuxProcessReuseBackend {
 			session.pending.add(pending);
 			return pending;
 		};
+		const creation = new TimelineInterval(startedAt, performance.now(), [{ computation: new TimelineInterval(startedAt, readyAt), overhead: true }]);
 		return {
 			ownership: session.ownership,
 			computationDependencies: () => Object.freeze([...session.computations]),
@@ -576,6 +602,29 @@ export class LinuxProcessReuseBackend {
 		};
 	}
 
+	private recordSessionPreparation(session: ActiveSession, creation: TimelineInterval, dispatch: TimelineInterval): void {
+		const computation = new TimelineInterval(creation.startedAt, dispatch.completedAt, [
+			{ computation: creation, owned: true, shared: [creation] }, { computation: dispatch, owned: true, shared: [dispatch] },
+			{ computation: new TimelineInterval(creation.completedAt, dispatch.startedAt), overhead: true },
+		]);
+		TimelineInterval.group(computation, session);
+		// Only recorded preparation cuts its caller's clock; work between creation and dispatch belongs to that caller.
+		session.preparation = { computation, shared: [creation, dispatch] };
+		session.computations.push({ ...session.preparation, owned: true });
+	}
+
+	private processComputation(session: ActiveSession, startedAt: number, completedAt: number, pids?: readonly number[], preparation?: TimelineInterval): TimelineInterval {
+		const computation = new TimelineInterval(startedAt, completedAt, [
+			...(preparation ? [{ computation: preparation, owned: true, shared: [preparation] }] : []),
+			...(session.preparation ? [session.preparation] : []), ...session.computations.filter(input => {
+				const pid = processDependencyPIDs.get(input);
+				return pid !== undefined && pids?.includes(pid);
+			}),
+		]);
+		TimelineInterval.group(computation, session);
+		return computation;
+	}
+
 	dispose(): Promise<void> {
 		if (this.disposal) return this.disposal;
 		this.disposed = true;
@@ -586,7 +635,7 @@ export class LinuxProcessReuseBackend {
 
 	private async resolveReady(): Promise<ReadyBackend> {
 		if (this.disposed) throw new Error("Linux process backend is disposed");
-		this.ready ??= this.probe();
+		this.ready ??= TimelineInterval.collect(() => this.probe()).then(result => result.output);
 		return this.ready;
 	}
 
@@ -640,6 +689,7 @@ export class LinuxProcessReuseBackend {
 	}
 
 	private async executeTopLevel(session: ActiveSession, request: ProcessExecutionRequest): Promise<{ exitCode: number | null }> {
+		const startedAt = performance.now();
 		if (session.closing) throw new Error("Linux process session is closed");
 		const signal = AbortSignal.any([session.signal, ...(request.signal ? [request.signal] : [])]);
 		signal?.throwIfAborted();
@@ -652,17 +702,27 @@ export class LinuxProcessReuseBackend {
 		const environment = definedProcessEnvironment(request.environment);
 		const command = request.command;
 		const logicalCwd = session.projection.toLogical(physicalCwd);
-		const prototype = await topLevelProcessPrototype(session.invocation, request, environment, session.projection, ready.platformFingerprint);
+		const prototypeStartedAt = performance.now();
+		const captured = await TimelineInterval.collect(() => topLevelProcessPrototype(session.invocation, request, environment, session.projection, ready.platformFingerprint))
+			.catch(error => { recordProcessReplayOverhead(session, prototypeStartedAt); throw error; });
+		const prototype = captured.output, preparation = new TimelineInterval(prototypeStartedAt, performance.now(), captured.dependencies);
 		this.add(session, "wholeCommandRequests");
+		const lookupStarted = performance.now();
 		const plan = await this.plan(
 			processWeakKey(prototype),
 			prototype.executablePath,
 			session.projection,
 			(candidate) => compatibleProducer(session.producer, candidate),
 			session,
-		);
+		).catch(error => { recordPrototypePreparation(session, preparation, false); recordProcessReplayOverhead(session, lookupStarted); throw error; });
 		signal?.throwIfAborted();
-		if (plan?.kind === "completed_replay") return this.replayTopLevel(session, plan, request);
+		if (plan?.kind === "completed_replay") {
+			recordPrototypePreparation(session, preparation, false);
+			try { return await this.replayTopLevel(session, plan, request); }
+			finally { recordProcessReplayOverhead(session, lookupStarted); }
+		}
+		recordPrototypePreparation(session, preparation, true);
+		recordProcessReplayOverhead(session, lookupStarted);
 		this.add(session, "wholeCommandMisses");
 		const sandbox = sandboxArguments({
 			ready,
@@ -695,7 +755,7 @@ export class LinuxProcessReuseBackend {
 					onOutput: (event) => request.onData(event.data),
 				},
 			);
-			session.topLevelExecution = { prototype, outcome, observedProcessMs: Math.max(0, performance.now() - processStarted) };
+			session.topLevelExecution = { prototype, outcome, observedProcessMs: Math.max(0, performance.now() - processStarted), startedAt };
 			try {
 				const after = await session.workspace.structure.capture();
 				const observation = await observeStrace(tracePrefix, session.invocation.shell, logicalCwd, {
@@ -753,11 +813,15 @@ export class LinuxProcessReuseBackend {
 		const execution = session.topLevelExecution;
 		const evidence = session.topLevelEvidence;
 		if (!execution || !evidence) return;
+		const result = await captureProcessResult(this.store, execution.outcome, execution.observedProcessMs, changes.map(change => ({ logicalPath: slash(change.target), change })));
+		const computation = new TimelineInterval(execution.startedAt, performance.now(), session.computations);
+		TimelineInterval.group(computation, session);
+		const recorded = TimelineInterval.serialize(computation);
 		const certificate = sealProcessCertificate({
 			prototype: execution.prototype,
 			producer: session.producer,
 			dependencyCertificate: evidence,
-			result: await captureProcessResult(this.store, execution.outcome, execution.observedProcessMs, changes.map(change => ({ logicalPath: slash(change.target), change }))),
+			result: { ...result, ...(recorded ? { computation: recorded } : {}) },
 		});
 		if (await this.planner.publishCompleted(certificate, SAME_CONFINEMENT_TAINTS)) this.add(session, "wholeCommandPublished");
 	}
@@ -834,12 +898,18 @@ export class LinuxProcessReuseBackend {
 		const cwd = session.projection.toPhysical(invocation.cwd), executable = session.projection.toPhysical(invocation.executable);
 		if (!cwd || !executable) throw new Error("bound process paths are unmapped");
 		const request = { ...invocation, cwd };
-		const prototype = await this.prototype(session, request, executable, invocation.outputRoute);
-		if (processWeakKey(prototype) !== binding.key) throw new Error("bound process execution context changed");
+		const prototypeStartedAt = performance.now();
+		const captured = await TimelineInterval.collect(async () => {
+			const prototype = await this.prototype(session, request, executable, invocation.outputRoute);
+			if (processWeakKey(prototype) !== binding.key) throw new Error("bound process execution context changed");
+			return { prototype, before: await session.workspace.structure.capture() };
+		})
+			.catch(error => { recordProcessReplayOverhead(session, prototypeStartedAt); throw error; });
+		const { prototype, before } = captured.output, preparation = new TimelineInterval(prototypeStartedAt, performance.now(), captured.dependencies);
 		this.add(session, "requests");
-		const observation = { complete: true, paths: [], taints: [], tracedProcesses: 0, incompleteReasons: [] }, before = await session.workspace.structure.capture();
+		const observation = { complete: true, paths: [], taints: [], tracedProcesses: 0, incompleteReasons: [] };
 		const result = await this.executeRequest(session, request, executable, invocation.outputRoute, session.metrics.requests, prototype,
-			capture => { session.topLevelCapture = { ...capture, observation }; });
+			capture => { session.topLevelCapture = { ...capture, observation }; }, undefined, preparation);
 		// Only it and what it launched ran here: when its own transaction could not seal (what it launched overlapped it), the session's
 		// endpoints stand for its interval, and what it observed joins its launches' evidence.
 		if (result.kind !== "suspended") session.topLevelCapture ??= { before, after: await session.workspace.structure.capture(), observation };
@@ -849,40 +919,56 @@ export class LinuxProcessReuseBackend {
 
 	private async executeRequest(session: ActiveSession, request: ProcessArguments, executable: string, outputRoute: OutputRoute,
 		requestID: number, prototype?: ExecPrototype,
-		captureWorkspace?: (capture: Omit<TopLevelCapture, "observation">) => void, inPlace?: number): Promise<DispatcherResponse> {
-		prototype ??= await this.prototype(session, request, executable, outputRoute);
-		const weakKey = processWeakKey(prototype);
+		captureWorkspace?: (capture: Omit<TopLevelCapture, "observation">) => void, inPlace?: number, preparation?: TimelineInterval): Promise<DispatcherResponse> {
+		if (!prototype) {
+			const prototypeStartedAt = performance.now();
+			const captured = await TimelineInterval.collect(() => this.prototype(session, request, executable, outputRoute))
+				.catch(error => { recordProcessReplayOverhead(session, prototypeStartedAt, inPlace); throw error; });
+			prototype = captured.output;
+			preparation = new TimelineInterval(prototypeStartedAt, performance.now(), captured.dependencies);
+		}
+		const weakKey = processWeakKey(prototype), executablePath = prototype.executablePath;
+		const lookupStarted = performance.now();
 		const acquired = await this.acquireProcessResult(
 			weakKey,
-			(live, excluded) => this.plan(weakKey, prototype.executablePath, session.projection, (candidate) => compatibleProducer(session.nestedProducer, candidate), session, live, excluded),
+			(live, excluded) => this.plan(weakKey, executablePath, session.projection, (candidate) => compatibleProducer(session.nestedProducer, candidate), session, live, excluded),
 			session.signal,
 			session.scope,
 			{ ownership: session.ownership, executablePath: prototype.executablePath },
-		);
+		).catch(error => { recordPrototypePreparation(session, preparation, false, inPlace); recordProcessReplayOverhead(session, lookupStarted, inPlace); throw error; });
 		if (acquired.plan?.kind === "completed_replay") {
-			const before = captureWorkspace ? await session.workspace.structure.capture() : undefined;
-			const result = await this.replay(session, acquired.plan, weakKey, acquired, request.streams && descriptorInputs(request.resources!));
-			if (inPlace !== undefined) session.writers.add({ startedAt: Date.now(), endedAt: Date.now(), writes: [], settled: true, pid: inPlace,
-				written: acquired.plan.certificate.result.journal.flatMap(event => event.kind === "workspace" && pathContains(session.sourceRoot, event.path) ? [slash(path.relative(session.sourceRoot, event.path))] : []) });
-			if (before) captureWorkspace!({ before, after: await session.workspace.structure.capture() });
-			const binding = acquired.producer?.binding;
-			if (binding && this.handoffs.resolveBinding(binding, session.scope)) session.executionBindings.set(requestID, binding);
-			return result;
+			recordPrototypePreparation(session, preparation, false, inPlace);
+			try {
+				const before = captureWorkspace ? await session.workspace.structure.capture() : undefined;
+				const result = await this.replay(session, acquired.plan, weakKey, acquired, request.streams && descriptorInputs(request.resources!), inPlace);
+				if (inPlace !== undefined) session.writers.add({ startedAt: Date.now(), endedAt: Date.now(), writes: [], settled: true, pid: inPlace,
+					written: acquired.plan.certificate.result.journal.flatMap(event => event.kind === "workspace" && pathContains(session.sourceRoot, event.path) ? [slash(path.relative(session.sourceRoot, event.path))] : []) });
+				if (before) captureWorkspace!({ before, after: await session.workspace.structure.capture() });
+				const binding = acquired.producer?.binding;
+				if (binding && this.handoffs.resolveBinding(binding, session.scope)) session.executionBindings.set(requestID, binding);
+				return result;
+			} finally { recordProcessReplayOverhead(session, lookupStarted, inPlace); }
 		}
-		if (!acquired.work) throw new Error("process work reservation failed");
+		recordProcessReplayOverhead(session, lookupStarted, inPlace);
+		if (!acquired.work) {
+			recordPrototypePreparation(session, preparation, false, inPlace);
+			throw new Error("process work reservation failed");
+		}
 		this.add(session, "misses");
 		try {
 			// Without a result to reuse, a child whose recent runs were all cheap resumes in place within its parent's trace.
 			if (inPlace !== undefined && Math.max(...this.childRunMs.get(prototype.executablePath) ?? [Infinity]) < (this.options.cheapChildMs ?? CHEAP_CHILD_MS)) {
+				recordPrototypePreparation(session, preparation, false, inPlace);
 				this.add(session, "bypasses");
 				session.bypasses.push([inPlace, `broker_bypass:${path.posix.basename(prototype.executablePath)}:cheap_child`]);
 				return { kind: "bypass", executable };
 			}
-			return await this.executeAndPublish(session, request, executable, prototype, weakKey, outputRoute, acquired.work, requestID, captureWorkspace, inPlace);
+			recordPrototypePreparation(session, preparation, true, inPlace);
+			return await this.executeAndPublish(session, request, executable, prototype, weakKey, outputRoute, acquired.work, requestID, captureWorkspace, inPlace, preparation);
 		} finally {
 			this.handoffs.complete(weakKey, acquired.work);
 			const computation = acquired.work.computation;
-			if (computation) session.computations.push({ computation, shared: [computation] });
+			if (computation) recordProcessDependency(session, { computation, owned: true, shared: [computation] }, inPlace);
 		}
 	}
 
@@ -944,11 +1030,12 @@ export class LinuxProcessReuseBackend {
 		executablePath: string, projection: ExecutionPathProjection, acceptProducer: (producer: ProcessProducerProof) => boolean,
 		session?: ActiveSession, live?: readonly ProcessProvenanceCertificate[], excludedCertificates?: ReadonlySet<Sha256Digest>, continuation = false,
 	): Promise<ReadyProcessPlan | undefined> {
-		const plan = await this.planner.plan({ weakKey, executablePath, acceptProducer, excludedCertificates,
+		// Proof reads belong to the caller's excluded lookup interval, even when file capture emits owned receipts.
+		const plan = (await TimelineInterval.collect(() => this.planner.plan({ weakKey, executablePath, acceptProducer, excludedCertificates,
 			contract: { sink: "buffered", orderedJournal: true, transactionalEffects: true, ...(continuation ? { continuation: true as const } : {}) },
 			validation: { resolvePath: (logicalPath) => projection.toPhysical(logicalPath), ...(session ? { acceptedTaints: SAME_CONFINEMENT_TAINTS } : {}) },
 			...(live ? { live: { certificate: live, acceptedTaints: [...TRANSFERRED_INPUT_TAINTS] } } : {}),
-		});
+		}))).output;
 		this.recordLookup(plan.lookup, session);
 		if (plan.kind === "miss" && plan.lookup.candidateCertificates > 0) {
 			const detail = `reuse_miss:${plan.reasons.join(",")}${plan.changedDependencies?.length ? `:${plan.changedDependencies.join(",")}` : ""}`;
@@ -974,6 +1061,16 @@ export class LinuxProcessReuseBackend {
 
 	private async decideHeldExec(process: HeldExecProcess, scope?: ExecutionScope): Promise<HeldExecDecision> {
 		const observation = this.observations.getStore();
+		const measured = (decision: HeldExecDecision): HeldExecDecision => !observation || observation.closed || !sameScope(observation.scope, scope)
+			? decision : { ...decision, observeTiming: timing => {
+				if (observation.closed) return;
+				if (observation.heldTimings.length < LEARNED_LAUNCHES)
+					observation.heldTimings.push({ ...timing, pid: process.pid, sequence: process.sequence });
+				else observation.timingOverflow = {
+					startedAt: Math.min(observation.timingOverflow?.startedAt ?? timing.requestedAt, timing.requestedAt),
+					completedAt: Math.max(observation.timingOverflow?.completedAt ?? timing.completedAt, timing.completedAt),
+				};
+			} };
 		let learning = observation?.learn && !observation.closed && sameScope(observation.scope, scope);
 		const order = observation ? ++observation.sequence : 0;
 		const requestStarted = performance.now();
@@ -988,7 +1085,7 @@ export class LinuxProcessReuseBackend {
 			if (learning && process.trackQueues) {
 				// An acquisition hint lives in the existing bounded binding owner, never in a prediction or result cache.
 				this.handoffs.observe(sha256Digest(`queue-tracking:${sourceRoot}`), executablePath, scope!, { trackingOnly: true, sourceRoot }, 0);
-				this.addActor("misses"); return { kind: "continue" };
+				this.addActor("misses"); return measured({ kind: "continue" });
 			}
 			// A call learns each distinct launch once, and at most LEARNED_LAUNCHES of them: an exec-dense loop or build
 			// would otherwise pay a held inspection and a whole-executable digest on every exec.
@@ -1000,16 +1097,17 @@ export class LinuxProcessReuseBackend {
 				this.handoffs.mayHaveExecutable(executablePath);
 			// Already learned in this call with nothing to adopt: a producer appearing later in the call is not worth an exec's round trip.
 			// Once this call learns no new launch, only the executable decides.
-			if (!learning && !available) { this.addActor("misses"); return { kind: "continue",
-				repeat: observation && !observation.closed && observation.learned.size < LEARNED_LAUNCHES ? "launch" : "executable" }; }
+			if (!learning && !available) { this.addActor("misses"); return measured({ kind: "continue",
+				repeat: observation && !observation.closed && observation.learned.size < LEARNED_LAUNCHES ? "launch" : "executable" }); }
 			const inspected = await inspectHeldExecProcess(process.pid, executable, process.descriptors);
 			const capturedInputs = await TimelineInterval.collect(() => process.descriptors?.length
 				? captureHeldDescriptorInputs(process.pid, process.descriptors, Math.min(MAX_REQUEST_BYTES / 2, this.store.limits.maxBytes),
 					sensitivePaths(this.options.storeRoot, this.options.deniedPaths), observation?.closed ? undefined : observation?.inputs, process.tracerPid, sourceRoot) : undefined);
 			const resources = capturedInputs.output;
-			if (observation && !observation.closed) observation.computations.push(...capturedInputs.dependencies);
+			// Fresh descriptor capture is held-boundary validation. Borrowed inputs retain their original work receipt.
+			if (observation && !observation.closed) observation.computations.push(...capturedInputs.dependencies.filter(input => !input.owned));
 			const snapshot = { ...inspected, ...(resources ? { resources } : {}) };
-			if (!pathContains(sourceRoot, snapshot.cwd)) { this.addActor("bypasses"); return { kind: "continue" }; }
+			if (!pathContains(sourceRoot, snapshot.cwd)) { this.addActor("bypasses"); return measured({ kind: "continue" }); }
 			const observe = (prototype: ExecPrototype, durationMs: number) => {
 				const weakKey = processWeakKey(prototype);
 				this.processScheduler.observeActorService(processTimingIdentity(prototype, weakKey), durationMs);
@@ -1028,18 +1126,19 @@ export class LinuxProcessReuseBackend {
 				const platform = await this.resolvePlatformFingerprint(), controller = new AbortController();
 				let pinned!: () => void, digest: Sha256Digest | undefined;
 				const ready = new Promise<void>(resolve => { pinned = resolve; });
-				const capturing = hashExecutableFile(`/proc/${process.pid}/exe`, { pinned,
+				const capturing = TimelineInterval.collect(() => hashExecutableFile(`/proc/${process.pid}/exe`, { pinned,
 					signal: process.signal ? AbortSignal.any([process.signal, controller.signal]) : controller.signal,
-				}).then(value => { digest = value; }, () => {}).finally(pinned);
+				})).then(value => { digest = value.output; }, () => {}).finally(pinned);
 				await ready;
 				this.addActor("misses");
-				return { kind: "continue", observeCompletion: async durationMs => {
+				return measured({ kind: "continue", observeCompletion: async durationMs => {
 					if (!digest || durationMs === undefined) controller.abort();
 					await capturing;
 					if (durationMs !== undefined && digest) observe(bufferedProcessPrototype(snapshot, projection, digest, platform), durationMs);
-				} };
+				} });
 			}
-			const prototype = bufferedProcessPrototype(snapshot, projection, await hashExecutableFile(`/proc/${process.pid}/exe`), await this.resolvePlatformFingerprint());
+			const digest = (await TimelineInterval.collect(() => hashExecutableFile(`/proc/${process.pid}/exe`))).output;
+			const prototype = bufferedProcessPrototype(snapshot, projection, digest, await this.resolvePlatformFingerprint());
 			const weakKey = processWeakKey(prototype), timing = processTimingIdentity(prototype, weakKey);
 			const accepted = (producer: ProcessProducerProof) => actorReplayProducer(producer, sensitivePaths(this.options.storeRoot, this.options.deniedPaths));
 			const acquired = await this.acquireProcessResult(weakKey,
@@ -1048,10 +1147,10 @@ export class LinuxProcessReuseBackend {
 			if (!plan || (plan.certificate.result.continuation ? !continuation || sha256Digest(continuation.image) !== plan.certificate.result.continuation.imageDigest :
 				plan.certificate.result.exit.kind !== "code")) {
 				this.addActor("misses");
-				return { kind: "continue", observeCompletion: durationMs => { if (durationMs !== undefined) observe(prototype, durationMs); } };
+				return measured({ kind: "continue", observeCompletion: durationMs => { if (durationMs !== undefined) observe(prototype, durationMs); } });
 			}
 			const output = loadOutputEvents(plan.artifacts, plan.certificate.result.journal);
-			return {
+			return measured({
 				kind: "replay",
 				...(continuation ? { continuation } : { exitCode: (plan.certificate.result.exit as Extract<ExitOutcome, { kind: "code" }>).code }),
 				output,
@@ -1085,22 +1184,23 @@ export class LinuxProcessReuseBackend {
 				},
 				adopted: () => {
 					const binding = acquired.producer?.binding;
+					const computation = reusedComputation(plan.certificate, acquired);
 					if (observation && !observation.closed && sameScope(observation.scope, scope)) {
 						if (binding && this.handoffs.resolveBinding(binding, scope) && observation.bindings.size < this.store.limits.maxCertificates)
 							observation.bindings.set(order, binding);
-						observation.computations.push(reusedComputation(plan.certificate, acquired));
+						observation.computations.push(computation);
 					}
 					this.recordHit(acquired.producer?.scope, acquired.joined, undefined, scope);
 					this.processScheduler.observeAdoption(timing, Math.max(0, performance.now() - requestStarted - acquired.waitedMs));
 					this.addActor("reusedProcessMs", plan.certificate.result.observedProcessMs ?? 0);
 					if (scope) acquired.producer?.ownership.adopted({ scope, id: process.id, sequence: process.sequence, operationIdentity: weakKey,
-						executionMs: plan.certificate.result.observedProcessMs ?? 0 });
+						executionMs: plan.certificate.result.observedProcessMs ?? 0, computation });
 				},
-			};
+			});
 		} catch (error) {
 			this.addActor("bypasses");
 			this.setActorError(`actor_child:${errorMessage(error)}`);
-			return { kind: "continue" };
+			return measured({ kind: "continue" });
 		}
 	}
 
@@ -1110,6 +1210,7 @@ export class LinuxProcessReuseBackend {
 		weakKey: Sha256Digest,
 		acquired: { readonly joined: boolean; readonly producer?: ProcessHandoff; readonly waiting?: readonly TimelineInterval[] },
 		inputs?: ReturnType<typeof descriptorInputs>,
+		pid?: number,
 	): Promise<DispatcherResponse> {
 		const started = performance.now();
 		let replayed = false;
@@ -1120,7 +1221,7 @@ export class LinuxProcessReuseBackend {
 				path.join(session.workspace.processRoot, "private"));
 			session.nestedEvidence.push(certificate.dependencyCertificate);
 			this.recordHit(acquired.producer?.scope, acquired.joined, session);
-			session.computations.push(reusedComputation(certificate, acquired));
+			recordProcessDependency(session, reusedComputation(certificate, acquired), pid);
 			replayed = true;
 			const streams = inputs && streamSettlement(inputs, (certificate.result.resources?.transitions ?? []).map(event => ({ alias: event.id, kind: event.kind, data: artifacts.read(event.data) })));
 			if (inputs && !streams) return { kind: "hit", weakKey, output: [], exit: { kind: "code", code: 125 } };
@@ -1143,6 +1244,7 @@ export class LinuxProcessReuseBackend {
 		requestID: number,
 		captureWorkspace?: (capture: Omit<TopLevelCapture, "observation">) => void,
 		inPlace?: number,
+		preparation?: TimelineInterval,
 	): Promise<DispatcherResponse> {
 		const ready = await this.resolveReady();
 		const started = performance.now();
@@ -1395,7 +1497,11 @@ export class LinuxProcessReuseBackend {
 					transitions.push({ id: input.alias, kind: event.kind, data: await this.store.artifacts.put(event.data), ...(event.requested !== undefined ? { requested: event.requested } : {}) });
 				}
 				const { exit, ...prefixResult } = baseResult;
+				// A transferred prefix consumes its original local setup too; its native frontier stays unchanged.
+				const computation = this.processComputation(session, work.startedAt, continuation?.computation.completedAt ?? performance.now(), observation.pids, preparation);
+				const recorded = TimelineInterval.serialize(computation);
 				const result: ProcessResultRecord = { ...prefixResult, ...(continuation ? { continuation: { imageDigest: sha256Digest(continuation.image), imageBytes: continuation.image.length } } : { exit: exit! }),
+					...(recorded ? { computation: recorded } : {}),
 					...(descriptorOffsets ? { resources: { ...descriptorEffects(request.resources!, descriptorOffsets), ...(resourceJournal ? { transitions } : {}) } } : {}) };
 				stage = "certificate";
 				const certificate = sealProcessCertificate({ prototype, producer: session.nestedProducer, dependencyCertificate, result });
@@ -1425,6 +1531,7 @@ export class LinuxProcessReuseBackend {
 						});
 					},
 					continuation,
+					computation,
 				)) {
 					this.add(session, "published");
 				}
@@ -1781,10 +1888,60 @@ function parseDescriptorOffsets(report: Buffer, inputs: ReturnType<typeof descri
 	return positions;
 }
 
+function recordProcessDependency(session: ActiveSession, dependency: TimelineDependency, pid?: number): void {
+	if (pid !== undefined) processDependencyPIDs.set(dependency, pid);
+	session.computations.push(dependency);
+}
+
+function recordProcessReplayOverhead(session: ActiveSession, startedAt: number, pid?: number): void {
+	recordProcessDependency(session, { computation: new TimelineInterval(startedAt, performance.now()), overhead: true }, pid);
+}
+
+function recordPrototypePreparation(session: ActiveSession, computation: TimelineInterval | undefined, produced: boolean, pid?: number): void {
+	if (!computation) return;
+	if (produced) TimelineInterval.group(computation, session);
+	recordProcessDependency(session, { computation, ...(produced ? { owned: true } : { overhead: true }), shared: [computation] }, pid);
+}
+
+/** Split only observed native clocks; the transport does not expose CPU time or every resumed child. */
+function actorHeldComputations(timings: readonly ActorHeldTiming[], overflow?: HeldExecClock): TimelineDependency[] {
+	const pauses = timings.map(timing => ({ timing, computation: new TimelineInterval(timing.requestedAt, timing.completedAt) }));
+	const ambiguous = !!overflow || timings.some(timing => timing.barrier === "none" || timing.barrier === "descriptors" &&
+		timing.committedAt !== undefined && timing.completedAt > timing.committedAt);
+	const omitted = overflow && { computation: new TimelineInterval(overflow.startedAt, overflow.completedAt), overhead: true, computeUncertain: true };
+	const globalPauses = timings.flatMap(timing => {
+		if (timing.barrier === "none") return [];
+		// Full descriptor replay releases siblings inside the native helper, after commit but before D.
+		const end = timing.barrier === "descriptors" && timing.committedAt !== undefined ? timing.committedAt : timing.completedAt;
+		return [{ computation: new TimelineInterval(timing.requestedAt, end), overhead: true } satisfies TimelineDependency];
+	});
+	// An unknown Actor denominator must not turn into inflated gross credit when the observation is later reused.
+	// Mask ambiguous pauses everywhere; this may omit parallel work, so it is a lower bound rather than an estimate.
+	const sharedPauses = ambiguous ? [...pauses.map(({ computation }) => ({ computation, overhead: true })), ...(omitted ? [omitted] : [])] : globalPauses;
+	const computations: TimelineDependency[] = pauses.map(({ timing, computation }) => ({ computation, overhead: true,
+		// A local hold can overlap unobserved siblings, shell work or a restored continuation's tail.
+		...(timing.barrier === "none" || timing.barrier === "descriptors" && timing.committedAt !== undefined && timing.completedAt > timing.committedAt
+			? { computeUncertain: true } : {}) }));
+	for (const timing of timings) {
+		if (!timing.native) continue;
+		// O observes process exit, including later exec images. Their pauses belong to those later images.
+		const next = timings.filter(candidate => candidate.pid === timing.pid && candidate.sequence > timing.sequence)
+			.reduce((end, candidate) => Math.min(end, candidate.requestedAt), timing.native.completedAt);
+		const end = Math.min(timing.native.completedAt, next);
+		if (end <= timing.native.startedAt) continue;
+		const localPauses = pauses.filter(({ timing: other }) => other.pid === timing.pid).map(({ computation }) => ({ computation, overhead: true }));
+		const computation = new TimelineInterval(timing.native.startedAt, end, [...sharedPauses, ...localPauses]);
+		computations.push({ computation, owned: true, shared: [computation] });
+	}
+	if (omitted) computations.push(omitted);
+	return computations;
+}
+
 function reusedComputation(certificate: ProcessProvenanceCertificate,
 	acquired?: { readonly producer?: ProcessHandoff; readonly waiting?: readonly TimelineInterval[] }): TimelineDependency {
-	const durationMs = certificate.result.observedProcessMs ?? 0;
-	return { computation: TimelineInterval.retained(`${certificate.id}:${certificate.createdAt}:${durationMs}`, durationMs, acquired?.producer?.computation), shared: acquired?.waiting };
+	const computation = acquired?.producer?.computation ?? TimelineInterval.restore(certificate.result.computation) ??
+		TimelineInterval.unknownReuse(`${certificate.id}:${certificate.createdAt}`);
+	return { computation, shared: acquired?.waiting, reused: true };
 }
 
 function processTimingIdentity(prototype: ExecPrototype, weakKey: Sha256Digest): ServiceTimingIdentity {

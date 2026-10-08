@@ -177,6 +177,84 @@ function call(turnID: string, input: Record<string, unknown> = { path: "README.m
 }
 
 describe("structural speculative runtime", () => {
+	it("preserves each mode's prediction attribution while charging one shared execution to its owner", async () => {
+		const materialized = vi.fn();
+		const { runtime, events, ready, executions } = harness({ onCandidateMaterialized: materialized,
+			source: planSource({ propose: () => [
+				{ ...plan("owner"), actions: [readAction("next", { path: "README.md" }, { mode: "reported-files" })] },
+				{ ...plan("supporter"), actions: [readAction("next", { path: "README.md" }, { mode: "result-neighbors" })] },
+			] }),
+		});
+		try {
+			await runtime.startTurn(start("turn"));
+			await ready.promise;
+			await expect.poll(() => materialized.mock.calls.length).toBe(2);
+			expect((await runtime.prepareActorCall(call("turn")))?.output).toBe("speculative");
+			await runtime.finishTurn({ ...call("turn"), terminal: true });
+			const candidates = events.filter(event => event.type === "candidate");
+			const completed = candidates.find(event => event.state.status === "succeeded")!;
+			const actor = events.find(event => event.type === "actor_action")!;
+			const predictions = events.filter(event => event.type === "prediction");
+			expect(executions()).toBe(1);
+			expect(candidates).toHaveLength(2);
+			expect(new Set(candidates.map(event => event.candidate.mode))).toEqual(new Set(["reported-files"]));
+			expect(predictions.map(event => event.mode).sort()).toEqual(["reported-files", "result-neighbors"]);
+			expect(predictions.every(event => event.settlement.observation === "observed" && event.settlement.match.matched && event.settlement.match.adoption.status === "adopted")).toBe(true);
+			expect(actor.candidate?.mode).toBe("reported-files");
+			expect(actor.computation?.reusedExecutionMs).toBeGreaterThan(0);
+			const modes = summarizeSpeculativeTrace(events).modesBySource.source!;
+			expect(modes["reported-files"]).toMatchObject({ observed: 1, matched: 1, adopted: 1, started: 1,
+				productionMs: completed.state.status === "succeeded" ? completed.state.executionMs : -1,
+				reusedExecutionMs: actor.computation!.reusedExecutionMs });
+			expect(modes["result-neighbors"]).toEqual({ observed: 1, matched: 1, adopted: 1, started: 0, productionMs: 0, reusedExecutionMs: 0 });
+		} finally { await runtime.dispose(); }
+	});
+
+	it("credits consumed operation receipts to their shared producer mode during native fallback", async () => {
+		const binding = Object.freeze({ backend: "process", identity: "child", permissionHash: "parent", executionMs: 40, expectedDurationMs: 40 });
+		const preparation = new TimelineInterval(0, 10);
+		TimelineInterval.producedBy(preparation, { source: "preparer", mode: "input" });
+		const partial = new TimelineInterval(10, 50, [{ computation: preparation, reused: true }]);
+		const receipt = { computation: partial, reused: true };
+		let adopted: Parameters<TestAdapter["executeCandidate"]>[0]["onOperationAdopted"];
+		const execute = vi.fn<TestAdapter["executeCandidate"]>(async ({ onOperationAdopted }) => {
+			adopted = onOperationAdopted;
+			return world("child output", { validate: async () => validResource() });
+		});
+		const { runtime, ready, events, summary } = harness({ executeCandidate: execute,
+			source: planSource({ propose: () => ["owner", "supporter"].map(mode => ({ ...plan(mode), actions: [
+				{ ...readAction("child", { path: "README.md" }, { mode }), type: "operation" as const, operation: binding },
+			] })) }),
+		});
+		try {
+			await runtime.startTurn(start("turn")); await ready.promise;
+			await expect.poll(() => runtime.inspect().pendingPredictions).toBe(0); // Both proposals have finished admission.
+			for (let index = 0; index < 2; index++) {
+				const prepared = await runtime.prepareActorCall({ ...call("turn"), id: `native-${index}` });
+				expect(prepared).toBeDefined(); expect(prepared?.output).toBeUndefined();
+				const adoption = { scope: start("turn"), id: `child-${index}`, sequence: index + 1, operationIdentity: binding.identity,
+					executionMs: 40, computation: receipt };
+				adopted!(adoption); adopted!(adoption);
+				await prepared?.settle(new TimelineInterval(100, 110, [receipt, receipt]), "native parent");
+			}
+			await runtime.finishTurn({ ...call("turn"), terminal: true });
+			expect(execute).toHaveBeenCalledOnce();
+			const actions = events.filter(event => event.type === "actor_action");
+			expect(actions).toHaveLength(2);
+			for (const action of actions) {
+				expect(action.candidate).toBeUndefined();
+				expect(action.settlement.provider.kind).toBe("actor");
+				expect(action.computation).toEqual({ actorComputeMs: 10, reusedExecutionMs: 50, reusedByMode: [
+					{ source: "source", mode: "owner", reusedExecutionMs: 40 }, { source: "preparer", mode: "input", reusedExecutionMs: 10 },
+				] });
+			}
+			const modes = summary().modesBySource;
+			expect(modes.source?.owner).toMatchObject({ observed: 1, matched: 1, adopted: 1, started: 1, reusedExecutionMs: 80 });
+			expect(modes.source?.supporter).toEqual({ observed: 1, matched: 1, adopted: 1, started: 0, productionMs: 0, reusedExecutionMs: 0 });
+			expect(modes.preparer?.input?.reusedExecutionMs).toBe(20);
+		} finally { await runtime.dispose(); }
+	});
+
 	it("calibrates a repeatedly adopted result with one Actor execution and then resumes reuse", async () => {
 		const { runtime, ready, events, executions } = harness({ source: planSource({ propose: () => plan("calibration"), observesOperations: () => true, observe: () => undefined }) });
 		try {
@@ -307,7 +385,7 @@ describe("structural speculative runtime", () => {
 
 	it.each(["absent", "normal", "failed", "blocked"] as const)("owns settlement and task epochs independently of %s diagnostics", async (mode) => {
 		const delivery = barrier(), completed = [barrier(), barrier()], feedback: PredictionSettlement[] = [], observed: string[] = [];
-		const snapshots = vi.spyOn(CandidateStore.prototype, "snapshot"), timing = vi.spyOn(TaskTimeline.prototype, "recordTool");
+		const snapshots = vi.spyOn(CandidateStore.prototype, "snapshot"), timing = vi.spyOn(TaskTimeline.prototype, "recordCall");
 		const { runtime, events, executions: executionCount } = harness({
 			source: planSource({
 				propose: ({ startInput }) => plan(startInput.turnID, { path: `${startInput.turnID}.txt` }),
@@ -1005,11 +1083,19 @@ describe("structural speculative runtime", () => {
 			expect(providers[0]?.toolExecution).toBe(execution);
 			if (reusable && !fallback) expect(providers[1]?.toolExecution).toBe(execution);
 			expect(events.filter((event) => event.type === "prediction")).toHaveLength(1);
+			const firstReuseMs = reusable ? 4 : 6, repeatedReuseMs = mode === "exclusive" ? 4 : firstReuseMs;
+			const totalReuseMs = fallback ? 0 : firstReuseMs + repeatedReuseMs;
 			expect(events.find((event) => event.type === "task")?.timing).toMatchObject({
-				authoritativeToolCount: reusable && !fallback ? 1 : 2,
-				toolExecutionMs: fallback ? 6 : reusable ? 4 : 10,
+				actorComputeMs: fallback ? 6 : 4,
+				reusedExecutionMs: totalReuseMs,
 			});
-			expect(summary()).toMatchObject({ tasks: 1, toolExecutionMs: fallback ? 6 : reusable ? 4 : 10, hiddenLatencyMs: reusable ? 0 : 6 });
+			expect(events.filter(event => event.type === "actor_action").map(event => event.computation)).toEqual([
+				{ actorComputeMs: 4, reusedExecutionMs: 0 },
+				{ actorComputeMs: fallback ? 2 : 0, reusedExecutionMs: fallback ? 0 : firstReuseMs },
+				...(fallback ? [] : [{ actorComputeMs: 0, reusedExecutionMs: repeatedReuseMs }]),
+			]);
+			expect(summary()).toMatchObject({ tasks: 1, actorComputeMs: fallback ? 6 : 4,
+				reusedExecutionMs: totalReuseMs });
 		} finally { await runtime.dispose(); clock.mockRestore(); }
 	});
 
@@ -1349,7 +1435,12 @@ describe("structural speculative runtime", () => {
 			admission.mockRestore(); adoption.mockRestore();
 		}
 		for (const dispose of queryDisposals) expect(dispose).toHaveBeenCalledOnce();
-		expect(events.find((event) => event.type === "task")?.timing?.authoritativeToolCount).toBe(succeeds ? outputOnly ? 2 : 1 : 0);
+		const computations = events.filter(event => event.type === "actor_action").map(event => event.computation!);
+		expect(computations).toHaveLength(succeeds ? inputLookup || scenario === "output-valid" ? 2 : 1 : 0);
+		expect(events.find(event => event.type === "task")?.timing).toMatchObject({
+			actorComputeMs: computations.reduce((sum, timing) => sum + timing.actorComputeMs!, 0),
+			reusedExecutionMs: computations.reduce((sum, timing) => sum + timing.reusedExecutionMs, 0),
+		});
 		if (scenario === "output-valid") expect(summarizeSpeculativeTrace(events)).toMatchObject({
 			actorActions: 2, speculativeHits: 2, exactReuseHits: 0, partialResultReuseHits: 2,
 			partialResultReuseByProjector: { "read.range": 2 }, hitRate: 1,
@@ -1700,19 +1791,48 @@ describe("structural speculative runtime", () => {
 			expect(queryValidate).not.toHaveBeenCalled(); // Oversized proof falls back to the full proof without repeating the query.
 			await runtime.finishTurn({ ...call("second"), terminal: true });
 			expect(events.find((event) => event.type === "task")?.timing).toMatchObject({
-				toolExecutionMs: evaluations * 20, authoritativeToolCount: evaluations,
-				hiddenLatencyMs: learned || unretained ? 0 : proofBytes ? 20 : 40,
+				actorComputeMs: unretained ? 60 : learned ? 20 : 0,
+				reusedExecutionMs: unretained ? 0 : learned ? 40 : 60,
 			});
+			expect(events.filter(event => event.type === "actor_action").map(event => event.computation)).toEqual(
+				[0, 1, 2].map(index => unretained || learned && index === 0
+					? { actorComputeMs: 20, reusedExecutionMs: 0 } : { actorComputeMs: 0, reusedExecutionMs: 20 }));
 			now += 10;
 			await runtime.startTurn(start("next-task"));
 			expect((await runtime.prepareActorCall(call("next-task", { path: "input", offset: 2, limit: 1 })))?.output).toBe("2");
 			await runtime.finishTurn({ ...call("next-task"), terminal: true });
 			expect(reconstruct).toHaveBeenCalledTimes(evaluations + (unretained ? 1 : 0));
 			expect(events.filter((event) => event.type === "task").at(-1)?.timing).toMatchObject({
-				toolExecutionMs: 20, authoritativeToolCount: 1, hiddenLatencyMs: unretained ? 0 : 20 });
+				actorComputeMs: unretained ? 20 : 0, reusedExecutionMs: unretained ? 0 : 20 });
 		} finally { await runtime.dispose(); clock.mockRestore(); admission.mockRestore(); }
 		expect(disposed).toHaveBeenCalledOnce(); expect(runtime.inspect().sharedCandidates).toBe(0);
 		for (const dispose of queryDisposals) expect(dispose).toHaveBeenCalledOnce();
+	});
+
+	it("credits a cached output projection separately from its source and excludes fresh projection and adoption costs", async () => {
+		let now = 100;
+		const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
+		const project = vi.fn(() => { now += 20; return "narrow"; });
+		const { runtime, events, ready } = harness({
+			source: planSource({ propose: () => plan("projection", { path: "input", offset: 1, limit: 100 }) }),
+			projection: { ...READ_RANGE_ACTION_KEY_PROJECTOR, captureCoverage: () => ({}), projectOutput: project },
+			execute: () => { now += 40; return world("wide", {
+				validate: async () => { now += 3; return validResource(); }, onCommit: () => { now += 5; },
+			}); },
+		});
+		try {
+			await runtime.startTurn(start("turn")); await ready.promise;
+			for (const id of ["fresh", "cached"]) {
+				expect((await runtime.prepareActorCall({ ...call("turn", { path: "input", offset: 10, limit: 1 }), id }))?.output).toBe("narrow");
+			}
+			await runtime.finishTurn({ ...call("turn"), terminal: true });
+			expect(project).toHaveBeenCalledOnce();
+			// Both calls reuse the 40 ms source; only the second reuses the 20 ms projection. Validation/commit are excluded.
+			expect(events.filter(event => event.type === "actor_action").map(event => event.computation)).toEqual([
+				{ actorComputeMs: 20, reusedExecutionMs: 40 }, { actorComputeMs: 0, reusedExecutionMs: 60 },
+			]);
+			expect(events.find(event => event.type === "task")?.timing).toMatchObject({ actorComputeMs: 20, reusedExecutionMs: 100 });
+		} finally { await runtime.dispose(); clock.mockRestore(); }
 	});
 
 	it("recomputes a proofless retained query instead of committing an input-only branch", async () => {
@@ -2086,7 +2206,16 @@ describe("structural speculative runtime", () => {
 				const providers = events.filter((event) => event.type === "actor_action").map((event) => event.settlement.provider);
 				expect(providers).toHaveLength(2);
 				expect(providers[1]!.toolExecution).toBe(providers[0]!.toolExecution);
-				if (dual) expect(events.find((event) => event.type === "task")?.timing.authoritativeToolCount).toBe(1);
+				if (dual) {
+					const receipts = events.filter(event => event.type === "actor_action").map(event => event.computation);
+					const execution = providers[0]!.toolExecution, reusedExecutionMs = receipts[0]!.reusedExecutionMs;
+					expect(reusedExecutionMs).toBeGreaterThan(0);
+					expect(reusedExecutionMs).toBeLessThanOrEqual(execution.completedAt - execution.startedAt);
+					expect(receipts).toEqual([
+						{ actorComputeMs: 0, reusedExecutionMs }, { actorComputeMs: 0, reusedExecutionMs },
+					]);
+					expect(events.find(event => event.type === "task")?.timing).toMatchObject({ actorComputeMs: 0, reusedExecutionMs: reusedExecutionMs * 2 });
+				}
 			}
 			if (mode === "parallel-predictions" || completed) {
 				expect(settlements).toHaveLength(8);
@@ -2101,7 +2230,16 @@ describe("structural speculative runtime", () => {
 				await runtime.startTurn(range); await nextReady.promise;
 				expect((await runtime.prepareActorCall(range))?.output).toBe("different query");
 				await runtime.finishTurn({ ...range, terminal: true });
-				expect(events.find((event) => event.type === "task")).toMatchObject({ timing: { authoritativeToolCount: 2 } });
+				const accepted = events.filter(event => event.type === "actor_action");
+				expect(accepted).toHaveLength(3);
+				const reusedExecutionMs = accepted.reduce((sum, event) => {
+					const execution = event.settlement.provider.toolExecution;
+					expect(event.computation?.actorComputeMs).toBe(0);
+					expect(event.computation!.reusedExecutionMs).toBeGreaterThan(0);
+					expect(event.computation!.reusedExecutionMs).toBeLessThanOrEqual(execution.completedAt - execution.startedAt);
+					return sum + event.computation!.reusedExecutionMs;
+				}, 0);
+				expect(events.find(event => event.type === "task")?.timing).toMatchObject({ actorComputeMs: 0, reusedExecutionMs });
 			}
 			expect(executionCount()).toBe(distinct || mode === "prediction-first" ? 2 : 1);
 			summary();

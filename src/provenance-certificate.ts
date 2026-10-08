@@ -2,6 +2,7 @@ import { nonNegativeCount as finiteTimestamp } from "./number-utils.ts";
 import { hash, webcrypto } from "node:crypto";
 import { cloneSharedData, stableEqual, stableStringify } from "./stable-json.ts";
 import type { WorkspaceFileMutation } from "./workspace-state.ts";
+import { normalizeTimelineComputation, type SerializedTimelineComputation } from "./task-timing.ts";
 
 /** Decimal strings preserve filesystem cookies beyond JavaScript's exact integer range. */
 export type OFDPosition = number | string;
@@ -190,6 +191,8 @@ export type ProcessResultRecord = {
 	readonly replayProfile: "buffered_noninteractive";
 	/** Producer process wall time; observational only and never used to authorize replay. */
 	readonly observedProcessMs?: number;
+	/** Original calculation graph; optional accounting metadata, never replay authority. */
+	readonly computation?: SerializedTimelineComputation;
 	/** Globally ordered output and filesystem effects. */
 	readonly journal: readonly OrderedEffectEvent[];
 	readonly resources?: ProcessResourceEffects;
@@ -326,7 +329,7 @@ function certificateContentKey(
 ): Sha256Digest {
 	const { createdAt: _createdAt, result, ...content } = certificate;
 	// Observational timing must not split otherwise identical reusable results.
-	const { observedProcessMs: _observedProcessMs, ...semanticResult } = result;
+	const { observedProcessMs: _observedProcessMs, computation: _computation, ...semanticResult } = result;
 	return digestObject({ ...content, result: semanticResult });
 }
 
@@ -601,6 +604,7 @@ function validExcludedEntries(entries: readonly string[] | undefined): boolean {
 }
 
 function normalizeResult(result: ProcessResultRecord, prototype: ExecPrototype): ProcessResultRecord {
+	const computation = normalizeTimelineComputation(result.computation);
 	if (result.replayProfile !== "buffered_noninteractive") throw new Error("unsupported replay profile");
 	if (result.continuation && (result.exit !== undefined || !isSha256Digest(result.continuation.imageDigest) ||
 		!Number.isSafeInteger(result.continuation.imageBytes) || result.continuation.imageBytes <= 0 || result.continuation.imageBytes > 65 * 1024 * 1024))
@@ -670,6 +674,7 @@ function normalizeResult(result: ProcessResultRecord, prototype: ExecPrototype):
 	return deepFreeze({
 		replayProfile: result.replayProfile,
 		...(result.observedProcessMs !== undefined ? { observedProcessMs: result.observedProcessMs } : {}),
+		...(computation ? { computation } : {}),
 		journal,
 		...(result.continuation ? { continuation: { ...result.continuation } } : { exit: { ...result.exit! } }),
 		...(resources ? { resources } : {}),
