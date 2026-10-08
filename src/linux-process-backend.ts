@@ -1361,24 +1361,12 @@ export class LinuxProcessReuseBackend {
 				...(live ? { onControl: (channel: import("node:stream").Duplex, wake: () => boolean) => {
 					let suspended: Promise<void> | undefined;
 					const release = this.handoffs.observeSuspension(weakKey, work, joinSignal => suspended ??= (async () => {
-						const stop = AbortSignal.any([session.signal, work.signal, ...(joinSignal ? [joinSignal] : [])]);
-						let pid = 0;
-						// Only probe while an Actor already waits within its join budget. A CPU
-						// prefix must be allowed to reach I/O instead of waiting forever for EOF.
-						while (!stop.aborted) {
-							const report = await readFile(descriptorReportPath!, "utf8").catch(() => ""), ready = /^RUNNING (\d+)\n$/.exec(report);
-							if (ready) {
-								pid = Number(ready[1]);
-								const state = await readFile(`/proc/${pid}/syscall`, "utf8").catch(() => ""), syscall = Number(state.split(" ", 1)[0]);
-								if (!state) return;
-								if (IO_FRONTIERS.has(syscall)) break;
-								if (syscall >= 0) return;
-							} else if (report.startsWith("OFD ")) return;
-							await delay(10, undefined, { signal: stop }).catch(() => undefined);
-						}
-						if (stop.aborted) return;
+						const executionSignal = AbortSignal.any([session.signal, work.signal]);
+						const stop = AbortSignal.any([executionSignal, ...(joinSignal ? [joinSignal] : [])]);
+						const frontier = await this.requestProcessImageAtFrontier(descriptorReportPath!, channel, wake, stop, executionSignal);
+						if (!frontier) return;
+						const { pid, reply } = frontier;
 						suspensionAttempted = true;
-						const reply = await requestProcessImage(pid, channel, wake, AbortSignal.any([session.signal, work.signal]));
 						if (reply.readInt32LE(0) !== pid) return;
 						const bytes = Number(reply.readBigUInt64LE(16)), begin = Number(reply.readBigUInt64LE(24)) / 1e6 - clockOffset,
 							end = Number(reply.readBigUInt64LE(32)) / 1e6 - clockOffset, fd = reply.readInt32LE(4), syscall = IO_FRONTIERS.get(reply.readInt32LE(8));
@@ -1599,6 +1587,28 @@ export class LinuxProcessReuseBackend {
 				if ([...session.writers].every(other => other.settled)) session.writers.clear();
 			}
 			if (traceRoot) await rm(traceRoot, { recursive: true, force: true }).catch(() => undefined);
+		}
+	}
+
+	/** Retry safe declines only while the existing Actor join still owns a wait budget. */
+	private async requestProcessImageAtFrontier(descriptorReportPath: string, channel: import("node:stream").Duplex,
+		wake: () => boolean, stop: AbortSignal, executionSignal: AbortSignal): Promise<{ pid: number; reply: Buffer } | undefined> {
+		while (!stop.aborted) {
+			const report = await readFile(descriptorReportPath, "utf8").catch(() => ""), ready = /^RUNNING (\d+)\n$/.exec(report);
+			if (ready) {
+				const pid = Number(ready[1]);
+				const state = await readFile(`/proc/${pid}/syscall`, "utf8").catch(() => ""), syscall = Number(state.split(" ", 1)[0]);
+				if (!state) return;
+				if (IO_FRONTIERS.has(syscall) && !stop.aborted) {
+					// An observed I/O syscall can finish before the interrupt. Zero leaves the private process running;
+					// a nonzero reply retires it and must follow the existing image or capture-failure checks.
+					// Drain a sent request even after the Actor deadline, so a late reply cannot belong to another request.
+					const reply = await requestProcessImage(pid, channel, wake, executionSignal);
+					if (reply.readInt32LE(0) !== 0) return { pid, reply };
+				}
+			} else if (report.startsWith("OFD ")) return;
+			// CPU work and transient non-I/O syscalls may still reach an admissible frontier within this same budget.
+			if (!stop.aborted) await delay(10, undefined, { signal: stop }).catch(() => undefined);
 		}
 	}
 
