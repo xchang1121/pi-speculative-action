@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 import type { BashOperations, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { deferred, nextTurn } from "./async.ts";
-import { installLinuxDependencies } from "../src/linux-setup.ts";
+import { checkLinuxEnvironment, installLinuxDependencies } from "../src/linux-setup.ts";
 
 type Component = {
 	render(width: number): string[];
@@ -17,7 +17,10 @@ const mocks = vi.hoisted(() => ({
 	createLocalBashOperations: vi.fn(),
 	disposeLoader: vi.fn(),
 	truncate: vi.fn((text: string, maxLines: number, _width: number) => ({ visualLines: text.split("\n").slice(-maxLines) })),
+	inspectLinuxEnvironment: vi.fn(),
 }));
+
+vi.mock("../src/linux-environment.ts", () => ({ inspectLinuxEnvironment: mocks.inspectLinuxEnvironment }));
 
 vi.mock("@earendil-works/pi-coding-agent", () => ({
 	createLocalBashOperations: mocks.createLocalBashOperations,
@@ -47,6 +50,7 @@ beforeEach(() => {
 	vi.clearAllMocks();
 	mocks.exec.mockReset().mockResolvedValue({ exitCode: 0 });
 	mocks.createLocalBashOperations.mockReturnValue({ exec: mocks.exec });
+	mocks.inspectLinuxEnvironment.mockReset().mockResolvedValue({ text: "Linux environment Doctor\nHost: openEuler; Cargo: not found", summary: "Host: openEuler; Cargo: not found", warnings: true });
 });
 
 afterEach(() => {
@@ -88,7 +92,7 @@ describe("Linux dependency installation UI", () => {
 	it.each([false, true])("requires an idle session even if a task starts during confirmation (%s)", async startsDuringConfirmation => {
 		const { context, ui, refresh } = fixture();
 		vi.mocked(context.isIdle).mockReturnValue(false);
-		if (startsDuringConfirmation) vi.mocked(context.isIdle).mockReturnValueOnce(true);
+		if (startsDuringConfirmation) vi.mocked(context.isIdle).mockReturnValueOnce(true).mockReturnValueOnce(true);
 		await installLinuxDependencies(context, refresh);
 		expect(ui.notify).toHaveBeenCalledWith(expect.stringMatching(/task/u), "warning");
 		expect(ui.confirm).toHaveBeenCalledTimes(startsDuringConfirmation ? 1 : 0);
@@ -100,7 +104,9 @@ describe("Linux dependency installation UI", () => {
 		const { context, ui, refresh } = fixture(), confirmation = deferred<boolean>();
 		ui.confirm.mockReturnValueOnce(confirmation.promise);
 		const installing = installLinuxDependencies(context, refresh);
+		await nextTurn();
 		expect(ui.confirm).toHaveBeenCalledWith(expect.stringMatching(/Install/u), expect.stringContaining("~/.local/bin"));
+		expect(ui.confirm).toHaveBeenCalledWith(expect.any(String), expect.stringContaining("Host: openEuler; Cargo: not found"));
 		expect(mocks.exec).not.toHaveBeenCalled();
 		confirmation.resolve(false);
 		await installing;
@@ -246,5 +252,50 @@ describe("Linux dependency installation UI", () => {
 		expect(report).toContain("正在安装\ncompiler warning\n");
 		expect(report).not.toMatch(/[\u001b\u0007\ufffd]/u);
 		expect(refresh).toHaveBeenCalledOnce();
+	});
+});
+
+describe("Linux environment Doctor UI", () => {
+	it("shows prerequisites and asks the controller for separate runtime qualification", async () => {
+		const { context, ui, refresh } = fixture();
+		await checkLinuxEnvironment(context, refresh);
+		expect(ui.notify).toHaveBeenCalledWith(expect.stringContaining("Host: openEuler; Cargo: not found"), "warning");
+		expect(refresh).toHaveBeenCalledOnce();
+		expect(ui.confirm).not.toHaveBeenCalled();
+		expect(mocks.exec).not.toHaveBeenCalled();
+	});
+
+	it.each(["win32", "darwin"])("does no Linux inspection or qualification on %s", async platform => {
+		Object.defineProperty(process, "platform", { ...platformDescriptor, value: platform });
+		const { context, ui, refresh } = fixture();
+		await checkLinuxEnvironment(context, refresh);
+		expect(ui.notify).toHaveBeenCalledWith(expect.stringMatching(/Linux.*WSL/u), "warning");
+		expect(mocks.inspectLinuxEnvironment).not.toHaveBeenCalled();
+		expect(refresh).not.toHaveBeenCalled();
+	});
+
+	it("does not inspect during an active task", async () => {
+		const { context, refresh } = fixture();
+		vi.mocked(context.isIdle).mockReturnValue(false);
+		await checkLinuxEnvironment(context, refresh);
+		expect(mocks.inspectLinuxEnvironment).not.toHaveBeenCalled();
+		expect(refresh).not.toHaveBeenCalled();
+	});
+
+	it("does not qualify if a task starts during inspection", async () => {
+		const { context, ui, refresh } = fixture();
+		vi.mocked(context.isIdle).mockReturnValueOnce(true).mockReturnValue(false);
+		await checkLinuxEnvironment(context, refresh);
+		expect(ui.notify).toHaveBeenLastCalledWith(expect.stringContaining("task is now running"), "warning");
+		expect(refresh).not.toHaveBeenCalled();
+	});
+
+	it("does not offer installation if a task starts during inspection", async () => {
+		const { context, ui, refresh } = fixture();
+		vi.mocked(context.isIdle).mockReturnValueOnce(true).mockReturnValue(false);
+		await installLinuxDependencies(context, refresh);
+		expect(ui.confirm).not.toHaveBeenCalled();
+		expect(mocks.exec).not.toHaveBeenCalled();
+		expect(refresh).not.toHaveBeenCalled();
 	});
 });
