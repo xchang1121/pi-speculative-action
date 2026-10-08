@@ -12,6 +12,7 @@ import { acquirePatternAwareStore, PATTERN_AWARE_DEFAULTS, asPatternAwareRuntime
 	projectPatternAwareObservation } from "./pattern-aware.ts";
 import type { PlanAction } from "./plan-proposal.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
+import { asRecord } from "./stable-json.ts";
 import type { ActorActionFeedback, SpeculativeActionSettings, SpeculativeCandidate } from "./runtime.ts";
 import { candidateExecutionMs, candidateToolNames } from "./runtime.ts";
 import { stableValueHash } from "./stable-value-hash.ts";
@@ -23,6 +24,11 @@ type PatternPlanFeedback = PatternAwareRuntimeContext & {
 	readonly operation?: ObservedOperation;
 };
 type CarriedPrediction = { readonly signature: string; readonly pending: Set<PatternPlanFeedback>; abandoned: boolean };
+type ObservedCommand = {
+	readonly parentHash: string; readonly tool: string; readonly input: Readonly<Record<string, unknown>>; readonly schemaHash?: string;
+	readonly failure?: { readonly paths: readonly string[]; readonly durationMs: number };
+};
+type CommandRerunState = { readonly native: boolean; readonly failed: boolean; workspaceChanged: boolean; retry?: ObservedCommand; issued?: object };
 
 export interface PatternPlanSourceController {
 	readonly source: AgentPlanSource;
@@ -59,18 +65,26 @@ export function createPatternPlanSource({
 	const issuedParents = new WeakSet<object>();
 	// Capabilities stay in this session; the persisted Pattern store receives only real tool batches.
 	const operationBindings = new BoundedRecencyMap<string, ObservedOperation>(PATTERN_AWARE_DEFAULTS.maxPatterns);
-	// The Actor's latest commands whose operations it learned: a workspace change since, or a rerun the runtime has not admitted, reruns one.
-	const learnedCommands = new BoundedRecencyMap<string, { readonly parentHash: string; readonly tool: string; readonly input: Readonly<Record<string, unknown>> }>(4);
-	let workspaceChanged = false, issuedRerun: object | undefined;
+	// Exact authoritative inputs stay session-local; the persisted history may shorten large payloads.
+	const learnedCommands = new BoundedRecencyMap<string, ObservedCommand>(4);
+	let commandRerun: CommandRerunState | undefined;
 	let analysisTail: Promise<void> = Promise.resolve();
 
-	const sourceSettings = (settings: SpeculativeActionSettings): PatternAwareSettings => patternAwareSettings(settings.sourceConfig?.patternAware);
+	const sourceSettings = (settings: SpeculativeActionSettings): PatternAwareSettings => {
+		const patternSettings = patternAwareSettings(settings.sourceConfig?.patternAware);
+		// Dropping this owner also fences work admitted before the preset was disabled.
+		const native = patternSettings.presets.includes("recent-command"), failed = patternSettings.presets.includes("retry-failed-command");
+		if (!settings.enabled || !patternSettings.enabled || !native && !failed) commandRerun = undefined;
+		else if (commandRerun?.native !== native || commandRerun.failed !== failed) commandRerun = { native, failed, workspaceChanged: false };
+		return patternSettings;
+	};
 	const admit = <Value>(settings: SpeculativeActionSettings,
-		operation: (settings: PatternAwareSettings) => Promise<Value>): Promise<Value> => {
+		operation: (settings: PatternAwareSettings, rerun: CommandRerunState | undefined) => Promise<Value>): Promise<Value> => {
 		try {
 			// Capture before admission yields; a sealed owner must not read caller configuration.
 			const patternSettings = lifecycle.sealed ? undefined : sourceSettings(settings);
-			return lifecycle.admit(() => operation(patternSettings!));
+			const rerun = commandRerun;
+			return lifecycle.admit(() => operation(patternSettings!, rerun));
 		} catch (error) { return Promise.reject(error); }
 	};
 	const nextRevision = (sessionID: string, turnID: string): number => {
@@ -123,6 +137,7 @@ export function createPatternPlanSource({
 		sessionID: startInput.sessionID, turnID: startInput.turnID,
 		...eventData(action.key.tool, action.input, output, durationMs), schemaHash: action.key.schemaHash, learnTarget: false,
 	});
+	const resourcePath = (target: string) => patternActionSemantics.actionKey("read", { path: target })?.resources[0];
 	const planActions = (candidates: readonly PatternAwareCandidate[], store: PatternAwareStore,
 		schemaHashes: Readonly<Record<string, string>>, operationLimit: number, dependsOn?: PlanAction["dependsOn"], parentID?: string) => {
 		let operations: Map<string, ObservedOperation[]> | undefined;
@@ -158,20 +173,30 @@ export function createPatternPlanSource({
 
 	/** Prepare a stale native launch against the Actor's edited files, without repeating its parent's earlier setup.
 	 * Captured-resource launches keep their parent ordering. Every result still requires current dependency evidence at adoption. */
-	const reruns = async (): Promise<readonly [rerun: PlanAction[], apart: (action: PlanAction) => boolean]> => {
-		if (!workspaceChanged && !issuedRerun) return NO_RERUN;
-		workspaceChanged = false; issuedRerun = undefined;
-		for (const command of [...learnedCommands.values()].reverse()) {
+	const reruns = async (state: CommandRerunState | undefined, schemaHashes: Readonly<Record<string, string>>): Promise<readonly [rerun: PlanAction[], apart: (action: PlanAction) => boolean]> => {
+		if (!state || state !== commandRerun || !state.workspaceChanged && !state.retry && !state.issued) return NO_RERUN;
+		const retry = state.retry;
+		state.workspaceChanged = false; state.retry = undefined; state.issued = undefined;
+		const commands = [...learnedCommands.values()].reverse();
+		if (retry) commands.sort((left, right) => Number(right === retry) - Number(left === retry));
+		for (const command of commands) {
+			if (!state.native && command !== retry || command.schemaHash !== schemaHashes[command.tool]) continue;
 			const children = [...operationBindings.values()].filter(item => item.parentHash === command.parentHash && item.binding.available !== false);
 			const stale = (await Promise.all(children.map(async ({ binding }) => binding.executionMs > 0 && await binding.stale?.() !== false ? binding : undefined)))
 				.filter((binding): binding is ExecutionOperationBinding => !!binding).sort((left, right) => right.executionMs - left.executionMs);
-			if (!stale.length) continue;
+			if (state !== commandRerun) return NO_RERUN;
+			if (![...learnedCommands.values()].includes(command)) continue;
+			const fallback = command === retry && command.failure && !children.some(({ binding }) => binding.executionMs > 0);
+			if (!stale.length && !fallback) continue;
 			const operation = stale.find(binding => binding.preparation === "current_workspace" && !binding.fed);
+			if (command === retry) state.retry = command;
 			return [[{ id: `rerun:${command.parentHash}`, type: operation ? "operation" : "tool_call", ...(operation ? { operation } : {}),
-				tool: command.tool, input: command.input, horizon: 0, producesOperations: true, feedback: issuedRerun = {},
-				expectedLatencyBenefitMs: operation?.executionMs ?? stale.reduce((total, binding) => total + binding.executionMs, 0),
-				expectedDurationMs: operation?.expectedDurationMs ?? Math.max(...children.map(({ binding }) => binding.expectedDurationMs)) }],
-				action => operation ? action.operation?.identity !== operation.identity : !children.some(({ binding }) => binding.identity === action.operation?.identity && !binding.fed)];
+				tool: command.tool, input: command.input, horizon: 0, producesOperations: true, feedback: state.issued = {},
+				...(fallback ? { empiricalProbability: 0.25, conditionalProbability: 0.25 } : {}),
+				expectedLatencyBenefitMs: fallback ? command.failure!.durationMs * 0.25 : operation?.executionMs ?? stale.reduce((total, binding) => total + binding.executionMs, 0),
+				expectedDurationMs: fallback ? command.failure!.durationMs : operation?.expectedDurationMs ?? Math.max(...children.map(({ binding }) => binding.expectedDurationMs)) }],
+				action => (action.type !== "tool_call" || patternActionSemantics.actionKey(action.tool, asRecord(action.input) ?? {}, schemaHashes[action.tool])?.hash !== command.parentHash) &&
+					(operation ? action.operation?.identity !== operation.identity : !children.some(({ binding }) => binding.identity === action.operation?.identity && !binding.fed))];
 		}
 		return NO_RERUN;
 	};
@@ -182,7 +207,7 @@ export function createPatternPlanSource({
 		observesOperations: action => actionSemantics.definition(action)?.requirements.capabilities.includes("invocation.process") === true,
 		multiStepEnabled: (settings) => sourceSettings(settings).multiStepEnabled,
 		requestLifetime: "actor_decision",
-		propose: ({ startInput, data, settings, signal }) => admit(settings, async (patternSettings) => {
+		propose: ({ startInput, data, settings, signal }) => admit(settings, async (patternSettings, rerunState) => {
 			if (!patternSettings.enabled) return undefined;
 			await analysisTail;
 			if (signal.aborted) return undefined;
@@ -190,7 +215,8 @@ export function createPatternPlanSource({
 			if (signal.aborted) return undefined;
 			const candidates = store.predict(startInput.sessionID, data.schemaHashes, patternSettings);
 			const signature = patternPredictionSignature(candidates);
-			const carried = carriedPredictions.get(startInput.sessionID), [rerun, apart] = await reruns();
+			const carried = carriedPredictions.get(startInput.sessionID), prepared = await reruns(rerunState, data.schemaHashes);
+			const [rerun, apart] = rerunState === commandRerun ? prepared : NO_RERUN;
 			carriedPredictions.delete(startInput.sessionID);
 			const repeated = !candidates.length || carried?.signature === signature && !carried.pending.size && !carried.abandoned;
 			if (repeated && !rerun.length) return undefined;
@@ -246,30 +272,44 @@ export function createPatternPlanSource({
 				upsert: planActions(next, context.store, data.schemaHashes, patternSettings.beamWidth, [{ actionID, condition: "execution_succeeded" }], actionID),
 			};
 		}),
-		observe: ({ data, settings, consumeInput, action, tool, concrete, output, durationMs, order, operations, signal, reserveRevision }) => admit(settings, async (patternSettings) => {
+		observe: ({ data, settings, consumeInput, action, tool, concrete, output, durationMs, order, operations, signal, reserveRevision }) => admit(settings, async (patternSettings, rerunState) => {
 			if (!patternSettings.enabled) return undefined;
 			const schemaHash = action?.schemaHash ?? data.schemaHashes[tool];
-			const parentHash = operations?.length && patternActionSemantics.actionKey(tool, concrete, schemaHash)?.hash;
+			const observed = eventData(tool, concrete, output, durationMs);
+			const parentHash = (operations?.length || tool === "bash") && patternActionSemantics.actionKey(tool, concrete, schemaHash)?.hash;
+			let bound = false;
 			if (parentHash) for (const binding of operations ?? []) {
 				if (binding.available === false || binding.permissionHash !== action?.hash) continue;
 				const key = `${parentHash}:${binding.backend}:${binding.identity}`;
 				operationBindings.set(key, { key, parentHash, binding });
-				learnedCommands.set(parentHash, { parentHash, tool, input: structuredClone(concrete) });
+				bound = true;
 			}
-			if (actionSemantics.toolNames("workspace_mutation").includes(tool)) workspaceChanged = true;
+			// A command mentioning a path is not evidence that its failure reported that file.
+			const paths = tool === "bash" && output?.isError ? [...new Set([...(extractOutputPaths(tool, {}, output.result) ?? []), ...(observed.outputLocations ?? []).map(location => location.path)]
+				.flatMap(target => resourcePath(target) ?? []))] : [];
+			const failure = paths.length && Number.isFinite(durationMs) && durationMs > 0 ? { paths, durationMs } : undefined;
+			if (parentHash && (bound || learnedCommands.get(parentHash) || patternSettings.presets.includes("retry-failed-command") && failure))
+				learnedCommands.set(parentHash, { parentHash, tool, input: observed.input, ...(schemaHash === undefined ? {} : { schemaHash }), ...(failure ? { failure } : {}) });
+			if (rerunState && rerunState === commandRerun && actionSemantics.toolNames("workspace_mutation").includes(tool)) {
+				rerunState.workspaceChanged = rerunState.native;
+				const edited = typeof concrete.path === "string" && output && !output.isError ? resourcePath(concrete.path) : undefined;
+				rerunState.retry = rerunState.failed && edited ? [...learnedCommands.values()].reverse().find(command => command.failure?.paths.includes(edited)) : undefined;
+				rerunState.issued = undefined;
+			}
 			const key = agentBatchKey(consumeInput.sessionID, consumeInput.turnID);
 			const batch = authoritativeBatches.get(key) ?? new Map();
 			const event: PatternAwareEventInput = {
 				sessionID: consumeInput.sessionID,
 				turnID: consumeInput.turnID,
-				...eventData(tool, concrete, output, durationMs),
+				...observed,
 				...(schemaHash === undefined ? {} : { schemaHash }),
 				learnTarget: candidateToolNames(settings, actionSemantics).includes(tool),
 			};
 			batch.set(order, event);
 			authoritativeBatches.set(key, batch);
 			// A closing turn drops these updates and the next turn predicts afresh (a rerun then goes with it): never hold turn closure for them.
-			const [rerun, apart] = signal?.aborted ? NO_RERUN : await reruns();
+			let [rerun, apart] = signal?.aborted ? NO_RERUN : await reruns(rerunState, data.schemaHashes);
+			if (rerunState !== commandRerun) [rerun, apart] = NO_RERUN;
 			if (!patternSettings.multiStepEnabled && !rerun.length || signal?.aborted) return undefined;
 			let actions = rerun;
 			if (patternSettings.multiStepEnabled) {
@@ -278,6 +318,7 @@ export function createPatternPlanSource({
 				const store = await resolveStore(patternSettings);
 				const ordered = [...batch.entries()].sort(([left], [right]) => left - right).map(([, item]) => item);
 				const candidates = store.predictAfterBatch(consumeInput.sessionID, ordered, data.schemaHashes, patternSettings);
+				if (rerunState !== commandRerun) [rerun, apart] = NO_RERUN;
 				const predicted = planActions(candidates, store, data.schemaHashes, patternSettings.beamWidth).filter(apart);
 				// An observation can finish after its turn closes, or lose individual actions during admission.
 				const carried = { signature: patternPredictionSignature(candidates), pending: new Set(predicted.map((action) => action.feedback)), abandoned: false };
@@ -293,7 +334,7 @@ export function createPatternPlanSource({
 		}),
 		onAdmitted: ({ feedback }) => {
 			if (lifecycle.sealed) return;
-			if (feedback === issuedRerun) issuedRerun = undefined;
+			if (commandRerun && commandRerun.issued === feedback) { commandRerun.issued = undefined; commandRerun.retry = undefined; }
 			const context = asPatternPlanFeedback(feedback);
 			if (context) predictionBatches.get(context)?.pending.delete(context);
 		},
@@ -328,8 +369,8 @@ export function createPatternPlanSource({
 		authoritativeBatches.delete(key);
 		revisions.delete(key);
 		if (terminal) carriedPredictions.delete(startInput.sessionID);
-		const patternSettings = settings.enabled ? sourceSettings(settings) : undefined;
-		if (!patternSettings?.enabled || lifecycle.sealed) { carriedPredictions.delete(startInput.sessionID); return; }
+		const patternSettings = sourceSettings(settings);
+		if (!settings.enabled || !patternSettings.enabled || lifecycle.sealed) { carriedPredictions.delete(startInput.sessionID); return; }
 		// Only a completed turn contributes its authoritative batch; entry discards any stale batch.
 		const events = terminal !== undefined && batch?.size ? [...batch.entries()].sort(([left], [right]) => left - right).map(([, event]) => event) : [];
 		analysisTail = analysisTail.then(() => new Promise<void>(setImmediate))
@@ -358,9 +399,11 @@ export function createPatternPlanSource({
 		},
 		finishSession: () => lifecycle.run(async () => {
 			await lifecycle.drain();
+			commandRerun = undefined;
 			revisions.clear();
 			carriedPredictions.clear();
 			operationBindings.clear();
+			learnedCommands.clear();
 			clearAuthoritativeSession(authoritativeBatches, sessionID);
 			try {
 				await flushStores(true);
@@ -371,11 +414,13 @@ export function createPatternPlanSource({
 		dispose: () => lifecycle.close(async () => {
 			await analysisTail;
 			await lifecycle.drain();
+			commandRerun = undefined;
 			const leases = [...ownedStores.values()];
 			ownedStores.clear();
 			openedStore = undefined;
 			authoritativeBatches.clear();
 			operationBindings.clear();
+			learnedCommands.clear();
 			revisions.clear();
 			carriedPredictions.clear();
 			await Promise.allSettled(leases.map(async lease => (await lease).release()));

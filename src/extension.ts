@@ -14,7 +14,7 @@ import { DrafterTaskBudget } from "./drafter-budget.ts";
 import { toolSpeedup } from "./task-timing.ts";
 import { forceToolChoice } from "./drafter-plan-source.ts";
 import { clampCandidateLimit } from "./common.ts";
-import type { PatternAwareSettings } from "./pattern-aware.ts";
+import { PATTERN_AWARE_PRESETS, type PatternAwareSettings } from "./pattern-aware.ts";
 import { createClosedSearchProfile, createPiToolDefinitions, PI_CLOSED_SEARCH_TOOLS, PI_OPERATION_TOOLS, resolvePiToolInvocation, type PiToolDefinition } from "./pi-tool-invocation.ts";
 import type { ToolInvocation } from "./tool-settlement.ts";
 import { LinuxProcessReuseBackend } from "./linux-process-backend.ts";
@@ -175,6 +175,7 @@ export function formatSpeculativeActionStatus(input: {
 		`Storage policy: ${settings.resourceCacheMaxEntries} live results/${formatBytes(settings.resourceCacheMaxBytes)}; ${settings.executionStoreMaxEntries} reusable commands/${formatBytes(settings.executionStoreMaxBytes)}`,
 		`Prediction wait limit: ${formatDuration(settings.predictionTimeoutMs)}`,
 		`Learned patterns: ${settings.patternAware.enabled ? "On" : "Off"}; follow-up steps: ${settings.patternAware.multiStepEnabled ? "On" : "Off"} (alternatives/tool ${settings.patternAware.beamWidth}, depth ${settings.patternAware.maxPredictionDepth}, learn after ${settings.patternAware.minOccurrences}, gap ${settings.patternAware.maxFutureGap}, coverage ${formatPercent(settings.patternAware.futureGapCoverage)}, half-life ${settings.patternAware.decayHalfLifeEvents})`,
+		`Prebuilt modes: ${settings.patternAware.presets.length}/${PATTERN_AWARE_PRESETS.length} selected${settings.patternAware.enabled ? "" : " (inactive)"}; ${PATTERN_AWARE_PRESETS.filter(preset => settings.patternAware.presets.includes(preset.id)).map(preset => preset.label).join(", ") || "None"}`,
 		`Actor probe: ${self.enabled && self.forkEnabled ? `On (${self.forkTransport})` : "Off"}; target verification ${self.enabled ? "On" : "Off"}; early tool execution ${self.enabled && self.forkTransport !== "provider" && self.forkEnabled && self.forkActionEnabled ? self.forkTransport === "drafter" ? "On (Drafter)" : `On (tool-name confidence ≥${formatPercent(self.forkActionMinConfidence)})` : "Off"}; benefit control ${self.forkGateEnabled ? `On (${self.forkGateWindowSize} samples, ≥${formatDuration(self.forkGateMinNetBenefitMs)} net)` : "Off"}; ${self.maxCandidates} candidates × ${self.maxDraftTokens} draft tokens; Actor Profile=${self.actorProfile}; ${self.draftFormat} (${syntaxSettingLabel(self.draftBoundary)} boundary); ${self.forkTransport === "sidecar" ? self.endpoint : FORK_TRANSPORT_LABELS[self.forkTransport]}`,
 		`Prediction tools: ${toolsSummary(settings.tools)}`,
 		`Execution routing: unified ${settings.executionRouting.primary ? "On" : "Off"}; native fallback ${settings.executionRouting.nativeFallback ? "On" : "Off"}; Actor always available`,
@@ -778,7 +779,7 @@ async function openSettings(ctx: ExtensionContext, controller: SpeculativeAction
 			if (!await ctx.ui.confirm("Restore defaults?", "Restore tuning values while keeping the main switch and prediction-source choices?")) return;
 			const defaults = normalizeSpeculativeActionSettings(undefined), { patternAware: pattern, selfSpeculation: probe } = draft;
 			await editor.setSettings({ ...defaults, enabled: draft.enabled, drafterEnabled: draft.drafterEnabled,
-				patternAware: { ...defaults.patternAware, enabled: pattern.enabled, multiStepEnabled: pattern.multiStepEnabled },
+				patternAware: { ...defaults.patternAware, enabled: pattern.enabled, multiStepEnabled: pattern.multiStepEnabled, presets: pattern.presets },
 				selfSpeculation: { ...defaults.selfSpeculation, enabled: probe.enabled, forkEnabled: probe.forkEnabled, forkActionEnabled: probe.forkActionEnabled } });
 		});
 		const choice = await ctx.ui.select("Speculative action", [...actions.keys(), CLOSE]);
@@ -800,7 +801,7 @@ function openPredictionSources(ctx: ExtensionContext, controller: SpeculativeAct
 		return new Map<string, MenuAction>([
 			[`Model Drafter › ${settings.drafterEnabled ? "On" : "Off"}, ${settings.draftModel ?? activeModelReference(ctx)}`, () => openDrafterSettings(ctx, controller)],
 			[`Actor probe › ${actorForkSummary(settings.selfSpeculation)}`, () => openActorForkSettings(ctx, controller)],
-			[`Learned patterns › ${settings.patternAware.enabled ? "On" : "Off"}, ${settings.patternAware.multiStepEnabled ? "follow-up steps" : "next step only"}`, () => openPatternAwareSettings(ctx, controller)],
+			[`Learned patterns › ${settings.patternAware.enabled ? "On" : "Off"}, ${settings.patternAware.multiStepEnabled ? "follow-up steps" : "next step only"}, ${settings.patternAware.presets.length}/${PATTERN_AWARE_PRESETS.length} prebuilt modes selected`, () => openPatternAwareSettings(ctx, controller)],
 		]);
 	});
 }
@@ -911,9 +912,9 @@ function openActorForkSettings(
 function openPatternAwareSettings(
 	ctx: ExtensionContext,
 	controller: SpeculativeActionController,
-	menu: "basic" | "advanced" | "learning" | "multiStep" = "basic",
+	menu: "basic" | "presets" | "advanced" | "learning" | "multiStep" = "basic",
 ): Promise<void> {
-	const title = { basic: "Learned patterns", advanced: "Learned-pattern advanced", learning: "Learning history", multiStep: "Multi-step search" }[menu];
+	const title = { basic: "Learned patterns", presets: "Prebuilt modes", advanced: "Learned-pattern advanced", learning: "Learning history", multiStep: "Multi-step search" }[menu];
 	return runActionMenuLoop(ctx, title, () => {
 		const settings = controller.settings();
 		const pattern = settings.patternAware;
@@ -922,8 +923,15 @@ function openPatternAwareSettings(
 		if (menu === "basic") return new Map<string, MenuAction>([
 			toggle("enabled", "Enabled"),
 			toggle("multiStepEnabled", "Predict follow-up tool steps"),
+			[`Prebuilt modes › ${pattern.presets.length}/${PATTERN_AWARE_PRESETS.length} selected`, () => openPatternAwareSettings(ctx, controller, "presets")],
 			[`Advanced settings › history, confidence, search limits`, () => openPatternAwareSettings(ctx, controller, "advanced")],
 		]);
+		if (menu === "presets") return new Map<string, MenuAction>(PATTERN_AWARE_PRESETS.map(preset => [
+			`[${pattern.presets.includes(preset.id) ? "x" : " "}] ${preset.label} · ${preset.description}`,
+			() => controller.setSettings({ ...settings, patternAware: { ...pattern, presets: PATTERN_AWARE_PRESETS
+				.filter(candidate => candidate.id === preset.id ? !pattern.presets.includes(candidate.id) : pattern.presets.includes(candidate.id))
+				.map(candidate => candidate.id) } }),
+		]));
 		if (menu === "advanced") {
 			const actions = new Map<string, MenuAction>([
 				[`Learning history › ${pattern.maxContextLength} previous actions`, () => openPatternAwareSettings(ctx, controller, "learning")],

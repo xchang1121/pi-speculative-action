@@ -1543,9 +1543,10 @@ describe("speculative action host", () => {
 		const store = new PatternAwareStore(patternAware, undefined, patternAwareActionSemantics(PI_ACTION_SEMANTICS, cwd));
 		const request = planRequest(tool, patternAware, "session", { bash: "schema", write: "schema" }), build = { command: "make -s" };
 		const controller = createPatternPlanSource({ sessionID: "session", cwd, store, actionSemantics: PI_ACTION_SEMANTICS, projectionRules: [] });
-		let compiled = true;
+		let compiled = true, staleness: ReturnType<typeof gated> | undefined;
 		const operation = (identity: string, executionMs: number, stale: () => boolean) => Object.freeze({ backend: "test", identity, executionMs,
-			expectedDurationMs: executionMs + 10, permissionHash: PI_ACTION_SEMANTICS.buildKey("bash", build, cwd, "schema")!.hash, available: true, stale: async () => stale(),
+			expectedDurationMs: executionMs + 10, permissionHash: PI_ACTION_SEMANTICS.buildKey("bash", build, cwd, "schema")!.hash, available: true,
+			stale: async () => { await staleness?.wait(); return stale(); },
 			...(preparation === "captured_resources" ? {} : { preparation: "current_workspace" as const }), ...(preparation === "live_input" ? { fed: true as const } : {}) });
 		const observe = (name: string, concrete: Record<string, unknown>, extra: object = {}) => controller.source.observe!({ ...request,
 			action: PI_ACTION_SEMANTICS.buildKey(name, concrete, cwd, "schema")!, consumeInput: { sessionID: "session", turnID: request.startInput.turnID, tool: name, args: concrete, tools: [tool] },
@@ -1565,7 +1566,73 @@ describe("speculative action host", () => {
 			const closed = new AbortController(); closed.abort();
 			expect(await observe("write", { path: "a.c", content: "int y;" }, { signal: closed.signal })).toBeUndefined();
 			expect(await controller.source.propose(request)).toMatchObject({ actions: [{ type: current ? "operation" : "tool_call", tool: "bash", input: build, producesOperations: true }] });
-		} finally { await controller.dispose(); }
+			const select = (presets: typeof patternAware.presets) => {
+				request.settings.sourceConfig.patternAware = patternAwareSettings({ ...patternAware, presets });
+				expect(controller.source.enabled(request.settings)).toBe(true);
+			};
+			// Disabling clears an unadmitted result and an edit whose turn already closed.
+			select([]); expect(await controller.source.propose(request)).toBeUndefined();
+			select(patternAware.presets); expect(await controller.source.propose(request)).toBeUndefined();
+			expect(await observe("write", { path: "a.c", content: "int z;" }, { signal: closed.signal })).toBeUndefined();
+			select([]); select(patternAware.presets);
+			expect(await controller.source.propose(request)).toBeUndefined();
+			// Neither a queued admission nor a stale check may restore the old owner's trigger after OFF -> ON.
+			const admitting = observe("write", { path: "a.c", content: "int queued;" });
+			select([]); select(patternAware.presets);
+			expect(await admitting).toBeUndefined();
+			staleness = gated();
+			const checking = observe("write", { path: "a.c", content: "int pending;" });
+			await staleness.entered;
+			select([]); select(patternAware.presets);
+			staleness.release();
+			expect(await checking).toBeUndefined();
+			staleness = undefined;
+			expect(await controller.source.propose(request)).toBeUndefined();
+			request.settings.sourceConfig.patternAware = patternAwareSettings({ ...patternAware, multiStepEnabled: true, presets: ["recent-command"] });
+			// A preset change during multi-step expansion also discards the already-prepared rerun.
+			vi.spyOn(store, "predictAfterBatch").mockImplementationOnce(() => { select([]); select(patternAware.presets); return []; });
+			expect(await observe("write", { path: "a.c", content: "int expanded;" })).toMatchObject({ actions: [] });
+			expect(await controller.source.propose(request)).toBeUndefined();
+			expect(await observe("write", { path: "a.c", content: "int fresh;" })).toMatchObject({ actions: [{ tool: "bash", input: build, producesOperations: true }] });
+			select(["retry-failed-command"]);
+			expect(await observe("write", { path: "a.c", content: "before failure" })).toBeUndefined();
+			const failedInput = { command: `validate ${"x".repeat(5000)}`, timeout: 7 }, exact = structuredClone(failedInput);
+			const failure = { output: { result: textResult("a.c:1: invalid value"), isError: true }, durationMs: 80 };
+			expect(await observe("bash", failedInput, failure)).toBeUndefined();
+			failedInput.command = "changed by caller"; failedInput.timeout = 1;
+			expect(await observe("write", { path: "unrelated.c", content: "unrelated" })).toBeUndefined();
+			expect(await observe("write", { path: "a.c", content: "failed edit" }, { output: { result: textResult("denied"), isError: true } })).toBeUndefined();
+			const retry = await observe("write", { path: "a.c", content: "repaired" });
+			if (!retry || !("actions" in retry)) throw new Error("missing failed-command proposal");
+			expect(retry).toMatchObject({ actions: [{ type: "tool_call", tool: "bash", input: exact, producesOperations: true,
+				empiricalProbability: 0.25, expectedLatencyBenefitMs: 20, expectedDurationMs: 80 }] });
+			expect(retry.actions).toHaveLength(1);
+			await controller.source.onAdmitted!({ proposalID: retry.id, actionID: retry.actions[0]!.id, feedback: retry.actions[0]!.feedback });
+			expect(await controller.source.propose(request)).toBeUndefined();
+			// Changing either command mode discards a failed retry waiting for a new turn.
+			expect(await observe("write", { path: "a.c", content: "closed" }, { signal: closed.signal })).toBeUndefined();
+			select([...patternAware.presets, "retry-failed-command"]); select(["retry-failed-command"]);
+			expect(await controller.source.propose(request)).toBeUndefined();
+			const schemas = request.data.schemaHashes;
+			request.data.schemaHashes = { ...schemas, bash: "other-schema" };
+			expect(await observe("write", { path: "a.c", content: "schema changed" })).toBeUndefined();
+			request.data.schemaHashes = schemas;
+			expect(await observe("write", { path: "a.c", content: "fresh repair" })).toMatchObject({ actions: [{ input: exact }] });
+			expect(await observe("bash", exact)).toBeUndefined();
+			expect(await observe("write", { path: "a.c", content: "already succeeded" })).toBeUndefined();
+			// Text in the command itself does not count as a failure reporting that file.
+			expect(await observe("bash", { command: "check src/mentioned.ts" }, { ...failure, output: { result: textResult("unrelated failure"), isError: true } })).toBeUndefined();
+			expect(await observe("write", { path: "src/mentioned.ts", content: "new" })).toBeUndefined();
+			const owned = { ...compile, identity: "failed-compile", permissionHash: PI_ACTION_SEMANTICS.buildKey("bash", exact, cwd, "schema")!.hash };
+			expect(await observe("bash", exact, { ...failure, operations: [owned] })).toBeUndefined();
+			compiled = true;
+			expect(await observe("write", { path: "a.c", content: "native already fresh" })).toBeUndefined();
+			compiled = false;
+			const native = await observe("write", { path: "a.c", content: "native repair" });
+			if (!native || !("actions" in native)) throw new Error("missing native proposal");
+			expect(native).toMatchObject({ actions: [{ type: current ? "operation" : "tool_call", input: exact, expectedLatencyBenefitMs: 50 }] });
+			expect(native.actions).toHaveLength(1);
+		} finally { staleness?.release(); await controller.dispose(); }
 	});
 
 	it("issues a parent's operation choices once and credits its pattern only with an observed adoption", async () => {
@@ -1707,9 +1774,11 @@ describe("speculative action host", () => {
 		}
 	});
 
-	it.each(["actor", "drafter", "closing", "preparing", "rejected", "carried", "revised"] as const)("rebases PatternAware across an authoritative %s result", async (origin) => {
-		const { cwd, patternSettings, patternStore, grepTool, readTool: learnedReadTool, materialized } = await patternRebaseFixture();
-		const carried = origin === "carried" || origin === "revised";
+	it.each(["actor", "drafter", "closing", "preparing", "rejected", "carried", "revised", "preset", "preset-stale", "preset-location"] as const)("rebases PatternAware across an authoritative %s result", async (origin) => {
+		const preset = origin === "preset" || origin === "preset-stale" || origin === "preset-location";
+		const { cwd, patternSettings, patternStore, grepTool, readTool: learnedReadTool, materialized } = await patternRebaseFixture(origin === "preset-location" ? "reported-lines" : preset ? "reported-files" : undefined);
+		if (preset) expect(patternStore.snapshot()).toEqual([]);
+		const carried = origin === "carried" || origin === "revised" || preset;
 		const retained = carried || origin === "preparing";
 		const readTool = carried ? createReadTool(cwd) : learnedReadTool;
 		const tools = [grepTool, readTool], ready = deferred<void>(), routeGate = deferred<void>();
@@ -1769,7 +1838,7 @@ describe("speculative action host", () => {
 				expect(predictAfterBatch.mock.calls[0]?.[1][0]?.schemaHash).toBe(actorSchema);
 				expect(materialized).toContainEqual(expect.objectContaining({
 					sessionID: "probe", turnID: call.turnID, expectedDecisionSequence: 2, latestDecisionSequence: 2,
-					source: "pattern_aware", tool: "read", input: { path: "notes.txt" },
+					source: "pattern_aware", tool: "read", input: origin === "preset-location" ? expect.objectContaining({ path: "notes.txt" }) : { path: "notes.txt" },
 				}));
 				expect(patternStore.recent("probe")).toHaveLength(0);
 				if (origin === "preparing" || origin === "rejected" || carried) await ready.promise;
@@ -1792,16 +1861,17 @@ describe("speculative action host", () => {
 				routeGate.resolve();
 				await waitFor(() => events.some(event => event.type === "candidate" && event.candidate.source === "pattern_aware" && event.state.status === "succeeded"));
 				expect(materialized.filter(candidate => candidate.source === "pattern_aware" && candidate.tool === "read")).toHaveLength(1);
-				const args = { path: "notes.txt", ...(carried ? { offset: 2, limit: 1 } : {}) };
+				if (origin === "preset-stale") await writeFile(path.join(cwd, "notes.txt"), "one\nchanged\nthree\nfour");
+				const args = { path: "notes.txt", ...(carried ? { offset: origin === "preset-location" ? 5000 : 2, limit: 1 } : {}) };
 				const native = vi.fn(() => readTool.execute("native", args));
 				expect(await host.execute({ turnID: "next", id: "narrow-read", tool: "read", args, tools }, undefined, native))
 					.toEqual(await readTool.execute("control", args));
 				await host.finishTurn("next");
-				expect(native).not.toHaveBeenCalled();
+				expect(native).toHaveBeenCalledTimes(origin === "preset-stale" ? 1 : 0);
 				expect(events.filter(event => event.type === "prediction")).toContainEqual(expect.objectContaining({ settlement:
 					expect.objectContaining({ observation: "observed", actorAction: expect.objectContaining({ turnID: "next" }), match:
 						expect.objectContaining({ matched: true, relation: expect.objectContaining(carried ? { kind: "projected", projector: "read.range" } : { kind: "exact" }),
-							adoption: expect.objectContaining({ status: "adopted" }) }) }) }));
+							adoption: expect.objectContaining(origin === "preset-stale" ? { status: "rejected", cause: expect.objectContaining({ stage: "freshness" }) } : { status: "adopted" }) }) }) }));
 			}
 		} finally { feedbackGate.resolve(); routeGate.resolve(); available.resolve(patternStore); await host.dispose(); }
 	});
@@ -2059,18 +2129,19 @@ function toolRuntimeWorld(): SpeculativeAgentExecutionWorld {
 	}));
 }
 
-async function patternRebaseFixture() {
+async function patternRebaseFixture(preset?: "reported-files" | "reported-lines") {
 	const cwd = await temporaryWorkspace();
-	const patternSettings = { ...PATTERN_AWARE_DEFAULTS, minOccurrences: 2, multiStepEnabled: true };
-	const patternStore = new PatternAwareStore(patternSettings);
-	for (const [trainingSession, filePath] of [["training-a", "alpha.txt"], ["training-b", "beta.txt"]] as const) {
+	if (preset === "reported-lines") await writeFile(path.join(cwd, "notes.txt"), Array.from({ length: 5200 }, (_, index) => `line ${index + 1}`).join("\n"));
+	const patternSettings = patternAwareSettings({ minOccurrences: 2, multiStepEnabled: true, ...(preset ? { presets: [preset] } : {}) });
+	const patternStore = new PatternAwareStore(patternSettings, undefined, preset ? patternAwareActionSemantics(PI_ACTION_SEMANTICS, cwd) : undefined);
+	for (const [trainingSession, filePath] of preset ? [] : [["training-a", "alpha.txt"], ["training-b", "beta.txt"]] as const) {
 		for (const [step, tool, input, outputPaths] of [
 			["scan", "grep", { pattern: "one", path: "." }, [filePath]],
 			["read", "read", { path: filePath }, undefined],
 		] as const) patternStore.observe({ sessionID: trainingSession, turnID: `${trainingSession}:${step}`,
 			tool, input, outputPaths, outcome: "success", durationMs: 10 });
 	}
-	const grepTool: AgentTool<typeof grepSchema> = { name: "grep", label: "grep", description: "grep", parameters: grepSchema, execute: async () => textResult("notes.txt:1:one") };
+	const grepTool: AgentTool<typeof grepSchema> = { name: "grep", label: "grep", description: "grep", parameters: grepSchema, execute: async () => textResult(`notes.txt:${preset === "reported-lines" ? "5000:line 5000" : "1:one"}`) };
 	const readTool: AgentTool<typeof readSchema> = { name: "read", label: "read", description: "read", parameters: readSchema, execute: async () => textResult("one") };
 	const materialized: MaterializedSpeculativeCandidate<string>[] = [];
 	return { cwd, patternSettings, patternStore, grepTool, readTool, materialized };

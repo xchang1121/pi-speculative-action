@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { createBashTool, createLocalBashOperations, createReadTool, createGrepTool, createLsTool, createFindTool } from "@earendil-works/pi-coding-agent";
+import { createBashTool, createLocalBashOperations, createReadTool, createGrepTool, createLsTool, createFindTool, createWriteTool } from "@earendil-works/pi-coding-agent";
 import { describe, expect, test, vi } from "vitest";
 import { buildPiActionKey, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { linuxOverlayfsCapability } from "../src/linux-overlayfs.ts";
@@ -39,6 +39,56 @@ vi.mock("node:child_process", { spy: true });
 vi.mock("node:fs/promises", { spy: true });
 
 describe("Linux process ExecutionWorld", () => {
+	test.for([false, true])("prepares a failed command after its reported input is edited and validates before committing (stale=%s)", { timeout: 20_000 }, async (stale, { skip }) => {
+		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
+		const fixture = await createLinuxProcessBenchmark("pi-failed-command-");
+		let host: ReturnType<typeof createSpeculativeActionHost> | undefined;
+		try {
+			await writeFile(path.join(fixture.workspace, "source.txt"), "broken\n");
+			await commitBenchmarkFixture(fixture.workspace, "failed command input");
+			await prepareLinuxProcessReuse(fixture);
+			const patternAware = patternAwareSettings({ presets: ["retry-failed-command"] }), events: SpeculativeActionEvent<string>[] = [];
+			const writer = createWriteTool(fixture.workspace), tools = [fixture.tool, writer], sessionID = "failed-command";
+			const command = 'IFS= read -r value < source.txt; if [ "$value" != fixed ]; then printf "source.txt:1: expected fixed, got %s\\n" "$value"; exit 1; fi; printf "%s\\n" "$value" > generated.txt; printf "verified\\n"';
+			host = createSpeculativeActionHost(sessionID, { cwd: fixture.workspace,
+				patternStore: new PatternAwareStore(patternAware, undefined, patternAwareActionSemantics(PI_ACTION_SEMANTICS, fixture.workspace)),
+				complete: async () => { throw new Error("unexpected inference"); }, preflight: () => true,
+				getSettings: () => ({ enabled: true, drafterEnabled: false, tools: ["bash"], patternAware }), executionWorlds: [fixture.world],
+				resolveInvocation: (tool, input) => resolvePiToolInvocation(tool, input, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath }),
+				onEvent: event => { events.push(event); },
+			});
+			const start = (turnID: string) => host!.startTurn({ turnID, tools, actorModel: testModel("actor"), actorOptions: undefined,
+				context: { systemPrompt: "unchanged", messages: [], tools } });
+			const call = (turnID: string) => ({ turnID, id: turnID, tool: "bash", args: { command }, tools });
+			await start("failure");
+			await expect(host.execute(call("failure"), undefined, () => fixture.tool.execute("failure", { command }))).rejects.toThrow("got broken");
+			await host.finishTurn("failure");
+			expect(fixture.backend.executionBindings({ sessionID, turnID: "failure" })).toEqual([]);
+			await start("repair");
+			const args = { path: "source.txt", content: "fixed\n" };
+			await host.execute({ turnID: "repair", id: "repair", tool: "write", args, tools }, undefined, () => writer.execute("repair", args));
+			await expect.poll(() => events.some(event => event.type === "candidate" && event.candidate.source === "pattern_aware" &&
+				event.candidate.tool === "bash" && event.state.status === "succeeded"), { timeout: 5000 }).toBe(true);
+			expect(existsSync(path.join(fixture.workspace, "generated.txt"))).toBe(false);
+			await host.finishTurn("repair");
+			if (stale) await writeFile(path.join(fixture.workspace, "source.txt"), "changed\n");
+			await start("retry");
+			const fallback = vi.fn(() => fixture.tool.execute("retry", { command })), result = host.execute(call("retry"), undefined, fallback);
+			if (stale) {
+				await expect(result).rejects.toThrow("got changed");
+				expect(existsSync(path.join(fixture.workspace, "generated.txt"))).toBe(false);
+			} else {
+				expect((await result).content).toEqual([{ type: "text", text: "verified\n" }]);
+				expect(await readFile(path.join(fixture.workspace, "generated.txt"), "utf8")).toBe("fixed\n");
+			}
+			await host.finishTurn("retry");
+			expect(fallback).toHaveBeenCalledTimes(stale ? 1 : 0);
+			expect(events.filter(event => event.type === "prediction")).toContainEqual(expect.objectContaining({ settlement:
+				expect.objectContaining({ observation: "observed", match: expect.objectContaining({ matched: true, adoption:
+					expect.objectContaining(stale ? { status: "rejected", cause: expect.objectContaining({ stage: "freshness" }) } : { status: "adopted" }) }) }) }));
+		} finally { await host?.dispose(); await fixture.dispose(); }
+	});
+
 	test.for(["pipe", "socket", "eventfd", "readv", "recvmsg", "writev", "mmap", "runtime", "handles", "eof", "early", "changed", "identity", "cancel"] as const)("resumes a learned running process with future input (%s)", { timeout: 60_000 }, async (mode, { skip }) => {
 		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-live-process-");
