@@ -550,6 +550,7 @@ export class LinuxProcessReuseBackend {
 					session.interposition = interposition;
 					return listenUnixSocket(server, socketPath);
 				}));
+				session.privateSince ??= Date.now();
 				return operation();
 			}).finally(() => { session.pending.delete(pending); });
 			session.pending.add(pending);
@@ -675,7 +676,6 @@ export class LinuxProcessReuseBackend {
 			...(request.timeout !== undefined ? { timeoutSeconds: request.timeout } : {}),
 		});
 		const before = await session.workspace.structure.capture();
-		session.privateSince ??= Date.now();
 		const traceRoot = await mkdtemp(path.join(session.workspace.processRoot, "top-trace-"));
 		const tracePrefix = path.join(traceRoot, "process");
 		const traced = straceCommand(ready.strace, tracePrefix, sandbox);
