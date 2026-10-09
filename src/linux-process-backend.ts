@@ -195,6 +195,7 @@ interface ActiveSession {
 	preparedInputSeeds: number;
 	/** Sealed hard failures whose actual descriptor capture supplied no input resources. */
 	closedInputFailures: number;
+	readonly closedInputFailureKeys: Set<Sha256Digest>;
 	readonly sourceRoot: string;
 	/** The workspace's own repository, shown read-only in place of the snapshot's: git reads what the Actor's git reads. */
 	readonly gitDirectory?: string;
@@ -544,6 +545,7 @@ export class LinuxProcessReuseBackend {
 			preparedResults: 0,
 			preparedInputSeeds: 0,
 			closedInputFailures: 0,
+			closedInputFailureKeys: new Set(),
 			nestedEvidence: [], foldedObservations: [], resumed: new Set(),
 			executionBindings: new Map(),
 			computations: [],
@@ -929,7 +931,17 @@ export class LinuxProcessReuseBackend {
 			// Every request must have sealed a closed-input hard failure. A hit, bypass, missing capture or live-input seed
 			// leaves the counts unequal and permits only a temporary delay. Any reusable child, continuation or live-input seed
 			// preserves the enclosing preparation. Workspace edits alone do not erase these bounded scheduling negatives.
-			if (session.closedInputFailures - failuresBefore === session.metrics.requests - requestsBefore) this.handoffs.retirePreparation(binding);
+			if (session.closedInputFailures - failuresBefore === session.metrics.requests - requestsBefore) {
+				this.handoffs.retirePreparation(binding);
+				// Each nested failure was sealed too. Retire only already learned launches with that exact identity;
+				// otherwise selecting the child next would pay again for the failure established by this preparation.
+				if (session.scope) for (const candidate of this.handoffs.bindings(session.scope)) {
+					if (!session.closedInputFailureKeys.has(candidate.key)) continue;
+					const native = this.handoffs.resolveBinding(candidate, session.scope);
+					if (native && !("trackingOnly" in native) && !native.producer && !native.resources && native.sourceRoot === session.sourceRoot)
+						this.handoffs.retirePreparation(candidate);
+				}
+			}
 			else this.handoffs.settlePreparation(binding, false, performance.now() - prototypeStartedAt);
 			throw new Error(`bound process preparation produced no reusable result${session.metrics.lastError ? `: ${session.metrics.lastError.slice(0, 4096)}` : ""}`);
 		}
@@ -1633,7 +1645,10 @@ export class LinuxProcessReuseBackend {
 		// resource can support an earlier live frontier even when the completed result later gains a hard taint.
 		// Output routes alone do not arm this backend's live tier: its capture guard requires an explicit input resource.
 		else if (!hasInputResources && certificate.prototype.stdin.type === "closed" &&
-			(!evidence.complete || evidence.taints.some(taint => !acceptedTaints.includes(taint)))) session.closedInputFailures++;
+			(!evidence.complete || evidence.taints.some(taint => !acceptedTaints.includes(taint)))) {
+			session.closedInputFailures++;
+			if (session.closedInputFailureKeys.size < this.store.limits.maxCertificates) session.closedInputFailureKeys.add(certificate.weakKey);
+		}
 		return reusable;
 	}
 

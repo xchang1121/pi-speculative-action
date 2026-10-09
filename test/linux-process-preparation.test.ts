@@ -22,7 +22,7 @@ function fixture(certificate: ProcessProvenanceCertificate = unusable, source: "
 		executeBinding: (session: unknown, binding: ProcessExecutionBinding) => Promise<unknown>;
 		recordPreparedResult: (session: unknown, certificate: ProcessProvenanceCertificate, hasInputResources: boolean) => boolean;
 	};
-	const invocation = { sourceRoot: "/workspace", executable: "/bin/tool", cwd: "/workspace", argv0: "tool", args: [], environment: { MODE: "test" }, outputRoute: [1, 2],
+	const invocation = { sourceRoot: "/workspace", executable: "/bin/tool", cwd: "/workspace", argv0: "tool", args: [] as readonly string[], environment: { MODE: "test" }, outputRoute: [1, 2],
 		...(source === "producer" ? { producer: SPECULATIVE_PRODUCER } : {}),
 		...(source === "resources" ? { resources: { handles: [{ fd: 0, description: 0 }], descriptions: { 0: { object: 0, flags: 0 } },
 			objects: { 0: { type: "pipe", contentDigest: sha256Digest("prefix"), content: Buffer.from("prefix").toString("base64"),
@@ -30,6 +30,7 @@ function fixture(certificate: ProcessProvenanceCertificate = unusable, source: "
 	const observe = (next = prototype, context = invocation) => internal.handoffs.observe(processWeakKey(next), next.executablePath, scope, context, 6000)!;
 	const binding = observe(), controller = new AbortController();
 	const session = { sourceRoot: "/workspace", scope, nestedProducer: SPECULATIVE_PRODUCER, projection: { toPhysical: (value: string) => value }, preparedResults: 0, preparedInputSeeds: 0, closedInputFailures: 0,
+		closedInputFailureKeys: new Set(),
 		workspace: { structure: { capture: vi.fn(async () => ({})) } }, signal: controller.signal, computations: [], metrics: { ...emptyWorldReuseMetrics() } };
 	const describe = vi.spyOn(internal, "prototype").mockResolvedValue(prototype);
 	const execute = vi.spyOn(internal, "executeRequest").mockImplementation(async () => ({
@@ -65,9 +66,15 @@ describe("native preparation evidence", () => {
 
 	it.each([false, true])("retires closed-input parent and child failures only after both seal (incompleteChild=%s)", async incompleteChild => {
 		const test = fixture();
+		const childPrototype = processPrototype({ argv: ["tool", "child"] }), context = { ...test.invocation, args: ["child"] };
+		const childBinding = test.observe(childPrototype, context), key = processWeakKey(childPrototype);
+		const producer = test.observe(childPrototype, { ...context, producer: SPECULATIVE_PRODUCER });
+		const otherSession = test.internal.handoffs.observe(key, childPrototype.executablePath, { ...scope, sessionID: "other" }, context, 10)!;
+		const differentLaunch = test.observe(processPrototype({ argv: ["tool", "different"] }), { ...context, args: ["different"] });
 		test.execute.mockImplementation(async () => {
 			test.session.metrics.requests++;
-			const child = incompleteChild ? processCertificate(prototype, { dependencyCertificate: { complete: false, dependencies: [], taints: [] } }) : unusable;
+			const child = processCertificate(childPrototype, { dependencyCertificate: incompleteChild
+				? { complete: false, dependencies: [], taints: [] } : unusable.dependencyCertificate });
 			expect(test.internal.recordPreparedResult(test.session, child, false)).toBe(false);
 			return { kind: "executed", exit: { kind: "code", code: 0 }, reusable: test.internal.recordPreparedResult(test.session, unusable, false) };
 		});
@@ -75,6 +82,8 @@ describe("native preparation evidence", () => {
 			await expect(test.run()).rejects.toThrow("bound process preparation produced no reusable result");
 			expect(test.session.closedInputFailures).toBe(2);
 			expect(test.binding.available).toBe(false);
+			expect(childBinding.available).toBe(false);
+			for (const retained of [producer, otherSession, differentLaunch]) expect(retained.available).toBe(true);
 			expect(test.observe()).toBe(test.binding);
 			await expect(test.run()).rejects.toThrow("binding is unavailable");
 			expect(test.execute).toHaveBeenCalledOnce();
