@@ -870,8 +870,10 @@ int main(int argc, char **argv) {
 			const patternStore = new PatternAwareStore(patternSettings, undefined, patternAwareActionSemantics(PI_ACTION_SEMANTICS, fixture.workspace));
 			const events: SpeculativeActionEvent<string>[] = [], tools = [fixture.tool];
 			host = createSpeculativeActionHost(scope.sessionID, { cwd: fixture.workspace, patternStore,
+				// This boundary fixture budgets two native preparations plus the Actor; single-CPU live transfers are tested above.
+				resources: { initial: { cpuCount: 6, idleCpuCount: 6 }, sample: async () => ({ cpuCount: 6, idleCpuCount: 6 }) },
 				complete: async () => { throw new Error("unexpected inference"); },
-				getSettings: () => ({ enabled: true, drafterEnabled: false, candidateLimit: 4, maxConcurrentActions: 4, tools: ["bash"], patternAware: patternSettings }),
+				getSettings: () => ({ enabled: true, drafterEnabled: false, candidateLimit: 4, maxConcurrentActions: 6, tools: ["bash"], patternAware: patternSettings }),
 				preflight: ({ args, action }) => { expect(args).toHaveProperty("command"); expect(action.input.command).toBe((args as { command: string }).command); return true; }, executionWorlds: [fixture.world],
 				resolveInvocation: (tool, input) => resolvePiToolInvocation(tool, input, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath }),
 				onEvent: event => { events.push(event); },

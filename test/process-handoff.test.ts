@@ -11,6 +11,21 @@ const OTHER_SCOPE = { sessionID: "session", turnID: "other" };
 const livePlan = async (live?: readonly ProcessProvenanceCertificate[]) => live?.[0] && { certificate: live[0] };
 
 describe("ProcessHandoffRegistry", () => {
+	it("revokes the scheduling hint when a live acquisition path ends, without granting a result", async () => {
+		const fixture = await producer(), owner = fixture.work.ownership;
+		expect(fixture.registry.hasJoinableWork(owner)).toBe(false);
+		const release = fixture.registry.observeInputs(fixture.key, fixture.work, async () => false);
+		expect(fixture.registry.hasJoinableWork(owner)).toBe(true);
+		expect(fixture.registry.hasJoinableWork(new ProcessHandoffOwnership())).toBe(false);
+		release(); expect(fixture.registry.hasJoinableWork(owner)).toBe(false);
+		fixture.registry.observeSuspension(fixture.key, fixture.work, async () => {});
+		expect(fixture.registry.hasJoinableWork(owner)).toBe(true);
+		fixture.registry.complete(fixture.key, fixture.work);
+		expect(fixture.registry.hasJoinableWork(owner)).toBe(false);
+		await expect(fixture.actor()).resolves.toMatchObject({ kind: "miss" });
+		fixture.registry.dispose();
+	});
+
 	it("backs off unproductive preparation, reprobes after a bounded delay, and resets after useful work", () => {
 		let clock = 100;
 		const timer = vi.spyOn(performance, "now").mockImplementation(() => clock);

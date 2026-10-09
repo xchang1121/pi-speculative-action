@@ -72,6 +72,8 @@ function settings(candidateLimit = 1) {
 function drafterHost(sessionID: string, options: CreateSpeculativeActionHostOptions) {
 	const events: SpeculativeActionEvent<string>[] = [];
 	const host = createSpeculativeActionHost(sessionID, {
+		// Protocol tests declare their hardware instead of depending on the runner's affinity and load.
+		resources: { initial: { cpuCount: 8, idleCpuCount: 8 }, sample: async () => ({ cpuCount: 8, idleCpuCount: 8 }) },
 		draftModel: model("draft"), preflight: () => true, ...options,
 		onEvent: event => { events.push(event); options.onEvent?.(event); },
 	});
@@ -105,6 +107,26 @@ async function temporaryWorkspace(base?: string): Promise<string> {
 afterEach(async () => { vi.restoreAllMocks(); await directories.dispose(); });
 
 describe("speculative action host", () => {
+	it("budgets route preparation only after a concrete candidate exists", async () => {
+		const cwd = await temporaryWorkspace(), tool = createReadTool(cwd), materialized = deferred<void>(), ready = deferred<void>();
+		const sample = deferred<{ cpuCount: number; idleCpuCount: number }>();
+		const world = toolRuntimeWorld(), prepare = vi.fn(async () => {});
+		const { host } = drafterHost("limited", { cwd,
+			resources: { initial: { cpuCount: 1, idleCpuCount: 0 }, sample: () => sample.promise },
+			getSettings: () => ({ ...settings(), drafterMaxDepth: 0, predictionTimeoutMs: 10_000 }),
+			complete: async () => drafterCall({ path: "notes.txt" }),
+			executionWorlds: [{ ...world, speculation: { ...world.speculation!, prepare } }],
+			onCandidateMaterialized: () => materialized.resolve(),
+			onEvent: event => { if (event.type === "candidate" && event.state.status === "succeeded") ready.resolve(); },
+		});
+		try {
+			await host.startTurn(startInput(tool)); await materialized.promise;
+			expect(prepare).not.toHaveBeenCalled();
+			sample.resolve({ cpuCount: 1, idleCpuCount: 1 }); await ready.promise;
+			expect(prepare).toHaveBeenCalledOnce();
+		} finally { await host.dispose(); }
+	});
+
 	it("owns concurrent binding and completion independently of caller IDs", async () => {
 		const cwd = await temporaryWorkspace(), tool = createReadTool(cwd);
 		await writeFile(path.join(cwd, "other.txt"), "different content");
@@ -286,7 +308,7 @@ describe("speculative action host", () => {
 		let predict = true;
 		const complete = vi.fn(async () => drafterCall({ steps }, "speculative_workflow")), world = sandbox.createExecutionWorld({ driver: "git" });
 		const { host, events } = drafterHost("workflow-ancestry", { cwd, complete,
-			getSettings: () => ({ ...settings(), tools: tools.map(tool => tool.name), drafterEnabled: predict, drafterMaxDepth: 2, drafterGateEnabled: false }),
+			getSettings: () => ({ ...settings(), maxConcurrentActions: 4, tools: tools.map(tool => tool.name), drafterEnabled: predict, drafterMaxDepth: 2, drafterGateEnabled: false }),
 			resolveInvocation: (name, input) => resolvePiToolInvocation(name, input, { cwd, environment: {} }),
 			executionWorlds: [{ ...world, speculation: { ...world.speculation, execute: async context => {
 				if (pending && context.action.tool === "edit") await waiting.wait();
@@ -2158,14 +2180,14 @@ describe("speculative action host", () => {
 				events.push(event);
 			},
 		});
-		const triggerFork = async (turnID: string) => {
+		const triggerFork = async (turnID: string, eligible = true) => {
 			prepare.mockClear();
 			await host.startTurn(startInput(tool, turnID));
 			expect(prepare).not.toHaveBeenCalled();
 			coordinator.decorateActorPayload({ prompt: "P" });
 			coordinator.observeActorOutput({ type: "text_delta", contentIndex: 0, delta: "x", partial: undefined as never });
-			if (actionSourceEnabled) await waitFor(() => prepare.mock.calls.length > 0);
-			expect(prepare.mock.calls.length > 0).toBe(actionSourceEnabled);
+			if (eligible) await waitFor(() => prepare.mock.calls.length > 0);
+			expect(prepare.mock.calls.length > 0).toBe(eligible);
 		};
 		const finishTurn = async (turnID: string) => { await host.finishTurn(turnID); coordinator.endTurn(); };
 		const actorRead = (scenario: string, path: string, native: Parameters<typeof host.execute>[2]) => host.execute({
@@ -2204,7 +2226,7 @@ describe("speculative action host", () => {
 
 		forkPath = "notes.txt";
 		forkMinimumLogprob = Math.log(0.8);
-		await triggerFork("fork-low-confidence");
+		await triggerFork("fork-low-confidence", false);
 		await waitFor(() => coordinator.snapshot().forkCompletions === 3);
 		expect(events.some((event) => event.type === "candidate" && event.turnID === "fork-low-confidence")).toBe(false);
 		coordinator.observeActorOutput({ type: "done", reason: "stop", message: assistant([], "stop") });
@@ -2216,7 +2238,7 @@ describe("speculative action host", () => {
 
 		actionSourceEnabled = false;
 		forkMinimumLogprob = Math.log(0.95);
-		await triggerFork("fork-disabled");
+		await triggerFork("fork-disabled", false);
 		await waitFor(() => coordinator.snapshot().forkCompletions === 4);
 		expect(events.some((event) => event.type === "source_request" && event.turnID === "fork-disabled")).toBe(false);
 		expect(events.some((event) => event.type === "candidate" && event.turnID === "fork-disabled")).toBe(false);
@@ -2229,15 +2251,14 @@ describe("speculative action host", () => {
 	it.each(["tools", "context", "model", "options", "empty", "invalid", "rejected"] as const)("releases an ineligible Drafter after %s without changing Actor history", async (phase) => {
 		const cwd = await temporaryWorkspace();
 		const gate = gated(), settled = deferred<void>();
-		const rejected = phase === "invalid" || phase === "rejected", warms = phase === "empty" || rejected;
+		const rejected = phase === "invalid" || phase === "rejected", produces = phase === "empty" || rejected;
 		const complete = vi.fn(async () => {
-			if (warms) await gate.entered;
 			if (phase === "empty") return assistant([], "stop");
 			return drafterCall(phase === "invalid" ? {} : { path: "notes.txt" });
 		});
 		const tool = createReadTool(cwd);
 		const world = toolRuntimeWorld(), prepare = vi.fn(async (_input: { signal?: AbortSignal }) => {
-			if (warms && prepare.mock.calls.length === 1) { await gate.wait(); }
+			if (phase === "rejected") await gate.wait();
 		});
 		const getDraftOptions = vi.fn(async () => { if (phase === "options") { await gate.wait(); } return {}; });
 		const draftModel = vi.fn(async () => {
@@ -2260,24 +2281,24 @@ describe("speculative action host", () => {
 				...startInput(tool),
 				context: { systemPrompt: "x".repeat(128), messages: [], tools: [tool] },
 			});
-			if (phase === "context" || phase === "tools") await settled.promise;
+			if (phase === "context" || phase === "tools" || phase === "empty" || phase === "invalid") await settled.promise;
+			else if (phase === "rejected") {
+				await gate.entered; gate.release(); await settled.promise; await nextTurn();
+				expect(prepare.mock.calls[0]![0].signal?.aborted, "rejected candidates retire their budgeted preparation").toBe(true);
+			}
 			else {
 				await gate.entered;
-				if (warms) {
-					await settled.promise; await nextTurn();
-					expect(prepare.mock.calls[0]![0].signal?.aborted, "unusable results retire preparation before Actor arrival").toBe(true);
-				}
 				closing = host.dispose().then(() => { closed = true; });
 				await nextTurn();
 				expect(closed).toBe(false);
 				gate.release(); await closing;
 			}
-			expect(complete).toHaveBeenCalledTimes(warms ? 1 : 0);
-			expect(prepare).toHaveBeenCalledTimes(phase === "rejected" ? 2 : warms ? 1 : 0);
+			expect(complete).toHaveBeenCalledTimes(produces ? 1 : 0);
+			expect(prepare).toHaveBeenCalledTimes(phase === "rejected" ? 1 : 0);
 			expect(draftModel).toHaveBeenCalledTimes(phase === "tools" ? 0 : 1);
 			expect(getDraftOptions).toHaveBeenCalledTimes(["model", "tools", "context"].includes(phase) ? 0 : 1);
 		} finally { gate.release(); await closing; await host.dispose(); }
-		if (phase === "context" || phase === "tools" || warms) return;
+		if (phase === "context" || phase === "tools" || produces) return;
 
 		const sharing = gated(), owners = [new AbortController(), new AbortController()];
 		const waitStage = async (stage: string) => { if (stage === phase) { await sharing.wait(); } };

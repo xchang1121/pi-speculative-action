@@ -152,6 +152,7 @@ export function createLinuxProcessExecutionWorld(
 						...(context.executionScope ? { scope: context.executionScope } : {}),
 						signal: context.signal,
 						onOperationAdopted: context.onOperationAdopted,
+						onOperationJoinable: context.onOperationJoinable,
 						acceptOperationScope: context.acceptOperationScope,
 					});
 					const executor = session.executor;

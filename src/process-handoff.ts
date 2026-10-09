@@ -206,6 +206,12 @@ export class ProcessHandoffRegistry<Invocation = never> {
 
 	/** Conservative availability hint; scope, ownership and evidence still decide acquisition. */
 	get hasResults(): boolean { for (const record of this.records()) if (record.state.status !== "retained") return true; return false; }
+	/** Acquisition can attempt this running work; inputs, timing, scope and commit proofs are still checked at the native boundary. */
+	hasJoinableWork(ownership: ProcessHandoffOwnership): boolean {
+		for (const record of this.records()) if (record.ownership === ownership && !record.signal.aborted &&
+			record.state.status === "running" && (record.inputsChanged || record.suspend)) return true;
+		return false;
+	}
 
 	/** Retrieval hint for both running and completed records; it grants no adoption authority. */
 	mayHaveExecutable(executablePath: string): boolean {

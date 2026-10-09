@@ -87,7 +87,7 @@ function validResource() {
 }
 
 function harness<SessionID = string>(input: Partial<Pick<TestAdapter<SessionID>,
-	"settings" | "stateData" | "actionKey" | "resolveExecution" | "captureAuthoritativeResult" |
+	"settings" | "resources" | "stateData" | "actionKey" | "resolveExecution" | "captureAuthoritativeResult" |
 	"preflightCandidate" | "authorizeCandidate" | "onCandidateMaterialized" | "onTurnFinished" | "rejectCandidateOutput" | "executeCandidate"
 >> & {
 	readonly source: Source<SessionID>;
@@ -104,6 +104,7 @@ function harness<SessionID = string>(input: Partial<Pick<TestAdapter<SessionID>,
 	let executions = 0;
 	const runtime = makeSpeculativeActionRuntime<SessionID, string, Start<SessionID>, Call<SessionID>, Call<SessionID>, { readonly cwd: string }>({
 		sources: [input.source, ...(input.peers ?? [])],
+		resources: input.resources,
 		settings: input.settings ?? (() => settings),
 		definitions: () => [{ name: "read" }, { name: "bash" }, { name: "write" }],
 		stateData: input.stateData ?? (() => ({ cwd: "/workspace" })),
@@ -175,6 +176,159 @@ function start(turnID: string): Start {
 function call(turnID: string, input: Record<string, unknown> = { path: "README.md" }): Call {
 	return { sessionID: "session", turnID, id: `call:${turnID}`, tool: "read", input };
 }
+
+describe("resource-aware execution admission", () => {
+	const limited = (cpuCount = 1, idle = cpuCount): NonNullable<TestAdapter["resources"]> => ({
+		initial: { cpuCount, idleCpuCount: idle }, sample: () => new Promise(() => {}),
+	});
+	const patient = () => ({ ...settings, predictionTimeoutMs: 10_000 });
+
+	it("lets the Actor pass a stalled sample and wakes queued preparation when idle capacity returns", async () => {
+		const sample = deferred<{ cpuCount: number; idleCpuCount: number }>(), sampled = barrier(), prepared = vi.fn();
+		const { runtime, ready, executions } = harness({ settings: patient,
+			resources: { initial: { cpuCount: 1, idleCpuCount: 0 }, sample: () => { sampled.arrive(); return sample.promise; } },
+			source: planSource({ propose: ({ startInput }) => startInput.sessionID === "session" ? plan("queued") : undefined }),
+			preflightCandidate: () => { prepared(); return { ok: true }; },
+		});
+		try {
+			await runtime.startTurn(start("turn")); await sampled.promise;
+			await expect.poll(() => runtime.inspect().resources?.queuedPreparations).toBe(1);
+			const actorCall = { ...call("actor"), sessionID: "other" };
+			await runtime.startTurn(actorCall);
+			await runFallback(runtime, actorCall);
+			expect(prepared).not.toHaveBeenCalled(); expect(executions()).toBe(0);
+			sample.resolve({ cpuCount: 1, idleCpuCount: 1 });
+			await ready.promise;
+			expect(prepared).toHaveBeenCalledOnce(); expect(executions()).toBe(1);
+		} finally { await runtime.dispose(); }
+	});
+
+	it("shares one physical CPU between preparation and execution despite an eight-action setting", async () => {
+		const gates = [gated(), gated(), gated()], prepared: string[] = [], executed: string[] = [];
+		const { runtime } = harness({ settings: patient, resources: limited(),
+			source: planSource({ propose: () => ({ ...plan("serial"), actions: gates.map((_, index) => readAction(String(index), { path: String(index) })) }) }),
+			preflightCandidate: ({ concrete }) => { prepared.push(String(concrete.path)); return { ok: true }; },
+			execute: async (_tool, input) => { executed.push(String(input.path)); await gates[Number(input.path)]!.wait(); return "ready"; },
+		});
+		try {
+			await runtime.startTurn(start("turn"));
+			for (const [index, gate] of gates.entries()) {
+				await gate.entered;
+				expect(executed).toHaveLength(index + 1); expect(prepared).toHaveLength(index + 1);
+				expect(runtime.inspect().resources).toMatchObject({ cpuCount: 1, executionUnits: 1, preparationUnits: 0 });
+				gate.release();
+			}
+		} finally { for (const gate of gates) gate.release(); await runtime.dispose(); }
+	});
+
+	it("cancels active preparation for the Actor without waiting for its physical cleanup", async () => {
+		const preparing = gated(), cancelled = barrier();
+		const { runtime, executions } = harness({ settings: patient, resources: limited(),
+			source: planSource({ propose: () => ({ ...plan("preflight"), actions: [0, 1].map(index => readAction(String(index), { path: String(index) }, { horizon: 2 })) }) }),
+			preflightCandidate: async ({ signal }) => {
+				signal.addEventListener("abort", cancelled.arrive, { once: true });
+				await preparing.wait(); return { ok: true };
+			},
+		});
+		try {
+			await runtime.startTurn(start("turn")); await preparing.entered;
+			const actor = await runtime.prepareActorCall(call("turn", { path: "unrelated" }));
+			await cancelled.promise;
+			expect(actor?.output).toBeUndefined(); expect(executions()).toBe(0);
+			expect(runtime.inspect().resources).toMatchObject({ actorUnits: 1, preparationUnits: 1 });
+			preparing.release();
+			await expect.poll(() => runtime.inspect().resources?.preparationUnits).toBe(0);
+			expect(executions()).toBe(0);
+			await actor?.settle(simulatedExecution(10), "actor");
+		} finally { preparing.release(); await runtime.dispose(); }
+	});
+
+	it("preempts even an imminent operation producer when an unrelated Actor needs the only CPU", async () => {
+		const executing = gated(), cancelled = barrier();
+		const { runtime } = harness({ settings: patient, resources: limited(), resolveExecution: () => MUTATION_ROUTE,
+			source: planSource({ propose: () => ({ ...plan("operation"), actions: [{ ...readAction("op", { path: "child" }),
+				type: "operation", producesOperations: true, operation: Object.freeze({ backend: "process", identity: "child", permissionHash: "parent", executionMs: 500, expectedDurationMs: 500 }),
+			}] }) }),
+			execute: async (_tool, _input, signal) => { signal.addEventListener("abort", cancelled.arrive, { once: true }); await executing.wait(); return "ready"; },
+		});
+		try {
+			await runtime.startTurn(start("turn")); await executing.entered;
+			const actor = await runtime.prepareActorCall(call("turn", { path: "unrelated" }));
+			await cancelled.promise;
+			expect(actor?.output).toBeUndefined();
+			expect(runtime.inspect().resources).toMatchObject({ actorUnits: 1, executionUnits: 1 });
+			executing.release();
+			await expect.poll(() => runtime.inspect().resources?.executionUnits).toBe(0);
+			await actor?.settle(simulatedExecution(10), "actor");
+		} finally { executing.release(); await runtime.dispose(); }
+	});
+
+	it("protects the in-flight candidate already leased by an Actor", async () => {
+		const executing = gated(), authorization = gated(), cancelled = vi.fn();
+		const { runtime } = harness({ settings: patient, resources: limited(),
+			source: planSource({ propose: ({ startInput }) => startInput.sessionID === "session" ? plan("selected") : undefined }),
+			authorizeCandidate: async () => { await authorization.wait(); return { ok: true }; },
+			execute: async (_tool, _input, signal) => { signal.addEventListener("abort", cancelled, { once: true }); await executing.wait(); return "selected"; },
+		});
+		try {
+			await runtime.startTurn(start("turn")); await executing.entered;
+			const selected = runtime.prepareActorCall(call("turn")); await authorization.entered;
+			const otherCall = { ...call("other"), sessionID: "other" };
+			await runtime.startTurn(otherCall);
+			const other = await runtime.prepareActorCall(otherCall);
+			expect(cancelled).not.toHaveBeenCalled();
+			executing.release(); authorization.release();
+			expect((await selected)?.output).toBe("selected");
+			await other?.settle(simulatedExecution(1), "other");
+		} finally { executing.release(); authorization.release(); await runtime.dispose(); }
+	});
+
+	it.each(["joinable", "unavailable", "other-tool", "other-session"])("reserves a native handoff window only for live work and its current Actor (%s)", async mode => {
+		const executing = gated(), cancelled = vi.fn(), sample = deferred<{ cpuCount: number; idleCpuCount: number }>();
+		let available = mode !== "unavailable";
+		const { runtime, events } = harness({ settings: patient,
+			resources: { initial: { cpuCount: 1, idleCpuCount: 1 }, sample: () => sample.promise }, resolveExecution: () => MUTATION_ROUTE,
+			source: planSource({ propose: ({ startInput }) => startInput.sessionID === "session" ? { ...plan("handoff"), actions: [{
+				id: "op", type: "operation", tool: "bash", input: { command: "predicted" }, producesOperations: true,
+				operation: Object.freeze({ backend: "process", identity: "child", permissionHash: "parent", executionMs: 500, expectedDurationMs: 500 }),
+			}] } : undefined }),
+			executeCandidate: async ({ signal, onOperationJoinable }) => {
+				onOperationJoinable?.(() => available); signal.addEventListener("abort", cancelled, { once: true });
+				await executing.wait(); return world("unconsumed");
+			},
+		});
+		try {
+			await runtime.startTurn(start("turn")); await executing.entered;
+			const actorCall = { ...call("turn"), ...(mode === "other-session" ? { sessionID: "other" } : {}),
+				tool: mode === "other-tool" ? "read" : "bash", input: mode === "other-tool" ? { path: "actual" } : { command: "actual" } };
+			if (mode === "other-session") await runtime.startTurn(actorCall);
+			const actor = await runtime.prepareActorCall(actorCall);
+			available = false; // Native publication may finish before the Actor's validation/commit does.
+			sample.resolve({ cpuCount: 1, idleCpuCount: 0 });
+			await expect.poll(() => runtime.inspect().resources?.idleCpuCount).toBe(0);
+			expect(cancelled).toHaveBeenCalledTimes(mode === "joinable" ? 0 : 1);
+			expect(actor?.output).toBeUndefined();
+			executing.release(); await actor?.settle(simulatedExecution(1), "native");
+			expect(events.some(event => event.type === "operation_prediction" && event.settlement.observation === "observed")).toBe(false);
+		} finally { executing.release(); await runtime.dispose(); }
+	});
+
+	it("shares the hardware budget across sessions and wakes the next session after completion", async () => {
+		const gates = [gated(), gated()], executed: string[] = [];
+		const { runtime } = harness({ settings: patient, resources: limited(),
+			source: planSource({ propose: ({ startInput }) => plan(startInput.sessionID, { path: startInput.sessionID }) }),
+			execute: async (_tool, input) => { const index = executed.length; executed.push(String(input.path)); await gates[index]!.wait(); return "ready"; },
+		});
+		try {
+			await runtime.startTurn(start("first")); await gates[0]!.entered;
+			await runtime.startTurn({ sessionID: "other", turnID: "second" });
+			await expect.poll(() => runtime.inspect().resources?.queuedPreparations).toBe(1);
+			expect(executed).toEqual(["session"]);
+			gates[0]!.release(); await gates[1]!.entered;
+			expect(executed).toEqual(["session", "other"]);
+		} finally { for (const gate of gates) gate.release(); await runtime.dispose(); }
+	});
+});
 
 describe("structural speculative runtime", () => {
 	it("preserves each mode's prediction attribution while charging one shared execution to its owner", async () => {
