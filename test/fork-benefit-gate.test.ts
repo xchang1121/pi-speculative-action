@@ -6,7 +6,7 @@ import { testModel } from "./model.ts";
 import { BenefitGate, DEFAULT_BENEFIT_GATE_POLICY as POLICY, type BenefitObservation } from "../src/fork-benefit-gate.ts";
 
 describe("fork benefit gate", () => {
-	it("amends one request sample with measured reuse while charging adoption cost separately", async () => {
+	it("amends one request sample only with actual consumed work", async () => {
 		for (const reusedExecutionMs of [0, 50, 300]) {
 			const budget = new DrafterTaskBudget(), batch = budget.start("drafter", true), pending = deferred<ReturnType<typeof fauxAssistantMessage>>();
 			batch.expectedBenefitMs = 1000; // Measured workflow hints may justify overlap before the final Actor outcome arrives.
@@ -17,12 +17,12 @@ describe("fork benefit gate", () => {
 			await first; budget.finish(batch); expect(batch.update).toBeUndefined();
 			await budget.run({ ...request, utility: batch }); // A continuation after turn closure runs beside the Actor.
 			pending.resolve(fauxAssistantMessage([])); await second;
-			budget.credit([batch, batch], { reusedExecutionMs, costMs: 100 });
+			budget.credit([batch, batch], { reusedExecutionMs });
 			budget.start("drafter", true);
-			expect(budget.utilitySnapshot()).toMatchObject({ samples: 1, expectedNetBenefitMs: reusedExecutionMs - 100 });
-			expect(batch).toMatchObject({ benefitMs: reusedExecutionMs, costMs: 100 });
+			expect(budget.utilitySnapshot()).toMatchObject({ samples: 1, expectedNetBenefitMs: reusedExecutionMs });
+			expect(batch).toMatchObject({ benefitMs: reusedExecutionMs });
 			expect(batch.startedRequests).toBe(3); expect(batch.pendingRequests).toBe(0);
-			expect(Boolean(await budget.run({ ...request, utility: budget.start("drafter", true) }))).toBe(reusedExecutionMs === 300);
+			expect(Boolean(await budget.run({ ...request, utility: budget.start("drafter", true) }))).toBe(reusedExecutionMs >= 50);
 		}
 	});
 

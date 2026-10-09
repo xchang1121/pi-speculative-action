@@ -48,7 +48,7 @@ describe("held native computation accounting", () => {
 		const actualInput = new TimelineInterval(200, 210), proofInput = new TimelineInterval(300, 350);
 		const planner = vi.spyOn(internal.planner, "plan").mockImplementation(async () => {
 			TimelineInterval.own(new TimelineInterval(10, 20)); TimelineInterval.use(proofInput);
-			return { kind: "miss", lookup: { durationMs: 10, candidateCertificates: 0, pathsetsValidated: 0,
+			return { kind: "miss", lookup: { candidateCertificates: 0, pathsetsValidated: 0,
 				filesRead: 1, bytesRead: 1, artifactsLoaded: 0, artifactBytesRead: 0 } };
 		});
 		try {
@@ -171,8 +171,11 @@ describe("held native computation accounting", () => {
 		});
 		const acquire = vi.spyOn(internal, "acquireProcessResult").mockImplementation(async () => { now = 20; throw new Error("invalid certificate"); });
 		try {
-			await expect(TimelineInterval.collect(() => internal.executeRequest(session, {}, "/bin/tool", [1, 2], 1))).rejects.toThrow("invalid certificate");
-			expect(new TaskTimeline(0).recordTool(new TimelineInterval(0, 100, computations), true)).toEqual({ actorComputeMs: 0, reusedExecutionMs: 80 });
+			const evaluation = await TimelineInterval.measure(async () => {
+				await expect(internal.executeRequest(session, {}, "/bin/tool", [1, 2], 1)).rejects.toThrow("invalid certificate");
+				now = 100;
+			}, () => computations);
+			expect(new TaskTimeline(0).recordTool(evaluation.computation, true)).toEqual({ actorComputeMs: 0, reusedExecutionMs: 80 });
 		} finally { prototype.mockRestore(); acquire.mockRestore(); clock.mockRestore(); }
 	});
 

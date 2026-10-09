@@ -188,8 +188,8 @@ describe("EffectTransactionCoordinator", () => {
 		Object.assign(offeredBranch, { validate: async () => ({ status: "valid", metrics: metrics() }) });
 
 		const validation = await transaction.validate();
-		Object.assign(offeredProof, { status: "valid" }); offeredProof.metrics.durationMs = 99;
-		expect(Reflect.set(validation, "status", "valid")).toBe(false); expect(Reflect.set(validation.metrics, "durationMs", 99)).toBe(false);
+		Object.assign(offeredProof, { status: "valid" }); offeredProof.metrics.bytesRead = 99;
+		expect(Reflect.set(validation, "status", "valid")).toBe(false); expect(Reflect.set(validation.metrics, "bytesRead", 99)).toBe(false);
 		expect(validation).toMatchObject({ status: proof === "stale" ? "stale" : "indeterminate",
 			cause: { code: proof === "stale" ? "changed" : proof === "missing" ? "validation_unavailable" : "validation_failed" } });
 		await expect(transaction.commit()).rejects.toThrow("requires successful validation");

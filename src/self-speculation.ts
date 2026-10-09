@@ -1,11 +1,12 @@
 import { hash, randomUUID } from "node:crypto";
 import { errorMessage } from "./error-utils.ts";
 import type { Api, AssistantMessageEvent, Context, Model } from "@earendil-works/pi-ai";
-import { DEFAULT_BENEFIT_GATE_POLICY, creditAdoption, BenefitGate, type BenefitGatePolicy } from "./fork-benefit-gate.ts";
+import { DEFAULT_BENEFIT_GATE_POLICY, BenefitGate, type BenefitGatePolicy } from "./fork-benefit-gate.ts";
 import { createActorForkPlanSource, type ActorProbeSchedule, type ActorProbeSnapshot, type ActorForkActionBatch, type ActorForkActionCall, type ActorForkPlanSource } from "./actor-fork-plan-source.ts";
 import type { MaterializedSpeculativeCandidate, PredictionFeedback } from "./runtime.ts";
 import type { ActionKey } from "./action-semantics.ts";
 import type { ActorActionSettlement } from "./settlement.ts";
+import type { ComputationReuseShare } from "./task-timing.ts";
 import { EvidenceLedger } from "./self-speculation-evidence.ts";
 import { asRecord as record, isRecord, stableStringify } from "./stable-json.ts";
 import { finiteNumber, nonNegativeFinite, nonNegativeCount } from "./number-utils.ts";
@@ -104,7 +105,7 @@ interface TurnState {
 	readonly matchedForkKeys: Set<string>;
 	readonly reportedCandidates: Map<string, ReportedCandidate>;
 	readonly gateKey: string;
-	readonly forkUtility: { costMs: number; benefitMs: number | undefined };
+	readonly forkUtility: { benefitMs: number; update?: (benefitMs: number) => void };
 	/** Summed probe compute; the Actor's streaming between retries costs the fork nothing. */
 	forkBusyMs?: number;
 	forkFailed: boolean;
@@ -158,6 +159,7 @@ export class SelfSpeculationCoordinator {
 	/** Per endpoint; a control plane without the declaration keeps serving everything, as before negotiation existed. */
 	private readonly capabilities = new Map<string, ControlPlaneCapabilities>();
 	private readonly forkGate = new BenefitGate();
+	private readonly forkUtilities = new WeakSet<TurnState["forkUtility"]>();
 	private readonly decoderEvidence = new EvidenceLedger(4, 2);
 	private readonly actionEvidence = new EvidenceLedger(2, 1);
 	private readonly background = new Set<Promise<void>>();
@@ -235,12 +237,13 @@ export class SelfSpeculationCoordinator {
 			matchedForkKeys: new Set(),
 			reportedCandidates: new Map(),
 			gateKey: modelKey(model),
-			forkUtility: { costMs: 0, benefitMs: 0 },
+			forkUtility: { benefitMs: 0 },
 			forkFailed: false,
 			ended: false,
 			gateSampleRecorded: false,
 		};
-		this.actorForkPlanSource.startTurn(turnID);
+		this.forkUtilities.add(this.active.forkUtility);
+		this.actorForkPlanSource.startTurn(turnID, this.active.forkUtility);
 		this.latestGateKey = modelKey(model);
 		if (settings.forkTransport !== "drafter" && !this.capabilities.has(settings.endpoint)) this.negotiate(settings);
 	}
@@ -430,15 +433,16 @@ export class SelfSpeculationCoordinator {
 		this.reconcileForkMatches(state);
 	}
 
-	/** Feed authoritative adoption into action utility without conflating it with token verification. */
-	observeActorSettlement(settlement: ActorActionSettlement): void {
-		const state = this.active;
-		if (!state) return;
-		const matchedSources = new Set(settlement.matchedPredictions.map((prediction) => prediction.source));
-		if (!matchedSources.has("self-speculation") || settlement.provider.kind !== "speculative") return;
-		const shares = matchedSources.size;
-		creditAdoption(state.forkUtility, settlement.provider.timing, shares);
-		this.counters.forkActionAdoptions++;
+	/** Credit actual consumed producer work, including a retained fork from an earlier turn. */
+	observeActorSettlement(settlement: ActorActionSettlement, shares: readonly ComputationReuseShare[] = []): void {
+		for (const share of shares) {
+			const utility = share.feedback as TurnState["forkUtility"];
+			if (share.source !== "self-speculation" || !this.forkUtilities.has(utility)) continue;
+			utility.benefitMs += nonNegativeFinite(share.reusedExecutionMs);
+			utility.update?.(utility.benefitMs);
+		}
+		if (settlement.provider.kind === "speculative" && settlement.matchedPredictions.some(prediction => prediction.source === "self-speculation"))
+			this.counters.forkActionAdoptions++;
 	}
 
 	/** Feed semantic prediction adoption into decoder ranking without touching token evidence. */
@@ -669,11 +673,9 @@ export class SelfSpeculationCoordinator {
 	private finalizeGateSample(state: TurnState): void {
 		if (state.gateSampleRecorded || !state.ended || state.forkBusyMs === undefined) return;
 		state.gateSampleRecorded = true;
-		this.forkGate.observe(
-			state.gateKey,
-			{ ...state.forkUtility, costMs: state.forkBusyMs + state.forkUtility.costMs, ...(state.forkFailed ? { failed: true } : {}) },
-			forkGatePolicy(state.settings),
-		);
+		const observation = { benefitMs: state.forkUtility.benefitMs, costMs: state.forkBusyMs, failed: state.forkFailed };
+		const update = this.forkGate.observe(state.gateKey, observation, forkGatePolicy(state.settings));
+		state.forkUtility.update = benefitMs => update({ ...observation, benefitMs });
 	}
 
 	/** Ask once which requests the endpoint serves; any failure leaves the legacy behavior (everything is attempted). */

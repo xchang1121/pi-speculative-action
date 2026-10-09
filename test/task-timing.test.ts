@@ -1,7 +1,56 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { deferred } from "./async.ts";
 import { TaskTimeline, TimelineInterval, toolSpeedup, normalizeTimelineComputation, TIMELINE_COMPUTATION_LIMITS, type ComputationReuseShare } from "../src/task-timing.ts";
 
 describe("gross Actor computation and successful reuse", () => {
+	it("records calculation segments without clocks or receipts for control work", async () => {
+		let now = 0;
+		const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
+		try {
+			const evaluation = await TimelineInterval.measure(async () => {
+				now = 10;
+				await TimelineInterval.outside(async () => {
+					now = 1000;
+					TimelineInterval.use(new TimelineInterval(200, 240));
+					const calculation = await TimelineInterval.measure(() => { now = 1010; });
+					TimelineInterval.own(calculation.computation);
+					now = 1015;
+				});
+				now = 1025;
+			});
+			const graph = TimelineInterval.serialize(evaluation.computation)!;
+			expect(graph.nodes.flatMap(node => node.inputs ?? []).some(input => input.overhead)).toBe(false);
+			expect(new TaskTimeline(0).recordTool(evaluation.computation)).toEqual({ actorComputeMs: 30, reusedExecutionMs: 40 });
+			expect(new TaskTimeline(0).recordTool(TimelineInterval.restore(graph)!, true)).toEqual({ actorComputeMs: 0, reusedExecutionMs: 70 });
+			clock.mockClear();
+			await TimelineInterval.outside(() => { now += 1000; });
+			expect(clock).not.toHaveBeenCalled();
+		} finally { clock.mockRestore(); }
+	});
+
+	it("keeps nested and overlapping control work outside every enclosing calculation after failure", async () => {
+		let now = 0;
+		const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
+		try {
+			const evaluation = await TimelineInterval.measure(async () => {
+				now = 5;
+				const child = await TimelineInterval.measure(async () => {
+					now = 10;
+					const first = deferred<void>(), second = deferred<void>();
+					const failure = TimelineInterval.outside(async () => { await first.promise; throw new Error("invalid proof"); }).catch(() => {});
+					now = 20;
+					const other = TimelineInterval.outside(() => second.promise);
+					now = 30; first.resolve(); await failure;
+					now = 40; second.resolve(); await other;
+					now = 50;
+					expect(new TaskTimeline(0).recordTool(TimelineInterval.current(5, 50))).toEqual({ actorComputeMs: 15, reusedExecutionMs: 0 });
+				});
+				TimelineInterval.own(child.computation); now = 60;
+			});
+			expect(new TaskTimeline(0).recordTool(evaluation.computation)).toEqual({ actorComputeMs: 30, reusedExecutionMs: 0 });
+		} finally { clock.mockRestore(); }
+	});
+
 	it("unions complete and interrupted tool waits without using them as the computation denominator", () => {
 		const timeline = new TaskTimeline(100);
 		timeline.recordTool(new TimelineInterval(0, 100));
@@ -407,7 +456,9 @@ describe("bounded persisted computation evidence", () => {
 	it("rejects malformed or cyclic graphs without issuing a successful receipt", async () => {
 		const graph = TimelineInterval.serialize(new TimelineInterval(10, 50))!;
 		const root = graph.nodes[0]!;
-		const invalid = [null, {}, { ...graph, version: 2 }, { ...graph, root: "absent" },
+		const invalid = [null, {}, { ...graph, version: 999 }, { ...graph, root: "absent" },
+			{ ...graph, nodes: [{ ...root, spans: [{ startedAt: 0, completedAt: 20 }] }] },
+			{ ...graph, nodes: [{ ...root, spans: [{ startedAt: 10, completedAt: 51 }] }] },
 			{ ...graph, nodes: [{ ...root, clock: undefined }] },
 			{ ...graph, nodes: [root, root] }, { ...graph, nodes: [{ ...root, completedAt: -1 }] },
 			{ ...graph, nodes: [{ ...root, startedAt: NaN }] },
@@ -437,7 +488,7 @@ describe("bounded persisted computation evidence", () => {
 		expect(TimelineInterval.serialize(tooManySpans)).toBeUndefined();
 		const nodes = Array.from({ length: 200 }, (_, index) => ({ id: `node-${index}`, clock: "synthetic", startedAt: 0, completedAt: 1,
 			producer: { source: "s".repeat(256), mode: "m".repeat(256) }, groups: ["g".repeat(256)] }));
-		expect(normalizeTimelineComputation({ version: 1, root: nodes[0]!.id,
+		expect(normalizeTimelineComputation({ version: 2, root: nodes[0]!.id,
 			nodes: nodes.map((node, index) => ({ ...node, ...(index === 0 ? { inputs: nodes.slice(1).map(input => ({ id: input.id })) } : {}) })) })).toBeUndefined();
 	});
 });

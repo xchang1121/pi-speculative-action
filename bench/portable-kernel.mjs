@@ -94,6 +94,9 @@ async function qualifyPiSearch(name) {
 			}, authoritative: (request) => { counts.actor++; return bound.authoritative(request); } };
 		const probe = searchJourney({ cwd: root, name, tools, args, invocation, world: resources,
 			settings: { maxConcurrentActions: capacity },
+			// Keep the paused producer until explicit disable, independently of the runner's CPU affinity.
+			resources: capacity > 1 ? { initial: { cpuCount: capacity, idleCpuCount: capacity },
+				sample: async () => ({ cpuCount: capacity, idleCpuCount: capacity }) } : undefined,
 		});
 		journeys.push(probe.host);
 		return probe;
@@ -215,7 +218,7 @@ async function qualifyPiSearch(name) {
 		assert.match(JSON.stringify(changedActor.settlement.rejections), /resource_fingerprint_changed/);
 		assert.deepEqual(changedActor.output, stale.output); assert.equal(changed.actorCalls(), 1);
 		const paused = Promise.withResolvers(), released = Promise.withResolvers();
-		const cancelled = journey(async () => { paused.resolve(); await released.promise; }, 2);
+		const cancelled = journey(async () => { paused.resolve(); await released.promise; }, 4); // Two units per search.
 		const disabled = { enabled: false, resourceCacheMaxEntries: 32, predictionTimeoutMs: 5000, tools: [name] };
 		await cancelled.start("cancelled");
 		try {
@@ -276,7 +279,8 @@ async function qualifySearchExtension() {
 	const model = createFauxCore({ provider: "qualification", models: [{ id: "qualification", reasoning: false }] }).getModel();
 	const context = { cwd, mode: "tui", hasUI: true, model, isProjectTrusted: () => true, getSystemPrompt: () => "qualification",
 		sessionManager: { getSessionId: () => "closed-search", getSessionFile: () => undefined }, thinkingLevel: "off",
-		modelRegistry: { getAvailable: () => [model], complete: async () => fauxAssistantMessage(fauxToolCall(...selected), { stopReason: "toolUse" }) },
+		modelRegistry: { getAvailable: () => [model], getApiKeyAndHeaders: async () => ({ ok: true }),
+			getProvider: () => ({ streamSimple: () => ({ result: async () => fauxAssistantMessage(fauxToolCall(...selected), { stopReason: "toolUse" }) }) }) },
 		ui: { notify: (text) => notices.push(text), setStatus: () => {}, select: async (title, options) => {
 			const next = choices.get(title)?.shift(); return options.find((option) => next && option.startsWith(next));
 		} },
@@ -292,6 +296,7 @@ async function qualifySearchExtension() {
 			patternAware: { enabled: false }, selfSpeculation: { enabled: false } }));
 		await createSpeculativeActionExtension({ createHost: (sessionID, options) => createSpeculativeActionHost(sessionID, {
 			...options, onEvent: (event) => { options.onEvent?.(event);
+				if (event.type === "source_request" && event.request.settlement.status === "error") candidate?.reject(new Error(JSON.stringify(event.request.settlement)));
 				if (event.type === "candidate" && event.candidate.origin === "prediction" && event.state.status !== "running") candidate?.resolve(event.state);
 			}, onActorActionSettled: (value) => { options.onActorActionSettled?.(value); settlement?.resolve(value.settlement); },
 		}) })({ on: (name, handler) => handlers.set(name, [...handlers.get(name) ?? [], handler]),
@@ -313,8 +318,7 @@ async function qualifySearchExtension() {
 			const completed = await bounded(candidate.promise, "extension candidate"); assert.equal(completed.status, "succeeded", JSON.stringify(completed));
 			assert.deepEqual(await invoke(name, args), expected);
 			const feedback = await bounded(settlement.promise, "extension settlement");
-			if (feedback.provider.kind !== "speculative") assert.ok(feedback.provider.kind === "actor" &&
-				feedback.rejections.some(({ cause }) => cause.code === "candidate_join_not_profitable"), JSON.stringify(feedback));
+			assert.equal(feedback.provider.kind, "speculative", JSON.stringify(feedback));
 			results[name] = { provider: feedback.provider.kind, rejections: feedback.rejections };
 			await emit("agent_end");
 		}

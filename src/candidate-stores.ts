@@ -320,8 +320,6 @@ export interface ResultCacheLimits {
 
 export interface SpeculativeCacheValueMetrics extends Pick<ResultCacheEvidence, "actorHits" | "insertedAt" | "lastActorHitAt"> {
 	readonly executionMs: number;
-	readonly expectedValidationMs: number;
-	readonly expectedProjectionMs: number;
 	readonly bytes: number;
 }
 
@@ -332,12 +330,7 @@ export function speculativeCacheValue(
 	now = Date.now(),
 	halfLifeMs = CACHE_HIT_HALF_LIFE_MS,
 ): number {
-	const reusableWorkMs = Math.max(
-		0,
-		finiteValue(metrics.executionMs) -
-			finiteValue(metrics.expectedValidationMs) -
-			finiteValue(metrics.expectedProjectionMs),
-	);
+	const reusableWorkMs = finiteValue(metrics.executionMs);
 	const referenceAt = metrics.actorHits > 0 ? (metrics.lastActorHitAt ?? metrics.insertedAt) : metrics.insertedAt;
 	const ageMs = Math.max(0, finiteValue(now - referenceAt));
 	const decay = halfLifeMs > 0 ? 2 ** (-ageMs / halfLifeMs) : 0;

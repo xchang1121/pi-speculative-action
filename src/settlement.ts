@@ -19,7 +19,6 @@ export type ResolutionStage =
 export interface ResolutionCause { readonly stage: ResolutionStage; readonly code: string; readonly detail?: string; }
 
 export interface ValidationMetrics {
-	readonly durationMs: number;
 	readonly bytesRead: number;
 	readonly filesRead: number;
 	readonly mode: "watcher" | "exact";
@@ -107,19 +106,11 @@ export interface SettledSourceRequest {
 
 export interface CandidateRejection { readonly candidateID: string; readonly match: ActionKeyMatch; readonly cause: ResolutionCause; }
 
-export interface ActorHitTiming {
-	/** Actor interception through adoption and result retention; session cleanup is separate. */
-	readonly hitLatencyMs: number;
-	/** Historical fallback-service estimate, absent without samples; not a no-speculation baseline. */
-	readonly expectedActorMs?: number;
-}
-
 export type ActorActionProvider =
 	| {
 			readonly kind: "speculative";
 			readonly candidateID: string;
 			readonly match: ActionKeyMatch;
-			readonly timing: ActorHitTiming;
 			readonly toolExecution: TimelineInterval;
 	  }
 	| {
@@ -158,5 +149,5 @@ export function cause<Stage extends ResolutionStage>(
 }
 
 export function zeroValidationMetrics(mode: ValidationMetrics["mode"] = "exact"): ValidationMetrics {
-	return { durationMs: 0, bytesRead: 0, filesRead: 0, mode };
+	return { bytesRead: 0, filesRead: 0, mode };
 }

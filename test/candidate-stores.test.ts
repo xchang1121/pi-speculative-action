@@ -241,15 +241,15 @@ describe("candidate retention", () => {
 		}
 	});
 
-	it("decays proven reuse value while keeping validation and projection costs honest", () => {
-		const base = { executionMs: 100, expectedValidationMs: 10, expectedProjectionMs: 5, bytes: 4_096, insertedAt: 0 };
+	it("ranks retained computation by actual work, reuse, size and age", () => {
+		const base = { executionMs: 100, bytes: 4_096, insertedAt: 0 };
 		const freshHot = speculativeCacheValue({ ...base, actorHits: 1, lastActorHitAt: 0 }, 0, 1_000);
 		const agedHot = speculativeCacheValue({ ...base, actorHits: 1, lastActorHitAt: 0 }, 1_000, 1_000);
 		const freshCold = speculativeCacheValue({ ...base, actorHits: 0 }, 0, 1_000);
 
 		expect(freshHot).toBeGreaterThan(agedHot);
 		expect(agedHot).toBeGreaterThan(freshCold);
-		expect(speculativeCacheValue({ ...base, actorHits: 3, expectedValidationMs: 100 }, 0, 1_000)).toBe(0);
+		expect(speculativeCacheValue({ ...base, actorHits: 3, executionMs: 0 }, 0, 1_000)).toBe(0);
 	});
 });
 

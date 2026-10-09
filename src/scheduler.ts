@@ -19,8 +19,6 @@ export interface PredictionForecast extends ServiceTimingIdentity {
 	readonly background?: boolean;
 	/** Dependencies have settled and this action is their immediate zero-horizon successor. */
 	readonly dependenciesResolved?: boolean;
-	/** Adopting this action's own result on its planned route: launch weighs the cost the Actor's join will. */
-	readonly adoptionIdentity?: ServiceTimingIdentity;
 }
 
 export interface ScheduledWork {
@@ -37,16 +35,12 @@ export interface ServiceTimingIdentity {
 	readonly semanticsEpoch?: string;
 	/** Stable execution environment shared by comparable service samples. */
 	readonly executionFingerprint?: string;
-	/** Exact K(a) or producer/consumer pair, before falling back to the wider timing class. */
+	/** Exact K(a), before falling back to the wider timing class. */
 	readonly actionKeyHash?: string;
-	/** Distinct work within one executor, such as exact adoption versus input re-evaluation. */
-	readonly operation?: string;
 }
 
 export interface CandidateJoinPolicy {
-	/** Required estimated Actor critical-path saving before waiting for unfinished work. */
-	readonly minNetBenefitMs: number;
-	/** Probe cap without Actor evidence, or with only class evidence and no action forecast (default: warm-up allowance). */
+	/** Wait cap without measured producer completion or an action forecast (default: warm-up allowance). */
 	readonly uncalibratedWaitMs?: number;
 	/** Uncertainty allowance added to the estimated remaining-time deadline during warm-up. */
 	readonly warmupWaitMs: number;
@@ -55,32 +49,21 @@ export interface CandidateJoinPolicy {
 }
 
 export interface CandidateJoinRequest {
-	/** Producer service; omitted consumer/adoption identities preserve exact-replay callers. */
+	/** The existing producer whose completion the Actor may await. */
 	readonly identity: ServiceTimingIdentity;
-	readonly actorIdentity?: ServiceTimingIdentity;
-	readonly adoptionIdentity?: ServiceTimingIdentity;
 	readonly state: "queued" | "running" | "succeeded";
 	/** Omit an unknown forecast; observed producer service still takes precedence. */
 	readonly expectedSpeculativeDurationMs?: number;
 	readonly elapsedMs?: number;
-	/** Forecast lead before the Actor arrives; it is not execution already performed. */
-	readonly leadTimeMs?: number;
 }
 
-type CandidateJoinReason = "ready" | "warmup_probe" | "calibration_probe" | "profitable" | "fallback_faster";
+type CandidateJoinReason = "ready" | "waiting" | "deadline";
 
 export interface CandidateJoinDecision {
 	readonly allowed: boolean;
 	readonly reason: CandidateJoinReason;
 	/** Zero for a completed candidate. A finite positive value is an Actor-side deadline. */
 	readonly waitBudgetMs: number;
-	readonly speculativeSamples: number;
-	readonly actorSamples: number;
-	readonly adoptionSamples: number;
-	readonly expectedRemainingMs: number;
-	readonly expectedAdoptionMs: number;
-	readonly expectedActorMs?: number;
-	readonly expectedNetBenefitMs?: number;
 }
 
 export type CandidateWaitResult<T> =
@@ -116,7 +99,7 @@ export async function waitForCandidate<T>(
 
 export type SchedulerAdmission =
 	| { readonly admitted: true; readonly work: ScheduledWork }
-	| { readonly admitted: false; readonly work: ScheduledWork; readonly reason: "budget_exhausted" | "not_profitable" | "failure_circuit"; };
+	| { readonly admitted: false; readonly work: ScheduledWork; readonly reason: "budget_exhausted" | "failure_circuit"; };
 
 export type WorldCompatibilityDecision =
 	| { readonly compatible: true }
@@ -132,11 +115,7 @@ interface SchedulerEntry<Job> { readonly job: Job; work: ScheduledWork; readonly
 export class SpeculationScheduler<Job extends object> {
 	private readonly entries = new Map<Job, SchedulerEntry<Job>>();
 	private readonly speculativeServiceTimes = new BoundedRecencyMap<string, SampleWindow>(1024);
-	private readonly actorServiceTimes = new BoundedRecencyMap<string, SampleWindow>(1024);
 	private readonly nativeServiceTimes = new BoundedRecencyMap<string, SampleWindow>(1024);
-	/** Per timing class: how much longer the same action takes speculatively than natively (sandbox and observation). */
-	private readonly speculativeOverheads = new BoundedRecencyMap<string, SampleWindow>(256);
-	private readonly adoptionTimes = new BoundedRecencyMap<string, SampleWindow>(1024);
 	private readonly actorDecisionDurations = new SampleWindow();
 	private readonly actorCycles = new SampleWindow();
 	private readonly candidateJoinPolicy: CandidateJoinPolicy;
@@ -146,7 +125,6 @@ export class SpeculationScheduler<Job extends object> {
 	constructor(options: { readonly candidateJoinPolicy?: Partial<CandidateJoinPolicy> } = {}) {
 		const policy = options.candidateJoinPolicy;
 		this.candidateJoinPolicy = Object.freeze({
-			minNetBenefitMs: finite(policy?.minNetBenefitMs ?? DEFAULT_BENEFIT_GATE_POLICY.minNetBenefitMs),
 			...(policy?.uncalibratedWaitMs === undefined ? {} : { uncalibratedWaitMs: finite(policy.uncalibratedWaitMs) }),
 			warmupWaitMs: finite(policy?.warmupWaitMs ?? 25),
 			durationSlack: Math.max(1, finite(policy?.durationSlack ?? 1.25)),
@@ -164,8 +142,6 @@ export class SpeculationScheduler<Job extends object> {
 		executionIdentity?: ServiceTimingIdentity,
 	): SchedulerAdmission {
 		if (role === "producer") {
-			if (forecasts.length && !forecasts.some((forecast) => this.canLaunch(forecast, work.expectedDurationMs)))
-				return { admitted: false, work, reason: "not_profitable" };
 			// Before the budget: a job the circuit refuses must not make room for itself by preempting others.
 			if (executionIdentity?.actionKeyHash &&
 				this.speculativeServiceTimes.get(timingKeys(executionIdentity)[0]!)?.allowExecution(job, this.decisionSequence) === false)
@@ -289,7 +265,7 @@ export class SpeculationScheduler<Job extends object> {
 
 	/** Cancelled work supplies an exact-action duration floor, never a successful service sample. */
 	observeSpeculativeService(identity: ServiceTimingIdentity, durationMs: number, failed: boolean | "cancelled" = false): void {
-		if (!failed) { this.observeTiming(this.speculativeServiceTimes, identity, durationMs); this.observeOverhead(identity); }
+		if (!failed) this.observeTiming(this.speculativeServiceTimes, identity, durationMs);
 		else if (identity.actionKeyHash) {
 			// Failed attempts cannot stand in for successful service or affect unrelated actions in the timing class.
 			const key = timingKeys(identity)[0]!, samples = this.speculativeServiceTimes.get(key) ?? new SampleWindow();
@@ -299,110 +275,27 @@ export class SpeculationScheduler<Job extends object> {
 		}
 	}
 
-	/** Fallback service includes optional capture and settlement, which only the join comparison should see. */
-	observeActorService(identity: ServiceTimingIdentity, durationMs: number, nativeMs = durationMs): void {
-		this.observeTiming(this.actorServiceTimes, identity, durationMs);
-		this.observeTiming(this.nativeServiceTimes, identity, nativeMs);
-		this.observeOverhead(identity);
+	/** Actual Actor computation informs scheduling value, never whether a ready result may be adopted. */
+	observeActorService(identity: ServiceTimingIdentity, durationMs: number): void {
+		this.observeTiming(this.nativeServiceTimes, identity, durationMs);
 	}
 
-	private observeOverhead(identity: ServiceTimingIdentity): void {
-		const [action] = timingKeys(identity);
-		const speculative = this.speculativeServiceTimes.get(action!)?.estimate(0.5), native = this.nativeServiceTimes.get(action!)?.estimate(0.5);
-		if (identity.actionKeyHash && speculative !== undefined && native !== undefined)
-			this.observeTiming(this.speculativeOverheads, { ...identity, actionKeyHash: undefined }, Math.max(0.001, speculative - native));
-	}
-
-	observeAdoption(identity: ServiceTimingIdentity, durationMs: number): void { this.observeTiming(this.adoptionTimes, identity, durationMs); }
-
-	/**
-	 * Decide whether the Actor should adopt speculative work from comparable measured service and bounded cold probes.
-	 */
+	/** Ready work proceeds to validation; unfinished work receives a finite completion deadline. */
 	assessCandidateJoin(request: CandidateJoinRequest): CandidateJoinDecision {
+		if (request.state === "succeeded") return { allowed: true, reason: "ready", waitBudgetMs: 0 };
 		const policy = this.candidateJoinPolicy;
 		const speculative = this.timingEstimate(this.speculativeServiceTimes, request.identity, 0.9, "upper");
-		const actor = this.timingEstimate(this.actorServiceTimes, request.actorIdentity ?? request.identity, 0.25);
-		const adoption = this.timingEstimate(this.adoptionTimes, request.adoptionIdentity ?? request.identity, 0.75, "upper");
 		const elapsedMs = request.state === "running" ? finite(request.elapsedMs) : 0, forecastMs = finite(request.expectedSpeculativeDurationMs);
-		const cold = !actor?.exact && !speculative?.exact && !forecastMs;
-		// A tool's timing class mixes short and long commands (ls and npm test): it may raise this action's own forecast or
-		// elapsed time, never shorten them, and for the same action without exact Actor evidence native takes about as long.
-		const sameAction = request.actorIdentity?.actionKeyHash === undefined || request.actorIdentity.actionKeyHash === request.identity.actionKeyHash;
-		const expectedSpeculativeMs = speculative?.exact ? speculative.value
-			: Math.max(forecastMs || (sameAction ? actor?.value ?? 0 : 0), speculative?.value ?? 0, elapsedMs) || actor?.value || 1;
-		// Without its own Actor samples, a fallback is judged among class samples this run could still match natively (net of overhead).
-		const overheadMs = this.speculativeOverheads.get(timingKeys(request.identity).at(-1)!)?.estimate(0.5) ?? 0;
-		const classFallbackMs = actor && !actor.exact && sameAction ? actor.window.estimate(0.5, "lower", elapsedMs - overheadMs) : undefined;
-		const expectedActorMs = classFallbackMs ?? (actor && !actor.exact && sameAction ? Math.max(actor.value, expectedSpeculativeMs) : actor?.value);
-		const expectedRemainingMs =
-			request.state === "succeeded" ? 0 : Math.max(0, expectedSpeculativeMs - elapsedMs - finite(request.leadTimeMs));
-		const expectedAdoptionMs = adoption?.value ?? 0;
-		const expectedNetBenefitMs = expectedActorMs === undefined ? undefined : expectedActorMs - expectedRemainingMs - expectedAdoptionMs;
-		const base = {
-			speculativeSamples: speculative?.samples ?? 0,
-			actorSamples: actor?.samples ?? 0,
-			adoptionSamples: adoption?.samples ?? 0,
-			expectedRemainingMs,
-			expectedAdoptionMs,
-			...(expectedActorMs === undefined ? {} : { expectedActorMs }),
-			...(expectedNetBenefitMs === undefined ? {} : { expectedNetBenefitMs }),
-		};
-
-		if (request.state === "succeeded") {
-			// Repeated ready hits censor the Actor alternative. One ordinary fallback supplies its first sample;
-			// no speculative effects have been committed and no completed Actor call is executed twice.
-			if (!actor && adoption?.exact && adoption.samples >= DEFAULT_BENEFIT_GATE_POLICY.minSamples)
-				return { allowed: false, reason: "calibration_probe", waitBudgetMs: 0, ...base };
-			// Repeated loss must sample the alternative; cached hits cannot grow Actor evidence.
-			if (
-				actor?.exact && adoption?.exact &&
-				adoption.samples >= DEFAULT_BENEFIT_GATE_POLICY.minSamples &&
-				expectedNetBenefitMs !== undefined &&
-				expectedNetBenefitMs < 0
-			) {
-				const allowed = adoption.window.allowProbe();
-				return { allowed, reason: allowed ? "ready" : "fallback_faster", waitBudgetMs: 0, ...base };
-			}
-			return { allowed: true, reason: "ready", waitBudgetMs: 0, ...base };
-		}
-
-		if (expectedActorMs === undefined) {
-			const waitBudgetMs = policy.uncalibratedWaitMs ?? policy.warmupWaitMs;
-			return { allowed: waitBudgetMs > 0, reason: "warmup_probe", waitBudgetMs, ...base };
-		}
-		const actorDeadlineMs = Math.max(0, expectedActorMs - expectedAdoptionMs - policy.minNetBenefitMs);
-		// Exact Actor evidence can fund its unknown alternative; heterogeneous class samples only fund a cold probe.
-		if (!speculative && !forecastMs) {
-			const waitBudgetMs = Math.min(policy.uncalibratedWaitMs ?? (cold ? policy.warmupWaitMs : Number.POSITIVE_INFINITY), actorDeadlineMs);
-			return { allowed: waitBudgetMs > 0, reason: "warmup_probe", waitBudgetMs, ...base };
-		}
-		if (expectedNetBenefitMs === undefined || expectedNetBenefitMs < policy.minNetBenefitMs) {
-			return { allowed: false, reason: "fallback_faster", waitBudgetMs: 0, ...base };
-		}
-		const estimatedDeadlineMs = speculative?.exact || forecastMs ? expectedRemainingMs * policy.durationSlack + policy.warmupWaitMs
-			: cold ? policy.uncalibratedWaitMs ?? policy.warmupWaitMs : actorDeadlineMs;
-		const waitBudgetMs = Math.min(actorDeadlineMs, estimatedDeadlineMs);
-		// A cancelled run supplies no completion sample. Passing that floor does not mean this run is nearly done.
-		const uncalibratedOverrun = speculative?.samples === 0 && request.state === "running" && elapsedMs >= expectedSpeculativeMs;
-		if (waitBudgetMs <= 0 || uncalibratedOverrun && !speculative.window.allowProbe()) {
-			return { allowed: false, reason: uncalibratedOverrun ? "warmup_probe" : "fallback_faster", waitBudgetMs: 0, ...base };
-		}
-		return { allowed: true, reason: !cold && speculative?.samples ? "profitable" : "warmup_probe", waitBudgetMs, ...base };
+		// Heterogeneous tool classes and cancelled runs cannot establish this producer's completion deadline.
+		const measuredMs = speculative?.exact && speculative.samples > 0 ? speculative.value : 0;
+		const expectedRemainingMs = Math.max(0, Math.max(measuredMs, forecastMs) - elapsedMs);
+		const waitBudgetMs = measuredMs || forecastMs ? expectedRemainingMs * policy.durationSlack + policy.warmupWaitMs
+			: policy.uncalibratedWaitMs ?? policy.warmupWaitMs;
+		return { allowed: waitBudgetMs > 0, reason: waitBudgetMs > 0 ? "waiting" : "deadline", waitBudgetMs };
 	}
 
 	snapshot(): readonly { readonly job: Job; readonly work: ScheduledWork }[] {
 		return [...this.entries.values()] .sort((left, right) => left.sequence - right.sequence) .map(({ job, work }) => ({ job, work }));
-	}
-
-	/** With exact Actor evidence and a known cost, avoid launching work its consumer would reject. */
-	private canLaunch(forecast: PredictionForecast, expectedDurationMs: number): boolean {
-		const runway = this.actorRunway(forecast);
-		if (runway === undefined || !forecast.actionKeyHash) return true;
-		const key = timingKeys(forecast)[0]!;
-		if (!this.actorServiceTimes.get(key)?.count || forecast.expectedDurationMs === undefined &&
-			this.speculativeServiceTimes.get(key)?.estimate(0.9, "upper") === undefined) return true;
-		return this.assessCandidateJoin({ identity: forecast, adoptionIdentity: forecast.adoptionIdentity, state: "queued",
-			expectedSpeculativeDurationMs: expectedDurationMs, leadTimeMs: runway }).allowed;
 	}
 
 	private actorRunway(forecast: PredictionForecast, phase = forecast.actorPhase): number | undefined {
@@ -438,13 +331,13 @@ export class SpeculationScheduler<Job extends object> {
 	private timingEstimate(windows: BoundedRecencyMap<string, SampleWindow>, identity: ServiceTimingIdentity, quantile: number, selection: QuantileSelection = "lower"): TimingEstimate | undefined {
 		for (const [index, key] of timingKeys(identity).entries()) {
 			const window = windows.get(key), value = window?.estimate(quantile, selection);
-			if (value !== undefined) return { value, samples: window!.count, window: window!, exact: Boolean(identity.actionKeyHash) && index === 0 };
+			if (value !== undefined) return { value, samples: window!.count, exact: Boolean(identity.actionKeyHash) && index === 0 };
 		}
 		return undefined;
 	}
 }
 
-interface TimingEstimate { readonly value: number; readonly samples: number; readonly window: SampleWindow; readonly exact: boolean; }
+interface TimingEstimate { readonly value: number; readonly samples: number; readonly exact: boolean; }
 
 class SampleWindow {
 	private readonly values: number[] = [];
@@ -482,18 +375,15 @@ class SampleWindow {
 	}
 
 	/** The same bounded evidence owns recovery, including decisions made before a probe settles. */
-	allowProbe(): boolean {
+	private allowProbe(): boolean {
 		if (++this.suppressedSinceProbe < DEFAULT_BENEFIT_GATE_POLICY.probeInterval) return false;
 		this.suppressedSinceProbe = 0;
 		return true;
 	}
 
-	/** `above` restricts the quantile to longer samples, and has no estimate when none is longer. */
-	estimate(value: number, selection: QuantileSelection = "lower", above?: number): number | undefined {
-		if (!this.values.length) return above === undefined ? this.lowerBound || undefined : undefined;
-		const all = this.sortedValues ??= [...this.values].sort((left, right) => left - right);
-		const sorted = above === undefined ? all : all.filter((sample) => sample > above);
-		if (!sorted.length) return undefined;
+	estimate(value: number, selection: QuantileSelection = "lower"): number | undefined {
+		if (!this.values.length) return this.lowerBound || undefined;
+		const sorted = this.sortedValues ??= [...this.values].sort((left, right) => left - right);
 		const index = (sorted.length - 1) * Math.max(0, Math.min(1, value));
 		return Math.max(this.lowerBound, sorted[selection === "upper" ? Math.ceil(index) : Math.floor(index)]!);
 	}
@@ -502,7 +392,7 @@ class SampleWindow {
 type QuantileSelection = "lower" | "upper";
 
 function timingKeys(identity: ServiceTimingIdentity): readonly string[] {
-	const group = [identity.tool, identity.semanticsEpoch ?? "", identity.executionFingerprint ?? "", identity.operation ?? ""];
+	const group = [identity.tool, identity.semanticsEpoch ?? "", identity.executionFingerprint ?? ""];
 	return [...(identity.actionKeyHash ? [JSON.stringify(["action", ...group, identity.actionKeyHash])] : []),
 		JSON.stringify(["class", ...group])];
 }

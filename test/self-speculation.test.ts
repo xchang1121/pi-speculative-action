@@ -523,8 +523,8 @@ describe("self-speculation control plane", () => {
 		await coordinator.dispose();
 	});
 
-	it("bounds censored adoptions and measured negative forks after warm-up", async () => {
-		for (const expectedActorMs of [undefined, 0]) {
+	it("credits actual fork computation after turn closure without a fallback estimate", async () => {
+		for (const reusedExecutionMs of [0, 10_000]) {
 			const coordinator = coordinatorFixture([], { forkTransport: "sidecar" },
 				Array.from({ length: 5 }, (_, index) => `actor-${index + 1}`),
 				(request) => request.path === SELF_SPECULATION_DEFAULTS.forkPath ? forkReceipt("read", { path: "a.txt" }) : {});
@@ -533,21 +533,23 @@ describe("self-speculation control plane", () => {
 				coordinator.decorateActorPayload({ prompt: "P" });
 				coordinator.observeActorOutput(delta("thinking_delta", "reason"));
 				await vi.waitFor(() => expect(coordinator.snapshot().forkCompletions).toBe(decision));
+				const plans = await coordinator.actorForkPlanSource.source.propose({ startInput: { turnID: `turn-${decision}` },
+					data: {}, candidateNames: ["read"], signal: new AbortController().signal } as never) as unknown as readonly { actions: { reuseFeedback: unknown }[] }[];
+				const feedback = plans[0]!.actions[0]!.reuseFeedback;
+				coordinator.endTurn();
 				coordinator.observeActorSettlement({
 					actorAction: { id: `actor-${decision}`, sequence: decision, turnID: `turn-${decision}` }, tool: "read", rejections: [],
 					matchedPredictions: [predictionFeedback("self-speculation", true, decision).settlement.prediction],
 					provider: { kind: "speculative", candidateID: "candidate", match: { kind: "exact", distance: 0 },
-						timing: { hitLatencyMs: 100, expectedActorMs },
 						toolExecution: { startedAt: 0, completedAt: 10000 } },
-				});
-				coordinator.endTurn();
+				}, [{ source: "self-speculation", feedback, reusedExecutionMs }]);
 			}
 
 			coordinator.startTurn("turn-5", model(), context(), 5);
 			coordinator.decorateActorPayload({ prompt: "P" });
 			coordinator.observeActorOutput(delta("thinking_delta", "reason"));
 			await vi.waitFor(() => expect(coordinator.snapshot()).toMatchObject({
-				forkRequests: 4, forkGateSkips: 1, forkGateSamples: 4,
+				forkRequests: reusedExecutionMs ? 5 : 4, forkGateSkips: reusedExecutionMs ? 0 : 1, forkGateSamples: 4,
 			}));
 			await coordinator.dispose();
 		}

@@ -49,7 +49,7 @@ export function emptySpeculativeTraceSummary(cache: SpeculativeCacheSnapshot | P
 		actorCandidateRejections: {} as Readonly<Record<string, number>>,
 		tasks: 0, actorComputeMs: 0 as number | undefined, toolWaitMs: 0, reusedExecutionMs: 0,
 		reusedExecutionIncomplete: undefined as true | undefined,
-		hitLatencyMs: 0, totalDraftTokens: 0,
+		totalDraftTokens: 0,
 		processReuse: emptyWorldReuseMetrics(), // Inside speculative worlds, never the Actor route.
 		cache: { ...EMPTY_CACHE, ...cache },
 	};
@@ -149,7 +149,6 @@ export function reduceSpeculativeTrace<SessionID>(
 					next.partialResultReuseByProjector = increment(current.partialResultReuseByProjector, match.projector);
 				} else if (match.kind === "inputs") next.inputReuseHits++;
 				else next.exactReuseHits++;
-				next.hitLatencyMs += metric(event.settlement.provider.timing.hitLatencyMs);
 			} else {
 				if (event.settlement.provider.origin === "preview") {
 					next.actorPreviews++;

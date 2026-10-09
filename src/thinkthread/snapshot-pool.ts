@@ -203,8 +203,8 @@ export class ThinkThreadSnapshotPool {
 	}
 
 	private async createBase(): Promise<SnapshotLease> {
-		const startedAt = performance.now(), capture = await TimelineInterval.collect(() => this.durable.snapshotCreate());
-		return this.ownSnapshot({ ...capture.output, computation: TimelineInterval.own(new TimelineInterval(startedAt, performance.now(), capture.dependencies)) });
+		const capture = await TimelineInterval.measure(() => this.durable.snapshotCreate());
+		return this.ownSnapshot({ ...capture.output, computation: TimelineInterval.own(capture.computation) });
 	}
 
 	private async finishActive(): Promise<void> {

@@ -3,12 +3,12 @@ import { createFauxCore, fauxAssistantMessage, fauxToolCall } from "@earendil-wo
 import { createSpeculativeActionHost } from "../dist/agent-integration.js";
 
 /** Common Host lifecycle for captured-search qualification; callers own inputs and assertions. */
-export function searchJourney({ cwd, name, tools, args, invocation, world, settings = {} }) {
+export function searchJourney({ cwd, name, tools, args, invocation, world, resources, settings = {} }) {
 	const model = createFauxCore({ provider: "qualification", models: [{ id: "qualification", reasoning: false }] }).getModel();
 	const candidate = Promise.withResolvers(), authorized = Promise.withResolvers();
 	let prediction = true, turnID, actorWaiting = false, actorCalls = 0, feedback;
 	const host = createSpeculativeActionHost("search-qualification", {
-		cwd, getSettings: () => ({ enabled: true, drafterEnabled: prediction, drafterGateEnabled: false,
+		cwd, resources, getSettings: () => ({ enabled: true, drafterEnabled: prediction, drafterGateEnabled: false,
 			drafterMaxDepth: 0, candidateLimit: 1, maxConcurrentActions: 1, tools: prediction ? [name] : [],
 			patternAware: { enabled: false }, selfSpeculation: { enabled: false }, ...settings }),
 		draftModel: model, complete: async () => fauxAssistantMessage(fauxToolCall(name, args), { stopReason: "toolUse" }),

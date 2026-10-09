@@ -10,7 +10,6 @@ export interface DrafterUtilityBatch {
 	readonly key: string;
 	readonly coldOpportunity: boolean;
 	chargedTokens: number;
-	costMs: number;
 	benefitMs?: number;
 	finished: boolean;
 	pendingRequests: number;
@@ -46,18 +45,17 @@ export class DrafterTaskBudget {
 	start(key: string, enabled: boolean, marginal = false, coldOpportunity = false): DrafterUtilityBatch {
 		if (!marginal) this.latestKey = key;
 		return { key, coldOpportunity, policy: { ...DEFAULT_BENEFIT_GATE_POLICY, enabled }, marginal, startedRequests: 0, pendingRequests: 0,
-			chargedTokens: 0, costMs: 0, benefitMs: 0, finished: false };
+			chargedTokens: 0, benefitMs: 0, finished: false };
 	}
 
 	finish(...batches: DrafterUtilityBatch[]): void {
 		for (const batch of batches) { batch.finished = true; this.observe(batch); }
 	}
 
-	/** Only measured, consumed computation earns benefit; admission costs remain a separate value. */
-	credit(batches: readonly DrafterUtilityBatch[], timing: { readonly reusedExecutionMs: number; readonly costMs?: number }): void {
+	/** Only measured, consumed computation earns benefit. */
+	credit(batches: readonly DrafterUtilityBatch[], timing: { readonly reusedExecutionMs: number }): void {
 		for (const batch of new Set(batches)) {
 			batch.benefitMs = (batch.benefitMs ?? 0) + metric(timing.reusedExecutionMs);
-			batch.costMs += metric(timing.costMs);
 			this.observe(batch);
 		}
 	}
@@ -102,7 +100,7 @@ export class DrafterTaskBudget {
 			const measured = new Map<string, { saved: number; tokens: number }>();
 			for (const sample of this.samples) if (sample.finished && !sample.pendingRequests && sample.benefitMs !== undefined && sample.chargedTokens > 0) {
 				const previous = measured.get(sample.key) ?? { saved: 0, tokens: 0 };
-				measured.set(sample.key, { saved: previous.saved + sample.benefitMs - sample.costMs, tokens: previous.tokens + sample.chargedTokens });
+				measured.set(sample.key, { saved: previous.saved + sample.benefitMs, tokens: previous.tokens + sample.chargedTokens });
 			}
 			const density = (key?: string) => Math.max(0, ...[...measured].filter(([name]) => name !== key).map(([, sample]) => sample.saved / sample.tokens));
 			const threshold = Math.max(batch.policy.minNetBenefitMs, (prompt + output) * density(batch.key));
@@ -115,7 +113,7 @@ export class DrafterTaskBudget {
 				futureOpportunityUsed: state.futureOpportunityUsed, opportunity: batch.key }));
 			const parentUseful = [...ancestors].some(parent => parent !== batch &&
 				(parent.pendingRequests === 0 && parent.chargedTokens > 0 && parent.benefitMs !== undefined
-					? parent.benefitMs - parent.costMs : this.gate.snapshot(parent.key).expectedNetBenefitMs ?? 0) >= batch.policy.minNetBenefitMs);
+					? parent.benefitMs : this.gate.snapshot(parent.key).expectedNetBenefitMs ?? 0) >= batch.policy.minNetBenefitMs);
 			// An unresolved root is not evidence for paying for a second racing guess.
 			if (batch.marginal && !input.afterExecution && [...ancestors].some(parent => parent !== batch && parent.pendingRequests > 0) && !parentUseful &&
 				(forecast === undefined || forecast < threshold))
@@ -179,7 +177,8 @@ export class DrafterTaskBudget {
 	private skip(reason: Suppression, onSkipped?: OnSkipped, detail?: string): undefined { this.state.skippedRequests++; onSkipped?.(reason, detail); return undefined; }
 	private observe(batch: DrafterUtilityBatch): void {
 		if (!batch.policy.enabled || !batch.finished || !batch.startedRequests || batch.pendingRequests) return;
-		if (batch.update) batch.update(batch); else batch.update = this.gate.observe(batch.key, batch, batch.policy);
+		const observation = { costMs: 0, benefitMs: batch.benefitMs };
+		if (batch.update) batch.update(observation); else batch.update = this.gate.observe(batch.key, observation, batch.policy);
 	}
 	private forecast(batch: DrafterUtilityBatch): number | undefined {
 		if (batch.expectedBenefitMs === undefined) return undefined;
@@ -187,8 +186,7 @@ export class DrafterTaskBudget {
 		const calibrated = samples.filter(sample => sample.expectedBenefitMs !== undefined && sample.benefitMs !== undefined);
 		const predicted = calibrated.reduce((sum, sample) => sum + sample.expectedBenefitMs!, 0);
 		const realized = calibrated.reduce((sum, sample) => sum + sample.benefitMs!, 0);
-		return Math.max(0, batch.expectedBenefitMs * (predicted > 0 ? Math.min(1, realized / predicted) : 1) -
-			samples.reduce((sum, sample) => sum + sample.costMs, 0) / Math.max(1, samples.length));
+		return Math.max(0, batch.expectedBenefitMs * (predicted > 0 ? Math.min(1, realized / predicted) : 1));
 	}
 	private spent() { return this.state.reportedTokens + this.state.unreportedTokens + this.state.reservedTokens; }
 	private empty() { return { requests: 0, reportedTokens: 0, unreportedTokens: 0, reservedTokens: 0, explorationTokens: 0, futureOpportunityUsed: false, skippedRequests: 0 }; }

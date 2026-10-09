@@ -40,7 +40,6 @@ export interface ProcessReuseLookupMetrics {
 	readonly bytesRead: number;
 	readonly artifactsLoaded: number;
 	readonly artifactBytesRead: number;
-	readonly durationMs: number;
 }
 
 interface ReadyProcessPlan {
@@ -69,9 +68,8 @@ export class ProcessReusePlanner {
 	constructor(options: { readonly store: ProvenanceCertificateStore }) { this.store = options.store; }
 
 	async plan(request: ProcessReuseRequest): Promise<ProcessReusePlan> {
-		const startedAt = performance.now();
 		const metrics = { candidateCertificates: 0, eligibleCertificates: 0, pathsetsValidated: 0, filesRead: 0, bytesRead: 0, artifactsLoaded: 0, artifactBytesRead: 0 };
-		const lookup = (): ProcessReuseLookupMetrics => Object.freeze({ ...metrics, durationMs: Math.max(0, performance.now() - startedAt) });
+		const lookup = (): ProcessReuseLookupMetrics => Object.freeze({ ...metrics });
 		const weakKey = request.weakKey;
 		if (!isSha256Digest(weakKey)) throw new Error("invalid process weak key");
 		const live = request.live ? [request.live.certificate].flat().filter(candidate => candidate.weakKey === weakKey) : [];
@@ -104,8 +102,8 @@ export class ProcessReusePlanner {
 			const strongKey = processStrongKey(weakKey, current);
 			const matching = grouped.filter((certificate) => certificate.strongKey === strongKey);
 			if (!matching.length) { reasons.add("dependency_changed"); continue; }
-			const { dependencies, filesRead, bytesRead, durationMs } = observation;
-			const validation: Extract<ProvenanceValidation, { status: "valid" }> = { status: "valid", strongKey, dependencies, filesRead, bytesRead, durationMs };
+			const { dependencies, filesRead, bytesRead } = observation;
+			const validation: Extract<ProvenanceValidation, { status: "valid" }> = { status: "valid", strongKey, dependencies, filesRead, bytesRead };
 			for (const certificate of matching) {
 				const artifacts = await this.store.artifacts.load(referencedArtifacts(certificate));
 				if (!artifacts) { reasons.add("artifact_missing"); continue; }

@@ -448,10 +448,10 @@ describe("speculative action resource versions", () => {
 			let dependencies: ReadonlySet<string> | undefined;
 			const query = () => view.evaluate(v => v.prepare(binding, "selection", build, async value => value), observed => { dependencies = observed; });
 			now += 100;
-			const startedAt = now, evaluated = await TimelineInterval.collect(query), timeline = new TaskTimeline(startedAt);
+			const startedAt = now, evaluated = await TimelineInterval.measure(async () => { const output = await query(); now += 5; return output; }), timeline = new TaskTimeline(startedAt);
 			expect(evaluated.output).toBe("A"); expect(build).toHaveBeenCalledTimes(exhausted ? 2 : 1);
-			now += 5; timeline.startToolWait(startedAt)(now);
-			timeline.recordTool(new TimelineInterval(startedAt, now, evaluated.dependencies));
+			timeline.startToolWait(startedAt)(now);
+			timeline.recordTool(evaluated.computation);
 			expect(timeline.measure(now)).toMatchObject({ actorComputeMs: exhausted ? 25 : 5, reusedExecutionMs: exhausted ? 0 : 20,
 				toolWaitMs: exhausted ? 55 : 5 });
 			expect(dispose).toHaveBeenCalledTimes(exhausted ? 2 : 0); expect(view.bytes).toBe(bytes);
@@ -487,12 +487,14 @@ describe("speculative action resource versions", () => {
 		const rejected = vi.fn(() => { now += 5; throw new Error("resource_input_proof_missing"); });
 		const accepted = vi.fn(() => { now += 3; });
 		try {
-			const evaluation = await TimelineInterval.collect(() => reader.evaluate(view => view.readFile(file), undefined, root,
-				() => sources.map((view, index) => ({ view, observed: index ? accepted : rejected }))));
+			const evaluation = await TimelineInterval.measure(async () => {
+				const output = await reader.evaluate(view => view.readFile(file), undefined, root,
+					() => sources.map((view, index) => ({ view, observed: index ? accepted : rejected })));
+				now += 2; return output;
+			});
 			expect(evaluation.output.toString()).toBe("accepted");
 			expect(rejected).toHaveBeenCalledOnce(); expect(accepted).toHaveBeenCalledOnce();
-			now += 2;
-			expect(new TaskTimeline(100).recordTool(new TimelineInterval(100, now, evaluation.dependencies)))
+			expect(new TaskTimeline(100).recordTool(evaluation.computation))
 				.toEqual({ actorComputeMs: 2, reusedExecutionMs: 30 });
 		} finally { clock.mockRestore(); await reader.dispose(); await Promise.all(sources.map(view => view.dispose())); }
 	});
@@ -521,7 +523,7 @@ describe("speculative action resource versions", () => {
 		} finally { clock.mockRestore(); await view.dispose(); expect(handle.fd).toBe(-1); }
 	});
 
-	test("keeps fresh calculation unknown when a rejected preparation also borrowed existing work", async () => {
+	test("keeps fresh calculation while discarding a rejected preparation's nested borrowed work", async () => {
 		const root = await workspace(), file = path.join(root, "value"), view = new ResourceReadView(8192), binding = {};
 		view.capture(file, { type: "file", content: Buffer.from("A"), dependency: "content:value" });
 		let now = 100;
@@ -531,15 +533,15 @@ describe("speculative action resource versions", () => {
 		};
 		try {
 			await view.prepare(binding, "parsed", build, async value => value); view.seal(); now = 200;
-			const evaluation = await TimelineInterval.collect(async () => {
+			const evaluation = await TimelineInterval.measure(async () => {
 				await expect(view.evaluate(inputs => inputs.prepare({}, "derived", async inner => {
 					const value = await inner.prepare!(binding, "parsed", build, async value => value);
 					now += 20; return { value, bytes: 1, dispose: () => {} };
 				}, async value => value), () => { now += 5; throw failure; })).rejects.toBe(failure);
 				now += 3;
 			});
-			expect(new TaskTimeline(200).recordTool(new TimelineInterval(200, now, evaluation.dependencies)))
-				.toEqual({ actorComputeMs: undefined, reusedExecutionMs: 0 });
+			expect(new TaskTimeline(200).recordTool(evaluation.computation))
+				.toEqual({ actorComputeMs: 23, reusedExecutionMs: 0 });
 		} finally { clock.mockRestore(); await view.dispose(); }
 	});
 
@@ -909,13 +911,13 @@ describe("speculative action resource versions", () => {
 				};
 			});
 			restore = () => retain.mockRestore();
-			const evaluation = await TimelineInterval.collect(() => world.speculation!.execute({ ...context,
+			const evaluation = await TimelineInterval.measure(() => world.speculation!.execute({ ...context,
 				inputs: () => branches.map(branch => branch.inputSource!) }));
 			branches.push(evaluation.output);
 			expect(evaluation.output.output.result.content).toEqual([{ type: "text", text: "A" }]);
 			expect(retain).toHaveBeenCalledTimes(mode === "next-owner" ? 2 : 1);
 			expect(released).toHaveBeenCalledOnce();
-			expect(new TaskTimeline(200).recordTool(new TimelineInterval(200, now, evaluation.dependencies)))
+			expect(new TaskTimeline(200).recordTool(evaluation.computation))
 				.toEqual({ actorComputeMs: mode === "next-owner" ? 8 : 98, reusedExecutionMs: mode === "next-owner" ? 30 : 0 });
 			expect(await evaluation.output.validate!()).toMatchObject({ status: "valid" });
 			await fs.writeFile(file, "changed");

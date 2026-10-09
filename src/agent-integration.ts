@@ -403,7 +403,7 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 				try { return await (prepared?.withInputs ? prepared.withInputs(execute) : execute()); }
 				finally {
 					if (actionSemantics.definition(bound.action ?? bound.tool)?.effect !== "observation") {
-						await TimelineInterval.overhead(() => Promise.allSettled(executionWorlds.map(async world => world.actorFallbackSettled?.())));
+						await TimelineInterval.outside(() => Promise.allSettled(executionWorlds.map(async world => world.actorFallbackSettled?.())));
 					}
 				}
 			}, {

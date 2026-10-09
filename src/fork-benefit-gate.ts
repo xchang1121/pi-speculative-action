@@ -1,4 +1,3 @@
-import type { ActorHitTiming } from "./settlement.ts";
 import { nonNegativeFinite as metric } from "./number-utils.ts";
 
 export interface BenefitGatePolicy extends Readonly<typeof benefitGateDefaults> {}
@@ -9,16 +8,9 @@ export const DEFAULT_BENEFIT_GATE_POLICY: BenefitGatePolicy = Object.freeze(bene
 
 export interface BenefitObservation {
 	readonly costMs: number;
-	/** Missing for adopted work whose counterfactual service time was not observed. */
+	/** Missing when this producer has no recorded computation-consumption feedback. */
 	readonly benefitMs?: number;
 	readonly failed?: boolean;
-}
-
-/** Historical fallback service is an estimate; a censored hit is neither zero gain nor measured savings. */
-export function creditAdoption(utility: { costMs: number; benefitMs?: number }, timing: ActorHitTiming, shares = 1): void {
-	utility.costMs += metric(timing.hitLatencyMs) / shares;
-	utility.benefitMs = utility.benefitMs === undefined || timing.expectedActorMs === undefined
-		? undefined : utility.benefitMs + metric(timing.expectedActorMs) / shares;
 }
 
 export type BenefitDecisionReason =

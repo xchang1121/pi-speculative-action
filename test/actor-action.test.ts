@@ -20,7 +20,7 @@ describe("ActorAction", () => {
 				identity, tool: "read", actionKey, fallback: cause("matching", "no_candidate"),
 			});
 			const selection = { candidate: { id: "fresh" }, match: exact, output: "value",
-				timing: { hitLatencyMs: 3 }, toolExecution: { startedAt: 10, completedAt: 50 } };
+				toolExecution: { startedAt: 10, completedAt: 50 } };
 			expect(action.rejectCandidate("stale", exact, cause("freshness", "resource_changed"))).toBe(true);
 			expect(action.select({ ...selection, candidate: { id: "stale" } })).toBe(false);
 			expect(action.select(selection)).toBe(true);
@@ -35,8 +35,8 @@ describe("ActorAction", () => {
 					: { status: "adopted", candidateID: "fresh" });
 			const settled = action.settlement;
 			expect(summarizeSpeculativeTrace([{ ...envelope, type: "actor_action", settlement: settled!, actualAction: "read file.ts" }])).toMatchObject(provider === "speculative"
-				? { hitLatencyMs: 3, speculativeHits: 1, actorPreviews: 0 }
-				: { hitLatencyMs: 0, speculativeHits: 0, actorPreviews: 1 });
+				? { speculativeHits: 1, actorPreviews: 0 }
+				: { speculativeHits: 0, actorPreviews: 1 });
 			expect(settled).toMatchObject({ actorAction: identity, matchedPredictions: [prediction],
 				rejections: [{ candidateID: "stale", cause: { stage: "freshness" } }], provider: { candidateID: "fresh",
 					...(provider === "preview" ? { kind: "actor", origin: "preview", durationMs: 40 } : { kind: "speculative", match: exact }) } });

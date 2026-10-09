@@ -98,7 +98,6 @@ export {
 	type ActorActionIdentity,
 	type ActorActionProvider,
 	type ActorActionSettlement,
-	type ActorHitTiming,
 	type CandidateRejection,
 	cause,
 	type PlanActionIdentity,

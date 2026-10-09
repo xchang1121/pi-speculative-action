@@ -23,7 +23,6 @@ describe("speculative action package boundary", () => {
 		]);
 
 		expect(core.zeroValidationMetrics()).toEqual({
-			durationMs: 0,
 			bytesRead: 0,
 			filesRead: 0,
 			mode: "exact",

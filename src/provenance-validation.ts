@@ -26,7 +26,7 @@ export type DynamicDependencyValidation = (
 			readonly dependencies: readonly DynamicDependency[];
 	  }
 	| { readonly status: "indeterminate"; readonly reason: string; }
-) & { readonly filesRead: number; readonly bytesRead: number; readonly durationMs: number };
+) & { readonly filesRead: number; readonly bytesRead: number };
 
 export type ProvenanceValidation =
 	| (Extract<DynamicDependencyValidation, { status: "valid" }> & { readonly strongKey: Sha256Digest })
@@ -59,10 +59,9 @@ export async function validateDynamicDependencyCertificate(
 	certificate: DynamicDependencyCertificate,
 	context: ProvenanceValidationContext = {},
 ): Promise<DynamicDependencyValidation> {
-	const startedAt = performance.now();
 	let filesRead = 0;
 	let bytesRead = 0;
-	const metrics = () => ({ filesRead, bytesRead, durationMs: Math.max(0, performance.now() - startedAt) });
+	const metrics = () => ({ filesRead, bytesRead });
 	const indeterminate = (reason: string): DynamicDependencyValidation => ({ status: "indeterminate", reason, ...metrics() });
 	if (!certificate.complete) return indeterminate("trace_incomplete");
 	const acceptedTaints = new Set(context.acceptedTaints ?? []);

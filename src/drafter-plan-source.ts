@@ -96,7 +96,6 @@ export function createDrafterPlanSource(input: {
 	const batches = new Map<string, DrafterPreparation>();
 	const budget = input.drafterBudget ?? new DrafterTaskBudget();
 	let rootRequestMs = 0, costlyService = false;
-	const lineage = (batch: DrafterPlanFeedback) => [...new Set([batch.utility, ...batch.marginalUtilities ?? []])];
 	// Separate Beta(1, 1) estimates over the latest 32 eligible outcomes per model and tool contract.
 	const calibration = new BoundedRecencyMap<string, { matches: number[]; adoptions: number[] }>(128);
 	const calibrationKey = (batch: DrafterBatch, tool: string) => JSON.stringify([batch.utility.key, tool]);
@@ -194,12 +193,7 @@ export function createDrafterPlanSource(input: {
 			let samples = calibration.get(key);
 			if (!samples) { samples = { matches: [], adoptions: [] }; calibration.set(key, samples); }
 			observe(samples.matches, settlement.match.matched);
-			if (settlement.match.matched) {
-				const adoption = settlement.match.adoption;
-				// Deliberate Actor calibration supplies timing evidence, not evidence that this result was unusable.
-				if (adoption.status === "rejected" && adoption.cause.code === "candidate_calibration_sample") return;
-				observe(samples.adoptions, adoption.status === "adopted");
-			}
+			if (settlement.match.matched) observe(samples.adoptions, settlement.match.adoption.status === "adopted");
 		},
 		enabled: (settings) => settings.drafterEnabled ?? DEFAULTS.drafterEnabled,
 		timeoutMs: (settings) => settings.predictionTimeoutMs,
@@ -303,15 +297,15 @@ export function createDrafterPlanSource(input: {
 		source,
 		snapshot: (): DrafterUtilitySnapshot & { readonly budget: DrafterBudgetSnapshot } => ({ ...budget.utilitySnapshot(), budget: budget.snapshot() }),
 		finishTurn: (sessionID: string, turnID: string) => { finishBatch(agentBatchKey(sessionID, turnID)); },
-		actorActionSettled: ({ sessionID, turnID, settlement, candidate, candidateFeedback, reusedComputations }: ActorActionFeedback<string>) => {
+		actorActionSettled: ({ sessionID, turnID, settlement, reusedComputations }: ActorActionFeedback<string>) => {
 			const provider = settlement.provider;
 			// Actual service can justify one cold phase; it is neither a predicted saving nor mutation evidence.
 			if (batches.has(agentBatchKey(sessionID, turnID)) && rootRequestMs > 0 && provider.kind === "actor" && provider.origin === "fallback" &&
 				!provider.isError && Number.isFinite(provider.durationMs) && provider.durationMs > rootRequestMs + DEFAULT_BENEFIT_GATE_POLICY.minNetBenefitMs) costlyService = true;
-			const credits = new Map<DrafterUtilityBatch, { reusedExecutionMs: number; costMs: number }>();
+			const credits = new Map<DrafterUtilityBatch, { reusedExecutionMs: number }>();
 			const credit = (utility: DrafterUtilityBatch) => {
 				let value = credits.get(utility);
-				if (!value) credits.set(utility, value = { reusedExecutionMs: 0, costMs: 0 });
+				if (!value) credits.set(utility, value = { reusedExecutionMs: 0 });
 				return value;
 			};
 			for (const share of reusedComputations ?? []) {
@@ -320,9 +314,6 @@ export function createDrafterPlanSource(input: {
 				// The timeline already deduplicated physical work; each shared ancestor receives its consumed parts once.
 				for (const utility of producer.utilities) credit(utility).reusedExecutionMs += share.reusedExecutionMs;
 			}
-			// A selected producer owns its measured adoption cost; predictions by other sources own neither its cost nor its benefit.
-			const owner = candidate?.source === "drafter" ? asDrafterPlanFeedback(candidateFeedback) : undefined;
-			if (owner && provider.kind === "speculative") for (const utility of lineage(owner)) credit(utility).costMs += provider.timing.hitLatencyMs;
 			for (const [utility, timing] of credits) budget.credit([utility], timing);
 		},
 		finishSession: () => { for (const key of batches.keys()) finishBatch(key); rootRequestMs = 0; costlyService = false; budget.finishTask(); },

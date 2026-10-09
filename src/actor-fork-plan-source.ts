@@ -31,6 +31,7 @@ export interface ActorProbeSchedule {
 export const ACTOR_PROBE_SCHEDULE: ActorProbeSchedule = Object.freeze({ maxAttempts: 5, retryStreamUpdates: 50, boundaryStreamUpdates: 10 });
 
 interface PendingFork {
+	readonly reuseFeedback?: unknown;
 	readonly promise: Promise<readonly ActorForkActionBatch[]>;
 	readonly resolve: (batches: readonly ActorForkActionBatch[]) => void;
 	readonly controller: AbortController;
@@ -83,16 +84,17 @@ export class ActorForkPlanSource {
 				const kept = batch.calls.filter((call) => allowed.has(call.tool)), whole = kept.length === batch.calls.length;
 				return kept.length ? [{ id: `self-speculation:${startInput.turnID}:${batch.id}`, source: "self-speculation", revision: 0,
 					actions: kept.map((call) => ({ id: call.id, type: "tool_call" as const, tool: call.tool, input: widenReadGuess(call.tool, call.input),
-						feedback: whole ? { batchCalls: kept.map(({ id }) => id) } : undefined })) }] : [];
+						reuseFeedback: pending?.reuseFeedback, feedback: whole ? { batchCalls: kept.map(({ id }) => id) } : undefined })) }] : [];
 			});
 		},
 	};
 
-	startTurn(turnID: string): void {
+	startTurn(turnID: string, reuseFeedback?: unknown): void {
 		this.closeTurn(turnID);
 		let resolve!: (batches: readonly ActorForkActionBatch[]) => void;
 		const promise = new Promise<readonly ActorForkActionBatch[]>((settle) => { resolve = settle; });
 		this.pending.set(turnID, {
+			reuseFeedback,
 			promise,
 			resolve,
 			controller: new AbortController(),

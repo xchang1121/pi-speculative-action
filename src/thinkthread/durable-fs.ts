@@ -204,7 +204,7 @@ export class DurableFsExecutor {
 
 	private async close(requestID: RequestId): Promise<void> {
 		try {
-			await TimelineInterval.overhead(() => this.client.fs.requestClose({ requestId: requestID }));
+			await TimelineInterval.outside(() => this.client.fs.requestClose({ requestId: requestID }));
 			this.pendingCloses.delete(requestID);
 		} catch (error) {
 			if (error instanceof RejectedError && error.response.error.code === "RequestNotFound") {

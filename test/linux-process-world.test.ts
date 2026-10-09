@@ -108,7 +108,7 @@ describe("Linux process ExecutionWorld", () => {
 				executor: { execute: async () => { throw new Error("enclosing tool must not run"); } },
 				metrics: () => ({ ...emptyWorldReuseMetrics(), executionMs: 90 }),
 				seal: async () => { clock += 30; return []; }, close: async () => { clock += 5; },
-				validate: async () => ({ status: "valid", metrics: { durationMs: 0, bytesRead: 0, filesRead: 0, mode: "exact" } }) };
+				validate: async () => ({ status: "valid", metrics: { bytesRead: 0, filesRead: 0, mode: "exact" } }) };
 		});
 		vi.spyOn(sandbox, "fork").mockImplementation(async input => {
 			clock += 10;
@@ -2220,9 +2220,7 @@ int main(void) { int fds[2], status; char queue[8]; if (pipe(fds) || fds[0] != 3
 			}, close } as unknown as LinuxHeldExecBoundary;
 		});
 		const planner = vi.spyOn(fixture.backend.planner, "plan");
-		const observed = vi.spyOn(SpeculationScheduler.prototype, "observeActorService");
-		const admission = vi.spyOn(SpeculationScheduler.prototype, "assessCandidateJoin").mockReturnValue({ allowed: false, reason: "fallback_faster", waitBudgetMs: 0,
-			speculativeSamples: 1, actorSamples: 1, adoptionSamples: 1, expectedRemainingMs: 0, expectedAdoptionMs: 100, expectedActorMs: 10, expectedNetBenefitMs: -90 });
+		const admission = vi.spyOn(SpeculationScheduler.prototype, "assessCandidateJoin");
 		const processInvocation = resolvePiToolInvocation("bash", { command: ":" }, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath })!.process!;
 		const invocation = vi.fn(() => processInvocation);
 		const coordinator = new ProcessExecutionCoordinator(host, {
@@ -2241,7 +2239,7 @@ int main(void) { int fds[2], status; char queue[8]; if (pipe(fds) || fds[0] != 3
 		try {
 			await fixture.backend.observeBindings({ sessionID: "session", turnID: "turn" }, invoke, bindings => { expect(bindings).toEqual([]); }, false);
 			expect(host.execute).toHaveBeenCalledOnce();
-			expect(invocation).not.toHaveBeenCalled(); expect(opening).not.toHaveBeenCalled(); expect(observed).not.toHaveBeenCalled();
+			expect(invocation).not.toHaveBeenCalled(); expect(opening).not.toHaveBeenCalled();
 			expect(coordinator.actorDiagnostics().state).toBe("degraded");
 			await mkdir(path.join(fixture.storeRoot, "certificates", "00"), { recursive: true });
 			calls = Promise.all([invoke(), invoke()]);
@@ -2254,7 +2252,7 @@ int main(void) { int fds[2], status; char queue[8]; if (pipe(fds) || fds[0] != 3
 			release(); await Promise.all([calls, refreshing]);
 			expect(held.execute).toHaveBeenCalledTimes(2); expect(invocation).toHaveBeenCalledTimes(2);
 			expect(planner).not.toHaveBeenCalled(); expect(admission).not.toHaveBeenCalled();
-			expect(observed).not.toHaveBeenCalled(); expect(opening).toHaveBeenCalledTimes(2); expect(close).toHaveBeenCalledOnce();
+			expect(opening).toHaveBeenCalledTimes(2); expect(close).toHaveBeenCalledOnce();
 			expect(coordinator.actorDiagnostics().state).toBe("ready");
 			await invoke(); // Clearing evidence is rechecked even after the helper was initialized.
 			expect(host.execute).toHaveBeenCalledTimes(3); expect(invocation).toHaveBeenCalledTimes(2);
@@ -2331,7 +2329,7 @@ int main(void) { int fds[2], status; char queue[8]; if (pipe(fds) || fds[0] != 3
 		} finally {
 			release(); gates.forEach(gate => gate.resolve()); captureGate.release();
 			await Promise.allSettled([calls, refreshing, ...producers]);
-			await coordinator.dispose(); opening.mockRestore(); admission.mockRestore(); observed.mockRestore();
+			await coordinator.dispose(); opening.mockRestore(); admission.mockRestore();
 			await fixture.dispose();
 		}
 	});
@@ -2718,7 +2716,7 @@ int main(void) { int fds[2], status; char queue[8]; if (pipe(fds) || fds[0] != 3
 			ownership, executeBinding: async () => { throw new Error("unexpected process binding"); }, executionBindings: () => [binding], computationDependencies: () => [],
 			executor: { execute: async (request) => { payload = `opaque bytes: ${workspace.sandboxRoot}`; request.onData(Buffer.from(payload)); return { exitCode: exit }; } },
 			metrics: emptyWorldReuseMetrics, seal: async () => [], close: () => close(workspace.sandboxRoot),
-			validate: async () => ({ status: "valid", metrics: { durationMs: 0, bytesRead: 0, filesRead: 0, mode: "exact" } }),
+			validate: async () => ({ status: "valid", metrics: { bytesRead: 0, filesRead: 0, mode: "exact" } }),
 		}));
 		try {
 			expect(await world.speculation.diagnostics?.({ cwd: root })).toMatchObject({ state: "registered" });
