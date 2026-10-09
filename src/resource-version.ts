@@ -22,7 +22,8 @@ export type ResourceObservation = ResourceDependency & { readonly fingerprint: s
 
 /** Supplied bytes and poststates remain proposals until exact adoption validation. */
 export type ResourceInput = Uint8Array | { readonly content: Uint8Array; readonly computation: TimelineInterval } |
-	{ readonly names?: readonly string[] } | null;
+	{ readonly names?: readonly string[]; readonly computation?: TimelineInterval } |
+	{ readonly type: "file" | "directory"; readonly computation?: TimelineInterval } | null;
 
 const inputContent = (input: ResourceInput | undefined) => input instanceof Uint8Array ? input : input && "content" in input ? input.content : undefined;
 
@@ -587,7 +588,7 @@ export class ResourceVersionManager {
 		if (providedInputs && retainBytes === undefined) throw new Error("resource_snapshot_budget_invalid");
 		return this.captureToken(dependencies, retainBytes, providedInputs && new Map([...providedInputs]
 			.map(([target, input]) => [filesystemPathKey(path.resolve(this.root, target)), input && !(input instanceof Uint8Array)
-				? "content" in input ? { ...input } : { names: input.names && [...input.names] } : input])));
+				? "names" in input ? { ...input, names: input.names && [...input.names] } : { ...input } : input])));
 	}
 
 	/** Notification cursor for preparation; empty observations cannot validate or seal any resource. */
@@ -781,7 +782,7 @@ export function resourceDependencies(action: ActionKey, root: string, actionSema
 export async function captureResourceVersion(action: ActionKey | undefined, root: string,
 	actionSemantics: ActionSemanticsRegistry = PI_ACTION_SEMANTICS, retainBytes?: number, providedInputs?: ReadonlyMap<string, ResourceInput>) {
 	const dependencies = providedInputs ? [...providedInputs].map(([path, input]): ResourceDependency => ({ path,
-		scope: input && !(input instanceof Uint8Array) && !("content" in input) ? input.names ? "names" : "type" : "content" }))
+		scope: input && !(input instanceof Uint8Array) && !("content" in input) ? "names" in input && input.names ? "names" : "type" : "content" }))
 		: action ? resourceDependencies(action, root, actionSemantics) : undefined;
 	if (dependencies?.length === 0 || (!dependencies && retainBytes === undefined)) throw new Error("resource_dependencies_unproven");
 	return resourceManager(root).capture(dependencies, retainBytes, providedInputs);
@@ -977,7 +978,7 @@ async function fingerprintDependencies(
 		const { info, link } = captured;
 		const supplied = providedInputs?.get(filesystemPathKey(target));
 		const suppliedContent = inputContent(supplied);
-		if (providedInputs && !(suppliedContent ? info.isFile() : supplied && info.isDirectory()))
+		if (providedInputs && !(suppliedContent ? info.isFile() : supplied && ("type" in supplied ? specialFileType(info) === supplied.type : info.isDirectory())))
 			throw new Error(suppliedContent ? "resource_input_not_regular" : "resource_input_type_changed");
 		const realTarget = info.isSymbolicLink()
 			? path.join(parentReal ?? await fingerprintIO(() => fs.realpath(path.dirname(target))), path.basename(target))
@@ -1013,7 +1014,8 @@ async function fingerprintDependencies(
 			};
 		}
 		if (["stat", "type", "entry"].includes(scope) || (scope === "entries" && !descend) || (["names", "entries", "tree_entries"].includes(scope) && !info.isDirectory())) {
-			view?.capture(target, { type: info.isDirectory() ? "directory" : info.isFile() ? "file" : "special", realPath: realTarget, dependency, computation: captured.computation,
+			view?.capture(target, { type: info.isDirectory() ? "directory" : info.isFile() ? "file" : "special", realPath: realTarget, dependency,
+				computation: supplied && "computation" in supplied ? supplied.computation : captured.computation,
 				...(scope === "stat" && info.isFile() ? { size: Number(info.size) } : {}) });
 			return stableEntry(target, info, identity, scope, parentReal !== undefined);
 		}
@@ -1055,7 +1057,8 @@ async function fingerprintDependencies(
 		}
 		if (!info.isDirectory() || scope === "content") throw new Error(`unsupported_resource_type:${specialFileType(info)}:${target}`);
 		if (supplied && "names" in supplied && supplied.names) {
-			view?.capture(target, { type: "directory", entries: supplied.names, realPath: realTarget, dependency, ...directoryObjectSlot(supplied.names, view) });
+			view?.capture(target, { type: "directory", entries: supplied.names, realPath: realTarget, dependency, computation: supplied.computation,
+				...directoryObjectSlot(supplied.names, view) });
 			return { ...fingerprintDirectory(info, realTarget, supplied.names), bytesRead: 0, filesRead: 0 };
 		}
 		const enumerationStarted = performance.now(), entries = await fingerprintIO(() => fs.readdir(target, { withFileTypes: true }));
