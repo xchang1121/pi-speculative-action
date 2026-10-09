@@ -1041,6 +1041,54 @@ int main(int argc, char **argv) {
 		} finally { publication?.close(); restorePreparation?.(); publishing.mockRestore(); errors.mockRestore(); await host?.dispose(); await fixture.dispose(); }
 	});
 
+	test.for(["temporary", "persistent", "descendant", "merged", "stale"])("seals output pipe status before reusing a child (%s)", { timeout: 30_000 }, async (mode, { skip }) => {
+		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
+		const fixture = await createLinuxProcessBenchmark("pi-output-status-", "git", { cheapChildMs: 0 });
+		try {
+			await writeFile(path.join(fixture.workspace, "input.txt"), "before\n");
+			await writeFile(path.join(fixture.workspace, "worker.c"), `#include <fcntl.h>
+#include <unistd.h>
+int main(void) {
+	for (volatile unsigned long i = 0; i < 20000000ul; ++i) {}
+	int fd = dup(${mode === "merged" ? 2 : 1}), flags = fcntl(fd, F_GETFL);
+	if (fd < 0 || flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK)) return 71;
+	${mode === "descendant" ? 'int child = fork(); if (child < 0) return 72; if (child) return 0;' : ""}
+	${mode !== "persistent" ? 'if (fcntl(fd, F_SETFL, flags)) return 73;' : ""}
+	char bytes[32]; int input = open("input.txt", O_RDONLY); if (input < 0) return 74;
+	int length = read(input, bytes, sizeof(bytes)); return length < 0 || write(fd, bytes, length) != length;
+}`);
+			await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker" });
+			await commitBenchmarkFixture(fixture.workspace, "output status");
+			await prepareLinuxProcessReuse(fixture);
+			const scope = { sessionID: "output-status", turnID: "learned" }, later = { ...scope, turnID: "prepared" };
+			const route = await fixture.prepareActorReplay(), command = `worker${mode === "merged" ? " 2>&1" : ""} | cat`;
+			const execute = async (turnID: string) => {
+				let output = "";
+				expect(await route.executor.execute({ command, cwd: fixture.workspace, environment: fixture.environment,
+					scope: { ...scope, turnID }, onData: data => { output += data.toString(); } })).toEqual({ exitCode: 0 });
+				return output;
+			};
+			let binding: ProcessExecutionBinding | undefined;
+			const handoffs = Reflect.get(fixture.backend, "handoffs") as ProcessHandoffRegistry<{ executable?: string }>;
+			expect(await fixture.backend.observeBindings(scope, () => execute(scope.turnID), bindings => {
+				binding = bindings.find(candidate => path.basename(handoffs.resolveBinding(candidate, scope)?.executable ?? "") === "worker");
+			}, true)).toBe("before\n");
+			expect(binding).toBeDefined();
+			const invocation = resolvePiToolInvocation("bash", { command }, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath })!.process!;
+			await fixture.workspaceSandbox.withWorkspace(fixture.workspace, async workspace => {
+				const session = await fixture.backend.open({ sourceRoot: fixture.workspace, workspace, invocation, scope: later });
+				try {
+					await session.executeBinding(binding!); await session.seal([]);
+					if (mode === "stale") await writeFile(path.join(fixture.workspace, "input.txt"), "after\n");
+					expect(await session.validate(), JSON.stringify(session.metrics())).toMatchObject({ status: mode === "persistent" ? "indeterminate" : mode === "stale" ? "stale" : "valid" });
+					if (mode === "persistent") expect(session.metrics().lastError).toContain("output pipe status changed");
+					expect(await execute(later.turnID)).toBe(mode === "stale" ? "after\n" : "before\n");
+					expect(fixture.backend.actorMetrics().hits, JSON.stringify({ actor: fixture.backend.actorMetrics(), producer: session.metrics() })).toBe(Number(!["persistent", "stale"].includes(mode)));
+				} finally { await session.close(); }
+			});
+		} finally { await fixture.dispose(); }
+	});
+
 	test.for((["git", "overlayfs"] as const).flatMap(driver => ["read", "write", "locks", "locks-close", "locks-named", "path-write", "unlinked", "hardlink-read", "hardlink-write", "hardlink-path-write", "hardlink-rename", "hardlink-split", "hardlink-unlink", "hardlink-detached"].map(mode => [driver, mode] as const)))("learns and adopts regular OFDs with shared positions and predecessor inputs (%s, %s)", { timeout: 30_000 }, async ([driver, mode], { skip }) => {
 		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
 		if (mode === "locks-named" && await filesystem.readlink("/proc/self/ns/pid") === "pid:[4026531836]") return skip("nested PID namespace visibility case");
@@ -1538,6 +1586,12 @@ static int split_exec(void *argument) {
 }
 static void *blocked_open(void *file) { int fd = open(file, O_RDONLY); if (fd < 0) _exit(79); close(fd); return 0; }
 int main(int argc, char **argv) {
+	if (argc >= 3 && !strncmp(argv[1], "external-", 9)) {
+		int pair[2];
+		if ((!strcmp(argv[1], "external-socket") ? socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) : pipe2(pair, O_CLOEXEC)) ||
+			write(pair[1], "abc", 3) != 3 || close(pair[1]) || dup2(pair[0], 0) < 0 || close(pair[0])) return 99;
+		execv(argv[2], argv + 2); return 100;
+	}
 	if (argc != 3) return 70;
 	if (!strncmp(argv[1], "rights", 6) || !strcmp(argv[1], "pidfd")) {
 		int sockets[2], status, copying = !strcmp(argv[1], "pidfd"); char byte = 'x';
@@ -1642,6 +1696,24 @@ int main(int argc, char **argv) {
 }
 `);
 			await compileBenchmarkHelper(root, { source: `${descriptorProbe}.c`, output: "descriptor-probe", arguments: ["-pthread", "-Werror"] });
+			for (const type of ["pipe", "socket"] as const) for (const descriptors of [true, "inspect"] as const) {
+				await writeFile(external, `#!/bin/sh\nexec '${descriptorProbe}' external-${type} '${binary}' "$@"\n`, { mode: 0o700 });
+				const snapshots: NonNullable<HeldExecProcess["descriptors"]>[] = [], failures: unknown[] = [], commit = vi.fn(async () => {});
+				const executor = held({ descriptors: () => descriptors, decide: async process => {
+					try {
+						const captured = process.descriptors!; snapshots.push(captured);
+						await inspectHeldExecProcess(process.pid, await filesystem.readlink(`/proc/${process.pid}/exe`), captured);
+						const input = captured.find(({ fd }) => fd === 0)!;
+						return { kind: "replay", exitCode: 0, output: [], commit, descriptorOffsets: [{ ...input, before: 0, after: 1, content: Buffer.from("abc") }] };
+					} catch (error) { failures.push(error); return { kind: "continue" }; }
+				} }, adaptProcessToolOperations(createLocalBashOperations({ shellPath: external })));
+				expect(await executor.execute('/bin/true; IFS= read -r -N 3 value; printf "%s" "$value"')).toEqual({ exitCode: 0 });
+				expect(failures, `${type}:${descriptors}`).toEqual([]);
+				expect(snapshots).toHaveLength(1);
+				expect(snapshots[0]).toMatchObject([{ fd: 0, type, owned: false, queueHex: "616263" }]);
+				expect(commit).not.toHaveBeenCalled(); expect(executor.output).toBe("abc");
+			}
+			await writeFile(external, `#!/bin/sh\nexec 9<'${input}'\nexec '${binary}' "$@"\n`, { mode: 0o700 });
 			for (const mode of ["lock", "export", "rights", "rights-batch", "rights-failed", "rights-unowned", "rights-orphan", "rights-pipe-orphan", "pidfd", "table", "thread", "thread-exec", "shared-table", "shared-exec", "overlap",
 				"unshare", "unshare-noop", "range-close", "range-cloexec", "range-invalid"]) {
 				let snapshot: HeldExecProcess["descriptors"];
@@ -2781,18 +2853,27 @@ test("preserves native metadata across stat families and rejects volatile or cha
 		await writeFile(path.join(bin, "pid.c"), '#include <stdio.h>\n#include <unistd.h>\nint main(void) { printf("%ld\\n", (long)getpid()); return 0; }\n');
 		await compileBenchmarkHelper(bin, { source: "pid.c", output: "cat" });
 		await writeFile(path.join(fixture.workspace, "README"), "metadata fixture\n");
+		await mkdir(path.join(fixture.workspace, "many"));
+		for (let index = 0; index < 300; index++) await mkdir(path.join(fixture.workspace, "many", `d${index}`));
+		await writeFile(path.join(fixture.workspace, "many", "file"), "regular\n");
+		await filesystem.symlink("d0", path.join(fixture.workspace, "many", "alias"));
 		await writeFile(path.join(fixture.workspace, "metadata.c"), String.raw`#define _GNU_SOURCE
+#include <dirent.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <unistd.h>
-static void emit(struct stat *s) { printf("%llu %llu %lld %o\n", (unsigned long long)s->st_dev, (unsigned long long)s->st_ino, (long long)s->st_size, s->st_mode); }
+static void emit(struct stat *s) { printf("%llu %llu %lld %o %llu\n", (unsigned long long)s->st_dev, (unsigned long long)s->st_ino, (long long)s->st_size, s->st_mode, (unsigned long long)s->st_nlink); }
 int main(int argc, char **argv) {
 	const char *name = argc > 1 ? argv[1] : "README";
 	struct stat s; struct statx x; int fd = open(name, O_RDONLY);
 	if (fd < 0) { perror("open"); return 1; }
+	if (argc > 2 && !strcmp(argv[2], "enumerate")) { DIR *dir = opendir(name); if (!dir) return 7; while (readdir(dir)) {} if (closedir(dir)) return 8; }
+	char held[64];
+	if (argc > 2 && !strcmp(argv[2], "proc")) { snprintf(held, sizeof(held), "/proc/self/fd/%d", fd); name = held; }
 	if (stat(name, &s)) { perror("stat"); return 1; } emit(&s);
 	if (lstat(name, &s)) return 2; emit(&s);
 	if (syscall(SYS_newfstatat, AT_FDCWD, name, &s, AT_EMPTY_PATH)) return 3; emit(&s);
@@ -2800,7 +2881,7 @@ int main(int argc, char **argv) {
 	if (syscall(SYS_fstat, fd, &s)) return 5; emit(&s);
 	for (int mode = 0; mode < 3; mode++) {
 		if (statx(mode == 1 ? fd : AT_FDCWD, mode == 1 ? "" : name, mode == 1 ? AT_EMPTY_PATH : mode == 2 ? AT_SYMLINK_NOFOLLOW : 0, STATX_BASIC_STATS, &x)) return 6;
-		printf("%llu %llu %lld %o\n", (unsigned long long)makedev(x.stx_dev_major, x.stx_dev_minor), (unsigned long long)x.stx_ino, (long long)x.stx_size, x.stx_mode);
+		printf("%llu %llu %lld %o %u\n", (unsigned long long)makedev(x.stx_dev_major, x.stx_dev_minor), (unsigned long long)x.stx_ino, (long long)x.stx_size, x.stx_mode, x.stx_nlink);
 	}
 	return close(fd);
 }
@@ -2815,6 +2896,30 @@ int main(int argc, char **argv) {
 		const produce = (command: string) => forkReusableBash(fixture, { command, label: "metadata", executionFingerprint, actionNamespace: "metadata",
 			executionScope: { sessionID: "metadata", turnID: String(turn++) } });
 		const native = (command: string) => execFileSync("/bin/bash", ["-c", command], { cwd: fixture.workspace, env: { ...fixture.environment }, encoding: "utf8" });
+		for (const mutation of ["", "mkdir many/new", "rmdir many/d0"] as const) {
+			const command = `${mutation ? `${mutation}; ` : ""}./metadata many enumerate`, candidate = await produce(command);
+			try {
+				expect(candidate.output.isError, textOutput(candidate.output.result)).toBe(false);
+				expect(textOutput(candidate.output.result)).toBe(native(command));
+				if (!mutation) {
+					expect(await candidate.validate?.()).toMatchObject({ status: "valid" });
+					await mkdir(path.join(fixture.workspace, "many", "changed"));
+					expect((await candidate.validate?.())?.status).toBe("stale");
+					await rm(path.join(fixture.workspace, "many", "changed"), { recursive: true });
+				}
+			} finally { await candidate.dispose(); }
+			if (mutation.startsWith("mkdir")) await rm(path.join(fixture.workspace, "many", "new"), { recursive: true });
+			if (mutation.startsWith("rmdir")) await mkdir(path.join(fixture.workspace, "many", "d0"));
+		}
+		for (const file of ["README", "many"]) {
+			const command = `./metadata ${file} proc`, candidate = await produce(command);
+			try {
+				// The proc link itself names the caller's descriptor; compare followed metadata only.
+				expect(candidate.output.isError, textOutput(candidate.output.result)).toBe(false);
+				const followed = (text: string) => text.trimEnd().split("\n").filter((_, index) => index !== 1 && index !== 7);
+				expect(followed(textOutput(candidate.output.result))).toEqual(followed(native(command)));
+			} finally { await candidate.dispose(); }
+		}
 		const rootMetadata = await produce("./metadata .");
 		try {
 			expect(rootMetadata.output.isError).toBe(false);

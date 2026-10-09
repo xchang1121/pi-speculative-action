@@ -408,6 +408,10 @@ describe("strace provenance decoder", () => {
 	});
 
 	test("classifies effects from syscall arguments and results, never embedded strings", async () => {
+		for (const pipe of ["pipe:[7]", "pipe:[8]"]) {
+			const captured = await observe({ 100: [EXEC, 'fcntl(1<pipe:[7]>, F_SETFL, O_WRONLY|O_NONBLOCK) = 0'] }, { unchangedOutputPipes: [pipe] });
+			expect(captured.taints.includes("unsupported_syscall")).toBe(pipe !== "pipe:[7]");
+		}
 		for (const operand of ["3</work/input>", "9</work/input>", "3</work/other>", "3<pipe:[7]>", "9<pipe:[7]>", "3<pipe:[8]>", "3", "3</work/input (deleted)>"]) {
 			const line = `fcntl(${operand}, F_GETFL) = 0x8000 (flags O_RDONLY|O_LARGEFILE)`;
 			expect((await observe({ 100: [EXEC, line] })).taints).toContain("unsupported_syscall");

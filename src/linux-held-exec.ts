@@ -395,6 +395,7 @@ export class LinuxHeldExecBoundary {
 						![position.capacity ?? 0, position.event ?? 0, ...Object.values(position.socket ?? {})].every(value => Number.isSafeInteger(value) && value >= 0) || (position.event ?? 0) > 0x80000000 ||
 						![position.before, position.after].every(isOFDPosition) ||
 						![position.fd, position.flags, position.afterFlags].every(value => Number.isSafeInteger(value) && value >= 0) ||
+						((position.flags ^ position.afterFlags) & ~0xc00) !== 0 ||
 						position.fd > 0x7fffffff || position.flags > 0x7fffffff || position.afterFlags > 0x7fffffff || ![position.device, position.inode].every(value =>
 							typeof value === "string" && /^(0|[1-9][0-9]{0,19})$/.test(value) && BigInt(value) <= 0xffffffffffffffffn);
 				}) || resourceEvents.length > 1024 || resourceEvents.some(event => !descriptors.has(event.fd) ||

@@ -80,6 +80,8 @@ export interface StraceObservationOptions {
 	readonly inheritedStreams?: readonly string[];
 	/** The capture sockets serving the traced command's output (`socket:[inode]`): naming them reveals no outside peer. */
 	readonly outputEndpoints?: readonly string[];
+	/** Private relay pipes whose retained writer OFDs proved unchanged status after all descendants exited. */
+	readonly unchangedOutputPipes?: readonly string[];
 	readonly inheritedHandles?: readonly { readonly fd: number; readonly installed?: false; readonly description?: number; readonly inode: string; readonly flags: number; readonly outside: number; readonly queuedBytes?: number; readonly queueData?: Buffer; readonly packet?: boolean; readonly messages?: readonly import("./linux-held-exec.ts").QueueMessage[] }[];
 }
 
@@ -682,6 +684,7 @@ export async function observeStrace(
 					!(command === "F_GETFL" && (own.has(Number.parseInt(line.args[0] ?? "", 10)) || /^[012]</.test(line.args[0] ?? ""))) && !((command === "F_GETFL" || command === "F_SETFL" && syscallSucceeded(line) &&
 						(line.args[2] ?? "").split("|").every(flag => /^(?:O_(?:RDONLY|WRONLY|RDWR|APPEND|NONBLOCK|NDELAY|LARGEFILE|DIRECTORY|DSYNC|SYNC|NOFOLLOW)|0)$/.test(flag))) &&
 						(options.inheritedFileImages?.includes(absoluteDescriptorPath(line.args[0]) ?? /^\d+<(pipe:\[\d+\])>$/.exec(line.args[0] ?? "")?.[1] ?? "") || stream || output ||
+							options.unchangedOutputPipes?.includes(/^\d+<(pipe:\[\d+\])>$/.exec(line.args[0] ?? "")?.[1] ?? "") ||
 							own.has(Number.parseInt(line.args[0] ?? "", 10)) || ownPipes.has(endpoint ?? ""))))
 					unsupported(syscall);
 			}
