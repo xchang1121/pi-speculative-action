@@ -162,13 +162,14 @@ describe("Linux process ExecutionWorld", () => {
 			const command = mode === "one-shot" ? "exec ./one-shot" : `exec /bin/sh -c '${script}'`;
 			const expectedOutput = mode === "one-shot" ? expect.stringMatching(/^prepared:\d+\n$/) : "prepared\n";
 			const handoffs = Reflect.get(fixture.backend, "handoffs") as ProcessHandoffRegistry<{ readonly args: readonly string[]; readonly executable: string }>;
-			let binding: ProcessExecutionBinding | undefined, output = "";
+			let binding: ProcessExecutionBinding | undefined, childBinding: ProcessExecutionBinding | undefined, output = "";
 			const observe = () => fixture.backend.observeBindings(scope, () => route.executor.execute({ command, cwd: fixture.workspace,
 				environment: fixture.environment, scope, onData: data => { output += data.toString(); } }), bindings => {
 				binding = bindings.find(candidate => {
 					const invocation = handoffs.resolveBinding(candidate, scope);
 					return mode === "one-shot" ? invocation?.executable.endsWith("/one-shot") : invocation?.args.includes(script);
 				}) ?? binding;
+				childBinding = bindings.find(candidate => handoffs.resolveBinding(candidate, scope)?.args.includes("./unusable-child.sh")) ?? childBinding;
 			}, true);
 			await observe();
 			expect(output).toEqual(expectedOutput);
@@ -195,13 +196,25 @@ describe("Linux process ExecutionWorld", () => {
 					expect(fixture.backend.metrics().requests - before).toBe(2);
 					expect(publishing.mock.calls.map(([certificate]) => certificate.dependencyCertificate.taints))
 						.toEqual([expect.arrayContaining(["unsupported_syscall"]), expect.arrayContaining(["unsupported_syscall"])]);
+					expect(childBinding).toBeDefined();
+					expect(childBinding!.available).toBe(false); // Its own sealed failure was already paid for inside the parent.
 				}
 				await writeFile(path.join(fixture.workspace, "input.txt"), "arbitrary edit\n");
 				output = ""; await observe(); // Ordinary Actor execution remains enabled; observation cannot restore rejected proof.
 				expect(output).toBe("prepared\n"); expect(binding!.available).toBe(false);
+				if (childBinding) expect(childBinding.available).toBe(false);
 				const requests = fixture.backend.metrics().requests;
 				await expect(prepare()).rejects.toThrow("binding is unavailable");
 				expect(fixture.backend.metrics().requests).toBe(requests);
+				if (mode === "unusable-descendant") {
+					let changed: ProcessExecutionBinding | undefined;
+					await fixture.backend.observeBindings(scope, () => route.executor.execute({ command: "exec /bin/bash ./unusable-child.sh new-context",
+						cwd: fixture.workspace, environment: fixture.environment, scope, onData: () => {} }), bindings => {
+						changed = bindings.find(candidate => handoffs.resolveBinding(candidate, scope)?.args.includes("new-context"));
+					}, true);
+					expect(changed).toMatchObject({ available: true });
+					expect(changed!.key).not.toBe(childBinding!.key);
+				}
 			} else {
 				await prepare();
 				expect(binding!.available).toBe(true);
