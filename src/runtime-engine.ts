@@ -52,6 +52,7 @@ import type {
 import { cause } from "./settlement.ts";
 import { runSourceRequest, SourceGeneration } from "./source-request.ts";
 import { TaskTimeline, TimelineInterval, type ComputationReuseShare } from "./task-timing.ts";
+import type { ExecutionResourceSnapshot } from "./system-resources.ts";
 
 class CandidateFailure extends Error {
 	readonly failure: ResolutionCause;
@@ -327,6 +328,8 @@ interface CandidateRecord<Output, StartInput = unknown, StateData = unknown> {
 	resultViews?: Map<string, RetainedResultView<Output>>;
 	previews?: Set<ActorPreviewRecord>;
 	onOperationAdopted?: (adoption: ExecutionOperationAdoption) => void;
+	operationJoinable?: () => boolean;
+	operationConsumers?: Set<object>;
 	/** The Actor adopted the whole of it, not only its operations. */
 	onAdopted?: (timing: ActorHitTiming) => void;
 	acceptOperationScope?: (scope: ExecutionScope, salvage?: boolean) => boolean;
@@ -490,6 +493,56 @@ export function makeSpeculativeActionRuntime<
 	const sessionStates = new Map<SessionID, Session>();
 	let masterEnabled: boolean | undefined;
 	const masterDisabled = () => masterEnabled === false;
+	type Preparation = {
+		readonly session: Session; readonly node: PlanRuntimeNode; readonly context: PlanActionContext<StartInput, StateData>;
+		readonly units: number; readonly run: () => Promise<void>; readonly complete: () => void;
+		active: boolean;
+	};
+	const preparations = new Map<PlanActionContext<StartInput, StateData>, Preparation>();
+	let resourceSnapshot: ExecutionResourceSnapshot | undefined = adapter.resources && {
+		cpuCount: positiveCount(adapter.resources.initial.cpuCount),
+		...(adapter.resources.initial.idleCpuCount === undefined ? {} : { idleCpuCount: finiteMetric(adapter.resources.initial.idleCpuCount) }),
+	};
+	let resourceAdmissionCapacity = resourceSnapshot ? Math.min(resourceSnapshot.cpuCount, Math.round(resourceSnapshot.idleCpuCount ?? 1)) : Infinity;
+	let resourceTimer: ReturnType<typeof setTimeout> | undefined, samplingResources = false;
+	const resourceUsage = (ignoreDraining = false) => {
+		let actor = 0, execution = 0, preparation = 0;
+		for (const session of sessionStates.values()) {
+			for (const units of session.actorResources.values()) actor += units;
+			for (const { job, work } of session.scheduler.snapshot())
+				if (!ignoreDraining || !draining(job)) execution += work.resourceUnits;
+		}
+		for (const entry of preparations.values()) if (entry.active && (!ignoreDraining || !entry.context.admissionSignal.aborted)) preparation += entry.units;
+		return { actor, execution, preparation };
+	};
+	const needsResourceSamples = () => [...sessionStates.values()].some(session => !session.lifecycle.sealed &&
+		(session.turns.size > 0 || session.scheduler.snapshot().length > 0 || candidateStore.pending(session.id).length > 0)) || preparations.size > 0;
+	const scheduleResourceSample = (delay = 250): void => {
+		if (!adapter.resources || resourceTimer || samplingResources || !needsResourceSamples()) return;
+		resourceTimer = setTimeout(() => {
+			resourceTimer = undefined;
+			if (!needsResourceSamples()) return;
+			samplingResources = true;
+			void Promise.resolve().then(() => adapter.resources!.sample()).then(sample => {
+				if (!needsResourceSamples()) return;
+				if (!Number.isFinite(sample.cpuCount) || sample.cpuCount < 1 ||
+					sample.idleCpuCount !== undefined && (!Number.isFinite(sample.idleCpuCount) || sample.idleCpuCount < 0)) return;
+				resourceSnapshot = { cpuCount: positiveCount(sample.cpuCount),
+					...(sample.idleCpuCount === undefined ? {} : { idleCpuCount: Math.min(sample.cpuCount, sample.idleCpuCount) }) };
+				const usage = resourceUsage(), allocated = usage.actor + usage.execution + usage.preparation;
+				// The sample already includes our running work. Count it once and spend only the measured idle remainder.
+				resourceAdmissionCapacity = Math.min(resourceSnapshot.cpuCount,
+					allocated + Math.round(resourceSnapshot.idleCpuCount ?? Number(allocated === 0)));
+				for (const session of sessionStates.values()) { preemptForActor(session); dispatchReady(session); }
+			}).catch(() => { /* Unavailable telemetry retains the last bounded budget; it cannot fail the Actor. */ })
+				.finally(() => { samplingResources = false; scheduleResourceSample(); });
+		}, delay);
+		resourceTimer.unref?.();
+	};
+	const wakeResourceWaiters = (): void => {
+		for (const session of sessionStates.values()) dispatchReady(session);
+		scheduleResourceSample();
+	};
 
 	const sessionFor = (sessionID: SessionID, settings: SpeculativeActionSettings): Session => {
 		const current = sessionStates.get(sessionID);
@@ -653,6 +706,7 @@ export function makeSpeculativeActionRuntime<
 				lifecycle: "active",
 			};
 			session.turns.set(input.turnID, state);
+			scheduleResourceSample(0);
 			await reconcileStores(state);
 			try {
 				await adapter.onTurnStarted?.({
@@ -931,26 +985,60 @@ export function makeSpeculativeActionRuntime<
 				}),
 			);
 		}
-		const admission = await executionRouteFor({
-			...turnContext(context),
-			candidate: context.draft,
-			tool: predictedAction.tool,
-			action: predictedAction,
-			concrete: executionInput,
-			callID: `spec_${session.candidateSequence + 1}`,
-			index: session.candidateSequence,
-			signal: context.admissionSignal,
-		});
-		if (!admission.ok) {
-			if (admission.cause.stage !== "execution" || admission.cause.code !== "isolation_unavailable") {
-				failUnlaunchable(session, node, admission.cause);
+		await prepareWithinResources(session, node, context, async () => {
+			const admission = await executionRouteFor({
+				...turnContext(context),
+				candidate: context.draft,
+				tool: predictedAction.tool,
+				action: predictedAction,
+				concrete: executionInput,
+				callID: `spec_${session.candidateSequence + 1}`,
+				index: session.candidateSequence,
+				signal: context.admissionSignal,
+			});
+			if (!admission.ok) {
+				if (admission.cause.stage !== "execution" || admission.cause.code !== "isolation_unavailable") {
+					failUnlaunchable(session, node, admission.cause);
+					return;
+				}
+				session.plan.finishPreparation(node.identity, admission.cause);
 				return;
 			}
-			session.plan.finishPreparation(node.identity, admission.cause);
-			return;
+			context.executionRoute = admission.route;
+			session.plan.finishPreparation(node.identity);
+		});
+	};
+
+	const prepareWithinResources = (session: Session, node: PlanRuntimeNode, context: PlanActionContext<StartInput, StateData>, run: () => Promise<void>): Promise<void> => {
+		if (!adapter.resources) return run();
+		if (context.admissionSignal.aborted) return Promise.resolve();
+		return new Promise(resolve => {
+			const complete = () => {
+				context.admissionSignal.removeEventListener("abort", aborted);
+				preparations.delete(context); resolve(); wakeResourceWaiters();
+			};
+			const aborted = () => {
+				if (entry.active) return; // Physical preparation keeps its units until its callback returns.
+				failUnlaunchable(session, node, cause("source", "generation_expired")); complete();
+			};
+			const entry: Preparation = { session, node, context,
+				units: positiveCount(node.action.resourceDemand ?? defaultResourceDemand(session, node.actionKey ?? node.action.tool)), run, complete, active: false };
+			preparations.set(context, entry);
+			context.admissionSignal.addEventListener("abort", aborted, { once: true });
+			startQueuedCandidates(session); scheduleResourceSample(0);
+		});
+	};
+
+	const startQueuedPreparations = (session: Session): void => {
+		for (const entry of preparations.values()) {
+			if (entry.session !== session || entry.active || entry.context.admissionSignal.aborted || session.lifecycle.sealed) continue;
+			const executing = session.scheduler.snapshot().reduce((sum, entry) => sum + entry.work.resourceUnits, 0);
+			if (entry.units + executing > speculativeCapacity(session)) continue;
+			entry.active = true;
+			void session.lifecycle.track(Promise.resolve().then(entry.run).catch(error => {
+				failUnlaunchable(session, entry.node, cause("admission", "preparation_failed", errorDetail(error)));
+			}).finally(entry.complete));
 		}
-		context.executionRoute = admission.route;
-		session.plan.finishPreparation(node.identity);
 	};
 
 	const releaseActionContext = (session: Session, id: string, keepContinuation = false): void => {
@@ -1061,7 +1149,8 @@ export function makeSpeculativeActionRuntime<
 	const startQueuedCandidates = (session: Session, preferred?: Candidate): void => {
 		if (session.lifecycle.sealed) return;
 		if (preferred) return launchCandidateBatch(session, preferred);
-		if (session.pendingLaunch || !candidateStore.pending(session.id).some((candidate) => candidate.work.execution.status === "queued")) return;
+		if (session.pendingLaunch || !candidateStore.pending(session.id).some((candidate) => candidate.work.execution.status === "queued") &&
+			![...preparations.values()].some(entry => entry.session === session && !entry.active)) return;
 		session.pendingLaunch = session.lifecycle.track(new Promise<void>(setImmediate).then(() => {
 			session.pendingLaunch = undefined;
 			if (!session.lifecycle.sealed && !masterDisabled()) launchCandidateBatch(session);
@@ -1127,6 +1216,8 @@ export function makeSpeculativeActionRuntime<
 			queueCandidateEvent(session, candidate);
 			void session.lifecycle.track(executeCandidate(session, candidate, startedAt));
 		}
+		startQueuedPreparations(session);
+		scheduleResourceSample();
 	};
 
 	/** Retained handoff policies must not retain a retired candidate's branch or its inputs. */
@@ -1192,6 +1283,7 @@ export function makeSpeculativeActionRuntime<
 				signal: candidate.work.controller.signal,
 				inputs: inputs?.lookup,
 				onOperationAdopted: candidate.onOperationAdopted,
+				onOperationJoinable: available => { candidate.operationJoinable = available; },
 				acceptOperationScope: candidate.acceptOperationScope,
 				...(parent ? { parentWorld: candidateBranch(parent)! } : {}),
 			}));
@@ -1255,7 +1347,9 @@ export function makeSpeculativeActionRuntime<
 				const feedback = { reuseFeedback: draft.reuseFeedback, status: execution.status, executionMs: execution.executionMs };
 				session.effects.enqueue(() => source.onExecutionSettled?.(feedback));
 			}
-			clearTimeout(candidate.salvaging); inputs?.dispose(); session.scheduler.complete(candidate); dispatchReady(session);
+			candidate.operationJoinable = undefined;
+			candidate.operationConsumers = undefined;
+			clearTimeout(candidate.salvaging); inputs?.dispose(); session.scheduler.complete(candidate); wakeResourceWaiters();
 		}
 	};
 
@@ -1821,7 +1915,7 @@ export function makeSpeculativeActionRuntime<
 		operations?: readonly ExecutionOperationBinding[],
 		operationLearning?: boolean,
 	): Promise<void> => {
-		if (state.session.actorResources.delete(actorAction)) state.session.effects.enqueue(() => dispatchReady(state.session));
+		if (state.session.actorResources.delete(actorAction)) state.session.effects.enqueue(wakeResourceWaiters);
 		if (!state.actorActions.delete(actorAction)) return;
 		const settlementStartedAt = performance.now();
 		const capture = actorAction.takeCapture();
@@ -2271,29 +2365,65 @@ export function makeSpeculativeActionRuntime<
 		const definition = semantics.definition(action);
 		const heavy = (route && route.isolation !== "resource_snapshot") || !definition || definition.effect === "unbounded" ||
 			definition.resourceScope === "tree_entries" || definition.resourceScope === "tree_content" || definition.resourceScope === "captured_inputs";
-		return Math.min(concurrentLimit(session.settings), heavy ? 2 : 1);
+		return Math.min(concurrentLimit(session.settings), resourceSnapshot?.cpuCount ?? Infinity, heavy ? 2 : 1);
 	};
 
-	const speculativeCapacity = (session: Session): number => {
+	const speculativeCapacity = (session: Session, preempting = false): number => {
 		let reserved = 0;
 		for (const demand of session.actorResources.values()) reserved += demand;
-		return Math.max(0, concurrentLimit(session.settings) - reserved);
+		if (!resourceSnapshot) return Math.max(0, concurrentLimit(session.settings) - reserved);
+		let globalReserved = reserved, ownPreparation = 0;
+		for (const other of sessionStates.values()) if (other !== session) {
+			for (const units of other.actorResources.values()) globalReserved += units;
+			for (const { job, work } of other.scheduler.snapshot()) if (!preempting || !draining(job)) globalReserved += work.resourceUnits;
+		}
+		for (const entry of preparations.values()) if (entry.active && (!preempting || !entry.context.admissionSignal.aborted)) {
+			globalReserved += entry.units;
+			if (entry.session === session) ownPreparation += entry.units;
+		}
+		return Math.max(0, Math.min(concurrentLimit(session.settings) - reserved - ownPreparation,
+			(preempting ? resourceSnapshot.cpuCount : resourceAdmissionCapacity) - globalReserved));
 	};
 
 	const preemptForActor = (session: Session, protectedCandidates: readonly Candidate[] = []): void => {
 		for (const turn of session.turns.values()) for (const action of turn.actorActions)
 			if (action.state.status === "awaiting_fallback") session.actorResources.set(action, defaultResourceDemand(session, action.actionKey ?? action.tool));
-		for (const candidate of session.scheduler.preemptFor(
+		if (resourceSnapshot) for (const entry of preparations.values()) {
+			const usage = resourceUsage(true);
+			if (usage.actor + usage.execution + usage.preparation <= resourceSnapshot.cpuCount) break;
+			if (!entry.active || entry.context.admissionSignal.aborted) continue;
+			const failure = cause("admission", "preempted_by_actor");
+			entry.context.admissionController.abort(failure);
+			failUnlaunchable(entry.session, entry.node, failure);
+		}
+		for (const owner of resourceSnapshot ? sessionStates.values() : [session]) for (const candidate of owner.scheduler.preemptFor(
 			protectedCandidates.length ? Math.max(...protectedCandidates.map(candidate => defaultResourceDemand(session, candidate.key, candidate.route))) : 0,
-			speculativeCapacity(session),
-			(candidate) => candidate.work.execution.status === "running" && !protectedCandidates.includes(candidate) && reservationAvailable(candidate.work.reservation) &&
-				// An imminent internal computation can serve this Actor inside its native fallback; its OS join happens later.
-				!((candidate.owner.draft.type === "operation" || candidate.owner.draft.producesOperations) && session.plan.consumers(candidate.id)
-					.some(node => node.expectedDecisionSeq <= session.decisionSequence && node.latestDecisionSeq >= session.decisionSequence)),
+			speculativeCapacity(owner, true),
+			(candidate) => {
+				if (candidate.work.execution.status !== "running" || protectedCandidates.includes(candidate) || !reservationAvailable(candidate.work.reservation)) return false;
+				for (const consumer of candidate.operationConsumers ?? []) {
+					if (owner.actorResources.has(consumer)) return false;
+					candidate.operationConsumers!.delete(consumer);
+				}
+				const imminent = (candidate.owner.draft.type === "operation" || candidate.owner.draft.producesOperations) && owner.plan.consumers(candidate.id)
+					.some(node => node.expectedDecisionSeq <= owner.decisionSequence && node.latestDecisionSeq >= owner.decisionSequence);
+				if (!imminent) return true;
+				if (!resourceSnapshot) return false;
+				// A forecast alone cannot reserve CPUs. Preserve a live native acquisition path for the current tool;
+				// its backend still checks the actual child, timing budget, input freshness and one-shot commit authority.
+				try {
+					if (candidate.operationJoinable?.()) for (const turn of owner.turns.values()) for (const action of turn.actorActions)
+						if (action.state.status === "awaiting_fallback" && action.tool === candidate.key.tool)
+							(candidate.operationConsumers ??= new Set()).add(action);
+					// Publication can finish before the native consumer validates and commits; keep that Actor's handoff window open.
+					if (candidate.operationConsumers?.size) return false;
+				} catch { /* No scheduling exemption. */ }
+				return true;
+			},
 			draining,
 		)) {
-			discardCandidate(session, candidate, cause("admission", "preempted_by_actor"));
-			session.plan.rearmExecution(candidate.id);
+			discardCandidate(owner, candidate, cause("admission", "preempted_by_actor"));
+			owner.plan.rearmExecution(candidate.id);
 		}
 	};
 
@@ -2510,6 +2640,7 @@ export function makeSpeculativeActionRuntime<
 			await session.effects.close();
 			await session.events.close({ drain: false });
 			sessionStates.delete(sessionID);
+			if (!needsResourceSamples()) { clearTimeout(resourceTimer); resourceTimer = undefined; }
 		});
 	};
 
@@ -2520,7 +2651,11 @@ export function makeSpeculativeActionRuntime<
 		const candidates = sessionID === undefined ? candidateStore.allValues() : candidateStore.values(sessionID);
 		const planNodes = selectedSessions.flatMap((session) => session.plan.values());
 		const telemetry = selectedSessions.map((session) => session.events.snapshot());
+		const usage = resourceUsage();
 		return {
+			...(resourceSnapshot ? { resources: { ...resourceSnapshot, admissionCapacity: resourceAdmissionCapacity,
+				actorUnits: usage.actor, preparationUnits: usage.preparation, executionUnits: usage.execution,
+				queuedPreparations: [...preparations.values()].filter(entry => !entry.active).length } } : {}),
 			activeTurns: selectedSessions.reduce((total, session) => total + session.turns.size, 0),
 			exclusiveCandidates: candidates.filter((candidate) => candidate.work.reservation.kind === "exclusive").length,
 			sharedCandidates: candidates.filter((candidate) => candidate.work.reservation.kind === "shared").length,

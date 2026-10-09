@@ -218,6 +218,8 @@ export interface SpeculativeActionRuntimeAdapter<
 	StateData,
 > {
 	readonly actionSemantics?: ActionSemanticsRegistry;
+	/** Optional host resource observations; absent for deterministic runtimes without host telemetry. */
+	readonly resources?: import("./system-resources.ts").ExecutionResourceMonitor;
 	readonly sources?: readonly SpeculativePlanSource<SessionID, Output, StartInput, ConsumeInput, StateData>[];
 	readonly settings: () => MaybePromise<SpeculativeActionSettings>;
 	readonly definitions: (input: StartInput) => readonly DrafterToolDefinition[];
@@ -251,6 +253,8 @@ export interface SpeculativeActionRuntimeAdapter<
 		/** Sealed input owners leased until execution settles; the backend must retain any derived proof. */
 		readonly inputs?: (path: string) => Iterable<object>;
 		readonly onOperationAdopted?: (adoption: ExecutionOperationAdoption) => void;
+		/** Scheduling hint for a backend's bounded running-operation join; it grants no reuse authority. */
+		readonly onOperationJoinable?: (available: () => boolean) => void;
 		readonly acceptOperationScope?: (scope: ExecutionScope, salvage?: boolean) => boolean;
 	}) => MaybePromise<WorldBranch<Output>>;
 	readonly projectionRules?: readonly ActionProjectionRule<Output>[];
@@ -279,6 +283,15 @@ export interface SpeculativeActionRuntimeAdapter<
 }
 
 export interface SpeculativeRuntimeInspection {
+	readonly resources?: {
+		readonly cpuCount: number;
+		readonly idleCpuCount?: number;
+		readonly admissionCapacity: number;
+		readonly actorUnits: number;
+		readonly preparationUnits: number;
+		readonly executionUnits: number;
+		readonly queuedPreparations: number;
+	};
 	readonly activeTurns: number;
 	readonly exclusiveCandidates: number;
 	readonly sharedCandidates: number;

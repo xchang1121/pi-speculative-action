@@ -497,6 +497,7 @@ export class LinuxProcessReuseBackend {
 		readonly scope?: ExecutionScope;
 		readonly signal?: AbortSignal;
 		readonly onOperationAdopted?: (adoption: ExecutionOperationAdoption) => void;
+		readonly onOperationJoinable?: (available: () => boolean) => void;
 		readonly acceptOperationScope?: (scope: ExecutionScope, salvage?: boolean) => boolean;
 	}): Promise<LinuxProcessSession> {
 		return this.withProducer(() => this.createSession(input));
@@ -552,6 +553,7 @@ export class LinuxProcessReuseBackend {
 			incompleteReasons: new Set<string>(), bypasses: [], writers: new Set(), nestedOutputEndpoints: new Set(),
 			metrics: { ...emptyWorldReuseMetrics() },
 		};
+		input.onOperationJoinable?.(() => !session.signal.aborted && this.handoffs.hasJoinableWork(session.ownership));
 		this.producers++;
 		let dispatch: Promise<void> | undefined;
 		const execute = <Value>(kind: NonNullable<typeof executionKind>, operation: () => Promise<Value>): Promise<Value> => {

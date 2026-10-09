@@ -26,6 +26,8 @@ export interface SpeculativeToolExecutionContext {
 	readonly inputs?: (path: string) => Iterable<object>;
 	readonly executionScope?: ExecutionScope;
 	readonly onOperationAdopted?: (adoption: ExecutionOperationAdoption) => void;
+	/** Live acquisition capability used only to avoid cancelling work the current Actor can join. */
+	readonly onOperationJoinable?: (available: () => boolean) => void;
 	readonly acceptOperationScope?: (scope: ExecutionScope, salvage?: boolean) => boolean;
 	/** Optional immutable parent state for source-neutral multi-step execution. */
 	readonly parentCheckpoint?: WorldCheckpoint;

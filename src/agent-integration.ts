@@ -33,6 +33,7 @@ import { booleanOr, positiveInteger } from "./setting-input.ts";
 import { immutableSnapshot, isImmutableSnapshot } from "./stable-json.ts";
 import type { ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
 import { ToolExecutionGateway, type ToolOperation } from "./tool-execution-gateway.ts";
+import { createSystemResourceMonitor, type ExecutionResourceMonitor } from "./system-resources.ts";
 
 const ACTOR_OPERATION = Symbol("actor-operation");
 const RAW_ACTOR_CALL = Symbol("raw-actor-call");
@@ -72,6 +73,8 @@ export interface SpeculativeAgentPreflightContext extends Pick<SpeculativeToolEx
 export type { DraftOptionsContext } from "./agent-runtime-types.ts";
 
 export interface CreateSpeculativeActionHostOptions extends Omit<Parameters<typeof createDrafterPlanSource>[0], "sessionID"> {
+	/** Override host observations for embedding or deterministic tests. */
+	readonly resources?: ExecutionResourceMonitor;
 	/** Canonical K(a), projection, and resource-version semantics for this host. */
 	readonly actionSemantics?: ActionSemanticsRegistry;
 	/** Workspace root used for action canonicalization and resource validation. */
@@ -248,17 +251,15 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 		AgentStateData
 	>({
 		actionSemantics,
+		resources: options.resources ?? createSystemResourceMonitor(),
 		sources: [patternPlans.source, drafterPlans.source, ...(options.actorForkPlanSource ? [options.actorForkPlanSource.source] : [])],
 		settings: resolveSettings,
 		definitions: (input) =>
 			input.tools.map((tool) => ({ name: tool.name, description: tool.description, inputSchema: tool.parameters })),
 		stateData: (input) => ({
 			tools: new Map(input.tools.map((tool) => [tool.name, tool])),
-			prepareExecution: (names, signal) => {
-				if (signal.aborted) return;
-				void Promise.all(names.filter((name) => input.tools.some((tool) => tool.name === name))
-					.map((tool) => resolveExecutionRoute(tool, signal))).catch(() => {});
-			},
+			// Concrete candidates prepare their routes inside the runtime's resource budget.
+			// Warming every possible tool here would bypass that budget before a proposal exists.
 			schemaHashes: definitionSchemaHashes(input.tools.map((tool) => ({ name: tool.name, inputSchema: tool.parameters }))),
 		}),
 		actionKey: async (toolName, input, context) => {
@@ -308,7 +309,7 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 		},
 		authorizeCandidate: ({ stateData, tool: toolName, concrete, action, route, signal }) =>
 			checkPermission(stateData.tools.get(toolName), { toolName, args: concrete, action, route, signal: signal ?? new AbortController().signal }, true),
-		executeCandidate: async ({ startInput, data, tool: toolName, concrete, action, route, callID, signal, parentWorld, inputs, onOperationAdopted, acceptOperationScope }) => {
+		executeCandidate: async ({ startInput, data, tool: toolName, concrete, action, route, callID, signal, parentWorld, inputs, onOperationAdopted, onOperationJoinable, acceptOperationScope }) => {
 			const tool = data.tools.get(toolName);
 			if (!tool) throw new Error(`Tool ${toolName} not found`);
 			const args = structuredClone(concrete);
@@ -319,6 +320,7 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 					cwd: options.cwd, tool, toolName, args, action, callID, signal,
 					inputs,
 					onOperationAdopted,
+					onOperationJoinable,
 					acceptOperationScope,
 					executionScope: { sessionID: startInput.sessionID, turnID: startInput.turnID },
 					...(parentWorld?.checkpoint ? { parentCheckpoint: parentWorld.checkpoint } : {}),
