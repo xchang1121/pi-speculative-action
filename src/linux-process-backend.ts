@@ -35,7 +35,7 @@ import { emptyWorldReuseMetrics, snapshotExecutionScope, type ExecutionScope, ty
 	type WorldReuseMetrics } from "./execution-world.ts";
 import { type ProcessReusePlan, ProcessReusePlanner } from "./reuse-planner.ts";
 import { ProvenanceCertificateStore, type ProvenanceStoreOptions, type VerifiedArtifactClosure } from "./reuse-store.ts";
-import { SpeculationScheduler, type ServiceTimingIdentity, waitForCandidate } from "./scheduler.ts";
+import { candidateJoinBudget, waitForCandidate } from "./scheduler.ts";
 import { observeStrace, straceCommand, traceTail, type ObservedProcessPath, type StraceObservation, type TraceTail, type TracedWrite, writesWithin } from "./strace-observer.ts";
 import type { WorkspaceTransactionOwnership } from "./workspace-transaction.ts";
 import type { ToolProcessInvocation } from "./tool-settlement.ts";
@@ -50,7 +50,7 @@ const OBSERVER_FINGERPRINT = digestObject(["linux-process-backend", "strace-obse
 	.map(name => sha256Digest(readFileSync(new URL(`./${name}.${import.meta.url.endsWith(".ts") ? "ts" : "js"}`, import.meta.url)))));
 const POLICY_ID = "sandlock-virtual-root-transparent-exec-creation-mode";
 const LEAF_POLICY_ID = "sandlock-virtual-workspace-leaf-creation-mode";
-const MAX_REQUEST_BYTES = 4 * 1024 * 1024, LEARNED_LAUNCHES = 64, MAX_INTERPOSED_MOUNT_BYTES = 512 * 1024, CHEAP_CHILD_MS = 500;
+const MAX_REQUEST_BYTES = 4 * 1024 * 1024, LEARNED_LAUNCHES = 64, MAX_INTERPOSED_MOUNT_BYTES = 512 * 1024;
 const MAX_CONTINUATION_BYTES = 65 * 1024 * 1024;
 const IO_FRONTIERS = new Map([[0, "read"], [1, "write"], [19, "readv"], [20, "writev"], [44, "sendto"], [45, "recvfrom"], [46, "sendmsg"], [47, "recvmsg"]]);
 const MAX_CAPTURE_BYTES = 512 * 1024 * 1024;
@@ -67,8 +67,6 @@ export interface LinuxProcessBackendOptions {
 	readonly heldExecBinary?: string;
 	/** Additional host paths that speculative processes must never read. */
 	readonly deniedPaths?: readonly string[];
-	/** Child cost threshold: recent cheap runs and unknown pipeline writers can resume in place (0 disables cost-based bypass). */
-	readonly cheapChildMs?: number;
 }
 
 export interface CompletedProcessReplayOptions {
@@ -280,9 +278,6 @@ export class LinuxProcessReuseBackend {
 	private disposed = false;
 	private readonly handoffs: ProcessHandoffRegistry<BoundProcessInvocation | { readonly trackingOnly: true; readonly sourceRoot: string }>;
 	private readonly actorExecutableDirectories = new Set<string>();
-	private readonly processScheduler = new SpeculationScheduler<object>();
-	/** Recent traced run times of nested children by executable, the longest kept: a cheap child never repays its own sandbox. */
-	private readonly childRunMs = new BoundedRecencyMap<string, readonly number[]>(512);
 	/** Executable entries of a PATH directory, by the directory's identity and the exclusions (see createProcessInterposition). */
 	private readonly executableEntries = new BoundedRecencyMap<string, readonly (readonly [name: string, file: string])[]>(64);
 	private sharedInterposition?: SharedInterposition;
@@ -507,7 +502,7 @@ export class LinuxProcessReuseBackend {
 		const nestedProducer = speculativeProducerProof(ready, deniedPaths, LEAF_POLICY_ID);
 		const controller = new AbortController();
 		let executionKind: "tool" | "operation" | undefined;
-		const server = net.createServer({ allowHalfOpen: true }, (socket) => this.serve(session, socket, executionKind === "tool"));
+		const server = net.createServer({ allowHalfOpen: true }, (socket) => this.serve(session, socket));
 		const gitDirectory = await lstat(path.join(sourceRoot, ".git")).then((info) => info.isDirectory() ? path.join(sourceRoot, ".git") : undefined, () => undefined);
 		const session: ActiveSession = {
 			token,
@@ -814,13 +809,13 @@ export class LinuxProcessReuseBackend {
 		if (await this.planner.publishCompleted(certificate, SAME_CONFINEMENT_TAINTS)) this.add(session, "wholeCommandPublished");
 	}
 
-	private serve(session: ActiveSession, socket: net.Socket, wholeTool: boolean): void {
+	private serve(session: ActiveSession, socket: net.Socket): void {
 		let body = "";
 		socket.setEncoding("utf8");
 		socket.on("data", (chunk) => { body += chunk; if (Buffer.byteLength(body) > MAX_REQUEST_BYTES) socket.destroy(new Error("request too large")); });
 		socket.once("error", () => undefined);
 		socket.once("end", () => {
-			void session.lifecycle.track(Promise.resolve().then(() => this.handleWireRequest(session, body, wholeTool)).then((response) => { socket.end(wireResponse(response)); })
+			void session.lifecycle.track(Promise.resolve().then(() => this.handleWireRequest(session, body)).then((response) => { socket.end(wireResponse(response)); })
 				.catch((error) => {
 					this.setError(session, errorMessage(error));
 					session.incompleteReasons.add(`broker:${errorMessage(error)}`);
@@ -829,7 +824,7 @@ export class LinuxProcessReuseBackend {
 		});
 	}
 
-	private async handleWireRequest(session: ActiveSession, body: string, wholeTool: boolean): Promise<DispatcherResponse> {
+	private async handleWireRequest(session: ActiveSession, body: string): Promise<DispatcherResponse> {
 		const received = parseDispatcherRequest(body);
 		if (!received || received.token !== session.token || session.lifecycle.sealed) throw new Error("invalid dispatcher request");
 		session.signal?.throwIfAborted();
@@ -840,20 +835,7 @@ export class LinuxProcessReuseBackend {
 		const ready = await this.resolveReady();
 		const executable = await this.resolveRequestedExecutable(session, request);
 		const resources = request.descriptors && await this.inheritedPipes(request).catch((error: unknown) => `inherited_pipes:${errorMessage(error)}`);
-		let eligibility = typeof resources === "string" ? { reason: resources } : await eligibleRequest(session, request, ready.executionContext);
-		if (wholeTool && (this.options.cheapChildMs ?? CHEAP_CHILD_MS) > 0 && request.pid !== undefined && !("reason" in eligibility) && eligibility.outputPipes?.some(Boolean)) {
-			const logicalExecutable = session.projection.toLogical(executable);
-			const known = () => this.handoffs.mayHaveExecutable(logicalExecutable) ||
-				this.childRunMs.get(logicalExecutable)?.some(duration => duration >= (this.options.cheapChildMs ?? CHEAP_CHILD_MS)) ||
-				session.scope && this.handoffs.bindings(session.scope).some(binding => {
-					const bound = this.handoffs.resolveBinding(binding, session.scope);
-					return bound && !("trackingOnly" in bound) && bound.sourceRoot === session.sourceRoot && bound.executable === logicalExecutable;
-				});
-			// A cold pipeline stays in the enclosing trace with its original OFDs; useful children still justify a separate capture.
-			const cold = !known() && !await this.store.mayHaveCertificates(logicalExecutable) && !known();
-			session.signal.throwIfAborted();
-			if (cold) eligibility = { reason: "cold_piped_child" };
-		}
+		const eligibility = typeof resources === "string" ? { reason: resources } : await eligibleRequest(session, request, ready.executionContext);
 		if ("reason" in eligibility) {
 			this.add(session, "bypasses");
 			const reason = `broker_bypass:${request.name}:${eligibility.reason}`;
@@ -885,7 +867,6 @@ export class LinuxProcessReuseBackend {
 		const cwd = session.projection.toPhysical(invocation.cwd), executable = session.projection.toPhysical(invocation.executable);
 		if (!cwd || !executable) throw new Error("bound process paths are unmapped");
 		const request = { ...invocation, cwd };
-		const prototypeStartedAt = performance.now();
 		const captured = await TimelineInterval.outside(() => TimelineInterval.measure(async () => {
 			const prototype = await this.prototype(session, request, executable, invocation.outputRoute);
 			if (processWeakKey(prototype) !== binding.key) throw new Error("bound process execution context changed");
@@ -914,11 +895,8 @@ export class LinuxProcessReuseBackend {
 						this.handoffs.retirePreparation(candidate);
 				}
 			}
-			else this.handoffs.settlePreparation(binding, false, performance.now() - prototypeStartedAt);
 			throw new Error(`bound process preparation produced no reusable result${session.metrics.lastError ? `: ${session.metrics.lastError.slice(0, 4096)}` : ""}`);
 		}
-		if (session.preparedResults > resultsBefore || result.kind === "suspended" || result.kind === "hit" || result.reusable === true)
-			this.handoffs.settlePreparation(binding, true);
 		// Only it and what it launched ran here: when its own transaction could not seal (what it launched overlapped it), the session's
 		// endpoints stand for its interval, and what it observed joins its launches' evidence.
 		if (result.kind !== "suspended") session.topLevelCapture ??= { before, after: await session.workspace.structure.capture(), observation };
@@ -959,12 +937,6 @@ export class LinuxProcessReuseBackend {
 			if (!acquired.work) throw new Error("process work reservation failed");
 			this.add(session, "misses");
 			try {
-				// Without a result to reuse, a child whose recent runs were all cheap resumes in place within its parent's trace.
-				if (inPlace !== undefined && Math.max(...this.childRunMs.get(prototype.executablePath) ?? [Infinity]) < (this.options.cheapChildMs ?? CHEAP_CHILD_MS)) {
-					this.add(session, "bypasses");
-					session.bypasses.push([inPlace, `broker_bypass:${path.posix.basename(prototype.executablePath)}:cheap_child`]);
-					return { kind: "bypass", executable };
-				}
 				recordPrototypePreparation(session, preparation, inPlace);
 				return await this.executeAndPublish(session, request, executable, prototype, weakKey, outputRoute, acquired.work, requestID, captureWorkspace, inPlace, preparation);
 			} finally {
@@ -980,7 +952,7 @@ export class LinuxProcessReuseBackend {
 		lookup: ProcessHandoffLookup<ReadyProcessPlan>,
 		signal: AbortSignal | undefined,
 		scope: ExecutionScope | undefined,
-		participant: { readonly timing: ServiceTimingIdentity } | { readonly ownership: ProcessHandoffOwnership; readonly executablePath: string },
+		participant: { readonly actor: true } | { readonly ownership: ProcessHandoffOwnership; readonly executablePath: string },
 	): Promise<{ readonly plan?: ReadyProcessPlan; readonly work?: ProcessHandoff; readonly producer?: ProcessHandoff; readonly continuation?: ProcessContinuation;
 		readonly waiting?: readonly TimelineInterval[]; readonly joined: boolean }> {
 		const waits: { readonly handoff: ProcessHandoff; readonly interval: TimelineInterval }[] = [];
@@ -988,20 +960,15 @@ export class LinuxProcessReuseBackend {
 			key: weakKey,
 			scope,
 			lookup,
-			...("timing" in participant ? {
+			...("actor" in participant ? {
 				role: "actor" as const,
 				waitForRunning: async (running: ProcessHandoff) => {
 					if (!running.ownership.acceptsScope(running.scope, scope)) return "miss";
-					const admission = this.processScheduler.assessCandidateJoin({
-						identity: participant.timing, state: "running",
-						elapsedMs: Math.max(0, performance.now() - running.startedAt),
-					});
-					if (!admission.allowed) return "miss";
 					if (await running.inputsChanged?.()) return "rejected";
 					const waitStarted = performance.now();
 					const waiting = new AbortController(), stop = signal ? AbortSignal.any([signal, waiting.signal]) : waiting.signal;
 					const completion = running.suspend ? running.suspend(stop).then(() => running.completion) : running.completion;
-					const finished = await waitForCandidate(completion, signal, admission.waitBudgetMs).finally(() => waiting.abort());
+					const finished = await waitForCandidate(completion, signal, candidateJoinBudget("running")).finally(() => waiting.abort());
 					const interval = new TimelineInterval(waitStarted, performance.now());
 					waits.push({ handoff: running, interval });
 					if (finished.status === "completed") return "completed";
@@ -1122,10 +1089,10 @@ export class LinuxProcessReuseBackend {
 			}
 			const digest = (await TimelineInterval.collect(() => hashExecutableFile(`/proc/${process.pid}/exe`))).output;
 			const prototype = bufferedProcessPrototype(snapshot, projection, digest, await this.resolvePlatformFingerprint());
-			const weakKey = processWeakKey(prototype), timing = processTimingIdentity(prototype, weakKey);
+			const weakKey = processWeakKey(prototype);
 			const accepted = (producer: ProcessProducerProof) => actorReplayProducer(producer, sensitivePaths(this.options.storeRoot, this.options.deniedPaths));
 			const acquired = await this.acquireProcessResult(weakKey,
-				(live, excluded) => this.plan(weakKey, executablePath, projection, accepted, undefined, live, excluded, true), process.signal, scope, { timing });
+				(live, excluded) => this.plan(weakKey, executablePath, projection, accepted, undefined, live, excluded, true), process.signal, scope, { actor: true });
 			const { plan, continuation } = acquired;
 			if (!plan || (plan.certificate.result.continuation ? !continuation || sha256Digest(continuation.image) !== plan.certificate.result.continuation.imageDigest :
 				plan.certificate.result.exit.kind !== "code")) {
@@ -1354,7 +1321,6 @@ export class LinuxProcessReuseBackend {
 			// Replays write each event to the target's own descriptor, whichever outlet this route gave it.
 			outcome = { ...outcome, output: outcome.output.map(event => ({ ...event, fd: outputRoute[0] === event.fd ? 1 : 2 })) };
 			const observedProcessMs = continuation ? continuation.computation.completedAt - continuation.computation.startedAt : Math.max(0, performance.now() - processStarted);
-			if (!continuation) this.childRunMs.set(prototype.executablePath, [observedProcessMs, ...this.childRunMs.get(prototype.executablePath) ?? []].slice(0, 8));
 			releaseInputs();
 			try {
 				if (suspensionAttempted && !continuation) throw new Error("private process suspension was not sealed");
@@ -1544,7 +1510,6 @@ export class LinuxProcessReuseBackend {
 			await inputCheck;
 			const durationMs = Math.max(0, performance.now() - started);
 			this.add(session, "executionMs", durationMs);
-			if (outcome) this.processScheduler.observeSpeculativeService(processTimingIdentity(prototype, weakKey), durationMs);
 			if (!transactionFinishing) await transaction.abort().catch(() => undefined);
 			if (writer) {
 				writer.writes ??= await writer.tail!.read().then(tail => tail.writes, () => [{ at: writer!.startedAt, opened: true }]);
@@ -1980,20 +1945,6 @@ function reusedComputation(certificate: ProcessProvenanceCertificate,
 	const computation = acquired?.producer?.computation ?? TimelineInterval.restore(certificate.result.computation) ??
 		TimelineInterval.unknownReuse(`${certificate.id}:${certificate.createdAt}`);
 	return { computation, shared: acquired?.waiting, reused: true };
-}
-
-function processTimingIdentity(prototype: ExecPrototype, weakKey: Sha256Digest): ServiceTimingIdentity {
-	return {
-		tool: "process",
-		executionFingerprint: digestObject({
-			executable: prototype.executableDigest,
-			// Different arguments can select a cheap probe or expensive work in the same image.
-			argv: prototype.argvDigest,
-			context: prototype.processContextDigest,
-			platform: prototype.platformFingerprint,
-		}),
-		actionKeyHash: weakKey,
-	};
 }
 
 async function sealSessionEvidence(session: ActiveSession, changes: readonly SandboxWorkspaceChange[]): Promise<readonly SandboxWorkspaceChange[]> {

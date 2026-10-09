@@ -1,6 +1,7 @@
 import { nonNegativeCount as sequence, nonNegativeFinite as finiteMetric } from "./number-utils.ts";
 import { isDeepStrictEqual } from "node:util";
 import { immutableSnapshot, isImmutableSnapshot } from "./stable-json.ts";
+import { RESOURCE_DIMENSIONS } from "./system-resources.ts";
 import type { ActionKey, ActionKeyMatch } from "./action-semantics.ts";
 import type { CandidateExecution } from "./candidate-execution.ts";
 import type { MaterializedPlan, PlanAction, PlanActionDependency, PlanActionDependencyCondition, PlanUpdate } from "./plan-proposal.ts";
@@ -37,7 +38,8 @@ export interface PlanRuntimeNode {
 	readonly earliestDecisionSeq: number;
 	readonly expectedDecisionSeq: number;
 	readonly latestDecisionSeq: number;
-	readonly criticalPathMs: number;
+	readonly criticalPathSteps: number;
+	readonly dependenciesReady: boolean;
 	readonly execution: PlanNodeExecution;
 	readonly readiness: PlanNodeReadiness;
 	readonly prediction: PredictionIdentity;
@@ -129,7 +131,7 @@ type MutableNodeExecution =
 	| { readonly status: "attached"; readonly candidateID: string; readonly owner: PlanExecutionOwner; };
 
 type PlanNodeFields = Pick<PlanRuntimeNode, "identity" | "action" | "actionKey" | "anchorDecisionSeq" |
-	"earliestDecisionSeq" | "expectedDecisionSeq" | "latestDecisionSeq" | "criticalPathMs">;
+	"earliestDecisionSeq" | "expectedDecisionSeq" | "latestDecisionSeq" | "criticalPathSteps">;
 
 type MutableNode = { -readonly [Key in keyof PlanNodeFields]: PlanNodeFields[Key] } & {
 	validDependencies: boolean;
@@ -306,47 +308,6 @@ export class PlanRuntime {
 
 	values(): readonly PlanRuntimeNode[] { return this.select(); }
 
-	/** The unfinished execution frontier that can unlock each pending descendant, without multiplying shared DAG paths. */
-	workflowFrontiers(eligible: (node: PlanRuntimeNode) => boolean): readonly {
-		readonly node: PlanRuntimeNode; readonly prerequisites: readonly PlanRuntimeNode[];
-	}[] {
-		const rows: { node: PlanRuntimeNode; prerequisites: readonly PlanRuntimeNode[] }[] = [];
-		const frontiers = new Map<MutableNode, ReadonlySet<MutableNode>>(), snapshots = new Map<MutableNode, PlanRuntimeNode>();
-		const graphs = new Set([...this.plans.values()].map(plan => plan.graph));
-		for (const graph of graphs) for (const node of graph.ordered) {
-			const plan = this.plans.get(node.identity.proposalID)!;
-			const snapshot = this.snapshot(plan, node), execution = snapshot.execution;
-			snapshots.set(node, snapshot);
-			if (snapshot.predictionState.status !== "pending" || executionSettled(execution) ||
-				execution.status === "execution_blocked" || !eligible(snapshot) || !node.validDependencies) continue;
-			const frontier = new Set<MutableNode>();
-			let unresolved = false, possible = true;
-			for (const dependency of node.action.dependsOn ?? []) {
-				const parent = this.parent(plan.id, dependency);
-				const state = parent ? dependencyReadiness(parent, dependency.condition) : "blocked";
-				if (state === "blocked") { possible = false; break; }
-				if (state === "ready") continue;
-				unresolved = true;
-				const inherited = parent && frontiers.get(parent);
-				// A completed prerequisite waiting for Actor adoption has no remaining execution to prioritize.
-				if (!inherited?.size) { possible = false; break; }
-				for (const prerequisite of inherited) frontier.add(prerequisite);
-			}
-			if (!possible) continue;
-			if (!unresolved) frontier.add(node);
-			frontiers.set(node, frontier);
-			if (!unresolved) continue;
-			const physical = new Map<string, PlanRuntimeNode>();
-			for (const prerequisite of frontier) {
-				const value = snapshots.get(prerequisite)!;
-				const key = "candidateID" in value.execution ? `candidate:${value.execution.candidateID}` : `node:${value.identity.id}`;
-				if (!physical.has(key)) physical.set(key, value);
-			}
-			rows.push({ node: snapshot, prerequisites: Object.freeze([...physical.values()]) });
-		}
-		return Object.freeze(rows.map(row => Object.freeze(row)));
-	}
-
 	pending(): readonly PlanRuntimeNode[] { return this.select((node) => node.opportunity.state.status === "pending"); }
 
 	matchable(decisionSequence: number): readonly PlanRuntimeNode[] {
@@ -484,7 +445,8 @@ export class PlanRuntime {
 			earliestDecisionSeq: node.earliestDecisionSeq,
 			expectedDecisionSeq: node.expectedDecisionSeq,
 			latestDecisionSeq: node.latestDecisionSeq,
-			criticalPathMs: node.criticalPathMs,
+			criticalPathSteps: node.criticalPathSteps,
+			dependenciesReady: this.dependencyReadiness(plan, node) === "ready",
 			execution: executionProjection(node.execution),
 			readiness,
 			prediction: node.opportunity.identity,
@@ -522,7 +484,7 @@ export class PlanRuntime {
 			node.earliestDecisionSeq = matched ?? node.anchorDecisionSeq + 1;
 			node.expectedDecisionSeq = matched ?? node.anchorDecisionSeq + horizon(node.action) + 1;
 			node.latestDecisionSeq = matched ?? node.anchorDecisionSeq + latestHorizon(node.action) + 1;
-			node.criticalPathMs = 0;
+			node.criticalPathSteps = 0;
 			node.validDependencies = true;
 			for (const dependency of node.action.dependsOn ?? []) {
 				const parent = this.parent(node.identity.proposalID, dependency);
@@ -536,10 +498,10 @@ export class PlanRuntime {
 		}
 		for (let index = graph.ordered.length - 1; index >= 0; index--) {
 			const node = graph.ordered[index]!;
-			node.criticalPathMs += Math.max(1, finiteMetric(node.action.expectedDurationMs));
+			node.criticalPathSteps += 1;
 			for (const dependency of node.action.dependsOn ?? []) {
 				const parent = this.parent(node.identity.proposalID, dependency);
-				if (parent) parent.criticalPathMs = Math.max(parent.criticalPathMs, node.criticalPathMs);
+				if (parent) parent.criticalPathSteps = Math.max(parent.criticalPathSteps, node.criticalPathSteps);
 			}
 		}
 	}
@@ -561,7 +523,7 @@ function newNode(proposalID: string, source: string, revision: number, action: P
 		earliestDecisionSeq: anchorDecisionSeq + 1,
 		expectedDecisionSeq: anchorDecisionSeq + horizon(action) + 1,
 		latestDecisionSeq: anchorDecisionSeq + latestHorizon(action) + 1,
-		criticalPathMs: Math.max(1, finiteMetric(action.expectedDurationMs)),
+		criticalPathSteps: 1,
 		validDependencies: true,
 		execution: { status: "deferred" },
 		opportunity: new PredictionOpportunity(identity),
@@ -648,6 +610,12 @@ function validateActions(actions: readonly PlanAction[]):
 	}
 	try {
 		for (const source of result) {
+			if (source.resourceDemand && typeof source.resourceDemand === "object") {
+				const entries = Object.entries(source.resourceDemand);
+				if (entries.some(([key, value]) => !RESOURCE_DIMENSIONS.includes(key as typeof RESOURCE_DIMENSIONS[number]) ||
+					typeof value !== "number" || !Number.isFinite(value) || value < 0)) return { ok: false, reason: "invalid_action" };
+				source.resourceDemand = Object.freeze(Object.fromEntries(entries));
+			}
 			source.input = immutableSnapshot(source.input);
 			if (!isImmutableSnapshot(source.input)) return { ok: false, reason: "invalid_action" };
 			Object.freeze(source);

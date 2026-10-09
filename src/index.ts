@@ -1,6 +1,6 @@
 /** Pi Host API. Runtime and provenance APIs have their own core and process-reuse entries. */
 export {
-	type ActionDrafterGateSnapshot,
+	type ActionDrafterBudgetSnapshot,
 	type CreateSpeculativeActionHostOptions,
 	createSpeculativeActionHost,
 	type DraftOptionsContext,

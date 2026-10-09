@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { READ_RANGE_ACTION_KEY_PROJECTOR } from "../src/action-key-projection.ts";
 import { type ActionKey, actionKeyCovers, buildPiActionKey } from "../src/action-semantics.ts";
-import { CandidateStore, speculativeCacheValue } from "../src/candidate-stores.ts";
+import { CandidateStore, resultCacheRecency } from "../src/candidate-stores.ts";
 
 interface Entry { readonly id: string; readonly key: ReturnType<typeof key>; readonly estimatedBytes: number; }
 
@@ -241,16 +241,12 @@ describe("candidate retention", () => {
 		}
 	});
 
-	it("ranks retained computation by actual work, reuse, size and age", () => {
-		const base = { executionMs: 100, bytes: 4_096, insertedAt: 0 };
-		const freshHot = speculativeCacheValue({ ...base, actorHits: 1, lastActorHitAt: 0 }, 0, 1_000);
-		const agedHot = speculativeCacheValue({ ...base, actorHits: 1, lastActorHitAt: 0 }, 1_000, 1_000);
-		const freshCold = speculativeCacheValue({ ...base, actorHits: 0 }, 0, 1_000);
-
-		expect(freshHot).toBeGreaterThan(agedHot);
-		expect(agedHot).toBeGreaterThan(freshCold);
-		expect(speculativeCacheValue({ ...base, actorHits: 3, executionMs: 0 }, 0, 1_000)).toBe(0);
+	it("retains recent use without treating production duration as cache benefit", () => {
+		expect(resultCacheRecency({ insertedAt: 10 })).toBe(10);
+		expect(resultCacheRecency({ insertedAt: 10, lastActorHitAt: 20 })).toBe(20);
+		expect(resultCacheRecency({ insertedAt: 0, lastActorHitAt: 0 })).toBe(0);
 	});
+
 });
 
 function entry(id: string, path: string, offset = 1, limit = 20, estimatedBytes = 1): Entry {

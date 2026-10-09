@@ -292,7 +292,7 @@ async function qualifySearchExtension() {
 		await fs.mkdir(cwd); await fs.mkdir(path.join(agent, "speculative-action"), { recursive: true });
 		await fs.writeFile(path.join(cwd, "notes.txt"), "before\nneedle\nafter\n");
 		await fs.writeFile(path.join(agent, "speculative-action.json"), JSON.stringify({ enabled: false, searchExecution: "closed",
-			drafterGateEnabled: false, drafterMaxDepth: 0, candidateLimit: 1, maxConcurrentActions: 1, tools: ["grep", "find"],
+			drafterMaxDepth: 0, candidateLimit: 1, maxConcurrentActions: 1, tools: ["grep", "find"],
 			patternAware: { enabled: false }, selfSpeculation: { enabled: false } }));
 		await createSpeculativeActionExtension({ createHost: (sessionID, options) => createSpeculativeActionHost(sessionID, {
 			...options, onEvent: (event) => { options.onEvent?.(event);

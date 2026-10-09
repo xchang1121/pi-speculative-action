@@ -6,7 +6,7 @@ import { benchmarkTraceReport } from "../bench/trace-report.ts";
 import { type ActionProjectionRule, READ_RANGE_ACTION_KEY_PROJECTOR } from "../src/action-key-projection.ts";
 import { buildPiActionKey, PI_ACTION_SEMANTICS, type ActionKey } from "../src/action-semantics.ts";
 import { EffectTransactionCoordinator, effectCommitFailure } from "../src/effect-transaction.ts";
-import { SALVAGE_MS, emptyWorldReuseMetrics, type ExecutionOperationBinding, type SpeculativeExecutionRoute, type WorldBranch } from "../src/execution-world.ts";
+import { SALVAGE_MS, emptyWorldReuseMetrics, type SpeculativeExecutionRoute, type WorldBranch } from "../src/execution-world.ts";
 import type {
 	MaterializedSpeculativeCandidate,
 	PreparedActorCall,
@@ -17,6 +17,7 @@ import type {
 import { makeSpeculativeActionRuntime } from "../src/runtime.ts";
 import { CandidateStore } from "../src/candidate-stores.ts";
 import { TaskTimeline, TimelineInterval } from "../src/task-timing.ts";
+import * as scheduling from "../src/scheduler.ts";
 import { SpeculationScheduler } from "../src/scheduler.ts";
 import { ToolExecutionGateway } from "../src/tool-execution-gateway.ts";
 import { cause, type PredictionSettlement, type ResourceValidation, zeroValidationMetrics } from "../src/settlement.ts";
@@ -183,6 +184,46 @@ describe("resource-aware execution admission", () => {
 	});
 	const patient = () => ({ ...settings, predictionTimeoutMs: 10_000 });
 
+	it.each([false, true])("defers far-future preparation until the live Actor frontier reaches its launch window (cancel=%s)", async (cancel) => {
+		const preparing = vi.fn(), caller = new AbortController();
+		const { runtime, ready } = harness({ settings: patient, resources: limited(),
+			source: planSource({ propose: ({ startInput }) => startInput.turnID === "turn" ? ({ ...plan("future"), actions: [readAction("future", { path: "future.ts" }, { horizon: 3 })] }) : undefined }),
+			preflightCandidate: () => { preparing(); return { ok: true }; },
+		});
+		try {
+			await runtime.startTurn(start("turn"), caller.signal);
+			await expect.poll(() => runtime.inspect().resources?.queuedPreparations).toBe(1);
+			expect(preparing).not.toHaveBeenCalled();
+			for (const [index, turnID] of ["turn", "second", "third"].entries()) {
+				if (index) await runtime.startTurn(start(turnID));
+				await runFallback(runtime, call(turnID, { path: `${turnID}.ts` }));
+				if (index < 2) { await runtime.finishTurn(call(turnID)); await nextTurn(); expect(preparing).not.toHaveBeenCalled(); }
+				if (cancel && index === 0) {
+					caller.abort();
+					await expect.poll(() => runtime.inspect().resources?.queuedPreparations).toBe(0);
+				}
+			}
+			if (cancel) { await nextTurn(); expect(preparing).not.toHaveBeenCalled(); }
+			else { await ready.promise; expect(preparing).toHaveBeenCalledOnce(); }
+		} finally { await runtime.dispose(); }
+	});
+
+	it("shares a memory reservation between preparation and execution with spare CPU", async () => {
+		const gate = gated(), prepared: string[] = [], executed: string[] = [];
+		const resources = { cpuCount: 4, idleCpuCount: 4, capacity: { memory: 100 }, available: { memory: 100 } };
+		const { runtime } = harness({ settings: patient, resources: { initial: resources, sample: () => new Promise(() => {}) },
+			source: planSource({ propose: () => ({ ...plan("memory"), actions: ["first", "second"].map(id => readAction(id, { path: id }, { resourceDemand: { cpu: 1, memory: 60 } })) }) }),
+			preflightCandidate: ({ concrete }) => { prepared.push(String(concrete.path)); return { ok: true }; },
+			execute: async (_tool, input) => { executed.push(String(input.path)); if (input.path === "first") await gate.wait(); return "result"; },
+		});
+		try {
+			await runtime.startTurn(start("turn")); await gate.entered; await nextTurn();
+			expect(prepared).toEqual(["first"]); expect(executed).toEqual(["first"]);
+			expect(runtime.inspect().resources?.reserved).toMatchObject({ cpu: 1, memory: 60 });
+			gate.release(); await expect.poll(() => executed).toEqual(["first", "second"]);
+		} finally { gate.release(); await runtime.dispose(); }
+	});
+
 	it("lets the Actor pass a stalled sample and wakes queued preparation when idle capacity returns", async () => {
 		const sample = deferred<{ cpuCount: number; idleCpuCount: number }>(), sampled = barrier(), prepared = vi.fn();
 		const { runtime, ready, executions } = harness({ settings: patient,
@@ -224,7 +265,7 @@ describe("resource-aware execution admission", () => {
 	it("cancels active preparation for the Actor without waiting for its physical cleanup", async () => {
 		const preparing = gated(), cancelled = barrier();
 		const { runtime, executions } = harness({ settings: patient, resources: limited(),
-			source: planSource({ propose: () => ({ ...plan("preflight"), actions: [0, 1].map(index => readAction(String(index), { path: String(index) }, { horizon: 2 })) }) }),
+			source: planSource({ propose: () => ({ ...plan("preflight"), actions: [0, 1].map(index => readAction(String(index), { path: String(index) }, { horizon: 0, latestHorizon: 2 })) }) }),
 			preflightCandidate: async ({ signal }) => {
 				signal.addEventListener("abort", cancelled.arrive, { once: true });
 				await preparing.wait(); return { ok: true };
@@ -247,7 +288,7 @@ describe("resource-aware execution admission", () => {
 		const executing = gated(), cancelled = barrier();
 		const { runtime } = harness({ settings: patient, resources: limited(), resolveExecution: () => MUTATION_ROUTE,
 			source: planSource({ propose: () => ({ ...plan("operation"), actions: [{ ...readAction("op", { path: "child" }),
-				type: "operation", producesOperations: true, operation: Object.freeze({ backend: "process", identity: "child", permissionHash: "parent", executionMs: 500, expectedDurationMs: 500 }),
+				type: "operation", producesOperations: true, operation: Object.freeze({ backend: "process", identity: "child", permissionHash: "parent", executionMs: 500 }),
 			}] }) }),
 			execute: async (_tool, _input, signal) => { signal.addEventListener("abort", cancelled.arrive, { once: true }); await executing.wait(); return "ready"; },
 		});
@@ -289,9 +330,9 @@ describe("resource-aware execution admission", () => {
 		const { runtime, events } = harness({ settings: patient,
 			resources: { initial: { cpuCount: 1, idleCpuCount: 1 }, sample: () => sample.promise }, resolveExecution: () => MUTATION_ROUTE,
 			source: planSource({ propose: ({ startInput }) => startInput.sessionID === "session" ? { ...plan("handoff"), actions: [{
-				id: "op", type: "operation", tool: "bash", input: { command: "predicted" }, producesOperations: true,
-				operation: Object.freeze({ backend: "process", identity: "child", permissionHash: "parent", executionMs: 500, expectedDurationMs: 500 }),
-			}] } : undefined }),
+				id: "op", type: "operation", tool: "bash", input: { command: "predicted" }, producesOperations: true, background: true,
+				operation: Object.freeze({ backend: "process", identity: "child", permissionHash: "parent", executionMs: 500 }),
+			}] } : startInput.sessionID === "competitor" ? plan("competitor", { path: "competing" }) : undefined }),
 			executeCandidate: async ({ signal, onOperationJoinable }) => {
 				onOperationJoinable?.(() => available); signal.addEventListener("abort", cancelled, { once: true });
 				await executing.wait(); return world("unconsumed");
@@ -304,6 +345,10 @@ describe("resource-aware execution admission", () => {
 			if (mode === "other-session") await runtime.startTurn(actorCall);
 			const actor = await runtime.prepareActorCall(actorCall);
 			available = false; // Native publication may finish before the Actor's validation/commit does.
+			if (mode === "joinable") {
+				await runtime.startTurn({ sessionID: "competitor", turnID: "queued" });
+				await expect.poll(() => runtime.inspect().resources?.queuedPreparations).toBe(1); await nextTurn();
+			}
 			sample.resolve({ cpuCount: 1, idleCpuCount: 0 });
 			await expect.poll(() => runtime.inspect().resources?.idleCpuCount).toBe(0);
 			expect(cancelled).toHaveBeenCalledTimes(mode === "joinable" ? 0 : 1);
@@ -391,7 +436,7 @@ describe("structural speculative runtime", () => {
 		} finally { gate.release(); await runtime.dispose(); }
 	});
 
-	it.each(["measured", "unknown", "blocked", "over-capacity", "retired-operation"] as const)("prioritizes a workflow prerequisite only for an eligible measured descendant (%s)", async mode => {
+	it.each(["measured", "unknown", "blocked", "over-capacity", "retired-operation"] as const)("orders current work without borrowing a descendant's historical duration (%s)", async mode => {
 		const gate = gated(), executed: string[] = [];
 		const { runtime, events } = harness({ settings: () => ({ ...settings, maxConcurrentActions: 1 }),
 			source: planSource({ propose: ({ startInput }) => startInput.turnID === "predict" ? { ...plan("workflow"), actions: [
@@ -401,7 +446,7 @@ describe("structural speculative runtime", () => {
 					empiricalProbability: 0.5, adoptionProbability: 0.8,
 					...(mode === "over-capacity" ? { resourceDemand: 2 } : {}),
 					...(mode === "retired-operation" ? { operation: Object.freeze({ backend: "test", identity: "retired", permissionHash: "parent",
-						executionMs: 10_000, expectedDurationMs: 10_000, available: false }) } : {}),
+						executionMs: 10_000, available: false }) } : {}),
 					dependsOn: [{ actionID: "prerequisite", condition: "execution_succeeded" }] },
 			] } : undefined }),
 			resolveExecution: () => RESOURCE_ROUTE,
@@ -417,13 +462,13 @@ describe("structural speculative runtime", () => {
 			if (mode !== "unknown") await runFallback(runtime, { ...call("seed"), tool: "bash", input: { command: "expensive-build" } }, 10_000);
 			await runtime.finishTurn(call("seed"));
 			await runtime.startTurn(start("predict")); await gate.entered;
-			expect(executed).toEqual([mode === "measured" ? "prerequisite.ts" : "independent.ts"]);
+			expect(executed).toEqual(["prerequisite.ts"]);
 			expect(events.filter(event => event.type === "actor_action").every(event => (event.computation?.reusedExecutionMs ?? 0) === 0)).toBe(true);
 		} finally { gate.release(); await runtime.dispose(); }
 	});
 
 	it("credits consumed operation receipts to their shared producer mode during native fallback", async () => {
-		const binding = Object.freeze({ backend: "process", identity: "child", permissionHash: "parent", executionMs: 40, expectedDurationMs: 40 });
+		const binding = Object.freeze({ backend: "process", identity: "child", permissionHash: "parent", executionMs: 40 });
 		const preparation = new TimelineInterval(0, 10);
 		TimelineInterval.producedBy(preparation, { source: "preparer", mode: "input" });
 		const partial = new TimelineInterval(10, 50, [{ computation: preparation, reused: true }]);
@@ -469,7 +514,7 @@ describe("structural speculative runtime", () => {
 
 
 	it.each(["same", "next", "unused"])("separates internal execution, matching and continuation in the %s turn even when an adapter collides keys", async mode => {
-		const binding = Object.freeze({ backend: "process", identity: "child", permissionHash: "parent", executionMs: 2, expectedDurationMs: 3 });
+		const binding = Object.freeze({ backend: "process", identity: "child", permissionHash: "parent", executionMs: 2 });
 		const complete = vi.fn(), materialized = vi.fn(), continuation = vi.fn(), settled = vi.fn();
 		let adopted: Parameters<TestAdapter["executeCandidate"]>[0]["onOperationAdopted"];
 		let acceptScope: Parameters<TestAdapter["executeCandidate"]>[0]["acceptOperationScope"];
@@ -532,7 +577,7 @@ describe("structural speculative runtime", () => {
 		const admit = SpeculationScheduler.prototype.admit;
 		const admission = vi.spyOn(SpeculationScheduler.prototype, "admit").mockImplementation(function (this: SpeculationScheduler<object>, ...args) {
 			const result = admit.apply(this, args);
-			if (turn === 2) attempted.resolve(result);
+			if (turn === 2 && args[3] === "execution") attempted.resolve(result);
 			return result;
 		});
 		const source = (id: string): Source => ({ id, enabled: () => true,
@@ -915,121 +960,8 @@ describe("structural speculative runtime", () => {
 	});
 
 
-	it.each(["failed", "costly-used", "profitable-used"] as const)("charges operation preparation before admitting another distinct launch (%s)", async mode => {
-		let elapsed = 0, completed = deferred<void>();
-		const nativeNow = performance.now.bind(performance), clock = vi.spyOn(performance, "now").mockImplementation(() => nativeNow() + elapsed);
-		const launched: string[] = [];
-		const { runtime } = harness({ source: planSource({ propose: ({ startInput }) => ({
-			...plan(startInput.turnID), actions: [{ ...readAction("prepare", { path: startInput.turnID }), type: "operation",
-				operation: Object.freeze({ backend: "process", identity: startInput.turnID, permissionHash: "parent", executionMs: 50, expectedDurationMs: 200 }),
-				producesOperations: true, expectedDurationMs: 200 }],
-		}), onExecutionSettled: () => { completed.resolve(); }, onSettled: ({ settlement }) => {
-			if (settlement.observation === "unobserved" && settlement.cause.code === "operations_unprofitable") completed.resolve();
-		} }), executeCandidate: async ({ candidate, startInput, onOperationAdopted }) => {
-			launched.push(startInput.turnID); elapsed += 200;
-			if (mode === "failed") throw new Error("no reusable process result");
-			onOperationAdopted!({ scope: startInput, id: `native:${startInput.turnID}`, sequence: 1,
-				operationIdentity: candidate.operation!.identity, executionMs: mode === "costly-used" ? 50 : 500 });
-			return world("prepared");
-		} });
-		try {
-			const attempts = mode === "failed" ? 3 : 5;
-			for (let index = 0; index < attempts; index++) {
-				completed = deferred<void>();
-				const turnID = `operation:${index}`;
-				await runtime.startTurn(start(turnID)); await completed.promise;
-				await runtime.finishTurn({ ...call(turnID), terminal: false });
-			}
-			expect(launched).toHaveLength(mode === "failed" ? 2 : mode === "costly-used" ? 4 : 5);
-		} finally { await runtime.dispose(); clock.mockRestore(); }
-	});
 
-	it.each(["failed", "cancelled"] as const)("recovers operation preparation from late consumed work after %s production", async mode => {
-		let elapsed = 0, completed = deferred<void>(), entered = deferred<void>(), recovered = false;
-		const nativeNow = performance.now.bind(performance), clock = vi.spyOn(performance, "now").mockImplementation(() => nativeNow() + elapsed);
-		const receipts = new Map<string, NonNullable<Parameters<TestAdapter["executeCandidate"]>[0]["onOperationAdopted"]>>();
-		const launched: string[] = [];
-		const { runtime } = harness({ resolveExecution: () => MUTATION_ROUTE, source: planSource({ propose: ({ startInput }) => ({ ...plan(startInput.turnID), actions: [{
-			...readAction("prepare", { path: startInput.turnID }), type: "operation", producesOperations: true,
-			operation: Object.freeze({ backend: "process", identity: startInput.turnID, permissionHash: "parent", executionMs: 50, expectedDurationMs: 200 }),
-		}] }), onExecutionSettled: () => { completed.resolve(); }, onSettled: ({ settlement }) => {
-			if (settlement.observation === "unobserved" && settlement.cause.code === "operations_unprofitable") completed.resolve();
-		} }), executeCandidate: async ({ startInput, signal, onOperationAdopted }) => {
-			launched.push(startInput.turnID); receipts.set(startInput.turnID, onOperationAdopted!); elapsed += 200; entered.resolve();
-			if (recovered) return world("prepared");
-			if (mode === "cancelled") await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
-			throw new Error("preparation did not finish");
-		} });
-		try {
-			const attempts = mode === "failed" ? 2 : 4;
-			for (let index = 0; index < attempts; index++) {
-				completed = deferred<void>(); entered = deferred<void>();
-				const turnID = `operation:${index}`;
-				await runtime.startTurn(start(turnID)); await entered.promise;
-				if (mode === "cancelled") await runtime.finishTurn({ ...call(turnID), terminal: true });
-				await completed.promise;
-				if (mode === "failed") await runtime.finishTurn({ ...call(turnID), terminal: false });
-			}
-			completed = deferred<void>(); await runtime.startTurn(start("blocked")); await completed.promise;
-			expect(launched).toHaveLength(attempts); // Cancellation spent its service cost but did not trigger the two-failure circuit.
-			receipts.get(`operation:${attempts - 1}`)!({ scope: start("blocked"), id: "late-child", sequence: 1,
-				operationIdentity: `operation:${attempts - 1}`, executionMs: 2000 });
-			await runtime.finishTurn({ ...call("blocked"), terminal: false });
-			recovered = true; completed = deferred<void>();
-			await runtime.startTurn(start("recovered")); await completed.promise;
-			expect(launched.at(-1)).toBe("recovered");
-		} finally { await runtime.dispose(); clock.mockRestore(); }
-	});
 
-	it("budgets learning by observable service and credits only the captured binding's distinct adoptions", async () => {
-		const binding: ExecutionOperationBinding = Object.freeze({ backend: "process", identity: "child", permissionHash: "parent", executionMs: 800, expectedDurationMs: 800 });
-		const bindings = [binding, Object.freeze({ ...binding })], receipts: NonNullable<Parameters<TestAdapter["executeCandidate"]>[0]["onOperationAdopted"]>[] = [];
-		const { runtime, events } = harness({ source: planSource({ propose: ({ startInput }) => startInput.turnID !== "reuse" ? undefined : {
-			...plan("reuse"), actions: bindings.map((operation, index) => ({ ...readAction(`child:${index}`, { path: `operation:${index}` }),
-				type: "operation" as const, operation, producesOperations: true as const })) },
-			observesOperations: action => action.tool === "bash", observe: () => undefined }),
-			executeCandidate: async ({ candidate, onOperationAdopted }) => {
-				receipts[bindings.indexOf(candidate.operation!)] = onOperationAdopted!;
-				return world("child", { validate: async () => validResource() });
-			} });
-		let index = 0, turnID = "learning";
-		const native = async (duration: number, operations?: typeof bindings) => {
-			const prepared = await runtime.prepareActorCall({ ...call(turnID, { command: `worker ${index}` }), tool: "bash", id: `call:${index++}` });
-			await prepared?.settle(simulatedExecution(duration), "actor", operations); return prepared?.observeOperations;
-		};
-		try {
-			await runtime.startTurn(start("learning"));
-			for (let probe = 0; probe < 4; probe++) expect(await native(10)).toBe(true);
-			expect(await native(1000, [binding])).toBe(true); // Cheap discovery did not spend the slow call's time budget.
-			const passive = await runtime.prepareActorCall({ ...call("learning", { path: "unobserved" }), id: "read" });
-			expect(passive?.observeOperations).toBe(false); await passive?.settle(simulatedExecution(10000), "read");
-			for (let probe = 0; probe < 3; probe++) expect(await native(1000)).toBe(false); // Untraced native service repays debt.
-			expect(await native(1000)).toBe(true); // A newer, unrelated capture must not own the earlier binding's benefit.
-			await runtime.finishTurn({ ...call(turnID), terminal: false });
-			await runtime.startTurn(start(turnID = "reuse"));
-			await expect.poll(() => receipts.filter(Boolean).length).toBe(2);
-			const receipt = { scope: start("reuse"), id: "consume", sequence: 1, operationIdentity: "child", executionMs: 800 };
-			receipts[1]!({ ...receipt, id: "unowned-consume" }); // Equal identity strings are not capture provenance.
-			receipts[0]!({ ...receipt, scope: { ...receipt.scope, sessionID: "other" } });
-			receipts[0]!({ ...receipt, operationIdentity: "other" });
-			expect(await native(0)).toBe(false);
-			receipts[0]!(receipt);
-			expect(await native(100)).toBe(true);
-			receipts[0]!({ ...receipt });
-			expect(await native(100)).toBe(true);
-			expect(await native(0)).toBe(false); // A duplicate receipt did not refill credit.
-			receipts[0]!({ ...receipt, id: "another-consume", sequence: 2 });
-			const pending = await Promise.all(Array.from({ length: 5 }, (_, probe) => runtime.prepareActorCall({
-				...call(turnID, { command: `parallel ${probe}` }), tool: "bash", id: `parallel:${probe}` })));
-			expect(pending.map(prepared => prepared?.observeOperations)).toEqual([true, true, true, true, false]);
-			for (const prepared of pending) await prepared?.settle(simulatedExecution(0), "actor");
-			await runtime.finishTurn({ ...call("reuse"), terminal: true });
-			expect(events.filter(event => event.type === "operation_prediction")).toMatchObject([
-				{ settlement: { match: { matched: true, adoption: { status: "adopted" } } } },
-				{ settlement: { match: { matched: true, adoption: { status: "adopted" } } } },
-			]);
-		} finally { await runtime.dispose(); }
-	});
 
 	it("bounds an uncalibrated in-flight join and falls back without cancelling the learning run", async () => {
 		let enabled = false;
@@ -1422,10 +1354,10 @@ describe("structural speculative runtime", () => {
 		} finally { release.resolve(); await runtime.dispose(); }
 	});
 
-	it("re-arms a preempted future prediction so it relaunches once capacity returns", async () => {
+	it("re-arms a preempted lower-priority prediction once capacity returns", async () => {
 		const executed: string[] = [], farStarted = barrier(), release = deferred<void>();
 		const { runtime } = harness({ settings: () => ({ ...settings, maxConcurrentActions: 1 }),
-			source: planSource({ propose: () => ({ id: "far", source: "source", revision: 0, actions: [readAction("far", { path: "far.ts" }, { horizon: 1 })] }) }),
+			source: planSource({ propose: () => ({ id: "far", source: "source", revision: 0, actions: [readAction("far", { path: "far.ts" }, { horizon: 0, latestHorizon: 2, background: true })] }) }),
 			peers: [{ id: "peer", enabled: () => true, propose: async () => { await farStarted.promise; return { id: "near", source: "peer", revision: 0, actions: [readAction("near", { path: "near.ts" })] }; } }],
 			execute: async (_tool, input, signal) => {
 				const path = String(input.path); executed.push(path);
@@ -1445,7 +1377,7 @@ describe("structural speculative runtime", () => {
 		const executed: string[] = [], drained = deferred<void>();
 		const { runtime } = harness({ settings: () => ({ ...settings, maxConcurrentActions: capacity }),
 			source: planSource({ propose: () => ({ id: "future", source: "source", revision: 0,
-				actions: Array.from({ length: 4 }, (_, index) => readAction(String(index), { path: `future-${index}.ts` }, { horizon: 2 })) }) }),
+				actions: Array.from({ length: 4 }, (_, index) => readAction(String(index), { path: `future-${index}.ts` }, { horizon: 0, latestHorizon: 2 })) }) }),
 			execute: async (_tool, input, signal) => {
 				executed.push(String(input.path));
 				await new Promise(resolve => signal.addEventListener("abort", resolve, { once: true }));
@@ -1467,8 +1399,8 @@ describe("structural speculative runtime", () => {
 		const executed: string[] = [], gates = [gated(), gated(), gated()];
 		const { runtime } = harness({ settings: () => ({ ...settings, maxConcurrentActions: 3 }),
 			source: planSource({ propose: () => ({ id: "weighted", source: "source", revision: 0,
-				actions: [readAction("0", { path: "0" }, { expectedLatencyBenefitMs: 3 }),
-					readAction("1", { path: "1" }, { expectedLatencyBenefitMs: 2, resourceDemand: 1 }), readAction("2", { path: "2" })] }) }),
+				actions: [readAction("0", { path: "0" }, { confidence: 1 }),
+					readAction("1", { path: "1" }, { confidence: 0.8, resourceDemand: 1 }), readAction("2", { path: "2" })] }) }),
 			resolveExecution: () => ({ ...RESOURCE_ROUTE, isolation: mode === "process" ? "runtime_sandbox" : "resource_snapshot" }),
 			actionKey: (tool, args) => PI_ACTION_SEMANTICS.buildKey(tool, args, "/workspace", "", mode === "process" ? undefined : {
 				fingerprint: "captured-scan", semantics: { ...PI_ACTION_SEMANTICS.definition(tool)!, resourceScope: mode } }),
@@ -1495,12 +1427,10 @@ describe("structural speculative runtime", () => {
 		} finally { await runtime.dispose(); }
 	});
 
-	it("holds speculative capacity through cancellation and cleanup, but never queues the actual Actor behind it", async () => {
-		for (const mode of ["producer", "preview", "queued", "running"] as const) {
+	it.each(["producer", "preview", "queued", "running"] as const)("holds speculative capacity through cleanup without queueing the actual Actor (%s)", async mode => {
 			const executed: string[] = [], aborted: string[] = [];
 			const busyStarted = barrier(), stop = barrier(), stopped = barrier(), cleanupGate = gated();
 			const targetGate = gated(), targetQueued = barrier();
-			const service = vi.spyOn(SpeculationScheduler.prototype, "observeSpeculativeService");
 			const original = SpeculationScheduler.prototype.admit;
 			const admission = vi.spyOn(SpeculationScheduler.prototype, "admit").mockImplementation(function (this: SpeculationScheduler<object>, job, forecasts, ...rest) {
 				const result = original.call(this, job, forecasts, ...rest);
@@ -1511,7 +1441,7 @@ describe("structural speculative runtime", () => {
 			const { runtime, summary } = harness({
 				source: planSource({ propose: () => [
 					{ id: "busy", source: "source", revision: 0, actions: [
-						readAction("busy", { path: "busy.ts" }, { expectedLatencyBenefitMs: speculative ? 0 : 1 })] },
+						readAction("busy", { path: "busy.ts" }, { confidence: speculative ? 0 : 1 })] },
 					...(mode === "preview" ? [] : [{ id: "target", source: "source", revision: 0, actions: [
 						readAction("target", { path: "target.ts" }, { resourceDemand: mode === "queued" ? 2 : 1 })] }]),
 				] }),
@@ -1529,15 +1459,17 @@ describe("structural speculative runtime", () => {
 				await runtime.startTurn(start("turn")); await busyStarted.promise;
 				if (mode === "preview") await runtime.previewActorCall(call("turn", { path: "target.ts" }));
 				if (mode === "running") await targetGate.entered;
-				if (mode === "queued") await targetQueued.promise;
+				if (mode === "queued") {
+					await targetQueued.promise;
+					const actor = await runtime.prepareActorCall(call("turn", { path: "target.ts" }));
+					expect(actor?.output).toBeUndefined(); expect(aborted).toEqual(["busy.ts"]);
+					expect(executed).toEqual(["busy.ts"]);
+					await actor!.settle(simulatedExecution(1), "native"); return;
+				}
 				if (speculative) {
 					await stop.promise; await nextTurn();
-					const cancelled = service.mock.calls.filter(([, , outcome]) => outcome === "cancelled");
-					expect(cancelled).toHaveLength(1);
-					expect(cancelled[0]![1]).toBeGreaterThan(0);
 					expect(executed, "cancellation is not physical completion").toEqual(["busy.ts"]);
 					stopped.arrive(); await cleanupGate.entered; await nextTurn();
-					expect(service.mock.calls.filter(([, , outcome]) => outcome === "cancelled")).toEqual(cancelled);
 					expect(summary()).toMatchObject({ candidateCancelled: 1, candidateTerminalCauses: { "admission:scheduler_preempted": 1 } });
 					expect(executed, "cleanup still owns the resource slot").toEqual(["busy.ts"]);
 					cleanupGate.release(); await targetGate.entered;
@@ -1549,17 +1481,15 @@ describe("structural speculative runtime", () => {
 				expect(aborted).toEqual(mode === "running" ? [] : ["busy.ts"]);
 			} finally {
 				stopped.arrive(); cleanupGate.release(); targetGate.release(); await runtime.dispose();
-				const failures = service.mock.calls.filter(([, , failed]) => failed === true);
-				service.mockRestore(); admission.mockRestore(); expect(failures).toEqual([]);
+				admission.mockRestore();
 			}
-		}
 	});
 
 	it.each((["no-reconstruction", "valid", "proof-missing", "uncovered", "rejected", "changed", "aborted", "running-unproven", "running-outside", "running-covered", "running-throws",
 		"output-valid", "output-uncovered", "output-rejected", "output-opaque", "output-preferred", "input-lookup", "input-scope"] as const)
 		.flatMap((scenario) => [false, ...(!scenario.startsWith("running") ? [true] : [])].map((preview) => [scenario, preview] as const)))(
 	"adopts reconstructed input or owned output coverage only after stable evaluation: %s (preview=%s)", async (scenario, preview) => {
-		const admission = vi.spyOn(SpeculationScheduler.prototype, "assessCandidateJoin");
+		const admission = vi.spyOn(scheduling, "candidateJoinBudget");
 		const commit = vi.fn(async () => "committed"), queryDisposals: ReturnType<typeof vi.fn>[] = [];
 		const gate = gated(), controller = new AbortController();
 		const started = barrier(), completion = barrier(), authorized = barrier(), running = scenario.startsWith("running");
@@ -1643,7 +1573,6 @@ describe("structural speculative runtime", () => {
 				expect((await runtime.prepareActorCall({ ...actor, id: "second-reader" }))?.output).toBe("narrow");
 				expect(commit).toHaveBeenCalledTimes(2);
 			}
-			if (succeeds) expect(admission.mock.lastCall![0].identity.tool).toBe("read");
 		} finally {
 			completion.arrive(); gate.release(); await Promise.all([preparation, consumed]);
 			await runtime.finishTurn({ ...actor, terminal: true }); await runtime.dispose();
@@ -1821,7 +1750,7 @@ describe("structural speculative runtime", () => {
 	it.each(["adopt", "salvage", "cancel", "orphan-preview", "owned-preview", "operation-salvage", "operation-unavailable", "operation-unmeasured", "operation-expired", "operation-terminal"])("retires unowned previews while retaining demanded or independently predicted work: %s", async mode => {
 		const started = deferred<void>(), release = deferred<void>();
 		const timers = vi.spyOn(globalThis, "setTimeout"), cleared = vi.spyOn(globalThis, "clearTimeout"), disposed = vi.fn();
-		const admission = vi.spyOn(SpeculationScheduler.prototype, "assessCandidateJoin");
+		const admission = vi.spyOn(scheduling, "candidateJoinBudget");
 		let available = true;
 		const binding = Object.freeze({ backend: "process", identity: "child", permissionHash: "parent", executionMs: mode === "operation-unmeasured" ? 0 : 2,
 			expectedDurationMs: 3, get available() { return available; } });
@@ -1842,7 +1771,7 @@ describe("structural speculative runtime", () => {
 			await started.promise;
 			if (mode.endsWith("preview")) {
 				if (mode === "owned-preview") await runtime.previewActorCall(call("turn"));
-				else admission.mockReturnValueOnce({ allowed: false, reason: "deadline", waitBudgetMs: 0 });
+				else admission.mockReturnValueOnce(0);
 				const prepared = await runtime.prepareActorCall(mode === "orphan-preview" ? call("turn") : { ...call("turn"), tool: "bash", input: { command: "git status" } });
 				expect(prepared?.output).toBeUndefined();
 				expect(executionSignal!.aborted).toBe(mode === "orphan-preview");
@@ -1854,7 +1783,7 @@ describe("structural speculative runtime", () => {
 			}
 			available = mode !== "operation-unavailable";
 			await runFallback(runtime, { ...call("turn"), id: "native", tool: "bash", input: { command: "git status" } });
-			if (mode === "operation-unavailable" || mode === "operation-unmeasured") {
+			if (mode === "operation-unavailable") {
 				expect(executionSignal!.aborted).toBe(false);
 				await runtime.finishTurn(call("turn"));
 				expect(executionSignal!.aborted).toBe(true);
@@ -1909,7 +1838,7 @@ describe("structural speculative runtime", () => {
 
 	it.each(["workspace_mutation", "unbounded"] as const)("skips input retrieval for a bound %s action while retaining exact results", async effect => {
 		const authorize = vi.fn(() => ({ ok: true as const })), reconstruct = vi.fn(async () => ({ output: "query" }));
-		const service = vi.spyOn(SpeculationScheduler.prototype, "observeActorService"), forecast = vi.spyOn(SpeculationScheduler.prototype, "evaluate");
+		const forecast = vi.spyOn(SpeculationScheduler.prototype, "evaluate");
 		const { runtime, ready } = harness({ source: planSource({ propose: () => plan("inputs", { path: "input", offset: 1, limit: 1 }) }),
 			actionKey: (tool, args) => PI_ACTION_SEMANTICS.buildKey(tool, args, "/workspace", "", (args as Record<string, unknown>).offset === 2 ? {
 				fingerprint: "bound", semantics: { ...PI_ACTION_SEMANTICS.definition("read")!, epoch: `bound.${effect}`, effect, resourceScope: undefined,
@@ -1926,15 +1855,14 @@ describe("structural speculative runtime", () => {
 			expect((await runtime.prepareActorCall({ ...call("turn", { path: "input", offset: 1, limit: 1 }), id: "exact" }))?.output).toBe("source");
 			expect(authorize).toHaveBeenCalledOnce(); expect(reconstruct).not.toHaveBeenCalled();
 			await prepared!.settle(simulatedExecution(10), "actor");
-			expect(service.mock.calls[0]![0]).toMatchObject({ semanticsEpoch: `bound.${effect}`, executionFingerprint: "bound" });
 			expect(new Set(forecast.mock.calls.flatMap(([forecasts]) => forecasts).filter(value => value.actionKeyHash).map(value => value.semanticsEpoch))).toEqual(new Set([PI_ACTION_SEMANTICS.definition("read")!.epoch]));
-		} finally { await runtime.dispose(); service.mockRestore(); forecast.mockRestore(); }
+		} finally { await runtime.dispose(); forecast.mockRestore(); }
 	});
 
 	it.each([[2, 4096, 0, 2, 10], [1, 4096, 0, 3, 10], [2, 128, 0, 3, 10], [2, 4096, 4096, 2, 10], [2, 4096, 0, 2, 10000]])("bounds sealed query results by %i entries and %i bytes with %i proof bytes (%i evaluations, %ims source)", async (entries, bytes, proofBytes, evaluations, sourceMs) => {
 		const disposed = vi.fn(), queryDisposals: ReturnType<typeof vi.fn>[] = [];
 		let now = 100;
-		const clock = vi.spyOn(performance, "now").mockImplementation(() => now), admission = vi.spyOn(SpeculationScheduler.prototype, "assessCandidateJoin");
+		const clock = vi.spyOn(performance, "now").mockImplementation(() => now), admission = vi.spyOn(scheduling, "candidateJoinBudget");
 		const learned = entries === 2 && bytes === 4096 && !proofBytes, unretained = bytes === 128;
 		const queryValidate = vi.fn(async () => { now += 3; return validResource(); });
 		const reconstruct = vi.fn<NonNullable<WorldBranch<string>["reconstruct"]>>(async ({ args }) => { now += 20; const dispose = vi.fn(); queryDisposals.push(dispose); return { dispose, output: String((args as { offset: number }).offset), capturedBytes: proofBytes, ...(proofBytes ? { validate: queryValidate } : {}) }; });
@@ -1956,12 +1884,6 @@ describe("structural speculative runtime", () => {
 				const actor = { ...call(turnID, { path: "input", offset, limit: 1 }), id: String(index) };
 				if (!learned || index > 0) await runtime.previewActorCall(actor);
 				expect((await runtime.prepareActorCall(actor))?.output).toBe(String(offset));
-				if (learned && index === 0) {
-					const scheduler = admission.mock.contexts[0] as SpeculationScheduler<object>, request = admission.mock.calls[0]![0];
-					for (let sample = 0; sample < 4; sample++) {
-						scheduler.observeActorService(request.identity, 5);
-					}
-				}
 			}
 			expect(reconstruct).toHaveBeenCalledTimes(evaluations); expect(executionCount()).toBe(1);
 			await nextTurn();
@@ -2399,7 +2321,7 @@ describe("structural speculative runtime", () => {
 				expect(settlements).toHaveLength(8);
 				expect(new Set(settlements.map((item) => item.observation === "observed" && item.actorAction.id))).toEqual(new Set([actor.id]));
 			}
-			if (mode === "future-prediction") expect(settlements).toEqual([expect.objectContaining({ match: expect.objectContaining({ matched: true, adoption: expect.objectContaining({ status: "adopted" }) }) })]);
+			if (mode === "future-prediction") expect(settlements).toEqual([expect.objectContaining({ match: expect.objectContaining({ matched: true, adoption: expect.objectContaining({ status: "rejected", cause: expect.objectContaining({ code: "actor_preview_provider" }) }) }) })]);
 			if (mode === "prediction-first") {
 				const providers = events.filter((event) => event.type === "actor_action").map((event) => event.settlement.provider);
 				expect(providers).toHaveLength(2); expect(providers.every((provider) => provider.kind === "speculative")).toBe(true);
@@ -2515,7 +2437,7 @@ describe("structural speculative runtime", () => {
 		const horizons = mode === "due" ? [4, 0, 2, 2, 1, 3] : projected ? [4, 3, 1, 1, 2, 5] : [0];
 		const proposalIDs = projected ? ["second", "first"] : ["bash"];
 		const predictedInput = projected ? { path: "README.md", offset: 1, limit: 100 } : { command: "build" };
-		const actionCount = horizons.length * proposalIDs.length, routeChecked = barrier(actionCount);
+		const actionCount = horizons.length * proposalIDs.length, bound = barrier(actionCount);
 		const project = vi.fn(READ_RANGE_ACTION_KEY_PROJECTOR.project);
 		const source = planSource({
 			propose: ({ startInput }) => startInput.turnID !== "turn-1" ? undefined : proposalIDs.map((id) => ({
@@ -2529,15 +2451,15 @@ describe("structural speculative runtime", () => {
 		const { runtime, events, executions: executionCount } = harness({
 			source,
 			projection: { ...READ_RANGE_ACTION_KEY_PROJECTOR, project },
-			resolveExecution: () => { routeChecked.arrive(); return undefined; },
+			onCandidateMaterialized: () => bound.arrive(), resolveExecution: () => undefined,
 		});
 		let turnID = "turn-1";
 		try {
 			await runtime.startTurn(start(turnID));
-			await routeChecked.promise;
+			await bound.promise;
 			await nextTurn();
 			expect(runtime.inspect()).toMatchObject({
-				exclusiveCandidates: 0, sharedCandidates: 0, executionBlockedPlanActions: actionCount,
+				exclusiveCandidates: 0, sharedCandidates: 0, executionBlockedPlanActions: horizons.filter(horizon => horizon === 0).length * proposalIDs.length,
 			});
 			for (let previous = 1; mode === "due" && previous <= 2; previous++) {
 				const earlier = call(turnID, { path: "unrelated.ts" });
@@ -2568,7 +2490,7 @@ describe("structural speculative runtime", () => {
 				match: {
 					matched: true,
 					relation: projected ? { kind: "projected", projector: "read.range", distance: 90 } : { kind: "exact", distance: 0 },
-					adoption: { status: "rejected", cause: { stage: "execution", code: "isolation_unavailable" } },
+					adoption: { status: "rejected", cause: mode === "future" ? { stage: "admission", code: "preparation_pending" } : { stage: "execution", code: "isolation_unavailable" } },
 				},
 			})));
 			expect(settlements).toHaveLength(actionCount);

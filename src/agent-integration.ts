@@ -40,8 +40,6 @@ const RAW_ACTOR_CALL = Symbol("raw-actor-call");
 type BoundActorCall = AgentConsumeInput & { readonly [ACTOR_OPERATION]?: () => Promise<ToolOperation>; readonly [RAW_ACTOR_CALL]?: true };
 
 export interface SpeculativeAgentSettingsInput extends Partial<DrafterRequestSettings>, Partial<Omit<SpeculativeActionSettings, "sourceConfig">> {
-	/** Adaptively skip a root Drafter batch when its measured action-side utility is negative. */
-	readonly drafterGateEnabled?: boolean;
 	readonly patternAware?: Partial<PatternAwareSettings>;
 	readonly selfSpeculation?: SelfSpeculationSettingsInput;
 	/** Prediction selection, independent of execution permissions; omitted uses the registered tools. */
@@ -54,7 +52,6 @@ export function normalizeSpeculativeAgentSettings(input: SpeculativeAgentSetting
 		...normalizeDrafterRequestSettings(input),
 		enabled: booleanOr(input.enabled, DEFAULTS.enabled),
 		drafterEnabled: booleanOr(input.drafterEnabled, DEFAULTS.drafterEnabled),
-		drafterGateEnabled: booleanOr(input.drafterGateEnabled, DEFAULTS.drafterGateEnabled),
 		candidateLimit: clampCandidateLimit(input.candidateLimit ?? DEFAULTS.candidateLimit),
 		maxConcurrentActions: clampCandidateLimit(input.maxConcurrentActions ?? DEFAULTS.maxConcurrentActions),
 		resourceCacheMaxEntries: positiveInteger(input.resourceCacheMaxEntries, DEFAULTS.resourceCacheMaxEntries),
@@ -141,7 +138,7 @@ export interface SpeculativeActionHost {
 		executor: (operation: ToolOperation) => Promise<AgentToolResult<unknown>>,
 	) => Promise<AgentToolResult<unknown>>;
 	readonly finishTurn: (turnID: string, terminal?: boolean) => Promise<void>;
-	readonly drafterGateSnapshot: () => ActionDrafterGateSnapshot;
+	readonly drafterBudgetSnapshot: () => ActionDrafterBudgetSnapshot;
 	readonly dispose: () => Promise<void>;
 }
 
@@ -154,7 +151,7 @@ export interface SpeculativeToolExecutionInput {
 	readonly tools: readonly AgentTool[];
 }
 
-export type ActionDrafterGateSnapshot = ReturnType<ReturnType<typeof createDrafterPlanSource>["snapshot"]>;
+export type ActionDrafterBudgetSnapshot = ReturnType<ReturnType<typeof createDrafterPlanSource>["snapshot"]>;
 
 export { patternPlanActionID } from "./pattern-plan-source.ts";
 
@@ -191,14 +188,14 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 			: undefined;
 	};
 	const resolveSettings = async (): Promise<SpeculativeActionSettings> => {
-		const { patternAware, selfSpeculation, drafterGateEnabled, drafterMaxDepth, drafterMaxTokens, drafterTaskMaxRequests, drafterTaskMaxTokens,
+		const { patternAware, selfSpeculation, drafterMaxDepth, drafterMaxTokens, drafterTaskMaxRequests, drafterTaskMaxTokens,
 			drafterDeterministicCandidates, drafterTemperatureMin, drafterTemperatureMax, drafterPatternHints, ...policy } =
 			normalizeSpeculativeAgentSettings(await options.getSettings?.(), actionSemantics.toolNames());
 		return {
 			...policy,
 			sourceConfig: {
 				drafterMaxDepth, drafterMaxTokens, drafterTaskMaxRequests, drafterTaskMaxTokens, drafterDeterministicCandidates, drafterTemperatureMin, drafterTemperatureMax, drafterPatternHints,
-				drafterGateEnabled, patternAware,
+				patternAware,
 				actorForkActionEnabled:
 					options.actorForkPlanSource !== undefined &&
 					selfSpeculation.enabled &&
@@ -350,7 +347,6 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 		onActorActionMaterialized: options.onActorActionMaterialized,
 		onActorActionSettled: async (feedback) => {
 			patternPlans.actorActionSettled(feedback);
-			await drafterPlans.actorActionSettled(feedback);
 			await options.onActorActionSettled?.(feedback);
 		},
 		onPredictionSettled: options.onPredictionSettled,
@@ -427,7 +423,7 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 					: {}),
 			});
 		}),
-		drafterGateSnapshot: drafterPlans.snapshot,
+		drafterBudgetSnapshot: drafterPlans.snapshot,
 		finishTurn: async (turnID, terminal = false) => {
 			try {
 				await runtime.finishTurn({ sessionID, turnID, tool: "", args: {}, tools: [], terminal });

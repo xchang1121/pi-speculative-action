@@ -8,7 +8,6 @@ import type { ExecutionOperationBinding } from "./execution-world.ts";
 import { agentBatchKey, type AgentPlanSource, type AgentStartInput } from "./agent-runtime-types.ts";
 import { acquirePatternAwareStore, PATTERN_AWARE_DEFAULTS, asPatternAwareRuntimeContext, type OutputLocation, type PatternAwareCandidate,
 	type PatternAwareEventInput, type PatternAwareRuntimeContext, type PatternAwareSettings, type PatternAwareStore, type PatternAwareStoreLease,
-	type PatternAwareReuseFeedback,
 	patternAwareActionSemantics, patternAwareAnalyzerKey, patternAwareRuntimeContext, patternAwareSettings, failureClass,
 	projectPatternAwareObservation } from "./pattern-aware.ts";
 import type { PlanAction } from "./plan-proposal.ts";
@@ -29,7 +28,7 @@ type PatternPlanFeedback = PatternAwareRuntimeContext & {
 type CarriedPrediction = { readonly signature: string; readonly pending: Set<PatternPlanFeedback>; abandoned: boolean };
 type ObservedCommand = {
 	readonly parentHash: string; readonly tool: string; readonly input: Readonly<Record<string, unknown>>; readonly schemaHash?: string;
-	readonly failure?: { readonly paths: readonly string[]; readonly durationMs: number };
+	readonly failure?: { readonly paths: readonly string[] };
 };
 type CommandRerunState = { readonly native: boolean; readonly failed: boolean; workspaceChanged: boolean; observedChange?: boolean;
 	changes?: Promise<ResourceVersionToken | undefined>; preparing?: Promise<unknown>; retry?: ObservedCommand;
@@ -42,7 +41,7 @@ export interface PatternPlanSourceController {
 	readonly actorActionSettled: (feedback: ActorActionFeedback<string>) => void;
 	/** The calls PatternAware expects next, without proposing them. */
 	readonly hints: (input: { readonly sessionID: string; readonly schemaHashes: Readonly<Record<string, string>>; readonly settings: SpeculativeActionSettings })
-		=> Promise<readonly Pick<PatternAwareCandidate, "tool" | "input" | "horizon" | "expectedLatencyBenefitMs">[]>;
+		=> Promise<readonly Pick<PatternAwareCandidate, "tool" | "input" | "horizon">[]>;
 	readonly finishSession: () => Promise<void>;
 	readonly dispose: () => Promise<void>;
 }
@@ -147,7 +146,7 @@ export function createPatternPlanSource({
 		...eventData(action.key.tool, action.input, output, durationMs), schemaHash: action.key.schemaHash, learnTarget: false,
 	});
 	const resourcePath = (target: string) => patternActionSemantics.actionKey("read", { path: target })?.resources[0];
-	const currentOperation = (binding: ExecutionOperationBinding) => binding.available !== false && binding.executionMs > 0 &&
+	const currentOperation = (binding: ExecutionOperationBinding) => binding.available !== false &&
 		binding.preparation === "current_workspace" && !binding.fed && typeof binding.stale === "function";
 	const observeWorkspace = async (state: CommandRerunState | undefined) => {
 		if (!state?.native || state !== commandRerun || ![...operationBindings.values()].some(({ binding }) => currentOperation(binding))) return;
@@ -176,12 +175,11 @@ export function createPatternPlanSource({
 				operations = new Map();
 				for (const item of operationBindings.values()) {
 					if (item.binding.available === false) operationBindings.delete(item.key);
-					else if (item.binding.executionMs > 0) {
+					else {
 						const choices = operations.get(item.parentHash) ?? [];
 						choices.push(item); operations.set(item.parentHash, choices);
 					}
 				}
-				for (const choices of operations.values()) choices.sort((left, right) => right.binding.executionMs - left.binding.executionMs);
 			}
 			const choices = parentHash === undefined ? undefined : operations.get(parentHash);
 			if (!choices?.length) return [action];
@@ -189,8 +187,6 @@ export function createPatternPlanSource({
 				id: `${action.id}:operation:${operation.binding.identity}`, type: "operation" as const, operation: operation.binding,
 				// Waiting on its producer, it takes only capacity nothing else wants.
 				...(operation.binding.fed ? { background: true } : {}),
-				expectedDurationMs: operation.binding.expectedDurationMs,
-				expectedLatencyBenefitMs: Math.min(candidate.expectedLatencyBenefitMs, candidate.empiricalProbability * operation.binding.executionMs),
 				feedback: { ...action.feedback, operation },
 			}));
 		});
@@ -205,38 +201,28 @@ export function createPatternPlanSource({
 		state.workspaceChanged = false; state.observedChange = false; state.retry = undefined; state.issued = undefined;
 		const commands = [...learnedCommands.values()].reverse();
 		if (retry) commands.sort((left, right) => Number(right === retry) - Number(left === retry));
-		else if (observedOnly) {
-			const costs = new Map<string, number>();
-			for (const { parentHash, binding } of operationBindings.values()) if (currentOperation(binding))
-				costs.set(parentHash, Math.max(costs.get(parentHash) ?? 0, binding.executionMs));
-			commands.sort((left, right) => (costs.get(right.parentHash) ?? 0) - (costs.get(left.parentHash) ?? 0));
-		}
 		for (const command of commands) {
 			if (!state.native && command !== retry || command.schemaHash !== schemaHashes[command.tool]) continue;
 			const children = [...operationBindings.values()].filter(item => item.parentHash === command.parentHash && item.binding.available !== false && (!observedOnly || currentOperation(item.binding)))
-				.sort((left, right) => right.binding.executionMs - left.binding.executionMs).slice(0, observedOnly ? patternSettings.beamWidth : undefined);
+				.slice(0, observedOnly ? patternSettings.beamWidth : undefined);
 			const stale = (await Promise.all(children.map(async ({ binding }) => {
-				const changed = binding.executionMs > 0 ? await binding.stale?.() : false;
+				const changed = await binding.stale?.();
 				return (observedOnly ? changed === true : changed !== false) ? binding : undefined;
 			})))
-				.filter((binding): binding is ExecutionOperationBinding => !!binding).sort((left, right) => right.executionMs - left.executionMs);
+				.filter((binding): binding is ExecutionOperationBinding => !!binding);
 			if (state !== commandRerun) return NO_RERUN;
 			if (![...learnedCommands.values()].includes(command)) continue;
-			const fallback = command === retry && command.failure && !children.some(({ binding }) => binding.executionMs > 0);
+			const fallback = command === retry && command.failure && !children.length;
 			if (!stale.length && !fallback) continue;
 			const operation = stale.find(binding => binding.preparation === "current_workspace" && !binding.fed);
-			const store = await resolveStore(patternSettings);
 			if (state !== commandRerun) return NO_RERUN;
 			if (command === retry) state.retry = command;
 			const mode = command === retry ? "retry-failed-command" : "recent-command";
-			const expectedDurationMs = fallback ? command.failure!.durationMs : operation?.expectedDurationMs ?? Math.max(...children.map(({ binding }) => binding.expectedDurationMs));
-			const priorBenefitMs = fallback ? command.failure!.durationMs * 0.25 : operation?.executionMs ?? stale.reduce((total, binding) => total + binding.executionMs, 0);
 			const feedback = state.issued = { observedOnly, presetID: mode };
 			if (operation) rerunOperations.set(feedback, children.find(item => item.binding === operation)!);
 			return [[{ id: `rerun:${command.parentHash}`, type: operation ? "operation" : "tool_call", ...(operation ? { operation } : {}),
-				tool: command.tool, input: command.input, horizon: 0, producesOperations: true, mode, feedback, reuseFeedback: store.presetReuseFeedback(mode),
-				...(fallback ? { empiricalProbability: 0.25, conditionalProbability: 0.25 } : {}),
-				expectedLatencyBenefitMs: store.presetExpectedBenefit(mode, priorBenefitMs, expectedDurationMs), expectedDurationMs }],
+				tool: command.tool, input: command.input, horizon: 0, producesOperations: true, mode, feedback,
+				...(fallback ? { empiricalProbability: 0.25, conditionalProbability: 0.25 } : {}) }],
 				action => (action.type !== "tool_call" || patternActionSemantics.actionKey(action.tool, asRecord(action.input) ?? {}, schemaHashes[action.tool])?.hash !== command.parentHash) &&
 					(operation ? action.operation?.identity !== operation.identity : !children.some(({ binding }) => binding.identity === action.operation?.identity && !binding.fed))];
 		}
@@ -339,7 +325,7 @@ export function createPatternPlanSource({
 			// A command mentioning a path is not evidence that its failure reported that file.
 			const paths = tool === "bash" && output?.isError ? [...new Set([...(extractOutputPaths(tool, {}, output.result) ?? []), ...(observed.outputLocations ?? []).map(location => location.path)]
 				.flatMap(target => resourcePath(target) ?? []))] : [];
-			const failure = paths.length && Number.isFinite(durationMs) && durationMs > 0 ? { paths, durationMs } : undefined;
+			const failure = paths.length ? { paths } : undefined;
 			if (parentHash && (bound || learnedCommands.get(parentHash) || patternSettings.presets.includes("retry-failed-command") && failure))
 				learnedCommands.set(parentHash, { parentHash, tool, input: observed.input, ...(schemaHash === undefined ? {} : { schemaHash }), ...(failure ? { failure } : {}) });
 			if (rerunState && rerunState === commandRerun && actionSemantics.toolNames("workspace_mutation").includes(tool)) {
@@ -399,13 +385,6 @@ export function createPatternPlanSource({
 			issuedParents.add(context.continuation);
 			for (const support of [context.continuation, ...context.patternIDs]) context.store.issued(support);
 		},
-		onExecutionSettled: ({ reuseFeedback, executionMs }) => {
-			const utility = asPatternUtilityFeedback(reuseFeedback)?.utility;
-			if (!utility || !Number.isFinite(executionMs) || executionMs < 0) return;
-			// Runtime calls this once for the physical owner, including failed/cancelled runs, not for each prediction sharing it.
-			utility.productions++;
-			utility.productionMs += executionMs;
-		},
 		onSettled: ({ feedback, settlement }) => {
 			if (lifecycle.sealed) return;
 			const context = asPatternPlanFeedback(feedback);
@@ -450,18 +429,14 @@ export function createPatternPlanSource({
 		hints: ({ sessionID, schemaHashes, settings }) => admit(settings, async (patternSettings) => {
 			await analysisTail;
 			return !patternSettings.enabled ? [] : (await resolveStore(patternSettings)).predict(sessionID, schemaHashes, patternSettings)
-				.slice(0, 4).map(({ tool, input, horizon, expectedLatencyBenefitMs }) => ({ tool, input, horizon, expectedLatencyBenefitMs }));
+				.slice(0, 4).map(({ tool, input, horizon }) => ({ tool, input, horizon }));
 		}),
 		turnStarted: observeTurn,
 		turnFinished: observeTurn,
 		// Serving the Actor is recorded before the owning prediction settles, which credits it even when unmatched.
-		actorActionSettled: ({ settlement, candidateFeedback: feedback, reusedComputations }) => {
+		actorActionSettled: ({ settlement, candidateFeedback: feedback }) => {
 			if (settlement.provider.kind === "speculative" && asPatternPlanFeedback(feedback)) served.add(feedback as PatternPlanFeedback);
-			for (const share of reusedComputations ?? []) {
-				const utility = share.source === "pattern_aware" ? asPatternUtilityFeedback(share.feedback)?.utility : undefined;
-				if (utility && Number.isFinite(share.reusedExecutionMs) && share.reusedExecutionMs > 0)
-					utility.reusedExecutionMs += share.reusedExecutionMs;
-			}
+
 		},
 		finishSession: () => lifecycle.run(async () => {
 			await lifecycle.drain();
@@ -522,13 +497,6 @@ function asPatternPlanFeedback(value: unknown): PatternPlanFeedback | undefined 
 	return value as PatternPlanFeedback;
 }
 
-function asPatternUtilityFeedback(value: unknown): PatternAwareReuseFeedback | undefined {
-	const feedback = asRecord(value), utility = asRecord(feedback?.utility);
-	return feedback?.kind === "pattern_utility" && utility && ["productions", "productionMs", "reusedExecutionMs"]
-		.every(key => typeof utility[key] === "number" && Number.isFinite(utility[key]) && utility[key] >= 0)
-		? value as PatternAwareReuseFeedback : undefined;
-}
-
 function patternPlanAction(
 	candidate: PatternAwareCandidate,
 	store: PatternAwareStore,
@@ -540,14 +508,12 @@ function patternPlanAction(
 		type: "tool_call",
 		tool: candidate.tool,
 		...(candidate.presetID ? { mode: candidate.presetID } : {}),
-		...(candidate.presetID ? { reuseFeedback: store.presetReuseFeedback(candidate.presetID) } : {}),
 		input: widenReadGuess(candidate.tool, candidate.input),
 		horizon: candidate.horizon,
 		latestHorizon: candidate.latestHorizon,
 		empiricalProbability: candidate.empiricalProbability,
 		conditionalProbability: candidate.conditionalProbability,
-		expectedDurationMs: candidate.expectedDurationMs,
-		expectedLatencyBenefitMs: candidate.expectedLatencyBenefitMs,
+		confidence: candidate.confidence,
 		...(candidate.background ? { background: true } : {}),
 		depth: candidate.depth,
 		...(dependsOn?.length ? { dependsOn } : {}),

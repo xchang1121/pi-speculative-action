@@ -14,7 +14,6 @@ export interface PatternRecurrentAction {
 	count: number;
 	/** Sufficient statistics at lastSeenSequence; count retains the actual support threshold. */
 	weightedCount: number;
-	weightedDurationMs: number;
 	lastSeenSequence: number;
 }
 

@@ -1,12 +1,10 @@
 import { hash, randomUUID } from "node:crypto";
 import { errorMessage } from "./error-utils.ts";
 import type { Api, AssistantMessageEvent, Context, Model } from "@earendil-works/pi-ai";
-import { DEFAULT_BENEFIT_GATE_POLICY, BenefitGate, type BenefitGatePolicy } from "./fork-benefit-gate.ts";
 import { createActorForkPlanSource, type ActorProbeSchedule, type ActorProbeSnapshot, type ActorForkActionBatch, type ActorForkActionCall, type ActorForkPlanSource } from "./actor-fork-plan-source.ts";
 import type { MaterializedSpeculativeCandidate, PredictionFeedback } from "./runtime.ts";
 import type { ActionKey } from "./action-semantics.ts";
 import type { ActorActionSettlement } from "./settlement.ts";
-import type { ComputationReuseShare } from "./task-timing.ts";
 import { EvidenceLedger } from "./self-speculation-evidence.ts";
 import { asRecord as record, isRecord, stableStringify } from "./stable-json.ts";
 import { finiteNumber, nonNegativeFinite, nonNegativeCount } from "./number-utils.ts";
@@ -54,12 +52,6 @@ const { defaults: selfSpeculationDefaults, parse: parseSettings } = settingsPars
 	forkForcedPrefix: ["auto", textOr],
 	/** Require a capable engine to expose token logprobs to its SPORK fork. */
 	requireLogprobs: [false, booleanOr],
-	forkGateEnabled: [DEFAULT_BENEFIT_GATE_POLICY.enabled, booleanOr],
-	forkGateMinSamples: [DEFAULT_BENEFIT_GATE_POLICY.minSamples, positiveInteger],
-	forkGateWindowSize: [DEFAULT_BENEFIT_GATE_POLICY.windowSize, positiveInteger],
-	forkGateMinNetBenefitMs: [DEFAULT_BENEFIT_GATE_POLICY.minNetBenefitMs, nonNegativeNumber],
-	forkGateProbeInterval: [DEFAULT_BENEFIT_GATE_POLICY.probeInterval, positiveInteger],
-	forkGateFailureThreshold: [DEFAULT_BENEFIT_GATE_POLICY.failureThreshold, positiveInteger],
 });
 
 export const SELF_SPECULATION_DEFAULTS: SelfSpeculationSettings = Object.freeze(selfSpeculationDefaults);
@@ -67,7 +59,6 @@ export const SELF_SPECULATION_DEFAULTS: SelfSpeculationSettings = Object.freeze(
 export function normalizeSelfSpeculationSettings(value: unknown): SelfSpeculationSettings {
 	const input = isRecord(value) ? value : {};
 	const result = parseSettings(input);
-	result.forkGateWindowSize = Math.max(result.forkGateMinSamples, result.forkGateWindowSize);
 	const apiKeyEnv = nonEmptyString(input.apiKeyEnv);
 	return apiKeyEnv ? { ...result, apiKeyEnv } : result;
 }
@@ -104,13 +95,8 @@ interface TurnState {
 	readonly agreedForkKeys: Set<string>;
 	readonly matchedForkKeys: Set<string>;
 	readonly reportedCandidates: Map<string, ReportedCandidate>;
-	readonly gateKey: string;
-	readonly forkUtility: { benefitMs: number; update?: (benefitMs: number) => void };
-	/** Summed probe compute; the Actor's streaming between retries costs the fork nothing. */
-	forkBusyMs?: number;
-	forkFailed: boolean;
+	readonly modelKey: string;
 	ended: boolean;
-	gateSampleRecorded: boolean;
 }
 
 /** Unknown until declared; a declaration serves only the kinds it lists as true. */
@@ -134,8 +120,7 @@ interface CandidateRecord {
 	latestDecisionSequence: number;
 	conditionalProbability: number;
 	empiricalProbability: number;
-	expectedLatencyBenefitMs: number;
-	expectedDurationMs: number;
+	expectedDurationMs?: number;
 }
 
 interface CandidateCalibration {
@@ -158,8 +143,6 @@ export class SelfSpeculationCoordinator {
 	private readonly draftFork: SelfSpeculationCoordinatorOptions["draftFork"];
 	/** Per endpoint; a control plane without the declaration keeps serving everything, as before negotiation existed. */
 	private readonly capabilities = new Map<string, ControlPlaneCapabilities>();
-	private readonly forkGate = new BenefitGate();
-	private readonly forkUtilities = new WeakSet<TurnState["forkUtility"]>();
 	private readonly decoderEvidence = new EvidenceLedger(4, 2);
 	private readonly actionEvidence = new EvidenceLedger(2, 1);
 	private readonly background = new Set<Promise<void>>();
@@ -189,13 +172,11 @@ export class SelfSpeculationCoordinator {
 		unresolvedDraftTokens: 0,
 		forkLatencyMs: 0,
 		forkLogprobTokens: 0,
-		forkGateSkips: 0,
 		forkActionAdoptions: 0,
 		failures: 0,
 	};
 	private lastVerification?: SelfSpeculationVerificationOutcome;
 	private totalForkLogprob = 0;
-	private latestGateKey?: string;
 	private lastFailure?: string;
 	private lastResolvedActorProfile?: string;
 	private lastProfileResolutionSource?: string;
@@ -236,15 +217,10 @@ export class SelfSpeculationCoordinator {
 			agreedForkKeys: new Set(),
 			matchedForkKeys: new Set(),
 			reportedCandidates: new Map(),
-			gateKey: modelKey(model),
-			forkUtility: { benefitMs: 0 },
-			forkFailed: false,
+			modelKey: modelKey(model),
 			ended: false,
-			gateSampleRecorded: false,
 		};
-		this.forkUtilities.add(this.active.forkUtility);
-		this.actorForkPlanSource.startTurn(turnID, this.active.forkUtility);
-		this.latestGateKey = modelKey(model);
+		this.actorForkPlanSource.startTurn(turnID);
 		if (settings.forkTransport !== "drafter" && !this.capabilities.has(settings.endpoint)) this.negotiate(settings);
 	}
 
@@ -307,8 +283,10 @@ export class SelfSpeculationCoordinator {
 				existing.provenance.push({ proposalID: candidate.proposalID, actionID: candidate.actionID });
 			for (const field of ["depth", "horizon"] as const)
 				existing[field] = Math.min(existing[field], finiteNumber(candidate[field]) ?? 0);
-			for (const field of ["conditionalProbability", "empiricalProbability", "expectedLatencyBenefitMs", "expectedDurationMs"] as const)
-				existing[field] = Math.max(existing[field], finiteNumber(candidate[field]) ?? 0);
+			for (const field of ["conditionalProbability", "empiricalProbability", "expectedDurationMs"] as const) {
+				const supplied = finiteNumber(candidate[field]);
+				if (supplied !== undefined) existing[field] = Math.max(existing[field] ?? 0, supplied);
+			}
 			existing.latestDecisionSequence = Math.max(existing.latestDecisionSequence, candidate.latestDecisionSequence);
 			return existing;
 		} else {
@@ -328,8 +306,7 @@ export class SelfSpeculationCoordinator {
 				latestDecisionSequence: candidate.latestDecisionSequence,
 				conditionalProbability: finiteNumber(candidate.conditionalProbability) ?? 0,
 				empiricalProbability: finiteNumber(candidate.empiricalProbability) ?? 0,
-				expectedLatencyBenefitMs: finiteNumber(candidate.expectedLatencyBenefitMs) ?? 0,
-				expectedDurationMs: finiteNumber(candidate.expectedDurationMs) ?? 0,
+				expectedDurationMs: finiteNumber(candidate.expectedDurationMs),
 			};
 			candidates.set(predictedAction.key, record);
 			return record;
@@ -358,18 +335,9 @@ export class SelfSpeculationCoordinator {
 			this.actorForkPlanSource.publish(state.turnID, []);
 			return;
 		}
-		if (probe.attempt === 1) {
-			const gateDecision = this.forkGate.decide(state.gateKey, forkGatePolicy(settings));
-			if (!gateDecision.allowed) {
-				this.counters.forkGateSkips++;
-				this.actorForkPlanSource.publish(state.turnID, []);
-				return;
-			}
-		} else {
-			this.counters.forkRetries++;
-		}
+		if (probe.attempt > 1) this.counters.forkRetries++;
 		this.counters.forkRequests++;
-		const probeStartedAt = performance.now(), signal = this.actorForkPlanSource.startProbe(state.turnID);
+		const signal = this.actorForkPlanSource.startProbe(state.turnID);
 		const task = (settings.forkTransport === "drafter" ? this.draftedFork(state, probe, signal) : this.post(
 			settings.forkPath,
 			{
@@ -390,20 +358,16 @@ export class SelfSpeculationCoordinator {
 			settings,
 			signal,
 		).then((receipt) => this.recordReceipt(receipt, state, true)))
-			.finally(() => { state.forkBusyMs = (state.forkBusyMs ?? 0) + performance.now() - probeStartedAt; })
 			.then((outcome) => {
 				const exhausted = this.actorForkPlanSource.finishProbe(state.turnID);
 				if (settings.forkActionEnabled && !outcome?.committed && !exhausted) return;
 				this.actorForkPlanSource.publish(state.turnID, state.settings.forkActionEnabled ? outcome?.batches ?? [] : []);
 				this.reconcileForkMatches(state);
-				this.finalizeGateSample(state);
 			})
 			.catch((error: unknown) => {
 				this.actorForkPlanSource.finishProbe(state.turnID);
 				this.actorForkPlanSource.publish(state.turnID, []);
-				if (signal?.aborted) { this.finalizeGateSample(state); return; }
-				state.forkFailed = true;
-				this.finalizeGateSample(state);
+				if (signal?.aborted) return;
 				throw error;
 			})
 			.finally(() => {
@@ -434,13 +398,7 @@ export class SelfSpeculationCoordinator {
 	}
 
 	/** Credit actual consumed producer work, including a retained fork from an earlier turn. */
-	observeActorSettlement(settlement: ActorActionSettlement, shares: readonly ComputationReuseShare[] = []): void {
-		for (const share of shares) {
-			const utility = share.feedback as TurnState["forkUtility"];
-			if (share.source !== "self-speculation" || !this.forkUtilities.has(utility)) continue;
-			utility.benefitMs += nonNegativeFinite(share.reusedExecutionMs);
-			utility.update?.(utility.benefitMs);
-		}
+	observeActorSettlement(settlement: ActorActionSettlement): void {
 		if (settlement.provider.kind === "speculative" && settlement.matchedPredictions.some(prediction => prediction.source === "self-speculation"))
 			this.counters.forkActionAdoptions++;
 	}
@@ -469,7 +427,7 @@ export class SelfSpeculationCoordinator {
 
 	private closeActive(preserveForRetry: boolean): void {
 		const state = this.active;
-		if (state) { state.ended = true; this.finalizeGateSample(state); this.actorForkPlanSource.closeTurn(state.turnID); }
+		if (state) { state.ended = true; this.actorForkPlanSource.closeTurn(state.turnID); }
 		this.active = undefined;
 		if (state && preserveForRetry && state.candidates.size) {
 			// The active decision owns its bundle exclusively; outstanding submissions keep the old snapshot.
@@ -491,7 +449,6 @@ export class SelfSpeculationCoordinator {
 	}
 
 	snapshot() {
-		const gate = this.latestGateKey ? this.forkGate.snapshot(this.latestGateKey) : undefined;
 		const decoderEvidence = this.decoderEvidence.snapshot();
 		const actionEvidence = this.actionEvidence.snapshot();
 		const snapshot = {
@@ -507,8 +464,6 @@ export class SelfSpeculationCoordinator {
 				: {}),
 			...(this.lastVerification ? { lastVerification: this.lastVerification } : {}),
 			...(this.counters.forkLogprobTokens > 0 ? { forkMeanLogprob: this.totalForkLogprob / this.counters.forkLogprobTokens } : {}),
-			forkGateSamples: gate?.samples ?? 0,
-			...(gate?.expectedNetBenefitMs === undefined ? {} : { forkGateExpectedNetBenefitMs: gate.expectedNetBenefitMs }),
 			decoderEvidenceContexts: decoderEvidence.contexts,
 			decoderVerificationSteps: decoderEvidence.observations,
 			actionEvidenceContexts: actionEvidence.contexts,
@@ -670,14 +625,6 @@ export class SelfSpeculationCoordinator {
 		}
 	}
 
-	private finalizeGateSample(state: TurnState): void {
-		if (state.gateSampleRecorded || !state.ended || state.forkBusyMs === undefined) return;
-		state.gateSampleRecorded = true;
-		const observation = { benefitMs: state.forkUtility.benefitMs, costMs: state.forkBusyMs, failed: state.forkFailed };
-		const update = this.forkGate.observe(state.gateKey, observation, forkGatePolicy(state.settings));
-		state.forkUtility.update = benefitMs => update({ ...observation, benefitMs });
-	}
-
 	/** Ask once which requests the endpoint serves; any failure leaves the legacy behavior (everything is attempted). */
 	private negotiate(settings: SelfSpeculationSettings): void {
 		this.capabilities.set(settings.endpoint, {});
@@ -767,22 +714,6 @@ function forkPayload(settings: SelfSpeculationSettings) {
 		require_logprobs: requiresForkLogprobs(settings),
 		max_draft_tokens: settings.maxDraftTokens,
 		...(settings.draftBoundary === "auto" ? {} : { draft_boundary: settings.draftBoundary }),
-		fork_gate: forkGatePayload(settings),
-	};
-}
-
-function forkGatePayload(settings: SelfSpeculationSettings): Readonly<Record<string, unknown>> {
-	return Object.fromEntries(Object.entries(forkGatePolicy(settings)).map(([key, value]) => [key.replace(/[A-Z]/g, letter => `_${letter.toLowerCase()}`), value]));
-}
-
-function forkGatePolicy(settings: SelfSpeculationSettings): BenefitGatePolicy {
-	return {
-		enabled: settings.forkGateEnabled,
-		minSamples: settings.forkGateMinSamples,
-		windowSize: settings.forkGateWindowSize,
-		minNetBenefitMs: settings.forkGateMinNetBenefitMs,
-		probeInterval: settings.forkGateProbeInterval,
-		failureThreshold: settings.forkGateFailureThreshold,
 	};
 }
 
@@ -808,7 +739,6 @@ function candidatePayload(candidate: CandidateRecord, calibration: CandidateCali
 			latest_decision_sequence: candidate.latestDecisionSequence,
 			conditional_probability: candidate.conditionalProbability,
 			empirical_probability: candidate.empiricalProbability,
-			expected_latency_benefit_ms: candidate.expectedLatencyBenefitMs,
 			expected_duration_ms: candidate.expectedDurationMs,
 		},
 	};
@@ -824,8 +754,6 @@ function rankedCandidates(candidates: Iterable<CandidateRecord>, calibration: (c
 				right.calibration.decoderProbability - left.calibration.decoderProbability ||
 				right.candidate.conditionalProbability - left.candidate.conditionalProbability ||
 				right.candidate.empiricalProbability - left.candidate.empiricalProbability ||
-				right.candidate.expectedLatencyBenefitMs - left.candidate.expectedLatencyBenefitMs ||
-				right.candidate.expectedDurationMs - left.candidate.expectedDurationMs ||
 				left.candidate.depth - right.candidate.depth ||
 				left.candidate.sequence - right.candidate.sequence,
 		);
@@ -857,7 +785,7 @@ const originOf = (value: string | undefined) => URL.canParse(value ?? "") ? new 
 
 function decoderEvidenceContext(state: TurnState, tool: string, source: string) {
 	return {
-		model: state.gateKey,
+		model: state.modelKey,
 		endpoint: state.settings.endpoint,
 		actorProfile: state.settings.actorProfile,
 		format: state.settings.draftFormat,
@@ -868,7 +796,7 @@ function decoderEvidenceContext(state: TurnState, tool: string, source: string) 
 }
 
 function actionEvidenceContext(state: TurnState, tool: string, source: string) {
-	return { model: state.gateKey, tool, source };
+	return { model: state.modelKey, tool, source };
 }
 
 function parseVerificationOutcome(

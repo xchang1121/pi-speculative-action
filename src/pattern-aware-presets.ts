@@ -19,7 +19,7 @@ export const PATTERN_AWARE_PRESETS = Object.freeze([
 export type PatternAwarePresetID = typeof PATTERN_AWARE_PRESETS[number]["id"];
 export type PatternPresetAction = {
 	kind: string; presetID: PatternAwarePresetID; tool: "read" | "grep"; input: Record<string, unknown>; prior: number;
-	durationMs?: number; schemaHash?: string;
+	schemaHash?: string;
 };
 
 /** Stateless suggestions from observed facts. The caller owns feedback, canonical coverage and admission. */
@@ -127,7 +127,7 @@ export function patternPresetActions(
 			// Any real repeat after this edit consumes the opportunity, even when its result is a failure.
 			if (!identity || scoped.some(event => event.sequence > edit.sequence && event.tool === "grep" && actionIdentity(event) === identity)) continue;
 			ranked.push({ kind: "recheck-search", presetID: "recheck-search", tool: "grep", input: search.input,
-				prior: 0.2, durationMs: Number.isFinite(search.durationMs) ? Math.max(0, search.durationMs) : 0,
+				prior: 0.2,
 				...(search.schemaHash === undefined ? {} : { schemaHash: search.schemaHash }) });
 			break;
 		}

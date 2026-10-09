@@ -1,408 +1,236 @@
 import { nonNegativeCount as sequence, nonNegativeFinite as finite, positiveCount as units } from "./number-utils.ts";
 import { BoundedRecencyMap } from "./bounded-recency-map.ts";
 import type { WorldCompatibilityEvidence } from "./execution-world.ts";
-import { DEFAULT_BENEFIT_GATE_POLICY } from "./fork-benefit-gate.ts";
-import { fitsResourceBudget } from "./resource-budget.ts";
+import { RESOURCE_DIMENSIONS as dimensions, type ExecutionResourceMonitor, type ExecutionResourceSnapshot, type HardwareResources } from "./system-resources.ts";
 
-export interface PredictionForecast extends ServiceTimingIdentity {
+export interface ExecutionIdentity {
+	readonly tool: string;
+	readonly semanticsEpoch?: string;
+	readonly executionFingerprint?: string;
+	readonly actionKeyHash?: string;
+}
+
+/** Current work and dependency facts. Duration is an explicit bound for this execution, never a learned service time. */
+export interface PredictionForecast extends ExecutionIdentity {
 	readonly expectedDurationMs?: number;
-	readonly resourceDemand?: number;
+	readonly elapsedMs?: number;
+	readonly resourceDemand?: number | HardwareResources;
 	readonly decisionBatchesUntilCall?: number;
-	readonly actorPhase?: { readonly kind: "decision" | "cycle"; readonly elapsedMs: number; };
-	readonly criticalPathMs?: number;
-	readonly expectedLatencyBenefitMs?: number;
-	/** Measured value unlocked in later actions; runtime allocates each opportunity over its unfinished prerequisites. */
-	readonly downstreamBenefits?: readonly { readonly opportunity: string; readonly expectedBenefitMs: number }[];
-	/** A model source's calibrated chance the Actor makes this call; without a benefit estimate it scales the work's value. */
+	readonly criticalPathSteps?: number;
 	readonly hitProbability?: number;
+	readonly confidence?: number;
 	readonly adoptionProbability?: number;
 	readonly background?: boolean;
-	/** Dependencies have settled and this action is their immediate zero-horizon successor. */
+	readonly actorDemand?: boolean;
+	readonly actorHint?: boolean;
 	readonly dependenciesResolved?: boolean;
 }
 
 export interface ScheduledWork {
-	readonly expectedDurationMs: number;
+	readonly expectedDurationMs?: number;
+	readonly elapsedMs: number;
+	readonly resources: HardwareResources;
 	readonly resourceUnits: number;
 	readonly decisionBatchesUntilCall: number;
-	readonly criticalPathMs: number;
-	readonly priorityMs: number;
+	readonly criticalPathSteps: number;
+	readonly confidence: number;
 	readonly background: boolean;
+	readonly actorDemand: boolean;
+	readonly actorHint: boolean;
+	readonly dependenciesResolved: boolean;
 }
 
-export interface ServiceTimingIdentity {
-	readonly tool: string;
-	readonly semanticsEpoch?: string;
-	/** Stable execution environment shared by comparable service samples. */
-	readonly executionFingerprint?: string;
-	/** Exact K(a), before falling back to the wider timing class. */
-	readonly actionKeyHash?: string;
+export const CANDIDATE_JOIN_TIMEOUT_MS = 1_000;
+export function candidateJoinBudget(state: "queued" | "running" | "succeeded"): number {
+	return state === "succeeded" ? 0 : CANDIDATE_JOIN_TIMEOUT_MS;
 }
+export type CandidateWaitResult<T> = { readonly status: "completed"; readonly value: T } | { readonly status: "aborted" } | { readonly status: "deadline" };
 
-export interface CandidateJoinPolicy {
-	/** Wait cap without measured producer completion or an action forecast (default: warm-up allowance). */
-	readonly uncalibratedWaitMs?: number;
-	/** Uncertainty allowance added to the estimated remaining-time deadline during warm-up. */
-	readonly warmupWaitMs: number;
-	/** Slack applied to a high-quantile remaining-time estimate. */
-	readonly durationSlack: number;
-}
-
-export interface CandidateJoinRequest {
-	/** The existing producer whose completion the Actor may await. */
-	readonly identity: ServiceTimingIdentity;
-	readonly state: "queued" | "running" | "succeeded";
-	/** Omit an unknown forecast; observed producer service still takes precedence. */
-	readonly expectedSpeculativeDurationMs?: number;
-	readonly elapsedMs?: number;
-}
-
-type CandidateJoinReason = "ready" | "waiting" | "deadline";
-
-export interface CandidateJoinDecision {
-	readonly allowed: boolean;
-	readonly reason: CandidateJoinReason;
-	/** Zero for a completed candidate. A finite positive value is an Actor-side deadline. */
-	readonly waitBudgetMs: number;
-}
-
-export type CandidateWaitResult<T> =
-	| { readonly status: "completed"; readonly value: T }
-	| { readonly status: "aborted" }
-	| { readonly status: "deadline" };
-
-/** Owns cancellation/deadline settlement for producer requests and in-flight adoption. */
-export async function waitForCandidate<T>(
-	promise: Promise<T>,
-	signal?: AbortSignal,
-	waitBudgetMs?: number,
-): Promise<CandidateWaitResult<T>> {
+/** Protocol deadline and cancellation, independent of scheduling value or past executions. */
+export async function waitForCandidate<T>(promise: Promise<T>, signal?: AbortSignal, waitBudgetMs?: number): Promise<CandidateWaitResult<T>> {
 	if (signal?.aborted) { void promise.catch(() => undefined); return { status: "aborted" }; }
 	const bounded = waitBudgetMs !== undefined && Number.isFinite(waitBudgetMs);
 	if (!signal && !bounded) return { status: "completed", value: await promise };
 	return new Promise((resolve, reject) => {
-		let settled = false;
-		let timer: ReturnType<typeof setTimeout> | undefined;
+		let settled = false, timer: ReturnType<typeof setTimeout> | undefined;
 		const finish = (complete: () => void) => {
 			if (settled) return;
-			settled = true;
-			if (timer) clearTimeout(timer);
-			signal?.removeEventListener("abort", aborted);
-			complete();
+			settled = true; clearTimeout(timer); signal?.removeEventListener("abort", aborted); complete();
 		};
 		const aborted = () => finish(() => resolve({ status: "aborted" }));
 		signal?.addEventListener("abort", aborted, { once: true });
 		if (bounded) timer = setTimeout(() => finish(() => resolve({ status: "deadline" })), Math.max(0, waitBudgetMs));
-		void promise.then((value) => finish(() => resolve({ status: "completed", value })), (error) => finish(() => reject(error)));
+		void promise.then(value => finish(() => resolve({ status: "completed", value })), error => finish(() => reject(error)));
 	});
 }
 
-export type SchedulerAdmission =
-	| { readonly admitted: true; readonly work: ScheduledWork }
-	| { readonly admitted: false; readonly work: ScheduledWork; readonly reason: "budget_exhausted" | "failure_circuit"; };
+type Role = "execution" | "preparation" | "actor";
+export interface SchedulingScope { readonly owner: object; readonly limit: number; }
+interface SchedulerEntry<Job> {
+	readonly job: Job; readonly scope: SchedulingScope; readonly role: Role; readonly sequence: number;
+	work: ScheduledWork;
+}
+export type SchedulerAdmission = { readonly admitted: true; readonly work: ScheduledWork } |
+	{ readonly admitted: false; readonly work: ScheduledWork; readonly reason: "budget_exhausted" | "failure_circuit" | "outside_launch_window" };
+export type WorldCompatibilityDecision = { readonly compatible: true } | {
+	readonly compatible: false;
+	readonly code: "backend_incompatible" | "backend_indeterminate" | "execution_fingerprint_changed";
+	readonly detail?: string;
+};
+interface SchedulerOptions {
+	readonly resources?: ExecutionResourceMonitor;
+	readonly active?: () => boolean;
+	readonly changed?: () => void;
+}
 
-export type WorldCompatibilityDecision =
-	| { readonly compatible: true }
-	| {
-			readonly compatible: false;
-			readonly code: "backend_incompatible" | "backend_indeterminate" | "execution_fingerprint_changed";
-			readonly detail?: string;
-	  };
+const add = (target: HardwareResources, source: HardwareResources, scale = 1) => {
+	for (const key of dimensions) if (source[key] !== undefined) target[key] = (target[key] ?? 0) + finite(source[key]) * scale;
+	return target;
+};
 
-interface SchedulerEntry<Job> { readonly job: Job; work: ScheduledWork; readonly sequence: number; }
-
-/** Owns forecast aggregation, timing observations, capacity, and preemption. */
+/** One physical ledger and ordering for all sessions, preparations, producers and real Actor work. */
 export class SpeculationScheduler<Job extends object> {
 	private readonly entries = new Map<Job, SchedulerEntry<Job>>();
-	private readonly speculativeServiceTimes = new BoundedRecencyMap<string, SampleWindow>(1024);
-	private readonly nativeServiceTimes = new BoundedRecencyMap<string, SampleWindow>(1024);
-	private readonly actorDecisionDurations = new SampleWindow();
-	private readonly actorCycles = new SampleWindow();
-	private readonly candidateJoinPolicy: CandidateJoinPolicy;
+	private readonly failures = new BoundedRecencyMap<string, { count: number; probes: number; decisions: WeakMap<object, { sequence: number; allowed: boolean }> }>(1024);
 	private sequence = 0;
 	private decisionSequence = 0;
+	private hardware?: ExecutionResourceSnapshot;
+	private capacity: HardwareResources = {};
+	private admission: HardwareResources = {};
+	private timer?: ReturnType<typeof setTimeout>;
+	private sampling = false;
+	private readonly options: SchedulerOptions;
+	constructor(options: SchedulerOptions = {}) { this.options = options; if (options.resources) this.updateResources(options.resources.initial); }
 
-	constructor(options: { readonly candidateJoinPolicy?: Partial<CandidateJoinPolicy> } = {}) {
-		const policy = options.candidateJoinPolicy;
-		this.candidateJoinPolicy = Object.freeze({
-			...(policy?.uncalibratedWaitMs === undefined ? {} : { uncalibratedWaitMs: finite(policy.uncalibratedWaitMs) }),
-			warmupWaitMs: finite(policy?.warmupWaitMs ?? 25),
-			durationSlack: Math.max(1, finite(policy?.durationSlack ?? 1.25)),
-		});
+	evaluate(forecasts: readonly PredictionForecast[]): ScheduledWork {
+		const resources: HardwareResources = {}, durations = forecasts.flatMap(f => f.expectedDurationMs === undefined ? [] : [finite(f.expectedDurationMs)]);
+		for (const forecast of forecasts) {
+			const demand = typeof forecast.resourceDemand === "number" ? { cpu: units(forecast.resourceDemand) } : forecast.resourceDemand ?? { cpu: 1 };
+			for (const key of dimensions) if (demand[key] !== undefined) resources[key] = Math.max(resources[key] ?? 0, finite(demand[key]));
+		}
+		return {
+			...(durations.length ? { expectedDurationMs: Math.max(...durations) } : {}),
+			elapsedMs: Math.max(0, ...forecasts.map(f => finite(f.elapsedMs))), resources, resourceUnits: Math.max(1, resources.cpu ?? 0),
+			decisionBatchesUntilCall: Math.min(...forecasts.map(f => sequence(f.decisionBatchesUntilCall))),
+			criticalPathSteps: Math.max(1, ...forecasts.map(f => units(f.criticalPathSteps))),
+			confidence: Math.max(0, ...forecasts.map(f => Math.min(1, finite(f.confidence ?? ((f.hitProbability ?? 1) * (f.adoptionProbability ?? 1)))))),
+			background: forecasts.length > 0 && forecasts.every(f => f.background),
+			actorDemand: forecasts.some(f => f.actorDemand), actorHint: forecasts.some(f => f.actorHint),
+			dependenciesResolved: forecasts.some(f => f.dependenciesResolved),
+		};
 	}
 
-	admit(
-		job: Job,
-		forecasts: readonly PredictionForecast[],
-		capacity: number,
-		role: "producer" | "actor" = "producer",
-		/** Ranking may supply its estimate from the same synchronous admission pass. */
-		work: ScheduledWork = this.evaluate(forecasts),
-		/** Physical producer identity; consumer forecasts can describe projected actions. Omit for confirmed Actor previews. */
-		executionIdentity?: ServiceTimingIdentity,
-	): SchedulerAdmission {
-		if (role === "producer") {
-			// Before the budget: a job the circuit refuses must not make room for itself by preempting others.
-			if (executionIdentity?.actionKeyHash &&
-				this.speculativeServiceTimes.get(timingKeys(executionIdentity)[0]!)?.allowExecution(job, this.decisionSequence) === false)
-				return { admitted: false, work, reason: "failure_circuit" };
-			if (!fitsResourceBudget(this.entries.values(), work.resourceUnits, capacity))
-				return { admitted: false, work, reason: "budget_exhausted" };
+	/** Advance with the live Actor/dependency frontier, keeping distant mutable inputs uncaptured. */
+	ready(work: ScheduledWork): boolean { return work.actorDemand || work.dependenciesResolved || work.decisionBatchesUntilCall <= work.criticalPathSteps; }
+
+	compare(left: ScheduledWork, right: ScheduledWork): number {
+		const remaining = (work: ScheduledWork) => work.expectedDurationMs === undefined ? undefined : Math.max(0, work.expectedDurationMs - work.elapsedMs);
+		const a = remaining(left), b = remaining(right);
+		return Number(right.actorDemand) - Number(left.actorDemand) ||
+			Math.max(0, left.decisionBatchesUntilCall - left.criticalPathSteps) - Math.max(0, right.decisionBatchesUntilCall - right.criticalPathSteps) ||
+			Number(right.actorHint) - Number(left.actorHint) || Number(left.background) - Number(right.background) ||
+			left.decisionBatchesUntilCall - right.decisionBatchesUntilCall || right.confidence - left.confidence ||
+			this.pressure(left) - this.pressure(right) || (a === undefined || b === undefined ? 0 : a - b);
+	}
+
+	admit(job: Job, forecasts: readonly PredictionForecast[], scope: SchedulingScope, role: Role = "execution", work = this.evaluate(forecasts), identity?: ExecutionIdentity): SchedulerAdmission {
+		if (role !== "actor" && !work.actorDemand) {
+			if (!this.ready(work)) return { admitted: false, work, reason: "outside_launch_window" };
+			const failed = identity && this.failures.get(executionKey(identity));
+			if (failed && failed.count >= 2) {
+				let decision = failed.decisions.get(job);
+				if (!decision || decision.sequence !== this.decisionSequence) {
+					decision = { sequence: this.decisionSequence, allowed: ++failed.probes % 4 === 0 }; failed.decisions.set(job, decision);
+				}
+				if (!decision.allowed) return { admitted: false, work, reason: "failure_circuit" };
+			}
+			if (this.shortages(work, scope).length) return { admitted: false, work, reason: "budget_exhausted" };
 		}
-		this.entries.set(job, { job, work, sequence: this.sequence++ });
+		this.entries.set(job, { job, work, scope, role, sequence: this.sequence++ });
+		this.watch();
 		return { admitted: true, work };
 	}
 
 	refresh(job: Job, forecasts: readonly PredictionForecast[]): ScheduledWork | undefined {
 		const entry = this.entries.get(job);
-		if (!entry) return undefined;
-		entry.work = this.evaluate(forecasts);
-		return entry.work;
+		// Updating demand/priority cannot return the hardware still owned by this physical execution.
+		if (entry) entry.work = { ...this.evaluate(forecasts), resources: entry.work.resources, resourceUnits: entry.work.resourceUnits };
+		return entry?.work;
+	}
+	complete(job: Job): boolean { return this.entries.delete(job); }
+	has(job: Job): boolean { return this.entries.has(job); }
+	advance(): void { this.decisionSequence++; }
+	observe(identity: ExecutionIdentity, failed: boolean): void {
+		const key = executionKey(identity);
+		if (!failed) this.failures.delete(key);
+		else this.failures.set(key, { count: (this.failures.get(key)?.count ?? 0) + 1, probes: 0, decisions: new WeakMap() });
 	}
 
-	complete(job: Job): boolean { return this.entries.delete(job); }
-
-	/** Choose cancellation victims; only their executor completion returns physical capacity. */
-	preemptFor(
-		resourceUnits: number,
-		capacity: number,
-		canPreempt: (job: Job) => boolean = () => true,
-		/** Cancelled work still draining returns its units soon: never a reason to cancel one more victim. */
-		releasing: (job: Job) => boolean = () => false,
-	): readonly Job[] {
-		const remaining = [...this.entries.values()].filter((entry) => !releasing(entry.job));
-		const victims: Job[] = [];
-		while (!fitsResourceBudget(remaining, resourceUnits, capacity)) {
-			const victim = remaining .filter((entry) => canPreempt(entry.job)) .sort(compareVictim)[0];
+	/** Cancellation never returns capacity. Draining victims are subtracted only while selecting more victims. */
+	preemptFor(scope: SchedulingScope, incoming: ScheduledWork | undefined, canPreempt: (job: Job) => boolean, draining: (job: Job) => boolean): readonly Job[] {
+		const remaining = this.snapshot().filter(entry => !draining(entry.job)), victims: Job[] = [];
+		const physical = !incoming || incoming.actorDemand;
+		if (incoming && !incoming.actorDemand && this.shortages(incoming, scope, [], physical).length) return victims;
+		for (let missing; (missing = this.shortages(incoming, scope, remaining, physical)).length;) {
+			const victim = remaining.filter(entry => entry.role !== "actor" && !entry.work.actorDemand && canPreempt(entry.job) &&
+				missing.some(key => key === "scope" ? entry.scope.owner === scope.owner : (entry.work.resources[key] ?? 0) > 0) &&
+				(!incoming || incoming.actorDemand || this.compare(incoming, entry.work) < 0))
+				.sort((a, b) => this.compare(b.work, a.work) || a.work.elapsedMs - b.work.elapsedMs || b.sequence - a.sequence)[0];
 			if (!victim) break;
-			remaining.splice(remaining.indexOf(victim), 1);
-			victims.push(victim.job);
+			remaining.splice(remaining.indexOf(victim), 1); victims.push(victim.job);
 		}
 		return victims;
 	}
 
-	/** Query existing service value without inventing cold benefits or changing admission state. */
-	measuredBenefitMs(forecast: PredictionForecast): number | undefined {
-		// Explicit source value already includes its own path, match and adoption calibration.
-		if (forecast.expectedLatencyBenefitMs !== undefined) return finite(forecast.expectedLatencyBenefitMs);
-		const native = this.timingEstimate(this.nativeServiceTimes, forecast, 0.5)?.value;
-		const probability = (value: number | undefined) => value === undefined ? 1 : Math.min(1, finite(value));
-		return native === undefined ? undefined : native * probability(forecast.hitProbability) * probability(forecast.adoptionProbability);
+	snapshot(owner?: object): readonly SchedulerEntry<Job>[] { return [...this.entries.values()].filter(entry => !owner || entry.scope.owner === owner); }
+	inspect() {
+		const usage = { actorUnits: 0, preparationUnits: 0, executionUnits: 0 }, reserved: HardwareResources = {};
+		for (const entry of this.entries.values()) { usage[`${entry.role}Units`] += entry.work.resourceUnits; add(reserved, entry.work.resources); }
+		return this.hardware && { ...this.hardware, admissionCapacity: this.admission.cpu ?? 0, ...usage, reserved, capacity: { ...this.capacity }, available: { ...this.admission } };
 	}
 
-	evaluate(forecasts: readonly PredictionForecast[]): ScheduledWork {
-		// Predictions of the same action in the same Actor batch share one chance of use.
-		const opportunities = new Map<string, { benefitMs: number; reachMs: number }>();
-		const downstream = new Map<string, number>();
-		let remaining = forecasts.length;
-		const work = forecasts.reduce((work, forecast) => {
-			remaining--;
-			for (const benefit of forecast.downstreamBenefits ?? []) if (benefit.opportunity)
-				downstream.set(benefit.opportunity, Math.max(downstream.get(benefit.opportunity) ?? 0, finite(benefit.expectedBenefitMs)));
-			const expectedDurationMs = this.duration(forecast) ?? 1;
-			const criticalPathMs = Math.max(expectedDurationMs, finite(forecast.criticalPathMs));
-			const runwayMs = this.actorRunway(forecast);
-			const benefitDurationMs = positive(forecast.expectedDurationMs, expectedDurationMs);
-			const runwayScale = runwayMs === undefined ? 1 : Math.min(1, runwayMs / benefitDurationMs);
-			work.expectedDurationMs = Math.max(work.expectedDurationMs, expectedDurationMs);
-			work.resourceUnits = Math.max(work.resourceUnits, units(forecast.resourceDemand));
-			work.decisionBatchesUntilCall = Math.min(work.decisionBatchesUntilCall, sequence(forecast.decisionBatchesUntilCall));
-			work.criticalPathMs = Math.max(work.criticalPathMs, criticalPathMs);
-			const benefitMs = forecast.expectedLatencyBenefitMs ?? (forecast.hitProbability === undefined ? undefined : forecast.hitProbability * (forecast.adoptionProbability ?? 1) * benefitDurationMs);
-			if (benefitMs === undefined) work.priorityMs = Math.max(work.priorityMs, criticalPathMs);
-			else {
-				const key = JSON.stringify([timingKeys(forecast)[0], sequence(forecast.decisionBatchesUntilCall)]);
-				const opportunity = opportunities.get(key) ?? { benefitMs: 0, reachMs: 0 };
-				opportunity.benefitMs = Math.max(opportunity.benefitMs, Math.min(benefitDurationMs, finite(benefitMs)) * runwayScale);
-				opportunity.reachMs = Math.max(opportunity.reachMs, benefitDurationMs * runwayScale);
-				opportunities.set(key, opportunity);
-			}
-			work.background = forecast.background === true && work.background;
-			return work;
-		}, {
-			expectedDurationMs: 0,
-			resourceUnits: 1,
-			decisionBatchesUntilCall: remaining ? Infinity : 0,
-			criticalPathMs: 0,
-			priorityMs: 0,
-			background: remaining > 0,
-		});
-		// Distinct opportunities can use the same result; merge their bounded values without mixing one source's
-		// probability with another source's longer duration. Duplicate evidence never increases a group's value.
-		let reachMs = 0, missed = 1;
-		for (const opportunity of opportunities.values()) reachMs = Math.max(reachMs, opportunity.reachMs);
-		if (reachMs > 0) {
-			for (const opportunity of opportunities.values()) missed *= 1 - opportunity.benefitMs / reachMs;
-			work.priorityMs = Math.max(work.priorityMs, (1 - missed) * reachMs);
+	watch(delay = 250): void {
+		if (!this.options.resources || this.timer || this.sampling || !this.options.active?.()) return;
+		this.timer = setTimeout(() => {
+			this.timer = undefined;
+			if (!this.options.active?.()) return;
+			this.sampling = true;
+			void this.options.resources!.sample().then(snapshot => {
+				if (this.options.active?.()) { this.updateResources(snapshot); this.options.changed?.(); }
+			}).catch(() => {}).finally(() => { this.sampling = false; this.watch(); });
+		}, delay);
+		this.timer.unref?.();
+	}
+	close(): void { clearTimeout(this.timer); this.timer = undefined; }
+
+	assessCompatibility(evidence: WorldCompatibilityEvidence, fingerprint: string): WorldCompatibilityDecision {
+		if (evidence.status !== "compatible") return { compatible: false, code: evidence.status === "incompatible" ? "backend_incompatible" : "backend_indeterminate", detail: evidence.detail ?? evidence.code };
+		return evidence.executionFingerprint === fingerprint ? { compatible: true } : { compatible: false, code: "execution_fingerprint_changed" };
+	}
+
+	private pressure(work: ScheduledWork): number {
+		return Math.max(0, ...dimensions.map(key => (work.resources[key] ?? 0) / Math.max(1e-9, this.capacity[key] ?? Infinity)));
+	}
+	private shortages(incoming: ScheduledWork | undefined, scope: SchedulingScope, entries = this.snapshot(), physical = false): (typeof dimensions[number] | "scope")[] {
+		const total = add({}, incoming?.resources ?? {}); let scoped = incoming?.resourceUnits ?? 0;
+		for (const entry of entries) { add(total, entry.work.resources); if (entry.scope.owner === scope.owner) scoped += entry.work.resourceUnits; }
+		const capacity = physical ? this.capacity : this.admission;
+		return [...(scoped > scope.limit ? ["scope" as const] : []),
+			...dimensions.filter(key => (total[key] ?? 0) > (capacity[key] ?? (key === "gpu" || key === "gpuMemory" ? 0 : Infinity)))];
+	}
+	private updateResources(snapshot: ExecutionResourceSnapshot): void {
+		if (!Number.isFinite(snapshot.cpuCount) || snapshot.cpuCount < 1) return;
+		this.hardware = snapshot;
+		this.capacity = { ...snapshot.capacity, cpu: units(snapshot.cpuCount) };
+		const allocated: HardwareResources = {};
+		for (const entry of this.entries.values()) add(allocated, entry.work.resources);
+		this.admission = { ...this.capacity };
+		for (const key of dimensions) {
+			const idle = key === "cpu" ? snapshot.idleCpuCount ?? Number((allocated.cpu ?? 0) === 0) : snapshot.available?.[key];
+			if (idle !== undefined && Number.isFinite(idle) && idle >= 0)
+				this.admission[key] = Math.min(this.capacity[key] ?? Infinity, (allocated[key] ?? 0) + (key === "cpu" ? Math.round(idle) : idle));
 		}
-		// This is ranking value only: prerequisites keep their own duration, capacity and join comparison.
-		for (const value of downstream.values()) work.priorityMs += value;
-		// Missing slots leave the numerical forecast indeterminate.
-		if (remaining) work.expectedDurationMs = work.resourceUnits = work.decisionBatchesUntilCall = work.criticalPathMs = work.priorityMs = NaN;
-		return work;
-	}
-
-	launchDelay(forecast: PredictionForecast, safetyMarginMs = 10): number {
-		if (forecast.dependenciesResolved || sequence(forecast.decisionBatchesUntilCall) <= 1) return 0;
-		const duration = this.duration(forecast, 0.9);
-		if (duration === undefined) return 0;
-		const availableMs = this.actorRunway(forecast, forecast.actorPhase ?? { kind: "cycle", elapsedMs: 0 }) ?? 0;
-		return Math.max(0, availableMs - duration - finite(safetyMarginMs));
-	}
-
-	assessCompatibility(evidence: WorldCompatibilityEvidence, actorExecutionFingerprint: string): WorldCompatibilityDecision {
-		if (evidence.status !== "compatible") {
-			return { compatible: false, code: evidence.status === "incompatible" ? "backend_incompatible" : "backend_indeterminate", detail: evidence.detail ?? evidence.code };
-		}
-		return evidence.executionFingerprint === actorExecutionFingerprint ? { compatible: true } : { compatible: false, code: "execution_fingerprint_changed" };
-	}
-
-	observeActorTiming(decisionDurationMs: number, cycleDurationMs?: number): void {
-		this.decisionSequence++;
-		this.actorDecisionDurations.observe(decisionDurationMs);
-		if (cycleDurationMs !== undefined) this.actorCycles.observe(cycleDurationMs);
-	}
-
-	/** Cancelled work supplies an exact-action duration floor, never a successful service sample. */
-	observeSpeculativeService(identity: ServiceTimingIdentity, durationMs: number, failed: boolean | "cancelled" = false): void {
-		if (!failed) this.observeTiming(this.speculativeServiceTimes, identity, durationMs);
-		else if (identity.actionKeyHash) {
-			// Failed attempts cannot stand in for successful service or affect unrelated actions in the timing class.
-			const key = timingKeys(identity)[0]!, samples = this.speculativeServiceTimes.get(key) ?? new SampleWindow();
-			if (failed === "cancelled") samples.observeLowerBound(durationMs);
-			else samples.observeFailure();
-			this.speculativeServiceTimes.set(key, samples);
-		}
-	}
-
-	/** Actual Actor computation informs scheduling value, never whether a ready result may be adopted. */
-	observeActorService(identity: ServiceTimingIdentity, durationMs: number): void {
-		this.observeTiming(this.nativeServiceTimes, identity, durationMs);
-	}
-
-	/** Ready work proceeds to validation; unfinished work receives a finite completion deadline. */
-	assessCandidateJoin(request: CandidateJoinRequest): CandidateJoinDecision {
-		if (request.state === "succeeded") return { allowed: true, reason: "ready", waitBudgetMs: 0 };
-		const policy = this.candidateJoinPolicy;
-		const speculative = this.timingEstimate(this.speculativeServiceTimes, request.identity, 0.9, "upper");
-		const elapsedMs = request.state === "running" ? finite(request.elapsedMs) : 0, forecastMs = finite(request.expectedSpeculativeDurationMs);
-		// Heterogeneous tool classes and cancelled runs cannot establish this producer's completion deadline.
-		const measuredMs = speculative?.exact && speculative.samples > 0 ? speculative.value : 0;
-		const expectedRemainingMs = Math.max(0, Math.max(measuredMs, forecastMs) - elapsedMs);
-		const waitBudgetMs = measuredMs || forecastMs ? expectedRemainingMs * policy.durationSlack + policy.warmupWaitMs
-			: policy.uncalibratedWaitMs ?? policy.warmupWaitMs;
-		return { allowed: waitBudgetMs > 0, reason: waitBudgetMs > 0 ? "waiting" : "deadline", waitBudgetMs };
-	}
-
-	snapshot(): readonly { readonly job: Job; readonly work: ScheduledWork }[] {
-		return [...this.entries.values()] .sort((left, right) => left.sequence - right.sequence) .map(({ job, work }) => ({ job, work }));
-	}
-
-	private actorRunway(forecast: PredictionForecast, phase = forecast.actorPhase): number | undefined {
-		if (!phase) return undefined;
-		const cycleMs = this.actorCycles.estimate(0.25);
-		const decisionMs = this.actorDecisionDurations.estimate(0.25);
-		const decisions = sequence(forecast.decisionBatchesUntilCall);
-		if (phase.kind === "decision") {
-			if (decisionMs === undefined) return undefined;
-			const futureCycles = Math.max(0, decisions - 1);
-			if (futureCycles > 0 && cycleMs === undefined) return undefined;
-			return Math.max(0, decisionMs - phase.elapsedMs) + futureCycles * (cycleMs ?? 0);
-		}
-		if (cycleMs !== undefined) return Math.max(0, decisions * cycleMs - phase.elapsedMs);
-		return decisions === 1 ? decisionMs : undefined;
-	}
-
-	private duration(forecast: PredictionForecast, quantile = 0.5): number | undefined {
-		const observed = this.timingEstimate(this.speculativeServiceTimes, forecast, quantile)?.value;
-		// A source's action-specific estimate remains a lower bound. Wider timing classes can
-		// conservatively raise scheduling cost, but must not make an explicitly long action look short.
-		return Math.max(finite(forecast.expectedDurationMs), observed ?? 0) || undefined;
-	}
-
-	private observeTiming(windows: BoundedRecencyMap<string, SampleWindow>, identity: ServiceTimingIdentity, durationMs: number): void {
-		for (const key of timingKeys(identity)) {
-			const samples = windows.get(key) ?? new SampleWindow();
-			samples.observe(durationMs);
-			windows.set(key, samples);
-		}
-	}
-
-	private timingEstimate(windows: BoundedRecencyMap<string, SampleWindow>, identity: ServiceTimingIdentity, quantile: number, selection: QuantileSelection = "lower"): TimingEstimate | undefined {
-		for (const [index, key] of timingKeys(identity).entries()) {
-			const window = windows.get(key), value = window?.estimate(quantile, selection);
-			if (value !== undefined) return { value, samples: window!.count, exact: Boolean(identity.actionKeyHash) && index === 0 };
-		}
-		return undefined;
 	}
 }
 
-interface TimingEstimate { readonly value: number; readonly samples: number; readonly exact: boolean; }
-
-class SampleWindow {
-	private readonly values: number[] = [];
-	private lowerBound = 0;
-	private sortedValues?: number[];
-	private suppressedSinceProbe = 0;
-	private failures?: { readonly count: number; readonly decisions: WeakMap<object, { readonly sequence: number; readonly allowed: boolean }>; };
-
-	get count(): number { return this.values.length; }
-
-	observe(value: number): void {
-		this.failures = undefined;
-		this.lowerBound = 0;
-		const normalized = finite(value);
-		if (normalized <= 0) return;
-		this.suppressedSinceProbe = 0;
-		this.sortedValues = undefined;
-		this.values.push(normalized);
-		if (this.values.length > 64) this.values.shift();
-	}
-
-	observeLowerBound(value: number): void { this.lowerBound = Math.max(this.lowerBound, finite(value)); }
-
-	observeFailure(): void { this.failures = { count: (this.failures?.count ?? 0) + 1, decisions: new WeakMap() }; this.suppressedSinceProbe = 0; }
-
-	/** Dispatch repeats do not consume probes; retained work can probe again after the next Actor decision. */
-	allowExecution(job: object, sequence: number): boolean {
-		if (!this.failures || this.failures.count < DEFAULT_BENEFIT_GATE_POLICY.failureThreshold) return true;
-		let decision = this.failures.decisions.get(job);
-		if (!decision || decision.sequence !== sequence) {
-			decision = { sequence, allowed: this.allowProbe() };
-			this.failures.decisions.set(job, decision);
-		}
-		return decision.allowed;
-	}
-
-	/** The same bounded evidence owns recovery, including decisions made before a probe settles. */
-	private allowProbe(): boolean {
-		if (++this.suppressedSinceProbe < DEFAULT_BENEFIT_GATE_POLICY.probeInterval) return false;
-		this.suppressedSinceProbe = 0;
-		return true;
-	}
-
-	estimate(value: number, selection: QuantileSelection = "lower"): number | undefined {
-		if (!this.values.length) return this.lowerBound || undefined;
-		const sorted = this.sortedValues ??= [...this.values].sort((left, right) => left - right);
-		const index = (sorted.length - 1) * Math.max(0, Math.min(1, value));
-		return Math.max(this.lowerBound, sorted[selection === "upper" ? Math.ceil(index) : Math.floor(index)]!);
-	}
-}
-
-type QuantileSelection = "lower" | "upper";
-
-function timingKeys(identity: ServiceTimingIdentity): readonly string[] {
-	const group = [identity.tool, identity.semanticsEpoch ?? "", identity.executionFingerprint ?? ""];
-	return [...(identity.actionKeyHash ? [JSON.stringify(["action", ...group, identity.actionKeyHash])] : []),
-		JSON.stringify(["class", ...group])];
-}
-
-function compareVictim<Job>(left: SchedulerEntry<Job>, right: SchedulerEntry<Job>): number {
-	return Number(right.work.background) - Number(left.work.background) || right.work.decisionBatchesUntilCall - left.work.decisionBatchesUntilCall ||
-		left.work.priorityMs - right.work.priorityMs || left.work.criticalPathMs - right.work.criticalPathMs || right.sequence - left.sequence;
-}
-
-function positive(value: number | undefined, fallback: number): number {
-	const normalized = finite(value);
-	return normalized > 0 ? normalized : Math.max(1, finite(fallback));
-}
+function executionKey(identity: ExecutionIdentity): string { return JSON.stringify([identity.tool, identity.semanticsEpoch, identity.executionFingerprint, identity.actionKeyHash]); }

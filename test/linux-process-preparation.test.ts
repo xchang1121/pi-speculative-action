@@ -90,9 +90,7 @@ describe("native preparation evidence", () => {
 		} finally { test.close(); }
 	});
 
-	it("temporarily backs off a useless parent when an additional request has no sealed result", async () => {
-		let clock = 100;
-		const timer = vi.spyOn(performance, "now").mockImplementation(() => clock);
+	it("preserves a parent when an additional request has no sealed failure evidence", async () => {
 		const test = fixture();
 		test.execute.mockImplementation(async () => {
 			// Hits, bypasses and unsealed failures do not report a new sealed negative.
@@ -103,14 +101,11 @@ describe("native preparation evidence", () => {
 			await expect(test.run()).rejects.toThrow("produced no reusable result");
 			expect(test.session.closedInputFailures).toBe(1);
 			expect(test.observe()).toBe(test.binding);
-			expect(test.binding.available).toBe(false);
-			await expect(test.run()).rejects.toThrow("binding is unavailable");
-			expect(test.execute).toHaveBeenCalledOnce();
-			clock += 12_000;
 			expect(test.binding.available).toBe(true);
 			test.execute.mockResolvedValue({ kind: "executed", reusable: true, exit: { kind: "code", code: 0 } });
 			await expect(test.run()).resolves.toMatchObject({ exit: { code: 0 } });
-		} finally { test.close(); timer.mockRestore(); }
+			expect(test.execute).toHaveBeenCalledTimes(2);
+		} finally { test.close(); }
 	});
 
 	it.each(["completed", "one-shot", "continuation", "nonzero"] as const)("preserves %s evidence independently of disk publication", async kind => {

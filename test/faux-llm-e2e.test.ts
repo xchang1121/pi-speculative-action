@@ -28,7 +28,7 @@ describe("faux LLM speculative action end to end", () => {
 		const calls = ready.map((_, index) => fauxToolCall("read", { path: `${index}.txt` }));
 		await Promise.all(ready.map((_, index) => writeFile(path.join(cwd, `${index}.txt`), "one\ntwo\nthree\n")));
 		const result = await runAgent({
-			cwd, sessionID: "completed-hit", tools: [fileRead(cwd)], settings: { ...drafterSettings(), drafterMaxDepth: 0, drafterGateEnabled: false },
+			cwd, sessionID: "completed-hit", tools: [fileRead(cwd)], settings: { ...drafterSettings(), drafterMaxDepth: 0, },
 			actorTurns: [...calls.map((call, index) => turn([fauxThinking("inspect the file before answering"), call], ready[index]!.promise)), turn("done")],
 			draftTurns: [...calls.map((call) => turn(call)), turn("no tool")],
 			onEvent: (event) => {
@@ -90,8 +90,8 @@ describe("faux LLM speculative action end to end", () => {
 			expect(result.actorFallbacks).toEqual(drafterMaxDepth ? [] : ["read"]);
 			expect(result.outputs).toEqual([textResult("one\ntwo\nthree\n"), textResult("target")]);
 			expect(result.summary.reusedExecutionMs).toBeGreaterThan(0);
-			expect(result.draftFeedback[0]).toMatchObject({ kind: "drafter_plan", utility: { benefitMs: result.summary.reusedExecutionMs } });
-			if (drafterMaxDepth) expect(result.draftFeedback[1]).toMatchObject({ kind: "drafter_plan", depth: 1, utility: { benefitMs: result.summary.reusedExecutionMs } });
+			expect(result.draftFeedback[0]).toMatchObject({ kind: "drafter_plan" });
+			if (drafterMaxDepth) expect(result.draftFeedback[1]).toMatchObject({ kind: "drafter_plan", depth: 1 });
 		}
 	});
 

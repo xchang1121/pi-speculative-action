@@ -30,16 +30,10 @@ export function createLinuxProcessExecutionWorld(
 	const workspaceOptions = { gitBinary, driver, overlayfsBinary, fusermountBinary, liveLower: true };
 	const roots = new Set<string>();
 	const operations = new WeakMap<ExecutionOperationBinding, { readonly binding: WeakRef<ProcessExecutionBinding>; readonly permissionKey: string }>();
-	const operationOverheads = new WeakMap<ProcessExecutionBinding, number>();
 	const describeOperation = (binding: ProcessExecutionBinding, permission: ActionKey) => {
 		const reference = new WeakRef(binding);
-		const overheads = new WeakRef(operationOverheads);
 		const descriptor = Object.freeze({ backend: "linux_process_reuse", identity: binding.key, permissionHash: permission.hash, ...backend.operationHints(binding),
 			get executionMs() { return reference.deref()?.executionMs ?? 0; },
-			get expectedDurationMs() {
-				const current = reference.deref();
-				return current ? (overheads.deref()?.get(current) ?? 0) + current.executionMs : 0;
-			},
 			get available() { return reference.deref()?.available ?? false; },
 			stale: () => { const current = reference.deref(); return current ? backend.bindingStale(current) : Promise.resolve(true); } });
 		operations.set(descriptor, { binding: reference, permissionKey: permission.key });
@@ -115,7 +109,6 @@ export function createLinuxProcessExecutionWorld(
 				qualifiedDrivers.set(path.resolve(cwd), prepared);
 			},
 			execute: (context) => backend.withProducer(async () => {
-			const startedAt = performance.now();
 			const invocation = processInvocation(context.action.executionContext);
 			if (!invocation) throw new Error("execution action has no process invocation");
 			const operation = operationFor(context.action);
@@ -178,25 +171,12 @@ export function createLinuxProcessExecutionWorld(
 						await session.close();
 					}
 				},
-			}).catch(error => {
-				// A failed attempt still spent preparation time. It supplies a lower bound, not a successful service sample.
-				// Cancellation and failures before a session opened do not describe the operation's preparation cost.
-				if (operation && session && !context.signal.aborted) operationOverheads.set(operation,
-					Math.max(operationOverheads.get(operation) ?? 0, performance.now() - startedAt - operation.executionMs));
-				throw error;
 			});
 			if (session) {
 				const ownership = session.ownership, commit = branch.commit.bind(branch);
-				const durationMs = performance.now() - startedAt;
-				// Backend execution metrics include tracing and proof capture, unlike the binding's native duration.
-				// Calibrate the original learned capability too: publishing often returns a distinct result binding.
-				if (operation) operationOverheads.set(operation, Math.max(0, durationMs - operation.executionMs));
 				Object.assign(branch, {
 					computationDependencies: session.computationDependencies(),
-					operations: Object.freeze(session.executionBindings().map(binding => {
-						operationOverheads.set(binding, Math.max(0, durationMs - binding.executionMs));
-						return describeOperation(binding, context.action);
-					})),
+					operations: Object.freeze(session.executionBindings().map(binding => describeOperation(binding, context.action))),
 					commit: () => {
 						if (operation) throw new Error("internal process output cannot commit an enclosing tool");
 						return ownership.commit(commit);

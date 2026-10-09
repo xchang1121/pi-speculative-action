@@ -318,24 +318,8 @@ export interface ResultCacheLimits {
 	readonly hotFraction?: number;
 }
 
-export interface SpeculativeCacheValueMetrics extends Pick<ResultCacheEvidence, "actorHits" | "insertedAt" | "lastActorHitAt"> {
-	readonly executionMs: number;
-	readonly bytes: number;
-}
-
-const CACHE_HIT_HALF_LIFE_MS = 30 * 60 * 1000;
-
-export function speculativeCacheValue(
-	metrics: SpeculativeCacheValueMetrics,
-	now = Date.now(),
-	halfLifeMs = CACHE_HIT_HALF_LIFE_MS,
-): number {
-	const reusableWorkMs = finiteValue(metrics.executionMs);
-	const referenceAt = metrics.actorHits > 0 ? (metrics.lastActorHitAt ?? metrics.insertedAt) : metrics.insertedAt;
-	const ageMs = Math.max(0, finiteValue(now - referenceAt));
-	const decay = halfLifeMs > 0 ? 2 ** (-ageMs / halfLifeMs) : 0;
-	const reuseWeight = metrics.actorHits > 0 ? 1 + finiteValue(metrics.actorHits) * decay : 0.1 * decay;
-	return (reuseWeight * reusableWorkMs) / (finiteValue(metrics.bytes) + 4096);
+export function resultCacheRecency(evidence: Pick<ResultCacheEvidence, "insertedAt" | "lastActorHitAt">): number {
+	return evidence.lastActorHitAt ?? evidence.insertedAt;
 }
 
 export interface ResultCacheEvidence {

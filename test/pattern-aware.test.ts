@@ -271,7 +271,7 @@ describe("PatternAware", () => {
 		expect(afterFreshnessRejection.adoptionProbability).toBeCloseTo(0.5);
 		expect(afterFreshnessRejection.conditionalProbability).toBeCloseTo(13 / 16, 10);
 		// Five decayed samples, one constant-path mapper and half adoption: Wilson90(13/16, 5) * 5/12.
-		expect(afterFreshnessRejection.expectedLatencyBenefitMs / afterFreshnessRejection.expectedDurationMs).toBeCloseTo(0.21930122364212437, 10);
+		expect(afterFreshnessRejection.confidence).toBeCloseTo(0.21930122364212437, 10);
 		store.settled("attributed", rejectedSettlement("freshness", "resource_changed"));
 		const afterRepeatedRejection = store.predict("probe").find((item) => item.patternID === "attributed")!;
 		expect(afterRepeatedRejection.adoptionProbability).toBeCloseTo(1 / 3);
@@ -368,7 +368,7 @@ describe("PatternAware", () => {
 	});
 
 	test("reads around the line a search reported, pairing each location's path with its own line", () => {
-		const store = patternStore({}, undefined, piActionSemantics());
+		const store = patternStore({ beamWidth: 16 }, undefined, piActionSemantics());
 		const located = (file: string, line: number) => ({ outputLocations: [{ path: "src/other.ts", line: 900 }, { path: file, line }] });
 		for (const [name, line] of [["alpha", 2310], ["beta", 3575], ["gamma", 5200]] as const) {
 			store.observe(input(name, "grep", { pattern: name }, located(`src/${name}.ts`, line)));
@@ -805,7 +805,7 @@ describe("PatternAware", () => {
 		expect(store.snapshot().find((item) => item.targetTool === "read")).toMatchObject({ occurrences: 3, feedback: { issued: 1 } });
 	});
 
-	test("emits weak control-flow candidates for bounded utility admission", () => {
+	test("emits weak control-flow candidates for bounded runtime admission", () => {
 		const store = patternStore();
 		trainGrepRead(store, "one", "src/a.ts");
 		trainGrepRead(store, "two", "src/b.ts");
@@ -930,18 +930,16 @@ describe("PatternAware", () => {
 		for (const candidate of candidates) {
 			expect(candidate.supportingPatternIDs).toEqual(["ranked-results"]);
 			expect(candidate.adoptionProbability).toBe(3 / 4);
-			expect(candidate.expectedDurationMs).toBe(100);
 		}
 		expect(store.snapshot()).toEqual(before);
 		if (count === 1) {
 			acceptPattern(store, { "0": 30 }, { id: "independent", bindings: constantBindings({ path: "src/a.ts" }),
-				occurrences: 30, historicalOpportunities: 30, historicalMatches: 15, averageDurationMs: 300,
+				occurrences: 30, historicalOpportunities: 30, historicalMatches: 15,
 				feedback: patternFeedback({ recentRejectedWeight: 3 }),
 			});
 			const [merged] = store.predict("probe");
 			expect(merged?.supportingPatternIDs).toEqual(["independent", "ranked-results"]);
 			expect(merged?.conditionalProbability).toBeCloseTo(1 / 2);
-			expect(merged?.expectedDurationMs).toBe(250);
 			expect(merged?.adoptionProbability).toBe(3 / 7);
 		}
 		store.observe(input("probe", "read", { ...base, [field]: values[1] }));
@@ -990,12 +988,12 @@ describe("PatternAware", () => {
 	test("charges evidence-annealed mapper complexity for transforms and ungrounded payloads", () => {
 		const store = patternStore({ beamWidth: 1, maxContextLength: 1, maxFutureGap: 0 });
 		const source = { type: "event" as const, relativeEvent: -1, field: "input" as const, path: ["path"] };
-		for (const [id, binding, averageDurationMs] of [
-			["z-direct", source, 100],
-			["a-composite", { type: "template" as const, source, prefix: "wrong/", suffix: "" }, 100],
-			["a-memorized", { type: "constant" as const, value: "README.md" }, 120],
+		for (const [id, binding] of [
+			["z-direct", source],
+			["a-composite", { type: "template" as const, source, prefix: "wrong/", suffix: "" }],
+			["a-memorized", { type: "constant" as const, value: "README.md" }],
 		] as const) {
-			acceptPattern(store, { "0": 2 }, { id, occurrences: 2, bindings: { '["path"]': binding }, averageDurationMs });
+			acceptPattern(store, { "0": 2 }, { id, occurrences: 2, bindings: { '["path"]': binding } });
 		}
 
 		store.observe(input("probe", "grep", { path: "src/index.ts" }));
@@ -1198,9 +1196,6 @@ describe("PatternAware", () => {
 				else {
 					expect(recurrent, mode).toMatchObject({ tool, input: first, horizon: 0, latestHorizon: 0, dependencies: [] });
 					expect(store.predict(mode, { [tool]: "schema-base" }, { ...config, presets: [] }).some(candidate => candidate.actionIdentity === recurrent!.actionIdentity)).toBe(true);
-					expect(recurrent!.expectedDurationMs).toBeCloseTo(700 / (1 + 2 ** (-4 / config.decayHalfLifeEvents)), 10);
-					// No mapper penalty: 700 * PPM(tool) / (1 + 2^(-4/2048) + 1.2816^2).
-					expect(recurrent!.expectedLatencyBenefitMs).toBeCloseTo(mode === "command" ? 38.437531185154405 : 189.19021130729962, 10);
 					const patterns = new Set(store.snapshot().map((pattern) => pattern.id));
 					expect(recurrent!.supportingPatternIDs.every((id) => patterns.has(id))).toBe(true);
 					// Inspect demoted samples even when competing reads displace them from the default beam.
@@ -1216,7 +1211,7 @@ describe("PatternAware", () => {
 					expect(settle(unobservedSettlement("control", "turn_closed"))).toEqual(before);
 					const rejected = settle(rejectedSettlement("freshness", "resource_changed"));
 					expect(rejected.adoptionProbability).toBeLessThan(recurrent!.adoptionProbability);
-					expect(rejected.expectedLatencyBenefitMs).toBeLessThan(recurrent!.expectedLatencyBenefitMs);
+					expect(rejected.confidence).toBeLessThan(recurrent!.confidence);
 					settle(unmatchedSettlement());
 					const contradicted = settle(unmatchedSettlement());
 					expect(contradicted.background).toBe(true);
@@ -1256,7 +1251,6 @@ describe("PatternAware", () => {
 			const prediction = predictions.find((candidate) => candidate.input.path === path)!;
 			expect(prediction.background).not.toBe(true);
 			expect(prediction.conditionalProbability).toBeCloseTo(mass / total, 12);
-			expect(prediction.expectedDurationMs).toBeCloseTo(evidence.reduce((sum, sample) => sum + sample.durationMs * sample.weight, 0) / mass, 10);
 		}
 	});
 
@@ -1295,7 +1289,6 @@ describe("PatternAware", () => {
 				bindings: { '["command"]': { type: "constant", value: command.command } },
 				...(index === 2
 					? {
-							averageDurationMs: 10_000,
 							feedback: patternFeedback({ observed: 3, recentMismatchedWeight: 3 }),
 						}
 					: {}),
@@ -1339,7 +1332,7 @@ describe("PatternAware", () => {
 		expect(new Set(bash?.continuation.visitedPatternIDs).size).toBe(3);
 	});
 
-	test("does not count tool-level PPM or failed target latency when valuing concrete patterns", () => {
+	test.each([1, 100_000])("ranks concrete patterns independently of successful or failed target duration (%sms)", durationMs => {
 		const store = patternStore({ beamWidth: 1, maxContextLength: 1, maxFutureGap: 0 });
 		for (let index = 0; index < 8; index++) {
 			store.observe(input(`fast-${index}`, "grep", {}, { durationMs: 1 }));
@@ -1352,7 +1345,7 @@ describe("PatternAware", () => {
 			store.observe(
 				input(`slow-${index}`, "bash", { command: "npm test" }, {
 					outcome: index === 0 ? "failure" : "success",
-					durationMs: index === 0 ? 10_000 : 100,
+					durationMs: index === 0 ? 10_000 : durationMs,
 				}),
 			);
 		}
@@ -1360,8 +1353,7 @@ describe("PatternAware", () => {
 		store.observe(input("probe", "grep"));
 		const candidates = store.predict("probe");
 
-		expect(candidates.map((candidate) => candidate.tool)).toEqual(["bash", "read"]);
-		expect(candidates[0]).toMatchObject({ tool: "bash", expectedDurationMs: 75 });
+		expect(candidates.map((candidate) => candidate.tool)).toEqual(["read", "bash"]);
 	});
 
 	test("unfolds recurrence only through distinct finite-motif contexts", () => {
@@ -1655,7 +1647,6 @@ function validatedGapPattern(gapCounts: Readonly<Record<string, number>>, overri
 		empiricalProbability: 1,
 		adoptionProbability: 1,
 		feedback: patternFeedback(),
-		averageDurationMs: 100,
 		lastSeenSequence: 1,
 		...overrides,
 	};
