@@ -1631,7 +1631,7 @@ describe("speculative action host", () => {
 		} finally { failure.release(); await host.dispose(); }
 	});
 
-	it("does not reprepare a retired native operation after repeated edits or identical observations", async () => {
+	it.each(["retired", "backoff"])("does not reprepare a %s native operation after repeated edits or identical observations", async mode => {
 		const cwd = await temporaryWorkspace(), tool = createReadTool(cwd), build = { command: "measured-build" };
 		const patternAware = patternAwareSettings({ presets: ["recent-command"], multiStepEnabled: false });
 		const store = new PatternAwareStore(patternAware, undefined, patternAwareActionSemantics(PI_ACTION_SEMANTICS, cwd));
@@ -1658,6 +1658,12 @@ describe("speculative action host", () => {
 			for (let edit = 0; edit < 5; edit++) {
 				expect(await observe("bash", build, [operation])).toBeUndefined();
 				expect(await observe("write", { path: "input.txt", content: `edit-${edit}` })).toBeUndefined();
+			}
+			if (mode === "backoff") {
+				available = true; // The same bounded backend capability is eligible again after its cooldown.
+				await observe("bash", build, [operation]);
+				expect(await observe("write", { path: "input.txt", content: "reprobe" })).toMatchObject({ actions: [{ operation }] });
+				available = false;
 			}
 			const changed = { ...operation, identity: "changed-launch-context", available: true };
 			await observe("bash", build, [changed]);

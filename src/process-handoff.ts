@@ -107,7 +107,8 @@ type AcquireOptions<Plan> = {
 /** Owns process evidence selection and the scope of one-shot transfers. */
 export class ProcessHandoffRegistry<Invocation = never> {
 	private readonly byKey = new Map<Sha256Digest, Map<ProcessHandoff, HandoffRecord>>();
-	private readonly invocations = new WeakMap<ProcessExecutionBinding, { readonly value: Invocation; readonly bytes: number; executionMs: number; preparationRetired?: true }>();
+	private readonly invocations = new WeakMap<ProcessExecutionBinding, { readonly value: Invocation; readonly bytes: number; executionMs: number;
+		preparationRetired?: true; preparationFailures?: number; prepareAfter?: number }>();
 	private maxCompleted: number;
 	private maxRetainedBytes: number;
 	private retainedBytes = 0;
@@ -159,7 +160,8 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		const owner = new WeakRef(this.invocations);
 		const binding = Object.freeze({ key, scope: record.scope,
 			get executionMs(): number { return owner.deref()?.get(this)?.executionMs ?? 0; },
-			get available(): boolean { const invocation = owner.deref()?.get(this); return !!invocation && !invocation.preparationRetired; } });
+			get available(): boolean { const invocation = owner.deref()?.get(this); return !!invocation && !invocation.preparationRetired &&
+				performance.now() >= (invocation.prepareAfter ?? 0); } });
 		this.invocations.set(binding, { value, bytes, executionMs });
 		record.binding = binding;
 		this.retainedBytes += bytes;
@@ -187,6 +189,19 @@ export class ProcessHandoffRegistry<Invocation = never> {
 	retirePreparation(binding: ProcessExecutionBinding): void {
 		const invocation = this.invocations.get(binding);
 		if (invocation) invocation.preparationRetired = true;
+	}
+
+	/** Unproductive preparation is scheduling evidence only: back off by its measured cost, then permit another probe.
+	 * Identical native observations preserve the delay; a useful result resets it without reviving hard retirement. */
+	settlePreparation(binding: ProcessExecutionBinding, reusable: boolean, preparationMs = 0): void {
+		const invocation = this.invocations.get(binding);
+		if (!invocation) return;
+		if (reusable) { invocation.preparationFailures = 0; invocation.prepareAfter = undefined; }
+		else {
+			invocation.preparationFailures = Math.min(8, (invocation.preparationFailures ?? 0) + 1);
+			const cost = Math.max(1_000, invocation.executionMs, Number.isFinite(preparationMs) ? preparationMs : 0);
+			invocation.prepareAfter = performance.now() + Math.min(300_000, cost * 2 ** invocation.preparationFailures);
+		}
 	}
 
 	/** Conservative availability hint; scope, ownership and evidence still decide acquisition. */

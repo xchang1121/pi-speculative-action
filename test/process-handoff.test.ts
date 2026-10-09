@@ -11,6 +11,34 @@ const OTHER_SCOPE = { sessionID: "session", turnID: "other" };
 const livePlan = async (live?: readonly ProcessProvenanceCertificate[]) => live?.[0] && { certificate: live[0] };
 
 describe("ProcessHandoffRegistry", () => {
+	it("backs off unproductive preparation, reprobes after a bounded delay, and resets after useful work", () => {
+		let clock = 100;
+		const timer = vi.spyOn(performance, "now").mockImplementation(() => clock);
+		const registry = new ProcessHandoffRegistry<unknown>(8, 4096), key = digest("retry"), invocation = { argv: ["worker"] };
+		const binding = registry.observe(key, "/bin/worker", SCOPE, invocation, 6000)!;
+		try {
+			registry.settlePreparation({ ...binding }, false);
+			expect(binding.available).toBe(true);
+			for (const delay of [12_000, 24_000, 48_000, 96_000, 192_000, 300_000, 300_000]) {
+				registry.settlePreparation(binding, false);
+				expect(registry.observe(key, "/bin/worker", OTHER_SCOPE, invocation, 6000)).toBe(binding);
+				expect(registry.resolveBinding(binding, SCOPE)).toBeUndefined();
+				clock += delay - 1; expect(binding.available).toBe(false);
+				clock++; expect(registry.resolveBinding(binding, SCOPE)).toEqual(invocation);
+			}
+			registry.settlePreparation(binding, true);
+			registry.settlePreparation(binding, false);
+			clock += 12_000; expect(binding.available).toBe(true);
+			registry.settlePreparation(binding, true);
+			registry.settlePreparation(binding, false, 30_000);
+			clock += 59_999; expect(binding.available).toBe(false);
+			clock++; expect(binding.available).toBe(true);
+			registry.retirePreparation(binding);
+			registry.settlePreparation(binding, true);
+			clock += 300_000; expect(binding.available).toBe(false);
+		} finally { registry.dispose(); timer.mockRestore(); }
+	});
+
 	it("bounds retired preparation with its measured launch and preserves new contexts and result acquisition", async () => {
 		const registry = new ProcessHandoffRegistry<unknown>(8, 4096), key = digest("measured"), invocation = { argv: ["worker"], environment: { MODE: "before" } };
 		const observed = registry.observe(key, "/bin/worker", SCOPE, invocation, 6000)!;
