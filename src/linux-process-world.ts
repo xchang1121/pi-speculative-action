@@ -180,11 +180,14 @@ export function createLinuxProcessExecutionWorld(
 			});
 			if (session) {
 				const ownership = session.ownership, commit = branch.commit.bind(branch);
-				const overheadMs = Math.max(0, performance.now() - startedAt - session.metrics().executionMs);
+				const durationMs = performance.now() - startedAt;
+				// Backend execution metrics include tracing and proof capture, unlike the binding's native duration.
+				// Calibrate the original learned capability too: publishing often returns a distinct result binding.
+				if (operation) operationOverheads.set(operation, Math.max(0, durationMs - operation.executionMs));
 				Object.assign(branch, {
 					computationDependencies: session.computationDependencies(),
 					operations: Object.freeze(session.executionBindings().map(binding => {
-						operationOverheads.set(binding, overheadMs);
+						operationOverheads.set(binding, Math.max(0, durationMs - binding.executionMs));
 						return describeOperation(binding, context.action);
 					})),
 					commit: () => {
