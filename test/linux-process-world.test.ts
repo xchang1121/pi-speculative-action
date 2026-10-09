@@ -39,6 +39,32 @@ vi.mock("node:child_process", { spy: true });
 vi.mock("node:fs/promises", { spy: true });
 
 describe("Linux process ExecutionWorld", () => {
+	test("prepares with a long temporary path and removes its restricted short broker socket", { timeout: 20_000 }, async ({ skip }) => {
+		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
+		const root = await mkdtemp(path.join(os.tmpdir(), "pi-long-broker-")), previous = process.env.TMPDIR;
+		const temporary = path.join(root, "nested-temporary-directory-".repeat(3));
+		await mkdir(temporary); process.env.TMPDIR = temporary;
+		const listening = vi.spyOn(net.Server.prototype, "listen");
+		let fixture: Awaited<ReturnType<typeof createLinuxProcessBenchmark>> | undefined;
+		try {
+			fixture = await createLinuxProcessBenchmark("command-", "git");
+			await writeFile(path.join(fixture.workspace, "input.txt"), "input\n");
+			await commitBenchmarkFixture(fixture.workspace, "long temporary path");
+			const prepared = await prepareLinuxProcessReuse(fixture);
+			const branch = await forkReusableBash(fixture, { label: "long-path", command: "printf prepared", actionNamespace: "test", ...prepared });
+			try { expect(textOutput(branch.output.result)).toBe("prepared"); }
+			finally { await branch.dispose(); }
+			const sockets = listening.mock.calls.flatMap(([target]) => typeof target === "string" && target.startsWith("/tmp/pi-broker-") ? [target] : []);
+			expect(sockets).toHaveLength(1);
+			expect(filesystem.chmod).toHaveBeenCalledWith(sockets[0], 0o600);
+			await expect(filesystem.access(sockets[0]!)).rejects.toMatchObject({ code: "ENOENT" });
+		} finally {
+			await fixture?.dispose(); listening.mockRestore();
+			if (previous === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = previous;
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
 	test.for(["unusable", "one-shot", "descendant", "unusable-descendant"] as const)("retires only native preparation without a reusable result (%s)", { timeout: 20_000 }, async (mode, { skip }) => {
 		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-preparation-evidence-");
@@ -2659,6 +2685,15 @@ int main(int argc, char **argv) {
 		const produce = (command: string) => forkReusableBash(fixture, { command, label: "metadata", executionFingerprint, actionNamespace: "metadata",
 			executionScope: { sessionID: "metadata", turnID: String(turn++) } });
 		const native = (command: string) => execFileSync("/bin/bash", ["-c", command], { cwd: fixture.workspace, env: { ...fixture.environment }, encoding: "utf8" });
+		const rootMetadata = await produce("./metadata .");
+		try {
+			expect(rootMetadata.output.isError).toBe(false);
+			expect(textOutput(rootMetadata.output.result)).toBe(native("./metadata ."));
+			expect((await rootMetadata.validate?.())?.status).toBe("valid");
+			const info = await filesystem.stat(fixture.workspace);
+			await filesystem.utimes(fixture.workspace, info.atime, new Date(info.mtimeMs - 2000));
+			expect((await rootMetadata.validate?.())?.status).toBe("stale");
+		} finally { await rootMetadata.dispose?.(); }
 		const linked = await produce("./metadata metadata-link");
 		try { expect(linked.output.isError, textOutput(linked.output.result)).toBe(false); expect(textOutput(linked.output.result)).toBe(native("./metadata metadata-link")); }
 		finally { await linked.dispose?.(); }

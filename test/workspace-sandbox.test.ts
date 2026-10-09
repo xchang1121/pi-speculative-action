@@ -378,6 +378,28 @@ describe("workspace-branch ExecutionWorld", () => {
 		expect(await fingerprint()).toBe("git-worktree");
 	});
 
+	it("preserves a live lower root's native metadata while collecting its private writes", async ({ skip }) => {
+		const capability = await linuxOverlayfsCapability();
+		if (!capability.available) return skip(capability.detail);
+		const root = await temporaryRoot(), options = { driver: "overlayfs" as const, liveLower: true };
+		await writeFile(path.join(root, "input"), "before");
+		const prepared = await sandbox.prepare(root, options), before = await fs.lstat(root, { bigint: true });
+		const branch = await sandbox.fork({ ...options, ...prepared, cwd: root, action: requiredAction("write", { path: "created", content: "private" }, root),
+			execute: async ({ sandboxRoot }) => {
+				const current = await fs.lstat(sandboxRoot, { bigint: true });
+				for (const field of ["ino", "mode", "nlink", "uid", "gid", "size", "mtimeNs", "ctimeNs"] as const)
+					expect(current[field], field).toBe(before[field]);
+				await writeFile(path.join(sandboxRoot, "created"), "private");
+				return settlement("created");
+			} });
+		try {
+			await expect(access(path.join(root, "created"))).rejects.toMatchObject({ code: "ENOENT" });
+			await branch.commit();
+			expect(await readFile(path.join(root, "created"), "utf8")).toBe("private");
+			expect(await readFile(path.join(root, "input"), "utf8")).toBe("before");
+		} finally { await branch.dispose(); }
+	});
+
 	it("keeps auto live-lower qualification within snapshot namespace boundaries", async ({ skip }) => {
 		const overlay = await linuxOverlayfsCapability();
 		if (!overlay.available) return skip(overlay.detail);

@@ -511,7 +511,9 @@ export class LinuxProcessReuseBackend {
 		const projection = new ExecutionPathProjection({ sourceRoot, workspaceRoot: input.workspace.sandboxRoot, privateRoot: input.workspace.processRoot });
 		const originalPath = input.invocation.environment.PATH ?? input.invocation.environment.Path ?? "";
 		const token = randomToken();
-		const socketPath = path.join(input.workspace.processRoot, `broker-${token.slice(0, 12)}.sock`);
+		const candidateSocket = path.join(input.workspace.processRoot, `broker-${token.slice(0, 12)}.sock`);
+		// sockaddr_un has a byte limit even when the private workspace supports longer paths.
+		const socketPath = Buffer.byteLength(candidateSocket) < 104 ? candidateSocket : path.join("/tmp", `pi-broker-${randomBytes(16).toString("hex")}.sock`);
 		const deniedPaths = sensitivePaths(this.options.storeRoot, this.options.deniedPaths).filter(
 			(target) =>
 				!pathContains(input.workspace.sandboxRoot, target) && !pathContains(input.workspace.processRoot, target),
@@ -583,6 +585,7 @@ export class LinuxProcessReuseBackend {
 					session.signal?.throwIfAborted();
 					session.interposition = interposition;
 					await listenUnixSocket(server, socketPath);
+					await chmod(socketPath, 0o600);
 					this.recordSessionPreparation(session, creation, new TimelineInterval(dispatchStartedAt, performance.now()));
 				}));
 				session.privateSince ??= Date.now();
@@ -2792,7 +2795,8 @@ async function runSpawn(
 
 /** Own the write endpoints before inheritance; a running tracer may replace its descriptors. */
 async function acquireOutputChannels(signal?: AbortSignal) {
-	const root = await mkdtemp(path.join(os.tmpdir(), "pi-process-output-"));
+	const temporary = os.tmpdir();
+	const root = await mkdtemp(path.join(Buffer.byteLength(path.join(temporary, "pi-process-output-XXXXXX", "2")) < 104 ? temporary : "/tmp", "pi-process-output-"));
 	const entries: { server: net.Server; source: net.Socket; target?: net.Socket; endpoint: string }[] = [];
 	const releaseWriters = () => { for (const entry of entries) entry.target?.destroy(); };
 	const dispose = async () => {

@@ -838,7 +838,10 @@ async function createPrivateSandboxWorkspace(state: WorkspaceSandboxState, cwd: 
 			await mkdir(processRoot);
 			// Lower-layer copy-up can split hardlinks. Materialize only shared objects in the private upper layer, with the times
 			// the lower shows: build tools compare them.
-			const upper = path.join(overlayStorageRoot, "upper"), directories = new Set<string>(), lowerRoot = liveBase ? sourceRoot : sharedBaseline!.sandboxRoot;
+			const directories = new Set<string>(), lowerRoot = liveBase ? sourceRoot : sharedBaseline!.sandboxRoot;
+			// A FUSE mount root has the private upper's identity. Keep a live workspace below it so root stat observations
+			// see the original directory, just as its children do, until the operation actually changes that directory.
+			const lowerName = liveBase ? path.basename(lowerRoot) : "", upper = path.join(overlayStorageRoot, "upper", lowerName);
 			const aliasGroups = liveBase ? [...new Map([...liveBase.entries.values()].flatMap(entry => entry.kind === "file" && entry.aliases
 				? [[entry.aliases.join("\0"), entry.aliases.map(name => path.relative(liveBase!.root, name))] as const] : [])).values()] : baseline.aliases;
 			const copyTimes = async (relative: string) => { const { atime, mtime } = await lstat(path.join(lowerRoot, relative)); await utimes(path.join(upper, relative), atime, mtime); };
@@ -855,12 +858,13 @@ async function createPrivateSandboxWorkspace(state: WorkspaceSandboxState, cwd: 
 				await chmod(path.join(upper, directory), (await lstat(path.join(lowerRoot, directory))).mode & 0o777);
 				await copyTimes(directory);
 			}
-			const mounted = await mountLinuxOverlayfs({ lowerRoot, privateRoot: overlayStorageRoot, options: overlayOptions, capabilityRegistry: state.overlayfsCapabilities });
-			overlay = mounted;
+			const mounted = await mountLinuxOverlayfs({ lowerRoot: lowerName ? path.dirname(lowerRoot) : lowerRoot,
+				privateRoot: overlayStorageRoot, options: overlayOptions, capabilityRegistry: state.overlayfsCapabilities });
+			overlay = { ...mounted, root: path.join(mounted.root, lowerName), upperRoot: upper };
 			// FUSE overlays count a file's links by the names they have loaded: list each alias's directory before anything stats one.
-			for (const directory of new Set(aliasGroups.flat().map(name => path.dirname(name)))) await readdir(path.join(mounted.root, directory));
-			overlayDevice = String((await lstat(mounted.root, { bigint: true })).dev);
-			sandboxRoot = mounted.root;
+			for (const directory of new Set(aliasGroups.flat().map(name => path.dirname(name)))) await readdir(path.join(overlay.root, directory));
+			overlayDevice = String((await lstat(overlay.root, { bigint: true })).dev);
+			sandboxRoot = overlay.root;
 			gitDirectory = sharedBaseline?.gitDirectory ?? path.join(overlayStorageRoot, "no-index"); // OverlayFS journals its own changes.
 			openTransactionClock = () => openLinuxAnonymousWorkspaceFile(mounted.upperRoot); transactionClockLinks = 0;
 			// A live lower may sit on another filesystem; its files' own identities, checked on every read, fence it instead.
@@ -1688,7 +1692,11 @@ async function walkOverlayUpper(upperRoot: string, journal: string, observe: (en
 	let entries = 0;
 	const visit = async (directory: string, relativeDirectory: string): Promise<void> => {
 		const subdirectories: (readonly [string, string])[] = [];
-		for (const child of await readdir(directory, { withFileTypes: true })) {
+		const children = await readdir(directory, { withFileTypes: true }).catch(error => {
+			if (directory === upperRoot && isMissing(error)) return []; // A live lower has no upper until the first copy-up.
+			throw error;
+		});
+		for (const child of children) {
 			if (++entries > WORKSPACE_TRANSACTION_MAX_FILES) throw new Error(`OverlayFS ${journal} exceeds file limit`);
 			if (child.name === ".wh..wh..opq") { await observe({ kind: "opaque", resource: relativeDirectory }); continue; }
 			if (child.name.startsWith(".wh.")) throw new Error(`unsupported OverlayFS whiteout encoding: ${child.name}`);
