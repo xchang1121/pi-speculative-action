@@ -963,7 +963,7 @@ export class LinuxProcessReuseBackend {
 			...("actor" in participant ? {
 				role: "actor" as const,
 				waitForRunning: async (running: ProcessHandoff) => {
-					if (!running.ownership.acceptsScope(running.scope, scope)) return "miss";
+					if (!running.ownership.acceptsScope(running.scope, scope, true)) return "rejected";
 					if (await running.inputsChanged?.()) return "rejected";
 					const waitStarted = performance.now();
 					const waiting = new AbortController(), stop = signal ? AbortSignal.any([signal, waiting.signal]) : waiting.signal;
@@ -977,12 +977,8 @@ export class LinuxProcessReuseBackend {
 				},
 			} : { role: "producer" as const, ownership: participant.ownership, executablePath: participant.executablePath }),
 		});
-		return {
-			...(acquired.kind === "hit" ? { plan: acquired.plan, producer: acquired.producer, continuation: acquired.continuation,
-				waiting: waits.filter(wait => wait.handoff === acquired.producer).map(wait => wait.interval) } : {}),
-			...(acquired.kind === "work" ? { work: acquired.work } : {}),
-			joined: acquired.joined,
-		};
+		return acquired.kind === "hit" ? { ...acquired,
+			waiting: waits.filter(wait => wait.handoff === acquired.producer).map(wait => wait.interval) } : acquired;
 	}
 
 	private async plan(
@@ -1305,7 +1301,7 @@ export class LinuxProcessReuseBackend {
 						const file = await open(imagePath, "r");
 						let image: Buffer;
 						try {
-							if ((await file.stat()).size > Math.min(MAX_CONTINUATION_BYTES, this.store.limits.maxBytes)) throw new Error("continuation exceeds retained resource budget");
+							if ((await file.stat()).size > MAX_CONTINUATION_BYTES) throw new Error("continuation exceeds image size limit");
 							image = await file.readFile();
 						} finally { await file.close(); }
 						continuation = { image, physicalRoot: session.workspace.sandboxRoot, computation: new TimelineInterval(begin, end) };

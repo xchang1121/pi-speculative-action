@@ -899,7 +899,7 @@ int main(int argc, char **argv) {
 			if (mode.includes("prepared-")) {
 				const fork = fixture.workspaceSandbox.fork.bind(fixture.workspaceSandbox);
 				const borrowing = vi.spyOn(fixture.workspaceSandbox, "fork").mockImplementation(async options => {
-					if (options.preparation) await writeFile(path.join(fixture.workspace, "input.txt"), "changed after preparation\n");
+					if (options.preparation) await writeFile(path.join(fixture.workspace, "input.txt"), "changed during preparation\n");
 					return fork(options);
 				});
 				restorePreparation = () => borrowing.mockRestore();
@@ -915,9 +915,12 @@ int main(int argc, char **argv) {
 				throw new Error(JSON.stringify({ metrics: fixture.backend.metrics(), actor: fixture.backend.actorMetrics(), errors: errors.mock.calls.map(call => call[1]) }), { cause: error });
 			});
 			if (mode.includes("prepared-")) {
-				expect(await readFile(path.join(fixture.workspace, "input.txt"), "utf8")).toBe("changed after preparation\n");
+				await expect.poll(() => events.filter(event => event.type === "candidate" && event.turnID === "prepared" &&
+					event.candidate.kind === "operation" && event.state.status === "succeeded").length).toBe(launcher ? 2 : 1);
+				expect(await readFile(path.join(fixture.workspace, "input.txt"), "utf8")).toBe("changed during preparation\n");
 				restorePreparation?.(); restorePreparation = undefined;
-				if (mode === "native-prepared-restored") await writeFile(path.join(fixture.workspace, "input.txt"), "newest\n");
+				// Every preparation is sealed before this change; no later producer can capture the replacement value.
+				await writeFile(path.join(fixture.workspace, "input.txt"), mode === "native-prepared-restored" ? "newest\n" : "changed after preparation\n");
 			}
 			expect(fixture.backend.metrics().misses).toBeGreaterThan(before.misses);
 			const changedParent = command.replace("parent", "automatic-parent");
@@ -946,7 +949,7 @@ int main(int argc, char **argv) {
 			for (const clock of [timeline, laterTask]) clock.recordTool(execution);
 			const timing = timeline.measure(execution.completedAt);
 			expect(laterTask.measure(execution.completedAt).reusedExecutionMs).toBe(timing.reusedExecutionMs);
-			if (stalePreparation) expect(timing.reusedExecutionMs).toBe(0);
+			if (stalePreparation) expect(timing.reusedExecutionMs, JSON.stringify({ execution, metrics: fixture.backend.actorMetrics(), operations: events.filter(event => event.type === "operation_prediction") })).toBe(0);
 			else expect(timing.reusedExecutionMs,
 				JSON.stringify({ execution, metrics: fixture.backend.actorMetrics(), producer: fixture.backend.metrics(), bindings: fixture.backend.executionBindings(later), operations: events.filter(event => event.type === "operation_prediction") })).toBeGreaterThan(0);
 			expect(events.filter(event => event.type === "operation_prediction").filter(event => !launcher || stalePreparation || event.settlement.observation === "observed")).toMatchObject(Array.from({ length: launcher && stalePreparation ? 2 : 1 }, () => ({ settlement: stalePreparation ? { observation: "unobserved" } : {

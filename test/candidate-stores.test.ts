@@ -155,7 +155,7 @@ describe("CandidateStore", () => {
 		expect(store.getOrCreate("session", root.key, () => root).inserted).toBe(true);
 		store.settle("session", root, false);
 		expect(store.pending("session")).toEqual([]);
-		expect(store.cached("session")).toEqual([]);
+		expect(store.cached("session")).toEqual([root]);
 		const separate = store.getOrCreate("session", derived.key, () => derived, () => false);
 		expect(separate.inserted).toBe(true);
 		expect(store.lookup("session", root.key).map((item) => item.entry.id)).toEqual(["derived", "root"]);

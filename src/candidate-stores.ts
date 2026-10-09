@@ -159,7 +159,7 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 		const indexed = this.record(scope, entry);
 		if (!indexed) return;
 		this.scopes.get(scope)!.pending.delete(indexed);
-		if (shared) indexed.result ??= { segment: "cold", insertedAt: this.now(), actorHits: 0 };
+		indexed.result ??= { segment: "cold", insertedAt: this.now(), actorHits: 0 };
 		if (shared && !indexed.inputs && inputs.length) {
 			const partitions = this.scopes.get(scope)!.partitions;
 			for (const key of new Set(inputs.map(input => inputPartition(input.path, input.descendants)))) {
@@ -193,10 +193,10 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 		}, (record) => { record.result = { ...record.result!, segment: "cold" }; });
 	}
 
-	snapshot(scope: Scope): ResultCacheSnapshot {
+	snapshot(scope: Scope, include: (entry: Entry) => boolean = () => true): ResultCacheSnapshot {
 		const snapshot = { coldEntries: 0, hotEntries: 0, coldBytes: 0, hotBytes: 0 };
 		for (const { entry, result } of this.scopes.get(scope)?.entries.values() ?? []) {
-			if (result) { snapshot[result.segment === "hot" ? "hotEntries" : "coldEntries"]++;
+			if (result && include(entry)) { snapshot[result.segment === "hot" ? "hotEntries" : "coldEntries"]++;
 				snapshot[result.segment === "hot" ? "hotBytes" : "coldBytes"] += finiteValue(entry.estimatedBytes); }
 		}
 		return snapshot;
