@@ -6,7 +6,7 @@ import { benchmarkTraceReport } from "../bench/trace-report.ts";
 import { type ActionProjectionRule, READ_RANGE_ACTION_KEY_PROJECTOR } from "../src/action-key-projection.ts";
 import { buildPiActionKey, PI_ACTION_SEMANTICS, type ActionKey } from "../src/action-semantics.ts";
 import { EffectTransactionCoordinator, effectCommitFailure } from "../src/effect-transaction.ts";
-import { SALVAGE_MS, emptyWorldReuseMetrics, type SpeculativeExecutionRoute, type WorldBranch } from "../src/execution-world.ts";
+import { emptyWorldReuseMetrics, type SpeculativeExecutionRoute, type WorldBranch } from "../src/execution-world.ts";
 import type {
 	MaterializedSpeculativeCandidate,
 	PreparedActorCall,
@@ -371,6 +371,24 @@ describe("resource-aware execution admission", () => {
 			gates[0]!.release(); await gates[1]!.entered;
 			expect(executed).toEqual(["session", "other"]);
 		} finally { for (const gate of gates) gate.release(); await runtime.dispose(); }
+	});
+	it("coalesces a hardware wakeup into one global preparation scan", async () => {
+		const bound = barrier(3), sample = gated(), original = SpeculationScheduler.prototype.evaluate;
+		let scans = 0;
+		const evaluate = vi.spyOn(SpeculationScheduler.prototype, "evaluate").mockImplementation(function(this: SpeculationScheduler<object>, forecasts) {
+			if (new Error().stack?.includes("launchCandidateBatch")) scans++;
+			return original.call(this, forecasts);
+		});
+		const { runtime } = harness({ settings: patient, onCandidateMaterialized: () => bound.arrive(),
+			resources: { initial: { cpuCount: 1, idleCpuCount: 0 }, sample: async () => { await sample.wait(); return { cpuCount: 1, idleCpuCount: 0 }; } },
+			source: planSource({ propose: ({ startInput }) => plan(startInput.sessionID) }) });
+		try {
+			await Promise.all(["first", "second", "third"].map(sessionID => runtime.startTurn({ sessionID, turnID: "turn" })));
+			await bound.promise; await sample.entered; await nextTurn(); await nextTurn();
+			scans = 0; sample.release(); await nextTurn(); await nextTurn();
+			expect(runtime.inspect().resources?.queuedPreparations).toBe(3);
+			expect(scans).toBe(3);
+		} finally { sample.release(); evaluate.mockRestore(); await runtime.dispose(); }
 	});
 });
 
@@ -934,7 +952,7 @@ describe("structural speculative runtime", () => {
 		} finally { await runtime.dispose(); clock.mockRestore(); }
 	});
 
-	it("waits for an in-flight candidate to capture its resource baseline before validation", async () => {
+	it("shares in-flight capture across distinct Actor executions even when their external IDs repeat", async () => {
 		const captured = deferred<{ version: number }>();
 		const captureStarted = barrier();
 		const validate = vi.fn((version: unknown) =>
@@ -949,34 +967,37 @@ describe("structural speculative runtime", () => {
 		await runtime.startTurn(start("turn"));
 		await captureStarted.promise;
 
-		const consumed = runtime.prepareActorCall(call("turn")).then(prepared => prepared?.output);
+		const consumed = Promise.all([0, 1].map(() => runtime.prepareActorCall(call("turn")).then(prepared => prepared?.output)));
 		expect(validate).not.toHaveBeenCalled();
 		captured.resolve({ version: 1 });
-		await expect(consumed).resolves.toBe("speculative");
-		expect(validate).toHaveBeenCalledOnce();
+		await expect(consumed).resolves.toEqual(["speculative", "speculative"]);
+		expect(validate).toHaveBeenCalledTimes(2);
 		expect(validate).toHaveBeenCalledWith({ version: 1 });
 		await runtime.finishTurn({ ...call("turn"), terminal: true });
 	});
-	it.each(["exact", "projected", "cancel", "turn-finished", "failed", "stale"])("waits for matched work without a join deadline (%s)", async mode => {
-		const gate = gated(), authorized = barrier(), controller = new AbortController();
+	it.each(["exact", "projected", "cancel", "turn-finished", "failed", "stale", "alternative"])("waits for matched work without a join deadline (%s)", async mode => {
+		const gate = gated(), alternative = gated(), authorized = barrier(), controller = new AbortController(), count = mode === "alternative" ? 2 : 1;
+		let routes = 0, running = 0;
 		const predicted = { path: "README.md", offset: 1, limit: 20 }, actor = call("turn", mode === "projected" ? { ...predicted, offset: 5, limit: 3 } : predicted);
 		const validate = vi.fn(() => mode === "stale" ? { status: "stale" as const, cause: cause("freshness", "resource_changed"), metrics: zeroValidationMetrics() } : validResource());
-		const { runtime, events, executions } = harness({ source: planSource({ propose: () => plan("join", predicted) }), validate,
+		const { runtime, events, executions } = harness({ source: planSource({ propose: ({ startInput }) => startInput.turnID !== "turn" ? undefined
+			: [1000, 1_000_000].slice(0, count).map((expectedDurationMs, index) => ({ ...plan(String(index)), actions: [readAction("next", predicted, { expectedDurationMs })] })) }), validate,
+			resolveExecution: () => ({ ...RESOURCE_ROUTE, backend: count === 2 ? `route:${++routes}` : RESOURCE_ROUTE.backend }),
 			authorizeCandidate: () => { authorized.arrive(); return { ok: true }; },
 			projection: { ...READ_RANGE_ACTION_KEY_PROJECTOR, captureCoverage: () => true, projectOutput: () => "narrow" },
-			execute: async () => { await gate.wait(); if (mode === "failed") throw new Error("producer failed"); return "wide"; } });
+			execute: async () => { await (++running === 2 ? alternative : gate).wait(); if (mode === "failed") throw new Error("producer failed"); return "wide"; } });
 		let settled = false, pending: ReturnType<typeof runtime.prepareActorCall> | undefined;
 		try {
-			await runtime.startTurn(start("turn")); await gate.entered;
+			await runtime.startTurn(start("turn")); await gate.entered; if (count === 2) await alternative.entered;
 			vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
 			pending = runtime.prepareActorCall(actor, controller.signal).then(value => { settled = true; return value; });
 			await authorized.promise; await vi.advanceTimersByTimeAsync(600_001);
-			expect(settled).toBe(false); expect(validate).not.toHaveBeenCalled(); expect(executions()).toBe(1);
+			expect(settled).toBe(false); expect(validate).not.toHaveBeenCalled(); expect(executions()).toBe(count);
 			if (mode === "cancel") controller.abort();
 			else if (mode === "turn-finished") await runtime.finishTurn(actor);
-			else gate.release();
-			const prepared = await pending, adopted = mode === "exact" || mode === "projected";
-			expect(prepared?.output).toBe(adopted ? mode === "exact" ? "wide" : "narrow" : undefined);
+			else (count === 2 ? alternative : gate).release();
+			const prepared = await pending, adopted = mode === "exact" || mode === "projected" || count === 2;
+			expect(prepared?.output).toBe(adopted ? mode === "projected" ? "narrow" : "wide" : undefined);
 			expect(validate).toHaveBeenCalledTimes(adopted || mode === "stale" ? 1 : 0);
 			if (adopted) {
 				await runtime.finishTurn(actor); await runtime.startTurn(start("retained"));
@@ -984,8 +1005,8 @@ describe("structural speculative runtime", () => {
 				await nextTurn(); expect(events.filter(event => event.type === "actor_action")).toHaveLength(2);
 				expect(events.filter(event => event.type === "actor_action").every(event => event.settlement.provider.kind === "speculative")).toBe(true);
 			}
-			expect(executions()).toBe(1);
-		} finally { gate.release(); await pending; await runtime.dispose(); vi.useRealTimers(); }
+			expect(executions()).toBe(count);
+		} finally { gate.release(); alternative.release(); await pending; await runtime.dispose(); vi.useRealTimers(); }
 	});
 
 	it.each(["refresh", "disabled", "disposed", "unwrapped", "terminal", "replaced", "evicted", "concurrent-refresh"] as const)("keeps prediction launch ownership across validation: %s", async (mode) => {
@@ -1444,15 +1465,9 @@ describe("structural speculative runtime", () => {
 			});
 			try {
 				await runtime.startTurn(start("turn")); await busyStarted.promise;
-				if (mode === "preview") await runtime.previewActorCall(call("turn", { path: "target.ts" }));
+				if (mode === "preview") void runtime.previewActorCall(call("turn", { path: "target.ts" }));
 				if (mode === "running") await targetGate.entered;
-				if (mode === "queued") {
-					await targetQueued.promise;
-					const actor = await runtime.prepareActorCall(call("turn", { path: "target.ts" }));
-					expect(actor?.output).toBeUndefined(); expect(aborted).toEqual(["busy.ts"]);
-					expect(executed).toEqual(["busy.ts"]);
-					await actor!.settle(simulatedExecution(1), "native"); return;
-				}
+				if (mode === "queued") await targetQueued.promise;
 				if (speculative) {
 					await stop.promise; await nextTurn();
 					expect(executed, "cancellation is not physical completion").toEqual(["busy.ts"]);
@@ -1500,7 +1515,7 @@ describe("structural speculative runtime", () => {
 				return output;
 			} };
 		const reconstruct = vi.fn<NonNullable<WorldBranch<string>["reconstruct"]>>(async (request) => {
-			expect(request).toMatchObject({ args: actor.input, callID: actor.id, signal: controller.signal });
+			expect(request).toMatchObject({ args: actor.input, callID: actor.id, signal: expect.any(AbortSignal) });
 			await gate.wait();
 			if (scenario === "rejected") throw new Error("evaluation failed");
 			if (scenario === "uncovered") return undefined;
@@ -1732,9 +1747,9 @@ describe("structural speculative runtime", () => {
 		} finally { await runtime.dispose(); }
 	});
 
-	it.each(["adopt", "salvage", "salvage-join", "salvage-abort", "cancel", "orphan-preview", "owned-preview", "operation-join", "operation-salvage", "operation-unavailable", "operation-unmeasured", "operation-expired", "operation-terminal"])("retires unowned previews while retaining demanded or independently predicted work: %s", async mode => {
+	it.each(["adopt", "completed", "join", "abort", "cancel", "orphan-preview", "owned-preview", "operation-join", "operation-completed", "operation-unavailable", "operation-unmeasured", "operation-late", "operation-terminal"])("retains started work independently of its prediction or preview owners: %s", async mode => {
 		const started = deferred<void>(), release = deferred<void>();
-		const timers = vi.spyOn(globalThis, "setTimeout"), cleared = vi.spyOn(globalThis, "clearTimeout"), disposed = vi.fn();
+		const disposed = vi.fn(), commit = vi.fn();
 		const clock = vi.spyOn(performance, "now"), controller = new AbortController();
 		let available = true;
 		const binding = Object.freeze({ backend: "process", identity: "child", permissionHash: "parent", executionMs: mode === "operation-unmeasured" ? 0 : 2,
@@ -1749,7 +1764,7 @@ describe("structural speculative runtime", () => {
 				if (mode === "operation-join") onOperationJoinable?.(() => available);
 				executionSignal = signal; signal.addEventListener("abort", () => release.resolve(), { once: true });
 				acceptScope = acceptOperationScope; started.resolve(); await release.promise;
-				return world("speculative", { validate: async () => validResource(), onDispose: disposed });
+				return world("speculative", { validate: async () => validResource(), onDispose: disposed, onCommit: commit });
 			} });
 		try {
 			await runtime.startTurn(start("turn"));
@@ -1759,80 +1774,69 @@ describe("structural speculative runtime", () => {
 				if (mode === "owned-preview") await runtime.previewActorCall(call("turn"));
 				const prepared = await runtime.prepareActorCall(mode === "orphan-preview" ? call("turn", { path: "changed.ts" }) : { ...call("turn"), tool: "bash", input: { command: "git status" } });
 				expect(prepared?.output).toBeUndefined();
-				expect(executionSignal!.aborted).toBe(mode === "orphan-preview");
-				expect(timers.mock.calls.some(([, delay]) => Number(delay) > SALVAGE_MS / 2)).toBe(false);
-				if (mode === "orphan-preview") await vi.waitFor(() => expect(disposed).toHaveBeenCalledOnce());
-				else { expect(disposed).not.toHaveBeenCalled(); release.resolve(); await ready.promise; }
+				expect(executionSignal!.aborted).toBe(false); expect(disposed).not.toHaveBeenCalled(); release.resolve(); await ready.promise;
 				await prepared!.settle(simulatedExecution(1), "actor");
+				expect((await runtime.prepareActorCall(call("turn")))?.output).toBe("speculative");
+				expect(commit).toHaveBeenCalledOnce();
 				return;
 			}
 			available = mode !== "operation-unavailable";
 			await runFallback(runtime, { ...call("turn"), id: "native", tool: "bash", input: { command: "git status" } });
-			if (mode === "operation-unavailable") {
-				expect(executionSignal!.aborted).toBe(false);
-				await runtime.finishTurn(call("turn"));
-				expect(executionSignal!.aborted).toBe(true);
-				expect(timers.mock.calls.some(([, delay]) => Number(delay) > SALVAGE_MS / 2)).toBe(false);
-				await vi.waitFor(() => expect(disposed).toHaveBeenCalledOnce()); return;
-			}
 			if (mode === "adopt") {
 				release.resolve(); expect((await runtime.prepareActorCall(call("turn")))?.output).toBe("speculative");
 			} else {
 				await runtime.finishTurn(call("turn")); await runtime.startTurn(start("next"));
-				const index = timers.mock.calls.reduce((last, [, delay], index) => Number(delay) > SALVAGE_MS / 2 ? index : last, -1);
-				expect(index).toBeGreaterThanOrEqual(0);
-				const timer = timers.mock.results[index]!.value;
-				expect(cleared).not.toHaveBeenCalledWith(timer);
+				clock.mockReturnValue(performance.now() + 3_600_000);
 				expect(executionSignal!.aborted).toBe(false);
-				expect(acceptScope!(start("next"))).toBe(false);
+				expect(acceptScope!(start("next"))).toBe(true);
+				expect(acceptScope!(start("turn"), true)).toBe(false);
+				expect(acceptScope!({ ...start("next"), sessionID: "foreign" }, true)).toBe(false);
 				if (mode === "cancel" || mode === "operation-terminal") {
 					const closing = mode === "cancel" ? runtime.settingsChanged({ ...settings, enabled: false }) : runtime.finishTurn({ ...call("next"), terminal: true });
-					await nextTurn(); expect(cleared).toHaveBeenCalledWith(timer); release.resolve(); await closing;
-					expect(acceptScope!(start("next"), true)).toBe(false);
-				} else if (mode === "operation-expired") {
-					clock.mockReturnValue(performance.now() + SALVAGE_MS);
-					timers.mock.calls[index]![0]();
+					await nextTurn(); release.resolve(); await closing;
 					expect(executionSignal!.aborted).toBe(true);
-					await vi.waitFor(() => expect(disposed).toHaveBeenCalledOnce());
-					expect(cleared).toHaveBeenCalledWith(timer);
-				} else if (mode.endsWith("join") || mode === "salvage-abort") {
+					expect(acceptScope!(start("next"), true)).toBe(false);
+				} else if (mode.endsWith("join") || mode === "abort") {
 					const pending = runtime.prepareActorCall(call("next"), controller.signal);
 					await nextTurn(); available = false;
-					clock.mockReturnValue(performance.now() + SALVAGE_MS);
-					timers.mock.calls[index]![0]();
 					expect(executionSignal!.aborted).toBe(false);
-					if (mode === "operation-join") {
-						const prepared = await pending; expect(prepared?.output).toBeUndefined();
-						await prepared!.settle(simulatedExecution(1), "actor");
-						expect(executionSignal!.aborted).toBe(true);
-					} else if (mode === "salvage-abort") {
-						controller.abort(); expect((await pending)?.output).toBeUndefined();
-						expect(executionSignal!.aborted).toBe(true);
-					} else { release.resolve(); expect((await pending)?.output).toBe("speculative"); }
+					if (mode === "abort") controller.abort(); else if (mode === "join") release.resolve();
+					const prepared = await pending;
+					expect(prepared?.output).toBe(mode === "join" ? "speculative" : undefined);
+					if (mode === "operation-join") await prepared!.settle(simulatedExecution(1), "actor");
+					expect(executionSignal!.aborted).toBe(false);
 				} else {
 					release.resolve(); await ready.promise;
-					expect(cleared).toHaveBeenCalledWith(timer);
-					expect(acceptScope!(start("next"))).toBe(false);
 					expect(acceptScope!(start("next"), true)).toBe(true);
-					expect(acceptScope!(start("turn"), true)).toBe(false);
+					if (mode === "completed") expect((await runtime.prepareActorCall(call("next")))?.output).toBe("speculative");
 				}
 			}
+			expect(commit).toHaveBeenCalledTimes(["adopt", "completed", "join"].includes(mode) ? 1 : 0);
 		} finally {
-			release.resolve(); await runtime.dispose(); timers.mockRestore(); cleared.mockRestore(); clock.mockRestore();
+			release.resolve(); await runtime.dispose(); clock.mockRestore();
 			expect(disposed).toHaveBeenCalledOnce();
 		}
 	});
 
-	it.each([false, true])("re-validates finished exclusive work off the Actor path after an unbounded native call (stale=%s)", async (stale) => {
-		const validate = vi.fn(async () => stale ? { status: "stale" as const, cause: cause("freshness", "resource_changed"), metrics: zeroValidationMetrics() } : validResource());
-		const { runtime, ready, executions } = harness({ actionKey: (tool, args) => buildPiActionKey(tool, args, process.cwd()), execute: () => world("written", { validate }),
+	it.each([false, true, "actor"])("re-validates finished exclusive work off the Actor path after an unbounded native call (stale=%s)", async (stale) => {
+		const background = gated(), actor = gated(), disposed = vi.fn(); let checks = 0;
+		const validate = vi.fn(async () => { const first = ++checks === 1;
+			if (stale === "actor") await (first ? background : actor).wait();
+			return stale && first ? { status: "stale" as const, cause: cause("freshness", "resource_changed"), metrics: zeroValidationMetrics() } : validResource(); });
+		const { runtime, ready, executions } = harness({ actionKey: (tool, args) => buildPiActionKey(tool, args, process.cwd()), execute: () => world("written", { validate, onDispose: disposed }),
 			source: planSource({ propose: () => ({ ...plan("write"), actions: [{ id: "write", type: "tool_call", tool: "write", input: { path: "out.txt", content: "x" } }] }) }) });
 		try {
 			await runtime.startTurn(start("turn")); await ready.promise;
 			await runFallback(runtime, { ...call("turn"), id: "native", tool: "bash", input: { command: "git status" } });
-			await vi.waitFor(() => expect(executions()).toBe(stale ? 2 : 1));
+			if (stale === "actor") {
+				await background.entered;
+				const consumed = runtime.prepareActorCall({ ...call("turn"), tool: "write", input: { path: "out.txt", content: "x" } });
+				await actor.entered; background.release(); await nextTurn(); expect(disposed).not.toHaveBeenCalled();
+				actor.release(); expect((await consumed)?.output).toBe("written");
+			}
+			await vi.waitFor(() => expect(executions()).toBe(stale === true ? 2 : 1));
 			expect(validate).toHaveBeenCalled();
-		} finally { await runtime.dispose(); }
+		} finally { background.release(); actor.release(); await runtime.dispose(); }
 	});
 
 
@@ -2413,8 +2417,9 @@ describe("structural speculative runtime", () => {
 			if (!independent) await runtime.previewActorCall({ ...actor, id: "unsupported", tool: "bash", input: { command: "echo preview" } });
 			if (mode === "expiry") {
 				gate.release(); await ready.promise; await runtime.finishTurn({ ...actor, terminal: false });
-				expect(effects).toBe(0); expect(disposed).toHaveBeenCalledOnce();
-				expect(runtime.inspect("session").exclusiveCandidates).toBe(0);
+				expect(effects).toBe(0); expect(disposed).not.toHaveBeenCalled();
+				const later = { ...actor, turnID: "later" }; await runtime.startTurn(later);
+				expect((await runtime.prepareActorCall(later))?.output).toBe("count:1"); expect(effects).toBe(1);
 			} else {
 				const consumed = runtime.prepareActorCall(actor).then(prepared => prepared?.output); expect(executionCount()).toBe(1); gate.release();
 				expect(await consumed).toBe("count:1"); expect(effects).toBe(1);
@@ -2490,7 +2495,7 @@ describe("structural speculative runtime", () => {
 				match: {
 					matched: true,
 					relation: projected ? { kind: "projected", projector: "read.range", distance: 90 } : { kind: "exact", distance: 0 },
-					adoption: { status: "rejected", cause: mode === "future" ? { stage: "admission", code: "preparation_pending" } : { stage: "execution", code: "isolation_unavailable" } },
+					adoption: { status: "rejected", cause: { stage: "execution", code: "isolation_unavailable" } },
 				},
 			})));
 			expect(settlements).toHaveLength(actionCount);
@@ -2502,46 +2507,57 @@ describe("structural speculative runtime", () => {
 		} finally { await runtime.dispose(); }
 	});
 
-	it.each(["route", "preflight"] as const)("matches a continuation during pending %s without authorizing execution", async (phase) => {
-		const preparation = gated(), settlements: PredictionSettlement[] = [];
+	it.each(["continuation", "prediction", "preview"].flatMap(kind => ["route", "preflight", "queued", "cancel"].map(phase => ({ kind, phase }))))(
+		"takes over $kind during pending $phase and validates its result", async ({ kind, phase }) => {
+		const preparation = gated(), root = barrier(), bound = barrier(), caller = new AbortController(), settlements: PredictionSettlement[] = [];
 		const child = { ...call("child"), tool: "write", input: { path: "child.ts", content: "next" } };
-		const hold = async () => { await preparation.wait(); };
 		const { runtime, executions: executionCount } = harness({
+			settings: () => ({ ...settings, predictionTimeoutMs: 10_000 }),
+			resources: phase === "queued" ? { initial: { cpuCount: 1, idleCpuCount: 0 }, sample: () => new Promise(() => {}) } : undefined,
+			onCandidateMaterialized: ({ tool }) => { (tool === child.tool ? bound : root).arrive(); },
 			source: planSource({
-				propose: ({ startInput }) => startInput.turnID === "parent" ? plan("root") : undefined,
+				enabled: () => kind !== "preview", requestLifetime: "actor_decision",
+				propose: ({ startInput }) => kind === "continuation" ? startInput.turnID === "parent" ? plan("root") : undefined
+					: { ...plan("root"), actions: [{ id: "child", type: "tool_call", tool: child.tool, input: child.input, horizon: phase === "queued" ? 8 : 0 }] },
 				continueOn: ["execution_succeeded"],
-				continue: ({ proposalID, actionID, revision }) => ({ proposalID, source: "source", revision,
+				continue: ({ proposalID, actionID, revision }) => kind !== "continuation" ? undefined : ({ proposalID, source: "source", revision,
 					upsert: [{ id: "child", type: "tool_call", tool: child.tool, input: child.input,
 						dependsOn: [{ actionID, condition: "execution_succeeded" }] }] }),
 				onSettled: ({ settlement }) => { settlements.push(settlement); },
 			}),
 			resolveExecution: async ({ tool }) => {
 				if (tool === "read") return RESOURCE_ROUTE;
-				if (phase === "route") await hold();
+				if (phase === "route" || phase === "cancel") await preparation.wait();
 				return MUTATION_ROUTE;
 			},
 			preflightCandidate: async ({ candidate }) => {
-				if (phase === "preflight" && candidate.tool === child.tool) await hold();
+				if (phase === "preflight" && candidate.tool === child.tool) await preparation.wait();
 				return { ok: true };
 			},
 		});
 		try {
-			await runtime.startTurn(start("parent")); await preparation.entered;
-			expect((await runtime.prepareActorCall(call("parent")))?.output).toBe("speculative");
-			await runtime.finishTurn(call("parent"));
+			if (kind === "continuation") {
+				await runtime.startTurn(start("parent")); await root.promise;
+				expect((await runtime.prepareActorCall(call("parent")))?.output).toBe("speculative");
+				await bound.promise; await runtime.finishTurn(call("parent"));
+			}
 			await runtime.startTurn(child);
-			const prepared = await runtime.prepareActorCall(child);
-			expect(prepared?.output).toBeUndefined();
-			expect(executionCount()).toBe(1);
-			await prepared?.settle(simulatedExecution(1), "actor");
+			const preview = kind === "preview" ? runtime.previewActorCall(child) : undefined;
+			if (phase === "queued") await expect.poll(() => runtime.inspect().resources?.queuedPreparations).toBe(1);
+			else await preparation.entered;
+			const consumed = runtime.prepareActorCall(child, caller.signal);
+			if (phase !== "queued") { await nextTurn(); expect(executionCount()).toBe(kind === "continuation" ? 1 : 0); }
+			if (phase === "cancel") { caller.abort(); expect((await consumed)?.output).toBeUndefined(); }
 			preparation.release();
+			expect((await consumed)?.output).toBe(phase === "cancel" ? undefined : "speculative");
+			await preview;
 			await runtime.finishTurn({ ...child, terminal: true });
-			expect(settlements.filter(({ prediction }) => prediction.actionID === "child")).toMatchObject([{
+			expect(settlements.filter(({ prediction }) => prediction.actionID === "child")).toMatchObject(kind === "preview" ? [] : [{
 				observation: "observed", match: { matched: true, relation: { kind: "exact" },
-					adoption: { status: "rejected", cause: { stage: "admission", code: "preparation_pending" } } },
+					adoption: { status: phase === "cancel" ? "rejected" : "adopted" } },
 			}]);
 		} finally { preparation.release(); await runtime.dispose(); }
-		expect(executionCount()).toBe(1);
+		expect(executionCount()).toBe(Number(kind === "continuation") + Number(phase !== "cancel"));
 		expect(runtime.inspect()).toMatchObject({ pendingPredictions: 0, deferredPlanActions: 0, sharedCandidates: 0, exclusiveCandidates: 0 });
 	});
 
@@ -2940,9 +2956,10 @@ describe("structural speculative runtime", () => {
 			expect(await childConsumption).toBe(mode === "cancelled" ? undefined : `child:${expectedParent}`);
 			expect(workspaceVersion).toBe(mode === "cancelled" ? 1 : 2);
 			await nextTurn();
-			expect(cleanup.mock.calls.filter(([output]) => output === `child:${expectedParent}`)).toHaveLength(1);
+			expect(cleanup.mock.calls.filter(([output]) => output === `child:${expectedParent}`)).toHaveLength(mode === "cancelled" ? 0 : 1);
 			parentGate.release();
 			await runtime.finishTurn({ ...childCall, terminal: true });
+			expect(cleanup.mock.calls.filter(([output]) => output === `child:${expectedParent}`)).toHaveLength(1);
 			const predictions = events.filter((event) => event.type === "prediction").map((event) => event.settlement);
 			expect(new Set(predictions.map((settlement) => settlement.prediction.id)).size).toBe(predictions.length);
 			if (claimed) {

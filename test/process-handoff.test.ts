@@ -66,7 +66,7 @@ describe("ProcessHandoffRegistry", () => {
 	});
 
 	it("owns continuation memory once, within scope and the common retention budget", async () => {
-		for (const revoke of ["consume", "clear", "budget", "dispose"]) {
+		for (const revoke of ["consume", "clear", "budget", "dispose", "borrowed-running", "borrowed-completed"]) {
 			const fixture = await producer(false, new ProcessHandoffRegistry<unknown>(8, 100));
 			const image = Buffer.from("private live state"), computation = new TimelineInterval(2, 5);
 			const certificate = sealFixture(fixture.certificate.prototype, { producer: fixture.certificate.producer,
@@ -76,6 +76,16 @@ describe("ProcessHandoffRegistry", () => {
 				{ image, physicalRoot: "/private/workspace", computation }); });
 			fixture.registry.observeSuspension(fixture.key, fixture.work, suspend);
 			const borrowed = fixture.work.suspend!;
+			if (revoke.startsWith("borrowed")) {
+				if (revoke === "borrowed-completed") await borrowed();
+				const receipt = await fixture.actor(async live => {
+					if (live) fixture.registry.configure(0, 0);
+					return livePlan(live);
+				}, async () => { fixture.registry.configure(0, 0); await borrowed(); return "completed"; });
+				expect(receipt).toMatchObject({ kind: "hit", continuation: { image, computation } });
+				await expect(fixture.actor()).resolves.toMatchObject({ kind: "miss" });
+				fixture.registry.dispose(); continue;
+			}
 			await borrowed(); await borrowed(); expect(suspend).toHaveBeenCalledOnce();
 			expect(fixture.work.computation).toBe(computation);
 			await expect(fixture.actor(undefined, undefined, OTHER_SCOPE)).resolves.toMatchObject({ kind: "miss" });
@@ -126,16 +136,18 @@ describe("ProcessHandoffRegistry", () => {
 		await expect(fixture.ownership.commit(async () => "whole")).rejects.toMatchObject({ disposition: "recoverable" });
 		fixture.registry.dispose();
 	});
-	it("lets a later Actor call salvage a completed one-shot result once, never a producer", async () => {
+	it("lets a later Actor call salvage an old one-shot result once, never a producer", async () => {
 		const acceptScope = vi.fn((_scope: typeof SCOPE, salvage?: boolean) => salvage === true);
 		const fixture = await producer(true, undefined, 0, SCOPE, new ProcessHandoffOwnership(undefined, acceptScope));
 		await fixture.publish();
-		await expect(fixture.registry.acquire({ key: fixture.key, scope: OTHER_SCOPE, role: "producer", ownership: new ProcessHandoffOwnership(), lookup: livePlan,
-			executablePath: fixture.certificate.prototype.executablePath })).resolves.toMatchObject({ kind: "work" });
-		await expect(fixture.actor(undefined, async () => "miss", OTHER_SCOPE)).resolves.toMatchObject({ kind: "hit", producer: fixture.work });
-		await expect(fixture.actor(undefined, async () => "miss", OTHER_SCOPE)).resolves.toMatchObject({ kind: "miss" });
-		expect(acceptScope).toHaveBeenCalledWith(OTHER_SCOPE, true);
-		fixture.registry.dispose();
+		const clock = vi.spyOn(performance, "now").mockReturnValue(performance.now() + 3_600_000);
+		try {
+			await expect(fixture.registry.acquire({ key: fixture.key, scope: OTHER_SCOPE, role: "producer", ownership: new ProcessHandoffOwnership(), lookup: livePlan,
+				executablePath: fixture.certificate.prototype.executablePath })).resolves.toMatchObject({ kind: "work" });
+			await expect(fixture.actor(undefined, async () => "miss", OTHER_SCOPE)).resolves.toMatchObject({ kind: "hit", producer: fixture.work });
+			await expect(fixture.actor(undefined, async () => "miss", OTHER_SCOPE)).resolves.toMatchObject({ kind: "miss" });
+			expect(acceptScope).toHaveBeenCalledWith(OTHER_SCOPE, true);
+		} finally { clock.mockRestore(); fixture.registry.dispose(); }
 	});
 	it("owns bounded launch bindings without persisting secrets or granting result adoption", async () => {
 		for (const source of ["sealed", "consumed", "native"]) for (const revoke of ["clear", "count", "bytes", "dispose"] as const) {
@@ -337,7 +349,7 @@ describe("ProcessHandoffRegistry", () => {
 	it.each(([
 		["clear", "completed"], ["trim", "completed"], ["dispose", "completed"], ["dispose", "history"],
 	] as const).flatMap(([operation, phase]) => (phase === "completed" ? [false, true] : [false]).map(oneShot => ({ operation, phase, oneShot }))))(
-		"revokes $operation during a pending $phase lookup (one-shot $oneShot)", async ({ operation, phase, oneShot }) => {
+		"protects acquisition from trimming but honors $operation during $phase lookup (one-shot $oneShot)", async ({ operation, phase, oneShot }) => {
 		const completed = phase === "completed";
 		const fixture = await producer(oneShot), gate = gated();
 		if (completed) await fixture.publish();
@@ -352,13 +364,18 @@ describe("ProcessHandoffRegistry", () => {
 		else if (operation === "trim") fixture.registry.configure(0);
 		else fixture.registry.dispose();
 		gate.release();
-		await expect(actor).resolves.toEqual({ kind: "miss", joined: false });
-		if (completed) await expect(fixture.ownership.commit(async () => "whole")).resolves.toBe("whole");
+		await expect(actor).resolves.toMatchObject({ kind: operation === "trim" ? "hit" : "miss", joined: false });
+		if (completed) {
+			const whole = expect(fixture.ownership.commit(async () => "whole"));
+			if (operation === "trim" && oneShot) await whole.rejects.toMatchObject({ disposition: "recoverable" });
+			else await whole.resolves.toBe("whole");
+		}
 		else {
 			await expect(fixture.actor(lookup)).resolves.toEqual({ kind: "miss", joined: false });
 			await expect(fixture.work.completion).resolves.toBeUndefined();
 		}
-		expect(lookup).toHaveBeenCalledTimes(operation === "dispose" ? 1 : 2);
+		expect(lookup).toHaveBeenCalledTimes(operation === "clear" ? 2 : 1);
+		expect(fixture.registry.hasResults).toBe(false);
 	});
 
 	it("arbitrates whole and child ownership across validation and commit, retaining repeatable results", async () => {
@@ -459,7 +476,7 @@ describe("ProcessHandoffRegistry", () => {
 		fixture.registry.dispose();
 	});
 
-	it("revokes running input lookups and lets a rejected candidate yield without cancelling its owner", async () => {
+	it.each(["rejected", "miss"] as const)("revokes running input lookups and lets a %s yield without cancelling its owner", async rejection => {
 		for (const revoke of ["release", "publish", "failure", "dispose"]) {
 			const fixture = await producer(), changed = vi.fn(async () => true);
 			const release = fixture.registry.observeInputs(fixture.key, fixture.work, changed);
@@ -476,7 +493,7 @@ describe("ProcessHandoffRegistry", () => {
 		const stale = await producer(), valid = await producer(false, stale.registry, 1);
 		stale.registry.observeInputs(stale.key, stale.work, async () => true);
 		await expect(stale.actor(undefined, async running => {
-			if (await running.inputsChanged?.()) return "rejected";
+			if (await running.inputsChanged?.()) return rejection;
 			await valid.publish(); return "completed";
 		})).resolves.toMatchObject({ kind: "hit", producer: valid.work, joined: true });
 		await expect(stale.work.inputsChanged!()).resolves.toBe(true);

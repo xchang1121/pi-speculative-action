@@ -1,4 +1,4 @@
-import { SALVAGE_MS, snapshotExecutionScope, type ExecutionScope, type ExecutionOperationAdoption } from "./execution-world.ts";
+import { snapshotExecutionScope, type ExecutionScope, type ExecutionOperationAdoption } from "./execution-world.ts";
 import { EffectCommitFailure, effectCommitFailure } from "./effect-transaction.ts";
 import type { ProcessProvenanceCertificate, Sha256Digest } from "./provenance-certificate.ts";
 import { immutableSnapshot, isImmutableSnapshot, stableEqual } from "./stable-json.ts";
@@ -16,8 +16,7 @@ export class ProcessHandoffOwnership {
 		if (acceptScope) this.scopeOwner = new WeakRef(acceptScope);
 	}
 
-	/** A live plan consumer may own this one-shot computation beyond its production turn; so may, while its owner still
-	 * speculates, a later Actor call of the same launch when the result is complete and recent (`salvage`). */
+	/** A live owner may transfer this computation beyond its production turn; age grants no reuse authority. */
 	acceptsScope(producer: ExecutionScope | undefined, consumer: ExecutionScope | undefined, salvage = false): boolean {
 		if (!producer || !consumer || producer.sessionID !== consumer.sessionID) return false;
 		return sameScope(producer, consumer) || this.scopeOwner?.deref()?.(consumer, salvage) === true;
@@ -74,6 +73,7 @@ type HandoffState =
 	| { readonly status: "completed" | "retained"; readonly candidate?: ProcessProvenanceCertificate };
 
 interface HandoffRecord extends ProcessHandoff {
+	borrowers: number;
 	readonly controller: AbortController;
 	readonly key: Sha256Digest;
 	state: HandoffState;
@@ -82,7 +82,6 @@ interface HandoffRecord extends ProcessHandoff {
 	readonly executablePath: string;
 	readonly settle: () => void;
 	continuation?: ProcessContinuation;
-	completedAt?: number;
 }
 
 export type ProcessHandoffAcquisition<Plan> =
@@ -226,49 +225,54 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		scope = snapshotExecutionScope(scope);
 		let joined = false, historyChecked = false;
 		const considered = new Map<HandoffRecord, Sha256Digest | undefined>();
-		while (true) {
-			if (this.disposed) return { kind: "miss", joined };
-			const records = [...this.byKey.get(request.key)?.values() ?? []];
-			const completed = [...records].reverse().flatMap((record) => {
-				const state = record.state;
-				if (state.status !== "completed" || !state.candidate || considered.has(record)) return [];
+		const borrowed = new Set<HandoffRecord>();
+		const retain = (record: HandoffRecord) => { if (!borrowed.has(record)) { borrowed.add(record); record.borrowers++; } };
+		try {
+			while (true) {
+				if (this.disposed) return { kind: "miss", joined };
+				const records = [...this.byKey.get(request.key)?.values() ?? []];
+				const completed = [...records].reverse().flatMap((record) => {
+					const state = record.state;
+					if (state.status !== "completed" || !state.candidate || considered.has(record)) return [];
 					const oneShot = state.candidate.dependencyCertificate.taints.length > 0 || !!state.candidate.result.continuation;
 					if (state.candidate.result.continuation && !record.continuation) return [];
-				return oneShot && (!this.transferable(record, scope, request.role) || record.ownership.wholeClaimed)
-					? [] : [{ record, state, candidate: state.candidate, oneShot }];
-			});
-			if (completed.length) {
-				const plan = await request.lookup(completed.map(({ candidate }) => candidate));
-				const selected = completed.find(({ candidate }) => candidate === plan?.certificate);
-				for (const { record, candidate } of selected ? [selected] : completed) considered.set(record, candidate.id);
-				if (plan && selected && selected.record.state === selected.state && this.byKey.get(request.key)?.has(selected.record) &&
-					(!selected.oneShot || (this.transferable(selected.record, scope, request.role) && selected.record.ownership.claimChild()))) {
-					// Retain bounded launch parameters without granting another transfer of this result.
-					if (selected.oneShot) selected.record.state = { ...selected.state, status: "retained" };
-					const continuation = selected.record.continuation;
-					if (continuation) { this.retainedBytes -= continuation.image.length; selected.record.continuation = undefined; }
-					return { kind: "hit", plan, joined, producer: selected.record, ...(continuation ? { continuation } : {}) };
+					return oneShot && (!record.ownership.acceptsScope(record.scope, scope, request.role === "actor") || record.ownership.wholeClaimed)
+						? [] : [{ record, state, candidate: state.candidate, oneShot }];
+				});
+				if (completed.length) {
+					for (const { record } of completed) retain(record);
+					const plan = await request.lookup(completed.map(({ candidate }) => candidate));
+					const selected = completed.find(({ candidate }) => candidate === plan?.certificate);
+					for (const { record, candidate } of selected ? [selected] : completed) considered.set(record, candidate.id);
+					if (plan && selected && selected.record.state === selected.state && this.byKey.get(request.key)?.has(selected.record) &&
+						(!selected.oneShot || (selected.record.ownership.acceptsScope(selected.record.scope, scope, request.role === "actor") && selected.record.ownership.claimChild()))) {
+						// Retain bounded launch parameters without granting another transfer of this result.
+						if (selected.oneShot) selected.record.state = { ...selected.state, status: "retained" };
+						const continuation = selected.record.continuation;
+						if (continuation) { this.retainedBytes -= continuation.image.length; selected.record.continuation = undefined; }
+						return { kind: "hit", plan, joined, producer: selected.record, ...(continuation ? { continuation } : {}) };
+					}
+					continue;
 				}
-				continue;
+				if (!historyChecked) {
+					// A failed live attempt also rules out its immutable disk copy for this acquisition.
+					const plan = await request.lookup(undefined, new Set([...considered.values()].flatMap(id => id ? [id] : [])));
+					if (plan && !this.disposed) return { kind: "hit", plan, joined };
+					historyChecked = true;
+					continue; // A candidate may have completed while history was being read.
+				}
+				if (request.role === "producer") return { kind: "work", work: this.reserve(request.key, request.executablePath, request.ownership, scope), joined };
+				// Waiting grants no transfer authority; acquisition rechecks the live consumer after validation.
+				const running = records.find((record) => !considered.has(record) && record.state.status === "running" && record.ownership.acceptsScope(record.scope, scope, true)) ??
+					records.find((record) => !considered.has(record) && record.state.status === "running" && scope && record.scope?.sessionID === scope.sessionID);
+				if (!running) return { kind: "miss", joined };
+				retain(running);
+				const decision = await request.waitForRunning(running);
+				if (decision !== "completed") { considered.set(running, undefined); continue; }
+				joined = true;
+				historyChecked = false;
 			}
-			if (!historyChecked) {
-				// A failed live attempt also rules out its immutable disk copy for this acquisition.
-				const plan = await request.lookup(undefined, new Set([...considered.values()].flatMap(id => id ? [id] : [])));
-				if (plan && !this.disposed) return { kind: "hit", plan, joined };
-				historyChecked = true;
-				continue; // A candidate may have completed while history was being read.
-			}
-			if (request.role === "producer") return { kind: "work", work: this.reserve(request.key, request.executablePath, request.ownership, scope), joined };
-			// Waiting grants no transfer authority; acquisition rechecks the live consumer after validation.
-			const running = records.find((record) => !considered.has(record) && record.state.status === "running" && record.ownership.acceptsScope(record.scope, scope)) ??
-				records.find((record) => !considered.has(record) && record.state.status === "running" && scope && record.scope?.sessionID === scope.sessionID);
-			if (!running) return { kind: "miss", joined };
-			const decision = await request.waitForRunning(running);
-			if (decision === "rejected") { considered.set(running, undefined); continue; }
-			if (decision !== "completed") return { kind: "miss", joined };
-			joined = true;
-			historyChecked = false;
-		}
+		} finally { for (const record of borrowed) record.borrowers--; this.trim(); }
 	}
 
 	/** Makes the candidate visible before persistence begins; persistence outcome never retracts it. */
@@ -289,10 +293,9 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		const record = this.byKey.get(key)?.get(handoff);
 		if (!record || record.state.status !== "running") return false;
 		if (!!candidate?.result.continuation !== !!continuation || continuation &&
-			(continuation.image.length !== candidate!.result.continuation!.imageBytes || continuation.image.length > this.maxRetainedBytes)) return false;
+			(continuation.image.length !== candidate!.result.continuation!.imageBytes || !record.borrowers && continuation.image.length > this.maxRetainedBytes)) return false;
 		if (continuation) { record.continuation = continuation; this.retainedBytes += continuation.image.length; }
 		record.state = { status: "completed", ...(candidate ? { candidate } : {}) };
-		record.completedAt = performance.now();
 		this.completedCount++;
 		if (candidate) record.computation = computation ?? continuation?.computation ?? new TimelineInterval(record.startedAt, performance.now());
 		record.settle();
@@ -301,7 +304,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		return true;
 	}
 
-	clearCompleted(): void { this.trim(0); }
+	clearCompleted(): void { for (const record of this.records()) if (record.state.status !== "running") this.remove(record); }
 
 	dispose(): void {
 		this.disposed = true;
@@ -314,18 +317,13 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		this.completedCount = 0;
 	}
 
-	/** Validated like history and used at most once; a suspended image never leaves its consumer's scope. */
-	private transferable(record: HandoffRecord, scope: ExecutionScope | undefined, role: "producer" | "actor"): boolean {
-		return record.ownership.acceptsScope(record.scope, scope, role === "actor" && !record.continuation && performance.now() - record.completedAt! <= SALVAGE_MS);
-	}
-
 	private reserve(key: Sha256Digest, executablePath: string, ownership: ProcessHandoffOwnership, scope?: ExecutionScope): HandoffRecord {
 		if (this.disposed) throw new Error("process handoff registry is disposed");
 		let settle!: () => void;
 		const completion = new Promise<void>((resolve) => { settle = resolve; });
 		const controller = new AbortController();
 		const record: HandoffRecord = {
-			controller, signal: controller.signal,
+			controller, signal: controller.signal, borrowers: 0,
 			key,
 			completion,
 			executablePath,
@@ -355,6 +353,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 	private trim(limit = this.maxCompleted): void {
 		if (this.completedCount <= limit && this.retainedBytes <= this.maxRetainedBytes) return;
 		for (const record of this.records()) {
+			if (record.borrowers) continue;
 			if (record.state.status !== "running" && this.completedCount > limit) this.remove(record);
 			else if (this.retainedBytes > this.maxRetainedBytes) this.revokeBinding(record);
 		}

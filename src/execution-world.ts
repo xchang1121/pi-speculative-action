@@ -14,9 +14,6 @@ export type ExecutionWorldScope = "runtime" | "fallback";
 /** Logical session and turn for execution ownership, separate from reusable action identity. */
 export interface ExecutionScope { readonly sessionID: string; readonly turnID: string; }
 
-/** How long a completed one-shot result its prediction left unused may still serve the Actor, once. */
-export const SALVAGE_MS = 10 * 60_000;
-
 export function snapshotExecutionScope(scope: ExecutionScope | undefined): ExecutionScope | undefined {
 	return scope ? Object.freeze({ sessionID: scope.sessionID, turnID: scope.turnID }) : undefined;
 }
