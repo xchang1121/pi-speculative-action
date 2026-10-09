@@ -1826,11 +1826,11 @@ static int descriptor_context(struct decision_job *job, char *line, size_t capac
 		struct stat state;
 		if (pin < 0) goto fail;
 		if (fstat(pin, &state) < 0) { close(pin); goto fail; }
-		struct resource_object *object = pin_object(job->domain, pin);
 		unsigned event = !(state.st_mode & S_IFMT) ? event_state(getpid(), pin, NULL, NULL) : 0;
+		/* Unowned streams still describe the launch. Ownership remains a separate
+		 * adoption proof; dropping their context prevents even safe discovery. */
 		if (!S_ISREG(state.st_mode) && !S_ISDIR(state.st_mode) &&
-			!((null_device(&state) || event || ((S_ISFIFO(state.st_mode) || S_ISSOCK(state.st_mode)) &&
-				(!job->domain->enabled || (object && (object->pipe || object->channel))))) && descriptor != 1 && descriptor != 2)) { close(pin); continue; }
+			!((null_device(&state) || event || S_ISFIFO(state.st_mode) || S_ISSOCK(state.st_mode)) && descriptor != 1 && descriptor != 2)) { close(pin); continue; }
 		if (job->capture_count == MAX_POSITIONS) { close(pin); goto fail; }
 		job->captures[job->capture_count++] = (struct file_position){.descriptor = descriptor, .duplicate = pin, .installed = 1};
 	}
@@ -3109,6 +3109,7 @@ static void *relay_output(void *argument) {
 static int execute_descriptors(const char *manifest, const char *report, char *executable, char **command, const char *route, unsigned closed_input, const int *output_flags) {
 	struct file_position positions[MAX_POSITIONS];
 	struct output_relay relays[2] = {{.source = -1, .writer = -1, .destination = 1}, {.source = -1, .writer = -1, .destination = 2}};
+	struct { int flags; uintmax_t inode; } output_state[2] = {{.flags = -1}, {.flags = -1}};
 	char line[MAX_LINE];
 	unsigned count = 0, close_input = closed_input, journal = 0, initialized = 0, inherited = 3;
 	int result = 70, minimum = 3, output = -1, root_status = -1;
@@ -3348,7 +3349,6 @@ static int execute_descriptors(const char *manifest, const char *report, char *e
 		}
 	}
 	for (unsigned index = 0; index < 2; index++) {
-		close(relays[index].writer); relays[index].writer = -1;
 		if (relays[index].source >= 0) {
 			if (pthread_create(&relays[index].thread, NULL, relay_output, &relays[index])) { kill(root, SIGKILL); goto done; }
 			relays[index].started = 1;
@@ -3362,6 +3362,16 @@ static int execute_descriptors(const char *manifest, const char *report, char *e
 		if (errno != ECHILD || root_status < 0) goto done;
 		break;
 	}
+	/* Only our relay reads these private pipes. Keep the writer OFD until every
+	 * descendant exits, seal its final status, then release it before joining EOF. */
+	for (unsigned index = 0; route[2] && index < 2; index++) if (route[index + 2] == 'p') {
+		int fd = relays[index && route[0] == route[1] ? 0 : index].writer;
+		struct stat state;
+		output_state[index].flags = fcntl(fd, F_GETFL);
+		if (output_state[index].flags < 0 || fstat(fd, &state) < 0 || !S_ISFIFO(state.st_mode)) goto done;
+		output_state[index].inode = state.st_ino;
+	}
+	for (unsigned index = 0; index < 2; index++) { close(relays[index].writer); relays[index].writer = -1; }
 	for (unsigned index = 0; index < 2; index++) if (relays[index].started) {
 		void *failed; int joined = pthread_join(relays[index].thread, &failed); relays[index].started = 0;
 		if (joined || failed) goto done;
@@ -3382,6 +3392,8 @@ static int execute_descriptors(const char *manifest, const char *report, char *e
 		if (offset < 0 || flags < 0 || dprintf(output, "%d %d %jd %ju %ju\n",
 			position->descriptor, flags, (intmax_t)offset, position->device, position->inode) < 0) goto done;
 	}
+	for (unsigned index = 0; index < 2; index++) if (output_state[index].flags >= 0 &&
+		dprintf(output, "O %u %d %ju\n", index + 1, output_state[index].flags, output_state[index].inode) < 0) goto done;
 	/* A nameless file still belongs to its inherited OFDs. Publish its final image once, before releasing the pins. */
 	size_t detached_bytes = 0;
 	for (unsigned index = 0; index < count; index++) {

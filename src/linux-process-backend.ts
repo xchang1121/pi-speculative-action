@@ -1422,6 +1422,7 @@ export class LinuxProcessReuseBackend {
 				transactionFinishing = true;
 				const observing = observeStrace(tracePrefix, image, session.projection.toLogical(request.cwd), { interposedExecutables, brokeredWrites: pid => brokeredWrites(session, pid, writer), privateUpper: privateUpper(session),
 						...(frozen ? { frozen } : {}), ...(outputEndpoints ? { outputEndpoints } : {}),
+						unchangedOutputPipes: descriptors.outputPipes,
 						guardFilesystemSemanticsWithin: [session.workspace.sandboxRoot, session.sourceRoot],
 						inheritedDirectoryImages: directoryImages.flatMap(([physical]) => [physical, session.projection.toLogical(physical)]),
 						inheritedFileImages: [...descriptorImages.values()].flatMap(image => [image.logical, image.physical])
@@ -1730,9 +1731,10 @@ function createProcessDescriptorCapture(session: ActiveSession, traceRoot: strin
 	const descriptorImages = new Map<number, { physical: string; logical: string; workspace: boolean; state: import("node:fs").BigIntStats }>();
 	const directoryImages: Array<readonly [string, string]> = [];
 	const inheritedFiles: Awaited<ReturnType<typeof open>>[] = [];
+	const outputPipes: string[] = [];
 	let descriptorReport: Awaited<ReturnType<typeof open>> | undefined;
 	return {
-		inputs, descriptorManifest, descriptorReportPath, descriptorImages, directoryImages, inheritedFiles,
+		inputs, descriptorManifest, descriptorReportPath, descriptorImages, directoryImages, inheritedFiles, outputPipes,
 		async prepare(resourceJournal: boolean): Promise<void> {
 			if (!descriptorManifest || !descriptorReportPath) return;
 			descriptorReport = await open(descriptorReportPath, "wx+", 0o600);
@@ -1782,7 +1784,10 @@ function createProcessDescriptorCapture(session: ActiveSession, traceRoot: strin
 			await writeFile(descriptorManifest, manifest, { flag: "wx", mode: 0o600 });
 		},
 		async readPositions() {
-			return descriptorReport && inputs.length ? parseDescriptorOffsets(await descriptorReport.readFile(), inputs) : undefined;
+			if (!descriptorReport) return undefined;
+			const positions = parseDescriptorOffsets(await descriptorReport.readFile(), inputs, request.outputPipes?.some(Boolean)
+				? { pipes: request.outputPipes, flags: request.outputFlags ?? [0, 0], endpoints: outputPipes } : undefined);
+			return inputs.length ? positions : undefined;
 		},
 		async captureFileEffects(store: ProvenanceCertificateStore, descriptorOffsets: ReturnType<typeof parseDescriptorOffsets> | undefined,
 			after: WorkspaceStructureSnapshot, effectsComplete: boolean, journal: readonly OrderedEffectEvent[]): Promise<void> {
@@ -1935,7 +1940,9 @@ function requestProcessImage(pid: number, channel: import("node:stream").Duplex,
 	});
 }
 
-function parseDescriptorOffsets(report: Buffer, inputs: ReturnType<typeof descriptorInputs>): Array<{
+function parseDescriptorOffsets(report: Buffer, inputs: ReturnType<typeof descriptorInputs>, outputs?: {
+	readonly pipes: readonly [boolean, boolean]; readonly flags: readonly [number, number]; readonly endpoints: string[];
+}): Array<{
 	fd: number; before: OFDPosition; after: OFDPosition; device: string; inode: string; afterFlags?: number;
 	content?: import("./provenance-certificate.ts").ArtifactReference;
 	detached?: { content: Buffer; mode: bigint; uid: bigint; gid: bigint; modified: bigint };
@@ -1956,6 +1963,14 @@ function parseDescriptorOffsets(report: Buffer, inputs: ReturnType<typeof descri
 	});
 	while (cursor < report.length) {
 		const value = line();
+		const output = /^O ([12]) (\d+) ([1-9]\d{0,19})$/.exec(value);
+		if (output) {
+			const index = Number(output[1]) - 1;
+			if (!outputs?.pipes[index] || outputs.endpoints[index] || BigInt(output[3]!) > 0xffffffffffffffffn ||
+				Number(output[2]) !== (1 | outputs.flags[index]! & 0xc00)) throw new Error("output pipe status changed during execution");
+			outputs.endpoints[index] = `pipe:[${output[3]}]`;
+			continue;
+		}
 		if (!/^F \d+ \d+ \d+ \d+ -?\d+ \d+ \d+$/.test(value)) throw new Error("invalid detached file image");
 		const [, fd, mode, uid, gid, seconds, nanos, length] = value.split(" "), size = Number(length);
 		const input = inputs.find(input => input.fd === Number(fd)), position = positions.find(position => position.fd === Number(fd));
@@ -1964,6 +1979,7 @@ function parseDescriptorOffsets(report: Buffer, inputs: ReturnType<typeof descri
 		position.detached = { content: report.subarray(cursor, cursor + size), mode: BigInt(mode!), uid: BigInt(uid!), gid: BigInt(gid!), modified: BigInt(seconds!) * 1_000_000_000n + BigInt(nanos!) };
 		cursor += size + 1;
 	}
+	if (outputs?.pipes.some((pipe, index) => pipe && !outputs.endpoints[index])) throw new Error("output pipe status proof missing");
 	return positions;
 }
 
