@@ -768,6 +768,72 @@ describe("structural speculative runtime", () => {
 		} finally { await runtime.dispose(); }
 	});
 
+	it.each(["failed", "costly-used", "profitable-used"] as const)("charges operation preparation before admitting another distinct launch (%s)", async mode => {
+		let elapsed = 0, completed = deferred<void>();
+		const nativeNow = performance.now.bind(performance), clock = vi.spyOn(performance, "now").mockImplementation(() => nativeNow() + elapsed);
+		const launched: string[] = [];
+		const { runtime } = harness({ source: planSource({ propose: ({ startInput }) => ({
+			...plan(startInput.turnID), actions: [{ ...readAction("prepare", { path: startInput.turnID }), type: "operation",
+				operation: Object.freeze({ backend: "process", identity: startInput.turnID, permissionHash: "parent", executionMs: 50, expectedDurationMs: 200 }),
+				producesOperations: true, expectedDurationMs: 200 }],
+		}), onExecutionSettled: () => { completed.resolve(); }, onSettled: ({ settlement }) => {
+			if (settlement.observation === "unobserved" && settlement.cause.code === "operations_unprofitable") completed.resolve();
+		} }), executeCandidate: async ({ candidate, startInput, onOperationAdopted }) => {
+			launched.push(startInput.turnID); elapsed += 200;
+			if (mode === "failed") throw new Error("no reusable process result");
+			onOperationAdopted!({ scope: startInput, id: `native:${startInput.turnID}`, sequence: 1,
+				operationIdentity: candidate.operation!.identity, executionMs: mode === "costly-used" ? 50 : 500 });
+			return world("prepared");
+		} });
+		try {
+			const attempts = mode === "failed" ? 3 : 5;
+			for (let index = 0; index < attempts; index++) {
+				completed = deferred<void>();
+				const turnID = `operation:${index}`;
+				await runtime.startTurn(start(turnID)); await completed.promise;
+				await runtime.finishTurn({ ...call(turnID), terminal: false });
+			}
+			expect(launched).toHaveLength(mode === "failed" ? 2 : mode === "costly-used" ? 4 : 5);
+		} finally { await runtime.dispose(); clock.mockRestore(); }
+	});
+
+	it.each(["failed", "cancelled"] as const)("recovers operation preparation from late consumed work after %s production", async mode => {
+		let elapsed = 0, completed = deferred<void>(), entered = deferred<void>(), recovered = false;
+		const nativeNow = performance.now.bind(performance), clock = vi.spyOn(performance, "now").mockImplementation(() => nativeNow() + elapsed);
+		const receipts = new Map<string, NonNullable<Parameters<TestAdapter["executeCandidate"]>[0]["onOperationAdopted"]>>();
+		const launched: string[] = [];
+		const { runtime } = harness({ resolveExecution: () => MUTATION_ROUTE, source: planSource({ propose: ({ startInput }) => ({ ...plan(startInput.turnID), actions: [{
+			...readAction("prepare", { path: startInput.turnID }), type: "operation", producesOperations: true,
+			operation: Object.freeze({ backend: "process", identity: startInput.turnID, permissionHash: "parent", executionMs: 50, expectedDurationMs: 200 }),
+		}] }), onExecutionSettled: () => { completed.resolve(); }, onSettled: ({ settlement }) => {
+			if (settlement.observation === "unobserved" && settlement.cause.code === "operations_unprofitable") completed.resolve();
+		} }), executeCandidate: async ({ startInput, signal, onOperationAdopted }) => {
+			launched.push(startInput.turnID); receipts.set(startInput.turnID, onOperationAdopted!); elapsed += 200; entered.resolve();
+			if (recovered) return world("prepared");
+			if (mode === "cancelled") await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+			throw new Error("preparation did not finish");
+		} });
+		try {
+			const attempts = mode === "failed" ? 2 : 4;
+			for (let index = 0; index < attempts; index++) {
+				completed = deferred<void>(); entered = deferred<void>();
+				const turnID = `operation:${index}`;
+				await runtime.startTurn(start(turnID)); await entered.promise;
+				if (mode === "cancelled") await runtime.finishTurn({ ...call(turnID), terminal: true });
+				await completed.promise;
+				if (mode === "failed") await runtime.finishTurn({ ...call(turnID), terminal: false });
+			}
+			completed = deferred<void>(); await runtime.startTurn(start("blocked")); await completed.promise;
+			expect(launched).toHaveLength(attempts); // Cancellation spent its service cost but did not trigger the two-failure circuit.
+			receipts.get(`operation:${attempts - 1}`)!({ scope: start("blocked"), id: "late-child", sequence: 1,
+				operationIdentity: `operation:${attempts - 1}`, executionMs: 2000 });
+			await runtime.finishTurn({ ...call("blocked"), terminal: false });
+			recovered = true; completed = deferred<void>();
+			await runtime.startTurn(start("recovered")); await completed.promise;
+			expect(launched.at(-1)).toBe("recovered");
+		} finally { await runtime.dispose(); clock.mockRestore(); }
+	});
+
 	it("budgets learning by observable service and credits only the captured binding's distinct adoptions", async () => {
 		const binding: ExecutionOperationBinding = Object.freeze({ backend: "process", identity: "child", permissionHash: "parent", executionMs: 800, expectedDurationMs: 800 });
 		const bindings = [binding, Object.freeze({ ...binding })], receipts: NonNullable<Parameters<TestAdapter["executeCandidate"]>[0]["onOperationAdopted"]>[] = [];

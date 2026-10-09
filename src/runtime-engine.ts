@@ -1143,6 +1143,9 @@ export function makeSpeculativeActionRuntime<
 		let branch: WorldBranch<Output> | undefined;
 		const inputs = candidate.owner.draft.type === "tool_call" && candidate.route.reuse === "shared_result" && !candidateWorld(candidate)
 			? borrowCandidateInputs(session, candidate, `inputs:prediction:${candidate.id}`) : undefined;
+		const draft = candidate.owner.draft, learning = session.operationLearning;
+		const sample = { costMs: 0, benefitMs: 0 as number | undefined, failed: false },
+			update = draft.producesOperations && learning.gate.observe("reruns", sample, DEFAULT_BENEFIT_GATE_POLICY);
 		try {
 			const parent = candidateWorld(candidate), owner = candidate.owner.startInput;
 			// A root fork outliving its turn runs in the live turn's scope: its own turn's snapshots and handoffs are closed.
@@ -1151,9 +1154,7 @@ export function makeSpeculativeActionRuntime<
 			candidate.acceptOperationScope = operationScopePolicy(session, candidate.id);
 			for (const [policy, at] of session.salvageScopes) if (startedAt - at > SALVAGE_MS) session.salvageScopes.delete(policy);
 			session.salvageScopes.set(candidate.acceptOperationScope, startedAt);
-			const draft = candidate.owner.draft, learning = session.operationLearning;
-			const sample = { costMs: 0, benefitMs: 0 as number | undefined }, update = draft.producesOperations && learning.gate.observe("reruns", sample, DEFAULT_BENEFIT_GATE_POLICY);
-			if (update) candidate.onAdopted = timing => { creditAdoption(sample, timing); update(sample); };
+			if (update) candidate.onAdopted = timing => { creditAdoption(sample, timing); sample.failed = false; update(sample); };
 			const adopted = update || draft.type === "operation" || candidate.origin === "prediction" ? new Set<string>() : undefined;
 			if (adopted) candidate.onOperationAdopted = adoption => {
 				const turn = session.turns.get(adoption.scope.turnID);
@@ -1165,7 +1166,7 @@ export function makeSpeculativeActionRuntime<
 				if (!adopted.has(receipt) && adopted.size < positiveCount(session.settings.resourceCacheMaxEntries)) {
 					adopted.add(receipt); // Saturate instead of evicting receipts that could otherwise be credited twice.
 					const saved = finiteMetric(adoption.executionMs);
-					if (update) { if (sample.benefitMs !== undefined) sample.benefitMs += saved; update(sample); }
+					if (update) { if (sample.benefitMs !== undefined) sample.benefitMs += saved; if (saved > 0) sample.failed = false; update(sample); }
 					if (draft.operation && learning.bindings.has(draft.operation)) learning.creditMs = Math.min(OPERATION_LEARNING_CREDIT_MS, learning.creditMs + saved);
 				}
 				if (draft.type !== "operation") return;
@@ -1242,7 +1243,13 @@ export function makeSpeculativeActionRuntime<
 			removeCandidate(session.id, candidate);
 			if (settled) queueCandidateEvent(session, candidate);
 		} finally {
-			const execution = candidate.work.execution, draft = candidate.owner.draft;
+			const execution = candidate.work.execution;
+			if (update && execution.status !== "queued" && execution.status !== "running") {
+				// One physical preparation pays once, including failure and cancellation. Later consumption amends this same sample.
+				sample.costMs += execution.executionMs;
+				sample.failed = execution.status === "failed" && sample.benefitMs === 0;
+				update(sample);
+			}
 			const source = candidate.origin === "prediction" ? sourcesByID.get(draft.source ?? "cache") : undefined;
 			if (source?.onExecutionSettled && execution.status !== "queued" && execution.status !== "running") {
 				const feedback = { reuseFeedback: draft.reuseFeedback, status: execution.status, executionMs: execution.executionMs };
