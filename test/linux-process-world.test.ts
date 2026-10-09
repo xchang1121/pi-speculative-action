@@ -32,6 +32,7 @@ import type { SpeculativeActionEvent } from "../src/events.ts";
 import { TaskTimeline } from "../src/task-timing.ts";
 import { testModel } from "./model.ts";
 import type { WorkspaceTransactionCapture } from "../src/workspace-transaction.ts";
+import { WorkspaceSandboxService, type SandboxWorkspaceContext } from "../src/workspace-sandbox.ts";
 import { commitBenchmarkFixture, compileBenchmarkHelper, createLinuxProcessBenchmark, forkReusableBash, prepareLinuxProcessReuse,
 	holdProcessPublication, textOutput } from "./linux-process-fixture.ts";
 
@@ -39,6 +40,54 @@ vi.mock("node:child_process", { spy: true });
 vi.mock("node:fs/promises", { spy: true });
 
 describe("Linux process ExecutionWorld", () => {
+	test("calibrates the original native operation with complete preparation and proof cost", async () => {
+		const root = await mkdtemp(path.join(os.tmpdir(), "pi-operation-timing-"));
+		const registry = new ProcessHandoffRegistry<null>(4, 128), scope = { sessionID: "timing", turnID: "native" };
+		const learned = registry.observe(sha256Digest("learned"), "/worker", scope, null, 10)!;
+		const prepared = registry.observe(sha256Digest("prepared"), "/worker", scope, null, 40)!;
+		const backend = new LinuxProcessReuseBackend({ storeRoot: path.join(root, "store") }), sandbox = new WorkspaceSandboxService();
+		const coordinator = new ProcessExecutionCoordinator(adaptProcessToolOperations(createLocalBashOperations()));
+		const world = createLinuxProcessExecutionWorld({ coordinator, backend, workspaceSandbox: sandbox, storeRoot: path.join(root, "store"), tools: PI_OPERATION_TOOLS.process });
+		let clock = 100, descriptor: ExecutionOperationBinding | undefined;
+		const timer = vi.spyOn(performance, "now").mockImplementation(() => clock);
+		vi.spyOn(backend, "observeBindings").mockImplementation(async (_scope, execute, observe) => { const result = await execute(); observe([learned], []); return result; });
+		vi.spyOn(sandbox, "qualify").mockImplementation(async () => { clock += 20; return { driver: "git", fingerprint: "test" }; });
+		vi.spyOn(backend, "open").mockImplementation(async () => {
+			clock += 5;
+			return { ownership: new ProcessHandoffOwnership(), executionBindings: () => [prepared], computationDependencies: () => [],
+				executeBinding: async () => { clock += 40; return { output: [], exit: { kind: "code", code: 0 } }; },
+				executor: { execute: async () => { throw new Error("enclosing tool must not run"); } },
+				metrics: () => ({ ...emptyWorldReuseMetrics(), executionMs: 90 }),
+				seal: async () => { clock += 30; return []; }, close: async () => { clock += 5; },
+				validate: async () => ({ status: "valid", metrics: { durationMs: 0, bytesRead: 0, filesRead: 0, mode: "exact" } }) };
+		});
+		vi.spyOn(sandbox, "fork").mockImplementation(async input => {
+			clock += 10;
+			const workspace = {} as SandboxWorkspaceContext, output = await input.execute(workspace);
+			if ("output" in output) throw new Error("unexpected delta");
+			await input.afterCapture?.(workspace, { output, changes: [] }); clock += 10;
+			return { output, backend: world.id, resources: [], capturedBytes: 0, executionMetrics: {},
+				compatibility: { status: "compatible", backend: world.id, executionFingerprint: "test" }, commit: async () => output, dispose: async () => {} };
+		});
+		try {
+			const cwd = path.resolve(os.tmpdir()), args = { command: "worker" }, invocation = resolvePiToolInvocation("bash", args, { cwd, environment: {} })!;
+			const permission = PI_ACTION_SEMANTICS.buildKey("bash", args, cwd, "schema", { fingerprint: "test", context: invocation })!;
+			await world.observeOperations!({ action: permission, scope, learn: true }, async () => undefined, bindings => { descriptor = bindings[0]; });
+			expect(descriptor!.expectedDurationMs).toBe(10);
+			const action = buildActionKey({ ...permission, input: { operation: descriptor!.identity },
+				executionContext: { ...invocation, operation: { binding: descriptor!, permission } } });
+			const began = clock, branch = await world.speculation.execute({ cwd, action, toolName: "bash", args, callID: "prepare",
+				tool: createBashTool(cwd), signal: new AbortController().signal, executionScope: scope });
+			try {
+				expect(clock - began).toBe(120);
+				expect(descriptor!.expectedDurationMs).toBe(120);
+				expect(branch.operations![0]!.expectedDurationMs).toBe(120);
+				expect(registry.observe(learned.key, "/worker", scope, null, 25)).toBe(learned);
+				expect(descriptor!.expectedDurationMs).toBe(135);
+			} finally { await branch.dispose(); }
+		} finally { timer.mockRestore(); await world.dispose?.(); await sandbox.dispose(); registry.dispose(); await rm(root, { recursive: true, force: true }); }
+	});
+
 	test("prepares with a long temporary path and removes its restricted short broker socket", { timeout: 20_000 }, async ({ skip }) => {
 		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-long-broker-")), previous = process.env.TMPDIR;

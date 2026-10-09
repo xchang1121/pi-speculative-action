@@ -28,7 +28,7 @@ import { definedProcessEnvironment, type PreparedProcessExecutionRoute, type Pro
 	type ProcessExecutor } from "./process-execution.ts";
 import { isPoisonedEffectCommit } from "./effect-transaction.ts";
 import { resolveHostExecutable } from "./executable-path.ts";
-import { assertNoSymlinkPath, captureFilesystemEntry, captureStableFile, hashExecutableFile, mapFilesystem, rememberCapture, sameFilesystemIdentity, sharedWalk, walkFilesystemPath } from "./filesystem-evidence.ts";
+import { assertNoSymlinkPath, cachedCapture, captureFilesystemEntry, captureStableFile, hashExecutableFile, mapFilesystem, rememberCapture, sameFilesystemIdentity, sharedWalk, walkFilesystemPath } from "./filesystem-evidence.ts";
 import { captureHeldDescriptorInputs, inspectHeldExecProcess, LinuxHeldExecBoundary, listenUnixSocket, resolveLinuxExecHelper, type HeldExecDecision,
 	type HeldExecProcess, type HeldExecSnapshot, type HeldExecTiming, type HeldExecClock, descriptorInputs, descriptorEffects, inheritedTracer, type ProcessResourceGraph } from "./linux-held-exec.ts";
 import { emptyWorldReuseMetrics, snapshotExecutionScope, type ExecutionScope, type ExecutionOperationAdoption, type ExecutionOperationBinding, type ExecutionWorldStorageControl,
@@ -2143,11 +2143,14 @@ async function captureDependencies(session: ActiveSession, snapshot: WorkspaceSt
 			const structure = snapshot.entries.get(relative);
 			if (!structure || structure.kind !== "file") return structure;
 			const delta = deltas.get(relative), before = delta?.before, takenAtMs = Date.now();
-			const captured = before ? undefined : await captureStableFile(structure.contentPath ?? path.resolve(snapshot.root, relative), structure.size);
+			const target = structure.contentPath ?? path.resolve(snapshot.root, relative);
+			// The same settled identity already used by exact adoption can stand for repeated preparation hashing.
+			// A symlink or changed inode/size/mtime/ctime misses; hydration still proves the transaction's prestate.
+			const captured = before ? undefined : cachedCapture(await lstat(target, { bigint: true }), target) ?? await captureStableFile(target, structure.size);
 			const hydrated = await hydrateWorkspaceFileEntry(structure, before ?? captured!);
 			if (!hydrated) throw new Error(`transaction baseline changed: ${relative}`);
 			// Its digest stands for the file again when an adoption validates it (see cachedCapture): bytes read under a settled identity stand for that.
-			if (captured || delta?.beforeIdentity) rememberCapture(captured ?? { identity: delta!.beforeIdentity!, hash: hydrated.digest.slice("sha256:".length) }, takenAtMs);
+			if (captured && !captured.shared || delta?.beforeIdentity) rememberCapture(captured ?? { identity: delta!.beforeIdentity!, hash: hydrated.digest.slice("sha256:".length) }, takenAtMs);
 			return hydrated;
 		})());
 		return cached.get(relative)!;
