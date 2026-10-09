@@ -3,7 +3,7 @@ import { nonNegativeNumber } from "./setting-input.ts";
 import { errorDetail } from "./error-utils.ts";
 import type { ResolutionCause, SettledSourceRequest, SourceRequestIdentity, SourceRequestSettlement } from "./settlement.ts";
 import { cause } from "./settlement.ts";
-import { waitForCandidate } from "./scheduler.ts";
+import { waitForCompletion } from "./scheduler.ts";
 
 /** A deliberate source admission decision; it produced no proposal and is not a provider failure. */
 export class SourceRequestSuppressed extends Error {
@@ -61,7 +61,7 @@ export async function runSourceRequest<Value>(input: {
 		.then(() => { signal.throwIfAborted(); return input.produce(signal); })
 		.then((value) => ({ kind: "produced" as const, value }), (error) => ({ kind: "error" as const, error }));
 
-	const waited = await waitForCandidate(producer, input.generation.signal, nonNegativeNumber(input.timeoutMs, undefined));
+	const waited = await waitForCompletion(producer, input.generation.signal, nonNegativeNumber(input.timeoutMs, undefined));
 	if (waited.status === "deadline") {
 		const expiration = cause("source", "timeout");
 		controller.abort(expiration);

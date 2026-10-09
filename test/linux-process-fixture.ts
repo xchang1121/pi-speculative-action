@@ -20,27 +20,26 @@ const BENCHMARK_SCOPE = { sessionID: "benchmark", turnID: "benchmark" } as const
 export type LinuxProcessBenchmark = Readonly<Awaited<ReturnType<typeof createLinuxProcessBenchmark>>>;
 
 /** Retain a real producer at publication until an Actor is admitted to its running work. */
-export function holdProcessPublication(backend: LinuxProcessReuseBackend) {
+export function holdProcessPublication(backend: LinuxProcessReuseBackend, delayMs = 0) {
 	const release = deferred();
-	let reached = false;
+	let reached = false, joined = false, timer: ReturnType<typeof setTimeout> | undefined;
 	const handoffs = Reflect.get(backend, "handoffs") as ProcessHandoffRegistry;
 	const publish = handoffs.publish.bind(handoffs);
 	const publication = vi.spyOn(handoffs, "publish").mockImplementation(async (...args) => {
 		reached = true; await release.promise; return publish(...args);
 	});
-	const wait = scheduling.waitForCandidate;
-	let evidence: { decision: { allowed: boolean; waitBudgetMs?: number } } | undefined;
-	const assessment = vi.spyOn(scheduling, "waitForCandidate").mockImplementation((promise, signal, waitBudgetMs) => {
-		if (waitBudgetMs !== undefined) {
-			evidence = { decision: { allowed: true, waitBudgetMs } };
-			queueMicrotask(() => release.resolve());
+	const wait = scheduling.waitForCompletion;
+	const assessment = vi.spyOn(scheduling, "waitForCompletion").mockImplementation((promise, signal, timeoutMs) => {
+		if (reached && !joined) {
+			joined = true;
+			timer = setTimeout(() => release.resolve(), delayMs);
 		}
-		return wait(promise, signal, waitBudgetMs);
+		return wait(promise, signal, timeoutMs);
 	});
 	return {
 		reached: () => reached,
-		evidence: () => evidence,
-		close: () => { release.resolve(); publication.mockRestore(); assessment.mockRestore(); },
+		joined: () => joined,
+		close: () => { clearTimeout(timer); release.resolve(); publication.mockRestore(); assessment.mockRestore(); },
 	};
 }
 

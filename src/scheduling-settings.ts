@@ -1,9 +1,8 @@
-import { milliseconds, positiveMilliseconds, positiveInteger, probability, settingsParser } from "./setting-input.ts";
+import { positiveMilliseconds, positiveInteger, probability, settingsParser } from "./setting-input.ts";
 
-/** Admission hints and bounded waits; none of these fields grant execution or reuse authority. */
+/** Admission and resource sampling hints; none of these fields grant execution or reuse authority. */
 export type SchedulingSettings = Readonly<typeof SCHEDULING_DEFAULTS>;
 export const { defaults: SCHEDULING_DEFAULTS, parse: normalizeSchedulingSettings } = settingsParser({
-	candidateJoinTimeoutMs: [1_000, milliseconds],
 	resourcePollIntervalMs: [250, positiveMilliseconds],
 	gpuPollIntervalMs: [1_000, positiveMilliseconds],
 	gpuProbeTimeoutMs: [1_000, positiveMilliseconds],

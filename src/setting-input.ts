@@ -80,8 +80,8 @@ export function nonNegativeIntegerInput(title: string): SettingInputDescriptor<n
 	return numericInput(title, (value) => Number.isSafeInteger(value) && value >= 0, `${title} must be a non-negative integer.`);
 }
 
-export function millisecondsInput(title: string, allowZero = false): SettingInputDescriptor<number> {
-	return numericInput(title, value => milliseconds(value, -1) >= (allowZero ? 0 : 1), `${title} must be an integer from ${allowZero ? 0 : 1} to 2147483647.`);
+export function millisecondsInput(title: string): SettingInputDescriptor<number> {
+	return numericInput(title, value => milliseconds(value, -1) >= 1, `${title} must be an integer from 1 to 2147483647.`);
 }
 
 export function nonNegativeNumberInput(title: string): SettingInputDescriptor<number> {

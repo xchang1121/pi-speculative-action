@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { SpeculationScheduler, candidateJoinBudget, CANDIDATE_JOIN_TIMEOUT_MS, waitForCandidate, type PredictionForecast } from "../src/scheduler.ts";
+import { SpeculationScheduler, waitForCompletion, type PredictionForecast } from "../src/scheduler.ts";
+import { deferred } from "./async.ts";
 import type { ExecutionResourceSnapshot } from "../src/system-resources.ts";
 
 const forecast = (facts: Partial<PredictionForecast> = {}): PredictionForecast => ({ tool: "read", decisionBatchesUntilCall: 1, ...facts });
@@ -124,18 +125,17 @@ describe("unified speculation scheduling", () => {
 		expect(scheduler.admit({}, [forecast()], owner, "execution", undefined, { ...identity, actionKeyHash: "b" }).admitted).toBe(true);
 	});
 
-	it("uses one bounded join and settles cancellation without retaining timers", async () => {
+	it("waits for completion without a timer and releases cancelled waits", async () => {
 		vi.useFakeTimers();
-		expect(candidateJoinBudget("succeeded")).toBe(0);
-		expect(candidateJoinBudget("running")).toBe(candidateJoinBudget("queued"));
+		const result = deferred<number>(), settled = vi.fn(), joined = waitForCompletion(result.promise).then(value => { settled(); return value; });
+		await vi.advanceTimersByTimeAsync(86_400_000); expect(settled).not.toHaveBeenCalled(); expect(vi.getTimerCount()).toBe(0);
+		result.resolve(42); expect(await joined).toEqual({ status: "completed", value: 42 });
 		const controller = new AbortController(), pending = new Promise<void>(() => {});
-		const aborted = waitForCandidate(pending, controller.signal, CANDIDATE_JOIN_TIMEOUT_MS);
+		const aborted = waitForCompletion(pending, controller.signal);
 		controller.abort(); expect(await aborted).toEqual({ status: "aborted" }); expect(vi.getTimerCount()).toBe(0);
-		const bounded = waitForCandidate(pending, undefined, candidateJoinBudget("running", 27));
+		const bounded = waitForCompletion(pending, undefined, 27); // Source production and teardown retain their own deadlines.
 		await vi.advanceTimersByTimeAsync(27);
 		expect(await bounded).toEqual({ status: "deadline" }); expect(vi.getTimerCount()).toBe(0);
-		expect(candidateJoinBudget("queued", 0)).toBe(0);
-		expect(candidateJoinBudget("running", 2 ** 31)).toBe(CANDIDATE_JOIN_TIMEOUT_MS);
 	});
 
 	it("samples off the Actor path at the configured interval", async () => {

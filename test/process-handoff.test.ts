@@ -415,7 +415,7 @@ describe("ProcessHandoffRegistry", () => {
 		}
 	});
 
-	it.each(["completed", "deadline", "producer failure", "disposal"].flatMap(phase =>
+	it.each(["completed", "producer failure", "disposal"].flatMap(phase =>
 		(phase === "completed" ? [false, true] : [false]).flatMap(oneShot => [SCOPE, OTHER_SCOPE].map(scope => ({ phase, oneShot, scope })))))(
 		"settles $phase in $scope.turnID and preserves one-shot ownership ($oneShot)", async ({ phase, oneShot, scope }) => {
 		const fixture = await producer(oneShot);
@@ -431,7 +431,7 @@ describe("ProcessHandoffRegistry", () => {
 				return "completed" as const;
 			}
 			await waitGate.wait();
-			return phase === "deadline" ? "miss" as const : "completed" as const;
+			return "completed" as const;
 		});
 
 		for (const foreign of [undefined, { sessionID: "other", turnID: "turn" }]) await expect(fixture.registry.acquire({
@@ -450,7 +450,7 @@ describe("ProcessHandoffRegistry", () => {
 		else if (phase === "disposal") fixture.registry.dispose();
 		waitGate.release();
 		const transferable = phase === "completed" && (!oneShot || scope === SCOPE);
-		await expect(actor).resolves.toMatchObject({ kind: transferable ? "hit" : "miss", joined: phase !== "deadline" });
+		await expect(actor).resolves.toMatchObject({ kind: transferable ? "hit" : "miss", joined: true });
 		if (phase === "completed") expect(lookup.mock.calls).toEqual([[undefined, new Set()], ...(scope === OTHER_SCOPE ? [[undefined, new Set()]] : []),
 			transferable ? [[fixture.certificate]] : [undefined, new Set()]]);
 		const whole = fixture.ownership.commit(async () => "whole");

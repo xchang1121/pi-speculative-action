@@ -34,8 +34,7 @@ import type {
 	SpeculativePlanSource,
 	SpeculativeRuntimeInspection, TurnInput,
 } from "./runtime-contracts.ts";
-import { type PredictionForecast, type ExecutionIdentity, type ScheduledWork, SpeculationScheduler, candidateJoinBudget,
-	waitForCandidate } from "./scheduler.ts";
+import { type PredictionForecast, type ExecutionIdentity, type ScheduledWork, SpeculationScheduler, waitForCompletion } from "./scheduler.ts";
 import type {
 	ActorActionIdentity,
 	PlanActionIdentity,
@@ -1341,19 +1340,20 @@ export function makeSpeculativeActionRuntime<
 
 	/** Results may outlive their consumers; work that has not started still needs an owner. */
 	const retireUndemandedCandidate = (session: Session, candidate: Candidate, failure: ResolutionCause): void => {
-		if (!reservationAvailable(candidate.work.reservation) || candidate.previews?.size || session.plan.consumers(candidate.id).length) return;
+		if (!reservationAvailable(candidate.work.reservation) || candidate.previews?.size || hasActorDemand(session, candidate) || session.plan.consumers(candidate.id).length) return;
 		if (candidate.owner.draft.type === "operation" && candidate.actorAdopted && candidate.work.execution.status === "running") return;
 		// Independently predicted process work may still serve another parent; an abandoned Actor preview has no demand.
 		const state = candidate.work.execution, draft = candidate.owner.draft;
 		if (state.status === "running" && candidate.origin !== "actor_preview" && candidate.route.isolation === "runtime_sandbox" && candidate.acceptOperationScope &&
 			(draft.type === "tool_call" || draft.operation?.available === true) &&
 			performance.now() - state.startedAt < SALVAGE_MS) {
-			// Bound retained running work even when its executor never exits.
-			candidate.salvaging ??= setTimeout(() => { if (candidate.work.execution.status === "running") discardCandidate(session, candidate, failure); },
+			// Recheck ownership at expiry: an Actor may have joined the retained work meanwhile.
+			clearTimeout(candidate.salvaging);
+			candidate.salvaging = setTimeout(() => retireUndemandedCandidate(session, candidate, failure),
 				SALVAGE_MS - (performance.now() - state.startedAt));
 			candidate.salvaging.unref?.(); return;
 		}
-		if (candidate.work.execution.status === "queued" || candidate.work.reservation.kind === "exclusive" ||
+		if (state.status === "queued" || candidate.work.reservation.kind === "exclusive" || (state.status === "running" && candidate.salvaging) ||
 			(candidate.origin === "actor_preview" && !candidate.actorAdopted)) discardCandidate(session, candidate, failure, false);
 	};
 
@@ -1394,7 +1394,8 @@ export function makeSpeculativeActionRuntime<
 	};
 
 	const selectActorCandidate = async (input: ActorSelectionInput): Promise<void> => {
-		const { state, actualCall, actualKey, actorAction, ranked, preview, signal } = input;
+		const { state, actualCall, actualKey, actorAction, ranked, preview } = input;
+		const signal = input.signal ? AbortSignal.any([input.signal, state.generation.signal]) : state.generation.signal;
 		const matchingCandidates = ranked.map(({ candidate }) => candidate);
 		const rebuilt = new Set<Candidate>();
 		const rejectCompatibility = (choice: typeof ranked[number], compatibility: ReturnType<typeof scheduler.assessCompatibility> | undefined): boolean => {
@@ -1415,8 +1416,6 @@ export function makeSpeculativeActionRuntime<
 
 		for (const choice of ranked) {
 			const candidate = choice.candidate;
-			const executionAtDecision = candidate.work.execution;
-			const waitBudgetMs = candidateJoinBudget(executionAtDecision.status === "succeeded" ? "succeeded" : executionAtDecision.status === "running" ? "running" : "queued", state.settings.scheduling?.candidateJoinTimeoutMs);
 			const reservation = acquireCandidate(state.session, candidate, actorAction.identity.id);
 			if (!reservation) { actorAction.rejectCandidate(candidate.id, choice.match, cause("matching", "candidate_reserved")); continue; }
 			(candidate.actorConsumers ??= new Set()).add(actorAction);
@@ -1430,17 +1429,9 @@ export function makeSpeculativeActionRuntime<
 				const authorization = await authorize(state, input.consumeInput, actualKey, actualCall, candidate, signal);
 				if (stopCandidate(candidate)) break;
 				if (authorization) { actorAction.rejectCandidate(candidate.id, choice.match, authorization); continue; }
-				const waiting = await waitForCandidate(candidate.work.completion, signal, waitBudgetMs);
+				const waiting = await waitForCompletion(candidate.work.completion, signal);
 				if (stopCandidate(candidate)) break;
 				if (waiting.status === "aborted") { actorAction.setFallback(cause("control", "actor_aborted"), candidate.id); break; }
-				if (waiting.status === "deadline") {
-					actorAction.rejectCandidate(
-						candidate.id,
-						choice.match,
-						cause("matching", "candidate_join_deadline", JSON.stringify({ waitBudgetMs })),
-					);
-					continue;
-				}
 				const execution = waiting.value;
 				if (execution.status !== "succeeded") { actorAction.rejectCandidate(candidate.id, choice.match, execution.cause); continue; }
 				const branch = execution.output;
@@ -1449,7 +1440,7 @@ export function makeSpeculativeActionRuntime<
 				if (rejectCompatibility(choice, sourceCompatibility)) continue;
 				// Join only this exact Actor intent; changed arguments or executors cannot inherit its preparation.
 				if (preview?.state.status === "candidate" && preview.state.candidateID === candidate.id &&
-					(await preview.actionKey)?.key === actualKey.key) await waitForCandidate(preview.task, signal);
+					(await preview.actionKey)?.key === actualKey.key) await waitForCompletion(preview.task, signal);
 				if (stopCandidate(candidate)) break;
 				// Evaluate sealed data first, then prove freshness once immediately before commit.
 				if (choice.match.kind !== "exact" && branch.inputSource && !candidate.resultViews?.has(actualKey.key))
@@ -1528,6 +1519,7 @@ export function makeSpeculativeActionRuntime<
 				inputs?.dispose();
 				candidate.actorConsumers?.delete(actorAction);
 				reservation.release();
+				if (candidate.salvaging) retireUndemandedCandidate(state.session, candidate, cause("retention", "prediction_horizon_settled"));
 				scheduler.refresh(candidate, forecastsForCandidate(state.session, candidate));
 			}
 		}
@@ -1716,6 +1708,8 @@ export function makeSpeculativeActionRuntime<
 		operations?: readonly ExecutionOperationBinding[],
 	): Promise<void> => {
 		if (state.session.actorRequests.delete(actorAction)) { scheduler.complete(actorAction); state.session.effects.enqueue(wakeResourceWaiters); }
+		for (const candidate of candidateStore.values(state.sessionID)) if (candidate.operationConsumers?.delete(actorAction) && candidate.salvaging)
+			retireUndemandedCandidate(state.session, candidate, cause("retention", "prediction_horizon_settled"));
 		if (!state.actorActions.delete(actorAction)) return;
 		const capture = actorAction.takeCapture();
 		const settlement = actorAction.settleActor(toolExecution, outputIsError(output));
@@ -1994,10 +1988,12 @@ export function makeSpeculativeActionRuntime<
 		return ([...parents].find((candidate) => [...parents].every((parent) => parent === candidate || descendsFrom(candidate, parent))) ?? null);
 	};
 
+	const hasActorDemand = (session: Session, candidate: Candidate): boolean =>
+		!!candidate.actorConsumers?.size || [...candidate.operationConsumers ?? []].some(actor => session.actorRequests.has(actor));
 	const forecastsForCandidate = (session: Session, candidate: Candidate): readonly PredictionForecast[] => {
 		const nodes = session.plan.consumers(candidate.id), execution = candidate.work.execution;
 		const current = { elapsedMs: execution.status === "running" ? Math.max(0, performance.now() - execution.startedAt) : 0,
-			actorDemand: !!candidate.actorConsumers?.size || [...candidate.operationConsumers ?? []].some(actor => session.actorRequests.has(actor)),
+			actorDemand: hasActorDemand(session, candidate),
 			actorHint: !!candidate.previews?.size || pendingActorTurn(session)?.actorToolHints.has(candidate.key.tool) === true };
 		if (nodes.length) return nodes.map(node => ({ ...forecastFor(node, session.decisionSequence), ...current,
 			resourceDemand: resourceDemand(session, candidate.key, candidate.route, node.action.resourceDemand) }));
@@ -2140,22 +2136,20 @@ export function makeSpeculativeActionRuntime<
 			if (scheduler.has(action)) scheduler.refresh(action, forecast);
 			else scheduler.admit(action, forecast, scopeFor(session), "actor");
 		}
+		for (const candidate of candidateStore.values(session.id)) {
+			for (const consumer of candidate.operationConsumers ?? []) if (!session.actorRequests.has(consumer)) candidate.operationConsumers!.delete(consumer);
+			try {
+				if (candidate.operationJoinable?.()) for (const turn of session.turns.values()) for (const action of turn.actorActions)
+					if (action.state.status === "awaiting_fallback" && action.tool === candidate.key.tool) (candidate.operationConsumers ??= new Set()).add(action);
+			} catch { /* A failed acquisition hint reserves no hardware. */ }
+		}
 		const preferred = protectedCandidates.find(candidate => !scheduler.has(candidate));
 		const incoming = preferred && scheduler.evaluate(forecastsForCandidate(session, preferred).map(f => ({ ...f, actorDemand: true })));
 		cancelScheduled(scheduler.preemptFor(scopeFor(session), incoming, job => {
 			if ("context" in job) return job.active && !job.context.admissionSignal.aborted;
 			if (!("work" in job) || job.work.execution.status !== "running" || protectedCandidates.includes(job) || !reservationAvailable(job.work.reservation)) return false;
 			const owner = scheduler.snapshot().find(entry => entry.job === job)?.scope.owner as Session;
-			for (const consumer of job.operationConsumers ?? []) {
-				if (owner.actorRequests.has(consumer)) return false;
-				job.operationConsumers!.delete(consumer);
-			}
-			try {
-				if (job.operationJoinable?.()) for (const turn of owner.turns.values()) for (const action of turn.actorActions)
-					if (action.state.status === "awaiting_fallback" && action.tool === job.key.tool) (job.operationConsumers ??= new Set()).add(action);
-				if (job.operationConsumers?.size) return false;
-			} catch { /* A failed acquisition hint reserves no hardware. */ }
-			return true;
+			return !hasActorDemand(owner, job);
 		}, drainingJob), true);
 	};
 

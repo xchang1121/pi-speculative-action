@@ -92,7 +92,6 @@ const SELF_SPECULATION_INPUTS = {
 } satisfies Partial<SettingInputDescriptors<SelfSpeculationSettings, keyof SelfSpeculationSettings>>;
 
 const SCHEDULING_INPUTS = {
-	candidateJoinTimeoutMs: millisecondsInput("Actor join wait (ms, 0 for immediate fallback)", true),
 	resourcePollIntervalMs: millisecondsInput("Resource sampling interval (ms)"),
 	gpuPollIntervalMs: millisecondsInput("GPU sampling interval (ms)"),
 	gpuProbeTimeoutMs: millisecondsInput("GPU query timeout (ms)"),
@@ -188,7 +187,7 @@ export function formatSpeculativeActionStatus(input: {
 		`Candidate requests per Actor decision: ${settings.candidateLimit}`,
 		`Model Drafter policy: ${settings.drafterMaxDepth} follow-up steps; ${settings.drafterMaxTokens} output tokens per request; ${settings.drafterTaskMaxRequests} requests / ${settings.drafterTaskMaxTokens} input+output tokens per task; ${settings.drafterDeterministicCandidates} temperature-0 candidates; sampling ${formatNumber(settings.drafterTemperatureMin)}-${formatNumber(settings.drafterTemperatureMax)}`,
 		`Speculative resource units per session: ${settings.maxConcurrentActions}`,
-		`Scheduler: Actor join ${formatDuration(settings.scheduling.candidateJoinTimeoutMs)}; sampling ${formatDuration(settings.scheduling.resourcePollIntervalMs)}; failure circuit ${settings.scheduling.failureThreshold} failures / ${settings.scheduling.failureRetryDecisions} eligible decisions`,
+		`Scheduler: sampling ${formatDuration(settings.scheduling.resourcePollIntervalMs)}; failure circuit ${settings.scheduling.failureThreshold} failures / ${settings.scheduling.failureRetryDecisions} eligible decisions`,
 		`Storage policy: ${settings.resourceCacheMaxEntries} live results/${formatBytes(settings.resourceCacheMaxBytes)}; ${settings.executionStoreMaxEntries} reusable commands/${formatBytes(settings.executionStoreMaxBytes)}`,
 		`Prediction wait limit: ${formatDuration(settings.predictionTimeoutMs)}`,
 		`Learned patterns: ${settings.patternAware.enabled ? "On" : "Off"}; follow-up steps: ${settings.patternAware.multiStepEnabled ? "On" : "Off"} (alternatives/tool ${settings.patternAware.beamWidth}, depth ${settings.patternAware.maxPredictionDepth}, learn after ${settings.patternAware.minOccurrences}, gap ${settings.patternAware.maxFutureGap}, coverage ${formatPercent(settings.patternAware.futureGapCoverage)}, half-life ${settings.patternAware.decayHalfLifeEvents})`,
@@ -361,8 +360,7 @@ async function installController(
 		autoResizeImages: piToolSettings.autoResizeImages,
 		settings,
 	}) ?? [];
-	const processBackend = new LinuxProcessReuseBackend({ storeRoot: path.join(getAgentDir(), "speculative-action", "process-reuse"),
-		candidateJoinTimeoutMs: () => currentSettings.scheduling.candidateJoinTimeoutMs });
+	const processBackend = new LinuxProcessReuseBackend({ storeRoot: path.join(getAgentDir(), "speculative-action", "process-reuse") });
 	const shell = getShellConfig(piToolSettings.shellPath);
 	const actorReplayEnabled = () => currentSettings.enabled;
 	const rawProcessExecutor = adaptProcessToolOperations(createLocalBashOperations({ shellPath: shell.shell }));
@@ -950,7 +948,7 @@ function openSchedulingAndCache(ctx: ExtensionContext, controller: SpeculativeAc
 		const { input } = settingActions(ctx, settings, ROOT_SETTING_INPUTS, controller.setSettings);
 		const actions = new Map<string, MenuAction>([
 			input("maxConcurrentActions"),
-			["Scheduler policy › waits, sampling, failure recovery", () => openSchedulingPolicy(ctx, controller)],
+			["Scheduler policy › sampling, failure recovery", () => openSchedulingPolicy(ctx, controller)],
 			["Resource estimates › process/tree and file snapshots", () => openSchedulingPolicy(ctx, controller, true)],
 			input("predictionTimeoutMs", "Prediction wait limit", formatDuration),
 			input("thinkThreadTimeoutMs", "ThinkThread execution timeout", formatDuration),
