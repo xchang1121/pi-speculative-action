@@ -59,7 +59,7 @@ int main(int argc, char **argv) {
 `);
 		await compileBenchmarkHelper(workspace, { source: "worker.c", output: "worker" });
 		await mkdir(path.join(workspace, "d", "e"), { recursive: true });
-		await Promise.all([writeFile(path.join(workspace, "data.txt"), "v1\n"), writeFile(path.join(workspace, "d", "data.txt"), "nested\n"),
+		await Promise.all([writeFile(path.join(workspace, "d", "e", ".keep"), ""), writeFile(path.join(workspace, "data.txt"), "v1\n"), writeFile(path.join(workspace, "d", "data.txt"), "nested\n"),
 			symlink("data.txt", path.join(workspace, "data.link")), symlink("d/e", path.join(workspace, "sub"))]);
 		await commitBenchmarkFixture(workspace, "Pi Held Exec Qualification");
 		const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
@@ -98,7 +98,7 @@ int main(int argc, char **argv) {
 					await expect.poll(publication!.reached, { timeout: 5000 }).toBe(true);
 				} else {
 					const branch = await pending;
-					expect(branch.output.isError, scenario.name).toBe(false);
+					expect(branch.output.isError, `${scenario.name}: ${textOutput(branch.output.result)}`).toBe(false);
 					const produced = metricDelta(before, backend.metrics());
 					if (["disposed", "completed", "security"].includes(scenario.name)) {
 						expect(produced.tainted).toBeGreaterThan(0);

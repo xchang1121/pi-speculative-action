@@ -27,6 +27,21 @@ async function observe(processes: Record<number, readonly string[]>, options?: S
 }
 
 describe("strace provenance decoder", () => {
+	test("retains ENOTDIR only when every lookup of that path failed that way", async () => {
+		const missing = 'newfstatat(AT_FDCWD, "/work/module.js/package.json", 0x0, 0) = -1 ENOTDIR (Not a directory)';
+		const target = { path: "/work/module.js/package.json", role: "input" };
+		expect((await observe({ 100: [EXEC, missing, missing] })).paths).toContainEqual({ ...target, lookupFailure: "ENOTDIR" });
+		expect((await observe({ 100: [EXEC, missing.replace("ENOTDIR", "ENOENT")] })).paths).toContainEqual({ ...target, lookupFailure: "ENOENT" });
+		for (const other of [missing.replace("ENOTDIR", "ENOENT"),
+			'openat(AT_FDCWD, "/work/module.js/package.json", O_RDONLY) = 3</work/module.js/package.json>',
+			`newfstatat(AT_FDCWD, "/work/module.js/package.json", ${STAT}, 0) = 0`]) {
+			for (const lines of [[missing, other], [other, missing]])
+				expect((await observe({ 100: [EXEC, ...lines] })).paths).toContainEqual(target);
+		}
+		const ambiguous = await observe({ 100: [EXEC, 'rename("/work/module.js/package.json", "/work/other") = -1 ENOTDIR (Not a directory)'] });
+		expect(ambiguous.paths.find(item => item.path === target.path)).not.toHaveProperty("lookupFailure");
+	});
+
 	test("reports blocking syscall names without retaining arguments or changing completeness", async () => {
 		const blocked = await observe({ 100: [EXEC, 'fcntl(4</private/name>, F_GETLEASE) = 2',
 			'ioctl(3</private/name>, FS_IOC_SETFLAGS, [FS_NODUMP_FL]) = 0', 'fcntl(5</private/other>, F_GETLEASE) = 2'] });
@@ -213,7 +228,7 @@ describe("strace provenance decoder", () => {
 			expect((await observe({ 100: [EXEC, `fstat(${memfd}, ${STAT}) = 0`] })).taints, memfd).toEqual(["clock", "descriptor_observation", "random"]);
 		const failed = await observe({ 100: [EXEC, 'newfstatat(AT_FDCWD, "/work/result=0", 0xabc, 0) = -1 ENOENT (No such file or directory)'] });
 		expect(failed).toMatchObject({ complete: true, taints: ["clock", "random"], incompleteReasons: [] });
-		expect(failed.paths).toContainEqual({ path: "/work/result=0", role: "input" });
+		expect(failed.paths).toContainEqual({ path: "/work/result=0", role: "input", lookupFailure: "ENOENT" });
 		await expect(observe({ 100: [EXEC, 'openat(AT_FDCWD, "/work/\\377", O_RDONLY) = 3'] })).rejects.toThrow();
 		// A failed lookup from no known directory read nothing; a successful one leaves the transcript incomplete.
 		expect(await observe({ 100: [EXEC, 'openat(8, "unresolved", O_RDONLY) = -1 EBADF (Bad file descriptor)', "statx(0<pipe:[8]>, NULL, 0, STATX_ALL, NULL) = -1 EFAULT (Bad address)"] }))
@@ -233,7 +248,7 @@ describe("strace provenance decoder", () => {
 			'readlinkat(4</work/alias>, "", "target", 4096) = 6', 'linkat(5</work/anonymous>, "", AT_FDCWD</work>, "named", AT_EMPTY_PATH) = 0'] });
 		expect(observation).toMatchObject({ complete: true, taints: ["clock", "descriptor_observation", "random"], incompleteReasons: [] });
 		expect(observation.paths).toEqual([{ path: "/usr/bin/example", role: "executable" },
-			...["/work/alias", "/work/anonymous", "/work/missing.txt", "/work/named"].map(path => ({ path, role: "input" })),
+			...["/work/alias", "/work/anonymous", "/work/missing.txt", "/work/named"].map(path => ({ path, role: "input", ...(path === "/work/missing.txt" ? { lookupFailure: "ENOENT" } : {}) })),
 			{ path: "/work/link", role: "metadata", followSymlinks: false, digest: STAT_DIGEST }, { path: "/work/file.txt", role: "metadata", followSymlinks: true, digest: STAT_DIGEST }]);
 		// ls asks only for the type: its observation covers the fields the mask reports, beside a full stat of the same path.
 		const partial = (mask: string) => `statx(AT_FDCWD</work>, "file.txt", AT_STATX_SYNC_AS_STAT, STATX_MODE, ${STATX.replace("STATX_BASIC_STATS|STATX_MNT_ID", mask).replace(/, stx_[mc]time=\{[^}]+\}/g, "")}) = 0`;
