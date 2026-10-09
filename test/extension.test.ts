@@ -36,6 +36,15 @@ afterEach(async () => {
 });
 
 describe("zero-modification Pi extension", () => {
+	it("normalizes invalid saved bounds without zero counts or overflowing timers", () => {
+		const defaults = normalizeSpeculativeActionSettings(undefined);
+		for (const value of [-1, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+			const normalized = normalizeSpeculativeActionSettings({ candidateLimit: value, maxConcurrentActions: value, predictionTimeoutMs: value,
+				scheduling: { candidateJoinTimeoutMs: value, resourcePollIntervalMs: value, heavyCpu: value }, selfSpeculation: { timeoutMs: value, forkMaxAttempts: value } });
+			expect(normalized).toEqual(defaults);
+		}
+		expect(normalizeSpeculativeActionSettings({ scheduling: { candidateJoinTimeoutMs: 0 }, thinkThreadTimeoutMs: 2 ** 31 })).toEqual({ ...defaults, scheduling: { ...defaults.scheduling, candidateJoinTimeoutMs: 0 } });
+	});
 	it("registers stock overrides, previews the stream without claiming it, then adopts once", async () => {
 		const fixture = await createFixture({ reuse: { result: textResult("cached"), isError: false } });
 		await fixture.emit("session_start");
@@ -374,7 +383,7 @@ describe("zero-modification Pi extension", () => {
 			expect.stringMatching(/find · Predict On · Replay Unavailable · Observe Unavailable · Fork Unavailable/u),
 		]));
 		expect(menus.get("Actor probe")).toEqual(expect.arrayContaining(["Actor probe prediction: Off"]));
-		expect(menus.get("Actor probe")?.some((label) => /^(Use forked calls|Minimum tool-name confidence)/u.test(label))).toBe(false);
+		expect(menus.get("Actor probe")?.filter(label => /^(Use forked calls|Minimum tool-name confidence)/u.test(label))).toEqual(["Minimum tool-name confidence: 90%"]);
 		expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Replay, Observe, and Fork are independent"), "info");
 		expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Tool   Predict  Replay"), "info");
 		expect(fixture.ui.notify).toHaveBeenCalledWith(expect.stringMatching(/bash\s+Off\s+(Ready|Unavailable)/u), "info");
@@ -534,12 +543,14 @@ describe("zero-modification Pi extension", () => {
 		const menus = driveSettingsMenus(fixture, {
 			"Speculative action": ["Advanced settings", "Prediction sources", "Apply changes", "Close"],
 			"Advanced settings": ["Scheduling and storage", "Actor probe and target verification", "Learned-pattern tuning", "Back"],
-			"Scheduling and storage": ["Prediction wait limit", "Live result memory", "Reusable command history entries", "Reusable command history memory", "Reclaim", "Clear", "Clear", "Back"],
-			"Actor probe advanced": ["Integration and authentication", "Fork decoding", "Target verification", "Benefit control", "Back"],
-			"Integration and authentication": ["Integration", "Control service URL", "Back"],
-			"Fork decoding": ["Back"],
+			"Scheduling and storage": ["Scheduler policy", "Resource estimates", "Prediction wait limit", "ThinkThread execution timeout", "Live result memory", "Reusable command history entries", "Reusable command history memory", "Reclaim", "Clear", "Clear", "Back"],
+			"Scheduler policy": ["Actor join wait", "Resource sampling interval", "GPU sampling interval", "GPU query timeout", "Failures before circuit", "Retry every", "Back"],
+			"Resource estimates": ["Process/tree CPU", "File snapshot CPU", "Process/tree memory", "File snapshot memory", "Process/tree I/O", "File snapshot I/O", "Back"],
+			"Actor probe advanced": ["Integration and authentication", "Fork decoding", "Target verification", "Back"],
+			"Integration and authentication": ["Integration", "Control service URL", "Service protocol", "Back"],
+			"Service protocol": ["Provider request ID", "Candidate registration", "Actor probe path", "Clear request", "Capabilities", "Require token probabilities", "Back"],
+			"Fork decoding": ["Maximum probes", "Stream updates between retries", "Stream updates before sentence", "Back"],
 			"Target verification": ["Back"],
-			"Benefit control": ["Back"],
 			"Learned-pattern advanced": ["Learning history", "Multi-step search", "Back", "Back"],
 			"Learning history": ["Early-prediction coverage", "Back"],
 			"Multi-step search": ["Back"],
@@ -553,6 +564,16 @@ describe("zero-modification Pi extension", () => {
 		fixture.ui.input = async (title) =>
 			({
 				"Prediction wait limit (ms)": "1",
+				"ThinkThread execution timeout (ms)": "6543",
+				"Actor join wait (ms, 0 for immediate fallback)": "0", "Resource sampling interval (ms)": "73",
+				"GPU sampling interval (ms)": "701", "GPU query timeout (ms)": "702",
+				"Failures before circuit opens": "3", "Retry every N eligible Actor decisions": "2",
+				"Process/tree CPU units": "3", "File snapshot CPU units": "2",
+				"Process/tree memory (MiB)": "80", "File snapshot memory (MiB)": "9",
+				"Process/tree I/O fraction": "0.4", "File snapshot I/O fraction": "0.1",
+				"Maximum probes per Actor decision": "3", "Stream updates between retries": "7", "Stream updates before sentence-boundary retry": "2",
+				"Provider request ID field": "trace_id", "Actor probe path": "/v2/fork", "Candidate registration path": "/v2/candidates",
+				"Clear request path": "/v2/clear", "Capabilities path": "/v2/capabilities",
 				"Maximum Drafter output tokens": "512",
 				"Live result memory (MiB)": "96",
 				"Reusable command history entries": "2048",
@@ -568,14 +589,20 @@ describe("zero-modification Pi extension", () => {
 		await fixture.commands.get("speculative-action")?.handler("", fixture.context as ExtensionCommandContext);
 
 		expect(fixture.store.effective()).toMatchObject({
-			predictionTimeoutMs: 1, drafterMaxDepth: 3, drafterMaxTokens: 512,
+			predictionTimeoutMs: 1, thinkThreadTimeoutMs: 6543, drafterMaxDepth: 3, drafterMaxTokens: 512,
 			resourceCacheMaxBytes: 96 * 1024 * 1024,
 			executionStoreMaxEntries: 2048,
 			executionStoreMaxBytes: 768 * 1024 * 1024,
-			selfSpeculation: { endpoint: "http://127.0.0.1:8000", forkTransport: "sidecar", forkActionMinConfidence: 0.75 },
+			selfSpeculation: { endpoint: "http://127.0.0.1:8000", forkTransport: "sidecar", forkActionMinConfidence: 0.75, requireLogprobs: true,
+				forkMaxAttempts: 3, forkRetryStreamUpdates: 7, forkBoundaryStreamUpdates: 2, requestIDField: "trace_id",
+				forkPath: "/v2/fork", candidatePath: "/v2/candidates", clearPath: "/v2/clear", capabilitiesPath: "/v2/capabilities" },
+			scheduling: { candidateJoinTimeoutMs: 0, resourcePollIntervalMs: 73, gpuPollIntervalMs: 701, gpuProbeTimeoutMs: 702,
+				failureThreshold: 3, failureRetryDecisions: 2, heavyCpu: 3, lightCpu: 2, heavyMemoryBytes: 80 * 1024 * 1024, lightMemoryBytes: 9 * 1024 * 1024, heavyIo: 0.4, lightIo: 0.1 },
 			patternAware: { futureGapCoverage: 0.8, enabled: false, multiStepEnabled: false },
 		});
 		expect(clearConfirmations).toBe(2);
+		expect(menus.get("Resource estimates")).toContain("Process/tree memory (MiB): 80");
+		expect(await fixture.hostSettings()).toMatchObject({ scheduling: fixture.store.effective()?.scheduling });
 		expect(menus.get("Learned-pattern advanced")?.some((label) => label.startsWith("Multi-step search"))).toBe(false);
 		expect(menus.get("Model Drafter")).toEqual(expect.arrayContaining([
 			"Enabled: On", expect.stringMatching(/^Model ›/), "Candidate requests per decision: 2",
@@ -723,7 +750,9 @@ function driveSettingsMenus(
 	fixture.ui.select = async (title, options) => {
 		menus.set(title, [...options]);
 		const prefix = pending.get(title)?.shift();
-		return prefix ? options.find((option) => option === prefix || option.startsWith(prefix)) : undefined;
+		const selected = prefix ? options.find((option) => option === prefix || option.startsWith(prefix)) : undefined;
+		if (prefix && !selected) throw new Error(`Missing menu entry ${title} > ${prefix}`);
+		return selected;
 	};
 	return menus;
 }

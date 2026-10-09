@@ -12,6 +12,7 @@ export interface SpeculativeActionPackageSettings extends SpeculativeAgentSettin
 	readonly draftModel?: string;
 	readonly executionStoreMaxEntries?: number;
 	readonly executionStoreMaxBytes?: number;
+	readonly thinkThreadTimeoutMs?: number;
 	readonly executionRouting?: ExecutionRoutingSettings;
 	/** Explicit Actor and speculative search semantics; native Pi remains the default. */
 	readonly searchExecution?: "native" | "captured";

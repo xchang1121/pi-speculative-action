@@ -23,6 +23,7 @@ export {
 	type ResourceDependencyScope,
 } from "./action-semantics.ts";
 export type { DrafterToolDefinition } from "./common.ts";
+export { SCHEDULING_DEFAULTS, normalizeSchedulingSettings, type SchedulingSettings } from "./scheduling-settings.ts";
 export type * from "./events.ts";
 export * from "./effect-model.ts";
 export * from "./effect-transaction.ts";

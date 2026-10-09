@@ -65,6 +65,7 @@ export interface LinuxProcessBackendOptions {
 	readonly sandlockBinary?: string;
 	readonly straceBinary?: string;
 	readonly heldExecBinary?: string;
+	readonly candidateJoinTimeoutMs?: () => number;
 	/** Additional host paths that speculative processes must never read. */
 	readonly deniedPaths?: readonly string[];
 }
@@ -968,7 +969,7 @@ export class LinuxProcessReuseBackend {
 					const waitStarted = performance.now();
 					const waiting = new AbortController(), stop = signal ? AbortSignal.any([signal, waiting.signal]) : waiting.signal;
 					const completion = running.suspend ? running.suspend(stop).then(() => running.completion) : running.completion;
-					const finished = await waitForCandidate(completion, signal, candidateJoinBudget("running")).finally(() => waiting.abort());
+					const finished = await waitForCandidate(completion, signal, candidateJoinBudget("running", this.options.candidateJoinTimeoutMs?.())).finally(() => waiting.abort());
 					const interval = new TimelineInterval(waitStarted, performance.now());
 					waits.push({ handoff: running, interval });
 					if (finished.status === "completed") return "completed";

@@ -69,9 +69,11 @@ describe("actor fork plan source", () => {
 	});
 
 	it("bounds retries and only probes a newer Actor snapshot", () => {
-		const source = createActorForkPlanSource({ maxAttempts: 2, retryStreamUpdates: 2 });
+		let configuration = { maxAttempts: 2, retryStreamUpdates: 2 };
+		const source = createActorForkPlanSource(() => configuration);
 		const delta = { type: "text_delta" as const, contentIndex: 0, delta: "x", partial: undefined as never };
 		source.startTurn("turn-d2");
+		configuration = { maxAttempts: 1, retryStreamUpdates: 10 };
 		source.bindActorRequest("turn-d2");
 		expect(source.observeActorDelta("turn-d2", delta)?.attempt).toBe(1);
 		expect(source.finishProbe("turn-d2")).toBe(false);
@@ -79,6 +81,8 @@ describe("actor fork plan source", () => {
 		expect(source.observeActorDelta("turn-d2", delta)).toBeUndefined();
 		expect(source.observeActorDelta("turn-d2", delta)?.attempt).toBe(2);
 		expect(source.finishProbe("turn-d2")).toBe(true);
+		source.startTurn("next"); source.bindActorRequest("next");
+		expect(source.observeActorDelta("next", delta)?.attempt).toBe(1); expect(source.finishProbe("next")).toBe(true);
 		expect(source.observeActorDelta("turn-d2", delta)).toBeUndefined();
 	});
 

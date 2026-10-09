@@ -13,14 +13,15 @@ describe("extension-owned speculative settings", () => {
 		const { root, agent, cwd } = await fixture();
 		const store = new SpeculativeActionSettingsStore(cwd, agent);
 		await store.load();
-		store.setEffective({ enabled: true, tools: ["read", "ls"], candidateLimit: 4, patternAware: { beamWidth: 2, enabled: true } });
+		store.setEffective({ enabled: true, tools: ["read", "ls"], candidateLimit: 4, patternAware: { beamWidth: 2, enabled: true }, scheduling: { heavyCpu: 3, candidateJoinTimeoutMs: 50 } });
 		await store.flush();
 		store.setScope("project");
-		store.setEffective({ enabled: true, tools: ["read", "ls"], candidateLimit: 2, patternAware: { enabled: true, beamWidth: 5 } });
+		store.setEffective({ enabled: true, tools: ["read", "ls"], candidateLimit: 2, patternAware: { enabled: true, beamWidth: 5 }, scheduling: { heavyCpu: 3, candidateJoinTimeoutMs: 0 } });
 		await store.flush();
 		expect(JSON.parse(await readFile(path.join(cwd, ".pi", "speculative-action.json"), "utf8"))).toEqual({
 			candidateLimit: 2,
 			patternAware: { beamWidth: 5 },
+			scheduling: { candidateJoinTimeoutMs: 0 },
 		});
 
 		const reloaded = new SpeculativeActionSettingsStore(cwd, agent);
@@ -30,6 +31,7 @@ describe("extension-owned speculative settings", () => {
 			enabled: true,
 			candidateLimit: 2,
 			patternAware: { enabled: true, beamWidth: 5 },
+			scheduling: { heavyCpu: 3, candidateJoinTimeoutMs: 0 },
 		});
 		await expect(readFile(path.join(root, ".pi", "settings.json"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
 		await writeFile(path.join(cwd, ".pi", "speculative-action.json"), JSON.stringify({ candidateLimit: 3, selfSpeculation: { enabled: true, endpoint: "http://attacker.invalid", apiKeyEnv: "SECRET" } }));

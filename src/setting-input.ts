@@ -1,11 +1,17 @@
 /** Stored values never coerce text; interactive parsers below separately enforce strict input. */
 export function positiveInteger<F extends number | undefined>(value: unknown, fallback: F): number | F {
-	return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+	return typeof value === "number" && Number.isSafeInteger(Math.floor(value)) && value >= 1 ? Math.floor(value) : fallback;
 }
 
 export function nonNegativeInteger(value: unknown, fallback: number): number {
-	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.floor(value) : fallback;
+	return typeof value === "number" && Number.isSafeInteger(Math.floor(value)) && value >= 0 ? Math.floor(value) : fallback;
 }
+
+/** Node timers otherwise turn an overflowing delay into a 1 ms timeout. */
+export function milliseconds(value: unknown, fallback: number): number {
+	return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 2_147_483_647 ? value : fallback;
+}
+export const positiveMilliseconds = (value: unknown, fallback: number): number => milliseconds(value, fallback) || fallback;
 
 export function nonNegativeNumber<F extends number | undefined>(value: unknown, fallback: F): number | F {
 	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : fallback;
@@ -60,16 +66,22 @@ export function settingInput<T>(
 function numericInput(title: string, valid: (value: number) => boolean, error: string, options: NumericInputOptions = {}): SettingInputDescriptor<number> {
 	return settingInput(title, options.format ?? String, (input) => {
 		const value = Number(input.trim());
-		return Number.isFinite(value) && valid(value) ? { ok: true, value: options.transform?.(value) ?? value } : { ok: false, error: options.error ?? error };
+		const result = options.transform?.(value) ?? value;
+		return input.trim() && Number.isFinite(value) && valid(value) && Number.isFinite(result) && valid(result)
+			? { ok: true, value: result } : { ok: false, error: options.error ?? error };
 	});
 }
 
 export function positiveIntegerInput(title: string, options: NumericInputOptions = {}): SettingInputDescriptor<number> {
-	return numericInput(title, (value) => Number.isInteger(value) && value > 0, `${title} must be a positive integer.`, options);
+	return numericInput(title, (value) => Number.isSafeInteger(value) && value > 0, `${title} must be a positive integer.`, options);
 }
 
 export function nonNegativeIntegerInput(title: string): SettingInputDescriptor<number> {
-	return numericInput(title, (value) => Number.isInteger(value) && value >= 0, `${title} must be a non-negative integer.`);
+	return numericInput(title, (value) => Number.isSafeInteger(value) && value >= 0, `${title} must be a non-negative integer.`);
+}
+
+export function millisecondsInput(title: string, allowZero = false): SettingInputDescriptor<number> {
+	return numericInput(title, value => milliseconds(value, -1) >= (allowZero ? 0 : 1), `${title} must be an integer from ${allowZero ? 0 : 1} to 2147483647.`);
 }
 
 export function nonNegativeNumberInput(title: string): SettingInputDescriptor<number> {
@@ -88,9 +100,5 @@ export function nonEmptyTextInput(title: string): SettingInputDescriptor<string>
 }
 
 export function optionalTextInput(title: string): SettingInputDescriptor<string | undefined> {
-	return settingInput(
-		title,
-		(value) => value ?? "",
-		(input) => ({ ok: true, value: input.trim() || undefined }),
-	);
+	return settingInput(title, value => value ?? "", input => ({ ok: true, value: input.trim() || undefined }));
 }

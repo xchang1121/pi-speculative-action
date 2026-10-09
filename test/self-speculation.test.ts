@@ -13,25 +13,11 @@ import { normalizeSelfSpeculationSettings, SELF_SPECULATION_DEFAULTS, SelfSpecul
 describe("self-speculation control plane", () => {
 	it("normalizes opt-in settings without weakening bounded defaults", () => {
 		expect(normalizeSelfSpeculationSettings(undefined)).toEqual(SELF_SPECULATION_DEFAULTS);
-		expect(
-			normalizeSelfSpeculationSettings({
-				enabled: true,
-				endpoint: "http://localhost:9000///",
-				candidatePath: "not-a-path",
-				maxCandidates: 0,
-				forkTransport: "sidecar",
-				forkTemperature: -1,
-				forkActionMinConfidence: 2,
-				forkForcedPrefix: "",
-				apiKeyEnv: " TOKEN_ENV ",
-			}),
-		).toEqual({
-			...SELF_SPECULATION_DEFAULTS,
-			enabled: true,
-			endpoint: "http://localhost:9000",
-			forkTransport: "sidecar",
-			apiKeyEnv: "TOKEN_ENV",
-		});
+		for (const endpoint of ["file:///tmp", "http:host", "http://host/?route=x", "http://host/#fragment", "http://user:secret@host", "http://host\\other"])
+			expect(normalizeSelfSpeculationSettings({ endpoint, forkPath: "//other", timeoutMs: 2 ** 31 })).toEqual(SELF_SPECULATION_DEFAULTS);
+		expect(normalizeSelfSpeculationSettings({ enabled: true, endpoint: "http://localhost:9000///", candidatePath: "not-a-path", maxCandidates: 0,
+			forkTransport: "sidecar", forkTemperature: -1, forkActionMinConfidence: 2, forkForcedPrefix: "", apiKeyEnv: " TOKEN_ENV " }))
+			.toEqual({ ...SELF_SPECULATION_DEFAULTS, enabled: true, endpoint: "http://localhost:9000", forkTransport: "sidecar", apiKeyEnv: "TOKEN_ENV" });
 		expect(normalizeSelfSpeculationSettings({ forkActionMinConfidence: 0 }).forkActionMinConfidence).toBe(0);
 		expect(
 			normalizeSelfSpeculationSettings({ draftBoundary: "[TOOLS]", forkForcedPrefix: "[TOOLS] name=" }),
@@ -41,6 +27,22 @@ describe("self-speculation control plane", () => {
 			draftFormat: "auto",
 		});
 		expect(normalizeSelfSpeculationSettings({})).toMatchObject({ actorProfile: "tagged_json", draftFormat: "auto" });
+	});
+
+	it("renegotiates a changed capability path with the configured authentication", async () => {
+		vi.stubEnv("SPEC_TEST_TOKEN", "fixture-token");
+		let settings = enabledSettings({ apiKeyEnv: "SPEC_TEST_TOKEN" });
+		const requests: string[] = [], coordinator = new SelfSpeculationCoordinator({ settings: () => settings, fetch: async (input, init) => {
+			expect(new Headers(init?.headers).get("authorization")).toBe("Bearer fixture-token");
+			requests.push(String(input)); return Response.json({ capabilities: { provider: true } });
+		} });
+		try {
+			for (const turn of [1, 2]) {
+				settings = { ...settings, capabilitiesPath: `/v${turn}/capabilities` };
+				coordinator.startTurn(`turn-${turn}`, model(), context(), turn);
+				await vi.waitFor(() => expect(requests).toContain(`${settings.endpoint}${settings.capabilitiesPath}`));
+			}
+		} finally { await coordinator.dispose(); vi.unstubAllEnvs(); }
 	});
 
 	it.each([false, true])("buffers an ordered Actor bundle while preserving predicted identity (covering=%s)", async (covering) => {
@@ -101,7 +103,7 @@ describe("self-speculation control plane", () => {
 
 	it("binds the provider self-fork contract once to the stable Actor request", async () => {
 		const requests: CapturedRequest[] = [];
-		const coordinator = coordinatorFixture(requests, {}, ["actor-request"]);
+		const coordinator = coordinatorFixture(requests, { forkMaxAttempts: 3, forkRetryStreamUpdates: 7 }, ["actor-request"]);
 		coordinator.startTurn("turn-1", model(), context(), 1);
 
 		const actor = coordinator.decorateActorPayload({ model: "actor" }) as Record<string, unknown>;
@@ -116,8 +118,8 @@ describe("self-speculation control plane", () => {
 				d2: {
 					confidence_metric: "minimum_tool_name_probability",
 					confidence_threshold: 0.9,
-					max_attempts: 5,
-					retry_token_step: 50,
+					max_attempts: 3,
+					retry_token_step: 7,
 				},
 			}),
 		);
@@ -169,50 +171,16 @@ describe("self-speculation control plane", () => {
 
 	it("records clear-time target verification without confusing registration receipts", async () => {
 		const requests: CapturedRequest[] = [];
-		const coordinator = coordinatorFixture(
-			requests,
-			{ forkEnabled: false },
-			["actor-request"],
-			(request) =>
-				request.path === SELF_SPECULATION_DEFAULTS.clearPath
-					? {
-							status: "cleared",
-							verification: {
-								num_spec_steps: 1,
-								num_draft_tokens: 3,
-								num_accepted_draft_tokens: 2,
-								num_rejected_draft_tokens: 1,
-								draft_acceptance_rate: 2 / 3,
-								mean_acceptance_length: 3,
-								steps: [
-									{
-										candidate_index: 0,
-										candidate_id: actionIdentity("key-a"),
-										drafted_tokens: 3,
-										accepted_tokens: 2,
-										rejected_tokens: 1,
-									},
-								],
-								unresolved_proposals: 0,
-								unresolved_draft_tokens: 0,
-							},
-						}
-					: {
-							registered: true,
-							draft_token_count: 3,
-							accepted_token_count: 3,
-							details: {
-								bundle: {
-									candidates: [
-										{
-											candidate_ids: [actionIdentity("key-a")],
-											sources: ["drafter", "pattern-aware"],
-										},
-									],
-								},
-							},
-						},
-		);
+		const candidateID = actionIdentity("key-a"), sources = ["drafter", "pattern-aware"];
+		const registered = { registered: true, draft_token_count: 3, accepted_token_count: 3,
+			details: { bundle: { candidates: [{ candidate_ids: [candidateID], sources }] } } };
+		const cleared = { status: "cleared", verification: {
+			num_spec_steps: 1, num_draft_tokens: 3, num_accepted_draft_tokens: 2, num_rejected_draft_tokens: 1,
+			draft_acceptance_rate: 2 / 3, mean_acceptance_length: 3, unresolved_proposals: 0, unresolved_draft_tokens: 0,
+			steps: [{ candidate_index: 0, candidate_id: candidateID, drafted_tokens: 3, accepted_tokens: 2, rejected_tokens: 1 }],
+		} };
+		const coordinator = coordinatorFixture(requests, { forkEnabled: false }, ["actor-request"],
+			request => request.path === SELF_SPECULATION_DEFAULTS.clearPath ? cleared : registered);
 		coordinator.startTurn("turn-1", model(), context(), 1);
 		coordinator.addCandidate(candidate("drafter", "key-a", "hash-a", "read", { path: "a.txt" }, 0.8));
 		coordinator.addCandidate(
@@ -233,62 +201,21 @@ describe("self-speculation control plane", () => {
 			verifiedDraftAcceptanceRate: 2 / 3,
 			unresolvedDraftProposals: 0,
 			unresolvedDraftTokens: 0,
-			lastVerification: {
-				requestID: "actor-request",
-				speculativeSteps: 1,
-				draftedTokens: 3,
-				acceptedTokens: 2,
-				rejectedTokens: 1,
-				steps: [
-					expect.objectContaining({
-						candidateIndex: 0,
-						candidateID: actionIdentity("key-a"),
-						sources: ["drafter", "pattern-aware"],
-					}),
-				],
-			},
+			lastVerification: { requestID: "actor-request", speculativeSteps: 1, draftedTokens: 3, acceptedTokens: 2, rejectedTokens: 1,
+				steps: [expect.objectContaining({ candidateIndex: 0, candidateID, sources })] },
 		});
 	});
 
 	it.each(["decoder", "Actor adoption"])("orders next-decision candidates using %s evidence", async (evidence) => {
 		const verified = evidence === "decoder";
 		const requests: CapturedRequest[] = [];
-		const coordinator = coordinatorFixture(
-			requests,
-			{ forkEnabled: false },
-			verified ? ["actor-1", "actor-2"] : ["actor-2"],
-			(request) =>
-				verified && request.path === SELF_SPECULATION_DEFAULTS.clearPath && request.body.request_id === "actor-1"
-					? {
-							verification: {
-								num_spec_steps: 2,
-								num_draft_tokens: 20,
-								num_accepted_draft_tokens: 10,
-								num_rejected_draft_tokens: 10,
-								steps: [
-									{
-										candidate_index: 0,
-										candidate_id: actionIdentity("drafter-1"),
-										candidate_ids: [actionIdentity("drafter-1")],
-										sources: ["drafter"],
-										drafted_tokens: 10,
-										accepted_tokens: 0,
-										rejected_tokens: 10,
-									},
-									{
-										candidate_index: 1,
-										candidate_id: actionIdentity("pattern-1"),
-										candidate_ids: [actionIdentity("pattern-1")],
-										sources: ["pattern-aware"],
-										drafted_tokens: 10,
-										accepted_tokens: 10,
-										rejected_tokens: 0,
-									},
-								],
-							},
-						}
-					: { ok: true },
-		);
+		const verification = { num_spec_steps: 2, num_draft_tokens: 20, num_accepted_draft_tokens: 10, num_rejected_draft_tokens: 10,
+			steps: [["drafter", "drafter-1", 0], ["pattern-aware", "pattern-1", 10]].map(([source, key, accepted], candidate_index) => ({
+				candidate_index, candidate_id: actionIdentity(String(key)), candidate_ids: [actionIdentity(String(key))], sources: [source],
+				drafted_tokens: 10, accepted_tokens: accepted, rejected_tokens: 10 - Number(accepted),
+			})) };
+		const coordinator = coordinatorFixture(requests, { forkEnabled: false }, verified ? ["actor-1", "actor-2"] : ["actor-2"], request =>
+			verified && request.path === SELF_SPECULATION_DEFAULTS.clearPath && request.body.request_id === "actor-1" ? { verification } : { ok: true });
 
 		coordinator.startTurn("turn-1", model(), context(), 1);
 		if (verified) {
@@ -417,10 +344,10 @@ describe("self-speculation control plane", () => {
 
 	it("forks through the Drafter from the Actor's reasoning when no control plane exists", async () => {
 		const actorForkPlans = createActorForkPlanSource({ maxAttempts: 1 }), requests: CapturedRequest[] = [], drafted: unknown[] = [];
-		const settings = enabledSettings({ forkTransport: "drafter" });
+		const settings = enabledSettings({ forkTransport: "drafter", forkMaxTokens: 73, forkTemperature: 0.2 });
 		const coordinator = new SelfSpeculationCoordinator({ settings: () => settings, actorForkPlanSource: actorForkPlans,
 			fetch: async (input) => { requests.push({ path: String(input), body: {} }); return Response.json({}); },
-			draftFork: async (input) => { drafted.push({ reasoning: input.reasoning, content: input.content }); return [{ tool: "read", input: { path: "a.ts" } }]; } });
+			draftFork: async ({ reasoning, content, maxTokens, temperature }) => { drafted.push({ reasoning, content, maxTokens, temperature }); return [{ tool: "read", input: { path: "a.ts" } }]; } });
 		coordinator.startTurn("turn-1", model("http://127.0.0.1:8000/v1"), context(), 1);
 		const pending = actorForkPlans.waitForBatches("turn-1", new AbortController().signal);
 		// Even at the control plane's own origin, a Drafter fork leaves the Actor's request as it is.
@@ -430,7 +357,7 @@ describe("self-speculation control plane", () => {
 		// No control-plane request, candidate registration or payload decoration reaches a hosted API.
 		coordinator.addCandidate(candidate("drafter", "k", "h", "read", { path: "a.ts" }, 0.9));
 		await coordinator.dispose();
-		expect({ drafted, requests, completions: coordinator.snapshot().forkCompletions }).toEqual({ drafted: [{ reasoning: "I should read a.ts", content: "" }], requests: [], completions: 1 });
+		expect({ drafted, requests, completions: coordinator.snapshot().forkCompletions }).toEqual({ drafted: [{ reasoning: "I should read a.ts", content: "", maxTokens: 73, temperature: 0.2 }], requests: [], completions: 1 });
 	});
 
 	it("deduplicates valid sidecar calls after confidence checks and counts every receipt", async () => {

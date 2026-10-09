@@ -31,6 +31,7 @@ export interface ActorProbeSchedule {
 export const ACTOR_PROBE_SCHEDULE: ActorProbeSchedule = Object.freeze({ maxAttempts: 5, retryStreamUpdates: 50, boundaryStreamUpdates: 10 });
 
 interface PendingFork {
+	readonly schedule: ActorProbeSchedule;
 	readonly reuseFeedback?: unknown;
 	readonly promise: Promise<readonly ActorForkActionBatch[]>;
 	readonly resolve: (batches: readonly ActorForkActionBatch[]) => void;
@@ -52,13 +53,14 @@ interface PendingFork {
 /** One turn-scoped Actor probe source, including result delivery and cancellation. */
 export class ActorForkPlanSource {
 	private readonly pending = new Map<string, PendingFork>();
-	readonly schedule: ActorProbeSchedule;
-	constructor(schedule: Partial<ActorProbeSchedule> = {}) {
-		const normalized = { ...ACTOR_PROBE_SCHEDULE, ...schedule };
+	private readonly configuration: Partial<ActorProbeSchedule> | (() => Partial<ActorProbeSchedule>);
+	constructor(configuration: Partial<ActorProbeSchedule> | (() => Partial<ActorProbeSchedule>) = {}) { this.configuration = configuration; void this.schedule; }
+	get schedule(): ActorProbeSchedule {
+		const normalized = { ...ACTOR_PROBE_SCHEDULE, ...(typeof this.configuration === "function" ? this.configuration() : this.configuration) };
 		for (const [field, value] of Object.entries(normalized)) {
 			if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${field} must be a positive integer`);
 		}
-		this.schedule = Object.freeze(normalized);
+		return Object.freeze(normalized);
 	}
 	readonly source: AgentPlanSource = {
 		id: "self-speculation",
@@ -94,6 +96,7 @@ export class ActorForkPlanSource {
 		let resolve!: (batches: readonly ActorForkActionBatch[]) => void;
 		const promise = new Promise<readonly ActorForkActionBatch[]>((settle) => { resolve = settle; });
 		this.pending.set(turnID, {
+			schedule: this.schedule,
 			reuseFeedback,
 			promise,
 			resolve,
@@ -128,7 +131,7 @@ export class ActorForkPlanSource {
 			else pending.reasoning += event.delta;
 			pending.generatedText += event.delta;
 			pending.outputChunks++;
-			if (/[.!?\n\u3002\uff01\uff1f]\s*$/u.test(event.delta)) retrySooner(this.schedule.boundaryStreamUpdates);
+			if (/[.!?\n\u3002\uff01\uff1f]\s*$/u.test(event.delta)) retrySooner(pending.schedule.boundaryStreamUpdates);
 		}
 		return this.claimProbe(pending);
 	}
@@ -137,7 +140,7 @@ export class ActorForkPlanSource {
 		const pending = this.pending.get(turnID);
 		if (!pending || pending.settled) return true;
 		pending.probeInFlight = false;
-		return pending.attempts >= this.schedule.maxAttempts;
+		return pending.attempts >= pending.schedule.maxAttempts;
 	}
 
 	claimPendingProbe(turnID: string): ActorProbeSnapshot | undefined {
@@ -150,13 +153,13 @@ export class ActorForkPlanSource {
 			pending.settled ||
 			pending.probeInFlight ||
 			!pending.requestBound ||
-			pending.attempts >= this.schedule.maxAttempts ||
+			pending.attempts >= pending.schedule.maxAttempts ||
 			pending.outputChunks < pending.retryAt
 		)
 			return undefined;
 		pending.probeInFlight = true;
 		pending.lastProbeOutputChunks = pending.outputChunks;
-		pending.retryAt = pending.outputChunks + this.schedule.retryStreamUpdates;
+		pending.retryAt = pending.outputChunks + pending.schedule.retryStreamUpdates;
 		pending.attempts++;
 		return {
 			attempt: pending.attempts,
@@ -218,6 +221,6 @@ export class ActorForkPlanSource {
 	}
 }
 
-export function createActorForkPlanSource(schedule: Partial<ActorProbeSchedule> = {}): ActorForkPlanSource {
+export function createActorForkPlanSource(schedule: Partial<ActorProbeSchedule> | (() => Partial<ActorProbeSchedule>) = {}): ActorForkPlanSource {
 	return new ActorForkPlanSource(schedule);
 }

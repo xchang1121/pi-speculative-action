@@ -112,11 +112,12 @@ describe("unified speculation scheduling", () => {
 	});
 
 	it("keeps failure recovery independent of elapsed time and repeated dispatch", () => {
-		const scheduler = new SpeculationScheduler<object>(), owner = scope(), job = {}, identity = { tool: "read", actionKeyHash: "a" };
-		scheduler.observe(identity, true); scheduler.observe(identity, true);
-		for (let decision = 0; decision < 3; decision++) {
-			for (let dispatch = 0; dispatch < 5; dispatch++)
-				expect(scheduler.admit(job, [forecast()], owner, "execution", undefined, identity)).toMatchObject({ admitted: false, reason: "failure_circuit" });
+		const scheduler = new SpeculationScheduler<object>(), owner = { ...scope(), scheduling: { failureThreshold: 3, failureRetryDecisions: 2 } }, job = {}, identity = { tool: "read", actionKeyHash: "a" };
+		for (let count = 0; count < 2; count++) { scheduler.observe(identity, true); expect(scheduler.admit(job, [forecast()], owner, "execution", undefined, identity).admitted).toBe(true); scheduler.complete(job); }
+		scheduler.observe(identity, true);
+		for (let decision = 0; decision < 1; decision++) {
+			for (let dispatch = 0; dispatch < 5; dispatch++) for (const attempt of [job, {}])
+				expect(scheduler.admit(attempt, [forecast()], owner, "execution", undefined, identity)).toMatchObject({ admitted: false, reason: "failure_circuit" });
 			scheduler.advance();
 		}
 		expect(scheduler.admit(job, [forecast()], owner, "execution", undefined, identity).admitted).toBe(true);
@@ -130,9 +131,20 @@ describe("unified speculation scheduling", () => {
 		const controller = new AbortController(), pending = new Promise<void>(() => {});
 		const aborted = waitForCandidate(pending, controller.signal, CANDIDATE_JOIN_TIMEOUT_MS);
 		controller.abort(); expect(await aborted).toEqual({ status: "aborted" }); expect(vi.getTimerCount()).toBe(0);
-		const bounded = waitForCandidate(pending, undefined, candidateJoinBudget("running"));
-		await vi.advanceTimersByTimeAsync(CANDIDATE_JOIN_TIMEOUT_MS);
+		const bounded = waitForCandidate(pending, undefined, candidateJoinBudget("running", 27));
+		await vi.advanceTimersByTimeAsync(27);
 		expect(await bounded).toEqual({ status: "deadline" }); expect(vi.getTimerCount()).toBe(0);
+		expect(candidateJoinBudget("queued", 0)).toBe(0);
+		expect(candidateJoinBudget("running", 2 ** 31)).toBe(CANDIDATE_JOIN_TIMEOUT_MS);
+	});
+
+	it("samples off the Actor path at the configured interval", async () => {
+		vi.useFakeTimers();
+		const sample = vi.fn(async () => ({ cpuCount: 2 })), scheduler = new SpeculationScheduler({
+			resources: { initial: { cpuCount: 2 }, sample }, active: () => true, pollIntervalMs: () => 73 });
+		scheduler.watch(); await vi.advanceTimersByTimeAsync(72); expect(sample).not.toHaveBeenCalled();
+		await vi.advanceTimersByTimeAsync(1); expect(sample).toHaveBeenCalledTimes(1); scheduler.close();
+		expect(vi.getTimerCount()).toBe(0);
 	});
 
 	it("preserves execution-world compatibility as an independent adoption requirement", () => {

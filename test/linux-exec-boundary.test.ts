@@ -6,7 +6,7 @@ import { commitBenchmarkFixture, compileBenchmarkHelper, createLinuxProcessBench
 
 test("preserves held-child output, effects and one-shot authority across parent commands", { timeout: 30_000 }, async ({ skip }) => {
 	if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
-	const fixture = await createLinuxProcessBenchmark("pi-held-production-");
+	const fixture = await createLinuxProcessBenchmark("pi-held-production-", undefined, { candidateJoinTimeoutMs: () => 1250 });
 	const { backend, workspace } = fixture;
 	try {
 		const status = await backend.check(true);
@@ -116,6 +116,7 @@ int main(int argc, char **argv) {
 					if (scenario.name === "stale" || scenario.name === "link") await writeFile(path.join(workspace, scenario.name === "stale" ? "input.txt" : "data.txt"), scenario.name === "stale" ? "after\n" : "v2\n");
 				}
 				const result = await actor(`printf 'actor-parent\\n'; ${scenario.command}`, "benchmark", scenario.name !== "descriptor");
+				if (publication) expect(publication.evidence()?.decision.waitBudgetMs).toBe(1250);
 				expect(result.output, scenario.name).toBe(`actor-parent\n${scenario.expected}`);
 				if (scenario.file) expect(await readFile(path.join(workspace, scenario.file), "utf8"))
 					.toBe(scenario.name === "descriptor" ? "descriptor" : `artifact:${scenario.name === "stale" ? "after" : "before"}\n`);

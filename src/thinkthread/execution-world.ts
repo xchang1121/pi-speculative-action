@@ -32,6 +32,8 @@ import { ResourceReadView, ResourceVersionManager, resourceDependencies, type Re
 import { RuntimeLifecycleLane } from "../runtime-lifecycle.ts";
 import { cause, type ResourceValidation } from "../settlement.ts";
 import { TimelineInterval } from "../task-timing.ts";
+import { DEFAULTS } from "../common.ts";
+import { positiveMilliseconds } from "../setting-input.ts";
 import { toolErrorSettlement, type ToolSettlement } from "../tool-settlement.ts";
 import type { DurableFsExecutor } from "./durable-fs.ts";
 import { ThinkThreadDurableError } from "./errors.ts";
@@ -48,7 +50,6 @@ import {
 const WORLD_ID = "ThinkThread";
 const RUNNER_MAX_OUTPUT_BYTES = 512 * 1024;
 const MAX_INPUT_BYTES = 8 * 1024 * 1024;
-const DEFAULT_RUN_TIMEOUT_MS = 120_000;
 const DIFF_PAGE_LIMIT = 256;
 const CAPABILITIES = [...new Set([...RESOURCE_OBSERVATION_EFFECTS.capabilities, ...WORKSPACE_PATH_MUTATION_EFFECTS.capabilities])];
 const TOOL_NAMES = THINKTHREAD_TOOL_NAMES.filter((tool) => effectCapabilitiesCover(CAPABILITIES, PI_ACTION_SEMANTICS.requirements(tool)!));
@@ -59,6 +60,7 @@ export interface ThinkThreadExecutionWorldOptions {
 	readonly runnerFingerprint?: string;
 	readonly nodePath?: string;
 	readonly autoResizeImages?: boolean;
+	readonly runTimeoutMs?: () => number;
 }
 
 export type ThinkThreadExecutionWorld = SpeculativeAgentExecutionWorld & {
@@ -133,7 +135,8 @@ export function createThinkThreadExecutionWorld(
 				signal.throwIfAborted();
 				const world = await prepare(context.cwd);
 				signal.throwIfAborted();
-				return forkThinkThreadWorld(world, { ...context, signal }, runnerPath, nodePath, autoResizeImages, snapshotInputs);
+				return forkThinkThreadWorld(world, { ...context, signal }, runnerPath, nodePath, autoResizeImages, snapshotInputs,
+					positiveMilliseconds(options.runTimeoutMs?.(), DEFAULTS.thinkThreadTimeoutMs));
 			}),
 		},
 		actorFallbackSettled: async () => {
@@ -188,6 +191,7 @@ async function forkThinkThreadWorld(
 	nodePath: string,
 	autoResizeImages: boolean,
 	snapshotInputs: boolean,
+	timeoutMs: number,
 ): Promise<WorldBranch<ToolSettlement>> {
 	const tool = toolName(context.toolName);
 	const settings = runnerSettings(context.action, autoResizeImages, context.cwd);
@@ -226,7 +230,7 @@ async function forkThinkThreadWorld(
 				cwd: ".",
 			},
 			limits: {
-				timeoutMs: DEFAULT_RUN_TIMEOUT_MS,
+				timeoutMs,
 				maxOutputBytes: RUNNER_MAX_OUTPUT_BYTES,
 			},
 		};
