@@ -4,7 +4,7 @@ import { validateToolArguments } from "@earendil-works/pi-ai";
 import { type ActionProjectionRule, resolveActionProjectionRules } from "./action-key-projection.ts";
 import { buildActionKey, type ActionKey, type ActionSemanticsRegistry, PI_ACTION_SEMANTICS } from "./action-semantics.ts";
 import { createResourceSnapshotExecutionWorld, type AgentExecutionWorld, type SpeculativeToolExecutionContext } from "./agent-execution-world.ts";
-import { clampCandidateLimit, DEFAULTS, type DrafterRequestSettings, normalizeDrafterRequestSettings,
+import { DEFAULTS, type DrafterRequestSettings, normalizeDrafterRequestSettings,
 	normalizeSpeculativeToolSelection } from "./common.ts";
 import type { AgentConsumeInput, AgentStartInput, AgentStateData } from "./agent-runtime-types.ts";
 import { definitionSchemaHashes } from "./agent-runtime-types.ts";
@@ -29,7 +29,8 @@ import type {
 import { normalizeSelfSpeculationSettings, type SelfSpeculationSettingsInput } from "./self-speculation.ts";
 import { makeSpeculativeActionRuntime } from "./runtime.ts";
 import { stableValueHash } from "./stable-value-hash.ts";
-import { booleanOr, positiveInteger } from "./setting-input.ts";
+import { booleanOr, positiveInteger, positiveMilliseconds } from "./setting-input.ts";
+import { normalizeSchedulingSettings } from "./scheduling-settings.ts";
 import { immutableSnapshot, isImmutableSnapshot } from "./stable-json.ts";
 import type { ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
 import { ToolExecutionGateway, type ToolOperation } from "./tool-execution-gateway.ts";
@@ -52,11 +53,12 @@ export function normalizeSpeculativeAgentSettings(input: SpeculativeAgentSetting
 		...normalizeDrafterRequestSettings(input),
 		enabled: booleanOr(input.enabled, DEFAULTS.enabled),
 		drafterEnabled: booleanOr(input.drafterEnabled, DEFAULTS.drafterEnabled),
-		candidateLimit: clampCandidateLimit(input.candidateLimit ?? DEFAULTS.candidateLimit),
-		maxConcurrentActions: clampCandidateLimit(input.maxConcurrentActions ?? DEFAULTS.maxConcurrentActions),
+		candidateLimit: positiveInteger(input.candidateLimit, DEFAULTS.candidateLimit),
+		maxConcurrentActions: positiveInteger(input.maxConcurrentActions, DEFAULTS.maxConcurrentActions),
 		resourceCacheMaxEntries: positiveInteger(input.resourceCacheMaxEntries, DEFAULTS.resourceCacheMaxEntries),
 		resourceCacheMaxBytes: positiveInteger(input.resourceCacheMaxBytes, DEFAULTS.resourceCacheMaxBytes),
-		predictionTimeoutMs: positiveInteger(input.predictionTimeoutMs, DEFAULTS.predictionTimeoutMs),
+		predictionTimeoutMs: positiveMilliseconds(input.predictionTimeoutMs, DEFAULTS.predictionTimeoutMs),
+		scheduling: normalizeSchedulingSettings(input.scheduling),
 		patternAware: patternAwareSettings(input.patternAware ?? PATTERN_AWARE_DEFAULTS),
 		selfSpeculation: normalizeSelfSpeculationSettings(input.selfSpeculation),
 		tools: normalizeSpeculativeToolSelection(input.tools, allowed),
@@ -248,7 +250,7 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 		AgentStateData
 	>({
 		actionSemantics,
-		resources: options.resources ?? createSystemResourceMonitor(),
+		resources: options.resources ?? createSystemResourceMonitor(async () => (await options.getSettings?.())?.scheduling),
 		sources: [patternPlans.source, drafterPlans.source, ...(options.actorForkPlanSource ? [options.actorForkPlanSource.source] : [])],
 		settings: resolveSettings,
 		definitions: (input) =>

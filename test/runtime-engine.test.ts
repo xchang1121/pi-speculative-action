@@ -208,11 +208,11 @@ describe("resource-aware execution admission", () => {
 		} finally { await runtime.dispose(); }
 	});
 
-	it("shares a memory reservation between preparation and execution with spare CPU", async () => {
+	it.each([false, true])("shares memory between preparation and execution (configured default=%s)", async configured => {
 		const gate = gated(), prepared: string[] = [], executed: string[] = [];
 		const resources = { cpuCount: 4, idleCpuCount: 4, capacity: { memory: 100 }, available: { memory: 100 } };
-		const { runtime } = harness({ settings: patient, resources: { initial: resources, sample: () => new Promise(() => {}) },
-			source: planSource({ propose: () => ({ ...plan("memory"), actions: ["first", "second"].map(id => readAction(id, { path: id }, { resourceDemand: { cpu: 1, memory: 60 } })) }) }),
+		const { runtime } = harness({ settings: () => ({ ...patient(), scheduling: { lightMemoryBytes: configured ? 60 : 8 * 1024 * 1024 } }), resources: { initial: resources, sample: () => new Promise(() => {}) },
+			source: planSource({ propose: () => ({ ...plan("memory"), actions: ["first", "second"].map(id => readAction(id, { path: id }, configured ? {} : { resourceDemand: { cpu: 1, memory: 60 } })) }) }),
 			preflightCandidate: ({ concrete }) => { prepared.push(String(concrete.path)); return { ok: true }; },
 			execute: async (_tool, input) => { executed.push(String(input.path)); if (input.path === "first") await gate.wait(); return "result"; },
 		});
@@ -963,7 +963,7 @@ describe("structural speculative runtime", () => {
 
 
 
-	it("bounds an uncalibrated in-flight join and falls back without cancelling the learning run", async () => {
+	it.each([0, 27])("bounds an in-flight join to the configured %i ms without cancelling the learning run", async candidateJoinTimeoutMs => {
 		let enabled = false;
 		const gate = gated();
 		const source = planSource({
@@ -972,7 +972,7 @@ describe("structural speculative runtime", () => {
 			observesOperations: () => true,
 			observe: () => undefined,
 		});
-		const { runtime, events, ready: candidateReady } = harness({ source, execute: async () => { await gate.wait(); return "learned"; } });
+		const { runtime, events, ready: candidateReady } = harness({ source, settings: () => ({ ...settings, scheduling: { candidateJoinTimeoutMs } }), execute: async () => { await gate.wait(); return "learned"; } });
 
 		await runtime.startTurn(start("calibration"));
 		const calibration = call("calibration");

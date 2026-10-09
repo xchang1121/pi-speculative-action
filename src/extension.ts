@@ -13,7 +13,7 @@ import { createSpeculativeActionHost, normalizeSpeculativeAgentSettings, type Ac
 import { DrafterTaskBudget } from "./drafter-budget.ts";
 import { toolSpeedup } from "./task-timing.ts";
 import { forceToolChoice } from "./drafter-plan-source.ts";
-import { clampCandidateLimit } from "./common.ts";
+import { DEFAULTS } from "./common.ts";
 import { PATTERN_AWARE_PRESETS, type PatternAwareSettings } from "./pattern-aware.ts";
 import { createClosedSearchProfile, createPiToolDefinitions, PI_CLOSED_SEARCH_TOOLS, PI_OPERATION_TOOLS, resolvePiToolInvocation, type PiToolDefinition } from "./pi-tool-invocation.ts";
 import type { ToolInvocation } from "./tool-settlement.ts";
@@ -27,11 +27,12 @@ import { adaptProcessToolOperations, definedProcessEnvironment, ProcessExecution
 import { DEFAULT_PROVENANCE_STORE_LIMITS } from "./reuse-store.ts";
 import type { SpeculativeActionEvent } from "./runtime.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
-import { nonEmptyTextInput, nonNegativeIntegerInput, nonNegativeNumberInput, optionalTextInput,
-	positiveIntegerInput, positiveInteger, probabilityInput, settingInput, type SettingInputDescriptor } from "./setting-input.ts";
+import { millisecondsInput, nonEmptyTextInput, nonNegativeIntegerInput, nonNegativeNumberInput, optionalTextInput,
+	positiveIntegerInput, positiveInteger, positiveMilliseconds, probabilityInput, settingInput, type SettingInputDescriptor } from "./setting-input.ts";
 import { errorMessage } from "./error-utils.ts";
 import { asRecord } from "./stable-json.ts";
-import { SelfSpeculationCoordinator, type SelfSpeculationCoordinatorSnapshot, type SelfSpeculationSettings } from "./self-speculation.ts";
+import { httpEndpoint, httpPath, SelfSpeculationCoordinator, type SelfSpeculationCoordinatorSnapshot, type SelfSpeculationSettings } from "./self-speculation.ts";
+import type { SchedulingSettings } from "./scheduling-settings.ts";
 import { type SpeculativeActionPackageSettings, SpeculativeActionSettingsStore, type SpeculativeSettingsScope } from "./settings-store.ts";
 import { emptySpeculativeTraceSummary, reduceSpeculativeTrace, type SpeculativeTraceSummary } from "./trace-summary.ts";
 import { resolvePatternWorkspaceIdentity } from "./workspace-identity.ts";
@@ -46,18 +47,17 @@ const RECENT_EVENT_LIMIT = 50;
 
 export type EffectiveSpeculativeActionSettings = ReturnType<typeof normalizeSpeculativeActionSettings>;
 
-type SettingInputDescriptors<T, K extends keyof T> = {
-	readonly [Field in K]: SettingInputDescriptor<T[Field]>;
-};
+type SettingInputDescriptors<T, K extends keyof T> = { readonly [Field in K]: SettingInputDescriptor<T[Field]> };
 
 const ROOT_SETTING_INPUTS = {
-	candidateLimit: positiveIntegerInput("Candidate requests per Actor decision", { transform: clampCandidateLimit }),
-	maxConcurrentActions: positiveIntegerInput("Simultaneous speculative tools", { transform: clampCandidateLimit }),
+	candidateLimit: positiveIntegerInput("Candidate requests per Actor decision"),
+	maxConcurrentActions: positiveIntegerInput("Speculative resource units per session"),
 	resourceCacheMaxEntries: positiveIntegerInput("Live result entries"),
 	resourceCacheMaxBytes: mebibyteInput("Live result memory"),
 	executionStoreMaxEntries: positiveIntegerInput("Reusable command history entries"),
 	executionStoreMaxBytes: mebibyteInput("Reusable command history memory"),
-	predictionTimeoutMs: positiveIntegerInput("Prediction wait limit (ms)"),
+	predictionTimeoutMs: millisecondsInput("Prediction wait limit (ms)"),
+	thinkThreadTimeoutMs: millisecondsInput("ThinkThread execution timeout (ms)"),
 	drafterMaxTokens: positiveIntegerInput("Maximum Drafter output tokens"),
 	drafterTaskMaxRequests: positiveIntegerInput("Maximum Drafter requests per task"),
 	drafterTaskMaxTokens: positiveIntegerInput("Maximum Drafter input/output tokens per task"),
@@ -65,11 +65,15 @@ const ROOT_SETTING_INPUTS = {
 	drafterDeterministicCandidates: nonNegativeIntegerInput("Temperature-0 Drafter candidates"),
 } satisfies Partial<SettingInputDescriptors<EffectiveSpeculativeActionSettings, keyof EffectiveSpeculativeActionSettings>>;
 
+function protocolInput(title: string, normalize: (value: unknown, fallback: string) => string, error: string) {
+	return settingInput(title, String, input => { const value = normalize(input, ""); return value ? { ok: true, value } : { ok: false, error }; });
+}
+const servicePathInput = (title: string) => protocolInput(title, httpPath, "Service path must start with one / and contain no whitespace or backslashes.");
 const SELF_SPECULATION_INPUTS = {
-	endpoint: settingInput("Control service URL", String, (input) => {
-		const value = input.trim();
-		return /^https?:\/\/[^\s]+$/u.test(value) ? { ok: true, value } : { ok: false, error: "Endpoint must be an absolute HTTP(S) URL." };
-	}),
+	endpoint: protocolInput("Control service URL", httpEndpoint, "Endpoint must be an absolute HTTP(S) URL."),
+	requestIDField: nonEmptyTextInput("Provider request ID field"),
+	candidatePath: servicePathInput("Candidate registration path"), forkPath: servicePathInput("Actor probe path"),
+	clearPath: servicePathInput("Clear request path"), capabilitiesPath: servicePathInput("Capabilities path"),
 	forkActionMinConfidence: probabilityInput("Minimum tool-name confidence"),
 	maxCandidates: positiveIntegerInput("Candidates sent per Actor decision"),
 	maxDraftTokens: positiveIntegerInput("Draft-token limit per candidate"),
@@ -77,12 +81,27 @@ const SELF_SPECULATION_INPUTS = {
 	draftFormat: nonEmptyTextInput("Target tool-call format"),
 	draftBoundary: nonEmptyTextInput("Target tool-call boundary override ('auto' to derive)"),
 	forkMaxTokens: positiveIntegerInput("Actor probe output-token limit"),
-	timeoutMs: positiveIntegerInput("Control request timeout (ms)"),
+	timeoutMs: millisecondsInput("Control request timeout (ms)"),
 	forkTemperature: nonNegativeNumberInput("Actor probe temperature"),
+	forkMaxAttempts: positiveIntegerInput("Maximum probes per Actor decision"),
+	forkRetryStreamUpdates: positiveIntegerInput("Stream updates between retries"),
+	forkBoundaryStreamUpdates: positiveIntegerInput("Stream updates before sentence-boundary retry"),
 	forkDecoder: nonEmptyTextInput("Forked tool-call decoder"),
 	forkForcedPrefix: nonEmptyTextInput("Forced tool-call prefix override ('auto' to derive)"),
 	apiKeyEnv: optionalTextInput("Authentication token environment variable name (not the token)"),
 } satisfies Partial<SettingInputDescriptors<SelfSpeculationSettings, keyof SelfSpeculationSettings>>;
+
+const SCHEDULING_INPUTS = {
+	candidateJoinTimeoutMs: millisecondsInput("Actor join wait (ms, 0 for immediate fallback)", true),
+	resourcePollIntervalMs: millisecondsInput("Resource sampling interval (ms)"),
+	gpuPollIntervalMs: millisecondsInput("GPU sampling interval (ms)"),
+	gpuProbeTimeoutMs: millisecondsInput("GPU query timeout (ms)"),
+	failureThreshold: positiveIntegerInput("Failures before circuit opens"),
+	failureRetryDecisions: positiveIntegerInput("Retry every N eligible Actor decisions"),
+	heavyCpu: positiveIntegerInput("Process/tree CPU units"), lightCpu: positiveIntegerInput("File snapshot CPU units"),
+	heavyMemoryBytes: mebibyteInput("Process/tree memory"), lightMemoryBytes: mebibyteInput("File snapshot memory"),
+	heavyIo: probabilityInput("Process/tree I/O fraction"), lightIo: probabilityInput("File snapshot I/O fraction"),
+} satisfies SettingInputDescriptors<SchedulingSettings, keyof SchedulingSettings>;
 
 const PATTERN_SETTING_INPUTS = {
 	maxContextLength: positiveIntegerInput("Previous actions used as context"),
@@ -99,7 +118,7 @@ const DRAFTER_TEMPERATURE_INPUT = settingInput<readonly [number, number]>(
 	"Drafter sampling temperature range",
 	([lower, upper]) => `${formatNumber(lower)},${formatNumber(upper)}`,
 	(input) => {
-		const [lower, upper, ...extra] = input.split(",").map((item) => Number(item.trim()));
+		const [lower, upper, ...extra] = input.split(",").map((item) => item.trim() ? Number(item.trim()) : NaN);
 		return extra.length === 0 && Number.isFinite(lower) && Number.isFinite(upper) && lower >= 0 && upper >= lower
 			? { ok: true, value: [lower, upper] as const }
 			: { ok: false, error: "Drafter temperature range must be two non-negative comma-separated numbers in ascending order." };
@@ -139,7 +158,7 @@ export interface SpeculativeActionExtensionDependencies {
 	readonly onMetrics?: (metrics: SpeculativeActionMetrics, routes: ExecutionRoutesSnapshot) => void;
 }
 
-export interface SpeculativeActionExecutionWorldContext { readonly cwd: string; readonly autoResizeImages: boolean; }
+export interface SpeculativeActionExecutionWorldContext { readonly cwd: string; readonly autoResizeImages: boolean; readonly settings: () => EffectiveSpeculativeActionSettings; }
 
 export function normalizeSpeculativeActionSettings(
 	input: SpeculativeActionPackageSettings | undefined,
@@ -147,6 +166,7 @@ export function normalizeSpeculativeActionSettings(
 	return {
 		...normalizeSpeculativeAgentSettings(input),
 		searchExecution: input?.searchExecution === "captured" ? "captured" : "native",
+		thinkThreadTimeoutMs: positiveMilliseconds(input?.thinkThreadTimeoutMs, DEFAULTS.thinkThreadTimeoutMs),
 		...(typeof input?.draftModel === "string" && input.draftModel.trim() ? { draftModel: input.draftModel.trim() } : {}),
 		executionStoreMaxEntries: positiveInteger(input?.executionStoreMaxEntries, DEFAULT_PROVENANCE_STORE_LIMITS.maxCertificates),
 		executionStoreMaxBytes: positiveInteger(input?.executionStoreMaxBytes, DEFAULT_PROVENANCE_STORE_LIMITS.maxBytes),
@@ -167,7 +187,8 @@ export function formatSpeculativeActionStatus(input: {
 		`Drafter model: ${settings.draftModel ?? "active model"}`,
 		`Candidate requests per Actor decision: ${settings.candidateLimit}`,
 		`Model Drafter policy: ${settings.drafterMaxDepth} follow-up steps; ${settings.drafterMaxTokens} output tokens per request; ${settings.drafterTaskMaxRequests} requests / ${settings.drafterTaskMaxTokens} input+output tokens per task; ${settings.drafterDeterministicCandidates} temperature-0 candidates; sampling ${formatNumber(settings.drafterTemperatureMin)}-${formatNumber(settings.drafterTemperatureMax)}`,
-		`Simultaneous speculative tools: ${settings.maxConcurrentActions}`,
+		`Speculative resource units per session: ${settings.maxConcurrentActions}`,
+		`Scheduler: Actor join ${formatDuration(settings.scheduling.candidateJoinTimeoutMs)}; sampling ${formatDuration(settings.scheduling.resourcePollIntervalMs)}; failure circuit ${settings.scheduling.failureThreshold} failures / ${settings.scheduling.failureRetryDecisions} eligible decisions`,
 		`Storage policy: ${settings.resourceCacheMaxEntries} live results/${formatBytes(settings.resourceCacheMaxBytes)}; ${settings.executionStoreMaxEntries} reusable commands/${formatBytes(settings.executionStoreMaxBytes)}`,
 		`Prediction wait limit: ${formatDuration(settings.predictionTimeoutMs)}`,
 		`Learned patterns: ${settings.patternAware.enabled ? "On" : "Off"}; follow-up steps: ${settings.patternAware.multiStepEnabled ? "On" : "Off"} (alternatives/tool ${settings.patternAware.beamWidth}, depth ${settings.patternAware.maxPredictionDepth}, learn after ${settings.patternAware.minOccurrences}, gap ${settings.patternAware.maxFutureGap}, coverage ${formatPercent(settings.patternAware.futureGapCoverage)}, half-life ${settings.patternAware.decayHalfLifeEvents})`,
@@ -324,10 +345,10 @@ async function installController(
 		},
 		...(dependencies.selfSpeculationFetch ? { fetch: dependencies.selfSpeculationFetch } : {}),
 		// Without reasoning, the Drafter must answer with the calls the Actor's own reasoning is heading for.
-		draftFork: async ({ model, context: actorContext, reasoning, content, signal }) => {
+		draftFork: async ({ model, context: actorContext, reasoning, content, signal, maxTokens, temperature }) => {
 			const message = await drafterBudget.run({ model: draftModelFor(model), context: { ...actorContext, messages: [...actorContext.messages, { role: "user", timestamp: Date.now(),
 				content: `The assistant has begun its next reply. Its reasoning so far:\n<reasoning>\n${reasoning}\n</reasoning>${content ? `\nIts reply so far:\n${content}` : ""}\nCall exactly the tool or tools it is about to call next, with the arguments it will use.` }] },
-				options: { signal, maxTokens: settings().drafterMaxTokens, onPayload: forceToolChoice(undefined) }, policy: settings(), complete: completeDraft });
+				options: { signal, maxTokens, temperature, onPayload: forceToolChoice(undefined) }, policy: settings(), complete: completeDraft });
 			return message?.content.flatMap((item) => item.type === "toolCall" ? [{ tool: item.name, input: item.arguments }] : []) ?? [];
 		},
 	});
@@ -338,8 +359,10 @@ async function installController(
 	const primaryExecutionWorlds = dependencies.createExecutionWorlds?.({
 		cwd: context.cwd,
 		autoResizeImages: piToolSettings.autoResizeImages,
+		settings,
 	}) ?? [];
-	const processBackend = new LinuxProcessReuseBackend({ storeRoot: path.join(getAgentDir(), "speculative-action", "process-reuse") });
+	const processBackend = new LinuxProcessReuseBackend({ storeRoot: path.join(getAgentDir(), "speculative-action", "process-reuse"),
+		candidateJoinTimeoutMs: () => currentSettings.scheduling.candidateJoinTimeoutMs });
 	const shell = getShellConfig(piToolSettings.shellPath);
 	const actorReplayEnabled = () => currentSettings.enabled;
 	const rawProcessExecutor = adaptProcessToolOperations(createLocalBashOperations({ shellPath: shell.shell }));
@@ -633,11 +656,7 @@ async function installController(
 }
 
 async function recoverSpeculation<T>(operation: () => Promise<T>): Promise<T | undefined> {
-	try {
-		return await operation();
-	} catch {
-		return undefined;
-	}
+	try { return await operation(); } catch { return undefined; }
 }
 
 interface PiToolSettings { readonly shellPath?: string; readonly shellCommandPrefix?: string; readonly autoResizeImages: boolean; }
@@ -810,7 +829,7 @@ function openAdvancedSettings(ctx: ExtensionContext, controller: SpeculativeActi
 			[`Model Drafter tuning › ${settings.candidateLimit} requests, ${settings.drafterMaxDepth} follow-up steps`, () => openDrafterSettings(ctx, controller, true)],
 			[`Actor probe and target verification › ${settings.selfSpeculation.forkTransport}`, () => openActorForkSettings(ctx, controller, "advanced")],
 			[`Learned-pattern tuning › ${settings.patternAware.maxPatterns} stored patterns`, () => openPatternAwareSettings(ctx, controller, "advanced")],
-			[`Scheduling and storage › ${settings.maxConcurrentActions} simultaneous tools`, () => openSchedulingAndCache(ctx, controller)],
+			[`Scheduling and storage › ${settings.maxConcurrentActions} resource units`, () => openSchedulingAndCache(ctx, controller)],
 		]);
 	});
 }
@@ -836,70 +855,58 @@ function openDrafterSettings(ctx: ExtensionContext, controller: SpeculativeActio
 	});
 }
 
-type ActorForkMenu = "basic" | "advanced" | "integration" | "fork" | "target";
+type ActorForkMenu = "basic" | "advanced" | "integration" | "protocol" | "fork" | "target";
 
-function openActorForkSettings(
-	ctx: ExtensionContext,
-	controller: SpeculativeActionController,
-	menu: ActorForkMenu = "basic",
-): Promise<void> {
-	const titles: Readonly<Record<ActorForkMenu, string>> = {
-		basic: "Actor probe",
-		advanced: "Actor probe advanced",
-		integration: "Integration and authentication",
-		fork: "Fork decoding",
-		target: "Target verification",
-	};
+function openActorForkSettings(ctx: ExtensionContext, controller: SpeculativeActionController, menu: ActorForkMenu = "basic"): Promise<void> {
+	const titles = { basic: "Actor probe", advanced: "Actor probe advanced", integration: "Integration and authentication",
+		protocol: "Service protocol", fork: "Fork decoding", target: "Target verification" };
 	return runActionMenuLoop(ctx, titles[menu], () => {
-		const settings = controller.settings();
-		const self = settings.selfSpeculation;
+		const settings = controller.settings(), self = settings.selfSpeculation, remote = self.forkTransport !== "drafter";
 		const save = (selfSpeculation: SelfSpeculationSettings) => controller.setSettings({ ...settings, selfSpeculation });
 		const { input, toggle } = settingActions(ctx, self, SELF_SPECULATION_INPUTS, save);
-		const actions = new Map<string, MenuAction>();
+		const link = (label: string, page: ActorForkMenu): [string, MenuAction] => [label, () => openActorForkSettings(ctx, controller, page)];
 		if (menu === "basic") {
 			const active = self.enabled && self.forkEnabled;
-			actions.set(`Actor probe prediction: ${active ? "On" : "Off"}`, () => save({ ...self, enabled: active ? self.enabled : true, forkEnabled: !active }));
-			actions.set("Advanced settings › integration, decoding, verification", () => openActorForkSettings(ctx, controller, "advanced"));
-			if (self.forkTransport !== "provider") actions.set(...toggle("forkActionEnabled", "Use forked calls for tool pre-execution"));
-			if (self.forkTransport === "sidecar" && self.forkActionEnabled) actions.set(...input("forkActionMinConfidence", undefined, formatPercent));
-		} else if (menu === "advanced") {
-			actions.set(`Integration and authentication › ${FORK_TRANSPORT_LABELS[self.forkTransport]}`, () => openActorForkSettings(ctx, controller, "integration"));
-			actions.set(`Fork decoding › ${self.forkDecoder}, ${self.forkMaxTokens} tokens`, () => openActorForkSettings(ctx, controller, "fork"));
-			actions.set(`Target verification › ${self.maxCandidates} candidates × ${self.maxDraftTokens} tokens`, () => openActorForkSettings(ctx, controller, "target"));
-		} else if (menu === "integration") {
-			actions.set(`Integration: ${FORK_TRANSPORT_LABELS[self.forkTransport]}`, async () => {
+			return new Map<string, MenuAction>([
+				[`Actor probe prediction: ${active ? "On" : "Off"}`, () => save({ ...self, enabled: active ? self.enabled : true, forkEnabled: !active })],
+				link("Advanced settings › integration, decoding, verification", "advanced"),
+				...(self.forkTransport !== "provider" ? [toggle("forkActionEnabled", "Use forked calls for tool pre-execution")] : []),
+				...(remote && (self.forkTransport === "provider" || self.forkActionEnabled) ? [input("forkActionMinConfidence", undefined, formatPercent)] : []),
+			]);
+		}
+		if (menu === "advanced") return new Map([
+			link(`Integration and authentication › ${FORK_TRANSPORT_LABELS[self.forkTransport]}`, "integration"),
+			link(`Fork decoding › ${self.forkMaxTokens} tokens, ${self.forkMaxAttempts} probes`, "fork"),
+			...(remote ? [link(`Target verification › ${self.maxCandidates} candidates × ${self.maxDraftTokens} tokens`, "target")] : []),
+		]);
+		if (menu === "integration") {
+			const actions = new Map<string, MenuAction>([[`Integration: ${FORK_TRANSPORT_LABELS[self.forkTransport]}`, async () => {
 				const selected = await ctx.ui.select("Actor probe integration", [...Object.values(FORK_TRANSPORT_LABELS), BACK]);
 				const transport = Object.entries(FORK_TRANSPORT_LABELS).find(([, label]) => label === selected)?.[0] as SelfSpeculationSettings["forkTransport"] | undefined;
 				if (transport) await save({ ...self, forkTransport: transport });
-			});
-			if (self.forkTransport === "sidecar") {
-				actions.set(...input("endpoint"));
+			}]]);
+			if (remote) {
 				actions.set(...input("timeoutMs", "Request timeout", formatDuration));
-				actions.set(...input("apiKeyEnv", "Authentication token variable", value => value ?? "None"));
+				if (controller.settingsScope() === "global") {
+					actions.set(...input("endpoint"));
+					actions.set(...input("apiKeyEnv", "Authentication token variable", value => value ?? "None"));
+				} else actions.set("Service URL and authentication › All projects only", () => ctx.ui.notify("Choose Save settings to → All projects in the main menu to edit the service URL and authentication.", "info"));
+				actions.set(...link("Service protocol › request field, paths, probability evidence", "protocol"));
 			}
-		} else if (menu === "fork") {
-			actions.set(...input("forkMaxTokens", "Maximum output tokens"));
-			actions.set(...input("forkTemperature", "Sampling temperature", formatNumber));
-			actions.set(...input("forkDecoder", "Tool-call decoder"));
-			actions.set(...input("forkForcedPrefix", "Forced tool-call prefix", syntaxSettingLabel));
-		} else if (menu === "target") {
-			actions.set(...toggle("enabled", "Verify predicted calls during Actor decoding"));
-			actions.set(...input("maxCandidates", "Candidates sent per decision"));
-			actions.set(...input("maxDraftTokens"));
-			actions.set(...input("actorProfile", "Actor Profile"));
-			actions.set(...input("draftFormat", "Tool-call format override"));
-			actions.set(...input("draftBoundary", "Tool-call boundary", syntaxSettingLabel));
+			return actions;
 		}
-
-		return actions;
+		if (menu === "protocol") return new Map([...(["requestIDField", "candidatePath", "forkPath", "clearPath", "capabilitiesPath"] as const).map(key => input(key)), toggle("requireLogprobs", "Require token probabilities")]);
+		if (menu === "fork") return new Map([
+			input("forkMaxTokens", "Maximum output tokens"), input("forkTemperature", "Sampling temperature", formatNumber),
+			...(["forkMaxAttempts", "forkRetryStreamUpdates", "forkBoundaryStreamUpdates"] as const).map(key => input(key)),
+			...(remote ? [input("forkDecoder", "Tool-call decoder"), input("forkForcedPrefix", "Forced tool-call prefix", syntaxSettingLabel)] : []),
+		]);
+		return new Map([toggle("enabled", "Verify predicted calls during Actor decoding"), input("maxCandidates", "Candidates sent per decision"),
+			input("maxDraftTokens"), input("actorProfile", "Actor Profile"), input("draftFormat", "Tool-call format override"), input("draftBoundary", "Tool-call boundary", syntaxSettingLabel)]);
 	});
 }
 
-function openPatternAwareSettings(
-	ctx: ExtensionContext,
-	controller: SpeculativeActionController,
-	menu: "basic" | "presets" | "advanced" | "learning" | "multiStep" = "basic",
-): Promise<void> {
+function openPatternAwareSettings(ctx: ExtensionContext, controller: SpeculativeActionController, menu: "basic" | "presets" | "advanced" | "learning" | "multiStep" = "basic"): Promise<void> {
 	const title = { basic: "Learned patterns", presets: "Prebuilt modes", advanced: "Learned-pattern advanced", learning: "Learning history", multiStep: "Multi-step search" }[menu];
 	return runActionMenuLoop(ctx, title, () => {
 		const settings = controller.settings();
@@ -943,7 +950,10 @@ function openSchedulingAndCache(ctx: ExtensionContext, controller: SpeculativeAc
 		const { input } = settingActions(ctx, settings, ROOT_SETTING_INPUTS, controller.setSettings);
 		const actions = new Map<string, MenuAction>([
 			input("maxConcurrentActions"),
+			["Scheduler policy › waits, sampling, failure recovery", () => openSchedulingPolicy(ctx, controller)],
+			["Resource estimates › process/tree and file snapshots", () => openSchedulingPolicy(ctx, controller, true)],
 			input("predictionTimeoutMs", "Prediction wait limit", formatDuration),
+			input("thinkThreadTimeoutMs", "ThinkThread execution timeout", formatDuration),
 			input("resourceCacheMaxEntries"),
 			input("resourceCacheMaxBytes", "Live result memory", formatBytes),
 			input("executionStoreMaxEntries"),
@@ -958,13 +968,18 @@ function openSchedulingAndCache(ctx: ExtensionContext, controller: SpeculativeAc
 	});
 }
 
+function openSchedulingPolicy(ctx: ExtensionContext, controller: SpeculativeActionController, resources = false): Promise<void> {
+	return runActionMenuLoop(ctx, resources ? "Resource estimates" : "Scheduler policy", () => {
+		const settings = controller.settings(), policy = settings.scheduling;
+		const { input } = settingActions(ctx, policy, SCHEDULING_INPUTS, scheduling => controller.setSettings({ ...settings, scheduling }));
+		return new Map((Object.keys(SCHEDULING_INPUTS) as (keyof SchedulingSettings)[])
+			.filter(key => /^(heavy|light)/.test(key) === resources).map(key => input(key)));
+	});
+}
+
 type MenuAction = () => void | Promise<void>;
 
-async function runActionMenuLoop(
-	ctx: ExtensionContext,
-	title: string,
-	actionsForCurrentSettings: () => ReadonlyMap<string, MenuAction>,
-): Promise<void> {
+async function runActionMenuLoop(ctx: ExtensionContext, title: string, actionsForCurrentSettings: () => ReadonlyMap<string, MenuAction>): Promise<void> {
 	while (true) {
 		const actions = actionsForCurrentSettings();
 		const choice = await ctx.ui.select(title, [...actions.keys(), BACK]);
@@ -1102,7 +1117,7 @@ function settingActions<T extends object, Field extends keyof T>(
 		return publish(next);
 	};
 	return {
-		input<Key extends Field>(key: Key, label = descriptors[key].title, format: (value: T[Key]) => string | number = String): [string, MenuAction] {
+		input<Key extends Field>(key: Key, label = descriptors[key].title, format: (value: T[Key]) => string | number = descriptors[key].format): [string, MenuAction] {
 			return [`${label}: ${format(current[key])}`, () => promptSetting(ctx, current[key], descriptors[key], value => update(key, value))];
 		},
 		toggle(key: { [Key in keyof T]: T[Key] extends boolean ? Key : never }[keyof T], label: string): [string, MenuAction] {
@@ -1111,34 +1126,16 @@ function settingActions<T extends object, Field extends keyof T>(
 	};
 }
 
-async function editDrafterTemperatureRange(
-	ctx: ExtensionContext,
-	controller: SpeculativeActionController,
-	settings: EffectiveSpeculativeActionSettings,
-): Promise<void> {
-	await promptSetting(
-		ctx,
-		[settings.drafterTemperatureMin, settings.drafterTemperatureMax] as const,
-		DRAFTER_TEMPERATURE_INPUT,
-		async ([drafterTemperatureMin, drafterTemperatureMax]) => {
-			await controller.setSettings({ ...settings, drafterTemperatureMin, drafterTemperatureMax });
-		},
-	);
+function editDrafterTemperatureRange(ctx: ExtensionContext, controller: SpeculativeActionController, settings: EffectiveSpeculativeActionSettings): Promise<void> {
+	return promptSetting(ctx, [settings.drafterTemperatureMin, settings.drafterTemperatureMax] as const, DRAFTER_TEMPERATURE_INPUT,
+		([drafterTemperatureMin, drafterTemperatureMax]) => controller.setSettings({ ...settings, drafterTemperatureMin, drafterTemperatureMax }));
 }
 
-async function editDraftModel(
-	ctx: ExtensionContext,
-	controller: SpeculativeActionController,
-	settings: EffectiveSpeculativeActionSettings,
-): Promise<void> {
-	const models = ctx.modelRegistry
-		.getAvailable()
-		.sort((left, right) => `${left.provider}/${left.id}`.localeCompare(`${right.provider}/${right.id}`));
+async function editDraftModel(ctx: ExtensionContext, controller: SpeculativeActionController, settings: EffectiveSpeculativeActionSettings): Promise<void> {
+	const models = ctx.modelRegistry.getAvailable().sort((left, right) => `${left.provider}/${left.id}`.localeCompare(`${right.provider}/${right.id}`));
 	const providers = new Map<string, typeof models>();
 	for (const model of models) providers.set(model.provider, [...(providers.get(model.provider) ?? []), model]);
-	const providerLabels = new Map(
-		[...providers].map(([provider, providerModels]) => [`${provider} (${providerModels.length} models) ›`, provider]),
-	);
+	const providerLabels = new Map([...providers].map(([provider, providerModels]) => [`${provider} (${providerModels.length} models) ›`, provider]));
 	const active = `${USE_ACTIVE_MODEL} (${activeModelReference(ctx)})`;
 	const choice = await ctx.ui.select("Drafter model", [active, ...providerLabels.keys(), CUSTOM_MODEL, BACK]);
 	if (!choice || choice === BACK) return;
@@ -1153,15 +1150,10 @@ async function editDraftModel(
 	}
 	const provider = providerLabels.get(choice);
 	if (!provider) return;
-	const labels = new Map(
-		(providers.get(provider) ?? []).map((model) => {
-			const reference = `${model.provider}/${model.id}`;
-			return [
-				`${settings.draftModel === reference ? "[x] " : ""}${model.id}${model.name && model.name !== model.id ? ` — ${model.name}` : ""}`,
-				reference,
-			];
-		}),
-	);
+	const labels = new Map((providers.get(provider) ?? []).map(model => {
+		const reference = `${model.provider}/${model.id}`;
+		return [`${settings.draftModel === reference ? "[x] " : ""}${model.id}${model.name && model.name !== model.id ? ` — ${model.name}` : ""}`, reference];
+	}));
 	const selected = await ctx.ui.select(`${provider} models`, [...labels.keys(), BACK]);
 	if (!selected || selected === BACK) return;
 	const draftModel = labels.get(selected);
@@ -1193,43 +1185,24 @@ export function formatSpeculativeActionEvent(event: SpeculativeActionEvent<strin
 			break;
 		}
 		case "candidate": {
-			const route = event.candidate.route;
-			parts.push(
-				`candidate ${compactEventText(event.candidate.id)}`,
-				event.candidate.tool,
-				event.candidate.source,
-				`${route.backend}/${executionRouteKind(route.isolation)}/${route.reuse}`,
-				event.state.status,
-			);
-			if (event.state.status === "running") {
-				parts.push(
-					`${event.candidate.origin === "actor_preview" ? "previewed" : "predicted"} ${compactEventText(event.candidate.predictedAction)}`,
-				);
-			} else if (event.state.status === "succeeded") {
-				parts.push(formatDuration(event.state.executionMs));
-				const reuse = event.candidate.world?.executionMetrics.reuse;
+			const { candidate, state } = event, { route } = candidate;
+			parts.push(`candidate ${compactEventText(candidate.id)}`, candidate.tool, candidate.source,
+				`${route.backend}/${executionRouteKind(route.isolation)}/${route.reuse}`, state.status);
+			if (state.status === "running") parts.push(`${candidate.origin === "actor_preview" ? "previewed" : "predicted"} ${compactEventText(candidate.predictedAction)}`);
+			else if (state.status === "succeeded") {
+				parts.push(formatDuration(state.executionMs));
+				const reuse = candidate.world?.executionMetrics.reuse;
 				if (reuse && hasProcessReuse(reuse)) parts.push(`Bash branch work ${formatProcessWorkReuse(reuse)}`);
-			} else {
-				parts.push(causeSummary(event.state.cause), formatDuration(event.state.executionMs));
-			}
+			} else parts.push(causeSummary(state.cause), formatDuration(state.executionMs));
 			break;
 		}
 		case "actor_action": {
-			const sources = [...new Set(event.settlement.matchedPredictions.map((prediction) => prediction.source))];
-			parts.push(
-				event.settlement.tool,
-				sources.join("+") || (event.settlement.provider.kind === "speculative" ? "cache" : "no prediction"),
-			);
-			if (event.settlement.provider.kind === "speculative") {
-				const match = event.settlement.provider.match;
-				parts.push(
-					match.kind === "projected" ? `partial-result reuse (${match.projector})` : match.kind === "inputs" ? "sealed-input reuse" : "exact-action reuse",
-				);
-			} else {
-				parts.push(
-					`${formatDuration(event.settlement.provider.durationMs)} Actor ${event.settlement.provider.origin} execution`,
-				);
-			}
+			const { provider, tool, matchedPredictions } = event.settlement, sources = [...new Set(matchedPredictions.map(prediction => prediction.source))];
+			parts.push(tool, sources.join("+") || (provider.kind === "speculative" ? "cache" : "no prediction"));
+			if (provider.kind === "speculative") {
+				const { match } = provider;
+				parts.push(match.kind === "projected" ? `partial-result reuse (${match.projector})` : match.kind === "inputs" ? "sealed-input reuse" : "exact-action reuse");
+			} else parts.push(`${formatDuration(provider.durationMs)} Actor ${provider.origin} execution`);
 			parts.push(compactEventText(event.actualAction));
 			break;
 		}
@@ -1265,19 +1238,14 @@ function mebibyteInput(title: string): SettingInputDescriptor<number> {
 
 function sourceSummary(settings: EffectiveSpeculativeActionSettings): string {
 	if (!settings.enabled) return "Inactive";
-	const sources = [
-		settings.drafterEnabled ? "Model Drafter" : undefined,
-		settings.selfSpeculation.enabled && settings.selfSpeculation.forkEnabled ? "Actor probe" : undefined,
-		settings.patternAware.enabled ? "Learned patterns" : undefined,
-	]
-		.filter((source): source is string => source !== undefined)
-		.join(" + ");
+	const sources = [settings.drafterEnabled && "Model Drafter", settings.selfSpeculation.enabled && settings.selfSpeculation.forkEnabled && "Actor probe",
+		settings.patternAware.enabled && "Learned patterns"].filter(Boolean).join(" + ");
 	return sources || "No source enabled";
 }
 
 function actorForkSummary(settings: SelfSpeculationSettings): string {
 	if (!settings.enabled || !settings.forkEnabled) return "Off";
-	return `On, ${settings.forkTransport === "provider" ? "provider-integrated" : "sidecar service"}`;
+	return `On, ${FORK_TRANSPORT_LABELS[settings.forkTransport]}`;
 }
 
 function syntaxSettingLabel(value: string): string {

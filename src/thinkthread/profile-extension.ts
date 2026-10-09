@@ -14,7 +14,7 @@ export interface ThinkThreadProfileExtensionOptions {
 
 export function createThinkThreadProfileExtension(options: ThinkThreadProfileExtensionOptions = {}): ExtensionFactory {
 	return createSpeculativeActionExtension({
-		createExecutionWorlds: ({ autoResizeImages }) => [createThinkThreadExecutionWorld({ autoResizeImages, ...options.world })],
+		createExecutionWorlds: ({ autoResizeImages, settings }) => [createThinkThreadExecutionWorld({ autoResizeImages, runTimeoutMs: () => settings().thinkThreadTimeoutMs, ...options.world })],
 		createSettingsStore: (cwd) =>
 			new SpeculativeActionSettingsStore(cwd, resolveConfigDirectory(options.configDirectory)),
 	});

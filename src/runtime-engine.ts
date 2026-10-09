@@ -51,6 +51,7 @@ import { cause } from "./settlement.ts";
 import { runSourceRequest, SourceGeneration } from "./source-request.ts";
 import { TaskTimeline, TimelineInterval, type ComputationReuseShare } from "./task-timing.ts";
 import type { HardwareResources } from "./system-resources.ts";
+import { normalizeSchedulingSettings, SCHEDULING_DEFAULTS } from "./scheduling-settings.ts";
 
 class CandidateFailure extends Error {
 	readonly failure: ResolutionCause;
@@ -459,9 +460,13 @@ export function makeSpeculativeActionRuntime<
 	type ScheduledJob = Candidate | Preparation | ActorAction<Candidate, Output>;
 	const needsResourceSamples = (): boolean => [...sessionStates.values()].some(session => !session.lifecycle.sealed &&
 		(session.turns.size > 0 || candidateStore.pending(session.id).length > 0)) || preparations.size > 0 || scheduler.snapshot().length > 0;
-	const scheduler = new SpeculationScheduler<ScheduledJob>({ resources: adapter.resources, active: needsResourceSamples,
+	const scheduler: SpeculationScheduler<ScheduledJob> = new SpeculationScheduler({ resources: adapter.resources, active: needsResourceSamples,
+		pollIntervalMs: () => {
+			const active = [...sessionStates.values()].filter(session => session.turns.size || candidateStore.pending(session.id).length || scheduler.snapshot(session).length);
+			return active.length ? Math.min(...active.map(session => normalizeSchedulingSettings(session.settings.scheduling).resourcePollIntervalMs)) : SCHEDULING_DEFAULTS.resourcePollIntervalMs;
+		},
 		changed: () => { for (const session of sessionStates.values()) { preemptForActor(session); dispatchReady(session); } } });
-	const scopeFor = (session: Session) => ({ owner: session, limit: concurrentLimit(session.settings) });
+	const scopeFor = (session: Session) => ({ owner: session, limit: concurrentLimit(session.settings), scheduling: session.settings.scheduling });
 	const scheduleResourceSample = (delay?: number) => scheduler.watch(delay);
 	const wakeResourceWaiters = (): void => {
 		for (const session of sessionStates.values()) dispatchReady(session);
@@ -1411,7 +1416,7 @@ export function makeSpeculativeActionRuntime<
 		for (const choice of ranked) {
 			const candidate = choice.candidate;
 			const executionAtDecision = candidate.work.execution;
-			const waitBudgetMs = candidateJoinBudget(executionAtDecision.status === "succeeded" ? "succeeded" : executionAtDecision.status === "running" ? "running" : "queued");
+			const waitBudgetMs = candidateJoinBudget(executionAtDecision.status === "succeeded" ? "succeeded" : executionAtDecision.status === "running" ? "running" : "queued", state.settings.scheduling?.candidateJoinTimeoutMs);
 			const reservation = acquireCandidate(state.session, candidate, actorAction.identity.id);
 			if (!reservation) { actorAction.rejectCandidate(candidate.id, choice.match, cause("matching", "candidate_reserved")); continue; }
 			(candidate.actorConsumers ??= new Set()).add(actorAction);
@@ -2109,8 +2114,9 @@ export function makeSpeculativeActionRuntime<
 		const definition = semantics.definition(action);
 		const heavy = (route && route.isolation !== "resource_snapshot") || !definition || definition.effect === "unbounded" ||
 			definition.resourceScope === "tree_entries" || definition.resourceScope === "tree_content" || definition.resourceScope === "captured_inputs";
-		return { cpu: Math.min(concurrentLimit(session.settings), adapter.resources?.initial.cpuCount ?? Infinity, heavy ? 2 : 1),
-			memory: (heavy ? 64 : 8) * 1024 * 1024, io: heavy ? 0.25 : 0.125,
+		const policy = normalizeSchedulingSettings(session.settings.scheduling);
+		return { cpu: Math.min(concurrentLimit(session.settings), adapter.resources?.initial.cpuCount ?? Infinity, heavy ? policy.heavyCpu : policy.lightCpu),
+			memory: heavy ? policy.heavyMemoryBytes : policy.lightMemoryBytes, io: heavy ? policy.heavyIo : policy.lightIo,
 			...(typeof declared === "number" ? { cpu: declared } : declared) };
 	};
 

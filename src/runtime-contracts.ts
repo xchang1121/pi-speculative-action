@@ -19,6 +19,7 @@ export interface SpeculativeActionSettings {
 	readonly resourceCacheMaxEntries: number;
 	readonly resourceCacheMaxBytes?: number;
 	readonly predictionTimeoutMs: number;
+	readonly scheduling?: Partial<import("./scheduling-settings.ts").SchedulingSettings>;
 	/** Source-owned configuration. The runtime treats every value as opaque. */
 	readonly sourceConfig?: Readonly<Record<string, unknown>>;
 	/** Tools eligible for prediction; execution isolation is resolved independently. */

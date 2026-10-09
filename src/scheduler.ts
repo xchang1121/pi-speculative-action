@@ -1,6 +1,8 @@
 import { nonNegativeCount as sequence, nonNegativeFinite as finite, positiveCount as units } from "./number-utils.ts";
 import { BoundedRecencyMap } from "./bounded-recency-map.ts";
 import type { WorldCompatibilityEvidence } from "./execution-world.ts";
+import { normalizeSchedulingSettings, SCHEDULING_DEFAULTS, type SchedulingSettings } from "./scheduling-settings.ts";
+import { milliseconds } from "./setting-input.ts";
 import { RESOURCE_DIMENSIONS as dimensions, type ExecutionResourceMonitor, type ExecutionResourceSnapshot, type HardwareResources } from "./system-resources.ts";
 
 export interface ExecutionIdentity {
@@ -40,9 +42,9 @@ export interface ScheduledWork {
 	readonly dependenciesResolved: boolean;
 }
 
-export const CANDIDATE_JOIN_TIMEOUT_MS = 1_000;
-export function candidateJoinBudget(state: "queued" | "running" | "succeeded"): number {
-	return state === "succeeded" ? 0 : CANDIDATE_JOIN_TIMEOUT_MS;
+export const CANDIDATE_JOIN_TIMEOUT_MS = SCHEDULING_DEFAULTS.candidateJoinTimeoutMs;
+export function candidateJoinBudget(state: "queued" | "running" | "succeeded", timeoutMs?: number): number {
+	return state === "succeeded" ? 0 : milliseconds(timeoutMs, CANDIDATE_JOIN_TIMEOUT_MS);
 }
 export type CandidateWaitResult<T> = { readonly status: "completed"; readonly value: T } | { readonly status: "aborted" } | { readonly status: "deadline" };
 
@@ -65,7 +67,7 @@ export async function waitForCandidate<T>(promise: Promise<T>, signal?: AbortSig
 }
 
 type Role = "execution" | "preparation" | "actor";
-export interface SchedulingScope { readonly owner: object; readonly limit: number; }
+export interface SchedulingScope { readonly owner: object; readonly limit: number; readonly scheduling?: Partial<SchedulingSettings>; }
 interface SchedulerEntry<Job> {
 	readonly job: Job; readonly scope: SchedulingScope; readonly role: Role; readonly sequence: number;
 	work: ScheduledWork;
@@ -79,6 +81,7 @@ export type WorldCompatibilityDecision = { readonly compatible: true } | {
 };
 interface SchedulerOptions {
 	readonly resources?: ExecutionResourceMonitor;
+	readonly pollIntervalMs?: () => number;
 	readonly active?: () => boolean;
 	readonly changed?: () => void;
 }
@@ -91,7 +94,7 @@ const add = (target: HardwareResources, source: HardwareResources, scale = 1) =>
 /** One physical ledger and ordering for all sessions, preparations, producers and real Actor work. */
 export class SpeculationScheduler<Job extends object> {
 	private readonly entries = new Map<Job, SchedulerEntry<Job>>();
-	private readonly failures = new BoundedRecencyMap<string, { count: number; probes: number; decisions: WeakMap<object, { sequence: number; allowed: boolean }> }>(1024);
+	private readonly failures = new BoundedRecencyMap<string, { count: number; decisions: WeakMap<object, { sequence: number; probes: number; allowed: boolean }> }>(1024);
 	private sequence = 0;
 	private decisionSequence = 0;
 	private hardware?: ExecutionResourceSnapshot;
@@ -135,12 +138,14 @@ export class SpeculationScheduler<Job extends object> {
 
 	admit(job: Job, forecasts: readonly PredictionForecast[], scope: SchedulingScope, role: Role = "execution", work = this.evaluate(forecasts), identity?: ExecutionIdentity): SchedulerAdmission {
 		if (role !== "actor" && !work.actorDemand) {
+			const policy = normalizeSchedulingSettings(scope.scheduling);
 			if (!this.ready(work)) return { admitted: false, work, reason: "outside_launch_window" };
 			const failed = identity && this.failures.get(executionKey(identity));
-			if (failed && failed.count >= 2) {
-				let decision = failed.decisions.get(job);
+			if (failed && failed.count >= policy.failureThreshold) {
+				let decision = failed.decisions.get(scope.owner);
 				if (!decision || decision.sequence !== this.decisionSequence) {
-					decision = { sequence: this.decisionSequence, allowed: ++failed.probes % 4 === 0 }; failed.decisions.set(job, decision);
+					const probes = (decision?.probes ?? 0) + 1;
+					decision = { sequence: this.decisionSequence, probes, allowed: probes % policy.failureRetryDecisions === 0 }; failed.decisions.set(scope.owner, decision);
 				}
 				if (!decision.allowed) return { admitted: false, work, reason: "failure_circuit" };
 			}
@@ -163,7 +168,7 @@ export class SpeculationScheduler<Job extends object> {
 	observe(identity: ExecutionIdentity, failed: boolean): void {
 		const key = executionKey(identity);
 		if (!failed) this.failures.delete(key);
-		else this.failures.set(key, { count: (this.failures.get(key)?.count ?? 0) + 1, probes: 0, decisions: new WeakMap() });
+		else this.failures.set(key, { count: (this.failures.get(key)?.count ?? 0) + 1, decisions: new WeakMap() });
 	}
 
 	/** Cancellation never returns capacity. Draining victims are subtracted only while selecting more victims. */
@@ -189,7 +194,7 @@ export class SpeculationScheduler<Job extends object> {
 		return this.hardware && { ...this.hardware, admissionCapacity: this.admission.cpu ?? 0, ...usage, reserved, capacity: { ...this.capacity }, available: { ...this.admission } };
 	}
 
-	watch(delay = 250): void {
+	watch(delay = this.options.pollIntervalMs?.() ?? SCHEDULING_DEFAULTS.resourcePollIntervalMs): void {
 		if (!this.options.resources || this.timer || this.sampling || !this.options.active?.()) return;
 		this.timer = setTimeout(() => {
 			this.timer = undefined;

@@ -6,7 +6,7 @@ describe("typed setting input", () => {
 	it("enforces integer and numeric domains at their boundaries", () => {
 		for (const [input, expected] of [
 			[undefined, [7, 7, 7, 7]], [null, [7, 7, 7, 7]], ["3", [7, 7, 7, 7]], [NaN, [7, 7, 7, 7]],
-			[Infinity, [7, 7, 7, 7]], [-1, [7, 7, 7, 7]], [0, [7, 0, 0, 0]], [0.5, [0, 0, 0.5, 0.5]], [3.9, [3, 3, 3.9, 7]],
+			[Infinity, [7, 7, 7, 7]], [-1, [7, 7, 7, 7]], [0, [7, 0, 0, 0]], [0.5, [7, 0, 0.5, 0.5]], [3.9, [3, 3, 3.9, 7]],
 		] as const) expect([positiveInteger(input, 7), nonNegativeInteger(input, 7), nonNegativeNumber(input, 7), probability(input, 7)]).toEqual(expected);
 		expect([positiveInteger("1", undefined), probability(2, undefined)]).toEqual([undefined, undefined]);
 		expect(positiveIntegerInput("Count").parse(" 3 ")).toEqual({ ok: true, value: 3 });
@@ -14,7 +14,8 @@ describe("typed setting input", () => {
 			ok: false,
 			error: "Count must be a positive integer.",
 		});
-		expect(nonNegativeIntegerInput("Depth").parse("")).toEqual({ ok: true, value: 0 });
+		for (const parser of [nonNegativeIntegerInput, nonNegativeNumberInput, positiveIntegerInput, probabilityInput])
+			for (const value of ["", " ", "Infinity"]) expect(parser("Value").parse(value).ok).toBe(false);
 		expect(nonNegativeIntegerInput("Depth").parse("0.5").ok).toBe(false);
 		expect(nonNegativeNumberInput("Delay").parse("0.25")).toEqual({ ok: true, value: 0.25 });
 		expect(nonNegativeNumberInput("Delay").parse("-1").ok).toBe(false);

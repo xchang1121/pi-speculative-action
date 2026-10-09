@@ -15,7 +15,7 @@ import { effectCapabilitiesCover, RESOURCE_OBSERVATION_EFFECTS, UNRESTRICTED_PRO
 	WORKSPACE_PATH_MUTATION_EFFECTS } from "../src/effect-model.ts";
 import { ExecutionWorldRouter } from "../src/execution-world.ts";
 import { ThinkThreadDurableError } from "../src/thinkthread/errors.ts";
-import { createThinkThreadExecutionWorld } from "../src/thinkthread/execution-world.ts";
+import { createThinkThreadExecutionWorld, type ThinkThreadExecutionWorldOptions } from "../src/thinkthread/execution-world.ts";
 import { encodeThinkThreadToolRunnerResponse } from "../src/thinkthread/tool-runner-protocol.ts";
 import { TaskTimeline, TimelineInterval } from "../src/task-timing.ts";
 
@@ -370,10 +370,10 @@ describe("ThinkThread execution world", () => {
 		],
 	] as const)("maps %s to sealed inputs or its exact fs.run and dependency policy", async (tool, args, writes, dependency) => {
 		const fixture = fakeClient();
-		const { world, cwd } = await startWorld(fixture);
+		const { world, cwd } = await startWorld(fixture, { runTimeoutMs: () => 6543 });
 		const branch = await world.speculation.execute(context(tool, args, cwd, `${tool}-1`));
 
-		expect(fixture.run.mock.calls[0]?.[0]).toMatchObject({ writes });
+		expect(fixture.run.mock.calls[0]?.[0]).toMatchObject({ writes, limits: { timeoutMs: 6543 } });
 		await expect(branch.validate?.()).resolves.toMatchObject({ status: "valid" });
 		expect(fixture.verify).toHaveBeenCalledWith({
 			snapshotId: expect.any(String),
@@ -659,12 +659,13 @@ function context(toolName: string, args: unknown, cwd: string, callID: string, s
 	};
 }
 
-async function startWorld(fixture: ReturnType<typeof fakeClient>) {
+async function startWorld(fixture: ReturnType<typeof fakeClient>, options: ThinkThreadExecutionWorldOptions = {}) {
 	const world = createThinkThreadExecutionWorld({
 		clientFactory: () => fixture.client,
 		runnerPath: "/opt/pi-speculative-action/tool-runner.js",
 		runnerFingerprint: "runner-v1",
 		nodePath: "/usr/bin/node",
+		...options,
 	});
 	const cwd = process.env.THINKTHREAD_FS ?? "/workspace";
 	await world.speculation.prepare?.({ cwd });

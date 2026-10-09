@@ -2,6 +2,7 @@ import os from "node:os";
 import { readFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { normalizeSchedulingSettings, type SchedulingSettings } from "./scheduling-settings.ts";
 
 /** CPU/GPU equivalents, bytes for memory, and fractional I/O/network capacity. */
 export const RESOURCE_DIMENSIONS = ["cpu", "memory", "io", "gpu", "gpuMemory", "network"] as const;
@@ -56,14 +57,15 @@ export function idleCpuCount(previous: readonly CpuTimes[], current: readonly Cp
 	return fractions.sort((a, b) => a - b).slice(0, cpuCount).reduce((sum, value) => sum + value, 0);
 }
 
-export function createSystemResourceMonitor(): ExecutionResourceMonitor {
+export function createSystemResourceMonitor(settings: () => Partial<SchedulingSettings> | undefined | Promise<Partial<SchedulingSettings> | undefined> = () => undefined): ExecutionResourceMonitor {
 	let previous: readonly CpuTimes[] | undefined, previousAffinity: string | undefined;
-	let sampleSequence = 0, gpu: Pick<ExecutionResourceSnapshot, "capacity" | "available"> = {}, gpuUnavailable = false;
+	let lastGpuSample = -Infinity, gpu: Pick<ExecutionResourceSnapshot, "capacity" | "available"> = {}, gpuUnavailable = false;
 	const memory = () => ({ capacity: { memory: Math.min(os.totalmem(), process.constrainedMemory() || Infinity), io: 1 },
 		available: { memory: Math.min(os.freemem(), process.availableMemory()) } });
 	return {
 		initial: { cpuCount: Math.max(1, os.availableParallelism()), ...memory() },
 		sample: async () => {
+			const policy = normalizeSchedulingSettings(await settings());
 			const allowed = process.platform === "linux"
 				? cpuAffinity(await readFile("/proc/self/status", "utf8").catch(() => "")) : undefined;
 			const cpuCount = Math.max(1, Math.min(os.availableParallelism(), allowed?.length ?? Infinity));
@@ -72,9 +74,10 @@ export function createSystemResourceMonitor(): ExecutionResourceMonitor {
 			previous = current; previousAffinity = affinity;
 			const io = process.platform === "linux" ? ioAvailability(await readFile("/proc/pressure/io", "utf8").catch(() => "")) : undefined;
 			// GPU telemetry is optional; never put a driver subprocess on the Actor path.
-			if (!gpuUnavailable && sampleSequence++ % 4 === 0) {
+			if (!gpuUnavailable && performance.now() - lastGpuSample >= policy.gpuPollIntervalMs) {
+				lastGpuSample = performance.now();
 				try { gpu = gpuAvailability((await promisify(execFile)("nvidia-smi", ["--query-gpu=memory.total,memory.free,utilization.gpu", "--format=csv,noheader,nounits"],
-					{ timeout: 1000, windowsHide: true, maxBuffer: 64 * 1024 })).stdout) ?? {}; }
+					{ timeout: policy.gpuProbeTimeoutMs, windowsHide: true, maxBuffer: 64 * 1024 })).stdout) ?? {}; }
 				catch (error) { gpu = {}; gpuUnavailable = (error as NodeJS.ErrnoException).code === "ENOENT"; }
 			}
 			const ram = memory();
