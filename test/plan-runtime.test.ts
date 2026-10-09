@@ -7,72 +7,9 @@ import { PlanRuntime, type PlanRuntimeNode } from "../src/plan-runtime.ts";
 import { cause } from "../src/settlement.ts";
 
 describe("PlanRuntime", () => {
-	it.each(["forward", "reverse"] as const)("finds unique unfinished workflow prerequisites through a %s diamond", (order) => {
-		const plan = new PlanRuntime();
-		const actions = [action("root"), action("left", { dependsOn: [{ actionID: "root" }] }),
-			action("right", { dependsOn: [{ actionID: "root" }] }), action("leaf", {
-				dependsOn: [{ actionID: "left" }, { actionID: "right" }, { actionID: "left" }],
-			})];
-		plan.apply(proposal(order === "reverse" ? actions.reverse() : actions), 0);
-		const frontiers = plan.workflowFrontiers(() => true);
-		expect(Object.fromEntries(frontiers.map(({ node, prerequisites }) => [node.action.id, ids(prerequisites)])))
-			.toEqual({ left: ["root"], right: ["root"], leaf: ["root"] });
-		expect(Object.isFrozen(frontiers)).toBe(true);
-		for (const row of frontiers) { expect(Object.isFrozen(row)).toBe(true); expect(Object.isFrozen(row.prerequisites)).toBe(true); }
-		const execution = new CandidateExecution<string>("shared");
-		plan.attachExecution("plan", "root", "root-candidate", execution);
-		execution.start(0); execution.succeed("root-output", new TimelineInterval(0, 1), 1);
-		expect(plan.workflowFrontiers(() => true).map(({ node, prerequisites }) => [node.action.id, ids(prerequisites)]))
-			.toEqual([["leaf", ["left", "right"]]]);
-	});
-
-	it("collapses already shared physical prerequisites without merging independent executions", () => {
-		const plan = new PlanRuntime();
-		plan.apply(proposal([action("first"), action("second"), action("leaf", {
-			dependsOn: [{ actionID: "first" }, { actionID: "second" }],
-		})]), 0);
-		expect(ids(plan.workflowFrontiers(() => true)[0]!.prerequisites)).toEqual(["first", "second"]);
-		const execution = new CandidateExecution<string>("shared");
-		for (const id of ["first", "second"]) plan.attachExecution("plan", id, "one-candidate", execution);
-		execution.start(0);
-		expect(ids(plan.workflowFrontiers(() => true)[0]!.prerequisites)).toEqual(["first"]);
-	});
-
-	it.each(["ineligible-root", "ineligible-child", "failed-root", "failed-child", "settled-root", "settled-child", "adoption-wait"] as const)(
-		"excludes workflow value behind %s", (mode) => {
-			const plan = new PlanRuntime();
-			plan.apply(proposal([action("root"), action("child", {
-				dependsOn: [{ actionID: "root", condition: mode === "adoption-wait" ? "actor_adopted" : "execution_succeeded" }],
-			})]), 0);
-			if (mode.startsWith("failed-")) plan.rejectExecution(plan.get("plan", mode.slice(7))!.identity, cause("execution", "unavailable"));
-			if (mode.startsWith("settled-")) plan.opportunity("plan", mode.slice(8))!.unobserve(cause("control", "expired"));
-			if (mode === "adoption-wait") {
-				const execution = new CandidateExecution<string>("shared");
-				plan.attachExecution("plan", "root", "root-candidate", execution);
-				execution.start(0); execution.succeed("root-output", new TimelineInterval(0, 1), 1);
-			}
-			expect(plan.workflowFrontiers(node => mode !== `ineligible-${node.action.id}`)).toEqual([]);
-		},
-	);
-
-	it("follows identity-pinned cross-source prerequisites and ignores completed execution edges", () => {
-		const plan = new PlanRuntime();
-		plan.apply(proposal([action("root"), action("finished")]), 0);
-		const edges = ["root", "finished"].map(actionID => ({ proposalID: "plan", actionID,
-			identity: plan.get("plan", actionID)!.identity.id, condition: "execution_succeeded" as const }));
-		plan.apply({ id: "peer", source: "peer", revision: 1, actions: [action("leaf", { dependsOn: edges })] }, 0);
-		const execution = new CandidateExecution<string>("shared");
-		plan.attachExecution("plan", "finished", "finished-candidate", execution);
-		execution.start(0); execution.succeed("output", new TimelineInterval(0, 1), 1);
-		expect(plan.workflowFrontiers(() => true).map(({ node, prerequisites }) => [node.proposalID, node.action.id, ids(prerequisites)]))
-			.toEqual([["peer", "leaf", ["root"]]]);
-		plan.apply({ proposalID: "plan", source: "source", revision: 2, upsert: [action("root", { input: { path: "replacement" } })] }, 0);
-		expect(plan.workflowFrontiers(() => true)).toEqual([]);
-	});
-
 	it("keeps internal preparation within its Actor batch and pins capability identity", () => {
 		const plan = new PlanRuntime(), operation = Object.freeze({ backend: "process", identity: "exec", permissionHash: "parent",
-			executionMs: 2, expectedDurationMs: 3 });
+			executionMs: 2 });
 		const prepare: PlanAction = { ...action("prepare"), type: "operation", operation };
 		const after = action("after", { dependsOn: [{ actionID: "prepare", condition: "execution_settled" }] });
 		expect(plan.apply(proposal([prepare, after]), 0)).toMatchObject({ accepted: true });
@@ -339,10 +276,10 @@ describe("PlanRuntime", () => {
 		plan.apply(proposal(actions), 4);
 
 		expect(plan.plan("plan")!.actions.map((action) => action.id)).toEqual(actions.map((action) => action.id));
-		expect(plan.get("plan", "short")).toMatchObject({ expectedDecisionSeq: 5, latestDecisionSeq: 8, criticalPathMs: 91 });
-		expect(plan.get("plan", "critical")).toMatchObject({ expectedDecisionSeq: 5, latestDecisionSeq: 9, criticalPathMs: 101 });
-		expect(plan.get("plan", "child")).toMatchObject({ earliestDecisionSeq: 6, expectedDecisionSeq: 6, latestDecisionSeq: 10, criticalPathMs: 81 });
-		expect(plan.get("plan", "leaf")).toMatchObject({ earliestDecisionSeq: 7, expectedDecisionSeq: 9, latestDecisionSeq: 12, criticalPathMs: 1 });
+		expect(plan.get("plan", "short")).toMatchObject({ expectedDecisionSeq: 5, latestDecisionSeq: 8, criticalPathSteps: 3 });
+		expect(plan.get("plan", "critical")).toMatchObject({ expectedDecisionSeq: 5, latestDecisionSeq: 9, criticalPathSteps: 3 });
+		expect(plan.get("plan", "child")).toMatchObject({ earliestDecisionSeq: 6, expectedDecisionSeq: 6, latestDecisionSeq: 10, criticalPathSteps: 2 });
+		expect(plan.get("plan", "leaf")).toMatchObject({ earliestDecisionSeq: 7, expectedDecisionSeq: 9, latestDecisionSeq: 12, criticalPathSteps: 1 });
 		const identity = plan.get("plan", "child")!.identity;
 		expect(ids(plan.launchable()).sort()).toEqual(["critical", "short"]);
 
@@ -350,25 +287,25 @@ describe("PlanRuntime", () => {
 		const opportunity = plan.claimMatch("plan", "critical", actor, { kind: "exact", distance: 0 })!;
 		plan.confirm(opportunity, actor, { status: "adopted", candidateID: "candidate" });
 		expect(plan.get("plan", "child")).toMatchObject({ earliestDecisionSeq: 8, expectedDecisionSeq: 8, latestDecisionSeq: 9 });
-		expect(plan.get("plan", "leaf")).toMatchObject({ earliestDecisionSeq: 9, expectedDecisionSeq: 9, latestDecisionSeq: 12, criticalPathMs: 1 });
+		expect(plan.get("plan", "leaf")).toMatchObject({ earliestDecisionSeq: 9, expectedDecisionSeq: 9, latestDecisionSeq: 12, criticalPathSteps: 1 });
 		const revisedChild = { ...child, horizon: 2, latestHorizon: 4, expectedDurationMs: 3.5 };
 		expect(plan.apply({ proposalID: "plan", source: "source", revision: 3, upsert: [revisedChild] }, 4))
 			.toMatchObject({ accepted: true, retired: [] });
 		expect(plan.get("plan", "child")!.identity).toBe(identity);
-		expect(plan.get("plan", "child")).toMatchObject({ earliestDecisionSeq: 8, expectedDecisionSeq: 8, latestDecisionSeq: 9, criticalPathMs: 4.5 });
-		expect(plan.get("plan", "short")!.criticalPathMs).toBe(14.5);
-		expect(plan.get("plan", "critical")!.criticalPathMs).toBe(24.5);
+		expect(plan.get("plan", "child")).toMatchObject({ earliestDecisionSeq: 8, expectedDecisionSeq: 8, latestDecisionSeq: 9, criticalPathSteps: 2 });
+		expect(plan.get("plan", "short")!.criticalPathSteps).toBe(3);
+		expect(plan.get("plan", "critical")!.criticalPathSteps).toBe(3);
 		expect(plan.apply({ proposalID: "plan", source: "source", revision: 4, remove: ["leaf"] }, 4).accepted).toBe(true);
-		expect(plan.get("plan", "child")!.criticalPathMs).toBe(3.5);
-		expect(plan.get("plan", "short")!.criticalPathMs).toBe(13.5);
-		expect(plan.get("plan", "critical")!.criticalPathMs).toBe(23.5);
+		expect(plan.get("plan", "child")!.criticalPathSteps).toBe(1);
+		expect(plan.get("plan", "short")!.criticalPathSteps).toBe(2);
+		expect(plan.get("plan", "critical")!.criticalPathSteps).toBe(2);
 		expect(plan.apply({ proposalID: "plan", source: "source", revision: 5, upsert: [
 			{ ...short, dependsOn: [{ actionID: "child" }] },
 			{ ...revisedChild, dependsOn: [{ actionID: "critical", condition: "execution_succeeded" }] },
 		] }, 8).accepted).toBe(true);
-		expect(plan.get("plan", "short")).toMatchObject({ earliestDecisionSeq: 10, expectedDecisionSeq: 12, latestDecisionSeq: 14, criticalPathMs: 10 });
-		expect(plan.get("plan", "child")).toMatchObject({ earliestDecisionSeq: 9, expectedDecisionSeq: 11, latestDecisionSeq: 13, criticalPathMs: 13.5 });
-		expect(plan.get("plan", "critical")).toMatchObject({ earliestDecisionSeq: 7, expectedDecisionSeq: 7, latestDecisionSeq: 7, criticalPathMs: 33.5 });
+		expect(plan.get("plan", "short")).toMatchObject({ earliestDecisionSeq: 10, expectedDecisionSeq: 12, latestDecisionSeq: 14, criticalPathSteps: 1 });
+		expect(plan.get("plan", "child")).toMatchObject({ earliestDecisionSeq: 9, expectedDecisionSeq: 11, latestDecisionSeq: 13, criticalPathSteps: 2 });
+		expect(plan.get("plan", "critical")).toMatchObject({ earliestDecisionSeq: 7, expectedDecisionSeq: 7, latestDecisionSeq: 7, criticalPathSteps: 3 });
 		expect(plan.plan("plan")!.actions.map((action) => action.id)).toEqual(actions.filter((action) => action.id !== "leaf").map((action) => action.id));
 		for (const invalid of [
 			[action("a", { dependsOn: [{ actionID: "missing" }] })],

@@ -1,15 +1,13 @@
 import { describe, expect, test } from "vitest";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { PatternAwareStore, patternAwareActionSemantics, patternAwareSettings, PATTERN_AWARE_DEFAULTS, PATTERN_AWARE_PRESETS,
-	type PatternAwareEventInput, type PatternAwarePresetID, type PatternAwareReuseFeedback } from "../src/pattern-aware.ts";
+	type PatternAwareEventInput, type PatternAwarePresetID } from "../src/pattern-aware.ts";
 import { createPatternPlanSource } from "../src/pattern-plan-source.ts";
 import type { AgentPlanSource } from "../src/agent-runtime-types.ts";
-import type { ActorActionFeedback } from "../src/runtime.ts";
 import type { ExecutionOperationBinding } from "../src/execution-world.ts";
-import { TimelineInterval } from "../src/task-timing.ts";
 import { testModel } from "./model.ts";
 import { textResult } from "./result.ts";
-import { unmatchedSettlement, unobservedSettlement } from "./prediction.ts";
+import { unmatchedSettlement } from "./prediction.ts";
 
 function fixture(preset: PatternAwarePresetID, exists?: (target: string) => boolean) {
 	const settings = patternAwareSettings({ presets: [preset] });
@@ -36,15 +34,7 @@ function sourceFixture(preset: PatternAwarePresetID) {
 			sourceConfig: { patternAware: { ...observed.settings, multiStepEnabled: false } } },
 		definitions: [], candidateNames: ["read", "bash"], proposalIndex: 0, proposalCount: 1, signal: new AbortController().signal,
 	};
-	let calls = 0;
-	const consume = (reusedComputations: ActorActionFeedback<string>["reusedComputations"], candidateFeedback?: unknown) => controller.actorActionSettled({
-		sessionID: "session", turnID: "later", candidateFeedback, reusedComputations,
-		computation: { actorComputeMs: 10, reusedExecutionMs: 10000 }, // The whole call's total is not this mode's credit.
-		settlement: { actorAction: { id: `consumer-${++calls}`, sequence: calls, turnID: "later" }, tool: "read", matchedPredictions: [], rejections: [],
-			provider: { kind: "actor", origin: "fallback", cause: { stage: "matching", code: "no_candidate" }, durationMs: 10, isError: false,
-				toolExecution: new TimelineInterval(0, 10) } },
-	});
-	return { ...observed, controller, request, consume };
+	return { ...observed, controller, request };
 }
 
 describe("observed search presets", () => {
@@ -63,7 +53,7 @@ describe("observed search presets", () => {
 		observe("grep", query, { schemaHash: "grep-v1", outputPaths: ["./src/../src/a.ts"], durationMs: 1500 });
 		observe("edit", { path: "src/a.ts", oldText: "old.name", newText: "new.name" }, { learnTarget: false });
 		const candidate = predict({ grep: "grep-v1" })[0]!;
-		expect(candidate).toMatchObject({ tool: "grep", input: query, presetID: "recheck-search", patternID: "structural:recheck-search", expectedDurationMs: 1500 });
+		expect(candidate).toMatchObject({ tool: "grep", input: query, presetID: "recheck-search", patternID: "structural:recheck-search" });
 		expect(predict()).toEqual([]);
 		expect(predict({ grep: "grep-v2" })).toEqual([]);
 		expect(store.predict("session", { grep: "grep-v1" }, { ...settings, presets: [] }).some(item => item.presetID)).toBe(false);
@@ -136,66 +126,15 @@ describe("observed search presets", () => {
 	});
 });
 
-describe("preset computation feedback", () => {
-	test("ranks from physical owner reuse after prediction and session settlement without changing probabilities or selections", async () => {
-		const test = sourceFixture("result-neighbors"), { controller, store, request, observe, predict, consume } = test;
-		const observations = () => { observe("find", {}, { outputPaths: ["src/a.ts", "src/b.ts"] });
-			observe("read", { path: "src/a.ts" }, { durationMs: 100, learnTarget: false }); };
-		try {
-			observations();
-			const before = predict()[0]!;
-			const proposal = await controller.source.propose(request);
-			if (!proposal || !("actions" in proposal)) throw new Error("missing preset proposal");
-			const action = proposal.actions.find(action => action.mode === "result-neighbors")!;
-			const token = action.reuseFeedback as PatternAwareReuseFeedback, foreign = store.presetReuseFeedback("reported-files");
-			expect(Object.isFrozen(token)).toBe(true);
-			expect(Object.keys(token).sort()).toEqual(["kind", "utility"]);
-			expect(Object.keys(token.utility).sort()).toEqual(["productionMs", "productions", "reusedExecutionMs"]);
-			const feedback = { proposalID: proposal.id, actionID: action.id, feedback: action.feedback };
-			await controller.source.onIssued!(feedback);
-			expect(token.utility.productions).toBe(0); // Predicting or sharing a candidate is not another physical production.
-			await controller.source.onExecutionSettled!({ reuseFeedback: token, status: "succeeded", executionMs: 400 });
-			await controller.source.onSettled!({ ...feedback, settlement: unobservedSettlement("control", "turn_closed") });
-			const unused = predict()[0]!;
-			expect(unused.expectedLatencyBenefitMs).toBeLessThan(before.expectedLatencyBenefitMs);
-			expect(unused).toMatchObject({ empiricalProbability: before.empiricalProbability, adoptionProbability: before.adoptionProbability });
-			await controller.finishSession();
-			expect(store.recent("session")).toEqual([]);
-			consume([{ source: "pattern_aware", feedback: token, reusedExecutionMs: 300 },
-				{ source: "drafter", feedback: token, reusedExecutionMs: 900 },
-				{ source: "pattern_aware", feedback: action.feedback, reusedExecutionMs: 900 }], foreign);
-			consume([{ source: "pattern_aware", feedback: token, reusedExecutionMs: 300 }]);
-			expect(token.utility).toEqual({ productions: 1, productionMs: 400, reusedExecutionMs: 600 });
-			expect(foreign.utility).toEqual({ productions: 0, productionMs: 0, reusedExecutionMs: 0 });
-			observations();
-			expect(predict()[0]!.expectedLatencyBenefitMs).toBeGreaterThan(before.expectedLatencyBenefitMs);
-			expect(store.predict("session", {}, { ...test.settings, presets: [] }).some(candidate => candidate.presetID)).toBe(false);
-			expect(predict()[0]!.presetID).toBe("result-neighbors");
-		} finally { await controller.dispose(); }
-	});
+describe("preset command preparation", () => {
 
-	test("includes failed and cancelled production costs while leaving a positive exploration floor", async () => {
-		const { store, controller, consume } = sourceFixture("recheck-search"), token = store.presetReuseFeedback("recheck-search");
-		try {
-			for (const status of ["succeeded", "failed", "cancelled"] as const)
-				await controller.source.onExecutionSettled!({ reuseFeedback: token, status, executionMs: 10000 });
-			for (const executionMs of [-1, Infinity, NaN]) await controller.source.onExecutionSettled!({ reuseFeedback: token, status: "failed", executionMs });
-			consume([-1, Infinity, NaN].map(reusedExecutionMs => ({ source: "pattern_aware", feedback: token, reusedExecutionMs })));
-			expect(token.utility).toEqual({ productions: 3, productionMs: 30000, reusedExecutionMs: 0 });
-			const unused = store.presetExpectedBenefit("recheck-search", 50, 100);
-			expect(unused).toBeGreaterThan(0); expect(unused).toBeLessThan(50);
-			consume([{ source: "pattern_aware", feedback: token, reusedExecutionMs: 30000 }]);
-			expect(store.presetExpectedBenefit("recheck-search", 50, 100)).toBeGreaterThan(unused);
-			expect(store.presetExpectedBenefit("reported-files", 50, 100)).toBe(50);
-		} finally { await controller.dispose(); }
-	});
 
-	test.for(["recent-command", "retry-failed-command"] as const)("attaches measured utility to %s preparation", async preset => {
-		const { controller, store, request, consume } = sourceFixture(preset), command = { command: "build" };
+	test.for(["recent-command", "retry-failed-command"] as const)("prepares %s from current workspace changes", async preset => {
+		const { controller, request } = sourceFixture(preset), command = { command: "build" };
 		const schemaHashes: Readonly<Record<string, string>> = { bash: "schema", write: "schema" };
 		const native = preset === "recent-command", action = PI_ACTION_SEMANTICS.buildKey("bash", command, "/workspace", schemaHashes.bash)!;
 		const operation: ExecutionOperationBinding = { backend: "test", identity: "worker", permissionHash: action.hash, available: true,
-			executionMs: 500, expectedDurationMs: 600, preparation: "current_workspace", stale: async () => true };
+			executionMs: 500, preparation: "current_workspace", stale: async () => true };
 		const observe = (tool: string, concrete: Record<string, unknown>, isError = false) => controller.source.observe!({ ...request, data: { ...request.data, schemaHashes },
 			consumeInput: { sessionID: "session", turnID: "producer", tool, args: concrete, tools: [] },
 			action: PI_ACTION_SEMANTICS.buildKey(tool, concrete, "/workspace", schemaHashes[tool])!, tool, concrete, order: 0, durationMs: 500,
@@ -204,15 +143,12 @@ describe("preset computation feedback", () => {
 			await observe("bash", command, !native);
 			const first = await observe("write", { path: "src/a.ts", content: "changed" });
 			if (!first || !("actions" in first)) throw new Error("missing command preparation");
-			const prepared = first.actions[0]!, token = prepared.reuseFeedback as PatternAwareReuseFeedback;
-			expect(prepared.mode).toBe(preset); expect(token.utility).toBe(store.presetReuseFeedback(preset).utility);
+			const prepared = first.actions[0]!;
+			expect(prepared.mode).toBe(preset);
 			await controller.source.onAdmitted!({ proposalID: first.id, actionID: prepared.id, feedback: prepared.feedback });
-			await controller.source.onExecutionSettled!({ reuseFeedback: token, status: "succeeded", executionMs: 600 });
-			consume([{ source: "pattern_aware", feedback: token, reusedExecutionMs: 1200 }]);
 			const next = await observe("write", { path: "src/a.ts", content: "changed again" });
 			if (!next || !("actions" in next)) throw new Error("missing next command preparation");
-			expect(next.actions[0]!.expectedLatencyBenefitMs).toBeGreaterThan(prepared.expectedLatencyBenefitMs!);
-			expect((next.actions[0]!.reuseFeedback as PatternAwareReuseFeedback).utility).toBe(token.utility);
+			expect(next.actions[0]!.mode).toBe(preset);
 		} finally { await controller.dispose(); }
 	});
 });

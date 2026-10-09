@@ -52,7 +52,7 @@ export interface AuthoritativeResultCapture<Output> extends WorldResultCapture<O
 
 /** A validated, concrete prediction suitable for a target-model draft verifier. */
 export interface MaterializedSpeculativeCandidate<SessionID> extends Pick<PlanAction,
-	"tool" | "depth" | "horizon" | "conditionalProbability" | "empiricalProbability" | "adoptionProbability" | "expectedLatencyBenefitMs" | "expectedDurationMs">, TurnIdentity<SessionID> {
+	"tool" | "depth" | "horizon" | "conditionalProbability" | "empiricalProbability" | "adoptionProbability" | "expectedDurationMs">, TurnIdentity<SessionID> {
 	/** Absolute Actor decision that this prediction is expected to match. */
 	readonly expectedDecisionSequence: number;
 	/** Last Actor decision for which the prediction may still be considered. */
@@ -283,9 +283,8 @@ export interface SpeculativeActionRuntimeAdapter<
 }
 
 export interface SpeculativeRuntimeInspection {
-	readonly resources?: {
-		readonly cpuCount: number;
-		readonly idleCpuCount?: number;
+	readonly resources?: import("./system-resources.ts").ExecutionResourceSnapshot & {
+		readonly reserved: import("./system-resources.ts").HardwareResources;
 		readonly admissionCapacity: number;
 		readonly actorUnits: number;
 		readonly preparationUnits: number;

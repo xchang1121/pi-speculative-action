@@ -9,7 +9,7 @@ import { KEYABLE_TOOLS, OBSERVATION_ACTION_TOOLS, PI_ACTION_SEMANTICS, UNBOUNDED
 	WORKSPACE_MUTATION_ACTION_TOOLS } from "./action-semantics.ts";
 import { ActorStreamPreviewTracker } from "./actor-stream-preview.ts";
 import { createResourceSnapshotExecutionWorld, type AgentExecutionWorld } from "./agent-execution-world.ts";
-import { createSpeculativeActionHost, normalizeSpeculativeAgentSettings, type ActionDrafterGateSnapshot, type CreateSpeculativeActionHostOptions } from "./agent-integration.ts";
+import { createSpeculativeActionHost, normalizeSpeculativeAgentSettings, type ActionDrafterBudgetSnapshot, type CreateSpeculativeActionHostOptions } from "./agent-integration.ts";
 import { DrafterTaskBudget } from "./drafter-budget.ts";
 import { toolSpeedup } from "./task-timing.ts";
 import { forceToolChoice } from "./drafter-plan-source.ts";
@@ -71,11 +71,6 @@ const SELF_SPECULATION_INPUTS = {
 		return /^https?:\/\/[^\s]+$/u.test(value) ? { ok: true, value } : { ok: false, error: "Endpoint must be an absolute HTTP(S) URL." };
 	}),
 	forkActionMinConfidence: probabilityInput("Minimum tool-name confidence"),
-	forkGateMinSamples: positiveIntegerInput("Benefit-gate warm-up samples"),
-	forkGateWindowSize: positiveIntegerInput("Benefit-gate rolling window"),
-	forkGateMinNetBenefitMs: nonNegativeNumberInput("Minimum expected time saved (ms)"),
-	forkGateProbeInterval: positiveIntegerInput("Recovery probe interval"),
-	forkGateFailureThreshold: positiveIntegerInput("Consecutive-failure limit"),
 	maxCandidates: positiveIntegerInput("Candidates sent per Actor decision"),
 	maxDraftTokens: positiveIntegerInput("Draft-token limit per candidate"),
 	actorProfile: nonEmptyTextInput("Actor tool-call Profile ('auto' to derive)"),
@@ -177,7 +172,7 @@ export function formatSpeculativeActionStatus(input: {
 		`Prediction wait limit: ${formatDuration(settings.predictionTimeoutMs)}`,
 		`Learned patterns: ${settings.patternAware.enabled ? "On" : "Off"}; follow-up steps: ${settings.patternAware.multiStepEnabled ? "On" : "Off"} (alternatives/tool ${settings.patternAware.beamWidth}, depth ${settings.patternAware.maxPredictionDepth}, learn after ${settings.patternAware.minOccurrences}, gap ${settings.patternAware.maxFutureGap}, coverage ${formatPercent(settings.patternAware.futureGapCoverage)}, half-life ${settings.patternAware.decayHalfLifeEvents})`,
 		`Prebuilt modes: ${settings.patternAware.presets.length}/${PATTERN_AWARE_PRESETS.length} selected${settings.patternAware.enabled ? "" : " (inactive)"}; ${PATTERN_AWARE_PRESETS.filter(preset => settings.patternAware.presets.includes(preset.id)).map(preset => preset.label).join(", ") || "None"}`,
-		`Actor probe: ${self.enabled && self.forkEnabled ? `On (${self.forkTransport})` : "Off"}; target verification ${self.enabled ? "On" : "Off"}; early tool execution ${self.enabled && self.forkTransport !== "provider" && self.forkEnabled && self.forkActionEnabled ? self.forkTransport === "drafter" ? "On (Drafter)" : `On (tool-name confidence ≥${formatPercent(self.forkActionMinConfidence)})` : "Off"}; benefit control ${self.forkGateEnabled ? `On (${self.forkGateWindowSize} samples, ≥${formatDuration(self.forkGateMinNetBenefitMs)} net)` : "Off"}; ${self.maxCandidates} candidates × ${self.maxDraftTokens} draft tokens; Actor Profile=${self.actorProfile}; ${self.draftFormat} (${syntaxSettingLabel(self.draftBoundary)} boundary); ${self.forkTransport === "sidecar" ? self.endpoint : FORK_TRANSPORT_LABELS[self.forkTransport]}`,
+		`Actor probe: ${self.enabled && self.forkEnabled ? `On (${self.forkTransport})` : "Off"}; target verification ${self.enabled ? "On" : "Off"}; early tool execution ${self.enabled && self.forkTransport !== "provider" && self.forkEnabled && self.forkActionEnabled ? self.forkTransport === "drafter" ? "On (Drafter)" : `On (tool-name confidence ≥${formatPercent(self.forkActionMinConfidence)})` : "Off"}; ${self.maxCandidates} candidates × ${self.maxDraftTokens} draft tokens; Actor Profile=${self.actorProfile}; ${self.draftFormat} (${syntaxSettingLabel(self.draftBoundary)} boundary); ${self.forkTransport === "sidecar" ? self.endpoint : FORK_TRANSPORT_LABELS[self.forkTransport]}`,
 		`Prediction tools: ${toolsSummary(settings.tools)}`,
 		`Execution routing: unified ${settings.executionRouting.primary ? "On" : "Off"}; native fallback ${settings.executionRouting.nativeFallback ? "On" : "Off"}; Actor always available`,
 		`Search execution when enabled: ${searchExecutionLabel(settings.searchExecution)}`,
@@ -332,7 +327,7 @@ async function installController(
 		draftFork: async ({ model, context: actorContext, reasoning, content, signal }) => {
 			const message = await drafterBudget.run({ model: draftModelFor(model), context: { ...actorContext, messages: [...actorContext.messages, { role: "user", timestamp: Date.now(),
 				content: `The assistant has begun its next reply. Its reasoning so far:\n<reasoning>\n${reasoning}\n</reasoning>${content ? `\nIts reply so far:\n${content}` : ""}\nCall exactly the tool or tools it is about to call next, with the arguments it will use.` }] },
-				options: { signal, maxTokens: settings().drafterMaxTokens, onPayload: forceToolChoice(undefined) }, policy: settings(), complete: completeDraft, marginal: true });
+				options: { signal, maxTokens: settings().drafterMaxTokens, onPayload: forceToolChoice(undefined) }, policy: settings(), complete: completeDraft });
 			return message?.content.flatMap((item) => item.type === "toolCall" ? [{ tool: item.name, input: item.arguments }] : []) ?? [];
 		},
 	});
@@ -465,7 +460,7 @@ async function installController(
 			selfSpeculation.startTurn(turnID, actorModel, actorContext, decisionSequence),
 		onCandidateMaterialized: (candidate) => selfSpeculation.addCandidate(candidate),
 		onActorActionMaterialized: ({ action }) => selfSpeculation.observeActorAction(action),
-		onActorActionSettled: ({ settlement, reusedComputations }) => selfSpeculation.observeActorSettlement(settlement, reusedComputations),
+		onActorActionSettled: ({ settlement }) => selfSpeculation.observeActorSettlement(settlement),
 		onPredictionSettled: (feedback) => selfSpeculation.observePredictionSettlement(feedback),
 		onEvent: (event) => {
 			currentMetrics = reduceSpeculativeTrace(currentMetrics, event);
@@ -603,7 +598,7 @@ async function installController(
 			const effective = settings();
 			return [
 				formatSpeculativeActionStatus({ settings: { ...effective, tools: runtimeSettings().tools }, metrics: visibleMetrics() }),
-				formatDrafterGateStatus(effective.drafterGateEnabled, host.drafterGateSnapshot()),
+				formatDrafterBudgetStatus(host.drafterBudgetSnapshot()),
 				formatSelfSpeculationStatus(selfSpeculation.snapshot()),
 				executionWorldSummary(toolCapabilities(), executionRoutes()),
 				`Custom tool conflicts: ${toolConflictSummary(toolConflicts)}`,
@@ -830,7 +825,6 @@ function openDrafterSettings(ctx: ExtensionContext, controller: SpeculativeActio
 			input("candidateLimit", "Candidate requests per decision"),
 			[`Advanced settings › sampling, follow-up steps, cost control`, () => openDrafterSettings(ctx, controller, true)],
 		] : [
-			toggle("drafterGateEnabled", "Pause drafts on estimated negative utility"),
 			toggle("drafterPatternHints", "Show PatternAware's expected calls"),
 			input("drafterMaxDepth", "Follow-up tool steps"),
 			input("drafterMaxTokens", "Maximum output tokens"),
@@ -842,7 +836,7 @@ function openDrafterSettings(ctx: ExtensionContext, controller: SpeculativeActio
 	});
 }
 
-type ActorForkMenu = "basic" | "advanced" | "integration" | "fork" | "target" | "benefit";
+type ActorForkMenu = "basic" | "advanced" | "integration" | "fork" | "target";
 
 function openActorForkSettings(
 	ctx: ExtensionContext,
@@ -855,7 +849,6 @@ function openActorForkSettings(
 		integration: "Integration and authentication",
 		fork: "Fork decoding",
 		target: "Target verification",
-		benefit: "Benefit control",
 	};
 	return runActionMenuLoop(ctx, titles[menu], () => {
 		const settings = controller.settings();
@@ -866,14 +859,13 @@ function openActorForkSettings(
 		if (menu === "basic") {
 			const active = self.enabled && self.forkEnabled;
 			actions.set(`Actor probe prediction: ${active ? "On" : "Off"}`, () => save({ ...self, enabled: active ? self.enabled : true, forkEnabled: !active }));
-			actions.set("Advanced settings › integration, decoding, verification, benefit control", () => openActorForkSettings(ctx, controller, "advanced"));
+			actions.set("Advanced settings › integration, decoding, verification", () => openActorForkSettings(ctx, controller, "advanced"));
 			if (self.forkTransport !== "provider") actions.set(...toggle("forkActionEnabled", "Use forked calls for tool pre-execution"));
 			if (self.forkTransport === "sidecar" && self.forkActionEnabled) actions.set(...input("forkActionMinConfidence", undefined, formatPercent));
 		} else if (menu === "advanced") {
 			actions.set(`Integration and authentication › ${FORK_TRANSPORT_LABELS[self.forkTransport]}`, () => openActorForkSettings(ctx, controller, "integration"));
 			actions.set(`Fork decoding › ${self.forkDecoder}, ${self.forkMaxTokens} tokens`, () => openActorForkSettings(ctx, controller, "fork"));
 			actions.set(`Target verification › ${self.maxCandidates} candidates × ${self.maxDraftTokens} tokens`, () => openActorForkSettings(ctx, controller, "target"));
-			actions.set(`Benefit control › ${self.forkGateEnabled ? "Adaptive pause on" : "Always fork"}`, () => openActorForkSettings(ctx, controller, "benefit"));
 		} else if (menu === "integration") {
 			actions.set(`Integration: ${FORK_TRANSPORT_LABELS[self.forkTransport]}`, async () => {
 				const selected = await ctx.ui.select("Actor probe integration", [...Object.values(FORK_TRANSPORT_LABELS), BACK]);
@@ -897,16 +889,8 @@ function openActorForkSettings(
 			actions.set(...input("actorProfile", "Actor Profile"));
 			actions.set(...input("draftFormat", "Tool-call format override"));
 			actions.set(...input("draftBoundary", "Tool-call boundary", syntaxSettingLabel));
-		} else {
-			actions.set(...toggle("forkGateEnabled", "Pause forks that stop saving time"));
-			if (self.forkGateEnabled) {
-				actions.set(...input("forkGateMinSamples", "Warm-up samples"));
-				actions.set(...input("forkGateWindowSize", "Rolling samples"));
-				actions.set(...input("forkGateMinNetBenefitMs", "Minimum expected time saved", formatDuration));
-				actions.set(...input("forkGateProbeInterval"));
-				actions.set(...input("forkGateFailureThreshold"));
-			}
 		}
+
 		return actions;
 	});
 }
@@ -1300,9 +1284,9 @@ function syntaxSettingLabel(value: string): string {
 	return value === "auto" ? "automatic" : value;
 }
 
-function formatDrafterGateStatus(enabled: boolean, gate: ActionDrafterGateSnapshot): string {
-	const budget = gate.budget;
-	return `Action Drafter gate: ${enabled ? "On" : "Off"}; ${gate.skippedBatches} batches skipped, ${gate.samples} samples${gate.expectedNetBenefitMs === undefined ? ", benefit unmeasured" : `, ${formatDuration(gate.expectedNetBenefitMs)} budget estimate`}; task budget: ${budget.requests} requests, ${budget.reportedTokens} reported + ${budget.unreportedTokens} estimated without usage + ${budget.reservedTokens} reserved tokens, ${budget.skippedRequests} requests skipped`;
+function formatDrafterBudgetStatus(snapshot: ActionDrafterBudgetSnapshot): string {
+	const budget = snapshot.budget;
+	return `Action Drafter task budget: ${budget.requests} requests, ${budget.reportedTokens} reported + ${budget.unreportedTokens} estimated without usage + ${budget.reservedTokens} reserved tokens, ${budget.skippedRequests} requests skipped`;
 }
 
 const FORK_TRANSPORT_LABELS: Readonly<Record<SelfSpeculationSettings["forkTransport"], string>> = { provider: "Provider-integrated", sidecar: "Sidecar service", drafter: "Drafter reads Actor reasoning" };
@@ -1316,7 +1300,7 @@ function formatSelfSpeculationStatus(bridge: SelfSpeculationCoordinatorSnapshot)
 				]
 			: []),
 		`${bridge.candidateSubmissions} bundles/${bridge.candidateReceipts} receipts`,
-		`${bridge.forkRequests}/${bridge.forkCompletions} probes completed (${bridge.forkRetries} later-snapshot retries), ${bridge.forkGateSkips} gated${bridge.forkGateExpectedNetBenefitMs === undefined ? ", benefit unmeasured" : ` at ${formatDuration(bridge.forkGateExpectedNetBenefitMs)} budget estimate`}`,
+		`${bridge.forkRequests}/${bridge.forkCompletions} probes completed (${bridge.forkRetries} later-snapshot retries)`,
 		`${bridge.forkCandidates} fork candidates (${bridge.forkAgreements} source agreements, ${bridge.forkExactMatches} exact Actor matches)`,
 		`${bridge.submittedDraftTokens} draft tokens registered (${bridge.acceptedDraftTokens} acknowledged)`,
 		`${bridge.verifiedAcceptedDraftTokens}/${bridge.verifiedDraftTokens} target-verified accepted, ${bridge.verifiedRejectedDraftTokens} rejected, ${bridge.unresolvedDraftTokens} unresolved`,

@@ -94,7 +94,6 @@ export interface ExecutionOperationBinding {
 	readonly permissionHash: string;
 	readonly executionMs: number;
 	/** Isolated service estimate, including observed preparation and capture. */
-	readonly expectedDurationMs: number;
 	/** Whether a run now would redo it: no result of it the backend holds is still valid for the workspace. */
 	readonly stale?: () => Promise<boolean>;
 	/** It reads what another process writes while it runs: alone, it runs only up to that input. */

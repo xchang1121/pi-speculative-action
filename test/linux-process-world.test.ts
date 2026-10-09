@@ -18,7 +18,7 @@ import { inspectHeldExecProcess, LinuxHeldExecBoundary, type HeldExecProcess, ty
 import { effectCommitFailure } from "../src/effect-transaction.ts";
 import { LinuxProcessReuseBackend, validateTransferredProcessEvidence } from "../src/linux-process-backend.ts";
 import { ProcessHandoffOwnership, ProcessHandoffRegistry, type ProcessHandoff, type ProcessExecutionBinding } from "../src/process-handoff.ts";
-import { SpeculationScheduler } from "../src/scheduler.ts";
+import * as scheduling from "../src/scheduler.ts";
 import { sha256Digest } from "../src/provenance-certificate.ts";
 import { createLinuxProcessExecutionWorld } from "../src/linux-process-world.ts";
 import { PI_OPERATION_TOOLS, resolvePiToolInvocation, createClosedSearchProfile } from "../src/pi-tool-invocation.ts";
@@ -32,7 +32,6 @@ import type { SpeculativeActionEvent } from "../src/events.ts";
 import { TaskTimeline } from "../src/task-timing.ts";
 import { testModel } from "./model.ts";
 import type { WorkspaceTransactionCapture } from "../src/workspace-transaction.ts";
-import { WorkspaceSandboxService, type SandboxWorkspaceContext } from "../src/workspace-sandbox.ts";
 import { commitBenchmarkFixture, compileBenchmarkHelper, createLinuxProcessBenchmark, forkReusableBash, prepareLinuxProcessReuse,
 	holdProcessPublication, textOutput } from "./linux-process-fixture.ts";
 
@@ -80,79 +79,6 @@ describe("Linux process ExecutionWorld", () => {
 		} finally { await fixture.dispose(); }
 	});
 
-	test.each(["completed", "failed", "cancelled", "completed-then-failed"] as const)("calibrates native preparation cost without crediting cancellation (%s)", async outcome => {
-		const root = await mkdtemp(path.join(os.tmpdir(), "pi-operation-timing-"));
-		const registry = new ProcessHandoffRegistry<null>(4, 128), scope = { sessionID: "timing", turnID: "native" };
-		const learned = registry.observe(sha256Digest("learned"), "/worker", scope, null, 10)!;
-		const prepared = registry.observe(sha256Digest("prepared"), "/worker", scope, null, 40)!;
-		const backend = new LinuxProcessReuseBackend({ storeRoot: path.join(root, "store") }), sandbox = new WorkspaceSandboxService();
-		const coordinator = new ProcessExecutionCoordinator(adaptProcessToolOperations(createLocalBashOperations()));
-		const world = createLinuxProcessExecutionWorld({ coordinator, backend, workspaceSandbox: sandbox, storeRoot: path.join(root, "store"), tools: PI_OPERATION_TOOLS.process });
-		let clock = 100, descriptor: ExecutionOperationBinding | undefined;
-		let executionOutcome = outcome === "completed-then-failed" ? "completed" : outcome;
-		const controller = new AbortController();
-		const timer = vi.spyOn(performance, "now").mockImplementation(() => clock);
-		vi.spyOn(backend, "observeBindings").mockImplementation(async (_scope, execute, observe) => { const result = await execute(); observe([learned], []); return result; });
-		vi.spyOn(sandbox, "qualify").mockImplementation(async () => { clock += 20; return { driver: "git", fingerprint: "test" }; });
-		vi.spyOn(backend, "open").mockImplementation(async () => {
-			clock += 5;
-			return { ownership: new ProcessHandoffOwnership(), executionBindings: () => [prepared], computationDependencies: () => [],
-				executeBinding: async () => {
-					clock += 40;
-					if (executionOutcome !== "completed") {
-						if (executionOutcome === "cancelled") controller.abort();
-						throw new Error("prepared operation failed");
-					}
-					return { output: [], exit: { kind: "code", code: 0 } };
-				},
-				executor: { execute: async () => { throw new Error("enclosing tool must not run"); } },
-				metrics: () => ({ ...emptyWorldReuseMetrics(), executionMs: 90 }),
-				seal: async () => { clock += 30; return []; }, close: async () => { clock += 5; },
-				validate: async () => ({ status: "valid", metrics: { bytesRead: 0, filesRead: 0, mode: "exact" } }) };
-		});
-		vi.spyOn(sandbox, "fork").mockImplementation(async input => {
-			clock += 10;
-			const workspace = {} as SandboxWorkspaceContext, output = await input.execute(workspace);
-			if ("output" in output) throw new Error("unexpected delta");
-			await input.afterCapture?.(workspace, { output, changes: [] }); clock += 10;
-			return { output, backend: world.id, resources: [], capturedBytes: 0, executionMetrics: {},
-				compatibility: { status: "compatible", backend: world.id, executionFingerprint: "test" }, commit: async () => output, dispose: async () => {} };
-		});
-		try {
-			const cwd = path.resolve(os.tmpdir()), args = { command: "worker" }, invocation = resolvePiToolInvocation("bash", args, { cwd, environment: {} })!;
-			const permission = PI_ACTION_SEMANTICS.buildKey("bash", args, cwd, "schema", { fingerprint: "test", context: invocation })!;
-			await world.observeOperations!({ action: permission, scope, learn: true }, async () => undefined, bindings => { descriptor = bindings[0]; });
-			expect(descriptor!.expectedDurationMs).toBe(10);
-			const action = buildActionKey({ ...permission, input: { operation: descriptor!.identity },
-				executionContext: { ...invocation, operation: { binding: descriptor!, permission } } });
-			const began = clock, pending = world.speculation.execute({ cwd, action, toolName: "bash", args, callID: "prepare",
-				tool: createBashTool(cwd), signal: controller.signal, executionScope: scope });
-			if (outcome === "failed" || outcome === "cancelled") {
-				await expect(pending).rejects.toThrow("prepared operation failed");
-				expect(clock - began).toBe(80);
-				expect(descriptor!.expectedDurationMs).toBe(outcome === "failed" ? 80 : 10);
-				expect(registry.observe(learned.key, "/worker", scope, null, 25)).toBe(learned);
-				expect(descriptor!.expectedDurationMs).toBe(outcome === "failed" ? 95 : 25);
-				return;
-			}
-			const branch = await pending;
-			try {
-				expect(clock - began).toBe(120);
-				expect(descriptor!.expectedDurationMs).toBe(120);
-				expect(branch.operations![0]!.expectedDurationMs).toBe(120);
-				expect(registry.observe(learned.key, "/worker", scope, null, 25)).toBe(learned);
-				expect(descriptor!.expectedDurationMs).toBe(135);
-			} finally { await branch.dispose(); }
-			if (outcome === "completed-then-failed") {
-				executionOutcome = "failed";
-				const retryBegan = clock;
-				await expect(world.speculation.execute({ cwd, action, toolName: "bash", args, callID: "retry",
-					tool: createBashTool(cwd), signal: controller.signal, executionScope: scope })).rejects.toThrow("prepared operation failed");
-				expect(clock - retryBegan).toBe(60);
-				expect(descriptor!.expectedDurationMs).toBe(135); // An early failure cannot make a completed preparation look cheaper.
-			}
-		} finally { timer.mockRestore(); await world.dispose?.(); await sandbox.dispose(); registry.dispose(); await rm(root, { recursive: true, force: true }); }
-	});
 
 	test("prepares with a long temporary path and removes its restricted short broker socket", { timeout: 20_000 }, async ({ skip }) => {
 		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
@@ -322,8 +248,8 @@ describe("Linux process ExecutionWorld", () => {
 		const fixture = await createLinuxProcessBenchmark("pi-live-process-");
 		let host: ReturnType<typeof createSpeculativeActionHost> | undefined;
 		// Timing policy is tested separately. Allow both admission and enough time to reach a safe frontier from active computation.
-		const assess = SpeculationScheduler.prototype.assessCandidateJoin, admitted = vi.spyOn(SpeculationScheduler.prototype, "assessCandidateJoin")
-			.mockImplementation(function (this: SpeculationScheduler<object>, request) { const decision = assess.call(this, request); return request.state === "running" ? { ...decision, allowed: true, waitBudgetMs: 10_000 } : decision; });
+		const wait = scheduling.waitForCandidate, admitted = vi.spyOn(scheduling, "waitForCandidate")
+			.mockImplementation((promise, signal) => wait(promise, signal, 10_000));
 		try {
 			await prepareLinuxProcessReuse(fixture);
 			if (!(await Reflect.get(fixture.backend, "ready")).imageLibrary) return skip("native process image capture is unavailable");
@@ -964,7 +890,7 @@ int main(int argc, char **argv) {
 				await fixture.world.observeOperations!({ action, scope: repeatedScope, learn: true }, () => route.executor.execute({ command: command.replace("parent", turnID),
 					cwd: fixture.workspace, environment: fixture.environment, scope: repeatedScope, onData: data => { output += data.toString(); } }), bindings => { retainedOperation ??= bindings.find(item => item.identity === binding!.key); });
 				expect(binding!.executionMs).not.toBe(previousMs);
-				expect(retainedOperation).toMatchObject({ executionMs: binding!.executionMs, expectedDurationMs: binding!.executionMs, preparation: "current_workspace" });
+				expect(retainedOperation).toMatchObject({ executionMs: binding!.executionMs, preparation: "current_workspace" });
 				expect(output).toBe(`${turnID}\nafter\n`);
 				expect(fixture.backend.executionBindings(later).filter(item => item.key === binding!.key)).toEqual([binding]);
 			}
@@ -1043,7 +969,7 @@ int main(int argc, char **argv) {
 
 	test.for(["temporary", "persistent", "descendant", "merged", "stale"])("seals output pipe status before reusing a child (%s)", { timeout: 30_000 }, async (mode, { skip }) => {
 		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
-		const fixture = await createLinuxProcessBenchmark("pi-output-status-", "git", { cheapChildMs: 0 });
+		const fixture = await createLinuxProcessBenchmark("pi-output-status-", "git", {});
 		try {
 			await writeFile(path.join(fixture.workspace, "input.txt"), "before\n");
 			await writeFile(path.join(fixture.workspace, "worker.c"), `#include <fcntl.h>
@@ -2070,44 +1996,6 @@ int main(void) {
 			} finally { gate.release(); await Promise.allSettled([closing, running]); }
 		} finally { await boundary.close(); await rm(root, { recursive: true, force: true }); }
 	});
-	test("resumes a child in place once its recent nested runs were cheap", async ({ skip }) => {
-		if (process.platform !== "linux") return skip("Linux only");
-		const fixture = await createLinuxProcessBenchmark("pi-cheap-child-", undefined, { cheapChildMs: 60_000 });
-		try {
-			for (const name of ["a.txt", "b.txt"]) await writeFile(path.join(fixture.workspace, name), `${name}\n`);
-			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
-			const run = async (label: string, command: string) => {
-				const before = fixture.backend.metrics(), branch = await forkReusableBash(fixture, { label, command, actionNamespace: "cheap-child", executionFingerprint });
-				try { return { text: textOutput(branch.output.result), bypasses: fixture.backend.metrics().bypasses - before.bypasses }; }
-				finally { await branch.dispose?.(); }
-			};
-			// The first cat learns its run time in its own sandbox; a different cat then needs none.
-			expect(await run("learn", "cat a.txt")).toMatchObject({ text: "a.txt\n" });
-			expect(await run("cheap", "cat b.txt | cat")).toEqual({ text: "b.txt\n", bypasses: 2 });
-			// A posix_spawn child execs in its parent's memory: the sandbox's exec path rewrite must not survive in it, and a parent
-			// with other threads (one parked in the spawn, one idle) must still be held while it holds the rewrite.
-			await writeFile(path.join(fixture.workspace, "spawner.c"), `#include <fcntl.h>\n#include <pthread.h>\n#include <spawn.h>\n#include <stdio.h>\n#include <sys/wait.h>\n#include <unistd.h>
-extern char **environ;\nstatic void *idle(void *unused) { (void)unused; pause(); return 0; }
-int main(int argc, char **argv) { if (argc == 2) { int flags = fcntl(1, F_GETFL); if (flags < 0) return 1;
-	if (argv[1][0] == 's') return fcntl(1, F_SETFL, flags | O_NONBLOCK) < 0;
-	return !(flags & O_NONBLOCK) || puts(argv[1]) < 0; }
-	char path[32] = "/bin/true\\0intact"; char *args[] = {path, 0}; pid_t pid; pthread_t thread; int status;
-	return pthread_create(&thread, 0, idle, 0) || posix_spawn(&pid, path, 0, 0, args, environ) || waitpid(pid, &status, 0) != pid || puts(path + 10) < 0; }\n`);
-			await compileBenchmarkHelper(fixture.workspace, { source: "spawner.c", output: "spawner", arguments: ["-pthread"] });
-			// Both execs share the subshell's writer OFD. A separate relay would hide the first exec's flag change from the second.
-			const before = fixture.backend.metrics(), cold = await forkReusableBash(fixture, { label: "cold-pipe", actionNamespace: "cold-pipe", executionFingerprint,
-				command: "set -o pipefail; (./spawner set && ./spawner cold) | cat" });
-			try {
-				const after = fixture.backend.metrics();
-				expect({ text: textOutput(cold.output.result), validation: await cold.validate?.(), misses: after.misses - before.misses,
-					published: after.published - before.published }, JSON.stringify(after)).toMatchObject({ text: "cold\n", validation: { status: "valid" }, misses: 0, published: 0 });
-			} finally { await cold.dispose(); }
-			// Created files take the open's mode under the process's umask; flock execs SHELL off its stack top; tar opens -C O_PATH; an orphan keeps its cwd.
-			const spawned = await forkReusableBash(fixture, { label: "spawn", actionNamespace: "spawn", executionFingerprint, command: "./spawner; umask 027; echo x > shared; cp /bin/true tool; mkdir made; " +
-				"stat -c '%a %n' shared tool made; SHELL=/bin/sh flock shared -c 'tar cf - tool | tar xf - -C made' && ls made; cd made && (echo orphan > kept &); for i in $(seq 100); do [ -s kept ] && break; sleep 0.05; done; cat kept; echo piped | cat /dev/stdin; cat /proc/self/comm; [ -x ../shared ] || echo not-x; hostname" });
-			try { expect(textOutput(spawned.output.result)).toBe(`intact\n640 shared\n750 tool\n750 made\ntool\norphan\npiped\ncat\nnot-x\n${os.hostname()}\n`); } finally { await spawned.dispose?.(); }
-		} finally { await fixture.dispose(); }
-	});
 
 	test("commits what it wrote outside the workspace on adoption, over the host state it replaced", async ({ skip }) => {
 		if (process.platform !== "linux") return skip("Linux only");
@@ -2220,7 +2108,7 @@ int main(void) { int fds[2], status; char queue[8]; if (pipe(fds) || fds[0] != 3
 			}, close } as unknown as LinuxHeldExecBoundary;
 		});
 		const planner = vi.spyOn(fixture.backend.planner, "plan");
-		const admission = vi.spyOn(SpeculationScheduler.prototype, "assessCandidateJoin");
+		const admission = vi.spyOn(scheduling, "waitForCandidate");
 		const processInvocation = resolvePiToolInvocation("bash", { command: ":" }, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath })!.process!;
 		const invocation = vi.fn(() => processInvocation);
 		const coordinator = new ProcessExecutionCoordinator(host, {
@@ -2728,11 +2616,11 @@ int main(void) { int fds[2], status; char queue[8]; if (pipe(fds) || fds[0] != 3
 			const branch = await world.speculation.execute(context);
 			try {
 				expect(branch.output.result.content).toEqual([{ type: "text", text: payload }]);
-				const operation = branch.operations![0]!, preparedMs = operation.expectedDurationMs;
+				const operation = branch.operations![0]!;
 				expect(operation.executionMs).toBe(10);
 				expect(registry.observe(binding.key, "/worker", scope, null, 30)).toBe(binding);
 				expect(operation.executionMs).toBe(30);
-				expect(operation.expectedDurationMs).toBeCloseTo(preparedMs + 20);
+				expect(operation).not.toHaveProperty("expectedDurationMs");
 				await expect(branch.commit()).resolves.toEqual(branch.output);
 				await expect(branch.commit()).resolves.toEqual(branch.output);
 				expect(ownership.claimChild()).toBe(false);

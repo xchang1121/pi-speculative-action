@@ -68,8 +68,8 @@ npm run bench:suite -- --suite swe_diverse --repeats 3 --label speculative
 | 场景 | 入口 | 验收内容 |
 | --- | --- | --- |
 | 搜索密集与输入频繁变化 | `bench/portable-kernel.mjs`、`bench/grep-captured-qualification.mjs` | 逐步输出、输入变化后的回退或重算、取消与关闭 |
-| 多步、低命中和未知收益 | `test/faux-llm-e2e.test.ts`、`test/drafter-adaptation.test.ts` | 完整 Agent 任务、有限探索、额外候选与续推层的收缩和恢复、延迟反馈 |
-| Actor 资源争用与内部进程接管 | `test/runtime-engine.test.ts`、`test/linux-process-world.test.ts` | 并发与跨轮资源预留、物理回收、当前调用的内部计算保留与一次采纳 |
+| 多步、低命中与任务预算 | `test/faux-llm-e2e.test.ts`、`test/drafter-adaptation.test.ts` | 完整 Agent 任务、并发候选及续推共用请求/token 额度、取消和迟到 usage 结算 |
+| Actor 资源争用与内部进程接管 | `test/scheduler.test.ts`、`test/runtime-engine.test.ts`、`test/linux-process-world.test.ts` | 跨会话硬件预算、Actor 优先、启动窗口、物理回收与内部计算的一次采纳 |
 | 自然修改与验证任务 | `bench:suite -- --suite swe_smoke --paired` | 最终回复、补丁、数据集指定测试、完整计时和实测 token/费用 |
 
 汇总时保留低命中、失败、超时及较慢样本，分别报告工具加速比、累计剩余计算与毛复用计算耗时、工具等待均值/P95、命中率、token 和任务正确性。构造的模型时序、组件资格和单个真实任务分别报告。

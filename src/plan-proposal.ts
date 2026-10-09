@@ -1,4 +1,5 @@
 import type { ExecutionOperationBinding } from "./execution-world.ts";
+import type { HardwareResources } from "./system-resources.ts";
 
 export type PlanActionDependencyCondition = "execution_settled" | "execution_succeeded" | "actor_adopted";
 
@@ -31,13 +32,14 @@ export interface PlanAction {
 	/** Chance a matched prediction can actually be adopted; independent of prediction precision. */
 	readonly adoptionProbability?: number;
 	readonly conditionalProbability?: number;
+	readonly confidence?: number;
+	/** Explicit duration for this execution, when supplied by its executor; never extrapolated from historical runs. */
 	readonly expectedDurationMs?: number;
-	readonly expectedLatencyBenefitMs?: number;
 	/** Uses only otherwise-idle speculative capacity and yields first under contention. */
 	readonly background?: boolean;
 	/** Run for the internal operations it leaves later calls as much as for its own result, which an Actor call may still adopt. */
 	readonly producesOperations?: true;
-	readonly resourceDemand?: number;
+	readonly resourceDemand?: number | HardwareResources;
 	readonly depth?: number;
 	readonly dependsOn?: readonly PlanActionDependency[];
 	/** Opaque producer-owned state. The runtime only returns it in feedback/continuation calls. */

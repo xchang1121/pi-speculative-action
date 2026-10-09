@@ -44,7 +44,7 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 async function chainWorld(files: readonly (readonly [string, string])[], loops: string, draft?: () => Promise<AssistantMessage>, resources?: ExecutionResourceMonitor) {
 	// Under the user's home, as a real workspace is: /tmp is each sandbox's own, so what a runtime observes of the workspace's parents
 	// there (Node's package.json probes) could never be validated.
-	const fixture = await createLinuxProcessBenchmark("pi-chain-", "overlayfs", { cheapChildMs: 50 }, path.join(os.homedir(), ".cache", "pi-speculative-action", "chain")), { workspace } = fixture;
+	const fixture = await createLinuxProcessBenchmark("pi-chain-", "overlayfs", {}, path.join(os.homedir(), ".cache", "pi-speculative-action", "chain")), { workspace } = fixture;
 	try {
 		for (const [file, text] of [...files, [".gitignore", "slow\n"], ["slow.c", "#include <stdio.h>\n#include <fcntl.h>\n#include <unistd.h>\nint main(int argc, char **argv) { int f = open(argv[1], O_RDONLY); if (f < 0) return 1;" +
 			` unsigned long h = 5381; unsigned char c;\n while (read(f, &c, 1) == 1) h = h * 33 + c; close(f);\n for (volatile unsigned long i = 0; i < ${loops}ul; i++) h ^= i;` +

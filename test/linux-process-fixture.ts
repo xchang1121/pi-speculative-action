@@ -13,7 +13,7 @@ import { PI_OPERATION_TOOLS, resolvePiToolInvocation } from "../src/pi-tool-invo
 import { adaptProcessToolOperations, ProcessExecutionCoordinator } from "../src/process-execution.ts";
 import { WorkspaceSandboxService, type WorkspaceSandboxDriver } from "../src/workspace-sandbox.ts";
 import type { ProcessHandoffRegistry } from "../src/process-handoff.ts";
-import type { SpeculationScheduler } from "../src/scheduler.ts";
+import * as scheduling from "../src/scheduler.ts";
 
 const BENCHMARK_SCOPE = { sessionID: "benchmark", turnID: "benchmark" } as const;
 
@@ -28,16 +28,14 @@ export function holdProcessPublication(backend: LinuxProcessReuseBackend) {
 	const publication = vi.spyOn(handoffs, "publish").mockImplementation(async (...args) => {
 		reached = true; await release.promise; return publish(...args);
 	});
-	const scheduler = Reflect.get(backend, "processScheduler") as SpeculationScheduler<object>;
-	const assess = scheduler.assessCandidateJoin.bind(scheduler);
-	let evidence: { request: Parameters<typeof assess>[0]; decision: ReturnType<typeof assess> } | undefined;
-	const assessment = vi.spyOn(scheduler, "assessCandidateJoin").mockImplementation(request => {
-		const decision = assess(request);
-		if (request.state === "running") {
-			evidence = { request, decision };
-			if (decision.allowed) queueMicrotask(() => release.resolve());
+	const wait = scheduling.waitForCandidate;
+	let evidence: { decision: { allowed: boolean; waitBudgetMs?: number } } | undefined;
+	const assessment = vi.spyOn(scheduling, "waitForCandidate").mockImplementation((promise, signal, waitBudgetMs) => {
+		if (waitBudgetMs !== undefined) {
+			evidence = { decision: { allowed: true, waitBudgetMs } };
+			queueMicrotask(() => release.resolve());
 		}
-		return decision;
+		return wait(promise, signal, waitBudgetMs);
 	});
 	return {
 		reached: () => reached,
@@ -49,7 +47,7 @@ export function holdProcessPublication(backend: LinuxProcessReuseBackend) {
 export async function createLinuxProcessBenchmark(
 	rootPrefix: string,
 	workspaceDriver?: WorkspaceSandboxDriver,
-	backendOptions: { readonly cheapChildMs?: number } = {},
+	backendOptions: Omit<ConstructorParameters<typeof LinuxProcessReuseBackend>[0], "storeRoot"> = {},
 	parent = os.tmpdir(),
 ) {
 	if (process.platform !== "linux") throw new Error("Run this benchmark inside Linux or WSL 2");
@@ -65,8 +63,7 @@ export async function createLinuxProcessBenchmark(
 		LANG: "C.UTF-8",
 	});
 	const localOperations = createLocalBashOperations({ shellPath });
-	// Fixture children are cheap stand-ins for the expensive children nested reuse serves.
-	const backend = new LinuxProcessReuseBackend({ storeRoot, cheapChildMs: 0, ...backendOptions });
+	const backend = new LinuxProcessReuseBackend({ storeRoot, ...backendOptions });
 	const coordinator = new ProcessExecutionCoordinator(
 		backend.completedReplayExecutor(adaptProcessToolOperations(localOperations), {
 			sourceRoot: workspace,

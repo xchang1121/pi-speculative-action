@@ -8,7 +8,7 @@ import { createPatternPlanSource } from "../src/pattern-plan-source.ts";
 
 type Call = { readonly id: string; readonly tool: string; readonly input: Record<string, unknown> };
 type Result = { readonly content: unknown[]; readonly details: unknown; readonly isError: boolean; readonly durationMs: number };
-type Prediction = { readonly type: string; readonly tool: string; readonly input: Record<string, unknown>; readonly feedback?: unknown; readonly expectedLatencyBenefitMs?: number };
+type Prediction = { readonly type: string; readonly tool: string; readonly input: Record<string, unknown>; readonly feedback?: unknown };
 type Counts = { actual: number; covered: number; predicted: number; hits: number; toolMs: number; top4Ms: number };
 
 const sessions = process.argv.slice(2).map((file) => {
@@ -47,8 +47,7 @@ for (const [index, { cwd, batches, results }] of sessions.entries()) {
 		startInput = { sessionID, turnID: `turn-${++turn}`, tools: [], actorModel: {}, context: { systemPrompt: "", messages: [], tools: [] } };
 		controller.turnStarted(startInput as never, runtimeSettings);
 		const proposal = await controller.source.propose(request(startInput) as never);
-		const predictions = [...carried, ...(proposal && "actions" in proposal ? proposal.actions as readonly Prediction[] : [])].filter((action) => action.type === "tool_call")
-			.sort((left, right) => (right.expectedLatencyBenefitMs ?? 0) - (left.expectedLatencyBenefitMs ?? 0)); // The scheduler's value order.
+		const predictions = [...carried, ...(proposal && "actions" in proposal ? proposal.actions as readonly Prediction[] : [])].filter((action) => action.type === "tool_call");
 		const actual = batch.map((call) => key(call.tool, call.input)), covered = new Set<number>(), top4 = new Set<number>();
 		totals.decisions++;
 		for (const [rank, prediction] of predictions.entries()) {

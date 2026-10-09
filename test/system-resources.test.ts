@@ -1,9 +1,16 @@
 import { describe, expect, it } from "vitest";
-import { cpuAffinity, idleCpuCount } from "../src/system-resources.ts";
+import { cpuAffinity, idleCpuCount, ioAvailability, gpuAvailability } from "../src/system-resources.ts";
 
 const cpu = (busy: number, idle: number) => ({ times: { user: busy, nice: 0, sys: 0, irq: 0, idle } });
 
 describe("host resource observations", () => {
+	it("reads I/O pressure and optional GPU capacity without inventing missing telemetry", () => {
+		expect(ioAvailability("some avg10=25.00 avg60=10.00 total=10\nfull avg10=2.00")).toBe(0.75);
+		expect(ioAvailability("")).toBeUndefined();
+		expect(gpuAvailability("8192, 4096, 25\n4096, 2048, 100")).toEqual({
+			capacity: { gpu: 2, gpuMemory: 12288 * 1024 * 1024 }, available: { gpu: 0.75, gpuMemory: 6144 * 1024 * 1024 } });
+		for (const value of ["", "N/A, N/A, N/A", "1024, -1, 0", "1024, 512"]) expect(gpuAvailability(value)).toBeUndefined();
+	});
 	it("uses allowed CPU IDs instead of the first available host CPUs", () => {
 		const allowed = cpuAffinity("Name:\tnode\nCpus_allowed_list:\t2,4-5\nMems_allowed_list:\t0\n");
 		expect(allowed).toEqual([2, 4, 5]);

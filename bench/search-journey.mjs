@@ -8,7 +8,7 @@ export function searchJourney({ cwd, name, tools, args, invocation, world, resou
 	const candidate = Promise.withResolvers(), authorized = Promise.withResolvers();
 	let prediction = true, turnID, actorWaiting = false, actorCalls = 0, feedback;
 	const host = createSpeculativeActionHost("search-qualification", {
-		cwd, resources, getSettings: () => ({ enabled: true, drafterEnabled: prediction, drafterGateEnabled: false,
+		cwd, resources, getSettings: () => ({ enabled: true, drafterEnabled: prediction,
 			drafterMaxDepth: 0, candidateLimit: 1, maxConcurrentActions: 1, tools: prediction ? [name] : [],
 			patternAware: { enabled: false }, selfSpeculation: { enabled: false }, ...settings }),
 		draftModel: model, complete: async () => fauxAssistantMessage(fauxToolCall(name, args), { stopReason: "toolUse" }),

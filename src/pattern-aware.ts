@@ -6,7 +6,6 @@ import os from "node:os";
 import path from "node:path";
 import { type ActionKey, type ActionKeyProjector, type ActionSemanticsRegistry, actionKeyCovers, ownActionKeyProjector, widenReadGuess } from "./action-semantics.ts";
 import { BoundedRecencyMap } from "./bounded-recency-map.ts";
-import { DEFAULT_BENEFIT_GATE_POLICY } from "./fork-benefit-gate.ts";
 import { patternSessionBudgets, type PatternPendingValidation, type PatternRecurrentAction, type PatternSessionState } from "./pattern-session-state.ts";
 import { containsLogicalPath, relativeFilesystemPath } from "./path-utils.ts";
 import { PpmCountTrie, type PpmCountTrieRow } from "./ppm-count-trie.ts";
@@ -153,8 +152,7 @@ export type PatternAwareCandidate = {
 	readonly empiricalProbability: number;
 	readonly conditionalProbability: number;
 	readonly adoptionProbability: number;
-	readonly expectedDurationMs: number;
-	readonly expectedLatencyBenefitMs: number;
+	readonly confidence: number;
 	readonly background?: boolean;
 	readonly dependencies: ReadonlyArray<PatternAwareDependency>;
 	readonly continuation: PatternAwareContinuation;
@@ -184,7 +182,6 @@ type MutablePattern = {
 	historicalOpportunities: number;
 	historicalMatches: number;
 	feedback: MutablePatternFeedback;
-	averageDurationMs: number;
 	lastSeenSequence: number;
 };
 
@@ -194,15 +191,7 @@ type PatternFeedbackCounters = Record<typeof PATTERN_FEEDBACK_COUNTERS[number], 
 type MutablePatternFeedback = PatternFeedbackCounters & {
 	rejectedAfterMatch: Partial<Record<ResolutionStage, number>>;
 	unobserved: Record<string, number>;
-	utility?: PatternComputationUtility;
 };
-
-/** Retained computations keep only these counters, never a store, continuation or observed tool data. */
-interface PatternComputationUtility { productions: number; productionMs: number; reusedExecutionMs: number; }
-export interface PatternAwareReuseFeedback {
-	readonly kind: "pattern_utility";
-	readonly utility: PatternComputationUtility;
-}
 
 const STRUCTURAL_PRIOR_WEIGHT = 4;
 
@@ -551,23 +540,21 @@ export class PatternAwareStore {
 			const patterns = ordered.map((item) => item.pattern);
 			const { horizon, latestHorizon } = groupGapTiming(patterns, settings, this.clock);
 			const replayProbability = backoffProbability(patterns, this.clock, settings.decayHalfLifeEvents, contextEvidence);
-			let totalWeight = 0, weightedVariants = 0, weightedDuration = 0;
+			let totalWeight = 0, weightedVariants = 0;
 			for (const item of ordered) {
 				const occurrences = Math.max(1, item.pattern.occurrences);
 				const decay = recencyWeight(item.pattern.lastSeenSequence, this.clock, settings.decayHalfLifeEvents);
 				totalWeight += occurrences * decay;
 				weightedVariants += item.variantProbability * occurrences * decay;
-				weightedDuration += Math.max(0, item.pattern.averageDurationMs) * occurrences * decay;
 			}
 			const variantProbability = weightedVariants / Math.max(1, totalWeight);
-			const expectedDurationMs = weightedDuration / Math.max(1, totalWeight);
 			const adoptionProbability = patternAdoptionProbability(patterns, this.clock, settings.decayHalfLifeEvents);
 			const conditionalProbability = clampProbability(replayProbability * variantProbability);
 			const empiricalProbability = clampProbability(continuation.pathProbability * conditionalProbability);
 			const mapperComplexity = Math.min(...ordered.map((item) => analyzeBindings(item.pattern.bindings).complexity));
 			const mapperConfidence = totalWeight / (totalWeight + mapperComplexity);
 			const evidence = evidenceConfidence(replayProbability, totalWeight);
-			const expectedLatencyBenefitMs = empiricalProbability * adoptionProbability * mapperConfidence * evidence * Math.max(1, Math.max(0, expectedDurationMs));
+			const confidence = empiricalProbability * adoptionProbability * mapperConfidence * evidence;
 			const background = patterns.every((pattern) => {
 				const feedback = feedbackEvidence(pattern, this.clock, settings.decayHalfLifeEvents);
 				return pattern.occurrences < settings.minOccurrences || feedback.mismatched > feedback.matched;
@@ -578,7 +565,7 @@ export class PatternAwareStore {
 				tool: representative.pattern.targetTool, input: representative.input, patternID: representative.pattern.id,
 				supportingPatternIDs: patterns.map((pattern) => pattern.id), dependencies: representative.pattern.dependencies,
 				horizon, latestHorizon, conditionalProbability, empiricalProbability, adoptionProbability,
-				expectedDurationMs, expectedLatencyBenefitMs,
+				confidence,
 			}] as const;
 		}));
 		// Session frequency supports another Actor opportunity, not a transition from hypothetical output.
@@ -586,7 +573,7 @@ export class PatternAwareStore {
 			const existing = predictions.get(recurrent.actionIdentity);
 			if (!existing) { predictions.set(recurrent.actionIdentity, recurrent); continue; }
 			const preferred = recurrent.background !== existing.background ? (recurrent.background ? existing : recurrent)
-				: recurrent.expectedLatencyBenefitMs > existing.expectedLatencyBenefitMs ? recurrent : existing;
+				: recurrent.confidence > existing.confidence ? recurrent : existing;
 			predictions.set(recurrent.actionIdentity, {
 				...preferred,
 				recurrentFeedback: recurrent.recurrentFeedback,
@@ -602,7 +589,7 @@ export class PatternAwareStore {
 			predictions.set(structural.actionIdentity, structural);
 		}
 		const ranked = [...predictions.values()].filter((prediction) => this.readable(prediction, history, schemaHashes.read)).sort((left, right) =>
-			Number(left.background) - Number(right.background) || right.expectedLatencyBenefitMs - left.expectedLatencyBenefitMs ||
+			Number(left.background) - Number(right.background) || right.confidence - left.confidence ||
 			right.empiricalProbability - left.empiricalProbability ||
 			right.conditionalProbability - left.conditionalProbability ||
 			left.horizon - right.horizon ||
@@ -665,17 +652,16 @@ export class PatternAwareStore {
 			const conditionalProbability = clampProbability((mass + evidence.matched) /
 				(Math.max(mass, massByTool.get(item.action.tool) ?? 0) + evidence.matched + evidence.mismatched));
 			const empiricalProbability = clampProbability(continuation.pathProbability * conditionalProbability);
-			const expectedDurationMs = item.weightedDurationMs / item.weightedCount;
 			const ppmProbability = estimatePpm(item.action.tool);
 			const adoptionProbability = patternAdoptionProbability([item], this.clock, settings.decayHalfLifeEvents);
-			const confidence = evidenceConfidence(conditionalProbability, item.weightedCount);
-			const expectedLatencyBenefitMs = empiricalProbability * adoptionProbability * (ppmProbability ?? 1) * confidence * Math.max(1, expectedDurationMs);
+			const evidenceWeight = evidenceConfidence(conditionalProbability, item.weightedCount);
+			const confidence = empiricalProbability * adoptionProbability * (ppmProbability ?? 1) * evidenceWeight;
 			return {
 				background: item.count < settings.minOccurrences || evidence.mismatched > evidence.matched, recurrentFeedback: item.feedback,
 				actionIdentity: hash(JSON.stringify({ actionKey: item.action.key, type: "tool_call" })), type: "tool_call" as const, tool: item.action.tool,
 				input: item.input, patternID, supportingPatternIDs: [] as string[], dependencies: [] as PatternAwareDependency[],
 				horizon: 0, latestHorizon: 0, conditionalProbability,
-				empiricalProbability, adoptionProbability, expectedDurationMs, expectedLatencyBenefitMs,
+				empiricalProbability, adoptionProbability, confidence,
 			};
 		});
 	}
@@ -690,12 +676,10 @@ export class PatternAwareStore {
 		continuation: PatternAwareContinuation,
 		settings: PatternAwareSettings,
 	) {
-		const reads = history.filter((event) => event.tool === "read" && typeof event.input.path === "string");
-		const readDurationMs = reads.reduce((total, event) => total + event.durationMs, 0) / Math.max(1, reads.length);
 		const identity = (target: string) => this.resolveActionKey("read", { path: target }, schemaHashes.read)?.key;
 		const actionIdentity = (event: PatternAwareEvent) => this.resolveActionKey(event.tool, event.input, event.schemaHash)?.key;
 		const seen = new Set<string>();
-		return patternPresetActions(history, settings.presets, identity, actionIdentity).flatMap(({ kind, presetID, tool, input, prior, durationMs = readDurationMs, schemaHash }) => {
+		return patternPresetActions(history, settings.presets, identity, actionIdentity).flatMap(({ kind, presetID, tool, input, prior, schemaHash }) => {
 			if (tool === "grep" && schemaHash !== schemaHashes[tool]) return [];
 			const key = this.resolveActionKey(tool, input, schemaHashes[tool])?.key;
 			if (!key || seen.has(key)) return [];
@@ -711,28 +695,9 @@ export class PatternAwareStore {
 				background: false, recurrentFeedback: feedback, actionIdentity: hash(JSON.stringify({ actionKey: key, type: "tool_call" })),
 				type: "tool_call" as const, tool, input, patternID, presetID, supportingPatternIDs: [] as string[],
 				dependencies: [] as PatternAwareDependency[], horizon: 0, latestHorizon: 0,
-				conditionalProbability, empiricalProbability, adoptionProbability, expectedDurationMs: durationMs,
-				expectedLatencyBenefitMs: this.presetExpectedBenefit(presetID, empiricalProbability * adoptionProbability * Math.max(1, durationMs), durationMs),
+				conditionalProbability, empiricalProbability, adoptionProbability, confidence: empiricalProbability * adoptionProbability,
 			}];
 		});
-	}
-
-	presetReuseFeedback(presetID: PatternAwarePresetID): PatternAwareReuseFeedback {
-		const feedback = this.presetFeedback(presetID);
-		return Object.freeze({ kind: "pattern_utility", utility: feedback.utility ??=
-			{ productions: 0, productionMs: 0, reusedExecutionMs: 0 } });
-	}
-
-	/** Gross reuse changes scheduling value, never the reported E/R or match/adoption probabilities. */
-	presetExpectedBenefit(presetID: PatternAwarePresetID, priorBenefitMs: number, durationMs: number): number {
-		const utility = this.structuralFeedback.get(presetID)?.utility;
-		if (!utility?.productions) return priorBenefitMs;
-		const duration = Math.max(1, nonNegativeFinite(durationMs)), prior = nonNegativeFinite(priorBenefitMs);
-		// Four representative executions regularize cold evidence. Repeated consumption may validly return more than production cost.
-		const measured = duration * (STRUCTURAL_PRIOR_WEIGHT * prior + utility.reusedExecutionMs) /
-			(STRUCTURAL_PRIOR_WEIGHT * duration + utility.productionMs);
-		// Keep the existing probe allowance as a positive ranking floor; this does not bypass admission or enable a disabled preset.
-		return Math.max(prior / DEFAULT_BENEFIT_GATE_POLICY.probeInterval, measured);
 	}
 
 	private presetFeedback(presetID: PatternAwarePresetID): MutablePatternFeedback {
@@ -824,15 +789,13 @@ export class PatternAwareStore {
 		const action = this.resolveActionKey(event.tool, event.input, event.schemaHash);
 		if (!action) return;
 		const existing = session.recurrentActions.get(action.key);
-		const durationMs = event.outcome === "success" && Number.isFinite(event.durationMs) ? Math.max(0, event.durationMs) : 0;
 		if (existing) {
 			const decay = recencyWeight(existing.lastSeenSequence, event.sequence, this.settings.decayHalfLifeEvents);
 			existing.count = Math.min(Number.MAX_SAFE_INTEGER, existing.count + 1);
 			existing.weightedCount = Math.min(Number.MAX_SAFE_INTEGER, existing.weightedCount * decay + 1);
-			existing.weightedDurationMs = Math.min(Number.MAX_VALUE / 2, existing.weightedDurationMs * decay + durationMs);
 			existing.lastSeenSequence = event.sequence;
 		} else {
-			session.recurrentActions.set(action.key, { action, input: structuredClone(event.input), count: 1, weightedCount: 1, weightedDurationMs: durationMs,
+			session.recurrentActions.set(action.key, { action, input: structuredClone(event.input), count: 1, weightedCount: 1,
 				lastSeenSequence: event.sequence });
 		}
 	}
@@ -995,16 +958,13 @@ export class PatternAwareStore {
 				gapCounts: {} as Record<string, number>,
 				gapLastSeen: {} as Record<string, number>,
 				occurrences: support.length,
-				averageDurationMs: 0,
 				lastSeenSequence: -Infinity,
 			};
 			for (const { gap, target } of support) {
 				observed.gapCounts[gap] = (observed.gapCounts[gap] ?? 0) + 1;
 				observed.gapLastSeen[gap] = Math.max(observed.gapLastSeen[gap] ?? 0, target.sequence);
 				observed.lastSeenSequence = Math.max(observed.lastSeenSequence, target.sequence);
-				observed.averageDurationMs += target.outcome === "success" ? Math.max(0, target.durationMs) : 0;
 			}
-			observed.averageDurationMs /= Math.max(1, support.length);
 			const existing = this.patterns.get(id);
 			if (existing) { Object.assign(existing, observed); continue; }
 			this.patterns.set(id, {
@@ -2179,7 +2139,7 @@ function mutablePattern(value: PatternAwarePattern): MutablePattern | undefined 
 	const feedback = mutablePatternFeedback(record?.feedback);
 	if (!record || typeof record.id !== "string" || !Array.isArray(record.context) || !record.context.every(isEventSignature) || typeof record.targetTool !== "string" ||
 		!bindings || !gapCounts || !gapLastSeen || Object.keys(gapCounts).some(gap => gapLastSeen[gap] === undefined) || !feedback ||
-		![record.occurrences, record.historicalOpportunities, record.historicalMatches, record.averageDurationMs, record.lastSeenSequence]
+		![record.occurrences, record.historicalOpportunities, record.historicalMatches, record.lastSeenSequence]
 			.every((metric) => isFiniteNumber(metric) && metric >= 0) ||
 		(record.targetSchemaHash !== undefined && typeof record.targetSchemaHash !== "string") ||
 		!Object.entries(bindings).every(([encoded, binding]) => parsePath(encoded) !== undefined && isPatternAwareBinding(binding))) return;
@@ -2196,7 +2156,6 @@ function mutablePattern(value: PatternAwarePattern): MutablePattern | undefined 
 		historicalOpportunities: Math.max(1, value.historicalOpportunities),
 		historicalMatches: value.historicalMatches,
 		feedback,
-		averageDurationMs: finiteNumber(value.averageDurationMs) ?? 0,
 		lastSeenSequence: finiteNumber(value.lastSeenSequence) ?? 0,
 	});
 	return { ...pattern, dependencies: analyzeBindings(pattern.bindings).dependencies };
