@@ -59,9 +59,9 @@ describe("native suspension frontier polling", () => {
 		} finally { test.close(); }
 	});
 
-	it("stops permanent safe declines when the existing join budget expires", async () => {
+	it("stops permanent safe declines when the Actor cancels its join", async () => {
 		const test = fixture({ replies: [0] });
-		test.onPause(() => { if (test.pauses.length === 3) test.join.abort(new Error("join deadline")); });
+		test.onPause(() => { if (test.pauses.length === 3) test.join.abort(new Error("Actor cancelled")); });
 		try {
 			await expect(test.run()).resolves.toBeUndefined();
 			expect(test.channel.requests).toEqual([123, 123, 123]);
@@ -85,7 +85,7 @@ describe("native suspension frontier polling", () => {
 			let settled = false;
 			const pending = test.run().finally(() => { settled = true; });
 			await test.requested.promise;
-			test.join.abort(new Error("join deadline"));
+			test.join.abort(new Error("Actor cancelled"));
 			await Promise.resolve();
 			expect(settled).toBe(false);
 			expect(test.channel.listenerCount("data")).toBe(1);

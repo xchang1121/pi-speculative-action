@@ -17,7 +17,6 @@ import type {
 import { makeSpeculativeActionRuntime } from "../src/runtime.ts";
 import { CandidateStore } from "../src/candidate-stores.ts";
 import { TaskTimeline, TimelineInterval } from "../src/task-timing.ts";
-import * as scheduling from "../src/scheduler.ts";
 import { SpeculationScheduler } from "../src/scheduler.ts";
 import { ToolExecutionGateway } from "../src/tool-execution-gateway.ts";
 import { cause, type PredictionSettlement, type ResourceValidation, zeroValidationMetrics } from "../src/settlement.ts";
@@ -958,47 +957,35 @@ describe("structural speculative runtime", () => {
 		expect(validate).toHaveBeenCalledWith({ version: 1 });
 		await runtime.finishTurn({ ...call("turn"), terminal: true });
 	});
-
-
-
-
-
-	it.each([0, 27])("bounds an in-flight join to the configured %i ms without cancelling the learning run", async candidateJoinTimeoutMs => {
-		let enabled = false;
-		const gate = gated();
-		const source = planSource({
-			enabled: () => enabled,
-			propose: () => plan("bounded-join"),
-			observesOperations: () => true,
-			observe: () => undefined,
-		});
-		const { runtime, events, ready: candidateReady } = harness({ source, settings: () => ({ ...settings, scheduling: { candidateJoinTimeoutMs } }), execute: async () => { await gate.wait(); return "learned"; } });
-
-		await runtime.startTurn(start("calibration"));
-		const calibration = call("calibration");
-		await runFallback(runtime, calibration, 100);
-		await runtime.finishTurn({ ...calibration, terminal: false });
-
-		enabled = true;
-		await runtime.startTurn(start("prediction"));
-		await gate.entered;
-		const prepared = await runtime.prepareActorCall(call("prediction"));
-		expect(prepared?.output).toBeUndefined();
-		expect(prepared?.observeOperations).toBe(true);
-
-		gate.release();
-		await candidateReady.promise;
-		await prepared?.settle(simulatedExecution(100), "actor");
-		await runtime.finishTurn({ ...call("prediction"), terminal: false });
-		expect(events.find((event) => event.type === "actor_action" && event.turnID === "prediction")).toMatchObject({ settlement: { provider: { kind: "actor" }, rejections: [{ cause: { code: "candidate_join_deadline" } }] } });
-		enabled = false;
-		await runtime.startTurn(start("retained"));
-		expect(await runtime.prepareActorCall(call("retained"))).toMatchObject({ output: "learned", observeOperations: false });
-		await runtime.finishTurn({ ...call("retained"), terminal: true });
-		const event = events.find((event) => event.type === "actor_action" && event.turnID === "retained");
-		const retained = event?.type === "actor_action" ? event.settlement.provider : undefined;
-		expect(retained?.kind).toBe("speculative");
-		expect(retained).not.toHaveProperty("timing");
+	it.each(["exact", "projected", "cancel", "turn-finished", "failed", "stale"])("waits for matched work without a join deadline (%s)", async mode => {
+		const gate = gated(), authorized = barrier(), controller = new AbortController();
+		const predicted = { path: "README.md", offset: 1, limit: 20 }, actor = call("turn", mode === "projected" ? { ...predicted, offset: 5, limit: 3 } : predicted);
+		const validate = vi.fn(() => mode === "stale" ? { status: "stale" as const, cause: cause("freshness", "resource_changed"), metrics: zeroValidationMetrics() } : validResource());
+		const { runtime, events, executions } = harness({ source: planSource({ propose: () => plan("join", predicted) }), validate,
+			authorizeCandidate: () => { authorized.arrive(); return { ok: true }; },
+			projection: { ...READ_RANGE_ACTION_KEY_PROJECTOR, captureCoverage: () => true, projectOutput: () => "narrow" },
+			execute: async () => { await gate.wait(); if (mode === "failed") throw new Error("producer failed"); return "wide"; } });
+		let settled = false, pending: ReturnType<typeof runtime.prepareActorCall> | undefined;
+		try {
+			await runtime.startTurn(start("turn")); await gate.entered;
+			vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+			pending = runtime.prepareActorCall(actor, controller.signal).then(value => { settled = true; return value; });
+			await authorized.promise; await vi.advanceTimersByTimeAsync(600_001);
+			expect(settled).toBe(false); expect(validate).not.toHaveBeenCalled(); expect(executions()).toBe(1);
+			if (mode === "cancel") controller.abort();
+			else if (mode === "turn-finished") await runtime.finishTurn(actor);
+			else gate.release();
+			const prepared = await pending, adopted = mode === "exact" || mode === "projected";
+			expect(prepared?.output).toBe(adopted ? mode === "exact" ? "wide" : "narrow" : undefined);
+			expect(validate).toHaveBeenCalledTimes(adopted || mode === "stale" ? 1 : 0);
+			if (adopted) {
+				await runtime.finishTurn(actor); await runtime.startTurn(start("retained"));
+				expect((await runtime.prepareActorCall({ ...actor, turnID: "retained" }))?.output).toBe(prepared?.output);
+				await nextTurn(); expect(events.filter(event => event.type === "actor_action")).toHaveLength(2);
+				expect(events.filter(event => event.type === "actor_action").every(event => event.settlement.provider.kind === "speculative")).toBe(true);
+			}
+			expect(executions()).toBe(1);
+		} finally { gate.release(); await pending; await runtime.dispose(); vi.useRealTimers(); }
 	});
 
 	it.each(["refresh", "disabled", "disposed", "unwrapped", "terminal", "replaced", "evicted", "concurrent-refresh"] as const)("keeps prediction launch ownership across validation: %s", async (mode) => {
@@ -1489,7 +1476,6 @@ describe("structural speculative runtime", () => {
 		"output-valid", "output-uncovered", "output-rejected", "output-opaque", "output-preferred", "input-lookup", "input-scope"] as const)
 		.flatMap((scenario) => [false, ...(!scenario.startsWith("running") ? [true] : [])].map((preview) => [scenario, preview] as const)))(
 	"adopts reconstructed input or owned output coverage only after stable evaluation: %s (preview=%s)", async (scenario, preview) => {
-		const admission = vi.spyOn(scheduling, "candidateJoinBudget");
 		const commit = vi.fn(async () => "committed"), queryDisposals: ReturnType<typeof vi.fn>[] = [];
 		const gate = gated(), controller = new AbortController();
 		const started = barrier(), completion = barrier(), authorized = barrier(), running = scenario.startsWith("running");
@@ -1576,7 +1562,6 @@ describe("structural speculative runtime", () => {
 		} finally {
 			completion.arrive(); gate.release(); await Promise.all([preparation, consumed]);
 			await runtime.finishTurn({ ...actor, terminal: true }); await runtime.dispose();
-			admission.mockRestore();
 		}
 		for (const dispose of queryDisposals) expect(dispose).toHaveBeenCalledOnce();
 		const computations = events.filter(event => event.type === "actor_action").map(event => event.computation!);
@@ -1747,10 +1732,10 @@ describe("structural speculative runtime", () => {
 		} finally { await runtime.dispose(); }
 	});
 
-	it.each(["adopt", "salvage", "cancel", "orphan-preview", "owned-preview", "operation-salvage", "operation-unavailable", "operation-unmeasured", "operation-expired", "operation-terminal"])("retires unowned previews while retaining demanded or independently predicted work: %s", async mode => {
+	it.each(["adopt", "salvage", "salvage-join", "salvage-abort", "cancel", "orphan-preview", "owned-preview", "operation-join", "operation-salvage", "operation-unavailable", "operation-unmeasured", "operation-expired", "operation-terminal"])("retires unowned previews while retaining demanded or independently predicted work: %s", async mode => {
 		const started = deferred<void>(), release = deferred<void>();
 		const timers = vi.spyOn(globalThis, "setTimeout"), cleared = vi.spyOn(globalThis, "clearTimeout"), disposed = vi.fn();
-		const admission = vi.spyOn(scheduling, "candidateJoinBudget");
+		const clock = vi.spyOn(performance, "now"), controller = new AbortController();
 		let available = true;
 		const binding = Object.freeze({ backend: "process", identity: "child", permissionHash: "parent", executionMs: mode === "operation-unmeasured" ? 0 : 2,
 			expectedDurationMs: 3, get available() { return available; } });
@@ -1760,7 +1745,8 @@ describe("structural speculative runtime", () => {
 			resolveExecution: ({ tool }) => tool === "read" ? mode === "adopt" ? RESOURCE_ROUTE : { ...MUTATION_ROUTE, isolation: "runtime_sandbox" } : undefined,
 			source: planSource({ propose: ({ startInput }) => startInput.turnID !== "turn" || mode === "orphan-preview" ? undefined : {
 				...plan("read"), ...(mode.startsWith("operation-") ? { actions: [{ ...readAction("child", { path: "README.md" }), type: "operation", operation: binding }] } : {}) } }),
-			executeCandidate: async ({ acceptOperationScope, signal }) => {
+			executeCandidate: async ({ acceptOperationScope, onOperationJoinable, signal }) => {
+				if (mode === "operation-join") onOperationJoinable?.(() => available);
 				executionSignal = signal; signal.addEventListener("abort", () => release.resolve(), { once: true });
 				acceptScope = acceptOperationScope; started.resolve(); await release.promise;
 				return world("speculative", { validate: async () => validResource(), onDispose: disposed });
@@ -1771,8 +1757,7 @@ describe("structural speculative runtime", () => {
 			await started.promise;
 			if (mode.endsWith("preview")) {
 				if (mode === "owned-preview") await runtime.previewActorCall(call("turn"));
-				else admission.mockReturnValueOnce(0);
-				const prepared = await runtime.prepareActorCall(mode === "orphan-preview" ? call("turn") : { ...call("turn"), tool: "bash", input: { command: "git status" } });
+				const prepared = await runtime.prepareActorCall(mode === "orphan-preview" ? call("turn", { path: "changed.ts" }) : { ...call("turn"), tool: "bash", input: { command: "git status" } });
 				expect(prepared?.output).toBeUndefined();
 				expect(executionSignal!.aborted).toBe(mode === "orphan-preview");
 				expect(timers.mock.calls.some(([, delay]) => Number(delay) > SALVAGE_MS / 2)).toBe(false);
@@ -1794,7 +1779,7 @@ describe("structural speculative runtime", () => {
 				release.resolve(); expect((await runtime.prepareActorCall(call("turn")))?.output).toBe("speculative");
 			} else {
 				await runtime.finishTurn(call("turn")); await runtime.startTurn(start("next"));
-				const index = timers.mock.calls.findIndex(([, delay]) => Number(delay) > SALVAGE_MS / 2);
+				const index = timers.mock.calls.reduce((last, [, delay], index) => Number(delay) > SALVAGE_MS / 2 ? index : last, -1);
 				expect(index).toBeGreaterThanOrEqual(0);
 				const timer = timers.mock.results[index]!.value;
 				expect(cleared).not.toHaveBeenCalledWith(timer);
@@ -1805,10 +1790,25 @@ describe("structural speculative runtime", () => {
 					await nextTurn(); expect(cleared).toHaveBeenCalledWith(timer); release.resolve(); await closing;
 					expect(acceptScope!(start("next"), true)).toBe(false);
 				} else if (mode === "operation-expired") {
+					clock.mockReturnValue(performance.now() + SALVAGE_MS);
 					timers.mock.calls[index]![0]();
 					expect(executionSignal!.aborted).toBe(true);
 					await vi.waitFor(() => expect(disposed).toHaveBeenCalledOnce());
 					expect(cleared).toHaveBeenCalledWith(timer);
+				} else if (mode.endsWith("join") || mode === "salvage-abort") {
+					const pending = runtime.prepareActorCall(call("next"), controller.signal);
+					await nextTurn(); available = false;
+					clock.mockReturnValue(performance.now() + SALVAGE_MS);
+					timers.mock.calls[index]![0]();
+					expect(executionSignal!.aborted).toBe(false);
+					if (mode === "operation-join") {
+						const prepared = await pending; expect(prepared?.output).toBeUndefined();
+						await prepared!.settle(simulatedExecution(1), "actor");
+						expect(executionSignal!.aborted).toBe(true);
+					} else if (mode === "salvage-abort") {
+						controller.abort(); expect((await pending)?.output).toBeUndefined();
+						expect(executionSignal!.aborted).toBe(true);
+					} else { release.resolve(); expect((await pending)?.output).toBe("speculative"); }
 				} else {
 					release.resolve(); await ready.promise;
 					expect(cleared).toHaveBeenCalledWith(timer);
@@ -1818,7 +1818,7 @@ describe("structural speculative runtime", () => {
 				}
 			}
 		} finally {
-			release.resolve(); await runtime.dispose(); timers.mockRestore(); cleared.mockRestore(); admission.mockRestore();
+			release.resolve(); await runtime.dispose(); timers.mockRestore(); cleared.mockRestore(); clock.mockRestore();
 			expect(disposed).toHaveBeenCalledOnce();
 		}
 	});
@@ -1862,7 +1862,7 @@ describe("structural speculative runtime", () => {
 	it.each([[2, 4096, 0, 2, 10], [1, 4096, 0, 3, 10], [2, 128, 0, 3, 10], [2, 4096, 4096, 2, 10], [2, 4096, 0, 2, 10000]])("bounds sealed query results by %i entries and %i bytes with %i proof bytes (%i evaluations, %ims source)", async (entries, bytes, proofBytes, evaluations, sourceMs) => {
 		const disposed = vi.fn(), queryDisposals: ReturnType<typeof vi.fn>[] = [];
 		let now = 100;
-		const clock = vi.spyOn(performance, "now").mockImplementation(() => now), admission = vi.spyOn(scheduling, "candidateJoinBudget");
+		const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
 		const learned = entries === 2 && bytes === 4096 && !proofBytes, unretained = bytes === 128;
 		const queryValidate = vi.fn(async () => { now += 3; return validResource(); });
 		const reconstruct = vi.fn<NonNullable<WorldBranch<string>["reconstruct"]>>(async ({ args }) => { now += 20; const dispose = vi.fn(); queryDisposals.push(dispose); return { dispose, output: String((args as { offset: number }).offset), capturedBytes: proofBytes, ...(proofBytes ? { validate: queryValidate } : {}) }; });
@@ -1904,7 +1904,7 @@ describe("structural speculative runtime", () => {
 			expect(reconstruct).toHaveBeenCalledTimes(evaluations + (unretained ? 1 : 0));
 			expect(events.filter((event) => event.type === "task").at(-1)?.timing).toMatchObject({
 				actorComputeMs: unretained ? 20 : 0, reusedExecutionMs: unretained ? 0 : 20 });
-		} finally { await runtime.dispose(); clock.mockRestore(); admission.mockRestore(); }
+		} finally { await runtime.dispose(); clock.mockRestore(); }
 		expect(disposed).toHaveBeenCalledOnce(); expect(runtime.inspect().sharedCandidates).toBe(0);
 		for (const dispose of queryDisposals) expect(dispose).toHaveBeenCalledOnce();
 	});

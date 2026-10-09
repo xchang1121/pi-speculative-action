@@ -6,7 +6,7 @@ import { commitBenchmarkFixture, compileBenchmarkHelper, createLinuxProcessBench
 
 test("preserves held-child output, effects and one-shot authority across parent commands", { timeout: 30_000 }, async ({ skip }) => {
 	if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
-	const fixture = await createLinuxProcessBenchmark("pi-held-production-", undefined, { candidateJoinTimeoutMs: () => 1250 });
+	const fixture = await createLinuxProcessBenchmark("pi-held-production-");
 	const { backend, workspace } = fixture;
 	try {
 		const status = await backend.check(true);
@@ -89,7 +89,7 @@ int main(int argc, char **argv) {
 		];
 		for (const scenario of cases) {
 			const before = backend.metrics();
-			const publication = scenario.name === "running" ? holdProcessPublication(backend) : undefined;
+			const publication = scenario.name === "running" ? holdProcessPublication(backend, 1500) : undefined;
 			const pending = produce(`: speculative-parent; ${scenario.command}`);
 			// Observe rejection immediately, while keeping the branch owned until every Actor has returned.
 			const settled = pending.catch(() => undefined);
@@ -116,7 +116,7 @@ int main(int argc, char **argv) {
 					if (scenario.name === "stale" || scenario.name === "link") await writeFile(path.join(workspace, scenario.name === "stale" ? "input.txt" : "data.txt"), scenario.name === "stale" ? "after\n" : "v2\n");
 				}
 				const result = await actor(`printf 'actor-parent\\n'; ${scenario.command}`, "benchmark", scenario.name !== "descriptor");
-				if (publication) expect(publication.evidence()?.decision.waitBudgetMs).toBe(1250);
+				if (publication) expect(publication.joined()).toBe(true);
 				expect(result.output, scenario.name).toBe(`actor-parent\n${scenario.expected}`);
 				if (scenario.file) expect(await readFile(path.join(workspace, scenario.file), "utf8"))
 					.toBe(scenario.name === "descriptor" ? "descriptor" : `artifact:${scenario.name === "stale" ? "after" : "before"}\n`);

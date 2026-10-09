@@ -247,9 +247,6 @@ describe("Linux process ExecutionWorld", () => {
 		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-live-process-");
 		let host: ReturnType<typeof createSpeculativeActionHost> | undefined;
-		// Timing policy is tested separately. Allow both admission and enough time to reach a safe frontier from active computation.
-		const wait = scheduling.waitForCandidate, admitted = vi.spyOn(scheduling, "waitForCandidate")
-			.mockImplementation((promise, signal) => wait(promise, signal, 10_000));
 		try {
 			await prepareLinuxProcessReuse(fixture);
 			if (!(await Reflect.get(fixture.backend, "ready")).imageLibrary) return skip("native process image capture is unavailable");
@@ -425,7 +422,7 @@ int main(int argc, char **argv) {
 			await expect.poll(() => existsSync(`/proc/${privatePid}`), { timeout: 5_000 }).toBe(false); // Retirement kills asynchronously, as for cancel.
 			if (resumed) expect(events.filter(event => event.type === "operation_prediction"), diagnostic()).toContainEqual(expect.objectContaining({ settlement: expect.objectContaining({
 				observation: "observed", match: expect.objectContaining({ matched: true, adoption: expect.objectContaining({ status: "adopted" }) }) }) }));
-		} finally { admitted.mockRestore(); await host?.dispose(); await fixture.dispose(); }
+		} finally { await host?.dispose(); await fixture.dispose(); }
 	});
 
 	test("transfers native Bash FD inputs to filesystem tools across turns with exact invalidation", { timeout: 30_000 }, async ({ skip }) => {
@@ -929,19 +926,19 @@ int main(int argc, char **argv) {
 				await route.executor.execute({ command: changedParent, cwd: fixture.workspace, environment: fixture.environment,
 					scope: { ...scope, turnID: "foreign" }, onData: bytes => { output += bytes.toString(); } });
 				expect(output).toBe("automatic-parent\nnewest\n");
-				expect(publication!.evidence(), "another turn cannot wait for this one-shot producer").toBeUndefined();
+				expect(publication!.joined(), "another turn cannot wait for this one-shot producer").toBe(false);
 			}
 			const actor = vi.fn(() => fixture.coordinator.runWith({ execute: request => route.executor.execute({ ...request,
 				scope: { ...scope, turnID: "prepared" } }) }, () => fixture.tool.execute("prepared", { command: changedParent })));
 			const nativeExecution = host.execute(call("prepared", changedParent), undefined, actor);
 			void nativeExecution.catch(() => undefined);
-			if (running) await expect.poll(() => publication!.evidence()?.decision.allowed).toBe(true);
+			if (running) await expect.poll(() => publication!.joined()).toBe(true);
 			const stalePreparation = mode.endsWith("prepared-stale");
 			expect((await nativeExecution).content).toEqual([{ type: "text", text: `automatic-parent\n${stalePreparation ? "changed after preparation\n" : "newest\n"}${suffix}` }]);
 			expect(actor).toHaveBeenCalledOnce();
 			if (segmented || orphan) expect(fixture.backend.actorMetrics().hits).toBe(1);
 			if (orphan) expect(publishing.mock.calls.some(([certificate]) => certificate.prototype.inheritedFDs.some(fd => fd.installed === false))).toBe(true);
-			expect(fixture.backend.actorMetrics().joinedHits, JSON.stringify({ joinEvidence: publication?.evidence(), metrics: fixture.backend.actorMetrics() })).toBe(Number(running));
+			expect(fixture.backend.actorMetrics().joinedHits, JSON.stringify({ joined: publication?.joined(), metrics: fixture.backend.actorMetrics() })).toBe(Number(running));
 			await host.finishTurn("prepared");
 			const execution = events.filter(event => event.type === "actor_action")
 				.find(event => event.turnID === "prepared")!.settlement.provider.toolExecution;
@@ -2108,7 +2105,7 @@ int main(void) { int fds[2], status; char queue[8]; if (pipe(fds) || fds[0] != 3
 			}, close } as unknown as LinuxHeldExecBoundary;
 		});
 		const planner = vi.spyOn(fixture.backend.planner, "plan");
-		const admission = vi.spyOn(scheduling, "waitForCandidate");
+		const admission = vi.spyOn(scheduling, "waitForCompletion");
 		const processInvocation = resolvePiToolInvocation("bash", { command: ":" }, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath })!.process!;
 		const invocation = vi.fn(() => processInvocation);
 		const coordinator = new ProcessExecutionCoordinator(host, {

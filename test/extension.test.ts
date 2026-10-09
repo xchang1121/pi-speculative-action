@@ -40,10 +40,11 @@ describe("zero-modification Pi extension", () => {
 		const defaults = normalizeSpeculativeActionSettings(undefined);
 		for (const value of [-1, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
 			const normalized = normalizeSpeculativeActionSettings({ candidateLimit: value, maxConcurrentActions: value, predictionTimeoutMs: value,
-				scheduling: { candidateJoinTimeoutMs: value, resourcePollIntervalMs: value, heavyCpu: value }, selfSpeculation: { timeoutMs: value, forkMaxAttempts: value } });
+				scheduling: { resourcePollIntervalMs: value, heavyCpu: value }, selfSpeculation: { timeoutMs: value, forkMaxAttempts: value } });
 			expect(normalized).toEqual(defaults);
 		}
-		expect(normalizeSpeculativeActionSettings({ scheduling: { candidateJoinTimeoutMs: 0 }, thinkThreadTimeoutMs: 2 ** 31 })).toEqual({ ...defaults, scheduling: { ...defaults.scheduling, candidateJoinTimeoutMs: 0 } });
+		expect(normalizeSpeculativeActionSettings({ thinkThreadTimeoutMs: 2 ** 31 })).toEqual(defaults);
+		expect(normalizeSpeculativeActionSettings(JSON.parse('{"scheduling":{"candidateJoinTimeoutMs":0}}'))).toEqual(defaults);
 	});
 	it("registers stock overrides, previews the stream without claiming it, then adopts once", async () => {
 		const fixture = await createFixture({ reuse: { result: textResult("cached"), isError: false } });
@@ -544,7 +545,7 @@ describe("zero-modification Pi extension", () => {
 			"Speculative action": ["Advanced settings", "Prediction sources", "Apply changes", "Close"],
 			"Advanced settings": ["Scheduling and storage", "Actor probe and target verification", "Learned-pattern tuning", "Back"],
 			"Scheduling and storage": ["Scheduler policy", "Resource estimates", "Prediction wait limit", "ThinkThread execution timeout", "Live result memory", "Reusable command history entries", "Reusable command history memory", "Reclaim", "Clear", "Clear", "Back"],
-			"Scheduler policy": ["Actor join wait", "Resource sampling interval", "GPU sampling interval", "GPU query timeout", "Failures before circuit", "Retry every", "Back"],
+			"Scheduler policy": ["Resource sampling interval", "GPU sampling interval", "GPU query timeout", "Failures before circuit", "Retry every", "Back"],
 			"Resource estimates": ["Process/tree CPU", "File snapshot CPU", "Process/tree memory", "File snapshot memory", "Process/tree I/O", "File snapshot I/O", "Back"],
 			"Actor probe advanced": ["Integration and authentication", "Fork decoding", "Target verification", "Back"],
 			"Integration and authentication": ["Integration", "Control service URL", "Service protocol", "Back"],
@@ -565,7 +566,7 @@ describe("zero-modification Pi extension", () => {
 			({
 				"Prediction wait limit (ms)": "1",
 				"ThinkThread execution timeout (ms)": "6543",
-				"Actor join wait (ms, 0 for immediate fallback)": "0", "Resource sampling interval (ms)": "73",
+				"Resource sampling interval (ms)": "73",
 				"GPU sampling interval (ms)": "701", "GPU query timeout (ms)": "702",
 				"Failures before circuit opens": "3", "Retry every N eligible Actor decisions": "2",
 				"Process/tree CPU units": "3", "File snapshot CPU units": "2",
@@ -596,7 +597,7 @@ describe("zero-modification Pi extension", () => {
 			selfSpeculation: { endpoint: "http://127.0.0.1:8000", forkTransport: "sidecar", forkActionMinConfidence: 0.75, requireLogprobs: true,
 				forkMaxAttempts: 3, forkRetryStreamUpdates: 7, forkBoundaryStreamUpdates: 2, requestIDField: "trace_id",
 				forkPath: "/v2/fork", candidatePath: "/v2/candidates", clearPath: "/v2/clear", capabilitiesPath: "/v2/capabilities" },
-			scheduling: { candidateJoinTimeoutMs: 0, resourcePollIntervalMs: 73, gpuPollIntervalMs: 701, gpuProbeTimeoutMs: 702,
+			scheduling: { resourcePollIntervalMs: 73, gpuPollIntervalMs: 701, gpuProbeTimeoutMs: 702,
 				failureThreshold: 3, failureRetryDecisions: 2, heavyCpu: 3, lightCpu: 2, heavyMemoryBytes: 80 * 1024 * 1024, lightMemoryBytes: 9 * 1024 * 1024, heavyIo: 0.4, lightIo: 0.1 },
 			patternAware: { futureGapCoverage: 0.8, enabled: false, multiStepEnabled: false },
 		});

@@ -35,7 +35,7 @@ import { emptyWorldReuseMetrics, snapshotExecutionScope, type ExecutionScope, ty
 	type WorldReuseMetrics } from "./execution-world.ts";
 import { type ProcessReusePlan, ProcessReusePlanner } from "./reuse-planner.ts";
 import { ProvenanceCertificateStore, type ProvenanceStoreOptions, type VerifiedArtifactClosure } from "./reuse-store.ts";
-import { candidateJoinBudget, waitForCandidate } from "./scheduler.ts";
+import { waitForCompletion } from "./scheduler.ts";
 import { observeStrace, straceCommand, traceTail, type ObservedProcessPath, type StraceObservation, type TraceTail, type TracedWrite, writesWithin } from "./strace-observer.ts";
 import type { WorkspaceTransactionOwnership } from "./workspace-transaction.ts";
 import type { ToolProcessInvocation } from "./tool-settlement.ts";
@@ -65,7 +65,6 @@ export interface LinuxProcessBackendOptions {
 	readonly sandlockBinary?: string;
 	readonly straceBinary?: string;
 	readonly heldExecBinary?: string;
-	readonly candidateJoinTimeoutMs?: () => number;
 	/** Additional host paths that speculative processes must never read. */
 	readonly deniedPaths?: readonly string[];
 }
@@ -969,7 +968,7 @@ export class LinuxProcessReuseBackend {
 					const waitStarted = performance.now();
 					const waiting = new AbortController(), stop = signal ? AbortSignal.any([signal, waiting.signal]) : waiting.signal;
 					const completion = running.suspend ? running.suspend(stop).then(() => running.completion) : running.completion;
-					const finished = await waitForCandidate(completion, signal, candidateJoinBudget("running", this.options.candidateJoinTimeoutMs?.())).finally(() => waiting.abort());
+					const finished = await waitForCompletion(completion, signal).finally(() => waiting.abort());
 					const interval = new TimelineInterval(waitStarted, performance.now());
 					waits.push({ handoff: running, interval });
 					if (finished.status === "completed") return "completed";
@@ -1521,7 +1520,7 @@ export class LinuxProcessReuseBackend {
 		}
 	}
 
-	/** Retry safe declines only while the existing Actor join still owns a wait budget. */
+	/** Retry safe declines until the producer finishes or the Actor cancels its join. */
 	private async requestProcessImageAtFrontier(descriptorReportPath: string, channel: import("node:stream").Duplex,
 		wake: () => boolean, stop: AbortSignal, executionSignal: AbortSignal): Promise<{ pid: number; reply: Buffer } | undefined> {
 		while (!stop.aborted) {
@@ -1533,12 +1532,12 @@ export class LinuxProcessReuseBackend {
 				if (IO_FRONTIERS.has(syscall) && !stop.aborted) {
 					// An observed I/O syscall can finish before the interrupt. Zero leaves the private process running;
 					// a nonzero reply retires it and must follow the existing image or capture-failure checks.
-					// Drain a sent request even after the Actor deadline, so a late reply cannot belong to another request.
+					// Drain a sent request even after Actor cancellation, so a late reply cannot belong to another request.
 					const reply = await requestProcessImage(pid, channel, wake, executionSignal);
 					if (reply.readInt32LE(0) !== 0) return { pid, reply };
 				}
 			} else if (report.startsWith("OFD ")) return;
-			// CPU work and transient non-I/O syscalls may still reach an admissible frontier within this same budget.
+			// CPU work and transient non-I/O syscalls may still reach an admissible frontier.
 			if (!stop.aborted) await delay(10, undefined, { signal: stop }).catch(() => undefined);
 		}
 	}

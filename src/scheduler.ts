@@ -2,7 +2,6 @@ import { nonNegativeCount as sequence, nonNegativeFinite as finite, positiveCoun
 import { BoundedRecencyMap } from "./bounded-recency-map.ts";
 import type { WorldCompatibilityEvidence } from "./execution-world.ts";
 import { normalizeSchedulingSettings, SCHEDULING_DEFAULTS, type SchedulingSettings } from "./scheduling-settings.ts";
-import { milliseconds } from "./setting-input.ts";
 import { RESOURCE_DIMENSIONS as dimensions, type ExecutionResourceMonitor, type ExecutionResourceSnapshot, type HardwareResources } from "./system-resources.ts";
 
 export interface ExecutionIdentity {
@@ -42,16 +41,14 @@ export interface ScheduledWork {
 	readonly dependenciesResolved: boolean;
 }
 
-export const CANDIDATE_JOIN_TIMEOUT_MS = SCHEDULING_DEFAULTS.candidateJoinTimeoutMs;
-export function candidateJoinBudget(state: "queued" | "running" | "succeeded", timeoutMs?: number): number {
-	return state === "succeeded" ? 0 : milliseconds(timeoutMs, CANDIDATE_JOIN_TIMEOUT_MS);
-}
-export type CandidateWaitResult<T> = { readonly status: "completed"; readonly value: T } | { readonly status: "aborted" } | { readonly status: "deadline" };
+export type CompletionWaitResult<T> = { readonly status: "completed"; readonly value: T } | { readonly status: "aborted" } | { readonly status: "deadline" };
 
-/** Protocol deadline and cancellation, independent of scheduling value or past executions. */
-export async function waitForCandidate<T>(promise: Promise<T>, signal?: AbortSignal, waitBudgetMs?: number): Promise<CandidateWaitResult<T>> {
+/** Actor joins supply cancellation only; source production and teardown may impose their own deadline. */
+export function waitForCompletion<T>(promise: Promise<T>, signal?: AbortSignal): Promise<Exclude<CompletionWaitResult<T>, { status: "deadline" }>>;
+export function waitForCompletion<T>(promise: Promise<T>, signal: AbortSignal | undefined, timeoutMs: number | undefined): Promise<CompletionWaitResult<T>>;
+export async function waitForCompletion<T>(promise: Promise<T>, signal?: AbortSignal, timeoutMs?: number): Promise<CompletionWaitResult<T>> {
 	if (signal?.aborted) { void promise.catch(() => undefined); return { status: "aborted" }; }
-	const bounded = waitBudgetMs !== undefined && Number.isFinite(waitBudgetMs);
+	const bounded = timeoutMs !== undefined && Number.isFinite(timeoutMs);
 	if (!signal && !bounded) return { status: "completed", value: await promise };
 	return new Promise((resolve, reject) => {
 		let settled = false, timer: ReturnType<typeof setTimeout> | undefined;
@@ -61,7 +58,7 @@ export async function waitForCandidate<T>(promise: Promise<T>, signal?: AbortSig
 		};
 		const aborted = () => finish(() => resolve({ status: "aborted" }));
 		signal?.addEventListener("abort", aborted, { once: true });
-		if (bounded) timer = setTimeout(() => finish(() => resolve({ status: "deadline" })), Math.max(0, waitBudgetMs));
+		if (bounded) timer = setTimeout(() => finish(() => resolve({ status: "deadline" })), Math.max(0, timeoutMs));
 		void promise.then(value => finish(() => resolve({ status: "completed", value })), error => finish(() => reject(error)));
 	});
 }

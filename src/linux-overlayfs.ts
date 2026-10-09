@@ -8,7 +8,7 @@ import { BoundedRecencyMap } from "./bounded-recency-map.ts";
 import { resolveHostExecutable } from "./executable-path.ts";
 import { advanceFilesystemClock, mapFilesystem } from "./filesystem-evidence.ts";
 import { errorMessage, isMissing } from "./error-utils.ts";
-import { waitForCandidate } from "./scheduler.ts";
+import { waitForCompletion } from "./scheduler.ts";
 import { positiveInteger as positiveCapacity, nonNegativeNumber as nonNegativeDuration } from "./setting-input.ts";
 
 const OVERLAY_OPTIONS_EPOCH = "fuse-overlayfs-cow";
@@ -402,7 +402,7 @@ async function closeMount(
 		try { await execText(fusermountBinary, ["-u", mountRoot]); } catch (error) { unmountError = error; child.kill("SIGKILL"); }
 	}
 	child.stdin.end();
-	const waitForClose = () => waitForCandidate(processClosed, undefined, OVERLAY_EXIT_TIMEOUT_MS);
+	const waitForClose = () => waitForCompletion(processClosed, undefined, OVERLAY_EXIT_TIMEOUT_MS);
 	let processShutdownDegraded = false;
 	if ((await waitForClose()).status !== "completed") {
 		child.kill("SIGKILL");
