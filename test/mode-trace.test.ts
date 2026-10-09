@@ -30,7 +30,7 @@ function actor(mode: string, sequence: number, reusedExecutionMs?: number, input
 		settlement: {
 			actorAction: { id: `actor-${sequence}`, sequence, turnID: "turn" }, tool: "read", matchedPredictions: [], rejections: [],
 			provider: { kind: "speculative", candidateID: "candidate", match: inputs ? { kind: "inputs", distance: 0 } : { kind: "exact", distance: 0 },
-				timing: { hitLatencyMs: 200 }, toolExecution: new TimelineInterval(10, 1010) },
+				toolExecution: new TimelineInterval(10, 1010) },
 		},
 	};
 }
@@ -77,7 +77,6 @@ describe("per-mode trace results", () => {
 		expect(summary.modesBySource.pattern_aware?.["reported-files"]).toEqual({
 			observed: 0, matched: 0, adopted: 0, started: 0, productionMs: 0, reusedExecutionMs: 9,
 		});
-		expect(summary.hitLatencyMs).toBe(400);
 	});
 
 	it("attributes fallback consumption from its receipt breakdown and leaves missing provenance unassigned", () => {

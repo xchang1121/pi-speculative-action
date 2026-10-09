@@ -467,21 +467,6 @@ describe("structural speculative runtime", () => {
 		} finally { await runtime.dispose(); }
 	});
 
-	it("calibrates a repeatedly adopted result with one Actor execution and then resumes reuse", async () => {
-		const { runtime, ready, events, executions } = harness({ source: planSource({ propose: () => plan("calibration"), observesOperations: () => true, observe: () => undefined }) });
-		try {
-			await runtime.startTurn(start("turn")); await ready.promise;
-			for (let index = 0; index < 4; index++) expect(await runtime.prepareActorCall({ ...call("turn"), id: `hit-${index}` })).toMatchObject({ output: "speculative", observeOperations: false });
-			await runFallback(runtime, { ...call("turn"), id: "calibration" }, 100, "speculative");
-			for (let index = 0; index < 4; index++) expect(await runtime.prepareActorCall({ ...call("turn"), id: `measured-${index}` })).toMatchObject({ output: "speculative", observeOperations: false });
-			await runtime.finishTurn({ ...call("turn"), terminal: true });
-			const actions = events.filter(event => event.type === "actor_action");
-			expect(actions.filter(event => event.settlement.provider.kind === "actor")).toHaveLength(1);
-			expect(actions.find(event => event.settlement.actorAction.id === "calibration")?.settlement.rejections)
-				.toMatchObject([{ cause: { code: "candidate_calibration_sample" } }]);
-			expect(executions()).toBe(1);
-		} finally { await runtime.dispose(); }
-	});
 
 	it.each(["same", "next", "unused"])("separates internal execution, matching and continuation in the %s turn even when an adapter collides keys", async mode => {
 		const binding = Object.freeze({ backend: "process", identity: "child", permissionHash: "parent", executionMs: 2, expectedDurationMs: 3 });
@@ -498,7 +483,7 @@ describe("structural speculative runtime", () => {
 				if (candidate.type === "operation") { adopted = onOperationAdopted; acceptScope = acceptOperationScope; }
 				return world(candidate.type === "operation" ? "child only" : "whole tool", { validate: async () => validResource(),
 					executionMetrics: candidate.type === "operation" ? { reuse: {
-						...emptyWorldReuseMetrics(), requests: 2, hits: 1, crossTurnHits: 1, replayMs: 3,
+						...emptyWorldReuseMetrics(), requests: 2, hits: 1, crossTurnHits: 1,
 					} } : {},
 				});
 			},
@@ -534,7 +519,7 @@ describe("structural speculative runtime", () => {
 			} }]);
 			expect(summary()).toMatchObject({ operationPredictionsSettled: 1, operationPredictionsAdopted: mode === "unused" ? 0 : 1,
 				candidateStarted: 2, candidateSucceeded: 2, candidateFailed: 0,
-				processReuse: { requests: 2, hits: 1, crossTurnHits: 1, replayMs: 3 } });
+				processReuse: { requests: 2, hits: 1, crossTurnHits: 1 } });
 			expect(continuation.mock.calls.every(([input]) => input.actionID === "whole")).toBe(true);
 			expect(events.filter(event => event.type === "actor_action")).toHaveLength(mode === "next" ? 2 : 1);
 		} finally { await runtime.dispose(); }
@@ -886,6 +871,25 @@ describe("structural speculative runtime", () => {
 			actorActions: 1, speculativeHits: 0, actorFallbacks: 1, totalDraftTokens: 3 });
 	});
 
+	it("reuses each fresh retained result after slow validation", async () => {
+		let now = 0;
+		const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
+		const validate = vi.fn(async () => { now += 2000; return validResource(); });
+		const { runtime } = harness({ source: planSource({ propose: () => undefined }),
+			captureAuthoritativeResult: ({ action }) => ({ route: RESOURCE_ROUTE, dispose: () => {},
+				seal: output => world(output, { executionFingerprint: action.executionFingerprint, validate }) }) });
+		try {
+			for (let index = 0; index < 12; index++) {
+				const actor = call(`ready-${index}`); await runtime.startTurn(actor);
+				const prepared = await runtime.prepareActorCall(actor);
+				if (index === 0) { expect(prepared?.output).toBeUndefined(); await prepared?.settle(new TimelineInterval(0, 2), "retained"); }
+				else expect(prepared?.output).toBe("retained");
+				await runtime.finishTurn(actor);
+			}
+			expect(validate).toHaveBeenCalledTimes(11);
+		} finally { await runtime.dispose(); clock.mockRestore(); }
+	});
+
 	it("waits for an in-flight candidate to capture its resource baseline before validation", async () => {
 		const captured = deferred<{ version: number }>();
 		const captureStarted = barrier();
@@ -910,17 +914,6 @@ describe("structural speculative runtime", () => {
 		await runtime.finishTurn({ ...call("turn"), terminal: true });
 	});
 
-	it("waits for an unmeasured run up to the Actor's own cost rather than a placeholder duration", async () => {
-		const started = deferred<void>(), { runtime } = harness({ source: planSource({ propose: ({ startInput }) => startInput.turnID === "cold" ? plan("cold") : undefined }),
-			execute: async () => { started.resolve(); await new Promise((resolve) => setTimeout(resolve, 150)); return "cold"; } });
-		try {
-			await runtime.startTurn(start("calibration"));
-			await runFallback(runtime, call("calibration"), 1000);
-			await runtime.finishTurn({ ...call("calibration"), terminal: false });
-			await runtime.startTurn(start("cold")); await started.promise;
-			expect((await runtime.prepareActorCall(call("cold")))?.output).toBe("cold");
-		} finally { await runtime.dispose(); }
-	});
 
 	it.each(["failed", "costly-used", "profitable-used"] as const)("charges operation preparation before admitting another distinct launch (%s)", async mode => {
 		let elapsed = 0, completed = deferred<void>();
@@ -1048,7 +1041,6 @@ describe("structural speculative runtime", () => {
 			observe: () => undefined,
 		});
 		const { runtime, events, ready: candidateReady } = harness({ source, execute: async () => { await gate.wait(); return "learned"; } });
-		const adoption = vi.spyOn(SpeculationScheduler.prototype, "observeAdoption");
 
 		await runtime.startTurn(start("calibration"));
 		const calibration = call("calibration");
@@ -1067,7 +1059,6 @@ describe("structural speculative runtime", () => {
 		await prepared?.settle(simulatedExecution(100), "actor");
 		await runtime.finishTurn({ ...call("prediction"), terminal: false });
 		expect(events.find((event) => event.type === "actor_action" && event.turnID === "prediction")).toMatchObject({ settlement: { provider: { kind: "actor" }, rejections: [{ cause: { code: "candidate_join_deadline" } }] } });
-		expect(adoption).not.toHaveBeenCalled(); adoption.mockRestore(); // A deadline exit began no adoption work to sample.
 		enabled = false;
 		await runtime.startTurn(start("retained"));
 		expect(await runtime.prepareActorCall(call("retained"))).toMatchObject({ output: "learned", observeOperations: false });
@@ -1075,7 +1066,7 @@ describe("structural speculative runtime", () => {
 		const event = events.find((event) => event.type === "actor_action" && event.turnID === "retained");
 		const retained = event?.type === "actor_action" ? event.settlement.provider : undefined;
 		expect(retained?.kind).toBe("speculative");
-		if (retained?.kind === "speculative") expect(retained.timing.expectedActorMs).toBeGreaterThanOrEqual(100);
+		expect(retained).not.toHaveProperty("timing");
 	});
 
 	it.each(["refresh", "disabled", "disposed", "unwrapped", "terminal", "replaced", "evicted", "concurrent-refresh"] as const)("keeps prediction launch ownership across validation: %s", async (mode) => {
@@ -1418,50 +1409,6 @@ describe("structural speculative runtime", () => {
 		expect(runtime.inspect().pendingPredictions).toBe(0);
 	});
 
-	it.each(["matched", "terminal", "future", "next-terminal"] as const)("launches queued work only for current demand after Actor timings change: %s", async (mode) => {
-		const queued = barrier(), materialized = barrier();
-		const original = SpeculationScheduler.prototype.admit;
-		const admission = vi.spyOn(SpeculationScheduler.prototype, "admit").mockImplementation(function (this: SpeculationScheduler<object>, job, forecasts, ...rest) {
-			const result = original.call(this, job, forecasts, ...rest);
-			if (!result.admitted && forecasts.length === (mode === "future" ? 2 : 1)) queued.arrive();
-			return result;
-		});
-		const proposal = () => ({ ...plan("demand", {}), actions: [0, ...(mode === "future" ? [1] : [])].map((horizon) =>
-			readAction(String(horizon), { path: "README.md" }, { horizon, expectedDurationMs: 500 }),
-		) });
-		const { runtime, executions: executionCount, ready: succeeded } = harness({
-			source: planSource({
-				propose: ({ startInput }) => mode !== "next-terminal" && startInput.turnID === "demand" ? proposal() : undefined,
-				observe: ({ consumeInput }) => mode === "next-terminal" && consumeInput.turnID === "demand" ? proposal() : undefined }),
-			onCandidateMaterialized: () => materialized.arrive(),
-		});
-		try {
-			for (const [index, durationMs] of [1, 1000, 1000, 1000].entries()) {
-				const actor = call(`seed-${index}`);
-				await runtime.startTurn(actor);
-				await runFallback(runtime, actor, durationMs, "native");
-				await runtime.finishTurn(actor);
-			}
-			const actor = call("demand");
-			await runtime.startTurn(actor); if (mode !== "next-terminal") await queued.promise;
-			expect(executionCount()).toBe(0);
-			await runFallback(runtime, actor, 1000, "native");
-			if (mode === "next-terminal") await materialized.promise;
-			await runtime.finishTurn({ ...actor, terminal: mode === "terminal" });
-			if (mode === "next-terminal") {
-				const done = call("done"); await runtime.startTurn(done);
-				await runtime.finishTurn({ ...done, terminal: true });
-			}
-			if (mode === "future") await succeeded.promise;
-			await nextTurn();
-			expect(executionCount()).toBe(mode === "future" ? 1 : 0);
-			expect(runtime.inspect().sharedCandidates).toBe(mode === "future" ? 1 : 0);
-			if (mode === "future") {
-				const next = call("next"); await runtime.startTurn(next);
-				expect((await runtime.prepareActorCall(next))?.output).toBe("speculative");
-			}
-		} finally { await runtime.dispose(); admission.mockRestore(); }
-	});
 
 	it("orders queued predictions by the streamed tool name without holding the others back", async () => {
 		const started: string[] = [], release = deferred<void>();
@@ -1613,7 +1560,6 @@ describe("structural speculative runtime", () => {
 		.flatMap((scenario) => [false, ...(!scenario.startsWith("running") ? [true] : [])].map((preview) => [scenario, preview] as const)))(
 	"adopts reconstructed input or owned output coverage only after stable evaluation: %s (preview=%s)", async (scenario, preview) => {
 		const admission = vi.spyOn(SpeculationScheduler.prototype, "assessCandidateJoin");
-		const adoption = vi.spyOn(SpeculationScheduler.prototype, "observeAdoption");
 		const commit = vi.fn(async () => "committed"), queryDisposals: ReturnType<typeof vi.fn>[] = [];
 		const gate = gated(), controller = new AbortController();
 		const started = barrier(), completion = barrier(), authorized = barrier(), running = scenario.startsWith("running");
@@ -1684,7 +1630,6 @@ describe("structural speculative runtime", () => {
 			expect(await consumed).toBe(succeeds ? "narrow" : undefined);
 			expect(commit).toHaveBeenCalledTimes(succeeds && !scoped ? 1 : 0);
 			expect(scoped ? queryValidate : validate).toHaveBeenCalledTimes(succeeds || scenario === "changed" ? 1 : 0);
-			if (["rejected", "changed", "uncovered", "output-rejected"].includes(scenario)) expect(adoption).toHaveBeenCalledOnce();
 			if (inputLookup) {
 				expect((await runtime.prepareActorCall({ ...actor, id: "same-query" }))?.output).toBe("narrow");
 				expect(reconstruct).toHaveBeenCalledOnce();
@@ -1698,19 +1643,11 @@ describe("structural speculative runtime", () => {
 				expect((await runtime.prepareActorCall({ ...actor, id: "second-reader" }))?.output).toBe("narrow");
 				expect(commit).toHaveBeenCalledTimes(2);
 			}
-			if (succeeds) {
-				const request = admission.mock.lastCall![0], actorHash = buildPiActionKey(actor.tool, actor.input, "/workspace")!.hash;
-				expect(request.actorIdentity?.actionKeyHash).toBe(actorHash);
-				expect(adoption.mock.lastCall![0]).toEqual(request.adoptionIdentity);
-				expect(request.adoptionIdentity).toMatchObject({ actionKeyHash: JSON.stringify([request.identity.actionKeyHash, actorHash]),
-					operation: JSON.stringify([RESOURCE_ROUTE.backend, RESOURCE_ROUTE.fingerprint, RESOURCE_ROUTE.scope,
-						RESOURCE_ROUTE.isolation, RESOURCE_ROUTE.reuse, inputLookup ? "inputs" : "read.range",
-						...(preview || inputLookup || scenario === "output-valid" ? ["retained"] : [])]) });
-			}
+			if (succeeds) expect(admission.mock.lastCall![0].identity.tool).toBe("read");
 		} finally {
 			completion.arrive(); gate.release(); await Promise.all([preparation, consumed]);
 			await runtime.finishTurn({ ...actor, terminal: true }); await runtime.dispose();
-			admission.mockRestore(); adoption.mockRestore();
+			admission.mockRestore();
 		}
 		for (const dispose of queryDisposals) expect(dispose).toHaveBeenCalledOnce();
 		const computations = events.filter(event => event.type === "actor_action").map(event => event.computation!);
@@ -1905,8 +1842,7 @@ describe("structural speculative runtime", () => {
 			await started.promise;
 			if (mode.endsWith("preview")) {
 				if (mode === "owned-preview") await runtime.previewActorCall(call("turn"));
-				else admission.mockReturnValueOnce({ allowed: false, reason: "fallback_faster", waitBudgetMs: 0,
-					speculativeSamples: 1, actorSamples: 1, adoptionSamples: 0, expectedRemainingMs: 10, expectedAdoptionMs: 0, expectedActorMs: 1 });
+				else admission.mockReturnValueOnce({ allowed: false, reason: "deadline", waitBudgetMs: 0 });
 				const prepared = await runtime.prepareActorCall(mode === "orphan-preview" ? call("turn") : { ...call("turn"), tool: "bash", input: { command: "git status" } });
 				expect(prepared?.output).toBeUndefined();
 				expect(executionSignal!.aborted).toBe(mode === "orphan-preview");
@@ -1970,41 +1906,6 @@ describe("structural speculative runtime", () => {
 		} finally { await runtime.dispose(); }
 	});
 
-	it.each([0, 40])("calibrates loss and recovery per Actor call across competing cached results with %ims capture", async (captureMs) => {
-		let now = 1, cost = 20;
-		const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
-		const { runtime } = harness({ source: { id: "none", enabled: () => false, propose: () => undefined },
-			captureAuthoritativeResult: ({ action }) => {
-				now += captureMs / 2;
-				return { route: RESOURCE_ROUTE, dispose: () => {}, seal: (output) => {
-					now += captureMs / 2;
-					return world(output, { executionFingerprint: action.executionFingerprint,
-						validate: async () => { now += cost; return validResource(); } });
-				} };
-			} });
-		const run = async (prefix: string, count: number) => {
-			const reused: boolean[] = [];
-			for (let index = 0; index < count; index++) {
-				const actor = call(`${prefix}-${index}`); await runtime.startTurn(actor);
-				const prepared = await runtime.prepareActorCall(actor); expect(prepared).toBeDefined();
-				reused.push(prepared?.output !== undefined);
-				if (prepared?.output === undefined) { now += 2; await prepared?.settle(new TimelineInterval(now - 2, now), "actor"); }
-				else expect(prepared.output).toBe("actor");
-				await runtime.finishTurn(actor);
-			}
-			return reused;
-		};
-		try {
-			if (captureMs) expect((await run("capture-cost", 12)).slice(1).every(Boolean)).toBe(true);
-			cost += captureMs;
-			const loss = await run("loss", 32);
-			if (!captureMs) expect(loss.slice(0, 5)).toEqual([false, true, true, true, true]);
-			expect(loss.slice(-8).filter((reused) => !reused).length).toBeGreaterThanOrEqual(4);
-			expect(loss.slice(-8).some(Boolean)).toBe(true);
-			cost = 1;
-			expect((await run("recovery", 256)).slice(-8).every(Boolean)).toBe(true);
-		} finally { await runtime.dispose(); clock.mockRestore(); }
-	});
 
 	it.each(["workspace_mutation", "unbounded"] as const)("skips input retrieval for a bound %s action while retaining exact results", async effect => {
 		const authorize = vi.fn(() => ({ ok: true as const })), reconstruct = vi.fn(async () => ({ output: "query" }));
@@ -2058,8 +1959,7 @@ describe("structural speculative runtime", () => {
 				if (learned && index === 0) {
 					const scheduler = admission.mock.contexts[0] as SpeculationScheduler<object>, request = admission.mock.calls[0]![0];
 					for (let sample = 0; sample < 4; sample++) {
-						scheduler.observeActorService(request.actorIdentity!, 5);
-						scheduler.observeAdoption(request.adoptionIdentity!, 100);
+						scheduler.observeActorService(request.identity, 5);
 					}
 				}
 			}

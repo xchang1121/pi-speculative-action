@@ -12,6 +12,7 @@ import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { PatternAwareStore, patternAwareActionSemantics, patternAwareSettings } from "../src/pattern-aware.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import type { SpeculativeActionEvent } from "../src/events.ts";
+import type { ExecutionResourceMonitor } from "../src/system-resources.ts";
 import { testModel } from "./model.ts";
 import { commitBenchmarkFixture, compileBenchmarkHelper, createLinuxProcessBenchmark, holdProcessPublication, prepareLinuxProcessReuse, textOutput } from "./linux-process-fixture.ts";
 
@@ -40,7 +41,7 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 /** A committed workspace holding `files` and `./slow` (`loops` rounds of CPU over a file's bytes: a stand-in for a test run or a
  * build step), a host over it with PatternAware alone, and one Actor step, a command or a write: prediction starts with it and
  * runs while the Actor model generates for `think` ms. */
-async function chainWorld(files: readonly (readonly [string, string])[], loops: string, draft?: () => Promise<AssistantMessage>) {
+async function chainWorld(files: readonly (readonly [string, string])[], loops: string, draft?: () => Promise<AssistantMessage>, resources?: ExecutionResourceMonitor) {
 	// Under the user's home, as a real workspace is: /tmp is each sandbox's own, so what a runtime observes of the workspace's parents
 	// there (Node's package.json probes) could never be validated.
 	const fixture = await createLinuxProcessBenchmark("pi-chain-", "overlayfs", { cheapChildMs: 50 }, path.join(os.homedir(), ".cache", "pi-speculative-action", "chain")), { workspace } = fixture;
@@ -54,7 +55,7 @@ async function chainWorld(files: readonly (readonly [string, string])[], loops: 
 		const route = await fixture.prepareActorReplay(), writer = createWriteTool(workspace), tools = [fixture.tool, writer];
 		const settings = patternAwareSettings({ enabled: true, multiStepEnabled: false });
 		const events: SpeculativeActionEvent<string>[] = [];
-		const host = createSpeculativeActionHost("chain", { cwd: workspace, complete: draft ?? (async () => { throw new Error("no inference"); }), onEvent: event => { events.push(event); },
+		const host = createSpeculativeActionHost("chain", { cwd: workspace, resources, complete: draft ?? (async () => { throw new Error("no inference"); }), onEvent: event => { events.push(event); },
 			patternStore: new PatternAwareStore(settings, undefined, patternAwareActionSemantics(PI_ACTION_SEMANTICS, workspace)),
 			getSettings: () => ({ enabled: true, drafterEnabled: !!draft, drafterMaxDepth: 1, candidateLimit: draft ? 1 : 4, maxConcurrentActions: 4, tools: draft ? ["bash", "write"] : ["bash"], patternAware: settings }),
 			preflight: () => true, executionWorlds: [fixture.world, fixture.workspaceSandbox.createExecutionWorld()],
@@ -69,7 +70,7 @@ async function chainWorld(files: readonly (readonly [string, string])[], loops: 
 					{ execute: (request) => route.executor.execute({ ...request, scope: { sessionID: "chain", turnID } }) }, () => fixture.tool.execute(turnID, { command: call })));
 			const ms = performance.now() - started, after = fixture.backend.actorMetrics();
 			await host.finishTurn(turnID);
-			return { ms, text: textOutput(result as never), hits: after.hits - before.hits, validationMs: after.validationMs - before.validationMs };
+			return { ms, text: textOutput(result as never), hits: after.hits - before.hits };
 		};
 		return { fixture, workspace, host, step, tools, events };
 	} catch (error) { await fixture.dispose(); throw error; }
@@ -89,8 +90,7 @@ test.skipIf(process.platform !== "linux" || !process.env.PI_SPEC_REUSE_CHAIN)("r
 			const command = (scenario.actual ?? scenario.next).replace("WORKSPACE", workspace);
 			const measured = await step("measured", command, scenario.detour ? 100 : scenario.think ?? 4000, scenario.during);
 			const started = performance.now(), native = execSync(command, { cwd: workspace, encoding: "utf8", shell: "/bin/bash" }), nativeMs = performance.now() - started;
-			rows.push(`${name.padEnd(26)} native ${nativeMs.toFixed(0).padStart(5)} ms  Actor ${measured.ms.toFixed(0).padStart(5)} ms  ${measured.hits ? "reused" : "native"}` +
-				`  validation ${measured.validationMs.toFixed(0)} ms`);
+			rows.push(`${name.padEnd(26)} native ${nativeMs.toFixed(0).padStart(5)} ms  Actor ${measured.ms.toFixed(0).padStart(5)} ms  ${measured.hits ? "reused" : "native"}`);
 			expect(measured.text.trim(), name).toBe(native.trim());
 			expect(measured.hits > 0, name).toBe(scenario.reuse);
 		} finally { await host.dispose(); await fixture.dispose(); }
@@ -99,8 +99,10 @@ test.skipIf(process.platform !== "linux" || !process.env.PI_SPEC_REUSE_CHAIN)("r
 });
 
 test.skipIf(process.platform !== "linux").for(["build", "current_workspace", "changed_after_preparation", "after_horizon", "changed_after_horizon", "bash_mutation", "bash_changed_after_preparation"] as const)("prepares learned work after an Actor edit (%s)", { timeout: 120_000 }, async mode => {
-	const { fixture, workspace, host, step, events } = await chainWorld([["a.txt", "alpha\n"], ["Makefile", "all:\n\t@./slow a.txt\n"]], "600000000");
 	const horizon = mode.endsWith("horizon"), stale = mode.includes("changed_"), bashMutation = mode.startsWith("bash_"), worker = `./slow a.txt${horizon ? " identity" : ""}`;
+	// This retention scenario needs capacity for the detour and producer; CPU preemption has separate coverage.
+	const { fixture, workspace, host, step, events } = await chainWorld([["a.txt", "alpha\n"], ["Makefile", "all:\n\t@./slow a.txt\n"]], "600000000", undefined,
+		horizon ? { initial: { cpuCount: 4, idleCpuCount: 4 }, sample: async () => ({ cpuCount: 4, idleCpuCount: 4 }) } : undefined);
 	let publication: ReturnType<typeof holdProcessPublication> | undefined;
 	try {
 		const command = mode === "build" ? "make -s all" : `${worker} | tail -1${horizon ? `; ${worker} | tail -2` : ""}`;
@@ -115,7 +117,7 @@ test.skipIf(process.platform !== "linux").for(["build", "current_workspace", "ch
 			await step("detour", "printf detour", () => expect.poll(publication!.reached, { timeout: 15_000 }).toBe(true));
 			const operation = events.filter(event => event.type === "candidate").find(event => event.candidate.kind === "operation")!.candidate.id;
 			const states = () => events.filter(event => event.type === "candidate").filter(event => event.candidate.id === operation).map(event => event.state.status);
-			expect(states()).toEqual(["running"]);
+			expect(states(), JSON.stringify(events.filter(event => event.type === "candidate" || event.type === "operation_prediction"))).toEqual(["running"]);
 			expect(events.filter(event => event.type === "operation_prediction").map(event => event.settlement)).toContainEqual(expect.objectContaining({ observation: "unobserved", cause: expect.objectContaining({ code: "operation_not_observed" }) }));
 			publication.close(); publication = undefined;
 			await expect.poll(states, { timeout: 15_000 }).toEqual(["running", "succeeded"]);

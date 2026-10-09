@@ -21,6 +21,8 @@ export interface TimelineDependency {
 type Receipt = Pick<TimelineDependency, "owned" | "reused" | "overhead" | "computeUncertain">;
 const dependencies = new WeakMap<TimelineInterval, readonly TimelineDependency[]>();
 const collecting = new AsyncLocalStorage<{ inputs?: Map<TimelineInterval, Receipt> }>();
+const calculating = new AsyncLocalStorage<CalculationClock | undefined>();
+const calculationSpans = new WeakMap<TimelineInterval, readonly TimelineInterval[]>();
 const provenance = new WeakMap<TimelineInterval, { readonly id: string; readonly priorMs: number }>();
 const owners = new WeakMap<TimelineInterval, TimelineInterval>();
 const producers = new WeakMap<TimelineInterval, ComputationProducer>();
@@ -46,9 +48,10 @@ export class TimelineInterval {
 	readonly startedAt: number;
 	readonly completedAt: number;
 
-	constructor(startedAt: number, completedAt: number, inputs: readonly TimelineDependency[] = []) {
+	constructor(startedAt: number, completedAt: number, inputs: readonly TimelineDependency[] = [], spans?: readonly TimelineInterval[]) {
 		this.startedAt = metric(startedAt);
 		this.completedAt = Math.max(this.startedAt, metric(completedAt));
+		if (spans) calculationSpans.set(this, Object.freeze(spans.map(TimelineInterval.from)));
 		if (inputs.length) dependencies.set(this, Object.freeze(inputs.map(input => Object.freeze({
 			computation: TimelineInterval.from(input.computation),
 			owned: input.owned, reused: input.reused, overhead: input.overhead, computeUncertain: input.computeUncertain,
@@ -82,15 +85,55 @@ export class TimelineInterval {
 		return computation;
 	}
 
+	/** An abandoned evaluation spent its own calculation, but did not successfully consume borrowed work. */
+	static attempted(computation: TimelineInterval): TimelineInterval {
+		const copies = new Map<TimelineInterval, TimelineInterval>();
+		const copy = (current: TimelineInterval): TimelineInterval => {
+			const existing = copies.get(current);
+			if (existing) return existing;
+			const result = new TimelineInterval(current.startedAt, current.completedAt, (dependencies.get(current) ?? []).map(input =>
+				input.reused ? { computation: input.computation, overhead: true, shared: input.shared }
+					: { ...input, computation: copy(input.computation) }), calculationSpans.get(current));
+			identities.set(result, computationIdentity(current)); clocks.set(result, computationClock(current));
+			const source = provenance.get(current), producer = producers.get(current), groups = concurrencyGroups.get(current);
+			if (source) provenance.set(result, source);
+			if (producer) producers.set(result, producer);
+			if (groups) concurrencyGroups.set(result, groups);
+			copies.set(current, result);
+			return result;
+		};
+		return copy(computation);
+	}
+
 	static exclude(computation: TimelineInterval, computeUncertain = false): void {
 		collecting.getStore()?.inputs?.set(computation, { overhead: true, ...(computeUncertain ? { computeUncertain: true } : {}) });
 	}
 
-	/** The same accounting boundary for validation, adoption and cleanup in every backend. */
-	static async overhead<T>(execute: () => T | Promise<T>): Promise<T> {
-		const startedAt = performance.now();
-		try { return await execute(); }
-		finally { TimelineInterval.exclude(new TimelineInterval(startedAt, performance.now())); }
+	/** Record only active calculation segments; control work never produces a duration or a cost sample. */
+	static async measure<T>(execute: () => T | Promise<T>, inputs: (output: T) => readonly TimelineDependency[] = () => []) {
+		const startedAt = performance.now(), clock = new CalculationClock(startedAt, calculating.getStore());
+		try {
+			const evaluation = await calculating.run(clock, () => TimelineInterval.collect(execute));
+			const completedAt = clock.finish();
+			let computation: TimelineInterval;
+			try { computation = new TimelineInterval(startedAt, completedAt, [...evaluation.dependencies, ...inputs(evaluation.output)], clock.spans); }
+			catch { computation = new TimelineInterval(startedAt, completedAt, [], clock.spans); } // Evidence cannot replace the execution outcome.
+			return { ...evaluation, computation };
+		} finally { clock.finish(); }
+	}
+
+	/** Cross a calculation boundary without timing validation, adoption or cleanup. */
+	static async outside<T>(execute: () => T | Promise<T>): Promise<T> {
+		const clock = calculating.getStore();
+		if (!clock) return execute();
+		for (let current: CalculationClock | undefined = clock; current; current = current.parent) current.pause();
+		try { return await calculating.run(undefined, execute); }
+		finally { for (let current: CalculationClock | undefined = clock; current; current = current.parent) current.resume(); }
+	}
+
+	/** Freeze the active calculation up to an observed native execution boundary. */
+	static current(startedAt: number, completedAt: number, inputs: readonly TimelineDependency[] = []): TimelineInterval {
+		return new TimelineInterval(startedAt, completedAt, inputs, calculating.getStore()?.read(startedAt, completedAt));
 	}
 
 	/** Diagnostic provenance belongs to the physical producer; later consumers cannot replace it. */
@@ -156,7 +199,11 @@ export class TimelineInterval {
 		for (const [id, { computation: current, groups, producer }] of selected) {
 			if (!reachable.has(id)) continue;
 			const priorMs = provenance.get(current)?.priorMs;
+			const spans = calculationSpans.get(current);
+			spanCount += spans?.length ?? 0;
+			if (spanCount > TIMELINE_COMPUTATION_LIMITS.spans * 4) return undefined;
 			nodes.push({ id, clock: computationClock(current), startedAt: current.startedAt, completedAt: current.completedAt,
+				...(spans ? { spans: spans.map(({ startedAt, completedAt }) => ({ startedAt, completedAt })) } : {}),
 				...(priorMs ? { priorMs } : {}), ...(producer ? { producer: { source: producer.source,
 					...(producer.mode !== undefined ? { mode: producer.mode } : {}) } } : {}), ...(groups.size ? { groups: [...groups] } : {}),
 				...(incompleteReuse.has(current) ? { incomplete: true as const } : {}),
@@ -168,7 +215,7 @@ export class TimelineInterval {
 				})),
 			});
 		}
-		return normalizeTimelineComputation({ version: 1, root: computationIdentity(computation), nodes });
+		return normalizeTimelineComputation({ version: 2, root: computationIdentity(computation), nodes });
 	}
 
 	/** Each restore is independent; stable identities deduplicate only within the receiving call. */
@@ -187,7 +234,7 @@ export class TimelineInterval {
 					clocks.set(span, part.clock);
 					return span;
 				}),
-			})));
+			})), node.spans?.map(span => new TimelineInterval(span.startedAt, span.completedAt)));
 			identities.set(current, id); publishedIdentities.add(current);
 			clocks.set(current, node.clock);
 			provenance.set(current, { id, priorMs: node.priorMs ?? 0 });
@@ -217,6 +264,39 @@ export interface ToolComputationTiming {
 	readonly reusedExecutionIncomplete?: true;
 	/** Only unambiguous producer shares of the same deduplicated reuse total. */
 	readonly reusedByMode?: readonly ModeComputationTiming[];
+}
+
+/** Pausing closes the current calculation; no interval is created for time outside it. */
+class CalculationClock {
+	readonly spans: TimelineInterval[] = [];
+	private startedAt: number;
+	private paused = 0;
+	private completedAt?: number;
+	readonly parent?: CalculationClock;
+	constructor(startedAt: number, parent?: CalculationClock) { this.startedAt = startedAt; this.parent = parent; }
+	read(startedAt: number, completedAt: number): readonly TimelineInterval[] {
+		return [...this.spans, ...(!this.paused && this.completedAt === undefined ? [new TimelineInterval(this.startedAt, completedAt)] : [])]
+			.filter(span => span.completedAt > startedAt && span.startedAt < completedAt)
+			.map(span => new TimelineInterval(Math.max(startedAt, span.startedAt), Math.min(completedAt, span.completedAt)));
+	}
+	pause(): void {
+		if (this.completedAt !== undefined || this.paused++ > 0) return;
+		this.close(performance.now());
+	}
+	resume(): void {
+		if (this.completedAt !== undefined || --this.paused > 0) return;
+		this.startedAt = performance.now();
+	}
+	finish(): number {
+		if (this.completedAt === undefined) {
+			this.completedAt = performance.now();
+			if (!this.paused) this.close(this.completedAt);
+		}
+		return this.completedAt;
+	}
+	private close(completedAt: number): void {
+		if (completedAt > this.startedAt) this.spans.push(new TimelineInterval(this.startedAt, completedAt));
+	}
 }
 export interface SpeculativeTaskTiming extends ReturnType<TaskTimeline["measure"]> {}
 
@@ -301,7 +381,7 @@ export class TaskTimeline {
 				return [{ startedAt: sameClock ? Math.max(input.computation.startedAt, part.startedAt) : part.startedAt,
 					completedAt: sameClock ? Math.min(input.computation.completedAt, part.completedAt) : part.completedAt }];
 			})).filter(part => part.completedAt > part.startedAt);
-			const all = exclusiveIntervals(computation, shared);
+			const all = (calculationSpans.get(computation) ?? [computation]).flatMap(span => exclusiveIntervals(span, shared));
 			const owner = JSON.stringify([groups.owner(computationIdentity(computation)), computationClock(computation)]);
 			for (const [index, groupsByOwner] of grouped.entries()) if (flags & (1 << index)) {
 				totals[index]! += source?.priorMs ?? 0;

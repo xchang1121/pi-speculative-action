@@ -16,7 +16,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActionSemanticsRegistry, buildPiActionKey, KEYABLE_TOOLS, PI_ACTION_SEMANTICS, widenReadGuess } from "../src/action-semantics.ts";
 import { borrowResourceObject, createResourceSnapshotExecutionWorld, type SpeculativeAgentExecutionWorld } from "../src/agent-execution-world.ts";
 import { createSpeculativeActionHost, type CreateSpeculativeActionHostOptions } from "../src/agent-integration.ts";
-import { SpeculationScheduler } from "../src/scheduler.ts";
 import { TimelineInterval } from "../src/task-timing.ts";
 import { createDrafterPlanSource } from "../src/drafter-plan-source.ts";
 import { DrafterTaskBudget, type DrafterUtilityBatch } from "../src/drafter-budget.ts";
@@ -358,8 +357,6 @@ describe("speculative action host", () => {
 			const learned = await propose();
 			expect(learned.empiricalProbability).toBeCloseTo(5 / 6);
 			expect(learned.adoptionProbability).toBeCloseTo(outcome === "adopted" ? 5 / 6 : 1 / 6);
-			await controller.source.onSettled!({ ...feedback, settlement: rejectedSettlement("matching", "candidate_calibration_sample") });
-			expect((await propose()).adoptionProbability).toBe(learned.adoptionProbability);
 			await controller.source.onSettled!({ ...feedback, settlement: unobservedSettlement("control", "cancelled") });
 			expect((await propose()).adoptionProbability).toBe(learned.adoptionProbability);
 			for (let index = 0; index < 32; index++) await controller.source.onSettled!({ ...feedback,
@@ -449,7 +446,7 @@ describe("speculative action host", () => {
 		const settle = (sequence: number) => controller.actorActionSettled({ sessionID: "session", turnID: "current",
 			candidate: { source: "pattern_aware" } as never, computation: { actorComputeMs: 0, reusedExecutionMs: 420 },
 			reusedComputations: [{ source: "pattern_aware", feedback: old[0]!.reuseFeedback, reusedExecutionMs: 420 }], settlement: { actorAction: actorAction(sequence),
-				provider: { kind: "speculative", timing: { hitLatencyMs: 20, expectedActorMs: 9000 } },
+				provider: { kind: "speculative", },
 				matchedPredictions: [{ source: "drafter" }, { source: "pattern_aware" }] } as never });
 		try {
 			await stage(1); await settle(1);
@@ -458,8 +455,8 @@ describe("speculative action host", () => {
 			await controller.actorActionSettled({ sessionID: "session", turnID: "current", computation: { actorComputeMs: 10, reusedExecutionMs: 5000 },
 				settlement: { actorAction: actorAction(3), provider: { kind: "actor", origin: "fallback", durationMs: 10, isError: false },
 					matchedPredictions: [{ source: "drafter" }] } as never });
-			for (const action of old) expect(utility(action)).toMatchObject({ benefitMs: 0, costMs: 0 });
-			expect(utility(current)).toMatchObject({ benefitMs: 0, costMs: 0 });
+			for (const action of old) expect(utility(action)).toMatchObject({ benefitMs: 0 });
+			expect(utility(current)).toMatchObject({ benefitMs: 0 });
 		} finally { controller.finishSession(); }
 	});
 
@@ -765,12 +762,6 @@ describe("speculative action host", () => {
 	});
 
 	it.for([false, true])("owns composed query proofs across turns and source retirement (oversized=%s)", async (oversized, { skip }) => {
-		// This fixture exercises repeated proof ownership; Actor calibration has its own end-to-end case.
-		const assessJoin = SpeculationScheduler.prototype.assessCandidateJoin;
-		vi.spyOn(SpeculationScheduler.prototype, "assessCandidateJoin").mockImplementation(function (this: SpeculationScheduler<object>, request) {
-			const decision = assessJoin.call(this, request);
-			return decision.reason === "calibration_probe" ? { ...decision, allowed: true, reason: "ready" } : decision;
-		});
 		const cwd = await temporaryWorkspace(), profile = await createClosedSearchProfile(cwd);
 		if (!profile.invocations.has("grep")) { await profile.pool.dispose(); return skip("qualified rg is unavailable"); }
 		await writeFile(path.join(cwd, ".ignore"), "# shared selection rules\n");
@@ -2365,7 +2356,7 @@ function mockRuntimeWorld(
 				return testBranch(output, {
 					backend: "runtime",
 					executionFingerprint: context.action.executionFingerprint,
-					validate: async () => ({ status: "valid", metrics: { durationMs: 0, bytesRead: 0, filesRead: 0, mode: "exact" } }), // Fixed fixture inputs.
+					validate: async () => ({ status: "valid", metrics: { bytesRead: 0, filesRead: 0, mode: "exact" } }), // Fixed fixture inputs.
 				});
 			},
 		},

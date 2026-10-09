@@ -88,7 +88,7 @@ describe("Drafter marginal request utility", () => {
 		const probes = [];
 		for (let index = 0; index < 4; index++) probes.push(Boolean(await budget.run({ ...request, utility: budget.start("model", true) })));
 		expect(probes).toEqual([false, false, false, true]);
-		budget.credit([first], { reusedExecutionMs: 5000, costMs: 1 });
+		budget.credit([first], { reusedExecutionMs: 5000 });
 		expect(await budget.run({ ...request, utility: budget.start("model", true) })).toBeDefined();
 	});
 
@@ -234,7 +234,7 @@ describe("Drafter marginal request utility", () => {
 			for (const status of ["empty", "error", "timeout", "aborted"] as const) requestDone(10000, "proposal", { status, cause: { stage: "source", code: "excluded" } });
 			controller.finishTurn("session", "seed");
 			const preview: ActorActionProvider = { kind: "actor", origin: "preview", candidateID: "preview", durationMs: 10000, isError: false, toolExecution: new TimelineInterval(0, 10000) };
-			const reused: ActorActionProvider = { kind: "speculative", candidateID: "hit", match: { kind: "exact", distance: 0 }, timing: { hitLatencyMs: 0, expectedActorMs: 10000 }, toolExecution: new TimelineInterval(0, 10000) };
+			const reused: ActorActionProvider = { kind: "speculative", candidateID: "hit", match: { kind: "exact", distance: 0 }, toolExecution: new TimelineInterval(0, 10000) };
 			for (const [index, provider] of [fallback(100), fallback(825), preview, reused, fallback(10000, true), fallback(Infinity)].entries()) {
 				await expect(offer(`cheap-${index}`, 4000, ["read", "grep", "edit", "write", "unknown", "bash"][index])).rejects.toMatchObject({ cause: { detail: expect.stringContaining('"coldOpportunity":false') } });
 				observe(provider); controller.finishTurn("session", turnID);
@@ -301,7 +301,7 @@ describe("Drafter marginal request utility", () => {
 					candidate: { source: "drafter" } as never, candidateFeedback: action.feedback,
 					reusedComputations: [{ source: "drafter", feedback: action.reuseFeedback, reusedExecutionMs: 500 }], settlement: {
 						actorAction: { id: `hit-${round}`, sequence: round * 2 + Number(action !== root), turnID: request.startInput.turnID },
-						provider: { kind: "speculative", timing: { hitLatencyMs: 0 } }, matchedPredictions: [{ source: "drafter" }] } as never });
+						provider: { kind: "speculative", }, matchedPredictions: [{ source: "drafter" }] } as never });
 				await credit(root!); // The first request remains useful even while its expansion is wasted.
 				controller.finishTurn("session", request.startInput.turnID); await nextTurn();
 				if (recoveredAt) { expect(extra).toBeDefined(); await credit(extra!); }
@@ -341,17 +341,17 @@ describe("Drafter marginal request utility", () => {
 					{ source: "pattern_aware", feedback: descendant.reuseFeedback, reusedExecutionMs: 200 },
 					{ source: "drafter", feedback: descendant.feedback, reusedExecutionMs: 90 },
 				], settlement: { actorAction: { id: "whole", sequence: 1, turnID: "consumer" },
-					provider: { kind: "speculative", timing: { expectedActorMs: 90000, hitLatencyMs: 7 } },
+					provider: { kind: "speculative", },
 					matchedPredictions: [{ source: "drafter" }, { source: "drafter" }, { source: "pattern_aware" }] } as never });
-			expect(ancestors.map(({ benefitMs, costMs }) => ({ benefitMs, costMs }))).toEqual([
-				{ benefitMs: 160, costMs: 7 }, { benefitMs: 160, costMs: 7 }, { benefitMs: 60, costMs: 7 },
+			expect(ancestors.map(({ benefitMs }) => ({ benefitMs }))).toEqual([
+				{ benefitMs: 160 }, { benefitMs: 160 }, { benefitMs: 60 },
 			]);
 			controller.actorActionSettled({ sessionID: "session", turnID: "consumer", computation: { actorComputeMs: 40, reusedExecutionMs: 100 },
 				reusedComputations: [{ source: "drafter", feedback: child.reuseFeedback, reusedExecutionMs: 100 }],
 				settlement: { actorAction: { id: "partial", sequence: 2, turnID: "consumer" },
 					provider: { kind: "actor", origin: "fallback", durationMs: 40, isError: false }, matchedPredictions: [] } as never });
-			expect(ancestors.map(({ benefitMs, costMs }) => ({ benefitMs, costMs }))).toEqual([
-				{ benefitMs: 260, costMs: 7 }, { benefitMs: 260, costMs: 7 }, { benefitMs: 60, costMs: 7 },
+			expect(ancestors.map(({ benefitMs }) => ({ benefitMs }))).toEqual([
+				{ benefitMs: 260 }, { benefitMs: 260 }, { benefitMs: 60 },
 			]);
 		} finally { controller.finishSession(); }
 	});
@@ -373,7 +373,7 @@ describe("Drafter marginal request utility", () => {
 				await controller.actorActionSettled({ sessionID: "session", turnID: request.startInput.turnID, candidate: { source: "drafter" } as never,
 					candidateFeedback: root.feedback, reusedComputations: [{ source: "drafter", feedback: root.reuseFeedback, reusedExecutionMs: 500 }],
 					settlement: { actorAction: { id: request.startInput.turnID, sequence: calls, turnID: request.startInput.turnID },
-						provider: { kind: "speculative", timing: { hitLatencyMs: 0 } },
+						provider: { kind: "speculative", },
 						matchedPredictions: [{ source: "drafter" }] } as never });
 			}
 			for (const index of [3, 1, 2, 0]) { controller.finishTurn("session", requests[index]!.startInput.turnID); pending.get(index * 2 + 1)!.resolve(); }

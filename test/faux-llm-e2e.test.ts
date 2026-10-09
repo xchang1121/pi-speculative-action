@@ -296,7 +296,7 @@ function fauxRuntimeWorld(): SpeculativeAgentExecutionWorld {
 			execute: async (context) => {
 				const output = { result: await context.tool.execute(context.callID, context.args as never, context.signal), isError: false };
 				return testBranch(output, { backend: "faux_runtime", executionFingerprint: context.action.executionFingerprint,
-					validate: async () => ({ status: "valid", metrics: { durationMs: 0, bytesRead: 0, filesRead: 0, mode: "exact" } }), // Scripted fixture inputs stay immutable.
+					validate: async () => ({ status: "valid", metrics: { bytesRead: 0, filesRead: 0, mode: "exact" } }), // Scripted fixture inputs stay immutable.
 				});
 			},
 		},

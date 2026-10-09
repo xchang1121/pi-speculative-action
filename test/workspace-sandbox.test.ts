@@ -1141,7 +1141,7 @@ describe("workspace-branch ExecutionWorld", () => {
 					action: requiredAction("write", { path: "value.txt", content: "after\n" }, root),
 					...(mode === "unvalidated" ? {} : { validate: async () => ({ status: "indeterminate" as const,
 						cause: { stage: "freshness" as const, code: "inputs_not_proven" },
-						metrics: { durationMs: 0, bytesRead: 0, filesRead: 0, mode: "exact" as const } }) }),
+						metrics: { bytesRead: 0, filesRead: 0, mode: "exact" as const } }) }),
 					execute: async ({ sandboxRoot }) => {
 						const file = path.join(sandboxRoot, "value.txt");
 						expect(await readFile(file, "utf8")).toBe(mode === "borrowed" ? "before\n" : "current\n");

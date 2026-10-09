@@ -130,7 +130,7 @@ export function createResourceSnapshotExecutionWorld(
 							const query = await evaluateResourceInputs(owner, context, actionSemantics, () => missing ??= captureResourceVersion(undefined,
 								(context.action.executionContext as ToolInvocation).filesystemRoot ?? context.cwd, actionSemantics, operations.maxBytes())
 								.then(token => captured = token), retained);
-							return TimelineInterval.overhead(() => {
+							return TimelineInterval.outside(() => {
 								let bytes = (query?.capturedBytes ?? 0) + (captured?.view?.bytes ?? 0);
 								if (!query || bytes > operations.maxBytes()) return undefined;
 								captured?.view?.seal();
@@ -150,7 +150,7 @@ export function createResourceSnapshotExecutionWorld(
 						context.signal.throwIfAborted();
 						// Unprovable or over-budget inputs fall back to the same bound capture executor.
 					} finally {
-						await TimelineInterval.overhead(async () => { await Promise.allSettled(retained.map(releaseResourceVersion)); await captured?.release(); });
+						await TimelineInterval.outside(async () => { await Promise.allSettled(retained.map(releaseResourceVersion)); await captured?.release(); });
 					}
 				}
 				const owned = await capture(context, operations.maxBytes(), true);
@@ -160,7 +160,7 @@ export function createResourceSnapshotExecutionWorld(
 					context.signal.throwIfAborted();
 					return await owned.seal(output);
 				} finally {
-					await TimelineInterval.overhead(() => owned.dispose());
+					await TimelineInterval.outside(() => owned.dispose());
 				}
 			},
 		} } : {}),
@@ -175,7 +175,7 @@ export async function borrowResourceObject(sources: Iterable<object>, target: st
 	for (const source of sources) for (const version of resourceVersions.get(source)?.versions ?? []) {
 		if (!version.view?.retained) continue;
 		try {
-			const captured = await version.view.borrowObject(target, (capture, handle) => TimelineInterval.overhead(async () => {
+			const captured = await version.view.borrowObject(target, (capture, handle) => TimelineInterval.outside(async () => {
 				if (!capture.content || capture.bytesRead > maxBytes || !sameFilesystemIdentity(expected, capture.stat) ||
 					!sameFilesystemIdentity(capture.stat, await handle.stat({ bigint: true }))) return undefined;
 				return { ...capture, content: Buffer.from(capture.content), shared: true as const };
@@ -304,13 +304,13 @@ function resourceSnapshotBranch(
 			const retained: ResourceVersionToken[] = [];
 			let missing: Promise<ResourceVersionToken> | undefined, captured: ResourceVersionToken | undefined;
 			let released: Promise<void> | undefined, transferred = false;
-			const dispose = () => released ??= TimelineInterval.overhead(async () => { await Promise.allSettled(retained.splice(0).map(releaseResourceVersion)); });
+			const dispose = () => released ??= TimelineInterval.outside(async () => { await Promise.allSettled(retained.splice(0).map(releaseResourceVersion)); });
 			try {
 				const query = await evaluateResourceInputs(owner, request, semantics, () => missing ??= captureResourceVersion(undefined,
 					(request.action.executionContext as ToolInvocation).filesystemRoot ?? version.root, semantics,
 					Math.max(0, version.view!.remainingBytes - versions.slice(1).reduce((bytes, token) => bytes + (token.view?.bytes ?? 0), 0)))
 					.then(token => { retained.push(token); return captured = token; }), retained);
-				return await TimelineInterval.overhead(() => {
+				return await TimelineInterval.outside(() => {
 					if (!query) return undefined;
 					captured?.view?.seal();
 					// Borrowed data is already evaluated; only its selected evidence must outlive the source view.

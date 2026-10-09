@@ -82,7 +82,7 @@ npm run bench:suite -- --suite swe_diverse --repeats 3 --label speculative
 
 关闭投机的基线运行目前只有 SDK 工具事件；这些事件的区间包含验证、交付和排队，无法分离实际计算，因此 E 记为未知、R 记为零，计算加速比为 `null`。其原始工具等待仍可用于 `pairedToolWaitRatio`。
 
-任务计时从 Host/工具初始化前到终态结算和回收完成，包含准备、预测、执行、验证、采纳、拒绝与清理。数据集下载、checkout 和最终补丁检查在计时外。完整 Host 返回与内部 `hitLatencyMs` 分开；running 接管还需区分接入、剩余执行与完成后交付。
+任务计时从 Host/工具初始化前到终态结算和回收完成，包含准备、预测、执行、验证、采纳、拒绝与清理。数据集下载、checkout 和最终补丁检查在计时外。完整 Host 等待由基准独立记录，不作为复用准入或计算收益；运行中接续保留超时与取消。
 
 未执行的预测只报告阻塞和匹配事实，不推算潜在节省。`traces` 的来源请求、预测、候选和 Actor 调用保留原事件结构，仅移除 `cache`/`sessionID`；通过 turn、decision、prediction 和 candidate ID 关联，预算或门控拒绝保存在来源请求的 `empty.cause`。事件和工具等待端点使用 epoch 毫秒；`provider.toolExecution` 的单调端点加 `metadata.monotonicTimeOrigin` 后可对齐。报告复用这些既有计时，不额外采集工具计时或可由记录还原的汇总。
 

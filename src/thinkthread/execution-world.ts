@@ -291,11 +291,11 @@ function thinkThreadWorldBranch(input: ThinkThreadBranchInput): WorldBranch<Tool
 		catch (error) { return cause("freshness", "thinkthread_input_authority_changed", error instanceof Error ? error.message : String(error)); }
 		return undefined;
 	};
-	const validate = (): Promise<ResourceValidation> => lifecycle.serialize(() => TimelineInterval.overhead(async () => {
-		const started = performance.now(), before = await nativeCause();
+	const validate = (): Promise<ResourceValidation> => lifecycle.serialize(() => TimelineInterval.outside(async () => {
+		const before = await nativeCause();
 		const result = before ? undefined : await client.fs.verify({ snapshotId: source.id, dependencies: [...dependencies] });
 		const changed = before ?? await nativeCause();
-		const metrics = { durationMs: performance.now() - started, bytesRead: result?.comparedBytes ?? 0,
+		const metrics = { bytesRead: result?.comparedBytes ?? 0,
 			filesRead: result?.comparedEntries ?? 0, mode: "exact" as const };
 		return changed || result?.status !== "matched"
 			? { status: "stale", cause: changed ?? cause("freshness", "thinkthread_dependency_changed"), metrics }
@@ -439,7 +439,7 @@ async function captureSnapshotInputs(world: PreparedWorld, context: SpeculativeT
 	try {
 		for (const target of files.keys()) await assertNoSymlinkPath(context.cwd, target);
 		await assertInputAuthority(version);
-		const matched = await TimelineInterval.overhead(() => world.client.fs.verify({ snapshotId, dependencies: [...dependencies] }));
+		const matched = await TimelineInterval.outside(() => world.client.fs.verify({ snapshotId, dependencies: [...dependencies] }));
 		if (matched.status !== "matched") throw new Error("ThinkThread snapshot inputs changed before execution");
 		await assertInputAuthority(version);
 		view = new ResourceReadView(MAX_INPUT_BYTES, async (dependency) => {
@@ -504,7 +504,7 @@ async function captureSnapshotInputs(world: PreparedWorld, context: SpeculativeT
 
 /** Snapshot metadata omits ACL/owner authority. Fence current access and all ancestor bindings as well. */
 async function assertInputAuthority(version: ResourceVersionToken): Promise<void> {
-	return TimelineInterval.overhead(async () => {
+	return TimelineInterval.outside(async () => {
 		for (const observation of version.observations.values()) if (observation.scope === "stat")
 			await access(observation.path, constants.R_OK | ((await lstat(observation.path)).isDirectory() ? constants.X_OK : 0));
 		const validation = await version.manager.seal(version);

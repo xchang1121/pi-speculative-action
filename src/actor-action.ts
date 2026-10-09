@@ -1,7 +1,6 @@
-import { nonNegativeFinite as finite } from "./number-utils.ts";
 import type { ActionKey, ActionKeyMatch } from "./action-semantics.ts";
 import type { AuthoritativeResultCapture } from "./runtime-contracts.ts";
-import { cause, type ActorActionIdentity, type ActorActionProvider, type ActorActionSettlement, type ActorHitTiming, type CandidateRejection,
+import { cause, type ActorActionIdentity, type ActorActionProvider, type ActorActionSettlement, type CandidateRejection,
 	type PredictionAdoption, type PredictionIdentity, type ResolutionCause } from "./settlement.ts";
 import { TimelineInterval } from "./task-timing.ts";
 
@@ -9,7 +8,6 @@ export interface ActorCandidateSelection<Candidate extends { readonly id: string
 	readonly candidate: Candidate;
 	readonly match: ActionKeyMatch;
 	readonly output: Output;
-	readonly timing: ActorHitTiming;
 	readonly toolExecution: TimelineInterval;
 	readonly projection?: TimelineInterval;
 	/** This projection already existed before the current Actor call; a fresh reconstruction has no receipt. */
@@ -121,7 +119,6 @@ export class ActorAction<Candidate extends { readonly id: string } = { readonly 
 			candidateID,
 			toolExecution,
 			match: Object.freeze({ ...selected.match }),
-			timing: normalizeTiming(selected.timing),
 		}), freezePredictions(matchedPredictions));
 		return provider === "preview"
 			? { status: "rejected", candidateID, cause: cause("control", "actor_preview_provider") }
@@ -164,13 +161,6 @@ export class ActorAction<Candidate extends { readonly id: string } = { readonly 
 		this.stateValue = Object.freeze({ status: "settled", value: settlement });
 		return settlement;
 	}
-}
-
-function normalizeTiming(timing: ActorHitTiming): ActorHitTiming {
-	return Object.freeze({
-		hitLatencyMs: finite(timing.hitLatencyMs),
-		...(Number.isFinite(timing.expectedActorMs) ? { expectedActorMs: finite(timing.expectedActorMs) } : {}),
-	});
 }
 
 function freezePredictions(predictions: readonly PredictionIdentity[]): readonly PredictionIdentity[] {

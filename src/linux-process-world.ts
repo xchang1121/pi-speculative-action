@@ -137,7 +137,7 @@ export function createLinuxProcessExecutionWorld(
 						: {
 								status: "indeterminate",
 								cause: { stage: "freshness", code: "process_evidence_missing" },
-								metrics: { durationMs: 0, bytesRead: 0, filesRead: 0, mode: "exact" },
+								metrics: { bytesRead: 0, filesRead: 0, mode: "exact" },
 							},
 				afterCapture: async (_workspace, capture) => {
 					if (!session) throw new Error("process evidence sealer is missing");

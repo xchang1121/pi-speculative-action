@@ -24,7 +24,7 @@ import { captureAbsenceDependency, captureDirectoryDependency, captureFileDepend
 	validateDynamicDependencyCertificate } from "./provenance-validation.ts";
 import { diffWorkspaceStructures, ExecutionPathProjection, hydrateWorkspaceFileEntry, snapshotDependency, type WorkspaceStructureSnapshot,
 	type WorkspaceTransactionDiff, type WorkspaceTreeEntry } from "./process-observation.ts";
-import { definedProcessEnvironment, type PreparedProcessExecutionRoute, type ProcessExecutionRequest, type ProcessExecutionResult,
+import { definedProcessEnvironment, type PreparedProcessExecutionRoute, type ProcessExecutionRequest,
 	type ProcessExecutor } from "./process-execution.ts";
 import { isPoisonedEffectCommit } from "./effect-transaction.ts";
 import { resolveHostExecutable } from "./executable-path.ts";
@@ -438,54 +438,38 @@ export class LinuxProcessReuseBackend {
 		return {
 			execute: async (request) => {
 				if (process.platform !== "linux" || !pathContains(sourceRoot, request.cwd)) return host.execute(request);
-				const requestStarted = performance.now();
 				this.addActor("wholeCommandRequests");
+				const result = await TimelineInterval.outside(async () => {
 				let committed = false;
-				let timing: ServiceTimingIdentity | undefined;
-				let overheadRecorded = false;
-				const recordOverhead = () => {
-					if (overheadRecorded) return;
-					overheadRecorded = true;
-					const observation = this.observations.getStore();
-					if (observation && !observation.closed && sameScope(observation.scope, request.scope))
-						observation.computations.push({ computation: new TimelineInterval(requestStarted, performance.now()), overhead: true });
-				};
-				const miss = () => { recordOverhead(); return this.actorReplayMiss(host, request, timing); };
 				try {
 					request.signal?.throwIfAborted();
 					const invocation = options.invocation(request);
-					if (!invocation || !await this.store.mayHaveCertificates(invocation.shell)) return miss();
+					if (!invocation || !await this.store.mayHaveCertificates(invocation.shell)) return;
 					assertInvocationMatches(invocation, request);
 					const projection = new ExecutionPathProjection({ sourceRoot, workspaceRoot: sourceRoot });
 					const platformFingerprint = await this.resolvePlatformFingerprint();
 					const prototype = (await TimelineInterval.collect(() => topLevelProcessPrototype(invocation, request, definedProcessEnvironment(request.environment), projection, platformFingerprint))).output;
 					const weakKey = processWeakKey(prototype);
-					timing = processTimingIdentity(prototype, weakKey);
-					const admission = this.processScheduler.assessCandidateJoin({ identity: timing, state: "succeeded" });
-					if (!admission.allowed) return miss();
 					const plan = await this.plan(weakKey, prototype.executablePath, projection, acceptProducer);
-					if (!plan?.certificate.result.exit) return miss();
+					if (!plan?.certificate.result.exit) return;
 					request.signal?.throwIfAborted();
-					const replayStarted = performance.now();
 					await replayFilesystemEffects(this.replayWorkspace, plan.artifacts, plan.certificate.result.journal, projection, sourceRoot);
 					committed = true;
 					for (const event of loadOutputEvents(plan.artifacts, plan.certificate.result.journal)) request.onData(event.data);
-					recordOverhead();
-					const hitLatencyMs = Math.max(0, performance.now() - requestStarted);
 					const observation = this.observations.getStore();
 					if (observation && !observation.closed && sameScope(observation.scope, request.scope))
 						observation.computations.push(reusedComputation(plan.certificate));
-					this.addActor("wholeCommandReplayMs", Math.max(0, performance.now() - replayStarted));
 					this.addActor("wholeCommandReusedProcessMs", plan.certificate.result.observedProcessMs ?? 0);
 					this.addActor("wholeCommandHits");
-					this.processScheduler.observeAdoption(timing, hitLatencyMs);
 					return { exitCode: plan.certificate.result.exit.kind === "code" ? plan.certificate.result.exit.code : null };
 				} catch (error) {
-					recordOverhead();
 					this.setActorError(`actor_replay:${errorMessage(error)}`);
 					if (committed || isPoisonedEffectCommit(error)) throw error;
-					return miss();
 				}
+				});
+				if (result) return result;
+				this.addActor("wholeCommandMisses");
+				return host.execute(request);
 			},
 		};
 	}
@@ -504,9 +488,8 @@ export class LinuxProcessReuseBackend {
 	}
 
 	private async createSession(input: Parameters<LinuxProcessReuseBackend["open"]>[0]): Promise<LinuxProcessSession> {
-		const startedAt = performance.now();
 		if (this.disposed) throw new Error("Linux process backend is disposed");
-		const ready = (await TimelineInterval.collect(() => this.resolveReady())).output;
+		const ready = await TimelineInterval.outside(async () => (await TimelineInterval.collect(() => this.resolveReady())).output);
 		const readyAt = performance.now();
 		input.signal?.throwIfAborted();
 		const sourceRoot = path.resolve(input.sourceRoot);
@@ -560,7 +543,7 @@ export class LinuxProcessReuseBackend {
 			if (session.lifecycle.sealed || executionKind === "operation" || executionKind && executionKind !== kind)
 				return Promise.reject(new Error("process session execution boundary is already consumed"));
 			executionKind = kind;
-			return session.lifecycle.admit(async () => {
+			return session.lifecycle.admit(() => measureProcess(session, async () => {
 				session.signal?.throwIfAborted();
 				const dispatchStartedAt = performance.now();
 				// Bound operations can launch reusable children too; interception excludes their own image below.
@@ -594,9 +577,9 @@ export class LinuxProcessReuseBackend {
 				}));
 				session.privateSince ??= Date.now();
 				return operation();
-			});
+			}));
 		};
-		const creation = new TimelineInterval(startedAt, performance.now(), [{ computation: new TimelineInterval(startedAt, readyAt), overhead: true }]);
+		const creation = new TimelineInterval(readyAt, performance.now());
 		return {
 			ownership: session.ownership,
 			computationDependencies: () => Object.freeze([...session.computations]),
@@ -622,8 +605,7 @@ export class LinuxProcessReuseBackend {
 	private recordSessionPreparation(session: ActiveSession, creation: TimelineInterval, dispatch: TimelineInterval): void {
 		const computation = new TimelineInterval(creation.startedAt, dispatch.completedAt, [
 			{ computation: creation, owned: true, shared: [creation] }, { computation: dispatch, owned: true, shared: [dispatch] },
-			{ computation: new TimelineInterval(creation.completedAt, dispatch.startedAt), overhead: true },
-		]);
+		], []);
 		TimelineInterval.group(computation, session);
 		// Only recorded preparation cuts its caller's clock; work between creation and dispatch belongs to that caller.
 		session.preparation = { computation, shared: [creation, dispatch] };
@@ -631,7 +613,7 @@ export class LinuxProcessReuseBackend {
 	}
 
 	private processComputation(session: ActiveSession, startedAt: number, completedAt: number, pids?: readonly number[], preparation?: TimelineInterval): TimelineInterval {
-		const computation = new TimelineInterval(startedAt, completedAt, [
+		const computation = TimelineInterval.current(startedAt, completedAt, [
 			...(preparation ? [{ computation: preparation, owned: true, shared: [preparation] }] : []),
 			...(session.preparation ? [session.preparation] : []), ...session.computations.filter(input => {
 				const pid = processDependencyPIDs.get(input);
@@ -719,27 +701,18 @@ export class LinuxProcessReuseBackend {
 		const environment = definedProcessEnvironment(request.environment);
 		const command = request.command;
 		const logicalCwd = session.projection.toLogical(physicalCwd);
-		const prototypeStartedAt = performance.now();
-		const captured = await TimelineInterval.collect(() => topLevelProcessPrototype(session.invocation, request, environment, session.projection, ready.platformFingerprint))
-			.catch(error => { recordProcessReplayOverhead(session, prototypeStartedAt); throw error; });
-		const prototype = captured.output, preparation = new TimelineInterval(prototypeStartedAt, performance.now(), captured.dependencies);
+		const captured = await TimelineInterval.outside(() => TimelineInterval.measure(() =>
+			topLevelProcessPrototype(session.invocation, request, environment, session.projection, ready.platformFingerprint)));
+		const prototype = captured.output, preparation = captured.computation;
 		this.add(session, "wholeCommandRequests");
-		const lookupStarted = performance.now();
-		const plan = await this.plan(
-			processWeakKey(prototype),
-			prototype.executablePath,
-			session.projection,
-			(candidate) => compatibleProducer(session.producer, candidate),
-			session,
-		).catch(error => { recordPrototypePreparation(session, preparation, false); recordProcessReplayOverhead(session, lookupStarted); throw error; });
-		signal?.throwIfAborted();
-		if (plan?.kind === "completed_replay") {
-			recordPrototypePreparation(session, preparation, false);
-			try { return await this.replayTopLevel(session, plan, request); }
-			finally { recordProcessReplayOverhead(session, lookupStarted); }
-		}
-		recordPrototypePreparation(session, preparation, true);
-		recordProcessReplayOverhead(session, lookupStarted);
+		const replayed = await TimelineInterval.outside(async () => {
+			const plan = await this.plan(processWeakKey(prototype), prototype.executablePath, session.projection,
+				(candidate) => compatibleProducer(session.producer, candidate), session);
+			signal?.throwIfAborted();
+			return plan?.kind === "completed_replay" ? this.replayTopLevel(session, plan, request) : undefined;
+		});
+		if (replayed) return replayed;
+		recordPrototypePreparation(session, preparation);
 		this.add(session, "wholeCommandMisses");
 		const sandbox = sandboxArguments({
 			ready,
@@ -811,7 +784,6 @@ export class LinuxProcessReuseBackend {
 		plan: Extract<ProcessReusePlan, { kind: "completed_replay" }>,
 		request: ProcessExecutionRequest,
 	): Promise<{ exitCode: number | null }> {
-		const replayStarted = performance.now();
 		const before = await session.workspace.structure.capture();
 		await replayFilesystemEffects(this.replayWorkspace, plan.artifacts, plan.certificate.result.journal, session.projection, session.workspace.sandboxRoot,
 			path.join(session.workspace.processRoot, "private"));
@@ -819,7 +791,6 @@ export class LinuxProcessReuseBackend {
 		session.nestedEvidence.push(plan.certificate.dependencyCertificate);
 		session.topLevelCapture = { before, after, observation: { complete: true, paths: [], taints: [], tracedProcesses: 0, incompleteReasons: [] } };
 		for (const event of loadOutputEvents(plan.artifacts, plan.certificate.result.journal)) request.onData(event.data);
-		this.add(session, "wholeCommandReplayMs", Math.max(0, performance.now() - replayStarted));
 		this.add(session, "wholeCommandReusedProcessMs", plan.certificate.result.observedProcessMs ?? 0);
 		this.add(session, "wholeCommandHits");
 		session.computations.push(reusedComputation(plan.certificate));
@@ -831,7 +802,7 @@ export class LinuxProcessReuseBackend {
 		const evidence = session.topLevelEvidence;
 		if (!execution || !evidence) return;
 		const result = await captureProcessResult(this.store, execution.outcome, execution.observedProcessMs, changes.map(change => ({ logicalPath: slash(change.target), change })));
-		const computation = new TimelineInterval(execution.startedAt, performance.now(), session.computations);
+		const computation = TimelineInterval.current(execution.startedAt, performance.now(), session.computations);
 		TimelineInterval.group(computation, session);
 		const recorded = TimelineInterval.serialize(computation);
 		const certificate = sealProcessCertificate({
@@ -915,13 +886,12 @@ export class LinuxProcessReuseBackend {
 		if (!cwd || !executable) throw new Error("bound process paths are unmapped");
 		const request = { ...invocation, cwd };
 		const prototypeStartedAt = performance.now();
-		const captured = await TimelineInterval.collect(async () => {
+		const captured = await TimelineInterval.outside(() => TimelineInterval.measure(async () => {
 			const prototype = await this.prototype(session, request, executable, invocation.outputRoute);
 			if (processWeakKey(prototype) !== binding.key) throw new Error("bound process execution context changed");
 			return { prototype, before: await session.workspace.structure.capture() };
-		})
-			.catch(error => { recordProcessReplayOverhead(session, prototypeStartedAt); throw error; });
-		const { prototype, before } = captured.output, preparation = new TimelineInterval(prototypeStartedAt, performance.now(), captured.dependencies);
+		}));
+		const { prototype, before } = captured.output, preparation = captured.computation;
 		const requestsBefore = session.metrics.requests, failuresBefore = session.closedInputFailures, resultsBefore = session.preparedResults, seedsBefore = session.preparedInputSeeds;
 		this.add(session, "requests");
 		const observation = { complete: true, paths: [], taints: [], tracedProcesses: 0, incompleteReasons: [] };
@@ -959,56 +929,50 @@ export class LinuxProcessReuseBackend {
 	private async executeRequest(session: ActiveSession, request: ProcessArguments, executable: string, outputRoute: OutputRoute,
 		requestID: number, prototype?: ExecPrototype,
 		captureWorkspace?: (capture: Omit<TopLevelCapture, "observation">) => void, inPlace?: number, preparation?: TimelineInterval): Promise<DispatcherResponse> {
-		if (!prototype) {
-			const prototypeStartedAt = performance.now();
-			const captured = await TimelineInterval.collect(() => this.prototype(session, request, executable, outputRoute))
-				.catch(error => { recordProcessReplayOverhead(session, prototypeStartedAt, inPlace); throw error; });
-			prototype = captured.output;
-			preparation = new TimelineInterval(prototypeStartedAt, performance.now(), captured.dependencies);
-		}
-		const weakKey = processWeakKey(prototype), executablePath = prototype.executablePath;
-		const lookupStarted = performance.now();
-		const acquired = await this.acquireProcessResult(
-			weakKey,
-			(live, excluded) => this.plan(weakKey, executablePath, session.projection, (candidate) => compatibleProducer(session.nestedProducer, candidate), session, live, excluded),
-			session.signal,
-			session.scope,
-			{ ownership: session.ownership, executablePath: prototype.executablePath },
-		).catch(error => { recordPrototypePreparation(session, preparation, false, inPlace); recordProcessReplayOverhead(session, lookupStarted, inPlace); throw error; });
-		if (acquired.plan?.kind === "completed_replay") {
-			recordPrototypePreparation(session, preparation, false, inPlace);
-			try {
-				const before = captureWorkspace ? await session.workspace.structure.capture() : undefined;
-				const result = await this.replay(session, acquired.plan, weakKey, acquired, request.streams && descriptorInputs(request.resources!), inPlace);
-				if (inPlace !== undefined) session.writers.add({ startedAt: Date.now(), endedAt: Date.now(), writes: [], settled: true, pid: inPlace,
-					written: acquired.plan.certificate.result.journal.flatMap(event => event.kind === "workspace" && pathContains(session.sourceRoot, event.path) ? [slash(path.relative(session.sourceRoot, event.path))] : []) });
-				if (before) captureWorkspace!({ before, after: await session.workspace.structure.capture() });
-				const binding = acquired.producer?.binding;
-				if (binding && this.handoffs.resolveBinding(binding, session.scope)) session.executionBindings.set(requestID, binding);
-				return result;
-			} finally { recordProcessReplayOverhead(session, lookupStarted, inPlace); }
-		}
-		recordProcessReplayOverhead(session, lookupStarted, inPlace);
-		if (!acquired.work) {
-			recordPrototypePreparation(session, preparation, false, inPlace);
-			throw new Error("process work reservation failed");
-		}
-		this.add(session, "misses");
-		try {
-			// Without a result to reuse, a child whose recent runs were all cheap resumes in place within its parent's trace.
-			if (inPlace !== undefined && Math.max(...this.childRunMs.get(prototype.executablePath) ?? [Infinity]) < (this.options.cheapChildMs ?? CHEAP_CHILD_MS)) {
-				recordPrototypePreparation(session, preparation, false, inPlace);
-				this.add(session, "bypasses");
-				session.bypasses.push([inPlace, `broker_bypass:${path.posix.basename(prototype.executablePath)}:cheap_child`]);
-				return { kind: "bypass", executable };
+		return measureProcess(session, async () => {
+			if (!prototype) {
+				const captured = await TimelineInterval.outside(() => TimelineInterval.measure(() => this.prototype(session, request, executable, outputRoute)));
+				prototype = captured.output;
+				preparation = captured.computation;
 			}
-			recordPrototypePreparation(session, preparation, true, inPlace);
-			return await this.executeAndPublish(session, request, executable, prototype, weakKey, outputRoute, acquired.work, requestID, captureWorkspace, inPlace, preparation);
-		} finally {
-			this.handoffs.complete(weakKey, acquired.work);
-			const computation = acquired.work.computation;
-			if (computation) recordProcessDependency(session, { computation, owned: true, shared: [computation] }, inPlace);
-		}
+			const weakKey = processWeakKey(prototype), executablePath = prototype.executablePath;
+			const acquired = await TimelineInterval.outside(() => this.acquireProcessResult(
+				weakKey,
+				(live, excluded) => this.plan(weakKey, executablePath, session.projection, (candidate) => compatibleProducer(session.nestedProducer, candidate), session, live, excluded),
+				session.signal,
+				session.scope,
+				{ ownership: session.ownership, executablePath },
+			));
+			if (acquired.plan?.kind === "completed_replay") {
+				const plan = acquired.plan;
+				return TimelineInterval.outside(async () => {
+					const before = captureWorkspace ? await session.workspace.structure.capture() : undefined;
+					const result = await this.replay(session, plan, weakKey, acquired, request.streams && descriptorInputs(request.resources!), inPlace);
+					if (inPlace !== undefined) session.writers.add({ startedAt: Date.now(), endedAt: Date.now(), writes: [], settled: true, pid: inPlace,
+						written: plan.certificate.result.journal.flatMap(event => event.kind === "workspace" && pathContains(session.sourceRoot, event.path) ? [slash(path.relative(session.sourceRoot, event.path))] : []) });
+					if (before) captureWorkspace!({ before, after: await session.workspace.structure.capture() });
+					const binding = acquired.producer?.binding;
+					if (binding && this.handoffs.resolveBinding(binding, session.scope)) session.executionBindings.set(requestID, binding);
+					return result;
+				});
+			}
+			if (!acquired.work) throw new Error("process work reservation failed");
+			this.add(session, "misses");
+			try {
+				// Without a result to reuse, a child whose recent runs were all cheap resumes in place within its parent's trace.
+				if (inPlace !== undefined && Math.max(...this.childRunMs.get(prototype.executablePath) ?? [Infinity]) < (this.options.cheapChildMs ?? CHEAP_CHILD_MS)) {
+					this.add(session, "bypasses");
+					session.bypasses.push([inPlace, `broker_bypass:${path.posix.basename(prototype.executablePath)}:cheap_child`]);
+					return { kind: "bypass", executable };
+				}
+				recordPrototypePreparation(session, preparation, inPlace);
+				return await this.executeAndPublish(session, request, executable, prototype, weakKey, outputRoute, acquired.work, requestID, captureWorkspace, inPlace, preparation);
+			} finally {
+				this.handoffs.complete(weakKey, acquired.work);
+				const computation = acquired.work.computation;
+				if (computation) recordProcessDependency(session, { computation, owned: true, shared: [computation] }, inPlace);
+			}
+		}, inPlace);
 	}
 
 	private async acquireProcessResult(
@@ -1018,11 +982,8 @@ export class LinuxProcessReuseBackend {
 		scope: ExecutionScope | undefined,
 		participant: { readonly timing: ServiceTimingIdentity } | { readonly ownership: ProcessHandoffOwnership; readonly executablePath: string },
 	): Promise<{ readonly plan?: ReadyProcessPlan; readonly work?: ProcessHandoff; readonly producer?: ProcessHandoff; readonly continuation?: ProcessContinuation;
-		readonly waiting?: readonly TimelineInterval[]; readonly joined: boolean; readonly waitedMs: number }> {
-		let waitedMs = 0;
+		readonly waiting?: readonly TimelineInterval[]; readonly joined: boolean }> {
 		const waits: { readonly handoff: ProcessHandoff; readonly interval: TimelineInterval }[] = [];
-		let admission = "timing" in participant ? this.processScheduler.assessCandidateJoin({ identity: participant.timing, state: "succeeded" }) : undefined;
-		if (admission && !admission.allowed) return { joined: false, waitedMs };
 		const acquired = await this.handoffs.acquire({
 			key: weakKey,
 			scope,
@@ -1031,24 +992,18 @@ export class LinuxProcessReuseBackend {
 				role: "actor" as const,
 				waitForRunning: async (running: ProcessHandoff) => {
 					if (!running.ownership.acceptsScope(running.scope, scope)) return "miss";
-					admission = this.processScheduler.assessCandidateJoin({
+					const admission = this.processScheduler.assessCandidateJoin({
 						identity: participant.timing, state: "running",
 						elapsedMs: Math.max(0, performance.now() - running.startedAt),
 					});
 					if (!admission.allowed) return "miss";
-					const check = running.inputsChanged;
-					if (check) {
-						const started = performance.now();
-						try { if (await check()) return "rejected"; }
-						finally { this.addActor("validationMs", Math.max(0, performance.now() - started)); }
-					}
+					if (await running.inputsChanged?.()) return "rejected";
 					const waitStarted = performance.now();
 					const waiting = new AbortController(), stop = signal ? AbortSignal.any([signal, waiting.signal]) : waiting.signal;
 					const completion = running.suspend ? running.suspend(stop).then(() => running.completion) : running.completion;
 					const finished = await waitForCandidate(completion, signal, admission.waitBudgetMs).finally(() => waiting.abort());
 					const interval = new TimelineInterval(waitStarted, performance.now());
 					waits.push({ handoff: running, interval });
-					waitedMs += interval.completedAt - interval.startedAt;
 					if (finished.status === "completed") return "completed";
 					signal?.throwIfAborted();
 					return "miss";
@@ -1060,7 +1015,6 @@ export class LinuxProcessReuseBackend {
 				waiting: waits.filter(wait => wait.handoff === acquired.producer).map(wait => wait.interval) } : {}),
 			...(acquired.kind === "work" ? { work: acquired.work } : {}),
 			joined: acquired.joined,
-			waitedMs,
 		};
 	}
 
@@ -1084,18 +1038,10 @@ export class LinuxProcessReuseBackend {
 	}
 
 	private recordLookup(lookup: ProcessReusePlan["lookup"], session?: ActiveSession): void {
-		for (const [metric, value] of [["validationMs", lookup.durationMs], ["validationCandidates", lookup.candidateCertificates],
+		for (const [metric, value] of [["validationCandidates", lookup.candidateCertificates],
 			["validationPathsets", lookup.pathsetsValidated], ["validationFilesRead", lookup.filesRead], ["validationBytesRead", lookup.bytesRead],
 			["validationArtifactsLoaded", lookup.artifactsLoaded], ["validationArtifactBytesRead", lookup.artifactBytesRead]] as const) {
 			if (session) this.add(session, metric, value); else this.addActor(metric, value); }
-	}
-
-	private async actorReplayMiss(host: ProcessExecutor, request: ProcessExecutionRequest, timing?: ServiceTimingIdentity): Promise<ProcessExecutionResult> {
-		this.addActor("wholeCommandMisses");
-		const started = performance.now();
-		try {
-			return await host.execute(request);
-		} finally { if (timing && !request.signal?.aborted) this.processScheduler.observeActorService(timing, Math.max(0, performance.now() - started)); }
 	}
 
 	private async decideHeldExec(process: HeldExecProcess, scope?: ExecutionScope): Promise<HeldExecDecision> {
@@ -1112,7 +1058,6 @@ export class LinuxProcessReuseBackend {
 			} };
 		let learning = observation?.learn && !observation.closed && sameScope(observation.scope, scope);
 		const order = observation ? ++observation.sequence : 0;
-		const requestStarted = performance.now();
 		this.addActor("requests");
 		try {
 			process.signal?.throwIfAborted();
@@ -1149,7 +1094,6 @@ export class LinuxProcessReuseBackend {
 			if (!pathContains(sourceRoot, snapshot.cwd)) { this.addActor("bypasses"); return measured({ kind: "continue" }); }
 			const observe = (prototype: ExecPrototype, durationMs: number) => {
 				const weakKey = processWeakKey(prototype);
-				this.processScheduler.observeActorService(processTimingIdentity(prototype, weakKey), durationMs);
 				if (!learning || observation!.closed || process.signal?.aborted || !snapshot.outputRoute || observation!.bindings.size >= this.store.limits.maxCertificates) return;
 				const binding = this.handoffs.observe(weakKey, executablePath, scope!, {
 					argv0: snapshot.argv[0]!, args: snapshot.argv.slice(1), environment: snapshot.environment,
@@ -1186,7 +1130,9 @@ export class LinuxProcessReuseBackend {
 			if (!plan || (plan.certificate.result.continuation ? !continuation || sha256Digest(continuation.image) !== plan.certificate.result.continuation.imageDigest :
 				plan.certificate.result.exit.kind !== "code")) {
 				this.addActor("misses");
-				return measured({ kind: "continue", observeCompletion: durationMs => { if (durationMs !== undefined) observe(prototype, durationMs); } });
+				return measured({ kind: "continue", ...(learning ? { observeCompletion: (durationMs: number | undefined) => {
+					if (durationMs !== undefined) observe(prototype, durationMs);
+				} } : {}) });
 			}
 			const output = loadOutputEvents(plan.artifacts, plan.certificate.result.journal);
 			return measured({
@@ -1210,15 +1156,12 @@ export class LinuxProcessReuseBackend {
 							: input.fd === input.image && object.content ? { content: plan.artifacts.read(object.content) } : {}) };
 				}) } : {}),
 				commit: async () => {
-					const started = performance.now();
 					try {
 						process.signal?.throwIfAborted();
 						await replayFilesystemEffects(this.replayWorkspace, plan.artifacts, plan.certificate.result.journal, projection, sourceRoot);
 					} catch (error) {
 						this.setActorError(`actor_child_commit:${errorMessage(error)}`);
 						throw error;
-					} finally {
-						this.addActor("replayMs", Math.max(0, performance.now() - started));
 					}
 				},
 				adopted: () => {
@@ -1230,7 +1173,6 @@ export class LinuxProcessReuseBackend {
 						observation.computations.push(computation);
 					}
 					this.recordHit(acquired.producer?.scope, acquired.joined, undefined, scope);
-					this.processScheduler.observeAdoption(timing, Math.max(0, performance.now() - requestStarted - acquired.waitedMs));
 					this.addActor("reusedProcessMs", plan.certificate.result.observedProcessMs ?? 0);
 					if (scope) acquired.producer?.ownership.adopted({ scope, id: process.id, sequence: process.sequence, operationIdentity: weakKey,
 						executionMs: plan.certificate.result.observedProcessMs ?? 0, computation });
@@ -1251,7 +1193,6 @@ export class LinuxProcessReuseBackend {
 		inputs?: ReturnType<typeof descriptorInputs>,
 		pid?: number,
 	): Promise<DispatcherResponse> {
-		const started = performance.now();
 		let replayed = false;
 		try {
 			const { artifacts, certificate } = plan;
@@ -1266,7 +1207,6 @@ export class LinuxProcessReuseBackend {
 			if (inputs && !streams) return { kind: "hit", weakKey, output: [], exit: { kind: "code", code: 125 } };
 			return { kind: "hit", weakKey, output, exit: certificate.result.exit, ...(streams?.length ? { streams } : {}) };
 		} finally {
-			this.add(session, "replayMs", Math.max(0, performance.now() - started));
 			const observed = plan.certificate.result.observedProcessMs;
 			if (replayed && observed !== undefined) this.add(session, "reusedProcessMs", observed);
 		}
@@ -1988,14 +1928,17 @@ function recordProcessDependency(session: ActiveSession, dependency: TimelineDep
 	session.computations.push(dependency);
 }
 
-function recordProcessReplayOverhead(session: ActiveSession, startedAt: number, pid?: number): void {
-	recordProcessDependency(session, { computation: new TimelineInterval(startedAt, performance.now()), overhead: true }, pid);
+async function measureProcess<T>(session: ActiveSession, execute: () => Promise<T>, pid?: number): Promise<T> {
+	const first = session.computations.length;
+	const result = await TimelineInterval.measure(execute, () => session.computations.slice(first).filter(input => processDependencyPIDs.get(input) === pid));
+	recordProcessDependency(session, { computation: result.computation, owned: true, shared: [result.computation] }, pid);
+	return result.output;
 }
 
-function recordPrototypePreparation(session: ActiveSession, computation: TimelineInterval | undefined, produced: boolean, pid?: number): void {
+function recordPrototypePreparation(session: ActiveSession, computation: TimelineInterval | undefined, pid?: number): void {
 	if (!computation) return;
-	if (produced) TimelineInterval.group(computation, session);
-	recordProcessDependency(session, { computation, ...(produced ? { owned: true } : { overhead: true }), shared: [computation] }, pid);
+	TimelineInterval.group(computation, session);
+	recordProcessDependency(session, { computation, owned: true, shared: [computation] }, pid);
 }
 
 /** Split only observed native clocks; the transport does not expose CPU time or every resumed child. */
@@ -3017,11 +2960,11 @@ export async function validateTransferredProcessEvidence(
 	incompleteReasons: Iterable<string> = [],
 ): Promise<ResourceValidation> {
 	if (!evidence) {
-		return { status: "indeterminate", cause: { stage: "freshness", code: "process_evidence_missing" }, metrics: { durationMs: 0, bytesRead: 0, filesRead: 0, mode: "exact" } };
+		return { status: "indeterminate", cause: { stage: "freshness", code: "process_evidence_missing" }, metrics: { bytesRead: 0, filesRead: 0, mode: "exact" } };
 	}
 	const blockingTaints = evidence.taints.filter((taint) => !TRANSFERRED_INPUT_TAINTS.has(taint));
 	const validation = await validateDynamicDependencyCertificate({ ...evidence, taints: blockingTaints }, { maxFileBytes: MAX_CAPTURE_BYTES });
-	const metrics = { durationMs: validation.durationMs, bytesRead: validation.bytesRead, filesRead: validation.filesRead, mode: "exact" as const };
+	const metrics = { bytesRead: validation.bytesRead, filesRead: validation.filesRead, mode: "exact" as const };
 	if (validation.status === "valid") return { status: "valid", metrics };
 	if (validation.status === "stale") return { status: "stale", cause: { stage: "freshness", code: "process_dependency_changed", detail: validation.changed.join(",") }, metrics };
 	return {

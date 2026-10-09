@@ -1,6 +1,6 @@
 /** Bounded observational evidence, independent of replay authority and output identity. */
 export interface SerializedTimelineComputation {
-	readonly version: 1;
+	readonly version: 1 | 2;
 	readonly root: string;
 	readonly nodes: readonly SerializedTimelineNode[];
 }
@@ -11,6 +11,8 @@ export interface SerializedTimelineNode {
 	readonly clock: string;
 	readonly startedAt: number;
 	readonly completedAt: number;
+	/** Explicit calculation segments; absence preserves historical continuous computation. */
+	readonly spans?: readonly { readonly startedAt: number; readonly completedAt: number }[];
 	readonly priorMs?: number;
 	readonly producer?: { readonly source: string; readonly mode?: string };
 	/** Concurrency aliases only: these never select an ancestor or its other work. */
@@ -32,7 +34,7 @@ export const TIMELINE_COMPUTATION_LIMITS = Object.freeze({ nodes: 256, edges: 10
 /** Invalid telemetry is unavailable evidence, not an invalid execution certificate. */
 export function normalizeTimelineComputation(value: unknown): SerializedTimelineComputation | undefined {
 	try {
-		if (!record(value) || value.version !== 1 || !identity(value.root) || !Array.isArray(value.nodes) ||
+		if (!record(value) || value.version !== 1 && value.version !== 2 || !identity(value.root) || !Array.isArray(value.nodes) ||
 			!value.nodes.length || value.nodes.length > TIMELINE_COMPUTATION_LIMITS.nodes) return undefined;
 		const nodes: SerializedTimelineNode[] = [], byID = new Map<string, SerializedTimelineNode>();
 		let edges = 0, spans = 0, groups = 0;
@@ -40,6 +42,17 @@ export function normalizeTimelineComputation(value: unknown): SerializedTimeline
 			if (!record(raw) || !identity(raw.id) || !identity(raw.clock) || byID.has(raw.id) || !endpoints(raw) ||
 				raw.priorMs !== undefined && !duration(raw.priorMs) || raw.incomplete !== undefined && typeof raw.incomplete !== "boolean") return undefined;
 			let producer: SerializedTimelineNode["producer"];
+			let calculation: SerializedTimelineNode["spans"];
+			if (raw.spans !== undefined) {
+				if (!Array.isArray(raw.spans) || (spans += raw.spans.length) > TIMELINE_COMPUTATION_LIMITS.spans) return undefined;
+				const parts: NonNullable<SerializedTimelineNode["spans"]>[number][] = [];
+				for (const part of raw.spans) {
+					if (!record(part) || !endpoints(part) || (part.startedAt as number) < (raw.startedAt as number) ||
+						(part.completedAt as number) > (raw.completedAt as number)) return undefined;
+					parts.push(Object.freeze({ startedAt: part.startedAt as number, completedAt: part.completedAt as number }));
+				}
+				calculation = Object.freeze(parts);
+			}
 			if (raw.producer !== undefined) {
 				if (!record(raw.producer) || !identity(raw.producer.source) || raw.producer.mode !== undefined && !identity(raw.producer.mode)) return undefined;
 				producer = Object.freeze({ source: raw.producer.source, ...(raw.producer.mode !== undefined ? { mode: raw.producer.mode as string } : {}) });
@@ -71,6 +84,7 @@ export function normalizeTimelineComputation(value: unknown): SerializedTimeline
 				}
 			}
 			const node = Object.freeze({ id: raw.id, clock: raw.clock, startedAt: raw.startedAt as number, completedAt: raw.completedAt as number,
+				...(calculation ? { spans: calculation } : {}),
 				...(raw.priorMs !== undefined ? { priorMs: raw.priorMs as number } : {}), ...(producer ? { producer } : {}),
 				...(aliases?.length ? { groups: aliases } : {}), ...(raw.incomplete ? { incomplete: true as const } : {}),
 				...(inputs.length ? { inputs: Object.freeze(inputs) } : {}) });
@@ -95,7 +109,7 @@ export function normalizeTimelineComputation(value: unknown): SerializedTimeline
 			return true;
 		};
 		if (!visit(value.root) || visited.size !== nodes.length) return undefined;
-		const graph = Object.freeze({ version: 1 as const, root: value.root, nodes: Object.freeze(nodes) });
+		const graph = Object.freeze({ version: value.version as 1 | 2, root: value.root, nodes: Object.freeze(nodes) });
 		return Buffer.byteLength(JSON.stringify(graph), "utf8") <= TIMELINE_COMPUTATION_LIMITS.bytes ? graph : undefined;
 	} catch { return undefined; }
 }

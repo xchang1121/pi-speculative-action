@@ -133,15 +133,10 @@ export class ToolExecutionGateway<Context, Output> {
 					// Reuse is optional; the supplied Actor executor remains authoritative.
 				}
 			}
-			const startedAt = performance.now();
-			const { output: outcome, dependencies } = await TimelineInterval.collect(async (): Promise<AuthoritativeExecutionOutcome<AuthoritativeOutput>> => {
+			const { output: outcome, computation: toolExecution } = await TimelineInterval.measure(async (): Promise<AuthoritativeExecutionOutcome<AuthoritativeOutput>> => {
 				try { return { status: "succeeded", output: await executor(operation) }; }
 				catch (error) { return { status: "failed", error }; }
-			});
-			const completedAt = performance.now();
-			let toolExecution: TimelineInterval;
-			try { toolExecution = new TimelineInterval(startedAt, completedAt, [...dependencies, ...hooks.computationDependencies?.() ?? []]); }
-			catch { toolExecution = new TimelineInterval(startedAt, completedAt); } // Accounting cannot replace the Actor outcome.
+			}, () => hooks.computationDependencies?.() ?? []);
 			const settlement = Object.freeze({ ...outcome, toolExecution, durationMs: toolExecution.completedAt - toolExecution.startedAt });
 			try { await hooks.settled?.(settlement); }
 			catch { /* Observation cannot replace the original Actor settlement. */ }

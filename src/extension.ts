@@ -181,7 +181,7 @@ export function formatSpeculativeActionStatus(input: {
 		`Prediction tools: ${toolsSummary(settings.tools)}`,
 		`Execution routing: unified ${settings.executionRouting.primary ? "On" : "Off"}; native fallback ${settings.executionRouting.nativeFallback ? "On" : "Off"}; Actor always available`,
 		`Search execution when enabled: ${searchExecutionLabel(settings.searchExecution)}`,
-		`Tool calls reused: ${formatRatio(metrics.speculativeHits, metrics.actorActions)}; ${metrics.exactReuseHits} exact, ${metrics.partialResultReuseHits} partial, ${metrics.inputReuseHits} inputs; ${formatDuration(metrics.hitLatencyMs)} wait after match`,
+		`Tool calls reused: ${formatRatio(metrics.speculativeHits, metrics.actorActions)}; ${metrics.exactReuseHits} exact, ${metrics.partialResultReuseHits} partial, ${metrics.inputReuseHits} inputs`,
 		...(hasProcessReuse(metrics.actorProcessReuse)
 			? [`Bash Actor reuse: ${formatActorProcessReuse(metrics.actorProcessReuse)}`]
 			: []),
@@ -465,7 +465,7 @@ async function installController(
 			selfSpeculation.startTurn(turnID, actorModel, actorContext, decisionSequence),
 		onCandidateMaterialized: (candidate) => selfSpeculation.addCandidate(candidate),
 		onActorActionMaterialized: ({ action }) => selfSpeculation.observeActorAction(action),
-		onActorActionSettled: ({ settlement }) => selfSpeculation.observeActorSettlement(settlement),
+		onActorActionSettled: ({ settlement, reusedComputations }) => selfSpeculation.observeActorSettlement(settlement, reusedComputations),
 		onPredictionSettled: (feedback) => selfSpeculation.observePredictionSettlement(feedback),
 		onEvent: (event) => {
 			currentMetrics = reduceSpeculativeTrace(currentMetrics, event);
@@ -1240,7 +1240,6 @@ export function formatSpeculativeActionEvent(event: SpeculativeActionEvent<strin
 				const match = event.settlement.provider.match;
 				parts.push(
 					match.kind === "projected" ? `partial-result reuse (${match.projector})` : match.kind === "inputs" ? "sealed-input reuse" : "exact-action reuse",
-					`${formatDuration(event.settlement.provider.timing.hitLatencyMs)} hit latency`,
 				);
 			} else {
 				parts.push(

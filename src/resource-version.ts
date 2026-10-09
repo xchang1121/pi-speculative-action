@@ -28,7 +28,6 @@ export type ResourceInput = Uint8Array | { readonly content: Uint8Array; readonl
 const inputContent = (input: ResourceInput | undefined) => input instanceof Uint8Array ? input : input && "content" in input ? input.content : undefined;
 
 export type ResourceValidationMetrics = {
-	readonly durationMs: number;
 	readonly bytesRead: number;
 	readonly filesRead: number;
 	readonly mode: "watcher" | "exact";
@@ -270,8 +269,7 @@ export class ResourceReadView {
 		return this.borrow(operation, observed, root, lookup, missing, acceptProofs);
 	}
 	/** Retain preparations only while capturing, so the sealed branch accounts for every owned byte. */
-	prepare: NonNullable<ToolFilesystemOperations["prepare"]> = (binding, key, build, consume, target) => {
-		const startedAt = performance.now();
+	prepare: NonNullable<ToolFilesystemOperations["prepare"]> = (binding, key, build, consume, target) => TimelineInterval.outside(() => {
 		this.assertComplete();
 		let owner: ResourceReadView = this;
 		while (owner.owner) owner = owner.owner;
@@ -289,7 +287,7 @@ export class ResourceReadView {
 			const release = async (cached: PreparedResource) => {
 				if (--cached.borrowers || cached.retained && !cached.revoked) return;
 				if (prepared.bindings.get(binding)?.get(key) === cached) prepared.bindings.get(binding)!.delete(key);
-				await TimelineInterval.overhead(() => (cached.destination.prepared?.lifetime ?? prepared.lifetime).release(cached));
+				await TimelineInterval.outside(() => (cached.destination.prepared?.lifetime ?? prepared.lifetime).release(cached));
 			};
 			const consumePrepared = async (cached: PreparedResource) => {
 				inherit(cached.origin === owner ? cached.dependencies : undefined);
@@ -297,11 +295,11 @@ export class ResourceReadView {
 				if (transferred) { for (const proof of this.acceptProofs!(cached.proofs!)) this.collectProofs?.set(proof.observations, proof); }
 				const run = async () => {
 					this.assertComplete(); cached.destination.assertComplete();
-					TimelineInterval.exclude(new TimelineInterval(startedAt, performance.now()));
-					const result = await consume(cached.value as Parameters<typeof consume>[0]);
-					return TimelineInterval.overhead(() => {
+					const evaluation = await TimelineInterval.measure(() => consume(cached.value as Parameters<typeof consume>[0]));
+					TimelineInterval.own(evaluation.computation);
+					return TimelineInterval.outside(() => {
 						TimelineInterval.use(cached.computation);
-						this.assertComplete(); if (!transferred && !(this.acceptProofs && cached.origin === owner && cached.dependencies)) cached.destination.assertComplete(); return result;
+						this.assertComplete(); if (!transferred && !(this.acceptProofs && cached.origin === owner && cached.dependencies)) cached.destination.assertComplete(); return evaluation.output;
 					});
 				};
 				return cached.destination === owner ? run() : cached.destination.prepared!.lifetime.admit(run);
@@ -344,8 +342,8 @@ export class ResourceReadView {
 				await this.borrow(async view => {
 					const foreign = view.onForeignInputs; view.onForeignInputs = transferable => { if (transferable) composed?.(); else decline(); foreign?.(transferable); };
 					view.collectProofs = this.acceptProofs ? new Map() : undefined;
-					const startedAt = performance.now(), evaluation = await TimelineInterval.collect(() => build(view));
-					resource = evaluation.output; pending.computation = TimelineInterval.own(new TimelineInterval(startedAt, performance.now(), evaluation.dependencies));
+					const evaluation = await TimelineInterval.measure(() => build(view));
+					resource = evaluation.output; pending.computation = TimelineInterval.own(evaluation.computation);
 					computationBytes += evaluation.dependencies.length * 96;
 					pending.shareable = !view.foreignInputs;
 					if (pending.shareable && view.collectProofs?.size) {
@@ -376,7 +374,7 @@ export class ResourceReadView {
 			try { await pending.ready; return await consumePrepared(pending); }
 			finally { await release(pending); }
 		});
-	};
+	});
 	private async borrow<T>(operation: (view: ResourceReadView) => Promise<T>, observed?: (dependencies: ReadonlySet<string> | undefined) => void,
 		root?: string | { readonly root: string; readonly physicalRoot: string }, lookup = this.lookup, missing = this.missing,
 		acceptProofs = this.acceptProofs): Promise<T> {
@@ -399,7 +397,7 @@ export class ResourceReadView {
 					view.boundary = { root, physicalRoot: entry.realPath! };
 				}
 				const output = await operation(view);
-				await TimelineInterval.overhead(() => {
+				await TimelineInterval.outside(() => {
 					view.assertComplete();
 					this.foreignInputs ||= view.foreignInputs;
 					observed?.(view.dependencies);
@@ -511,7 +509,7 @@ export class ResourceReadView {
 	}
 }
 
-/** Failed resource attempts keep overhead exclusions, never receipts for discarded inputs. */
+/** Failed resource attempts keep their actual computation, never receipts for discarded inputs. */
 export async function collectResourceComputation<T>(operation: () => T | Promise<T>, accept: (value: T) => boolean = () => true): Promise<T> {
 	const evaluation = await TimelineInterval.collect(async () => {
 		try { return { ok: true as const, value: await operation() }; }
@@ -520,10 +518,9 @@ export async function collectResourceComputation<T>(operation: () => T | Promise
 	const accepted = evaluation.output.ok && accept(evaluation.output.value);
 	for (const { computation, owned, overhead, computeUncertain } of evaluation.dependencies) {
 		if (overhead) TimelineInterval.exclude(computation, computeUncertain);
-		else if (accepted) { if (owned) TimelineInterval.own(computation); else TimelineInterval.use(computation); }
+		else if (owned) TimelineInterval.own(accepted ? computation : TimelineInterval.attempted(computation));
+		else if (accepted) TimelineInterval.use(computation);
 	}
-	// An abandoned fresh graph may contain both calculation and nested reuse; do not misreport its remainder as zero.
-	if (!accepted && evaluation.dependencies.some(input => input.owned)) TimelineInterval.exclude(new TimelineInterval(0, 0), true);
 	if (!evaluation.output.ok) throw evaluation.output.error;
 	return evaluation.output.value;
 }
@@ -668,9 +665,8 @@ export class ResourceVersionManager {
 	async seal(token: ResourceVersionToken): Promise<ResourceVersionValidation> { return this.inspect(token, true); }
 
 	private async inspect(token: ResourceVersionToken, sealing: boolean): Promise<ResourceVersionValidation> {
-		const started = performance.now();
 		if (!this.open || token.manager !== this || token.root !== this.root)
-			return validation(started, "resource_version_owner_changed");
+			return validation("resource_version_owner_changed");
 		try {
 			if (sealing) token.view?.seal(); else token.view?.assertComplete(true);
 			if (sealing && this.snapshotExcludes.size) throw new Error("resource_filtered_snapshot_not_observable");
@@ -680,21 +676,21 @@ export class ResourceVersionManager {
 			// Watcher delivery fences host execution windows; future adoption uses the exact fingerprints below.
 			if (sealing) await watcherTurn();
 			const watcherFailure = this.invalidation(token, sealing);
-			if (watcherFailure) return validation(started, watcherFailure, "watcher");
+			if (watcherFailure) return validation(watcherFailure, "watcher");
 			const current = await fingerprintDependencies([...token.observations.values()].filter((entry) => sealing || entry.scope !== "binding"), token.physicalRoot, this.snapshotExcludes);
 			if (sealing) await watcherTurn();
 			const lateFailure = this.invalidation(token, sealing);
-			if (lateFailure) return validation(started, lateFailure, "watcher");
+			if (lateFailure) return validation(lateFailure, "watcher");
 			const changed = current.filter((entry) => {
 				const captured = token.observations.get(dependencyKey(entry));
 				return entry.fingerprint !== captured?.fingerprint || (sealing && (!entry.stamp || !captured?.stamp || entry.stamp !== captured.stamp));
 			}).map(dependencyKey);
 			const expired = !current.length || changed.length > 0;
 			const reason = sealing ? "resource_observation_window_changed" : "resource_fingerprint_changed";
-			return { ...validation(started, expired ? reason : undefined, "exact", current), ...(!sealing && changed.length ? { changed } : {}) };
+			return { ...validation(expired ? reason : undefined, "exact", current), ...(!sealing && changed.length ? { changed } : {}) };
 		} catch {
 			const reason = sealing ? "resource_observation_window_unprovable" : "resource_validation_failed";
-			return validation(started, reason);
+			return validation(reason);
 		}
 	}
 
@@ -806,9 +802,9 @@ function resourceManager(root: string): ResourceVersionManager {
 
 export async function validateResourceVersion(token: unknown): Promise<ResourceVersionValidation> {
 	if (!Array.isArray(token)) return isResourceVersionToken(token)
-		? token.manager.validate(token) : validation(performance.now(), "resource_version_missing");
+		? token.manager.validate(token) : validation("resource_version_missing");
 	if (token.length === 1) return validateResourceVersion(token[0]);
-	const started = performance.now(), checked: ResourceVersionValidation[] = [];
+	const checked: ResourceVersionValidation[] = [];
 	const groups = new Map<ResourceVersionManager, ResourceVersionToken & { observations: Map<string, ResourceObservation> }>();
 	try {
 		if (!token.length) throw new Error("resource_version_missing");
@@ -825,10 +821,10 @@ export async function validateResourceVersion(token: unknown): Promise<ResourceV
 		}
 		for (const group of groups.values()) { const result = await group.manager.validate(group); checked.push(result); }
 		const expired = checked.find(result => result.expired);
-		if (expired) return { ...validation(started, expired.reason, "exact", checked), changed: [...new Set(checked.flatMap(result => result.changed ?? []))] };
+		if (expired) return { ...validation(expired.reason, "exact", checked), changed: [...new Set(checked.flatMap(result => result.changed ?? []))] };
 		for (const source of token as ResourceVersionToken[]) source.view?.assertComplete(true);
-		return validation(started, undefined, "exact", checked);
-	} catch (error) { return validation(started, error instanceof Error ? error.message : "resource_validation_failed", "exact", checked); }
+		return validation(undefined, "exact", checked);
+	} catch (error) { return validation(error instanceof Error ? error.message : "resource_validation_failed", "exact", checked); }
 }
 
 
@@ -1165,11 +1161,11 @@ function assertInside(realRoot: string, target: string): void {
 	if (!containsFilesystemPath(realRoot, target)) throw new Error(`resource_symlink_escapes_workspace:${target}`);
 }
 
-function validation(started: number, reason?: string, mode: ResourceValidationMetrics["mode"] = "exact",
+function validation(reason?: string, mode: ResourceValidationMetrics["mode"] = "exact",
 	observed: ReadonlyArray<Pick<ResourceValidationMetrics, "bytesRead" | "filesRead">> = []): ResourceVersionValidation {
 	return {
 		expired: reason !== undefined, ...(reason === undefined ? {} : { reason }),
-		durationMs: Math.max(0, performance.now() - started), mode,
+		mode,
 		bytesRead: observed.reduce((total, entry) => total + entry.bytesRead, 0),
 		filesRead: observed.reduce((total, entry) => total + entry.filesRead, 0),
 	};
