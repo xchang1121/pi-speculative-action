@@ -177,6 +177,12 @@ export function createLinuxProcessExecutionWorld(
 						await session.close();
 					}
 				},
+			}).catch(error => {
+				// A failed attempt still spent preparation time. It supplies a lower bound, not a successful service sample.
+				// Cancellation and failures before a session opened do not describe the operation's preparation cost.
+				if (operation && session && !context.signal.aborted) operationOverheads.set(operation,
+					Math.max(operationOverheads.get(operation) ?? 0, performance.now() - startedAt - operation.executionMs));
+				throw error;
 			});
 			if (session) {
 				const ownership = session.ownership, commit = branch.commit.bind(branch);
