@@ -1,10 +1,10 @@
 import { deferred, nextTurn } from "./async.ts";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readdir, rename, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { createReadTool } from "@earendil-works/pi-coding-agent";
-import { type AgentPosixClient, parseFsPayloadId, parseFsSnapshotId, parseRequestId, parseThinkThreadId } from "@thinkthread/agent-posix";
+import { createLsTool, createReadTool } from "@earendil-works/pi-coding-agent";
+import { type AgentPosixClient, type FsEntryV1, parseFsPayloadId, parseFsSnapshotId, parseRequestId, parseThinkThreadId } from "@thinkthread/agent-posix";
 import { describe, expect, it, vi } from "vitest";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { resolvePiToolInvocation, type PiToolInvocationOptions } from "../src/pi-tool-invocation.ts";
@@ -22,6 +22,104 @@ import { TaskTimeline, TimelineInterval } from "../src/task-timing.ts";
 const ownerID = parseThinkThreadId("tt-00000000-0000-4000-8000-000000000001");
 
 describe("ThinkThread execution world", () => {
+	it.runIf(process.platform === "linux").each(["add", "remove", "rename", "mode", "child-mode", "kind"])("shares paged directory names across limits and rejects %s", async change => {
+		const fixture = await snapshotDirectoryFixture(), { cwd, world } = fixture;
+		const branch = await world.speculation.execute(context("ls", { path: ".", limit: 1 }, cwd, "first"));
+		const fallback = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: ["ls"], maxBytes: () => 64 * 1024 });
+		let borrowed: typeof branch | undefined;
+		try {
+			const request = context("ls", { path: ".", limit: 10 }, cwd, "all");
+			const expected = { result: await createLsTool(cwd).execute(request.callID, request.args as { path: string; limit: number }), isError: false };
+			const query = await branch.reconstruct!(request);
+			borrowed = await fallback.speculation!.execute({ ...request, inputs: () => [branch.inputSource!] });
+			expect(query?.output).toEqual(expected); expect(borrowed.output).toEqual(expected);
+			expect(query?.output).not.toEqual(branch.output);
+			await expect(query?.validate?.()).resolves.toMatchObject({ status: "valid" });
+			await expect(borrowed.validate?.()).resolves.toMatchObject({ status: "valid" });
+			expect(fixture.snapshotReaddir).toHaveBeenCalledTimes(2); expect(fixture.run).not.toHaveBeenCalled();
+			const bytes = branch.capturedBytes;
+			if (change === "add") await writeFile(path.join(cwd, "new.txt"), "new");
+			if (change === "remove") await rm(path.join(cwd, "z.txt"));
+			if (change === "rename") await rename(path.join(cwd, "z.txt"), path.join(cwd, "renamed.txt"));
+			if (change === "mode") await chmod(cwd, 0o500);
+			if (change === "child-mode") await chmod(path.join(cwd, "z.txt"), 0o600);
+			if (change === "kind") { await rm(path.join(cwd, "z.txt")); await mkdir(path.join(cwd, "z.txt")); }
+			await expect(query?.validate?.()).resolves.toMatchObject({ status: "stale" });
+			await expect(borrowed.validate?.()).resolves.toMatchObject({ status: "stale" });
+			await query?.dispose?.();
+			await branch.dispose();
+			expect(branch.capturedBytes).toBeLessThan(bytes);
+			await expect(branch.reconstruct!(request)).rejects.toThrow("lifetime is closed");
+		} finally { await chmod(cwd, 0o700); await borrowed?.dispose(); await branch.dispose(); await fallback.dispose?.(); await fixture.close(); }
+	});
+
+	it.runIf(process.platform === "linux")("deduplicates directory page and snapshot computation across child metadata queries", async () => {
+		const fixture = await snapshotDirectoryFixture(); let clock = 100;
+		const timer = vi.spyOn(performance, "now").mockImplementation(() => clock);
+		const create = fixture.snapshotCreate.getMockImplementation()!, readdir = fixture.snapshotReaddir.getMockImplementation()!;
+		fixture.snapshotCreate.mockImplementation(async () => { clock += 30; return create(); });
+		fixture.snapshotReaddir.mockImplementation(async input => { clock += 20; return readdir(input); });
+		fixture.verify.mockImplementation(async () => { clock += 200; return { status: "matched", durationMs: 200, comparedEntries: 4, comparedBytes: 0 }; });
+		let branch: Awaited<ReturnType<typeof fixture.world.speculation.execute>> | undefined;
+		try {
+			branch = await fixture.world.speculation.execute(context("ls", { path: ".", limit: 1 }, fixture.cwd, "first"));
+			const evaluated = await TimelineInterval.collect(async () => {
+				const query = await branch!.reconstruct!(context("ls", { path: ".", limit: 10 }, fixture.cwd, "all"));
+				await expect(query?.validate?.()).resolves.toMatchObject({ status: "valid" }); await query?.dispose?.();
+			});
+			expect(new TaskTimeline(0).recordTool(new TimelineInterval(clock, clock + 1, evaluated.dependencies)).reusedExecutionMs).toBe(70);
+			expect(fixture.snapshotReaddir).toHaveBeenCalledTimes(2);
+		} finally { await branch?.dispose(); await fixture.close(); timer.mockRestore(); }
+	});
+
+	it.runIf(process.platform === "linux")("shares an empty directory without inventing child metadata", async () => {
+		const fixture = await snapshotDirectoryFixture();
+		for (const entry of fixture.entries.splice(0)) await rm(path.join(fixture.cwd, entry.path.utf8!), { recursive: true });
+		let branch: Awaited<ReturnType<typeof fixture.world.speculation.execute>> | undefined;
+		try {
+			branch = await fixture.world.speculation.execute(context("ls", { path: ".", limit: 1 }, fixture.cwd, "first"));
+			const query = await branch.reconstruct!(context("ls", { path: ".", limit: 5 }, fixture.cwd, "empty"));
+			expect(query?.output).toEqual({ result: await createLsTool(fixture.cwd).execute("empty", { path: ".", limit: 5 }), isError: false });
+			await expect(query?.validate?.()).resolves.toMatchObject({ status: "valid" }); await query?.dispose?.();
+			expect(fixture.snapshotReaddir).toHaveBeenCalledOnce(); expect(fixture.run).not.toHaveBeenCalled();
+		} finally { await branch?.dispose(); await fixture.close(); }
+	});
+
+	it.runIf(process.platform === "linux").each(["abort", "dispose"])("drains a late directory page on %s", async mode => {
+		const fixture = await snapshotDirectoryFixture(), entered = deferred(), gate = deferred();
+		const read = fixture.snapshotReaddir.getMockImplementation()!;
+		fixture.snapshotReaddir.mockImplementationOnce(async input => { entered.resolve(); await gate.promise; return read(input); });
+		const controller = new AbortController();
+		const running = fixture.world.speculation.execute({ ...context("ls", { path: "." }, fixture.cwd, "ls"), signal: controller.signal });
+		const rejected = expect(running).rejects.toThrow(); await entered.promise;
+		if (mode === "abort") controller.abort();
+		const closing = mode === "dispose" ? fixture.world.dispose!() : undefined;
+		try {
+			expect(fixture.snapshotRemove).not.toHaveBeenCalled(); gate.resolve(); await rejected; await closing;
+			expect(fixture.run).not.toHaveBeenCalled();
+		} finally { gate.resolve(); await fixture.close(); }
+		expect(fixture.snapshotRemove).toHaveBeenCalledOnce();
+	});
+
+	it.runIf(process.platform === "linux").each(["duplicate", "cursor", "total", "escape", "encoding", "symlink"])("keeps unproven directory pages on the isolated route (%s)", async mode => {
+		const fixture = await snapshotDirectoryFixture(), read = fixture.snapshotReaddir.getMockImplementation()!;
+		fixture.snapshotReaddir.mockImplementation(async input => {
+			const page = await read(input);
+			if (mode === "duplicate" && input.cursor) page.entries[0] = fixture.entries[0]!;
+			if (mode === "cursor" && input.cursor) return { ...page, hasMore: true, nextCursor: input.cursor };
+			if (mode === "total") page.totalEntries++;
+			if (mode === "escape") page.entries[0] = { ...page.entries[0]!, path: { utf8: "../outside", bytesBase64: Buffer.from("../outside").toString("base64") } };
+			if (mode === "encoding") page.entries[0] = { ...page.entries[0]!, path: { utf8: "different", bytesBase64: Buffer.from("name").toString("base64") } };
+			if (mode === "symlink") page.entries[0] = { ...page.entries[0]!, kind: "symlink" };
+			return page;
+		});
+		try {
+			const branch = await fixture.world.speculation.execute(context("ls", { path: "." }, fixture.cwd, "ls"));
+			try { expect(branch.inputSource).toBeUndefined(); expect(fixture.run).toHaveBeenCalledOnce(); }
+			finally { await branch.dispose(); }
+		} finally { await fixture.close(); }
+	});
+
 	it.runIf(process.platform === "linux")("shares snapshot inputs across read ranges with query freshness and owned cleanup", async () => {
 		const fixture = await snapshotInputFixture();
 		const { world, cwd, file, relative, snapshotPread } = fixture;
@@ -526,6 +624,21 @@ async function snapshotInputFixture() {
 	return { ...fixture, world, cwd, file, relative, bytes, snapshotPread, close: async () => {
 		await world.dispose!(); await rm(directory, { recursive: true, force: true });
 	} };
+}
+
+async function snapshotDirectoryFixture() {
+	const cwd = await mkdtemp(path.join(process.cwd(), "thinkthread-directory-"));
+	await mkdir(path.join(cwd, "folder")); await writeFile(path.join(cwd, "z.txt"), "last"); await writeFile(path.join(cwd, "中文.txt"), "unicode");
+	const entries: FsEntryV1[] = await Promise.all((await readdir(cwd)).map(async name => {
+		const info = await lstat(path.join(cwd, name));
+		return { path: { utf8: name, bytesBase64: Buffer.from(name).toString("base64") }, kind: info.isDirectory() ? "directory" : "file", mode: info.mode, len: info.size };
+	}));
+	const fixture = fakeClient();
+	const snapshotReaddir = vi.fn(async ({ cursor }: { cursor?: string | null }) => ({ entries: entries.slice(cursor ? 2 : 0, cursor ? undefined : 2),
+		totalEntries: entries.length, hasMore: !cursor && entries.length > 2, nextCursor: cursor || entries.length <= 2 ? null : "second" }));
+	Object.assign(fixture.client.fs, { snapshotReaddir, snapshotStat: vi.fn(async () => ({ kind: "directory", mode: 0o700, len: 0 })) });
+	const world = createThinkThreadExecutionWorld({ clientFactory: () => fixture.client });
+	return { ...fixture, entries, cwd, world, snapshotReaddir, close: async () => { await world.dispose!(); await rm(cwd, { recursive: true, force: true }); } };
 }
 
 function context(toolName: string, args: unknown, cwd: string, callID: string, settings: Partial<PiToolInvocationOptions> = {}) {

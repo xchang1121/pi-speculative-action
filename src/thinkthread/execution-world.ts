@@ -1,11 +1,12 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { access, readFile } from "node:fs/promises";
+import { access, lstat, readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type {
 	AgentPosixClient,
 	FsDependency,
+	FsEntryV1,
 	FsRunKeyParamsV1,
 	FsRunOutputChunkV1,
 	FsRunV1,
@@ -206,7 +207,7 @@ async function forkThinkThreadWorld(
 			...settings,
 		});
 		if (snapshotInputs && !context.parentCheckpoint && PI_ACTION_SEMANTICS.effect(tool) === "observation" &&
-			dependencies.length && dependencies.every((dependency) => dependency.scope === "content")) {
+			dependencies.length && dependencies.every((dependency) => dependency.scope === "content" || dependency.scope === "entries")) {
 			inputs = await captureSnapshotInputs(world, context, source.lease, dependencies, decodeThinkThreadToolRunnerRequest(request));
 			context.signal.throwIfAborted();
 			if (inputs) return thinkThreadWorldBranch({
@@ -378,27 +379,55 @@ function thinkThreadWorldBranch(input: ThinkThreadBranchInput): WorldBranch<Tool
 	};
 }
 
-/** Consume immutable regular inputs through the stock operation seam; other shapes retain fs.run. */
+/** Consume immutable regular files and directory entries through the stock operation seam. */
 async function captureSnapshotInputs(world: PreparedWorld, context: SpeculativeToolExecutionContext,
 	source: SnapshotLease, dependencies: readonly FsDependency[], request: ThinkThreadToolRunnerRequest) {
 	const snapshotId = source.id;
-	if (typeof world.client.fs.snapshotStat !== "function" || typeof world.client.fs.snapshotPread !== "function") return undefined;
-	const files = new Map<string, { path: string; bytes: number }>();
+	if (typeof world.client.fs.snapshotStat !== "function") return undefined;
+	const files = new Map<string, { path: string } & ({ kind: "file"; bytes: number } |
+		{ kind: "directory"; entries: readonly FsEntryV1[]; computation: TimelineInterval })>();
 	let totalBytes = 0;
 	try {
 		for (const resource of context.action.resources) {
 			context.signal.throwIfAborted();
 			const target = path.resolve(context.cwd, resource), relative = relativeFilesystemPath(context.cwd, target);
-			if (!relative) return undefined;
+			if (relative === undefined) return undefined;
 			const parts = slash(relative).split("/");
 			for (let end = 1; end < parts.length; end++) {
 				const parent = await world.client.fs.snapshotStat({ snapshotId, path: parts.slice(0, end).join("/") });
 				if (!("kind" in parent) || parent.kind !== "directory") return undefined;
 			}
-			const entry = await world.client.fs.snapshotStat({ snapshotId, path: slash(relative) });
-			if (!("kind" in entry) || entry.kind !== "file" || !Number.isSafeInteger(entry.len) || entry.len < 0 ||
-				(totalBytes += entry.len + 2 * Buffer.byteLength(target) + 64) > MAX_INPUT_BYTES) return undefined;
-			files.set(target, { path: slash(relative), bytes: entry.len });
+			const name = slash(relative) || ".", entry = await world.client.fs.snapshotStat({ snapshotId, path: name });
+			if (!("kind" in entry)) return undefined;
+			if (entry.kind === "file" && dependencies.some(dependency => dependency.path === name && dependency.scope === "content")) {
+				if (typeof world.client.fs.snapshotPread !== "function" || !Number.isSafeInteger(entry.len) || entry.len < 0 ||
+					(totalBytes += entry.len + 2 * Buffer.byteLength(target) + 64) > MAX_INPUT_BYTES) return undefined;
+				files.set(target, { kind: "file", path: name, bytes: entry.len });
+			} else if (entry.kind === "directory" && dependencies.some(dependency => dependency.path === name && dependency.scope === "entries")) {
+				if (typeof world.client.fs.snapshotReaddir !== "function") return undefined;
+				const startedAt = performance.now(), entries: FsEntryV1[] = [], names = new Set<string>(), cursors = new Set<string>();
+				let cursor: string | undefined, total: number | undefined;
+				do {
+					context.signal.throwIfAborted();
+					const page = await world.client.fs.snapshotReaddir({ snapshotId, path: name, limit: DIFF_PAGE_LIMIT, ...(cursor ? { cursor } : {}) });
+					if (!Number.isSafeInteger(page.totalEntries) || page.totalEntries < 0 || total !== undefined && total !== page.totalEntries) return undefined;
+					total = page.totalEntries;
+					for (const child of page.entries) {
+						const childPath = child.path.utf8, raw = Buffer.from(child.path.bytesBase64, "base64");
+						if (typeof childPath !== "string" || !Buffer.from(childPath).equals(raw) || childPath.includes("\0") ||
+							path.posix.dirname(childPath) !== name || childPath !== path.posix.normalize(childPath) ||
+							[".", ".."].includes(path.posix.basename(childPath)) || !["file", "directory"].includes(child.kind) || names.has(childPath)) return undefined;
+						names.add(childPath); entries.push(child);
+						if ((totalBytes += 3 * Buffer.byteLength(path.resolve(context.cwd, childPath)) + 256) > MAX_INPUT_BYTES) return undefined;
+					}
+					if (entries.length > total || page.hasMore && (!page.entries.length || !page.nextCursor || cursors.has(page.nextCursor))) return undefined;
+					cursor = page.hasMore ? page.nextCursor! : undefined;
+					if (cursor) cursors.add(cursor);
+				} while (cursor);
+				if (entries.length !== total) return undefined;
+				files.set(target, { kind: "directory", path: name, entries, computation: TimelineInterval.own(new TimelineInterval(startedAt, performance.now(),
+					source.computation ? [{ computation: source.computation, reused: true }] : [])) });
+			} else return undefined;
 		}
 	} catch { return undefined; } // Missing entries or unavailable snapshot metadata retain the isolated runner.
 	if (!files.size) return undefined;
@@ -416,8 +445,19 @@ async function captureSnapshotInputs(world: PreparedWorld, context: SpeculativeT
 		view = new ResourceReadView(MAX_INPUT_BYTES, async (dependency) => {
 			context.signal.throwIfAborted();
 			const target = path.resolve(dependency.path), file = files.get(target);
-			if (!file || !["content", "stat", "type"].includes(dependency.scope)) throw new Error("ThinkThread input operation is unproven");
+			if (!file || !(file.kind === "file" ? ["content", "stat", "type"] : ["names", "stat", "type"]).includes(dependency.scope)) throw new Error("ThinkThread input operation is unproven");
 			if (loaded.has(target)) return;
+			if (file.kind === "directory") {
+				const names = file.entries.map(entry => path.posix.basename(entry.path.utf8!));
+				view!.capture(target, { type: "directory", entries: names, realPath: target, computation: file.computation });
+				retainedInputs.set(target, { names, computation: file.computation });
+				for (const entry of file.entries) {
+					const child = path.resolve(context.cwd, entry.path.utf8!), type = entry.kind as "file" | "directory";
+					view!.capture(child, { type, realPath: child, computation: file.computation });
+					retainedInputs.set(child, { type, computation: file.computation });
+				}
+				loaded.add(target); return;
+			}
 			const startedAt = performance.now();
 			view!.reserve(file.bytes);
 			const chunks: Buffer[] = [];
@@ -465,7 +505,8 @@ async function captureSnapshotInputs(world: PreparedWorld, context: SpeculativeT
 /** Snapshot metadata omits ACL/owner authority. Fence current access and all ancestor bindings as well. */
 async function assertInputAuthority(version: ResourceVersionToken): Promise<void> {
 	return TimelineInterval.overhead(async () => {
-		for (const observation of version.observations.values()) if (observation.scope === "stat") await access(observation.path, constants.R_OK);
+		for (const observation of version.observations.values()) if (observation.scope === "stat")
+			await access(observation.path, constants.R_OK | ((await lstat(observation.path)).isDirectory() ? constants.X_OK : 0));
 		const validation = await version.manager.seal(version);
 		if (validation.expired) throw new Error(validation.reason ?? "ThinkThread input authority changed");
 	});
