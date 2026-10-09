@@ -192,6 +192,7 @@ interface ActiveSession {
 	readonly ownership: ProcessHandoffOwnership;
 	/** Completed reusable children and retained live frontiers produced by this preparation. */
 	preparedResults: number;
+	preparedInputSeeds: number;
 	/** Sealed hard failures whose actual descriptor capture supplied no input resources. */
 	closedInputFailures: number;
 	readonly sourceRoot: string;
@@ -539,6 +540,7 @@ export class LinuxProcessReuseBackend {
 			lifecycle: new RuntimeLifecycleLane(),
 			ownership: new ProcessHandoffOwnership(input.onOperationAdopted, input.acceptOperationScope),
 			preparedResults: 0,
+			preparedInputSeeds: 0,
 			closedInputFailures: 0,
 			nestedEvidence: [], foldedObservations: [], resumed: new Set(),
 			executionBindings: new Map(),
@@ -913,20 +915,23 @@ export class LinuxProcessReuseBackend {
 		})
 			.catch(error => { recordProcessReplayOverhead(session, prototypeStartedAt); throw error; });
 		const { prototype, before } = captured.output, preparation = new TimelineInterval(prototypeStartedAt, performance.now(), captured.dependencies);
-		const requestsBefore = session.metrics.requests, failuresBefore = session.closedInputFailures, resultsBefore = session.preparedResults;
+		const requestsBefore = session.metrics.requests, failuresBefore = session.closedInputFailures, resultsBefore = session.preparedResults, seedsBefore = session.preparedInputSeeds;
 		this.add(session, "requests");
 		const observation = { complete: true, paths: [], taints: [], tracedProcesses: 0, incompleteReasons: [] };
 		const result = await this.executeRequest(session, request, executable, invocation.outputRoute, session.metrics.requests, prototype,
 			capture => { session.topLevelCapture = { ...capture, observation }; }, undefined, preparation);
 		session.signal.throwIfAborted();
 		if (!invocation.producer && !invocation.resources && result.kind === "executed" && result.reusable === false &&
-			session.preparedResults === resultsBefore && session.closedInputFailures - failuresBefore === session.metrics.requests - requestsBefore) {
+			session.preparedResults === resultsBefore && session.preparedInputSeeds === seedsBefore) {
 			// Every request must have sealed a closed-input hard failure. A hit, bypass, missing capture or live-input seed
-			// leaves the counts unequal; any reusable child or retained continuation also preserves the enclosing preparation.
-			// Keep this negative with its bounded launch owner; an arbitrary workspace edit does not prove it can now replay.
-			this.handoffs.retirePreparation(binding);
+			// leaves the counts unequal and permits only a temporary delay. Any reusable child, continuation or live-input seed
+			// preserves the enclosing preparation. Workspace edits alone do not erase these bounded scheduling negatives.
+			if (session.closedInputFailures - failuresBefore === session.metrics.requests - requestsBefore) this.handoffs.retirePreparation(binding);
+			else this.handoffs.settlePreparation(binding, false, performance.now() - prototypeStartedAt);
 			throw new Error(`bound process preparation produced no reusable result${session.metrics.lastError ? `: ${session.metrics.lastError.slice(0, 4096)}` : ""}`);
 		}
+		if (session.preparedResults > resultsBefore || result.kind === "suspended" || result.kind === "hit" || result.reusable === true)
+			this.handoffs.settlePreparation(binding, true);
 		// Only it and what it launched ran here: when its own transaction could not seal (what it launched overlapped it), the session's
 		// endpoints stand for its interval, and what it observed joins its launches' evidence.
 		if (result.kind !== "suspended") session.topLevelCapture ??= { before, after: await session.workspace.structure.capture(), observation };
@@ -1619,6 +1624,7 @@ export class LinuxProcessReuseBackend {
 		// preparation feedback cannot replace the native contract and dependency checks at its eventual adoption.
 		const acceptedTaints = [...TRANSFERRED_INPUT_TAINTS, ...SAME_CONFINEMENT_TAINTS], evidence = certificate.dependencyCertificate;
 		const reusable = !!certificate.result.continuation || certificateReplayable(certificate, acceptedTaints);
+		if (hasInputResources) session.preparedInputSeeds++;
 		if (reusable) session.preparedResults++;
 		// Use the inputs actually installed by descriptor capture, not a descriptor-count or EOF guess. A captured
 		// resource can support an earlier live frontier even when the completed result later gains a hard taint.
