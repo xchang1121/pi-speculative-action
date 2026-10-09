@@ -40,7 +40,7 @@ vi.mock("node:child_process", { spy: true });
 vi.mock("node:fs/promises", { spy: true });
 
 describe("Linux process ExecutionWorld", () => {
-	test("calibrates the original native operation with complete preparation and proof cost", async () => {
+	test.each(["completed", "failed", "cancelled", "completed-then-failed"] as const)("calibrates native preparation cost without crediting cancellation (%s)", async outcome => {
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-operation-timing-"));
 		const registry = new ProcessHandoffRegistry<null>(4, 128), scope = { sessionID: "timing", turnID: "native" };
 		const learned = registry.observe(sha256Digest("learned"), "/worker", scope, null, 10)!;
@@ -49,13 +49,22 @@ describe("Linux process ExecutionWorld", () => {
 		const coordinator = new ProcessExecutionCoordinator(adaptProcessToolOperations(createLocalBashOperations()));
 		const world = createLinuxProcessExecutionWorld({ coordinator, backend, workspaceSandbox: sandbox, storeRoot: path.join(root, "store"), tools: PI_OPERATION_TOOLS.process });
 		let clock = 100, descriptor: ExecutionOperationBinding | undefined;
+		let executionOutcome = outcome === "completed-then-failed" ? "completed" : outcome;
+		const controller = new AbortController();
 		const timer = vi.spyOn(performance, "now").mockImplementation(() => clock);
 		vi.spyOn(backend, "observeBindings").mockImplementation(async (_scope, execute, observe) => { const result = await execute(); observe([learned], []); return result; });
 		vi.spyOn(sandbox, "qualify").mockImplementation(async () => { clock += 20; return { driver: "git", fingerprint: "test" }; });
 		vi.spyOn(backend, "open").mockImplementation(async () => {
 			clock += 5;
 			return { ownership: new ProcessHandoffOwnership(), executionBindings: () => [prepared], computationDependencies: () => [],
-				executeBinding: async () => { clock += 40; return { output: [], exit: { kind: "code", code: 0 } }; },
+				executeBinding: async () => {
+					clock += 40;
+					if (executionOutcome !== "completed") {
+						if (executionOutcome === "cancelled") controller.abort();
+						throw new Error("prepared operation failed");
+					}
+					return { output: [], exit: { kind: "code", code: 0 } };
+				},
 				executor: { execute: async () => { throw new Error("enclosing tool must not run"); } },
 				metrics: () => ({ ...emptyWorldReuseMetrics(), executionMs: 90 }),
 				seal: async () => { clock += 30; return []; }, close: async () => { clock += 5; },
@@ -76,8 +85,17 @@ describe("Linux process ExecutionWorld", () => {
 			expect(descriptor!.expectedDurationMs).toBe(10);
 			const action = buildActionKey({ ...permission, input: { operation: descriptor!.identity },
 				executionContext: { ...invocation, operation: { binding: descriptor!, permission } } });
-			const began = clock, branch = await world.speculation.execute({ cwd, action, toolName: "bash", args, callID: "prepare",
-				tool: createBashTool(cwd), signal: new AbortController().signal, executionScope: scope });
+			const began = clock, pending = world.speculation.execute({ cwd, action, toolName: "bash", args, callID: "prepare",
+				tool: createBashTool(cwd), signal: controller.signal, executionScope: scope });
+			if (outcome === "failed" || outcome === "cancelled") {
+				await expect(pending).rejects.toThrow("prepared operation failed");
+				expect(clock - began).toBe(80);
+				expect(descriptor!.expectedDurationMs).toBe(outcome === "failed" ? 80 : 10);
+				expect(registry.observe(learned.key, "/worker", scope, null, 25)).toBe(learned);
+				expect(descriptor!.expectedDurationMs).toBe(outcome === "failed" ? 95 : 25);
+				return;
+			}
+			const branch = await pending;
 			try {
 				expect(clock - began).toBe(120);
 				expect(descriptor!.expectedDurationMs).toBe(120);
@@ -85,6 +103,14 @@ describe("Linux process ExecutionWorld", () => {
 				expect(registry.observe(learned.key, "/worker", scope, null, 25)).toBe(learned);
 				expect(descriptor!.expectedDurationMs).toBe(135);
 			} finally { await branch.dispose(); }
+			if (outcome === "completed-then-failed") {
+				executionOutcome = "failed";
+				const retryBegan = clock;
+				await expect(world.speculation.execute({ cwd, action, toolName: "bash", args, callID: "retry",
+					tool: createBashTool(cwd), signal: controller.signal, executionScope: scope })).rejects.toThrow("prepared operation failed");
+				expect(clock - retryBegan).toBe(60);
+				expect(descriptor!.expectedDurationMs).toBe(135); // An early failure cannot make a completed preparation look cheaper.
+			}
 		} finally { timer.mockRestore(); await world.dispose?.(); await sandbox.dispose(); registry.dispose(); await rm(root, { recursive: true, force: true }); }
 	});
 
