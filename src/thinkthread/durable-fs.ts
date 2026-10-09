@@ -20,6 +20,7 @@ import {
 	WorkflowError,
 } from "@thinkthread/agent-posix";
 import { ThinkThreadDurableError, ThinkThreadRecoveryRequiredError } from "./errors.ts";
+import { TimelineInterval } from "../task-timing.ts";
 
 const MAX_INVOKE_ATTEMPTS = 3;
 const STATUS_POLL_MS = 50;
@@ -203,7 +204,7 @@ export class DurableFsExecutor {
 
 	private async close(requestID: RequestId): Promise<void> {
 		try {
-			await this.client.fs.requestClose({ requestId: requestID });
+			await TimelineInterval.overhead(() => this.client.fs.requestClose({ requestId: requestID }));
 			this.pendingCloses.delete(requestID);
 		} catch (error) {
 			if (error instanceof RejectedError && error.response.error.code === "RequestNotFound") {

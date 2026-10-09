@@ -20,8 +20,11 @@ export type ResourceObservation = ResourceDependency & { readonly fingerprint: s
 	/** Named edges captured in this tree; links exceeding paths indicate an open namespace. */
 	readonly aliases?: readonly { readonly paths: readonly string[]; readonly links: number }[] };
 
-/** Declared poststates remain proposals until exact adoption validation. */
-export type ResourceInput = Uint8Array | { readonly names?: readonly string[] } | null;
+/** Supplied bytes and poststates remain proposals until exact adoption validation. */
+export type ResourceInput = Uint8Array | { readonly content: Uint8Array; readonly computation: TimelineInterval } |
+	{ readonly names?: readonly string[] } | null;
+
+const inputContent = (input: ResourceInput | undefined) => input instanceof Uint8Array ? input : input && "content" in input ? input.content : undefined;
 
 export type ResourceValidationMetrics = {
 	readonly durationMs: number;
@@ -584,7 +587,7 @@ export class ResourceVersionManager {
 		if (providedInputs && retainBytes === undefined) throw new Error("resource_snapshot_budget_invalid");
 		return this.captureToken(dependencies, retainBytes, providedInputs && new Map([...providedInputs]
 			.map(([target, input]) => [filesystemPathKey(path.resolve(this.root, target)), input && !(input instanceof Uint8Array)
-				? { names: input.names && [...input.names] } : input])));
+				? "content" in input ? { ...input } : { names: input.names && [...input.names] } : input])));
 	}
 
 	/** Notification cursor for preparation; empty observations cannot validate or seal any resource. */
@@ -778,7 +781,7 @@ export function resourceDependencies(action: ActionKey, root: string, actionSema
 export async function captureResourceVersion(action: ActionKey | undefined, root: string,
 	actionSemantics: ActionSemanticsRegistry = PI_ACTION_SEMANTICS, retainBytes?: number, providedInputs?: ReadonlyMap<string, ResourceInput>) {
 	const dependencies = providedInputs ? [...providedInputs].map(([path, input]): ResourceDependency => ({ path,
-		scope: input && !(input instanceof Uint8Array) ? input.names ? "names" : "type" : "content" }))
+		scope: input && !(input instanceof Uint8Array) && !("content" in input) ? input.names ? "names" : "type" : "content" }))
 		: action ? resourceDependencies(action, root, actionSemantics) : undefined;
 	if (dependencies?.length === 0 || (!dependencies && retainBytes === undefined)) throw new Error("resource_dependencies_unproven");
 	return resourceManager(root).capture(dependencies, retainBytes, providedInputs);
@@ -973,8 +976,9 @@ async function fingerprintDependencies(
 		}
 		const { info, link } = captured;
 		const supplied = providedInputs?.get(filesystemPathKey(target));
-		if (providedInputs && !(supplied instanceof Uint8Array ? info.isFile() : supplied && info.isDirectory()))
-			throw new Error(supplied instanceof Uint8Array ? "resource_input_not_regular" : "resource_input_type_changed");
+		const suppliedContent = inputContent(supplied);
+		if (providedInputs && !(suppliedContent ? info.isFile() : supplied && info.isDirectory()))
+			throw new Error(suppliedContent ? "resource_input_not_regular" : "resource_input_type_changed");
 		const realTarget = info.isSymbolicLink()
 			? path.join(parentReal ?? await fingerprintIO(() => fs.realpath(path.dirname(target))), path.basename(target))
 			: parentReal === undefined ? await fingerprintIO(() => fs.realpath(target)) : path.join(parentReal, path.basename(target));
@@ -1023,14 +1027,15 @@ async function fingerprintDependencies(
 			if (existing) return { ...await staged(existing), bytesRead: 0, filesRead: 0 };
 			const pending = (async () => {
 				// Join concurrent reads of this identity; a settled capture stands for a later read only below, by the file's identity.
-				const provided = supplied instanceof Uint8Array ? supplied : undefined;
+				const provided = suppliedContent;
 				const retain = view?.reserve(provided?.byteLength ?? Number(info.size)) ?? false;
 				if (provided && !retain) throw new Error("resource_snapshot_budget_exceeded");
 				const bytes = provided && Buffer.from(provided);
 				// Supplied bytes own data, never a host observation window; adoption validates them exactly.
 				// A file unchanged since an earlier read of it, by the racy-git rule, needs no read unless its bytes are retained.
 				const gitBlob = scope === "tree_content" && treeObjects !== undefined, takenAtMs = Date.now();
-				const content: StableFilesystemCapture = bytes ? { content: bytes, bytesRead: bytes.length, hash: hash("sha256", bytes), stat: info, realPath: realTarget }
+				const content: StableFilesystemCapture = bytes ? { content: bytes, bytesRead: bytes.length, hash: hash("sha256", bytes), stat: info, realPath: realTarget,
+					computation: supplied && "computation" in supplied ? supplied.computation : undefined }
 					: !retain && cachedCapture(info, realTarget, gitBlob) || await fingerprintIO(() => captureStableFile(target, retain ? Number(info.size) : undefined, retain, {
 						stat: info, realPath: realTarget, retainObject: retain && view!.canRetainObject, gitBlob }));
 				if (!bytes && !content.shared) rememberCapture(content, takenAtMs);
@@ -1049,7 +1054,7 @@ async function fingerprintDependencies(
 			return staged(pending);
 		}
 		if (!info.isDirectory() || scope === "content") throw new Error(`unsupported_resource_type:${specialFileType(info)}:${target}`);
-		if (supplied && !(supplied instanceof Uint8Array) && supplied.names) {
+		if (supplied && "names" in supplied && supplied.names) {
 			view?.capture(target, { type: "directory", entries: supplied.names, realPath: realTarget, dependency, ...directoryObjectSlot(supplied.names, view) });
 			return { ...fingerprintDirectory(info, realTarget, supplied.names), bytesRead: 0, filesRead: 0 };
 		}
