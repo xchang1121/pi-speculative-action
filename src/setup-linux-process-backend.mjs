@@ -108,6 +108,10 @@ async function qualifySandlock(binary) {
 			"run", "--chroot", "/", "--fs-read", "/", "--", process.execPath, "-e", `
 				const fs = require('node:fs'), assert = require('node:assert/strict');
 				assert.throws(() => fs.openSync('/pi-speculative-action/not/present', 'r'), { code: 'ENOENT' });
+				for (const tail of ['/package.json', '/../false']) {
+					assert.throws(() => fs.statSync(process.argv[1] + tail), { code: 'ENOTDIR' });
+					assert.throws(() => fs.openSync(process.argv[1] + tail, 'r'), { code: 'ENOTDIR' });
+				}
 				for (const p of [process.argv[1], require('node:path').dirname(process.argv[1])]) {
 					assert.throws(() => fs.readlinkSync(p), { code: 'EINVAL' });
 					assert.equal(fs.realpathSync.native(p), fs.realpathSync(p));

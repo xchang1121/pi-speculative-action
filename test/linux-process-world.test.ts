@@ -40,6 +40,46 @@ vi.mock("node:child_process", { spy: true });
 vi.mock("node:fs/promises", { spy: true });
 
 describe("Linux process ExecutionWorld", () => {
+	test.for(["file", "symlink", "lexical-parent", "normalized-blocker"] as const)("proves ENOTDIR from the blocking file and invalidates a changed walk (%s)", { timeout: 30_000 }, async (mode, { skip }) => {
+		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
+		const fixture = await createLinuxProcessBenchmark("pi-enotdir-", "overlayfs", {}, os.homedir());
+		try {
+			const blocker = path.join(fixture.workspace, "module.js");
+			await writeFile(blocker, "source\n");
+			await writeFile(path.join(fixture.workspace, "package.json"), "{}\n");
+			await filesystem.symlink(mode === "normalized-blocker" ? "inner/dir" : "module.js", path.join(fixture.workspace, "alias"));
+			if (mode === "normalized-blocker") {
+				await mkdir(path.join(fixture.workspace, "inner/dir"), { recursive: true });
+				await mkdir(path.join(fixture.workspace, "inner/module.js"));
+				await filesystem.symlink("../../module.js", path.join(fixture.workspace, "inner/module.js/package.json"));
+			}
+			await commitBenchmarkFixture(fixture.workspace, "blocked module lookup");
+			const prepared = await prepareLinuxProcessReuse(fixture);
+			const target = mode === "normalized-blocker" ? "alias/../module.js/package.json" : mode === "symlink" ? "alias/package.json" : mode === "lexical-parent" ? "module.js/../package.json" : "module.js/package.json";
+			const script = `import os\ntry:\n os.stat(${JSON.stringify(target)})\n print(0)\nexcept OSError as error:\n print(error.errno)`;
+			const command = `if [ -e '${target}' ]; then printf present; else printf blocked; fi`;
+			expect(execFileSync("/usr/bin/python3", ["-c", script], { cwd: fixture.workspace, encoding: "utf8" })).toBe(mode === "normalized-blocker" ? "0\n" : "20\n");
+			const branch = await forkReusableBash(fixture, { command, label: "enotdir", actionNamespace: "enotdir", ...prepared });
+			try {
+				const native = execFileSync("/bin/bash", ["-c", command], { cwd: fixture.workspace, env: fixture.environment, encoding: "utf8" });
+				expect(native).toBe(mode === "normalized-blocker" ? "present" : "blocked");
+				const validation = await branch.validate?.();
+				expect(textOutput(branch.output.result)).toBe(native);
+				if (mode === "normalized-blocker") {
+					expect(validation).toMatchObject({ status: "indeterminate" });
+					expect(JSON.stringify(validation)).toContain("pathname_walk:");
+				} else {
+					expect(validation, JSON.stringify(validation)).toMatchObject({ status: "valid" });
+					const changed = mode === "symlink" ? path.join(fixture.workspace, "alias") : blocker;
+					await rm(changed); await mkdir(changed);
+					await writeFile(path.join(changed, "package.json"), "{}\n");
+					expect(await branch.validate?.()).toMatchObject({ status: expect.stringMatching(/^(stale|indeterminate)$/) });
+					expect(execFileSync("/bin/bash", ["-c", command], { cwd: fixture.workspace, env: fixture.environment, encoding: "utf8" })).toBe("present");
+				}
+			} finally { await branch.dispose(); }
+		} finally { await fixture.dispose(); }
+	});
+
 	test.each(["completed", "failed", "cancelled", "completed-then-failed"] as const)("calibrates native preparation cost without crediting cancellation (%s)", async outcome => {
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-operation-timing-"));
 		const registry = new ProcessHandoffRegistry<null>(4, 128), scope = { sessionID: "timing", turnID: "native" };

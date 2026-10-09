@@ -28,7 +28,9 @@ export function straceCommand(
 
 export type ObservedProcessPath =
 	/** `listed` when its entries reached the run: it read them, or a removal or rename found some. */
-	| { readonly path: string; readonly role: DependencyRole; readonly listed?: true }
+	| { readonly path: string; readonly role: DependencyRole; readonly listed?: true;
+		/** Uniform lookup error; the dependency walker must independently prove the failing component. */
+		readonly lookupFailure?: "ENOENT" | "ENOTDIR" }
 	| { readonly path: string; readonly role: "metadata"; readonly followSymlinks: boolean; readonly digest: Sha256Digest; readonly fields?: readonly FilesystemObservationField[] };
 
 export interface StraceObservation {
@@ -587,6 +589,7 @@ export async function observeStrace(
 	if (options.frozen && selected.size !== 1) { complete = false; incompleteReasons.add("continuation_process_tree"); }
 
 	const paths = new Map<string, DependencyRole>(), listedPaths = new Set<string>(), metadata = new Map<string, Extract<ObservedProcessPath, { role: "metadata" }>>();
+	const lookupFailures = new Map<string, "ENOENT" | "ENOTDIR" | undefined>();
 	// Native instructions and ELF startup state expose clock/random inputs without a syscall.
 	// A complete transcript therefore permits only the existing one-shot transfer, never proof
 	// that this process can be repeated. Do not infer unused inputs from their absence here.
@@ -612,6 +615,7 @@ export async function observeStrace(
 	const systemAliases = new Map([...interposedExecutables].flatMap(([original, shadow]) => systemToolName(original, semanticRoots) ? [[shadow, original] as const] : []));
 	const { ignored: ignoredSegments, resumed: resumedInterpositions } = ignoredProcessSegments(selected, interposedExecutables);
 	const observeMetadata = (observedPath: string, followSymlinks: boolean, { digest, fields }: StatObservation) => {
+		lookupFailures.set(observedPath, undefined);
 		const identity = `metadata:${followSymlinks}:${fields?.join(",") ?? ""}:${observedPath}`;
 		if (metadata.get(identity)?.digest !== undefined && metadata.get(identity)?.digest !== digest) changedMetadata.add(observedPath);
 		metadata.set(identity, { path: observedPath, role: "metadata", followSymlinks, digest, ...(fields ? { fields } : {}) });
@@ -755,7 +759,14 @@ export async function observeStrace(
 			const observedPaths = syscallPaths(line, syscall, cwd);
 			if (!observedPaths) { complete = false; incompleteReasons.add(`unresolved_pathname:${syscall}:${pid}`); }
 			const nonEmpty = /^(?:rmdir|unlinkat|rename(?:at2?)?)$/.test(syscall) && /^-1 (?:ENOTEMPTY|EEXIST)\b/.test(line.result);
-			for (const observed of observedPaths ?? []) { if (paths.get(observed) !== "executable") paths.set(observed, role); if (nonEmpty) listedPaths.add(observed); }
+			for (const observed of observedPaths ?? []) {
+				if (paths.get(observed) !== "executable") paths.set(observed, role);
+				if (nonEmpty) listedPaths.add(observed);
+				// A multi-path syscall does not identify which operand failed its walk.
+				const failure = observedPaths?.length === 1 ? /^-1 (ENOENT|ENOTDIR)\b/.exec(line.result)?.[1] as "ENOENT" | "ENOTDIR" | undefined : undefined;
+				if (!lookupFailures.has(observed)) lookupFailures.set(observed, failure);
+				else if (lookupFailures.get(observed) !== failure) lookupFailures.set(observed, undefined);
+			}
 			if ((syscall === "chdir" || syscall === "fchdir") && syscallSucceeded(line)) {
 				const changed = tracedCwd(line, cwd);
 				if (changed) cwd = changed;
@@ -780,6 +791,7 @@ export async function observeStrace(
 		...(options.inheritedHandles || options.inheritedStreams ? { resourceJournal: resourceJournal.sort((a, b) => a.order - b.order).map(({ order, ...event }) => event), retainedDescriptions: retained,
 			...(options.frozen ? { finalHandles } : {}) } : {}),
 		paths: Object.freeze([...[...paths].map(([observedPath, role]) => ({ path: observedPath, role: sharedObjectRole(observedPath, role),
+			...(lookupFailures.get(observedPath) ? { lookupFailure: lookupFailures.get(observedPath)! } : {}),
 			...(listedPaths.has(observedPath) ? { listed: true as const } : {}) })), ...metadata.values()]
 			.sort((left, right) => pathOrder(left).localeCompare(pathOrder(right)))),
 		taints: Object.freeze([...taints].sort()),

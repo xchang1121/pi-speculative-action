@@ -2223,7 +2223,7 @@ async function captureDependencies(session: ActiveSession, snapshot: WorkspaceSt
 			if (session.gitDirectory && pathContains(session.gitDirectory, repository)) return { path: path.posix.join(repository, ...pending), links };
 			const physical = pathContains(session.sourceRoot, next) ? session.projection.toPhysical(next) : undefined;
 			const entry = physical ? await before(physical) : undefined;
-			if (entry?.kind === "file" && pending.length) return undefined; // Native ENOTDIR; lexical collapse would continue.
+			if (entry?.kind === "file" && pending.length) return { path: next, links, blocked: true as const };
 			if (entry?.kind !== "symlink" || !pending.length && !follow) { current = next; continue; }
 			if (links.push(next) > 40) return undefined;
 			pending.unshift(...entry.target.split("/").filter(Boolean));
@@ -2240,7 +2240,13 @@ async function captureDependencies(session: ActiveSession, snapshot: WorkspaceSt
 	const pending = [...observed], seenImages = new Set<string>(), hostPaths = new Map<string, { physical: string; role: Exclude<ObservedProcessPath["role"], "metadata">; listed: boolean }>();
 	for (let item = pending.shift(); item; item = pending.shift()) {
 		const follow = item.role !== "metadata" || item.followSymlinks, walked = await walk(item.path, follow);
-		if (!walked || walked.path !== (item.path.split("/").includes("..") ? (await walk(path.posix.normalize(item.path), follow))?.path : walked.path)) {
+		// A failed walk depends on its blocking file and links, not on an absent leaf. Only the same
+		// ENOTDIR on every observation proves that walk; older sandboxes reported ENOENT instead.
+		if (walked?.blocked && (item.role === "metadata" || item.lookupFailure !== "ENOTDIR")) {
+			add(undefined, `pathname_not_directory:${item.path}${item.role !== "metadata" && item.lookupFailure ? `:observed_${item.lookupFailure}` : ""}`); continue;
+		}
+		const normalized = !walked?.blocked && item.path.split("/").includes("..") ? await walk(path.posix.normalize(item.path), follow) : walked;
+		if (!walked || normalized?.blocked && !walked.blocked || walked.path !== normalized?.path) {
 			add(undefined, `pathname_walk:${item.path}`); continue;
 		}
 		for (const link of item.role === "metadata" ? [] : walked.links) add(await workspaceDependency(session.projection.toPhysical(link)!, link, "input"));
