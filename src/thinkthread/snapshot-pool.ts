@@ -1,6 +1,7 @@
 import type { FsSnapshotId } from "@thinkthread/agent-posix";
 import type { ExecutionScope, WorldCheckpoint } from "../execution-world.ts";
 import type { DurableFsExecutor } from "./durable-fs.ts";
+import { TimelineInterval } from "../task-timing.ts";
 
 interface ActiveTurn {
 	readonly scope: ExecutionScope;
@@ -12,16 +13,18 @@ interface ActiveTurn {
 class SnapshotResource {
 	readonly id: FsSnapshotId;
 	readonly logicalBytes: number;
+	readonly computation?: TimelineInterval;
 	private readonly remove: (snapshotID: FsSnapshotId) => Promise<void>;
 	private references = 0;
 	private removal?: Promise<void>;
 
 	constructor(
-		view: { readonly snapshotId: FsSnapshotId; readonly logicalBytes: number },
+		view: { readonly snapshotId: FsSnapshotId; readonly logicalBytes: number; readonly computation?: TimelineInterval },
 		remove: (snapshotID: FsSnapshotId) => Promise<void>,
 	) {
 		this.id = view.snapshotId;
 		this.logicalBytes = view.logicalBytes;
+		this.computation = view.computation;
 		this.remove = remove;
 	}
 
@@ -62,6 +65,8 @@ export class SnapshotLease {
 	get id(): FsSnapshotId {
 		return this.resource.id;
 	}
+
+	get computation(): TimelineInterval | undefined { return this.resource.computation; }
 
 	retain(): SnapshotLease {
 		return this.resource.retain();
@@ -164,7 +169,7 @@ export class ThinkThreadSnapshotPool {
 		return new ThinkThreadCheckpoint(snapshot, lineage, depth, this.identity);
 	}
 
-	ownSnapshot(view: { readonly snapshotId: FsSnapshotId; readonly logicalBytes: number }): SnapshotLease {
+	ownSnapshot(view: { readonly snapshotId: FsSnapshotId; readonly logicalBytes: number; readonly computation?: TimelineInterval }): SnapshotLease {
 		if (this.resources.has(view.snapshotId)) {
 			throw new Error(`ThinkThread snapshot ${view.snapshotId} is already owned by this execution world`);
 		}
@@ -198,7 +203,8 @@ export class ThinkThreadSnapshotPool {
 	}
 
 	private async createBase(): Promise<SnapshotLease> {
-		return this.ownSnapshot(await this.durable.snapshotCreate());
+		const startedAt = performance.now(), capture = await TimelineInterval.collect(() => this.durable.snapshotCreate());
+		return this.ownSnapshot({ ...capture.output, computation: TimelineInterval.own(new TimelineInterval(startedAt, performance.now(), capture.dependencies)) });
 	}
 
 	private async finishActive(): Promise<void> {

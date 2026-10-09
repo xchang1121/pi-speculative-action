@@ -17,10 +17,77 @@ import { ExecutionWorldRouter } from "../src/execution-world.ts";
 import { ThinkThreadDurableError } from "../src/thinkthread/errors.ts";
 import { createThinkThreadExecutionWorld } from "../src/thinkthread/execution-world.ts";
 import { encodeThinkThreadToolRunnerResponse } from "../src/thinkthread/tool-runner-protocol.ts";
+import { TaskTimeline, TimelineInterval } from "../src/task-timing.ts";
 
 const ownerID = parseThinkThreadId("tt-00000000-0000-4000-8000-000000000001");
 
 describe("ThinkThread execution world", () => {
+	it.runIf(process.platform === "linux")("shares snapshot inputs across read ranges with query freshness and owned cleanup", async () => {
+		const fixture = await snapshotInputFixture();
+		const { world, cwd, file, relative, snapshotPread } = fixture;
+		const fallback = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: ["read"], maxBytes: () => 4096 });
+		const source = await world.speculation.execute(context("read", { path: relative, limit: 1 }, cwd, "first"));
+		const coordinator = new EffectTransactionCoordinator<typeof source.output>();
+		const branch = await coordinator.execute(coordinator.begin({ tool: "read", route: {
+			isolation: "runtime_sandbox", reuse: "shared_result", scope: "runtime", backend: world.id, fingerprint: "test",
+		} }), async () => source);
+		let borrowed: typeof source | undefined;
+		try {
+			const args = { path: relative, offset: 2, limit: 1 }, request = context("read", args, cwd, "second");
+			const expected = { result: await createReadTool(cwd).execute(request.callID, args), isError: false };
+			const supplied = vi.fn(async () => { throw new Error("unqualified caller function executed"); });
+			const query = await branch.reconstruct!({ ...request, action: { ...request.action,
+				executionContext: { ...(request.action.executionContext as object), filesystem: supplied } } });
+			expect(branch.reconstructionScope).toBe("current_action");
+			expect(branch.inputSource).toBeDefined();
+			expect(branch.inputResources).toContainEqual({ path: file, descendants: false });
+			expect(branch.capturedBytes).toBeGreaterThan(fixture.bytes.length);
+			expect(query?.output).toEqual(expected);
+			expect(query?.output).not.toEqual(branch.output);
+			await expect(query?.validate?.()).resolves.toMatchObject({ status: "valid" });
+			expect(supplied).not.toHaveBeenCalled();
+			await expect(branch.reconstruct!({ ...request, action: { ...request.action,
+				executionContext: { ...(request.action.executionContext as object), executor: "custom" } } })).rejects.toThrow("bound stock Pi");
+			borrowed = await fallback.speculation!.execute({ ...request, inputs: () => [branch.inputSource!] });
+			expect(borrowed.output).toEqual(expected);
+			expect(snapshotPread).toHaveBeenCalledOnce();
+			expect(fixture.run).not.toHaveBeenCalled();
+			const retainedBytes = branch.capturedBytes;
+			await writeFile(file, "changed\nother\n");
+			await expect(query?.validate?.()).resolves.toMatchObject({ status: "stale" });
+			await expect(borrowed.validate?.()).resolves.toMatchObject({ status: "stale" });
+			await query?.dispose?.();
+			await branch.dispose();
+			expect(branch.capturedBytes).toBeLessThan(retainedBytes);
+			await expect(branch.reconstruct!(request)).resolves.toBeUndefined();
+		} finally { await borrowed?.dispose(); await branch.dispose(); await fallback.dispose?.(); await fixture.close(); }
+	});
+
+	it.runIf(process.platform === "linux")("counts shared snapshot preparation once per call and excludes verification and request cleanup", async () => {
+		const fixture = await snapshotInputFixture();
+		let clock = 100;
+		const timer = vi.spyOn(performance, "now").mockImplementation(() => clock);
+		const create = fixture.snapshotCreate.getMockImplementation()!, pread = fixture.snapshotPread.getMockImplementation()!;
+		fixture.snapshotCreate.mockImplementation(async () => { clock += 30; return create(); });
+		fixture.snapshotPread.mockImplementation(async input => { clock += 20; return pread(input); });
+		fixture.verify.mockImplementation(async () => { clock += 200; return { status: "matched", durationMs: 200, comparedEntries: 1, comparedBytes: fixture.bytes.length }; });
+		vi.mocked(fixture.client.fs.requestClose).mockImplementation(async () => { clock += 500; return {}; });
+		const branches: Awaited<ReturnType<typeof fixture.world.speculation.execute>>[] = [];
+		try {
+			for (const limit of [1, 2]) branches.push(await fixture.world.speculation.execute(context("read", { path: fixture.relative, limit }, fixture.cwd, `read-${limit}`)));
+			const evaluated = await TimelineInterval.collect(async () => {
+				for (const branch of branches) {
+					const query = await branch.reconstruct!(context("read", { path: fixture.relative, offset: 2 }, fixture.cwd, "query"));
+					await expect(query?.validate?.()).resolves.toMatchObject({ status: "valid" });
+					await query?.dispose?.();
+				}
+			});
+			const measured = new TaskTimeline(0).recordTool(new TimelineInterval(clock, clock + 1, evaluated.dependencies));
+			expect(measured.reusedExecutionMs).toBe(70); // One 30 ms BASE and two independently read 20 ms inputs.
+			expect(fixture.snapshotCreate).toHaveBeenCalledOnce();
+		} finally { await Promise.allSettled(branches.map(branch => branch.dispose())); await fixture.close(); timer.mockRestore(); }
+	});
+
 	it("binds the stock runner and execution options without inventing a Runtime epoch", async () => {
 		const fixture = fakeClient(), cwd = process.env.THINKTHREAD_FS ?? path.resolve("/workspace");
 		const world = createThinkThreadExecutionWorld({ clientFactory: () => fixture.client, runnerFingerprint: "runner-v1" });
@@ -440,6 +507,25 @@ async function verifySnapshotInputs() {
 			expect(fixture.snapshotRemove).toHaveBeenCalledOnce();
 		}
 	} finally { await rm(directory, { recursive: true, force: true }); }
+}
+
+async function snapshotInputFixture() {
+	const directory = await mkdtemp(path.join(process.env.THINKTHREAD_FS ?? process.cwd(), "thinkthread-shared-"));
+	const cwd = process.env.THINKTHREAD_FS ?? directory, file = path.join(directory, "notes.txt"), relative = path.relative(cwd, file);
+	const bytes = Buffer.from("alpha\nbeta\ngamma\n");
+	await writeFile(file, bytes);
+	const fixture = fakeClient();
+	const snapshotPread = vi.fn(async ({ offset = 0, length = 65536 }: { offset?: number; length?: number }) => {
+		const content = bytes.subarray(offset, offset + length);
+		return { offset, bytesRead: content.length, dataBase64: content.toString("base64"), eof: offset + content.length === bytes.length };
+	});
+	Object.assign(fixture.client.fs, { snapshotPread, snapshotStat: vi.fn(async ({ path: name }: { path: string }) => ({
+		kind: name === relative ? "file" : "directory", len: bytes.length, mode: 0o644,
+	})) });
+	const world = createThinkThreadExecutionWorld({ clientFactory: () => fixture.client });
+	return { ...fixture, world, cwd, file, relative, bytes, snapshotPread, close: async () => {
+		await world.dispose!(); await rm(directory, { recursive: true, force: true });
+	} };
 }
 
 function context(toolName: string, args: unknown, cwd: string, callID: string, settings: Partial<PiToolInvocationOptions> = {}) {
