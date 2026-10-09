@@ -275,7 +275,7 @@ export class LinuxHeldExecBoundary {
 		const candidate = path.join(options.storeRoot, `held-${process.pid}-${randomBytes(6).toString("hex")}.sock`);
 		const socketPath = Buffer.byteLength(candidate) < 104
 			? candidate
-			: path.join(os.tmpdir(), `pi-held-${process.getuid?.() ?? 0}-${process.pid}-${randomBytes(6).toString("hex")}.sock`);
+			: path.join("/tmp", `pi-held-${process.getuid?.() ?? 0}-${process.pid}-${randomBytes(6).toString("hex")}.sock`);
 		const boundary = new LinuxHeldExecBoundary(binary, socketPath);
 		await listenUnixSocket(boundary.server, socketPath);
 		try { await chmod(socketPath, 0o600); return boundary; } catch (error) { await boundary.close(); throw error; }
