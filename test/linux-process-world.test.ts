@@ -80,15 +80,18 @@ describe("Linux process ExecutionWorld", () => {
 	});
 
 
-	test.for(["missing", "appeared", "file", "blocked", "symlink", "lexical"] as const)("proves only absent host lookups and cleans its long-path broker (%s)", { timeout: 20_000 }, async (mode, { skip }) => {
+	test.for(["missing", "appeared", "file", "blocked", "symlink", "lexical", "socket", "socket-file", "socket-blocked", "socket-listening", "socket-private", "socket-private-blocked", "socket-mapped", "socket-relative", "socket-link"] as const)("proves only absent host lookups and cleans its long-path broker (%s)", { timeout: 20_000 }, async (mode, { skip }) => {
 		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-long-broker-")), previous = process.env.TMPDIR;
 		const temporary = path.join(root, "nested-temporary-directory-".repeat(3));
 		await mkdir(temporary); process.env.TMPDIR = temporary;
 		const listening = vi.spyOn(net.Server.prototype, "listen");
-		const target = `${root}/candidate${mode === "blocked" ? "/child" : mode === "lexical" ? "/../other" : ""}`;
-		if (mode === "file" || mode === "blocked") await writeFile(path.join(root, "candidate"), "prepared");
-		if (mode === "symlink") await filesystem.symlink("absent", target);
+		let target = `${root}/candidate${mode.endsWith("blocked") ? "/child" : mode === "lexical" ? "/../other" : ""}`;
+		if (mode.endsWith("file") || mode === "blocked" || mode === "socket-blocked") await writeFile(path.join(root, "candidate"), "prepared");
+		if (mode === "symlink" || mode === "socket-link") await filesystem.symlink("absent", target);
+		let connections = 0;
+		const listener = mode === "socket-listening" ? net.createServer(socket => { connections++; socket.destroy(); }) : undefined;
+		if (listener) { listener.listen(target); await once(listener, "listening"); }
 		const { lstat } = await vi.importActual<typeof filesystem>("node:fs/promises");
 		const probing = vi.spyOn(filesystem, "lstat").mockImplementation(async (...args) => {
 			if (mode === "appeared" && String(args[0]) === target) await writeFile(target, "appeared");
@@ -98,13 +101,35 @@ describe("Linux process ExecutionWorld", () => {
 		try {
 			fixture = await createLinuxProcessBenchmark("command-", "git");
 			await writeFile(path.join(fixture.workspace, "input.txt"), "input\n");
+			if (mode.startsWith("socket")) {
+				await writeFile(path.join(fixture.workspace, "connect.c"), String.raw`#include <sys/socket.h>
+#include <sys/un.h>
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+	struct sockaddr_un address = {.sun_family = AF_UNIX};
+	if (argc != 2 || strlen(argv[1]) >= sizeof(address.sun_path)) return 2;
+	strcpy(address.sun_path, argv[1]); int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	int result = connect(fd, (struct sockaddr *)&address, sizeof(address));
+	printf("%d\n", result < 0 ? errno : 0); close(fd); return 0;
+}
+`);
+				await compileBenchmarkHelper(fixture.workspace, { source: "connect.c", output: "connect" });
+			}
+			if (mode === "socket-mapped") target = `${fixture.workspace}/candidate`;
 			await commitBenchmarkFixture(fixture.workspace, "long temporary path");
 			const prepared = await prepareLinuxProcessReuse(fixture);
-			const branch = await forkReusableBash(fixture, { label: "long-path", command: `/bin/cat '${target}' 2>/dev/null || printf prepared`, actionNamespace: "test", ...prepared });
+			const privateWrite = mode.startsWith("socket-private") || mode === "socket-mapped";
+			const command = mode.startsWith("socket") ? `${privateWrite ? `printf private > '${mode === "socket-private-blocked" ? path.dirname(target) : target}'; ` : ""}${mode === "socket-relative" ? `cd '${root}'; ` : ""}'${fixture.workspace}/connect' '${mode === "socket-relative" || mode === "socket-mapped" ? "candidate" : target}'` : `/bin/cat '${target}' 2>/dev/null || printf prepared`;
+			const branch = await forkReusableBash(fixture, { label: "long-path", command, actionNamespace: "test", ...prepared });
 			try {
-				expect(textOutput(branch.output.result)).toBe("prepared");
-				expect(await branch.validate?.()).toMatchObject({ status: mode === "missing" ? "valid" : "indeterminate" });
-				if (mode === "missing") {
+				expect(textOutput(branch.output.result)).toBe(mode.startsWith("socket") ? `${mode.endsWith("blocked") ? 20 : privateWrite || mode === "socket-listening" || mode === "socket-file" ? 13 : 2}\n` : "prepared");
+				if (!privateWrite) expect(await branch.validate?.()).toMatchObject({ status: mode === "missing" || mode === "socket" ? "valid" : "indeterminate" });
+				if (privateWrite) await expect(filesystem.access(target)).rejects.toMatchObject({ code: "ENOENT" });
+				expect(connections).toBe(0);
+				if (mode === "missing" || mode === "socket") {
 					await writeFile(target, "appeared");
 					expect(await branch.validate?.()).toMatchObject({ status: "stale" });
 				}
@@ -115,6 +140,7 @@ describe("Linux process ExecutionWorld", () => {
 			expect(filesystem.chmod).toHaveBeenCalledWith(sockets[0], 0o600);
 			await expect(filesystem.access(sockets[0]!)).rejects.toMatchObject({ code: "ENOENT" });
 		} finally {
+			if (listener) await new Promise<void>((resolve, reject) => listener.close(error => error ? reject(error) : resolve()));
 			await fixture?.dispose(); listening.mockRestore(); probing.mockRestore();
 			if (previous === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = previous;
 			await rm(root, { recursive: true, force: true });
