@@ -414,10 +414,8 @@ done:
 int pi_process_image_frontier(long number) {
 	if (number == SYS_read || number == SYS_readv || number == SYS_recvfrom || number == SYS_recvmsg ||
 		number == SYS_write || number == SYS_writev || number == SYS_sendto || number == SYS_sendmsg) return 1;
-	return number == SYS_getrandom || number == SYS_getpid || number == SYS_gettid || number == SYS_clock_gettime ||
-		number == SYS_prlimit64 || number == SYS_clone || number == SYS_clone3 || number == SYS_fork || number == SYS_vfork ||
-		number == SYS_poll || number == SYS_ppoll || number == SYS_select || number == SYS_pselect6 ||
-		number == SYS_nanosleep || number == SYS_clock_nanosleep || number == SYS_futex || number == SYS_openat ? 2 : 0;
+	/* Any native x86-64 syscall entry precedes its effects. Only restartable I/O also permits an exit stop. */
+	return number >= 0 && number < 0x40000000 ? 2 : 0;
 }
 static int image_status(pid_t pid, int consumer) {
 	char path[64], line[256]; snprintf(path, sizeof(path), "/proc/%d/status", pid);
@@ -440,10 +438,11 @@ int pi_capture_process_image(pid_t pid, const char *path, unsigned long watched_
 		!pi_process_image_frontier(header->registers.orig_rax) || ((long)header->registers.rax != -ENOSYS &&
 			(pi_process_image_frontier(header->registers.orig_rax) != 1 || ((long)header->registers.rax != -512 && (long)header->registers.rax != -514))) ||
 		image_status(pid, 0) < 0) goto done;
-	unsigned long original; unsigned char bootstrap_cow[2];
+	unsigned long original; unsigned char bootstrap_cow[2]; unsigned short instruction;
 	uint64_t bootstrap = header->registers.rip & ~UINT64_C(4095);
 	size_t bootstrap_length = ((header->registers.rip + sizeof(original) - 1) & ~UINT64_C(4095)) - bootstrap + 4096;
-	if (image_memory(pid, header->registers.rip, &original, sizeof(original), 0) < 0 ||
+	if (image_memory(pid, header->registers.rip - 2, &instruction, sizeof(instruction), 0) < 0 || instruction != 0x050f ||
+		image_memory(pid, header->registers.rip, &original, sizeof(original), 0) < 0 ||
 		image_cow(pid, bootstrap, bootstrap_length, bootstrap_cow) < 0) goto done;
 	header->registers.rax = header->registers.orig_rax; header->registers.orig_rax = (unsigned long)-1; header->registers.rip -= 2;
 	if (image_descriptors(pid, image) < 0 || image_scratch(pid) < 0 || image_mm(pid, header) < 0) goto done;

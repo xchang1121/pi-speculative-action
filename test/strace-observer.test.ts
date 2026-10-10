@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, test } from "vitest";
-import { FILESYSTEM_OBSERVATION_FIELDS, filesystemObservationDigest } from "../src/provenance-certificate.ts";
+import { filesystemObservationDigest } from "../src/provenance-certificate.ts";
 import { observeStrace, straceCommand, traceTail, type StraceObservationOptions } from "../src/strace-observer.ts";
 
 const EXEC = 'execve("/usr/bin/example", ["example"], 0x0) = 0';
@@ -27,14 +27,14 @@ async function observe(processes: Record<string, readonly string[]>, options?: S
 }
 
 describe("strace provenance decoder", () => {
-	test("requires an unexecuted frontier and transferable prior process state", async () => {
-		for (const syscall of ["getrandom", "clone", "prlimit64", "read"]) for (const state of ["entry", "completed", "wrong-fd", "identity", "signal", "child"]) {
+	test("requires a complete sealed prefix and transferable prior process state", async () => {
+		for (const syscall of ["getrandom", "newfstatat", "ioctl", "read"]) for (const state of ["entry", "partial", "wrong-pid", "identity", "signal", "child"]) {
 			const lines = [`100 ${EXEC}`];
 			if (state === "identity") lines.push("100 getpid() = 100");
 			if (state === "signal") lines.push("100 --- SIGUSR1 {si_signo=SIGUSR1} ---");
 			if (state === "child") lines.push("100 clone(child_stack=NULL, flags=SIGCHLD) = 101", "101 +++ exited with 0 +++");
-			lines.push(`100 ${syscall}(${syscall === "read" ? "3<pipe:[91]>, " : ""}${state === "completed" ? ") = 0" : ""}`);
-			const frozen = { pid: 100, syscall, fd: state === "wrong-fd" ? 63 : syscall === "read" ? 3 : -1, bytes: Buffer.byteLength(lines.join("\n")) };
+			const frozen = { pid: state === "wrong-pid" ? 99 : 100, bytes: Buffer.byteLength(lines.join("\n")) + Number(state !== "partial") };
+			lines.push(`100 ${syscall}(`);
 			const result = await observe({ stream: lines }, { frozen }, false);
 			expect(result.complete, `${syscall}:${state}:${result.incompleteReasons.join(",")}`).toBe(state === "entry");
 			expect(result.taints).toEqual(expect.arrayContaining(["clock", "random"]));
@@ -77,7 +77,7 @@ describe("strace provenance decoder", () => {
 		expect(observation.unsupportedSyscallsTruncated).toBe(true);
 	});
 
-	test("records only the workspace stat fields a program reveals, and flags it read of descriptors it opened", async () => {
+	test("records metadata independently of program names and keeps native descriptor observations", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-stat-fields-")), prefix = path.join(root, "process");
 		const run = async (argv: readonly string[], target: string, extra: readonly string[] = []) => {
 			await fs.writeFile(`${prefix}.100`, [`execve("/usr/bin/${argv[0]}", [${argv.map((item) => `"${item}"`).join(", ")}], 0x0) = 0`,
@@ -86,16 +86,11 @@ describe("strace provenance decoder", () => {
 		};
 		const fields = async (argv: readonly string[], target = "/work/a.txt") => (await run(argv, target)).paths.find((item) => item.role === "metadata")!;
 		try {
-			const all = FILESYSTEM_OBSERVATION_FIELDS, withoutDevice = all.filter((field) => field !== "dev");
-			// Only git's stat cache has this contract; arbitrary programs can print every field.
-			const withoutIdentity = all.filter((field) => !["dev", "ino", "blksize", "blocks", "ctimeNs"].includes(field));
-			for (const [argv, expected] of [[["cat", "a.txt"], ["mode"]], [["ls"], ["mode"]], [["ls", "-la"], withoutDevice], [["find", ".", "-size", "+1k"], ["mode", "size"]],
-				[["find", ".", "-newer", "b"], withoutDevice], [["git", "status"], withoutIdentity], [["du", "-s", "."], ["mode", "dev", "ino", "nlink", "size", "blocks"]],
-				[["stat", "-c", "%s %i", "a.txt"], ["mode", "size", "ino"]], [["stat", "--format=%Y", "a.txt"], ["mode", "mtimeNs"]], [["stat", "-c%a", "a.txt"], ["mode"]]] as const)
-				expect((await fields(argv)).fields, argv.join(" ")).toEqual(all.filter((field) => (expected as readonly string[]).includes(field)));
-			for (const argv of [["python3", "x.py"], ["bash", "-c", "true"]]) expect((await fields(argv)).fields).toBeUndefined();
+			for (const argv of [["cat", "a.txt"], ["ls"], ["find", ".", "-size", "+1k"], ["git", "status"], ["du", "-s", "."],
+				["stat", "-c", "%s %i", "a.txt"], ["python3", "x.py"], ["bash", "-c", "true"]])
+				expect(await fields(argv), argv.join(" ")).toEqual({ path: "/work/a.txt", role: "metadata", followSymlinks: false, digest: STAT_DIGEST });
 			const directory = `newfstatat(AT_FDCWD, "/work/src", ${STAT.replace("S_IFREG", "S_IFDIR")}, 0) = 0`;
-			expect((await run(["git", "status"], "/work/a.txt", [directory])).paths.find((item) => item.path === "/work/src")).toMatchObject({ fields: ["mode", "uid", "gid"] });
+			expect((await run(["git", "status"], "/work/a.txt", [directory])).paths.find((item) => item.path === "/work/src")).not.toHaveProperty("fields");
 			expect((await run(["node", "x"], "/work/a.txt", [directory])).paths.find((item) => item.path === "/work/src")).not.toHaveProperty("fields");
 			for (const [argv, target] of [[["stat", "a.txt"], "/work/a.txt"], [["stat", "-c", "%X", "a.txt"], "/work/a.txt"], [["stat", "-t", "-c", "%s", "a.txt"], "/work/a.txt"],
 				[["cat", "hosts"], "/etc/hosts"], [["find", ".", "-printf", "%D %p"], "/work/a.txt"]] as const)
@@ -104,11 +99,11 @@ describe("strace provenance decoder", () => {
 			expect((await run(["find", "."], "/work/a.txt", ['openat(AT_FDCWD, ".", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = 4</work>', flags])).taints).not.toContain("unsupported_syscall");
 			expect((await run(["find", "."], "/work/a.txt", [flags])).taints).toContain("unsupported_syscall");
 			expect((await run(["python3", "x.py"], "/work/a.txt", ['ioctl(3</work/x.py>, FIOCLEX) = 0'])).taints).not.toContain("unsupported_syscall");
-			// A read-only repository refuses git's index lock: harmless to a git that still succeeds (status), not to one that fails (add).
+			// A refused operation is an observation even when a program subsequently exits successfully.
 			const lock = 'openat(AT_FDCWD, "/work/.git/index.lock", O_RDWR|O_CREAT|O_EXCL|O_CLOEXEC, 0666) = -1 EACCES (Permission denied)';
-			for (const [exit, tainted] of [[0, false], [128, true]] as const) {
+			for (const exit of [0, 128]) {
 				await fs.writeFile(`${prefix}.100`, ['execve("/usr/bin/git", ["git", "status"], 0x0) = 0', lock, `+++ exited with ${exit} +++`].join("\n"));
-				expect((await observeStrace(prefix, "/usr/bin/git", "/work")).taints.includes("confinement_observation"), `exit ${exit}`).toBe(tainted);
+				expect((await observeStrace(prefix, "/usr/bin/git", "/work")).taints, `exit ${exit}`).toContain("confinement_observation");
 			}
 			// Runtime start-up (libuv): capabilities, io_uring, stdio probes and flags on its own pipe reveal nothing of the host.
 			await fs.writeFile(`${prefix}.100`, ['execve("/usr/bin/node", ["node", "-p", "1"], 0x0) = 0', "pipe2([3<pipe:[5]>, 4<pipe:[5]>], O_CLOEXEC) = 0",
@@ -130,22 +125,32 @@ describe("strace provenance decoder", () => {
 		} finally { await fs.rm(root, { recursive: true, force: true }); }
 	});
 
-	test("replays across turns only a transcript of whitelisted system tools that cannot pass on the clock, randomness or readdir order", async () => {
+	test("never infers input independence from shell syntax, tool names or startup environments", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-repeatable-")), prefix = path.join(root, "process");
-		const exec = (image: string, ...argv: string[]) => `execve("${image}", ${JSON.stringify([path.posix.basename(image), ...argv])}, 0x0) = 0`;
-		const run = async (script: string, children: readonly (readonly string[])[], roots: readonly string[] = ["/work"], interposedExecutables?: StraceObservationOptions["interposedExecutables"]) => {
+		const exec = (image: string, ...argv: string[]) => `execve("${image}", ${JSON.stringify([path.posix.basename(image), ...argv])}, []) = 0`;
+		const run = async (script: string, children: readonly (readonly string[])[], roots: readonly string[] = ["/work"], interposedExecutables?: StraceObservationOptions["interposedExecutables"], environment = "[]") => {
 			await fs.rm(root, { recursive: true, force: true }); await fs.mkdir(root);
-			await fs.writeFile(`${prefix}.100`, [exec("/bin/bash", "-c", script), "getpid() = 100",
+			await fs.writeFile(`${prefix}.100`, [exec("/bin/bash", "-c", script).replace(", []) = 0", `, ${environment}) = 0`), "getpid() = 100",
 				...children.map((_, index) => `clone(child_stack=NULL, flags=SIGCHLD) = ${101 + index}`), "+++ exited with 0 +++"].join("\n"));
 			for (const [index, lines] of children.entries()) await fs.writeFile(`${prefix}.${101 + index}`, [...lines, "+++ exited with 0 +++"].join("\n"));
 			return (await observeStrace(prefix, "/bin/bash", "/work", { guardFilesystemSemanticsWithin: roots, interposedExecutables })).taints;
 		};
 		const listing = "getdents64(3</work/src>, [], 512) = 0";
 		try {
-			expect(await run("cat a | grep x", [[exec("/usr/bin/cat", "a")], [exec("/usr/bin/grep", "x")]])).toEqual([]);
-			expect(await run("cat a", [[exec("/shadow/cat", "a")]], ["/work"], [["/usr/bin/cat", "/shadow/cat"]])).toEqual([]);
+			expect(await run("cat a | grep x", [[exec("/usr/bin/cat", "a")], [exec("/usr/bin/grep", "x")]])).toEqual(expect.arrayContaining(["clock", "random"]));
+			expect(await run("cat a", [[exec("/shadow/cat", "a")]], ["/work"], [["/usr/bin/cat", "/shadow/cat"]])).toEqual(expect.arrayContaining(["clock", "random"]));
 			expect(await run("cat a", [[exec("/shadow/cat", "a")]], ["/work"], [["/home/user/cat", "/shadow/cat"]])).toContain("clock");
-			expect(await run("ls src && git -C /work status", [[exec("/usr/bin/ls", "src"), listing], [exec("/usr/bin/git", "-C", "/work", "status")]])).toEqual([]);
+			expect(await run("ls src && git -C /work status", [[exec("/usr/bin/ls", "src"), listing], [exec("/usr/bin/git", "-C", "/work", "status")]])).toEqual(expect.arrayContaining(["clock", "random"]));
+			for (const script of ["printf '%s\\n' constant", "printf '%s\\n' '$((RANDOM))'", "echo literal > result; /bin/cat result", "printf '%s' \\\n literal"])
+				expect(await run(script, []), script).toEqual(expect.arrayContaining(["clock", "random"]));
+			for (const script of ['printf "%s\\n" "$((RANDOM))"', 'v=RANDOM; printf "%s\\n" "${!v}"', 'declare -n v=RANDOM; printf "%s\\n" "$v"',
+				'eval "printf $RANDOM"', '. script.sh', 'printf "%s" "$(date)"', 'printf "%(%s)T" -1', 'printf \\\n "%(%s)T" -1', 'printf -v RANDOM 1',
+				'cat <(echo hi)', 'printf "unterminated', 'printf foo &&', 'printf %s *'])
+				expect(await run(script, []), script).toEqual(expect.arrayContaining(["clock", "random"]));
+			for (const environment of ['0x0', '["PATH=/bin", ...]', '["BASH_ENV=/tmp/startup"]', '["ENV=/tmp/startup"]', '["BASH_FUNC_printf%%=() { echo $RANDOM; }"]',
+				'["LD_PRELOAD=/tmp/hook.so"]', '["SHELLOPTS=xtrace"]'])
+				expect(await run("printf '%s' constant", [], ["/work"], undefined, environment), environment).toEqual(expect.arrayContaining(["clock", "random"]));
+			expect(await run("printf '%s' constant", [], ["/work"], undefined, '["PATH=/bin", "HOME=/home/user"]')).toEqual(expect.arrayContaining(["clock", "random"]));
 			for (const [script, children, roots] of [["echo $RANDOM", []], ["true & jobs -l", []], ["find . -mmin 5", [[exec("/usr/bin/find", ".", "-mmin", "5")]]],
 				["./cat a", [[exec("/work/cat", "a")]]], ["/home/user/cat", [[exec("/home/user/cat")]]], ["grep -r x src", [[exec("/usr/bin/grep", "-r", "x", "src"), listing]]],
 				["git log -1 --format=%cr", [[exec("/usr/bin/git", "log", "-1", "--format=%cr")]]],
@@ -276,7 +281,7 @@ describe("strace provenance decoder", () => {
 		expect((await observe({ 100: [EXEC, partial("STATX_TYPE|0x40000")] })).incompleteReasons).toEqual(["unparsed_metadata:statx:100"]);
 	});
 
-	test("retains unknown programs' directory handle metadata and isolates the system shell's PWD contract", async () => {
+	test("retains the same directory metadata for arbitrary programs and system shells", async () => {
 		const directory = STAT.replace("S_IFREG|0644", "S_IFDIR|0755");
 		expect((await observe({ 100: [EXEC, `fstat(3</work/src>, ${directory}) = 0`] })).paths).toContainEqual(
 			{ path: "/work/src", role: "metadata", followSymlinks: true, digest: filesystemObservationDigest({ dev: 1n, ino: 42n, mode: 0o40755n, nlink: 1n, uid: 0n, gid: 0n,
@@ -285,7 +290,7 @@ describe("strace provenance decoder", () => {
 		try {
 			await fs.writeFile(`${prefix}.100`, ['execve("/bin/bash", ["bash", "-c", "true"], 0x0) = 0', `newfstatat(AT_FDCWD, ".", ${directory}, 0) = 0`,
 				`newfstatat(AT_FDCWD, "a.txt", ${STAT}, 0) = 0`, "+++ exited with 0 +++"].join("\n"));
-			expect((await observeStrace(prefix, "/bin/bash", "/work")).paths.filter((item) => item.role === "metadata").map((item) => item.path)).toEqual(["/work/a.txt"]);
+			expect((await observeStrace(prefix, "/bin/bash", "/work")).paths.filter((item) => item.role === "metadata").map((item) => item.path)).toEqual(["/work", "/work/a.txt"]);
 		} finally { await fs.rm(root, { recursive: true, force: true }); }
 	});
 
@@ -402,7 +407,7 @@ describe("strace provenance decoder", () => {
 		const message = '{msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="x", iov_len=1}], msg_iovlen=1, msg_control=[{cmsg_len=20, cmsg_level=SOL_SOCKET, cmsg_type=SCM_RIGHTS, cmsg_data=[3<UNIX-STREAM:[11->12]>]}], msg_controllen=24, msg_flags=0}';
 		const addressed = message.replace('msg_name=NULL, msg_namelen=0', 'msg_name={sa_family=AF_UNIX, sun_path="/outside/socket"}, msg_namelen=110');
 		for (const [lines, taints, child] of [[polls, []], [['poll([{fd=1<pipe:[7]>, events=POLLOUT}], 1, 0) = 1 ([{fd=1, revents=POLLOUT}])'], ["unsupported_syscall"]],
-			[[write, stat(4), stat(8)], ["descriptor_observation"]], [[stat(4), stat(8)], ["descriptor_observation", "mutable_input"]],
+			[[write, stat(4), stat(8)], []], [[stat(4), stat(8)], ["mutable_input"]],
 			[[pair, 'clone(child_stack=NULL, flags=SIGCHLD) = 101'], [], ['dup2(3<UNIX-STREAM:[11->12]>, 1) = 1<UNIX-STREAM:[11->12]>', 'fcntl(1<UNIX-STREAM:[11->12]>, F_SETFL, O_RDWR|O_NONBLOCK) = 0']],
 			[['fcntl(3<UNIX-STREAM:[11->12]>, F_SETFL, O_RDWR|O_NONBLOCK) = 0'], ["unsupported_syscall"]],
 			[[pair, 'fcntl(3<UNIX-STREAM:[15->16]>, F_SETFL, O_RDWR) = 0'], ["unsupported_syscall"]],

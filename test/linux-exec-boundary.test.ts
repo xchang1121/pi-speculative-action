@@ -148,7 +148,7 @@ int main(int argc, char **argv) {
 				if (scenario.name === "completed") await expect(branch.commit()).rejects.toMatchObject({
 					disposition: "recoverable", message: expect.stringContaining("partially consumed"),
 				});
-				if (scenario.name === "cwd") for (let repeat = 0; repeat < 3; repeat++) expect((await actor(scenario.command)).metrics.hits).toBe(1);
+				if (scenario.name === "cwd") for (let repeat = 0; repeat < 3; repeat++) expect((await actor(scenario.command)).metrics.hits).toBe(0);
 			} finally { publication?.close(); await (await settled)?.dispose(); }
 		}
 		const before = backend.metrics(), pending = produce(": speculative-late; worker late.txt volatile");

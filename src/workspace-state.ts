@@ -1,4 +1,4 @@
-import type { Sha256Digest } from "./provenance-certificate.ts";
+import type { FilesystemObservationEvidence, Sha256Digest } from "./provenance-certificate.ts";
 
 interface WorkspaceEntryChange { readonly changeDigest: Sha256Digest; readonly changeTimeMs: number; }
 
@@ -20,6 +20,8 @@ export type WorkspaceTreeEntry = WorkspaceEntryChange & (
 	  }
 	| {
 			readonly kind: "directory";
+			/** Kernel prestate for observations made after this operation changed the directory's entries. */
+			readonly observed?: FilesystemObservationEvidence;
 			readonly entriesDigest: Sha256Digest;
 			readonly metadataDigest: Sha256Digest;
 			readonly mode: number;

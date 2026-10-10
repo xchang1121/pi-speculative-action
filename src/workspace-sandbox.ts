@@ -19,6 +19,7 @@ import { captureWorkspaceStructure, captureWorkspaceStructureEntry, statChangeDi
 	type WorkspaceStructureEntry, type WorkspaceStructureSnapshot } from "./process-observation.ts";
 import { ResourceVersionManager, type ResourceChangeSet, type ResourceVersionToken, type ResourceInput } from "./resource-version.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
+import { FILESYSTEM_OBSERVATION_FIELDS, type FilesystemObservationEvidence } from "./provenance-certificate.ts";
 import type { ResourceValidation } from "./settlement.ts";
 import type { ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
 import { deferredWorkspaceTransactionDriver, orderWorkspaceChanges, type WorkspaceRegularDelta, type WorkspaceStructureDriver,
@@ -80,6 +81,7 @@ export interface SandboxWorkspaceContext {
 	/** Native metadata for pinned snapshot objects; shared by every process in this private workspace. */
 	readonly metadataImage?: string;
 	readonly metadataObjects?: ReadonlyMap<string, string>;
+	readonly projectMetadata?: (stat: FilesystemObservationEvidence) => FilesystemObservationEvidence;
 	/** Root entry names owned by the isolation substrate and invisible to effect observation. */
 	readonly observationExcludes: readonly string[];
 	/** Driver-native content-free structure view shared by outer and nested process observers. */
@@ -898,10 +900,12 @@ async function createPrivateSandboxWorkspace(state: WorkspaceSandboxState, cwd: 
 			},
 		};
 		const transactions = deferredWorkspaceTransactionDriver(() => createGitWorkspaceTransactionDriver(workspace));
+		const sourceDevice = (await lstat(sourceRoot, { bigint: true })).dev;
 		workspace = {
 			sourceRoot, sandboxRoot, processRoot, observationExcludes, structure, transactions, pool, commit, baselineFrontier,
 			...(metadata ? { metadataImage: metadata.image } : {}),
 			...(metadata?.image ? { metadataObjects: metadata.objects } : {}),
+			projectMetadata: (stat) => ({ ...metadata?.project(stat) ?? stat, dev: sourceDevice }),
 			captureChanges: frontier => collectSandboxChanges(workspace, frontier),
 			sourceChanges: () => pool.versions.changesSince(baseline.version),
 			indexGit: bindGit(gitBinary, sandboxRoot, ["--git-dir", gitDirectory, "--work-tree", sandboxRoot]),
@@ -951,7 +955,7 @@ async function preserveSnapshotMetadata(sourceRoot: string, sandboxRoot: string,
 			if (!current) await mkdir(target);
 			else if (!current.isDirectory()) throw new Error(`snapshot directory type changed: ${resource}`);
 		}
-		const rows: string[][][] = [], objects = new Map<string, string>();
+		const rows: [BigIntStats, BigIntStats][] = [], objects = new Map<string, string>();
 		const fields = SNAPSHOT_METADATA_FIELDS;
 		// Set parent modes last so a read-only directory cannot prevent its own snapshot from being populated.
 		for (const resource of names.reverse()) {
@@ -967,16 +971,23 @@ async function preserveSnapshotMetadata(sourceRoot: string, sandboxRoot: string,
 			const handle = await open(target, 0x200000 | fsConstants.O_NOFOLLOW); // Linux O_PATH also pins symlinks and unreadable objects.
 			handles.push(handle);
 			const physical = await handle.stat({ bigint: true });
-			rows.push([fields.map(field => String(physical[field])), fields.map(field => String(source[field]))]);
+			rows.push([physical, source]);
 		}
 		const image = native ? path.join(processRoot, "metadata.json") : undefined;
 		if (image) {
 			const parent = await open(path.dirname(sandboxRoot), 0x200000 | fsConstants.O_NOFOLLOW); handles.push(parent);
 			const physicalParent = await parent.stat({ bigint: true }), sourceParent = await lstat(path.dirname(sourceRoot), { bigint: true });
-			rows.push([fields.map(field => String(physicalParent[field])), fields.map(field => String(sourceParent[field]))]);
-			await writeFile(image, JSON.stringify(rows), { flag: "wx", mode: 0o600 });
+			rows.push([physicalParent, sourceParent]);
+			await writeFile(image, JSON.stringify(rows.map(row => row.map(stat => fields.map(field => String(stat[field]))))), { flag: "wx", mode: 0o600 });
 		}
-		return { image, objects, modes: new Map([...original].map(([name, stat]) => [slash(name), process.platform === "win32" ? 0 : Number(stat.mode & 0o777n)])), dispose };
+		const mappings = new Map(rows.map(row => [`${row[0].dev}:${row[0].ino}`, row]));
+		return { image, objects, project: (stat: FilesystemObservationEvidence): FilesystemObservationEvidence => {
+			const row = mappings.get(`${stat.dev}:${stat.ino}`); if (!row) return stat;
+			const [physical, source] = row, links = source.nlink + stat.nlink - physical.nlink, unchanged = stat.size === physical.size && stat.mtimeNs === physical.mtimeNs && stat.ctimeNs === physical.ctimeNs;
+			return { ...Object.fromEntries(FILESYSTEM_OBSERVATION_FIELDS.map(field => [field,
+				stat[field] === physical[field] && (field !== "blocks" || unchanged) ? source[field] : stat[field]])),
+				dev: source.dev, ino: source.ino, nlink: links < 0n ? 0n : links } as FilesystemObservationEvidence;
+		}, modes: new Map([...original].map(([name, stat]) => [slash(name), process.platform === "win32" ? 0 : Number(stat.mode & 0o777n)])), dispose };
 	} catch (error) { await dispose(); throw error; }
 }
 

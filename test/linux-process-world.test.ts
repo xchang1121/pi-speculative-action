@@ -39,6 +39,101 @@ vi.mock("node:child_process", { spy: true });
 vi.mock("node:fs/promises", { spy: true });
 
 describe("Linux process ExecutionWorld", () => {
+	test("preserves fresh invocation inputs without classifying shell syntax", { timeout: 30_000 }, async ({ skip }) => {
+		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
+		const fixture = await createLinuxProcessBenchmark("pi-shell-proof-", "git");
+		try {
+			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
+			for (const command of ['printf "%s\\n" constant', 'printf "%s\\n" "$RANDOM"', 'printf "%s\\n" "$((RANDOM))"',
+				'v=RANDOM; printf "%s\\n" "${!v}"', 'declare -n v=RANDOM; printf "%s\\n" "$v"']) {
+				const constant = command.includes("constant"), before = fixture.backend.metrics().wholeCommandHits;
+				for (let turn = 0; turn < 3; turn++) {
+					const branch = await forkReusableBash(fixture, { command, label: String(turn), executionFingerprint, actionNamespace: "shell-proof",
+						executionScope: { sessionID: "shell-proof", turnID: String(turn) } });
+					try { expect(textOutput(branch.output.result)).toMatch(constant ? /^constant\n$/ : /^\d+\n$/); }
+					finally { await branch.dispose(); }
+				}
+				expect(fixture.backend.metrics().wholeCommandHits - before, command).toBe(0);
+				const actorBefore = fixture.backend.actorMetrics().wholeCommandHits;
+				for (let turn = 0; turn < 3; turn++)
+					expect(textOutput(await fixture.tool.execute(`actor-${turn}`, { command }))).toMatch(constant ? /^constant\n$/ : /^\d+\n$/);
+				expect(fixture.backend.actorMetrics().wholeCommandHits - actorBefore, command).toBe(0);
+			}
+		} finally { await fixture.dispose(); }
+	});
+
+	test("proves external reads from their opened image and never commits a read copy", { timeout: 30_000 }, async ({ skip }) => {
+		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
+		const fixture = await createLinuxProcessBenchmark("pi-read-image-", "git"), outside = await mkdtemp(path.join(os.tmpdir(), "pi-read-image-host-"));
+		const target = path.join(outside, "input"), alias = path.join(outside, "alias");
+		try {
+			await writeFile(target, "old\n"); await filesystem.symlink("input", alias);
+			await writeFile(path.join(fixture.workspace, "permissions.c"), `#include <stdio.h>
+#include <unistd.h>
+#include <dirent.h>
+#include <string.h>
+#include <sys/stat.h>
+int main(int argc, char **argv) { FILE *f = fopen(argc > 1 ? argv[1] : "/etc/issue", "r"); if (!f) return 1; fgetc(f);
+ if (argc > 1) { struct stat st; if (fstat(fileno(f), &st)) return 2; DIR *d = opendir(argv[2]); if (!d) return 3; struct dirent *e;
+  while ((e = readdir(d))) if (!strcmp(e->d_name, "input")) { puts(e->d_ino == st.st_ino ? "identical" : "different"); break; } closedir(d);
+ } else printf("%d %d %d\\n", access("/etc/issue", R_OK), access("/etc/issue", W_OK), access("/etc/issue", X_OK)); fclose(f); }\n`);
+			await compileBenchmarkHelper(fixture.workspace, { source: "permissions.c", output: "permissions" });
+			const prepared = await prepareLinuxProcessReuse(fixture), route = await fixture.prepareActorReplay(), scope = { sessionID: "read-image", turnID: "actor" };
+			for (const args of [[], [target, outside]]) {
+				const permissionBranch = await forkReusableBash(fixture, { command: `./permissions ${args.map(arg => `'${arg}'`).join(" ")}`, label: "permissions", actionNamespace: "read-image", ...prepared });
+				try {
+					expect(textOutput(permissionBranch.output.result)).toBe(execFileSync(path.join(fixture.workspace, "permissions"), args, { encoding: "utf8" }));
+				} finally { await permissionBranch.dispose(); }
+			}
+			for (const [label, pathname] of [["direct", target], ["alias", alias]] as const) {
+				const command = `cat '${pathname}'`, branch = await forkReusableBash(fixture, { command, label, executionScope: scope, actionNamespace: "read-image", ...prepared });
+				try {
+					expect(textOutput(branch.output.result)).toBe("old\n");
+					const validation = await branch.validate?.();
+					expect(validation, JSON.stringify({ validation, metrics: fixture.backend.metrics() })).toMatchObject({ status: "valid" });
+					const before = fixture.backend.actorMetrics().hits; let output = "";
+					await route.executor.execute({ command, cwd: fixture.workspace, environment: fixture.environment, scope, onData: data => { output += data.toString(); } });
+					expect(output).toBe("old\n"); expect(fixture.backend.actorMetrics().hits - before, JSON.stringify(fixture.backend.actorMetrics())).toBe(1);
+					expect(await readFile(target, "utf8")).toBe("old\n");
+				} finally { await branch.dispose(); }
+			}
+			const { readFile: read } = await vi.importActual<typeof filesystem>("node:fs/promises"); let changed = false;
+			const reading = vi.spyOn(filesystem, "readFile").mockImplementation(async (...args) => {
+				const bytes = await read(...args);
+				if (!changed && String(args[0]).includes("/trace-")) { changed = true; await writeFile(target, "new\n"); }
+				return bytes;
+			});
+			try {
+				const branch = await forkReusableBash(fixture, { command: `cat '${target}'`, label: "raced", actionNamespace: "read-image-race", ...prepared });
+				try {
+					expect(changed).toBe(true); expect(textOutput(branch.output.result)).toBe("old\n");
+					expect(await branch.validate?.()).toMatchObject({ status: "stale" });
+					expect(textOutput(await fixture.tool.execute("raced-actor", { command: `cat '${target}'` }))).toBe("new\n");
+					await branch.commit(); expect(await readFile(target, "utf8")).toBe("new\n");
+				} finally { await branch.dispose(); }
+			} finally { reading.mockRestore(); }
+		} finally { await fixture.dispose(); await rm(outside, { recursive: true, force: true }); }
+	});
+
+	test("admits expensive late launches by completed work within a bounded learning budget", { timeout: 30_000 }, async ({ skip }) => {
+		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
+		const fixture = await createLinuxProcessBenchmark("pi-learning-admission-", "git");
+		try {
+			await prepareLinuxProcessReuse(fixture);
+			const route = await fixture.prepareActorReplay(), scope = { sessionID: "admission", turnID: "native" };
+			const handoffs = Reflect.get(fixture.backend, "handoffs") as ProcessHandoffRegistry<{ executable: string; args: readonly string[] }>;
+			const command = [...Array.from({ length: 66 }, (_, index) => `/bin/true ${index}`), "/bin/sleep 0.12",
+				...Array.from({ length: 66 }, (_, index) => `/bin/true ${index + 66}`)].join("; ");
+			await fixture.backend.observeBindings(scope, () => route.executor.execute({ command, cwd: fixture.workspace, environment: fixture.environment,
+				scope, onData: () => {} }), bindings => {
+				expect(bindings.length).toBeGreaterThan(0); expect(bindings.length).toBeLessThanOrEqual(64);
+				const slow = bindings.find(binding => handoffs.resolveBinding(binding, scope)?.executable.endsWith("/sleep"));
+				expect(slow, JSON.stringify(fixture.backend.actorMetrics())).toMatchObject({ available: true });
+				expect(slow!.executionMs).toBeGreaterThanOrEqual(100);
+			}, true);
+		} finally { await fixture.dispose(); }
+	});
+
 	test.for(["file", "symlink", "lexical-parent", "normalized-blocker"] as const)("proves ENOTDIR from the blocking file and invalidates a changed walk (%s)", { timeout: 30_000 }, async (mode, { skip }) => {
 		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-enotdir-", "overlayfs", {}, os.homedir());
@@ -126,7 +221,7 @@ int main(int argc, char **argv) {
 			const branch = await forkReusableBash(fixture, { label: "long-path", command, actionNamespace: "test", ...prepared });
 			try {
 				expect(textOutput(branch.output.result)).toBe(mode.startsWith("socket") ? `${mode.endsWith("blocked") ? 20 : privateWrite || mode === "socket-listening" || mode === "socket-file" ? 13 : 2}\n` : "prepared");
-				if (!privateWrite) expect(await branch.validate?.()).toMatchObject({ status: mode === "missing" || mode === "socket" ? "valid" : "indeterminate" });
+				if (!privateWrite) expect(await branch.validate?.()).toMatchObject({ status: mode === "missing" || mode === "socket" || mode === "file" ? "valid" : "indeterminate" });
 				if (privateWrite) await expect(filesystem.access(target)).rejects.toMatchObject({ code: "ENOENT" });
 				expect(connections).toBe(0);
 				if (mode === "missing" || mode === "socket") {
@@ -280,7 +375,7 @@ int main(int argc, char **argv) {
 		} finally { await host?.dispose(); await fixture.dispose(); }
 	});
 
-	test.for(["sample", "threads", "limit", "identity"] as const)("transfers a closed-input calculation before its next syscall (%s)", { timeout: 30_000 }, async (mode, { skip }) => {
+	test.for(["sample", "threads", "limit", "metadata", "identity"] as const)("transfers a closed-input calculation before its next syscall (%s)", { timeout: 30_000 }, async (mode, { skip }) => {
 		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-prefix-process-", "git");
 		try {
@@ -290,6 +385,7 @@ int main(int argc, char **argv) {
 #include <sys/syscall.h>
 #include <sys/random.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -299,6 +395,7 @@ int main(void) {
  ${mode === "identity" ? "pid_t prior = getpid();" : ""}
  int fd = open("prefix-ready", O_WRONLY|O_CREAT|O_TRUNC, 0600); if (fd < 0 || write(fd, "ready", 5) != 5 || close(fd)) return 71;
  volatile uint64_t hash = 1; for (unsigned i = 0; i < 800000000; i++) hash = hash * 33 + i;
+ ${mode === "metadata" ? "struct stat state; if (fstat(STDOUT_FILENO, &state) || !state.st_ino) return 76;" : ""}
  ${mode === "threads" ? "pthread_t worker; void *result; if (pthread_create(&worker, NULL, thread, (void *)37) || pthread_join(worker, &result) || result != (void *)37) return 72;" : "(void)thread;"}
  ${mode === "limit" ? "struct rlimit limit = {0, 0}; if (setrlimit(RLIMIT_CORE, &limit)) return 73;" : ""}
  uint64_t value; if (getrandom(&value, sizeof(value), 0) != sizeof(value)) return 74;
@@ -2119,7 +2216,7 @@ int main(void) {
 			} finally { await branch.dispose?.(); }
 			// A child that read another's scratch file saw the command's own doing: the command stands on the workspace as it found it.
 			const scratched = await forkReusableBash(fixture, { label: "scratch", command: "mkdir w && echo t > w/x && cat w/x && rm -r w", actionNamespace: "private-writes", executionFingerprint });
-			try { expect([textOutput(scratched.output.result), await scratched.validate?.()]).toMatchObject(["t\n", { status: "valid" }]); } finally { await scratched.dispose?.(); }
+			try { const validation = await scratched.validate?.(); expect([textOutput(scratched.output.result), validation], JSON.stringify({ validation, metrics: fixture.backend.metrics() })).toMatchObject(["t\n", { status: "valid" }]); } finally { await scratched.dispose?.(); }
 			// A host object someone changed meanwhile is no baseline: the Actor must run the command instead.
 			const raced = await forkReusableBash(fixture, { label: "raced", command: `echo again > ${outside}/kept`, actionNamespace: "private-writes", executionFingerprint });
 			try {
@@ -2127,12 +2224,13 @@ int main(void) {
 				await expect(raced.commit()).rejects.toThrow();
 				expect(await host("kept")).toBe("raced\n");
 			} finally { await raced.dispose?.(); }
-			// A replayed child's write outside lands in the session's branch, where its successors read it, and commits on adoption.
-			for (const label of ["learned", "replayed"]) {
+			// Successors read prior children's private writes; the whole transaction proves them without publishing native history.
+			for (const label of ["prepared", "fresh"]) {
 				const before = fixture.backend.metrics(), child = await forkReusableBash(fixture, { label, command: `/bin/sh -c 'printf "g\\n" > "$1"' sh ${outside}/g && cat ${outside}/g`, actionNamespace: "private-writes", executionFingerprint });
 				try {
-					expect([textOutput(child.output.result), await host("g"), fixture.backend.metrics().hits > before.hits], JSON.stringify(fixture.backend.metrics())).toEqual(["g\n", "absent", label === "replayed"]);
-					if (label === "replayed") { await child.commit(); expect(await host("g")).toBe("g\n"); }
+					expect([textOutput(child.output.result), await host("g"), fixture.backend.metrics().hits > before.hits], JSON.stringify(fixture.backend.metrics())).toEqual(["g\n", "absent", false]);
+					expect(await child.validate?.()).toMatchObject({ status: "valid" });
+					if (label === "fresh") { await child.commit(); expect(await host("g")).toBe("g\n"); }
 				} finally { await child.dispose?.(); }
 			}
 			// An independently prepared native operation has the same external-write baseline as a whole tool.
@@ -2309,14 +2407,14 @@ int main(void) { int fds[2], status; char queue[8]; if (pipe(fds) || fds[0] != 3
 				captureGate.release(); await producing;
 			} finally { captureGate.release(); forking.mockRestore(); }
 			admission.mockRestore();
-			await invoke(); // A whole-shell certificate published after the empty lookup remains usable.
-			expect(fixture.backend.actorMetrics().wholeCommandHits).toBe(1);
+			await invoke(); // An unproved native shell result does not become persistent replay authority.
+			expect(fixture.backend.actorMetrics().wholeCommandHits).toBe(0); expect(host.execute).toHaveBeenCalledTimes(6);
 			expect(held.execute).toHaveBeenCalledTimes(5);
-			await fixture.backend.store.clear(); await invoke(); expect(host.execute).toHaveBeenCalledTimes(6);
+			await fixture.backend.store.clear(); await invoke(); expect(host.execute).toHaveBeenCalledTimes(7);
 			opening.mockRejectedValueOnce(new Error("held-exec functional probe failed"));
 			await coordinator.refreshActorRoute();
 			expect(coordinator.actorDiagnostics()).toMatchObject({ state: "degraded", detail: expect.stringContaining("functional probe failed") });
-			await invoke(); expect(host.execute).toHaveBeenCalledTimes(7);
+			await invoke(); expect(host.execute).toHaveBeenCalledTimes(8);
 		} finally {
 			release(); gates.forEach(gate => gate.resolve()); captureGate.release();
 			await Promise.allSettled([calls, refreshing, ...producers]);
@@ -2513,14 +2611,13 @@ int main(void) { int fds[2], status; char queue[8]; if (pipe(fds) || fds[0] != 3
 		}
 	}, 15_000);
 
-	test.for(["trace", "transaction", "dependency", "host_parent", "publication"] as const)("preserves output and capture ownership when %s fails", { timeout: 15_000 }, async (failure, { skip }) => {
+	test.for(["trace", "transaction", "dependency", "input_image", "publication"] as const)("preserves output and capture ownership when %s fails", { timeout: 15_000 }, async (failure, { skip }) => {
 		if (process.platform !== "linux") return skip("Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-process-capture-failure-", failure === "dependency" ? "git" : undefined); // Invalidate the copied prestate.
-		const { readFile: readTrace, rm: removeFile, lstat: readStat } = await vi.importActual<typeof filesystem>("node:fs/promises");
+		const { readFile: readTrace, rm: removeFile } = await vi.importActual<typeof filesystem>("node:fs/promises");
 		const { spawn } = await vi.importActual<typeof childProcess>("node:child_process");
 		const entered = deferred(), failed = deferred(), gate = deferred();
-		const error = new Error(failure === "dependency" ? "transaction baseline changed: input.txt"
-			: failure === "host_parent" ? "mutable_input" : `injected ${failure} capture failure`);
+		const error = new Error(failure === "dependency" ? "transaction baseline changed: input.txt" : `injected ${failure} capture failure`);
 		let traceRoot: string | undefined, released = false, cleanupBeforeRelease = false, returned = false, executions = 0;
 		let processContext = {};
 		let restoreTransactions: (() => void) | undefined;
@@ -2530,7 +2627,7 @@ int main(void) { int fds[2], status; char queue[8]; if (pipe(fds) || fds[0] != 3
 			const begin = input.workspace.transactions.begin;
 			const recording = vi.spyOn(input.workspace.transactions, "begin").mockImplementation(async () => {
 				const capture = await begin();
-				if (failure === "publication" || failure === "host_parent") return capture;
+				if (failure === "publication" || failure === "input_image") return capture;
 				return { abort: capture.abort, finish: async () => {
 					if (failure === "dependency") {
 						const result = await capture.finish(), next = await begin();
@@ -2545,20 +2642,14 @@ int main(void) { int fds[2], status; char queue[8]; if (pipe(fds) || fds[0] != 3
 			return open(input);
 		});
 		const reading = vi.spyOn(filesystem, "readFile").mockImplementation(async (...args) => {
+			if (failure === "input_image" && String(args[0]).endsWith("/proof.json")) { failed.resolve(); await gate.promise; throw error; }
 			if (String(args[0]).includes("/trace-")) {
 				traceRoot = path.dirname(String(args[0]));
-				if (failure === "publication" || failure === "dependency" || failure === "host_parent") return readTrace(...args);
+				if (failure === "publication" || failure === "dependency" || failure === "input_image") return readTrace(...args);
 				if (failure === "trace") { await entered.promise; failed.resolve(); throw error; }
 				entered.resolve(); await gate.promise;
 			}
 			return readTrace(...args);
-		});
-		const probing = vi.spyOn(filesystem, "lstat").mockImplementation(async (...args) => {
-			const info = await readStat(...args);
-			if (failure === "host_parent" && String(args[0]) === "/etc" && typeof info.mode === "bigint") {
-				failed.resolve(); await gate.promise; info.mode |= 0o022n;
-			}
-			return info;
 		});
 		const removing = vi.spyOn(filesystem, "rm").mockImplementation((...args) => {
 			if (String(args[0]) === traceRoot && !released) cleanupBeforeRelease = true;
@@ -2581,8 +2672,9 @@ int main(void) { int fds[2], status; char queue[8]; if (pipe(fds) || fds[0] != 3
 		try {
 			const status = await fixture.backend.check(true);
 			if (status.state !== "ready") return skip(status.detail);
-			await writeFile(path.join(fixture.workspace, "input.txt"), "capture-once");
-			await writeFile(path.join(fixture.workspace, "emit.c"), '#include <fcntl.h>\n#include <unistd.h>\nint main(void) { char text[12]; return read(open("input.txt", O_RDONLY), text, 12) != 12 || write(1, text, 12) != 12; }\n');
+			const inputName = failure === "input_image" ? path.join(fixture.root, "input.txt") : "input.txt";
+			await writeFile(path.resolve(fixture.workspace, inputName), "capture-once");
+			await writeFile(path.join(fixture.workspace, "emit.c"), `#include <fcntl.h>\n#include <unistd.h>\nint main(void) { char text[12]; return read(open(${JSON.stringify(inputName)}, O_RDONLY), text, 12) != 12 || write(1, text, 12) != 12; }\n`);
 			await compileBenchmarkHelper(fixture.workspace, { source: "emit.c", output: "emit" });
 			await commitBenchmarkFixture(fixture.workspace, "Process capture failure");
 			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
@@ -2598,8 +2690,8 @@ int main(void) { int fds[2], status; char queue[8]; if (pipe(fds) || fds[0] != 3
 			expect({ executions, published: fixture.backend.metrics().published }).toEqual({ executions: 1, published: 0 });
 			const lastError = branch.executionMetrics.reuse?.lastError ?? "";
 			expect(lastError).toContain(error.message);
-			const detail = failure === "host_parent" ? undefined : JSON.parse(lastError.split("; process=")[1]!);
-			if (failure !== "host_parent") {
+			const detail = failure === "input_image" ? undefined : JSON.parse(lastError.split("; process=")[1]!);
+			if (failure !== "input_image") {
 				expect(detail).toMatchObject({ ...processContext, requestID: 1,
 					stage: failure === "publication" ? "history_publication" : failure === "dependency" ? "dependencies" : `${failure}_capture` });
 				expect(detail.weakKey).toMatch(/^sha256:[a-f0-9]{64}$/);
@@ -2609,17 +2701,17 @@ int main(void) { int fds[2], status; char queue[8]; if (pipe(fds) || fds[0] != 3
 				await expect(validateTransferredProcessEvidence(publishing.mock.calls[0]![0].dependencyCertificate)).resolves.toMatchObject({ status: "valid" });
 				expect(lastError).toContain(`nested_publish:${error.message}`);
 				expect(detail).toMatchObject({ certificateID: publishing.mock.calls[0]![0].id, complete: true, taints: ["clock", "random"] });
-				// Only the nested publication failed; the shell's own $PWD checks never tie the parent to the private root's identity.
+				// Only publication failed; the captured root still represents the shell's original directory metadata.
 				expect(validation).toMatchObject({ status: "valid" });
 				expect((await fixture.backend.store.stats()).certificates).toBe(0);
 			} else {
 				expect(validation?.status).toBe("indeterminate");
-				expect(JSON.stringify(validation)).toContain(failure === "host_parent" ? "top_evidence:mutable:/etc/ld.so.cache" : `nested_capture:${error.message}`);
+				expect(JSON.stringify(validation)).toContain(`nested_capture:${error.message}`);
 			}
 		} finally {
 			released = true; gate.resolve();
 			await running?.then((branch) => branch.dispose(), () => undefined);
-			restoreTransactions?.(); opening.mockRestore(); reading.mockRestore(); probing.mockRestore(); removing.mockRestore(); spawning.mockRestore(); publishing.mockRestore();
+			restoreTransactions?.(); opening.mockRestore(); reading.mockRestore(); removing.mockRestore(); spawning.mockRestore(); publishing.mockRestore();
 			await fixture.dispose();
 		}
 	});

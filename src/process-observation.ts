@@ -6,7 +6,7 @@ import { isMissing } from "./error-utils.ts";
 import type { StableFilesystemCapture } from "./filesystem-evidence.ts";
 import { FILESYSTEM_CONCURRENCY, mapFilesystem } from "./filesystem-evidence.ts";
 import type { DynamicDependency, FilesystemTypeEvidence, Sha256Digest } from "./provenance-certificate.ts";
-import { digestObject, filesystemEntryType, filesystemMetadataDigest, sha256Digest, sha256DigestAsync } from "./provenance-certificate.ts";
+import { digestObject, FILESYSTEM_OBSERVATION_FIELDS, filesystemEntryType, filesystemMetadataDigest, sha256Digest, sha256DigestAsync, type FilesystemObservationEvidence } from "./provenance-certificate.ts";
 import type { WorkspaceStructureEntry, WorkspaceStructureSnapshot, WorkspaceTreeEntry } from "./workspace-state.ts";
 import { orderWorkspaceChanges, type WorkspaceRegularDelta } from "./workspace-transaction.ts";
 
@@ -128,6 +128,7 @@ async function captureExistingWorkspaceStructureEntry(
 		const entries = (children ?? await readdir(target, { withFileTypes: true })).filter((entry) => !excluded.has(entry.name));
 		return {
 			kind: "directory",
+			observed: Object.fromEntries(FILESYSTEM_OBSERVATION_FIELDS.map(field => [field, stat[field]])) as FilesystemObservationEvidence,
 			entriesDigest: directoryEntriesDigest(entries),
 			metadataDigest: filesystemMetadataDigest(stat),
 			...change,
