@@ -335,9 +335,7 @@ async function resolveWorkspaceDriver(state: WorkspaceSandboxState, options: Wor
 	if (requested === "overlayfs") return overlay;
 	if (!sourceRoot) return { driver: "git", fingerprint: GIT_WORKSPACE_FINGERPRINT };
 
-	const ownedRepository = acquiredRepository ? undefined : await acquireSandboxRepository(state, path.resolve(sourceRoot), options.gitBinary ?? "git");
-	const repository = acquiredRepository ?? ownedRepository;
-	if (!repository) throw new Error("workspace repository is unavailable");
+	const repository = acquiredRepository ?? await acquireSandboxRepository(state, path.resolve(sourceRoot), options.gitBinary ?? "git");
 	try {
 		// Driver choice is preparation; actual workspace allocation still validates its captured inputs.
 		const captured = options.liveLower ? await captureLiveBase(repository) : undefined;
@@ -353,20 +351,19 @@ async function resolveWorkspaceDriver(state: WorkspaceSandboxState, options: Wor
 		const links = live && entries!.flatMap(([resource, entry]) => entry.kind === "symlink"
 			? [{ path: path.join(repository.sourceRoot, resource), scope: "tree_entries" as const }] : []);
 		if (links?.length) await (await repository.versions.capture(links)).release();
-		const treeEntries = live ? entries!.filter(([, entry]) => entry.kind !== "directory").length
-			: parseNullList(await repository.git(["ls-tree", "-r", "-z", "--name-only", baseline as string])).length;
-		const resolved = treeEntries >= AUTO_OVERLAY_MIN_TREE_ENTRIES ? overlay : { driver: "git", fingerprint: GIT_WORKSPACE_FINGERPRINT } as const;
+		// A live lower preserves process-observed metadata even in small workspaces.
+		const resolved = live || parseNullList(await repository.git(["ls-tree", "-r", "-z", "--name-only", baseline as string])).length >= AUTO_OVERLAY_MIN_TREE_ENTRIES
+			? overlay : { driver: "git", fingerprint: GIT_WORKSPACE_FINGERPRINT } as const;
 		repository.autoDriverDecision = { baseline, capabilityFingerprint: capability.fingerprint, resolved };
 		return resolved;
 	} finally {
-		if (ownedRepository) releaseSandboxRepository(ownedRepository);
+		if (!acquiredRepository) releaseSandboxRepository(repository);
 	}
 }
 
 function createWorkspaceSandboxFor(state: WorkspaceSandboxState, options: WorkspaceSandboxOptions): SpeculativeAgentExecutionWorld {
-	// Generic mutation routes have no workspace root at fingerprint time. Their short, targeted
-	// branches retain Git unless OverlayFS was explicitly requested; Linux process routes can make
-	// the exact baseline-qualified auto decision from their invocation context.
+	// Generic mutations retain Git unless OverlayFS was explicitly requested. Process routes
+	// qualify a live lower from their invocation cwd to preserve native metadata.
 	const resolvedOptions: WorkspaceSandboxOptions = options.driver === "overlayfs" ? options : { ...options, driver: "git" };
 	const roots = new Set<string>();
 	return { id: "git_worktree", scope: "fallback", isolation: "workspace_branch", speculation: {
