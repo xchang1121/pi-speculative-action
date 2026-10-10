@@ -1454,7 +1454,7 @@ function countSummary(counts: Readonly<Record<string, number>>): string {
 	return entries.length > 0 ? entries.map(([key, count]) => `${key}=${count}`).join(", ") : "none";
 }
 
-type TimingSummary = Pick<SpeculativeTraceSummary, "toolComputeMs" | "hiddenComputeMs"> & { readonly hiddenComputeIncomplete?: true };
+type TimingSummary = Pick<SpeculativeTraceSummary, "toolComputeMs" | "hiddenComputeMs"> & { readonly hiddenComputeIncomplete?: true; readonly adoptionWaitMs?: number };
 
 function formatHiddenCompute(timing: TimingSummary): string {
 	return `${formatDuration(timing.hiddenComputeMs)} tool computation hidden${timing.hiddenComputeIncomplete ? " (known lower bound)" : ""}`;
@@ -1462,7 +1462,8 @@ function formatHiddenCompute(timing: TimingSummary): string {
 
 function formatTaskTiming(timing: TimingSummary): string {
 	return `${formatSpeedup(timing)}; ${formatHiddenCompute(timing)}; ` +
-		`${formatDuration(timing.toolComputeMs ?? NaN)} total tool computation`;
+		`${formatDuration(timing.toolComputeMs ?? NaN)} total tool computation` +
+		(timing.adoptionWaitMs === undefined ? "" : `; ${formatDuration(timing.adoptionWaitMs)} adoption/control wait`);
 }
 
 function formatSpeedup(timing: TimingSummary): string {

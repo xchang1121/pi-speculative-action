@@ -6,6 +6,7 @@ export interface SuiteBenchmarkSummary {
 	/** Absent in legacy or incomplete reports; raw tool wait is not a substitute. */
 	readonly toolComputeMs?: number;
 	readonly hiddenComputeMs?: number;
+	readonly adoptionWaitMs?: number;
 	readonly hiddenComputeIncomplete?: true;
 	readonly actorActions: number;
 	readonly speculativeHits: number;
@@ -40,6 +41,7 @@ export function summarizeSuite(runs: readonly SuiteBenchmarkRun[]) {
 	const measured = runs.filter(hasTiming);
 	const toolWaits = runs.filter(hasToolWait).map(run => run.summary.toolWaitMs);
 	const reused = runs.flatMap(run => measuredValue(run.summary?.hiddenComputeMs));
+	const adoption = runs.flatMap(run => measuredValue(run.summary?.adoptionWaitMs));
 	const invalidRuns = runs.flatMap((run) => {
 		const reasons = [...(run.error ? ["runner_error"] : []), ...screeningFailures(run.summary)];
 		if (run.summary && !hasTiming(run)) reasons.push("unavailable_timing");
@@ -58,6 +60,7 @@ export function summarizeSuite(runs: readonly SuiteBenchmarkRun[]) {
 		unmeasuredRuns: runs.length - measured.length,
 		// Incomplete denominators must not hide known hidden calculation or actual waits.
 		diagnostics: {
+			adoptionWaitMeasuredRuns: adoption.length, adoptionWaitMs: total(adoption),
 			toolWaitMeasuredRuns: toolWaits.length, toolWaitMs: total(toolWaits),
 			toolWaitMeanMs: toolWaits.length ? total(toolWaits)! / toolWaits.length : undefined,
 			toolWaitP95Ms: nearestRank(toolWaits, 0.95),

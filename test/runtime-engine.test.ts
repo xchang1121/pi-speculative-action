@@ -1255,9 +1255,9 @@ describe("structural speculative runtime", () => {
 			}
 			await runtime.finishTurn({ ...call("turn"), terminal: true });
 			expect(events.filter(event => event.type === "actor_action").map(event => event.computation)).toEqual([
-				{ toolComputeMs: 100, hiddenComputeMs: 40, reused: true }, { toolComputeMs: 100, hiddenComputeMs: 60, reused: true },
+				{ toolComputeMs: 100, hiddenComputeMs: 40, adoptionWaitMs: 20, reused: true }, { toolComputeMs: 100, hiddenComputeMs: 60, adoptionWaitMs: 40, reused: true },
 			]);
-			expect(summary()).toMatchObject({ toolComputeMs: 200, hiddenComputeMs: 100 });
+			expect(summary()).toMatchObject({ toolComputeMs: 200, hiddenComputeMs: 100, adoptionWaitMs: 60 });
 		} finally { await runtime.dispose(); clock.mockRestore(); }
 	});
 
@@ -1324,9 +1324,9 @@ describe("structural speculative runtime", () => {
 				hiddenComputeMs: totalReuseMs,
 			});
 			expect(events.filter(event => event.type === "actor_action").map(event => event.computation)).toEqual([
-				{ toolComputeMs: 4, hiddenComputeMs: 0 },
-				{ toolComputeMs: fallback ? 2 : firstReuseMs, hiddenComputeMs: fallback ? 0 : firstReuseMs, ...(fallback ? {} : { reused: true }) },
-				...(fallback ? [] : [{ toolComputeMs: repeatedReuseMs, hiddenComputeMs: repeatedReuseMs, reused: true }]),
+				{ toolComputeMs: 4, hiddenComputeMs: 0, adoptionWaitMs: 50 },
+				{ toolComputeMs: fallback ? 2 : firstReuseMs, hiddenComputeMs: fallback ? 0 : firstReuseMs, adoptionWaitMs: 0, ...(fallback ? {} : { reused: true }) },
+				...(fallback ? [] : [{ toolComputeMs: repeatedReuseMs, hiddenComputeMs: repeatedReuseMs, adoptionWaitMs: 0, reused: true }]),
 			]);
 			expect(summary()).toMatchObject({ tasks: 1, toolComputeMs: fallback ? 6 : 4 + totalReuseMs,
 				hiddenComputeMs: totalReuseMs });
@@ -1925,7 +1925,7 @@ describe("structural speculative runtime", () => {
 			});
 			expect(events.filter(event => event.type === "actor_action").map(event => event.computation)).toEqual(
 				[0, 1, 2].map(index => unretained || learned && index === 0
-					? { toolComputeMs: 20, hiddenComputeMs: 0 } : { toolComputeMs: 20, hiddenComputeMs: 20, reused: true }));
+					? { toolComputeMs: 20, hiddenComputeMs: 0, adoptionWaitMs: 3 } : { toolComputeMs: 20, hiddenComputeMs: 20, adoptionWaitMs: 3, reused: true }));
 			now += 10;
 			await runtime.startTurn(start("next-task"));
 			expect((await runtime.prepareActorCall(call("next-task", { path: "input", offset: 2, limit: 1 })))?.output).toBe("2");
@@ -1958,9 +1958,9 @@ describe("structural speculative runtime", () => {
 			expect(project).toHaveBeenCalledOnce();
 			// Both calls reuse the 40 ms source; only the second reuses the 20 ms projection. Validation/commit are excluded.
 			expect(events.filter(event => event.type === "actor_action").map(event => event.computation)).toEqual([
-				{ toolComputeMs: 60, hiddenComputeMs: 40, reused: true }, { toolComputeMs: 60, hiddenComputeMs: 60, reused: true },
+				{ toolComputeMs: 60, hiddenComputeMs: 40, adoptionWaitMs: 8, reused: true }, { toolComputeMs: 60, hiddenComputeMs: 60, adoptionWaitMs: 8, reused: true },
 			]);
-			expect(events.find(event => event.type === "task")?.timing).toMatchObject({ toolComputeMs: 120, hiddenComputeMs: 100 });
+			expect(events.find(event => event.type === "task")?.timing).toMatchObject({ toolComputeMs: 120, hiddenComputeMs: 100, adoptionWaitMs: 16 });
 		} finally { await runtime.dispose(); clock.mockRestore(); }
 	});
 
@@ -2340,9 +2340,10 @@ describe("structural speculative runtime", () => {
 					const execution = providers[0]!.toolExecution, hiddenComputeMs = receipts[0]!.hiddenComputeMs;
 					expect(hiddenComputeMs).toBeGreaterThan(0);
 					expect(hiddenComputeMs).toBeLessThanOrEqual(execution.completedAt - execution.startedAt);
-					expect(receipts).toEqual([
-						{ toolComputeMs: hiddenComputeMs, hiddenComputeMs, reused: true }, { toolComputeMs: hiddenComputeMs, hiddenComputeMs, reused: true },
-					]);
+					for (const receipt of receipts) {
+						expect(receipt).toEqual({ toolComputeMs: hiddenComputeMs, hiddenComputeMs, reused: true, adoptionWaitMs: expect.any(Number) });
+						expect(receipt!.adoptionWaitMs).toBeGreaterThanOrEqual(0);
+					}
 					expect(events.find(event => event.type === "task")?.timing).toMatchObject({ toolComputeMs: hiddenComputeMs * 2, hiddenComputeMs: hiddenComputeMs * 2 });
 				}
 			}

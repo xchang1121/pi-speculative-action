@@ -242,13 +242,11 @@ interface SpawnOutcome { readonly code: number | null; readonly signal: NodeJS.S
 
 type ReadyProcessPlan = Exclude<ProcessReusePlan, { kind: "miss" }>;
 
-type ActorHeldTiming = HeldExecTiming & { readonly pid: number; readonly sequence: number };
-
 /** Linux-only process substrate. Unavailable dependencies remove the route instead of weakening it. */
 export class LinuxProcessReuseBackend {
 	private readonly observations = new AsyncLocalStorage<{ scope: ExecutionScope; sequence: number; closed: boolean; learn: boolean; pending: number; learned: Map<number, number>;
 		inputs?: (path: string) => Iterable<object>; bindings: Map<number, ProcessExecutionBinding>; computations: TimelineDependency[];
-		heldTimings: ActorHeldTiming[]; timingOverflow?: HeldExecClock }>();
+		heldClock: ActorHeldClock }>();
 
 	/** Keep actual completed launches and acknowledged adoptions in their enclosing native call's order. */
 	async observeBindings<Value>(scope: ExecutionScope, execute: () => Promise<Value>,
@@ -256,12 +254,12 @@ export class LinuxProcessReuseBackend {
 		inputs?: (path: string) => Iterable<object>): Promise<Value> {
 		const observation = { scope: snapshotExecutionScope(scope)!, sequence: 0, closed: false,
 			learn, pending: 0, learned: new Map<number, number>(), inputs, bindings: new Map<number, ProcessExecutionBinding>(), computations: [] as TimelineDependency[],
-			heldTimings: [] as ActorHeldTiming[], timingOverflow: undefined as HeldExecClock | undefined };
+			heldClock: new ActorHeldClock() };
 		try { return await this.observations.run(observation, execute); }
 		finally {
 			observation.closed = true;
 			try { observe([...observation.bindings].sort(([left], [right]) => left - right).map(([, binding]) => binding),
-				Object.freeze([...observation.computations, ...actorHeldComputations(observation.heldTimings, observation.timingOverflow)])); }
+				Object.freeze([...observation.computations, ...observation.heldClock.dependencies()])); }
 			catch { /* Learning cannot replace the native result or error. */ }
 		}
 	}
@@ -1007,15 +1005,7 @@ export class LinuxProcessReuseBackend {
 				decision = { ...decision, observeCompletion: async (...args) => { try { await complete(...args); } finally { releaseLearning(); } } };
 			}
 			return !observation || observation.closed || !sameScope(observation.scope, scope)
-			? decision : { ...decision, observeTiming: timing => {
-				if (observation.closed) return;
-				if (observation.heldTimings.length < LEARNED_LAUNCHES)
-					observation.heldTimings.push({ ...timing, pid: process.pid, sequence: process.sequence });
-				else observation.timingOverflow = {
-					startedAt: Math.min(observation.timingOverflow?.startedAt ?? timing.requestedAt, timing.requestedAt),
-					completedAt: Math.max(observation.timingOverflow?.completedAt ?? timing.completedAt, timing.completedAt),
-				};
-			} };
+			? decision : { ...decision, observeTiming: timing => { if (!observation.closed) observation.heldClock.record(timing); } };
 		};
 		const learning = observation?.learn && !observation.closed && sameScope(observation.scope, scope) && observation.pending < LEARNED_LAUNCHES;
 		const order = observation ? ++observation.sequence : 0;
@@ -1912,37 +1902,29 @@ function recordPrototypePreparation(session: ActiveSession, computation: Timelin
 	recordProcessDependency(session, { computation, owned: true, shared: [computation] }, pid);
 }
 
-/** Split only observed native clocks; the transport does not expose CPU time or every resumed child. */
-function actorHeldComputations(timings: readonly ActorHeldTiming[], overflow?: HeldExecClock): TimelineDependency[] {
-	const pauses = timings.map(timing => ({ timing, computation: new TimelineInterval(timing.requestedAt, timing.completedAt) }));
-	const ambiguous = !!overflow || timings.some(timing => timing.barrier === "none" || timing.barrier === "descriptors" &&
-		timing.committedAt !== undefined && timing.completedAt > timing.committedAt);
-	const omitted = overflow && { computation: new TimelineInterval(overflow.startedAt, overflow.completedAt), overhead: true, computeUncertain: true };
-	const globalPauses = timings.flatMap(timing => {
-		if (timing.barrier === "none") return [];
-		// Full descriptor replay releases siblings inside the native helper, after commit but before D.
-		const end = timing.barrier === "descriptors" && timing.committedAt !== undefined ? timing.committedAt : timing.completedAt;
-		return [{ computation: new TimelineInterval(timing.requestedAt, end), overhead: true } satisfies TimelineDependency];
-	});
-	// Mask ambiguous pauses in Actor and reused computation; unobserved overlap makes this only a lower bound.
-	const sharedPauses = ambiguous ? [...pauses.map(({ computation }) => ({ computation, overhead: true })), ...(omitted ? [omitted] : [])] : globalPauses;
-	const computations: TimelineDependency[] = pauses.map(({ timing, computation }) => ({ computation, overhead: true,
-		// A local hold can overlap unobserved siblings, shell work or a restored continuation's tail.
-		...(timing.barrier === "none" || timing.barrier === "descriptors" && timing.committedAt !== undefined && timing.completedAt > timing.committedAt
-			? { computeUncertain: true } : {}) }));
-	for (const timing of timings) {
-		if (!timing.native) continue;
-		// O observes process exit, including later exec images. Their pauses belong to those later images.
-		const next = timings.filter(candidate => candidate.pid === timing.pid && candidate.sequence > timing.sequence)
-			.reduce((end, candidate) => Math.min(end, candidate.requestedAt), timing.native.completedAt);
-		const end = Math.min(timing.native.completedAt, next);
-		if (end <= timing.native.startedAt) continue;
-		const localPauses = pauses.filter(({ timing: other }) => other.pid === timing.pid).map(({ computation }) => ({ computation, overhead: true }));
-		const computation = new TimelineInterval(timing.native.startedAt, end, [...sharedPauses, ...localPauses]);
-		computations.push({ computation, owned: true, shared: [computation] });
+/** Optimistic execution boundaries: control wins over sibling overlap; original producers keep their own clocks. */
+class ActorHeldClock {
+	private readonly spans: HeldExecClock[][] = [[], []];
+	record(timing: HeldExecTiming): void {
+		for (const [index, clock] of [{ startedAt: timing.requestedAt, completedAt: timing.completedAt }, timing.native].entries()) {
+			if (!clock || clock.completedAt <= clock.startedAt) continue;
+			const spans = this.spans[index]!;
+			let start = clock.startedAt, end = clock.completedAt, left = 0, right = spans.length;
+			while (left < right) { const middle = (left + right) >>> 1; if (spans[middle]!.completedAt < start) left = middle + 1; else right = middle; }
+			while (right < spans.length && spans[right]!.startedAt <= end) {
+				start = Math.min(start, spans[right]!.startedAt); end = Math.max(end, spans[right++]!.completedAt);
+			}
+			spans.splice(left, right - left, { startedAt: start, completedAt: end });
+		}
 	}
-	if (omitted) computations.push(omitted);
-	return computations;
+	dependencies(): TimelineDependency[] {
+		const result: TimelineDependency[] = [];
+		for (const [index, spans] of this.spans.entries()) if (spans.length) {
+			const computation = new TimelineInterval(spans[0]!.startedAt, spans.at(-1)!.completedAt, index ? result : [], index ? spans : undefined);
+			result.push({ computation, ...(index ? { owned: true } : { overhead: true }), shared: spans });
+		}
+		return result;
+	}
 }
 
 function reusedComputation(certificate: ProcessProvenanceCertificate,
