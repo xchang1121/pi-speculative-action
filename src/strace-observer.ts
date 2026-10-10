@@ -1,8 +1,7 @@
 import { open, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
-import { directoryStatFields, hostStatFields, repeatableExecutions, SHELLS, systemToolName, workspaceStatFields, type TracedExecution } from "./deterministic-tools.ts";
 import { containsLogicalPath } from "./path-utils.ts";
-import { type DependencyRole, FILESYSTEM_OBSERVATION_FIELDS, type FilesystemObservationField, filesystemObservationDigest, ONE_SHOT_TAINTS, type ProvenanceTaint,
+import { type DependencyRole, FILESYSTEM_OBSERVATION_FIELDS, type FilesystemObservationField, filesystemObservationDigest, type ProvenanceTaint,
 	type Sha256Digest, type ResourceTransitionKind } from "./provenance-certificate.ts";
 
 const CONFINEMENT_SENSITIVE_SYSCALLS = new Set([
@@ -64,8 +63,8 @@ export interface StraceObservationOptions {
 	readonly privateUpper?: string;
 	/** Bounded prefix lookup for running work; its evidence is always incomplete. */
 	readonly previewBytes?: number;
-	/** An owned tracer flushed this exact byte boundary while the target was stopped in restartable I/O. */
-	readonly frozen?: { readonly pid: number; readonly fd: number; readonly syscall: string; readonly bytes: number };
+	/** The owned tracer sealed this complete prefix before the pending syscall's entry, while capturing the stopped target. */
+	readonly frozen?: { readonly pid: number; readonly bytes: number };
 	/** Intercepted path to native target; a later exec of the target in the same process proves descriptor-preserving bypass. */
 	readonly interposedExecutables?: readonly (readonly [intercepted: string, original: string])[];
 	/**
@@ -552,12 +551,7 @@ export async function observeStrace(
 		}
 		for (const [pid, group] of groups) {
 			if (options.frozen?.pid === pid) {
-				const pending = group.lines.at(-1) ?? "";
-				frontier = (options.frozen.fd === -1 ? /^(?:getrandom|getpid|gettid|clock_gettime|prlimit64|clone|clone3|fork|vfork|poll|ppoll|select|pselect6|nanosleep|clock_nanosleep|futex|openat)$/.test(options.frozen.syscall) :
-					/^(?:read|readv|write|writev|sendto|recvfrom|sendmsg|recvmsg)$/.test(options.frozen.syscall)) &&
-					new RegExp(`^${options.frozen.syscall}\\(${options.frozen.fd === -1 ? "" : `${options.frozen.fd}(?:<|,)`}`).test(pending) && !/\)\s+=/.test(pending);
-				if (frontier) { group.lines.pop(); group.order?.pop(); }
-				if (group.lines.some(line => /^--- /.test(line))) frontier = false;
+				frontier = contents.endsWith("\n") && !group.lines.some(line => /^--- /.test(line));
 			}
 			const last = group.lines.filter(line => line.trim()).at(-1) ?? "", exited = /^\+\+\+ exited with (\d+) \+\+\+\s*$/.exec(last)?.[1];
 			files.push({ pid, lines: reassembleSyscalls(group.lines, pid, group.order), ...(exited === undefined ? {} : { exitCode: Number(exited) }),
@@ -598,7 +592,7 @@ export async function observeStrace(
 		lookupFailures.set(target, lookupFailures.has(target) && lookupFailures.get(target) !== failure ? undefined : failure);
 	};
 	// A transcript cannot prove untraced clock/random inputs repeatable; it permits only a one-shot transfer.
-	const taints = new Set<ProvenanceTaint>(["clock", "random"]), executions: TracedExecution[] = [], listingPIDs = new Set<number>();
+	const taints = new Set<ProvenanceTaint>(["clock", "random"]);
 	const unsupportedSyscalls = new Set<string>();
 	let unsupportedSyscallsTruncated = false;
 	const unsupported = (syscall: string) => {
@@ -607,9 +601,8 @@ export async function observeStrace(
 		if (unsupportedSyscalls.size < 16) unsupportedSyscalls.add(name);
 		else if (!unsupportedSyscalls.has(name)) unsupportedSyscallsTruncated = true;
 	};
-	const images = new Map<number, string>(), statFields = new Map<number, readonly FilesystemObservationField[] | undefined>(); // A process's program, inherited across a fork until it execs.
 	const opened = new Map<number, Set<number>>(); // Descriptors a process opened itself, whose status flags it chose.
-	const refusedIndexLocks = new Set<number>(), ownPipes = new Set<string>(); // Pipes and socket pairs the traced processes created, by inode.
+	const ownPipes = new Set<string>(); // Pipes and socket pairs the traced processes created, by inode.
 	// The semantic roots are one workspace seen from the sandbox and from its source: name a file by its place in it.
 	const locks = new Map<string, boolean>(), changedMetadata = new Set<string>(), written = new Set<string>(), writable = new Set<string>(), external = new Set<string>(), workspaceName = (target: string) =>
 		semanticRoots.flatMap((root) => containsLogicalPath(root, target) ? [`//${path.posix.relative(root, target)}`] : [])[0];
@@ -617,7 +610,6 @@ export async function observeStrace(
 		? resourceTransitions(selected, root.file.pid, options) : { journal: [], handled: new Set<TraceLine>(), retained: [], finalHandles: [] };
 	const interposedExecutables = new Map((options.interposedExecutables ?? []).map(([intercepted, original]) => [path.posix.resolve(intercepted), path.posix.resolve(original)]));
 	const semanticRoots = (options.guardFilesystemSemanticsWithin ?? []).map((value) => path.posix.resolve(value));
-	const systemAliases = new Map([...interposedExecutables].flatMap(([original, shadow]) => systemToolName(original, semanticRoots) ? [[shadow, original] as const] : []));
 	const { ignored: ignoredSegments, resumed: resumedInterpositions } = ignoredProcessSegments(selected, interposedExecutables);
 	const observeMetadata = (observedPath: string, followSymlinks: boolean, { digest, fields }: StatObservation) => {
 		lookupFailures.set(observedPath, undefined);
@@ -635,7 +627,6 @@ export async function observeStrace(
 			const line = file.lines[index]!;
 			if (!line) continue;
 			const spawned = spawnedPID(line);
-			if (spawned && images.has(pid)) { images.set(spawned, images.get(pid)!); statFields.set(spawned, statFields.get(pid)); }
 			if (spawned) opened.set(spawned, new Set(opened.get(pid)));
 			const own = opened.get(pid) ?? opened.set(pid, new Set()).get(pid)!, result = Number.parseInt(line.result ?? "", 10);
 			// Files and pipes the traced processes created stay private to them, through duplication and inheritance.
@@ -691,11 +682,6 @@ export async function observeStrace(
 							own.has(Number.parseInt(line.args[0] ?? "", 10)) || ownPipes.has(endpoint ?? ""))))
 					unsupported(syscall);
 			}
-			// git refreshes its index's stat cache when it can, and reports the same without it (the repository is read-only
-			// here); a git that needed the lock (add, commit, stash) fails instead, and its refusal stays a confinement observation.
-			if (images.get(pid) === "git" && /^open(?:at)?$/.test(syscall) && /\/index\.lock"?$/.test(quotedStrings(line).at(-1) ?? "") && confinementDenied(line)) {
-				refusedIndexLocks.add(pid); continue;
-			}
 			// An unprivileged process holds no capabilities, sandboxed or not (the observer runs as the Actor's user).
 			const noCapabilities = syscall === "capget" && process.getuid?.() !== 0 && /\{effective=0, permitted=0, inheritable=0\}\) = 0$/.test(`${line.args.join(", ")}) = ${line.result}`);
 			// A refused io_uring leaves libuv on epoll and its thread pool: the same results, every file call traced.
@@ -719,7 +705,7 @@ export async function observeStrace(
 			const directoryImage = !!listed && !!options.inheritedDirectoryImages?.includes(listed);
 			// A listed directory's entry set is its dependency; readdir order and d_ino are volatile identity, as a descriptor's is.
 			const listing = !!listed && !directoryImage && syscallSucceeded(line);
-			if (listing) { taints.add("descriptor_observation"); listingPIDs.add(pid); listedPaths.add(listed!); if (paths.get(listed!) !== "executable") paths.set(listed!, "input"); }
+			if (listing) { taints.add("descriptor_observation"); listedPaths.add(listed!); if (paths.get(listed!) !== "executable") paths.set(listed!, "input"); }
 			if (UNMODELED_METADATA_SYSCALLS.has(syscall) && !listing && (syscallSucceeded(line) ? !directoryImage : directoryImage)) {
 				unsupported(syscall);
 				incompleteReasons.add(`unmodeled_metadata:${syscall}:${pid}`);
@@ -735,30 +721,18 @@ export async function observeStrace(
 				// A recreated null device has the same I/O semantics, but may have a different device-node inode.
 				if (/<char 1:3>>$/.test(line.args[0] ?? "")) { taints.add("descriptor_observation"); continue; }
 				const metadataPaths = syscallPaths(line, syscall, cwd) ?? [];
-				// A directory descriptor's identity serves traversal (ls and fts track loops by it); printed metadata comes from path stats.
-				const directory = /\bstx?_mode=S_IFDIR\b/.test(line.args[structure] ?? ""), directoryHandle = directory && (syscall === "fstat" || !quotedArgument(line.args[1]));
-				// Only the fields a program reveals of a workspace file are its dependency (see workspaceStatFields).
-				const workspace = metadataPaths.length > 0 && metadataPaths.every((target) => semanticRoots.some((root) => containsLogicalPath(root, target)));
-				const fields = workspace ? statFields.get(pid) : hostStatFields(images.get(pid) ?? "");
-				if (workspace && fields === undefined) taints.add("descriptor_observation");
-				const observed = statObservationDigest(line.args[structure] ?? "", directoryHandle && fields !== undefined ? ["mode"] : undefined, directory ? directoryStatFields(images.get(pid) ?? "", fields, workspace) : fields);
+				// The returned ABI fields are the observation. Program names and argv cannot prove a field unused.
+				const observed = statObservationDigest(line.args[structure] ?? "");
 				if (!metadataPaths.length || !observed) {
 					// fstat, or an empty *at name, of a pipe or socket
 					if (descriptorTarget(line) && !quotedArgument(line.args[1])) taints.add("descriptor_observation");
 					else { unsupported(syscall); incompleteReasons.add(`unparsed_metadata:${syscall}:${pid}`); }
 				}
-				// A shell stats directories only to validate $PWD: their sandbox identity never reaches its output.
-				if (observed && observed.fields?.length !== 0 && !(SHELLS.has(images.get(pid) ?? "") && directory)) {
+				if (observed && observed.fields?.length !== 0) {
 					const followSymlinks = syscall !== "lstat" && !(flags && /\bAT_SYMLINK_NOFOLLOW\b/.test(line.args[flags] ?? ""));
 					for (const metadataPath of metadataPaths) observeMetadata(metadataPath, followSymlinks, observed);
 				}
 				continue;
-			}
-			if (successfulExec(line)) {
-				const traced = tracedExecution(pid, line, cwd), execution = { ...traced, path: systemAliases.get(traced.path ?? "") ?? traced.path };
-				const image = systemToolName(execution.path, semanticRoots);
-				executions.push(execution); images.set(pid, image);
-				statFields.set(pid, workspaceStatFields(image, execution.argv));
 			}
 			if (!PATH_ARGUMENTS[syscall]) continue;
 			const role: DependencyRole = syscall === "execve" || syscall === "execveat" ? "executable" : "input";
@@ -778,18 +752,16 @@ export async function observeStrace(
 			}
 		}
 	}
-	for (const pid of refusedIndexLocks) if (selected.get(pid)?.file.exitCode !== 0) taints.add("confinement_observation");
 	// A workspace file the traced processes wrote changes under their own hands; its later state is their effect, not an input.
 	// A run brokered from its tree, whose launcher the trace holds, wrote on its behalf.
 	for (const pid of selected.keys()) for (const name of options.brokeredWrites?.(pid) ?? []) written.add(`//${name}`);
 	// What it wrote outside the workspace, and the directories holding those names, change by its own hand.
-	const touched = new Set([...external].flatMap(target => [target, path.posix.dirname(target)]));
-	for (const observed of changedMetadata) if (!written.has(workspaceName(observed) ?? observed) && !touched.has(observed)) {
+	const touched = new Set([...external, ...[...written].flatMap(name => semanticRoots.map(root => path.posix.join(root, name.slice(2))))]
+		.flatMap(target => [target, path.posix.dirname(target)]));
+	for (const observed of changedMetadata) if (!touched.has(observed)) {
 		taints.add("mutable_input"); incompleteReasons.add(`metadata_changed:${observed}`);
 	}
 	if (!complete) taints.add("trace_incomplete");
-	// Chosen tools cannot pass their one-shot inputs on to output: the transcript may be replayed across turns.
-	else if (repeatableExecutions(executions, listingPIDs, semanticRoots)) for (const taint of ONE_SHOT_TAINTS) taints.delete(taint);
 	return {
 		complete,
 		...(options.inheritedHandles || options.inheritedStreams ? { resourceJournal: resourceJournal.sort((a, b) => a.order - b.order).map(({ order, ...event }) => event), retainedDescriptions: retained,
@@ -1006,14 +978,6 @@ function tracedPath(target: string, cwd: string | undefined): string | undefined
 }
 
 
-function tracedExecution(pid: number, line: TraceLine, cwd: string): TracedExecution {
-	try {
-		const image = line.name === "execve" ? quotedArgument(line.args[0]) : undefined, argv = line.args[line.name === "execve" ? 1 : 2] ?? "";
-		return { pid, ...(image ? { path: tracedPath(image, cwd) } : {}),
-			argv: /^\[.*\]$/su.test(argv) ? [...argv.matchAll(/"((?:\\.|[^"\\])*)"/g)].map((match) => decodeCString(match[1]!)) : [] };
-	} catch { return { pid, argv: [] }; } // Undecodable arguments prove nothing.
-}
-
 function successfulExec(line: TraceLine): boolean { return (line.name === "execve" || line.name === "execveat") && syscallSucceeded(line); }
 
 function spawnedPID(line: TraceLine): number | undefined {
@@ -1095,10 +1059,9 @@ const STATX_FIELD_MASKS: Readonly<Record<string, readonly FilesystemObservationF
 	STATX_INO: ["ino"], STATX_SIZE: ["size"], STATX_BLOCKS: ["blocks"], STATX_BASIC_STATS: FILESYSTEM_OBSERVATION_FIELDS, STATX_ALL: FILESYSTEM_OBSERVATION_FIELDS,
 	...Object.fromEntries(["MNT_ID", "MNT_ID_UNIQUE", "BTIME", "DIOALIGN", "DIO_READ_ALIGN", "SUBVOL", "WRITE_ATOMIC"].map((flag) => [`STATX_${flag}`, []])) };
 
-function statObservationDigest(structure: string, only?: readonly FilesystemObservationField[], revealed?: readonly FilesystemObservationField[]): StatObservation | undefined {
+function statObservationDigest(structure: string): StatObservation | undefined {
 	const flags = /\bstx_mask=([A-Z_|0-9x]+)/.exec(structure)?.[1]?.split("|");
-	const requested = only ?? (flags?.every((flag) => STATX_FIELD_MASKS[flag]) ? flags.flatMap((flag) => STATX_FIELD_MASKS[flag]!) : undefined);
-	const mask = revealed ? (requested ?? FILESYSTEM_OBSERVATION_FIELDS).filter((field) => revealed.includes(field)) : requested;
+	const mask = flags?.every((flag) => STATX_FIELD_MASKS[flag]) ? flags.flatMap((flag) => STATX_FIELD_MASKS[flag]!) : undefined;
 	const line = structure.replace(/\bstx_(r?dev)_major=(\w+), stx_\1_minor=(\w+)/g, "st_$1=makedev($2, $3)")
 		.replace(/\bstx_([amc]time)=\{tv_sec=(-?\d+), tv_nsec=(\d+)\}/g, "st_$1=$2, st_$1_nsec=$3").replace(/\bstx_/g, "st_");
 	const field = (name: string): bigint | undefined => parseInteger(new RegExp(`\\b${name}=(-?(?:0x[0-9a-f]+|0[0-7]+|[0-9]+))`, "i").exec(line)?.[1]);

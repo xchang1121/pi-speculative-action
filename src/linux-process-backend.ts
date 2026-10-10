@@ -17,7 +17,7 @@ import { stableEqual } from "./stable-json.ts";
 import { TimelineInterval, type TimelineDependency } from "./task-timing.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
 import { certificateReplayable, createExecPrototype, digestObject, dynamicDependencyIdentity, type DynamicDependency, type DynamicDependencyCertificate, type ExecPrototype,
-	type ExitOutcome, filesystemObservationDigest, ONE_SHOT_TAINTS, type OrderedEffectEvent, type OFDPosition, type ProcessProducerProof,
+	type ExitOutcome, filesystemMetadataDigest, filesystemObservationDigest, ONE_SHOT_TAINTS, type OrderedEffectEvent, type OFDPosition, type ProcessProducerProof,
 	type ProcessProvenanceCertificate, type ProcessResultRecord, processWeakKey, type ProvenanceTaint, sealProcessCertificate, sha256Digest,
 	type Sha256Digest, type WorkspaceEffectState } from "./provenance-certificate.ts";
 import { captureAbsenceDependency, captureDirectoryDependency, captureFileDependency,
@@ -46,15 +46,12 @@ import { WorkspaceSandboxService, readSandboxDirectoryState, restoreModifiedTime
 import { containsFilesystemPath as pathContains, relativeFilesystemPath, slash } from "./path-utils.ts";
 
 // Certificates are meaningful only under the implementation that collected and authorized their proof.
-const OBSERVER_FINGERPRINT = digestObject(["linux-process-backend", "strace-observer", "deterministic-tools", "reuse-planner", "reuse-store", "provenance-certificate", "provenance-validation"]
+const OBSERVER_FINGERPRINT = digestObject(["linux-process-backend", "strace-observer", "reuse-planner", "reuse-store", "provenance-certificate", "provenance-validation"]
 	.map(name => sha256Digest(readFileSync(new URL(`./${name}.${import.meta.url.endsWith(".ts") ? "ts" : "js"}`, import.meta.url)))));
 const POLICY_ID = "sandlock-virtual-root-transparent-exec-creation-mode";
 const LEAF_POLICY_ID = "sandlock-virtual-workspace-leaf-creation-mode";
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024, LEARNED_LAUNCHES = 64, MAX_INTERPOSED_MOUNT_BYTES = 512 * 1024;
 const MAX_CONTINUATION_BYTES = 65 * 1024 * 1024;
-const PROCESS_FRONTIERS = new Map([[0, "read"], [1, "write"], [19, "readv"], [20, "writev"], [44, "sendto"], [45, "recvfrom"], [46, "sendmsg"], [47, "recvmsg"],
-	[7, "poll"], [23, "select"], [35, "nanosleep"], [39, "getpid"], [56, "clone"], [57, "fork"], [58, "vfork"], [186, "gettid"], [202, "futex"],
-	[228, "clock_gettime"], [230, "clock_nanosleep"], [257, "openat"], [270, "pselect6"], [271, "ppoll"], [302, "prlimit64"], [318, "getrandom"], [435, "clone3"]]);
 const MAX_CAPTURE_BYTES = 512 * 1024 * 1024;
 /** The consumer launcher places a dependency inside its existing traced parent; metadata owns neither one. */
 const processDependencyPIDs = new WeakMap<TimelineDependency, number>();
@@ -184,7 +181,7 @@ interface DispatcherResponse {
 /** A brokered run writing into a session's workspace: its launcher's pid and, once known, what it and the runs brokered from its tree wrote. */
 interface SessionWriter {
 	readonly startedAt: number; endedAt?: number; writes?: readonly TracedWrite[]; tail?: TraceTail; settled?: true;
-	readonly pid?: number; written?: readonly string[]; descendants?: readonly SessionWriter[];
+	readonly pid?: number; written?: readonly string[]; external?: readonly string[]; descendants?: readonly SessionWriter[];
 }
 
 interface ActiveSession {
@@ -222,6 +219,7 @@ interface ActiveSession {
 	readonly resumed: Set<number>;
 	/** Nested executions whose workspace intervals may overlap: running ones by their live trace, settled ones by their writes. */
 	readonly writers: Set<SessionWriter>;
+	readonly completedWrites: Map<number, Pick<StraceObservation, "written" | "external">>;
 	readonly metrics: MutableLinuxProcessReuseMetrics;
 	topLevelCapture?: TopLevelCapture;
 	topLevelExecution?: { readonly prototype: ExecPrototype; readonly outcome: SpawnOutcome; readonly observedProcessMs: number; readonly startedAt: number; };
@@ -248,7 +246,7 @@ type ActorHeldTiming = HeldExecTiming & { readonly pid: number; readonly sequenc
 
 /** Linux-only process substrate. Unavailable dependencies remove the route instead of weakening it. */
 export class LinuxProcessReuseBackend {
-	private readonly observations = new AsyncLocalStorage<{ scope: ExecutionScope; sequence: number; closed: boolean; learn: boolean; learned: Set<string>;
+	private readonly observations = new AsyncLocalStorage<{ scope: ExecutionScope; sequence: number; closed: boolean; learn: boolean; pending: number; learned: Map<number, number>;
 		inputs?: (path: string) => Iterable<object>; bindings: Map<number, ProcessExecutionBinding>; computations: TimelineDependency[];
 		heldTimings: ActorHeldTiming[]; timingOverflow?: HeldExecClock }>();
 
@@ -257,7 +255,7 @@ export class LinuxProcessReuseBackend {
 		observe: (bindings: readonly ProcessExecutionBinding[], computations: readonly TimelineDependency[]) => void, learn = false,
 		inputs?: (path: string) => Iterable<object>): Promise<Value> {
 		const observation = { scope: snapshotExecutionScope(scope)!, sequence: 0, closed: false,
-			learn, learned: new Set<string>(), inputs, bindings: new Map<number, ProcessExecutionBinding>(), computations: [] as TimelineDependency[],
+			learn, pending: 0, learned: new Map<number, number>(), inputs, bindings: new Map<number, ProcessExecutionBinding>(), computations: [] as TimelineDependency[],
 			heldTimings: [] as ActorHeldTiming[], timingOverflow: undefined as HeldExecClock | undefined };
 		try { return await this.observations.run(observation, execute); }
 		finally {
@@ -528,7 +526,7 @@ export class LinuxProcessReuseBackend {
 			nestedEvidence: [], foldedObservations: [], resumed: new Set(),
 			executionBindings: new Map(),
 			computations: [],
-			incompleteReasons: new Set<string>(), bypasses: [], writers: new Set(), nestedOutputEndpoints: new Set(),
+			incompleteReasons: new Set<string>(), bypasses: [], writers: new Set(), completedWrites: new Map(), nestedOutputEndpoints: new Set(),
 			metrics: { ...emptyWorldReuseMetrics() },
 		};
 		input.onOperationJoinable?.(() => !session.signal.aborted && this.handoffs.hasJoinableWork(session.ownership));
@@ -734,7 +732,7 @@ export class LinuxProcessReuseBackend {
 				{
 					cwd: physicalCwd,
 					environment,
-					onOutputEndpoints: (endpoints) => { session.topLevelOutputEndpoints = endpoints; },
+					outputRoot: traceRoot, onOutputEndpoints: (endpoints) => { session.topLevelOutputEndpoints = endpoints; },
 					...(session.invocation.commandTransport === "stdin" ? { stdin: Buffer.from(command, "utf8") } : {}),
 					signal,
 					...(request.timeout !== undefined ? { timeoutSeconds: request.timeout } : {}),
@@ -763,7 +761,9 @@ export class LinuxProcessReuseBackend {
 	}
 
 	private async seal(session: ActiveSession, changes: readonly SandboxWorkspaceChange[]): Promise<readonly SandboxWorkspaceChange[]> {
-		const external = await privateCommits(path.join(session.workspace.processRoot, "private"), session.privateSince ?? 0);
+		const external = await privateCommits(path.join(session.workspace.processRoot, "private"), session.privateSince ?? 0,
+			[...session.topLevelCapture?.observation.external ?? [], ...[...session.completedWrites.values()].flatMap(writer => writer.external ?? []),
+				...session.foldedObservations.flatMap(observation => observation.external ?? [])]);
 		// Adopting without them would leave the host unlike the native run: the Actor runs it instead.
 		if (external.unrepresentable.length) throw new Error(`unrepresentable writes outside the workspace: ${external.unrepresentable.join(",")}`);
 		const refined = [...await sealSessionEvidence(session, changes), ...external.changes];
@@ -913,8 +913,11 @@ export class LinuxProcessReuseBackend {
 				return TimelineInterval.outside(async () => {
 					const before = captureWorkspace ? await session.workspace.structure.capture() : undefined;
 					const result = await this.replay(session, plan, weakKey, acquired, request.streams && descriptorInputs(request.resources!), inPlace);
-					if (inPlace !== undefined) session.writers.add({ startedAt: Date.now(), endedAt: Date.now(), writes: [], settled: true, pid: inPlace,
-						written: plan.certificate.result.journal.flatMap(event => event.kind === "workspace" && pathContains(session.sourceRoot, event.path) ? [slash(path.relative(session.sourceRoot, event.path))] : []) });
+					const written = {
+						external: plan.certificate.result.journal.flatMap(event => event.kind === "workspace" && !pathContains(session.sourceRoot, event.path) ? [event.path] : []),
+						written: plan.certificate.result.journal.flatMap(event => event.kind === "workspace" && pathContains(session.sourceRoot, event.path) ? [slash(path.relative(session.sourceRoot, event.path))] : []) };
+					recordSessionWrites(session, inPlace ?? -requestID, written);
+					if (inPlace !== undefined) session.writers.add({ startedAt: Date.now(), endedAt: Date.now(), writes: [], settled: true, pid: inPlace, ...written });
 					if (before) captureWorkspace!({ before, after: await session.workspace.structure.capture() });
 					const binding = acquired.producer?.binding;
 					if (binding && this.handoffs.resolveBinding(binding, session.scope)) session.executionBindings.set(requestID, binding);
@@ -996,7 +999,14 @@ export class LinuxProcessReuseBackend {
 
 	private async decideHeldExec(process: HeldExecProcess, scope?: ExecutionScope): Promise<HeldExecDecision> {
 		const observation = this.observations.getStore();
-		const measured = (decision: HeldExecDecision): HeldExecDecision => !observation || observation.closed || !sameScope(observation.scope, scope)
+		let reserved = false, completing = false;
+		const releaseLearning = () => { if (reserved) { observation!.pending--; reserved = false; } };
+		const measured = (decision: HeldExecDecision): HeldExecDecision => {
+			if (reserved && decision.kind === "continue" && decision.observeCompletion) {
+				const complete = decision.observeCompletion; completing = true;
+				decision = { ...decision, observeCompletion: async (...args) => { try { await complete(...args); } finally { releaseLearning(); } } };
+			}
+			return !observation || observation.closed || !sameScope(observation.scope, scope)
 			? decision : { ...decision, observeTiming: timing => {
 				if (observation.closed) return;
 				if (observation.heldTimings.length < LEARNED_LAUNCHES)
@@ -1006,7 +1016,8 @@ export class LinuxProcessReuseBackend {
 					completedAt: Math.max(observation.timingOverflow?.completedAt ?? timing.completedAt, timing.completedAt),
 				};
 			} };
-		let learning = observation?.learn && !observation.closed && sameScope(observation.scope, scope);
+		};
+		const learning = observation?.learn && !observation.closed && sameScope(observation.scope, scope) && observation.pending < LEARNED_LAUNCHES;
 		const order = observation ? ++observation.sequence : 0;
 		let settle: ((consumed: boolean) => void) | undefined, transferred = false;
 		this.addActor("requests");
@@ -1022,18 +1033,12 @@ export class LinuxProcessReuseBackend {
 				this.handoffs.observe(sha256Digest(`queue-tracking:${sourceRoot}`), executablePath, scope!, { trackingOnly: true, sourceRoot }, 0);
 				this.addActor("misses"); return measured({ kind: "continue" });
 			}
-			// A call learns each distinct launch once, and at most LEARNED_LAUNCHES of them: an exec-dense loop or build
-			// would otherwise pay a held inspection and a whole-executable digest on every exec.
-			if (learning) {
-				const launch = `${executablePath}\0${await readFile(`/proc/${process.pid}/cmdline`, "latin1")}`, learned = observation!.learned;
-				if (learning = learned.size < LEARNED_LAUNCHES && !learned.has(launch)) learned.add(launch);
-			}
+			if (learning) { observation!.pending++; reserved = true; }
 			const available = this.handoffs.mayHaveExecutable(executablePath) || await this.store.mayHaveCertificates(executablePath) ||
 				this.handoffs.mayHaveExecutable(executablePath);
-			// Already learned in this call with nothing to adopt: a producer appearing later in the call is not worth an exec's round trip.
-			// Once this call learns no new launch, only the executable decides.
+			// Concurrent discovery is bounded, but a full retained set never shuts discovery off for the rest of the call.
 			if (!learning && !available) { this.addActor("misses"); return measured({ kind: "continue",
-				repeat: observation && !observation.closed && observation.learned.size < LEARNED_LAUNCHES ? "launch" : "executable" }); }
+				...(!observation?.learn ? { repeat: "executable" as const } : {}) }); }
 			const inspected = await inspectHeldExecProcess(process.pid, executable, process.descriptors);
 			const capturedInputs = await TimelineInterval.collect(() => process.descriptors?.length
 				? captureHeldDescriptorInputs(process.pid, process.descriptors, Math.min(MAX_REQUEST_BYTES / 2, this.store.limits.maxBytes),
@@ -1043,32 +1048,44 @@ export class LinuxProcessReuseBackend {
 			if (observation && !observation.closed) observation.computations.push(...capturedInputs.dependencies.filter(input => !input.owned));
 			const snapshot = { ...inspected, ...(resources ? { resources } : {}) };
 			if (!pathContains(sourceRoot, snapshot.cwd)) { this.addActor("bypasses"); return measured({ kind: "continue" }); }
+			// Completion admits the most valuable launches. Undefined is a free slot, a sequence is its replacement,
+			// and false refuses admission. Existing adoptions keep their bindings and computation receipts.
+			const slot = (durationMs: number, key?: Sha256Digest): number | false | undefined => {
+				if (!learning || observation!.closed || process.signal?.aborted || !snapshot.outputRoute || !Number.isFinite(durationMs)) return false;
+				const entries = [...observation!.learned], previous = key && entries.find(([order]) => observation!.bindings.get(order)?.key === key);
+				const victim = previous || (entries.length >= LEARNED_LAUNCHES || observation!.bindings.size >= this.store.limits.maxCertificates
+					? entries.reduce<(typeof entries)[number] | undefined>((lowest, entry) => !lowest || entry[1] < lowest[1] ? entry : lowest, undefined) : undefined);
+				return victim ? durationMs > victim[1] ? victim[0] : false : observation!.bindings.size < this.store.limits.maxCertificates ? undefined : false;
+			};
 			const observe = (prototype: ExecPrototype, durationMs: number) => {
-				const weakKey = processWeakKey(prototype);
-				if (!learning || observation!.closed || process.signal?.aborted || !snapshot.outputRoute || observation!.bindings.size >= this.store.limits.maxCertificates) return;
+				const weakKey = processWeakKey(prototype), replace = slot(durationMs, weakKey);
+				if (replace === false) return;
 				const binding = this.handoffs.observe(weakKey, executablePath, scope!, {
 					argv0: snapshot.argv[0]!, args: snapshot.argv.slice(1), environment: snapshot.environment,
-					cwd: projection.toLogical(snapshot.cwd), executable: executablePath, sourceRoot, outputRoute: snapshot.outputRoute,
+					cwd: projection.toLogical(snapshot.cwd), executable: executablePath, sourceRoot, outputRoute: snapshot.outputRoute!,
 					...(snapshot.outputPipes?.some(Boolean) ? { outputPipes: snapshot.outputPipes } : {}), ...(outputStatusFlags(snapshot.context) ? { outputFlags: outputStatusFlags(snapshot.context) } : {}),
 					...(snapshot.context.descriptorTypes[0] === "closed" ? { closeStdin: true } : {}),
 					...(resources ? { resources } : {}),
 				}, durationMs);
-				if (binding) observation!.bindings.set(order, binding);
+				if (binding) {
+					if (replace !== undefined) { observation!.bindings.delete(replace); observation!.learned.delete(replace); }
+					observation!.bindings.set(order, binding); observation!.learned.set(order, durationMs);
+				}
 			};
 			if (!available || resources && process.descriptors!.some(({ owned }) => !owned)) {
-				// Pin the actual image before resuming it. Learning must not wait for a large digest after a short native call.
-				const platform = await this.resolvePlatformFingerprint(), controller = new AbortController();
-				let pinned!: () => void, digest: Sha256Digest | undefined;
-				const ready = new Promise<void>(resolve => { pinned = resolve; });
-				const capturing = TimelineInterval.collect(() => hashExecutableFile(`/proc/${process.pid}/exe`, { pinned,
-					signal: process.signal ? AbortSignal.any([process.signal, controller.signal]) : controller.signal,
-				})).then(value => { digest = value.output; }, () => {}).finally(pinned);
-				await ready;
+				// Pin the executable's object now, digest it only after admission. Its original identity must still hold:
+				// the pathname can be replaced after exec, and the pinned inode can be rewritten after the process exits.
+				const image = await open(`/proc/${process.pid}/exe`, 0x200000);
+				let before: Awaited<ReturnType<typeof image.stat>>;
+				try { before = await image.stat({ bigint: true }); } catch (error) { await image.close(); throw error; }
 				this.addActor("misses");
 				return measured({ kind: "continue", observeCompletion: async durationMs => {
-					if (!digest || durationMs === undefined) controller.abort();
-					await capturing;
-					if (durationMs !== undefined && digest) observe(bufferedProcessPrototype(snapshot, projection, digest, platform), durationMs);
+					try {
+						if (durationMs === undefined || slot(durationMs) === false || !sameFilesystemIdentity(before, await image.stat({ bigint: true }))) return;
+						const digest = (await TimelineInterval.collect(() => hashExecutableFile(`/proc/self/fd/${image.fd}`))).output;
+						if (sameFilesystemIdentity(before, await image.stat({ bigint: true })))
+							observe(bufferedProcessPrototype(snapshot, projection, digest, await this.resolvePlatformFingerprint()), durationMs);
+					} finally { await image.close(); }
 				} });
 			}
 			const digest = (await TimelineInterval.collect(() => hashExecutableFile(`/proc/${process.pid}/exe`))).output;
@@ -1137,7 +1154,7 @@ export class LinuxProcessReuseBackend {
 			this.addActor("bypasses");
 			this.setActorError(`actor_child:${errorMessage(error)}`);
 			return measured({ kind: "continue" });
-		} finally { if (!transferred) settle?.(false); }
+		} finally { if (!transferred) settle?.(false); if (!completing) releaseLearning(); }
 	}
 
 	private async replay(
@@ -1191,7 +1208,7 @@ export class LinuxProcessReuseBackend {
 		let transactionFinishing = false;
 		let releaseInputs: (() => void) | undefined, inputCheck: Promise<boolean> | undefined;
 		let stage = "capture", dependencyCertificate: DynamicDependencyCertificate | undefined, certificateID: Sha256Digest | undefined, unattributed: StraceObservation | undefined;
-		let continuation: ProcessContinuation | undefined, frozen: { pid: number; fd: number; syscall: string; bytes: number } | undefined;
+		let continuation: ProcessContinuation | undefined, frozen: { pid: number; fd: number; writing: boolean; bytes: number } | undefined;
 		const executedStreams: { alias: number; kind: string; data: Buffer }[] = [];
 		let suspensionAttempted = false, writer: ActiveSession["writers"] extends Set<infer Writer> ? Writer | undefined : never;
 		const failureDetail = (error: unknown) => `${errorMessage(error)}; process=${JSON.stringify({
@@ -1271,7 +1288,7 @@ export class LinuxProcessReuseBackend {
 			let outputEndpoints: readonly [string, string] | undefined;
 			outcome = await runSpawn(ready.strace, [...(live ? [`--handoff-fd=${inheritedFiles.length + 3}`, `--handoff-library=${ready.imageLibrary}`, `--handoff-image=${imagePath}`] : []), ...command.slice(1)], {
 				// The child writes to (and may query) these sockets; their identity lets its observation recognize them.
-				onOutputEndpoints: (endpoints) => {
+				outputRoot: traceRoot, onOutputEndpoints: (endpoints) => {
 					session.nestedOutputEndpoints.add(outputEndpoints = endpoints);
 					if (captureWorkspace) session.topLevelOutputEndpoints = endpoints;
 				},
@@ -1290,8 +1307,9 @@ export class LinuxProcessReuseBackend {
 						suspensionAttempted = true;
 						if (reply.readInt32LE(0) !== pid) return;
 						const bytes = Number(reply.readBigUInt64LE(16)), begin = Number(reply.readBigUInt64LE(24)) / 1e6 - clockOffset,
-							end = Number(reply.readBigUInt64LE(32)) / 1e6 - clockOffset, fd = reply.readInt32LE(4), syscall = PROCESS_FRONTIERS.get(reply.readInt32LE(8));
-						if (!syscall || !Number.isSafeInteger(bytes) || bytes <= 0 || fd < -1 || begin < processStarted || end < begin || end > performance.now()) throw new Error("invalid native continuation frontier");
+							end = Number(reply.readBigUInt64LE(32)) / 1e6 - clockOffset, fd = reply.readInt32LE(4), syscall = reply.readInt32LE(8);
+						if (reply.readInt32LE(12) !== 1 || syscall < 0 || syscall >= 0x40000000 || !Number.isSafeInteger(bytes) || bytes <= 0 || fd < -1 ||
+							begin < processStarted || end < begin || end > performance.now()) throw new Error("invalid native continuation frontier");
 						const file = await open(imagePath, "r");
 						let image: Buffer;
 						try {
@@ -1299,7 +1317,7 @@ export class LinuxProcessReuseBackend {
 							image = await file.readFile();
 						} finally { await file.close(); }
 						continuation = { image, physicalRoot: session.workspace.sandboxRoot, computation: new TimelineInterval(begin, end) };
-						frozen = { pid, fd, syscall, bytes };
+						frozen = { pid, fd, writing: [1, 20, 44, 46].includes(syscall), bytes };
 					})().catch(error => { this.setActorError(`actor_suspend:${errorMessage(error)}`); }).finally(() => {
 						if (!suspensionAttempted) suspended = undefined;
 					}));
@@ -1361,7 +1379,7 @@ export class LinuxProcessReuseBackend {
 						result.status === "rejected" ? [index === 0 ? "transaction_capture" : "trace_capture"] : []).join("+");
 					throw error;
 				});
-				own.written ??= observation.written ?? []; // What its launcher's trace answers for, whether or not its interval overlapped another.
+				own.written ??= observation.written ?? []; own.external = observation.external ?? [];
 				for (const pid of observation.resumedInterpositions ?? []) session.resumed.add(pid);
 				if (continuation) continuation = { ...continuation, image: bindContinuationDescriptors(continuation.image, frozen!, inputs,
 					!!request.closeStdin, observation.finalHandles ?? [], descriptorOffsets ?? []) };
@@ -1430,7 +1448,10 @@ export class LinuxProcessReuseBackend {
 				stage = "certificate";
 				const certificate = sealProcessCertificate({ prototype, producer: session.nestedProducer, dependencyCertificate, result });
 				certificateID = certificate.id;
-				session.nestedEvidence.push(certificate.dependencyCertificate);
+				// A child can read an earlier child's private output. Its parent can prove that input from the combined
+				// transaction even when this child, considered alone against the host, could not.
+				if (!evidence.complete && observation.complete && !escaped && !external.unrepresentable.length && !continuation) session.foldedObservations.push(observation);
+				else session.nestedEvidence.push(certificate.dependencyCertificate);
 				if (taints.size) {
 					this.add(session, "tainted");
 					// Keep the capture's existing reasons beside its categories. Diagnostic text never changes sealed evidence.
@@ -1502,6 +1523,7 @@ export class LinuxProcessReuseBackend {
 			this.add(session, "executionMs", durationMs);
 			if (!transactionFinishing) await transaction.abort().catch(() => undefined);
 			if (writer) {
+				recordSessionWrites(session, writer.pid ?? -requestID, writer);
 				writer.writes ??= await writer.tail!.read().then(tail => tail.writes, () => [{ at: writer!.startedAt, opened: true }]);
 				writer.settled = true;
 				if ([...session.writers].every(other => other.settled)) session.writers.clear();
@@ -1769,7 +1791,7 @@ function bufferedProcessPrototype(
 	});
 }
 
-function bindContinuationDescriptors(image: Buffer, frontier: { pid: number; fd: number; syscall: string }, inputs: ReturnType<typeof descriptorInputs>, closedInput: boolean,
+function bindContinuationDescriptors(image: Buffer, frontier: { pid: number; fd: number; writing: boolean }, inputs: ReturnType<typeof descriptorInputs>, closedInput: boolean,
 	handles: NonNullable<import("./strace-observer.ts").StraceObservation["finalHandles"]>, positions: ReturnType<typeof parseDescriptorOffsets>) {
 	let cursor = 0;
 	const line = () => {
@@ -1797,7 +1819,7 @@ function bindContinuationDescriptors(image: Buffer, frontier: { pid: number; fd:
 		records.set(fd, fields); bound.push(fields.join(" "));
 	}
 	const pending = inputs.find(input => input.fd === Number(records.get(frontier.fd)?.[5]));
-	if (frontier.fd >= 0 && !pending && !([1, 2].includes(frontier.fd) && /^(?:write|writev|sendto|sendmsg)$/.test(frontier.syscall)) ||
+	if (frontier.fd >= 0 && !pending && !([1, 2].includes(frontier.fd) && frontier.writing) ||
 		[...(closedInput ? [] : [0]), 1, 2, ...handles.map(handle => handle.fd)].some(fd => !records.has(fd)) ||
 		cursor + Number(header[3]) + Number(header[4]) !== image.length) throw new Error("incomplete continuation FD table");
 	for (const position of positions) {
@@ -1964,7 +1986,8 @@ async function sealSessionEvidence(session: ActiveSession, changes: readonly San
 	const directoryChanges = await sourceDirectoryChanges(session, effects.effects);
 	try {
 		const observed = [capture.observation, ...session.foldedObservations];
-		const evidence = await captureDependencies(session, capture.before, observed.flatMap(observation => observation.paths), effects, { external: observed.flatMap(observation => observation.external ?? []),
+		const evidence = await captureDependencies(session, capture.before, observed.flatMap(observation => observation.paths), effects, { external: [...observed.flatMap(observation => observation.external ?? []),
+			...[...session.completedWrites.values()].flatMap(writer => writer.external ?? [])],
 			locks: observed.flatMap(observation => observation.locks ?? []), written: observed.flatMap(observation => observation.written ?? []) }, session.nestedEvidence);
 		for (const reason of evidence.incompleteReasons) session.incompleteReasons.add(`top_evidence:${reason}`);
 		session.topLevelEvidence = mergeDependencyEvidence(
@@ -2064,6 +2087,12 @@ async function captureDependencies(session: ActiveSession, snapshot: WorkspaceSt
 	};
 	// A name it created itself depends only on having been free, not on everything else its directory held.
 	const created = new Set(written.map(name => path.resolve(session.workspace.sandboxRoot, name)));
+	const parentWrites = new Set([...created].map(name => path.dirname(name)));
+	const metadataBefore = (physical: string, dependency: Extract<DynamicDependency, { kind: "metadata" }>) => {
+		const relative = relativeFilesystemPath(snapshot.root, physical), entry = relative === undefined ? undefined : snapshot.entries.get(relative);
+		return parentWrites.has(physical) && entry?.kind === "directory" && entry.observed ? { ...dependency,
+			digest: filesystemObservationDigest(session.workspace.projectMetadata?.(entry.observed) ?? entry.observed, dependency.fields) } : dependency;
+	};
 	const workspaceDependency = async (physical: string, logical: string, role: Exclude<ObservedProcessPath["role"], "metadata">, listed = true) => {
 		const [entry, parent] = await Promise.all([before(physical),
 			path.resolve(physical) === path.resolve(session.workspace.sandboxRoot) || created.has(path.resolve(physical)) ? undefined : before(path.dirname(physical))]);
@@ -2091,6 +2120,7 @@ async function captureDependencies(session: ActiveSession, snapshot: WorkspaceSt
 		const physical = dependency.kind === "fd" ? undefined : session.projection.toPhysical(dependency.path);
 		const relative = physical && relativeFilesystemPath(snapshot.root, physical);
 		if (dependency.kind === "fd" || !physical || relative === undefined || session.workspace.observationExcludes.includes(relative.split(path.sep)[0]!)) return dependency;
+		if (dependency.kind === "metadata" && parentWrites.has(physical)) return metadataBefore(physical, dependency);
 		const entry = snapshot.entries.get(relative), up = relativeFilesystemPath(snapshot.root, path.dirname(physical)), parent = up === undefined ? undefined : snapshot.entries.get(up);
 		const same = dependency.kind === "absence" ? !entry && (dependency.parentEntriesDigest === undefined || parent?.kind === "directory" && parent.entriesDigest === dependency.parentEntriesDigest)
 			: dependency.kind === "directory" ? entry?.kind === "directory" && entry.metadataDigest === dependency.metadataDigest && (dependency.entriesDigest ?? entry.entriesDigest) === entry.entriesDigest
@@ -2165,13 +2195,13 @@ async function captureDependencies(session: ActiveSession, snapshot: WorkspaceSt
 		if (/^\/sys\/(?:devices\/system\/cpu|fs\/cgroup)(?:\/|$)|^\/proc\/(?:meminfo|version|version_signature|cpuinfo|stat|loadavg|uptime)$/.test(observedPath)) { taints.add("clock"); continue; }
 		if (item.role === "metadata") {
 			if (created.has(path.resolve(physical))) continue; // Its own writes set what it saw of them.
-			add(await atStart({
+			add(await atStart(metadataBefore(physical, {
 				kind: "metadata",
 				path: session.projection.isWorkspacePhysical(physical) ? session.projection.toLogical(physical) : slash(physical),
 				followSymlinks: item.followSymlinks,
 				digest: item.digest,
 				...(item.fields ? { fields: item.fields } : {}),
-			}));
+			})));
 			continue;
 		}
 		if (STABLE_SANDBOX_DEVICES.has(observedPath)) continue;
@@ -2188,9 +2218,15 @@ async function captureDependencies(session: ActiveSession, snapshot: WorkspaceSt
 			absent: item.lookupFailure === "ENOENT" && !item.path.split("/").includes("..") && previous?.absent !== false });
 	}
 	// Host files are independent of each other and of the workspace: capture them concurrently (walking what they share once), add them in trace order.
-	const capture = sharedWalk();
+	const capture = sharedWalk(), images = await privateInputImages(path.join(session.workspace.processRoot, "private"), new Set([...hostPaths.values()].map(item => item.physical)));
 	for (const captured of await mapFilesystem([...hostPaths.values()], ({ physical, role, listed, absent }) =>
-		captureHostPath(physical, role, listed, absent, capture).then(value => ({ physical, value }), (error: unknown) => ({ physical, error })))) {
+		(async () => {
+			const image = images.get(physical);
+			if (!image) return captureHostPath(physical, role, listed, absent, capture);
+			if (!image.unchanged) return undefined;
+			return [...image.links, { kind: "file", path: slash(image.path), role, contentDigest: `sha256:${image.hash}`,
+				metadataDigest: filesystemMetadataDigest(image.original) }] satisfies DynamicDependency[];
+		})().then(value => ({ physical, value }), (error: unknown) => ({ physical, error })))) {
 		if ("error" in captured) { complete = false; taints.add("trace_incomplete"); incompleteReasons.add(`capture:${captured.physical}:${errorMessage(captured.error)}`); }
 		else if (captured.value) for (const dependency of captured.value) add(dependency);
 		else { taints.add("mutable_input"); add(undefined, `mutable:${captured.physical}`); }
@@ -2326,7 +2362,7 @@ async function captureProcessResult(
 	const journal: OrderedEffectEvent[] = [];
 	for (const { logicalPath, change } of effects) {
 		const state = async (side: "before" | "after"): Promise<WorkspaceEffectState> => {
-			if (change.kind === "directory") return change[side] ? { kind: "directory", ...change[side] } : { kind: "absent" };
+			if (change.kind === "directory") return change[side] ? { kind: "directory", ...directoryState(change[side]!) } : { kind: "absent" };
 			const content = change[side], mode = change[side === "before" ? "beforeMode" : "afterMode"];
 			if (content === undefined) return { kind: "absent" };
 			if (mode === undefined) throw new Error("transaction file mode is unavailable");
@@ -2342,7 +2378,7 @@ async function captureProcessResult(
 	return { replayProfile: "buffered_noninteractive", observedProcessMs, journal, exit: exitOutcome(outcome) };
 }
 
-function directoryState(state: Extract<WorkspaceEffectState, { kind: "directory" }>): SandboxDirectoryChange["before"] {
+function directoryState(state: NonNullable<SandboxDirectoryChange["before"]>): NonNullable<SandboxDirectoryChange["before"]> {
 	return { entriesDigest: state.entriesDigest, mode: state.mode, uid: state.uid, gid: state.gid };
 }
 
@@ -2533,7 +2569,14 @@ function sandboxPolicyArguments(
 
 /** What the brokered run a traced launcher `pid` started wrote, with its own descendants; a run never answers for itself. */
 function brokeredWrites(session: ActiveSession, pid: number, self?: SessionWriter): readonly string[] | undefined {
-	return [...session.writers].find(writer => writer !== self && writer.pid === pid)?.written;
+	return [...session.writers].find(writer => writer !== self && writer.pid === pid)?.written ?? session.completedWrites.get(pid)?.written;
+}
+
+function recordSessionWrites(session: ActiveSession, pid: number, writes: Pick<StraceObservation, "written" | "external">) {
+	if (!writes.written?.length && !writes.external?.length) return;
+	const previous = session.completedWrites.get(pid);
+	session.completedWrites.set(pid, { written: [...new Set([...previous?.written ?? [], ...writes.written ?? []])],
+		external: [...new Set([...previous?.external ?? [], ...writes.external ?? []])] });
 }
 
 const privateUpper = (session: ActiveSession) => path.join(session.workspace.processRoot, "private", "writes", "upper");
@@ -2553,16 +2596,47 @@ async function hostRoot(target: string): Promise<string> {
 	}
 }
 
-/** A session's private branch under `storage` as changes against the host, at `candidates` or wherever it differs: a copy that
- * differs from the host object, a directory the host lacks, a deletion of something the host holds. Each stands over the host
- * state it replaces, which only holds as a baseline for an object no one changed since `since`; anything else is unrepresentable. */
-async function privateCommits(storage: string, since: number, candidates?: Iterable<string>) {
-	const { upper, deletions, deleted } = await privateBranch(storage), stat = (target: string) => lstat(target, { bigint: true }).catch(() => undefined);
-	const held: string[] = [], changes: SandboxWorkspaceChange[] = [], unrepresentable: string[] = [], walk = async (host: string): Promise<void> => {
-		for (const name of await readdir(path.join(upper, host)).catch(() => [] as string[])) { held.push(path.posix.join(host, name)); await walk(path.posix.join(host, name)); }
+/** Native opens pin these bytes before exposing a descriptor; no post-execution host read can replace that proof. */
+async function privateInputImages(storage: string, needed?: ReadonlySet<string>) {
+	const root = path.join(storage, "writes", "inputs"), indexes = await readdir(path.join(root, "paths")).catch(error => {
+		if (missing(error)) return []; throw error;
+	});
+	if (indexes.length > 8192) throw new Error("input image index bound exceeded");
+	const fields = ["dev", "ino", "mode", "nlink", "uid", "gid", "rdev", "size", "blksize", "blocks", "atimeNs", "mtimeNs", "ctimeNs", "birthtimeNs"] as const;
+	const decode = (values: unknown) => {
+		if (!Array.isArray(values) || values.length !== fields.length || values.some(value => typeof value !== "string" || !/^-?\d{1,40}$/.test(value)))
+			throw new Error("invalid input image identity");
+		return Object.fromEntries(fields.map((field, index) => [field, BigInt(values[index])])) as Record<typeof fields[number], bigint>;
 	};
-	if (!candidates) await walk("/");
-	for (const target of new Set(candidates ? [...candidates].map(name => path.posix.resolve(name)) : [...held, ...deletions])) {
+	const capture = async (key: string) => {
+		const directory = path.join(root, key), row = JSON.parse(await readFile(path.join(directory, "proof.json"), "utf8")) as { path: string; physical: unknown; original: unknown };
+		const original = decode(row.original), physical = decode(row.physical);
+		if (!path.isAbsolute(row.path) || (original.mode & 0o170000n) !== 0o100000n || original.nlink !== 1n || original.size < 0n || original.size > 32n * 1024n * 1024n)
+			throw new Error("invalid input image proof");
+		const [baseline, working] = await Promise.all([captureStableFile(path.join(directory, "baseline"), Number(original.size)), captureStableFile(path.join(directory, "working"), 32 * 1024 * 1024)]);
+		if (baseline.stat.size !== original.size || working.stat.dev !== physical.dev || working.stat.ino !== physical.ino) throw new Error("input image owner changed");
+		return { path: row.path, hash: baseline.hash, physical, original: { ...original, isFile: () => true, isDirectory: () => false, isSymbolicLink: () => false },
+			unchanged: working.hash === baseline.hash && working.stat.mode === physical.mode && working.stat.uid === physical.uid && working.stat.gid === physical.gid &&
+				working.stat.mtimeNs === physical.mtimeNs && working.stat.ctimeNs === physical.ctimeNs };
+	};
+	const captured = new Map<string, ReturnType<typeof capture>>(), images = new Map<string, Awaited<ReturnType<typeof capture>> & { links: Extract<DynamicDependency, { kind: "symlink" }>[] }>();
+	for (const name of indexes) {
+		if (!/^[0-9a-f]{16}\.json$/.test(name)) throw new Error("invalid input image index");
+		const index = JSON.parse(await readFile(path.join(root, "paths", name), "utf8")) as { path: string; image: string; ambiguous?: boolean; sealed?: boolean; links: [string, string][] };
+		if (needed && !needed.has(index.path)) continue;
+		if (!path.isAbsolute(index.path) || index.ambiguous || !index.sealed || !/^[0-9a-f]{16}$/.test(index.image) || !Array.isArray(index.links) || index.links.length > 40 ||
+			index.links.some(link => !Array.isArray(link) || link.length !== 2 || !path.isAbsolute(link[0]) || typeof link[1] !== "string")) throw new Error("unsealed input image");
+		if (!captured.has(index.image)) captured.set(index.image, capture(index.image));
+		images.set(index.path, { ...await captured.get(index.image)!, links: index.links.map(([path, target]) => ({ kind: "symlink", path, target, targetDigest: sha256Digest(target) })) });
+	}
+	return images;
+}
+
+/** Private changes stand over the host state they replace; unchanged read images have no effects to commit. */
+async function privateCommits(storage: string, since: number, candidates: Iterable<string>) {
+	const { upper, deleted } = await privateBranch(storage), stat = (target: string) => lstat(target, { bigint: true }).catch(() => undefined);
+	const changes: SandboxWorkspaceChange[] = [], unrepresentable: string[] = [];
+	for (const target of new Set([...candidates].map(name => path.posix.resolve(name)))) {
 		const copy = path.join(upper, target), [own, native] = await Promise.all([stat(copy), stat(target)]);
 		if (!own && !(native && deleted(target)) || own?.isDirectory() && native?.isDirectory()) continue;
 		const file = async (at: string, info?: Awaited<ReturnType<typeof stat>>) => info?.isFile() ? { content: await readFile(at), mode: Number(info.mode) & 0o7777, modified: String(info.mtimeNs) } : undefined;
@@ -2652,13 +2726,14 @@ async function runSpawn(
 		readonly signal?: AbortSignal;
 		readonly timeoutSeconds?: number;
 		readonly onOutput?: (event: BufferedOutput) => void;
+		readonly outputRoot?: string;
 		readonly onOutputEndpoints?: (endpoints: readonly [string, string]) => void;
 		readonly inheritedFiles?: readonly number[];
 		readonly onControl?: (channel: import("node:stream").Duplex, wake: () => boolean) => (() => void | Promise<void>);
 	},
 ): Promise<SpawnOutcome> {
 	options.signal?.throwIfAborted();
-	const channels = options.onOutputEndpoints ? await acquireOutputChannels(options.signal) : undefined;
+	const channels = options.onOutputEndpoints ? await acquireOutputChannels(options.outputRoot!, options.signal) : undefined;
 	try {
 		options.signal?.throwIfAborted();
 		if (channels) options.onOutputEndpoints!([channels.entries[0]!.endpoint, channels.entries[1]!.endpoint]);
@@ -2715,21 +2790,22 @@ async function runSpawn(
 }
 
 /** Own the write endpoints before inheritance; a running tracer may replace its descriptors. */
-async function acquireOutputChannels(signal?: AbortSignal) {
-	const temporary = os.tmpdir();
-	const root = await mkdtemp(path.join(Buffer.byteLength(path.join(temporary, "pi-process-output-XXXXXX", "2")) < 104 ? temporary : "/tmp", "pi-process-output-"));
+async function acquireOutputChannels(parent: string, signal?: AbortSignal) {
+	const root = await mkdtemp(path.join(parent, "pi-process-output-")), directory = await open(root, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY)
+		.catch(async error => { await rm(root, { recursive: true, force: true }); throw error; });
 	const entries: { server: net.Server; source: net.Socket; target?: net.Socket; endpoint: string }[] = [];
 	const releaseWriters = () => { for (const entry of entries) entry.target?.destroy(); };
 	const dispose = async () => {
 		releaseWriters();
 		for (const entry of entries) entry.source.destroy();
 		await Promise.all(entries.map(({ server }) => new Promise<void>((resolve) => server.close(() => resolve()))));
+		await directory.close();
 		await rm(root, { recursive: true, force: true });
 	};
 	try {
 		for (const fd of [1, 2]) {
 			signal?.throwIfAborted();
-			const socketPath = path.join(root, String(fd));
+			const socketPath = `/proc/self/fd/${directory.fd}/${fd}`;
 			const entry = { server: net.createServer({ pauseOnConnect: true }), source: new net.Socket({ signal }), endpoint: "" } as typeof entries[number];
 			entries.push(entry);
 			entry.source.on("error", () => undefined); // Abort may precede the stream-drain observer.

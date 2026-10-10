@@ -25,7 +25,7 @@ async function account(timings: readonly TimingReceipt[]) {
 			for (const [index, timing] of timings.entries()) {
 				const decision = await decide.call(backend, { id: `clock:${index}`, sequence: index + 1, pid: timing.pid,
 					tracerPid: 1, sourceRoot, scope }, scope);
-				expect(decision).toMatchObject({ kind: "continue", repeat: "launch" });
+				expect(decision).toMatchObject({ kind: "continue", repeat: "executable" });
 				if (decision.kind !== "continue") throw new Error("unexpected replay");
 				expect(decision.observeCompletion, "accounting must not request extra native observations").toBeUndefined();
 				decision.observeTiming!(timing);
@@ -133,7 +133,7 @@ describe("held native computation accounting", () => {
 			processComputation: (session: unknown, startedAt: number, completedAt: number, pids?: readonly number[], preparation?: TimelineInterval) => TimelineInterval;
 		};
 		const computations: TimelineDependency[] = [], source = new TimelineInterval(200, 300), native = new TimelineInterval(20, 50);
-		const session = { computations, metrics: emptyWorldReuseMetrics(), signal: new AbortController().signal };
+		const session = { computations, completedWrites: new Map(), metrics: emptyWorldReuseMetrics(), signal: new AbortController().signal };
 		const work = { computation: native };
 		let now = 0;
 		const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
@@ -141,7 +141,7 @@ describe("held native computation accounting", () => {
 			now = 10; TimelineInterval.own(new TimelineInterval(0, 10)); return processPrototype();
 		});
 		const acquired = vi.spyOn(internal, "acquireProcessResult").mockImplementation(async () => {
-			now = 20; return hit ? { plan: { kind: "completed_replay" } } : { work };
+			now = 20; return hit ? { plan: { kind: "completed_replay", certificate: processCertificate(processPrototype()) } } : { work };
 		});
 		const replay = vi.spyOn(internal, "replay").mockImplementation(async () => {
 			now = 50; computations.push({ computation: source, reused: true }); return { kind: "hit" };
