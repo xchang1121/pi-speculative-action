@@ -146,9 +146,12 @@ describe("preset command preparation", () => {
 			const prepared = first.actions[0]!;
 			expect(prepared.mode).toBe(preset);
 			await controller.source.onAdmitted!({ proposalID: first.id, actionID: prepared.id, feedback: prepared.feedback });
+			if (native) await controller.source.onSettled!({ feedback: prepared.feedback,
+				settlement: { observation: "unobserved", cause: { stage: "execution", code: "execution_failed" } } } as Parameters<NonNullable<typeof controller.source.onSettled>>[0]);
 			const next = await observe("write", { path: "src/a.ts", content: "changed again" });
 			if (!next || !("actions" in next)) throw new Error("missing next command preparation");
 			expect(next.actions[0]!.mode).toBe(preset);
+			if (native) expect(next.actions[0]!.operation).toBe(operation);
 		} finally { await controller.dispose(); }
 	});
 });

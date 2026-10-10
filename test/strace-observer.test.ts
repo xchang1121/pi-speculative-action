@@ -14,7 +14,7 @@ const STAT_DIGEST = filesystemObservationDigest({
 });
 
 /** Owns a complete per-PID transcript, including its filesystem lifetime. */
-async function observe(processes: Record<number, readonly string[]>, options?: StraceObservationOptions, terminated = true) {
+async function observe(processes: Record<string, readonly string[]>, options?: StraceObservationOptions, terminated = true) {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-strace-observer-"));
 	const prefix = path.join(root, "process");
 	try {
@@ -27,6 +27,20 @@ async function observe(processes: Record<number, readonly string[]>, options?: S
 }
 
 describe("strace provenance decoder", () => {
+	test("requires an unexecuted frontier and transferable prior process state", async () => {
+		for (const syscall of ["getrandom", "clone", "prlimit64", "read"]) for (const state of ["entry", "completed", "wrong-fd", "identity", "signal", "child"]) {
+			const lines = [`100 ${EXEC}`];
+			if (state === "identity") lines.push("100 getpid() = 100");
+			if (state === "signal") lines.push("100 --- SIGUSR1 {si_signo=SIGUSR1} ---");
+			if (state === "child") lines.push("100 clone(child_stack=NULL, flags=SIGCHLD) = 101", "101 +++ exited with 0 +++");
+			lines.push(`100 ${syscall}(${syscall === "read" ? "3<pipe:[91]>, " : ""}${state === "completed" ? ") = 0" : ""}`);
+			const frozen = { pid: 100, syscall, fd: state === "wrong-fd" ? 63 : syscall === "read" ? 3 : -1, bytes: Buffer.byteLength(lines.join("\n")) };
+			const result = await observe({ stream: lines }, { frozen }, false);
+			expect(result.complete, `${syscall}:${state}:${result.incompleteReasons.join(",")}`).toBe(state === "entry");
+			expect(result.taints).toEqual(expect.arrayContaining(["clock", "random"]));
+		}
+	});
+
 	test.for(["ENOENT", "ENOTDIR"])("retains %s only when every lookup of that path failed that way", async (failure) => {
 		const missing = `newfstatat(AT_FDCWD, "/work/module.js/package.json", 0x0, 0) = -1 ${failure} (lookup failed)`;
 		const target = { path: "/work/module.js/package.json", role: "input" };

@@ -29,8 +29,7 @@ function fixture(certificate: ProcessProvenanceCertificate = unusable, source: "
 				queue: { eof: false, bytes: 6, capacity: 4096, producer: "live" } } } } } : {}) };
 	const observe = (next = prototype, context = invocation) => internal.handoffs.observe(processWeakKey(next), next.executablePath, scope, context, 6000)!;
 	const binding = observe(), controller = new AbortController();
-	const session = { sourceRoot: "/workspace", scope, nestedProducer: SPECULATIVE_PRODUCER, projection: { toPhysical: (value: string) => value }, preparedResults: 0, preparedInputSeeds: 0, closedInputFailures: 0,
-		closedInputFailureKeys: new Set(),
+	const session = { sourceRoot: "/workspace", scope, nestedProducer: SPECULATIVE_PRODUCER, projection: { toPhysical: (value: string) => value }, preparedResults: 0, preparedInputSeeds: 0,
 		workspace: { structure: { capture: vi.fn(async () => ({})) } }, signal: controller.signal, computations: [], metrics: { ...emptyWorldReuseMetrics() } };
 	const describe = vi.spyOn(internal, "prototype").mockResolvedValue(prototype);
 	const execute = vi.spyOn(internal, "executeRequest").mockImplementation(async () => ({
@@ -43,28 +42,21 @@ function fixture(certificate: ProcessProvenanceCertificate = unusable, source: "
 }
 
 describe("native preparation evidence", () => {
-	it("retires repeated tainted preparation without reviving it on identical measured launches", async () => {
+	it("keeps a failed launch available for input-aware scheduling and subsequent preparation", async () => {
 		const test = fixture();
 		try {
 			test.session.metrics.lastError = "tainted:unsupported_syscall,mutable_input; syscalls:fcntl; dependency:mutable:/tmp/jest/input";
 			await expect(test.run()).rejects.toThrow("bound process preparation produced no reusable result: tainted:unsupported_syscall,mutable_input; syscalls:fcntl; dependency:mutable:/tmp/jest/input");
-			expect(test.binding.available).toBe(false);
-			for (let edit = 0; edit < 5; edit++) {
-				expect(test.observe()).toBe(test.binding);
-				await expect(test.run()).rejects.toThrow("binding is unavailable");
-			}
+			expect(test.binding.available).toBe(true);
+			expect(test.observe()).toBe(test.binding);
 			expect(test.execute).toHaveBeenCalledOnce();
-			// A changed launch environment has new proof identity and earns its own probe.
-			const next = processPrototype({ environment: { MODE: "changed" } });
-			const changed = test.observe(next, { ...test.invocation, environment: { MODE: "changed" } });
-			test.describe.mockResolvedValue(next);
 			test.execute.mockResolvedValue({ kind: "executed", reusable: true, exit: { kind: "code", code: 0 } });
-			await expect(test.run(changed)).resolves.toMatchObject({ exit: { code: 0 } });
-			expect(changed.available).toBe(true);
+			await expect(test.run()).resolves.toMatchObject({ exit: { code: 0 } });
+			expect(test.execute).toHaveBeenCalledTimes(2);
 		} finally { test.close(); }
 	});
 
-	it.each([false, true])("retires closed-input parent and child failures only after both seal (incompleteChild=%s)", async incompleteChild => {
+	it.each([false, true])("keeps parent and child launches after failed preparation (incompleteChild=%s)", async incompleteChild => {
 		const test = fixture();
 		const childPrototype = processPrototype({ argv: ["tool", "child"] }), context = { ...test.invocation, args: ["child"] };
 		const childBinding = test.observe(childPrototype, context), key = processWeakKey(childPrototype);
@@ -80,12 +72,8 @@ describe("native preparation evidence", () => {
 		});
 		try {
 			await expect(test.run()).rejects.toThrow("bound process preparation produced no reusable result");
-			expect(test.session.closedInputFailures).toBe(2);
-			expect(test.binding.available).toBe(false);
-			expect(childBinding.available).toBe(false);
-			for (const retained of [producer, otherSession, differentLaunch]) expect(retained.available).toBe(true);
+			for (const retained of [test.binding, childBinding, producer, otherSession, differentLaunch]) expect(retained.available).toBe(true);
 			expect(test.observe()).toBe(test.binding);
-			await expect(test.run()).rejects.toThrow("binding is unavailable");
 			expect(test.execute).toHaveBeenCalledOnce();
 		} finally { test.close(); }
 	});
@@ -99,7 +87,6 @@ describe("native preparation evidence", () => {
 		});
 		try {
 			await expect(test.run()).rejects.toThrow("produced no reusable result");
-			expect(test.session.closedInputFailures).toBe(1);
 			expect(test.observe()).toBe(test.binding);
 			expect(test.binding.available).toBe(true);
 			test.execute.mockResolvedValue({ kind: "executed", reusable: true, exit: { kind: "code", code: 0 } });
@@ -174,7 +161,6 @@ describe("native preparation evidence", () => {
 		});
 		try {
 			await expect(test.run()).resolves.toMatchObject({ exit: { code: 0 } });
-			expect(test.session.closedInputFailures).toBe(1);
 			expect(test.binding.available).toBe(true);
 		} finally { test.close(); }
 	});

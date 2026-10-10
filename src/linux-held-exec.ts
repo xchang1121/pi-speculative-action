@@ -200,6 +200,8 @@ export type HeldExecDecision = { readonly observeTiming?: (timing: HeldExecTimin
 	| { readonly kind: "continue"; readonly repeat?: "launch" | "executable"; readonly observeCompletion?: (durationMs: number | undefined, clock?: HeldExecClock) => void | Promise<void> }
 	| ({
 			readonly kind: "replay";
+			/** Release a reservation only when the native peer has definitely performed no adoption effects. */
+			readonly settle?: (consumed: boolean) => void;
 			readonly output: readonly { readonly fd: 1 | 2; readonly data: Buffer }[];
 			readonly resourceEvents?: readonly { readonly fd: number; readonly kind: ResourceTransitionKind; readonly data: Buffer; readonly requested?: number }[];
 			/** Applied after commit, before output. The caller owns predecessor proof and serialization of every OFD sharer. */
@@ -437,6 +439,7 @@ export class LinuxHeldExecBoundary {
 			}
 			if (!socket.destroyed) socket.end(active?.failure ? "F\n" : "C\n");
 		} finally {
+			if (decision?.kind === "replay") decision.settle?.(prepared);
 			if (active && decision?.observeTiming) try {
 				decision.observeTiming({ requestedAt, completedAt: completedAt ?? performance.now(), barrier: active.barrier, outcome,
 					...(committedAt !== undefined ? { committedAt } : {}), ...(native ? { native } : {}) });

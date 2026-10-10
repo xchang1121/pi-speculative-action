@@ -48,14 +48,14 @@ function fixture(input: { states?: string[]; reports?: string[]; replies?: numbe
 }
 
 describe("native suspension frontier polling", () => {
-	it("waits through CPU and non-I/O states, then retries a completed ACK write before capturing the read frontier", async () => {
+	it("arms a native request during CPU work and retries a safe decline at the next frontier", async () => {
 		const test = fixture({ states: ["running\n", "39 0x0\n", "1 0x4\n", "0 0x3\n"], replies: [0, 123] });
 		try {
 			const captured = await test.run();
 			expect(captured?.pid).toBe(123);
 			expect(captured?.reply.readInt32LE(0)).toBe(123);
 			expect(test.channel.requests).toEqual([123, 123]);
-			expect(test.pauses).toEqual([10, 10, 10]);
+			expect(test.pauses).toEqual([10]);
 		} finally { test.close(); }
 	});
 
@@ -69,12 +69,12 @@ describe("native suspension frontier polling", () => {
 		} finally { test.close(); }
 	});
 
-	it("stops transient non-I/O polling at cancellation without sending a native request", async () => {
-		const test = fixture({ states: ["39 0x0\n"] });
+	it("does not send another request after cancellation during a safe decline", async () => {
+		const test = fixture({ states: ["39 0x0\n"], replies: [0] });
 		test.onPause(() => { if (test.pauses.length === 2) test.join.abort(); });
 		try {
 			await expect(test.run()).resolves.toBeUndefined();
-			expect(test.channel.requests).toEqual([]);
+			expect(test.channel.requests).toEqual([123, 123]);
 			expect(test.pauses).toEqual([10, 10]);
 		} finally { test.close(); }
 	});

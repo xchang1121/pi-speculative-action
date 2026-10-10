@@ -553,8 +553,9 @@ export async function observeStrace(
 		for (const [pid, group] of groups) {
 			if (options.frozen?.pid === pid) {
 				const pending = group.lines.at(-1) ?? "";
-				frontier = /^(?:read|readv|write|writev|sendto|recvfrom|sendmsg|recvmsg)$/.test(options.frozen.syscall) &&
-					new RegExp(`^${options.frozen.syscall}\\(${options.frozen.fd}(?:<|,)`).test(pending) && !/\)\s+=/.test(pending);
+				frontier = (options.frozen.fd === -1 ? /^(?:getrandom|getpid|gettid|clock_gettime|prlimit64|clone|clone3|fork|vfork|poll|ppoll|select|pselect6|nanosleep|clock_nanosleep|futex|openat)$/.test(options.frozen.syscall) :
+					/^(?:read|readv|write|writev|sendto|recvfrom|sendmsg|recvmsg)$/.test(options.frozen.syscall)) &&
+					new RegExp(`^${options.frozen.syscall}\\(${options.frozen.fd === -1 ? "" : `${options.frozen.fd}(?:<|,)`}`).test(pending) && !/\)\s+=/.test(pending);
 				if (frontier) { group.lines.pop(); group.order?.pop(); }
 				if (group.lines.some(line => /^--- /.test(line))) frontier = false;
 			}
@@ -823,7 +824,7 @@ function continuationCall(line: TraceLine, initial: boolean): boolean {
 	if (call === "fcntl" || call === "fcntl64") return fd >= 3 || line.args[1] !== "F_SETFD";
 	if (/^dup[23]$/.test(call)) return Number.parseInt(line.args[1] ?? "", 10) >= 3;
 	if (call === "mmap") return (line.args[3] ?? "").split("|").every(flag => /^(?:MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED|MAP_DENYWRITE|MAP_STACK)$/.test(flag));
-	if (call === "madvise") return line.args[2] === "MADV_DONTNEED";
+	if (call === "madvise") return line.args[2] === "MADV_DONTNEED" || line.args[2] === "MADV_NOHUGEPAGE";
 	if (call === "arch_prctl") return /^ARCH_(?:SET|GET)_(?:FS|GS)$/.test(line.args[0] ?? "");
 	return /^(?:read|pread64|readv|write|writev|pwrite64|lseek|open|openat|access|faccessat|newfstatat|fstat|stat|lstat|statx|readlink|readlinkat|brk|mprotect|munmap|set_tid_address|set_robust_list|rseq|prlimit64|getrandom|rt_sigaction|rt_sigprocmask|sigaltstack|dup|poll|ppoll|select|pselect6|sendto|recvfrom|sendmsg|recvmsg|shutdown|flock|rename|renameat|renameat2|unlink|unlinkat|link|linkat|mkdir|mkdirat|rmdir|chmod|fchmod|fchmodat|truncate|ftruncate)$/.test(call);
 }
