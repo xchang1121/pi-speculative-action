@@ -277,10 +277,9 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	const waitTrace = [...toolWaits].map(([id, { startedAt, completedAt }]) => ({ id, startedAt: performance.timeOrigin + startedAt,
 		completedAt: completedAt === undefined ? undefined : performance.timeOrigin + completedAt }));
 	const { calls: slowCalls, ...slowCallCoverage } = slowCallReport(events, waitTrace);
-	const computation = input.speculationEnabled
-		? { toolComputeMs: summary.tasks ? summary.toolComputeMs : undefined, hiddenComputeMs: summary.tasks ? summary.hiddenComputeMs : undefined,
-			hiddenComputeIncomplete: summary.hiddenComputeIncomplete }
-		: { toolComputeMs: undefined, hiddenComputeMs: 0 }; // SDK events include preparation and delivery; only raw waits are measured here.
+	// SDK-only runs expose raw waits; complete calculation diagnostics come from extension task events.
+	const computation = input.speculationEnabled && summary.tasks ? summary : { toolComputeMs: undefined,
+		hiddenComputeMs: input.speculationEnabled ? undefined : 0, hiddenComputeIncomplete: undefined, adoptionWaitMs: undefined };
 	const changedFiles = lines((await command("git", ["-C", task.workspace, "diff", "--name-only"])).stdout);
 	const goldFiles = patchFiles(task.row.patch);
 	const testPatchFiles = patchFiles(task.row.test_patch);
@@ -301,7 +300,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			drafter: `${drafter.provider}/${drafter.id}`,
 			timingScope: "setup, Agent prompt, terminal settlement, extension shutdown",
 			monotonicTimeOrigin: performance.timeOrigin,
-			timingModel: "actor_issue_hidden_compute_v2",
+			timingModel: "actor_issue_boundary_compute_v3",
 			patternState: input.patternState ?? "isolated-per-run",
 			executionBoundary: "installed extension routes",
 			executionRoutes: finalMetrics ? { ...finalMetrics[1], primaryIDs: [...finalMetrics[1].primaryIDs] } : null,
@@ -318,6 +317,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			toolWaitMs,
 			slowCallCoverage,
 			toolComputeMs: computation.toolComputeMs,
+			adoptionWaitMs: computation.adoptionWaitMs,
 			hiddenComputeMs: computation.hiddenComputeMs,
 			hiddenComputeIncomplete: computation.hiddenComputeIncomplete,
 			toolSpeedup: computation.hiddenComputeMs === undefined ? null : toolSpeedup({ ...computation, hiddenComputeMs: computation.hiddenComputeMs }),

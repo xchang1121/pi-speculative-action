@@ -3,7 +3,7 @@ import { deferred } from "./async.ts";
 import { TaskTimeline, TimelineInterval, toolSpeedup, normalizeTimelineComputation, TIMELINE_COMPUTATION_LIMITS } from "../src/task-timing.ts";
 
 describe("consumed calculation and time hidden before Actor issue", () => {
-	it("records calculation segments without clocks or receipts for control work", async () => {
+	it("records execution boundaries and diagnoses the remaining control wait", async () => {
 		let now = 0;
 		const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
 		try {
@@ -22,10 +22,23 @@ describe("consumed calculation and time hidden before Actor issue", () => {
 			expect(graph.nodes.flatMap(node => node.inputs ?? []).some(input => input.overhead)).toBe(false);
 			expect(new TaskTimeline(0).recordTool(evaluation.computation, 100_000)).toMatchObject({ toolComputeMs: 70, hiddenComputeMs: 40 });
 			expect(new TaskTimeline(0).recordTool(TimelineInterval.restore(graph)!, 100_000, true)).toMatchObject({ toolComputeMs: 70, hiddenComputeMs: 70 });
+			expect(new TaskTimeline(0).recordCall([{ computation: evaluation.computation }], 0, now))
+				.toMatchObject({ toolComputeMs: 70, hiddenComputeMs: 0, adoptionWaitMs: 955 });
 			clock.mockClear();
 			await TimelineInterval.outside(() => { now += 1000; });
 			expect(clock).not.toHaveBeenCalled();
 		} finally { clock.mockRestore(); }
+	});
+	it.each([0, 60, 120])("separates control wait from a producer finishing at %s", end => {
+		const producer = new TimelineInterval(0, end), timeline = new TaskTimeline(40);
+		const roots = [{ computation: new TimelineInterval(40, 140, [{ computation: producer, reused: true },
+			{ computation: new TimelineInterval(40, 140), overhead: true }]) }];
+		expect(timeline.recordCall(roots, 40, 140)).toMatchObject({ toolComputeMs: end, hiddenComputeMs: Math.min(40, end), adoptionWaitMs: 140 - Math.max(40, end) });
+		const restored = TimelineInterval.restore(TimelineInterval.serialize(producer))!;
+		expect(timeline.recordCall([{ computation: restored, reused: true }], 50, 150).adoptionWaitMs).toBe(150 - Math.max(50, end));
+		expect(timeline.measure(150).adoptionWaitMs).toBe(150 - Math.max(40, end));
+		expect(timeline.recordCall([{ computation: TimelineInterval.unknownReuse("old"), reused: true }], 150, 160).adoptionWaitMs).toBeUndefined();
+		expect(timeline.measure(160).adoptionWaitMs).toBeUndefined();
 	});
 
 	it("keeps nested and overlapping control work outside every enclosing calculation after failure", async () => {
@@ -427,9 +440,9 @@ describe("bounded persisted computation evidence", () => {
 		const original = new TimelineInterval(100, 200), graph = TimelineInterval.serialize(original)!;
 		const foreign = TimelineInterval.restore({ ...graph, nodes: graph.nodes.map(node => ({ ...node,
 			clock: "earlier-process", timeOrigin: offset === undefined ? undefined : performance.timeOrigin + offset })) })!;
-		const timing = new TaskTimeline(0).recordTool(foreign, 150, true);
+		const timing = new TaskTimeline(0).recordCall([{ computation: foreign, reused: true }], 150, 250);
 		expect(timing).toEqual({ toolComputeMs: 100, hiddenComputeMs: offset === undefined || offset > 0 ? 0 : offset < 0 ? 100 : 50,
-			reused: true, ...(offset === undefined ? { hiddenComputeIncomplete: true } : {}) });
+			reused: true, ...(offset === undefined ? { hiddenComputeIncomplete: true } : { adoptionWaitMs: offset === 0 ? 50 : 100 }) });
 		expect(TimelineInterval.serialize(foreign)?.nodes[0]?.timeOrigin).toBe(offset === undefined ? undefined : performance.timeOrigin + offset);
 	});
 

@@ -263,6 +263,8 @@ export interface ToolComputationTiming {
 	readonly toolComputeMs?: number;
 	/** Successfully reused calculation completed before this Actor call was issued. */
 	readonly hiddenComputeMs: number;
+	/** Actor wait outside consumed execution boundaries, including validation and delivery; never part of T/(T-H). */
+	readonly adoptionWaitMs?: number;
 	/** A successful receipt, even when no calculation was hidden before the call. */
 	readonly reused?: true;
 	/** The recorded hidden time is a lower bound because original timing evidence is unavailable. */
@@ -312,7 +314,8 @@ export function toolSpeedup({ toolComputeMs, hiddenComputeMs, hiddenComputeIncom
 }
 
 export class TaskTimeline {
-	private readonly toolWaits: number[] = [];
+	private readonly toolWaits: { startedAt: number; completedAt: number }[] = [];
+	private adoptionWaits: TimelineInterval[] | undefined = [];
 	private toolComputeMs: number | undefined = 0;
 	private hiddenComputeMs = 0;
 	private hiddenComputeIncomplete = false;
@@ -322,19 +325,19 @@ export class TaskTimeline {
 
 	/** Raw latency for diagnosis only; it is never the computation-ratio denominator. */
 	startToolWait(startedAt: number): (completedAt: number) => void {
-		const end = this.toolWaits.push(startedAt, Number.MAX_VALUE) - 1;
-		return completedAt => { this.toolWaits[end] = Math.min(this.toolWaits[end]!, metric(completedAt)); };
+		const wait = { startedAt, completedAt: Number.MAX_VALUE }; this.toolWaits.push(wait);
+		return completedAt => { wait.completedAt = Math.min(wait.completedAt, metric(completedAt)); };
 	}
 
-	recordTool(computation: TimelineInterval, issuedAt: number, reused = false): ToolComputationTiming {
-		return this.recordCall([{ computation, reused }], issuedAt);
-	}
+	recordTool(computation: TimelineInterval, issuedAt: number, reused = false): ToolComputationTiming { return this.recordCall([{ computation, reused }], issuedAt); }
 
 	/** Exactly one settled Actor call. Shared work counts once here; an independent later reuse counts again. */
-	recordCall(roots: readonly TimelineDependency[], issuedAt: number): ToolComputationTiming {
+	recordCall(roots: readonly TimelineDependency[], issuedAt: number, completedAt?: number): ToolComputationTiming {
 		const selected = new Map<string, { computation: TimelineInterval; flags: number; producer?: ComputationProducer | null }>();
 		const visited = new Map<TimelineInterval, number>(), groups = new ComputationGroups();
 		let complete = true, hiddenComputeIncomplete = !Number.isFinite(issuedAt);
+		let adoptionComplete = Number.isFinite(issuedAt) && completedAt !== undefined && Number.isFinite(completedAt) && completedAt >= issuedAt;
+		const observed: TimelineInterval[] = [];
 		const visit = (input: TimelineDependency, inheritedReuse = false): void => {
 			if (input.computeUncertain) { complete = false; if (inheritedReuse || input.reused) hiddenComputeIncomplete = true; }
 			if (input.overhead) return;
@@ -372,6 +375,8 @@ export class TaskTimeline {
 			const owner = JSON.stringify([groups.owner(computationIdentity(computation)), computationClock(computation)]);
 			const origin = computationTimeOrigin(computation);
 			const cutoff = computationClock(computation) === identityNamespace ? issuedAt : origin === undefined ? NaN : issuedAt + (performance.timeOrigin - origin);
+			if (priorMs > 0 || all.length > 0 && !Number.isFinite(cutoff)) adoptionComplete = false;
+			if (adoptionComplete) observed.push(...all.map(span => ({ startedAt: span.startedAt + issuedAt - cutoff, completedAt: span.completedAt + issuedAt - cutoff })));
 			const hidden = flags & 2 && Number.isFinite(cutoff) ? all.filter(span => span.startedAt < cutoff)
 				.map(span => ({ startedAt: span.startedAt, completedAt: Math.min(span.completedAt, cutoff) })) : [];
 			for (const [index, intervals] of [all, hidden].entries()) {
@@ -388,7 +393,10 @@ export class TaskTimeline {
 		for (const [index, groupsByOwner] of grouped.entries()) for (const all of groupsByOwner.values()) totals[index]! += unionDuration(all);
 		for (const spans of attributed.values()) attributeUnion(spans, credit, producerKey);
 		const hiddenByMode = Object.freeze([...modes.values()].map(value => Object.freeze(value)));
+		const adoption = complete && adoptionComplete ? exclusiveIntervals(new TimelineInterval(issuedAt, completedAt!), observed) : undefined;
+		if (adoption) this.adoptionWaits?.push(...adoption); else this.adoptionWaits = undefined;
 		const timing = Object.freeze({ toolComputeMs: complete ? totals[0]! : undefined, hiddenComputeMs: totals[1]!,
+			...(adoption ? { adoptionWaitMs: unionDuration(adoption) } : {}),
 			...(reused ? { reused: true as const } : {}), ...(hiddenComputeIncomplete ? { hiddenComputeIncomplete: true as const } : {}),
 			...(hiddenByMode.length ? { hiddenByMode } : {}) });
 		this.toolComputeMs = this.toolComputeMs !== undefined && timing.toolComputeMs !== undefined ? this.toolComputeMs + timing.toolComputeMs : undefined;
@@ -399,14 +407,12 @@ export class TaskTimeline {
 
 	measure(endedAt: number) {
 		const startedAt = this.startedAt, completedAt = Math.max(startedAt, metric(endedAt));
-		const waits: TimelineInterval[] = [];
-		for (let index = 0; index < this.toolWaits.length; index += 2) {
-			const start = Math.max(startedAt, metric(this.toolWaits[index]!)), end = Math.min(completedAt, metric(this.toolWaits[index + 1]!));
-			if (end > start) waits.push({ startedAt: start, completedAt: end });
-		}
+		const duration = (spans: readonly TimelineInterval[]) => unionDuration(spans.map(span => ({
+			startedAt: Math.max(startedAt, metric(span.startedAt)), completedAt: Math.min(completedAt, metric(span.completedAt)),
+		})).filter(span => span.completedAt > span.startedAt));
 		return Object.freeze({ startedAt, completedAt, toolComputeMs: this.toolComputeMs,
 			hiddenComputeMs: this.hiddenComputeMs, ...(this.hiddenComputeIncomplete ? { hiddenComputeIncomplete: true as const } : {}),
-			toolWaitMs: unionDuration(waits) });
+			...(this.adoptionWaits ? { adoptionWaitMs: duration(this.adoptionWaits) } : {}), toolWaitMs: duration(this.toolWaits) });
 	}
 }
 
@@ -416,9 +422,7 @@ function objectIdentity(object: object): string {
 	return id;
 }
 
-function computationTimeOrigin(computation: TimelineInterval): number | undefined {
-	return computationClock(computation) === identityNamespace ? performance.timeOrigin : timeOrigins.get(computation);
-}
+function computationTimeOrigin(computation: TimelineInterval): number | undefined { return computationClock(computation) === identityNamespace ? performance.timeOrigin : timeOrigins.get(computation); }
 
 function computationClock(computation: TimelineInterval): string { return clocks.get(computation) ?? identityNamespace; }
 
@@ -520,11 +524,10 @@ function exclusiveIntervals(interval: TimelineInterval, shared: readonly Timelin
 }
 
 function unionDuration(intervals: readonly TimelineInterval[]): number {
-	const sorted = [...intervals].sort((left, right) => left.startedAt - right.startedAt || left.completedAt - right.completedAt);
-	let total = 0, start = 0, end = 0;
-	for (const interval of sorted) {
-		if (interval.startedAt > end) { total += end - start; start = interval.startedAt; }
+	let total = 0, end = 0;
+	for (const interval of [...intervals].sort((left, right) => left.startedAt - right.startedAt)) {
+		total += Math.max(0, interval.completedAt - Math.max(end, interval.startedAt));
 		end = Math.max(end, interval.completedAt);
 	}
-	return total + end - start;
+	return total;
 }

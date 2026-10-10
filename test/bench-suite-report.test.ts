@@ -127,7 +127,7 @@ describe("ablation suite report", () => {
 			await expect(import("../bench/run.ts")).rejects.toThrow("Benchmark failed:");
 			expect(phases).toEqual(["prompt", "shutdown", "dispose"]);
 			const { metadata, summary, traces } = JSON.parse(files.get(path.resolve("offline-result.json"))!);
-			expect(metadata).toMatchObject({ actor: "offline/model", drafter: "offline/model", drafterMaxDepth: 2, monotonicTimeOrigin: performance.timeOrigin });
+			expect(metadata).toMatchObject({ actor: "offline/model", drafter: "offline/model", drafterMaxDepth: 2, monotonicTimeOrigin: performance.timeOrigin, timingModel: "actor_issue_boundary_compute_v3" });
 			const configuration = JSON.parse(files.get(path.resolve("offline-task", "agent", "speculative-action.json"))!);
 			expect(configuration.patternAware).toEqual(reported ? { enabled: true, presets: ["reported-files", "edited-file"] } : { enabled: false });
 			if (reported) expect(metadata.patternPresets).toEqual(["reported-files", "edited-file"]);
@@ -234,9 +234,10 @@ describe("ablation suite report", () => {
 	});
 
 	it("distinguishes fully hidden computation from an empty task and pools amounts before dividing", () => {
-		const reused = run("reused", 1, { toolComputeMs: 90, hiddenComputeMs: 90, toolWaitMs: 12 });
+		const reused = run("reused", 1, { toolComputeMs: 90, hiddenComputeMs: 90, toolWaitMs: 12, adoptionWaitMs: 12 });
 		const empty = run("empty", 1, { toolComputeMs: 0, hiddenComputeMs: 0, toolWaitMs: 0 });
 		expect(summarizeSuite([reused, empty])).toMatchObject({ unmeasuredRuns: 0,
+			diagnostics: { adoptionWaitMeasuredRuns: 1, adoptionWaitMs: 12 },
 			pooled: { toolComputeMs: 90, hiddenComputeMs: 90, unhiddenComputeMs: 0, toolSpeedup: null, fullyHidden: true },
 			byInstance: { empty: { toolSpeedup: null, fullyHidden: false }, reused: { toolSpeedup: null, fullyHidden: true } },
 		});

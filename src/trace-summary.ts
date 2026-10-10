@@ -47,7 +47,7 @@ export function emptySpeculativeTraceSummary(cache: SpeculativeCacheSnapshot | P
 		actorFallbacks: 0,
 		hitRate: 0,
 		actorCandidateRejections: {} as Readonly<Record<string, number>>,
-		tasks: 0, toolComputeMs: 0 as number | undefined, toolWaitMs: 0, hiddenComputeMs: 0,
+		tasks: 0, toolComputeMs: 0 as number | undefined, toolWaitMs: 0, hiddenComputeMs: 0, adoptionWaitMs: 0 as number | undefined,
 		hiddenComputeIncomplete: undefined as true | undefined,
 		totalDraftTokens: 0,
 		processReuse: emptyWorldReuseMetrics(), // Inside speculative worlds, never the Actor route.
@@ -84,8 +84,8 @@ export function reduceSpeculativeTrace<SessionID>(
 			break;
 		case "task":
 			next.tasks++;
-			next.toolComputeMs = current.toolComputeMs !== undefined && event.timing.toolComputeMs !== undefined
-				? current.toolComputeMs + metric(event.timing.toolComputeMs) : undefined;
+			for (const key of ["toolComputeMs", "adoptionWaitMs"] as const) next[key] = current[key] !== undefined && event.timing[key] !== undefined
+				? current[key] + metric(event.timing[key]) : undefined;
 			next.toolWaitMs += metric(event.timing.toolWaitMs);
 			next.hiddenComputeMs += metric(event.timing.hiddenComputeMs);
 			next.hiddenComputeIncomplete = current.hiddenComputeIncomplete || event.timing.hiddenComputeIncomplete;

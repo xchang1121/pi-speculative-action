@@ -1697,7 +1697,7 @@ export function makeSpeculativeActionRuntime<
 		const computation = state.session.timeline?.recordCall([
 			{ computation: settlement.provider.toolExecution, reused: !!selection && (selection.match.kind !== "inputs" || !!selection.projectionReused) },
 			...(selection?.projection ? [{ computation: selection.projection, reused: selection.projectionReused }] : []),
-		], actorAction.issuedAt);
+		], actorAction.issuedAt, performance.now());
 		const key = actorAction.actionKey;
 		const settledCandidate = selection?.candidate;
 		const settledCandidateDescriptor = settledCandidate && (adapter.onActorActionSettled || adapter.onEvent)

@@ -69,6 +69,10 @@ async function chainWorld(files: readonly (readonly [string, string])[], loops: 
 				: await host.execute({ turnID, id: turnID, tool: "bash", args: { command: call }, tools }, undefined, () => fixture.coordinator.runWith(
 					{ execute: (request) => route.executor.execute({ ...request, scope: { sessionID: "chain", turnID } }) }, () => fixture.tool.execute(turnID, { command: call })));
 			const ms = performance.now() - started, after = fixture.backend.actorMetrics();
+			const timing = events.filter(event => event.type === "actor_action").at(-1)?.computation;
+			expect(timing).toMatchObject({ toolComputeMs: expect.any(Number), hiddenComputeMs: expect.any(Number), adoptionWaitMs: expect.any(Number) });
+			expect(timing!.toolComputeMs!).toBeGreaterThanOrEqual(timing!.hiddenComputeMs);
+			expect(timing!.adoptionWaitMs!).toBeGreaterThanOrEqual(0); expect(timing!.adoptionWaitMs!).toBeLessThanOrEqual(ms);
 			await host.finishTurn(turnID);
 			return { ms, text: textOutput(result as never), hits: after.hits - before.hits };
 		};

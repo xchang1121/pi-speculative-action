@@ -33,10 +33,9 @@ async function account(timings: readonly TimingReceipt[]) {
 		}, (_bindings, measured) => { dependencies = measured; });
 	} finally { image.mockRestore(); available.mockRestore(); }
 	const reused = new TimelineInterval(200, 240);
-	const timeline = new TaskTimeline(0);
 	const computation = new TimelineInterval(0, 120, [...dependencies, { computation: reused, reused: true }]);
-	const result = timeline.recordTool(computation, performance.now());
-	const later = new TaskTimeline(0).recordTool(computation, performance.now(), true);
+	const result = new TaskTimeline(0).recordTool(computation, performance.now());
+	const later = new TaskTimeline(0).recordTool(TimelineInterval.restore(TimelineInterval.serialize(computation))!, performance.now(), true);
 	return { dependencies, result, later };
 }
 
@@ -179,33 +178,26 @@ describe("held native computation accounting", () => {
 		} finally { prototype.mockRestore(); acquire.mockRestore(); clock.mockRestore(); }
 	});
 
-	it("excludes a sibling barrier from every observed clock and clips replaced images", async () => {
-		const { dependencies, result } = await account([
+	it.each(["inspection", "none", "descriptors"] as const)("unions native execution with optimistic %s control boundaries", async barrier => {
+		const { dependencies, result, later } = await account([
 			{ pid: 10, requestedAt: 10, completedAt: 20, barrier: "inspection", outcome: "continued", native: { startedAt: 20, completedAt: 100 } },
 			{ pid: 20, requestedAt: 30, completedAt: 40, barrier: "inspection", outcome: "continued", native: { startedAt: 40, completedAt: 100 } },
-			{ pid: 10, requestedAt: 50, committedAt: 65, completedAt: 70, barrier: "inspection", outcome: "adopted" },
+			{ pid: 10, requestedAt: 50, committedAt: 65, completedAt: 70, barrier, outcome: "adopted" },
 		]);
 		expect(result).toMatchObject({ toolComputeMs: 120, hiddenComputeMs: 40 });
-		expect(dependencies.filter(input => input.owned).map(input => [input.computation.startedAt, input.computation.completedAt]))
-			.toEqual([[20, 50], [40, 100]]);
+		expect(dependencies).toHaveLength(2);
+		expect(later).toMatchObject({ toolComputeMs: 120, hiddenComputeMs: 120 });
+		expect(later.hiddenComputeIncomplete).toBeUndefined();
 	});
 
-	it.each(["none", "descriptors"] as const)("keeps known hidden computation when %s transport cannot separate sibling computation", async barrier => {
-		const { result, later } = await account([
-			{ pid: 10, requestedAt: 10, completedAt: 20, barrier: "inspection", outcome: "continued", native: { startedAt: 20, completedAt: 100 } },
-			{ pid: 20, requestedAt: 40, committedAt: 50, completedAt: 70, barrier, outcome: "adopted" },
-		]);
-		expect(result).toMatchObject({ toolComputeMs: undefined, hiddenComputeMs: 40 });
-		expect(later, "later reuse cannot credit ambiguous adoption as original computation").toMatchObject({ toolComputeMs: undefined, hiddenComputeMs: 120, hiddenComputeIncomplete: true });
-	});
-
-	it("does not invent a denominator after bounded timing storage saturates", async () => {
-		const { dependencies, result, later } = await account(Array.from({ length: 66 }, (_, index) => ({
-			pid: index + 10, requestedAt: index, completedAt: index + 0.5, barrier: "inspection", outcome: "continued",
+	it.each([66, 130])("retains gaps and complete timing after %s out-of-order observations", async count => {
+		const { dependencies, result, later } = await account(Array.from({ length: count }, (_, index) => ({
+			pid: index + 10, requestedAt: index / 2, completedAt: index / 2 + 0.25, barrier: "inspection", outcome: "continued",
 			...(index === 0 ? { native: { startedAt: 0.5, completedAt: 120 } } : {}),
-		})));
-		expect(dependencies).toHaveLength(66); // 64 pauses, one native clock and one bounded omission envelope.
-		expect(result).toMatchObject({ toolComputeMs: undefined, hiddenComputeMs: 40 });
-		expect(later).toMatchObject({ toolComputeMs: undefined, hiddenComputeMs: 126.5, hiddenComputeIncomplete: true });
+		})).reverse() as TimingReceipt[]);
+		expect(dependencies).toHaveLength(2);
+		expect(result).toMatchObject({ toolComputeMs: 160 - count / 4, hiddenComputeMs: 40 });
+		expect(later).toMatchObject({ toolComputeMs: 160 - count / 4, hiddenComputeMs: 160 - count / 4 });
+		expect(later.hiddenComputeIncomplete).toBeUndefined();
 	});
 });
