@@ -42,7 +42,7 @@ flowchart LR
 | --- | --- |
 | [封存资源](./src/agent-execution-world.ts) / [输入版本](./src/resource-version.ts) | 为绑定的文件工具捕获实际访问的数据，保留内容与路径证明；后续查询复用仍有效的输入，并对本次使用的依赖精确验新。受控 `find/grep` 由 [统一工具绑定](./src/pi-tool-invocation.ts) 让 Actor 与投机使用相同执行器，需显式启用。 |
 | [私有工作区](./src/workspace-sandbox.ts) / [文件事务](./src/workspace-transaction.ts) | 普通 `write/edit` 先在内存事务中执行；需要私有分支时使用 Git 或通过检查的 OverlayFS。文件效果在持锁状态下验证并提交，多步计划可沿私有分支继续执行。 |
-| [Linux 进程](./src/linux-process-world.ts) / [进程后端](./src/linux-process-backend.ts) | 用 Sandlock 隔离执行、strace 记录依赖和效果，再通过证书验证。合格的 x86-64 Linux 使用 [held-exec](./src/linux-held-exec.c) 在子进程边界接管已完成计算或运行中映像。受时钟、随机输入和内核状态的可证明性限制，当前结果按一次性转交管理。 |
+| [Linux 进程](./src/linux-process-world.ts) / [进程后端](./src/linux-process-backend.ts) | 用 Sandlock 隔离执行、strace 记录依赖和效果，再通过证书验证。合格的 x86-64 Linux 使用 [held-exec](./src/linux-held-exec.c) 接管已完成计算，或在支持的系统调用入口转移单线程进程、继续执行后缀。可证明等价的结果在输入不变且生命周期有效时反复复用；含时钟、随机或进程身份等观测的结果只转交一次。 |
 | [ThinkThread](./src/thinkthread/execution-world.ts) | 通过固定 SDK 的快照与 `fs.run` 接入相同分支协议，文件读取可进入公共封存输入层。默认覆盖 `read/ls/write/edit`；原生 `bash/find/grep` 回到 Actor，不嵌套 Linux 进程后端。 |
 
 结果、输入和进程句柄分别保留自己的所有权；跨轮复用仍需作用域与新鲜度证明。结果按容量统一回收，预测结束或计算年龄不会单独撤销接管机会；后台回收保护已进入接管流程的工作，取消和关闭按生命周期排空资源。文件监听与缓存索引只辅助定位和失效处理，不能代替采纳证明。

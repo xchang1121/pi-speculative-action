@@ -26,7 +26,7 @@ import { diffWorkspaceStructures, ExecutionPathProjection, hydrateWorkspaceFileE
 	type WorkspaceTransactionDiff, type WorkspaceTreeEntry } from "./process-observation.ts";
 import { definedProcessEnvironment, type PreparedProcessExecutionRoute, type ProcessExecutionRequest,
 	type ProcessExecutor } from "./process-execution.ts";
-import { isPoisonedEffectCommit } from "./effect-transaction.ts";
+import { EffectCommitFailure, isPoisonedEffectCommit } from "./effect-transaction.ts";
 import { execHostText as execText, resolveHostExecutable } from "./executable-path.ts";
 import { assertNoSymlinkPath, cachedCapture, captureFilesystemEntry, captureStableFile, hashExecutableFile, mapFilesystem, rememberCapture, sameFilesystemIdentity, sharedWalk, walkFilesystemPath } from "./filesystem-evidence.ts";
 import { captureHeldDescriptorInputs, inspectHeldExecProcess, LinuxHeldExecBoundary, listenUnixSocket, resolveLinuxExecHelper, type HeldExecDecision,
@@ -52,7 +52,9 @@ const POLICY_ID = "sandlock-virtual-root-transparent-exec-creation-mode";
 const LEAF_POLICY_ID = "sandlock-virtual-workspace-leaf-creation-mode";
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024, LEARNED_LAUNCHES = 64, MAX_INTERPOSED_MOUNT_BYTES = 512 * 1024;
 const MAX_CONTINUATION_BYTES = 65 * 1024 * 1024;
-const IO_FRONTIERS = new Map([[0, "read"], [1, "write"], [19, "readv"], [20, "writev"], [44, "sendto"], [45, "recvfrom"], [46, "sendmsg"], [47, "recvmsg"]]);
+const PROCESS_FRONTIERS = new Map([[0, "read"], [1, "write"], [19, "readv"], [20, "writev"], [44, "sendto"], [45, "recvfrom"], [46, "sendmsg"], [47, "recvmsg"],
+	[7, "poll"], [23, "select"], [35, "nanosleep"], [39, "getpid"], [56, "clone"], [57, "fork"], [58, "vfork"], [186, "gettid"], [202, "futex"],
+	[228, "clock_gettime"], [230, "clock_nanosleep"], [257, "openat"], [270, "pselect6"], [271, "ppoll"], [302, "prlimit64"], [318, "getrandom"], [435, "clone3"]]);
 const MAX_CAPTURE_BYTES = 512 * 1024 * 1024;
 /** The consumer launcher places a dependency inside its existing traced parent; metadata owns neither one. */
 const processDependencyPIDs = new WeakMap<TimelineDependency, number>();
@@ -191,9 +193,6 @@ interface ActiveSession {
 	/** Completed reusable children and retained live frontiers produced by this preparation. */
 	preparedResults: number;
 	preparedInputSeeds: number;
-	/** Sealed hard failures whose actual descriptor capture supplied no input resources. */
-	closedInputFailures: number;
-	readonly closedInputFailureKeys: Set<Sha256Digest>;
 	readonly sourceRoot: string;
 	/** The workspace's own repository, shown read-only in place of the snapshot's: git reads what the Actor's git reads. */
 	readonly gitDirectory?: string;
@@ -359,7 +358,9 @@ export class LinuxProcessReuseBackend {
 			if (checked.has(certificate.id)) continue;
 			checked.add(certificate.id);
 			const validation = await TimelineInterval.collect(() => validateDynamicDependencyCertificate(certificate.dependencyCertificate, { resolvePath: (logical) => projection.toPhysical(logical),
-				acceptedTaints: [...TRANSFERRED_INPUT_TAINTS] })).then(result => result.output, () => undefined);
+				// A failed run can suppress repeated preparation only while its observed inputs still hold.
+				// This scheduling check grants no result adoption authority.
+				acceptedTaints: certificate.dependencyCertificate.taints })).then(result => result.output, () => undefined);
 			if (validation?.status === "valid") return false;
 		}
 		return true;
@@ -389,6 +390,7 @@ export class LinuxProcessReuseBackend {
 					realShell: options.held.realShell,
 					sourceRoot: path.resolve(options.sourceRoot),
 					descriptors: request => {
+						if (this.handoffs.needsContinuationTracking(request.scope)) return true;
 						if (request.scope) for (const binding of this.handoffs.bindings(request.scope)) {
 							const invocation = this.handoffs.resolveBinding(binding, request.scope);
 							if (invocation && ("trackingOnly" in invocation || invocation.resources?.handles.length) && invocation.sourceRoot === path.resolve(options.sourceRoot)) return true;
@@ -523,8 +525,6 @@ export class LinuxProcessReuseBackend {
 			ownership: new ProcessHandoffOwnership(input.onOperationAdopted, input.acceptOperationScope),
 			preparedResults: 0,
 			preparedInputSeeds: 0,
-			closedInputFailures: 0,
-			closedInputFailureKeys: new Set(),
 			nestedEvidence: [], foldedObservations: [], resumed: new Set(),
 			executionBindings: new Map(),
 			computations: [],
@@ -874,7 +874,7 @@ export class LinuxProcessReuseBackend {
 			return { prototype, before: await session.workspace.structure.capture() };
 		}));
 		const { prototype, before } = captured.output, preparation = captured.computation;
-		const requestsBefore = session.metrics.requests, failuresBefore = session.closedInputFailures, resultsBefore = session.preparedResults, seedsBefore = session.preparedInputSeeds;
+		const resultsBefore = session.preparedResults, seedsBefore = session.preparedInputSeeds;
 		this.add(session, "requests");
 		const observation = { complete: true, paths: [], taints: [], tracedProcesses: 0, incompleteReasons: [] };
 		const result = await this.executeRequest(session, request, executable, invocation.outputRoute, session.metrics.requests, prototype,
@@ -882,20 +882,6 @@ export class LinuxProcessReuseBackend {
 		session.signal.throwIfAborted();
 		if (!invocation.producer && !invocation.resources && result.kind === "executed" && result.reusable === false &&
 			session.preparedResults === resultsBefore && session.preparedInputSeeds === seedsBefore) {
-			// Every request must have sealed a closed-input hard failure. A hit, bypass, missing capture or live-input seed
-			// leaves the counts unequal and permits only a temporary delay. Any reusable child, continuation or live-input seed
-			// preserves the enclosing preparation. Workspace edits alone do not erase these bounded scheduling negatives.
-			if (session.closedInputFailures - failuresBefore === session.metrics.requests - requestsBefore) {
-				this.handoffs.retirePreparation(binding);
-				// Each nested failure was sealed too. Retire only already learned launches with that exact identity;
-				// otherwise selecting the child next would pay again for the failure established by this preparation.
-				if (session.scope) for (const candidate of this.handoffs.bindings(session.scope)) {
-					if (!session.closedInputFailureKeys.has(candidate.key)) continue;
-					const native = this.handoffs.resolveBinding(candidate, session.scope);
-					if (native && !("trackingOnly" in native) && !native.producer && !native.resources && native.sourceRoot === session.sourceRoot)
-						this.handoffs.retirePreparation(candidate);
-				}
-			}
 			throw new Error(`bound process preparation produced no reusable result${session.metrics.lastError ? `: ${session.metrics.lastError.slice(0, 4096)}` : ""}`);
 		}
 		// Only it and what it launched ran here: when its own transaction could not seal (what it launched overlapped it), the session's
@@ -933,7 +919,7 @@ export class LinuxProcessReuseBackend {
 					const binding = acquired.producer?.binding;
 					if (binding && this.handoffs.resolveBinding(binding, session.scope)) session.executionBindings.set(requestID, binding);
 					return result;
-				});
+				}).finally(() => acquired.settle?.(false));
 			}
 			if (!acquired.work) throw new Error("process work reservation failed");
 			this.add(session, "misses");
@@ -955,7 +941,7 @@ export class LinuxProcessReuseBackend {
 		scope: ExecutionScope | undefined,
 		participant: { readonly actor: true } | { readonly ownership: ProcessHandoffOwnership; readonly executablePath: string },
 	): Promise<{ readonly plan?: ReadyProcessPlan; readonly work?: ProcessHandoff; readonly producer?: ProcessHandoff; readonly continuation?: ProcessContinuation;
-		readonly waiting?: readonly TimelineInterval[]; readonly joined: boolean }> {
+		readonly waiting?: readonly TimelineInterval[]; readonly joined: boolean; readonly settle?: (consumed: boolean) => void }> {
 		const waits: { readonly handoff: ProcessHandoff; readonly interval: TimelineInterval }[] = [];
 		const acquired = await this.handoffs.acquire({
 			key: weakKey,
@@ -1022,6 +1008,7 @@ export class LinuxProcessReuseBackend {
 			} };
 		let learning = observation?.learn && !observation.closed && sameScope(observation.scope, scope);
 		const order = observation ? ++observation.sequence : 0;
+		let settle: ((consumed: boolean) => void) | undefined, transferred = false;
 		this.addActor("requests");
 		try {
 			process.signal?.throwIfAborted();
@@ -1091,6 +1078,7 @@ export class LinuxProcessReuseBackend {
 			const acquired = await this.acquireProcessResult(weakKey,
 				(live, excluded) => this.plan(weakKey, executablePath, projection, accepted, undefined, live, excluded, true), process.signal, scope, { actor: true });
 			const { plan, continuation } = acquired;
+			settle = acquired.settle;
 			if (!plan || (plan.certificate.result.continuation ? !continuation || sha256Digest(continuation.image) !== plan.certificate.result.continuation.imageDigest :
 				plan.certificate.result.exit.kind !== "code")) {
 				this.addActor("misses");
@@ -1099,8 +1087,9 @@ export class LinuxProcessReuseBackend {
 				} } : {}) });
 			}
 			const output = loadOutputEvents(plan.artifacts, plan.certificate.result.journal);
-			return measured({
+			const decision = measured({
 				kind: "replay",
+				settle,
 				...(continuation ? { continuation } : { exitCode: (plan.certificate.result.exit as Extract<ExitOutcome, { kind: "code" }>).code }),
 				output,
 				...(plan.certificate.result.resources?.transitions ? { resourceEvents: plan.certificate.result.resources.transitions.map(event =>
@@ -1142,18 +1131,20 @@ export class LinuxProcessReuseBackend {
 						executionMs: plan.certificate.result.observedProcessMs ?? 0, computation });
 				},
 			});
+			transferred = true;
+			return decision;
 		} catch (error) {
 			this.addActor("bypasses");
 			this.setActorError(`actor_child:${errorMessage(error)}`);
 			return measured({ kind: "continue" });
-		}
+		} finally { if (!transferred) settle?.(false); }
 	}
 
 	private async replay(
 		session: ActiveSession,
 		plan: Extract<ProcessReusePlan, { kind: "completed_replay" }>,
 		weakKey: Sha256Digest,
-		acquired: { readonly joined: boolean; readonly producer?: ProcessHandoff; readonly waiting?: readonly TimelineInterval[] },
+		acquired: { readonly joined: boolean; readonly producer?: ProcessHandoff; readonly waiting?: readonly TimelineInterval[]; readonly settle?: (consumed: boolean) => void },
 		inputs?: ReturnType<typeof descriptorInputs>,
 		pid?: number,
 	): Promise<DispatcherResponse> {
@@ -1162,7 +1153,9 @@ export class LinuxProcessReuseBackend {
 			const { artifacts, certificate } = plan;
 			const output = wireOutput(loadOutputEvents(artifacts, certificate.result.journal));
 			await replayFilesystemEffects(this.replayWorkspace, artifacts, certificate.result.journal, session.projection, session.workspace.sandboxRoot,
-				path.join(session.workspace.processRoot, "private"));
+				path.join(session.workspace.processRoot, "private")).then(() => acquired.settle?.(true), error => {
+					acquired.settle?.(!(error instanceof EffectCommitFailure && error.disposition === "recoverable")); throw error;
+				});
 			session.nestedEvidence.push(certificate.dependencyCertificate);
 			this.recordHit(acquired.producer?.scope, acquired.joined, session);
 			recordProcessDependency(session, reusedComputation(certificate, acquired), pid);
@@ -1211,11 +1204,10 @@ export class LinuxProcessReuseBackend {
 			const logicalExecutable = session.projection.toLogical(executable);
 			const { execMounts, executables: interposedExecutables } = interception(session.interposition, executable), image = logicalExecutable;
 			const logicalCwd = session.projection.toLogical(request.cwd);
-			descriptors = createProcessDescriptorCapture(session, traceRoot, request);
+			descriptors = createProcessDescriptorCapture(session, traceRoot, request, !!captureWorkspace && !!ready.imageLibrary);
 			const { inputs, descriptorManifest, descriptorReportPath, descriptorImages, directoryImages, inheritedFiles } = descriptors;
 			const outputPipes = request.outputPipes?.some(Boolean);
-			const live = !!captureWorkspace && !!ready.imageLibrary && inputs.every(input => input.installed !== false) &&
-				inputs.some(input => input.type === "eventfd" || (input.type === "pipe" || input.type === "socket") && !request.resources!.objects[input.image]!.queue!.eof);
+			const live = !!captureWorkspace && !!ready.imageLibrary && inputs.every(input => input.installed !== false);
 			const resourceJournal = live || inputs.some(input => !input.type || input.type === "eventfd" || input.type === "socket" || input.type === "pipe" && (input.flags & 3) !== 0);
 			const streamIdentity = (position: { fd: number; inode: string }) => {
 				const input = inputs.find(input => input.fd === position.fd)!;
@@ -1298,8 +1290,8 @@ export class LinuxProcessReuseBackend {
 						suspensionAttempted = true;
 						if (reply.readInt32LE(0) !== pid) return;
 						const bytes = Number(reply.readBigUInt64LE(16)), begin = Number(reply.readBigUInt64LE(24)) / 1e6 - clockOffset,
-							end = Number(reply.readBigUInt64LE(32)) / 1e6 - clockOffset, fd = reply.readInt32LE(4), syscall = IO_FRONTIERS.get(reply.readInt32LE(8));
-						if (!syscall || !Number.isSafeInteger(bytes) || bytes <= 0 || fd < 0 || begin < processStarted || end < begin || end > performance.now()) throw new Error("invalid native continuation frontier");
+							end = Number(reply.readBigUInt64LE(32)) / 1e6 - clockOffset, fd = reply.readInt32LE(4), syscall = PROCESS_FRONTIERS.get(reply.readInt32LE(8));
+						if (!syscall || !Number.isSafeInteger(bytes) || bytes <= 0 || fd < -1 || begin < processStarted || end < begin || end > performance.now()) throw new Error("invalid native continuation frontier");
 						const file = await open(imagePath, "r");
 						let image: Buffer;
 						try {
@@ -1372,7 +1364,7 @@ export class LinuxProcessReuseBackend {
 				own.written ??= observation.written ?? []; // What its launcher's trace answers for, whether or not its interval overlapped another.
 				for (const pid of observation.resumedInterpositions ?? []) session.resumed.add(pid);
 				if (continuation) continuation = { ...continuation, image: bindContinuationDescriptors(continuation.image, frozen!, inputs,
-					!!request.closeStdin, observation.finalHandles ?? [], descriptorOffsets!) };
+					!!request.closeStdin, observation.finalHandles ?? [], descriptorOffsets ?? []) };
 				// A destroyed OFD has no observable final position. If it escaped into a
 				// surviving message, its position instead needs a kernel observation.
 				if (!continuation && inputs.some(input => input.outside === 0 && observation.retainedDescriptions?.includes(input.alias)))
@@ -1525,11 +1517,10 @@ export class LinuxProcessReuseBackend {
 			const report = await readFile(descriptorReportPath, "utf8").catch(() => ""), ready = /^RUNNING (\d+)\n$/.exec(report);
 			if (ready) {
 				const pid = Number(ready[1]);
-				const state = await readFile(`/proc/${pid}/syscall`, "utf8").catch(() => ""), syscall = Number(state.split(" ", 1)[0]);
+				const state = await readFile(`/proc/${pid}/syscall`, "utf8").catch(() => "");
 				if (!state) return;
-				if (IO_FRONTIERS.has(syscall) && !stop.aborted) {
-					// An observed I/O syscall can finish before the interrupt. Zero leaves the private process running;
-					// a nonzero reply retires it and must follow the existing image or capture-failure checks.
+				if (!stop.aborted) {
+					// The tracer stops at a blocked I/O call or the next admissible syscall entry, before its effects.
 					// Drain a sent request even after Actor cancellation, so a late reply cannot belong to another request.
 					const reply = await requestProcessImage(pid, channel, wake, executionSignal);
 					if (reply.readInt32LE(0) !== 0) return { pid, reply };
@@ -1543,18 +1534,9 @@ export class LinuxProcessReuseBackend {
 	private recordPreparedResult(session: ActiveSession, certificate: ProcessProvenanceCertificate, hasInputResources: boolean): boolean {
 		// A live one-shot result need not be publishable on disk. A retained continuation still owns its frontier;
 		// preparation feedback cannot replace the native contract and dependency checks at its eventual adoption.
-		const acceptedTaints = [...TRANSFERRED_INPUT_TAINTS, ...SAME_CONFINEMENT_TAINTS], evidence = certificate.dependencyCertificate;
-		const reusable = !!certificate.result.continuation || certificateReplayable(certificate, acceptedTaints);
+		const reusable = !!certificate.result.continuation || certificateReplayable(certificate, [...TRANSFERRED_INPUT_TAINTS, ...SAME_CONFINEMENT_TAINTS]);
 		if (hasInputResources) session.preparedInputSeeds++;
 		if (reusable) session.preparedResults++;
-		// Use the inputs actually installed by descriptor capture, not a descriptor-count or EOF guess. A captured
-		// resource can support an earlier live frontier even when the completed result later gains a hard taint.
-		// Output routes alone do not arm this backend's live tier: its capture guard requires an explicit input resource.
-		else if (!hasInputResources && certificate.prototype.stdin.type === "closed" &&
-			(!evidence.complete || evidence.taints.some(taint => !acceptedTaints.includes(taint)))) {
-			session.closedInputFailures++;
-			if (session.closedInputFailureKeys.size < this.store.limits.maxCertificates) session.closedInputFailureKeys.add(certificate.weakKey);
-		}
 		return reusable;
 	}
 
@@ -1626,9 +1608,9 @@ export class LinuxProcessReuseBackend {
 }
 
 /** Owns inherited descriptor images, their final proofs, and every handle opened during preparation. */
-function createProcessDescriptorCapture(session: ActiveSession, traceRoot: string, request: ProcessArguments) {
+function createProcessDescriptorCapture(session: ActiveSession, traceRoot: string, request: ProcessArguments, capture = false) {
 	const inputs = descriptorInputs(request.resources);
-	const needsReport = inputs.length > 0 || request.outputPipes?.some(Boolean);
+	const needsReport = capture || inputs.length > 0 || request.outputPipes?.some(Boolean);
 	const descriptorManifest = needsReport ? path.join(traceRoot, "fd-inputs") : undefined;
 	const descriptorReportPath = needsReport ? path.join(traceRoot, "fd-offsets") : undefined;
 	const descriptorImages = new Map<number, { physical: string; logical: string; workspace: boolean; state: import("node:fs").BigIntStats }>();
@@ -1787,7 +1769,7 @@ function bufferedProcessPrototype(
 	});
 }
 
-function bindContinuationDescriptors(image: Buffer, frontier: { pid: number; fd: number }, inputs: ReturnType<typeof descriptorInputs>, closedInput: boolean,
+function bindContinuationDescriptors(image: Buffer, frontier: { pid: number; fd: number; syscall: string }, inputs: ReturnType<typeof descriptorInputs>, closedInput: boolean,
 	handles: NonNullable<import("./strace-observer.ts").StraceObservation["finalHandles"]>, positions: ReturnType<typeof parseDescriptorOffsets>) {
 	let cursor = 0;
 	const line = () => {
@@ -1815,7 +1797,7 @@ function bindContinuationDescriptors(image: Buffer, frontier: { pid: number; fd:
 		records.set(fd, fields); bound.push(fields.join(" "));
 	}
 	const pending = inputs.find(input => input.fd === Number(records.get(frontier.fd)?.[5]));
-	if (!pending || !["pipe", "socket", "eventfd"].includes(pending.type ?? "") ||
+	if (frontier.fd >= 0 && !pending && !([1, 2].includes(frontier.fd) && /^(?:write|writev|sendto|sendmsg)$/.test(frontier.syscall)) ||
 		[...(closedInput ? [] : [0]), 1, 2, ...handles.map(handle => handle.fd)].some(fd => !records.has(fd)) ||
 		cursor + Number(header[3]) + Number(header[4]) !== image.length) throw new Error("incomplete continuation FD table");
 	for (const position of positions) {

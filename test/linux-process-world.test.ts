@@ -147,12 +147,13 @@ int main(int argc, char **argv) {
 		}
 	});
 
-	test.for(["unusable", "one-shot", "descendant", "unusable-descendant"] as const)("retires only native preparation without a reusable result (%s)", { timeout: 20_000 }, async (mode, { skip }) => {
+	test.for(["unusable", "one-shot", "descendant", "unusable-descendant"] as const)("rechecks failed native preparation when its observed inputs change (%s)", { timeout: 20_000 }, async (mode, { skip }) => {
 		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-preparation-evidence-");
 		const publishing = vi.spyOn(fixture.backend.planner, "publishCompleted");
 		try {
 			await writeFile(path.join(fixture.workspace, "input.txt"), "prepared\n");
+			await writeFile(path.join(fixture.workspace, "body.sh"), 'ulimit -c 0\n' + (mode === "unusable-descendant" ? "" : 'printf "prepared\\n"\n'));
 			if (mode === "unusable-descendant") await writeFile(path.join(fixture.workspace, "unusable-child.sh"),
 				'i=0; while [ "$i" -lt 10000 ]; do i=$((i + 1)); done\nulimit -c 0\nprintf "prepared\\n"\n');
 			if (mode === "one-shot") {
@@ -164,8 +165,8 @@ int main(int argc, char **argv) {
 			const route = await fixture.prepareActorReplay(), scope = { sessionID: "preparation-evidence", turnID: "native" };
 			// Changing a process limit is an existing unsupported syscall observation. Only this child changes its limit.
 			const script = 'i=0; while [ "$i" -lt 10000 ]; do i=$((i + 1)); done; ' +
-				(mode === "one-shot" ? "" : "ulimit -c 0; ") + (mode === "descendant" ? "/bin/cat input.txt; :" :
-					mode === "unusable-descendant" ? "/bin/bash ./unusable-child.sh; :" : 'printf "prepared\\n"');
+				(mode === "descendant" ? "ulimit -c 0; /bin/cat input.txt; :" :
+					mode === "unusable-descendant" ? ". ./body.sh; /bin/bash ./unusable-child.sh; :" : ". ./body.sh");
 			const command = mode === "one-shot" ? "exec ./one-shot" : `exec /bin/sh -c '${script}'`;
 			const expectedOutput = mode === "one-shot" ? expect.stringMatching(/^prepared:\d+\n$/) : "prepared\n";
 			const handoffs = Reflect.get(fixture.backend, "handoffs") as ProcessHandoffRegistry<{ readonly args: readonly string[]; readonly executable: string }>;
@@ -193,35 +194,30 @@ int main(int argc, char **argv) {
 					expect(result.output.map(event => event.data.toString()).join("")).toEqual(expectedOutput);
 					if (mode === "descendant") expect(session.executionBindings().some(child => child.available && child.key !== binding!.key)).toBe(true);
 				} finally { await session.close(); }
-			});
+			}, { liveLower: true });
 			if (mode === "unusable" || mode === "unusable-descendant") {
 				const before = fixture.backend.metrics().requests;
 				await expect(prepare()).rejects.toThrow("bound process preparation produced no reusable result");
-				expect(binding!.available).toBe(false);
+				expect(binding!.available).toBe(true);
+				expect(await fixture.backend.bindingStale(binding!)).toBe(false);
 				expect(fixture.backend.metrics().lastError).toContain("unsupported_syscall");
 				if (mode === "unusable-descendant") {
 					expect(fixture.backend.metrics().requests - before).toBe(2);
 					expect(publishing.mock.calls.map(([certificate]) => certificate.dependencyCertificate.taints))
 						.toEqual([expect.arrayContaining(["unsupported_syscall"]), expect.arrayContaining(["unsupported_syscall"])]);
 					expect(childBinding).toBeDefined();
-					expect(childBinding!.available).toBe(false); // Its own sealed failure was already paid for inside the parent.
+					expect(await fixture.backend.bindingStale(childBinding!)).toBe(false);
 				}
 				await writeFile(path.join(fixture.workspace, "input.txt"), "arbitrary edit\n");
-				output = ""; await observe(); // Ordinary Actor execution remains enabled; observation cannot restore rejected proof.
-				expect(output).toBe("prepared\n"); expect(binding!.available).toBe(false);
-				if (childBinding) expect(childBinding.available).toBe(false);
-				const requests = fixture.backend.metrics().requests;
-				await expect(prepare()).rejects.toThrow("binding is unavailable");
-				expect(fixture.backend.metrics().requests).toBe(requests);
-				if (mode === "unusable-descendant") {
-					let changed: ProcessExecutionBinding | undefined;
-					await fixture.backend.observeBindings(scope, () => route.executor.execute({ command: "exec /bin/bash ./unusable-child.sh new-context",
-						cwd: fixture.workspace, environment: fixture.environment, scope, onData: () => {} }), bindings => {
-						changed = bindings.find(candidate => handoffs.resolveBinding(candidate, scope)?.args.includes("new-context"));
-					}, true);
-					expect(changed).toMatchObject({ available: true });
-					expect(changed!.key).not.toBe(childBinding!.key);
-				}
+				output = ""; await observe();
+				expect(output).toBe("prepared\n");
+				expect(await fixture.backend.bindingStale(binding!)).toBe(false); // An unrelated edit cannot revive unchanged failure inputs.
+				await writeFile(path.join(fixture.workspace, "body.sh"), mode === "unusable-descendant" ? "" : 'printf "prepared\\n"\n');
+				if (childBinding) await writeFile(path.join(fixture.workspace, "unusable-child.sh"), 'printf "prepared\\n"\n');
+				expect(await fixture.backend.bindingStale(binding!)).toBe(true);
+				if (childBinding) expect(await fixture.backend.bindingStale(childBinding)).toBe(true);
+				await prepare();
+				expect(await fixture.backend.bindingStale(binding!)).toBe(false);
 			} else {
 				await prepare();
 				expect(binding!.available).toBe(true);
@@ -282,6 +278,69 @@ int main(int argc, char **argv) {
 				expect.objectContaining({ observation: "observed", match: expect.objectContaining({ matched: true, adoption:
 					expect.objectContaining(stale ? { status: "rejected", cause: expect.objectContaining({ stage: "freshness" }) } : { status: "adopted" }) }) }) }));
 		} finally { await host?.dispose(); await fixture.dispose(); }
+	});
+
+	test.for(["sample", "threads", "limit", "identity"] as const)("transfers a closed-input calculation before its next syscall (%s)", { timeout: 30_000 }, async (mode, { skip }) => {
+		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
+		const fixture = await createLinuxProcessBenchmark("pi-prefix-process-", "git");
+		try {
+			await prepareLinuxProcessReuse(fixture);
+			await writeFile(path.join(fixture.workspace, "worker.c"), `#define _GNU_SOURCE
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <sys/random.h>
+#include <sys/resource.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <fcntl.h>
+static void *thread(void *unused) { return unused; }
+int main(void) {
+ ${mode === "identity" ? "pid_t prior = getpid();" : ""}
+ int fd = open("prefix-ready", O_WRONLY|O_CREAT|O_TRUNC, 0600); if (fd < 0 || write(fd, "ready", 5) != 5 || close(fd)) return 71;
+ volatile uint64_t hash = 1; for (unsigned i = 0; i < 800000000; i++) hash = hash * 33 + i;
+ ${mode === "threads" ? "pthread_t worker; void *result; if (pthread_create(&worker, NULL, thread, (void *)37) || pthread_join(worker, &result) || result != (void *)37) return 72;" : "(void)thread;"}
+ ${mode === "limit" ? "struct rlimit limit = {0, 0}; if (setrlimit(RLIMIT_CORE, &limit)) return 73;" : ""}
+ uint64_t value; if (getrandom(&value, sizeof(value), 0) != sizeof(value)) return 74;
+ printf("%ld:%ld:%llu:%llu\\n", (long)getpid(), (long)syscall(SYS_gettid), (unsigned long long)hash, (unsigned long long)value);
+ ${mode === "identity" ? "if (prior != getpid()) return 75;" : ""} return 0;
+}
+`);
+			await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker", arguments: ["-pthread"] });
+			await commitBenchmarkFixture(fixture.workspace, "Closed input prefix");
+			const route = await fixture.prepareActorReplay(), scope = { sessionID: "prefix", turnID: "same" }, command = "exec ./worker";
+			const handoffs = Reflect.get(fixture.backend, "handoffs") as ProcessHandoffRegistry<{ executable: string }>;
+			const publishing = vi.spyOn(handoffs, "publish");
+			let binding: ProcessExecutionBinding | undefined;
+			const actor = async () => {
+				let output = "";
+				await fixture.backend.observeBindings(scope, () => route.executor.execute({ command, cwd: fixture.workspace, environment: fixture.environment,
+					scope, signal: AbortSignal.timeout(20_000), onData: data => { output += data.toString(); } }), bindings => {
+					binding ??= bindings.find(candidate => handoffs.resolveBinding(candidate, scope)?.executable.endsWith("/worker"));
+				}, true);
+				return output;
+			};
+			const seed = await actor(); expect(binding).toBeDefined();
+			await rm(path.join(fixture.workspace, "prefix-ready"));
+			const invocation = resolvePiToolInvocation("bash", { command: "exit 97" }, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath })!.process!;
+			await fixture.workspaceSandbox.withWorkspace(fixture.workspace, async workspace => {
+				const session = await fixture.backend.open({ sourceRoot: fixture.workspace, workspace, invocation, scope });
+				const pending = session.executeBinding(binding!), settled = pending.catch(() => undefined);
+				try {
+					await expect.poll(() => existsSync(path.join(workspace.sandboxRoot, "prefix-ready"))).toBe(true);
+					expect(existsSync(path.join(fixture.workspace, "prefix-ready"))).toBe(false);
+					const actual = await actor(), fields = actual.trim().split(":");
+					expect(fields).toHaveLength(4); expect(fields[0]).toBe(fields[1]); expect(fields[2]).toBe(seed.trim().split(":")[2]);
+					expect(fields[3]).not.toBe(seed.trim().split(":")[3]);
+					expect(fixture.backend.actorMetrics().joinedHits, JSON.stringify(fixture.backend.metrics())).toBe(mode === "identity" ? 0 : 1);
+					if (mode !== "identity") {
+						expect(await pending).toMatchObject({ suspended: true });
+						expect(publishing.mock.calls.some(([, , certificate]) => certificate?.result.continuation)).toBe(true);
+					}
+				} finally { await session.close(); await settled; }
+			}, { liveLower: true });
+			publishing.mockRestore();
+		} finally { await fixture.dispose(); }
 	});
 
 	test.for(["pipe", "socket", "eventfd", "readv", "recvmsg", "writev", "mmap", "runtime", "handles", "eof", "early", "changed", "identity", "cancel"] as const)("resumes a learned running process with future input (%s)", { timeout: 60_000 }, async (mode, { skip }) => {
@@ -1876,7 +1935,7 @@ int main(void) {
 				const commit = vi.fn(async () => {
 					expect(await readFile(`/proc/${heldPid}/fdinfo/3`, "utf8")).toMatch(/^pos:\s*0$/m);
 					if (mode === "commit-failure") throw new Error("injected offset commit failure");
-				}), adopted = vi.fn();
+				}), adopted = vi.fn(), settle = vi.fn();
 				const executor = held({ descriptors: directory, decide: async ({ pid, descriptors }) => {
 					if (await filesystem.readlink(`/proc/${pid}/exe`) !== "/usr/bin/true") return { kind: "continue" };
 					heldPid = pid;
@@ -1903,7 +1962,7 @@ int main(void) {
 					if (mode === "directory-stale") await writeFile(path.join(directoryInput, "created-after-capture"), "");
 					if (mode === "directory-replaced") { await filesystem.rename(directoryInput, `${directoryInput}-old`); await mkdir(directoryInput); }
 					if (mode === "directory-symlink") { await filesystem.rename(directoryInput, `${directoryInput}-target`); await filesystem.symlink(`${directoryInput}-target`, directoryInput); }
-					return { kind: "replay", descriptorOffsets, exitCode: 0, output: [{ fd: 1, data: Buffer.from("replayed:") }], commit, adopted };
+					return { kind: "replay", descriptorOffsets, exitCode: 0, output: [{ fd: 1, data: Buffer.from("replayed:") }], commit, adopted, settle };
 				} });
 				const running = executor.execute(`exec 3<'${target}'; exec 4<&3; exec 5<'${target}'; ${opath ? `'${descriptorProbe}' opath '${target}'` : mode === "status-clear" ? `'${descriptorProbe}' status '${input}'` : "/bin/true"}; ` +
 					(mode.startsWith("status-") ? `for fd in 3 4 5; do while read -r key value; do if [[ $key == flags: ]]; then (( (8#$value & 3072) == (${mode === "status-set" ? 3072 : 0} * (fd != 5)) )) || exit 90; fi; done </proc/self/fdinfo/$fd; done; ` : "") +
@@ -1916,6 +1975,7 @@ int main(void) {
 				}
 				expect(commit).toHaveBeenCalledTimes(Number(accepted || mode === "commit-failure"));
 				expect(adopted).toHaveBeenCalledTimes(Number(accepted));
+				expect(settle.mock.calls).toEqual([[accepted || mode === "commit-failure"]]);
 			}
 			for (const killed of [false, true]) {
 				const waiting = deferred(), nativeDone = deferred();
@@ -2666,7 +2726,7 @@ int main(void) { int fds[2], status; char queue[8]; if (pipe(fds) || fds[0] != 3
 				expect(operation).not.toHaveProperty("expectedDurationMs");
 				await expect(branch.commit()).resolves.toEqual(branch.output);
 				await expect(branch.commit()).resolves.toEqual(branch.output);
-				expect(ownership.claimChild()).toBe(false);
+					expect(ownership.claimChild()).toBeUndefined();
 
 			}
 			finally { await branch.dispose(); }

@@ -392,9 +392,9 @@ export function createPatternPlanSource({
 			const carried = context && predictionBatches.get(context);
 			if (carried && settlement.observation === "unobserved") carried.abandoned = true;
 			if (operation) {
-				// Execution failure retires this preparation hint; absence of an OS observation is not a negative example.
+				// Native bindings recheck their observed inputs after edits, including after a failed preparation.
 				if (settlement.observation === "unobserved" && settlement.cause.stage === "execution" &&
-					operationBindings.get(operation.key) === operation) operationBindings.delete(operation.key);
+					!currentOperation(operation.binding) && operationBindings.get(operation.key) === operation) operationBindings.delete(operation.key);
 				if (settlement.observation === "unobserved") return; // An adopted child credits its parent pattern.
 			}
 			if (context) for (const support of [context.continuation, ...context.patternIDs]) context.store.settled(support, settlement, served.has(context));

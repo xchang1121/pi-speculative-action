@@ -789,13 +789,13 @@ describe("speculative action host", () => {
 		const cwd = await temporaryWorkspace(), profile = await createClosedSearchProfile(cwd), original = profile.invocations.get("grep");
 		if (!original) { await profile.pool.dispose(); return skip("qualified rg is unavailable"); }
 		const tool = createGrepTool(cwd), world = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: ["grep", "read"], maxBytes: () => 1024 * 1024 });
-		const joined = deferred<void>(), actorJoined = deferred<void>(), gate = gated(), consuming = gated(), cancelled = new AbortController(), nativeMkdtemp = fs.mkdtemp;
+		const joined = deferred<void>(), actorJoined = deferred<void>(), cancellation = deferred(), gate = gated(), consuming = gated(), cancelled = new AbortController(), nativeMkdtemp = fs.mkdtemp;
 		const invocation: ToolInvocation = { ...original, filesystem: (view, request) => original.filesystem!({ ...view, prepare: (binding, key, build, consume, target) => {
 			const pending = view.prepare!(binding, key, build, async value => {
 				const result = await consume(value);
 				if (target === cwd && mode === "cancelled" && request.callID === "second") await consuming.wait();
 				if (target === cwd && mode === "cancelled" && request.callID === "first") {
-					await consuming.entered; cancelled.abort(new Error("first consumer cancelled")); throw cancelled.signal.reason;
+					await consuming.entered; cancelled.abort(new Error("first consumer cancelled")); cancellation.resolve(); throw cancelled.signal.reason;
 				}
 				return result;
 			}, target);
@@ -826,7 +826,7 @@ describe("speculative action host", () => {
 		let query: Awaited<typeof rebuilding>;
 		try {
 			await Promise.all([joined.promise, actorJoined.promise]); await nextTurn(); gate.release();
-			if (mode === "cancelled") { await expect.poll(() => cancelled.signal.aborted).toBe(true); await nextTurn(); consuming.release(); }
+			if (mode === "cancelled") { await cancellation.promise; expect(cancelled.signal.aborted).toBe(true); await nextTurn(); consuming.release(); }
 			const attempts = await settled; branches = attempts.flatMap(attempt => attempt.status === "fulfilled" ? [attempt.value] : []);
 			query = await rebuilding; expect(query).toBeDefined();
 			expect(attempts.map(attempt => attempt.status)).toEqual([mode === "cancelled" ? "rejected" : "fulfilled", "fulfilled"]);
@@ -1535,7 +1535,7 @@ describe("speculative action host", () => {
 		} finally { await controller.dispose(); }
 	});
 
-	it("retires a failed rerun through the runtime before the next Actor edit", async () => {
+	it("rechecks a failed rerun through the runtime after the next Actor edit", async () => {
 		const cwd = await temporaryWorkspace(), writer = createWriteTool(cwd), failure = gated();
 		const tool: AgentTool<typeof bashSchema> = { name: "bash", label: "bash", description: "Fixture build", parameters: bashSchema,
 			execute: async () => textResult("built") };
@@ -1584,7 +1584,7 @@ describe("speculative action host", () => {
 			await host.finishTurn("first-edit");
 			await edit("second-edit");
 			await waitFor(() => attempted.length === 2);
-			expect(attempted[1]).toBe(observed[1]);
+			expect(attempted[1]).toBe(observed[0]);
 			expect(await fs.readFile(path.join(cwd, "notes.txt"), "utf8")).toBe("second-edit");
 			expect(settled).not.toHaveBeenCalled();
 		} finally { failure.release(); await host.dispose(); }

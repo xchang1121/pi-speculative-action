@@ -202,7 +202,7 @@ static int read_line(int fd, char *buffer, size_t capacity) {
 #define IMAGE_SCRATCH 0x100000000UL
 struct image_map {
 	uint64_t start, end, offset, size, device, inode;
-	unsigned prot, file;
+	unsigned prot, file, no_huge_pages;
 	char path[PATH_MAX];
 };
 struct image_header {
@@ -305,6 +305,7 @@ static int image_maps(pid_t pid, struct image_header *header, int capturing) {
 			char *saved;
 			for (char *flag = strtok_r(line + 8, " \n", &saved); flag; flag = strtok_r(NULL, " \n", &saved)) {
 				if (!strcmp(flag, "gd")) { if (strcmp(map->path, "[stack]")) goto done; }
+				else if (!strcmp(flag, "nh")) map->no_huge_pages = 1;
 				else if (strcmp(flag, "rd") && strcmp(flag, "wr") && strcmp(flag, "ex") && strcmp(flag, "mr") &&
 					strcmp(flag, "mw") && strcmp(flag, "me") && strcmp(flag, "ac") && strcmp(flag, "sd")) goto done;
 			}
@@ -411,8 +412,12 @@ done:
 /* Called by the already authorized strace owner; no new ptracer exception or
  * sandbox permission is needed. The private process is retired on either result. */
 int pi_process_image_frontier(long number) {
-	return number == SYS_read || number == SYS_readv || number == SYS_recvfrom || number == SYS_recvmsg ||
-		number == SYS_write || number == SYS_writev || number == SYS_sendto || number == SYS_sendmsg;
+	if (number == SYS_read || number == SYS_readv || number == SYS_recvfrom || number == SYS_recvmsg ||
+		number == SYS_write || number == SYS_writev || number == SYS_sendto || number == SYS_sendmsg) return 1;
+	return number == SYS_getrandom || number == SYS_getpid || number == SYS_gettid || number == SYS_clock_gettime ||
+		number == SYS_prlimit64 || number == SYS_clone || number == SYS_clone3 || number == SYS_fork || number == SYS_vfork ||
+		number == SYS_poll || number == SYS_ppoll || number == SYS_select || number == SYS_pselect6 ||
+		number == SYS_nanosleep || number == SYS_clock_nanosleep || number == SYS_futex || number == SYS_openat ? 2 : 0;
 }
 static int image_status(pid_t pid, int consumer) {
 	char path[64], line[256]; snprintf(path, sizeof(path), "/proc/%d/status", pid);
@@ -432,7 +437,8 @@ int pi_capture_process_image(pid_t pid, const char *path, unsigned long watched_
 	if (!image) return -1;
 	struct image_header *header = &image->header;
 	if (ptrace(PTRACE_GETREGS, pid, 0, &header->registers) < 0 || header->registers.cs != 0x33 ||
-		!pi_process_image_frontier(header->registers.orig_rax) || ((long)header->registers.rax != -512 && (long)header->registers.rax != -514) ||
+		!pi_process_image_frontier(header->registers.orig_rax) || ((long)header->registers.rax != -ENOSYS &&
+			(pi_process_image_frontier(header->registers.orig_rax) != 1 || ((long)header->registers.rax != -512 && (long)header->registers.rax != -514))) ||
 		image_status(pid, 0) < 0) goto done;
 	unsigned long original; unsigned char bootstrap_cow[2];
 	uint64_t bootstrap = header->registers.rip & ~UINT64_C(4095);
@@ -535,7 +541,7 @@ static int image_load(struct decision_job *job, size_t length, const char *physi
 		struct image_map *map = &header->maps[i];
 		if (!memchr(map->path, 0, sizeof(map->path)) || map->start >= map->end || ((map->start | map->end | map->offset) & 4095) ||
 			(map->start < IMAGE_SCRATCH + 8192 && map->end > IMAGE_SCRATCH) ||
-			(i && header->maps[i - 1].end > map->start) || map->prot > 7 || map->file != (unsigned)(*map->path == '/')) goto fail;
+			(i && header->maps[i - 1].end > map->start) || map->prot > 7 || map->no_huge_pages > 1 || map->file != (unsigned)(*map->path == '/')) goto fail;
 		if (image_special(map)) continue;
 		size_t length = (size_t)(map->end - map->start);
 		if (length > IMAGE_BYTES || length * (1 + map->file) + map->file * (length / 4096) > bytes - offset) goto fail;
@@ -638,7 +644,8 @@ static int image_restore(pid_t pid, struct decision_job *job) {
 		if (!map->file) { if (image_memory(pid, map->start, image->data + offset, length, 1) < 0) goto done; }
 		else for (size_t page = 0; page < length / 4096; page++) if (image->data[offset + 2 * length + page] &&
 			image_memory(pid, map->start + page * 4096, image->data + offset + page * 4096, 4096, 1) < 0) goto done;
-		if (image_syscall(pid, SYS_mprotect, map->start, length, map->prot, 0, 0, 0, 0) < 0) goto done;
+		if (image_syscall(pid, SYS_mprotect, map->start, length, map->prot, 0, 0, 0, 0) < 0 ||
+			(map->no_huge_pages && image_syscall(pid, SYS_madvise, map->start, length, MADV_NOHUGEPAGE, 0, 0, 0, 0) < 0)) goto done;
 		offset += length * (1 + map->file) + map->file * (length / 4096);
 	}
 	if (header->clear_tid) {
@@ -2487,8 +2494,11 @@ done:
 static int image_context(struct decision_job *job) {
 	struct process_image *current = image_new();
 	if (!current) return -1;
+	unsigned long call = job->image->header.registers.rax, descriptor = job->image->header.registers.rdi;
 	int valid = image_descriptors(job->pid, current) == 0 && job->process->table &&
-		job->process->table->references == 1 && !job->process->table->active, input = 0;
+		job->process->table->references == 1 && !job->process->table->active;
+	int input = pi_process_image_frontier(call) == 2 || ((descriptor == 1 || descriptor == 2) &&
+		(call == SYS_write || call == SYS_writev || call == SYS_sendto || call == SYS_sendmsg));
 	for (unsigned i = 0; valid && i < current->fd_count; i++) {
 		if (current->fds[i].fd < 3) continue;
 		unsigned p = 0;
@@ -2506,7 +2516,7 @@ static int image_context(struct decision_job *job) {
 		if (position) {
 			valid &= (job->image->fds[i].flags & ~O_CLOEXEC) == position->after_flags &&
 				job->image->fds[i].offset == (position->stream ? 0 : position->after);
-			if ((unsigned long)fd == job->image->header.registers.rdi && position->stream) input = 1;
+			if ((unsigned long)fd == descriptor) input = 1;
 		} else valid &= fd < 3 && source == fd && job->image->fds[i].flags == current->fds[original].flags;
 	}
 	image_free(current);
@@ -3308,7 +3318,7 @@ static int execute_descriptors(const char *manifest, const char *report, char *e
 		if (relays[index].source < 0 || relays[index].writer < 0) goto done;
 	}
 	/* Nothing to settle after the run: it replaces this launcher, as a native exec would. */
-	int in_place = !count && !route[2];
+	int in_place = !manifest && !route[2];
 	if (!in_place) output = open(report, O_WRONLY | O_CLOEXEC | O_NOFOLLOW);
 	for (unsigned index = 0; index < count; index++) for (unsigned entry = 0; entry < positions[index].locks.count; entry++)
 		if (set_file_lock(positions[index].duplicate, positions[index].locks.entries[entry]) < 0) goto done;

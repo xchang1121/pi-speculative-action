@@ -27,28 +27,25 @@ describe("ProcessHandoffRegistry", () => {
 	});
 
 
-	it("bounds retired preparation with its measured launch and preserves new contexts and result acquisition", async () => {
-		const registry = new ProcessHandoffRegistry<unknown>(8, 4096), key = digest("measured"), invocation = { argv: ["worker"], environment: { MODE: "before" } };
-		const observed = registry.observe(key, "/bin/worker", SCOPE, invocation, 6000)!;
-		registry.retirePreparation({ ...observed });
-		expect(observed.available).toBe(true); // A copied descriptor cannot change the owner.
-		registry.retirePreparation(observed);
-		expect(registry.resolveBinding(observed, SCOPE)).toBeUndefined();
-		expect(registry.observe(key, "/bin/worker", OTHER_SCOPE, invocation, 7000)).toBe(observed);
-		expect(observed).toMatchObject({ executionMs: 7000, available: false });
-		for (const context of [{ ...invocation, argv: ["worker", "new-input"] }, { ...invocation, environment: { MODE: "after" } },
-			{ ...invocation, descriptors: [{ fd: 3, identity: "new-ofd" }] }]) {
-			expect(registry.observe(key, "/bin/worker", SCOPE, context, 10)).toMatchObject({ available: true });
+	it("releases refused reservations, consumes accepted ones, and keeps equivalent results reusable", async () => {
+		for (const oneShot of [false, true]) for (const consumed of [false, true]) {
+			const fixture = await producer(oneShot); await fixture.publish();
+			const receipt = await fixture.actor(undefined, undefined, SCOPE, false);
+			if (receipt.kind !== "hit") throw new Error("missing reservation");
+			if (oneShot) {
+				await expect(fixture.actor()).resolves.toMatchObject({ kind: "miss" });
+				await expect(fixture.ownership.commit(async () => "whole")).rejects.toMatchObject({ disposition: "recoverable" });
+			}
+			receipt.settle?.(consumed); receipt.settle?.(!consumed);
+			expect(fixture.registry.results(fixture.key, SCOPE)).toEqual(oneShot && consumed ? [] : [fixture.certificate]);
+			const retry = await fixture.actor(undefined, undefined, SCOPE, false);
+			expect(retry.kind).toBe(oneShot && consumed ? "miss" : "hit");
+			if (retry.kind === "hit") retry.settle?.(false);
+			const whole = expect(fixture.ownership.commit(async () => "whole"));
+			if (oneShot && consumed) await whole.rejects.toMatchObject({ disposition: "recoverable" });
+			else await whole.resolves.toBe("whole");
+			fixture.registry.dispose();
 		}
-		const fixture = await producer(false, registry);
-		await fixture.publish();
-		const resultBinding = registry.bind(fixture.key, fixture.work, invocation)!;
-		registry.retirePreparation(resultBinding);
-		await expect(fixture.actor()).resolves.toMatchObject({ kind: "hit" });
-		registry.clearCompleted();
-		expect(registry.observe(key, "/bin/worker", SCOPE, invocation, 6000)).toMatchObject({ available: true });
-		registry.dispose();
-		expect(observed.available).toBe(false);
 	});
 
 	it("publishes the original calculation graph once, excluding nested replay overhead", async () => {
@@ -59,7 +56,7 @@ describe("ProcessHandoffRegistry", () => {
 		expect(fixture.work.computation).toBe(computation);
 		const receipt = await fixture.actor();
 		expect(receipt).toMatchObject({ kind: "hit", producer: { computation } });
-		expect(new TaskTimeline(0).recordTool(fixture.work.computation!, performance.now(), true)).toMatchObject({ toolComputeMs: 130, hiddenComputeMs: 80 });
+		expect(new TaskTimeline(0).recordTool(fixture.work.computation!, 150, true)).toMatchObject({ toolComputeMs: 130, hiddenComputeMs: 80 });
 		expect(fixture.registry.complete(fixture.key, fixture.work, fixture.certificate)).toBe(false);
 		expect(fixture.work.computation).toBe(computation);
 		fixture.registry.dispose();
@@ -517,7 +514,8 @@ async function producer(oneShot = false, registry = new ProcessHandoffRegistry<u
 	return { certificate, key, registry, ownership, work: acquired.work,
 		publish: (persist = async () => false) => registry.publish(key, acquired.work, certificate, persist),
 		actor: (lookup = livePlan, waitForRunning: (running: ProcessHandoff) => Promise<"completed" | "miss" | "rejected"> =
-			running => running.completion.then(() => "completed"), scope = SCOPE) => registry.acquire({ key, scope, role: "actor", lookup, waitForRunning }),
+			running => running.completion.then(() => "completed"), scope = SCOPE, consume = true) =>
+			registry.acquire({ key, scope, role: "actor", lookup, waitForRunning }).then(receipt => { if (consume && receipt.kind === "hit") receipt.settle?.(true); return receipt; }),
 	};
 }
 

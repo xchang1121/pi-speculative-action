@@ -7,6 +7,7 @@ import { TimelineInterval } from "./task-timing.ts";
 /** One-shot children and their enclosing branch share adoption authority. */
 export class ProcessHandoffOwnership {
 	private state: "available" | "partial" | "whole" = "available";
+	private reservations = 0;
 	private transfer?: { readonly apply: WeakRef<() => Promise<unknown>>; readonly result: Promise<unknown> };
 	private readonly observer?: WeakRef<(adoption: ExecutionOperationAdoption) => void>;
 	private readonly scopeOwner?: WeakRef<(scope: ExecutionScope, salvage?: boolean) => boolean>;
@@ -27,11 +28,16 @@ export class ProcessHandoffOwnership {
 
 	get wholeClaimed(): boolean { return this.state === "whole"; }
 
-	claimChild(): boolean { if (this.wholeClaimed) return false; this.state = "partial"; return true; }
+	claimChild(): ((consumed: boolean) => void) | undefined {
+		if (this.wholeClaimed) return;
+		this.reservations++;
+		let pending = true;
+		return consumed => { if (pending) { pending = false; this.reservations--; if (consumed) this.state = "partial"; } };
+	}
 
 	async commit<T>(apply: () => Promise<T>): Promise<T> {
 		if (this.transfer?.apply.deref() === apply) return this.transfer.result as Promise<T>;
-		if (this.state !== "available") throw effectCommitFailure(new Error(this.state === "partial" ? "process execution was partially consumed" : "process execution was already claimed"), "recoverable");
+		if (this.state !== "available" || this.reservations) throw effectCommitFailure(new Error(this.state === "partial" ? "process execution was partially consumed" : "process execution was already claimed"), "recoverable");
 		this.state = "whole";
 		const result = Promise.resolve().then(apply).catch(error => {
 			if (error instanceof EffectCommitFailure && error.disposition === "recoverable") { this.state = "available"; this.transfer = undefined; }
@@ -85,7 +91,8 @@ interface HandoffRecord extends ProcessHandoff {
 }
 
 export type ProcessHandoffAcquisition<Plan> =
-	| { readonly kind: "hit"; readonly plan: Plan; readonly joined: boolean; readonly producer?: ProcessHandoff; readonly continuation?: ProcessContinuation }
+	| { readonly kind: "hit"; readonly plan: Plan; readonly joined: boolean; readonly producer?: ProcessHandoff; readonly continuation?: ProcessContinuation;
+		readonly settle?: (consumed: boolean) => void }
 	| { readonly kind: "work"; readonly work: ProcessHandoff; readonly joined: boolean }
 	| { readonly kind: "miss"; readonly joined: boolean };
 
@@ -106,8 +113,7 @@ type AcquireOptions<Plan> = {
 /** Owns process evidence selection and the scope of one-shot transfers. */
 export class ProcessHandoffRegistry<Invocation = never> {
 	private readonly byKey = new Map<Sha256Digest, Map<ProcessHandoff, HandoffRecord>>();
-	private readonly invocations = new WeakMap<ProcessExecutionBinding, { readonly value: Invocation; readonly bytes: number; executionMs: number;
-		preparationRetired?: true }>();
+	private readonly invocations = new WeakMap<ProcessExecutionBinding, { readonly value: Invocation; readonly bytes: number; executionMs: number }>();
 	private maxCompleted: number;
 	private maxRetainedBytes: number;
 	private retainedBytes = 0;
@@ -159,7 +165,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		const owner = new WeakRef(this.invocations);
 		const binding = Object.freeze({ key, scope: record.scope,
 			get executionMs(): number { return owner.deref()?.get(this)?.executionMs ?? 0; },
-			get available(): boolean { const invocation = owner.deref()?.get(this); return !!invocation && !invocation.preparationRetired; } });
+			get available(): boolean { return owner.deref()?.has(this) ?? false; } });
 		this.invocations.set(binding, { value, bytes, executionMs });
 		record.binding = binding;
 		this.retainedBytes += bytes;
@@ -170,7 +176,8 @@ export class ProcessHandoffRegistry<Invocation = never> {
 	/** Results of `key` this session produced, newest first: what a run of it could still reuse, never an adoption. */
 	results(key: Sha256Digest, scope: ExecutionScope): readonly ProcessProvenanceCertificate[] {
 		return [...this.byKey.get(key)?.values() ?? []].reverse().flatMap(record =>
-			record.state.status !== "running" && record.state.candidate && record.scope?.sessionID === scope.sessionID ? [record.state.candidate] : []);
+			record.state.status === "completed" && record.state.candidate && (!record.state.candidate.result.continuation || record.continuation) &&
+				record.scope?.sessionID === scope.sessionID ? [record.state.candidate] : []);
 	}
 
 	bindings(scope: ExecutionScope): readonly ProcessExecutionBinding[] {
@@ -182,16 +189,15 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		return binding.available && scope?.sessionID === binding.scope.sessionID ? this.invocations.get(binding)?.value : undefined;
 	}
 
-	/** Keep a failed preparation with its bounded measured launch: another observation of that same launch does not prove reuse.
-	 * Different launch context and normal owner eviction can introduce a new capability; result acquisition is unchanged. */
-	retirePreparation(binding: ProcessExecutionBinding): void {
-		const invocation = this.invocations.get(binding);
-		if (invocation) invocation.preparationRetired = true;
-	}
-
 	/** Conservative availability hint; scope, ownership and evidence still decide acquisition. */
 	get hasResults(): boolean { for (const record of this.records()) if (record.state.status !== "retained") return true; return false; }
 	/** Acquisition can attempt this running work; inputs, timing, scope and commit proofs are still checked at the native boundary. */
+	needsContinuationTracking(scope?: ExecutionScope): boolean {
+		for (const record of this.records()) if ((record.state.status === "running" || record.continuation) &&
+			!record.ownership.wholeClaimed && record.ownership.acceptsScope(record.scope, scope, true)) return true;
+		return false;
+	}
+
 	hasJoinableWork(ownership: ProcessHandoffOwnership): boolean {
 		for (const record of this.records()) if (record.ownership === ownership && !record.signal.aborted &&
 			record.state.status === "running" && (record.inputsChanged || record.suspend)) return true;
@@ -244,13 +250,20 @@ export class ProcessHandoffRegistry<Invocation = never> {
 					const plan = await request.lookup(completed.map(({ candidate }) => candidate));
 					const selected = completed.find(({ candidate }) => candidate === plan?.certificate);
 					for (const { record, candidate } of selected ? [selected] : completed) considered.set(record, candidate.id);
-					if (plan && selected && selected.record.state === selected.state && this.byKey.get(request.key)?.has(selected.record) &&
-						(!selected.oneShot || (selected.record.ownership.acceptsScope(selected.record.scope, scope, request.role === "actor") && selected.record.ownership.claimChild()))) {
-						// Retain bounded launch parameters without granting another transfer of this result.
-						if (selected.oneShot) selected.record.state = { ...selected.state, status: "retained" };
-						const continuation = selected.record.continuation;
-						if (continuation) { this.retainedBytes -= continuation.image.length; selected.record.continuation = undefined; }
-						return { kind: "hit", plan, joined, producer: selected.record, ...(continuation ? { continuation } : {}) };
+					if (plan && selected && selected.record.state === selected.state && this.byKey.get(request.key)?.has(selected.record)) {
+						const { record, state, oneShot } = selected;
+						const claim = oneShot && record.ownership.acceptsScope(record.scope, scope, request.role === "actor") ? record.ownership.claimChild() : undefined;
+						if (oneShot && !claim) continue;
+						if (oneShot) record.state = { ...state, status: "retained" };
+						record.borrowers++;
+						let pending = true;
+						return { kind: "hit", plan, joined, producer: record, continuation: record.continuation, settle: consumed => {
+							if (!pending) return;
+							pending = false; claim?.(consumed); record.borrowers--;
+							if (!consumed && oneShot) record.state = state;
+							if (consumed && record.continuation) { this.retainedBytes -= record.continuation.image.length; record.continuation = undefined; }
+							this.trim();
+						} };
 					}
 					continue;
 				}

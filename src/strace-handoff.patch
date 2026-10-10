@@ -131,7 +131,7 @@
  
  #include "kill_save_errno.h"
  #include "exitkill.h"
-@@ -2231,6 +2235,131 @@ add_path_trace(struct pathtrace *pt, const char *path)
+@@ -2231,6 +2235,154 @@ add_path_trace(struct pathtrace *pt, const char *path)
   * Don't want main() to inline us and defeat the reason
   * we have a separate function.
   */
@@ -245,6 +245,29 @@
 +    return true;
 +}
 +
++/* Entry snapshots exclude the pending call from the trace; blocked I/O snapshots restart it. */
++static bool handoff_stop(struct tcb *tcp, bool entry)
++{
++    if (!tcp || tcp->pid != handoff_pid) return false;
++    struct user_regs_struct regs;
++    if (tcp->handoff_tid_state == 1 || tcp->handoff_tid_state == 3 || !tcp->handoff_started ||
++        !tcp->handoff_entered || ptrace(PTRACE_GETREGS, tcp->pid, 0, &regs) < 0) {
++        handoff_pid = 0; handoff_reply((struct handoff_reply){0}); return false;
++    }
++    int frontier = handoff_frontier(regs.orig_rax);
++    if (!frontier || (entry ? (long)regs.rax != -ENOSYS :
++        frontier != 1 || ((long)regs.rax != -512 && (long)regs.rax != -514))) return false;
++    pid_t pid = handoff_pid; handoff_pid = 0;
++    if (fflush(tcp->outf)) perror_msg_and_die("handoff trace flush");
++    off_t boundary = ftello(tcp->outf);
++    struct handoff_reply reply = {.pid = pid, .fd = frontier == 1 ? (int32_t)regs.rdi : -1, .syscall = regs.orig_rax, .bytes = boundary,
++        .started = tcp->handoff_started, .frontier = tcp->handoff_entered};
++    if (boundary < 0 || handoff_capture(pid, handoff_image, tcp->handoff_tid_state == 2 ? tcp->handoff_tid : 0)) reply.pid = -pid;
++    if (kill(pid, SIGKILL)) perror_msg_and_die("handoff retirement");
++    handoff_reply(reply);
++    return true;
++}
++
 +static void handoff_request(void)
 +{
 +    if (!handoff_requested) return;
@@ -263,7 +286,7 @@
  static void ATTRIBUTE_NOINLINE
  init(int argc, char *argv[])
  {
-@@ -2364,6 +2493,11 @@ init(int argc, char *argv[])
+@@ -2364,6 +2516,11 @@ init(int argc, char *argv[])
  		{ "help",		no_argument,	   0, 'h' },
  		{ "instruction-pointer", no_argument,      0, 'i' },
  		{ "interruptible",	required_argument, 0, 'I' },
@@ -275,7 +298,7 @@
  		{ "kill-on-exit",	no_argument,	   0, GETOPT_KILL_ON_EXIT },
  		{ "stack-trace" ,	optional_argument, 0, GETOPT_STACK },
  		{ "stack-traces" ,	optional_argument, 0, GETOPT_STACK },
-@@ -2564,6 +2698,15 @@ init(int argc, char *argv[])
+@@ -2564,6 +2721,15 @@ init(int argc, char *argv[])
  					  "by this build of strace");
  #endif
  			break;
@@ -291,7 +314,7 @@
  		case GETOPT_KILL_ON_EXIT:
  			opt_kill_on_exit = true;
  			break;
-@@ -3007,6 +3150,9 @@ init(int argc, char *argv[])
+@@ -3007,6 +3173,9 @@ init(int argc, char *argv[])
  
  	debug_msg("ptrace_setoptions = %#x", ptrace_setoptions);
  	test_ptrace_seize();
@@ -301,7 +324,7 @@
  	test_ptrace_get_syscall_info();
  
  	/*
-@@ -3288,6 +3434,12 @@ static struct tcb *
+@@ -3288,6 +3457,12 @@ static struct tcb *
  maybe_allocate_tcb(const int pid, int status)
  {
  	if (!WIFSTOPPED(status)) {
@@ -314,7 +337,7 @@
  		if (detach_on_execve && pid == strace_child) {
  			/* example: strace -bexecve sh -c 'exec true' */
  			strace_child = 0;
-@@ -3304,6 +3456,11 @@ maybe_allocate_tcb(const int pid, int status)
+@@ -3304,6 +3479,11 @@ maybe_allocate_tcb(const int pid, int status)
  		return NULL;
  	}
  	if (followfork) {
@@ -326,7 +349,7 @@
  		/* We assume it's a fork/vfork/clone child */
  		struct tcb *tcp = alloctcb(pid);
  		after_successful_attach(tcp, post_attach_sigstop);
-@@ -3588,6 +3745,7 @@ tcb_wait_tab_check_size(const size_t size)
+@@ -3588,6 +3768,7 @@ tcb_wait_tab_check_size(const size_t size)
  static const struct tcb_wait_data *
  next_event(void)
  {
@@ -334,34 +357,16 @@
  	if (interrupted)
  		return NULL;
  
-@@ -3913,6 +4071,26 @@ dispatch_event(const struct tcb_wait_data *wd)
+@@ -3913,6 +4094,8 @@ dispatch_event(const struct tcb_wait_data *wd)
  	 * around union wait fixed by glibc commit glibc-2.24~391
  	 */
  	int status = wd ? wd->status : 0;
 +    if (handoff_watch_stop(current_tcp, status)) return true;
-+    if (current_tcp && current_tcp->pid == handoff_pid && WIFSTOPPED(status) &&
-+        ((unsigned)status >> 16 == PTRACE_EVENT_STOP || WSTOPSIG(status) == syscall_trap_sig)) {
-+        pid_t pid = handoff_pid; handoff_pid = 0;
-+        struct user_regs_struct regs;
-+        if (current_tcp->handoff_tid_state == 1 || current_tcp->handoff_tid_state == 3 || !current_tcp->handoff_started ||
-+            !current_tcp->handoff_entered || ptrace(PTRACE_GETREGS, pid, 0, &regs) < 0 || !handoff_frontier(regs.orig_rax) ||
-+            ((long)regs.rax != -512 && (long)regs.rax != -514)) {
-+            handoff_reply((struct handoff_reply){0});
-+        } else {
-+            if (fflush(current_tcp->outf)) perror_msg_and_die("handoff trace flush");
-+            off_t boundary = ftello(current_tcp->outf);
-+            struct handoff_reply reply = {.pid = pid, .fd = regs.rdi, .syscall = regs.orig_rax, .bytes = boundary,
-+                .started = current_tcp->handoff_started, .frontier = current_tcp->handoff_entered};
-+            if (boundary < 0 || handoff_capture(pid, handoff_image, current_tcp->handoff_tid_state == 2 ? current_tcp->handoff_tid : 0)) reply.pid = -pid;
-+            if (kill(pid, SIGKILL)) perror_msg_and_die("handoff retirement");
-+            handoff_reply(reply);
-+            return true;
-+        }
-+    }
++    if (WIFSTOPPED(status) && ((unsigned)status >> 16 == PTRACE_EVENT_STOP || WSTOPSIG(status) == syscall_trap_sig) && handoff_stop(current_tcp, false)) return true;
  
  	if (current_tcp && has_seccomp_filter(current_tcp))
  		restart_op = seccomp_filter_restart_operator(current_tcp);
-@@ -3951,6 +4129,8 @@ dispatch_event(const struct tcb_wait_data *wd)
+@@ -3951,6 +4134,8 @@ dispatch_event(const struct tcb_wait_data *wd)
  		ATTRIBUTE_FALLTHROUGH;
  
  	case TE_SYSCALL_STOP:
@@ -370,10 +375,11 @@
  		if (trace_syscall(current_tcp, &restart_sig) < 0) {
  			/*
  			 * ptrace() failed in trace_syscall().
-@@ -3965,6 +4145,11 @@ dispatch_event(const struct tcb_wait_data *wd)
+@@ -3965,6 +4150,12 @@ dispatch_event(const struct tcb_wait_data *wd)
  			 */
  			return true;
  		}
++        if (exiting(current_tcp) && handoff_stop(current_tcp, true)) return true;
 +		/* Once the launcher has recorded the command's start, it runs untraced too. */
 +		if (children_only && current_tcp->pid == strace_child && entering(current_tcp) && started_process(current_tcp)) {
 +			detach(current_tcp);
@@ -382,7 +388,7 @@
  		if (has_seccomp_filter(current_tcp)) {
  			/*
  			 * Syscall and seccomp stops can happen in different
-@@ -4034,6 +4219,9 @@ dispatch_event(const struct tcb_wait_data *wd)
+@@ -4034,6 +4225,9 @@ dispatch_event(const struct tcb_wait_data *wd)
  		return true;
  
  	case TE_STOP_BEFORE_EXECVE:
@@ -392,7 +398,7 @@
  		/* The syscall succeeded, clear the flag.  */
  		current_tcp->flags &= ~TCB_CHECK_EXEC_SYSCALL;
  		/*
-@@ -4231,6 +4419,14 @@ main(int argc, char *argv[])
+@@ -4231,6 +4425,14 @@ main(int argc, char *argv[])
  {
  	setlocale(LC_ALL, "");
  	init(argc, argv);
