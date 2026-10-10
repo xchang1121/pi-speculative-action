@@ -1,4 +1,4 @@
-/** Bounded observational evidence, independent of replay authority and output identity. */
+/** Complete observational evidence, independent of replay authority and output identity. */
 export interface SerializedTimelineComputation {
 	readonly version: 1 | 2 | 3;
 	readonly root: string;
@@ -30,17 +30,13 @@ export interface SerializedTimelineNode {
 	}[];
 }
 
-/** Saturation drops the whole optional graph; it must never drop only an overhead cut. */
-export const TIMELINE_COMPUTATION_LIMITS = Object.freeze({ nodes: 256, edges: 1024, spans: 2048, groups: 1024, bytes: 128 * 1024 });
-
-/** Invalid telemetry is unavailable evidence, not an invalid execution certificate. */
+/** Validate complete telemetry and order dependencies before consumers; invalid evidence does not invalidate replay. */
 export function normalizeTimelineComputation(value: unknown): SerializedTimelineComputation | undefined {
 	try {
 		if (!record(value) || ![1, 2, 3].includes(value.version as number) || !identity(value.root) || !Array.isArray(value.nodes) ||
-			!value.nodes.length || value.nodes.length > TIMELINE_COMPUTATION_LIMITS.nodes) return undefined;
+			!value.nodes.length) return undefined;
 		const nodes: SerializedTimelineNode[] = [], byID = new Map<string, SerializedTimelineNode>();
 		const origins = new Map<string, number>();
-		let edges = 0, spans = 0, groups = 0;
 		for (const raw of value.nodes) {
 			if (!record(raw) || !identity(raw.id) || !identity(raw.clock) || byID.has(raw.id) || !endpoints(raw) ||
 				raw.priorMs !== undefined && !duration(raw.priorMs) || raw.timeOrigin !== undefined && !duration(raw.timeOrigin) ||
@@ -52,7 +48,7 @@ export function normalizeTimelineComputation(value: unknown): SerializedTimeline
 			let producer: SerializedTimelineNode["producer"];
 			let calculation: SerializedTimelineNode["spans"];
 			if (raw.spans !== undefined) {
-				if (!Array.isArray(raw.spans) || (spans += raw.spans.length) > TIMELINE_COMPUTATION_LIMITS.spans) return undefined;
+				if (!Array.isArray(raw.spans)) return undefined;
 				const parts: NonNullable<SerializedTimelineNode["spans"]>[number][] = [];
 				for (const part of raw.spans) {
 					if (!record(part) || !endpoints(part) || (part.startedAt as number) < (raw.startedAt as number) ||
@@ -67,19 +63,18 @@ export function normalizeTimelineComputation(value: unknown): SerializedTimeline
 			}
 			let aliases: readonly string[] | undefined;
 			if (raw.groups !== undefined) {
-				if (!Array.isArray(raw.groups) || raw.groups.length > TIMELINE_COMPUTATION_LIMITS.groups ||
-					!raw.groups.every(identity) || (groups += raw.groups.length) > TIMELINE_COMPUTATION_LIMITS.groups) return undefined;
+				if (!Array.isArray(raw.groups) || !raw.groups.every(identity)) return undefined;
 				aliases = Object.freeze([...new Set<string>(raw.groups)]);
 			}
 			const inputs: NonNullable<SerializedTimelineNode["inputs"]>[number][] = [];
 			if (raw.inputs !== undefined) {
-				if (!Array.isArray(raw.inputs) || (edges += raw.inputs.length) > TIMELINE_COMPUTATION_LIMITS.edges) return undefined;
+				if (!Array.isArray(raw.inputs)) return undefined;
 				for (const input of raw.inputs) {
 					if (!record(input) || !identity(input.id) || ["owned", "reused", "overhead", "computeUncertain"].some(
 						key => input[key] !== undefined && typeof input[key] !== "boolean")) return undefined;
 					const shared: { readonly clock: string; readonly startedAt: number; readonly completedAt: number }[] = [];
 					if (input.shared !== undefined) {
-						if (!Array.isArray(input.shared) || (spans += input.shared.length) > TIMELINE_COMPUTATION_LIMITS.spans) return undefined;
+						if (!Array.isArray(input.shared)) return undefined;
 						for (const span of input.shared) {
 							if (!record(span) || !identity(span.clock) || !endpoints(span)) return undefined;
 							shared.push(Object.freeze({ clock: span.clock, startedAt: span.startedAt as number, completedAt: span.completedAt as number }));
@@ -108,22 +103,22 @@ export function normalizeTimelineComputation(value: unknown): SerializedTimeline
 				owned.set(input.id, node.id);
 			}
 		}
-		const visiting = new Set<string>(), visited = new Set<string>();
-		const visit = (id: string): boolean => {
-			if (visiting.has(id)) return false;
-			if (visited.has(id)) return true;
-			visiting.add(id);
-			for (const input of byID.get(id)!.inputs ?? []) if (!visit(input.id)) return false;
-			visiting.delete(id); visited.add(id);
-			return true;
-		};
-		if (!visit(value.root) || visited.size !== nodes.length) return undefined;
-		const graph = Object.freeze({ version: value.version as 1 | 2 | 3, root: value.root, nodes: Object.freeze(nodes) });
-		return Buffer.byteLength(JSON.stringify(graph), "utf8") <= TIMELINE_COMPUTATION_LIMITS.bytes ? graph : undefined;
+		const visiting = new Set<string>(), visited = new Set<string>(), ordered: SerializedTimelineNode[] = [];
+		const pending = [{ id: value.root, finished: false }];
+		while (pending.length) {
+			const { id, finished } = pending.pop()!, node = byID.get(id)!;
+			if (finished) { visiting.delete(id); visited.add(id); ordered.push(node); continue; }
+			if (visited.has(id)) continue;
+			if (visiting.has(id)) return undefined;
+			visiting.add(id); pending.push({ id, finished: true });
+			for (const input of node.inputs ?? []) pending.push({ id: input.id, finished: false });
+		}
+		if (visited.size !== nodes.length) return undefined;
+		return Object.freeze({ version: value.version as 1 | 2 | 3, root: value.root, nodes: Object.freeze(ordered) });
 	} catch { return undefined; }
 }
 
 function record(value: unknown): value is Record<string, unknown> { return !!value && typeof value === "object" && !Array.isArray(value); }
-function identity(value: unknown): value is string { return typeof value === "string" && value.length > 0 && value.length <= 256 && !value.includes("\0"); }
+function identity(value: unknown): value is string { return typeof value === "string" && value.length > 0 && !value.includes("\0"); }
 function duration(value: unknown): value is number { return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= Number.MAX_SAFE_INTEGER; }
 function endpoints(value: Record<string, unknown>): boolean { return duration(value.startedAt) && duration(value.completedAt) && value.completedAt >= value.startedAt; }

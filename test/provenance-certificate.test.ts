@@ -11,15 +11,16 @@ import { createExecPrototype, dependencyPathsetKey, type DynamicDependency, type
 import { captureAbsenceDependency, captureDirectoryDependency, captureFileDependency, captureMetadataDependency,
 	captureSymlinkDependency, validateDynamicDependencyCertificate, validateProcessCertificate } from "../src/provenance-validation.ts";
 import { TaskTimeline, TimelineInterval } from "../src/task-timing.ts";
+import { ProvenanceCertificateStore } from "../src/reuse-store.ts";
 
 const { create: workspace, dispose } = temporaryDirectories("pi-provenance-");
 
 afterEach(dispose);
 
 describe("process provenance certificates", () => {
-	it("retains calculation graphs without changing execution identity", () => {
-		const input = new TimelineInterval(200, 250), overhead = new TimelineInterval(20, 40);
-		const original = new TimelineInterval(10, 110, [{ computation: overhead, overhead: true }, { computation: input, reused: true }]);
+	it.each([1, 4096])("retains calculation graphs on disk without changing execution identity (%s inputs)", async count => {
+		const inputs = Array.from({ length: count }, (_, index) => ({ computation: new TimelineInterval(200 + index * 50, 250 + index * 50), reused: true }));
+		const original = new TimelineInterval(10, 110, [{ computation: new TimelineInterval(20, 40), overhead: true }, ...inputs]);
 		const computation = TimelineInterval.serialize(original);
 		expect(computation).toBeDefined();
 		const plain = processCertificate(prototype()), measured = processCertificate(prototype(), {
@@ -30,8 +31,11 @@ describe("process provenance certificates", () => {
 		expect(parsed).toBeDefined();
 		expect(parsed.result.computation).toEqual(computation);
 		expect(Object.isFrozen(parsed.result.computation)).toBe(true);
-		const restored = TimelineInterval.restore(parsed.result.computation)!;
-		expect(new TaskTimeline(0).recordTool(restored, performance.now(), true)).toMatchObject({ toolComputeMs: 130, hiddenComputeMs: 130 });
+		const root = await workspace(); await new ProvenanceCertificateStore(root).put(parsed);
+		const stored = await new ProvenanceCertificateStore(root).get(parsed.id);
+		expect(stored?.result.computation).toEqual(computation);
+		const restored = TimelineInterval.restore(stored?.result.computation)!;
+		expect(new TaskTimeline(0).recordTool(restored, 1_000_000, true)).toMatchObject({ toolComputeMs: 80 + 50 * count, hiddenComputeMs: 80 + 50 * count });
 	});
 
 	it("ignores malformed accounting metadata without changing valid replay evidence", () => {

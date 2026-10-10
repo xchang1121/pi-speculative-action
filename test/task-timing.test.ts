@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { deferred } from "./async.ts";
-import { TaskTimeline, TimelineInterval, toolSpeedup, normalizeTimelineComputation, TIMELINE_COMPUTATION_LIMITS } from "../src/task-timing.ts";
+import { TaskTimeline, TimelineInterval, toolSpeedup, normalizeTimelineComputation } from "../src/task-timing.ts";
 
 describe("consumed calculation and time hidden before Actor issue", () => {
 	it("records execution boundaries and diagnoses the remaining control wait", async () => {
@@ -349,7 +349,7 @@ describe("consumed calculation and time hidden before Actor issue", () => {
 	});
 });
 
-describe("bounded persisted computation evidence", () => {
+describe("persisted computation evidence", () => {
 	const restore = (computation: TimelineInterval): TimelineInterval => {
 		const evidence = TimelineInterval.serialize(computation);
 		expect(evidence).toBeDefined();
@@ -377,7 +377,7 @@ describe("bounded persisted computation evidence", () => {
 		for (const roots of [[parent, left], [left, parent]]) expect(reused(roots)).toMatchObject(expected);
 		const graph = TimelineInterval.serialize(parent)!;
 		expect(Object.isFrozen(graph)).toBe(true);
-		expect(Object.isFrozen(graph.nodes[0]!.inputs)).toBe(true);
+		expect(Object.isFrozen(graph.nodes.find(node => node.id === graph.root)!.inputs)).toBe(true);
 	});
 
 	it.each([false, true])("deduplicates independently restored parents sharing a borrowed child (reverse=%s)", reverse => {
@@ -510,19 +510,29 @@ describe("bounded persisted computation evidence", () => {
 		expect(collected.dependencies).toEqual([]);
 	});
 
-	it("omits saturated evidence atomically instead of dropping excluded spans", () => {
-		const children = Array.from({ length: TIMELINE_COMPUTATION_LIMITS.nodes }, (_, index) => new TimelineInterval(index, index + 1));
-		const tooManyNodes = new TimelineInterval(0, 1000, children.map(computation => ({ computation, owned: true, shared: [computation] })));
-		expect(TimelineInterval.serialize(tooManyNodes)).toBeUndefined();
+	it("retains large calculation graphs and every excluded span through JSON persistence", () => {
+		const children = Array.from({ length: 4096 }, (_, index) => new TimelineInterval(index, index + 1));
+		const largeGraph = new TimelineInterval(0, 10_000, children.map(computation => ({ computation, owned: true, shared: [computation] })));
 		const child = new TimelineInterval(0, 1);
-		const tooManyEdges = new TimelineInterval(0, 1000, Array.from({ length: TIMELINE_COMPUTATION_LIMITS.edges + 1 }, () => ({ computation: child, overhead: true })));
-		expect(TimelineInterval.serialize(tooManyEdges)).toBeUndefined();
-		const tooManySpans = new TimelineInterval(0, 1000, [{ computation: child, overhead: true,
-			shared: Array.from({ length: TIMELINE_COMPUTATION_LIMITS.spans + 1 }, () => child) }]);
-		expect(TimelineInterval.serialize(tooManySpans)).toBeUndefined();
-		const nodes = Array.from({ length: 200 }, (_, index) => ({ id: `node-${index}`, clock: "synthetic", startedAt: 0, completedAt: 1,
-			producer: { source: "s".repeat(256), mode: "m".repeat(256) }, groups: ["g".repeat(256)] }));
-		expect(normalizeTimelineComputation({ version: 2, root: nodes[0]!.id,
-			nodes: nodes.map((node, index) => ({ ...node, ...(index === 0 ? { inputs: nodes.slice(1).map(input => ({ id: input.id })) } : {}) })) })).toBeUndefined();
+		const manyEdges = new TimelineInterval(0, 10_000, Array.from({ length: 4096 }, () => ({ computation: child, overhead: true })));
+		const spans = Array.from({ length: 131_072 }, (_, index) => new TimelineInterval(index, index + 0.5));
+		const manySpans = new TimelineInterval(0, spans.length, [{ computation: new TimelineInterval(0, spans.length), overhead: true, shared: spans }]);
+		const activeSpans = new TimelineInterval(0, spans.length, [], spans);
+		const groups = TimelineInterval.retained("long-id".repeat(128), 0, new TimelineInterval(0, 10_000));
+		for (let index = 0; index < 4096; index++) TimelineInterval.group(groups, {});
+		let deep = child, owned = child;
+		for (let index = 0; index < 8192; index++) {
+			deep = new TimelineInterval(index + 1, index + 2, [{ computation: deep }]);
+			owned = new TimelineInterval(index + 1, index + 2, [{ computation: owned, owned: true }]);
+		}
+		TimelineInterval.producedBy(owned, { source: "pattern", mode: "whole" });
+		for (const [computation, total] of [[largeGraph, 10_000], [manyEdges, 9999], [manySpans, 65_536], [activeSpans, 65_536],
+			[groups, 10_000], [deep, 8193], [TimelineInterval.attempted(deep), 8193]] as const) {
+			const saved = restore(computation);
+			expect(new TaskTimeline(0).recordTool(saved, 1_000_000, true)).toMatchObject({ toolComputeMs: total, hiddenComputeMs: total });
+			for (const issuedAt of [0, 500, 1_000_000]) expect(new TaskTimeline(0).recordCall([{ computation: saved, reused: true }], issuedAt, 1_000_000))
+				.toEqual(new TaskTimeline(0).recordCall([{ computation, reused: true }], issuedAt, 1_000_000));
+		}
+		expect(Buffer.byteLength(JSON.stringify(TimelineInterval.serialize(largeGraph)))).toBeGreaterThan(128 * 1024);
 	});
 });
