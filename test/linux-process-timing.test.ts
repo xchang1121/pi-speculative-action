@@ -104,7 +104,7 @@ describe("held native computation accounting", () => {
 		expect(plan.artifacts.read).not.toHaveBeenCalled();
 	});
 
-	it("publishes top-level preparation and nested work with replay overhead excluded", async () => {
+	it("includes original proof and sealing with replay overhead excluded", async () => {
 		const backend = new LinuxProcessReuseBackend({ storeRoot: path.join(os.tmpdir(), "published-clock-fixture") });
 		const internal = backend as unknown as { planner: { publishCompleted: (...args: unknown[]) => Promise<boolean> };
 			publishTopLevel: (session: unknown, changes: readonly unknown[]) => Promise<void> };

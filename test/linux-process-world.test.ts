@@ -80,27 +80,42 @@ describe("Linux process ExecutionWorld", () => {
 	});
 
 
-	test("prepares with a long temporary path and removes its restricted short broker socket", { timeout: 20_000 }, async ({ skip }) => {
+	test.for(["missing", "appeared", "file", "blocked", "symlink", "lexical"] as const)("proves only absent host lookups and cleans its long-path broker (%s)", { timeout: 20_000 }, async (mode, { skip }) => {
 		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-long-broker-")), previous = process.env.TMPDIR;
 		const temporary = path.join(root, "nested-temporary-directory-".repeat(3));
 		await mkdir(temporary); process.env.TMPDIR = temporary;
 		const listening = vi.spyOn(net.Server.prototype, "listen");
+		const target = `${root}/candidate${mode === "blocked" ? "/child" : mode === "lexical" ? "/../other" : ""}`;
+		if (mode === "file" || mode === "blocked") await writeFile(path.join(root, "candidate"), "prepared");
+		if (mode === "symlink") await filesystem.symlink("absent", target);
+		const { lstat } = await vi.importActual<typeof filesystem>("node:fs/promises");
+		const probing = vi.spyOn(filesystem, "lstat").mockImplementation(async (...args) => {
+			if (mode === "appeared" && String(args[0]) === target) await writeFile(target, "appeared");
+			return lstat(...args);
+		});
 		let fixture: Awaited<ReturnType<typeof createLinuxProcessBenchmark>> | undefined;
 		try {
 			fixture = await createLinuxProcessBenchmark("command-", "git");
 			await writeFile(path.join(fixture.workspace, "input.txt"), "input\n");
 			await commitBenchmarkFixture(fixture.workspace, "long temporary path");
 			const prepared = await prepareLinuxProcessReuse(fixture);
-			const branch = await forkReusableBash(fixture, { label: "long-path", command: "printf prepared", actionNamespace: "test", ...prepared });
-			try { expect(textOutput(branch.output.result)).toBe("prepared"); }
+			const branch = await forkReusableBash(fixture, { label: "long-path", command: `/bin/cat '${target}' 2>/dev/null || printf prepared`, actionNamespace: "test", ...prepared });
+			try {
+				expect(textOutput(branch.output.result)).toBe("prepared");
+				expect(await branch.validate?.()).toMatchObject({ status: mode === "missing" ? "valid" : "indeterminate" });
+				if (mode === "missing") {
+					await writeFile(target, "appeared");
+					expect(await branch.validate?.()).toMatchObject({ status: "stale" });
+				}
+			}
 			finally { await branch.dispose(); }
 			const sockets = listening.mock.calls.flatMap(([target]) => typeof target === "string" && target.startsWith("/tmp/pi-broker-") ? [target] : []);
 			expect(sockets).toHaveLength(1);
 			expect(filesystem.chmod).toHaveBeenCalledWith(sockets[0], 0o600);
 			await expect(filesystem.access(sockets[0]!)).rejects.toMatchObject({ code: "ENOENT" });
 		} finally {
-			await fixture?.dispose(); listening.mockRestore();
+			await fixture?.dispose(); listening.mockRestore(); probing.mockRestore();
 			if (previous === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = previous;
 			await rm(root, { recursive: true, force: true });
 		}
@@ -417,7 +432,8 @@ int main(int argc, char **argv) {
 				text: item.text.replace(/^seedA/, `actual${mode === "changed" ? "D" : "A"}`) } : item));
 			const resumed = mode !== "changed" && mode !== "identity" && mode !== "cancel";
 			expect(fixture.backend.actorMetrics().joinedHits, diagnostic()).toBe(Number(resumed));
-			if (resumed) expect(publishing.mock.calls.some(([, , certificate]) => certificate?.result.continuation), diagnostic()).toBe(true);
+			if (resumed) expect(publishing.mock.calls.some(([, , certificate, , continuation, computation]) => certificate?.result.continuation &&
+				continuation && computation && computation.completedAt > continuation.computation.completedAt), diagnostic()).toBe(true);
 			if (mode !== "cancel") await host.finishTurn("prepared", true);
 			await expect.poll(() => existsSync(`/proc/${privatePid}`), { timeout: 5_000 }).toBe(false); // Retirement kills asynchronously, as for cancel.
 			if (resumed) expect(events.filter(event => event.type === "operation_prediction"), diagnostic()).toContainEqual(expect.objectContaining({ settlement: expect.objectContaining({

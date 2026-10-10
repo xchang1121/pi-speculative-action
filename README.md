@@ -69,6 +69,4 @@ npm test -- --maxWorkers=1 --no-file-parallelism
 npm run bench:check
 ```
 
-[test](./test) 覆盖匹配、隔离、效果提交与清理；[bench](./bench/README.md) 提供真实后端资格、搜索路径和完整模型任务的验证入口。
-
-计量区分 Actor 当前仍需完成的计算 `E`、实际消费的毛复用计算 `R` 和完整工具等待。`toolSpeedup = (E + R) / E` 描述计算复用，不能直接当作任务端到端加速；统计与验收口径见[验证说明](./bench/README.md)。
+[test](./test) 覆盖匹配、隔离、效果提交与清理；[验证说明](./bench/README.md) 提供真实后端资格、搜索路径、完整模型任务和计量规则。`toolSpeedup = T / (T - H)`，T 为本次调用实际使用的全部计算，含成果首次生成所必需的证明和封存，H 为其中实际复用且在 Actor 发出调用前完成的部分；采纳当次的验新、拷贝、恢复和交付仅供内部优化，不进入公式。该比值不代表任务端到端加速。

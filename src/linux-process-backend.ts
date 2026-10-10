@@ -1427,8 +1427,8 @@ export class LinuxProcessReuseBackend {
 					transitions.push({ id: input.alias, kind: event.kind, data: await this.store.artifacts.put(event.data), ...(event.requested !== undefined ? { requested: event.requested } : {}) });
 				}
 				const { exit, ...prefixResult } = baseResult;
-				// A transferred prefix consumes its original local setup too; its native frontier stays unchanged.
-				const computation = this.processComputation(session, work.startedAt, continuation?.computation.completedAt ?? performance.now(), observation.pids, preparation);
+				// A transferred prefix includes producing its proof and sealed image; the separate native frontier is unchanged.
+				const computation = this.processComputation(session, work.startedAt, performance.now(), observation.pids, preparation);
 				const recorded = TimelineInterval.serialize(computation);
 				const result: ProcessResultRecord = { ...prefixResult, ...(continuation ? { continuation: { imageDigest: sha256Digest(continuation.image), imageBytes: continuation.image.length } } : { exit: exit! }),
 					...(recorded ? { computation: recorded } : {}),
@@ -1914,8 +1914,7 @@ function actorHeldComputations(timings: readonly ActorHeldTiming[], overflow?: H
 		const end = timing.barrier === "descriptors" && timing.committedAt !== undefined ? timing.committedAt : timing.completedAt;
 		return [{ computation: new TimelineInterval(timing.requestedAt, end), overhead: true } satisfies TimelineDependency];
 	});
-	// An unknown Actor denominator must not turn into inflated gross credit when the observation is later reused.
-	// Mask ambiguous pauses everywhere; this may omit parallel work, so it is a lower bound rather than an estimate.
+	// Mask ambiguous pauses in Actor and reused computation; unobserved overlap makes this only a lower bound.
 	const sharedPauses = ambiguous ? [...pauses.map(({ computation }) => ({ computation, overhead: true })), ...(omitted ? [omitted] : [])] : globalPauses;
 	const computations: TimelineDependency[] = pauses.map(({ timing, computation }) => ({ computation, overhead: true,
 		// A local hold can overlap unobserved siblings, shell work or a restored continuation's tail.
@@ -2015,11 +2014,8 @@ async function sourceDirectoryChanges(
 		}
 		const sourceBefore = await readSandboxDirectoryState(target);
 		const before = effect.change.before ? directoryState(effect.change.before) : undefined;
-		if (before === undefined) {
-			if (sourceBefore !== undefined) throw new Error(`directory creation baseline changed: ${resource}`);
-		} else if (!sameSandboxState(sourceBefore, before)) {
-			throw new Error(`source directory differs from execution baseline: ${resource}`);
-		}
+		if (!sameSandboxState(sourceBefore, before))
+			throw new Error(`${before === undefined ? "directory creation baseline changed" : "source directory differs from execution baseline"}: ${resource}`);
 		changes.push({
 			kind: "directory",
 			root: session.sourceRoot,
@@ -2143,7 +2139,7 @@ async function captureDependencies(session: ActiveSession, snapshot: WorkspaceSt
 	for (const lock of locks) if (await (session.projection.isWorkspacePhysical(lock.path) ? before(lock.path) : lstat(lock.path).catch(() => undefined))) {
 		add({ kind: "lock", path: session.projection.isWorkspacePhysical(lock.path) ? session.projection.toLogical(lock.path) : slash(lock.path), exclusive: lock.exclusive });
 	}
-	const pending = [...observed], seenImages = new Set<string>(), hostPaths = new Map<string, { physical: string; role: Exclude<ObservedProcessPath["role"], "metadata">; listed: boolean }>();
+	const pending = [...observed], seenImages = new Set<string>(), hostPaths = new Map<string, { physical: string; role: Exclude<ObservedProcessPath["role"], "metadata">; listed: boolean; absent: boolean }>();
 	for (let item = pending.shift(); item; item = pending.shift()) {
 		const follow = item.role !== "metadata" || item.followSymlinks, walked = await walk(item.path, follow);
 		// A failed walk depends on its blocking file and links, not on an absent leaf. Only the same
@@ -2199,18 +2195,18 @@ async function captureDependencies(session: ActiveSession, snapshot: WorkspaceSt
 			add(await workspaceDependency(physical, session.projection.toLogical(physical), item.role, !!item.listed));
 			continue;
 		}
-		hostPaths.set(`${item.role}\0${physical}`, { physical, role: item.role, listed: !!item.listed });
+		const key = `${item.role}\0${physical}`, previous = hostPaths.get(key);
+		hostPaths.set(key, { physical, role: item.role, listed: !!item.listed || !!previous?.listed,
+			absent: item.lookupFailure === "ENOENT" && !item.path.split("/").includes("..") && previous?.absent !== false });
 	}
 	// Host files are independent of each other and of the workspace: capture them concurrently (walking what they share once), add them in trace order.
 	const capture = sharedWalk();
-	const hostCaptures = await mapFilesystem([...hostPaths.values()], ({ physical, role, listed }) =>
-		captureHostPath(physical, role, listed, capture).then(value => ({ value }), (error: unknown) => ({ error })));
-	[...hostPaths.values()].forEach(({ physical }, index) => {
-		const captured = hostCaptures[index]!;
-		if ("error" in captured) { complete = false; taints.add("trace_incomplete"); incompleteReasons.add(`capture:${physical}:${errorMessage(captured.error)}`); }
+	for (const captured of await mapFilesystem([...hostPaths.values()], ({ physical, role, listed, absent }) =>
+		captureHostPath(physical, role, listed, absent, capture).then(value => ({ physical, value }), (error: unknown) => ({ physical, error })))) {
+		if ("error" in captured) { complete = false; taints.add("trace_incomplete"); incompleteReasons.add(`capture:${captured.physical}:${errorMessage(captured.error)}`); }
 		else if (captured.value) for (const dependency of captured.value) add(dependency);
-		else { taints.add("mutable_input"); add(undefined, `mutable:${physical}`); }
-	});
+		else { taints.add("mutable_input"); add(undefined, `mutable:${captured.physical}`); }
+	}
 	for (const effect of effects.effects) {
 		const physical = session.projection.toPhysical(effect.logicalPath);
 		if (!physical) { complete = false; incompleteReasons.add(`effect_unmapped:${effect.logicalPath}`); continue; }
@@ -2231,17 +2227,18 @@ function workspaceMetadataExclusions(session: ActiveSession, target: string): re
 	return path.resolve(target) === path.resolve(session.workspace.sandboxRoot) ? session.workspace.observationExcludes : undefined;
 }
 
-async function captureHostPath(physicalPath: string, role: Exclude<ObservedProcessPath["role"], "metadata">, listed: boolean,
+async function captureHostPath(physicalPath: string, role: Exclude<ObservedProcessPath["role"], "metadata">, listed: boolean, absent: boolean,
 	capture?: (target: string) => ReturnType<typeof captureFilesystemEntry>): Promise<readonly DynamicDependency[] | undefined> {
+	// A uniformly failed lookup depends on this exact name remaining absent, including under mutable roots.
+	if (absent) {
+		const dependency = await captureAbsenceDependency(physicalPath, slash(physicalPath), false);
+		return dependency ? [dependency] : undefined;
+	}
 	const dependencies: DynamicDependency[] = [];
 	for await (const { path: current, info, link, terminal } of walkFilesystemPath(path.resolve(physicalPath), capture ? { capture } : {})) {
-		// A runtime socket's absence validates exactly; what exists under these roots changes without a trace.
+		// What exists under these roots changes without a trace; absence was independently proved above.
 		if (["/proc", "/sys", "/dev", "/run", "/tmp", "/var/tmp"].some((root) => pathContains(root, current)) && (!pathContains("/run", current) || info && terminal)) return undefined;
-		if (!info) {
-			const absence = await captureAbsenceDependency(current, slash(current), false); // A case-sensitive lookup proves itself; siblings may come and go.
-			if (!absence) throw new Error("host dependency changed during capture");
-			return [...dependencies, absence];
-		}
+		if (!info) return undefined;
 		// Root's files, and this user's own outside the workspace (a PATH through ~/.local or nvm), validate exactly; no one else may write them.
 		if (info.uid !== 0n && info.uid !== BigInt(process.getuid?.() ?? -1) || (link === undefined && (info.mode & 0o022n) !== 0n)) return undefined;
 		if (link !== undefined) dependencies.push({ kind: "symlink", path: slash(current), target: link, targetDigest: sha256Digest(Buffer.from(link, "utf8")) });
