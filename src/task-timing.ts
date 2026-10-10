@@ -1,8 +1,8 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { nonNegativeFinite as metric } from "./number-utils.ts";
-import { normalizeTimelineComputation, TIMELINE_COMPUTATION_LIMITS, type SerializedTimelineComputation, type SerializedTimelineNode } from "./timeline-computation.ts";
-export { normalizeTimelineComputation, TIMELINE_COMPUTATION_LIMITS, type SerializedTimelineComputation } from "./timeline-computation.ts";
+import { normalizeTimelineComputation, type SerializedTimelineComputation, type SerializedTimelineNode } from "./timeline-computation.ts";
+export { normalizeTimelineComputation, type SerializedTimelineComputation } from "./timeline-computation.ts";
 
 export interface TimelineDependency {
 	readonly computation: TimelineInterval;
@@ -84,13 +84,18 @@ export class TimelineInterval {
 
 	/** An abandoned evaluation spent its own calculation, but did not successfully consume borrowed work. */
 	static attempted(computation: TimelineInterval): TimelineInterval {
-		const copies = new Map<TimelineInterval, TimelineInterval>();
-		const copy = (current: TimelineInterval): TimelineInterval => {
-			const existing = copies.get(current);
-			if (existing) return existing;
+		const copies = new Map<TimelineInterval, TimelineInterval>(), pending = [{ current: computation, finished: false }];
+		while (pending.length) {
+			const { current, finished } = pending.pop()!;
+			if (copies.has(current)) continue;
+			if (!finished) {
+				pending.push({ current, finished: true });
+				for (const input of dependencies.get(current) ?? []) if (!input.reused) pending.push({ current: input.computation, finished: false });
+				continue;
+			}
 			const result = new TimelineInterval(current.startedAt, current.completedAt, (dependencies.get(current) ?? []).map(input =>
 				input.reused ? { computation: input.computation, overhead: true, shared: input.shared }
-					: { ...input, computation: copy(input.computation) }), calculationSpans.get(current));
+					: { ...input, computation: copies.get(input.computation)! }), calculationSpans.get(current));
 			identities.set(result, computationIdentity(current)); clocks.set(result, computationClock(current));
 			const timeOrigin = computationTimeOrigin(current);
 			if (timeOrigin !== undefined) timeOrigins.set(result, timeOrigin);
@@ -99,9 +104,8 @@ export class TimelineInterval {
 			if (producer) producers.set(result, producer);
 			if (groups) concurrencyGroups.set(result, groups);
 			copies.set(current, result);
-			return result;
-		};
-		return copy(computation);
+		}
+		return copies.get(computation)!;
 	}
 
 	static exclude(computation: TimelineInterval, computeUncertain = false): void {
@@ -137,11 +141,15 @@ export class TimelineInterval {
 
 	/** Diagnostic provenance belongs to the physical producer; later consumers cannot replace it. */
 	static producedBy(computation: TimelineInterval, producer: ComputationProducer): void {
-		if (producers.has(computation)) return;
-		const owner = computationProducer(computation) ?? Object.freeze({ source: producer.source,
-			...(producer.mode !== undefined ? { mode: producer.mode } : {}) });
-		producers.set(computation, owner);
-		for (const input of dependencies.get(computation) ?? []) if (input.owned) TimelineInterval.producedBy(input.computation, owner);
+		const pending = [{ computation, producer }];
+		while (pending.length) {
+			const { computation: current, producer } = pending.pop()!;
+			if (producers.has(current)) continue;
+			const owner = computationProducer(current) ?? Object.freeze({ source: producer.source,
+				...(producer.mode !== undefined ? { mode: producer.mode } : {}) });
+			producers.set(current, owner);
+			for (const input of dependencies.get(current) ?? []) if (input.owned) pending.push({ computation: input.computation, producer: owner });
+		}
 	}
 
 	/** A production can establish parallelism before its enclosing interval exists. */
@@ -157,50 +165,36 @@ export class TimelineInterval {
 		return computation;
 	}
 
-	/** Persist the same immutable evidence used by recordCall; saturation omits the entire graph. */
+	/** Persist the complete immutable evidence used by recordCall, regardless of graph size. */
 	static serialize(computation: TimelineInterval): SerializedTimelineComputation | undefined {
 		const selected = new Map<string, { computation: TimelineInterval; groups: Set<string>; producer?: ComputationProducer | null }>();
-		const visited = new Set<TimelineInterval>();
-		let valid = true, edgeCount = 0, spanCount = 0, groupCount = 0;
-		const visit = (current: TimelineInterval): void => {
-			if (!valid || visited.has(current)) return;
+		const visited = new Set<TimelineInterval>(), pending = [computation];
+		while (pending.length) {
+			const current = pending.pop()!;
+			if (visited.has(current)) continue;
 			visited.add(current);
-			if (visited.size > TIMELINE_COMPUTATION_LIMITS.nodes * 4) { valid = false; return; }
 			const id = computationIdentity(current), prior = selected.get(id);
 			const chosen = preferredComputation(prior?.computation, current);
 			const groups = prior?.groups ?? new Set<string>();
-			const aliases = computationGroups(current, true, TIMELINE_COMPUTATION_LIMITS.groups);
-			if (aliases.size > TIMELINE_COMPUTATION_LIMITS.groups) { valid = false; return; }
-			for (const group of aliases) if (!groups.has(group)) { groups.add(group); groupCount++; }
-			if (groupCount > TIMELINE_COMPUTATION_LIMITS.groups) { valid = false; return; }
+			for (const group of computationGroups(current, true)) groups.add(group);
 			const producer = computationProducer(current);
 			selected.set(id, { computation: chosen, groups, producer: mergeProducers(prior?.producer, producer) });
 			publishedIdentities.add(current);
-			if (selected.size > TIMELINE_COMPUTATION_LIMITS.nodes) { valid = false; return; }
-			for (const input of dependencies.get(current) ?? []) {
-				spanCount += input.shared?.length ?? 0;
-				if (++edgeCount > TIMELINE_COMPUTATION_LIMITS.edges * 4 || spanCount > TIMELINE_COMPUTATION_LIMITS.spans * 4) {
-					valid = false; return;
-				}
-				visit(input.computation);
-			}
-		};
-		visit(computation);
-		if (!valid) return undefined;
-		const reachable = new Set<string>();
-		const include = (id: string): void => {
-			if (reachable.has(id)) return;
+			const inputs = dependencies.get(current) ?? [];
+			for (let index = inputs.length - 1; index >= 0; index--) pending.push(inputs[index]!.computation);
+		}
+		const reachable = new Set<string>(), remaining = [computationIdentity(computation)];
+		while (remaining.length) {
+			const id = remaining.pop()!;
+			if (reachable.has(id)) continue;
 			reachable.add(id);
-			for (const input of dependencies.get(selected.get(id)!.computation) ?? []) include(computationIdentity(input.computation));
-		};
-		include(computationIdentity(computation));
+			for (const input of dependencies.get(selected.get(id)!.computation) ?? []) remaining.push(computationIdentity(input.computation));
+		}
 		const nodes: SerializedTimelineNode[] = [];
 		for (const [id, { computation: current, groups, producer }] of selected) {
 			if (!reachable.has(id)) continue;
 			const priorMs = provenance.get(current)?.priorMs;
 			const spans = calculationSpans.get(current);
-			spanCount += spans?.length ?? 0;
-			if (spanCount > TIMELINE_COMPUTATION_LIMITS.spans * 4) return undefined;
 			nodes.push({ id, clock: computationClock(current), startedAt: current.startedAt, completedAt: current.completedAt,
 				...(computationTimeOrigin(current) !== undefined ? { timeOrigin: computationTimeOrigin(current) } : {}),
 				...(spans ? { spans: spans.map(({ startedAt, completedAt }) => ({ startedAt, completedAt })) } : {}),
@@ -222,30 +216,26 @@ export class TimelineInterval {
 	static restore(value: unknown): TimelineInterval | undefined {
 		const graph = normalizeTimelineComputation(value);
 		if (!graph) return undefined;
-		const nodes = new Map(graph.nodes.map(node => [node.id, node])), restored = new Map<string, TimelineInterval>();
-		const restore = (id: string): TimelineInterval => {
-			const existing = restored.get(id);
-			if (existing) return existing;
-			const node = nodes.get(id)!;
+		const restored = new Map<string, TimelineInterval>();
+		for (const node of graph.nodes) {
 			const current = new TimelineInterval(node.startedAt, node.completedAt, (node.inputs ?? []).map(input => ({
-				computation: restore(input.id), owned: input.owned, reused: input.reused, overhead: input.overhead,
+				computation: restored.get(input.id)!, owned: input.owned, reused: input.reused, overhead: input.overhead,
 				computeUncertain: input.computeUncertain, shared: input.shared?.map(part => {
 					const span = new TimelineInterval(part.startedAt, part.completedAt);
 					clocks.set(span, part.clock);
 					return span;
 				}),
 			})), node.spans?.map(span => new TimelineInterval(span.startedAt, span.completedAt)));
-			identities.set(current, id); publishedIdentities.add(current);
+			identities.set(current, node.id); publishedIdentities.add(current);
 			clocks.set(current, node.clock);
 			if (node.timeOrigin !== undefined) timeOrigins.set(current, node.timeOrigin);
-			provenance.set(current, { id, priorMs: node.priorMs ?? 0 });
+			provenance.set(current, { id: node.id, priorMs: node.priorMs ?? 0 });
 			if (node.groups) concurrencyGroups.set(current, new Set(node.groups));
 			if (node.producer) producers.set(current, node.producer);
 			if (node.incomplete) incompleteReuse.add(current);
-			restored.set(id, current);
-			return current;
-		};
-		return restore(graph.root);
+			restored.set(node.id, current);
+		}
+		return restored.get(graph.root);
 	}
 
 	/** Retained history contributes its measured duration even without a same-process clock. */
@@ -338,19 +328,21 @@ export class TaskTimeline {
 		let complete = true, hiddenComputeIncomplete = !Number.isFinite(issuedAt);
 		let adoptionComplete = Number.isFinite(issuedAt) && completedAt !== undefined && Number.isFinite(completedAt) && completedAt >= issuedAt;
 		const observed: TimelineInterval[] = [];
-		const visit = (input: TimelineDependency, inheritedReuse = false): void => {
+		const pending = roots.map(input => ({ input, inheritedReuse: false })).reverse();
+		while (pending.length) {
+			const { input, inheritedReuse } = pending.pop()!;
 			if (input.computeUncertain) { complete = false; if (inheritedReuse || input.reused) hiddenComputeIncomplete = true; }
-			if (input.overhead) return;
+			if (input.overhead) continue;
 			const computation = input.computation, reused = inheritedReuse || !!input.reused, flag = reused ? 2 : 1;
-			if ((visited.get(computation) ?? 0) & flag) return;
+			if ((visited.get(computation) ?? 0) & flag) continue;
 			visited.set(computation, (visited.get(computation) ?? 0) | flag);
 			const key = computationIdentity(computation), previous = selected.get(key);
 			for (const group of computationGroups(computation)) groups.join(key, group);
 			selected.set(key, { computation: preferredComputation(previous?.computation, computation),
 				flags: (previous?.flags ?? 0) | flag, producer: mergeProducers(previous?.producer, computationProducer(computation)) });
-			for (const dependency of dependencies.get(computation) ?? []) visit(dependency, reused);
-		};
-		for (const root of roots) visit(root);
+			const inputs = dependencies.get(computation) ?? [];
+			for (let index = inputs.length - 1; index >= 0; index--) pending.push({ input: inputs[index]!, inheritedReuse: reused });
+		}
 		const grouped = [new Map<string, TimelineInterval[]>(), new Map<string, TimelineInterval[]>()];
 		const attributed = new Map<string, { interval: TimelineInterval; producer?: ComputationProducer }[]>();
 		const modes = new Map<string, ModeComputationTiming>();
@@ -376,25 +368,27 @@ export class TaskTimeline {
 			const origin = computationTimeOrigin(computation);
 			const cutoff = computationClock(computation) === identityNamespace ? issuedAt : origin === undefined ? NaN : issuedAt + (performance.timeOrigin - origin);
 			if (priorMs > 0 || all.length > 0 && !Number.isFinite(cutoff)) adoptionComplete = false;
-			if (adoptionComplete) observed.push(...all.map(span => ({ startedAt: span.startedAt + issuedAt - cutoff, completedAt: span.completedAt + issuedAt - cutoff })));
+			if (adoptionComplete) for (const span of all) observed.push({ startedAt: span.startedAt + issuedAt - cutoff, completedAt: span.completedAt + issuedAt - cutoff });
 			const hidden = flags & 2 && Number.isFinite(cutoff) ? all.filter(span => span.startedAt < cutoff)
 				.map(span => ({ startedAt: span.startedAt, completedAt: Math.min(span.completedAt, cutoff) })) : [];
 			for (const [index, intervals] of [all, hidden].entries()) {
 				const group = grouped[index]!.get(owner) ?? [];
-				group.push(...intervals); grouped[index]!.set(owner, group);
+				for (const interval of intervals) group.push(interval);
+				grouped[index]!.set(owner, group);
 			}
 			if (flags & 2) {
 				reused = true;
 				if (priorMs > 0 || all.length > 0 && !Number.isFinite(cutoff)) hiddenComputeIncomplete = true;
 				const group = attributed.get(owner) ?? [];
-				group.push(...hidden.map(interval => ({ interval, producer: producer?.mode ? producer : undefined }))); attributed.set(owner, group);
+				for (const interval of hidden) group.push({ interval, producer: producer?.mode ? producer : undefined });
+				attributed.set(owner, group);
 			}
 		}
 		for (const [index, groupsByOwner] of grouped.entries()) for (const all of groupsByOwner.values()) totals[index]! += unionDuration(all);
 		for (const spans of attributed.values()) attributeUnion(spans, credit, producerKey);
 		const hiddenByMode = Object.freeze([...modes.values()].map(value => Object.freeze(value)));
 		const adoption = complete && adoptionComplete ? exclusiveIntervals(new TimelineInterval(issuedAt, completedAt!), observed) : undefined;
-		if (adoption) this.adoptionWaits?.push(...adoption); else this.adoptionWaits = undefined;
+		if (adoption) { for (const interval of adoption) this.adoptionWaits?.push(interval); } else this.adoptionWaits = undefined;
 		const timing = Object.freeze({ toolComputeMs: complete ? totals[0]! : undefined, hiddenComputeMs: totals[1]!,
 			...(adoption ? { adoptionWaitMs: unionDuration(adoption) } : {}),
 			...(reused ? { reused: true as const } : {}), ...(hiddenComputeIncomplete ? { hiddenComputeIncomplete: true as const } : {}),
@@ -441,19 +435,15 @@ function preferredComputation(previous: TimelineInterval | undefined, current: T
 }
 
 /** Follow ownership only to obtain aliases; ancestors are never selected as consumed work. */
-function computationGroups(computation: TimelineInterval, publish = false, limit = Infinity): ReadonlySet<string> {
+function computationGroups(computation: TimelineInterval, publish = false): ReadonlySet<string> {
 	const groups = new Set<string>(), visited = new Set<TimelineInterval>();
 	let current: TimelineInterval | undefined = computation;
 	while (current && !visited.has(current)) {
 		visited.add(current);
 		if (publish) publishedIdentities.add(current);
-		for (const group of concurrencyGroups.get(current) ?? []) {
-			groups.add(group);
-			if (groups.size > limit) return groups;
-		}
+		for (const group of concurrencyGroups.get(current) ?? []) groups.add(group);
 		const owner = owners.get(current);
 		if (owner) groups.add(computationIdentity(owner));
-		if (groups.size > limit) return groups;
 		current = owner;
 	}
 	return groups;
@@ -463,10 +453,9 @@ function computationGroups(computation: TimelineInterval, publish = false, limit
 class ComputationGroups {
 	private readonly parents = new Map<string, string>();
 	owner(id: string): string {
-		const parent = this.parents.get(id);
-		if (!parent) return id;
-		const owner = this.owner(parent);
-		if (owner !== parent) this.parents.set(id, owner);
+		let owner = id;
+		while (this.parents.has(owner)) owner = this.parents.get(owner)!;
+		while (this.parents.has(id)) { const parent = this.parents.get(id)!; this.parents.set(id, owner); id = parent; }
 		return owner;
 	}
 	join(left: string, right: string): void {
