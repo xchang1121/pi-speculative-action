@@ -5,7 +5,7 @@ import type { CandidateEventDescriptor, SpeculativeActionEvent } from "./events.
 import type { ExecutionOperationAdoption, ExecutionOperationBinding, ExecutionScope, SpeculativeExecutionRoute, WorldBranch, WorldResultCapture } from "./execution-world.ts";
 import type { PlanAction, PlanProposal, PlanUpdate } from "./plan-proposal.ts";
 import type { ActorActionIdentity, ActorActionSettlement, PlanActionIdentity, PredictionSettlement, SettledSourceRequest } from "./settlement.ts";
-import type { ComputationReuseShare, TimelineInterval, ToolComputationTiming } from "./task-timing.ts";
+import type { TimelineInterval, ToolComputationTiming } from "./task-timing.ts";
 
 export type { SpeculativeActionEvent, SpeculativeCacheSnapshot } from "./events.ts";
 
@@ -84,8 +84,6 @@ export interface ActorActionFeedback<SessionID> extends TurnIdentity<SessionID> 
 	/** Opaque producer-owned feedback of the execution owner, including cross-turn cache adoption. */
 	readonly candidateFeedback?: unknown;
 	readonly computation?: ToolComputationTiming;
-	/** Measured consumption attributed to live physical producers, including partial Actor fallback reuse. */
-	readonly reusedComputations?: readonly ComputationReuseShare[];
 }
 
 /** Policy-facing prediction outcome with the tool context omitted from generic settlement identity. */
@@ -315,7 +313,7 @@ export interface PreparedActorCall<Output> {
 
 export interface SpeculativeActionRuntime<SessionID, Output, StartInput, ConsumeInput, FinishInput> {
 	/** Measure the complete authoritative call against its originating task, including errors and fallback. */
-	readonly trackActorTool: <Value>(sessionID: SessionID, execute: () => Promise<Value>) => Promise<Value>;
+	readonly trackActorTool: <Value>(sessionID: SessionID, execute: (issuedAt: number) => Promise<Value>) => Promise<Value>;
 	readonly startTurn: (input: StartInput, signal?: AbortSignal) => Promise<void>;
 	/** Streamed Actor tool identity: prioritize complete predictions for that tool without matching them. */
 	readonly previewActorTool: (
@@ -324,7 +322,8 @@ export interface SpeculativeActionRuntime<SessionID, Output, StartInput, Consume
 	) => Promise<void>;
 	/** Complete streamed Actor intent: prioritize matching work or start an isolated preview; never commit it. */
 	readonly previewActorCall: (input: ConsumeInput, signal?: AbortSignal) => Promise<void>;
-	readonly prepareActorCall: (input: ConsumeInput, signal?: AbortSignal) => Promise<PreparedActorCall<Output> | undefined>;
+	/** Use the original trackActorTool arrival when preparation follows an asynchronous boundary. */
+	readonly prepareActorCall: (input: ConsumeInput, signal?: AbortSignal, issuedAt?: number) => Promise<PreparedActorCall<Output> | undefined>;
 	readonly finishTurn: (input: FinishInput) => Promise<void>;
 	readonly settingsChanged: (settings: SpeculativeActionSettings) => Promise<void>;
 	readonly disposeSession: (sessionID: SessionID) => Promise<void>;

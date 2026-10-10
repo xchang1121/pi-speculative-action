@@ -49,7 +49,7 @@ describe("faux LLM speculative action end to end", () => {
 		expect(result.summary.toolWaitMs).toBeGreaterThan(0);
 		const task = result.events.find(event => event.type === "task")!.timing;
 		expect(result.summary.toolWaitMs).toBeLessThanOrEqual(task.completedAt - task.startedAt);
-		expect(result.summary.reusedExecutionMs).toBeGreaterThanOrEqual(0);
+		expect(result.summary.hiddenComputeMs).toBeGreaterThanOrEqual(0);
 	});
 
 	it("joins a running parent and adopts its completed follow-up without re-execution", async () => {
@@ -89,7 +89,7 @@ describe("faux LLM speculative action end to end", () => {
 			expect(result.executions).toEqual({ read: 2 });
 			expect(result.actorFallbacks).toEqual(drafterMaxDepth ? [] : ["read"]);
 			expect(result.outputs).toEqual([textResult("one\ntwo\nthree\n"), textResult("target")]);
-			expect(result.summary.reusedExecutionMs).toBeGreaterThan(0);
+			expect(result.summary.hiddenComputeMs).toBeGreaterThan(0);
 			expect(result.draftFeedback[0]).toMatchObject({ kind: "drafter_plan" });
 			if (drafterMaxDepth) expect(result.draftFeedback[1]).toMatchObject({ kind: "drafter_plan", depth: 1 });
 		}

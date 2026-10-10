@@ -87,7 +87,7 @@ export function slowCallReport<SessionID>(events: readonly SpeculativeActionEven
 		return {
 			...wait, diagnosis: "recorded_settlement" as const,
 			actor: traceEvents([actor])[0]!,
-			partialReuse: settlement.provider.kind === "actor" && settlement.provider.origin === "fallback" && (computation?.reusedExecutionMs ?? 0) > 0,
+			partialReuse: settlement.provider.kind === "actor" && settlement.provider.origin === "fallback" && computation?.reused === true,
 			// These requests target the same decision; their outcomes are context, not proof of why this command missed.
 			sourceRequestsForDecision: traceEvents(events.filter(event => event.type === "source_request" && event.sessionID === actor.sessionID &&
 				event.request.request.targetDecisionSequence === (identity.decisionSequence ?? identity.sequence))),

@@ -67,7 +67,7 @@ describe("ThinkThread execution world", () => {
 				const query = await branch!.reconstruct!(context("ls", { path: ".", limit: 10 }, fixture.cwd, "all"));
 				await expect(query?.validate?.()).resolves.toMatchObject({ status: "valid" }); await query?.dispose?.();
 			});
-			expect(new TaskTimeline(0).recordTool(new TimelineInterval(clock, clock + 1, evaluated.dependencies)).reusedExecutionMs).toBe(70);
+			expect(new TaskTimeline(0).recordTool(new TimelineInterval(clock, clock + 1, evaluated.dependencies), performance.now()).hiddenComputeMs).toBe(70);
 			expect(fixture.snapshotReaddir).toHaveBeenCalledTimes(2);
 		} finally { await branch?.dispose(); await fixture.close(); timer.mockRestore(); }
 	});
@@ -180,8 +180,8 @@ describe("ThinkThread execution world", () => {
 					await query?.dispose?.();
 				}
 			});
-			const measured = new TaskTimeline(0).recordTool(new TimelineInterval(clock, clock + 1, evaluated.dependencies));
-			expect(measured.reusedExecutionMs).toBe(70); // One 30 ms BASE and two independently read 20 ms inputs.
+			const measured = new TaskTimeline(0).recordTool(new TimelineInterval(clock, clock + 1, evaluated.dependencies), performance.now());
+			expect(measured.hiddenComputeMs).toBe(70); // One 30 ms BASE and two independently read 20 ms inputs.
 			expect(fixture.snapshotCreate).toHaveBeenCalledOnce();
 		} finally { await Promise.allSettled(branches.map(branch => branch.dispose())); await fixture.close(); timer.mockRestore(); }
 	});

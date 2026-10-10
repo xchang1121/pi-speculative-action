@@ -48,7 +48,7 @@ import type {
 } from "./settlement.ts";
 import { cause } from "./settlement.ts";
 import { runSourceRequest, SourceGeneration } from "./source-request.ts";
-import { TaskTimeline, TimelineInterval, type ComputationReuseShare } from "./task-timing.ts";
+import { TaskTimeline, TimelineInterval } from "./task-timing.ts";
 import type { HardwareResources } from "./system-resources.ts";
 import { normalizeSchedulingSettings, SCHEDULING_DEFAULTS } from "./scheduling-settings.ts";
 
@@ -1089,7 +1089,7 @@ export function makeSpeculativeActionRuntime<
 				if (session.lifecycle.sealed || session.id !== adoption.scope.sessionID || !turn ||
 					draft.type === "operation" && draft.operation?.identity !== adoption.operationIdentity) return;
 				if (candidate.origin === "prediction" && adoption.computation?.reused)
-					TimelineInterval.producedBy(adoption.computation.computation, { source: draft.source ?? "cache", mode: draft.mode, feedback: draft.reuseFeedback });
+					TimelineInterval.producedBy(adoption.computation.computation, { source: draft.source ?? "cache", mode: draft.mode });
 				if (draft.type !== "operation") return;
 				const actorAction: ActorActionIdentity = { id: adoption.id, kind: "operation", sequence: adoption.sequence,
 					decisionSequence: turn.decisionSequence, turnID: turn.turnID };
@@ -1130,7 +1130,7 @@ export function makeSpeculativeActionRuntime<
 				await session.lifecycle.release(branch);
 				return;
 			}
-			if (candidate.origin === "prediction") TimelineInterval.producedBy(computation, { source: draft.source ?? "cache", mode: draft.mode, feedback: draft.reuseFeedback });
+			if (candidate.origin === "prediction") TimelineInterval.producedBy(computation, { source: draft.source ?? "cache", mode: draft.mode });
 			scheduler.observe(actionExecutionIdentity(candidate.key), false);
 			candidateStore.settle(session.id, candidate, candidate.work.reservation.kind === "shared", branch.reconstruct ? branch.inputResources : undefined);
 			// An exclusive result waits for its own adoption; meanwhile the unchanged bytes it read can answer other reads.
@@ -1479,8 +1479,7 @@ export function makeSpeculativeActionRuntime<
 		}
 	};
 
-	const prepareActorCall = async (input: ConsumeInput, signal?: AbortSignal): Promise<PreparedActorCall<Output> | undefined> => {
-		const actorArrivedAt = performance.now();
+	const prepareActorCall = async (input: ConsumeInput, signal?: AbortSignal, actorArrivedAt = performance.now()): Promise<PreparedActorCall<Output> | undefined> => {
 		const state = sessionStates.get(input.sessionID)?.turns.get(input.turnID);
 		if (!state || signal?.aborted || !actorTurnActive(state)) return undefined;
 		const actualCall = adapter.actual(input);
@@ -1500,7 +1499,7 @@ export function makeSpeculativeActionRuntime<
 		}
 		const actorAction = new ActorAction<Candidate, Output>({
 			identity: { id: actualCall.id ?? JSON.stringify([input.turnID, sequence]), sequence, decisionSequence: state.decisionSequence, turnID: input.turnID },
-			tool: actualCall.tool,
+			tool: actualCall.tool, issuedAt: actorArrivedAt,
 			...(actualKey ? { actionKey: actualKey } : {}),
 			fallback: cause("matching", "no_candidate"),
 		});
@@ -1695,11 +1694,10 @@ export function makeSpeculativeActionRuntime<
 	): void => {
 		const settlement = actorAction.settlement;
 		if (!settlement) return;
-		let reusedComputations: readonly ComputationReuseShare[] | undefined;
 		const computation = state.session.timeline?.recordCall([
 			{ computation: settlement.provider.toolExecution, reused: !!selection && (selection.match.kind !== "inputs" || !!selection.projectionReused) },
 			...(selection?.projection ? [{ computation: selection.projection, reused: selection.projectionReused }] : []),
-		], shares => { reusedComputations = shares; });
+		], actorAction.issuedAt);
 		const key = actorAction.actionKey;
 		const settledCandidate = selection?.candidate;
 		const settledCandidateDescriptor = settledCandidate && (adapter.onActorActionSettled || adapter.onEvent)
@@ -1720,7 +1718,7 @@ export function makeSpeculativeActionRuntime<
 			settlement,
 			...(settledCandidateDescriptor ? { candidate: settledCandidateDescriptor } : {}),
 			candidateFeedback: settledCandidate?.owner.draft.feedback,
-			computation, reusedComputations,
+			computation,
 		}));
 		if (event) state.session.effects.enqueue(() => { state.session.events.enqueue(event); });
 		for (const source of sources) {
@@ -2425,14 +2423,14 @@ export function makeSpeculativeActionRuntime<
 
 	return {
 		trackActorTool: async (sessionID, execute) => {
-			const finish = sessionStates.get(sessionID)?.timeline?.startToolWait(performance.now());
-			try { return await execute(); } finally { finish?.(performance.now()); }
+			const issuedAt = performance.now(), finish = sessionStates.get(sessionID)?.timeline?.startToolWait(issuedAt);
+			try { return await execute(issuedAt); } finally { finish?.(performance.now()); }
 		},
 		startTurn,
 		previewActorTool,
 		previewActorCall,
-		prepareActorCall: (input, signal) => {
-			const task = prepareActorCall(input, signal);
+		prepareActorCall: (input, signal, issuedAt) => {
+			const task = prepareActorCall(input, signal, issuedAt);
 			return sessionStates.get(input.sessionID)?.lifecycle.track(task) ?? task;
 		},
 		finishTurn,

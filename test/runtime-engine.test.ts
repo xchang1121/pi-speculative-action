@@ -419,12 +419,12 @@ describe("structural speculative runtime", () => {
 			expect(predictions.map(event => event.mode).sort()).toEqual(["reported-files", "result-neighbors"]);
 			expect(predictions.every(event => event.settlement.observation === "observed" && event.settlement.match.matched && event.settlement.match.adoption.status === "adopted")).toBe(true);
 			expect(actor.candidate?.mode).toBe("reported-files");
-			expect(actor.computation?.reusedExecutionMs).toBeGreaterThan(0);
+			expect(actor.computation?.hiddenComputeMs).toBeGreaterThan(0);
 			const modes = summarizeSpeculativeTrace(events).modesBySource.source!;
 			expect(modes["reported-files"]).toMatchObject({ observed: 1, matched: 1, adopted: 1, started: 1,
 				productionMs: completed.state.status === "succeeded" ? completed.state.executionMs : -1,
-				reusedExecutionMs: actor.computation!.reusedExecutionMs });
-			expect(modes["result-neighbors"]).toEqual({ observed: 1, matched: 1, adopted: 1, started: 0, productionMs: 0, reusedExecutionMs: 0 });
+				hiddenComputeMs: actor.computation!.hiddenComputeMs });
+			expect(modes["result-neighbors"]).toEqual({ observed: 1, matched: 1, adopted: 1, started: 0, productionMs: 0, hiddenComputeMs: 0 });
 		} finally { await runtime.dispose(); }
 	});
 
@@ -480,7 +480,7 @@ describe("structural speculative runtime", () => {
 			await runtime.finishTurn(call("seed"));
 			await runtime.startTurn(start("predict")); await gate.entered;
 			expect(executed).toEqual(["prerequisite.ts"]);
-			expect(events.filter(event => event.type === "actor_action").every(event => (event.computation?.reusedExecutionMs ?? 0) === 0)).toBe(true);
+			expect(events.filter(event => event.type === "actor_action").every(event => (event.computation?.hiddenComputeMs ?? 0) === 0)).toBe(true);
 		} finally { gate.release(); await runtime.dispose(); }
 	});
 
@@ -518,14 +518,14 @@ describe("structural speculative runtime", () => {
 			for (const action of actions) {
 				expect(action.candidate).toBeUndefined();
 				expect(action.settlement.provider.kind).toBe("actor");
-				expect(action.computation).toEqual({ actorComputeMs: 10, reusedExecutionMs: 50, reusedByMode: [
-					{ source: "source", mode: "owner", reusedExecutionMs: 40 }, { source: "preparer", mode: "input", reusedExecutionMs: 10 },
+				expect(action.computation).toMatchObject({ toolComputeMs: 60, hiddenComputeMs: 50, hiddenByMode: [
+					{ source: "source", mode: "owner", hiddenComputeMs: 40 }, { source: "preparer", mode: "input", hiddenComputeMs: 10 },
 				] });
 			}
 			const modes = summary().modesBySource;
-			expect(modes.source?.owner).toMatchObject({ observed: 1, matched: 1, adopted: 1, started: 1, reusedExecutionMs: 80 });
-			expect(modes.source?.supporter).toEqual({ observed: 1, matched: 1, adopted: 1, started: 0, productionMs: 0, reusedExecutionMs: 0 });
-			expect(modes.preparer?.input?.reusedExecutionMs).toBe(20);
+			expect(modes.source?.owner).toMatchObject({ observed: 1, matched: 1, adopted: 1, started: 1, hiddenComputeMs: 80 });
+			expect(modes.source?.supporter).toEqual({ observed: 1, matched: 1, adopted: 1, started: 0, productionMs: 0, hiddenComputeMs: 0 });
+			expect(modes.preparer?.input?.hiddenComputeMs).toBe(20);
 		} finally { await runtime.dispose(); }
 	});
 
@@ -1236,6 +1236,31 @@ describe("structural speculative runtime", () => {
 		} finally { gate.arrive(); await runtime.dispose(); clock.mockRestore(); wallClock.mockRestore(); }
 	});
 
+	it("freezes each call's hidden-time cutoff before binding or a later partial handoff", async () => {
+		let now = 0;
+		const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
+		const prefix = new TimelineInterval(0, 60);
+		const { runtime, events, summary } = harness({ source: planSource({ propose: () => undefined }),
+			actionKey: async (tool, input) => { now += 20; return buildPiActionKey(tool, input, "/workspace"); } });
+		try {
+			await runtime.startTurn(start("turn"));
+			for (const issuedAt of [40, 110]) {
+				now = issuedAt;
+				await runtime.trackActorTool("session", async arrival => {
+					now += 20;
+					const actor = await runtime.prepareActorCall({ ...call("turn"), id: `call-${issuedAt}` }, undefined, arrival);
+					const tail = new TimelineInterval(now, now + 40, [{ computation: prefix, reused: true }]);
+					now += 40; await actor!.settle(tail, "continued");
+				});
+			}
+			await runtime.finishTurn({ ...call("turn"), terminal: true });
+			expect(events.filter(event => event.type === "actor_action").map(event => event.computation)).toEqual([
+				{ toolComputeMs: 100, hiddenComputeMs: 40, reused: true }, { toolComputeMs: 100, hiddenComputeMs: 60, reused: true },
+			]);
+			expect(summary()).toMatchObject({ toolComputeMs: 200, hiddenComputeMs: 100 });
+		} finally { await runtime.dispose(); clock.mockRestore(); }
+	});
+
 	it.each(["same", "alternate", "stale-before", "stale-after", "incompatible", "indeterminate", "exclusive", "denied"] as const)(
 		"recalls sealed Actor observations with compatibility, freshness and authorization: %s", async (mode) => {
 		let version = 1, captures = 0, seals = 0, now = 100;
@@ -1295,16 +1320,16 @@ describe("structural speculative runtime", () => {
 			const firstReuseMs = reusable ? 4 : 6, repeatedReuseMs = mode === "exclusive" ? 4 : firstReuseMs;
 			const totalReuseMs = fallback ? 0 : firstReuseMs + repeatedReuseMs;
 			expect(events.find((event) => event.type === "task")?.timing).toMatchObject({
-				actorComputeMs: fallback ? 6 : 4,
-				reusedExecutionMs: totalReuseMs,
+				toolComputeMs: fallback ? 6 : 4 + totalReuseMs,
+				hiddenComputeMs: totalReuseMs,
 			});
 			expect(events.filter(event => event.type === "actor_action").map(event => event.computation)).toEqual([
-				{ actorComputeMs: 4, reusedExecutionMs: 0 },
-				{ actorComputeMs: fallback ? 2 : 0, reusedExecutionMs: fallback ? 0 : firstReuseMs },
-				...(fallback ? [] : [{ actorComputeMs: 0, reusedExecutionMs: repeatedReuseMs }]),
+				{ toolComputeMs: 4, hiddenComputeMs: 0 },
+				{ toolComputeMs: fallback ? 2 : firstReuseMs, hiddenComputeMs: fallback ? 0 : firstReuseMs, ...(fallback ? {} : { reused: true }) },
+				...(fallback ? [] : [{ toolComputeMs: repeatedReuseMs, hiddenComputeMs: repeatedReuseMs, reused: true }]),
 			]);
-			expect(summary()).toMatchObject({ tasks: 1, actorComputeMs: fallback ? 6 : 4,
-				reusedExecutionMs: totalReuseMs });
+			expect(summary()).toMatchObject({ tasks: 1, toolComputeMs: fallback ? 6 : 4 + totalReuseMs,
+				hiddenComputeMs: totalReuseMs });
 		} finally { await runtime.dispose(); clock.mockRestore(); }
 	});
 
@@ -1582,8 +1607,8 @@ describe("structural speculative runtime", () => {
 		const computations = events.filter(event => event.type === "actor_action").map(event => event.computation!);
 		expect(computations).toHaveLength(succeeds ? inputLookup || scenario === "output-valid" ? 2 : 1 : 0);
 		expect(events.find(event => event.type === "task")?.timing).toMatchObject({
-			actorComputeMs: computations.reduce((sum, timing) => sum + timing.actorComputeMs!, 0),
-			reusedExecutionMs: computations.reduce((sum, timing) => sum + timing.reusedExecutionMs, 0),
+			toolComputeMs: computations.reduce((sum, timing) => sum + timing.toolComputeMs!, 0),
+			hiddenComputeMs: computations.reduce((sum, timing) => sum + timing.hiddenComputeMs, 0),
 		});
 		if (scenario === "output-valid") expect(summarizeSpeculativeTrace(events)).toMatchObject({
 			actorActions: 2, speculativeHits: 2, exactReuseHits: 0, partialResultReuseHits: 2,
@@ -1895,19 +1920,19 @@ describe("structural speculative runtime", () => {
 			expect(queryValidate).not.toHaveBeenCalled(); // Oversized proof falls back to the full proof without repeating the query.
 			await runtime.finishTurn({ ...call("second"), terminal: true });
 			expect(events.find((event) => event.type === "task")?.timing).toMatchObject({
-				actorComputeMs: unretained ? 60 : learned ? 20 : 0,
-				reusedExecutionMs: unretained ? 0 : learned ? 40 : 60,
+				toolComputeMs: 60,
+				hiddenComputeMs: unretained ? 0 : learned ? 40 : 60,
 			});
 			expect(events.filter(event => event.type === "actor_action").map(event => event.computation)).toEqual(
 				[0, 1, 2].map(index => unretained || learned && index === 0
-					? { actorComputeMs: 20, reusedExecutionMs: 0 } : { actorComputeMs: 0, reusedExecutionMs: 20 }));
+					? { toolComputeMs: 20, hiddenComputeMs: 0 } : { toolComputeMs: 20, hiddenComputeMs: 20, reused: true }));
 			now += 10;
 			await runtime.startTurn(start("next-task"));
 			expect((await runtime.prepareActorCall(call("next-task", { path: "input", offset: 2, limit: 1 })))?.output).toBe("2");
 			await runtime.finishTurn({ ...call("next-task"), terminal: true });
 			expect(reconstruct).toHaveBeenCalledTimes(evaluations + (unretained ? 1 : 0));
 			expect(events.filter((event) => event.type === "task").at(-1)?.timing).toMatchObject({
-				actorComputeMs: unretained ? 20 : 0, reusedExecutionMs: unretained ? 0 : 20 });
+				toolComputeMs: 20, hiddenComputeMs: unretained ? 0 : 20 });
 		} finally { await runtime.dispose(); clock.mockRestore(); }
 		expect(disposed).toHaveBeenCalledOnce(); expect(runtime.inspect().sharedCandidates).toBe(0);
 		for (const dispose of queryDisposals) expect(dispose).toHaveBeenCalledOnce();
@@ -1933,9 +1958,9 @@ describe("structural speculative runtime", () => {
 			expect(project).toHaveBeenCalledOnce();
 			// Both calls reuse the 40 ms source; only the second reuses the 20 ms projection. Validation/commit are excluded.
 			expect(events.filter(event => event.type === "actor_action").map(event => event.computation)).toEqual([
-				{ actorComputeMs: 20, reusedExecutionMs: 40 }, { actorComputeMs: 0, reusedExecutionMs: 60 },
+				{ toolComputeMs: 60, hiddenComputeMs: 40, reused: true }, { toolComputeMs: 60, hiddenComputeMs: 60, reused: true },
 			]);
-			expect(events.find(event => event.type === "task")?.timing).toMatchObject({ actorComputeMs: 20, reusedExecutionMs: 100 });
+			expect(events.find(event => event.type === "task")?.timing).toMatchObject({ toolComputeMs: 120, hiddenComputeMs: 100 });
 		} finally { await runtime.dispose(); clock.mockRestore(); }
 	});
 
@@ -2312,13 +2337,13 @@ describe("structural speculative runtime", () => {
 				expect(providers[1]!.toolExecution).toBe(providers[0]!.toolExecution);
 				if (dual) {
 					const receipts = events.filter(event => event.type === "actor_action").map(event => event.computation);
-					const execution = providers[0]!.toolExecution, reusedExecutionMs = receipts[0]!.reusedExecutionMs;
-					expect(reusedExecutionMs).toBeGreaterThan(0);
-					expect(reusedExecutionMs).toBeLessThanOrEqual(execution.completedAt - execution.startedAt);
+					const execution = providers[0]!.toolExecution, hiddenComputeMs = receipts[0]!.hiddenComputeMs;
+					expect(hiddenComputeMs).toBeGreaterThan(0);
+					expect(hiddenComputeMs).toBeLessThanOrEqual(execution.completedAt - execution.startedAt);
 					expect(receipts).toEqual([
-						{ actorComputeMs: 0, reusedExecutionMs }, { actorComputeMs: 0, reusedExecutionMs },
+						{ toolComputeMs: hiddenComputeMs, hiddenComputeMs, reused: true }, { toolComputeMs: hiddenComputeMs, hiddenComputeMs, reused: true },
 					]);
-					expect(events.find(event => event.type === "task")?.timing).toMatchObject({ actorComputeMs: 0, reusedExecutionMs: reusedExecutionMs * 2 });
+					expect(events.find(event => event.type === "task")?.timing).toMatchObject({ toolComputeMs: hiddenComputeMs * 2, hiddenComputeMs: hiddenComputeMs * 2 });
 				}
 			}
 			if (mode === "parallel-predictions" || completed) {
@@ -2336,14 +2361,14 @@ describe("structural speculative runtime", () => {
 				await runtime.finishTurn({ ...range, terminal: true });
 				const accepted = events.filter(event => event.type === "actor_action");
 				expect(accepted).toHaveLength(3);
-				const reusedExecutionMs = accepted.reduce((sum, event) => {
+				const hiddenComputeMs = accepted.reduce((sum, event) => {
 					const execution = event.settlement.provider.toolExecution;
-					expect(event.computation?.actorComputeMs).toBe(0);
-					expect(event.computation!.reusedExecutionMs).toBeGreaterThan(0);
-					expect(event.computation!.reusedExecutionMs).toBeLessThanOrEqual(execution.completedAt - execution.startedAt);
-					return sum + event.computation!.reusedExecutionMs;
+					expect(event.computation?.toolComputeMs).toBe(event.computation!.hiddenComputeMs);
+					expect(event.computation!.hiddenComputeMs).toBeGreaterThan(0);
+					expect(event.computation!.hiddenComputeMs).toBeLessThanOrEqual(execution.completedAt - execution.startedAt);
+					return sum + event.computation!.hiddenComputeMs;
 				}, 0);
-				expect(events.find(event => event.type === "task")?.timing).toMatchObject({ actorComputeMs: 0, reusedExecutionMs });
+				expect(events.find(event => event.type === "task")?.timing).toMatchObject({ toolComputeMs: hiddenComputeMs, hiddenComputeMs });
 			}
 			expect(executionCount()).toBe(distinct || mode === "prediction-first" ? 2 : 1);
 			summary();

@@ -7,12 +7,12 @@ import { TimelineInterval } from "../src/task-timing.ts";
 import { emptySpeculativeTraceSummary } from "../src/trace-summary.ts";
 
 describe("slow tool call diagnosis", () => {
-	it("joins recorded stages by identity without treating nearby budget suppression as the fallback cause", () => {
+	it.each([0, 80])("joins recorded stages and recognizes partial reuse with %s ms hidden", hiddenComputeMs => {
 		const envelope = { sessionID: "session", turnID: "turn", timestamp: 1000, cache: emptySpeculativeTraceSummary().cache };
-		const rejected = new ActorAction({ identity: { id: "stale", sequence: 1, turnID: "turn" }, tool: "bash", fallback: cause("matching", "no_candidate") });
+		const rejected = new ActorAction({ issuedAt: 100, identity: { id: "stale", sequence: 1, turnID: "turn" }, tool: "bash", fallback: cause("matching", "no_candidate") });
 		rejected.rejectCandidate("candidate", { kind: "exact", distance: 0 }, cause("freshness", "resource_changed"));
 		rejected.deferToFallback(); rejected.settleActor(new TimelineInterval(200, 900), false);
-		const partial = new ActorAction({ identity: { id: "partial", sequence: 2, turnID: "turn" }, tool: "bash", fallback: cause("matching", "no_candidate") });
+		const partial = new ActorAction({ issuedAt: 100, identity: { id: "partial", sequence: 2, turnID: "turn" }, tool: "bash", fallback: cause("matching", "no_candidate") });
 		partial.deferToFallback(); partial.settleActor(new TimelineInterval(500, 900), false);
 		const events: SpeculativeActionEvent<string>[] = [
 			{ ...envelope, type: "source_request", request: { request: { source: "drafter", turnID: "turn", index: 0, kind: "proposal", targetDecisionSequence: 1 },
@@ -22,8 +22,8 @@ describe("slow tool call diagnosis", () => {
 			{ ...envelope, type: "prediction", settlement: { prediction: { id: "prediction", source: "pattern_aware", proposalID: "proposal", actionID: "action" },
 				observation: "observed", actorAction: rejected.identity, match: { matched: true, relation: { kind: "exact", distance: 0 },
 					adoption: { status: "rejected", candidateID: "candidate", cause: cause("freshness", "resource_changed") } } } },
-			{ ...envelope, type: "actor_action", settlement: rejected.settlement!, actualAction: "bash build", computation: { actorComputeMs: 700, reusedExecutionMs: 0 } },
-			{ ...envelope, type: "actor_action", settlement: partial.settlement!, actualAction: "bash wrapper", computation: { actorComputeMs: 400, reusedExecutionMs: 80 } },
+			{ ...envelope, type: "actor_action", settlement: rejected.settlement!, actualAction: "bash build", computation: { toolComputeMs: 700, hiddenComputeMs: 0 } },
+			{ ...envelope, type: "actor_action", settlement: partial.settlement!, actualAction: "bash wrapper", computation: { toolComputeMs: 480, hiddenComputeMs, reused: true } },
 		];
 		// Another session's matching display string and decision must not become this call's evidence.
 		events.push({ ...events[0]!, sessionID: "other" } as SpeculativeActionEvent<string>);
@@ -44,7 +44,7 @@ describe("slow tool call diagnosis", () => {
 		if (staleCall.diagnosis !== "recorded_settlement") throw new Error("Expected the stale call's recorded settlement");
 		expect(staleCall.sourceRequestsForDecision).toHaveLength(1);
 		expect(report.calls[1]).toMatchObject({ partialReuse: true, sourceRequestsForDecision: [], candidates: [],
-			actor: { computation: { reusedExecutionMs: 80 }, settlement: { provider: { cause: { code: "no_candidate" } } } } });
+			actor: { computation: { hiddenComputeMs }, settlement: { provider: { cause: { code: "no_candidate" } } } } });
 		expect(report.calls[2]).toMatchObject({ diagnosis: "settlement_unavailable" });
 	});
 
@@ -53,7 +53,7 @@ describe("slow tool call diagnosis", () => {
 		{ name: "turns", sessionID: "session", turnID: "other", sequence: 1 },
 		{ name: "sequences", sessionID: "session", turnID: "turn", sequence: 2 },
 	])("keeps an unscoped wait ambiguous when its ID occurs in multiple $name", ({ sessionID, turnID, sequence }) => {
-		const action = new ActorAction({ identity: { id: "shared", sequence: 1, turnID: "turn" }, tool: "bash", fallback: cause("matching", "no_candidate") });
+		const action = new ActorAction({ issuedAt: 100, identity: { id: "shared", sequence: 1, turnID: "turn" }, tool: "bash", fallback: cause("matching", "no_candidate") });
 		action.deferToFallback(); action.settleActor(new TimelineInterval(0, 900), false);
 		const first: SpeculativeActionEvent<string> = { sessionID: "session", turnID: "turn", timestamp: 1000, cache: emptySpeculativeTraceSummary().cache,
 			type: "actor_action", settlement: action.settlement!, actualAction: "bash build" };
@@ -67,7 +67,7 @@ describe("slow tool call diagnosis", () => {
 	});
 
 	it("joins predictions only to the complete actor identity in the same session", () => {
-		const action = new ActorAction({ identity: { id: "shared", sequence: 1, turnID: "turn" }, tool: "bash", fallback: cause("matching", "no_candidate") });
+		const action = new ActorAction({ issuedAt: 100, identity: { id: "shared", sequence: 1, turnID: "turn" }, tool: "bash", fallback: cause("matching", "no_candidate") });
 		action.deferToFallback(); action.settleActor(new TimelineInterval(0, 900), false);
 		const envelope = { sessionID: "session", turnID: "turn", timestamp: 1000, cache: emptySpeculativeTraceSummary().cache };
 		const predictions: SpeculativeActionEvent<string>[] = [
@@ -98,10 +98,10 @@ describe("slow tool call diagnosis", () => {
 			settlement: { actorAction: identity, tool: "read", matchedPredictions: [], rejections: [],
 				provider: { kind: "actor", origin: "preview", candidateID: "candidate", durationMs: 600, isError: false,
 					toolExecution: new TimelineInterval(0, 600) } },
-			actualAction: "read source", computation: { actorComputeMs: 0, reusedExecutionMs: 600 },
+			actualAction: "read source", computation: { toolComputeMs: 600, hiddenComputeMs: 600 },
 		};
 		expect(slowCallReport([event], [{ id: "preview", startedAt: 0, completedAt: 700 }]).calls[0]).toMatchObject({
-			partialReuse: false, actor: { computation: { actorComputeMs: 0, reusedExecutionMs: 600 } },
+			partialReuse: false, actor: { computation: { toolComputeMs: 600, hiddenComputeMs: 600 } },
 		});
 	});
 });

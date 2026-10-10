@@ -4,9 +4,9 @@ export interface SuiteBenchmarkSummary {
 	readonly actualEndToEndMs: number;
 	readonly toolWaitMs: number;
 	/** Absent in legacy or incomplete reports; raw tool wait is not a substitute. */
-	readonly actorComputeMs?: number;
-	readonly reusedExecutionMs?: number;
-	readonly reusedExecutionIncomplete?: true;
+	readonly toolComputeMs?: number;
+	readonly hiddenComputeMs?: number;
+	readonly hiddenComputeIncomplete?: true;
 	readonly actorActions: number;
 	readonly speculativeHits: number;
 	readonly actorCost: number;
@@ -32,14 +32,14 @@ export interface SuiteBenchmarkRun {
 }
 
 type MeasuredRun = SuiteBenchmarkRun & {
-	readonly summary: SuiteBenchmarkSummary & { readonly actorComputeMs: number; readonly reusedExecutionMs: number };
+	readonly summary: SuiteBenchmarkSummary & { readonly toolComputeMs: number; readonly hiddenComputeMs: number };
 };
 type ToolWaitRun = SuiteBenchmarkRun & { readonly summary: SuiteBenchmarkSummary };
 
 export function summarizeSuite(runs: readonly SuiteBenchmarkRun[]) {
 	const measured = runs.filter(hasTiming);
 	const toolWaits = runs.filter(hasToolWait).map(run => run.summary.toolWaitMs);
-	const reused = runs.flatMap(run => measuredValue(run.summary?.reusedExecutionMs));
+	const reused = runs.flatMap(run => measuredValue(run.summary?.hiddenComputeMs));
 	const invalidRuns = runs.flatMap((run) => {
 		const reasons = [...(run.error ? ["runner_error"] : []), ...screeningFailures(run.summary)];
 		if (run.summary && !hasTiming(run)) reasons.push("unavailable_timing");
@@ -52,17 +52,17 @@ export function summarizeSuite(runs: readonly SuiteBenchmarkRun[]) {
 		allRunsScreenedIn: runs.length > 0 && invalidRuns.length === 0,
 		statistics: {
 			primaryEstimator: "ratio_of_means",
-			baseline: "same_run_actor_compute_plus_gross_reused_execution",
+			baseline: "same_run_consumed_calculation",
 			samplePolicy: "all_measured_runs",
 		},
 		unmeasuredRuns: runs.length - measured.length,
-		// Incomplete denominators must not hide known gross savings or actual waits.
+		// Incomplete denominators must not hide known hidden calculation or actual waits.
 		diagnostics: {
 			toolWaitMeasuredRuns: toolWaits.length, toolWaitMs: total(toolWaits),
 			toolWaitMeanMs: toolWaits.length ? total(toolWaits)! / toolWaits.length : undefined,
 			toolWaitP95Ms: nearestRank(toolWaits, 0.95),
-			reuseMeasuredRuns: reused.length, reusedExecutionMs: total(reused),
-			reusedExecutionIncomplete: runs.some(run => run.summary?.reusedExecutionIncomplete) || undefined,
+			hiddenMeasuredRuns: reused.length, hiddenComputeMs: total(reused),
+			hiddenComputeIncomplete: runs.some(run => run.summary?.hiddenComputeIncomplete) || undefined,
 		},
 		implementationCommits: [...new Set(runs.flatMap((run) => run.implementationCommit ? [run.implementationCommit] : []))],
 		invalidRuns,
@@ -97,7 +97,7 @@ export function safeName(value: string): string {
 }
 
 function hasTiming(run: SuiteBenchmarkRun): run is MeasuredRun {
-	return !!run.summary && !run.summary.reusedExecutionIncomplete && measured(run.summary.actorComputeMs) && measured(run.summary.reusedExecutionMs);
+	return !!run.summary && !run.summary.hiddenComputeIncomplete && measured(run.summary.toolComputeMs) && measured(run.summary.hiddenComputeMs) && run.summary.hiddenComputeMs <= run.summary.toolComputeMs;
 }
 
 function hasToolWait(run: SuiteBenchmarkRun): run is ToolWaitRun {
@@ -120,7 +120,7 @@ export function nearestRank(values: readonly number[], percentile: number): numb
 
 function pooled(runs: readonly MeasuredRun[]) {
 	const actualEndToEndMs = sum(runs, "actualEndToEndMs");
-	const actorComputeMs = sum(runs, "actorComputeMs"), reusedExecutionMs = sum(runs, "reusedExecutionMs");
+	const toolComputeMs = sum(runs, "toolComputeMs"), hiddenComputeMs = sum(runs, "hiddenComputeMs");
 	const toolWaitRuns = runs.filter(hasToolWait), toolWaitMs = toolWaitRuns.length ? sum(toolWaitRuns, "toolWaitMs") : undefined;
 	const actorActions = sum(runs, "actorActions");
 	const speculativeHits = sum(runs, "speculativeHits");
@@ -134,11 +134,11 @@ function pooled(runs: readonly MeasuredRun[]) {
 		toolWaitMeasuredRuns: toolWaitRuns.length,
 		toolWaitMeanMs: toolWaitMs === undefined ? undefined : toolWaitMs / toolWaitRuns.length,
 		toolWaitP95Ms: nearestRank(toolWaitRuns.map((run) => run.summary.toolWaitMs), 0.95),
-		actorComputeMs,
-		reusedExecutionMs,
-		baselineComputeMs: actorComputeMs + reusedExecutionMs,
-		toolSpeedup: toolSpeedup({ actorComputeMs, reusedExecutionMs }),
-		fullyReused: actorComputeMs === 0 && reusedExecutionMs > 0,
+		toolComputeMs,
+		hiddenComputeMs,
+		unhiddenComputeMs: toolComputeMs - hiddenComputeMs,
+		toolSpeedup: toolSpeedup({ toolComputeMs, hiddenComputeMs }),
+		fullyHidden: toolComputeMs === hiddenComputeMs && hiddenComputeMs > 0,
 		actorActions,
 		speculativeHits,
 		hitRate: actorActions > 0 ? speculativeHits / actorActions : 0,

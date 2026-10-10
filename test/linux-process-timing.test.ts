@@ -35,8 +35,8 @@ async function account(timings: readonly TimingReceipt[]) {
 	const reused = new TimelineInterval(200, 240);
 	const timeline = new TaskTimeline(0);
 	const computation = new TimelineInterval(0, 120, [...dependencies, { computation: reused, reused: true }]);
-	const result = timeline.recordTool(computation);
-	const later = new TaskTimeline(0).recordTool(computation, true);
+	const result = timeline.recordTool(computation, performance.now());
+	const later = new TaskTimeline(0).recordTool(computation, performance.now(), true);
 	return { dependencies, result, later };
 }
 
@@ -57,8 +57,8 @@ describe("held native computation accounting", () => {
 				await internal.plan("key", "/bin/tool", {}, () => true);
 				TimelineInterval.exclude(new TimelineInterval(10, 20));
 			});
-			expect(new TaskTimeline(0).recordTool(new TimelineInterval(0, 30, evaluation.dependencies)))
-				.toEqual({ actorComputeMs: 20, reusedExecutionMs: 10 });
+			expect(new TaskTimeline(0).recordTool(new TimelineInterval(0, 30, evaluation.dependencies), performance.now()))
+				.toMatchObject({ toolComputeMs: 30, hiddenComputeMs: 10 });
 		} finally { planner.mockRestore(); }
 	});
 
@@ -74,13 +74,13 @@ describe("held native computation accounting", () => {
 		const native = new TimelineInterval(60, 80), prefix = internal.processComputation(session, 50, native.completedAt);
 		const sibling = internal.processComputation(session, 70, 100);
 		expect([native.startedAt, native.completedAt], "native frontier remains unchanged").toEqual([60, 80]);
-		expect(new TaskTimeline(0).recordTool(prefix, true)).toMatchObject({ actorComputeMs: 0, reusedExecutionMs: 48 });
+		expect(new TaskTimeline(0).recordTool(prefix, performance.now(), true)).toMatchObject({ toolComputeMs: 48, hiddenComputeMs: 48 });
 		const restored = [prefix, sibling].map(computation => ({ computation: TimelineInterval.restore(TimelineInterval.serialize(computation))!, reused: true }));
 		expect(restored.every(input => !!input.computation)).toBe(true);
-		expect(new TaskTimeline(0).recordCall(restored)).toMatchObject({ actorComputeMs: 0, reusedExecutionMs: 68 });
+		expect(new TaskTimeline(0).recordCall(restored, performance.now())).toMatchObject({ toolComputeMs: 68, hiddenComputeMs: 68 });
 		// The outer caller keeps its own work between session creation and dispatch; only readiness is excluded.
-		expect(new TaskTimeline(0).recordTool(new TimelineInterval(0, 110, session.computations), true))
-			.toMatchObject({ actorComputeMs: 0, reusedExecutionMs: 108 });
+		expect(new TaskTimeline(0).recordTool(new TimelineInterval(0, 110, session.computations), performance.now(), true))
+			.toMatchObject({ toolComputeMs: 108, hiddenComputeMs: 108 });
 	});
 
 	it.each(["live", "stored", "legacy", "malformed"] as const)("credits successful %s replay from original calculation evidence", async kind => {
@@ -97,9 +97,9 @@ describe("held native computation accounting", () => {
 		const replay = Reflect.get(backend, "replay") as (...args: unknown[]) => Promise<unknown>;
 		expect(await replay.call(backend, session, plan, certificate.weakKey, { joined: false,
 			...(kind === "live" ? { producer: { computation: original } } : {}) })).toMatchObject({ kind: "hit", exit: { kind: "code", code: 0 } });
-		const timing = new TaskTimeline(0).recordCall(computations);
-		expect(timing).toMatchObject({ actorComputeMs: 0, reusedExecutionMs: kind === "live" || kind === "stored" ? 130 : 0 });
-		expect(timing.reusedExecutionIncomplete).toBe(kind === "legacy" || kind === "malformed" ? true : undefined);
+		const timing = new TaskTimeline(0).recordCall(computations, performance.now());
+		expect(timing).toMatchObject({ toolComputeMs: kind === "live" || kind === "stored" ? 130 : undefined, hiddenComputeMs: kind === "live" || kind === "stored" ? 130 : 0 });
+		expect(timing.hiddenComputeIncomplete).toBe(kind === "legacy" || kind === "malformed" ? true : undefined);
 		if (kind === "live") expect(computations[0]!.computation).toBe(original);
 		expect(plan.artifacts.read).not.toHaveBeenCalled();
 	});
@@ -118,7 +118,7 @@ describe("held native computation accounting", () => {
 			const certificate = publish.mock.calls[0]![0] as ReturnType<typeof processCertificate>;
 			const restored = TimelineInterval.restore(certificate.result.computation)!;
 			expect(restored).toBeDefined();
-			expect(new TaskTimeline(0).recordTool(restored, true)).toMatchObject({ actorComputeMs: 0, reusedExecutionMs: 130 });
+			expect(new TaskTimeline(0).recordTool(restored, performance.now(), true)).toMatchObject({ toolComputeMs: 130, hiddenComputeMs: 80 });
 		} finally { publish.mockRestore(); clock.mockRestore(); }
 	});
 
@@ -154,8 +154,8 @@ describe("held native computation accounting", () => {
 			const outer = await TimelineInterval.collect(() => internal.executeRequest(session, {}, "/bin/tool", [1, 2], 1, undefined));
 			expect(replay).toHaveBeenCalledTimes(Number(hit)); expect(fresh).toHaveBeenCalledTimes(Number(!hit));
 			const producer = new TimelineInterval(0, 60, [...outer.dependencies, ...computations]);
-			expect(new TaskTimeline(0).recordTool(producer, true)).toEqual({ actorComputeMs: 0, reusedExecutionMs: hit ? 110 : 50 });
-			if (!hit) expect(new TaskTimeline(0).recordTool(work.computation, true)).toMatchObject({ actorComputeMs: 0, reusedExecutionMs: 40 });
+			expect(new TaskTimeline(0).recordTool(producer, performance.now(), true)).toMatchObject({ toolComputeMs: hit ? 110 : 50, hiddenComputeMs: hit ? 0 : 40 });
+			if (!hit) expect(new TaskTimeline(0).recordTool(work.computation, performance.now(), true)).toMatchObject({ toolComputeMs: 40, hiddenComputeMs: 40 });
 		} finally { prototype.mockRestore(); acquired.mockRestore(); replay.mockRestore(); fresh.mockRestore(); clock.mockRestore(); }
 	});
 
@@ -175,7 +175,7 @@ describe("held native computation accounting", () => {
 				await expect(internal.executeRequest(session, {}, "/bin/tool", [1, 2], 1)).rejects.toThrow("invalid certificate");
 				now = 100;
 			}, () => computations);
-			expect(new TaskTimeline(0).recordTool(evaluation.computation, true)).toEqual({ actorComputeMs: 0, reusedExecutionMs: 80 });
+			expect(new TaskTimeline(0).recordTool(evaluation.computation, performance.now(), true)).toMatchObject({ toolComputeMs: 80, hiddenComputeMs: 80 });
 		} finally { prototype.mockRestore(); acquire.mockRestore(); clock.mockRestore(); }
 	});
 
@@ -185,18 +185,18 @@ describe("held native computation accounting", () => {
 			{ pid: 20, requestedAt: 30, completedAt: 40, barrier: "inspection", outcome: "continued", native: { startedAt: 40, completedAt: 100 } },
 			{ pid: 10, requestedAt: 50, committedAt: 65, completedAt: 70, barrier: "inspection", outcome: "adopted" },
 		]);
-		expect(result).toEqual({ actorComputeMs: 80, reusedExecutionMs: 40 });
+		expect(result).toMatchObject({ toolComputeMs: 120, hiddenComputeMs: 40 });
 		expect(dependencies.filter(input => input.owned).map(input => [input.computation.startedAt, input.computation.completedAt]))
 			.toEqual([[20, 50], [40, 100]]);
 	});
 
-	it.each(["none", "descriptors"] as const)("keeps gross reuse when %s transport cannot separate sibling computation", async barrier => {
+	it.each(["none", "descriptors"] as const)("keeps known hidden computation when %s transport cannot separate sibling computation", async barrier => {
 		const { result, later } = await account([
 			{ pid: 10, requestedAt: 10, completedAt: 20, barrier: "inspection", outcome: "continued", native: { startedAt: 20, completedAt: 100 } },
 			{ pid: 20, requestedAt: 40, committedAt: 50, completedAt: 70, barrier, outcome: "adopted" },
 		]);
-		expect(result).toEqual({ actorComputeMs: undefined, reusedExecutionMs: 40 });
-		expect(later, "later reuse cannot credit ambiguous adoption as original computation").toEqual({ actorComputeMs: 0, reusedExecutionMs: 120, reusedExecutionIncomplete: true });
+		expect(result).toMatchObject({ toolComputeMs: undefined, hiddenComputeMs: 40 });
+		expect(later, "later reuse cannot credit ambiguous adoption as original computation").toMatchObject({ toolComputeMs: undefined, hiddenComputeMs: 120, hiddenComputeIncomplete: true });
 	});
 
 	it("does not invent a denominator after bounded timing storage saturates", async () => {
@@ -205,7 +205,7 @@ describe("held native computation accounting", () => {
 			...(index === 0 ? { native: { startedAt: 0.5, completedAt: 120 } } : {}),
 		})));
 		expect(dependencies).toHaveLength(66); // 64 pauses, one native clock and one bounded omission envelope.
-		expect(result).toEqual({ actorComputeMs: undefined, reusedExecutionMs: 40 });
-		expect(later).toEqual({ actorComputeMs: 0, reusedExecutionMs: 126.5, reusedExecutionIncomplete: true });
+		expect(result).toMatchObject({ toolComputeMs: undefined, hiddenComputeMs: 40 });
+		expect(later).toMatchObject({ toolComputeMs: undefined, hiddenComputeMs: 126.5, hiddenComputeIncomplete: true });
 	});
 });

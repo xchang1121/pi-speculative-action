@@ -59,7 +59,7 @@ describe("ProcessHandoffRegistry", () => {
 		expect(fixture.work.computation).toBe(computation);
 		const receipt = await fixture.actor();
 		expect(receipt).toMatchObject({ kind: "hit", producer: { computation } });
-		expect(new TaskTimeline(0).recordTool(fixture.work.computation!, true)).toMatchObject({ actorComputeMs: 0, reusedExecutionMs: 130 });
+		expect(new TaskTimeline(0).recordTool(fixture.work.computation!, performance.now(), true)).toMatchObject({ toolComputeMs: 130, hiddenComputeMs: 80 });
 		expect(fixture.registry.complete(fixture.key, fixture.work, fixture.certificate)).toBe(false);
 		expect(fixture.work.computation).toBe(computation);
 		fixture.registry.dispose();

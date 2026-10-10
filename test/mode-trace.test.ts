@@ -23,10 +23,10 @@ function prediction(mode: string, matched: boolean, adopted: boolean, operation 
 	} : { ...observed, match: { matched: false } } };
 }
 
-function actor(mode: string, sequence: number, reusedExecutionMs?: number, inputs = false): Extract<SpeculativeActionEvent<string>, { type: "actor_action" }> {
+function actor(mode: string, sequence: number, hiddenComputeMs?: number, inputs = false): Extract<SpeculativeActionEvent<string>, { type: "actor_action" }> {
 	return { ...envelope, type: "actor_action", candidate: candidate(mode), actualAction: "read file.ts",
-		...(reusedExecutionMs === undefined ? {} : { computation: { actorComputeMs: 120, reusedExecutionMs,
-			reusedByMode: [{ source: "pattern_aware", mode, reusedExecutionMs }] } }),
+		...(hiddenComputeMs === undefined ? {} : { computation: { toolComputeMs: 120, hiddenComputeMs,
+			hiddenByMode: [{ source: "pattern_aware", mode, hiddenComputeMs }] } }),
 		settlement: {
 			actorAction: { id: `actor-${sequence}`, sequence, turnID: "turn" }, tool: "read", matchedPredictions: [], rejections: [],
 			provider: { kind: "speculative", candidateID: "candidate", match: inputs ? { kind: "inputs", distance: 0 } : { kind: "exact", distance: 0 },
@@ -38,10 +38,10 @@ function actor(mode: string, sequence: number, reusedExecutionMs?: number, input
 describe("per-mode trace results", () => {
 	it("preserves incomplete computation evidence across later complete tasks in both live and replay summaries", () => {
 		const events: SpeculativeActionEvent<string>[] = [true, false].map(incomplete => ({ ...envelope, type: "task",
-			timing: { startedAt: 0, completedAt: 20, actorComputeMs: 10, reusedExecutionMs: 20, toolWaitMs: 20,
-				...(incomplete ? { reusedExecutionIncomplete: true as const } : {}) } }));
+			timing: { startedAt: 0, completedAt: 20, toolComputeMs: 30, hiddenComputeMs: 20, toolWaitMs: 20,
+				...(incomplete ? { hiddenComputeIncomplete: true as const } : {}) } }));
 		const summary = summarizeSpeculativeTrace(events);
-		expect(summary).toMatchObject({ actorComputeMs: 20, reusedExecutionMs: 40, reusedExecutionIncomplete: true });
+		expect(summary).toMatchObject({ toolComputeMs: 60, hiddenComputeMs: 40, hiddenComputeIncomplete: true });
 		expect(events.reduce(reduceSpeculativeTrace, emptySpeculativeTraceSummary())).toEqual(summary);
 	});
 
@@ -54,8 +54,8 @@ describe("per-mode trace results", () => {
 		];
 		const summary = summarizeSpeculativeTrace(events);
 		expect(summary.modesBySource.pattern_aware).toEqual({
-			"recheck-search": { observed: 1, matched: 1, adopted: 1, started: 1, productionMs: 12, reusedExecutionMs: 80 },
-			"result-neighbors": { observed: 1, matched: 1, adopted: 1, started: 0, productionMs: 0, reusedExecutionMs: 0 },
+			"recheck-search": { observed: 1, matched: 1, adopted: 1, started: 1, productionMs: 12, hiddenComputeMs: 80 },
+			"result-neighbors": { observed: 1, matched: 1, adopted: 1, started: 0, productionMs: 0, hiddenComputeMs: 0 },
 		});
 		const live = events.reduce<SpeculativeTraceSummary>((current, event) => {
 			for (const modes of Object.values(current.modesBySource)) {
@@ -68,28 +68,28 @@ describe("per-mode trace results", () => {
 		expect(live).toEqual(summary);
 		const status = formatSpeculativeActionStatus({ settings: normalizeSpeculativeActionSettings(undefined),
 			metrics: { ...summary, actorProcessReuse: emptyWorldReuseMetrics() } });
-		expect(status).toContain("Mode results: Recheck search: 1/1 matched, 1 adopted; 80ms gross reused, 12ms production wall (1 started)");
-		expect(status).toContain("Result neighbors: 1/1 matched, 1 adopted; 0ms gross reused, 0ms production wall (0 started)");
+		expect(status).toContain("Mode results: Recheck search: 1/1 matched, 1 adopted; 80ms hidden, 12ms production wall (1 started)");
+		expect(status).toContain("Result neighbors: 1/1 matched, 1 adopted; 0ms hidden, 0ms production wall (0 started)");
 	});
 
 	it("uses measured reconstruction benefit and never treats the original result or adoption time as saved computation", () => {
 		const summary = summarizeSpeculativeTrace([actor("reported-files", 1, 9, true), actor("reported-files", 2, undefined, true)]);
 		expect(summary.modesBySource.pattern_aware?.["reported-files"]).toEqual({
-			observed: 0, matched: 0, adopted: 0, started: 0, productionMs: 0, reusedExecutionMs: 9,
+			observed: 0, matched: 0, adopted: 0, started: 0, productionMs: 0, hiddenComputeMs: 9,
 		});
 	});
 
 	it("attributes fallback consumption from its receipt breakdown and leaves missing provenance unassigned", () => {
 		const selected = actor("selected-result", 1, 45);
 		const summary = summarizeSpeculativeTrace([
-			{ ...selected, candidate: undefined, computation: { actorComputeMs: 12, reusedExecutionMs: 45, reusedByMode: [
-				{ source: "pattern_aware", mode: "child", reusedExecutionMs: 30 },
-				{ source: "other", mode: "preparation", reusedExecutionMs: 10 },
+			{ ...selected, candidate: undefined, computation: { toolComputeMs: 57, hiddenComputeMs: 45, hiddenByMode: [
+				{ source: "pattern_aware", mode: "child", hiddenComputeMs: 30 },
+				{ source: "other", mode: "preparation", hiddenComputeMs: 10 },
 			] } },
-			{ ...selected, computation: { actorComputeMs: 0, reusedExecutionMs: 45 } },
+			{ ...selected, computation: { toolComputeMs: 45, hiddenComputeMs: 45 } },
 		]);
-		expect(summary.modesBySource.pattern_aware?.child?.reusedExecutionMs).toBe(30);
-		expect(summary.modesBySource.other?.preparation?.reusedExecutionMs).toBe(10);
+		expect(summary.modesBySource.pattern_aware?.child?.hiddenComputeMs).toBe(30);
+		expect(summary.modesBySource.other?.preparation?.hiddenComputeMs).toBe(10);
 		expect(summary.modesBySource.pattern_aware?.["selected-result"]).toBeUndefined();
 	});
 
@@ -103,7 +103,7 @@ describe("per-mode trace results", () => {
 			prediction("recent-command", true, false, true), prediction("recent-command", false, false, true),
 		];
 		expect(summarizeSpeculativeTrace(events).modesBySource.pattern_aware?.["recent-command"]).toEqual({
-			observed: 2, matched: 1, adopted: 0, started: 2, productionMs: 35, reusedExecutionMs: 0,
+			observed: 2, matched: 1, adopted: 0, started: 2, productionMs: 35, hiddenComputeMs: 0,
 		});
 	});
 
