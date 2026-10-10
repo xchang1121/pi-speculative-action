@@ -1,3 +1,4 @@
+import { execFile, type ExecFileOptions } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
 import { access, realpath } from "node:fs/promises";
 import path from "node:path";
@@ -22,4 +23,14 @@ export async function resolveHostExecutable(
 
 async function executable(candidate: string): Promise<boolean> {
 	return access(candidate, fsConstants.X_OK).then(() => true, () => false);
+}
+
+/** Run a host utility with bounded output; callers retain their timeout and environment policy. */
+export function execHostText(executable: string, args: readonly string[], options: ExecFileOptions = {}): Promise<string> {
+	return new Promise((resolve, reject) => {
+		execFile(executable, args, { maxBuffer: 16 * 1024 * 1024, ...options, encoding: "utf8" }, (error, stdout, stderr) => {
+			if (error) reject(new Error(`${executable} failed: ${stderr.trim() || error.message}`, { cause: error }));
+			else resolve(`${stdout}${stderr}`);
+		});
+	});
 }

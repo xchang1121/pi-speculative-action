@@ -4,9 +4,9 @@ import { expect, test } from "vitest";
 import { commitBenchmarkFixture, compileBenchmarkHelper, createLinuxProcessBenchmark,
 	forkReusableBash, holdProcessPublication, metricDelta, prepareLinuxProcessReuse, textOutput } from "./linux-process-fixture.ts";
 
-test("preserves held-child output, effects and one-shot authority across parent commands", { timeout: 30_000 }, async ({ skip }) => {
+test.for(["git", "auto"] as const)("preserves held-child output, effects and one-shot authority across parent commands (%s)", { timeout: 30_000 }, async (driver, { skip }) => {
 	if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
-	const fixture = await createLinuxProcessBenchmark("pi-held-production-");
+	const fixture = await createLinuxProcessBenchmark("pi-held-production-", driver);
 	const { backend, workspace } = fixture;
 	try {
 		const status = await backend.check(true);
@@ -63,7 +63,6 @@ int main(int argc, char **argv) {
 			symlink("data.txt", path.join(workspace, "data.link")), symlink("d/e", path.join(workspace, "sub"))]);
 		await commitBenchmarkFixture(workspace, "Pi Held Exec Qualification");
 		const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
-		const nativeMetadata = (await fixture.workspaceSandbox.qualify({ liveLower: true }, workspace)).driver === "overlayfs";
 		const route = await fixture.prepareActorReplay();
 		const produce = (command: string) => forkReusableBash(fixture, {
 			label: "producer", command, actionNamespace: "held-production", executionFingerprint,
@@ -121,7 +120,7 @@ int main(int argc, char **argv) {
 				expect(result.output, scenario.name).toBe(`actor-parent\n${scenario.expected}`);
 				if (scenario.file) expect(await readFile(path.join(workspace, scenario.file), "utf8"))
 					.toBe(scenario.name === "descriptor" ? "descriptor" : `artifact:${scenario.name === "stale" ? "after" : "before"}\n`);
-				if (["disposed", "completed", "running", "cwd"].includes(scenario.name) || scenario.name === "inode" && nativeMetadata) {
+				if (["disposed", "completed", "running", "cwd", "inode"].includes(scenario.name)) {
 					expect(result.metrics, `${scenario.name}: ${JSON.stringify(result.metrics)}`).toMatchObject({ hits: 1, joinedHits: Number(scenario.name === "running"), sameTurnHits: 1,
 						reusedProcessMs: expect.any(Number) });
 					expect(result.metrics.reusedProcessMs).toBeGreaterThan(0);

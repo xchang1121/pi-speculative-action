@@ -1,8 +1,8 @@
 diff --git a/crates/sandlock-cli/src/main.rs b/crates/sandlock-cli/src/main.rs
-index 96309ec..8d6fb8d 100644
+index 96309ec..c67890c 100644
 --- a/crates/sandlock-cli/src/main.rs
 +++ b/crates/sandlock-cli/src/main.rs
-@@ -98,6 +98,22 @@ struct RunArgs {
+@@ -98,6 +98,25 @@ struct RunArgs {
      #[arg(long = "fs-mount", value_name = "VIRTUAL:HOST[:ro]")]
      fs_mount: Vec<String>,
 
@@ -21,11 +21,14 @@ index 96309ec..8d6fb8d 100644
 +    /// Reproduce captured directory entries on a private directory object.
 +    #[arg(long = "directory-image", value_name = "DIRECTORY:IMAGE")]
 +    directory_image: Vec<String>,
++    /// Preserve the metadata of snapshot objects pinned by the workspace owner.
++    #[arg(long = "metadata-image", value_name = "IMAGE")]
++    metadata_image: Option<PathBuf>,
 +
      /// COW branch action on normal sandbox exit: commit | abort | keep
      /// (default: commit).
      #[arg(long = "on-exit", value_name = "ACTION")]
-@@ -560,6 +576,7 @@ async fn run_command(args: RunArgs) -> Result<i32> {
+@@ -560,6 +579,7 @@ async fn run_command(args: RunArgs) -> Result<i32> {
          // Filesystem extras
          if let Some(ref path) = base.chroot { b = b.chroot(path); }
          if let Some(ref path) = base.fs_storage { b = b.fs_storage(path); }
@@ -33,7 +36,7 @@ index 96309ec..8d6fb8d 100644
          for (virt, host) in &base.fs_mount {
              if base.fs_mount_ro.iter().any(|d| d == virt) {
                  b = b.fs_mount_ro(virt, host);
-@@ -606,6 +623,7 @@ async fn run_command(args: RunArgs) -> Result<i32> {
+@@ -606,6 +626,7 @@ async fn run_command(args: RunArgs) -> Result<i32> {
      if let Some(ref path) = pb.workdir { builder = builder.workdir(path); }
      if let Some(ref path) = pb.cwd { builder = builder.cwd(path); }
      if let Some(ref path) = pb.fs_storage { builder = builder.fs_storage(path); }
@@ -41,7 +44,7 @@ index 96309ec..8d6fb8d 100644
      if !pb.extra_allow_syscalls.is_empty() { builder = builder.extra_allow_syscalls(pb.extra_allow_syscalls.clone()); }
      if !pb.extra_deny_syscalls.is_empty() { builder = builder.extra_deny_syscalls(pb.extra_deny_syscalls.clone()); }
      for rule in &pb.http_allow { builder = builder.http_allow(rule); }
-@@ -644,6 +662,25 @@ async fn run_command(args: RunArgs) -> Result<i32> {
+@@ -644,6 +665,29 @@ async fn run_command(args: RunArgs) -> Result<i32> {
              builder.fs_mount(virt, host)
          };
      }
@@ -59,6 +62,10 @@ index 96309ec..8d6fb8d 100644
 +        }
 +        builder = builder.exec_alias(virt, presented);
 +    }
++    if let Some(image) = &args.metadata_image {
++        if std::fs::metadata(image)?.len() > 64 * 1024 * 1024 { return Err(anyhow!("metadata image exceeds its bound")); }
++        builder = builder.metadata_image(&std::fs::read(image)?)?;
++    }
 +    for spec in &args.directory_image {
 +        let (directory, image, read_only) = profile::parse_mount_spec(spec)?;
 +        if read_only || std::fs::metadata(&image)?.len() > 2 * 1024 * 1024 { return Err(anyhow!("invalid directory image")); }
@@ -67,7 +74,7 @@ index 96309ec..8d6fb8d 100644
      if !args.cpu_cores.is_empty() { builder = builder.cpu_cores(args.cpu_cores.clone()); }
      match &args.gpu {
          // `all` maps to an empty device list, which the core expands to every
-@@ -742,6 +779,8 @@ async fn run_command(args: RunArgs) -> Result<i32> {
+@@ -742,6 +786,8 @@ async fn run_command(args: RunArgs) -> Result<i32> {
          policy
      };
 
@@ -77,7 +84,7 @@ index 96309ec..8d6fb8d 100644
          if policy.workdir.is_none() {
              return Err(anyhow!("--dry-run requires --workdir"));
 diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/src/chroot/dispatch.rs
-index 6e4ab93..c917c71 100644
+index 6e4ab93..4d386e4 100644
 --- a/crates/sandlock-core/src/chroot/dispatch.rs
 +++ b/crates/sandlock-core/src/chroot/dispatch.rs
 @@ -59,7 +59,7 @@ use crate::chroot::resolve::{
@@ -89,7 +96,7 @@ index 6e4ab93..c917c71 100644
  use crate::seccomp::state::{ChrootState, CowState, ProcessIndex};
  use crate::sys::structs::{SeccompNotif, SeccompNotifAddfd, SECCOMP_IOCTL_NOTIF_ADDFD};
 
-@@ -76,9 +76,29 @@ pub(crate) struct ChrootCtx<'a> {
+@@ -76,9 +76,30 @@ pub(crate) struct ChrootCtx<'a> {
      pub mounts: &'a [(PathBuf, PathBuf)],
      /// Virtual paths of read-only mounts: reads allowed, writes denied.
      pub mount_ro: &'a [PathBuf],
@@ -98,6 +105,7 @@ index 6e4ab93..c917c71 100644
 +    /// Directories whose executables really live, and are named to interpreters, under another directory.
 +    pub exec_aliases: &'a [(PathBuf, PathBuf)],
 +    pub directory_images: &'a [(PathBuf, Vec<u8>)],
++    pub metadata_image: &'a MetadataImage,
      /// Per-process supervisor state, for handlers that track the caller's
      /// filesystem context rather than just resolving one path.
      pub processes: &'a Arc<ProcessIndex>,
@@ -119,13 +127,14 @@ index 6e4ab93..c917c71 100644
  }
 
  impl<'a> ChrootCtx<'a> {
-@@ -94,12 +114,42 @@ impl<'a> ChrootCtx<'a> {
+@@ -94,12 +115,43 @@ impl<'a> ChrootCtx<'a> {
              denied: &policy.chroot_denied,
              mounts: &policy.chroot_mounts,
              mount_ro: &policy.chroot_mount_ro,
 +            exec_mounts: &policy.chroot_exec_mounts,
 +            exec_aliases: &policy.chroot_exec_aliases,
 +            directory_images: &policy.chroot_directory_images,
++            metadata_image: &policy.chroot_metadata_image,
              processes,
 +            private_writes: policy.cow_enabled && policy.chroot_root.as_deref() == Some(Path::new("/")),
 +            private_upper: policy.chroot_private_upper.as_deref().filter(|_| policy.cow_enabled && policy.chroot_root.as_deref() == Some(Path::new("/"))),
@@ -162,7 +171,7 @@ index 6e4ab93..c917c71 100644
      fn is_denied(&self, virtual_path: &Path) -> bool {
          self.denied.iter().any(|p| virtual_path.starts_with(p))
      }
-@@ -143,6 +193,18 @@ impl ChrootCtx<'_> {
+@@ -143,6 +195,18 @@ impl ChrootCtx<'_> {
          self.writable.iter().any(|p| virtual_path.starts_with(p))
      }
 
@@ -181,7 +190,7 @@ index 6e4ab93..c917c71 100644
      /// Check if a virtual path falls under any mount point.
      fn is_mounted(&self, virtual_path: &Path) -> bool {
          self.mounts.iter().any(|(vp, _)| virtual_path.starts_with(vp))
-@@ -169,39 +231,46 @@ impl ChrootCtx<'_> {
+@@ -169,39 +233,46 @@ impl ChrootCtx<'_> {
          Some((mount_hp, sub_str))
      }
 
@@ -199,6 +208,11 @@ index 6e4ab93..c917c71 100644
 -        let confined = confine(virtual_path);
 -        let (mount_target, sub_path) = self.mount_target(&confined)?;
 -        resolver(mount_target, &sub_path).map(|(host, _)| (host, confined))
+-    }
+-
+-    /// Resolve against mounts for paths that may not exist yet (O_CREAT).
+-    fn resolve_mount(&self, virtual_path: &str) -> Option<(PathBuf, PathBuf)> {
+-        self.resolve_mount_with(virtual_path, resolve_in_root)
 +        resolver: fn(&Path, &str) -> Result<(PathBuf, PathBuf), i32>,
 +    ) -> Result<(PathBuf, PathBuf), i32> {
 +        let requested = Path::new(virtual_path);
@@ -209,11 +223,6 @@ index 6e4ab93..c917c71 100644
 +        Ok((host, virtual_root.join(resolved.strip_prefix("/").map_err(|_| libc::EACCES)?)))
      }
 
--    /// Resolve against mounts for paths that may not exist yet (O_CREAT).
--    fn resolve_mount(&self, virtual_path: &str) -> Option<(PathBuf, PathBuf)> {
--        self.resolve_mount_with(virtual_path, resolve_in_root)
--    }
--
 -    /// Resolve against mounts for paths that must exist.
 -    fn resolve_mount_existing(&self, virtual_path: &str) -> Option<(PathBuf, PathBuf)> {
 -        self.resolve_mount_with(virtual_path, resolve_existing_in_root)
@@ -252,7 +261,7 @@ index 6e4ab93..c917c71 100644
      }
  }
 
-@@ -272,6 +341,8 @@ fn virtual_cwd_of(notif: &SeccompNotif, ctx: &ChrootCtx<'_>) -> Option<PathBuf>
+@@ -272,6 +343,8 @@ fn virtual_cwd_of(notif: &SeccompNotif, ctx: &ChrootCtx<'_>) -> Option<PathBuf>
  /// Record the calling task's new virtual cwd.
  fn set_virtual_cwd(notif: &SeccompNotif, ctx: &ChrootCtx<'_>, cwd: PathBuf) {
      if let Ok(pid) = i32::try_from(notif.pid) {
@@ -261,7 +270,7 @@ index 6e4ab93..c917c71 100644
          ctx.processes.set_virtual_cwd(pid, cwd);
      }
  }
-@@ -407,60 +478,34 @@ fn build_virtual_path(
+@@ -407,60 +480,34 @@ fn build_virtual_path(
      Some(canon_proc_cwd(&canon_proc_self(&vpath, notif.pid), ctx))
  }
 
@@ -342,7 +351,7 @@ index 6e4ab93..c917c71 100644
  }
 
  /// Convert a Path to CString, returning Errno on failure.
-@@ -475,6 +520,23 @@ fn last_errno(fallback: i32) -> i32 {
+@@ -475,6 +522,23 @@ fn last_errno(fallback: i32) -> i32 {
          .unwrap_or(fallback)
  }
 
@@ -366,7 +375,7 @@ index 6e4ab93..c917c71 100644
  /// Resolve host_path through COW (handle_stat), returning the real path.
  /// Falls back to host_path if COW is inactive or doesn't match.
  async fn cow_resolve(
-@@ -507,7 +569,7 @@ fn read_and_resolve(
+@@ -507,7 +571,7 @@ fn read_and_resolve(
          .ok_or(NotifAction::Continue)?;
      let dirfd = notif.data.args[dirfd_idx] as i64;
      let (host_path, virtual_path) =
@@ -375,27 +384,35 @@ index 6e4ab93..c917c71 100644
      Ok((path, host_path, virtual_path))
  }
 
-@@ -523,8 +585,7 @@ fn read_and_resolve_nofollow(
+@@ -523,26 +587,7 @@ fn read_and_resolve_nofollow(
      let path = read_path(notif, notif.data.args[path_idx], notif_fd)
          .ok_or(NotifAction::Continue)?;
      let dirfd = notif.data.args[dirfd_idx] as i64;
 -    let (host_path, virtual_path) = resolve_chroot_path_nofollow(notif, dirfd, &path, ctx)
 -        .ok_or(NotifAction::Errno(libc::EACCES))?;
+-    Ok((path, host_path, virtual_path))
+-}
+-
+-/// Like [`read_and_resolve`] but requires the path to already exist.
+-/// Returns a fully kernel-resolved host path with no unresolved symlinks.
+-fn read_and_resolve_existing(
+-    notif: &SeccompNotif,
+-    notif_fd: RawFd,
+-    ctx: &ChrootCtx<'_>,
+-    dirfd_idx: usize,
+-    path_idx: usize,
+-) -> Result<(String, PathBuf, PathBuf), NotifAction> {
+-    let path = read_path(notif, notif.data.args[path_idx], notif_fd)
+-        .ok_or(NotifAction::Continue)?;
+-    let dirfd = notif.data.args[dirfd_idx] as i64;
+-    let (host_path, virtual_path) =
+-        resolve_chroot_path_existing(notif, dirfd, &path, ctx)
+-            .ok_or(NotifAction::Errno(libc::ENOENT))?;
 +    let (host_path, virtual_path) = resolve_chroot_path_nofollow(notif, dirfd, &path, ctx).map_err(NotifAction::Errno)?;
      Ok((path, host_path, virtual_path))
  }
 
-@@ -541,8 +602,7 @@ fn read_and_resolve_existing(
-         .ok_or(NotifAction::Continue)?;
-     let dirfd = notif.data.args[dirfd_idx] as i64;
-     let (host_path, virtual_path) =
--        resolve_chroot_path_existing(notif, dirfd, &path, ctx)
--            .ok_or(NotifAction::Errno(libc::ENOENT))?;
-+        resolve_chroot_path_existing(notif, dirfd, &path, ctx).map_err(NotifAction::Errno)?;
-     Ok((path, host_path, virtual_path))
- }
-
-@@ -563,6 +623,102 @@ fn exec_on_host(f: impl FnOnce(*const libc::c_char) -> libc::c_int, host: &Path)
+@@ -563,6 +608,102 @@ fn exec_on_host(f: impl FnOnce(*const libc::c_char) -> libc::c_int, host: &Path)
  // openat handler
  // ============================================================
 
@@ -498,7 +515,7 @@ index 6e4ab93..c917c71 100644
  pub(crate) async fn handle_chroot_open(
      notif: &SeccompNotif,
      _chroot_state: &Arc<Mutex<ChrootState>>,
-@@ -573,8 +729,8 @@ pub(crate) async fn handle_chroot_open(
+@@ -573,8 +714,8 @@ pub(crate) async fn handle_chroot_open(
      // Every open spelling lands here, and they do not share an argument
      // layout: openat2 keeps flags, mode and resolve in a struct open_how in
      // child memory, where args[2] is the pointer to it rather than the flags.
@@ -509,7 +526,7 @@ index 6e4ab93..c917c71 100644
          None => return NotifAction::Continue,
      };
 
-@@ -583,6 +739,18 @@ pub(crate) async fn handle_chroot_open(
+@@ -583,6 +724,18 @@ pub(crate) async fn handle_chroot_open(
          None => return NotifAction::Continue,
      };
 
@@ -528,7 +545,7 @@ index 6e4ab93..c917c71 100644
      let honored = honorable_resolve_flags(resolve);
      if let Some(refusal) = enforce_resolve_flags(notif, dirfd, &rel_path, ctx, honored) {
          return refusal;
-@@ -590,17 +758,21 @@ pub(crate) async fn handle_chroot_open(
+@@ -590,17 +743,21 @@ pub(crate) async fn handle_chroot_open(
 
      // Resolve to get the virtual path for access control.
      let (host_path, virtual_path) = match resolve_chroot_path(notif, dirfd, &rel_path, ctx) {
@@ -558,7 +575,7 @@ index 6e4ab93..c917c71 100644
          return NotifAction::Errno(libc::EACCES);
      }
 
-@@ -617,17 +789,20 @@ pub(crate) async fn handle_chroot_open(
+@@ -617,17 +774,20 @@ pub(crate) async fn handle_chroot_open(
                              Ok(c) => c,
                              Err(a) => return a,
                          };
@@ -585,7 +602,7 @@ index 6e4ab93..c917c71 100644
                      }
                      Ok(None) => {
                          // Fall through to openat2_in_root below. This keeps
-@@ -635,6 +810,18 @@ pub(crate) async fn handle_chroot_open(
+@@ -635,6 +795,18 @@ pub(crate) async fn handle_chroot_open(
                          // cases confined to the chroot instead of executing the
                          // original host syscall. (Whiteouts are handled by the
                          // BranchError::Deleted arm below, not here.)
@@ -604,7 +621,7 @@ index 6e4ab93..c917c71 100644
                      }
                      Err(crate::error::BranchError::QuotaExceeded) => {
                          return NotifAction::Errno(libc::ENOSPC);
-@@ -657,25 +844,8 @@ pub(crate) async fn handle_chroot_open(
+@@ -657,25 +829,8 @@ pub(crate) async fn handle_chroot_open(
      }
 
      // Resolve the path to an fd to hand the child: either a freshly opened tree
@@ -632,7 +649,7 @@ index 6e4ab93..c917c71 100644
  }
 
  /// Open `virtual_path` within the child's virtual namespace, returning an fd to
-@@ -714,22 +884,20 @@ fn open_in_namespace(
+@@ -714,22 +869,20 @@ fn open_in_namespace(
 
      // Category 2, named directly: skip the open and dup straight away.
      if let Some(child_fd) = magic_self_fd(&vp_str, child_pid) {
@@ -659,7 +676,7 @@ index 6e4ab93..c917c71 100644
                  None => Err(errno),
              }
          }
-@@ -737,11 +905,50 @@ fn open_in_namespace(
+@@ -737,11 +890,50 @@ fn open_in_namespace(
      }
  }
 
@@ -711,7 +728,7 @@ index 6e4ab93..c917c71 100644
      let is_self =
          who == "self" || who == "thread-self" || who.parse::<u32>().ok() == Some(child_pid);
      if !is_self || fd_part.contains('/') {
-@@ -867,6 +1074,110 @@ fn read_pt_interp(fd: RawFd) -> Option<(String, u64, usize)> {
+@@ -867,6 +1059,110 @@ fn read_pt_interp(fd: RawFd) -> Option<(String, u64, usize)> {
      None
  }
 
@@ -822,7 +839,7 @@ index 6e4ab93..c917c71 100644
  /// Create a memfd copy of `src_fd` with PT_INTERP patched to `new_interp`.
  /// Uses sendfile for efficient kernel-to-kernel copy, then patches the
  /// interpreter path in place.
-@@ -937,7 +1248,7 @@ fn memfd_with_patched_interp(
+@@ -937,7 +1233,7 @@ fn memfd_with_patched_interp(
  pub(crate) async fn handle_chroot_exec(
      notif: &SeccompNotif,
      chroot_state: &Arc<Mutex<ChrootState>>,
@@ -831,7 +848,7 @@ index 6e4ab93..c917c71 100644
      notif_fd: RawFd,
      ctx: &ChrootCtx<'_>,
  ) -> NotifAction {
-@@ -952,6 +1263,7 @@ pub(crate) async fn handle_chroot_exec(
+@@ -952,6 +1248,7 @@ pub(crate) async fn handle_chroot_exec(
          Some(p) => p,
          None => return NotifAction::Continue,
      };
@@ -839,7 +856,7 @@ index 6e4ab93..c917c71 100644
 
      // Build the full virtual path from dirfd + relative path.
      let full_path = if Path::new(&rel_path).is_absolute() {
-@@ -973,30 +1285,96 @@ pub(crate) async fn handle_chroot_exec(
+@@ -973,30 +1270,96 @@ pub(crate) async fn handle_chroot_exec(
      if !ctx.can_read(&virtual_path) {
          return NotifAction::Errno(libc::EACCES);
      }
@@ -950,7 +967,7 @@ index 6e4ab93..c917c71 100644
          // Open the image's interpreter from the chroot root (intentionally
          // NOT mount-aware ��� the dynamic linker should come from the base
          // image, not from workspace mounts).
-@@ -1019,7 +1397,7 @@ pub(crate) async fn handle_chroot_exec(
+@@ -1019,7 +1382,7 @@ pub(crate) async fn handle_chroot_exec(
              flags: 0,
              srcfd: interp_src as u32,
              newfd: 0,
@@ -959,7 +976,7 @@ index 6e4ab93..c917c71 100644
          };
          let child_interp_fd = unsafe {
              libc::ioctl(
-@@ -1068,7 +1446,7 @@ pub(crate) async fn handle_chroot_exec(
+@@ -1068,7 +1431,7 @@ pub(crate) async fn handle_chroot_exec(
          flags: 0,
          srcfd: exec_fd.as_raw_fd() as u32,
          newfd: 0,
@@ -968,7 +985,7 @@ index 6e4ab93..c917c71 100644
      };
      let child_fd = unsafe {
          libc::ioctl(
-@@ -1084,13 +1462,13 @@ pub(crate) async fn handle_chroot_exec(
+@@ -1084,13 +1447,13 @@ pub(crate) async fn handle_chroot_exec(
      }
 
      // Rewrite the path to /proc/self/fd/N, relocating argv[0] when it aliases
@@ -987,7 +1004,7 @@ index 6e4ab93..c917c71 100644
      )
      .is_err()
      {
-@@ -1119,7 +1497,7 @@ pub(crate) async fn handle_chroot_write(
+@@ -1119,7 +1482,7 @@ pub(crate) async fn handle_chroot_write(
              Ok(r) => r,
              Err(a) => return a,
          };
@@ -996,7 +1013,7 @@ index 6e4ab93..c917c71 100644
          let is_dir = (notif.data.args[2] & libc::AT_REMOVEDIR as u64) != 0;
 
          {
-@@ -1135,6 +1513,7 @@ pub(crate) async fn handle_chroot_write(
+@@ -1135,6 +1498,7 @@ pub(crate) async fn handle_chroot_write(
                  }
              }
          }
@@ -1004,7 +1021,7 @@ index 6e4ab93..c917c71 100644
          return exec_on_host(
              |p| if is_dir { unsafe { libc::rmdir(p) } } else { unsafe { libc::unlink(p) } },
              &host_path,
-@@ -1146,15 +1525,15 @@ pub(crate) async fn handle_chroot_write(
+@@ -1146,15 +1510,15 @@ pub(crate) async fn handle_chroot_write(
              Ok(r) => r,
              Err(a) => return a,
          };
@@ -1023,7 +1040,7 @@ index 6e4ab93..c917c71 100644
                          Ok(true) => return NotifAction::ReturnValue(0),
                          Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
                          _ => {}
-@@ -1162,13 +1541,27 @@ pub(crate) async fn handle_chroot_write(
+@@ -1162,13 +1526,27 @@ pub(crate) async fn handle_chroot_write(
                  }
              }
          }
@@ -1054,7 +1071,7 @@ index 6e4ab93..c917c71 100644
          let old_path = match read_path(notif, notif.data.args[1], notif_fd) {
              Some(p) => p,
              None => return NotifAction::Continue,
-@@ -1180,14 +1573,14 @@ pub(crate) async fn handle_chroot_write(
+@@ -1180,14 +1558,14 @@ pub(crate) async fn handle_chroot_write(
          // rename(2) moves the names themselves: a symlink on either side is
          // renamed, not chased.
          let (old_host, old_vp) = match resolve_chroot_path_nofollow(notif, notif.data.args[0] as i64, &old_path, ctx) {
@@ -1074,7 +1091,7 @@ index 6e4ab93..c917c71 100644
              return NotifAction::Errno(libc::EACCES);
          }
 
-@@ -1196,6 +1589,8 @@ pub(crate) async fn handle_chroot_write(
+@@ -1196,6 +1574,8 @@ pub(crate) async fn handle_chroot_write(
              if let Some(cow) = cs.branch.as_mut() {
                  let old_str = old_host.to_string_lossy();
                  if cow.matches(&old_str) {
@@ -1083,7 +1100,7 @@ index 6e4ab93..c917c71 100644
                      match cow.handle_rename(&old_str, &new_host.to_string_lossy()) {
                          Ok(true) => return NotifAction::ReturnValue(0),
                          Err(errno) => return NotifAction::Errno(errno),
-@@ -1205,9 +1600,10 @@ pub(crate) async fn handle_chroot_write(
+@@ -1205,9 +1585,10 @@ pub(crate) async fn handle_chroot_write(
              }
          }
 
@@ -1095,7 +1112,7 @@ index 6e4ab93..c917c71 100644
              NotifAction::Errno(last_errno(libc::EIO))
          } else {
              NotifAction::ReturnValue(0)
-@@ -1225,10 +1621,10 @@ pub(crate) async fn handle_chroot_write(
+@@ -1225,10 +1606,10 @@ pub(crate) async fn handle_chroot_write(
              None => return NotifAction::Continue,
          };
          let (host_link, link_vp) = match resolve_chroot_path(notif, notif.data.args[1] as i64, &linkpath, ctx) {
@@ -1109,7 +1126,7 @@ index 6e4ab93..c917c71 100644
 
          {
              let mut cs = cow_state.lock().await;
-@@ -1244,6 +1640,7 @@ pub(crate) async fn handle_chroot_write(
+@@ -1244,6 +1625,7 @@ pub(crate) async fn handle_chroot_write(
              }
          }
 
@@ -1117,7 +1134,7 @@ index 6e4ab93..c917c71 100644
          let c_target = match CString::new(target.as_str()) { Ok(c) => c, Err(_) => return NotifAction::Errno(libc::EINVAL) };
          let c_link = match path_cstr(&host_link, libc::EINVAL) { Ok(c) => c, Err(a) => return a };
          return if unsafe { libc::symlink(c_target.as_ptr(), c_link.as_ptr()) } < 0 {
-@@ -1284,22 +1681,17 @@ pub(crate) async fn handle_chroot_write(
+@@ -1284,22 +1666,17 @@ pub(crate) async fn handle_chroot_write(
              // would otherwise be judged by the link's own name, and a denied
              // or read-only target would pass under any allowed spelling.
              resolve_chroot_path_existing(notif, notif.data.args[0] as i64, &old_path, ctx)
@@ -1145,7 +1162,7 @@ index 6e4ab93..c917c71 100644
          };
          // A hard link is a second name for one inode, so afterwards the
          // authority over that inode is the union of the policy on both names.
-@@ -1309,7 +1701,7 @@ pub(crate) async fn handle_chroot_write(
+@@ -1309,7 +1686,7 @@ pub(crate) async fn handle_chroot_write(
          // keeps the weaker name from being upgraded, the same rule rename
          // already applies to the name it destroys. Off the chroot path
          // Landlock enforces this already: linking needs REFER on both sides.
@@ -1154,7 +1171,7 @@ index 6e4ab93..c917c71 100644
              return NotifAction::Errno(libc::EACCES);
          }
 
-@@ -1334,6 +1726,7 @@ pub(crate) async fn handle_chroot_write(
+@@ -1334,6 +1711,7 @@ pub(crate) async fn handle_chroot_write(
              }
          }
 
@@ -1162,7 +1179,7 @@ index 6e4ab93..c917c71 100644
          let c_old = match path_cstr(&old_host, libc::EINVAL) { Ok(c) => c, Err(a) => return a };
          let c_new = match path_cstr(&new_host, libc::EINVAL) { Ok(c) => c, Err(a) => return a };
          // Both defined flags describe a source this code has already resolved,
-@@ -1358,7 +1751,7 @@ pub(crate) async fn handle_chroot_write(
+@@ -1358,7 +1736,7 @@ pub(crate) async fn handle_chroot_write(
              Ok(r) => r,
              Err(a) => return a,
          };
@@ -1171,7 +1188,7 @@ index 6e4ab93..c917c71 100644
          let mode = (notif.data.args[2] & 0o7777) as u32;
 
          {
-@@ -1374,6 +1767,7 @@ pub(crate) async fn handle_chroot_write(
+@@ -1374,6 +1752,7 @@ pub(crate) async fn handle_chroot_write(
                  }
              }
          }
@@ -1179,7 +1196,7 @@ index 6e4ab93..c917c71 100644
          return exec_on_host(|p| unsafe { libc::chmod(p, mode) }, &host_path);
      }
 
-@@ -1388,7 +1782,7 @@ pub(crate) async fn handle_chroot_write(
+@@ -1388,7 +1767,7 @@ pub(crate) async fn handle_chroot_write(
              Ok(r) => r,
              Err(a) => return a,
          };
@@ -1188,7 +1205,7 @@ index 6e4ab93..c917c71 100644
          let uid = notif.data.args[2] as u32;
          let gid = notif.data.args[3] as u32;
 
-@@ -1405,6 +1799,7 @@ pub(crate) async fn handle_chroot_write(
+@@ -1405,6 +1784,7 @@ pub(crate) async fn handle_chroot_write(
                  }
              }
          }
@@ -1196,7 +1213,7 @@ index 6e4ab93..c917c71 100644
          return exec_on_host(
              |p| unsafe {
                  if nofollow { libc::lchown(p, uid, gid) } else { libc::chown(p, uid, gid) }
-@@ -1419,10 +1814,10 @@ pub(crate) async fn handle_chroot_write(
+@@ -1419,10 +1799,10 @@ pub(crate) async fn handle_chroot_write(
              None => return NotifAction::Continue,
          };
          let (host_path, vp) = match resolve_chroot_path(notif, libc::AT_FDCWD as i64, &path, ctx) {
@@ -1210,7 +1227,7 @@ index 6e4ab93..c917c71 100644
          let length = notif.data.args[1] as i64;
 
          {
-@@ -1438,6 +1833,7 @@ pub(crate) async fn handle_chroot_write(
+@@ -1438,6 +1818,7 @@ pub(crate) async fn handle_chroot_write(
                  }
              }
          }
@@ -1218,19 +1235,114 @@ index 6e4ab93..c917c71 100644
          return exec_on_host(|p| unsafe { libc::truncate(p, length) }, &host_path);
      }
 
-@@ -1449,7 +1845,7 @@ pub(crate) async fn handle_chroot_write(
+@@ -1448,8 +1829,101 @@ pub(crate) async fn handle_chroot_write(
+ // stat/access handler
  // ============================================================
 
++/// The owner pins each private object while this mapping exists. Inodes cannot be
++/// recycled under a retained identity, including after rename, unlink, or replacement.
++#[derive(Debug, Default)]
++pub struct MetadataImage {
++    objects: std::collections::HashMap<(u64, u64), ([i128; 14], [i128; 14])>,
++}
++
++impl MetadataImage {
++    pub fn decode(bytes: &[u8]) -> std::io::Result<Self> {
++        let rows: Vec<([String; 14], [String; 14])> = serde_json::from_slice(bytes)?;
++        let parse = |row: [String; 14]| -> std::io::Result<[i128; 14]> {
++            Ok(row.into_iter().map(|value| value.parse()).collect::<Result<Vec<i128>, _>>()
++                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?.try_into().unwrap())
++        };
++        Self::from_rows(rows.into_iter().map(|(a, b)| Ok((parse(a)?, parse(b)?))).collect::<std::io::Result<Vec<_>>>()?)
++    }
++
++    fn from_rows(rows: Vec<([i128; 14], [i128; 14])>) -> std::io::Result<Self> {
++        let invalid = |message| std::io::Error::new(std::io::ErrorKind::InvalidData, message);
++        if rows.len() > 100_002 { return Err(invalid("metadata object bound exceeded")); }
++        let mut image = Self::default();
++        for (physical, original) in rows {
++            if !physical[..10].iter().chain(&original[..10]).all(|value| *value >= 0 && *value <= u64::MAX as i128) {
++                return Err(invalid("invalid metadata value"));
++            }
++            if image.objects.insert((physical[0] as u64, physical[1] as u64), (physical, original)).is_some() {
++                return Err(invalid("duplicate snapshot object"));
++            }
++        }
++        Ok(image)
++    }
++
++    pub fn serialize<S: serde::Serializer>(image: &Arc<Self>, serializer: S) -> Result<S::Ok, S::Error> {
++        serde::Serialize::serialize(&image.objects.values().collect::<Vec<_>>(), serializer)
++    }
++
++    pub fn deserialize<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Arc<Self>, D::Error> {
++        Self::from_rows(serde::Deserialize::deserialize(deserializer)?).map(Arc::new).map_err(serde::de::Error::custom)
++    }
++
++    pub fn is_empty(&self) -> bool { self.objects.is_empty() }
++
++    fn inode(&self, device: u64, inode: u64) -> u64 {
++        self.objects.get(&(device, inode)).map_or(inode, |(_, source)| source[1] as u64)
++    }
++
++    fn project(&self, values: &mut [i128; 14]) {
++        let Some((before, source)) = self.objects.get(&(values[0] as u64, values[1] as u64)) else { return; };
++        let unchanged = [7, 11, 12].iter().all(|index| values[*index] == before[*index]);
++        for index in [2, 4, 5, 6, 7, 8, 9, 10, 11, 12] {
++            if values[index] == before[index] && (index != 9 || unchanged) { values[index] = source[index]; }
++        }
++        values[0] = source[0]; values[1] = source[1]; values[13] = source[13];
++        values[3] = (source[3] + values[3] - before[3]).max(0);
++    }
++
++    fn stat(&self, state: &mut libc::stat) {
++        let mut fields = [state.st_dev as i128, state.st_ino as i128, state.st_mode as i128, state.st_nlink as i128,
++            state.st_uid as i128, state.st_gid as i128, state.st_rdev as i128, state.st_size as i128,
++            state.st_blksize as i128, state.st_blocks as i128,
++            state.st_atime as i128 * 1_000_000_000 + state.st_atime_nsec as i128,
++            state.st_mtime as i128 * 1_000_000_000 + state.st_mtime_nsec as i128,
++            state.st_ctime as i128 * 1_000_000_000 + state.st_ctime_nsec as i128, 0];
++        self.project(&mut fields);
++        state.st_dev = fields[0] as _; state.st_ino = fields[1] as _; state.st_mode = fields[2] as _;
++        state.st_nlink = fields[3] as _; state.st_uid = fields[4] as _; state.st_gid = fields[5] as _;
++        state.st_rdev = fields[6] as _; state.st_size = fields[7] as _; state.st_blksize = fields[8] as _; state.st_blocks = fields[9] as _;
++        state.st_atime = fields[10].div_euclid(1_000_000_000) as _; state.st_atime_nsec = fields[10].rem_euclid(1_000_000_000) as _;
++        state.st_mtime = fields[11].div_euclid(1_000_000_000) as _; state.st_mtime_nsec = fields[11].rem_euclid(1_000_000_000) as _;
++        state.st_ctime = fields[12].div_euclid(1_000_000_000) as _; state.st_ctime_nsec = fields[12].rem_euclid(1_000_000_000) as _;
++    }
++
++    fn statx(&self, state: &mut libc::statx) {
++        let mut fields = [libc::makedev(state.stx_dev_major, state.stx_dev_minor) as i128, state.stx_ino as i128,
++            state.stx_mode as i128, state.stx_nlink as i128, state.stx_uid as i128, state.stx_gid as i128,
++            libc::makedev(state.stx_rdev_major, state.stx_rdev_minor) as i128, state.stx_size as i128,
++            state.stx_blksize as i128, state.stx_blocks as i128,
++            state.stx_atime.tv_sec as i128 * 1_000_000_000 + state.stx_atime.tv_nsec as i128,
++            state.stx_mtime.tv_sec as i128 * 1_000_000_000 + state.stx_mtime.tv_nsec as i128,
++            state.stx_ctime.tv_sec as i128 * 1_000_000_000 + state.stx_ctime.tv_nsec as i128,
++            state.stx_btime.tv_sec as i128 * 1_000_000_000 + state.stx_btime.tv_nsec as i128];
++        self.project(&mut fields);
++        state.stx_dev_major = libc::major(fields[0] as _); state.stx_dev_minor = libc::minor(fields[0] as _);
++        state.stx_ino = fields[1] as _; state.stx_mode = fields[2] as _; state.stx_nlink = fields[3] as _;
++        state.stx_uid = fields[4] as _; state.stx_gid = fields[5] as _;
++        state.stx_rdev_major = libc::major(fields[6] as _); state.stx_rdev_minor = libc::minor(fields[6] as _);
++        state.stx_size = fields[7] as _; state.stx_blksize = fields[8] as _; state.stx_blocks = fields[9] as _;
++        for (stamp, value) in [&mut state.stx_atime, &mut state.stx_mtime, &mut state.stx_ctime, &mut state.stx_btime].into_iter().zip(&fields[10..]) {
++            stamp.tv_sec = value.div_euclid(1_000_000_000) as _; stamp.tv_nsec = value.rem_euclid(1_000_000_000) as _;
++        }
++    }
++}
++
  /// Pack struct stat and write to child buffer.
 -fn stat_and_write(notif: &SeccompNotif, notif_fd: RawFd, path: &Path) -> NotifAction {
-+fn stat_and_write(notif: &SeccompNotif, notif_fd: RawFd, path: &Path, device: Option<u64>) -> NotifAction {
++fn stat_and_write(notif: &SeccompNotif, notif_fd: RawFd, path: &Path, device: Option<u64>, metadata: &MetadataImage) -> NotifAction {
      let statbuf_addr = notif.data.args[2];
      let flags = notif.data.args[3];
      let follow = (flags & libc::AT_SYMLINK_NOFOLLOW as u64) == 0;
-@@ -1476,6 +1872,10 @@ fn stat_and_write(notif: &SeccompNotif, notif_fd: RawFd, path: &Path) -> NotifAc
+@@ -1476,6 +1950,11 @@ fn stat_and_write(notif: &SeccompNotif, notif_fd: RawFd, path: &Path) -> NotifAc
          return NotifAction::Errno(last_errno(libc::ENOENT));
      }
 
++    metadata.stat(&mut st);
 +    if let Some(device) = device {
 +        st.st_dev = device;
 +        if let Some(links) = mounted_directory_links(path, st.st_mode, st.st_nlink as u64) { st.st_nlink = links as _; }
@@ -1238,7 +1350,16 @@ index 6e4ab93..c917c71 100644
      let bytes = unsafe {
          std::slice::from_raw_parts(
              &st as *const libc::stat as *const u8,
-@@ -1496,13 +1896,24 @@ pub(crate) async fn handle_chroot_stat(
+@@ -1488,6 +1967,8 @@ fn stat_and_write(notif: &SeccompNotif, notif_fd: RawFd, path: &Path) -> NotifAc
+     NotifAction::ReturnValue(0)
+ }
+
++/// All stat entry points resolve and project the same object. A held descriptor
++/// stays pinned until its result is written; pathname reads retain their access gate.
+ pub(crate) async fn handle_chroot_stat(
+     notif: &SeccompNotif,
+     _chroot_state: &Arc<Mutex<ChrootState>>,
+@@ -1496,98 +1977,98 @@ pub(crate) async fn handle_chroot_stat(
      ctx: &ChrootCtx<'_>,
  ) -> NotifAction {
      let nr = notif.data.nr as i64;
@@ -1249,49 +1370,114 @@ index 6e4ab93..c917c71 100644
 -    // kernel stat it directly.
 -    if (flags & libc::AT_EMPTY_PATH as u64) != 0 {
 -        return NotifAction::Continue;
-+    // faccessat has no flags argument: its fourth register is whatever the caller left there.
-+    let flags = if nr == libc::SYS_faccessat { 0 } else { notif.data.args[3] };
-+
-+    // An empty name observes the held object, including its virtual filesystem device.
-+    if nr == libc::SYS_newfstatat && (flags & libc::AT_EMPTY_PATH as u64) != 0
-+        && (notif.data.args[1] == 0 || read_path(notif, notif.data.args[1], notif_fd).as_deref() == Some("")) {
-+        return handle_chroot_fstat(notif, _chroot_state, cow_state, notif_fd, ctx).await;
-+    }
-+
-+    // A self fd link observes an already-held object, just like AT_EMPTY_PATH.
-+    // Resolving its magic link beneath a mount with openat2 would return EXDEV.
-+    if nr == libc::SYS_newfstatat && flags & libc::AT_SYMLINK_NOFOLLOW as u64 == 0 {
-+        if let Some(fd) = read_path(notif, notif.data.args[1], notif_fd)
-+            .and_then(|path| build_virtual_path(notif, notif.data.args[0] as i64, &path, ctx))
-+            .and_then(|path| magic_self_fd(&path, notif.pid)) {
-+            return handle_chroot_fstat(&notif_with_args(notif, [fd as u64, 0, notif.data.args[2],
-+                flags | libc::AT_EMPTY_PATH as u64, 0, 0]), _chroot_state, cow_state, notif_fd, ctx).await;
+-    }
+-
+-    let resolved = if (flags & libc::AT_SYMLINK_NOFOLLOW as u64) != 0 {
+-        read_and_resolve_nofollow(notif, notif_fd, ctx, 0, 1)
++    let extended = nr == libc::SYS_statx;
++    let descriptor = nr == libc::SYS_fstat;
++    let access = nr == libc::SYS_faccessat || nr == crate::arch::SYS_FACCESSAT2;
++    // faccessat has no flags argument: the fourth register is not an input.
++    let mut flags = if descriptor || nr == libc::SYS_faccessat { 0 } else { notif.data.args[if extended { 2 } else { 3 }] as i32 };
++    let dirfd = notif.data.args[0] as i64;
++    let path = if descriptor { None } else { read_path(notif, notif.data.args[1], notif_fd) };
++    let held_fd = if descriptor || (!access && flags & libc::AT_EMPTY_PATH != 0
++        && (notif.data.args[1] == 0 || path.as_deref() == Some(""))) {
++        Some(dirfd as i32)
++    } else if !access && flags & libc::AT_SYMLINK_NOFOLLOW == 0 {
++        path.as_deref().and_then(|path| build_virtual_path(notif, dirfd, path, ctx))
++            .and_then(|path| magic_self_fd(&path, notif.pid))
++    } else { None };
++    let pin;
++    let (real_path, device) = if let Some(fd) = held_fd {
++        if !extended && flags & !(libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW | libc::AT_NO_AUTOMOUNT) != 0 {
++            return NotifAction::Continue;
 +        }
-     }
-
-     let resolved = if (flags & libc::AT_SYMLINK_NOFOLLOW as u64) != 0 {
-@@ -1521,15 +1932,57 @@ pub(crate) async fn handle_chroot_stat(
-         Err(a) => return a,
++        pin = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, fd) { Ok(pin) => pin, Err(_) => return NotifAction::Continue };
++        let held_path = PathBuf::from(format!("/proc/self/fd/{}", pin.as_raw_fd()));
++        let device = std::fs::read_link(&held_path).ok().and_then(|host| ctx.host_to_virtual(&host)
++            .and_then(|vp| mounted_device(ctx, &host, &vp, true)));
++        if device.is_none() && ctx.metadata_image.is_empty() { return NotifAction::Continue; }
++        flags &= !(libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW);
++        (held_path, device)
+     } else {
+-        read_and_resolve_existing(notif, notif_fd, ctx, 0, 1)
+-    };
+-    let (_, host_path, vp) = match resolved {
+-        Ok(r) => r,
+-        Err(a) => return a,
+-    };
+-    if !ctx.can_read(&vp) { return NotifAction::Errno(libc::EACCES); }
+-
+-    let real_path = match cow_resolve(cow_state, &host_path).await {
+-        Ok(p) => p,
+-        Err(a) => return a,
++        let path = match path { Some(path) if !extended || !path.is_empty() => path, _ => return NotifAction::Continue };
++        let resolve = if flags & libc::AT_SYMLINK_NOFOLLOW != 0 { resolve_chroot_path_nofollow } else { resolve_chroot_path_existing };
++        let (host_path, vp) = match resolve(notif, dirfd, &path, ctx) { Ok(paths) => paths, Err(errno) => return NotifAction::Errno(errno) };
++        if !ctx.can_read(&vp) { return NotifAction::Errno(libc::EACCES); }
++        let real_path = match cow_resolve(cow_state, &host_path).await { Ok(path) => path, Err(action) => return action };
++        (real_path, mounted_device(ctx, &host_path, &vp, flags & libc::AT_SYMLINK_NOFOLLOW == 0))
      };
-
-+    // The kernel judges the requested permissions on the object the view resolves to; this supervisor runs as the caller.
-     if nr == libc::SYS_faccessat || nr == crate::arch::SYS_FACCESSAT2 {
+-
+-    if nr == libc::SYS_faccessat || nr == crate::arch::SYS_FACCESSAT2 {
 -        return if real_path.exists() || real_path.is_symlink() {
-+        let mode = notif.data.args[2] as libc::c_int & (libc::R_OK | libc::W_OK | libc::X_OK);
-+        let at = flags as libc::c_int & (libc::AT_EACCESS | libc::AT_SYMLINK_NOFOLLOW);
-+        let c_path = match path_cstr(&real_path, libc::EINVAL) { Ok(c) => c, Err(a) => return a };
-+        return if unsafe { libc::faccessat(libc::AT_FDCWD, c_path.as_ptr(), mode, at) } == 0 {
-             NotifAction::ReturnValue(0)
-         } else {
+-            NotifAction::ReturnValue(0)
+-        } else {
 -            NotifAction::Errno(libc::ENOENT)
-+            NotifAction::Errno(last_errno(libc::EACCES))
-         };
+-        };
++    if access {
++        let mode = notif.data.args[2] as libc::c_int & (libc::R_OK | libc::W_OK | libc::X_OK);
++        let at = flags & (libc::AT_EACCESS | libc::AT_SYMLINK_NOFOLLOW);
++        return exec_on_host(|path| unsafe { libc::faccessat(libc::AT_FDCWD, path, mode, at) }, &real_path);
      }
-
+-
 -    stat_and_write(notif, notif_fd, &real_path)
-+    stat_and_write(notif, notif_fd, &real_path, mounted_device(ctx, &host_path, &vp, flags & libc::AT_SYMLINK_NOFOLLOW as u64 == 0))
+-}
+-
+-// ============================================================
+-// statx handler
+-// ============================================================
+-
+-pub(crate) async fn handle_chroot_statx(
+-    notif: &SeccompNotif,
+-    _chroot_state: &Arc<Mutex<ChrootState>>,
+-    cow_state: &Arc<Mutex<CowState>>,
+-    notif_fd: RawFd,
+-    ctx: &ChrootCtx<'_>,
+-) -> NotifAction {
+-    let dirfd = notif.data.args[0] as i64;
+-    let path_ptr = notif.data.args[1];
+-    let flags = notif.data.args[2] as i32;
+-    let mask = notif.data.args[3] as u32;
+-    let statxbuf_addr = notif.data.args[4];
+-
+-    // AT_EMPTY_PATH: stat the fd directly, no chroot path resolution needed.
+-    if (flags & libc::AT_EMPTY_PATH) != 0 {
+-        return NotifAction::Continue;
++    if extended {
++        statx_and_write(notif, notif_fd, &real_path, flags, notif.data.args[3] as u32, device, ctx.metadata_image)
++    } else {
++        let target = notif.data.args[if descriptor { 1 } else { 2 }];
++        stat_and_write(&notif_with_args(notif, [0, 0, target, flags as u64, 0, 0]), notif_fd, &real_path, device, ctx.metadata_image)
+     }
 +}
-+
+
+-    let path = match read_path(notif, path_ptr, notif_fd) {
+-        Some(p) if !p.is_empty() => p,
+-        _ => return NotifAction::Continue,
+-    };
+-
+-    let resolved = if (flags & libc::AT_SYMLINK_NOFOLLOW) != 0 {
+-        resolve_chroot_path_nofollow(notif, dirfd, &path, ctx)
+-    } else {
+-        resolve_chroot_path_existing(notif, dirfd, &path, ctx)
+-    };
+-    let (host_path, vp) = match resolved {
+-        Some(r) => r,
+-        None => return NotifAction::Errno(libc::ENOENT),
+-    };
+-    if !ctx.can_read(&vp) { return NotifAction::Errno(libc::EACCES); }
 +/// The mounted tree represents its source filesystem; FUSE's transport device is not a program input.
 +fn mounted_device(ctx: &ChrootCtx<'_>, host: &Path, virtual_path: &Path, follow: bool) -> Option<u64> {
 +    use std::os::unix::fs::MetadataExt;
@@ -1299,7 +1485,11 @@ index 6e4ab93..c917c71 100644
 +    let path = viewed_filesystem(ctx, host, virtual_path);
 +    (if follow { std::fs::metadata(path) } else { std::fs::symlink_metadata(path) }).ok().map(|state| state.dev())
 +}
-+
+
+-    let real_path = match cow_resolve(cow_state, &host_path).await {
+-        Ok(p) => p,
+-        Err(a) => return a,
+-    };
 +/// FUSE overlay directories count their merged child directories, but its inode
 +/// cache can forget children between lookups. Count the actual view, including
 +/// new directories and whiteouts, instead of exposing that partial cache count.
@@ -1312,76 +1502,9 @@ index 6e4ab93..c917c71 100644
 +        entry?.file_type().map(|kind| count + u64::from(kind.is_dir()))
 +    }).ok()
 +}
-+
-+/// Pin the same open file description before resolving its mount, so close/reuse of the caller's fd cannot redirect the stat.
-+pub(crate) async fn handle_chroot_fstat(
-+    notif: &SeccompNotif,
-+    _chroot_state: &Arc<Mutex<ChrootState>>,
-+    _cow_state: &Arc<Mutex<CowState>>,
-+    notif_fd: RawFd,
-+    ctx: &ChrootCtx<'_>,
-+) -> NotifAction {
-+    if notif.data.nr as i64 != libc::SYS_fstat && notif.data.args[3] & !(libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW | libc::AT_NO_AUTOMOUNT) as u64 != 0 { return NotifAction::Continue; }
-+    let Ok(pin) = crate::seccomp::notif::dup_fd_from_pid(notif.pid, notif.data.args[0] as i32) else { return NotifAction::Continue };
-+    let held_path = PathBuf::from(format!("/proc/self/fd/{}", pin.as_raw_fd()));
-+    let device = std::fs::read_link(&held_path).ok().and_then(|host| ctx.host_to_virtual(&host).and_then(|vp| mounted_device(ctx, &host, &vp, true)));
-+    if device.is_none() { return NotifAction::Continue; }
-+    let target = notif.data.args[if notif.data.nr as i64 == libc::SYS_fstat { 1 } else { 2 }];
-+    stat_and_write(&notif_with_args(notif, [0, 0, target, 0, 0, 0]), notif_fd, &held_path, device)
- }
-
- // ============================================================
-@@ -1547,14 +2000,23 @@ pub(crate) async fn handle_chroot_statx(
-     let path_ptr = notif.data.args[1];
-     let flags = notif.data.args[2] as i32;
-     let mask = notif.data.args[3] as u32;
--    let statxbuf_addr = notif.data.args[4];
-
--    // AT_EMPTY_PATH: stat the fd directly, no chroot path resolution needed.
--    if (flags & libc::AT_EMPTY_PATH) != 0 {
--        return NotifAction::Continue;
--    }
--
--    let path = match read_path(notif, path_ptr, notif_fd) {
-+    let path = read_path(notif, path_ptr, notif_fd);
-+    let held_fd = if (flags & libc::AT_EMPTY_PATH) != 0 && (path_ptr == 0 || path.as_deref() == Some("")) {
-+        Some(dirfd as i32)
-+    } else if flags & libc::AT_SYMLINK_NOFOLLOW == 0 {
-+        path.as_deref().and_then(|path| build_virtual_path(notif, dirfd, path, ctx))
-+            .and_then(|path| magic_self_fd(&path, notif.pid))
-+    } else { None };
-+    if let Some(fd) = held_fd {
-+        let Ok(pin) = crate::seccomp::notif::dup_fd_from_pid(notif.pid, fd) else { return NotifAction::Continue };
-+        let held_path = PathBuf::from(format!("/proc/self/fd/{}", pin.as_raw_fd()));
-+        let device = std::fs::read_link(&held_path).ok().and_then(|host| ctx.host_to_virtual(&host).and_then(|vp| mounted_device(ctx, &host, &vp, true)));
-+        if device.is_none() { return NotifAction::Continue; }
-+        return statx_and_write(notif, notif_fd, &held_path, flags & !(libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW), mask, device);
-+    }
-+
-+    let path = match path {
-         Some(p) if !p.is_empty() => p,
-         _ => return NotifAction::Continue,
-     };
-@@ -1565,8 +2027,8 @@ pub(crate) async fn handle_chroot_statx(
-         resolve_chroot_path_existing(notif, dirfd, &path, ctx)
-     };
-     let (host_path, vp) = match resolved {
--        Some(r) => r,
--        None => return NotifAction::Errno(libc::ENOENT),
-+        Ok(r) => r,
-+        Err(errno) => return NotifAction::Errno(errno),
-     };
-     if !ctx.can_read(&vp) { return NotifAction::Errno(libc::EACCES); }
-
-@@ -1575,19 +2037,32 @@ pub(crate) async fn handle_chroot_statx(
-         Err(a) => return a,
-     };
 
 -    let c_path = match path_cstr(&real_path, libc::ENOENT) {
-+    statx_and_write(notif, notif_fd, &real_path, flags, mask, mounted_device(ctx, &host_path, &vp, flags & libc::AT_SYMLINK_NOFOLLOW == 0))
-+}
-+
-+fn statx_and_write(notif: &SeccompNotif, notif_fd: RawFd, path: &Path, flags: i32, mask: u32, device: Option<u64>) -> NotifAction {
++fn statx_and_write(notif: &SeccompNotif, notif_fd: RawFd, path: &Path, flags: i32, mask: u32, device: Option<u64>, metadata: &MetadataImage) -> NotifAction {
 +    let c_path = match path_cstr(path, libc::ENOENT) {
          Ok(c) => c,
          Err(a) => return a,
@@ -1397,6 +1520,7 @@ index 6e4ab93..c917c71 100644
      }
 
 -    if write_child_mem(notif_fd, notif.id, notif.pid, statxbuf_addr, &stx_buf).is_err() {
++    metadata.statx(&mut state);
 +    if let Some(device) = device {
 +        state.stx_dev_major = libc::major(device); state.stx_dev_minor = libc::minor(device);
 +        if state.stx_mask & libc::STATX_NLINK != 0 {
@@ -1410,7 +1534,7 @@ index 6e4ab93..c917c71 100644
          return NotifAction::Continue;
      }
      NotifAction::ReturnValue(0)
-@@ -1704,8 +2179,8 @@ pub(crate) async fn handle_chroot_readlink(
+@@ -1704,8 +2185,8 @@ pub(crate) async fn handle_chroot_readlink(
      // readlink must read the link itself, never what it points at, which is
      // exactly what the no-follow resolver gives.
      let (host_path, _) = match resolve_chroot_path_nofollow(notif, dirfd, &path, ctx) {
@@ -1421,7 +1545,7 @@ index 6e4ab93..c917c71 100644
      };
 
      // COW
-@@ -1716,7 +2191,12 @@ pub(crate) async fn handle_chroot_readlink(
+@@ -1716,7 +2197,12 @@ pub(crate) async fn handle_chroot_readlink(
              if cow.matches(&host_str) {
                  let target = match cow.handle_readlink(&host_str) {
                      Some(t) => t,
@@ -1435,7 +1559,7 @@ index 6e4ab93..c917c71 100644
                  };
                  drop(cs);
                  return write_target(target.as_bytes());
-@@ -1726,7 +2206,7 @@ pub(crate) async fn handle_chroot_readlink(
+@@ -1726,7 +2212,7 @@ pub(crate) async fn handle_chroot_readlink(
 
      let target = match std::fs::read_link(&host_path) {
          Ok(t) => t,
@@ -1444,7 +1568,7 @@ index 6e4ab93..c917c71 100644
      };
 
      // Strip chroot/mount prefix from absolute targets
-@@ -1856,17 +2336,17 @@ pub(crate) async fn handle_chroot_xattr(
+@@ -1856,17 +2342,17 @@ pub(crate) async fn handle_chroot_xattr(
          } else {
              resolve_chroot_path_nofollow(notif, libc::AT_FDCWD as i64, &path, ctx)
          } {
@@ -1466,7 +1590,7 @@ index 6e4ab93..c917c71 100644
          Ok(p) => p,
          Err(a) => return a,
      };
-@@ -1940,18 +2420,101 @@ pub(crate) async fn handle_chroot_xattr(
+@@ -1940,18 +2426,120 @@ pub(crate) async fn handle_chroot_xattr(
  // ============================================================
 
  pub(crate) async fn handle_chroot_getdents(
@@ -1488,7 +1612,7 @@ index 6e4ab93..c917c71 100644
 -    // time, not at directory listing time.
 -    NotifAction::Continue
 +    use std::os::unix::fs::MetadataExt;
-+    if ctx.directory_images.is_empty() && !ctx.private_writes { return NotifAction::Continue; }
++    if ctx.directory_images.is_empty() && ctx.metadata_image.is_empty() && !ctx.private_writes { return NotifAction::Continue; }
 +    // getdents and seek share the OFD cursor, including dup and fork aliases.
 +    let _cursor_guard = chroot_state.lock().await;
 +    let pin = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, notif.data.args[0] as i32) {
@@ -1500,26 +1624,41 @@ index 6e4ab93..c917c71 100644
 +        let named = std::fs::metadata(directory).ok()?;
 +        (named.dev() == state.st_dev && named.ino() == state.st_ino).then_some(bytes)
 +    });
-+    // A directory the private branch holds entries in lists them over the host's.
 +    let merged = if image.is_some() || !ctx.private_writes { None } else { merged_listing(cow_state, pin.as_raw_fd(), &state).await };
-+    let Some(image) = image.map(Vec::as_slice).or(merged.as_deref()) else { return NotifAction::Continue; };
++    let image = image.map(Vec::as_slice).or(merged.as_deref());
++    let native = image.is_none();
++    if native && (ctx.metadata_image.is_empty() || notif.data.nr as i64 == libc::SYS_lseek) { return NotifAction::Continue; }
 +    if unsafe { libc::fcntl(pin.as_raw_fd(), libc::F_GETFL) } & libc::O_PATH != 0 { return NotifAction::Errno(libc::EBADF); }
 +    if notif.data.nr as i64 == libc::SYS_lseek {
 +        let position = unsafe { libc::lseek(pin.as_raw_fd(), notif.data.args[1] as i64, notif.data.args[2] as i32) };
 +        return if position < 0 { NotifAction::Errno(last_errno(libc::EINVAL)) } else { NotifAction::ReturnValue(position) };
 +    }
-+    let cursor = unsafe { libc::lseek(pin.as_raw_fd(), 0, libc::SEEK_CUR) };
-+    if cursor < 0 { return NotifAction::Errno(last_errno(libc::EIO)); }
 +    let capacity = notif.data.args[2] as u32 as usize;
-+    if capacity > i32::MAX as usize || image.len() > 2 * 1024 * 1024 { return NotifAction::Errno(libc::EINVAL); }
++    if capacity > i32::MAX as usize { return NotifAction::Errno(libc::EINVAL); }
++    let cursor = unsafe { libc::lseek(pin.as_raw_fd(), 0, libc::SEEK_CUR) };
++    let restore = || { if native && cursor >= 0 { unsafe { libc::lseek(pin.as_raw_fd(), cursor, libc::SEEK_SET); } } };
++    // All sources use getdents64 records. Only a native read advances the OFD now;
++    // an image advances it after delivery, while a failed native delivery restores it.
++    let mut observed = Vec::new();
++    let image = if let Some(image) = image {
++        if cursor < 0 { return NotifAction::Errno(last_errno(libc::EIO)); }
++        image
++    } else {
++        observed.resize(capacity.min(2 * 1024 * 1024), 0);
++        let used = unsafe { libc::syscall(libc::SYS_getdents64, pin.as_raw_fd(), observed.as_mut_ptr(), observed.len()) };
++        if used < 0 { return NotifAction::Errno(last_errno(libc::EIO)); }
++        observed.truncate(used as usize);
++        &observed
++    };
++    if image.len() > 2 * 1024 * 1024 { return NotifAction::Errno(libc::EINVAL); }
 +    let mut entries = Vec::new();
 +    let (mut offset, mut previous, mut used, mut next) = (0usize, 0i64, 0usize, cursor);
-+    let mut reached = cursor == 0;
++    let mut reached = native || cursor == 0;
 +    while offset < image.len() {
 +        if image.len() - offset < 20 { return NotifAction::Errno(libc::EIO); }
 +        let size = u16::from_le_bytes(image[offset+16..offset+18].try_into().unwrap()) as usize;
 +        let cookie = i64::from_le_bytes(image[offset+8..offset+16].try_into().unwrap());
-+        if size < 24 || size % 8 != 0 || size > image.len() - offset || cookie <= previous { return NotifAction::Errno(libc::EIO); }
++        if size < 24 || size % 8 != 0 || size > image.len() - offset || (!native && cookie <= previous) { return NotifAction::Errno(libc::EIO); }
 +        let Some(name) = image[offset+19..offset+size].iter().position(|&byte| byte == 0) else { return NotifAction::Errno(libc::EIO); };
 +        reached |= cursor == previous;
 +        if reached {
@@ -1530,22 +1669,26 @@ index 6e4ab93..c917c71 100644
 +    }
 +    if !reached && cursor != previous { return NotifAction::Errno(libc::EINVAL); }
 +    if used == 0 { return if offset == image.len() { NotifAction::ReturnValue(0) } else { NotifAction::Errno(libc::EINVAL) }; }
-+    // Preserve untouched user padding, just as the kernel does. No buffer read or
-+    // write may silently turn a fault into a successful enumeration.
++    // Preserve padding and touch only returned records, including a buffer that
++    // ends at a protected page before the caller's requested capacity.
 +    let mut output = match read_child_mem(notif_fd, notif.id, notif.pid, notif.data.args[1], used) {
-+        Ok(bytes) => bytes, Err(_) => return NotifAction::Errno(libc::EFAULT),
++        Ok(bytes) => bytes, Err(_) => { restore(); return NotifAction::Errno(libc::EFAULT); }
 +    };
 +    let legacy = Some(notif.data.nr as i64) == crate::arch::sys_getdents();
 +    let mut destination = 0;
 +    for (source, size, name) in entries {
 +        output[destination..destination+18].copy_from_slice(&image[source..source+18]);
++        if native {
++            let inode = u64::from_le_bytes(image[source..source+8].try_into().unwrap());
++            output[destination..destination+8].copy_from_slice(&ctx.metadata_image.inode(state.st_dev, inode).to_ne_bytes());
++        }
 +        let name_start = if legacy { 18 } else { 19 };
 +        output[destination+name_start..destination+name_start+name+1].copy_from_slice(&image[source+19..source+20+name]);
 +        output[destination+if legacy { size-1 } else { 18 }] = image[source+18];
 +        destination += size;
 +    }
-+    if write_child_mem(notif_fd, notif.id, notif.pid, notif.data.args[1], &output).is_err() { return NotifAction::Errno(libc::EFAULT); }
-+    if unsafe { libc::lseek(pin.as_raw_fd(), next, libc::SEEK_SET) } != next { return NotifAction::Errno(libc::EIO); }
++    if write_child_mem(notif_fd, notif.id, notif.pid, notif.data.args[1], &output).is_err() { restore(); return NotifAction::Errno(libc::EFAULT); }
++    if !native && unsafe { libc::lseek(pin.as_raw_fd(), next, libc::SEEK_SET) } != next { return NotifAction::Errno(libc::EIO); }
 +    NotifAction::ReturnValue(used as i64)
 +}
 +
@@ -1579,7 +1722,7 @@ index 6e4ab93..c917c71 100644
  }
 
  // ============================================================
-@@ -2043,6 +2606,20 @@ pub(crate) async fn handle_chroot_fchdir(
+@@ -2043,6 +2631,20 @@ pub(crate) async fn handle_chroot_fchdir(
      NotifAction::Continue
  }
 
@@ -1600,7 +1743,7 @@ index 6e4ab93..c917c71 100644
  // ============================================================
  // getcwd handler
  // ============================================================
-@@ -2092,12 +2669,38 @@ pub(crate) async fn handle_chroot_statfs(
+@@ -2092,12 +2694,38 @@ pub(crate) async fn handle_chroot_statfs(
          None => return NotifAction::Continue,
      };
 
@@ -1621,8 +1764,7 @@ index 6e4ab93..c917c71 100644
 +    }
 +    virtual_path.ancestors().find(|ancestor| ancestor.exists()).unwrap_or(host_path).to_path_buf()
 +}
-
--    let c_path = match path_cstr(&host_path, libc::ENOENT) {
++
 +/// fstatfs of a descriptor on a mounted path, answered for its virtual path; any other descriptor is the kernel's to answer.
 +pub(crate) async fn handle_chroot_fstatfs(
 +    notif: &SeccompNotif,
@@ -1637,13 +1779,14 @@ index 6e4ab93..c917c71 100644
 +        None => NotifAction::Continue,
 +    }
 +}
-+
+
+-    let c_path = match path_cstr(&host_path, libc::ENOENT) {
 +fn write_statfs(notif: &SeccompNotif, notif_fd: RawFd, statfsbuf_addr: u64, target: &Path) -> NotifAction {
 +    let c_path = match path_cstr(target, libc::ENOENT) {
          Ok(c) => c,
          Err(a) => return a,
      };
-@@ -2149,12 +2752,12 @@ pub(crate) async fn handle_chroot_utimensat(
+@@ -2149,12 +2777,12 @@ pub(crate) async fn handle_chroot_utimensat(
          resolve_chroot_path(notif, dirfd, &path, ctx)
      };
      let (host_path, vp) = match resolved {
@@ -1660,20 +1803,298 @@ index 6e4ab93..c917c71 100644
          Ok(p) => p,
          Err(a) => return a,
      };
-@@ -2263,8 +2866,8 @@ pub(crate) async fn handle_chroot_legacy_access(
-     let mut synth = notif_with_args(notif, [
-         libc::AT_FDCWD as u64,
-         notif.data.args[0], // path
+@@ -2201,243 +2829,51 @@ fn notif_with_args(notif: &SeccompNotif, args: [u64; 6]) -> SeccompNotif {
+     copy
+ }
+
+-/// SYS_open(path, flags, mode) → handle_chroot_open via openat(AT_FDCWD, path, flags, mode)
+-pub(crate) async fn handle_chroot_legacy_open(
+-    notif: &SeccompNotif,
+-    chroot_state: &Arc<Mutex<ChrootState>>,
+-    cow_state: &Arc<Mutex<CowState>>,
+-    notif_fd: RawFd,
+-    ctx: &ChrootCtx<'_>,
+-) -> NotifAction {
+-    // open(path, flags, mode) needs no reshaping: decode_open_args reads the
+-    // legacy layout from the syscall number and supplies the implied AT_FDCWD.
+-    handle_chroot_open(notif, chroot_state, cow_state, notif_fd, ctx).await
++// Legacy ABIs differ only in their argument layout. Keep the layout next to
++// its canonical syscall and delegate all resolution, policy and side effects.
++macro_rules! legacy_chroot_handler {
++    ($name:ident, $handler:ident, $nr:expr, |$args:ident $(, $extra:ident: $ty:ty)*| $layout:expr) => {
++        pub(crate) async fn $name(
++            notif: &SeccompNotif,
++            chroot_state: &Arc<Mutex<ChrootState>>,
++            cow_state: &Arc<Mutex<CowState>>,
++            notif_fd: RawFd,
++            ctx: &ChrootCtx<'_>,
++            $($extra: $ty,)*
++        ) -> NotifAction {
++            let $args = notif.data.args;
++            let mut synth = notif_with_args(notif, $layout);
++            synth.data.nr = $nr as i32;
++            $handler(&synth, chroot_state, cow_state, notif_fd, ctx).await
++        }
++    };
+ }
+
+-/// SYS_stat(path, statbuf) → handle_chroot_stat via newfstatat(AT_FDCWD, path, statbuf, 0)
+-pub(crate) async fn handle_chroot_legacy_stat(
+-    notif: &SeccompNotif,
+-    chroot_state: &Arc<Mutex<ChrootState>>,
+-    cow_state: &Arc<Mutex<CowState>>,
+-    notif_fd: RawFd,
+-    ctx: &ChrootCtx<'_>,
+-) -> NotifAction {
+-    let synth = notif_with_args(notif, [
+-        libc::AT_FDCWD as u64,
+-        notif.data.args[0], // path
+-        notif.data.args[1], // statbuf
+-        0,                  // flags = 0 (follow symlinks)
+-        0, 0,
+-    ]);
+-    handle_chroot_stat(&synth, chroot_state, cow_state, notif_fd, ctx).await
+-}
+-
+-/// SYS_lstat(path, statbuf) → handle_chroot_stat via newfstatat(AT_FDCWD, path, statbuf, AT_SYMLINK_NOFOLLOW)
+-pub(crate) async fn handle_chroot_legacy_lstat(
+-    notif: &SeccompNotif,
+-    chroot_state: &Arc<Mutex<ChrootState>>,
+-    cow_state: &Arc<Mutex<CowState>>,
+-    notif_fd: RawFd,
+-    ctx: &ChrootCtx<'_>,
+-) -> NotifAction {
+-    let synth = notif_with_args(notif, [
+-        libc::AT_FDCWD as u64,
+-        notif.data.args[0], // path
+-        notif.data.args[1], // statbuf
+-        libc::AT_SYMLINK_NOFOLLOW as u64,
+-        0, 0,
+-    ]);
+-    handle_chroot_stat(&synth, chroot_state, cow_state, notif_fd, ctx).await
+-}
+-
+-/// SYS_access(path, mode) → handle_chroot_stat via faccessat(AT_FDCWD, path, mode, 0)
+-pub(crate) async fn handle_chroot_legacy_access(
+-    notif: &SeccompNotif,
+-    chroot_state: &Arc<Mutex<ChrootState>>,
+-    cow_state: &Arc<Mutex<CowState>>,
+-    notif_fd: RawFd,
+-    ctx: &ChrootCtx<'_>,
+-) -> NotifAction {
+-    // Synthesize as faccessat — reuse SYS_faccessat nr so the handler
+-    // recognises it as an access check.
+-    let mut synth = notif_with_args(notif, [
+-        libc::AT_FDCWD as u64,
+-        notif.data.args[0], // path
 -        0,                  // statbuf (unused for faccessat path)
 -        0,                  // flags
-+        notif.data.args[1], // mode
-+        0,
-         0, 0,
-     ]);
-     synth.data.nr = libc::SYS_faccessat as i32;
-@@ -2476,12 +3079,17 @@ mod mount_ro_tests {
+-        0, 0,
+-    ]);
+-    synth.data.nr = libc::SYS_faccessat as i32;
+-    handle_chroot_stat(&synth, chroot_state, cow_state, notif_fd, ctx).await
+-}
+-
+-/// SYS_readlink(path, buf, bufsiz) → handle_chroot_readlink via readlinkat(AT_FDCWD, path, buf, bufsiz)
+-pub(crate) async fn handle_chroot_legacy_readlink(
+-    notif: &SeccompNotif,
+-    chroot_state: &Arc<Mutex<ChrootState>>,
+-    cow_state: &Arc<Mutex<CowState>>,
+-    notif_fd: RawFd,
+-    ctx: &ChrootCtx<'_>,
+-) -> NotifAction {
+-    let synth = notif_with_args(notif, [
+-        libc::AT_FDCWD as u64,
+-        notif.data.args[0], // path
+-        notif.data.args[1], // buf
+-        notif.data.args[2], // bufsiz
+-        0, 0,
+-    ]);
+-    handle_chroot_readlink(&synth, chroot_state, cow_state, notif_fd, ctx).await
+-}
+-
+-/// SYS_unlink(path) → handle_chroot_write via unlinkat(AT_FDCWD, path, 0)
+-pub(crate) async fn handle_chroot_legacy_unlink(
+-    notif: &SeccompNotif,
+-    chroot_state: &Arc<Mutex<ChrootState>>,
+-    cow_state: &Arc<Mutex<CowState>>,
+-    notif_fd: RawFd,
+-    ctx: &ChrootCtx<'_>,
+-) -> NotifAction {
+-    let mut synth = notif_with_args(notif, [
+-        libc::AT_FDCWD as u64,
+-        notif.data.args[0], // path
+-        0,                  // flags
+-        0, 0, 0,
+-    ]);
+-    synth.data.nr = libc::SYS_unlinkat as i32;
+-    handle_chroot_write(&synth, chroot_state, cow_state, notif_fd, ctx).await
+-}
+-
+-/// SYS_rmdir(path) → handle_chroot_write via unlinkat(AT_FDCWD, path, AT_REMOVEDIR)
+-pub(crate) async fn handle_chroot_legacy_rmdir(
+-    notif: &SeccompNotif,
+-    chroot_state: &Arc<Mutex<ChrootState>>,
+-    cow_state: &Arc<Mutex<CowState>>,
+-    notif_fd: RawFd,
+-    ctx: &ChrootCtx<'_>,
+-) -> NotifAction {
+-    let mut synth = notif_with_args(notif, [
+-        libc::AT_FDCWD as u64,
+-        notif.data.args[0], // path
+-        libc::AT_REMOVEDIR as u64,
+-        0, 0, 0,
+-    ]);
+-    synth.data.nr = libc::SYS_unlinkat as i32;
+-    handle_chroot_write(&synth, chroot_state, cow_state, notif_fd, ctx).await
+-}
+-
+-/// SYS_mkdir(path, mode) → handle_chroot_write via mkdirat(AT_FDCWD, path, mode)
+-pub(crate) async fn handle_chroot_legacy_mkdir(
+-    notif: &SeccompNotif,
+-    chroot_state: &Arc<Mutex<ChrootState>>,
+-    cow_state: &Arc<Mutex<CowState>>,
+-    notif_fd: RawFd,
+-    ctx: &ChrootCtx<'_>,
+-) -> NotifAction {
+-    let mut synth = notif_with_args(notif, [
+-        libc::AT_FDCWD as u64,
+-        notif.data.args[0], // path
+-        notif.data.args[1], // mode
+-        0, 0, 0,
+-    ]);
+-    synth.data.nr = libc::SYS_mkdirat as i32;
+-    handle_chroot_write(&synth, chroot_state, cow_state, notif_fd, ctx).await
+-}
+-
+-/// SYS_rename(oldpath, newpath) → handle_chroot_write via renameat2(AT_FDCWD, old, AT_FDCWD, new, 0)
+-pub(crate) async fn handle_chroot_legacy_rename(
+-    notif: &SeccompNotif,
+-    chroot_state: &Arc<Mutex<ChrootState>>,
+-    cow_state: &Arc<Mutex<CowState>>,
+-    notif_fd: RawFd,
+-    ctx: &ChrootCtx<'_>,
+-) -> NotifAction {
+-    let mut synth = notif_with_args(notif, [
+-        libc::AT_FDCWD as u64,
+-        notif.data.args[0], // oldpath
+-        libc::AT_FDCWD as u64,
+-        notif.data.args[1], // newpath
+-        0, 0,
+-    ]);
+-    synth.data.nr = libc::SYS_renameat2 as i32;
+-    handle_chroot_write(&synth, chroot_state, cow_state, notif_fd, ctx).await
+-}
+-
+-/// SYS_symlink(target, linkpath) → handle_chroot_write via symlinkat(target, AT_FDCWD, linkpath)
+-pub(crate) async fn handle_chroot_legacy_symlink(
+-    notif: &SeccompNotif,
+-    chroot_state: &Arc<Mutex<ChrootState>>,
+-    cow_state: &Arc<Mutex<CowState>>,
+-    notif_fd: RawFd,
+-    ctx: &ChrootCtx<'_>,
+-) -> NotifAction {
+-    let mut synth = notif_with_args(notif, [
+-        notif.data.args[0], // target
+-        libc::AT_FDCWD as u64,
+-        notif.data.args[1], // linkpath
+-        0, 0, 0,
+-    ]);
+-    synth.data.nr = libc::SYS_symlinkat as i32;
+-    handle_chroot_write(&synth, chroot_state, cow_state, notif_fd, ctx).await
+-}
+-
+-/// SYS_link(oldpath, newpath) → handle_chroot_write via linkat(AT_FDCWD, old, AT_FDCWD, new, 0)
+-pub(crate) async fn handle_chroot_legacy_link(
+-    notif: &SeccompNotif,
+-    chroot_state: &Arc<Mutex<ChrootState>>,
+-    cow_state: &Arc<Mutex<CowState>>,
+-    notif_fd: RawFd,
+-    ctx: &ChrootCtx<'_>,
+-) -> NotifAction {
+-    let mut synth = notif_with_args(notif, [
+-        libc::AT_FDCWD as u64,
+-        notif.data.args[0], // oldpath
+-        libc::AT_FDCWD as u64,
+-        notif.data.args[1], // newpath
+-        0, 0,
+-    ]);
+-    synth.data.nr = libc::SYS_linkat as i32;
+-    handle_chroot_write(&synth, chroot_state, cow_state, notif_fd, ctx).await
+-}
+-
+-/// SYS_chmod(path, mode) → handle_chroot_write via fchmodat(AT_FDCWD, path, mode)
+-pub(crate) async fn handle_chroot_legacy_chmod(
+-    notif: &SeccompNotif,
+-    chroot_state: &Arc<Mutex<ChrootState>>,
+-    cow_state: &Arc<Mutex<CowState>>,
+-    notif_fd: RawFd,
+-    ctx: &ChrootCtx<'_>,
+-) -> NotifAction {
+-    let mut synth = notif_with_args(notif, [
+-        libc::AT_FDCWD as u64,
+-        notif.data.args[0], // path
+-        notif.data.args[1], // mode
+-        0, 0, 0,
+-    ]);
+-    synth.data.nr = libc::SYS_fchmodat as i32;
+-    handle_chroot_write(&synth, chroot_state, cow_state, notif_fd, ctx).await
+-}
+-
+-/// SYS_chown/lchown(path, uid, gid) → handle_chroot_write via fchownat(AT_FDCWD, path, uid, gid, flags)
+-pub(crate) async fn handle_chroot_legacy_chown(
+-    notif: &SeccompNotif,
+-    chroot_state: &Arc<Mutex<ChrootState>>,
+-    cow_state: &Arc<Mutex<CowState>>,
+-    notif_fd: RawFd,
+-    ctx: &ChrootCtx<'_>,
+-    nofollow: bool,
+-) -> NotifAction {
+-    let flags = if nofollow { libc::AT_SYMLINK_NOFOLLOW as u64 } else { 0 };
+-    let mut synth = notif_with_args(notif, [
+-        libc::AT_FDCWD as u64,
+-        notif.data.args[0], // path
+-        notif.data.args[1], // uid
+-        notif.data.args[2], // gid
+-        flags,
+-        0,
+-    ]);
+-    synth.data.nr = libc::SYS_fchownat as i32;
+-    handle_chroot_write(&synth, chroot_state, cow_state, notif_fd, ctx).await
+-}
++const LEGACY_CWD: u64 = libc::AT_FDCWD as u64;
++legacy_chroot_handler!(handle_chroot_legacy_stat, handle_chroot_stat, libc::SYS_newfstatat,
++    |a| [LEGACY_CWD, a[0], a[1], 0, 0, 0]);
++legacy_chroot_handler!(handle_chroot_legacy_lstat, handle_chroot_stat, libc::SYS_newfstatat,
++    |a| [LEGACY_CWD, a[0], a[1], libc::AT_SYMLINK_NOFOLLOW as u64, 0, 0]);
++legacy_chroot_handler!(handle_chroot_legacy_access, handle_chroot_stat, libc::SYS_faccessat,
++    |a| [LEGACY_CWD, a[0], a[1], 0, 0, 0]);
++legacy_chroot_handler!(handle_chroot_legacy_readlink, handle_chroot_readlink, libc::SYS_readlinkat,
++    |a| [LEGACY_CWD, a[0], a[1], a[2], 0, 0]);
++legacy_chroot_handler!(handle_chroot_legacy_unlink, handle_chroot_write, libc::SYS_unlinkat,
++    |a| [LEGACY_CWD, a[0], 0, 0, 0, 0]);
++legacy_chroot_handler!(handle_chroot_legacy_rmdir, handle_chroot_write, libc::SYS_unlinkat,
++    |a| [LEGACY_CWD, a[0], libc::AT_REMOVEDIR as u64, 0, 0, 0]);
++legacy_chroot_handler!(handle_chroot_legacy_mkdir, handle_chroot_write, libc::SYS_mkdirat,
++    |a| [LEGACY_CWD, a[0], a[1], 0, 0, 0]);
++legacy_chroot_handler!(handle_chroot_legacy_rename, handle_chroot_write, libc::SYS_renameat2,
++    |a| [LEGACY_CWD, a[0], LEGACY_CWD, a[1], 0, 0]);
++legacy_chroot_handler!(handle_chroot_legacy_symlink, handle_chroot_write, libc::SYS_symlinkat,
++    |a| [a[0], LEGACY_CWD, a[1], 0, 0, 0]);
++legacy_chroot_handler!(handle_chroot_legacy_link, handle_chroot_write, libc::SYS_linkat,
++    |a| [LEGACY_CWD, a[0], LEGACY_CWD, a[1], 0, 0]);
++legacy_chroot_handler!(handle_chroot_legacy_chmod, handle_chroot_write, libc::SYS_fchmodat,
++    |a| [LEGACY_CWD, a[0], a[1], 0, 0, 0]);
++legacy_chroot_handler!(handle_chroot_legacy_chown, handle_chroot_write, libc::SYS_fchownat,
++    |a, nofollow: bool| [LEGACY_CWD, a[0], a[1], a[2], if nofollow { libc::AT_SYMLINK_NOFOLLOW as u64 } else { 0 }, 0]);
+
+ #[cfg(test)]
+ mod self_rewrite_tests {
+@@ -2475,13 +2911,20 @@ mod mount_ro_tests {
+         writable: &'a [PathBuf],
          processes: &'a Arc<ProcessIndex>,
      ) -> ChrootCtx<'a> {
++        static METADATA: std::sync::LazyLock<super::MetadataImage> = std::sync::LazyLock::new(super::MetadataImage::default);
          ChrootCtx {
 +            private_writes: false,
 +            private_upper: None,
@@ -1686,6 +2107,7 @@ index 6e4ab93..c917c71 100644
 +            exec_mounts: &[],
 +            exec_aliases: &[],
 +            directory_images: &[],
++            metadata_image: &METADATA,
              processes,
          }
      }
@@ -2548,10 +2970,10 @@ index 634755e..38fd708 100644
              policy_fn: sandbox.policy_fn.is_some(),
              port_remap: sandbox.port_remap,
 diff --git a/crates/sandlock-core/src/resource.rs b/crates/sandlock-core/src/resource.rs
-index 398d45a..4a4abb9 100644
+index 398d45a..17c5b7f 100644
 --- a/crates/sandlock-core/src/resource.rs
 +++ b/crates/sandlock-core/src/resource.rs
-@@ -955,12 +955,16 @@ mod tests {
+@@ -955,12 +955,17 @@ mod tests {
              num_cpus: None,
              port_remap: false,
              cow_enabled: false,
@@ -2565,11 +2987,12 @@ index 398d45a..4a4abb9 100644
 +            chroot_exec_mounts: Vec::new(),
 +            chroot_exec_aliases: Vec::new(),
 +                chroot_directory_images: Vec::new(),
++                chroot_metadata_image: Default::default(),
              deterministic_dirs: false,
              virtual_hostname: None,
              has_http_acl: false,
 diff --git a/crates/sandlock-core/src/sandbox.rs b/crates/sandlock-core/src/sandbox.rs
-index 8d06d60..f0f5bd4 100644
+index 8d06d60..1928cab 100644
 --- a/crates/sandlock-core/src/sandbox.rs
 +++ b/crates/sandlock-core/src/sandbox.rs
 @@ -179,6 +179,8 @@ impl TryFrom<&Sandbox> for Confinement {
@@ -2589,7 +3012,7 @@ index 8d06d60..f0f5bd4 100644
      pub max_disk: Option<ByteSize>,
      pub on_exit: BranchAction,
      pub on_error: BranchAction,
-@@ -498,6 +501,11 @@ pub struct Sandbox {
+@@ -498,6 +501,13 @@ pub struct Sandbox {
      // Virtual paths (a subset of fs_mount destinations) mounted read-only:
      // reads allowed, writes denied even on a writable rootfs.
      pub fs_mount_ro: Vec<PathBuf>,
@@ -2598,10 +3021,12 @@ index 8d06d60..f0f5bd4 100644
 +    /// Exec aliases: (virtual directory, directory its executables really live and are named under).
 +    pub exec_alias: Vec<(PathBuf, PathBuf)>,
 +    pub directory_images: Vec<(PathBuf, Vec<u8>)>,
++    #[serde(default, serialize_with = "crate::chroot::dispatch::MetadataImage::serialize", deserialize_with = "crate::chroot::dispatch::MetadataImage::deserialize")]
++    pub metadata_image: std::sync::Arc<crate::chroot::dispatch::MetadataImage>,
 
      // Environment
      pub chroot: Option<PathBuf>,
-@@ -639,11 +647,15 @@ impl Clone for Sandbox {
+@@ -639,11 +649,16 @@ impl Clone for Sandbox {
              workdir: self.workdir.clone(),
              cwd: self.cwd.clone(),
              fs_storage: self.fs_storage.clone(),
@@ -2614,10 +3039,11 @@ index 8d06d60..f0f5bd4 100644
 +            exec_mount: self.exec_mount.clone(),
 +            exec_alias: self.exec_alias.clone(),
 +            directory_images: self.directory_images.clone(),
++            metadata_image: self.metadata_image.clone(),
              chroot: self.chroot.clone(),
              in_child_main: self.in_child_main,
              clean_env: self.clean_env,
-@@ -1200,6 +1212,13 @@ impl Sandbox {
+@@ -1200,6 +1215,13 @@ impl Sandbox {
          self.do_create(cmd, false).await
      }
 
@@ -2631,7 +3057,17 @@ index 8d06d60..f0f5bd4 100644
      /// Like `create_with_io` but also maps extra fds into the child.
      #[doc(hidden)]
      pub async fn create_with_gather_io(
-@@ -1817,8 +1836,14 @@ impl Sandbox {
+@@ -1283,6 +1305,9 @@ impl Sandbox {
+         if target_pid <= 0 {
+             return Err(SandlockError::Runtime(SandboxRuntimeError::NotRunning));
+         }
++        if !self.metadata_image.is_empty() {
++            return Err(crate::error::SandboxError::Invalid("snapshot metadata pins cannot be persisted in a process checkpoint".into()).into());
++        }
+         self.freeze().await?;
+         let cp = crate::checkpoint::capture(target_pid, self);
+         self.thaw().await?;
+@@ -1817,8 +1842,14 @@ impl Sandbox {
              let workdir = self.workdir.as_ref().unwrap().clone();
              let storage = self.fs_storage.clone();
              let max_disk = self.max_disk.map(|b| b.0).unwrap_or(0);
@@ -2647,7 +3083,7 @@ index 8d06d60..f0f5bd4 100644
                      // `Keep` must survive a sandbox that is never `wait()`ed:
                      // the branch only reaches `Sandbox`'s own disposition after
                      // a completed `wait()`, and the branch's `Drop` would
-@@ -1846,10 +1871,10 @@ impl Sandbox {
+@@ -1846,10 +1877,10 @@ impl Sandbox {
          };
 
          let handler_syscalls: Vec<i64> = self.rt().handlers.iter().map(|(nr, _)| *nr).collect();
@@ -2660,7 +3096,7 @@ index 8d06d60..f0f5bd4 100644
              &handler_syscalls,
          );
 
-@@ -1884,6 +1909,9 @@ impl Sandbox {
+@@ -1884,6 +1915,9 @@ impl Sandbox {
          let foreground = stdio.all_inherit();
          let tty_foreground_taken = foreground && unsafe { libc::isatty(0) } == 1;
 
@@ -2670,7 +3106,7 @@ index 8d06d60..f0f5bd4 100644
          let pid = unsafe { libc::fork() };
          if pid < 0 {
              return Err(SandboxRuntimeError::Fork(std::io::Error::last_os_error()).into());
-@@ -1946,7 +1974,6 @@ impl Sandbox {
+@@ -1946,7 +1980,6 @@ impl Sandbox {
                  .map(|h| h.0 as u32)
                  .collect();
 
@@ -2678,7 +3114,7 @@ index 8d06d60..f0f5bd4 100644
              // In-process entrypoint (OCI PID-1) names the process from cmd[0];
              // otherwise execve the command.
              let entry = match self.in_child_main {
-@@ -1959,7 +1986,7 @@ impl Sandbox {
+@@ -1959,7 +1992,7 @@ impl Sandbox {
                  pipes: &pipes,
                  no_supervisor,
                  keep_fds: &gather_keep_fds,
@@ -2687,7 +3123,7 @@ index 8d06d60..f0f5bd4 100644
                  extra_syscalls: &extra_syscalls,
                  parent_pid,
                  foreground,
-@@ -2115,7 +2142,6 @@ impl Sandbox {
+@@ -2115,7 +2148,6 @@ impl Sandbox {
                  .map(|t| crate::time::calculate_time_offset(t))
                  .unwrap_or(0);
 
@@ -2695,7 +3131,7 @@ index 8d06d60..f0f5bd4 100644
              let notif_policy = NotifPolicy {
                  max_memory_bytes: self.max_memory.map(|m| m.0).unwrap_or(0),
                  max_processes: self.max_processes,
-@@ -2130,14 +2156,18 @@ impl Sandbox {
+@@ -2130,14 +2162,19 @@ impl Sandbox {
                  num_cpus: self.num_cpus,
                  port_remap: resolved.features.port_remap,
                  cow_enabled: resolved.features.cow,
@@ -2709,6 +3145,7 @@ index 8d06d60..f0f5bd4 100644
 +                chroot_exec_mounts: crate::chroot::resolve::resolve_chroot_mounts(&self.exec_mount),
 +                chroot_exec_aliases: self.exec_alias.clone(),
 +                chroot_directory_images: self.directory_images.clone(),
++                chroot_metadata_image: self.metadata_image.clone(),
                  deterministic_dirs: self.deterministic_dirs,
 -                virtual_hostname: Some(rt_name),
 +                virtual_hostname: self.name.clone(),
@@ -2716,7 +3153,7 @@ index 8d06d60..f0f5bd4 100644
                  virtual_etc_hosts,
                  ca_inject_paths: self.http_inject_ca.clone(),
 diff --git a/crates/sandlock-core/src/sandbox/builder.rs b/crates/sandlock-core/src/sandbox/builder.rs
-index 6eaa211..db70c1e 100644
+index 6eaa211..7cf6e68 100644
 --- a/crates/sandlock-core/src/sandbox/builder.rs
 +++ b/crates/sandlock-core/src/sandbox/builder.rs
 @@ -150,6 +150,10 @@ pub struct SandboxBuilder {
@@ -2730,7 +3167,7 @@ index 6eaa211..db70c1e 100644
      // max_disk uses a string in the CLI (e.g. "10G"); not directly clap-friendly as ByteSize.
      #[cfg_attr(feature = "cli", clap(skip))]
      pub max_disk: Option<ByteSize>,
-@@ -169,6 +173,15 @@ pub struct SandboxBuilder {
+@@ -169,6 +173,17 @@ pub struct SandboxBuilder {
      #[cfg_attr(feature = "cli", clap(skip))]
      pub fs_mount_ro: Vec<PathBuf>,
 
@@ -2742,11 +3179,13 @@ index 6eaa211..db70c1e 100644
 +    pub exec_alias: Vec<(PathBuf, PathBuf)>,
 +    #[cfg_attr(feature = "cli", arg(skip))]
 +    pub directory_images: Vec<(PathBuf, Vec<u8>)>,
++    #[cfg_attr(feature = "cli", arg(skip))]
++    pub metadata_image: std::sync::Arc<crate::chroot::dispatch::MetadataImage>,
 +
      #[cfg_attr(feature = "cli", arg(long = "chroot"))]
      pub chroot: Option<PathBuf>,
 
-@@ -288,11 +301,15 @@ impl Default for SandboxBuilder {
+@@ -288,11 +303,16 @@ impl Default for SandboxBuilder {
              workdir: None,
              cwd: None,
              fs_storage: None,
@@ -2759,10 +3198,11 @@ index 6eaa211..db70c1e 100644
 +            exec_mount: Vec::new(),
 +            exec_alias: Vec::new(),
 +            directory_images: Vec::new(),
++            metadata_image: Default::default(),
              chroot: None,
              clean_env: false,
              env: std::collections::HashMap::new(),
-@@ -352,11 +369,15 @@ impl Clone for SandboxBuilder {
+@@ -352,11 +372,16 @@ impl Clone for SandboxBuilder {
              workdir: self.workdir.clone(),
              cwd: self.cwd.clone(),
              fs_storage: self.fs_storage.clone(),
@@ -2775,10 +3215,11 @@ index 6eaa211..db70c1e 100644
 +            exec_mount: self.exec_mount.clone(),
 +            exec_alias: self.exec_alias.clone(),
 +            directory_images: self.directory_images.clone(),
++            metadata_image: self.metadata_image.clone(),
              chroot: self.chroot.clone(),
              clean_env: self.clean_env,
              env: self.env.clone(),
-@@ -662,6 +683,11 @@ impl SandboxBuilder {
+@@ -662,6 +687,11 @@ impl SandboxBuilder {
          self
      }
 
@@ -2790,7 +3231,7 @@ index 6eaa211..db70c1e 100644
      pub fn max_disk(mut self, size: ByteSize) -> Self {
          self.max_disk = Some(size);
          self
-@@ -696,6 +722,24 @@ impl SandboxBuilder {
+@@ -696,6 +726,29 @@ impl SandboxBuilder {
          self
      }
 
@@ -2807,6 +3248,11 @@ index 6eaa211..db70c1e 100644
 +    }
 +
 +    /// Attach exact kernel entries to one private directory; never exposes a host FD.
++    pub fn metadata_image(mut self, bytes: &[u8]) -> std::io::Result<Self> {
++        self.metadata_image = std::sync::Arc::new(crate::chroot::dispatch::MetadataImage::decode(bytes)?);
++        Ok(self)
++    }
++
 +    pub fn directory_image(mut self, directory: impl Into<PathBuf>, bytes: Vec<u8>) -> Self {
 +        self.directory_images.push((directory.into(), bytes));
 +        self
@@ -2815,7 +3261,7 @@ index 6eaa211..db70c1e 100644
      pub fn clean_env(mut self, v: bool) -> Self {
          self.clean_env = v;
          self
-@@ -1042,11 +1086,15 @@ impl SandboxBuilder {
+@@ -1042,11 +1095,16 @@ impl SandboxBuilder {
              workdir: self.workdir,
              cwd: self.cwd,
              fs_storage: self.fs_storage,
@@ -2828,11 +3274,12 @@ index 6eaa211..db70c1e 100644
 +            exec_mount: self.exec_mount,
 +            exec_alias: self.exec_alias,
 +            directory_images: self.directory_images,
++            metadata_image: self.metadata_image,
              chroot: self.chroot,
              in_child_main: None,
              clean_env: self.clean_env,
 diff --git a/crates/sandlock-core/src/seccomp/dispatch.rs b/crates/sandlock-core/src/seccomp/dispatch.rs
-index 3673d84..b7ad08b 100644
+index 3673d84..c509061 100644
 --- a/crates/sandlock-core/src/seccomp/dispatch.rs
 +++ b/crates/sandlock-core/src/seccomp/dispatch.rs
 @@ -546,7 +546,8 @@ pub(crate) fn build_dispatch_table(
@@ -2845,17 +3292,126 @@ index 3673d84..b7ad08b 100644
          register_cow_handlers(&mut table, ctx);
      }
 
-@@ -928,6 +929,9 @@ fn register_chroot_handlers(
-             crate::chroot::dispatch::handle_chroot_stat));
+@@ -779,7 +780,7 @@ fn register_chroot_handlers(
+     // The closure clones `policy` (Arc) before the async block; inside the
+     // async block it borrows fields of that cloned Arc to build `ChrootCtx`.
+     macro_rules! chroot_handler {
+-        ($policy:expr, $handler:expr) => {{
++        ($policy:expr, $handler:expr $(, $extra:expr)*) => {{
+             let policy = Arc::clone($policy);
+             let chroot_state = Arc::clone(&ctx.chroot);
+             let cow_state = Arc::clone(&ctx.cow);
+@@ -793,30 +794,7 @@ fn register_chroot_handlers(
+                 let policy = Arc::clone(&policy);
+                 async move {
+                     let chroot_ctx = ChrootCtx::new(&policy, &processes);
+-                    $handler(&notif, &chroot_state, &cow_state, notif_fd, &chroot_ctx).await
+-                }
+-            }
+-        }};
+-    }
+-
+-    // Same shape for fall-through variants (semantically identical here;
+-    // kept separate for symmetry with the old code).
+-    macro_rules! chroot_handler_fallthrough {
+-        ($policy:expr, $handler:expr) => {{
+-            let policy = Arc::clone($policy);
+-            let chroot_state = Arc::clone(&ctx.chroot);
+-            let cow_state = Arc::clone(&ctx.cow);
+-            let processes = Arc::clone(&ctx.processes);
+-            move |cx: &HandlerCtx| {
+-                let notif = cx.notif;
+-                let chroot_state = Arc::clone(&chroot_state);
+-                let cow_state = Arc::clone(&cow_state);
+-                let processes = Arc::clone(&processes);
+-                let notif_fd = cx.notif_fd;
+-                let policy = Arc::clone(&policy);
+-                async move {
+-                    let chroot_ctx = ChrootCtx::new(&policy, &processes);
+-                    $handler(&notif, &chroot_state, &cow_state, notif_fd, &chroot_ctx).await
++                    $handler(&notif, &chroot_state, &cow_state, notif_fd, &chroot_ctx $(, $extra)*).await
+                 }
+             }
+         }};
+@@ -826,14 +804,14 @@ fn register_chroot_handlers(
+     // openat, openat2 — fallthrough if Continue. Both carry (dirfd, path) in
+     // the same slots; the handler decodes the rest per spelling.
+     for &nr in &[libc::SYS_openat, arch::SYS_OPENAT2] {
+-        table.register(nr, chroot_handler_fallthrough!(policy,
++        table.register(nr, chroot_handler!(policy,
+             crate::chroot::dispatch::handle_chroot_open));
      }
 
-+    table.register(libc::SYS_fstat, chroot_handler!(policy,
-+        crate::chroot::dispatch::handle_chroot_fstat));
-+
-     // Legacy stat
-     if let Some(nr) = arch::sys_stat() {
-         table.register(nr, chroot_handler!(policy,
-@@ -956,6 +960,7 @@ fn register_chroot_handlers(
+     // open (legacy) — fallthrough if Continue
+     if let Some(open) = arch::sys_open() {
+-        table.register(open, chroot_handler_fallthrough!(policy,
+-            crate::chroot::dispatch::handle_chroot_legacy_open));
++        table.register(open, chroot_handler!(policy,
++            crate::chroot::dispatch::handle_chroot_open));
+     }
+
+     // execve, execveat — unconditional return
+@@ -886,41 +864,17 @@ fn register_chroot_handlers(
+             crate::chroot::dispatch::handle_chroot_legacy_chmod));
+     }
+
+-    // chown — non-follow
+-    if let Some(chown) = arch::sys_chown() {
+-        let policy_for_chown = Arc::clone(policy);
+-        let __sup = Arc::clone(ctx);
+-        table.register(chown, move |cx: &HandlerCtx| {
+-            let notif = cx.notif;
+-            let sup = Arc::clone(&__sup);
+-            let notif_fd = cx.notif_fd;
+-            let policy = Arc::clone(&policy_for_chown);
+-            async move {
+-                let chroot_ctx = ChrootCtx::new(&policy, &sup.processes);
+-                crate::chroot::dispatch::handle_chroot_legacy_chown(&notif, &sup.chroot, &sup.cow, notif_fd, &chroot_ctx, false).await
+-            }
+-        });
+-    }
+-
+-    // lchown — follow
+-    if let Some(lchown) = arch::sys_lchown() {
+-        let policy_for_lchown = Arc::clone(policy);
+-        let __sup = Arc::clone(ctx);
+-        table.register(lchown, move |cx: &HandlerCtx| {
+-            let notif = cx.notif;
+-            let sup = Arc::clone(&__sup);
+-            let notif_fd = cx.notif_fd;
+-            let policy = Arc::clone(&policy_for_lchown);
+-            async move {
+-                let chroot_ctx = ChrootCtx::new(&policy, &sup.processes);
+-                crate::chroot::dispatch::handle_chroot_legacy_chown(&notif, &sup.chroot, &sup.cow, notif_fd, &chroot_ctx, true).await
+-            }
+-        });
++    // chown follows the target; lchown changes the link itself.
++    for (nr, nofollow) in [(arch::sys_chown(), false), (arch::sys_lchown(), true)] {
++        if let Some(nr) = nr {
++            table.register(nr, chroot_handler!(policy,
++                crate::chroot::dispatch::handle_chroot_legacy_chown, nofollow));
++        }
+     }
+
+     // stat family
+     for &nr in &[
+-        libc::SYS_newfstatat,
++        libc::SYS_fstat, libc::SYS_statx, libc::SYS_newfstatat,
+         libc::SYS_faccessat,
+         arch::SYS_FACCESSAT2,
+     ] {
+@@ -942,10 +896,6 @@ fn register_chroot_handlers(
+             crate::chroot::dispatch::handle_chroot_legacy_access));
+     }
+
+-    // statx
+-    table.register(libc::SYS_statx, chroot_handler!(policy,
+-        crate::chroot::dispatch::handle_chroot_statx));
+-
+     // readlink
+     table.register(libc::SYS_readlinkat, chroot_handler!(policy,
+         crate::chroot::dispatch::handle_chroot_readlink));
+@@ -956,6 +906,7 @@ fn register_chroot_handlers(
 
      // getdents
      let mut getdents_nrs = vec![libc::SYS_getdents64];
@@ -2863,7 +3419,7 @@ index 3673d84..b7ad08b 100644
      if let Some(getdents) = arch::sys_getdents() {
          getdents_nrs.push(getdents);
      }
-@@ -969,10 +974,14 @@ fn register_chroot_handlers(
+@@ -969,10 +920,14 @@ fn register_chroot_handlers(
          crate::chroot::dispatch::handle_chroot_chdir));
      table.register(libc::SYS_fchdir as i64, chroot_handler!(policy,
          crate::chroot::dispatch::handle_chroot_fchdir));
@@ -2878,7 +3434,7 @@ index 3673d84..b7ad08b 100644
      table.register(libc::SYS_utimensat as i64, chroot_handler!(policy,
          crate::chroot::dispatch::handle_chroot_utimensat));
 
-@@ -1140,12 +1149,16 @@ mod handler_tests {
+@@ -1140,12 +1095,17 @@ mod handler_tests {
                  argv_safety_required: false,
                  port_remap: false,
                  cow_enabled: false,
@@ -2892,11 +3448,12 @@ index 3673d84..b7ad08b 100644
 +                chroot_exec_mounts: Vec::new(),
 +                chroot_exec_aliases: Vec::new(),
 +                chroot_directory_images: Vec::new(),
++                chroot_metadata_image: Default::default(),
                  deterministic_dirs: false,
                  virtual_hostname: None,
                  has_http_acl: false,
 diff --git a/crates/sandlock-core/src/seccomp/notif.rs b/crates/sandlock-core/src/seccomp/notif.rs
-index abcd92c..7437da1 100644
+index abcd92c..3ea465e 100644
 --- a/crates/sandlock-core/src/seccomp/notif.rs
 +++ b/crates/sandlock-core/src/seccomp/notif.rs
 @@ -514,6 +514,13 @@ pub(crate) struct OpenArgs {
@@ -2922,7 +3479,7 @@ index abcd92c..7437da1 100644
      pub chroot_root: Option<std::path::PathBuf>,
      /// Virtual paths allowed for reading under chroot (original user-specified paths).
      pub chroot_readable: Vec<std::path::PathBuf>,
-@@ -787,6 +796,11 @@ pub struct NotifPolicy {
+@@ -787,6 +796,12 @@ pub struct NotifPolicy {
      /// procfs mount and OCI `ro` bind mounts so a writable rootfs cannot make
      /// e.g. `/proc/sys/*` writable.
      pub chroot_mount_ro: Vec<std::path::PathBuf>,
@@ -2931,10 +3488,11 @@ index abcd92c..7437da1 100644
 +    /// Directories whose executables really live, and are named to interpreters, under another directory.
 +    pub chroot_exec_aliases: Vec<(std::path::PathBuf, std::path::PathBuf)>,
 +    pub chroot_directory_images: Vec<(std::path::PathBuf, Vec<u8>)>,
++    pub chroot_metadata_image: std::sync::Arc<crate::chroot::dispatch::MetadataImage>,
      pub deterministic_dirs: bool,
      pub virtual_hostname: Option<String>,
      pub has_http_acl: bool,
-@@ -937,10 +951,11 @@ fn inject_failure_resp(id: u64) -> SeccompNotifResp {
+@@ -937,10 +952,11 @@ fn inject_failure_resp(id: u64) -> SeccompNotifResp {
  /// The ioctl return value is the fd number assigned in the child process.
  /// After this call, no additional SECCOMP_IOCTL_NOTIF_SEND is needed.
  fn inject_fd_and_send(fd: RawFd, id: u64, srcfd: RawFd, newfd_flags: u32) -> io::Result<i32> {
@@ -2947,7 +3505,7 @@ index abcd92c..7437da1 100644
          newfd: 0,   // ignored when SECCOMP_ADDFD_FLAG_SETFD is not set
          newfd_flags,
      };
-@@ -954,6 +969,26 @@ fn inject_fd_and_send(fd: RawFd, id: u64, srcfd: RawFd, newfd_flags: u32) -> io:
+@@ -954,6 +970,26 @@ fn inject_fd_and_send(fd: RawFd, id: u64, srcfd: RawFd, newfd_flags: u32) -> io:
      }
  }
 
@@ -2974,7 +3532,7 @@ index abcd92c..7437da1 100644
  /// Inject a file descriptor into the child process (without responding).
  /// ioctl(fd, SECCOMP_IOCTL_NOTIF_ADDFD, &addfd)
  fn inject_fd(fd: RawFd, id: u64, srcfd: RawFd, targetfd: i32) -> io::Result<()> {
-@@ -1214,11 +1249,15 @@ const EXEC_MAX_PTR_ENTRIES: usize = 1 << 20;
+@@ -1214,11 +1250,15 @@ const EXEC_MAX_PTR_ENTRIES: usize = 1 << 20;
  /// child, plus the relocation buffer being assembled for it.
  struct ExecRewritePlan {
      /// Bytes to write at the path pointer: the fd path, then every
@@ -2991,7 +3549,7 @@ index abcd92c..7437da1 100644
  }
 
  /// Read a NULL-terminated pointer array (argv or envp) from child memory.
-@@ -1313,6 +1352,13 @@ fn read_exec_cstr(
+@@ -1313,6 +1353,13 @@ fn read_exec_cstr(
  ///   downward so each gap segment is read once, and once a NUL is seen every
  ///   lower string is known to terminate before the window.
  ///
@@ -3005,7 +3563,7 @@ index abcd92c..7437da1 100644
  /// Fails if the argv/envp pointer arrays themselves fall inside the final
  /// window: the kernel reads those arrays after we return, and they cannot be
  /// moved because their addresses live in syscall registers.
-@@ -1322,57 +1368,85 @@ fn plan_exec_rewrite(
+@@ -1322,57 +1369,85 @@ fn plan_exec_rewrite(
      fd_path: &[u8],
      argv_ptr: u64,
      envp_ptr: u64,
@@ -3113,7 +3671,7 @@ index abcd92c..7437da1 100644
                  grew = true;
              }
          }
-@@ -1382,19 +1456,151 @@ fn plan_exec_rewrite(
+@@ -1382,19 +1457,151 @@ fn plan_exec_rewrite(
      }
 
      let end = path_ptr + buf.len() as u64;
@@ -3275,7 +3833,7 @@ index abcd92c..7437da1 100644
  }
 
  /// Rewrite an execve/execveat path argument to `/proc/self/fd/<child_fd>`,
-@@ -1425,23 +1631,52 @@ fn plan_exec_rewrite(
+@@ -1425,23 +1632,52 @@ fn plan_exec_rewrite(
  ///
  /// `argv_ptr`/`envp_ptr` are the syscall's argv/envp arguments (args[1]/[2]
  /// for execve, args[2]/[3] for execveat); 0 (NULL) arrays are skipped.
@@ -3335,7 +3893,7 @@ index abcd92c..7437da1 100644
  }
 
  // ============================================================
-@@ -2546,6 +2781,12 @@ pub(crate) async fn cleanup_pid(ctx: &super::ctx::SupervisorCtx, key: super::sta
+@@ -2546,6 +2782,12 @@ pub(crate) async fn cleanup_pid(ctx: &super::ctx::SupervisorCtx, key: super::sta
          }
      }
      ctx.processes.unregister(key);
@@ -3348,7 +3906,7 @@ index abcd92c..7437da1 100644
  }
 
  // ============================================================
-@@ -2585,6 +2826,16 @@ mod tests {
+@@ -2585,6 +2827,16 @@ mod tests {
          path_ptr: u64,
          argv_ptr: u64,
          envp_ptr: u64,
@@ -3365,7 +3923,7 @@ index abcd92c..7437da1 100644
      ) -> Result<ExecRewritePlan, NotifError> {
          let mut read = |addr: u64, len: usize| {
              let off = addr
-@@ -2595,7 +2846,74 @@ mod tests {
+@@ -2595,7 +2847,74 @@ mod tests {
                  .map(|s| s.to_vec())
                  .ok_or_else(|| NotifError::Supervisor("read past fake memory".into()))
          };
@@ -3441,7 +3999,7 @@ index abcd92c..7437da1 100644
      }
 
      #[test]
-@@ -2712,6 +3030,19 @@ mod tests {
+@@ -2712,6 +3031,19 @@ mod tests {
          assert!(p.patches.is_empty());
      }
 

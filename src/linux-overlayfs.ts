@@ -1,11 +1,11 @@
-import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import { lstat, mkdir, mkdtemp, open, readFile, rm, writeFile, type FileHandle } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { BoundedRecencyMap } from "./bounded-recency-map.ts";
-import { resolveHostExecutable } from "./executable-path.ts";
+import { execHostText, resolveHostExecutable } from "./executable-path.ts";
 import { advanceFilesystemClock, mapFilesystem } from "./filesystem-evidence.ts";
 import { errorMessage, isMissing } from "./error-utils.ts";
 import { waitForCompletion } from "./scheduler.ts";
@@ -479,14 +479,7 @@ function availableCapabilityKey(
 	return `${capability.binary}\0${capability.fusermountBinary}\0${capability.fingerprint}`;
 }
 
-function execText(executable: string, args: readonly string[]): Promise<string> {
-	return new Promise((resolve, reject) => {
-		execFile(executable, args, { encoding: "utf8", maxBuffer: 4 * 1024 * 1024 }, (error, stdout, stderr) => {
-			if (error) reject(new Error(`${executable} failed: ${stderr.trim() || error.message}`, { cause: error }));
-			else resolve(`${stdout}${stderr}`);
-		});
-	});
-}
+const execText = (executable: string, args: readonly string[]) => execHostText(executable, args, { maxBuffer: 4 * 1024 * 1024 });
 
 async function expectMissing(target: string): Promise<void> {
 	try { await lstat(target); throw new Error(`expected path to be absent: ${target}`); } catch (error) {

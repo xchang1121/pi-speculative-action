@@ -1,11 +1,10 @@
-import { execFile } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
 import { access, readFile, realpath, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import { errorMessage } from "./error-utils.ts";
-import { resolveHostExecutable } from "./executable-path.ts";
+import { execHostText, resolveHostExecutable } from "./executable-path.ts";
 
 export interface LinuxEnvironmentReport { readonly text: string; readonly summary: string; readonly warnings: boolean; }
 
@@ -170,12 +169,8 @@ async function executableCheck(label: string, name: string, options: {
 }
 
 function query(file: string, args: readonly string[]): Promise<string> {
-	return new Promise((resolve, reject) => {
-		execFile(file, args, { encoding: "utf8", cwd: "/", env: { ...process.env, RUSTUP_AUTO_INSTALL: "0", CARGO_NET_OFFLINE: "true" },
-			timeout: 2_000, killSignal: "SIGKILL", maxBuffer: 16_384 }, (error, stdout, stderr) => {
-			if (error) reject(new Error(stderr.trim() || error.message)); else resolve(`${stdout}${stderr}`);
-		});
-	});
+	return execHostText(file, args, { cwd: "/", env: { ...process.env, RUSTUP_AUTO_INSTALL: "0", CARGO_NET_OFFLINE: "true" },
+		timeout: 2_000, killSignal: "SIGKILL", maxBuffer: 16_384 });
 }
 
 function formatExecutable(check: ExecutableCheck): string { return `${check.label}: ${check.detail}${check.file ? ` — ${clean(check.file)}` : ""}`; }
