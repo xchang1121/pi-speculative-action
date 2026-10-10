@@ -530,7 +530,7 @@ int main(void) { char b[1024]; return syscall(SYS_getdents64, 4, b, sizeof(b)) <
 	test.for(["git", "auto"] as const)("selects changed running inputs after unrelated hints and compares the predecessor state (%s)", { timeout: 20_000 }, async (driver, { skip }) => {
 		if (process.platform !== "linux") return skip("Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-running-inputs-", driver);
-		let pending: ReturnType<typeof forkReusableBash> | undefined, sandboxRoot: string | undefined;
+		let pending: ReturnType<typeof forkReusableBash> | undefined, workspace: Parameters<typeof fixture.backend.open>[0]["workspace"] | undefined;
 		let check: (() => Promise<boolean>) | undefined;
 		const registry = Reflect.get(fixture.backend, "handoffs") as ProcessHandoffRegistry;
 		const observe = registry.observeInputs.bind(registry), open = fixture.backend.open.bind(fixture.backend);
@@ -539,7 +539,7 @@ int main(void) { char b[1024]; return syscall(SYS_getdents64, 4, b, sizeof(b)) <
 		});
 		const hints = ["ignored.txt", "stable.txt", "input.txt"].map(name => path.join(fixture.workspace, name));
 		const opening = vi.spyOn(fixture.backend, "open").mockImplementation(input => {
-			sandboxRoot = input.workspace.sandboxRoot;
+			workspace = input.workspace;
 			return open({ ...input, workspace: { ...input.workspace, sourceChanges: () => ({ uncertain: false, paths: hints }) } });
 		});
 		try {
@@ -570,7 +570,7 @@ int main(void) {
 			pending = forkReusableBash(fixture, { label: "inputs", command: "printf predecessor > input.txt; worker",
 				actionNamespace: "running-inputs", executionFingerprint });
 			void pending.catch(() => {});
-			await expect.poll(() => Boolean(sandboxRoot && existsSync(path.join(sandboxRoot, "ready"))), { timeout: 5000 }).toBe(true);
+			await expect.poll(() => Boolean(workspace && existsSync(path.join(workspace.sandboxRoot, "ready"))), { timeout: 5000 }).toBe(true);
 			expect(check).toBeDefined();
 			await writeFile(hints[0]!, "unrelated"); await writeFile(hints[2]!, "predecessor");
 			const opened = vi.spyOn(filesystem, "open"), reads = opened.mock.calls.length;
@@ -582,10 +582,11 @@ int main(void) {
 				expect(opened.mock.calls.slice(reads).filter(([file]) => String(file) === hints[0])).toHaveLength(0);
 				expect(fixture.backend.actorMetrics().lastError).toContain("actor_running_input_changed:");
 			} finally { opened.mockRestore(); }
-			await writeFile(path.join(sandboxRoot!, "release"), "");
-			expect((await pending).output.result.content).toEqual([{ type: "text", text: "predecessor" }]);
+			await writeFile(path.join(workspace!.sandboxRoot, "release"), "");
+			if (workspace && Reflect.get(workspace, "liveBase")) await expect(pending).rejects.toThrow("workspace changed since the sandbox started: input.txt");
+			else expect((await pending).output.result.content).toEqual([{ type: "text", text: "predecessor" }]);
 		} finally {
-			if (sandboxRoot) await writeFile(path.join(sandboxRoot, "release"), "").catch(() => {});
+			if (workspace) await writeFile(path.join(workspace.sandboxRoot, "release"), "").catch(() => {});
 			await (await pending?.catch(() => undefined))?.dispose();
 			opening.mockRestore(); observing.mockRestore(); await fixture.dispose();
 		}
@@ -593,7 +594,7 @@ int main(void) {
 
 	test.for(["completed", "running", "native", "native-merged", "native-closed-input", "native-descriptors", "native-null", "native-null-stdin", "native-status", "native-directory", "native-directory-entries", "native-directory-prepared-stale", "native-directory-opath", "native-directory-opath-prepared-stale", "native-pipe", "native-pipe-prepared-stale", "native-pipe-live", "native-pipe-live-prepared-stale", "native-pipe-live-mixed", "native-pipe-live-transfer", "native-pipe-producer", "native-pipe-producer-queued", "native-pipe-producer-short", "native-pipe-producer-splice", "native-socket", "native-socket-running", "native-socket-duplex", "native-socket-lifetime", "native-socket-io", "native-socket-messages", "native-socket-export", "native-socket-counter-export", "native-socket-prequeued", "native-socket-segmented", "native-socket-prefixed", "native-socket-orphan", "native-eventfd", "native-eventfd-semaphore", "native-socket-concurrent", "native-socket-half-closed", "native-socket-prepared-stale", "native-shared-table", "native-unshare", "native-prepared-stale", "native-prepared-restored"] as const)("reexecutes an owned child binding across turns without replaying its parent or stale input (%s)", { timeout: 20_000 }, async (mode, { skip }) => {
 		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
-		const fixture = await createLinuxProcessBenchmark("pi-process-binding-");
+		const fixture = await createLinuxProcessBenchmark("pi-process-binding-", mode.includes("prepared-") ? "git" : undefined); // Borrowed immutable preparations.
 		const publishing = vi.spyOn(fixture.backend.planner, "publishCompleted");
 		const errors = vi.spyOn(fixture.backend as unknown as { setError(session: unknown, message: string): void }, "setError");
 		const native = mode.startsWith("native"), running = mode.endsWith("running"), enumerate = mode.includes("entries");
@@ -2454,7 +2455,7 @@ int main(void) { int fds[2], status; char queue[8]; if (pipe(fds) || fds[0] != 3
 
 	test.for(["trace", "transaction", "dependency", "host_parent", "publication"] as const)("preserves output and capture ownership when %s fails", { timeout: 15_000 }, async (failure, { skip }) => {
 		if (process.platform !== "linux") return skip("Linux only");
-		const fixture = await createLinuxProcessBenchmark("pi-process-capture-failure-");
+		const fixture = await createLinuxProcessBenchmark("pi-process-capture-failure-", failure === "dependency" ? "git" : undefined); // Invalidate the copied prestate.
 		const { readFile: readTrace, rm: removeFile, lstat: readStat } = await vi.importActual<typeof filesystem>("node:fs/promises");
 		const { spawn } = await vi.importActual<typeof childProcess>("node:child_process");
 		const entered = deferred(), failed = deferred(), gate = deferred();
@@ -2775,7 +2776,7 @@ int main(int argc, char **argv) {
 });
 test("preserves native metadata across stat families and rejects volatile or changed results", { timeout: 120_000 }, async ({ skip }) => {
 	if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
-	const fixture = await createLinuxProcessBenchmark("pi-native-metadata-", "overlayfs", {}, os.homedir());
+	const fixture = await createLinuxProcessBenchmark("pi-native-metadata-", "auto", {}, os.homedir());
 	try {
 		const bin = path.join(fixture.root, "host-bin"); await mkdir(bin);
 		await writeFile(path.join(bin, "pid.c"), '#include <stdio.h>\n#include <unistd.h>\nint main(void) { printf("%ld\\n", (long)getpid()); return 0; }\n');
@@ -2848,18 +2849,18 @@ int main(int argc, char **argv) {
 				expect(followed(textOutput(candidate.output.result))).toEqual(followed(native(command)));
 			} finally { await candidate.dispose(); }
 		}
-		const rootMetadata = await produce("./metadata .");
-		try {
-			expect(rootMetadata.output.isError).toBe(false);
-			expect(textOutput(rootMetadata.output.result)).toBe(native("./metadata ."));
-			expect((await rootMetadata.validate?.())?.status).toBe("valid");
-			const info = await filesystem.stat(fixture.workspace);
-			await filesystem.utimes(fixture.workspace, info.atime, new Date(info.mtimeMs - 2000));
-			expect((await rootMetadata.validate?.())?.status).toBe("stale");
-		} finally { await rootMetadata.dispose?.(); }
-		const linked = await produce("./metadata metadata-link");
-		try { expect(linked.output.isError, textOutput(linked.output.result)).toBe(false); expect(textOutput(linked.output.result)).toBe(native("./metadata metadata-link")); }
-		finally { await linked.dispose?.(); }
+		for (const name of [".", "metadata-link"]) {
+			const command = `./metadata ${name}`, candidate = await produce(command);
+			try {
+				expect(candidate.output.isError, textOutput(candidate.output.result)).toBe(false);
+				expect(textOutput(candidate.output.result)).toBe(native(command));
+				if (name !== ".") continue;
+				expect((await candidate.validate?.())?.status).toBe("valid");
+				const info = await filesystem.stat(fixture.workspace);
+				await filesystem.utimes(fixture.workspace, info.atime, new Date(info.mtimeMs - 2000));
+				expect((await candidate.validate?.())?.status).toBe("stale");
+			} finally { await candidate.dispose(); }
+		}
 		const branch = await produce("./metadata");
 		try {
 			expect(branch.output.isError).toBe(false);

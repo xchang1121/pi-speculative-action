@@ -63,6 +63,7 @@ int main(int argc, char **argv) {
 			symlink("data.txt", path.join(workspace, "data.link")), symlink("d/e", path.join(workspace, "sub"))]);
 		await commitBenchmarkFixture(workspace, "Pi Held Exec Qualification");
 		const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
+		const nativeMetadata = (await fixture.workspaceSandbox.qualify({ liveLower: true }, workspace)).driver === "overlayfs";
 		const route = await fixture.prepareActorReplay();
 		const produce = (command: string) => forkReusableBash(fixture, {
 			label: "producer", command, actionNamespace: "held-production", executionFingerprint,
@@ -120,7 +121,7 @@ int main(int argc, char **argv) {
 				expect(result.output, scenario.name).toBe(`actor-parent\n${scenario.expected}`);
 				if (scenario.file) expect(await readFile(path.join(workspace, scenario.file), "utf8"))
 					.toBe(scenario.name === "descriptor" ? "descriptor" : `artifact:${scenario.name === "stale" ? "after" : "before"}\n`);
-				if (["disposed", "completed", "running", "cwd"].includes(scenario.name)) {
+				if (["disposed", "completed", "running", "cwd"].includes(scenario.name) || scenario.name === "inode" && nativeMetadata) {
 					expect(result.metrics, `${scenario.name}: ${JSON.stringify(result.metrics)}`).toMatchObject({ hits: 1, joinedHits: Number(scenario.name === "running"), sameTurnHits: 1,
 						reusedProcessMs: expect.any(Number) });
 					expect(result.metrics.reusedProcessMs).toBeGreaterThan(0);

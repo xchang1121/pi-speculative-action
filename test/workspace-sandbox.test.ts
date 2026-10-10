@@ -348,24 +348,25 @@ describe("workspace-branch ExecutionWorld", () => {
 		}
 	});
 
-	it.for([false, true])("qualifies auto OverlayFS by current workspace size (live lower: %s)", async (liveLower, { skip }) => {
+	it.for([false, true])("qualifies auto OverlayFS by metadata needs and workspace size (live lower: %s)", async (liveLower, { skip }) => {
 		const overlay = await linuxOverlayfsCapability();
 		if (!overlay.available) return skip(overlay.detail);
 		const root = await temporaryRoot(), options = { driver: "auto" as const, liveLower };
 		const fingerprint = () => sandbox.fingerprint(options, root);
+		const smallFingerprint = liveLower ? /^linux-overlayfs:/ : /^git-worktree$/;
 		const files = Array.from({ length: 260 }, (_, index) => ({ name: path.join(root, `${index.toString().padStart(4, "0")}.txt`), content: `${index}\n` }));
 		const write = ({ name, content }: typeof files[number]) => writeFile(name, content, "utf8");
 		await writeFile(path.join(root, "small.txt"), "small\n", "utf8");
-		expect(await fingerprint()).toBe("git-worktree");
+		expect(await fingerprint()).toMatch(smallFingerprint);
 		const validations = vi.spyOn(ResourceVersionManager.prototype, "validate");
 		try {
-			expect(await fingerprint()).toBe("git-worktree");
+			expect(await fingerprint()).toMatch(smallFingerprint);
 			expect(validations, "driver selection must not revalidate a quiet prepared tree").not.toHaveBeenCalled();
 		} finally { validations.mockRestore(); }
 		await Promise.all(files.slice(0, 100).map(write));
 		await mkdir(path.join(root, "nested", ".git"), { recursive: true });
 		await Promise.all(Array.from({ length: 200 }, (_, index) => writeFile(path.join(root, "nested", ".git", `${index}`), "excluded")));
-		expect(await fingerprint()).toBe("git-worktree");
+		expect(await fingerprint()).toMatch(smallFingerprint);
 		await Promise.all(files.slice(100).map(write));
 		expect(await fingerprint()).toMatch(/^linux-overlayfs:/);
 		const prepared = await sandbox.prepare(root, { ...options, driver: "overlayfs" });
@@ -375,7 +376,7 @@ describe("workspace-branch ExecutionWorld", () => {
 		try { expect(branch.output).toEqual(settlement("changed\n")); } finally { await branch.dispose(); }
 		await Promise.all(files.slice(100).map(({ name }) => unlink(name)));
 		await nextTurn(); // Driver preparation reacts to delivered notifications; allocation still proves its own inputs.
-		expect(await fingerprint()).toBe("git-worktree");
+		expect(await fingerprint()).toMatch(smallFingerprint);
 	});
 
 	it("preserves a live lower root's native metadata while collecting its private writes", async ({ skip }) => {
@@ -419,10 +420,10 @@ describe("workspace-branch ExecutionWorld", () => {
 			await unlink(alias); await symlink(destination, alias);
 			await expect(fingerprint()).rejects.toThrow(/resource_symlink_escapes_workspace|symlink_cycle|ELOOP/);
 		}
-		await unlink(alias); await link(target, path.join(outside, "external"));
+		await unlink(alias); await link(target, path.join(outside, "external")); await nextTurn();
 		await expect(fingerprint()).rejects.toThrow("hardlink namespace is not closed");
 		await unlink(path.join(outside, "external")); await mkdir(path.join(root, "nested", ".git"), { recursive: true });
-		await link(target, path.join(root, "nested", ".git", "excluded"));
+		await link(target, path.join(root, "nested", ".git", "excluded")); await nextTurn();
 		await expect(fingerprint()).rejects.toThrow(/hardlink namespace is not closed|hardlink escapes snapshot/);
 	});
 
