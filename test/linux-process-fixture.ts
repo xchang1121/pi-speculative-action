@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execHostText } from "../src/executable-path.ts";
 import { access, mkdir, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -178,12 +178,7 @@ export async function commitBenchmarkFixture(workspace: string, name: string, pa
 }
 
 function commandOutput(executable: string, args: readonly string[], cwd?: string): Promise<string> {
-	return new Promise((resolve, reject) => {
-		execFile(executable, args, { cwd, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => {
-			if (error) reject(new Error(`${executable}: ${stderr || error.message}`));
-			else resolve(`${stdout}${stderr}`);
-		});
-	});
+	return execHostText(executable, args, { cwd });
 }
 
 export function textOutput(result: { readonly content: readonly { readonly type: string; readonly text?: string }[] }): string {

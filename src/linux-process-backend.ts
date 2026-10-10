@@ -27,7 +27,7 @@ import { diffWorkspaceStructures, ExecutionPathProjection, hydrateWorkspaceFileE
 import { definedProcessEnvironment, type PreparedProcessExecutionRoute, type ProcessExecutionRequest,
 	type ProcessExecutor } from "./process-execution.ts";
 import { isPoisonedEffectCommit } from "./effect-transaction.ts";
-import { resolveHostExecutable } from "./executable-path.ts";
+import { execHostText as execText, resolveHostExecutable } from "./executable-path.ts";
 import { assertNoSymlinkPath, cachedCapture, captureFilesystemEntry, captureStableFile, hashExecutableFile, mapFilesystem, rememberCapture, sameFilesystemIdentity, sharedWalk, walkFilesystemPath } from "./filesystem-evidence.ts";
 import { captureHeldDescriptorInputs, inspectHeldExecProcess, LinuxHeldExecBoundary, listenUnixSocket, resolveLinuxExecHelper, type HeldExecDecision,
 	type HeldExecProcess, type HeldExecSnapshot, type HeldExecTiming, type HeldExecClock, descriptorInputs, descriptorEffects, inheritedTracer, type ProcessResourceGraph } from "./linux-held-exec.ts";
@@ -717,6 +717,7 @@ export class LinuxProcessReuseBackend {
 			mounts: session.interposition.mounts,
 			execMounts: interception(session.interposition).execMounts,
 			privateWrites: path.join(session.workspace.processRoot, "private"),
+			metadataImage: session.workspace.metadataImage,
 			command: [session.invocation.shell, ...shellArguments(session.invocation, command)],
 			...(request.timeout !== undefined ? { timeoutSeconds: request.timeout } : {}),
 		});
@@ -1259,6 +1260,7 @@ export class LinuxProcessReuseBackend {
 						...(session.gitDirectory ? [{ virtualPath: session.gitDirectory, hostPath: session.gitDirectory, readOnly: true }] : []), ...session.interposition.mounts],
 					execMounts, path.join(session.workspace.processRoot, "private"),
 				),
+				...(session.workspace.metadataImage ? ["--metadata-image", session.workspace.metadataImage] : []),
 				...inheritedFiles.flatMap((_, index) => ["--preserve-fd", String(index + 3)]),
 				...directoryImages.flatMap(([directory, image]) => ["--directory-image", sandboxMountArgument({ virtualPath: directory, hostPath: image, readOnly: false })]),
 				"--",
@@ -1697,7 +1699,10 @@ function createProcessDescriptorCapture(session: ActiveSession, traceRoot: strin
 				const input = inputs.find(({ fd }) => fd === position.fd)!;
 				if (input.type === "null" || input.type === "pipe" || input.type === "socket" || input.type === "eventfd" || input.fd !== input.image) continue;
 				const image = descriptorImages.get(input.image)!;
-				const finalName = image.workspace && !input.type ? finalObjects.get(`${image.state.dev}:${position.inode}`) : undefined;
+				const identity = `${image.state.dev}:${image.state.ino}`, reported = `${position.device}:${position.inode}`;
+				const exposed = image.workspace ? session.workspace.metadataObjects?.get(identity) : undefined;
+				if (exposed && exposed !== reported) throw new Error("inherited FD object changed during execution");
+				const finalName = image.workspace && !input.type ? finalObjects.get(exposed ? identity : `${image.state.dev}:${position.inode}`) : undefined;
 				if (position.detached) {
 					const final = position.detached;
 					if (final.mode !== image.state.mode || final.uid !== image.state.uid || final.gid !== image.state.gid ||
@@ -1720,7 +1725,8 @@ function createProcessDescriptorCapture(session: ActiveSession, traceRoot: strin
 						catch (error) { if (!missing(error) || path.dirname(logical) === logical) throw error; logical = path.dirname(logical); }
 					}
 				}
-				if ((input.type === "directory" ? !current.isDirectory() : !current.isFile()) || String(device) !== position.device || current.dev !== image.state.dev || String(current.ino) !== position.inode ||
+				const currentObject = image.workspace && session.workspace.metadataObjects?.get(`${current.dev}:${current.ino}`) || `${device}:${current.ino}`;
+				if ((input.type === "directory" ? !current.isDirectory() : !current.isFile()) || currentObject !== reported || current.dev !== image.state.dev ||
 					current.mode !== image.state.mode || current.uid !== image.state.uid || current.gid !== image.state.gid)
 					throw new Error("inherited FD namespace changed during execution");
 				if (input.type === "directory" && !sameFilesystemIdentity(current, image.state)) throw new Error("inherited directory changed during enumeration");
@@ -2499,12 +2505,14 @@ function sandboxArguments(input: {
 	readonly mounts: readonly SandboxMount[];
 	readonly execMounts: readonly ExecMount[];
 	readonly privateWrites: string;
+	readonly metadataImage?: string;
 	readonly command: readonly string[];
 	readonly timeoutSeconds?: number;
 }): readonly string[] {
 	return [
 		input.ready.sandlock,
 		...sandboxPolicyArguments(input.cwd, input.deniedPaths, input.writablePaths, input.mounts, input.execMounts, input.privateWrites),
+		...(input.metadataImage ? ["--metadata-image", input.metadataImage] : []),
 		...(input.timeoutSeconds !== undefined ? ["--timeout", String(Math.max(1, Math.ceil(input.timeoutSeconds)))] : []),
 		"--",
 		...input.command,
@@ -2618,9 +2626,11 @@ async function probeExecutionContext(input: {
 	readonly physicalRoot: string;
 }): Promise<ProcessExecutionContext> {
 	await writeFile(path.join(input.physicalRoot, "script-position"), "#!/bin/sh\nexit 42\n", { mode: 0o700 });
+	const metadataImage = path.join(input.physicalRoot, "metadata.json"); await writeFile(metadataImage, "[]", { mode: 0o600 });
 	const command = straceCommand(input.strace, path.join(input.physicalRoot, "context"), [
 		input.sandlock,
 		...sandboxPolicyArguments(input.logicalRoot, [], [input.physicalRoot], [{ virtualPath: input.logicalRoot, hostPath: input.physicalRoot, readOnly: false }], [], path.join(input.physicalRoot, "private")),
+		"--metadata-image", metadataImage,
 		"--",
 		input.dispatcher,
 		"--exec",
@@ -2872,15 +2882,6 @@ function actorReplayProducer(producer: ProcessProducerProof, deniedPaths: readon
 	if (producer.observer.provider !== "strace" || producer.observer.fingerprint !== OBSERVER_FINGERPRINT) return false;
 	const confinement = producer.execution.authority === "actor" ? undefined : producer.execution.confinement;
 	return !confinement || confinement.provider === "sandlock" && [POLICY_ID, LEAF_POLICY_ID].some((policy) => confinement.fingerprint === digestObject({ policy, deniedPaths }));
-}
-
-function execText(executable: string, args: readonly string[]): Promise<string> {
-	return new Promise((resolve, reject) => {
-		execFile(executable, args, { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => {
-			if (error) reject(new Error(`${executable}: ${stderr || error.message}`));
-			else resolve(`${stdout}${stderr}`);
-		});
-	});
 }
 
 function closeServer(server: net.Server): Promise<void> { return new Promise((resolve) => server.close(() => resolve())); }

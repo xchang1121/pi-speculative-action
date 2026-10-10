@@ -8,7 +8,7 @@ const mocks = vi.hoisted(() => ({
 vi.mock("node:fs/promises", () => ({ readFile: mocks.readFile, access: mocks.access, stat: mocks.stat, realpath: mocks.realpath }));
 vi.mock("node:child_process", () => ({ execFile: mocks.execFile }));
 vi.mock("node:os", () => ({ default: { release: () => "6.6.0-test", homedir: () => "/home/test", machine: () => "x86_64" } }));
-vi.mock("../src/executable-path.ts", () => ({ resolveHostExecutable: mocks.resolve }));
+vi.mock("../src/executable-path.ts", async (original) => ({ ...await original<typeof import("../src/executable-path.ts")>(), resolveHostExecutable: mocks.resolve }));
 
 const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
 const arch = Object.getOwnPropertyDescriptor(process, "arch")!;

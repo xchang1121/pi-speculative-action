@@ -77,6 +77,9 @@ export interface SandboxWorkspaceContext {
 	readonly sourceRoot: string;
 	readonly sandboxRoot: string;
 	readonly processRoot: string;
+	/** Native metadata for pinned snapshot objects; shared by every process in this private workspace. */
+	readonly metadataImage?: string;
+	readonly metadataObjects?: ReadonlyMap<string, string>;
 	/** Root entry names owned by the isolation substrate and invisible to effect observation. */
 	readonly observationExcludes: readonly string[];
 	/** Driver-native content-free structure view shared by outer and nested process observers. */
@@ -171,7 +174,7 @@ interface PreparedGitWorkspace {
 	readonly dispose: () => Promise<void>;
 }
 
-interface SharedOverlayBaseline extends PreparedGitWorkspace { structure?: Promise<WorkspaceStructureSnapshot>; active: number; }
+interface SharedOverlayBaseline extends PreparedGitWorkspace { structure?: Promise<WorkspaceStructureSnapshot>; active: number; readonly modes: ReadonlyMap<string, number>; }
 
 interface AutoWorkspaceDriverDecision {
 	readonly baseline: string | WorkspaceStructureSnapshot;
@@ -218,7 +221,7 @@ const WORKSPACE_TRANSACTION_MAX_BYTES = 512 * 1024 * 1024;
 const WORKSPACE_TRANSACTION_MAX_FILES = 100_000;
 const WORKSPACE_TRANSACTION_STABILITY_ATTEMPTS = 3;
 const SANDBOX_STAGING_FILE_PREFIX = ".pi-speculative-";
-const GIT_WORKSPACE_FINGERPRINT = "git-worktree";
+const GIT_WORKSPACE_FINGERPRINT = "git-worktree-metadata";
 // Small-tree gains remain host-sensitive and carry one-time FUSE preparation cost, while the
 // 500/1,000-file A/B is material. Use a conservative power-of-two boundary and exact baseline.
 const AUTO_OVERLAY_MIN_TREE_ENTRIES = 256;
@@ -298,9 +301,10 @@ export class WorkspaceSandboxService {
 		return await forkSandboxWorkspaceFor(this.state, options);
 	}
 
-	async withWorkspace<T>(cwd: string, run: (workspace: SandboxWorkspaceContext) => Promise<T>, gitBinary = "git"): Promise<T> {
+	async withWorkspace<T>(cwd: string, run: (workspace: SandboxWorkspaceContext) => Promise<T>, options: Pick<WorkspaceSandboxOptions, "gitBinary" | "liveLower"> | string = {}): Promise<T> {
 		assertWorkspaceSandboxOpen(this.state);
-		return await withPrivateSandboxWorkspace(this.state, cwd, gitBinary, "git", {}, run);
+		const config = typeof options === "string" ? { gitBinary: options } : options;
+		return await withPrivateSandboxWorkspace(this.state, cwd, config.gitBinary ?? "git", "git", config, run);
 	}
 
 	async commitDelta(delta: SandboxExecutionDelta): Promise<ToolSettlement> {
@@ -786,7 +790,7 @@ async function executeFilesystemMutation(context: SpeculativeToolExecutionContex
 }
 
 async function createPrivateSandboxWorkspace(state: WorkspaceSandboxState, cwd: string, gitBinary: string,
-	driver: Exclude<WorkspaceSandboxDriver, "auto">, overlayOptions: LinuxOverlayfsOptions,
+	driver: Exclude<WorkspaceSandboxDriver, "auto">, overlayOptions: WorkspaceSandboxOptions,
 	preparation?: SandboxPreparation): Promise<PrivateSandboxWorkspace> {
 	const sourceRoot = path.resolve(cwd);
 	await assertNoSymlinkPath(sourceRoot, sourceRoot);
@@ -795,11 +799,13 @@ async function createPrivateSandboxWorkspace(state: WorkspaceSandboxState, cwd: 
 	let sharedBaseline: SharedOverlayBaseline | undefined;
 	let overlay: LinuxOverlayfsMount | undefined;
 	let overlayStorageRoot: string | undefined, cursor: ResourceVersionToken | undefined;
+	let metadata: Awaited<ReturnType<typeof preserveSnapshotMetadata>> | undefined;
 	let workspace!: PrivateSandboxWorkspace;
 	let disposal: Promise<void> | undefined;
 	const dispose = (unsafe = false): Promise<void> => disposal ??= (async () => {
 		const failures: unknown[] = [];
 		await workspace?.transactions.dispose().catch((error) => failures.push(error));
+		await metadata?.dispose().catch(error => failures.push(error));
 		await overlay?.close().catch((error) => { unsafe = true; failures.push(error); });
 		if (unsafe) {
 			// A live mount retains upper/work/lower storage; quarantine it rather than recycling its roots.
@@ -819,7 +825,7 @@ async function createPrivateSandboxWorkspace(state: WorkspaceSandboxState, cwd: 
 	try {
 		const prepared = typeof preparation === "object" ? preparedWorkspaceBaselines.get(preparation) : undefined;
 		// A live lower is the workspace itself: what changed since now stands in for a baseline of its bytes.
-		cursor = driver === "overlayfs" && (overlayOptions as WorkspaceSandboxOptions).liveLower ? await pool.versions.observeChanges() : undefined;
+		cursor = driver === "overlayfs" && overlayOptions.liveLower ? await pool.versions.observeChanges() : undefined;
 		const liveBase = cursor && await captureLiveBase(pool);
 		const baseline = liveBase ? { commit: "", tree: "", version: cursor!, aliases: [] } : prepared?.repository === pool && typeof preparation === "object" &&
 			preparation.driver === driver ? prepared.baseline : await acquireSandboxBaseline(pool, preparation === capturedWorkspaceInputs);
@@ -841,20 +847,16 @@ async function createPrivateSandboxWorkspace(state: WorkspaceSandboxState, cwd: 
 			const lowerName = liveBase ? path.basename(lowerRoot) : "", upper = path.join(overlayStorageRoot, "upper", lowerName);
 			const aliasGroups = liveBase ? [...new Map([...liveBase.entries.values()].flatMap(entry => entry.kind === "file" && entry.aliases
 				? [[entry.aliases.join("\0"), entry.aliases.map(name => path.relative(liveBase!.root, name))] as const] : [])).values()] : baseline.aliases;
-			const copyTimes = async (relative: string) => { const { atime, mtime } = await lstat(path.join(lowerRoot, relative)); await utimes(path.join(upper, relative), atime, mtime); };
 			for (const aliases of aliasGroups) {
 				for (const name of aliases) {
 					for (let parent = path.dirname(name); parent !== "."; parent = path.dirname(parent)) directories.add(parent);
 					await mkdir(path.dirname(path.join(upper, name)), { recursive: true });
 				}
 				await copyFile(path.join(lowerRoot, aliases[0]!), path.join(upper, aliases[0]!), fsConstants.COPYFILE_FICLONE);
-				await copyTimes(aliases[0]!);
 				for (const alias of aliases.slice(1)) await link(path.join(upper, aliases[0]!), path.join(upper, alias));
 			}
-			for (const directory of [...directories].sort((a, b) => b.length - a.length)) {
-				await chmod(path.join(upper, directory), (await lstat(path.join(lowerRoot, directory))).mode & 0o777);
-				await copyTimes(directory);
-			}
+			const copied = ["", ...directories, ...aliasGroups.flat()];
+			if (!liveBase && aliasGroups.length) await preserveSnapshotMetadata(lowerRoot, upper, processRoot, false, await captureSnapshotMetadata(lowerRoot, copied));
 			const mounted = await mountLinuxOverlayfs({ lowerRoot: lowerName ? path.dirname(lowerRoot) : lowerRoot,
 				privateRoot: overlayStorageRoot, options: overlayOptions, capabilityRegistry: state.overlayfsCapabilities });
 			overlay = { ...mounted, root: path.join(mounted.root, lowerName), upperRoot: upper };
@@ -862,6 +864,8 @@ async function createPrivateSandboxWorkspace(state: WorkspaceSandboxState, cwd: 
 			for (const directory of new Set(aliasGroups.flat().map(name => path.dirname(name)))) await readdir(path.join(overlay.root, directory));
 			overlayDevice = String((await lstat(overlay.root, { bigint: true })).dev);
 			sandboxRoot = overlay.root;
+			if (liveBase && aliasGroups.length) metadata = await preserveSnapshotMetadata(sourceRoot, sandboxRoot, processRoot, true,
+				await captureSnapshotMetadata(sourceRoot, copied));
 			gitDirectory = sharedBaseline?.gitDirectory ?? path.join(overlayStorageRoot, "no-index"); // OverlayFS journals its own changes.
 			openTransactionClock = () => openLinuxAnonymousWorkspaceFile(mounted.upperRoot); transactionClockLinks = 0;
 			// A live lower may sit on another filesystem; its files' own identities, checked on every read, fence it instead.
@@ -874,6 +878,7 @@ async function createPrivateSandboxWorkspace(state: WorkspaceSandboxState, cwd: 
 			if ((overlayOptions as Partial<SandboxWorkspaceBranchOptions>).action && preparation !== capturedWorkspaceInputs) prepareNextSandbox(pool, baseline);
 			attached = prepared;
 			({ sandboxRoot, processRoot, gitDirectory } = prepared);
+			metadata = await preserveSnapshotMetadata(sourceRoot, sandboxRoot, processRoot, process.platform === "linux" && !!overlayOptions.liveLower);
 			const transactionClockPath = path.join(prepared.processRoot, "workspace-transaction.clock");
 			const noFollow = typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0;
 			openTransactionClock = () => open(transactionClockPath, fsConstants.O_WRONLY | fsConstants.O_CREAT | noFollow, 0o600);
@@ -895,10 +900,15 @@ async function createPrivateSandboxWorkspace(state: WorkspaceSandboxState, cwd: 
 		const transactions = deferredWorkspaceTransactionDriver(() => createGitWorkspaceTransactionDriver(workspace));
 		workspace = {
 			sourceRoot, sandboxRoot, processRoot, observationExcludes, structure, transactions, pool, commit, baselineFrontier,
+			...(metadata ? { metadataImage: metadata.image } : {}),
+			...(metadata?.image ? { metadataObjects: metadata.objects } : {}),
 			captureChanges: frontier => collectSandboxChanges(workspace, frontier),
 			sourceChanges: () => pool.versions.changesSince(baseline.version),
 			indexGit: bindGit(gitBinary, sandboxRoot, ["--git-dir", gitDirectory, "--work-tree", sandboxRoot]),
-			readBase: liveBase ? (resource, maxBytes) => readLiveBase(liveBase!, resource, maxBytes) : (resource, maxBytes) => readGitTreeRegularState(pool.git, commit, resource, maxBytes),
+			readBase: liveBase ? (resource, maxBytes) => readLiveBase(liveBase!, resource, maxBytes) : async (resource, maxBytes) => {
+				const state = await readGitTreeRegularState(pool.git, commit, resource, maxBytes), mode = (metadata?.modes ?? sharedBaseline?.modes)?.get(slash(resource));
+				return state && mode !== undefined ? { ...state, mode } : state;
+			},
 			...(liveBase ? { liveBase } : {}),
 			openTransactionClock, transactionClockLinks, transactionClockRoots, dispose,
 			...(overlay ? { overlay } : {}),
@@ -914,6 +924,60 @@ async function createPrivateSandboxWorkspace(state: WorkspaceSandboxState, cwd: 
 		}
 		throw error;
 	}
+}
+
+/** Git owns bytes and links, while an OS snapshot also owns empty directories and object metadata.
+ * Pin every translated object until disposal: unlink/recreate must never reuse a saved inode mapping. */
+const SNAPSHOT_METADATA_FIELDS = ["dev", "ino", "mode", "nlink", "uid", "gid", "rdev", "size", "blksize", "blocks", "atimeNs", "mtimeNs", "ctimeNs", "birthtimeNs"] as const;
+async function captureSnapshotMetadata(sourceRoot: string, copied?: readonly string[]) {
+	const original = new Map<string, BigIntStats>();
+	if (copied) await mapFilesystem([...new Set(copied)], async resource => { original.set(resource, await lstat(path.join(sourceRoot, resource), { bigint: true })); });
+	else if (!(await captureWorkspaceStructure(sourceRoot, { maxFiles: WORKSPACE_TRANSACTION_MAX_FILES, exclude: SNAPSHOT_EXCLUDES,
+		observeStat: (resource, stat) => { original.set(resource, stat); } })).complete) throw new Error("snapshot metadata namespace is incomplete");
+	return original;
+}
+async function preserveSnapshotMetadata(sourceRoot: string, sandboxRoot: string, processRoot: string, native: boolean, captured?: ReadonlyMap<string, BigIntStats>) {
+	const original = captured ?? await captureSnapshotMetadata(sourceRoot), handles: FileHandle[] = [];
+	const dispose = async () => {
+		const closed = await Promise.allSettled(handles.splice(0).map(handle => handle.close()));
+		const failed = closed.flatMap(result => result.status === "rejected" ? [result.reason] : []);
+		if (failed.length) throw new AggregateError(failed, "snapshot metadata pins did not close");
+	};
+	try {
+		const names = [...original.keys()].sort((a, b) => a.length - b.length);
+		// Check each parent before populating its children: a stale checkout may contain a symlink in its place.
+		for (const resource of names) if (original.get(resource)!.isDirectory()) {
+			const target = path.join(sandboxRoot, resource), current = await lstat(target).catch(error => { if (isMissing(error)) return undefined; throw error; });
+			if (!current) await mkdir(target);
+			else if (!current.isDirectory()) throw new Error(`snapshot directory type changed: ${resource}`);
+		}
+		const rows: string[][][] = [], objects = new Map<string, string>();
+		const fields = SNAPSHOT_METADATA_FIELDS;
+		// Set parent modes last so a read-only directory cannot prevent its own snapshot from being populated.
+		for (const resource of names.reverse()) {
+			const source = original.get(resource)!, target = path.join(sandboxRoot, resource);
+			const current = await lstat(target, { bigint: true }).catch(error => { if (isMissing(error)) return undefined; throw error; });
+			if (!current) continue; // A warmup can predate this name; exact input validation still decides adoption.
+			if (objects.has(`${current.dev}:${current.ino}`)) continue;
+			if ((source.mode & 0o170000n) !== (current.mode & 0o170000n)) throw new Error(`snapshot object type changed: ${resource}`);
+			if (source.uid !== current.uid || source.gid !== current.gid) throw new Error(`snapshot object ownership differs: ${resource}`);
+			if (!source.isSymbolicLink()) { await chmod(target, Number(source.mode & 0o7777n)); await utimes(target, source.atime, source.mtime); }
+			objects.set(`${current.dev}:${current.ino}`, `${source.dev}:${source.ino}`);
+			if (!native) continue;
+			const handle = await open(target, 0x200000 | fsConstants.O_NOFOLLOW); // Linux O_PATH also pins symlinks and unreadable objects.
+			handles.push(handle);
+			const physical = await handle.stat({ bigint: true });
+			rows.push([fields.map(field => String(physical[field])), fields.map(field => String(source[field]))]);
+		}
+		const image = native ? path.join(processRoot, "metadata.json") : undefined;
+		if (image) {
+			const parent = await open(path.dirname(sandboxRoot), 0x200000 | fsConstants.O_NOFOLLOW); handles.push(parent);
+			const physicalParent = await parent.stat({ bigint: true }), sourceParent = await lstat(path.dirname(sourceRoot), { bigint: true });
+			rows.push([fields.map(field => String(physicalParent[field])), fields.map(field => String(sourceParent[field]))]);
+			await writeFile(image, JSON.stringify(rows), { flag: "wx", mode: 0o600 });
+		}
+		return { image, objects, modes: new Map([...original].map(([name, stat]) => [slash(name), process.platform === "win32" ? 0 : Number(stat.mode & 0o777n)])), dispose };
+	} catch (error) { await dispose(); throw error; }
 }
 
 async function createGitWorkspaceTransactionDriver(workspace: PrivateSandboxWorkspace): Promise<WorkspaceTransactionDriver> {
@@ -1413,19 +1477,26 @@ async function acquireOverlayBaseline(
 ): Promise<SharedOverlayBaseline> {
 	const { commit } = snapshot;
 	return withWorkspaceLock(repository, async () => {
+		const original = await captureSnapshotMetadata(repository.sourceRoot), identity = createHash("sha256").update(commit);
+		for (const [name, stat] of [...original].sort(([a], [b]) => a.localeCompare(b)))
+			identity.update(JSON.stringify([name, ...SNAPSHOT_METADATA_FIELDS.filter(field => field !== "atimeNs").map(field => String(stat[field]))]));
+		const key = identity.digest("hex");
 		for (const [candidateCommit, pending] of repository.overlayBaselines) {
-			if (candidateCommit === commit) continue;
+			if (candidateCommit === key) continue;
 			const candidate = await pending.catch(() => undefined);
 			if (!candidate || candidate.active > 0) continue;
 			repository.overlayBaselines.delete(candidateCommit);
 			await candidate.dispose().catch(() => undefined);
 		}
-		let pending = repository.overlayBaselines.get(commit);
+		let pending = repository.overlayBaselines.get(key);
 		if (!pending) {
-			pending = attachSandboxWorkspace(repository, snapshot, path.join(repository.parent, `overlay-baseline-${commit}`))
-				.then(workspace => ({ ...workspace, active: 0 }));
-			repository.overlayBaselines.set(commit, pending);
-			void pending.catch(() => { if (repository.overlayBaselines.get(commit) === pending) repository.overlayBaselines.delete(commit); });
+			pending = attachSandboxWorkspace(repository, snapshot, path.join(repository.parent, `overlay-baseline-${key}`))
+				.then(async workspace => {
+					try { return { ...workspace, active: 0, modes: (await preserveSnapshotMetadata(repository.sourceRoot, workspace.sandboxRoot, workspace.processRoot, false, original)).modes }; }
+					catch (error) { await workspace.dispose(); throw error; }
+				});
+			repository.overlayBaselines.set(key, pending);
+			void pending.catch(() => { if (repository.overlayBaselines.get(key) === pending) repository.overlayBaselines.delete(key); });
 		}
 		const baseline = await pending;
 		baseline.active++;
@@ -1554,7 +1625,7 @@ function assertWorkspaceSandboxOpen(state: WorkspaceSandboxState): void {
 }
 
 async function withPrivateSandboxWorkspace<T>(state: WorkspaceSandboxState, cwd: string, gitBinary: string,
-	driver: Exclude<WorkspaceSandboxDriver, "auto">, overlayOptions: LinuxOverlayfsOptions, run: (workspace: PrivateSandboxWorkspace) => Promise<T>,
+	driver: Exclude<WorkspaceSandboxDriver, "auto">, overlayOptions: WorkspaceSandboxOptions, run: (workspace: PrivateSandboxWorkspace) => Promise<T>,
 	checkpoint?: WorkspaceCheckpoint, preparation?: SandboxPreparation): Promise<T> {
 	const workspace = await createPrivateSandboxWorkspace(state, cwd, gitBinary, driver, overlayOptions, preparation);
 	try { if (checkpoint) await materializeCheckpoint(workspace, checkpoint); return await run(workspace); } finally { await workspace.dispose(); }

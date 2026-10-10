@@ -1160,7 +1160,7 @@ int main(int argc,char **argv) {
 				environment: fixture.environment, shellPath: fixture.shellPath })!.process!;
 			for (const changed of [false, true]) {
 				await reset();
-				const branch = await fixture.workspaceSandbox.fork({ cwd: fixture.workspace, driver,
+				const branch = await fixture.workspaceSandbox.fork({ cwd: fixture.workspace, driver, liveLower: true,
 					action: buildPiActionKey("bash", { command }, fixture.workspace)!, execute: async workspace => {
 					const session = await fixture.backend.open({ sourceRoot: fixture.workspace, workspace, invocation, scope: later });
 					try {
@@ -2774,14 +2774,25 @@ int main(int argc, char **argv) {
 		}
 	});
 });
-test("preserves native metadata across stat families and rejects volatile or changed results", { timeout: 120_000 }, async ({ skip }) => {
+test.for(["git", "auto"] as const)("preserves native metadata across stat families and rejects volatile or changed results (%s)", { timeout: 120_000 }, async (driver, { skip }) => {
 	if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
-	const fixture = await createLinuxProcessBenchmark("pi-native-metadata-", "auto", {}, os.homedir());
+	const fixture = await createLinuxProcessBenchmark("pi-native-metadata-", driver, {}, os.homedir());
+	const actual = await vi.importActual<typeof filesystem>("node:fs/promises"), pins: filesystem.FileHandle[] = [];
+	const opening = vi.mocked(filesystem.open).mockImplementation(async (...args) => {
+		const handle = await actual.open(...args);
+		if (typeof args[1] === "number" && args[1] & 0x200000) pins.push(handle);
+		return handle;
+	});
 	try {
 		const bin = path.join(fixture.root, "host-bin"); await mkdir(bin);
 		await writeFile(path.join(bin, "pid.c"), '#include <stdio.h>\n#include <unistd.h>\nint main(void) { printf("%ld\\n", (long)getpid()); return 0; }\n');
 		await compileBenchmarkHelper(bin, { source: "pid.c", output: "cat" });
 		await writeFile(path.join(fixture.workspace, "README"), "metadata fixture\n");
+		await filesystem.chmod(path.join(fixture.workspace, "README"), 0o640);
+		await filesystem.link(path.join(fixture.workspace, "README"), path.join(fixture.workspace, "README-alias"));
+		await writeFile(path.join(fixture.workspace, ".gitignore"), "dist/\n");
+		await mkdir(path.join(fixture.workspace, "dist"));
+		await writeFile(path.join(fixture.workspace, "dist", "module.cjs"), "module.exports = 42;\n");
 		await mkdir(path.join(fixture.workspace, "many"));
 		for (let index = 0; index < 300; index++) await mkdir(path.join(fixture.workspace, "many", `d${index}`));
 		await writeFile(path.join(fixture.workspace, "many", "file"), "regular\n");
@@ -2791,6 +2802,7 @@ test("preserves native metadata across stat families and rejects volatile or cha
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
@@ -2800,11 +2812,36 @@ int main(int argc, char **argv) {
 	const char *name = argc > 1 ? argv[1] : "README";
 	struct stat s; struct statx x; int fd = open(name, O_RDONLY);
 	if (fd < 0) { perror("open"); return 1; }
-	if (argc > 2 && !strcmp(argv[2], "enumerate")) { DIR *dir = opendir(name); if (!dir) return 7; while (readdir(dir)) {} if (closedir(dir)) return 8; }
+	if (argc > 2 && !strcmp(argv[2], "legacy")) {
+		char target[32] = {0};
+		if (syscall(SYS_mkdir, "legacy-dir", 0750)) return 20;
+		int output = syscall(SYS_open, "legacy-dir/input", O_CREAT|O_RDWR, 0640);
+		if (output < 0 || write(output, "legacy", 6) != 6 || close(output)) return 21;
+		if (syscall(SYS_link, "legacy-dir/input", "legacy-dir/alias") ||
+			syscall(SYS_rename, "legacy-dir/input", "legacy-result") ||
+			syscall(SYS_symlink, "../legacy-result", "legacy-dir/link")) return 22;
+		if (syscall(SYS_readlink, "legacy-dir/link", target, sizeof(target)) != 16 || strcmp(target, "../legacy-result") ||
+			syscall(SYS_access, "legacy-dir/link", R_OK) || syscall(SYS_chmod, "legacy-result", 0440) ||
+			syscall(SYS_chown, "legacy-result", getuid(), getgid()) || syscall(SYS_lchown, "legacy-dir/link", getuid(), getgid())) return 23;
+		if (syscall(SYS_unlink, "legacy-dir/link") || syscall(SYS_unlink, "legacy-dir/alias") || syscall(SYS_rmdir, "legacy-dir")) return 24;
+		puts("legacy-ok"); return close(fd);
+	}
+	if (argc > 2 && !strcmp(argv[2], "enumerate")) {
+		DIR *dir = opendir(name); struct dirent *entry; if (!dir) return 7;
+		while ((entry = readdir(dir))) { struct stat child; if (fstatat(dirfd(dir), entry->d_name, &child, AT_SYMLINK_NOFOLLOW) || child.st_ino != entry->d_ino) return 8; }
+		if (closedir(dir)) return 9;
+		char *buffer = mmap(NULL, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+		if (buffer == MAP_FAILED || mprotect(buffer+4096, 4096, PROT_NONE)) return 10;
+		int empty = open("many/d1", O_RDONLY|O_DIRECTORY); if (empty < 0) return 11;
+		for (int legacy = 0; legacy < 2; legacy++) {
+			if (lseek(empty, 0, SEEK_SET) || syscall(legacy ? SYS_getdents : SYS_getdents64, empty, buffer+4096-128, 4096) <= 0) return 12;
+		}
+		if (close(empty) || munmap(buffer, 8192)) return 13;
+	}
 	char held[64];
 	if (argc > 2 && !strcmp(argv[2], "proc")) { snprintf(held, sizeof(held), "/proc/self/fd/%d", fd); name = held; }
-	if (stat(name, &s)) { perror("stat"); return 1; } emit(&s);
-	if (lstat(name, &s)) return 2; emit(&s);
+	if (syscall(SYS_stat, name, &s)) { perror("stat"); return 1; } emit(&s);
+	if (syscall(SYS_lstat, name, &s)) return 2; emit(&s);
 	if (syscall(SYS_newfstatat, AT_FDCWD, name, &s, AT_EMPTY_PATH)) return 3; emit(&s);
 	if (syscall(SYS_newfstatat, fd, "", &s, AT_EMPTY_PATH)) return 4; emit(&s);
 	if (syscall(SYS_fstat, fd, &s)) return 5; emit(&s);
@@ -2825,10 +2862,22 @@ int main(int argc, char **argv) {
 		const produce = (command: string) => forkReusableBash(fixture, { command, label: "metadata", executionFingerprint, actionNamespace: "metadata",
 			executionScope: { sessionID: "metadata", turnID: String(turn++) } });
 		const native = (command: string) => execFileSync("/bin/bash", ["-c", command], { cwd: fixture.workspace, env: { ...fixture.environment }, encoding: "utf8" });
-		for (const mutation of ["", "mkdir many/new", "rmdir many/d0"] as const) {
+		const publication = vi.mocked(filesystem.writeFile).mockImplementation(async (...args) => {
+			if (String(args[0]).endsWith("/metadata.json")) throw new Error("injected metadata publication failure");
+			return actual.writeFile(...args);
+		});
+		try {
+			await expect(produce("true")).rejects.toThrow("injected metadata publication failure");
+			expect(pins.length).toBeGreaterThan(0); expect(pins.every(handle => handle.fd === -1)).toBe(true);
+		} finally { publication.mockRestore(); }
+		for (const mutation of ["", "mkdir many/new", "rmdir many/d0", "./metadata README legacy"] as const) {
 			const command = `${mutation ? `${mutation}; ` : ""}./metadata many enumerate`, candidate = await produce(command);
 			try {
 				expect(candidate.output.isError, textOutput(candidate.output.result)).toBe(false);
+				if (mutation.endsWith("legacy")) {
+					expect(textOutput(candidate.output.result)).toContain("legacy-ok\n");
+					await expect(filesystem.lstat(path.join(fixture.workspace, "legacy-result"))).rejects.toMatchObject({ code: "ENOENT" });
+				}
 				expect(textOutput(candidate.output.result)).toBe(native(command));
 				if (!mutation) {
 					expect(await candidate.validate?.()).toMatchObject({ status: "valid" });
@@ -2839,6 +2888,7 @@ int main(int argc, char **argv) {
 			} finally { await candidate.dispose(); }
 			if (mutation.startsWith("mkdir")) await rm(path.join(fixture.workspace, "many", "new"), { recursive: true });
 			if (mutation.startsWith("rmdir")) await mkdir(path.join(fixture.workspace, "many", "d0"));
+			if (mutation.endsWith("legacy")) { expect(await readFile(path.join(fixture.workspace, "legacy-result"), "utf8")).toBe("legacy"); await rm(path.join(fixture.workspace, "legacy-result")); }
 		}
 		for (const file of ["README", "many"]) {
 			const command = `./metadata ${file} proc`, candidate = await produce(command);
@@ -2849,13 +2899,18 @@ int main(int argc, char **argv) {
 				expect(followed(textOutput(candidate.output.result))).toEqual(followed(native(command)));
 			} finally { await candidate.dispose(); }
 		}
-		for (const name of [".", "metadata-link"]) {
-			const command = `./metadata ${name}`, candidate = await produce(command);
+		for (const name of [".", "metadata-link", "dist/module.cjs"]) {
+			const command = name.startsWith("dist/") ? `node -e "console.log(require('./${name}'))"` : `./metadata ${name}`, candidate = await produce(command);
 			try {
 				expect(candidate.output.isError, textOutput(candidate.output.result)).toBe(false);
 				expect(textOutput(candidate.output.result)).toBe(native(command));
-				if (name !== ".") continue;
 				expect((await candidate.validate?.())?.status).toBe("valid");
+				if (name.startsWith("dist/")) {
+					await writeFile(path.join(fixture.workspace, name), "module.exports = 43;\n");
+					expect((await candidate.validate?.())?.status).toBe("stale");
+					continue;
+				}
+				if (name !== ".") continue;
 				const info = await filesystem.stat(fixture.workspace);
 				await filesystem.utimes(fixture.workspace, info.atime, new Date(info.mtimeMs - 2000));
 				expect((await candidate.validate?.())?.status).toBe("stale");
@@ -2882,5 +2937,8 @@ int main(int argc, char **argv) {
 			expect(fixture.backend.metrics().wholeCommandHits - before, command).toBe(0);
 			expect(outputs[0], command).not.toBe(outputs[1]);
 		}
-	} finally { await fixture.dispose(); }
+	} finally {
+		try { await fixture.dispose(); expect(pins.every(handle => handle.fd === -1)).toBe(true); }
+		finally { opening.mockRestore(); }
+	}
 });

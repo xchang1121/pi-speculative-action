@@ -57,7 +57,7 @@ pi -e /absolute/path/to/pi-speculative-action
 
 版本与依赖见 [package.json](./package.json)。在 Pi 中运行 `/speculative-action`，开启投机、选择预测来源和工具后 **Apply changes**；在 **Tools & execution → Execution routes** 检查实际可用的后端。配置保存在 `<agent-dir>/speculative-action.json`，项目的 `.pi/speculative-action.json` 可覆盖全局设置。
 
-Linux / WSL 2 的 Bash 后端可从菜单检查和安装，也可在源码目录运行 `npm run setup:linux`；WSL checkout 应放在 Linux 原生文件系统。原生进程自动选用合格的 OverlayFS 保留原始 inode 等元数据；回退 Git 副本时，观察这些元数据的结果可能无法通过精确验新。ThinkThread 使用独立的 [Profile 安装脚本](./scripts/install-thinkthread-profile.sh)，安装后在项目中运行 `tt pi-speculative-action`。后端不可用时保留正常 Actor 执行。
+Linux / WSL 2 的 Bash 后端可从菜单检查和安装，也可在源码目录运行 `npm run setup:linux`；WSL checkout 应放在 Linux 原生文件系统。原生进程自动选用合格的 OverlayFS，回退 Git 时补齐空目录和权限；两条路径中被复制的原始对象通过持有对象和元数据映射，保持路径、文件描述符及目录枚举所见身份一致，采纳前仍精确验新。ThinkThread 使用独立的 [Profile 安装脚本](./scripts/install-thinkthread-profile.sh)，安装后在项目中运行 `tt pi-speculative-action`。后端不可用时保留正常 Actor 执行。
 
 ## 开发与验证
 

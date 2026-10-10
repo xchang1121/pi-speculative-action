@@ -49,7 +49,7 @@ export class ExecutionPathProjection {
 	isWorkspacePhysical(physicalPath: string): boolean { return containsFilesystemPath(this.workspaceRoot, physicalPath); }
 }
 
-export interface WorkspaceStructureCaptureOptions { readonly maxFiles?: number; readonly exclude?: readonly string[]; }
+export interface WorkspaceStructureCaptureOptions { readonly maxFiles?: number; readonly exclude?: readonly string[]; readonly observeStat?: (relative: string, stat: BigIntStats) => void; }
 
 /** Capture inode and directory semantics without reading regular-file contents. */
 export async function captureWorkspaceStructure(root: string, options: WorkspaceStructureCaptureOptions = {}): Promise<WorkspaceStructureSnapshot> {
@@ -64,6 +64,7 @@ export async function captureWorkspaceStructure(root: string, options: Workspace
 		cursor += batch.length;
 		const captured = await mapFilesystem(batch, async (relative) => {
 			const target = path.join(absoluteRoot, relative), stat = await lstat(target, { bigint: true });
+			options.observeStat?.(relative, stat);
 			const children = !relative || stat.isDirectory() ? await readdir(target, { withFileTypes: true }) : [];
 			const entry = await captureExistingWorkspaceStructureEntry(target, stat, relative ? [] : [...excludes], children);
 			return { relative, entry, children };

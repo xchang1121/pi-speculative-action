@@ -57,6 +57,7 @@ describe("workspace-branch ExecutionWorld", () => {
 	it("resets a returned filesystem-tool worktree to its baseline for the next actions", async () => {
 		const root = await temporaryRoot(), world = sandbox.createExecutionWorld({ inPlaceMutations: false }), at = (name: string) => path.join(root, name);
 		await writeFile(at("a"), "base\n"); await writeFile(at("b"), "linked\n"); await link(at("b"), at("c"));
+		await mkdir(at("empty/nested"), { recursive: true }); await chmod(at("empty"), 0o750); await chmod(at("a"), 0o640);
 		vi.mocked(mkdtemp).mockClear();
 		await (await world.speculation.execute(boundContext(root, async (view) => {
 			for (const name of ["a", "b", "dir/new"]) { if (name === "dir/new") await view.mkdir!(at("dir")); await view.writeFile!(at(name), "first\n"); }
@@ -74,6 +75,8 @@ describe("workspace-branch ExecutionWorld", () => {
 		await sandbox.withWorkspace(root, async ({ sandboxRoot }) => {
 			const [b, c] = await Promise.all(["b", "c"].map(name => stat(path.join(sandboxRoot, name), { bigint: true })));
 			expect(b.ino).not.toBe(c.ino);
+			expect(await readdir(path.join(sandboxRoot, "empty/nested"))).toEqual([]);
+			for (const name of ["a", "empty"]) expect((await stat(path.join(sandboxRoot, name))).mode).toBe((await stat(at(name))).mode);
 		});
 		expect(vi.mocked(mkdtemp).mock.calls.filter(([prefix]) => String(prefix).endsWith(`${path.sep}action-`))).toHaveLength(1);
 	});
@@ -353,7 +356,7 @@ describe("workspace-branch ExecutionWorld", () => {
 		if (!overlay.available) return skip(overlay.detail);
 		const root = await temporaryRoot(), options = { driver: "auto" as const, liveLower };
 		const fingerprint = () => sandbox.fingerprint(options, root);
-		const smallFingerprint = liveLower ? /^linux-overlayfs:/ : /^git-worktree$/;
+		const smallFingerprint = liveLower ? /^linux-overlayfs:/ : /^git-worktree-metadata$/;
 		const files = Array.from({ length: 260 }, (_, index) => ({ name: path.join(root, `${index.toString().padStart(4, "0")}.txt`), content: `${index}\n` }));
 		const write = ({ name, content }: typeof files[number]) => writeFile(name, content, "utf8");
 		await writeFile(path.join(root, "small.txt"), "small\n", "utf8");
@@ -370,6 +373,14 @@ describe("workspace-branch ExecutionWorld", () => {
 		await Promise.all(files.slice(100).map(write));
 		expect(await fingerprint()).toMatch(/^linux-overlayfs:/);
 		const prepared = await sandbox.prepare(root, { ...options, driver: "overlayfs" });
+		await mkdir(path.join(root, "empty")); await chmod(path.join(root, "small.txt"), 0o640);
+		const metadata = await sandbox.fork({ ...options, ...prepared, cwd: root, action: requiredAction("read", { path: "small.txt" }, root),
+			execute: async ({ sandboxRoot }) => {
+				expect(await readdir(path.join(sandboxRoot, "empty"))).toEqual([]);
+				expect((await stat(path.join(sandboxRoot, "small.txt"))).mode).toBe((await stat(path.join(root, "small.txt"))).mode);
+				return settlement("metadata");
+			} });
+		await metadata.dispose();
 		await writeFile(path.join(root, "small.txt"), "changed\n");
 		const branch = await sandbox.fork({ ...options, ...prepared, cwd: root, action: requiredAction("read", { path: "small.txt" }, root),
 			execute: async ({ sandboxRoot }) => settlement(await readFile(path.join(sandboxRoot, "small.txt"), "utf8")) });
@@ -414,7 +425,7 @@ describe("workspace-branch ExecutionWorld", () => {
 		try {
 			await writeFile(target, "changed");
 			capture.mockResolvedValueOnce({ root, entries: new Map(), complete: false });
-			expect(await fingerprint()).toBe("git-worktree");
+			expect(await fingerprint()).toBe("git-worktree-metadata");
 		} finally { capture.mockRestore(); }
 		for (const destination of [path.join(outside, "missing"), "alias"]) {
 			await unlink(alias); await symlink(destination, alias);
@@ -702,7 +713,7 @@ describe("workspace-branch ExecutionWorld", () => {
 					else if (changed) await writeFile(changed, "actor\n");
 				};
 				if (phase === "preparation") { await alter(); delayed = true; }
-				const branch = await world.speculation.execute(boundContext(root, async (view) => {
+				const execute = () => world.speculation.execute(boundContext(root, async (view) => {
 					const captures = vi.spyOn(await import("../src/filesystem-evidence.ts"), "captureStableFile");
 					try {
 						await view.access(input, true);
@@ -717,11 +728,16 @@ describe("workspace-branch ExecutionWorld", () => {
 						return result;
 					} finally { captures.mockRestore(); }
 				}));
-				delayed = false;
+				const permissionChange = changed === "permission" || changed === "directory-permission";
+				if (phase === "preparation" && permissionChange && !(await access(changed === "permission" ? input : directory,
+					changed === "permission" ? fsConstants.R_OK | fsConstants.W_OK : fsConstants.R_OK).then(() => true, () => false))) {
+					await expect(execute()).rejects.toThrow(); expect(await readFile(target, "utf8")).toBe("before\n");
+					await chmod(input, 0o666); await chmod(directory, 0o755); delayed = false; continue;
+				}
+				const branch = await execute(); delayed = false;
 				expect(branch.resources).toEqual(["output.txt"]);
 				expect(await readFile(target, "utf8")).toBe(phase === "preparation" && changed === target ? "actor\n" : "before\n");
 				if (phase === "execution") await alter();
-				const permissionChange = changed === "permission" || changed === "directory-permission";
 				const permissionDenied = permissionChange && !(await access(changed === "permission" ? input : directory,
 					changed === "permission" ? fsConstants.R_OK | fsConstants.W_OK : fsConstants.R_OK).then(() => true, () => false));
 				const commit = branch.commit();
@@ -1155,6 +1171,17 @@ describe("workspace-branch ExecutionWorld", () => {
 				await branch.dispose();
 				expect(await readFile(target, "utf8")).toBe(mode === "borrowed" ? "current\n" : "after\n");
 			} finally { notifications?.mockRestore(); await other.dispose(); }
+		}
+		if (process.platform !== "win32") {
+			const root = await temporaryRoot(), outside = path.join(root, "untouched"), name = path.join(root, "directory");
+			await mkdir(outside); await symlink(outside, name);
+			const preparation = await sandbox.prepare(root, { driver: "git" });
+			await unlink(name); await mkdir(path.join(name, "nested"), { recursive: true });
+			await expect(sandbox.fork({ cwd: root, driver: "git", preparation,
+				action: requiredAction("write", { path: "file", content: "" }, root), validate: async () => { throw new Error("stale symlink reached validation"); },
+				execute: async () => { throw new Error("stale symlink reached execution"); },
+			})).rejects.toThrow("snapshot directory type changed");
+			expect(await readdir(outside)).toEqual([]);
 		}
 	});
 
