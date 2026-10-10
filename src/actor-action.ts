@@ -26,6 +26,7 @@ type ActorActionState<Candidate extends { readonly id: string }, Output> =
 /** One owner for matching, the committed selection and exactly-once settlement. */
 export class ActorAction<Candidate extends { readonly id: string } = { readonly id: string }, Output = unknown> {
 	readonly identity: ActorActionIdentity;
+	readonly issuedAt: number;
 	readonly tool: string;
 	readonly actionKey?: ActionKey;
 	private readonly rejections: CandidateRejection[] = [];
@@ -33,10 +34,11 @@ export class ActorAction<Candidate extends { readonly id: string } = { readonly 
 	private fallbackValue: { readonly cause: ResolutionCause; readonly candidateID?: string };
 	private resultCapture?: AuthoritativeResultCapture<Output>;
 
-	constructor(input: Pick<ActorAction<Candidate, Output>, "identity" | "tool" | "actionKey"> & {
+	constructor(input: Pick<ActorAction<Candidate, Output>, "identity" | "issuedAt" | "tool" | "actionKey"> & {
 		readonly fallback: ResolutionCause;
 	}) {
 		this.identity = Object.freeze({ ...input.identity });
+		this.issuedAt = input.issuedAt;
 		this.tool = input.tool;
 		this.actionKey = input.actionKey;
 		this.fallbackValue = Object.freeze({ cause: input.fallback });

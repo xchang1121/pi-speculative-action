@@ -1,6 +1,6 @@
 /** Bounded observational evidence, independent of replay authority and output identity. */
 export interface SerializedTimelineComputation {
-	readonly version: 1 | 2;
+	readonly version: 1 | 2 | 3;
 	readonly root: string;
 	readonly nodes: readonly SerializedTimelineNode[];
 }
@@ -9,6 +9,8 @@ export interface SerializedTimelineNode {
 	readonly id: string;
 	/** Monotonic coordinate namespace; endpoints from different clocks are never compared. */
 	readonly clock: string;
+	/** Unix epoch origin of this monotonic clock, used only to compare Actor issue time. */
+	readonly timeOrigin?: number;
 	readonly startedAt: number;
 	readonly completedAt: number;
 	/** Explicit calculation segments; absence preserves historical continuous computation. */
@@ -34,13 +36,19 @@ export const TIMELINE_COMPUTATION_LIMITS = Object.freeze({ nodes: 256, edges: 10
 /** Invalid telemetry is unavailable evidence, not an invalid execution certificate. */
 export function normalizeTimelineComputation(value: unknown): SerializedTimelineComputation | undefined {
 	try {
-		if (!record(value) || value.version !== 1 && value.version !== 2 || !identity(value.root) || !Array.isArray(value.nodes) ||
+		if (!record(value) || ![1, 2, 3].includes(value.version as number) || !identity(value.root) || !Array.isArray(value.nodes) ||
 			!value.nodes.length || value.nodes.length > TIMELINE_COMPUTATION_LIMITS.nodes) return undefined;
 		const nodes: SerializedTimelineNode[] = [], byID = new Map<string, SerializedTimelineNode>();
+		const origins = new Map<string, number>();
 		let edges = 0, spans = 0, groups = 0;
 		for (const raw of value.nodes) {
 			if (!record(raw) || !identity(raw.id) || !identity(raw.clock) || byID.has(raw.id) || !endpoints(raw) ||
-				raw.priorMs !== undefined && !duration(raw.priorMs) || raw.incomplete !== undefined && typeof raw.incomplete !== "boolean") return undefined;
+				raw.priorMs !== undefined && !duration(raw.priorMs) || raw.timeOrigin !== undefined && !duration(raw.timeOrigin) ||
+				raw.incomplete !== undefined && typeof raw.incomplete !== "boolean") return undefined;
+			if (raw.timeOrigin !== undefined) {
+				if (origins.has(raw.clock) && origins.get(raw.clock) !== raw.timeOrigin) return undefined;
+				origins.set(raw.clock, raw.timeOrigin as number);
+			}
 			let producer: SerializedTimelineNode["producer"];
 			let calculation: SerializedTimelineNode["spans"];
 			if (raw.spans !== undefined) {
@@ -84,6 +92,7 @@ export function normalizeTimelineComputation(value: unknown): SerializedTimeline
 				}
 			}
 			const node = Object.freeze({ id: raw.id, clock: raw.clock, startedAt: raw.startedAt as number, completedAt: raw.completedAt as number,
+				...(raw.timeOrigin !== undefined ? { timeOrigin: raw.timeOrigin as number } : {}),
 				...(calculation ? { spans: calculation } : {}),
 				...(raw.priorMs !== undefined ? { priorMs: raw.priorMs as number } : {}), ...(producer ? { producer } : {}),
 				...(aliases?.length ? { groups: aliases } : {}), ...(raw.incomplete ? { incomplete: true as const } : {}),
@@ -109,7 +118,7 @@ export function normalizeTimelineComputation(value: unknown): SerializedTimeline
 			return true;
 		};
 		if (!visit(value.root) || visited.size !== nodes.length) return undefined;
-		const graph = Object.freeze({ version: value.version as 1 | 2, root: value.root, nodes: Object.freeze(nodes) });
+		const graph = Object.freeze({ version: value.version as 1 | 2 | 3, root: value.root, nodes: Object.freeze(nodes) });
 		return Buffer.byteLength(JSON.stringify(graph), "utf8") <= TIMELINE_COMPUTATION_LIMITS.bytes ? graph : undefined;
 	} catch { return undefined; }
 }

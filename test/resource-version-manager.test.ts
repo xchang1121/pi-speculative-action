@@ -451,8 +451,8 @@ describe("speculative action resource versions", () => {
 			const startedAt = now, evaluated = await TimelineInterval.measure(async () => { const output = await query(); now += 5; return output; }), timeline = new TaskTimeline(startedAt);
 			expect(evaluated.output).toBe("A"); expect(build).toHaveBeenCalledTimes(exhausted ? 2 : 1);
 			timeline.startToolWait(startedAt)(now);
-			timeline.recordTool(evaluated.computation);
-			expect(timeline.measure(now)).toMatchObject({ actorComputeMs: exhausted ? 25 : 5, reusedExecutionMs: exhausted ? 0 : 20,
+			timeline.recordTool(evaluated.computation, performance.now());
+			expect(timeline.measure(now)).toMatchObject({ toolComputeMs: 25, hiddenComputeMs: exhausted ? 0 : 20,
 				toolWaitMs: exhausted ? 55 : 5 });
 			expect(dispose).toHaveBeenCalledTimes(exhausted ? 2 : 0); expect(view.bytes).toBe(bytes);
 			expect(dependencies?.size).toBeGreaterThan(0);
@@ -494,8 +494,8 @@ describe("speculative action resource versions", () => {
 			});
 			expect(evaluation.output.toString()).toBe("accepted");
 			expect(rejected).toHaveBeenCalledOnce(); expect(accepted).toHaveBeenCalledOnce();
-			expect(new TaskTimeline(100).recordTool(evaluation.computation))
-				.toEqual({ actorComputeMs: 2, reusedExecutionMs: 30 });
+			expect(new TaskTimeline(100).recordTool(evaluation.computation, performance.now()))
+				.toMatchObject({ toolComputeMs: 32, hiddenComputeMs: 30 });
 		} finally { clock.mockRestore(); await reader.dispose(); await Promise.all(sources.map(view => view.dispose())); }
 	});
 
@@ -518,8 +518,8 @@ describe("speculative action resource versions", () => {
 				else expect(await pending).toEqual(mode === "accepted" ? Buffer.from("A") : undefined);
 				now += 3;
 			});
-			expect(new TaskTimeline(100).recordTool(new TimelineInterval(100, now, evaluation.dependencies)))
-				.toEqual({ actorComputeMs: 3, reusedExecutionMs: mode === "accepted" ? 40 : 0 });
+			expect(new TaskTimeline(100).recordTool(new TimelineInterval(100, now, evaluation.dependencies), performance.now()))
+				.toMatchObject({ toolComputeMs: mode === "accepted" ? 43 : 3, hiddenComputeMs: mode === "accepted" ? 40 : 0 });
 		} finally { clock.mockRestore(); await view.dispose(); expect(handle.fd).toBe(-1); }
 	});
 
@@ -540,8 +540,8 @@ describe("speculative action resource versions", () => {
 				}, async value => value), () => { now += 5; throw failure; })).rejects.toBe(failure);
 				now += 3;
 			});
-			expect(new TaskTimeline(200).recordTool(evaluation.computation))
-				.toEqual({ actorComputeMs: 23, reusedExecutionMs: 0 });
+			expect(new TaskTimeline(200).recordTool(evaluation.computation, performance.now()))
+				.toMatchObject({ toolComputeMs: 23, hiddenComputeMs: 0 });
 		} finally { clock.mockRestore(); await view.dispose(); }
 	});
 
@@ -917,8 +917,8 @@ describe("speculative action resource versions", () => {
 			expect(evaluation.output.output.result.content).toEqual([{ type: "text", text: "A" }]);
 			expect(retain).toHaveBeenCalledTimes(mode === "next-owner" ? 2 : 1);
 			expect(released).toHaveBeenCalledOnce();
-			expect(new TaskTimeline(200).recordTool(evaluation.computation))
-				.toEqual({ actorComputeMs: mode === "next-owner" ? 8 : 98, reusedExecutionMs: mode === "next-owner" ? 30 : 0 });
+			expect(new TaskTimeline(200).recordTool(evaluation.computation, performance.now()))
+				.toMatchObject({ toolComputeMs: mode === "next-owner" ? 38 : 98, hiddenComputeMs: mode === "next-owner" ? 30 : 0 });
 			expect(await evaluation.output.validate!()).toMatchObject({ status: "valid" });
 			await fs.writeFile(file, "changed");
 			expect(await evaluation.output.validate!()).toMatchObject({ status: "stale" });

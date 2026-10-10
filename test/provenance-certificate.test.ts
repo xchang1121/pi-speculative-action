@@ -31,7 +31,7 @@ describe("process provenance certificates", () => {
 		expect(parsed.result.computation).toEqual(computation);
 		expect(Object.isFrozen(parsed.result.computation)).toBe(true);
 		const restored = TimelineInterval.restore(parsed.result.computation)!;
-		expect(new TaskTimeline(0).recordTool(restored, true)).toMatchObject({ actorComputeMs: 0, reusedExecutionMs: 130 });
+		expect(new TaskTimeline(0).recordTool(restored, performance.now(), true)).toMatchObject({ toolComputeMs: 130, hiddenComputeMs: 130 });
 	});
 
 	it("ignores malformed accounting metadata without changing valid replay evidence", () => {

@@ -16,7 +16,7 @@ const actionKey = buildPiActionKey("read", { path: "file.ts" }, "/workspace", "s
 describe("ActorAction", () => {
 	it("owns candidate rejections and one authoritative provider", () => {
 		for (const provider of ["speculative", "preview"] as const) {
-			const action = new ActorAction<{ readonly id: string }, string>({
+			const action = new ActorAction<{ readonly id: string }, string>({ issuedAt: 100,
 				identity, tool: "read", actionKey, fallback: cause("matching", "no_candidate"),
 			});
 			const selection = { candidate: { id: "fresh" }, match: exact, output: "value",
@@ -52,7 +52,7 @@ describe("ActorAction", () => {
 	it("spans interception and exactly one Actor fallback completion", () => {
 		for (const mode of ["empty", "rejected", "interrupted"]) {
 			const execution = new TimelineInterval(0, 0);
-			const action = new ActorAction({ identity, tool: "bash", fallback: cause("matching", "no_candidate") });
+			const action = new ActorAction({ issuedAt: 100, identity, tool: "bash", fallback: cause("matching", "no_candidate") });
 			if (mode !== "empty") {
 				const failure = cause("execution", "tool_failed");
 				expect(mode === "rejected" ? action.rejectCandidate("failed", exact, failure) : action.setFallback(failure, "failed")).toBe(true);
@@ -72,13 +72,13 @@ describe("ActorAction", () => {
 
 	it("reports an isolation-blocked fallback without inventing completed computation", () => {
 		const execution = new TimelineInterval(100, 220), timeline = new TaskTimeline(0);
-		const action = new ActorAction({ identity, tool: "bash", actionKey,
+		const action = new ActorAction({ issuedAt: 100, identity, tool: "bash", actionKey,
 			fallback: cause("execution", "isolation_unavailable") });
 		expect(action.deferToFallback([prediction])?.status).toBe("rejected");
 		expect(action.settleActor(execution, false)).toMatchObject({ matchedPredictions: [prediction], provider: { kind: "actor", durationMs: 120 } });
 		expect(action.settlement?.provider.toolExecution).toBe(execution);
-		timeline.recordTool(action.settlement!.provider.toolExecution);
-		expect(timeline.measure(500)).toMatchObject({ actorComputeMs: 120, reusedExecutionMs: 0 });
+		timeline.recordTool(action.settlement!.provider.toolExecution, 100_000);
+		expect(timeline.measure(500)).toMatchObject({ toolComputeMs: 120, hiddenComputeMs: 0 });
 	});
 });
 

@@ -363,7 +363,7 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 		startTurn: (input, signal) => runtime.startTurn({ ...input, sessionID }, signal),
 		previewActorTool: (input, signal) => runtime.previewActorTool({ ...input, sessionID }, signal),
 		previewActorCall: (input, signal) => runtime.previewActorCall({ ...input, sessionID, [RAW_ACTOR_CALL]: true } as BoundActorCall, signal),
-		execute: (input, signal, executor) => runtime.trackActorTool(sessionID, async () => {
+		execute: (input, signal, executor) => runtime.trackActorTool(sessionID, async issuedAt => {
 			const operation: ToolOperation = {
 				tool: input.tool,
 				input: immutableSnapshot(input.args),
@@ -409,7 +409,7 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 				...(actorCall
 					? {
 							reuse: async () => {
-								prepared = await runtime.prepareActorCall(actorCall, signal);
+								prepared = await runtime.prepareActorCall(actorCall, signal, issuedAt);
 								const output = prepared?.output;
 								if (output?.isError) throw ToolExecutionGateway.reusedFailure(output.result.content.flatMap((item) => item.type === "text" ? [item.text] : []).join("\n"));
 								return output?.result;

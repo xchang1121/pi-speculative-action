@@ -214,7 +214,7 @@ export function formatSpeculativeActionStatus(input: {
 		metrics.tasks > 0
 			? `Tool timing (${metrics.tasks} completed tasks): ${formatTaskTiming(metrics)}.`
 			: "Tool timing: n/a (no completed task).",
-		`Prediction Drafter tokens (input + output): ${metrics.totalDraftTokens}${metrics.reusedExecutionMs > 0 && !metrics.reusedExecutionIncomplete ? `; ${Math.round(metrics.totalDraftTokens * 1000 / metrics.reusedExecutionMs)} per second of gross tool time saved` : ""}`,
+		`Prediction Drafter tokens (input + output): ${metrics.totalDraftTokens}${metrics.hiddenComputeMs > 0 && !metrics.hiddenComputeIncomplete ? `; ${Math.round(metrics.totalDraftTokens * 1000 / metrics.hiddenComputeMs)} per second of tool computation hidden` : ""}`,
 		`Live speculative results: ${cache.resultEntries}/${cache.cacheCapacity}, ${formatBytes(cache.resultBytes)}/${formatBytes(cache.cacheByteCapacity ?? 0)}; cold: ${cache.cacheCold}; hot: ${cache.cacheHot}; jobs: ${cache.inFlightJobs}; branches: ${cache.branchEntries} (${formatBytes(cache.branchBytes)})`,
 	].join("\n");
 }
@@ -1388,7 +1388,7 @@ function formatSpeculativeFooter(
 	const storedBytes = storageWorlds.reduce((total, world) => total + (world.storage?.bytes ?? 0), 0);
 	return [
 		"spec: on",
-		metrics.tasks > 0 ? `${formatSpeedup(metrics)}; ${formatGrossReuse(metrics)}` : "Tool SpeedUp n/a",
+		metrics.tasks > 0 ? `${formatSpeedup(metrics)}; ${formatHiddenCompute(metrics)}` : "Tool SpeedUp n/a",
 		`tools reused ${formatRatio(metrics.speculativeHits, metrics.actorActions)}`,
 		...(hasProcessReuse(reuse) ? [`Bash Actor ${formatActorProcessFooter(reuse)}`] : []),
 		`live results ${metrics.cache.resultEntries}/${metrics.cache.cacheCapacity} (${formatBytes(metrics.cache.resultBytes)})`,
@@ -1443,7 +1443,7 @@ function tallySummary(counts: Readonly<Record<string, readonly number[]>>, forma
 function modeSummary(sources: SpeculativeTraceSummary["modesBySource"]): string {
 	return Object.entries(sources).flatMap(([source, modes]) => Object.entries(modes).map(([mode, result]) => {
 		const label = source === "pattern_aware" ? PATTERN_AWARE_PRESETS.find(preset => preset.id === mode)?.label ?? mode : `${source}/${mode}`;
-		return `${label}: ${result.matched}/${result.observed} matched, ${result.adopted} adopted; ${formatDuration(result.reusedExecutionMs)} gross reused, ${formatDuration(result.productionMs)} production wall (${result.started} started)`;
+		return `${label}: ${result.matched}/${result.observed} matched, ${result.adopted} adopted; ${formatDuration(result.hiddenComputeMs)} hidden, ${formatDuration(result.productionMs)} production wall (${result.started} started)`;
 	})).join("; ") || "none";
 }
 
@@ -1454,20 +1454,20 @@ function countSummary(counts: Readonly<Record<string, number>>): string {
 	return entries.length > 0 ? entries.map(([key, count]) => `${key}=${count}`).join(", ") : "none";
 }
 
-type TimingSummary = Pick<SpeculativeTraceSummary, "actorComputeMs" | "reusedExecutionMs"> & { readonly reusedExecutionIncomplete?: true };
+type TimingSummary = Pick<SpeculativeTraceSummary, "toolComputeMs" | "hiddenComputeMs"> & { readonly hiddenComputeIncomplete?: true };
 
-function formatGrossReuse(timing: TimingSummary): string {
-	return `${formatDuration(timing.reusedExecutionMs)} gross tool time saved${timing.reusedExecutionIncomplete ? " (known lower bound)" : ""}`;
+function formatHiddenCompute(timing: TimingSummary): string {
+	return `${formatDuration(timing.hiddenComputeMs)} tool computation hidden${timing.hiddenComputeIncomplete ? " (known lower bound)" : ""}`;
 }
 
 function formatTaskTiming(timing: TimingSummary): string {
-	return `${formatSpeedup(timing)}; ${formatGrossReuse(timing)}; ` +
-		`${formatDuration(timing.actorComputeMs ?? NaN)} Actor computation`;
+	return `${formatSpeedup(timing)}; ${formatHiddenCompute(timing)}; ` +
+		`${formatDuration(timing.toolComputeMs ?? NaN)} total tool computation`;
 }
 
 function formatSpeedup(timing: TimingSummary): string {
 	const ratio = toolSpeedup(timing);
-	return `Tool SpeedUp ${ratio === null ? !timing.reusedExecutionIncomplete && timing.actorComputeMs === 0 && timing.reusedExecutionMs > 0 ? "fully reused" : "n/a" : `${ratio.toFixed(2)}x`}`;
+	return `Tool SpeedUp ${ratio === null ? !timing.hiddenComputeIncomplete && Number.isFinite(timing.toolComputeMs) && timing.toolComputeMs === timing.hiddenComputeMs && timing.hiddenComputeMs > 0 ? "fully hidden" : "n/a" : `${ratio.toFixed(2)}x`}`;
 }
 
 function formatDuration(ms: number): string {

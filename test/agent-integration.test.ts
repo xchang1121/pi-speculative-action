@@ -422,7 +422,7 @@ describe("speculative action host", () => {
 		let now = 1000, prepared: TimelineInterval | undefined;
 		vi.spyOn(performance, "now").mockImplementation(() => now);
 		const unrelated = new TimelineInterval(0, 200);
-		TimelineInterval.producedBy(unrelated, { source: "pattern_aware", mode: "reported-files", feedback: {} });
+		TimelineInterval.producedBy(unrelated, { source: "pattern_aware", mode: "reported-files" });
 		const { host, events } = drafterHost("partial-drafter", { cwd,
 			getSettings: () => ({ ...settings(), drafterMaxDepth: 0 }), complete: async () => drafterCall({ path: "notes.txt" }),
 			executionWorlds: [mockRuntimeWorld(async () => {
@@ -440,7 +440,7 @@ describe("speculative action host", () => {
 			const actors = events.filter(event => event.type === "actor_action");
 			expect(actors).toHaveLength(2);
 			for (const actor of actors) expect(actor).toMatchObject({ settlement: { provider: { kind: "actor", origin: "fallback" } },
-				computation: { actorComputeMs: 40, reusedExecutionMs: 320 } });
+				computation: { toolComputeMs: 360, hiddenComputeMs: 320 } });
 			expect(host.drafterBudgetSnapshot()).toMatchObject({ budget: { requests: 1 } });
 			expect(JSON.stringify(actors)).not.toContain("drafter_plan");
 		} finally { await host.dispose(); }
@@ -781,7 +781,7 @@ describe("speculative action host", () => {
 			expect(findActor).not.toHaveBeenCalled();
 			await host.finishTurn(call.turnID, true);
 			expect(summarizeSpeculativeTrace(events)).toMatchObject({ inputReuseHits: 8, exactReuseHits: 0, predictionsMatched: 0 });
-			expect(summarizeSpeculativeTrace(events).reusedExecutionMs, "consumed cross-tool inputs and preparations save work without an exact tool hit").toBeGreaterThan(0);
+			expect(summarizeSpeculativeTrace(events).hiddenComputeMs, "consumed cross-tool inputs and preparations save work without an exact tool hit").toBeGreaterThan(0);
 		} finally { await host.dispose(); await profile.pool.dispose(); }
 	});
 

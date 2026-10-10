@@ -946,11 +946,11 @@ int main(int argc, char **argv) {
 			const execution = events.filter(event => event.type === "actor_action")
 				.find(event => event.turnID === "prepared")!.settlement.provider.toolExecution;
 			const timeline = new TaskTimeline(0), laterTask = new TaskTimeline(execution.startedAt);
-			for (const clock of [timeline, laterTask]) clock.recordTool(execution);
+			for (const clock of [timeline, laterTask]) clock.recordTool(execution, performance.now());
 			const timing = timeline.measure(execution.completedAt);
-			expect(laterTask.measure(execution.completedAt).reusedExecutionMs).toBe(timing.reusedExecutionMs);
-			if (stalePreparation) expect(timing.reusedExecutionMs, JSON.stringify({ execution, metrics: fixture.backend.actorMetrics(), operations: events.filter(event => event.type === "operation_prediction") })).toBe(0);
-			else expect(timing.reusedExecutionMs,
+			expect(laterTask.measure(execution.completedAt).hiddenComputeMs).toBe(timing.hiddenComputeMs);
+			if (stalePreparation) expect(timing.hiddenComputeMs, JSON.stringify({ execution, metrics: fixture.backend.actorMetrics(), operations: events.filter(event => event.type === "operation_prediction") })).toBe(0);
+			else expect(timing.hiddenComputeMs,
 				JSON.stringify({ execution, metrics: fixture.backend.actorMetrics(), producer: fixture.backend.metrics(), bindings: fixture.backend.executionBindings(later), operations: events.filter(event => event.type === "operation_prediction") })).toBeGreaterThan(0);
 			expect(events.filter(event => event.type === "operation_prediction").filter(event => !launcher || stalePreparation || event.settlement.observation === "observed")).toMatchObject(Array.from({ length: launcher && stalePreparation ? 2 : 1 }, () => ({ settlement: stalePreparation ? { observation: "unobserved" } : {
 				prediction: { source: "pattern_aware", kind: "operation" }, observation: "observed", match: { matched: true, adoption: { status: "adopted" } },

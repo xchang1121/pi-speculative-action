@@ -97,15 +97,15 @@ describe("zero-modification Pi extension", () => {
 		expect(fixture.host.finishTurn).toHaveBeenLastCalledWith("turn_2", true);
 	});
 
-	it("reports gross computation speedup without adoption or model time in the denominator", () => {
-		const timing = { toolWaitMs: 400, actorComputeMs: 80, reusedExecutionMs: 120 };
+	it("reports hidden computation speedup without adoption or model time in the denominator", () => {
+		const timing = { toolWaitMs: 400, toolComputeMs: 200, hiddenComputeMs: 120 };
 		expect(formatSpeculativeActionEvent({ type: "task", sessionID: "s", turnID: "t", timing } as never)).toContain(
-			"Tool SpeedUp 2.50x; 120ms gross tool time saved; 80ms Actor computation");
-		for (const [actorComputeMs, reusedExecutionMs, ratio] of [[1000, 0, "1.00x"], [0, 0, "n/a"], [0, 1000, "fully reused"], [undefined, 1000, "n/a"], [1000, NaN, "n/a"]] as const)
-			expect(formatSpeculativeActionEvent({ type: "task", sessionID: "s", turnID: "t", timing: { actorComputeMs, reusedExecutionMs } } as never)).toContain(`Tool SpeedUp ${ratio}`);
-		for (const actorComputeMs of [0, 80]) expect(formatSpeculativeActionEvent({ type: "task", sessionID: "s", turnID: "t",
-			timing: { ...timing, actorComputeMs, reusedExecutionIncomplete: true } } as never)).toContain(
-			"Tool SpeedUp n/a; 120ms gross tool time saved (known lower bound)");
+			"Tool SpeedUp 2.50x; 120ms tool computation hidden; 200ms total tool computation");
+		for (const [toolComputeMs, hiddenComputeMs, ratio] of [[1000, 0, "1.00x"], [0, 0, "n/a"], [1000, 1000, "fully hidden"], [0, 1000, "n/a"], [Infinity, Infinity, "n/a"], [undefined, 1000, "n/a"], [1000, NaN, "n/a"]] as const)
+			expect(formatSpeculativeActionEvent({ type: "task", sessionID: "s", turnID: "t", timing: { toolComputeMs, hiddenComputeMs } } as never)).toContain(`Tool SpeedUp ${ratio}`);
+		for (const toolComputeMs of [0, 80]) expect(formatSpeculativeActionEvent({ type: "task", sessionID: "s", turnID: "t",
+			timing: { ...timing, toolComputeMs, hiddenComputeIncomplete: true } } as never)).toContain(
+			"Tool SpeedUp n/a; 120ms tool computation hidden (known lower bound)");
 	});
 
 	it("sends Drafter requests as simple options through the provider with registry auth", async () => {
@@ -183,7 +183,7 @@ describe("zero-modification Pi extension", () => {
 		expect(result?.content).toEqual([{ type: "text", text: "authoritative" }]);
 		expect(fixture.host.runtime.prepareActorCall).toHaveBeenCalledWith(expect.objectContaining({
 			tool: "read", args: { path: "notes.txt" },
-		}), undefined);
+		}), undefined, expect.any(Number));
 		if (mode === "cache") expect(fixture.settle).not.toHaveBeenCalled();
 		else expect(fixture.settle).toHaveBeenCalledWith(expect.any(TimelineInterval), { result, isError: false }, undefined);
 	});

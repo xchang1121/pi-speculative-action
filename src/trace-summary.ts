@@ -12,8 +12,8 @@ export interface ModeTraceSummary {
 	readonly started: number;
 	/** Measured speculative production wall time, including failed and cancelled work. */
 	readonly productionMs: number;
-	/** Gross computation actually consumed by Actor calls, attributed to the execution owner. */
-	readonly reusedExecutionMs: number;
+	/** Calculation hidden before Actor calls, attributed to the execution owner. */
+	readonly hiddenComputeMs: number;
 }
 type ModesBySource = Readonly<Record<string, Readonly<Record<string, ModeTraceSummary>>>>;
 
@@ -47,8 +47,8 @@ export function emptySpeculativeTraceSummary(cache: SpeculativeCacheSnapshot | P
 		actorFallbacks: 0,
 		hitRate: 0,
 		actorCandidateRejections: {} as Readonly<Record<string, number>>,
-		tasks: 0, actorComputeMs: 0 as number | undefined, toolWaitMs: 0, reusedExecutionMs: 0,
-		reusedExecutionIncomplete: undefined as true | undefined,
+		tasks: 0, toolComputeMs: 0 as number | undefined, toolWaitMs: 0, hiddenComputeMs: 0,
+		hiddenComputeIncomplete: undefined as true | undefined,
 		totalDraftTokens: 0,
 		processReuse: emptyWorldReuseMetrics(), // Inside speculative worlds, never the Actor route.
 		cache: { ...EMPTY_CACHE, ...cache },
@@ -73,8 +73,8 @@ export function reduceSpeculativeTrace<SessionID>(
 		next.modesBySource = addMode(current.modesBySource, event.candidate.source, event.candidate.mode,
 			event.state.status === "running" ? { started: 1 } : { productionMs: metric(event.state.executionMs) });
 	} else if (event.type === "actor_action") {
-		for (const timing of event.computation?.reusedByMode ?? []) next.modesBySource = addMode(next.modesBySource, timing.source, timing.mode,
-			{ reusedExecutionMs: metric(timing.reusedExecutionMs) });
+		for (const timing of event.computation?.hiddenByMode ?? []) next.modesBySource = addMode(next.modesBySource, timing.source, timing.mode,
+			{ hiddenComputeMs: metric(timing.hiddenComputeMs) });
 	}
 	switch (event.type) {
 		case "operation_prediction":
@@ -84,11 +84,11 @@ export function reduceSpeculativeTrace<SessionID>(
 			break;
 		case "task":
 			next.tasks++;
-			next.actorComputeMs = current.actorComputeMs !== undefined && event.timing.actorComputeMs !== undefined
-				? current.actorComputeMs + metric(event.timing.actorComputeMs) : undefined;
+			next.toolComputeMs = current.toolComputeMs !== undefined && event.timing.toolComputeMs !== undefined
+				? current.toolComputeMs + metric(event.timing.toolComputeMs) : undefined;
 			next.toolWaitMs += metric(event.timing.toolWaitMs);
-			next.reusedExecutionMs += metric(event.timing.reusedExecutionMs);
-			next.reusedExecutionIncomplete = current.reusedExecutionIncomplete || event.timing.reusedExecutionIncomplete;
+			next.hiddenComputeMs += metric(event.timing.hiddenComputeMs);
+			next.hiddenComputeIncomplete = current.hiddenComputeIncomplete || event.timing.hiddenComputeIncomplete;
 			break;
 		case "source_request":
 			next.sourceRequests++;
@@ -199,7 +199,7 @@ function increment(target: Readonly<Record<string, number>>, key: string): Recor
 function addMode(target: ModesBySource, source: string, mode: string, delta: Partial<ModeTraceSummary>): ModesBySource {
 	const modes = Object.hasOwn(target, source) ? target[source]! : {};
 	const current = Object.hasOwn(modes, mode) ? modes[mode]! : {
-		observed: 0, matched: 0, adopted: 0, started: 0, productionMs: 0, reusedExecutionMs: 0,
+		observed: 0, matched: 0, adopted: 0, started: 0, productionMs: 0, hiddenComputeMs: 0,
 	};
 	const next = { ...current };
 	for (const key of Object.keys(delta) as (keyof ModeTraceSummary)[]) next[key] += metric(delta[key]);

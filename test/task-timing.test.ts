@@ -1,8 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { deferred } from "./async.ts";
-import { TaskTimeline, TimelineInterval, toolSpeedup, normalizeTimelineComputation, TIMELINE_COMPUTATION_LIMITS, type ComputationReuseShare } from "../src/task-timing.ts";
+import { TaskTimeline, TimelineInterval, toolSpeedup, normalizeTimelineComputation, TIMELINE_COMPUTATION_LIMITS } from "../src/task-timing.ts";
 
-describe("gross Actor computation and successful reuse", () => {
+describe("consumed calculation and time hidden before Actor issue", () => {
 	it("records calculation segments without clocks or receipts for control work", async () => {
 		let now = 0;
 		const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
@@ -20,8 +20,8 @@ describe("gross Actor computation and successful reuse", () => {
 			});
 			const graph = TimelineInterval.serialize(evaluation.computation)!;
 			expect(graph.nodes.flatMap(node => node.inputs ?? []).some(input => input.overhead)).toBe(false);
-			expect(new TaskTimeline(0).recordTool(evaluation.computation)).toEqual({ actorComputeMs: 30, reusedExecutionMs: 40 });
-			expect(new TaskTimeline(0).recordTool(TimelineInterval.restore(graph)!, true)).toEqual({ actorComputeMs: 0, reusedExecutionMs: 70 });
+			expect(new TaskTimeline(0).recordTool(evaluation.computation, 100_000)).toMatchObject({ toolComputeMs: 70, hiddenComputeMs: 40 });
+			expect(new TaskTimeline(0).recordTool(TimelineInterval.restore(graph)!, 100_000, true)).toMatchObject({ toolComputeMs: 70, hiddenComputeMs: 70 });
 			clock.mockClear();
 			await TimelineInterval.outside(() => { now += 1000; });
 			expect(clock).not.toHaveBeenCalled();
@@ -43,63 +43,72 @@ describe("gross Actor computation and successful reuse", () => {
 					now = 30; first.resolve(); await failure;
 					now = 40; second.resolve(); await other;
 					now = 50;
-					expect(new TaskTimeline(0).recordTool(TimelineInterval.current(5, 50))).toEqual({ actorComputeMs: 15, reusedExecutionMs: 0 });
+					expect(new TaskTimeline(0).recordTool(TimelineInterval.current(5, 50), 100_000)).toMatchObject({ toolComputeMs: 15, hiddenComputeMs: 0 });
 				});
 				TimelineInterval.own(child.computation); now = 60;
 			});
-			expect(new TaskTimeline(0).recordTool(evaluation.computation)).toEqual({ actorComputeMs: 30, reusedExecutionMs: 0 });
+			expect(new TaskTimeline(0).recordTool(evaluation.computation, 100_000)).toMatchObject({ toolComputeMs: 30, hiddenComputeMs: 0 });
 		} finally { clock.mockRestore(); }
 	});
 
 	it("unions complete and interrupted tool waits without using them as the computation denominator", () => {
 		const timeline = new TaskTimeline(100);
-		timeline.recordTool(new TimelineInterval(0, 100));
-		timeline.recordTool(new TimelineInterval(110, 130), true);
+		timeline.recordTool(new TimelineInterval(0, 100), 100_000);
+		timeline.recordTool(new TimelineInterval(110, 130), 100_000, true);
 		timeline.startToolWait(140)(170);
 		timeline.startToolWait(150)(180);
 		const interrupted = timeline.startToolWait(190);
-		expect(timeline.measure(200)).toMatchObject({ toolWaitMs: 50, actorComputeMs: 100, reusedExecutionMs: 20 });
+		expect(timeline.measure(200)).toMatchObject({ toolWaitMs: 50, toolComputeMs: 120, hiddenComputeMs: 20 });
 		expect(toolSpeedup(timeline.measure(200))).toBe(1.2);
 		interrupted(195); interrupted(250);
 		expect(timeline.measure(200).toolWaitMs).toBe(45);
 		expect(toolSpeedup(timeline.measure(200))).toBe(1.2);
 		expect(toolSpeedup(new TaskTimeline(200).measure(300))).toBeNull();
-		for (const actorComputeMs of [0, -1, NaN, Infinity]) expect(toolSpeedup({ actorComputeMs, reusedExecutionMs: 20 })).toBeNull();
-		for (const reusedExecutionMs of [-1, NaN, Infinity]) expect(toolSpeedup({ actorComputeMs: 50, reusedExecutionMs })).toBeNull();
-		expect(toolSpeedup({ actorComputeMs: 50, reusedExecutionMs: 100, reusedExecutionIncomplete: true })).toBeNull();
+		for (const toolComputeMs of [0, -1, NaN, Infinity]) expect(toolSpeedup({ toolComputeMs, hiddenComputeMs: 20 })).toBeNull();
+		for (const hiddenComputeMs of [-1, NaN, Infinity]) expect(toolSpeedup({ toolComputeMs: 50, hiddenComputeMs })).toBeNull();
+		expect(toolSpeedup({ toolComputeMs: 150, hiddenComputeMs: 100, hiddenComputeIncomplete: true })).toBeNull();
 	});
 
 	it.each([
-		{ name: "native work without reuse", computation: new TimelineInterval(0, 100), reused: false,
-			expected: { actorComputeMs: 100, reusedExecutionMs: 0 }, speedup: 1 },
-		{ name: "a fully adopted result", computation: new TimelineInterval(0, 100), reused: true,
-			expected: { actorComputeMs: 0, reusedExecutionMs: 100 }, speedup: null },
+		{ name: "native work without reuse", computation: new TimelineInterval(0, 100), issuedAt: 0, reused: false,
+			expected: { toolComputeMs: 100, hiddenComputeMs: 0 }, speedup: 1 },
+		{ name: "a completed result", computation: new TimelineInterval(0, 100), issuedAt: 200, reused: true,
+			expected: { toolComputeMs: 100, hiddenComputeMs: 100 }, speedup: null },
+		{ name: "an in-flight result", computation: new TimelineInterval(0, 100), issuedAt: 40, reused: true,
+			expected: { toolComputeMs: 100, hiddenComputeMs: 40 }, speedup: 100 / 60 },
+		{ name: "a result started after issue", computation: new TimelineInterval(10, 110), issuedAt: 5, reused: true,
+			expected: { toolComputeMs: 100, hiddenComputeMs: 0 }, speedup: 1 },
+		{ name: "a partially executed prefix with a resumed tail", computation: new TimelineInterval(100, 104, [
+			{ computation: new TimelineInterval(0, 6), reused: true },
+		]), issuedAt: 4, reused: false, expected: { toolComputeMs: 10, hiddenComputeMs: 4 }, speedup: 10 / 6 },
+		{ name: "disjoint calculation segments", computation: new TimelineInterval(0, 10, [], [new TimelineInterval(0, 1), new TimelineInterval(9, 10)]), issuedAt: 5, reused: true,
+			expected: { toolComputeMs: 2, hiddenComputeMs: 1 }, speedup: 2 },
 		{ name: "fresh work using a prepared input", computation: new TimelineInterval(100, 110, [
 			{ computation: new TimelineInterval(10, 50), reused: true },
-		]), reused: false, expected: { actorComputeMs: 10, reusedExecutionMs: 40 }, speedup: 5 },
-	])("measures $name independently of adoption wait", ({ computation, reused, expected, speedup }) => {
+		]), issuedAt: 100, reused: false, expected: { toolComputeMs: 50, hiddenComputeMs: 40 }, speedup: 5 },
+	])("measures $name independently of adoption wait", ({ computation, issuedAt, reused, expected, speedup }) => {
 		const timeline = new TaskTimeline(100);
 		timeline.startToolWait(200)(450);
-		expect(timeline.recordTool(computation, reused)).toEqual(expected);
+		expect(timeline.recordTool(computation, issuedAt, reused)).toEqual({ ...expected, ...(reused || expected.hiddenComputeMs > 0 ? { reused: true } : {}) });
 		expect(timeline.measure(450)).toMatchObject({ ...expected, toolWaitMs: 250 });
 		expect(toolSpeedup(timeline.measure(450))).toBe(speedup);
 	});
 
-	it("credits a consumed input's full execution while removing its overlapping join from fresh work", () => {
+	it("keeps a producer's post-issue calculation in the denominator and removes overlapping join waits", () => {
 		const child = new TimelineInterval(20, 150), timeline = new TaskTimeline(100);
 		timeline.recordTool(new TimelineInterval(100, 170, [{ computation: child, reused: true, shared: [
 			new TimelineInterval(105, 140), new TimelineInterval(130, 150),
-		] }]));
-		expect(timeline.measure(170)).toMatchObject({ actorComputeMs: 25, reusedExecutionMs: 130 });
+		] }]), 100);
+		expect(timeline.measure(170)).toMatchObject({ toolComputeMs: 155, hiddenComputeMs: 80 });
 		const repeated = new TaskTimeline(100);
-		repeated.recordTool(new TimelineInterval(100, 170, [{ computation: child, reused: true }, { computation: child, reused: true }]));
-		expect(repeated.measure(170)).toMatchObject({ actorComputeMs: 70, reusedExecutionMs: 130 });
+		repeated.recordTool(new TimelineInterval(100, 170, [{ computation: child, reused: true }, { computation: child, reused: true }]), 100);
+		expect(repeated.measure(170)).toMatchObject({ toolComputeMs: 200, hiddenComputeMs: 80 });
 	});
 
 	it("sums independent native calls even when their clocks overlap", () => {
 		const timeline = new TaskTimeline(0);
-		for (const end of [100, 90, 70]) timeline.recordTool(new TimelineInterval(40, end));
-		expect(timeline.measure(100)).toMatchObject({ actorComputeMs: 140, reusedExecutionMs: 0 });
+		for (const end of [100, 90, 70]) timeline.recordTool(new TimelineInterval(40, end), 100_000);
+		expect(timeline.measure(100)).toMatchObject({ toolComputeMs: 140, hiddenComputeMs: 0 });
 		expect(toolSpeedup(timeline.measure(100))).toBe(1);
 	});
 
@@ -110,12 +119,12 @@ describe("gross Actor computation and successful reuse", () => {
 		expect(first.completedAt).toBe(160);
 		expect(TimelineInterval.from(first)).toBe(first);
 		expect(Reflect.set(first, "completedAt", 1000)).toBe(false);
-		expect(timeline.recordCall([first, first, second].map(computation => ({ computation, reused: true }))))
-			.toEqual({ actorComputeMs: 0, reusedExecutionMs: 80 });
-		for (let repeat = 0; repeat < 3; repeat++) timeline.recordTool(first, true);
-		expect(timeline.measure(300)).toMatchObject({ actorComputeMs: 0, reusedExecutionMs: 200 });
+		expect(timeline.recordCall([first, first, second].map((computation, index) => ({ computation, reused: index > 0 })), 200))
+			.toMatchObject({ toolComputeMs: 80, hiddenComputeMs: 80 });
+		for (let repeat = 0; repeat < 3; repeat++) timeline.recordTool(first, 210 + repeat * 10, true);
+		expect(timeline.measure(300)).toMatchObject({ toolComputeMs: 200, hiddenComputeMs: 200 });
 		expect(new TimelineInterval(Number.NaN, -1)).toEqual({ startedAt: 0, completedAt: 0 });
-		expect(timeline.recordTool(new TimelineInterval(140, 120))).toEqual({ actorComputeMs: 0, reusedExecutionMs: 0 });
+		expect(timeline.recordTool(new TimelineInterval(140, 120), 140)).toMatchObject({ toolComputeMs: 0, hiddenComputeMs: 0 });
 	});
 
 	it("isolates concurrent evaluations and excludes rejected input work from their callers", async () => {
@@ -128,8 +137,8 @@ describe("gross Actor computation and successful reuse", () => {
 			const timeline = new TaskTimeline(100);
 			timeline.startToolWait(100)(110);
 			const accepted = new TimelineInterval(100, 110, evaluation.dependencies);
-			expect(timeline.recordTool(accepted)).toEqual({ actorComputeMs: 10, reusedExecutionMs: saved });
-			expect(timeline.measure(110)).toMatchObject({ actorComputeMs: 10, reusedExecutionMs: saved, toolWaitMs: 10 });
+			expect(timeline.recordTool(accepted, 100)).toMatchObject({ toolComputeMs: 10 + saved, hiddenComputeMs: saved });
+			expect(timeline.measure(110)).toMatchObject({ toolComputeMs: 10 + saved, hiddenComputeMs: saved, toolWaitMs: 10 });
 		}
 	});
 
@@ -139,9 +148,9 @@ describe("gross Actor computation and successful reuse", () => {
 		const timeline = new TaskTimeline(100);
 		timeline.startToolWait(100)(110);
 		timeline.recordTool(new TimelineInterval(100, 110, (liveFirst ? [live, cached, cached, other] : [cached, live, other])
-			.map(computation => ({ computation, reused: true }))));
-		expect(timeline.measure(110)).toMatchObject({ actorComputeMs: 10, reusedExecutionMs: 45 });
-		expect(toolSpeedup(timeline.measure(110))).toBe(5.5);
+			.map(computation => ({ computation, reused: true }))), 100_000);
+		expect(timeline.measure(110)).toMatchObject({ toolComputeMs: 55, hiddenComputeMs: 40, hiddenComputeIncomplete: true });
+		expect(toolSpeedup(timeline.measure(110))).toBeNull();
 	});
 
 	it.each([false, true])("preserves owned parallelism and credits the work independently consumed by later calls (adopted=%s)", async adopted => {
@@ -151,14 +160,14 @@ describe("gross Actor computation and successful reuse", () => {
 		const query = new TimelineInterval(100, 110, borrowed.dependencies);
 		for (const childFirst of [false, true]) {
 			const measured = new TaskTimeline(0);
-			for (const computation of childFirst ? [query, parent] : [parent, query]) measured.recordTool(computation, computation === parent && adopted);
-			expect(measured.measure(110)).toMatchObject({ actorComputeMs: adopted ? 10 : 90, reusedExecutionMs: adopted ? 140 : 60 });
-			measured.recordTool(new TimelineInterval(115, 120, [{ computation: TimelineInterval.retained("external", 7), reused: true }]));
-			expect(measured.measure(120)).toMatchObject({ actorComputeMs: adopted ? 15 : 95, reusedExecutionMs: adopted ? 147 : 67 });
+			for (const computation of childFirst ? [query, parent] : [parent, query]) measured.recordTool(computation, 100_000, computation === parent && adopted);
+			expect(measured.measure(110)).toMatchObject({ toolComputeMs: 150, hiddenComputeMs: adopted ? 140 : 60 });
+			measured.recordTool(new TimelineInterval(115, 120, [{ computation: TimelineInterval.retained("external", 7), reused: true }]), 100_000);
+			expect(measured.measure(120)).toMatchObject({ toolComputeMs: 162, hiddenComputeMs: adopted ? 140 : 60, hiddenComputeIncomplete: true });
 		}
 		const partial = new TaskTimeline(0);
-		partial.recordTool(query);
-		expect(partial.measure(110)).toMatchObject({ actorComputeMs: 10, reusedExecutionMs: 60 });
+		partial.recordTool(query, 100_000);
+		expect(partial.measure(110)).toMatchObject({ toolComputeMs: 70, hiddenComputeMs: 60 });
 	});
 
 	it("snapshots dependency joins without double-counting them as fresh computation", () => {
@@ -168,30 +177,30 @@ describe("gross Actor computation and successful reuse", () => {
 		inputs.length = 0;
 		expect(JSON.stringify(native)).toBe('{"startedAt":100,"completedAt":170}');
 		const timeline = new TaskTimeline(0);
-		expect(timeline.recordTool(native)).toEqual({ actorComputeMs: 25, reusedExecutionMs: 130 });
-		timeline.recordTool(child, true);
-		expect(timeline.measure(170)).toMatchObject({ actorComputeMs: 25, reusedExecutionMs: 260 });
+		expect(timeline.recordTool(native, 100_000)).toMatchObject({ toolComputeMs: 155, hiddenComputeMs: 130 });
+		timeline.recordTool(child, 100_000, true);
+		expect(timeline.measure(170)).toMatchObject({ toolComputeMs: 285, hiddenComputeMs: 260 });
 		const serialChild = new TimelineInterval(100, 150), serial = new TaskTimeline(0);
-		serial.recordTool(new TimelineInterval(100, 160, [{ computation: serialChild, reused: true, shared: [serialChild] }]));
-		expect(serial.measure(160)).toMatchObject({ actorComputeMs: 10, reusedExecutionMs: 50 });
+		serial.recordTool(new TimelineInterval(100, 160, [{ computation: serialChild, reused: true, shared: [serialChild] }]), 100_000);
+		expect(serial.measure(160)).toMatchObject({ toolComputeMs: 60, hiddenComputeMs: 50 });
 	});
 
 	it.each([false, true])("deduplicates a parent's overlapping input roots while retaining independent work (child first=%s)", childFirst => {
 		const left = new TimelineInterval(20, 60), right = new TimelineInterval(40, 80);
 		const parent = new TimelineInterval(10, 90, [left, right].map(computation => ({ computation, reused: true, shared: [computation] })));
 		const timeline = new TaskTimeline(0);
-		timeline.recordCall((childFirst ? [left, right, parent] : [parent, left, right]).map(computation => ({ computation, reused: true })));
+		timeline.recordCall((childFirst ? [left, right, parent] : [parent, left, right]).map(computation => ({ computation, reused: true })), 100_000);
 		// The independent children retain their durations; the parent adds only its remaining 20 ms.
-		expect(timeline.measure(100)).toMatchObject({ actorComputeMs: 0, reusedExecutionMs: 100 });
+		expect(timeline.measure(100)).toMatchObject({ toolComputeMs: 100, hiddenComputeMs: 100 });
 	});
 
 	it("credits complete recorded execution on every reuse without deducting adoption costs", () => {
 		const computation = new TimelineInterval(1000, 2000), timeline = new TaskTimeline(0);
 		timeline.startToolWait(61_000)(61_250);
-		timeline.recordCall([{ computation, reused: true }, { computation, reused: true }]);
-		expect(timeline.measure(61_250)).toMatchObject({ actorComputeMs: 0, reusedExecutionMs: 1000, toolWaitMs: 250 });
-		timeline.recordTool(computation, true);
-		expect(timeline.measure(121_250)).toMatchObject({ actorComputeMs: 0, reusedExecutionMs: 2000 });
+		timeline.recordCall([{ computation, reused: true }, { computation, reused: true }], 100_000);
+		expect(timeline.measure(61_250)).toMatchObject({ toolComputeMs: 1000, hiddenComputeMs: 1000, toolWaitMs: 250 });
+		timeline.recordTool(computation, 100_000, true);
+		expect(timeline.measure(121_250)).toMatchObject({ toolComputeMs: 2000, hiddenComputeMs: 2000 });
 	});
 
 	it.each([false, true])("unions a reused parent's owned children including normalized inputs (plain=%s)", plain => {
@@ -199,11 +208,11 @@ describe("gross Actor computation and successful reuse", () => {
 			? { startedAt: startedAt!, completedAt: completedAt! } : new TimelineInterval(startedAt!, completedAt!));
 		const parent = new TimelineInterval(10, 90, children.map(computation => ({ computation, owned: true, shared: [computation] })));
 		const timeline = new TaskTimeline(0);
-		expect(timeline.recordTool(parent)).toEqual({ actorComputeMs: 80, reusedExecutionMs: 0 });
-		timeline.recordTool(parent, true);
-		expect(timeline.measure(210)).toMatchObject({ actorComputeMs: 80, reusedExecutionMs: 80 });
-		timeline.recordTool(parent, true);
-		expect(timeline.measure(310)).toMatchObject({ actorComputeMs: 80, reusedExecutionMs: 160 });
+		expect(timeline.recordTool(parent, 100_000)).toMatchObject({ toolComputeMs: 80, hiddenComputeMs: 0 });
+		timeline.recordTool(parent, 100_000, true);
+		expect(timeline.measure(210)).toMatchObject({ toolComputeMs: 160, hiddenComputeMs: 80 });
+		timeline.recordTool(parent, 100_000, true);
+		expect(timeline.measure(310)).toMatchObject({ toolComputeMs: 240, hiddenComputeMs: 160 });
 	});
 
 	it("credits only the consumed preparation and never its unconsumed owner or siblings", () => {
@@ -211,15 +220,15 @@ describe("gross Actor computation and successful reuse", () => {
 		const producer = new TimelineInterval(10, 110, children.map(computation => ({ computation, owned: true, shared: [computation] })));
 		const consumer = new TimelineInterval(300, 310, [{ computation: children[0]!, reused: true }]);
 		const timeline = new TaskTimeline(0);
-		timeline.recordTool(producer); timeline.recordTool(consumer);
-		expect(timeline.measure(310)).toMatchObject({ actorComputeMs: 110, reusedExecutionMs: 20 });
+		timeline.recordTool(producer, 100_000); timeline.recordTool(consumer, 100_000);
+		expect(timeline.measure(310)).toMatchObject({ toolComputeMs: 130, hiddenComputeMs: 20 });
 	});
 
 	it("does not credit native misses or newly owned children without a successful reuse receipt", () => {
 		const child = new TimelineInterval(20, 60);
 		const native = new TimelineInterval(10, 90, [{ computation: child, owned: true, shared: [child] }]);
 		const timeline = new TaskTimeline(0);
-		expect(timeline.recordTool(native)).toEqual({ actorComputeMs: 80, reusedExecutionMs: 0 });
+		expect(timeline.recordTool(native, 100_000)).toMatchObject({ toolComputeMs: 80, hiddenComputeMs: 0 });
 	});
 
 	it("counts reconstruction inputs once across one Actor call's provider and projection", () => {
@@ -227,8 +236,8 @@ describe("gross Actor computation and successful reuse", () => {
 		const reconstructed = new TimelineInterval(100, 180, [{ computation: preparation, reused: true }]);
 		const projected = new TimelineInterval(180, 190, [{ computation: preparation, reused: true }]);
 		const timeline = new TaskTimeline(0);
-		expect(timeline.recordCall([{ computation: reconstructed }, { computation: projected }]))
-			.toEqual({ actorComputeMs: 90, reusedExecutionMs: 40 });
+		expect(timeline.recordCall([{ computation: reconstructed }, { computation: projected }], 100_000))
+			.toMatchObject({ toolComputeMs: 130, hiddenComputeMs: 40 });
 	});
 
 	it.each([false, true])("deduplicates retained/live identities and preserves live timing regardless of order (live first=%s)", liveFirst => {
@@ -236,12 +245,12 @@ describe("gross Actor computation and successful reuse", () => {
 			const live = TimelineInterval.retained("same-process", priorMs, new TimelineInterval(10, 50));
 			const retained = TimelineInterval.retained("same-process", priorMs), external = TimelineInterval.retained("external", 7);
 			const timeline = new TaskTimeline(0);
-			timeline.recordCall((liveFirst ? [live, retained, external] : [retained, live, external]).map(computation => ({ computation, reused: true })));
-			expect(timeline.measure(210)).toMatchObject({ actorComputeMs: 0, reusedExecutionMs: 47 });
+			timeline.recordCall((liveFirst ? [live, retained, external] : [retained, live, external]).map(computation => ({ computation, reused: true })), 100_000);
+			expect(timeline.measure(210)).toMatchObject({ toolComputeMs: 47, hiddenComputeMs: 40, hiddenComputeIncomplete: true });
 		}
 		const historical = new TaskTimeline(100);
-		historical.recordTool(TimelineInterval.retained("historical", 40), true);
-		expect(historical.measure(100_010)).toMatchObject({ actorComputeMs: 0, reusedExecutionMs: 40 });
+		historical.recordTool(TimelineInterval.retained("historical", 40), 100_000, true);
+		expect(historical.measure(100_010)).toMatchObject({ toolComputeMs: 40, hiddenComputeMs: 0, hiddenComputeIncomplete: true });
 	});
 
 	it.each([false, true])("excludes only work paused by validation while retaining a known sibling's interval (child paused=%s)", async paused => {
@@ -251,8 +260,8 @@ describe("gross Actor computation and successful reuse", () => {
 			TimelineInterval.own(sibling); TimelineInterval.own(fresh); TimelineInterval.exclude(validation);
 		});
 		const parent = new TimelineInterval(0, 150, measured.dependencies), timeline = new TaskTimeline(0);
-		expect(timeline.recordTool(parent)).toEqual({ actorComputeMs: paused ? 120 : 150, reusedExecutionMs: 0 });
-		expect(timeline.recordTool(sibling, true)).toEqual({ actorComputeMs: 0, reusedExecutionMs: 60 });
+		expect(timeline.recordTool(parent, 100_000)).toMatchObject({ toolComputeMs: paused ? 120 : 150, hiddenComputeMs: 0 });
+		expect(timeline.recordTool(sibling, 100_000, true)).toMatchObject({ toolComputeMs: 60, hiddenComputeMs: 60 });
 	});
 
 	it("keeps unproven fresh computation unknown while preserving successful reuse receipts", () => {
@@ -262,13 +271,13 @@ describe("gross Actor computation and successful reuse", () => {
 			{ computation: new TimelineInterval(0, 0), overhead: true, computeUncertain: true },
 		]);
 		const timeline = new TaskTimeline(0);
-		expect(timeline.recordTool(root)).toEqual({ actorComputeMs: undefined, reusedExecutionMs: 40 });
-		timeline.recordTool(new TimelineInterval(120, 130));
-		expect(timeline.measure(130)).toMatchObject({ actorComputeMs: undefined, reusedExecutionMs: 40 });
+		expect(timeline.recordTool(root, 100_000)).toMatchObject({ toolComputeMs: undefined, hiddenComputeMs: 40 });
+		timeline.recordTool(new TimelineInterval(120, 130), 100_000);
+		expect(timeline.measure(130)).toMatchObject({ toolComputeMs: undefined, hiddenComputeMs: 40 });
 		expect(toolSpeedup(timeline.measure(130))).toBeNull();
 		const adopted = new TaskTimeline(200);
-		expect(adopted.recordTool(root, true)).toEqual({ actorComputeMs: 0, reusedExecutionMs: 50, reusedExecutionIncomplete: true });
-		expect(adopted.measure(300)).toMatchObject({ actorComputeMs: 0, reusedExecutionMs: 50, reusedExecutionIncomplete: true });
+		expect(adopted.recordTool(root, 100_000, true)).toMatchObject({ toolComputeMs: undefined, hiddenComputeMs: 50, hiddenComputeIncomplete: true });
+		expect(adopted.measure(300)).toMatchObject({ toolComputeMs: undefined, hiddenComputeMs: 50, hiddenComputeIncomplete: true });
 		expect(toolSpeedup(adopted.measure(300))).toBeNull();
 	});
 
@@ -282,12 +291,12 @@ describe("gross Actor computation and successful reuse", () => {
 		TimelineInterval.producedBy(borrowed, { source: "drafter", mode: "input" });
 		TimelineInterval.producedBy(owned, { source: "consumer", mode: "replacement" });
 		const timeline = new TaskTimeline(100);
-		expect(timeline.recordTool(producer, true)).toEqual({ actorComputeMs: 0, reusedExecutionMs: 55, reusedByMode: [
-			{ source: "pattern", mode: "whole", reusedExecutionMs: 40 }, { source: "drafter", mode: "input", reusedExecutionMs: 10 },
+		expect(timeline.recordTool(producer, 100_000, true)).toMatchObject({ toolComputeMs: 55, hiddenComputeMs: 55, hiddenByMode: [
+			{ source: "pattern", mode: "whole", hiddenComputeMs: 40 }, { source: "drafter", mode: "input", hiddenComputeMs: 10 },
 		] });
 		const partial = new TimelineInterval(100, 110, [owned, borrowed, unknown, owned].map(computation => ({ computation, reused: true })));
-		for (let repeat = 0; repeat < 2; repeat++) expect(timeline.recordTool(partial)).toEqual({ actorComputeMs: 10, reusedExecutionMs: 35, reusedByMode: [
-			{ source: "pattern", mode: "whole", reusedExecutionMs: 20 }, { source: "drafter", mode: "input", reusedExecutionMs: 10 },
+		for (let repeat = 0; repeat < 2; repeat++) expect(timeline.recordTool(partial, 100_000)).toMatchObject({ toolComputeMs: 45, hiddenComputeMs: 35, hiddenByMode: [
+			{ source: "pattern", mode: "whole", hiddenComputeMs: 20 }, { source: "drafter", mode: "input", hiddenComputeMs: 10 },
 		] });
 	});
 
@@ -297,12 +306,12 @@ describe("gross Actor computation and successful reuse", () => {
 		const parent = new TimelineInterval(0, 100, children.map(computation => ({ computation, owned: true, shared: [computation] })));
 		TimelineInterval.producedBy(left, { source: "pattern", mode: "left" });
 		TimelineInterval.producedBy(right, { source: "pattern", mode: "right" });
-		const result = new TaskTimeline(100).recordCall([parent, ...children].map(computation => ({ computation, reused: true })));
-		expect(result).toMatchObject({ actorComputeMs: 0, reusedExecutionMs: 100 });
-		expect(result.reusedByMode).toEqual([
-			{ source: "pattern", mode: "left", reusedExecutionMs: 20 }, { source: "pattern", mode: "right", reusedExecutionMs: 10 },
+		const result = new TaskTimeline(100).recordCall([parent, ...children].map(computation => ({ computation, reused: true })), 100_000);
+		expect(result).toMatchObject({ toolComputeMs: 100, hiddenComputeMs: 100 });
+		expect(result.hiddenByMode).toEqual([
+			{ source: "pattern", mode: "left", hiddenComputeMs: 20 }, { source: "pattern", mode: "right", hiddenComputeMs: 10 },
 		]);
-		expect(result.reusedByMode!.reduce((sum, value) => sum + value.reusedExecutionMs, 0)).toBeLessThanOrEqual(result.reusedExecutionMs);
+		expect(result.hiddenByMode!.reduce((sum, value) => sum + value.hiddenComputeMs, 0)).toBeLessThanOrEqual(result.hiddenComputeMs);
 	});
 
 	it.each([false, true])("deduplicates retained attribution, preserves write-once provenance and rejects conflicting aliases (live first=%s)", liveFirst => {
@@ -312,18 +321,18 @@ describe("gross Actor computation and successful reuse", () => {
 		producer.mode = "mutated";
 		TimelineInterval.producedBy(live, { source: "other", mode: "supporter" });
 		const roots = (liveFirst ? [live, retained] : [retained, live]).map(computation => ({ computation, reused: true }));
-		expect(new TaskTimeline(100).recordCall(roots)).toEqual({ actorComputeMs: 0, reusedExecutionMs: 40,
-			reusedByMode: [{ source: "pattern", mode: "owner", reusedExecutionMs: 40 }] });
+		expect(new TaskTimeline(100).recordCall(roots, 100_000)).toMatchObject({ toolComputeMs: 40, hiddenComputeMs: 40,
+			hiddenByMode: [{ source: "pattern", mode: "owner", hiddenComputeMs: 40 }] });
 		TimelineInterval.producedBy(retained, { source: "other", mode: "conflict" });
-		expect(new TaskTimeline(100).recordCall(roots)).toEqual({ actorComputeMs: 0, reusedExecutionMs: 40 });
+		expect(new TaskTimeline(100).recordCall(roots, 100_000)).toMatchObject({ toolComputeMs: 40, hiddenComputeMs: 40 });
 	});
 
 	it("propagates uncertain excluded work through collection without inventing reuse", async () => {
 		const preparation = new TimelineInterval(10, 50);
 		TimelineInterval.producedBy(preparation, { source: "pattern", mode: "failed" });
 		const collected = await TimelineInterval.collect(() => TimelineInterval.exclude(preparation, true));
-		expect(new TaskTimeline(0).recordTool(new TimelineInterval(10, 60, collected.dependencies)))
-			.toEqual({ actorComputeMs: undefined, reusedExecutionMs: 0 });
+		expect(new TaskTimeline(0).recordTool(new TimelineInterval(10, 60, collected.dependencies), 100_000))
+			.toMatchObject({ toolComputeMs: undefined, hiddenComputeMs: 0 });
 	});
 });
 
@@ -335,7 +344,7 @@ describe("bounded persisted computation evidence", () => {
 		expect(restored).toBeDefined();
 		return restored!;
 	};
-	const reused = (computations: readonly TimelineInterval[]) => new TaskTimeline(0).recordCall(computations.map(computation => ({ computation, reused: true })));
+	const reused = (computations: readonly TimelineInterval[]) => new TaskTimeline(0).recordCall(computations.map(computation => ({ computation, reused: true })), 100_000);
 
 	it("roundtrips original input graphs, explicit exclusions and physical producer attribution", () => {
 		const child = new TimelineInterval(110, 150), borrowed = new TimelineInterval(0, 40);
@@ -345,14 +354,14 @@ describe("bounded persisted computation evidence", () => {
 		]);
 		TimelineInterval.producedBy(parent, { source: "pattern", mode: "whole" });
 		TimelineInterval.producedBy(borrowed, { source: "drafter", mode: "input" });
-		const expected = { actorComputeMs: 0, reusedExecutionMs: 100, reusedByMode: [
-			{ source: "pattern", mode: "whole", reusedExecutionMs: 60 }, { source: "drafter", mode: "input", reusedExecutionMs: 40 },
+		const expected = { toolComputeMs: 100, hiddenComputeMs: 100, hiddenByMode: [
+			{ source: "pattern", mode: "whole", hiddenComputeMs: 60 }, { source: "drafter", mode: "input", hiddenComputeMs: 40 },
 		] };
-		expect(reused([parent])).toEqual(expected);
+		expect(reused([parent])).toMatchObject(expected);
 		const left = restore(parent), right = restore(parent);
 		expect(left).not.toBe(right);
-		expect(reused([left, right])).toEqual(expected);
-		for (const roots of [[parent, left], [left, parent]]) expect(reused(roots)).toEqual(expected);
+		expect(reused([left, right])).toMatchObject(expected);
+		for (const roots of [[parent, left], [left, parent]]) expect(reused(roots)).toMatchObject(expected);
 		const graph = TimelineInterval.serialize(parent)!;
 		expect(Object.isFrozen(graph)).toBe(true);
 		expect(Object.isFrozen(graph.nodes[0]!.inputs)).toBe(true);
@@ -363,20 +372,20 @@ describe("bounded persisted computation evidence", () => {
 		const left = new TimelineInterval(100, 110, [{ computation: child, reused: true }]);
 		const right = new TimelineInterval(200, 220, [{ computation: child, reused: true }]);
 		const roots = [restore(left), restore(right), restore(child)];
-		expect(reused(reverse ? roots.reverse() : roots)).toEqual({ actorComputeMs: 0, reusedExecutionMs: 70 });
+		expect(reused(reverse ? roots.reverse() : roots)).toMatchObject({ toolComputeMs: 70, hiddenComputeMs: 70 });
 		const timeline = new TaskTimeline(0);
-		for (const root of roots) timeline.recordTool(root, true);
-		expect(timeline.measure(500)).toMatchObject({ reusedExecutionMs: 150 });
+		for (const root of roots) timeline.recordTool(root, 100_000, true);
+		expect(timeline.measure(500)).toMatchObject({ hiddenComputeMs: 150 });
 	});
 
 	it.each([false, true])("unions persisted owned siblings without selecting their ancestor or other siblings (reverse=%s)", reverse => {
 		const left = new TimelineInterval(20, 60), right = new TimelineInterval(40, 80), unconsumed = new TimelineInterval(90, 200);
 		const parent = new TimelineInterval(10, 210, [left, right, unconsumed].map(computation => ({ computation, owned: true, shared: [computation] })));
 		const roots = [restore(left), restore(right)];
-		expect(reused(reverse ? roots.reverse() : roots)).toEqual({ actorComputeMs: 0, reusedExecutionMs: 60 });
-		expect(reused([restore(left)])).toEqual({ actorComputeMs: 0, reusedExecutionMs: 40 });
+		expect(reused(reverse ? roots.reverse() : roots)).toMatchObject({ toolComputeMs: 60, hiddenComputeMs: 60 });
+		expect(reused([restore(left)])).toMatchObject({ toolComputeMs: 40, hiddenComputeMs: 40 });
 		const complete = [restore(parent), restore(left), restore(right)];
-		expect(reused(reverse ? complete.reverse() : complete)).toEqual({ actorComputeMs: 0, reusedExecutionMs: 200 });
+		expect(reused(reverse ? complete.reverse() : complete)).toMatchObject({ toolComputeMs: 200, hiddenComputeMs: 200 });
 	});
 
 	it.each([false, true])("preserves early production groups after the enclosing live interval is created (reverse=%s)", reverse => {
@@ -384,34 +393,44 @@ describe("bounded persisted computation evidence", () => {
 		TimelineInterval.group(left, production); TimelineInterval.group(right, production);
 		const savedLeft = restore(left), savedRight = restore(right);
 		const parent = new TimelineInterval(10, 90, [left, right].map(computation => ({ computation, owned: true, shared: [computation] })));
-		expect(reused([savedLeft, savedRight])).toEqual({ actorComputeMs: 0, reusedExecutionMs: 60 });
+		expect(reused([savedLeft, savedRight])).toMatchObject({ toolComputeMs: 60, hiddenComputeMs: 60 });
 		for (const enclosing of [parent, restore(parent)]) {
 			const roots = [enclosing, savedLeft, savedRight];
-			expect(reused(reverse ? roots.reverse() : roots)).toEqual({ actorComputeMs: 0, reusedExecutionMs: 80 });
+			expect(reused(reverse ? roots.reverse() : roots)).toMatchObject({ toolComputeMs: 80, hiddenComputeMs: 80 });
 		}
 		const separate = new TimelineInterval(20, 60);
 		TimelineInterval.group(separate, {});
-		expect(reused([savedLeft, restore(separate)])).toEqual({ actorComputeMs: 0, reusedExecutionMs: 80 });
+		expect(reused([savedLeft, restore(separate)])).toMatchObject({ toolComputeMs: 80, hiddenComputeMs: 80 });
 	});
 
 	it("keeps graph identity stable when a live or restored result receives a certificate alias", () => {
 		const original = new TimelineInterval(10, 50), saved = restore(original);
 		TimelineInterval.retained("later-certificate-alias", 999, original);
 		TimelineInterval.retained("another-certificate-alias", 999, saved);
-		expect(reused([original, saved, restore(original)])).toEqual({ actorComputeMs: 0, reusedExecutionMs: 40 });
+		expect(reused([original, saved, restore(original)])).toMatchObject({ toolComputeMs: 40, hiddenComputeMs: 40 });
 		const measuredLegacy = TimelineInterval.retained("independently-measured", 25);
 		const retainedLegacy = restore(measuredLegacy);
 		TimelineInterval.retained("later-measured-alias", 999, retainedLegacy);
-		expect(reused([measuredLegacy, retainedLegacy])).toEqual({ actorComputeMs: 0, reusedExecutionMs: 25 });
+		expect(reused([measuredLegacy, retainedLegacy])).toMatchObject({ toolComputeMs: 25, hiddenComputeMs: 0, hiddenComputeIncomplete: true });
 	});
 
 	it("canonicalizes nested owned aliases when a session records both a parent and its child", () => {
 		const child = new TimelineInterval(20, 60);
 		const parent = new TimelineInterval(10, 80, [{ computation: child, owned: true, shared: [child] }]);
 		const root = new TimelineInterval(0, 100, [parent, child].map(computation => ({ computation, owned: true, shared: [computation] })));
-		expect(reused([root])).toEqual({ actorComputeMs: 0, reusedExecutionMs: 100 });
+		expect(reused([root])).toMatchObject({ toolComputeMs: 100, hiddenComputeMs: 100 });
 		const restored = restore(root);
-		expect(reused([restored, restore(child), restore(parent)])).toEqual({ actorComputeMs: 0, reusedExecutionMs: 100 });
+		expect(reused([restored, restore(child), restore(parent)])).toMatchObject({ toolComputeMs: 100, hiddenComputeMs: 100 });
+	});
+
+	it.each([undefined, 0, 1000, -1000])("clips restored computation at Actor issue across clock origins (offset=%s)", offset => {
+		const original = new TimelineInterval(100, 200), graph = TimelineInterval.serialize(original)!;
+		const foreign = TimelineInterval.restore({ ...graph, nodes: graph.nodes.map(node => ({ ...node,
+			clock: "earlier-process", timeOrigin: offset === undefined ? undefined : performance.timeOrigin + offset })) })!;
+		const timing = new TaskTimeline(0).recordTool(foreign, 150, true);
+		expect(timing).toEqual({ toolComputeMs: 100, hiddenComputeMs: offset === undefined || offset > 0 ? 0 : offset < 0 ? 100 : 50,
+			reused: true, ...(offset === undefined ? { hiddenComputeIncomplete: true } : {}) });
+		expect(TimelineInterval.serialize(foreign)?.nodes[0]?.timeOrigin).toBe(offset === undefined ? undefined : performance.timeOrigin + offset);
 	});
 
 	it("keeps old monotonic coordinates from cutting unrelated work after a process restart", async () => {
@@ -420,12 +439,12 @@ describe("bounded persisted computation evidence", () => {
 		const collected = await TimelineInterval.collect(() => TimelineInterval.use(foreign));
 		// The numerical coordinates overlap, but the producer and this Actor have different clocks.
 		const current = new TimelineInterval(120, 130, collected.dependencies);
-		expect(new TaskTimeline(0).recordTool(current)).toEqual({ actorComputeMs: 10, reusedExecutionMs: 40 });
-		expect(reused([restore(current), restore(foreign)])).toEqual({ actorComputeMs: 0, reusedExecutionMs: 50 });
+		expect(new TaskTimeline(0).recordTool(current, 100_000)).toMatchObject({ toolComputeMs: 50, hiddenComputeMs: 40 });
+		expect(reused([restore(current), restore(foreign)])).toMatchObject({ toolComputeMs: 50, hiddenComputeMs: 50 });
 		// An explicit current-process join still removes its measured wait without clipping it to the old clock.
 		const joined = new TimelineInterval(200, 210, [{ computation: foreign, reused: true, shared: [new TimelineInterval(202, 207)] }]);
-		expect(new TaskTimeline(0).recordTool(joined)).toEqual({ actorComputeMs: 5, reusedExecutionMs: 40 });
-		expect(reused([restore(joined)])).toEqual({ actorComputeMs: 0, reusedExecutionMs: 45 });
+		expect(new TaskTimeline(0).recordTool(joined, 100_000)).toMatchObject({ toolComputeMs: 45, hiddenComputeMs: 40 });
+		expect(reused([restore(joined)])).toMatchObject({ toolComputeMs: 45, hiddenComputeMs: 45 });
 	});
 
 	it("never unions matching numerical spans from different monotonic clocks", () => {
@@ -434,7 +453,7 @@ describe("bounded persisted computation evidence", () => {
 		const graph = TimelineInterval.serialize(live)!;
 		const foreign = TimelineInterval.restore({ ...graph, root: "foreign-root", nodes: graph.nodes.map(node => ({ ...node,
 			id: "foreign-root", clock: "earlier-process" })) })!;
-		for (const roots of [[live, foreign], [foreign, live]]) expect(reused(roots)).toEqual({ actorComputeMs: 0, reusedExecutionMs: 80 });
+		for (const roots of [[live, foreign], [foreign, live]]) expect(reused(roots)).toMatchObject({ toolComputeMs: 80, hiddenComputeMs: 80 });
 	});
 
 	it("retains known spans while marking missing reuse evidence and incomplete producer coverage", () => {
@@ -443,14 +462,14 @@ describe("bounded persisted computation evidence", () => {
 			{ computation: missing, reused: true }, { computation: known, reused: true },
 			{ computation: new TimelineInterval(100, 105), overhead: true, computeUncertain: true },
 		]);
-		expect(reused([restore(missing)])).toEqual({ actorComputeMs: 0, reusedExecutionMs: 0, reusedExecutionIncomplete: true });
-		expect(reused([restore(parent)])).toEqual({ actorComputeMs: 0, reusedExecutionMs: 55, reusedExecutionIncomplete: true });
+		expect(reused([restore(missing)])).toMatchObject({ toolComputeMs: undefined, hiddenComputeMs: 0, hiddenComputeIncomplete: true });
+		expect(reused([restore(parent)])).toMatchObject({ toolComputeMs: undefined, hiddenComputeMs: 55, hiddenComputeIncomplete: true });
 		const timeline = new TaskTimeline(100);
-		expect(timeline.recordTool(parent)).toEqual({ actorComputeMs: undefined, reusedExecutionMs: 40, reusedExecutionIncomplete: true });
-		timeline.recordTool(new TimelineInterval(200, 210));
-		expect(timeline.measure(300)).toMatchObject({ actorComputeMs: undefined, reusedExecutionMs: 40, reusedExecutionIncomplete: true });
+		expect(timeline.recordTool(parent, 100_000)).toMatchObject({ toolComputeMs: undefined, hiddenComputeMs: 40, hiddenComputeIncomplete: true });
+		timeline.recordTool(new TimelineInterval(200, 210), 100_000);
+		expect(timeline.measure(300)).toMatchObject({ toolComputeMs: undefined, hiddenComputeMs: 40, hiddenComputeIncomplete: true });
 		const knownAlias = TimelineInterval.retained("unrecorded", 40, new TimelineInterval(10, 50));
-		for (const roots of [[missing, knownAlias], [knownAlias, missing]]) expect(reused(roots)).toEqual({ actorComputeMs: 0, reusedExecutionMs: 40 });
+		for (const roots of [[missing, knownAlias], [knownAlias, missing]]) expect(reused(roots)).toMatchObject({ toolComputeMs: 40, hiddenComputeMs: 40 });
 	});
 
 	it("rejects malformed or cyclic graphs without issuing a successful receipt", async () => {
@@ -462,6 +481,8 @@ describe("bounded persisted computation evidence", () => {
 			{ ...graph, nodes: [{ ...root, clock: undefined }] },
 			{ ...graph, nodes: [root, root] }, { ...graph, nodes: [{ ...root, completedAt: -1 }] },
 			{ ...graph, nodes: [{ ...root, startedAt: NaN }] },
+			{ ...graph, nodes: [{ ...root, timeOrigin: NaN }] },
+			{ ...graph, nodes: [{ ...root, inputs: [{ id: "child" }] }, { ...root, id: "child", timeOrigin: root.timeOrigin! + 1 }] },
 			{ ...graph, nodes: [{ ...root, inputs: [{ id: root.id }] }] },
 			{ ...graph, nodes: [{ ...root, inputs: [{ id: "absent" }] }] },
 			{ ...graph, nodes: [{ ...root, inputs: [{ id: root.id, reused: "yes" }] }] },
@@ -490,99 +511,5 @@ describe("bounded persisted computation evidence", () => {
 			producer: { source: "s".repeat(256), mode: "m".repeat(256) }, groups: ["g".repeat(256)] }));
 		expect(normalizeTimelineComputation({ version: 2, root: nodes[0]!.id,
 			nodes: nodes.map((node, index) => ({ ...node, ...(index === 0 ? { inputs: nodes.slice(1).map(input => ({ id: input.id })) } : {}) })) })).toBeUndefined();
-	});
-});
-
-describe("live producer receipts for measured reuse", () => {
-	const measure = (computations: readonly TimelineInterval[]) => {
-		let shares: readonly ComputationReuseShare[] = [], calls = 0;
-		const timing = new TaskTimeline(0).recordCall(computations.map(computation => ({ computation, reused: true })), receipt => {
-			shares = receipt; calls++;
-		});
-		expect(calls).toBe(1);
-		expect(Object.isFrozen(shares)).toBe(true);
-		for (const share of shares) expect(Object.isFrozen(share)).toBe(true);
-		return { timing, shares };
-	};
-
-	it("credits one producer's owned union once per accepted call without requiring a mode", () => {
-		const feedback = {}, left = new TimelineInterval(20, 60), right = new TimelineInterval(40, 80);
-		const parent = new TimelineInterval(10, 90, [left, right].map(computation => ({ computation, owned: true, shared: [computation] })));
-		TimelineInterval.producedBy(parent, { source: "drafter", feedback });
-		for (let repeat = 0; repeat < 2; repeat++) {
-			const result = measure([parent, left, right, parent]);
-			expect(result.timing).toEqual({ actorComputeMs: 0, reusedExecutionMs: 80 });
-			expect(result.shares).toEqual([{ source: "drafter", feedback, reusedExecutionMs: 80 }]);
-			expect(result.shares[0]!.feedback).toBe(feedback);
-		}
-	});
-
-	it.each([false, true])("keeps live feedback when the same computation also has a persisted alias (live first=%s)", liveFirst => {
-		const feedback: { privateMarker: string; self?: unknown } = { privateMarker: "must-not-persist" }, live = new TimelineInterval(10, 50);
-		feedback.self = feedback;
-		TimelineInterval.producedBy(live, { source: "drafter", feedback });
-		const graph = TimelineInterval.serialize(live)!;
-		expect(JSON.stringify(graph)).not.toContain("must-not-persist");
-		expect(graph.nodes[0]!.producer).toEqual({ source: "drafter" });
-		const disk = TimelineInterval.restore(JSON.parse(JSON.stringify(graph)))!;
-		expect(measure([disk]).shares).toEqual([]);
-		const result = measure(liveFirst ? [live, disk] : [disk, live]);
-		expect(result.timing).toEqual({ actorComputeMs: 0, reusedExecutionMs: 40 });
-		expect(result.shares).toEqual([{ source: "drafter", feedback, reusedExecutionMs: 40 }]);
-	});
-
-	it.each([false, true])("partitions overlapping physical feedback separately from a shared mode label (reverse=%s)", reverse => {
-		const first = {}, second = {}, left = new TimelineInterval(10, 50), right = new TimelineInterval(30, 70);
-		new TimelineInterval(0, 100, [left, right].map(computation => ({ computation, owned: true, shared: [computation] })));
-		TimelineInterval.producedBy(left, { source: "drafter", mode: "workflow", feedback: first });
-		TimelineInterval.producedBy(right, { source: "drafter", mode: "workflow", feedback: second });
-		const result = measure(reverse ? [right, left] : [left, right]);
-		expect(result.timing).toEqual({ actorComputeMs: 0, reusedExecutionMs: 60,
-			reusedByMode: [{ source: "drafter", mode: "workflow", reusedExecutionMs: 60 }] });
-		expect(result.shares).toEqual([
-			{ source: "drafter", feedback: first, reusedExecutionMs: 20 }, { source: "drafter", feedback: second, reusedExecutionMs: 20 },
-		]);
-	});
-
-	it("leaves overlap with unknown lineage unassigned and separates borrowed producers", () => {
-		const feedback = {}, otherFeedback = {}, known = new TimelineInterval(10, 50), unknown = new TimelineInterval(30, 70);
-		new TimelineInterval(0, 100, [known, unknown].map(computation => ({ computation, owned: true, shared: [computation] })));
-		TimelineInterval.producedBy(known, { source: "drafter", feedback });
-		const borrowed = new TimelineInterval(100, 130);
-		TimelineInterval.producedBy(borrowed, { source: "pattern", mode: "input", feedback: otherFeedback });
-		const result = measure([known, unknown, borrowed]);
-		expect(result.timing.reusedExecutionMs).toBe(90);
-		expect(result.shares).toEqual([
-			{ source: "drafter", feedback, reusedExecutionMs: 20 }, { source: "pattern", feedback: otherFeedback, reusedExecutionMs: 30 },
-		]);
-	});
-
-	it.each([false, true])("leaves conflicting live aliases unassigned while retaining diagnostic mode credit (reverse=%s)", reverse => {
-		const left = TimelineInterval.retained("aliased", 40, new TimelineInterval(10, 50));
-		const right = TimelineInterval.retained("aliased", 40, new TimelineInterval(10, 50));
-		TimelineInterval.producedBy(left, { source: "drafter", mode: "workflow", feedback: {} });
-		TimelineInterval.producedBy(right, { source: "drafter", mode: "workflow", feedback: {} });
-		const result = measure(reverse ? [right, left] : [left, right]);
-		expect(result.timing).toEqual({ actorComputeMs: 0, reusedExecutionMs: 40,
-			reusedByMode: [{ source: "drafter", mode: "workflow", reusedExecutionMs: 40 }] });
-		expect(result.shares).toEqual([]);
-	});
-
-	it("delivers positive known lower-bound shares but never credits native or rejected work", async () => {
-		const feedback = {}, known = new TimelineInterval(10, 50, [
-			{ computation: new TimelineInterval(10, 20), overhead: true, computeUncertain: true },
-		]);
-		TimelineInterval.producedBy(known, { source: "drafter", feedback });
-		const measured = measure([known]);
-		expect(measured.timing).toEqual({ actorComputeMs: 0, reusedExecutionMs: 30, reusedExecutionIncomplete: true });
-		expect(measured.shares).toEqual([{ source: "drafter", feedback, reusedExecutionMs: 30 }]);
-		let native: readonly ComputationReuseShare[] = [];
-		new TaskTimeline(0).recordCall([{ computation: known }], shares => { native = shares; });
-		expect(native).toEqual([]);
-		await expect(TimelineInterval.collect(() => { TimelineInterval.use(known); throw new Error("rejected"); })).rejects.toThrow("rejected");
-		const collected = await TimelineInterval.collect(() => {});
-		let rejected: readonly ComputationReuseShare[] = [];
-		new TaskTimeline(0).recordCall(collected.dependencies, shares => { rejected = shares; });
-		expect(rejected).toEqual([]);
 	});
 });

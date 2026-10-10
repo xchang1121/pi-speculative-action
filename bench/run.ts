@@ -278,9 +278,9 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		completedAt: completedAt === undefined ? undefined : performance.timeOrigin + completedAt }));
 	const { calls: slowCalls, ...slowCallCoverage } = slowCallReport(events, waitTrace);
 	const computation = input.speculationEnabled
-		? { actorComputeMs: summary.tasks ? summary.actorComputeMs : undefined, reusedExecutionMs: summary.tasks ? summary.reusedExecutionMs : undefined,
-			reusedExecutionIncomplete: summary.reusedExecutionIncomplete }
-		: { actorComputeMs: undefined, reusedExecutionMs: 0 }; // SDK events include preparation and delivery; only raw waits are measured here.
+		? { toolComputeMs: summary.tasks ? summary.toolComputeMs : undefined, hiddenComputeMs: summary.tasks ? summary.hiddenComputeMs : undefined,
+			hiddenComputeIncomplete: summary.hiddenComputeIncomplete }
+		: { toolComputeMs: undefined, hiddenComputeMs: 0 }; // SDK events include preparation and delivery; only raw waits are measured here.
 	const changedFiles = lines((await command("git", ["-C", task.workspace, "diff", "--name-only"])).stdout);
 	const goldFiles = patchFiles(task.row.patch);
 	const testPatchFiles = patchFiles(task.row.test_patch);
@@ -301,7 +301,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			drafter: `${drafter.provider}/${drafter.id}`,
 			timingScope: "setup, Agent prompt, terminal settlement, extension shutdown",
 			monotonicTimeOrigin: performance.timeOrigin,
-			timingModel: "actor_compute_gross_v1",
+			timingModel: "actor_issue_hidden_compute_v2",
 			patternState: input.patternState ?? "isolated-per-run",
 			executionBoundary: "installed extension routes",
 			executionRoutes: finalMetrics ? { ...finalMetrics[1], primaryIDs: [...finalMetrics[1].primaryIDs] } : null,
@@ -317,11 +317,11 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			teardownMs: taskCompletedAt - agentCompletedAt,
 			toolWaitMs,
 			slowCallCoverage,
-			actorComputeMs: computation.actorComputeMs,
-			reusedExecutionMs: computation.reusedExecutionMs,
-			reusedExecutionIncomplete: computation.reusedExecutionIncomplete,
-			toolSpeedup: computation.reusedExecutionMs === undefined ? null : toolSpeedup({ ...computation, reusedExecutionMs: computation.reusedExecutionMs }),
-			fullyReused: !computation.reusedExecutionIncomplete && computation.actorComputeMs === 0 && (computation.reusedExecutionMs ?? 0) > 0,
+			toolComputeMs: computation.toolComputeMs,
+			hiddenComputeMs: computation.hiddenComputeMs,
+			hiddenComputeIncomplete: computation.hiddenComputeIncomplete,
+			toolSpeedup: computation.hiddenComputeMs === undefined ? null : toolSpeedup({ ...computation, hiddenComputeMs: computation.hiddenComputeMs }),
+			fullyHidden: !computation.hiddenComputeIncomplete && Number.isFinite(computation.toolComputeMs) && computation.toolComputeMs === computation.hiddenComputeMs && (computation.hiddenComputeMs ?? 0) > 0,
 			actorActions,
 			actorActionsByTool,
 			actorFallbacks: input.speculationEnabled ? summary.actorFallbacks : actorActions,

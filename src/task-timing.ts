@@ -30,18 +30,15 @@ const identities = new WeakMap<object, string>(), publishedIdentities = new Weak
 const concurrencyGroups = new WeakMap<TimelineInterval, ReadonlySet<string>>();
 const incompleteReuse = new WeakSet<TimelineInterval>();
 const clocks = new WeakMap<TimelineInterval, string>();
+const timeOrigins = new WeakMap<TimelineInterval, number>();
 const identityNamespace = randomUUID();
 let nextIdentity = 0;
 
 export interface ComputationProducer {
 	readonly source: string;
 	readonly mode?: string;
-	/** Opaque live producer lineage; never written to persisted evidence or diagnostic metrics. */
-	readonly feedback?: unknown;
 }
-export interface ModeComputationTiming { readonly source: string; readonly mode: string; readonly reusedExecutionMs: number; }
-export interface ComputationReuseShare { readonly source: string; readonly feedback: unknown; readonly reusedExecutionMs: number; }
-type ComputationLineage = Pick<ComputationReuseShare, "source" | "feedback">;
+export interface ModeComputationTiming { readonly source: string; readonly mode: string; readonly hiddenComputeMs: number; }
 
 /** Immutable calculation evidence; carries no Actor, candidate or output ownership. */
 export class TimelineInterval {
@@ -95,6 +92,8 @@ export class TimelineInterval {
 				input.reused ? { computation: input.computation, overhead: true, shared: input.shared }
 					: { ...input, computation: copy(input.computation) }), calculationSpans.get(current));
 			identities.set(result, computationIdentity(current)); clocks.set(result, computationClock(current));
+			const timeOrigin = computationTimeOrigin(current);
+			if (timeOrigin !== undefined) timeOrigins.set(result, timeOrigin);
 			const source = provenance.get(current), producer = producers.get(current), groups = concurrencyGroups.get(current);
 			if (source) provenance.set(result, source);
 			if (producer) producers.set(result, producer);
@@ -140,7 +139,7 @@ export class TimelineInterval {
 	static producedBy(computation: TimelineInterval, producer: ComputationProducer): void {
 		if (producers.has(computation)) return;
 		const owner = computationProducer(computation) ?? Object.freeze({ source: producer.source,
-			...(producer.mode !== undefined ? { mode: producer.mode } : {}), ...(producer.feedback !== undefined ? { feedback: producer.feedback } : {}) });
+			...(producer.mode !== undefined ? { mode: producer.mode } : {}) });
 		producers.set(computation, owner);
 		for (const input of dependencies.get(computation) ?? []) if (input.owned) TimelineInterval.producedBy(input.computation, owner);
 	}
@@ -203,6 +202,7 @@ export class TimelineInterval {
 			spanCount += spans?.length ?? 0;
 			if (spanCount > TIMELINE_COMPUTATION_LIMITS.spans * 4) return undefined;
 			nodes.push({ id, clock: computationClock(current), startedAt: current.startedAt, completedAt: current.completedAt,
+				...(computationTimeOrigin(current) !== undefined ? { timeOrigin: computationTimeOrigin(current) } : {}),
 				...(spans ? { spans: spans.map(({ startedAt, completedAt }) => ({ startedAt, completedAt })) } : {}),
 				...(priorMs ? { priorMs } : {}), ...(producer ? { producer: { source: producer.source,
 					...(producer.mode !== undefined ? { mode: producer.mode } : {}) } } : {}), ...(groups.size ? { groups: [...groups] } : {}),
@@ -215,7 +215,7 @@ export class TimelineInterval {
 				})),
 			});
 		}
-		return normalizeTimelineComputation({ version: 2, root: computationIdentity(computation), nodes });
+		return normalizeTimelineComputation({ version: 3, root: computationIdentity(computation), nodes });
 	}
 
 	/** Each restore is independent; stable identities deduplicate only within the receiving call. */
@@ -237,6 +237,7 @@ export class TimelineInterval {
 			})), node.spans?.map(span => new TimelineInterval(span.startedAt, span.completedAt)));
 			identities.set(current, id); publishedIdentities.add(current);
 			clocks.set(current, node.clock);
+			if (node.timeOrigin !== undefined) timeOrigins.set(current, node.timeOrigin);
 			provenance.set(current, { id, priorMs: node.priorMs ?? 0 });
 			if (node.groups) concurrencyGroups.set(current, new Set(node.groups));
 			if (node.producer) producers.set(current, node.producer);
@@ -258,12 +259,16 @@ export class TimelineInterval {
 }
 
 export interface ToolComputationTiming {
-	readonly actorComputeMs?: number;
-	readonly reusedExecutionMs: number;
-	/** The recorded reuse is a lower bound because some original evidence is unavailable. */
-	readonly reusedExecutionIncomplete?: true;
-	/** Only unambiguous producer shares of the same deduplicated reuse total. */
-	readonly reusedByMode?: readonly ModeComputationTiming[];
+	/** All calculation actually used by this call, including the producer's remaining work. */
+	readonly toolComputeMs?: number;
+	/** Successfully reused calculation completed before this Actor call was issued. */
+	readonly hiddenComputeMs: number;
+	/** A successful receipt, even when no calculation was hidden before the call. */
+	readonly reused?: true;
+	/** The recorded hidden time is a lower bound because original timing evidence is unavailable. */
+	readonly hiddenComputeIncomplete?: true;
+	/** Only unambiguous producer shares of the same deduplicated hidden total. */
+	readonly hiddenByMode?: readonly ModeComputationTiming[];
 }
 
 /** Pausing closes the current calculation; no interval is created for time outside it. */
@@ -300,17 +305,17 @@ class CalculationClock {
 }
 export interface SpeculativeTaskTiming extends ReturnType<TaskTimeline["measure"]> {}
 
-/** Gross Actor computation ratio; zero remaining calculation is represented separately as fully reused. */
-export function toolSpeedup({ actorComputeMs, reusedExecutionMs, reusedExecutionIncomplete }: ToolComputationTiming): number | null {
-	return !reusedExecutionIncomplete && actorComputeMs !== undefined && actorComputeMs > 0 && Number.isFinite(actorComputeMs + reusedExecutionMs) && reusedExecutionMs >= 0
-		? (actorComputeMs + reusedExecutionMs) / actorComputeMs : null;
+/** T / (T - H); adoption costs are excluded from both quantities. */
+export function toolSpeedup({ toolComputeMs, hiddenComputeMs, hiddenComputeIncomplete }: ToolComputationTiming): number | null {
+	return !hiddenComputeIncomplete && toolComputeMs !== undefined && Number.isFinite(toolComputeMs) && hiddenComputeMs >= 0 && toolComputeMs > hiddenComputeMs
+		? toolComputeMs / (toolComputeMs - hiddenComputeMs) : null;
 }
 
 export class TaskTimeline {
 	private readonly toolWaits: number[] = [];
-	private actorComputeMs: number | undefined = 0;
-	private reusedExecutionMs = 0;
-	private reusedExecutionIncomplete = false;
+	private toolComputeMs: number | undefined = 0;
+	private hiddenComputeMs = 0;
+	private hiddenComputeIncomplete = false;
 	readonly startedAt: number;
 
 	constructor(startedAt: number) { this.startedAt = metric(startedAt); }
@@ -321,95 +326,74 @@ export class TaskTimeline {
 		return completedAt => { this.toolWaits[end] = Math.min(this.toolWaits[end]!, metric(completedAt)); };
 	}
 
-	recordTool(computation: TimelineInterval, reused = false): ToolComputationTiming {
-		return this.recordCall([{ computation, reused }]);
+	recordTool(computation: TimelineInterval, issuedAt: number, reused = false): ToolComputationTiming {
+		return this.recordCall([{ computation, reused }], issuedAt);
 	}
 
 	/** Exactly one settled Actor call. Shared work counts once here; an independent later reuse counts again. */
-	recordCall(roots: readonly TimelineDependency[], onReused?: (shares: readonly ComputationReuseShare[]) => void): ToolComputationTiming {
-		const selected = new Map<string, { computation: TimelineInterval; flags: number; producer?: ComputationProducer | null; lineage?: ComputationLineage | null }>();
-		const visited = new Map<TimelineInterval, number>();
-		const groups = new ComputationGroups();
-		let complete = true, reusedExecutionIncomplete = false;
+	recordCall(roots: readonly TimelineDependency[], issuedAt: number): ToolComputationTiming {
+		const selected = new Map<string, { computation: TimelineInterval; flags: number; producer?: ComputationProducer | null }>();
+		const visited = new Map<TimelineInterval, number>(), groups = new ComputationGroups();
+		let complete = true, hiddenComputeIncomplete = !Number.isFinite(issuedAt);
 		const visit = (input: TimelineDependency, inheritedReuse = false): void => {
-			if (input.computeUncertain && !inheritedReuse && !input.reused) complete = false;
-			if (input.computeUncertain && (inheritedReuse || input.reused)) reusedExecutionIncomplete = true;
+			if (input.computeUncertain) { complete = false; if (inheritedReuse || input.reused) hiddenComputeIncomplete = true; }
 			if (input.overhead) return;
 			const computation = input.computation, reused = inheritedReuse || !!input.reused, flag = reused ? 2 : 1;
 			if ((visited.get(computation) ?? 0) & flag) return;
 			visited.set(computation, (visited.get(computation) ?? 0) | flag);
 			const key = computationIdentity(computation), previous = selected.get(key);
 			for (const group of computationGroups(computation)) groups.join(key, group);
-			const producer = computationProducer(computation), combined = mergeProducers(previous?.producer, producer);
 			selected.set(key, { computation: preferredComputation(previous?.computation, computation),
-				flags: (previous?.flags ?? 0) | flag,
-				producer: combined, lineage: combined === null ? null : mergeLineages(previous?.lineage,
-					producer?.feedback !== undefined ? { source: producer.source, feedback: producer.feedback } : undefined) });
+				flags: (previous?.flags ?? 0) | flag, producer: mergeProducers(previous?.producer, computationProducer(computation)) });
 			for (const dependency of dependencies.get(computation) ?? []) visit(dependency, reused);
 		};
 		for (const root of roots) visit(root);
 		const grouped = [new Map<string, TimelineInterval[]>(), new Map<string, TimelineInterval[]>()];
 		const attributed = new Map<string, { interval: TimelineInterval; producer?: ComputationProducer }[]>();
-		const policy = new Map<string, { interval: TimelineInterval; producer?: ComputationLineage }[]>();
-		const lineageTokens = new Map<unknown, Map<string, ComputationLineage>>(), receipts = new Map<ComputationLineage, number>();
-		const lineageToken = (lineage: ComputationLineage): ComputationLineage => {
-			let sources = lineageTokens.get(lineage.feedback);
-			if (!sources) { sources = new Map(); lineageTokens.set(lineage.feedback, sources); }
-			let token = sources.get(lineage.source);
-			if (!token) { token = lineage; sources.set(lineage.source, token); }
-			return token;
-		};
-		const creditLineage = (lineage: ComputationLineage | null | undefined, duration: number): void => {
-			if (!lineage || duration <= 0) return;
-			const token = lineageToken(lineage);
-			receipts.set(token, (receipts.get(token) ?? 0) + duration);
-		};
 		const modes = new Map<string, ModeComputationTiming>();
 		const credit = (producer: ComputationProducer | null | undefined, duration: number): void => {
 			if (!producer?.mode || duration <= 0) return;
 			const key = producerKey(producer);
-			modes.set(key, { source: producer.source, mode: producer.mode, reusedExecutionMs: (modes.get(key)?.reusedExecutionMs ?? 0) + duration });
+			modes.set(key, { source: producer.source, mode: producer.mode, hiddenComputeMs: (modes.get(key)?.hiddenComputeMs ?? 0) + duration });
 		};
 		const totals = [0, 0];
-		for (const { computation, flags, producer, lineage } of selected.values()) {
-			if (flags & 2 && incompleteReuse.has(computation)) reusedExecutionIncomplete = true;
-			const source = provenance.get(computation);
+		let reused = false;
+		for (const { computation, flags, producer } of selected.values()) {
+			if (incompleteReuse.has(computation)) { complete = false; if (flags & 2) hiddenComputeIncomplete = true; }
+			const priorMs = provenance.get(computation)?.priorMs ?? 0;
+			totals[0]! += priorMs;
 			const shared = (dependencies.get(computation) ?? []).flatMap(input => (input.shared ?? []).flatMap(part => {
 				if (computationClock(part) !== computationClock(computation)) return [];
-				// A current-clock join has no coordinate relationship to an older producer's interval.
 				const sameClock = computationClock(part) === computationClock(input.computation);
 				return [{ startedAt: sameClock ? Math.max(input.computation.startedAt, part.startedAt) : part.startedAt,
 					completedAt: sameClock ? Math.min(input.computation.completedAt, part.completedAt) : part.completedAt }];
 			})).filter(part => part.completedAt > part.startedAt);
 			const all = (calculationSpans.get(computation) ?? [computation]).flatMap(span => exclusiveIntervals(span, shared));
 			const owner = JSON.stringify([groups.owner(computationIdentity(computation)), computationClock(computation)]);
-			for (const [index, groupsByOwner] of grouped.entries()) if (flags & (1 << index)) {
-				totals[index]! += source?.priorMs ?? 0;
-				const group = groupsByOwner.get(owner) ?? [];
-				group.push(...all); groupsByOwner.set(owner, group);
+			const origin = computationTimeOrigin(computation);
+			const cutoff = computationClock(computation) === identityNamespace ? issuedAt : origin === undefined ? NaN : issuedAt + (performance.timeOrigin - origin);
+			const hidden = flags & 2 && Number.isFinite(cutoff) ? all.filter(span => span.startedAt < cutoff)
+				.map(span => ({ startedAt: span.startedAt, completedAt: Math.min(span.completedAt, cutoff) })) : [];
+			for (const [index, intervals] of [all, hidden].entries()) {
+				const group = grouped[index]!.get(owner) ?? [];
+				group.push(...intervals); grouped[index]!.set(owner, group);
 			}
 			if (flags & 2) {
-				credit(producer, source?.priorMs ?? 0);
+				reused = true;
+				if (priorMs > 0 || all.length > 0 && !Number.isFinite(cutoff)) hiddenComputeIncomplete = true;
 				const group = attributed.get(owner) ?? [];
-				group.push(...all.map(interval => ({ interval, producer: producer?.mode ? producer : undefined }))); attributed.set(owner, group);
-				if (onReused) {
-					creditLineage(lineage, source?.priorMs ?? 0);
-					const shares = policy.get(owner) ?? [];
-					shares.push(...all.map(interval => ({ interval, producer: lineage ?? undefined }))); policy.set(owner, shares);
-				}
+				group.push(...hidden.map(interval => ({ interval, producer: producer?.mode ? producer : undefined }))); attributed.set(owner, group);
 			}
 		}
 		for (const [index, groupsByOwner] of grouped.entries()) for (const all of groupsByOwner.values()) totals[index]! += unionDuration(all);
 		for (const spans of attributed.values()) attributeUnion(spans, credit, producerKey);
-		if (onReused) for (const spans of policy.values()) attributeUnion(spans, creditLineage, lineageToken);
-		const reusedByMode = Object.freeze([...modes.values()].map(value => Object.freeze(value)));
-		const timing = Object.freeze({ actorComputeMs: complete ? totals[0]! : undefined, reusedExecutionMs: totals[1]!,
-			...(reusedExecutionIncomplete ? { reusedExecutionIncomplete: true as const } : {}),
-			...(reusedByMode.length ? { reusedByMode } : {}) });
-		this.actorComputeMs = this.actorComputeMs !== undefined && timing.actorComputeMs !== undefined ? this.actorComputeMs + timing.actorComputeMs : undefined;
-		this.reusedExecutionMs += timing.reusedExecutionMs;
-		this.reusedExecutionIncomplete ||= reusedExecutionIncomplete;
-		onReused?.(Object.freeze([...receipts].map(([lineage, reusedExecutionMs]) => Object.freeze({ ...lineage, reusedExecutionMs }))));
+		const hiddenByMode = Object.freeze([...modes.values()].map(value => Object.freeze(value)));
+		const timing = Object.freeze({ toolComputeMs: complete ? totals[0]! : undefined, hiddenComputeMs: totals[1]!,
+			...(reused ? { reused: true as const } : {}), ...(hiddenComputeIncomplete ? { hiddenComputeIncomplete: true as const } : {}),
+			...(hiddenByMode.length ? { hiddenByMode } : {}) });
+		this.toolComputeMs = this.toolComputeMs !== undefined && timing.toolComputeMs !== undefined ? this.toolComputeMs + timing.toolComputeMs : undefined;
+		this.hiddenComputeMs += timing.hiddenComputeMs;
+		this.hiddenComputeIncomplete ||= hiddenComputeIncomplete;
 		return timing;
 	}
 
@@ -420,8 +404,8 @@ export class TaskTimeline {
 			const start = Math.max(startedAt, metric(this.toolWaits[index]!)), end = Math.min(completedAt, metric(this.toolWaits[index + 1]!));
 			if (end > start) waits.push({ startedAt: start, completedAt: end });
 		}
-		return Object.freeze({ startedAt, completedAt, actorComputeMs: this.actorComputeMs,
-			reusedExecutionMs: this.reusedExecutionMs, ...(this.reusedExecutionIncomplete ? { reusedExecutionIncomplete: true as const } : {}),
+		return Object.freeze({ startedAt, completedAt, toolComputeMs: this.toolComputeMs,
+			hiddenComputeMs: this.hiddenComputeMs, ...(this.hiddenComputeIncomplete ? { hiddenComputeIncomplete: true as const } : {}),
 			toolWaitMs: unionDuration(waits) });
 	}
 }
@@ -430,6 +414,10 @@ function objectIdentity(object: object): string {
 	let id = identities.get(object);
 	if (!id) { id = `timeline:${identityNamespace}:${++nextIdentity}`; identities.set(object, id); }
 	return id;
+}
+
+function computationTimeOrigin(computation: TimelineInterval): number | undefined {
+	return computationClock(computation) === identityNamespace ? performance.timeOrigin : timeOrigins.get(computation);
 }
 
 function computationClock(computation: TimelineInterval): string { return clocks.get(computation) ?? identityNamespace; }
@@ -491,12 +479,6 @@ function mergeProducers(previous: ComputationProducer | null | undefined, curren
 	return previous?.mode !== undefined ? previous : current?.mode !== undefined ? current : previous ?? current;
 }
 
-function mergeLineages(previous: ComputationLineage | null | undefined, current: ComputationLineage | undefined): ComputationLineage | null | undefined {
-	if (previous === null || previous && current && (previous.source !== current.source ||
-		previous.feedback !== current.feedback && !Object.is(previous.feedback, current.feedback))) return null;
-	return previous ?? current;
-}
-
 /** Ownership passes production provenance to children; borrowed dependencies have their own owner chain. */
 function computationProducer(computation: TimelineInterval): ComputationProducer | undefined {
 	let current: TimelineInterval | undefined = computation;
@@ -508,7 +490,7 @@ function computationProducer(computation: TimelineInterval): ComputationProducer
 	return undefined;
 }
 
-/** The same owner union as R; an overlapping segment with conflicting or missing provenance stays unassigned. */
+/** The same owner union as H; an overlapping segment with conflicting or missing provenance stays unassigned. */
 function attributeUnion<T>(spans: readonly { interval: TimelineInterval; producer?: T }[],
 	credit: (producer: T, duration: number) => void, keyOf: (producer: T) => unknown): void {
 	const points = spans.flatMap(({ interval, producer }) => [
