@@ -10,7 +10,7 @@ export interface TimelineDependency {
 	readonly owned?: boolean;
 	/** Only a successful consumption of existing work issues this receipt. */
 	readonly reused?: boolean;
-	/** Validation, adoption and delivery are excluded from computation accounting. */
+	/** Adoption-time validation and delivery are excluded; original proof and sealing are computation. */
 	readonly overhead?: boolean;
 	/** The current boundary cannot separate remaining calculation from adoption overhead. */
 	readonly computeUncertain?: boolean;
@@ -121,7 +121,7 @@ export class TimelineInterval {
 		} finally { clock.finish(); }
 	}
 
-	/** Cross a calculation boundary without timing validation, adoption or cleanup. */
+	/** Cross a calculation boundary without timing adoption-time validation, delivery or cleanup. */
 	static async outside<T>(execute: () => T | Promise<T>): Promise<T> {
 		const clock = calculating.getStore();
 		if (!clock) return execute();

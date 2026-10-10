@@ -27,12 +27,13 @@ async function observe(processes: Record<number, readonly string[]>, options?: S
 }
 
 describe("strace provenance decoder", () => {
-	test("retains ENOTDIR only when every lookup of that path failed that way", async () => {
-		const missing = 'newfstatat(AT_FDCWD, "/work/module.js/package.json", 0x0, 0) = -1 ENOTDIR (Not a directory)';
+	test.for(["ENOENT", "ENOTDIR"])("retains %s only when every lookup of that path failed that way", async (failure) => {
+		const missing = `newfstatat(AT_FDCWD, "/work/module.js/package.json", 0x0, 0) = -1 ${failure} (lookup failed)`;
 		const target = { path: "/work/module.js/package.json", role: "input" };
-		expect((await observe({ 100: [EXEC, missing, missing] })).paths).toContainEqual({ ...target, lookupFailure: "ENOTDIR" });
-		expect((await observe({ 100: [EXEC, missing.replace("ENOTDIR", "ENOENT")] })).paths).toContainEqual({ ...target, lookupFailure: "ENOENT" });
-		for (const other of [missing.replace("ENOTDIR", "ENOENT"),
+		expect((await observe({ 100: [EXEC, missing, missing] })).paths).toContainEqual({ ...target, lookupFailure: failure });
+		for (const other of [missing.replace(failure, failure === "ENOENT" ? "ENOTDIR" : "ENOENT"),
+			`mkdir("/work/module.js/package.json", 0700) = -1 ${failure} (lookup failed)`,
+			`openat(AT_FDCWD, "/work/module.js/package.json", O_WRONLY|O_CREAT, 0600) = -1 ${failure} (lookup failed)`,
 			'openat(AT_FDCWD, "/work/module.js/package.json", O_RDONLY) = 3</work/module.js/package.json>',
 			`newfstatat(AT_FDCWD, "/work/module.js/package.json", ${STAT}, 0) = 0`]) {
 			for (const lines of [[missing, other], [other, missing]])
@@ -107,9 +108,10 @@ describe("strace provenance decoder", () => {
 			// ls -l asks an NSS cache first: a refused local socket is only a path the Actor's host must lack too.
 			const nss = ["socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0) = 3<UNIX-STREAM:[9]>",
 				'connect(3<UNIX-STREAM:[9]>, {sa_family=AF_UNIX, sun_path="/var/run/nscd/socket"}, 110) = -1 EACCES (Permission denied)'];
-			const refused = await run(["ls", "-la"], "/work/a.txt", nss);
-			expect(refused.taints).toEqual(["clock", "random"]);
-			expect(refused.paths).toContainEqual({ path: "/var/run/nscd/socket", role: "input" });
+			for (const error of ["ENOENT", "EACCES", "ECONNREFUSED"]) {
+				const refused = await run(["ls", "-la"], "/work/a.txt", nss.map(line => line.replace("EACCES", error)));
+				expect([refused.taints, refused.paths.find(item => item.path === "/var/run/nscd/socket")]).toEqual([["clock", "random"], { path: "/var/run/nscd/socket", role: "input", ...(error === "ENOENT" ? { lookupFailure: "ENOENT" } : {}) }]);
+			}
 			expect((await run(["ls", "-la"], "/work/a.txt", [nss[0]!, nss[1]!.replace("-1 EACCES (Permission denied)", "0")])).taints).toContain("network");
 		} finally { await fs.rm(root, { recursive: true, force: true }); }
 	});

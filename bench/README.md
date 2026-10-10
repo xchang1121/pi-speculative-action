@@ -2,18 +2,9 @@
 
 这里保留维护中的资格入口、模型套件和报告工具。日常回归使用 `npm test`；研究笔记、临时场景、构建快照和逐轮测量不提交到仓库，试验结束后清理。
 
-## 本地回归
+## 回归与受控搜索资格
 
-```sh
-npm run check
-npm run build
-npm run bench:check
-npm test -- --maxWorkers=1 --no-file-parallelism
-```
-
-Windows 与 WSL 顺序运行。性能压力、模型请求和后端资格按需执行，不随文档修改重复运行。原版工具资格共用 `stock-tool-qualification.ts`；Linux 进程场景共用 `test/linux-process-fixture.ts`。
-
-## 受控搜索资格
+本地检查命令见[开发与验证](../README.md#开发与验证)，Windows 与 WSL 顺序运行。性能压力、模型请求和后端资格按需执行，不随文档修改重复运行。原版工具资格共用 `stock-tool-qualification.ts`；Linux 进程场景共用 `test/linux-process-fixture.ts`。
 
 ```sh
 node bench/portable-kernel.mjs
@@ -40,8 +31,6 @@ npm run bench:overlay-probe
 失败时保留原错误和最小复现信息；时钟证明拒绝不能通过延长等待或跳过检查消除。
 
 ## 模型套件
-
-`bench:tape` 离线 SSE 相似度分析入口已退役；不再维护独立的协议解析、上下文配对和潜在命中统计。实际命中、工具批次、usage、失败和耗时由下述完整运行报告保留，既有原始录制与阶段材料仍在仓库外保存。
 
 真实模型套件需要显式提供 `DEEPSEEK_API_KEY`，会产生网络和 API 成本：
 
@@ -72,11 +61,9 @@ npm run bench:suite -- --suite swe_diverse --repeats 3 --label speculative
 | Actor 资源争用与内部进程接管 | `test/scheduler.test.ts`、`test/runtime-engine.test.ts`、`test/linux-process-world.test.ts` | 跨会话硬件预算、Actor 优先、启动窗口、物理回收与内部计算的一次采纳 |
 | 自然修改与验证任务 | `bench:suite -- --suite swe_smoke --paired` | 最终回复、补丁、数据集指定测试、完整计时和实测 token/费用 |
 
-汇总时保留低命中、失败、超时及较慢样本，分别报告工具加速比、累计剩余计算与毛复用计算耗时、工具等待均值/P95、命中率、token 和任务正确性。构造的模型时序、组件资格和单个真实任务分别报告。
-
 ## 计时与验收规则
 
-工具加速比为 `T / (T - H)`：`T = toolComputeMs` 是当前调用实际使用的全部计算耗时，包括复用前缀、生产者在 Actor 调用后继续完成的计算，以及 Actor 自己执行的剩余部分；`H = hiddenComputeMs` 只计实际复用且在本次 Actor 发出调用之前完成的计算。单段计算为 `max(min(实际计算时长, Actor 调用时间 - 原始计算起点), 0)`；不连续的计算逐段截断，同一调用按计算身份去重，同次原始执行的并行父子区间取并集，不计空档或未消费的兄弟进程。独立后续调用再次复用时，使用该次调用自己的时间重新记账。验证、拷贝、采纳、恢复和交付开销均不进入 T、H 或分母，只供内部优化诊断。记录完整、T=H>0 时报告 `fullyHidden`，比值为 `null`；T 未知、H 不完整或 T=H=0 时显示 `n/a`。
+工具加速比为 `T / (T - H)`：`T = toolComputeMs` 是当前调用实际使用的全部计算耗时，包括复用前缀、成果首次生成所必需的证明和封存、生产者在 Actor 调用后继续完成的计算，以及 Actor 自己执行的剩余部分；`H = hiddenComputeMs` 只计实际复用且在本次 Actor 发出调用之前完成的部分。单段计算为 `max(min(实际计算时长, Actor 调用时间 - 原始计算起点), 0)`；不连续的计算逐段截断，同一调用按计算身份去重，同次原始执行的并行父子区间取并集，不计空档或未消费的兄弟进程。独立后续调用再次复用时，使用该次调用自己的时间重新记账。采纳当次的验新、拷贝、恢复和交付开销不进入 T、H 或分母，只供内部优化诊断。记录完整、T=H>0 时报告 `fullyHidden`，比值为 `null`；T 未知、H 不完整或 T=H=0 时显示 `n/a`。
 
 `toolWaitMs` 仅作原始延迟诊断，按 Actor 调用起止区间取并集，包含准备、验证、采纳、回退和结算；它不包含模型思考时间，也不作为计算加速比的分母。
 

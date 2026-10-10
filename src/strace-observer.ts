@@ -29,7 +29,7 @@ export function straceCommand(
 export type ObservedProcessPath =
 	/** `listed` when its entries reached the run: it read them, or a removal or rename found some. */
 	| { readonly path: string; readonly role: DependencyRole; readonly listed?: true;
-		/** Uniform lookup error; the dependency walker must independently prove the failing component. */
+		/** Uniform non-writing lookup error; the dependency walker must independently prove the failing component. */
 		readonly lookupFailure?: "ENOENT" | "ENOTDIR" }
 	| { readonly path: string; readonly role: "metadata"; readonly followSymlinks: boolean; readonly digest: Sha256Digest; readonly fields?: readonly FilesystemObservationField[] };
 
@@ -592,9 +592,11 @@ export async function observeStrace(
 
 	const paths = new Map<string, DependencyRole>(), listedPaths = new Set<string>(), metadata = new Map<string, Extract<ObservedProcessPath, { role: "metadata" }>>();
 	const lookupFailures = new Map<string, "ENOENT" | "ENOTDIR" | undefined>();
-	// Native instructions and ELF startup state expose clock/random inputs without a syscall.
-	// A complete transcript therefore permits only the existing one-shot transfer, never proof
-	// that this process can be repeated. Do not infer unused inputs from their absence here.
+	const observePath = (target: string, role: DependencyRole, failure?: "ENOENT" | "ENOTDIR") => {
+		if (paths.get(target) !== "executable") paths.set(target, role);
+		lookupFailures.set(target, lookupFailures.has(target) && lookupFailures.get(target) !== failure ? undefined : failure);
+	};
+	// A transcript cannot prove untraced clock/random inputs repeatable; it permits only a one-shot transfer.
 	const taints = new Set<ProvenanceTaint>(["clock", "random"]), executions: TracedExecution[] = [], listingPIDs = new Set<number>();
 	const unsupportedSyscalls = new Set<string>();
 	let unsupportedSyscallsTruncated = false;
@@ -657,7 +659,7 @@ export async function observeStrace(
 			// A local socket reaches another process only once connected: a refused path (an NSS cache that is absent here) is a
 			// pathname dependency, validated absent where the Actor runs.
 			const refused = syscall === "connect" && /^-1 (?:ENOENT|ECONNREFUSED|EACCES)\b/.test(line.result) ? /\bsun_path="(\/[^"]+)"/.exec(line.args[1] ?? "")?.[1] : undefined;
-			if (refused) { if (!paths.has(refused)) paths.set(refused, "input"); continue; }
+			if (refused) { observePath(refused, "input", /^-1 ENOENT\b/.test(line.result) ? "ENOENT" : undefined); continue; }
 			const output = !!options.outputEndpoints?.includes(`socket:[${/^\d+<UNIX-STREAM:\[(\d+)/.exec(line.args[0] ?? "")?.[1]}]`);
 			const outputQuery = output && /^(?:getsockname|getpeername|getsockopt)$/.test(syscall);
 			// Created pairs stay within the tree only while they neither open another connection nor send to another address.
@@ -762,13 +764,11 @@ export async function observeStrace(
 			const observedPaths = syscallPaths(line, syscall, cwd);
 			if (!observedPaths) { complete = false; incompleteReasons.add(`unresolved_pathname:${syscall}:${pid}`); }
 			const nonEmpty = /^(?:rmdir|unlinkat|rename(?:at2?)?)$/.test(syscall) && /^-1 (?:ENOTEMPTY|EEXIST)\b/.test(line.result);
+			// Creating a name can fail on its parent; a multi-path syscall does not identify the failed operand.
+			const failure = observedPaths?.length === 1 && !writesPath(line) ? /^-1 (ENOENT|ENOTDIR)\b/.exec(line.result)?.[1] as "ENOENT" | "ENOTDIR" | undefined : undefined;
 			for (const observed of observedPaths ?? []) {
-				if (paths.get(observed) !== "executable") paths.set(observed, role);
+				observePath(observed, role, failure);
 				if (nonEmpty) listedPaths.add(observed);
-				// A multi-path syscall does not identify which operand failed its walk.
-				const failure = observedPaths?.length === 1 ? /^-1 (ENOENT|ENOTDIR)\b/.exec(line.result)?.[1] as "ENOENT" | "ENOTDIR" | undefined : undefined;
-				if (!lookupFailures.has(observed)) lookupFailures.set(observed, failure);
-				else if (lookupFailures.get(observed) !== failure) lookupFailures.set(observed, undefined);
 			}
 			if ((syscall === "chdir" || syscall === "fchdir") && syscallSucceeded(line)) {
 				const changed = tracedCwd(line, cwd);
