@@ -72,24 +72,22 @@ export class ActorAction<Candidate extends { readonly id: string } = { readonly 
 		return capture;
 	}
 
-	setFallback(failure: ResolutionCause, candidateID?: string): boolean {
-		if (this.stateValue.status !== "matching") return false;
+	setFallback(failure: ResolutionCause, candidateID?: string): void {
+		if (this.stateValue.status !== "matching") return;
 		this.fallbackValue = Object.freeze({ cause: failure, ...(candidateID ? { candidateID } : {}) });
-		return true;
 	}
 
-	rejectCandidate(candidateID: string, match: ActionKeyMatch, failure: ResolutionCause): boolean {
-		if (!this.accepts(candidateID)) return false;
+	rejectCandidate(candidateID: string, match: ActionKeyMatch, failure: ResolutionCause): void {
+		if (this.stateValue.status !== "matching") return;
 		this.rejections.push(
 			Object.freeze({ candidateID, match: Object.freeze({ ...match }), cause: Object.freeze({ ...failure }) }),
 		);
-		return this.setFallback(failure, candidateID);
+		this.setFallback(failure, candidateID);
 	}
 
-	select(selection: ActorCandidateSelection<Candidate, Output>): boolean {
-		if (!this.accepts(selection.candidate.id)) return false;
+	select(selection: ActorCandidateSelection<Candidate, Output>): void {
+		if (this.stateValue.status !== "matching") return;
 		this.stateValue = Object.freeze({ status: "selected", value: Object.freeze({ ...selection }) });
-		return true;
 	}
 
 	settleSelection(
@@ -130,19 +128,14 @@ export class ActorAction<Candidate extends { readonly id: string } = { readonly 
 	settleActor(execution: TimelineInterval, isError: boolean): ActorActionSettlement | undefined {
 		if (this.stateValue.status !== "awaiting_fallback") return undefined;
 		const toolExecution = TimelineInterval.from(execution);
-		const duration = toolExecution.completedAt - toolExecution.startedAt;
 		return this.finish(Object.freeze({
 			kind: "actor",
 			origin: "fallback",
 			...this.fallbackValue,
-			durationMs: duration,
+			durationMs: toolExecution.completedAt - toolExecution.startedAt,
 			isError,
 			toolExecution,
 		}), this.stateValue.matchedPredictions);
-	}
-
-	private accepts(candidateID: string): boolean {
-		return this.stateValue.status === "matching" && !this.rejections.some(rejection => rejection.candidateID === candidateID);
 	}
 
 	private finish(provider: ActorActionProvider, matchedPredictions: readonly PredictionIdentity[]): ActorActionSettlement {

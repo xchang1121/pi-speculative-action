@@ -529,7 +529,7 @@ export function makeSpeculativeActionRuntime<
 		const candidate: Candidate = {
 			id: `${input.origin === "prediction" ? "spec" : input.origin === "actor_preview" ? "actor" : input.origin}_${sequence}_${input.key.hash.slice(0, 12)}`,
 			work: new CandidateExecution<WorldBranch<Output>>(input.origin !== "actor_result" && input.route.reuse === "exclusive_branch" ? "exclusive" : "shared",
-				undefined, () => candidateStore.notify(session.id)),
+				undefined, () => candidateStore.notify(session.id, false)),
 			actorAdopted: input.origin === "actor_result",
 			owner: { ...turnContext(context), draft, index: sequence - 1 },
 			projectionCoverage: [],
@@ -1341,6 +1341,7 @@ export function makeSpeculativeActionRuntime<
 
 		for (;;) {
 			const observation = candidateStore.observe(state.sessionID);
+			const stop = AbortSignal.any([signal, observation.signal]);
 			try {
 				const ranked = rankCandidates(state.session, actualKey, preview?.state.status === "candidate" ? preview.state.candidateID : undefined)
 					.filter(({ candidate }) => !attempted.has(candidate));
@@ -1350,7 +1351,8 @@ export function makeSpeculativeActionRuntime<
 				}), mode = retry?.mode ?? "cached"; retry = undefined;
 				if (!choice) {
 					if (!pending.size && !ranked.length) break;
-					if ((await waitForCompletion(Promise.race([...pending, observation.changed]), signal)).status === "aborted") { actorAction.setFallback(cause("control", "actor_aborted")); break; }
+					await waitForCompletion(Promise.race(pending), stop);
+					if (signal.aborted) { actorAction.setFallback(cause("control", "actor_aborted")); break; }
 					continue;
 				}
 				const candidate = choice.candidate;
@@ -1368,11 +1370,10 @@ export function makeSpeculativeActionRuntime<
 					const authorization = await authorize(input, candidate, signal);
 					if (stopCandidate(candidate)) break;
 					if (authorization) { actorAction.rejectCandidate(candidate.id, choice.match, authorization); continue; }
-					const waiting = await waitForCompletion(Promise.race([candidate.work.completion, observation.changed, ...pending]), signal);
+					const waiting = await waitForCompletion(Promise.race([candidate.work.completion, ...pending]), stop);
 					if (stopCandidate(candidate)) break;
-					if (waiting.status === "aborted") { actorAction.setFallback(cause("control", "actor_aborted"), candidate.id); break; }
+					if (waiting.status === "aborted" || !waiting.value) { attempted.delete(candidate); continue; }
 					const execution = waiting.value;
-					if (!execution) { attempted.delete(candidate); continue; }
 					if (execution.status !== "succeeded") { actorAction.rejectCandidate(candidate.id, choice.match, execution.cause); continue; }
 					const branch = execution.output;
 					const sourceCompatibility = branch.reconstructionScope === "current_action" && choice.match.kind !== "exact" ? undefined
@@ -1461,7 +1462,10 @@ export function makeSpeculativeActionRuntime<
 					retireUndemandedCandidate(state.session, candidate, cause("retention", "actor_released"));
 					scheduler.refresh(candidate, forecastsForCandidate(state.session, candidate));
 				}
-			} finally { observation.dispose(); }
+			} finally {
+				observation.dispose();
+				if (observation.changed) { attempted.clear(); retry = undefined; }
+			}
 		}
 	};
 

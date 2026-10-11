@@ -34,7 +34,7 @@ interface IndexedScope<Entry> {
 /** One registration survives execution, settlement and cache retention. Keys identify reuse, IDs own work. */
 export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 	private readonly scopes = new Map<Scope, IndexedScope<Entry>>();
-	private readonly waiters = new Map<Scope, Set<() => void>>();
+	private readonly waiters = new Map<Scope, Set<(changed: boolean) => void>>();
 	private readonly projectors: readonly ActionKeyProjector[];
 	private readonly score: (entry: Entry, evidence: ResultCacheEvidence, now: number) => number;
 	private readonly now: () => number;
@@ -59,16 +59,16 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 	}
 
 	/** Observe before yielding: a later producer or sealed view may satisfy an existing consumer. */
-	observe(scope: Scope): { changed: Promise<void>; dispose: () => void } {
-		const waiters = this.waiters.get(scope) ?? new Set<() => void>();
-		let wake!: () => void;
-		const changed = new Promise<void>(resolve => { wake = resolve; });
+	observe(scope: Scope): { signal: AbortSignal; changed: boolean; dispose: () => void } {
+		const waiters = this.waiters.get(scope) ?? new Set<(changed: boolean) => void>(), controller = new AbortController();
+		const observation = { signal: controller.signal, changed: false, dispose: () => { waiters.delete(wake); if (!waiters.size) this.waiters.delete(scope); } };
+		const wake = (changed: boolean) => { observation.changed ||= changed; controller.abort(); };
 		waiters.add(wake); this.waiters.set(scope, waiters);
-		return { changed, dispose: () => { waiters.delete(wake); if (!waiters.size) this.waiters.delete(scope); } };
+		return observation;
 	}
 
-	/** Includes availability changes within an existing result owner. */
-	notify(scope: Scope): void { for (const wake of this.waiters.get(scope) ?? []) wake(); }
+	/** Availability wakes waiters; only new result evidence invalidates a search pass. */
+	notify(scope: Scope, changed = true): void { for (const wake of this.waiters.get(scope) ?? []) wake(changed); }
 
 	getOrCreate(
 		scope: Scope,

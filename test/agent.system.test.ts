@@ -188,42 +188,45 @@ test.for(["unrelated", "changed", "descendant"])("retains native workflow result
 	} finally { await f.dispose(); await sandbox.dispose(); await native.dispose(); }
 });
 
-test("shares pending reads, reselects later results and retains fresh queries across turns", async () => {
+test("reconsiders restored results while sharing pending reads and retains fresh queries across turns", async () => {
 	const cwd = await directories.create(), reader = createReadTool(cwd);
 	const file = path.join(cwd, "notes.txt"), original = Array.from({ length: 20 }, (_, i) => `line ${i + 1}`).join("\n");
 	await writeFile(file, original);
 	const world = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: ["read"], maxBytes: () => 1024 * 1024 });
 	const computed = deferred(), release = deferred(), entered = deferred(), controller = new AbortController();
+	const args = { path: "notes.txt", offset: 5, limit: 1 }, wide = { ...args, offset: 1, limit: 10 };
 	let runs = 0, authorizations = 0;
 	const f = systemHost(cwd, [reader, createWriteTool(cwd)], {
 		preflight: context => {
-			if ((context.args as { offset?: number }).offset === 5) {
-				entered.resolve();
-				if (++authorizations > 100) controller.abort(new Error("shared waiters prevented producer progress"));
-			}
+			if ((context.args as { offset?: number }).offset === 5 && ++authorizations > 100)
+				controller.abort(new Error("shared waiters prevented producer progress"));
 			return true;
 		},
 		executionWorlds: [{ ...world, speculation: { ...world.speculation!, execute: async context => {
 			const first = ++runs === 1, branch = await world.speculation!.execute(context);
-			if (first) { computed.resolve(); await release.promise; } return branch;
+			if (!first) { computed.resolve(); await release.promise; } return first ? { ...branch, reconstruct: undefined, reconstructionScope: undefined,
+				validate: async () => { const result = await branch.validate!(); if (result.status === "stale") entered.resolve(); return result; },
+			} : branch;
 		} } }],
 	});
 	let actors: Promise<unknown>[] = [];
 	try {
-		await f.start(); await f.preview("read", { path: "notes.txt", offset: 1, limit: 10 }); await computed.promise;
-		const args = { path: "notes.txt", offset: 5, limit: 1 };
+		await f.start(); await f.preview("read", args); await f.ready();
+		await writeFile(file, original.replaceAll("line", "edit"));
+		await f.preview("read", wide); await computed.promise;
 		actors = [1, 2].map(() => f.execute("read", args, controller.signal).catch(error => error)); await entered.promise;
-		await f.preview("read", { path: "notes.txt", offset: 3, limit: 10 }); await f.ready();
-		expect(controller.signal.aborted).toBe(false);
+		await writeFile(file, original); release.resolve();
 		const expected = await reader.execute("oracle", args); expect(await Promise.all(actors)).toEqual([expected, expected]);
-		release.resolve(); await f.preview("read", { ...args, offset: 6 }); await f.finish(); await f.start("second");
-		for (const input of [args, { path: "notes.txt", offset: 1, limit: 10 }])
+		await f.preview("read", { ...args, offset: 6 }); await f.finish(); await f.start("second");
+		for (const event of f.events.filter(event => event.type === "actor_action")) {
+			expect(event.settlement.provider).toMatchObject({ kind: "speculative", match: { kind: "exact" } }); expect(event.computation?.hiddenComputeMs).toBeGreaterThan(0);
+		}
+		for (const input of [args, wide])
 			expect(await f.execute("read", input)).toEqual(await reader.execute("reference", input));
 		expect({ runs, fallbacks: f.fallbacks }).toEqual({ runs: 2, fallbacks: [] });
 		await f.execute("write", { path: "notes.txt", content: "new\n" });
-		const wide = { path: "notes.txt", offset: 1, limit: 10 };
 		expect(textOutput(await f.execute("read", wide))).toBe("new\n");
-		await writeFile(file, original); expect(await f.execute("read", wide)).toEqual(await reader.execute("restored", wide)); await f.finish();
+		await writeFile(file, original); expect(await f.execute("read", args)).toEqual(await reader.execute("restored", args)); await f.finish();
 		expect(f.events.filter(event => event.type === "actor_action").at(-1)?.settlement.provider).toMatchObject({ kind: "speculative", match: { kind: "exact" } });
 	} finally { controller.abort(); release.resolve(); await Promise.allSettled(actors); await f.dispose(); }
 });
