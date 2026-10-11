@@ -350,7 +350,7 @@ export class LinuxProcessReuseBackend {
 		if (!invocation || "trackingOnly" in invocation) return true;
 		const projection = new ExecutionPathProjection({ sourceRoot: invocation.sourceRoot, workspaceRoot: invocation.sourceRoot });
 		const checked = new Set<Sha256Digest>();
-		for (const certificate of [...this.handoffs.results(binding.key, binding.scope), ...await this.store.findByWeakKey(binding.key, invocation.executable).catch(() => [])]) {
+		try { for (const candidates of [this.handoffs.results(binding.key, binding.scope), this.store.candidatesByWeakKey(binding.key, invocation.executable)]) for await (const certificate of candidates) {
 			if (checked.has(certificate.id)) continue;
 			checked.add(certificate.id);
 			const validation = await TimelineInterval.collect(() => validateDynamicDependencyCertificate(certificate.dependencyCertificate, { resolvePath: (logical) => projection.toPhysical(logical),
@@ -358,7 +358,7 @@ export class LinuxProcessReuseBackend {
 				// This scheduling check grants no result adoption authority.
 				acceptedTaints: certificate.dependencyCertificate.taints })).then(result => result.output, () => undefined);
 			if (validation?.status === "valid") return false;
-		}
+		} } catch { /* Unreadable history cannot establish current inputs. */ }
 		return true;
 	}
 
@@ -620,7 +620,7 @@ export class LinuxProcessReuseBackend {
 		this.disposed = true;
 		this.handoffs.dispose();
 		const shared = this.sharedInterposition?.root.then((root) => rm(root, { recursive: true, force: true }), () => undefined);
-		return this.disposal = this.resetActorReplay().finally(() => Promise.all([this.replayWorkspace.dispose(), shared]));
+		return this.disposal = this.resetActorReplay().finally(() => Promise.all([this.replayWorkspace.dispose(), shared, this.store.drain()]));
 	}
 
 	private async resolveReady(): Promise<ReadyBackend> {

@@ -1,6 +1,6 @@
-import { readFile, unlink, writeFile } from "node:fs/promises";
+import { readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { afterEach, expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 import { captureFileDependency, ProcessReusePlanner, ProvenanceCertificateStore, referencedArtifacts, sealProcessCertificate,
 	type ProcessProvenanceCertificate } from "../src/process-reuse.ts";
 import { ProcessHandoffOwnership, ProcessHandoffRegistry, type ProcessHandoff } from "../src/process-handoff.ts";
@@ -9,7 +9,7 @@ import { waitForCompletion } from "../src/scheduler.ts";
 import { TaskTimeline, TimelineInterval } from "../src/task-timing.ts";
 import { processPrototype, processCertificate } from "./process-fixture.ts";
 import { temporaryDirectories } from "./filesystem.ts";
-import { deferred } from "./async.ts";
+import { deferred, nextTurn } from "./async.ts";
 
 const directories = temporaryDirectories("pi-reuse-system-");
 const registries = new Set<ProcessHandoffRegistry>();
@@ -79,18 +79,57 @@ test.each(["certificate JSON", "certificate digest", "artifact bytes", "artifact
 	expect((await reopened.plan(f.request)).kind).toBe("miss");
 });
 
-test("reopens a completed result with its full calculation graph and preserves reported reuse", async () => {
-	const f = await fixture(), plain = await f.produce("timed result");
+test("reopens history incrementally with full calculation graphs, fresh validation and legacy fallback", async () => {
+	const f = await fixture(), certificates: ProcessProvenanceCertificate[] = [];
 	const inputs = Array.from({ length: 4096 }, (_, index) => ({ computation: new TimelineInterval(200 + index * 50, 250 + index * 50), reused: true }));
 	const original = new TimelineInterval(10, 110, [{ computation: new TimelineInterval(20, 40), overhead: true }, ...inputs]);
-	const measured = sealProcessCertificate({ ...plain, result: { ...plain.result, computation: TimelineInterval.serialize(original) } });
-	await f.store.put(measured);
-	const replay = await new ProcessReusePlanner({ store: new ProvenanceCertificateStore(f.root) }).plan(f.request);
-	if (replay.kind !== "completed_replay") throw new Error("completed result was lost");
-	expect(f.output(replay)).toBe("timed result");
-	expect(replay.certificate.id).toBe(plain.id);
-	expect(new TaskTimeline(0).recordTool(TimelineInterval.restore(replay.certificate.result.computation)!, 1_000_000, true))
-		.toMatchObject({ toolComputeMs: 204880, hiddenComputeMs: 204880 });
+	for (let index = 1; index <= 256; index++) {
+		await writeFile(f.input, `input ${index}`);
+		const certificate = await f.produce(`output ${index}`, index); certificates.push(certificate);
+		await f.store.put(index === 256 ? sealProcessCertificate({ ...certificate, result: { ...certificate.result, computation: TimelineInterval.serialize(original) } }) : certificate);
+	}
+	const references = await readdir(path.join(f.root, "indexes"), { recursive: true }), first = certificates[0]!, latest = certificates.at(-1)!;
+	const legacy = path.join(f.root, "indexes", references.find(name => name.endsWith(`${first.id.slice(7)}.ref`))!);
+	await rename(legacy, path.join(path.dirname(legacy), `${first.id.slice(7)}.ref`));
+	await f.store.put(sealProcessCertificate({ ...latest, createdAt: 9999 }));
+	expect((await readdir(path.dirname(legacy))).length).toBe(256); // Duplicate publication keeps the stored metadata and one reference.
+	const store = new ProvenanceCertificateStore(f.root), reads = vi.spyOn(store, "get"), planner = new ProcessReusePlanner({ store });
+	for (const version of [256, 1, 0]) {
+		await writeFile(f.input, `input ${version}`); reads.mockClear();
+		const plan = await planner.plan(f.request);
+		expect(reads).toHaveBeenCalledTimes(version === 256 ? 1 : 256);
+		expect(plan.lookup.pathsetsValidated).toBe(1);
+		if (version === 0) expect(plan.kind).toBe("miss");
+		else {
+			if (plan.kind !== "completed_replay") throw new Error("verified history was lost");
+			expect(f.output(plan)).toBe(`output ${version}`); expect(plan.certificate.id).toBe(certificates[version - 1]!.id);
+			if (version === 256) expect(new TaskTimeline(0).recordTool(TimelineInterval.restore(plan.certificate.result.computation)!, 1_000_000, true))
+				.toMatchObject({ toolComputeMs: 204880, hiddenComputeMs: 204880 });
+		}
+	}
+	expect((await store.findByWeakKey(f.request.weakKey, f.request.executablePath)).map(certificate => certificate.createdAt))
+		.toEqual(Array.from({ length: 256 }, (_, index) => 256 - index));
+});
+
+test.each(["publish", "clear"])("delivers publications while maintenance scans and safely handles a concurrent %s", async operation => {
+	const f = await fixture(), entered = deferred(), release = deferred();
+	await f.store.put(await f.produce("old", 1));
+	const scanning = f.store as unknown as { inventory(): Promise<unknown> }, inventory = scanning.inventory.bind(scanning);
+	let held = false, published = false, drained = false;
+	scanning.inventory = async () => { const snapshot = await inventory(); if (!held) { held = true; entered.resolve(); await release.promise; } return snapshot; };
+	f.store.configure({ maxCertificates: 1 });
+	const publishing = f.store.put(await f.produce("ready", 2)).then(() => { published = true; });
+	try {
+		await entered.promise; await nextTurn(); expect(published).toBe(true);
+		if (operation === "clear") await f.store.clear();
+		await f.store.put(await f.produce("latest", 3));
+		const closing = f.store.drain().then(() => { drained = true; });
+		await nextTurn(); expect(drained).toBe(false);
+		release.resolve(); await closing;
+		expect((await f.store.stats(true)).certificates).toBe(1);
+		const replay = await f.lookup(); if (!replay) throw new Error("concurrent publication was pruned");
+		expect(f.output(replay)).toBe("latest");
+	} finally { release.resolve(); await publishing; await f.store.drain(); }
 });
 
 test.each(["existing", "new"])("delivers a %s producer while an older producer is still running", async peer => {

@@ -1,4 +1,4 @@
-import { certificateReplayable, dependencyPathsetKey, type DynamicDependencyCertificate, isSha256Digest, type ProcessProducerProof, processStrongKey,
+import { certificateReplayable, dependencyPathsetKey, isSha256Digest, type ProcessProducerProof, processStrongKey,
 	type ProcessProvenanceCertificate, type ProvenanceTaint, referencedArtifacts, type Sha256Digest } from "./provenance-certificate.ts";
 import { type ProvenanceValidation, type ProvenanceValidationContext, validateDynamicDependencyCertificate } from "./provenance-validation.ts";
 import { ProvenanceCertificateStore, type VerifiedArtifactClosure } from "./reuse-store.ts";
@@ -33,23 +33,16 @@ export type ProcessReuseMissReason = "no_candidate_pathset" | "certificate_taint
 	| "validation_indeterminate" | "artifact_missing" | "artifact_unreadable" | "observation_contract_incompatible";
 
 export interface ProcessReuseLookupMetrics {
-	readonly candidateCertificates: number;
-	readonly eligibleCertificates: number;
-	readonly pathsetsValidated: number;
-	readonly filesRead: number;
-	readonly bytesRead: number;
-	readonly artifactsLoaded: number;
-	readonly artifactBytesRead: number;
+	readonly candidateCertificates: number; readonly eligibleCertificates: number; readonly pathsetsValidated: number;
+	readonly filesRead: number; readonly bytesRead: number;
+	readonly artifactsLoaded: number; readonly artifactBytesRead: number;
 }
 
 interface ReadyProcessPlan {
-			readonly source: "live" | "l2";
-			readonly weakKey: Sha256Digest;
-			readonly certificate: ProcessProvenanceCertificate;
-			readonly validation: Extract<ProvenanceValidation, { status: "valid" }>;
-			readonly artifacts: VerifiedArtifactClosure;
-			readonly lookup: ProcessReuseLookupMetrics;
-	  }
+	readonly source: "live" | "l2"; readonly weakKey: Sha256Digest; readonly certificate: ProcessProvenanceCertificate;
+	readonly validation: Extract<ProvenanceValidation, { status: "valid" }>;
+	readonly artifacts: VerifiedArtifactClosure; readonly lookup: ProcessReuseLookupMetrics;
+}
 export type ProcessReusePlan =
 	| (ReadyProcessPlan & { readonly kind: "completed_replay" })
 	| (ReadyProcessPlan & { readonly kind: "running_resume" })
@@ -74,12 +67,11 @@ export class ProcessReusePlanner {
 		if (!isSha256Digest(weakKey)) throw new Error("invalid process weak key");
 		const live = request.live ? [request.live.certificate].flat().filter(candidate => candidate.weakKey === weakKey) : [];
 		const acceptedTaints = [...new Set([...(request.validation?.acceptedTaints ?? []), ...(live.length ? request.live!.acceptedTaints : [])])];
-		const certificates = live.length ? live : await this.store.findByWeakKey(weakKey, request.executablePath, request.excludedCertificates);
-		metrics.candidateCertificates = certificates.length;
-		if (!certificates.length) return { kind: "miss", weakKey, reasons: ["no_candidate_pathset"], lookup: lookup() };
+		const certificates = live.length ? live : this.store.candidatesByWeakKey(weakKey, request.executablePath, request.excludedCertificates);
 		const reasons = new Set<ProcessReuseMissReason>(), changedDependencies = new Set<string>();
-		const pathsets = new Map<Sha256Digest, ProcessProvenanceCertificate[]>();
-		for (const certificate of certificates) {
+		const pathsets = new Map<Sha256Digest, Extract<ProvenanceValidation, { status: "valid" }> | undefined>();
+		for await (const certificate of certificates) {
+			metrics.candidateCertificates++;
 			if (request.acceptProducer && !request.acceptProducer(certificate.producer)) { reasons.add("producer_guarantee_incompatible"); continue; }
 			if (!certificateReplayable(certificate, acceptedTaints)) { reasons.add("certificate_tainted"); continue; }
 			if (!contractCompatible(request.contract, certificate) || certificate.result.continuation && !live.includes(certificate)) {
@@ -88,32 +80,28 @@ export class ProcessReusePlanner {
 			}
 			metrics.eligibleCertificates++;
 			const pathset = dependencyPathsetKey(certificate.dependencyCertificate);
-			pathsets.set(pathset, [...pathsets.get(pathset) ?? [], certificate]);
-		}
-
-		for (const grouped of pathsets.values()) {
-			metrics.pathsetsValidated++;
-			const observation = await validateDynamicDependencyCertificate(grouped[0]!.dependencyCertificate, { ...request.validation, acceptedTaints });
-			metrics.filesRead += observation.filesRead;
-			metrics.bytesRead += observation.bytesRead;
-			if (observation.status === "indeterminate") { reasons.add("validation_indeterminate"); continue; }
-			if (observation.status === "stale") for (const changed of observation.changed) changedDependencies.add(changed);
-			const current: DynamicDependencyCertificate = { complete: true, dependencies: observation.dependencies, taints: [] };
-			const strongKey = processStrongKey(weakKey, current);
-			const matching = grouped.filter((certificate) => certificate.strongKey === strongKey);
-			if (!matching.length) { reasons.add("dependency_changed"); continue; }
-			const { dependencies, filesRead, bytesRead } = observation;
-			const validation: Extract<ProvenanceValidation, { status: "valid" }> = { status: "valid", strongKey, dependencies, filesRead, bytesRead };
-			for (const certificate of matching) {
-				let artifacts: VerifiedArtifactClosure | undefined;
-				try { artifacts = await this.store.artifacts.load(referencedArtifacts(certificate)); }
-				catch { reasons.add("artifact_unreadable"); continue; }
-				if (!artifacts) { reasons.add("artifact_missing"); continue; }
-				metrics.artifactsLoaded += artifacts.artifacts;
-				metrics.artifactBytesRead += artifacts.bytes;
-				const kind = certificate.result.continuation ? "running_resume" : "completed_replay";
-				return { kind, source: live.length ? "live" : "l2", weakKey, certificate, validation, artifacts, lookup: lookup() };
+			if (!pathsets.has(pathset)) {
+				metrics.pathsetsValidated++;
+				const observation = await validateDynamicDependencyCertificate(certificate.dependencyCertificate, { ...request.validation, acceptedTaints });
+				const { filesRead, bytesRead } = observation;
+				metrics.filesRead += filesRead; metrics.bytesRead += bytesRead;
+				pathsets.set(pathset, undefined);
+				if (observation.status !== "indeterminate") {
+					if (observation.status === "stale") for (const changed of observation.changed) changedDependencies.add(changed);
+					const dependencies = observation.dependencies, strongKey = processStrongKey(weakKey, { complete: true, dependencies, taints: [] });
+					pathsets.set(pathset, { status: "valid", strongKey, dependencies, filesRead, bytesRead });
+				}
 			}
+			const validation = pathsets.get(pathset);
+			if (!validation) { reasons.add("validation_indeterminate"); continue; }
+			if (certificate.strongKey !== validation.strongKey) { reasons.add("dependency_changed"); continue; }
+			let artifacts: VerifiedArtifactClosure | undefined;
+			try { artifacts = await this.store.artifacts.load(referencedArtifacts(certificate)); }
+			catch { reasons.add("artifact_unreadable"); continue; }
+			if (!artifacts) { reasons.add("artifact_missing"); continue; }
+			metrics.artifactsLoaded += artifacts.artifacts; metrics.artifactBytesRead += artifacts.bytes;
+			const kind = certificate.result.continuation ? "running_resume" : "completed_replay";
+			return { kind, source: live.length ? "live" : "l2", weakKey, certificate, validation, artifacts, lookup: lookup() };
 		}
 		return { kind: "miss", weakKey, reasons: Object.freeze(reasons.size ? [...reasons] : ["no_candidate_pathset"]),
 			...(changedDependencies.size ? { changedDependencies: Object.freeze([...changedDependencies].sort()) } : {}), lookup: lookup() };

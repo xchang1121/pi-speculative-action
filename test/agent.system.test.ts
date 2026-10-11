@@ -188,27 +188,34 @@ test.for(["unrelated", "changed", "descendant"])("retains native workflow result
 	} finally { await f.dispose(); await sandbox.dispose(); await native.dispose(); }
 });
 
-test("reselects later read results, retains queries across turns and observes changed bytes", async () => {
+test("shares pending reads, reselects later results and retains fresh queries across turns", async () => {
 	const cwd = await directories.create(), reader = createReadTool(cwd);
 	const file = path.join(cwd, "notes.txt"), original = Array.from({ length: 20 }, (_, i) => `line ${i + 1}`).join("\n");
 	await writeFile(file, original);
 	const world = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: ["read"], maxBytes: () => 1024 * 1024 });
-	const computed = deferred(), release = deferred(), entered = deferred();
-	let runs = 0;
+	const computed = deferred(), release = deferred(), entered = deferred(), controller = new AbortController();
+	let runs = 0, authorizations = 0;
 	const f = systemHost(cwd, [reader, createWriteTool(cwd)], {
-		preflight: context => { if ((context.args as { offset?: number }).offset === 5) entered.resolve(); return true; },
+		preflight: context => {
+			if ((context.args as { offset?: number }).offset === 5) {
+				entered.resolve();
+				if (++authorizations > 100) controller.abort(new Error("shared waiters prevented producer progress"));
+			}
+			return true;
+		},
 		executionWorlds: [{ ...world, speculation: { ...world.speculation!, execute: async context => {
 			const first = ++runs === 1, branch = await world.speculation!.execute(context);
 			if (first) { computed.resolve(); await release.promise; } return branch;
 		} } }],
 	});
-	let actor: Promise<unknown> | undefined;
+	let actors: Promise<unknown>[] = [];
 	try {
 		await f.start(); await f.preview("read", { path: "notes.txt", offset: 1, limit: 10 }); await computed.promise;
 		const args = { path: "notes.txt", offset: 5, limit: 1 };
-		actor = f.execute("read", args); await entered.promise;
+		actors = [1, 2].map(() => f.execute("read", args, controller.signal).catch(error => error)); await entered.promise;
 		await f.preview("read", { path: "notes.txt", offset: 3, limit: 10 }); await f.ready();
-		expect(await actor).toEqual(await reader.execute("oracle", args));
+		expect(controller.signal.aborted).toBe(false);
+		const expected = await reader.execute("oracle", args); expect(await Promise.all(actors)).toEqual([expected, expected]);
 		release.resolve(); await f.preview("read", { ...args, offset: 6 }); await f.finish(); await f.start("second");
 		for (const input of [args, { path: "notes.txt", offset: 1, limit: 10 }])
 			expect(await f.execute("read", input)).toEqual(await reader.execute("reference", input));
@@ -218,5 +225,5 @@ test("reselects later read results, retains queries across turns and observes ch
 		expect(textOutput(await f.execute("read", wide))).toBe("new\n");
 		await writeFile(file, original); expect(await f.execute("read", wide)).toEqual(await reader.execute("restored", wide)); await f.finish();
 		expect(f.events.filter(event => event.type === "actor_action").at(-1)?.settlement.provider).toMatchObject({ kind: "speculative", match: { kind: "exact" } });
-	} finally { release.resolve(); await actor; await f.dispose(); }
+	} finally { controller.abort(); release.resolve(); await Promise.allSettled(actors); await f.dispose(); }
 });

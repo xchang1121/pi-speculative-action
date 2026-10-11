@@ -989,14 +989,14 @@ int main(int argc, char **argv) {
 				expect(JSON.stringify(binding)).not.toContain("private value");
 				await writeFile(path.join(fixture.workspace, "input.txt"), "after\n");
 				await expect(validateTransferredProcessEvidence(certificate!.dependencyCertificate)).resolves.toMatchObject({ status: "stale" });
-				const history = vi.spyOn(fixture.backend.store, "findByWeakKey").mockResolvedValue([certificate!]);
+				await fixture.backend.store.put(certificate!);
 				const validation = vi.spyOn(await import("../src/provenance-validation.ts"), "validateDynamicDependencyCertificate");
 				try {
 					for (const expected of [1, 2]) {
 						expect(await fixture.backend.bindingStale(binding!)).toBe(true);
 						expect(validation).toHaveBeenCalledTimes(expected); // The live/disk duplicate is checked once, afresh on the next call.
 					}
-				} finally { validation.mockRestore(); history.mockRestore(); }
+				} finally { validation.mockRestore(); }
 
 				let operationRoot = "";
 				await fixture.workspaceSandbox.withWorkspace(fixture.workspace, async workspace => {

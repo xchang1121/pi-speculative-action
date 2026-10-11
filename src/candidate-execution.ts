@@ -101,7 +101,7 @@ export class CandidateExecution<Output> {
 				? { kind: "shared", owners: Object.freeze(current.owners.filter((value) => value !== owner)) }
 				: { kind: "exclusive", status: consumed ? "consumed" : "available" });
 			state = consumed ? "consumed" : "released";
-			this.released?.();
+			if (kind === "exclusive") this.released?.();
 			return true;
 		};
 		return {
