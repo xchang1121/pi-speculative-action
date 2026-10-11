@@ -220,9 +220,21 @@ test.each(["existing", "new"])("selects a %s ready producer and retains its comp
 	await expect(f.registry.publish(f.request.weakKey, first, broken, async () => false)).rejects.toThrow("complete owned result");
 	second ??= await f.reserve(); await f.publish(second, "fast result");
 	expect(await f.consume(actor, "fast result")).toMatchObject({ producer: second }); await stopped.promise;
+	const later = await f.reserve();
 	const graph = new TimelineInterval(0, 10, Array.from({ length: 8192 }, (_, index) => ({ computation: new TimelineInterval(index, index + 1), reused: true })));
 	f.registry.configure(8, 8 * 1024 * 1024);
 	const slow = await f.publish(first, "slow result", 2, false, graph); await f.consume(f.actor(), "slow result");
+	await writeFile(f.input, "changed input"); const changed = await f.produce("changed result", 3, true), lookup = vi.fn(f.lookup);
+	await f.consume(f.actor({ lookup }), undefined); expect(lookup).toHaveBeenCalledTimes(2);
+	const restore = async () => {
+		await writeFile(f.input, "current input"); await f.registry.publish(f.request.weakKey, later, changed, async () => false);
+	};
+	// Reconsider the old result both after a joined completion and after publication during history lookup.
+	await f.consume(f.actor({ lookup: async (...args) => {
+		const plan = await f.lookup(...args); if (!args[0] && arrival === "new") await restore(); return plan;
+	}, waitForRunning: async (running, signal) => {
+		await restore(); return (await waitForCompletion(running.completion, signal)).status === "completed" ? "completed" : "miss";
+	} }), "slow result");
 	await f.store.put(await f.produce("saved", 3));
 	const reference = referencedArtifacts(slow)[0]!, target = f.store.artifacts.artifactPath(reference.digest), borrowed = await f.actor();
 	if (borrowed.kind !== "hit") throw new Error("expected owned result");

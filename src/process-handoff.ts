@@ -229,76 +229,74 @@ export class ProcessHandoffRegistry<Invocation = never> {
 
 	async acquire<Plan extends { readonly certificate: ProcessProvenanceCertificate }>({ scope, ...request }: AcquireOptions<Plan>): Promise<ProcessHandoffAcquisition<Plan>> {
 		scope = snapshotExecutionScope(scope);
-		let joined = false, historyChecked = false;
-		const considered = new Map<HandoffRecord, Sha256Digest | undefined>();
+		let joined = false;
 		const borrowed = new Set<HandoffRecord>();
 		const retain = (record: HandoffRecord) => { if (!borrowed.has(record)) { borrowed.add(record); record.borrowers++; } };
 		try {
 			while (true) {
 				if (this.disposed || request.signal?.aborted) return { kind: "miss", joined };
-				const records = [...this.byKey.get(request.key)?.values() ?? []];
-				const completed = [...records].reverse().flatMap((record) => {
-					const state = record.state;
-					if (state.status !== "completed" || !state.result || considered.has(record)) return [];
-					const { candidate, artifacts } = state.result, oneShot = candidate.dependencyCertificate.taints.length > 0 || !!candidate.result.continuation;
-					return oneShot && (!record.ownership.acceptsScope(record.scope, scope, request.role === "actor") || record.ownership.wholeClaimed)
-						? [] : [{ record, state, candidate, artifacts, oneShot }];
-				});
-				if (completed.length) {
-					for (const { record } of completed) retain(record);
-					const plan = await request.lookup(completed.map(({ candidate }) => candidate), undefined, new Map(completed.map(({ candidate, artifacts }) => [candidate.id, artifacts])));
-					if (request.signal?.aborted) return { kind: "miss", joined };
-					const selected = completed.find(({ candidate }) => candidate === plan?.certificate);
-					if (!selected) for (const { record, candidate } of completed) considered.set(record, candidate.id);
-					if (plan && selected && selected.record.state === selected.state && this.byKey.get(request.key)?.has(selected.record)) {
-						const { record, state, oneShot } = selected;
-						const claim = oneShot && record.ownership.acceptsScope(record.scope, scope, request.role === "actor") ? record.ownership.claimChild() : undefined;
-						if (oneShot && !claim) { considered.set(record, selected.candidate.id); continue; }
-						if (oneShot) record.state = { ...state, status: "reserved" };
-						record.borrowers++;
-						let pending = true;
-						return { kind: "hit", plan, joined, producer: record, continuation: record.continuation, settle: consumed => {
-							if (!pending) return;
-							pending = false; claim?.(consumed); record.borrowers--;
-							if (oneShot && this.byKey.get(request.key)?.has(record)) {
-								if (consumed) this.releaseResult(record); else record.state = state; this.wake(request.key);
-							}
-							this.trim();
-						} };
-					}
-					continue;
-				}
-				if (!historyChecked) {
-					// A failed live attempt also rules out its immutable disk copy for this acquisition.
-					const plan = await request.lookup(undefined, new Set([...considered.values()].flatMap(id => id ? [id] : [])));
-					if (plan && !this.disposed && !request.signal?.aborted) return { kind: "hit", plan, joined };
-					historyChecked = true;
-					continue; // A candidate may have completed while history was being read.
-				}
-				if (request.role === "producer") return { kind: "work", work: this.reserve(request.key, request.executablePath, request.ownership, scope), joined };
-				// Waiting grants no transfer authority; acquisition rechecks the live consumer after validation.
-				const running = records.find((record) => !considered.has(record) && record.state.status === "running" && record.ownership.acceptsScope(record.scope, scope, true)) ??
-					records.find((record) => !considered.has(record) && record.state.status === "running" && scope && record.scope?.sessionID === scope.sessionID);
-				const waitingOn = running ?? records.find(record => (record.state.status === "reserved" || record.ownership.pendingWhole) && record.ownership.acceptsScope(record.scope, scope, true));
-				if (!waitingOn) return { kind: "miss", joined };
-				retain(waitingOn);
+				// Observe before any asynchronous lookup; negative evidence belongs only to this unchanged pass.
 				const changed = new AbortController(), waiters = this.waiters.get(request.key) ?? new Set<AbortController>();
 				waiters.add(changed); this.waiters.set(request.key, waiters);
 				const stop = request.signal ? AbortSignal.any([changed.signal, request.signal]) : changed.signal;
-				let decision: "completed" | "miss" | "rejected";
+				const considered = new Map<HandoffRecord, Sha256Digest | undefined>();
+				let historyChecked = false;
 				try {
-					// Any newly available result may win, including a producer registered after this wait began.
-					const completion = running ? request.waitForRunning(running, stop) : waitingOn.ownership.pendingWhole?.then(() => "completed" as const, () => "completed" as const) ?? new Promise<never>(() => {});
-					const waiting = await waitForCompletion(completion, stop);
-					if (waiting.status === "aborted") { joined = true; historyChecked = false; continue; }
-					decision = waiting.value;
+					while (!stop.aborted) {
+						const records = [...this.byKey.get(request.key)?.values() ?? []];
+						const completed = [...records].reverse().flatMap((record) => {
+							const state = record.state;
+							if (state.status !== "completed" || !state.result || considered.has(record)) return [];
+							const { candidate, artifacts } = state.result, oneShot = candidate.dependencyCertificate.taints.length > 0 || !!candidate.result.continuation;
+							return oneShot && (!record.ownership.acceptsScope(record.scope, scope, request.role === "actor") || record.ownership.wholeClaimed)
+								? [] : [{ record, state, candidate, artifacts, oneShot }];
+						});
+						if (completed.length || !historyChecked) {
+							historyChecked ||= !completed.length;
+							for (const { record } of completed) retain(record);
+							const plan = completed.length
+								? await request.lookup(completed.map(({ candidate }) => candidate), undefined, new Map(completed.map(({ candidate, artifacts }) => [candidate.id, artifacts])))
+								: await request.lookup(undefined, new Set([...considered.values()].flatMap(id => id ? [id] : [])));
+							if (this.disposed || request.signal?.aborted) return { kind: "miss", joined };
+							if (plan && !completed.length) return { kind: "hit", plan, joined };
+							const selected = completed.find(({ candidate }) => candidate === plan?.certificate);
+							if (!selected) for (const { record, candidate } of completed) considered.set(record, candidate.id);
+							if (plan && selected && selected.record.state === selected.state && this.byKey.get(request.key)?.has(selected.record)) {
+								const { record, state, oneShot } = selected;
+								const claim = oneShot && record.ownership.acceptsScope(record.scope, scope, request.role === "actor") ? record.ownership.claimChild() : undefined;
+								if (oneShot && !claim) { considered.set(record, selected.candidate.id); continue; }
+								if (oneShot) record.state = { ...state, status: "reserved" };
+								record.borrowers++;
+								let pending = true;
+								return { kind: "hit", plan, joined, producer: record, continuation: record.continuation, settle: consumed => {
+									if (!pending) return;
+									pending = false; claim?.(consumed); record.borrowers--;
+									if (oneShot && this.byKey.get(request.key)?.has(record)) {
+										if (consumed) this.releaseResult(record); else record.state = state; this.wake(request.key);
+									}
+									this.trim();
+								} };
+							}
+							continue;
+						}
+						if (request.role === "producer") return { kind: "work", work: this.reserve(request.key, request.executablePath, request.ownership, scope), joined };
+						// Waiting grants no transfer authority; acquisition rechecks the live consumer after validation.
+						const running = records.find((record) => !considered.has(record) && record.state.status === "running" && record.ownership.acceptsScope(record.scope, scope, true)) ??
+							records.find((record) => !considered.has(record) && record.state.status === "running" && scope && record.scope?.sessionID === scope.sessionID);
+						const waitingOn = running ?? records.find(record => (record.state.status === "reserved" || record.ownership.pendingWhole) && record.ownership.acceptsScope(record.scope, scope, true));
+						if (!waitingOn) return { kind: "miss", joined };
+						retain(waitingOn);
+						// Any newly available result may win, including a producer registered after this pass began.
+						const completion = running ? request.waitForRunning(running, stop) : waitingOn.ownership.pendingWhole?.then(() => "completed" as const, () => "completed" as const) ?? new Promise<never>(() => {});
+						const waiting = await waitForCompletion(completion, stop);
+						if (waiting.status === "completed" && waiting.value !== "completed") { considered.set(waitingOn, undefined); continue; }
+						joined = true;
+						break;
+					}
 				} finally {
 					waiters.delete(changed); if (!waiters.size) this.waiters.delete(request.key);
 					changed.abort();
 				}
-				if (decision !== "completed") { considered.set(waitingOn, undefined); continue; }
-				joined = true;
-				historyChecked = false;
 			}
 		} finally { for (const record of borrowed) record.borrowers--; this.trim(); }
 	}

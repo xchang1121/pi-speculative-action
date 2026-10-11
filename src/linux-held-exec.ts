@@ -196,8 +196,8 @@ export interface HeldExecTiming {
 }
 
 export type HeldExecDecision = { readonly observeTiming?: (timing: HeldExecTiming) => void } & (
-	/** `repeat`: the same launch, or the same executable with any argv, may run natively for the rest of this call without asking again. */
-	| { readonly kind: "continue"; readonly repeat?: "launch" | "executable"; readonly observeCompletion?: (durationMs: number | undefined, clock?: HeldExecClock) => void | Promise<void> }
+	/** Continue only this held launch; a later launch must observe candidates available then. */
+	| { readonly kind: "continue"; readonly observeCompletion?: (durationMs: number | undefined, clock?: HeldExecClock) => void | Promise<void> }
 	| ({
 			readonly kind: "replay";
 			/** Release a reservation only when the native peer has definitely performed no adoption effects. */
@@ -372,7 +372,7 @@ export class LinuxHeldExecBoundary {
 			});
 			if (decision.kind === "continue") {
 				completedAt = performance.now(); outcome = "continued";
-				if (!decision.observeCompletion) return void socket.end(decision.repeat === "executable" ? "e\n" : decision.repeat ? "c\n" : "C\n");
+				if (!decision.observeCompletion) return void socket.end("C\n");
 				native = await observeCompletion(socket, decision.observeCompletion);
 				if (native) completedAt = native.startedAt;
 				return;

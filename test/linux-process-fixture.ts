@@ -27,7 +27,7 @@ export const processTest: ReturnType<TestAPI<{ benchmark: typeof createLinuxProc
 }).skipIf(process.platform !== "linux");
 
 /** Hold finished production before its shared writer admission until an Actor joins owned running work. */
-export function holdProcessPublication(backend: LinuxProcessReuseBackend, delayMs = 0) {
+export function holdProcessPublication(backend: LinuxProcessReuseBackend, delayMs = 0, beforeRelease = async () => {}) {
 	const release = deferred();
 	let joined = false, reached = false, timer: ReturnType<typeof setTimeout> | undefined;
 	const handoffs = Reflect.get(backend, "handoffs") as ProcessHandoffRegistry;
@@ -37,7 +37,9 @@ export function holdProcessPublication(backend: LinuxProcessReuseBackend, delayM
 	});
 	const wait = scheduling.waitForCompletion;
 	const assessment = vi.spyOn(scheduling, "waitForCompletion").mockImplementation((promise, signal, timeoutMs) => {
-		if (observing.mock.calls.some(([, owner]) => owner.completion === promise) && !joined && !signal?.aborted) { joined = true; timer = setTimeout(release.resolve, delayMs); }
+		if (observing.mock.calls.some(([, owner]) => owner.completion === promise) && !joined && !signal?.aborted) {
+			joined = true; timer = setTimeout(() => { void beforeRelease().then(release.resolve, release.reject); }, delayMs);
+		}
 		return wait(promise, signal, timeoutMs);
 	});
 	return {

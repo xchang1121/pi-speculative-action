@@ -1036,8 +1036,7 @@ export class LinuxProcessReuseBackend {
 			const available = this.handoffs.mayHaveExecutable(executablePath) || await this.store.mayHaveCertificates(executablePath, process.signal) ||
 				this.handoffs.mayHaveExecutable(executablePath);
 			// Concurrent discovery is bounded, but a full retained set never shuts discovery off for the rest of the call.
-			if (!learning && !available) { this.addActor("misses"); return measured({ kind: "continue",
-				...(!observation?.learn ? { repeat: "executable" as const } : {}) }); }
+			if (!learning && !available) { this.addActor("misses"); return measured({ kind: "continue" }); }
 			const inspected = await inspectHeldExecProcess(process.pid, executable, process.descriptors);
 			const capturedInputs = await TimelineInterval.collect(() => process.descriptors?.length
 				? captureHeldDescriptorInputs(process.pid, process.descriptors, Math.min(MAX_REQUEST_BYTES / 2, this.store.limits.maxBytes),
