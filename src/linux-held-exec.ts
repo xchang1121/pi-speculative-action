@@ -133,7 +133,7 @@ export function descriptorInputs(graph?: ProcessResourceGraph): readonly FileDes
 		const ofd = graph.descriptions[description]!, object = graph.objects[ofd.object]!;
 		return { fd, alias: description, flags: ofd.flags, offset: ofd.position ?? 0, image: ofd.object,
 			...(ofd.locks ? { locks: ofd.locks } : {}),
-			...(ofd.outside !== undefined ? { outside: ofd.outside } : {}),
+			...(ofd.outside !== undefined || object.queue ? { outside: ofd.outside ?? object.queue?.outside ?? 3 } : {}),
 			...("installed" in handle ? { installed: false as const } : {}),
 			...(object.type === "regular" ? {} : { type: object.type }), contentDigest: object.contentDigest,
 			...(object.sourcePath ? { sourcePath: object.sourcePath } : {}),

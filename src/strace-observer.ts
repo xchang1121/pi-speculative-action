@@ -261,7 +261,9 @@ function resourceTransitions(processes: ReadonlyMap<number, TraceProcess>, root:
 			const bytes = /^"((?:\\.|[^"\\])*)"$/.exec(line.args[1] ?? "");
 			const vector = syscall === "readv" || syscall === "writev" ? queueVectors(line.args[1], Number(line.args[2])) : undefined;
 			const data = bytes ? decodeCBytes(bytes[1]!) : vector?.data, requested = vector?.length ?? Number(line.args[2]);
-			if ((produced || consumed) && data && /^\d+$/.test(line.result)) {
+			// A kernel restart transferred no bytes; the eventual completion is its own ordered record.
+			if ((produced || consumed) && /^\? ERESTARTSYS\b/.test(line.result)) handled.add(line);
+			else if ((produced || consumed) && data && /^\d+$/.test(line.result)) {
 				const returned = Number(line.result), truncated = /MSG_TRUNC/.test(flags);
 				const packet = truncated && stream.packet ? messages.find(message => message.inode === stream.inode) : undefined;
 				const length = truncated ? Math.min(returned, requested) : returned;

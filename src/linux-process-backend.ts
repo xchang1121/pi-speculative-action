@@ -1179,6 +1179,10 @@ export class LinuxProcessReuseBackend {
 			const { inputs, descriptorManifest, descriptorReportPath, descriptorImages, directoryImages, inheritedFiles, outputPipes: unchangedOutputPipes } = descriptors;
 			const outputPipes = request.outputPipes?.some(Boolean);
 			const streamInputs = inputs.filter(input => ["pipe", "socket", "eventfd"].includes(input.type ?? ""));
+			const closedStreams = streamInputs.every(input => {
+				const peer = request.resources!.objects[input.image]!.socket?.peer;
+				return input.outside === 0 && (!peer?.connected || peer.object !== undefined);
+			});
 			const live = !!captureWorkspace && !!ready.imageLibrary && inputs.every(input => input.installed !== false);
 			const resourceJournal = live || inputs.some(input => !input.type || input.type === "eventfd" || input.type === "socket" || input.type === "pipe" && (input.flags & 3) !== 0);
 			const streamIdentity = (position: { fd: number; inode: string }) => {
@@ -1253,7 +1257,7 @@ export class LinuxProcessReuseBackend {
 				inheritedStreams: resourceJournal ? descriptorOffsets?.filter(position => streamInputs.some(input => input.fd === position.fd)).map(streamIdentity) : undefined,
 				inheritedHandles: resourceJournal ? descriptorOffsets?.flatMap(position => {
 					const input = inputs.find(input => input.fd === position.fd)!, object = request.resources!.objects[input.image]!;
-					return [{ fd: input.fd, installed: input.installed, description: input.alias, inode: streamIdentity(position), flags: input.flags, outside: input.outside ?? object.queue?.outside ?? 3, packet: !!object.socket && (object.socket.type ?? 1) !== 1,
+					return [{ fd: input.fd, installed: input.installed, description: input.alias, inode: streamIdentity(position), flags: input.flags, outside: input.outside ?? 3, packet: !!object.socket && (object.socket.type ?? 1) !== 1,
 						queuedBytes: object.queue?.bytes, ...(object.queue && input.fd === input.image ? { queueData: Buffer.from(object.content!, "base64"), messages: object.queue.messages } : {}) }];
 				}) : undefined,
 			});
@@ -1295,13 +1299,13 @@ export class LinuxProcessReuseBackend {
 									return true;
 								}
 							} catch {}
-							// A private copy cannot make future progress on a blocked inherited stream.
+							// Stop capture at a blocked stream; its ownership separately decides whether to await completion.
 							const description = observation?.finalHandles?.find(handle => handle.fd === frozen.fd)?.description;
 							return reply.readInt32LE(12) & 4 && streamInputs.some(input => input.alias === description) ? false : undefined;
 						});
 						if (!frontier) return true; // It completed while the request was advancing.
 						const { pid, reply } = frontier;
-						if (reply.readInt32LE(0) === 0) return !streamInputs.length;
+						if (reply.readInt32LE(0) === 0) return closedStreams;
 						suspensionAttempted = true;
 						if (reply.readInt32LE(0) !== pid) return false;
 						const captured = parseFrontier(pid, reply);
@@ -1356,7 +1360,7 @@ export class LinuxProcessReuseBackend {
 					!!request.closeStdin, observation.finalHandles ?? [], descriptorOffsets ?? []) };
 				// A destroyed OFD has no observable final position. If it escaped into a
 				// surviving message, its position instead needs a kernel observation.
-				if (!continuation && inputs.some(input => input.outside === 0 && observation.retainedDescriptions?.includes(input.alias)))
+				if (!continuation && inputs.some(input => !input.type && input.outside === 0 && observation.retainedDescriptions?.includes(input.alias)))
 					throw new Error("queued file description has no final position observation");
 				if (observation.incompleteReasons.length) {
 					this.setError(session, `trace:${observation.incompleteReasons.join(",")}`);
@@ -1662,7 +1666,7 @@ function createProcessDescriptorCapture(session: ActiveSession, traceRoot: strin
 					inheritedFiles.push(await open(descriptor.type === "null" ? "/dev/null" : descriptorImages.get(descriptor.image)!.physical, descriptor.flags));
 				const object = request.resources!.objects[descriptor.image]!;
 				const stream = object.counter ? 6 : object.socket ? object.socket.peer.connected ? 4 : 5 : object.queue ? (descriptor.flags & 3) === 1 ? 3 : object.queue.eof ? 1 : 2 : 0;
-				manifest += `${descriptor.fd} ${descriptor.alias} ${descriptor.flags} ${descriptor.offset} ${Buffer.byteLength(image)} ${stream} ${object.queue?.capacity ?? 0} ${object.socket?.shutdown ?? 0} ${object.socket?.peer.shutdown ?? 0} ${object.socket?.peer.object ?? -1} ${descriptor.outside ?? object.queue?.outside ?? 3} ${Number(descriptor.installed !== false)} ${object.socket ? object.socket.type ?? 1 : 0}\n${image}\n`;
+				manifest += `${descriptor.fd} ${descriptor.alias} ${descriptor.flags} ${descriptor.offset} ${Buffer.byteLength(image)} ${stream} ${object.queue?.capacity ?? 0} ${object.socket?.shutdown ?? 0} ${object.socket?.peer.shutdown ?? 0} ${object.socket?.peer.object ?? -1} ${descriptor.outside ?? 3} ${Number(descriptor.installed !== false)} ${object.socket ? object.socket.type ?? 1 : 0}\n${image}\n`;
 			}
 			for (const [image, object] of Object.entries(request.resources?.objects ?? {})) for (const message of object.queue?.messages ?? [])
 				manifest += `M ${image} ${message.start} ${message.end} ${message.rights.length} ${message.rights.join(" ")}\n`;
@@ -1761,7 +1765,7 @@ function bufferedProcessPrototype(
 		})), ...inputs.filter(({ fd }) => fd > 2).map(({ fd }) => ({ fd, type: "regular" as const,
 			flagsDigest: sha256Digest(`${context.key}\0${fd}`) }))].map(descriptor => {
 			const input = inputs.find(({ fd }) => fd === descriptor.fd);
-			return input ? { ...descriptor, flagsDigest: input.locks || input.outside !== undefined ? digestObject({ flags: input.flags, locks: input.locks, outside: input.outside }) : sha256Digest(String(input.flags)), ...(input.installed === false ? { installed: false as const } : {}), type: input.type ?? descriptor.type, alias: input.alias, object: input.image, contentDigest: input.contentDigest, offset: input.offset,
+			return input ? { ...descriptor, flagsDigest: input.locks || !input.type && input.outside !== undefined ? digestObject({ flags: input.flags, locks: input.locks, outside: input.outside }) : sha256Digest(String(input.flags)), ...(input.installed === false ? { installed: false as const } : {}), type: input.type ?? descriptor.type, alias: input.alias, object: input.image, contentDigest: input.contentDigest, offset: input.offset,
 				eof: snapshot.resources!.objects[input.image]!.queue?.eof,
 				...(snapshot.resources!.objects[input.image]!.queue ? { endpointDigest: digestObject({ queue: snapshot.resources!.objects[input.image]!.queue, socket: snapshot.resources!.objects[input.image]!.socket }) } : {}),
 				...(input.sourcePath ? { resourcePath: projection.toLogical(input.sourcePath) } : {}),
