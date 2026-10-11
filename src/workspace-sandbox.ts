@@ -237,7 +237,7 @@ const SANDBOX_AUTHOR_ENVIRONMENT = {
 interface WorkspaceCheckpoint {
 	readonly token: WorldCheckpoint;
 	readonly sourceRoot: string;
-	readonly parent?: WorkspaceCheckpoint;
+	parent?: WorkspaceCheckpoint;
 	readonly changes: readonly SandboxWorkspaceChange[];
 	committed: boolean;
 }
@@ -402,7 +402,7 @@ function workspaceBranch(snapshot: WorkspaceExecutionSnapshot, sourceRoot: strin
 	owner: WorkspaceSandboxState, parent?: WorkspaceCheckpoint, validate?: () => Promise<ResourceValidation>): WorldBranch<ToolSettlement> {
 	const { changes } = snapshot, { executionFingerprint } = action, backend = "git_worktree", id = randomUUID();
 	const checkpoint = Object.freeze({ backend, id, lineage: parent?.token.lineage ?? id, depth: (parent?.token.depth ?? -1) + 1 });
-	const retained = { token: checkpoint, sourceRoot, parent, changes, committed: false };
+	const retained: WorkspaceCheckpoint = { token: checkpoint, sourceRoot, parent, changes, committed: false };
 	owner.checkpoints.set(checkpoint, retained);
 	let commitPromise: Promise<ToolSettlement> | undefined;
 	const inputs = new Map<string, ResourceInput>();
@@ -413,7 +413,10 @@ function workspaceBranch(snapshot: WorkspaceExecutionSnapshot, sourceRoot: strin
 		capturedBytes: changes.reduce((total, change) => total + sandboxChangeBytes(change), 0),
 		executionMetrics: Object.freeze({ ...snapshot.executionMetrics }),
 		compatibility: Object.freeze({ status: "compatible" as const, backend, executionFingerprint }),
-		commit: () => commitPromise ??= commitSandboxExecution(owner, snapshot, inputs).then(output => { retained.committed = true; if (disposed) inputs.clear(); return output; }),
+		commit: () => commitPromise ??= commitSandboxExecution(owner, snapshot, inputs).then(output => {
+			// A proven commit anchors future forks in the live workspace, independently of unadopted ancestors.
+			retained.committed = true; retained.parent = undefined; if (disposed) inputs.clear(); return output;
+		}),
 		takeReadInputs: async (maxBytes) => {
 			// Every file this branch read keeps its pre-image until commit; each serves reads while it stays unchanged.
 			const preimages = new Map<string, ResourceInput>(changes.flatMap((change) => change.kind !== "directory" && change.before && !change.aliases && textual(change.before) ? [[change.target, change.before]] : []));
@@ -472,14 +475,7 @@ async function commitSandboxExecution(state: WorkspaceSandboxState, execution: S
 					baselines.set(change, current);
 					if (!sameSandboxBaseline(current, change)) throw new Error(`resource changed before commit: ${change.resource}`);
 					if (change.accessMode) await access(change.target, change.accessMode);
-					if (change.kind !== "directory" && change.aliases) {
-						const identity = (current as RegularFileState | undefined)?.identity;
-						if (!identity || identity.nlink !== BigInt(change.aliases.length) || !change.aliases.includes(change.target)) throw new Error("file alias set changed");
-						for (const alias of change.aliases) {
-							await assertNoSymlinkPath(change.root, alias);
-							if (!sameFilesystemIdentity(identity, await lstat(alias, { bigint: true }))) throw new Error("file alias identity changed");
-						}
-					}
+					if (change.kind !== "directory" && change.aliases) await assertFileAliases(change.root, change.target, change.aliases, (current as RegularFileState | undefined)?.identity);
 					if (!change.validationOnly && change.kind !== "directory" && change.operation && !change.object) {
 						if (change.after === undefined) throw new Error("A content write cannot delete a file");
 						const before = current as RegularFileState | undefined;
@@ -1646,22 +1642,20 @@ async function materializeCheckpoint(workspace: PrivateSandboxWorkspace, checkpo
 	const lineage: WorkspaceCheckpoint[] = [];
 	for (let current: WorkspaceCheckpoint | undefined = checkpoint; current; current = current.parent) { lineage.push(current); }
 	lineage.reverse();
-	// Allocation can finish after Actor adoption. Skip an adopted prefix only when this private baseline proves its final state.
-	let adopted = 0;
-	while (lineage[adopted]?.committed) adopted++;
-	for (; adopted; adopted--) {
-		const final = new Map(lineage.slice(0, adopted).flatMap(ancestor => ancestor.changes.filter(change => !change.validationOnly).map(change => [change.resource, change] as const)));
-		if ((await mapFilesystem([...final.values()], async change => {
-			const target = path.resolve(workspace.sandboxRoot, change.resource);
-			await assertNoSymlinkPath(workspace.sandboxRoot, target);
-			if (change.kind === "directory") return sameDirectoryAfter(target, change).catch(() => false);
-			if (change.object || change.aliases) return false;
-			const current = await readRegularState(target);
-			return sameSandboxState(current, change.after === undefined ? undefined : { content: change.after, mode: change.afterMode ?? change.beforeMode ?? 0 }) &&
-				(change.afterModified === undefined || String(current?.identity?.mtimeNs) === change.afterModified);
-		})).every(Boolean)) break;
-	}
-	for (const ancestor of lineage.slice(adopted)) {
+	// Committing cuts ancestry. Allocation may precede adoption, so prove this baseline contains the adopted root.
+	const root = lineage[0]!;
+	const adopted = root.committed && (await mapFilesystem(root.changes.filter(change => !change.validationOnly), async change => {
+		const target = path.resolve(workspace.sandboxRoot, change.resource);
+		await assertNoSymlinkPath(workspace.sandboxRoot, target);
+		if (change.kind === "directory") return sameDirectoryAfter(target, change).catch(() => false);
+		if (change.object) return false;
+		const current = await readRegularState(target);
+		if (change.aliases) await assertFileAliases(workspace.sandboxRoot, target,
+			change.aliases.map(alias => path.resolve(workspace.sandboxRoot, path.relative(root.sourceRoot, alias))), current?.identity);
+		return sameSandboxState(current, change.after === undefined ? undefined : { content: change.after, mode: change.afterMode ?? change.beforeMode ?? 0 }) &&
+			(change.afterModified === undefined || String(current?.identity?.mtimeNs) === change.afterModified);
+	})).every(Boolean);
+	for (const ancestor of lineage.slice(adopted ? 1 : 0)) {
 		const project = (name: string) => {
 			const relative = relativeFilesystemPath(ancestor.sourceRoot, name);
 			if (relative === undefined) throw new Error("checkpoint object escapes workspace");
@@ -1908,6 +1902,14 @@ async function readRegularState(target: string, maxBytes = Number.POSITIVE_INFIN
 		const captured = await captureStableFile(target, maxBytes, true, { digest: false });
 		return { content: captured.content!, mode: process.platform === "win32" ? 0 : Number(captured.stat.mode & 0o777n), identity: captured.stat };
 	} catch (error) { if (isMissing(error)) return undefined; throw error; }
+}
+
+async function assertFileAliases(root: string, target: string, aliases: readonly string[], identity?: BigIntStats): Promise<void> {
+	if (!identity || identity.nlink !== BigInt(aliases.length) || !aliases.includes(target)) throw new Error("file alias set changed");
+	for (const alias of aliases) {
+		await assertNoSymlinkPath(root, alias);
+		if (!sameFilesystemIdentity(identity, await lstat(alias, { bigint: true }))) throw new Error("file alias identity changed");
+	}
 }
 
 /** Capture a directory without following links and reject concurrent namespace changes. */
