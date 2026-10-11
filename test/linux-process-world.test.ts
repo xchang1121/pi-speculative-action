@@ -389,9 +389,9 @@ nativeTest.for([false, true])("prepares a failed command after its reported inpu
 		} finally { await host?.dispose(); await fixture.dispose(); }
 	});
 
-nativeTest.for(["sample", "file", "dup", "threads", "limit", "metadata", "identity", "pipe", "socket", "pipe:unavailable", "socket:unavailable"])("adopts a closed-input calculation through capture or completion (%s)", { timeout: 30_000 }, async (scenario, { benchmark }) => {
+nativeTest.for(["sample", "file", "dup", "threads", "limit", "metadata", "identity", "pipe", "socket", "eventfd", "pipe:unavailable", "socket:unavailable", "eventfd:unavailable"])("adopts a closed-input calculation through capture or completion (%s)", { timeout: 30_000 }, async (scenario, { benchmark }) => {
 		const [mode, unavailable] = scenario.split(":"), fixture = await benchmark("pi-prefix-process-", "git", { processImages: unavailable ? false : undefined });
-		const descendant = mode === "pipe" || mode === "socket", complete = descendant || mode === "identity";
+		const descendant = mode === "pipe" || mode === "socket" || mode === "eventfd", complete = descendant || mode === "identity";
 		await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker", arguments: ["-pthread"], code: `#define _GNU_SOURCE
 ${cHeaders("unistd.h sys/syscall.h sys/random.h sys/resource.h sys/stat.h sys/wait.h pthread.h stdio.h stdint.h fcntl.h")}
 static void *thread(void *unused) { return unused; }
@@ -413,8 +413,8 @@ int main(void) {
 }
 ` });
 		if (descendant) await compileBenchmarkHelper(fixture.workspace, { source: "launch.c", output: "launch", code: `#define _GNU_SOURCE
-${cHeaders("unistd.h sys/socket.h")}
-int main(void) { int fds[2]; if (${mode === "socket" ? "socketpair(AF_UNIX, SOCK_STREAM, 0, fds)" : "pipe(fds)"} || fds[0] != 3 || fds[1] != 4) return 61;
+${cHeaders("unistd.h sys/socket.h sys/eventfd.h")}
+int main(void) { int fds[2]; if (${mode === "eventfd" ? "(fds[0] = eventfd(0, 0)) < 0 || (fds[1] = dup(fds[0])) < 0" : mode === "socket" ? "socketpair(AF_UNIX, SOCK_STREAM, 0, fds)" : "pipe(fds)"} || fds[0] != 3 || fds[1] != 4) return 61;
  close_range(5, ~0U, 0); execlp("worker", "worker", NULL); return 62; }
 ` });
 		await commitBenchmarkFixture(fixture.workspace, "Closed input prefix");
@@ -477,7 +477,7 @@ int main(void) { int fds[2]; if (${mode === "socket" ? "socketpair(AF_UNIX, SOCK
 		publishing.mockRestore();
 	});
 
-	nativeTest.for(["pipe", "socket", "peer", "eventfd", "readv", "recvmsg", "writev", "mmap", "runtime", "handles", "eof", "early", "changed", "identity", "file", "cancel", "pipe:unavailable", "peer:unavailable"])("resumes a learned running process with future input (%s)", { timeout: 60_000 }, async (scenario, { skip, benchmark }) => {
+	nativeTest.for(["pipe", "socket", "peer", "eventfd", "readv", "recvmsg", "writev", "mmap", "runtime", "handles", "eof", "early", "changed", "identity", "file", "cancel", "pipe:unavailable", "peer:unavailable", "eventfd:unavailable"])("resumes a learned running process with future input (%s)", { timeout: 60_000 }, async (scenario, { skip, benchmark }) => {
 		const [mode, unavailable] = scenario.split(":"), fixture = await benchmark("pi-live-process-", undefined, { processImages: unavailable ? false : undefined });
 		let host: ReturnType<typeof createSpeculativeActionHost> | undefined;
 		try {
@@ -1561,7 +1561,7 @@ int main(void) { int status; struct timespec pause = {0, 300000000}; pid_t sibli
 				expect(failures).toEqual([]); expect(snapshots).toHaveLength(2);
 			}
 			const descriptorProbe = path.join(root, "descriptor-probe");
-			await writeFile(`${descriptorProbe}.c`, `#define _GNU_SOURCE
+			await compileBenchmarkHelper(root, { source: "descriptor-probe.c", output: "descriptor-probe", arguments: ["-pthread", "-Werror"], code: `#define _GNU_SOURCE
 ${cHeaders("fcntl.h pthread.h sched.h stdlib.h string.h poll.h sys/file.h sys/socket.h sys/stat.h sys/syscall.h sys/wait.h unistd.h")}
 static int aliases(void *unused) {
 	(void)unused;
@@ -1695,8 +1695,7 @@ int main(int argc, char **argv) {
 	} else if (aliases(0)) return 75;
 	char *command[] = {"true", 0}; execv("/bin/true", command); return 76;
 }
-`);
-			await compileBenchmarkHelper(root, { source: `${descriptorProbe}.c`, output: "descriptor-probe", arguments: ["-pthread", "-Werror"] });
+` });
 			for (const type of ["pipe", "socket"] as const) for (const descriptors of [true, "inspect"] as const) {
 				await writeFile(external, `#!/bin/sh\nexec '${descriptorProbe}' external-${type} '${binary}' "$@"\n`, { mode: 0o700 });
 				const snapshots: NonNullable<HeldExecProcess["descriptors"]>[] = [], failures: unknown[] = [], commit = vi.fn(async () => {});
@@ -1754,7 +1753,7 @@ int main(int argc, char **argv) {
 			expect(await piped.execute(`exec 3<'${input}'; /bin/true | /usr/bin/wc -c; IFS= read -r -N 1 byte <&3; printf '%s' "$byte"`)).toEqual({ exitCode: 0 });
 			expect(piped.output).toBe("1048576\nb");
 			const pipeProbe = path.join(root, "pipe-probe");
-			await writeFile(`${pipeProbe}.c`, `#define _GNU_SOURCE
+			await compileBenchmarkHelper(root, { source: "pipe-probe.c", output: "pipe-probe", arguments: ["-Werror"], code: `#define _GNU_SOURCE
 ${cHeaders("fcntl.h string.h sys/wait.h unistd.h")}
 int main(int argc, char **argv) {
 	if (argc != 2) return 70;
@@ -1773,8 +1772,7 @@ int main(int argc, char **argv) {
 	char bytes[6]; ssize_t size = read(0, bytes, sizeof(bytes));
 	return size < 0 || write(1, bytes, (size_t)size) != size;
 }
-`);
-			await compileBenchmarkHelper(root, { source: `${pipeProbe}.c`, output: "pipe-probe", arguments: ["-Werror"] });
+` });
 			for (const mode of ["partial", "empty", "flags", "queue-conflict", "contents", "overrun", "stale", "live", "packet", "inspect", "commit-failure", "journal", "journal-conflict", "journal-write-readonly", "journal-shutdown-pipe", "journal-commit-failure"]) {
 				const accepted = ["partial", "empty", "flags", "journal"].includes(mode), journal = mode.startsWith("journal"), failedCommit = mode.endsWith("commit-failure");
 				let descriptors: HeldExecProcess["descriptors"];
@@ -1807,7 +1805,7 @@ int main(int argc, char **argv) {
 				if (accepted) expect(descriptors, mode).toMatchObject([{ fd: 0, alias: 0, type: "pipe", owned: true }, { fd: 3, alias: 0, type: "pipe", owned: true }, { fd: 8, alias: 8, type: "pipe", owned: true }]);
 			}
 			const messageProbe = path.join(root, "message-probe");
-			await writeFile(messageProbe + ".c", `#define _GNU_SOURCE
+			await compileBenchmarkHelper(root, { source: "message-probe.c", output: "message-probe", arguments: ["-Werror"], code: `#define _GNU_SOURCE
 ${cHeaders("fcntl.h sys/socket.h sys/wait.h string.h unistd.h")}
 int main(int argc, char **argv) {
 	if (argc != 3) return 70;
@@ -1829,8 +1827,7 @@ int main(int argc, char **argv) {
 	for (int left = 10; left;) { char bytes[10]; ssize_t size = read(3, bytes, left); if (size <= 0 || write(1, bytes, size) != size) return 78; left -= size; }
 	return 0;
 }
-`);
-			await compileBenchmarkHelper(root, { source: messageProbe + ".c", output: "message-probe", arguments: ["-Werror"] });
+` });
 			for (const orphan of [false, true]) for (const mode of ["messages", "start", "end", "rights", "commit-failure", "cancel"]) {
 				const controller = new AbortController();
 				const pinCounts: number[] = [];
@@ -1861,7 +1858,7 @@ int main(int argc, char **argv) {
 				if (mode === "cancel" || mode === "commit-failure") expect(executor.output).toBe("");
 			}
 			const counterProbe = path.join(root, "counter-probe");
-			await writeFile(counterProbe + ".c", `${cHeaders("sys/eventfd.h sys/wait.h stdint.h stdio.h unistd.h")}
+			await compileBenchmarkHelper(root, { source: "counter-probe.c", output: "counter-probe", arguments: ["-Werror"], code: `${cHeaders("sys/eventfd.h sys/wait.h stdint.h stdio.h unistd.h")}
 int main(void) {
 	int fd = eventfd(5, EFD_NONBLOCK | EFD_CLOEXEC); if (fd < 0 || dup2(fd, 20) < 0 || dup2(fd, 21) < 0) return 70; close(fd);
 	pid_t child = fork(); if (child < 0) return 71;
@@ -1869,18 +1866,19 @@ int main(void) {
 	int status; uint64_t value; if (waitpid(child, &status, 0) != child || status || read(20, &value, 8) != 8) return 73;
 	printf("%llu", (unsigned long long)value); return 0;
 }
-`);
-			await compileBenchmarkHelper(root, { source: counterProbe + ".c", output: "counter-probe", arguments: ["-Werror"] });
-			for (const mode of ["counter", "value", "identity", "alias", "overflow", "commit-failure"]) {
+` });
+			for (const mode of ["counter", "value", "identity", "alias", "overflow", "release", "commit-failure"]) {
 				const commit = vi.fn(async () => { if (mode === "commit-failure") throw new Error("counter commit failure"); });
 				const executor = held({ descriptors: true, decide: async process => {
 					if (await filesystem.readlink(`/proc/${process.pid}/exe`) !== "/usr/bin/true") return { kind: "continue" };
 					const descriptorOffsets = process.descriptors!.filter(fd => fd.type === "eventfd").map(fd => {
+						expect(fd.outside, mode).toBe(3);
 						const content = Buffer.alloc(9); content.writeBigUInt64LE(BigInt(mode === "value" || mode === "alias" && fd.fd === 21 ? 6 : fd.counter!.value));
 						return { ...fd, event: fd.counter!.id + (mode === "identity" ? 2 : 1), before: 0, after: 0, content };
 					});
 					const data = Buffer.alloc(8); data.writeBigUInt64LE(mode === "overflow" ? 0xffffffffffffffffn : 2n);
-					return { kind: "replay", exitCode: 0, output: [], descriptorOffsets, resourceEvents: [{ fd: 21, kind: "produce", data }], commit };
+					return { kind: "replay", exitCode: 0, output: [], descriptorOffsets, resourceEvents: [{ fd: 21, kind: "produce", data },
+						...(mode === "release" ? [{ fd: 21, kind: "release" as const, data: Buffer.from([3]) }] : [])], commit };
 				} });
 				const running = executor.execute(`'${counterProbe}'`);
 				if (mode === "commit-failure") await expect(running).rejects.toMatchObject({ disposition: "poisoned" });

@@ -1914,7 +1914,7 @@ static int descriptor_context(struct decision_job *job, char *line, size_t capac
 		if (length < 0 || (size_t)length + 512 >= capacity - used) goto fail;
 		used += (size_t)length;
 		if (!capture->installed) used += (size_t)sprintf(line + used, ",\"pin\":%d", pin);
-		if (S_ISREG(state.st_mode)) {
+		if (S_ISREG(state.st_mode) || capture->event) {
 			if (capture->alias == capture->descriptor) capture->outside = walk_process_list(outside_description_locked, job, pin) == 0 ? 0 : 3;
 			else for (unsigned previous = 0; previous < index; previous++) if (job->captures[previous].descriptor == capture->alias) capture->outside = job->captures[previous].outside;
 			used += (size_t)sprintf(line + used, ",\"outside\":%d", capture->outside);
@@ -2409,9 +2409,9 @@ static int resource_events(struct decision_job *job, int apply) {
 				(position->stream >= 4 ? send(position->duplicate, event->data, event->length, MSG_DONTWAIT | MSG_NOSIGNAL)
 				: write(position->duplicate, event->data, event->length)) != (ssize_t)event->length)) goto done;
 		} else if (event->kind == 4) {
-			if (position->event) goto done;
 			if (event->length != 1 || !event->data[0] || event->data[0] > 3 ||
-				(walk_process_list(outside_references_locked, job, position->duplicate) & event->data[0])) goto done;
+				(position->event ? event->data[0] != 3 || walk_process_list(outside_description_locked, job, position->duplicate) != 0 :
+				(walk_process_list(outside_references_locked, job, position->duplicate) & event->data[0]))) goto done;
 			for (unsigned cursor = 0; cursor < message_count; cursor++) if (messages[cursor].object != -1)
 				for (unsigned right = 0; right < messages[cursor].count; right++) {
 					unsigned reference = messages[cursor].rights[right];
@@ -2419,6 +2419,7 @@ static int resource_events(struct decision_job *job, int apply) {
 				}
 			/* The held image exits after commit; replay closes are logical until then.
 			 * Snapshot pins must not turn these last-reference observations into live peers. */
+			if (position->event) continue;
 			if (position->stream >= 4) {
 				queues[object].shutdown = 3;
 				if (peer >= 0 && position->socket_type != SOCK_DGRAM) {

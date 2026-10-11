@@ -531,7 +531,7 @@ export async function captureHeldDescriptorInputs(pid: number, descriptors: read
 		const object = image ?? fd;
 		if (descriptor.pin === undefined) handles.push({ fd, description: representative });
 		if (fd === representative) descriptions[representative] = { object, flags, ...(!descriptor.type || descriptor.type === "directory" ? { position: offset } : {}),
-			...(!descriptor.type && descriptor.outside !== undefined ? { outside: descriptor.outside } : {}),
+			...((!descriptor.type || descriptor.type === "eventfd") && descriptor.outside !== undefined ? { outside: descriptor.outside } : {}),
 			...(descriptor.locks ? { locks: descriptor.locks } : {}) };
 		if (image !== undefined && descriptor.type === "directory" && fd === representative && await readlink(heldPath) !== objects[image]!.sourcePath)
 			throw new Error("inherited directory namespace aliases are unproven");
@@ -649,7 +649,7 @@ function validDescriptors(descriptors: WireRequest["descriptors"]): boolean {
 			(descriptor.type === "eventfd" ? !descriptor.counter || !Number.isInteger(descriptor.counter.id) || descriptor.counter.id < 0 || descriptor.counter.id > 0x7fffffff ||
 				!/^(0|[1-9][0-9]{0,19})$/.test(descriptor.counter.value) || BigInt(descriptor.counter.value) >= 0xffffffffffffffffn || ![0, 1].includes(descriptor.counter.semaphore) : descriptor.counter !== undefined) ||
 			(descriptor.outside !== undefined && (!Number.isInteger(descriptor.outside) || descriptor.outside < 0 || descriptor.outside > 3 ||
-				(descriptor.type !== undefined ? !["pipe", "socket"].includes(descriptor.type) : descriptor.outside !== 0 && descriptor.outside !== 3))) ||
+				(descriptor.type !== undefined && descriptor.type !== "eventfd" ? !["pipe", "socket"].includes(descriptor.type) : descriptor.outside !== 0 && descriptor.outside !== 3))) ||
 			(descriptor.messages !== undefined && (descriptor.type !== "socket" || !validQueueMessages(descriptor.messages, (descriptor.queueHex?.length ?? 0) / 2))) ||
 			(descriptor.type === "pipe" || descriptor.type === "socket" ? typeof descriptor.eof !== "boolean" || typeof descriptor.queueHex !== "string" || descriptor.queueHex.length > 4 * 1024 * 1024 || descriptor.queueHex.length % 2 !== 0 || !/^[0-9a-f]*$/.test(descriptor.queueHex) || !Number.isSafeInteger(descriptor.capacity) || descriptor.capacity! < 4096 : descriptor.queueHex !== undefined || descriptor.eof !== undefined || descriptor.capacity !== undefined) ||
 			(descriptor.type === "socket" ? !descriptor.socket || ![1, 2, 5].includes(descriptor.socket.type ?? 1) || ![descriptor.socket.shutdown, descriptor.socket.peerShutdown].every(value => Number.isInteger(value) && value >= 0 && value <= 3) || ![descriptor.socket.peerInode, descriptor.socket.peerQueued, descriptor.socket.allocated].every(value => Number.isSafeInteger(value) && value >= 0) : descriptor.socket !== undefined) ||

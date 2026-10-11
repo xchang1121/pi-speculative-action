@@ -1765,7 +1765,7 @@ function bufferedProcessPrototype(
 		})), ...inputs.filter(({ fd }) => fd > 2).map(({ fd }) => ({ fd, type: "regular" as const,
 			flagsDigest: sha256Digest(`${context.key}\0${fd}`) }))].map(descriptor => {
 			const input = inputs.find(({ fd }) => fd === descriptor.fd);
-			return input ? { ...descriptor, flagsDigest: input.locks || !input.type && input.outside !== undefined ? digestObject({ flags: input.flags, locks: input.locks, outside: input.outside }) : sha256Digest(String(input.flags)), ...(input.installed === false ? { installed: false as const } : {}), type: input.type ?? descriptor.type, alias: input.alias, object: input.image, contentDigest: input.contentDigest, offset: input.offset,
+			return input ? { ...descriptor, flagsDigest: input.locks || (!input.type || input.type === "eventfd") && input.outside !== undefined ? digestObject({ flags: input.flags, locks: input.locks, outside: input.outside }) : sha256Digest(String(input.flags)), ...(input.installed === false ? { installed: false as const } : {}), type: input.type ?? descriptor.type, alias: input.alias, object: input.image, contentDigest: input.contentDigest, offset: input.offset,
 				eof: snapshot.resources!.objects[input.image]!.queue?.eof,
 				...(snapshot.resources!.objects[input.image]!.queue ? { endpointDigest: digestObject({ queue: snapshot.resources!.objects[input.image]!.queue, socket: snapshot.resources!.objects[input.image]!.socket }) } : {}),
 				...(input.sourcePath ? { resourcePath: projection.toLogical(input.sourcePath) } : {}),
