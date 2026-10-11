@@ -208,16 +208,18 @@ test.each(["scan", "deletion", "clear"])("preserves publications from both owner
 });
 
 test.each(["existing", "new"])("selects a %s ready producer and retains its complete result through collection, borrowing and eviction", async arrival => {
-	const f = await fixture(), first = await f.reserve(), entered = deferred();
+	const f = await fixture(), first = await f.reserve(), entered = hold();
 	let second = arrival === "existing" ? await f.reserve() : undefined;
-	f.registry.observeRunning(f.request.weakKey, first, "inputsChanged", async () => { entered.resolve(); return false; });
-	const actor = track(f.actor());
-	await entered.promise; const broken = await f.produce("broken", 0, true);
+	f.registry.observeRunning(f.request.weakKey, first, "inputsChanged", async () => { if (arrival === "existing") await entered.wait(); return false; });
+	f.registry.observeRunning(f.request.weakKey, first, "suspend", entered.wait);
+	const actor = track(f.actor({ signal: AbortSignal.timeout(5000) }));
+	await entered.entered; const broken = await f.produce("broken", 0, true);
 	await unlink(f.store.artifacts.artifactPath(referencedArtifacts(broken)[0]!.digest));
 	await expect(f.registry.publish(f.request.weakKey, first, broken, async () => false)).rejects.toThrow("complete owned result");
-	second ??= await f.reserve(); await f.publish(second, "fast result");
-	expect(await f.consume(actor, "fast result")).toMatchObject({ producer: second, waiting: [] }); expect(first.signal.aborted).toBe(false);
-	const later = await f.reserve();
+	second ??= await f.reserve(); f.registry.observeRunning(f.request.weakKey, second, "inputsChanged", async () => false);
+	f.registry.observeRunning(f.request.weakKey, second, "suspend", async () => { await f.publish(second!, "fast result"); });
+	expect(await f.consume(actor, "fast result")).toMatchObject({ producer: second, waiting: [expect.any(TimelineInterval)] }); expect(first.signal.aborted).toBe(false);
+	entered.release(); const later = await f.reserve();
 	const graph = new TimelineInterval(0, 10, Array.from({ length: 8192 }, (_, index) => ({ computation: new TimelineInterval(index, index + 1), reused: true })));
 	f.registry.configure(8, 8 * 1024 * 1024);
 	const slow = await f.publish(first, "slow result", 2, false, graph); await f.consume(f.actor(), "slow result");

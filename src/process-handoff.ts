@@ -231,18 +231,17 @@ export class ProcessHandoffRegistry<Invocation = never> {
 
 	async acquire<Plan extends { readonly certificate: ProcessProvenanceCertificate }>({ scope, ...request }: AcquireOptions<Plan>): Promise<ProcessHandoffAcquisition<Plan>> {
 		scope = snapshotExecutionScope(scope);
-		let joined = false;
 		const waits: { readonly handoff: ProcessHandoff; readonly interval: TimelineInterval }[] = [];
 		const borrowed = new Set<HandoffRecord>();
 		const retain = (record: HandoffRecord) => { if (!borrowed.has(record)) { borrowed.add(record); record.borrowers++; } };
 		try {
 			while (true) {
-				if (this.disposed || request.signal?.aborted) return { kind: "miss", joined };
+				if (this.disposed || request.signal?.aborted) return { kind: "miss", joined: waits.length > 0 };
 				// Observe before any asynchronous lookup; negative evidence belongs only to this unchanged pass.
 				const changed = new AbortController(), waiters = this.waiters.get(request.key) ?? new Set<AbortController>();
 				waiters.add(changed); this.waiters.set(request.key, waiters);
 				const stop = request.signal ? AbortSignal.any([changed.signal, request.signal]) : changed.signal;
-				const considered = new Map<HandoffRecord, Sha256Digest | undefined>();
+				const considered = new Map<HandoffRecord, Sha256Digest>();
 				let historyChecked = false;
 				try {
 					while (!stop.aborted) {
@@ -259,9 +258,9 @@ export class ProcessHandoffRegistry<Invocation = never> {
 							for (const { record } of completed) retain(record);
 							const plan = completed.length
 								? await request.lookup(completed.map(({ candidate }) => candidate), undefined, new Map(completed.map(({ candidate, artifacts }) => [candidate.id, artifacts])))
-								: await request.lookup(undefined, new Set([...considered.values()].flatMap(id => id ? [id] : [])));
-							if (this.disposed || request.signal?.aborted) return { kind: "miss", joined };
-							if (plan && !completed.length) return { kind: "hit", plan, joined };
+								: await request.lookup(undefined, new Set(considered.values()));
+							if (this.disposed || request.signal?.aborted) return { kind: "miss", joined: waits.length > 0 };
+							if (plan && !completed.length) return { kind: "hit", plan, joined: waits.length > 0 };
 							const selected = completed.find(({ candidate }) => candidate === plan?.certificate);
 							if (!selected) for (const { record, candidate } of completed) considered.set(record, candidate.id);
 							if (plan && selected && selected.record.state === selected.state && this.byKey.get(request.key)?.has(selected.record)) {
@@ -271,7 +270,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 								if (oneShot) record.state = { ...state, status: "reserved" };
 								record.borrowers++;
 								let pending = true;
-								return { kind: "hit", plan, joined, producer: record, continuation: record.continuation,
+								return { kind: "hit", plan, joined: waits.length > 0, producer: record, continuation: record.continuation,
 									waiting: waits.filter(wait => wait.handoff === record).map(wait => wait.interval), settle: consumed => {
 									if (!pending) return;
 									pending = false; claim?.(consumed); record.borrowers--;
@@ -283,24 +282,23 @@ export class ProcessHandoffRegistry<Invocation = never> {
 							}
 							continue;
 						}
-						if (request.role === "producer") return { kind: "work", work: this.reserve(request.key, request.executablePath, request.ownership, scope), joined };
-						// Waiting grants no transfer authority; acquisition rechecks the live consumer after validation.
-						const running = records.find((record) => !considered.has(record) && record.state.status === "running" && record.ownership.acceptsScope(record.scope, scope, true));
-						const waitingOn = running ?? records.find(record => (record.state.status === "reserved" || record.ownership.pendingWhole) && record.ownership.acceptsScope(record.scope, scope, true));
-						if (!waitingOn) return { kind: "miss", joined };
-						retain(waitingOn);
-						if (running) {
-							const inputs = await waitForCompletion(running.inputsChanged?.() ?? Promise.resolve(false), stop);
-							if (inputs.status === "aborted" || stop.aborted) break;
-							if (inputs.value) { considered.set(running, undefined); continue; }
-						}
-						// Any newly available result may win, including a producer registered after this pass began.
-						const startedAt = performance.now();
-						const completion = running ? running.suspend?.().then(() => running.completion) ?? running.completion :
-							waitingOn.ownership.pendingWhole?.then(() => {}, () => {}) ?? new Promise<never>(() => {});
-						await waitForCompletion(completion, stop);
-						waits.push({ handoff: waitingOn, interval: new TimelineInterval(startedAt, performance.now()) });
-						joined = true;
+						if (request.role === "producer") return { kind: "work", work: this.reserve(request.key, request.executablePath, request.ownership, scope), joined: waits.length > 0 };
+						// Each producer advances independently; readiness never grants transfer authority.
+						await Promise.allSettled(records.filter(record => record.ownership.acceptsScope(record.scope, scope, true) &&
+							(record.state.status === "running" || record.state.status === "reserved" || record.ownership.pendingWhole)).map(async record => {
+							retain(record);
+							const running = record.state.status === "running";
+							if (running) {
+								const inputs = await waitForCompletion(record.inputsChanged?.() ?? Promise.resolve(false), stop);
+								if (inputs.status === "aborted" || stop.aborted || inputs.value) return;
+							}
+							const startedAt = performance.now();
+							await waitForCompletion(running ? record.suspend?.().then(() => record.completion) ?? record.completion :
+								record.ownership.pendingWhole?.then(() => {}, () => {}) ?? new Promise<never>(() => {}), stop);
+							waits.push({ handoff: record, interval: new TimelineInterval(startedAt, performance.now()) });
+							changed.abort();
+						}));
+						if (!stop.aborted) return { kind: "miss", joined: waits.length > 0 };
 						break;
 					}
 				} finally {
