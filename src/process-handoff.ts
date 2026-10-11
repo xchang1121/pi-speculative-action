@@ -3,6 +3,7 @@ import { EffectCommitFailure, effectCommitFailure } from "./effect-transaction.t
 import type { ProcessProvenanceCertificate, Sha256Digest } from "./provenance-certificate.ts";
 import { immutableSnapshot, isImmutableSnapshot, stableEqual } from "./stable-json.ts";
 import { TimelineInterval } from "./task-timing.ts";
+import { waitForCompletion } from "./scheduler.ts";
 
 /** One-shot children and their enclosing branch share adoption authority. */
 export class ProcessHandoffOwnership {
@@ -107,12 +108,13 @@ type AcquireOptions<Plan> = {
 	readonly lookup: ProcessHandoffLookup<Plan>;
 } & (
 	| { readonly role: "producer"; readonly ownership: ProcessHandoffOwnership; readonly executablePath: string }
-	| { readonly role: "actor"; readonly waitForRunning: (handoff: ProcessHandoff) => Promise<"completed" | "miss" | "rejected">; }
+	| { readonly role: "actor"; readonly waitForRunning: (handoff: ProcessHandoff, signal: AbortSignal) => Promise<"completed" | "miss" | "rejected">; }
 );
 
 /** Owns process evidence selection and the scope of one-shot transfers. */
 export class ProcessHandoffRegistry<Invocation = never> {
 	private readonly byKey = new Map<Sha256Digest, Map<ProcessHandoff, HandoffRecord>>();
+	private readonly waiters = new Map<Sha256Digest, Set<AbortController>>();
 	private readonly invocations = new WeakMap<ProcessExecutionBinding, { readonly value: Invocation; readonly bytes: number; executionMs: number }>();
 	private maxCompleted: number;
 	private maxRetainedBytes: number;
@@ -260,7 +262,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 						return { kind: "hit", plan, joined, producer: record, continuation: record.continuation, settle: consumed => {
 							if (!pending) return;
 							pending = false; claim?.(consumed); record.borrowers--;
-							if (!consumed && oneShot) record.state = state;
+							if (!consumed && oneShot) { record.state = state; this.wake(request.key); }
 							if (consumed && record.continuation) { this.retainedBytes -= record.continuation.image.length; record.continuation = undefined; }
 							this.trim();
 						} };
@@ -280,7 +282,18 @@ export class ProcessHandoffRegistry<Invocation = never> {
 					records.find((record) => !considered.has(record) && record.state.status === "running" && scope && record.scope?.sessionID === scope.sessionID);
 				if (!running) return { kind: "miss", joined };
 				retain(running);
-				const decision = await request.waitForRunning(running);
+				const changed = new AbortController(), waiters = this.waiters.get(request.key) ?? new Set<AbortController>();
+				waiters.add(changed); this.waiters.set(request.key, waiters);
+				let decision: "completed" | "miss" | "rejected";
+				try {
+					// Any newly available result may win, including a producer registered after this wait began.
+					const waiting = await waitForCompletion(request.waitForRunning(running, changed.signal), changed.signal);
+					if (waiting.status === "aborted") { joined = true; historyChecked = false; continue; }
+					decision = waiting.value;
+				} finally {
+					waiters.delete(changed); if (!waiters.size) this.waiters.delete(request.key);
+					changed.abort();
+				}
 				if (decision !== "completed") { considered.set(running, undefined); continue; }
 				joined = true;
 				historyChecked = false;
@@ -312,6 +325,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		this.completedCount++;
 		if (candidate) record.computation = computation ?? continuation?.computation ?? new TimelineInterval(record.startedAt, performance.now());
 		record.settle();
+		this.wake(key);
 		if (!candidate || !record.scope) this.remove(record);
 		else this.trim();
 		return true;
@@ -321,6 +335,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 
 	dispose(): void {
 		this.disposed = true;
+		for (const key of this.waiters.keys()) this.wake(key);
 		for (const record of this.records()) {
 			if (record.state.status === "running") record.controller.abort(new Error("process handoff disposed"));
 			this.revokeBinding(record);
@@ -355,6 +370,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 	}
 
 	private *records(): IterableIterator<HandoffRecord> { for (const records of this.byKey.values()) yield* records.values(); }
+	private wake(key: Sha256Digest): void { for (const waiter of this.waiters.get(key) ?? []) waiter.abort(); }
 
 	private remove(record: HandoffRecord): void {
 		this.revokeBinding(record);

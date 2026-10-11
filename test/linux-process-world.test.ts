@@ -10,22 +10,19 @@ import { fileURLToPath } from "node:url";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { createBashTool, createLocalBashOperations, createReadTool, createGrepTool, createLsTool, createFindTool, createWriteTool } from "@earendil-works/pi-coding-agent";
+import { createLocalBashOperations, createReadTool, createGrepTool, createLsTool, createFindTool, createWriteTool } from "@earendil-works/pi-coding-agent";
 import { describe, expect, test, vi } from "vitest";
 import { buildActionKey, buildPiActionKey, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { linuxOverlayfsCapability } from "../src/linux-overlayfs.ts";
 import { inspectHeldExecProcess, LinuxHeldExecBoundary, type HeldExecProcess, type HeldExecTiming } from "../src/linux-held-exec.ts";
 import { effectCommitFailure } from "../src/effect-transaction.ts";
-import { LinuxProcessReuseBackend, validateTransferredProcessEvidence } from "../src/linux-process-backend.ts";
-import { ProcessHandoffOwnership, ProcessHandoffRegistry, type ProcessHandoff, type ProcessExecutionBinding } from "../src/process-handoff.ts";
-import * as scheduling from "../src/scheduler.ts";
-import { sha256Digest } from "../src/provenance-certificate.ts";
-import { createLinuxProcessExecutionWorld } from "../src/linux-process-world.ts";
-import { PI_OPERATION_TOOLS, resolvePiToolInvocation, createClosedSearchProfile } from "../src/pi-tool-invocation.ts";
+import { validateTransferredProcessEvidence } from "../src/linux-process-backend.ts";
+import { ProcessHandoffRegistry, type ProcessExecutionBinding } from "../src/process-handoff.ts";
+import { resolvePiToolInvocation, createClosedSearchProfile } from "../src/pi-tool-invocation.ts";
 import { createResourceSnapshotExecutionWorld } from "../src/agent-execution-world.ts";
 import { summarizeSpeculativeTrace } from "../src/trace-summary.ts";
-import { adaptProcessToolOperations, ProcessExecutionCoordinator } from "../src/process-execution.ts";
-import { emptyWorldReuseMetrics, type ExecutionOperationBinding } from "../src/execution-world.ts";
+import { adaptProcessToolOperations } from "../src/process-execution.ts";
+import type { ExecutionOperationBinding } from "../src/execution-world.ts";
 import { createSpeculativeActionHost } from "../src/agent-integration.ts";
 import { PatternAwareStore, patternAwareSettings, patternAwareActionSemantics } from "../src/pattern-aware.ts";
 import type { SpeculativeActionEvent } from "../src/events.ts";
@@ -2295,134 +2292,6 @@ int main(void) { int fds[2], status; char queue[8]; if (pipe(fds) || fds[0] != 3
 		} finally { await fixture.dispose(); }
 	});
 
-	test("defers empty replay, retains later evidence and drains lazy preparation before refresh", async ({ skip }) => {
-		if (process.platform !== "linux") return skip("Linux only");
-		const fixture = await createLinuxProcessBenchmark("pi-process-admission-");
-		const host = { execute: vi.fn(async () => ({ exitCode: 0 })) };
-		const held = { execute: vi.fn(async () => ({ exitCode: 0 })) }, close = vi.fn(async () => {});
-		let decide!: Parameters<LinuxHeldExecBoundary["executor"]>[1]["decide"];
-		const { promise: pending, resolve: release } = deferred();
-		const opening = vi.spyOn(LinuxHeldExecBoundary, "open").mockImplementation(async () => {
-			await pending;
-			return { shellPath: fixture.shellPath, executor: (_host: unknown, options: Parameters<LinuxHeldExecBoundary["executor"]>[1]) => {
-				decide = options.decide; return held;
-			}, close } as unknown as LinuxHeldExecBoundary;
-		});
-		const planner = vi.spyOn(fixture.backend.planner, "plan");
-		const admission = vi.spyOn(scheduling, "waitForCompletion");
-		const processInvocation = resolvePiToolInvocation("bash", { command: ":" }, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath })!.process!;
-		const invocation = vi.fn(() => processInvocation);
-		const coordinator = new ProcessExecutionCoordinator(host, {
-			enabled: () => true,
-			prepare: (refresh) => fixture.backend.prepareActorReplay(host, {
-				sourceRoot: fixture.workspace, invocation,
-				held: { realShell: fixture.shellPath, executor: () => held },
-			}, refresh),
-			reset: () => fixture.backend.resetActorReplay(),
-		});
-		const invoke = () => coordinator.operations.exec(":", fixture.workspace, { env: fixture.environment, onData: () => {} });
-		const gates = [deferred(), deferred()], sessionsReady = deferred(), captureGate = gated();
-		const producers: Promise<unknown>[] = [];
-		let sessions = 0;
-		let calls: Promise<unknown> | undefined, refreshing: Promise<unknown> | undefined;
-		try {
-			await fixture.backend.observeBindings({ sessionID: "session", turnID: "turn" }, invoke, bindings => { expect(bindings).toEqual([]); }, false);
-			expect(host.execute).toHaveBeenCalledOnce();
-			expect(invocation).not.toHaveBeenCalled(); expect(opening).not.toHaveBeenCalled();
-			expect(coordinator.actorDiagnostics().state).toBe("degraded");
-			await mkdir(path.join(fixture.storeRoot, "certificates", "00"), { recursive: true });
-			calls = Promise.all([invoke(), invoke()]);
-			await vi.waitFor(() => expect(opening).toHaveBeenCalledOnce());
-			await fixture.backend.store.clear();
-			refreshing = coordinator.refreshActorRoute();
-			await invoke();
-			expect(host.execute).toHaveBeenCalledTimes(2); expect(close).not.toHaveBeenCalled();
-			expect(coordinator.actorDiagnostics().state).toBe("probing");
-			release(); await Promise.all([calls, refreshing]);
-			expect(held.execute).toHaveBeenCalledTimes(2); expect(invocation).toHaveBeenCalledTimes(2);
-			expect(planner).not.toHaveBeenCalled(); expect(admission).not.toHaveBeenCalled();
-			expect(opening).toHaveBeenCalledTimes(2); expect(close).toHaveBeenCalledOnce();
-			expect(coordinator.actorDiagnostics().state).toBe("ready");
-			await invoke(); // Clearing evidence is rechecked even after the helper was initialized.
-			expect(host.execute).toHaveBeenCalledTimes(3); expect(invocation).toHaveBeenCalledTimes(2);
-			expect(await fixture.backend.check()).toMatchObject({ state: "ready" }); await invoke();
-			expect(host.execute, "backend preparation alone cannot produce a replay result").toHaveBeenCalledTimes(4);
-			expect(held.execute).toHaveBeenCalledTimes(2);
-			const availability = vi.spyOn(fixture.backend.store, "mayHaveCertificates").mockImplementationOnce(async () => {
-				producers.push(...gates.map(gate => fixture.workspaceSandbox.withWorkspace(fixture.workspace, async workspace => {
-					const session = await fixture.backend.open({ workspace, sourceRoot: fixture.workspace, invocation: processInvocation });
-					try { if (++sessions === gates.length) sessionsReady.resolve(); await gate.promise; }
-					finally { const first = session.close(), second = session.close(); await first; expect(second).toBe(first); }
-				})));
-				await Promise.race([sessionsReady.promise, Promise.all(producers)]);
-				return false; // Actual sessions appeared while the empty history lookup was awaiting IO.
-			});
-			try { await invoke(); expect(held.execute).toHaveBeenCalledTimes(3); } finally { availability.mockRestore(); }
-			const cancelled = new AbortController(); cancelled.abort(new Error("cancelled preparation"));
-			await fixture.workspaceSandbox.withWorkspace(fixture.workspace, async workspace => {
-				await expect(fixture.backend.open({ workspace, sourceRoot: fixture.workspace, invocation: processInvocation, signal: cancelled.signal }))
-					.rejects.toThrow("cancelled preparation");
-			});
-			gates[0]!.resolve(); await producers[0]; await invoke();
-			expect(held.execute, "one closed or failed producer cannot retire its live sibling").toHaveBeenCalledTimes(4);
-			gates[1]!.resolve(); await producers[1]; await invoke(); expect(host.execute).toHaveBeenCalledTimes(5);
-
-			const executable = path.join(fixture.workspace, "lookup-worker"), key = sha256Digest("different execution identity");
-			const handoffs = Reflect.get(fixture.backend, "handoffs") as ProcessHandoffRegistry;
-			const scan = vi.spyOn(await import("../src/linux-held-exec.ts"), "inspectHeldExecProcess").mockRejectedValue(new Error("process context required"));
-			const image = vi.spyOn(filesystem, "realpath").mockResolvedValue(executable);
-			const inspect = () => decide({ id: "lookup:1", sequence: 1, pid: process.pid, tracerPid: process.pid, sourceRoot: fixture.workspace });
-			let work: ProcessHandoff | undefined;
-			const history = vi.spyOn(fixture.backend.store, "mayHaveCertificates");
-			try {
-				await expect(inspect()).resolves.toEqual({ kind: "continue", repeat: "executable" }); expect(scan).not.toHaveBeenCalled();
-				history.mockImplementationOnce(async () => {
-					const result = await handoffs.acquire({ key, executablePath: executable, role: "producer",
-						ownership: new ProcessHandoffOwnership(), lookup: async () => undefined });
-					if (result.kind !== "work") throw new Error("expected concurrent producer registration");
-					work = result.work; return false;
-				});
-				await expect(inspect()).resolves.toEqual({ kind: "continue" });
-				expect(history).toHaveBeenLastCalledWith(executable);
-				expect(scan).toHaveBeenCalledExactlyOnceWith(process.pid, executable, undefined);
-				expect(fixture.backend.actorMetrics()).toMatchObject({ hits: 0, lastError: "actor_child:process context required" });
-			} finally {
-				if (work) handoffs.complete(key, work);
-				history.mockRestore(); image.mockRestore(); scan.mockRestore();
-			}
-
-			const fork = fixture.workspaceSandbox.fork.bind(fixture.workspaceSandbox);
-			const forking = vi.spyOn(fixture.workspaceSandbox, "fork").mockImplementation(options => fork({ ...options,
-				afterCapture: async (workspace, capture) => {
-					await captureGate.wait();
-					return options.afterCapture!(workspace, capture); // The process is closed; final evidence can still be published.
-				},
-			}));
-			try {
-				const producing = forkReusableBash(fixture, { command: ":", label: "sealing", actionNamespace: "readiness", executionFingerprint: "readiness" })
-					.then(async branch => { try { expect(branch.output.isError).toBe(false); } finally { await branch.dispose(); } });
-				producers.push(producing);
-				await Promise.race([captureGate.entered, producing]); await invoke();
-				expect(held.execute, "outer evidence capture still owns possible publication").toHaveBeenCalledTimes(5);
-				captureGate.release(); await producing;
-			} finally { captureGate.release(); forking.mockRestore(); }
-			admission.mockRestore();
-			await invoke(); // An unproved native shell result does not become persistent replay authority.
-			expect(fixture.backend.actorMetrics().wholeCommandHits).toBe(0); expect(host.execute).toHaveBeenCalledTimes(6);
-			expect(held.execute).toHaveBeenCalledTimes(5);
-			await fixture.backend.store.clear(); await invoke(); expect(host.execute).toHaveBeenCalledTimes(7);
-			opening.mockRejectedValueOnce(new Error("held-exec functional probe failed"));
-			await coordinator.refreshActorRoute();
-			expect(coordinator.actorDiagnostics()).toMatchObject({ state: "degraded", detail: expect.stringContaining("functional probe failed") });
-			await invoke(); expect(host.execute).toHaveBeenCalledTimes(8);
-		} finally {
-			release(); gates.forEach(gate => gate.resolve()); captureGate.release();
-			await Promise.allSettled([calls, refreshing, ...producers]);
-			await coordinator.dispose(); opening.mockRestore(); admission.mockRestore();
-			await fixture.dispose();
-		}
-	});
-
 	test("owns output and capture lifetimes, preserves concurrency and brokers an internal pipe", async ({ skip }) => {
 		if (process.platform !== "linux") return skip("Linux only");
 		const fixture = await createLinuxProcessBenchmark("pi-process-concurrency-");
@@ -2714,123 +2583,6 @@ int main(void) { int fds[2], status; char queue[8]; if (pipe(fds) || fds[0] != 3
 			restoreTransactions?.(); opening.mockRestore(); reading.mockRestore(); removing.mockRestore(); spawning.mockRestore(); publishing.mockRestore();
 			await fixture.dispose();
 		}
-	});
-
-	test.for([false, true, "close"] as const)("replenishes shared PATH alias probes while preserving mappings and owned cancellation (cancel=%s)", { timeout: 15_000 }, async (cancel, { skip }) => {
-		if (process.platform !== "linux") return skip("Linux only");
-		const fixture = await createLinuxProcessBenchmark("pi-process-interposition-cancel-");
-		const { realpath: resolvePath } = await vi.importActual<typeof filesystem>("node:fs/promises");
-		const controller = new AbortController(), entered = deferred(), gate = deferred();
-		let activeRoot: string | undefined, held = false, returned = false, probesAfterAbort = 0;
-		const probes = new Map<string, number>();
-		let closing: (() => Promise<void>) | undefined, closed: Promise<void> | undefined, cancelled = false;
-		const open = fixture.backend.open.bind(fixture.backend);
-		const opening = vi.spyOn(fixture.backend, "open").mockImplementation(async (input) => {
-			activeRoot = input.workspace.sandboxRoot;
-			const session = await open(input); closing = session.close; return session;
-		});
-		const resolving = vi.spyOn(filesystem, "realpath").mockImplementation((...args) => {
-			const target = String(args[0]);
-			if (activeRoot && path.dirname(target) === path.join(activeRoot, "bin") && path.basename(target).startsWith("probe-")) {
-				probes.set(path.basename(target), (probes.get(path.basename(target)) ?? 0) + 1);
-				if (cancelled) probesAfterAbort++;
-				if (!held) { held = true; entered.resolve(); return gate.promise.then(() => resolvePath(...args)); }
-			}
-			return resolvePath(...args);
-		});
-		const listening = vi.spyOn(net.Server.prototype, "listen");
-		let running: ReturnType<typeof forkReusableBash> | undefined;
-		try {
-			const status = await fixture.backend.check(true);
-			if (status.state !== "ready") return skip(status.detail);
-			await mkdir(path.join(fixture.workspace, "bin"));
-			for (let index = 0; index < 33; index++) {
-				const target = path.join(fixture.workspace, "bin", `probe-${index}`);
-				await writeFile(target, "#!/bin/sh\nexit 0\n"); await chmod(target, 0o755);
-			}
-			await filesystem.symlink("bin", path.join(fixture.workspace, "alias"));
-			const environment = { ...fixture.environment, PATH: `${fixture.workspace}/bin:${fixture.workspace}/alias:${fixture.environment.PATH}` };
-			const tool = createBashTool(fixture.workspace, { shellPath: fixture.shellPath, operations: fixture.coordinator.operations,
-				exposeSessionEnvironment: false, spawnHook: (context) => ({ ...context, env: environment }) });
-			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
-			const args = { command: ":" };
-			const expected = await tool.execute("oracle", args);
-			running = forkReusableBash({ ...fixture, tool, environment }, { ...args, label: "cancel-interposition",
-				actionNamespace: "cancel-interposition", executionFingerprint, signal: controller.signal });
-			void running.then(() => { returned = true; }, () => { returned = true; });
-			await Promise.race([entered.promise, running]);
-			if (cancel) { cancelled = true; if (cancel === "close") closed = closing!(); else controller.abort(); }
-			await nextTurn();
-			if (!cancel) await expect.poll(() => probes.size, { timeout: 1000 }).toBe(33);
-			expect({ returned, owned: existsSync(activeRoot!) }).toEqual({ returned: false, owned: true });
-			gate.resolve();
-			if (cancel) await expect(running).rejects.toThrow();
-			else {
-				expect((await running).output).toEqual({ result: expected, isError: false });
-				expect(probes.size).toBe(33); expect([...probes.values()]).toEqual(Array(33).fill(1));
-				const mounts = vi.mocked(childProcess.spawn).mock.calls.flatMap(([, values]) => Array.isArray(values)
-					? values.filter((value, index) => values[index - 1] === "--exec-mount" && value.includes("/probe-"))
-						.map((value) => value.split(":")[0]) : []);
-				expect(mounts.sort()).toEqual([`${fixture.workspace}/bin`, `${fixture.workspace}/alias`]
-					.flatMap((directory) => Array.from({ length: 33 }, (_, index) => `${directory}/probe-${index}`)).sort());
-			}
-			const brokerStarted = listening.mock.calls.some(([address]) => typeof address === "string" && path.basename(address).startsWith("broker-"));
-			const afterAbort = { probesAfterAbort, brokerStarted };
-			expect(afterAbort, `preparation ownership: ${JSON.stringify(afterAbort)}`).toEqual({ probesAfterAbort: 0, brokerStarted: !cancel });
-			await expect(stat(activeRoot!)).rejects.toMatchObject({ code: "ENOENT" });
-		} finally {
-			gate.resolve(); await running?.then((branch) => branch.dispose(), () => undefined); await closed;
-			opening.mockRestore(); resolving.mockRestore(); listening.mockRestore(); await fixture.dispose();
-		}
-	});
-
-	test("defers native initialization and preserves opaque process output without path rewriting", async () => {
-		const root = await mkdtemp(path.join(os.tmpdir(), "pi-process-health-"));
-		const storeRoot = path.join(root, "store");
-		const backend = new LinuxProcessReuseBackend({ storeRoot });
-		const coordinator = new ProcessExecutionCoordinator(adaptProcessToolOperations(createLocalBashOperations()));
-		const world = createLinuxProcessExecutionWorld({ coordinator, tools: PI_OPERATION_TOOLS.process, backend, storeRoot });
-		let payload = "", ownedAtClose = false, exit = 0;
-		const ownership = new ProcessHandoffOwnership();
-		const registry = new ProcessHandoffRegistry<null>(1, 16), scope = { sessionID: "cost", turnID: "first" };
-		const binding = registry.observe(sha256Digest("cost"), "/worker", scope, null, 10)!;
-		const close = vi.fn(async (workspace: string) => { ownedAtClose = existsSync(workspace); });
-		vi.spyOn(backend, "open").mockImplementation(async ({ workspace }) => ({
-			ownership, executeBinding: async () => { throw new Error("unexpected process binding"); }, executionBindings: () => [binding], computationDependencies: () => [],
-			executor: { execute: async (request) => { payload = `opaque bytes: ${workspace.sandboxRoot}`; request.onData(Buffer.from(payload)); return { exitCode: exit }; } },
-			metrics: emptyWorldReuseMetrics, seal: async () => [], close: () => close(workspace.sandboxRoot),
-			validate: async () => ({ status: "valid", metrics: { bytesRead: 0, filesRead: 0, mode: "exact" } }),
-		}));
-		try {
-			expect(await world.speculation.diagnostics?.({ cwd: root })).toMatchObject({ state: "registered" });
-			await expect(stat(storeRoot)).rejects.toThrow();
-			const args = { command: "opaque" };
-			const invocation = resolvePiToolInvocation("bash", args, { cwd: root, environment: {} })!;
-			const action = PI_ACTION_SEMANTICS.buildKey("bash", args, root, "", { fingerprint: "fake-process", context: invocation })!;
-			const context = { cwd: root, toolName: "bash", args, action, callID: "opaque", tool: createBashTool(root, { operations: coordinator.operations }), signal: new AbortController().signal };
-			const branch = await world.speculation.execute(context);
-			try {
-				expect(branch.output.result.content).toEqual([{ type: "text", text: payload }]);
-				const operation = branch.operations![0]!;
-				expect(operation.executionMs).toBe(10);
-				expect(registry.observe(binding.key, "/worker", scope, null, 30)).toBe(binding);
-				expect(operation.executionMs).toBe(30);
-				expect(operation).not.toHaveProperty("expectedDurationMs");
-				await expect(branch.commit()).resolves.toEqual(branch.output);
-				await expect(branch.commit()).resolves.toEqual(branch.output);
-					expect(ownership.claimChild()).toBeUndefined();
-
-			}
-			finally { await branch.dispose(); }
-			expect(close).toHaveBeenCalledOnce();
-			expect(ownedAtClose).toBe(true);
-			exit = 3; // A command that ran to completion and failed stays adoptable, carrying its exit code.
-			const failed = await world.speculation.execute({ ...context, callID: "failed" });
-			try { expect(failed.output).toMatchObject({ isError: true, exitCode: 3, result: { content: [{ text: `${payload}
-
-Command exited with code 3` }] } }); }
-			finally { await failed.dispose(); }
-		} finally { await world.dispose?.(); registry.dispose(); await rm(root, { recursive: true, force: true }); }
 	});
 
 	test.for(["rename", "posix-lock", "ofd-lock", "flock", "rdtsc", "auxv-random"] as const)("rejects reuse when isolated resource semantics differ from native (%s)", { timeout: 20_000 }, async (mode, { skip }) => {

@@ -30,7 +30,7 @@ export interface ProcessReuseRequest {
 }
 
 export type ProcessReuseMissReason = "no_candidate_pathset" | "certificate_tainted" | "producer_guarantee_incompatible" | "dependency_changed"
-	| "validation_indeterminate" | "artifact_missing" | "observation_contract_incompatible";
+	| "validation_indeterminate" | "artifact_missing" | "artifact_unreadable" | "observation_contract_incompatible";
 
 export interface ProcessReuseLookupMetrics {
 	readonly candidateCertificates: number;
@@ -105,7 +105,9 @@ export class ProcessReusePlanner {
 			const { dependencies, filesRead, bytesRead } = observation;
 			const validation: Extract<ProvenanceValidation, { status: "valid" }> = { status: "valid", strongKey, dependencies, filesRead, bytesRead };
 			for (const certificate of matching) {
-				const artifacts = await this.store.artifacts.load(referencedArtifacts(certificate));
+				let artifacts: VerifiedArtifactClosure | undefined;
+				try { artifacts = await this.store.artifacts.load(referencedArtifacts(certificate)); }
+				catch { reasons.add("artifact_unreadable"); continue; }
 				if (!artifacts) { reasons.add("artifact_missing"); continue; }
 				metrics.artifactsLoaded += artifacts.artifacts;
 				metrics.artifactBytesRead += artifacts.bytes;

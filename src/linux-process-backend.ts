@@ -950,13 +950,13 @@ export class LinuxProcessReuseBackend {
 			lookup,
 			...("actor" in participant ? {
 				role: "actor" as const,
-				waitForRunning: async (running: ProcessHandoff) => {
+				waitForRunning: async (running: ProcessHandoff, changed: AbortSignal) => {
 					if (!running.ownership.acceptsScope(running.scope, scope, true)) return "rejected";
 					if (await running.inputsChanged?.()) return "rejected";
 					const waitStarted = performance.now();
-					const waiting = new AbortController(), stop = signal ? AbortSignal.any([signal, waiting.signal]) : waiting.signal;
+					const waiting = new AbortController(), stop = AbortSignal.any([changed, waiting.signal, ...(signal ? [signal] : [])]);
 					const completion = running.suspend ? running.suspend(stop).then(() => running.completion) : running.completion;
-					const finished = await waitForCompletion(completion, signal).finally(() => waiting.abort());
+					const finished = await waitForCompletion(completion, stop).finally(() => waiting.abort());
 					const interval = new TimelineInterval(waitStarted, performance.now());
 					waits.push({ handoff: running, interval });
 					if (finished.status === "completed") return "completed";

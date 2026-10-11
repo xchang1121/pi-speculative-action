@@ -8,7 +8,7 @@ const directories = temporaryDirectories("pi-spec-settings-");
 
 afterEach(directories.dispose);
 
-describe("extension-owned speculative settings", () => {
+describe("settings publication and reopening on disk", () => {
 	it("persists only the project overlay while preserving global inheritance", async () => {
 		const { root, agent, cwd } = await fixture();
 		const store = new SpeculativeActionSettingsStore(cwd, agent);

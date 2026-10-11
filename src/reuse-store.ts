@@ -188,9 +188,11 @@ export class ProvenanceCertificateStore {
 			const id: Sha256Digest = `sha256:${match[1]}`;
 			if (excludedCertificates?.has(id)) continue;
 			const reference = path.join(directory, name);
-			const certificate = await this.get(id);
+			let certificate: ProcessProvenanceCertificate | undefined;
+			try { certificate = await this.get(id); }
+			catch { continue; } // An unreadable candidate cannot suppress another verified result.
 			if (certificate?.weakKey === weakKey) certificates.push(certificate);
-			else await rm(reference, { force: true });
+			else await rm(reference, { force: true }).catch(() => undefined);
 		}
 		certificates.sort((left, right) => right.createdAt - left.createdAt || right.id.localeCompare(left.id));
 		return certificates;

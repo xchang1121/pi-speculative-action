@@ -22,7 +22,7 @@ export type LinuxProcessBenchmark = Readonly<Awaited<ReturnType<typeof createLin
 /** Retain a real producer at publication until an Actor is admitted to its running work. */
 export function holdProcessPublication(backend: LinuxProcessReuseBackend, delayMs = 0) {
 	const release = deferred();
-	let reached = false, joined = false, timer: ReturnType<typeof setTimeout> | undefined;
+	let reached = false, joined = false, closed = false, timer: ReturnType<typeof setTimeout> | undefined;
 	const handoffs = Reflect.get(backend, "handoffs") as ProcessHandoffRegistry;
 	const publish = handoffs.publish.bind(handoffs);
 	const publication = vi.spyOn(handoffs, "publish").mockImplementation(async (...args) => {
@@ -30,16 +30,21 @@ export function holdProcessPublication(backend: LinuxProcessReuseBackend, delayM
 	});
 	const wait = scheduling.waitForCompletion;
 	const assessment = vi.spyOn(scheduling, "waitForCompletion").mockImplementation((promise, signal, timeoutMs) => {
+		const waiting = wait(promise, signal, timeoutMs);
 		if (reached && !joined) {
-			joined = true;
-			timer = setTimeout(() => release.resolve(), delayMs);
+			let settled = false;
+			void waiting.then(() => { settled = true; }, () => { settled = true; });
+			setImmediate(() => {
+				if (closed || settled || joined) return; // An immediately rejected selection is not a join.
+				joined = true; timer = setTimeout(() => release.resolve(), delayMs);
+			});
 		}
-		return wait(promise, signal, timeoutMs);
+		return waiting;
 	});
 	return {
 		reached: () => reached,
 		joined: () => joined,
-		close: () => { clearTimeout(timer); release.resolve(); publication.mockRestore(); assessment.mockRestore(); },
+		close: () => { closed = true; clearTimeout(timer); release.resolve(); publication.mockRestore(); assessment.mockRestore(); },
 	};
 }
 

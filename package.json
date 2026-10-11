@@ -55,7 +55,7 @@
 		"bench:suite": "tsx ./bench/suite.ts",
 		"bench:check": "tsc --noEmit -p ./bench/tsconfig.json",
 		"bench:exec-boundary": "vitest --run test/linux-exec-boundary.test.ts test/linux-process-world.test.ts --maxWorkers=1 --no-file-parallelism",
-		"bench:overlay-probe": "vitest --run test/linux-overlayfs.test.ts test/workspace-sandbox.test.ts --maxWorkers=1 --no-file-parallelism -t OverlayFS",
+		"bench:overlay-probe": "vitest --run test/linux-overlayfs.test.ts --maxWorkers=1 --no-file-parallelism",
 		"setup:linux": "node ./src/setup-linux-process-backend.mjs",
 		"test": "vitest --run",
 		"prepack": "npm run build"

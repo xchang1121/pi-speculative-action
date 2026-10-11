@@ -52,13 +52,14 @@ npm run bench:suite -- --suite swe_diverse --repeats 3 --label speculative
 
 `--drafter-task-max-requests` 和 `--drafter-task-max-tokens` 约束整个任务的预测、续推和 Actor 探测。报告的 Drafter usage 与费用包含全部收到的响应；`drafterBudget` 另外列出缺少 usage 的预留，无法据此声称精确账单。普通来源的预测 token 统计与这份完整请求统计分开。
 
-每次调度策略变更至少覆盖以下矩阵；`swe_smoke` 只运行 Axios FormData 修复任务，用于限制首次真实模型验证的范围。完整自然任务结论仍需扩大到多实例、多次重复。
+日常回归从完整工作流的可观察行为验证功能，按改动选择相关入口。真实模型运行用于评估任务表现与收益；`swe_smoke` 只运行 Axios FormData 修复任务，完整自然任务结论仍需扩大到多实例、多次重复。
 
 | 场景 | 入口 | 验收内容 |
 | --- | --- | --- |
 | 搜索密集与输入频繁变化 | `bench/portable-kernel.mjs`、`bench/grep-captured-qualification.mjs` | 逐步输出、输入变化后的回退或重算、取消与关闭 |
-| 多步、低命中与任务预算 | `test/faux-llm-e2e.test.ts`、`test/drafter-adaptation.test.ts` | 完整 Agent 任务、并发候选及续推共用请求/token 额度、取消和迟到 usage 结算 |
-| Actor 资源争用与内部进程接管 | `test/scheduler.test.ts`、`test/runtime-engine.test.ts`、`test/linux-process-world.test.ts` | 跨会话硬件预算、Actor 优先、启动窗口、物理回收与内部计算的一次采纳 |
+| Pi 会话与文件工作流 | `test/extension.system.test.ts`、`test/agent.system.test.ts` | 真实 SDK 加载扩展、跨轮读写、学习状态重开、变更后验新和未采纳效果隔离 |
+| 多生产者与历史结果 | `test/process-reuse.system.test.ts` | 后完成的生产者唤醒等待者、损坏缓存隔离、有效历史结果与输入变更 |
+| 原生进程接管 | `test/linux-process-world.test.ts`、`test/linux-exec-boundary.test.ts`、`test/linux-reuse-chain.test.ts` | 真实进程与系统调用、跨轮接管、描述符与文件效果、取消后的资源释放 |
 | 自然修改与验证任务 | `bench:suite -- --suite swe_smoke --paired` | 最终回复、补丁、数据集指定测试、完整计时和实测 token/费用 |
 
 ## 计时与验收规则

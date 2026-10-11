@@ -2174,8 +2174,8 @@ export function makeSpeculativeActionRuntime<
 		const changed = (adopted ? candidateBranch(adopted)?.resources ?? action.resources : action.resources).map(resource => rootedResource(action, resource));
 		if (!changed.length) return;
 		const paths = (adopted || effect === "workspace_mutation" ? changed : []).filter(resource => path.isAbsolute(resource));
-		// A native unbounded call names no write set: running work validates at adoption, finished branches off the Actor's path.
-		const unbounded = !adopted && effect === "unbounded", revalidate: Candidate[] = [];
+		// A native unbounded call names no write set; its neighbours validate at adoption.
+		const unbounded = !adopted && effect === "unbounded";
 		const candidates = candidateStore.values(session.id);
 		const invalid = new Set<Candidate>();
 		for (const candidate of candidates) {
@@ -2188,26 +2188,16 @@ export function makeSpeculativeActionRuntime<
 			// Once an Actor reserves a candidate, its freshness and compatibility checks
 			// are authoritative. Cache invalidation may only retire unclaimed work.
 			if (!reservationAvailable(candidate.work.reservation)) continue;
-			if (candidate.key.resources.some((resource) => changed.some((path) => resourcePathsOverlap(rootedResource(candidate.key, resource), path)))) {
-				if (unbounded) { if (candidate.work.execution.status === "succeeded" && candidate.work.reservation.kind !== "shared") revalidate.push(candidate); continue; }
-				for (const descendant of candidates) {
-					// Completed shared outputs are checked against their sealed evidence at every adoption.
-					// Pending work and checkpoint descendants still retain conservative conflict invalidation.
-					if (descendant === candidate && candidate.work.execution.status === "succeeded" && candidate.work.reservation.kind === "shared") continue;
-					if (descendant === candidate || descendsFrom(descendant, candidate)) invalid.add(descendant);
-				}
-			}
+			// Path hints retire pending captures, not sealed results with their own adoption proof.
+			if (unbounded || candidate.work.execution.status === "succeeded" &&
+				(candidate.work.reservation.kind === "shared" || candidateBranch(candidate)?.validate)) continue;
+			if (candidate.key.resources.some(resource => changed.some(path => resourcePathsOverlap(rootedResource(candidate.key, resource), path))))
+				invalid.add(candidate);
 		}
+		const parents = [...invalid].filter(candidate => reservationAvailable(candidate.work.reservation));
+		for (const candidate of candidates) if (parents.some(parent => descendsFrom(candidate, parent))) invalid.add(candidate);
 		// The Actor's settlement relaunches what still has a future; relaunched now, work for the decision it settles would only be retired.
 		invalidateCandidates(session, [...invalid].filter((candidate) => reservationAvailable(candidate.work.reservation)), cause("freshness", "authoritative_resource_changed"), false, false);
-		if (revalidate.length) trackSourceTask(session, (async () => {
-			for (const candidate of revalidate) {
-				if (session.lifecycle.sealed || !reservationAvailable(candidate.work.reservation) || !candidateStore.has(session.id, candidate)) continue;
-				const validation = await validateCandidate(candidate).catch(() => undefined);
-				if (validation?.status === "stale") invalidateCandidates(session, candidateStore.values(session.id).filter((descendant) =>
-					reservationAvailable(descendant.work.reservation) && (descendant === candidate || descendsFrom(descendant, candidate))), validation.cause);
-			}
-		})());
 	};
 
 	const pruneActionContexts = (session: Session): void => {
