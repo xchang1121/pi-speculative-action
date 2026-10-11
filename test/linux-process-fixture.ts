@@ -1,5 +1,5 @@
 import { execHostText } from "../src/executable-path.ts";
-import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, copyFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { test, vi, type TestAPI } from "vitest";
@@ -8,6 +8,7 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { createBashTool, createLocalBashOperations } from "@earendil-works/pi-coding-agent";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { LinuxProcessReuseBackend, type LinuxProcessReuseMetrics } from "../src/linux-process-backend.ts";
+import { resolveLinuxExecHelper } from "../src/linux-held-exec.ts";
 import { createLinuxProcessExecutionWorld } from "../src/linux-process-world.ts";
 import { PI_OPERATION_TOOLS, resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { adaptProcessToolOperations, definedProcessEnvironment, ProcessExecutionCoordinator, type ProcessExecutionRequest, type ProcessExecutor } from "../src/process-execution.ts";
@@ -52,7 +53,7 @@ export function holdProcessPublication(backend: LinuxProcessReuseBackend, delayM
 export async function createLinuxProcessBenchmark(
 	rootPrefix: string,
 	workspaceDriver?: WorkspaceSandboxDriver,
-	backendOptions: Omit<ConstructorParameters<typeof LinuxProcessReuseBackend>[0], "storeRoot"> = {},
+	{ processImages, ...backendOptions }: Omit<ConstructorParameters<typeof LinuxProcessReuseBackend>[0], "storeRoot"> & { readonly processImages?: false } = {},
 	parent = os.tmpdir(),
 ) {
 	if (process.platform !== "linux") throw new Error("Run this benchmark inside Linux or WSL 2");
@@ -68,6 +69,8 @@ export async function createLinuxProcessBenchmark(
 		LANG: "C.UTF-8",
 	});
 	const executor = (shellPath: string) => adaptProcessToolOperations(createLocalBashOperations({ shellPath })), host = executor(shellPath);
+	if (processImages === false) await copyFile(await resolveLinuxExecHelper(backendOptions.heldExecBinary ?? process.env.PI_SPEC_HELD_EXEC),
+		backendOptions.heldExecBinary = path.join(root, "held-exec")); // The ordinary helper works without its adjacent image library.
 	const backend = new LinuxProcessReuseBackend({ storeRoot, ...backendOptions });
 	const coordinator = new ProcessExecutionCoordinator(backend.completedReplayExecutor(host, {
 		sourceRoot: workspace, invocation: request => resolvePiToolInvocation("bash", { command: request.command }, {

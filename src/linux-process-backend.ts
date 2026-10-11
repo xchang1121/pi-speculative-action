@@ -1213,8 +1213,8 @@ export class LinuxProcessReuseBackend {
 				}
 				return false;
 			};
-			const advancing = (suspend?: () => Promise<boolean>) => this.handoffs.observeRunning(weakKey, work, async () =>
-				!await (inputCheck ??= changedInput().catch(() => true).finally(() => { inputCheck = undefined; })) && (suspend ? suspend() : true));
+			const advancing = (advance = async () => live || closedStreams) => this.handoffs.observeRunning(weakKey, work, async () =>
+				!await (inputCheck ??= changedInput().catch(() => true).finally(() => { inputCheck = undefined; })) && advance());
 			releaseRunning = advancing();
 			const imagePath = path.join(traceRoot, "continuation");
 			const command = straceCommand(ready.strace, tracePrefix, [

@@ -77,8 +77,8 @@ async function runningProcess(start: number, ready: (pid: number, syscall: strin
 	let pid = 0;
 	await expect.poll(async () => {
 		for (const [, args] of vi.mocked(childProcess.spawn).mock.calls.slice(start)) {
-			const image = Array.isArray(args) && args.find(arg => arg.startsWith("--handoff-image=")); if (!image) continue;
-			const report = await readFile(path.join(path.dirname(image.slice("--handoff-image=".length)), "fd-offsets"), "utf8").catch(() => "");
+			const reportPath = Array.isArray(args) && args.find(arg => arg.endsWith("/fd-offsets")); if (!reportPath) continue;
+			const report = await readFile(reportPath, "utf8").catch(() => "");
 			const match = /\nRUNNING (\d+)\n$/.exec(report); if (!match) continue;
 			const current = Number(match[1]), syscall = await readFile(`/proc/${current}/syscall`, "utf8").catch(() => "");
 			if (await ready(current, syscall)) { pid = current; return true; }
@@ -389,8 +389,8 @@ nativeTest.for([false, true])("prepares a failed command after its reported inpu
 		} finally { await host?.dispose(); await fixture.dispose(); }
 	});
 
-nativeTest.for(["sample", "file", "dup", "threads", "limit", "metadata", "identity", "pipe", "socket"] as const)("adopts a closed-input calculation through capture or completion (%s)", { timeout: 30_000 }, async (mode, { benchmark }) => {
-		const fixture = await benchmark("pi-prefix-process-", "git");
+nativeTest.for(["sample", "file", "dup", "threads", "limit", "metadata", "identity", "pipe", "socket", "pipe:unavailable", "socket:unavailable"])("adopts a closed-input calculation through capture or completion (%s)", { timeout: 30_000 }, async (scenario, { benchmark }) => {
+		const [mode, unavailable] = scenario.split(":"), fixture = await benchmark("pi-prefix-process-", "git", { processImages: unavailable ? false : undefined });
 		const descendant = mode === "pipe" || mode === "socket", complete = descendant || mode === "identity";
 		await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker", arguments: ["-pthread"], code: `#define _GNU_SOURCE
 ${cHeaders("unistd.h sys/syscall.h sys/random.h sys/resource.h sys/stat.h sys/wait.h pthread.h stdio.h stdint.h fcntl.h")}
@@ -460,19 +460,15 @@ int main(void) { int fds[2]; if (${mode === "socket" ? "socketpair(AF_UNIX, SOCK
 				expect(fields[3]).not.toBe(seed.trim().split(":")[3]);
 				expect(fixture.backend.actorMetrics().joinedHits, JSON.stringify(fixture.backend.metrics())).toBe(1);
 				if (mode === "file" || mode === "dup") expect(admissions).toEqual([{ syscall: 3, accepted: undefined }, { syscall: 318, accepted: true }]);
+				expect(await pending).toMatchObject(complete ? { exit: { kind: "code", code: 0 } } : { suspended: true });
+				const continuations = publishing.mock.calls.flatMap(([, , certificate, , continuation]) => certificate?.result.continuation ? [continuation] : []);
+				expect(continuations).toEqual(complete ? [] : [expect.anything()]); expect(timing.reused).toBe(true);
+				expect(timing.toolComputeMs).toBeGreaterThanOrEqual(timing.hiddenComputeMs);
 				if (complete) {
-					expect(await pending).toMatchObject({ exit: { kind: "code", code: 0 } });
-					expect(admissions.length).toBeGreaterThan(0); expect(admissions.every(result => !result.accepted)).toBe(true);
-					expect(publishing.mock.calls.some(([, , certificate]) => certificate?.result.continuation)).toBe(false);
-					if (descendant) { expect(admissions).toContainEqual({ syscall: 0, accepted: false }); expect(timing.hiddenComputeMs).toBeGreaterThan(0); }
-				}
-				else {
-					expect(await pending).toMatchObject({ suspended: true });
-					const continuation = publishing.mock.calls.find(([, , certificate]) => certificate?.result.continuation)?.[4];
-					expect(continuation).toBeDefined(); expect(timing.reused).toBe(true);
-					expect(timing.toolComputeMs).toBeGreaterThanOrEqual(timing.hiddenComputeMs);
-					if (mode === "sample") expect(new TaskTimeline(issuedAt).recordTool(continuation!.computation, issuedAt, true).hiddenComputeMs).toBe(0);
-				}
+					expect(admissions.length > 0).toBe(!unavailable); expect(admissions.every(result => !result.accepted)).toBe(true);
+					if (descendant && !unavailable) expect(admissions).toContainEqual({ syscall: 0, accepted: false });
+					expect(timing.hiddenComputeMs).toBeGreaterThan(0);
+				} else if (mode === "sample") expect(new TaskTimeline(issuedAt).recordTool(continuations[0]!.computation, issuedAt, true).hiddenComputeMs).toBe(0);
 			} finally {
 				controller.abort(); starting.release(); frontier.release(); await session.close(); await settled; await cancelled;
 				acquiring.mockRestore(); joining.mockRestore(); observing.mockRestore(); requesting.mockRestore();
@@ -481,13 +477,14 @@ int main(void) { int fds[2]; if (${mode === "socket" ? "socketpair(AF_UNIX, SOCK
 		publishing.mockRestore();
 	});
 
-	nativeTest.for(["pipe", "socket", "peer", "eventfd", "readv", "recvmsg", "writev", "mmap", "runtime", "handles", "eof", "early", "changed", "identity", "file", "cancel"] as const)("resumes a learned running process with future input (%s)", { timeout: 60_000 }, async (mode, { skip, benchmark }) => {
-		const fixture = await benchmark("pi-live-process-");
+	nativeTest.for(["pipe", "socket", "peer", "eventfd", "readv", "recvmsg", "writev", "mmap", "runtime", "handles", "eof", "early", "changed", "identity", "file", "cancel", "pipe:unavailable", "peer:unavailable"])("resumes a learned running process with future input (%s)", { timeout: 60_000 }, async (scenario, { skip, benchmark }) => {
+		const [mode, unavailable] = scenario.split(":"), fixture = await benchmark("pi-live-process-", undefined, { processImages: unavailable ? false : undefined });
 		let host: ReturnType<typeof createSpeculativeActionHost> | undefined;
 		try {
 			await prepareLinuxProcessReuse(fixture);
-			if (!(await Reflect.get(fixture.backend, "ready")).imageLibrary) return skip("native process image capture is unavailable");
-			await writeFile(path.join(fixture.workspace, "worker.c"), `#define _GNU_SOURCE
+			if (unavailable) expect((await Reflect.get(fixture.backend, "ready")).imageLibrary).toBeUndefined();
+			if (!unavailable && !(await Reflect.get(fixture.backend, "ready")).imageLibrary) return skip("native process image capture is unavailable");
+			await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker", arguments: ["-pthread"], code: `#define _GNU_SOURCE
 ${cHeaders("unistd.h stdio.h stdint.h sys/syscall.h sys/uio.h sys/socket.h sys/mman.h pthread.h signal.h stdlib.h string.h fcntl.h errno.h")}
 #define INPUT_FD ${mode === "handles" ? 8 : 3}
 #define ACK_FD ${mode === "handles" ? 3 : 4}
@@ -538,8 +535,8 @@ int main(void) {
  for (unsigned i = 0; i < 3; i++) if (pread(5, &value, 1, i * 4096) != 1 || value != 'B') return 77;` : ""}
  printf("%cBC:%llu\\n", input[0], (unsigned long long)hash); return 37;
 }
-`);
-			await writeFile(path.join(fixture.workspace, "launch.c"), `#define _GNU_SOURCE
+` });
+			await compileBenchmarkHelper(fixture.workspace, { source: "launch.c", output: "launch", code: `#define _GNU_SOURCE
 ${cHeaders("unistd.h fcntl.h stdio.h string.h stdlib.h stdint.h sys/socket.h sys/eventfd.h sys/mman.h sys/wait.h")}
 int main(int argc, char **argv) {
  if (argc != 2) return 60;
@@ -579,8 +576,7 @@ int main(int argc, char **argv) {
  int status; return waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status) != 37
  ${mode === "handles" ? "|| lseek(backing, 0, SEEK_CUR) != 3 || lseek(independent, 0, SEEK_CUR) != 1 || !(fcntl(backing, F_GETFL) & O_APPEND)" : ""};
 }
-`);
-			for (const name of ["worker", "launch"]) await compileBenchmarkHelper(fixture.workspace, { source: `${name}.c`, output: name, arguments: ["-pthread"] });
+` });
 			await commitBenchmarkFixture(fixture.workspace, "Live process continuation");
 			const route = await fixture.prepareActorReplay();
 			const scope = { sessionID: "live", turnID: "seed" };
@@ -589,8 +585,8 @@ int main(int argc, char **argv) {
 			const prepared = patternProcessHost(fixture, scope.sessionID, { candidateLimit: 4, maxConcurrentActions: 4,
 				patternAware: patternAwareSettings({ enabled: true, multiStepEnabled: false, beamWidth: 4 }) }), { events, start, call } = prepared;
 			host = prepared.host;
-			const execute = (turnID: string, command: string) => host!.execute(call(turnID, command), undefined,
-				() => fixture.coordinator.runWith({ execute: request => route.executor.execute({ ...request, scope: { ...scope, turnID } }) },
+			const execute = (turnID: string, command: string, signal = AbortSignal.timeout(10_000)) => host!.execute(call(turnID, command), signal,
+				() => fixture.coordinator.runWith({ execute: request => route.executor.execute({ ...request, scope: { ...scope, turnID }, signal }) },
 					() => fixture.tool.execute(turnID, { command })));
 			for (const turnID of ["common-1", "common-2"]) { await start(turnID); await execute(turnID, "printf common"); await host.finishTurn(turnID); }
 			await start("seed"); const seed = await execute("seed", "printf seed; launch seed"); await host.finishTurn("seed");
@@ -613,7 +609,7 @@ int main(int argc, char **argv) {
 				() => fixture.tool.execute("later", { command })) : await execute("prepared", command);
 			expect(actual.content, JSON.stringify(actual.content)).toEqual(seed.content.map(item => item.type === "text" ? { ...item,
 				text: item.text.replace(/^seedA/, `actual${mode === "changed" ? "D" : "A"}`) } : item));
-			const resumed = !["changed", "identity", "peer", "file", "cancel"].includes(mode);
+			const resumed = !unavailable && !["changed", "identity", "peer", "file", "cancel"].includes(mode!);
 			expect(fixture.backend.actorMetrics().joinedHits, diagnostic()).toBe(Number(resumed));
 			if (resumed) expect(publishing.mock.calls.some(([, , certificate, , continuation, computation]) => certificate?.result.continuation &&
 				continuation && computation && computation.completedAt > continuation.computation.completedAt), diagnostic()).toBe(true);
