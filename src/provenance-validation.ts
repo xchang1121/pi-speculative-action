@@ -3,7 +3,7 @@ import { lstat, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { captureFileDigest, captureFilesystemEntry, mapFilesystem, sameFilesystemIdentity } from "./filesystem-evidence.ts";
 import { errorMessage, isMissing as missing } from "./error-utils.ts";
-import { type DynamicDependency, type DynamicDependencyCertificate, filesystemMetadataDigest, filesystemObservationDigest,
+import { dependencyPathsetKey, type DynamicDependency, type DynamicDependencyCertificate, filesystemMetadataDigest, filesystemObservationDigest,
 	type FilesystemObservationField, type ProcessProvenanceCertificate, processStrongKey, type ProvenanceTaint, sha256Digest,
 	type Sha256Digest } from "./provenance-certificate.ts";
 
@@ -32,15 +32,23 @@ export type ProvenanceValidation =
 	| (Extract<DynamicDependencyValidation, { status: "valid" }> & { readonly strongKey: Sha256Digest })
 	| Exclude<DynamicDependencyValidation, { status: "valid" }>;
 
-const OBSERVATION_FIELDS = {
-	file: ["contentDigest", "metadataDigest", "aliases"],
-	directory: ["entriesDigest", "metadataDigest"],
-	absence: ["parentEntriesDigest"],
-	symlink: ["targetDigest", "target"],
-	metadata: ["digest"],
-	fd: ["contentDigest", "eof"],
-	lock: ["exclusive"],
-} satisfies { [Kind in DynamicDependency["kind"]]: readonly (keyof Extract<DynamicDependency, { kind: Kind }>)[] };
+/** One lookup, one projection: share current observations, never a previous certificate's validity or a previous lookup's inputs. */
+export function observeProcessInputs(weakKey: Sha256Digest,
+	capture: (evidence: DynamicDependencyCertificate) => Promise<DynamicDependencyValidation | undefined>) {
+	const observations = new Map<string, Promise<Extract<ProvenanceValidation, { status: "valid" }> | undefined>>();
+	return (evidence: DynamicDependencyCertificate) => {
+		if (!evidence.complete) return Promise.resolve(undefined);
+		const key = `${evidence.taints.join(",")}:${dependencyPathsetKey(evidence)}`;
+		let observation = observations.get(key);
+		if (!observation) observations.set(key, observation = capture(evidence).then(result => result && result.status !== "indeterminate"
+			? { status: "valid" as const, strongKey: processStrongKey(weakKey, { complete: true, dependencies: result.dependencies, taints: [] }),
+				dependencies: result.dependencies, filesRead: result.filesRead, bytesRead: result.bytesRead } : undefined));
+		return observation;
+	};
+}
+
+type DependencyField = { [Kind in DynamicDependency["kind"]]: keyof Extract<DynamicDependency, { kind: Kind }> }[DynamicDependency["kind"]];
+const OBSERVATION_FIELDS = ["contentDigest", "metadataDigest", "aliases", "entriesDigest", "parentEntriesDigest", "targetDigest", "target", "digest", "eof", "exclusive"] satisfies readonly DependencyField[];
 
 export async function validateProcessCertificate(
 	certificate: ProcessProvenanceCertificate,
@@ -107,7 +115,7 @@ export async function validateDynamicDependencyCertificate(
 		if (typeof check === "string") return indeterminate(check);
 		const expected = expectations[index]!, { observed } = check;
 		if (observed) current.push(observed);
-		if (!observed || OBSERVATION_FIELDS[expected.kind].some(field => Reflect.get(observed, field) !== Reflect.get(expected, field))) {
+		if (!observed || OBSERVATION_FIELDS.some(field => Reflect.get(observed, field) !== Reflect.get(expected, field))) {
 			changed.push(expected.kind === "fd" ? `fd:${expected.fd}` : expected.path);
 		}
 	}
@@ -142,7 +150,7 @@ export async function captureFileDependency(
 	options: { readonly includeMetadata?: boolean; readonly maxFileBytes?: number; readonly aliases?: readonly string[];
 		readonly resolvePath?: ProvenanceValidationContext["resolvePath"] } = {},
 ): Promise<{ readonly dependency: Extract<DynamicDependency, { kind: "file" }>; readonly bytesRead: number; readonly filesRead: number }> {
-	const maxBytes = finiteLimit(options.maxFileBytes ?? Number.POSITIVE_INFINITY);
+	const limit = options.maxFileBytes ?? Infinity, maxBytes = Number.isFinite(limit) ? Math.max(0, limit) : Infinity;
 	const content = await captureFileDigest(physicalPath, maxBytes);
 	let aliases = options.aliases;
 	if (aliases) {
@@ -216,8 +224,4 @@ export async function captureSymlinkDependency(
 	const { link: target } = await captureFilesystemEntry(physicalPath);
 	if (target === undefined) throw new Error("not_symlink");
 	return { kind: "symlink", path: logicalPath, target, targetDigest: sha256Digest(Buffer.from(target, "utf8")) };
-}
-
-function finiteLimit(value: number): number {
-	return Number.isFinite(value) ? Math.max(0, value) : Number.POSITIVE_INFINITY;
 }

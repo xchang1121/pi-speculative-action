@@ -2,10 +2,11 @@ import { randomUUID } from "node:crypto";
 import { link, mkdir, open, readFile, readdir, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { type ArtifactReference, certificateReplayable, isSha256Digest, parseProcessCertificate, type ProcessProvenanceCertificate,
-	type ProvenanceTaint, referencedArtifacts, sha256Digest, sha256DigestAsync, type Sha256Digest } from "./provenance-certificate.ts";
+	type ProvenanceTaint, referencedArtifacts, sha256Digest, sha256DigestAsync, type Sha256Digest, validateArtifact } from "./provenance-certificate.ts";
 import { stableStringify } from "./stable-json.ts";
 import { nonNegativeNumber, positiveInteger } from "./setting-input.ts";
 import { hasErrorCode, isMissing as missing } from "./error-utils.ts";
+import { mapFilesystem } from "./filesystem-evidence.ts";
 
 export interface ProvenanceStoreLimits { readonly maxCertificates: number; readonly maxBytes: number; }
 
@@ -31,27 +32,26 @@ const STORE_SEGMENTS = ["indexes", "certificates", "cas"] as const;
 /** Immutable content-addressed effect storage; it never stores decoded Runtime result objects. */
 export class ArtifactCAS {
 	readonly root: string;
+	private readonly publish: typeof publishImmutable;
 
-	constructor(root: string) { this.root = path.resolve(root); }
+	constructor(root: string, publish = publishImmutable) { this.root = path.resolve(root); this.publish = publish; }
 
 	async put(value: string | Uint8Array): Promise<ArtifactReference> {
 		const bytes = typeof value === "string" ? Buffer.from(value, "utf8") : value;
 		const reference = Object.freeze({ digest: await sha256DigestAsync(bytes), size: bytes.byteLength }), target = this.artifactPath(reference.digest);
-		await publishImmutable(target, bytes);
+		await this.publish(target, bytes);
 		return reference;
 	}
 
 	async get(reference: ArtifactReference): Promise<Buffer | undefined> {
-		const { digest, size } = reference;
-		if (!isSha256Digest(digest) || !Number.isSafeInteger(size) || size < 0) throw new Error("invalid artifact reference");
-		const bytes = await readOptional(this.artifactPath(digest));
-		if (bytes && (bytes.byteLength !== size || await sha256DigestAsync(bytes) !== digest)) throw new Error(`artifact integrity check failed for ${digest}`);
+		validateArtifact(reference);
+		const bytes = await readOptional(this.artifactPath(reference.digest));
+		if (bytes && (bytes.byteLength !== reference.size || await sha256DigestAsync(bytes) !== reference.digest)) throw new Error(`artifact integrity check failed for ${reference.digest}`);
 		return bytes;
 	}
 
 	/** Availability hint only; publication and adoption verify content. */
 	async has(reference: ArtifactReference): Promise<boolean> {
-		if (!isSha256Digest(reference.digest)) throw new Error("invalid artifact reference");
 		const info = await stat(this.artifactPath(reference.digest)).catch((error): undefined => { if (!missing(error)) throw error; });
 		return info?.isFile() === true && info.size === reference.size;
 	}
@@ -59,10 +59,7 @@ export class ArtifactCAS {
 	/** Load and integrity-check a complete effect closure before any replay side effect begins. */
 	async load(references: readonly ArtifactReference[]): Promise<VerifiedArtifactClosure | undefined> {
 		const sizes = new Map<Sha256Digest, number>();
-		for (const { digest, size } of references) {
-			if (sizes.has(digest) && sizes.get(digest) !== size) throw new Error(`conflicting artifact sizes for ${digest}`);
-			sizes.set(digest, size);
-		}
+		for (const reference of references) validateArtifact(reference, sizes);
 		const values = new Map<Sha256Digest, Buffer>();
 		for (const [digest, size] of sizes) {
 			const value = await this.get({ digest, size });
@@ -71,7 +68,6 @@ export class ArtifactCAS {
 		}
 		return Object.freeze({ artifacts: values.size, bytes: [...values.values()].reduce((total, value) => total + value.byteLength, 0),
 			read: ({ digest, size }: ArtifactReference): Buffer => {
-				if (!isSha256Digest(digest) || !Number.isSafeInteger(size) || size < 0) throw new Error("invalid artifact reference");
 				const value = values.get(digest);
 				if (!value || value.byteLength !== size) throw new Error(`artifact is outside the verified closure: ${digest}`);
 				return value;
@@ -79,7 +75,7 @@ export class ArtifactCAS {
 		});
 	}
 
-	private artifactPath(digest: Sha256Digest): string {
+	artifactPath(digest: Sha256Digest): string {
 		const hex = digestHex(digest); return path.join(this.root, "sha256", hex.slice(0, 2), hex.slice(2));
 	}
 }
@@ -100,13 +96,15 @@ export class ProvenanceCertificateStore {
 	private readonly acceptedTaints: readonly ProvenanceTaint[];
 	private maintenance: Promise<void> = Promise.resolve();
 	private collection?: Promise<ProvenanceStoreGCResult>;
-	private revision = 0;
+	private protectedObjects?: Set<string>;
 	private gcDueAt: number;
 	private statsValue?: ProvenanceStoreStats;
 
 	constructor(root: string, options: ProvenanceStoreOptions = {}) {
 		this.root = path.resolve(root);
-		this.artifacts = new ArtifactCAS(path.join(this.root, "cas"));
+		this.artifacts = new ArtifactCAS(path.join(this.root, "cas"), (target, bytes, verify) => this.exclusive(() => {
+			this.protectedObjects?.add(target); return publishImmutable(target, bytes, verify);
+		}));
 		this.limitsValue = Object.freeze({
 			maxCertificates: positiveInteger(options.maxCertificates, DEFAULT_PROVENANCE_STORE_LIMITS.maxCertificates),
 			maxBytes: positiveInteger(options.maxBytes, DEFAULT_PROVENANCE_STORE_LIMITS.maxBytes),
@@ -134,10 +132,13 @@ export class ProvenanceCertificateStore {
 		if (!owned) throw new Error("invalid process provenance certificate");
 		const published = await this.exclusive(async () => {
 			let indexed: ProcessProvenanceCertificate | undefined;
-			for (const reference of referencedArtifacts(owned))
+			this.protectedObjects?.add(this.certificatePath(owned.id));
+			await mapFilesystem(referencedArtifacts(owned), async reference => {
+				this.protectedObjects?.add(this.artifacts.artifactPath(reference.digest));
 				if (!(await this.artifacts.has(reference))) throw new Error(`certificate references missing artifact ${reference.digest}`);
+			});
 			const published = await publishImmutable(this.certificatePath(owned.id), Buffer.from(stableStringify(owned), "utf8"),
-				bytes => (indexed = parseProcessCertificate(JSON.parse(bytes.toString("utf8"))))?.id === owned.id);
+				bytes => (indexed = decodeCertificate(bytes))?.id === owned.id);
 			await publishImmutable(this.weakReferencePath(published ? owned : indexed ?? owned), new Uint8Array());
 			return published;
 		});
@@ -146,12 +147,8 @@ export class ProvenanceCertificateStore {
 	}
 
 	async get(id: Sha256Digest): Promise<ProcessProvenanceCertificate | undefined> {
-		const bytes = await readOptional(this.certificatePath(id));
-		if (!bytes) return undefined;
-		let value: unknown;
-		try { value = JSON.parse(bytes.toString("utf8")); } catch { throw new Error(`certificate ${id} is not valid JSON`); }
-		const certificate = parseProcessCertificate(value);
-		if (!certificate || certificate.id !== id) throw new Error(`certificate integrity check failed for ${id}`);
+		const bytes = await readOptional(this.certificatePath(id)), certificate = bytes && decodeCertificate(bytes);
+		if (bytes && certificate?.id !== id) throw new Error(`certificate integrity check failed for ${id}`);
 		return certificate;
 	}
 
@@ -167,18 +164,14 @@ export class ProvenanceCertificateStore {
 		const names = await readdir(directory).catch((error): string[] => { if (missing(error)) return []; throw error; });
 		const references = names.flatMap(name => {
 			const match = /^(?:(.+)-)?([0-9a-f]{64})\.ref$/.exec(name), createdAt = Number(match?.[1] ?? 0);
-			return match && Number.isFinite(createdAt) && createdAt >= 0 ? [{ name, createdAt, id: `sha256:${match[2]}` as Sha256Digest }] : [];
+			return match && Number.isFinite(createdAt) && createdAt >= 0 ? [{ createdAt, id: `sha256:${match[2]}` as Sha256Digest }] : [];
 		}).sort((left, right) => right.createdAt - left.createdAt || right.id.localeCompare(left.id));
 		const checked = new Set(excludedCertificates);
-		for (const { name, id } of references) {
+		for (const { id } of references) {
 			if (checked.has(id)) continue;
 			checked.add(id);
-			const reference = path.join(directory, name);
-			let certificate: ProcessProvenanceCertificate | undefined;
-			try { certificate = await this.get(id); }
-			catch { continue; } // An unreadable candidate cannot suppress another verified result.
+			const certificate = await this.get(id).catch(() => undefined); // An unreadable candidate cannot suppress another verified result.
 			if (certificate?.weakKey === weakKey) yield certificate;
-			else await rm(reference, { force: true }).catch(() => undefined);
 		}
 	}
 
@@ -195,14 +188,11 @@ export class ProvenanceCertificateStore {
 	}
 
 	gc(): Promise<ProvenanceStoreGCResult> {
-		return this.collection ??= (async () => {
-			for (;;) {
-				const revision = this.revision, inventory = await this.inventory();
-				// Inventory does not hold up publication. A concurrent mutation requires a fresh scan before pruning.
-				const result = await this.exclusive(async () => revision === this.revision ? this.collect(inventory) : undefined);
-				if (result) return result;
-			}
-		})().finally(() => { this.collection = undefined; });
+		if (this.collection) return this.collection;
+		const protectedObjects = this.protectedObjects = new Set<string>();
+		// One finite snapshot. Publications during this cycle survive until the next; clear invalidates the old namespace.
+		return this.collection = this.inventory().then(inventory => this.collect(inventory, protectedObjects))
+			.finally(() => { this.collection = undefined; this.protectedObjects = undefined; });
 	}
 
 	/** Wait for admitted publication and optional maintenance before disposing the store owner. */
@@ -213,6 +203,7 @@ export class ProvenanceCertificateStore {
 
 	clear(): Promise<ProvenanceStoreGCResult> {
 		return this.exclusive(async () => {
+			this.protectedObjects = undefined;
 			const before = inventoryStats(await this.inventory(), this.limits, this.acceptedTaints);
 			await mkdir(this.root, { recursive: true });
 			const tomb = path.join(this.root, `.clear-${randomUUID()}`);
@@ -225,8 +216,8 @@ export class ProvenanceCertificateStore {
 		});
 	}
 
-	private async collect(inventory: StoreInventory): Promise<ProvenanceStoreGCResult> {
-		const now = Date.now();
+	private async collect(inventory: StoreInventory, protectedObjects: ReadonlySet<string>): Promise<ProvenanceStoreGCResult> {
+		const cutoff = Date.now() - this.orphanGraceMs, result = { removedCertificates: 0, removedArtifacts: 0, removedBytes: 0 };
 		const retained = new Set<Sha256Digest>(), retainedArtifacts = new Set<Sha256Digest>();
 		let retainedBytes = 0;
 		for (const record of [...inventory.certificates].sort((left, right) => (right.certificate?.createdAt ?? 0) - (left.certificate?.createdAt ?? 0))) {
@@ -241,43 +232,36 @@ export class ProvenanceCertificateStore {
 			retainedBytes += addedBytes;
 			for (const reference of references) retainedArtifacts.add(reference.digest);
 		}
-		const removed = inventory.certificates.filter((record) => !record.certificate || !retained.has(record.certificate.id));
-		// A deduplicated put renews an artifact after the inventory: re-check each orphan's age just before removal.
-		const orphans = (await Promise.all([...inventory.artifacts].map(async ([digest, artifact]) => !retainedArtifacts.has(digest) &&
-			now - artifact.modifiedAt >= this.orphanGraceMs && now - ((await stat(artifact.path).catch(() => undefined))?.mtimeMs ?? now) >= this.orphanGraceMs
-			? [artifact] : []))).flat();
-		const removals = [
-			...removed.map((record) => rm(record.path, { force: true })),
-			...removed.flatMap((record) => record.certificate ? [false, true].map(legacy => rm(this.weakReferencePath(record.certificate!, legacy), { force: true })) : []),
-			...orphans.map((artifact) => rm(artifact.path, { force: true })),
-		];
-		await Promise.all(removals).catch(async (error) => { await Promise.allSettled(removals); throw error; });
-		return { removedCertificates: removed.length, removedArtifacts: orphans.length,
-			removedBytes: [...removed, ...orphans].reduce((total, record) => total + record.bytes, 0) };
+		// Admit one removal at a time: a publisher can wait for one object, never the remainder of the collection.
+		const remove = (record: StoredFile, certificate?: ProcessProvenanceCertificate) => this.exclusive(async () => {
+			if (protectedObjects !== this.protectedObjects || protectedObjects.has(record.path)) return;
+			if (!record.path.endsWith(".json") && ((await stat(record.path).catch(() => undefined))?.mtimeMs ?? Infinity) > cutoff) return;
+			await mapFilesystem([record.path, ...certificate ? [false, true].map(legacy => this.weakReferencePath(certificate, legacy)) : []], target => rm(target, { force: true }));
+			result[record.path.endsWith(".json") ? "removedCertificates" : "removedArtifacts"]++; result.removedBytes += record.bytes;
+		});
+		for (const record of inventory.certificates) if (!record.certificate || !retained.has(record.certificate.id)) await remove(record, record.certificate);
+		for (const [digest, artifact] of inventory.artifacts) if (!retainedArtifacts.has(digest) && artifact.modifiedAt <= cutoff) await remove(artifact);
+		return result;
 	}
 
 	private async inventory(): Promise<StoreInventory> {
-		const scans = [filesUnder(this.managedPath("certificates")), filesUnder(path.join(this.artifacts.root, "sha256"))] as const;
-		const [certificatePaths, artifactPaths] = await Promise.all(scans).catch(async (error) => { await Promise.allSettled(scans); throw error; });
-		const certificates = (await Promise.all(certificatePaths.filter((target) => target.endsWith(".json")).map(async (target) => {
+		const [certificatePaths, artifactPaths] = await mapFilesystem([this.managedPath("certificates"), path.join(this.artifacts.root, "sha256")], filesUnder);
+		const certificates = (await mapFilesystem(certificatePaths.filter((target) => target.endsWith(".json")), async (target) => {
 			const bytes = await readFile(target).catch(() => undefined);
 			if (!bytes) return undefined;
-			let value: unknown;
-			try { value = JSON.parse(bytes.toString("utf8")); } catch { value = undefined; }
-			return { path: target, bytes: bytes.byteLength, modifiedAt: 0, certificate: parseProcessCertificate(value) };
-		}))).filter((record): record is StoredCertificateFile => Boolean(record));
+			return { path: target, bytes: bytes.byteLength, modifiedAt: 0, certificate: decodeCertificate(bytes) };
+		})).filter((record): record is StoredCertificateFile => Boolean(record));
 		const artifactRoot = path.join(this.artifacts.root, "sha256");
-		const artifacts = new Map<Sha256Digest, StoredFile>((await Promise.all(artifactPaths.map(async (target): Promise<readonly (readonly [Sha256Digest, StoredFile])[]> => {
+		const artifacts = new Map<Sha256Digest, StoredFile>((await mapFilesystem(artifactPaths, async (target): Promise<readonly (readonly [Sha256Digest, StoredFile])[]> => {
 			const value = await stat(target).catch(() => undefined);
 			const hex = path.relative(artifactRoot, target).split(path.sep).join("");
 			return value && /^[0-9a-f]{64}$/.test(hex) ? [[`sha256:${hex}`, { path: target, bytes: value.size, modifiedAt: value.mtimeMs }]] : [];
-		}))).flat());
+		})).flat());
 		return { certificates, artifacts };
 	}
 
 	private exclusive<T>(operation: () => Promise<T>): Promise<T> {
-		const mutate = async () => { try { return await operation(); } finally { this.statsValue = undefined; this.revision++; } };
-		const result = this.maintenance.then(mutate, mutate);
+		const result = this.maintenance.then(operation).finally(() => { this.statsValue = undefined; });
 		this.maintenance = result.then(() => undefined, () => undefined);
 		return result;
 	}
@@ -322,7 +306,8 @@ async function publishImmutable(target: string, bytes: Uint8Array, verify = (sto
 	const present = async () => {
 		const stored = await readOptional(target);
 		try { if (!stored || !verify(stored)) return false; } catch { return false; }
-		return renew(target);
+		const now = new Date(); // Referencing the same object restarts its orphan grace.
+		return utimes(target, now, now).then(() => true, (error): false => { if (!missing(error)) throw error; return false; });
 	};
 	if (await present()) return false;
 	await mkdir(path.dirname(target), { recursive: true });
@@ -341,8 +326,9 @@ async function publishImmutable(target: string, bytes: Uint8Array, verify = (sto
 	}
 }
 
-/** An existing object is referenced again: its orphan grace restarts now. False when it is gone. */
-const renew = (target: string, now = new Date()) => utimes(target, now, now).then(() => true, (error): false => { if (!missing(error)) throw error; return false; });
+function decodeCertificate(bytes: Buffer): ProcessProvenanceCertificate | undefined {
+	try { return parseProcessCertificate(JSON.parse(bytes.toString("utf8"))); } catch { return undefined; }
+}
 
 function readOptional(target: string) { return readFile(target).catch((error): undefined => { if (!missing(error)) throw error; }); }
 

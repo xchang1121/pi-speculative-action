@@ -1,4 +1,5 @@
 import { readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
+import * as filesystem from "node:fs/promises";
 import path from "node:path";
 import { afterEach, expect, test, vi } from "vitest";
 import { captureFileDependency, ProcessReusePlanner, ProvenanceCertificateStore, referencedArtifacts, sealProcessCertificate,
@@ -11,14 +12,16 @@ import { processPrototype, processCertificate } from "./process-fixture.ts";
 import { temporaryDirectories } from "./filesystem.ts";
 import { deferred, nextTurn } from "./async.ts";
 
+vi.mock("node:fs/promises", { spy: true });
 const directories = temporaryDirectories("pi-reuse-system-");
 const registries = new Set<ProcessHandoffRegistry>();
-afterEach(async () => { for (const registry of registries) registry.dispose(); registries.clear(); await directories.dispose(); });
+const stores = new Set<ProvenanceCertificateStore>();
+afterEach(async () => { for (const registry of registries) registry.dispose(); registries.clear(); await Promise.all([...stores].map(store => store.drain())); stores.clear(); await directories.dispose(); });
 
-async function fixture() {
+async function fixture(options: ConstructorParameters<typeof ProvenanceCertificateStore>[1] = {}) {
 	const root = await directories.create(), input = path.join(root, "input");
 	await writeFile(input, "current input");
-	const store = new ProvenanceCertificateStore(root), prototype = processPrototype();
+	const store = new ProvenanceCertificateStore(root, options), prototype = processPrototype(); stores.add(store);
 	const request = { weakKey: processCertificate(prototype).weakKey, executablePath: prototype.executablePath,
 		contract: { sink: "buffered" as const, orderedJournal: true, transactionalEffects: true },
 		validation: { resolvePath: () => input } };
@@ -52,34 +55,7 @@ async function fixture() {
 	return { root, input, store, request, produce, lookup, output, registry, reserve, actor, publish };
 }
 
-test.each(["certificate JSON", "certificate digest", "artifact bytes", "artifact length", "missing artifact"])(
-	"reopens a cache with %s damage and delivers another verified result", async damage => {
-	const f = await fixture(), good = await f.produce("valid result", 1), bad = await f.produce("other result", 2);
-	await f.store.put(good); await f.store.put(bad);
-	const hex = bad.id.slice(7), certificatePath = path.join(f.root, "certificates", hex.slice(0, 2), hex.slice(2) + ".json");
-	const artifact = referencedArtifacts(bad)[0]!, digest = artifact.digest.slice(7);
-	const artifactPath = path.join(f.root, "cas", "sha256", digest.slice(0, 2), digest.slice(2));
-	if (damage === "certificate JSON") await writeFile(certificatePath, "{");
-	else if (damage === "certificate digest") {
-		const bytes = JSON.parse(await readFile(certificatePath, "utf8")); bytes.result.exit.code++;
-		await writeFile(certificatePath, JSON.stringify(bytes));
-	} else if (damage === "artifact bytes") await writeFile(artifactPath, "wrong result");
-	else if (damage === "artifact length") await writeFile(artifactPath, "wrong");
-	else await unlink(artifactPath);
-	const store = new ProvenanceCertificateStore(f.root), reopened = new ProcessReusePlanner({ store });
-	const plan = await reopened.plan(f.request);
-	expect(plan.kind).toBe("completed_replay");
-	if (plan.kind !== "completed_replay") throw new Error("valid result was lost");
-	expect(f.output(plan)).toBe("valid result");
-	await store.put(await f.produce("other result", 2));
-	const restored = await reopened.plan(f.request);
-	if (restored.kind !== "completed_replay") throw new Error("fresh publication did not repair the damaged object");
-	expect(f.output(restored)).toBe("other result");
-	await writeFile(f.input, "changed input");
-	expect((await reopened.plan(f.request)).kind).toBe("miss");
-});
-
-test("reopens history incrementally with full calculation graphs, fresh validation and legacy fallback", async () => {
+test("reopens history incrementally with calculation graphs, fresh inputs, legacy indexes and damaged objects", async () => {
 	const f = await fixture(), certificates: ProcessProvenanceCertificate[] = [];
 	const inputs = Array.from({ length: 4096 }, (_, index) => ({ computation: new TimelineInterval(200 + index * 50, 250 + index * 50), reused: true }));
 	const original = new TimelineInterval(10, 110, [{ computation: new TimelineInterval(20, 40), overhead: true }, ...inputs]);
@@ -109,27 +85,67 @@ test("reopens history incrementally with full calculation graphs, fresh validati
 	}
 	expect((await store.findByWeakKey(f.request.weakKey, f.request.executablePath)).map(certificate => certificate.createdAt))
 		.toEqual(Array.from({ length: 256 }, (_, index) => 256 - index));
+	await writeFile(f.input, "input 256");
+	const bad = await f.produce("other result", 257), hex = bad.id.slice(7), digest = referencedArtifacts(bad)[0]!.digest.slice(7);
+	const certificatePath = path.join(f.root, "certificates", hex.slice(0, 2), hex.slice(2) + ".json"), artifactPath = path.join(f.root, "cas", "sha256", digest.slice(0, 2), digest.slice(2));
+	await f.store.put(bad);
+	for (const damage of ["certificate JSON", "certificate digest", "artifact bytes", "artifact length", "missing artifact"]) {
+		await writeFile(f.input, "input 256");
+		if (damage === "certificate JSON") await writeFile(certificatePath, "{");
+		else if (damage === "certificate digest") {
+			const bytes = JSON.parse(await readFile(certificatePath, "utf8")); bytes.result.exit.code++;
+			await writeFile(certificatePath, JSON.stringify(bytes));
+		} else if (damage === "artifact bytes") await writeFile(artifactPath, "wrong result");
+		else if (damage === "artifact length") await writeFile(artifactPath, "wrong");
+		else await unlink(artifactPath);
+		const reopened = new ProcessReusePlanner({ store: new ProvenanceCertificateStore(f.root) }), plan = await reopened.plan(f.request);
+		if (plan.kind !== "completed_replay") throw new Error(`${damage}: valid history was lost`);
+		expect(f.output(plan), damage).toBe("output 256");
+		await f.store.artifacts.put("other result"); await f.store.put(bad);
+		const restored = await reopened.plan(f.request);
+		if (restored.kind !== "completed_replay") throw new Error(`${damage}: publication did not repair the object`);
+		expect(f.output(restored), damage).toBe("other result");
+		await writeFile(f.input, "changed input"); expect((await reopened.plan(f.request)).kind, damage).toBe("miss");
+	}
 });
 
-test.each(["publish", "clear"])("delivers publications while maintenance scans and safely handles a concurrent %s", async operation => {
-	const f = await fixture(), entered = deferred(), release = deferred();
-	await f.store.put(await f.produce("old", 1));
+test.each(["scan", "deletion", "clear"])("bounds maintenance and protects concurrent publications during %s", async phase => {
+	const f = await fixture({ orphanGraceMs: 0 }), entered = deferred(), release = deferred();
+	const old = await f.produce("old", 1), orphan = await f.store.artifacts.put("orphan"); await f.store.put(old);
+	for (let version = 2; version < 64; version++) await f.store.put(await f.produce(`output ${version}`, version));
+	const pending = await f.produce("next", 65), original = (await vi.importActual<typeof filesystem>("node:fs/promises")).rm;
 	const scanning = f.store as unknown as { inventory(): Promise<unknown> }, inventory = scanning.inventory.bind(scanning);
-	let held = false, published = false, drained = false;
-	scanning.inventory = async () => { const snapshot = await inventory(); if (!held) { held = true; entered.resolve(); await release.promise; } return snapshot; };
+	let scans = 0, removals = 0, published = false, drained = false;
+	scanning.inventory = async () => { const snapshot = await inventory(); if (++scans === 1 && phase !== "deletion") { entered.resolve(); await release.promise; } return snapshot; };
+	const removing = vi.spyOn(filesystem, "rm").mockImplementation(async (target, options) => {
+		if (phase === "deletion" && String(target).endsWith(".json") && ++removals === 2) { entered.resolve(); await release.promise; }
+		return original(target, options);
+	});
 	f.store.configure({ maxCertificates: 1 });
-	const publishing = f.store.put(await f.produce("ready", 2)).then(() => { published = true; });
+	const publishing = f.store.put(await f.produce("ready", 64)).then(() => { published = true; });
+	let concurrent: Promise<unknown> | undefined;
 	try {
 		await entered.promise; await nextTurn(); expect(published).toBe(true);
-		if (operation === "clear") await f.store.clear();
-		await f.store.put(await f.produce("latest", 3));
+		if (phase === "clear") { await f.store.clear(); await f.store.artifacts.put("next"); }
+		concurrent = f.store.put(pending);
+		if (phase === "deletion") release.resolve();
+		await concurrent;
+		if (phase === "deletion") expect(removals).toBeLessThanOrEqual(3); // One object can delay delivery; the remaining tail cannot.
+		for (let version = 66; version <= 72; version++) await f.store.put(await f.produce(`output ${version}`, version));
+		await f.store.artifacts.put("old"); await f.store.put(old); await f.store.artifacts.put("orphan");
 		const closing = f.store.drain().then(() => { drained = true; });
-		await nextTurn(); expect(drained).toBe(false);
+		if (phase !== "deletion") { await nextTurn(); expect(drained).toBe(false); }
 		release.resolve(); await closing;
+		expect(scans).toBe(phase === "clear" ? 2 : 1); // Clear has its own inventory; publications never restart the collection.
+		expect(await f.store.get(old.id)).toEqual(old); expect((await f.store.artifacts.get(orphan))?.toString()).toBe("orphan");
+		expect(await f.store.get(pending.id)).toEqual(pending); expect(await f.store.artifacts.load(referencedArtifacts(pending))).toBeDefined();
+		const first = await f.lookup(); if (!first) throw new Error("concurrent publication lost its artifact closure");
+		expect(f.output(first)).toBe("output 72");
+		await f.store.gc(); // A quiet cycle also collects the objects protected by the preceding cycle.
 		expect((await f.store.stats(true)).certificates).toBe(1);
 		const replay = await f.lookup(); if (!replay) throw new Error("concurrent publication was pruned");
-		expect(f.output(replay)).toBe("latest");
-	} finally { release.resolve(); await publishing; await f.store.drain(); }
+		expect(f.output(replay)).toBe("output 72"); expect(await f.store.artifacts.get(orphan)).toBeUndefined();
+	} finally { release.resolve(); await Promise.allSettled([publishing, concurrent]); await f.store.drain(); removing.mockRestore(); }
 });
 
 test.each(["existing", "new"])("delivers a %s producer while an older producer is still running", async peer => {

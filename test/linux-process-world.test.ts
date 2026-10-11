@@ -967,34 +967,38 @@ int main(int argc, char **argv) {
 			const invocation = resolvePiToolInvocation("bash", { command: "exit 92" }, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath })!.process!;
 			let binding: ProcessExecutionBinding | undefined;
 			if (!native) {
-				const branch = await forkReusableBash(fixture, { command, label: "recorded", actionNamespace: "binding", executionFingerprint, executionScope: scope });
-				try {
-					expect(branch.output).toMatchObject({ isError: false, result: { content: [{ text: "parent\nbefore\n" }] } });
-					const invocation = resolvePiToolInvocation("bash", { command }, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath })!;
-					const permission = PI_ACTION_SEMANTICS.buildKey("bash", { command }, fixture.workspace, "binding", { fingerprint: executionFingerprint, context: invocation })!;
-					const binding = branch.operations![0]!;
-					for (const operation of [{ binding: Object.freeze({ ...binding }), permission }, { binding, permission: { ...permission, key: "different action with colliding hash" } }]) {
-						await expect(fixture.world.speculation.fingerprint!({ effect: "unbounded", requirements: PI_ACTION_SEMANTICS.definition("bash")!.requirements, tool: "bash",
-							action: { ...permission, executionContext: { ...invocation, operation } } })).rejects.toThrow("binding is unavailable");
-					}
+				for (const value of ["before", ...Array.from({ length: 8 }, (_, version) => `history-${version}`)]) {
+					await writeFile(path.join(fixture.workspace, "input.txt"), `${value}\n`);
+					const branch = await forkReusableBash(fixture, { command, label: value, actionNamespace: "binding", executionFingerprint, executionScope: scope });
+					try {
+						expect(branch.output).toMatchObject({ isError: false, result: { content: [{ text: `parent\n${value}\n` }] } });
+						const invocation = resolvePiToolInvocation("bash", { command }, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath })!;
+						const permission = PI_ACTION_SEMANTICS.buildKey("bash", { command }, fixture.workspace, "binding", { fingerprint: executionFingerprint, context: invocation })!;
+						const binding = branch.operations![0]!;
+						for (const operation of [{ binding: Object.freeze({ ...binding }), permission }, { binding, permission: { ...permission, key: "different action with colliding hash" } }]) {
+							await expect(fixture.world.speculation.fingerprint!({ effect: "unbounded", requirements: PI_ACTION_SEMANTICS.definition("bash")!.requirements, tool: "bash",
+								action: { ...permission, executionContext: { ...invocation, operation } } })).rejects.toThrow("binding is unavailable");
+						}
+					} finally { await branch.dispose(); }
 				}
-				finally { await branch.dispose(); }
 				[binding] = fixture.backend.executionBindings(later);
 				expect(binding, JSON.stringify(fixture.backend.metrics())).toBeDefined();
-				const certificate = publishing.mock.calls.find(([certificate]) => certificate.weakKey === binding!.key)?.[0];
+				const history = publishing.mock.calls.map(([certificate]) => certificate).filter(certificate => certificate.weakKey === binding!.key), [certificate] = history;
 				expect(certificate!.producer.execution.authority).toBe("speculative");
 				expect(certificate!.dependencyCertificate.taints).toEqual(["clock", "random"]);
 				expect(await fixture.backend.store.findByWeakKey(binding!.key, path.join(fixture.workspace, "worker"))).toEqual([]);
 				expect(JSON.stringify(binding)).not.toContain("private argument");
 				expect(JSON.stringify(binding)).not.toContain("private value");
+				expect(new Set(history.map(certificate => certificate.id)).size).toBe(9);
+				for (const certificate of history) await fixture.backend.store.put(certificate);
 				await writeFile(path.join(fixture.workspace, "input.txt"), "after\n");
 				await expect(validateTransferredProcessEvidence(certificate!.dependencyCertificate)).resolves.toMatchObject({ status: "stale" });
-				await fixture.backend.store.put(certificate!);
 				const validation = vi.spyOn(await import("../src/provenance-validation.ts"), "validateDynamicDependencyCertificate");
 				try {
-					for (const expected of [1, 2]) {
-						expect(await fixture.backend.bindingStale(binding!)).toBe(true);
-						expect(validation).toHaveBeenCalledTimes(expected); // The live/disk duplicate is checked once, afresh on the next call.
+					for (const value of ["after", "before", "history-3", "after"]) {
+						await writeFile(path.join(fixture.workspace, "input.txt"), `${value}\n`); validation.mockClear();
+						expect(await fixture.backend.bindingStale(binding!)).toBe(value === "after");
+						expect(validation).toHaveBeenCalledOnce(); // All historical results share current evidence; every new call captures it again.
 					}
 				} finally { validation.mockRestore(); }
 

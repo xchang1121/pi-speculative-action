@@ -20,7 +20,7 @@ import { certificateReplayable, createExecPrototype, digestObject, dynamicDepend
 	type ExitOutcome, filesystemMetadataDigest, filesystemObservationDigest, ONE_SHOT_TAINTS, type OrderedEffectEvent, type OFDPosition, type ProcessProducerProof,
 	type ProcessProvenanceCertificate, type ProcessResultRecord, processWeakKey, type ProvenanceTaint, sealProcessCertificate, sha256Digest,
 	type Sha256Digest, type WorkspaceEffectState } from "./provenance-certificate.ts";
-import { captureAbsenceDependency, captureDirectoryDependency, captureFileDependency,
+import { captureAbsenceDependency, captureDirectoryDependency, captureFileDependency, observeProcessInputs,
 	validateDynamicDependencyCertificate } from "./provenance-validation.ts";
 import { diffWorkspaceStructures, ExecutionPathProjection, hydrateWorkspaceFileEntry, snapshotDependency, type WorkspaceStructureSnapshot,
 	type WorkspaceTransactionDiff, type WorkspaceTreeEntry } from "./process-observation.ts";
@@ -348,16 +348,14 @@ export class LinuxProcessReuseBackend {
 	async bindingStale(binding: ProcessExecutionBinding): Promise<boolean> {
 		const invocation = this.handoffs.resolveBinding(binding, binding.scope);
 		if (!invocation || "trackingOnly" in invocation) return true;
-		const projection = new ExecutionPathProjection({ sourceRoot: invocation.sourceRoot, workspaceRoot: invocation.sourceRoot });
 		const checked = new Set<Sha256Digest>();
-		try { for (const candidates of [this.handoffs.results(binding.key, binding.scope), this.store.candidatesByWeakKey(binding.key, invocation.executable)]) for await (const certificate of candidates) {
+		const currentInputs = observeProcessInputs(binding.key, evidence => TimelineInterval.collect(() => validateDynamicDependencyCertificate(evidence,
+			// This scheduling observation grants no adoption authority; failed runs also suppress repeated preparation while their inputs hold.
+			{ acceptedTaints: evidence.taints })).then(result => result.output, () => undefined));
+		try { for (const candidates of [this.handoffs.results(binding.key, binding.scope), this.store.candidatesByWeakKey(binding.key, invocation.executable, checked)]) for await (const certificate of candidates) {
 			if (checked.has(certificate.id)) continue;
 			checked.add(certificate.id);
-			const validation = await TimelineInterval.collect(() => validateDynamicDependencyCertificate(certificate.dependencyCertificate, { resolvePath: (logical) => projection.toPhysical(logical),
-				// A failed run can suppress repeated preparation only while its observed inputs still hold.
-				// This scheduling check grants no result adoption authority.
-				acceptedTaints: certificate.dependencyCertificate.taints })).then(result => result.output, () => undefined);
-			if (validation?.status === "valid") return false;
+			if ((await currentInputs(certificate.dependencyCertificate))?.strongKey === certificate.strongKey) return false;
 		} } catch { /* Unreadable history cannot establish current inputs. */ }
 		return true;
 	}

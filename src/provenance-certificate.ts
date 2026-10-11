@@ -694,11 +694,11 @@ function normalizeWorkspaceEffectState(state: WorkspaceEffectState, artifactSize
 	return { ...state };
 }
 
-function validateArtifact(reference: ArtifactReference, sizes: Map<Sha256Digest, number>): void {
+export function validateArtifact(reference: ArtifactReference, sizes?: Map<Sha256Digest, number>): void {
 	if (!reference || !isSha256Digest(reference.digest) || !Number.isSafeInteger(reference.size) || reference.size < 0) throw new Error("invalid effect artifact");
-	const previousSize = sizes.get(reference.digest);
+	const previousSize = sizes?.get(reference.digest);
 	if (previousSize !== undefined && previousSize !== reference.size) throw new Error("conflicting effect artifact sizes");
-	sizes.set(reference.digest, reference.size);
+	sizes?.set(reference.digest, reference.size);
 }
 
 function validLogicalPath(value: string): boolean {

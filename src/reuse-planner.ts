@@ -1,6 +1,6 @@
-import { certificateReplayable, dependencyPathsetKey, isSha256Digest, type ProcessProducerProof, processStrongKey,
+import { certificateReplayable, isSha256Digest, type ProcessProducerProof,
 	type ProcessProvenanceCertificate, type ProvenanceTaint, referencedArtifacts, type Sha256Digest } from "./provenance-certificate.ts";
-import { type ProvenanceValidation, type ProvenanceValidationContext, validateDynamicDependencyCertificate } from "./provenance-validation.ts";
+import { observeProcessInputs, type ProvenanceValidation, type ProvenanceValidationContext, validateDynamicDependencyCertificate } from "./provenance-validation.ts";
 import { ProvenanceCertificateStore, type VerifiedArtifactClosure } from "./reuse-store.ts";
 
 export interface ReplayObservationContract {
@@ -69,7 +69,13 @@ export class ProcessReusePlanner {
 		const acceptedTaints = [...new Set([...(request.validation?.acceptedTaints ?? []), ...(live.length ? request.live!.acceptedTaints : [])])];
 		const certificates = live.length ? live : this.store.candidatesByWeakKey(weakKey, request.executablePath, request.excludedCertificates);
 		const reasons = new Set<ProcessReuseMissReason>(), changedDependencies = new Set<string>();
-		const pathsets = new Map<Sha256Digest, Extract<ProvenanceValidation, { status: "valid" }> | undefined>();
+		const currentInputs = observeProcessInputs(weakKey, async evidence => {
+			metrics.pathsetsValidated++;
+			const observation = await validateDynamicDependencyCertificate(evidence, { ...request.validation, acceptedTaints });
+			metrics.filesRead += observation.filesRead; metrics.bytesRead += observation.bytesRead;
+			if (observation.status === "stale") for (const changed of observation.changed) changedDependencies.add(changed);
+			return observation;
+		});
 		for await (const certificate of certificates) {
 			metrics.candidateCertificates++;
 			if (request.acceptProducer && !request.acceptProducer(certificate.producer)) { reasons.add("producer_guarantee_incompatible"); continue; }
@@ -79,20 +85,7 @@ export class ProcessReusePlanner {
 				continue;
 			}
 			metrics.eligibleCertificates++;
-			const pathset = dependencyPathsetKey(certificate.dependencyCertificate);
-			if (!pathsets.has(pathset)) {
-				metrics.pathsetsValidated++;
-				const observation = await validateDynamicDependencyCertificate(certificate.dependencyCertificate, { ...request.validation, acceptedTaints });
-				const { filesRead, bytesRead } = observation;
-				metrics.filesRead += filesRead; metrics.bytesRead += bytesRead;
-				pathsets.set(pathset, undefined);
-				if (observation.status !== "indeterminate") {
-					if (observation.status === "stale") for (const changed of observation.changed) changedDependencies.add(changed);
-					const dependencies = observation.dependencies, strongKey = processStrongKey(weakKey, { complete: true, dependencies, taints: [] });
-					pathsets.set(pathset, { status: "valid", strongKey, dependencies, filesRead, bytesRead });
-				}
-			}
-			const validation = pathsets.get(pathset);
+			const validation = await currentInputs(certificate.dependencyCertificate);
 			if (!validation) { reasons.add("validation_indeterminate"); continue; }
 			if (certificate.strongKey !== validation.strongKey) { reasons.add("dependency_changed"); continue; }
 			let artifacts: VerifiedArtifactClosure | undefined;
@@ -114,9 +107,7 @@ export class ProcessReusePlanner {
 }
 
 function contractCompatible(contract: ReplayObservationContract, certificate: ProcessProvenanceCertificate): boolean {
-	if (!contract.orderedJournal || !contract.transactionalEffects) return false;
-	if (contract.sink !== "buffered") return false;
-	if (certificate.result.continuation && (!contract.continuation || certificate.dependencyCertificate.taints.some(
-		taint => taint === "pid_observation" || taint === "descriptor_observation"))) return false;
-	return certificate.result.replayProfile === "buffered_noninteractive";
+	return contract.orderedJournal && contract.transactionalEffects && contract.sink === "buffered" && certificate.result.replayProfile === "buffered_noninteractive" &&
+		(!certificate.result.continuation || contract.continuation === true && !certificate.dependencyCertificate.taints.some(
+			taint => taint === "pid_observation" || taint === "descriptor_observation"));
 }
