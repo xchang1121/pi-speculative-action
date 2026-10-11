@@ -194,23 +194,20 @@ function resourceTransitions(processes: ReadonlyMap<number, TraceProcess>, root:
 	})));
 	const wake = (inode: string | undefined) => { if (inode !== undefined) generations.set(inode, (generations.get(inode) ?? 0) + 1); };
 	const references = () => {
-		const masks = new Map<string, number>();
-		for (const table of new Set(tables.values())) for (const handle of table.values())
+		const masks = new Map<string, number>(), descriptions = new Map<number | undefined, Handle>();
+		for (const handle of [...new Set(tables.values())].flatMap(table => [...table.values()]).concat(messages.flatMap(message => message.rights))) {
 			masks.set(handle.inode, (masks.get(handle.inode) ?? 0) | handle.access);
-		for (const message of messages) for (const handle of message.rights)
-			masks.set(handle.inode, (masks.get(handle.inode) ?? 0) | handle.access);
-		return masks;
+			descriptions.set(handle.description, handle);
+		}
+		return { masks, descriptions };
 	};
-	const liveDescriptions = () => new Set([...new Set(tables.values())].flatMap(table => [...table.values()].map(handle => handle.description))
-		.concat(messages.flatMap(message => message.rights.map(handle => handle.description))));
 	const records = [...processes].flatMap(([pid, process]) => process.file.lines.slice(process.start).map(line => ({ pid, line })))
 		.sort((a, b) => (a.line.order ?? Infinity) - (b.line.order ?? Infinity));
 	for (const { pid, line } of records) {
 		let table = tables.get(pid);
 		if (!table || line.order === undefined) continue;
 		const lifetime = /^(?:close|close_range|dup|dup2|dup3|fcntl|fcntl64|execve|execveat|terminated)$/.test(line.name);
-		const before = lifetime || messages.length && /^(?:read|readv|recvfrom|recvmsg)$/.test(line.name) ? references() : undefined;
-		const previousDescriptions = before ? liveDescriptions() : undefined;
+		let before = lifetime || messages.length && /^(?:read|readv|recvfrom|recvmsg)$/.test(line.name) ? references() : undefined;
 		const endpoint = (argument: string | undefined): Handle | undefined => {
 			const file = table!.get(Number.parseInt(argument ?? "", 10));
 			if (file?.inode.startsWith("file:") && /^\d+<\//.test(argument ?? "")) return file;
@@ -397,20 +394,25 @@ function resourceTransitions(processes: ReadonlyMap<number, TraceProcess>, root:
 		} else if (source && line.args[1] === "F_SETFD") table.set(fd, { ...source, cloexec: line.args[2] !== "0" });
 		}
 		if (!before) continue;
-		const after = references();
-		const descriptions = liveDescriptions();
-		for (const description of previousDescriptions!) if (description !== undefined && !descriptions.has(description)) {
-			const handle = handles.find(handle => (handle.description ?? handle.fd) === description);
-			if (handle?.inode.startsWith("file:")) journal.push({ order: line.order, inode: handle.inode, description, kind: "release", data: Buffer.from([3]) });
+		let after = references();
+		for (;;) {
+			for (const [description, handle] of before.descriptions) if (description !== undefined && !after.descriptions.has(description) && handle.inode.startsWith("file:"))
+				journal.push({ order: line.order, inode: handle.inode, description, kind: "release", data: Buffer.from([3]) });
+			for (const [inode, mask] of before.masks) {
+				const released = mask & ~(after.masks.get(inode) ?? 0) & ~(outside.get(inode) ?? 3);
+				if (released && options.inheritedStreams?.includes(inode)) { journal.push({ order: line.order, inode, kind: "release", data: Buffer.from([released]) }); wake(peers.get(inode)); }
+			}
+			// Destroyed receivers drop their rights before the newly unowned objects.
+			// An external or cyclic reference still keeps its queue alive.
+			const count = messages.length;
+			for (let index = count - 1; index >= 0; index--) if (!after.masks.has(messages[index]!.inode) && outside.get(messages[index]!.inode) === 0) messages.splice(index, 1);
+			if (messages.length === count) break;
+			before = after; after = references();
 		}
 		for (const table of new Set(tables.values())) for (const handle of table.values()) if (handle.epoll)
-			for (const [key, entry] of handle.epoll) if (!descriptions.has(entry.handle.description)) handle.epoll.delete(key);
-		for (const [inode, mask] of before) {
-			const released = mask & ~(after.get(inode) ?? 0) & ~(outside.get(inode) ?? 3);
-			if (released && options.inheritedStreams?.includes(inode)) { journal.push({ order: line.order, inode, kind: "release", data: Buffer.from([released]) }); wake(peers.get(inode)); }
-		}
+			for (const [key, entry] of handle.epoll) if (!after.descriptions.has(entry.handle.description)) handle.epoll.delete(key);
 	}
-	return { journal, handled, retained: [...liveDescriptions()].filter((id): id is number => id !== undefined),
+	return { journal, handled, retained: [...references().descriptions.keys()].filter((id): id is number => id !== undefined),
 		finalHandles: [...(tables.get(root) ?? [])].map(([fd, handle]) => ({ fd, description: handle.description, cloexec: handle.cloexec })) };
 }
 

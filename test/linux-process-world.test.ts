@@ -413,9 +413,9 @@ nativeTest.for([false, true])("prepares a failed command after its reported inpu
 		} finally { await host?.dispose(); await fixture.dispose(); }
 	});
 
-nativeTest.for(["sample", "file", "dup", "threads", "limit", "metadata", "identity", "pipe", "socket", "eventfd", "pipe:unavailable", "socket:unavailable", "eventfd:unavailable", "eventfd:unavailable:destroyed", "eventfd::inherited", "eventfd:unavailable:external", "eventfd::external"])("adopts a closed-input calculation through capture or completion (%s)", { timeout: 30_000 }, async (scenario, { benchmark }) => {
+nativeTest.for(["sample", "file", "dup", "threads", "limit", "metadata", "identity", "pipe", "socket", "eventfd", "pipe:unavailable", "socket:unavailable", "eventfd:unavailable", "eventfd:unavailable:destroyed", "eventfd::inherited", "eventfd:unavailable:external", "eventfd::external", "eventfd:unavailable:discard", "eventfd::discard", "eventfd:unavailable:discard-nested", "eventfd::discard-nested", "eventfd:unavailable:discard-cycle"])("adopts a closed-input calculation through capture or completion (%s)", { timeout: 30_000 }, async (scenario, { benchmark }) => {
 		const [mode, unavailable, queue] = scenario.split(":"), fixture = await benchmark("pi-prefix-process-", "git", { processImages: unavailable ? false : undefined });
-		const descendant = mode === "pipe" || mode === "socket" || mode === "eventfd", complete = descendant || mode === "identity";
+		const descendant = mode === "pipe" || mode === "socket" || mode === "eventfd", complete = descendant || mode === "identity", discarded = queue?.startsWith("discard"), cyclic = queue === "discard-cycle", capturable = !unavailable && !discarded;
 		await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker", arguments: ["-pthread"], code: `#define _GNU_SOURCE
 ${cHeaders("unistd.h sys/syscall.h sys/random.h sys/resource.h sys/stat.h sys/wait.h pthread.h stdio.h stdint.h fcntl.h")}
 static void *thread(void *unused) { return unused; }
@@ -437,15 +437,17 @@ int main(void) {
 }
 ` });
 		if (descendant) await compileBenchmarkHelper(fixture.workspace, { source: "launch.c", output: "launch", code: `#define _GNU_SOURCE
-${cHeaders("sys/eventfd.h sys/wait.h")}
+${cHeaders("sys/eventfd.h sys/wait.h sys/mman.h")}
 ${rightsHelpers}
 int main(void) { int fds[2]; if (${mode === "eventfd" ? "(fds[0] = eventfd(0, 0)) < 0 || (fds[1] = dup(fds[0])) < 0" : mode === "socket" ? "socketpair(AF_UNIX, SOCK_STREAM, 0, fds)" : "pipe(fds)"} || fds[0] != 3 || fds[1] != 4) return 61;
- ${queue && queue !== "external" ? 'int queues[2]; struct iovec bytes = {.iov_base = "x", .iov_len = 1}; struct msghdr message = {.msg_iov = &bytes, .msg_iovlen = 1}; if (socketpair(AF_UNIX, SOCK_STREAM, 0, queues) || sendmsg(queues[0], &message, 0) != 1) return 63;' : ""}
+ ${queue && queue !== "external" ? `int queues[2]; if (socketpair(AF_UNIX, SOCK_STREAM, 0, queues)) return 63;
+ int reference = ${discarded ? queue !== "discard" ? `wrap_queue(memfd_create("queued-file", MFD_CLOEXEC), ${Number(cyclic)})` : 'memfd_create("queued-file", MFD_CLOEXEC)' : "-1"};
+ if (${discarded ? "reference < 0 || " : ""}pass(queues[0], "x", 1, &reference, ${discarded ? 1 : 0}, 0)${discarded ? " || close(reference)" : ""}) return 63;` : ""}
  ${queue === "external" ? `int gate[2]; char byte; if (wrap_queue(wrap_queue(eventfd(5, EFD_CLOEXEC), 0), 0) < 0 || pipe2(gate, O_CLOEXEC)) return 64;
  pid_t child = fork(); if (child < 0) return 65;
  if (child) { close(3); close(4); close(gate[0]); if (write(gate[1], "x", 1) != 1) return 66; close(gate[1]); int status; return waitpid(child, &status, 0) != child || status; }
  close(gate[1]); if (read(gate[0], &byte, 1) != 1) return 66; close(gate[0]);` : ""}
- close_range(${queue === "inherited" ? 7 : 5}, ~0U, 0); execlp("worker", "worker", NULL); return 62; }
+ close_range(${queue === "inherited" || discarded ? 7 : 5}, ~0U, 0); execlp("worker", "worker", NULL); return 62; }
 ` });
 		await commitBenchmarkFixture(fixture.workspace, "Closed input prefix");
 		const scope = { sessionID: "prefix", turnID: "same" };
@@ -488,16 +490,22 @@ int main(void) { int fds[2]; if (${mode === "eventfd" ? "(fds[0] = eventfd(0, 0)
 				const timing = new TaskTimeline(issuedAt).recordCall([{ computation: actual.computation }], issuedAt, performance.now());
 				expect(fields).toHaveLength(4); expect(fields[0]).toBe(fields[1]); expect(fields[2]).toBe(seed.trim().split(":")[2]);
 				expect(fields[3]).not.toBe(seed.trim().split(":")[3]);
-				expect(fixture.backend.actorMetrics().joinedHits, JSON.stringify(fixture.backend.metrics())).toBe(1);
+				expect(fixture.backend.actorMetrics().joinedHits, JSON.stringify(fixture.backend.metrics())).toBe(Number(!cyclic));
 				if (mode === "file" || mode === "dup") expect(admissions).toEqual([{ syscall: 3, accepted: undefined }, { syscall: 318, accepted: true }]);
 				expect(await pending).toMatchObject(complete ? { exit: { kind: "code", code: 0 } } : { suspended: true });
 				const continuations = publishing.mock.calls.flatMap(([, , certificate, , continuation]) => certificate?.result.continuation ? [continuation] : []);
-				expect(continuations).toEqual(complete ? [] : [expect.anything()]); expect(timing.reused).toBe(true);
+				expect(continuations).toEqual(complete ? [] : [expect.anything()]); expect(timing.reused).toBe(cyclic ? undefined : true);
 				expect(timing.toolComputeMs).toBeGreaterThanOrEqual(timing.hiddenComputeMs);
 				if (complete) {
-					expect(admissions.length > 0).toBe(!unavailable); expect(admissions.every(result => !result.accepted)).toBe(true);
-					if (descendant && !unavailable) expect(admissions).toContainEqual({ syscall: 0, accepted: false });
-					expect(timing.hiddenComputeMs).toBeGreaterThan(0);
+					expect(admissions.length > 0).toBe(capturable); expect(admissions.every(result => !result.accepted)).toBe(true);
+					if (descendant && capturable) expect(admissions).toContainEqual({ syscall: 0, accepted: false });
+					if (cyclic) expect(publishing).not.toHaveBeenCalled();
+					else if (discarded) {
+						const certificate = publishing.mock.calls.find(([, , certificate]) => certificate?.dependencyCertificate.complete)?.[2]!;
+						const file = certificate.prototype.inheritedFDs.find(fd => fd.type === "regular")!;
+						expect(certificate.result.resources!.transitions!.at(-1)).toMatchObject({ id: file.alias, kind: "release" });
+					}
+					if (cyclic) expect(timing.hiddenComputeMs).toBe(0); else expect(timing.hiddenComputeMs).toBeGreaterThan(0);
 				} else if (mode === "sample") expect(new TaskTimeline(issuedAt).recordTool(continuations[0]!.computation, issuedAt, true).hiddenComputeMs).toBe(0);
 			} finally {
 				controller.abort(); starting.release(); frontier.release(); await session.close(); await settled; await cancelled;
@@ -1451,10 +1459,12 @@ static int takePacket(int length,int peek,int truncated,char expected) {
 							onData: data => { output += data.toString(); }, ...request }),
 				};
 			};
-			await compileBenchmarkHelper(root, { source: "packet-capture.c", output: "packet-capture", code: `#define _GNU_SOURCE
-${cHeaders("sys/socket.h sys/wait.h stdlib.h string.h unistd.h")}
-int main(int argc,char **argv) {
-	if(argc!=2)return 1;int pair[2],offset=0;char bytes[4];
+			const descriptorProbe = path.join(root, "descriptor-probe");
+			await compileBenchmarkHelper(root, { source: "descriptor-probe.c", output: "descriptor-probe", arguments: ["-pthread", "-Werror"], code: `#define _GNU_SOURCE
+${cHeaders("pthread.h sched.h stdlib.h poll.h stdio.h stdint.h sys/file.h sys/stat.h sys/syscall.h sys/wait.h sys/eventfd.h sys/mman.h")}
+${rightsHelpers}
+static int packet_capture(char **argv) {
+	int pair[2],offset=0;char bytes[4];
 	if(socketpair(AF_UNIX,atoi(argv[1])|SOCK_NONBLOCK,0,pair) || send(pair[0],"",0,0)!=0 || send(pair[0],"tail",4,0)!=4)return 2;
 	pid_t child=fork();if(child<0)return 3;if(!child){execl("/bin/true","true",(char *)0);_exit(4);}
 	int status;if(waitpid(child,&status,0)!=child || status)return 5;
@@ -1463,87 +1473,66 @@ int main(int argc,char **argv) {
 	offset=-1;if(setsockopt(pair[1],SOL_SOCKET,SO_PEEK_OFF,&offset,sizeof(offset)) || recv(pair[1],bytes,4,0)!=0 || recv(pair[1],bytes,4,0)!=4 || memcmp(bytes,"tail",4))return 7;
 	return 0;
 }
-` });
-			for (const type of [2, 5]) {
-				const executor = held({ descriptors: true, decide: async () => ({ kind: "continue" }) });
-				expect(await executor.execute(`exec './packet-capture' ${type}`)).toEqual({ exitCode: 0 });
-			}
-			// A vfork parent cannot stop until its child execs: a sibling's exec decision must not wait for it (cargo build scripts hung).
-			await compileBenchmarkHelper(root, { source: "spawner.c", output: "spawner", code: `#include <sys/syscall.h>\n#include <sys/wait.h>\n#include <time.h>\n#include <unistd.h>
-int main(void) { int status; struct timespec pause = {0, 300000000}; pid_t sibling = fork(), child;
-	if (!sibling) { usleep(50000); execl("/bin/true", "true", (char *)0); _exit(1); }
-	if (!(child = vfork())) { syscall(SYS_nanosleep, &pause, 0); execl("/bin/true", "true", (char *)0); _exit(1); }
-	return waitpid(child, &status, 0) != child || status || waitpid(sibling, &status, 0) != sibling || status; }\n` });
-			expect(await held({ descriptors: true, decide: async () => ({ kind: "continue" }) }).execute("exec ./spawner")).toEqual({ exitCode: 0 });
-			const compat = path.join(root, "compat32");
-			await writeFile(`${compat}.s`, ".global _start\n_start: movl $1, %eax; movl $7, %ebx; int $0x80\n");
-			execFileSync("cc", ["-nostdlib", "-m32", "-static", `${compat}.s`, "-o", compat]);
-			if (childProcess.spawnSync(compat).status === 7) for (const descriptors of [false, true]) {
-				const decide = vi.fn(async () => ({ kind: "continue" as const }));
-				const executor = held({ descriptors, decide });
-				expect(await executor.execute(`exec '${compat}'`)).toEqual({ exitCode: 7 });
-				expect(decide).not.toHaveBeenCalled();
-			}
-			for (const [redirection, route] of [["", [1, 2]], ["2>&1", [1, 1]], ["3>&1", undefined], ["0<&-", [1, 2]], ["1>/dev/null", [0, 2]], ["2>&1 1>/dev/null", [0, 2]],
-				["&>/dev/null", [0, 0]], ["2>>/dev/null", [1, 0]], ["1>&-", undefined]] as const) {
-				let inspected = 0;
-				let inspection: ReturnType<typeof inspectHeldExecProcess> | undefined;
-				const inspecting = held({ decide: async ({ pid }) => {
-					inspected++;
-					inspection = inspectHeldExecProcess(pid, await filesystem.readlink(`/proc/${pid}/exe`));
-					await inspection.catch(() => undefined);
-					return { kind: "continue" };
-				} });
-				expect(await inspecting.execute(`exec /bin/true ${redirection}`)).toEqual({ exitCode: 0 });
-				expect(inspected).toBe(1);
-				// Assert outside the advisory callback, whose failures intentionally preserve native execution.
-				if (route) {
-					expect((await inspection!).outputRoute).toEqual(route);
-					expect((await inspection!).context.descriptorTypes[0]).toBe(redirection === "0<&-" ? "closed" : "device");
-				} else await expect(inspection).rejects.toThrow(/descriptors/);
-			}
-			const directoryInput = path.join(root, "anchor"); await mkdir(directoryInput);
-			const input = path.join(root, "ofd-input");
-			await writeFile(input, "abcdef");
-			const manifest = path.join(root, "fd-plan"), report = path.join(root, "fd-report");
-			await writeFile(report, "");
-			await writeFile(manifest, `INPUTS 3 0 0\n0 0 32768 1 ${Buffer.byteLength(input)} 0 0 0 0 -1 3 1 0\n${input}\n3 0 32768 1 0 0 0 0 0 -1 3 1 0\n\n8 8 32768 1 ${Buffer.byteLength(input)} 0 0 0 0 -1 3 1 0\n${input}\n`);
-			const reproduced = run("--exec-fds", "12", manifest, report, "fd-worker", "/bin/bash", "-c",
-				`IFS= read -r -N 1 a; IFS= read -r -N 1 b <&3; IFS= read -r -N 1 c <&8; printf '%s:%s:%s' "$a" "$b" "$c"; ` +
-				`(sleep 0.02; IFS= read -r -N 1 d <&3) & exit 7`);
-			expect(reproduced).toMatchObject({ status: 7, stdout: "b:c:b", stderr: "" });
-			const reportLines = (await readFile(report, "utf8")).trimEnd().split("\n");
-			expect([reportLines[0], ...reportLines.slice(1).map(line => line.split(" ").slice(0, 3).join(" "))])
-				.toEqual(["OFD 3", "0 32768 4", "3 32768 4", "8 32768 2"]);
-			const external = path.join(root, "external-fd");
-			await writeFile(external, `#!/bin/sh\nexec 9<'${input}'\nexec '${binary}' "$@"\n`, { mode: 0o700 });
-			for (const shell of [binary, external]) {
-				const snapshots: NonNullable<HeldExecProcess["descriptors"]>[] = [], failures: unknown[] = [];
-				const inspecting = held({ descriptors: true, decide: async process => {
-					try {
-						const descriptors = process.descriptors!;
-						expect(descriptors).toBeDefined(); snapshots.push(descriptors);
-						const snapshot = await inspectHeldExecProcess(process.pid, await filesystem.readlink(`/proc/${process.pid}/exe`), descriptors);
-						expect(snapshot.context.regularDescriptors).toEqual(descriptors);
-						const first = descriptors.find(({ fd }) => fd === 3)!;
-						expect(first).toMatchObject({ fd: 3, alias: 3, owned: true });
-						expect(descriptors.find(({ fd }) => fd === 4)).toEqual({ ...first, fd: 4 });
-						expect(descriptors.find(({ fd }) => fd === 5)).toMatchObject({ fd: 5, alias: 5, owned: true, inode: first.inode });
-						if (shell === external) expect(descriptors.find(({ fd }) => fd === 9)).toMatchObject({ fd: 9, alias: 9, owned: false });
-						await new Promise(resolve => setTimeout(resolve, 30));
-						expect(await readFile(`/proc/${process.pid}/fdinfo/3`, "utf8")).toMatch(new RegExp(`^pos:\\s*${first.offset}$`, "m"));
-					} catch (error) { failures.push(error); }
-					return { kind: "continue" };
-				} }, adaptProcessToolOperations(createLocalBashOperations({ shellPath: shell })));
-				// A sibling stopped inside a call (the read builtin's ioctl) leaves ownership unproven by design: let it finish first.
-				expect(await inspecting.execute(`exec 3<'${input}'; exec 4<&3; exec 5<'${input}'; ` +
-					`(while IFS= read -r -N 1 value <&4; do :; done) & wait; /bin/true; /bin/true`)).toEqual({ exitCode: 0 });
-				expect(failures).toEqual([]); expect(snapshots).toHaveLength(2);
-			}
-			const descriptorProbe = path.join(root, "descriptor-probe");
-			await compileBenchmarkHelper(root, { source: "descriptor-probe.c", output: "descriptor-probe", arguments: ["-pthread", "-Werror"], code: `#define _GNU_SOURCE
-${cHeaders("pthread.h sched.h stdlib.h poll.h sys/file.h sys/stat.h sys/syscall.h sys/wait.h unistd.h")}
-${rightsHelpers}
+static int pipe_probe(char **argv) {
+	int fds[2]; if (pipe2(fds, O_CLOEXEC | (!strcmp(argv[1], "packet") ? O_DIRECT : 0))) return 71;
+	if (strcmp(argv[1], "empty") && write(fds[1], "abcdef", 6) != 6) return 72;
+	int writer = fcntl(fds[1], F_DUPFD_CLOEXEC, 20); close(fds[1]);
+	if (dup2(fds[0], 0) < 0) return 73;
+	close(fds[0]);
+	if (dup2(0, 3) < 0) return 74;
+	int fd = open("/proc/self/fd/0", O_RDONLY); if (fd < 0 || dup2(fd, 8) < 0) return 75; close(fd);
+	if (strcmp(argv[1], "live")) { close(writer); writer = -1; }
+	pid_t child = fork(); if (child < 0) return 76;
+	if (!child) { char *command[] = {"true", 0}; execv("/bin/true", command); _exit(77); }
+	int status; if (waitpid(child, &status, 0) != child || status) return 78; close(writer);
+	if (!strcmp(argv[1], "flags") && (!(fcntl(3, F_GETFL) & O_NONBLOCK) || (fcntl(8, F_GETFL) & O_NONBLOCK))) return 79;
+	char bytes[6]; ssize_t size = read(0, bytes, sizeof(bytes));
+	return size < 0 || write(1, bytes, (size_t)size) != size;
+}
+static int message_probe(char **argv) {
+	int fds[2]; if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) || fds[0] != 3 || fds[1] != 4) return 71;
+	int input = open(argv[1], O_RDONLY); if (input < 0 || dup2(input, 9) < 0) return 72; close(input);
+	int passed[2] = {9, 3};
+	if (write(4, "L", 1) != 1 || pass(4, "qI", 2, passed, 2, 0)) return 73;
+	if (pass(4, "t", 1, passed, 2, 0) || write(4, "bcaXYZ", 6) != 6) return 74;
+	if (*argv[2] == '1' && close(9)) return 79;
+	for (int repeat = 0; repeat < 2; repeat++) {
+		pid_t child = fork(); if (child < 0) return 75;
+		if (!child) { execl("/bin/true", "true", (char *)0); _exit(76); }
+		int status, cursor; socklen_t size = sizeof(cursor);
+		if (waitpid(child, &status, 0) != child || status || getsockopt(3, SOL_SOCKET, SO_PEEK_OFF, &cursor, &size) || cursor != -1) return 77;
+	}
+	for (int left = 10; left;) { char bytes[10]; ssize_t size = read(3, bytes, left); if (size <= 0 || write(1, bytes, size) != size) return 78; left -= size; }
+	return 0;
+}
+static int queue_owners(char **argv) {
+	int state = atoi(argv[2]), local = (state >= 3 && state <= 5) || state >= 11, other = state == 2 || state == 9 || state == 10, data[2], channel[2], gate[2], fd; char type = *argv[1], byte; uint64_t value = 5;
+	if (type == 's') { if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, data)) return 71; fd = data[0]; }
+	else if (type == 'c') fd = eventfd(5, EFD_NONBLOCK | EFD_CLOEXEC);
+	else { fd = memfd_create("queued-file", MFD_CLOEXEC); if (write(fd, &value, 8) != 8 || lseek(fd, 0, SEEK_SET)) return 71; }
+	if (fd < 0 || dup2(fd, 20) < 0 || dup2(fd, 21) < 0) return 72;
+	close(fd);
+	if (type == 'f' && local && flock(20, LOCK_EX | LOCK_NB)) return 72;
+	if (state) {
+		int reference = other ? (type == 'c' ? eventfd(5, EFD_CLOEXEC) : open("/proc/self/fd/20", O_RDWR | O_CLOEXEC)) : 20;
+		if (state >= 7) reference = wrap_queue(other ? reference : dup(reference), state == 10 || state == 12);
+		if (reference < 0 || socketpair(AF_UNIX, SOCK_STREAM | (local || state == 7 ? 0 : SOCK_CLOEXEC), 0, channel) || pass(channel[0], "x", 1, &reference, 1, 0)) return 73;
+		if (state == 2 || state >= 7) close(reference);
+		if (state == 6) { if (take(channel[1], 'x', &reference, 1, 0, 0)) return 74; close(reference); }
+	}
+	if (pipe2(gate, O_CLOEXEC)) return 75;
+	pid_t child = fork(); if (child < 0) return 75;
+	if (!child) { close(gate[1]); if (read(gate[0], &byte, 1) != 1) return 76; close(gate[0]); execl("/bin/true", "true", (char *)0); return 76; }
+	if (state) { close(20); close(21); } if (local) { close(channel[0]); close(channel[1]); }
+	close(gate[0]); if (write(gate[1], "x", 1) != 1) return 77; close(gate[1]);
+	int status; if (waitpid(child, &status, 0) != child || status) return 78;
+	if (type == 's') { struct pollfd ready = {.fd = data[1], .events = POLLIN | POLLRDHUP}; if (poll(&ready, 1, 0) < 0 || ((state == 1 || state >= 7) && ready.revents)) return 79; }
+	if (state && !local && state != 6) { if (take(channel[1], 'x', &fd, 1, 0, 0)) return 80; } else fd = 20;
+	if (state >= 7 && !local) { int nested = fd, rights[2]; if (take(nested, 'x', rights, state == 10 ? 2 : 1, 0, 0)) return 80; close(nested); fd = rights[0]; if (state == 10) close(rights[1]); }
+	if (type == 's') { if (state != 6) close(fd); struct pollfd ready = {.fd = data[1], .events = POLLIN | POLLRDHUP}; return poll(&ready, 1, 0) != 1 || read(data[1], &byte, 1) != 0; }
+	if (local) value = 0; else if (type == 'f') value = lseek(fd, 0, SEEK_CUR); else if (read(fd, &value, 8) != 8) return 81;
+	printf("%llu", (unsigned long long)value); return 0;
+}
 static int aliases(void *unused) {
 	(void)unused;
 	if (dup2(3, 65) < 0 || dup3(3, 66, O_CLOEXEC) < 0 || fcntl(3, F_DUPFD, 67) != 67) return 75;
@@ -1568,6 +1557,8 @@ static int split_exec(void *argument) {
 }
 static void *blocked_open(void *file) { int fd = open(file, O_RDONLY); if (fd < 0) _exit(79); close(fd); return 0; }
 int main(int argc, char **argv) {
+	const struct { const char *name; int argc; int (*run)(char **); } probes[] = {{"packet", 3, packet_capture}, {"pipe", 3, pipe_probe}, {"message", 4, message_probe}, {"queue", 4, queue_owners}};
+	for (unsigned index = 0; argc > 1 && index < sizeof(probes) / sizeof(*probes); index++) if (!strcmp(argv[1], probes[index].name)) return argc == probes[index].argc ? probes[index].run(argv + 1) : 70;
 	if (argc >= 3 && !strncmp(argv[1], "external-", 9)) {
 		int pair[2];
 		if ((!strcmp(argv[1], "external-socket") ? socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) : pipe2(pair, O_CLOEXEC)) ||
@@ -1666,6 +1657,82 @@ int main(int argc, char **argv) {
 	char *command[] = {"true", 0}; execv("/bin/true", command); return 76;
 }
 ` });
+			for (const type of [2, 5]) {
+				const executor = held({ descriptors: true, decide: async () => ({ kind: "continue" }) });
+				expect(await executor.execute(`exec '${descriptorProbe}' packet ${type}`)).toEqual({ exitCode: 0 });
+			}
+			// A vfork parent cannot stop until its child execs: a sibling's exec decision must not wait for it (cargo build scripts hung).
+			await compileBenchmarkHelper(root, { source: "spawner.c", output: "spawner", code: `#include <sys/syscall.h>\n#include <sys/wait.h>\n#include <time.h>\n#include <unistd.h>
+int main(void) { int status; struct timespec pause = {0, 300000000}; pid_t sibling = fork(), child;
+	if (!sibling) { usleep(50000); execl("/bin/true", "true", (char *)0); _exit(1); }
+	if (!(child = vfork())) { syscall(SYS_nanosleep, &pause, 0); execl("/bin/true", "true", (char *)0); _exit(1); }
+	return waitpid(child, &status, 0) != child || status || waitpid(sibling, &status, 0) != sibling || status; }\n` });
+			expect(await held({ descriptors: true, decide: async () => ({ kind: "continue" }) }).execute("exec ./spawner")).toEqual({ exitCode: 0 });
+			const compat = path.join(root, "compat32");
+			await writeFile(`${compat}.s`, ".global _start\n_start: movl $1, %eax; movl $7, %ebx; int $0x80\n");
+			execFileSync("cc", ["-nostdlib", "-m32", "-static", `${compat}.s`, "-o", compat]);
+			if (childProcess.spawnSync(compat).status === 7) for (const descriptors of [false, true]) {
+				const decide = vi.fn(async () => ({ kind: "continue" as const }));
+				const executor = held({ descriptors, decide });
+				expect(await executor.execute(`exec '${compat}'`)).toEqual({ exitCode: 7 });
+				expect(decide).not.toHaveBeenCalled();
+			}
+			for (const [redirection, route] of [["", [1, 2]], ["2>&1", [1, 1]], ["3>&1", undefined], ["0<&-", [1, 2]], ["1>/dev/null", [0, 2]], ["2>&1 1>/dev/null", [0, 2]],
+				["&>/dev/null", [0, 0]], ["2>>/dev/null", [1, 0]], ["1>&-", undefined]] as const) {
+				let inspected = 0;
+				let inspection: ReturnType<typeof inspectHeldExecProcess> | undefined;
+				const inspecting = held({ decide: async ({ pid }) => {
+					inspected++;
+					inspection = inspectHeldExecProcess(pid, await filesystem.readlink(`/proc/${pid}/exe`));
+					await inspection.catch(() => undefined);
+					return { kind: "continue" };
+				} });
+				expect(await inspecting.execute(`exec /bin/true ${redirection}`)).toEqual({ exitCode: 0 });
+				expect(inspected).toBe(1);
+				// Assert outside the advisory callback, whose failures intentionally preserve native execution.
+				if (route) {
+					expect((await inspection!).outputRoute).toEqual(route);
+					expect((await inspection!).context.descriptorTypes[0]).toBe(redirection === "0<&-" ? "closed" : "device");
+				} else await expect(inspection).rejects.toThrow(/descriptors/);
+			}
+			const directoryInput = path.join(root, "anchor"); await mkdir(directoryInput);
+			const input = path.join(root, "ofd-input");
+			await writeFile(input, "abcdef");
+			const manifest = path.join(root, "fd-plan"), report = path.join(root, "fd-report");
+			await writeFile(report, "");
+			await writeFile(manifest, `INPUTS 3 0 0\n0 0 32768 1 ${Buffer.byteLength(input)} 0 0 0 0 -1 3 1 0\n${input}\n3 0 32768 1 0 0 0 0 0 -1 3 1 0\n\n8 8 32768 1 ${Buffer.byteLength(input)} 0 0 0 0 -1 3 1 0\n${input}\n`);
+			const reproduced = run("--exec-fds", "12", manifest, report, "fd-worker", "/bin/bash", "-c",
+				`IFS= read -r -N 1 a; IFS= read -r -N 1 b <&3; IFS= read -r -N 1 c <&8; printf '%s:%s:%s' "$a" "$b" "$c"; ` +
+				`(sleep 0.02; IFS= read -r -N 1 d <&3) & exit 7`);
+			expect(reproduced).toMatchObject({ status: 7, stdout: "b:c:b", stderr: "" });
+			const reportLines = (await readFile(report, "utf8")).trimEnd().split("\n");
+			expect([reportLines[0], ...reportLines.slice(1).map(line => line.split(" ").slice(0, 3).join(" "))])
+				.toEqual(["OFD 3", "0 32768 4", "3 32768 4", "8 32768 2"]);
+			const external = path.join(root, "external-fd");
+			await writeFile(external, `#!/bin/sh\nexec 9<'${input}'\nexec '${binary}' "$@"\n`, { mode: 0o700 });
+			for (const shell of [binary, external]) {
+				const snapshots: NonNullable<HeldExecProcess["descriptors"]>[] = [], failures: unknown[] = [];
+				const inspecting = held({ descriptors: true, decide: async process => {
+					try {
+						const descriptors = process.descriptors!;
+						expect(descriptors).toBeDefined(); snapshots.push(descriptors);
+						const snapshot = await inspectHeldExecProcess(process.pid, await filesystem.readlink(`/proc/${process.pid}/exe`), descriptors);
+						expect(snapshot.context.regularDescriptors).toEqual(descriptors);
+						const first = descriptors.find(({ fd }) => fd === 3)!;
+						expect(first).toMatchObject({ fd: 3, alias: 3, owned: true });
+						expect(descriptors.find(({ fd }) => fd === 4)).toEqual({ ...first, fd: 4 });
+						expect(descriptors.find(({ fd }) => fd === 5)).toMatchObject({ fd: 5, alias: 5, owned: true, inode: first.inode });
+						if (shell === external) expect(descriptors.find(({ fd }) => fd === 9)).toMatchObject({ fd: 9, alias: 9, owned: false });
+						await new Promise(resolve => setTimeout(resolve, 30));
+						expect(await readFile(`/proc/${process.pid}/fdinfo/3`, "utf8")).toMatch(new RegExp(`^pos:\\s*${first.offset}$`, "m"));
+					} catch (error) { failures.push(error); }
+					return { kind: "continue" };
+				} }, adaptProcessToolOperations(createLocalBashOperations({ shellPath: shell })));
+				// A sibling stopped inside a call (the read builtin's ioctl) leaves ownership unproven by design: let it finish first.
+				expect(await inspecting.execute(`exec 3<'${input}'; exec 4<&3; exec 5<'${input}'; ` +
+					`(while IFS= read -r -N 1 value <&4; do :; done) & wait; /bin/true; /bin/true`)).toEqual({ exitCode: 0 });
+				expect(failures).toEqual([]); expect(snapshots).toHaveLength(2);
+			}
 			for (const type of ["pipe", "socket"] as const) for (const descriptors of [true, "inspect"] as const) {
 				await writeFile(external, `#!/bin/sh\nexec '${descriptorProbe}' external-${type} '${binary}' "$@"\n`, { mode: 0o700 });
 				const snapshots: NonNullable<HeldExecProcess["descriptors"]>[] = [], failures: unknown[] = [], commit = vi.fn(async () => {});
@@ -1722,26 +1789,6 @@ int main(int argc, char **argv) {
 			} });
 			expect(await piped.execute(`exec 3<'${input}'; /bin/true | /usr/bin/wc -c; IFS= read -r -N 1 byte <&3; printf '%s' "$byte"`)).toEqual({ exitCode: 0 });
 			expect(piped.output).toBe("1048576\nb");
-			await compileBenchmarkHelper(root, { source: "pipe-probe.c", output: "pipe-probe", arguments: ["-Werror"], code: `#define _GNU_SOURCE
-${cHeaders("fcntl.h string.h sys/wait.h unistd.h")}
-int main(int argc, char **argv) {
-	if (argc != 2) return 70;
-	int fds[2]; if (pipe2(fds, O_CLOEXEC | (!strcmp(argv[1], "packet") ? O_DIRECT : 0))) return 71;
-	if (strcmp(argv[1], "empty") && write(fds[1], "abcdef", 6) != 6) return 72;
-	int writer = fcntl(fds[1], F_DUPFD_CLOEXEC, 20); close(fds[1]);
-	if (dup2(fds[0], 0) < 0) return 73;
-	close(fds[0]);
-	if (dup2(0, 3) < 0) return 74;
-	int fd = open("/proc/self/fd/0", O_RDONLY); if (fd < 0 || dup2(fd, 8) < 0) return 75; close(fd);
-	if (strcmp(argv[1], "live")) { close(writer); writer = -1; }
-	pid_t child = fork(); if (child < 0) return 76;
-	if (!child) { char *command[] = {"true", 0}; execv("/bin/true", command); _exit(77); }
-	int status; if (waitpid(child, &status, 0) != child || status) return 78; close(writer);
-	if (!strcmp(argv[1], "flags") && (!(fcntl(3, F_GETFL) & O_NONBLOCK) || (fcntl(8, F_GETFL) & O_NONBLOCK))) return 79;
-	char bytes[6]; ssize_t size = read(0, bytes, sizeof(bytes));
-	return size < 0 || write(1, bytes, (size_t)size) != size;
-}
-` });
 			for (const mode of ["partial", "empty", "flags", "queue-conflict", "contents", "overrun", "stale", "live", "packet", "inspect", "commit-failure", "journal", "journal-conflict", "journal-write-readonly", "journal-shutdown-pipe", "journal-commit-failure"]) {
 				const accepted = ["partial", "empty", "flags", "journal"].includes(mode), journal = mode.startsWith("journal"), failedCommit = mode.endsWith("commit-failure");
 				let descriptors: HeldExecProcess["descriptors"];
@@ -1764,7 +1811,7 @@ int main(int argc, char **argv) {
 						...(journal ? { resourceEvents: [{ fd: 3, kind: "peek" as const, data: Buffer.from("abc") }, { fd: 0, kind: mode === "journal-write-readonly" ? "produce" as const : mode === "journal-shutdown-pipe" ? "shutdown" as const : "consume" as const, data: Buffer.from("ab") },
 							{ fd: 8, kind: "consume" as const, data: Buffer.from(mode === "journal-conflict" ? "x" : "c") }] } : {}) };
 				} });
-				const running = executor.execute(`'./pipe-probe' ${mode}`);
+				const running = executor.execute(`'${descriptorProbe}' pipe ${mode}`);
 				if (failedCommit) await expect(running).rejects.toMatchObject({ disposition: "poisoned" });
 				else {
 					expect(await running, mode).toEqual({ exitCode: 0 });
@@ -1773,27 +1820,6 @@ int main(int argc, char **argv) {
 				expect(commit, mode).toHaveBeenCalledTimes(Number(accepted || failedCommit));
 				if (accepted) expect(descriptors, mode).toMatchObject([{ fd: 0, alias: 0, type: "pipe", owned: true }, { fd: 3, alias: 0, type: "pipe", owned: true }, { fd: 8, alias: 8, type: "pipe", owned: true }]);
 			}
-			await compileBenchmarkHelper(root, { source: "message-probe.c", output: "message-probe", arguments: ["-Werror"], code: `#define _GNU_SOURCE
-${cHeaders("sys/wait.h unistd.h")}
-${rightsHelpers}
-int main(int argc, char **argv) {
-	if (argc != 3) return 70;
-	int fds[2]; if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) || fds[0] != 3 || fds[1] != 4) return 71;
-	int input = open(argv[1], O_RDONLY); if (input < 0 || dup2(input, 9) < 0) return 72; close(input);
-	int passed[2] = {9, 3};
-	if (write(4, "L", 1) != 1 || pass(4, "qI", 2, passed, 2, 0)) return 73;
-	if (pass(4, "t", 1, passed, 2, 0) || write(4, "bcaXYZ", 6) != 6) return 74;
-	if (*argv[2] == '1' && close(9)) return 79;
-	for (int repeat = 0; repeat < 2; repeat++) {
-		pid_t child = fork(); if (child < 0) return 75;
-		if (!child) { execl("/bin/true", "true", (char *)0); _exit(76); }
-		int status, cursor; socklen_t size = sizeof(cursor);
-		if (waitpid(child, &status, 0) != child || status || getsockopt(3, SOL_SOCKET, SO_PEEK_OFF, &cursor, &size) || cursor != -1) return 77;
-	}
-	for (int left = 10; left;) { char bytes[10]; ssize_t size = read(3, bytes, left); if (size <= 0 || write(1, bytes, size) != size) return 78; left -= size; }
-	return 0;
-}
-` });
 			for (const orphan of [false, true]) for (const mode of ["messages", "start", "end", "rights", "commit-failure", "cancel"]) {
 				const controller = new AbortController();
 				const pinCounts: number[] = [];
@@ -1815,7 +1841,7 @@ int main(int argc, char **argv) {
 					if (mode === "cancel") controller.abort();
 					return { kind: "replay", exitCode: 0, output: [{ fd: 1, data: Buffer.from("replayed:") }], descriptorOffsets, commit };
 				} });
-				const running = executor.execute(`'./message-probe' '${input}' ${Number(orphan)}`, { signal: controller.signal });
+				const running = executor.execute(`'${descriptorProbe}' message '${input}' ${Number(orphan)}`, { signal: controller.signal });
 				if (mode === "commit-failure") await expect(running).rejects.toMatchObject({ disposition: "poisoned" });
 				else if (mode === "cancel") await expect(running).rejects.toThrow();
 				else { expect(await running, mode).toEqual({ exitCode: 0 }); expect(executor.output, mode).toBe(`${mode === "messages" ? "replayed:replayed:" : ""}LqItbcaXYZ`); }
@@ -1823,44 +1849,11 @@ int main(int argc, char **argv) {
 				if (pinCounts.length === 2) expect(pinCounts[1]).toBe(pinCounts[0]);
 				if (mode === "cancel" || mode === "commit-failure") expect(executor.output).toBe("");
 			}
-			await compileBenchmarkHelper(root, { source: "queue-owners.c", output: "queue-owners", arguments: ["-Werror"], code: `#define _GNU_SOURCE
-${cHeaders("sys/eventfd.h sys/mman.h sys/wait.h sys/file.h poll.h stdint.h stdio.h stdlib.h unistd.h")}
-${rightsHelpers}
-int main(int argc, char **argv) {
-	if (argc != 3) return 70;
-	int state = atoi(argv[2]), local = state >= 3 && state <= 5, data[2], channel[2], gate[2], fd; char type = *argv[1], byte; uint64_t value = 5;
-	if (type == 's') { if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, data)) return 71; fd = data[0]; }
-	else if (type == 'c') fd = eventfd(5, EFD_NONBLOCK | EFD_CLOEXEC);
-	else { fd = memfd_create("queued-file", MFD_CLOEXEC); if (write(fd, &value, 8) != 8 || lseek(fd, 0, SEEK_SET)) return 71; }
-	if (fd < 0 || dup2(fd, 20) < 0 || dup2(fd, 21) < 0) return 72;
-	close(fd);
-	if (type == 'f' && local && flock(20, LOCK_EX | LOCK_NB)) return 72;
-	if (state) {
-		int reference = state == 2 || state >= 9 ? (type == 'c' ? eventfd(5, EFD_CLOEXEC) : open("/proc/self/fd/20", O_RDWR | O_CLOEXEC)) : 20;
-		if (state >= 7) reference = wrap_queue(state >= 9 ? reference : dup(reference), state == 10);
-		if (reference < 0 || socketpair(AF_UNIX, SOCK_STREAM | (local || state == 7 ? 0 : SOCK_CLOEXEC), 0, channel) || pass(channel[0], "x", 1, &reference, 1, 0)) return 73;
-		if (state == 2 || state >= 7) close(reference);
-		if (state == 6) { if (take(channel[1], 'x', &reference, 1, 0, 0)) return 74; close(reference); }
-	}
-	if (pipe2(gate, O_CLOEXEC)) return 75;
-	pid_t child = fork(); if (child < 0) return 75;
-	if (!child) { close(gate[1]); if (read(gate[0], &byte, 1) != 1) return 76; close(gate[0]); execl("/bin/true", "true", (char *)0); return 76; }
-	if (state) { close(20); close(21); } if (local) { close(channel[0]); close(channel[1]); }
-	close(gate[0]); if (write(gate[1], "x", 1) != 1) return 77; close(gate[1]);
-	int status; if (waitpid(child, &status, 0) != child || status) return 78;
-	if (type == 's') { struct pollfd ready = {.fd = data[1], .events = POLLIN | POLLRDHUP}; if (poll(&ready, 1, 0) < 0 || ((state == 1 || state >= 7) && ready.revents)) return 79; }
-	if (state && !local && state != 6) { if (take(channel[1], 'x', &fd, 1, 0, 0)) return 80; } else fd = 20;
-	if (state >= 7) { int nested = fd, rights[2]; if (take(nested, 'x', rights, state == 10 ? 2 : 1, 0, 0)) return 80; close(nested); fd = rights[0]; if (state == 10) close(rights[1]); }
-	if (type == 's') { if (state != 6) close(fd); struct pollfd ready = {.fd = data[1], .events = POLLIN | POLLRDHUP}; return poll(&ready, 1, 0) != 1 || read(data[1], &byte, 1) != 0; }
-	if (local) value = 0; else if (type == 'f') value = lseek(fd, 0, SEEK_CUR); else if (read(fd, &value, 8) != 8) return 81;
-	printf("%llu", (unsigned long long)value); return 0;
-}
-` });
 			for (const scenario of ["counter", "value", "identity", "alias", "overflow", "release", "commit-failure",
-				"counter:queued", "counter:other", "counter:local", "counter:partial", "counter:drained", "counter:nested", "counter:external-nested", "counter:external-other", "counter:external-cycle", "file:queued", "file:other", "file:local", "file:partial", "file:drained", "file:nested", "file:external-nested", "file:external-other", "file:external-cycle", "socket:queued", "socket:consumed", "socket:external-nested"]) {
+				"counter:queued", "counter:other", "counter:local", "counter:partial", "counter:drained", "counter:nested", "counter:external-nested", "counter:external-other", "counter:external-cycle", "counter:discarded", "counter:discard-nested", "counter:discard-cycle", "counter:peer-closed", "file:queued", "file:other", "file:local", "file:partial", "file:drained", "file:nested", "file:external-nested", "file:external-other", "file:external-cycle", "file:discarded", "file:discard-nested", "file:discard-cycle", "file:peer-closed", "socket:queued", "socket:consumed", "socket:external-nested"]) {
 				const [mode, queue] = scenario.split(":"), type = mode === "file" ? "file" : mode === "socket" ? "socket" : "counter";
-				const state = [undefined, "queued", "other", "local", "partial", "drained", "consumed", "nested", "external-nested", "external-other", "external-cycle"].indexOf(queue), local = state >= 3 && state <= 5;
-				const accepted = ["counter", "counter:other", "counter:drained", "counter:external-other", "counter:external-cycle", "file:queued", "file:other", "file:drained", "file:nested", "file:external-nested", "file:external-other", "file:external-cycle"].includes(scenario), outside: number[] = [];
+				const state = [undefined, "queued", "other", "local", "partial", "drained", "consumed", "nested", "external-nested", "external-other", "external-cycle", "discard-nested", "discard-cycle"].indexOf(queue === "discarded" || queue === "peer-closed" ? "drained" : queue), local = state >= 3 && state <= 5 || state >= 11;
+				const accepted = ["counter", "counter:other", "counter:drained", "counter:external-other", "counter:external-cycle", "counter:discarded", "counter:discard-nested", "file:queued", "file:other", "file:drained", "file:nested", "file:external-nested", "file:external-other", "file:external-cycle", "file:discarded", "file:discard-nested"].includes(scenario), outside: number[] = [];
 				const external = !queue || ["queued", "nested", "external-nested"].includes(queue);
 				const commit = vi.fn(async () => { if (mode === "commit-failure") throw new Error("counter commit failure"); });
 				const executor = held({ descriptors: true, decide: async process => {
@@ -1875,10 +1868,11 @@ int main(int argc, char **argv) {
 					const data = Buffer.alloc(8); data.writeBigUInt64LE(mode === "overflow" ? 0xffffffffffffffffn : 2n);
 					return { kind: "replay", exitCode: 0, output: [], descriptorOffsets, resourceEvents: [
 						...(queue === "drained" ? [{ fd: descriptorOffsets.find(fd => fd.messages)?.fd!, kind: "consume" as const, data: Buffer.from("x") }] : []),
+						...descriptorOffsets.filter(fd => queue?.startsWith("discard") ? fd.messages?.length : queue === "peer-closed" && fd.type === "socket" && !fd.messages).map(fd => ({ fd: fd.fd, kind: "release" as const, data: Buffer.from([3]) })),
 						...(type === "counter" ? [{ fd: 21, kind: "produce" as const, data }] : []),
 						...(local || type === "counter" && (mode === "release" || queue) ? [{ fd: 21, kind: "release" as const, data: Buffer.from([3]) }] : [])], commit };
 				} });
-				const running = executor.execute(`exec './queue-owners' ${type} ${state}`);
+				const running = executor.execute(`exec '${descriptorProbe}' queue ${type} ${state}`);
 				if (mode === "commit-failure") await expect(running).rejects.toMatchObject({ disposition: "poisoned" });
 				else { expect(await running, scenario).toEqual({ exitCode: 0 }); expect(executor.output, scenario).toBe(type === "socket" ? "" : local ? "0" : type === "file" ? external ? "1" : "0" : !queue && accepted ? "7" : "5"); }
 				expect(outside, scenario).toEqual([external ? 3 : 0, external ? 3 : 0]);

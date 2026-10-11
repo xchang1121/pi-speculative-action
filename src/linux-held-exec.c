@@ -2436,6 +2436,8 @@ static int resource_events(struct decision_job *job, int apply) {
 					queues[peer].eof = 1; queues[peer].shutdown = 3;
 					if (queues[object].length || packet_head) queues[peer].error = ECONNRESET;
 				}
+				for (unsigned cursor = 0; cursor < message_count; cursor++) if (messages[cursor].object == object) messages[cursor].object = -1;
+				queues[object].length = 0;
 			} else {
 				if (event->data[0] & 2) queues[object].eof = 1;
 				if (event->data[0] & 1) queues[object].shutdown |= 2;
