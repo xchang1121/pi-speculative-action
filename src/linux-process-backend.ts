@@ -40,7 +40,7 @@ import { observeStrace, straceCommand, traceTail, type ObservedProcessPath, type
 import type { WorkspaceTransactionOwnership } from "./workspace-transaction.ts";
 import type { ToolProcessInvocation } from "./tool-settlement.ts";
 import type { ResourceValidation } from "./settlement.ts";
-import { ProcessHandoffOwnership, ProcessHandoffRegistry, sameScope, type ProcessContinuation, type ProcessExecutionBinding, type ProcessHandoff, type ProcessHandoffLookup } from "./process-handoff.ts";
+import { ProcessHandoffOwnership, ProcessHandoffRegistry, sameScope, type ProcessContinuation, type ProcessExecutionBinding, type ProcessHandoff } from "./process-handoff.ts";
 import { WorkspaceSandboxService, readSandboxDirectoryState, restoreModifiedTimes, sameSandboxState, useModifiedTimesHelper, type SandboxDirectoryChange, type SandboxFileChange,
 	type SandboxWorkspaceChange, type SandboxWorkspaceContext } from "./workspace-sandbox.ts";
 import { containsFilesystemPath as pathContains, relativeFilesystemPath, slash } from "./path-utils.ts";
@@ -907,14 +907,11 @@ export class LinuxProcessReuseBackend {
 				preparation = captured.computation;
 			}
 			const weakKey = processWeakKey(prototype), executablePath = prototype.executablePath;
-			const acquired = await TimelineInterval.outside(() => this.acquireProcessResult(
-				weakKey,
-				(live, excludedCertificates, artifacts) => this.plan(weakKey, executablePath, session.projection, (candidate) => compatibleProducer(session.nestedProducer, candidate), { session, live, excludedCertificates, artifacts }),
-				session.signal,
-				session.scope,
-				{ ownership: session.ownership, executablePath },
-			));
-			if (acquired.plan?.kind === "completed_replay") {
+			const acquired = await TimelineInterval.outside(() => this.handoffs.acquire({
+				key: weakKey, signal: session.signal, scope: session.scope, role: "producer", ownership: session.ownership, executablePath,
+				lookup: (live, excludedCertificates, artifacts) => this.plan(weakKey, executablePath, session.projection, (candidate) => compatibleProducer(session.nestedProducer, candidate), { session, live, excludedCertificates, artifacts }),
+			}));
+			if (acquired.kind === "hit" && acquired.plan.kind === "completed_replay") {
 				const plan = acquired.plan;
 				return TimelineInterval.outside(async () => {
 					const before = captureWorkspace ? await session.workspace.structure.capture() : undefined;
@@ -930,7 +927,7 @@ export class LinuxProcessReuseBackend {
 					return result;
 				}).finally(() => acquired.settle?.(false));
 			}
-			if (!acquired.work) throw new Error("process work reservation failed");
+			if (acquired.kind !== "work") throw new Error("process work reservation failed");
 			this.add(session, "misses");
 			try {
 				recordPrototypePreparation(session, preparation, inPlace);
@@ -939,41 +936,6 @@ export class LinuxProcessReuseBackend {
 				this.handoffs.complete(weakKey, acquired.work);
 			}
 		}, inPlace);
-	}
-
-	private async acquireProcessResult(
-		weakKey: Sha256Digest,
-		lookup: ProcessHandoffLookup<ReadyProcessPlan>,
-		signal: AbortSignal | undefined,
-		scope: ExecutionScope | undefined,
-		participant: { readonly actor: true } | { readonly ownership: ProcessHandoffOwnership; readonly executablePath: string },
-	): Promise<{ readonly plan?: ReadyProcessPlan; readonly work?: ProcessHandoff; readonly producer?: ProcessHandoff; readonly continuation?: ProcessContinuation;
-		readonly waiting?: readonly TimelineInterval[]; readonly joined: boolean; readonly settle?: (consumed: boolean) => void }> {
-		const waits: { readonly handoff: ProcessHandoff; readonly interval: TimelineInterval }[] = [];
-		const acquired = await this.handoffs.acquire({
-			key: weakKey,
-			scope,
-			signal,
-			lookup,
-			...("actor" in participant ? {
-				role: "actor" as const,
-				waitForRunning: async (running: ProcessHandoff, changed: AbortSignal) => {
-					if (!running.ownership.acceptsScope(running.scope, scope, true)) return "rejected";
-					if (await running.inputsChanged?.()) return "rejected";
-					const waitStarted = performance.now();
-					const waiting = new AbortController(), stop = AbortSignal.any([changed, waiting.signal, ...(signal ? [signal] : [])]);
-					const completion = running.suspend ? running.suspend(stop).then(() => running.completion) : running.completion;
-					const finished = await waitForCompletion(completion, stop).finally(() => waiting.abort());
-					const interval = new TimelineInterval(waitStarted, performance.now());
-					waits.push({ handoff: running, interval });
-					if (finished.status === "completed") return "completed";
-					signal?.throwIfAborted();
-					return "miss";
-				},
-			} : { role: "producer" as const, ownership: participant.ownership, executablePath: participant.executablePath }),
-		});
-		return acquired.kind === "hit" ? { ...acquired,
-			waiting: waits.filter(wait => wait.handoff === acquired.producer).map(wait => wait.interval) } : acquired;
 	}
 
 	private async plan(
@@ -1090,11 +1052,11 @@ export class LinuxProcessReuseBackend {
 			const prototype = bufferedProcessPrototype(snapshot, projection, digest, await this.resolvePlatformFingerprint());
 			const weakKey = processWeakKey(prototype);
 			const accepted = (producer: ProcessProducerProof) => actorReplayProducer(producer, sensitivePaths(this.options.storeRoot, this.options.deniedPaths));
-			const acquired = await this.acquireProcessResult(weakKey,
-				(live, excludedCertificates, artifacts) => this.plan(weakKey, executablePath, projection, accepted, { live, artifacts, excludedCertificates, continuation: true, signal: process.signal }), process.signal, scope, { actor: true });
-			const { plan, continuation } = acquired;
-			settle = acquired.settle;
-			if (!plan || (plan.certificate.result.continuation ? !continuation || sha256Digest(continuation.image) !== plan.certificate.result.continuation.imageDigest :
+			const result = await this.handoffs.acquire({ key: weakKey, scope, signal: process.signal, role: "actor",
+				lookup: (live, excludedCertificates, artifacts) => this.plan(weakKey, executablePath, projection, accepted, { live, artifacts, excludedCertificates, continuation: true, signal: process.signal }) });
+			const acquired = result.kind === "hit" ? result : undefined, { plan, continuation } = acquired ?? {};
+			settle = acquired?.settle;
+			if (!acquired || !plan || (plan.certificate.result.continuation ? !continuation || sha256Digest(continuation.image) !== plan.certificate.result.continuation.imageDigest :
 				plan.certificate.result.exit.kind !== "code")) {
 				this.addActor("misses");
 				return measured({ kind: "continue", ...(learning ? { observeCompletion: (durationMs: number | undefined) => {
@@ -1290,10 +1252,9 @@ export class LinuxProcessReuseBackend {
 				inheritedFiles: inheritedFiles.map(file => file.fd),
 				...(live ? { onControl: (channel: import("node:stream").Duplex, wake: () => boolean) => {
 					let suspended: Promise<void> | undefined;
-					const release = this.handoffs.observeRunning(weakKey, work, "suspend", joinSignal => suspended ??= (async () => {
+					const release = this.handoffs.observeRunning(weakKey, work, "suspend", () => suspended ??= (async () => {
 						const executionSignal = AbortSignal.any([session.signal, work.signal]);
-						const stop = AbortSignal.any([executionSignal, ...(joinSignal ? [joinSignal] : [])]);
-						const frontier = await this.requestProcessImageAtFrontier(descriptorReportPath!, channel, wake, stop, executionSignal);
+						const frontier = await this.requestProcessImageAtFrontier(descriptorReportPath!, channel, wake, executionSignal);
 						if (!frontier) return;
 						const { pid, reply } = frontier;
 						suspensionAttempted = true;
@@ -1526,24 +1487,23 @@ export class LinuxProcessReuseBackend {
 		}
 	}
 
-	/** Retry safe declines until the producer finishes or the Actor cancels its join. */
+	/** Retry safe declines while this producer owns the control channel, independently of any one consumer. */
 	private async requestProcessImageAtFrontier(descriptorReportPath: string, channel: import("node:stream").Duplex,
-		wake: () => boolean, stop: AbortSignal, executionSignal: AbortSignal): Promise<{ pid: number; reply: Buffer } | undefined> {
-		while (!stop.aborted) {
+		wake: () => boolean, signal: AbortSignal): Promise<{ pid: number; reply: Buffer } | undefined> {
+		while (!signal.aborted) {
 			const report = await readFile(descriptorReportPath, "utf8").catch(() => ""), ready = /^RUNNING (\d+)\n$/.exec(report);
 			if (ready) {
 				const pid = Number(ready[1]);
 				const state = await readFile(`/proc/${pid}/syscall`, "utf8").catch(() => "");
 				if (!state) return;
-				if (!stop.aborted) {
+				if (!signal.aborted) {
 					// The tracer stops at a blocked I/O call or the next admissible syscall entry, before its effects.
-					// Drain a sent request even after Actor cancellation, so a late reply cannot belong to another request.
-					const reply = await requestProcessImage(pid, channel, wake, executionSignal);
+					const reply = await requestProcessImage(pid, channel, wake, signal);
 					if (reply.readInt32LE(0) !== 0) return { pid, reply };
 				}
 			} else if (report.startsWith("OFD ")) return;
 			// CPU work and transient non-I/O syscalls may still reach an admissible frontier.
-			if (!stop.aborted) await delay(10, undefined, { signal: stop }).catch(() => undefined);
+			if (!signal.aborted) await delay(10, undefined, { signal }).catch(() => undefined);
 		}
 	}
 

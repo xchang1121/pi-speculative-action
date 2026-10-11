@@ -5,7 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, expect, test, vi } from "vitest";
 import { ArtifactCAS, captureFileDependency, ProcessReusePlanner, ProvenanceCertificateStore, referencedArtifacts, sealProcessCertificate, sha256Digest,
 	type ProcessProvenanceCertificate, type VerifiedArtifactClosure } from "../src/process-reuse.ts";
-import { ProcessHandoffOwnership, ProcessHandoffRegistry, type ProcessHandoff } from "../src/process-handoff.ts";
+import { ProcessHandoffOwnership, ProcessHandoffRegistry } from "../src/process-handoff.ts";
 import { effectCommitFailure } from "../src/effect-transaction.ts";
 import { waitForCompletion } from "../src/scheduler.ts";
 import { TaskTimeline, TimelineInterval } from "../src/task-timing.ts";
@@ -55,11 +55,10 @@ async function fixture(options: ConstructorParameters<typeof ProvenanceCertifica
 	const reserve = async (ownership = new ProcessHandoffOwnership()) => {
 		const result = await registry.acquire({ ...common, ownership, role: "producer", executablePath: request.executablePath });
 		if (result.kind !== "work") throw new Error("expected producer");
+		registry.observeRunning(common.key, result.work, "inputsChanged", async () => true);
 		return result.work;
 	};
-	const actor = (options: { signal?: AbortSignal; lookup?: typeof lookup;
-		waitForRunning?: (work: ProcessHandoff, signal: AbortSignal) => Promise<"completed" | "miss" | "rejected"> } = {}) =>
-		registry.acquire({ ...common, role: "actor", waitForRunning: async () => "miss", ...options });
+	const actor = (options: { signal?: AbortSignal; lookup?: typeof lookup } = {}) => registry.acquire({ ...common, role: "actor", ...options });
 	const publish = (work: Awaited<ReturnType<typeof reserve>>, value: string, createdAt = 1, oneShot = true, computation?: TimelineInterval) => store.withPublication(async () => {
 		const produced = await produce(value, createdAt, oneShot), certificate = computation ? sealProcessCertificate({ ...produced,
 			result: { ...produced.result, computation: TimelineInterval.serialize(computation) } }) : produced;
@@ -209,17 +208,15 @@ test.each(["scan", "deletion", "clear"])("preserves publications from both owner
 });
 
 test.each(["existing", "new"])("selects a %s ready producer and retains its complete result through collection, borrowing and eviction", async arrival => {
-	const f = await fixture(), first = await f.reserve(), entered = deferred(), stopped = deferred();
+	const f = await fixture(), first = await f.reserve(), entered = deferred();
 	let second = arrival === "existing" ? await f.reserve() : undefined;
-	const actor = track(f.actor({ waitForRunning: async (running, signal) => {
-		entered.resolve(); const result = await waitForCompletion(running.completion, signal); if (signal.aborted) stopped.resolve();
-		return result.status === "completed" ? "completed" : "miss";
-	} }));
+	f.registry.observeRunning(f.request.weakKey, first, "inputsChanged", async () => { entered.resolve(); return false; });
+	const actor = track(f.actor());
 	await entered.promise; const broken = await f.produce("broken", 0, true);
 	await unlink(f.store.artifacts.artifactPath(referencedArtifacts(broken)[0]!.digest));
 	await expect(f.registry.publish(f.request.weakKey, first, broken, async () => false)).rejects.toThrow("complete owned result");
 	second ??= await f.reserve(); await f.publish(second, "fast result");
-	expect(await f.consume(actor, "fast result")).toMatchObject({ producer: second }); await stopped.promise;
+	expect(await f.consume(actor, "fast result")).toMatchObject({ producer: second, waiting: [] }); expect(first.signal.aborted).toBe(false);
 	const later = await f.reserve();
 	const graph = new TimelineInterval(0, 10, Array.from({ length: 8192 }, (_, index) => ({ computation: new TimelineInterval(index, index + 1), reused: true })));
 	f.registry.configure(8, 8 * 1024 * 1024);
@@ -229,11 +226,10 @@ test.each(["existing", "new"])("selects a %s ready producer and retains its comp
 	const restore = async () => {
 		await writeFile(f.input, "current input"); await f.registry.publish(f.request.weakKey, later, changed, async () => false);
 	};
-	// Reconsider the old result both after a joined completion and after publication during history lookup.
+	// Reconsider the old result after publication during join preparation or history lookup.
+	f.registry.observeRunning(f.request.weakKey, later, "inputsChanged", async () => { await restore(); return false; });
 	await f.consume(f.actor({ lookup: async (...args) => {
 		const plan = await f.lookup(...args); if (!args[0] && arrival === "new") await restore(); return plan;
-	}, waitForRunning: async (running, signal) => {
-		await restore(); return (await waitForCompletion(running.completion, signal)).status === "completed" ? "completed" : "miss";
 	} }), "slow result");
 	await f.store.put(await f.produce("saved", 3));
 	const reference = referencedArtifacts(slow)[0]!, target = f.store.artifacts.artifactPath(reference.digest), borrowed = await f.actor();

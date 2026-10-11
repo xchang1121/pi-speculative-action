@@ -64,8 +64,8 @@ export interface ProcessHandoff {
 	readonly startedAt: number;
 	/** A running owner's bounded negative lookup; false never authorizes adoption. */
 	readonly inputsChanged?: () => Promise<boolean>;
-	/** Owned producer may freeze a proved frontier; completion still seals its evidence. */
-	readonly suspend?: (signal?: AbortSignal) => Promise<void>;
+	/** The producer owns a requested frontier through sealing; consumers only cancel their waits. */
+	readonly suspend?: () => Promise<void>;
 }
 
 export interface ProcessContinuation { readonly image: Buffer; readonly physicalRoot: string; readonly computation: TimelineInterval; }
@@ -97,6 +97,7 @@ interface HandoffRecord extends ProcessHandoff {
 
 export type ProcessHandoffAcquisition<Plan> =
 	| { readonly kind: "hit"; readonly plan: Plan; readonly joined: boolean; readonly producer?: ProcessHandoff; readonly continuation?: ProcessContinuation;
+		readonly waiting?: readonly TimelineInterval[];
 		readonly settle?: (consumed: boolean) => void }
 	| { readonly kind: "work"; readonly work: ProcessHandoff; readonly joined: boolean }
 	| { readonly kind: "miss"; readonly joined: boolean };
@@ -114,7 +115,7 @@ type AcquireOptions<Plan> = {
 	readonly lookup: ProcessHandoffLookup<Plan>;
 } & (
 	| { readonly role: "producer"; readonly ownership: ProcessHandoffOwnership; readonly executablePath: string }
-	| { readonly role: "actor"; readonly waitForRunning: (handoff: ProcessHandoff, signal: AbortSignal) => Promise<"completed" | "miss" | "rejected">; }
+	| { readonly role: "actor" }
 );
 
 /** Owns process evidence selection and the scope of one-shot transfers. */
@@ -218,18 +219,20 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		return false;
 	}
 
-	/** The running state owns lookup access; completion or release revokes even a borrowed callback. */
+	/** Running capabilities are observable state; completion or withdrawal revokes even a borrowed callback. */
 	observeRunning<Key extends "inputsChanged" | "suspend">(key: Sha256Digest, handoff: ProcessHandoff, capability: Key, invoke: NonNullable<ProcessHandoff[Key]>): () => void {
 		const record = this.byKey.get(key)?.get(handoff), state = record?.state;
 		if (!record || state?.status !== "running") return () => {};
-		const owned = (signal?: AbortSignal) => record.state === state && state[capability] === owned ? invoke(signal) : Promise.resolve(capability === "inputsChanged" ? false : undefined);
+		const owned = () => record.state === state && state[capability] === owned ? invoke() : Promise.resolve(capability === "inputsChanged" ? false : undefined);
 		Object.assign(state, { [capability]: owned });
-		return () => { if (state[capability] === owned) state[capability] = undefined; };
+		this.wake(key);
+		return () => { if (state[capability] === owned) { state[capability] = undefined; this.wake(key); } };
 	}
 
 	async acquire<Plan extends { readonly certificate: ProcessProvenanceCertificate }>({ scope, ...request }: AcquireOptions<Plan>): Promise<ProcessHandoffAcquisition<Plan>> {
 		scope = snapshotExecutionScope(scope);
 		let joined = false;
+		const waits: { readonly handoff: ProcessHandoff; readonly interval: TimelineInterval }[] = [];
 		const borrowed = new Set<HandoffRecord>();
 		const retain = (record: HandoffRecord) => { if (!borrowed.has(record)) { borrowed.add(record); record.borrowers++; } };
 		try {
@@ -268,7 +271,8 @@ export class ProcessHandoffRegistry<Invocation = never> {
 								if (oneShot) record.state = { ...state, status: "reserved" };
 								record.borrowers++;
 								let pending = true;
-								return { kind: "hit", plan, joined, producer: record, continuation: record.continuation, settle: consumed => {
+								return { kind: "hit", plan, joined, producer: record, continuation: record.continuation,
+									waiting: waits.filter(wait => wait.handoff === record).map(wait => wait.interval), settle: consumed => {
 									if (!pending) return;
 									pending = false; claim?.(consumed); record.borrowers--;
 									if (oneShot && this.byKey.get(request.key)?.has(record)) {
@@ -281,15 +285,21 @@ export class ProcessHandoffRegistry<Invocation = never> {
 						}
 						if (request.role === "producer") return { kind: "work", work: this.reserve(request.key, request.executablePath, request.ownership, scope), joined };
 						// Waiting grants no transfer authority; acquisition rechecks the live consumer after validation.
-						const running = records.find((record) => !considered.has(record) && record.state.status === "running" && record.ownership.acceptsScope(record.scope, scope, true)) ??
-							records.find((record) => !considered.has(record) && record.state.status === "running" && scope && record.scope?.sessionID === scope.sessionID);
+						const running = records.find((record) => !considered.has(record) && record.state.status === "running" && record.ownership.acceptsScope(record.scope, scope, true));
 						const waitingOn = running ?? records.find(record => (record.state.status === "reserved" || record.ownership.pendingWhole) && record.ownership.acceptsScope(record.scope, scope, true));
 						if (!waitingOn) return { kind: "miss", joined };
 						retain(waitingOn);
+						if (running) {
+							const inputs = await waitForCompletion(running.inputsChanged?.() ?? Promise.resolve(false), stop);
+							if (inputs.status === "aborted" || stop.aborted) break;
+							if (inputs.value) { considered.set(running, undefined); continue; }
+						}
 						// Any newly available result may win, including a producer registered after this pass began.
-						const completion = running ? request.waitForRunning(running, stop) : waitingOn.ownership.pendingWhole?.then(() => "completed" as const, () => "completed" as const) ?? new Promise<never>(() => {});
-						const waiting = await waitForCompletion(completion, stop);
-						if (waiting.status === "completed" && waiting.value !== "completed") { considered.set(waitingOn, undefined); continue; }
+						const startedAt = performance.now();
+						const completion = running ? running.suspend?.().then(() => running.completion) ?? running.completion :
+							waitingOn.ownership.pendingWhole?.then(() => {}, () => {}) ?? new Promise<never>(() => {});
+						await waitForCompletion(completion, stop);
+						waits.push({ handoff: waitingOn, interval: new TimelineInterval(startedAt, performance.now()) });
 						joined = true;
 						break;
 					}

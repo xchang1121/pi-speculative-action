@@ -28,7 +28,7 @@ import type { ExecutionOperationBinding } from "../src/execution-world.ts";
 import { createSpeculativeActionHost } from "../src/agent-integration.ts";
 import { PatternAwareStore, patternAwareSettings, patternAwareActionSemantics } from "../src/pattern-aware.ts";
 import type { SpeculativeActionEvent } from "../src/events.ts";
-import { TaskTimeline } from "../src/task-timing.ts";
+import { TaskTimeline, TimelineInterval, type TimelineDependency } from "../src/task-timing.ts";
 import { testModel } from "./model.ts";
 import type { WorkspaceTransactionCapture } from "../src/workspace-transaction.ts";
 import { commitBenchmarkFixture, compileBenchmarkHelper, cHeaders, processTest as test, executeProcess, forkReusableBash, prepareLinuxProcessReuse,
@@ -377,27 +377,58 @@ int main(void) {
 		const handoffs = Reflect.get(fixture.backend, "handoffs") as ProcessHandoffRegistry<{ executable: string }>;
 		const publishing = vi.spyOn(handoffs, "publish");
 		let binding: ProcessExecutionBinding | undefined;
-		const actor = () => fixture.backend.observeBindings(scope,
-			() => executeProcess(fixture, route.executor, command, { scope, signal: AbortSignal.timeout(20_000) }),
-			bindings => { binding ??= bindings.find(candidate => handoffs.resolveBinding(candidate, scope)?.executable.endsWith("/worker")); }, true).then(result => result.output);
-		const seed = await actor(); expect(binding).toBeDefined();
+		const actor = (signal = AbortSignal.timeout(20_000)) => {
+			let computations: readonly TimelineDependency[] = [];
+			return TimelineInterval.measure(() => fixture.backend.observeBindings(scope,
+				() => executeProcess(fixture, route.executor, command, { scope, signal }),
+				(bindings, observed) => { computations = observed; binding ??= bindings.find(candidate => handoffs.resolveBinding(candidate, scope)?.executable.endsWith("/worker")); }, true), () => computations);
+		};
+		const seed = (await actor()).output.output; expect(binding).toBeDefined();
 		await rm(path.join(fixture.workspace, "prefix-ready"));
 		const invocation = resolvePiToolInvocation("bash", { command: "exit 97" }, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath })!.process!;
 		await fixture.workspaceSandbox.withWorkspace(fixture.workspace, async workspace => {
 			const session = await fixture.backend.open({ sourceRoot: fixture.workspace, workspace, invocation, scope });
+			const starting = gated(), frontier = gated(), controller = new AbortController();
+			const acquire = handoffs.acquire.bind(handoffs), observe = handoffs.observeRunning.bind(handoffs), wait = scheduling.waitForCompletion;
+			let completion: Promise<void> | undefined, joins = 0, cancelled: Promise<unknown> | undefined;
+			const acquiring = vi.spyOn(handoffs, "acquire").mockImplementation(async request => {
+				const result = await acquire(request);
+				if (mode === "sample" && result.kind === "work") { completion = result.work.completion; await starting.wait(); }
+				return result;
+			});
+			const joining = vi.spyOn(scheduling, "waitForCompletion").mockImplementation((promise, signal, timeout) => {
+				if (promise === completion) starting.release(); return wait(promise, signal, timeout);
+			});
+			const observing = vi.spyOn(handoffs, "observeRunning").mockImplementation((key, work, capability, invoke) =>
+				observe(key, work, capability, capability !== "suspend" ? invoke : async (...args: Parameters<typeof invoke>) => {
+					if (mode === "threads" && ++joins === 2) { controller.abort(); frontier.release(); } await invoke(...args);
+				}));
+			const target = fixture.backend as unknown as { requestProcessImageAtFrontier(...args: unknown[]): Promise<unknown> }, request = target.requestProcessImageAtFrontier.bind(target);
+			const requesting = vi.spyOn(target, "requestProcessImageAtFrontier").mockImplementation(async (...args) => {
+				if (mode === "threads") await frontier.wait(); return request(...args);
+			});
 			const pending = session.executeBinding(binding!), settled = pending.catch(() => undefined);
 			try {
-				await expect.poll(() => existsSync(path.join(workspace.sandboxRoot, "prefix-ready"))).toBe(true);
+				if (mode === "sample") await starting.entered;
+				else await expect.poll(() => existsSync(path.join(workspace.sandboxRoot, "prefix-ready"))).toBe(true);
 				expect(existsSync(path.join(fixture.workspace, "prefix-ready"))).toBe(false);
-				const actual = await actor(), fields = actual.trim().split(":");
+				if (mode === "threads") { cancelled = actor(controller.signal).catch(() => undefined); await frontier.entered; }
+				const issuedAt = performance.now(), actual = await actor(), fields = actual.output.output.trim().split(":");
+				const timing = new TaskTimeline(issuedAt).recordCall([{ computation: actual.computation }], issuedAt, performance.now());
 				expect(fields).toHaveLength(4); expect(fields[0]).toBe(fields[1]); expect(fields[2]).toBe(seed.trim().split(":")[2]);
 				expect(fields[3]).not.toBe(seed.trim().split(":")[3]);
 				expect(fixture.backend.actorMetrics().joinedHits, JSON.stringify(fixture.backend.metrics())).toBe(mode === "identity" ? 0 : 1);
 				if (mode !== "identity") {
 					expect(await pending).toMatchObject({ suspended: true });
-					expect(publishing.mock.calls.some(([, , certificate]) => certificate?.result.continuation)).toBe(true);
+					const continuation = publishing.mock.calls.find(([, , certificate]) => certificate?.result.continuation)?.[4];
+					expect(continuation).toBeDefined(); expect(timing.reused).toBe(true);
+					expect(timing.toolComputeMs).toBeGreaterThanOrEqual(timing.hiddenComputeMs);
+					if (mode === "sample") expect(new TaskTimeline(issuedAt).recordTool(continuation!.computation, issuedAt, true).hiddenComputeMs).toBe(0);
 				}
-			} finally { await session.close(); await settled; }
+			} finally {
+				controller.abort(); starting.release(); frontier.release(); await session.close(); await settled; await cancelled;
+				acquiring.mockRestore(); joining.mockRestore(); observing.mockRestore(); requesting.mockRestore();
+			}
 		}, { liveLower: true });
 		publishing.mockRestore();
 	});
