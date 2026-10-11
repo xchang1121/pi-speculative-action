@@ -47,9 +47,7 @@ export class ArtifactCAS {
 	async put(value: string | Uint8Array): Promise<ArtifactReference> {
 		const bytes = typeof value === "string" ? Buffer.from(value, "utf8") : value;
 		const reference = Object.freeze({ digest: await sha256DigestAsync(bytes), size: bytes.byteLength }), target = this.artifactPath(reference.digest);
-		// A present object at its size holds these bytes already (see has): renewing it replaces writing them again.
-		if (!(await this.has(reference) && await renew(target))) await publishImmutable(target, bytes);
-		if (!(await this.has(reference))) throw new Error(`artifact publication failed for ${reference.digest}`);
+		await publishImmutable(target, bytes);
 		return reference;
 	}
 
@@ -61,7 +59,7 @@ export class ArtifactCAS {
 		return bytes;
 	}
 
-	/** Present at its size: content-addressed objects are published whole and checked when read for use. */
+	/** Availability hint only; publication and adoption verify content. */
 	async has(reference: ArtifactReference): Promise<boolean> {
 		if (!isSha256Digest(reference.digest)) throw new Error("invalid artifact reference");
 		const info = await stat(this.artifactPath(reference.digest)).catch((error): undefined => { if (!missing(error)) throw error; });
@@ -152,8 +150,8 @@ export class ProvenanceCertificateStore {
 			for (const reference of referencedArtifacts(owned)) {
 				if (!(await this.artifacts.has(reference))) throw new Error(`certificate references missing artifact ${reference.digest}`);
 			}
-			const published = await publishImmutable(this.certificatePath(owned.id), Buffer.from(stableStringify(owned), "utf8"));
-			if ((await this.get(owned.id))?.id !== owned.id) throw new Error("certificate publication failed");
+			const published = await publishImmutable(this.certificatePath(owned.id), Buffer.from(stableStringify(owned), "utf8"),
+				bytes => parseProcessCertificate(JSON.parse(bytes.toString("utf8")))?.id === owned.id);
 			await publishImmutable(this.weakReferencePath(owned), new Uint8Array());
 			return published;
 		});
@@ -351,7 +349,14 @@ async function filesUnder(root: string): Promise<readonly string[]> {
 	} catch (error) { if (missing(error)) return []; throw error; }
 }
 
-async function publishImmutable(target: string, bytes: Uint8Array): Promise<boolean> {
+/** Preserve verified objects; a new complete publication atomically replaces a corrupt copy. */
+async function publishImmutable(target: string, bytes: Uint8Array, verify = (stored: Buffer) => stored.equals(bytes)): Promise<boolean> {
+	const present = async () => {
+		const stored = await readOptional(target);
+		try { if (!stored || !verify(stored)) return false; } catch { return false; }
+		return renew(target);
+	};
+	if (await present()) return false;
 	await mkdir(path.dirname(target), { recursive: true });
 	const temporary = path.join(path.dirname(target), `.${path.basename(target)}.${process.pid}.${randomUUID()}.tmp`);
 	// Exclusive creation grants cleanup ownership; an existing temporary belongs to another publisher.
@@ -360,8 +365,8 @@ async function publishImmutable(target: string, bytes: Uint8Array): Promise<bool
 		try { await writeFile(file, bytes); } finally { await file.close(); }
 		try { await link(temporary, target); return true; } catch (error) {
 			if (!hasErrorCode(error, "EEXIST")) throw error;
-			await renew(target);
-			return false;
+			if (await present()) return false;
+			await rename(temporary, target); return true;
 		}
 	} finally {
 		await rm(temporary, { force: true });

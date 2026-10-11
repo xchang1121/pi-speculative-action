@@ -76,11 +76,15 @@ test("reconstructs new searches from captured inputs across turns and observes n
 	} finally { await f.dispose(); await profile.pool.dispose(); }
 });
 
-test.for(["in-place", "git"] as const)("keeps speculative effects private and refuses stale preimages (%s)", async driver => {
+test.for(["in-place", "git"] as const)("keeps effects private, retries restored preimages and transfers an aborted claim (%s)", async driver => {
 	const cwd = await directories.create(), sandbox = new WorkspaceSandboxService(), file = path.join(cwd, "notes.txt");
 	await writeFile(file, "one two\n"); await link(file, path.join(cwd, "alias.txt"));
+	const entered = deferred(), release = deferred(), secondResolved = deferred(), controller = new AbortController();
+	let hold = false, waiting = false, first: Promise<unknown> | undefined, second: Promise<unknown> | undefined;
 	const f = systemHost(cwd, [createEditTool(cwd), createReadTool(cwd)], {
 		executionWorlds: [sandbox.createExecutionWorld(driver === "git" ? { driver, inPlaceMutations: false } : {})],
+		preflight: async () => { if (hold) { hold = false; waiting = true; entered.resolve(); await release.promise; } return true; },
+		resolveInvocation: (tool, input) => { if (waiting) secondResolved.resolve(); return resolvePiToolInvocation(tool, input, { cwd, environment: {} }); },
 	});
 	try {
 		await f.start();
@@ -92,11 +96,17 @@ test.for(["in-place", "git"] as const)("keeps speculative effects private and re
 		await f.execute("edit", args);
 		expect(await readFile(file, "utf8")).toBe("changed three\n");
 		expect(textOutput(await f.execute("read", { path: "alias.txt" }))).toBe("changed three\n");
+		await writeFile(file, "one two\n"); hold = true;
+		first = f.execute("edit", args, controller.signal).catch(error => error); await entered.promise;
+		second = f.execute("edit", args); await secondResolved.promise; await new Promise<void>(setImmediate);
+		expect(f.fallbacks.filter(tool => tool === "edit")).toEqual(["edit"]); expect(await readFile(file, "utf8")).toBe("one two\n");
+		controller.abort(); release.resolve(); await first; await second;
+		expect(await readFile(file, "utf8")).toBe("one three\n"); expect(f.fallbacks.filter(tool => tool === "edit")).toEqual(["edit", "edit"]);
 		await f.finish(); await f.start("discard");
 		await f.preview("edit", { path: "notes.txt", edits: [{ oldText: "three", newText: "discarded" }] });
 		await f.ready(2);
-	} finally { await f.dispose(); await sandbox.dispose(); }
-	expect(await readFile(file, "utf8")).toBe("changed three\n");
+	} finally { controller.abort(); release.resolve(); await Promise.allSettled([first, second]); await f.dispose(); await sandbox.dispose(); }
+	expect(await readFile(file, "utf8")).toBe("one three\n");
 });
 
 test.each(["ordered", "independent", "dependent"])("adopts only the proven effects of a predicted workflow across prompts (%s)", async order => {
@@ -127,14 +137,14 @@ test.each(["ordered", "independent", "dependent"])("adopts only the proven effec
 		await f.finish(true);
 		if (order === "dependent") {
 			await f.start("missing-parent"); await expect(f.execute(steps[1]!.tool, steps[1]!.input)).rejects.toThrow();
-			expect(await readFile(file, "utf8")).toBe("original\n"); return;
+			expect(await readFile(file, "utf8")).toBe("original\n"); await f.finish();
 		}
 		for (const [index, step] of steps.entries()) {
 			if (order === "independent" && index < 2) continue;
 			await f.start(`step-${index}`);
 			await f.execute(step.tool, step.input); await f.finish();
 		}
-		expect(f.fallbacks).toEqual([]);
+		expect(f.fallbacks).toEqual(order === "dependent" ? ["edit"] : []);
 		const expected = order === "independent" ? "final\n" : "final\nbeta\n";
 		expect(await readFile(file, "utf8")).toBe(expected);
 		expect(await readFile(path.join(cwd, "alias.txt"), "utf8")).toBe(expected);
@@ -180,7 +190,8 @@ test.for(["unrelated", "changed", "descendant"])("retains native workflow result
 
 test("reselects later read results, retains queries across turns and observes changed bytes", async () => {
 	const cwd = await directories.create(), reader = createReadTool(cwd);
-	await writeFile(path.join(cwd, "notes.txt"), Array.from({ length: 20 }, (_, i) => `line ${i + 1}`).join("\n"));
+	const file = path.join(cwd, "notes.txt"), original = Array.from({ length: 20 }, (_, i) => `line ${i + 1}`).join("\n");
+	await writeFile(file, original);
 	const world = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: ["read"], maxBytes: () => 1024 * 1024 });
 	const computed = deferred(), release = deferred(), entered = deferred();
 	let runs = 0;
@@ -203,6 +214,9 @@ test("reselects later read results, retains queries across turns and observes ch
 			expect(await f.execute("read", input)).toEqual(await reader.execute("reference", input));
 		expect({ runs, fallbacks: f.fallbacks }).toEqual({ runs: 2, fallbacks: [] });
 		await f.execute("write", { path: "notes.txt", content: "new\n" });
-		expect(textOutput(await f.execute("read", { path: "notes.txt" }))).toBe("new\n");
+		const wide = { path: "notes.txt", offset: 1, limit: 10 };
+		expect(textOutput(await f.execute("read", wide))).toBe("new\n");
+		await writeFile(file, original); expect(await f.execute("read", wide)).toEqual(await reader.execute("restored", wide)); await f.finish();
+		expect(f.events.filter(event => event.type === "actor_action").at(-1)?.settlement.provider).toMatchObject({ kind: "speculative", match: { kind: "exact" } });
 	} finally { release.resolve(); await actor; await f.dispose(); }
 });

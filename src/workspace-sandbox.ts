@@ -12,7 +12,7 @@ import type { WorldBranch, WorldCheckpoint, WorldExecutionMetrics } from "./exec
 import { advanceFilesystemClock, assertNoSymlinkPath, captureFilesystemEntry, captureStableFile, fileIdentity, mapFilesystem, sameFilesystemIdentity,
 	settledIdentity, sharedWalk } from "./filesystem-evidence.ts";
 import { WORKSPACE_PATH_MUTATION_EFFECTS } from "./effect-model.ts";
-import { effectCommitFailure } from "./effect-transaction.ts";
+import { EffectCommit, effectCommitFailure } from "./effect-transaction.ts";
 import { LinuxOverlayfsCapabilityRegistry, LinuxOverlayfsUnsafeCleanupError, mountLinuxOverlayfs, openLinuxAnonymousWorkspaceFile,
 	type LinuxOverlayfsMount, type LinuxOverlayfsOptions } from "./linux-overlayfs.ts";
 import { captureWorkspaceStructure, captureWorkspaceStructureEntry, statChangeDigest, workspaceStructureSnapshot, directoryEntriesDigest,
@@ -404,7 +404,7 @@ function workspaceBranch(snapshot: WorkspaceExecutionSnapshot, sourceRoot: strin
 	const checkpoint = Object.freeze({ backend, id, lineage: parent?.token.lineage ?? id, depth: (parent?.token.depth ?? -1) + 1 });
 	const retained: WorkspaceCheckpoint = { token: checkpoint, sourceRoot, parent, changes, committed: false };
 	owner.checkpoints.set(checkpoint, retained);
-	let commitPromise: Promise<ToolSettlement> | undefined;
+	const commit = new EffectCommit<ToolSettlement>();
 	const inputs = new Map<string, ResourceInput>();
 	let disposed = false, readInputs = false, transferred: ReturnType<NonNullable<WorldBranch<ToolSettlement>["takeCommittedInputs"]>> | undefined;
 	return {
@@ -413,14 +413,14 @@ function workspaceBranch(snapshot: WorkspaceExecutionSnapshot, sourceRoot: strin
 		capturedBytes: changes.reduce((total, change) => total + sandboxChangeBytes(change), 0),
 		executionMetrics: Object.freeze({ ...snapshot.executionMetrics }),
 		compatibility: Object.freeze({ status: "compatible" as const, backend, executionFingerprint }),
-		commit: () => commitPromise ??= commitSandboxExecution(owner, snapshot, inputs).then(output => {
+		commit: () => commit.run(() => commitSandboxExecution(owner, snapshot, inputs).then(output => {
 			// A proven commit anchors future forks in the live workspace, independently of unadopted ancestors.
 			retained.committed = true; retained.parent = undefined; if (disposed) inputs.clear(); return output;
-		}),
+		})),
 		takeReadInputs: async (maxBytes) => {
 			// Every file this branch read keeps its pre-image until commit; each serves reads while it stays unchanged.
 			const preimages = new Map<string, ResourceInput>(changes.flatMap((change) => change.kind !== "directory" && change.before && !change.aliases && textual(change.before) ? [[change.target, change.before]] : []));
-			if (disposed || commitPromise || readInputs || !preimages.size) return undefined;
+			if (disposed || commit.result || readInputs || !preimages.size) return undefined;
 			readInputs = true;
 			const inputs = await createCommittedResourceInputs(snapshot.output, action, sourceRoot, preimages, maxBytes).catch(() => undefined);
 			// Stamped only now: each file must still hold the bytes it was read with, or the owner would vouch for stale ones.

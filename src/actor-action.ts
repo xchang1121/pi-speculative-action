@@ -79,12 +79,7 @@ export class ActorAction<Candidate extends { readonly id: string } = { readonly 
 	}
 
 	rejectCandidate(candidateID: string, match: ActionKeyMatch, failure: ResolutionCause): boolean {
-		if (
-			this.stateValue.status !== "matching" ||
-			this.rejections.some((rejection) => rejection.candidateID === candidateID)
-		) {
-			return false;
-		}
+		if (!this.accepts(candidateID)) return false;
 		this.rejections.push(
 			Object.freeze({ candidateID, match: Object.freeze({ ...match }), cause: Object.freeze({ ...failure }) }),
 		);
@@ -92,12 +87,7 @@ export class ActorAction<Candidate extends { readonly id: string } = { readonly 
 	}
 
 	select(selection: ActorCandidateSelection<Candidate, Output>): boolean {
-		if (
-			this.stateValue.status !== "matching" ||
-			this.rejections.some((rejection) => rejection.candidateID === selection.candidate.id)
-		) {
-			return false;
-		}
+		if (!this.accepts(selection.candidate.id)) return false;
 		this.stateValue = Object.freeze({ status: "selected", value: Object.freeze({ ...selection }) });
 		return true;
 	}
@@ -149,6 +139,10 @@ export class ActorAction<Candidate extends { readonly id: string } = { readonly 
 			isError,
 			toolExecution,
 		}), this.stateValue.matchedPredictions);
+	}
+
+	private accepts(candidateID: string): boolean {
+		return this.stateValue.status === "matching" && !this.rejections.some(rejection => rejection.candidateID === candidateID);
 	}
 
 	private finish(provider: ActorActionProvider, matchedPredictions: readonly PredictionIdentity[]): ActorActionSettlement {

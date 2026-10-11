@@ -10,6 +10,7 @@ export class ProcessHandoffOwnership {
 	private state: "available" | "partial" | "whole" = "available";
 	private reservations = 0;
 	private transfer?: { readonly apply: WeakRef<() => Promise<unknown>>; readonly result: Promise<unknown> };
+	private committing?: Promise<unknown>;
 	private readonly observer?: WeakRef<(adoption: ExecutionOperationAdoption) => void>;
 	private readonly scopeOwner?: WeakRef<(scope: ExecutionScope, salvage?: boolean) => boolean>;
 
@@ -28,6 +29,7 @@ export class ProcessHandoffOwnership {
 	adopted(adoption: ExecutionOperationAdoption): void { this.observer?.deref()?.(adoption); }
 
 	get wholeClaimed(): boolean { return this.state === "whole"; }
+	get pendingWhole(): Promise<unknown> | undefined { return this.committing; }
 
 	claimChild(): ((consumed: boolean) => void) | undefined {
 		if (this.wholeClaimed) return;
@@ -43,7 +45,8 @@ export class ProcessHandoffOwnership {
 		const result = Promise.resolve().then(apply).catch(error => {
 			if (error instanceof EffectCommitFailure && error.disposition === "recoverable") { this.state = "available"; this.transfer = undefined; }
 			throw error;
-		});
+		}).finally(() => { this.committing = undefined; });
+		this.committing = result;
 		this.transfer = { apply: new WeakRef(apply), result };
 		return result;
 	}
@@ -77,7 +80,7 @@ export interface ProcessExecutionBinding {
 
 type HandoffState =
 	| { readonly status: "running"; inputsChanged?: () => Promise<boolean>; suspend?: () => Promise<void> }
-	| { readonly status: "completed" | "retained"; readonly candidate?: ProcessProvenanceCertificate };
+	| { readonly status: "completed" | "reserved" | "retained"; readonly candidate?: ProcessProvenanceCertificate };
 
 interface HandoffRecord extends ProcessHandoff {
 	borrowers: number;
@@ -105,6 +108,7 @@ export type ProcessHandoffLookup<Plan> = (
 type AcquireOptions<Plan> = {
 	readonly key: Sha256Digest;
 	readonly scope?: ExecutionScope;
+	readonly signal?: AbortSignal;
 	readonly lookup: ProcessHandoffLookup<Plan>;
 } & (
 	| { readonly role: "producer"; readonly ownership: ProcessHandoffOwnership; readonly executablePath: string }
@@ -237,7 +241,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		const retain = (record: HandoffRecord) => { if (!borrowed.has(record)) { borrowed.add(record); record.borrowers++; } };
 		try {
 			while (true) {
-				if (this.disposed) return { kind: "miss", joined };
+				if (this.disposed || request.signal?.aborted) return { kind: "miss", joined };
 				const records = [...this.byKey.get(request.key)?.values() ?? []];
 				const completed = [...records].reverse().flatMap((record) => {
 					const state = record.state;
@@ -250,19 +254,20 @@ export class ProcessHandoffRegistry<Invocation = never> {
 				if (completed.length) {
 					for (const { record } of completed) retain(record);
 					const plan = await request.lookup(completed.map(({ candidate }) => candidate));
+					if (request.signal?.aborted) return { kind: "miss", joined };
 					const selected = completed.find(({ candidate }) => candidate === plan?.certificate);
-					for (const { record, candidate } of selected ? [selected] : completed) considered.set(record, candidate.id);
+					if (!selected) for (const { record, candidate } of completed) considered.set(record, candidate.id);
 					if (plan && selected && selected.record.state === selected.state && this.byKey.get(request.key)?.has(selected.record)) {
 						const { record, state, oneShot } = selected;
 						const claim = oneShot && record.ownership.acceptsScope(record.scope, scope, request.role === "actor") ? record.ownership.claimChild() : undefined;
-						if (oneShot && !claim) continue;
-						if (oneShot) record.state = { ...state, status: "retained" };
+						if (oneShot && !claim) { considered.set(record, state.candidate?.id); continue; }
+						if (oneShot) record.state = { ...state, status: "reserved" };
 						record.borrowers++;
 						let pending = true;
 						return { kind: "hit", plan, joined, producer: record, continuation: record.continuation, settle: consumed => {
 							if (!pending) return;
 							pending = false; claim?.(consumed); record.borrowers--;
-							if (!consumed && oneShot) { record.state = state; this.wake(request.key); }
+							if (oneShot) { record.state = consumed ? { ...state, status: "retained" } : state; this.wake(request.key); }
 							if (consumed && record.continuation) { this.retainedBytes -= record.continuation.image.length; record.continuation = undefined; }
 							this.trim();
 						} };
@@ -272,7 +277,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 				if (!historyChecked) {
 					// A failed live attempt also rules out its immutable disk copy for this acquisition.
 					const plan = await request.lookup(undefined, new Set([...considered.values()].flatMap(id => id ? [id] : [])));
-					if (plan && !this.disposed) return { kind: "hit", plan, joined };
+					if (plan && !this.disposed && !request.signal?.aborted) return { kind: "hit", plan, joined };
 					historyChecked = true;
 					continue; // A candidate may have completed while history was being read.
 				}
@@ -280,21 +285,24 @@ export class ProcessHandoffRegistry<Invocation = never> {
 				// Waiting grants no transfer authority; acquisition rechecks the live consumer after validation.
 				const running = records.find((record) => !considered.has(record) && record.state.status === "running" && record.ownership.acceptsScope(record.scope, scope, true)) ??
 					records.find((record) => !considered.has(record) && record.state.status === "running" && scope && record.scope?.sessionID === scope.sessionID);
-				if (!running) return { kind: "miss", joined };
-				retain(running);
+				const waitingOn = running ?? records.find(record => (record.state.status === "reserved" || record.ownership.pendingWhole) && record.ownership.acceptsScope(record.scope, scope, true));
+				if (!waitingOn) return { kind: "miss", joined };
+				retain(waitingOn);
 				const changed = new AbortController(), waiters = this.waiters.get(request.key) ?? new Set<AbortController>();
 				waiters.add(changed); this.waiters.set(request.key, waiters);
+				const stop = request.signal ? AbortSignal.any([changed.signal, request.signal]) : changed.signal;
 				let decision: "completed" | "miss" | "rejected";
 				try {
 					// Any newly available result may win, including a producer registered after this wait began.
-					const waiting = await waitForCompletion(request.waitForRunning(running, changed.signal), changed.signal);
+					const completion = running ? request.waitForRunning(running, stop) : waitingOn.ownership.pendingWhole?.then(() => "completed" as const, () => "completed" as const) ?? new Promise<never>(() => {});
+					const waiting = await waitForCompletion(completion, stop);
 					if (waiting.status === "aborted") { joined = true; historyChecked = false; continue; }
 					decision = waiting.value;
 				} finally {
 					waiters.delete(changed); if (!waiters.size) this.waiters.delete(request.key);
 					changed.abort();
 				}
-				if (decision !== "completed") { considered.set(running, undefined); continue; }
+				if (decision !== "completed") { considered.set(waitingOn, undefined); continue; }
 				joined = true;
 				historyChecked = false;
 			}
@@ -375,7 +383,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 	private remove(record: HandoffRecord): void {
 		this.revokeBinding(record);
 		const records = this.byKey.get(record.key);
-		if (records?.delete(record) && record.state.status !== "running") this.completedCount--;
+		if (records?.delete(record)) { if (record.state.status !== "running") this.completedCount--; this.wake(record.key); }
 		if (!records?.size) this.byKey.delete(record.key);
 	}
 

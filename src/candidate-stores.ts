@@ -67,7 +67,8 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 		return { changed, dispose: () => { waiters.delete(wake); if (!waiters.size) this.waiters.delete(scope); } };
 	}
 
-	private changed(scope: Scope): void { for (const wake of this.waiters.get(scope) ?? []) wake(); }
+	/** Includes availability changes within an existing result owner. */
+	notify(scope: Scope): void { for (const wake of this.waiters.get(scope) ?? []) wake(); }
 
 	getOrCreate(
 		scope: Scope,
@@ -122,7 +123,7 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 		else if (!members.has(indexed)) {
 			members.add(indexed); state.partitions.set(key, members); indexed.memberships.push([state.partitions, key]);
 		}
-		this.changed(scope);
+		this.notify(scope);
 	}
 
 	delete(scope: Scope, entry: Entry): boolean {
@@ -132,7 +133,7 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 		state.pending.delete(indexed);
 		this.unindex(indexed);
 		if (!state.entries.size) this.scopes.delete(scope);
-		this.changed(scope);
+		this.notify(scope);
 		return true;
 	}
 
@@ -164,7 +165,7 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 			}
 			indexed.inputs = true;
 		}
-		this.changed(scope);
+		this.notify(scope);
 	}
 
 	cached(scope: Scope): Entry[] {
@@ -267,7 +268,7 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 			index.set(key, members);
 		}
 		this.scopes.set(scope, state);
-		this.changed(scope);
+		this.notify(scope);
 		return undefined;
 	}
 

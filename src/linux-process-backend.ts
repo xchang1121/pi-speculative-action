@@ -947,6 +947,7 @@ export class LinuxProcessReuseBackend {
 		const acquired = await this.handoffs.acquire({
 			key: weakKey,
 			scope,
+			signal,
 			lookup,
 			...("actor" in participant ? {
 				role: "actor" as const,

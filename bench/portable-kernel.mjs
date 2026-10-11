@@ -200,21 +200,21 @@ async function qualifyPiSearch(name) {
 		} finally { resume.resolve(); await running.host.dispose(); }
 		await fs.appendFile(path.join(root, ".gitignore"), "data-*.txt\nnotes.txt\n中文*\nutf16.txt\nUPPER.TXT\nnested/\n*é*\n*é*\n①*\n1*\n");
 		const stale = await ready.actor("stale");
-		assert.equal(stale.settlement.provider.kind, "actor"); assert.equal(ready.actorCalls(), 1);
+		assert.equal(stale.settlement.provider.kind, "speculative"); assert.equal(ready.actorCalls(), 0);
 		assert.notDeepEqual(stale.output, expected);
+		assert.deepEqual(stale.output, (await execute("actor", fs, { args, signal })).result);
 		const beforeReplay = counts.producer;
 		await ready.start("observed", false);
 		const observed = await ready.actor("observed");
 		assert.deepEqual(observed.output, stale.output);
-		assert.equal(bound.semantics.resourceScope, "captured_inputs");
-		assert.equal(observed.settlement.provider.kind, "speculative"); assert.equal(observed.settlement.provider.match.kind, "inputs");
-		assert.equal(counts.producer, beforeReplay + 1, "the new query captures changed rules and reuses unaffected names");
-		assert.equal(ready.actorCalls(), 1);
+		assert.equal(observed.settlement.provider.kind, "speculative", JSON.stringify(observed.settlement)); assert.equal(observed.settlement.provider.match.kind, "inputs");
+		assert.equal(counts.producer, beforeReplay, "the rebuilt query remains reusable after its original proof was rejected");
+		assert.equal(ready.actorCalls(), 0);
 		const changed = journey(() => fs.appendFile(path.join(root, ".gitignore"), "# changed during search\n"));
 		await changed.start("changing");
 		assert.equal((await bounded(changed.candidate, "changed search")).status, "succeeded"); // Private captured inputs seal without rereading the host.
-		const changedActor = await changed.actor("changed");
-		assert.equal(changedActor.settlement.provider.kind, "actor");
+		const beforeChanged = counts.producer, changedActor = await changed.actor("changed");
+		assert.equal(changedActor.settlement.provider.kind, "actor"); assert.equal(counts.producer, beforeChanged + 1);
 		assert.match(JSON.stringify(changedActor.settlement.rejections), /resource_fingerprint_changed/);
 		assert.deepEqual(changedActor.output, stale.output); assert.equal(changed.actorCalls(), 1);
 		const paused = Promise.withResolvers(), released = Promise.withResolvers();

@@ -670,13 +670,13 @@ int main(void) { char b[1024]; return syscall(SYS_getdents64, 4, b, sizeof(b)) <
 			const read = tools[1]!, args = { path: "input.txt" }, execute = vi.fn(() => read.execute("fallback", args));
 			await writeFile(file, "new\nvalue\n");
 			expect(await host.execute({ turnID: "queries", id: "stale", tool: "read", args, tools }, undefined, execute)).toEqual(await read.execute("oracle", args));
-			expect(execute).toHaveBeenCalledOnce();
+			expect(execute).not.toHaveBeenCalled();
 			await writeFile(path.join(fixture.workspace, "entries", "new.txt"), "new");
 			const ls = tools[3]!, directory = { path: "entries" }, list = vi.fn(() => ls.execute("fallback", directory));
 			expect(await host.execute({ turnID: "queries", id: "stale-directory", tool: "ls", args: directory, tools }, undefined, list)).toEqual(await ls.execute("oracle", directory));
-			expect(list).toHaveBeenCalledOnce();
+			expect(list).not.toHaveBeenCalled();
 			await host.finishTurn("queries", true);
-			expect(summarizeSpeculativeTrace(events)).toMatchObject({ inputReuseHits: 4, exactReuseHits: 0 });
+			expect(summarizeSpeculativeTrace(events)).toMatchObject({ inputReuseHits: 6, exactReuseHits: 0 });
 		} finally { await host?.dispose(); await search.pool.dispose(); await fixture.dispose(); }
 	});
 

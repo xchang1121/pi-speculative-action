@@ -37,19 +37,19 @@ export interface CandidateReservationLease {
 export class CandidateExecution<Output> {
 	readonly controller: AbortController;
 	readonly completion: Promise<CandidateExecutionSettlement<Output>>;
+	private readonly released?: () => void;
 	private executionValue: CandidateExecutionState<Output> = Object.freeze({ status: "queued" });
 	private reservationValue: CandidateReservation;
 	private settleCompletion!: (settlement: CandidateExecutionSettlement<Output>) => void;
 
-	constructor(reuse: "shared" | "exclusive", controller = new AbortController()) {
+	constructor(reuse: "shared" | "exclusive", controller = new AbortController(), released?: () => void) {
 		this.controller = controller;
+		this.released = released;
 		this.reservationValue =
 			reuse === "shared"
 				? Object.freeze({ kind: "shared", owners: Object.freeze([]) })
 				: Object.freeze({ kind: "exclusive", status: "available" });
-		this.completion = new Promise((resolve) => {
-			this.settleCompletion = resolve;
-		});
+		this.completion = new Promise(resolve => { this.settleCompletion = resolve; });
 	}
 
 	get execution(): CandidateExecutionState<Output> {
@@ -67,24 +67,15 @@ export class CandidateExecution<Output> {
 	}
 
 	succeed(output: Output, toolExecution: TimelineInterval, executionMs: number): boolean {
-		if (this.executionValue.status !== "running") return false;
-		const settlement: CandidateExecutionSettlement<Output> = Object.freeze({
-			status: "succeeded",
-			output,
-			toolExecution: TimelineInterval.from(toolExecution),
-			executionMs: metric(executionMs),
-		});
-		this.executionValue = settlement;
-		this.settleCompletion(settlement);
-		return true;
+		return this.finish({ status: "succeeded", output, toolExecution, executionMs });
 	}
 
 	fail(cause: ResolutionCause, executionMs: number): boolean {
-		return this.finish("failed", cause, executionMs);
+		return this.finish({ status: "failed", cause, executionMs });
 	}
 
 	cancel(cause: ResolutionCause, executionMs: number): boolean {
-		const changed = this.finish("cancelled", cause, executionMs);
+		const changed = this.finish({ status: "cancelled", cause, executionMs });
 		if (changed) this.controller.abort(cause);
 		return changed;
 	}
@@ -110,6 +101,7 @@ export class CandidateExecution<Output> {
 				? { kind: "shared", owners: Object.freeze(current.owners.filter((value) => value !== owner)) }
 				: { kind: "exclusive", status: consumed ? "consumed" : "available" });
 			state = consumed ? "consumed" : "released";
+			this.released?.();
 			return true;
 		};
 		return {
@@ -122,15 +114,12 @@ export class CandidateExecution<Output> {
 		};
 	}
 
-	private finish(status: "failed" | "cancelled", cause: ResolutionCause, executionMs: number): boolean {
-		if (this.executionValue.status !== "queued" && this.executionValue.status !== "running") return false;
-		const settlement: CandidateExecutionSettlement<Output> = Object.freeze({
-			status,
-			cause: Object.freeze({ ...cause }),
-			executionMs: metric(executionMs),
-		});
-		this.executionValue = settlement;
-		this.settleCompletion(settlement);
+	private finish(settlement: CandidateExecutionSettlement<Output>): boolean {
+		if (this.executionValue.status !== "running" && (this.executionValue.status !== "queued" || settlement.status === "succeeded")) return false;
+		const owned = settlement.status === "succeeded" ? { ...settlement, toolExecution: TimelineInterval.from(settlement.toolExecution) }
+			: { ...settlement, cause: Object.freeze({ ...settlement.cause }) };
+		this.executionValue = Object.freeze({ ...owned, executionMs: metric(owned.executionMs) });
+		this.settleCompletion(this.executionValue);
 		return true;
 	}
 }

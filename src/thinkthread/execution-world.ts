@@ -25,7 +25,7 @@ import {
 	type ExecutionWorldRequest,
 	type WorldBranch,
 } from "../execution-world.ts";
-import { effectCommitFailure } from "../effect-transaction.ts";
+import { EffectCommit, effectCommitFailure } from "../effect-transaction.ts";
 import { assertNoSymlinkPath } from "../filesystem-evidence.ts";
 import { relativeFilesystemPath, slash } from "../path-utils.ts";
 import { ResourceReadView, ResourceVersionManager, resourceDependencies, type ResourceInput, type ResourceVersionToken } from "../resource-version.ts";
@@ -288,7 +288,7 @@ interface ThinkThreadBranchInput {
 
 function thinkThreadWorldBranch(input: ThinkThreadBranchInput): WorldBranch<ToolSettlement> {
 	const { output, source, target, client, durable, pool, dependencies, nativeInputs, reusableInputs } = input;
-	let commitPromise: Promise<ToolSettlement> | undefined;
+	const commit = new EffectCommit<ToolSettlement>();
 	const lifecycle = new RuntimeLifecycleLane();
 	const nativeCause = async () => {
 		try { if (nativeInputs) await assertInputAuthority(nativeInputs); }
@@ -305,28 +305,15 @@ function thinkThreadWorldBranch(input: ThinkThreadBranchInput): WorldBranch<Tool
 			? { status: "stale", cause: changed ?? cause("freshness", "thinkthread_dependency_changed"), metrics }
 			: { status: "valid", metrics };
 	}));
-	async function commitOnce(onValidation?: (validation: ResourceValidation) => void): Promise<ToolSettlement> {
+	async function commitOnce(): Promise<ToolSettlement> {
+		if (!target) {
+			const validation = await validate();
+			if (validation.status === "valid") return output;
+			throw effectCommitFailure(new Error("ThinkThread speculative observation is stale"), "recoverable", undefined, validation.cause);
+		}
 		try {
-			if (!target) {
-				const validation = await validate();
-				onValidation?.(validation);
-				if (validation.status !== "valid") {
-					throw effectCommitFailure(
-						new Error("ThinkThread speculative observation is stale"),
-						"recoverable",
-						"ThinkThread speculative observation is stale",
-						validation.cause,
-					);
-				}
-			} else {
-				await durable.apply({
-					baseSnapshotId: source.id,
-					targetSnapshotId: target.id,
-					dependencies: [...dependencies],
-					policyId: "safe_content_v1",
-				});
-				await pool.invalidate();
-			}
+			await durable.apply({ baseSnapshotId: source.id, targetSnapshotId: target.id, dependencies: [...dependencies], policyId: "safe_content_v1" });
+			await pool.invalidate();
 			return output;
 		} catch (error) {
 			if (error instanceof ThinkThreadDurableError && error.code === "FsApplyConflict") {
@@ -358,24 +345,12 @@ function thinkThreadWorldBranch(input: ThinkThreadBranchInput): WorldBranch<Tool
 		compatibility: Object.freeze({ status: "compatible", backend: WORLD_ID, executionFingerprint: input.executionFingerprint }),
 		validate,
 		validateAndCommit: target || reusableInputs ? undefined : async () => {
-			if (commitPromise) {
-				await commitPromise;
-				return validate();
-			}
-			if (lifecycle.sealed) throw new Error("ThinkThread branch is disposed");
-			let validation: ResourceValidation | undefined;
-			const pending = lifecycle.track(commitOnce((proof) => { validation = proof; }));
-			commitPromise = pending;
-			try { await pending; }
-			catch (error) {
-				// A failed proof did not commit; later validation may retry an indeterminate observation.
-				if (validation?.status === "valid") throw error;
-				if (commitPromise === pending) commitPromise = undefined;
-				if (!validation) throw error;
-			}
-			return validation!;
+			await commit.result;
+			const validation = await validate();
+			if (validation.status === "valid") await lifecycle.track(commit.run(async () => output));
+			return validation;
 		},
-		commit: () => lifecycle.sealed ? Promise.reject(new Error("ThinkThread branch is disposed")) : (commitPromise ??= lifecycle.track(commitOnce())),
+		commit: () => lifecycle.sealed ? Promise.reject(new Error("ThinkThread branch is disposed")) : lifecycle.track(commit.run(commitOnce)),
 		dispose: () => lifecycle.close(async () => {
 			await lifecycle.drain();
 			await Promise.allSettled([target?.release(), source.release(), nativeInputs?.release(), reusableInputs?.dispose()]);

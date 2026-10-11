@@ -44,10 +44,21 @@ export function effectCommitFailure(
 		: new EffectCommitFailure(disposition, message, error, resolutionCause);
 }
 
-export function isPoisonedEffectCommit(
-	error: unknown,
-): error is EffectCommitFailure & { readonly disposition: "poisoned" } {
+export function isPoisonedEffectCommit(error: unknown): error is EffectCommitFailure & { readonly disposition: "poisoned" } {
 	return error instanceof EffectCommitFailure && error.disposition === "poisoned";
+}
+
+/** Share pending/successful effects; only proven recoverable failures permit another attempt. */
+export class EffectCommit<Output> {
+	private outcome?: Promise<Output>;
+	get result(): Promise<Output> | undefined { return this.outcome; }
+	run(apply: () => Promise<Output>): Promise<Output> {
+		return this.outcome ??= Promise.resolve().then(apply).catch(error => {
+			const failure = effectCommitFailure(error, "poisoned");
+			if (failure.disposition === "recoverable") this.outcome = undefined;
+			throw failure;
+		});
+	}
 }
 
 export interface EffectTransactionDescriptor { readonly tool: string; readonly callID?: string; readonly route: SpeculativeExecutionRoute; }
@@ -91,10 +102,7 @@ export class EffectTransactionCoordinator<Output> {
 		return attempt;
 	}
 
-	async execute(
-		attempt: EffectTransactionAttempt,
-		executor: () => Promise<WorldBranch<Output>>,
-	): Promise<EffectTransaction<Output>> {
+	async execute(attempt: EffectTransactionAttempt, executor: () => Promise<WorldBranch<Output>>): Promise<EffectTransaction<Output>> {
 		const owned = this.owned(attempt);
 		this.transition(owned, "begun", "executing");
 		try {
@@ -152,11 +160,7 @@ export class EffectTransactionCoordinator<Output> {
 		return mutable;
 	}
 
-	private transition(
-		attempt: MutableEffectTransactionAttempt,
-		expected: EffectTransactionState,
-		next: EffectTransactionState,
-	): void {
+	private transition(attempt: MutableEffectTransactionAttempt, expected: EffectTransactionState, next: EffectTransactionState): void {
 		if (attempt.stateValue !== expected) throw new Error(`effect transaction ${attempt.id} is ${attempt.stateValue}, expected ${expected}`);
 		attempt.stateValue = next;
 	}
@@ -181,12 +185,12 @@ function sealEffectTransaction<Output>(attempt: MutableEffectTransactionAttempt,
 		takeCommittedInputs: branch.takeCommittedInputs?.bind(branch), takeReadInputs: branch.takeReadInputs?.bind(branch),
 	});
 	let validation: ResourceValidation | undefined, validationPromise: Promise<ResourceValidation> | undefined;
-	let commitPromise: Promise<Output> | undefined;
+	const commit = new EffectCommit<Output>();
 	let inputTransfer: ReturnType<NonNullable<WorldBranch<Output>["takeCommittedInputs"]>> | undefined;
 	const lifecycle = new RuntimeLifecycleLane();
 	const queryResources = new Set<() => Promise<void>>();
 	const abort = (): Promise<void> => {
-		if (!lifecycle.sealed && !["committed", "poisoned"].includes(attempt.stateValue) && !commitPromise) attempt.stateValue = "aborting";
+		if (!lifecycle.sealed && !["committed", "poisoned"].includes(attempt.stateValue) && !commit.result) attempt.stateValue = "aborting";
 		return lifecycle.close(async () => {
 			try {
 				await lifecycle.drain();
@@ -199,7 +203,7 @@ function sealEffectTransaction<Output>(attempt: MutableEffectTransactionAttempt,
 	};
 	const validate = async (queryProof?: WorldBranch<Output>["validate"]): Promise<ResourceValidation> => {
 		// A reserved commit owns its proof window; a later validation must not reset that state.
-		if (!lifecycle.sealed && commitPromise && attempt.stateValue !== "committed") await Promise.allSettled([commitPromise]);
+		if (!lifecycle.sealed && commit.result && attempt.stateValue !== "committed") await Promise.allSettled([commit.result]);
 		if (lifecycle.sealed || ["aborted", "aborting", "poisoned", "failed"].includes(attempt.stateValue)) {
 			return { status: "indeterminate", cause: cause("freshness", "transaction_unavailable"), metrics: zeroValidationMetrics() };
 		}
@@ -253,13 +257,13 @@ function sealEffectTransaction<Output>(attempt: MutableEffectTransactionAttempt,
 		validate: () => validate(),
 		commit: async () => {
 			// An admitted effect keeps its original settlement, including during/after retirement.
-			if (commitPromise) return shared ? cloneSharedData(await commitPromise) : commitPromise;
+			if (commit.result) return shared ? cloneSharedData(await commit.result) : commit.result;
 			if (lifecycle.sealed) throw effectCommitFailure(new Error("effect transaction resources are retired"), "recoverable");
 			if (!validationPromise && validation?.status !== "valid") {
 				throw new Error(`effect transaction ${attempt.id} requires successful validation before commit`);
 			}
 			// Reserve the entire validation → commit operation before yielding, not just its effect.
-			commitPromise = lifecycle.track((async () => {
+			const pending = lifecycle.track(commit.run(async () => {
 				try {
 					await validationPromise;
 					if (validation?.status !== "valid" || attempt.stateValue !== "validated") {
@@ -272,11 +276,12 @@ function sealEffectTransaction<Output>(attempt: MutableEffectTransactionAttempt,
 					return shared ? sealed.output : output;
 				} catch (error) {
 					const failure = effectCommitFailure(error, "poisoned", "effect commit failed without proof that its side effects were restored");
-					attempt.stateValue = failure.disposition === "poisoned" ? "poisoned" : "failed";
+					attempt.stateValue = failure.disposition === "poisoned" ? "poisoned" : "sealed";
+					validation = undefined;
 					throw failure;
 				}
-			})());
-			return shared ? cloneSharedData(await commitPromise) : commitPromise;
+			}));
+			return shared ? cloneSharedData(await pending) : pending;
 		},
 		abort, dispose: abort,
 	});
