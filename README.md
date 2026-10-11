@@ -1,6 +1,6 @@
 # Pi 投机执行
 
-一个无需修改 Pi 的工具投机执行扩展：在 Actor（执行当前任务的模型）发出正式工具调用前，预测后续动作并提前执行；调用到达后，验证并采纳已有计算。项目围绕三个部分组织：预测计划、统一 Runtime、隔离执行后端。
+通过 Pi 扩展接口接入的工具投机执行系统：在 Actor（执行当前任务的模型）发出正式工具调用前，预测后续动作并提前执行；调用到达后，验证并采纳已有计算。项目围绕三个部分组织：预测计划、统一 Runtime、隔离执行后端。
 
 ## 工作流程
 
@@ -11,15 +11,15 @@ flowchart LR
     Runtime --> World["ExecutionWorld<br/>隔离执行与封存"]
     World -->|输出与证明| Runtime
     Runtime -->|验证通过| Commit["提交并返回"]
-    Runtime -->|无可用候选| Fallback["正常执行当前工具"]
+    Runtime -->|常规执行| Fallback["执行当前工具"]
     Runtime -. 结算反馈 .-> Sources
 ```
 
 预测来源统一生成带依赖关系的 `PlanProposal`，可随执行结果继续扩展。Runtime 按 Actor 决策进度推进计划，根据依赖、启动窗口和实时资源安排准备与执行。同一 Runtime 的各会话共用调度器，准备、投机执行与真实调用共用资源账本，Actor 优先。
 
-正式调用通过动作键和投影规则查找候选：可以采用完整或覆盖当前请求的结果，也可以在封存的不可变输入上按当前参数重新求值。已绑定动作的准备工作、排队候选和在途执行均可交给 Actor 继续推进，直至完成或接续其进程；取消、执行失败和输入失效按生命周期处理。
+正式调用通过动作键和投影规则查找候选：可以采用完整或覆盖当前请求的结果，也可以在封存的固定输入版本上按当前参数重新求值。已绑定动作的准备工作、排队候选和在途执行均可交给 Actor 继续推进，直至完成或接续其进程；取消、执行失败和输入失效按生命周期处理。
 
-匹配只负责找到候选；采纳还必须证明执行器兼容、权限与作用域有效、实际依赖未变。提交前无法证明可用时按当前绑定正常执行；部分或不确定的提交失败终止本次调用，避免重复副作用。
+匹配负责发现候选，采纳以执行器兼容、权限与作用域有效、实际依赖与记录版本一致为前提。提交前的验证负责选择采纳结果或按当前绑定执行工具。效果采用单次提交语义；发生部分提交或效果状态待核实的错误时，本次调用随即终止。
 
 ## 代码模块
 
@@ -32,20 +32,20 @@ flowchart LR
 | 执行协议 | [execution-world.ts](./src/execution-world.ts)、[effect-transaction.ts](./src/effect-transaction.ts)、[runtime-lifecycle.ts](./src/runtime-lifecycle.ts) | 统一后端能力、分支提交状态，以及在途任务和资源的关闭排空。 |
 | 度量 | [settlement.ts](./src/settlement.ts)、[task-timing.ts](./src/task-timing.ts)、[trace-summary.ts](./src/trace-summary.ts) | 区分预测、执行与实际采纳，按计算来源汇总复用量、工具等待和诊断事件。 |
 
-根入口导出 [Pi Host API](./src/index.ts)；[`./core`](./src/core.ts) 提供不依赖 Pi 的 Runtime，[`./process-reuse`](./src/process-reuse.ts) 提供进程证明、规划和存储接口。新增预测来源实现 `SpeculativePlanSource`；新增后端实现 `ExecutionWorld`，通过 Host 的 `executionWorlds` 注册。宿主负责在结束时调用 `host.dispose()`。
+根入口导出 [Pi Host API](./src/index.ts)；[`./core`](./src/core.ts) 提供可独立使用的 Runtime，[`./process-reuse`](./src/process-reuse.ts) 提供进程证明、规划和存储接口。新增预测来源实现 `SpeculativePlanSource`；新增后端实现 `ExecutionWorld`，通过 Host 的 `executionWorlds` 注册。宿主负责在结束时调用 `host.dispose()`。
 
 ## 执行方案
 
-各后端遵循同一协议：`ExecutionWorld` 提供执行或观察能力，一次执行返回 `WorldBranch`，封装输出、依赖证明、可提交效果和资源释放方法；`EffectTransaction` 管理验证与采纳状态。后端可额外提供封存输入与查询能力，使不同工具或参数复用已有输入计算。只有通过能力检查的路线才允许提前执行。
+各后端遵循同一协议：`ExecutionWorld` 提供执行或观察能力，一次执行返回 `WorldBranch`，封装输出、依赖证明、可提交效果和资源释放方法；`EffectTransaction` 管理验证与采纳状态。后端可额外提供封存输入与查询能力，使不同工具或参数复用已有输入计算。通过能力检查的执行路线可以提前执行。
 
 | 实现 | 方法与边界 |
 | --- | --- |
 | [封存资源](./src/agent-execution-world.ts) / [输入版本](./src/resource-version.ts) | 为绑定的文件工具捕获实际访问的数据，保留内容与路径证明；后续查询复用仍有效的输入，并对本次使用的依赖精确验新。受控 `find/grep` 由 [统一工具绑定](./src/pi-tool-invocation.ts) 让 Actor 与投机使用相同执行器，需显式启用。 |
 | [私有工作区](./src/workspace-sandbox.ts) / [文件事务](./src/workspace-transaction.ts) | 普通 `write/edit` 先在内存事务中执行；需要私有分支时使用 Git 或通过检查的 OverlayFS。文件效果在持锁状态下验证并提交，多步计划可沿私有分支继续执行。 |
-| [Linux 进程](./src/linux-process-world.ts) / [进程后端](./src/linux-process-backend.ts) | 用 Sandlock 隔离执行、strace 记录依赖和效果，再通过证书验证。合格的 x86-64 Linux 使用 [held-exec](./src/linux-held-exec.c) 接管已完成计算，或在支持的系统调用入口转移单线程进程、继续执行后缀。可证明等价的结果在输入不变且生命周期有效时反复复用；含时钟、随机或进程身份等观测的结果只转交一次。 |
-| [ThinkThread](./src/thinkthread/execution-world.ts) | 通过固定 SDK 的快照与 `fs.run` 接入相同分支协议，文件读取可进入公共封存输入层。默认覆盖 `read/ls/write/edit`；原生 `bash/find/grep` 回到 Actor，不嵌套 Linux 进程后端。 |
+| [Linux 进程](./src/linux-process-world.ts) / [进程后端](./src/linux-process-backend.ts) | 用 Sandlock 隔离执行、strace 记录依赖和效果，再通过证书验证。合格的 x86-64 Linux 使用 [held-exec](./src/linux-held-exec.c) 接管已完成计算，或在支持的系统调用入口转移单线程进程、继续执行后缀。可证明等价的结果在输入与证明记录一致、生命周期有效时反复复用；含时钟、随机或进程身份等观测的结果采用一次性交接。 |
+| [ThinkThread](./src/thinkthread/execution-world.ts) | 通过固定 SDK 的快照与 `fs.run` 接入相同分支协议，文件读取可进入公共封存输入层。默认覆盖 `read/ls/write/edit`；`bash/find/grep` 由 Actor 的原生工具执行。 |
 
-结果、输入和进程句柄分别保留自己的所有权；跨轮复用仍需作用域与新鲜度证明。独立子步骤按自身证明采纳，不要求先提交父步骤；提交后，后续工作区分支以真实状态为基线。候选库变化和临时占用释放会唤醒等待者重新选取，包括等待开始后才出现的结果；一次拒绝只影响当前请求，证明未产生效果的提交失败可在重新验新后重试。单条损坏证书或产物不会阻断其他结果，新发布的正确内容可修复损坏副本。已封存结果按容量保留，路径变更提示、计算年龄或本轮回答结束不直接撤销复用机会；实际采纳仍精确验新，关闭会话则排空并释放资源。
+结果、输入和进程句柄分别保留自己的所有权；跨轮复用以作用域与新鲜度证明为依据。独立子步骤凭自身证明即可采纳；提交后，后续工作区分支以真实状态为基线。候选库变化和临时占用释放会唤醒等待者重新选取，等待期间新增的结果也参与匹配。每次请求都依据自身证明决定采纳；提交失败后，已确认本次操作保持或恢复原有状态的请求可重新验新并重试。各条证书和产物独立验证与筛选，新发布的正确内容可修复损坏副本。已封存结果按容量预算跨轮保留，采纳时按实际依赖精确验新；关闭会话会排空并释放资源。
 
 ## 使用
 
@@ -57,7 +57,7 @@ pi -e /absolute/path/to/pi-speculative-action
 
 版本与依赖见 [package.json](./package.json)。在 Pi 中运行 `/speculative-action`，开启投机、选择预测来源和工具后 **Apply changes**；在 **Tools & execution → Execution routes** 检查实际可用的后端。配置保存在 `<agent-dir>/speculative-action.json`，项目的 `.pi/speculative-action.json` 可覆盖全局设置。
 
-Linux / WSL 2 的 Bash 后端可从菜单检查和安装，也可在源码目录运行 `npm run setup:linux`；WSL checkout 应放在 Linux 原生文件系统。原生进程自动选用合格的 OverlayFS，回退 Git 时补齐空目录和权限；两条路径中被复制的原始对象通过持有对象和元数据映射，保持路径、文件描述符及目录枚举所见身份一致，采纳前仍精确验新。ThinkThread 使用独立的 [Profile 安装脚本](./scripts/install-thinkthread-profile.sh)，安装后在项目中运行 `tt pi-speculative-action`。后端不可用时保留正常 Actor 执行。
+Linux / WSL 2 的 Bash 后端可从菜单检查和安装，也可在源码目录运行 `npm run setup:linux`；WSL checkout 应放在 Linux 原生文件系统。原生进程自动选用合格的 OverlayFS，回退 Git 时补齐空目录和权限；两条路径中被复制的原始对象通过持有对象和元数据映射，保持路径、文件描述符及目录枚举所见身份一致，采纳前仍精确验新。ThinkThread 使用独立的 [Profile 安装脚本](./scripts/install-thinkthread-profile.sh)，安装后在项目中运行 `tt pi-speculative-action`。Actor 常规执行承担基础工具调用，各后端在满足可用条件时承接投机工作。
 
 ## 开发与验证
 
@@ -69,6 +69,6 @@ npm test -- --maxWorkers=1 --no-file-parallelism
 npm run bench:check
 ```
 
-[test](./test) 以系统功能测试为主：真实 Pi 会话、文件读写与跨轮工作流、Linux 原生进程接管、磁盘缓存重开和 HTTP/socket 通信。模型回复使用确定性脚本；断言关注交付结果、复用与副作用，不固定内部方法调用次数或调度顺序。仅保留少量计时数学单元测试。Linux 用例需要已安装的原生后端；ThinkThread 本地 wire runner 与控制协议测试不代表真实 Runtime 资格。[验证说明](./bench/README.md) 列出后端资格、完整模型任务和计量规则。
+[test](./test) 以系统功能测试为主：真实 Pi 会话、文件读写与跨轮工作流、Linux 原生进程接管、磁盘缓存重开和 HTTP/socket 通信。模型回复使用确定性脚本；系统测试以交付结果、复用与副作用作为断言依据，计时数学另用少量单元测试验证。Linux 用例需要已安装的原生后端；ThinkThread 本地 wire runner 与控制协议测试覆盖本地传输行为，真实 Runtime 资格需通过实机流程验证。[验证说明](./bench/README.md) 列出后端资格、完整模型任务和计量规则。
 
-`toolSpeedup = T / (T - H)` 采用乐观执行边界口径：T 为本次调用实际消费的执行区间，含首次证明、封存及生产者在调用后继续完成的计算；H 为其中实际复用且在 Actor 发出调用前完成的部分。接管控制区间从 Actor 执行中排除，`adoptionWaitMs` 单列未被计算覆盖的协调等待。该比值不代表 CPU 加速或任务端到端净收益。
+`toolSpeedup = T / (T - H)` 采用乐观执行边界口径：T 为本次调用实际消费的执行区间，含首次证明、封存及生产者在调用后继续完成的计算；H 为其中实际复用且在 Actor 发出调用前完成的部分。工具计算和接管控制分开计量，`adoptionWaitMs` 单列纯协调等待。该比值描述工具执行区间的复用收益；CPU 使用与任务端到端净收益通过独立测量评估。
