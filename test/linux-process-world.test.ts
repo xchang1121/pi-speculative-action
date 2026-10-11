@@ -25,21 +25,37 @@ import { adaptProcessToolOperations, ProcessExecutionCoordinator } from "../src/
 import { PROCESS_CERTIFICATE } from "./process-fixture.ts";
 import * as scheduling from "../src/scheduler.ts";
 import type { ExecutionOperationBinding } from "../src/execution-world.ts";
-import { createSpeculativeActionHost } from "../src/agent-integration.ts";
+import { createSpeculativeActionHost, type CreateSpeculativeActionHostOptions, type SpeculativeAgentSettingsInput } from "../src/agent-integration.ts";
 import { PatternAwareStore, patternAwareSettings, patternAwareActionSemantics } from "../src/pattern-aware.ts";
 import type { SpeculativeActionEvent } from "../src/events.ts";
 import { TaskTimeline, TimelineInterval, type TimelineDependency } from "../src/task-timing.ts";
 import { testModel } from "./model.ts";
 import type { WorkspaceTransactionCapture } from "../src/workspace-transaction.ts";
 import { commitBenchmarkFixture, compileBenchmarkHelper, cHeaders, processTest as test, executeProcess, forkReusableBash, prepareLinuxProcessReuse,
-	holdProcessPublication, textOutput } from "./linux-process-fixture.ts";
+	holdProcessPublication, textOutput, type LinuxProcessBenchmark } from "./linux-process-fixture.ts";
 
 vi.mock("node:child_process", { spy: true });
 vi.mock("node:fs/promises", { spy: true });
+const nativeTest = process.arch === "x64" ? test : test.skip;
+
+function patternProcessHost(fixture: LinuxProcessBenchmark, sessionID: string, settings: SpeculativeAgentSettingsInput,
+	options: Partial<CreateSpeculativeActionHostOptions> = {}, tools = [fixture.tool]) {
+	const events: SpeculativeActionEvent<string>[] = [], patternStore = new PatternAwareStore(patternAwareSettings(settings.patternAware), undefined,
+		patternAwareActionSemantics(PI_ACTION_SEMANTICS, fixture.workspace));
+	const host = createSpeculativeActionHost(sessionID, { cwd: fixture.workspace, patternStore,
+		complete: async () => { throw new Error("unexpected inference"); }, preflight: () => true, executionWorlds: [fixture.world],
+		getSettings: () => ({ enabled: true, drafterEnabled: false, tools: ["bash"], ...settings }),
+		resolveInvocation: (tool, input) => resolvePiToolInvocation(tool, input, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath }),
+		onEvent: event => { events.push(event); }, ...options,
+	});
+	return { host, events, patternStore,
+		start: (turnID: string) => host.startTurn({ turnID, tools, actorModel: testModel("actor"), actorOptions: undefined, context: { systemPrompt: "unchanged", messages: [], tools } }),
+		call: (turnID: string, command: string) => ({ turnID, id: turnID, tool: "bash", args: { command }, tools }),
+	};
+}
 
 describe("Linux process ExecutionWorld", () => {
-	test("preserves fresh invocation inputs without classifying shell syntax", { timeout: 30_000 }, async ({ skip, benchmark }) => {
-		if (process.arch !== "x64") return skip("x86-64 Linux only");
+nativeTest("preserves fresh invocation inputs without classifying shell syntax", { timeout: 30_000 }, async ({ benchmark }) => {
 		const fixture = await benchmark("pi-shell-proof-", "git");
 		const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
 		for (const command of ['printf "%s\\n" constant', 'printf "%s\\n" "$RANDOM"', 'printf "%s\\n" "$((RANDOM))"',
@@ -59,8 +75,7 @@ describe("Linux process ExecutionWorld", () => {
 		}
 	});
 
-	test("proves external reads from their opened image and never commits a read copy", { timeout: 30_000 }, async ({ skip, benchmark }) => {
-		if (process.arch !== "x64") return skip("x86-64 Linux only");
+nativeTest("proves external reads from their opened image and never commits a read copy", { timeout: 30_000 }, async ({ benchmark }) => {
 		const fixture = await benchmark("pi-read-image-", "git"), outside = await mkdtemp(path.join(os.tmpdir(), "pi-read-image-host-"));
 		const target = path.join(outside, "input"), alias = path.join(outside, "alias");
 		try {
@@ -107,8 +122,7 @@ int main(int argc, char **argv) { FILE *f = fopen(argc > 1 ? argv[1] : "/etc/iss
 		} finally { await fixture.dispose(); await rm(outside, { recursive: true, force: true }); }
 	});
 
-	test("admits expensive late launches by completed work within a bounded learning budget", { timeout: 30_000 }, async ({ skip, benchmark }) => {
-		if (process.arch !== "x64") return skip("x86-64 Linux only");
+nativeTest("admits expensive late launches by completed work within a bounded learning budget", { timeout: 30_000 }, async ({ benchmark }) => {
 		const fixture = await benchmark("pi-learning-admission-", "git");
 		await prepareLinuxProcessReuse(fixture);
 		const route = await fixture.prepareActorReplay(), scope = { sessionID: "admission", turnID: "native" };
@@ -124,8 +138,7 @@ int main(int argc, char **argv) { FILE *f = fopen(argc > 1 ? argv[1] : "/etc/iss
 		}, true);
 	});
 
-	test.for(["file", "symlink", "lexical-parent", "normalized-blocker"] as const)("proves ENOTDIR from the blocking file and invalidates a changed walk (%s)", { timeout: 30_000 }, async (mode, { skip, benchmark }) => {
-		if (process.arch !== "x64") return skip("x86-64 Linux only");
+nativeTest.for(["file", "symlink", "lexical-parent", "normalized-blocker"] as const)("proves ENOTDIR from the blocking file and invalidates a changed walk (%s)", { timeout: 30_000 }, async (mode, { benchmark }) => {
 		const fixture = await benchmark("pi-enotdir-", "overlayfs", {}, os.homedir());
 		const blocker = path.join(fixture.workspace, "module.js");
 		await writeFile(blocker, "source\n");
@@ -163,8 +176,7 @@ int main(int argc, char **argv) { FILE *f = fopen(argc > 1 ? argv[1] : "/etc/iss
 	});
 
 
-	test.for(["missing", "appeared", "file", "blocked", "symlink", "lexical", "socket", "socket-file", "socket-blocked", "socket-listening", "socket-private", "socket-private-blocked", "socket-mapped", "socket-relative", "socket-link"] as const)("proves only absent host lookups and cleans its long-path broker (%s)", { timeout: 20_000 }, async (mode, { skip, benchmark }) => {
-		if (process.arch !== "x64") return skip("x86-64 Linux only");
+nativeTest.for(["missing", "appeared", "file", "blocked", "symlink", "lexical", "socket", "socket-file", "socket-blocked", "socket-listening", "socket-private", "socket-private-blocked", "socket-mapped", "socket-relative", "socket-link"] as const)("proves only absent host lookups and cleans its long-path broker (%s)", { timeout: 20_000 }, async (mode, { benchmark }) => {
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-long-broker-")), previous = process.env.TMPDIR;
 		const temporary = path.join(root, "nested-temporary-directory-".repeat(3));
 		await mkdir(temporary); process.env.TMPDIR = temporary;
@@ -224,8 +236,7 @@ int main(int argc, char **argv) {
 		}
 	});
 
-	test.for(["unusable", "one-shot", "descendant", "unusable-descendant"] as const)("rechecks failed native preparation when its observed inputs change (%s)", { timeout: 20_000 }, async (mode, { skip, benchmark }) => {
-		if (process.arch !== "x64") return skip("x86-64 Linux only");
+nativeTest.for(["unusable", "one-shot", "descendant", "unusable-descendant"] as const)("rechecks failed native preparation when its observed inputs change (%s)", { timeout: 20_000 }, async (mode, { benchmark }) => {
 		const fixture = await benchmark("pi-preparation-evidence-");
 		const publishing = vi.spyOn(fixture.backend.planner, "publishCompleted");
 		try {
@@ -303,27 +314,18 @@ int main(int argc, char **argv) {
 		} finally { publishing.mockRestore(); await fixture.dispose(); }
 	});
 
-	test.for([false, true])("prepares a failed command after its reported input is edited and validates before committing (stale=%s)", { timeout: 20_000 }, async (stale, { skip, benchmark }) => {
-		if (process.arch !== "x64") return skip("x86-64 Linux only");
+nativeTest.for([false, true])("prepares a failed command after its reported input is edited and validates before committing (stale=%s)", { timeout: 20_000 }, async (stale, { benchmark }) => {
 		const fixture = await benchmark("pi-failed-command-");
 		let host: ReturnType<typeof createSpeculativeActionHost> | undefined;
 		try {
 			await writeFile(path.join(fixture.workspace, "source.txt"), "broken\n");
 			await commitBenchmarkFixture(fixture.workspace, "failed command input");
 			await prepareLinuxProcessReuse(fixture);
-			const patternAware = patternAwareSettings({ presets: ["retry-failed-command"] }), events: SpeculativeActionEvent<string>[] = [];
 			const writer = createWriteTool(fixture.workspace), tools = [fixture.tool, writer], sessionID = "failed-command";
 			const command = 'IFS= read -r value < source.txt; if [ "$value" != fixed ]; then printf "source.txt:1: expected fixed, got %s\\n" "$value"; exit 1; fi; printf "%s\\n" "$value" > generated.txt; printf "verified\\n"';
-			host = createSpeculativeActionHost(sessionID, { cwd: fixture.workspace,
-				patternStore: new PatternAwareStore(patternAware, undefined, patternAwareActionSemantics(PI_ACTION_SEMANTICS, fixture.workspace)),
-				complete: async () => { throw new Error("unexpected inference"); }, preflight: () => true,
-				getSettings: () => ({ enabled: true, drafterEnabled: false, tools: ["bash"], patternAware }), executionWorlds: [fixture.world],
-				resolveInvocation: (tool, input) => resolvePiToolInvocation(tool, input, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath }),
-				onEvent: event => { events.push(event); },
-			});
-			const start = (turnID: string) => host!.startTurn({ turnID, tools, actorModel: testModel("actor"), actorOptions: undefined,
-				context: { systemPrompt: "unchanged", messages: [], tools } });
-			const call = (turnID: string) => ({ turnID, id: turnID, tool: "bash", args: { command }, tools });
+			const prepared = patternProcessHost(fixture, sessionID, { patternAware: patternAwareSettings({ presets: ["retry-failed-command"] }) }, {}, tools), { events, start } = prepared;
+			host = prepared.host;
+			const call = (turnID: string) => prepared.call(turnID, command);
 			await start("failure");
 			await expect(host.execute(call("failure"), undefined, () => fixture.tool.execute("failure", { command }))).rejects.toThrow("got broken");
 			await host.finishTurn("failure");
@@ -353,8 +355,7 @@ int main(int argc, char **argv) {
 		} finally { await host?.dispose(); await fixture.dispose(); }
 	});
 
-	test.for(["sample", "threads", "limit", "metadata", "identity"] as const)("transfers a closed-input calculation before its next syscall (%s)", { timeout: 30_000 }, async (mode, { skip, benchmark }) => {
-		if (process.arch !== "x64") return skip("x86-64 Linux only");
+nativeTest.for(["sample", "file", "dup", "threads", "limit", "metadata", "identity"] as const)("transfers a closed-input calculation before its next syscall (%s)", { timeout: 30_000 }, async (mode, { benchmark }) => {
 		const fixture = await benchmark("pi-prefix-process-", "git");
 		await prepareLinuxProcessReuse(fixture);
 		await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker", arguments: ["-pthread"], code: `#define _GNU_SOURCE
@@ -362,8 +363,10 @@ ${cHeaders("unistd.h sys/syscall.h sys/random.h sys/resource.h sys/stat.h pthrea
 static void *thread(void *unused) { return unused; }
 int main(void) {
  ${mode === "identity" ? "pid_t prior = getpid();" : ""}
- int fd = open("prefix-ready", O_WRONLY|O_CREAT|O_TRUNC, 0600); if (fd < 0 || write(fd, "ready", 5) != 5 || close(fd)) return 71;
+ int fd = open("prefix-ready", O_WRONLY|O_CREAT|O_TRUNC, 0600); if (fd < 0 || write(fd, "ready", 5) != 5) return 71;
+ ${mode === "dup" ? "int copy = dup(fd); if (copy < 0 || close(fd)) return 77; fd = copy;" : mode === "file" ? "" : "if (close(fd)) return 71;"}
  volatile uint64_t hash = 1; for (unsigned i = 0; i < 800000000; i++) hash = hash * 33 + i;
+ ${mode === "file" || mode === "dup" ? "if (close(fd)) return 77;" : ""}
  ${mode === "metadata" ? "struct stat state; if (fstat(STDOUT_FILENO, &state) || !state.st_ino) return 76;" : ""}
  ${mode === "threads" ? "pthread_t worker; void *result; if (pthread_create(&worker, NULL, thread, (void *)37) || pthread_join(worker, &result) || result != (void *)37) return 72;" : "(void)thread;"}
  ${mode === "limit" ? "struct rlimit limit = {0, 0}; if (setrlimit(RLIMIT_CORE, &limit)) return 73;" : ""}
@@ -391,6 +394,7 @@ int main(void) {
 			const starting = gated(), frontier = gated(), controller = new AbortController();
 			const acquire = handoffs.acquire.bind(handoffs), observe = handoffs.observeRunning.bind(handoffs), wait = scheduling.waitForCompletion;
 			let completion: Promise<void> | undefined, joins = 0, cancelled: Promise<unknown> | undefined;
+			const admissions: Array<{ syscall: number; accepted: boolean | undefined }> = [];
 			const acquiring = vi.spyOn(handoffs, "acquire").mockImplementation(async request => {
 				const result = await acquire(request);
 				if (mode === "sample" && result.kind === "work") { completion = result.work.completion; await starting.wait(); }
@@ -399,12 +403,15 @@ int main(void) {
 			const joining = vi.spyOn(scheduling, "waitForCompletion").mockImplementation((promise, signal, timeout) => {
 				if (promise === completion) starting.release(); return wait(promise, signal, timeout);
 			});
-			const observing = vi.spyOn(handoffs, "observeRunning").mockImplementation((key, work, capability, invoke) =>
-				observe(key, work, capability, capability !== "suspend" ? invoke : async (...args: Parameters<typeof invoke>) => {
-					if (mode === "threads" && ++joins === 2) { controller.abort(); frontier.release(); } await invoke(...args);
-				}));
+			const observing = vi.spyOn(handoffs, "observeRunning").mockImplementation((key, work, invoke) => observe(key, work, async () => {
+				if (mode === "threads" && ++joins === 2) { controller.abort(); frontier.release(); } return invoke();
+			}));
 			const target = fixture.backend as unknown as { requestProcessImageAtFrontier(...args: unknown[]): Promise<unknown> }, request = target.requestProcessImageAtFrontier.bind(target);
 			const requesting = vi.spyOn(target, "requestProcessImageAtFrontier").mockImplementation(async (...args) => {
+				const admit = args[4] as (pid: number, reply: Buffer, report: Buffer) => Promise<boolean | undefined>;
+				args[4] = async (pid: number, reply: Buffer, report: Buffer) => {
+					const accepted = await admit(pid, reply, report); admissions.push({ syscall: reply.readInt32LE(8), accepted }); return accepted;
+				};
 				if (mode === "threads") await frontier.wait(); return request(...args);
 			});
 			const pending = session.executeBinding(binding!), settled = pending.catch(() => undefined);
@@ -417,7 +424,13 @@ int main(void) {
 				const timing = new TaskTimeline(issuedAt).recordCall([{ computation: actual.computation }], issuedAt, performance.now());
 				expect(fields).toHaveLength(4); expect(fields[0]).toBe(fields[1]); expect(fields[2]).toBe(seed.trim().split(":")[2]);
 				expect(fields[3]).not.toBe(seed.trim().split(":")[3]);
-				expect(fixture.backend.actorMetrics().joinedHits, JSON.stringify(fixture.backend.metrics())).toBe(mode === "identity" ? 0 : 1);
+				expect(fixture.backend.actorMetrics().joinedHits, JSON.stringify(fixture.backend.metrics())).toBe(1);
+				if (mode === "file" || mode === "dup") expect(admissions).toEqual([{ syscall: 3, accepted: undefined }, { syscall: 318, accepted: true }]);
+				if (mode === "identity") {
+					expect(await pending).toMatchObject({ exit: { kind: "code", code: 0 } });
+					expect(admissions.length).toBeGreaterThan(0); expect(admissions.every(result => !result.accepted)).toBe(true);
+					expect(publishing.mock.calls.some(([, , certificate]) => certificate?.result.continuation)).toBe(false);
+				}
 				if (mode !== "identity") {
 					expect(await pending).toMatchObject({ suspended: true });
 					const continuation = publishing.mock.calls.find(([, , certificate]) => certificate?.result.continuation)?.[4];
@@ -433,8 +446,7 @@ int main(void) {
 		publishing.mockRestore();
 	});
 
-	test.for(["pipe", "socket", "eventfd", "readv", "recvmsg", "writev", "mmap", "runtime", "handles", "eof", "early", "changed", "identity", "cancel"] as const)("resumes a learned running process with future input (%s)", { timeout: 60_000 }, async (mode, { skip, benchmark }) => {
-		if (process.arch !== "x64") return skip("x86-64 Linux only");
+	nativeTest.for(["pipe", "socket", "eventfd", "readv", "recvmsg", "writev", "mmap", "runtime", "handles", "eof", "early", "changed", "identity", "file", "cancel"] as const)("resumes a learned running process with future input (%s)", { timeout: 60_000 }, async (mode, { skip, benchmark }) => {
 		const fixture = await benchmark("pi-live-process-");
 		let host: ReturnType<typeof createSpeculativeActionHost> | undefined;
 		try {
@@ -458,7 +470,7 @@ static ssize_t next_input(void *bytes, size_t length) {
  ${mode === "recvmsg" ? "struct msghdr message = {.msg_iov = parts, .msg_iovlen = 2}; return recvmsg(INPUT_FD, &message, 0);" : mode === "readv" ? "return readv(INPUT_FD, parts, 2);" : "(void)parts; return read(INPUT_FD, bytes, length);"}
 }
 int main(void) {
- ${mode === "identity" ? "pid_t identity = getpid();" : ""}
+ ${mode === "identity" ? "pid_t identity = getpid();" : mode === "file" ? "int temporary = open(\"/dev/null\", O_RDONLY); if (temporary < 0) return 86;" : ""}
  ${mode === "runtime" ? `char *heap = malloc(65536); if (!heap) return 78; memset(heap, 'H', 65536); local = 23;
  stack_t stack = {.ss_sp = alternate, .ss_size = sizeof(alternate)};
  struct sigaction action = {.sa_handler = receive_signal, .sa_flags = SA_ONSTACK};
@@ -471,7 +483,7 @@ int main(void) {
  if (fcntl(5, F_DUPFD_CLOEXEC, 12) != 12 || close(5) || close(6) || dup2(7, 6) != 6 || close(7) ||
      dup2(3, 8) != 8 || close(3) || dup2(4, 3) != 3 || close(4) || fcntl(8, F_SETFD, FD_CLOEXEC) ||
      fcntl(12, F_SETFL, O_APPEND)) return 84;` : ""}
- volatile uint64_t hash = 1; for (unsigned i = 0; i < ${mode === "early" ? 1500000000 : 250000000}; i++) hash = hash * 33 + i;
+ volatile uint64_t hash = 1; for (unsigned i = 0; i < ${mode === "early" || mode === "identity" ? 1500000000 : 250000000}; i++) hash = hash * 33 + i;
  ${mode === "eof" ? `char fill[131072]; memset(fill, 'P', sizeof(fill));
  if (close(4) || write(1, fill, sizeof(fill)) != sizeof(fill)) return 72;` : mode === "writev" ? `char fill[4096]; for (unsigned i = 0; i < sizeof(fill); i++) fill[i] = 'P';
  if (write(4, fill, sizeof(fill)) != sizeof(fill)) return 72;
@@ -480,7 +492,7 @@ int main(void) {
  input[0] = 'A';` : `
  unsigned used = 1; ssize_t n; while ((n = next_input(input + used, sizeof(input) - used)) > 0) used += n;
  if (n || used != 3 || (input[0] != 'A' && input[0] != 'D') || input[1] != 'B' || input[2] != 'C') return 73;`}
- if (getpid() != syscall(SYS_gettid) ${mode === "identity" ? "|| identity != getpid()" : ""}) return 74;
+ if (getpid() != syscall(SYS_gettid) ${mode === "identity" ? "|| identity != getpid()" : mode === "file" ? "|| close(temporary)" : ""}) return 74;
  ${mode === "handles" ? `if (fcntl(4, F_GETFD) != -1 || errno != EBADF || fcntl(8, F_GETFD) != FD_CLOEXEC ||
      fcntl(12, F_GETFD) != FD_CLOEXEC || !(fcntl(12, F_GETFL) & O_APPEND) || read(12, bytes, 1) != 1 || bytes[0] != 'c' ||
      lseek(6, 0, SEEK_CUR) || read(6, bytes, 1) != 1 || bytes[0] != 'a') return 85;` : ""}
@@ -536,20 +548,13 @@ int main(int argc, char **argv) {
 			for (const name of ["worker", "launch"]) await compileBenchmarkHelper(fixture.workspace, { source: `${name}.c`, output: name, arguments: ["-pthread"] });
 			await commitBenchmarkFixture(fixture.workspace, "Live process continuation");
 			const route = await fixture.prepareActorReplay();
-			const tools = [fixture.tool], events: SpeculativeActionEvent<string>[] = [], scope = { sessionID: "live", turnID: "seed" };
-			const settings = patternAwareSettings({ enabled: true, multiStepEnabled: false, beamWidth: 4 });
-			const patternStore = new PatternAwareStore(settings, undefined, patternAwareActionSemantics(PI_ACTION_SEMANTICS, fixture.workspace));
+			const scope = { sessionID: "live", turnID: "seed" };
 			const registry = Reflect.get(fixture.backend, "handoffs") as ProcessHandoffRegistry;
 			const publishing = vi.spyOn(registry, "publish"), errors = vi.spyOn(fixture.backend as any, "setError");
-			host = createSpeculativeActionHost(scope.sessionID, { cwd: fixture.workspace, patternStore, complete: async () => { throw new Error("no inference"); },
-				getSettings: () => ({ enabled: true, drafterEnabled: false, candidateLimit: 4, maxConcurrentActions: 4, tools: ["bash"], patternAware: settings }),
-				preflight: () => true, executionWorlds: [fixture.world],
-				resolveInvocation: (tool, input) => resolvePiToolInvocation(tool, input, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath }),
-				onEvent: event => { events.push(event); },
-			});
-			const start = (turnID: string) => host!.startTurn({ turnID, tools, actorModel: testModel("actor"), actorOptions: undefined,
-				context: { systemPrompt: "continuation", messages: [], tools } });
-			const execute = (turnID: string, command: string) => host!.execute({ turnID, id: turnID, tool: "bash", args: { command }, tools }, undefined,
+			const prepared = patternProcessHost(fixture, scope.sessionID, { candidateLimit: 4, maxConcurrentActions: 4,
+				patternAware: patternAwareSettings({ enabled: true, multiStepEnabled: false, beamWidth: 4 }) }), { events, start, call } = prepared;
+			host = prepared.host;
+			const execute = (turnID: string, command: string) => host!.execute(call(turnID, command), undefined,
 				() => fixture.coordinator.runWith({ execute: request => route.executor.execute({ ...request, scope: { ...scope, turnID } }) },
 					() => fixture.tool.execute(turnID, { command })));
 			for (const turnID of ["common-1", "common-2"]) { await start(turnID); await execute(turnID, "printf common"); await host.finishTurn(turnID); }
@@ -566,9 +571,9 @@ int main(int argc, char **argv) {
 					const image = Array.isArray(args) && args.find(arg => arg.startsWith("--handoff-image="));
 					if (!image) continue;
 					const report = await readFile(path.join(path.dirname(image.slice("--handoff-image=".length)), "fd-offsets"), "utf8").catch(() => "");
-					const ready = /^RUNNING (\d+)\n$/.exec(report); if (!ready) continue;
+					const ready = /\nRUNNING (\d+)\n$/.exec(report); if (!ready) continue;
 					const pid = Number(ready[1]), state = await readFile(`/proc/${pid}/syscall`, "utf8").catch(() => "");
-					if (mode === "early") {
+					if (mode === "early" || mode === "identity") {
 						const usage = await readFile(`/proc/${pid}/stat`, "utf8").catch(() => ""), fields = usage.slice(usage.lastIndexOf(")") + 2).split(" ");
 						if (/^(?:running|-1 )/.test(state) && Number(fields[11]) + Number(fields[12]) >= 40) { privatePid = pid; return true; }
 						continue;
@@ -584,19 +589,18 @@ int main(int argc, char **argv) {
 				() => fixture.tool.execute("later", { command })) : await execute("prepared", command);
 			expect(actual.content, JSON.stringify(actual.content)).toEqual(seed.content.map(item => item.type === "text" ? { ...item,
 				text: item.text.replace(/^seedA/, `actual${mode === "changed" ? "D" : "A"}`) } : item));
-			const resumed = mode !== "changed" && mode !== "identity" && mode !== "cancel";
+			const resumed = !["changed", "identity", "file", "cancel"].includes(mode);
 			expect(fixture.backend.actorMetrics().joinedHits, diagnostic()).toBe(Number(resumed));
 			if (resumed) expect(publishing.mock.calls.some(([, , certificate, , continuation, computation]) => certificate?.result.continuation &&
 				continuation && computation && computation.completedAt > continuation.computation.completedAt), diagnostic()).toBe(true);
-			if (mode !== "cancel") await host.finishTurn("prepared", true);
+			if (mode !== "cancel") { if (!resumed) expect(existsSync(`/proc/${privatePid}`)).toBe(true); await host.finishTurn("prepared", true); }
 			await expect.poll(() => existsSync(`/proc/${privatePid}`), { timeout: 5_000 }).toBe(false); // Retirement kills asynchronously, as for cancel.
 			if (resumed) expect(events.filter(event => event.type === "operation_prediction"), diagnostic()).toContainEqual(expect.objectContaining({ settlement: expect.objectContaining({
 				observation: "observed", match: expect.objectContaining({ matched: true, adoption: expect.objectContaining({ status: "adopted" }) }) }) }));
 		} finally { await host?.dispose(); await fixture.dispose(); }
 	});
 
-	test("transfers native Bash FD inputs to filesystem tools across turns with exact invalidation", { timeout: 30_000 }, async ({ skip, benchmark }) => {
-		if (process.arch !== "x64") return skip("x86-64 Linux only");
+nativeTest("transfers native Bash FD inputs to filesystem tools across turns with exact invalidation", { timeout: 30_000 }, async ({ skip, benchmark }) => {
 		const fixture = await benchmark("pi-native-resource-inputs-");
 		let host: ReturnType<typeof createSpeculativeActionHost> | undefined;
 		const search = await createClosedSearchProfile(fixture.workspace);
@@ -610,18 +614,14 @@ int main(void) { char b[1024]; return syscall(SYS_getdents64, 4, b, sizeof(b)) <
 ` });
 			await commitBenchmarkFixture(fixture.workspace, "Native resource input bridge"); await prepareLinuxProcessReuse(fixture);
 			const route = await fixture.prepareActorReplay();
-			const tools = [fixture.tool, createReadTool(fixture.workspace), createGrepTool(fixture.workspace), createLsTool(fixture.workspace), createFindTool(fixture.workspace)], events: SpeculativeActionEvent<string>[] = [];
-			host = createSpeculativeActionHost("native-inputs", { cwd: fixture.workspace, complete: async () => { throw new Error("no inference"); },
-				getSettings: () => ({ enabled: true, drafterEnabled: false, tools: tools.map(tool => tool.name), resourceCacheMaxEntries: 8,
-					resourceCacheMaxBytes: 1024 * 1024, patternAware: patternAwareSettings({ enabled: true, multiStepEnabled: false }) }),
-				preflight: () => true, executionWorlds: [fixture.world,
-					createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: ["read", "grep", "ls", "find"], maxBytes: () => 1024 * 1024 })],
+			const tools = [fixture.tool, createReadTool(fixture.workspace), createGrepTool(fixture.workspace), createLsTool(fixture.workspace), createFindTool(fixture.workspace)];
+			const prepared = patternProcessHost(fixture, "native-inputs", { tools: tools.map(tool => tool.name), resourceCacheMaxEntries: 8,
+				resourceCacheMaxBytes: 1024 * 1024, patternAware: patternAwareSettings({ enabled: true, multiStepEnabled: false }) }, {
+				executionWorlds: [fixture.world, createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: ["read", "grep", "ls", "find"], maxBytes: () => 1024 * 1024 })],
 				resolveInvocation: (tool, input) => search.invocations.get(tool) ?? resolvePiToolInvocation(tool, input,
 					{ cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath }),
-				onEvent: event => { events.push(event); },
-			});
-			const start = (turnID: string) => host!.startTurn({ turnID, tools, actorModel: testModel("actor"), actorOptions: undefined,
-				context: { systemPrompt: "inputs", messages: [], tools } });
+			}, tools), { events, start } = prepared;
+			host = prepared.host;
 			const command = "exec 3<input.txt 4<entries; worker; worker", bash = vi.fn(() => fixture.coordinator.runWith({ execute: request => route.executor.execute({ ...request,
 				scope: { sessionID: "native-inputs", turnID: "seed" } }) }, () => fixture.tool.execute("seed", { command })));
 			await start("seed");
@@ -658,8 +658,8 @@ int main(void) { char b[1024]; return syscall(SYS_getdents64, 4, b, sizeof(b)) <
 		let check: (() => Promise<boolean>) | undefined;
 		const registry = Reflect.get(fixture.backend, "handoffs") as ProcessHandoffRegistry;
 		const observe = registry.observeRunning.bind(registry), open = fixture.backend.open.bind(fixture.backend);
-		const observing = vi.spyOn(registry, "observeRunning").mockImplementation((key, owner, capability, invoke) => {
-			const release = observe(key, owner, capability, invoke); if (capability === "inputsChanged") check = owner.inputsChanged; return release;
+		const observing = vi.spyOn(registry, "observeRunning").mockImplementation((key, owner, invoke) => {
+			const release = observe(key, owner, invoke); check = owner.advance; return release;
 		});
 		const hints = ["ignored.txt", "stable.txt", "input.txt"].map(name => path.join(fixture.workspace, name));
 		const opening = vi.spyOn(fixture.backend, "open").mockImplementation(input => {
@@ -695,10 +695,10 @@ int main(void) {
 			await writeFile(hints[0]!, "unrelated"); await writeFile(hints[2]!, "predecessor");
 			const opened = vi.spyOn(filesystem, "open"), reads = opened.mock.calls.length;
 			try {
-				expect(await check!()).toBe(false); // The child's transaction starts after the shell's write.
+				expect(await check!()).toBe(true); // The child's transaction starts after the shell's write.
 				await writeFile(hints[2]!, "after");
 				// A bounded trace preview can lag the separate filesystem readiness signal.
-				await expect.poll(() => check!(), { timeout: 2000 }).toBe(true);
+				await expect.poll(() => check!(), { timeout: 2000 }).toBe(false);
 				expect(opened.mock.calls.slice(reads).filter(([file]) => String(file) === hints[0])).toHaveLength(0);
 				expect(fixture.backend.actorMetrics().lastError).toContain("actor_running_input_changed:");
 			} finally { opened.mockRestore(); }
@@ -712,8 +712,7 @@ int main(void) {
 		}
 	});
 
-	test.for(["completed", "running", "native", "native-merged", "native-closed-input", "native-descriptors", "native-null", "native-null-stdin", "native-status", "native-directory", "native-directory-entries", "native-directory-prepared-stale", "native-directory-opath", "native-directory-opath-prepared-stale", "native-pipe", "native-pipe-prepared-stale", "native-pipe-live", "native-pipe-live-prepared-stale", "native-pipe-live-mixed", "native-pipe-live-transfer", "native-pipe-producer", "native-pipe-producer-queued", "native-pipe-producer-short", "native-pipe-producer-splice", "native-socket", "native-socket-running", "native-socket-duplex", "native-socket-lifetime", "native-socket-io", "native-socket-messages", "native-socket-export", "native-socket-counter-export", "native-socket-prequeued", "native-socket-segmented", "native-socket-prefixed", "native-socket-orphan", "native-eventfd", "native-eventfd-semaphore", "native-socket-concurrent", "native-socket-half-closed", "native-socket-prepared-stale", "native-shared-table", "native-unshare", "native-prepared-stale", "native-prepared-restored"] as const)("reexecutes an owned child binding across turns without replaying its parent or stale input (%s)", { timeout: 20_000 }, async (mode, { skip, benchmark }) => {
-		if (process.arch !== "x64") return skip("x86-64 Linux only");
+nativeTest.for(["completed", "running", "native", "native-merged", "native-closed-input", "native-descriptors", "native-null", "native-null-stdin", "native-status", "native-directory", "native-directory-entries", "native-directory-prepared-stale", "native-directory-opath", "native-directory-opath-prepared-stale", "native-pipe", "native-pipe-prepared-stale", "native-pipe-live", "native-pipe-live-prepared-stale", "native-pipe-live-mixed", "native-pipe-live-transfer", "native-pipe-producer", "native-pipe-producer-queued", "native-pipe-producer-short", "native-pipe-producer-splice", "native-socket", "native-socket-running", "native-socket-duplex", "native-socket-lifetime", "native-socket-io", "native-socket-messages", "native-socket-export", "native-socket-counter-export", "native-socket-prequeued", "native-socket-segmented", "native-socket-prefixed", "native-socket-orphan", "native-eventfd", "native-eventfd-semaphore", "native-socket-concurrent", "native-socket-half-closed", "native-socket-prepared-stale", "native-shared-table", "native-unshare", "native-prepared-stale", "native-prepared-restored"] as const)("reexecutes an owned child binding across turns without replaying its parent or stale input (%s)", { timeout: 20_000 }, async (mode, { skip, benchmark }) => {
 		const fixture = await benchmark("pi-process-binding-", mode.includes("prepared-") ? "git" : undefined); // Borrowed immutable preparations.
 		const publishing = vi.spyOn(fixture.backend.planner, "publishCompleted");
 		const errors = vi.spyOn(fixture.backend as unknown as { setError(session: unknown, message: string): void }, "setError");
@@ -966,21 +965,13 @@ int main(int argc, char **argv) {
 				await writeFile(path.join(fixture.workspace, "input.txt"), "after\n");
 			}
 
-			const patternSettings = patternAwareSettings({ enabled: true, multiStepEnabled: false, beamWidth: 4 });
-			const patternStore = new PatternAwareStore(patternSettings, undefined, patternAwareActionSemantics(PI_ACTION_SEMANTICS, fixture.workspace));
-			const events: SpeculativeActionEvent<string>[] = [], tools = [fixture.tool];
-			host = createSpeculativeActionHost(scope.sessionID, { cwd: fixture.workspace, patternStore,
+			const prepared = patternProcessHost(fixture, scope.sessionID, { candidateLimit: 4, maxConcurrentActions: 6,
+				patternAware: patternAwareSettings({ enabled: true, multiStepEnabled: false, beamWidth: 4 }) }, {
 				// This boundary fixture budgets two native preparations plus the Actor; single-CPU live transfers are tested above.
 				resources: { initial: { cpuCount: 6, idleCpuCount: 6 }, sample: async () => ({ cpuCount: 6, idleCpuCount: 6 }) },
-				complete: async () => { throw new Error("unexpected inference"); },
-				getSettings: () => ({ enabled: true, drafterEnabled: false, candidateLimit: 4, maxConcurrentActions: 6, tools: ["bash"], patternAware: patternSettings }),
-				preflight: ({ args, action }) => { expect(args).toHaveProperty("command"); expect(action.input.command).toBe((args as { command: string }).command); return true; }, executionWorlds: [fixture.world],
-				resolveInvocation: (tool, input) => resolvePiToolInvocation(tool, input, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath }),
-				onEvent: event => { events.push(event); },
-			});
-			const start = (turnID: string) => host!.startTurn({ turnID, tools, actorModel: testModel("actor"), actorOptions: undefined,
-				context: { systemPrompt: "unchanged", messages: [], tools } });
-			const call = (turnID: string, command: string) => ({ turnID, id: turnID, tool: "bash", args: { command }, tools });
+				preflight: ({ args, action }) => { expect(args).toHaveProperty("command"); expect(action.input.command).toBe((args as { command: string }).command); return true; },
+			}), { events, patternStore, start, call } = prepared;
+			host = prepared.host;
 			for (const turnID of ["common-1", "common-2"]) {
 				await start(turnID);
 				await host.execute(call(turnID, "printf common"), undefined, () => fixture.tool.execute(turnID, { command: "printf common" }));
@@ -1101,8 +1092,7 @@ int main(int argc, char **argv) {
 		} finally { publication?.close(); restorePreparation?.(); publishing.mockRestore(); errors.mockRestore(); await host?.dispose(); await fixture.dispose(); }
 	});
 
-	test.for(["temporary", "persistent", "descendant", "merged", "stale"])("seals output pipe status before reusing a child (%s)", { timeout: 30_000 }, async (mode, { skip, benchmark }) => {
-		if (process.arch !== "x64") return skip("x86-64 Linux only");
+nativeTest.for(["temporary", "persistent", "descendant", "merged", "stale"])("seals output pipe status before reusing a child (%s)", { timeout: 30_000 }, async (mode, { benchmark }) => {
 		const fixture = await benchmark("pi-output-status-", "git", {});
 		await writeFile(path.join(fixture.workspace, "input.txt"), "before\n");
 		await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker", code: `${cHeaders("fcntl.h unistd.h")}
@@ -1143,8 +1133,7 @@ int main(void) {
 		});
 	});
 
-	test.for((["git", "overlayfs"] as const).flatMap(driver => ["read", "write", "locks", "locks-close", "locks-named", "path-write", "unlinked", "hardlink-read", "hardlink-write", "hardlink-path-write", "hardlink-rename", "hardlink-split", "hardlink-unlink", "hardlink-detached"].map(mode => [driver, mode] as const)))("learns and adopts regular OFDs with shared positions and predecessor inputs (%s, %s)", { timeout: 30_000 }, async ([driver, mode], { skip, benchmark }) => {
-		if (process.arch !== "x64") return skip("x86-64 Linux only");
+nativeTest.for((["git", "overlayfs"] as const).flatMap(driver => ["read", "write", "locks", "locks-close", "locks-named", "path-write", "unlinked", "hardlink-read", "hardlink-write", "hardlink-path-write", "hardlink-rename", "hardlink-split", "hardlink-unlink", "hardlink-detached"].map(mode => [driver, mode] as const)))("learns and adopts regular OFDs with shared positions and predecessor inputs (%s, %s)", { timeout: 30_000 }, async ([driver, mode], { skip, benchmark }) => {
 		if (mode === "locks-named" && await filesystem.readlink("/proc/self/ns/pid") === "pid:[4026531836]") return skip("nested PID namespace visibility case");
 		const fixture = await benchmark("pi-fd-binding-", driver);
 		const hardlink = mode.startsWith("hardlink"), pathWrite = mode.endsWith("path-write"), locks = mode.startsWith("locks");
@@ -1259,8 +1248,7 @@ int main(int argc,char **argv) {
 		}
 	});
 
-	test.for(["SOCK_DGRAM", "SOCK_SEQPACKET", "SOCK_DGRAM:close", "SOCK_SEQPACKET:close"])("adopts packet boundaries, empty messages, truncation and queued OFDs (%s)", { timeout: 30_000 }, async (scenario, { skip, benchmark }) => {
-		if (process.arch !== "x64") return skip("x86-64 Linux only");
+nativeTest.for(["SOCK_DGRAM", "SOCK_SEQPACKET", "SOCK_DGRAM:close", "SOCK_SEQPACKET:close"])("adopts packet boundaries, empty messages, truncation and queued OFDs (%s)", { timeout: 30_000 }, async (scenario, { benchmark }) => {
 		const [type, closing] = scenario.split(":");
 		const fixture = await benchmark("pi-packet-binding-");
 		await writeFile(path.join(fixture.workspace, "input.txt"), "abcdef");
@@ -1337,8 +1325,7 @@ static int take(int length,int peek,int truncated,char expected) {
 		});
 	});
 
-	test("owns the entire Actor call when a held child crosses the adoption boundary", async ({ skip }) => {
-		if (process.arch !== "x64") return skip("x86-64 Linux only");
+	nativeTest("owns the entire Actor call when a held child crosses the adoption boundary", async () => {
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-held-transaction-"));
 		const binary = path.join(root, "helper");
 		await compileBenchmarkHelper(root, { source: fileURLToPath(new URL("../src/linux-held-exec.c", import.meta.url)), output: "helper", arguments: ["-pthread", "-Werror"] });
@@ -1411,7 +1398,7 @@ static int take(int length,int peek,int truncated,char expected) {
 						expect(completed, "exhausted active input must block, never fabricate EOF").toBe(false);
 						process.kill(-child.pid!, "SIGKILL"); await closed;
 						await expect.poll(async () => (await readFile(`/proc/${Number(childPID)}/stat`, "utf8").catch(() => "")).split(") ")[1]?.[0] ?? "").not.toMatch(/[RSDT]/);
-						expect(await readFile(queueReport, "utf8")).toMatch(/^RUNNING \d+\n$/);
+						expect(await readFile(queueReport, "utf8")).toMatch(/^OFD 1\n0 (?:0|2) 0 \d+ \d+\nRUNNING \d+\n$/);
 					}
 				} finally { if (!completed) { process.kill(-child.pid!, "SIGKILL"); await closed; } }
 			}
@@ -2543,8 +2530,7 @@ int main(int argc, char **argv) {
 		}
 	});
 });
-test.for(["git", "auto"] as const)("preserves native metadata across stat families and rejects volatile or changed results (%s)", { timeout: 120_000 }, async (driver, { skip, benchmark }) => {
-	if (process.arch !== "x64") return skip("x86-64 Linux only");
+nativeTest.for(["git", "auto"] as const)("preserves native metadata across stat families and rejects volatile or changed results (%s)", { timeout: 120_000 }, async (driver, { benchmark }) => {
 	const fixture = await benchmark("pi-native-metadata-", driver, {}, os.homedir());
 	const actual = await vi.importActual<typeof filesystem>("node:fs/promises"), pins: filesystem.FileHandle[] = [];
 	const opening = vi.mocked(filesystem.open).mockImplementation(async (...args) => {

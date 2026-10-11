@@ -62,10 +62,8 @@ export interface ProcessHandoff {
 	readonly completion: Promise<void>;
 	readonly scope: ExecutionScope | undefined;
 	readonly startedAt: number;
-	/** A running owner's bounded negative lookup; false never authorizes adoption. */
-	readonly inputsChanged?: () => Promise<boolean>;
-	/** The producer owns a requested frontier through sealing; consumers only cancel their waits. */
-	readonly suspend?: () => Promise<void>;
+	/** Advance owned work toward a result. False declines this join; true still needs a sealed, validated result. */
+	readonly advance?: () => Promise<boolean>;
 }
 
 export interface ProcessContinuation { readonly image: Buffer; readonly physicalRoot: string; readonly computation: TimelineInterval; }
@@ -80,7 +78,7 @@ export interface ProcessExecutionBinding {
 }
 
 type HandoffState =
-	| { readonly status: "running"; inputsChanged?: () => Promise<boolean>; suspend?: () => Promise<void> }
+	| { readonly status: "running"; advance?: () => Promise<boolean> }
 	| { readonly status: "completed" | "reserved" | "retained"; readonly result?: { readonly candidate: ProcessProvenanceCertificate; readonly artifacts: VerifiedArtifactClosure;
 		readonly bytes: number; readonly computation: TimelineInterval; readonly continuation?: ProcessContinuation } };
 
@@ -208,8 +206,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 	}
 
 	hasJoinableWork(ownership: ProcessHandoffOwnership): boolean {
-		for (const record of this.records()) if (record.ownership === ownership && !record.signal.aborted &&
-			record.state.status === "running" && (record.inputsChanged || record.suspend)) return true;
+		for (const record of this.records()) if (record.ownership === ownership && !record.signal.aborted && record.advance) return true;
 		return false;
 	}
 
@@ -220,13 +217,13 @@ export class ProcessHandoffRegistry<Invocation = never> {
 	}
 
 	/** Running capabilities are observable state; completion or withdrawal revokes even a borrowed callback. */
-	observeRunning<Key extends "inputsChanged" | "suspend">(key: Sha256Digest, handoff: ProcessHandoff, capability: Key, invoke: NonNullable<ProcessHandoff[Key]>): () => void {
+	observeRunning(key: Sha256Digest, handoff: ProcessHandoff, invoke: NonNullable<ProcessHandoff["advance"]>): () => void {
 		const record = this.byKey.get(key)?.get(handoff), state = record?.state;
 		if (!record || state?.status !== "running") return () => {};
-		const owned = () => record.state === state && state[capability] === owned ? invoke() : Promise.resolve(capability === "inputsChanged" ? false : undefined);
-		Object.assign(state, { [capability]: owned });
+		const owned = () => record.state === state && state.advance === owned ? invoke() : Promise.resolve(false);
+		state.advance = owned;
 		this.wake(key);
-		return () => { if (state[capability] === owned) { state[capability] = undefined; this.wake(key); } };
+		return () => { if (state.advance === owned) { state.advance = undefined; this.wake(key); } };
 	}
 
 	async acquire<Plan extends { readonly certificate: ProcessProvenanceCertificate }>({ scope, ...request }: AcquireOptions<Plan>): Promise<ProcessHandoffAcquisition<Plan>> {
@@ -287,13 +284,12 @@ export class ProcessHandoffRegistry<Invocation = never> {
 						await Promise.allSettled(records.filter(record => record.ownership.acceptsScope(record.scope, scope, true) &&
 							(record.state.status === "running" || record.state.status === "reserved" || record.ownership.pendingWhole)).map(async record => {
 							retain(record);
-							const running = record.state.status === "running";
+							const running = record.state.status === "running", startedAt = performance.now();
 							if (running) {
-								const inputs = await waitForCompletion(record.inputsChanged?.() ?? Promise.resolve(false), stop);
-								if (inputs.status === "aborted" || stop.aborted || inputs.value) return;
+								const advanced = await waitForCompletion(record.advance?.() ?? Promise.resolve(true), stop);
+								if (advanced.status === "completed" && !advanced.value) return;
 							}
-							const startedAt = performance.now();
-							await waitForCompletion(running ? record.suspend?.().then(() => record.completion) ?? record.completion :
+							await waitForCompletion(running ? record.completion :
 								record.ownership.pendingWhole?.then(() => {}, () => {}) ?? new Promise<never>(() => {}), stop);
 							waits.push({ handoff: record, interval: new TimelineInterval(startedAt, performance.now()) });
 							changed.abort();
@@ -373,8 +369,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 			settle,
 			startedAt: performance.now(),
 			state: { status: "running" },
-			get inputsChanged() { return record.state.status === "running" ? record.state.inputsChanged : undefined; },
-			get suspend() { return record.state.status === "running" ? record.state.suspend : undefined; },
+			get advance() { return record.state.status === "running" ? record.state.advance : undefined; },
 			get computation() { return record.state.status !== "running" ? record.state.result?.computation : undefined; },
 			get continuation() { return record.state.status !== "running" ? record.state.result?.continuation : undefined; },
 		};

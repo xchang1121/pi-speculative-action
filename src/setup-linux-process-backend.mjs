@@ -175,7 +175,7 @@ async function installStrace() {
 	const target = path.join(localBin, "pi-speculative-strace"), stamp = `${target}.sha256`;
 	const qualify = async binary => {
 		await run(binary, ["--kill-on-exit", "-f", "-q", "-e", "trace=none", "-o", "/dev/null",
-			`--handoff-library=${heldExec}.so`, "--handoff-image=/dev/null", "--", "/bin/true"]);
+			`--handoff-admission-library=${heldExec}.so`, "--handoff-image=/dev/null", "--", "/bin/true"]);
 	};
 	try {
 		if ((await readFile(stamp, "utf8")).trim() !== `${sourceDigest}:${sha256(await readFile(target))}`) throw new Error("installation changed");

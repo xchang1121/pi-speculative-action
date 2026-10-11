@@ -410,7 +410,7 @@ done:
 }
 
 /* Called by the already authorized strace owner; no new ptracer exception or
- * sandbox permission is needed. The private process is retired on either result. */
+ * sandbox permission is needed. A positive result leaves the process unchanged. */
 int pi_process_image_frontier(long number) {
 	if (number == SYS_read || number == SYS_readv || number == SYS_recvfrom || number == SYS_recvmsg ||
 		number == SYS_write || number == SYS_writev || number == SYS_sendto || number == SYS_sendmsg) return 1;
@@ -430,9 +430,16 @@ static int image_status(pid_t pid, int consumer) {
 	}
 	valid &= !ferror(status) && seen == 15; fclose(status); return valid ? 0 : -1;
 }
-int pi_capture_process_image(pid_t pid, const char *path, unsigned long watched_tid) {
-	struct process_image *image = image_new(); int result = -1, output = -1;
-	if (!image) return -1;
+static int image_write(int output, pid_t pid, struct process_image *image, int complete) {
+	struct image_header *header = &image->header;
+	if (dprintf(output, "PIIMAGE %d %u %zu %" PRIu64 "\n", pid, image->fd_count, complete ? sizeof(*header) : 0, complete ? header->length : 0) < 0) return -1;
+	for (unsigned i = 0; i < image->fd_count; i++) if (dprintf(output, "%d %d %" PRId64 " %ju %ju %d\n", image->fds[i].fd,
+		image->fds[i].flags, image->fds[i].offset, image->fds[i].device, image->fds[i].inode, image->fds[i].fd) < 0) return -1;
+	return !complete || (transfer(output, header, sizeof(*header), 1) == 0 && transfer(output, image->data, (size_t)header->length, 1) == 0) ? 0 : -1;
+}
+int pi_prepare_process_image(pid_t pid, const char *path, unsigned long watched_tid, int (*admit)(void *), void *context) {
+	struct process_image *image = image_new(); int result = 1, output = -1;
+	if (!image) return 1;
 	struct image_header *header = &image->header;
 	if (ptrace(PTRACE_GETREGS, pid, 0, &header->registers) < 0 || header->registers.cs != 0x33 ||
 		!pi_process_image_frontier(header->registers.orig_rax) || ((long)header->registers.rax != -ENOSYS &&
@@ -445,7 +452,13 @@ int pi_capture_process_image(pid_t pid, const char *path, unsigned long watched_
 		image_memory(pid, header->registers.rip, &original, sizeof(original), 0) < 0 ||
 		image_cow(pid, bootstrap, bootstrap_length, bootstrap_cow) < 0) goto done;
 	header->registers.rax = header->registers.orig_rax; header->registers.orig_rax = (unsigned long)-1; header->registers.rip -= 2;
-	if (image_descriptors(pid, image) < 0 || image_scratch(pid) < 0 || image_mm(pid, header) < 0) goto done;
+	if (image_descriptors(pid, image) < 0) goto done;
+	output = open(path, O_WRONLY | O_CLOEXEC | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+	if (output < 0 || image_write(output, pid, image, 0) < 0) goto done;
+	result = admit(context); if (result) goto done;
+	/* Admission only reads the stopped process. From this point failure retires it. */
+	result = -1;
+	if (image_scratch(pid) < 0 || image_mm(pid, header) < 0) goto done;
 	struct iovec xstate = {.iov_base = header->xstate, .iov_len = sizeof(header->xstate)};
 	if (ptrace(PTRACE_GETREGSET, pid, NT_X86_XSTATE, &xstate) < 0 ||
 		ptrace(PTRACE_GETSIGMASK, pid, sizeof(header->sigmask), &header->sigmask) < 0) goto done;
@@ -498,13 +511,11 @@ int pi_capture_process_image(pid_t pid, const char *path, unsigned long watched_
 		}
 	}
 	header->magic = UINT64_C(0x50494d4147453033);
-	output = open(path, O_WRONLY | O_CLOEXEC | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
-	if (output < 0 || dprintf(output, "PIIMAGE %d %u %zu %" PRIu64 "\n", pid, image->fd_count, sizeof(*header), header->length) < 0) goto done;
-	for (unsigned i = 0; i < image->fd_count; i++) if (dprintf(output, "%d %d %" PRId64 " %ju %ju %d\n", image->fds[i].fd,
-		image->fds[i].flags, image->fds[i].offset, image->fds[i].device, image->fds[i].inode, image->fds[i].fd) < 0) goto done;
-	if (transfer(output, header, sizeof(*header), 1) == 0 && transfer(output, image->data, (size_t)header->length, 1) == 0) result = 0;
+	if (ftruncate(output, 0) < 0 || lseek(output, 0, SEEK_SET) != 0) goto done;
+	result = image_write(output, pid, image, 1);
 done:
-	if (output >= 0 && close(output) < 0) result = -1;
+	if (output >= 0 && close(output) < 0 && !result) result = -1;
+	if (result > 0 && output >= 0) unlink(path);
 	image_free(image); return result;
 }
 
@@ -3115,6 +3126,25 @@ static void *relay_output(void *argument) {
 		if (count < 0 || transfer(relay->destination, bytes, (size_t)count, 1) < 0) return (void *)1;
 	}
 }
+static int descriptor_report(int output, struct file_position *positions, unsigned count, int journal, int initial) {
+	if (dprintf(output, "OFD %u\n", count) < 0) return -1;
+	for (unsigned index = 0; index < count; index++) {
+		struct file_position *position = &positions[index];
+		int flags = initial || position->duplicate < 0 ? position->flags : fcntl(position->duplicate, F_GETFL);
+		off_t offset = position->before;
+		if (!initial && position->stream && !journal) {
+			unsigned char *bytes;
+			int eof, remaining = pipe_bytes(position->duplicate, &bytes, &eof);
+			const struct file_position *image = &positions[position->object];
+			offset = image->content_length - remaining;
+			int valid = remaining >= 0 && (position->stream >= 4 || eof == (position->stream == 1)) && offset >= 0 && (!remaining || !memcmp(bytes, image->content + offset, (size_t)remaining));
+			free(bytes); if (!valid) return -1;
+		} else if (!initial) offset = position->stream ? 0 : position->duplicate < 0 ? position->before : descriptor_seek(position->duplicate, flags, 0, SEEK_CUR);
+		if (offset < 0 || flags < 0 || dprintf(output, "%d %d %jd %ju %ju\n",
+			position->descriptor, flags, (intmax_t)offset, position->device, position->inode) < 0) return -1;
+	}
+	return 0;
+}
 static int execute_descriptors(const char *manifest, const char *report, char *executable, char **command, const char *route, unsigned closed_input, const int *output_flags) {
 	struct file_position positions[MAX_POSITIONS];
 	struct output_relay relays[2] = {{.source = -1, .writer = -1, .destination = 1}, {.source = -1, .writer = -1, .destination = 2}};
@@ -3340,7 +3370,7 @@ static int execute_descriptors(const char *manifest, const char *report, char *e
 		execv(executable, command);
 		_exit(errno == ENOENT ? 127 : 126);
 	}
-	if (dprintf(output, "RUNNING %d\n", root) < 0) { kill(root, SIGKILL); goto done; }
+	if (descriptor_report(output, positions, count, journal, 1) < 0 || dprintf(output, "RUNNING %d\n", root) < 0) { kill(root, SIGKILL); goto done; }
 	/* Journaling owns observations, not endpoints. Retain only references representing
 	 * real owners outside the private subtree; target aliases/forks own their own FDs. */
 	if (journal) for (unsigned index = 0; index < count; index++) {
@@ -3385,22 +3415,7 @@ static int execute_descriptors(const char *manifest, const char *report, char *e
 		void *failed; int joined = pthread_join(relays[index].thread, &failed); relays[index].started = 0;
 		if (joined || failed) goto done;
 	}
-	if (ftruncate(output, 0) < 0 || lseek(output, 0, SEEK_SET) != 0 || dprintf(output, "OFD %u\n", count) < 0) goto done;
-	for (unsigned index = 0; index < count; index++) {
-		struct file_position *position = &positions[index];
-		int flags = position->duplicate < 0 ? position->flags : fcntl(position->duplicate, F_GETFL);
-		off_t offset;
-		if (position->stream && !journal) {
-			unsigned char *bytes;
-			int eof, remaining = pipe_bytes(position->duplicate, &bytes, &eof);
-			const struct file_position *image = &positions[position->object];
-			offset = image->content_length - remaining;
-			int valid = remaining >= 0 && (position->stream >= 4 || eof == (position->stream == 1)) && offset >= 0 && (!remaining || !memcmp(bytes, image->content + offset, (size_t)remaining));
-			free(bytes); if (!valid) goto done;
-		} else offset = position->stream ? 0 : position->duplicate < 0 ? position->before : descriptor_seek(position->duplicate, flags, 0, SEEK_CUR);
-		if (offset < 0 || flags < 0 || dprintf(output, "%d %d %jd %ju %ju\n",
-			position->descriptor, flags, (intmax_t)offset, position->device, position->inode) < 0) goto done;
-	}
+	if (ftruncate(output, 0) < 0 || lseek(output, 0, SEEK_SET) != 0 || descriptor_report(output, positions, count, journal, 0) < 0) goto done;
 	for (unsigned index = 0; index < 2; index++) if (output_state[index].flags >= 0 &&
 		dprintf(output, "O %u %d %ju\n", index + 1, output_state[index].flags, output_state[index].inode) < 0) goto done;
 	/* A nameless file still belongs to its inherited OFDs. Publish its final image once, before releasing the pins. */

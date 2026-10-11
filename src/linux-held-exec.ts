@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { on } from "node:events";
 import { AsyncResource } from "node:async_hooks";
 import { randomBytes } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
@@ -405,28 +406,28 @@ export class LinuxHeldExecBoundary {
 					event.requested !== undefined && (!Number.isSafeInteger(event.requested) || event.requested < 0 || event.requested > 2 * 1024 * 1024))) return void socket.end("C\n");
 			// Once a proposal is delivered the peer may arm its exit stub, even if its ACK is lost.
 			prepared = true;
-			await write(socket, Buffer.from(`P ${code} ${decision.output.length} ${total} ${positions.length} ${resourceEvents.length} ${continuation?.image.length ?? 0} ${physicalRoot.length} ${sourceRoot.length}\n`));
+			await writeProcessChannel(socket, Buffer.from(`P ${code} ${decision.output.length} ${total} ${positions.length} ${resourceEvents.length} ${continuation?.image.length ?? 0} ${physicalRoot.length} ${sourceRoot.length}\n`));
 			for (const position of positions) {
-				await write(socket, Buffer.from(`S ${position.fd} ${position.device} ${position.inode} ${position.flags} ${position.before} ${position.after} ${position.content?.length ?? -1} ${position.afterFlags} ${Buffer.byteLength(position.path ?? "")} ${position.eof === undefined ? -1 : Number(position.eof)} ${position.capacity ?? 0} ${position.socket?.shutdown ?? 0} ${position.socket?.peerShutdown ?? 0} ${position.socket?.peerInode ?? 0} ${position.socket?.peerQueued ?? 0} ${position.socket?.allocated ?? 0} ${position.event ?? 0} ${position.messages?.length ?? 0} ${position.socket ? position.socket.type ?? 1 : 0}\n${position.messages?.map(message => `M ${position.fd} ${message.start} ${message.end} ${message.rights.length} ${message.rights.join(" ")}\n`).join("") ?? ""}`));
-				if (position.path) await write(socket, Buffer.from(position.path));
-				if (position.content) await write(socket, position.content);
+				await writeProcessChannel(socket, Buffer.from(`S ${position.fd} ${position.device} ${position.inode} ${position.flags} ${position.before} ${position.after} ${position.content?.length ?? -1} ${position.afterFlags} ${Buffer.byteLength(position.path ?? "")} ${position.eof === undefined ? -1 : Number(position.eof)} ${position.capacity ?? 0} ${position.socket?.shutdown ?? 0} ${position.socket?.peerShutdown ?? 0} ${position.socket?.peerInode ?? 0} ${position.socket?.peerQueued ?? 0} ${position.socket?.allocated ?? 0} ${position.event ?? 0} ${position.messages?.length ?? 0} ${position.socket ? position.socket.type ?? 1 : 0}\n${position.messages?.map(message => `M ${position.fd} ${message.start} ${message.end} ${message.rights.length} ${message.rights.join(" ")}\n`).join("") ?? ""}`));
+				if (position.path) await writeProcessChannel(socket, Buffer.from(position.path));
+				if (position.content) await writeProcessChannel(socket, position.content);
 			}
 			for (const event of resourceEvents) {
-				await write(socket, Buffer.from(`Q ${RESOURCE_TRANSITIONS.indexOf(event.kind)} ${event.fd} ${event.data.length} ${event.requested ?? event.data.length}\n`));
-				await write(socket, event.data);
+				await writeProcessChannel(socket, Buffer.from(`Q ${RESOURCE_TRANSITIONS.indexOf(event.kind)} ${event.fd} ${event.data.length} ${event.requested ?? event.data.length}\n`));
+				await writeProcessChannel(socket, event.data);
 			}
 			for (const event of decision.output) {
-				await write(socket, Buffer.from(`O ${event.fd} ${event.data.length}\n`));
-				await write(socket, event.data);
+				await writeProcessChannel(socket, Buffer.from(`O ${event.fd} ${event.data.length}\n`));
+				await writeProcessChannel(socket, event.data);
 			}
-			if (continuation) { await write(socket, physicalRoot); await write(socket, sourceRoot); await write(socket, continuation.image); }
+			if (continuation) { await writeProcessChannel(socket, physicalRoot); await writeProcessChannel(socket, sourceRoot); await writeProcessChannel(socket, continuation.image); }
 			const acknowledgement = await readLine(socket);
 			if (acknowledgement === "N") { prepared = false; return void socket.end(); }
 			if (acknowledgement !== "A") throw new Error("held-exec adoption was not acknowledged");
 			active.signal?.throwIfAborted();
 			await decision.commit();
 			committedAt = performance.now();
-			await write(socket, Buffer.from("R\n"));
+			await writeProcessChannel(socket, Buffer.from("R\n"));
 			if ((await readLine(socket)) !== "D") throw new Error("held-exec adoption completion is unknown");
 			completedAt = performance.now(); outcome = "adopted";
 			try { decision.adopted?.(); } catch { /* Feedback cannot poison a completed handoff. */ }
@@ -455,7 +456,7 @@ async function observeCompletion(socket: net.Socket,
 	const startedAt = performance.now();
 	let clock: HeldExecClock | undefined;
 	try {
-		await write(socket, Buffer.from("O\n"));
+		await writeProcessChannel(socket, Buffer.from("O\n"));
 		if (await readLine(socket) === "D") clock = Object.freeze({ startedAt, completedAt: performance.now() });
 	} finally {
 		try {
@@ -690,37 +691,22 @@ async function heldBy(pid: number, tracer: number, binary: string): Promise<bool
 }
 
 async function readLine(socket: net.Socket): Promise<string> {
-	socket.pause();
-	return new Promise((resolve, reject) => {
-		let body = "";
-		const cleanup = () => {
-			socket.pause();
-			socket.off("data", onData);
-			socket.off("end", onEnd);
-			socket.off("close", onEnd);
-			socket.off("error", onError);
-		};
-		const finish = (error?: unknown, value?: string) => { cleanup(); error ? reject(error) : resolve(value ?? ""); };
-		const onData = (chunk: Buffer) => {
+	const chunks = on(socket, "data", { close: ["end", "close"] });
+	let body = "";
+	try {
+		socket.resume();
+		for await (const [chunk] of chunks) {
 			body += chunk.toString("utf8");
 			const newline = body.indexOf("\n");
-			if (newline >= 0) finish(undefined, body.slice(0, newline));
-			else if (Buffer.byteLength(body) > MAX_REQUEST_BYTES) finish(new Error("held-exec message too large"));
-		};
-		const onEnd = () => finish(new Error("held-exec peer closed"));
-		const onError = (error: Error) => finish(error);
-		socket.on("data", onData);
-		socket.once("end", onEnd);
-		socket.once("close", onEnd);
-		socket.once("error", onError);
-		socket.resume();
-	});
+			if (newline >= 0) return body.slice(0, newline);
+			if (Buffer.byteLength(body) > MAX_REQUEST_BYTES) throw new Error("held-exec message too large");
+		}
+		throw new Error("held-exec peer closed");
+	} finally { socket.pause(); }
 }
 
-async function write(socket: net.Socket, data: Buffer): Promise<void> {
-	await new Promise<void>((resolve, reject) => {
-		socket.write(data, (error) => error ? reject(error) : resolve());
-	});
+export function writeProcessChannel(channel: NodeJS.WritableStream, data: Buffer): Promise<void> {
+	return new Promise((resolve, reject) => channel.write(data, error => error ? reject(error) : resolve()));
 }
 
 export function listenUnixSocket(server: net.Server, socketPath: string): Promise<void> {
