@@ -81,7 +81,8 @@ export interface ProcessExecutionBinding {
 
 type HandoffState =
 	| { readonly status: "running"; inputsChanged?: () => Promise<boolean>; suspend?: () => Promise<void> }
-	| { readonly status: "completed" | "reserved" | "retained"; readonly result?: { readonly candidate: ProcessProvenanceCertificate; readonly artifacts: VerifiedArtifactClosure } };
+	| { readonly status: "completed" | "reserved" | "retained"; readonly result?: { readonly candidate: ProcessProvenanceCertificate; readonly artifacts: VerifiedArtifactClosure;
+		readonly bytes: number; readonly computation: TimelineInterval; readonly continuation?: ProcessContinuation } };
 
 interface HandoffRecord extends ProcessHandoff {
 	borrowers: number;
@@ -89,10 +90,9 @@ interface HandoffRecord extends ProcessHandoff {
 	readonly key: Sha256Digest;
 	state: HandoffState;
 	binding?: ProcessExecutionBinding;
-	computation?: TimelineInterval;
 	readonly executablePath: string;
 	readonly settle: () => void;
-	continuation?: ProcessContinuation;
+	readonly continuation?: ProcessContinuation;
 }
 
 export type ProcessHandoffAcquisition<Plan> =
@@ -219,20 +219,12 @@ export class ProcessHandoffRegistry<Invocation = never> {
 	}
 
 	/** The running state owns lookup access; completion or release revokes even a borrowed callback. */
-	observeInputs(key: Sha256Digest, handoff: ProcessHandoff, changed: () => Promise<boolean>): () => void {
+	observeRunning<Key extends "inputsChanged" | "suspend">(key: Sha256Digest, handoff: ProcessHandoff, capability: Key, invoke: NonNullable<ProcessHandoff[Key]>): () => void {
 		const record = this.byKey.get(key)?.get(handoff), state = record?.state;
 		if (!record || state?.status !== "running") return () => {};
-		const check = () => record.state === state && state.inputsChanged === check ? changed() : Promise.resolve(false);
-		state.inputsChanged = check;
-		return () => { if (state.inputsChanged === check) state.inputsChanged = undefined; };
-	}
-
-	observeSuspension(key: Sha256Digest, handoff: ProcessHandoff, suspend: NonNullable<ProcessHandoff["suspend"]>): () => void {
-		const record = this.byKey.get(key)?.get(handoff), state = record?.state;
-		if (!record || state?.status !== "running") return () => {};
-		const owned: NonNullable<ProcessHandoff["suspend"]> = signal => record.state === state && state.suspend === owned ? suspend(signal) : Promise.resolve();
-		state.suspend = owned;
-		return () => { if (state.suspend === owned) state.suspend = undefined; };
+		const owned = (signal?: AbortSignal) => record.state === state && state[capability] === owned ? invoke(signal) : Promise.resolve(capability === "inputsChanged" ? false : undefined);
+		Object.assign(state, { [capability]: owned });
+		return () => { if (state[capability] === owned) state[capability] = undefined; };
 	}
 
 	async acquire<Plan extends { readonly certificate: ProcessProvenanceCertificate }>({ scope, ...request }: AcquireOptions<Plan>): Promise<ProcessHandoffAcquisition<Plan>> {
@@ -321,22 +313,24 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		computation?: TimelineInterval,
 	): Promise<boolean> {
 		if (this.byKey.get(key)?.get(handoff)?.state.status !== "running") throw new Error("process handoff is no longer running");
-		const references = referencedArtifacts(candidate), bytes = [...new Map(references.map(reference => [reference.digest, reference.size])).values()].reduce((sum, size) => sum + size, continuation?.image.length ?? 0);
+		computation ??= continuation?.computation ?? new TimelineInterval(handoff.startedAt, performance.now());
+		const graphs = [...new Set([computation, ...(continuation ? [continuation.computation] : [])])].map(value => TimelineInterval.serialize(value));
+		const references = referencedArtifacts(candidate), bytes = Buffer.byteLength(JSON.stringify([candidate, graphs])) +
+			[...new Map(references.map(reference => [reference.digest, reference.size])).values()].reduce((sum, size) => sum + size, continuation?.image.length ?? 0);
 		if (bytes > this.maxRetainedBytes) { this.complete(key, handoff); return persist(); }
 		const artifacts = await this.store.loadArtifacts(references, handoff.signal);
-		if (!artifacts || !this.complete(key, handoff, { candidate, artifacts }, continuation, computation)) throw new Error("process handoff has no complete owned result");
+		if (!artifacts || !this.complete(key, handoff, { candidate, artifacts, bytes, computation, continuation })) throw new Error("process handoff has no complete owned result");
 		return persist();
 	}
 
-	complete(key: Sha256Digest, handoff: ProcessHandoff, result?: Extract<HandoffState, { status: "completed" | "reserved" | "retained" }>["result"], continuation?: ProcessContinuation,
-		computation?: TimelineInterval): boolean {
+	complete(key: Sha256Digest, handoff: ProcessHandoff, result?: Extract<HandoffState, { status: "completed" | "reserved" | "retained" }>["result"]): boolean {
 		const record = this.byKey.get(key)?.get(handoff);
 		if (!record || record.state.status !== "running") return false;
+		const continuation = result?.continuation;
 		if (!!result?.candidate.result.continuation !== !!continuation || continuation && continuation.image.length !== result!.candidate.result.continuation!.imageBytes) return false;
-		record.continuation = continuation; this.retainedBytes += (result?.artifacts.bytes ?? 0) + (continuation?.image.length ?? 0);
+		this.retainedBytes += result?.bytes ?? 0;
 		record.state = { status: "completed", result };
 		this.completedCount++;
-		if (result) record.computation = computation ?? continuation?.computation ?? new TimelineInterval(record.startedAt, performance.now());
 		record.settle();
 		this.wake(key);
 		if (!result || !record.scope) this.remove(record);
@@ -370,11 +364,13 @@ export class ProcessHandoffRegistry<Invocation = never> {
 			executablePath,
 			scope,
 			ownership,
+			settle,
 			startedAt: performance.now(),
 			state: { status: "running" },
 			get inputsChanged() { return record.state.status === "running" ? record.state.inputsChanged : undefined; },
 			get suspend() { return record.state.status === "running" ? record.state.suspend : undefined; },
-			settle,
+			get computation() { return record.state.status !== "running" ? record.state.result?.computation : undefined; },
+			get continuation() { return record.state.status !== "running" ? record.state.result?.continuation : undefined; },
 		};
 		const records = this.byKey.get(key) ?? new Map();
 		records.set(record, record);
@@ -386,7 +382,12 @@ export class ProcessHandoffRegistry<Invocation = never> {
 	private wake(key: Sha256Digest): void { for (const waiter of this.waiters.get(key) ?? []) waiter.abort(); }
 
 	private remove(record: HandoffRecord): void {
-		this.revokeBinding(record);
+		this.releaseResult(record);
+		if (record.binding) {
+			this.retainedBytes -= this.invocations.get(record.binding)?.bytes ?? 0;
+			this.invocations.delete(record.binding);
+			record.binding = undefined;
+		}
 		const records = this.byKey.get(record.key);
 		if (records?.delete(record)) { if (record.state.status !== "running") this.completedCount--; this.wake(record.key); }
 		if (!records?.size) this.byKey.delete(record.key);
@@ -400,16 +401,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 	}
 
 	private releaseResult(record: HandoffRecord): void {
-		if (record.state.status !== "running") { this.retainedBytes -= record.state.result?.artifacts.bytes ?? 0; record.state = { status: "retained" }; }
-		if (record.continuation) { this.retainedBytes -= record.continuation.image.length; record.continuation = undefined; }
-	}
-
-	private revokeBinding(record: HandoffRecord): void {
-		this.releaseResult(record);
-		if (!record.binding) return;
-		this.retainedBytes -= this.invocations.get(record.binding)?.bytes ?? 0;
-		this.invocations.delete(record.binding);
-		record.binding = undefined;
+		if (record.state.status !== "running") { this.retainedBytes -= record.state.result?.bytes ?? 0; record.state = { status: "retained" }; }
 	}
 }
 

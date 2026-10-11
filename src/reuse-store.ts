@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { mkdir, open, readFile, readdir, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -101,8 +102,10 @@ export class ProvenanceCertificateStore {
 	private readonly lifecycle = new RuntimeLifecycleLane();
 	private readonly stopped = new AbortController();
 	private collection?: Promise<ProvenanceStoreGCResult>;
+	private maintenance?: NodeJS.Timeout;
+	private readonly publication = new AsyncLocalStorage<{ database: DatabaseSync; touched: Set<string>; active: boolean }>();
 	private control?: DatabaseSync;
-	private gcDueAt: number;
+	private reader?: DatabaseSync;
 
 	constructor(root: string, options: ProvenanceStoreOptions = {}) {
 		this.root = path.resolve(root); this.configure(options);
@@ -111,17 +114,23 @@ export class ProvenanceCertificateStore {
 		this.gcIntervalMs = nonNegativeNumber(options.gcIntervalMs, DEFAULT_GC_INTERVAL_MS);
 		this.orphanGraceMs = nonNegativeNumber(options.orphanGraceMs, DEFAULT_ORPHAN_GRACE_MS);
 		this.acceptedTaints = Object.freeze([...options.acceptedTaints ?? []]);
-		this.gcDueAt = Date.now() + this.gcIntervalMs;
 	}
 
 	get limits(): ProvenanceStoreLimits { return this.limitsValue; }
 	get signal(): AbortSignal { return this.stopped.signal; }
-	loadArtifacts(references: readonly ArtifactReference[], signal?: AbortSignal, retained?: VerifiedArtifactClosure): Promise<VerifiedArtifactClosure | undefined> {
-		return this.lifecycle.admit(() => this.artifacts.load(references, AbortSignal.any([this.signal, ...(signal ? [signal] : [])]), retained));
+	/** Own the complete read, including input proofs and their handle cleanup. */
+	read<T>(operation: (signal: AbortSignal) => Promise<T>, signal?: AbortSignal): Promise<T> {
+		return this.lifecycle.admit(() => {
+			const combined = AbortSignal.any([this.signal, ...(signal ? [signal] : [])]); combined.throwIfAborted(); return operation(combined);
+		});
 	}
+	loadArtifacts(references: readonly ArtifactReference[], signal?: AbortSignal, retained?: VerifiedArtifactClosure): Promise<VerifiedArtifactClosure | undefined> {
+		return this.read(signal => this.artifacts.load(references, signal, retained), signal);
+	}
+	/** A finite publication owns its payloads until sealing; other processes cannot collect between its writes. */
+	withPublication<T>(operation: () => Promise<T>): Promise<T> { return this.exclusive(() => operation()); }
 	configure(limits: Partial<ProvenanceStoreLimits>): void {
 		this.limitsValue = Object.freeze({ maxCertificates: positiveInteger(limits.maxCertificates, this.limits.maxCertificates), maxBytes: positiveInteger(limits.maxBytes, this.limits.maxBytes) });
-		this.gcDueAt = 0;
 	}
 
 	async put(certificate: ProcessProvenanceCertificate): Promise<boolean> {
@@ -129,15 +138,13 @@ export class ProvenanceCertificateStore {
 		const owned = parseProcessCertificate(certificate);
 		if (!owned) throw new Error("invalid process provenance certificate");
 		const references = referencedArtifacts(owned), touched = [`certificate:${owned.id}`, ...references.map(reference => this.objectKey(this.artifacts.artifactPath(reference.digest)))];
-		const published = await this.exclusive(async database => {
+		return this.exclusive(async database => {
 			await mapFilesystem(references, async reference => { if (!await this.artifacts.has(reference)) throw new Error(`certificate references missing artifact ${reference.digest}`); });
 			const stored = decodeCertificate(database.prepare("SELECT value FROM certificates WHERE id = ?").get(owned.id)?.value);
 			const valid = stored?.id === owned.id;
 			if (!valid) writeCertificate(database, owned);
 			return !valid;
 		}, touched);
-		if (Date.now() >= this.gcDueAt) { this.gcDueAt = Date.now() + this.gcIntervalMs; void this.gc().catch(() => undefined); }
-		return published;
 	}
 
 	get(id: Sha256Digest, signal?: AbortSignal): Promise<ProcessProvenanceCertificate | undefined> {
@@ -182,22 +189,31 @@ export class ProvenanceCertificateStore {
 
 	gc(): Promise<ProvenanceStoreGCResult> {
 		// Later publications are marked in the shared transaction log, so this finite inventory never restarts.
-		return this.collection ??= this.lifecycle.admit(async () => {
-			const revision = await this.revision(); return this.collect(await this.inventory(), revision);
-		}).finally(() => { this.collection = undefined; });
+		return this.collection ??= this.publication.exit(() => this.lifecycle.admit(async () => {
+			const revision = await this.exclusive(async database => changeRevision(database), [], false); return this.collect(await this.inventory(), revision);
+		}).finally(() => { this.collection = undefined; }));
 	}
 
 	/** Flush and release the connection; subsequent operations may reopen it. */
 	async drain(): Promise<void> {
+		clearTimeout(this.maintenance); this.maintenance = undefined;
 		await this.lifecycle.drain();
 		if (this.lifecycle.sealed) return this.dispose();
 		await this.lifecycle.serialize(() => this.closeDatabase());
 	}
 	dispose(): Promise<void> {
 		this.stopped.abort(new Error("provenance store is closed"));
+		clearTimeout(this.maintenance); this.maintenance = undefined;
 		return this.lifecycle.close(async () => { await this.lifecycle.drain(); this.closeDatabase(); });
 	}
-	private closeDatabase(): void { this.control?.close(); this.control = undefined; }
+	private closeDatabase(): void {
+		clearTimeout(this.maintenance); this.maintenance = undefined;
+		this.reader?.close(); this.reader = undefined; this.control?.close(); this.control = undefined;
+	}
+	private maintain(): void {
+		if (!this.control || this.maintenance || this.lifecycle.sealed) return;
+		this.publication.exit(() => { this.maintenance = setInterval(() => { void this.gc().catch(() => undefined); }, Math.max(100, this.gcIntervalMs)).unref(); });
+	}
 
 	async clear(): Promise<ProvenanceStoreGCResult> {
 		return this.exclusive(async database => {
@@ -262,22 +278,32 @@ export class ProvenanceCertificateStore {
 		return [this.artifacts.root, ...(await readdir(this.root)).filter(name => /^\.clear-[0-9a-f-]{36}$/.test(name)).map(name => path.join(this.root, name))];
 	}
 
-	private revision(): Promise<number> { return this.exclusive(async database => changeRevision(database), [], false); }
 	private objectKey(target: string): string { return path.relative(this.root, target).split(path.sep).join("/"); }
 	private async exclusive<T>(operation: (database: DatabaseSync) => Promise<T>, touched: readonly string[] = [], mutate = true, signal?: AbortSignal): Promise<T> {
+		const publication = this.publication.getStore();
+		if (publication?.active) {
+			const value = await operation(publication.database);
+			for (const key of touched) publication.touched.add(key);
+			return value;
+		}
+		// WAL readers see committed history without waiting behind a producer that an Actor may need to join.
+		if (!mutate && this.control) return this.read(() => operation(this.reader ??= new DatabaseSync(path.join(this.root, "metadata.sqlite"), { readOnly: true })), signal);
 		const admission = AbortSignal.any([this.stopped.signal, AbortSignal.timeout(1_000), ...(signal ? [signal] : [])]);
 		let admitted = false;
 		const task = this.lifecycle.serialize(async () => {
 			admission.throwIfAborted(); const database = this.control ??= await this.open(admission);
+			this.maintain();
 			if (!mutate) { admission.throwIfAborted(); return operation(database); }
 			await sqliteReady(() => { database.exec("BEGIN IMMEDIATE"); admitted = true; }, admission);
+			const publication = { database, touched: new Set(touched), active: true };
 			// Cancellation ends at admission. Finish owned filesystem work before releasing the transaction.
 			try {
-				const value = await operation(database);
+				const value = await this.publication.run(publication, () => operation(database));
 				const version = changeRevision(database) + 1, update = database.prepare("INSERT INTO changes VALUES (?, ?) ON CONFLICT(path) DO UPDATE SET revision=excluded.revision");
-				for (const key of ["", ...touched]) update.run(key, version);
+				for (const key of ["", ...publication.touched]) update.run(key, version);
 				database.exec("COMMIT"); return value;
 			} catch (error) { if (database.isTransaction) database.exec("ROLLBACK"); throw error; }
+			finally { publication.active = false; }
 		});
 		const result = await waitForCompletion(task, admission);
 		if (result.status !== "completed") { if (admitted) return task; throw admission.reason; }

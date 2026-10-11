@@ -26,25 +26,24 @@ export const processTest: ReturnType<TestAPI<{ benchmark: typeof createLinuxProc
 	},
 }).skipIf(process.platform !== "linux");
 
-/** Retain a real producer at publication until an Actor is admitted to its running work. */
+/** Hold finished production before its shared writer admission until an Actor joins owned running work. */
 export function holdProcessPublication(backend: LinuxProcessReuseBackend, delayMs = 0) {
 	const release = deferred();
-	let joined = false, timer: ReturnType<typeof setTimeout> | undefined;
-	const completions = new Set<Promise<void>>();
+	let joined = false, reached = false, timer: ReturnType<typeof setTimeout> | undefined;
 	const handoffs = Reflect.get(backend, "handoffs") as ProcessHandoffRegistry;
-	const publish = handoffs.publish.bind(handoffs);
-	const publication = vi.spyOn(handoffs, "publish").mockImplementation(async (...args) => {
-		completions.add(args[1].completion); await release.promise; return publish(...args);
+	const observing = vi.spyOn(handoffs, "observeRunning"), publish = backend.store.withPublication.bind(backend.store);
+	const publication = vi.spyOn(backend.store, "withPublication").mockImplementation(async (...args) => {
+		reached = true; await release.promise; return publish(...args);
 	});
 	const wait = scheduling.waitForCompletion;
 	const assessment = vi.spyOn(scheduling, "waitForCompletion").mockImplementation((promise, signal, timeoutMs) => {
-		if (completions.has(promise as Promise<void>) && !joined && !signal?.aborted) { joined = true; timer = setTimeout(release.resolve, delayMs); }
+		if (observing.mock.calls.some(([, owner]) => owner.completion === promise) && !joined && !signal?.aborted) { joined = true; timer = setTimeout(release.resolve, delayMs); }
 		return wait(promise, signal, timeoutMs);
 	});
 	return {
-		reached: () => completions.size > 0,
+		reached: () => reached,
 		joined: () => joined,
-		close: () => { clearTimeout(timer); release.resolve(); publication.mockRestore(); assessment.mockRestore(); },
+		close: () => { clearTimeout(timer); release.resolve(); publication.mockRestore(); assessment.mockRestore(); observing.mockRestore(); },
 	};
 }
 
@@ -110,10 +109,10 @@ export async function createLinuxProcessBenchmark(
 
 export async function prepareLinuxProcessReuse(
 	fixture: LinuxProcessBenchmark,
-	options: { readonly workspaceDriver?: WorkspaceSandboxDriver; readonly includeWorkspaceFingerprint?: boolean } = {},
+	options: { readonly workspaceDriver?: WorkspaceSandboxDriver; readonly includeWorkspaceFingerprint?: boolean; readonly skip?: (reason: string) => void } = {},
 ) {
 	const status = await fixture.backend.check(true);
-	if (status.state !== "ready") throw new Error(status.detail);
+	if (status.state !== "ready") { options.skip?.(status.detail); throw new Error(status.detail); }
 	if (!status.sandlockBinary || !status.straceBinary) throw new Error("Linux process backend omitted ready binaries");
 	const workspaceFingerprint = options.includeWorkspaceFingerprint
 		? await fixture.workspaceSandbox.fingerprint({ driver: options.workspaceDriver ?? "auto" }, fixture.workspace)

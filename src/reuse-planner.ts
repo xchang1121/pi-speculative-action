@@ -62,8 +62,8 @@ export class ProcessReusePlanner {
 
 	constructor(options: { readonly store: ProvenanceCertificateStore }) { this.store = options.store; }
 
-	async plan(request: ProcessReuseRequest): Promise<ProcessReusePlan> {
-		const signal = AbortSignal.any([this.store.signal, ...(request.signal ? [request.signal] : [])]); signal.throwIfAborted();
+	plan(request: ProcessReuseRequest): Promise<ProcessReusePlan> { return this.store.read(signal => this.lookup(request, signal), request.signal); }
+	private async lookup(request: ProcessReuseRequest, signal: AbortSignal): Promise<ProcessReusePlan> {
 		const metrics = { candidateCertificates: 0, eligibleCertificates: 0, pathsetsValidated: 0, filesRead: 0, bytesRead: 0, artifactsLoaded: 0, artifactBytesRead: 0 };
 		const lookup = (): ProcessReuseLookupMetrics => Object.freeze({ ...metrics });
 		const weakKey = request.weakKey;

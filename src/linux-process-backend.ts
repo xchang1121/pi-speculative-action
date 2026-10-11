@@ -348,16 +348,18 @@ export class LinuxProcessReuseBackend {
 	async bindingStale(binding: ProcessExecutionBinding): Promise<boolean> {
 		const invocation = this.handoffs.resolveBinding(binding, binding.scope);
 		if (!invocation || "trackingOnly" in invocation) return true;
-		const checked = new Set<Sha256Digest>();
-		const currentInputs = observeProcessInputs(binding.key, evidence => TimelineInterval.collect(() => validateDynamicDependencyCertificate(evidence,
-			// This scheduling observation grants no adoption authority; failed runs also suppress repeated preparation while their inputs hold.
-			{ acceptedTaints: evidence.taints })).then(result => result.output, () => undefined));
-		try { for (const candidates of [this.handoffs.results(binding.key, binding.scope), this.store.candidatesByWeakKey(binding.key, invocation.executable, checked)]) for await (const certificate of candidates) {
-			if (checked.has(certificate.id)) continue;
-			checked.add(certificate.id);
-			if ((await currentInputs(certificate.dependencyCertificate))?.strongKey === certificate.strongKey) return false;
-		} } catch { /* Unreadable history cannot establish current inputs. */ }
-		return true;
+		return this.store.read(async signal => {
+			const checked = new Set<Sha256Digest>();
+			const currentInputs = observeProcessInputs(binding.key, evidence => TimelineInterval.collect(() => validateDynamicDependencyCertificate(evidence,
+				// This scheduling observation grants no adoption authority; failed runs also suppress repeated preparation while their inputs hold.
+				{ acceptedTaints: evidence.taints, signal })).then(result => result.output, () => undefined));
+			for (const candidates of [this.handoffs.results(binding.key, binding.scope), this.store.candidatesByWeakKey(binding.key, invocation.executable, checked, signal)]) for await (const certificate of candidates) {
+				if (checked.has(certificate.id)) continue;
+				checked.add(certificate.id);
+				if ((await currentInputs(certificate.dependencyCertificate))?.strongKey === certificate.strongKey) return false;
+			}
+			return true;
+		}).catch(() => true);
 	}
 
 	/** Keep possible publication visible through preparation, execution, and final evidence capture. */
@@ -800,17 +802,18 @@ export class LinuxProcessReuseBackend {
 		const execution = session.topLevelExecution;
 		const evidence = session.topLevelEvidence;
 		if (!execution || !evidence) return;
-		const result = await captureProcessResult(this.store, execution.outcome, execution.observedProcessMs, changes.map(change => ({ logicalPath: slash(change.target), change })));
-		const computation = TimelineInterval.current(execution.startedAt, performance.now(), session.computations);
-		TimelineInterval.group(computation, session);
-		const recorded = TimelineInterval.serialize(computation);
-		const certificate = sealProcessCertificate({
-			prototype: execution.prototype,
-			producer: session.producer,
-			dependencyCertificate: evidence,
-			result: { ...result, ...(recorded ? { computation: recorded } : {}) },
+		await this.store.withPublication(async () => {
+			const result = await captureProcessResult(this.store, execution.outcome, execution.observedProcessMs, changes.map(change => ({ logicalPath: slash(change.target), change })));
+			const computation = TimelineInterval.current(execution.startedAt, performance.now(), session.computations);
+			TimelineInterval.group(computation, session);
+			const certificate = sealProcessCertificate({
+				prototype: execution.prototype,
+				producer: session.producer,
+				dependencyCertificate: evidence,
+				result: { ...result, computation: TimelineInterval.serialize(computation) },
+			});
+			if (await this.planner.publishCompleted(certificate, SAME_CONFINEMENT_TAINTS)) this.add(session, "wholeCommandPublished");
 		});
-		if (await this.planner.publishCompleted(certificate, SAME_CONFINEMENT_TAINTS)) this.add(session, "wholeCommandPublished");
 	}
 
 	private serve(session: ActiveSession, socket: net.Socket): void {
@@ -934,8 +937,6 @@ export class LinuxProcessReuseBackend {
 				return await this.executeAndPublish(session, request, executable, prototype, weakKey, outputRoute, acquired.work, requestID, captureWorkspace, inPlace, preparation);
 			} finally {
 				this.handoffs.complete(weakKey, acquired.work);
-				const computation = acquired.work.computation;
-				if (computation) recordProcessDependency(session, { computation, owned: true, shared: [computation] }, inPlace);
 			}
 		}, inPlace);
 	}
@@ -1101,7 +1102,7 @@ export class LinuxProcessReuseBackend {
 					if (durationMs !== undefined) observe(prototype, durationMs);
 				} } : {}) });
 			}
-			const output = loadOutputEvents(plan.artifacts, plan.certificate.result.journal);
+			const output = loadOutputEvents(plan.artifacts, plan.certificate.result.journal), computation = reusedComputation(plan.certificate, acquired);
 			const decision = measured({
 				kind: "replay",
 				settle,
@@ -1134,7 +1135,6 @@ export class LinuxProcessReuseBackend {
 				},
 				adopted: () => {
 					const binding = acquired.producer?.binding;
-					const computation = reusedComputation(plan.certificate, acquired);
 					if (observation && !observation.closed && sameScope(observation.scope, scope)) {
 						if (binding && this.handoffs.resolveBinding(binding, scope) && observation.bindings.size < this.store.limits.maxCertificates)
 							observation.bindings.set(order, binding);
@@ -1163,25 +1163,20 @@ export class LinuxProcessReuseBackend {
 		inputs?: ReturnType<typeof descriptorInputs>,
 		pid?: number,
 	): Promise<DispatcherResponse> {
-		let replayed = false;
-		try {
-			const { artifacts, certificate } = plan;
-			const output = wireOutput(loadOutputEvents(artifacts, certificate.result.journal));
-			await replayFilesystemEffects(this.replayWorkspace, artifacts, certificate.result.journal, session.projection, session.workspace.sandboxRoot,
-				path.join(session.workspace.processRoot, "private")).then(() => acquired.settle?.(true), error => {
-					acquired.settle?.(!(error instanceof EffectCommitFailure && error.disposition === "recoverable")); throw error;
-				});
-			session.nestedEvidence.push(certificate.dependencyCertificate);
-			this.recordHit(acquired.producer?.scope, acquired.joined, session);
-			recordProcessDependency(session, reusedComputation(certificate, acquired), pid);
-			replayed = true;
-			const streams = inputs && streamSettlement(inputs, (certificate.result.resources?.transitions ?? []).map(event => ({ alias: event.id, kind: event.kind, data: artifacts.read(event.data) })));
-			if (inputs && !streams) return { kind: "hit", weakKey, output: [], exit: { kind: "code", code: 125 } };
-			return { kind: "hit", weakKey, output, exit: certificate.result.exit, ...(streams?.length ? { streams } : {}) };
-		} finally {
-			const observed = plan.certificate.result.observedProcessMs;
-			if (replayed && observed !== undefined) this.add(session, "reusedProcessMs", observed);
-		}
+		const { artifacts, certificate } = plan;
+		const output = wireOutput(loadOutputEvents(artifacts, certificate.result.journal)), computation = reusedComputation(certificate, acquired);
+		await replayFilesystemEffects(this.replayWorkspace, artifacts, certificate.result.journal, session.projection, session.workspace.sandboxRoot,
+			path.join(session.workspace.processRoot, "private")).then(() => acquired.settle?.(true), error => {
+				acquired.settle?.(!(error instanceof EffectCommitFailure && error.disposition === "recoverable")); throw error;
+			});
+		session.nestedEvidence.push(certificate.dependencyCertificate);
+		this.recordHit(acquired.producer?.scope, acquired.joined, session);
+		recordProcessDependency(session, computation, pid);
+		const observed = certificate.result.observedProcessMs;
+		if (observed !== undefined) this.add(session, "reusedProcessMs", observed);
+		const streams = inputs && streamSettlement(inputs, (certificate.result.resources?.transitions ?? []).map(event => ({ alias: event.id, kind: event.kind, data: artifacts.read(event.data) })));
+		if (inputs && !streams) return { kind: "hit", weakKey, output: [], exit: { kind: "code", code: 125 } };
+		return { kind: "hit", weakKey, output, exit: certificate.result.exit, ...(streams?.length ? { streams } : {}) };
 	}
 
 	private async executeAndPublish(
@@ -1252,7 +1247,7 @@ export class LinuxProcessReuseBackend {
 				}
 				return false;
 			};
-			releaseInputs = this.handoffs.observeInputs(weakKey, work, () => inputCheck ??=
+			releaseInputs = this.handoffs.observeRunning(weakKey, work, "inputsChanged", () => inputCheck ??=
 				changedInput().catch(() => true /* an unproven check rejects the join */).finally(() => { inputCheck = undefined; }));
 			const imagePath = path.join(traceRoot, "continuation");
 			const command = straceCommand(ready.strace, tracePrefix, [
@@ -1296,7 +1291,7 @@ export class LinuxProcessReuseBackend {
 				inheritedFiles: inheritedFiles.map(file => file.fd),
 				...(live ? { onControl: (channel: import("node:stream").Duplex, wake: () => boolean) => {
 					let suspended: Promise<void> | undefined;
-					const release = this.handoffs.observeSuspension(weakKey, work, joinSignal => suspended ??= (async () => {
+					const release = this.handoffs.observeRunning(weakKey, work, "suspend", joinSignal => suspended ??= (async () => {
 						const executionSignal = AbortSignal.any([session.signal, work.signal]);
 						const stop = AbortSignal.any([executionSignal, ...(joinSignal ? [joinSignal] : [])]);
 						const frontier = await this.requestProcessImageAtFrontier(descriptorReportPath!, channel, wake, stop, executionSignal);
@@ -1424,71 +1419,73 @@ export class LinuxProcessReuseBackend {
 					taints: [...taints],
 				};
 				stage = "artifacts";
-				const baseResult = await captureProcessResult(this.store, outcome, observedProcessMs,
-					[...effects.effects, ...external.changes.map(change => ({ logicalPath: slash(change.target), change }))]);
-				await descriptors.captureFileEffects(this.store, descriptorOffsets, after, effects.complete, baseResult.journal);
-				const transitions: NonNullable<import("./provenance-certificate.ts").ProcessResourceEffects["transitions"]>[number][] = [];
-				for (const event of observation.resourceJournal ?? []) {
-					const input = inputs.find(input => streamIdentity(descriptorOffsets!.find(position => position.fd === input.fd)!) === event.inode &&
-						(event.description !== undefined ? input.alias === event.description : event.kind === "produce" ? (input.flags & 3) !== 0 :
-							!["consume", "peek"].includes(event.kind) || (input.flags & 3) !== 1));
-					if (!input) throw new Error("unbound stream transition");
-					executedStreams.push({ alias: input.alias, kind: event.kind, data: event.data });
-					transitions.push({ id: input.alias, kind: event.kind, data: await this.store.artifacts.put(event.data), ...(event.requested !== undefined ? { requested: event.requested } : {}) });
-				}
-				const { exit, ...prefixResult } = baseResult;
-				// A transferred prefix includes producing its proof and sealed image; the separate native frontier is unchanged.
-				const computation = this.processComputation(session, work.startedAt, performance.now(), observation.pids, preparation);
-				const recorded = TimelineInterval.serialize(computation);
-				const result: ProcessResultRecord = { ...prefixResult, ...(continuation ? { continuation: { imageDigest: sha256Digest(continuation.image), imageBytes: continuation.image.length } } : { exit: exit! }),
-					...(recorded ? { computation: recorded } : {}),
-					...(descriptorOffsets ? { resources: { ...descriptorEffects(request.resources!, descriptorOffsets), ...(resourceJournal ? { transitions } : {}) } } : {}) };
-				stage = "certificate";
-				const certificate = sealProcessCertificate({ prototype, producer: session.nestedProducer, dependencyCertificate, result });
-				certificateID = certificate.id;
-				// A child can read an earlier child's private output. Its parent can prove that input from the combined
-				// transaction even when this child, considered alone against the host, could not.
-				if (!evidence.complete && observation.complete && !escaped && !external.unrepresentable.length && !continuation) session.foldedObservations.push(observation);
-				else session.nestedEvidence.push(certificate.dependencyCertificate);
-				if (taints.size) {
-					this.add(session, "tainted");
-					// Keep the capture's existing reasons beside its categories. Diagnostic text never changes sealed evidence.
-					const reasons = (stage: string, values: readonly string[]) => values.slice(0, 4).map(value => `${stage}:${value.slice(0, 512)}${value.length > 512 ? "…" : ""}`)
-						.concat(values.length > 4 ? [`${stage}:more_reasons`] : []);
-					const detail = [`tainted:${[...taints].join(",")}`,
-						...(observation.unsupportedSyscalls?.length ? [`syscalls:${observation.unsupportedSyscalls.join(",")}${observation.unsupportedSyscallsTruncated ? ",…" : ""}`] : []),
-						...reasons("trace", observation.incompleteReasons), ...reasons("dependency", evidence.incompleteReasons),
-						...reasons("external", external.unrepresentable)].join("; ");
-					this.setError(session, detail.length > 4096 ? `${detail.slice(0, 4095)}…` : detail);
-				}
-				stage = "handoff_registration";
-				if (await this.handoffs.publish(
-					weakKey,
-					work,
-					certificate,
-					() => {
-						if (continuation) return Promise.resolve(false);
-						const binding = this.handoffs.bind(weakKey, work, {
-							argv0: request.argv0, args: request.args, environment: request.environment,
-							cwd: logicalCwd, executable: logicalExecutable, sourceRoot: session.sourceRoot, outputRoute, producer: session.nestedProducer,
-							...(request.outputPipes ? { outputPipes: request.outputPipes } : {}), ...(request.outputFlags ? { outputFlags: request.outputFlags } : {}),
-							...(request.closeStdin ? { closeStdin: true } : {}),
-								...(request.resources ? { resources: request.resources } : {}),
-						});
-						if (binding) session.executionBindings.set(requestID, binding);
-						stage = "history_publication";
-						return this.planner.publishCompleted(certificate, SAME_CONFINEMENT_TAINTS).catch((error: unknown) => {
-							// Optional history storage cannot invalidate already sealed execution evidence.
-							this.setError(session, `nested_publish:${failureDetail(error)}`);
-							return false;
-						});
-					},
-					continuation,
-					computation,
-				)) {
-					this.add(session, "published");
-				}
-				reusable = this.recordPreparedResult(session, certificate, !!request.resources || inputs.length > 0);
+				await this.store.withPublication(async () => {
+					const baseResult = await captureProcessResult(this.store, outcome!, observedProcessMs,
+						[...effects.effects, ...external.changes.map(change => ({ logicalPath: slash(change.target), change }))]);
+					await descriptors!.captureFileEffects(this.store, descriptorOffsets, after, effects.complete, baseResult.journal);
+					const transitions: NonNullable<import("./provenance-certificate.ts").ProcessResourceEffects["transitions"]>[number][] = [];
+					for (const event of observation.resourceJournal ?? []) {
+						const input = inputs.find(input => streamIdentity(descriptorOffsets!.find(position => position.fd === input.fd)!) === event.inode &&
+							(event.description !== undefined ? input.alias === event.description : event.kind === "produce" ? (input.flags & 3) !== 0 :
+								!["consume", "peek"].includes(event.kind) || (input.flags & 3) !== 1));
+						if (!input) throw new Error("unbound stream transition");
+						executedStreams.push({ alias: input.alias, kind: event.kind, data: event.data });
+						transitions.push({ id: input.alias, kind: event.kind, data: await this.store.artifacts.put(event.data), ...(event.requested !== undefined ? { requested: event.requested } : {}) });
+					}
+					const { exit, ...prefixResult } = baseResult;
+					// A transferred prefix includes producing its proof and sealed image; the separate native frontier is unchanged.
+					const computation = this.processComputation(session, work.startedAt, performance.now(), observation.pids, preparation);
+					recordProcessDependency(session, { computation, owned: true, shared: [computation] }, inPlace);
+					const result: ProcessResultRecord = { ...prefixResult, ...(continuation ? { continuation: { imageDigest: sha256Digest(continuation.image), imageBytes: continuation.image.length } } : { exit: exit! }),
+						computation: TimelineInterval.serialize(computation),
+						...(descriptorOffsets ? { resources: { ...descriptorEffects(request.resources!, descriptorOffsets), ...(resourceJournal ? { transitions } : {}) } } : {}) };
+					stage = "certificate";
+					const certificate = sealProcessCertificate({ prototype, producer: session.nestedProducer, dependencyCertificate: dependencyCertificate!, result });
+					certificateID = certificate.id;
+					// A child can read an earlier child's private output. Its parent can prove that input from the combined
+					// transaction even when this child, considered alone against the host, could not.
+					if (!evidence.complete && observation.complete && !escaped && !external.unrepresentable.length && !continuation) session.foldedObservations.push(observation);
+					else session.nestedEvidence.push(certificate.dependencyCertificate);
+					if (taints.size) {
+						this.add(session, "tainted");
+						// Keep the capture's existing reasons beside its categories. Diagnostic text never changes sealed evidence.
+						const reasons = (stage: string, values: readonly string[]) => values.slice(0, 4).map(value => `${stage}:${value.slice(0, 512)}${value.length > 512 ? "…" : ""}`)
+							.concat(values.length > 4 ? [`${stage}:more_reasons`] : []);
+						const detail = [`tainted:${[...taints].join(",")}`,
+							...(observation.unsupportedSyscalls?.length ? [`syscalls:${observation.unsupportedSyscalls.join(",")}${observation.unsupportedSyscallsTruncated ? ",…" : ""}`] : []),
+							...reasons("trace", observation.incompleteReasons), ...reasons("dependency", evidence.incompleteReasons),
+							...reasons("external", external.unrepresentable)].join("; ");
+						this.setError(session, detail.length > 4096 ? `${detail.slice(0, 4095)}…` : detail);
+					}
+					stage = "handoff_registration";
+					if (await this.handoffs.publish(
+						weakKey,
+						work,
+						certificate,
+						() => {
+							if (continuation) return Promise.resolve(false);
+							const binding = this.handoffs.bind(weakKey, work, {
+								argv0: request.argv0, args: request.args, environment: request.environment,
+								cwd: logicalCwd, executable: logicalExecutable, sourceRoot: session.sourceRoot, outputRoute, producer: session.nestedProducer,
+								...(request.outputPipes ? { outputPipes: request.outputPipes } : {}), ...(request.outputFlags ? { outputFlags: request.outputFlags } : {}),
+								...(request.closeStdin ? { closeStdin: true } : {}),
+									...(request.resources ? { resources: request.resources } : {}),
+							});
+							if (binding) session.executionBindings.set(requestID, binding);
+							stage = "history_publication";
+							return this.planner.publishCompleted(certificate, SAME_CONFINEMENT_TAINTS).catch((error: unknown) => {
+								// Optional history storage cannot invalidate already sealed execution evidence.
+								this.setError(session, `nested_publish:${failureDetail(error)}`);
+								return false;
+							});
+						},
+						continuation,
+						computation,
+					)) {
+						this.add(session, "published");
+					}
+					reusable = this.recordPreparedResult(session, certificate, !!request.resources || inputs.length > 0);
+				});
 			} catch (error) {
 				// The process already ran. Certificate failure must never cause dispatcher fallback/re-execution.
 				const detail = failureDetail(error);

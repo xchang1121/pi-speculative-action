@@ -310,13 +310,7 @@ export function parseProcessCertificate(value: unknown): ProcessProvenanceCertif
 	const candidate = value as Partial<ProcessProvenanceCertificate>;
 	if (!isSha256Digest(candidate.id) || !candidate.prototype || !candidate.producer || !candidate.dependencyCertificate || !candidate.result) return undefined;
 	try {
-		const sealed = sealProcessCertificate({
-			prototype: candidate.prototype,
-			producer: candidate.producer,
-			dependencyCertificate: candidate.dependencyCertificate,
-			result: candidate.result,
-			createdAt: candidate.createdAt,
-		});
+		const sealed = sealProcessCertificate(candidate as ProcessProvenanceCertificate);
 		if (sealed.id !== candidate.id || sealed.weakKey !== candidate.weakKey || sealed.strongKey !== candidate.strongKey) return undefined;
 		return sealed;
 	} catch {

@@ -626,9 +626,9 @@ int main(void) { char b[1024]; return syscall(SYS_getdents64, 4, b, sizeof(b)) <
 		let pending: ReturnType<typeof forkReusableBash> | undefined, workspace: Parameters<typeof fixture.backend.open>[0]["workspace"] | undefined;
 		let check: (() => Promise<boolean>) | undefined;
 		const registry = Reflect.get(fixture.backend, "handoffs") as ProcessHandoffRegistry;
-		const observe = registry.observeInputs.bind(registry), open = fixture.backend.open.bind(fixture.backend);
-		const observing = vi.spyOn(registry, "observeInputs").mockImplementation((key, owner, changed) => {
-			check = changed; return observe(key, owner, changed);
+		const observe = registry.observeRunning.bind(registry), open = fixture.backend.open.bind(fixture.backend);
+		const observing = vi.spyOn(registry, "observeRunning").mockImplementation((key, owner, capability, invoke) => {
+			const release = observe(key, owner, capability, invoke); if (capability === "inputsChanged") check = owner.inputsChanged; return release;
 		});
 		const hints = ["ignored.txt", "stable.txt", "input.txt"].map(name => path.join(fixture.workspace, name));
 		const opening = vi.spyOn(fixture.backend, "open").mockImplementation(input => {
@@ -636,8 +636,6 @@ int main(void) { char b[1024]; return syscall(SYS_getdents64, 4, b, sizeof(b)) <
 			return open({ ...input, workspace: { ...input.workspace, sourceChanges: () => ({ uncertain: false, paths: hints }) } });
 		});
 		try {
-			const status = await fixture.backend.check(true);
-			if (status.state !== "ready") return skip(status.detail);
 			for (const file of hints) await writeFile(file, "baseline");
 			await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker", code: `${cHeaders("fcntl.h unistd.h")}
 int main(void) {
@@ -657,7 +655,7 @@ int main(void) {
 }
 ` });
 			await commitBenchmarkFixture(fixture.workspace, "Running predecessor inputs");
-			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
+			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture, { skip });
 			pending = forkReusableBash(fixture, { label: "inputs", command: "printf predecessor > input.txt; worker",
 				actionNamespace: "running-inputs", executionFingerprint });
 			void pending.catch(() => {});
@@ -717,8 +715,6 @@ static int take(int fd, char expected, int *rights, int count, int peek) {
 		let publication: ReturnType<typeof holdProcessPublication> | undefined;
 		let restorePreparation: (() => void) | undefined;
 		try {
-			const status = await fixture.backend.check(true);
-			if (status.state !== "ready") return skip(status.detail);
 			await writeFile(path.join(fixture.workspace, "input.txt"), "before\n");
 			if (descriptors) await writeFile(path.join(fixture.workspace, "fd.txt"), "abcdef");
 			await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker", code: `#define _GNU_SOURCE
@@ -868,7 +864,7 @@ int main(int argc, char **argv) {
 ` });
 			}
 			await commitBenchmarkFixture(fixture.workspace, "Bound process invocation");
-			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
+			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture, { skip });
 			const scope = { sessionID: "binding", turnID: "recorded" }, later = { ...scope, turnID: "prepared" };
 			const command = (descriptors ? "exec 3<fd.txt; exec 4<&3; exec 8<fd.txt; IFS= read -r -N 1 discarded <&3; " : "") +
 				(directory ? "exec 10<.; exec 11<&10; " : "") +
@@ -1042,7 +1038,7 @@ int main(int argc, char **argv) {
 				scope: { ...scope, turnID: "prepared" } }) }, () => fixture.tool.execute("prepared", { command: changedParent })));
 			const nativeExecution = host.execute(call("prepared", changedParent), undefined, actor);
 			void nativeExecution.catch(() => undefined);
-			if (running) await expect.poll(() => publication!.joined()).toBe(true);
+			if (running) await expect.poll(() => publication!.joined() || { actor: fixture.backend.actorMetrics(), producer: fixture.backend.metrics() }).toBe(true);
 			const stalePreparation = mode.endsWith("prepared-stale");
 			expect((await nativeExecution).content).toEqual([{ type: "text", text: `automatic-parent\n${stalePreparation ? "changed after preparation\n" : "newest\n"}${suffix}` }]);
 			expect(actor).toHaveBeenCalledOnce();
@@ -1123,8 +1119,6 @@ int main(void) {
 		const hardlink = mode.startsWith("hardlink"), pathWrite = mode.endsWith("path-write"), locks = mode.startsWith("locks");
 		const memory = locks && mode !== "locks-named", closing = mode === "locks-close";
 		const writable = !pathWrite && mode !== "read" && mode !== "hardlink-read";
-		const status = await fixture.backend.check(true);
-		if (status.state !== "ready") throw new Error(status.detail);
 		const input = path.join(fixture.workspace, "input.txt");
 		const reset = async () => {
 			if (hardlink) for (const name of ["input.txt", "alias.txt", "moved.txt"]) await rm(path.join(fixture.workspace, name), { force: true });
@@ -2196,8 +2190,6 @@ int main(void) { int fds[2], status; char queue[8]; if (pipe(fds) || fds[0] != 3
 		});
 		let branch: Awaited<ReturnType<typeof forkReusableBash>> | undefined;
 		try {
-			const status = await fixture.backend.check(true);
-			if (status.state !== "ready") return skip(status.detail);
 			await writeFile(path.join(fixture.workspace, "barrier-worker"), [
 				"#!/bin/sh", "set -C",
 				"if ( : > \"$1/slot\" ) 2>/dev/null; then self=one other=two; else self=two other=one; fi",
@@ -2213,8 +2205,7 @@ int main(void) { int fds[2], status; char queue[8]; if (pipe(fds) || fds[0] != 3
 			await compileBenchmarkHelper(fixture.workspace, { source: "fd-check.c", output: "fd-check", code: "#include <fcntl.h>\nint main(void) {\n\tint mask = 0;\n\tfor (int fd = 0; fd < 3; fd++) if (fcntl(fd, F_GETFD) >= 0) mask |= 1 << fd;\n\treturn mask;\n}\n" });
 			const streamProbes = ["", "0<&-", "1>&-", "2>&-", "0<&- 1>&- 2>&-", "3>&1"].map((redirection) =>
 				"status=0; fd-check " + redirection + " || status=$?; printf 'fds:%s\\n' \"$status\"").join("; ");
-			await fixture.world.speculation.prepare?.({ cwd: fixture.workspace });
-			const executionFingerprint = await fixture.backend.fingerprint();
+			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture, { skip });
 			let allocationFailed = false;
 			allocations.mockImplementation((...args) => {
 				if (!allocationFailed && path.basename(String(args[0])) === "trace-") {
@@ -2396,13 +2387,11 @@ int main(void) { int fds[2], status; char queue[8]; if (pipe(fds) || fds[0] != 3
 		});
 		let running: ReturnType<typeof forkReusableBash> | undefined;
 		try {
-			const status = await fixture.backend.check(true);
-			if (status.state !== "ready") return skip(status.detail);
 			const inputName = failure === "input_image" ? path.join(fixture.root, "input.txt") : "input.txt";
 			await writeFile(path.resolve(fixture.workspace, inputName), "capture-once");
 			await compileBenchmarkHelper(fixture.workspace, { source: "emit.c", output: "emit", code: `#include <fcntl.h>\n#include <unistd.h>\nint main(void) { char text[12]; return read(open(${JSON.stringify(inputName)}, O_RDONLY), text, 12) != 12 || write(1, text, 12) != 12; }\n` });
 			await commitBenchmarkFixture(fixture.workspace, "Process capture failure");
-			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
+			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture, { skip });
 			running = forkReusableBash(fixture, { command: "emit", label: failure, actionNamespace: "capture-owners", executionFingerprint });
 			void running.then(() => { returned = true; }, () => { returned = true; });
 			await Promise.race([failed.promise, running.then(() => { throw new Error(`failure injection was not reached: ${JSON.stringify(fixture.backend.metrics())}`); })]);

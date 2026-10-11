@@ -6,7 +6,6 @@ import { afterEach, expect, test, vi } from "vitest";
 import { ArtifactCAS, captureFileDependency, ProcessReusePlanner, ProvenanceCertificateStore, referencedArtifacts, sealProcessCertificate, sha256Digest,
 	type ProcessProvenanceCertificate, type VerifiedArtifactClosure } from "../src/process-reuse.ts";
 import { ProcessHandoffOwnership, ProcessHandoffRegistry, type ProcessHandoff } from "../src/process-handoff.ts";
-import { LinuxProcessReuseBackend } from "../src/linux-process-backend.ts";
 import { effectCommitFailure } from "../src/effect-transaction.ts";
 import { waitForCompletion } from "../src/scheduler.ts";
 import { TaskTimeline, TimelineInterval } from "../src/task-timing.ts";
@@ -45,7 +44,7 @@ async function fixture(options: ConstructorParameters<typeof ProvenanceCertifica
 		return sealProcessCertificate({ ...PROCESS_CERTIFICATE, createdAt, dependencyCertificate: { complete: true, dependencies: [dependency], taints: oneShot ? ["clock"] : [] },
 			result: { replayProfile: "buffered_noninteractive", journal, exit: { kind: "code", code: 0 } } });
 	};
-	const planner = new ProcessReusePlanner({ store }), registry = own(new ProcessHandoffRegistry(store, 1024));
+	const planner = new ProcessReusePlanner({ store }), registry = own(new ProcessHandoffRegistry(store, 64 * 1024));
 	const lookup = async (certificates?: readonly ProcessProvenanceCertificate[], excludedCertificates?: ReadonlySet<ProcessProvenanceCertificate["id"]>, artifacts?: ReadonlyMap<ProcessProvenanceCertificate["id"], VerifiedArtifactClosure>) => {
 		const plan = await planner.plan({ ...request, excludedCertificates, ...(certificates ? { live: { certificate: certificates, artifacts, acceptedTaints: ["clock"] } } : {}) });
 		return plan.kind === "completed_replay" ? plan : undefined;
@@ -61,9 +60,11 @@ async function fixture(options: ConstructorParameters<typeof ProvenanceCertifica
 	const actor = (options: { signal?: AbortSignal; lookup?: typeof lookup;
 		waitForRunning?: (work: ProcessHandoff, signal: AbortSignal) => Promise<"completed" | "miss" | "rejected"> } = {}) =>
 		registry.acquire({ ...common, role: "actor", waitForRunning: async () => "miss", ...options });
-	const publish = async (work: Awaited<ReturnType<typeof reserve>>, value: string, createdAt = 1, oneShot = true) => {
-		const certificate = await produce(value, createdAt, oneShot); await registry.publish(request.weakKey, work, certificate, async () => false); return certificate;
-	};
+	const publish = (work: Awaited<ReturnType<typeof reserve>>, value: string, createdAt = 1, oneShot = true, computation?: TimelineInterval) => store.withPublication(async () => {
+		const produced = await produce(value, createdAt, oneShot), certificate = computation ? sealProcessCertificate({ ...produced,
+			result: { ...produced.result, computation: TimelineInterval.serialize(computation) } }) : produced;
+		await registry.publish(request.weakKey, work, certificate, () => planner.publishCompleted(certificate), undefined, computation); return certificate;
+	});
 	const consume = async (pending: ReturnType<typeof actor>, expected: string | undefined) => {
 		const result = await pending; expect(result.kind).toBe(expected === undefined ? "miss" : "hit");
 		if (result.kind === "hit") { expect(output(result.plan)).toBe(expected); result.settle?.(true); } return result;
@@ -121,19 +122,25 @@ test("reopens, validates, repairs and collects persisted history without stale o
 	for (const executable of [undefined, f.request.executablePath]) expect(await f.store.mayHaveCertificates(executable)).toBe(false);
 	expect(await readdir(path.join(f.root, "indexes"), { recursive: true }).catch(() => [])).toEqual([]);
 	reads.mockClear(); expect(f.output(await planner.plan(f.request))).toBeUndefined(); expect(reads).not.toHaveBeenCalled();
-	const bytes = Buffer.alloc(64 * 1024 * 1024), controller = new AbortController(), opened: filesystem.FileHandle[] = [];
+	const bytes = Buffer.alloc(64 * 1024 * 1024);
 	await writeFile(f.input, bytes);
 	const certificate = sealProcessCertificate({ ...PROCESS_CERTIFICATE, dependencyCertificate: { complete: true, taints: [],
 		dependencies: [{ kind: "file", role: "input", path: "/workspace/input", contentDigest: sha256Digest(bytes) }] } });
-	const native = await vi.importActual<typeof filesystem>("node:fs/promises"); let readBytes = 0;
-	vi.spyOn(filesystem, "open").mockImplementation(async (...args) => {
-		const handle = await native.open(...args), read = handle.read; opened.push(handle);
-		vi.spyOn(handle, "read").mockImplementation(async (...args) => {
-			const result = await Reflect.apply(read, handle, args); readBytes += result.bytesRead; controller.abort(); return result;
-		}); return handle;
-	});
-	await expect(planner.plan({ ...f.request, signal: controller.signal, live: { certificate, acceptedTaints: [] } })).rejects.toThrow();
-	expect(readBytes).toBe(1024 * 1024); expect(opened.length).toBeGreaterThan(0); expect(opened.every(handle => handle.fd === -1)).toBe(true);
+	for (const close of [false, true]) {
+		const paused = hold(), controller = new AbortController(), opened: filesystem.FileHandle[] = [], native = await vi.importActual<typeof filesystem>("node:fs/promises"); let readBytes = 0;
+		vi.spyOn(filesystem, "open").mockImplementation(async (...args) => {
+			const handle = await native.open(...args), read = handle.read; opened.push(handle);
+			vi.spyOn(handle, "read").mockImplementation(async (...args) => {
+				const result = await Reflect.apply(read, handle, args); readBytes += result.bytesRead; await paused.wait(); return result;
+			}); return handle;
+		});
+		const pending = track(planner.plan({ ...f.request, signal: controller.signal, live: { certificate, acceptedTaints: [] } })); await paused.entered;
+		const closing = close ? store.dispose() : (controller.abort(), pending.then(() => undefined, () => undefined));
+		expect((await waitForCompletion(closing, undefined, 30)).status).toBe("deadline");
+		if (close) await expect(planner.plan(f.request)).rejects.toThrow("closed");
+		paused.release(); await expect(pending).rejects.toThrow(); await closing;
+		expect(readBytes).toBe(1024 * 1024); expect(opened.length).toBeGreaterThan(0); expect(opened.every(handle => handle.fd === -1)).toBe(true);
+	}
 });
 
 test.each(["scan", "deletion", "clear"])("preserves publications from both owners across %s, collection and process exit", async phase => {
@@ -146,10 +153,10 @@ test.each(["scan", "deletion", "clear"])("preserves publications from both owner
 	const removals = vi.spyOn(filesystem, "rm").mockImplementation(async (file, options) => {
 		if (phase === "deletion" && String(file) === target) await pause.wait(); return original(file, options);
 	});
-	let published = false, drained = false; f.store.configure({ maxCertificates: 1 });
+	let drained = false; f.store.configure({ maxCertificates: 1 });
 	// Keep "next" available while its new certificate waits behind the deletion transaction.
-	track(f.store.put(await f.produce(["ready", "next"], 64)).then(() => { published = true; }));
-	await pause.entered; await nextTurn(); expect(published).toBe(true);
+	await f.store.put(await f.produce(["ready", "next"], 64)); track(f.store.gc());
+	await pause.entered;
 	if (phase === "clear") { await f.store.clear(); await f.store.artifacts.put("next"); }
 	const count = removals.mock.calls.length, concurrent = track(f.store.put(pending)), publisher = peer(f.root, remote, phase === "scan" ? [] : ["shared", "next"]);
 	await publisher.noticed; if (phase === "deletion") pause.release(); await concurrent;
@@ -174,41 +181,31 @@ test.each(["scan", "deletion", "clear"])("preserves publications from both owner
 	expect((await readdir(f.root, { recursive: true })).filter(file => file.includes(".clear-") || file.endsWith(".tmp"))).toEqual([]);
 	await recovered.artifacts.put("shared"); await recovered.artifacts.put("next"); await recovered.put(remote);
 	expect(f.output(await f.lookup())).toBe("sharednext");
-	const owner = peer(f.root); expect(await owner.noticed).toBe("held");
-	expect((await waitForCompletion(owner.completed, undefined, 30)).status).toBe("deadline");
-	const backend = own(new LinuxProcessReuseBackend({ storeRoot: f.root })), commands = vi.spyOn(DatabaseSync.prototype, "exec");
-	expect(await backend.store.get(remote.id)).toEqual(remote);
-	for (let read = 0; read < 3; read++) expect((await backend.store.stats()).certificates).toBe(1);
-	expect(commands).not.toHaveBeenCalledWith("BEGIN IMMEDIATE");
-	const blocked = track(backend.store.artifacts.put("waiting for writer"));
-	await expect.poll(() => commands.mock.results.some(result => result.type === "throw" && [5, 6].includes(Number(result.value.errcode) & 0xff))).toBe(true);
-	const controller = new AbortController(), host = vi.fn(async (request: { signal?: AbortSignal }) => { request.signal?.throwIfAborted(); return { exitCode: 0 }; });
-	const route = await backend.prepareActorReplay({ execute: host }, { sourceRoot: f.root, invocation: () => undefined });
-	expect(route.state === "unavailable").toBe(process.platform !== "linux");
-	const executor = route.state !== "unavailable" ? route.executor : { execute: async (request: { signal?: AbortSignal }) => {
-		await backend.store.mayHaveCertificates(undefined, request.signal); return host(request);
-	} };
-	const entered = deferred(), hint = backend.store.mayHaveCertificates.bind(backend.store);
-	vi.spyOn(backend.store, "mayHaveCertificates").mockImplementation((...args) => { entered.resolve(); return hint(...args); });
-	const actor = track(executor.execute({ command: "true", cwd: f.root, signal: controller.signal, onData() {}, environment: {} })
-		.then(() => "completed", error => { if (controller.signal.aborted) return "aborted"; throw error; })); await entered.promise;
-	if (phase === "clear") expect(await waitForCompletion(blocked.catch(error => error.name), undefined, 1500)).toEqual({ status: "completed", value: "TimeoutError" });
-	if (phase === "scan") {
-		controller.abort(); expect(await waitForCompletion(actor, undefined, 200)).toEqual({ status: "completed", value: "aborted" });
-	}
-	expect(await waitForCompletion(Promise.all([actor, backend.dispose()]), undefined, 200))
-		.toEqual({ status: "completed", value: [phase === "scan" ? "aborted" : "completed", undefined] });
-	await expect(blocked).rejects.toThrow(); expect(host).toHaveBeenCalledOnce();
-	owner.child.kill("SIGKILL"); await owner.completed.catch(() => undefined); expect(owner.child.signalCode).toBe("SIGKILL");
-	const writer = storeAt(f.root), writing = hold(), rename = (await vi.importActual<typeof filesystem>("node:fs/promises")).rename;
-	vi.spyOn(filesystem, "rename").mockImplementationOnce(async (...args) => { await writing.wait(); return rename(...args); });
-	const publication = track(writer.artifacts.put("admitted write")); await writing.entered;
+	const writer = storeAt(f.root), writing = hold(), owner = phase === "scan" ? peer(f.root) : undefined;
+	if (owner) expect(await owner.noticed).toBe("held");
+	const commands = vi.spyOn(DatabaseSync.prototype, "exec");
+	const publication = track(writer.withPublication(async () => {
+		const certificate = await f.produce("protected until sealed", 100, false, writer.artifacts);
+		for (const reference of referencedArtifacts(certificate)) await utimes(writer.artifacts.artifactPath(reference.digest), new Date(0), new Date(0));
+		await writing.wait(); await writer.put(certificate); return certificate;
+	}));
+	if (owner) await expect.poll(() => commands.mock.results.some(result => result.type === "throw" && [5, 6].includes(Number(result.value.errcode) & 0xff))).toBe(true);
+	else await writing.entered;
+	const lookup = new ProcessReusePlanner({ store: writer }).plan(f.request);
+	expect(await waitForCompletion(lookup, undefined, 200)).toMatchObject({ status: "completed", value: { kind: "completed_replay" } });
+	expect(f.output(await lookup)).toBe("sharednext"); expect((await writer.stats()).certificates).toBe(1);
 	const queued = track(writer.artifacts.put("queued write"));
-	expect(await waitForCompletion(queued.catch(error => error.name), undefined, 1500)).toEqual({ status: "completed", value: "TimeoutError" });
-	const disposed = writer.dispose(); expect((await waitForCompletion(disposed, undefined, 30)).status).toBe("deadline");
-	writing.release(); const reference = await publication; await disposed;
-	expect((await recovered.artifacts.get(reference))?.toString()).toBe("admitted write");
-	await expect(writer.put(remote)).rejects.toThrow("closed");
+	if (phase !== "scan") expect(await waitForCompletion(queued.catch(error => error.name), undefined, 1500)).toEqual({ status: "completed", value: "TimeoutError" });
+	const collecting = owner ? undefined : peer(f.root, undefined, [], "collect");
+	if (collecting) { await collecting.noticed; expect((await waitForCompletion(collecting.completed, undefined, 30)).status).toBe("deadline"); }
+	const disposed = writer.dispose(); expect((await waitForCompletion(disposed, undefined, owner ? 200 : 30)).status).toBe(owner ? "completed" : "deadline");
+	writing.release();
+	if (owner) { await expect(publication).rejects.toThrow(); owner.child.kill("SIGKILL"); await owner.completed.catch(() => undefined); }
+	else {
+		const certificate = await publication; await collecting!.completed;
+		expect(await recovered.get(certificate.id)).toEqual(certificate); expect(f.output(await f.lookup())).toBe("protected until sealed");
+	}
+	await disposed; await expect(queued).rejects.toThrow(); await expect(writer.put(remote)).rejects.toThrow("closed");
 });
 
 test.each(["existing", "new"])("selects a %s ready producer and retains its complete result through collection, borrowing and eviction", async arrival => {
@@ -223,10 +220,13 @@ test.each(["existing", "new"])("selects a %s ready producer and retains its comp
 	await expect(f.registry.publish(f.request.weakKey, first, broken, async () => false)).rejects.toThrow("complete owned result");
 	second ??= await f.reserve(); await f.publish(second, "fast result");
 	expect(await f.consume(actor, "fast result")).toMatchObject({ producer: second }); await stopped.promise;
-	const slow = await f.publish(first, "slow result", 2, false); await f.consume(f.actor(), "slow result");
+	const graph = new TimelineInterval(0, 10, Array.from({ length: 8192 }, (_, index) => ({ computation: new TimelineInterval(index, index + 1), reused: true })));
+	f.registry.configure(8, 8 * 1024 * 1024);
+	const slow = await f.publish(first, "slow result", 2, false, graph); await f.consume(f.actor(), "slow result");
 	await f.store.put(await f.produce("saved", 3));
 	const reference = referencedArtifacts(slow)[0]!, target = f.store.artifacts.artifactPath(reference.digest), borrowed = await f.actor();
 	if (borrowed.kind !== "hit") throw new Error("expected owned result");
+	expect(borrowed.plan.certificate.result.computation?.nodes).toHaveLength(8193);
 	await writeFile(target, "damage"); await utimes(target, new Date(0), new Date(0)); await peer(f.root, undefined, [], "collect").completed;
 	expect(await f.store.artifacts.get(reference)).toBeUndefined(); expect(f.output(borrowed.plan)).toBe("slow result");
 	borrowed.plan.artifacts.read(reference).fill(0); expect(f.output(borrowed.plan)).toBe("slow result");
@@ -234,12 +234,20 @@ test.each(["existing", "new"])("selects a %s ready producer and retains its comp
 	expect(f.output(await f.lookup([slow], undefined, new Map([[slow.id, source]])))).toBe("slow result");
 	expect(await f.lookup([slow], undefined, new Map([[slow.id, { ...borrowed.plan.artifacts, read: () => Buffer.alloc(reference.size) }]]))).toBeUndefined();
 	f.registry.configure(8, 1); expect(f.registry.results(f.request.weakKey, { sessionID: "system", turnID: "one" })).toHaveLength(1);
+	expect(first.computation).toBe(graph);
 	borrowed.settle?.(false); expect(f.registry.hasResults).toBe(false);
+	expect(first.computation).toBeUndefined();
 	await f.consume(f.actor(), "saved"); await writeFile(f.input, "changed input"); await f.consume(f.actor(), undefined);
+	f.registry.configure(8, arrival === "existing" ? 1024 : 64 * 1024);
+	const oversized = await f.reserve(), metadata = sealProcessCertificate({ ...PROCESS_CERTIFICATE,
+		result: { ...PROCESS_CERTIFICATE.result, computation: arrival === "existing" ? TimelineInterval.serialize(graph) : undefined } });
+	await f.registry.publish(f.request.weakKey, oversized, metadata, async () => false, undefined, arrival === "new" ? graph : undefined);
+	expect(f.registry.hasResults).toBe(false); expect(oversized.computation).toBeUndefined();
+	f.registry.configure(8, 64 * 1024); await f.publish(await f.reserve(), "bounded"); await f.consume(f.actor(), "bounded");
 });
 
 test.each(["released", "consumed", "cancelled", "raced", "whole-released", "whole-consumed"])("settles a %s one-shot claim without losing another Actor's result", async outcome => {
-	const f = await fixture(), ownership = new ProcessHandoffOwnership(), releaseWhole = hold();
+	const f = await fixture({ gcIntervalMs: 0, orphanGraceMs: 0, maxBytes: 128 * 1024 }), ownership = new ProcessHandoffOwnership(), releaseWhole = hold();
 	const certificate = await f.publish(await f.reserve(ownership), "computed result");
 	const checked = deferred(), racing = hold(), controller = new AbortController(), consumed = outcome.endsWith("consumed");
 	cleanup.push(() => controller.abort()); let settled = false;
@@ -253,8 +261,12 @@ test.each(["released", "consumed", "cancelled", "raced", "whole-released", "whol
 	}).catch(error => { expect(error.disposition).toBe("recoverable"); })) : undefined;
 	const first = whole ? undefined : await f.actor(); if (first && first.kind !== "hit") throw new Error("expected first claim");
 	const second = earlier ?? next(); racing.release(); await checked.promise; await nextTurn(); expect(settled).toBe(false);
-	for (const reference of referencedArtifacts(certificate)) await utimes(f.store.artifacts.artifactPath(reference.digest), new Date(0), new Date(0));
-	await peer(f.root, undefined, [], "collect").completed;
+	vi.spyOn(f.store, "gc").mockRejectedValueOnce(new Error("transient collection failure"));
+	await expect(f.store.withPublication(async () => {
+		for (let index = 0; index < 16; index++) await f.store.artifacts.put(`${index}`.padEnd(64 * 1024, "x"));
+		throw new Error("abandoned before certificate");
+	})).rejects.toThrow("abandoned before certificate");
+	await expect.poll(async () => (await f.store.stats()).artifacts).toBe(0);
 	expect(await f.store.artifacts.load(referencedArtifacts(certificate))).toBeUndefined();
 	if (outcome === "cancelled") controller.abort(); else { first?.settle?.(consumed); releaseWhole.release(); }
 	await f.consume(second, consumed || outcome === "cancelled" ? undefined : "computed result");
