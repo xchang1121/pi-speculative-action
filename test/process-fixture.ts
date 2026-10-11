@@ -30,7 +30,7 @@ export async function legacyCertificate(root: string, certificate: ProcessProven
 }
 
 /** A separate owner exercises the on-disk publication protocol, including native lock recovery on process exit. */
-export function storePeer(root: string, certificate?: ProcessProvenanceCertificate, values: readonly string[] = [], crash?: "publish" | "clear" | "legacy-clear") {
+export function storePeer(root: string, certificate?: ProcessProvenanceCertificate, values: readonly string[] = [], crash?: "publish" | "clear" | "legacy-clear" | "collect") {
 	const child = spawn(process.execPath, ["--input-type=module", "--eval", `
 		import { DatabaseSync } from 'node:sqlite';
 		import filesystem from 'node:fs/promises';
@@ -43,7 +43,7 @@ export function storePeer(root: string, certificate?: ProcessProvenanceCertifica
 		DatabaseSync.prototype.exec = function (sql) { try { return execute.call(this, sql); } catch (error) {
 			if ((error.errcode & 0xff) === 5) { process.send('busy'); DatabaseSync.prototype.exec = execute; } throw error; } };
 		const store = new ProvenanceCertificateStore(root);
-		if (crash) {
+		if (crash && crash !== 'collect') {
 			const operation = crash === 'publish' ? 'rename' : 'rm', original = filesystem[operation];
 			filesystem[operation] = async (...args) => {
 				if (!String(args[0]).startsWith(root)) return original(...args);
@@ -54,9 +54,10 @@ export function storePeer(root: string, certificate?: ProcessProvenanceCertifica
 			else if (crash === 'clear') await store.clear();
 			else { const tomb = root + '/.clear-' + randomUUID(); await filesystem.rename(store.artifacts.root, tomb); await filesystem.rm(tomb, { recursive: true }); }
 		}
-		if (!certificate) await store.exclusive(async () => { process.send('held'); await new Promise(() => {}); });
+		if (!certificate && !crash) await store.exclusive(async () => { process.send('held'); await new Promise(() => {}); });
 		for (const value of values) await store.artifacts.put(value);
-		await store.put(certificate); await store.dispose(); clearInterval(alive); process.send('published'); process.disconnect();
+		if (crash === 'collect') await store.gc(); else await store.put(certificate);
+		await store.dispose(); clearInterval(alive); process.send('published'); process.disconnect();
 	`], { stdio: ["ignore", "pipe", "pipe", "ipc"] });
 	let errors = ""; child.stderr!.on("data", data => { errors += data; });
 	child.on("message", message => { if (message === "crash") child.kill("SIGKILL"); });

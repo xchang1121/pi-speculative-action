@@ -269,7 +269,7 @@ export class LinuxProcessReuseBackend {
 	private readonly options: LinuxProcessBackendOptions;
 	private ready?: Promise<ReadyBackend>;
 	private platformFingerprint?: Promise<Sha256Digest>;
-	private heldExec?: Promise<LinuxHeldExecBoundary>;
+	private heldExec?: { readonly controller: AbortController; readonly ready: Promise<LinuxHeldExecBoundary> };
 	private disposed = false;
 	private readonly handoffs: ProcessHandoffRegistry<BoundProcessInvocation | { readonly trackingOnly: true; readonly sourceRoot: string }>;
 	private readonly actorExecutableDirectories = new Set<string>();
@@ -287,7 +287,7 @@ export class LinuxProcessReuseBackend {
 			heldExecBinary: process.env.PI_SPEC_HELD_EXEC, ...options };
 		this.store = new ProvenanceCertificateStore(options.storeRoot, { ...options.store, acceptedTaints: SAME_CONFINEMENT_TAINTS });
 		this.planner = new ProcessReusePlanner({ store: this.store });
-		this.handoffs = new ProcessHandoffRegistry(this.store.limits.maxCertificates, Math.min(MAX_CONTINUATION_BYTES, this.store.limits.maxBytes));
+		this.handoffs = new ProcessHandoffRegistry(this.store, Math.min(MAX_CONTINUATION_BYTES, this.store.limits.maxBytes));
 		this.storage = {
 			configure: ({ maxEntries, maxBytes }) => {
 				this.store.configure({ maxCertificates: maxEntries, maxBytes });
@@ -368,18 +368,22 @@ export class LinuxProcessReuseBackend {
 
 	private get hasLiveResults(): boolean { return this.producers > 0 || this.handoffs.hasResults; }
 
-	async prepareActorReplay(host: ProcessExecutor, options: ActorProcessReplayOptions, refresh = false): Promise<PreparedProcessExecutionRoute> {
+	async prepareActorReplay(host: ProcessExecutor, options: ActorProcessReplayOptions, refresh = false, owner = this.store.signal): Promise<PreparedProcessExecutionRoute> {
 		if (process.platform !== "linux") return { state: "unavailable", detail: "Linux or WSL 2 required" };
+		const signal = AbortSignal.any([owner, this.store.signal]);
 		let state: "degraded" | "ready" = "degraded";
 		let detail = options.held ? "Bash history; child handoff checked when evidence exists or on refresh" : "matching whole Bash calls; this shell cannot hold child processes";
 		let prepared: Promise<ProcessExecutor> | undefined;
 		const prepare = async () => {
+			signal.throwIfAborted();
 			let executor = host;
 			if (options.held) try {
-				const boundary = await (this.heldExec ??= LinuxHeldExecBoundary.open({
-					storeRoot: this.options.storeRoot,
-					...(this.options.heldExecBinary ? { binary: this.options.heldExecBinary } : {}),
-				}));
+				if (!this.heldExec) {
+					const controller = new AbortController();
+					this.heldExec = { controller, ready: LinuxHeldExecBoundary.open({ storeRoot: this.options.storeRoot,
+						binary: this.options.heldExecBinary, signal: AbortSignal.any([signal, controller.signal]) }) };
+				}
+				const boundary = await this.heldExec.ready;
 				executor = boundary.executor(options.held.executor(boundary.shellPath), {
 					realShell: options.held.realShell,
 					sourceRoot: path.resolve(options.sourceRoot),
@@ -410,8 +414,9 @@ export class LinuxProcessReuseBackend {
 				const observation = this.observations.getStore();
 				const learning = observation?.learn && !observation.closed && sameScope(observation.scope, request.scope);
 				// Learning explicitly requests held execs; other calls retain the empty-history fast path.
-				if ((!learning && !this.hasLiveResults && !(await this.store.mayHaveCertificates(undefined, request.signal)) && !this.hasLiveResults) || this.disposed || request.signal?.aborted) return host.execute(request);
-				return (await (prepared ??= prepare())).execute(request);
+				if ((!learning && !this.hasLiveResults && !(await this.store.mayHaveCertificates(undefined, request.signal)) && !this.hasLiveResults) || signal.aborted || request.signal?.aborted) return host.execute(request);
+				const ready = await waitForCompletion(prepared ??= prepare(), AbortSignal.any([signal, ...(request.signal ? [request.signal] : [])]));
+				return (ready.status === "completed" ? ready.value : host).execute(request);
 			},
 		} };
 	}
@@ -419,7 +424,8 @@ export class LinuxProcessReuseBackend {
 	async resetActorReplay(): Promise<void> {
 		const heldExec = this.heldExec;
 		this.heldExec = undefined;
-		await heldExec?.then((boundary) => boundary.close(), () => undefined);
+		heldExec?.controller.abort(new Error("held-exec initialization retired"));
+		await heldExec?.ready.then((boundary) => boundary.close(), () => undefined);
 	}
 
 	/** Hit-only Actor path. Certificate lookup and replay deliberately require no tracing or confinement tools. */
@@ -900,7 +906,7 @@ export class LinuxProcessReuseBackend {
 			const weakKey = processWeakKey(prototype), executablePath = prototype.executablePath;
 			const acquired = await TimelineInterval.outside(() => this.acquireProcessResult(
 				weakKey,
-				(live, excludedCertificates) => this.plan(weakKey, executablePath, session.projection, (candidate) => compatibleProducer(session.nestedProducer, candidate), { session, live, excludedCertificates }),
+				(live, excludedCertificates, artifacts) => this.plan(weakKey, executablePath, session.projection, (candidate) => compatibleProducer(session.nestedProducer, candidate), { session, live, excludedCertificates, artifacts }),
 				session.signal,
 				session.scope,
 				{ ownership: session.ownership, executablePath },
@@ -972,15 +978,15 @@ export class LinuxProcessReuseBackend {
 	private async plan(
 		weakKey: Sha256Digest,
 		executablePath: string, projection: ExecutionPathProjection, acceptProducer: (producer: ProcessProducerProof) => boolean,
-		{ session, live, excludedCertificates, continuation = false, signal = session?.signal }: {
-			session?: ActiveSession; live?: readonly ProcessProvenanceCertificate[]; excludedCertificates?: ReadonlySet<Sha256Digest>; continuation?: boolean; signal?: AbortSignal;
+		{ session, live, artifacts, excludedCertificates, continuation = false, signal = session?.signal }: {
+			session?: ActiveSession; live?: readonly ProcessProvenanceCertificate[]; artifacts?: ReadonlyMap<Sha256Digest, VerifiedArtifactClosure>; excludedCertificates?: ReadonlySet<Sha256Digest>; continuation?: boolean; signal?: AbortSignal;
 		} = {},
 	): Promise<ReadyProcessPlan | undefined> {
 		// Proof reads belong to the caller's excluded lookup interval, even when file capture emits owned receipts.
 		const plan = (await TimelineInterval.collect(() => this.planner.plan({ weakKey, executablePath, acceptProducer, excludedCertificates, signal,
 			contract: { sink: "buffered", orderedJournal: true, transactionalEffects: true, ...(continuation ? { continuation: true as const } : {}) },
 			validation: { resolvePath: (logicalPath) => projection.toPhysical(logicalPath), ...(session ? { acceptedTaints: SAME_CONFINEMENT_TAINTS } : {}) },
-			...(live ? { live: { certificate: live, acceptedTaints: [...TRANSFERRED_INPUT_TAINTS] } } : {}),
+			...(live ? { live: { certificate: live, artifacts, acceptedTaints: [...TRANSFERRED_INPUT_TAINTS] } } : {}),
 		}))).output;
 		this.recordLookup(plan.lookup, session);
 		if (plan.kind === "miss" && plan.lookup.candidateCertificates > 0) {
@@ -1074,18 +1080,18 @@ export class LinuxProcessReuseBackend {
 				return measured({ kind: "continue", observeCompletion: async durationMs => {
 					try {
 						if (durationMs === undefined || slot(durationMs) === false || !sameFilesystemIdentity(before, await image.stat({ bigint: true }))) return;
-						const digest = (await TimelineInterval.collect(() => hashExecutableFile(`/proc/self/fd/${image.fd}`))).output;
+						const digest = (await TimelineInterval.collect(() => hashExecutableFile(`/proc/self/fd/${image.fd}`, process.signal))).output;
 						if (sameFilesystemIdentity(before, await image.stat({ bigint: true })))
 							observe(bufferedProcessPrototype(snapshot, projection, digest, await this.resolvePlatformFingerprint()), durationMs);
 					} finally { await image.close(); }
 				} });
 			}
-			const digest = (await TimelineInterval.collect(() => hashExecutableFile(`/proc/${process.pid}/exe`))).output;
+			const digest = (await TimelineInterval.collect(() => hashExecutableFile(`/proc/${process.pid}/exe`, process.signal))).output;
 			const prototype = bufferedProcessPrototype(snapshot, projection, digest, await this.resolvePlatformFingerprint());
 			const weakKey = processWeakKey(prototype);
 			const accepted = (producer: ProcessProducerProof) => actorReplayProducer(producer, sensitivePaths(this.options.storeRoot, this.options.deniedPaths));
 			const acquired = await this.acquireProcessResult(weakKey,
-				(live, excludedCertificates) => this.plan(weakKey, executablePath, projection, accepted, { live, excludedCertificates, continuation: true, signal: process.signal }), process.signal, scope, { actor: true });
+				(live, excludedCertificates, artifacts) => this.plan(weakKey, executablePath, projection, accepted, { live, artifacts, excludedCertificates, continuation: true, signal: process.signal }), process.signal, scope, { actor: true });
 			const { plan, continuation } = acquired;
 			settle = acquired.settle;
 			if (!plan || (plan.certificate.result.continuation ? !continuation || sha256Digest(continuation.image) !== plan.certificate.result.continuation.imageDigest :
@@ -2898,13 +2904,13 @@ async function topLevelProcessPrototype(invocation: ToolProcessInvocation, reque
 	if (invocation.commandTransport === "argv") argv.push(request.command);
 	return createExecPrototype({
 		executablePath: invocation.shell,
-		executableDigest: await hashExecutableFile(invocation.shell),
+		executableDigest: await hashExecutableFile(invocation.shell, request.signal),
 		argv: argv.map((value) => projection.normalizeValue(value)),
 		logicalCwd: projection.toLogical(projection.toPhysical(request.cwd) ?? request.cwd),
 		environment,
 		umask: process.umask(),
 		processContextDigest: digestObject({
-			limits: sha256Digest(await readFile("/proc/self/limits")),
+			limits: sha256Digest(await readFile("/proc/self/limits", { signal: request.signal })),
 			credentials: { uid: process.getuid?.(), euid: process.geteuid?.(), gid: process.getgid?.(), egid: process.getegid?.(), groups: process.getgroups?.() },
 			scheduler: { cpuCount: os.availableParallelism(), timeout: request.timeout ?? null },
 			signals: "node-default",

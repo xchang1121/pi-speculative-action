@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { spawn } from "node:child_process";
 import { AsyncResource } from "node:async_hooks";
 import { randomBytes } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
@@ -222,7 +222,7 @@ export type HeldExecDecision = { readonly observeTiming?: (timing: HeldExecTimin
 	  } & ({ readonly exitCode: number; readonly continuation?: never } |
 		{ readonly exitCode?: never; readonly continuation: { readonly image: Buffer; readonly physicalRoot: string } })));
 
-export interface LinuxHeldExecOptions { readonly storeRoot: string; readonly binary?: string; }
+export interface LinuxHeldExecOptions { readonly storeRoot: string; readonly binary?: string; readonly signal?: AbortSignal; }
 
 interface ActiveExecution {
 	readonly barrier: HeldExecTiming["barrier"];
@@ -269,9 +269,9 @@ export class LinuxHeldExecBoundary {
 
 	static async open(options: LinuxHeldExecOptions): Promise<LinuxHeldExecBoundary> {
 		if (process.platform !== "linux" || process.arch !== "x64") throw new Error("x86-64 Linux required");
+		options.signal?.throwIfAborted();
 		const binary = await resolveLinuxExecHelper(options.binary);
-		const probe = await execute(binary, ["--skip-code", "42", "/bin/sh", "-c", "exec /bin/true"]);
-		if (probe.code !== 42 || probe.signal) throw new Error(`held-exec functional probe failed${await inheritedTracer()}`);
+		try { await probe(binary, options.signal); } catch (error) { options.signal?.throwIfAborted(); throw new Error(`held-exec functional probe failed${await inheritedTracer()}`, { cause: error }); }
 		await mkdir(options.storeRoot, { recursive: true, mode: 0o700 });
 		await chmod(options.storeRoot, 0o700);
 		const candidate = path.join(options.storeRoot, `held-${process.pid}-${randomBytes(6).toString("hex")}.sock`);
@@ -280,7 +280,7 @@ export class LinuxHeldExecBoundary {
 			: path.join("/tmp", `pi-held-${process.getuid?.() ?? 0}-${process.pid}-${randomBytes(6).toString("hex")}.sock`);
 		const boundary = new LinuxHeldExecBoundary(binary, socketPath);
 		await listenUnixSocket(boundary.server, socketPath);
-		try { await chmod(socketPath, 0o600); return boundary; } catch (error) { await boundary.close(); throw error; }
+		try { await chmod(socketPath, 0o600); options.signal?.throwIfAborted(); return boundary; } catch (error) { await boundary.close(); throw error; }
 	}
 
 	executor(
@@ -730,11 +730,19 @@ export function listenUnixSocket(server: net.Server, socketPath: string): Promis
 	});
 }
 
-function execute(command: string, args: readonly string[]): Promise<{ stdout: string; code: number | null; signal: NodeJS.Signals | null }> {
-	return new Promise((resolve, reject) => {
-		execFile(command, args, { encoding: "utf8" }, (error, stdout) => {
-			if (error && typeof error.code !== "number") return void reject(error);
-			resolve({ stdout, code: error && typeof error.code === "number" ? error.code : 0, signal: error?.signal ?? null });
+async function probe(binary: string, owner?: AbortSignal): Promise<void> {
+	const signal = AbortSignal.any([AbortSignal.timeout(10_000), ...(owner ? [owner] : [])]); signal.throwIfAborted();
+	await new Promise<void>((resolve, reject) => {
+		const child = spawn(binary, ["--skip-code", "42", "/bin/sh", "-c", "exec /bin/true"], { detached: true, stdio: "ignore" });
+		let failure: Error | undefined;
+		const abort = () => { if (child.pid && child.exitCode === null && child.signalCode === null) {
+			try { process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); }
+		} };
+		child.once("error", error => { failure = error; });
+		child.once("close", (code, stopped) => {
+			signal.removeEventListener("abort", abort);
+			if (signal.aborted) reject(signal.reason); else if (failure) reject(failure); else if (code === 42 && !stopped) resolve(); else reject(new Error(`probe exited ${code ?? stopped}`));
 		});
+		signal.addEventListener("abort", abort, { once: true }); if (signal.aborted) abort();
 	});
 }

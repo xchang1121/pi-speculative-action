@@ -48,9 +48,7 @@ export class ArtifactCAS {
 
 	async get(reference: ArtifactReference, signal?: AbortSignal): Promise<Buffer | undefined> {
 		validateArtifact(reference);
-		const bytes = await readOptional(this.artifactPath(reference.digest), signal);
-		if (bytes && (bytes.byteLength !== reference.size || await sha256DigestAsync(bytes) !== reference.digest)) throw new Error(`artifact integrity check failed for ${reference.digest}`);
-		return bytes;
+		return verifyArtifact(reference, await readOptional(this.artifactPath(reference.digest), signal));
 	}
 
 	/** Availability hint only; publication and adoption verify content. */
@@ -60,20 +58,23 @@ export class ArtifactCAS {
 	}
 
 	/** Load and integrity-check a complete effect closure before any replay side effect begins. */
-	async load(references: readonly ArtifactReference[], signal?: AbortSignal): Promise<VerifiedArtifactClosure | undefined> {
+	async load(references: readonly ArtifactReference[], signal?: AbortSignal, retained?: VerifiedArtifactClosure): Promise<VerifiedArtifactClosure | undefined> {
+		signal?.throwIfAborted();
 		const sizes = new Map<Sha256Digest, number>();
 		for (const reference of references) validateArtifact(reference, sizes);
 		const values = new Map<Sha256Digest, Buffer>();
 		for (const [digest, size] of sizes) {
-			const value = await this.get({ digest, size }, signal);
+			signal?.throwIfAborted();
+			const reference = { digest, size }, value = retained ? await verifyArtifact(reference, Buffer.from(retained.read(reference))) : await this.get(reference, signal);
 			if (!value) return undefined;
 			values.set(digest, value);
 		}
+		signal?.throwIfAborted();
 		return Object.freeze({ artifacts: values.size, bytes: [...values.values()].reduce((total, value) => total + value.byteLength, 0),
 			read: ({ digest, size }: ArtifactReference): Buffer => {
 				const value = values.get(digest);
 				if (!value || value.byteLength !== size) throw new Error(`artifact is outside the verified closure: ${digest}`);
-				return value;
+				return Buffer.from(value);
 			},
 		});
 	}
@@ -85,7 +86,7 @@ export class ArtifactCAS {
 
 export interface VerifiedArtifactClosure {
 	readonly artifacts: number; readonly bytes: number;
-	/** Borrow verified bytes. Trusted replay consumers must treat the returned buffer as read-only. */
+	/** Each consumer owns its copy; callbacks cannot mutate a retained result's verified bytes. */
 	readonly read: (reference: ArtifactReference) => Buffer;
 }
 
@@ -115,6 +116,9 @@ export class ProvenanceCertificateStore {
 
 	get limits(): ProvenanceStoreLimits { return this.limitsValue; }
 	get signal(): AbortSignal { return this.stopped.signal; }
+	loadArtifacts(references: readonly ArtifactReference[], signal?: AbortSignal, retained?: VerifiedArtifactClosure): Promise<VerifiedArtifactClosure | undefined> {
+		return this.lifecycle.admit(() => this.artifacts.load(references, AbortSignal.any([this.signal, ...(signal ? [signal] : [])]), retained));
+	}
 	configure(limits: Partial<ProvenanceStoreLimits>): void {
 		this.limitsValue = Object.freeze({ maxCertificates: positiveInteger(limits.maxCertificates, this.limits.maxCertificates), maxBytes: positiveInteger(limits.maxBytes, this.limits.maxBytes) });
 		this.gcDueAt = 0;
@@ -262,10 +266,11 @@ export class ProvenanceCertificateStore {
 	private objectKey(target: string): string { return path.relative(this.root, target).split(path.sep).join("/"); }
 	private async exclusive<T>(operation: (database: DatabaseSync) => Promise<T>, touched: readonly string[] = [], mutate = true, signal?: AbortSignal): Promise<T> {
 		const admission = AbortSignal.any([this.stopped.signal, AbortSignal.timeout(1_000), ...(signal ? [signal] : [])]);
+		let admitted = false;
 		const task = this.lifecycle.serialize(async () => {
 			admission.throwIfAborted(); const database = this.control ??= await this.open(admission);
 			if (!mutate) { admission.throwIfAborted(); return operation(database); }
-			await sqliteReady(() => database.exec("BEGIN IMMEDIATE"), admission);
+			await sqliteReady(() => { database.exec("BEGIN IMMEDIATE"); admitted = true; }, admission);
 			// Cancellation ends at admission. Finish owned filesystem work before releasing the transaction.
 			try {
 				const value = await operation(database);
@@ -274,9 +279,8 @@ export class ProvenanceCertificateStore {
 				database.exec("COMMIT"); return value;
 			} catch (error) { if (database.isTransaction) database.exec("ROLLBACK"); throw error; }
 		});
-		if (mutate) return task;
 		const result = await waitForCompletion(task, admission);
-		if (result.status !== "completed") throw admission.reason;
+		if (result.status !== "completed") { if (admitted) return task; throw admission.reason; }
 		return result.value;
 	}
 
@@ -349,6 +353,11 @@ function decodeCertificate(value: unknown): ProcessProvenanceCertificate | undef
 }
 
 function readOptional(target: string, signal?: AbortSignal) { return readFile(target, { signal }).catch((error): undefined => { if (!missing(error)) throw error; }); }
+
+async function verifyArtifact(reference: ArtifactReference, bytes?: Buffer): Promise<Buffer | undefined> {
+	if (bytes && (bytes.byteLength !== reference.size || await sha256DigestAsync(bytes) !== reference.digest)) throw new Error(`artifact integrity check failed for ${reference.digest}`);
+	return bytes;
+}
 
 function digestHex(digest: Sha256Digest): string {
 	if (!isSha256Digest(digest)) throw new Error("invalid sha256 digest");

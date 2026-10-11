@@ -16,12 +16,14 @@ import { buildActionKey, buildPiActionKey, PI_ACTION_SEMANTICS } from "../src/ac
 import { linuxOverlayfsCapability } from "../src/linux-overlayfs.ts";
 import { inspectHeldExecProcess, LinuxHeldExecBoundary, type HeldExecProcess, type HeldExecTiming } from "../src/linux-held-exec.ts";
 import { effectCommitFailure } from "../src/effect-transaction.ts";
-import { validateTransferredProcessEvidence } from "../src/linux-process-backend.ts";
+import { LinuxProcessReuseBackend, validateTransferredProcessEvidence } from "../src/linux-process-backend.ts";
 import { ProcessHandoffRegistry, type ProcessExecutionBinding } from "../src/process-handoff.ts";
 import { resolvePiToolInvocation, createClosedSearchProfile } from "../src/pi-tool-invocation.ts";
 import { createResourceSnapshotExecutionWorld } from "../src/agent-execution-world.ts";
 import { summarizeSpeculativeTrace } from "../src/trace-summary.ts";
-import { adaptProcessToolOperations } from "../src/process-execution.ts";
+import { adaptProcessToolOperations, ProcessExecutionCoordinator } from "../src/process-execution.ts";
+import { PROCESS_CERTIFICATE } from "./process-fixture.ts";
+import * as scheduling from "../src/scheduler.ts";
 import type { ExecutionOperationBinding } from "../src/execution-world.ts";
 import { createSpeculativeActionHost } from "../src/agent-integration.ts";
 import { PatternAwareStore, patternAwareSettings, patternAwareActionSemantics } from "../src/pattern-aware.ts";
@@ -29,7 +31,7 @@ import type { SpeculativeActionEvent } from "../src/events.ts";
 import { TaskTimeline } from "../src/task-timing.ts";
 import { testModel } from "./model.ts";
 import type { WorkspaceTransactionCapture } from "../src/workspace-transaction.ts";
-import { commitBenchmarkFixture, compileBenchmarkHelper, processTest as test, executeProcess, forkReusableBash, prepareLinuxProcessReuse,
+import { commitBenchmarkFixture, compileBenchmarkHelper, cHeaders, processTest as test, executeProcess, forkReusableBash, prepareLinuxProcessReuse,
 	holdProcessPublication, textOutput } from "./linux-process-fixture.ts";
 
 vi.mock("node:child_process", { spy: true });
@@ -63,11 +65,7 @@ describe("Linux process ExecutionWorld", () => {
 		const target = path.join(outside, "input"), alias = path.join(outside, "alias");
 		try {
 			await writeFile(target, "old\n"); await filesystem.symlink("input", alias);
-			await compileBenchmarkHelper(fixture.workspace, { source: "permissions.c", output: "permissions", code: `#include <stdio.h>
-#include <unistd.h>
-#include <dirent.h>
-#include <string.h>
-#include <sys/stat.h>
+			await compileBenchmarkHelper(fixture.workspace, { source: "permissions.c", output: "permissions", code: `${cHeaders("stdio.h unistd.h dirent.h string.h sys/stat.h")}
 int main(int argc, char **argv) { FILE *f = fopen(argc > 1 ? argv[1] : "/etc/issue", "r"); if (!f) return 1; fgetc(f);
  if (argc > 1) { struct stat st; if (fstat(fileno(f), &st)) return 2; DIR *d = opendir(argv[2]); if (!d) return 3; struct dirent *e;
   while ((e = readdir(d))) if (!strcmp(e->d_name, "input")) { puts(e->d_ino == st.st_ino ? "identical" : "different"); break; } closedir(d);
@@ -187,12 +185,7 @@ int main(int argc, char **argv) { FILE *f = fopen(argc > 1 ? argv[1] : "/etc/iss
 			fixture = await benchmark("command-", "git");
 			await writeFile(path.join(fixture.workspace, "input.txt"), "input\n");
 			if (mode.startsWith("socket")) {
-				await compileBenchmarkHelper(fixture.workspace, { source: "connect.c", output: "connect", code: String.raw`#include <sys/socket.h>
-#include <sys/un.h>
-#include <errno.h>
-#include <stdio.h>
-#include <string.h>
-#include <unistd.h>
+				await compileBenchmarkHelper(fixture.workspace, { source: "connect.c", output: "connect", code: String.raw`${cHeaders("sys/socket.h sys/un.h errno.h stdio.h string.h unistd.h")}
 int main(int argc, char **argv) {
 	struct sockaddr_un address = {.sun_family = AF_UNIX};
 	if (argc != 2 || strlen(argv[1]) >= sizeof(address.sun_path)) return 2;
@@ -365,15 +358,7 @@ int main(int argc, char **argv) {
 		const fixture = await benchmark("pi-prefix-process-", "git");
 		await prepareLinuxProcessReuse(fixture);
 		await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker", arguments: ["-pthread"], code: `#define _GNU_SOURCE
-#include <unistd.h>
-#include <sys/syscall.h>
-#include <sys/random.h>
-#include <sys/resource.h>
-#include <sys/stat.h>
-#include <pthread.h>
-#include <stdio.h>
-#include <stdint.h>
-#include <fcntl.h>
+${cHeaders("unistd.h sys/syscall.h sys/random.h sys/resource.h sys/stat.h pthread.h stdio.h stdint.h fcntl.h")}
 static void *thread(void *unused) { return unused; }
 int main(void) {
  ${mode === "identity" ? "pid_t prior = getpid();" : ""}
@@ -425,19 +410,7 @@ int main(void) {
 			await prepareLinuxProcessReuse(fixture);
 			if (!(await Reflect.get(fixture.backend, "ready")).imageLibrary) return skip("native process image capture is unavailable");
 			await writeFile(path.join(fixture.workspace, "worker.c"), `#define _GNU_SOURCE
-#include <unistd.h>
-#include <stdio.h>
-#include <stdint.h>
-#include <sys/syscall.h>
-#include <sys/uio.h>
-#include <sys/socket.h>
-#include <sys/mman.h>
-#include <pthread.h>
-#include <signal.h>
-#include <stdlib.h>
-#include <string.h>
-#include <fcntl.h>
-#include <errno.h>
+${cHeaders("unistd.h stdio.h stdint.h sys/syscall.h sys/uio.h sys/socket.h sys/mman.h pthread.h signal.h stdlib.h string.h fcntl.h errno.h")}
 #define INPUT_FD ${mode === "handles" ? 8 : 3}
 #define ACK_FD ${mode === "handles" ? 3 : 4}
 ${mode === "runtime" ? `static __thread int local = 17;
@@ -489,16 +462,7 @@ int main(void) {
 }
 `);
 			await writeFile(path.join(fixture.workspace, "launch.c"), `#define _GNU_SOURCE
-#include <unistd.h>
-#include <fcntl.h>
-#include <stdio.h>
-#include <string.h>
-#include <stdlib.h>
-#include <stdint.h>
-#include <sys/socket.h>
-#include <sys/eventfd.h>
-#include <sys/mman.h>
-#include <sys/wait.h>
+${cHeaders("unistd.h fcntl.h stdio.h string.h stdlib.h stdint.h sys/socket.h sys/eventfd.h sys/mman.h sys/wait.h")}
 int main(int argc, char **argv) {
  if (argc != 2) return 60;
  int in[2], ack[2]; if (${mode === "eventfd" ? "(in[0] = eventfd(0, 0)) < 0 || (in[1] = dup(in[0])) < 0" : mode === "socket" || mode === "recvmsg" ? "socketpair(AF_UNIX, SOCK_STREAM, 0, in)" : "pipe(in)"} || pipe(ack)) return 61;
@@ -610,9 +574,7 @@ int main(int argc, char **argv) {
 			const file = path.join(fixture.workspace, "input.txt"); await writeFile(file, "one\ntwo\n");
 			await mkdir(path.join(fixture.workspace, "entries"));
 			for (const name of ["z.txt", "a.txt", "\ue000.txt", "\u{10000}.txt"]) await writeFile(path.join(fixture.workspace, "entries", name), name);
-			await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker", code: `#include <unistd.h>
-#include <stdio.h>
-#include <sys/syscall.h>
+			await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker", code: `${cHeaders("unistd.h stdio.h sys/syscall.h")}
 int main(void) { char b[1024]; return syscall(SYS_getdents64, 4, b, sizeof(b)) < 0 || pread(3, b, 8, 0) != 8 || write(1, b, 8) != 8; }
 ` });
 			await commitBenchmarkFixture(fixture.workspace, "Native resource input bridge"); await prepareLinuxProcessReuse(fixture);
@@ -677,8 +639,7 @@ int main(void) { char b[1024]; return syscall(SYS_getdents64, 4, b, sizeof(b)) <
 			const status = await fixture.backend.check(true);
 			if (status.state !== "ready") return skip(status.detail);
 			for (const file of hints) await writeFile(file, "baseline");
-			await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker", code: `#include <fcntl.h>
-#include <unistd.h>
+			await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker", code: `${cHeaders("fcntl.h unistd.h")}
 int main(void) {
 	char value[32];
 	int stable = open("stable.txt", O_RDONLY);
@@ -761,19 +722,7 @@ static int take(int fd, char expected, int *rights, int count, int peek) {
 			await writeFile(path.join(fixture.workspace, "input.txt"), "before\n");
 			if (descriptors) await writeFile(path.join(fixture.workspace, "fd.txt"), "abcdef");
 			await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker", code: `#define _GNU_SOURCE
-#include <errno.h>
-#include <poll.h>
-#include <sys/select.h>
-#include <sys/eventfd.h>
-#include <sys/syscall.h>
-#include <stdint.h>
-#include <sys/epoll.h>
-#include <fcntl.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/socket.h>
-#include <sys/wait.h>
-#include <unistd.h>
+${cHeaders("errno.h poll.h sys/select.h sys/eventfd.h sys/syscall.h stdint.h sys/epoll.h fcntl.h stdlib.h string.h sys/socket.h sys/wait.h unistd.h")}
 ${rightsHelpers}
 ${enumerate ? `static int count_directory(int fd) {
 	char entries[64]; int count = 0; ssize_t length;
@@ -872,19 +821,7 @@ int main(int argc, char **argv) {
 ` });
 			if (launcher) {
 				await compileBenchmarkHelper(fixture.workspace, { source: "fd-launch.c", output: "fd-launch", arguments: ["-pthread", "-Werror"], code: `#define _GNU_SOURCE
-#include <fcntl.h>
-#include <pthread.h>
-#include <sys/syscall.h>
-#include <stdlib.h>
-#include <errno.h>
-#include <stdint.h>
-#include <sys/eventfd.h>
-#include <sched.h>
-#include <string.h>
-#include <sys/socket.h>
-#include <sys/wait.h>
-#include <stdio.h>
-#include <unistd.h>
+${cHeaders("fcntl.h pthread.h sys/syscall.h stdlib.h errno.h stdint.h sys/eventfd.h sched.h string.h sys/socket.h sys/wait.h stdio.h unistd.h")}
 static void *duplicate(void *unused) { (void)unused; if (dup2(3, 9) < 0) _exit(73); return 0; }
 ${rightsHelpers}
 int main(int argc, char **argv) {
@@ -1141,8 +1078,7 @@ int main(int argc, char **argv) {
 		if (process.arch !== "x64") return skip("x86-64 Linux only");
 		const fixture = await benchmark("pi-output-status-", "git", {});
 		await writeFile(path.join(fixture.workspace, "input.txt"), "before\n");
-		await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker", code: `#include <fcntl.h>
-#include <unistd.h>
+		await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker", code: `${cHeaders("fcntl.h unistd.h")}
 int main(void) {
 	for (volatile unsigned long i = 0; i < 20000000ul; ++i) {}
 	int fd = dup(${mode === "merged" ? 2 : 1}), flags = fcntl(fd, F_GETFL);
@@ -1197,9 +1133,7 @@ int main(void) {
 		};
 		await reset();
 		const lockHelpers = `#define _GNU_SOURCE
-#include <errno.h>
-#include <sys/file.h>
-#include <fcntl.h>
+${cHeaders("errno.h sys/file.h fcntl.h")}
 static int lock(int fd,int type,int start,int length) { struct flock range={.l_type=type,.l_whence=SEEK_SET,.l_start=start,.l_len=length};return fcntl(fd,F_OFD_SETLK,&range); }
 static int query(int fd,int start,int length,int type,int foundStart,int foundLength) {
 	struct flock range={.l_type=F_WRLCK,.l_whence=SEEK_SET,.l_start=start,.l_len=length};
@@ -1213,9 +1147,7 @@ static int query(int fd,int start,int length,int type,int foundStart,int foundLe
 	return query(8,2,4,F_UNLCK,2,4) || query(8,10,3,F_RDLCK,10,3) || flock(8,LOCK_EX|LOCK_NB)!=-1 || errno!=EAGAIN;
 }` });
 		}
-		await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker", code: (locks ? lockHelpers : "") + `#include <unistd.h>
-#include <sys/wait.h>
-#include <fcntl.h>
+		await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker", code: (locks ? lockHelpers : "") + `${cHeaders("unistd.h sys/wait.h fcntl.h")}
 int main(void) {
 	char bytes[6] = {0, 0, 0, ':', 0, '\\n'};
 	if (read(3, bytes, 2) != 2 || read(4, bytes + 2, 1) != 1 || read(8, bytes + 4, 1) != 1) return 71;
@@ -1237,11 +1169,7 @@ int main(void) {
 		const body = `IFS= read -r -N 1 discard <&3; IFS= read -r -N 1 discard <&8; locker init; printf '%s\\n' "$1"; worker; IFS= read -r -N 1 a <&4; IFS= read -r -N 1 b <&8; printf 'tail:%s:%s\\n' "$a" "$b"; locker check`;
 		if (memory) {
 			await compileBenchmarkHelper(fixture.workspace, { source: "fd-memory.c", output: "fd-memory", code: lockHelpers + `
-#include <sys/mman.h>
-#include <sys/wait.h>
-#include <stdio.h>
-#include <unistd.h>
-#include <fcntl.h>
+${cHeaders("sys/mman.h sys/wait.h stdio.h unistd.h fcntl.h")}
 int main(int argc,char **argv) {
 	char bytes[6];int input=open("input.txt",O_RDONLY);if(argc!=2 || input<0 || read(input,bytes,6)!=6)return 80;close(input);
 	int fd=memfd_create("lock-input",0);if(fd<0 || write(fd,bytes,6)!=6 || lseek(fd,0,SEEK_SET)!=0 || dup2(fd,3)<0)return 81;
@@ -1312,14 +1240,7 @@ int main(int argc,char **argv) {
 		const fixture = await benchmark("pi-packet-binding-");
 		await writeFile(path.join(fixture.workspace, "input.txt"), "abcdef");
 		const helpers = `#define _GNU_SOURCE
-#include <sys/socket.h>
-#include <sys/wait.h>
-#include <poll.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <stdio.h>
-#include <string.h>
-#include <unistd.h>
+${cHeaders("sys/socket.h sys/wait.h poll.h errno.h fcntl.h stdio.h string.h unistd.h")}
 static int pass(const char *bytes, int length) {
 	char control[CMSG_SPACE(sizeof(int))] = {0}; struct iovec vector = {(void *)bytes, length};
 	struct msghdr message = {.msg_iov=&vector,.msg_iovlen=1,.msg_control=control,.msg_controllen=sizeof(control)};
@@ -1398,6 +1319,34 @@ static int take(int length,int peek,int truncated,char expected) {
 		await compileBenchmarkHelper(root, { source: fileURLToPath(new URL("../src/linux-held-exec.c", import.meta.url)), output: "helper", arguments: ["-pthread", "-Werror"] });
 		const boundary = await LinuxHeldExecBoundary.open({ storeRoot: root, binary });
 		try {
+			for (const stop of ["waiter", "preparing", "owner"]) {
+				const gate = path.join(root, `probe-${stop}`), marker = gate + "-pid", helper = gate + "-helper", storeRoot = gate + "-store";
+				await writeFile(helper, `#!/bin/sh\nif [ "$1" = "--skip-code" ]; then echo $$ > '${marker}'; while [ ! -f '${gate}' ]; do sleep .01; done; fi\nexec '${binary}' "$@"\n`, { mode: 0o700 });
+				const backend = new LinuxProcessReuseBackend({ storeRoot, heldExecBinary: helper }), host = adaptProcessToolOperations(createLocalBashOperations({ shellPath: "/bin/bash" }));
+				const create = () => new ProcessExecutionCoordinator(host, { enabled: () => true,
+					prepare: (refresh, signal) => backend.prepareActorReplay(host, { sourceRoot: root, invocation: () => undefined,
+						held: { realShell: "/bin/bash", executor: shellPath => adaptProcessToolOperations(createLocalBashOperations({ shellPath })) } }, refresh || stop === "preparing", signal),
+					reset: () => backend.resetActorReplay() });
+				let coordinator = create(); const controller = new AbortController();
+				const execute = async (signal?: AbortSignal) => { let output = "";
+					try { await coordinator.operations.exec("printf ready", root, { signal, env: {}, onData: data => { output += data.toString(); } }); return output; }
+					catch (error) { if (signal?.aborted) return "aborted"; throw error; }
+				};
+				try {
+					await backend.store.put(PROCESS_CERTIFICATE); const first = execute(controller.signal);
+					await expect.poll(() => existsSync(marker)).toBe(true); const pid = Number(await readFile(marker, "utf8")), second = execute();
+					if (stop !== "owner") {
+						controller.abort(); expect(await scheduling.waitForCompletion(first, undefined, 500)).toEqual({ status: "completed", value: "aborted" });
+						expect((await scheduling.waitForCompletion(second, undefined, 30)).status).toBe("deadline"); expect(() => process.kill(pid, 0)).not.toThrow();
+						await writeFile(gate, ""); expect(await second).toBe("ready");
+					} else {
+						expect((await scheduling.waitForCompletion(coordinator.dispose(), undefined, 500)).status).toBe("completed");
+						expect(await Promise.all([first, second])).toEqual(["ready", "ready"]); coordinator = create(); await writeFile(gate, "");
+					}
+					expect(() => process.kill(pid, 0)).toThrow(); expect((await coordinator.refreshActorRoute()).state).toBe("ready"); expect(await execute()).toBe("ready");
+				} finally { await coordinator.dispose(); await backend.dispose(); }
+				expect((await filesystem.readdir(storeRoot)).filter(name => name.endsWith(".sock"))).toEqual([]);
+			}
 			const run = (...args: string[]) => childProcess.spawnSync(binary, args, { encoding: "utf8", timeout: 1_000 });
 			const passThrough = "printf out; printf err >&2; exit 7";
 			const direct = childProcess.spawnSync("/bin/bash", ["-c", passThrough], { encoding: "utf8" });
@@ -1470,20 +1419,11 @@ static int take(int length,int peek,int truncated,char expected) {
 			const stopped = new Promise<void>((resolve) => tracer.once("close", () => resolve()));
 			let pid = 0;
 			try {
-				for (let retry = 0; retry < 100 && !pid; retry++) {
-					pid = Number(await readFile(pidFile, "utf8").catch(() => ""));
-					if (!pid) await new Promise((resolve) => setTimeout(resolve, 10));
-				}
-				expect(pid).toBeGreaterThan(0);
+				await expect.poll(async () => pid = Number(await readFile(pidFile, "utf8").catch(() => "")), { timeout: 1000 }).toBeGreaterThan(0);
 				tracer.kill("SIGKILL");
 				await stopped;
-				let alive = true;
-				for (let retry = 0; retry < 100 && alive; retry++) {
-					const state = (await readFile(`/proc/${pid}/stat`, "utf8").catch(() => "")).match(/\) (\w) /)?.[1];
-					alive = state !== undefined && state !== "Z";
-					if (alive) await new Promise((resolve) => setTimeout(resolve, 10));
-				}
-				expect(alive, "killed tracer must not release its tracees to run").toBe(false);
+				await expect.poll(async () => (await readFile(`/proc/${pid}/stat`, "utf8").catch(() => "")).match(/\) (\w) /)?.[1],
+					{ timeout: 1000, message: "killed tracer must not release its tracees to run" }).toSatisfy(state => state === undefined || state === "Z");
 			} finally {
 				tracer.kill("SIGKILL");
 				if (pid) try { process.kill(-pid, "SIGKILL"); } catch { /* Already reaped. */ }
@@ -1501,12 +1441,7 @@ static int take(int length,int peek,int truncated,char expected) {
 				};
 			};
 			await compileBenchmarkHelper(root, { source: "queue-owners.c", output: "queue-owners", code: `#define _GNU_SOURCE
-#include <fcntl.h>
-#include <poll.h>
-#include <string.h>
-#include <sys/socket.h>
-#include <sys/wait.h>
-#include <unistd.h>
+${cHeaders("fcntl.h poll.h string.h sys/socket.h sys/wait.h unistd.h")}
 int main(int argc, char **argv) {
 	if (argc != 2) return 1;
 	int data[2], channel[2], gate[2];
@@ -1535,11 +1470,7 @@ int main(int argc, char **argv) {
 					expect(outside, state).toBe(state === "queued" ? 3 : 0);
 				}
 			await compileBenchmarkHelper(root, { source: "packet-capture.c", output: "packet-capture", code: `#define _GNU_SOURCE
-#include <sys/socket.h>
-#include <sys/wait.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
+${cHeaders("sys/socket.h sys/wait.h stdlib.h string.h unistd.h")}
 int main(int argc,char **argv) {
 	if(argc!=2)return 1;int pair[2],offset=0;char bytes[4];
 	if(socketpair(AF_UNIX,atoi(argv[1])|SOCK_NONBLOCK,0,pair) || send(pair[0],"",0,0)!=0 || send(pair[0],"tail",4,0)!=4)return 2;
@@ -1629,18 +1560,7 @@ int main(void) { int status; struct timespec pause = {0, 300000000}; pid_t sibli
 			}
 			const descriptorProbe = path.join(root, "descriptor-probe");
 			await writeFile(`${descriptorProbe}.c`, `#define _GNU_SOURCE
-#include <fcntl.h>
-#include <pthread.h>
-#include <sched.h>
-#include <stdlib.h>
-#include <string.h>
-#include <poll.h>
-#include <sys/file.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/syscall.h>
-#include <sys/wait.h>
-#include <unistd.h>
+${cHeaders("fcntl.h pthread.h sched.h stdlib.h string.h poll.h sys/file.h sys/socket.h sys/stat.h sys/syscall.h sys/wait.h unistd.h")}
 static int aliases(void *unused) {
 	(void)unused;
 	if (dup2(3, 65) < 0 || dup3(3, 66, O_CLOEXEC) < 0 || fcntl(3, F_DUPFD, 67) != 67) return 75;
@@ -1833,10 +1753,7 @@ int main(int argc, char **argv) {
 			expect(piped.output).toBe("1048576\nb");
 			const pipeProbe = path.join(root, "pipe-probe");
 			await writeFile(`${pipeProbe}.c`, `#define _GNU_SOURCE
-#include <fcntl.h>
-#include <string.h>
-#include <sys/wait.h>
-#include <unistd.h>
+${cHeaders("fcntl.h string.h sys/wait.h unistd.h")}
 int main(int argc, char **argv) {
 	if (argc != 2) return 70;
 	int fds[2]; if (pipe2(fds, O_CLOEXEC | (!strcmp(argv[1], "packet") ? O_DIRECT : 0))) return 71;
@@ -1889,11 +1806,7 @@ int main(int argc, char **argv) {
 			}
 			const messageProbe = path.join(root, "message-probe");
 			await writeFile(messageProbe + ".c", `#define _GNU_SOURCE
-#include <fcntl.h>
-#include <sys/socket.h>
-#include <sys/wait.h>
-#include <string.h>
-#include <unistd.h>
+${cHeaders("fcntl.h sys/socket.h sys/wait.h string.h unistd.h")}
 int main(int argc, char **argv) {
 	if (argc != 3) return 70;
 	int fds[2]; if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) || fds[0] != 3 || fds[1] != 4) return 71;
@@ -1946,11 +1859,7 @@ int main(int argc, char **argv) {
 				if (mode === "cancel" || mode === "commit-failure") expect(executor.output).toBe("");
 			}
 			const counterProbe = path.join(root, "counter-probe");
-			await writeFile(counterProbe + ".c", `#include <sys/eventfd.h>
-#include <sys/wait.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <unistd.h>
+			await writeFile(counterProbe + ".c", `${cHeaders("sys/eventfd.h sys/wait.h stdint.h stdio.h unistd.h")}
 int main(void) {
 	int fd = eventfd(5, EFD_NONBLOCK | EFD_CLOEXEC); if (fd < 0 || dup2(fd, 20) < 0 || dup2(fd, 21) < 0) return 70; close(fd);
 	pid_t child = fork(); if (child < 0) return 71;
@@ -2057,8 +1966,7 @@ int main(void) {
 				} finally { waiting.resolve(); await Promise.allSettled([siblings]); }
 			}
 			const threaded = path.join(root, "thread-exec");
-			await writeFile(`${threaded}.c`, `#include <pthread.h>
-#include <unistd.h>
+			await writeFile(`${threaded}.c`, `${cHeaders("pthread.h unistd.h")}
 static void *replace(void *unused) {
 	(void)unused;
 	execl("/bin/true", "true", (char *)0);
@@ -2547,10 +2455,7 @@ int main(void) { int fds[2], status; char queue[8]; if (pipe(fds) || fds[0] != 3
 			await mkdir(path.join(workspace, "source"));
 			await writeFile(path.join(workspace, "source", "value.txt"), "value\n", "utf8");
 			if (mode !== "rename") {
-				await compileBenchmarkHelper(workspace, { source: "probe.c", output: "probe", code: instanceInput ? `#include <elf.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <unistd.h>
+				await compileBenchmarkHelper(workspace, { source: "probe.c", output: "probe", code: instanceInput ? `${cHeaders("elf.h stdint.h stdio.h unistd.h")}
 int main(int argc, char **argv, char **envp) {
 	(void)argc; (void)argv; (void)envp; unsigned long long value;
 	${mode === "rdtsc" ? 'unsigned lo, hi; __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi)); value = ((unsigned long long)hi << 32) | lo;' : `
@@ -2564,9 +2469,7 @@ int main(int argc, char **argv, char **envp) {
 	return write(1, output, (size_t)size) != size;
 }
 ` : `#define _GNU_SOURCE
-#include <fcntl.h>
-#include <sys/file.h>
-#include <unistd.h>
+${cHeaders("fcntl.h sys/file.h unistd.h")}
 int main(int argc, char **argv) {
 	(void)argv; int fd = open("source/value.txt", O_RDWR); if (fd < 0) return 2;
 	struct flock lock = {.l_type=F_WRLCK, .l_whence=SEEK_SET}; char value;
@@ -2643,15 +2546,7 @@ test.for(["git", "auto"] as const)("preserves native metadata across stat famili
 		await writeFile(path.join(fixture.workspace, "many", "file"), "regular\n");
 		await filesystem.symlink("d0", path.join(fixture.workspace, "many", "alias"));
 		await compileBenchmarkHelper(fixture.workspace, { source: "metadata.c", output: "metadata", code: String.raw`#define _GNU_SOURCE
-#include <dirent.h>
-#include <fcntl.h>
-#include <stdio.h>
-#include <string.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <sys/syscall.h>
-#include <sys/sysmacros.h>
-#include <unistd.h>
+${cHeaders("dirent.h fcntl.h stdio.h string.h sys/mman.h sys/stat.h sys/syscall.h sys/sysmacros.h unistd.h")}
 static void emit(struct stat *s) { printf("%llu %llu %lld %o %llu\n", (unsigned long long)s->st_dev, (unsigned long long)s->st_ino, (long long)s->st_size, s->st_mode, (unsigned long long)s->st_nlink); }
 int main(int argc, char **argv) {
 	const char *name = argc > 1 ? argv[1] : "README";

@@ -29,29 +29,22 @@ export const processTest: ReturnType<TestAPI<{ benchmark: typeof createLinuxProc
 /** Retain a real producer at publication until an Actor is admitted to its running work. */
 export function holdProcessPublication(backend: LinuxProcessReuseBackend, delayMs = 0) {
 	const release = deferred();
-	let reached = false, joined = false, closed = false, timer: ReturnType<typeof setTimeout> | undefined;
+	let joined = false, timer: ReturnType<typeof setTimeout> | undefined;
+	const completions = new Set<Promise<void>>();
 	const handoffs = Reflect.get(backend, "handoffs") as ProcessHandoffRegistry;
 	const publish = handoffs.publish.bind(handoffs);
 	const publication = vi.spyOn(handoffs, "publish").mockImplementation(async (...args) => {
-		reached = true; await release.promise; return publish(...args);
+		completions.add(args[1].completion); await release.promise; return publish(...args);
 	});
 	const wait = scheduling.waitForCompletion;
 	const assessment = vi.spyOn(scheduling, "waitForCompletion").mockImplementation((promise, signal, timeoutMs) => {
-		const waiting = wait(promise, signal, timeoutMs);
-		if (reached && !joined) {
-			let settled = false;
-			void waiting.then(() => { settled = true; }, () => { settled = true; });
-			setImmediate(() => {
-				if (closed || settled || joined) return; // An immediately rejected selection is not a join.
-				joined = true; timer = setTimeout(() => release.resolve(), delayMs);
-			});
-		}
-		return waiting;
+		if (completions.has(promise as Promise<void>) && !joined && !signal?.aborted) { joined = true; timer = setTimeout(release.resolve, delayMs); }
+		return wait(promise, signal, timeoutMs);
 	});
 	return {
-		reached: () => reached,
+		reached: () => completions.size > 0,
 		joined: () => joined,
-		close: () => { closed = true; clearTimeout(timer); release.resolve(); publication.mockRestore(); assessment.mockRestore(); },
+		close: () => { clearTimeout(timer); release.resolve(); publication.mockRestore(); assessment.mockRestore(); },
 	};
 }
 
@@ -164,6 +157,11 @@ export async function compileBenchmarkHelper(
 	if (input.code !== undefined) await writeFile(path.join(workspace, input.source), input.code);
 	await execHostText("cc", ["-O2", "-Wall", "-Wextra", ...(input.arguments ?? []), "-o", input.output, input.source], { cwd: workspace });
 	await access(path.join(workspace, input.output));
+}
+
+/** Render shared C boilerplate without changing include order or the helper's source bytes. */
+export function cHeaders(headers: string): string {
+	return headers.split(" ").map(header => `#include <${header}>`).join("\n");
 }
 
 export async function executeProcess(fixture: Pick<LinuxProcessBenchmark, "workspace" | "environment">, executor: ProcessExecutor,

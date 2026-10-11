@@ -27,6 +27,7 @@ export interface ProcessReuseRequest {
 	readonly live?: {
 		readonly certificate: ProcessProvenanceCertificate | readonly ProcessProvenanceCertificate[];
 		readonly acceptedTaints: readonly ProvenanceTaint[];
+		readonly artifacts?: ReadonlyMap<Sha256Digest, VerifiedArtifactClosure>;
 	};
 }
 
@@ -73,7 +74,7 @@ export class ProcessReusePlanner {
 		const reasons = new Set<ProcessReuseMissReason>(), changedDependencies = new Set<string>();
 		const currentInputs = observeProcessInputs(weakKey, async evidence => {
 			metrics.pathsetsValidated++;
-			const observation = await validateDynamicDependencyCertificate(evidence, { ...request.validation, acceptedTaints });
+			const observation = await validateDynamicDependencyCertificate(evidence, { ...request.validation, acceptedTaints, signal });
 			metrics.filesRead += observation.filesRead; metrics.bytesRead += observation.bytesRead;
 			if (observation.status === "stale") for (const changed of observation.changed) changedDependencies.add(changed);
 			return observation;
@@ -92,7 +93,7 @@ export class ProcessReusePlanner {
 			if (!validation) { reasons.add("validation_indeterminate"); continue; }
 			if (certificate.strongKey !== validation.strongKey) { reasons.add("dependency_changed"); continue; }
 			let artifacts: VerifiedArtifactClosure | undefined;
-			try { artifacts = await this.store.artifacts.load(referencedArtifacts(certificate), signal); }
+			try { artifacts = await this.store.loadArtifacts(referencedArtifacts(certificate), signal, request.live?.artifacts?.get(certificate.id)); }
 			catch { reasons.add("artifact_unreadable"); continue; }
 			signal.throwIfAborted();
 			if (!artifacts) { reasons.add("artifact_missing"); continue; }

@@ -1,6 +1,7 @@
 import { snapshotExecutionScope, type ExecutionScope, type ExecutionOperationAdoption } from "./execution-world.ts";
 import { EffectCommitFailure, effectCommitFailure } from "./effect-transaction.ts";
-import type { ProcessProvenanceCertificate, Sha256Digest } from "./provenance-certificate.ts";
+import { referencedArtifacts, type ProcessProvenanceCertificate, type Sha256Digest } from "./provenance-certificate.ts";
+import type { ProvenanceCertificateStore, VerifiedArtifactClosure } from "./reuse-store.ts";
 import { immutableSnapshot, isImmutableSnapshot, stableEqual } from "./stable-json.ts";
 import { TimelineInterval } from "./task-timing.ts";
 import { waitForCompletion } from "./scheduler.ts";
@@ -80,7 +81,7 @@ export interface ProcessExecutionBinding {
 
 type HandoffState =
 	| { readonly status: "running"; inputsChanged?: () => Promise<boolean>; suspend?: () => Promise<void> }
-	| { readonly status: "completed" | "reserved" | "retained"; readonly candidate?: ProcessProvenanceCertificate };
+	| { readonly status: "completed" | "reserved" | "retained"; readonly result?: { readonly candidate: ProcessProvenanceCertificate; readonly artifacts: VerifiedArtifactClosure } };
 
 interface HandoffRecord extends ProcessHandoff {
 	borrowers: number;
@@ -103,6 +104,7 @@ export type ProcessHandoffAcquisition<Plan> =
 export type ProcessHandoffLookup<Plan> = (
 	candidates?: readonly ProcessProvenanceCertificate[],
 	excludedCertificates?: ReadonlySet<Sha256Digest>,
+	artifacts?: ReadonlyMap<Sha256Digest, VerifiedArtifactClosure>,
 ) => Promise<Plan | undefined>;
 
 type AcquireOptions<Plan> = {
@@ -120,13 +122,14 @@ export class ProcessHandoffRegistry<Invocation = never> {
 	private readonly byKey = new Map<Sha256Digest, Map<ProcessHandoff, HandoffRecord>>();
 	private readonly waiters = new Map<Sha256Digest, Set<AbortController>>();
 	private readonly invocations = new WeakMap<ProcessExecutionBinding, { readonly value: Invocation; readonly bytes: number; executionMs: number }>();
+	private readonly store: ProvenanceCertificateStore;
 	private maxCompleted: number;
 	private maxRetainedBytes: number;
 	private retainedBytes = 0;
 	private completedCount = 0;
 	private disposed = false;
 
-	constructor(maxCompleted: number, maxRetainedBytes = 0) { this.maxCompleted = maxCompleted; this.maxRetainedBytes = maxRetainedBytes; }
+	constructor(store: ProvenanceCertificateStore, maxRetainedBytes: number) { this.store = store; this.maxCompleted = store.limits.maxCertificates; this.maxRetainedBytes = maxRetainedBytes; }
 
 	configure(maxCompleted: number, maxRetainedBytes = this.maxRetainedBytes): void {
 		this.maxCompleted = maxCompleted;
@@ -137,8 +140,8 @@ export class ProcessHandoffRegistry<Invocation = never> {
 	/** Keep secrets only with their existing handoff owner; the returned capability contains no raw arguments. */
 	bind(key: Sha256Digest, handoff: ProcessHandoff, invocation: Invocation): ProcessExecutionBinding | undefined {
 		const record = this.byKey.get(key)?.get(handoff);
-		if (!record || record.state.status === "running" || record.state.candidate?.weakKey !== key || !record.state.candidate.dependencyCertificate.complete) return;
-		return this.retainBinding(key, record, invocation, record.state.candidate.result.observedProcessMs ?? 0);
+		if (!record || record.state.status === "running" || record.state.result?.candidate.weakKey !== key || !record.state.result.candidate.dependencyCertificate.complete) return;
+		return this.retainBinding(key, record, invocation, record.state.result.candidate.result.observedProcessMs ?? 0);
 	}
 
 	/** A completed native launch teaches preparation only; it has no result or adoption authority. */
@@ -160,8 +163,8 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		const bytes = Buffer.byteLength(JSON.stringify(value));
 		if (bytes > this.maxRetainedBytes) return;
 		// Repeated native learning shares its launch capability; result owners remain distinct.
-		if (record.state.status === "retained" && !record.state.candidate) for (const previous of this.byKey.get(key)?.values() ?? []) {
-			if (previous !== record && previous.state.status === "retained" && !previous.state.candidate &&
+		if (record.state.status === "retained" && !record.state.result) for (const previous of this.byKey.get(key)?.values() ?? []) {
+			if (previous !== record && previous.state.status === "retained" && !previous.state.result &&
 				previous.scope?.sessionID === record.scope.sessionID && previous.executablePath === record.executablePath &&
 				previous.binding && stableEqual(this.invocations.get(previous.binding)?.value, value)) {
 				this.invocations.get(previous.binding)!.executionMs = executionMs;
@@ -182,8 +185,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 	/** Results of `key` this session produced, newest first: what a run of it could still reuse, never an adoption. */
 	results(key: Sha256Digest, scope: ExecutionScope): readonly ProcessProvenanceCertificate[] {
 		return [...this.byKey.get(key)?.values() ?? []].reverse().flatMap(record =>
-			record.state.status === "completed" && record.state.candidate && (!record.state.candidate.result.continuation || record.continuation) &&
-				record.scope?.sessionID === scope.sessionID ? [record.state.candidate] : []);
+				record.state.status === "completed" && record.state.result && record.scope?.sessionID === scope.sessionID ? [record.state.result.candidate] : []);
 	}
 
 	bindings(scope: ExecutionScope): readonly ProcessExecutionBinding[] {
@@ -245,30 +247,30 @@ export class ProcessHandoffRegistry<Invocation = never> {
 				const records = [...this.byKey.get(request.key)?.values() ?? []];
 				const completed = [...records].reverse().flatMap((record) => {
 					const state = record.state;
-					if (state.status !== "completed" || !state.candidate || considered.has(record)) return [];
-					const oneShot = state.candidate.dependencyCertificate.taints.length > 0 || !!state.candidate.result.continuation;
-					if (state.candidate.result.continuation && !record.continuation) return [];
+					if (state.status !== "completed" || !state.result || considered.has(record)) return [];
+					const { candidate, artifacts } = state.result, oneShot = candidate.dependencyCertificate.taints.length > 0 || !!candidate.result.continuation;
 					return oneShot && (!record.ownership.acceptsScope(record.scope, scope, request.role === "actor") || record.ownership.wholeClaimed)
-						? [] : [{ record, state, candidate: state.candidate, oneShot }];
+						? [] : [{ record, state, candidate, artifacts, oneShot }];
 				});
 				if (completed.length) {
 					for (const { record } of completed) retain(record);
-					const plan = await request.lookup(completed.map(({ candidate }) => candidate));
+					const plan = await request.lookup(completed.map(({ candidate }) => candidate), undefined, new Map(completed.map(({ candidate, artifacts }) => [candidate.id, artifacts])));
 					if (request.signal?.aborted) return { kind: "miss", joined };
 					const selected = completed.find(({ candidate }) => candidate === plan?.certificate);
 					if (!selected) for (const { record, candidate } of completed) considered.set(record, candidate.id);
 					if (plan && selected && selected.record.state === selected.state && this.byKey.get(request.key)?.has(selected.record)) {
 						const { record, state, oneShot } = selected;
 						const claim = oneShot && record.ownership.acceptsScope(record.scope, scope, request.role === "actor") ? record.ownership.claimChild() : undefined;
-						if (oneShot && !claim) { considered.set(record, state.candidate?.id); continue; }
+						if (oneShot && !claim) { considered.set(record, selected.candidate.id); continue; }
 						if (oneShot) record.state = { ...state, status: "reserved" };
 						record.borrowers++;
 						let pending = true;
 						return { kind: "hit", plan, joined, producer: record, continuation: record.continuation, settle: consumed => {
 							if (!pending) return;
 							pending = false; claim?.(consumed); record.borrowers--;
-							if (oneShot) { record.state = consumed ? { ...state, status: "retained" } : state; this.wake(request.key); }
-							if (consumed && record.continuation) { this.retainedBytes -= record.continuation.image.length; record.continuation = undefined; }
+							if (oneShot && this.byKey.get(request.key)?.has(record)) {
+								if (consumed) this.releaseResult(record); else record.state = state; this.wake(request.key);
+							}
 							this.trim();
 						} };
 					}
@@ -309,7 +311,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		} finally { for (const record of borrowed) record.borrowers--; this.trim(); }
 	}
 
-	/** Makes the candidate visible before persistence begins; persistence outcome never retracts it. */
+	/** Seal owned bytes before visibility; disk maintenance and persistence cannot revoke a live result. */
 	async publish(
 		key: Sha256Digest,
 		handoff: ProcessHandoff,
@@ -318,23 +320,26 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		continuation?: ProcessContinuation,
 		computation?: TimelineInterval,
 	): Promise<boolean> {
-		if (!this.complete(key, handoff, candidate, continuation, computation)) throw new Error("process handoff is no longer running");
+		if (this.byKey.get(key)?.get(handoff)?.state.status !== "running") throw new Error("process handoff is no longer running");
+		const references = referencedArtifacts(candidate), bytes = [...new Map(references.map(reference => [reference.digest, reference.size])).values()].reduce((sum, size) => sum + size, continuation?.image.length ?? 0);
+		if (bytes > this.maxRetainedBytes) { this.complete(key, handoff); return persist(); }
+		const artifacts = await this.store.loadArtifacts(references, handoff.signal);
+		if (!artifacts || !this.complete(key, handoff, { candidate, artifacts }, continuation, computation)) throw new Error("process handoff has no complete owned result");
 		return persist();
 	}
 
-	complete(key: Sha256Digest, handoff: ProcessHandoff, candidate?: ProcessProvenanceCertificate, continuation?: ProcessContinuation,
+	complete(key: Sha256Digest, handoff: ProcessHandoff, result?: Extract<HandoffState, { status: "completed" | "reserved" | "retained" }>["result"], continuation?: ProcessContinuation,
 		computation?: TimelineInterval): boolean {
 		const record = this.byKey.get(key)?.get(handoff);
 		if (!record || record.state.status !== "running") return false;
-		if (!!candidate?.result.continuation !== !!continuation || continuation &&
-			(continuation.image.length !== candidate!.result.continuation!.imageBytes || !record.borrowers && continuation.image.length > this.maxRetainedBytes)) return false;
-		if (continuation) { record.continuation = continuation; this.retainedBytes += continuation.image.length; }
-		record.state = { status: "completed", ...(candidate ? { candidate } : {}) };
+		if (!!result?.candidate.result.continuation !== !!continuation || continuation && continuation.image.length !== result!.candidate.result.continuation!.imageBytes) return false;
+		record.continuation = continuation; this.retainedBytes += (result?.artifacts.bytes ?? 0) + (continuation?.image.length ?? 0);
+		record.state = { status: "completed", result };
 		this.completedCount++;
-		if (candidate) record.computation = computation ?? continuation?.computation ?? new TimelineInterval(record.startedAt, performance.now());
+		if (result) record.computation = computation ?? continuation?.computation ?? new TimelineInterval(record.startedAt, performance.now());
 		record.settle();
 		this.wake(key);
-		if (!candidate || !record.scope) this.remove(record);
+		if (!result || !record.scope) this.remove(record);
 		else this.trim();
 		return true;
 	}
@@ -346,8 +351,8 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		for (const key of this.waiters.keys()) this.wake(key);
 		for (const record of this.records()) {
 			if (record.state.status === "running") record.controller.abort(new Error("process handoff disposed"));
-			this.revokeBinding(record);
 			this.complete(record.key, record);
+			this.remove(record);
 		}
 		this.byKey.clear();
 		this.completedCount = 0;
@@ -388,16 +393,19 @@ export class ProcessHandoffRegistry<Invocation = never> {
 	}
 
 	private trim(limit = this.maxCompleted): void {
-		if (this.completedCount <= limit && this.retainedBytes <= this.maxRetainedBytes) return;
 		for (const record of this.records()) {
-			if (record.borrowers) continue;
-			if (record.state.status !== "running" && this.completedCount > limit) this.remove(record);
-			else if (this.retainedBytes > this.maxRetainedBytes) this.revokeBinding(record);
+			if (this.completedCount <= limit && this.retainedBytes <= this.maxRetainedBytes) break;
+			if (!record.borrowers && record.state.status !== "running") this.remove(record);
 		}
 	}
 
-	private revokeBinding(record: HandoffRecord): void {
+	private releaseResult(record: HandoffRecord): void {
+		if (record.state.status !== "running") { this.retainedBytes -= record.state.result?.artifacts.bytes ?? 0; record.state = { status: "retained" }; }
 		if (record.continuation) { this.retainedBytes -= record.continuation.image.length; record.continuation = undefined; }
+	}
+
+	private revokeBinding(record: HandoffRecord): void {
+		this.releaseResult(record);
 		if (!record.binding) return;
 		this.retainedBytes -= this.invocations.get(record.binding)?.bytes ?? 0;
 		this.invocations.delete(record.binding);

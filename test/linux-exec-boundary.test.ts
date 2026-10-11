@@ -116,6 +116,7 @@ int main(int argc, char **argv) {
 					if (scenario.name === "stale" || scenario.name === "link") await writeFile(path.join(workspace, scenario.name === "stale" ? "input.txt" : "data.txt"), scenario.name === "stale" ? "after\n" : "v2\n");
 				}
 				if (scenario.name === "completed") {
+					await backend.store.clear(); // The live child owns its complete effects independently of the shared disk cache.
 					const decide = Reflect.get(backend, "decideHeldExec") as (process: HeldExecProcess, scope?: HeldExecProcess["scope"]) => Promise<HeldExecDecision>;
 					Reflect.set(backend, "decideHeldExec", async (...args: Parameters<typeof decide>) => {
 						const decision = await decide.apply(backend, args);

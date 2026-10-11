@@ -368,7 +368,7 @@ async function installController(
 		rawProcessExecutor,
 		{
 			enabled: actorReplayEnabled,
-			prepare: (refresh) => processBackend.prepareActorReplay(rawProcessExecutor, {
+			prepare: (refresh, signal) => processBackend.prepareActorReplay(rawProcessExecutor, {
 				sourceRoot: context.cwd,
 				...(shell.commandTransport !== "stdin" ? { held: {
 					realShell: shell.shell,
@@ -382,7 +382,7 @@ async function installController(
 					environment: definedProcessEnvironment(request.environment),
 					...(piToolSettings.shellPath ? { shellPath: piToolSettings.shellPath } : {}),
 				})?.process,
-			}, refresh),
+			}, refresh, signal),
 			reset: () => processBackend.resetActorReplay(),
 		},
 	);

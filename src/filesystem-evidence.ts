@@ -10,13 +10,13 @@ const IDENTITY_FIELDS = ["dev", "ino", "mode", "nlink", "uid", "gid", "rdev", "s
 export const FILESYSTEM_CONCURRENCY = 12;
 
 /** Bound independent filesystem work and drain every admitted operation before propagating failure. */
-export async function mapFilesystem<Input, Output>(values: ReadonlyArray<Input>, run: (value: Input) => Promise<Output>) {
+export async function mapFilesystem<Input, Output>(values: ReadonlyArray<Input>, run: (value: Input) => Promise<Output>, signal?: AbortSignal) {
 	const output: Output[] = [];
 	let cursor = 0;
 	const pending = Array.from({ length: Math.min(FILESYSTEM_CONCURRENCY, values.length) }, async () => {
-		while (cursor < values.length) { const index = cursor++; output[index] = await run(values[index]); }
+		while (cursor < values.length) { signal?.throwIfAborted(); const index = cursor++; output[index] = await run(values[index]); }
 	});
-	try { await Promise.all(pending); }
+	try { await Promise.all(pending); signal?.throwIfAborted(); }
 	catch (error) { cursor = values.length; await Promise.allSettled(pending); throw error; }
 	return output;
 }
@@ -83,8 +83,9 @@ export function captureStableFile(
 	maxBytes = Number.POSITIVE_INFINITY,
 	retainContent = false,
 	observed?: Parameters<typeof captureFile>[4], // Without a digest when only the bytes and their identity are kept.
+	signal?: AbortSignal,
 ): Promise<StableFilesystemCapture> {
-	return captureFile(target, maxBytes, retainContent, true, observed);
+	return captureFile(target, maxBytes, retainContent, true, observed, signal);
 }
 
 /** File digests by kernel identity and change times (userspace cannot set a ctime). An entry is trusted once the file's last change
@@ -113,19 +114,21 @@ export function rememberCapture(capture: StableFilesystemCapture | { readonly id
 }
 
 /** Follow executable aliases (including /proc/PID/exe), then hash the complete pinned image. */
-export async function hashExecutableFile(target: string, observation?: { readonly pinned: () => void; readonly signal: AbortSignal }): Promise<`sha256:${string}`> {
+export async function hashExecutableFile(target: string, signal?: AbortSignal): Promise<`sha256:${string}`> {
+	signal?.throwIfAborted();
 	const cached = cachedCapture(await fs.stat(target, { bigint: true }), target);
-	if (cached) { observation?.pinned(); return `sha256:${cached.hash}`; }
-	const takenAtMs = Date.now(), capture = await captureFile(target, Infinity, false, false, undefined, observation);
+	signal?.throwIfAborted(); if (cached) return `sha256:${cached.hash}`;
+	const takenAtMs = Date.now(), capture = await captureFile(target, Infinity, false, false, undefined, signal);
 	rememberCapture(capture, takenAtMs);
 	return `sha256:${capture.hash}`;
 }
 
 /** A dependency's content digest: an unchanged file validates by its identity (a runtime's image and libraries on every reuse). */
-export async function captureFileDigest(target: string, maxBytes = Number.POSITIVE_INFINITY): Promise<StableFilesystemCapture> {
+export async function captureFileDigest(target: string, maxBytes = Number.POSITIVE_INFINITY, signal?: AbortSignal): Promise<StableFilesystemCapture> {
+	signal?.throwIfAborted();
 	const stat = await fs.stat(target, { bigint: true }), cached = Number(stat.size) <= maxBytes ? cachedCapture(stat, target) : undefined;
-	if (cached) return cached;
-	const takenAtMs = Date.now(), capture = await captureStableFile(target, maxBytes);
+	signal?.throwIfAborted(); if (cached) return cached;
+	const takenAtMs = Date.now(), capture = await captureStableFile(target, maxBytes, false, undefined, signal);
 	rememberCapture(capture, takenAtMs);
 	return capture;
 }
@@ -161,8 +164,8 @@ export async function captureHeldDirectory(pid: number, fd: number, content: Buf
 }
 
 async function captureFile(target: string, maxBytes: number, retainContent: boolean, verifyPath: boolean,
-	observed?: Partial<Pick<StableFilesystemCapture, "stat" | "realPath">> & { readonly retainObject?: boolean; readonly gitBlob?: boolean; readonly digest?: false }, observation?: { readonly pinned: () => void; readonly signal: AbortSignal }): Promise<StableFilesystemCapture> {
-	const startedAt = performance.now();
+	observed?: Partial<Pick<StableFilesystemCapture, "stat" | "realPath">> & { readonly retainObject?: boolean; readonly gitBlob?: boolean; readonly digest?: false }, signal?: AbortSignal): Promise<StableFilesystemCapture> {
+	signal?.throwIfAborted(); const startedAt = performance.now();
 	// O_PATH pins even executable aliases without admitting I/O on a raced-in FIFO or device.
 	let binding = process.platform === "linux" && (process.arch === "x64" || process.arch === "arm64")
 		? await fs.open(target, 0x200000 | (verifyPath ? constants.O_NOFOLLOW : 0)) : undefined;
@@ -178,12 +181,9 @@ async function captureFile(target: string, maxBytes: number, retainContent: bool
 		handle = await fs.open(binding ? `/proc/self/fd/${binding.fd}` : target,
 			constants.O_RDONLY | (binding || !verifyPath ? 0 : constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
 		if (!sameFilesystemIdentity(before, await handle.stat({ bigint: true }))) throw new Error("file_changed_during_capture");
-		observation?.pinned();
-		observation?.signal.throwIfAborted();
 		// Never borrow another capture's ongoing read: bytes read before this stat can predate a same-size rewrite
 		// that coarse timestamps leave with the same identity.
-		const captured = await readFileContents(handle, before, maxBytes, retainContent, () => observation?.signal.throwIfAborted(), observed?.gitBlob, observed?.digest);
-		observation?.signal.throwIfAborted();
+		const captured = await readFileContents(handle, before, maxBytes, retainContent, signal, observed?.gitBlob, observed?.digest);
 		const after = captured.stat;
 		if (verifyPath) {
 			const [afterPath, pathStat] = await Promise.all([fs.realpath(target), fs.lstat(target, { bigint: true })]);
@@ -196,18 +196,18 @@ async function captureFile(target: string, maxBytes: number, retainContent: bool
 			return { ...result, object };
 		}
 		return result;
-	} catch (error) { observation?.signal.throwIfAborted(); throw error; } finally {
+	} catch (error) { signal?.throwIfAborted(); throw error; } finally {
 		try { await handle?.close(); } finally { await binding?.close(); }
 	}
 }
 
-async function readFileContents(handle: FileHandle, before: BigIntStats, maxBytes: number, retainContent: boolean, check?: () => void, gitBlob = false, digest = true) {
+async function readFileContents(handle: FileHandle, before: BigIntStats, maxBytes: number, retainContent: boolean, signal?: AbortSignal, gitBlob = false, digest = true) {
 	const hash = digest ? createHash("sha256") : undefined, blob = gitBlob ? createHash("sha1").update(`blob ${before.size}\0`) : undefined;
 	const content = retainContent ? Buffer.allocUnsafe(Number(before.size)) : undefined;
 	const buffer = Buffer.allocUnsafe(content ? 1 : Math.max(1, Math.min(Number(before.size), 1024 * 1024)));
 	let bytesRead = 0;
 	for (;;) {
-		check?.();
+		signal?.throwIfAborted();
 		const chunk = content && bytesRead < content.length ? content.subarray(bytesRead) : buffer;
 		const { bytesRead: size } = await handle.read(chunk);
 		if (size === 0) break;
@@ -217,7 +217,7 @@ async function readFileContents(handle: FileHandle, before: BigIntStats, maxByte
 		hash?.update(chunk.subarray(0, size)); blob?.update(chunk.subarray(0, size));
 	}
 	const after = await handle.stat({ bigint: true });
-	check?.();
+	signal?.throwIfAborted();
 	if (bytesRead !== Number(before.size) || !sameFilesystemIdentity(before, after)) { throw new Error("file_changed_during_capture"); }
 	return { hash: hash?.digest("hex") ?? "", bytesRead, stat: after, ...(content ? { content } : {}), ...(blob ? { blob: blob.digest("hex") } : {}) };
 }

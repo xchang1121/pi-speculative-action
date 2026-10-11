@@ -8,6 +8,7 @@ import { dependencyPathsetKey, type DynamicDependency, type DynamicDependencyCer
 	type Sha256Digest } from "./provenance-certificate.ts";
 
 export interface ProvenanceValidationContext {
+	readonly signal?: AbortSignal;
 	/** Map a stable logical path from the certificate into the current physical execution world. */
 	readonly resolvePath?: (logicalPath: string) => string | undefined;
 	/** Current inherited readable-FD content identities. Missing entries fail closed. */
@@ -67,6 +68,7 @@ export async function validateDynamicDependencyCertificate(
 	certificate: DynamicDependencyCertificate,
 	context: ProvenanceValidationContext = {},
 ): Promise<DynamicDependencyValidation> {
+	context.signal?.throwIfAborted();
 	let filesRead = 0;
 	let bytesRead = 0;
 	const metrics = () => ({ filesRead, bytesRead });
@@ -93,7 +95,7 @@ export async function validateDynamicDependencyCertificate(
 			switch (expected.kind) {
 				case "file": {
 					const captured = await captureFileDependency(physicalPath, expected.path, expected.role, {
-						includeMetadata: expected.metadataDigest !== undefined, maxFileBytes: context.maxFileBytes, aliases: expected.aliases, resolvePath: context.resolvePath });
+						includeMetadata: expected.metadataDigest !== undefined, maxFileBytes: context.maxFileBytes, aliases: expected.aliases, resolvePath: context.resolvePath, signal: context.signal });
 					filesRead += captured.filesRead;
 					bytesRead += captured.bytesRead;
 					return { observed: captured.dependency };
@@ -107,10 +109,11 @@ export async function validateDynamicDependencyCertificate(
 				case "lock": return { observed: await probeLock(physicalPath, expected.path, expected.exclusive) };
 			}
 		} catch (error) {
+			context.signal?.throwIfAborted();
 			if (missing(error)) return { missing: true };
 			return `validation_error:${expected.kind === "fd" ? expected.fd : expected.path}:${errorMessage(error)}`;
 		}
-	});
+	}, context.signal);
 	for (const [index, check] of checks.entries()) {
 		if (typeof check === "string") return indeterminate(check);
 		const expected = expectations[index]!, { observed } = check;
@@ -147,18 +150,18 @@ export async function captureFileDependency(
 	physicalPath: string,
 	logicalPath: string,
 	role: Extract<DynamicDependency, { kind: "file" }>["role"] = "input",
-	options: { readonly includeMetadata?: boolean; readonly maxFileBytes?: number; readonly aliases?: readonly string[];
+	options: { readonly includeMetadata?: boolean; readonly maxFileBytes?: number; readonly aliases?: readonly string[]; readonly signal?: AbortSignal;
 		readonly resolvePath?: ProvenanceValidationContext["resolvePath"] } = {},
 ): Promise<{ readonly dependency: Extract<DynamicDependency, { kind: "file" }>; readonly bytesRead: number; readonly filesRead: number }> {
 	const limit = options.maxFileBytes ?? Infinity, maxBytes = Number.isFinite(limit) ? Math.max(0, limit) : Infinity;
-	const content = await captureFileDigest(physicalPath, maxBytes);
+	const content = await captureFileDigest(physicalPath, maxBytes, options.signal);
 	let aliases = options.aliases;
 	if (aliases) {
-		const states = await Promise.all(aliases.map(async logical => {
+		const states = await mapFilesystem(aliases, async logical => {
 			const physical = options.resolvePath ? options.resolvePath(logical) : path.resolve(logical);
 			if (!physical) throw new Error(`alias_unmapped:${logical}`);
 			return lstat(physical, { bigint: true });
-		}));
+		}, options.signal);
 		if (content.stat.nlink !== BigInt(aliases.length) || states.some(state => !state.isFile() || !sameFilesystemIdentity(content.stat, state))) aliases = undefined; // Changed topology: a plain file entry.
 	}
 	return {

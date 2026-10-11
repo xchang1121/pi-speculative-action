@@ -26,13 +26,14 @@ export type PreparedProcessExecutionRoute =
 	| (ProcessRouteSnapshot & { readonly state: "unavailable" });
 export interface ProcessExecutionRoute {
 	readonly enabled: () => boolean;
-	readonly prepare: (refresh: boolean) => Promise<PreparedProcessExecutionRoute>;
+	readonly prepare: (refresh: boolean, signal: AbortSignal) => Promise<PreparedProcessExecutionRoute>;
 	readonly reset?: () => Promise<void>;
 }
 
 export type ProcessToolOperations = BashOperations;
 
 interface ActorProcessGeneration {
+	readonly controller: AbortController;
 	readonly preparation: Promise<PreparedProcessExecutionRoute>;
 	readonly executions: Set<Promise<ProcessExecutionResult>>;
 	prepared?: PreparedProcessExecutionRoute;
@@ -110,8 +111,9 @@ export class ProcessExecutionCoordinator {
 		if (!this.actorRoute) throw new Error("Actor process reuse is not configured");
 		if (this.actor) return "retirement" in this.actor ? undefined : this.actor;
 		const generation: ActorProcessGeneration = {
+			controller: new AbortController(),
 			executions: new Set(),
-			preparation: Promise.resolve().then(() => this.actorRoute!.prepare(refresh))
+			preparation: Promise.resolve().then(() => this.actorRoute!.prepare(refresh, generation.controller.signal))
 			.catch((error): PreparedProcessExecutionRoute => ({
 				state: "unavailable",
 				detail: errorMessage(error),
@@ -126,11 +128,12 @@ export class ProcessExecutionCoordinator {
 		if (!generation) return Promise.resolve();
 		if ("retirement" in generation) return generation.retirement;
 		// Detach admission before yielding; only this generation's already admitted calls may drain.
-		const retiring = { retirement: (async () => {
+		const retiring = { retirement: Promise.resolve().then(async () => {
+			generation.controller.abort(new Error("Actor process preparation retired"));
 			await generation.preparation;
 			await Promise.allSettled(generation.executions);
 			await this.actorRoute?.reset?.();
-		})().finally(() => { if (this.actor === retiring) this.actor = undefined; }) };
+		}).finally(() => { if (this.actor === retiring) this.actor = undefined; }) };
 		this.actor = retiring;
 		return retiring.retirement;
 	}
