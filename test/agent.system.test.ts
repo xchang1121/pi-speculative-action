@@ -225,8 +225,14 @@ test("reconsiders restored results while sharing pending reads and retains fresh
 			expect(await f.execute("read", input)).toEqual(await reader.execute("reference", input));
 		expect({ runs, fallbacks: f.fallbacks }).toEqual({ runs: 2, fallbacks: [] });
 		await f.execute("write", { path: "notes.txt", content: "new\n" });
-		expect(textOutput(await f.execute("read", wide))).toBe("new\n");
+		await f.preview("read", wide, undefined, "fresh");
+		expect(textOutput(await f.execute("read", wide, undefined, "fresh"))).toBe("new\n");
+		await writeFile(file, "prepared\n"); await f.preview("read", wide); await writeFile(file, "changed again\n");
+		expect(textOutput(await f.execute("read", wide))).toBe("changed again\n");
 		await writeFile(file, original); expect(await f.execute("read", args)).toEqual(await reader.execute("restored", args)); await f.finish();
-		expect(f.events.filter(event => event.type === "actor_action").at(-1)?.settlement.provider).toMatchObject({ kind: "speculative", match: { kind: "exact" } });
+		const settled = f.events.filter(event => event.type === "actor_action");
+		expect(settled.at(-3)?.computation?.hiddenComputeMs).toBeGreaterThan(0);
+		expect(settled.at(-2)?.computation?.hiddenComputeMs).toBe(0);
+		expect(settled.at(-1)?.settlement.provider).toMatchObject({ kind: "speculative", match: { kind: "exact" } });
 	} finally { controller.abort(); release.resolve(); await Promise.allSettled(actors); await f.dispose(); }
 });

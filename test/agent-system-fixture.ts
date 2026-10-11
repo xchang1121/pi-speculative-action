@@ -32,9 +32,9 @@ export function systemHost(cwd: string, tools: AgentTool[], options: Partial<Cre
 			await host.startTurn({ turnID, tools, actorOptions: {}, actorModel: testModel("actor", { contextWindow: 262144 }),
 				context: { systemPrompt: "Use tools to inspect and edit these files.", messages: [], tools } });
 		},
-		preview: (tool: string, args: Record<string, unknown>, signal?: AbortSignal) => host.previewActorCall(call(tool, args), signal),
-		execute: (tool: string, args: Record<string, unknown>, signal?: AbortSignal) => {
-			const input = call(tool, args), executor = tools.find(candidate => candidate.name === tool)!;
+		preview: (tool: string, args: Record<string, unknown>, signal?: AbortSignal, id?: string) => host.previewActorCall(call(tool, args, id), signal),
+		execute: (tool: string, args: Record<string, unknown>, signal?: AbortSignal, id?: string) => {
+			const input = call(tool, args, id), executor = tools.find(candidate => candidate.name === tool)!;
 			return host.execute(input, signal, operation => {
 				fallbacks.push(tool);
 				if (operation.invocation?.authoritative) return operation.invocation.authoritative({ callID: input.id,
