@@ -1,29 +1,29 @@
 import { readdir, unlink, utimes, writeFile } from "node:fs/promises";
 import * as filesystem from "node:fs/promises";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, expect, test, vi } from "vitest";
 import { ArtifactCAS, captureFileDependency, ProcessReusePlanner, ProvenanceCertificateStore, referencedArtifacts, sealProcessCertificate,
 	type ProcessProvenanceCertificate } from "../src/process-reuse.ts";
 import { ProcessHandoffOwnership, ProcessHandoffRegistry, type ProcessHandoff } from "../src/process-handoff.ts";
+import { LinuxProcessReuseBackend } from "../src/linux-process-backend.ts";
+import { ProcessExecutionCoordinator } from "../src/process-execution.ts";
 import { effectCommitFailure } from "../src/effect-transaction.ts";
 import { waitForCompletion } from "../src/scheduler.ts";
 import { TaskTimeline, TimelineInterval } from "../src/task-timing.ts";
-import { legacyCertificate, processPrototype, processCertificate, storeMetadata, storePeer } from "./process-fixture.ts";
+import { legacyCertificate, PROCESS_CERTIFICATE, storeMetadata, storePeer } from "./process-fixture.ts";
 import { temporaryDirectories } from "./filesystem.ts";
 import { deferred, gated, nextTurn } from "./async.ts";
 
 vi.mock("node:fs/promises", { spy: true });
 const directories = temporaryDirectories("pi-reuse-system-");
-const registries = new Set<ProcessHandoffRegistry>();
-const stores = new Set<ProvenanceCertificateStore>();
 const cleanup: (() => unknown)[] = [];
 afterEach(async () => {
-	for (const registry of registries) registry.dispose(); registries.clear();
 	await Promise.all(cleanup.splice(0).map(close => close()));
-	await Promise.all([...stores].map(store => store.drain())); stores.clear();
 	vi.restoreAllMocks(); await directories.dispose();
 });
-const storeAt = (root: string, options?: ConstructorParameters<typeof ProvenanceCertificateStore>[1]) => { const store = new ProvenanceCertificateStore(root, options); stores.add(store); return store; };
+const own = <T extends { dispose(): unknown }>(resource: T): T => { cleanup.push(() => resource.dispose()); return resource; };
+const storeAt = (...args: ConstructorParameters<typeof ProvenanceCertificateStore>) => own(new ProvenanceCertificateStore(...args));
 const hold = () => { const pause = gated(); cleanup.push(pause.release); return pause; };
 const track = <T>(pending: Promise<T>): Promise<T> => { const settled = pending.catch(() => undefined); cleanup.push(() => settled); return pending; };
 const peer = (...args: Parameters<typeof storePeer>) => { const owner = storePeer(...args); cleanup.push(() => { owner.child.kill(); return owner.completed.catch(() => undefined); }); return owner; };
@@ -33,18 +33,20 @@ function watchInventory(store: ProvenanceCertificateStore, pause?: ReturnType<ty
 }
 
 async function fixture(options: ConstructorParameters<typeof ProvenanceCertificateStore>[1] = {}) {
-	const root = await directories.create(), input = path.join(root, "input"), store = storeAt(root, options), prototype = processPrototype();
+	const root = await directories.create(), input = path.join(root, "input"), store = storeAt(root, options);
 	await writeFile(input, "current input");
-	const request = { weakKey: processCertificate(prototype).weakKey, executablePath: prototype.executablePath,
+	const request = { weakKey: PROCESS_CERTIFICATE.weakKey, executablePath: PROCESS_CERTIFICATE.prototype.executablePath,
 		contract: { sink: "buffered" as const, orderedJournal: true, transactionalEffects: true }, validation: { resolvePath: () => input } };
 	const produce = async (output: string | readonly string[], createdAt = 1, oneShot = false, artifacts = store.artifacts) => {
 		const { dependency } = await captureFileDependency(input, "/workspace/input");
-		const journal = await Promise.all((typeof output === "string" ? [output] : output).map(async (value, sequence) =>
-			({ sequence, kind: "output" as const, fd: 1 as const, data: await artifacts.put(value) })));
-		return processCertificate(prototype, { createdAt, dependencyCertificate: { complete: true, dependencies: [dependency], taints: oneShot ? ["clock"] : [] },
+		const journal = await Promise.all((typeof output === "string" ? [output] : output).map(async (value, sequence) => {
+			const bytes = Buffer.from(value), pending = artifacts.put(bytes); bytes.fill(0);
+			return { sequence, kind: "output" as const, fd: 1 as const, data: await pending };
+		}));
+		return sealProcessCertificate({ ...PROCESS_CERTIFICATE, createdAt, dependencyCertificate: { complete: true, dependencies: [dependency], taints: oneShot ? ["clock"] : [] },
 			result: { replayProfile: "buffered_noninteractive", journal, exit: { kind: "code", code: 0 } } });
 	};
-	const planner = new ProcessReusePlanner({ store }), registry = new ProcessHandoffRegistry(8); registries.add(registry);
+	const planner = new ProcessReusePlanner({ store }), registry = own(new ProcessHandoffRegistry(8));
 	const lookup = async (certificates?: readonly ProcessProvenanceCertificate[], excludedCertificates?: ReadonlySet<ProcessProvenanceCertificate["id"]>) => {
 		const plan = await planner.plan({ ...request, excludedCertificates, ...(certificates ? { live: { certificate: certificates, acceptedTaints: ["clock"] } } : {}) });
 		return plan.kind === "completed_replay" ? plan : undefined;
@@ -52,8 +54,8 @@ async function fixture(options: ConstructorParameters<typeof ProvenanceCertifica
 	const output = (plan: Awaited<ReturnType<ProcessReusePlanner["plan"]>> | undefined) => plan?.kind === "completed_replay" ? plan.certificate.result.journal.map(event =>
 		event.kind === "output" ? plan.artifacts.read(event.data).toString() : "").join("") : undefined;
 	const common = { key: request.weakKey, scope: { sessionID: "system", turnID: "one" }, lookup };
-	const reserve = async (select = lookup, ownership = new ProcessHandoffOwnership()) => {
-		const result = await registry.acquire({ ...common, lookup: select, ownership, role: "producer", executablePath: request.executablePath });
+	const reserve = async (ownership = new ProcessHandoffOwnership()) => {
+		const result = await registry.acquire({ ...common, ownership, role: "producer", executablePath: request.executablePath });
 		if (result.kind !== "work") throw new Error("expected producer");
 		return result.work;
 	};
@@ -97,7 +99,12 @@ test("reopens, validates, repairs and collects persisted history without stale o
 		if (damage.startsWith("certificate")) storeMetadata(f.root, database => {
 			const value = { ...bad, result: { ...bad.result, exit: { kind: "code", code: 1 } } };
 			database.prepare("UPDATE certificates SET value = ? WHERE id = ?").run(damage === "certificate JSON" ? "{" : JSON.stringify(value), bad.id);
-		}); else if (damage === "missing artifact") await unlink(artifactPath);
+		}); else if (damage === "missing artifact") {
+			await unlink(artifactPath);
+			const versions = () => storeMetadata(f.root, database => database.prepare("SELECT count(*) AS count FROM changes").get()!.count), before = versions();
+			for (let code = 1; code <= 4; code++) await expect(f.store.put(sealProcessCertificate({ ...bad, result: { ...bad.result, continuation: undefined, exit: { kind: "code", code } } }))).rejects.toThrow("missing artifact");
+			expect(versions()).toBe(before);
+		}
 		else await writeFile(artifactPath, damage === "artifact bytes" ? "wrong result" : "wrong");
 		const reopened = new ProcessReusePlanner({ store: storeAt(f.root) });
 		for (const [input, expected, repair] of [["input 256", "output 256", false], ["input 256", "other result", true], ["changed input", undefined, false]] as const) {
@@ -108,9 +115,10 @@ test("reopens, validates, repairs and collects persisted history without stale o
 	const pause = hold(); watchInventory(f.store, pause); const pending = track(f.store.stats(true));
 	await pause.entered; await f.store.put(await f.produce("published during stats", 258)); pause.release(); expect((await pending).certificates).toBe(257);
 	for (const owner of [f.store, store]) expect(await owner.stats()).toMatchObject({ certificates: 258, overBudget: true });
-	storeMetadata(f.root, database => database.exec("UPDATE certificates SET value = '{'"));
+	storeMetadata(f.root, database => database.exec("UPDATE certificates SET value = '{'; INSERT INTO changes VALUES ('certificate:abandoned', 0), ('cas/abandoned', 0)"));
 	const pages = () => storeMetadata(f.root, database => Number(database.prepare("PRAGMA page_count").get()!.page_count)), beforeGC = pages();
 	await f.store.gc(); expect(pages()).toBeLessThan(beforeGC); expect(await store.stats()).toMatchObject({ certificates: 0, artifacts: 0 });
+	expect(storeMetadata(f.root, database => database.prepare("SELECT path FROM changes WHERE path <> ''").all())).toEqual([]);
 	for (const executable of [undefined, f.request.executablePath]) expect(await f.store.mayHaveCertificates(executable)).toBe(false);
 	expect(await readdir(path.join(f.root, "indexes"), { recursive: true }).catch(() => [])).toEqual([]);
 	reads.mockClear(); expect(f.output(await planner.plan(f.request))).toBeUndefined(); expect(reads).not.toHaveBeenCalled();
@@ -146,8 +154,52 @@ test.each(["scan", "deletion", "clear"])("preserves publications from both owner
 	}
 	expect((await f.store.artifacts.get(orphan))?.toString()).toBe("orphan"); expect(f.output(await f.lookup())).toBe("sharednext");
 	await f.store.gc(); expect((await f.store.stats(true)).certificates).toBe(1); expect(await f.store.artifacts.get(orphan)).toBeUndefined();
-	const owner = peer(f.root); expect(await owner.noticed).toBe("held"); owner.child.kill("SIGKILL"); await owner.completed.catch(() => undefined);
-	await f.store.put(remote); expect(f.output(await f.lookup())).toBe("sharednext");
+	const crash = peer(f.root, undefined, [], phase === "scan" ? "publish" : phase === "deletion" ? "clear" : "legacy-clear");
+	await crash.completed.catch(() => undefined); expect(crash.child.signalCode).toBe("SIGKILL");
+	expect((await f.store.stats()).artifacts).toBe(phase === "scan" ? 3 : phase === "clear" ? 2 : 0);
+	const recovered = storeAt(f.root, { orphanGraceMs: 0 });
+	await recovered.gc(); await recovered.gc();
+	expect((await readdir(f.root, { recursive: true })).filter(file => file.includes(".clear-") || file.endsWith(".tmp"))).toEqual([]);
+	await recovered.artifacts.put("shared"); await recovered.artifacts.put("next"); await recovered.put(remote);
+	expect(f.output(await f.lookup())).toBe("sharednext");
+	const owner = peer(f.root); expect(await owner.noticed).toBe("held");
+	expect((await waitForCompletion(owner.completed, undefined, 30)).status).toBe("deadline");
+	const backend = own(new LinuxProcessReuseBackend({ storeRoot: f.root })), commands = vi.spyOn(DatabaseSync.prototype, "exec");
+	expect(await backend.store.get(remote.id)).toEqual(remote);
+	for (let read = 0; read < 3; read++) expect((await backend.store.stats()).certificates).toBe(1);
+	expect(commands).not.toHaveBeenCalledWith("BEGIN IMMEDIATE");
+	const blocked = track(backend.store.artifacts.put("waiting for writer"));
+	await expect.poll(() => commands.mock.results.some(result => result.type === "throw" && [5, 6].includes(Number(result.value.errcode) & 0xff))).toBe(true);
+	const controller = new AbortController(), host = vi.fn(async (request: { signal?: AbortSignal }) => { request.signal?.throwIfAborted(); return { exitCode: 0 }; });
+	const route = await backend.prepareActorReplay({ execute: host }, { sourceRoot: f.root, invocation: () => undefined });
+	expect(route.state === "unavailable").toBe(process.platform !== "linux");
+	const executor = route.state !== "unavailable" ? route.executor : { execute: async (request: { signal?: AbortSignal }) => {
+		await backend.store.mayHaveCertificates(undefined, request.signal); return host(request);
+	} };
+	const preparing = hold(), coordinator = own(new ProcessExecutionCoordinator({ execute: host }, { enabled: () => true,
+		prepare: async () => { await preparing.wait(); return { state: "ready", detail: "store lifecycle", executor }; } }));
+	const entered = deferred(), hint = backend.store.mayHaveCertificates.bind(backend.store);
+	vi.spyOn(backend.store, "mayHaveCertificates").mockImplementation((...args) => { entered.resolve(); return hint(...args); });
+	const invoke = (signal: AbortSignal) => track(coordinator.operations.exec("true", f.root, { signal, onData() {}, env: {} })
+		.then(() => "completed", error => { if (signal.aborted) return "aborted"; throw error; }));
+	const beforeAdmission = new AbortController(), early = invoke(beforeAdmission.signal); await preparing.entered; beforeAdmission.abort();
+	expect(await waitForCompletion(early, undefined, 200)).toEqual({ status: "completed", value: "aborted" });
+	preparing.release(); const actor = invoke(controller.signal); await entered.promise;
+	if (phase === "clear") expect(await waitForCompletion(blocked.catch(error => error.name), undefined, 1500)).toEqual({ status: "completed", value: "TimeoutError" });
+	if (phase === "scan") {
+		controller.abort(); expect(await waitForCompletion(actor, undefined, 200)).toEqual({ status: "completed", value: "aborted" });
+	}
+	expect(await waitForCompletion(Promise.all([actor, backend.dispose()]), undefined, 200))
+		.toEqual({ status: "completed", value: [phase === "scan" ? "aborted" : "completed", undefined] });
+	await expect(blocked).rejects.toThrow(); expect(host).toHaveBeenCalledTimes(2);
+	owner.child.kill("SIGKILL"); await owner.completed.catch(() => undefined); expect(owner.child.signalCode).toBe("SIGKILL");
+	const writer = storeAt(f.root), writing = hold(), rename = (await vi.importActual<typeof filesystem>("node:fs/promises")).rename;
+	vi.spyOn(filesystem, "rename").mockImplementationOnce(async (...args) => { await writing.wait(); return rename(...args); });
+	const publication = track(writer.artifacts.put("admitted write")); await writing.entered;
+	const disposed = writer.dispose(); expect((await waitForCompletion(disposed, undefined, 30)).status).toBe("deadline");
+	writing.release(); const reference = await publication; await disposed;
+	expect((await recovered.artifacts.get(reference))?.toString()).toBe("admitted write");
+	await expect(writer.put(remote)).rejects.toThrow("closed");
 });
 
 test.each(["existing", "new"])("selects a %s ready producer, then falls through damaged live results to fresh persisted evidence", async peer => {
@@ -167,7 +219,7 @@ test.each(["existing", "new"])("selects a %s ready producer, then falls through 
 
 test.each(["released", "consumed", "cancelled", "raced", "whole-released", "whole-consumed"])("settles a %s one-shot claim without losing another Actor's result", async outcome => {
 	const f = await fixture(), ownership = new ProcessHandoffOwnership(), releaseWhole = hold();
-	await f.publish(await f.reserve(f.lookup, ownership), "computed result");
+	await f.publish(await f.reserve(ownership), "computed result");
 	const checked = deferred(), racing = hold(), controller = new AbortController(), consumed = outcome.endsWith("consumed");
 	cleanup.push(() => controller.abort()); let settled = false;
 	const next = () => track(f.actor({ signal: controller.signal, lookup: async (candidates, excluded) => {

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { link, mkdir, open, readFile, readdir, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, readdir, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { setTimeout as delay } from "node:timers/promises";
@@ -7,8 +7,10 @@ import { type ArtifactReference, certificateReplayable, isSha256Digest, parsePro
 	type ProvenanceTaint, referencedArtifacts, sha256DigestAsync, type Sha256Digest, validateArtifact } from "./provenance-certificate.ts";
 import { stableStringify } from "./stable-json.ts";
 import { nonNegativeNumber, positiveInteger } from "./setting-input.ts";
-import { hasErrorCode, isMissing as missing } from "./error-utils.ts";
+import { isMissing as missing } from "./error-utils.ts";
 import { mapFilesystem } from "./filesystem-evidence.ts";
+import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
+import { waitForCompletion } from "./scheduler.ts";
 
 export interface ProvenanceStoreLimits { readonly maxCertificates: number; readonly maxBytes: number; }
 
@@ -30,7 +32,7 @@ export const DEFAULT_PROVENANCE_STORE_LIMITS: ProvenanceStoreLimits = Object.fre
 const DEFAULT_GC_INTERVAL_MS = 5 * 60_000;
 const DEFAULT_ORPHAN_GRACE_MS = 5 * 60_000;
 
-/** Immutable content-addressed effect storage; it never stores decoded Runtime result objects. */
+/** Immutable effects; use store.artifacts to participate in a shared store's publication and retention lifecycle. */
 export class ArtifactCAS {
 	readonly root: string;
 	private readonly publish: typeof publishImmutable;
@@ -38,15 +40,15 @@ export class ArtifactCAS {
 	constructor(root: string, publish = publishImmutable) { this.root = path.resolve(root); this.publish = publish; }
 
 	async put(value: string | Uint8Array): Promise<ArtifactReference> {
-		const bytes = typeof value === "string" ? Buffer.from(value, "utf8") : value;
+		const bytes = Buffer.from(value);
 		const reference = Object.freeze({ digest: await sha256DigestAsync(bytes), size: bytes.byteLength }), target = this.artifactPath(reference.digest);
 		await this.publish(target, bytes);
 		return reference;
 	}
 
-	async get(reference: ArtifactReference): Promise<Buffer | undefined> {
+	async get(reference: ArtifactReference, signal?: AbortSignal): Promise<Buffer | undefined> {
 		validateArtifact(reference);
-		const bytes = await readOptional(this.artifactPath(reference.digest));
+		const bytes = await readOptional(this.artifactPath(reference.digest), signal);
 		if (bytes && (bytes.byteLength !== reference.size || await sha256DigestAsync(bytes) !== reference.digest)) throw new Error(`artifact integrity check failed for ${reference.digest}`);
 		return bytes;
 	}
@@ -58,12 +60,12 @@ export class ArtifactCAS {
 	}
 
 	/** Load and integrity-check a complete effect closure before any replay side effect begins. */
-	async load(references: readonly ArtifactReference[]): Promise<VerifiedArtifactClosure | undefined> {
+	async load(references: readonly ArtifactReference[], signal?: AbortSignal): Promise<VerifiedArtifactClosure | undefined> {
 		const sizes = new Map<Sha256Digest, number>();
 		for (const reference of references) validateArtifact(reference, sizes);
 		const values = new Map<Sha256Digest, Buffer>();
 		for (const [digest, size] of sizes) {
-			const value = await this.get({ digest, size });
+			const value = await this.get({ digest, size }, signal);
 			if (!value) return undefined;
 			values.set(digest, value);
 		}
@@ -95,16 +97,16 @@ export class ProvenanceCertificateStore {
 	private readonly gcIntervalMs: number;
 	private readonly orphanGraceMs: number;
 	private readonly acceptedTaints: readonly ProvenanceTaint[];
-	private maintenance: Promise<void> = Promise.resolve();
+	private readonly lifecycle = new RuntimeLifecycleLane();
+	private readonly stopped = new AbortController();
 	private collection?: Promise<ProvenanceStoreGCResult>;
-	private control?: Promise<DatabaseSync>;
+	private control?: DatabaseSync;
 	private gcDueAt: number;
-	private statsValue?: { revision: number; value: ProvenanceStoreStats; limits: ProvenanceStoreLimits };
 
 	constructor(root: string, options: ProvenanceStoreOptions = {}) {
 		this.root = path.resolve(root); this.configure(options);
-		this.artifacts = new ArtifactCAS(path.join(this.root, "cas"), (target, bytes, verify) =>
-			this.exclusive(() => publishImmutable(target, bytes, verify), [this.objectKey(target)]));
+		this.artifacts = new ArtifactCAS(path.join(this.root, "cas"), (target, bytes) =>
+			this.exclusive(() => publishImmutable(target, bytes), [this.objectKey(target)]));
 		this.gcIntervalMs = nonNegativeNumber(options.gcIntervalMs, DEFAULT_GC_INTERVAL_MS);
 		this.orphanGraceMs = nonNegativeNumber(options.orphanGraceMs, DEFAULT_ORPHAN_GRACE_MS);
 		this.acceptedTaints = Object.freeze([...options.acceptedTaints ?? []]);
@@ -112,9 +114,10 @@ export class ProvenanceCertificateStore {
 	}
 
 	get limits(): ProvenanceStoreLimits { return this.limitsValue; }
+	get signal(): AbortSignal { return this.stopped.signal; }
 	configure(limits: Partial<ProvenanceStoreLimits>): void {
 		this.limitsValue = Object.freeze({ maxCertificates: positiveInteger(limits.maxCertificates, this.limits.maxCertificates), maxBytes: positiveInteger(limits.maxBytes, this.limits.maxBytes) });
-		this.gcDueAt = 0; this.statsValue = undefined;
+		this.gcDueAt = 0;
 	}
 
 	async put(certificate: ProcessProvenanceCertificate): Promise<boolean> {
@@ -133,13 +136,13 @@ export class ProvenanceCertificateStore {
 		return published;
 	}
 
-	get(id: Sha256Digest): Promise<ProcessProvenanceCertificate | undefined> {
+	get(id: Sha256Digest, signal?: AbortSignal): Promise<ProcessProvenanceCertificate | undefined> {
 		digestHex(id);
 		return this.exclusive(async database => {
 			const value = database.prepare("SELECT value FROM certificates WHERE id = ?").get(id)?.value, certificate = decodeCertificate(value);
 			if (value !== undefined && certificate?.id !== id) throw new Error(`certificate integrity check failed for ${id}`);
 			return certificate;
-		}, [], false);
+		}, [], false, signal);
 	}
 
 	async findByWeakKey(weakKey: Sha256Digest, executablePath: string, excludedCertificates?: ReadonlySet<Sha256Digest>): Promise<readonly ProcessProvenanceCertificate[]> {
@@ -149,50 +152,55 @@ export class ProvenanceCertificateStore {
 	}
 
 	/** Indexes only select candidates; every yielded certificate still verifies its complete identity. */
-	async *candidatesByWeakKey(weakKey: Sha256Digest, executablePath: string, excludedCertificates?: ReadonlySet<Sha256Digest>): AsyncGenerator<ProcessProvenanceCertificate> {
-		const candidates = await this.exclusive(async database => database.prepare("SELECT id FROM certificates WHERE weakKey = ? AND executable = ? ORDER BY createdAt DESC, id DESC").all(weakKey, executablePath), [], false);
+	async *candidatesByWeakKey(weakKey: Sha256Digest, executablePath: string, excludedCertificates?: ReadonlySet<Sha256Digest>, signal?: AbortSignal): AsyncGenerator<ProcessProvenanceCertificate> {
+		const candidates = await this.exclusive(async database => database.prepare("SELECT id FROM certificates WHERE weakKey = ? AND executable = ? ORDER BY createdAt DESC, id DESC").all(weakKey, executablePath), [], false, signal);
 		for (const { id } of candidates) {
+			signal?.throwIfAborted();
 			if (!isSha256Digest(id) || excludedCertificates?.has(id)) continue;
-			const certificate = await this.get(id).catch(() => undefined);
+			const certificate = await this.get(id, signal).catch(() => undefined);
 			if (certificate?.weakKey === weakKey) yield certificate;
 		}
 	}
 
-	/** IO uncertainty retains the replay route; an empty metadata index has no leftover directory hints. */
-	async mayHaveCertificates(executablePath?: string): Promise<boolean> {
-		try { return await this.exclusive(async database => Boolean(executablePath === undefined ? database.prepare("SELECT 1 FROM certificates LIMIT 1").get() : database.prepare("SELECT 1 FROM certificates WHERE executable = ? LIMIT 1").get(executablePath)), [], false); }
-		catch { return true; }
+	/** An unavailable optional cache is a miss; live handoffs have their own availability check. */
+	async mayHaveCertificates(executablePath?: string, signal?: AbortSignal): Promise<boolean> {
+		try { return await this.exclusive(async database => Boolean(executablePath === undefined ? database.prepare("SELECT 1 FROM certificates LIMIT 1").get() : database.prepare("SELECT 1 FROM certificates WHERE executable = ? LIMIT 1").get(executablePath)), [], false, signal); }
+		catch { return false; }
 	}
 
-	async stats(refresh = false): Promise<ProvenanceStoreStats> {
-		await this.drain(); const revision = await this.revision(), limits = this.limits;
-		if (!refresh && this.statsValue?.revision === revision && this.statsValue.limits === limits) return this.statsValue.value;
+	/** Physical snapshots include uncommitted crash debris; a metadata revision cannot cache them. */
+	async stats(_refresh = false): Promise<ProvenanceStoreStats> {
+		const limits = this.limits;
 		const inventory = await this.inventory(), referenced = new Set(inventory.certificates.flatMap(({ certificate }) => certificate && certificateReplayable(certificate, this.acceptedTaints) ? referencedArtifacts(certificate).map(reference => reference.digest) : []));
-		const totalBytes = [...inventory.certificates, ...inventory.artifacts.values()].reduce((total, record) => total + record.bytes, 0);
-		const value = Object.freeze({ certificates: inventory.certificates.length, artifacts: inventory.artifacts.size, totalBytes, orphanArtifacts: [...inventory.artifacts.keys()].filter(digest => !referenced.has(digest)).length, overBudget: inventory.certificates.length > limits.maxCertificates || totalBytes > limits.maxBytes });
-		if (await this.revision() === revision && this.limits === limits) this.statsValue = { revision, limits, value };
-		return value;
+		const totalBytes = inventory.objects.reduce((total, record) => total + record.bytes, 0), artifacts = inventory.objects.filter(record => record.path).length;
+		return Object.freeze({ certificates: inventory.certificates.length, artifacts, totalBytes, orphanArtifacts: artifacts - [...referenced].filter(digest => inventory.artifacts.has(digest)).length, overBudget: inventory.certificates.length > limits.maxCertificates || totalBytes > limits.maxBytes });
 	}
 
 	gc(): Promise<ProvenanceStoreGCResult> {
 		// Later publications are marked in the shared transaction log, so this finite inventory never restarts.
-		return this.collection ??= this.revision().then(async revision => this.collect(await this.inventory(), revision)).finally(() => { this.collection = undefined; });
+		return this.collection ??= this.lifecycle.admit(async () => {
+			const revision = await this.revision(); return this.collect(await this.inventory(), revision);
+		}).finally(() => { this.collection = undefined; });
 	}
 
+	/** Flush and release the connection; subsequent operations may reopen it. */
 	async drain(): Promise<void> {
-		await this.maintenance; await this.collection?.catch(() => undefined);
-		const pending = this.maintenance; await pending;
-		if (pending === this.maintenance && !this.collection) { const control = this.control; this.control = undefined; (await control)?.close(); }
+		await this.lifecycle.drain();
+		if (this.lifecycle.sealed) return this.dispose();
+		await this.lifecycle.serialize(() => this.closeDatabase());
 	}
+	dispose(): Promise<void> {
+		this.stopped.abort(new Error("provenance store is closed"));
+		return this.lifecycle.close(async () => { await this.lifecycle.drain(); this.closeDatabase(); });
+	}
+	private closeDatabase(): void { this.control?.close(); this.control = undefined; }
 
 	async clear(): Promise<ProvenanceStoreGCResult> {
 		return this.exclusive(async database => {
 			const before = await this.inventory(database);
-			const tomb = path.join(this.root, `.clear-${randomUUID()}`);
-			await rename(this.artifacts.root, tomb).catch(error => { if (!missing(error)) throw error; });
-			await rm(tomb, { recursive: true, force: true });
+			await mapFilesystem(await this.payloadRoots(), root => rm(root, { recursive: true, force: true }));
 			database.exec("DELETE FROM certificates; DELETE FROM changes WHERE path <> ''");
-			return { removedCertificates: before.certificates.length, removedArtifacts: before.artifacts.size, removedBytes: [...before.certificates, ...before.artifacts.values()].reduce((total, record) => total + record.bytes, 0) };
+			return { removedCertificates: before.certificates.length, removedArtifacts: before.objects.filter(record => record.path).length, removedBytes: before.objects.reduce((total, record) => total + record.bytes, 0) };
 		}, [".clear"]);
 	}
 
@@ -210,14 +218,21 @@ export class ProvenanceCertificateStore {
 			for (const reference of references) retained.add(reference!.key);
 		}
 		// Each certificate (including its index) or payload is one transaction. Publishers can run between objects.
-		for (const record of [...inventory.certificates, ...inventory.artifacts.values()]) if (!retained.has(record.key)) await this.exclusive(async database => {
+		for (const record of inventory.objects) if (!retained.has(record.key)) await this.exclusive(async database => {
 			if ([".clear", record.key].some(key => changeRevision(database, key) > revision)) return;
 			if (record.path) {
-				if (record.modifiedAt > cutoff || ((await stat(record.path).catch(() => undefined))?.mtimeMs ?? Infinity) > cutoff) return;
-				await rm(record.path, { force: true }); result.removedArtifacts++;
-			} else { database.prepare("DELETE FROM certificates WHERE id = ?").run(record.key.slice("certificate:".length)); result.removedCertificates++; }
-			database.prepare("DELETE FROM changes WHERE path = ?").run(record.key); result.removedBytes += record.bytes;
+				const current = await stat(record.path).catch(error => { if (!missing(error)) throw error; });
+				if (record.digest && (record.modifiedAt > cutoff || (current?.mtimeMs ?? 0) > cutoff)) return;
+				if (current) {
+					await rm(record.path, { force: true }); result.removedArtifacts++; result.removedBytes += current.size;
+				}
+			} else if (record.key.startsWith("certificate:")) {
+				const removed = Number(database.prepare("DELETE FROM certificates WHERE id = ?").run(record.key.slice("certificate:".length)).changes);
+				result.removedCertificates += removed; result.removedBytes += removed ? record.bytes : 0;
+			}
+			database.prepare("DELETE FROM changes WHERE path = ?").run(record.key);
 		});
+		await mapFilesystem(inventory.retiredRoots, root => rm(root, { recursive: true, force: true }));
 		return result;
 	}
 
@@ -226,39 +241,54 @@ export class ProvenanceCertificateStore {
 			const certificate = decodeCertificate(value);
 			return { key: `certificate:${id}`, bytes: Buffer.byteLength(String(value)), modifiedAt: 0, certificate: certificate?.id === id ? certificate : undefined };
 		});
-		const certificates = control ? read(control) : await this.exclusive(async database => read(database), [], false);
-		const root = path.join(this.artifacts.root, "sha256"), paths = await filesUnder(root);
-		const artifacts = new Map<Sha256Digest, StoredFile>((await mapFilesystem(paths, async target => {
-			const value = await stat(target).catch(() => undefined), hex = path.relative(root, target).split(path.sep).join("");
-			return value && /^[0-9a-f]{64}$/.test(hex) ? [[`sha256:${hex}` as Sha256Digest, { key: this.objectKey(target), path: target, bytes: value.size, modifiedAt: value.mtimeMs }] as const] : [];
-		})).flat());
-		return { certificates, artifacts };
+		const metadata = (database: DatabaseSync) => ({ certificates: read(database), keys: database.prepare("SELECT path FROM changes WHERE path NOT IN ('', '.clear')").all() });
+		const { certificates, keys } = control ? metadata(control) : await this.exclusive(async database => metadata(database), [], false);
+		const roots = await this.payloadRoots(), paths = (await mapFilesystem(roots, filesUnder)).flat(), artifacts = new Map<Sha256Digest, StoredFile>();
+		const objects: StoredFile[] = [...certificates, ...(await mapFilesystem(paths, async target => {
+			const value = await stat(target).catch(error => { if (!missing(error)) throw error; }), key = this.objectKey(target), match = /^cas\/sha256\/([0-9a-f]{2})\/([0-9a-f]{62})$/.exec(key);
+			if (!value) return [];
+			const digest = match ? `sha256:${match[1]}${match[2]}` as Sha256Digest : undefined, record = { key, path: target, bytes: value.size, modifiedAt: value.mtimeMs, digest };
+			if (digest) artifacts.set(digest, record); return [record];
+		})).flat()];
+		const present = new Set(objects.map(record => record.key));
+		for (const { path: key } of keys) if (typeof key === "string" && !present.has(key)) objects.push({ key, bytes: 0, modifiedAt: 0 });
+		return { certificates, artifacts, objects, retiredRoots: roots.slice(1) };
+	}
+	private async payloadRoots(): Promise<readonly string[]> {
+		return [this.artifacts.root, ...(await readdir(this.root)).filter(name => /^\.clear-[0-9a-f-]{36}$/.test(name)).map(name => path.join(this.root, name))];
 	}
 
 	private revision(): Promise<number> { return this.exclusive(async database => changeRevision(database), [], false); }
 	private objectKey(target: string): string { return path.relative(this.root, target).split(path.sep).join("/"); }
-	private exclusive<T>(operation: (database: DatabaseSync) => Promise<T>, touched: readonly string[] = [], mutate = true): Promise<T> {
-		const result = this.maintenance.then(async () => {
-			const database = await (this.control ??= this.open().catch(error => { this.control = undefined; throw error; }));
-			if (!mutate) return operation(database);
-			await sqliteReady(() => database.exec("BEGIN IMMEDIATE"));
-			try { return await operation(database); }
-			finally {
-				try {
-					const version = changeRevision(database) + 1, update = database.prepare("INSERT INTO changes VALUES (?, ?) ON CONFLICT(path) DO UPDATE SET revision=excluded.revision");
-					for (const key of ["", ...touched]) update.run(key, version);
-					database.exec("COMMIT");
-				} catch (error) { database.exec("ROLLBACK"); throw error; }
-			}
+	private async exclusive<T>(operation: (database: DatabaseSync) => Promise<T>, touched: readonly string[] = [], mutate = true, signal?: AbortSignal): Promise<T> {
+		const admission = AbortSignal.any([this.stopped.signal, AbortSignal.timeout(1_000), ...(signal ? [signal] : [])]);
+		const task = this.lifecycle.serialize(async () => {
+			admission.throwIfAborted(); const database = this.control ??= await this.open(admission);
+			if (!mutate) { admission.throwIfAborted(); return operation(database); }
+			await sqliteReady(() => database.exec("BEGIN IMMEDIATE"), admission);
+			// Cancellation ends at admission. Finish owned filesystem work before releasing the transaction.
+			try {
+				const value = await operation(database);
+				const version = changeRevision(database) + 1, update = database.prepare("INSERT INTO changes VALUES (?, ?) ON CONFLICT(path) DO UPDATE SET revision=excluded.revision");
+				for (const key of ["", ...touched]) update.run(key, version);
+				database.exec("COMMIT"); return value;
+			} catch (error) { if (database.isTransaction) database.exec("ROLLBACK"); throw error; }
 		});
-		this.maintenance = result.then(() => undefined, () => undefined); return result;
+		if (mutate) return task;
+		const result = await waitForCompletion(task, admission);
+		if (result.status !== "completed") throw admission.reason;
+		return result.value;
 	}
 
-	private async open(): Promise<DatabaseSync> {
+	private async open(signal: AbortSignal): Promise<DatabaseSync> {
 		await mkdir(this.root, { recursive: true }); const database = new DatabaseSync(path.join(this.root, "metadata.sqlite"));
 		try {
-			await sqliteReady(() => database.exec("PRAGMA auto_vacuum=FULL; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL"));
-			await sqliteReady(() => database.exec("BEGIN IMMEDIATE"));
+			database.exec("PRAGMA synchronous=NORMAL");
+			const version = Number(await sqliteReady(() => database.prepare("PRAGMA user_version").get()?.user_version, signal));
+			if (version === 2) return database;
+			if (version > 2) throw new Error(`unsupported provenance store version ${version}`);
+			await sqliteReady(() => database.exec("PRAGMA auto_vacuum=FULL; PRAGMA journal_mode=WAL"), signal);
+			await sqliteReady(() => database.exec("BEGIN IMMEDIATE"), signal);
 			database.exec("CREATE TABLE IF NOT EXISTS changes(path TEXT PRIMARY KEY, revision INTEGER NOT NULL); INSERT OR IGNORE INTO changes VALUES ('', 0); CREATE TABLE IF NOT EXISTS certificates(id TEXT PRIMARY KEY, value TEXT NOT NULL, weakKey TEXT NOT NULL, executable TEXT NOT NULL, createdAt REAL NOT NULL); CREATE INDEX IF NOT EXISTS candidates ON certificates(executable, weakKey, createdAt DESC, id DESC)");
 			if (database.prepare("PRAGMA user_version").get()?.user_version === 0) {
 				const root = path.join(this.root, "certificates");
@@ -270,7 +300,7 @@ export class ProvenanceCertificateStore {
 			}
 			database.exec("COMMIT"); // Imported metadata is durable before any legacy file is removed.
 			if (database.prepare("PRAGMA user_version").get()?.user_version === 1) {
-				await sqliteReady(() => database.exec("BEGIN IMMEDIATE"));
+				await sqliteReady(() => database.exec("BEGIN IMMEDIATE"), signal);
 				await mapFilesystem(["certificates", "indexes"], segment => rm(path.join(this.root, segment), { recursive: true, force: true }));
 				database.exec("PRAGMA user_version=2; COMMIT");
 			}
@@ -279,8 +309,8 @@ export class ProvenanceCertificateStore {
 	}
 }
 
-interface StoredFile { readonly key: string; readonly path?: string; readonly bytes: number; readonly modifiedAt: number; }
-interface StoreInventory { readonly certificates: readonly (StoredFile & { readonly certificate: ProcessProvenanceCertificate | undefined })[]; readonly artifacts: ReadonlyMap<Sha256Digest, StoredFile>; }
+interface StoredFile { readonly key: string; readonly path?: string; readonly bytes: number; readonly modifiedAt: number; readonly digest?: Sha256Digest; }
+interface StoreInventory { readonly certificates: readonly (StoredFile & { readonly certificate: ProcessProvenanceCertificate | undefined })[]; readonly artifacts: ReadonlyMap<Sha256Digest, StoredFile>; readonly objects: readonly StoredFile[]; readonly retiredRoots: readonly string[]; }
 
 async function filesUnder(root: string): Promise<readonly string[]> {
 	try { return (await readdir(root, { recursive: true, withFileTypes: true })).filter(entry => entry.isFile()).map(entry => path.join(entry.parentPath, entry.name)); }
@@ -291,29 +321,24 @@ function writeCertificate(database: DatabaseSync, certificate: ProcessProvenance
 	database.prepare("INSERT OR REPLACE INTO certificates VALUES (?, ?, ?, ?, ?)").run(certificate.id, stableStringify(certificate), certificate.weakKey, certificate.prototype.executablePath, certificate.createdAt);
 }
 /** Native transactions recover on process exit. Busy acquisition yields; filesystem work stays asynchronous. */
-async function sqliteReady<T>(run: () => T): Promise<T> {
-	for (;;) { try { return run(); } catch (error) { if (![5, 6].includes(Number((error as { errcode?: number }).errcode) & 0xff)) throw error; await delay(1); } }
+async function sqliteReady<T>(run: () => T, signal: AbortSignal): Promise<T> {
+	for (let wait = 1; ; wait = Math.min(wait * 2, 16)) { signal.throwIfAborted(); try { return run(); } catch (error) {
+		if (![5, 6].includes(Number((error as { errcode?: number }).errcode) & 0xff)) throw error; await delay(wait);
+	} }
 }
 /** Preserve verified objects; a new complete publication atomically replaces a corrupt copy. */
-async function publishImmutable(target: string, bytes: Uint8Array, verify = (stored: Buffer) => stored.equals(bytes)): Promise<boolean> {
-	const present = async () => {
-		const stored = await readOptional(target);
-		try { if (!stored || !verify(stored)) return false; } catch { return false; }
+async function publishImmutable(target: string, bytes: Uint8Array): Promise<boolean> {
+	if ((await readOptional(target))?.equals(bytes)) {
 		const now = new Date(); // Referencing the same object restarts its orphan grace.
-		return utimes(target, now, now).then(() => true, (error): false => { if (!missing(error)) throw error; return false; });
-	};
-	if (await present()) return false;
+		try { await utimes(target, now, now); return false; } catch (error) { if (!missing(error)) throw error; }
+	}
 	await mkdir(path.dirname(target), { recursive: true });
 	const temporary = path.join(path.dirname(target), `.${path.basename(target)}.${process.pid}.${randomUUID()}.tmp`);
 	// Exclusive creation grants cleanup ownership; an existing temporary belongs to another publisher.
 	const file = await open(temporary, "wx");
 	try {
 		try { await writeFile(file, bytes); } finally { await file.close(); }
-		try { await link(temporary, target); return true; } catch (error) {
-			if (!hasErrorCode(error, "EEXIST")) throw error;
-			if (await present()) return false;
-			await rename(temporary, target); return true;
-		}
+		await rename(temporary, target); return true;
 	} finally {
 		await rm(temporary, { force: true });
 	}
@@ -323,7 +348,7 @@ function decodeCertificate(value: unknown): ProcessProvenanceCertificate | undef
 	try { return typeof value === "string" ? parseProcessCertificate(JSON.parse(value)) : undefined; } catch { return undefined; }
 }
 
-function readOptional(target: string) { return readFile(target).catch((error): undefined => { if (!missing(error)) throw error; }); }
+function readOptional(target: string, signal?: AbortSignal) { return readFile(target, { signal }).catch((error): undefined => { if (!missing(error)) throw error; }); }
 
 function digestHex(digest: Sha256Digest): string {
 	if (!isSha256Digest(digest)) throw new Error("invalid sha256 digest");

@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { errorMessage } from "./error-utils.ts";
 import { snapshotExecutionScope, type ExecutionScope } from "./execution-world.ts";
+import { waitForCompletion } from "./scheduler.ts";
 import type { BashOperations } from "@earendil-works/pi-coding-agent";
 
 /** One process launch as observed at the generic tool-execution outlet. */
@@ -98,9 +99,9 @@ export class ProcessExecutionCoordinator {
 	private async executeActor(request: ProcessExecutionRequest): Promise<ProcessExecutionResult> {
 		const generation = this.actorRoute?.enabled() && !this.disposed ? this.prepareActorRoute() : undefined;
 		if (!generation) return this.host.execute(request);
-		const prepared = await generation.preparation;
-		if (this.disposed || this.actor !== generation || !this.actorRoute?.enabled() || !("executor" in prepared)) return this.host.execute(request);
-		const execution = Promise.resolve().then(() => prepared.executor.execute(request));
+		const prepared = await waitForCompletion(generation.preparation, request.signal);
+		if (prepared.status !== "completed" || this.disposed || this.actor !== generation || !this.actorRoute?.enabled() || !("executor" in prepared.value)) return this.host.execute(request);
+		const executor = prepared.value.executor, execution = Promise.resolve().then(() => executor.execute(request));
 		generation.executions.add(execution);
 		try { return await execution; } finally { generation.executions.delete(execution); }
 	}

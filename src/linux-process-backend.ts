@@ -410,7 +410,7 @@ export class LinuxProcessReuseBackend {
 				const observation = this.observations.getStore();
 				const learning = observation?.learn && !observation.closed && sameScope(observation.scope, request.scope);
 				// Learning explicitly requests held execs; other calls retain the empty-history fast path.
-				if ((!learning && !this.hasLiveResults && !(await this.store.mayHaveCertificates()) && !this.hasLiveResults) || this.disposed) return host.execute(request);
+				if ((!learning && !this.hasLiveResults && !(await this.store.mayHaveCertificates(undefined, request.signal)) && !this.hasLiveResults) || this.disposed || request.signal?.aborted) return host.execute(request);
 				return (await (prepared ??= prepare())).execute(request);
 			},
 		} };
@@ -428,21 +428,21 @@ export class LinuxProcessReuseBackend {
 		const acceptProducer = (producer: ProcessProducerProof) => actorReplayProducer(producer, sensitivePaths(this.options.storeRoot, this.options.deniedPaths));
 		return {
 			execute: async (request) => {
-				if (process.platform !== "linux" || !pathContains(sourceRoot, request.cwd)) return host.execute(request);
+				if (this.disposed || process.platform !== "linux" || !pathContains(sourceRoot, request.cwd)) return host.execute(request);
 				this.addActor("wholeCommandRequests");
 				const result = await TimelineInterval.outside(async () => {
 				let committed = false;
 				try {
 					request.signal?.throwIfAborted();
 					const invocation = options.invocation(request);
-					if (!invocation || !await this.store.mayHaveCertificates(invocation.shell)) return;
+					if (!invocation || !await this.store.mayHaveCertificates(invocation.shell, request.signal)) return;
 					assertInvocationMatches(invocation, request);
 					const projection = new ExecutionPathProjection({ sourceRoot, workspaceRoot: sourceRoot });
 					const platformFingerprint = await this.resolvePlatformFingerprint();
 					const prototype = (await TimelineInterval.collect(() => topLevelProcessPrototype(invocation, request, definedProcessEnvironment(request.environment), projection, platformFingerprint))).output;
 					const weakKey = processWeakKey(prototype);
-					const plan = await this.plan(weakKey, prototype.executablePath, projection, acceptProducer);
-					if (!plan?.certificate.result.exit) return;
+					const plan = await this.plan(weakKey, prototype.executablePath, projection, acceptProducer, { signal: request.signal });
+					if (this.disposed || !plan?.certificate.result.exit) return;
 					request.signal?.throwIfAborted();
 					await replayFilesystemEffects(this.replayWorkspace, plan.artifacts, plan.certificate.result.journal, projection, sourceRoot);
 					committed = true;
@@ -617,8 +617,9 @@ export class LinuxProcessReuseBackend {
 		if (this.disposal) return this.disposal;
 		this.disposed = true;
 		this.handoffs.dispose();
+		const store = this.store.dispose();
 		const shared = this.sharedInterposition?.root.then((root) => rm(root, { recursive: true, force: true }), () => undefined);
-		return this.disposal = this.resetActorReplay().finally(() => Promise.all([this.replayWorkspace.dispose(), shared, this.store.drain()]));
+		return this.disposal = this.resetActorReplay().finally(() => Promise.all([this.replayWorkspace.dispose(), shared, store]));
 	}
 
 	private async resolveReady(): Promise<ReadyBackend> {
@@ -696,7 +697,7 @@ export class LinuxProcessReuseBackend {
 		this.add(session, "wholeCommandRequests");
 		const replayed = await TimelineInterval.outside(async () => {
 			const plan = await this.plan(processWeakKey(prototype), prototype.executablePath, session.projection,
-				(candidate) => compatibleProducer(session.producer, candidate), session);
+				(candidate) => compatibleProducer(session.producer, candidate), { session, signal });
 			signal?.throwIfAborted();
 			return plan?.kind === "completed_replay" ? this.replayTopLevel(session, plan, request) : undefined;
 		});
@@ -899,7 +900,7 @@ export class LinuxProcessReuseBackend {
 			const weakKey = processWeakKey(prototype), executablePath = prototype.executablePath;
 			const acquired = await TimelineInterval.outside(() => this.acquireProcessResult(
 				weakKey,
-				(live, excluded) => this.plan(weakKey, executablePath, session.projection, (candidate) => compatibleProducer(session.nestedProducer, candidate), session, live, excluded),
+				(live, excludedCertificates) => this.plan(weakKey, executablePath, session.projection, (candidate) => compatibleProducer(session.nestedProducer, candidate), { session, live, excludedCertificates }),
 				session.signal,
 				session.scope,
 				{ ownership: session.ownership, executablePath },
@@ -971,10 +972,12 @@ export class LinuxProcessReuseBackend {
 	private async plan(
 		weakKey: Sha256Digest,
 		executablePath: string, projection: ExecutionPathProjection, acceptProducer: (producer: ProcessProducerProof) => boolean,
-		session?: ActiveSession, live?: readonly ProcessProvenanceCertificate[], excludedCertificates?: ReadonlySet<Sha256Digest>, continuation = false,
+		{ session, live, excludedCertificates, continuation = false, signal = session?.signal }: {
+			session?: ActiveSession; live?: readonly ProcessProvenanceCertificate[]; excludedCertificates?: ReadonlySet<Sha256Digest>; continuation?: boolean; signal?: AbortSignal;
+		} = {},
 	): Promise<ReadyProcessPlan | undefined> {
 		// Proof reads belong to the caller's excluded lookup interval, even when file capture emits owned receipts.
-		const plan = (await TimelineInterval.collect(() => this.planner.plan({ weakKey, executablePath, acceptProducer, excludedCertificates,
+		const plan = (await TimelineInterval.collect(() => this.planner.plan({ weakKey, executablePath, acceptProducer, excludedCertificates, signal,
 			contract: { sink: "buffered", orderedJournal: true, transactionalEffects: true, ...(continuation ? { continuation: true as const } : {}) },
 			validation: { resolvePath: (logicalPath) => projection.toPhysical(logicalPath), ...(session ? { acceptedTaints: SAME_CONFINEMENT_TAINTS } : {}) },
 			...(live ? { live: { certificate: live, acceptedTaints: [...TRANSFERRED_INPUT_TAINTS] } } : {}),
@@ -1023,7 +1026,7 @@ export class LinuxProcessReuseBackend {
 				this.addActor("misses"); return measured({ kind: "continue" });
 			}
 			if (learning) { observation!.pending++; reserved = true; }
-			const available = this.handoffs.mayHaveExecutable(executablePath) || await this.store.mayHaveCertificates(executablePath) ||
+			const available = this.handoffs.mayHaveExecutable(executablePath) || await this.store.mayHaveCertificates(executablePath, process.signal) ||
 				this.handoffs.mayHaveExecutable(executablePath);
 			// Concurrent discovery is bounded, but a full retained set never shuts discovery off for the rest of the call.
 			if (!learning && !available) { this.addActor("misses"); return measured({ kind: "continue",
@@ -1082,7 +1085,7 @@ export class LinuxProcessReuseBackend {
 			const weakKey = processWeakKey(prototype);
 			const accepted = (producer: ProcessProducerProof) => actorReplayProducer(producer, sensitivePaths(this.options.storeRoot, this.options.deniedPaths));
 			const acquired = await this.acquireProcessResult(weakKey,
-				(live, excluded) => this.plan(weakKey, executablePath, projection, accepted, undefined, live, excluded, true), process.signal, scope, { actor: true });
+				(live, excludedCertificates) => this.plan(weakKey, executablePath, projection, accepted, { live, excludedCertificates, continuation: true, signal: process.signal }), process.signal, scope, { actor: true });
 			const { plan, continuation } = acquired;
 			settle = acquired.settle;
 			if (!plan || (plan.certificate.result.continuation ? !continuation || sha256Digest(continuation.image) !== plan.certificate.result.continuation.imageDigest :

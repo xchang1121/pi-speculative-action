@@ -1,8 +1,8 @@
 import { execHostText } from "../src/executable-path.ts";
-import { access, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { vi } from "vitest";
+import { test, vi, type TestAPI } from "vitest";
 import { deferred } from "./async.ts";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { createBashTool, createLocalBashOperations } from "@earendil-works/pi-coding-agent";
@@ -10,14 +10,21 @@ import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { LinuxProcessReuseBackend, type LinuxProcessReuseMetrics } from "../src/linux-process-backend.ts";
 import { createLinuxProcessExecutionWorld } from "../src/linux-process-world.ts";
 import { PI_OPERATION_TOOLS, resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
-import { adaptProcessToolOperations, ProcessExecutionCoordinator } from "../src/process-execution.ts";
+import { adaptProcessToolOperations, definedProcessEnvironment, ProcessExecutionCoordinator, type ProcessExecutionRequest, type ProcessExecutor } from "../src/process-execution.ts";
 import { WorkspaceSandboxService, type WorkspaceSandboxDriver } from "../src/workspace-sandbox.ts";
 import type { ProcessHandoffRegistry } from "../src/process-handoff.ts";
 import * as scheduling from "../src/scheduler.ts";
 
-const BENCHMARK_SCOPE = { sessionID: "benchmark", turnID: "benchmark" } as const;
-
 export type LinuxProcessBenchmark = Readonly<Awaited<ReturnType<typeof createLinuxProcessBenchmark>>>;
+
+/** Tests release their backends after assertions, failures and early skips. */
+export const processTest: ReturnType<TestAPI<{ benchmark: typeof createLinuxProcessBenchmark }>["skipIf"]> = test.extend<{ benchmark: typeof createLinuxProcessBenchmark }>({
+	benchmark: async ({}, use) => {
+		const fixtures: LinuxProcessBenchmark[] = [];
+		try { await use(async (...args) => { const fixture = await createLinuxProcessBenchmark(...args); fixtures.push(fixture); return fixture; }); }
+		finally { for (const fixture of fixtures) await fixture.dispose(); }
+	},
+}).skipIf(process.platform !== "linux");
 
 /** Retain a real producer at publication until an Actor is admitted to its running work. */
 export function holdProcessPublication(backend: LinuxProcessReuseBackend, delayMs = 0) {
@@ -66,21 +73,13 @@ export async function createLinuxProcessBenchmark(
 		SHELL: shellPath,
 		LANG: "C.UTF-8",
 	});
-	const localOperations = createLocalBashOperations({ shellPath });
+	const executor = (shellPath: string) => adaptProcessToolOperations(createLocalBashOperations({ shellPath })), host = executor(shellPath);
 	const backend = new LinuxProcessReuseBackend({ storeRoot, ...backendOptions });
-	const coordinator = new ProcessExecutionCoordinator(
-		backend.completedReplayExecutor(adaptProcessToolOperations(localOperations), {
-			sourceRoot: workspace,
-			invocation: (request) =>
-				resolvePiToolInvocation("bash", { command: request.command }, {
-					cwd: request.cwd,
-					environment: Object.fromEntries(
-						Object.entries(request.environment).filter((entry): entry is [string, string] => entry[1] !== undefined),
-					),
-					shellPath,
-				})?.process,
-		}),
-	);
+	const coordinator = new ProcessExecutionCoordinator(backend.completedReplayExecutor(host, {
+		sourceRoot: workspace, invocation: request => resolvePiToolInvocation("bash", { command: request.command }, {
+			cwd: request.cwd, environment: definedProcessEnvironment(request.environment), shellPath,
+		})?.process,
+	}));
 	const workspaceSandbox = new WorkspaceSandboxService();
 	const world = createLinuxProcessExecutionWorld({
 		workspaceSandbox,
@@ -96,7 +95,7 @@ export async function createLinuxProcessBenchmark(
 		exposeSessionEnvironment: false,
 		spawnHook: (context) => ({ ...context, env: { ...environment } }),
 	});
-	let disposed = false;
+	let disposal: Promise<void> | undefined;
 	return {
 		root,
 		workspace,
@@ -108,19 +107,11 @@ export async function createLinuxProcessBenchmark(
 		world,
 		workspaceSandbox,
 		tool: tool as AgentTool, // Preserve a portable type across nested schema packages.
-		prepareActorReplay: (refresh?: boolean) => backend.prepareActorReplay(adaptProcessToolOperations(localOperations), {
-			sourceRoot: workspace, invocation: () => undefined, held: { realShell: shellPath,
-				executor: shellPath => adaptProcessToolOperations(createLocalBashOperations({ shellPath })) },
+		prepareActorReplay: (refresh?: boolean) => backend.prepareActorReplay(host, {
+			sourceRoot: workspace, invocation: () => undefined, held: { realShell: shellPath, executor },
 		}, refresh).then(route => "executor" in route ? route : Promise.reject(new Error(route.detail))),
-		dispose: async () => {
-			if (disposed) return;
-			disposed = true;
-			try {
-				try { await world.dispose?.(); } finally { await workspaceSandbox.dispose(); }
-			} finally {
-				await rm(root, { recursive: true, force: true });
-			}
-		},
+		dispose: () => disposal ??= Promise.resolve().then(() => world.dispose?.())
+			.finally(() => workspaceSandbox.dispose()).finally(() => rm(root, { recursive: true, force: true })),
 	};
 }
 
@@ -162,47 +153,40 @@ export async function forkReusableBash(fixture: Pick<LinuxProcessBenchmark, "wor
 		action,
 		callID: `bench-${input.label}`,
 		signal: input.signal ?? new AbortController().signal,
-		executionScope: input.executionScope ?? BENCHMARK_SCOPE,
+		executionScope: input.executionScope ?? { sessionID: "benchmark", turnID: "benchmark" },
 	});
 }
 
 export async function compileBenchmarkHelper(
 	workspace: string,
-	input: { readonly source: string; readonly output: string; readonly arguments?: readonly string[] },
+	input: { readonly source: string; readonly output: string; readonly arguments?: readonly string[]; readonly code?: string },
 ): Promise<void> {
-	await commandOutput("cc", ["-O2", "-Wall", "-Wextra", ...(input.arguments ?? []), "-o", input.output, input.source], workspace);
+	if (input.code !== undefined) await writeFile(path.join(workspace, input.source), input.code);
+	await execHostText("cc", ["-O2", "-Wall", "-Wextra", ...(input.arguments ?? []), "-o", input.output, input.source], { cwd: workspace });
 	await access(path.join(workspace, input.output));
 }
 
-export async function commitBenchmarkFixture(workspace: string, name: string, paths: readonly string[] = ["."]): Promise<void> {
-	await commandOutput("git", ["init", "--quiet"], workspace);
-	await commandOutput("git", ["config", "user.name", name], workspace);
-	await commandOutput("git", ["config", "user.email", "benchmark@localhost"], workspace);
-	await commandOutput("git", ["add", ...paths], workspace);
-	await commandOutput("git", ["commit", "--quiet", "-m", "benchmark fixture"], workspace);
+export async function executeProcess(fixture: Pick<LinuxProcessBenchmark, "workspace" | "environment">, executor: ProcessExecutor,
+	command: string, request: Pick<ProcessExecutionRequest, "scope" | "signal" | "timeout"> = {}) {
+	let output = "";
+	return { ...await executor.execute({ command, cwd: fixture.workspace, environment: fixture.environment, ...request, onData: data => { output += data.toString(); } }), output };
 }
 
-function commandOutput(executable: string, args: readonly string[], cwd?: string): Promise<string> {
-	return execHostText(executable, args, { cwd });
+export async function commitBenchmarkFixture(workspace: string, name: string, paths: readonly string[] = ["."]): Promise<void> {
+	await execHostText("git", ["init", "--quiet"], { cwd: workspace });
+	await execHostText("git", ["config", "user.name", name], { cwd: workspace });
+	await execHostText("git", ["config", "user.email", "benchmark@localhost"], { cwd: workspace });
+	await execHostText("git", ["add", ...paths], { cwd: workspace });
+	await execHostText("git", ["commit", "--quiet", "-m", "benchmark fixture"], { cwd: workspace });
 }
 
 export function textOutput(result: { readonly content: readonly { readonly type: string; readonly text?: string }[] }): string {
-	return result.content
-		.filter((item): item is { readonly type: "text"; readonly text: string } =>
-			item.type === "text" && typeof item.text === "string")
-		.map((item) => item.text)
-		.join("\n");
+	return result.content.flatMap(item => item.type === "text" && typeof item.text === "string" ? [item.text] : []).join("\n");
 }
 
 export function metricDelta(before: LinuxProcessReuseMetrics, after: LinuxProcessReuseMetrics): LinuxProcessReuseMetrics {
 	return {
-		...Object.fromEntries(Object.entries(numericMetrics(after)).map(([name, value]) => [name, value - (Reflect.get(before, name) ?? 0)])),
+		...Object.fromEntries(Object.entries(after).flatMap(([name, value]) => typeof value === "number" ? [[name, value - (Reflect.get(before, name) ?? 0)]] : [])),
 		...(after.lastError !== before.lastError && after.lastError ? { lastError: after.lastError } : {}),
 	} as LinuxProcessReuseMetrics;
-}
-
-function numericMetrics(metrics: LinuxProcessReuseMetrics): Readonly<Record<string, number>> {
-	return Object.fromEntries(
-		Object.entries(metrics).filter((entry): entry is [string, number] => typeof entry[1] === "number"),
-	);
 }

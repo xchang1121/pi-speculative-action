@@ -11,7 +11,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { createLocalBashOperations, createReadTool, createGrepTool, createLsTool, createFindTool, createWriteTool } from "@earendil-works/pi-coding-agent";
-import { describe, expect, test, vi } from "vitest";
+import { describe, expect, vi } from "vitest";
 import { buildActionKey, buildPiActionKey, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { linuxOverlayfsCapability } from "../src/linux-overlayfs.ts";
 import { inspectHeldExecProcess, LinuxHeldExecBoundary, type HeldExecProcess, type HeldExecTiming } from "../src/linux-held-exec.ts";
@@ -29,43 +29,41 @@ import type { SpeculativeActionEvent } from "../src/events.ts";
 import { TaskTimeline } from "../src/task-timing.ts";
 import { testModel } from "./model.ts";
 import type { WorkspaceTransactionCapture } from "../src/workspace-transaction.ts";
-import { commitBenchmarkFixture, compileBenchmarkHelper, createLinuxProcessBenchmark, forkReusableBash, prepareLinuxProcessReuse,
+import { commitBenchmarkFixture, compileBenchmarkHelper, processTest as test, executeProcess, forkReusableBash, prepareLinuxProcessReuse,
 	holdProcessPublication, textOutput } from "./linux-process-fixture.ts";
 
 vi.mock("node:child_process", { spy: true });
 vi.mock("node:fs/promises", { spy: true });
 
 describe("Linux process ExecutionWorld", () => {
-	test("preserves fresh invocation inputs without classifying shell syntax", { timeout: 30_000 }, async ({ skip }) => {
-		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
-		const fixture = await createLinuxProcessBenchmark("pi-shell-proof-", "git");
-		try {
-			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
-			for (const command of ['printf "%s\\n" constant', 'printf "%s\\n" "$RANDOM"', 'printf "%s\\n" "$((RANDOM))"',
-				'v=RANDOM; printf "%s\\n" "${!v}"', 'declare -n v=RANDOM; printf "%s\\n" "$v"']) {
-				const constant = command.includes("constant"), before = fixture.backend.metrics().wholeCommandHits;
-				for (let turn = 0; turn < 3; turn++) {
-					const branch = await forkReusableBash(fixture, { command, label: String(turn), executionFingerprint, actionNamespace: "shell-proof",
-						executionScope: { sessionID: "shell-proof", turnID: String(turn) } });
-					try { expect(textOutput(branch.output.result)).toMatch(constant ? /^constant\n$/ : /^\d+\n$/); }
-					finally { await branch.dispose(); }
-				}
-				expect(fixture.backend.metrics().wholeCommandHits - before, command).toBe(0);
-				const actorBefore = fixture.backend.actorMetrics().wholeCommandHits;
-				for (let turn = 0; turn < 3; turn++)
-					expect(textOutput(await fixture.tool.execute(`actor-${turn}`, { command }))).toMatch(constant ? /^constant\n$/ : /^\d+\n$/);
-				expect(fixture.backend.actorMetrics().wholeCommandHits - actorBefore, command).toBe(0);
+	test("preserves fresh invocation inputs without classifying shell syntax", { timeout: 30_000 }, async ({ skip, benchmark }) => {
+		if (process.arch !== "x64") return skip("x86-64 Linux only");
+		const fixture = await benchmark("pi-shell-proof-", "git");
+		const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
+		for (const command of ['printf "%s\\n" constant', 'printf "%s\\n" "$RANDOM"', 'printf "%s\\n" "$((RANDOM))"',
+			'v=RANDOM; printf "%s\\n" "${!v}"', 'declare -n v=RANDOM; printf "%s\\n" "$v"']) {
+			const constant = command.includes("constant"), before = fixture.backend.metrics().wholeCommandHits;
+			for (let turn = 0; turn < 3; turn++) {
+				const branch = await forkReusableBash(fixture, { command, label: String(turn), executionFingerprint, actionNamespace: "shell-proof",
+					executionScope: { sessionID: "shell-proof", turnID: String(turn) } });
+				try { expect(textOutput(branch.output.result)).toMatch(constant ? /^constant\n$/ : /^\d+\n$/); }
+				finally { await branch.dispose(); }
 			}
-		} finally { await fixture.dispose(); }
+			expect(fixture.backend.metrics().wholeCommandHits - before, command).toBe(0);
+			const actorBefore = fixture.backend.actorMetrics().wholeCommandHits;
+			for (let turn = 0; turn < 3; turn++)
+				expect(textOutput(await fixture.tool.execute(`actor-${turn}`, { command }))).toMatch(constant ? /^constant\n$/ : /^\d+\n$/);
+			expect(fixture.backend.actorMetrics().wholeCommandHits - actorBefore, command).toBe(0);
+		}
 	});
 
-	test("proves external reads from their opened image and never commits a read copy", { timeout: 30_000 }, async ({ skip }) => {
-		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
-		const fixture = await createLinuxProcessBenchmark("pi-read-image-", "git"), outside = await mkdtemp(path.join(os.tmpdir(), "pi-read-image-host-"));
+	test("proves external reads from their opened image and never commits a read copy", { timeout: 30_000 }, async ({ skip, benchmark }) => {
+		if (process.arch !== "x64") return skip("x86-64 Linux only");
+		const fixture = await benchmark("pi-read-image-", "git"), outside = await mkdtemp(path.join(os.tmpdir(), "pi-read-image-host-"));
 		const target = path.join(outside, "input"), alias = path.join(outside, "alias");
 		try {
 			await writeFile(target, "old\n"); await filesystem.symlink("input", alias);
-			await writeFile(path.join(fixture.workspace, "permissions.c"), `#include <stdio.h>
+			await compileBenchmarkHelper(fixture.workspace, { source: "permissions.c", output: "permissions", code: `#include <stdio.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <string.h>
@@ -73,8 +71,7 @@ describe("Linux process ExecutionWorld", () => {
 int main(int argc, char **argv) { FILE *f = fopen(argc > 1 ? argv[1] : "/etc/issue", "r"); if (!f) return 1; fgetc(f);
  if (argc > 1) { struct stat st; if (fstat(fileno(f), &st)) return 2; DIR *d = opendir(argv[2]); if (!d) return 3; struct dirent *e;
   while ((e = readdir(d))) if (!strcmp(e->d_name, "input")) { puts(e->d_ino == st.st_ino ? "identical" : "different"); break; } closedir(d);
- } else printf("%d %d %d\\n", access("/etc/issue", R_OK), access("/etc/issue", W_OK), access("/etc/issue", X_OK)); fclose(f); }\n`);
-			await compileBenchmarkHelper(fixture.workspace, { source: "permissions.c", output: "permissions" });
+ } else printf("%d %d %d\\n", access("/etc/issue", R_OK), access("/etc/issue", W_OK), access("/etc/issue", X_OK)); fclose(f); }\n` });
 			const prepared = await prepareLinuxProcessReuse(fixture), route = await fixture.prepareActorReplay(), scope = { sessionID: "read-image", turnID: "actor" };
 			for (const args of [[], [target, outside]]) {
 				const permissionBranch = await forkReusableBash(fixture, { command: `./permissions ${args.map(arg => `'${arg}'`).join(" ")}`, label: "permissions", actionNamespace: "read-image", ...prepared });
@@ -88,9 +85,9 @@ int main(int argc, char **argv) { FILE *f = fopen(argc > 1 ? argv[1] : "/etc/iss
 					expect(textOutput(branch.output.result)).toBe("old\n");
 					const validation = await branch.validate?.();
 					expect(validation, JSON.stringify({ validation, metrics: fixture.backend.metrics() })).toMatchObject({ status: "valid" });
-					const before = fixture.backend.actorMetrics().hits; let output = "";
-					await route.executor.execute({ command, cwd: fixture.workspace, environment: fixture.environment, scope, onData: data => { output += data.toString(); } });
-					expect(output).toBe("old\n"); expect(fixture.backend.actorMetrics().hits - before, JSON.stringify(fixture.backend.actorMetrics())).toBe(1);
+					const before = fixture.backend.actorMetrics().hits;
+					expect((await executeProcess(fixture, route.executor, command, { scope })).output).toBe("old\n");
+					expect(fixture.backend.actorMetrics().hits - before, JSON.stringify(fixture.backend.actorMetrics())).toBe(1);
 					expect(await readFile(target, "utf8")).toBe("old\n");
 				} finally { await branch.dispose(); }
 			}
@@ -112,68 +109,64 @@ int main(int argc, char **argv) { FILE *f = fopen(argc > 1 ? argv[1] : "/etc/iss
 		} finally { await fixture.dispose(); await rm(outside, { recursive: true, force: true }); }
 	});
 
-	test("admits expensive late launches by completed work within a bounded learning budget", { timeout: 30_000 }, async ({ skip }) => {
-		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
-		const fixture = await createLinuxProcessBenchmark("pi-learning-admission-", "git");
-		try {
-			await prepareLinuxProcessReuse(fixture);
-			const route = await fixture.prepareActorReplay(), scope = { sessionID: "admission", turnID: "native" };
-			const handoffs = Reflect.get(fixture.backend, "handoffs") as ProcessHandoffRegistry<{ executable: string; args: readonly string[] }>;
-			const command = [...Array.from({ length: 66 }, (_, index) => `/bin/true ${index}`), "/bin/sleep 0.12",
-				...Array.from({ length: 66 }, (_, index) => `/bin/true ${index + 66}`)].join("; ");
-			await fixture.backend.observeBindings(scope, () => route.executor.execute({ command, cwd: fixture.workspace, environment: fixture.environment,
-				scope, onData: () => {} }), bindings => {
-				expect(bindings.length).toBeGreaterThan(0); expect(bindings.length).toBeLessThanOrEqual(64);
-				const slow = bindings.find(binding => handoffs.resolveBinding(binding, scope)?.executable.endsWith("/sleep"));
-				expect(slow, JSON.stringify(fixture.backend.actorMetrics())).toMatchObject({ available: true });
-				expect(slow!.executionMs).toBeGreaterThanOrEqual(100);
-			}, true);
-		} finally { await fixture.dispose(); }
+	test("admits expensive late launches by completed work within a bounded learning budget", { timeout: 30_000 }, async ({ skip, benchmark }) => {
+		if (process.arch !== "x64") return skip("x86-64 Linux only");
+		const fixture = await benchmark("pi-learning-admission-", "git");
+		await prepareLinuxProcessReuse(fixture);
+		const route = await fixture.prepareActorReplay(), scope = { sessionID: "admission", turnID: "native" };
+		const handoffs = Reflect.get(fixture.backend, "handoffs") as ProcessHandoffRegistry<{ executable: string; args: readonly string[] }>;
+		const command = [...Array.from({ length: 66 }, (_, index) => `/bin/true ${index}`), "/bin/sleep 0.12",
+			...Array.from({ length: 66 }, (_, index) => `/bin/true ${index + 66}`)].join("; ");
+		await fixture.backend.observeBindings(scope, () => route.executor.execute({ command, cwd: fixture.workspace, environment: fixture.environment,
+			scope, onData: () => {} }), bindings => {
+			expect(bindings.length).toBeGreaterThan(0); expect(bindings.length).toBeLessThanOrEqual(64);
+			const slow = bindings.find(binding => handoffs.resolveBinding(binding, scope)?.executable.endsWith("/sleep"));
+			expect(slow, JSON.stringify(fixture.backend.actorMetrics())).toMatchObject({ available: true });
+			expect(slow!.executionMs).toBeGreaterThanOrEqual(100);
+		}, true);
 	});
 
-	test.for(["file", "symlink", "lexical-parent", "normalized-blocker"] as const)("proves ENOTDIR from the blocking file and invalidates a changed walk (%s)", { timeout: 30_000 }, async (mode, { skip }) => {
-		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
-		const fixture = await createLinuxProcessBenchmark("pi-enotdir-", "overlayfs", {}, os.homedir());
+	test.for(["file", "symlink", "lexical-parent", "normalized-blocker"] as const)("proves ENOTDIR from the blocking file and invalidates a changed walk (%s)", { timeout: 30_000 }, async (mode, { skip, benchmark }) => {
+		if (process.arch !== "x64") return skip("x86-64 Linux only");
+		const fixture = await benchmark("pi-enotdir-", "overlayfs", {}, os.homedir());
+		const blocker = path.join(fixture.workspace, "module.js");
+		await writeFile(blocker, "source\n");
+		await writeFile(path.join(fixture.workspace, "package.json"), "{}\n");
+		await filesystem.symlink(mode === "normalized-blocker" ? "inner/dir" : "module.js", path.join(fixture.workspace, "alias"));
+		if (mode === "normalized-blocker") {
+			await mkdir(path.join(fixture.workspace, "inner/dir"), { recursive: true });
+			await mkdir(path.join(fixture.workspace, "inner/module.js"));
+			await filesystem.symlink("../../module.js", path.join(fixture.workspace, "inner/module.js/package.json"));
+		}
+		await commitBenchmarkFixture(fixture.workspace, "blocked module lookup");
+		const prepared = await prepareLinuxProcessReuse(fixture);
+		const target = mode === "normalized-blocker" ? "alias/../module.js/package.json" : mode === "symlink" ? "alias/package.json" : mode === "lexical-parent" ? "module.js/../package.json" : "module.js/package.json";
+		const script = `import os\ntry:\n os.stat(${JSON.stringify(target)})\n print(0)\nexcept OSError as error:\n print(error.errno)`;
+		const command = `if [ -e '${target}' ]; then printf present; else printf blocked; fi`;
+		expect(execFileSync("/usr/bin/python3", ["-c", script], { cwd: fixture.workspace, encoding: "utf8" })).toBe(mode === "normalized-blocker" ? "0\n" : "20\n");
+		const branch = await forkReusableBash(fixture, { command, label: "enotdir", actionNamespace: "enotdir", ...prepared });
 		try {
-			const blocker = path.join(fixture.workspace, "module.js");
-			await writeFile(blocker, "source\n");
-			await writeFile(path.join(fixture.workspace, "package.json"), "{}\n");
-			await filesystem.symlink(mode === "normalized-blocker" ? "inner/dir" : "module.js", path.join(fixture.workspace, "alias"));
+			const native = execFileSync("/bin/bash", ["-c", command], { cwd: fixture.workspace, env: fixture.environment, encoding: "utf8" });
+			expect(native).toBe(mode === "normalized-blocker" ? "present" : "blocked");
+			const validation = await branch.validate?.();
+			expect(textOutput(branch.output.result)).toBe(native);
 			if (mode === "normalized-blocker") {
-				await mkdir(path.join(fixture.workspace, "inner/dir"), { recursive: true });
-				await mkdir(path.join(fixture.workspace, "inner/module.js"));
-				await filesystem.symlink("../../module.js", path.join(fixture.workspace, "inner/module.js/package.json"));
+				expect(validation).toMatchObject({ status: "indeterminate" });
+				expect(JSON.stringify(validation)).toContain("pathname_walk:");
+			} else {
+				expect(validation, JSON.stringify(validation)).toMatchObject({ status: "valid" });
+				const changed = mode === "symlink" ? path.join(fixture.workspace, "alias") : blocker;
+				await rm(changed); await mkdir(changed);
+				await writeFile(path.join(changed, "package.json"), "{}\n");
+				expect(await branch.validate?.()).toMatchObject({ status: expect.stringMatching(/^(stale|indeterminate)$/) });
+				expect(execFileSync("/bin/bash", ["-c", command], { cwd: fixture.workspace, env: fixture.environment, encoding: "utf8" })).toBe("present");
 			}
-			await commitBenchmarkFixture(fixture.workspace, "blocked module lookup");
-			const prepared = await prepareLinuxProcessReuse(fixture);
-			const target = mode === "normalized-blocker" ? "alias/../module.js/package.json" : mode === "symlink" ? "alias/package.json" : mode === "lexical-parent" ? "module.js/../package.json" : "module.js/package.json";
-			const script = `import os\ntry:\n os.stat(${JSON.stringify(target)})\n print(0)\nexcept OSError as error:\n print(error.errno)`;
-			const command = `if [ -e '${target}' ]; then printf present; else printf blocked; fi`;
-			expect(execFileSync("/usr/bin/python3", ["-c", script], { cwd: fixture.workspace, encoding: "utf8" })).toBe(mode === "normalized-blocker" ? "0\n" : "20\n");
-			const branch = await forkReusableBash(fixture, { command, label: "enotdir", actionNamespace: "enotdir", ...prepared });
-			try {
-				const native = execFileSync("/bin/bash", ["-c", command], { cwd: fixture.workspace, env: fixture.environment, encoding: "utf8" });
-				expect(native).toBe(mode === "normalized-blocker" ? "present" : "blocked");
-				const validation = await branch.validate?.();
-				expect(textOutput(branch.output.result)).toBe(native);
-				if (mode === "normalized-blocker") {
-					expect(validation).toMatchObject({ status: "indeterminate" });
-					expect(JSON.stringify(validation)).toContain("pathname_walk:");
-				} else {
-					expect(validation, JSON.stringify(validation)).toMatchObject({ status: "valid" });
-					const changed = mode === "symlink" ? path.join(fixture.workspace, "alias") : blocker;
-					await rm(changed); await mkdir(changed);
-					await writeFile(path.join(changed, "package.json"), "{}\n");
-					expect(await branch.validate?.()).toMatchObject({ status: expect.stringMatching(/^(stale|indeterminate)$/) });
-					expect(execFileSync("/bin/bash", ["-c", command], { cwd: fixture.workspace, env: fixture.environment, encoding: "utf8" })).toBe("present");
-				}
-			} finally { await branch.dispose(); }
-		} finally { await fixture.dispose(); }
+		} finally { await branch.dispose(); }
 	});
 
 
-	test.for(["missing", "appeared", "file", "blocked", "symlink", "lexical", "socket", "socket-file", "socket-blocked", "socket-listening", "socket-private", "socket-private-blocked", "socket-mapped", "socket-relative", "socket-link"] as const)("proves only absent host lookups and cleans its long-path broker (%s)", { timeout: 20_000 }, async (mode, { skip }) => {
-		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
+	test.for(["missing", "appeared", "file", "blocked", "symlink", "lexical", "socket", "socket-file", "socket-blocked", "socket-listening", "socket-private", "socket-private-blocked", "socket-mapped", "socket-relative", "socket-link"] as const)("proves only absent host lookups and cleans its long-path broker (%s)", { timeout: 20_000 }, async (mode, { skip, benchmark }) => {
+		if (process.arch !== "x64") return skip("x86-64 Linux only");
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-long-broker-")), previous = process.env.TMPDIR;
 		const temporary = path.join(root, "nested-temporary-directory-".repeat(3));
 		await mkdir(temporary); process.env.TMPDIR = temporary;
@@ -189,12 +182,12 @@ int main(int argc, char **argv) { FILE *f = fopen(argc > 1 ? argv[1] : "/etc/iss
 			if (mode === "appeared" && String(args[0]) === target) await writeFile(target, "appeared");
 			return lstat(...args);
 		});
-		let fixture: Awaited<ReturnType<typeof createLinuxProcessBenchmark>> | undefined;
+		let fixture: Awaited<ReturnType<typeof benchmark>> | undefined;
 		try {
-			fixture = await createLinuxProcessBenchmark("command-", "git");
+			fixture = await benchmark("command-", "git");
 			await writeFile(path.join(fixture.workspace, "input.txt"), "input\n");
 			if (mode.startsWith("socket")) {
-				await writeFile(path.join(fixture.workspace, "connect.c"), String.raw`#include <sys/socket.h>
+				await compileBenchmarkHelper(fixture.workspace, { source: "connect.c", output: "connect", code: String.raw`#include <sys/socket.h>
 #include <sys/un.h>
 #include <errno.h>
 #include <stdio.h>
@@ -207,8 +200,7 @@ int main(int argc, char **argv) {
 	int result = connect(fd, (struct sockaddr *)&address, sizeof(address));
 	printf("%d\n", result < 0 ? errno : 0); close(fd); return 0;
 }
-`);
-				await compileBenchmarkHelper(fixture.workspace, { source: "connect.c", output: "connect" });
+` });
 			}
 			if (mode === "socket-mapped") target = `${fixture.workspace}/candidate`;
 			await commitBenchmarkFixture(fixture.workspace, "long temporary path");
@@ -239,9 +231,9 @@ int main(int argc, char **argv) {
 		}
 	});
 
-	test.for(["unusable", "one-shot", "descendant", "unusable-descendant"] as const)("rechecks failed native preparation when its observed inputs change (%s)", { timeout: 20_000 }, async (mode, { skip }) => {
-		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
-		const fixture = await createLinuxProcessBenchmark("pi-preparation-evidence-");
+	test.for(["unusable", "one-shot", "descendant", "unusable-descendant"] as const)("rechecks failed native preparation when its observed inputs change (%s)", { timeout: 20_000 }, async (mode, { skip, benchmark }) => {
+		if (process.arch !== "x64") return skip("x86-64 Linux only");
+		const fixture = await benchmark("pi-preparation-evidence-");
 		const publishing = vi.spyOn(fixture.backend.planner, "publishCompleted");
 		try {
 			await writeFile(path.join(fixture.workspace, "input.txt"), "prepared\n");
@@ -249,8 +241,7 @@ int main(int argc, char **argv) {
 			if (mode === "unusable-descendant") await writeFile(path.join(fixture.workspace, "unusable-child.sh"),
 				'i=0; while [ "$i" -lt 10000 ]; do i=$((i + 1)); done\nulimit -c 0\nprintf "prepared\\n"\n');
 			if (mode === "one-shot") {
-				await writeFile(path.join(fixture.workspace, "one-shot.c"), '#include <stdio.h>\n#include <unistd.h>\nint main(void) { usleep(20000); printf("prepared:%ld\\n", (long)getpid()); return 0; }\n');
-				await compileBenchmarkHelper(fixture.workspace, { source: "one-shot.c", output: "one-shot" });
+				await compileBenchmarkHelper(fixture.workspace, { source: "one-shot.c", output: "one-shot", code: '#include <stdio.h>\n#include <unistd.h>\nint main(void) { usleep(20000); printf("prepared:%ld\\n", (long)getpid()); return 0; }\n' });
 			}
 			await commitBenchmarkFixture(fixture.workspace, "Preparation evidence");
 			await prepareLinuxProcessReuse(fixture);
@@ -262,17 +253,15 @@ int main(int argc, char **argv) {
 			const command = mode === "one-shot" ? "exec ./one-shot" : `exec /bin/sh -c '${script}'`;
 			const expectedOutput = mode === "one-shot" ? expect.stringMatching(/^prepared:\d+\n$/) : "prepared\n";
 			const handoffs = Reflect.get(fixture.backend, "handoffs") as ProcessHandoffRegistry<{ readonly args: readonly string[]; readonly executable: string }>;
-			let binding: ProcessExecutionBinding | undefined, childBinding: ProcessExecutionBinding | undefined, output = "";
-			const observe = () => fixture.backend.observeBindings(scope, () => route.executor.execute({ command, cwd: fixture.workspace,
-				environment: fixture.environment, scope, onData: data => { output += data.toString(); } }), bindings => {
+			let binding: ProcessExecutionBinding | undefined, childBinding: ProcessExecutionBinding | undefined;
+			const observe = () => fixture.backend.observeBindings(scope, () => executeProcess(fixture, route.executor, command, { scope }), bindings => {
 				binding = bindings.find(candidate => {
 					const invocation = handoffs.resolveBinding(candidate, scope);
 					return mode === "one-shot" ? invocation?.executable.endsWith("/one-shot") : invocation?.args.includes(script);
 				}) ?? binding;
 				childBinding = bindings.find(candidate => handoffs.resolveBinding(candidate, scope)?.args.includes("./unusable-child.sh")) ?? childBinding;
 			}, true);
-			await observe();
-			expect(output).toEqual(expectedOutput);
+			expect((await observe()).output).toEqual(expectedOutput);
 			expect(binding, JSON.stringify(fixture.backend.actorMetrics())).toMatchObject({ available: true });
 			expect(fixture.backend.operationHints(binding!).preparation).toBe("current_workspace");
 			// The session excludes its shell from interposition. Keep the selected parent excluded, not the distinct child under test.
@@ -301,8 +290,7 @@ int main(int argc, char **argv) {
 					expect(await fixture.backend.bindingStale(childBinding!)).toBe(false);
 				}
 				await writeFile(path.join(fixture.workspace, "input.txt"), "arbitrary edit\n");
-				output = ""; await observe();
-				expect(output).toBe("prepared\n");
+				expect((await observe()).output).toBe("prepared\n");
 				expect(await fixture.backend.bindingStale(binding!)).toBe(false); // An unrelated edit cannot revive unchanged failure inputs.
 				await writeFile(path.join(fixture.workspace, "body.sh"), mode === "unusable-descendant" ? "" : 'printf "prepared\\n"\n');
 				if (childBinding) await writeFile(path.join(fixture.workspace, "unusable-child.sh"), 'printf "prepared\\n"\n');
@@ -322,9 +310,9 @@ int main(int argc, char **argv) {
 		} finally { publishing.mockRestore(); await fixture.dispose(); }
 	});
 
-	test.for([false, true])("prepares a failed command after its reported input is edited and validates before committing (stale=%s)", { timeout: 20_000 }, async (stale, { skip }) => {
-		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
-		const fixture = await createLinuxProcessBenchmark("pi-failed-command-");
+	test.for([false, true])("prepares a failed command after its reported input is edited and validates before committing (stale=%s)", { timeout: 20_000 }, async (stale, { skip, benchmark }) => {
+		if (process.arch !== "x64") return skip("x86-64 Linux only");
+		const fixture = await benchmark("pi-failed-command-");
 		let host: ReturnType<typeof createSpeculativeActionHost> | undefined;
 		try {
 			await writeFile(path.join(fixture.workspace, "source.txt"), "broken\n");
@@ -372,12 +360,11 @@ int main(int argc, char **argv) {
 		} finally { await host?.dispose(); await fixture.dispose(); }
 	});
 
-	test.for(["sample", "threads", "limit", "metadata", "identity"] as const)("transfers a closed-input calculation before its next syscall (%s)", { timeout: 30_000 }, async (mode, { skip }) => {
-		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
-		const fixture = await createLinuxProcessBenchmark("pi-prefix-process-", "git");
-		try {
-			await prepareLinuxProcessReuse(fixture);
-			await writeFile(path.join(fixture.workspace, "worker.c"), `#define _GNU_SOURCE
+	test.for(["sample", "threads", "limit", "metadata", "identity"] as const)("transfers a closed-input calculation before its next syscall (%s)", { timeout: 30_000 }, async (mode, { skip, benchmark }) => {
+		if (process.arch !== "x64") return skip("x86-64 Linux only");
+		const fixture = await benchmark("pi-prefix-process-", "git");
+		await prepareLinuxProcessReuse(fixture);
+		await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker", arguments: ["-pthread"], code: `#define _GNU_SOURCE
 #include <unistd.h>
 #include <sys/syscall.h>
 #include <sys/random.h>
@@ -399,47 +386,40 @@ int main(void) {
  printf("%ld:%ld:%llu:%llu\\n", (long)getpid(), (long)syscall(SYS_gettid), (unsigned long long)hash, (unsigned long long)value);
  ${mode === "identity" ? "if (prior != getpid()) return 75;" : ""} return 0;
 }
-`);
-			await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker", arguments: ["-pthread"] });
-			await commitBenchmarkFixture(fixture.workspace, "Closed input prefix");
-			const route = await fixture.prepareActorReplay(), scope = { sessionID: "prefix", turnID: "same" }, command = "exec ./worker";
-			const handoffs = Reflect.get(fixture.backend, "handoffs") as ProcessHandoffRegistry<{ executable: string }>;
-			const publishing = vi.spyOn(handoffs, "publish");
-			let binding: ProcessExecutionBinding | undefined;
-			const actor = async () => {
-				let output = "";
-				await fixture.backend.observeBindings(scope, () => route.executor.execute({ command, cwd: fixture.workspace, environment: fixture.environment,
-					scope, signal: AbortSignal.timeout(20_000), onData: data => { output += data.toString(); } }), bindings => {
-					binding ??= bindings.find(candidate => handoffs.resolveBinding(candidate, scope)?.executable.endsWith("/worker"));
-				}, true);
-				return output;
-			};
-			const seed = await actor(); expect(binding).toBeDefined();
-			await rm(path.join(fixture.workspace, "prefix-ready"));
-			const invocation = resolvePiToolInvocation("bash", { command: "exit 97" }, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath })!.process!;
-			await fixture.workspaceSandbox.withWorkspace(fixture.workspace, async workspace => {
-				const session = await fixture.backend.open({ sourceRoot: fixture.workspace, workspace, invocation, scope });
-				const pending = session.executeBinding(binding!), settled = pending.catch(() => undefined);
-				try {
-					await expect.poll(() => existsSync(path.join(workspace.sandboxRoot, "prefix-ready"))).toBe(true);
-					expect(existsSync(path.join(fixture.workspace, "prefix-ready"))).toBe(false);
-					const actual = await actor(), fields = actual.trim().split(":");
-					expect(fields).toHaveLength(4); expect(fields[0]).toBe(fields[1]); expect(fields[2]).toBe(seed.trim().split(":")[2]);
-					expect(fields[3]).not.toBe(seed.trim().split(":")[3]);
-					expect(fixture.backend.actorMetrics().joinedHits, JSON.stringify(fixture.backend.metrics())).toBe(mode === "identity" ? 0 : 1);
-					if (mode !== "identity") {
-						expect(await pending).toMatchObject({ suspended: true });
-						expect(publishing.mock.calls.some(([, , certificate]) => certificate?.result.continuation)).toBe(true);
-					}
-				} finally { await session.close(); await settled; }
-			}, { liveLower: true });
-			publishing.mockRestore();
-		} finally { await fixture.dispose(); }
+` });
+		await commitBenchmarkFixture(fixture.workspace, "Closed input prefix");
+		const route = await fixture.prepareActorReplay(), scope = { sessionID: "prefix", turnID: "same" }, command = "exec ./worker";
+		const handoffs = Reflect.get(fixture.backend, "handoffs") as ProcessHandoffRegistry<{ executable: string }>;
+		const publishing = vi.spyOn(handoffs, "publish");
+		let binding: ProcessExecutionBinding | undefined;
+		const actor = () => fixture.backend.observeBindings(scope,
+			() => executeProcess(fixture, route.executor, command, { scope, signal: AbortSignal.timeout(20_000) }),
+			bindings => { binding ??= bindings.find(candidate => handoffs.resolveBinding(candidate, scope)?.executable.endsWith("/worker")); }, true).then(result => result.output);
+		const seed = await actor(); expect(binding).toBeDefined();
+		await rm(path.join(fixture.workspace, "prefix-ready"));
+		const invocation = resolvePiToolInvocation("bash", { command: "exit 97" }, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath })!.process!;
+		await fixture.workspaceSandbox.withWorkspace(fixture.workspace, async workspace => {
+			const session = await fixture.backend.open({ sourceRoot: fixture.workspace, workspace, invocation, scope });
+			const pending = session.executeBinding(binding!), settled = pending.catch(() => undefined);
+			try {
+				await expect.poll(() => existsSync(path.join(workspace.sandboxRoot, "prefix-ready"))).toBe(true);
+				expect(existsSync(path.join(fixture.workspace, "prefix-ready"))).toBe(false);
+				const actual = await actor(), fields = actual.trim().split(":");
+				expect(fields).toHaveLength(4); expect(fields[0]).toBe(fields[1]); expect(fields[2]).toBe(seed.trim().split(":")[2]);
+				expect(fields[3]).not.toBe(seed.trim().split(":")[3]);
+				expect(fixture.backend.actorMetrics().joinedHits, JSON.stringify(fixture.backend.metrics())).toBe(mode === "identity" ? 0 : 1);
+				if (mode !== "identity") {
+					expect(await pending).toMatchObject({ suspended: true });
+					expect(publishing.mock.calls.some(([, , certificate]) => certificate?.result.continuation)).toBe(true);
+				}
+			} finally { await session.close(); await settled; }
+		}, { liveLower: true });
+		publishing.mockRestore();
 	});
 
-	test.for(["pipe", "socket", "eventfd", "readv", "recvmsg", "writev", "mmap", "runtime", "handles", "eof", "early", "changed", "identity", "cancel"] as const)("resumes a learned running process with future input (%s)", { timeout: 60_000 }, async (mode, { skip }) => {
-		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
-		const fixture = await createLinuxProcessBenchmark("pi-live-process-");
+	test.for(["pipe", "socket", "eventfd", "readv", "recvmsg", "writev", "mmap", "runtime", "handles", "eof", "early", "changed", "identity", "cancel"] as const)("resumes a learned running process with future input (%s)", { timeout: 60_000 }, async (mode, { skip, benchmark }) => {
+		if (process.arch !== "x64") return skip("x86-64 Linux only");
+		const fixture = await benchmark("pi-live-process-");
 		let host: ReturnType<typeof createSpeculativeActionHost> | undefined;
 		try {
 			await prepareLinuxProcessReuse(fixture);
@@ -620,9 +600,9 @@ int main(int argc, char **argv) {
 		} finally { await host?.dispose(); await fixture.dispose(); }
 	});
 
-	test("transfers native Bash FD inputs to filesystem tools across turns with exact invalidation", { timeout: 30_000 }, async ({ skip }) => {
-		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
-		const fixture = await createLinuxProcessBenchmark("pi-native-resource-inputs-");
+	test("transfers native Bash FD inputs to filesystem tools across turns with exact invalidation", { timeout: 30_000 }, async ({ skip, benchmark }) => {
+		if (process.arch !== "x64") return skip("x86-64 Linux only");
+		const fixture = await benchmark("pi-native-resource-inputs-");
 		let host: ReturnType<typeof createSpeculativeActionHost> | undefined;
 		const search = await createClosedSearchProfile(fixture.workspace);
 		try {
@@ -630,12 +610,11 @@ int main(int argc, char **argv) {
 			const file = path.join(fixture.workspace, "input.txt"); await writeFile(file, "one\ntwo\n");
 			await mkdir(path.join(fixture.workspace, "entries"));
 			for (const name of ["z.txt", "a.txt", "\ue000.txt", "\u{10000}.txt"]) await writeFile(path.join(fixture.workspace, "entries", name), name);
-			await writeFile(path.join(fixture.workspace, "worker.c"), `#include <unistd.h>
+			await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker", code: `#include <unistd.h>
 #include <stdio.h>
 #include <sys/syscall.h>
 int main(void) { char b[1024]; return syscall(SYS_getdents64, 4, b, sizeof(b)) < 0 || pread(3, b, 8, 0) != 8 || write(1, b, 8) != 8; }
-`);
-			await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker" });
+` });
 			await commitBenchmarkFixture(fixture.workspace, "Native resource input bridge"); await prepareLinuxProcessReuse(fixture);
 			const route = await fixture.prepareActorReplay();
 			const tools = [fixture.tool, createReadTool(fixture.workspace), createGrepTool(fixture.workspace), createLsTool(fixture.workspace), createFindTool(fixture.workspace)], events: SpeculativeActionEvent<string>[] = [];
@@ -680,9 +659,8 @@ int main(void) { char b[1024]; return syscall(SYS_getdents64, 4, b, sizeof(b)) <
 		} finally { await host?.dispose(); await search.pool.dispose(); await fixture.dispose(); }
 	});
 
-	test.for(["git", "auto"] as const)("selects changed running inputs after unrelated hints and compares the predecessor state (%s)", { timeout: 20_000 }, async (driver, { skip }) => {
-		if (process.platform !== "linux") return skip("Linux only");
-		const fixture = await createLinuxProcessBenchmark("pi-running-inputs-", driver);
+	test.for(["git", "auto"] as const)("selects changed running inputs after unrelated hints and compares the predecessor state (%s)", { timeout: 20_000 }, async (driver, { skip, benchmark }) => {
+		const fixture = await benchmark("pi-running-inputs-", driver);
 		let pending: ReturnType<typeof forkReusableBash> | undefined, workspace: Parameters<typeof fixture.backend.open>[0]["workspace"] | undefined;
 		let check: (() => Promise<boolean>) | undefined;
 		const registry = Reflect.get(fixture.backend, "handoffs") as ProcessHandoffRegistry;
@@ -699,7 +677,7 @@ int main(void) { char b[1024]; return syscall(SYS_getdents64, 4, b, sizeof(b)) <
 			const status = await fixture.backend.check(true);
 			if (status.state !== "ready") return skip(status.detail);
 			for (const file of hints) await writeFile(file, "baseline");
-			await writeFile(path.join(fixture.workspace, "worker.c"), `#include <fcntl.h>
+			await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker", code: `#include <fcntl.h>
 #include <unistd.h>
 int main(void) {
 	char value[32];
@@ -716,8 +694,7 @@ int main(void) {
 	while (access("release", F_OK) != 0) usleep(1000);
 	return write(1, value, (size_t)length) == length ? 0 : 4;
 }
-`);
-			await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker" });
+` });
 			await commitBenchmarkFixture(fixture.workspace, "Running predecessor inputs");
 			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
 			pending = forkReusableBash(fixture, { label: "inputs", command: "printf predecessor > input.txt; worker",
@@ -745,9 +722,9 @@ int main(void) {
 		}
 	});
 
-	test.for(["completed", "running", "native", "native-merged", "native-closed-input", "native-descriptors", "native-null", "native-null-stdin", "native-status", "native-directory", "native-directory-entries", "native-directory-prepared-stale", "native-directory-opath", "native-directory-opath-prepared-stale", "native-pipe", "native-pipe-prepared-stale", "native-pipe-live", "native-pipe-live-prepared-stale", "native-pipe-live-mixed", "native-pipe-live-transfer", "native-pipe-producer", "native-pipe-producer-queued", "native-pipe-producer-short", "native-pipe-producer-splice", "native-socket", "native-socket-running", "native-socket-duplex", "native-socket-lifetime", "native-socket-io", "native-socket-messages", "native-socket-export", "native-socket-counter-export", "native-socket-prequeued", "native-socket-segmented", "native-socket-prefixed", "native-socket-orphan", "native-eventfd", "native-eventfd-semaphore", "native-socket-concurrent", "native-socket-half-closed", "native-socket-prepared-stale", "native-shared-table", "native-unshare", "native-prepared-stale", "native-prepared-restored"] as const)("reexecutes an owned child binding across turns without replaying its parent or stale input (%s)", { timeout: 20_000 }, async (mode, { skip }) => {
-		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
-		const fixture = await createLinuxProcessBenchmark("pi-process-binding-", mode.includes("prepared-") ? "git" : undefined); // Borrowed immutable preparations.
+	test.for(["completed", "running", "native", "native-merged", "native-closed-input", "native-descriptors", "native-null", "native-null-stdin", "native-status", "native-directory", "native-directory-entries", "native-directory-prepared-stale", "native-directory-opath", "native-directory-opath-prepared-stale", "native-pipe", "native-pipe-prepared-stale", "native-pipe-live", "native-pipe-live-prepared-stale", "native-pipe-live-mixed", "native-pipe-live-transfer", "native-pipe-producer", "native-pipe-producer-queued", "native-pipe-producer-short", "native-pipe-producer-splice", "native-socket", "native-socket-running", "native-socket-duplex", "native-socket-lifetime", "native-socket-io", "native-socket-messages", "native-socket-export", "native-socket-counter-export", "native-socket-prequeued", "native-socket-segmented", "native-socket-prefixed", "native-socket-orphan", "native-eventfd", "native-eventfd-semaphore", "native-socket-concurrent", "native-socket-half-closed", "native-socket-prepared-stale", "native-shared-table", "native-unshare", "native-prepared-stale", "native-prepared-restored"] as const)("reexecutes an owned child binding across turns without replaying its parent or stale input (%s)", { timeout: 20_000 }, async (mode, { skip, benchmark }) => {
+		if (process.arch !== "x64") return skip("x86-64 Linux only");
+		const fixture = await benchmark("pi-process-binding-", mode.includes("prepared-") ? "git" : undefined); // Borrowed immutable preparations.
 		const publishing = vi.spyOn(fixture.backend.planner, "publishCompleted");
 		const errors = vi.spyOn(fixture.backend as unknown as { setError(session: unknown, message: string): void }, "setError");
 		const native = mode.startsWith("native"), running = mode.endsWith("running"), enumerate = mode.includes("entries");
@@ -783,7 +760,7 @@ static int take(int fd, char expected, int *rights, int count, int peek) {
 			if (status.state !== "ready") return skip(status.detail);
 			await writeFile(path.join(fixture.workspace, "input.txt"), "before\n");
 			if (descriptors) await writeFile(path.join(fixture.workspace, "fd.txt"), "abcdef");
-			await writeFile(path.join(fixture.workspace, "worker.c"), `#define _GNU_SOURCE
+			await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker", code: `#define _GNU_SOURCE
 #include <errno.h>
 #include <poll.h>
 #include <sys/select.h>
@@ -892,10 +869,9 @@ int main(int argc, char **argv) {
 	if (size <= 0 || write(1, text, (size_t)size) != size) return 1;
 	return ${mode === "native-merged" ? 'write(2, "stderr\\n", 7) != 7' : "0"};
 }
-`);
-			await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker" });
+` });
 			if (launcher) {
-				await writeFile(path.join(fixture.workspace, "fd-launch.c"), `#define _GNU_SOURCE
+				await compileBenchmarkHelper(fixture.workspace, { source: "fd-launch.c", output: "fd-launch", arguments: ["-pthread", "-Werror"], code: `#define _GNU_SOURCE
 #include <fcntl.h>
 #include <pthread.h>
 #include <sys/syscall.h>
@@ -952,8 +928,7 @@ int main(int argc, char **argv) {
 	close(sockets[1]);` : ""}
 	char *command[] = {"bound-name", "private argument", 0}; execv("./worker", command); return 76;
 }
-`);
-				await compileBenchmarkHelper(fixture.workspace, { source: "fd-launch.c", output: "fd-launch", arguments: ["-pthread", "-Werror"] });
+` });
 			}
 			await commitBenchmarkFixture(fixture.workspace, "Bound process invocation");
 			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
@@ -1019,10 +994,8 @@ int main(int argc, char **argv) {
 				});
 				expect(existsSync(operationRoot)).toBe(false);
 
-				let output = "";
-				const result = await route.executor.execute({ command: command.replace("parent", "other-parent"), cwd: fixture.workspace,
-					environment: fixture.environment, scope: { ...scope, turnID: "actor" }, onData: data => { output += data.toString(); } });
-				expect(result).toEqual({ exitCode: 0 }); expect(output).toBe("other-parent\nafter\n");
+				expect(await executeProcess(fixture, route.executor, command.replace("parent", "other-parent"), { scope: { ...scope, turnID: "actor" } }))
+					.toEqual({ exitCode: 0, output: "other-parent\nafter\n" });
 				expect(fixture.backend.actorMetrics()).toMatchObject({ hits: 0, crossTurnHits: 0 });
 			} else {
 				expect(fixture.backend.executionBindings(later)).toEqual([]);
@@ -1081,14 +1054,14 @@ int main(int argc, char **argv) {
 				expect(fixture.backend.operationHints(binding!).preparation).toBe(mode === "native" || mode === "native-merged" ? "current_workspace" : undefined);
 			let retainedOperation: ExecutionOperationBinding | undefined;
 			if (mode === "native") for (const turnID of ["repeated-native-1", "repeated-native-2"]) {
-				const repeatedScope = { ...scope, turnID }; let output = "";
+				const repeatedScope = { ...scope, turnID };
 				const previousMs = binding!.executionMs;
 				const action = PI_ACTION_SEMANTICS.buildKey("bash", { command }, fixture.workspace, "binding")!;
-				await fixture.world.observeOperations!({ action, scope: repeatedScope, learn: true }, () => route.executor.execute({ command: command.replace("parent", turnID),
-					cwd: fixture.workspace, environment: fixture.environment, scope: repeatedScope, onData: data => { output += data.toString(); } }), bindings => { retainedOperation ??= bindings.find(item => item.identity === binding!.key); });
+				const result = await fixture.world.observeOperations!({ action, scope: repeatedScope, learn: true },
+					() => executeProcess(fixture, route.executor, command.replace("parent", turnID), { scope: repeatedScope }), bindings => { retainedOperation ??= bindings.find(item => item.identity === binding!.key); });
 				expect(binding!.executionMs).not.toBe(previousMs);
 				expect(retainedOperation).toMatchObject({ executionMs: binding!.executionMs, preparation: "current_workspace" });
-				expect(output).toBe(`${turnID}\nafter\n`);
+				expect(result.output).toBe(`${turnID}\nafter\n`);
 				expect(fixture.backend.executionBindings(later).filter(item => item.key === binding!.key)).toEqual([binding]);
 			}
 			await expect.poll(() => patternStore.recent(scope.sessionID).map(event => event.input.command)).toEqual(["printf common", "printf common", ...(discovery ? [command] : []), command]);
@@ -1125,10 +1098,7 @@ int main(int argc, char **argv) {
 			expect(fixture.backend.metrics().misses).toBeGreaterThan(before.misses);
 			const changedParent = command.replace("parent", "automatic-parent");
 			if (running) {
-				let output = "";
-				await route.executor.execute({ command: changedParent, cwd: fixture.workspace, environment: fixture.environment,
-					scope: { ...scope, turnID: "foreign" }, onData: bytes => { output += bytes.toString(); } });
-				expect(output).toBe("automatic-parent\nnewest\n");
+				expect((await executeProcess(fixture, route.executor, changedParent, { scope: { ...scope, turnID: "foreign" } })).output).toBe("automatic-parent\nnewest\n");
 				expect(publication!.joined(), "another turn cannot wait for this one-shot producer").toBe(false);
 			}
 			const actor = vi.fn(() => fixture.coordinator.runWith({ execute: request => route.executor.execute({ ...request,
@@ -1167,12 +1137,11 @@ int main(int argc, char **argv) {
 		} finally { publication?.close(); restorePreparation?.(); publishing.mockRestore(); errors.mockRestore(); await host?.dispose(); await fixture.dispose(); }
 	});
 
-	test.for(["temporary", "persistent", "descendant", "merged", "stale"])("seals output pipe status before reusing a child (%s)", { timeout: 30_000 }, async (mode, { skip }) => {
-		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
-		const fixture = await createLinuxProcessBenchmark("pi-output-status-", "git", {});
-		try {
-			await writeFile(path.join(fixture.workspace, "input.txt"), "before\n");
-			await writeFile(path.join(fixture.workspace, "worker.c"), `#include <fcntl.h>
+	test.for(["temporary", "persistent", "descendant", "merged", "stale"])("seals output pipe status before reusing a child (%s)", { timeout: 30_000 }, async (mode, { skip, benchmark }) => {
+		if (process.arch !== "x64") return skip("x86-64 Linux only");
+		const fixture = await benchmark("pi-output-status-", "git", {});
+		await writeFile(path.join(fixture.workspace, "input.txt"), "before\n");
+		await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker", code: `#include <fcntl.h>
 #include <unistd.h>
 int main(void) {
 	for (volatile unsigned long i = 0; i < 20000000ul; ++i) {}
@@ -1182,57 +1151,52 @@ int main(void) {
 	${mode !== "persistent" ? 'if (fcntl(fd, F_SETFL, flags)) return 73;' : ""}
 	char bytes[32]; int input = open("input.txt", O_RDONLY); if (input < 0) return 74;
 	int length = read(input, bytes, sizeof(bytes)); return length < 0 || write(fd, bytes, length) != length;
-}`);
-			await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker" });
-			await commitBenchmarkFixture(fixture.workspace, "output status");
-			await prepareLinuxProcessReuse(fixture);
-			const scope = { sessionID: "output-status", turnID: "learned" }, later = { ...scope, turnID: "prepared" };
-			const route = await fixture.prepareActorReplay(), command = `worker${mode === "merged" ? " 2>&1" : ""} | cat`;
-			const execute = async (turnID: string) => {
-				let output = "";
-				expect(await route.executor.execute({ command, cwd: fixture.workspace, environment: fixture.environment,
-					scope: { ...scope, turnID }, onData: data => { output += data.toString(); } })).toEqual({ exitCode: 0 });
-				return output;
-			};
-			let binding: ProcessExecutionBinding | undefined;
-			const handoffs = Reflect.get(fixture.backend, "handoffs") as ProcessHandoffRegistry<{ executable?: string }>;
-			expect(await fixture.backend.observeBindings(scope, () => execute(scope.turnID), bindings => {
-				binding = bindings.find(candidate => path.basename(handoffs.resolveBinding(candidate, scope)?.executable ?? "") === "worker");
-			}, true)).toBe("before\n");
-			expect(binding).toBeDefined();
-			const invocation = resolvePiToolInvocation("bash", { command }, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath })!.process!;
-			await fixture.workspaceSandbox.withWorkspace(fixture.workspace, async workspace => {
-				const session = await fixture.backend.open({ sourceRoot: fixture.workspace, workspace, invocation, scope: later });
-				try {
-					await session.executeBinding(binding!); await session.seal([]);
-					if (mode === "stale") await writeFile(path.join(fixture.workspace, "input.txt"), "after\n");
-					expect(await session.validate(), JSON.stringify(session.metrics())).toMatchObject({ status: mode === "persistent" ? "indeterminate" : mode === "stale" ? "stale" : "valid" });
-					if (mode === "persistent") expect(session.metrics().lastError).toContain("output pipe status changed");
-					expect(await execute(later.turnID)).toBe(mode === "stale" ? "after\n" : "before\n");
-					expect(fixture.backend.actorMetrics().hits, JSON.stringify({ actor: fixture.backend.actorMetrics(), producer: session.metrics() })).toBe(Number(!["persistent", "stale"].includes(mode)));
-				} finally { await session.close(); }
-			});
-		} finally { await fixture.dispose(); }
+}` });
+		await commitBenchmarkFixture(fixture.workspace, "output status");
+		await prepareLinuxProcessReuse(fixture);
+		const scope = { sessionID: "output-status", turnID: "learned" }, later = { ...scope, turnID: "prepared" };
+		const route = await fixture.prepareActorReplay(), command = `worker${mode === "merged" ? " 2>&1" : ""} | cat`;
+		const execute = async (turnID: string) => {
+			const { output, ...result } = await executeProcess(fixture, route.executor, command, { scope: { ...scope, turnID } });
+			expect(result).toEqual({ exitCode: 0 }); return output;
+		};
+		let binding: ProcessExecutionBinding | undefined;
+		const handoffs = Reflect.get(fixture.backend, "handoffs") as ProcessHandoffRegistry<{ executable?: string }>;
+		expect(await fixture.backend.observeBindings(scope, () => execute(scope.turnID), bindings => {
+			binding = bindings.find(candidate => path.basename(handoffs.resolveBinding(candidate, scope)?.executable ?? "") === "worker");
+		}, true)).toBe("before\n");
+		expect(binding).toBeDefined();
+		const invocation = resolvePiToolInvocation("bash", { command }, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath })!.process!;
+		await fixture.workspaceSandbox.withWorkspace(fixture.workspace, async workspace => {
+			const session = await fixture.backend.open({ sourceRoot: fixture.workspace, workspace, invocation, scope: later });
+			try {
+				await session.executeBinding(binding!); await session.seal([]);
+				if (mode === "stale") await writeFile(path.join(fixture.workspace, "input.txt"), "after\n");
+				expect(await session.validate(), JSON.stringify(session.metrics())).toMatchObject({ status: mode === "persistent" ? "indeterminate" : mode === "stale" ? "stale" : "valid" });
+				if (mode === "persistent") expect(session.metrics().lastError).toContain("output pipe status changed");
+				expect(await execute(later.turnID)).toBe(mode === "stale" ? "after\n" : "before\n");
+				expect(fixture.backend.actorMetrics().hits, JSON.stringify({ actor: fixture.backend.actorMetrics(), producer: session.metrics() })).toBe(Number(!["persistent", "stale"].includes(mode)));
+			} finally { await session.close(); }
+		});
 	});
 
-	test.for((["git", "overlayfs"] as const).flatMap(driver => ["read", "write", "locks", "locks-close", "locks-named", "path-write", "unlinked", "hardlink-read", "hardlink-write", "hardlink-path-write", "hardlink-rename", "hardlink-split", "hardlink-unlink", "hardlink-detached"].map(mode => [driver, mode] as const)))("learns and adopts regular OFDs with shared positions and predecessor inputs (%s, %s)", { timeout: 30_000 }, async ([driver, mode], { skip }) => {
-		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
+	test.for((["git", "overlayfs"] as const).flatMap(driver => ["read", "write", "locks", "locks-close", "locks-named", "path-write", "unlinked", "hardlink-read", "hardlink-write", "hardlink-path-write", "hardlink-rename", "hardlink-split", "hardlink-unlink", "hardlink-detached"].map(mode => [driver, mode] as const)))("learns and adopts regular OFDs with shared positions and predecessor inputs (%s, %s)", { timeout: 30_000 }, async ([driver, mode], { skip, benchmark }) => {
+		if (process.arch !== "x64") return skip("x86-64 Linux only");
 		if (mode === "locks-named" && await filesystem.readlink("/proc/self/ns/pid") === "pid:[4026531836]") return skip("nested PID namespace visibility case");
-		const fixture = await createLinuxProcessBenchmark("pi-fd-binding-", driver);
+		const fixture = await benchmark("pi-fd-binding-", driver);
 		const hardlink = mode.startsWith("hardlink"), pathWrite = mode.endsWith("path-write"), locks = mode.startsWith("locks");
 		const memory = locks && mode !== "locks-named", closing = mode === "locks-close";
 		const writable = !pathWrite && mode !== "read" && mode !== "hardlink-read";
-		try {
-			const status = await fixture.backend.check(true);
-			if (status.state !== "ready") throw new Error(status.detail);
-			const input = path.join(fixture.workspace, "input.txt");
-			const reset = async () => {
-				if (hardlink) for (const name of ["input.txt", "alias.txt", "moved.txt"]) await rm(path.join(fixture.workspace, name), { force: true });
-				await writeFile(input, "abcdef");
-				if (hardlink) await filesystem.link(input, path.join(fixture.workspace, "alias.txt"));
-			};
-			await reset();
-			const lockHelpers = `#define _GNU_SOURCE
+		const status = await fixture.backend.check(true);
+		if (status.state !== "ready") throw new Error(status.detail);
+		const input = path.join(fixture.workspace, "input.txt");
+		const reset = async () => {
+			if (hardlink) for (const name of ["input.txt", "alias.txt", "moved.txt"]) await rm(path.join(fixture.workspace, name), { force: true });
+			await writeFile(input, "abcdef");
+			if (hardlink) await filesystem.link(input, path.join(fixture.workspace, "alias.txt"));
+		};
+		await reset();
+		const lockHelpers = `#define _GNU_SOURCE
 #include <errno.h>
 #include <sys/file.h>
 #include <fcntl.h>
@@ -1242,15 +1206,14 @@ static int query(int fd,int start,int length,int type,int foundStart,int foundLe
 	return fcntl(fd,F_OFD_GETLK,&range) || range.l_type!=type || range.l_start!=foundStart || range.l_len!=foundLength || (type!=F_UNLCK && range.l_pid!=-1);
 }
 `;
-			if (locks) {
-				await writeFile(path.join(fixture.workspace, "locker.c"), lockHelpers + `int main(int argc,char **argv) {
+		if (locks) {
+			await compileBenchmarkHelper(fixture.workspace, { source: "locker.c", output: "locker", code: lockHelpers + `int main(int argc,char **argv) {
 	if(argc!=2)return 70;
 	if(argv[1][0]=='i')return lock(3,F_WRLCK,2,4) || flock(3,LOCK_SH|LOCK_NB);
 	return query(8,2,4,F_UNLCK,2,4) || query(8,10,3,F_RDLCK,10,3) || flock(8,LOCK_EX|LOCK_NB)!=-1 || errno!=EAGAIN;
-}`);
-				await compileBenchmarkHelper(fixture.workspace, { source: "locker.c", output: "locker" });
-			}
-			await writeFile(path.join(fixture.workspace, "worker.c"), (locks ? lockHelpers : "") + `#include <unistd.h>
+}` });
+		}
+		await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker", code: (locks ? lockHelpers : "") + `#include <unistd.h>
 #include <sys/wait.h>
 #include <fcntl.h>
 int main(void) {
@@ -1270,11 +1233,10 @@ int main(void) {
 	for (volatile unsigned long i = 0; i < 50000000ul; ++i) {}
 	return write(1, bytes, sizeof(bytes)) != sizeof(bytes);
 }
-`);
-			await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker" });
-			const body = `IFS= read -r -N 1 discard <&3; IFS= read -r -N 1 discard <&8; locker init; printf '%s\\n' "$1"; worker; IFS= read -r -N 1 a <&4; IFS= read -r -N 1 b <&8; printf 'tail:%s:%s\\n' "$a" "$b"; locker check`;
-			if (memory) {
-				await writeFile(path.join(fixture.workspace, "fd-memory.c"), lockHelpers + `
+` });
+		const body = `IFS= read -r -N 1 discard <&3; IFS= read -r -N 1 discard <&8; locker init; printf '%s\\n' "$1"; worker; IFS= read -r -N 1 a <&4; IFS= read -r -N 1 b <&8; printf 'tail:%s:%s\\n' "$a" "$b"; locker check`;
+		if (memory) {
+			await compileBenchmarkHelper(fixture.workspace, { source: "fd-memory.c", output: "fd-memory", code: lockHelpers + `
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <stdio.h>
@@ -1290,71 +1252,66 @@ int main(int argc,char **argv) {
 	close(gate[0]);close(3);close(4);if(write(gate[1],"x",1)!=1)return 86;close(gate[1]);int status;
 	if(waitpid(child,&status,0)!=child || status || read(8,&byte,1)!=1 || query(8,10,3,F_UNLCK,10,3) || flock(8,LOCK_EX|LOCK_NB) || flock(8,LOCK_UN))return 87;
 	printf("tail::%c\\n",byte);return 0;` : `execl("/bin/bash","bash","-c",${JSON.stringify(body)},"fd-memory",argv[1],(char *)0);return 84;`}
-}`);
-				await compileBenchmarkHelper(fixture.workspace, { source: "fd-memory.c", output: "fd-memory" });
-			}
-			await commitBenchmarkFixture(fixture.workspace, "Inherited FD binding");
-			await prepareLinuxProcessReuse(fixture);
-			const scope = { sessionID: "fd-binding", turnID: "recorded" }, later = { ...scope, turnID: "prepared" };
-			const route = await fixture.prepareActorReplay();
-			const command = memory ? "fd-memory parent" : `exec 3<${writable ? ">" : ""}input.txt; exec 4<&3; exec 8<${locks ? ">" : ""}${hardlink ? "alias.txt" : "input.txt"}; IFS= read -r -N 1 discard <&3; IFS= read -r -N 1 discard <&8; ` +
-				(mode === "unlinked" ? "rm input.txt; " : "") +
-				(locks ? "locker init; " : "") + `printf 'parent\\n'; worker; IFS= read -r -N 1 a <&4; IFS= read -r -N 1 b <&8; printf 'tail:%s:%s\\n' "$a" "$b"` + (locks ? "; locker check" : "");
-			const execute = async (scope: { sessionID: string; turnID: string }, command: string) => {
-				let output = "";
-				const result = await route.executor.execute({ command, cwd: fixture.workspace, environment: fixture.environment, scope,
-					timeout: 10, onData: data => { output += data.toString(); } });
-				expect(result).toEqual({ exitCode: 0 }); return output;
-			};
-			const tail = writable ? ":c" : pathWrite ? "e:Z" : "e:c";
-			let binding: ProcessExecutionBinding | undefined;
-			const handoffs = Reflect.get(fixture.backend, "handoffs") as ProcessHandoffRegistry<{ executable?: string }>;
-			expect(await fixture.backend.observeBindings(scope, () => execute(scope, command), bindings => {
-				binding = bindings.find(candidate => path.basename(handoffs.resolveBinding(candidate, scope)?.executable ?? "") === "worker");
-			}, true)).toBe(`parent\nbcd:b\ntail:${tail}\n`);
-			expect(binding, JSON.stringify(fixture.backend.metrics())).toBeDefined();
-			const invocation = resolvePiToolInvocation("bash", { command: "exit 92" }, { cwd: fixture.workspace,
-				environment: fixture.environment, shellPath: fixture.shellPath })!.process!;
-			for (const changed of [false, true]) {
-				await reset();
-				const branch = await fixture.workspaceSandbox.fork({ cwd: fixture.workspace, driver, liveLower: true,
-					action: buildPiActionKey("bash", { command }, fixture.workspace)!, execute: async workspace => {
-					const session = await fixture.backend.open({ sourceRoot: fixture.workspace, workspace, invocation, scope: later });
-					try {
-						const result = await session.executeBinding(binding!);
-						expect(result.exit).toEqual({ kind: "code", code: 0 });
-						expect(result.output.map(({ data }) => data.toString()).join("")).toBe("bcd:b\n");
-						await session.seal([]);
-						const checked = await session.validate(); expect(checked, JSON.stringify(checked)).toMatchObject({ status: "valid" });
-						const hits = fixture.backend.actorMetrics().hits;
-						if (changed) await writeFile(input, "uvwxyz");
-						expect(await execute(later, command.replace("parent", "changed-parent"))).toBe(changed
-							? `changed-parent\nvwx:v\ntail:${writable ? ":w" : pathWrite ? "y:Z" : "y:w"}\n` : `changed-parent\nbcd:b\ntail:${tail}\n`);
-						if (mode === "hardlink-detached") { expect(existsSync(input)).toBe(false); expect(existsSync(path.join(fixture.workspace, "alias.txt"))).toBe(false); }
-						else if (hardlink) {
-							const alias = path.join(fixture.workspace, "alias.txt");
-							expect(await readFile(alias, "utf8")).toBe(writable ? `${changed ? "uvwx" : "abcd"}XY` : pathWrite ? `${changed ? "uv" : "ab"}Z${changed ? "xyz" : "def"}` : changed ? "uvwxyz" : "abcdef");
-							if (mode === "hardlink-rename" || mode === "hardlink-unlink") expect(existsSync(input)).toBe(false);
-							if (mode === "hardlink-rename") expect((await stat(path.join(fixture.workspace, "moved.txt"))).ino).toBe((await stat(alias)).ino);
-							if (mode === "hardlink-split") expect(await readFile(input, "utf8")).toBe("new");
-						}
-						expect(fixture.backend.actorMetrics().hits, JSON.stringify({ actor: fixture.backend.actorMetrics(), producer: session.metrics() }))
-							.toBe(hits + Number(!changed && mode !== "locks-named"));
-					} finally { await session.close(); }
-					return { output: { result: { content: [], details: {} }, isError: false }, changes: [] };
-				} });
-				await branch.dispose();
-			}
-		} finally { await fixture.dispose(); }
+}` });
+		}
+		await commitBenchmarkFixture(fixture.workspace, "Inherited FD binding");
+		await prepareLinuxProcessReuse(fixture);
+		const scope = { sessionID: "fd-binding", turnID: "recorded" }, later = { ...scope, turnID: "prepared" };
+		const route = await fixture.prepareActorReplay();
+		const command = memory ? "fd-memory parent" : `exec 3<${writable ? ">" : ""}input.txt; exec 4<&3; exec 8<${locks ? ">" : ""}${hardlink ? "alias.txt" : "input.txt"}; IFS= read -r -N 1 discard <&3; IFS= read -r -N 1 discard <&8; ` +
+			(mode === "unlinked" ? "rm input.txt; " : "") +
+			(locks ? "locker init; " : "") + `printf 'parent\\n'; worker; IFS= read -r -N 1 a <&4; IFS= read -r -N 1 b <&8; printf 'tail:%s:%s\\n' "$a" "$b"` + (locks ? "; locker check" : "");
+		const execute = async (scope: { sessionID: string; turnID: string }, command: string) => {
+			const { output, ...result } = await executeProcess(fixture, route.executor, command, { scope, timeout: 10 });
+			expect(result).toEqual({ exitCode: 0 }); return output;
+		};
+		const tail = writable ? ":c" : pathWrite ? "e:Z" : "e:c";
+		let binding: ProcessExecutionBinding | undefined;
+		const handoffs = Reflect.get(fixture.backend, "handoffs") as ProcessHandoffRegistry<{ executable?: string }>;
+		expect(await fixture.backend.observeBindings(scope, () => execute(scope, command), bindings => {
+			binding = bindings.find(candidate => path.basename(handoffs.resolveBinding(candidate, scope)?.executable ?? "") === "worker");
+		}, true)).toBe(`parent\nbcd:b\ntail:${tail}\n`);
+		expect(binding, JSON.stringify(fixture.backend.metrics())).toBeDefined();
+		const invocation = resolvePiToolInvocation("bash", { command: "exit 92" }, { cwd: fixture.workspace,
+			environment: fixture.environment, shellPath: fixture.shellPath })!.process!;
+		for (const changed of [false, true]) {
+			await reset();
+			const branch = await fixture.workspaceSandbox.fork({ cwd: fixture.workspace, driver, liveLower: true,
+				action: buildPiActionKey("bash", { command }, fixture.workspace)!, execute: async workspace => {
+				const session = await fixture.backend.open({ sourceRoot: fixture.workspace, workspace, invocation, scope: later });
+				try {
+					const result = await session.executeBinding(binding!);
+					expect(result.exit).toEqual({ kind: "code", code: 0 });
+					expect(result.output.map(({ data }) => data.toString()).join("")).toBe("bcd:b\n");
+					await session.seal([]);
+					const checked = await session.validate(); expect(checked, JSON.stringify(checked)).toMatchObject({ status: "valid" });
+					const hits = fixture.backend.actorMetrics().hits;
+					if (changed) await writeFile(input, "uvwxyz");
+					expect(await execute(later, command.replace("parent", "changed-parent"))).toBe(changed
+						? `changed-parent\nvwx:v\ntail:${writable ? ":w" : pathWrite ? "y:Z" : "y:w"}\n` : `changed-parent\nbcd:b\ntail:${tail}\n`);
+					if (mode === "hardlink-detached") { expect(existsSync(input)).toBe(false); expect(existsSync(path.join(fixture.workspace, "alias.txt"))).toBe(false); }
+					else if (hardlink) {
+						const alias = path.join(fixture.workspace, "alias.txt");
+						expect(await readFile(alias, "utf8")).toBe(writable ? `${changed ? "uvwx" : "abcd"}XY` : pathWrite ? `${changed ? "uv" : "ab"}Z${changed ? "xyz" : "def"}` : changed ? "uvwxyz" : "abcdef");
+						if (mode === "hardlink-rename" || mode === "hardlink-unlink") expect(existsSync(input)).toBe(false);
+						if (mode === "hardlink-rename") expect((await stat(path.join(fixture.workspace, "moved.txt"))).ino).toBe((await stat(alias)).ino);
+						if (mode === "hardlink-split") expect(await readFile(input, "utf8")).toBe("new");
+					}
+					expect(fixture.backend.actorMetrics().hits, JSON.stringify({ actor: fixture.backend.actorMetrics(), producer: session.metrics() }))
+						.toBe(hits + Number(!changed && mode !== "locks-named"));
+				} finally { await session.close(); }
+				return { output: { result: { content: [], details: {} }, isError: false }, changes: [] };
+			} });
+			await branch.dispose();
+		}
 	});
 
-	test.for(["SOCK_DGRAM", "SOCK_SEQPACKET", "SOCK_DGRAM:close", "SOCK_SEQPACKET:close"])("adopts packet boundaries, empty messages, truncation and queued OFDs (%s)", { timeout: 30_000 }, async (scenario, { skip }) => {
-		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
+	test.for(["SOCK_DGRAM", "SOCK_SEQPACKET", "SOCK_DGRAM:close", "SOCK_SEQPACKET:close"])("adopts packet boundaries, empty messages, truncation and queued OFDs (%s)", { timeout: 30_000 }, async (scenario, { skip, benchmark }) => {
+		if (process.arch !== "x64") return skip("x86-64 Linux only");
 		const [type, closing] = scenario.split(":");
-		const fixture = await createLinuxProcessBenchmark("pi-packet-binding-");
-		try {
-			await writeFile(path.join(fixture.workspace, "input.txt"), "abcdef");
-			const helpers = `#define _GNU_SOURCE
+		const fixture = await benchmark("pi-packet-binding-");
+		await writeFile(path.join(fixture.workspace, "input.txt"), "abcdef");
+		const helpers = `#define _GNU_SOURCE
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <poll.h>
@@ -1380,7 +1337,7 @@ static int take(int length,int peek,int truncated,char expected) {
 	close(fd);return failed;
 }
 `;
-			await writeFile(path.join(fixture.workspace, "worker.c"), helpers + `int main(void) {
+		await writeFile(path.join(fixture.workspace, "worker.c"), helpers + `int main(void) {
 	char bytes[8];struct pollfd ready={.fd=22,.events=POLLIN};
 	if(pass("",0) || read(22,bytes,0)!=0 || poll(&ready,1,0)!=1 || take(0,1,0,0) || take(0,0,0,'a'))return 70;
 	if(write(21,"abcdef",6)!=6 || read(22,bytes,2)!=2 || memcmp(bytes,"ab",2))return 71;
@@ -1396,7 +1353,7 @@ static int take(int length,int peek,int truncated,char expected) {
 	return write(1,"packets\\n",8)!=8;
 }
 `);
-			await writeFile(path.join(fixture.workspace, "fd-launch.c"), helpers + `int main(int argc,char **argv) {
+		await writeFile(path.join(fixture.workspace, "fd-launch.c"), helpers + `int main(int argc,char **argv) {
 	if(argc!=2)return 80;int pair[2],gate[2];char byte;
 	if(socketpair(AF_UNIX,${type}|SOCK_CLOEXEC|SOCK_NONBLOCK,0,pair) || dup2(pair[0],20)<0 || dup2(pair[0],21)<0 || dup2(pair[1],22)<0)return 81;
 	close(pair[0]);close(pair[1]);int fd=open("input.txt",O_RDONLY);if(fd<0 || dup2(fd,9)<0)return 82;if(fd!=9)close(fd);
@@ -1408,35 +1365,34 @@ static int take(int length,int peek,int truncated,char expected) {
 	return 0;
 }
 `);
-			for (const name of ["worker", "fd-launch"]) await compileBenchmarkHelper(fixture.workspace, { source: `${name}.c`, output: name });
-			await commitBenchmarkFixture(fixture.workspace, "Packet resource graph"); await prepareLinuxProcessReuse(fixture);
-			const scope = { sessionID: "packet-binding", turnID: "seed" }, later = { ...scope, turnID: "prepared" };
-			const route = await fixture.prepareActorReplay();
-			const command = "fd-launch parent";
-			const execute = async (scope: { sessionID: string; turnID: string }, command: string) => {
-				let output = ""; const result = await route.executor.execute({ command, cwd: fixture.workspace, environment: fixture.environment, scope,
-					timeout: 10, onData: data => { output += data.toString(); } }); expect(result).toEqual({ exitCode: 0 }); return output;
-			};
-			let binding: ProcessExecutionBinding | undefined;
-			expect(await fixture.backend.observeBindings(scope, () => execute(scope, command), bindings => { binding = bindings.at(-1); }, true)).toBe("parent\npackets\n");
-			expect(fixture.backend.actorMetrics().bypasses, JSON.stringify(fixture.backend.actorMetrics())).toBe(0);
-			expect(binding).toBeDefined();
-			const invocation = resolvePiToolInvocation("bash", { command: "exit 92" }, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath })!.process!;
-			await fixture.workspaceSandbox.withWorkspace(fixture.workspace, async workspace => {
-				const session = await fixture.backend.open({ sourceRoot: fixture.workspace, workspace, invocation, scope: later });
-				try {
-					const result = await session.executeBinding(binding!);expect(result.exit).toEqual({ kind: "code", code: 0 });
-					expect(result.output.map(({ data }) => data.toString()).join("")).toBe("packets\n");
-					await session.seal([]);expect(await session.validate(), JSON.stringify(session.metrics())).toMatchObject({ status: "valid" });
-					expect(await execute(later, command.replace("parent", "changed-parent"))).toBe("changed-parent\npackets\n");
-					expect(fixture.backend.actorMetrics().hits, JSON.stringify({ actor: fixture.backend.actorMetrics(), producer: session.metrics() })).toBe(1);
-				} finally { await session.close(); }
-			});
-		} finally { await fixture.dispose(); }
+		for (const name of ["worker", "fd-launch"]) await compileBenchmarkHelper(fixture.workspace, { source: `${name}.c`, output: name });
+		await commitBenchmarkFixture(fixture.workspace, "Packet resource graph"); await prepareLinuxProcessReuse(fixture);
+		const scope = { sessionID: "packet-binding", turnID: "seed" }, later = { ...scope, turnID: "prepared" };
+		const route = await fixture.prepareActorReplay();
+		const command = "fd-launch parent";
+		const execute = async (scope: { sessionID: string; turnID: string }, command: string) => {
+			const { output, ...result } = await executeProcess(fixture, route.executor, command, { scope, timeout: 10 });
+			expect(result).toEqual({ exitCode: 0 }); return output;
+		};
+		let binding: ProcessExecutionBinding | undefined;
+		expect(await fixture.backend.observeBindings(scope, () => execute(scope, command), bindings => { binding = bindings.at(-1); }, true)).toBe("parent\npackets\n");
+		expect(fixture.backend.actorMetrics().bypasses, JSON.stringify(fixture.backend.actorMetrics())).toBe(0);
+		expect(binding).toBeDefined();
+		const invocation = resolvePiToolInvocation("bash", { command: "exit 92" }, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath })!.process!;
+		await fixture.workspaceSandbox.withWorkspace(fixture.workspace, async workspace => {
+			const session = await fixture.backend.open({ sourceRoot: fixture.workspace, workspace, invocation, scope: later });
+			try {
+				const result = await session.executeBinding(binding!);expect(result.exit).toEqual({ kind: "code", code: 0 });
+				expect(result.output.map(({ data }) => data.toString()).join("")).toBe("packets\n");
+				await session.seal([]);expect(await session.validate(), JSON.stringify(session.metrics())).toMatchObject({ status: "valid" });
+				expect(await execute(later, command.replace("parent", "changed-parent"))).toBe("changed-parent\npackets\n");
+				expect(fixture.backend.actorMetrics().hits, JSON.stringify({ actor: fixture.backend.actorMetrics(), producer: session.metrics() })).toBe(1);
+			} finally { await session.close(); }
+		});
 	});
 
 	test("owns the entire Actor call when a held child crosses the adoption boundary", async ({ skip }) => {
-		if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
+		if (process.arch !== "x64") return skip("x86-64 Linux only");
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-held-transaction-"));
 		const binary = path.join(root, "helper");
 		await compileBenchmarkHelper(root, { source: fileURLToPath(new URL("../src/linux-held-exec.c", import.meta.url)), output: "helper", arguments: ["-pthread", "-Werror"] });
@@ -1544,7 +1500,7 @@ static int take(int length,int peek,int truncated,char expected) {
 							onData: data => { output += data.toString(); }, ...request }),
 				};
 			};
-			await writeFile(path.join(root, "queue-owners.c"), `#define _GNU_SOURCE
+			await compileBenchmarkHelper(root, { source: "queue-owners.c", output: "queue-owners", code: `#define _GNU_SOURCE
 #include <fcntl.h>
 #include <poll.h>
 #include <string.h>
@@ -1568,8 +1524,7 @@ int main(int argc, char **argv) {
 	if (!strcmp(argv[1], "queued")) { if (ready.revents || recvmsg(channel[1], &message, MSG_CMSG_CLOEXEC) != 1) return 11; int received; memcpy(&received, CMSG_DATA(CMSG_FIRSTHDR(&message)), sizeof(int)); close(received); }
 	return read(data[1], &byte, 1) != 0;
 }
-`);
-			await compileBenchmarkHelper(root, { source: "queue-owners.c", output: "queue-owners" });
+` });
 			for (const state of ["queued", "consumed"]) {
 				let outside: number | undefined;
 				const executor = held({ descriptors: true, decide: async process => {
@@ -1579,7 +1534,7 @@ int main(int argc, char **argv) {
 				expect(await executor.execute(`exec './queue-owners' ${state}`)).toEqual({ exitCode: 0 });
 					expect(outside, state).toBe(state === "queued" ? 3 : 0);
 				}
-			await writeFile(path.join(root, "packet-capture.c"), `#define _GNU_SOURCE
+			await compileBenchmarkHelper(root, { source: "packet-capture.c", output: "packet-capture", code: `#define _GNU_SOURCE
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <stdlib.h>
@@ -1595,19 +1550,17 @@ int main(int argc,char **argv) {
 	offset=-1;if(setsockopt(pair[1],SOL_SOCKET,SO_PEEK_OFF,&offset,sizeof(offset)) || recv(pair[1],bytes,4,0)!=0 || recv(pair[1],bytes,4,0)!=4 || memcmp(bytes,"tail",4))return 7;
 	return 0;
 }
-`);
-			await compileBenchmarkHelper(root, { source: "packet-capture.c", output: "packet-capture" });
+` });
 			for (const type of [2, 5]) {
 				const executor = held({ descriptors: true, decide: async () => ({ kind: "continue" }) });
 				expect(await executor.execute(`exec './packet-capture' ${type}`)).toEqual({ exitCode: 0 });
 			}
 			// A vfork parent cannot stop until its child execs: a sibling's exec decision must not wait for it (cargo build scripts hung).
-			await writeFile(path.join(root, "spawner.c"), `#include <sys/syscall.h>\n#include <sys/wait.h>\n#include <time.h>\n#include <unistd.h>
+			await compileBenchmarkHelper(root, { source: "spawner.c", output: "spawner", code: `#include <sys/syscall.h>\n#include <sys/wait.h>\n#include <time.h>\n#include <unistd.h>
 int main(void) { int status; struct timespec pause = {0, 300000000}; pid_t sibling = fork(), child;
 	if (!sibling) { usleep(50000); execl("/bin/true", "true", (char *)0); _exit(1); }
 	if (!(child = vfork())) { syscall(SYS_nanosleep, &pause, 0); execl("/bin/true", "true", (char *)0); _exit(1); }
-	return waitpid(child, &status, 0) != child || status || waitpid(sibling, &status, 0) != sibling || status; }\n`);
-			await compileBenchmarkHelper(root, { source: "spawner.c", output: "spawner" });
+	return waitpid(child, &status, 0) != child || status || waitpid(sibling, &status, 0) != sibling || status; }\n` });
 			expect(await held({ descriptors: true, decide: async () => ({ kind: "continue" }) }).execute("exec ./spawner")).toEqual({ exitCode: 0 });
 			const compat = path.join(root, "compat32");
 			await writeFile(`${compat}.s`, ".global _start\n_start: movl $1, %eax; movl $7, %ebx; int $0x80\n");
@@ -2198,9 +2151,8 @@ int main(void) {
 		} finally { await boundary.close(); await rm(root, { recursive: true, force: true }); }
 	});
 
-	test("commits what it wrote outside the workspace on adoption, over the host state it replaced", async ({ skip }) => {
-		if (process.platform !== "linux") return skip("Linux only");
-		const fixture = await createLinuxProcessBenchmark("pi-private-writes-"), outside = await mkdtemp(path.join(os.tmpdir(), "pi-private-outside-"));
+	test("commits what it wrote outside the workspace on adoption, over the host state it replaced", async ({ benchmark }) => {
+		const fixture = await benchmark("pi-private-writes-"), outside = await mkdtemp(path.join(os.tmpdir(), "pi-private-outside-"));
 		try {
 			for (const name of ["kept", "stay"]) await writeFile(path.join(outside, name), "old\n");
 			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
@@ -2272,33 +2224,29 @@ int main(void) {
 		} finally { await fixture.dispose(); await rm(outside, { recursive: true, force: true }); }
 	});
 
-	test("settles a brokered child's inherited pipe as the child left its queue, executed and replayed", async ({ skip }) => {
-		if (process.platform !== "linux") return skip("Linux only");
-		const fixture = await createLinuxProcessBenchmark("pi-pipe-settle-");
-		try {
-			await writeFile(path.join(fixture.workspace, "pipe-child.c"), "#include <unistd.h>\nint main(void) { char byte; return read(3, &byte, 1) != 1 || byte != 'a' || write(4, \"cX\", 2) != 2; }\n");
-			// Both ends reach the child; the parent reads what the queue holds once it exits.
-			await writeFile(path.join(fixture.workspace, "piper.c"), `#include <stdio.h>\n#include <sys/wait.h>\n#include <unistd.h>
+	test("settles a brokered child's inherited pipe as the child left its queue, executed and replayed", async ({ benchmark }) => {
+		const fixture = await benchmark("pi-pipe-settle-");
+		await writeFile(path.join(fixture.workspace, "pipe-child.c"), "#include <unistd.h>\nint main(void) { char byte; return read(3, &byte, 1) != 1 || byte != 'a' || write(4, \"cX\", 2) != 2; }\n");
+		// Both ends reach the child; the parent reads what the queue holds once it exits.
+		await writeFile(path.join(fixture.workspace, "piper.c"), `#include <stdio.h>\n#include <sys/wait.h>\n#include <unistd.h>
 int main(void) { int fds[2], status; char queue[8]; if (pipe(fds) || fds[0] != 3 || write(4, "ab", 2) != 2) return 90; pid_t child = fork();
 	if (!child) { execlp("pipe-child", "pipe-child", (char *)0); _exit(91); }
 	if (waitpid(child, &status, 0) != child || status) return 92; close(4); ssize_t length = read(3, queue, sizeof(queue));
 	return length < 0 || printf("%.*s\\n", (int)length, queue) < 0; }\n`);
-			for (const name of ["pipe-child", "piper"]) await compileBenchmarkHelper(fixture.workspace, { source: `${name}.c`, output: name });
-			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
-			for (const label of ["executed", "replayed"]) {
-				const before = fixture.backend.metrics(), branch = await forkReusableBash(fixture, { label, command: "./piper", actionNamespace: "pipe-settle", executionFingerprint });
-				try {
-					const after = fixture.backend.metrics();
-					expect({ text: textOutput(branch.output.result), bypasses: after.bypasses - before.bypasses, hits: after.hits > before.hits }, JSON.stringify(after))
-						.toEqual({ text: "bcX\n", bypasses: 0, hits: label === "replayed" });
-				} finally { await branch.dispose?.(); }
-			}
-		} finally { await fixture.dispose(); }
+		for (const name of ["pipe-child", "piper"]) await compileBenchmarkHelper(fixture.workspace, { source: `${name}.c`, output: name });
+		const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
+		for (const label of ["executed", "replayed"]) {
+			const before = fixture.backend.metrics(), branch = await forkReusableBash(fixture, { label, command: "./piper", actionNamespace: "pipe-settle", executionFingerprint });
+			try {
+				const after = fixture.backend.metrics();
+				expect({ text: textOutput(branch.output.result), bypasses: after.bypasses - before.bypasses, hits: after.hits > before.hits }, JSON.stringify(after))
+					.toEqual({ text: "bcX\n", bypasses: 0, hits: label === "replayed" });
+			} finally { await branch.dispose?.(); }
+		}
 	});
 
-	test("owns output and capture lifetimes, preserves concurrency and brokers an internal pipe", async ({ skip }) => {
-		if (process.platform !== "linux") return skip("Linux only");
-		const fixture = await createLinuxProcessBenchmark("pi-process-concurrency-");
+	test("owns output and capture lifetimes, preserves concurrency and brokers an internal pipe", async ({ skip, benchmark }) => {
+		const fixture = await benchmark("pi-process-concurrency-");
 		const { readlink, readFile: readTrace, rm: removeFile, mkdtemp: allocateRoot } = await vi.importActual<typeof filesystem>("node:fs/promises");
 		const { spawn } = await vi.importActual<typeof childProcess>("node:child_process");
 		const kill = process.kill.bind(process), killing = vi.spyOn(process, "kill");
@@ -2354,8 +2302,7 @@ int main(void) { int fds[2], status; char queue[8]; if (pipe(fds) || fds[0] != 3
 				await writeFile(path.join(fixture.workspace, name), `${script}\n`);
 				await chmod(path.join(fixture.workspace, name), 0o755);
 			}
-			await writeFile(path.join(fixture.workspace, "fd-check.c"), "#include <fcntl.h>\nint main(void) {\n\tint mask = 0;\n\tfor (int fd = 0; fd < 3; fd++) if (fcntl(fd, F_GETFD) >= 0) mask |= 1 << fd;\n\treturn mask;\n}\n");
-			await compileBenchmarkHelper(fixture.workspace, { source: "fd-check.c", output: "fd-check" });
+			await compileBenchmarkHelper(fixture.workspace, { source: "fd-check.c", output: "fd-check", code: "#include <fcntl.h>\nint main(void) {\n\tint mask = 0;\n\tfor (int fd = 0; fd < 3; fd++) if (fcntl(fd, F_GETFD) >= 0) mask |= 1 << fd;\n\treturn mask;\n}\n" });
 			const streamProbes = ["", "0<&-", "1>&-", "2>&-", "0<&- 1>&- 2>&-", "3>&1"].map((redirection) =>
 				"status=0; fd-check " + redirection + " || status=$?; printf 'fds:%s\\n' \"$status\"").join("; ");
 			await fixture.world.speculation.prepare?.({ cwd: fixture.workspace });
@@ -2480,13 +2427,11 @@ int main(void) { int fds[2], status; char queue[8]; if (pipe(fds) || fds[0] != 3
 			allocations.mockRestore();
 			sampling.mockRestore();
 			await branch?.dispose();
-			await fixture.dispose();
 		}
 	}, 15_000);
 
-	test.for(["trace", "transaction", "dependency", "input_image", "publication"] as const)("preserves output and capture ownership when %s fails", { timeout: 15_000 }, async (failure, { skip }) => {
-		if (process.platform !== "linux") return skip("Linux only");
-		const fixture = await createLinuxProcessBenchmark("pi-process-capture-failure-", failure === "dependency" ? "git" : undefined); // Invalidate the copied prestate.
+	test.for(["trace", "transaction", "dependency", "input_image", "publication"] as const)("preserves output and capture ownership when %s fails", { timeout: 15_000 }, async (failure, { skip, benchmark }) => {
+		const fixture = await benchmark("pi-process-capture-failure-", failure === "dependency" ? "git" : undefined); // Invalidate the copied prestate.
 		const { readFile: readTrace, rm: removeFile } = await vi.importActual<typeof filesystem>("node:fs/promises");
 		const { spawn } = await vi.importActual<typeof childProcess>("node:child_process");
 		const entered = deferred(), failed = deferred(), gate = deferred();
@@ -2547,8 +2492,7 @@ int main(void) { int fds[2], status; char queue[8]; if (pipe(fds) || fds[0] != 3
 			if (status.state !== "ready") return skip(status.detail);
 			const inputName = failure === "input_image" ? path.join(fixture.root, "input.txt") : "input.txt";
 			await writeFile(path.resolve(fixture.workspace, inputName), "capture-once");
-			await writeFile(path.join(fixture.workspace, "emit.c"), `#include <fcntl.h>\n#include <unistd.h>\nint main(void) { char text[12]; return read(open(${JSON.stringify(inputName)}, O_RDONLY), text, 12) != 12 || write(1, text, 12) != 12; }\n`);
-			await compileBenchmarkHelper(fixture.workspace, { source: "emit.c", output: "emit" });
+			await compileBenchmarkHelper(fixture.workspace, { source: "emit.c", output: "emit", code: `#include <fcntl.h>\n#include <unistd.h>\nint main(void) { char text[12]; return read(open(${JSON.stringify(inputName)}, O_RDONLY), text, 12) != 12 || write(1, text, 12) != 12; }\n` });
 			await commitBenchmarkFixture(fixture.workspace, "Process capture failure");
 			const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
 			running = forkReusableBash(fixture, { command: "emit", label: failure, actionNamespace: "capture-owners", executionFingerprint });
@@ -2585,19 +2529,17 @@ int main(void) { int fds[2], status; char queue[8]; if (pipe(fds) || fds[0] != 3
 			released = true; gate.resolve();
 			await running?.then((branch) => branch.dispose(), () => undefined);
 			restoreTransactions?.(); opening.mockRestore(); reading.mockRestore(); removing.mockRestore(); spawning.mockRestore(); publishing.mockRestore();
-			await fixture.dispose();
 		}
 	});
 
-	test.for(["rename", "posix-lock", "ofd-lock", "flock", "rdtsc", "auxv-random"] as const)("rejects reuse when isolated resource semantics differ from native (%s)", { timeout: 20_000 }, async (mode, { skip }) => {
-		if (process.platform !== "linux") return skip("Linux only");
+	test.for(["rename", "posix-lock", "ofd-lock", "flock", "rdtsc", "auxv-random"] as const)("rejects reuse when isolated resource semantics differ from native (%s)", { timeout: 20_000 }, async (mode, { skip, benchmark }) => {
 		const instanceInput = mode === "rdtsc" || mode === "auxv-random";
 		if (instanceInput && process.arch !== "x64") return skip("x86-64 ELF input probe");
 		if (mode === "rename") {
 			const overlay = await linuxOverlayfsCapability();
 			if (!overlay.available) return skip(overlay.detail);
 		}
-		const fixture = await createLinuxProcessBenchmark("pi-process-driver-semantics-", mode === "rename" ? "overlayfs" : undefined);
+		const fixture = await benchmark("pi-process-driver-semantics-", mode === "rename" ? "overlayfs" : undefined);
 		const { workspace, backend } = fixture;
 		let branch: Awaited<ReturnType<typeof forkReusableBash>> | undefined;
 		let locker: childProcess.ChildProcessWithoutNullStreams | undefined, lockerClosed: Promise<unknown> | undefined;
@@ -2605,7 +2547,7 @@ int main(void) { int fds[2], status; char queue[8]; if (pipe(fds) || fds[0] != 3
 			await mkdir(path.join(workspace, "source"));
 			await writeFile(path.join(workspace, "source", "value.txt"), "value\n", "utf8");
 			if (mode !== "rename") {
-				await writeFile(path.join(workspace, "probe.c"), instanceInput ? `#include <elf.h>
+				await compileBenchmarkHelper(workspace, { source: "probe.c", output: "probe", code: instanceInput ? `#include <elf.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -2637,8 +2579,7 @@ int main(int argc, char **argv) {
 		`if (fcntl(fd, ${mode === "ofd-lock" ? "F_OFD_GETLK" : "F_GETLK"}, &lock) < 0) return 5; value = lock.l_type == F_UNLCK ? 'U' : 'L';`}
 	return write(1, &value, 1) != 1;
 }
-`);
-				await compileBenchmarkHelper(workspace, { source: "probe.c", output: "probe" });
+` });
 				await commitBenchmarkFixture(workspace, "Resource control observation");
 				if (!instanceInput) {
 					locker = childProcess.spawn(path.join(workspace, "probe"), ["hold"], { cwd: workspace, env: fixture.environment, stdio: ["pipe", "pipe", "pipe"] });
@@ -2654,9 +2595,7 @@ int main(int argc, char **argv) {
 			if (mode !== "rename") {
 				expect(branch.output.result.content).toEqual([{ type: "text", text: instanceInput ? expect.stringMatching(/^\d+\n$/) : "U" }]);
 				const route = await fixture.prepareActorReplay(true);
-				let output = "";
-				await route.executor.execute({ command: ": changed-parent; probe", cwd: workspace, environment: fixture.environment,
-					scope: { sessionID: "benchmark", turnID: "later" }, onData: data => { output += data.toString(); } });
+				const { output } = await executeProcess(fixture, route.executor, ": changed-parent; probe", { scope: { sessionID: "benchmark", turnID: "later" } });
 				expect(output, JSON.stringify(backend.actorMetrics())).toEqual(instanceInput ? expect.stringMatching(/^\d+\n$/) : "L");
 				expect(backend.actorMetrics().hits).toBe(0);
 			}
@@ -2678,13 +2617,12 @@ int main(int argc, char **argv) {
 		} finally {
 			locker?.stdin.end(); await lockerClosed;
 			await branch?.dispose();
-			await fixture.dispose();
 		}
 	});
 });
-test.for(["git", "auto"] as const)("preserves native metadata across stat families and rejects volatile or changed results (%s)", { timeout: 120_000 }, async (driver, { skip }) => {
-	if (process.platform !== "linux" || process.arch !== "x64") return skip("x86-64 Linux only");
-	const fixture = await createLinuxProcessBenchmark("pi-native-metadata-", driver, {}, os.homedir());
+test.for(["git", "auto"] as const)("preserves native metadata across stat families and rejects volatile or changed results (%s)", { timeout: 120_000 }, async (driver, { skip, benchmark }) => {
+	if (process.arch !== "x64") return skip("x86-64 Linux only");
+	const fixture = await benchmark("pi-native-metadata-", driver, {}, os.homedir());
 	const actual = await vi.importActual<typeof filesystem>("node:fs/promises"), pins: filesystem.FileHandle[] = [];
 	const opening = vi.mocked(filesystem.open).mockImplementation(async (...args) => {
 		const handle = await actual.open(...args);
@@ -2693,8 +2631,7 @@ test.for(["git", "auto"] as const)("preserves native metadata across stat famili
 	});
 	try {
 		const bin = path.join(fixture.root, "host-bin"); await mkdir(bin);
-		await writeFile(path.join(bin, "pid.c"), '#include <stdio.h>\n#include <unistd.h>\nint main(void) { printf("%ld\\n", (long)getpid()); return 0; }\n');
-		await compileBenchmarkHelper(bin, { source: "pid.c", output: "cat" });
+		await compileBenchmarkHelper(bin, { source: "pid.c", output: "cat", code: '#include <stdio.h>\n#include <unistd.h>\nint main(void) { printf("%ld\\n", (long)getpid()); return 0; }\n' });
 		await writeFile(path.join(fixture.workspace, "README"), "metadata fixture\n");
 		await filesystem.chmod(path.join(fixture.workspace, "README"), 0o640);
 		await filesystem.link(path.join(fixture.workspace, "README"), path.join(fixture.workspace, "README-alias"));
@@ -2705,7 +2642,7 @@ test.for(["git", "auto"] as const)("preserves native metadata across stat famili
 		for (let index = 0; index < 300; index++) await mkdir(path.join(fixture.workspace, "many", `d${index}`));
 		await writeFile(path.join(fixture.workspace, "many", "file"), "regular\n");
 		await filesystem.symlink("d0", path.join(fixture.workspace, "many", "alias"));
-		await writeFile(path.join(fixture.workspace, "metadata.c"), String.raw`#define _GNU_SOURCE
+		await compileBenchmarkHelper(fixture.workspace, { source: "metadata.c", output: "metadata", code: String.raw`#define _GNU_SOURCE
 #include <dirent.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -2759,8 +2696,7 @@ int main(int argc, char **argv) {
 	}
 	return close(fd);
 }
-`);
-		await compileBenchmarkHelper(fixture.workspace, { source: "metadata.c", output: "metadata" });
+` });
 		await filesystem.symlink("README", path.join(fixture.workspace, "metadata-link"));
 		await commitBenchmarkFixture(fixture.workspace, "metadata");
 		const stamp = `${Math.floor(Date.now() / 1000) - 30} +0000`;

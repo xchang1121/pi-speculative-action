@@ -13,7 +13,7 @@ test.for(["git", "auto"] as const)("preserves held-child output, effects and one
 		const status = await backend.check(true);
 		if (status.state !== "ready") return skip(status.detail);
 		await writeFile(path.join(workspace, "input.txt"), "before\n");
-		await writeFile(path.join(workspace, "worker.c"), String.raw`
+		await compileBenchmarkHelper(workspace, { source: "worker.c", output: "worker", code: String.raw`
 #include <fcntl.h>
 #include <sys/random.h>
 #include <sys/prctl.h>
@@ -57,8 +57,7 @@ int main(int argc, char **argv) {
   close(output);
   return write(1, "worker:", 7) == 7 && write(1, value, (size_t)length) == length ? 0 : 67;
 }
-`);
-		await compileBenchmarkHelper(workspace, { source: "worker.c", output: "worker" });
+` });
 		await mkdir(path.join(workspace, "d", "e"), { recursive: true });
 		await Promise.all([writeFile(path.join(workspace, "d", "e", ".keep"), ""), writeFile(path.join(workspace, "data.txt"), "v1\n"), writeFile(path.join(workspace, "d", "data.txt"), "nested\n"),
 			symlink("data.txt", path.join(workspace, "data.link")), symlink("d/e", path.join(workspace, "sub"))]);

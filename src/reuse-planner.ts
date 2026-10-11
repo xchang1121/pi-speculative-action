@@ -12,6 +12,7 @@ export interface ReplayObservationContract {
 }
 
 export interface ProcessReuseRequest {
+	readonly signal?: AbortSignal;
 	/** Static exec identity already derived from the caller's bound invocation; not replay authority. */
 	readonly weakKey: Sha256Digest;
 	/** Coarse index partition; the full weak key and current evidence still authorize reuse. */
@@ -61,13 +62,14 @@ export class ProcessReusePlanner {
 	constructor(options: { readonly store: ProvenanceCertificateStore }) { this.store = options.store; }
 
 	async plan(request: ProcessReuseRequest): Promise<ProcessReusePlan> {
+		const signal = AbortSignal.any([this.store.signal, ...(request.signal ? [request.signal] : [])]); signal.throwIfAborted();
 		const metrics = { candidateCertificates: 0, eligibleCertificates: 0, pathsetsValidated: 0, filesRead: 0, bytesRead: 0, artifactsLoaded: 0, artifactBytesRead: 0 };
 		const lookup = (): ProcessReuseLookupMetrics => Object.freeze({ ...metrics });
 		const weakKey = request.weakKey;
 		if (!isSha256Digest(weakKey)) throw new Error("invalid process weak key");
 		const live = request.live ? [request.live.certificate].flat().filter(candidate => candidate.weakKey === weakKey) : [];
 		const acceptedTaints = [...new Set([...(request.validation?.acceptedTaints ?? []), ...(live.length ? request.live!.acceptedTaints : [])])];
-		const certificates = live.length ? live : this.store.candidatesByWeakKey(weakKey, request.executablePath, request.excludedCertificates);
+		const certificates = live.length ? live : this.store.candidatesByWeakKey(weakKey, request.executablePath, request.excludedCertificates, signal);
 		const reasons = new Set<ProcessReuseMissReason>(), changedDependencies = new Set<string>();
 		const currentInputs = observeProcessInputs(weakKey, async evidence => {
 			metrics.pathsetsValidated++;
@@ -77,6 +79,7 @@ export class ProcessReusePlanner {
 			return observation;
 		});
 		for await (const certificate of certificates) {
+			signal.throwIfAborted();
 			metrics.candidateCertificates++;
 			if (request.acceptProducer && !request.acceptProducer(certificate.producer)) { reasons.add("producer_guarantee_incompatible"); continue; }
 			if (!certificateReplayable(certificate, acceptedTaints)) { reasons.add("certificate_tainted"); continue; }
@@ -89,13 +92,15 @@ export class ProcessReusePlanner {
 			if (!validation) { reasons.add("validation_indeterminate"); continue; }
 			if (certificate.strongKey !== validation.strongKey) { reasons.add("dependency_changed"); continue; }
 			let artifacts: VerifiedArtifactClosure | undefined;
-			try { artifacts = await this.store.artifacts.load(referencedArtifacts(certificate)); }
+			try { artifacts = await this.store.artifacts.load(referencedArtifacts(certificate), signal); }
 			catch { reasons.add("artifact_unreadable"); continue; }
+			signal.throwIfAborted();
 			if (!artifacts) { reasons.add("artifact_missing"); continue; }
 			metrics.artifactsLoaded += artifacts.artifacts; metrics.artifactBytesRead += artifacts.bytes;
 			const kind = certificate.result.continuation ? "running_resume" : "completed_replay";
 			return { kind, source: live.length ? "live" : "l2", weakKey, certificate, validation, artifacts, lookup: lookup() };
 		}
+		signal.throwIfAborted();
 		return { kind: "miss", weakKey, reasons: Object.freeze(reasons.size ? [...reasons] : ["no_candidate_pathset"]),
 			...(changedDependencies.size ? { changedDependencies: Object.freeze([...changedDependencies].sort()) } : {}), lookup: lookup() };
 	}
