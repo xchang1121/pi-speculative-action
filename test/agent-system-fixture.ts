@@ -25,23 +25,24 @@ export function systemHost(cwd: string, tools: AgentTool[], options: Partial<Cre
 		onEvent: event => { events.push(event); return options.onEvent?.(event); },
 	});
 	const call = (tool: string, args: Record<string, unknown>, id = `call-${++calls}`) => ({ turnID, id, tool, args, tools });
+	const authoritative = async (tool: string, args: Record<string, unknown>, signal?: AbortSignal, id = "oracle", invocation = options.resolveInvocation?.(tool, args) ?? null) => {
+		const bound = await invocation;
+		if (bound?.authoritative) return (await bound.authoritative({ callID: id, args, signal: signal ?? new AbortController().signal })).result;
+		return tools.find(candidate => candidate.name === tool)!.execute(id, args as never, signal);
+	};
 	return {
-		host, events, fallbacks,
+		host, events, fallbacks, oracle: authoritative,
 		start: async (id = "first") => {
 			turnID = id;
 			await host.startTurn({ turnID, tools, actorOptions: {}, actorModel: testModel("actor", { contextWindow: 262144 }),
 				context: { systemPrompt: "Use tools to inspect and edit these files.", messages: [], tools } });
 		},
 		preview: (tool: string, args: Record<string, unknown>, signal?: AbortSignal, id?: string) => host.previewActorCall(call(tool, args, id), signal),
-		execute: (tool: string, args: Record<string, unknown>, signal?: AbortSignal, id?: string) => {
-			const input = call(tool, args, id), executor = tools.find(candidate => candidate.name === tool)!;
-			return host.execute(input, signal, operation => {
+		execute: (tool: string, args: Record<string, unknown>, signal?: AbortSignal, id?: string) =>
+			host.execute(call(tool, args, id), signal, operation => {
 				fallbacks.push(tool);
-				if (operation.invocation?.authoritative) return operation.invocation.authoritative({ callID: input.id,
-					args: operation.input as Record<string, unknown>, signal: operation.signal ?? new AbortController().signal }).then(output => output.result);
-				return executor.execute(input.id, operation.input as never, operation.signal);
-			});
-		},
+				return authoritative(tool, operation.input as Record<string, unknown>, operation.signal, operation.callID, operation.invocation ?? null);
+			}),
 		ready: async (count = 1) => {
 			try { await expect.poll(() => events.filter(event => event.type === "candidate" && event.state.status === "succeeded").length,
 				{ timeout: 10_000 }).toBeGreaterThanOrEqual(count); }

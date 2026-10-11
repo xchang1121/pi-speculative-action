@@ -18,6 +18,7 @@ import { spawn } from "node:child_process";
 import { captureStableFile } from "./filesystem-evidence.ts";
 import { resolveHostExecutable } from "./executable-path.ts";
 import { createCommittedResourceInputs } from "./agent-execution-world.ts";
+import { SharedAbortScope } from "./runtime-lifecycle.ts";
 
 export const PI_CLOSED_SEARCH_TOOLS: readonly string[] = ["find", "grep"];
 
@@ -283,7 +284,7 @@ export async function createClosedSearchProfile(cwd: string) {
 					if (!engine || !view) return await run();
 					const query = request.args as GrepInput;
 					const target = resolvePath(query.path || ".", cwd, { homeDir: home, normalizeUnicodeSpaces: true, stripAtPrefix: true });
-					const build = async (inputs: ToolFilesystemOperations) => {
+					const build = async (inputs: ToolFilesystemOperations, signal: AbortSignal) => {
 						const root = await fs.mkdtemp(path.join(engine.root, "inputs-"));
 						const dispose = async () => { assert.equal(path.dirname(root), engine.root); await fs.rm(root, { recursive: true, force: true }); };
 						try {
@@ -292,8 +293,8 @@ export async function createClosedSearchProfile(cwd: string) {
 							return { value: { root, ...prepared }, bytes: prepared.bytes, dispose };
 						} catch (error) { await dispose(); throw error; }
 					};
-					if (view.prepare) return await view.prepare(engine, JSON.stringify([target, query.glob]), build, run, target);
-					const prepared = await build(view);
+					if (view.prepare) return await view.prepare(engine, JSON.stringify([target, query.glob]), build, run, target, signal);
+					const prepared = await build(view, signal);
 					try { return await run(prepared.value); } finally { await prepared.dispose(); }
 				} finally { await capture?.release(); }
 			}, request.signal);
@@ -410,53 +411,52 @@ type PreparedGrep = { readonly root: string; readonly cwd: string; readonly path
 async function matchCapturedGrep(view: ToolFilesystemOperations, engine: NonNullable<Awaited<ReturnType<typeof prepareGrepEngine>>>,
 	prepared: PreparedGrep, query: GrepInput, signal: AbortSignal, emit: (output: SearchOutput) => void) {
 	type Match = { readonly line_number: number; readonly lines: { readonly text?: string; readonly bytes?: string } };
-	type Pending = { readonly source: string; readonly inputs: ToolFilesystemOperations; readonly resolve: (matches: Match[]) => void; readonly reject: (error: unknown) => void };
-	let pending: Pending[] = [];
-	const enqueue = (source: string, inputs: ToolFilesystemOperations) => new Promise<Match[]>((resolve, reject) => {
-		pending.push({ source, inputs, resolve, reject });
-		if (pending.length !== 1) return;
-		setImmediate(() => {
-			const batch = pending; pending = [];
-			void (async () => {
-				let root: string | undefined;
-				try {
-					signal.throwIfAborted(); root = await fs.mkdtemp(path.join(engine.root, "matches-"));
-					const files = new Map<string, Match[]>(); let inputBytes = 0, outputBytes = 0;
-					for (const [index, item] of batch.entries()) {
-						signal.throwIfAborted(); const bytes = await item.inputs.readFile(item.source);
-						assert.ok((inputBytes += bytes.length) <= 8 * 1024 * 1024, "search input byte budget");
-						const file = path.join(root, String(index)); files.set(file, []); await fs.writeFile(file, bytes);
-					}
-					const output: Buffer[] = [], diagnostic: Buffer[] = [];
-					const result = await engine.execute("producer", root, ["--json", "--line-number", "--color=never", "--hidden",
-						...(query.ignoreCase ? ["--ignore-case"] : []), ...(query.literal ? ["--fixed-strings"] : []), "--", query.pattern, root], signal,
-						({ fd, data }) => { assert.ok((outputBytes += data.length) <= 8 * 1024 * 1024, "search match byte budget"); (fd === 1 ? output : diagnostic).push(data); });
-					signal.throwIfAborted(); assert.ok(result.code === 0 || result.code === 1, Buffer.concat(diagnostic).toString());
-					for (const line of Buffer.concat(output).toString("utf8").split("\n")) {
-						if (!line) continue; const event = JSON.parse(line);
-						if (event.type !== "match") continue;
-						const matches = files.get(event.data?.path?.text); assert.ok(matches, "unowned grep match");
-						matches.push({ line_number: event.data.line_number, lines: event.data.lines });
-					}
-					return batch.map((_, index) => files.get(path.join(root!, String(index)))!);
+	let pending: { readonly source: string; readonly inputs: ToolFilesystemOperations; readonly signal: AbortSignal }[] = [];
+	let queued: Promise<Match[][]> | undefined;
+	const enqueue = (source: string, inputs: ToolFilesystemOperations, signal: AbortSignal) => {
+		const index = pending.push({ source, inputs, signal }) - 1;
+		return (queued ??= new Promise<void>(setImmediate).then(async () => {
+			const batch = pending; pending = []; queued = undefined;
+			const scope = new SharedAbortScope(), release = batch.filter(item => !item.signal.aborted).map(item => scope.acquire(item.signal)), signal = scope.signal;
+			if (!release.length) scope.abort();
+			let root: string | undefined;
+			try {
+				signal.throwIfAborted(); root = await fs.mkdtemp(path.join(engine.root, "matches-"));
+				const files = new Map<string, Match[]>(); let inputBytes = 0, outputBytes = 0;
+				for (const [index, item] of batch.entries()) {
+					signal.throwIfAborted(); if (item.signal.aborted) continue;
+					const bytes = await item.inputs.readFile(item.source);
+					assert.ok((inputBytes += bytes.length) <= 8 * 1024 * 1024, "search input byte budget");
+					const file = path.join(root, String(index)); files.set(file, []); await fs.writeFile(file, bytes);
 				}
-				finally { if (root) { assert.equal(path.dirname(root), engine.root); await fs.rm(root, { recursive: true, force: true }); } }
-			})().then(results => { for (const [index, item] of batch.entries()) item.resolve(results[index]!); },
-				error => { for (const item of batch) item.reject(error); });
-		});
-	});
+				const output: Buffer[] = [], diagnostic: Buffer[] = [];
+				const result = await engine.execute("producer", root, ["--json", "--line-number", "--color=never", "--hidden",
+					...(query.ignoreCase ? ["--ignore-case"] : []), ...(query.literal ? ["--fixed-strings"] : []), "--", query.pattern, root], signal,
+					({ fd, data }) => { assert.ok((outputBytes += data.length) <= 8 * 1024 * 1024, "search match byte budget"); (fd === 1 ? output : diagnostic).push(data); });
+				signal.throwIfAborted(); assert.ok(result.code === 0 || result.code === 1, Buffer.concat(diagnostic).toString());
+				for (const line of Buffer.concat(output).toString("utf8").split("\n")) {
+					if (!line) continue; const event = JSON.parse(line);
+					if (event.type !== "match") continue;
+					const matches = files.get(event.data?.path?.text); assert.ok(matches, "unowned grep match");
+					matches.push({ line_number: event.data.line_number, lines: event.data.lines });
+				}
+				return batch.map((_, index) => files.get(path.join(root!, String(index)))!);
+			}
+			finally { for (const withdraw of release) withdraw(); if (root) { assert.equal(path.dirname(root), engine.root); await fs.rm(root, { recursive: true, force: true }); } }
+		})).then(results => { signal.throwIfAborted(); return results[index]!; });
+	};
 	if (!prepared.files.length) {
 		// Even an empty selection must compile the pattern and preserve native errors.
-		await enqueue("", { ...view, readFile: async () => Buffer.alloc(0) });
+		await enqueue("", { ...view, readFile: async () => Buffer.alloc(0) }, signal);
 		return { code: 1, signal: null };
 	}
 	const jobs = prepared.files.map(file => {
-		const build = async (inputs: ToolFilesystemOperations) => {
-			const value = await enqueue(file.source, inputs);
+		const build = async (inputs: ToolFilesystemOperations, signal: AbortSignal) => {
+			const value = await enqueue(file.source, inputs, signal);
 			return { value, bytes: JSON.stringify(value).length * 2 + value.length * 64, dispose: () => {} };
 		};
 		return view.prepare ? view.prepare(engine, JSON.stringify([file.source, query.pattern, !!query.ignoreCase, !!query.literal]),
-			build, async value => value, file.source) : build(view).then(resource => resource.value);
+			build, async value => value, file.source, signal) : build(view, signal).then(resource => resource.value);
 	});
 	try {
 		const results = await Promise.all(jobs); signal.throwIfAborted();

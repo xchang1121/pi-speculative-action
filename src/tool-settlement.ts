@@ -40,10 +40,10 @@ export interface ToolFilesystemOperations {
 	readonly readdir?: (target: string) => string[] | Promise<string[]>;
 	readonly writeFile?: (target: string, content: string) => Promise<void>;
 	readonly mkdir?: (target: string) => Promise<void>;
-	/** Borrow a derived input representation under its owner's byte budget; resource is an optional lookup hint. */
+	/** Borrow under the owner's byte budget; build uses the shared lifetime, signal owns only this consumer. */
 	readonly prepare?: <Value, Result>(binding: object, key: string,
-		build: (view: ToolFilesystemOperations) => Promise<{ readonly value: Value; readonly bytes: number; readonly dispose: () => void | Promise<void> }>,
-		consume: (value: Value) => Promise<Result>, resource?: string) => Promise<Result>;
+		build: (view: ToolFilesystemOperations, signal: AbortSignal) => Promise<{ readonly value: Value; readonly bytes: number; readonly dispose: () => void | Promise<void> }>,
+		consume: (value: Value) => Promise<Result>, resource?: string, signal?: AbortSignal) => Promise<Result>;
 }
 
 /** Identity of the concrete tool executor. */

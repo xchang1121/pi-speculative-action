@@ -10,7 +10,7 @@ import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { PatternAwareStore, patternAwareSettings, patternAwareActionSemantics } from "../src/pattern-aware.ts";
 import { temporaryDirectories } from "./filesystem.ts";
 import { systemHost } from "./agent-system-fixture.ts";
-import { deferred } from "./async.ts";
+import { deferred, nextTurn } from "./async.ts";
 import { commitBenchmarkFixture, createLinuxProcessBenchmark, textOutput } from "./linux-process-fixture.ts";
 
 const directories = temporaryDirectories("pi-agent-system-");
@@ -43,37 +43,51 @@ test("learns from executed tool workflows, reopens the saved state and supplies 
 	} finally { await f.dispose(); await reopened.flush(); }
 });
 
-test("reconstructs new searches from captured inputs across turns and observes namespace changes", async ({ skip }) => {
+test.for([false, true])("reconstructs shared searches after cancellation and namespace changes (cancel all: %s)", async (cancelAll, { skip }) => {
 	const cwd = await directories.create();
 	await writeFile(path.join(cwd, "a.txt"), "one\ntwo\nthree\n");
 	await writeFile(path.join(cwd, ".ignore"), "ignored.txt\n");
 	await writeFile(path.join(cwd, "ignored.txt"), "two ignored\n");
 	const profile = await createClosedSearchProfile(cwd);
 	if (!profile.invocations.has("grep")) { await profile.pool.dispose(); return skip("qualified rg unavailable"); }
+	const entered = deferred(), joined = deferred(), release = deferred(), controllers = [new AbortController(), new AbortController()];
+	let holding = false, borrowers = 0, builds = 0, shared: AbortSignal | undefined;
+	const grep = profile.invocations.get("grep")!, actors: Promise<unknown>[] = [];
+	const invocation: typeof grep = { ...grep, filesystem: (view, request) => grep.filesystem!({ ...view,
+		prepare: (binding, key, build, consume, target, signal) => {
+			if (holding && target === path.join(cwd, "a.txt") && ++borrowers === 2) joined.resolve();
+			return view.prepare!(binding, key, async (inputs, signal) => {
+				if (holding && target === path.join(cwd, "a.txt")) { builds++; shared = signal; entered.resolve(); await release.promise; }
+				return build(inputs, signal);
+			}, consume, target, signal);
+		},
+	}, request) };
 	const tools = [createGrepTool(cwd), createFindTool(cwd), createLsTool(cwd), createReadTool(cwd)];
 	const f = systemHost(cwd, tools, {
-		resolveInvocation: (tool, input) => profile.invocations.get(tool) ?? resolvePiToolInvocation(tool, input, { cwd, environment: {} }),
+		resolveInvocation: (tool, input) => tool === "grep" ? invocation : profile.invocations.get(tool) ?? resolvePiToolInvocation(tool, input, { cwd, environment: {} }),
 	});
-	const oracle = async (tool: string, args: Record<string, unknown>) => {
-		const invocation = profile.invocations.get(tool);
-		return invocation?.authoritative
-			? (await invocation.authoritative({ callID: "oracle", args, signal: new AbortController().signal })).result
-			: tools.find(value => value.name === tool)!.execute("oracle", args as never);
-	};
 	try {
 		await f.start(); await f.preview("grep", { pattern: "one", path: "." }); await f.ready();
 		await f.finish(); await f.start("queries");
+		holding = true;
+		actors.push(f.execute("grep", { pattern: "two", path: ".", limit: 1 }, controllers[0]!.signal).catch(error => error)); await entered.promise;
+		actors.push(f.execute("grep", { pattern: "two", path: ".", limit: 2 }, controllers[1]!.signal).catch(error => error)); await joined.promise; await nextTurn();
+		controllers[0]!.abort(); if (cancelAll) controllers[1]!.abort();
+		expect(shared?.aborted).toBe(cancelAll); release.resolve();
+		const results = await Promise.all(actors); holding = false;
+		if (!cancelAll) expect(results[1]).toEqual(await f.oracle("grep", { pattern: "two", path: ".", limit: 2 }));
+		expect(builds).toBe(1); expect(f.fallbacks).toEqual(cancelAll ? ["grep", "grep"] : ["grep"]); f.fallbacks.length = 0;
 		const queries = [
 			{ tool: "grep", input: { pattern: "two", path: "." } },
 			{ tool: "find", input: { pattern: "*.txt", path: "." } },
 			{ tool: "read", input: { path: "a.txt", offset: 2, limit: 1 } },
 		];
-		for (const query of queries) expect(await f.execute(query.tool, query.input)).toEqual(await oracle(query.tool, query.input));
+		for (const query of queries) expect(await f.execute(query.tool, query.input)).toEqual(await f.oracle(query.tool, query.input));
 		expect(f.fallbacks).toEqual([]);
 		await writeFile(path.join(cwd, "a.txt"), "two changed\n");
 		await writeFile(path.join(cwd, "added.txt"), "two new\n");
-		for (const query of queries) expect(await f.execute(query.tool, query.input)).toEqual(await oracle(query.tool, query.input));
-	} finally { await f.dispose(); await profile.pool.dispose(); }
+		for (const query of queries) expect(await f.execute(query.tool, query.input)).toEqual(await f.oracle(query.tool, query.input));
+	} finally { for (const controller of controllers) controller.abort(); release.resolve(); await Promise.allSettled(actors); await f.dispose(); await profile.pool.dispose(); }
 });
 
 test.for(["in-place", "git"] as const)("keeps effects private, retries restored preimages and transfers an aborted claim (%s)", async driver => {

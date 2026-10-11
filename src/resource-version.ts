@@ -8,7 +8,7 @@ import { type ActionKey, type ActionSemanticsRegistry, PI_ACTION_SEMANTICS, type
 import { type StableFilesystemCapture, cachedCapture, captureFilesystemEntry, captureStableFile, rememberCapture, FILESYSTEM_CONCURRENCY, mapFilesystem, sameFilesystemIdentity, walkFilesystemPath } from "./filesystem-evidence.ts";
 import { containsFilesystemPath, filesystemPathKey, relativeFilesystemPath } from "./path-utils.ts";
 import type { ToolFilesystemOperations, ToolFilesystemStat } from "./tool-settlement.ts";
-import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
+import { RuntimeLifecycleLane, SharedAbortScope } from "./runtime-lifecycle.ts";
 import { TimelineInterval } from "./task-timing.ts";
 
 export type ResourceDependency = {
@@ -76,6 +76,7 @@ type ResourceInputSource = {
 };
 type ResourceInputLookup = (target: string) => Iterable<ResourceInputSource>;
 type PreparedResource = {
+	readonly cancellation: SharedAbortScope;
 	computation?: TimelineInterval;
 	value?: unknown; readonly dispose: () => void | Promise<void>;
 	readonly resource?: string;
@@ -269,7 +270,8 @@ export class ResourceReadView {
 		return this.borrow(operation, observed, root, lookup, missing, acceptProofs);
 	}
 	/** Retain preparations only while capturing, so the sealed branch accounts for every owned byte. */
-	prepare: NonNullable<ToolFilesystemOperations["prepare"]> = (binding, key, build, consume, target) => TimelineInterval.outside(() => {
+	prepare: NonNullable<ToolFilesystemOperations["prepare"]> = (binding, key, build, consume, target, signal) => TimelineInterval.outside(() => {
+		signal?.throwIfAborted();
 		this.assertComplete();
 		let owner: ResourceReadView = this;
 		while (owner.owner) owner = owner.owner;
@@ -279,46 +281,47 @@ export class ResourceReadView {
 			const inputEpoch = owner.inputEpoch;
 			const cached = prepared.bindings.get(binding)?.get(key);
 			const compatible = (cached: PreparedResource | undefined) => cached && !cached.revoked && cached.destination.retained &&
+				(cached.retained || !cached.cancellation.signal.aborted) &&
 				cached.boundary?.root === this.boundary?.root && cached.boundary?.physicalRoot === this.boundary?.physicalRoot;
-			const inherit = (dependencies: ReadonlySet<string> | undefined) => {
-				if (!dependencies) this.dependencies = undefined;
-				else if (this.dependencies) for (const dependency of dependencies) this.dependencies.add(dependency);
-			};
-			const release = async (cached: PreparedResource) => {
-				if (--cached.borrowers || cached.retained && !cached.revoked) return;
-				if (prepared.bindings.get(binding)?.get(key) === cached) prepared.bindings.get(binding)!.delete(key);
-				await TimelineInterval.outside(() => (cached.destination.prepared?.lifetime ?? prepared.lifetime).release(cached));
-			};
-			const consumePrepared = async (cached: PreparedResource) => {
-				inherit(cached.origin === owner ? cached.dependencies : undefined);
-				const transferred = cached.proofs?.length && (!cached.retained || cached.destination !== owner);
-				if (transferred) { for (const proof of this.acceptProofs!(cached.proofs!)) this.collectProofs?.set(proof.observations, proof); }
-				const run = async () => {
-					this.assertComplete(); cached.destination.assertComplete();
-					const evaluation = await TimelineInterval.measure(() => consume(cached.value as Parameters<typeof consume>[0]));
-					TimelineInterval.own(evaluation.computation);
-					return TimelineInterval.outside(() => {
-						TimelineInterval.use(cached.computation);
-						this.assertComplete(); if (!transferred && !(this.acceptProofs && cached.origin === owner && cached.dependencies)) cached.destination.assertComplete(); return evaluation.output;
-					});
-				};
-				return cached.destination === owner ? run() : cached.destination.prepared!.lifetime.admit(run);
-			};
-			if (cached && compatible(cached)) {
+			const use = async (cached: PreparedResource, building = false) => {
 				cached.borrowers++;
+				const withdraw = cached.cancellation.acquire(signal);
 				try {
 					// A composed waiter must take its own proof references before the producer can retire.
-					if (cached.retained && cached.destination === owner ||
+					if (!building && !(cached.retained && cached.destination === owner ||
 						await Promise.race([cached.ready!.then(() => cached.shareable), cached.declined.then(() => cached.shareable),
 							...(!this.acceptProofs && cached.composed ? [cached.composed.then(() => cached.shareable && !cached.proofs?.length)] : [])]) &&
-						(!cached.proofs?.length || this.acceptProofs)) return await consumePrepared(cached);
-				} finally { await release(cached); }
+						(!cached.proofs?.length || this.acceptProofs))) return undefined;
+					if (building) await cached.ready;
+					signal?.throwIfAborted();
+					if (cached.origin !== owner || !cached.dependencies) this.dependencies = undefined;
+					else if (this.dependencies) for (const dependency of cached.dependencies) this.dependencies.add(dependency);
+					const transferred = cached.proofs?.length && (!cached.retained || cached.destination !== owner);
+					if (transferred) { for (const proof of this.acceptProofs!(cached.proofs!)) this.collectProofs?.set(proof.observations, proof); }
+					return await cached.destination.prepared!.lifetime.admit(async () => {
+						this.assertComplete(); cached.destination.assertComplete();
+						const evaluation = await TimelineInterval.measure(() => consume(cached.value as Parameters<typeof consume>[0]));
+						TimelineInterval.own(evaluation.computation);
+						return TimelineInterval.outside(() => {
+							TimelineInterval.use(cached.computation);
+							this.assertComplete(); if (!transferred && !(this.acceptProofs && cached.origin === owner && cached.dependencies)) cached.destination.assertComplete();
+							return { value: evaluation.output };
+						});
+					});
+				} finally {
+					withdraw();
+					if (!--cached.borrowers && !(cached.retained && !cached.revoked))
+						await TimelineInterval.outside(() => (cached.destination.prepared?.lifetime ?? prepared.lifetime).release(cached));
+				}
+			};
+			if (cached && compatible(cached)) {
+				const result = await use(cached); if (result) return result.value;
 			}
 			if (target) for (const source of this.lookup?.(target) ?? []) {
 				if (source.view.entries === this.entries || !source.view.retained || !source.view.sealed ||
 					!source.view.prepared?.bindings.get(binding)?.get(key)?.retained ||
 					!compatible(source.view.prepared.bindings.get(binding)?.get(key))) continue;
-				const result = await source.view.borrow(view => view.prepare(binding, key, build, consume), this.observeSource(source), this.boundary,
+				const result = await source.view.borrow(view => view.prepare(binding, key, build, consume, undefined, signal), this.observeSource(source), this.boundary,
 					undefined, undefined, this.acceptProofs);
 				this.assertComplete(); return result;
 			}
@@ -327,7 +330,7 @@ export class ResourceReadView {
 			let decline!: () => void;
 			let composed: (() => void) | undefined;
 			const name = target && filesystemPathKey(target);
-			const pending: PreparedResource = { resource: name, origin: owner, destination: owner, borrowers: 1, boundary: this.boundary,
+			const pending: PreparedResource = { resource: name, origin: owner, destination: owner, borrowers: 0, boundary: this.boundary, cancellation: new SharedAbortScope(),
 				declined: new Promise<void>(resolve => { decline = resolve; }),
 				composed: this.acceptProofs && new Promise<void>(resolve => { composed = resolve; }),
 				dispose: async () => { try { await resource?.dispose(); } finally {
@@ -337,20 +340,20 @@ export class ResourceReadView {
 				} } };
 			let entries = prepared.bindings.get(binding);
 			if (!entries) prepared.bindings.set(binding, entries = new Map());
-			if (!entries.has(key)) entries.set(key, pending);
-			pending.ready = (async () => {
-				await this.borrow(async view => {
-					const foreign = view.onForeignInputs; view.onForeignInputs = transferable => { if (transferable) composed?.(); else decline(); foreign?.(transferable); };
-					view.collectProofs = this.acceptProofs ? new Map() : undefined;
-					const evaluation = await TimelineInterval.measure(() => build(view));
-					resource = evaluation.output; pending.computation = TimelineInterval.own(evaluation.computation);
-					computationBytes += evaluation.dependencies.length * 96;
-					pending.shareable = !view.foreignInputs;
-					if (pending.shareable && view.collectProofs?.size) {
-						pending.proofs = [];
-						for (const proof of view.collectProofs.values()) pending.proofs.push(proof.manager.retain({ ...proof, view: undefined }));
-					}
-				}, observed => { pending.dependencies = observed; });
+			if (!entries.has(key) || !entries.get(key)!.retained && entries.get(key)!.cancellation.signal.aborted) entries.set(key, pending);
+			pending.ready = this.borrow(async view => {
+				const foreign = view.onForeignInputs; view.onForeignInputs = transferable => { if (transferable) composed?.(); else decline(); foreign?.(transferable); };
+				view.collectProofs = this.acceptProofs ? new Map() : undefined;
+				const evaluation = await TimelineInterval.measure(() => build(view, pending.cancellation.signal));
+				resource = evaluation.output; pending.computation = TimelineInterval.own(evaluation.computation);
+				pending.cancellation.signal.throwIfAborted();
+				computationBytes += evaluation.dependencies.length * 96;
+				pending.shareable = !view.foreignInputs;
+				if (pending.shareable && view.collectProofs?.size) {
+					pending.proofs = [];
+					for (const proof of view.collectProofs.values()) pending.proofs.push(proof.manager.retain({ ...proof, view: undefined }));
+				}
+			}, observed => { pending.dependencies = observed; }).then(async () => {
 				if (!resource) throw new Error("resource_preparation_missing");
 				pending.value = resource.value;
 				bytes = resource.bytes + computationBytes + (key.length + (name?.length ?? 0)) * 2 + 192 + [...pending.dependencies ?? []].reduce((sum, name) => sum + name.length * 2 + 64, 0);
@@ -358,6 +361,7 @@ export class ResourceReadView {
 					bytes += (key.length + entry.path.length + entry.fingerprint.length + (entry.stamp?.length ?? 0)) * 2 + 128;
 				if (!Number.isSafeInteger(resource.bytes) || resource.bytes < 0) throw new Error("resource_snapshot_budget_invalid");
 				const destination = pending.destination = owner.sealed && this.missing ? (await this.missing()).view : owner;
+				pending.cancellation.signal.throwIfAborted();
 				this.assertComplete(); destination.assertComplete();
 				const retention = destination.prepared ??= { lifetime: new RuntimeLifecycleLane(), bindings: new Map() };
 				if (inputEpoch === owner.inputEpoch && !destination.sealed && destination.bytes + bytes <= destination.maxBytes) {
@@ -368,11 +372,10 @@ export class ResourceReadView {
 					}
 				}
 				// The origin keeps a borrowed lookup; the destination owns its bytes and disposal.
-			})();
+			});
 			const settled = () => { decline(); composed?.(); };
 			void pending.ready.then(settled, settled);
-			try { await pending.ready; return await consumePrepared(pending); }
-			finally { await release(pending); }
+			return (await use(pending, true))!.value;
 		});
 	});
 	private async borrow<T>(operation: (view: ResourceReadView) => Promise<T>, observed?: (dependencies: ReadonlySet<string> | undefined) => void,

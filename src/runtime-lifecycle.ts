@@ -69,3 +69,18 @@ export class RuntimeLifecycleLane {
 		return task;
 	}
 }
+
+/** A shared operation lives while any borrower still needs it. */
+export class SharedAbortScope extends AbortController {
+	private readonly borrowers = new Set<() => void>();
+	acquire(signal?: AbortSignal): () => void {
+		const release = () => {
+			signal?.removeEventListener("abort", release);
+			if (this.borrowers.delete(release) && !this.borrowers.size) this.abort(signal?.reason);
+		};
+		this.borrowers.add(release);
+		signal?.addEventListener("abort", release, { once: true });
+		if (signal?.aborted) release();
+		return release;
+	}
+}
