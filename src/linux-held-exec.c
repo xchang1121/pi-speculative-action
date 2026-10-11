@@ -101,7 +101,7 @@ struct output_event {
 };
 
 struct process_image;
-struct file_reference { dev_t device; ino_t inode; int access, pin; };
+struct file_reference { dev_t device; ino_t inode; int access, pin, queue; };
 struct decision_job {
 	struct process_image *image;
 	pthread_t thread;
@@ -1659,8 +1659,13 @@ static void clear_references(struct decision_job *job) {
 }
 
 static int add_reference(struct decision_job *job, const struct stat *state, int flags, int pin) {
-	if (flags < 0 || job->reference_count == MAX_OBJECTS) return -1;
-	job->references[job->reference_count++] = (struct file_reference){state->st_dev, state->st_ino, (flags & O_ACCMODE) + 1, pin};
+	if (flags < 0) return -1;
+	if (pin >= 0 && S_ISSOCK(state->st_mode)) for (unsigned index = 0; index < job->reference_count; index++) {
+		const struct file_reference *entry = &job->references[index];
+		if (entry->pin >= 0 && entry->device == state->st_dev && entry->inode == state->st_ino) { close(pin); return 0; }
+	}
+	if (job->reference_count == MAX_OBJECTS) return -1;
+	job->references[job->reference_count++] = (struct file_reference){state->st_dev, state->st_ino, (flags & O_ACCMODE) + 1, pin, S_ISSOCK(state->st_mode)};
 	return 0;
 }
 
@@ -1671,27 +1676,6 @@ static int represented_queue(struct decision_job *job, dev_t device, ino_t inode
 	for (unsigned index = 0; index < count; index++)
 		if (positions[index].device == (uintmax_t)device && positions[index].inode == (uintmax_t)inode) return 1;
 	return 0;
-}
-
-/* Other queues keep their rights alive independently of the exec image's FD table.
- * Observation pins preserve exact OFD identity, never ownership. */
-static int queue_references(struct decision_job *job, pid_t pid, int fd, const struct stat *state) {
-	if (represented_queue(job, state->st_dev, state->st_ino)) return 0;
-	struct decision_job source = {.pid = pid, .pidfd = -1};
-	int pin = duplicate_tracee_fd(&source, (unsigned)fd), eof;
-	close(source.pidfd);
-	if (pin < 0) return -1;
-	unsigned char *bytes; struct queue_messages messages = {0};
-	int valid = socket_bytes(pin, &bytes, &eof, &messages, owned_pin(job->domain, pin), &job->needs_tracking) >= 0;
-	free(bytes); close(pin);
-	for (unsigned message = 0; valid && message < messages.count; message++) for (unsigned index = 0; valid && index < messages.entries[message].rights.count; index++) {
-		int reference = messages.entries[message].rights.fds[index];
-		struct stat entry;
-		if (fstat(reference, &entry) < 0 || add_reference(job, &entry, fcntl(reference, F_GETFL), reference) < 0) { valid = 0; break; }
-		messages.entries[message].rights.fds[index] = -1;
-	}
-	close_messages(&messages);
-	return valid ? 0 : -1;
 }
 
 /* References outside the exec image survive its closes. No snapshot pin is an owner. */
@@ -1706,44 +1690,66 @@ static int walk_process_list(int (*walk)(struct decision_job *, int), struct dec
 	return result;
 }
 
-/* A historical message flag requests a current queue proof, not blanket exclusion. */
+static int process_descriptors(struct traced_process *process, int tracked, int *fds) {
+	if (!tracked) return descriptor_numbers(process->pid, fds, MAX_HANDLES);
+	if (!process->table || !process->table->complete || process->table->active) return -1;
+	for (unsigned index = 0; index < process->table->count; index++) fds[index] = process->table->entries[index].fd;
+	return (int)process->table->count;
+}
+
+/* Discover every rooted queue before testing historical objects for lost ownership.
+ * Observation pins preserve identity and reachability, never a new resource owner. */
 static int queue_owners_locked(struct decision_job *job) {
 	struct descriptor_domain *domain = job->domain;
 	if (job->reference_state) return job->reference_state > 0 ? 0 : -1;
 	job->reference_state = -1;
 	job->references = calloc(MAX_OBJECTS, sizeof(*job->references));
 	if (!job->references) return -1;
-	if (!domain->enabled) {
-		/* Discovery snapshots the stopped tree; adoption independently proves its ancestry. */
-		for (struct traced_process *process = *domain->processes; process; process = process->next) {
-			if (process == job->process || process->historical) continue;
-			int fds[MAX_HANDLES], count = descriptor_numbers(process->pid, fds, MAX_HANDLES);
-			if (count < 0) return -1;
-			for (int index = 0; index < count; index++) {
-				char name[64]; struct stat state;
+	for (struct traced_process *process = *domain->processes; process; process = process->next) {
+		if (process->historical || (!domain->enabled && process == job->process)) continue;
+		int fds[MAX_HANDLES], count = process_descriptors(process, domain->enabled, fds);
+		if (count < 0) return -1;
+		for (int index = 0; index < count; index++) {
+			struct stat state;
+			if (domain->enabled) {
+				struct resource_object *object = origin_object(domain, process->table->entries[index]);
+				if (!object || !object->messages) continue;
+				state = (struct stat){.st_dev = object->device, .st_ino = object->inode, .st_mode = S_IFSOCK};
+			} else {
+				char name[64];
 				snprintf(name, sizeof(name), "/proc/%ld/fd/%d", (long)process->pid, fds[index]);
 				if (stat(name, &state) < 0) return -1;
 				if (!S_ISFIFO(state.st_mode) && !S_ISSOCK(state.st_mode)) continue;
 				if (add_reference(job, &state, descriptor_flags(process->pid, fds[index]), -1) < 0) return -1;
-				if (S_ISSOCK(state.st_mode) && queue_references(job, process->pid, fds[index], &state) < 0) return -1;
 			}
+			if (!S_ISSOCK(state.st_mode) || represented_queue(job, state.st_dev, state.st_ino)) continue;
+			struct decision_job source = {.pid = process->pid, .pidfd = -1};
+			int pin = duplicate_tracee_fd(&source, (unsigned)fds[index]); close(source.pidfd);
+			if (pin < 0) return -1;
+			if (add_reference(job, &state, fcntl(pin, F_GETFL), pin) < 0) { close(pin); return -1; }
 		}
-	} else for (unsigned index = 0; index < domain->object_count; index++) {
+	}
+	for (unsigned cursor = 0; cursor < job->reference_count; cursor++) {
+		struct file_reference source = job->references[cursor];
+		if (source.pin < 0 || !source.queue || represented_queue(job, source.device, source.inode)) continue;
+		unsigned char *bytes; int eof; struct queue_messages messages = {0};
+		int valid = socket_bytes(source.pin, &bytes, &eof, &messages, owned_pin(domain, source.pin), &job->needs_tracking) >= 0;
+		free(bytes);
+		for (unsigned message = 0; valid && message < messages.count; message++) for (unsigned index = 0; valid && index < messages.entries[message].rights.count; index++) {
+			int reference = messages.entries[message].rights.fds[index]; struct stat state;
+			if (fstat(reference, &state) < 0 || add_reference(job, &state, fcntl(reference, F_GETFL), reference) < 0) { valid = 0; break; }
+			messages.entries[message].rights.fds[index] = -1;
+		}
+		close_messages(&messages); if (!valid) return -1;
+	}
+	for (unsigned index = 0; domain->enabled && index < domain->object_count; index++) {
 		const struct resource_object *queue = &domain->objects[index];
-		if (!queue->messages) continue;
-		int found = represented_queue(job, queue->device, queue->inode);
-		for (struct traced_process *process = *domain->processes; !found && process; process = process->next) {
-			if (process->historical || !process->table) continue;
-			if (!process->table->complete || process->table->active) return -1;
-			for (unsigned entry = 0; !found && entry < process->table->count; entry++) if (process->table->entries[entry].object == index + 1) {
-				struct stat state = {.st_dev = queue->device, .st_ino = queue->inode};
-				if (queue_references(job, process->pid, process->table->entries[entry].fd, &state) < 0) return -1;
-				found = 1;
-			}
-		}
+		if (!queue->messages || represented_queue(job, queue->device, queue->inode)) continue;
+		unsigned reference = 0;
+		while (reference < job->reference_count && (job->references[reference].device != queue->device || job->references[reference].inode != queue->inode)) reference++;
 		/* Unrooted cyclic queues still own their rights until the kernel destroys them. */
 		struct socket_state state;
-		if (!found && socket_state(queue->inode, &state) != 1) return -1;
+		if (reference == job->reference_count && socket_state(queue->inode, &state) != 1) return -1;
 	}
 	job->reference_state = 1;
 	return 0;
@@ -1759,17 +1765,12 @@ static int outside_references_locked(struct decision_job *job, int pin) {
 	unsigned object = domain->enabled ? (unsigned)(pin_object(domain, pin) - domain->objects) + 1 : 0;
 	for (struct traced_process *process = *domain->processes; (description || domain->enabled) && process; process = process->next) {
 		if (process == job->process || process->historical) continue;
-		int fds[MAX_HANDLES], count;
-		if (domain->enabled) {
-			if (!process->table || !process->table->complete || process->table->active) return unknown;
-			count = (int)process->table->count;
-		} else count = descriptor_numbers(process->pid, fds, MAX_HANDLES);
+		int fds[MAX_HANDLES], count = process_descriptors(process, domain->enabled, fds);
 		if (count < 0) return unknown;
 		for (int index = 0; index < count; index++) {
 			if (domain->enabled && process->table->entries[index].object != object) continue;
 			if (!description) { access |= process->table->entries[index].access; continue; }
-			int fd = domain->enabled ? process->table->entries[index].fd : fds[index];
-			long same = syscall(SYS_kcmp, process->pid, getpid(), KCMP_FILE, fd, pin);
+			long same = syscall(SYS_kcmp, process->pid, getpid(), KCMP_FILE, fds[index], pin);
 			if (same < 0) return -1;
 			if (!same) return 1;
 		}

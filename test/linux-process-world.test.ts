@@ -38,7 +38,7 @@ vi.mock("node:child_process", { spy: true });
 vi.mock("node:fs/promises", { spy: true });
 const nativeTest = process.arch === "x64" ? test : test.skip;
 
-const rightsHelpers = `${cHeaders("fcntl.h sys/socket.h string.h")}
+const rightsHelpers = `${cHeaders("fcntl.h sys/socket.h string.h unistd.h")}
 static inline int pass(int fd, const char *text, int length, const int *rights, int count, int flags) {
 	char control[CMSG_SPACE(8 * sizeof(int))] = {0}; struct iovec vector = {(void *)text, (size_t)length};
 	struct mmsghdr message = {.msg_hdr = {.msg_iov = &vector, .msg_iovlen = 1, .msg_control = control, .msg_controllen = CMSG_SPACE((size_t)count * sizeof(int))}};
@@ -55,6 +55,11 @@ static inline int take(int fd, char expected, int *rights, int count, int peek, 
 	memcpy(rights, CMSG_DATA(header), (size_t)count * sizeof(int));
 	for (int index = 0; index < count; index++) if (fcntl(rights[index], F_GETFD) != FD_CLOEXEC) return 1;
 	return 0;
+}
+static inline int wrap_queue(int reference, int cycle) {
+	int pair[2]; if (reference < 0 || socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair)) return -1;
+	int rights[2] = {reference, pair[1]}, failed = pass(pair[0], "x", 1, rights, cycle ? 2 : 1, 0);
+	close(reference); close(pair[0]); if (failed) { close(pair[1]); return -1; } return pair[1];
 }`;
 
 function patternProcessHost(fixture: LinuxProcessBenchmark, sessionID: string, settings: SpeculativeAgentSettingsInput,
@@ -408,7 +413,7 @@ nativeTest.for([false, true])("prepares a failed command after its reported inpu
 		} finally { await host?.dispose(); await fixture.dispose(); }
 	});
 
-nativeTest.for(["sample", "file", "dup", "threads", "limit", "metadata", "identity", "pipe", "socket", "eventfd", "pipe:unavailable", "socket:unavailable", "eventfd:unavailable", "eventfd:unavailable:destroyed", "eventfd::inherited"])("adopts a closed-input calculation through capture or completion (%s)", { timeout: 30_000 }, async (scenario, { benchmark }) => {
+nativeTest.for(["sample", "file", "dup", "threads", "limit", "metadata", "identity", "pipe", "socket", "eventfd", "pipe:unavailable", "socket:unavailable", "eventfd:unavailable", "eventfd:unavailable:destroyed", "eventfd::inherited", "eventfd:unavailable:external", "eventfd::external"])("adopts a closed-input calculation through capture or completion (%s)", { timeout: 30_000 }, async (scenario, { benchmark }) => {
 		const [mode, unavailable, queue] = scenario.split(":"), fixture = await benchmark("pi-prefix-process-", "git", { processImages: unavailable ? false : undefined });
 		const descendant = mode === "pipe" || mode === "socket" || mode === "eventfd", complete = descendant || mode === "identity";
 		await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker", arguments: ["-pthread"], code: `#define _GNU_SOURCE
@@ -432,9 +437,14 @@ int main(void) {
 }
 ` });
 		if (descendant) await compileBenchmarkHelper(fixture.workspace, { source: "launch.c", output: "launch", code: `#define _GNU_SOURCE
-${cHeaders("unistd.h sys/socket.h sys/eventfd.h")}
+${cHeaders("sys/eventfd.h sys/wait.h")}
+${rightsHelpers}
 int main(void) { int fds[2]; if (${mode === "eventfd" ? "(fds[0] = eventfd(0, 0)) < 0 || (fds[1] = dup(fds[0])) < 0" : mode === "socket" ? "socketpair(AF_UNIX, SOCK_STREAM, 0, fds)" : "pipe(fds)"} || fds[0] != 3 || fds[1] != 4) return 61;
- ${queue ? 'int queues[2]; struct iovec bytes = {.iov_base = "x", .iov_len = 1}; struct msghdr message = {.msg_iov = &bytes, .msg_iovlen = 1}; if (socketpair(AF_UNIX, SOCK_STREAM, 0, queues) || sendmsg(queues[0], &message, 0) != 1) return 63;' : ""}
+ ${queue && queue !== "external" ? 'int queues[2]; struct iovec bytes = {.iov_base = "x", .iov_len = 1}; struct msghdr message = {.msg_iov = &bytes, .msg_iovlen = 1}; if (socketpair(AF_UNIX, SOCK_STREAM, 0, queues) || sendmsg(queues[0], &message, 0) != 1) return 63;' : ""}
+ ${queue === "external" ? `int gate[2]; char byte; if (wrap_queue(wrap_queue(eventfd(5, EFD_CLOEXEC), 0), 0) < 0 || pipe2(gate, O_CLOEXEC)) return 64;
+ pid_t child = fork(); if (child < 0) return 65;
+ if (child) { close(3); close(4); close(gate[0]); if (write(gate[1], "x", 1) != 1) return 66; close(gate[1]); int status; return waitpid(child, &status, 0) != child || status; }
+ close(gate[1]); if (read(gate[0], &byte, 1) != 1) return 66; close(gate[0]);` : ""}
  close_range(${queue === "inherited" ? 7 : 5}, ~0U, 0); execlp("worker", "worker", NULL); return 62; }
 ` });
 		await commitBenchmarkFixture(fixture.workspace, "Closed input prefix");
@@ -889,8 +899,7 @@ int main(int argc, char **argv) {
 	int rights[] = {9, 9, counter, queue[0], queue[1], channel[0], 3};
 	if (pass(channel[0], "C", 1, &channel[0], 1, 0) || pass(channel[1], "D", 1, &channel[1], 1, 0) ||
 		pass(fds[1], "qbcaXYZ", 7, rights, 7, 0) || pass(fds[1], "T", 1, rights, 1, 0)) return 199;
-	close(counter); close(queue[0]); close(queue[1]); close(channel[0]); close(channel[1]);
-	(void)take;` : ""}
+	close(counter); close(queue[0]); close(queue[1]); close(channel[0]); close(channel[1]);` : ""}
 	${prequeued && !orphan ? 'int passed[2] = {' + (queueCounter ? '20' : '9') + ', 3}; char control[CMSG_SPACE(sizeof(passed))] = {0}; struct iovec vector = {"qbcaXYZ", 7}; struct msghdr message = {.msg_iov = &vector, .msg_iovlen = 1, .msg_control = control, .msg_controllen = sizeof(control)}; struct cmsghdr *header = CMSG_FIRSTHDR(&message); header->cmsg_level = SOL_SOCKET; header->cmsg_type = SCM_RIGHTS; header->cmsg_len = CMSG_LEN(sizeof(passed)); memcpy(CMSG_DATA(header), passed, sizeof(passed)); ' + (segmented ? 'vector.iov_base = "qI"; vector.iov_len = 2; if (write(fds[1], "L", 1) != 1 || sendmsg(fds[1], &message, 0) != 2) return 185; vector.iov_len = 1; vector.iov_base = "t"; if (sendmsg(fds[1], &message, 0) != 1 || write(fds[1], "bcaXYZ", 6) != 6) return 186;' : (prefixed ? 'if (write(fds[1], "L", 1) != 1) return 186; ' : '') + 'if (sendmsg(fds[1], &message, 0) != 7) return 157;') : ""}
 	${duplex ? 'if (dup2(fds[1], 14) < 0 || write(0, "peer", 4) != 4) return 100;' : ""}
 	${orphan ? 'if (close(9)) return 188;' : ""}
@@ -899,18 +908,15 @@ int main(int argc, char **argv) {
 	${lifetime || exporting ? 'int gate[2]; if (pipe2(gate, O_CLOEXEC)) return 109;' : ""}
 	puts(argv[1]); fflush(stdout);
 	${enumerate ? 'int anchor = open(".", O_PATH | O_DIRECTORY); if (anchor < 0 || dup2(anchor, 6) < 0) return 175; if (anchor != 6) close(anchor); char entries[24]; int independent = open(".", O_RDONLY | O_DIRECTORY); if (independent < 0 || dup2(independent, 13) < 0 || syscall(SYS_getdents64, 10, entries, sizeof(entries)) != 24) return 168; if (independent != 13) close(independent); char captured[39]; for (int index = 0; index < 19; index++) snprintf(captured + 2 * index, 3, "%02x", (unsigned char)entries[index]); if (setenv("BOUND_DIRECTORY_ENTRY", captured, 1)) return 178; pid_t reader = fork(); if (reader < 0) return 169; if (reader) { int waited; if (waitpid(reader, &waited, 0) != reader || waited || lseek(10, 0, SEEK_CUR) <= 9007199254740991LL || lseek(11, 0, SEEK_CUR) != lseek(10, 0, SEEK_CUR) || lseek(13, 0, SEEK_CUR) <= 0 || lseek(13, 0, SEEK_CUR) == lseek(10, 0, SEEK_CUR)) return 170; return 0; }' : ""}
-	${mode === "native-pipe-live-transfer" ? `int sockets[2], passed[] = {0, 3, 4, 8}; char byte = 'x', control[CMSG_SPACE(sizeof(passed))] = {0};
-	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets)) return 89;
-	struct iovec vector = {&byte, 1}; struct msghdr message = {.msg_iov = &vector, .msg_iovlen = 1, .msg_control = control, .msg_controllen = sizeof(control)};
-	struct cmsghdr *header = CMSG_FIRSTHDR(&message); header->cmsg_level = SOL_SOCKET; header->cmsg_type = SCM_RIGHTS; header->cmsg_len = CMSG_LEN(sizeof(passed));
-	memcpy(CMSG_DATA(header), passed, sizeof(passed)); if (sendmsg(sockets[0], &message, 0) != 1) return 90; close(sockets[0]);` : ""}
+	${mode === "native-pipe-live-transfer" ? `int sockets[2], passed[] = {0, 3, 4, 8};
+	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) || pass(sockets[0], "x", 1, passed, 4, 0)) return 89;
+	close(sockets[0]);` : ""}
 	${counter ? 'pid_t child = fork(); if (child < 0) return 150; if (child) { int status; if (waitpid(child, &status, 0) != child || status) return 151; uint64_t count, total = 0; while (read(21, &count, 8) == 8) total += count; if (errno != EAGAIN || total != ' + (semaphore ? 11 : 7) + ' || !(fcntl(20, F_GETFL) & O_NONBLOCK) || read(22, &count, 8) != -1 || errno != EAGAIN) return 152; return 0; }' : ""}
 	${pipe || socket ? 'pid_t child = fork(); if (child < 0) return 84; ' + (exporting ? 'if (child) { close(0); close(3); close(4); close(8); close(gate[0]); if (write(gate[1], "x", 1) != 1) return 133; close(gate[1]); int status; if (waitpid(child, &status, 0) != child || status) return 134; char text[6], control[CMSG_SPACE(sizeof(int))] = {0}; struct iovec vector = {text, 5}; struct msghdr message = {.msg_iov = &vector, .msg_iovlen = 1, .msg_control = control, .msg_controllen = sizeof(control)}; if (recvmsg(14, &message, MSG_CMSG_CLOEXEC) != 5 || memcmp(text, "peerx", 5)) return 135; int received; memcpy(&received, CMSG_DATA(CMSG_FIRSTHDR(&message)), sizeof(received)); if (!(fcntl(received, F_GETFL) & O_NONBLOCK) || read(received, text, 6) != 6 || memcmp(text, "bcaXYZ", 6)) return 136; close(received); ' + (queueCounter ? 'uint64_t count; if (read(20, &count, 8) != 8 || count != 7) return 161; ' : '') + 'return 0; } ' : '') + (lifetime ? 'if (child) { close(0); close(3); close(4); close(8); close(14); close(fds[1]); close(gate[0]); if (write(gate[1], "x", 1) != 1) return 110; close(gate[1]); int status; return waitpid(child, &status, 0) != child || status; } ' : '') + 'if (child) { int status; char tail[3]; if (waitpid(child, &status, 0) != child || status || ' + (mixed ? 'lseek(16, 0, SEEK_CUR) != 4 || lseek(18, 0, SEEK_CUR) != 0 || pread(18, tail, 1, 2) != 1 || tail[0] != 81 || !(fcntl(3, F_GETFL) & O_NONBLOCK) || !(fcntl(4, F_GETFL) & O_NONBLOCK) || (fcntl(8, F_GETFL) & O_NONBLOCK) || ' : '') + 'read(3, tail, 1) != 1 || read(4, tail + 1, 1) != 1 || read(8, tail + 2, 1) != 1 || tail[0] != \'X\' || tail[1] != \'Y\' || tail[2] != \'Z\') return 85; ' + (orphan ? 'int remaining; if (take(3, 84, &remaining, 1, 0, 0) || lseek(remaining, 0, SEEK_CUR) != 2 || !(fcntl(remaining, F_GETFL) & O_NONBLOCK)) return 200; close(remaining); ' : '') + (socket || pipeOutput ? 'char reply[6]; ' + (shortWrite ? 'char head[4091]; if (read(15, head, sizeof(head)) != sizeof(head)) return 122; for (unsigned index = 0; index < sizeof(head); index++) if (head[index] != 90) return 123; ' : '') + (transferIO ? 'if (read(15, reply, 6) != 6 || memcmp(reply, "bcabca", 6)) return 131; ' : '') + (queuedOutput ? 'if (read(15, reply, 5) != 5 || memcmp(reply, "start", 5)) return 113; ' : '') + (duplex ? 'if (read(0, reply, 4) != 4 || memcmp(reply, "back", 4) || read(0, reply, 1) != 0) return 102; ' : 'if (read(' + (socket ? 'fds[1]' : '15') + ', reply, 5) != 5 || memcmp(reply, "' + (shortWrite ? 'ZZZZZ' : 'reply') + '", 5)) return 98; ') + (socket ? 'if (read(fds[1], reply, 1) != 0) return 99; ' : '') : '') + 'return 0; }' : ""}
 	${lifetime || exporting ? 'char ready; close(gate[1]); if (read(gate[0], &ready, 1) != 1) return 111; close(gate[0]);' : ""}
 	${exporting ? 'close(14);' : ""}
 	${mode === "native-pipe-live-transfer" ? `for (unsigned index = 0; index < 4; index++) close(passed[index]);
-	if (recvmsg(sockets[1], &message, MSG_CMSG_CLOEXEC) != 1) return 91;
-	int received[4], saved[4]; memcpy(received, CMSG_DATA(CMSG_FIRSTHDR(&message)), sizeof(received));
+	int received[4], saved[4]; if (take(sockets[1], 'x', received, 4, 0, 0)) return 91;
 	for (unsigned index = 0; index < 4; index++) { saved[index] = fcntl(received[index], F_DUPFD_CLOEXEC, 100); if (saved[index] < 0) return 92; close(received[index]); }
 	for (unsigned index = 0; index < 4; index++) { if (dup2(saved[index], passed[index]) < 0) return 93; close(saved[index]); }
 	close(sockets[1]);` : ""}
@@ -1147,7 +1153,7 @@ int main(void) {
 		});
 	});
 
-nativeTest.for((["git", "overlayfs"] as const).flatMap(driver => ["read", "write", "locks", "locks-close", "locks-close-queues", "locks-named", "path-write", "unlinked", "hardlink-read", "hardlink-write", "hardlink-path-write", "hardlink-rename", "hardlink-split", "hardlink-unlink", "hardlink-detached"].map(mode => [driver, mode] as const)))("learns and adopts regular OFDs with shared positions and predecessor inputs (%s, %s)", { timeout: 30_000 }, async ([driver, mode], { skip, benchmark }) => {
+nativeTest.for((["git", "overlayfs"] as const).flatMap(driver => ["read", "write", "locks", "locks-close", "locks-close-queues", "locks-close-nested", "locks-named", "path-write", "unlinked", "hardlink-read", "hardlink-write", "hardlink-path-write", "hardlink-rename", "hardlink-split", "hardlink-unlink", "hardlink-detached"].map(mode => [driver, mode] as const)))("learns and adopts regular OFDs with shared positions and predecessor inputs (%s, %s)", { timeout: 30_000 }, async ([driver, mode], { skip, benchmark }) => {
 		if (mode === "locks-named" && await filesystem.readlink("/proc/self/ns/pid") === "pid:[4026531836]") return skip("nested PID namespace visibility case");
 		const fixture = await benchmark("pi-fd-binding-", driver);
 		const hardlink = mode.startsWith("hardlink"), pathWrite = mode.endsWith("path-write"), locks = mode.startsWith("locks");
@@ -1197,12 +1203,14 @@ int main(void) {
 		const body = `IFS= read -r -N 1 discard <&3; IFS= read -r -N 1 discard <&8; locker init; printf '%s\\n' "$1"; worker; IFS= read -r -N 1 a <&4; IFS= read -r -N 1 b <&8; printf 'tail:%s:%s\\n' "$a" "$b"; locker check`;
 		if (memory) {
 			await compileBenchmarkHelper(fixture.workspace, { source: "fd-memory.c", output: "fd-memory", code: lockHelpers + `
-${cHeaders("sys/mman.h sys/wait.h sys/socket.h stdio.h unistd.h fcntl.h")}
+${cHeaders("sys/mman.h sys/wait.h stdio.h")}
+${rightsHelpers}
 int main(int argc,char **argv) {
 	char bytes[6];int input=open("input.txt",O_RDONLY);if(argc!=2 || input<0 || read(input,bytes,6)!=6)return 80;close(input);
 	${mode === "locks-close-queues" ? 'int queues[2]; struct iovec vector = {bytes, 1}; struct msghdr message = {.msg_iov = &vector, .msg_iovlen = 1}; if (socketpair(AF_UNIX, SOCK_STREAM, 0, queues) || sendmsg(queues[0], &message, 0) != 1 || close(queues[0]) || close(queues[1])) return 88;' : ""}
 	int fd=memfd_create("lock-input",0);if(fd<0 || write(fd,bytes,6)!=6 || lseek(fd,0,SEEK_SET)!=0 || dup2(fd,3)<0)return 81;
 	if(fd!=3)close(fd);if(dup2(3,4)<0)return 82;fd=open("/proc/self/fd/3",O_RDWR);if(fd<0 || dup2(fd,8)<0)return 83;if(fd!=8)close(fd);
+	${mode === "locks-close-nested" ? 'if (wrap_queue(wrap_queue(memfd_create("unrelated", MFD_CLOEXEC), 0), 0) < 0) return 88;' : ""}
 	${closing ? `int gate[2];char byte;if(pipe2(gate,O_CLOEXEC) || lseek(3,1,SEEK_SET)!=1 || lseek(8,1,SEEK_SET)!=1 || lock(3,F_WRLCK,2,4) || flock(3,LOCK_SH|LOCK_NB))return 84;
 	puts(argv[1]);fflush(stdout);pid_t child=fork();if(child<0)return 85;
 	if(!child){close(gate[1]);if(read(gate[0],&byte,1)!=1)_exit(86);close(gate[0]);execl("./worker","worker",(char *)0);_exit(86);}
@@ -1626,9 +1634,11 @@ int main(int argc, char **argv) {
 		int sockets[2], fd = 3;
 		if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sockets) < 0 || pass(sockets[0], "x", 1, &fd, 1, 0)) return 74;
 		close(sockets[0]); close(sockets[1]);
-	} else if (!strcmp(argv[1], "thread") || !strcmp(argv[1], "thread-exec")) {
+	} else if (!strncmp(argv[1], "thread", 6)) {
 		pthread_t worker;
-		if (pthread_create(&worker, 0, thread, !strcmp(argv[1], "thread-exec") ? argv : 0) || pthread_join(worker, 0)) return 77;
+		if (pthread_create(&worker, 0, thread, strcmp(argv[1], "thread") ? argv : 0)) return 77;
+		if (!strcmp(argv[1], "thread-exit")) pthread_exit(0);
+		if (pthread_join(worker, 0)) return 77;
 	} else if (!strcmp(argv[1], "shared-table") || !strcmp(argv[1], "shared-exec")) {
 		char *stack = malloc(65536); int status;
 		pid_t child = stack ? clone(!strcmp(argv[1], "shared-exec") ? shared_exec : aliases, stack + 65536, CLONE_FILES | SIGCHLD, 0) : -1;
@@ -1712,7 +1722,6 @@ int main(int argc, char **argv) {
 			} });
 			expect(await piped.execute(`exec 3<'${input}'; /bin/true | /usr/bin/wc -c; IFS= read -r -N 1 byte <&3; printf '%s' "$byte"`)).toEqual({ exitCode: 0 });
 			expect(piped.output).toBe("1048576\nb");
-			const pipeProbe = path.join(root, "pipe-probe");
 			await compileBenchmarkHelper(root, { source: "pipe-probe.c", output: "pipe-probe", arguments: ["-Werror"], code: `#define _GNU_SOURCE
 ${cHeaders("fcntl.h string.h sys/wait.h unistd.h")}
 int main(int argc, char **argv) {
@@ -1755,7 +1764,7 @@ int main(int argc, char **argv) {
 						...(journal ? { resourceEvents: [{ fd: 3, kind: "peek" as const, data: Buffer.from("abc") }, { fd: 0, kind: mode === "journal-write-readonly" ? "produce" as const : mode === "journal-shutdown-pipe" ? "shutdown" as const : "consume" as const, data: Buffer.from("ab") },
 							{ fd: 8, kind: "consume" as const, data: Buffer.from(mode === "journal-conflict" ? "x" : "c") }] } : {}) };
 				} });
-				const running = executor.execute(`'${pipeProbe}' ${mode}`);
+				const running = executor.execute(`'./pipe-probe' ${mode}`);
 				if (failedCommit) await expect(running).rejects.toMatchObject({ disposition: "poisoned" });
 				else {
 					expect(await running, mode).toEqual({ exitCode: 0 });
@@ -1827,10 +1836,10 @@ int main(int argc, char **argv) {
 	close(fd);
 	if (type == 'f' && local && flock(20, LOCK_EX | LOCK_NB)) return 72;
 	if (state) {
-		int reference = state == 2 ? (type == 'c' ? eventfd(5, EFD_CLOEXEC) : open("/proc/self/fd/20", O_RDWR | O_CLOEXEC)) : 20;
-		if (state == 7) { int nested[2]; if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, nested) || pass(nested[0], "x", 1, &reference, 1, 0)) return 73; close(nested[0]); reference = nested[1]; }
+		int reference = state == 2 || state >= 9 ? (type == 'c' ? eventfd(5, EFD_CLOEXEC) : open("/proc/self/fd/20", O_RDWR | O_CLOEXEC)) : 20;
+		if (state >= 7) reference = wrap_queue(state >= 9 ? reference : dup(reference), state == 10);
 		if (reference < 0 || socketpair(AF_UNIX, SOCK_STREAM | (local || state == 7 ? 0 : SOCK_CLOEXEC), 0, channel) || pass(channel[0], "x", 1, &reference, 1, 0)) return 73;
-		if (state == 2 || state == 7) close(reference);
+		if (state == 2 || state >= 7) close(reference);
 		if (state == 6) { if (take(channel[1], 'x', &reference, 1, 0, 0)) return 74; close(reference); }
 	}
 	if (pipe2(gate, O_CLOEXEC)) return 75;
@@ -1839,19 +1848,20 @@ int main(int argc, char **argv) {
 	if (state) { close(20); close(21); } if (local) { close(channel[0]); close(channel[1]); }
 	close(gate[0]); if (write(gate[1], "x", 1) != 1) return 77; close(gate[1]);
 	int status; if (waitpid(child, &status, 0) != child || status) return 78;
-	if (type == 's') { struct pollfd ready = {.fd = data[1], .events = POLLIN | POLLRDHUP}; if (poll(&ready, 1, 0) < 0 || (state == 1 && ready.revents)) return 79; }
+	if (type == 's') { struct pollfd ready = {.fd = data[1], .events = POLLIN | POLLRDHUP}; if (poll(&ready, 1, 0) < 0 || ((state == 1 || state >= 7) && ready.revents)) return 79; }
 	if (state && !local && state != 6) { if (take(channel[1], 'x', &fd, 1, 0, 0)) return 80; } else fd = 20;
-	if (state == 7) { int nested = fd; if (take(nested, 'x', &fd, 1, 0, 0)) return 80; close(nested); }
-	if (type == 's') { if (state == 1) close(fd); return read(data[1], &byte, 1) != 0; }
+	if (state >= 7) { int nested = fd, rights[2]; if (take(nested, 'x', rights, state == 10 ? 2 : 1, 0, 0)) return 80; close(nested); fd = rights[0]; if (state == 10) close(rights[1]); }
+	if (type == 's') { if (state != 6) close(fd); struct pollfd ready = {.fd = data[1], .events = POLLIN | POLLRDHUP}; return poll(&ready, 1, 0) != 1 || read(data[1], &byte, 1) != 0; }
 	if (local) value = 0; else if (type == 'f') value = lseek(fd, 0, SEEK_CUR); else if (read(fd, &value, 8) != 8) return 81;
 	printf("%llu", (unsigned long long)value); return 0;
 }
 ` });
 			for (const scenario of ["counter", "value", "identity", "alias", "overflow", "release", "commit-failure",
-				"counter:queued", "counter:other", "counter:local", "counter:partial", "counter:drained", "counter:nested", "file:queued", "file:other", "file:local", "file:partial", "file:drained", "file:nested", "socket:queued", "socket:consumed"]) {
+				"counter:queued", "counter:other", "counter:local", "counter:partial", "counter:drained", "counter:nested", "counter:external-nested", "counter:external-other", "counter:external-cycle", "file:queued", "file:other", "file:local", "file:partial", "file:drained", "file:nested", "file:external-nested", "file:external-other", "file:external-cycle", "socket:queued", "socket:consumed", "socket:external-nested"]) {
 				const [mode, queue] = scenario.split(":"), type = mode === "file" ? "file" : mode === "socket" ? "socket" : "counter";
-				const state = [undefined, "queued", "other", "local", "partial", "drained", "consumed", "nested"].indexOf(queue), local = state >= 3 && state <= 5;
-				const accepted = ["counter", "counter:other", "counter:drained", "file:queued", "file:other", "file:drained", "file:nested"].includes(scenario), outside: number[] = [];
+				const state = [undefined, "queued", "other", "local", "partial", "drained", "consumed", "nested", "external-nested", "external-other", "external-cycle"].indexOf(queue), local = state >= 3 && state <= 5;
+				const accepted = ["counter", "counter:other", "counter:drained", "counter:external-other", "counter:external-cycle", "file:queued", "file:other", "file:drained", "file:nested", "file:external-nested", "file:external-other", "file:external-cycle"].includes(scenario), outside: number[] = [];
+				const external = !queue || ["queued", "nested", "external-nested"].includes(queue);
 				const commit = vi.fn(async () => { if (mode === "commit-failure") throw new Error("counter commit failure"); });
 				const executor = held({ descriptors: true, decide: async process => {
 					if (await filesystem.readlink(`/proc/${process.pid}/exe`) !== "/usr/bin/true") return { kind: "continue" };
@@ -1870,8 +1880,7 @@ int main(int argc, char **argv) {
 				} });
 				const running = executor.execute(`exec './queue-owners' ${type} ${state}`);
 				if (mode === "commit-failure") await expect(running).rejects.toMatchObject({ disposition: "poisoned" });
-				else { expect(await running, scenario).toEqual({ exitCode: 0 }); expect(executor.output, scenario).toBe(type === "socket" ? "" : local ? "0" : type === "file" ? queue === "queued" || queue === "nested" ? "1" : "0" : !queue && accepted ? "7" : "5"); }
-				const external = !queue || queue === "queued" || queue === "nested";
+				else { expect(await running, scenario).toEqual({ exitCode: 0 }); expect(executor.output, scenario).toBe(type === "socket" ? "" : local ? "0" : type === "file" ? external ? "1" : "0" : !queue && accepted ? "7" : "5"); }
 				expect(outside, scenario).toEqual([external ? 3 : 0, external ? 3 : 0]);
 				expect(commit, scenario).toHaveBeenCalledTimes(Number(accepted || mode === "commit-failure"));
 			}
@@ -1955,20 +1964,7 @@ int main(int argc, char **argv) {
 					}
 				} finally { waiting.resolve(); await Promise.allSettled([siblings]); }
 			}
-			const threaded = path.join(root, "thread-exec");
-			await compileBenchmarkHelper(root, { source: "thread-exec.c", output: "thread-exec", arguments: ["-pthread", "-Werror"], code: `${cHeaders("pthread.h unistd.h")}
-static void *replace(void *unused) {
-	(void)unused;
-	execl("/bin/true", "true", (char *)0);
-	_exit(127);
-}
-int main(void) {
-	pthread_t worker;
-	if (pthread_create(&worker, 0, replace, 0)) return 70;
-	pthread_exit(0);
-}
-` });
-			for (const command of ["exec /bin/sh -c 'exec /bin/true'", `exec ${threaded}`]) {
+			for (const command of ["exec /bin/sh -c 'exec /bin/true'", `exec 3<'${input}'; exec '${descriptorProbe}' thread-exit '${input}'`]) {
 				const visited: string[] = [], completed: string[] = [];
 				const chained = held({ decide: async ({ pid }) => {
 					const image = `${pid}:${await filesystem.readlink(`/proc/${pid}/exe`)}`;
