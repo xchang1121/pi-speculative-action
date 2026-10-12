@@ -10,6 +10,7 @@ import { containsFilesystemPath, filesystemPathKey, relativeFilesystemPath } fro
 import type { ToolFilesystemOperations, ToolFilesystemStat } from "./tool-settlement.ts";
 import { RuntimeLifecycleLane, SharedAbortScope } from "./runtime-lifecycle.ts";
 import { TimelineInterval } from "./task-timing.ts";
+import type { ValidationMetrics } from "./settlement.ts";
 
 export type ResourceDependency = {
 	readonly path: string;
@@ -27,11 +28,7 @@ export type ResourceInput = Uint8Array | { readonly content: Uint8Array; readonl
 
 const inputContent = (input: ResourceInput | undefined) => input instanceof Uint8Array ? input : input && "content" in input ? input.content : undefined;
 
-export type ResourceValidationMetrics = {
-	readonly bytesRead: number;
-	readonly filesRead: number;
-	readonly mode: "watcher" | "exact";
-};
+export type ResourceValidationMetrics = ValidationMetrics;
 
 export type ResourceVersionValidation = ResourceValidationMetrics & {
 	readonly expired: boolean;
@@ -261,10 +258,7 @@ export class ResourceReadView {
 		this.entries.set(key, { ...entry, ...(entry.type === "file" ? { content: capture.content } : { entries: capture.entries }), object: capture.object, computation: capture.computation });
 		return true;
 	}
-	access = async (target: string): Promise<void> => {
-		const entry = await this.get(target, "content");
-		if (entry.type !== "file" || entry.content === undefined) this.unproven(target);
-	};
+	access = async (target: string): Promise<void> => { await this.readFile(target, 0); };
 	/** Retain preparations only while capturing, so the sealed branch accounts for every owned byte. */
 	prepare: NonNullable<ToolFilesystemOperations["prepare"]> = (binding, key, build, consume, target, signal) => TimelineInterval.outside(() => {
 		signal?.throwIfAborted();
@@ -312,9 +306,8 @@ export class ResourceReadView {
 						await TimelineInterval.outside(() => (cached.destination.prepared?.lifetime ?? prepared.lifetime).release(cached));
 				}
 			};
-			if (cached && compatible(cached)) {
-				const result = await use(cached); if (result) return result.value;
-			}
+			const reused = cached && compatible(cached) && await use(cached);
+			if (reused) return reused.value;
 			for (const source of this.lookup?.() ?? []) {
 				if (source.view.entries === this.entries || !source.view.retained || !source.view.sealed ||
 					!source.view.prepared?.bindings.get(binding)?.get(key)?.retained ||
@@ -347,16 +340,13 @@ export class ResourceReadView {
 				pending.cancellation.signal.throwIfAborted();
 				computationBytes += evaluation.dependencies.length * 96;
 				pending.shareable = !view.foreignInputs;
-				if (pending.shareable && view.collectProofs?.size) {
-					pending.proofs = [];
-					for (const proof of view.collectProofs.values()) pending.proofs.push(proof.manager.retain({ ...proof, view: undefined }));
-				}
+				if (pending.shareable && view.collectProofs?.size) for (const proof of view.collectProofs.values())
+					(pending.proofs ??= []).push(proof.manager.retain({ ...proof, view: undefined }));
 			}, observed => { pending.dependencies = observed; }).then(async () => {
 				if (!resource) throw new Error("resource_preparation_missing");
 				pending.value = resource.value;
-				bytes = resource.bytes + computationBytes + (key.length + (name?.length ?? 0)) * 2 + 192 + [...pending.dependencies ?? []].reduce((sum, name) => sum + name.length * 2 + 64, 0);
-				for (const proof of pending.proofs ?? []) for (const [key, entry] of proof.observations)
-					bytes += (key.length + entry.path.length + entry.fingerprint.length + (entry.stamp?.length ?? 0)) * 2 + 128;
+				bytes = resource.bytes + computationBytes + resourceProofBytes(pending.proofs ?? []) + (key.length + (name?.length ?? 0)) * 2 + 192 +
+					[...pending.dependencies ?? []].reduce((sum, name) => sum + name.length * 2 + 64, 0);
 				if (!Number.isSafeInteger(resource.bytes) || resource.bytes < 0) throw new Error("resource_snapshot_budget_invalid");
 				const destination = pending.destination = owner.sealed && this.missing ? (await this.missing()).view : owner;
 				pending.cancellation.signal.throwIfAborted();
@@ -832,6 +822,13 @@ export function invalidateResourceInputs(tokens: readonly ResourceVersionToken[]
 			: affects(dependency, { path: changed, type: "rename", epoch: 0 }, precise))) dependencies.add(key);
 	}
 	return [...new Set(tokens.flatMap(token => token.view?.invalidate(dependencies) ?? []))];
+}
+
+export function resourceProofBytes(versions: readonly ResourceVersionToken[]): number {
+	let bytes = 0;
+	for (const token of versions) for (const [key, entry] of token.observations)
+		bytes += (key.length + entry.path.length + entry.fingerprint.length + (entry.stamp?.length ?? 0)) * 2 + 128;
+	return bytes;
 }
 
 export function releaseResourceVersion(token: unknown): void | Promise<void> { if (!isResourceVersionToken(token)) return; return token.release(); }
