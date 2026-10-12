@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { errorMessage } from "./error-utils.ts";
-import { snapshotExecutionScope, type ExecutionScope } from "./execution-world.ts";
+import { currentExecutionScope, snapshotExecutionScope, withExecutionScope, type ExecutionScope } from "./execution-world.ts";
 import { waitForCompletion } from "./scheduler.ts";
 import type { BashOperations } from "@earendil-works/pi-coding-agent";
 
@@ -40,8 +40,8 @@ interface ActorProcessGeneration {
 }
 
 /** One process outlet; execution worlds replace only its dynamic async scope. */
-export class ProcessExecutionCoordinator {
-	private readonly scope = new AsyncLocalStorage<ProcessExecutor>();
+export class ProcessExecutionCoordinator implements ProcessExecutor {
+	private readonly scope = new AsyncLocalStorage<ProcessExecutor | undefined>();
 	private readonly host: ProcessExecutor;
 	private readonly actorRoute?: ProcessExecutionRoute;
 	private actor?: ActorProcessGeneration | { readonly retirement: Promise<void> };
@@ -52,18 +52,17 @@ export class ProcessExecutionCoordinator {
 		this.host = host;
 		this.actorRoute = actorRoute;
 		this.operations = Object.freeze({
-			exec: async (command: string, cwd: string, options: Parameters<ProcessToolOperations["exec"]>[2]) => {
-				const request = {
-					command,
-					cwd,
-					environment: options.env ?? process.env,
-					onData: options.onData,
-					...(options.signal ? { signal: options.signal } : {}),
-					...(options.timeout !== undefined ? { timeout: options.timeout } : {}),
-				};
-				return this.scope.getStore()?.execute(request) ?? this.executeActor(request);
-			},
+			exec: (command: string, cwd: string, options: Parameters<ProcessToolOperations["exec"]>[2]) => this.execute({
+				command, cwd, environment: options.env ?? process.env, onData: options.onData,
+				...(options.signal ? { signal: options.signal } : {}), ...(options.timeout !== undefined ? { timeout: options.timeout } : {}),
+			}),
 		});
+	}
+
+	async execute(request: ProcessExecutionRequest): Promise<ProcessExecutionResult> {
+		const scope = snapshotExecutionScope(currentExecutionScope() ?? request.scope);
+		if (scope) request = { ...request, scope };
+		return this.scope.getStore()?.execute(request) ?? this.executeActor(request);
 	}
 
 	actorDiagnostics(): ProcessRouteSnapshot {
@@ -73,7 +72,7 @@ export class ProcessExecutionCoordinator {
 		if (this.actor && "retirement" in this.actor) return { state: "probing", detail: "Retiring Actor process reuse; new calls use the original executor" };
 		return this.actor?.prepared ?? (this.actor
 			? { state: "probing", detail: "Checking Actor process reuse" }
-			: { state: "idle", detail: "Checked on first Bash execution" });
+			: { state: "idle", detail: "Checked on first process execution" });
 	}
 
 	async refreshActorRoute(): Promise<ProcessRouteSnapshot> {
@@ -87,14 +86,13 @@ export class ProcessExecutionCoordinator {
 	/** Bind an executor to exactly one tool execution and every async child it creates. */
 	runWith<Value>(executor: ProcessExecutor, operation: () => Promise<Value>): Promise<Value> {
 		// Overlap Actor readiness with actual production; its generation owns preparation through retirement.
-		if (!this.disposed && this.actorRoute?.enabled()) this.scope.exit(() => this.prepareActorRoute(true));
+		if (!this.disposed && this.actorRoute?.enabled()) this.prepareActorRoute(true);
 		return this.scope.run(executor, operation);
 	}
 
 	/** Own the Actor scope before tool binding, reuse, and process preparation can yield. */
 	runActor<Value>(scope: ExecutionScope | undefined, operation: () => Promise<Value>): Promise<Value> {
-		const captured = snapshotExecutionScope(scope);
-		return this.scope.run({ execute: (request) => this.executeActor({ ...request, scope: captured }) }, operation);
+		return withExecutionScope(scope, () => this.scope.run(undefined, operation));
 	}
 
 	private async executeActor(request: ProcessExecutionRequest): Promise<ProcessExecutionResult> {
@@ -113,7 +111,7 @@ export class ProcessExecutionCoordinator {
 		const generation: ActorProcessGeneration = {
 			controller: new AbortController(),
 			executions: new Set(),
-			preparation: Promise.resolve().then(() => this.actorRoute!.prepare(refresh, generation.controller.signal))
+			preparation: Promise.resolve().then(() => withExecutionScope(undefined, () => this.scope.exit(() => this.actorRoute!.prepare(refresh, generation.controller.signal))))
 			.catch((error): PreparedProcessExecutionRoute => ({
 				state: "unavailable",
 				detail: errorMessage(error),
@@ -140,15 +138,8 @@ export class ProcessExecutionCoordinator {
 }
 
 export function adaptProcessToolOperations(operations: ProcessToolOperations): ProcessExecutor {
-	return {
-		execute: (request) =>
-			operations.exec(request.command, request.cwd, {
-				onData: request.onData,
-				...(request.signal ? { signal: request.signal } : {}),
-				...(request.timeout !== undefined ? { timeout: request.timeout } : {}),
-				env: definedProcessEnvironment(request.environment),
-			}),
-	};
+	return { execute: ({ command, cwd, onData, signal, timeout, environment }) =>
+		operations.exec(command, cwd, { onData, signal, timeout, env: definedProcessEnvironment(environment) }) };
 }
 
 export function definedProcessEnvironment(environment: Readonly<Record<string, string | undefined>>): Record<string, string> {

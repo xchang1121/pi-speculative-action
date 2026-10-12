@@ -3,7 +3,7 @@ import type { ToolInvocation } from "./tool-settlement.ts";
 const REUSED_FAILURE = Symbol("reused tool failure");
 import { TimelineInterval, type TimelineDependency } from "./task-timing.ts";
 import { EffectTransactionCoordinator, type EffectTransaction, isPoisonedEffectCommit } from "./effect-transaction.ts";
-import { type CapturedExecutionWorldResult, ExecutionWorldRouter, type ExecutionWorldRequest, type ExecutionWorldPreparation,
+import { type CapturedExecutionWorldResult, currentExecutionScope, withExecutionScope, type ExecutionScope, ExecutionWorldRouter, type ExecutionWorldRequest, type ExecutionWorldPreparation,
 	type SpeculativeExecutionRoute } from "./execution-world.ts";
 
 /**
@@ -17,6 +17,7 @@ export interface ToolOperation {
 	readonly tool: string;
 	/** Absent for capability warm-up before a concrete call exists. */
 	readonly callID?: string;
+	readonly scope?: ExecutionScope;
 	readonly input: unknown;
 	readonly signal?: AbortSignal;
 	/** Present after the caller has resolved the canonical action identity. */
@@ -74,7 +75,7 @@ export class ToolExecutionGateway<Context, Output, ObservationContext = Context>
 		executor: AuthoritativeToolExecutor<AuthoritativeOutput>,
 		hooks: AuthoritativeExecutionHooks<AuthoritativeOutput> = {},
 	): Promise<AuthoritativeOutput> {
-		return this.lifecycle.admit(async () => {
+		return withExecutionScope("scope" in operation ? operation.scope : currentExecutionScope(), () => this.lifecycle.admit(async () => {
 			if (hooks.reuse) {
 				try {
 					const reused = await hooks.reuse();
@@ -93,7 +94,7 @@ export class ToolExecutionGateway<Context, Output, ObservationContext = Context>
 			catch { /* Observation cannot replace the original Actor settlement. */ }
 			if (settlement.status === "failed") throw settlement.error;
 			return settlement.output;
-		});
+		}));
 	}
 
 	executeSpeculative(
@@ -102,6 +103,6 @@ export class ToolExecutionGateway<Context, Output, ObservationContext = Context>
 		context: Context,
 	): Promise<EffectTransaction<Output>> {
 		const attempt = this.transactions.begin({ tool: operation.tool, callID: operation.callID, route });
-		return this.lifecycle.track(this.transactions.execute(attempt, () => this.fork(route, context)));
+		return this.lifecycle.track(this.transactions.execute(attempt, () => withExecutionScope(operation.scope, () => this.fork(route, context))));
 	}
 }

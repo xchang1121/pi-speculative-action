@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { ActionEffect, ActionKey, ActionSemanticsDefinition } from "./action-semantics.ts";
 import { effectCapabilitiesCover, type EffectCapabilities, type EffectRequirements } from "./effect-model.ts";
 import { cause, type ResourceValidation, zeroValidationMetrics } from "./settlement.ts";
@@ -11,12 +12,15 @@ export type SpeculativeExecution = "runtime_sandbox" | "resource_snapshot" | "wo
 export type WorldReuseStrategy = "shared_result" | "exclusive_branch";
 export type ExecutionWorldScope = "runtime" | "fallback";
 
-/** Logical session and turn for execution ownership, separate from reusable action identity. */
-export interface ExecutionScope { readonly sessionID: string; readonly turnID: string; }
+/** Execution ownership, separate from reusable action identity and cross-call sharing permission. */
+export interface ExecutionScope { readonly sessionID: string; readonly turnID: string; readonly callID?: string; }
 
 export function snapshotExecutionScope(scope: ExecutionScope | undefined): ExecutionScope | undefined {
-	return scope ? Object.freeze({ sessionID: scope.sessionID, turnID: scope.turnID }) : undefined;
+	return scope ? Object.freeze({ sessionID: scope.sessionID, turnID: scope.turnID, ...(scope.callID !== undefined ? { callID: scope.callID } : {}) }) : undefined;
 }
+const executionScope = new AsyncLocalStorage<ExecutionScope | undefined>();
+export const currentExecutionScope = () => executionScope.getStore();
+export const withExecutionScope = <Value>(scope: ExecutionScope | undefined, execute: () => Value): Value => executionScope.run(snapshotExecutionScope(scope), execute);
 
 /** Tool effects are resolved independently from K(a) and prediction source. */
 export interface ExecutionWorldRequest {

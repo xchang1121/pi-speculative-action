@@ -5,6 +5,7 @@ import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager
 import { afterEach, expect, test, vi } from "vitest";
 import { createSpeculativeActionExtension } from "../src/extension.ts";
 import { createSpeculativeActionHost } from "../src/agent-integration.ts";
+import { ProcessExecutionCoordinator } from "../src/process-execution.ts";
 import type { SpeculativeActionEvent } from "../src/runtime.ts";
 import { temporaryDirectories } from "./filesystem.ts";
 
@@ -47,5 +48,9 @@ test.each([false, true])("runs the shipped extension through a real Pi session (
 		expect(results.every(message => !message.isError)).toBe(true);
 		expect(results.at(-1)?.content).toEqual([{ type: "text", text: "final\n" }]);
 		if (enabled) expect(events.some(event => event.type === "actor_action")).toBe(true);
+		const failure = new Error("process launch failed"), coordinator = new ProcessExecutionCoordinator({ execute: async () => ({ exitCode: 0 }) });
+		await coordinator.runWith({ execute: () => { throw failure; } }, async () => {
+			for (const execute of [() => coordinator.execute({ command: "", cwd, environment: {}, onData: () => {} }), () => coordinator.operations.exec("", cwd, { onData: () => {} })]) await expect(execute()).rejects.toBe(failure);
+		});
 	} finally { await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" }); session.dispose(); }
 });

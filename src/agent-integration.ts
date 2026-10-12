@@ -298,9 +298,9 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 		executeCandidate: async ({ startInput, data, tool: toolName, concrete, action, route, callID, signal, parentWorld, inputs, onOperationAdopted, onOperationJoinable, acceptOperationScope }) => {
 			const tool = data.tools.get(toolName);
 			if (!tool) throw new Error(`Tool ${toolName} not found`);
-			const args = structuredClone(concrete);
+			const args = structuredClone(concrete), executionScope = { sessionID: startInput.sessionID, turnID: startInput.turnID, callID };
 			return executionGateway.executeSpeculative(
-				{ tool: toolName, callID, input: args, signal, action },
+				{ tool: toolName, callID, input: args, signal, action, scope: executionScope },
 				route,
 				{
 					cwd: options.cwd, tool, toolName, args, action, callID, signal,
@@ -308,7 +308,7 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 					onOperationAdopted,
 					onOperationJoinable,
 					acceptOperationScope,
-					executionScope: { sessionID: startInput.sessionID, turnID: startInput.turnID },
+					executionScope,
 					...(parentWorld?.checkpoint ? { parentCheckpoint: parentWorld.checkpoint } : {}),
 				},
 			);
@@ -351,8 +351,10 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 		previewActorTool: (input, signal) => runtime.previewActorTool({ ...input, sessionID }, signal),
 		previewActorCall: (input, signal) => runtime.previewActorCall({ ...input, sessionID, [RAW_ACTOR_CALL]: true } as BoundActorCall, signal),
 		execute: (input, signal, executor) => runtime.trackActorTool(sessionID, async issuedAt => {
+			const scope = input.turnID ? { sessionID, turnID: input.turnID, ...(input.id !== undefined ? { callID: input.id } : {}) } : undefined;
 			const operation: ToolOperation = {
 				tool: input.tool,
+				scope,
 				input: immutableSnapshot(input.args),
 				...(input.id ? { callID: input.id } : {}),
 				...(signal ? { signal } : {}),
@@ -370,7 +372,7 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 			const computations: TimelineDependency[] = [];
 			return executionGateway.executeAuthoritative(operation, async () => {
 				const bound = await bind();
-				const execute = (inputs?: (path?: string) => Iterable<object>) => input.turnID ? executionGateway.observeOperations(bound.action, { sessionID, turnID: input.turnID },
+				const execute = (inputs?: (path?: string) => Iterable<object>) => scope ? executionGateway.observeOperations(bound.action, scope,
 					() => executor(bound), (bindings, dependencies) => {
 						if (bindings.length) (operations ??= []).push(...bindings);
 						if (dependencies) computations.push(...dependencies);

@@ -1,7 +1,7 @@
 import { gated, deferred, nextTurn } from "./async.ts";
 import { execFileSync } from "node:child_process";
 import { once } from "node:events";
-import { AsyncLocalStorage } from "node:async_hooks";
+import { ToolExecutionGateway } from "../src/tool-execution-gateway.ts";
 import * as childProcess from "node:child_process";
 import { existsSync } from "node:fs";
 import * as filesystem from "node:fs/promises";
@@ -24,7 +24,7 @@ import { summarizeSpeculativeTrace } from "../src/trace-summary.ts";
 import { adaptProcessToolOperations, ProcessExecutionCoordinator } from "../src/process-execution.ts";
 import { PROCESS_CERTIFICATE } from "./process-fixture.ts";
 import * as scheduling from "../src/scheduler.ts";
-import type { ExecutionOperationBinding } from "../src/execution-world.ts";
+import { currentExecutionScope, type ExecutionOperationBinding } from "../src/execution-world.ts";
 import { createSpeculativeActionHost, type CreateSpeculativeActionHostOptions, type SpeculativeAgentSettingsInput } from "../src/agent-integration.ts";
 import { PatternAwareStore, patternAwareSettings, patternAwareActionSemantics } from "../src/pattern-aware.ts";
 import type { SpeculativeActionEvent } from "../src/events.ts";
@@ -444,7 +444,7 @@ int main(int argc, char **argv) { if (argc != 2) return 1; int fd = open(${layou
 		const settings = { candidateLimit: 4, maxConcurrentActions: 4, patternAware: patternAwareSettings({ multiStepEnabled: false, beamWidth: 1, presets: ["recent-command"] }) };
 		const prepared = patternProcessHost(fixture, scope.sessionID, settings, {}, tools), { events, start, call } = prepared; host = prepared.host;
 		const execute = (turnID: string, command: string) => host!.execute({ ...call(turnID, command), id: `${turnID}:${command}` }, AbortSignal.timeout(10_000),
-			() => fixture.coordinator.runWith({ execute: request => route.executor.execute({ ...request, scope: { ...scope, turnID } }) }, () => fixture.tool.execute(turnID, { command })));
+			() => fixture.coordinator.runWith(route.executor, () => fixture.tool.execute(turnID, { command })));
 		await start("seed");
 		const commands = layout === "parents" ? ["printf parent >> marker; worker first", "worker last"] : ["printf parent >> marker; worker first; worker last", ...layout === "aliases" ? ["printf ''; worker first; worker last"] : []];
 		for (const command of commands) expect(textOutput(await execute("seed", command))).toBe("old\n".repeat(command.includes("; worker last") ? 2 : 1));
@@ -719,8 +719,7 @@ int main(int argc, char **argv) {
 				patternAware: patternAwareSettings({ enabled: true, multiStepEnabled: false, beamWidth: 4 }) }), { events, start, call } = prepared;
 			host = prepared.host;
 			const execute = (turnID: string, command: string, signal = AbortSignal.timeout(10_000)) => host!.execute(call(turnID, command), signal,
-				() => fixture.coordinator.runWith({ execute: request => route.executor.execute({ ...request, scope: { ...scope, turnID }, signal }) },
-					() => fixture.tool.execute(turnID, { command })));
+					() => fixture.coordinator.runWith(route.executor, () => fixture.tool.execute(turnID, { command }, signal)));
 			for (const turnID of ["common-1", "common-2"]) { await start(turnID); await execute(turnID, "printf common"); await host.finishTurn(turnID); }
 			await start("seed"); const seed = await execute("seed", "printf seed; launch seed"); await host.finishTurn("seed");
 			expect(seed.content).toMatchObject([{ type: "text", text: expect.stringMatching(/^seedABC:\d+\n$/) }]);
@@ -787,7 +786,7 @@ int main(int argc, char **argv) {
 	});
 
 nativeTest.for(["keyed", "unkeyed", "keyed-large", "unkeyed-opaque", "keyed-failed", "unkeyed-failed", "keyed-exit", "unkeyed-exit"])("transfers native Bash FD inputs to filesystem tools across turns with exact invalidation (%s)", { timeout: 30_000 }, async (mode, { skip, benchmark }) => {
-		const fixture = await benchmark("pi-native-resource-inputs-");
+		const fixture = await benchmark("pi-native-resource-inputs-"), observing = vi.spyOn(fixture.backend, "observeBindings");
 		const unkeyed = mode.startsWith("unkeyed"), parentOutput = { transcript: mode.endsWith("large") ? "x".repeat(128 * 1024) : "", ...(mode.endsWith("opaque") ? { callback: () => "parent-only" } : {}) };
 		let host: ReturnType<typeof createSpeculativeActionHost> | undefined;
 		const search = await createClosedSearchProfile(fixture.workspace);
@@ -812,7 +811,7 @@ int main(void) { char b[1024]; return syscall(SYS_getdents64, 4, b, sizeof(b)) <
 			}, tools), { events, start } = prepared;
 			host = prepared.host;
 			const error = new Error("native producer failed after completed work"), command = "exec 3<input.txt 4<entries; worker; worker" + (mode.endsWith("exit") ? "; exit 17" : "");
-			const bash = vi.fn(() => fixture.coordinator.runWith({ execute: request => route.executor.execute({ ...request, scope: { sessionID: "native-inputs", turnID: "seed" } }) }, async () => {
+			const bash = vi.fn(() => fixture.coordinator.runWith(route.executor, async () => {
 				const output = await fixture.tool.execute("seed", { command }); if (mode.endsWith("failed")) throw error; return { ...output, details: parentOutput };
 			}));
 			await start("seed");
@@ -821,6 +820,7 @@ int main(void) { char b[1024]; return syscall(SYS_getdents64, 4, b, sizeof(b)) <
 			else if (mode.endsWith("exit")) await expect(result).rejects.toThrow(/17/);
 			else expect(await result).toEqual({ content: [{ type: "text", text: "one\ntwo\none\ntwo\n" }], details: parentOutput });
 			await host.finishTurn("seed"); expect(bash).toHaveBeenCalledOnce();
+			expect(observing.mock.calls[0]![0]).toEqual({ sessionID: "native-inputs", turnID: "seed", callID: "seed" });
 			if (unkeyed) expect(events.find(event => event.type === "actor_action")).toMatchObject({ settlement: { provider: { kind: "actor", cause: { code: "action_not_keyable" } } } });
 			await start("queries");
 			for (const [tool, args, change] of [["read", { path: "input.txt", offset: 2 }, undefined], ["grep", { path: "input.txt", pattern: "two" }, undefined],
@@ -835,7 +835,7 @@ int main(void) { char b[1024]; return syscall(SYS_getdents64, 4, b, sizeof(b)) <
 			}
 			await host.finishTurn("queries", true);
 			expect(summarizeSpeculativeTrace(events)).toMatchObject({ inputReuseHits: 6, exactReuseHits: 0 });
-		} finally { await host?.dispose(); await search.pool.dispose(); await fixture.dispose(); }
+		} finally { observing.mockRestore(); await host?.dispose(); await search.pool.dispose(); await fixture.dispose(); }
 	});
 
 	test.for(["git", "auto"] as const)("selects changed running inputs after unrelated hints and compares the predecessor state (%s)", { timeout: 20_000 }, async (driver, { skip, benchmark }) => {
@@ -1139,8 +1139,7 @@ int main(int argc, char **argv) {
 			if (discovery) {
 				const coldScope = { ...scope, turnID: "cold-queue" };
 				await start(coldScope.turnID);
-				const output = await host.execute(call(coldScope.turnID, command), undefined, () => fixture.coordinator.runWith({
-					execute: request => route.executor.execute({ ...request, scope: coldScope }) }, () => fixture.tool.execute(coldScope.turnID, { command })));
+				const output = await host.execute(call(coldScope.turnID, command), undefined, () => fixture.coordinator.runWith(route.executor, () => fixture.tool.execute(coldScope.turnID, { command })));
 				expect(output.content).toEqual([{ type: "text", text: "parent\nafter\n" }]);
 				await host.finishTurn(coldScope.turnID);
 				const registry = Reflect.get(fixture.backend, "handoffs") as ProcessHandoffRegistry;
@@ -1154,8 +1153,7 @@ int main(int argc, char **argv) {
 			}
 
 			await expect.poll(() => patternStore.recent(scope.sessionID).map(event => event.input.command)).toEqual(["printf common", "printf common", ...(discovery ? [command] : [])]);
-			const seedFallback = vi.fn(() => fixture.coordinator.runWith({ execute: request => route.executor.execute({ ...request,
-				scope: { ...scope, turnID: "seed" } }) }, () => fixture.tool.execute("seed", { command })));
+			const seedFallback = vi.fn(() => fixture.coordinator.runWith(route.executor, () => fixture.tool.execute("seed", { command })));
 			const suffix = mode === "native-merged" ? "stderr\n" : "";
 			expect((await host.execute(call("seed", command), undefined, seedFallback)).content).toEqual([{ type: "text", text: `parent\nafter\n${suffix}` }]);
 			await host.finishTurn("seed");
@@ -1215,8 +1213,7 @@ int main(int argc, char **argv) {
 				expect((await executeProcess(fixture, route.executor, changedParent, { scope: { ...scope, turnID: "foreign" } })).output).toBe("automatic-parent\nnewest\n");
 				expect(publication!.joined(), "another turn cannot wait for this one-shot producer").toBe(false);
 			}
-			const actor = vi.fn(() => fixture.coordinator.runWith({ execute: request => route.executor.execute({ ...request,
-				scope: { ...scope, turnID: "prepared" } }) }, () => fixture.tool.execute("prepared", { command: changedParent })));
+			const actor = vi.fn(() => fixture.coordinator.runWith(route.executor, () => fixture.tool.execute("prepared", { command: changedParent })));
 			const nativeExecution = host.execute(call("prepared", changedParent), undefined, actor);
 			void nativeExecution.catch(() => undefined);
 			if (running) await expect.poll(() => publication!.joined() || { actor: fixture.backend.actorMetrics(), producer: fixture.backend.metrics() }).toBe(true);
@@ -1552,7 +1549,7 @@ static int takePacket(int length,int peek,int truncated,char expected) {
 			}
 			const native = adaptProcessToolOperations(createLocalBashOperations({ shellPath: binary }));
 			const held = (options: Pick<Parameters<LinuxHeldExecBoundary["executor"]>[1], "decide" | "descriptors">, executor = native) => {
-				const wrapped = boundary.executor(executor, { sourceRoot: root, realShell: "/bin/bash", ...options });
+				const wrapped = new ProcessExecutionCoordinator(boundary.executor(executor, { sourceRoot: root, realShell: "/bin/bash", ...options }));
 				let output = "";
 				return {
 					get output() { return output; },
@@ -2053,10 +2050,10 @@ int main(void) { int status; struct timespec pause = {0, 300000000}; pid_t sibli
 			await replay("delivery", async () => ({ output: [{ fd: 1, data: Buffer.alloc(2 * 1024 * 1024, 97) }] }),
 				{ descriptors: false, beforeCommit: () => writeFile(path.join(root, "producer-armed"), "ready") })
 				.verify("/bin/true | (while [[ ! -e producer-armed ]]; do :; done; /usr/bin/wc -c)", "2097152\n", 1);
-			const actorContext = new AsyncLocalStorage<string>(), execIDs = new Set<string>();
-			for (const disposition of [undefined, "recoverable", "poisoned", "killed"] as const) {
+			const gateway = new ToolExecutionGateway<never, never>([]), execIDs = new Set<string>();
+			await Promise.all(([undefined, "recoverable", "poisoned", "killed"] as const).map(async disposition => {
 				const after = path.join(root, `after-${disposition}`);
-				const scope = { sessionID: "session", turnID: "original" };
+				const scope = { sessionID: "session", turnID: "original", callID: String(disposition) }, expected = { ...scope };
 				const nativeDone = deferred();
 				const adopted = vi.fn(() => { throw new Error("advisory feedback failed"); });
 				const observeTiming = vi.fn<(timing: HeldExecTiming) => void>();
@@ -2066,14 +2063,15 @@ int main(void) { int status; struct timespec pause = {0, 300000000}; pid_t sibli
 					else if (disposition) throw effectCommitFailure(new Error("injected commit failure"), disposition);
 				});
 				const decide = vi.fn(async (process: HeldExecProcess) => {
-					expect(actorContext.getStore()).toBe("original");
+					expect(currentExecutionScope()).toEqual(expected);
 					expect(process.id).toMatch(/^[a-f0-9]{48}:1$/); expect(process.sequence).toBe(1);
 					execIDs.add(process.id);
 					heldPid = process.pid; return { kind: "replay" as const, output: [], exitCode: 0, commit, adopted, observeTiming };
 				});
 				const executor = held({ decide }, { execute: request => native.execute(request).finally(nativeDone.resolve) });
-				const run = actorContext.run("original", () => executor.execute(`/bin/true; printf continued > '${after}'`, { scope }));
-				scope.turnID = "later";
+				const run = gateway.executeAuthoritative({ tool: "custom", input: {}, scope }, async () => {
+					await nextTurn(); return executor.execute(`/bin/true; printf continued > '${after}'`);
+				}); scope.turnID = scope.callID = "later";
 				if (disposition) {
 					await expect(run).rejects.toMatchObject({ disposition: "poisoned" });
 					await expect(stat(after)).rejects.toThrow();
@@ -2092,10 +2090,10 @@ int main(void) { int status; struct timespec pause = {0, 300000000}; pid_t sibli
 					expect(timing.completedAt).toBeGreaterThanOrEqual(timing.committedAt!);
 				}
 				expect(decide).toHaveBeenCalledOnce();
-				expect(decide.mock.calls[0]![0].scope).toEqual({ sessionID: "session", turnID: "original" });
+				expect(decide.mock.calls[0]![0].scope).toEqual(expected);
 				expect(Object.isFrozen(decide.mock.calls[0]![0].scope)).toBe(true);
-			}
-			expect(execIDs.size).toBe(4);
+			}));
+			expect(execIDs.size).toBe(4); await gateway.dispose();
 			let closed = false;
 			const gate = gated();
 			const executor = boundary.executor({ execute: async () => {

@@ -604,14 +604,14 @@ async function installController(
 			const definition = baseDefinitions.get(tool);
 			if (!definition) throw new Error(`Speculative wrapper has no base tool ${tool}`);
 			const turnID = currentTurnID;
-			return processCoordinator.runActor(turnID ? { sessionID, turnID } : undefined, () => host.execute(
+			return host.execute(
 				{ ...(turnID ? { turnID } : {}), id: callID, tool, args: input, tools: turnTools },
 				signal,
 				async (operation) =>
 					operation.invocation?.authoritative ? (await operation.invocation.authoritative({
 						callID, args: operation.input, signal: operation.signal ?? new AbortController().signal,
 					})).result : await definition.execute(callID, operation.input as never, operation.signal, onUpdate as never, nextContext),
-			));
+			);
 		},
 		statusText: () => {
 			const effective = settings();

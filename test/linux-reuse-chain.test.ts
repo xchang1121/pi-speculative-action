@@ -78,8 +78,7 @@ async function chainWorld(files: readonly (readonly [string, string])[], loops: 
 			const before = fixture.backend.actorMetrics(), started = performance.now();
 			const processTool = role && ((role === "producer" || role === "stale" || role === "retired-running") ? turnID === "seed" : turnID === "check") ? report : fixture.tool;
 			const result = typeof call !== "string" ? await host.execute({ turnID, id: turnID, tool: "write", args: call, tools }, undefined, () => writer.execute(turnID, call))
-				: await host.execute({ turnID, id: turnID, tool: processTool.name, args: { command: call }, tools }, undefined, () => fixture.coordinator.runWith(
-					{ execute: (request) => route.executor.execute({ ...request, scope: { sessionID: "chain", turnID } }) }, () => processTool.execute(turnID, { command: call })));
+				: await host.execute({ turnID, id: turnID, tool: processTool.name, args: { command: call }, tools }, undefined, () => fixture.coordinator.runWith(route.executor, () => processTool.execute(turnID, { command: call })));
 			const ms = performance.now() - started, after = fixture.backend.actorMetrics();
 			const timing = events.filter(event => event.type === "actor_action").at(-1)?.computation;
 			expect(timing).toMatchObject({ toolComputeMs: expect.any(Number), hiddenComputeMs: expect.any(Number), adoptionWaitMs: expect.any(Number) });
