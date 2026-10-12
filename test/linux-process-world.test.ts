@@ -427,6 +427,57 @@ nativeTest.for([false, true])("prepares a failed command after its reported inpu
 		} finally { await host?.dispose(); await fixture.dispose(); }
 	});
 
+nativeTest.for(["bash", "write", "stale", "disabled"])("reprepares changed children beyond fresh beam entries (%s)", { timeout: 20_000 }, async (mode, { benchmark }) => {
+	const fixture = await benchmark("pi-rerun-frontier-", "git"), scope = { sessionID: "frontier", turnID: "seed" };
+	let host: ReturnType<typeof createSpeculativeActionHost> | undefined;
+	try {
+		for (const name of ["first", "last"]) await writeFile(path.join(fixture.workspace, name), "old\n");
+		await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker", code: `${cHeaders("fcntl.h unistd.h")}
+int main(int argc, char **argv) { if (argc != 2) return 1; int fd = open(argv[1], O_RDONLY); char bytes[16];
+ int length = read(fd, bytes, sizeof(bytes)); if (length < 0 || close(fd)) return 2;
+ for (volatile unsigned long i = 0; i < 40000000ul; ++i) {} return write(1, bytes, (size_t)length) != length; }
+` });
+		await commitBenchmarkFixture(fixture.workspace, "changed child frontier"); await prepareLinuxProcessReuse(fixture);
+		const route = await fixture.prepareActorReplay(), writer = createWriteTool(fixture.workspace), tools = [fixture.tool, writer];
+		const registry = Reflect.get(fixture.backend, "handoffs") as ProcessHandoffRegistry<{ executable: string }>;
+		const settings = { candidateLimit: 4, maxConcurrentActions: 4, patternAware: patternAwareSettings({ multiStepEnabled: false, beamWidth: 1, presets: ["recent-command"] }) };
+		const prepared = patternProcessHost(fixture, scope.sessionID, settings, {}, tools), { events, start, call } = prepared; host = prepared.host;
+		const execute = (turnID: string, command: string) => host!.execute({ ...call(turnID, command), id: `${turnID}:${command}` }, AbortSignal.timeout(10_000),
+			() => fixture.coordinator.runWith({ execute: request => route.executor.execute({ ...request, scope: { ...scope, turnID } }) }, () => fixture.tool.execute(turnID, { command })));
+		await start("seed"); expect(textOutput(await execute("seed", "printf parent >> marker; worker first; worker last"))).toBe("old\nold\n"); await host.finishTurn("seed");
+		const bindings = fixture.backend.executionBindings(scope).filter(binding => registry.resolveBinding(binding, scope)?.executable.endsWith("/worker"));
+		expect(bindings).toHaveLength(2);
+		const invocation = resolvePiToolInvocation("bash", { command: "exit 92" }, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath })!.process!;
+		for (const binding of bindings) await fixture.workspaceSandbox.withWorkspace(fixture.workspace, workspace =>
+			withPreparedWorker(fixture, { sourceRoot: fixture.workspace, workspace, invocation, scope: { ...scope, turnID: "warm" } }, binding, "old\n", async () => {}), { liveLower: true });
+		expect(await Promise.all(bindings.map(binding => fixture.backend.bindingStale(binding)))).toEqual([false, false]);
+		const publishing = vi.spyOn(fixture.backend.planner, "publishCompleted"), checking = vi.spyOn(fixture.backend, "bindingStale");
+		await start("unrelated"); await execute("unrelated", "printf ignored > unrelated");
+		await expect.poll(() => checking.mock.calls.length).toBeGreaterThan(0);
+		await Promise.all(checking.mock.results.map(result => result.value)); await nextTurn();
+		expect(events.filter(event => event.type === "candidate" && event.candidate.mode === "recent-command")).toEqual([]); await host.finishTurn("unrelated");
+		if (mode === "disabled") settings.patternAware = patternAwareSettings({ enabled: false });
+		await start("edit");
+		if (mode === "write") {
+			const args = { path: "last", content: "new\n" };
+			await host.execute({ turnID: "edit", id: "edit", tool: "write", args, tools }, undefined, () => writer.execute("edit", args));
+		} else await execute("edit", "printf 'new\\n' > last");
+		if (mode !== "disabled") await expect.poll(() => events.some(event => event.type === "candidate" && event.turnID === "edit" &&
+			event.candidate.mode === "recent-command" && event.candidate.kind === "operation" && event.state.status === "succeeded"), { timeout: 5000 }).toBe(true);
+		expect(publishing.mock.calls.map(([certificate]) => certificate.weakKey)).toEqual(mode === "disabled" ? [] : [bindings[1]!.key]);
+		if (mode === "stale") await writeFile(path.join(fixture.workspace, "last"), "bad\n");
+		const before = fixture.backend.actorMetrics().hits, actual = await execute("edit", "printf actual; worker last");
+		const timing = consumedTiming(events.filter(event => event.type === "actor_action").at(-1)!.settlement.provider.toolExecution);
+		expect(textOutput(actual)).toBe(`actual${mode === "stale" ? "bad" : "new"}\n`);
+		expect(await readFile(path.join(fixture.workspace, "marker"), "utf8")).toBe("parent");
+		const reused = mode === "bash" || mode === "write";
+		expect([fixture.backend.actorMetrics().hits - before, timing.hiddenComputeMs > 0]).toEqual([Number(reused), reused]);
+		if (reused) expect(timing.hiddenByMode).toEqual([{ source: "pattern_aware", mode: "recent-command", hiddenComputeMs: timing.hiddenComputeMs }]);
+		await host.finishTurn("edit", true);
+		if (mode === "disabled") expect(events.filter(event => event.type === "candidate" && event.candidate.mode === "recent-command")).toEqual([]);
+	} finally { await host?.dispose(); await fixture.dispose(); }
+});
+
 nativeTest.for(["sample", "file", "dup", "threads", "limit", "metadata", "identity", "pipe", "socket", "eventfd", "pipe:unavailable", "socket:unavailable", "eventfd:unavailable", "eventfd:unavailable:destroyed", "eventfd::inherited", "eventfd:unavailable:external", "eventfd::external", "eventfd:unavailable:discard", "eventfd::discard", "eventfd:unavailable:discard-nested", "eventfd::discard-nested", "eventfd:unavailable:discard-cycle"])("adopts a closed-input calculation through capture or completion (%s)", { timeout: 30_000 }, async (scenario, { benchmark }) => {
 		const [mode, unavailable, queue] = scenario.split(":"), fixture = await benchmark("pi-prefix-process-", "git", { processImages: unavailable ? false : undefined });
 		const descendant = mode === "pipe" || mode === "socket" || mode === "eventfd", complete = descendant || mode === "identity", discarded = queue?.startsWith("discard"), cyclic = queue === "discard-cycle", capturable = !unavailable;

@@ -148,6 +148,10 @@ export function createPatternPlanSource({
 	const resourcePath = (target: string) => patternActionSemantics.actionKey("read", { path: target })?.resources[0];
 	const currentOperation = (binding: ExecutionOperationBinding) => binding.available !== false &&
 		binding.preparation === "current_workspace" && !binding.fed && typeof binding.stale === "function";
+	const learnedOperations = (parentHash?: string) => [...operationBindings.values()].filter(item => {
+		if (item.binding.available !== false) return item.parentHash === parentHash;
+		operationBindings.delete(item.key); return false;
+	});
 	const observeWorkspace = async (state: CommandRerunState | undefined) => {
 		if (!state?.native || state !== commandRerun || ![...operationBindings.values()].some(({ binding }) => currentOperation(binding))) return;
 		// One pooled watcher cursor follows actual changes, including Bash writes. Notification is a scheduling hint, never freshness proof.
@@ -163,26 +167,14 @@ export function createPatternPlanSource({
 		await state.changes;
 	};
 	const planActions = (candidates: readonly PatternAwareCandidate[], store: PatternAwareStore,
-		schemaHashes: Readonly<Record<string, string>>, operationLimit: number, dependsOn?: PlanAction["dependsOn"], parentID?: string) => {
-		let operations: Map<string, ObservedOperation[]> | undefined;
-		return candidates.flatMap(candidate => {
+		schemaHashes: Readonly<Record<string, string>>, operationLimit: number, dependsOn?: PlanAction["dependsOn"], parentID?: string) => candidates.flatMap(candidate => {
 			const action = patternPlanAction(candidate, store, patternPlanActionID(candidate.actionIdentity, parentID), dependsOn);
 			// Both recurring predictions and background probes may reuse a root's native
 			// operations. Dependent steps still need their parent's complete tool result.
 			if (dependsOn?.length || !operationBindings.size) return [action];
 			const parentHash = patternActionSemantics.actionKey(candidate.tool, candidate.input, schemaHashes[candidate.tool])?.hash;
-			if (!operations) {
-				operations = new Map();
-				for (const item of operationBindings.values()) {
-					if (item.binding.available === false) operationBindings.delete(item.key);
-					else {
-						const choices = operations.get(item.parentHash) ?? [];
-						choices.push(item); operations.set(item.parentHash, choices);
-					}
-				}
-			}
-			const choices = parentHash === undefined ? undefined : operations.get(parentHash);
-			if (!choices?.length) return [action];
+			const choices = learnedOperations(parentHash);
+			if (!choices.length) return [action];
 			return choices.slice(0, operationLimit).map(operation => ({ ...action,
 				id: `${action.id}:operation:${operation.binding.identity}`, type: "operation" as const, operation: operation.binding,
 				// Waiting on its producer, it takes only capacity nothing else wants.
@@ -190,12 +182,11 @@ export function createPatternPlanSource({
 				feedback: { ...action.feedback, operation },
 			}));
 		});
-	};
 
 	/** Prepare a stale native launch against the Actor's edited files, without repeating its parent's earlier setup.
 	 * Captured-resource launches keep their parent ordering. Every result still requires current dependency evidence at adoption. */
-	const prepareRerun = async (state: CommandRerunState | undefined, schemaHashes: Readonly<Record<string, string>>, patternSettings: PatternAwareSettings): Promise<readonly [rerun: PlanAction[], apart: (action: PlanAction) => boolean]> => {
-		if (!state || state !== commandRerun || !state.workspaceChanged && !state.observedChange && !state.retry && !state.issued) return NO_RERUN;
+	const prepareRerun = async (state: CommandRerunState, schemaHashes: Readonly<Record<string, string>>): Promise<typeof NO_RERUN> => {
+		if (state !== commandRerun || !state.workspaceChanged && !state.observedChange && !state.retry && !state.issued) return NO_RERUN;
 		const retry = state.retry;
 		const observedOnly = !state.workspaceChanged && !retry && (state.observedChange === true || state.issued?.observedOnly === true);
 		state.workspaceChanged = false; state.observedChange = false; state.retry = undefined; state.issued = undefined;
@@ -203,23 +194,21 @@ export function createPatternPlanSource({
 		if (retry) commands.sort((left, right) => Number(right === retry) - Number(left === retry));
 		for (const command of commands) {
 			if (!state.native && command !== retry || command.schemaHash !== schemaHashes[command.tool]) continue;
-			const children = [...operationBindings.values()].filter(item => item.parentHash === command.parentHash && item.binding.available !== false && (!observedOnly || currentOperation(item.binding)))
-				.slice(0, observedOnly ? patternSettings.beamWidth : undefined);
-			const stale = (await Promise.all(children.map(async ({ binding }) => {
-				const changed = await binding.stale?.();
-				return (observedOnly ? changed === true : changed !== false) ? binding : undefined;
-			})))
-				.filter((binding): binding is ExecutionOperationBinding => !!binding);
+			// The bounded history limits inspection; a fresh prefix must not consume the proposal's execution budget.
+			const children = learnedOperations(command.parentHash).filter(item => !observedOnly || currentOperation(item.binding));
+			const stale = (await Promise.all(children.map(async item => {
+				const changed = await item.binding.stale?.();
+				return (observedOnly ? changed === true : changed !== false) ? item : undefined;
+			}))).filter((item): item is ObservedOperation => !!item && item.binding.available !== false);
 			if (state !== commandRerun) return NO_RERUN;
 			if (![...learnedCommands.values()].includes(command)) continue;
 			const fallback = command === retry && command.failure && !children.length;
 			if (!stale.length && !fallback) continue;
-			const operation = stale.find(binding => binding.preparation === "current_workspace" && !binding.fed);
-			if (state !== commandRerun) return NO_RERUN;
+			const selected = stale.find(({ binding }) => binding.preparation === "current_workspace" && !binding.fed), operation = selected?.binding;
 			if (command === retry) state.retry = command;
 			const mode = command === retry ? "retry-failed-command" : "recent-command";
 			const feedback = state.issued = { observedOnly, presetID: mode };
-			if (operation) rerunOperations.set(feedback, children.find(item => item.binding === operation)!);
+			if (selected) rerunOperations.set(feedback, selected);
 			return [[{ id: `rerun:${command.parentHash}`, type: operation ? "operation" : "tool_call", ...(operation ? { operation } : {}),
 				tool: command.tool, input: command.input, horizon: 0, producesOperations: true, mode, feedback,
 				...(fallback ? { empiricalProbability: 0.25, conditionalProbability: 0.25 } : {}) }],
@@ -228,10 +217,10 @@ export function createPatternPlanSource({
 		}
 		return NO_RERUN;
 	};
-	const reruns = async (state: CommandRerunState | undefined, schemaHashes: Readonly<Record<string, string>>, patternSettings: PatternAwareSettings) => {
+	const reruns = async (state: CommandRerunState | undefined, schemaHashes: Readonly<Record<string, string>>) => {
 		if (!state || state !== commandRerun) return NO_RERUN;
 		// A closing observation may still be checking staleness. Its next decision must see the issued result, not the cleared trigger.
-		const preparing = (state.preparing ?? Promise.resolve()).catch(() => {}).then(() => prepareRerun(state, schemaHashes, patternSettings));
+		const preparing = (state.preparing ?? Promise.resolve()).catch(() => {}).then(() => prepareRerun(state, schemaHashes));
 		state.preparing = preparing;
 		try { return await preparing; } finally { if (state.preparing === preparing) state.preparing = undefined; }
 	};
@@ -252,7 +241,7 @@ export function createPatternPlanSource({
 			const signature = patternPredictionSignature(candidates);
 			await rerunState?.changes;
 			if (signal.aborted) return undefined;
-			const carried = carriedPredictions.get(startInput.sessionID), prepared = await reruns(rerunState, data.schemaHashes, patternSettings);
+			const carried = carriedPredictions.get(startInput.sessionID), prepared = await reruns(rerunState, data.schemaHashes);
 			if (signal.aborted) return undefined;
 			const [rerun, apart] = rerunState === commandRerun ? prepared : NO_RERUN;
 			carriedPredictions.delete(startInput.sessionID);
@@ -277,36 +266,15 @@ export function createPatternPlanSource({
 				identity: identity.id, condition: "execution_succeeded" as const }));
 			return { id, source: "pattern_aware", revision: 0, actions: planActions(candidates, store, data.schemaHashes, patternSettings.beamWidth, dependencies) };
 		}),
-		continue: ({
-			startInput,
-			data,
-			settings,
-			candidate,
-			adoptedAction,
-			proposalID,
-			actionID,
-			revision,
-			feedback,
-			output,
-			trigger,
-			signal,
-		}) => admit(settings, async (patternSettings) => {
+		continue: ({ startInput, data, settings, candidate, adoptedAction, proposalID, actionID, revision, feedback, output, trigger, signal }) => admit(settings, async (patternSettings) => {
 			if (signal.aborted) return undefined;
 			const context = asPatternPlanFeedback(feedback);
 			if (!context || context.operation) return undefined;
 			const action = adoptedAction ?? candidate;
-			const next = context.store.continue(
-				context.continuation,
-				predictedEvent(startInput, action, output, candidateExecutionMs(candidate)),
-				data.schemaHashes,
-				trigger === "actor_adopted",
-				patternSettings,
-			);
+			const next = context.store.continue(context.continuation, predictedEvent(startInput, action, output, candidateExecutionMs(candidate)),
+				data.schemaHashes, trigger === "actor_adopted", patternSettings);
 			if (!next.length) return undefined;
-			return {
-				proposalID,
-				source: "pattern_aware",
-				revision,
+			return { proposalID, source: "pattern_aware", revision,
 				upsert: planActions(next, context.store, data.schemaHashes, patternSettings.beamWidth, [{ actionID, condition: "execution_succeeded" }], actionID),
 			};
 		}),
@@ -336,18 +304,14 @@ export function createPatternPlanSource({
 			}
 			const key = agentBatchKey(consumeInput.sessionID, consumeInput.turnID);
 			const batch = authoritativeBatches.get(key) ?? new Map();
-			const event: PatternAwareEventInput = {
-				sessionID: consumeInput.sessionID,
-				turnID: consumeInput.turnID,
-				...observed,
+			batch.set(order, { sessionID: consumeInput.sessionID, turnID: consumeInput.turnID, ...observed,
 				...(schemaHash === undefined ? {} : { schemaHash }),
 				learnTarget: candidateToolNames(settings, actionSemantics).includes(tool),
-			};
-			batch.set(order, event);
+			});
 			authoritativeBatches.set(key, batch);
 			await observeWorkspace(rerunState);
 			// A closing turn drops these updates and the next turn predicts afresh (a rerun then goes with it): never hold turn closure for them.
-			let [rerun, apart] = signal?.aborted ? NO_RERUN : await reruns(rerunState, data.schemaHashes, patternSettings);
+			let [rerun, apart] = signal?.aborted ? NO_RERUN : await reruns(rerunState, data.schemaHashes);
 			if (rerunState !== commandRerun) [rerun, apart] = NO_RERUN;
 			if (!patternSettings.multiStepEnabled && !rerun.length || signal?.aborted) return undefined;
 			let actions = rerun;
@@ -424,6 +388,14 @@ export function createPatternPlanSource({
 				// Optional learning cannot poison later observations or the Actor lifecycle.
 			});
 	};
+	const clearSession = async () => {
+		await lifecycle.drain();
+		const closing = commandRerun;
+		commandRerun = undefined;
+		await releaseChanges(closing);
+		for (const entries of [revisions, carriedPredictions, operationBindings, learnedCommands]) entries.clear();
+		for (const [key, batch] of authoritativeBatches) if (batch.values().next().value?.sessionID === sessionID) authoritativeBatches.delete(key);
+	};
 	return {
 		source,
 		hints: ({ sessionID, schemaHashes, settings }) => admit(settings, async (patternSettings) => {
@@ -436,38 +408,18 @@ export function createPatternPlanSource({
 		// Serving the Actor is recorded before the owning prediction settles, which credits it even when unmatched.
 		actorActionSettled: ({ settlement, candidateFeedback: feedback }) => {
 			if (settlement.provider.kind === "speculative" && asPatternPlanFeedback(feedback)) served.add(feedback as PatternPlanFeedback);
-
 		},
 		finishSession: () => lifecycle.run(async () => {
-			await lifecycle.drain();
-			const closing = commandRerun;
-			commandRerun = undefined;
-			await releaseChanges(closing);
-			revisions.clear();
-			carriedPredictions.clear();
-			operationBindings.clear();
-			learnedCommands.clear();
-			clearAuthoritativeSession(authoritativeBatches, sessionID);
-			try {
-				await flushStores(true);
-			} catch {
-				// Persistence failure must not change Agent lifecycle semantics.
-			}
+			await clearSession();
+			await flushStores(true).catch(() => {}); // Persistence failure must not change Agent lifecycle semantics.
 		}),
 		dispose: () => lifecycle.close(async () => {
 			await analysisTail;
-			await lifecycle.drain();
-			const closing = commandRerun;
-			commandRerun = undefined;
-			await releaseChanges(closing);
+			await clearSession();
 			const leases = [...ownedStores.values()];
 			ownedStores.clear();
 			openedStore = undefined;
 			authoritativeBatches.clear();
-			operationBindings.clear();
-			learnedCommands.clear();
-			revisions.clear();
-			carriedPredictions.clear();
 			await Promise.allSettled(leases.map(async lease => (await lease).release()));
 		}),
 	};
@@ -484,10 +436,6 @@ function patternPredictionSignature(candidates: readonly PatternAwareCandidate[]
 		candidates.map((candidate) => [candidate.actionIdentity, candidate.horizon, candidate.latestHorizon] as const)
 			.sort(([left], [right]) => left.localeCompare(right)),
 	);
-}
-
-function clearAuthoritativeSession(batches: Map<string, Map<number, PatternAwareEventInput>>, sessionID: string): void {
-	for (const [key, batch] of batches) if (batch.values().next().value?.sessionID === sessionID) batches.delete(key);
 }
 
 function asPatternPlanFeedback(value: unknown): PatternPlanFeedback | undefined {
