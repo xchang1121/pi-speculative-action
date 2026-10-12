@@ -72,7 +72,7 @@ npm run bench:suite -- --suite swe_diverse --repeats 3 --label speculative
 
 任务计时从 Host/工具初始化前到终态结算和回收完成，包含准备、预测、执行、验证、采纳、拒绝与清理。数据集下载和 checkout 先于任务计时，最终补丁检查在任务计时结束后进行。完整 Host 等待由基准独立记录，用于延迟诊断；复用准入依据执行证明，计算收益依据 T、H。命中的运行中工作等待完成，支持调用方取消。
 
-停留在预测阶段的候选记录阻塞和匹配事实，节省量依据已执行并采纳的计算计量。`traces` 的来源请求、预测、候选和 Actor 调用保留原事件结构，导出时清理 `cache`/`sessionID`；通过 turn、decision、prediction 和 candidate ID 关联，预算或门控拒绝保存在来源请求的 `empty.cause`。事件和工具等待端点使用 epoch 毫秒；`provider.toolExecution` 的单调端点加 `metadata.monotonicTimeOrigin` 后可对齐。报告从既有记录还原计时和汇总。
+停留在预测阶段的候选记录阻塞和匹配事实，节省量依据已执行并采纳的计算计量。来源在计算产生时固定，借用、恢复和失败副本保留原归属，历史未知不归给当前消费者。原生子操作的成功消费按所有权回执结算候选，嵌套消费标作投影；已结算的失配不重写，晚到复用仍计 H。`traces` 的来源请求、预测、候选和 Actor 调用保留原事件结构，导出时清理 `cache`/`sessionID`；通过 turn、decision、prediction 和 candidate ID 关联，预算或门控拒绝保存在来源请求的 `empty.cause`。事件和工具等待端点使用 epoch 毫秒；`provider.toolExecution` 的单调端点加 `metadata.monotonicTimeOrigin` 后可对齐。报告从既有记录还原计时和汇总。
 
 `traces.slowCalls` 将等待至少 500ms 的调用按实际等待时长排序，连接唯一 Actor 结算、预测与候选记录，并标出部分复用。同一决策的来源请求作为上下文保留；调用失配原因依据该调用的实际结算单独归因，调用 ID 重复时标记归因歧义。`summary.slowCallCoverage` 报告慢调用占全部已完成调用等待总和的比例，采用逐调用累计口径；并行等待采用区间并集口径单独计量。
 

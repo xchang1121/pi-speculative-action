@@ -19,7 +19,7 @@ import { deferred, onExit } from "./async.ts";
 const directories = temporaryDirectories("pi-extension-system-");
 afterEach(async () => { vi.unstubAllEnvs(); vi.restoreAllMocks(); await directories.dispose(); });
 
-test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-stale", "native-running", "native-retired", "native-unkeyed"] : [])])("runs the shipped extension through a real Pi session (%s)", async mode => {
+test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-nested", "native-stale", "native-running", "native-retired", "native-unkeyed"] : [])])("runs the shipped extension through a real Pi session (%s)", async mode => {
 	const enabled = mode !== "off", native = mode.startsWith("native"), running = mode === "native-running" || mode === "native-retired";
 	const cwd = await directories.create(native ? os.homedir() : undefined), agentDir = path.join(cwd, "agent");
 	await mkdir(agentDir); vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
@@ -79,8 +79,10 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-st
 		await session.bindExtensions({ mode: "print", onError: error => { throw error; } });
 		if (native) {
 			let backend: LinuxProcessReuseBackend | undefined;
-			const observe = LinuxProcessReuseBackend.prototype.observeNative;
-			vi.spyOn(LinuxProcessReuseBackend.prototype, "observeNative").mockImplementation(function (this: LinuxProcessReuseBackend, ...args) { backend = this; return observe.apply(this, args); });
+			const observe = LinuxProcessReuseBackend.prototype.observeBindings, nested = !["native", "native-stale"].includes(mode);
+			vi.spyOn(LinuxProcessReuseBackend.prototype, "observeBindings").mockImplementation(function (this: LinuxProcessReuseBackend, scope, execute, receive, ...args) {
+				backend = this; return observe.call(this, scope, execute, (bindings, computations) => receive(nested && scope.callID === "seed" ? bindings.slice(0, 1) : bindings, computations), ...args);
+			});
 			await compileBenchmarkHelper(cwd, { source: "slow.c", output: "slow", code: "#include <stdio.h>\n#include <fcntl.h>\n#include <unistd.h>\nint main(int n,char**v){int f=open(v[1],O_RDONLY);if(f<0)return 1;unsigned long h=5381;char c;while(read(f,&c,1)==1)h=h*33+c;close(f);for(volatile unsigned long i=0;i<40000000ul;i++)h^=i;printf(\"%s %lx\\n\",v[1],h);return 0;}\n" });
 			await commitBenchmarkFixture(cwd, "sdk-callback");
 			const initial = "printf initial:; ./slow notes.txt; :", remaining = "printf remaining:; ./slow notes.txt; printf once >> marker";
@@ -102,8 +104,13 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-st
 			expect(results.at(-1)?.content, JSON.stringify(session.messages)).toEqual([{ type: "text", text: "hook:own:format_rows:remaining:" + execFileSync("./slow", ["notes.txt"], { cwd, encoding: "utf8" }) }]);
 			expect(results.every(result => !result.isError)).toBe(true); expect(await readFile(path.join(cwd, "marker"), "utf8")).toBe("once");
 			expect(calls).toEqual(["seed", "check"]); expect(prepared).toEqual([initial, remaining]);
-			expect(backend!.actorMetrics().hits).toBe(Number(reused)); expect(events.filter(event => event.type === "actor_action").at(-1)?.computation?.hiddenComputeMs! > 0).toBe(reused);
-			expect(!!events.filter(event => event.type === "actor_action").at(-1)?.settlement.actionKeyHash).toBe(mode !== "native-unkeyed");
+			const settled = events.filter(event => event.type === "actor_action").at(-1)!, timing = settled.computation!;
+			expect(backend!.actorMetrics().hits).toBe(Number(reused)); expect(timing.hiddenComputeMs > 0).toBe(reused);
+			expect((timing.hiddenByMode ?? []).reduce((total, part) => total + part.hiddenComputeMs, 0)).toBeCloseTo(timing.hiddenComputeMs, 5);
+			const predictions = events.filter(event => event.type === "operation_prediction"), adopted = predictions.flatMap(event => event.settlement.observation === "observed" && event.settlement.match.matched && event.settlement.match.adoption.status === "adopted" ? [event.settlement.match.relation] : []);
+			expect(adopted).toHaveLength(Number(reused && mode !== "native-retired")); if (nested && adopted.length) expect(adopted[0]).toMatchObject({ kind: "projected", projector: "owned-operation" });
+			if (mode === "native-retired") expect(predictions.filter(event => event.settlement.prediction.id === predictions[0]!.settlement.prediction.id)).toMatchObject([{ settlement: { observation: "unobserved", cause: { code: "operation_not_observed" } } }]);
+			expect(!!settled.settlement.actionKeyHash).toBe(mode !== "native-unkeyed");
 			if (publication) expect(publication.joined()).toBe(true);
 			expect(events.filter(event => event.type === "candidate" && event.state.status === "cancelled" && event.state.cause.code === "tool_disabled" && event.state.executionMs > 0)).toEqual([]);
 			return;

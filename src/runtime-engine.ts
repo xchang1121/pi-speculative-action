@@ -1074,18 +1074,16 @@ export function makeSpeculativeActionRuntime<
 			// A root fork outliving its turn runs in the live turn's scope: its own turn's snapshots and handoffs are closed.
 			const live = parent || session.turns.get(owner.turnID)?.lifecycle === "active" ? undefined
 				: [...session.turns.values()].find((turn) => turn.lifecycle === "active")?.startInput;
-			if (draft.type === "operation" || candidate.origin === "prediction") candidate.onOperationAdopted = adoption => {
+			if (draft.type === "operation") candidate.onOperationAdopted = adoption => {
 				const turn = session.turns.get(adoption.scope.turnID);
-				if (session.lifecycle.sealed || session.id !== adoption.scope.sessionID || !turn ||
-					draft.type === "operation" && draft.operation?.identity !== adoption.operationIdentity) return;
-				if (candidate.origin === "prediction" && adoption.computation?.reused)
-					TimelineInterval.producedBy(adoption.computation.computation, { source: draft.source ?? "cache", mode: draft.mode });
-				if (draft.type !== "operation") return;
+				if (session.lifecycle.sealed || session.id !== adoption.scope.sessionID || !turn) return;
+				const relation: ActionKeyMatch = draft.operation?.identity === adoption.operationIdentity ? { kind: "exact", distance: 0 }
+					: { kind: "projected", distance: 1, projector: "owned-operation" };
 				const actorAction: ActorActionIdentity = { id: adoption.id, kind: "operation", sequence: adoption.sequence,
 					decisionSequence: turn.decisionSequence, turnID: turn.turnID };
 				candidate.actorAdopted = true; candidate.forkParent = undefined;
 				for (const node of session.plan.consumers(candidate.id)) {
-					const opportunity = session.plan.claimMatch(node.proposalID, node.action.id, actorAction, { kind: "exact", distance: 0 });
+					const opportunity = session.plan.claimMatch(node.proposalID, node.action.id, actorAction, relation);
 					const settled = opportunity && session.plan.confirm(opportunity, actorAction, { status: "adopted", candidateID: candidate.id });
 					if (settled) predictionSettled(session, node, settled);
 				}
@@ -1106,7 +1104,7 @@ export function makeSpeculativeActionRuntime<
 				onOperationJoinable: available => { candidate.operationJoinable = available; },
 				acceptOperationScope: session.acceptOperationScope,
 				...(parent ? { parentWorld: candidateBranch(parent)! } : {}),
-			}), branch => branch.computationDependencies ?? []);
+			}), branch => branch.computationDependencies ?? [], candidate.origin === "prediction" ? { source: draft.source ?? "cache", mode: draft.mode } : undefined);
 			branch = evaluation.output;
 			inputs?.dispose(); // The returned branch owns its proof before cache admission can evict sources.
 			const rejected = !branch.inputsOnly && adapter.rejectCandidateOutput?.({ output: branch.output, candidate: publicCandidate(candidate) });
@@ -1119,7 +1117,6 @@ export function makeSpeculativeActionRuntime<
 				await session.lifecycle.release(branch);
 				return;
 			}
-			if (candidate.origin === "prediction") TimelineInterval.producedBy(computation, { source: draft.source ?? "cache", mode: draft.mode });
 			scheduler.observe(actionExecutionIdentity(action), false);
 			candidateStore.settle(session.id, candidate, candidate.work.reservation.kind === "shared", branch.reconstruct ? branch.inputResources : undefined);
 			// An exclusive result waits for its own adoption; meanwhile the unchanged bytes it read can answer other reads.

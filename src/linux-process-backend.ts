@@ -819,14 +819,14 @@ export class LinuxProcessReuseBackend {
 		socket.setEncoding("utf8");
 		socket.on("data", (chunk) => { body += chunk; if (Buffer.byteLength(body) > MAX_REQUEST_BYTES) socket.destroy(new Error("request too large")); });
 		socket.once("error", () => undefined);
-		socket.once("end", () => {
+		socket.once("end", AsyncLocalStorage.bind(() => {
 			void session.lifecycle.track(Promise.resolve().then(() => this.handleWireRequest(session, body)).then((response) => { socket.end(wireResponse(response)); })
 				.catch((error) => {
 					this.setError(session, errorMessage(error));
 					session.incompleteReasons.add(`broker:${errorMessage(error)}`);
 					socket.end("f\n");
 				}));
-		});
+		}));
 	}
 
 	private async handleWireRequest(session: ActiveSession, body: string): Promise<DispatcherResponse> {

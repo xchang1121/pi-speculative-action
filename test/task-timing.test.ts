@@ -4,23 +4,28 @@ import { TaskTimeline, TimelineInterval, toolSpeedup, normalizeTimelineComputati
 describe("consumed calculation and time hidden before Actor issue", () => {
 	it("records execution boundaries and diagnoses the remaining control wait", async () => {
 		let now = 0;
+		const borrowed = new TimelineInterval(200, 240), producer = { source: "pattern", mode: "early" };
 		const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
 		try {
 			const evaluation = await TimelineInterval.measure(async () => {
 				now = 10;
 				await TimelineInterval.outside(async () => {
 					now = 1000;
-					TimelineInterval.use(new TimelineInterval(200, 240));
+					for (const unknown of [TimelineInterval.unknownReuse("old"), TimelineInterval.from({ startedAt: 200, completedAt: 240 })]) expect(TimelineInterval.serialize(unknown)?.nodes[0]?.producer).toBeUndefined();
+					for (const input of [borrowed, TimelineInterval.restore(TimelineInterval.serialize(borrowed))!, TimelineInterval.attempted(borrowed)]) TimelineInterval.use(input);
 					const calculation = await TimelineInterval.measure(() => { now = 1010; });
+					expect(new TaskTimeline(0).recordTool(TimelineInterval.restore(TimelineInterval.serialize(calculation.computation))!, 100_000, true).hiddenByMode)
+						.toEqual([{ ...producer, hiddenComputeMs: 10 }]);
 					TimelineInterval.own(calculation.computation);
 					now = 1015;
 				});
 				now = 1025;
-			});
+			}, undefined, producer);
 			const graph = TimelineInterval.serialize(evaluation.computation)!;
 			expect(graph.nodes.flatMap(node => node.inputs ?? []).some(input => input.overhead)).toBe(false);
 			expect(new TaskTimeline(0).recordTool(evaluation.computation, 100_000)).toMatchObject({ toolComputeMs: 70, hiddenComputeMs: 40 });
-			expect(new TaskTimeline(0).recordTool(TimelineInterval.restore(graph)!, 100_000, true)).toMatchObject({ toolComputeMs: 70, hiddenComputeMs: 70 });
+			expect(new TaskTimeline(0).recordTool(TimelineInterval.restore(graph)!, 100_000, true)).toMatchObject({ toolComputeMs: 70, hiddenComputeMs: 70,
+				hiddenByMode: [{ ...producer, hiddenComputeMs: 30 }] });
 			expect(new TaskTimeline(0).recordCall([{ computation: evaluation.computation }], 0, now))
 				.toMatchObject({ toolComputeMs: 70, hiddenComputeMs: 0, adoptionWaitMs: 955 });
 			clock.mockClear();

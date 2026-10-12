@@ -20,10 +20,10 @@ export interface TimelineDependency {
 
 type Receipt = Pick<TimelineDependency, "owned" | "reused" | "overhead" | "computeUncertain">;
 const dependencies = new WeakMap<TimelineInterval, readonly TimelineDependency[]>();
-const collecting = new AsyncLocalStorage<{ inputs?: Map<TimelineInterval, Receipt> }>();
+const collecting = new AsyncLocalStorage<{ inputs?: Map<TimelineInterval, Receipt>; producer?: ComputationProducer }>();
 const calculating = new AsyncLocalStorage<CalculationClock | undefined>();
 const calculationSpans = new WeakMap<TimelineInterval, readonly TimelineInterval[]>();
-const provenance = new WeakMap<TimelineInterval, { readonly id: string; readonly priorMs: number }>();
+const priorDurations = new WeakMap<TimelineInterval, number>();
 const owners = new WeakMap<TimelineInterval, TimelineInterval>();
 const producers = new WeakMap<TimelineInterval, ComputationProducer>();
 const identities = new WeakMap<object, string>(), publishedIdentities = new WeakSet<TimelineInterval>();
@@ -45,9 +45,11 @@ export class TimelineInterval {
 	readonly startedAt: number;
 	readonly completedAt: number;
 
-	constructor(startedAt: number, completedAt: number, inputs: readonly TimelineDependency[] = [], spans?: readonly TimelineInterval[]) {
+	constructor(startedAt: number, completedAt: number, inputs: readonly TimelineDependency[] = [], spans?: readonly TimelineInterval[],
+		producer: ComputationProducer | null = collecting.getStore()?.producer ?? null) {
 		this.startedAt = metric(startedAt);
 		this.completedAt = Math.max(this.startedAt, metric(completedAt));
+		if (producer) producers.set(this, Object.freeze({ source: producer.source, ...(producer.mode !== undefined ? { mode: producer.mode } : {}) }));
 		if (spans) calculationSpans.set(this, Object.freeze(spans.map(TimelineInterval.from)));
 		if (inputs.length) dependencies.set(this, Object.freeze(inputs.map(input => Object.freeze({
 			computation: TimelineInterval.from(input.computation),
@@ -60,12 +62,12 @@ export class TimelineInterval {
 
 	static from(interval: TimelineInterval): TimelineInterval {
 		const { startedAt, completedAt } = interval;
-		return interval instanceof TimelineInterval ? interval : new TimelineInterval(startedAt, completedAt);
+		return interval instanceof TimelineInterval ? interval : new TimelineInterval(startedAt, completedAt, [], undefined, null);
 	}
 
-	/** Failed evaluations never transfer their borrowed work to the caller. */
-	static async collect<T>(execute: () => T | Promise<T>) {
-		const scope = { inputs: new Map<TimelineInterval, Receipt>() as Map<TimelineInterval, Receipt> | undefined };
+	/** Record provenance before publication; failed evaluations never transfer borrowed work to the caller. */
+	static async collect<T>(execute: () => T | Promise<T>, producer = collecting.getStore()?.producer) {
+		const scope = { inputs: new Map<TimelineInterval, Receipt>() as Map<TimelineInterval, Receipt> | undefined, producer: producer && Object.freeze({ ...producer }) };
 		try {
 			const output = await collecting.run(scope, execute);
 			return { output, dependencies: Object.freeze([...scope.inputs!].map(([computation, receipt]) => ({ computation, ...receipt, shared: [computation] }))) };
@@ -95,13 +97,12 @@ export class TimelineInterval {
 			}
 			const result = new TimelineInterval(current.startedAt, current.completedAt, (dependencies.get(current) ?? []).map(input =>
 				input.reused ? { computation: input.computation, overhead: true, shared: input.shared }
-					: { ...input, computation: copies.get(input.computation)! }), calculationSpans.get(current));
+					: { ...input, computation: copies.get(input.computation)! }), calculationSpans.get(current), computationProducer(current) ?? null);
 			identities.set(result, computationIdentity(current)); clocks.set(result, computationClock(current));
 			const timeOrigin = computationTimeOrigin(current);
 			if (timeOrigin !== undefined) timeOrigins.set(result, timeOrigin);
-			const source = provenance.get(current), producer = producers.get(current), groups = concurrencyGroups.get(current);
-			if (source) provenance.set(result, source);
-			if (producer) producers.set(result, producer);
+			const priorMs = priorDurations.get(current), groups = concurrencyGroups.get(current);
+			if (priorMs !== undefined) priorDurations.set(result, priorMs);
 			if (groups) concurrencyGroups.set(result, groups);
 			copies.set(current, result);
 		}
@@ -113,14 +114,15 @@ export class TimelineInterval {
 	}
 
 	/** Record only active calculation segments; control work never produces a duration or a cost sample. */
-	static async measure<T>(execute: () => T | Promise<T>, inputs: (output: T) => readonly TimelineDependency[] = () => []) {
+	static async measure<T>(execute: () => T | Promise<T>, inputs: (output: T) => readonly TimelineDependency[] = () => [], producer = collecting.getStore()?.producer) {
+		producer = producer && Object.freeze({ ...producer });
 		const startedAt = performance.now(), clock = new CalculationClock(startedAt, calculating.getStore());
 		try {
-			const evaluation = await calculating.run(clock, () => TimelineInterval.collect(execute));
+			const evaluation = await calculating.run(clock, () => TimelineInterval.collect(execute, producer));
 			const completedAt = clock.finish();
 			let computation: TimelineInterval;
-			try { computation = new TimelineInterval(startedAt, completedAt, [...evaluation.dependencies, ...inputs(evaluation.output)], clock.spans); }
-			catch { computation = new TimelineInterval(startedAt, completedAt, [], clock.spans); } // Evidence cannot replace the execution outcome.
+			try { computation = new TimelineInterval(startedAt, completedAt, [...evaluation.dependencies, ...inputs(evaluation.output)], clock.spans, producer); }
+			catch { computation = new TimelineInterval(startedAt, completedAt, [], clock.spans, producer); } // Evidence cannot replace the execution outcome.
 			return { ...evaluation, computation };
 		} finally { clock.finish(); }
 	}
@@ -155,7 +157,7 @@ export class TimelineInterval {
 	/** A production can establish parallelism before its enclosing interval exists. */
 	static group(computation: TimelineInterval, owner: object): void {
 		const groups = new Set(concurrencyGroups.get(computation));
-		groups.add(objectIdentity(owner)); concurrencyGroups.set(computation, groups);
+		groups.add(computationIdentity(owner)); concurrencyGroups.set(computation, groups);
 	}
 
 	/** Missing historical evidence contributes no invented duration and remains visibly incomplete. */
@@ -193,13 +195,12 @@ export class TimelineInterval {
 		const nodes: SerializedTimelineNode[] = [];
 		for (const [id, { computation: current, groups, producer }] of selected) {
 			if (!reachable.has(id)) continue;
-			const priorMs = provenance.get(current)?.priorMs;
+			const priorMs = priorDurations.get(current);
 			const spans = calculationSpans.get(current);
 			nodes.push({ id, clock: computationClock(current), startedAt: current.startedAt, completedAt: current.completedAt,
 				...(computationTimeOrigin(current) !== undefined ? { timeOrigin: computationTimeOrigin(current) } : {}),
 				...(spans ? { spans: spans.map(({ startedAt, completedAt }) => ({ startedAt, completedAt })) } : {}),
-				...(priorMs ? { priorMs } : {}), ...(producer ? { producer: { source: producer.source,
-					...(producer.mode !== undefined ? { mode: producer.mode } : {}) } } : {}), ...(groups.size ? { groups: [...groups] } : {}),
+				...(priorMs ? { priorMs } : {}), ...(producer ? { producer } : {}), ...(groups.size ? { groups: [...groups] } : {}),
 				...(incompleteReuse.has(current) ? { incomplete: true as const } : {}),
 				inputs: (dependencies.get(current) ?? []).map(input => ({ id: computationIdentity(input.computation),
 					...(input.owned && computationIdentity(owners.get(input.computation) ?? current) === id ? { owned: true as const } : {}),
@@ -225,13 +226,12 @@ export class TimelineInterval {
 					clocks.set(span, part.clock);
 					return span;
 				}),
-			})), node.spans?.map(span => new TimelineInterval(span.startedAt, span.completedAt)));
+			})), node.spans, node.producer ?? null);
 			identities.set(current, node.id); publishedIdentities.add(current);
 			clocks.set(current, node.clock);
 			if (node.timeOrigin !== undefined) timeOrigins.set(current, node.timeOrigin);
-			provenance.set(current, { id: node.id, priorMs: node.priorMs ?? 0 });
+			priorDurations.set(current, node.priorMs ?? 0);
 			if (node.groups) concurrencyGroups.set(current, new Set(node.groups));
-			if (node.producer) producers.set(current, node.producer);
 			if (node.incomplete) incompleteReuse.add(current);
 			restored.set(node.id, current);
 		}
@@ -240,10 +240,9 @@ export class TimelineInterval {
 
 	/** Retained history contributes its measured duration even without a same-process clock. */
 	static retained(id: string, durationMs: number, original?: TimelineInterval): TimelineInterval {
-		const computation = original ?? new TimelineInterval(0, 0);
-		const identity = publishedIdentities.has(computation) ? computationIdentity(computation) : id;
-		identities.set(computation, identity);
-		provenance.set(computation, { id: identity, priorMs: original ? provenance.get(original)?.priorMs ?? 0 : metric(durationMs) });
+		const computation = original ?? new TimelineInterval(0, 0, [], undefined, null);
+		identities.set(computation, publishedIdentities.has(computation) ? computationIdentity(computation) : id);
+		priorDurations.set(computation, original ? priorDurations.get(original) ?? 0 : metric(durationMs));
 		return computation;
 	}
 }
@@ -355,7 +354,7 @@ export class TaskTimeline {
 		let reused = false;
 		for (const { computation, flags, producer } of selected.values()) {
 			if (incompleteReuse.has(computation)) { complete = false; if (flags & 2) hiddenComputeIncomplete = true; }
-			const priorMs = provenance.get(computation)?.priorMs ?? 0;
+			const priorMs = priorDurations.get(computation) ?? 0;
 			totals[0]! += priorMs;
 			const shared = (dependencies.get(computation) ?? []).flatMap(input => (input.shared ?? []).flatMap(part => {
 				if (computationClock(part) !== computationClock(computation)) return [];
@@ -410,7 +409,7 @@ export class TaskTimeline {
 	}
 }
 
-function objectIdentity(object: object): string {
+function computationIdentity(object: object): string {
 	let id = identities.get(object);
 	if (!id) { id = `timeline:${identityNamespace}:${++nextIdentity}`; identities.set(object, id); }
 	return id;
@@ -419,14 +418,6 @@ function objectIdentity(object: object): string {
 function computationTimeOrigin(computation: TimelineInterval): number | undefined { return computationClock(computation) === identityNamespace ? performance.timeOrigin : timeOrigins.get(computation); }
 
 function computationClock(computation: TimelineInterval): string { return clocks.get(computation) ?? identityNamespace; }
-
-function computationIdentity(computation: TimelineInterval): string {
-	const existing = identities.get(computation);
-	if (existing) return existing;
-	const id = provenance.get(computation)?.id;
-	if (id) { identities.set(computation, id); return id; }
-	return objectIdentity(computation);
-}
 
 function preferredComputation(previous: TimelineInterval | undefined, current: TimelineInterval): TimelineInterval {
 	if (!previous || incompleteReuse.has(previous) && !incompleteReuse.has(current)) return current;
