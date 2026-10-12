@@ -250,7 +250,7 @@ export interface SpeculativeActionRuntimeAdapter<
 	readonly executeCandidate: (input: Omit<RuntimeTurnContext<StartInput, StateData>, "settings"> & BoundCandidateCall & {
 		readonly parentWorld?: WorldBranch<Output>;
 		/** Sealed input owners leased until execution settles; the backend must retain any derived proof. */
-		readonly inputs?: (path: string) => Iterable<object>;
+		readonly inputs?: (path?: string) => Iterable<object>;
 		readonly onOperationAdopted?: (adoption: ExecutionOperationAdoption) => void;
 		/** Scheduling hint for a backend's running-operation join; it grants no reuse authority. */
 		readonly onOperationJoinable?: (available: () => boolean) => void;

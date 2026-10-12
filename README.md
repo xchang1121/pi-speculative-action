@@ -38,6 +38,8 @@ flowchart LR
 
 各后端遵循同一协议：`ExecutionWorld` 提供执行或观察能力，一次执行返回 `WorldBranch`，封装输出、依赖证明、可提交效果和资源释放方法；`EffectTransaction` 管理验证与采纳状态。后端可额外提供封存输入与查询能力，使不同工具或参数复用已有输入计算。通过能力检查的执行路线可以提前执行。
 
+自定义工具通过 `ToolInvocation.filesystem`、`captureInputs` 或 `ProcessExecutionCoordinator` 绑定实际操作；`ExecutionWorld.observeOperations` 可独立观察调用，即使整工具没有动作键。共享输入和子计算按实际依赖、效果与所有权查找和验新，工具名称不限制复用；运行时才发现的路径也能查询现有资源。生产者退出当前工具集后，已经运行的工作与已完成资源继续由原有所有权和预算管理，尚未启动的预测重新检查可用工具。`ToolFilesystemOperations.prepare` 以共享绑定和计算键借用已完成子计算，消费工具继续执行自己的格式化与剩余操作。原生子计算携带后端签发的独立效果契约，准备时仍检查当前父调用权限；整段宿主函数的隔离仍需明确绑定完整执行出口。未接入操作出口的第三方函数需要宿主提供绑定。
+
 | 实现 | 方法与边界 |
 | --- | --- |
 | [封存资源](./src/agent-execution-world.ts) / [输入版本](./src/resource-version.ts) | 为绑定的文件工具捕获实际访问的数据，保留内容与路径证明；后续查询复用仍有效的输入，并对本次使用的依赖精确验新。受控 `find/grep` 由 [统一工具绑定](./src/pi-tool-invocation.ts) 让 Actor 与投机使用相同执行器，需显式启用。 |

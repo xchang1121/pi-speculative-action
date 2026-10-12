@@ -1,4 +1,4 @@
-import type { ActionEffect, ActionKey } from "./action-semantics.ts";
+import type { ActionEffect, ActionKey, ActionSemanticsDefinition } from "./action-semantics.ts";
 import { effectCapabilitiesCover, type EffectCapabilities, type EffectRequirements } from "./effect-model.ts";
 import { cause, type ResourceValidation, zeroValidationMetrics } from "./settlement.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
@@ -85,6 +85,8 @@ export interface WorldCheckpoint { readonly backend: string; readonly id: string
 export interface ExecutionOperationBinding {
 	readonly backend: string;
 	readonly identity: string;
+	/** The internal unit's effects; its enclosing tool still supplies the permission check. */
+	readonly semantics: Pick<ActionSemanticsDefinition, "effect" | "requirements" | "resourceScope">;
 	/** Live preparation hint only; true never replaces backend permission or dependency checks. */
 	readonly available?: boolean;
 	/** Retrieval hint only. The issuing backend must check the current enclosing action's complete K(a). */
@@ -156,7 +158,7 @@ export interface WorldBranch<Output> {
 		readonly callID: string;
 		readonly signal: AbortSignal;
 		/** Leased sealed owners from the session's input index; the backend must prove every borrowed dependency. */
-		readonly inputs?: (path: string) => Iterable<object>;
+		readonly inputs?: (path?: string) => Iterable<object>;
 	}) => Promise<{
 		readonly output: Output;
 		/** Evidence for the current operation that evaluated these inputs. */
@@ -312,7 +314,7 @@ interface ExecutionWorldLifecycle<Context, Output> {
 	readonly speculation?: ExecutionWorldSpeculation<Context, Output>;
 	readonly observation?: ExecutionWorldObservation<Context, Output>;
 	/** Observe proven internal work inside exactly one native Actor call; never seals its whole result. */
-	readonly observeOperations?: <Value>(request: { readonly action: ActionKey; readonly scope: ExecutionScope; readonly learn?: boolean; readonly inputs?: (path: string) => Iterable<object> },
+	readonly observeOperations?: <Value>(request: { readonly action: ActionKey | undefined; readonly scope: ExecutionScope; readonly learn?: boolean; readonly inputs?: (path: string) => Iterable<object> },
 		execute: () => Promise<Value>, observe: (bindings: readonly ExecutionOperationBinding[], computations?: readonly TimelineDependency[]) => void) => Promise<Value>;
 	/** Retire preparation invalidated by an Actor mutation before its successors may launch. */
 	readonly actorFallbackSettled?: () => Promise<void>;
@@ -339,7 +341,7 @@ export type ExecutionWorld<Context, Output> = ExecutionWorldLifecycle<Context, O
 
 /** The only authority allowed to resolve, prepare, fork, and dispose speculative tool execution. */
 export class ExecutionWorldRouter<Context, Output> {
-	private readonly lifecycle: RuntimeLifecycleLane;
+	protected readonly lifecycle: RuntimeLifecycleLane;
 	private readonly speculationEnabled: (backend: string) => boolean;
 	private readonly worldsByID = new Map<string, ExecutionWorld<Context, Output>>();
 	private readonly routeObservations = new Map<string, ExecutionWorldDiagnosticReport & { readonly cwd: string }>();
@@ -350,7 +352,7 @@ export class ExecutionWorldRouter<Context, Output> {
 		this.speculationEnabled = speculationEnabled;
 		for (const world of new Set(worlds)) {
 			if (!world.id.trim()) throw new Error("execution world id must not be empty");
-			if (!world.speculation && !world.observation) throw new Error(`execution world ${world.id} provides no operation`);
+			if (!world.speculation && !world.observation && !world.observeOperations) throw new Error(`execution world ${world.id} provides no operation`);
 			if (this.worldsByID.has(world.id)) throw new Error(`duplicate execution world ${world.id}`);
 			this.worldsByID.set(world.id, world);
 		}
@@ -371,11 +373,11 @@ export class ExecutionWorldRouter<Context, Output> {
 		return this.lifecycle.admit(() => world.speculation!.execute(context));
 	}
 
-	observeOperations<Value>(action: ActionKey, scope: ExecutionScope, execute: () => Promise<Value>,
+	observeOperations<Value>(action: ActionKey | undefined, scope: ExecutionScope, execute: () => Promise<Value>,
 		observe: (bindings: readonly ExecutionOperationBinding[], computations?: readonly TimelineDependency[]) => void, learn = false,
 		inputs?: (path: string) => Iterable<object>): Promise<Value> {
 		for (const world of this.worldsByID.values()) {
-			if (!world.observeOperations || !supportsTool(world.speculation ?? world.observation!, action.tool)) continue;
+			if (!world.observeOperations) continue;
 			let learning = false;
 			try { learning = learn && this.speculationEnabled(world.id); } catch { /* Optional observation cannot deny the Actor call. */ }
 			const next = execute;

@@ -9,7 +9,7 @@ import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { createResourceSnapshotExecutionWorld, type SpeculativeToolExecutionContext } from "../src/agent-execution-world.ts";
 import { isPoisonedEffectCommit } from "../src/effect-transaction.ts";
 import { slash } from "../src/path-utils.ts";
-import { PI_OPERATION_TOOLS, resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
+import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { stableValueHash } from "../src/stable-value-hash.ts";
 import { runThinkThreadTool } from "../src/thinkthread/tool-runner.ts";
 import { decodeThinkThreadToolRunnerResponse, encodeThinkThreadToolRunnerResponse,
@@ -56,7 +56,7 @@ export async function qualifyStockTool(
 		executionScope: { sessionID: root, turnID: name } };
 	const operation = { tool: name, input: args, action, callID: context.callID };
 	const workspaceSandbox = new WorkspaceSandboxService(), fallback = workspaceSandbox.createExecutionWorld({ driver: "git" });
-	const resources = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: PI_OPERATION_TOOLS.resources, maxBytes: () => 1024 * 1024 });
+	const resources = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { maxBytes: () => 1024 * 1024 });
 	const gateway = new ToolExecutionGateway<SpeculativeToolExecutionContext, ToolSettlement>([fallback, resources]);
 	const actor = async (): Promise<ToolSettlement> => {
 		try {
@@ -80,7 +80,7 @@ export async function qualifyStockTool(
 		const expected = await workspaceState(root);
 		const executeRoute = async () => {
 			await reset();
-			const route = await gateway.resolve({ operation, effect: semantics.effect, requirements: semantics.requirements }, { cwd });
+			const route = await gateway.resolve({ ...operation, effect: semantics.effect, requirements: semantics.requirements }, { cwd });
 			assert.equal(route?.backend, semantics.effect === "workspace_mutation" ? fallback.id : invocation?.filesystem ? resources.id : undefined,
 				`${name}: native route differs from its stock fallback`);
 			let output: ToolSettlement;

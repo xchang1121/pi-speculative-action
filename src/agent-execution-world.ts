@@ -1,5 +1,4 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import path from "node:path";
 import type { BigIntStats } from "node:fs";
 import { sameFilesystemIdentity, type StableFilesystemCapture } from "./filesystem-evidence.ts";
 import { PI_ACTION_SEMANTICS, type ActionKey, type ActionSemanticsRegistry } from "./action-semantics.ts";
@@ -21,8 +20,8 @@ export interface SpeculativeToolExecutionContext {
 	readonly action: ActionKey;
 	readonly callID: string;
 	readonly signal: AbortSignal;
-	/** Input owners remain leased for this execution; derived results must own their evidence. */
-	readonly inputs?: (path: string) => Iterable<object>;
+	/** Leased input owners, indexed by path or enumerated for dynamic queries; derived results own their evidence. */
+	readonly inputs?: (path?: string) => Iterable<object>;
 	readonly executionScope?: ExecutionScope;
 	readonly onOperationAdopted?: (adoption: ExecutionOperationAdoption) => void;
 	/** Live acquisition capability used only to avoid cancelling work the current Actor can join. */
@@ -40,7 +39,7 @@ export type SpeculativeAgentExecutionWorld = AgentExecutionWorld & {
 /** Observe Actor reads; only explicitly bound operations may execute ahead over sealed resource data. */
 export function createResourceSnapshotExecutionWorld(
 	actionSemantics: ActionSemanticsRegistry = PI_ACTION_SEMANTICS,
-	operations?: { readonly tools: readonly string[]; readonly maxBytes: () => number },
+	operations?: { readonly maxBytes: () => number },
 ): AgentExecutionWorld {
 	const canObserve = process.platform !== "win32";
 	const route = {
@@ -101,11 +100,10 @@ export function createResourceSnapshotExecutionWorld(
 				if (operations && invocation?.captureInputs) return invocation.captureInputs(context.action, operations.maxBytes(), context.callID);
 				if (process.platform === "linux" && operations && invocation?.process) return capture(context, operations.maxBytes(), true, true);
 				if (actionSemantics.definition(context.action)?.effect !== "observation") throw new Error("Actor input capture requires an explicit binding");
-				return capture(context, operations?.tools.includes(context.toolName) && invocation?.filesystem ? operations.maxBytes() : undefined);
+				return capture(context, operations && invocation?.filesystem ? operations.maxBytes() : undefined);
 			} },
-		...(operations?.tools.length ? { speculation: {
+		...(operations ? { speculation: {
 			...route,
-			tools: operations.tools,
 			fingerprint: (request) => {
 				if (request.action && !(request.action.executionContext as ToolInvocation | undefined)?.filesystem) {
 					throw new Error("Resource execution requires an explicitly bound operation");
@@ -116,10 +114,7 @@ export function createResourceSnapshotExecutionWorld(
 				const execute = (context.action.executionContext as ToolInvocation | undefined)?.filesystem;
 				if (!execute || context.parentCheckpoint) throw new Error("Resource execution context is not supported");
 				context.signal.throwIfAborted();
-				const attempted = new Set<object>();
-				for (const resource of context.action.resources) for (const source of context.inputs?.(path.resolve(context.action.resourceRoot ?? context.cwd, resource)) ?? []) {
-					if (attempted.has(source)) continue;
-					attempted.add(source);
+				for (const source of context.inputs?.() ?? []) {
 					const owner = resourceVersions.get(source);
 					if (!owner) continue;
 					try {

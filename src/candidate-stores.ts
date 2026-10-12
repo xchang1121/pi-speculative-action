@@ -100,8 +100,8 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 		return this.lookupRecords(scope, action, actionKeyProjectionPartitions(action, this.projectors), requireCoverage, includeInputs).map(({ entry, match }) => ({ entry, match }));
 	}
 
-	/** The same owned-name index serves dynamically discovered query dependencies. */
-	lookupInputs(scope: Scope, resources: readonly string[]): readonly Entry[] {
+	/** Path lookup and dynamic query discovery share the same bounded input owners. */
+	lookupInputs(scope: Scope, resources?: readonly string[]): readonly Entry[] {
 		return [...this.inputRecords(scope, resources)].sort(([left, a], [right, b]) => a - b || right.recency - left.recency)
 			.map(([{ entry }]) => entry);
 	}
@@ -215,16 +215,14 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 		indexed.memberships.length = kept;
 	}
 
-	private inputRecords(scope: Scope, resources: readonly string[]) {
-		const state = this.scopes.get(scope);
-		const inputs = new Map<IndexedEntry<Entry>, number>();
-		if (state) for (const resource of resources) {
+	private inputRecords(scope: Scope, resources?: readonly string[]) {
+		const state = this.scopes.get(scope), inputs = new Map<IndexedEntry<Entry>, number>();
+		if (state && !resources) for (const indexed of state.entries.values()) { if (indexed.inputs) inputs.set(indexed, 0); }
+		if (state) for (const resource of resources ?? []) {
 			let current = path.resolve(resource), depth = 0;
 			for (;;) {
 				const keys = depth ? [inputPartition(current, true)] : [inputPartition(current), inputPartition(current, true)];
-				for (const key of keys) {
-					for (const indexed of state.partitions.get(key) ?? []) inputs.set(indexed, Math.min(inputs.get(indexed) ?? depth, depth));
-				}
+				for (const key of keys) for (const indexed of state.partitions.get(key) ?? []) inputs.set(indexed, Math.min(inputs.get(indexed) ?? depth, depth));
 				const parent = path.dirname(current); if (parent === current) break;
 				current = parent; depth++;
 			}
@@ -237,6 +235,7 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 		if (!state) return [];
 		const inputs = this.inputRecords(scope, includeInputs ? action.resources.flatMap(resource =>
 			action.resourceRoot !== undefined || path.isAbsolute(resource) ? [path.resolve(action.resourceRoot ?? "", resource)] : []) : []);
+		if (includeInputs) for (const indexed of this.inputRecords(scope).keys()) { if (!inputs.has(indexed)) inputs.set(indexed, 1024); }
 		const views = includeInputs ? state.partitions.get(`view:${action.key}`) : undefined;
 		const candidates = new Set([...(state.exact.get(action.key) ?? []), ...inputs.keys(), ...(views ?? [])]);
 		for (const key of partitions) for (const indexed of state.partitions.get(key) ?? []) candidates.add(indexed);

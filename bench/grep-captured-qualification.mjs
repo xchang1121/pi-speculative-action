@@ -73,7 +73,7 @@ async function qualifyCaptured(cwd, profile, args, expected, changed, rejected =
     executions++;
     return bound.filesystem(observeInputs(view), request);
   } };
-  const world = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: ["grep"], maxBytes: () => 8 * 1024 * 1024 });
+  const world = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { maxBytes: () => 8 * 1024 * 1024 });
   const probe = searchJourney({ cwd, name: "grep", tools: [createGrepTool(cwd)], args, invocation, world,
     settings: { resourceCacheMaxEntries: 32, resourceCacheMaxBytes: 16 * 1024 * 1024 },
   });

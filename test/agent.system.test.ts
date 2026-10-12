@@ -6,7 +6,7 @@ import { afterEach, expect, test } from "vitest";
 import { WorkspaceSandboxService } from "../src/workspace-sandbox.ts";
 import { createResourceSnapshotExecutionWorld } from "../src/agent-execution-world.ts";
 import { createClosedSearchProfile, resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
-import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
+import { ActionSemanticsRegistry, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { PatternAwareStore, patternAwareSettings, patternAwareActionSemantics } from "../src/pattern-aware.ts";
 import { temporaryDirectories } from "./filesystem.ts";
 import { systemHost } from "./agent-system-fixture.ts";
@@ -15,6 +15,40 @@ import { commitBenchmarkFixture, createLinuxProcessBenchmark, textOutput } from 
 
 const directories = temporaryDirectories("pi-agent-system-");
 afterEach(directories.dispose);
+
+test.for(["actor", "preview", "dynamic", "dynamic-preview", "hints", "hints-preview", "retired", "retired-preview", "predicted", "stale", "binding"])("shares actual inputs across independently formatted tools (%s)", async mode => {
+	const cwd = await directories.create(), file = path.join(cwd, "input.txt"), shared = {};
+	await writeFile(file, "one\ntwo\n");
+	let builds = 0, renders = 0;
+	const names = ["count_records", "summarize_records"], read = PI_ACTION_SEMANTICS.definition("read")!;
+	const definitions = names.map((tool, index) => ({ ...read, tool, epoch: `custom:${tool}`, projectors: [], resourceScope: "captured_inputs" as const,
+		canonicalize: (input: unknown, cwd: string) => { const key = read.canonicalize(input, cwd); return key && { ...key,
+			resources: !index ? key.resources : mode.startsWith("dynamic") ? [] : mode.startsWith("hints") ? ["selector"] : key.resources }; } }));
+	const actionSemantics = new ActionSemanticsRegistry(definitions), settings = { drafterEnabled: false };
+	const render = (tool: string, count: number) => { renders++; return { content: [{ type: "text" as const, text: `${tool}:${count}` }], details: { tool } }; };
+	const count = async (read: () => Promise<Buffer | string>) => { builds++; return (await read()).toString().trim().split("\n").length; };
+	const tools = names.map(name => ({ ...createReadTool(cwd), name, execute: async () => render(name, await count(() => readFile(file))) }));
+	const invocations = new Map(names.map((tool, index) => [tool, { executor: `custom:${tool}`, identity: { tool }, filesystemRoot: cwd, semantics: definitions[index],
+		filesystem: async (view: import("../src/tool-settlement.ts").ToolFilesystemOperations) => ({ isError: false, result: render(tool,
+			await view.prepare!(mode === "binding" && index ? definitions[index]! : shared, "lines:v1",
+				async inputs => ({ value: await count(() => inputs.readFile(file)), bytes: 8, dispose: () => {} }), async count => count, file)) }) }]));
+	const f = systemHost(cwd, tools, { actionSemantics, resolveInvocation: tool => invocations.get(tool),
+		complete: async () => fauxAssistantMessage(fauxToolCall("speculative_workflow", { steps: [{ tool: names[1], input: { path: "input.txt" } }] }), { stopReason: "toolUse" }),
+		executionWorlds: [createResourceSnapshotExecutionWorld(actionSemantics, { maxBytes: () => 1024 * 1024 })] }, settings);
+	try {
+		await f.start(); await f.preview(names[0]!, { path: "input.txt" }); await f.ready();
+		expect({ builds, renders }).toEqual({ builds: 1, renders: 1 });
+		if (mode.startsWith("retired") || mode === "predicted") { await f.finish(); tools.shift(); settings.drafterEnabled = mode === "predicted"; await f.start("consumer"); }
+		if (mode === "predicted") await f.ready(2);
+		if (mode.endsWith("preview")) { await f.preview(names[1]!, { path: "input.txt" }); await expect.poll(() => renders).toBe(2); }
+		if (mode === "stale") await writeFile(file, "one\ntwo\nthree\n");
+		expect(await f.execute(names[1]!, { path: "input.txt" })).toEqual({ content: [{ type: "text", text: `summarize_records:${mode === "stale" ? 3 : 2}` }], details: { tool: names[1] } });
+		expect({ builds, renders, fallbacks: f.fallbacks }).toEqual({ builds: mode === "stale" || mode === "binding" ? 2 : 1, renders: mode === "stale" ? 3 : 2, fallbacks: [] });
+		await f.finish();
+		const timing = f.events.filter(event => event.type === "actor_action").at(-1)?.computation;
+		if (mode !== "binding") expect(timing?.hiddenComputeMs! > 0, JSON.stringify({ timing, events: f.events })).toBe(mode !== "stale");
+	} finally { await f.dispose(); }
+});
 
 test("learns from executed tool workflows, reopens the saved state and supplies the next read", async () => {
 	const cwd = await directories.create(), state = path.join(cwd, "patterns.json");
@@ -206,7 +240,7 @@ test("reconsiders restored results while sharing pending reads and retains fresh
 	const cwd = await directories.create(), reader = createReadTool(cwd);
 	const file = path.join(cwd, "notes.txt"), original = Array.from({ length: 20 }, (_, i) => `line ${i + 1}`).join("\n");
 	await writeFile(file, original);
-	const world = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: ["read"], maxBytes: () => 1024 * 1024 });
+	const world = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { maxBytes: () => 1024 * 1024 });
 	const computed = deferred(), release = deferred(), entered = deferred(), controller = new AbortController();
 	const args = { path: "notes.txt", offset: 5, limit: 1 }, wide = { ...args, offset: 1, limit: 10 };
 	let runs = 0, authorizations = 0;

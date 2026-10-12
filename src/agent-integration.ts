@@ -172,22 +172,9 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 	const executionGateway = new ToolExecutionGateway(executionWorlds, options.speculativeExecutionWorldEnabled);
 	const resolveExecutionRoute = (tool: string, signal?: AbortSignal, action?: ActionKey) => {
 		const definition = actionSemantics.definition(action ?? tool);
-		return definition
-			? executionGateway.resolve(
-					{
-						operation: {
-							tool,
-							backend: (action?.executionContext as ToolInvocation | undefined)?.operation?.binding.backend,
-							input: undefined,
-							...(signal ? { signal } : {}),
-							...(action ? { action } : {}),
-						},
-						effect: definition.effect,
-						requirements: definition.requirements,
-					},
-					{ cwd: options.cwd, ...(signal ? { signal } : {}) },
-				)
-			: undefined;
+		return definition && executionGateway.resolve({ tool, action,
+			backend: (action?.executionContext as ToolInvocation | undefined)?.operation?.binding.backend,
+			effect: definition.effect, requirements: definition.requirements }, { cwd: options.cwd, signal });
 	};
 	const resolveSettings = async (): Promise<SpeculativeActionSettings> => {
 		const { patternAware, selfSpeculation, drafterMaxDepth, drafterMaxTokens, drafterTaskMaxRequests, drafterTaskMaxTokens,
@@ -280,7 +267,7 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 			if (!action || !invocation || !definition || operation.permissionHash !== action.hash) return undefined;
 			const epoch = `${definition.epoch}:operation:${operation.backend}`;
 			return buildActionKey({ ...action, input: { operation: operation.identity }, semanticsEpoch: epoch,
-				semantics: { ...definition, epoch, projectors: [] },
+				semantics: { ...definition, resourceScope: undefined, ...operation.semantics, epoch, projectors: [] },
 				executionContext: Object.freeze({ ...invocation, operation: Object.freeze({ binding: operation, permission: action }) }),
 			});
 		},
@@ -290,9 +277,8 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 			if (!tool) return undefined;
 			const definition = actionSemantics.definition(action);
 			if (!definition) return undefined;
-			const operation: ToolOperation = { tool: toolName, callID, input: concrete, signal, action };
 			const captured = await executionGateway.captureAuthoritativeResult(
-				{ operation, effect: definition.effect, requirements: definition.requirements },
+				{ tool: toolName, callID, action, effect: definition.effect, requirements: definition.requirements },
 				{ cwd: options.cwd, signal },
 				{
 					cwd: options.cwd, tool, toolName, args: concrete, action, callID, signal,
@@ -377,23 +363,13 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 				return Object.freeze({ ...operation, ...await resolveBinding(operation.tool, operation.input,
 					tool ? stableValueHash(tool.parameters ?? null) : undefined) });
 			})();
-			const actorCall = input.turnID
-				? {
-						sessionID,
-						[ACTOR_OPERATION]: bind,
-						turnID: input.turnID,
-						id: input.id,
-						tool: input.tool,
-						args: operation.input,
-						tools: input.tools,
-					}
-				: undefined;
+			const actorCall = input.turnID ? { ...input, sessionID, turnID: input.turnID, args: operation.input, [ACTOR_OPERATION]: bind } : undefined;
 			let prepared: PreparedActorCall<ToolSettlement> | undefined;
 			let operations: ExecutionOperationBinding[] | undefined;
 			const computations: TimelineDependency[] = [];
 			return executionGateway.executeAuthoritative(operation, async () => {
 				const bound = await bind();
-				const execute = (inputs?: (path: string) => Iterable<object>) => bound.action && input.turnID ? executionGateway.observeOperations(bound.action, { sessionID, turnID: input.turnID },
+				const execute = (inputs?: (path: string) => Iterable<object>) => input.turnID ? executionGateway.observeOperations(bound.action, { sessionID, turnID: input.turnID },
 					() => executor(bound), (bindings, dependencies) => {
 						if (bindings.length) (operations ??= []).push(...bindings);
 						if (dependencies) computations.push(...dependencies);

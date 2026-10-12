@@ -398,9 +398,7 @@ async function installController(
 				workspaceSandbox,
 			}),
 			workspaceSandbox.createExecutionWorld(),
-			createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, {
-				tools: [...PI_OPERATION_TOOLS.resources, ...PI_CLOSED_SEARCH_TOOLS], maxBytes: () => currentSettings.resourceCacheMaxBytes,
-			}),
+			createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { maxBytes: () => currentSettings.resourceCacheMaxBytes }),
 		]),
 	];
 	const primaryExecutionWorldIDs = new Set(primaryExecutionWorlds.map((world) => world.id));

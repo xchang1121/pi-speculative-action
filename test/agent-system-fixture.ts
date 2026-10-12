@@ -20,7 +20,7 @@ export function systemHost(cwd: string, tools: AgentTool[], options: Partial<Cre
 		getSettings: () => ({ enabled: true, drafterEnabled: false, candidateLimit: 1, maxConcurrentActions: 2,
 			predictionTimeoutMs: 10_000, patternAware: { enabled: false }, tools: tools.map(tool => tool.name), ...settings }),
 		resolveInvocation: (tool, input) => resolvePiToolInvocation(tool, input, { cwd, environment: {} }),
-		executionWorlds: [createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: tools.map(tool => tool.name), maxBytes: () => 8 * 1024 * 1024 })],
+		executionWorlds: [createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { maxBytes: () => 8 * 1024 * 1024 })],
 		...options,
 		onEvent: event => { events.push(event); return options.onEvent?.(event); },
 	});

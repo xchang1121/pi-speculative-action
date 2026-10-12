@@ -504,9 +504,9 @@ export function makeSpeculativeActionRuntime<
 		const leases = new Map<Candidate, NonNullable<ReturnType<typeof acquireCandidate>>>();
 		let closed = false;
 		return {
-			lookup: function* (path: string): Iterable<object> {
+			lookup: function* (path?: string): Iterable<object> {
 				if (closed || session.lifecycle.sealed || masterDisabled()) return;
-				for (const candidate of candidateStore.lookupInputs(session.id, [path])) {
+				for (const candidate of candidateStore.lookupInputs(session.id, path === undefined ? undefined : [path])) {
 					if (candidate === source || candidate.owner.draft.type !== "tool_call" || candidate.route.reuse !== "shared_result" ||
 						candidate.work.execution.status !== "succeeded" || !candidate.work.execution.output.inputSource) continue;
 					const lease = leases.get(candidate) ?? acquireCandidate(session, candidate, owner);
@@ -2075,7 +2075,8 @@ export function makeSpeculativeActionRuntime<
 			for (const consumer of candidate.operationConsumers ?? []) if (!session.actorRequests.has(consumer)) candidate.operationConsumers!.delete(consumer);
 			try {
 				if (candidate.operationJoinable?.()) for (const turn of session.turns.values()) for (const action of turn.actorActions)
-					if (action.state.status === "awaiting_fallback" && action.tool === candidate.key.tool) (candidate.operationConsumers ??= new Set()).add(action);
+					if (action.state.status === "awaiting_fallback" && (!action.actionKey || semantics.requirements(action.actionKey)?.capabilities.includes("invocation.process")))
+						(candidate.operationConsumers ??= new Set()).add(action);
 			} catch { /* A failed acquisition hint reserves no hardware. */ }
 		}
 		const preferred = protectedCandidates.find(candidate => !scheduler.has(candidate));
@@ -2103,8 +2104,8 @@ export function makeSpeculativeActionRuntime<
 
 	const reconcileStores = async (state: Turn): Promise<void> => {
 		const available = new Set(state.definitions.map((definition) => definition.name));
-		for (const candidate of candidateStore.values(state.sessionID)) {
-			if (!available.has(candidate.key.tool) || (candidate.work.execution.status === "queued" && !state.candidateNames.includes(candidate.key.tool)))
+		for (const candidate of candidateStore.pending(state.sessionID)) {
+			if (candidate.work.execution.status === "queued" && (!available.has(candidate.key.tool) || !state.candidateNames.includes(candidate.key.tool)))
 				discardCandidate(state.session, candidate, cause("control", "tool_disabled"));
 		}
 		trimResults(state.session, state.settings);

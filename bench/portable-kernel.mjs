@@ -83,7 +83,7 @@ async function qualifyPiSearch(name) {
 	}, request.signal);
 	const tool = createFindToolDefinition(root), write = createWriteTool(root), tools = [tool, write];
 	const semantics = PI_ACTION_SEMANTICS;
-	const resources = createResourceSnapshotExecutionWorld(semantics, { tools: [name], maxBytes: () => profile.limits.inputBytes });
+	const resources = createResourceSnapshotExecutionWorld(semantics, { maxBytes: () => profile.limits.inputBytes });
 	const signal = new AbortController().signal, journeys = [];
 	const args = { pattern: "*.txt", path: "search", limit: 1000 };
 	function journey(checkpoint, capacity = 1) {

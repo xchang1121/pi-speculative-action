@@ -803,7 +803,7 @@ int main(void) { char b[1024]; return syscall(SYS_getdents64, 4, b, sizeof(b)) <
 			const tools = [fixture.tool, createReadTool(fixture.workspace), createGrepTool(fixture.workspace), createLsTool(fixture.workspace), createFindTool(fixture.workspace)];
 			const prepared = patternProcessHost(fixture, "native-inputs", { tools: tools.map(tool => tool.name), resourceCacheMaxEntries: 8,
 				resourceCacheMaxBytes: 1024 * 1024, patternAware: patternAwareSettings({ enabled: true, multiStepEnabled: false }) }, {
-				executionWorlds: [fixture.world, createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { tools: ["read", "grep", "ls", "find"], maxBytes: () => 1024 * 1024 })],
+				executionWorlds: [fixture.world, createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { maxBytes: () => 1024 * 1024 })],
 				resolveInvocation: (tool, input) => search.invocations.get(tool) ?? resolvePiToolInvocation(tool, input,
 					{ cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath }),
 			}, tools), { events, start } = prepared;

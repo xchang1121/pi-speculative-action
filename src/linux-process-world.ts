@@ -32,7 +32,8 @@ export function createLinuxProcessExecutionWorld(
 	const operations = new WeakMap<ExecutionOperationBinding, { readonly binding: WeakRef<ProcessExecutionBinding>; readonly permissionKey: string }>();
 	const describeOperation = (binding: ProcessExecutionBinding, permission: ActionKey) => {
 		const reference = new WeakRef(binding);
-		const descriptor = Object.freeze({ backend: "linux_process_reuse", identity: binding.key, permissionHash: permission.hash, ...backend.operationHints(binding),
+		const descriptor = Object.freeze({ backend: "linux_process_reuse", identity: binding.key, permissionHash: permission.hash,
+			semantics: Object.freeze({ effect: "unbounded" as const, requirements: UNRESTRICTED_PROCESS_EFFECTS }), ...backend.operationHints(binding),
 			get executionMs() { return reference.deref()?.executionMs ?? 0; },
 			get available() { return reference.deref()?.available ?? false; },
 			stale: () => { const current = reference.deref(); return current ? backend.bindingStale(current) : Promise.resolve(true); } });
@@ -60,17 +61,17 @@ export function createLinuxProcessExecutionWorld(
 		isolation: "runtime_sandbox",
 		storage: backend.storage,
 		observeOperations: ({ action, scope, learn, inputs }, execute, observe) => backend.observeBindings(scope, execute, (bindings, computations) => {
-			observe(bindings.map(binding => describeOperation(binding, action)), computations);
+			observe(action ? bindings.map(binding => describeOperation(binding, action)) : [], computations);
 		}, learn, inputs),
 		speculation: {
 			capabilities: UNRESTRICTED_PROCESS_EFFECTS.capabilities,
-			tools: options.tools,
 			acceptsCheckpoint: (checkpoint, cwd) => workspaceSandbox.acceptsCheckpoint(checkpoint, cwd),
 			fingerprint: async (request) => {
 				backendChecked = true;
-				const invocation = request.action ? processInvocation(request.action.executionContext) : undefined;
-				if (request.action && !invocation) throw new Error("execution action has no process invocation");
-				if (request.action) operationFor(request.action);
+				const { action } = request, tool = action?.tool ?? request.tool, invocation = action && processInvocation(action.executionContext);
+				if (action && !invocation) throw new Error("execution action has no process invocation");
+				if (tool && (!action || !operationFor(action)) && !options.tools.includes(tool))
+					throw new Error("Complete host process outlet is not bound");
 				const [processFingerprint, workspaceFingerprint] = await Promise.all([
 					backend.fingerprint(),
 					invocation?.cwd ? qualify(invocation.cwd).then((selected) => selected.fingerprint) : workspaceSandbox.fingerprint(workspaceOptions),

@@ -1,12 +1,9 @@
-import type { ActionEffect, ActionKey } from "./action-semantics.ts";
-import type { EffectRequirements } from "./effect-model.ts";
+import type { ActionKey } from "./action-semantics.ts";
 import type { ToolInvocation } from "./tool-settlement.ts";
-import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
 const REUSED_FAILURE = Symbol("reused tool failure");
 import { TimelineInterval, type TimelineDependency } from "./task-timing.ts";
 import { EffectTransactionCoordinator, type EffectTransaction, isPoisonedEffectCommit } from "./effect-transaction.ts";
-import { type CapturedExecutionWorldResult, type ExecutionWorldDiagnosticSnapshot, type ExecutionWorldDiagnosticsContext, ExecutionWorldRouter,
-	type ExecutionWorld, type ExecutionWorldPreparation, type ExecutionOperationBinding, type ExecutionScope,
+import { type CapturedExecutionWorldResult, ExecutionWorldRouter, type ExecutionWorldRequest, type ExecutionWorldPreparation,
 	type SpeculativeExecutionRoute } from "./execution-world.ts";
 
 /**
@@ -18,8 +15,6 @@ import { type CapturedExecutionWorldResult, type ExecutionWorldDiagnosticSnapsho
  */
 export interface ToolOperation {
 	readonly tool: string;
-	/** A backend-issued internal unit cannot fall through to another world's whole-tool executor. */
-	readonly backend?: string;
 	/** Absent for capability warm-up before a concrete call exists. */
 	readonly callID?: string;
 	readonly input: unknown;
@@ -28,13 +23,6 @@ export interface ToolOperation {
 	readonly action?: ActionKey;
 	/** The Actor owns its selected executor even when no reusable action key can be constructed. */
 	readonly invocation?: ToolInvocation;
-}
-
-/** Dynamic effect requirement used to select an isolation backend. */
-export interface ToolExecutionRequirement {
-	readonly operation: ToolOperation;
-	readonly effect: ActionEffect;
-	readonly requirements: EffectRequirements;
 }
 
 export type AuthoritativeToolExecutor<Output> = (operation: ToolOperation) => Promise<Output>;
@@ -63,54 +51,17 @@ export interface AuthoritativeExecutionHooks<Output> {
  * supplied executor. Speculative calls fork an execution world. Keeping both paths here creates
  * one structural seam for effect transactions, provenance certificates, and persistent reuse.
  */
-export class ToolExecutionGateway<Context, Output> {
-	private readonly router: ExecutionWorldRouter<Context, Output>;
+export class ToolExecutionGateway<Context, Output> extends ExecutionWorldRouter<Context, Output> {
 	private readonly transactions = new EffectTransactionCoordinator<Output>();
-	private readonly lifecycle = new RuntimeLifecycleLane();
 
-	constructor(worlds: readonly ExecutionWorld<Context, Output>[], speculationEnabled?: (backend: string) => boolean) {
-		this.router = new ExecutionWorldRouter(worlds, speculationEnabled, this.lifecycle);
-	}
-
-	resolve(
-		requirement: ToolExecutionRequirement,
-		preparation: ExecutionWorldPreparation,
-	): Promise<SpeculativeExecutionRoute | undefined> {
-		const { operation, effect, requirements } = requirement;
-		return this.router.resolve({ tool: operation.tool, action: operation.action, backend: operation.backend, effect, requirements }, preparation);
-	}
-
-	diagnostics(input: ExecutionWorldDiagnosticsContext): Promise<readonly ExecutionWorldDiagnosticSnapshot[]> {
-		return this.router.diagnostics(input);
-	}
-
-	observeOperations<Value>(action: ActionKey, scope: ExecutionScope, execute: () => Promise<Value>,
-		observe: (bindings: readonly ExecutionOperationBinding[], computations?: readonly TimelineDependency[]) => void, learn = false,
-		inputs?: (path: string) => Iterable<object>): Promise<Value> {
-		return this.router.observeOperations(action, scope, execute, observe, learn, inputs);
-	}
-
-	captureAuthoritativeResult(
-		requirement: ToolExecutionRequirement,
+	override async captureAuthoritativeResult(
+		request: ExecutionWorldRequest & { readonly callID?: string },
 		preparation: ExecutionWorldPreparation,
 		context: Context,
 	): Promise<CapturedExecutionWorldResult<Output> | undefined> {
-		const { operation, effect, requirements } = requirement;
-		return this.router.captureAuthoritativeResult(
-			{ tool: operation.tool, action: operation.action, effect, requirements },
-			preparation,
-			context,
-		).then((captured) =>
-			captured
-				? Object.freeze({
-						route: captured.route,
-						capture: this.transactions.capture(
-							this.transactions.begin({ tool: operation.tool, callID: operation.callID, route: captured.route }),
-							captured.capture,
-						),
-					})
-				: undefined,
-		);
+		const captured = await super.captureAuthoritativeResult(request, preparation, context);
+		return captured && Object.freeze({ route: captured.route, capture: this.transactions.capture(
+			this.transactions.begin({ tool: request.action?.tool ?? request.tool ?? "", callID: request.callID, route: captured.route }), captured.capture) });
 	}
 
 	/** Reuse supplied an adopted failure: the Actor receives the error its native run throws, not a native rerun. */
@@ -151,10 +102,6 @@ export class ToolExecutionGateway<Context, Output> {
 		context: Context,
 	): Promise<EffectTransaction<Output>> {
 		const attempt = this.transactions.begin({ tool: operation.tool, callID: operation.callID, route });
-		return this.lifecycle.track(this.transactions.execute(attempt, () => this.router.fork(route, context)));
-	}
-
-	dispose(): Promise<void> {
-		return this.router.dispose();
+		return this.lifecycle.track(this.transactions.execute(attempt, () => this.fork(route, context)));
 	}
 }
