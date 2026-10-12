@@ -4,7 +4,7 @@ import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { createEditTool, createFindTool, createGrepTool, createLsTool, createReadTool, createWriteTool } from "@earendil-works/pi-coding-agent";
 import { afterEach, expect, test } from "vitest";
 import { WorkspaceSandboxService } from "../src/workspace-sandbox.ts";
-import { createResourceSnapshotExecutionWorld } from "../src/agent-execution-world.ts";
+import { bindResourceOperation, createResourceSnapshotExecutionWorld } from "../src/agent-execution-world.ts";
 import { createClosedSearchProfile, resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { ActionSemanticsRegistry, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { PatternAwareStore, patternAwareSettings, patternAwareActionSemantics } from "../src/pattern-aware.ts";
@@ -17,41 +17,72 @@ const directories = temporaryDirectories("pi-agent-system-");
 afterEach(directories.dispose);
 
 test.for(["actor", "preview", "dynamic", "dynamic-preview", "hints", "hints-preview", "retired", "retired-preview", "predicted", "stale", "binding",
-	"calculation", "calculation-preview", "calculation-unrelated", "calculation-unrelated-preview", "calculation-hint", "calculation-hint-preview", "calculation-key"])("shares actual inputs across independently formatted tools (%s)", async mode => {
-	const cwd = await directories.create(), file = path.join(cwd, "input.txt"), shared = {};
+	"calculation", "calculation-preview", "calculation-unrelated", "calculation-unrelated-preview", "calculation-hint", "calculation-hint-preview", "calculation-key",
+	"seed-dynamic", "seed-dynamic-preview", "seed-calculation", "seed-calculation-preview", "seed-stale", "seed-binding", "seed-calculation-key", "seed-unbounded", "seed-repeat",
+	"mixed-producer", "mixed-consumer", "mixed-stale", "mixed-failure", "mixed-budget", "mixed-outside", "mixed-revoke", "mixed-overlap", "mixed-cancel"])("shares actual inputs across independently formatted tools (%s)", async scenario => {
+	const mode = scenario.replace(/^seed-/, ""), seeded = scenario.startsWith("seed-") || ["mixed-producer", "mixed-budget", "mixed-outside"].includes(mode), bound = seeded || mode.startsWith("mixed");
+	const cwd = await directories.create(), file = path.join(mode === "mixed-outside" ? await directories.create() : cwd, "input.txt"), shared = {};
 	await writeFile(file, "one\ntwo\n");
-	let builds = 0, renders = 0, disposed = 0;
+	let builds = 0, renders = 0, disposed = 0, effects = 0, borrowers = 0, revoke: (() => void | Promise<void>) | undefined;
 	const pure = mode.startsWith("calculation"), unrelated = mode.includes("unrelated") || mode.startsWith("calculation-hint");
+	const stale = mode.endsWith("stale"), cancelled = mode === "mixed-cancel", overlap = cancelled || mode === "mixed-overlap", failed = mode === "mixed-failure";
+	const unavailable = mode === "mixed-budget" || mode === "mixed-outside", mutates = (index: number) => mode.startsWith("mixed") && index === Number(mode !== "mixed-producer");
+	const entered = deferred(), joined = deferred(), release = deferred(), controller = new AbortController(), actors: Promise<unknown>[] = [];
 	const names = ["count_records", "summarize_records", "other_records"], read = PI_ACTION_SEMANTICS.definition("read")!;
-	const definitions = names.map((tool, index) => ({ ...read, tool, epoch: `custom:${tool}`, projectors: [], resourceScope: "captured_inputs" as const,
+	const definitions = names.map((tool, index) => ({ ...read, ...(mutates(index) ? PI_ACTION_SEMANTICS.definition("write") :
+		mode === "unbounded" && !index ? PI_ACTION_SEMANTICS.definition("bash") : {}), tool, epoch: `custom:${tool}`, projectors: [],
+		resourceScope: mutates(index) || mode === "unbounded" && !index ? undefined : "captured_inputs" as const,
 		canonicalize: (input: unknown, cwd: string) => { const key = read.canonicalize(input, cwd); return key && { ...key,
 			resources: pure || index && mode.startsWith("dynamic") ? [] : index && mode.startsWith("hints") ? ["selector"] : key.resources }; } }));
 	const actionSemantics = new ActionSemanticsRegistry(definitions), settings = { drafterEnabled: false };
 	const render = (tool: string, count: number) => { renders++; return { content: [{ type: "text" as const, text: `${tool}:${count}` }], details: { tool } }; };
-	const count = async (read: () => Promise<Buffer | string>) => { builds++; return (pure ? "one\ntwo\n" : await read()).toString().trim().split("\n").length; };
+	const count = async (read: () => Promise<Buffer | string>) => { const text = pure ? "one\ntwo\n" : await read(); builds++; return text.toString().trim().split("\n").length; };
 	const tools = names.map(name => ({ ...createReadTool(cwd), name, execute: async () => render(name, await count(() => readFile(file))) }));
-	const invocations = new Map(names.map((tool, index) => [tool, { executor: `custom:${tool}`, identity: { tool }, filesystemRoot: cwd, semantics: definitions[index],
-		filesystem: async (view: import("../src/tool-settlement.ts").ToolFilesystemOperations) => ({ isError: false, result: render(tool,
-			await view.prepare!(mode === "binding" && index || index === 2 ? definitions[index]! : shared, mode === "calculation-key" && index ? "next" : "lines:v1",
-				async inputs => ({ value: await count(() => inputs.readFile(file)), bytes: 8, dispose: () => { disposed++; } }), async count => count,
-				mode.startsWith("calculation-hint") ? path.join(cwd, `hint-${index}`) : pure ? undefined : file)) }) }]));
+	const invocations = new Map(names.map((tool, index) => {
+		const execute: NonNullable<import("../src/tool-settlement.ts").ToolInvocation["filesystem"]> = async (view, request) => {
+			const build = async (inputs: typeof view) => ({ value: await count(() => inputs.readFile(file)), bytes: 8, dispose: () => { disposed++; } });
+			if (mode === "repeat" && !index) await view.prepare!(shared, "lines:v1", build, async value => value, file, request.signal);
+			return { isError: false, result: await view.prepare!(mode === "binding" && index || index === 2 ? definitions[index]! : shared, mode === "calculation-key" && index ? "next" : "lines:v1",
+				build, async count => {
+					if (mutates(index) && overlap) { if (++borrowers === 1) entered.resolve(); else joined.resolve(); await release.promise; request.signal.throwIfAborted(); }
+					if (mutates(index) && mode === "mixed-revoke") { await revoke?.(); expect(disposed).toBe(0); }
+					if (mutates(index)) { effects++; await view.writeFile!(path.join(cwd, `${tool}.txt`), String(count)); if (failed) throw new Error("consumer failed after writing"); }
+					return render(tool, count);
+				}, mode.startsWith("calculation-hint") ? path.join(cwd, `hint-${index}`) : pure ? undefined : file, request.signal) };
+		};
+		const binding = bound ? bindResourceOperation(execute, cwd) : { filesystem: execute, filesystemRoot: cwd };
+		return [tool, { executor: `custom:${tool}`, identity: { tool }, semantics: definitions[index], ...binding,
+			...(binding.captureInputs ? { captureInputs: (...args: Parameters<NonNullable<typeof binding.captureInputs>>) => { const capture = binding.captureInputs!(...args); revoke = capture.dispose; return capture; } } : {}) }];
+	}));
 	const f = systemHost(cwd, tools, { actionSemantics, resolveInvocation: tool => invocations.get(tool),
 		complete: async () => fauxAssistantMessage(fauxToolCall("speculative_workflow", { steps: [{ tool: names[unrelated ? 2 : 1], input: { path: "input.txt" } }] }), { stopReason: "toolUse" }),
-		executionWorlds: [createResourceSnapshotExecutionWorld(actionSemantics, { maxBytes: () => 1024 * 1024 })] }, settings);
+		executionWorlds: [createResourceSnapshotExecutionWorld(actionSemantics, { maxBytes: () => mode === "mixed-budget" ? 64 : 1024 * 1024 })] }, settings);
 	try {
-		await f.start(); await f.preview(names[0]!, { path: "input.txt" }); await f.ready();
+		await f.start();
+		if (seeded) await f.execute(names[0]!, { path: "input.txt" }); else { await f.preview(names[0]!, { path: "input.txt" }); await f.ready(); }
 		expect({ builds, renders }).toEqual({ builds: 1, renders: 1 });
 		if (mode.startsWith("retired") || mode === "predicted") { await f.finish(); tools.shift(); settings.drafterEnabled = mode === "predicted"; await f.start("consumer"); }
 		if (mode === "predicted") await f.ready(2);
 		if (unrelated) { await f.finish(); settings.drafterEnabled = true; await f.start("unrelated"); await f.ready(2); await f.finish(); settings.drafterEnabled = false; await f.start("consumer"); }
 		if (mode.endsWith("preview")) { await f.preview(names[1]!, { path: "input.txt" }); await expect.poll(() => renders).toBe(unrelated ? 3 : 2); }
-		if (mode === "stale") await writeFile(file, "one\ntwo\nthree\n");
-		expect(await f.execute(names[1]!, { path: "input.txt" })).toEqual({ content: [{ type: "text", text: `summarize_records:${mode === "stale" ? 3 : 2}` }], details: { tool: names[1] } });
-		expect({ builds, renders, fallbacks: f.fallbacks }).toEqual({ builds: (mode === "stale" || mode === "binding" || mode === "calculation-key" ? 2 : 1) + Number(unrelated), renders: (mode === "stale" ? 3 : 2) + Number(unrelated), fallbacks: [] });
+		if (stale) await writeFile(file, "one\ntwo\nthree\n");
+		const result = f.execute(names[1]!, { path: "input.txt" }, controller.signal); actors.push(result); void result.catch(() => {});
+		if (overlap) {
+			await entered.promise; actors.push(f.execute(names[1]!, { path: "input.txt" })); await joined.promise;
+			expect(disposed).toBe(0); if (cancelled) controller.abort(new Error("consumer cancelled")); release.resolve();
+			expect(textOutput(await actors[1] as Awaited<typeof result>)).toBe("summarize_records:2");
+		}
+		if (failed || cancelled) await expect(result).rejects.toThrow(failed ? "consumer failed after writing" : "consumer cancelled");
+		else expect(await result).toEqual({ content: [{ type: "text", text: `summarize_records:${stale ? 3 : 2}` }], details: { tool: names[1] } });
+		expect({ builds, renders, effects }).toEqual({ builds: (stale || unavailable || mode === "binding" || mode === "calculation-key" ? 2 : 1) + Number(unrelated),
+			renders: 2 + Number(mode === "stale") + Number(unrelated) + Number(overlap) - Number(failed || cancelled), effects: Number(mode.startsWith("mixed")) + Number(overlap && !cancelled) });
+		expect(f.fallbacks).toEqual([...(seeded ? [names[0]!] : []), ...(mutates(1) ? Array(1 + Number(overlap)).fill(names[1]!) : [])]);
+		if (mode.startsWith("mixed")) expect(await readFile(path.join(cwd, `${names[Number(mode !== "mixed-producer")]}.txt`), "utf8")).toBe(String(stale ? 3 : 2));
 		await f.finish();
 		const timing = f.events.filter(event => event.type === "actor_action").at(-1)?.computation;
-		if (mode !== "binding") expect(timing?.hiddenComputeMs! > 0, JSON.stringify({ timing, events: f.events })).toBe(mode !== "stale" && mode !== "calculation-key");
-	} finally { await f.dispose(); expect(disposed).toBe(builds - f.fallbacks.length); }
+		if (mode !== "binding") expect(timing?.hiddenComputeMs! > 0, JSON.stringify({ timing, events: f.events })).toBe(!stale && !unavailable && !failed && mode !== "calculation-key");
+		if (cancelled) expect(f.events.filter(event => event.type === "actor_action")[0]?.computation?.hiddenComputeMs).toBe(0);
+	} finally { controller.abort(); release.resolve(); await Promise.allSettled(actors); await f.dispose(); expect(disposed).toBe(builds - (bound ? 0 : f.fallbacks.length)); }
 });
 
 test("learns from executed tool workflows, reopens the saved state and supplies the next read", async () => {

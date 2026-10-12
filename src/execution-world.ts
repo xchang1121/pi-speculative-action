@@ -159,19 +159,11 @@ export interface WorldBranch<Output> {
 		readonly signal: AbortSignal;
 		/** Leased sealed owners from the session's input index; the backend must prove every borrowed dependency. */
 		readonly inputs?: (path?: string) => Iterable<object>;
-	}) => Promise<{
-		readonly output: Output;
-		/** Evidence for the current operation that evaluated these inputs. */
-		readonly compatibility?: WorldCompatibilityEvidence;
-		/** Authorizes only this effect-free result, without committing the source output. */
-		readonly validate?: () => Promise<ResourceValidation>;
-		/** Additional retained proof storage, excluding the already-owned inputs. */
-		readonly capturedBytes?: number;
-		/** A composed query cannot fall back to the source branch's narrower proof. */
+	}) => Promise<(Pick<WorldBranch<Output>, "output"> & Partial<Pick<WorldBranch<Output>, "compatibility" | "validate" | "capturedBytes" | "dispose">> & {
+		/** Query-owned proof and storage; dispose after its last reader. Never commits the source output.
+		 * A composed query cannot fall back to the source branch's narrower proof. */
 		readonly requiresQueryValidation?: true;
-		/** Caller-owned query resources; release after its last reader or retained view. */
-		readonly dispose?: () => void | Promise<void>;
-	} | undefined>;
+	}) | undefined>;
 	/** Shared adoption returns the sealed output; only exclusive effects may return an updated settlement.
 	 * Unknown failures are indeterminate; backends may mark fully restored failures as recoverable. */
 	readonly commit: () => Promise<Output>;
@@ -314,7 +306,7 @@ interface ExecutionWorldLifecycle<Context, Output> {
 	readonly speculation?: ExecutionWorldSpeculation<Context, Output>;
 	readonly observation?: ExecutionWorldObservation<Context, Output>;
 	/** Observe proven internal work inside exactly one native Actor call; never seals its whole result. */
-	readonly observeOperations?: <Value>(request: { readonly action: ActionKey | undefined; readonly scope: ExecutionScope; readonly learn?: boolean; readonly inputs?: (path: string) => Iterable<object> },
+	readonly observeOperations?: <Value>(request: { readonly action: ActionKey | undefined; readonly scope: ExecutionScope; readonly learn?: boolean; readonly inputs?: (path?: string) => Iterable<object> },
 		execute: () => Promise<Value>, observe: (bindings: readonly ExecutionOperationBinding[], computations?: readonly TimelineDependency[]) => void) => Promise<Value>;
 	/** Retire preparation invalidated by an Actor mutation before its successors may launch. */
 	readonly actorFallbackSettled?: () => Promise<void>;
@@ -375,7 +367,7 @@ export class ExecutionWorldRouter<Context, Output> {
 
 	observeOperations<Value>(action: ActionKey | undefined, scope: ExecutionScope, execute: () => Promise<Value>,
 		observe: (bindings: readonly ExecutionOperationBinding[], computations?: readonly TimelineDependency[]) => void, learn = false,
-		inputs?: (path: string) => Iterable<object>): Promise<Value> {
+		inputs?: (path?: string) => Iterable<object>): Promise<Value> {
 		for (const world of this.worldsByID.values()) {
 			if (!world.observeOperations) continue;
 			let learning = false;

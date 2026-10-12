@@ -1578,12 +1578,11 @@ export function makeSpeculativeActionRuntime<
 			abandonActorPreview(state, preview, actorAction.fallback.cause);
 			const adoption = actorAction.deferToFallback(matchingPredictions.map(({ opportunity }) => opportunity.identity));
 			if (adoption) confirmPredictions(state.session, matchingPredictions, identity, adoption);
-			const effect = semantics.effect(actualKey);
 			operationLearning = state.settings.enabled && sources.some(source => source.observe && source.enabled(state.settings) && source.observesOperations?.(actualKey))
 				? true : undefined;
 			preemptForActor(state.session);
 			state.session.effects.enqueue(() => dispatchReady(state.session));
-			if (adapter.captureAuthoritativeResult && (effect === "observation" || effect === "workspace_mutation" || prepared.observeOperations)) {
+			if (adapter.captureAuthoritativeResult) {
 				captureInputSource = (await beginAuthoritativeResultCapture(state, input, actualCall, actorAction, actualKey, signal))?.inputSource;
 			}
 			return Object.freeze(prepared);

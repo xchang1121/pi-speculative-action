@@ -40,7 +40,7 @@ export interface ToolFilesystemOperations {
 	readonly readdir?: (target: string) => string[] | Promise<string[]>;
 	readonly writeFile?: (target: string, content: string) => Promise<void>;
 	readonly mkdir?: (target: string) => Promise<void>;
-	/** Binding/key identify the calculation; the optional resource is an index hint, and signal owns only this consumer. */
+	/** Build is pure and reads only view inputs; binding/key cover other inputs and values stay immutable. Resource is a hint; signal owns this consumer. */
 	readonly prepare?: <Value, Result>(binding: object, key: string,
 		build: (view: ToolFilesystemOperations, signal: AbortSignal) => Promise<{ readonly value: Value; readonly bytes: number; readonly dispose: () => void | Promise<void> }>,
 		consume: (value: Value) => Promise<Result>, resource?: string, signal?: AbortSignal) => Promise<Result>;
@@ -60,7 +60,7 @@ export interface ToolInvocation {
 	readonly filesystemRoot?: string;
 	/** Explicit selected Actor semantics; the host invokes this inside its original execution callback. */
 	readonly authoritative?: (request: Parameters<NonNullable<ToolInvocation["filesystem"]>>[1]) => Promise<ToolSettlement>;
-	/** Arm bounded final-byte retention in the selected Actor executor, without replaying a mutation. */
+	/** Arm bounded input and pure-computation retention in the selected Actor executor, without replaying effects. */
 	readonly captureInputs?: (action: ActionKey, maxBytes: number, callID: string) => WorldResultCapture<ToolSettlement>;
 	/** Explicit trusted operation binding; never permission to call the supplied host tool. */
 	readonly filesystem?: (

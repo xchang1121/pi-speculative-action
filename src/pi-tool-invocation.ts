@@ -6,7 +6,7 @@ import { BASH_TIMEOUT_ACTION_KEY_PROJECTOR, GREP_LITERAL_ACTION_KEY_PROJECTOR, g
 import type { ActionProjectionRule } from "./action-key-projection.ts";
 import { asRecord } from "./stable-json.ts";
 import { RESOURCE_OBSERVATION_EFFECTS } from "./effect-model.ts";
-import { captureResourceVersion, type ResourceInput } from "./resource-version.ts";
+import { captureResourceVersion } from "./resource-version.ts";
 import { relativeFilesystemPath, sameFilesystemPath, slash } from "./path-utils.ts";
 import fs from "node:fs/promises";
 import process from "node:process";
@@ -17,7 +17,7 @@ import { pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
 import { captureStableFile } from "./filesystem-evidence.ts";
 import { resolveHostExecutable } from "./executable-path.ts";
-import { createCommittedResourceInputs } from "./agent-execution-world.ts";
+import { bindResourceOperation } from "./agent-execution-world.ts";
 import { SharedAbortScope } from "./runtime-lifecycle.ts";
 
 export const PI_CLOSED_SEARCH_TOOLS: readonly string[] = ["find", "grep"];
@@ -36,13 +36,9 @@ const toolFactories = {
 type PiToolName = keyof typeof toolFactories;
 export type PiToolDefinition = ReturnType<(typeof toolFactories)[PiToolName]>;
 
-function createPiToolDefinition(tool: PiToolName, cwd: string, options: ToolsOptions): PiToolDefinition {
-	return toolFactories[tool](cwd, options[tool] as never);
-}
-
 /** Stock definitions and their public operation seams; shared by Actor and isolated runners. */
 export function createPiToolDefinitions(cwd: string, options: ToolsOptions = {}): Map<string, PiToolDefinition> {
-	return new Map((Object.keys(toolFactories) as PiToolName[]).map((tool) => [tool, createPiToolDefinition(tool, cwd, options)]));
+	return new Map((Object.keys(toolFactories) as PiToolName[]).map((tool) => [tool, toolFactories[tool](cwd, options[tool] as never)]));
 }
 
 export interface PiToolInvocationOptions {
@@ -90,7 +86,7 @@ export function resolvePiToolInvocation(
 				} : {
 					edit: { operations: { readFile: view.readFile, access: (target) => view.access(target, true), writeFile: view.writeFile ?? denied } },
 				};
-				const definition = createPiToolDefinition(tool as PiToolName, cwd, scoped);
+				const definition = toolFactories[tool as PiToolName](cwd, scoped[tool as PiToolName] as never);
 				// The qualified stock read executor consults only model.input, never other context fields.
 				const context = { model: { input: modelSupportsImages ? ["image"] : [] } } as ExtensionContext;
 				// Stock cancellation can reject before its internal operation and image worker finish.
@@ -100,7 +96,7 @@ export function resolvePiToolInvocation(
 				return { result, isError: false };
 			},
 		};
-		return PI_OPERATION_TOOLS.workspace.includes(tool) ? { ...invocation, ...captureActorWrites(invocation.filesystem!, cwd) } : invocation;
+		return PI_OPERATION_TOOLS.workspace.includes(tool) ? { ...invocation, ...bindResourceOperation(invocation.filesystem!, cwd) } : invocation;
 	}
 	if (!PI_OPERATION_TOOLS.process.includes(tool) || !input || typeof input !== "object" || Array.isArray(input)) return undefined;
 	const record = input as Record<string, unknown>;
@@ -150,59 +146,6 @@ export const PI_GREP_LITERAL_PROJECTION_RULE: ActionProjectionRule<ToolSettlemen
 export function piToolErrorSettlement(tool: string, error: unknown): ToolSettlement {
 	const code = tool === "bash" && error instanceof Error ? /(?:^|\n\n)Command exited with code (\d+)$/.exec(error.message)?.[1] : undefined;
 	return code === undefined ? toolErrorSettlement(error) : { ...toolErrorSettlement(error), exitCode: Number(code) };
-}
-
-/** Retain stock write poststates; edit normalization and queuing stay in Pi. */
-function captureActorWrites(execute: NonNullable<ToolInvocation["filesystem"]>, root: string): Pick<ToolInvocation, "authoritative" | "captureInputs"> {
-	let active: { inputs: Map<string, ResourceInput>; maxBytes: number; callID: string; started: boolean; complete: boolean; overflow: boolean } | undefined;
-	return {
-		captureInputs: (action, maxBytes, callID) => {
-			if (active || !Number.isFinite(maxBytes) || maxBytes <= 0) throw new Error("resource_snapshot_budget_invalid");
-			const owned = active = { inputs: new Map(), maxBytes, callID, started: false, complete: false, overflow: false };
-			const dispose = () => { if (active === owned) active = undefined; owned.inputs.clear(); };
-			return { inputsOnly: true, dispose, seal: async (output) => {
-				try {
-					if (active !== owned || !owned.complete || owned.overflow || !owned.inputs.size) throw new Error("actor_write_inputs_unavailable");
-					active = undefined;
-					// Only directories mkdir actually created are inferred; later adoption checks concurrent additions.
-					const names = new Map([...owned.inputs].filter(([, input]) => !(input instanceof Uint8Array)).map(([target]) => [target, [] as string[]]));
-					for (const target of owned.inputs.keys()) names.get(path.dirname(target))?.push(path.basename(target));
-					for (const [target, entries] of names) owned.inputs.set(target, { names: entries });
-					return await createCommittedResourceInputs(output, action, root, owned.inputs, maxBytes);
-				} finally { dispose(); }
-			} };
-		},
-		authoritative: async (request) => {
-			const owned = active?.callID === request.callID && !active.started ? active : undefined;
-			if (owned) owned.started = true;
-			const output = await execute({
-				readFile: target => fs.readFile(target),
-				access: (target, writable) => fs.access(target, fs.constants.R_OK | (writable ? fs.constants.W_OK : 0)),
-				mkdir: async target => {
-					const created = await fs.mkdir(target, { recursive: true });
-					if (created && owned && active === owned && !owned.overflow) {
-						for (let directory = target; relativeFilesystemPath(path.toNamespacedPath(created), path.toNamespacedPath(directory)) !== undefined; directory = path.dirname(directory)) {
-							owned.inputs.set(directory, {});
-							if (path.dirname(directory) === directory) break;
-						}
-					}
-				},
-				writeFile: async (target, content) => {
-					const retain = owned && active === owned && !owned.overflow;
-					const bytes = retain && Buffer.byteLength(content) <= owned.maxBytes ? Buffer.from(content) : undefined;
-					await fs.writeFile(target, bytes ?? content, "utf-8");
-					if (retain && active === owned) {
-						if (bytes) owned.inputs.set(target, bytes);
-						if (!bytes || [...owned.inputs.values()].reduce((sum, input) => sum + (input instanceof Uint8Array ? input.length : 0), 0) > owned.maxBytes) {
-							owned.overflow = true; owned.inputs.clear();
-						}
-					}
-				},
-			}, request);
-			if (owned && active === owned) owned.complete = !output.isError;
-			return output;
-		},
-	};
 }
 
 const filesystemWorkers = new AsyncLocalStorage<Promise<void>[]>();

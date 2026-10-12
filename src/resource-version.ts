@@ -102,6 +102,8 @@ export class ResourceReadView {
 	private foreignInputs = false;
 	private onForeignInputs?: (transferable: boolean) => void;
 	private collectProofs?: Map<ResourceVersionToken["observations"], ResourceVersionToken>;
+	private observed?: ResourceInputSource["observed"];
+	private validatePrepared?: (proofs: readonly ResourceVersionToken[]) => Promise<void>;
 	private acceptProofs?: (proofs: readonly ResourceVersionToken[]) => readonly ResourceVersionToken[];
 	private prepared?: { readonly lifetime: RuntimeLifecycleLane; readonly bindings: Map<object, Map<string, PreparedResource>> };
 	private boundary?: { readonly root: string; readonly physicalRoot: string; readonly dependency?: string };
@@ -263,12 +265,6 @@ export class ResourceReadView {
 		const entry = await this.get(target, "content");
 		if (entry.type !== "file" || entry.content === undefined) this.unproven(target);
 	};
-	/** Each evaluation owns its failures, but borrows the same sealed inputs and lifetime. */
-	async evaluate<T>(operation: (view: ResourceReadView) => Promise<T>, observed?: (dependencies: ReadonlySet<string> | undefined) => void,
-		root?: string, lookup?: ResourceInputLookup, missing?: () => Promise<ResourceInputSource>, acceptProofs?: ResourceReadView["acceptProofs"]): Promise<T> {
-		this.assertComplete(true);
-		return this.borrow(operation, observed, root, lookup, missing, acceptProofs);
-	}
 	/** Retain preparations only while capturing, so the sealed branch accounts for every owned byte. */
 	prepare: NonNullable<ToolFilesystemOperations["prepare"]> = (binding, key, build, consume, target, signal) => TimelineInterval.outside(() => {
 		signal?.throwIfAborted();
@@ -300,6 +296,8 @@ export class ResourceReadView {
 					if (transferred) { for (const proof of this.acceptProofs!(cached.proofs!)) this.collectProofs?.set(proof.observations, proof); }
 					return await cached.destination.prepared!.lifetime.admit(async () => {
 						this.assertComplete(); cached.destination.assertComplete();
+						await this.validatePrepared?.([...(this.observed?.(this.dependencies) ?? []), ...cached.proofs ?? []]);
+						signal?.throwIfAborted();
 						const evaluation = await TimelineInterval.measure(() => consume(cached.value as Parameters<typeof consume>[0]));
 						TimelineInterval.own(evaluation.computation);
 						return TimelineInterval.outside(() => {
@@ -321,8 +319,8 @@ export class ResourceReadView {
 				if (source.view.entries === this.entries || !source.view.retained || !source.view.sealed ||
 					!source.view.prepared?.bindings.get(binding)?.get(key)?.retained ||
 					!compatible(source.view.prepared.bindings.get(binding)?.get(key))) continue;
-				const result = await source.view.borrow(view => view.prepare(binding, key, build, consume, undefined, signal), this.observeSource(source), this.boundary,
-					undefined, undefined, this.acceptProofs);
+				const result = await source.view.evaluate(view => view.prepare(binding, key, build, consume, undefined, signal), this.observeSource(source), this.boundary,
+					undefined, undefined, this.acceptProofs, this.validatePrepared);
 				this.assertComplete(); return result;
 			}
 			let resource: Awaited<ReturnType<typeof build>> | undefined;
@@ -341,7 +339,7 @@ export class ResourceReadView {
 			let entries = prepared.bindings.get(binding);
 			if (!entries) prepared.bindings.set(binding, entries = new Map());
 			if (!entries.has(key) || !entries.get(key)!.retained && entries.get(key)!.cancellation.signal.aborted) entries.set(key, pending);
-			pending.ready = this.borrow(async view => {
+			pending.ready = this.evaluate(async view => {
 				const foreign = view.onForeignInputs; view.onForeignInputs = transferable => { if (transferable) composed?.(); else decline(); foreign?.(transferable); };
 				view.collectProofs = this.acceptProofs ? new Map() : undefined;
 				const evaluation = await TimelineInterval.measure(() => build(view, pending.cancellation.signal));
@@ -373,20 +371,20 @@ export class ResourceReadView {
 				}
 				// The origin keeps a borrowed lookup; the destination owns its bytes and disposal.
 			});
-			const settled = () => { decline(); composed?.(); };
-			void pending.ready.then(settled, settled);
+			void pending.ready.finally(() => { decline(); composed?.(); }).catch(() => {});
 			return (await use(pending, true))!.value;
 		});
 	});
-	private async borrow<T>(operation: (view: ResourceReadView) => Promise<T>, observed?: (dependencies: ReadonlySet<string> | undefined) => void,
+	/** Each evaluation owns its proof and failures while borrowing the input lifetime. */
+	async evaluate<T>(operation: (view: ResourceReadView) => Promise<T>, observed?: ResourceInputSource["observed"],
 		root?: string | { readonly root: string; readonly physicalRoot: string }, lookup = this.lookup, missing = this.missing,
-		acceptProofs = this.acceptProofs): Promise<T> {
+		acceptProofs = this.acceptProofs, validatePrepared = this.validatePrepared): Promise<T> {
 		return collectResourceComputation(async () => {
 			this.assertComplete();
 			const view = new ResourceReadView(0);
 			view.entries = this.entries; view.owner = this; view.sealed = true; view.dependencies = new Set(); view.lookup = lookup; view.missing = missing;
 			view.onForeignInputs = this.onForeignInputs;
-			view.acceptProofs = acceptProofs; view.collectProofs = this.collectProofs;
+			view.acceptProofs = acceptProofs; view.collectProofs = this.collectProofs; view.observed = observed; view.validatePrepared = validatePrepared;
 			try {
 				if (typeof root === "object") view.boundary = { root: root.root, physicalRoot: root.physicalRoot };
 				else if (root === undefined || this.boundary && filesystemPathKey(root) === filesystemPathKey(this.boundary.root)) {
@@ -458,13 +456,13 @@ export class ResourceReadView {
 				// The caller already owns the boundary proof; the source contributes only its resource evidence.
 				const boundary = this.boundary && query !== target
 					? { root: this.boundary.physicalRoot, physicalRoot: this.boundary.physicalRoot } : this.boundary;
-				return await source.view.borrow(view => view.get(query, scope), this.observeSource(source), boundary);
+				return await source.view.evaluate(view => view.get(query, scope), this.observeSource(source), boundary);
 			} catch { /* An indexed name alone grants no coverage; another sealed owner may supply it. */ }
 		}
 		if (this.missing) {
 			try {
 				const source = await this.missing();
-				return await source.view.borrow(view => view.get(target, scope), this.observeSource(source), this.boundary);
+				return await source.view.evaluate(view => view.get(target, scope), this.observeSource(source), this.boundary);
 			} catch (error) { throw this.failure ??= error instanceof Error ? error : new Error(String(error)); }
 		}
 		return this.unproven(target);
@@ -476,6 +474,7 @@ export class ResourceReadView {
 				for (const proof of proofs) this.collectProofs.set(proof.observations, proof);
 				this.onForeignInputs?.(true);
 			} else { this.foreignInputs = true; this.onForeignInputs?.(false); }
+			return proofs;
 		};
 	}
 	private entry(target: string, follow = true, scope: ResourceDependency["scope"] = "content"): { entry?: CapturedResource; resolved: string } {
@@ -602,10 +601,7 @@ export class ResourceVersionManager {
 		const observations = new Map(token.observations);
 		const view = metadataBytes === undefined ? undefined : token.view?.retainMetadata(observations, metadataBytes);
 		this.references++;
-		return { ...token, observations, view, watching: false, preciseContent: Object.freeze([]), release: releaseOnce(() => {
-			const finish = () => { observations.clear(); if (--this.references === 0 && !this.preciseWatches.size) this.onIdle?.(); };
-			const pending = view?.dispose(); return pending ? pending.then(finish) : finish();
-		}) };
+		return { ...token, observations, view, watching: false, preciseContent: Object.freeze([]), release: releaseOnce(() => this.releaseCapture(observations, view)) };
 	}
 
 	private async captureToken(dependencies: ReadonlyArray<ResourceDependency> | undefined, retainBytes?: number,
@@ -618,14 +614,7 @@ export class ResourceVersionManager {
 		this.references++;
 		let view: ResourceReadView | undefined;
 		const observing = dependencies !== undefined && !providedInputs;
-		const release = releaseOnce(() => {
-			const finish = () => {
-				observations.clear(); precise?.release();
-				if (--this.references === 0 && !this.preciseWatches.size) this.onIdle?.();
-			};
-			const pending = view?.dispose();
-			return pending ? pending.then(finish) : finish();
-		});
+		const release = releaseOnce(() => this.releaseCapture(observations, view, precise));
 		try {
 			if (observing) await (this.ready ??= this.startWatching());
 			const physicalRoot = await fingerprintIO(() => fs.realpath(this.root));
@@ -660,6 +649,11 @@ export class ResourceVersionManager {
 				manager: this, ...(retained ? { view: retained, inputView: new WeakRef(retained) } : {}), ...(treeObjects ? { treeObjects } : {}), release,
 			};
 		} catch (error) { await release(); throw error; }
+	}
+
+	private releaseCapture(observations: Map<string, ResourceObservation>, view?: ResourceReadView, precise?: { release: () => void }) {
+		const finish = () => { observations.clear(); precise?.release(); if (--this.references === 0 && !this.preciseWatches.size) this.onIdle?.(); };
+		const pending = view?.dispose(); return pending ? pending.then(finish) : finish();
 	}
 
 	/** Adoption waits on these few checks, so their I/O never queues behind a whole-tree scan's waiters. */
