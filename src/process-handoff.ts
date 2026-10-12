@@ -96,7 +96,7 @@ interface HandoffRecord extends ProcessHandoff {
 export type ProcessHandoffAcquisition<Plan> =
 	| { readonly kind: "hit"; readonly plan: Plan; readonly joined: boolean; readonly producer?: ProcessHandoff; readonly continuation?: ProcessContinuation;
 		readonly waiting?: readonly TimelineInterval[];
-		readonly settle?: (consumed: boolean) => void }
+		readonly settle?: (consumed: boolean, forward?: boolean) => void }
 	| { readonly kind: "work"; readonly work: ProcessHandoff; readonly joined: boolean }
 	| { readonly kind: "miss"; readonly joined: boolean };
 
@@ -268,11 +268,17 @@ export class ProcessHandoffRegistry<Invocation = never> {
 								record.borrowers++;
 								let pending = true;
 								return { kind: "hit", plan, joined: waits.length > 0, producer: record, continuation: record.continuation,
-									waiting: waits.filter(wait => wait.handoff === record).map(wait => wait.interval), settle: consumed => {
+									waiting: waits.filter(wait => wait.handoff === record).map(wait => wait.interval), settle: (consumed, forward) => {
 									if (!pending) return;
 									pending = false; claim?.(consumed); record.borrowers--;
 									if (oneShot && this.byKey.get(request.key)?.has(record)) {
-										if (consumed) this.releaseResult(record); else record.state = state; this.wake(request.key);
+										if (consumed && forward && request.role === "producer") {
+											// Private replay moves the one-shot authority; only final consumption destroys it.
+											const next = this.reserve(request.key, request.executablePath, request.ownership, scope);
+											next.binding = record.binding; record.binding = undefined;
+											this.remove(record); this.complete(request.key, next, state.result);
+										} else if (consumed) this.releaseResult(record); else record.state = state;
+										this.wake(request.key);
 									}
 									this.trim();
 								} };
@@ -306,14 +312,8 @@ export class ProcessHandoffRegistry<Invocation = never> {
 	}
 
 	/** Seal owned bytes before visibility; disk maintenance and persistence cannot revoke a live result. */
-	async publish(
-		key: Sha256Digest,
-		handoff: ProcessHandoff,
-		candidate: ProcessProvenanceCertificate,
-		persist: () => Promise<boolean>,
-		continuation?: ProcessContinuation,
-		computation?: TimelineInterval,
-	): Promise<boolean> {
+	async publish(key: Sha256Digest, handoff: ProcessHandoff, candidate: ProcessProvenanceCertificate, persist: () => Promise<boolean>,
+		continuation?: ProcessContinuation, computation?: TimelineInterval): Promise<boolean> {
 		if (this.byKey.get(key)?.get(handoff)?.state.status !== "running") throw new Error("process handoff is no longer running");
 		computation ??= continuation?.computation ?? new TimelineInterval(handoff.startedAt, performance.now());
 		const graphs = [...new Set([computation, ...(continuation ? [continuation.computation] : [])])].map(value => TimelineInterval.serialize(value));
@@ -347,10 +347,8 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		for (const key of this.waiters.keys()) this.wake(key);
 		for (const record of this.records()) {
 			if (record.state.status === "running") record.controller.abort(new Error("process handoff disposed"));
-			this.complete(record.key, record);
-			this.remove(record);
+			if (!this.complete(record.key, record)) this.remove(record);
 		}
-		this.byKey.clear();
 		this.completedCount = 0;
 	}
 

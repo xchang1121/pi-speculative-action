@@ -40,7 +40,7 @@ import { observeStrace, straceCommand, traceTail, type ObservedProcessPath, type
 import type { WorkspaceTransactionOwnership } from "./workspace-transaction.ts";
 import type { ToolProcessInvocation } from "./tool-settlement.ts";
 import type { ResourceValidation } from "./settlement.ts";
-import { ProcessHandoffOwnership, ProcessHandoffRegistry, sameScope, type ProcessContinuation, type ProcessExecutionBinding, type ProcessHandoff } from "./process-handoff.ts";
+import { ProcessHandoffOwnership, ProcessHandoffRegistry, sameScope, type ProcessContinuation, type ProcessExecutionBinding, type ProcessHandoff, type ProcessHandoffAcquisition } from "./process-handoff.ts";
 import { WorkspaceSandboxService, readSandboxDirectoryState, restoreModifiedTimes, sameSandboxState, useModifiedTimesHelper, type SandboxDirectoryChange, type SandboxFileChange,
 	type SandboxWorkspaceChange, type SandboxWorkspaceContext } from "./workspace-sandbox.ts";
 import { containsFilesystemPath as pathContains, relativeFilesystemPath, slash } from "./path-utils.ts";
@@ -862,12 +862,11 @@ export class LinuxProcessReuseBackend {
 		const cwd = session.projection.toPhysical(invocation.cwd), executable = session.projection.toPhysical(invocation.executable);
 		if (!cwd || !executable) throw new Error("bound process paths are unmapped");
 		const request = { ...invocation, cwd };
-		const captured = await TimelineInterval.outside(() => TimelineInterval.measure(async () => {
+		const { output: { prototype, before }, computation: preparation } = await TimelineInterval.outside(() => TimelineInterval.measure(async () => {
 			const prototype = await this.prototype(session, request, executable, invocation.outputRoute);
 			if (processWeakKey(prototype) !== binding.key) throw new Error("bound process execution context changed");
 			return { prototype, before: await session.workspace.structure.capture() };
 		}));
-		const { prototype, before } = captured.output, preparation = captured.computation;
 		const resultsBefore = session.preparedResults, seedsBefore = session.preparedInputSeeds;
 		this.add(session, "requests");
 		const observation = { complete: true, paths: [], taints: [], tracedProcesses: 0, incompleteReasons: [] };
@@ -900,7 +899,7 @@ export class LinuxProcessReuseBackend {
 				lookup: (live, excludedCertificates, artifacts) => this.plan(weakKey, executablePath, session.projection, (candidate) => compatibleProducer(session.nestedProducer, candidate), { session, live, excludedCertificates, artifacts }),
 			}));
 			if (acquired.kind === "hit" && acquired.plan.kind === "completed_replay") {
-				const plan = acquired.plan;
+				const plan = acquired.plan, binding = acquired.producer?.binding;
 				return TimelineInterval.outside(async () => {
 					const before = captureWorkspace ? await session.workspace.structure.capture() : undefined;
 					const result = await this.replay(session, plan, weakKey, acquired, request.streams && descriptorInputs(request.resources!), inPlace);
@@ -910,7 +909,6 @@ export class LinuxProcessReuseBackend {
 					recordSessionWrites(session, inPlace ?? -requestID, written);
 					if (inPlace !== undefined) session.writers.add({ startedAt: Date.now(), endedAt: Date.now(), writes: [], settled: true, pid: inPlace, ...written });
 					if (before) captureWorkspace!({ before, after: await session.workspace.structure.capture() });
-					const binding = acquired.producer?.binding;
 					if (binding && this.handoffs.resolveBinding(binding, session.scope)) session.executionBindings.set(requestID, binding);
 					return result;
 				}).finally(() => acquired.settle?.(false));
@@ -1104,18 +1102,12 @@ export class LinuxProcessReuseBackend {
 		} finally { if (!transferred) settle?.(false); if (!completing) releaseLearning(); }
 	}
 
-	private async replay(
-		session: ActiveSession,
-		plan: Extract<ProcessReusePlan, { kind: "completed_replay" }>,
-		weakKey: Sha256Digest,
-		acquired: { readonly joined: boolean; readonly producer?: ProcessHandoff; readonly waiting?: readonly TimelineInterval[]; readonly settle?: (consumed: boolean) => void },
-		inputs?: ReturnType<typeof descriptorInputs>,
-		pid?: number,
-	): Promise<DispatcherResponse> {
+	private async replay(session: ActiveSession, plan: Extract<ProcessReusePlan, { kind: "completed_replay" }>, weakKey: Sha256Digest,
+		acquired: Extract<ProcessHandoffAcquisition<ReadyProcessPlan>, { kind: "hit" }>, inputs?: ReturnType<typeof descriptorInputs>, pid?: number): Promise<DispatcherResponse> {
 		const { artifacts, certificate } = plan;
 		const output = wireOutput(loadOutputEvents(artifacts, certificate.result.journal)), computation = reusedComputation(certificate, acquired);
 		await replayFilesystemEffects(this.replayWorkspace, artifacts, certificate.result.journal, session.projection, session.workspace.sandboxRoot,
-			path.join(session.workspace.processRoot, "private")).then(() => acquired.settle?.(true), error => {
+			path.join(session.workspace.processRoot, "private")).then(() => acquired.settle?.(true, true), error => {
 				acquired.settle?.(!(error instanceof EffectCommitFailure && error.disposition === "recoverable")); throw error;
 			});
 		session.nestedEvidence.push(certificate.dependencyCertificate);

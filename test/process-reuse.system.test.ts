@@ -44,7 +44,7 @@ async function fixture(options: ConstructorParameters<typeof ProvenanceCertifica
 		return sealProcessCertificate({ ...PROCESS_CERTIFICATE, createdAt, dependencyCertificate: { complete: true, dependencies: [dependency], taints: oneShot ? ["clock"] : [] },
 			result: { replayProfile: "buffered_noninteractive", journal, exit: { kind: "code", code: 0 } } });
 	};
-	const planner = new ProcessReusePlanner({ store }), registry = own(new ProcessHandoffRegistry(store, 64 * 1024));
+	const planner = new ProcessReusePlanner({ store }), registry = own(new ProcessHandoffRegistry<string>(store, 64 * 1024));
 	const lookup = async (certificates?: readonly ProcessProvenanceCertificate[], excludedCertificates?: ReadonlySet<ProcessProvenanceCertificate["id"]>, artifacts?: ReadonlyMap<ProcessProvenanceCertificate["id"], VerifiedArtifactClosure>) => {
 		const plan = await planner.plan({ ...request, excludedCertificates, ...(certificates ? { live: { certificate: certificates, artifacts, acceptedTaints: ["clock"] } } : {}) });
 		return plan.kind === "completed_replay" ? plan : undefined;
@@ -68,7 +68,7 @@ async function fixture(options: ConstructorParameters<typeof ProvenanceCertifica
 		const result = await pending; expect(result.kind).toBe(expected === undefined ? "miss" : "hit");
 		if (result.kind === "hit") { expect(output(result.plan)).toBe(expected); result.settle?.(true); } return result;
 	};
-	return { root, input, store, request, produce, lookup, output, registry, reserve, actor, publish, consume };
+	return { root, input, store, request, common, produce, lookup, output, registry, reserve, actor, publish, consume };
 }
 
 test("reopens, validates, repairs and collects persisted history without stale observations", async () => {
@@ -254,9 +254,10 @@ test.each(["existing", "new"])("selects a %s ready producer and retains its comp
 	f.registry.configure(8, 64 * 1024); await f.publish(await f.reserve(), "bounded"); await f.consume(f.actor(), "bounded");
 });
 
-test.each(["released", "consumed", "cancelled", "raced", "whole-released", "whole-consumed"])("settles a %s one-shot claim without losing another Actor's result", async outcome => {
+test.each(["released", "consumed", "cancelled", "raced", "whole-released", "whole-consumed", "forwarded", "forwarded-stale", "forwarded-whole", "producer-consumed", "producer-released"])("settles a %s one-shot claim without losing another Actor's result", async outcome => {
 	const f = await fixture({ gcIntervalMs: 0, orphanGraceMs: 0, maxBytes: 128 * 1024 }), ownership = new ProcessHandoffOwnership(), releaseWhole = hold();
-	const certificate = await f.publish(await f.reserve(ownership), "computed result");
+	const work = await f.reserve(ownership), certificate = await f.publish(work, "computed result", 1, true, new TimelineInterval(0, 10));
+	const binding = f.registry.bind(f.common.key, work, "learned invocation"), forward = outcome.startsWith("forwarded"), destination = new ProcessHandoffOwnership();
 	const checked = deferred(), racing = hold(), controller = new AbortController(), consumed = outcome.endsWith("consumed");
 	cleanup.push(() => controller.abort()); let settled = false;
 	const next = () => track(f.actor({ signal: controller.signal, lookup: async (...args) => {
@@ -267,7 +268,8 @@ test.each(["released", "consumed", "cancelled", "raced", "whole-released", "whol
 	const whole = outcome.startsWith("whole") ? track(ownership.commit(async () => {
 		await releaseWhole.wait(); if (!consumed) throw effectCommitFailure(new Error("unchanged effects"), "recoverable");
 	}).catch(error => { expect(error.disposition).toBe("recoverable"); })) : undefined;
-	const first = whole ? undefined : await f.actor(); if (first && first.kind !== "hit") throw new Error("expected first claim");
+	const first = whole ? undefined : await (forward || outcome.startsWith("producer") ? f.registry.acquire({ ...f.common, role: "producer", ownership: destination, executablePath: f.request.executablePath }) : f.actor());
+	if (first && first.kind !== "hit") throw new Error("expected first claim");
 	const second = earlier ?? next(); racing.release(); await checked.promise; await nextTurn(); expect(settled).toBe(false);
 	vi.spyOn(f.store, "gc").mockRejectedValueOnce(new Error("transient collection failure"));
 	await expect(f.store.withPublication(async () => {
@@ -276,8 +278,16 @@ test.each(["released", "consumed", "cancelled", "raced", "whole-released", "whol
 	})).rejects.toThrow("abandoned before certificate");
 	await expect.poll(async () => (await f.store.stats()).artifacts).toBe(0);
 	expect(await f.store.artifacts.load(referencedArtifacts(certificate))).toBeUndefined();
-	if (outcome === "cancelled") controller.abort(); else { first?.settle?.(consumed); releaseWhole.release(); }
-	await f.consume(second, consumed || outcome === "cancelled" ? undefined : "computed result");
+	if (outcome === "forwarded-stale") await writeFile(f.input, "changed input");
+	if (outcome === "forwarded-whole") await destination.commit(async () => {});
+	if (outcome === "cancelled") controller.abort(); else { first?.settle?.(consumed || forward, outcome !== "producer-consumed"); releaseWhole.release(); }
+	const result = await f.consume(second, consumed || outcome === "cancelled" || outcome === "forwarded-stale" || outcome === "forwarded-whole" ? undefined : "computed result");
+	if (result.kind === "hit") expect(result.plan.certificate).toEqual(certificate);
+	if (forward) {
+		expect(f.registry.bindings(f.common.scope)).toEqual([binding]); expect(f.registry.resolveBinding(binding!, f.common.scope)).toBe("learned invocation");
+		await expect(ownership.commit(async () => {})).rejects.toThrow("partially consumed");
+		if (outcome === "forwarded") await expect(destination.commit(async () => {})).rejects.toThrow("partially consumed");
+	}
 	first?.settle?.(false); releaseWhole.release(); await whole;
 	await f.consume(f.actor(), outcome === "cancelled" ? "computed result" : undefined);
 });

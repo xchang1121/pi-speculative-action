@@ -427,26 +427,31 @@ nativeTest.for([false, true])("prepares a failed command after its reported inpu
 		} finally { await host?.dispose(); await fixture.dispose(); }
 	});
 
-nativeTest.for(["bash", "write", "stale", "disabled"])("reprepares changed children beyond fresh beam entries (%s)", { timeout: 20_000 }, async (mode, { benchmark }) => {
+nativeTest.for(["bash", "write", "stale", "disabled", "bash:shared", "write:shared", "stale:shared", "disabled:shared", "bash:parents", "bash:aliases", "bash:both", "bash:repeat", "write:repeat"])("reprepares changed children beyond fresh beam entries (%s)", { timeout: 20_000 }, async (scenario, { benchmark }) => {
+	const [mode, layout] = scenario.split(":"), target = layout === "parents" ? "first" : "last", both = layout === "both";
 	const fixture = await benchmark("pi-rerun-frontier-", "git"), scope = { sessionID: "frontier", turnID: "seed" };
 	let host: ReturnType<typeof createSpeculativeActionHost> | undefined;
 	try {
 		for (const name of ["first", "last"]) await writeFile(path.join(fixture.workspace, name), "old\n");
 		await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker", code: `${cHeaders("fcntl.h unistd.h")}
-int main(int argc, char **argv) { if (argc != 2) return 1; int fd = open(argv[1], O_RDONLY); char bytes[16];
+int main(int argc, char **argv) { if (argc != 2) return 1; int fd = open(${layout ? '"last"' : "argv[1]"}, O_RDONLY); char bytes[16];
  int length = read(fd, bytes, sizeof(bytes)); if (length < 0 || close(fd)) return 2;
  for (volatile unsigned long i = 0; i < 40000000ul; ++i) {} return write(1, bytes, (size_t)length) != length; }
 ` });
 		await commitBenchmarkFixture(fixture.workspace, "changed child frontier"); await prepareLinuxProcessReuse(fixture);
 		const route = await fixture.prepareActorReplay(), writer = createWriteTool(fixture.workspace), tools = [fixture.tool, writer];
-		const registry = Reflect.get(fixture.backend, "handoffs") as ProcessHandoffRegistry<{ executable: string }>;
+		const registry = Reflect.get(fixture.backend, "handoffs") as ProcessHandoffRegistry<{ executable: string; args: readonly string[] }>;
 		const settings = { candidateLimit: 4, maxConcurrentActions: 4, patternAware: patternAwareSettings({ multiStepEnabled: false, beamWidth: 1, presets: ["recent-command"] }) };
 		const prepared = patternProcessHost(fixture, scope.sessionID, settings, {}, tools), { events, start, call } = prepared; host = prepared.host;
 		const execute = (turnID: string, command: string) => host!.execute({ ...call(turnID, command), id: `${turnID}:${command}` }, AbortSignal.timeout(10_000),
 			() => fixture.coordinator.runWith({ execute: request => route.executor.execute({ ...request, scope: { ...scope, turnID } }) }, () => fixture.tool.execute(turnID, { command })));
-		await start("seed"); expect(textOutput(await execute("seed", "printf parent >> marker; worker first; worker last"))).toBe("old\nold\n"); await host.finishTurn("seed");
+		await start("seed");
+		const commands = layout === "parents" ? ["printf parent >> marker; worker first", "worker last"] : ["printf parent >> marker; worker first; worker last", ...layout === "aliases" ? ["printf ''; worker first; worker last"] : []];
+		for (const command of commands) expect(textOutput(await execute("seed", command))).toBe("old\n".repeat(command.includes("; worker last") ? 2 : 1));
+		await host.finishTurn("seed");
 		const bindings = fixture.backend.executionBindings(scope).filter(binding => registry.resolveBinding(binding, scope)?.executable.endsWith("/worker"));
 		expect(bindings).toHaveLength(2);
+		const consumed = bindings.find(binding => registry.resolveBinding(binding, scope)?.args.includes(target))!;
 		const invocation = resolvePiToolInvocation("bash", { command: "exit 92" }, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath })!.process!;
 		for (const binding of bindings) await fixture.workspaceSandbox.withWorkspace(fixture.workspace, workspace =>
 			withPreparedWorker(fixture, { sourceRoot: fixture.workspace, workspace, invocation, scope: { ...scope, turnID: "warm" } }, binding, "old\n", async () => {}), { liveLower: true });
@@ -458,20 +463,25 @@ int main(int argc, char **argv) { if (argc != 2) return 1; int fd = open(argv[1]
 		expect(events.filter(event => event.type === "candidate" && event.candidate.mode === "recent-command")).toEqual([]); await host.finishTurn("unrelated");
 		if (mode === "disabled") settings.patternAware = patternAwareSettings({ enabled: false });
 		await start("edit");
-		if (mode === "write") {
-			const args = { path: "last", content: "new\n" };
-			await host.execute({ turnID: "edit", id: "edit", tool: "write", args, tools }, undefined, () => writer.execute("edit", args));
-		} else await execute("edit", "printf 'new\\n' > last");
-		if (mode !== "disabled") await expect.poll(() => events.some(event => event.type === "candidate" && event.turnID === "edit" &&
-			event.candidate.mode === "recent-command" && event.candidate.kind === "operation" && event.state.status === "succeeded"), { timeout: 5000 }).toBe(true);
-		expect(publishing.mock.calls.map(([certificate]) => certificate.weakKey)).toEqual(mode === "disabled" ? [] : [bindings[1]!.key]);
+		for (const value of layout === "repeat" ? ["new", "two"] : ["new"]) {
+			if (mode === "write") {
+				const args = { path: "last", content: `${value}\n` };
+				await host.execute({ turnID: "edit", id: `edit:${value}`, tool: "write", args, tools }, undefined, () => writer.execute("edit", args));
+			} else await execute("edit", `printf '${value}\\n' > last`);
+			if (mode !== "disabled") await expect.poll(() => events.filter(event => event.type === "candidate" && event.turnID === "edit" &&
+				event.candidate.mode === "recent-command" && event.candidate.kind === "operation" && event.state.status === "succeeded").length, { timeout: 5000 }).toBe((layout ? 2 : 1) * (value === "two" ? 2 : 1));
+		}
+		expect(publishing.mock.calls.map(([certificate]) => certificate.weakKey).sort()).toEqual(mode === "disabled" ? [] : (layout ? bindings : [consumed]).flatMap(binding => layout === "repeat" ? [binding.key, binding.key] : [binding.key]).sort());
 		if (mode === "stale") await writeFile(path.join(fixture.workspace, "last"), "bad\n");
-		const before = fixture.backend.actorMetrics().hits, actual = await execute("edit", "printf actual; worker last");
-		const timing = consumedTiming(events.filter(event => event.type === "actor_action").at(-1)!.settlement.provider.toolExecution);
-		expect(textOutput(actual)).toBe(`actual${mode === "stale" ? "bad" : "new"}\n`);
+		const before = fixture.backend.actorMetrics().hits, actual = await execute("edit", `printf actual; ${both ? "worker first; " : ""}worker ${target}`);
+		const computation = events.filter(event => event.type === "actor_action").at(-1)!.settlement.provider.toolExecution, timing = consumedTiming(computation);
+		expect(textOutput(actual)).toBe(`actual${`${mode === "stale" ? "bad" : layout === "repeat" ? "two" : "new"}\n`.repeat(both ? 2 : 1)}`);
 		expect(await readFile(path.join(fixture.workspace, "marker"), "utf8")).toBe("parent");
 		const reused = mode === "bash" || mode === "write";
-		expect([fixture.backend.actorMetrics().hits - before, timing.hiddenComputeMs > 0]).toEqual([Number(reused), reused]);
+		expect([fixture.backend.actorMetrics().hits - before, timing.hiddenComputeMs > 0]).toEqual([reused ? both ? 2 : 1 : 0, reused]);
+		const receipts = new Set(TimelineInterval.serialize(computation)!.nodes.flatMap(node => node.inputs?.filter(input => input.reused).map(input => input.id) ?? []));
+		expect(publishing.mock.calls.filter(([certificate]) => receipts.has(certificate.result.computation!.root)).map(([certificate]) => certificate.weakKey).sort())
+			.toEqual(reused ? (both ? bindings : [consumed]).map(binding => binding.key).sort() : []);
 		if (reused) expect(timing.hiddenByMode).toEqual([{ source: "pattern_aware", mode: "recent-command", hiddenComputeMs: timing.hiddenComputeMs }]);
 		await host.finishTurn("edit", true);
 		if (mode === "disabled") expect(events.filter(event => event.type === "candidate" && event.candidate.mode === "recent-command")).toEqual([]);

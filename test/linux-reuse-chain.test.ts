@@ -74,7 +74,7 @@ async function chainWorld(files: readonly (readonly [string, string])[], loops: 
 			expect(timing!.toolComputeMs!).toBeGreaterThanOrEqual(timing!.hiddenComputeMs);
 			expect(timing!.adoptionWaitMs!).toBeGreaterThanOrEqual(0); expect(timing!.adoptionWaitMs!).toBeLessThanOrEqual(ms);
 			await host.finishTurn(turnID);
-			return { ms, text: textOutput(result as never), hits: after.hits - before.hits };
+			return { ms, text: textOutput(result as never), hits: after.hits - before.hits, hiddenMs: timing!.hiddenComputeMs };
 		};
 		return { fixture, workspace, host, step, tools, events };
 	} catch (error) { await fixture.dispose(); throw error; }
@@ -102,15 +102,15 @@ test.skipIf(process.platform !== "linux" || !process.env.PI_SPEC_REUSE_CHAIN)("r
 	console.log(rows.join("\n"));
 });
 
-test.skipIf(process.platform !== "linux").for(["build", "current_workspace", "changed_after_preparation", "after_horizon", "changed_after_horizon", "bash_mutation", "bash_changed_after_preparation"] as const)("prepares learned work after an Actor edit (%s)", { timeout: 120_000 }, async mode => {
-	const horizon = mode.endsWith("horizon"), stale = mode.includes("changed_"), bashMutation = mode.startsWith("bash_"), worker = `./slow a.txt${horizon ? " identity" : ""}`;
+test.skipIf(process.platform !== "linux").for(["build", "build_changed_after_preparation", "current_workspace", "changed_after_preparation", "after_horizon", "changed_after_horizon", "bash_mutation", "bash_changed_after_preparation"] as const)("prepares learned work after an Actor edit (%s)", { timeout: 120_000 }, async mode => {
+	const horizon = mode.endsWith("horizon"), stale = mode.includes("changed_"), bashMutation = mode.startsWith("bash_"), build = mode.startsWith("build"), worker = `./slow a.txt${horizon ? " identity" : ""}`;
 	// This retention scenario needs capacity for the detour and producer; CPU preemption has separate coverage.
 	const { fixture, workspace, host, step, events } = await chainWorld([["a.txt", "alpha\n"], ["Makefile", "all:\n\t@./slow a.txt\n"]], "600000000", undefined,
 		horizon ? { initial: { cpuCount: 4, idleCpuCount: 4 }, sample: async () => ({ cpuCount: 4, idleCpuCount: 4 }) } : undefined);
 	let publication: ReturnType<typeof holdProcessPublication> | undefined;
 	try {
-		const command = mode === "build" ? "make -s all" : `${worker} | tail -1${horizon ? `; ${worker} | tail -2` : ""}`;
-		await step("build", mode === "build" ? "make -s" : `cat > a.txt <<'EOF'\nalpha\nEOF\n${worker} | tail -2`, 0);
+		const command = build ? "make -s all" : `${worker} | tail -1${horizon ? `; ${worker} | tail -2` : ""}`;
+		await step("build", build ? "make -s" : `cat > a.txt <<'EOF'\nalpha\nEOF\n${worker} | tail -2`, 0);
 		if (bashMutation) {
 			await step("unchanged", "printf unchanged", 0);
 			expect(events.some(event => event.type === "candidate" && event.candidate.kind === "operation")).toBe(false);
@@ -130,8 +130,8 @@ test.skipIf(process.platform !== "linux").for(["build", "current_workspace", "ch
 		const measured = await step("check", command, bashMutation ? () => expect.poll(() => events.some(event => event.type === "candidate" &&
 			event.candidate.kind === "operation" && event.state.status === "succeeded"), { timeout: 15_000 }).toBe(true) : horizon ? 0 : 3000,
 			stale ? "printf 'newest\\n' > a.txt" : undefined);
-		expect([measured.text.trim(), measured.hits], JSON.stringify({ events: events.filter(event => event.type === "candidate" || event.type === "operation_prediction"), metrics: fixture.backend.metrics() }))
-			.toEqual([execSync(command, { cwd: workspace, encoding: "utf8" }).trim(), Number(!stale)]);
+		expect([measured.text.trim(), measured.hits, measured.hiddenMs > 0], JSON.stringify({ events: events.filter(event => event.type === "candidate" || event.type === "operation_prediction"), metrics: fixture.backend.metrics() }))
+			.toEqual([execSync(command, { cwd: workspace, encoding: "utf8" }).trim(), Number(!stale), !stale]);
 	} finally { publication?.close(); await host.dispose(); await fixture.dispose(); }
 });
 
