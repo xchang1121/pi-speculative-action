@@ -1174,8 +1174,8 @@ export class LinuxProcessReuseBackend {
 			const tracePrefix = path.join(traceRoot, "process");
 			const logicalExecutable = session.projection.toLogical(executable);
 			const { execMounts, executables: interposedExecutables } = interception(session.interposition, executable), image = logicalExecutable;
-			const logicalCwd = session.projection.toLogical(request.cwd);
-			descriptors = createProcessDescriptorCapture(session, traceRoot, request, !!captureWorkspace && !!ready.imageLibrary);
+			const logicalCwd = session.projection.toLogical(request.cwd), live = !!captureWorkspace && !!ready.imageLibrary;
+			descriptors = createProcessDescriptorCapture(session, traceRoot, request, live);
 			const { inputs, descriptorManifest, descriptorReportPath, descriptorImages, directoryImages, inheritedFiles, outputPipes: unchangedOutputPipes } = descriptors;
 			const outputPipes = request.outputPipes?.some(Boolean);
 			const streamInputs = inputs.filter(input => ["pipe", "socket", "eventfd"].includes(input.type ?? ""));
@@ -1183,7 +1183,6 @@ export class LinuxProcessReuseBackend {
 				const peer = request.resources!.objects[input.image]!.socket?.peer;
 				return input.outside === 0 && (!peer?.connected || peer.object !== undefined);
 			});
-			const live = !!captureWorkspace && !!ready.imageLibrary && inputs.every(input => input.installed !== false);
 			const resourceJournal = live || inputs.some(input => !input.type || input.type === "eventfd" || input.type === "socket" || input.type === "pipe" && (input.flags & 3) !== 0);
 			const streamIdentity = (position: { fd: number; inode: string }) => {
 				const input = inputs.find(input => input.fd === position.fd)!;
@@ -1295,7 +1294,7 @@ export class LinuxProcessReuseBackend {
 							try {
 								observation = await observe(positions, frozen);
 								if (observation.complete) {
-									bindContinuationDescriptors(await readImage(), frozen, inputs, !!request.closeStdin, observation.finalHandles ?? [], positions);
+									bindProcessDescriptors(inputs, positions, observation, { image: await readImage(), frontier: frozen, closedInput: !!request.closeStdin });
 									return true;
 								}
 							} catch {}
@@ -1356,12 +1355,9 @@ export class LinuxProcessReuseBackend {
 				});
 				own.written ??= observation.written ?? []; own.external = observation.external ?? [];
 				for (const pid of observation.resumedInterpositions ?? []) session.resumed.add(pid);
-				if (continuation) continuation = { ...continuation, image: bindContinuationDescriptors(continuation.image, frozen!, inputs,
-					!!request.closeStdin, observation.finalHandles ?? [], descriptorOffsets ?? []) };
-				// A destroyed OFD has no observable final position. If it escaped into a
-				// surviving message, its position instead needs a kernel observation.
-				if (!continuation && inputs.some(input => !input.type && input.outside === 0 && observation.retainedDescriptions?.includes(input.alias)))
-					throw new Error("queued file description has no final position observation");
+				const boundImage = bindProcessDescriptors(inputs, descriptorOffsets ?? [], observation, continuation && {
+					image: continuation.image, frontier: frozen!, closedInput: !!request.closeStdin });
+				if (continuation) continuation = { ...continuation, image: boundImage! };
 				if (observation.incompleteReasons.length) {
 					this.setError(session, `trace:${observation.incompleteReasons.join(",")}`);
 					for (const reason of observation.incompleteReasons) session.incompleteReasons.add(`nested_trace:${reason}`);
@@ -1775,8 +1771,14 @@ function bufferedProcessPrototype(
 	});
 }
 
-function bindContinuationDescriptors(image: Buffer, frontier: { pid: number; fd: number; writing: boolean }, inputs: ReturnType<typeof descriptorInputs>, closedInput: boolean,
-	handles: NonNullable<import("./strace-observer.ts").StraceObservation["finalHandles"]>, positions: ReturnType<typeof parseDescriptorOffsets>) {
+function bindProcessDescriptors(inputs: ReturnType<typeof descriptorInputs>, positions: ReturnType<typeof parseDescriptorOffsets>, observation: StraceObservation,
+	continuation?: { image: Buffer; frontier: { pid: number; fd: number; writing: boolean }; closedInput: boolean }) {
+	const handles = observation.finalHandles ?? [];
+	// Surviving queued OFDs need a current position; a continuation can prove it through an installed alias.
+	if (inputs.some(input => !input.type && input.outside === 0 && observation.retainedDescriptions?.includes(input.alias) &&
+		(!continuation || !handles.some(handle => handle.description === input.alias)))) throw new Error("queued file description has no final position observation");
+	if (!continuation) return;
+	const { image, frontier, closedInput } = continuation;
 	let cursor = 0;
 	const line = () => {
 		const end = image.indexOf(10, cursor);
@@ -1794,8 +1796,8 @@ function bindContinuationDescriptors(image: Buffer, frontier: { pid: number; fd:
 		const input = handle?.description !== undefined ? inputs.find(input => input.alias === handle.description) : undefined;
 		if (input) {
 			const before = positions.find(position => position.fd === input.fd)!;
-			if (fields[3] !== before.device || fields[4] !== before.inode || Boolean(Number(fields[1]) & 0x80000) !== handle!.cloexec)
-				throw new Error("continuation descriptor identity changed");
+			if (input.installed === false || fields[3] !== before.device || fields[4] !== before.inode || Boolean(Number(fields[1]) & 0x80000) !== handle!.cloexec)
+				throw new Error("continuation descriptor source is unavailable or changed");
 			const state = [String(Number(fields[1]) & ~0x80000), ...fields.slice(2, 5)], previous = descriptions.get(input.alias);
 			if (previous && previous.join(" ") !== state.join(" ")) throw new Error("continuation shared OFD diverged");
 			descriptions.set(input.alias, state); fields[5] = String(input.fd);
