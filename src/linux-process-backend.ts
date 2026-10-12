@@ -159,10 +159,8 @@ type ProcessArguments = Pick<DispatcherRequest, "argv0" | "args" | "cwd" | "envi
 	readonly outputFlags?: readonly [number, number];
 };
 type BoundProcessInvocation = ProcessArguments & {
-	readonly sourceRoot: string;
-	readonly executable: string;
-	readonly outputRoute: OutputRoute;
-	readonly producer?: ProcessProducerProof;
+	readonly sourceRoot: string; readonly executable: string;
+	readonly outputRoute: OutputRoute; readonly producer?: ProcessProducerProof;
 };
 
 interface BufferedOutput { readonly fd: 1 | 2; readonly data: Buffer; }
@@ -509,27 +507,17 @@ export class LinuxProcessReuseBackend {
 		const server = net.createServer({ allowHalfOpen: true }, (socket) => this.serve(session, socket));
 		const gitDirectory = await lstat(path.join(sourceRoot, ".git")).then((info) => info.isDirectory() ? path.join(sourceRoot, ".git") : undefined, () => undefined);
 		const session: ActiveSession = {
-			token,
-			sourceRoot,
+			token, sourceRoot, projection, originalPath, deniedPaths, producer, nestedProducer, socketPath,
 			...(gitDirectory ? { gitDirectory } : {}),
-			workspace: input.workspace,
-			invocation: input.invocation,
+			workspace: input.workspace, invocation: input.invocation,
 			scope: snapshotExecutionScope(input.scope),
-			projection,
 			interposition: { mounts: [], directories: [], entries: [], dependencies: [] },
-			originalPath,
-			deniedPaths,
-			producer,
-			nestedProducer,
-			socketPath,
 			signal: AbortSignal.any([controller.signal, ...(input.signal ? [input.signal] : [])]),
 			lifecycle: new RuntimeLifecycleLane(),
 			ownership: new ProcessHandoffOwnership(input.onOperationAdopted, input.acceptOperationScope),
-			preparedResults: 0,
-			preparedInputSeeds: 0,
+			preparedResults: 0, preparedInputSeeds: 0,
 			nestedEvidence: [], foldedObservations: [], resumed: new Set(),
-			executionBindings: new Map(),
-			computations: [],
+			executionBindings: new Map(), computations: [],
 			incompleteReasons: new Set<string>(), bypasses: [], writers: new Set(), completedWrites: new Map(), nestedOutputEndpoints: new Set(),
 			metrics: { ...emptyWorldReuseMetrics() },
 		};
@@ -1436,32 +1424,19 @@ export class LinuxProcessReuseBackend {
 						this.setError(session, detail.length > 4096 ? `${detail.slice(0, 4095)}…` : detail);
 					}
 					stage = "handoff_registration";
-					if (await this.handoffs.publish(
-						weakKey,
-						work,
-						certificate,
-						() => {
-							if (continuation) return Promise.resolve(false);
-							const binding = this.handoffs.bind(weakKey, work, {
-								argv0: request.argv0, args: request.args, environment: request.environment,
-								cwd: logicalCwd, executable: logicalExecutable, sourceRoot: session.sourceRoot, outputRoute, producer: session.nestedProducer,
-								...(request.outputPipes ? { outputPipes: request.outputPipes } : {}), ...(request.outputFlags ? { outputFlags: request.outputFlags } : {}),
-								...(request.closeStdin ? { closeStdin: true } : {}),
-									...(request.resources ? { resources: request.resources } : {}),
-							});
-							if (binding) session.executionBindings.set(requestID, binding);
-							stage = "history_publication";
-							return this.planner.publishCompleted(certificate, SAME_CONFINEMENT_TAINTS).catch((error: unknown) => {
-								// Optional history storage cannot invalidate already sealed execution evidence.
-								this.setError(session, `nested_publish:${failureDetail(error)}`);
-								return false;
-							});
-						},
-						continuation,
-						computation,
-					)) {
-						this.add(session, "published");
-					}
+					if (await this.handoffs.publish(weakKey, work, certificate, () => {
+						const { streams: _streams, ...invocation } = request;
+						const binding = this.handoffs.bind(weakKey, work, { ...invocation, cwd: logicalCwd, executable: logicalExecutable,
+							sourceRoot: session.sourceRoot, outputRoute, producer: session.nestedProducer });
+						if (binding) session.executionBindings.set(requestID, binding);
+						if (continuation) return Promise.resolve(false);
+						stage = "history_publication";
+						return this.planner.publishCompleted(certificate, SAME_CONFINEMENT_TAINTS).catch((error: unknown) => {
+							// Optional history storage cannot invalidate already sealed execution evidence.
+							this.setError(session, `nested_publish:${failureDetail(error)}`);
+							return false;
+						});
+					}, continuation, computation)) this.add(session, "published");
 					reusable = this.recordPreparedResult(session, certificate, !!request.resources || inputs.length > 0);
 				});
 			} catch (error) {

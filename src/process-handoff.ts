@@ -360,15 +360,8 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		const completion = new Promise<void>((resolve) => { settle = resolve; });
 		const controller = new AbortController();
 		const record: HandoffRecord = {
+			key, completion, executablePath, scope, ownership, settle, startedAt: performance.now(), state: { status: "running" },
 			controller, signal: controller.signal, borrowers: 0,
-			key,
-			completion,
-			executablePath,
-			scope,
-			ownership,
-			settle,
-			startedAt: performance.now(),
-			state: { status: "running" },
 			get advance() { return record.state.status === "running" ? record.state.advance : undefined; },
 			get computation() { return record.state.status !== "running" ? record.state.result?.computation : undefined; },
 			get continuation() { return record.state.status !== "running" ? record.state.result?.continuation : undefined; },

@@ -112,8 +112,8 @@ async function runningProcess(start: number, ready: (pid: number, syscall: strin
 	return pid;
 }
 
-function consumedTiming(events: readonly SpeculativeActionEvent<string>[], turnID: string) {
-	const computation = events.filter(event => event.type === "actor_action").find(event => event.turnID === turnID)!.settlement.provider.toolExecution;
+function consumedTiming(source: readonly SpeculativeActionEvent<string>[] | TimelineInterval, turnID?: string) {
+	const computation = source instanceof TimelineInterval ? source : source.filter(event => event.type === "actor_action").find(event => event.turnID === turnID)!.settlement.provider.toolExecution;
 	const timings = [0, computation.startedAt].map(start => new TaskTimeline(start).recordCall([{ computation }], computation.startedAt, computation.completedAt));
 	expect(timings[1]!.hiddenComputeMs).toBe(timings[0]!.hiddenComputeMs);
 	expect(timings[0]!.toolComputeMs).toBeGreaterThanOrEqual(timings[0]!.hiddenComputeMs);
@@ -534,6 +534,10 @@ int main(void) { int fds[2]; if (${mode === "eventfd" ? "(fds[0] = eventfd(0, 0)
 		const queued = mode!.startsWith("queue-"), stale = mode === "queue-stale", changed = stale || mode!.endsWith("changed"), cancelled = mode!.endsWith("cancel");
 		const received = queued && !["queue-drop", "queue-deferred", "queue-changed", "queue-cancel"].includes(mode!), alias = mode === "queue-alias";
 		const inspecting = vi.spyOn(await import("../src/linux-held-exec.ts"), "inspectHeldExecProcess");
+		const observations = new Map<string, { bindings: readonly ProcessExecutionBinding[]; computations: readonly TimelineDependency[] }>();
+		const observeBindings = fixture.backend.observeBindings.bind(fixture.backend);
+		const observing = vi.spyOn(fixture.backend, "observeBindings").mockImplementation((scope, execute, observe, learn, inputs) =>
+			observeBindings(scope, execute, (bindings, computations) => { observations.set(scope.turnID, { bindings, computations }); observe(bindings, computations); }, learn, inputs));
 		let host: ReturnType<typeof createSpeculativeActionHost> | undefined;
 		try {
 			await prepareLinuxProcessReuse(fixture);
@@ -647,9 +651,8 @@ int main(int argc, char **argv) {
 }
 ` });
 			await commitBenchmarkFixture(fixture.workspace, "Live process continuation");
-			const route = await fixture.prepareActorReplay();
-			const scope = { sessionID: "live", turnID: "seed" };
-			const registry = Reflect.get(fixture.backend, "handoffs") as ProcessHandoffRegistry;
+			const route = await fixture.prepareActorReplay(), scope = { sessionID: "live", turnID: "seed" };
+			const registry = Reflect.get(fixture.backend, "handoffs") as ProcessHandoffRegistry<{ executable: string }>;
 			const publishing = vi.spyOn(registry, "publish"), errors = vi.spyOn(fixture.backend as any, "setError");
 			const prepared = patternProcessHost(fixture, scope.sessionID, { candidateLimit: 4, maxConcurrentActions: 4,
 				patternAware: patternAwareSettings({ enabled: true, multiStepEnabled: false, beamWidth: 4 }) }), { events, start, call } = prepared;
@@ -690,7 +693,36 @@ int main(int argc, char **argv) {
 			if (!cancelled) expect(consumedTiming(events, "prepared").hiddenComputeMs > 0, diagnostic()).toBe(resumed);
 			if (resumed) expect(events.filter(event => event.type === "operation_prediction"), diagnostic()).toContainEqual(expect.objectContaining({ settlement: expect.objectContaining({
 				observation: "observed", match: expect.objectContaining({ matched: true, adoption: expect.objectContaining({ status: "adopted" }) }) }) }));
-		} finally { inspecting.mockRestore(); await host?.dispose(); await fixture.dispose(); }
+			const binding = observations.get("prepared")?.bindings.find(candidate => registry.resolveBinding(candidate, scope)?.executable === path.join(fixture.workspace, "worker"));
+			if (resumed) expect(binding, diagnostic()).toMatchObject({ available: true });
+			if (resumed && ["pipe", "queue-received"].includes(mode!)) {
+				const invocation = resolvePiToolInvocation("bash", { command: "exit 92" }, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath })!.process!;
+				for (const phase of ["foreign", "fresh", "changed", "cancel", "revoked"]) await fixture.workspaceSandbox.withWorkspace(fixture.workspace, async workspace => {
+					if (phase === "revoked") { await fixture.backend.storage.maintain("clear"); expect(binding!.available).toBe(false); }
+					const later = { sessionID: phase === "foreign" ? "foreign" : scope.sessionID, turnID: phase }, fresh = phase === "fresh";
+					const session = await fixture.backend.open({ sourceRoot: fixture.workspace, workspace, invocation, scope: later });
+					const spawnStart = vi.mocked(childProcess.spawn).mock.calls.length, preparing = session.executeBinding(binding!);
+					void preparing.catch(() => undefined);
+					try {
+						if (phase === "foreign" || phase === "revoked") { await expect(preparing).rejects.toThrow("unavailable in this scope"); return; }
+						const pid = await runningProcess(spawnStart, (_pid, syscall) => syscall.startsWith("0 0x3 "));
+						if (phase === "cancel") await session.close();
+						const before = fixture.backend.actorMetrics().joinedHits;
+						const repeated = await TimelineInterval.measure(() => fixture.backend.observeBindings(later,
+							() => executeProcess(fixture, route.executor, `launch ${phase === "changed" ? "changed" : "actual"}`, { scope: later, signal: AbortSignal.timeout(10_000) }), () => {}, false),
+							() => observations.get(phase)!.computations);
+						const timing = consumedTiming(repeated.computation);
+						expect(repeated.output).toEqual({ output: `${phase === "changed" ? "D" : "A"}BC:7107042143181080257\n`, exitCode: 0 });
+						expect([fixture.backend.actorMetrics().joinedHits - before, timing.hiddenComputeMs > 0], diagnostic()).toEqual([Number(fresh), fresh]);
+						if (fresh) {
+							expect(await preparing).toEqual({ output: [], suspended: true });
+							expect(observations.get(phase)!.bindings).toEqual([session.executionBindings()[0]]);
+						} else expect(observations.get(phase)!.bindings).toEqual([]);
+						expect(existsSync(`/proc/${pid}`)).toBe(phase === "changed");
+					} finally { await session.close(); await preparing.catch(() => undefined); }
+				}, { liveLower: true });
+			}
+		} finally { observing.mockRestore(); inspecting.mockRestore(); await host?.dispose(); await fixture.dispose(); }
 	});
 
 nativeTest("transfers native Bash FD inputs to filesystem tools across turns with exact invalidation", { timeout: 30_000 }, async ({ skip, benchmark }) => {
