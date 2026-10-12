@@ -24,7 +24,7 @@ import { captureAbsenceDependency, captureDirectoryDependency, captureFileDepend
 	validateDynamicDependencyCertificate } from "./provenance-validation.ts";
 import { diffWorkspaceStructures, ExecutionPathProjection, hydrateWorkspaceFileEntry, snapshotDependency, type WorkspaceStructureSnapshot,
 	type WorkspaceTransactionDiff, type WorkspaceTreeEntry } from "./process-observation.ts";
-import { definedProcessEnvironment, type PreparedProcessExecutionRoute, type ProcessExecutionRequest,
+import { definedProcessEnvironment, type ProcessRouteSnapshot, type ProcessExecutionRequest,
 	type ProcessExecutor } from "./process-execution.ts";
 import { EffectCommitFailure, isPoisonedEffectCommit } from "./effect-transaction.ts";
 import { execHostText as execText, resolveHostExecutable } from "./executable-path.ts";
@@ -72,8 +72,6 @@ export interface CompletedProcessReplayOptions {
 	readonly sourceRoot: string;
 	readonly invocation: (request: ProcessExecutionRequest) => ToolProcessInvocation | undefined;
 }
-
-export type ActorProcessReplayOptions = CompletedProcessReplayOptions & { readonly held?: boolean };
 
 export interface LinuxProcessBackendStatus {
 	readonly state: "ready" | "unavailable";
@@ -186,7 +184,7 @@ interface ActiveSession {
 	/** The workspace's own repository, shown read-only in place of the snapshot's: git reads what the Actor's git reads. */
 	readonly gitDirectory?: string;
 	readonly workspace: SandboxWorkspaceContext;
-	readonly invocation: ToolProcessInvocation;
+	readonly invocation?: ToolProcessInvocation;
 	readonly scope?: ExecutionScope;
 	readonly projection: ExecutionPathProjection;
 	interposition: Awaited<ReturnType<typeof createProcessInterposition>>;
@@ -261,7 +259,8 @@ export class LinuxProcessReuseBackend {
 	private readonly options: LinuxProcessBackendOptions;
 	private ready?: Promise<ReadyBackend>;
 	private platformFingerprint?: Promise<Sha256Digest>;
-	private heldExec?: { readonly controller: AbortController; readonly ready: Promise<LinuxHeldExecBoundary> };
+	private heldExec?: { readonly controller: AbortController; readonly ready: Promise<LinuxHeldExecBoundary>; status: ProcessRouteSnapshot };
+	private nativeRetirement?: Promise<void>;
 	private disposed = false;
 	private readonly handoffs: ProcessHandoffRegistry<BoundProcessInvocation | { readonly trackingOnly: true; readonly sourceRoot: string }>;
 	private readonly actorExecutableDirectories = new Set<string>();
@@ -318,6 +317,13 @@ export class LinuxProcessReuseBackend {
 
 	/** Actor-path counters, excluding child reuse performed inside speculative worlds. */
 	actorMetrics(): LinuxProcessReuseMetrics { return Object.freeze({ ...this.actorCounters }); }
+	/** The issued operation owns its launch context independently of the enclosing tool's implementation. */
+	bindingWorkspace(binding: ProcessExecutionBinding): string { return this.boundInvocation(binding, binding.scope).sourceRoot; }
+	private boundInvocation(binding: ProcessExecutionBinding, scope: ExecutionScope | undefined): BoundProcessInvocation {
+		const invocation = this.handoffs.resolveBinding(binding, scope);
+		if (!invocation || "trackingOnly" in invocation) throw new Error("process execution binding is unavailable in this scope");
+		return invocation;
+	}
 
 	/** One captured input graph decides preparation: native filesystem reads can restart, live external queues need their producer. */
 	operationHints(binding: ProcessExecutionBinding): Pick<ExecutionOperationBinding, "fed" | "preparation"> {
@@ -363,12 +369,27 @@ export class LinuxProcessReuseBackend {
 	private get hasLiveResults(): boolean { return this.producers > 0 || this.handoffs.hasResults; }
 
 	private heldBoundary(): Promise<LinuxHeldExecBoundary> {
+		if (this.disposed || this.nativeRetirement) return Promise.reject(new Error("native process observation is retiring"));
 		if (!this.heldExec) {
 			const controller = new AbortController();
-			this.heldExec = { controller, ready: LinuxHeldExecBoundary.open({ storeRoot: this.options.storeRoot,
-				binary: this.options.heldExecBinary, signal: AbortSignal.any([this.store.signal, controller.signal]) }) };
+			const entry: NonNullable<LinuxProcessReuseBackend["heldExec"]> = { controller, status: { state: "probing", detail: "Checking native process startup" },
+				ready: LinuxHeldExecBoundary.open({ storeRoot: this.options.storeRoot, binary: this.options.heldExecBinary,
+					signal: AbortSignal.any([this.store.signal, controller.signal]) }).then(boundary => {
+						entry.status = { state: "ready", detail: "Native child startup and validated result reuse" }; return boundary;
+					}, error => { entry.status = { state: "unavailable", detail: errorMessage(error) }; throw error; }) };
+			this.heldExec = entry;
 		}
 		return this.heldExec.ready;
+	}
+	nativeDiagnostics(enabled = true): ProcessRouteSnapshot {
+		if (this.disposed || process.platform !== "linux") return { state: "unavailable", detail: this.disposed ? "Native route disposed" : "Linux or WSL 2 required" };
+		if (!enabled) return { state: "disabled", detail: "Native process reuse is disabled" };
+		return this.nativeRetirement ? { state: "probing", detail: "Draining native observations" }
+			: this.heldExec?.status ?? { state: "idle", detail: "Checked when native work is learned or reusable evidence exists" };
+	}
+	async refreshNativeObservation(enabled = true): Promise<void> {
+		await this.resetNativeObservation();
+		if (enabled && !this.disposed && process.platform === "linux") await this.heldBoundary().catch(() => undefined);
 	}
 
 	private async nativeRequested(scope?: ExecutionScope, signal?: AbortSignal): Promise<boolean> {
@@ -389,9 +410,9 @@ export class LinuxProcessReuseBackend {
 	}
 
 	/** Observe the native launches of the actual callback, independently of its tool name or process adapter. */
-	async observeNative<Value>(sourceRoot: string, scope: ExecutionScope, signal: AbortSignal | undefined, execute: () => Promise<Value>): Promise<Value> {
+	async observeNative<Value>(sourceRoot: string, scope: ExecutionScope | undefined, signal: AbortSignal | undefined, execute: () => Promise<Value>): Promise<Value> {
 		let boundary: LinuxHeldExecBoundary | undefined;
-		const owner = snapshotExecutionScope(scope)!;
+		const owner = snapshotExecutionScope(scope);
 		try {
 			if (!this.disposed && process.platform === "linux" && await this.nativeRequested(owner, signal)) {
 				const ready = await waitForCompletion(this.heldBoundary(), signal);
@@ -401,44 +422,13 @@ export class LinuxProcessReuseBackend {
 		return boundary ? boundary.observe(this.nativeObservation(path.resolve(sourceRoot), owner, signal), execute) : execute();
 	}
 
-	async prepareActorReplay(host: ProcessExecutor, options: ActorProcessReplayOptions, refresh = false, owner = this.store.signal): Promise<PreparedProcessExecutionRoute> {
-		if (process.platform !== "linux") return { state: "unavailable", detail: "Linux or WSL 2 required" };
-		const signal = AbortSignal.any([owner, this.store.signal]);
-		let state: "degraded" | "ready" = "degraded";
-		let detail = options.held ? "Bash history; native startup checked when evidence exists or on refresh" : "matching whole Bash calls";
-		let prepared: Promise<ProcessExecutor> | undefined;
-		const prepare = async () => {
-			signal.throwIfAborted();
-			let executor = host;
-			if (options.held) try {
-				const boundary = await this.heldBoundary(), sourceRoot = path.resolve(options.sourceRoot);
-				executor = { execute: request => boundary.observe({ ...this.nativeObservation(sourceRoot, request.scope, request.signal), skipRoot: true }, () => host.execute(request)) };
-				state = "ready";
-				detail = "matching whole Bash calls plus native process startup observation";
-			} catch (error) {
-				detail = `matching whole Bash calls; child handoff unavailable (${errorMessage(error)})`;
-			}
-			return this.completedReplayExecutor(executor, options);
-		};
-		if (refresh) await (prepared = prepare());
-		return { get state() { return state; }, get detail() { return detail; }, executor: {
-			execute: async (request) => {
-				try {
-					request = { ...request, scope: snapshotExecutionScope(request.scope) };
-				} catch { return host.execute(request); }
-				// Learning explicitly requests held execs; other calls retain the empty-history fast path.
-				if (!await this.nativeRequested(request.scope, request.signal) || signal.aborted || request.signal?.aborted) return host.execute(request);
-				const ready = await waitForCompletion(prepared ??= prepare(), AbortSignal.any([signal, ...(request.signal ? [request.signal] : [])]));
-				return (ready.status === "completed" ? ready.value : host).execute(request);
-			},
-		} };
-	}
-
-	async resetActorReplay(): Promise<void> {
+	resetNativeObservation(): Promise<void> {
+		if (this.nativeRetirement) return this.nativeRetirement;
 		const heldExec = this.heldExec;
 		this.heldExec = undefined;
 		heldExec?.controller.abort(new Error("held-exec initialization retired"));
-		await heldExec?.ready.then((boundary) => boundary.close(), () => undefined);
+		return this.nativeRetirement = Promise.resolve(heldExec?.ready).then(boundary => boundary?.close(), () => undefined)
+			.finally(() => { this.nativeRetirement = undefined; });
 	}
 
 	/** Hit-only Actor path. Certificate lookup and replay deliberately require no tracing or confinement tools. */
@@ -488,7 +478,7 @@ export class LinuxProcessReuseBackend {
 	async open(input: {
 		readonly sourceRoot: string;
 		readonly workspace: SandboxWorkspaceContext;
-		readonly invocation: ToolProcessInvocation;
+		readonly invocation: ToolProcessInvocation | ProcessExecutionBinding;
 		readonly scope?: ExecutionScope;
 		readonly signal?: AbortSignal;
 		readonly onOperationAdopted?: (adoption: ExecutionOperationAdoption) => void;
@@ -505,7 +495,11 @@ export class LinuxProcessReuseBackend {
 		input.signal?.throwIfAborted();
 		const sourceRoot = path.resolve(input.sourceRoot);
 		const projection = new ExecutionPathProjection({ sourceRoot, workspaceRoot: input.workspace.sandboxRoot, privateRoot: input.workspace.processRoot });
-		const originalPath = input.invocation.environment.PATH ?? input.invocation.environment.Path ?? "";
+		const invocation = "environment" in input.invocation ? input.invocation : undefined;
+		const bound = "environment" in input.invocation ? undefined : this.boundInvocation(input.invocation, input.scope);
+		if (bound && bound.sourceRoot !== sourceRoot) throw new Error("bound process workspace changed");
+		const environment = (invocation ?? bound!).environment, image = invocation?.shell ?? bound!.executable;
+		const originalPath = environment.PATH ?? environment.Path ?? "";
 		const token = randomToken();
 		const candidateSocket = path.join(input.workspace.processRoot, `broker-${token.slice(0, 12)}.sock`);
 		// sockaddr_un has a byte limit even when the private workspace supports longer paths.
@@ -523,7 +517,7 @@ export class LinuxProcessReuseBackend {
 		const session: ActiveSession = {
 			token, sourceRoot, projection, originalPath, deniedPaths, producer, nestedProducer, socketPath,
 			...(gitDirectory ? { gitDirectory } : {}),
-			workspace: input.workspace, invocation: input.invocation,
+			workspace: input.workspace, invocation,
 			scope: snapshotExecutionScope(input.scope),
 			interposition: { mounts: [], directories: [], entries: [], dependencies: [] },
 			signal: AbortSignal.any([controller.signal, ...(input.signal ? [input.signal] : [])]),
@@ -559,7 +553,7 @@ export class LinuxProcessReuseBackend {
 					token,
 					socketPath,
 					dispatcherBinary: ready.dispatcher,
-					excludedExecutables: [input.invocation.shell, process.execPath, ready.dispatcher, ready.sandlock, ready.strace],
+					excludedExecutables: [image, process.execPath, ready.dispatcher, ready.sandlock, ready.strace],
 					executableEntries: this.executableEntries,
 					shared: this.sharedInterposition ??= { views: new BoundedRecencyMap(64), root: mkdtemp(path.join(os.tmpdir(), "pi-spec-interposition-")).then(async (shared) => {
 						await mkdir(path.join(shared, "session"));
@@ -629,7 +623,7 @@ export class LinuxProcessReuseBackend {
 		this.handoffs.dispose();
 		const store = this.store.dispose();
 		const shared = this.sharedInterposition?.root.then((root) => rm(root, { recursive: true, force: true }), () => undefined);
-		return this.disposal = this.resetActorReplay().finally(() => Promise.all([this.replayWorkspace.dispose(), shared, store]));
+		return this.disposal = this.resetNativeObservation().finally(() => Promise.all([this.replayWorkspace.dispose(), shared, store]));
 	}
 
 	private async resolveReady(): Promise<ReadyBackend> {
@@ -689,11 +683,13 @@ export class LinuxProcessReuseBackend {
 
 	private async executeTopLevel(session: ActiveSession, request: ProcessExecutionRequest): Promise<{ exitCode: number | null }> {
 		const startedAt = performance.now();
+		const { invocation } = session;
+		if (!invocation) throw new Error("process session has no whole-tool invocation");
 		if (session.lifecycle.sealed) throw new Error("Linux process session is closed");
 		const signal = AbortSignal.any([session.signal, ...(request.signal ? [request.signal] : [])]);
 		signal?.throwIfAborted();
 		const ready = await this.resolveReady();
-		assertInvocationMatches(session.invocation, request);
+		assertInvocationMatches(invocation, request);
 		const invocationCwd = path.resolve(request.cwd);
 		if (!pathContains(session.sourceRoot, invocationCwd)) throw new Error("process cwd escapes source workspace");
 		const physicalCwd = session.projection.toPhysical(invocationCwd);
@@ -702,7 +698,7 @@ export class LinuxProcessReuseBackend {
 		const command = request.command;
 		const logicalCwd = session.projection.toLogical(physicalCwd);
 		const captured = await TimelineInterval.outside(() => TimelineInterval.measure(() =>
-			topLevelProcessPrototype(session.invocation, request, environment, session.projection, ready.platformFingerprint)));
+			topLevelProcessPrototype(invocation, request, environment, session.projection, ready.platformFingerprint)));
 		const prototype = captured.output, preparation = captured.computation;
 		this.add(session, "wholeCommandRequests");
 		const replayed = await TimelineInterval.outside(async () => {
@@ -723,7 +719,7 @@ export class LinuxProcessReuseBackend {
 			execMounts: interception(session.interposition).execMounts,
 			privateWrites: path.join(session.workspace.processRoot, "private"),
 			metadataImage: session.workspace.metadataImage,
-			command: [session.invocation.shell, ...shellArguments(session.invocation, command)],
+			command: [invocation.shell, ...shellArguments(invocation, command)],
 			...(request.timeout !== undefined ? { timeoutSeconds: request.timeout } : {}),
 		});
 		const before = await session.workspace.structure.capture();
@@ -740,7 +736,7 @@ export class LinuxProcessReuseBackend {
 					cwd: physicalCwd,
 					environment,
 					outputRoot: traceRoot, onOutputEndpoints: (endpoints) => { session.topLevelOutputEndpoints = endpoints; },
-					...(session.invocation.commandTransport === "stdin" ? { stdin: Buffer.from(command, "utf8") } : {}),
+					...(invocation.commandTransport === "stdin" ? { stdin: Buffer.from(command, "utf8") } : {}),
 					signal,
 					...(request.timeout !== undefined ? { timeoutSeconds: request.timeout } : {}),
 					onOutput: (event) => request.onData(event.data),
@@ -749,7 +745,7 @@ export class LinuxProcessReuseBackend {
 			session.topLevelExecution = { prototype, outcome, observedProcessMs: Math.max(0, performance.now() - processStarted), startedAt };
 			try {
 				const after = await session.workspace.structure.capture();
-				const observation = await observeStrace(tracePrefix, session.invocation.shell, logicalCwd, {
+				const observation = await observeStrace(tracePrefix, invocation.shell, logicalCwd, {
 					interposedExecutables: interception(session.interposition).executables, brokeredWrites: pid => brokeredWrites(session, pid), privateUpper: privateUpper(session),
 					...(session.topLevelOutputEndpoints ? { outputEndpoints: session.topLevelOutputEndpoints } : {}),
 					guardFilesystemSemanticsWithin: [session.workspace.sandboxRoot, session.sourceRoot],
@@ -869,8 +865,8 @@ export class LinuxProcessReuseBackend {
 	}
 
 	private async executeBinding(session: ActiveSession, binding: ProcessExecutionBinding) {
-		const invocation = this.handoffs.resolveBinding(binding, session.scope);
-		if (!invocation || "trackingOnly" in invocation || invocation.sourceRoot !== session.sourceRoot ||
+		const invocation = this.boundInvocation(binding, session.scope);
+		if (invocation.sourceRoot !== session.sourceRoot ||
 			invocation.producer && !compatibleProducer(session.nestedProducer, invocation.producer))
 			throw new Error("process execution binding is unavailable in this scope");
 		const cwd = session.projection.toPhysical(invocation.cwd), executable = session.projection.toPhysical(invocation.executable);

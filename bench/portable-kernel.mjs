@@ -265,72 +265,83 @@ async function qualifySearchExtension() {
 	const { createSpeculativeActionExtension } = await import("../dist/extension.js");
 	const { createSpeculativeActionHost } = await import("../dist/agent-integration.js");
 	const { createPiToolDefinitions } = await import("../dist/pi-tool-invocation.js");
-	const { createFauxCore, fauxAssistantMessage, fauxToolCall } = await import("@earendil-works/pi-ai");
+	const { fauxProvider, fauxAssistantMessage, fauxToolCall } = await import("@earendil-works/pi-ai");
+	const { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } = await import("@earendil-works/pi-coding-agent");
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-search-extension-")), cwd = path.join(root, "workspace"), agent = path.join(root, "agent");
 	const previousAgent = process.env.PI_CODING_AGENT_DIR;
 	process.env.PI_CODING_AGENT_DIR = agent;
-	const handlers = new Map(), commands = new Map(), registered = createPiToolDefinitions(cwd), notices = [], results = {};
-	let selected, candidate, settlement;
+	const notices = [], results = {}, settingsManager = SettingsManager.inMemory({}, { projectTrusted: true });
+	const provider = id => fauxProvider({ provider: id, api: "faux-" + id, models: [{ id }], tokensPerSecond: 100_000, tokenSize: { min: 20, max: 40 } });
+	const actor = provider("qualification"), draft = provider("qualification-draft");
+	let selected, candidate, settlement, session;
+	const native = (name, args) => createPiToolDefinitions(cwd).get(name).execute("expected", args, undefined, undefined, session.extensionRunner.createContext());
 	const choices = new Map(Object.entries({
 		"Speculative action": ["Tools & execution", "Enabled", "Apply changes", "Close"],
 		"Tools & execution": ["Execution routes", "Back"], "Execution routes": ["Search execution", "Back"],
 		"Search execution": ["Captured search"],
 	}));
-	const model = createFauxCore({ provider: "qualification", models: [{ id: "qualification", reasoning: false }] }).getModel();
-	const context = { cwd, mode: "tui", hasUI: true, model, isProjectTrusted: () => true, getSystemPrompt: () => "qualification",
-		sessionManager: { getSessionId: () => "closed-search", getSessionFile: () => undefined }, thinkingLevel: "off",
-		modelRegistry: { getAvailable: () => [model], getApiKeyAndHeaders: async () => ({ ok: true }),
-			getProvider: () => ({ streamSimple: () => ({ result: async () => fauxAssistantMessage(fauxToolCall(...selected), { stopReason: "toolUse" }) }) }) },
-		ui: { notify: (text) => notices.push(text), setStatus: () => {}, select: async (title, options) => {
-			const next = choices.get(title)?.shift(); return options.find((option) => next && option.startsWith(next));
-		} },
+	const command = args => session.extensionRunner.getCommand("speculative-action").handler(args, session.extensionRunner.createCommandContext());
+	const invoke = async (name, args, wait = false) => {
+		const previous = session.messages.filter(message => message.role === "toolResult").length;
+		selected = [name, args];
+		draft.setResponses([fauxAssistantMessage(fauxToolCall(name, args), { stopReason: "toolUse" }), fauxAssistantMessage("done")]);
+		actor.setResponses([async () => {
+			if (wait) { const state = await bounded(candidate.promise, "extension candidate"); assert.equal(state.status, "succeeded", JSON.stringify(state)); }
+			return fauxAssistantMessage(fauxToolCall(name, args), { stopReason: "toolUse" });
+		}, fauxAssistantMessage("done")]);
+		await session.prompt("Run the selected search.");
+		const results = session.messages.filter(message => message.role === "toolResult"), result = results.at(-1);
+		assert.equal(results.length, previous + 1, JSON.stringify(session.messages.at(-1)));
+		assert.equal(result.isError, false, JSON.stringify(result));
+		return { content: result.content, details: result.details };
 	};
-	const emit = async (name, event = {}) => { for (const handler of handlers.get(name) ?? []) await handler(event, context); };
-	const command = (args) => commands.get("speculative-action").handler(args, context);
-	const invoke = (name, args) => registered.get(name).execute("actor", args, undefined, undefined, context);
 	try {
 		await fs.mkdir(cwd); await fs.mkdir(path.join(agent, "speculative-action"), { recursive: true });
 		await fs.writeFile(path.join(cwd, "notes.txt"), "before\nneedle\nafter\n");
 		await fs.writeFile(path.join(agent, "speculative-action.json"), JSON.stringify({ enabled: false, searchExecution: "closed",
+			draftModel: "qualification-draft/qualification-draft",
 			drafterMaxDepth: 0, candidateLimit: 1, maxConcurrentActions: 1, tools: ["grep", "find"],
 			patternAware: { enabled: false }, selfSpeculation: { enabled: false } }));
-		await createSpeculativeActionExtension({ createHost: (sessionID, options) => createSpeculativeActionHost(sessionID, {
+		const extension = createSpeculativeActionExtension({ createHost: (sessionID, options) => createSpeculativeActionHost(sessionID, {
 			...options, onEvent: (event) => { options.onEvent?.(event);
 				if (event.type === "source_request" && event.request.settlement.status === "error") candidate?.reject(new Error(JSON.stringify(event.request.settlement)));
 				if (event.type === "candidate" && event.candidate.origin === "prediction" && event.state.status !== "running") candidate?.resolve(event.state);
 			}, onActorActionSettled: (value) => { options.onActorActionSettled?.(value); settlement?.resolve(value.settlement); },
-		}) })({ on: (name, handler) => handlers.set(name, [...handlers.get(name) ?? [], handler]),
-			registerCommand: (name, value) => commands.set(name, value), registerTool: (tool) => registered.set(tool.name, tool),
-			getActiveTools: () => [...registered.keys()], getAllTools: () => [...registered.values()].map((tool) => ({ ...tool,
-				sourceInfo: { path: `<builtin:${tool.name}>`, source: "builtin", scope: "temporary", origin: "top-level" } })),
-		});
-		await emit("session_start"); await command("on");
-		const stockFind = createPiToolDefinitions(cwd).get("find"), oldArgs = { pattern: "notes.txt" };
-		assert.deepEqual(await invoke("find", oldArgs), await stockFind.execute("old", oldArgs, undefined, undefined, context));
+		}) });
+		const loader = new DefaultResourceLoader({ cwd, agentDir: agent, settingsManager, noExtensions: true, extensionFactories: [extension] });
+		await loader.reload();
+		const modelRuntime = await ModelRuntime.create({ authPath: path.join(agent, "auth.json"), modelsPath: null, refreshOnCreate: false });
+		for (const source of [actor, draft]) modelRuntime.registerNativeProvider(source.provider);
+		({ session } = await createAgentSession({ cwd, agentDir: agent, model: actor.getModel(), modelRuntime, settingsManager, resourceLoader: loader,
+			sessionManager: SessionManager.inMemory(cwd), tools: ["find", "grep"] }));
+		await session.bindExtensions({ mode: "tui", uiContext: { ...session.extensionRunner.getUIContext(),
+			notify: text => notices.push(text), setStatus: () => {}, select: async (title, options) => {
+				const next = choices.get(title)?.shift(); return options.find(option => next && option.startsWith(next));
+			} } });
+		await command("on");
+		const oldArgs = { pattern: "notes.txt" };
+		assert.deepEqual(await invoke("find", oldArgs), await native("find", oldArgs));
 		assert.ok(!notices.some((message) => /WASM|setup:search|reselect/.test(message)));
 		await command("off"); await command("");
 		assert.match(notices.join("\n"), /settings applied/);
 		for (const name of ["find", "grep"]) {
-			const args = { pattern: name === "find" ? "notes.txt" : "needle", path: "." }; selected = [name, args];
-			const expected = await invoke(name, args);
+			const args = { pattern: name === "find" ? "notes.txt" : "needle", path: "." };
+			const expected = await native(name, args);
 			candidate = Promise.withResolvers(); settlement = Promise.withResolvers();
-			await emit("context", { messages: [] });
-			const completed = await bounded(candidate.promise, "extension candidate"); assert.equal(completed.status, "succeeded", JSON.stringify(completed));
-			assert.deepEqual(await invoke(name, args), expected);
+			assert.deepEqual(await invoke(name, args, true), expected);
 			const feedback = await bounded(settlement.promise, "extension settlement");
 			assert.equal(feedback.provider.kind, "speculative", JSON.stringify(feedback));
 			results[name] = { provider: feedback.provider.kind, rejections: feedback.rejections };
-			await emit("agent_end");
+			candidate = settlement = undefined;
 		}
 		await command("status"); await invoke(...selected);
 		await command("off");
-		const stock = createPiToolDefinitions(cwd).get(selected[0]);
-		assert.deepEqual(await invoke(...selected), await stock.execute("native", selected[1], undefined, undefined, context));
-		await emit("session_shutdown"); // The real store drains its publication queue at shutdown.
+		assert.deepEqual(await invoke(...selected), await native(...selected));
+		await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
 		assert.equal(JSON.parse(await fs.readFile(path.join(agent, "speculative-action.json"))).searchExecution, "captured");
 		return { results, appliedThroughTui: true, noExtraSetup: true, obsoleteSettingsUseNative: true, refreshRetiresWorker: true, disabledNativeActor: true };
 	} finally {
-		try { await emit("session_shutdown"); }
+		try { await session?.extensionRunner.emit({ type: "session_shutdown", reason: "quit" }); session?.dispose(); }
 		finally {
 			if (previousAgent === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgent;
 			assert.equal(path.dirname(root), path.resolve(os.tmpdir())); await fs.rm(root, { recursive: true, force: true });

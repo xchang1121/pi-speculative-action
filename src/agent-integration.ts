@@ -82,7 +82,7 @@ export interface CreateSpeculativeActionHostOptions extends Omit<Parameters<type
 	/** Runtime settings. The feature remains disabled when omitted. */
 	readonly getSettings?: () => SpeculativeAgentSettingsInput | Promise<SpeculativeAgentSettingsInput>;
 	/** Bind the concrete executor used by both speculative and Actor calls; rejection fails this invocation. */
-	readonly resolveInvocation?: (tool: string, input: unknown) => ToolInvocation | undefined | Promise<ToolInvocation | undefined>;
+	readonly resolveInvocation?: (tool: string, input: unknown, definition?: AgentTool) => ToolInvocation | undefined | Promise<ToolInvocation | undefined>;
 	/**
 	 * Non-interactive permission and policy check for speculative execution.
 	 * Candidates are rejected when this callback is absent.
@@ -209,9 +209,9 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 		workspaceIdentity: options.patternWorkspaceIdentity,
 		store: options.patternStore,
 	});
-	const resolveBinding = async (tool: string, input: unknown, schemaHash?: string) => {
+	const resolveBinding = async (tool: string, input: unknown, schemaHash?: string, definition?: AgentTool) => {
 		// A candidate runs its key's canonical input (a redundant `cd <cwd> &&` dropped): its invocation is resolved from that input.
-		const resolved = await options.resolveInvocation?.(tool, (() => { try { return actionSemantics.definition(tool)?.canonicalize(input, options.cwd)?.input ?? input; } catch { return input; } })());
+		const resolved = await options.resolveInvocation?.(tool, (() => { try { return actionSemantics.definition(tool)?.canonicalize(input, options.cwd)?.input ?? input; } catch { return input; } })(), definition);
 		const invocation = resolved && Object.freeze({ ...resolved,
 			...(resolved.identity !== undefined ? { identity: immutableSnapshot(resolved.identity) } : {}),
 			...(resolved.process ? { process: immutableSnapshot(resolved.process) } : {}),
@@ -261,7 +261,7 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 			if (!tool || validated === undefined) return undefined;
 			const schemaHash =
 				context.type === "consume" ? stableValueHash(tool.parameters ?? null) : context.data.schemaHashes[toolName];
-			const { action, invocation } = await resolveBinding(toolName, validated, schemaHash);
+			const { action, invocation } = await resolveBinding(toolName, validated, schemaHash, tool);
 			const operation = context.type === "start" ? context.operation : undefined;
 			if (!operation) return action;
 			const definition = action && actionSemantics.definition(action);
@@ -364,7 +364,7 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 			const bind = () => binding ??= (async () => {
 				const tool = input.tools.find((tool) => tool.name === input.tool);
 				return Object.freeze({ ...operation, ...await resolveBinding(operation.tool, operation.input,
-					tool ? stableValueHash(tool.parameters ?? null) : undefined) });
+					tool ? stableValueHash(tool.parameters ?? null) : undefined, tool) });
 			})();
 			const actorCall = input.turnID ? { ...input, sessionID, turnID: input.turnID, args: operation.input, [ACTOR_OPERATION]: bind } : undefined;
 			let prepared: PreparedActorCall<ToolSettlement> | undefined;
@@ -379,7 +379,7 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 					}, prepared?.observeOperations, inputs, { cwd: options.cwd, signal }) : executor(bound);
 				try { return await (prepared?.withInputs ? prepared.withInputs(execute) : execute()); }
 				finally {
-					if (actionSemantics.definition(bound.action ?? bound.tool)?.effect !== "observation") {
+					if ((bound.invocation?.semantics ?? actionSemantics.definition(bound.action ?? bound.tool))?.effect !== "observation") {
 						await TimelineInterval.outside(() => Promise.allSettled(executionWorlds.map(async world => world.actorFallbackSettled?.())));
 					}
 				}

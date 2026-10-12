@@ -150,6 +150,8 @@ export function createPatternPlanSource({
 	const currentOperation = (binding: ExecutionOperationBinding) => binding.available !== false &&
 		binding.preparation === "current_workspace" && !binding.fed && typeof binding.stale === "function";
 	const operationID = (binding: ExecutionOperationBinding) => `${binding.backend}:${binding.identity}`;
+	// A lookup hint, not equivalence or permission: materialization rebinds the actual callback and operation.
+	const parentIdentity = (tool: string, input: unknown, schema?: string) => stableValueHash([tool, input, schema]);
 	const learnedOperations = (parentHash?: string) => [...operationBindings.values()].filter(item => {
 		if (item.binding.available !== false) return item.parentHash === parentHash;
 		operationBindings.delete(item.key); return false;
@@ -175,7 +177,7 @@ export function createPatternPlanSource({
 			// Both recurring predictions and background probes may reuse a root's native
 			// operations. Dependent steps still need their parent's complete tool result.
 			if (dependsOn?.length || !operationBindings.size) return [action];
-			const choices = learnedOperations(patternActionSemantics.actionKey(candidate.tool, candidate.input, schemaHashes[candidate.tool])?.hash);
+			const choices = learnedOperations(parentIdentity(candidate.tool, candidate.input, schemaHashes[candidate.tool]));
 			if (!choices.length) return [action];
 			return choices.slice(0, operationLimit).map(operation => ({ ...action,
 				id: `${action.id}:operation:${operation.binding.identity}`, type: "operation" as const, operation: operation.binding,
@@ -227,7 +229,7 @@ export function createPatternPlanSource({
 			}
 			if (!rerun.size) state.request = undefined;
 			return [[...rerun.values()], action => (!action.operation || !covered.has(operationID(action.operation))) &&
-				(action.type !== "tool_call" || !parents.has(patternActionSemantics.actionKey(action.tool, asRecord(action.input) ?? {}, schemaHashes[action.tool])?.hash ?? ""))];
+				(action.type !== "tool_call" || !parents.has(parentIdentity(action.tool, asRecord(action.input) ?? {}, schemaHashes[action.tool])))];
 		});
 		state.preparing = preparing;
 		try { return await preparing; } finally { if (state.preparing === preparing) state.preparing = undefined; }
@@ -288,7 +290,7 @@ export function createPatternPlanSource({
 			if (!patternSettings.enabled) return undefined;
 			const schemaHash = action?.schemaHash ?? data.schemaHashes[tool];
 			const observed = eventData(tool, concrete, output, durationMs);
-			const parentHash = (operations?.length || tool === "bash") && patternActionSemantics.actionKey(tool, concrete, schemaHash)?.hash;
+			const parentHash = (operations?.length || tool === "bash") && parentIdentity(tool, concrete, schemaHash);
 			let bound = false;
 			if (parentHash) for (const binding of operations ?? []) {
 				if (binding.available === false || binding.permissionHash !== action?.hash) continue;

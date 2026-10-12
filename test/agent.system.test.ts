@@ -11,7 +11,7 @@ import { PatternAwareStore, patternAwareSettings, patternAwareActionSemantics } 
 import { temporaryDirectories } from "./filesystem.ts";
 import { systemHost } from "./agent-system-fixture.ts";
 import { disposable, onExit, deferred, nextTurn } from "./async.ts";
-import { commitBenchmarkFixture, createLinuxProcessBenchmark, textOutput } from "./linux-process-fixture.ts";
+import { commitBenchmarkFixture, compileBenchmarkHelper, createLinuxProcessBenchmark, textOutput } from "./linux-process-fixture.ts";
 
 const directories = temporaryDirectories("pi-agent-system-");
 afterEach(directories.dispose);
@@ -271,20 +271,21 @@ test.each(["ordered", "independent", "dependent"])("adopts only the proven effec
 	if (order === "independent") await expect(readFile(path.join(cwd, "unused.txt"))).rejects.toMatchObject({ code: "ENOENT" });
 });
 
-test.for(["unrelated", "changed", "descendant"])("retains native workflow results across prompts and validates Actor changes (%s)", async (change, { skip }) => {
+test.for(["unrelated", "changed", "descendant", "mutation"])("retains native workflow results across prompts and validates Actor changes (%s)", async (change, { skip }) => {
 	if (process.platform !== "linux" || process.arch !== "x64") return skip("native process backend requires x86-64 Linux");
-	const native = await createLinuxProcessBenchmark("pi-sealed-result-", "git"), sandbox = new WorkspaceSandboxService();
+	const native = await createLinuxProcessBenchmark("pi-sealed-result-", change === "mutation" ? "overlayfs" : "git"), sandbox = native.workspaceSandbox;
 	const { workspace: cwd } = native;
 	await writeFile(path.join(cwd, "a.txt"), "original\n"); await writeFile(path.join(cwd, "b.txt"), "other\n");
 	await writeFile(path.join(cwd, "c.txt"), "second\n");
+	if (change === "mutation") await compileBenchmarkHelper(cwd, { source: "reader.c", output: "reader", code: "#include <fcntl.h>\n#include <unistd.h>\nint main(void){char text[64];int f=open(\"a.txt\",O_RDONLY),n=read(f,text,sizeof text);close(f);for(volatile unsigned long i=0;i<600000000ul;i++);return n<0||write(1,text,n)!=n;}\n" });
 	await commitBenchmarkFixture(cwd, "Sealed result reuse");
-	let predict = change === "descendant";
+	let predict = change === "descendant" || change === "mutation", requests = 0; const command = change === "mutation" ? "./reader" : "cat a.txt";
+	const steps = change === "mutation" ? [{ tool: "write", input: { path: "a.txt", content: "prepared\n" } }, { tool: "bash", input: { command } }]
+		: [{ tool: "bash", input: { command: "cat a.txt" } }, { tool: "bash", input: { command: "cat c.txt" } }];
 	const f = systemHost(cwd, [native.tool, createWriteTool(cwd)], {
 		executionWorlds: [native.world, sandbox.createExecutionWorld()],
 		resolveInvocation: (tool, input) => resolvePiToolInvocation(tool, input, { cwd, environment: native.environment, shellPath: native.shellPath }),
-		complete: async () => fauxAssistantMessage(fauxToolCall("speculative_workflow", { steps: [
-			{ tool: "bash", input: { command: "cat a.txt" } }, { tool: "bash", input: { command: "cat c.txt" } },
-		] }), { stopReason: "toolUse" }),
+		complete: async () => { requests++; return fauxAssistantMessage(fauxToolCall("speculative_workflow", { steps }), { stopReason: "toolUse" }); },
 		getSettings: () => ({ enabled: true, drafterEnabled: predict, candidateLimit: 1, drafterMaxDepth: 1,
 			tools: ["bash", "write"], patternAware: { enabled: false } }),
 	});
@@ -293,17 +294,20 @@ test.for(["unrelated", "changed", "descendant"])("retains native workflow result
 	if (status.state !== "ready") return skip(status.detail);
 	await f.start(); if (!predict) await f.preview("bash", { command: "cat a.txt" });
 	await f.ready(predict ? 2 : 1); predict = false;
-	await f.finish(true); await f.start("next-prompt");
-	await f.execute("write", { path: change === "changed" ? "a.txt" : "b.txt", content: "updated\n" });
-	expect(textOutput(await f.execute("bash", { command: "cat a.txt" }))).toBe(change === "changed" ? "updated\n" : "original\n");
+	expect(await readFile(path.join(cwd, "a.txt"), "utf8")).toBe("original\n");
+	if (change !== "mutation") { await f.finish(true); await f.start("next-prompt"); }
+	await f.execute("write", change === "mutation" ? steps[0]!.input : { path: change === "changed" ? "a.txt" : "b.txt", content: "updated\n" });
+	if (change === "mutation") { await f.finish(); await f.start("process"); }
+	expect(textOutput(await f.execute("bash", { command }))).toBe(change === "changed" ? "updated\n" : change === "mutation" ? "prepared\n" : "original\n");
 	if (change === "descendant") {
 		await f.finish(); await f.start("next");
 		expect(textOutput(await f.execute("bash", { command: "cat c.txt" }))).toBe("second\n");
 	}
 	if (change !== "changed") {
-		expect(f.fallbacks).toEqual(["write"]);
-		expect(f.events.filter(event => event.type === "candidate" && event.state.status === "running")).toHaveLength(change === "descendant" ? 2 : 1);
+		expect(f.fallbacks, JSON.stringify(f.events.filter(event => event.type === "actor_action" || event.type === "candidate"))).toEqual(change === "mutation" ? [] : ["write"]);
+		expect(f.events.filter(event => event.type === "candidate" && event.state.status === "running")).toHaveLength(change === "descendant" || change === "mutation" ? 2 : 1);
 	}
+	if (change === "mutation") { await f.finish(true); expect(requests).toBe(1); expect(f.events.filter(event => event.type === "actor_action").map(event => event.settlement.provider.kind)).toEqual(["speculative", "speculative"]); }
 });
 
 test("reconsiders restored results while sharing pending reads and retains fresh queries across turns", async () => {

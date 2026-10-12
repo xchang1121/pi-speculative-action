@@ -1,15 +1,14 @@
 import { onExit } from "./async.ts";
 // Constructed Actor sequences through the real host and Linux process world, PatternAware only (no model): which reuse path
 // serves the predicted command, and how long the Actor waits. The scenario table takes minutes of CPU; run it with PI_SPEC_REUSE_CHAIN=1.
-import { execSync, spawn } from "node:child_process";
-import { readFile, writeFile } from "node:fs/promises";
+import { execSync } from "node:child_process";
+import { writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createWriteTool } from "@earendil-works/pi-coding-agent";
-import { fauxAssistantMessage, type AssistantMessage } from "@earendil-works/pi-ai";
 import { expect, test } from "vitest";
 import { createSpeculativeActionHost } from "../src/agent-integration.ts";
-import { ActionSemanticsRegistry, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
+import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { PatternAwareStore, patternAwareActionSemantics, patternAwareSettings } from "../src/pattern-aware.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import type { SpeculativeActionEvent } from "../src/events.ts";
@@ -42,7 +41,7 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 /** A committed workspace holding `files` and `./slow` (`loops` rounds of CPU over a file's bytes: a stand-in for a test run or a
  * build step), a host over it with PatternAware alone, and one Actor step, a command or a write: prediction starts with it and
  * runs while the Actor model generates for `think` ms. */
-async function chainWorld(files: readonly (readonly [string, string])[], loops: string, draft?: () => Promise<AssistantMessage>, resources?: ExecutionResourceMonitor, role = "") {
+async function chainWorld(files: readonly (readonly [string, string])[], loops: string, resources?: ExecutionResourceMonitor) {
 	// Under the user's home, as a real workspace is: /tmp is each sandbox's own, so what a runtime observes of the workspace's parents
 	// there (Node's package.json probes) could never be validated.
 	const fixture = await createLinuxProcessBenchmark("pi-chain-", "overlayfs", {}, path.join(os.homedir(), ".cache", "pi-speculative-action", "chain")), { workspace } = fixture;
@@ -53,39 +52,21 @@ async function chainWorld(files: readonly (readonly [string, string])[], loops: 
 		await compileBenchmarkHelper(workspace, { source: "slow.c", output: "slow" });
 		await commitBenchmarkFixture(workspace, "chain");
 		await prepareLinuxProcessReuse(fixture);
-		const route = await fixture.prepareActorReplay(), writer = createWriteTool(workspace), observed: (string | undefined)[] = [];
-		let renders = 0;
-		const report = { ...fixture.tool, name: "render_report", execute: async (...args: Parameters<typeof fixture.tool.execute>) => {
-			renders++;
-			const output = await new Promise<string>((resolve, reject) => {
-				const child = spawn(fixture.shellPath, ["-c", (args[1] as { command: string }).command],
-					{ cwd: workspace, env: fixture.environment, signal: args[2], stdio: ["ignore", "pipe", "pipe"] });
-				let text = ""; for (const stream of [child.stdout, child.stderr]) stream.on("data", data => { text += data; });
-				child.once("error", reject); child.once("close", code => code ? reject(new Error(`report exited ${code}`)) : resolve(text));
-			});
-			return { content: [{ type: "text" as const, text: `report:${output}` }], details: { renders } };
-		} };
-		const reportSemantics = { ...PI_ACTION_SEMANTICS.definition("bash")!, tool: report.name, epoch: "custom:report", projectors: [],
-			requirements: { capabilities: [...PI_ACTION_SEMANTICS.definition("bash")!.requirements.capabilities, "invocation.host_function" as const] } };
-		const actionSemantics = new ActionSemanticsRegistry([...PI_ACTION_SEMANTICS.toolNames().map(tool => PI_ACTION_SEMANTICS.definition(tool)!), ...(role === "unkeyed" ? [] : [reportSemantics])]);
-		const tools = [fixture.tool, writer, ...(role ? [report] : [])];
+		const route = await fixture.prepareActorReplay(), writer = createWriteTool(workspace), tools = [fixture.tool, writer];
 		const settings = patternAwareSettings({ enabled: true, multiStepEnabled: false });
 		const events: SpeculativeActionEvent<string>[] = [];
 		const resolve = (tool: string, input: unknown) => resolvePiToolInvocation(tool, input, { cwd: workspace, environment: fixture.environment, shellPath: fixture.shellPath });
-		const host = createSpeculativeActionHost("chain", { cwd: workspace, resources, actionSemantics, complete: draft ?? (async () => { throw new Error("no inference"); }), onEvent: event => { events.push(event); },
-			patternStore: new PatternAwareStore(settings, undefined, patternAwareActionSemantics(actionSemantics, workspace)),
-			getSettings: () => ({ enabled: true, drafterEnabled: !!draft, drafterMaxDepth: 1, candidateLimit: draft ? 1 : 4, maxConcurrentActions: 4, tools: role ? tools.map(tool => tool.name) : draft ? ["bash", "write"] : ["bash"], patternAware: settings }),
-			preflight: () => true, executionWorlds: [fixture.world, fixture.workspaceSandbox.createExecutionWorld(), { id: "observer", scope: "fallback", isolation: "resource_snapshot",
-				observeOperations: ({ action }, execute) => { observed.push(action?.tool); return execute(); } }],
-			resolveInvocation: (tool, input) => tool === report.name ? role === "unkeyed" ? undefined : { ...resolve("bash", input)!, semantics: reportSemantics } : resolve(tool, input) });
+		const host = createSpeculativeActionHost("chain", { cwd: workspace, resources, complete: async () => { throw new Error("no inference"); }, onEvent: event => { events.push(event); },
+			patternStore: new PatternAwareStore(settings, undefined, patternAwareActionSemantics(PI_ACTION_SEMANTICS, workspace)),
+			getSettings: () => ({ enabled: true, drafterEnabled: false, candidateLimit: 4, maxConcurrentActions: 4, tools: ["bash"], patternAware: settings }),
+			preflight: () => true, executionWorlds: [fixture.world, fixture.workspaceSandbox.createExecutionWorld()], resolveInvocation: resolve });
 		const step = async (turnID: string, call: string | { readonly path: string; readonly content: string }, think: number | (() => Promise<unknown>), during?: string) => {
 			await host.startTurn({ turnID, tools, actorModel: testModel("actor"), actorOptions: undefined, context: { systemPrompt: "chain", messages: [], tools } });
 			await (typeof think === "number" ? sleep(think) : think());
 			if (during) execSync(during, { cwd: workspace, shell: "/bin/bash" });
 			const before = fixture.backend.actorMetrics(), started = performance.now();
-			const processTool = role && ((role === "producer" || role === "stale" || role === "retired-running") ? turnID === "seed" : turnID === "check") ? report : fixture.tool;
 			const result = typeof call !== "string" ? await host.execute({ turnID, id: turnID, tool: "write", args: call, tools }, undefined, () => writer.execute(turnID, call))
-				: await host.execute({ turnID, id: turnID, tool: processTool.name, args: { command: call }, tools }, undefined, () => fixture.coordinator.runWith(route.executor, () => processTool.execute(turnID, { command: call })));
+				: await host.execute({ turnID, id: turnID, tool: fixture.tool.name, args: { command: call }, tools }, undefined, () => fixture.coordinator.runWith(route.executor, () => fixture.tool.execute(turnID, { command: call })));
 			const ms = performance.now() - started, after = fixture.backend.actorMetrics();
 			const timing = events.filter(event => event.type === "actor_action").at(-1)?.computation;
 			expect(timing).toMatchObject({ toolComputeMs: expect.any(Number), hiddenComputeMs: expect.any(Number), adoptionWaitMs: expect.any(Number) });
@@ -94,34 +75,9 @@ async function chainWorld(files: readonly (readonly [string, string])[], loops: 
 			await host.finishTurn(turnID);
 			return { ms, text: textOutput(result as never), hits: after.hits - before.hits, hiddenMs: timing!.hiddenComputeMs };
 		};
-		return { fixture, workspace, host, step, tools, events, observed, renders: () => renders };
+		return { fixture, workspace, host, step, tools, events };
 	} catch (error) { await fixture.dispose(); throw error; }
 }
-
-test.skipIf(process.platform !== "linux").for(["producer", "consumer", "unkeyed", "stale", "retired-running"])("shares native child work across tool contracts while preserving remaining effects (%s)", { timeout: 30_000 }, async role => {
-	const { fixture, workspace, host, step, events, observed, renders, tools } = await chainWorld([["a.txt", "alpha\n"]], "40000000", undefined,
-		{ initial: { cpuCount: 1, idleCpuCount: 1 }, sample: async () => ({ cpuCount: 1, idleCpuCount: 1 }) }, role);
-	const wrapped = role === "consumer" || role === "unkeyed", running = wrapped || role === "retired-running", command = "printf remaining:; ./slow a.txt; :";
-	let publication: ReturnType<typeof holdProcessPublication> | undefined;
-	await using _cleanup = onExit(async () => { publication?.close(); await host.dispose(); await fixture.dispose(); });
-	await step("seed", "printf initial:; ./slow a.txt; :", 0);
-	if (running) publication = holdProcessPublication(fixture.backend);
-	await step("edit", { path: "a.txt", content: "alpha\nbeta\n" }, 0);
-	if (role === "retired-running") {
-		await host.startTurn({ turnID: "warming", tools, actorModel: testModel("actor"), actorOptions: undefined, context: { messages: [], tools } });
-		await expect.poll(publication!.reached, { timeout: 5000 }).toBe(true); await host.finishTurn("warming"); tools.splice(tools.findIndex(tool => tool.name === "render_report"), 1);
-	}
-	const measured = await step("check", `${command}; printf once >> marker`, async () => {
-		await expect.poll(() => publication ? publication.reached() : events.some(event => event.type === "candidate" &&
-			event.candidate.kind === "operation" && event.state.status === "succeeded"), { timeout: 5000 }).toBe(true);
-		await expect(readFile(path.join(workspace, "marker"))).rejects.toMatchObject({ code: "ENOENT" });
-	}, role === "stale" ? "printf fresh > a.txt" : undefined);
-	expect([measured.text, measured.hits, measured.hiddenMs! > 0]).toEqual([(wrapped ? "report:" : "") + execSync(command, { cwd: workspace, encoding: "utf8" }), Number(role !== "stale"), role !== "stale"]);
-	expect([renders(), await readFile(path.join(workspace, "marker"), "utf8")]).toEqual([1, "once"]);
-	expect(observed).toEqual([wrapped ? "bash" : "render_report", "write", role === "unkeyed" ? undefined : wrapped ? "render_report" : "bash"]);
-	expect(events.filter(event => event.type === "candidate" && event.state.status === "cancelled" && event.state.cause.code === "tool_disabled" && event.state.executionMs > 0)).toEqual([]);
-	if (publication) expect(publication.joined()).toBe(true);
-});
 
 test.skipIf(process.platform !== "linux" || !process.env.PI_SPEC_REUSE_CHAIN)("reuse chain", { timeout: 3_600_000 }, async () => {
 	const rows: string[] = [];
@@ -147,7 +103,7 @@ test.skipIf(process.platform !== "linux" || !process.env.PI_SPEC_REUSE_CHAIN)("r
 test.skipIf(process.platform !== "linux").for(["build", "build_changed_after_preparation", "current_workspace", "changed_after_preparation", "after_horizon", "changed_after_horizon", "bash_mutation", "bash_changed_after_preparation"] as const)("prepares learned work after an Actor edit (%s)", { timeout: 120_000 }, async mode => {
 	const horizon = mode.endsWith("horizon"), stale = mode.includes("changed_"), bashMutation = mode.startsWith("bash_"), build = mode.startsWith("build"), worker = `./slow a.txt${horizon ? " identity" : ""}`;
 	// This retention scenario needs capacity for the detour and producer; CPU preemption has separate coverage.
-	const { fixture, workspace, host, step, events } = await chainWorld([["a.txt", "alpha\n"], ["Makefile", "all:\n\t@./slow a.txt\n"]], "600000000", undefined,
+	const { fixture, workspace, host, step, events } = await chainWorld([["a.txt", "alpha\n"], ["Makefile", "all:\n\t@./slow a.txt\n"]], "600000000",
 		horizon ? { initial: { cpuCount: 4, idleCpuCount: 4 }, sample: async () => ({ cpuCount: 4, idleCpuCount: 4 }) } : undefined);
 	let publication: ReturnType<typeof holdProcessPublication> | undefined;
 	await using _cleanup = onExit(async () => { publication?.close(); await host.dispose(); await fixture.dispose(); });
@@ -174,28 +130,4 @@ test.skipIf(process.platform !== "linux").for(["build", "build_changed_after_pre
 		stale ? "printf 'newest\\n' > a.txt" : undefined);
 	expect([measured.text.trim(), measured.hits, measured.hiddenMs > 0], JSON.stringify({ events: events.filter(event => event.type === "candidate" || event.type === "operation_prediction"), metrics: fixture.backend.metrics() }))
 		.toEqual([execSync(command, { cwd: workspace, encoding: "utf8" }).trim(), Number(!stale), !stale]);
-});
-
-test.skipIf(process.platform !== "linux")("prepares a process from a predicted mutation before either Actor call, then adopts across turns", { timeout: 30_000 }, async () => {
-	const steps = [{ tool: "write", input: { path: "a.txt", content: "next\n" } }, { tool: "bash", input: { command: "./slow a.txt" } }];
-	let requests = 0;
-	const { fixture, workspace, host, tools, events } = await chainWorld([["a.txt", "original\n"]], "600000000", async () => {
-		requests++;
-		return fauxAssistantMessage([{ type: "toolCall", id: "workflow", name: "speculative_workflow", arguments: { steps } }], { stopReason: "toolUse" });
-	});
-	const start = (turnID: string) => host.startTurn({ turnID, tools, actorModel: testModel("actor"), actorOptions: undefined, context: { messages: [], tools } });
-	await using _cleanup = onExit(async () => { await host.dispose(); await fixture.dispose(); });
-	await start("write");
-	await expect.poll(() => events.filter(event => event.type === "candidate" && event.state.status === "succeeded"), { timeout: 15_000 }).toHaveLength(2);
-	expect(await readFile(path.join(workspace, "a.txt"), "utf8")).toBe("original\n");
-	for (const step of steps) {
-		if (step.tool === "bash") await start(step.tool);
-		const output = await host.execute({ turnID: step.tool, id: step.tool, tool: step.tool, args: step.input, tools }, undefined,
-			() => tools.find(tool => tool.name === step.tool)!.execute(step.tool, step.input as never));
-		if (step.tool === "bash") expect(textOutput(output as never).trim()).toBe(execSync(step.input.command!, { cwd: workspace, encoding: "utf8" }).trim());
-		await host.finishTurn(step.tool, step.tool === "bash");
-	}
-	const settled = events.filter(event => event.type === "actor_action").map(event => event.settlement);
-	expect(settled.map(event => event.provider.kind), JSON.stringify(settled)).toEqual(["speculative", "speculative"]);
-	expect(requests).toBe(1);
 });

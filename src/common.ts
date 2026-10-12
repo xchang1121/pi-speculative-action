@@ -1,4 +1,4 @@
-import { KEYABLE_TOOLS, type ActionSemanticsRegistry, PI_ACTION_SEMANTICS } from "./action-semantics.ts";
+import { KEYABLE_TOOLS, type ActionSemanticsRegistry } from "./action-semantics.ts";
 import type { SpeculativeActionSettings } from "./runtime-contracts.ts";
 import { positiveCount } from "./number-utils.ts";
 import { booleanOr, nonNegativeInteger, nonNegativeNumber, positiveInteger, settingsParser } from "./setting-input.ts";
@@ -39,20 +39,16 @@ export const DEFAULTS = {
 
 export const clampCandidateLimit = positiveCount;
 
-export function candidateToolNames(
-	settings: SpeculativeActionSettings,
-	semantics: ActionSemanticsRegistry = PI_ACTION_SEMANTICS,
-): readonly string[] {
-	const known = new Set(semantics.toolNames());
-	return [...new Set(settings.tools)].filter((tool) => known.has(tool));
+/** Selection is policy; invocation capabilities decide which operations can execute. */
+export function candidateToolNames(settings: SpeculativeActionSettings, _semantics?: ActionSemanticsRegistry): readonly string[] {
+	return [...new Set(settings.tools)];
 }
 
 /** Only omitted selection defaults to allowed tools; malformed input disables prediction. */
 export function normalizeSpeculativeToolSelection(value: unknown, allowed: readonly string[] = KEYABLE_TOOLS): readonly string[] {
 	const items = value === undefined ? allowed : value;
 	if (!Array.isArray(items) || !items.every((item): item is string => typeof item === "string")) return [];
-	const allowedSet = new Set(allowed);
-	return [...new Set(items.filter((item) => allowedSet.has(item)))];
+	return [...new Set(items)];
 }
 
 export function normalizeDrafterRequestSettings(value: unknown): DrafterRequestSettings {

@@ -94,8 +94,7 @@ async function learnWorker(fixture: LinuxProcessBenchmark, scope: { sessionID: s
 		}, true), () => computations);
 	};
 	const seed = (await actor()).output; expect(binding, JSON.stringify(fixture.backend.metrics())).toBeDefined();
-	const invocation = resolvePiToolInvocation("bash", { command: "exit 92" }, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath })!.process!;
-	return { actor, execute, seed, binding: binding!, handoffs, invocation };
+	return { actor, execute, seed, binding: binding!, handoffs, invocation: binding! };
 }
 
 async function runningProcess(start: number, ready: (pid: number, syscall: string) => boolean | Promise<boolean>) {
@@ -1460,28 +1459,24 @@ static int takePacket(int length,int peek,int truncated,char expected) {
 			await writeFile(helper, `#!/bin/sh\nif [ "$1" = "--attach-skip-code" ]; then echo $$ > '${marker}'; while [ ! -f '${gate}' ]; do sleep .01; done; fi\nexec '${binary}' "$@"\n`, { mode: 0o700 });
 			await filesystem.symlink(binary + ".node", helper + ".node");
 			const backend = new LinuxProcessReuseBackend({ storeRoot, heldExecBinary: helper }), host = adaptProcessToolOperations(createLocalBashOperations({ shellPath: "/bin/bash" }));
-			const create = () => new ProcessExecutionCoordinator(host, { enabled: () => true,
-				prepare: (refresh, signal) => backend.prepareActorReplay(host, { sourceRoot: root, invocation: () => undefined,
-					held: true }, refresh || stop === "preparing", signal),
-				reset: () => backend.resetActorReplay() });
-			let coordinator = create(); const controller = new AbortController();
+			const controller = new AbortController();
 			const execute = async (signal?: AbortSignal) => { let output = "";
-				try { await coordinator.operations.exec("printf ready", root, { signal, env: {}, onData: data => { output += data.toString(); } }); return output; }
+				try { await backend.observeNative(root, { sessionID: "preparing", turnID: stop }, signal, () => host.execute({ command: "printf ready", cwd: root, signal, environment: {}, onData: data => { output += data.toString(); } })); return output; }
 				catch (error) { if (signal?.aborted) return "aborted"; throw error; }
 			};
 			try {
-				await backend.store.put(PROCESS_CERTIFICATE); const first = execute(controller.signal);
+				await backend.store.put(PROCESS_CERTIFICATE); const warming = stop === "preparing" ? backend.refreshNativeObservation() : undefined, first = execute(controller.signal);
 				await expect.poll(() => existsSync(marker)).toBe(true); const pid = Number(await readFile(marker, "utf8")), second = execute();
 				if (stop !== "owner") {
 					controller.abort(); expect(await scheduling.waitForCompletion(first, undefined, 500)).toEqual({ status: "completed", value: "aborted" });
 					expect((await scheduling.waitForCompletion(second, undefined, 30)).status).toBe("deadline"); expect(() => process.kill(pid, 0)).not.toThrow();
 					await writeFile(gate, ""); expect(await second).toBe("ready");
 				} else {
-					expect((await scheduling.waitForCompletion(coordinator.dispose(), undefined, 500)).status).toBe("completed");
-					expect(await Promise.all([first, second])).toEqual(["ready", "ready"]); coordinator = create(); await writeFile(gate, "");
+					expect((await scheduling.waitForCompletion(backend.resetNativeObservation(), undefined, 500)).status).toBe("completed");
+					expect(await Promise.all([first, second])).toEqual(["ready", "ready"]); await writeFile(gate, "");
 				}
-				expect(() => process.kill(pid, 0)).toThrow(); expect((await coordinator.refreshActorRoute()).state).toBe("ready"); expect(await execute()).toBe("ready");
-			} finally { await coordinator.dispose(); await backend.dispose(); }
+				await warming; expect(() => process.kill(pid, 0)).toThrow(); await backend.refreshNativeObservation(); expect(backend.nativeDiagnostics().state).toBe("ready"); expect(await execute()).toBe("ready");
+			} finally { await backend.dispose(); }
 			expect((await filesystem.readdir(storeRoot)).filter(name => name.endsWith(".sock"))).toEqual([]);
 		}
 		const run = (command: string) => observe("transport", () => collect(childProcess.spawn("/bin/bash", ["-c", command], { cwd: root })));

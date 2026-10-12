@@ -70,12 +70,13 @@ export function createLinuxProcessExecutionWorld(
 			fingerprint: async (request) => {
 				backendChecked = true;
 				const { action } = request, tool = action?.tool ?? request.tool, invocation = action && processInvocation(action.executionContext);
-				if (action && !invocation) throw new Error("execution action has no process invocation");
-				if (tool && (!action || !operationFor(action)) && !options.tools.includes(tool))
+				const operation = action && operationFor(action), cwd = operation ? backend.bindingWorkspace(operation) : invocation?.cwd;
+				if (action && !operation && !invocation) throw new Error("execution action has no process invocation");
+				if (tool && !operation && !options.tools.includes(tool))
 					throw new Error("Complete host process outlet is not bound");
 				const [processFingerprint, workspaceFingerprint] = await Promise.all([
 					backend.fingerprint(),
-					invocation?.cwd ? qualify(invocation.cwd).then((selected) => selected.fingerprint) : workspaceSandbox.fingerprint(workspaceOptions),
+					cwd ? qualify(cwd).then((selected) => selected.fingerprint) : workspaceSandbox.fingerprint(workspaceOptions),
 				]);
 				return `${processFingerprint}:${workspaceFingerprint}`;
 			},
@@ -111,9 +112,8 @@ export function createLinuxProcessExecutionWorld(
 				qualifiedDrivers.set(path.resolve(cwd), prepared);
 			},
 			execute: (context) => backend.withProducer(async () => {
-			const invocation = processInvocation(context.action.executionContext);
+			const operation = operationFor(context.action), invocation = operation ?? processInvocation(context.action.executionContext);
 			if (!invocation) throw new Error("execution action has no process invocation");
-			const operation = operationFor(context.action);
 			const sourceRoot = path.resolve(context.cwd);
 			roots.add(sourceRoot);
 			const selected = operation && qualifiedDrivers.get(sourceRoot) || await qualify(sourceRoot);

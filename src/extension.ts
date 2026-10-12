@@ -1,12 +1,11 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import type { AgentMessage, AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@earendil-works/pi-agent-core";
+import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
 import type { Api, AssistantMessage, Model } from "@earendil-works/pi-ai";
 import { convertToLlm, createLocalBashOperations, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, type ExtensionFactory,
-	type ExtensionUIContext, getAgentDir, getShellConfig, SettingsManager, type SourceInfo, type ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { KEYABLE_TOOLS, OBSERVATION_ACTION_TOOLS, PI_ACTION_SEMANTICS, UNBOUNDED_ACTION_TOOLS,
-	WORKSPACE_MUTATION_ACTION_TOOLS } from "./action-semantics.ts";
+	type ExtensionUIContext, getAgentDir, getShellConfig, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { PI_ACTION_SEMANTICS } from "./action-semantics.ts";
 import { ActorStreamPreviewTracker } from "./actor-stream-preview.ts";
 import { createResourceSnapshotExecutionWorld, type AgentExecutionWorld } from "./agent-execution-world.ts";
 import { createSpeculativeActionHost, normalizeSpeculativeAgentSettings, type ActionDrafterBudgetSnapshot, type CreateSpeculativeActionHostOptions } from "./agent-integration.ts";
@@ -15,8 +14,7 @@ import { toolSpeedup } from "./task-timing.ts";
 import { forceToolChoice } from "./drafter-plan-source.ts";
 import { DEFAULTS } from "./common.ts";
 import { PATTERN_AWARE_PRESETS, type PatternAwareSettings } from "./pattern-aware.ts";
-import { createClosedSearchProfile, createPiToolDefinitions, PI_CLOSED_SEARCH_TOOLS, PI_OPERATION_TOOLS, resolvePiToolInvocation, type PiToolDefinition } from "./pi-tool-invocation.ts";
-import type { ToolInvocation } from "./tool-settlement.ts";
+import { createClosedSearchProfile, createPiToolDefinitions, PI_CLOSED_SEARCH_TOOLS, PI_OPERATION_TOOLS, resolvePiToolInvocation } from "./pi-tool-invocation.ts";
 import { LinuxProcessReuseBackend } from "./linux-process-backend.ts";
 import { checkLinuxEnvironment, installLinuxDependencies } from "./linux-setup.ts";
 import { createLinuxProcessExecutionWorld } from "./linux-process-world.ts";
@@ -37,6 +35,7 @@ import { type SpeculativeActionPackageSettings, SpeculativeActionSettingsStore, 
 import { emptySpeculativeTraceSummary, reduceSpeculativeTrace, type SpeculativeTraceSummary } from "./trace-summary.ts";
 import { resolvePatternWorkspaceIdentity } from "./workspace-identity.ts";
 import { WorkspaceSandboxService } from "./workspace-sandbox.ts";
+import { attachSdkTools, currentSdkTurn, isStockSdkTool, sdkCallbackTool, sdkToolInvocation } from "./sdk-tool-binding.ts";
 
 const STATUS_KEY = "speculative-action";
 const CLOSE = "Close";
@@ -225,7 +224,6 @@ export function createSpeculativeActionExtension(
 	return (pi) => {
 		let controller: SpeculativeActionController | undefined;
 		const sessions = new RuntimeLifecycleLane();
-		const wrapperSources = new Map<string, string>();
 		const actorStream = new ActorStreamPreviewTracker();
 		const providerRequest = new AsyncLocalStorage<"drafter">();
 
@@ -235,7 +233,7 @@ export function createSpeculativeActionExtension(
 
 		pi.on("session_start", (_event, ctx) => sessions.run(async () => {
 			await controller?.dispose();
-			controller = await installController(ctx, pi, dependencies, wrapperSources, providerRequest);
+			controller = await installController(ctx, pi, dependencies, providerRequest);
 			controller.attachUI(ctx.ui);
 		}));
 		pi.on("context", async (event, ctx) => { actorStream.clear(); await controller?.startTurn(event.messages, ctx); });
@@ -275,7 +273,6 @@ async function installController(
 	context: ExtensionContext,
 	pi: ExtensionAPI,
 	dependencies: SpeculativeActionExtensionDependencies,
-	wrapperSources: Map<string, string>,
 	providerRequest: AsyncLocalStorage<"drafter">,
 ) {
 	let ui: ExtensionUIContext | undefined;
@@ -351,38 +348,22 @@ async function installController(
 			return message?.content.flatMap((item) => item.type === "toolCall" ? [{ tool: item.name, input: item.arguments }] : []) ?? [];
 		},
 	});
-	const [piToolSettings, patternWorkspaceIdentity] = await Promise.all([
-		loadPiToolSettings(context),
-		resolvePatternWorkspaceIdentity(context.cwd),
-	]);
+	const piToolSettings = loadPiToolSettings(context);
+	const patternWorkspaceIdentity = await resolvePatternWorkspaceIdentity(context.cwd);
 	const primaryExecutionWorlds = dependencies.createExecutionWorlds?.({
 		cwd: context.cwd,
 		autoResizeImages: piToolSettings.autoResizeImages,
 		settings,
 	}) ?? [];
 	const processBackend = new LinuxProcessReuseBackend({ storeRoot: path.join(getAgentDir(), "speculative-action", "process-reuse") });
-	const shell = getShellConfig(piToolSettings.shellPath);
-	const actorReplayEnabled = () => currentSettings.enabled;
-	const rawProcessExecutor = adaptProcessToolOperations(createLocalBashOperations({ shellPath: shell.shell }));
-	const processCoordinator = new ProcessExecutionCoordinator(
-		rawProcessExecutor,
-		{
-			enabled: actorReplayEnabled,
-			prepare: (refresh, signal) => processBackend.prepareActorReplay(rawProcessExecutor, {
-				sourceRoot: context.cwd,
-				held: true,
-				invocation: (request) => resolvePiToolInvocation("bash", {
-					command: request.command,
-					...(request.timeout !== undefined ? { timeout: request.timeout } : {}),
-				}, {
-					cwd: request.cwd,
-					environment: definedProcessEnvironment(request.environment),
-					...(piToolSettings.shellPath ? { shellPath: piToolSettings.shellPath } : {}),
-				})?.process,
-			}, refresh, signal),
-			reset: () => processBackend.resetActorReplay(),
-		},
-	);
+	const rawProcessExecutor = adaptProcessToolOperations(createLocalBashOperations({ shellPath: getShellConfig(piToolSettings.shellPath).shell }));
+	const completedReplay = processBackend.completedReplayExecutor(rawProcessExecutor, {
+		sourceRoot: context.cwd, invocation: request => resolvePiToolInvocation("bash", { command: request.command, timeout: request.timeout }, {
+			cwd: request.cwd, environment: definedProcessEnvironment(request.environment), shellPath: piToolSettings.shellPath,
+		})?.process,
+	});
+	const processCoordinator = new ProcessExecutionCoordinator({ execute: request =>
+		(currentSettings.enabled ? completedReplay : rawProcessExecutor).execute(request) });
 	const workspaceSandbox = dependencies.createWorkspaceSandboxService?.() ?? new WorkspaceSandboxService();
 	const executionWorlds = [
 		...new Set([
@@ -410,40 +391,31 @@ async function installController(
 	configureExecutionStorage();
 	let executionDiagnostics: readonly ExecutionWorldDiagnosticSnapshot[] = [];
 	const executionRoutes = (): ExecutionRoutesSnapshot => ({
-		worlds: executionDiagnostics, actorProcessReplay: processCoordinator.actorDiagnostics(), primaryIDs: primaryExecutionWorldIDs,
+		worlds: executionDiagnostics, actorProcessReplay: processBackend.nativeDiagnostics(currentSettings.enabled), primaryIDs: primaryExecutionWorldIDs,
 		searchDetail: !closedSearchEnabled() || (search && !search.profile) ? "Native Pi" : `${searchExecutionLabel(currentSettings.searchExecution)}; ${search?.profile ? [...search.profile.invocations.keys()].join(", ") + " prepared" : "not checked"}`,
 	});
-	const availableTools = new Map(pi.getAllTools().map((tool) => [tool.name, tool]));
-	const toolConflicts = new Map<string, string>();
-	// Pi exposes metadata, but not another extension's execute function. Only stock tools and our own
-	// wrappers can be intercepted without silently substituting different tool semantics.
-	const baseDefinitions = new Map(
-		[...createPiToolDefinitions(context.cwd, {
-			read: { autoResizeImages: piToolSettings.autoResizeImages },
-			bash: {
-				operations: processCoordinator.operations,
-				shellPath: piToolSettings.shellPath,
-				commandPrefix: piToolSettings.shellCommandPrefix,
-			},
-		})].filter(([name]) => {
-			const available = availableTools.get(name);
-			if (!available) return false;
-			const source = toolSourceFingerprint(available.sourceInfo);
-			if (available.sourceInfo.source === "builtin" || wrapperSources.get(name) === source) return true;
-			toolConflicts.set(name, `${available.sourceInfo.source}: ${available.sourceInfo.path}`);
-			return false;
-		}),
-	);
-	const agentTools = new Map([...baseDefinitions].map(([name, definition]) => [name, toAgentTool(definition, () => latestContext)]));
+	const agentTools = new Map([...createPiToolDefinitions(context.cwd, {
+		read: { autoResizeImages: piToolSettings.autoResizeImages },
+		bash: {
+			operations: processCoordinator.operations,
+			shellPath: piToolSettings.shellPath,
+			commandPrefix: piToolSettings.shellCommandPrefix,
+		},
+	})].map(([name, definition]): [string, AgentTool] => [name, { ...definition,
+		execute: (callID, input, signal, onUpdate) => definition.execute(callID, input as never, signal, onUpdate as never, latestContext),
+	}]));
+	const selectTool = (tool: AgentTool) => (isStockSdkTool(tool) && agentTools.get(tool.name)) || sdkCallbackTool(tool);
+	const registeredTools = () => new Set(pi.getAllTools().map(tool => tool.name));
 	const toolCapabilities = () => resolveToolCapabilities(
-		currentSettings, baseDefinitions.keys(), toolConflicts, executionRoutes(),
-		closedSearchEnabled() ? search?.profile?.invocations : undefined,
+		currentSettings, new Map(sdk.tools().map(selectTool).map(tool => [tool.name, agentTools.get(tool.name) === tool
+			? (closedSearchEnabled() ? search?.profile?.invocations.get(tool.name)?.semantics : undefined)?.requirements ?? PI_ACTION_SEMANTICS.requirements(tool.name)
+			: sdkToolInvocation(tool).semantics?.requirements])), executionRoutes(),
 	);
-	const runtimeSettings = () => ({ ...currentSettings, tools: predictionTools(currentSettings, baseDefinitions.keys()) });
+	const runtimeSettings = () => ({ ...currentSettings, tools: predictionTools(currentSettings, registeredTools()) });
 	const visibleMetrics = (): SpeculativeActionMetrics => ({ ...currentMetrics, actorProcessReuse: processBackend.actorMetrics() });
 	function renderFooter(): void {
 		if (!ui) return;
-		ui.setStatus(STATUS_KEY, formatSpeculativeFooter(settings(), visibleMetrics(), executionRoutes(), toolConflicts.size));
+		ui.setStatus(STATUS_KEY, formatSpeculativeFooter(settings(), visibleMetrics(), executionRoutes()));
 	}
 	const host = (dependencies.createHost ?? createSpeculativeActionHost)(sessionID, {
 		cwd: context.cwd,
@@ -452,8 +424,9 @@ async function installController(
 		drafterBudget,
 		draftModel: draftModelFor,
 		preflight: ({ toolName }) =>
-			latestContext.isProjectTrusted() && baseDefinitions.has(toolName) && pi.getActiveTools().includes(toolName),
-		resolveInvocation: async (tool, input) => {
+			latestContext.isProjectTrusted() && pi.getActiveTools().includes(toolName),
+		resolveInvocation: async (tool, input, definition) => {
+			if (!definition || agentTools.get(tool) !== definition) return definition && sdkToolInvocation(definition);
 			if (closedSearchEnabled() && PI_CLOSED_SEARCH_TOOLS.includes(tool)) {
 				const invocation = (await prepareSearch())?.invocations.get(tool);
 				if (invocation) return invocation; // Qualification precedes identity binding; never switch an admitted call.
@@ -489,7 +462,7 @@ async function installController(
 		if (refresh) await resetSearch();
 		const preparations = [
 			closedSearchEnabled() ? prepareSearch() : undefined,
-			refresh ? processCoordinator.refreshActorRoute() : undefined,
+			refresh ? processBackend.refreshNativeObservation(currentSettings.enabled) : undefined,
 			Promise.resolve().then(() => host.executionWorldDiagnostics(refresh && currentSettings.enabled)),
 		] as const;
 		// A failed provider cannot detach preparation from refresh or shutdown ownership.
@@ -505,9 +478,8 @@ async function installController(
 		settingsScope: () => settingsStore.scope,
 		setSettingsScope: (scope: SpeculativeSettingsScope) => settingsStore.setScope(scope),
 		metrics: visibleMetrics,
-		registeredTools: (): ReadonlySet<string> => new Set(baseDefinitions.keys()),
+		registeredTools,
 		toolCapabilities,
-		toolConflicts: (): ReadonlyMap<string, string> => new Map(toolConflicts),
 		recentEvents: (): readonly string[] => [...recentEvents],
 		refreshExecutionDiagnostics,
 		executionRoutes,
@@ -547,15 +519,20 @@ async function installController(
 		detachUI: () => { ui?.setStatus(STATUS_KEY, undefined); ui = undefined; },
 		startTurn: async (messages: AgentMessage[], nextContext: ExtensionContext) => {
 			latestContext = nextContext;
-			const model = nextContext.model;
-			if (!model) return;
+			const model = nextContext.model, turn = currentSdkTurn(nextContext);
+			if (!model || !turn) return;
 			try {
 				if (currentTurnID) await host.finishTurn(currentTurnID);
-				currentTurnID = `turn_${++turnSequence}`;
-				turnTools = pi
-					.getActiveTools()
-					.map((name) => agentTools.get(name))
-					.filter((tool): tool is AgentTool => tool !== undefined);
+				const turnID = currentTurnID = `turn_${++turnSequence}`;
+				const tools = turnTools = turn.tools.map(selectTool);
+				turn.execute = (tool, args) => {
+					const [callID, input, signal] = args, selected = selectTool(tool);
+					return host.execute({ turnID, id: callID, tool: tool.name, args: input,
+						tools: tools.map(current => current.name === tool.name ? selected : current) }, signal, async operation =>
+						operation.invocation?.authoritative ? (await operation.invocation.authoritative({
+							callID, args: operation.input, signal: signal ?? new AbortController().signal,
+						})).result : selected.execute(...args));
+				};
 				const actorContext = { systemPrompt: nextContext.getSystemPrompt(), messages: convertToLlm(messages), tools: [...turnTools] };
 				await host.startTurn(
 					{
@@ -574,12 +551,12 @@ async function installController(
 		},
 		previewActorCall: (tool: string, callID: string, input: unknown, signal?: AbortSignal) => {
 			const turnID = currentTurnID;
-			if (!turnID || !baseDefinitions.has(tool)) return;
+			if (!turnID) return;
 			void recoverSpeculation(() => host.previewActorCall({ turnID, id: callID, tool, args: input, tools: turnTools }, signal));
 		},
 		previewActorTool: (tool: string, signal?: AbortSignal) => {
 			const turnID = currentTurnID;
-			if (!turnID || !baseDefinitions.has(tool)) return;
+			if (!turnID) return;
 			void recoverSpeculation(() => host.previewActorTool({ turnID, tool }, signal));
 		},
 		decorateActorPayload: (payload: unknown) => selfSpeculation.decorateActorPayload(payload),
@@ -595,21 +572,6 @@ async function installController(
 			else selfSpeculation.endTurn();
 			if (terminal) lastTurnID = undefined;
 		},
-		execute: async (tool: string, callID: string, input: unknown, signal: AbortSignal | undefined,
-			onUpdate: AgentToolUpdateCallback<unknown> | undefined, nextContext: ExtensionContext): Promise<AgentToolResult<unknown>> => {
-			latestContext = nextContext;
-			const definition = baseDefinitions.get(tool);
-			if (!definition) throw new Error(`Speculative wrapper has no base tool ${tool}`);
-			const turnID = currentTurnID;
-			return host.execute(
-				{ ...(turnID ? { turnID } : {}), id: callID, tool, args: input, tools: turnTools },
-				signal,
-				async (operation) =>
-					operation.invocation?.authoritative ? (await operation.invocation.authoritative({
-						callID, args: operation.input, signal: operation.signal ?? new AbortController().signal,
-					})).result : await definition.execute(callID, operation.input as never, operation.signal, onUpdate as never, nextContext),
-			);
-		},
 		statusText: () => {
 			const effective = settings();
 			return [
@@ -617,17 +579,16 @@ async function installController(
 				formatDrafterBudgetStatus(host.drafterBudgetSnapshot()),
 				formatSelfSpeculationStatus(selfSpeculation.snapshot()),
 				executionWorldSummary(toolCapabilities(), executionRoutes()),
-				`Custom tool conflicts: ${toolConflictSummary(toolConflicts)}`,
 			].join("\n");
 		},
 		dispose: () => {
+			sdk.dispose();
 			ui?.setStatus(STATUS_KEY, undefined);
 			ui = undefined;
 			return lifecycle.close(async () => {
 				await lifecycle.drain();
 				const routes = executionRoutes();
 				return Promise.resolve().then(() => settingsStore.flush())
-				.finally(() => processCoordinator.dispose().catch(() => undefined))
 				.finally(() => host.dispose())
 				.finally(() => workspaceSandbox.dispose())
 				.finally(() => selfSpeculation.dispose())
@@ -637,51 +598,13 @@ async function installController(
 			});
 		},
 	} as const;
-	for (const definition of baseDefinitions.values())
-		pi.registerTool(speculativeToolDefinition(definition, controller));
-	const registeredTools = new Map(pi.getAllTools().map((tool) => [tool.name, tool]));
-	for (const name of baseDefinitions.keys()) {
-		const registered = registeredTools.get(name);
-		if (registered) wrapperSources.set(name, toolSourceFingerprint(registered.sourceInfo));
-	}
+	const sdk = attachSdkTools(context);
 	await recoverSpeculation(() => refreshExecutionDiagnostics());
 	return controller;
 }
 
 async function recoverSpeculation<T>(operation: () => Promise<T>): Promise<T | undefined> {
 	try { return await operation(); } catch { return undefined; }
-}
-
-interface PiToolSettings { readonly shellPath?: string; readonly shellCommandPrefix?: string; readonly autoResizeImages: boolean; }
-
-function speculativeToolDefinition(base: PiToolDefinition, controller: SpeculativeActionController): ToolDefinition {
-	return {
-		...base,
-		renderCall: base.renderCall as ToolDefinition["renderCall"],
-		renderResult: base.renderResult as ToolDefinition["renderResult"],
-		async execute(callID, input, signal, onUpdate, context) {
-			return controller.execute(base.name, callID, input, signal, onUpdate, context);
-		},
-	};
-}
-
-function toolSourceFingerprint(source: SourceInfo): string {
-	return [source.path, source.source, source.scope, source.origin, source.baseDir ?? ""].join("\0");
-}
-
-function toolConflictSummary(conflicts: ReadonlyMap<string, string>): string {
-	if (conflicts.size === 0) return "none";
-	return [...conflicts]
-		.sort(([left], [right]) => left.localeCompare(right))
-		.map(([tool, source]) => `${tool} (${source}); excluded from speculation`)
-		.join(", ");
-}
-
-function toAgentTool(base: PiToolDefinition, context: () => ExtensionContext): AgentTool {
-	return {
-		...base,
-		execute: (callID, input, signal, onUpdate) => base.execute(callID, input as never, signal, onUpdate as never, context()),
-	};
 }
 
 function piShellEnvironment(context: ExtensionContext): Readonly<Record<string, string>> {
@@ -705,13 +628,11 @@ function piShellEnvironment(context: ExtensionContext): Readonly<Record<string, 
 	return definedProcessEnvironment(environment);
 }
 
-function loadPiToolSettings(context: ExtensionContext): PiToolSettings {
+function loadPiToolSettings(context: ExtensionContext) {
 	const settings = SettingsManager.create(context.cwd, getAgentDir(), { projectTrusted: context.isProjectTrusted() });
-	const shellPath = settings.getShellPath();
-	const shellCommandPrefix = settings.getShellCommandPrefix();
 	return {
-		...(shellPath ? { shellPath } : {}),
-		...(shellCommandPrefix ? { shellCommandPrefix } : {}),
+		shellPath: settings.getShellPath(),
+		shellCommandPrefix: settings.getShellCommandPrefix(),
 		autoResizeImages: settings.getImageAutoResize(),
 	};
 }
@@ -994,7 +915,7 @@ function openToolsAndExecution(
 			ctx.ui.notify(executionWorldSummary(controller.toolCapabilities(), controller.executionRoutes()), "info");
 		};
 		return new Map<string, MenuAction>([
-			[`Tool policy › ${policy.enabled}/${policy.available} enabled for prediction`, () => editToolPolicy(ctx, editor, controller.registeredTools(), controller.toolConflicts())],
+			[`Tool policy › ${policy.enabled}/${policy.available} enabled for prediction`, () => editToolPolicy(ctx, editor, controller.registeredTools())],
 			["Execution routes", () => openExecutionRoutes(ctx, editor, controller)],
 			["Check Linux environment", () => checkLinuxEnvironment(ctx, refresh)],
 			["Install / update Linux dependencies", () => installLinuxDependencies(ctx, refresh)],
@@ -1052,29 +973,18 @@ function editToolPolicy(
 	ctx: ExtensionContext,
 	controller: SpeculativeActionController,
 	registered: ReadonlySet<string>,
-	conflicts: ReadonlyMap<string, string>,
 ): Promise<void> {
 	return runActionMenuLoop(ctx, "Tool policy · [x] prediction on · [ ] prediction off", () => {
 		const settings = controller.settings();
 		const capabilities = controller.toolCapabilities();
-		const tools = [...new Set([...KEYABLE_TOOLS, ...settings.tools, ...registered])].sort(
-			(left, right) => toolCategory(left) - toolCategory(right) || left.localeCompare(right),
-		);
+		const tools = [...new Set([...settings.tools, ...registered])].sort((left, right) => left.localeCompare(right));
 		return new Map<string, MenuAction>(tools.map((tool) => {
-			const supported = (KEYABLE_TOOLS as readonly string[]).includes(tool);
-			const selected = supported && settings.tools.includes(tool);
+			const selected = settings.tools.includes(tool);
 			const capability = capabilities.get(tool);
 			const staged = capability ? { ...capability, predict: selected ? "on" as const : "off" as const } : undefined;
 			return [`${selected ? "[x]" : "[ ]"} ${tool} · ${capabilityRowLabel(staged)}`, async () => {
-				if (!supported) { ctx.ui.notify(`${tool} has no speculative action semantics.`, "warning"); return; }
 				if (!selected && !registered.has(tool)) {
-					const conflict = conflicts.get(tool);
-					ctx.ui.notify(
-						conflict
-							? `${tool} is provided by ${conflict}. Custom tool overrides remain authoritative and are excluded from speculation.`
-							: `${tool} is not registered in the current Pi session.`,
-						"warning",
-					);
+					ctx.ui.notify(`${tool} is not registered in the current Pi session.`, "warning");
 					return;
 				}
 				const next = selected ? settings.tools.filter((item) => item !== tool) : [...settings.tools, tool];
@@ -1276,18 +1186,13 @@ function activeModelReference(ctx: ExtensionContext): string {
 
 function resolveToolCapabilities(
 	settings: EffectiveSpeculativeActionSettings,
-	registered: Iterable<string>,
-	conflicts: ReadonlyMap<string, string>,
+	registered: ReadonlyMap<string, ReturnType<typeof PI_ACTION_SEMANTICS.requirements>>,
 	routes: ExecutionRoutesSnapshot,
-	bindings?: ReadonlyMap<string, ToolInvocation>,
 ): ReadonlyMap<string, ToolCapabilityRow> {
-	const registeredTools = new Set(registered);
 	const { worlds, actorProcessReplay } = routes;
 	return new Map<string, ToolCapabilityRow>(
-		KEYABLE_TOOLS.map((tool): [string, ToolCapabilityRow] => {
-			const requirements = bindings?.get(tool)?.semantics?.requirements ?? PI_ACTION_SEMANTICS.requirements(tool);
-			const unavailable = conflicts.get(tool) ?? (!registeredTools.has(tool) ? "not registered" : undefined);
-			if (unavailable || !requirements) {
+		[...registered].map(([tool, requirements]): [string, ToolCapabilityRow] => {
+			if (!requirements) {
 				return [tool, { predict: "unavailable", replay: "unavailable", observe: "unavailable", fork: "unavailable" }];
 			}
 			const fork = executionCapabilityStatus(requirements, worlds, "speculation", tool);
@@ -1295,16 +1200,15 @@ function resolveToolCapabilities(
 			const replay = bestCapabilityState([
 				fork.state,
 				observe.state,
-				...(tool === "bash" && actorProcessReplay ? [processRouteCapability(actorProcessReplay.state)] : []),
+				...(actorProcessReplay ? [processRouteCapability(actorProcessReplay.state)] : []),
 			]);
 			return [tool, { predict: settings.tools.includes(tool) ? "on" : "off", replay, observe: observe.state, fork: fork.state }];
 		}),
 	);
 }
 
-function predictionTools(settings: EffectiveSpeculativeActionSettings, registered: Iterable<string>): readonly string[] {
-	const available = new Set(registered);
-	return [...new Set(settings.tools)].filter((tool) => available.has(tool));
+function predictionTools(settings: EffectiveSpeculativeActionSettings, registered: ReadonlySet<string>): readonly string[] {
+	return [...new Set(settings.tools)].filter((tool) => registered.has(tool));
 }
 
 function toolPolicyCounts(
@@ -1319,7 +1223,7 @@ function bestCapabilityState(states: readonly ExecutionWorldHealthState[]): Exec
 }
 
 function processRouteCapability(state: ProcessRouteSnapshot["state"]): ExecutionWorldHealthState {
-	return state === "ready" || state === "degraded" ? "ready" : state === "idle" || state === "probing" ? "registered" : "unavailable";
+	return state === "ready" ? "ready" : state === "idle" || state === "probing" ? "registered" : "unavailable";
 }
 
 function searchExecutionLabel(mode: string): string {
@@ -1327,7 +1231,7 @@ function searchExecutionLabel(mode: string): string {
 }
 
 function processRouteLabel(state: ProcessRouteSnapshot["state"]): string {
-	return { disabled: "Disabled", idle: "Idle", probing: "Checking", ready: "Ready", degraded: "Limited", unavailable: "Unavailable" }[state];
+	return { disabled: "Disabled", idle: "Idle", probing: "Checking", ready: "Ready", unavailable: "Unavailable" }[state];
 }
 
 function executionRouteKind(isolation: SpeculativeExecution): string {
@@ -1355,13 +1259,6 @@ function capabilityLabel(state: CapabilityState): string {
 	}
 }
 
-function toolCategory(tool: string): number {
-	if ((OBSERVATION_ACTION_TOOLS as readonly string[]).includes(tool)) return 0;
-	if ((WORKSPACE_MUTATION_ACTION_TOOLS as readonly string[]).includes(tool)) return 1;
-	if ((UNBOUNDED_ACTION_TOOLS as readonly string[]).includes(tool)) return 2;
-	return 3;
-}
-
 function toolsSummary(tools: readonly string[]): string {
 	return tools.length > 0 ? tools.join(" ") : "none";
 }
@@ -1370,7 +1267,6 @@ function formatSpeculativeFooter(
 	settings: EffectiveSpeculativeActionSettings,
 	metrics: SpeculativeActionMetrics,
 	routes: ExecutionRoutesSnapshot,
-	conflicts: number,
 ): string {
 	if (!settings.enabled) return "spec: off";
 	const { worlds, actorProcessReplay } = routes;
@@ -1390,7 +1286,6 @@ function formatSpeculativeFooter(
 		...(storageWorlds.length ? [`reuse history ${storedEntries} entries (${formatBytes(storedBytes)})`] : []),
 		providers > 0 ? `providers ${ready}/${providers} ready` : "providers probing",
 		"unsafe→Actor",
-		...(conflicts > 0 ? [`${conflicts} tool conflict${conflicts === 1 ? "" : "s"}`] : []),
 	].join(" · ");
 }
 
@@ -1403,7 +1298,7 @@ function executionWorldSummary(tools: ReadonlyMap<string, ToolCapabilityRow>, ro
 		...(routes.searchDetail ? [`Search executor: ${routes.searchDetail}`] : []),
 		"Providers:",
 		...(actorProcessReplay
-			? [`- Actor Bash history: ${processRouteLabel(actorProcessReplay.state)} — ${actorProcessReplay.detail}`]
+			? [`- Native child reuse: ${processRouteLabel(actorProcessReplay.state)} — ${actorProcessReplay.detail}`]
 			: []),
 		...worlds.map(
 			(world) =>

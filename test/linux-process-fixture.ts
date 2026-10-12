@@ -107,9 +107,11 @@ export async function createLinuxProcessBenchmark(
 		world,
 		workspaceSandbox,
 		tool: tool as AgentTool, // Preserve a portable type across nested schema packages.
-		prepareActorReplay: (refresh?: boolean) => backend.prepareActorReplay(host, {
-			sourceRoot: workspace, invocation: () => undefined, held: true,
-		}, refresh).then(route => "executor" in route ? route : Promise.reject(new Error(route.detail))),
+		prepareActorReplay: async (refresh?: boolean) => {
+			if (refresh) await backend.refreshNativeObservation();
+			const replay = backend.completedReplayExecutor(host, { sourceRoot: workspace, invocation: () => undefined });
+			return { executor: { execute: (request: ProcessExecutionRequest) => backend.observeNative(workspace, request.scope, request.signal, () => replay.execute(request)) } };
+		},
 		dispose: () => disposal ??= Promise.resolve().then(() => world.dispose?.())
 			.finally(() => workspaceSandbox.dispose()).finally(() => rm(root, { recursive: true, force: true })),
 	};
