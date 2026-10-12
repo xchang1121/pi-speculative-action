@@ -1796,8 +1796,8 @@ function bindProcessDescriptors(inputs: ReturnType<typeof descriptorInputs>, pos
 		const input = handle?.description !== undefined ? inputs.find(input => input.alias === handle.description) : undefined;
 		if (input) {
 			const before = positions.find(position => position.fd === input.fd)!;
-			if (input.installed === false || fields[3] !== before.device || fields[4] !== before.inode || Boolean(Number(fields[1]) & 0x80000) !== handle!.cloexec)
-				throw new Error("continuation descriptor source is unavailable or changed");
+			if (fields[3] !== before.device || fields[4] !== before.inode || Boolean(Number(fields[1]) & 0x80000) !== handle!.cloexec)
+				throw new Error("continuation descriptor identity changed");
 			const state = [String(Number(fields[1]) & ~0x80000), ...fields.slice(2, 5)], previous = descriptions.get(input.alias);
 			if (previous && previous.join(" ") !== state.join(" ")) throw new Error("continuation shared OFD diverged");
 			descriptions.set(input.alias, state); fields[5] = String(input.fd);

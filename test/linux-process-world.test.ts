@@ -14,7 +14,7 @@ import { createLocalBashOperations, createReadTool, createGrepTool, createLsTool
 import { describe, expect, vi } from "vitest";
 import { buildActionKey, buildPiActionKey, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { linuxOverlayfsCapability } from "../src/linux-overlayfs.ts";
-import { inspectHeldExecProcess, LinuxHeldExecBoundary, type HeldExecProcess, type HeldExecTiming } from "../src/linux-held-exec.ts";
+import { inspectHeldExecProcess, LinuxHeldExecBoundary, type HeldExecDecision, type HeldExecProcess, type HeldExecTiming } from "../src/linux-held-exec.ts";
 import { effectCommitFailure } from "../src/effect-transaction.ts";
 import { LinuxProcessReuseBackend, validateTransferredProcessEvidence, type LinuxProcessSession } from "../src/linux-process-backend.ts";
 import { ProcessHandoffRegistry, type ProcessExecutionBinding } from "../src/process-handoff.ts";
@@ -529,9 +529,11 @@ int main(void) { int fds[2]; if (${mode === "eventfd" ? "(fds[0] = eventfd(0, 0)
 		publishing.mockRestore();
 	});
 
-	nativeTest.for(["pipe", "socket", "peer", "eventfd", "readv", "recvmsg", "writev", "mmap", "runtime", "handles", "eof", "early", "changed", "identity", "file", "cancel", "pipe:unavailable", "peer:unavailable", "eventfd:unavailable", "queue-drop", "queue-deferred", "queue-received", "queue-closed", "queue-peeked", "queue-changed", "queue-cancel", "queue-deferred:unavailable"])("resumes a learned running process with future input (%s)", { timeout: 60_000 }, async (scenario, { skip, benchmark }) => {
+	nativeTest.for(["pipe", "socket", "peer", "eventfd", "readv", "recvmsg", "writev", "mmap", "runtime", "handles", "eof", "early", "changed", "identity", "file", "cancel", "pipe:unavailable", "peer:unavailable", "eventfd:unavailable", "queue-drop", "queue-deferred", "queue-received", "queue-closed", "queue-peeked", "queue-changed", "queue-cancel", "queue-deferred:unavailable", "queue-alias", "queue-counter", "queue-stream", "queue-nested", "queue-peek-kept", "queue-stale", "queue-received-cancel", "queue-received:unavailable"])("resumes a learned running process with future input (%s)", { timeout: 60_000 }, async (scenario, { skip, benchmark }) => {
 		const [mode, unavailable] = scenario.split(":"), fixture = await benchmark("pi-live-process-", undefined, { processImages: unavailable ? false : undefined });
-		const queued = mode!.startsWith("queue-"), changed = mode!.endsWith("changed"), cancelled = mode!.endsWith("cancel"), received = ["queue-received", "queue-closed", "queue-peeked"].includes(mode!);
+		const queued = mode!.startsWith("queue-"), stale = mode === "queue-stale", changed = stale || mode!.endsWith("changed"), cancelled = mode!.endsWith("cancel");
+		const received = queued && !["queue-drop", "queue-deferred", "queue-changed", "queue-cancel"].includes(mode!), alias = mode === "queue-alias";
+		const inspecting = vi.spyOn(await import("../src/linux-held-exec.ts"), "inspectHeldExecProcess");
 		let host: ReturnType<typeof createSpeculativeActionHost> | undefined;
 		try {
 			await prepareLinuxProcessReuse(fixture);
@@ -555,7 +557,8 @@ static ssize_t next_input(void *bytes, size_t length) {
  struct iovec parts[] = {{bytes, length / 2}, {(char *)bytes + length / 2, length - length / 2}};
  ${mode === "recvmsg" ? "struct msghdr message = {.msg_iov = parts, .msg_iovlen = 2}; return recvmsg(INPUT_FD, &message, 0);" : mode === "readv" ? "return readv(INPUT_FD, parts, 2);" : "(void)parts; return read(INPUT_FD, bytes, length);"}
 }
-int main(void) {
+int main(${alias ? "int argc, char **argv" : "void"}) {
+ ${alias ? `if (argc > 1) { char byte; return strcmp(argv[1], "verify") || fcntl(12, F_GETFD) != -1 || errno != EBADF || fcntl(13, F_GETFD) || lseek(5, 0, SEEK_CUR) != 2 || lseek(13, 0, SEEK_CUR) != 2 || read(5, &byte, 1) != 1 || byte != 'c' || lseek(13, 0, SEEK_CUR) != 3 ? 86 : 37; }` : ""}
  ${mode === "identity" || mode === "peer" ? "pid_t identity = getpid();" : mode === "file" ? "int temporary = open(\"/dev/null\", O_RDONLY); if (temporary < 0) return 86;" : ""}
  ${mode === "runtime" ? `char *heap = malloc(65536); if (!heap) return 78; memset(heap, 'H', 65536); local = 23;
  stack_t stack = {.ss_sp = alternate, .ss_size = sizeof(alternate)};
@@ -564,9 +567,13 @@ int main(void) {
  ${mode === "mmap" ? `volatile char *mapping = mmap(NULL, 12288, PROT_READ | PROT_WRITE, MAP_PRIVATE, 5, 0);
  if (mapping == MAP_FAILED || mapping[0] != 'A') return 75; mapping[4096] = 'A'; mapping[8192] = 'Z';` : ""}
  char input[4] = {0}, byte; uint64_t counter = 0; int received = -1;
- ${mode === "queue-drop" ? "if (close(5)) return 86;" : received ? `if (take(5, 'x', &received, 1, ${Number(mode === "queue-peeked")}, 0) || read(received, &byte, 1) != 1 || byte != 'a') return 86;
- ${mode === "queue-received" ? "if (close(5)) return 86;" : `if (close(received)${mode === "queue-closed" ? " || close(5)" : ""}) return 86; received = -1;`}` : ""}
+ ${mode === "queue-nested" ? "if (take(5, 'x', &received, 1, 0, 0) || close(5) || dup2(received, 5) != 5 || close(received)) return 86;" : ""}
+ ${mode === "queue-drop" ? "if (close(5)) return 86;" : received ? `if (take(5, 'x', &received, 1, ${Number(mode!.startsWith("queue-peek"))}, 0)) return 86;
+ ${mode === "queue-counter" ? "if (read(received, &counter, 8) != 8 || counter != 3) return 86; counter = 7; if (write(received, &counter, 8) != 8) return 86;" : `if (read(received, &byte, 1) != 1 || (byte != 'a'${stale ? " && byte != 'x'" : ""})) return 86;`}
+ ${["queue-closed", "queue-peeked"].includes(mode!) ? `if (close(received)${mode === "queue-closed" ? " || close(5)" : ""}) return 86; received = -1;` : mode === "queue-peek-kept" ? "" : "if (close(5)) return 86;"}
+ ${alias ? "if (dup3(received, 5, 0) != 5 || fcntl(received, F_DUPFD_CLOEXEC, 12) != 12 || dup3(received, 13, 0) != 13 || close(received) || fcntl(5, F_SETFL, O_APPEND)) return 86; received = 5;" : ""}` : ""}
  if (${mode === "eventfd" ? "read(3, &counter, 8) != 8 || counter != 1" : "read(3, input, 1) != 1"}) return 71;
+ ${stale ? "if (byte == 'x') input[0] = 'D';" : ""}
  ${mode === "handles" ? `char bytes[2]; if (read(5, bytes, 2) != 2 || memcmp(bytes, "ab", 2) || lseek(6, 0, SEEK_CUR) != 2 || lseek(7, 0, SEEK_CUR)) return 83;
  if (fcntl(5, F_DUPFD_CLOEXEC, 12) != 12 || close(5) || close(6) || dup2(7, 6) != 6 || close(7) ||
      dup2(3, 8) != 8 || close(3) || dup2(4, 3) != 3 || close(4) || fcntl(8, F_SETFD, FD_CLOEXEC) ||
@@ -580,7 +587,9 @@ int main(void) {
  input[0] = 'A';` : `
  unsigned used = 1; ssize_t n; while ((n = next_input(input + used, sizeof(input) - used)) > 0) used += n;
  if (n || used != 3 || (input[0] != 'A' && input[0] != 'D') || input[1] != 'B' || input[2] != 'C') return 73;`}
- ${queued && !["queue-drop", "queue-closed"].includes(mode!) ? `if ((received < 0 && (take(5, 'x', &received, 1, 0, 0) || close(5))) || ${received ? "read(received, &byte, 1) != 1 || byte != 'b'" : "read(received, &counter, 8) != 8 || counter != 3"} || close(received)) return 86;` : "(void)byte; (void)received;"}
+ ${mode === "queue-peek-kept" ? "int queued_alias; if (take(5, 'x', &queued_alias, 1, 0, 0) || close(5) || lseek(queued_alias, 0, SEEK_CUR) != 1 || close(queued_alias)) return 86;" : ""}
+ ${queued && !["queue-drop", "queue-closed"].includes(mode!) ? `if ((received < 0 && (take(5, 'x', &received, 1, 0, 0) || close(5))) || ${received && mode !== "queue-counter" ? "read(received, &byte, 1) != 1 || byte != 'b'" : `read(received, &counter, 8) != 8 || counter != ${received ? 7 : 3}`} ${alias ? "|| fcntl(5, F_GETFD) || fcntl(12, F_GETFD) != FD_CLOEXEC || !(fcntl(5, F_GETFL) & O_APPEND) || !(fcntl(12, F_GETFL) & O_APPEND) || lseek(12, 0, SEEK_CUR) != 2" : "|| close(received)"}) return 86;` : "(void)byte; (void)received;"}
+ ${alias ? "for (int fd = 6; fd < 64; fd++) if (fd != 12 && fd != 13 && (fcntl(fd, F_GETFD) != -1 || errno != EBADF)) return 86;" : ""}
  if (getpid() != syscall(SYS_gettid) ${mode === "identity" || mode === "peer" ? "|| identity != getpid()" : mode === "file" ? "|| close(temporary)" : ""}) return 74;
  ${mode === "handles" ? `if (fcntl(4, F_GETFD) != -1 || errno != EBADF || fcntl(8, F_GETFD) != FD_CLOEXEC ||
      fcntl(12, F_GETFD) != FD_CLOEXEC || !(fcntl(12, F_GETFL) & O_APPEND) || read(12, bytes, 1) != 1 || bytes[0] != 'c' ||
@@ -590,7 +599,7 @@ int main(void) {
  pthread_t thread; void *returned; if (pthread_create(&thread, NULL, future_thread, NULL) || pthread_join(thread, &returned) || returned != (void *)1) return 82;` : ""}
  ${mode === "mmap" ? `char value; if (mapping[0] != 'B' || mapping[4096] != 'A' || mapping[8192] != 'Z') return 76;
  for (unsigned i = 0; i < 3; i++) if (pread(5, &value, 1, i * 4096) != 1 || value != 'B') return 77;` : ""}
- printf("%cBC:%llu\\n", input[0], (unsigned long long)hash); return 37;
+ printf("%cBC:%llu\\n", input[0], (unsigned long long)hash); ${alias ? 'fflush(stdout); if (close(3) || close(4)) return 86; execlp("worker", "worker", "verify", NULL); return 86;' : "return 37;"}
 }
 ` });
 			await compileBenchmarkHelper(fixture.workspace, { source: "launch.c", output: "launch", code: `#define _GNU_SOURCE
@@ -605,11 +614,11 @@ int main(int argc, char **argv) {
  for (unsigned i = 0; i < 3; i++) if (pwrite(backing, "A", 1, i * 4096) != 1) return 61;` : ""}
  ${mode === "handles" ? `int backing = memfd_create("live-ofd", 0); if (backing < 0 || write(backing, "abcd", 4) != 4 || lseek(backing, 0, SEEK_SET)) return 61;
  char pathname[64]; snprintf(pathname, sizeof(pathname), "/proc/self/fd/%d", backing); int independent = open(pathname, O_RDONLY); if (independent < 0) return 61;` : ""}
- ${queued ? `int reference = ${received || mode === "queue-drop" ? 'memfd_create("queued-file", 0)' : "eventfd(3, 0)"}; if (reference < 0${received ? ' || write(reference, "ab", 2) != 2 || lseek(reference, 0, SEEK_SET)' : ""}) return 61;
- int queued = wrap_queue(reference, 0); if (queued < 0) return 61;` : ""}
+ ${queued ? mode === "queue-stream" ? 'int stream[2]; if (pipe(stream) || write(stream[1], "ab", 2) != 2 || close(stream[1])) return 61; int reference = stream[0];' : `int reference = ${received && mode !== "queue-counter" || mode === "queue-drop" ? 'memfd_create("queued-file", 0)' : "eventfd(3, 0)"}; if (reference < 0${received && mode !== "queue-counter" ? ` || write(reference, ${stale ? 'argv[1][0] == \'c\' ? "xb" : "ab"' : alias ? '"abc"' : '"ab"'}, ${alias ? 3 : 2}) != ${alias ? 3 : 2} || lseek(reference, 0, SEEK_SET)` : ""}) return 61;` : ""}
+ ${queued ? `int queued = wrap_queue(${mode === "queue-nested" ? "wrap_queue(reference, 0)" : "reference"}, 0); if (queued < 0) return 61;` : ""}
  // The prefix and parent endpoints must be stable before exec, independent of fork scheduling.
  uint64_t counter = 1;
- if (${mode === "eventfd" ? "write(in[1], &counter, 8) != 8" : `write(in[1], argv[1][0] == 'c' ? "D" : "A", 1) != 1`}) return 65;
+ if (${mode === "eventfd" ? "write(in[1], &counter, 8) != 8" : `write(in[1], ${stale ? '"A"' : 'argv[1][0] == \'c\' ? "D" : "A"'}, 1) != 1`}) return 65;
  int start[2]; if (pipe(start)) return 61;
  pid_t child = fork(); if (child < 0) return 62;
  if (!child) { close(start[1]); char go; if (read(start[0], &go, 1) != 1 || close(start[0])) _exit(63);
@@ -665,12 +674,14 @@ int main(int argc, char **argv) {
 			}).catch(error => { throw new Error(diagnostic(), { cause: error }); });
 			if (cancelled) { await host.finishTurn("prepared", true); await expect.poll(() => existsSync(`/proc/${privatePid}`)).toBe(false); }
 			const command = `printf actual; launch ${changed ? "changed" : "actual"}`;
+			const inspectionStart = inspecting.mock.calls.length;
 			const actual = cancelled ? await fixture.coordinator.runWith({ execute: request => route.executor.execute({ ...request, scope: { ...scope, turnID: "later" } }) },
 				() => fixture.tool.execute("later", { command })) : await execute("prepared", command);
 			expect(actual.content, JSON.stringify(actual.content)).toEqual(seed.content.map(item => item.type === "text" ? { ...item,
 				text: item.text.replace(/^seedA/, `actual${changed ? "D" : "A"}`) } : item));
-			const resumed = !unavailable && !changed && !cancelled && !["identity", "peer", "file", "queue-received", "queue-peeked"].includes(mode!);
+			const resumed = !unavailable && !changed && !cancelled && !["identity", "peer", "file", "queue-peeked"].includes(mode!);
 			expect(fixture.backend.actorMetrics().joinedHits, diagnostic()).toBe(Number(resumed));
+			if (alias) expect(inspecting.mock.calls.slice(inspectionStart).some(([, , descriptors]) => [5, 13].every(slot => descriptors?.some(fd => fd.fd === slot && fd.alias === 5 && fd.offset === 2 && fd.owned)) && !descriptors?.some(fd => fd.fd === 12))).toBe(true);
 			if (queued && resumed) expect(publishing.mock.calls.some(([, , certificate]) => certificate?.prototype.inheritedFDs.some(fd => fd.installed === false))).toBe(true);
 			if (resumed) expect(publishing.mock.calls.some(([, , certificate, , continuation, computation]) => certificate?.result.continuation &&
 				continuation && computation && computation.completedAt > continuation.computation.completedAt), diagnostic()).toBe(true);
@@ -679,7 +690,7 @@ int main(int argc, char **argv) {
 			if (!cancelled) expect(consumedTiming(events, "prepared").hiddenComputeMs > 0, diagnostic()).toBe(resumed);
 			if (resumed) expect(events.filter(event => event.type === "operation_prediction"), diagnostic()).toContainEqual(expect.objectContaining({ settlement: expect.objectContaining({
 				observation: "observed", match: expect.objectContaining({ matched: true, adoption: expect.objectContaining({ status: "adopted" }) }) }) }));
-		} finally { await host?.dispose(); await fixture.dispose(); }
+		} finally { inspecting.mockRestore(); await host?.dispose(); await fixture.dispose(); }
 	});
 
 nativeTest("transfers native Bash FD inputs to filesystem tools across turns with exact invalidation", { timeout: 30_000 }, async ({ skip, benchmark }) => {
@@ -1457,6 +1468,27 @@ static int takePacket(int length,int peek,int truncated,char expected) {
 							onData: data => { output += data.toString(); }, ...request }),
 				};
 			};
+			type Replay = Pick<Extract<HeldExecDecision, { kind: "replay" }>, "descriptorOffsets" | "resourceEvents" | "output">;
+			const replay = (mode: string, decide: (process: HeldExecProcess) => Promise<Partial<Replay> | undefined>,
+				options: { descriptors?: Parameters<typeof held>[0]["descriptors"]; executor?: typeof native; beforeCommit?: (process: HeldExecProcess) => Promise<void> } = {}) => {
+				const failed = mode.endsWith("commit-failure"), controller = new AbortController(), adopted = vi.fn(), settle = vi.fn();
+				const commit = vi.fn(async (process: HeldExecProcess) => { await options.beforeCommit?.(process); if (failed) throw new Error("injected commit failure"); });
+				const executor = held({ descriptors: options.descriptors ?? true, decide: async process => {
+					if (await filesystem.readlink(`/proc/${process.pid}/exe`) !== "/usr/bin/true") return { kind: "continue" };
+					const decision = await decide(process); if (!decision) return { kind: "continue" };
+					if (mode === "cancel") controller.abort();
+					return { kind: "replay", exitCode: 0, output: [{ fd: 1, data: Buffer.from("replayed:") }],
+						commit: () => commit(process), adopted, settle, ...decision };
+				} }, options.executor);
+				return { adopted, settle, verify: async (command: string, output: string, commits: number) => {
+					const running = executor.execute(command, { signal: controller.signal });
+					if (failed) await expect(running, mode).rejects.toMatchObject({ disposition: "poisoned" });
+					else if (mode === "cancel") await expect(running, mode).rejects.toThrow();
+					else expect(await running, mode).toEqual({ exitCode: 0 });
+					expect(executor.output, mode).toBe(failed || mode === "cancel" ? "" : output);
+					expect(commit, mode).toHaveBeenCalledTimes(commits);
+				} };
+			};
 			const descriptorProbe = path.join(root, "descriptor-probe");
 			await compileBenchmarkHelper(root, { source: "descriptor-probe.c", output: "descriptor-probe", arguments: ["-pthread", "-Werror"], code: `#define _GNU_SOURCE
 ${cHeaders("pthread.h sched.h stdlib.h poll.h stdio.h stdint.h sys/file.h sys/stat.h sys/syscall.h sys/wait.h sys/eventfd.h sys/mman.h")}
@@ -1757,18 +1789,15 @@ int main(void) { int status; struct timespec pause = {0, 300000000}; pid_t sibli
 				const unknown = mode === "rights-unowned";
 				const shared = mode === "unshare-noop" || mode === "range-invalid", slots: number[][] = [];
 				const ownership: boolean[] = [];
-				const commit = vi.fn(async () => {});
-				const executor = held({ descriptors: true, decide: async process => {
-					if (await filesystem.readlink(`/proc/${process.pid}/exe`) !== "/usr/bin/true") return { kind: "continue" };
+				const executor = replay(mode, async process => {
 					snapshot = process.descriptors;
 					slots.push(snapshot!.map(({ fd }) => fd));
 					ownership.push(snapshot!.find(({ fd }) => fd === 3)!.owned);
-					return mode === "export" || split || imported ? { kind: "replay", descriptorOffsets: snapshot!.map(({ offset, ...descriptor }) =>
-						({ ...descriptor, before: offset, after: Number(offset) + 1, ...(descriptor.type === "pipe" ? { content: Buffer.from(descriptor.queueHex!, "hex") } : {}) })), exitCode: 0, output: [], commit } : { kind: "continue" };
-				} }, mode === "rights-unowned" ? adaptProcessToolOperations(createLocalBashOperations({ shellPath: external })) : native);
-				expect(await executor.execute(`exec 3<'${input}'; '${descriptorProbe}' ${mode} '${input}'; result=$?; ` +
-					`IFS= read -r -N 1 byte <&3; printf '%s' "$byte"; exit "$result"`)).toEqual({ exitCode: 0 });
-				expect(executor.output, mode).toBe(split ? "c" : imported && !unknown ? "b" : "a"); expect(commit).toHaveBeenCalledTimes(split ? 2 : imported && !unknown ? 1 : 0);
+					return mode === "export" || split || imported ? { descriptorOffsets: snapshot!.map(({ offset, ...descriptor }) =>
+						({ ...descriptor, before: offset, after: Number(offset) + 1, ...(descriptor.type === "pipe" ? { content: Buffer.from(descriptor.queueHex!, "hex") } : {}) })), output: [] } : undefined;
+				}, { executor: mode === "rights-unowned" ? adaptProcessToolOperations(createLocalBashOperations({ shellPath: external })) : native });
+				await executor.verify(`exec 3<'${input}'; '${descriptorProbe}' ${mode} '${input}'; result=$?; IFS= read -r -N 1 byte <&3; printf '%s' "$byte"; exit "$result"`,
+					split ? "c" : imported && !unknown ? "b" : "a", split ? 2 : imported && !unknown ? 1 : 0);
 				if (!["lock", "export", "overlap"].includes(mode)) expect(snapshot?.map(({ fd, alias, owned }) => ({ fd, alias, owned })), mode).toEqual([
 					{ fd: 3, alias: 3, owned: true }, { fd: 65, alias: 3, owned: true }, { fd: 67, alias: imported ? 67 : 3, owned: !unknown },
 					...(shared ? [{ fd: 68, alias: 3, owned: true }] : []),
@@ -1780,19 +1809,13 @@ int main(void) { int status; struct timespec pause = {0, 300000000}; pid_t sibli
 				if (mode === "export") expect(snapshot).toMatchObject([{ fd: 3, owned: false }]);
 				if (mode === "overlap") expect(ownership).toEqual([false, true]);
 			}
-			const piped = held({ descriptors: true, decide: async process => {
-				if (await filesystem.readlink(`/proc/${process.pid}/exe`) !== "/usr/bin/true") return { kind: "continue" };
-				return { kind: "replay", exitCode: 0, output: [{ fd: 1, data: Buffer.alloc(1024 * 1024, "x") }],
-					descriptorOffsets: process.descriptors!.map(({ offset, ...descriptor }) => ({ ...descriptor, before: offset, after: Number(offset) + 1 })), commit: async () => {} };
-			} });
-			expect(await piped.execute(`exec 3<'${input}'; /bin/true | /usr/bin/wc -c; IFS= read -r -N 1 byte <&3; printf '%s' "$byte"`)).toEqual({ exitCode: 0 });
-			expect(piped.output).toBe("1048576\nb");
+			await replay("output pipe", async process => ({ output: [{ fd: 1, data: Buffer.alloc(1024 * 1024, "x") }],
+				descriptorOffsets: process.descriptors!.map(({ offset, ...descriptor }) => ({ ...descriptor, before: offset, after: Number(offset) + 1 })) }))
+				.verify(`exec 3<'${input}'; /bin/true | /usr/bin/wc -c; IFS= read -r -N 1 byte <&3; printf '%s' "$byte"`, "1048576\nb", 1);
 			for (const mode of ["partial", "empty", "flags", "queue-conflict", "contents", "overrun", "stale", "live", "packet", "inspect", "commit-failure", "journal", "journal-conflict", "journal-write-readonly", "journal-shutdown-pipe", "journal-commit-failure"]) {
 				const accepted = ["partial", "empty", "flags", "journal"].includes(mode), journal = mode.startsWith("journal"), failedCommit = mode.endsWith("commit-failure");
 				let descriptors: HeldExecProcess["descriptors"];
-				const commit = vi.fn(async () => { if (failedCommit) throw new Error("pipe commit failure"); });
-				const executor = held({ descriptors: mode === "inspect" ? () => "inspect" : true, decide: async process => {
-					if (await filesystem.readlink(`/proc/${process.pid}/exe`) !== "/usr/bin/true") return { kind: "continue" };
+				const executor = replay(mode, async process => {
 					descriptors = process.descriptors;
 					if (mode === "stale") {
 						const reader = await filesystem.open(`/proc/${process.pid}/fd/0`, "r");
@@ -1805,25 +1828,16 @@ int main(void) { int status; struct timespec pause = {0, 300000000}; pid_t sibli
 							after: journal || mode === "empty" ? 0 : mode === "overrun" ? 7 : mode === "queue-conflict" && fd === 8 ? 2 : 3,
 							...(mode === "flags" && fd !== 8 ? { afterFlags: 2048 } : {}), content: Buffer.from(mode === "empty" ? "" : mode === "contents" ? "xxxxxx" : "abcdef") };
 					}));
-					return { kind: "replay", exitCode: 0, output: [{ fd: 1, data: Buffer.from("replayed:") }], descriptorOffsets, commit,
+					return { descriptorOffsets,
 						...(journal ? { resourceEvents: [{ fd: 3, kind: "peek" as const, data: Buffer.from("abc") }, { fd: 0, kind: mode === "journal-write-readonly" ? "produce" as const : mode === "journal-shutdown-pipe" ? "shutdown" as const : "consume" as const, data: Buffer.from("ab") },
 							{ fd: 8, kind: "consume" as const, data: Buffer.from(mode === "journal-conflict" ? "x" : "c") }] } : {}) };
-				} });
-				const running = executor.execute(`'${descriptorProbe}' pipe ${mode}`);
-				if (failedCommit) await expect(running).rejects.toMatchObject({ disposition: "poisoned" });
-				else {
-					expect(await running, mode).toEqual({ exitCode: 0 });
-					expect(executor.output, mode).toBe(accepted ? `replayed:${mode === "empty" ? "" : "def"}` : mode === "stale" ? "bcdef" : "abcdef");
-				}
-				expect(commit, mode).toHaveBeenCalledTimes(Number(accepted || failedCommit));
+				}, { descriptors: mode === "inspect" ? () => "inspect" : true });
+				await executor.verify(`'${descriptorProbe}' pipe ${mode}`, accepted ? `replayed:${mode === "empty" ? "" : "def"}` : mode === "stale" ? "bcdef" : "abcdef", Number(accepted || failedCommit));
 				if (accepted) expect(descriptors, mode).toMatchObject([{ fd: 0, alias: 0, type: "pipe", owned: true }, { fd: 3, alias: 0, type: "pipe", owned: true }, { fd: 8, alias: 8, type: "pipe", owned: true }]);
 			}
 			for (const orphan of [false, true]) for (const mode of ["messages", "start", "end", "rights", "commit-failure", "cancel"]) {
-				const controller = new AbortController();
 				const pinCounts: number[] = [];
-				const commit = vi.fn(async () => { if (mode === "commit-failure") throw new Error("message commit failure"); });
-				const executor = held({ descriptors: true, decide: async process => {
-					if (await filesystem.readlink(`/proc/${process.pid}/exe`) !== "/usr/bin/true") return { kind: "continue" };
+				const executor = replay(mode, async process => {
 					const descriptorOffsets = process.descriptors!.map(fd => ({ ...fd, before: fd.offset, after: fd.offset,
 						...(fd.queueHex !== undefined ? { content: Buffer.from(fd.queueHex, "hex") } : {}) }));
 					const receiver = descriptorOffsets.find(fd => fd.fd === 3)!;
@@ -1836,16 +1850,10 @@ int main(void) { int status; struct timespec pause = {0, 300000000}; pid_t sibli
 					expect(receiver.messages).toEqual([{ start: 1, end: 3, rights: [reference.fd, 3] }, { start: 3, end: 4, rights: [reference.fd, 3] }]);
 					receiver.messages = receiver.messages!.map((message, index) => index ? message : { ...message,
 						...(mode === "start" ? { start: 0 } : mode === "end" ? { end: 2 } : mode === "rights" ? { rights: [3, reference.fd] } : {}) });
-					if (mode === "cancel") controller.abort();
-					return { kind: "replay", exitCode: 0, output: [{ fd: 1, data: Buffer.from("replayed:") }], descriptorOffsets, commit };
-				} });
-				const running = executor.execute(`'${descriptorProbe}' message '${input}' ${Number(orphan)}`, { signal: controller.signal });
-				if (mode === "commit-failure") await expect(running).rejects.toMatchObject({ disposition: "poisoned" });
-				else if (mode === "cancel") await expect(running).rejects.toThrow();
-				else { expect(await running, mode).toEqual({ exitCode: 0 }); expect(executor.output, mode).toBe(`${mode === "messages" ? "replayed:replayed:" : ""}LqItbcaXYZ`); }
-				expect(commit, mode).toHaveBeenCalledTimes(mode === "messages" ? 2 : Number(mode === "commit-failure"));
+					return { descriptorOffsets };
+				});
+				await executor.verify(`'${descriptorProbe}' message '${input}' ${Number(orphan)}`, `${mode === "messages" ? "replayed:replayed:" : ""}LqItbcaXYZ`, mode === "messages" ? 2 : Number(mode === "commit-failure"));
 				if (pinCounts.length === 2) expect(pinCounts[1]).toBe(pinCounts[0]);
-				if (mode === "cancel" || mode === "commit-failure") expect(executor.output).toBe("");
 			}
 			for (const scenario of ["counter", "value", "identity", "alias", "overflow", "release", "commit-failure",
 				"counter:queued", "counter:other", "counter:local", "counter:partial", "counter:drained", "counter:nested", "counter:external-nested", "counter:external-other", "counter:external-cycle", "counter:discarded", "counter:discard-nested", "counter:discard-cycle", "counter:peer-closed", "file:queued", "file:other", "file:local", "file:partial", "file:drained", "file:nested", "file:external-nested", "file:external-other", "file:external-cycle", "file:discarded", "file:discard-nested", "file:discard-cycle", "file:peer-closed", "socket:queued", "socket:consumed", "socket:external-nested"]) {
@@ -1853,28 +1861,23 @@ int main(void) { int status; struct timespec pause = {0, 300000000}; pid_t sibli
 				const state = [undefined, "queued", "other", "local", "partial", "drained", "consumed", "nested", "external-nested", "external-other", "external-cycle", "discard-nested", "discard-cycle"].indexOf(queue === "discarded" || queue === "peer-closed" ? "drained" : queue), local = state >= 3 && state <= 5 || state >= 11;
 				const accepted = ["counter", "counter:other", "counter:drained", "counter:external-other", "counter:external-cycle", "counter:discarded", "counter:discard-nested", "file:queued", "file:other", "file:drained", "file:nested", "file:external-nested", "file:external-other", "file:external-cycle", "file:discarded", "file:discard-nested"].includes(scenario), outside: number[] = [];
 				const external = !queue || ["queued", "nested", "external-nested"].includes(queue);
-				const commit = vi.fn(async () => { if (mode === "commit-failure") throw new Error("counter commit failure"); });
-				const executor = held({ descriptors: true, decide: async process => {
-					if (await filesystem.readlink(`/proc/${process.pid}/exe`) !== "/usr/bin/true") return { kind: "continue" };
+				const executor = replay(scenario, async process => {
 					const descriptorOffsets = process.descriptors!.filter(fd => fd.fd === 20 || fd.fd === 21 || (local && queue !== "partial" || queue === "nested") && fd.type === "socket").map(fd => {
 						if (fd.fd === 20 || fd.fd === 21) outside.push(fd.outside!);
 						let content = fd.queueHex === undefined ? undefined : Buffer.from(fd.queueHex, "hex");
 						if (fd.counter) { content = Buffer.alloc(9); content.writeBigUInt64LE(BigInt(mode === "value" || mode === "alias" && fd.fd === 21 ? 6 : fd.counter.value)); }
 						return { ...fd, before: fd.offset, after: type === "file" && !fd.type ? 1 : fd.offset, content, ...(fd.counter ? { event: fd.counter.id + (mode === "identity" ? 2 : 1) } : {}) };
 					});
-					if (type === "socket") return { kind: "continue" };
+					if (type === "socket") return;
 					const data = Buffer.alloc(8); data.writeBigUInt64LE(mode === "overflow" ? 0xffffffffffffffffn : 2n);
-					return { kind: "replay", exitCode: 0, output: [], descriptorOffsets, resourceEvents: [
+					return { output: [], descriptorOffsets, resourceEvents: [
 						...(queue === "drained" ? [{ fd: descriptorOffsets.find(fd => fd.messages)?.fd!, kind: "consume" as const, data: Buffer.from("x") }] : []),
 						...descriptorOffsets.filter(fd => queue?.startsWith("discard") ? fd.messages?.length : queue === "peer-closed" && fd.type === "socket" && !fd.messages).map(fd => ({ fd: fd.fd, kind: "release" as const, data: Buffer.from([3]) })),
 						...(type === "counter" ? [{ fd: 21, kind: "produce" as const, data }] : []),
-						...(local || type === "counter" && (mode === "release" || queue) ? [{ fd: 21, kind: "release" as const, data: Buffer.from([3]) }] : [])], commit };
-				} });
-				const running = executor.execute(`exec '${descriptorProbe}' queue ${type} ${state}`);
-				if (mode === "commit-failure") await expect(running).rejects.toMatchObject({ disposition: "poisoned" });
-				else { expect(await running, scenario).toEqual({ exitCode: 0 }); expect(executor.output, scenario).toBe(type === "socket" ? "" : local ? "0" : type === "file" ? external ? "1" : "0" : !queue && accepted ? "7" : "5"); }
+						...(local || type === "counter" && (mode === "release" || queue) ? [{ fd: 21, kind: "release" as const, data: Buffer.from([3]) }] : [])] };
+				});
+				await executor.verify(`exec '${descriptorProbe}' queue ${type} ${state}`, type === "socket" ? "" : local ? "0" : type === "file" ? external ? "1" : "0" : !queue && accepted ? "7" : "5", Number(accepted || mode === "commit-failure"));
 				expect(outside, scenario).toEqual([external ? 3 : 0, external ? 3 : 0]);
-				expect(commit, scenario).toHaveBeenCalledTimes(Number(accepted || mode === "commit-failure"));
 			}
 			for (const mode of ["shared", "unlinked", "offset", "identity", "flags", "closed", "alias-conflict", "invalid", "commit-failure",
 				"null", "null-offset", "null-content", "zero", "status-set", "status-clear", "status-conflict", "status-unsupported", "directory", "directory-offset", "directory-content", "directory-stale", "directory-replaced", "directory-no-path", "opath", "opath-offset", "opath-content", "opath-flags", "directory-opath", "directory-symlink"]) {
@@ -1882,14 +1885,7 @@ int main(void) { int status; struct timespec pause = {0, 300000000}; pid_t sibli
 				const directory = mode.startsWith("directory"), opath = mode.includes("opath"), device = directory || opath || mode.startsWith("null") || mode === "zero";
 				const target = directory ? directoryInput : opath ? input : device ? mode === "zero" ? "/dev/zero" : "/dev/null" : input;
 				const accepted = mode === "shared" || mode === "unlinked" || mode === "null" || mode === "status-set" || mode === "status-clear" || mode === "directory" || mode === "opath" || mode === "opath-content" || mode === "directory-opath";
-				let heldPid = 0;
-				const commit = vi.fn(async () => {
-					expect(await readFile(`/proc/${heldPid}/fdinfo/3`, "utf8")).toMatch(/^pos:\s*0$/m);
-					if (mode === "commit-failure") throw new Error("injected offset commit failure");
-				}), adopted = vi.fn(), settle = vi.fn();
-				const executor = held({ descriptors: directory, decide: async ({ pid, descriptors }) => {
-					if (await filesystem.readlink(`/proc/${pid}/exe`) !== "/usr/bin/true") return { kind: "continue" };
-					heldPid = pid;
+				const executor = replay(mode, async ({ pid, descriptors }) => {
 					const descriptorOffsets = await Promise.all([3, 4, 5].map(async fd => {
 						const info = await filesystem.stat(`/proc/${pid}/fd/${fd}`, { bigint: true });
 						const text = await readFile(`/proc/${pid}/fdinfo/${fd}`, "utf8");
@@ -1913,20 +1909,14 @@ int main(void) { int status; struct timespec pause = {0, 300000000}; pid_t sibli
 					if (mode === "directory-stale") await writeFile(path.join(directoryInput, "created-after-capture"), "");
 					if (mode === "directory-replaced") { await filesystem.rename(directoryInput, `${directoryInput}-old`); await mkdir(directoryInput); }
 					if (mode === "directory-symlink") { await filesystem.rename(directoryInput, `${directoryInput}-target`); await filesystem.symlink(`${directoryInput}-target`, directoryInput); }
-					return { kind: "replay", descriptorOffsets, exitCode: 0, output: [{ fd: 1, data: Buffer.from("replayed:") }], commit, adopted, settle };
-				} });
-				const running = executor.execute(`exec 3<'${target}'; exec 4<&3; exec 5<'${target}'; ${opath ? `'${descriptorProbe}' opath '${target}'` : mode === "status-clear" ? `'${descriptorProbe}' status '${input}'` : "/bin/true"}; ` +
+					return { descriptorOffsets };
+				}, { descriptors: directory, beforeCommit: async ({ pid }) => { expect(await readFile(`/proc/${pid}/fdinfo/3`, "utf8")).toMatch(/^pos:\s*0$/m); } });
+				await executor.verify(`exec 3<'${target}'; exec 4<&3; exec 5<'${target}'; ${opath ? `'${descriptorProbe}' opath '${target}'` : mode === "status-clear" ? `'${descriptorProbe}' status '${input}'` : "/bin/true"}; ` +
 					(mode.startsWith("status-") ? `for fd in 3 4 5; do while read -r key value; do if [[ $key == flags: ]]; then (( (8#$value & 3072) == (${mode === "status-set" ? 3072 : 0} * (fd != 5)) )) || exit 90; fi; done </proc/self/fdinfo/$fd; done; ` : "") +
-					(device ? "printf native" : `IFS= read -r -N 1 a <&4; IFS= read -r -N 1 b <&5; IFS= read -r -N 1 c <&3; printf '%s:%s:%s' "$a" "$b" "$c"`));
-				if (mode === "commit-failure") {
-					await expect(running).rejects.toMatchObject({ disposition: "poisoned" }); expect(executor.output).toBe("");
-				} else {
-					expect(await running).toEqual({ exitCode: 0 });
-					expect(executor.output, mode).toBe(device ? (accepted ? "replayed:native" : "native") : accepted ? "replayed:d:b:e" : "a:a:b");
-				}
-				expect(commit).toHaveBeenCalledTimes(Number(accepted || mode === "commit-failure"));
-				expect(adopted).toHaveBeenCalledTimes(Number(accepted));
-				expect(settle.mock.calls).toEqual([[accepted || mode === "commit-failure"]]);
+					(device ? "printf native" : `IFS= read -r -N 1 a <&4; IFS= read -r -N 1 b <&5; IFS= read -r -N 1 c <&3; printf '%s:%s:%s' "$a" "$b" "$c"`),
+					device ? (accepted ? "replayed:native" : "native") : accepted ? "replayed:d:b:e" : "a:a:b", Number(accepted || mode === "commit-failure"));
+				expect(executor.adopted).toHaveBeenCalledTimes(Number(accepted));
+				expect(executor.settle.mock.calls).toEqual([[accepted || mode === "commit-failure"]]);
 			}
 			for (const killed of [false, true]) {
 				const waiting = deferred(), nativeDone = deferred();
@@ -1967,14 +1957,9 @@ int main(void) { int status; struct timespec pause = {0, 300000000}; pid_t sibli
 				expect(visited).toHaveLength(2);
 				expect(completed.sort(), "every exec image must retain its completion owner through replacement").toEqual(visited.sort());
 			}
-			const committed = vi.fn(async () => { await writeFile(path.join(root, "producer-armed"), "ready"); });
-			const delivery = held({ decide: async process => {
-				if (path.basename(await filesystem.readlink(`/proc/${process.pid}/exe`)) === "true")
-					return { kind: "replay", exitCode: 0, output: [{ fd: 1, data: Buffer.alloc(2 * 1024 * 1024, 97) }], commit: committed };
-				return { kind: "continue" };
-			} });
-			expect(await delivery.execute("/bin/true | (while [[ ! -e producer-armed ]]; do :; done; /usr/bin/wc -c)")).toEqual({ exitCode: 0 });
-			expect(delivery.output).toBe("2097152\n"); expect(committed).toHaveBeenCalledOnce();
+			await replay("delivery", async () => ({ output: [{ fd: 1, data: Buffer.alloc(2 * 1024 * 1024, 97) }] }),
+				{ descriptors: false, beforeCommit: () => writeFile(path.join(root, "producer-armed"), "ready") })
+				.verify("/bin/true | (while [[ ! -e producer-armed ]]; do :; done; /usr/bin/wc -c)", "2097152\n", 1);
 			const actorContext = new AsyncLocalStorage<string>(), execIDs = new Set<string>();
 			for (const disposition of [undefined, "recoverable", "poisoned", "killed"] as const) {
 				const after = path.join(root, `after-${disposition}`);

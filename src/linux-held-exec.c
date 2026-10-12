@@ -20,6 +20,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -382,32 +383,50 @@ static int image_cow(pid_t pid, uint64_t start, size_t length, unsigned char *co
 	}
 	close(fd); return moved == count ? 0 : -1;
 }
-static int image_descriptors(pid_t pid, struct process_image *image) {
-	char path[64], line[256]; snprintf(path, sizeof(path), "/proc/%d/fd", pid);
-	DIR *directory = opendir(path); if (!directory) return -1;
-	struct dirent *entry; int valid = 0;
-	while ((entry = readdir(directory))) {
-		if (*entry->d_name == '.') continue;
-		if (image->fd_count == MAX_HANDLES) goto done;
+static int descriptor_numbers(pid_t pid, int minimum, int *fds, unsigned capacity) {
+	char path[64]; snprintf(path, sizeof(path), "/proc/%ld/fd", (long)pid);
+	DIR *directory = opendir(path);
+	if (!directory) return -1;
+	unsigned count = 0; int error = 0, scanner = pid == getpid() ? dirfd(directory) : -1;
+	for (;;) {
+		errno = 0; struct dirent *entry = readdir(directory);
+		if (!entry) { error = errno; break; }
 		char *end; long fd = strtol(entry->d_name, &end, 10);
-		if (*end || fd < 0 || fd > INT_MAX) goto done;
-		struct stat state; snprintf(path, sizeof(path), "/proc/%d/fd/%ld", pid, fd);
-		if (stat(path, &state) < 0) goto done;
-		unsigned index = image->fd_count++;
-		image->fds[index].fd = (int)fd; image->fds[index].flags = -1; image->fds[index].offset = -1;
-		image->fds[index].device = state.st_dev; image->fds[index].inode = state.st_ino;
-		snprintf(path, sizeof(path), "/proc/%d/fdinfo/%ld", pid, fd); FILE *info = fopen(path, "re"); if (!info) goto done;
-		while (fgets(line, sizeof(line), info)) {
-			unsigned flags; int64_t offset;
-			if (sscanf(line, "flags: %o", &flags) == 1 && flags <= INT_MAX) image->fds[index].flags = (int)flags;
-			if (sscanf(line, "pos: %" SCNd64, &offset) == 1) image->fds[index].offset = offset;
-		}
-		int failed = ferror(info); fclose(info);
-		if (failed || image->fds[index].flags < 0 || image->fds[index].offset < 0) goto done;
+		if (!*entry->d_name || *end || fd < minimum || fd > INT_MAX || fd == scanner) continue;
+		if (count == capacity) { error = E2BIG; break; }
+		fds[count++] = (int)fd;
 	}
-	valid = 1;
-done:
-	closedir(directory); return valid ? 0 : -1;
+	closedir(directory);
+	if (error) errno = error;
+	return error ? -1 : (int)count;
+}
+
+/* Read installed state, never a tracee's mutable result/control buffer. */
+static int descriptor_info(pid_t pid, int fd, int64_t *position) {
+	char name[64], line[256]; unsigned flags; int result = -1; int64_t offset = -1;
+	snprintf(name, sizeof(name), "/proc/%ld/fdinfo/%d", (long)pid, fd);
+	FILE *file = fopen(name, "re"); if (!file) return -1;
+	while (fgets(line, sizeof(line), file)) {
+		if (sscanf(line, "flags: %o", &flags) == 1 && flags <= INT_MAX) result = (int)flags;
+		if (position) sscanf(line, "pos: %" SCNd64, &offset);
+	}
+	int failed = ferror(file); fclose(file);
+	if (position) *position = offset;
+	return failed || (position && offset < 0) ? -1 : result;
+}
+
+static int image_descriptors(pid_t pid, struct process_image *image) {
+	int fds[MAX_HANDLES], count = descriptor_numbers(pid, 0, fds, MAX_HANDLES - image->fd_count);
+	if (count < 0) return -1;
+	for (int i = 0; i < count; i++) {
+		char path[64]; struct stat state; snprintf(path, sizeof(path), "/proc/%d/fd/%d", pid, fds[i]);
+		if (stat(path, &state) < 0) return -1;
+		unsigned index = image->fd_count++;
+		image->fds[index].fd = fds[i]; image->fds[index].flags = descriptor_info(pid, fds[i], &image->fds[index].offset);
+		image->fds[index].device = state.st_dev; image->fds[index].inode = state.st_ino;
+		if (image->fds[index].flags < 0) return -1;
+	}
+	return 0;
 }
 
 /* Called by the already authorized strace owner; no new ptracer exception or
@@ -588,37 +607,90 @@ fail:
 	return -1;
 }
 
-/* Duplicate from the original OFDs before replacing any slot, so cycles retain
- * identity. Qualification uses the same pinned OFDs in a disposable child. */
+static int duplicate_tracee_fd(struct decision_job *job, unsigned fd) {
+	#if defined(SYS_pidfd_open) && defined(SYS_pidfd_getfd)
+	if (job->pidfd < 0) job->pidfd = (int)syscall(SYS_pidfd_open, job->pid, 0);
+	/* Both syscalls return CLOEXEC handles; one process pin serves the entire held decision. */
+	if (job->pidfd >= 0) return (int)syscall(SYS_pidfd_getfd, job->pidfd, fd, 0);
+	#endif
+	return -1;
+}
+
+static const struct file_position *resource_position(const struct decision_job *job, int source) {
+	for (unsigned p = 0; p < job->position_count; p++) if (job->positions[p].descriptor == source) return &job->positions[p];
+	return NULL;
+}
+
+/* Transfer the verified OFDs themselves, including queued-only sources. Both
+ * qualification and restoration use this channel; it never reopens a pathname. */
+static int image_sources(pid_t pid, struct decision_job *job, int *sources) {
+	if (!job->position_count) return 0;
+	struct image_message {
+		struct msghdr message; struct iovec vector;
+		union { struct cmsghdr alignment; unsigned char bytes[CMSG_SPACE(MAX_POSITIONS * sizeof(int))]; } control;
+		char byte;
+	} packet = {0};
+	_Static_assert(sizeof(packet) <= 4096, "image transfer fits in scratch page");
+	const unsigned long address = IMAGE_SCRATCH + 4096;
+	struct decision_job target = {.pid = pid, .pidfd = -1};
+	int channel[2] = {-1, -1}, sender = -1, result = -1;
+	if (image_syscall(pid, SYS_socketpair, AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0, address, 0, 0, 0) < 0 ||
+		image_memory(pid, address, channel, sizeof(channel), 0) < 0 || (sender = duplicate_tracee_fd(&target, (unsigned)channel[1])) < 0) goto done;
+	packet.vector = (struct iovec){.iov_base = &packet.byte, .iov_len = 1};
+	packet.message = (struct msghdr){.msg_iov = &packet.vector, .msg_iovlen = 1, .msg_control = packet.control.bytes,
+		.msg_controllen = CMSG_SPACE(job->position_count * sizeof(int))};
+	struct cmsghdr *header = CMSG_FIRSTHDR(&packet.message);
+	header->cmsg_level = SOL_SOCKET; header->cmsg_type = SCM_RIGHTS; header->cmsg_len = CMSG_LEN(job->position_count * sizeof(int));
+	for (unsigned p = 0; p < job->position_count; p++) ((int *)CMSG_DATA(header))[p] = job->positions[p].duplicate;
+	if (sendmsg(sender, &packet.message, MSG_DONTWAIT | MSG_NOSIGNAL) != 1) goto done;
+	packet.message.msg_iov = (void *)(address + offsetof(struct image_message, vector));
+	packet.vector.iov_base = (void *)(address + offsetof(struct image_message, byte));
+	packet.message.msg_control = (void *)(address + offsetof(struct image_message, control));
+	memset(&packet.control, 0, sizeof(packet.control));
+	if (image_memory(pid, address, &packet, sizeof(packet), 1) < 0 ||
+		image_syscall(pid, SYS_recvmsg, channel[0], address, MSG_DONTWAIT | MSG_CMSG_CLOEXEC, 0, 0, 0, 1) < 0 ||
+		image_memory(pid, address, &packet, sizeof(packet), 0) < 0) goto done;
+	header = (struct cmsghdr *)packet.control.bytes;
+	if (packet.byte || (packet.message.msg_flags & (MSG_CTRUNC | MSG_TRUNC | MSG_OOB)) ||
+		packet.message.msg_controllen != CMSG_SPACE(job->position_count * sizeof(int)) || header->cmsg_level != SOL_SOCKET ||
+		header->cmsg_type != SCM_RIGHTS || header->cmsg_len != CMSG_LEN(job->position_count * sizeof(int))) goto done;
+	for (unsigned p = 0; p < job->position_count; p++) {
+		sources[p] = ((int *)CMSG_DATA(header))[p];
+		if (sources[p] < 0 || syscall(SYS_kcmp, pid, getpid(), KCMP_FILE, sources[p], job->positions[p].duplicate) != 0) goto done;
+	}
+	result = 0;
+done:
+	close(sender); close(target.pidfd);
+	for (unsigned end = 0; end < 2; end++) if (channel[end] >= 0 && image_syscall(pid, SYS_close, channel[end], 0, 0, 0, 0, 0, 0) < 0) result = -1;
+	return result;
+}
+
+/* Pin every source before replacing any slot, so aliases and cycles retain identity. */
 static int image_handles(pid_t pid, struct decision_job *job) {
-	struct process_image *image = job->image, *current = image_new();
-	int result = -1, minimum = 3;
+	struct process_image *image = job->image;
+	int current[MAX_HANDLES], count = descriptor_numbers(pid, 0, current, MAX_HANDLES), minimum = 3, sources[MAX_POSITIONS];
 	long pins[MAX_HANDLES];
-	if (!current || image_descriptors(pid, current) < 0) goto done;
-	for (unsigned i = 0; i < current->fd_count; i++) if (current->fds[i].fd >= minimum) minimum = current->fds[i].fd + 1;
+	if (count < 0 || image_sources(pid, job, sources) < 0) return -1;
+	for (int i = 0; i < count; i++) if (current[i] >= minimum) minimum = current[i] + 1;
 	for (unsigned i = 0; i < image->fd_count; i++) if (image->fds[i].fd >= minimum) minimum = image->fds[i].fd + 1;
 	for (unsigned i = 0; i < image->fd_count; i++) {
 		int source = image->fds[i].source;
-		if (pid != job->pid && source >= 3) {
-			unsigned p = 0;
-			while (p < job->position_count && job->positions[p].descriptor != source) p++;
-			if (p == job->position_count) goto done;
-			source = job->positions[p].duplicate;
-		}
-		if (image_call(pid, IMAGE_SCRATCH, SYS_fcntl, source, F_DUPFD_CLOEXEC, minimum, 0, 0, 0, &pins[i]) < 0 || pins[i] < minimum || pins[i] >= INT_MAX) goto done;
+		const struct file_position *position = resource_position(job, source);
+		if (position) source = sources[position - job->positions];
+		else if (source >= 3) return -1;
+		if (image_call(pid, IMAGE_SCRATCH, SYS_fcntl, source, F_DUPFD_CLOEXEC, minimum, 0, 0, 0, &pins[i]) < 0 || pins[i] < minimum || pins[i] >= INT_MAX) return -1;
 		minimum = (int)pins[i] + 1;
 	}
+	for (unsigned p = 0; p < job->position_count; p++) if (image_syscall(pid, SYS_close, sources[p], 0, 0, 0, 0, 0, 0) < 0) return -1;
 	for (unsigned i = 0; i < image->fd_count; i++) if (image_syscall(pid, SYS_dup3, (unsigned long)pins[i], image->fds[i].fd,
-		image->fds[i].flags & O_CLOEXEC, 0, 0, 0, image->fds[i].fd) < 0) goto done;
-	for (unsigned i = 0; i < current->fd_count; i++) {
+		image->fds[i].flags & O_CLOEXEC, 0, 0, 0, image->fds[i].fd) < 0) return -1;
+	for (int i = 0; i < count; i++) {
 		unsigned next = 0;
-		while (next < image->fd_count && image->fds[next].fd != current->fds[i].fd) next++;
-		if (next == image->fd_count && image_syscall(pid, SYS_close, current->fds[i].fd, 0, 0, 0, 0, 0, 0) < 0) goto done;
+		while (next < image->fd_count && image->fds[next].fd != current[i]) next++;
+		if (next == image->fd_count && image_syscall(pid, SYS_close, current[i], 0, 0, 0, 0, 0, 0) < 0) return -1;
 	}
-	for (unsigned i = 0; i < image->fd_count; i++) if (image_syscall(pid, SYS_close, (unsigned long)pins[i], 0, 0, 0, 0, 0, 0) < 0) goto done;
-	result = 0;
-done:
-	image_free(current); return result;
+	for (unsigned i = 0; i < image->fd_count; i++) if (image_syscall(pid, SYS_close, (unsigned long)pins[i], 0, 0, 0, 0, 0, 0) < 0) return -1;
+	return 0;
 }
 static int image_restore(pid_t pid, struct decision_job *job) {
 	struct process_image *image = job->image;
@@ -722,24 +794,13 @@ static int has_unmodeled_descriptors(int minimum) {
 	for (int fd = 0; fd < 3; fd++) {
 		if (fcntl(fd, F_GETFD) < 0) return errno == EBADF ? 1 : -1;
 	}
-	DIR *directory = opendir("/proc/self/fd");
-	if (!directory) return -1;
-	int scan_fd = dirfd(directory), found = 0, saved = 0;
-	struct dirent *entry;
-	for (;;) {
-		errno = 0;
-		entry = readdir(directory);
-		if (!entry) { saved = errno; break; }
-		char *end;
-		long fd = strtol(entry->d_name, &end, 10);
-		if (!*entry->d_name || *end || fd < minimum || fd == scan_fd) continue;
-		errno = 0;
-		if (fcntl((int)fd, F_GETFD) >= 0) { found = 1; break; }
-		if (errno != EBADF) { saved = errno; break; }
+	int fds[MAX_HANDLES], count = descriptor_numbers(getpid(), minimum, fds, MAX_HANDLES);
+	if (count < 0) return errno == E2BIG ? 1 : -1;
+	for (int index = 0; index < count; index++) {
+		if (fcntl(fds[index], F_GETFD) >= 0) return 1;
+		if (errno != EBADF) return -1;
 	}
-	closedir(directory);
-	if (saved) { errno = saved; return -1; }
-	return found;
+	return 0;
 }
 
 static int mapped_image(char *image, size_t capacity) {
@@ -820,34 +881,24 @@ static int raw_context(FILE *out) {
  * Anything else stays unmodeled and the image runs native in place. */
 static int pipe_bytes(int fd, unsigned char **bytes, int *eof);
 static int own_pipe_descriptors(FILE *out) {
-	DIR *directory = opendir("/proc/self/fd");
-	if (!directory) return -1;
-	int fds[MAX_HANDLES], count = 0, scan = dirfd(directory), result = -1;
-	for (struct dirent *entry; (entry = readdir(directory));) {
-		char *end; long fd = strtol(entry->d_name, &end, 10);
-		if (!*entry->d_name || *end || fd < 3 || fd == scan) continue;
-		if (count == MAX_HANDLES) goto done;
-		fds[count++] = (int)fd;
-	}
+	int fds[MAX_HANDLES], count = descriptor_numbers(getpid(), 3, fds, MAX_HANDLES);
+	if (count < 0) return -1;
 	for (int index = 0; index < count; index++) {
 		struct stat state, other_state; int flags = fcntl(fds[index], F_GETFL), capacity = fcntl(fds[index], F_GETPIPE_SZ), eof = 0, alias = fds[index], reader = -1;
 		unsigned char *bytes = NULL;
-		if (fstat(fds[index], &state) < 0 || !S_ISFIFO(state.st_mode) || flags < 0 || capacity <= 0) goto done;
+		if (fstat(fds[index], &state) < 0 || !S_ISFIFO(state.st_mode) || flags < 0 || capacity <= 0) return -1;
 		for (int other = 0; other < index; other++) if (syscall(SYS_kcmp, getpid(), getpid(), KCMP_FILE, fds[index], fds[other]) == 0) { alias = fds[other]; break; }
 		/* The queue is read through an end this process already holds: reopening a writer for reading would widen its access. */
 		for (int other = 0; other < count && reader < 0; other++)
 			if ((fcntl(fds[other], F_GETFL) & O_ACCMODE) != O_WRONLY && fstat(fds[other], &other_state) == 0 && other_state.st_dev == state.st_dev && other_state.st_ino == state.st_ino) reader = fds[other];
 		int length = reader < 0 ? -1 : pipe_bytes(reader, &bytes, &eof);
-		if (length < 0) goto done;
+		if (length < 0) return -1;
 		fprintf(out, "%s{\"fd\":%d,\"alias\":%d,\"device\":\"%ju\",\"inode\":\"%ju\",\"flags\":%d,\"capacity\":%d,\"eof\":%s,\"queueHex\":\"",
 			index ? "," : "", fds[index], alias, (uintmax_t)state.st_dev, (uintmax_t)state.st_ino, flags, capacity, eof ? "true" : "false");
 		for (int byte = 0; byte < length; byte++) fprintf(out, "%02x", bytes[byte]);
 		fputs("\"}", out); free(bytes);
 	}
-	result = count;
-done:
-	closedir(directory);
-	return result;
+	return count;
 }
 
 static int broker_request(FILE *out, const char *token, const char *invoked, int argc, char **argv, const char *descriptors) {
@@ -1008,15 +1059,6 @@ static int probe_context(const char *root, const char *script) {
 	return valid ? 0 : 70;
 }
 
-static int duplicate_tracee_fd(struct decision_job *job, unsigned fd) {
-	#if defined(SYS_pidfd_open) && defined(SYS_pidfd_getfd)
-	if (job->pidfd < 0) job->pidfd = (int)syscall(SYS_pidfd_open, job->pid, 0);
-	/* Both syscalls return CLOEXEC handles; one process pin serves the entire held decision. */
-	if (job->pidfd >= 0) return (int)syscall(SYS_pidfd_getfd, job->pidfd, fd, 0);
-	#endif
-	return -1;
-}
-
 static struct descriptor_origin descriptor_origin(struct traced_process *process, int fd) {
 	for (unsigned index = 0; process->table && index < process->table->count; index++)
 		if (process->table->entries[index].fd == fd) return process->table->entries[index];
@@ -1032,33 +1074,6 @@ static void set_descriptor_origin(struct traced_process *process, struct descrip
 	if (!entry.id) return;
 	if (table->count == sizeof(table->entries) / sizeof(table->entries[0])) { domain->escaped = 1; return; }
 	table->entries[table->count++] = entry;
-}
-
-static int descriptor_numbers(pid_t pid, int *fds, unsigned capacity) {
-	char path[64]; snprintf(path, sizeof(path), "/proc/%ld/fd", (long)pid);
-	DIR *directory = opendir(path);
-	if (!directory) return -1;
-	unsigned count = 0; int error = 0;
-	for (;;) {
-		errno = 0; struct dirent *entry = readdir(directory);
-		if (!entry) { error = errno; break; }
-		char *end; long fd = strtol(entry->d_name, &end, 10);
-		if (!*entry->d_name || *end || fd < 0 || fd > INT_MAX) continue;
-		if (count == capacity) { error = E2BIG; break; }
-		fds[count++] = (int)fd;
-	}
-	closedir(directory);
-	return error ? -1 : (int)count;
-}
-
-/* Read installed flags, never a tracee's mutable result/control buffer. */
-static int descriptor_flags(pid_t pid, int fd) {
-	char name[64], line[256]; unsigned flags; int result = -1;
-	snprintf(name, sizeof(name), "/proc/%ld/fdinfo/%d", (long)pid, fd);
-	FILE *file = fopen(name, "re");
-	while (file && fgets(line, sizeof(line), file)) if (sscanf(line, "flags: %o", &flags) == 1) { result = (int)flags; break; }
-	if (file) fclose(file);
-	return result;
 }
 
 /* fdinfo identifies locks owned by this OFD. Process-owned locks remain a separate
@@ -1174,7 +1189,7 @@ static struct resource_object *pin_object(struct descriptor_domain *domain, int 
 
 static struct descriptor_origin created_origin(struct traced_process *process, struct descriptor_domain *domain,
 	int fd, int cloexec, int pipe, unsigned long channel) {
-	int flags = descriptor_flags(process->pid, fd);
+	int flags = descriptor_info(process->pid, fd, NULL);
 	if (flags < 0) domain->incomplete = 1;
 	struct descriptor_origin origin = {.fd = fd, .cloexec = cloexec, .id = ++domain->next,
 		.object = remember_object(domain, process->pid, fd, 0), .access = flags < 0 ? 3 : (flags & O_ACCMODE) + 1};
@@ -1187,7 +1202,7 @@ static struct descriptor_origin created_origin(struct traced_process *process, s
  * a fresh OFD node only when every external import is accounted for and the
  * object has exclusively internal ancestry. No kernel reference is retained. */
 static struct descriptor_origin received_origin(struct traced_process *process, struct descriptor_domain *domain, int fd) {
-	int flags = descriptor_flags(process->pid, fd);
+	int flags = descriptor_info(process->pid, fd, NULL);
 	if (flags >= 0) for (struct traced_process *source = *domain->processes; source; source = source->next) {
 		if (source->historical || !source->table || source->table->active) continue;
 		for (unsigned index = 0; index < source->table->count; index++) {
@@ -1246,7 +1261,7 @@ static int observe_descriptor_syscall(struct traced_process *process, struct des
 	if (!process->table && !(process->table = copy_descriptor_table(NULL))) return -1;
 	struct descriptor_table *table = process->table;
 	if (!domain->initialized) {
-		int fds[MAX_HANDLES], count = descriptor_numbers(pid, fds, MAX_HANDLES);
+		int fds[MAX_HANDLES], count = descriptor_numbers(pid, 0, fds, MAX_HANDLES);
 		domain->initialized = 1;
 		if (count < 0) domain->incomplete = 1;
 		for (int index = 0; index < count; index++) (void)remember_object(domain, pid, fds[index], 1);
@@ -1299,7 +1314,7 @@ static int observe_descriptor_syscall(struct traced_process *process, struct des
 		if (number == SYS_close) set_descriptor_origin(process, domain, (struct descriptor_origin){.fd = (int)first});
 		if ((number == SYS_dup2 || number == SYS_dup3) && first != second)
 			set_descriptor_origin(process, domain, (struct descriptor_origin){.fd = (int)second});
-		if (pair || receiving) process->descriptor_count = descriptor_numbers(pid, process->descriptors, MAX_HANDLES);
+		if (pair || receiving) process->descriptor_count = descriptor_numbers(pid, 0, process->descriptors, MAX_HANDLES);
 	}
 	if (info.op != PTRACE_SYSCALL_INFO_EXIT) return 0;
 	if (process->uncertain) {
@@ -1328,7 +1343,7 @@ static int observe_descriptor_syscall(struct traced_process *process, struct des
 	struct descriptor_origin source = descriptor_origin(process, (int)first);
 	int fd = (int)info.exit.rval;
 	if (pair || receiving) {
-		int installed[MAX_HANDLES], count = descriptor_numbers(pid, installed, MAX_HANDLES), added = 0;
+		int installed[MAX_HANDLES], count = descriptor_numbers(pid, 0, installed, MAX_HANDLES), added = 0;
 		if (count < 0 || process->descriptor_count < 0) return 0;
 		for (int index = 0; index < count; index++) {
 			int previous = 0;
@@ -1365,7 +1380,7 @@ static int observe_descriptor_syscall(struct traced_process *process, struct des
 		if (object && number == SYS_memfd_create) object->anonymous = 1;
 		set_descriptor_origin(process, domain, origin);
 	} else if (number == SYS_openat2) {
-		int flags = descriptor_flags(pid, fd);
+		int flags = descriptor_info(pid, fd, NULL);
 		if (flags >= 0) set_descriptor_origin(process, domain, created_origin(process, domain, fd, (flags & O_CLOEXEC) != 0, 0, 0));
 	}
 	return 0;
@@ -1691,7 +1706,7 @@ static int walk_process_list(int (*walk)(struct decision_job *, int), struct dec
 }
 
 static int process_descriptors(struct traced_process *process, int tracked, int *fds) {
-	if (!tracked) return descriptor_numbers(process->pid, fds, MAX_HANDLES);
+	if (!tracked) return descriptor_numbers(process->pid, 0, fds, MAX_HANDLES);
 	if (!process->table || !process->table->complete || process->table->active) return -1;
 	for (unsigned index = 0; index < process->table->count; index++) fds[index] = process->table->entries[index].fd;
 	return (int)process->table->count;
@@ -1720,7 +1735,7 @@ static int queue_owners_locked(struct decision_job *job) {
 				snprintf(name, sizeof(name), "/proc/%ld/fd/%d", (long)process->pid, fds[index]);
 				if (stat(name, &state) < 0) return -1;
 				if (!S_ISFIFO(state.st_mode) && !S_ISSOCK(state.st_mode)) continue;
-				if (add_reference(job, &state, descriptor_flags(process->pid, fds[index]), -1) < 0) return -1;
+				if (add_reference(job, &state, descriptor_info(process->pid, fds[index], NULL), -1) < 0) return -1;
 			}
 			if (!S_ISSOCK(state.st_mode) || represented_queue(job, state.st_dev, state.st_ino)) continue;
 			struct decision_job source = {.pid = process->pid, .pidfd = -1};
@@ -1827,7 +1842,7 @@ fail:
 /* The entire owned tree is stopped until this job retires. Capture the reachable
  * closure before calculating external owners, including rooted queue cycles. */
 static int descriptor_context(struct decision_job *job, char *line, size_t capacity) {
-	int installed[MAX_HANDLES], total = descriptor_numbers(job->pid, installed, MAX_HANDLES), next = 3;
+	int installed[MAX_HANDLES], total = descriptor_numbers(job->pid, 0, installed, MAX_HANDLES), next = 3;
 	if (total < 0 || !(job->captures = calloc(MAX_POSITIONS, sizeof(*job->captures)))) return -1;
 	for (int index = 0; index < total; index++) {
 		int descriptor = installed[index];
@@ -2017,9 +2032,8 @@ static int position_state_matches(const struct file_position *position, const st
 			const struct queue_message *actual = &messages.entries[message], *expected = &position->messages.entries[message];
 			matches = !position->after && actual->start == expected->start && actual->end == expected->end && actual->rights.count == expected->rights.count;
 			for (unsigned right = 0; matches && right < actual->rights.count; right++) {
-				unsigned other = 0;
-				while (other < job->position_count && job->positions[other].descriptor != expected->rights.fds[right]) other++;
-				matches = other < job->position_count && syscall(SYS_kcmp, getpid(), getpid(), KCMP_FILE, actual->rights.fds[right], job->positions[other].duplicate) == 0;
+				const struct file_position *other = resource_position(job, expected->rights.fds[right]);
+				matches = other && syscall(SYS_kcmp, getpid(), getpid(), KCMP_FILE, actual->rights.fds[right], other->duplicate) == 0;
 			}
 		}
 		close_messages(&messages);
@@ -2225,10 +2239,9 @@ static int resource_events(struct decision_job *job, int apply) {
 			struct control_message *control = &messages[message_count++];
 			control->object = (int)index; control->start = captured->start; control->end = captured->end; control->count = captured->rights.count;
 			for (unsigned right = 0; right < control->count; right++) {
-				unsigned other = 0;
-				while (other < job->position_count && job->positions[other].descriptor != captured->rights.fds[right]) other++;
-				if (other == job->position_count) goto done;
-				control->rights[right] = other;
+				const struct file_position *other = resource_position(job, captured->rights.fds[right]);
+				if (!other) goto done;
+				control->rights[right] = (unsigned)(other - job->positions);
 			}
 		}
 		if (position->event) {
@@ -2258,9 +2271,9 @@ static int resource_events(struct decision_job *job, int apply) {
 			memcpy(&right_count, event->data, 4);
 			if (right_count > MAX_POSITIONS || event->length < 4 + 4 * right_count) goto done;
 			for (unsigned right = 0; right < right_count; right++) {
-				unsigned fd; memcpy(&fd, event->data + 4 + 4 * right, 4); rights[right] = 0;
-				while (rights[right] < job->position_count && job->positions[rights[right]].descriptor != (int)fd) rights[right]++;
-				if (rights[right] == job->position_count) goto done;
+				unsigned fd; memcpy(&fd, event->data + 4 + 4 * right, 4);
+				const struct file_position *other = resource_position(job, (int)fd); if (!other) goto done;
+				rights[right] = (unsigned)(other - job->positions);
 			}
 			decoded.kind -= 8; decoded.data += 4 + 4 * right_count; decoded.length -= 4 + 4 * right_count;
 		}
@@ -2268,14 +2281,12 @@ static int resource_events(struct decision_job *job, int apply) {
 			unsigned fd;
 			if (event->length < 4) goto done;
 			memcpy(&fd, event->data, 4);
-			for (unsigned other = 0; other < job->position_count; other++) if (job->positions[other].descriptor == (int)fd) source = (int)other;
-			if (source < 0) goto done;
+			const struct file_position *other = resource_position(job, (int)fd); if (!other) goto done;
+			source = (int)(other - job->positions);
 			decoded.kind = 2; decoded.data += 4; decoded.length -= 4;
 		}
-		unsigned handle = 0;
-		while (handle < job->position_count && job->positions[handle].descriptor != (int)event->fd) handle++;
-		if (handle == job->position_count) goto done;
-		const struct file_position *position = &job->positions[handle];
+		const struct file_position *position = resource_position(job, (int)event->fd); if (!position) goto done;
+		unsigned handle = (unsigned)(position - job->positions);
 		if (event->kind == 4) {
 			if (event->length != 1 || !event->data[0] || event->data[0] > 3 || ((!position->stream || position->event) && event->data[0] != 3)) goto done;
 			for (unsigned cursor = 0; cursor < message_count; cursor++) if (messages[cursor].object != -1)
@@ -2515,47 +2526,50 @@ done:
 
 /* A nonnegative return keeps the connection until the continued tracee exits. */
 static int image_context(struct decision_job *job) {
-	struct process_image *current = image_new();
-	if (!current) return -1;
+	int current[MAX_HANDLES], count = descriptor_numbers(job->pid, 0, current, MAX_HANDLES);
 	unsigned long call = job->image->header.registers.rax, descriptor = job->image->header.registers.rdi;
-	int valid = image_descriptors(job->pid, current) == 0 && job->process->table &&
+	int valid = count >= 0 && job->process->table &&
 		job->process->table->references == 1 && !job->process->table->active;
 	int input = pi_process_image_frontier(call) == 2 || ((descriptor == 1 || descriptor == 2) &&
 		(call == SYS_write || call == SYS_writev || call == SYS_sendto || call == SYS_sendmsg));
-	for (unsigned i = 0; valid && i < current->fd_count; i++) {
-		if (current->fds[i].fd < 3) continue;
-		unsigned p = 0;
-		while (p < job->position_count && (!job->positions[p].installed || job->positions[p].descriptor != current->fds[i].fd)) p++;
-		valid = p < job->position_count;
+	for (int i = 0; valid && i < count; i++) {
+		if (current[i] < 3) continue;
+		const struct file_position *position = resource_position(job, current[i]);
+		valid = position && position->installed;
 	}
 	for (unsigned i = 0; valid && i < job->image->fd_count; i++) {
 		int source = job->image->fds[i].source, fd = job->image->fds[i].fd;
-		unsigned original = 0;
-		while (original < current->fd_count && current->fds[original].fd != source) original++;
-		if (original == current->fd_count) { valid = 0; break; }
 		for (unsigned previous = 0; previous < i; previous++) if (job->image->fds[previous].fd == fd) valid = 0;
-		struct file_position *position = NULL;
-		for (unsigned p = 0; p < job->position_count; p++) if (job->positions[p].installed && job->positions[p].descriptor == source) position = &job->positions[p];
+		const struct file_position *position = resource_position(job, source);
 		if (position) {
 			valid &= (job->image->fds[i].flags & ~O_CLOEXEC) == position->after_flags &&
 				job->image->fds[i].offset == (position->stream ? 0 : position->after);
 			if ((unsigned long)fd == descriptor) input = 1;
-		} else valid &= fd < 3 && source == fd && job->image->fds[i].flags == current->fds[original].flags;
+		} else valid &= fd < 3 && source == fd && job->image->fds[i].flags == descriptor_info(job->pid, fd, NULL);
 	}
-	image_free(current);
 	return valid && input && image_status(job->pid, 1) == 0 && image_qualify(job) == 0 ? 0 : -1;
 }
 
-static void image_descriptor_table(struct decision_job *job) {
+static int image_descriptor_table(struct decision_job *job) {
 	struct descriptor_table *table = job->process->table;
-	struct descriptor_origin final[MAX_HANDLES]; unsigned count = 0;
-	for (unsigned i = 0; i < job->image->fd_count; i++) for (unsigned old = 0; old < table->count; old++)
-		if (table->entries[old].fd == job->image->fds[i].source) {
-			final[count] = table->entries[old]; final[count].fd = job->image->fds[i].fd;
-			final[count++].cloexec = !!(job->image->fds[i].flags & O_CLOEXEC); break;
+	struct descriptor_origin final[MAX_HANDLES] = {0}; unsigned count = 0;
+	for (unsigned i = 0; i < job->image->fd_count; i++) {
+		int source = job->image->fds[i].source;
+		final[i] = descriptor_origin(job->process, source);
+		const struct file_position *position = resource_position(job, source);
+		if (position && !position->installed) {
+			struct resource_object *object = pin_object(job->domain, position->duplicate);
+			if (!object || !object->internal || object->foreign) return -1;
+			final[i] = (struct descriptor_origin){.id = ++job->domain->next,
+				.object = (unsigned)(object - job->domain->objects) + 1, .access = (position->after_flags & O_ACCMODE) + 1};
+			for (unsigned previous = 0; previous < i; previous++) if (job->image->fds[previous].source == source) final[i].id = final[previous].id;
 		}
-	memcpy(table->entries, final, count * sizeof(*final)); table->count = count;
+		final[i].fd = job->image->fds[i].fd; final[i].cloexec = !!(job->image->fds[i].flags & O_CLOEXEC);
+	}
+	for (unsigned i = 0; i < job->image->fd_count; i++) if (final[i].id) table->entries[count++] = final[i];
+	table->count = count;
 	job->process->call_epoch = ++table->epoch; table->generation++;
+	return 0;
 }
 
 static void release_position_fds(struct decision_job *job) {
@@ -2936,7 +2950,7 @@ static int trace(char **command, const char *socket_path, const char *token, con
 					int stopped;
 					reply = ptrace(PTRACE_SYSCALL, item->pid, 0, 0) == 0 && image_wait(item->pid, &stopped) == 0 &&
 						WSTOPSIG(stopped) == (SIGTRAP | 0x80) && image_restore(item->pid, job) == 0 ? 'Y' : 'N';
-					if (reply == 'Y') image_descriptor_table(job);
+					if (reply == 'Y' && image_descriptor_table(job) < 0) reply = 'N';
 				} else if (code == 256 && descriptors && item->armed) {
 					item->pending = 0; if (barrier == item->pid) barrier = 0;
 					reply = 'Y';
