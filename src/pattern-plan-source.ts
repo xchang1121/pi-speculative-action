@@ -141,10 +141,11 @@ export function createPatternPlanSource({
 		...(typeof input.operation === "string" ? { operation: input.operation } : {}),
 	});
 	const predictedEvent = (startInput: AgentStartInput, action: Pick<SpeculativeCandidate, "key" | "input">,
-		output: ToolSettlement, durationMs: number): PatternAwareEventInput => ({
-		sessionID: startInput.sessionID, turnID: startInput.turnID,
-		...eventData(action.key.tool, action.input, output, durationMs), schemaHash: action.key.schemaHash, learnTarget: false,
-	});
+		output: ToolSettlement, durationMs: number): PatternAwareEventInput => {
+		if (!action.key) throw new Error("prediction_key_required");
+		return { sessionID: startInput.sessionID, turnID: startInput.turnID,
+			...eventData(action.key.tool, action.input, output, durationMs), schemaHash: action.key.schemaHash, learnTarget: false };
+	};
 	const resourcePath = (target: string) => patternActionSemantics.actionKey("read", { path: target })?.resources[0];
 	const currentOperation = (binding: ExecutionOperationBinding) => binding.available !== false &&
 		binding.preparation === "current_workspace" && !binding.fed && typeof binding.stale === "function";
@@ -235,7 +236,7 @@ export function createPatternPlanSource({
 	const source: AgentPlanSource = {
 		id: "pattern_aware",
 		enabled: (settings) => !lifecycle.sealed && sourceSettings(settings).enabled,
-		observesOperations: action => actionSemantics.definition(action)?.requirements.capabilities.includes("invocation.process") === true,
+		observesOperations: true,
 		multiStepEnabled: (settings) => sourceSettings(settings).multiStepEnabled,
 		requestLifetime: "actor_decision",
 		propose: ({ startInput, data, settings, signal }) => admit(settings, async (patternSettings, rerunState) => {

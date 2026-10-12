@@ -21,23 +21,28 @@ test.for(["actor", "preview", "dynamic", "dynamic-preview", "hints", "hints-prev
 	"seed-dynamic", "seed-dynamic-preview", "seed-calculation", "seed-calculation-preview", "seed-stale", "seed-binding", "seed-calculation-key", "seed-unbounded", "seed-repeat", "seed-revoke",
 	"mixed-producer", "mixed-consumer", "mixed-stale", "mixed-failure", "mixed-budget", "mixed-outside", "mixed-revoke", "mixed-overlap", "mixed-cancel", "mixed-unkeyed", "mixed-binding-unkeyed",
 	...["read", "names"].flatMap(input => ["", "-preview", "-stale", "-copy", "-change", "-budget", "-outside", "-unkeyed"].map(suffix => `input-${input}${suffix}`)),
-	"input-read-range", "input-read-cancel", "input-read-failure"])("shares actual inputs across independently formatted tools (%s)", async scenario => {
-	const mode = scenario.replace(/^seed-/, ""), direct = mode.startsWith("input-"), listing = mode.startsWith("input-names"), changes = mode.endsWith("change"), range = mode.endsWith("range");
-	const seeded = scenario.startsWith("seed-") || direct && !mode.endsWith("preview") || ["mixed-producer", "mixed-budget", "mixed-outside"].includes(mode), bound = seeded || direct || mode.startsWith("mixed");
+	"input-read-range", "input-read-cancel", "input-read-failure", "unregistered-dynamic", "unregistered-mixed-producer", "late-dynamic",
+	...["dynamic", "dynamic-preview", "calculation", "calculation-preview", "calculation-unrelated", "calculation-key", "stale", "binding", "retired", "unbounded", "repeat", "revoke", "rejected-capture", "rejected-branch",
+		"mixed-producer", "mixed-consumer", "mixed-stale", "mixed-failure", "mixed-budget", "mixed-outside", "mixed-revoke", "mixed-overlap", "mixed-cancel", "mixed-unkeyed",
+		...["read", "names"].flatMap(input => ["", "-stale", "-copy", "-change", "-budget", "-outside", "-unkeyed"].map(suffix => `input-${input}${suffix}`)),
+		"input-read-range", "input-read-cancel", "input-read-failure"].map(mode => `unkeyed-${mode}`)])("shares actual inputs across independently formatted tools (%s)", async scenario => {
+	const mode = scenario.replace(/^(seed|unkeyed|unregistered|late)-/, ""), direct = mode.startsWith("input-"), listing = mode.startsWith("input-names"), changes = mode.endsWith("change"), range = mode.endsWith("range");
+	const unkeyed = /^(unkeyed|unregistered|late)-/.test(scenario), unknown = scenario.startsWith("unregistered-");
+	const seeded = unkeyed || scenario.startsWith("seed-") || direct && !mode.endsWith("preview") || ["mixed-producer", "mixed-budget", "mixed-outside"].includes(mode), bound = seeded || direct || mode.startsWith("mixed");
 	const cwd = await directories.create(), file = path.join(mode.endsWith("outside") ? await directories.create() : cwd, "input.txt"), shared = {};
 	await writeFile(file, "one\ntwo\n"); if (listing) await writeFile(path.join(path.dirname(file), "second.txt"), "");
-	let builds = 0, renders = 0, disposed = 0, effects = 0, borrowers = 0, revoke: (() => void | Promise<void>) | undefined;
+	let builds = 0, renders = 0, disposed = 0, effects = 0, borrowers = 0, bindings = 0, revoke: (() => void | Promise<void>) | undefined;
 	const pure = mode.startsWith("calculation"), unrelated = mode.includes("unrelated") || mode.startsWith("calculation-hint");
 	const stale = mode.endsWith("stale"), cancelled = mode.endsWith("cancel"), overlap = mode === "mixed-cancel" || mode === "mixed-overlap", failed = mode.endsWith("failure");
-	const unavailable = mode.endsWith("budget") || mode.endsWith("outside"), mutates = (index: number) => (direct || mode.startsWith("mixed")) && index === Number(mode !== "mixed-producer");
+	const unavailable = mode.endsWith("budget") || mode.endsWith("outside") || mode.startsWith("rejected"), mutates = (index: number) => (direct || mode.startsWith("mixed")) && index === Number(mode !== "mixed-producer");
 	const entered = deferred(), joined = deferred(), release = deferred(), controller = new AbortController(), actors: Promise<unknown>[] = [];
 	const names = ["count_records", "summarize_records", "other_records"], read = PI_ACTION_SEMANTICS.definition("read")!;
 	const definitions = names.map((tool, index) => ({ ...read, ...(mutates(index) ? PI_ACTION_SEMANTICS.definition("write") :
 		mode === "unbounded" && !index ? PI_ACTION_SEMANTICS.definition("bash") : {}), tool, epoch: `custom:${tool}`, projectors: [],
 		resourceScope: mutates(index) || mode === "unbounded" && !index ? undefined : "captured_inputs" as const,
-		canonicalize: (input: unknown, cwd: string) => { const key = !(index && mode.endsWith("unkeyed")) && read.canonicalize(input, cwd); return key ? { ...key,
+		canonicalize: (input: unknown, cwd: string) => { const key = !(index ? mode.endsWith("unkeyed") : unkeyed) && read.canonicalize(input, cwd); return key ? { ...key,
 			resources: pure || index && mode.startsWith("dynamic") ? [] : index && mode.startsWith("hints") ? ["selector"] : key.resources } : undefined; } }));
-	const actionSemantics = new ActionSemanticsRegistry(definitions), settings = { drafterEnabled: false };
+	const actionSemantics = new ActionSemanticsRegistry(unknown ? definitions.slice(1) : definitions), settings = { drafterEnabled: false };
 	const render = (tool: string, count: number) => { renders++; return { content: [{ type: "text" as const, text: `${tool}:${count}` }], details: { tool } }; };
 	const count = async (read: () => Promise<Buffer | string>) => { const text = pure ? "one\ntwo\n" : await read(); builds++; return text.toString().trim().split("\n").length; };
 	const tools = names.map(name => ({ ...createReadTool(cwd), name, execute: async () => render(name, await count(() => readFile(file))) }));
@@ -63,19 +68,26 @@ test.for(["actor", "preview", "dynamic", "dynamic-preview", "hints", "hints-prev
 				mode === "calculation-key" && index ? "next" : "lines:v1", build, consume, mode.startsWith("calculation-hint") ? path.join(cwd, `hint-${index}`) : pure ? undefined : file, request.signal) };
 		};
 		const binding = bound ? bindResourceOperation(execute, cwd) : { filesystem: execute, filesystemRoot: cwd };
-		return [tool, { executor: `custom:${tool}`, identity: { tool }, semantics: definitions[index], ...binding,
+		return [tool, { executor: `custom:${tool}`, identity: { tool }, semantics: unknown && !index ? undefined : definitions[index], ...binding,
 			...(binding.captureInputs ? { captureInputs: (...args: Parameters<NonNullable<typeof binding.captureInputs>>) => { const capture = binding.captureInputs!(...args); revoke = capture.dispose; return capture; } } : {}) }];
 	}));
-	const f = systemHost(cwd, tools, { actionSemantics, resolveInvocation: tool => invocations.get(tool),
+	const world = createResourceSnapshotExecutionWorld(actionSemantics, { maxBytes: () => mode.endsWith("budget") ? 64 : 1024 * 1024 });
+	if (mode.startsWith("rejected")) { const capture = world.observation!.capture;
+		Object.assign(world.observation!, { capture: async (context: Parameters<typeof capture>[0]) => {
+			const result = await capture(context);
+			return mode === "rejected-capture" ? { ...result, inputsOnly: undefined } : { ...result, seal: async (output: Parameters<typeof result.seal>[0]) => ({ ...await result.seal(output), inputsOnly: undefined }) };
+		} }); }
+	const f = systemHost(cwd, tools, { actionSemantics, resolveInvocation: tool => { if (tool === names[0]) bindings++; return invocations.get(tool); },
 		complete: async () => fauxAssistantMessage(fauxToolCall("speculative_workflow", { steps: [{ tool: names[unrelated ? 2 : 1], input: { path: "input.txt" } }] }), { stopReason: "toolUse" }),
-		executionWorlds: [createResourceSnapshotExecutionWorld(actionSemantics, { maxBytes: () => mode.endsWith("budget") ? 64 : 1024 * 1024 })] }, settings);
+		executionWorlds: [world] }, settings);
 	try {
-		await f.start();
+		const late = scenario.startsWith("late-") ? tools.shift() : undefined; await f.start(); if (late) tools.unshift(late);
 		if (seeded) await f.execute(names[0]!, { path: "input.txt" }); else { await f.preview(names[0]!, { path: "input.txt" }); await f.ready(); }
+		if (unkeyed) { expect(bindings).toBe(1); expect(f.events.find(event => event.type === "actor_action")).toMatchObject({ settlement: { provider: { kind: "actor", cause: { code: "action_not_keyable" } } } }); }
 		expect({ builds, renders }).toEqual({ builds: 1, renders: 1 });
 		if (mode.startsWith("retired") || mode === "predicted") { await f.finish(); tools.shift(); settings.drafterEnabled = mode === "predicted"; await f.start("consumer"); }
 		if (mode === "predicted") await f.ready(2);
-		if (unrelated) { await f.finish(); settings.drafterEnabled = true; await f.start("unrelated"); await f.ready(2); await f.finish(); settings.drafterEnabled = false; await f.start("consumer"); }
+		if (unrelated) { await f.finish(); settings.drafterEnabled = true; await f.start("unrelated"); await f.ready(seeded ? 1 : 2); await f.finish(); settings.drafterEnabled = false; await f.start("consumer"); }
 		if (mode.endsWith("preview") && !direct) { await f.preview(names[1]!, { path: "input.txt" }); await expect.poll(() => renders).toBe(unrelated ? 3 : 2); }
 		if (stale) await writeFile(listing ? path.join(path.dirname(file), "third.txt") : file, "one\ntwo\nthree\n");
 		const result = f.execute(names[1]!, { path: "input.txt" }, controller.signal); actors.push(result); void result.catch(() => {});
@@ -88,7 +100,7 @@ test.for(["actor", "preview", "dynamic", "dynamic-preview", "hints", "hints-prev
 		else expect(await result).toEqual({ content: [{ type: "text", text: `summarize_records:${stale || changes ? 3 : range ? 1 : 2}` }], details: { tool: names[1] } });
 		expect({ builds, renders, effects }).toEqual({ builds: (direct || stale || unavailable || mode.includes("binding") || mode === "calculation-key" || mode === "revoke" ? 2 : 1) + Number(unrelated) - Number(direct && cancelled),
 			renders: 2 + Number(mode === "stale") + Number(unrelated) + Number(overlap) - Number(failed || cancelled), effects: Number(direct || mode.startsWith("mixed")) + Number(changes) + Number(overlap && !cancelled) - Number(direct && cancelled) });
-		expect(f.fallbacks).toEqual([...(seeded ? [names[0]!] : []), ...(mutates(1) || mode === "revoke" ? Array(1 + Number(overlap)).fill(names[1]!) : [])]);
+		expect(f.fallbacks).toEqual([...(seeded ? [names[0]!] : []), ...(mutates(1) || mode === "revoke" || mode.startsWith("rejected") ? Array(1 + Number(overlap)).fill(names[1]!) : [])]);
 		if (direct && cancelled) await expect(readFile(path.join(cwd, `${names[1]}.txt`))).rejects.toMatchObject({ code: "ENOENT" });
 		else if (direct || mode.startsWith("mixed")) expect(await readFile(path.join(cwd, `${names[Number(mode !== "mixed-producer")]}.txt`), "utf8")).toBe(String(stale || changes ? 3 : range ? 1 : 2));
 		await f.finish();

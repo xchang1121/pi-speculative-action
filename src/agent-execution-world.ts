@@ -29,7 +29,8 @@ export type SpeculativeToolExecutionContext = Parameters<NonNullable<WorldBranch
 	readonly parentCheckpoint?: WorldCheckpoint;
 };
 
-export type AgentExecutionWorld = ExecutionWorld<SpeculativeToolExecutionContext, ToolSettlement>;
+export type ActorToolExecutionContext = Omit<SpeculativeToolExecutionContext, "action"> & { readonly action?: ActionKey; readonly executionContext?: ToolInvocation };
+export type AgentExecutionWorld = ExecutionWorld<SpeculativeToolExecutionContext, ToolSettlement, ActorToolExecutionContext>;
 export type SpeculativeAgentExecutionWorld = AgentExecutionWorld & Required<Pick<AgentExecutionWorld, "speculation">>;
 
 /** Observe Actor reads; only explicitly bound operations may execute ahead over sealed resource data. */
@@ -52,14 +53,14 @@ export function createResourceSnapshotExecutionWorld(
 		scope: "fallback",
 		isolation: "resource_snapshot",
 		observation: { ...route, capabilities: [...(canObserve ? route.capabilities : []), ...(operations ? WORKSPACE_PATH_MUTATION_EFFECTS.capabilities : [])],
-			inputsOnly: request => !!operations && !!((request.action?.executionContext as ToolInvocation | undefined)?.captureInputs ||
-				process.platform === "linux" && (request.action?.executionContext as ToolInvocation | undefined)?.process),
+			inputsOnly: request => { const invocation = (request.executionContext ?? request.action?.executionContext) as ToolInvocation | undefined;
+				return !!operations && !!(invocation?.captureInputs || process.platform === "linux" && invocation?.process); },
 			diagnostics: () => canObserve ? route.diagnostics() : { state: operations ? "ready" : "unavailable", detail: "Explicit input and computation bindings are available; host read windows remain unproven on Windows" },
 			capture: async (context) => {
-				const invocation = context.action.executionContext as ToolInvocation | undefined;
+				const invocation = context.executionContext ?? context.action?.executionContext as ToolInvocation | undefined;
 				if (operations && invocation?.captureInputs) return invocation.captureInputs(context.action, operations.maxBytes(), context.callID);
 				const inputsOnly = process.platform === "linux" && !!operations && !!invocation?.process;
-				if (!inputsOnly && (!canObserve || actionSemantics.definition(context.action)?.effect !== "observation")) throw new Error("Actor input capture requires an explicit binding");
+				if (!inputsOnly && (!context.action || !canObserve || actionSemantics.definition(context.action)?.effect !== "observation")) throw new Error("Actor input capture requires an explicit binding");
 				const root = inputsOnly ? invocation?.filesystemRoot ?? context.cwd : context.cwd;
 				const version = await captureResourceVersion(inputsOnly ? undefined : context.action, root, actionSemantics, operations && (inputsOnly || invocation?.filesystem) ? operations.maxBytes() : undefined);
 				return resourceCapture([version], context.action, actionSemantics, inputsOnly, inputsOnly ? undefined : async () => {
@@ -179,12 +180,12 @@ export async function createCommittedResourceInputs(
 }
 
 function resourceSnapshotBranch(
-	output: ToolSettlement, versions: readonly ResourceVersionToken[], action: ActionKey, semantics: ActionSemanticsRegistry,
+	output: ToolSettlement, versions: readonly ResourceVersionToken[], action: ActionKey | undefined, semantics: ActionSemanticsRegistry,
 	inputsOnly = false,
 ): WorldBranch<ToolSettlement> {
 	// Input revocation releases data, not the old result's immutable freshness evidence.
 	const version = versions[0]!, proofBytes = resourceProofBytes(versions);
-	const { executionFingerprint } = action;
+	const executionFingerprint = action?.executionFingerprint;
 	const inputSource = Object.freeze({});
 	resourceVersions.set(inputSource, versions);
 	let owned: readonly ResourceVersionToken[] | undefined = versions;
@@ -202,7 +203,8 @@ function resourceSnapshotBranch(
 		reconstructionScope: "current_action",
 		get capturedBytes() { return versions.reduce((bytes, token) => bytes + (token.view?.bytes ?? 0), proofBytes); },
 		executionMetrics: Object.freeze({}),
-		compatibility: Object.freeze({ status: "compatible", backend: "resource_version", executionFingerprint }),
+		compatibility: Object.freeze(executionFingerprint === undefined ? { status: "indeterminate", backend: "resource_version", code: "input_only_capture" }
+			: { status: "compatible", backend: "resource_version", executionFingerprint }),
 		validate: async () => {
 			const { expired, reason, changed, ...metrics } = await validateResourceInputs(owned);
 			return expired ? { status: "stale", cause: cause("freshness", reason ?? "resource_changed"), metrics,
@@ -238,7 +240,7 @@ async function validateResourceInputs(tokens?: readonly ResourceVersionToken[], 
 }
 
 /** One transfer boundary for observed windows, native inputs and explicit Actor preparations. */
-function resourceCapture(versions: ResourceVersionToken[], action: ActionKey, semantics: ActionSemanticsRegistry, inputsOnly = false,
+function resourceCapture(versions: ResourceVersionToken[], action: ActionKey | undefined, semantics: ActionSemanticsRegistry, inputsOnly = false,
 	beforeSeal?: () => Promise<void>, close?: () => void): WorldResultCapture<ToolSettlement> {
 	const inputSource = Object.freeze({}); let open = true, sealing = false;
 	resourceVersions.set(inputSource, versions);

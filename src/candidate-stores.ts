@@ -7,7 +7,7 @@ import { type ActionKey, type ActionKeyMatch, type ActionKeyProjector,
 
 export interface CandidateStoreEntry {
 	readonly id: string;
-	readonly key: ActionKey;
+	readonly key?: ActionKey;
 	readonly estimatedBytes: number;
 }
 
@@ -55,7 +55,7 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 	}
 
 	insert(scope: Scope, entry: Entry): Entry | undefined {
-		return this.get(scope, entry.id) ?? this.add(scope, entry, actionKeyProjectionPartitions(entry.key, this.projectors));
+		return this.get(scope, entry.id) ?? this.add(scope, entry, entry.key ? actionKeyProjectionPartitions(entry.key, this.projectors) : []);
 	}
 
 	/** Observe before yielding: a later producer or sealed view may satisfy an existing consumer. */
@@ -243,7 +243,7 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 		for (const indexed of candidates) {
 			if (this.record(scope, indexed.entry) !== indexed) continue;
 			const coverage = requireCoverage?.(indexed.entry) ?? false;
-			const match = actionKeyMatch(indexed.entry.key, action, this.projectors, coverage) ??
+			const match = (indexed.entry.key && actionKeyMatch(indexed.entry.key, action, this.projectors, coverage)) ??
 				(!coverage && (inputs.has(indexed) || views?.has(indexed))
 					? { kind: "inputs" as const, distance: Number.MAX_SAFE_INTEGER - 1024 + Math.min(inputs.get(indexed) ?? 0, 1024) } : undefined);
 			if (match) ranked.push({ entry: indexed.entry, match, indexed });
@@ -257,7 +257,7 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 		const state: IndexedScope<Entry> = this.scopes.get(scope) ?? { entries: new Map(), pending: new Set(), exact: new Map(), partitions: new Map() };
 		const existing = state.entries.get(entry.id);
 		if (existing) return existing.entry;
-		const memberships = [[state.exact, entry.key.key] as const, ...partitions.map((key) => [state.partitions, key] as const)];
+		const memberships = [...(entry.key ? [[state.exact, entry.key.key] as const] : []), ...partitions.map((key) => [state.partitions, key] as const)];
 		const indexed: IndexedEntry<Entry> = { entry, memberships, recency: this.sequence++ };
 		state.entries.set(entry.id, indexed);
 		state.pending.add(indexed);

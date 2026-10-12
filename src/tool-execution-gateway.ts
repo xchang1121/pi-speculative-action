@@ -51,13 +51,13 @@ export interface AuthoritativeExecutionHooks<Output> {
  * supplied executor. Speculative calls fork an execution world. Keeping both paths here creates
  * one structural seam for effect transactions, provenance certificates, and persistent reuse.
  */
-export class ToolExecutionGateway<Context, Output> extends ExecutionWorldRouter<Context, Output> {
+export class ToolExecutionGateway<Context, Output, ObservationContext = Context> extends ExecutionWorldRouter<Context, Output, ObservationContext> {
 	private readonly transactions = new EffectTransactionCoordinator<Output>();
 
 	override async captureAuthoritativeResult(
 		request: ExecutionWorldRequest & { readonly callID?: string },
 		preparation: ExecutionWorldPreparation,
-		context: Context,
+		context: ObservationContext,
 	): Promise<CapturedExecutionWorldResult<Output> | undefined> {
 		const captured = await super.captureAuthoritativeResult(request, preparation, context);
 		return captured && Object.freeze({ route: captured.route, capture: this.transactions.capture(

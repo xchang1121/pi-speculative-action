@@ -786,7 +786,7 @@ int main(int argc, char **argv) {
 		} finally { observing.mockRestore(); inspecting.mockRestore(); await host?.dispose(); await fixture.dispose(); }
 	});
 
-nativeTest("transfers native Bash FD inputs to filesystem tools across turns with exact invalidation", { timeout: 30_000 }, async ({ skip, benchmark }) => {
+nativeTest.for([false, true])("transfers native Bash FD inputs to filesystem tools across turns with exact invalidation (unkeyed=%s)", { timeout: 30_000 }, async (unkeyed, { skip, benchmark }) => {
 		const fixture = await benchmark("pi-native-resource-inputs-");
 		let host: ReturnType<typeof createSpeculativeActionHost> | undefined;
 		const search = await createClosedSearchProfile(fixture.workspace);
@@ -804,8 +804,10 @@ int main(void) { char b[1024]; return syscall(SYS_getdents64, 4, b, sizeof(b)) <
 			const prepared = patternProcessHost(fixture, "native-inputs", { tools: tools.map(tool => tool.name), resourceCacheMaxEntries: 8,
 				resourceCacheMaxBytes: 1024 * 1024, patternAware: patternAwareSettings({ enabled: true, multiStepEnabled: false }) }, {
 				executionWorlds: [fixture.world, createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { maxBytes: () => 1024 * 1024 })],
-				resolveInvocation: (tool, input) => search.invocations.get(tool) ?? resolvePiToolInvocation(tool, input,
-					{ cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath }),
+				resolveInvocation: (tool, input) => {
+					const invocation = search.invocations.get(tool) ?? resolvePiToolInvocation(tool, input, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath });
+					return unkeyed && tool === "bash" ? { ...invocation!, semantics: { ...PI_ACTION_SEMANTICS.definition("bash")!, canonicalize: () => undefined } } : invocation;
+				},
 			}, tools), { events, start } = prepared;
 			host = prepared.host;
 			const command = "exec 3<input.txt 4<entries; worker; worker", bash = vi.fn(() => fixture.coordinator.runWith({ execute: request => route.executor.execute({ ...request,
@@ -814,6 +816,7 @@ int main(void) { char b[1024]; return syscall(SYS_getdents64, 4, b, sizeof(b)) <
 			expect((await host.execute({ turnID: "seed", id: "seed", tool: "bash", args: { command }, tools }, undefined, bash)).content)
 				.toEqual([{ type: "text", text: "one\ntwo\none\ntwo\n" }]);
 			await host.finishTurn("seed"); expect(bash).toHaveBeenCalledOnce();
+			if (unkeyed) expect(events.find(event => event.type === "actor_action")).toMatchObject({ settlement: { provider: { kind: "actor", cause: { code: "action_not_keyable" } } } });
 			await start("queries");
 			for (const [tool, args] of [["read", { path: "input.txt", offset: 2 }], ["grep", { path: "input.txt", pattern: "two" }],
 				["ls", { path: "entries" }], ["find", { path: "entries", pattern: "*.txt" }]] as const) {

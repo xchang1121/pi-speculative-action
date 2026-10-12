@@ -61,7 +61,7 @@ export interface ToolInvocation {
 	/** Explicit selected Actor semantics; the host invokes this inside its original execution callback. */
 	readonly authoritative?: (request: Parameters<NonNullable<ToolInvocation["filesystem"]>>[1]) => Promise<ToolSettlement>;
 	/** Arm bounded input and pure-computation retention in the selected Actor executor, without replaying effects. */
-	readonly captureInputs?: (action: ActionKey, maxBytes: number, callID: string) => WorldResultCapture<ToolSettlement>;
+	readonly captureInputs?: (action: ActionKey | undefined, maxBytes: number, callID: string) => WorldResultCapture<ToolSettlement>;
 	/** Explicit trusted operation binding; never permission to call the supplied host tool. */
 	readonly filesystem?: (
 		view: ToolFilesystemOperations,

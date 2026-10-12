@@ -10,7 +10,7 @@ export {
 	type SpeculativeAgentSettingsInput,
 	type SpeculativeToolExecutionInput,
 } from "./agent-integration.ts";
-export { bindResourceOperation, createResourceSnapshotExecutionWorld, type AgentExecutionWorld, type SpeculativeAgentExecutionWorld, type SpeculativeToolExecutionContext } from "./agent-execution-world.ts";
+export { bindResourceOperation, createResourceSnapshotExecutionWorld, type AgentExecutionWorld, type SpeculativeAgentExecutionWorld, type SpeculativeToolExecutionContext, type ActorToolExecutionContext } from "./agent-execution-world.ts";
 export { createLinuxProcessExecutionWorld, type LinuxProcessExecutionWorldOptions } from "./linux-process-world.ts";
 export { LinuxProcessReuseBackend, type LinuxProcessBackendOptions, type LinuxProcessBackendStatus, type LinuxProcessSession } from "./linux-process-backend.ts";
 export { adaptProcessToolOperations, ProcessExecutionCoordinator, type ProcessExecutionRequest, type ProcessExecutionResult, type ProcessExecutor, type ProcessToolOperations } from "./process-execution.ts";

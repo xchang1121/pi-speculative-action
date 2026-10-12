@@ -35,6 +35,7 @@ import { immutableSnapshot, isImmutableSnapshot } from "./stable-json.ts";
 import type { ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
 import { ToolExecutionGateway, type ToolOperation } from "./tool-execution-gateway.ts";
 import { createSystemResourceMonitor, type ExecutionResourceMonitor } from "./system-resources.ts";
+import { UNRESTRICTED_PROCESS_EFFECTS } from "./effect-model.ts";
 
 const ACTOR_OPERATION = Symbol("actor-operation");
 const RAW_ACTOR_CALL = Symbol("raw-actor-call");
@@ -272,16 +273,16 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 			});
 		},
 		resolveExecution: ({ tool, action, signal }) => resolveExecutionRoute(tool, signal, action),
-		captureAuthoritativeResult: async ({ startInput, data, tool: toolName, concrete, action, callID, signal }) => {
-			const tool = data.tools.get(toolName);
+		captureAuthoritativeResult: async ({ startInput, consumeInput, tool: toolName, concrete, action, callID, signal }) => {
+			const tool = consumeInput.tools.find(tool => tool.name === toolName);
 			if (!tool) return undefined;
-			const definition = actionSemantics.definition(action);
-			if (!definition) return undefined;
+			const invocation = (await (consumeInput as BoundActorCall)[ACTOR_OPERATION]?.())?.invocation ?? action?.executionContext as ToolInvocation | undefined;
+			const definition = invocation?.semantics ?? actionSemantics.definition(action ?? toolName);
 			const captured = await executionGateway.captureAuthoritativeResult(
-				{ tool: toolName, callID, action, effect: definition.effect, requirements: definition.requirements },
+				{ tool: toolName, callID, action, executionContext: invocation, effect: definition?.effect ?? "unbounded", requirements: definition?.requirements ?? UNRESTRICTED_PROCESS_EFFECTS },
 				{ cwd: options.cwd, signal },
 				{
-					cwd: options.cwd, tool, toolName, args: concrete, action, callID, signal,
+					cwd: options.cwd, tool, toolName, args: concrete, action, executionContext: invocation, callID, signal,
 					executionScope: { sessionID: startInput.sessionID, turnID: startInput.turnID },
 				},
 			);

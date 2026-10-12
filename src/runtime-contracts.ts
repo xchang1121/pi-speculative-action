@@ -39,7 +39,7 @@ export type CandidatePreflight =
 /** Read-only execution view passed to host callbacks. Prediction facts are supplied separately. */
 export interface SpeculativeCandidate extends Pick<PlanAction, "tool" | "empiricalProbability" | "adoptionProbability" | "conditionalProbability" | "depth"> {
 	readonly id: string;
-	readonly key: ActionKey;
+	readonly key?: ActionKey;
 	readonly input: Readonly<Record<string, unknown>>;
 	readonly work?: { readonly execution?: { readonly executionMs?: number } };
 	readonly source?: string;
@@ -94,7 +94,7 @@ export interface PredictionFeedback<SessionID> extends TurnIdentity<SessionID> {
 }
 
 /** The concrete Actor action represented by an `actor_adopted` continuation output. */
-export type AdoptedAction = Pick<SpeculativeCandidate, "key" | "input">;
+export type AdoptedAction = Required<Pick<SpeculativeCandidate, "key" | "input">>;
 
 export interface TurnInput<SessionID> { readonly sessionID: SessionID; readonly turnID: string; readonly terminal?: boolean; }
 
@@ -173,7 +173,7 @@ export interface SpeculativePlanSource<
 		readonly trigger: "execution_succeeded" | "actor_adopted";
 	}) => boolean);
 	/** Request scoped OS launch observations; this grants neither execution nor result-reuse authority. */
-	readonly observesOperations?: (action: ActionKey) => boolean;
+	readonly observesOperations?: boolean;
 	readonly observe?: (input: RuntimeTurnContext<StartInput, StateData> & {
 		readonly consumeInput: ConsumeInput;
 		readonly action?: ActionKey;
@@ -235,7 +235,8 @@ export interface SpeculativeActionRuntimeAdapter<
 		Omit<BoundCandidateCall, "route" | "callID" | "index">) => MaybePromise<SpeculativeExecutionRoute | undefined>;
 	/** Snapshot freshness before fallback execution; this callback must never execute the tool. */
 	readonly captureAuthoritativeResult?: (input: RuntimeTurnContext<StartInput, StateData> &
-		Omit<BoundCandidateCall, "candidate" | "route" | "index"> & {
+		Omit<BoundCandidateCall, "candidate" | "route" | "index" | "action"> & {
+		readonly action?: ActionKey;
 		readonly consumeInput: ConsumeInput;
 	}) => MaybePromise<AuthoritativeResultCapture<Output> | undefined>;
 	readonly actual: (input: ConsumeInput) => ActualToolCall;

@@ -27,6 +27,8 @@ export interface ExecutionWorldRequest {
 	readonly tool?: string;
 	/** Present for concrete candidates; omitted for best-effort turn warm-up. */
 	readonly action?: ActionKey;
+	/** Selected Actor executor, independent of whole-call reuse identity. */
+	readonly executionContext?: unknown;
 }
 
 /** One resolved execution capability. Absence of a route means speculation is blocked. */
@@ -298,13 +300,13 @@ export interface ExecutionWorldObservation<Context, Output> extends ExecutionWor
 	readonly capture: (context: Context) => Promise<WorldResultCapture<Output>>;
 }
 
-interface ExecutionWorldLifecycle<Context, Output> {
+interface ExecutionWorldLifecycle<Context, Output, ObservationContext> {
 	readonly id: string;
 	/** Optional persistent storage capability, independent from tool or action syntax. */
 	readonly storage?: ExecutionWorldStorageControl;
 	/** Pre-Actor execution and Actor-authorized observation deliberately have independent authority. */
 	readonly speculation?: ExecutionWorldSpeculation<Context, Output>;
-	readonly observation?: ExecutionWorldObservation<Context, Output>;
+	readonly observation?: ExecutionWorldObservation<ObservationContext, Output>;
 	/** Observe proven internal work inside exactly one native Actor call; never seals its whole result. */
 	readonly observeOperations?: <Value>(request: { readonly action: ActionKey | undefined; readonly scope: ExecutionScope; readonly learn?: boolean; readonly inputs?: (path?: string) => Iterable<object> },
 		execute: () => Promise<Value>, observe: (bindings: readonly ExecutionOperationBinding[], computations?: readonly TimelineDependency[]) => void) => Promise<Value>;
@@ -317,7 +319,7 @@ interface ExecutionWorldLifecycle<Context, Output> {
 }
 
 /** Source-independent lifecycle for isolating, sealing, and committing speculative effects. */
-export type ExecutionWorld<Context, Output> = ExecutionWorldLifecycle<Context, Output> &
+export type ExecutionWorld<Context, Output, ObservationContext = Context> = ExecutionWorldLifecycle<Context, Output, ObservationContext> &
 	(
 		| {
 				/** A runtime world is preferred when its advertised guarantees cover the operation. */
@@ -332,13 +334,13 @@ export type ExecutionWorld<Context, Output> = ExecutionWorldLifecycle<Context, O
 	);
 
 /** The only authority allowed to resolve, prepare, fork, and dispose speculative tool execution. */
-export class ExecutionWorldRouter<Context, Output> {
+export class ExecutionWorldRouter<Context, Output, ObservationContext = Context> {
 	protected readonly lifecycle: RuntimeLifecycleLane;
 	private readonly speculationEnabled: (backend: string) => boolean;
-	private readonly worldsByID = new Map<string, ExecutionWorld<Context, Output>>();
+	private readonly worldsByID = new Map<string, ExecutionWorld<Context, Output, ObservationContext>>();
 	private readonly routeObservations = new Map<string, ExecutionWorldDiagnosticReport & { readonly cwd: string }>();
 
-	constructor(worlds: readonly ExecutionWorld<Context, Output>[], speculationEnabled: (backend: string) => boolean = () => true,
+	constructor(worlds: readonly ExecutionWorld<Context, Output, ObservationContext>[], speculationEnabled: (backend: string) => boolean = () => true,
 		lifecycle = new RuntimeLifecycleLane()) {
 		this.lifecycle = lifecycle;
 		this.speculationEnabled = speculationEnabled;
@@ -382,7 +384,7 @@ export class ExecutionWorldRouter<Context, Output> {
 	async captureAuthoritativeResult(
 		request: ExecutionWorldRequest,
 		preparation: ExecutionWorldPreparation,
-		context: Context,
+		context: ObservationContext,
 	): Promise<CapturedExecutionWorldResult<Output> | undefined> {
 		return this.lifecycle.admit(() => this.select(
 			"observation",
@@ -390,7 +392,7 @@ export class ExecutionWorldRouter<Context, Output> {
 			preparation,
 			async (world, route) => {
 				const capture = await world.observation!.capture(context);
-				if (!effectCapabilitiesCover(world.observation!.capabilities, request.requirements) && !capture.inputsOnly) {
+				if ((!request.action || !effectCapabilitiesCover(world.observation!.capabilities, request.requirements)) && !capture.inputsOnly) {
 					await capture.dispose(); throw new Error("input_only_capture_required");
 				}
 				return Object.freeze({ route: capture.inputsOnly ? Object.freeze({ ...route, reuse: "shared_result" as const }) : route, capture });
@@ -427,7 +429,7 @@ export class ExecutionWorldRouter<Context, Output> {
 		));
 	}
 
-	private world(route: SpeculativeExecutionRoute): ExecutionWorld<Context, Output> {
+	private world(route: SpeculativeExecutionRoute): ExecutionWorld<Context, Output, ObservationContext> {
 		const world = this.worldsByID.get(route.backend);
 		if (!world || world.scope !== route.scope || world.isolation !== route.isolation) {
 			throw new Error(`Execution world ${route.backend} is unavailable for ${route.isolation}`);
@@ -440,7 +442,7 @@ export class ExecutionWorldRouter<Context, Output> {
 		request: ExecutionWorldRequest,
 		preparation: ExecutionWorldPreparation,
 		select: (
-			world: ExecutionWorld<Context, Output>,
+			world: ExecutionWorld<Context, Output, ObservationContext>,
 			route: SpeculativeExecutionRoute,
 		) => Selected | undefined | Promise<Selected | undefined>,
 	): Promise<Selected | undefined> {
