@@ -142,7 +142,7 @@ export async function forkReusableBash(fixture: Pick<LinuxProcessBenchmark, "wor
 	if (!invocation) throw new Error("Pi Bash invocation could not be materialized");
 	const action = PI_ACTION_SEMANTICS.buildKey("bash", args, fixture.workspace, input.actionNamespace, { fingerprint: input.executionFingerprint, context: invocation });
 	if (!action) throw new Error("Pi Bash action could not be keyed");
-	return fixture.world.speculation.execute({
+	const branch = await fixture.world.speculation.execute({
 		cwd: fixture.workspace,
 		tool: fixture.tool,
 		toolName: "bash",
@@ -152,6 +152,8 @@ export async function forkReusableBash(fixture: Pick<LinuxProcessBenchmark, "wor
 		signal: input.signal ?? new AbortController().signal,
 		executionScope: input.executionScope ?? { sessionID: "benchmark", turnID: "benchmark" },
 	});
+	if (branch.inputsOnly) { await branch.dispose(); throw new Error("Bash fork must produce its tool result"); }
+	return branch;
 }
 
 export async function compileBenchmarkHelper(

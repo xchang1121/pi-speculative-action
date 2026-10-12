@@ -472,7 +472,7 @@ async function captureSnapshotInputs(world: PreparedWorld, context: SpeculativeT
 		context.signal.throwIfAborted();
 		output = decodeThinkThreadToolRunnerResponse(frame);
 		// Imported bytes are proposals until the common exact content proof validates them at consumption.
-		const branch = await createCommittedResourceInputs(output, context.action, context.cwd, retainedInputs, MAX_INPUT_BYTES);
+		const branch = await createCommittedResourceInputs(context.action, context.cwd, retainedInputs, MAX_INPUT_BYTES);
 		retained = true;
 		return { output, version, branch };
 	} finally {

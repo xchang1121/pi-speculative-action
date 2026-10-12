@@ -70,14 +70,8 @@ export interface EffectTransactionAttempt {
 	readonly state: EffectTransactionState;
 }
 
-/**
- * A sealed effect transaction presented to reuse policy.
- *
- * It remains structurally compatible with WorldBranch while making validation mandatory and
- * exposing one common abort operation. This lets existing isolation backends stay small while
- * the gateway owns the safety-critical lifecycle.
- */
-export interface EffectTransaction<Output> extends WorldBranch<Output> {
+/** WorldBranch with mandatory validation and one abort lifecycle owned by the gateway. */
+export type EffectTransaction<Output> = WorldBranch<Output> & {
 	readonly transactionID: string;
 	/** The sole public lifecycle for validation, adoption, and disposal. */
 	readonly state: EffectTransactionState;
@@ -167,17 +161,18 @@ export class EffectTransactionCoordinator<Output> {
 }
 
 function sealEffectTransaction<Output>(attempt: MutableEffectTransactionAttempt, branch: WorldBranch<Output>): EffectTransaction<Output> {
+	if (branch.inputsOnly && "output" in branch) throw new Error("input_only_output_retained");
 	const shared = attempt.descriptor.route.reuse === "shared_result";
 	const retainedBytes = Object.getOwnPropertyDescriptor(branch, "capturedBytes")?.get?.bind(branch);
 	const validateAndCommit = shared ? branch.validateAndCommit?.bind(branch) : undefined;
 	const sealed: WorldBranch<Output> = Object.freeze({
-		...immutableSnapshot({ backend: branch.backend, resources: branch.resources, inputsOnly: branch.inputsOnly, inputResources: shared && branch.reconstruct ? branch.inputResources : undefined, capturedBytes: branch.capturedBytes,
+		...immutableSnapshot({ backend: branch.backend, resources: branch.resources, inputResources: shared && branch.reconstruct ? branch.inputResources : undefined, capturedBytes: branch.capturedBytes,
 			reconstructionScope: shared && branch.reconstruct && !validateAndCommit ? branch.reconstructionScope : undefined,
 			executionMetrics: branch.executionMetrics, compatibility: branch.compatibility }),
 		// Checkpoints are opaque backend-issued handles; pin the reference without cloning their owner.
 		checkpoint: branch.checkpoint, inputSource: shared ? branch.inputSource : undefined,
 		invalidateInputs: shared ? branch.invalidateInputs?.bind(branch) : undefined,
-		output: shared ? cloneSharedData(branch.output) : branch.output,
+		...(branch.inputsOnly ? { inputsOnly: true as const } : { output: shared ? cloneSharedData(branch.output) : branch.output }),
 		operations: branch.operations && Object.freeze([...branch.operations]),
 		computationDependencies: branch.computationDependencies && Object.freeze([...branch.computationDependencies]),
 		validate: validateAndCommit ?? branch.validate?.bind(branch), reconstruct: branch.reconstruct?.bind(branch),
@@ -221,11 +216,10 @@ function sealEffectTransaction<Output>(attempt: MutableEffectTransactionAttempt,
 		validationPromise = pending;
 		try { return await pending; } finally { if (validationPromise === pending) validationPromise = undefined; }
 	};
-	return Object.freeze<EffectTransaction<Output>>({
+	const transaction: EffectTransaction<Output> = {
 		...sealed, transactionID: attempt.id,
 		get state() { return attempt.stateValue; },
 		get latestValidation() { return validation; },
-		get output() { return shared ? cloneSharedData(sealed.output) : sealed.output; },
 		get capturedBytes() { return retainedBytes ? retainedBytes() : sealed.capturedBytes; },
 		takeCommittedInputs: sealed.takeCommittedInputs ? async (maxBytes) => {
 			if (lifecycle.sealed || attempt.stateValue !== "committed" || inputTransfer) return undefined;
@@ -256,6 +250,7 @@ function sealEffectTransaction<Output>(attempt: MutableEffectTransactionAttempt,
 		} : undefined,
 		validate: () => validate(),
 		commit: async () => {
+			if (sealed.inputsOnly) throw effectCommitFailure(new Error("input_only_branch"), "recoverable");
 			// An admitted effect keeps its original settlement, including during/after retirement.
 			if (commit.result) return shared ? cloneSharedData(await commit.result) : commit.result;
 			if (lifecycle.sealed) throw effectCommitFailure(new Error("effect transaction resources are retired"), "recoverable");
@@ -284,5 +279,7 @@ function sealEffectTransaction<Output>(attempt: MutableEffectTransactionAttempt,
 			return shared ? cloneSharedData(await pending) : pending;
 		},
 		abort, dispose: abort,
-	});
+	};
+	if (!sealed.inputsOnly) Object.defineProperty(transaction, "output", { get: () => shared ? cloneSharedData(sealed.output) : sealed.output });
+	return Object.freeze(transaction);
 }

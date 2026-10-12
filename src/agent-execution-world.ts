@@ -6,7 +6,7 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { BigIntStats } from "node:fs";
 import { sameFilesystemIdentity, type StableFilesystemCapture } from "./filesystem-evidence.ts";
 import { PI_ACTION_SEMANTICS, type ActionKey, type ActionSemanticsRegistry } from "./action-semantics.ts";
-import type { ExecutionWorld, ExecutionScope, ExecutionOperationAdoption, WorldBranch, WorldCheckpoint, WorldResultCapture } from "./execution-world.ts";
+import type { ExecutionWorld, ExecutionScope, ExecutionOperationAdoption, WorldBranch, WorldOutput, WorldCheckpoint, WorldResultCapture } from "./execution-world.ts";
 import { effectCommitFailure } from "./effect-transaction.ts";
 import { effectCapabilitiesCover, RESOURCE_OBSERVATION_EFFECTS, WORKSPACE_PATH_MUTATION_EFFECTS } from "./effect-model.ts";
 import { captureResourceVersion, collectResourceComputation, invalidateResourceInputs, releaseResourceVersion, resourceProofBytes, validateResourceVersion,
@@ -79,7 +79,7 @@ export function createResourceSnapshotExecutionWorld(
 				if (!execute || context.parentCheckpoint) throw new Error("Resource execution context is not supported");
 				const query = await evaluateResourceQuery(undefined, context, invocation?.filesystemRoot ?? context.cwd, view => execute(view, context), actionSemantics, operations.maxBytes(), true);
 				if (!query) throw new Error("resource_snapshot_budget_exceeded");
-				return resourceSnapshotBranch(query.output, query.versions, context.action, actionSemantics);
+				return resourceSnapshotBranch({ output: query.output }, query.versions, context.action, actionSemantics);
 			},
 		} } : {}),
 	};
@@ -173,25 +173,26 @@ async function evaluateResourceQuery<Output>(
 
 /** Committed poststates enter the same read view and exact validation as captured inputs. */
 export async function createCommittedResourceInputs(
-	output: ToolSettlement, action: ActionKey, root: string, inputs: ReadonlyMap<string, ResourceInput>, maxBytes: number,
+	action: ActionKey, root: string, inputs: ReadonlyMap<string, ResourceInput>, maxBytes: number,
 ): Promise<WorldBranch<ToolSettlement> & { readonly inputsOnly: true }> {
 	const version = await captureResourceVersion(undefined, root, PI_ACTION_SEMANTICS, maxBytes, inputs);
-	return Object.assign(await resourceCapture([version], action, PI_ACTION_SEMANTICS, true).seal(output), { inputsOnly: true as const });
+	try { return resourceSnapshotBranch({ inputsOnly: true }, [version], action, PI_ACTION_SEMANTICS); }
+	catch (error) { await version.release(); throw error; }
 }
 
-function resourceSnapshotBranch(
-	output: ToolSettlement, versions: readonly ResourceVersionToken[], action: ActionKey | undefined, semantics: ActionSemanticsRegistry,
-	inputsOnly = false,
-): WorldBranch<ToolSettlement> {
+function resourceSnapshotBranch<Outcome extends WorldOutput<ToolSettlement>>(
+	outcome: Outcome, versions: readonly ResourceVersionToken[], action: ActionKey | undefined, semantics: ActionSemanticsRegistry,
+) {
+	for (const version of versions) version.view?.seal();
+	if (outcome.inputsOnly && !versions.some(token => token.view?.resources.length || token.view?.hasPreparedInputs)) throw new Error("resource_inputs_empty");
 	// Input revocation releases data, not the old result's immutable freshness evidence.
 	const version = versions[0]!, proofBytes = resourceProofBytes(versions);
 	const executionFingerprint = action?.executionFingerprint;
 	const inputSource = Object.freeze({});
 	resourceVersions.set(inputSource, versions);
 	let owned: readonly ResourceVersionToken[] | undefined = versions;
-	return {
-		backend: "resource_version", output, inputSource, resources: Object.freeze([]),
-		...(inputsOnly ? { inputsOnly: true as const } : {}),
+	const branch: Omit<WorldBranch<ToolSettlement>, "output" | "inputsOnly"> = {
+		backend: "resource_version", inputSource, resources: Object.freeze([]),
 		invalidateInputs: paths => {
 			if (!owned) return [];
 			const removed = invalidateResourceInputs(owned, paths);
@@ -217,18 +218,19 @@ function resourceSnapshotBranch(
 			if (!owned || !execute || !root || definition?.effect !== "observation" || !definition.resourceScope || !effectCapabilitiesCover(RESOURCE_OBSERVATION_EFFECTS.capabilities, definition.requirements)) return undefined;
 			const query = await evaluateResourceQuery(versions, request, root, view => execute(view, request), semantics,
 				Math.max(0, version.view!.remainingBytes - versions.slice(1).reduce((bytes, token) => bytes + (token.view?.bytes ?? 0), 0)));
-			return query && Object.assign(resourceSnapshotBranch(query.output, query.versions, request.action, semantics), { requiresQueryValidation: true as const });
+			return query && Object.assign(resourceSnapshotBranch({ output: query.output }, query.versions, request.action, semantics), { requiresQueryValidation: true as const });
 		} } : {}),
 		commit: async () => {
 			// Nothing was applied: an input-only branch can only be declined, never poison the Actor call.
-			if (inputsOnly) throw effectCommitFailure(new Error("input_only_branch"), "recoverable");
+			if (outcome.inputsOnly) throw effectCommitFailure(new Error("input_only_branch"), "recoverable");
 			if (!owned) throw new Error("resource snapshot is disposed");
-			return output;
+			return outcome.output;
 		},
 		dispose: () => { owned = undefined; resourceVersions.delete(inputSource);
 			return versions.length === 1 ? version.release() : Promise.allSettled(versions.map(releaseResourceVersion)).then(() => {});
 		},
 	};
+	return Object.assign(branch, outcome);
 }
 
 async function validateResourceInputs(tokens?: readonly ResourceVersionToken[], revokeUnknown = false) {
@@ -253,9 +255,7 @@ function resourceCapture(versions: ResourceVersionToken[], action: ActionKey | u
 		try {
 			await beforeSeal?.();
 			if (!open) throw new Error("resource_snapshot_capture_disposed");
-			for (const version of versions) version.view?.seal();
-			if (inputsOnly && !versions.some(token => token.view?.resources.length || token.view?.hasPreparedInputs)) throw new Error("resource_inputs_empty");
-			const branch = resourceSnapshotBranch(output, [...versions], action, semantics, inputsOnly);
+			const branch = resourceSnapshotBranch(inputsOnly ? { inputsOnly: true } : { output }, [...versions], action, semantics);
 			versions.length = 0; return branch;
 		} finally { await dispose(); }
 	} };

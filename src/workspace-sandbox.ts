@@ -422,7 +422,7 @@ function workspaceBranch(snapshot: WorkspaceExecutionSnapshot, sourceRoot: strin
 			const preimages = new Map<string, ResourceInput>(changes.flatMap((change) => change.kind !== "directory" && change.before && !change.aliases && textual(change.before) ? [[change.target, change.before]] : []));
 			if (disposed || commit.result || readInputs || !preimages.size) return undefined;
 			readInputs = true;
-			const inputs = await createCommittedResourceInputs(snapshot.output, action, sourceRoot, preimages, maxBytes).catch(() => undefined);
+			const inputs = await createCommittedResourceInputs(action, sourceRoot, preimages, maxBytes).catch(() => undefined);
 			// Stamped only now: each file must still hold the bytes it was read with, or the owner would vouch for stale ones.
 			const current = inputs && await Promise.all([...preimages].map(async ([target, before]) => sameOptionalBytes((await readRegularState(target))?.content, before as Uint8Array)));
 			if (inputs && current?.every(Boolean)) return inputs;
@@ -433,7 +433,7 @@ function workspaceBranch(snapshot: WorkspaceExecutionSnapshot, sourceRoot: strin
 			return transferred = (async () => {
 				if (!inputs.size) return undefined;
 				try {
-					const branch = await createCommittedResourceInputs(snapshot.output, action, sourceRoot, inputs, maxBytes);
+					const branch = await createCommittedResourceInputs(action, sourceRoot, inputs, maxBytes);
 					if (!disposed) return branch;
 					await branch.dispose(); return undefined;
 				} finally { inputs.clear(); }

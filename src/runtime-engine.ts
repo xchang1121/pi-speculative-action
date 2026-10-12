@@ -21,7 +21,6 @@ import { containsLogicalPath } from "./path-utils.ts";
 import type {
 	AdoptedAction,
 	ActualToolCall,
-	AuthoritativeResultCapture,
 	PreparedActorCall,
 	RuntimeTurnContext,
 	SpeculativeActionEvent,
@@ -162,7 +161,7 @@ async function projectOutput<Output>(candidate: CandidateRecord<Output>, actor: 
 		if (retained.resource) retained.resource.references++;
 		return { ok: true, ...retained, output, reused: true };
 	}
-	if (match.kind === "exact" && mode !== "inputs") return { ok: true, output: branch.output };
+	if (!branch.inputsOnly && match.kind === "exact" && mode !== "inputs") return { ok: true, output: branch.output };
 	const reconstruct = branch.reconstruct;
 	const rule = match.kind === "projected" && mode !== "inputs" ? rules.find((item) => item.id === match.projector) : undefined;
 	const coverage = candidate.projectionCoverage.find((item) => item.rule === rule?.id);
@@ -170,7 +169,7 @@ async function projectOutput<Output>(candidate: CandidateRecord<Output>, actor: 
 	let transferred = false;
 	try {
 		const { output: projected, computation: execution } = await TimelineInterval.measure(async () => {
-			const projected: Output | undefined = candidate.key && match.kind === "projected" && coverage && rule?.projectOutput ? cloneSharedData(await rule.projectOutput({
+			const projected: Output | undefined = !branch.inputsOnly && candidate.key && match.kind === "projected" && coverage && rule?.projectOutput ? cloneSharedData(await rule.projectOutput({
 				speculative: candidate.key, actor, output: branch.output, coverage: cloneSharedData(coverage.value), keyMatch: match,
 			})) : undefined;
 			return projected !== undefined ? projected : (rebuilt = await reconstruct?.(request))?.output;
@@ -999,7 +998,7 @@ export function makeSpeculativeActionRuntime<
 		const scheduled = scheduler.refresh(candidate, forecasts) ?? scheduler.evaluate(forecasts);
 		candidate.expectedDurationMs = scheduled.expectedDurationMs;
 		const execution = candidate.work.execution;
-		if (execution.status === "succeeded") { queueContinuation(session, node, candidate, execution.output.output, "execution_succeeded"); return; }
+		if (execution.status === "succeeded" && !execution.output.inputsOnly) { queueContinuation(session, node, candidate, execution.output.output, "execution_succeeded"); return; }
 		if (execution.status === "queued") startQueuedCandidates(session);
 	};
 
@@ -1110,11 +1109,10 @@ export function makeSpeculativeActionRuntime<
 			}), branch => branch.computationDependencies ?? []);
 			branch = evaluation.output;
 			inputs?.dispose(); // The returned branch owns its proof before cache admission can evict sources.
-			const output = branch.output;
-			const rejected = adapter.rejectCandidateOutput?.({ output, candidate: publicCandidate(candidate) });
+			const rejected = !branch.inputsOnly && adapter.rejectCandidateOutput?.({ output: branch.output, candidate: publicCandidate(candidate) });
 			if (rejected) throw new CandidateFailure(cause("execution", "output_rejected", rejected));
-			candidate.projectionCoverage = captureCoverage(action, output, projectionRules);
-			candidate.estimatedBytes = estimateValueBytes(output) + inputIndexBytes(branch);
+			candidate.projectionCoverage = branch.inputsOnly ? [] : captureCoverage(action, branch.output, projectionRules);
+			candidate.estimatedBytes = estimateValueBytes(branch.output) + inputIndexBytes(branch);
 			const completedAt = performance.now();
 			const computation = evaluation.computation;
 			if (!candidate.work.succeed(branch, computation, completedAt - startedAt)) {
@@ -1127,10 +1125,9 @@ export function makeSpeculativeActionRuntime<
 			// An exclusive result waits for its own adoption; meanwhile the unchanged bytes it read can answer other reads.
 			const budget = cacheLimits(candidate.owner.settings), preimages = candidate.work.reservation.kind === "exclusive" && budget.maxEntries > 0 && budget.maxBytes > 0
 				? await branch.takeReadInputs?.(budget.maxBytes).catch(() => undefined) : undefined;
-			if (preimages) await promoteAuthoritativeResult(session, candidate.owner, () => candidateStore.has(session.id, candidate), candidate.owner.draft, action, preimages.output, 0,
-				computation, { route: { ...candidate.route, backend: preimages.backend, isolation: "resource_snapshot", reuse: "shared_result" },
-					seal: () => preimages, dispose: preimages.dispose });
-			for (const node of session.plan.consumers(candidate.id)) queueContinuation(session, node, candidate, output, "execution_succeeded");
+			if (preimages) await retainAuthoritativeBranch(session, candidate.owner, () => candidateStore.has(session.id, candidate), candidate.owner.draft, action, preimages, 0,
+				computation, { ...candidate.route, backend: preimages.backend, isolation: "resource_snapshot", reuse: "shared_result" });
+			if (!branch.inputsOnly) for (const node of session.plan.consumers(candidate.id)) queueContinuation(session, node, candidate, branch.output, "execution_succeeded");
 			trimResults(session, candidate.owner.settings);
 			queueCandidateEvent(session, candidate);
 			retireUndemandedCandidate(session, candidate, cause("retention", "execution_settled"));
@@ -1393,10 +1390,8 @@ export function makeSpeculativeActionRuntime<
 						const budget = cacheLimits(state.settings);
 						if (branch.takeCommittedInputs && budget.maxEntries > 0 && budget.maxBytes > 0) {
 							const inputs = await branch.takeCommittedInputs(budget.maxBytes).catch(() => undefined);
-							if (inputs) await promoteAuthoritativeResult(state.session, state, () => state.lifecycle === "active", candidate.owner.draft, candidate.key, inputs.output, 0, execution.toolExecution, {
-								route: { ...candidate.route, backend: inputs.backend, isolation: "resource_snapshot", reuse: "shared_result" },
-								seal: () => inputs, dispose: inputs.dispose,
-							});
+							if (inputs) await retainAuthoritativeBranch(state.session, state, () => state.lifecycle === "active", candidate.owner.draft, candidate.key, inputs, 0, execution.toolExecution,
+								{ ...candidate.route, backend: inputs.backend, isolation: "resource_snapshot", reuse: "shared_result" });
 						}
 						removeCandidate(state.session.id, candidate);
 					} else {
@@ -1572,19 +1567,17 @@ export function makeSpeculativeActionRuntime<
 		}
 	};
 
-	const promoteAuthoritativeResult = async (
+	const retainAuthoritativeBranch = async (
 		session: Session,
 		context: RuntimeTurnContext<StartInput, StateData>,
 		active: () => boolean,
 		actualCall: ActualToolCall,
 		action: ActionKey | undefined,
-		output: Output,
+		branch: WorldBranch<Output>,
 		durationMs: number,
 		toolExecution: TimelineInterval,
-		capture: AuthoritativeResultCapture<Output>,
+		route: SpeculativeExecutionRoute,
 	): Promise<void> => {
-		let branch: WorldBranch<Output> | undefined;
-		try { branch = await capture.seal(output); } catch { session.lifecycle.release(capture); return; }
 		let retained = false;
 		try {
 			if (!active() || session.lifecycle.sealed || masterDisabled() || !action && !branch.inputsOnly) return;
@@ -1592,13 +1585,13 @@ export function makeSpeculativeActionRuntime<
 				{ type: "tool_call", tool: actualCall.tool, input: action?.input ?? asConcreteInput(actualCall.input) ?? {}, source: "actor_result" }, {
 				origin: "actor_result",
 				key: action,
-				route: capture.route,
-				estimatedBytes: estimateValueBytes(output) + inputIndexBytes(branch),
-				projectionCoverage: action ? captureCoverage(action, output, projectionRules) : [],
+				route,
+				estimatedBytes: estimateValueBytes(branch.output) + inputIndexBytes(branch),
+				projectionCoverage: action && !branch.inputsOnly ? captureCoverage(action, branch.output, projectionRules) : [],
 			});
 			candidate.work.start(toolExecution.startedAt);
 			if (!candidate.work.succeed(branch, toolExecution, durationMs)) return;
-			const rejected = adapter.rejectCandidateOutput?.({ output, candidate: publicCandidate(candidate) });
+			const rejected = !branch.inputsOnly && adapter.rejectCandidateOutput?.({ output: branch.output, candidate: publicCandidate(candidate) });
 			if (rejected) return;
 			candidateStore.settle(session.id, candidate, true, branch.reconstruct ? branch.inputResources : undefined);
 			retained = true;
@@ -1632,7 +1625,8 @@ export function makeSpeculativeActionRuntime<
 		// Authoritative feedback must enter the settlement queue before optional cache work can yield.
 		queueActorSettlement(state, input, actualCall, actorAction, output, undefined, operations);
 		if (capture && output !== undefined && !outputIsError(output)) {
-			await promoteAuthoritativeResult(state.session, state, () => state.lifecycle === "active", actualCall, key, output, durationMs, execution, capture);
+			try { await retainAuthoritativeBranch(state.session, state, () => state.lifecycle === "active", actualCall, key, await capture.seal(output), durationMs, execution, capture.route); }
+			catch { state.session.lifecycle.release(capture); }
 		} else if (capture) state.session.lifecycle.release(capture);
 	};
 
@@ -1844,7 +1838,7 @@ export function makeSpeculativeActionRuntime<
 				parent.expectedDecisionSeq !== session.decisionSequence + 1 || parent.action.dependsOn?.length ||
 				parent.execution.status !== "succeeded") return;
 			const candidate = candidateStore.get(session.id, parent.execution.candidateID);
-			if (candidate?.work.execution.status !== "succeeded") return;
+			if (candidate?.work.execution.status !== "succeeded" || candidate.work.execution.output.inputsOnly) return;
 			batch.push({ identity: parent.identity, candidate: predictionCandidate(candidate, parent), output: candidate.work.execution.output.output });
 			parents.push(owner);
 		}

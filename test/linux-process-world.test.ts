@@ -786,8 +786,9 @@ int main(int argc, char **argv) {
 		} finally { observing.mockRestore(); inspecting.mockRestore(); await host?.dispose(); await fixture.dispose(); }
 	});
 
-nativeTest.for([false, true])("transfers native Bash FD inputs to filesystem tools across turns with exact invalidation (unkeyed=%s)", { timeout: 30_000 }, async (unkeyed, { skip, benchmark }) => {
+nativeTest.for(["keyed", "unkeyed", "keyed-large", "unkeyed-opaque"])("transfers native Bash FD inputs to filesystem tools across turns with exact invalidation (%s)", { timeout: 30_000 }, async (mode, { skip, benchmark }) => {
 		const fixture = await benchmark("pi-native-resource-inputs-");
+		const unkeyed = mode.startsWith("unkeyed"), parentOutput = { transcript: mode.endsWith("large") ? "x".repeat(128 * 1024) : "", ...(mode.endsWith("opaque") ? { callback: () => "parent-only" } : {}) };
 		let host: ReturnType<typeof createSpeculativeActionHost> | undefined;
 		const search = await createClosedSearchProfile(fixture.workspace);
 		try {
@@ -802,7 +803,7 @@ int main(void) { char b[1024]; return syscall(SYS_getdents64, 4, b, sizeof(b)) <
 			const route = await fixture.prepareActorReplay();
 			const tools = [fixture.tool, createReadTool(fixture.workspace), createGrepTool(fixture.workspace), createLsTool(fixture.workspace), createFindTool(fixture.workspace)];
 			const prepared = patternProcessHost(fixture, "native-inputs", { tools: tools.map(tool => tool.name), resourceCacheMaxEntries: 8,
-				resourceCacheMaxBytes: 1024 * 1024, patternAware: patternAwareSettings({ enabled: true, multiStepEnabled: false }) }, {
+				resourceCacheMaxBytes: 32 * 1024, patternAware: patternAwareSettings({ enabled: true, multiStepEnabled: false }) }, {
 				executionWorlds: [fixture.world, createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { maxBytes: () => 1024 * 1024 })],
 				resolveInvocation: (tool, input) => {
 					const invocation = search.invocations.get(tool) ?? resolvePiToolInvocation(tool, input, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath });
@@ -811,10 +812,10 @@ int main(void) { char b[1024]; return syscall(SYS_getdents64, 4, b, sizeof(b)) <
 			}, tools), { events, start } = prepared;
 			host = prepared.host;
 			const command = "exec 3<input.txt 4<entries; worker; worker", bash = vi.fn(() => fixture.coordinator.runWith({ execute: request => route.executor.execute({ ...request,
-				scope: { sessionID: "native-inputs", turnID: "seed" } }) }, () => fixture.tool.execute("seed", { command })));
+				scope: { sessionID: "native-inputs", turnID: "seed" } }) }, async () => ({ ...await fixture.tool.execute("seed", { command }), details: parentOutput })));
 			await start("seed");
-			expect((await host.execute({ turnID: "seed", id: "seed", tool: "bash", args: { command }, tools }, undefined, bash)).content)
-				.toEqual([{ type: "text", text: "one\ntwo\none\ntwo\n" }]);
+			expect(await host.execute({ turnID: "seed", id: "seed", tool: "bash", args: { command }, tools }, undefined, bash))
+				.toEqual({ content: [{ type: "text", text: "one\ntwo\none\ntwo\n" }], details: parentOutput });
 			await host.finishTurn("seed"); expect(bash).toHaveBeenCalledOnce();
 			if (unkeyed) expect(events.find(event => event.type === "actor_action")).toMatchObject({ settlement: { provider: { kind: "actor", cause: { code: "action_not_keyable" } } } });
 			await start("queries");

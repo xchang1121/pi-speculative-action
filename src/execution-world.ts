@@ -115,15 +115,12 @@ export interface ExecutionOperationAdoption {
 	readonly computation?: TimelineDependency;
 }
 
-/**
- * A sealed speculative execution artifact.
- *
- * The tool output and promotable persistent effects are captured together. Ephemeral process,
- * environment, and network state never crosses the branch boundary. Backends provide an
- * idempotent commit primitive; EffectTransaction exclusively owns validation and adoption state.
- */
-export interface WorldBranch<Output> {
-	readonly output: Output;
+/** Input-only owners omit output and can serve proven queries, never the source action's result or effects. */
+export type WorldOutput<Output> = { readonly output: Output; readonly inputsOnly?: never } | { readonly inputsOnly: true; readonly output?: never };
+
+/** Sealed backend artifact; ephemeral process, environment and network state do not cross this boundary.
+ * Backends provide idempotent commits; EffectTransaction owns validation and adoption. */
+export type WorldBranch<Output> = WorldOutput<Output> & {
 	readonly backend: string;
 	/** Observed internal work. Only successful Actor adoption makes these authoritative learning inputs. */
 	readonly operations?: readonly ExecutionOperationBinding[];
@@ -136,8 +133,6 @@ export interface WorldBranch<Output> {
 	readonly inputSource?: object;
 	/** Revoke borrowable inputs, optionally returning removed indexed names; sealed output proofs remain. */
 	readonly invalidateInputs?: (paths: readonly string[]) => void | readonly string[];
-	/** Retained data may serve proven queries, never the source action's result or effects. */
-	readonly inputsOnly?: true;
 	/** Transfer one input owner after a successful commit; the receiver owns its cleanup. */
 	readonly takeCommittedInputs?: (maxBytes: number) => Promise<(WorldBranch<Output> & { readonly inputsOnly: true }) | undefined>;
 	/** Before any commit, the unchanged bytes an exclusive branch read, as an independent input owner (at most once). */
@@ -161,7 +156,8 @@ export interface WorldBranch<Output> {
 		readonly signal: AbortSignal;
 		/** Leased sealed owners from the session's input index; the backend must prove every borrowed dependency. */
 		readonly inputs?: (path?: string) => Iterable<object>;
-	}) => Promise<(Pick<WorldBranch<Output>, "output"> & Partial<Pick<WorldBranch<Output>, "compatibility" | "validate" | "capturedBytes" | "dispose">> & {
+	}) => Promise<(Partial<Pick<WorldBranch<Output>, "compatibility" | "validate" | "capturedBytes" | "dispose">> & {
+		readonly output: Output;
 		/** Query-owned proof and storage; dispose after its last reader. Never commits the source output.
 		 * A composed query cannot fall back to the source branch's narrower proof. */
 		readonly requiresQueryValidation?: true;
