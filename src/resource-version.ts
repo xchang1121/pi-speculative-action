@@ -74,7 +74,7 @@ type ResourceInputSource = {
 	readonly view: ResourceReadView;
 	readonly observed: (dependencies: ReadonlySet<string> | undefined) => readonly ResourceVersionToken[] | void;
 };
-type ResourceInputLookup = (target: string) => Iterable<ResourceInputSource>;
+type ResourceInputLookup = (target?: string) => Iterable<ResourceInputSource>;
 type PreparedResource = {
 	readonly cancellation: SharedAbortScope;
 	computation?: TimelineInterval;
@@ -317,7 +317,7 @@ export class ResourceReadView {
 			if (cached && compatible(cached)) {
 				const result = await use(cached); if (result) return result.value;
 			}
-			if (target) for (const source of this.lookup?.(target) ?? []) {
+			for (const source of this.lookup?.() ?? []) {
 				if (source.view.entries === this.entries || !source.view.retained || !source.view.sealed ||
 					!source.view.prepared?.bindings.get(binding)?.get(key)?.retained ||
 					!compatible(source.view.prepared.bindings.get(binding)?.get(key))) continue;

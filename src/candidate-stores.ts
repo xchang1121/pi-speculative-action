@@ -149,14 +149,14 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 		return [...(this.scopes.get(scope)?.pending ?? [])].map(({ entry }) => entry);
 	}
 
-	/** Retention adds evidence to the existing owner; it neither reinserts nor changes identity. */
-	settle(scope: Scope, entry: Entry, shared = true, inputs: NonNullable<WorldBranch<unknown>["inputResources"]> = []): void {
+	/** A present input capability may own calculations without paths; retention preserves its existing identity. */
+	settle(scope: Scope, entry: Entry, shared = true, inputs?: NonNullable<WorldBranch<unknown>["inputResources"]>): void {
 		this.insert(scope, entry);
 		const indexed = this.record(scope, entry);
 		if (!indexed) return;
 		this.scopes.get(scope)!.pending.delete(indexed);
 		indexed.result ??= { segment: "cold", insertedAt: this.now(), actorHits: 0 };
-		if (shared && !indexed.inputs && inputs.length) {
+		if (shared && !indexed.inputs && inputs) {
 			const partitions = this.scopes.get(scope)!.partitions;
 			for (const key of new Set(inputs.map(input => inputPartition(input.path, input.descendants)))) {
 				const members = partitions.get(key) ?? new Set();

@@ -169,14 +169,12 @@ async function projectOutput<Output>(candidate: CandidateRecord<Output>, actor: 
 	let rebuilt: Awaited<ReturnType<NonNullable<typeof reconstruct>>>;
 	let transferred = false;
 	try {
-		const evaluation = await TimelineInterval.measure(async () => {
-			let projected: Output | undefined = match.kind === "projected" && coverage && rule?.projectOutput ? cloneSharedData(await rule.projectOutput({
+		const { output: projected, computation: execution } = await TimelineInterval.measure(async () => {
+			const projected: Output | undefined = match.kind === "projected" && coverage && rule?.projectOutput ? cloneSharedData(await rule.projectOutput({
 				speculative: candidate.key, actor, output: branch.output, coverage: cloneSharedData(coverage.value), keyMatch: match,
 			})) : undefined;
-			if (projected === undefined) { rebuilt = await reconstruct?.(request); if (rebuilt) projected = rebuilt.output; }
-			return projected;
+			return projected !== undefined ? projected : (rebuilt = await reconstruct?.(request))?.output;
 		});
-		const { output: projected, computation: execution } = evaluation;
 		if ((rebuilt?.requiresQueryValidation || mode === "inputs") && !rebuilt?.validate) return { ok: false, cause: cause("projection", "query_proof_missing") };
 		if (projected === undefined) return { ok: false, cause: cause("projection", "view_not_covered") };
 		const resource = rebuilt?.dispose ? { dispose: rebuilt.dispose.bind(rebuilt), references: 1 } : undefined;
@@ -1333,11 +1331,9 @@ export function makeSpeculativeActionRuntime<
 					projectionRules, { action, args: call.input, callID: call.id ?? action.hash, signal, inputs: inputs?.lookup }, mode);
 				if (!projection.ok) return projection;
 				const compatibility = sourceCompatibility ?? scheduler.assessCompatibility(projection.compatibility ?? branch.compatibility, action.executionFingerprint);
-				if (!compatibility.compatible) {
-					releaseProjectionResource(state.sessionID, projection.resource);
-					return { ok: false, cause: cause("compatibility", compatibility.code, compatibility.detail) };
-				}
-				const validation = await validateWorldBranch(projection.validate ? { validate: projection.validate } : branch, candidate.route.reuse);
+				const validation = compatibility.compatible
+					? await validateWorldBranch(projection.validate ? { validate: projection.validate } : branch, candidate.route.reuse)
+					: { status: "incompatible" as const, cause: cause("compatibility", compatibility.code, compatibility.detail) };
 				if (validation.status === "valid") return projection;
 				releaseProjectionResource(state.sessionID, projection.resource);
 				if (validation.status === "stale") {
