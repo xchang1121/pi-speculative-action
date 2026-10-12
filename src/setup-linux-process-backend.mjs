@@ -7,7 +7,9 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { fileURLToPath } from "node:url";
+import { qualifyNativeStartup } from "./process-startup.mjs";
 
 const SANDLOCK_REVISION = "f6a3e39b31afa80f66609c8af8ae5b2582f628e8";
 const SANDLOCK_REPOSITORY = "https://github.com/multikernel/sandlock.git";
@@ -51,27 +53,12 @@ console.log(
 );
 
 async function installSandlock() {
-	const patch = await readFile(SANDLOCK_PATCH);
-	const sourceDigest = sha256(SANDLOCK_REVISION, patch);
-	const stamp = `${sandlock}.sha256`;
-	let installedMatches = false;
-	try {
-		const [installedStamp, installed] = await Promise.all([readFile(stamp, "utf8"), readFile(sandlock)]);
-		installedMatches = installedStamp.trim() === `${sourceDigest}:${sha256(installed)}`;
-	} catch {
-		// Install the pinned source revision below.
-	}
-	if (installedMatches) { await qualifySandlock(sandlock); console.log(`Speculative Bash producer ready: ${sandlock}`); return; }
-	const cargo = await executable([path.join(os.homedir(), ".cargo", "bin", "cargo"), "cargo"]).catch(() => {
-		throw new Error("Rust stable is required to build Sandlock. Install it from https://rustup.rs and retry.");
-	});
-	const git = await executable(["git"]);
-	const buildRoot = await mkdtemp(path.join(os.tmpdir(), "pi-speculative-sandlock-"));
-	const source = path.join(buildRoot, "source");
-	const targetRoot = path.join(buildRoot, "target");
-	const temporary = `${sandlock}.${process.pid}.tmp`;
-	console.log(`Building Sandlock ${SANDLOCK_REVISION.slice(0, 12)} into ${localRoot} ...`);
-	try {
+	return installNative(sandlock, sha256(SANDLOCK_REVISION, await readFile(SANDLOCK_PATCH)), qualifySandlock, async (buildRoot, temporary) => {
+		const cargo = await executable([path.join(os.homedir(), ".cargo", "bin", "cargo"), "cargo"]).catch(() => {
+			throw new Error("Rust stable is required to build Sandlock. Install it from https://rustup.rs and retry.");
+		});
+		const git = await executable(["git"]), source = path.join(buildRoot, "source"), targetRoot = path.join(buildRoot, "target");
+		console.log(`Building Sandlock ${SANDLOCK_REVISION.slice(0, 12)} into ${localRoot} ...`);
 		await run(git, ["clone", "--quiet", "--no-checkout", SANDLOCK_REPOSITORY, source]);
 		await run(git, ["-C", source, "checkout", "--quiet", "--detach", SANDLOCK_REVISION]);
 		await run(git, ["-C", source, "apply", "--whitespace=error-all", SANDLOCK_PATCH]);
@@ -80,17 +67,7 @@ async function installSandlock() {
 			"--manifest-path", path.join(source, "Cargo.toml"), "--target-dir", targetRoot,
 		]);
 		await copyFile(path.join(targetRoot, "release", "sandlock"), temporary, fsConstants.COPYFILE_EXCL);
-		await chmod(temporary, 0o755);
-		await qualifySandlock(temporary);
-		await rename(temporary, sandlock);
-		await writeFile(stamp, `${sourceDigest}:${sha256(await readFile(sandlock))}\n`, { mode: 0o600 });
-	} finally {
-		await Promise.all([
-			rm(buildRoot, { recursive: true, force: true }).catch(() => undefined),
-			rm(temporary, { force: true }).catch(() => undefined),
-		]);
-	}
-	console.log(`Speculative Bash producer ready: ${sandlock}`);
+	});
 }
 
 async function qualifySandlock(binary) {
@@ -135,55 +112,28 @@ async function qualifySandlock(binary) {
 
 async function installHeldExec() {
 	const source = fileURLToPath(new URL("./linux-held-exec.c", import.meta.url));
-	const content = await readFile(source);
-	const sourceDigest = sha256("static-pthread+shared-image", content);
-	const target = heldExec;
-	const stamp = `${target}.sha256`;
-	try {
-		const [installedStamp, installed, library] = await Promise.all([readFile(stamp, "utf8"), readFile(target), readFile(`${target}.so`)]);
-		if (installedStamp.trim() !== `${sourceDigest}:${sha256(installed, library)}`) throw new Error("installation changed");
-		await qualifyHeldExec(target);
-		console.log(`Held-exec Actor boundary ready: ${target}`);
-		return;
-	} catch {
-		// Build and functionally qualify the exact packaged source below.
-	}
-	const compiler = await executable(["cc", "gcc", "clang"]);
-	const temporary = `${target}.${process.pid}.tmp`;
-	try {
+	return installNative(heldExec, sha256("static-pthread+shared-image+native-startup", await readFile(source)), qualifyHeldExec, async (_root, temporary) => {
+		const compiler = await executable(["cc", "gcc", "clang"]);
 		await run(compiler, ["-static", "-pthread", "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", source, "-o", temporary]);
 		await run(compiler, ["-shared", "-fPIC", "-pthread", "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", source, "-o", `${temporary}.so`]);
-		await chmod(temporary, 0o755);
-		await qualifyHeldExec(temporary);
-		await rename(`${temporary}.so`, `${target}.so`);
-		await rename(temporary, target);
-		await writeFile(stamp, `${sourceDigest}:${sha256(await readFile(target), await readFile(`${target}.so`))}\n`, { mode: 0o600 });
-	} finally {
-		await Promise.all([temporary, `${temporary}.so`].map(file => rm(file, { force: true }).catch(() => undefined)));
-	}
-	console.log(`Held-exec Actor boundary ready: ${target}`);
+		await copyFile(`${temporary}.so`, `${temporary}.node`, fsConstants.COPYFILE_EXCL);
+	}, [".so", ".node", ""]);
 }
 
 async function qualifyHeldExec(binary) {
-	await run(binary, ["--skip-code", "42", "/bin/sh", "-c", "exec /bin/true"], 42);
 	await run(binary, ["--exec", "21", "pi-exec-probe", binary, "--probe-clean-fds"]);
+	await qualifyNativeStartup(binary);
 }
 
 async function installStrace() {
 	if (process.arch !== "x64") throw new Error("running process capture requires x86-64 Linux");
 	const patch = await readFile(STRACE_PATCH), sourceDigest = sha256(STRACE_SHA256, patch);
-	const target = path.join(localBin, "pi-speculative-strace"), stamp = `${target}.sha256`;
 	const qualify = async binary => {
 		await run(binary, ["--kill-on-exit", "-f", "-q", "-e", "trace=none", "-o", "/dev/null",
 			`--handoff-admission-library=${heldExec}.so`, "--handoff-image=/dev/null", "--", "/bin/true"]);
 	};
-	try {
-		if ((await readFile(stamp, "utf8")).trim() !== `${sourceDigest}:${sha256(await readFile(target))}`) throw new Error("installation changed");
-		await qualify(target); return;
-	} catch { /* Build the pinned tracer extension with the packaged native image ABI. */ }
-	const git = await executable(["git"]), tar = await executable(["tar"]), make = await executable(["make"]);
-	const buildRoot = await mkdtemp(path.join(os.tmpdir(), "pi-speculative-strace-")), temporary = `${target}.${process.pid}.tmp`;
-	try {
+	return installNative(path.join(localBin, "pi-speculative-strace"), sourceDigest, qualify, async (buildRoot, temporary) => {
+		const git = await executable(["git"]), tar = await executable(["tar"]), make = await executable(["make"]);
 		const archive = path.join(buildRoot, "source.tar.xz"), source = path.join(buildRoot, `strace-${STRACE_RELEASE}`);
 		await writeFile(archive, await downloadPinned(`https://strace.io/files/${STRACE_RELEASE}/strace-${STRACE_RELEASE}.tar.xz`, STRACE_SHA256));
 		await run(tar, ["-xJf", archive, "-C", buildRoot]);
@@ -191,57 +141,51 @@ async function installStrace() {
 		await run(path.join(source, "configure"), ["--enable-mpers=no", "--without-libunwind", "--without-libdw"], 0, source);
 		await run(make, ["-j", String(Math.min(4, os.availableParallelism()))], 0, source);
 		await copyFile(path.join(source, "src", "strace"), temporary, fsConstants.COPYFILE_EXCL);
-		await chmod(temporary, 0o755); await qualify(temporary); await rename(temporary, target);
-		await writeFile(stamp, `${sourceDigest}:${sha256(await readFile(target))}\n`, { mode: 0o600 });
-	} finally {
-		await Promise.all([rm(buildRoot, { recursive: true, force: true }), rm(temporary, { force: true })]);
-	}
+	});
 }
 
 async function installFuseOverlayfs() {
 	const target = path.join(localBin, "fuse-overlayfs");
 	const asset = FUSE_OVERLAYFS_ASSETS[process.arch];
 	if (!asset) throw new Error(`no pinned fuse-overlayfs asset for ${process.arch}`);
+	return installNative(target, asset.sha256, binary => run(binary, ["--version"]), async (_root, temporary) => {
+		await access("/dev/fuse", fsConstants.R_OK | fsConstants.W_OK);
+		await executable(["fusermount3", "fusermount"]);
+		const url = `https://github.com/containers/fuse-overlayfs/releases/download/${FUSE_OVERLAYFS_RELEASE}/${asset.name}`;
+		console.log(`Installing fuse-overlayfs ${FUSE_OVERLAYFS_RELEASE} into ${localRoot} ...`);
+		await writeFile(temporary, await downloadPinned(url, asset.sha256), { mode: 0o700, flag: "wx" });
+	}, [""], true);
+}
+
+/** Qualify a complete artifact set before replacement; publish the executable after its libraries. */
+async function installNative(target, sourceDigest, qualify, build, suffixes = [""], pinned = false) {
+	const stamp = `${target}.sha256`, digest = async binary => sha256(...await Promise.all(suffixes.map(suffix => readFile(binary + suffix))));
 	try {
-		const installed = await readFile(target);
-		const digest = sha256(installed);
-		if (digest !== asset.sha256) throw new Error(`installed fuse-overlayfs checksum mismatch: ${digest}`);
-		await run(target, ["--version"]);
-		console.log(`OverlayFS workspace driver ready: ${target}`);
+		const current = await digest(target);
+		if (pinned ? current !== sourceDigest : (await readFile(stamp, "utf8")).trim() !== `${sourceDigest}:${current}`) throw new Error("installation changed");
+		await qualify(target); console.log(`${path.basename(target)} ready: ${target}`);
 		return;
-	} catch {
-		// Install a hash-pinned official static release below.
-	}
-	await access("/dev/fuse", fsConstants.R_OK | fsConstants.W_OK);
-	await executable(["fusermount3", "fusermount"]);
-	const url = `https://github.com/containers/fuse-overlayfs/releases/download/${FUSE_OVERLAYFS_RELEASE}/${asset.name}`;
-	console.log(`Installing fuse-overlayfs ${FUSE_OVERLAYFS_RELEASE} into ${localRoot} ...`);
-	const bytes = await downloadPinned(url, asset.sha256);
+	} catch { /* Rebuild the exact packaged source or download the pinned artifact. */ }
+	const root = await mkdtemp(path.join(os.tmpdir(), `${path.basename(target)}-`));
 	const temporary = `${target}.${process.pid}.tmp`;
 	try {
-		await writeFile(temporary, bytes, { mode: 0o700, flag: "wx" });
+		await build(root, temporary);
 		await chmod(temporary, 0o755);
-		await rename(temporary, target);
+		await qualify(temporary);
+		const installed = await digest(temporary);
+		if (pinned && installed !== sourceDigest) throw new Error("artifact changed after qualification");
+		for (const suffix of suffixes) await rename(temporary + suffix, target + suffix);
+		if (!pinned) await writeFile(stamp, `${sourceDigest}:${installed}\n`, { mode: 0o600 });
 	} finally {
-		await rm(temporary, { force: true }).catch(() => undefined);
+		await Promise.all([rm(root, { recursive: true, force: true }), ...suffixes.map(suffix => rm(temporary + suffix, { force: true }))]);
 	}
-	await run(target, ["--version"]);
-	console.log(`OverlayFS workspace driver ready: ${target}`);
+	console.log(`${path.basename(target)} ready: ${target}`);
 }
 
 async function executable(candidates) {
 	for (const candidate of candidates) {
-		if (candidate.includes(path.sep)) { try { await access(candidate); return candidate; } catch { continue; } }
-		for (const directory of (process.env.PATH ?? "").split(path.delimiter)) {
-			if (!directory) continue;
-			const target = path.join(directory, candidate);
-			try {
-				await access(target);
-				return target;
-			} catch {
-				// Continue PATH lookup.
-			}
-		}
+		const targets = candidate.includes(path.sep) ? [candidate] : (process.env.PATH ?? "").split(path.delimiter).filter(Boolean).map(directory => path.join(directory, candidate));
+		for (const target of targets) try { await access(target); return target; } catch { /* Continue the same ordered lookup. */ }
 	}
 	throw new Error(`Executable not found: ${candidates.join(" or ")}`);
 }
@@ -276,13 +220,7 @@ async function downloadPinned(url, expected) {
 	return bytes;
 }
 
-function run(command, args, expected = 0, cwd) {
-	return new Promise((resolve, reject) => {
-		const child = spawn(command, args, { stdio: "inherit", cwd });
-		child.once("error", reject);
-		child.once("exit", (code, signal) => {
-			if (code === expected && signal === null) resolve();
-			else reject(new Error(`${command} failed (${signal ?? code ?? "unknown"})`));
-		});
-	});
+async function run(command, args, expected = 0, cwd) {
+	const [code, signal] = await once(spawn(command, args, { stdio: "inherit", cwd }), "exit");
+	if (code !== expected || signal !== null) throw new Error(`${command} failed (${signal ?? code ?? "unknown"})`);
 }

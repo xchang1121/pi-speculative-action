@@ -10,7 +10,7 @@ import { ActionSemanticsRegistry, PI_ACTION_SEMANTICS } from "../src/action-sema
 import { PatternAwareStore, patternAwareSettings, patternAwareActionSemantics } from "../src/pattern-aware.ts";
 import { temporaryDirectories } from "./filesystem.ts";
 import { systemHost } from "./agent-system-fixture.ts";
-import { deferred, nextTurn } from "./async.ts";
+import { disposable, onExit, deferred, nextTurn } from "./async.ts";
 import { commitBenchmarkFixture, createLinuxProcessBenchmark, textOutput } from "./linux-process-fixture.ts";
 
 const directories = temporaryDirectories("pi-agent-system-");
@@ -94,37 +94,36 @@ test.for(["actor", "preview", "dynamic", "dynamic-preview", "hints", "hints-prev
 	const f = systemHost(cwd, tools, { actionSemantics, resolveInvocation: tool => { if (tool === names[0]) bindings++; return invocations.get(tool); },
 		complete: async () => fauxAssistantMessage(fauxToolCall("speculative_workflow", { steps: [{ tool: names[unrelated ? 2 : 1], input: { path: "input.txt" } }] }), { stopReason: "toolUse" }),
 		executionWorlds: [world] }, settings);
-	try {
-		const late = scenario.startsWith("late-") ? tools.shift() : undefined; await f.start(); if (late) tools.unshift(late);
-		if (parentFailure && !parentFailure.endsWith("return")) await expect(f.execute(names[0]!, { path: "input.txt" }, producer.signal)).rejects.toBe(parentError);
-		else if (seeded) expect(await f.execute(names[0]!, { path: "input.txt" }, producer.signal)).toEqual({ content: [{ type: "text", text: "count_records:2" }], details: { tool: names[0], ...parentOutput } });
-		else { await f.preview(names[0]!, { path: "input.txt" }); await f.ready(); }
-		if (unkeyed) { expect(bindings).toBe(1); expect(f.events.find(event => event.type === "actor_action")).toMatchObject({ settlement: { provider: { kind: "actor", cause: { code: "action_not_keyable" } } } }); }
-		expect({ builds, renders }).toEqual({ builds: Number(!early), renders: Number(!early) });
-		if (parentFailure) expect(f.events.find(event => event.type === "actor_action")).toMatchObject({ settlement: { provider: { kind: "actor", isError: !parentFailure.endsWith("return") } }, computation: { hiddenComputeMs: 0 } });
-		if (mode.startsWith("retired") || mode === "predicted") { await f.finish(); tools.shift(); settings.drafterEnabled = mode === "predicted"; await f.start("consumer"); }
-		if (mode === "predicted") await f.ready(2);
-		if (unrelated) { await f.finish(); settings.drafterEnabled = true; await f.start("unrelated"); await f.ready(seeded ? 1 : 2); await f.finish(); settings.drafterEnabled = false; await f.start("consumer"); }
-		if (mode.endsWith("preview") && !direct) { await f.preview(names[1]!, { path: "input.txt" }); await expect.poll(() => renders).toBe(unrelated ? 3 : 2); }
-		if (stale) await writeFile(listing ? path.join(path.dirname(file), "third.txt") : file, "one\ntwo\nthree\n");
-		const result = f.execute(names[1]!, { path: "input.txt" }, controller.signal); actors.push(result); void result.catch(() => {});
-		if (overlap) {
-			await entered.promise; actors.push(f.execute(names[1]!, { path: "input.txt" })); await joined.promise;
-			expect(disposed).toBe(0); if (cancelled) controller.abort(new Error("consumer cancelled")); release.resolve();
-			expect(textOutput(await actors[1] as Awaited<typeof result>)).toBe("summarize_records:2");
-		}
-		if (failed || cancelled) await expect(result).rejects.toThrow(failed ? "consumer failed after writing" : "consumer cancelled");
-		else expect(await result).toEqual({ content: [{ type: "text", text: `summarize_records:${stale || changes ? 3 : range ? 1 : 2}` }], details: { tool: names[1] } });
-		expect({ builds, renders, effects }).toEqual({ builds: (direct || stale || unavailable || mode.includes("binding") || mode === "calculation-key" || mode === "revoke" ? 2 : 1) + Number(unrelated) - Number(direct && cancelled) - Number(early),
-			renders: 2 + Number(mode === "stale") + Number(unrelated) + Number(overlap) - Number(failed || cancelled) - Number(early), effects: Number(direct || mode.startsWith("mixed")) + Number(changes) + Number(overlap && !cancelled) - Number(direct && cancelled) - Number(early && mutates(0)) });
-		expect(f.fallbacks).toEqual([...(seeded ? [names[0]!] : []), ...(early || mutates(1) || mode === "revoke" || mode.startsWith("rejected") ? Array(1 + Number(overlap)).fill(names[1]!) : [])]);
-		if (direct && cancelled) await expect(readFile(path.join(cwd, `${names[1]}.txt`))).rejects.toMatchObject({ code: "ENOENT" });
-		else if ((direct || mode.startsWith("mixed")) && !(early && mutates(0))) expect(await readFile(path.join(cwd, `${names[Number(mode !== "mixed-producer")]}.txt`), "utf8")).toBe(String(stale || changes ? 3 : range ? 1 : 2));
-		await f.finish();
-		const timing = f.events.filter(event => event.type === "actor_action").at(-1)?.computation;
-		if (mode !== "binding") expect(timing?.hiddenComputeMs! > 0, JSON.stringify({ timing, events: f.events })).toBe(!stale && !unavailable && (!failed || direct) && !(direct && cancelled) && !["calculation-key", "revoke"].includes(mode));
-		if (cancelled) expect(f.events.filter(event => event.type === "actor_action")[0]?.computation?.hiddenComputeMs).toBe(0);
-	} finally { controller.abort(); release.resolve(); await Promise.allSettled(actors); await f.dispose(); expect(disposed).toBe(direct ? 0 : builds - (bound ? 0 : f.fallbacks.length)); }
+	await using _cleanup = onExit(async () => { controller.abort(); release.resolve(); await Promise.allSettled(actors); await f.dispose(); expect(disposed).toBe(direct ? 0 : builds - (bound ? 0 : f.fallbacks.length)); });
+	const late = scenario.startsWith("late-") ? tools.shift() : undefined; await f.start(); if (late) tools.unshift(late);
+	if (parentFailure && !parentFailure.endsWith("return")) await expect(f.execute(names[0]!, { path: "input.txt" }, producer.signal)).rejects.toBe(parentError);
+	else if (seeded) expect(await f.execute(names[0]!, { path: "input.txt" }, producer.signal)).toEqual({ content: [{ type: "text", text: "count_records:2" }], details: { tool: names[0], ...parentOutput } });
+	else { await f.preview(names[0]!, { path: "input.txt" }); await f.ready(); }
+	if (unkeyed) { expect(bindings).toBe(1); expect(f.events.find(event => event.type === "actor_action")).toMatchObject({ settlement: { provider: { kind: "actor", cause: { code: "action_not_keyable" } } } }); }
+	expect({ builds, renders }).toEqual({ builds: Number(!early), renders: Number(!early) });
+	if (parentFailure) expect(f.events.find(event => event.type === "actor_action")).toMatchObject({ settlement: { provider: { kind: "actor", isError: !parentFailure.endsWith("return") } }, computation: { hiddenComputeMs: 0 } });
+	if (mode.startsWith("retired") || mode === "predicted") { await f.finish(); tools.shift(); settings.drafterEnabled = mode === "predicted"; await f.start("consumer"); }
+	if (mode === "predicted") await f.ready(2);
+	if (unrelated) { await f.finish(); settings.drafterEnabled = true; await f.start("unrelated"); await f.ready(seeded ? 1 : 2); await f.finish(); settings.drafterEnabled = false; await f.start("consumer"); }
+	if (mode.endsWith("preview") && !direct) { await f.preview(names[1]!, { path: "input.txt" }); await expect.poll(() => renders).toBe(unrelated ? 3 : 2); }
+	if (stale) await writeFile(listing ? path.join(path.dirname(file), "third.txt") : file, "one\ntwo\nthree\n");
+	const result = f.execute(names[1]!, { path: "input.txt" }, controller.signal); actors.push(result); void result.catch(() => {});
+	if (overlap) {
+		await entered.promise; actors.push(f.execute(names[1]!, { path: "input.txt" })); await joined.promise;
+		expect(disposed).toBe(0); if (cancelled) controller.abort(new Error("consumer cancelled")); release.resolve();
+		expect(textOutput(await actors[1] as Awaited<typeof result>)).toBe("summarize_records:2");
+	}
+	if (failed || cancelled) await expect(result).rejects.toThrow(failed ? "consumer failed after writing" : "consumer cancelled");
+	else expect(await result).toEqual({ content: [{ type: "text", text: `summarize_records:${stale || changes ? 3 : range ? 1 : 2}` }], details: { tool: names[1] } });
+	expect({ builds, renders, effects }).toEqual({ builds: (direct || stale || unavailable || mode.includes("binding") || mode === "calculation-key" || mode === "revoke" ? 2 : 1) + Number(unrelated) - Number(direct && cancelled) - Number(early),
+		renders: 2 + Number(mode === "stale") + Number(unrelated) + Number(overlap) - Number(failed || cancelled) - Number(early), effects: Number(direct || mode.startsWith("mixed")) + Number(changes) + Number(overlap && !cancelled) - Number(direct && cancelled) - Number(early && mutates(0)) });
+	expect(f.fallbacks).toEqual([...(seeded ? [names[0]!] : []), ...(early || mutates(1) || mode === "revoke" || mode.startsWith("rejected") ? Array(1 + Number(overlap)).fill(names[1]!) : [])]);
+	if (direct && cancelled) await expect(readFile(path.join(cwd, `${names[1]}.txt`))).rejects.toMatchObject({ code: "ENOENT" });
+	else if ((direct || mode.startsWith("mixed")) && !(early && mutates(0))) expect(await readFile(path.join(cwd, `${names[Number(mode !== "mixed-producer")]}.txt`), "utf8")).toBe(String(stale || changes ? 3 : range ? 1 : 2));
+	await f.finish();
+	const timing = f.events.filter(event => event.type === "actor_action").at(-1)?.computation;
+	if (mode !== "binding") expect(timing?.hiddenComputeMs! > 0, JSON.stringify({ timing, events: f.events })).toBe(!stale && !unavailable && (!failed || direct) && !(direct && cancelled) && !["calculation-key", "revoke"].includes(mode));
+	if (cancelled) expect(f.events.filter(event => event.type === "actor_action")[0]?.computation?.hiddenComputeMs).toBe(0);
 });
 
 test("learns from executed tool workflows, reopens the saved state and supplies the next read", async () => {
@@ -134,24 +133,21 @@ test("learns from executed tool workflows, reopens the saved state and supplies 
 	const createStore = () => new PatternAwareStore(settings, state, patternAwareActionSemantics(PI_ACTION_SEMANTICS, cwd));
 	const store = createStore(); await store.load();
 	for (let round = 0; round < 4; round++) {
-		const f = systemHost(cwd, [createReadTool(cwd)], { patternStore: store }, { patternAware: settings }, `training-${round}`);
-		try {
-			await f.start(); await f.execute("read", { path: "first.txt" }); await f.finish();
-			await f.start("next"); await f.execute("read", { path: "next.txt" }); await f.finish(true);
-		} finally { await f.dispose(); }
+		await using f = disposable(systemHost(cwd, [createReadTool(cwd)], { patternStore: store }, { patternAware: settings }, `training-${round}`));
+		await f.start(); await f.execute("read", { path: "first.txt" }); await f.finish();
+		await f.start("next"); await f.execute("read", { path: "next.txt" }); await f.finish(true);
 	}
 	await store.flush();
 	const reopened = createStore(); await reopened.load();
 	const f = systemHost(cwd, [createReadTool(cwd)], { patternStore: reopened }, { patternAware: settings }, "learned");
-	try {
-		await f.start(); await f.execute("read", { path: "first.txt" }); await f.finish();
-		await f.start("next");
-		await expect.poll(() => f.events.some(event => event.type === "candidate" && event.candidate.source === "pattern_aware" &&
-			event.state.status === "succeeded"), { timeout: 10_000 }).toBe(true);
-		f.fallbacks.length = 0;
-		expect(textOutput(await f.execute("read", { path: "next.txt" }))).toBe("next\n");
-		expect(f.fallbacks).toEqual([]);
-	} finally { await f.dispose(); await reopened.flush(); }
+	await using _cleanup = onExit(async () => { await f.dispose(); await reopened.flush(); });
+	await f.start(); await f.execute("read", { path: "first.txt" }); await f.finish();
+	await f.start("next");
+	await expect.poll(() => f.events.some(event => event.type === "candidate" && event.candidate.source === "pattern_aware" &&
+		event.state.status === "succeeded"), { timeout: 10_000 }).toBe(true);
+	f.fallbacks.length = 0;
+	expect(textOutput(await f.execute("read", { path: "next.txt" }))).toBe("next\n");
+	expect(f.fallbacks).toEqual([]);
 });
 
 test.for([false, true])("reconstructs shared searches after cancellation and namespace changes (cancel all: %s)", async (cancelAll, { skip }) => {
@@ -177,28 +173,27 @@ test.for([false, true])("reconstructs shared searches after cancellation and nam
 	const f = systemHost(cwd, tools, {
 		resolveInvocation: (tool, input) => tool === "grep" ? invocation : profile.invocations.get(tool) ?? resolvePiToolInvocation(tool, input, { cwd, environment: {} }),
 	});
-	try {
-		await f.start(); await f.preview("grep", { pattern: "one", path: "." }); await f.ready();
-		await f.finish(); await f.start("queries");
-		holding = true;
-		actors.push(f.execute("grep", { pattern: "two", path: ".", limit: 1 }, controllers[0]!.signal).catch(error => error)); await entered.promise;
-		actors.push(f.execute("grep", { pattern: "two", path: ".", limit: 2 }, controllers[1]!.signal).catch(error => error)); await joined.promise; await nextTurn();
-		controllers[0]!.abort(); if (cancelAll) controllers[1]!.abort();
-		expect(shared?.aborted).toBe(cancelAll); release.resolve();
-		const results = await Promise.all(actors); holding = false;
-		if (!cancelAll) expect(results[1]).toEqual(await f.oracle("grep", { pattern: "two", path: ".", limit: 2 }));
-		expect(builds).toBe(1); expect(f.fallbacks).toEqual(cancelAll ? ["grep", "grep"] : ["grep"]); f.fallbacks.length = 0;
-		const queries = [
-			{ tool: "grep", input: { pattern: "two", path: "." } },
-			{ tool: "find", input: { pattern: "*.txt", path: "." } },
-			{ tool: "read", input: { path: "a.txt", offset: 2, limit: 1 } },
-		];
-		for (const query of queries) expect(await f.execute(query.tool, query.input)).toEqual(await f.oracle(query.tool, query.input));
-		expect(f.fallbacks).toEqual([]);
-		await writeFile(path.join(cwd, "a.txt"), "two changed\n");
-		await writeFile(path.join(cwd, "added.txt"), "two new\n");
-		for (const query of queries) expect(await f.execute(query.tool, query.input)).toEqual(await f.oracle(query.tool, query.input));
-	} finally { for (const controller of controllers) controller.abort(); release.resolve(); await Promise.allSettled(actors); await f.dispose(); await profile.pool.dispose(); }
+	await using _cleanup = onExit(async () => { for (const controller of controllers) controller.abort(); release.resolve(); await Promise.allSettled(actors); await f.dispose(); await profile.pool.dispose(); });
+	await f.start(); await f.preview("grep", { pattern: "one", path: "." }); await f.ready();
+	await f.finish(); await f.start("queries");
+	holding = true;
+	actors.push(f.execute("grep", { pattern: "two", path: ".", limit: 1 }, controllers[0]!.signal).catch(error => error)); await entered.promise;
+	actors.push(f.execute("grep", { pattern: "two", path: ".", limit: 2 }, controllers[1]!.signal).catch(error => error)); await joined.promise; await nextTurn();
+	controllers[0]!.abort(); if (cancelAll) controllers[1]!.abort();
+	expect(shared?.aborted).toBe(cancelAll); release.resolve();
+	const results = await Promise.all(actors); holding = false;
+	if (!cancelAll) expect(results[1]).toEqual(await f.oracle("grep", { pattern: "two", path: ".", limit: 2 }));
+	expect(builds).toBe(1); expect(f.fallbacks).toEqual(cancelAll ? ["grep", "grep"] : ["grep"]); f.fallbacks.length = 0;
+	const queries = [
+		{ tool: "grep", input: { pattern: "two", path: "." } },
+		{ tool: "find", input: { pattern: "*.txt", path: "." } },
+		{ tool: "read", input: { path: "a.txt", offset: 2, limit: 1 } },
+	];
+	for (const query of queries) expect(await f.execute(query.tool, query.input)).toEqual(await f.oracle(query.tool, query.input));
+	expect(f.fallbacks).toEqual([]);
+	await writeFile(path.join(cwd, "a.txt"), "two changed\n");
+	await writeFile(path.join(cwd, "added.txt"), "two new\n");
+	for (const query of queries) expect(await f.execute(query.tool, query.input)).toEqual(await f.oracle(query.tool, query.input));
 });
 
 test.for(["in-place", "git"] as const)("keeps effects private, retries restored preimages and transfers an aborted claim (%s)", async driver => {
@@ -253,28 +248,27 @@ test.each(["ordered", "independent", "dependent"])("adopts only the proven effec
 		getSettings: () => ({ enabled: true, drafterEnabled: predict, candidateLimit: 1, maxConcurrentActions: 2,
 			drafterMaxDepth: 2, tools: ["write", "edit"], patternAware: { enabled: false } }),
 	});
-	try {
-		await f.start(); await f.ready(order === "independent" ? 2 : 3); predict = false;
-		expect(await readFile(file, "utf8")).toBe("original\n");
-		if (order === "independent") {
-			await fork.promise; await f.execute(steps[1]!.tool, steps[1]!.input); release.resolve(); await f.ready(3);
-		}
-		await f.finish(true);
-		if (order === "dependent") {
-			await f.start("missing-parent"); await expect(f.execute(steps[1]!.tool, steps[1]!.input)).rejects.toThrow();
-			expect(await readFile(file, "utf8")).toBe("original\n"); await f.finish();
-		}
-		for (const [index, step] of steps.entries()) {
-			if (order === "independent" && index < 2) continue;
-			await f.start(`step-${index}`);
-			await f.execute(step.tool, step.input); await f.finish();
-		}
-		expect(f.fallbacks).toEqual(order === "dependent" ? ["edit"] : []);
-		const expected = order === "independent" ? "final\n" : "final\nbeta\n";
-		expect(await readFile(file, "utf8")).toBe(expected);
-		expect(await readFile(path.join(cwd, "alias.txt"), "utf8")).toBe(expected);
-		if (order === "independent") await expect(readFile(path.join(cwd, "unused.txt"))).rejects.toMatchObject({ code: "ENOENT" });
-	} finally { release.resolve(); await f.dispose(); await sandbox.dispose(); }
+	await using _cleanup = onExit(async () => { release.resolve(); await f.dispose(); await sandbox.dispose(); });
+	await f.start(); await f.ready(order === "independent" ? 2 : 3); predict = false;
+	expect(await readFile(file, "utf8")).toBe("original\n");
+	if (order === "independent") {
+		await fork.promise; await f.execute(steps[1]!.tool, steps[1]!.input); release.resolve(); await f.ready(3);
+	}
+	await f.finish(true);
+	if (order === "dependent") {
+		await f.start("missing-parent"); await expect(f.execute(steps[1]!.tool, steps[1]!.input)).rejects.toThrow();
+		expect(await readFile(file, "utf8")).toBe("original\n"); await f.finish();
+	}
+	for (const [index, step] of steps.entries()) {
+		if (order === "independent" && index < 2) continue;
+		await f.start(`step-${index}`);
+		await f.execute(step.tool, step.input); await f.finish();
+	}
+	expect(f.fallbacks).toEqual(order === "dependent" ? ["edit"] : []);
+	const expected = order === "independent" ? "final\n" : "final\nbeta\n";
+	expect(await readFile(file, "utf8")).toBe(expected);
+	expect(await readFile(path.join(cwd, "alias.txt"), "utf8")).toBe(expected);
+	if (order === "independent") await expect(readFile(path.join(cwd, "unused.txt"))).rejects.toMatchObject({ code: "ENOENT" });
 });
 
 test.for(["unrelated", "changed", "descendant"])("retains native workflow results across prompts and validates Actor changes (%s)", async (change, { skip }) => {
@@ -294,23 +288,22 @@ test.for(["unrelated", "changed", "descendant"])("retains native workflow result
 		getSettings: () => ({ enabled: true, drafterEnabled: predict, candidateLimit: 1, drafterMaxDepth: 1,
 			tools: ["bash", "write"], patternAware: { enabled: false } }),
 	});
-	try {
-		const status = await native.backend.check(true);
-		if (status.state !== "ready") return skip(status.detail);
-		await f.start(); if (!predict) await f.preview("bash", { command: "cat a.txt" });
-		await f.ready(predict ? 2 : 1); predict = false;
-		await f.finish(true); await f.start("next-prompt");
-		await f.execute("write", { path: change === "changed" ? "a.txt" : "b.txt", content: "updated\n" });
-		expect(textOutput(await f.execute("bash", { command: "cat a.txt" }))).toBe(change === "changed" ? "updated\n" : "original\n");
-		if (change === "descendant") {
-			await f.finish(); await f.start("next");
-			expect(textOutput(await f.execute("bash", { command: "cat c.txt" }))).toBe("second\n");
-		}
-		if (change !== "changed") {
-			expect(f.fallbacks).toEqual(["write"]);
-			expect(f.events.filter(event => event.type === "candidate" && event.state.status === "running")).toHaveLength(change === "descendant" ? 2 : 1);
-		}
-	} finally { await f.dispose(); await sandbox.dispose(); await native.dispose(); }
+	await using _cleanup = onExit(async () => { await f.dispose(); await sandbox.dispose(); await native.dispose(); });
+	const status = await native.backend.check(true);
+	if (status.state !== "ready") return skip(status.detail);
+	await f.start(); if (!predict) await f.preview("bash", { command: "cat a.txt" });
+	await f.ready(predict ? 2 : 1); predict = false;
+	await f.finish(true); await f.start("next-prompt");
+	await f.execute("write", { path: change === "changed" ? "a.txt" : "b.txt", content: "updated\n" });
+	expect(textOutput(await f.execute("bash", { command: "cat a.txt" }))).toBe(change === "changed" ? "updated\n" : "original\n");
+	if (change === "descendant") {
+		await f.finish(); await f.start("next");
+		expect(textOutput(await f.execute("bash", { command: "cat c.txt" }))).toBe("second\n");
+	}
+	if (change !== "changed") {
+		expect(f.fallbacks).toEqual(["write"]);
+		expect(f.events.filter(event => event.type === "candidate" && event.state.status === "running")).toHaveLength(change === "descendant" ? 2 : 1);
+	}
 });
 
 test("reconsiders restored results while sharing pending reads and retains fresh queries across turns", async () => {
@@ -335,29 +328,28 @@ test("reconsiders restored results while sharing pending reads and retains fresh
 		} } }],
 	});
 	let actors: Promise<unknown>[] = [];
-	try {
-		await f.start(); await f.preview("read", args); await f.ready();
-		await writeFile(file, original.replaceAll("line", "edit"));
-		await f.preview("read", wide); await computed.promise;
-		actors = [1, 2].map(() => f.execute("read", args, controller.signal).catch(error => error)); await entered.promise;
-		await writeFile(file, original); release.resolve();
-		const expected = await reader.execute("oracle", args); expect(await Promise.all(actors)).toEqual([expected, expected]);
-		await f.preview("read", { ...args, offset: 6 }); await f.finish(); await f.start("second");
-		for (const event of f.events.filter(event => event.type === "actor_action")) {
-			expect(event.settlement.provider).toMatchObject({ kind: "speculative", match: { kind: "exact" } }); expect(event.computation?.hiddenComputeMs).toBeGreaterThan(0);
-		}
-		for (const input of [args, wide])
-			expect(await f.execute("read", input)).toEqual(await reader.execute("reference", input));
-		expect({ runs, fallbacks: f.fallbacks }).toEqual({ runs: 2, fallbacks: [] });
-		await f.execute("write", { path: "notes.txt", content: "new\n" });
-		await f.preview("read", wide, undefined, "fresh");
-		expect(textOutput(await f.execute("read", wide, undefined, "fresh"))).toBe("new\n");
-		await writeFile(file, "prepared\n"); await f.preview("read", wide); await writeFile(file, "changed again\n");
-		expect(textOutput(await f.execute("read", wide))).toBe("changed again\n");
-		await writeFile(file, original); expect(await f.execute("read", args)).toEqual(await reader.execute("restored", args)); await f.finish();
-		const settled = f.events.filter(event => event.type === "actor_action");
-		expect(settled.at(-3)?.computation?.hiddenComputeMs).toBeGreaterThan(0);
-		expect(settled.at(-2)?.computation?.hiddenComputeMs).toBe(0);
-		expect(settled.at(-1)?.settlement.provider).toMatchObject({ kind: "speculative", match: { kind: "exact" } });
-	} finally { controller.abort(); release.resolve(); await Promise.allSettled(actors); await f.dispose(); }
+	await using _cleanup = onExit(async () => { controller.abort(); release.resolve(); await Promise.allSettled(actors); await f.dispose(); });
+	await f.start(); await f.preview("read", args); await f.ready();
+	await writeFile(file, original.replaceAll("line", "edit"));
+	await f.preview("read", wide); await computed.promise;
+	actors = [1, 2].map(() => f.execute("read", args, controller.signal).catch(error => error)); await entered.promise;
+	await writeFile(file, original); release.resolve();
+	const expected = await reader.execute("oracle", args); expect(await Promise.all(actors)).toEqual([expected, expected]);
+	await f.preview("read", { ...args, offset: 6 }); await f.finish(); await f.start("second");
+	for (const event of f.events.filter(event => event.type === "actor_action")) {
+		expect(event.settlement.provider).toMatchObject({ kind: "speculative", match: { kind: "exact" } }); expect(event.computation?.hiddenComputeMs).toBeGreaterThan(0);
+	}
+	for (const input of [args, wide])
+		expect(await f.execute("read", input)).toEqual(await reader.execute("reference", input));
+	expect({ runs, fallbacks: f.fallbacks }).toEqual({ runs: 2, fallbacks: [] });
+	await f.execute("write", { path: "notes.txt", content: "new\n" });
+	await f.preview("read", wide, undefined, "fresh");
+	expect(textOutput(await f.execute("read", wide, undefined, "fresh"))).toBe("new\n");
+	await writeFile(file, "prepared\n"); await f.preview("read", wide); await writeFile(file, "changed again\n");
+	expect(textOutput(await f.execute("read", wide))).toBe("changed again\n");
+	await writeFile(file, original); expect(await f.execute("read", args)).toEqual(await reader.execute("restored", args)); await f.finish();
+	const settled = f.events.filter(event => event.type === "actor_action");
+	expect(settled.at(-3)?.computation?.hiddenComputeMs).toBeGreaterThan(0);
+	expect(settled.at(-2)?.computation?.hiddenComputeMs).toBe(0);
+	expect(settled.at(-1)?.settlement.provider).toMatchObject({ kind: "speculative", match: { kind: "exact" } });
 });

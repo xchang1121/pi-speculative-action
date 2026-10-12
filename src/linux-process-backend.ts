@@ -73,13 +73,7 @@ export interface CompletedProcessReplayOptions {
 	readonly invocation: (request: ProcessExecutionRequest) => ToolProcessInvocation | undefined;
 }
 
-export interface ActorProcessReplayOptions extends CompletedProcessReplayOptions {
-	readonly held?: {
-		readonly realShell: string;
-		readonly executor: (shellPath: string) => ProcessExecutor;
-		readonly scope?: () => ExecutionScope | undefined;
-	};
-}
+export type ActorProcessReplayOptions = CompletedProcessReplayOptions & { readonly held?: boolean };
 
 export interface LinuxProcessBackendStatus {
 	readonly state: "ready" | "unavailable";
@@ -368,38 +362,59 @@ export class LinuxProcessReuseBackend {
 
 	private get hasLiveResults(): boolean { return this.producers > 0 || this.handoffs.hasResults; }
 
+	private heldBoundary(): Promise<LinuxHeldExecBoundary> {
+		if (!this.heldExec) {
+			const controller = new AbortController();
+			this.heldExec = { controller, ready: LinuxHeldExecBoundary.open({ storeRoot: this.options.storeRoot,
+				binary: this.options.heldExecBinary, signal: AbortSignal.any([this.store.signal, controller.signal]) }) };
+		}
+		return this.heldExec.ready;
+	}
+
+	private async nativeRequested(scope?: ExecutionScope, signal?: AbortSignal): Promise<boolean> {
+		const observation = this.observations.getStore();
+		return !!(observation?.learn && !observation.closed && sameScope(observation.scope, scope)) || this.hasLiveResults ||
+			await this.store.mayHaveCertificates(undefined, signal) || this.hasLiveResults;
+	}
+
+	private nativeObservation(sourceRoot: string, scope?: ExecutionScope, signal?: AbortSignal) {
+		let descriptors: boolean | "inspect" = this.handoffs.needsContinuationTracking(scope);
+		if (scope) for (const binding of this.handoffs.bindings(scope)) {
+			const invocation = this.handoffs.resolveBinding(binding, scope);
+			if (invocation && ("trackingOnly" in invocation || invocation.resources?.handles.length) && invocation.sourceRoot === sourceRoot) descriptors = true;
+		}
+		if (!descriptors && (this.observations.getStore()?.learn || this.hasLiveResults)) descriptors = "inspect";
+		return { sourceRoot, scope: snapshotExecutionScope(scope), signal, descriptors,
+			decide: (process: HeldExecProcess) => this.decideHeldExec(process, process.scope) };
+	}
+
+	/** Observe the native launches of the actual callback, independently of its tool name or process adapter. */
+	async observeNative<Value>(sourceRoot: string, scope: ExecutionScope, signal: AbortSignal | undefined, execute: () => Promise<Value>): Promise<Value> {
+		let boundary: LinuxHeldExecBoundary | undefined;
+		const owner = snapshotExecutionScope(scope)!;
+		try {
+			if (!this.disposed && process.platform === "linux" && await this.nativeRequested(owner, signal)) {
+				const ready = await waitForCompletion(this.heldBoundary(), signal);
+				if (ready.status === "completed") boundary = ready.value;
+			}
+		} catch { /* Optional native observation leaves the actual callback authoritative. */ }
+		return boundary ? boundary.observe(this.nativeObservation(path.resolve(sourceRoot), owner, signal), execute) : execute();
+	}
+
 	async prepareActorReplay(host: ProcessExecutor, options: ActorProcessReplayOptions, refresh = false, owner = this.store.signal): Promise<PreparedProcessExecutionRoute> {
 		if (process.platform !== "linux") return { state: "unavailable", detail: "Linux or WSL 2 required" };
 		const signal = AbortSignal.any([owner, this.store.signal]);
 		let state: "degraded" | "ready" = "degraded";
-		let detail = options.held ? "Bash history; child handoff checked when evidence exists or on refresh" : "matching whole Bash calls; this shell cannot hold child processes";
+		let detail = options.held ? "Bash history; native startup checked when evidence exists or on refresh" : "matching whole Bash calls";
 		let prepared: Promise<ProcessExecutor> | undefined;
 		const prepare = async () => {
 			signal.throwIfAborted();
 			let executor = host;
 			if (options.held) try {
-				if (!this.heldExec) {
-					const controller = new AbortController();
-					this.heldExec = { controller, ready: LinuxHeldExecBoundary.open({ storeRoot: this.options.storeRoot,
-						binary: this.options.heldExecBinary, signal: AbortSignal.any([signal, controller.signal]) }) };
-				}
-				const boundary = await this.heldExec.ready;
-				executor = boundary.executor(options.held.executor(boundary.shellPath), {
-					realShell: options.held.realShell,
-					sourceRoot: path.resolve(options.sourceRoot),
-					descriptors: request => {
-						if (this.handoffs.needsContinuationTracking(request.scope)) return true;
-						if (request.scope) for (const binding of this.handoffs.bindings(request.scope)) {
-							const invocation = this.handoffs.resolveBinding(binding, request.scope);
-							if (invocation && ("trackingOnly" in invocation || invocation.resources?.handles.length) && invocation.sourceRoot === path.resolve(options.sourceRoot)) return true;
-						}
-						// A speculative producer may hold an inherited-pipe result: its launch identity includes those descriptors.
-						return this.observations.getStore()?.learn || this.hasLiveResults ? "inspect" : false;
-					},
-					decide: (process) => this.decideHeldExec(process, process.scope),
-				}, host);
+				const boundary = await this.heldBoundary(), sourceRoot = path.resolve(options.sourceRoot);
+				executor = { execute: request => boundary.observe({ ...this.nativeObservation(sourceRoot, request.scope, request.signal), skipRoot: true }, () => host.execute(request)) };
 				state = "ready";
-				detail = "matching whole Bash calls plus completed or running child processes";
+				detail = "matching whole Bash calls plus native process startup observation";
 			} catch (error) {
 				detail = `matching whole Bash calls; child handoff unavailable (${errorMessage(error)})`;
 			}
@@ -409,12 +424,10 @@ export class LinuxProcessReuseBackend {
 		return { get state() { return state; }, get detail() { return detail; }, executor: {
 			execute: async (request) => {
 				try {
-					request = { ...request, scope: snapshotExecutionScope("scope" in request ? request.scope : options.held?.scope?.()) };
+					request = { ...request, scope: snapshotExecutionScope(request.scope) };
 				} catch { return host.execute(request); }
-				const observation = this.observations.getStore();
-				const learning = observation?.learn && !observation.closed && sameScope(observation.scope, request.scope);
 				// Learning explicitly requests held execs; other calls retain the empty-history fast path.
-				if ((!learning && !this.hasLiveResults && !(await this.store.mayHaveCertificates(undefined, request.signal)) && !this.hasLiveResults) || signal.aborted || request.signal?.aborted) return host.execute(request);
+				if (!await this.nativeRequested(request.scope, request.signal) || signal.aborted || request.signal?.aborted) return host.execute(request);
 				const ready = await waitForCompletion(prepared ??= prepare(), AbortSignal.any([signal, ...(request.signal ? [request.signal] : [])]));
 				return (ready.status === "completed" ? ready.value : host).execute(request);
 			},
@@ -431,10 +444,11 @@ export class LinuxProcessReuseBackend {
 	/** Hit-only Actor path. Certificate lookup and replay deliberately require no tracing or confinement tools. */
 	completedReplayExecutor(host: ProcessExecutor, options: CompletedProcessReplayOptions): ProcessExecutor {
 		const sourceRoot = path.resolve(options.sourceRoot);
+		const execute = (request: ProcessExecutionRequest) => LinuxHeldExecBoundary.command(() => host.execute(request));
 		const acceptProducer = (producer: ProcessProducerProof) => actorReplayProducer(producer, sensitivePaths(this.options.storeRoot, this.options.deniedPaths));
 		return {
 			execute: async (request) => {
-				if (this.disposed || process.platform !== "linux" || !pathContains(sourceRoot, request.cwd)) return host.execute(request);
+				if (this.disposed || process.platform !== "linux" || !pathContains(sourceRoot, request.cwd)) return execute(request);
 				this.addActor("wholeCommandRequests");
 				const result = await TimelineInterval.outside(async () => {
 				let committed = false;
@@ -466,7 +480,7 @@ export class LinuxProcessReuseBackend {
 				});
 				if (result) return result;
 				this.addActor("wholeCommandMisses");
-				return host.execute(request);
+				return execute(request);
 			},
 		};
 	}

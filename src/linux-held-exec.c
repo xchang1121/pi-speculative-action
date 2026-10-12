@@ -45,6 +45,61 @@
 static const long options = PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK |
 	PTRACE_O_TRACEVFORKDONE | PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXEC | PTRACE_O_EXITKILL;
 
+/* Stable Node-API types. Weak imports keep the same source usable as a static
+ * tracer and as the image library loaded by programs without a Node runtime. */
+typedef void *napi_env, *napi_value, *napi_callback_info;
+typedef napi_value (*napi_callback)(napi_env, napi_callback_info);
+extern int napi_get_cb_info(napi_env, napi_callback_info, size_t *, napi_value *, napi_value *, void **) __attribute__((weak));
+extern int napi_get_value_int32(napi_env, napi_value, int32_t *) __attribute__((weak));
+extern int napi_create_int32(napi_env, int32_t, napi_value *) __attribute__((weak));
+extern int napi_create_function(napi_env, const char *, size_t, napi_callback, void *, napi_value *) __attribute__((weak));
+static __thread int startup_gate[2] = {-1, -1};
+static __thread pid_t startup_observer;
+static pthread_once_t startup_registration = PTHREAD_ONCE_INIT;
+static int startup_registered;
+
+static void startup_child(void) {
+	if (startup_gate[0] < 0 || startup_observer <= 0) return;
+	pid_t pid = getpid(); char ready;
+	struct pollfd channel = {.fd = startup_gate[0], .events = POLLIN};
+	/* Only async-signal-safe operations here, before libuv's original child setup.
+	 * A missing observer leaves the original exec and its error channel intact. */
+	if (!prctl(PR_SET_PTRACER, (unsigned long)startup_observer, 0, 0, 0)) {
+		if (send(channel.fd, &pid, sizeof(pid), MSG_NOSIGNAL) == sizeof(pid)) {
+			int status;
+			do { status = poll(&channel, 1, 5000); } while (status < 0 && errno == EINTR);
+			if (status > 0 && read(channel.fd, &ready, 1) != 1) ready = 0;
+		}
+		(void)prctl(PR_SET_PTRACER, 0, 0, 0, 0);
+	}
+	close(startup_gate[0]); startup_gate[0] = -1;
+}
+
+static void register_startup(void) { startup_registered = pthread_atfork(NULL, NULL, startup_child) == 0; }
+
+/* Open a gate (0), bind its observer PID (>0), or release the parent ends (-1).
+ * Thread-local state cannot lend one worker's launch to another callback. */
+static napi_value startup_bridge(napi_env env, napi_callback_info info) {
+	size_t count = 1; napi_value argument, result; int32_t operation, value = -1;
+	if (napi_get_cb_info(env, info, &count, &argument, NULL, NULL) || count != 1 ||
+		napi_get_value_int32(env, argument, &operation)) return NULL;
+	if (!operation && startup_gate[0] < 0) {
+		if (!socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, startup_gate)) value = startup_gate[1];
+	} else if (operation > 0 && startup_gate[0] >= 0 && !startup_observer) {
+		startup_observer = operation; close(startup_gate[1]); startup_gate[1] = -1; value = 0;
+	} else if (operation == -1) {
+		close(startup_gate[0]); close(startup_gate[1]); startup_gate[0] = startup_gate[1] = -1; startup_observer = 0; value = 0;
+	}
+	return napi_create_int32(env, value, &result) ? NULL : result;
+}
+
+napi_value napi_register_module_v1(napi_env env, napi_value exports) {
+	(void)exports; napi_value result;
+	if (!napi_create_function || !napi_get_cb_info || !napi_get_value_int32 || !napi_create_int32 ||
+		pthread_once(&startup_registration, register_startup) || !startup_registered) return NULL;
+	return napi_create_function(env, "startup", (size_t)-1, startup_bridge, NULL, &result) ? NULL : result;
+}
+
 #define MAX_LINE 32768
 #define MAX_OUTPUT_EVENTS 65536
 #define MAX_OUTPUT_BYTES (512UL * 1024 * 1024)
@@ -134,25 +189,7 @@ struct traced_process {
 	long syscall;
 	unsigned long arguments[6];
 	int descriptor_count, descriptors[MAX_HANDLES], internal_message;
-	uint64_t launch, image; /* The exec image's identity with its argv, and alone: what the decider let run for the rest of this call. */
 };
-
-/* A launch is its executable's inode and its exact argv: FNV-1a over both, 0 when unreadable; `image` gets the inode's alone. */
-static uint64_t launch_key(pid_t pid, uint64_t *image_key) {
-	char path[64], argv[8192]; struct stat image;
-	snprintf(path, sizeof(path), "/proc/%ld/exe", (long)pid);
-	*image_key = 0;
-	if (stat(path, &image) < 0) return 0;
-	snprintf(path, sizeof(path), "/proc/%ld/cmdline", (long)pid);
-	int fd = open(path, O_RDONLY | O_CLOEXEC); if (fd < 0) return 0;
-	ssize_t length = read(fd, argv, sizeof(argv)); close(fd);
-	if (length <= 0 || length == (ssize_t)sizeof(argv)) return 0; /* A truncated argv cannot name its launch. */
-	uint64_t hash = 1469598103934665603ULL, parts[2] = {image.st_dev, image.st_ino};
-	for (size_t index = 0; index < sizeof(parts); index++) hash = (hash ^ ((unsigned char *)parts)[index]) * 1099511628211ULL;
-	*image_key = hash ? hash : 1;
-	for (ssize_t index = 0; index < length; index++) hash = (hash ^ (unsigned char)argv[index]) * 1099511628211ULL;
-	return hash ? hash : 1;
-}
 
 static int replace_with_exit(pid_t pid, unsigned code) {
 #if defined(__x86_64__)
@@ -781,26 +818,12 @@ static void free_events(struct output_event *events, unsigned count) {
 	free(events);
 }
 
-static char *take_env(const char *name) {
-	char *value = getenv(name);
-	char *copy = value ? strdup(value) : NULL;
-	if (value) explicit_bzero(value, strlen(value));
-	unsetenv(name);
-	return copy;
-}
-
 static int has_unmodeled_descriptors(int minimum) {
 	/* A closed standard stream would be filled by the first file opened; bypass before any is. */
 	for (int fd = 0; fd < 3; fd++) {
 		if (fcntl(fd, F_GETFD) < 0) return errno == EBADF ? 1 : -1;
 	}
-	int fds[MAX_HANDLES], count = descriptor_numbers(getpid(), minimum, fds, MAX_HANDLES);
-	if (count < 0) return errno == E2BIG ? 1 : -1;
-	for (int index = 0; index < count; index++) {
-		if (fcntl(fds[index], F_GETFD) >= 0) return 1;
-		if (errno != EBADF) return -1;
-	}
-	return 0;
+	return descriptor_numbers(getpid(), minimum, NULL, 0) < 0 ? (errno == E2BIG ? 1 : -1) : 0;
 }
 
 static int mapped_image(char *image, size_t capacity) {
@@ -1705,13 +1728,6 @@ static int walk_process_list(int (*walk)(struct decision_job *, int), struct dec
 	return result;
 }
 
-static int process_descriptors(struct traced_process *process, int tracked, int *fds) {
-	if (!tracked) return descriptor_numbers(process->pid, 0, fds, MAX_HANDLES);
-	if (!process->table || !process->table->complete || process->table->active) return -1;
-	for (unsigned index = 0; index < process->table->count; index++) fds[index] = process->table->entries[index].fd;
-	return (int)process->table->count;
-}
-
 /* Discover every rooted queue before testing historical objects for lost ownership.
  * Observation pins preserve identity and reachability, never a new resource owner. */
 static int queue_owners_locked(struct decision_job *job) {
@@ -1722,12 +1738,12 @@ static int queue_owners_locked(struct decision_job *job) {
 	if (!job->references) return -1;
 	for (struct traced_process *process = *domain->processes; process; process = process->next) {
 		if (process->historical || (!domain->enabled && process == job->process)) continue;
-		int fds[MAX_HANDLES], count = process_descriptors(process, domain->enabled, fds);
+		int fds[MAX_HANDLES], count = descriptor_numbers(process->pid, 0, fds, MAX_HANDLES);
 		if (count < 0) return -1;
 		for (int index = 0; index < count; index++) {
 			struct stat state;
 			if (domain->enabled) {
-				struct resource_object *object = origin_object(domain, process->table->entries[index]);
+				struct resource_object *object = origin_object(domain, descriptor_origin(process, fds[index]));
 				if (!object || !object->messages) continue;
 				state = (struct stat){.st_dev = object->device, .st_ino = object->inode, .st_mode = S_IFSOCK};
 			} else {
@@ -1770,21 +1786,28 @@ static int queue_owners_locked(struct decision_job *job) {
 	return 0;
 }
 
-/* Streams count endpoint access; files and counters require exact OFD identity.
- * The frozen tree and its current queues prove both, never observation pins. */
+/* The frozen kernel table proves current owners even during an unrelated close.
+ * Streams count endpoint access; files and counters require exact OFD identity. */
 static int outside_references_locked(struct decision_job *job, int pin) {
 	struct descriptor_domain *domain = job->domain;
 	struct stat state; if (fstat(pin, &state) < 0) return -1;
 	int description = !S_ISFIFO(state.st_mode) && !S_ISSOCK(state.st_mode), unknown = description ? -1 : 3, access = 0;
 	if (!domain || (domain->enabled && (!owned_pin(domain, pin) || !job->process->table || !job->process->table->complete))) return unknown;
-	unsigned object = domain->enabled ? (unsigned)(pin_object(domain, pin) - domain->objects) + 1 : 0;
 	for (struct traced_process *process = *domain->processes; (description || domain->enabled) && process; process = process->next) {
 		if (process == job->process || process->historical) continue;
-		int fds[MAX_HANDLES], count = process_descriptors(process, domain->enabled, fds);
+		int fds[MAX_HANDLES], count = descriptor_numbers(process->pid, 0, fds, MAX_HANDLES);
 		if (count < 0) return unknown;
 		for (int index = 0; index < count; index++) {
-			if (domain->enabled && process->table->entries[index].object != object) continue;
-			if (!description) { access |= process->table->entries[index].access; continue; }
+			if (!description) {
+				char name[64]; struct stat current;
+				snprintf(name, sizeof(name), "/proc/%ld/fd/%d", (long)process->pid, fds[index]);
+				if (stat(name, &current) < 0) return unknown;
+				if (current.st_dev == state.st_dev && current.st_ino == state.st_ino) {
+					int flags = descriptor_info(process->pid, fds[index], NULL); if (flags < 0) return unknown;
+					access |= (flags & O_ACCMODE) + 1;
+				}
+				continue;
+			}
 			long same = syscall(SYS_kcmp, process->pid, getpid(), KCMP_FILE, fds[index], pin);
 			if (same < 0) return -1;
 			if (!same) return 1;
@@ -2119,15 +2142,17 @@ static int closed_lock_object(struct decision_job *job, int pin) {
 		if (job->references[index].device == object->device && job->references[index].inode == object->inode) return 0;
 	for (struct traced_process *process = *domain->processes; process; process = process->next) {
 		if (process->historical) continue;
-		if (!process->table || !process->table->complete || process->table->active) return 0;
-		for (unsigned index = 0; index < process->table->count; index++) {
-			struct descriptor_origin origin = process->table->entries[index];
-			if (origin.object != (unsigned)(object - domain->objects) + 1) continue;
+		int fds[MAX_HANDLES], count = descriptor_numbers(process->pid, 0, fds, MAX_HANDLES);
+		if (!process->table || !process->table->complete || count < 0) return 0;
+		for (int index = 0; index < count; index++) {
+			char name[64]; struct stat state; snprintf(name, sizeof(name), "/proc/%ld/fd/%d", (long)process->pid, fds[index]);
+			if (stat(name, &state) < 0) return 0;
+			if (state.st_dev != object->device || state.st_ino != object->inode) continue;
 			unsigned represented = 0;
-			while (represented < job->position_count && syscall(SYS_kcmp, process->pid, getpid(), KCMP_FILE, origin.fd, job->positions[represented].duplicate) != 0) represented++;
+			while (represented < job->position_count && syscall(SYS_kcmp, process->pid, getpid(), KCMP_FILE, fds[index], job->positions[represented].duplicate) != 0) represented++;
 			if (represented == job->position_count) return 0;
 			struct file_locks locks = {0};
-			int valid = capture_file_locks(process->pid, origin.fd, &locks) == 0;
+			int valid = capture_file_locks(process->pid, fds[index], &locks) == 0;
 			free(locks.entries); if (!valid) return 0;
 		}
 	}
@@ -2611,8 +2636,6 @@ static int actor_decision(struct decision_job *job) {
 	free(descriptors); job->context = NULL;
 	if (!sent || read_line(connection, line, sizeof(line)) < 0) return -1;
 	if (!strcmp(line, "C")) return -1;
-	if (!strcmp(line, "c")) return -3; /* Continue, and this launch again in this call without asking. */
-	if (!strcmp(line, "e")) return -4; /* Continue, and this executable with any argv. */
 	if (!strcmp(line, "F")) return -2;
 	if (!strcmp(line, "O")) return connection;
 	if (sscanf(line, "P %u %u %zu %u %u %zu %u %u", &code, &job->count, &total, &job->position_count, &job->resource_count,
@@ -2842,7 +2865,7 @@ static int track_process(struct traced_process **processes, pid_t pid) {
 	return 0;
 }
 
-static void release_process(struct traced_process **processes, pid_t pid, struct descriptor_domain *domain) {
+static void release_process(struct traced_process **processes, pid_t pid, struct descriptor_domain *domain, int completed) {
 	struct traced_process **cursor = processes;
 	while (*cursor) {
 		struct traced_process *observer = *cursor;
@@ -2855,7 +2878,7 @@ static void release_process(struct traced_process **processes, pid_t pid, struct
 		}
 		size_t sent = 0;
 		while (observer->fd >= 0 && sent < 2) {
-			ssize_t moved = send(observer->fd, "D\n" + sent, 2 - sent, MSG_NOSIGNAL);
+			ssize_t moved = send(observer->fd, (completed ? "D\n" : "C\n") + sent, 2 - sent, MSG_NOSIGNAL);
 			if (moved < 0 && errno == EINTR) continue;
 			if (moved <= 0) break;
 			sent += (size_t)moved;
@@ -2880,7 +2903,7 @@ static int release_tracees(struct traced_process **processes, struct descriptor_
 		pid_t pid = waitpid(-1, &status, __WALL);
 		if (pid < 0) { if (errno == EINTR) continue; if (errno != ECHILD) return -1; break; }
 		for (item = *processes; item && (item->pid != pid || item->historical);) item = item->next;
-		if (WIFEXITED(status) || WIFSIGNALED(status)) { if (item) release_process(processes, pid, domain); continue; }
+		if (WIFEXITED(status) || WIFSIGNALED(status)) { if (item) release_process(processes, pid, domain, 1); continue; }
 		if (!item) { if (track_process(processes, pid) < 0) return -1; item = *processes; }
 		unsigned event = (unsigned)status >> 16; unsigned long child;
 		/* A fork racing the interrupt attaches a child that must be detached too. */
@@ -2897,8 +2920,8 @@ static int release_tracees(struct traced_process **processes, struct descriptor_
 	return 0;
 }
 
-static int trace(char **command, const char *socket_path, const char *token, const char *execution_id,
-	int skip, unsigned skip_code, int descriptors) {
+static int trace(const char *socket_path, const char *token, const char *execution_id,
+	int skip, unsigned skip_code, int descriptors, int skip_root) {
 	struct descriptor_domain domain = {.enabled = descriptors == 1};
 	pid_t barrier = 0;
 	sigset_t blocked, original;
@@ -2906,39 +2929,22 @@ static int trace(char **command, const char *socket_path, const char *token, con
 	if (pthread_sigmask(SIG_BLOCK, &blocked, &original) != 0) return 70;
 	int signals = signalfd(-1, &blocked, SFD_CLOEXEC | SFD_NONBLOCK);
 	if (signals < 0) return 70;
-	int gate[2];
-	if (pipe2(gate, O_CLOEXEC) < 0) return 70;
-	pid_t root = fork();
-	if (root < 0) return 70;
-	if (root == 0) {
-		char ready;
-		close(gate[1]);
-		if (transfer(gate[0], &ready, 1, 0) < 0) _exit(71);
-		close(gate[0]);
-		if (pthread_sigmask(SIG_SETMASK, &original, NULL) != 0) _exit(71);
-		execvp(command[0], command);
-		_exit(errno == ENOENT ? 127 : 126);
-	}
-	close(gate[0]);
-	if (ptrace(PTRACE_SEIZE, root, 0, options | (descriptors ? PTRACE_O_TRACESYSGOOD : 0)) < 0 || transfer(gate[1], "R", 1, 1) < 0) {
-		close(gate[1]);
-		kill(root, SIGKILL);
-		waitpid(root, NULL, 0);
-		return 72;
-	}
-	close(gate[1]);
-	int status = 0, root_status = -1;
-	unsigned exec_events = 0, allowed_count = 0;
-	uint64_t allowed[256];
+	pid_t root;
+	if (transfer(3, &root, sizeof(root), 0) < 0 || root <= 0) return 71;
+	if (ptrace(PTRACE_SEIZE, root, 0, options | (descriptors ? PTRACE_O_TRACESYSGOOD : 0)) < 0 || transfer(3, "R", 1, 1) < 0) return 72;
+	close(3);
+	int status = 0, root_status = -1, retiring = 0;
+	unsigned exec_events = !skip_root;
 	struct traced_process *processes = NULL;
 	domain.processes = &processes;
 	struct pollfd *polling = NULL;
 	size_t capacity = 0;
 	if (track_process(&processes, root) < 0) { kill(root, SIGKILL); goto fatal; }
 	for (;;) {
+		struct pollfd control = {.fd = STDIN_FILENO, .events = POLLIN};
+		if (!retiring && poll(&control, 1, 0) > 0) retiring = 1;
 		struct signalfd_siginfo notification;
 		while (read(signals, &notification, sizeof(notification)) > 0) {}
-		size_t count = 1;
 		for (struct traced_process *item = processes; item; item = item->next) {
 			struct decision_job *job = item->job;
 			if (!job) continue;
@@ -2963,15 +2969,17 @@ static int trace(char **command, const char *socket_path, const char *token, con
 				pthread_join(job->thread, NULL);
 				int result = job->result;
 				if (result >= 0) { item->fd = result; job->connection = -1; }
-				uint64_t key = result == -3 ? item->launch : result == -4 ? item->image : 0;
-				if (key && allowed_count < sizeof(allowed) / sizeof(*allowed)) allowed[allowed_count++] = key;
 				free_job(job); item->job = NULL; item->armed = 0;
 				if (result == -2) goto fatal;
 				if (descriptors) { item->pending = 0; if (barrier == item->pid) barrier = 0; }
 				else if (ptrace(PTRACE_CONT, item->pid, 0, 0) < 0 && errno != ESRCH) goto fatal;
 				continue;
 			} else if (received > 0 || (errno != EAGAIN && errno != EINTR)) goto fatal;
-			count++;
+		}
+		if (retiring) {
+			int busy = 0;
+			for (struct traced_process *item = processes; item; item = item->next) busy |= item->job != NULL;
+			if (!busy) { if (release_tracees(&processes, &domain, descriptors) < 0) goto fatal; break; }
 		}
 	manage_descriptors:
 		if (descriptors) {
@@ -3009,7 +3017,7 @@ static int trace(char **command, const char *socket_path, const char *token, con
 			goto fatal;
 		}
 		if (pid == 0) {
-			count = 1;
+			size_t count = 2;
 			for (struct traced_process *item = processes; item; item = item->next) if (item->job) count++;
 			if (count > capacity) {
 				struct pollfd *grown = realloc(polling, count * sizeof(*polling));
@@ -3017,7 +3025,8 @@ static int trace(char **command, const char *socket_path, const char *token, con
 				polling = grown; capacity = count;
 			}
 			polling[0] = (struct pollfd){.fd = signals, .events = POLLIN};
-			count = 1;
+			polling[1] = (struct pollfd){.fd = retiring ? -1 : STDIN_FILENO, .events = POLLIN};
+			count = 2;
 			for (struct traced_process *item = processes; item; item = item->next)
 				if (item->job) polling[count++] = (struct pollfd){.fd = item->job->channel[0], .events = POLLIN};
 			if (poll(polling, count, -1) < 0 && errno != EINTR) goto fatal;
@@ -3028,7 +3037,7 @@ static int trace(char **command, const char *socket_path, const char *token, con
 			if (pid == root) root_status = status;
 			for (struct traced_process *item = processes; item; item = item->next)
 				if (item->pid == pid && item->armed) goto fatal;
-			release_process(&processes, pid, &domain);
+			release_process(&processes, pid, &domain, 1);
 			continue;
 		}
 		if (!WIFSTOPPED(status)) continue;
@@ -3079,7 +3088,7 @@ static int trace(char **command, const char *socket_path, const char *token, con
 					current->table = item->table; item->table = NULL; current->call_epoch = item->call_epoch;
 					break;
 				}
-				release_process(&processes, (pid_t)previous, &domain);
+				release_process(&processes, (pid_t)previous, &domain, 0);
 			}
 			/* exec unshares CLONE_FILES before closing only this image's CLOEXEC slots. */
 			if (detach_descriptor_table(current, &domain) < 0) goto fatal;
@@ -3090,7 +3099,7 @@ static int trace(char **command, const char *socket_path, const char *token, con
 		}
 		if (event == PTRACE_EVENT_EXEC && ++exec_events > 1) {
 			if (skip && replace_with_exit(pid, skip_code) < 0) goto fatal;
-			if (socket_path) {
+			if (socket_path && !retiring) {
 				for (struct traced_process *item = processes; item; item = item->next) {
 					if (item->pid != pid) continue;
 					/* Earlier images still own completion of this process, including later execs. */
@@ -3102,10 +3111,6 @@ static int trace(char **command, const char *socket_path, const char *token, con
 						item->stopped = 1;
 					}
 					if (descriptors) { item->pending = 1; goto held; }
-					unsigned known = 0;
-					if ((item->launch = launch_key(pid, &item->image)))
-						while (known < allowed_count && allowed[known] != item->launch && allowed[known] != item->image) known++;
-					if (known < allowed_count) break; /* Allowed earlier in this call: native, as a declined decision. */
 					if (start_decision(item, socket_path, token, execution_id, NULL) == 0) goto held;
 					break;
 				}
@@ -3116,10 +3121,10 @@ static int trace(char **command, const char *socket_path, const char *token, con
 		if (ptrace(PTRACE_CONT, pid, 0, delivered) < 0 && errno != ESRCH) goto fatal;
 	held:;
 	}
-	while (processes) release_process(&processes, processes->pid, &domain);
+	while (processes) release_process(&processes, processes->pid, &domain, 0);
 	free(polling); close(signals);
 	pthread_sigmask(SIG_SETMASK, &original, NULL);
-	if (root_status < 0) return 125;
+	if (root_status < 0) return retiring ? 0 : 125;
 	if (WIFEXITED(root_status)) return WEXITSTATUS(root_status);
 	signal(WTERMSIG(root_status), SIG_DFL);
 	raise(WTERMSIG(root_status));
@@ -3127,7 +3132,7 @@ static int trace(char **command, const char *socket_path, const char *token, con
 fatal:
 	for (struct traced_process *item = processes; item; item = item->next) kill(item->pid, SIGKILL);
 	while (waitpid(-1, &status, __WALL) > 0 || errno == EINTR) {}
-	while (processes) release_process(&processes, processes->pid, &domain);
+	while (processes) release_process(&processes, processes->pid, &domain, 0);
 	free(polling); close(signals);
 	return 125;
 }
@@ -3500,6 +3505,15 @@ static int set_modified_times(void) {
 int main(int argc, char **argv) {
 	int dispatched = image_dispatch(argc, argv);
 	if (dispatched >= 0) return dispatched;
+	if (argc >= 2 && (!strcmp(argv[1], "--attach") || !strcmp(argv[1], "--attach-skip-code"))) {
+		int probe = !strcmp(argv[1], "--attach-skip-code");
+		if (probe && (argc != 3 || strspn(argv[2], "0123456789") != strlen(argv[2]) || atoi(argv[2]) > 255)) return 64;
+		char *socket = getenv("PI_SPEC_HELD_EXEC_SOCKET"), *token = getenv("PI_SPEC_HELD_EXEC_TOKEN"), *id = getenv("PI_SPEC_HELD_EXEC_ID");
+		char *descriptors = getenv("PI_SPEC_HELD_EXEC_DESCRIPTORS"), *skip = getenv("PI_SPEC_HELD_EXEC_ROOT");
+		if (!probe && (!socket || !token || !id)) return 64;
+		return trace(socket, token, id, probe, probe ? (unsigned)atoi(argv[2]) : 0,
+			descriptors && !strcmp(descriptors, "1") ? 1 : descriptors && !strcmp(descriptors, "2") ? 2 : 0, !!skip);
+	}
 	if (argc >= 2 && (!strcmp(argv[1], "--exec") || !strcmp(argv[1], "--exec-closed-input") || !strcmp(argv[1], "--exec-fds"))) {
 		int descriptors = !strcmp(argv[1], "--exec-fds"), name = descriptors ? 5 : 3, output_flags[2] = {-1, -1};
 		/* ",<stdout>,<stderr>": status flags the target's outputs carry natively, its parent's own (make's O_APPEND). */
@@ -3533,31 +3547,5 @@ int main(int argc, char **argv) {
 		int extra = has_unmodeled_descriptors(3);
 		return extra < 0 ? 70 : extra ? 65 : 0;
 	}
-	if (getenv("PI_SPEC_HELD_EXEC_SHELL")) {
-		char *real_shell = take_env("PI_SPEC_HELD_EXEC_SHELL");
-		char *socket_path = take_env("PI_SPEC_HELD_EXEC_SOCKET");
-		char *token = take_env("PI_SPEC_HELD_EXEC_TOKEN");
-		char *execution_id = take_env("PI_SPEC_HELD_EXEC_ID");
-		char *descriptors = take_env("PI_SPEC_HELD_EXEC_DESCRIPTORS");
-		int track_descriptors = descriptors && !strcmp(descriptors, "1") ? 1 : descriptors && !strcmp(descriptors, "2") ? 2 : 0;
-		free(descriptors);
-		if (!real_shell) return 70;
-		char **command = calloc((size_t)argc + 1, sizeof(*command));
-		if (!command) return 70;
-		command[0] = real_shell;
-		for (int index = 1; index < argc; index++) command[index] = argv[index];
-		if (!socket_path || !token || !execution_id) {
-			execvp(real_shell, command);
-			return errno == ENOENT ? 127 : 126;
-		}
-		return trace(command, socket_path, token, execution_id, 0, 0, track_descriptors);
-	}
-	if (argc < 2) return 64;
-	int command = 1, skip = 0;
-	unsigned skip_code = 0;
-	if (argc >= 4 && !strcmp(argv[1], "--skip-code")) {
-		skip = 1; skip_code = (unsigned)strtoul(argv[2], 0, 10); command = 3;
-		if (skip_code > 255) return 64;
-	}
-	return trace(argv + command, NULL, NULL, NULL, skip, skip_code, 0);
+	return 64;
 }

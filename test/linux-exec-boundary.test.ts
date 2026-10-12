@@ -1,3 +1,4 @@
+import { onExit } from "./async.ts";
 import { lstat, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { expect } from "vitest";
@@ -97,53 +98,52 @@ int main(int argc, char **argv) {
 		if (older) await writeFile(path.join(workspace, "input.txt"), "changed while waiting\n");
 		const publication = older ? holdProcessPublication(backend, 1500, () => writeFile(path.join(workspace, "input.txt"), "before\n")) : undefined;
 		const pending = produce(`: speculative-parent; ${scenario.command}`), settled = pending.catch(() => undefined);
-		try {
-			for (const phase of scenario.name === "foreign" ? ["running", "completed"] : [publication ? "running" : "completed"]) {
-				if (phase === "running") {
-					if (publication) await expect.poll(publication.reached, { timeout: 5000 }).toBe(true);
-					else await expect.poll(() => backend.metrics().misses).toBeGreaterThan(before.misses);
-				} else {
-					const branch = await pending, produced = metricDelta(before, backend.metrics());
-					if (["disposed", "completed", "security"].includes(scenario.name)) {
-						expect(produced.tainted).toBeGreaterThan(0);
-						expect(produced.published).toBe(0);
-					}
-					if (scenario.name === "security") expect(textOutput(branch.output.result)).toBe("nnp:1\n");
-					if (scenario.name === "cwd") expect(textOutput(branch.output.result)).toBe(scenario.expected);
-					if (scenario.name === "descriptor") {
-						expect(textOutput(branch.output.result)).toBe("descriptor-ok");
-						expect((await branch.validate?.())?.status).toBe("valid"); // The clock read by date makes this a one-shot transfer.
-						expect(produced.wholeCommandPublished).toBe(0);
-					}
-					if (scenario.name === "disposed") await branch.dispose();
-					if (scenario.name === "stale" || scenario.name === "link") await writeFile(path.join(workspace, scenario.name === "stale" ? "input.txt" : "data.txt"), scenario.name === "stale" ? "after\n" : "v2\n");
-					if (scenario.name === "foreign") await rm(path.join(workspace, scenario.file!));
+		await using _cleanup = onExit(async () => { publication?.close(); await (await settled)?.dispose(); await older?.dispose(); });
+		for (const phase of scenario.name === "foreign" ? ["running", "completed"] : [publication ? "running" : "completed"]) {
+			if (phase === "running") {
+				if (publication) await expect.poll(publication.reached, { timeout: 5000 }).toBe(true);
+				else await expect.poll(() => backend.metrics().misses).toBeGreaterThan(before.misses);
+			} else {
+				const branch = await pending, produced = metricDelta(before, backend.metrics());
+				if (["disposed", "completed", "security"].includes(scenario.name)) {
+					expect(produced.tainted).toBeGreaterThan(0);
+					expect(produced.published).toBe(0);
 				}
-				if (scenario.name === "completed") {
-					await backend.store.clear(); // Live effects survive disk loss and a recoverable native commit failure.
-					Reflect.set(backend, "decideHeldExec", async (...args: Parameters<typeof decide>) => {
-						const decision = await decide.apply(backend, args);
-						return decision.kind === "replay" ? { ...decision, descriptorOffsets: [{ fd: 63, device: "0", inode: "0", flags: 0, before: 0, after: 0 }] } : decision;
-					});
-					try { expect((await actor(scenario.command)).metrics.hits).toBe(0); }
-					finally { Reflect.set(backend, "decideHeldExec", decide); }
-					await rm(path.join(workspace, scenario.file!));
+				if (scenario.name === "security") expect(textOutput(branch.output.result)).toBe("nnp:1\n");
+				if (scenario.name === "cwd") expect(textOutput(branch.output.result)).toBe(scenario.expected);
+				if (scenario.name === "descriptor") {
+					expect(textOutput(branch.output.result)).toBe("descriptor-ok");
+					expect((await branch.validate?.())?.status).toBe("valid"); // The clock read by date makes this a one-shot transfer.
+					expect(produced.wholeCommandPublished).toBe(0);
 				}
-				const result = await actor(`printf 'actor-parent\\n'; ${scenario.command}`, scenario.name === "foreign" ? "later" : "benchmark", scenario.name !== "descriptor");
-				if (publication) expect(publication.joined()).toBe(true);
-				expect(result.output, scenario.name).toBe(`actor-parent\n${scenario.expected}`);
-				if (scenario.file) expect(await readFile(path.join(workspace, scenario.file), "utf8"))
-					.toBe(scenario.name === "descriptor" ? "descriptor" : `artifact:${["stale", "foreign"].includes(scenario.name) ? "after" : "before"}\n`);
-				expect(result.metrics, scenario.name).toMatchObject(scenario.metrics);
-				if ("hits" in scenario.metrics && scenario.metrics.hits) expect(result.metrics.reusedProcessMs).toBeGreaterThan(0);
-				else expect(result.metrics[scenario.name === "descriptor" ? "wholeCommandMisses" : "misses"]).toBeGreaterThan(0);
-				const branch = await pending;
-				expect(branch.output.isError, `${scenario.name}: ${textOutput(branch.output.result)}`).toBe(false);
-				if (scenario.name === "completed") await expect(branch.commit()).rejects.toMatchObject({
-					disposition: "recoverable", message: expect.stringContaining("partially consumed"),
-				});
-				if (scenario.name === "cwd") for (let repeat = 0; repeat < 3; repeat++) expect((await actor(scenario.command)).metrics.hits).toBe(0);
+				if (scenario.name === "disposed") await branch.dispose();
+				if (scenario.name === "stale" || scenario.name === "link") await writeFile(path.join(workspace, scenario.name === "stale" ? "input.txt" : "data.txt"), scenario.name === "stale" ? "after\n" : "v2\n");
+				if (scenario.name === "foreign") await rm(path.join(workspace, scenario.file!));
 			}
-		} finally { publication?.close(); await (await settled)?.dispose(); await older?.dispose(); }
+			if (scenario.name === "completed") {
+				await backend.store.clear(); // Live effects survive disk loss and a recoverable native commit failure.
+				Reflect.set(backend, "decideHeldExec", async (...args: Parameters<typeof decide>) => {
+					const decision = await decide.apply(backend, args);
+					return decision.kind === "replay" ? { ...decision, descriptorOffsets: [{ fd: 63, device: "0", inode: "0", flags: 0, before: 0, after: 0 }] } : decision;
+				});
+				try { expect((await actor(scenario.command)).metrics.hits).toBe(0); }
+				finally { Reflect.set(backend, "decideHeldExec", decide); }
+				await rm(path.join(workspace, scenario.file!));
+			}
+			const result = await actor(`printf 'actor-parent\\n'; ${scenario.command}`, scenario.name === "foreign" ? "later" : "benchmark", scenario.name !== "descriptor");
+			if (publication) expect(publication.joined()).toBe(true);
+			expect(result.output, scenario.name).toBe(`actor-parent\n${scenario.expected}`);
+			if (scenario.file) expect(await readFile(path.join(workspace, scenario.file), "utf8"))
+				.toBe(scenario.name === "descriptor" ? "descriptor" : `artifact:${["stale", "foreign"].includes(scenario.name) ? "after" : "before"}\n`);
+			expect(result.metrics, scenario.name).toMatchObject(scenario.metrics);
+			if ("hits" in scenario.metrics && scenario.metrics.hits) expect(result.metrics.reusedProcessMs).toBeGreaterThan(0);
+			else expect(result.metrics[scenario.name === "descriptor" ? "wholeCommandMisses" : "misses"]).toBeGreaterThan(0);
+			const branch = await pending;
+			expect(branch.output.isError, `${scenario.name}: ${textOutput(branch.output.result)}`).toBe(false);
+			if (scenario.name === "completed") await expect(branch.commit()).rejects.toMatchObject({
+				disposition: "recoverable", message: expect.stringContaining("partially consumed"),
+			});
+			if (scenario.name === "cwd") for (let repeat = 0; repeat < 3; repeat++) expect((await actor(scenario.command)).metrics.hits).toBe(0);
+		}
 	}
 });

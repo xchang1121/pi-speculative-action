@@ -60,7 +60,8 @@ export function createLinuxProcessExecutionWorld(
 		scope: "runtime",
 		isolation: "runtime_sandbox",
 		storage: backend.storage,
-		observeOperations: ({ action, scope, learn, inputs }, execute, observe) => backend.observeBindings(scope, execute, (bindings, computations) => {
+		observeOperations: ({ action, scope, learn, inputs, cwd, signal, enabled }, execute, observe) => backend.observeBindings(scope,
+			() => enabled && cwd ? backend.observeNative(cwd, scope, signal, execute) : execute(), (bindings, computations) => {
 			observe(action ? bindings.map(binding => describeOperation(binding, action)) : [], computations);
 		}, learn, inputs),
 		speculation: {

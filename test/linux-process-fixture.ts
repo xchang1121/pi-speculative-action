@@ -3,7 +3,7 @@ import { access, copyFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promise
 import os from "node:os";
 import path from "node:path";
 import { test, vi, type TestAPI } from "vitest";
-import { deferred } from "./async.ts";
+import { deferred, onExit } from "./async.ts";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { createBashTool, createLocalBashOperations } from "@earendil-works/pi-coding-agent";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
@@ -22,8 +22,8 @@ export type LinuxProcessBenchmark = Readonly<Awaited<ReturnType<typeof createLin
 export const processTest: ReturnType<TestAPI<{ benchmark: typeof createLinuxProcessBenchmark }>["skipIf"]> = test.extend<{ benchmark: typeof createLinuxProcessBenchmark }>({
 	benchmark: async ({}, use) => {
 		const fixtures: LinuxProcessBenchmark[] = [];
-		try { await use(async (...args) => { const fixture = await createLinuxProcessBenchmark(...args); fixtures.push(fixture); return fixture; }); }
-		finally { for (const fixture of fixtures) await fixture.dispose(); }
+		await using _cleanup = onExit(async () => { for (const fixture of fixtures) await fixture.dispose(); });
+		await use(async (...args) => { const fixture = await createLinuxProcessBenchmark(...args); fixtures.push(fixture); return fixture; });
 	},
 }).skipIf(process.platform !== "linux");
 
@@ -63,14 +63,17 @@ export async function createLinuxProcessBenchmark(
 	await mkdir(workspace);
 	const shellPath = "/bin/bash";
 	const environment: Readonly<Record<string, string>> = Object.freeze({
-		PATH: `${workspace}:/home/${os.userInfo().username}/.local/bin:/usr/local/bin:/usr/bin:/bin`,
+		PATH: `${workspace}:${path.dirname(process.execPath)}:/home/${os.userInfo().username}/.local/bin:/usr/local/bin:/usr/bin:/bin`,
 		HOME: os.homedir(),
 		SHELL: shellPath,
 		LANG: "C.UTF-8",
 	});
 	const executor = (shellPath: string) => adaptProcessToolOperations(createLocalBashOperations({ shellPath })), host = executor(shellPath);
-	if (processImages === false) await copyFile(await resolveLinuxExecHelper(backendOptions.heldExecBinary ?? process.env.PI_SPEC_HELD_EXEC),
-		backendOptions.heldExecBinary = path.join(root, "held-exec")); // The ordinary helper works without its adjacent image library.
+	if (processImages === false) {
+		const binary = await resolveLinuxExecHelper(backendOptions.heldExecBinary ?? process.env.PI_SPEC_HELD_EXEC);
+		backendOptions.heldExecBinary = path.join(root, "held-exec");
+		for (const suffix of ["", ".node"]) await copyFile(binary + suffix, backendOptions.heldExecBinary + suffix);
+	}
 	const backend = new LinuxProcessReuseBackend({ storeRoot, ...backendOptions });
 	const coordinator = new ProcessExecutionCoordinator(backend.completedReplayExecutor(host, {
 		sourceRoot: workspace, invocation: request => resolvePiToolInvocation("bash", { command: request.command }, {
@@ -105,7 +108,7 @@ export async function createLinuxProcessBenchmark(
 		workspaceSandbox,
 		tool: tool as AgentTool, // Preserve a portable type across nested schema packages.
 		prepareActorReplay: (refresh?: boolean) => backend.prepareActorReplay(host, {
-			sourceRoot: workspace, invocation: () => undefined, held: { realShell: shellPath, executor },
+			sourceRoot: workspace, invocation: () => undefined, held: true,
 		}, refresh).then(route => "executor" in route ? route : Promise.reject(new Error(route.detail))),
 		dispose: () => disposal ??= Promise.resolve().then(() => world.dispose?.())
 			.finally(() => workspaceSandbox.dispose()).finally(() => rm(root, { recursive: true, force: true })),

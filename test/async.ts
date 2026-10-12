@@ -1,5 +1,11 @@
 export { setImmediate as nextTurn } from "node:timers/promises";
 
+/** Release test resources at their lexical ownership boundary, including assertion failures. */
+export function disposable<Value extends { dispose(): unknown } | { close(): unknown }>(value: Value) {
+	return Object.assign(value, { [Symbol.asyncDispose]: async () => { await ("dispose" in value ? value.dispose() : value.close()); } });
+}
+export function onExit(dispose: () => Promise<void>) { return { [Symbol.asyncDispose]: dispose }; }
+
 /** Explicit race barriers; tests control admission and completion independently of elapsed time. */
 export function deferred<Value = void>() {
 	let resolve!: (value: Value | PromiseLike<Value>) => void;

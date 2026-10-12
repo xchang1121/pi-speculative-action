@@ -1,6 +1,7 @@
+import { onExit } from "./async.ts";
 // Constructed Actor sequences through the real host and Linux process world, PatternAware only (no model): which reuse path
 // serves the predicted command, and how long the Actor waits. The scenario table takes minutes of CPU; run it with PI_SPEC_REUSE_CHAIN=1.
-import { execSync } from "node:child_process";
+import { execSync, spawn } from "node:child_process";
 import { readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -55,8 +56,14 @@ async function chainWorld(files: readonly (readonly [string, string])[], loops: 
 		const route = await fixture.prepareActorReplay(), writer = createWriteTool(workspace), observed: (string | undefined)[] = [];
 		let renders = 0;
 		const report = { ...fixture.tool, name: "render_report", execute: async (...args: Parameters<typeof fixture.tool.execute>) => {
-			renders++; const result = await fixture.tool.execute(...args);
-			return { content: [{ type: "text" as const, text: `report:${textOutput(result)}` }], details: { renders } };
+			renders++;
+			const output = await new Promise<string>((resolve, reject) => {
+				const child = spawn(fixture.shellPath, ["-c", (args[1] as { command: string }).command],
+					{ cwd: workspace, env: fixture.environment, signal: args[2], stdio: ["ignore", "pipe", "pipe"] });
+				let text = ""; for (const stream of [child.stdout, child.stderr]) stream.on("data", data => { text += data; });
+				child.once("error", reject); child.once("close", code => code ? reject(new Error(`report exited ${code}`)) : resolve(text));
+			});
+			return { content: [{ type: "text" as const, text: `report:${output}` }], details: { renders } };
 		} };
 		const reportSemantics = { ...PI_ACTION_SEMANTICS.definition("bash")!, tool: report.name, epoch: "custom:report", projectors: [],
 			requirements: { capabilities: [...PI_ACTION_SEMANTICS.definition("bash")!.requirements.capabilities, "invocation.host_function" as const] } };
@@ -96,25 +103,24 @@ test.skipIf(process.platform !== "linux").for(["producer", "consumer", "unkeyed"
 		{ initial: { cpuCount: 1, idleCpuCount: 1 }, sample: async () => ({ cpuCount: 1, idleCpuCount: 1 }) }, role);
 	const wrapped = role === "consumer" || role === "unkeyed", running = wrapped || role === "retired-running", command = "printf remaining:; ./slow a.txt; :";
 	let publication: ReturnType<typeof holdProcessPublication> | undefined;
-	try {
-		await step("seed", "printf initial:; ./slow a.txt; :", 0);
-		if (running) publication = holdProcessPublication(fixture.backend);
-		await step("edit", { path: "a.txt", content: "alpha\nbeta\n" }, 0);
-		if (role === "retired-running") {
-			await host.startTurn({ turnID: "warming", tools, actorModel: testModel("actor"), actorOptions: undefined, context: { messages: [], tools } });
-			await expect.poll(publication!.reached, { timeout: 5000 }).toBe(true); await host.finishTurn("warming"); tools.splice(tools.findIndex(tool => tool.name === "render_report"), 1);
-		}
-		const measured = await step("check", `${command}; printf once >> marker`, async () => {
-			await expect.poll(() => publication ? publication.reached() : events.some(event => event.type === "candidate" &&
-				event.candidate.kind === "operation" && event.state.status === "succeeded"), { timeout: 5000 }).toBe(true);
-			await expect(readFile(path.join(workspace, "marker"))).rejects.toMatchObject({ code: "ENOENT" });
-		}, role === "stale" ? "printf fresh > a.txt" : undefined);
-		expect([measured.text, measured.hits, measured.hiddenMs! > 0]).toEqual([(wrapped ? "report:" : "") + execSync(command, { cwd: workspace, encoding: "utf8" }), Number(role !== "stale"), role !== "stale"]);
-		expect([renders(), await readFile(path.join(workspace, "marker"), "utf8")]).toEqual([1, "once"]);
-		expect(observed).toEqual([wrapped ? "bash" : "render_report", "write", role === "unkeyed" ? undefined : wrapped ? "render_report" : "bash"]);
-		expect(events.filter(event => event.type === "candidate" && event.state.status === "cancelled" && event.state.cause.code === "tool_disabled" && event.state.executionMs > 0)).toEqual([]);
-		if (publication) expect(publication.joined()).toBe(true);
-	} finally { publication?.close(); await host.dispose(); await fixture.dispose(); }
+	await using _cleanup = onExit(async () => { publication?.close(); await host.dispose(); await fixture.dispose(); });
+	await step("seed", "printf initial:; ./slow a.txt; :", 0);
+	if (running) publication = holdProcessPublication(fixture.backend);
+	await step("edit", { path: "a.txt", content: "alpha\nbeta\n" }, 0);
+	if (role === "retired-running") {
+		await host.startTurn({ turnID: "warming", tools, actorModel: testModel("actor"), actorOptions: undefined, context: { messages: [], tools } });
+		await expect.poll(publication!.reached, { timeout: 5000 }).toBe(true); await host.finishTurn("warming"); tools.splice(tools.findIndex(tool => tool.name === "render_report"), 1);
+	}
+	const measured = await step("check", `${command}; printf once >> marker`, async () => {
+		await expect.poll(() => publication ? publication.reached() : events.some(event => event.type === "candidate" &&
+			event.candidate.kind === "operation" && event.state.status === "succeeded"), { timeout: 5000 }).toBe(true);
+		await expect(readFile(path.join(workspace, "marker"))).rejects.toMatchObject({ code: "ENOENT" });
+	}, role === "stale" ? "printf fresh > a.txt" : undefined);
+	expect([measured.text, measured.hits, measured.hiddenMs! > 0]).toEqual([(wrapped ? "report:" : "") + execSync(command, { cwd: workspace, encoding: "utf8" }), Number(role !== "stale"), role !== "stale"]);
+	expect([renders(), await readFile(path.join(workspace, "marker"), "utf8")]).toEqual([1, "once"]);
+	expect(observed).toEqual([wrapped ? "bash" : "render_report", "write", role === "unkeyed" ? undefined : wrapped ? "render_report" : "bash"]);
+	expect(events.filter(event => event.type === "candidate" && event.state.status === "cancelled" && event.state.cause.code === "tool_disabled" && event.state.executionMs > 0)).toEqual([]);
+	if (publication) expect(publication.joined()).toBe(true);
 });
 
 test.skipIf(process.platform !== "linux" || !process.env.PI_SPEC_REUSE_CHAIN)("reuse chain", { timeout: 3_600_000 }, async () => {
@@ -124,17 +130,16 @@ test.skipIf(process.platform !== "linux" || !process.env.PI_SPEC_REUSE_CHAIN)("r
 			["Makefile", "all:\n\t@./slow a.txt\n\t@wc -l < b.txt\n"], ["check.sh", "set -e\ngrep -c a a.txt\n./slow b.txt\n"],
 			["stats.py", "text = open('a.txt').read()\ns = 0\nfor i in range(20_000_000): s += i % 7\nprint(len(text.split()), s)\n"],
 			["stats.js", "const t = require('fs').readFileSync('a.txt', 'utf8'); let s = 0; for (let i = 0; i < 1e9; i++) s += i % 7; console.log(t.length, s);\n"]], "3500000000");
-		try {
-			for (let index = 0; index < 3; index++) { await step(`learn-${index}-a`, scenario.first, 0); await step(`learn-${index}-b`, scenario.next, 1500); }
-			await step("measured-a", scenario.first, 0);
-			if (scenario.detour) await step("detour", scenario.detour, scenario.think ?? 4000);
-			const command = (scenario.actual ?? scenario.next).replace("WORKSPACE", workspace);
-			const measured = await step("measured", command, scenario.detour ? 100 : scenario.think ?? 4000, scenario.during);
-			const started = performance.now(), native = execSync(command, { cwd: workspace, encoding: "utf8", shell: "/bin/bash" }), nativeMs = performance.now() - started;
-			rows.push(`${name.padEnd(26)} native ${nativeMs.toFixed(0).padStart(5)} ms  Actor ${measured.ms.toFixed(0).padStart(5)} ms  ${measured.hits ? "reused" : "native"}`);
-			expect(measured.text.trim(), name).toBe(native.trim());
-			expect(measured.hits > 0, name).toBe(scenario.reuse);
-		} finally { await host.dispose(); await fixture.dispose(); }
+		await using _cleanup = onExit(async () => { await host.dispose(); await fixture.dispose(); });
+		for (let index = 0; index < 3; index++) { await step(`learn-${index}-a`, scenario.first, 0); await step(`learn-${index}-b`, scenario.next, 1500); }
+		await step("measured-a", scenario.first, 0);
+		if (scenario.detour) await step("detour", scenario.detour, scenario.think ?? 4000);
+		const command = (scenario.actual ?? scenario.next).replace("WORKSPACE", workspace);
+		const measured = await step("measured", command, scenario.detour ? 100 : scenario.think ?? 4000, scenario.during);
+		const started = performance.now(), native = execSync(command, { cwd: workspace, encoding: "utf8", shell: "/bin/bash" }), nativeMs = performance.now() - started;
+		rows.push(`${name.padEnd(26)} native ${nativeMs.toFixed(0).padStart(5)} ms  Actor ${measured.ms.toFixed(0).padStart(5)} ms  ${measured.hits ? "reused" : "native"}`);
+		expect(measured.text.trim(), name).toBe(native.trim());
+		expect(measured.hits > 0, name).toBe(scenario.reuse);
 	}
 	console.log(rows.join("\n"));
 });
@@ -145,31 +150,30 @@ test.skipIf(process.platform !== "linux").for(["build", "build_changed_after_pre
 	const { fixture, workspace, host, step, events } = await chainWorld([["a.txt", "alpha\n"], ["Makefile", "all:\n\t@./slow a.txt\n"]], "600000000", undefined,
 		horizon ? { initial: { cpuCount: 4, idleCpuCount: 4 }, sample: async () => ({ cpuCount: 4, idleCpuCount: 4 }) } : undefined);
 	let publication: ReturnType<typeof holdProcessPublication> | undefined;
-	try {
-		const command = build ? "make -s all" : `${worker} | tail -1${horizon ? `; ${worker} | tail -2` : ""}`;
-		await step("build", build ? "make -s" : `cat > a.txt <<'EOF'\nalpha\nEOF\n${worker} | tail -2`, 0);
-		if (bashMutation) {
-			await step("unchanged", "printf unchanged", 0);
-			expect(events.some(event => event.type === "candidate" && event.candidate.kind === "operation")).toBe(false);
-		}
-		if (horizon) publication = holdProcessPublication(fixture.backend);
-		await step("edit", bashMutation ? "printf 'alpha\\nbeta\\n' > a.txt" : { path: "a.txt", content: "alpha\nbeta\n" }, 0);
-		if (publication) {
-			await step("detour", "printf detour", () => expect.poll(publication!.reached, { timeout: 15_000 }).toBe(true));
-			const operation = events.filter(event => event.type === "candidate").find(event => event.candidate.kind === "operation")!.candidate.id;
-			const states = () => events.filter(event => event.type === "candidate").filter(event => event.candidate.id === operation).map(event => event.state.status);
-			expect(states(), JSON.stringify(events.filter(event => event.type === "candidate" || event.type === "operation_prediction"))).toEqual(["running"]);
-			expect(events.filter(event => event.type === "operation_prediction").map(event => event.settlement)).toContainEqual(expect.objectContaining({ observation: "unobserved", cause: expect.objectContaining({ code: "operation_not_observed" }) }));
-			publication.close(); publication = undefined;
-			await expect.poll(states, { timeout: 15_000 }).toEqual(["running", "succeeded"]);
-		}
-		// A PID-observing child has a one-shot result: the second native exec must run even after the first reuses it.
-		const measured = await step("check", command, bashMutation ? () => expect.poll(() => events.some(event => event.type === "candidate" &&
-			event.candidate.kind === "operation" && event.state.status === "succeeded"), { timeout: 15_000 }).toBe(true) : horizon ? 0 : 3000,
-			stale ? "printf 'newest\\n' > a.txt" : undefined);
-		expect([measured.text.trim(), measured.hits, measured.hiddenMs > 0], JSON.stringify({ events: events.filter(event => event.type === "candidate" || event.type === "operation_prediction"), metrics: fixture.backend.metrics() }))
-			.toEqual([execSync(command, { cwd: workspace, encoding: "utf8" }).trim(), Number(!stale), !stale]);
-	} finally { publication?.close(); await host.dispose(); await fixture.dispose(); }
+	await using _cleanup = onExit(async () => { publication?.close(); await host.dispose(); await fixture.dispose(); });
+	const command = build ? "make -s all" : `${worker} | tail -1${horizon ? `; ${worker} | tail -2` : ""}`;
+	await step("build", build ? "make -s" : `cat > a.txt <<'EOF'\nalpha\nEOF\n${worker} | tail -2`, 0);
+	if (bashMutation) {
+		await step("unchanged", "printf unchanged", 0);
+		expect(events.some(event => event.type === "candidate" && event.candidate.kind === "operation")).toBe(false);
+	}
+	if (horizon) publication = holdProcessPublication(fixture.backend);
+	await step("edit", bashMutation ? "printf 'alpha\\nbeta\\n' > a.txt" : { path: "a.txt", content: "alpha\nbeta\n" }, 0);
+	if (publication) {
+		await step("detour", "printf detour", () => expect.poll(publication!.reached, { timeout: 15_000 }).toBe(true));
+		const operation = events.filter(event => event.type === "candidate").find(event => event.candidate.kind === "operation")!.candidate.id;
+		const states = () => events.filter(event => event.type === "candidate").filter(event => event.candidate.id === operation).map(event => event.state.status);
+		expect(states(), JSON.stringify(events.filter(event => event.type === "candidate" || event.type === "operation_prediction"))).toEqual(["running"]);
+		expect(events.filter(event => event.type === "operation_prediction").map(event => event.settlement)).toContainEqual(expect.objectContaining({ observation: "unobserved", cause: expect.objectContaining({ code: "operation_not_observed" }) }));
+		publication.close(); publication = undefined;
+		await expect.poll(states, { timeout: 15_000 }).toEqual(["running", "succeeded"]);
+	}
+	// A PID-observing child has a one-shot result: the second native exec must run even after the first reuses it.
+	const measured = await step("check", command, bashMutation ? () => expect.poll(() => events.some(event => event.type === "candidate" &&
+		event.candidate.kind === "operation" && event.state.status === "succeeded"), { timeout: 15_000 }).toBe(true) : horizon ? 0 : 3000,
+		stale ? "printf 'newest\\n' > a.txt" : undefined);
+	expect([measured.text.trim(), measured.hits, measured.hiddenMs > 0], JSON.stringify({ events: events.filter(event => event.type === "candidate" || event.type === "operation_prediction"), metrics: fixture.backend.metrics() }))
+		.toEqual([execSync(command, { cwd: workspace, encoding: "utf8" }).trim(), Number(!stale), !stale]);
 });
 
 test.skipIf(process.platform !== "linux")("prepares a process from a predicted mutation before either Actor call, then adopts across turns", { timeout: 30_000 }, async () => {
@@ -180,19 +184,18 @@ test.skipIf(process.platform !== "linux")("prepares a process from a predicted m
 		return fauxAssistantMessage([{ type: "toolCall", id: "workflow", name: "speculative_workflow", arguments: { steps } }], { stopReason: "toolUse" });
 	});
 	const start = (turnID: string) => host.startTurn({ turnID, tools, actorModel: testModel("actor"), actorOptions: undefined, context: { messages: [], tools } });
-	try {
-		await start("write");
-		await expect.poll(() => events.filter(event => event.type === "candidate" && event.state.status === "succeeded"), { timeout: 15_000 }).toHaveLength(2);
-		expect(await readFile(path.join(workspace, "a.txt"), "utf8")).toBe("original\n");
-		for (const step of steps) {
-			if (step.tool === "bash") await start(step.tool);
-			const output = await host.execute({ turnID: step.tool, id: step.tool, tool: step.tool, args: step.input, tools }, undefined,
-				() => tools.find(tool => tool.name === step.tool)!.execute(step.tool, step.input as never));
-			if (step.tool === "bash") expect(textOutput(output as never).trim()).toBe(execSync(step.input.command!, { cwd: workspace, encoding: "utf8" }).trim());
-			await host.finishTurn(step.tool, step.tool === "bash");
-		}
-		const settled = events.filter(event => event.type === "actor_action").map(event => event.settlement);
-		expect(settled.map(event => event.provider.kind), JSON.stringify(settled)).toEqual(["speculative", "speculative"]);
-		expect(requests).toBe(1);
-	} finally { await host.dispose(); await fixture.dispose(); }
+	await using _cleanup = onExit(async () => { await host.dispose(); await fixture.dispose(); });
+	await start("write");
+	await expect.poll(() => events.filter(event => event.type === "candidate" && event.state.status === "succeeded"), { timeout: 15_000 }).toHaveLength(2);
+	expect(await readFile(path.join(workspace, "a.txt"), "utf8")).toBe("original\n");
+	for (const step of steps) {
+		if (step.tool === "bash") await start(step.tool);
+		const output = await host.execute({ turnID: step.tool, id: step.tool, tool: step.tool, args: step.input, tools }, undefined,
+			() => tools.find(tool => tool.name === step.tool)!.execute(step.tool, step.input as never));
+		if (step.tool === "bash") expect(textOutput(output as never).trim()).toBe(execSync(step.input.command!, { cwd: workspace, encoding: "utf8" }).trim());
+		await host.finishTurn(step.tool, step.tool === "bash");
+	}
+	const settled = events.filter(event => event.type === "actor_action").map(event => event.settlement);
+	expect(settled.map(event => event.provider.kind), JSON.stringify(settled)).toEqual(["speculative", "speculative"]);
+	expect(requests).toBe(1);
 });

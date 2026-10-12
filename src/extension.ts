@@ -370,10 +370,7 @@ async function installController(
 			enabled: actorReplayEnabled,
 			prepare: (refresh, signal) => processBackend.prepareActorReplay(rawProcessExecutor, {
 				sourceRoot: context.cwd,
-				...(shell.commandTransport !== "stdin" ? { held: {
-					realShell: shell.shell,
-					executor: (shellPath) => adaptProcessToolOperations(createLocalBashOperations({ shellPath })),
-				} } : {}),
+				held: true,
 				invocation: (request) => resolvePiToolInvocation("bash", {
 					command: request.command,
 					...(request.timeout !== undefined ? { timeout: request.timeout } : {}),

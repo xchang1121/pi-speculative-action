@@ -376,7 +376,7 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 					() => executor(bound), (bindings, dependencies) => {
 						if (bindings.length) (operations ??= []).push(...bindings);
 						if (dependencies) computations.push(...dependencies);
-					}, prepared?.observeOperations, inputs) : executor(bound);
+					}, prepared?.observeOperations, inputs, { cwd: options.cwd, signal }) : executor(bound);
 				try { return await (prepared?.withInputs ? prepared.withInputs(execute) : execute()); }
 				finally {
 					if (actionSemantics.definition(bound.action ?? bound.tool)?.effect !== "observation") {
