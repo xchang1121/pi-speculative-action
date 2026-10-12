@@ -111,7 +111,7 @@ export function retainResourceObject(sources: Iterable<object>, target: string, 
 	return false;
 }
 
-/** Query proof composition is shared by whole observations and Actor-owned pure subcalculations. */
+/** Whole queries and independent Actor inputs share proof composition; completed inputs survive consumer failure. */
 async function evaluateResourceQuery<Output>(
 	inputs: readonly ResourceVersionToken[] | undefined, request: Pick<Parameters<NonNullable<WorldBranch<ToolSettlement>["reconstruct"]>>[0], "signal" | "inputs">,
 	root: string, execute: (view: ResourceReadView) => Promise<Output>, semantics: ActionSemanticsRegistry, maxBytes: number,
@@ -139,7 +139,8 @@ async function evaluateResourceQuery<Output>(
 		dependencies ? [observe(tokens[0]!, dependencies)] : tokens.map(token => observe(token, undefined));
 	try { return await collectResourceComputation(async () => {
 		view.assertComplete(true);
-		const output = await view.evaluate(execute, dependencies => observeOwner(versions, dependencies), root,
+		let output: Output, completed = false, sealed: ResourceVersionToken[] | undefined;
+		try { output = await view.evaluate(execute, dependencies => observeOwner(versions, dependencies), root,
 			function* (target) {
 				const owners = [versions, ...[...request.inputs?.(target) ?? []].flatMap(source => resourceVersions.has(source) ? [resourceVersions.get(source)!] : [])];
 				for (const tokens of owners) for (const token of tokens) if (token.view) yield { view: token.view,
@@ -150,23 +151,28 @@ async function evaluateResourceQuery<Output>(
 				return { view: token.view, observed: dependencies => [observe(token, dependencies)] };
 			}, inputs => inputs.map(input => {
 				const proof = input.manager.retain(input); retained.push(proof); observe(proof, undefined); return proof;
-			}), validation && (async proofs => { await validateResourceInputs(proofs, true); }));
-		return TimelineInterval.outside(async () => {
-			let bytes = captured?.view?.bytes ?? 0;
-			captured?.view?.seal();
-			const owned = captured ? [captured] : [];
-			for (const [token, observations] of proofs) if (observations.size && token !== captured) {
-				const selected = observations.size === token.observations.size ? token : { ...token, observations };
-				const proof = retained.includes(selected) ? selected : selected.manager.retain(retainMetadata ? selected : { ...selected, view: undefined }, retainMetadata ? maxBytes - bytes : undefined);
-				if (proof !== selected) retained.push(proof);
-				owned.push(proof); bytes += proof.view?.bytes ?? 0;
-			}
-			if (retainMetadata && resourceProofBytes(owned) + bytes > maxBytes) return undefined;
-			if (validation === "output") await validateResourceInputs(owned, true);
-			request.signal.throwIfAborted();
-			if (!transfer || transfer(owned)) { captured = undefined; retained.length = 0; }
-			return { output, versions: owned };
-		});
+			}), validation && (async proofs => { await validateResourceInputs(proofs, true); })); completed = true;
+		} finally { await TimelineInterval.outside(async () => {
+			if (!completed && !transfer) return;
+			try {
+				let bytes = captured?.view?.bytes ?? 0;
+				captured?.view?.seal();
+				const owned = captured ? [captured] : [];
+				for (const [token, observations] of proofs) if (observations.size && token !== captured) {
+					const selected = observations.size === token.observations.size ? token : { ...token, observations };
+					const proof = retained.includes(selected) ? selected : selected.manager.retain(retainMetadata ? selected : { ...selected, view: undefined }, retainMetadata ? maxBytes - bytes : undefined);
+					if (proof !== selected) retained.push(proof);
+					owned.push(proof); bytes += proof.view?.bytes ?? 0;
+				}
+				if (retainMetadata && resourceProofBytes(owned) + bytes > maxBytes) return undefined;
+				if (completed && validation === "output") await validateResourceInputs(owned, true);
+				if (!transfer) request.signal.throwIfAborted();
+				if (!transfer || transfer(owned)) { captured = undefined; retained.length = 0; }
+				if (completed && transfer && validation !== "prepared") request.signal.throwIfAborted();
+				sealed = owned;
+			} catch (error) { if (completed) throw error; } // Optional input retention preserves the original execution failure.
+		}); }
+		return sealed && { output, versions: sealed };
 	}, branch => branch !== undefined); }
 	finally { await TimelineInterval.outside(async () => { await Promise.allSettled(retained.map(releaseResourceVersion)); await captured?.release(); await initial?.release(); }); }
 }
@@ -253,9 +259,10 @@ function resourceCapture(versions: ResourceVersionToken[], action: ActionKey | u
 		if (!open || sealing) throw new Error("resource_snapshot_capture_consumed");
 		sealing = true;
 		try {
+			if (!inputsOnly && output === undefined) throw new Error("authoritative_result_missing");
 			await beforeSeal?.();
 			if (!open) throw new Error("resource_snapshot_capture_disposed");
-			const branch = resourceSnapshotBranch(inputsOnly ? { inputsOnly: true } : { output }, [...versions], action, semantics);
+			const branch = resourceSnapshotBranch(inputsOnly ? { inputsOnly: true } : { output: output! }, [...versions], action, semantics);
 			versions.length = 0; return branch;
 		} finally { await dispose(); }
 	} };
@@ -263,7 +270,7 @@ function resourceCapture(versions: ResourceVersionToken[], action: ActionKey | u
 
 /** Explicit Actor callback: native effects execute once; only proven inputs and pure preparations are shared. */
 export function bindResourceOperation(execute: NonNullable<ToolInvocation["filesystem"]>, root: string): Pick<ToolInvocation, "authoritative" | "captureInputs" | "filesystem" | "filesystemRoot"> {
-	type Capture = { maxBytes: number; inputs: Map<string, ResourceInput>; versions: ResourceVersionToken[]; started?: boolean; complete?: boolean };
+	type Capture = { maxBytes: number; inputs: Map<string, ResourceInput>; versions: ResourceVersionToken[]; started?: boolean };
 	const active = new Map<string, Capture>();
 	const bytes = (owned: Capture, inputs = true) => resourceProofBytes(owned.versions) + owned.versions.reduce((sum, token) => sum + (token.view?.bytes ?? 0), 0) +
 		(inputs ? [...owned.inputs].reduce((sum, [target, input]) => sum + target.length * 2 + 128 + (input instanceof Uint8Array ? input.length :
@@ -274,7 +281,7 @@ export function bindResourceOperation(execute: NonNullable<ToolInvocation["files
 			const owned: Capture = { maxBytes, inputs: new Map(), versions: [] };
 			active.set(callID, owned);
 			return resourceCapture(owned.versions, action, PI_ACTION_SEMANTICS, true, async () => {
-				if (!owned.complete) throw new Error("actor_resource_inputs_unavailable");
+				if (active.get(callID) === owned) active.delete(callID);
 				// Infer entries only for directories this callback actually created.
 				const names = new Map([...owned.inputs].filter(([, input]) => input && !(input instanceof Uint8Array) && !Object.keys(input).length).map(([target]) => [target, [] as string[]]));
 				for (const target of owned.inputs.keys()) names.get(path.dirname(target))?.push(path.basename(target));
@@ -327,9 +334,7 @@ export function bindResourceOperation(execute: NonNullable<ToolInvocation["files
 					try { return await use(resource.value); } finally { await resource.dispose(); }
 				},
 			};
-			const output = await execute(host, request);
-			if (owned && active.get(request.callID) === owned) owned.complete = !output.isError;
-			return output;
+			return execute(host, request);
 		},
 	};
 }

@@ -187,8 +187,8 @@ export interface WorldResultCapture<Output> {
 	readonly inputsOnly?: true;
 	/** Revocable input sink available during the authoritative execution. */
 	readonly inputSource?: object;
-	/** Transfer the captured baseline into a normal branch. May be called at most once. */
-	readonly seal: (output: Output) => WorldBranch<Output> | Promise<WorldBranch<Output>>;
+	/** Transfer completed work at most once. Only input captures may seal without a successful output. */
+	readonly seal: (output?: Output) => WorldBranch<Output> | Promise<WorldBranch<Output>>;
 	/** Release an unsealed baseline. Idempotent; a sealed branch owns its own cleanup. */
 	readonly dispose: () => void | Promise<void>;
 }

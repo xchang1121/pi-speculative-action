@@ -786,7 +786,7 @@ int main(int argc, char **argv) {
 		} finally { observing.mockRestore(); inspecting.mockRestore(); await host?.dispose(); await fixture.dispose(); }
 	});
 
-nativeTest.for(["keyed", "unkeyed", "keyed-large", "unkeyed-opaque"])("transfers native Bash FD inputs to filesystem tools across turns with exact invalidation (%s)", { timeout: 30_000 }, async (mode, { skip, benchmark }) => {
+nativeTest.for(["keyed", "unkeyed", "keyed-large", "unkeyed-opaque", "keyed-failed", "unkeyed-failed", "keyed-exit", "unkeyed-exit"])("transfers native Bash FD inputs to filesystem tools across turns with exact invalidation (%s)", { timeout: 30_000 }, async (mode, { skip, benchmark }) => {
 		const fixture = await benchmark("pi-native-resource-inputs-");
 		const unkeyed = mode.startsWith("unkeyed"), parentOutput = { transcript: mode.endsWith("large") ? "x".repeat(128 * 1024) : "", ...(mode.endsWith("opaque") ? { callback: () => "parent-only" } : {}) };
 		let host: ReturnType<typeof createSpeculativeActionHost> | undefined;
@@ -811,32 +811,28 @@ int main(void) { char b[1024]; return syscall(SYS_getdents64, 4, b, sizeof(b)) <
 				},
 			}, tools), { events, start } = prepared;
 			host = prepared.host;
-			const command = "exec 3<input.txt 4<entries; worker; worker", bash = vi.fn(() => fixture.coordinator.runWith({ execute: request => route.executor.execute({ ...request,
-				scope: { sessionID: "native-inputs", turnID: "seed" } }) }, async () => ({ ...await fixture.tool.execute("seed", { command }), details: parentOutput })));
+			const error = new Error("native producer failed after completed work"), command = "exec 3<input.txt 4<entries; worker; worker" + (mode.endsWith("exit") ? "; exit 17" : "");
+			const bash = vi.fn(() => fixture.coordinator.runWith({ execute: request => route.executor.execute({ ...request, scope: { sessionID: "native-inputs", turnID: "seed" } }) }, async () => {
+				const output = await fixture.tool.execute("seed", { command }); if (mode.endsWith("failed")) throw error; return { ...output, details: parentOutput };
+			}));
 			await start("seed");
-			expect(await host.execute({ turnID: "seed", id: "seed", tool: "bash", args: { command }, tools }, undefined, bash))
-				.toEqual({ content: [{ type: "text", text: "one\ntwo\none\ntwo\n" }], details: parentOutput });
+			const result = host.execute({ turnID: "seed", id: "seed", tool: "bash", args: { command }, tools }, undefined, bash);
+			if (mode.endsWith("failed")) await expect(result).rejects.toBe(error);
+			else if (mode.endsWith("exit")) await expect(result).rejects.toThrow(/17/);
+			else expect(await result).toEqual({ content: [{ type: "text", text: "one\ntwo\none\ntwo\n" }], details: parentOutput });
 			await host.finishTurn("seed"); expect(bash).toHaveBeenCalledOnce();
 			if (unkeyed) expect(events.find(event => event.type === "actor_action")).toMatchObject({ settlement: { provider: { kind: "actor", cause: { code: "action_not_keyable" } } } });
 			await start("queries");
-			for (const [tool, args] of [["read", { path: "input.txt", offset: 2 }], ["grep", { path: "input.txt", pattern: "two" }],
-				["ls", { path: "entries" }], ["find", { path: "entries", pattern: "*.txt" }]] as const) {
-				const native = tools.find(value => value.name === tool)!;
-				const invocation = search.invocations.get(tool);
+			for (const [tool, args, change] of [["read", { path: "input.txt", offset: 2 }, undefined], ["grep", { path: "input.txt", pattern: "two" }, undefined],
+				["ls", { path: "entries" }, undefined], ["find", { path: "entries", pattern: "*.txt" }, undefined], ["read", { path: "input.txt" }, "new\nvalue\n"], ["ls", { path: "entries" }, "new.txt"]] as const) {
+				if (change) await writeFile(tool === "read" ? file : path.join(fixture.workspace, "entries", change), change);
+				const native = tools.find(value => value.name === tool)!, invocation = search.invocations.get(tool);
 				const authoritative = (callID: string) => invocation?.authoritative
 					? invocation.authoritative({ callID, args, signal: new AbortController().signal }).then(value => value.result) : native.execute(callID, args);
 				const execute = vi.fn(() => authoritative("fallback"));
-				expect(await host.execute({ turnID: "queries", id: tool, tool, args, tools }, undefined, execute)).toEqual(await authoritative("oracle"));
+				expect(await host.execute({ turnID: "queries", id: change ? `stale-${tool}` : tool, tool, args, tools }, undefined, execute)).toEqual(await authoritative("oracle"));
 				expect(execute, JSON.stringify(summarizeSpeculativeTrace(events))).not.toHaveBeenCalled();
 			}
-			const read = tools[1]!, args = { path: "input.txt" }, execute = vi.fn(() => read.execute("fallback", args));
-			await writeFile(file, "new\nvalue\n");
-			expect(await host.execute({ turnID: "queries", id: "stale", tool: "read", args, tools }, undefined, execute)).toEqual(await read.execute("oracle", args));
-			expect(execute).not.toHaveBeenCalled();
-			await writeFile(path.join(fixture.workspace, "entries", "new.txt"), "new");
-			const ls = tools[3]!, directory = { path: "entries" }, list = vi.fn(() => ls.execute("fallback", directory));
-			expect(await host.execute({ turnID: "queries", id: "stale-directory", tool: "ls", args: directory, tools }, undefined, list)).toEqual(await ls.execute("oracle", directory));
-			expect(list).not.toHaveBeenCalled();
 			await host.finishTurn("queries", true);
 			expect(summarizeSpeculativeTrace(events)).toMatchObject({ inputReuseHits: 6, exactReuseHits: 0 });
 		} finally { await host?.dispose(); await search.pool.dispose(); await fixture.dispose(); }

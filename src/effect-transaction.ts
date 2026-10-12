@@ -109,16 +109,14 @@ export class EffectTransactionCoordinator<Output> {
 	/** Wrap a pre-execution authoritative capture in the same transaction lifecycle. */
 	capture(attempt: EffectTransactionAttempt, capture: WorldResultCapture<Output>): WorldResultCapture<Output> {
 		const owned = this.owned(attempt);
-		let consumed = false;
 		const inputsOnly = capture.inputsOnly;
 		return Object.freeze({
 			...(inputsOnly ? { inputsOnly } : {}),
-			get inputSource() { return !consumed && inputsOnly ? capture.inputSource : undefined; },
-			seal: async (output: Output) => {
-				if (consumed) throw new Error("effect transaction capture is already consumed");
-				consumed = true;
+			get inputSource() { return owned.stateValue === "begun" && inputsOnly ? capture.inputSource : undefined; },
+			seal: async (output?: Output) => {
 				this.transition(owned, "begun", "sealing");
 				try {
+					if (!inputsOnly && output === undefined) throw new Error("authoritative_result_missing");
 					const branch = await capture.seal(output);
 					if (inputsOnly && !branch.inputsOnly) {
 						await branch.dispose();
@@ -128,14 +126,9 @@ export class EffectTransactionCoordinator<Output> {
 				} catch (error) { owned.stateValue = "failed"; await capture.dispose(); throw error; }
 			},
 			dispose: async () => {
-				if (consumed) return;
-				consumed = true;
+				if (owned.stateValue !== "begun") return;
 				owned.stateValue = "aborting";
-				try {
-					await capture.dispose();
-				} finally {
-					owned.stateValue = "aborted";
-				}
+				try { await capture.dispose(); } finally { owned.stateValue = "aborted"; }
 			},
 		});
 	}

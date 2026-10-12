@@ -1596,11 +1596,8 @@ export function makeSpeculativeActionRuntime<
 			candidateStore.settle(session.id, candidate, true, branch.reconstruct ? branch.inputResources : undefined);
 			retained = true;
 			trimResults(session, context.settings);
-		} catch {
-			// Optional cache promotion cannot alter an already completed Actor result.
-		} finally {
-			if (!retained) session.lifecycle.release(branch);
-		}
+		} catch { /* Optional cache retention cannot alter the Actor outcome. */ }
+		finally { if (!retained) session.lifecycle.release(branch); }
 	};
 
 	const settleActorCall = async (
@@ -1624,7 +1621,7 @@ export function makeSpeculativeActionRuntime<
 		if (key) reconcileAuthoritativeEffects(state.session, key);
 		// Authoritative feedback must enter the settlement queue before optional cache work can yield.
 		queueActorSettlement(state, input, actualCall, actorAction, output, undefined, operations);
-		if (capture && output !== undefined && !outputIsError(output)) {
+		if (capture && (capture.inputsOnly || output !== undefined && !outputIsError(output))) {
 			try { await retainAuthoritativeBranch(state.session, state, () => state.lifecycle === "active", actualCall, key, await capture.seal(output), durationMs, execution, capture.route); }
 			catch { state.session.lifecycle.release(capture); }
 		} else if (capture) state.session.lifecycle.release(capture);
