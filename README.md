@@ -61,6 +61,8 @@ pi -e /absolute/path/to/pi-speculative-action
 
 Linux / WSL 2 的 Bash 后端可从菜单检查和安装，也可在源码目录运行 `npm run setup:linux`；WSL checkout 应放在 Linux 原生文件系统。原生进程自动选用合格的 OverlayFS，回退 Git 时补齐空目录和权限；两条路径中被复制的原始对象通过持有对象和元数据映射，保持路径、文件描述符及目录枚举所见身份一致，采纳前仍精确验新。ThinkThread 使用独立的 [Profile 安装脚本](./scripts/install-thinkthread-profile.sh)，安装后在项目中运行 `tt pi-speculative-action`。Actor 常规执行承担基础工具调用，各后端在满足可用条件时承接投机工作。
 
+原生子进程交接需要保留程序自身的提权语义。安装程序同时构建专用的 `.observer`；普通 Actor 需要通过 `PI_SPEC_HELD_EXEC_OBSERVER` 指向由管理员部署、仅具有 `CAP_SYS_PTRACE` 的专用观察器。已继承 `no_new_privs` 的 Actor 可使用无附加权限的观察器。安装探测仅在一次性进程内设置此限制，并单独报告当前 Actor 的交接资格；资格不足时原生执行、缓存命令回放和投机生产仍各自可用。通用执行 helper 和映像库始终保持无附加权限。
+
 ## 开发与验证
 
 ```sh

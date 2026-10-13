@@ -774,7 +774,7 @@ int main(void) { char b[1024]; return syscall(SYS_getdents64, 4, b, sizeof(b)) <
 		const error = new Error("native producer failed after completed work"), command = "exec 3<input.txt 4<entries; worker; worker" + (mode.endsWith("exit") ? "; exit 17" : "");
 		const bash = vi.fn(async () => {
 			const output = await new Promise<{ content: { type: "text"; text: string }[] }>((resolve, reject) =>
-				childProcess.execFile(fixture.shellPath, ["-c", command], { cwd: fixture.workspace, env: fixture.environment }, (error, stdout) =>
+				childProcess.execFile(fixture.shellPath, ["-c", command], { cwd: fixture.workspace, env: fixture.environment, uid: process.getuid!(), gid: process.getgid!() }, (error, stdout) =>
 					error ? reject(error) : resolve({ content: [{ type: "text", text: stdout }] })));
 			if (mode.endsWith("failed")) throw error; return { ...output, details: parentOutput };
 		});
@@ -1411,14 +1411,16 @@ static int takePacket(int length,int peek,int truncated,char expected) {
 			} }, execute);
 		const code = `console.log(JSON.stringify({pid:process.pid,ppid:process.ppid,argv0:process.argv0,env:process.env.PI_SPEC_HELD_EXEC_ID,
 				raw:require('fs').readFileSync('/proc/self/environ').includes('PI_SPEC_HELD_EXEC_ID=caller-owned')}));console.error('stderr');`;
-		await Promise.all(["first", "second"].map(callID => observe(callID, async () => {
-			await nextTurn(); const child = childProcess.spawn(process.execPath, ["-e", code], { argv0: callID, env: { PI_SPEC_HELD_EXEC_ID: "caller-owned" } });
+		const credentials = { uid: process.getuid!(), gid: process.getgid!() }, launches = [[], ["uid"], ["gid"], ["uid", "gid"]] as const;
+		await Promise.all(launches.map(fields => observe(`credentials:${fields}`, async () => {
+			const callID = `credentials:${fields}`;
+			await nextTurn(); const child = childProcess.spawn(process.execPath, ["-e", code], { ...Object.fromEntries(fields.map(field => [field, credentials[field]])), argv0: callID, env: { PI_SPEC_HELD_EXEC_ID: "caller-owned" } });
 			expect(child).toBeInstanceOf(actual.ChildProcess); const result = await collect(child);
 			expect(JSON.parse(result.stdout)).toEqual({ pid: child.pid, ppid: process.pid, argv0: callID, env: "caller-owned", raw: true });
 			expect(result).toMatchObject({ code: 0, signal: null, stderr: "stderr\n", error: undefined });
 		})));
-		expect(observations.map(held => held.scope!.callID).sort()).toEqual(["first", "second"]);
-		expect(new Set(observations.map(held => held.id.split(":")[0])).size).toBe(2);
+		expect(observations.map(held => held.scope!.callID).sort()).toEqual(launches.map(fields => `credentials:${fields}`).sort());
+		expect(new Set(observations.map(held => held.id.split(":")[0])).size).toBe(4);
 		await writeFile(path.join(root, "no-permission"), "x", { mode: 0o600 });
 		for (const [name, expected] of [["missing", "ENOENT"], ["no-permission", "EACCES"]]) await observe(name!, async () => {
 			const command = path.join(root, name!), child = childProcess.spawn(command);
@@ -1466,9 +1468,9 @@ int main(int n,char **v) { if(n!=2)return 90; pid_t child=!strcmp(v[1],"vfork")?
 		const count = observations.length; await collect(childProcess.spawn("/bin/true")); expect(observations).toHaveLength(count);
 		for (const stop of ["waiter", "preparing", "owner"]) {
 			const gate = path.join(root, `probe-${stop}`), marker = gate + "-pid", helper = gate + "-helper", storeRoot = gate + "-store";
-			await writeFile(helper, `#!/bin/sh\nif [ "$1" = "--attach-skip-code" ]; then echo $$ > '${marker}'; while [ ! -f '${gate}' ]; do sleep .01; done; fi\nexec '${binary}' "$@"\n`, { mode: 0o700 });
+			await writeFile(helper, `#!/bin/sh\nif [ "$1" = "--attach-skip-code" ]; then echo $$ > '${marker}'; while [ ! -f '${gate}' ]; do sleep .01; done; fi\nexec '${Reflect.get(boundary, "observerBinary")}' "$@"\n`, { mode: 0o700 });
 			await filesystem.symlink(binary + ".node", helper + ".node");
-			const backend = new LinuxProcessReuseBackend({ storeRoot, heldExecBinary: helper }), host = adaptProcessToolOperations(createLocalBashOperations({ shellPath: "/bin/bash" }));
+			const backend = new LinuxProcessReuseBackend({ storeRoot, heldExecBinary: helper, heldExecObserverBinary: helper }), host = adaptProcessToolOperations(createLocalBashOperations({ shellPath: "/bin/bash" }));
 			const controller = new AbortController();
 			const execute = async (signal?: AbortSignal) => { let output = "";
 				try { await backend.observeNative(root, { sessionID: "preparing", turnID: stop }, signal, () => host.execute({ command: "printf ready", cwd: root, signal, environment: {}, onData: data => { output += data.toString(); } })); return output; }
@@ -1579,11 +1581,15 @@ int main(int n,char **v) { if(n!=2)return 90; pid_t child=!strcmp(v[1],"vfork")?
 		const replay = (mode: string, decide: (process: HeldExecProcess) => Promise<Partial<Replay> | undefined>,
 			options: { descriptors?: Parameters<typeof held>[0]["descriptors"]; executor?: typeof native; beforeCommit?: (process: HeldExecProcess) => Promise<void> } = {}) => {
 			const failed = mode.endsWith("commit-failure"), controller = new AbortController(), adopted = vi.fn(), settle = vi.fn();
-			const commit = vi.fn(async (process: HeldExecProcess) => { await options.beforeCommit?.(process); if (failed) throw new Error("injected commit failure"); });
+			let decisionError: unknown;
+			const commit = vi.fn(async (process: HeldExecProcess) => {
+				if (process.holderPid) await expect(readFile(`/proc/${process.holderPid}/stat`)).rejects.toMatchObject({ code: "ENOENT" });
+				await options.beforeCommit?.(process); if (failed) throw new Error("injected commit failure");
+			});
 			const executor = held({ descriptors: options.descriptors ?? true, decide: async process => {
 				if (await filesystem.readlink(`/proc/${process.pid}/exe`) !== "/usr/bin/true") return { kind: "continue" };
-				const decision = await decide(process); if (!decision) return { kind: "continue" };
-				if (mode === "cancel") controller.abort();
+				const decision = await decide(process).catch(error => { decisionError = error; throw error; }); if (!decision) return { kind: "continue" };
+				if (mode === "cancel" || mode === "retire") controller.abort();
 				return { kind: "replay", exitCode: 0, output: [{ fd: 1, data: Buffer.from("replayed:") }],
 					commit: () => commit(process), adopted, settle, ...decision };
 			} }, options.executor);
@@ -1592,6 +1598,7 @@ int main(int n,char **v) { if(n!=2)return 90; pid_t child=!strcmp(v[1],"vfork")?
 				if (failed) await expect(running, mode).rejects.toMatchObject({ disposition: "poisoned" });
 				else if (mode === "cancel") await expect(running, mode).rejects.toThrow();
 				else expect(await running, mode).toEqual({ exitCode: 0 });
+				expect(decisionError, mode).toBeUndefined();
 				expect(executor.output, mode).toBe(failed || mode === "cancel" ? "" : output);
 				expect(commit, mode).toHaveBeenCalledTimes(commits);
 			} };
@@ -1948,7 +1955,7 @@ int main(void) { int status; struct timespec pause = {0, 300000000}; pid_t sibli
 			await executor.verify(`'${descriptorProbe}' pipe ${mode}`, accepted ? `replayed:${mode === "empty" ? "" : "def"}` : mode === "stale" ? "bcdef" : "abcdef", Number(accepted || failedCommit));
 			if (accepted) expect(descriptors, mode).toMatchObject([{ fd: 0, alias: 0, type: "pipe", owned: true }, { fd: 3, alias: 0, type: "pipe", owned: true }, { fd: 8, alias: 8, type: "pipe", owned: true }]);
 		}
-		for (const orphan of [false, true]) for (const mode of ["messages", "start", "end", "rights", "commit-failure", "cancel"]) {
+		for (const orphan of [false, true]) for (const mode of ["messages", "start", "end", "rights", "commit-failure", "cancel", "retire"]) {
 			const pinCounts: number[] = [];
 			const executor = replay(mode, async process => {
 				const descriptorOffsets = process.descriptors!.map(fd => ({ ...fd, before: fd.offset, after: fd.offset,
@@ -1958,13 +1965,17 @@ int main(void) { int status; struct timespec pause = {0, 300000000}; pid_t sibli
 				expect(reference).toBeDefined();
 				if (orphan) {
 					expect(await filesystem.readdir(`/proc/${process.pid}/fd`)).not.toContain(String(reference.fd));
-					pinCounts.push((await filesystem.readdir(`/proc/${process.tracerPid}/fd`)).length);
+					const pins = (await filesystem.readdir(`/proc/${process.holderPid}/fd`)).map(Number);
+					expect(pins).toContain(reference.pin); expect(pins).toHaveLength(new Set(descriptorOffsets.flatMap(fd => fd.pin === undefined ? [] : [fd.pin])).size + 1);
+					await expect(filesystem.readlink(`/proc/${process.tracerPid}/exe`)).rejects.toMatchObject({ code: "EACCES" });
+					for (const kind of ["Prm", "Eff", "Inh", "Amb"]) expect(await readFile(`/proc/${process.tracerPid}/status`, "utf8")).toMatch(new RegExp(`^Cap${kind}:\\s+0+$`, "m"));
+					pinCounts.push(pins.length);
 				}
 				expect(receiver.messages).toEqual([{ start: 1, end: 3, rights: [reference.fd, 3] }, { start: 3, end: 4, rights: [reference.fd, 3] }]);
 				receiver.messages = receiver.messages!.map((message, index) => index ? message : { ...message,
 					...(mode === "start" ? { start: 0 } : mode === "end" ? { end: 2 } : mode === "rights" ? { rights: [3, reference.fd] } : {}) });
 				return { descriptorOffsets };
-			});
+			}, mode === "retire" ? { executor: { execute: request => native.execute({ ...request, signal: undefined }) } } : {});
 			await executor.verify(`'${descriptorProbe}' message '${input}' ${Number(orphan)}`, `${mode === "messages" ? "replayed:replayed:" : ""}LqItbcaXYZ`, mode === "messages" ? 2 : Number(mode === "commit-failure"));
 			if (pinCounts.length === 2) expect(pinCounts[1]).toBe(pinCounts[0]);
 		}

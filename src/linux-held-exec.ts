@@ -21,10 +21,10 @@ import { qualifyNativeStartup } from "./process-startup.mjs";
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024 + 32768;
 const MAX_OUTPUT_EVENTS = 65_536;
 const MAX_OUTPUT_BYTES = 512 * 1024 * 1024;
-type NativeSpawn = (this: ChildProcess, options: { readonly uid?: number; readonly gid?: number }) => number;
+type NativeSpawn = (this: ChildProcess, options: object) => number;
 const startupScope = new AsyncLocalStorage<{
 	readonly skipRoot?: boolean;
-	readonly launch: (child: ChildProcess, options: Parameters<NativeSpawn>[0], start: () => number) => number;
+	readonly launch: (child: ChildProcess, start: () => number) => number;
 }>();
 const nativeRequire = createRequire(import.meta.url);
 const startupPrototype = nativeRequire("node:child_process").ChildProcess.prototype as { spawn: NativeSpawn };
@@ -37,7 +37,7 @@ function enterStartup(): void {
 		const start = () => { const outer = starting; starting = true;
 			try { return Reflect.apply(original, this, [options]); } finally { starting = outer; } };
 		const scope = !starting && startupScope.getStore();
-		return scope ? scope.launch(this, options, start) : start();
+		return scope ? scope.launch(this, start) : start();
 	};
 	startupPrototype.spawn = intercept;
 	restoreStartup = () => { if (!--startupUsers && startupPrototype.spawn === intercept) startupPrototype.spawn = original; };
@@ -49,6 +49,8 @@ export interface HeldExecProcess {
 	readonly sequence: number;
 	readonly pid: number;
 	readonly tracerPid: number;
+	/** Unprivileged owner of queued-only snapshot pins, retired before native validation. */
+	readonly holderPid?: number;
 	readonly sourceRoot: string;
 	readonly scope?: ExecutionScope;
 	readonly signal?: AbortSignal;
@@ -227,7 +229,7 @@ export type HeldExecDecision = { readonly observeTiming?: (timing: HeldExecTimin
 	  } & ({ readonly exitCode: number; readonly continuation?: never } |
 		{ readonly exitCode?: never; readonly continuation: { readonly image: Buffer; readonly physicalRoot: string } })));
 
-export interface LinuxHeldExecOptions { readonly storeRoot: string; readonly binary?: string; readonly signal?: AbortSignal; }
+export interface LinuxHeldExecOptions { readonly storeRoot: string; readonly binary?: string; readonly observerBinary?: string; readonly signal?: AbortSignal; }
 
 interface ActiveExecution {
 	readonly barrier: HeldExecTiming["barrier"];
@@ -240,6 +242,7 @@ interface ActiveExecution {
 	readonly completion: Promise<void>;
 	readonly sockets: Set<net.Socket>;
 	readonly child: ChildProcess;
+	readonly observer: ChildProcess;
 	readonly retire: () => void;
 	failure?: Error;
 }
@@ -254,13 +257,13 @@ interface WireRequest {
 	readonly execution: string;
 	readonly pid: number;
 	readonly tracer: number;
+	readonly holder?: number;
 	readonly descriptors?: readonly HeldFileDescriptor[];
 	readonly trackQueues?: true;
 }
 
 /** A two-phase held-exec transport: arm the exit stub before committing reusable effects. */
 export class LinuxHeldExecBoundary {
-	readonly shellPath: string;
 	private readonly token = randomBytes(32).toString("hex");
 	private readonly active = new Map<string, ActiveExecution>();
 	private readonly calls = new Set<{ readonly controller: AbortController; readonly completion: Promise<void> }>();
@@ -270,9 +273,9 @@ export class LinuxHeldExecBoundary {
 	private closing?: Promise<void>;
 
 	private readonly startup: (operation: number) => number;
-	private constructor(binary: string, socketPath: string, startup: (operation: number) => number) {
-		this.shellPath = binary;
-		this.startup = startup;
+	private readonly observerBinary: string;
+	private constructor(socketPath: string, native: Awaited<ReturnType<typeof qualifyNativeStartup>>) {
+		this.startup = native.startup; this.observerBinary = native.observer;
 		this.socketPath = socketPath;
 		this.server = net.createServer({ allowHalfOpen: true }, (socket) => {
 			this.sockets.add(socket);
@@ -286,16 +289,16 @@ export class LinuxHeldExecBoundary {
 		if (process.platform !== "linux" || process.arch !== "x64") throw new Error("x86-64 Linux required");
 		options.signal?.throwIfAborted();
 		const binary = await resolveLinuxExecHelper(options.binary);
-		let startup: (operation: number) => number;
-		try { startup = await startupScope.exit(() => qualifyNativeStartup(binary, options.signal)); }
-		catch (error) { options.signal?.throwIfAborted(); throw new Error(`held-exec functional probe failed${await inheritedTracer()}`, { cause: error }); }
+		let native: Awaited<ReturnType<typeof qualifyNativeStartup>>;
+		try { native = await startupScope.exit(() => qualifyNativeStartup(binary, { observer: options.observerBinary, signal: options.signal })); }
+		catch (error) { options.signal?.throwIfAborted(); throw new Error(`held-exec functional probe failed${await inheritedTracer()}: ${error instanceof Error ? error.message : error}`, { cause: error }); }
 		await mkdir(options.storeRoot, { recursive: true, mode: 0o700 });
 		await chmod(options.storeRoot, 0o700);
 		const candidate = path.join(options.storeRoot, `held-${process.pid}-${randomBytes(6).toString("hex")}.sock`);
 		const socketPath = Buffer.byteLength(candidate) < 104
 			? candidate
 			: path.join("/tmp", `pi-held-${process.getuid?.() ?? 0}-${process.pid}-${randomBytes(6).toString("hex")}.sock`);
-		const boundary = new LinuxHeldExecBoundary(binary, socketPath, startup);
+		const boundary = new LinuxHeldExecBoundary(socketPath, native);
 		await listenUnixSocket(boundary.server, socketPath);
 		try { await chmod(socketPath, 0o600); options.signal?.throwIfAborted(); return boundary; } catch (error) { await boundary.close(); throw error; }
 	}
@@ -316,8 +319,8 @@ export class LinuxHeldExecBoundary {
 		const call = { controller, completion: new Promise<void>(resolve => { finished = resolve; }) };
 		this.calls.add(call); enterStartup();
 		try {
-			return await startupScope.run({ skipRoot: options.skipRoot, launch: (child, configuration, start) =>
-				closed || signal.aborted || configuration.uid !== undefined || configuration.gid !== undefined ? start()
+			return await startupScope.run({ skipRoot: options.skipRoot, launch: (child, start) =>
+				closed || signal.aborted ? start()
 					: this.launch(child, { ...snapshot, skipRoot: startupScope.getStore()?.skipRoot }, launches, start) }, execute);
 		} finally {
 			closed = true;
@@ -335,7 +338,7 @@ export class LinuxHeldExecBoundary {
 		try {
 			gate = this.startup(0);
 			if (!Number.isInteger(gate) || gate < 0) throw new Error("native startup gate unavailable");
-			observer = startupScope.exit(() => spawn(this.shellPath, ["--attach"], { stdio: ["pipe", "pipe", "ignore", gate], env: {
+			observer = startupScope.exit(() => spawn(this.observerBinary, ["--attach"], { stdio: ["pipe", "pipe", "ignore", gate], env: {
 				PI_SPEC_HELD_EXEC_SOCKET: this.socketPath, PI_SPEC_HELD_EXEC_TOKEN: this.token, PI_SPEC_HELD_EXEC_ID: execution,
 				...(options.descriptors ? { PI_SPEC_HELD_EXEC_DESCRIPTORS: options.descriptors === "inspect" ? "2" : "1" } : {}),
 				...(options.skipRoot ? { PI_SPEC_HELD_EXEC_ROOT: "skip" } : {}),
@@ -350,7 +353,7 @@ export class LinuxHeldExecBoundary {
 				if (!controller.signal.aborted) controller.abort(new Error("native observation retired"));
 				observer?.stdin?.end(); for (const socket of active?.sockets ?? []) socket.destroy();
 			};
-			active = { ...options, signal, child, retire, sequence: 0,
+			active = { ...options, signal, child, observer, retire, sequence: 0,
 				barrier: options.descriptors === "inspect" ? "inspection" : options.descriptors ? "descriptors" : "none",
 				pending: new Set(), sockets: new Set(), completion: done.then(async () => {
 					await Promise.allSettled(active!.pending); signal.removeEventListener("abort", retire); this.active.delete(execution);
@@ -389,19 +392,21 @@ export class LinuxHeldExecBoundary {
 			active = request?.token === this.token ? this.active.get(request.execution) : undefined;
 			active?.pending.add(pending);
 			active?.sockets.add(socket);
-			if (!request || !active || !(await heldBy(request.pid, request.tracer, this.shellPath))) { return void socket.end("C\n"); }
+			if (!request || !active || !(await heldBy(request, active.observer))) { return void socket.end("C\n"); }
 			active.signal?.throwIfAborted();
 			decision = await active.decide({
 				id: `${request.execution}:${++active.sequence}`,
 				sequence: active.sequence,
 				pid: request.pid,
 				tracerPid: request.tracer,
+				...(request.holder ? { holderPid: request.holder } : {}),
 				sourceRoot: active.sourceRoot,
 				scope: active.scope,
 				...(active.signal ? { signal: active.signal } : {}),
 				...(request.descriptors ? { descriptors: request.descriptors } : {}),
 				...(request.trackQueues ? { trackQueues: true as const } : {}),
 			});
+			active.signal?.throwIfAborted();
 			if (decision.kind === "continue") {
 				completedAt = performance.now(); outcome = "continued";
 				if (!decision.observeCompletion) return void socket.end("C\n");
@@ -661,7 +666,8 @@ function parseRequest(line: string): WireRequest | undefined {
 		const value = JSON.parse(line) as Partial<WireRequest>;
 		return /^[0-9a-f]{64}$/.test(value.token ?? "") &&
 			/^[0-9a-f]{48}$/.test(value.execution ?? "") && Number.isSafeInteger(value.pid) && value.pid! > 0 &&
-			Number.isSafeInteger(value.tracer) && value.tracer! > 0 && (value.trackQueues === undefined || value.trackQueues === true && value.descriptors === undefined) &&
+			Number.isSafeInteger(value.tracer) && value.tracer! > 0 && (value.holder === undefined || Number.isSafeInteger(value.holder) && value.holder! >= 0) &&
+			(value.trackQueues === undefined || value.trackQueues === true && value.descriptors === undefined) &&
 			validDescriptors(value.descriptors) ? value as WireRequest : undefined;
 	} catch {
 		return undefined;
@@ -710,16 +716,19 @@ export async function inheritedTracer(): Promise<string> {
 	return tracer ? `: processes here are already traced by pid ${tracer}` : "";
 }
 
-async function heldBy(pid: number, tracer: number, binary: string): Promise<boolean> {
+async function heldBy({ pid, tracer, holder }: WireRequest, observer: ChildProcess): Promise<boolean> {
+	const alive = () => observer.pid === tracer && observer.exitCode === null && observer.signalCode === null;
+	if (!alive()) return false;
 	try {
-		const [status, executable] = await Promise.all([
-			readFile(`/proc/${pid}/status`, "utf8"),
-			realpath(`/proc/${tracer}/exe`),
-		]);
-		return executable === binary && new RegExp(`^TracerPid:\\s*${tracer}$`, "m").test(status) && /^State:\s+t\b/m.test(status);
-	} catch {
-		return false;
-	}
+		const status = await readFile(`/proc/${pid}/status`, "utf8");
+		if (holder) {
+			const owner = await readFile(`/proc/${holder}/status`, "utf8");
+			if (!new RegExp(`^PPid:\\s*${tracer}$`, "m").test(owner) || !/^NoNewPrivs:\s+1$/m.test(owner) ||
+				!["Prm", "Eff", "Inh", "Amb"].every(kind => new RegExp(`^Cap${kind}:\\s+0+$`, "m").test(owner)) ||
+				![["Uid", process.getuid!()], ["Gid", process.getgid!()]].every(([kind, id]) => new RegExp(`^${kind}:(?:\\s+${id}){4}$`, "m").test(owner))) return false;
+		}
+		return alive() && new RegExp(`^TracerPid:\\s*${tracer}$`, "m").test(status) && /^State:\s+t\b/m.test(status);
+	} catch { return false; }
 }
 
 async function readLine(socket: net.Socket): Promise<string> {

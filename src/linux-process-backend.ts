@@ -64,6 +64,7 @@ export interface LinuxProcessBackendOptions {
 	readonly sandlockBinary?: string;
 	readonly straceBinary?: string;
 	readonly heldExecBinary?: string;
+	readonly heldExecObserverBinary?: string;
 	/** Additional host paths that speculative processes must never read. */
 	readonly deniedPaths?: readonly string[];
 }
@@ -275,7 +276,7 @@ export class LinuxProcessReuseBackend {
 
 	constructor(options: LinuxProcessBackendOptions) {
 		this.options = { sandlockBinary: process.env.PI_SPEC_SANDLOCK, straceBinary: process.env.PI_SPEC_STRACE,
-			heldExecBinary: process.env.PI_SPEC_HELD_EXEC, ...options };
+			heldExecBinary: process.env.PI_SPEC_HELD_EXEC, heldExecObserverBinary: process.env.PI_SPEC_HELD_EXEC_OBSERVER, ...options };
 		this.store = new ProvenanceCertificateStore(options.storeRoot, { ...options.store, acceptedTaints: SAME_CONFINEMENT_TAINTS });
 		this.planner = new ProcessReusePlanner({ store: this.store });
 		this.handoffs = new ProcessHandoffRegistry(this.store, Math.min(MAX_CONTINUATION_BYTES, this.store.limits.maxBytes));
@@ -373,7 +374,7 @@ export class LinuxProcessReuseBackend {
 		if (!this.heldExec) {
 			const controller = new AbortController();
 			const entry: NonNullable<LinuxProcessReuseBackend["heldExec"]> = { controller, status: { state: "probing", detail: "Checking native process startup" },
-				ready: LinuxHeldExecBoundary.open({ storeRoot: this.options.storeRoot, binary: this.options.heldExecBinary,
+				ready: LinuxHeldExecBoundary.open({ storeRoot: this.options.storeRoot, binary: this.options.heldExecBinary, observerBinary: this.options.heldExecObserverBinary,
 					signal: AbortSignal.any([this.store.signal, controller.signal]) }).then(boundary => {
 						entry.status = { state: "ready", detail: "Native child startup and validated result reuse" }; return boundary;
 					}, error => { entry.status = { state: "unavailable", detail: errorMessage(error) }; throw error; }) };
@@ -998,7 +999,7 @@ export class LinuxProcessReuseBackend {
 			const inspected = await inspectHeldExecProcess(process.pid, executable, process.descriptors);
 			const capturedInputs = await TimelineInterval.collect(() => process.descriptors?.length
 				? captureHeldDescriptorInputs(process.pid, process.descriptors, Math.min(MAX_REQUEST_BYTES / 2, this.store.limits.maxBytes),
-					sensitivePaths(this.options.storeRoot, this.options.deniedPaths), observation?.closed ? undefined : observation?.inputs, process.tracerPid, sourceRoot) : undefined);
+					sensitivePaths(this.options.storeRoot, this.options.deniedPaths), observation?.closed ? undefined : observation?.inputs, process.holderPid ?? process.tracerPid, sourceRoot) : undefined);
 			const resources = capturedInputs.output;
 			// Fresh descriptor capture is held-boundary validation. Borrowed inputs retain their original work receipt.
 			if (observation && !observation.closed) observation.computations.push(...capturedInputs.dependencies.filter(input => !input.owned));

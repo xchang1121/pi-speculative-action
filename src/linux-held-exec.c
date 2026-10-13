@@ -2,7 +2,12 @@
 #include <dirent.h>
 #include <elf.h>
 #include <linux/prctl.h>
+#include <linux/capability.h>
+#ifndef PI_SPEC_AUTHORITY_ONLY
+#define PI_SPEC_AUTHORITY_ONLY 0
+#endif
 #include <sys/uio.h>
+#include <sys/auxv.h>
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -87,6 +92,8 @@ static napi_value startup_bridge(napi_env env, napi_callback_info info) {
 		if (!socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, startup_gate)) value = startup_gate[1];
 	} else if (operation > 0 && startup_gate[0] >= 0 && !startup_observer) {
 		startup_observer = operation; close(startup_gate[1]); startup_gate[1] = -1; value = 0;
+	} else if (operation == -2 && startup_gate[0] < 0) {
+		value = prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
 	} else if (operation == -1) {
 		close(startup_gate[0]); close(startup_gate[1]); startup_gate[0] = startup_gate[1] = -1; startup_observer = 0; value = 0;
 	}
@@ -163,7 +170,7 @@ struct decision_job {
 	pthread_t thread;
 	pid_t pid;
 	const char *socket_path, *token, *execution_id;
-	int channel[2], connection, outputs[3], result, pidfd;
+	int channel[2], connection, outputs[3], result, pidfd, holder_control; pid_t holder;
 	struct output_event *events;
 	unsigned count, resource_count;
 	struct file_position *positions;
@@ -474,18 +481,35 @@ int pi_process_image_frontier(long number) {
 	/* Any native x86-64 syscall entry precedes its effects. Only restartable I/O also permits an exit stop. */
 	return number >= 0 && number < 0x40000000 ? 2 : 0;
 }
-static int image_status(pid_t pid, int consumer) {
-	char path[64], line[256]; snprintf(path, sizeof(path), "/proc/%d/status", pid);
-	FILE *status = fopen(path, "re"); if (!status) return -1;
-	unsigned seen = 0; int valid = 1;
-	while (fgets(line, sizeof(line), status)) {
-		unsigned value; unsigned long pending;
-		if (sscanf(line, "Threads: %u", &value) == 1) { seen |= 1; valid &= value == 1; }
-		if (sscanf(line, "Seccomp: %u", &value) == 1) { seen |= 2; valid &= !consumer || !value; }
-		if (sscanf(line, "SigPnd: %lx", &pending) == 1) { seen |= 4; valid &= !pending; }
-		if (sscanf(line, "ShdPnd: %lx", &pending) == 1) { seen |= 8; valid &= !pending; }
+struct process_credentials {
+	unsigned parent, uid[4], gid[4], no_new_privileges, threads, seccomp;
+	unsigned long long permitted, effective, inheritable, ambient, pending, shared_pending;
+};
+
+static int process_credentials(pid_t pid, struct process_credentials *value) {
+	char filename[64], line[256]; snprintf(filename, sizeof(filename), "/proc/%d/status", pid);
+	FILE *input = fopen(filename, "re"); if (!input) return -1;
+	unsigned fields = 0;
+	while (fgets(line, sizeof(line), input)) {
+		if (sscanf(line, "PPid: %u", &value->parent) == 1) fields |= 1;
+		if (sscanf(line, "Uid: %u %u %u %u", value->uid, value->uid + 1, value->uid + 2, value->uid + 3) == 4) fields |= 2;
+		if (sscanf(line, "Gid: %u %u %u %u", value->gid, value->gid + 1, value->gid + 2, value->gid + 3) == 4) fields |= 4;
+		if (sscanf(line, "CapPrm: %llx", &value->permitted) == 1) fields |= 8;
+		if (sscanf(line, "CapEff: %llx", &value->effective) == 1) fields |= 16;
+		if (sscanf(line, "CapInh: %llx", &value->inheritable) == 1) fields |= 32;
+		if (sscanf(line, "CapAmb: %llx", &value->ambient) == 1) fields |= 64;
+		if (sscanf(line, "NoNewPrivs: %u", &value->no_new_privileges) == 1) fields |= 128;
+		if (sscanf(line, "Threads: %u", &value->threads) == 1) fields |= 256;
+		if (sscanf(line, "Seccomp: %u", &value->seccomp) == 1) fields |= 512;
+		if (sscanf(line, "SigPnd: %llx", &value->pending) == 1) fields |= 1024;
+		if (sscanf(line, "ShdPnd: %llx", &value->shared_pending) == 1) fields |= 2048;
 	}
-	valid &= !ferror(status) && seen == 15; fclose(status); return valid ? 0 : -1;
+	int valid = fields == 4095 && !ferror(input); fclose(input); return valid ? 0 : -1;
+}
+
+static int image_status(pid_t pid, int consumer) {
+	struct process_credentials value;
+	return process_credentials(pid, &value) == 0 && value.threads == 1 && (!consumer || !value.seccomp) && !value.pending && !value.shared_pending ? 0 : -1;
 }
 static int image_write(int output, pid_t pid, struct process_image *image, int complete) {
 	struct image_header *header = &image->header;
@@ -660,8 +684,9 @@ static const struct file_position *resource_position(const struct decision_job *
 
 /* Transfer the verified OFDs themselves, including queued-only sources. Both
  * qualification and restoration use this channel; it never reopens a pathname. */
-static int image_sources(pid_t pid, struct decision_job *job, int *sources) {
-	if (!job->position_count) return 0;
+static int image_sources(pid_t pid, const int *pins, unsigned count, int *sources) {
+	if (!count) return 0;
+	if (count > MAX_POSITIONS) return -1;
 	struct image_message {
 		struct msghdr message; struct iovec vector;
 		union { struct cmsghdr alignment; unsigned char bytes[CMSG_SPACE(MAX_POSITIONS * sizeof(int))]; } control;
@@ -675,10 +700,10 @@ static int image_sources(pid_t pid, struct decision_job *job, int *sources) {
 		image_memory(pid, address, channel, sizeof(channel), 0) < 0 || (sender = duplicate_tracee_fd(&target, (unsigned)channel[1])) < 0) goto done;
 	packet.vector = (struct iovec){.iov_base = &packet.byte, .iov_len = 1};
 	packet.message = (struct msghdr){.msg_iov = &packet.vector, .msg_iovlen = 1, .msg_control = packet.control.bytes,
-		.msg_controllen = CMSG_SPACE(job->position_count * sizeof(int))};
+		.msg_controllen = CMSG_SPACE(count * sizeof(int))};
 	struct cmsghdr *header = CMSG_FIRSTHDR(&packet.message);
-	header->cmsg_level = SOL_SOCKET; header->cmsg_type = SCM_RIGHTS; header->cmsg_len = CMSG_LEN(job->position_count * sizeof(int));
-	for (unsigned p = 0; p < job->position_count; p++) ((int *)CMSG_DATA(header))[p] = job->positions[p].duplicate;
+	header->cmsg_level = SOL_SOCKET; header->cmsg_type = SCM_RIGHTS; header->cmsg_len = CMSG_LEN(count * sizeof(int));
+	for (unsigned p = 0; p < count; p++) ((int *)CMSG_DATA(header))[p] = pins[p];
 	if (sendmsg(sender, &packet.message, MSG_DONTWAIT | MSG_NOSIGNAL) != 1) goto done;
 	packet.message.msg_iov = (void *)(address + offsetof(struct image_message, vector));
 	packet.vector.iov_base = (void *)(address + offsetof(struct image_message, byte));
@@ -689,11 +714,11 @@ static int image_sources(pid_t pid, struct decision_job *job, int *sources) {
 		image_memory(pid, address, &packet, sizeof(packet), 0) < 0) goto done;
 	header = (struct cmsghdr *)packet.control.bytes;
 	if (packet.byte || (packet.message.msg_flags & (MSG_CTRUNC | MSG_TRUNC | MSG_OOB)) ||
-		packet.message.msg_controllen != CMSG_SPACE(job->position_count * sizeof(int)) || header->cmsg_level != SOL_SOCKET ||
-		header->cmsg_type != SCM_RIGHTS || header->cmsg_len != CMSG_LEN(job->position_count * sizeof(int))) goto done;
-	for (unsigned p = 0; p < job->position_count; p++) {
+		packet.message.msg_controllen != CMSG_SPACE(count * sizeof(int)) || header->cmsg_level != SOL_SOCKET ||
+		header->cmsg_type != SCM_RIGHTS || header->cmsg_len != CMSG_LEN(count * sizeof(int))) goto done;
+	for (unsigned p = 0; p < count; p++) {
 		sources[p] = ((int *)CMSG_DATA(header))[p];
-		if (sources[p] < 0 || syscall(SYS_kcmp, pid, getpid(), KCMP_FILE, sources[p], job->positions[p].duplicate) != 0) goto done;
+		if (sources[p] < 0 || syscall(SYS_kcmp, pid, getpid(), KCMP_FILE, sources[p], pins[p]) != 0) goto done;
 	}
 	result = 0;
 done:
@@ -705,9 +730,10 @@ done:
 /* Pin every source before replacing any slot, so aliases and cycles retain identity. */
 static int image_handles(pid_t pid, struct decision_job *job) {
 	struct process_image *image = job->image;
-	int current[MAX_HANDLES], count = descriptor_numbers(pid, 0, current, MAX_HANDLES), minimum = 3, sources[MAX_POSITIONS];
+	int current[MAX_HANDLES], count = descriptor_numbers(pid, 0, current, MAX_HANDLES), minimum = 3, sources[MAX_POSITIONS], borrowed[MAX_POSITIONS];
 	long pins[MAX_HANDLES];
-	if (count < 0 || image_sources(pid, job, sources) < 0) return -1;
+	for (unsigned p = 0; p < job->position_count; p++) borrowed[p] = job->positions[p].duplicate;
+	if (count < 0 || image_sources(pid, borrowed, job->position_count, sources) < 0) return -1;
 	for (int i = 0; i < count; i++) if (current[i] >= minimum) minimum = current[i] + 1;
 	for (unsigned i = 0; i < image->fd_count; i++) if (image->fds[i].fd >= minimum) minimum = image->fds[i].fd + 1;
 	for (unsigned i = 0; i < image->fd_count; i++) {
@@ -752,11 +778,9 @@ static int image_restore(pid_t pid, struct decision_job *job) {
 	}
 	for (unsigned i = 0; i < header->count; i++) {
 		struct image_map *map = &header->maps[i]; if (image_special(map)) continue;
-		long fd = -1; int flags = MAP_PRIVATE | MAP_FIXED;
+		int fd = -1, flags = MAP_PRIVATE | MAP_FIXED;
 		if (map->file) {
-			char path[64]; snprintf(path, sizeof(path), "/proc/%d/fd/%d", getpid(), image->files[i]);
-			if (image_memory(pid, IMAGE_SCRATCH + 4096, path, strlen(path) + 1, 1) < 0 ||
-				image_call(pid, IMAGE_SCRATCH, SYS_openat, (unsigned long)AT_FDCWD, IMAGE_SCRATCH + 4096, O_RDONLY | O_CLOEXEC, 0, 0, 0, &fd) < 0 || fd < 0) goto done;
+			if (image_sources(pid, &image->files[i], 1, &fd) < 0) goto done;
 		} else { flags |= MAP_ANONYMOUS; if (!strcmp(map->path, "[stack]")) flags |= MAP_GROWSDOWN; }
 		size_t length = (size_t)(map->end - map->start);
 		if (image_syscall(pid, SYS_mmap, map->start, length, PROT_READ | PROT_WRITE, flags, (unsigned long)fd, map->offset, (long)map->start) < 0 ||
@@ -801,7 +825,7 @@ done:
 static int image_qualify(struct decision_job *job) {
 	pid_t child = fork(); if (child < 0) return -1;
 	if (!child) {
-		if (prctl(PR_SET_PDEATHSIG, SIGKILL) < 0 || ptrace(PTRACE_TRACEME, 0, 0, 0) < 0 || raise(SIGSTOP)) _exit(70);
+		if (prctl(PR_SET_DUMPABLE, 1, 0, 0, 0) < 0 || prctl(PR_SET_PDEATHSIG, SIGKILL) < 0 || ptrace(PTRACE_TRACEME, 0, 0, 0) < 0 || raise(SIGSTOP)) _exit(70);
 		_exit(70);
 	}
 	int status, result = -1;
@@ -2608,6 +2632,55 @@ static void release_position_fds(struct decision_job *job) {
 	pthread_setcancelstate(cancellation, NULL);
 }
 
+/* The host may read queue-only pins without access to the protected observer.
+ * These extra references end before any ownership or adoption validation. */
+static void stop_pin_holder(struct decision_job *job) {
+	int cancellation, status;
+	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancellation);
+	if (job->holder > 0) {
+		kill(job->holder, SIGKILL);
+		while (waitpid(job->holder, &status, __WALL) < 0 && errno == EINTR) {}
+	}
+	job->holder = 0;
+	close(job->holder_control); job->holder_control = -1;
+	pthread_setcancelstate(cancellation, NULL);
+}
+
+static int start_pin_holder(struct decision_job *job) {
+	int keep[MAX_POSITIONS + 1], channel[2], count = 0;
+	for (unsigned index = 0; index < job->capture_count; index++)
+		if (!job->captures[index].installed) keep[count++] = job->captures[index].duplicate;
+	if (!count) return 0;
+	if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, channel) < 0) return -1;
+	keep[count++] = channel[1];
+	for (int index = 1; index < count; index++) {
+		int value = keep[index], previous = index;
+		while (previous && keep[previous - 1] > value) { keep[previous] = keep[previous - 1]; previous--; }
+		keep[previous] = value;
+	}
+	char control[24], parent[24];
+	snprintf(control, sizeof(control), "%d", channel[1]); snprintf(parent, sizeof(parent), "%d", getpid());
+	char *arguments[] = {"pi-held-pins", "--hold-pins", control, parent, NULL}, *environment[] = {NULL};
+	job->holder_control = channel[0];
+	job->holder = fork();
+	if (!job->holder) {
+		unsigned next = 0;
+		for (int index = 0; index < count; index++) {
+			if (next < (unsigned)keep[index] && syscall(SYS_close_range, next, (unsigned)keep[index] - 1, 0) < 0) _exit(70);
+			if (fcntl(keep[index], F_SETFD, 0) < 0) _exit(70);
+			next = (unsigned)keep[index] + 1;
+		}
+		if (syscall(SYS_close_range, next, UINT_MAX, 0) < 0 || prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) _exit(70);
+		execve("/proc/self/exe", arguments, environment); _exit(70);
+	}
+	close(channel[1]);
+	struct pollfd ready = {.fd = channel[0], .events = POLLIN}; char byte;
+	if (job->holder <= 0 || poll(&ready, 1, 5000) <= 0 || read(channel[0], &byte, 1) != 1 || byte != 'R') {
+		stop_pin_holder(job); return -1;
+	}
+	return 0;
+}
+
 static int actor_decision(struct decision_job *job) {
 	unsigned code = 125;
 	size_t total = 0, image_bytes = 0;
@@ -2624,17 +2697,19 @@ static int actor_decision(struct decision_job *job) {
 	if (descriptors) {
 		/* Publish every snapshot pin under job ownership before allowing cancellation. */
 		pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-		captured = descriptor_context(job, descriptors, MAX_REQUEST_BYTES) == 0;
+		captured = descriptor_context(job, descriptors, MAX_REQUEST_BYTES) == 0 && start_pin_holder(job) == 0;
 		pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
 	}
 	int request_length = snprintf(line, sizeof(line),
-		"{\"token\":\"%s\",\"execution\":\"%s\",\"pid\":%ld,\"tracer\":%ld%s",
-		job->token, job->execution_id, (long)job->pid, (long)getpid(),
+		"{\"token\":\"%s\",\"execution\":\"%s\",\"pid\":%ld,\"tracer\":%ld,\"holder\":%ld%s",
+		job->token, job->execution_id, (long)job->pid, (long)getpid(), (long)job->holder,
 		captured ? ",\"descriptors\":[" : job->needs_tracking ? ",\"trackQueues\":true" : "");
 	int sent = request_length > 0 && request_length < (int)sizeof(line) && transfer(connection, line, (size_t)request_length, 1) == 0 &&
 		(!captured || transfer(connection, descriptors, strlen(descriptors), 1) == 0) && transfer(connection, captured ? "]}\n" : "}\n", captured ? 3 : 2, 1) == 0;
 	free(descriptors); job->context = NULL;
-	if (!sent || read_line(connection, line, sizeof(line)) < 0) return -1;
+	int received_line = sent ? read_line(connection, line, sizeof(line)) : -1;
+	stop_pin_holder(job);
+	if (received_line < 0) return -1;
 	if (!strcmp(line, "C")) return -1;
 	if (!strcmp(line, "F")) return -2;
 	if (!strcmp(line, "O")) return connection;
@@ -2825,6 +2900,7 @@ static void *decide_process(void *argument) {
 }
 
 static void free_job(struct decision_job *job) {
+	stop_pin_holder(job);
 	image_free(job->image);
 	release_position_fds(job);
 	close(job->channel[0]); close(job->channel[1]); close(job->connection); close(job->pidfd);
@@ -2847,7 +2923,7 @@ static int start_decision(struct traced_process *process, const char *socket_pat
 	if (!job) return -1;
 	*job = (struct decision_job){ .pid = process->pid, .socket_path = socket_path,
 		.token = token, .execution_id = execution_id, .channel = {-1, -1},
-		.connection = -1, .pidfd = -1, .outputs = {-1, -1, -1}, .result = -1, .domain = domain, .process = process };
+		.connection = -1, .pidfd = -1, .holder_control = -1, .outputs = {-1, -1, -1}, .result = -1, .domain = domain, .process = process };
 	if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, job->channel) < 0 ||
 		pthread_create(&job->thread, NULL, decide_process, job) != 0) {
 		free_job(job);
@@ -2911,6 +2987,49 @@ static int release_tracees(struct traced_process **processes, struct descriptor_
 	return live;
 }
 
+/* An ordinary caller cannot lend either saved IDs or capabilities to a reusable image. */
+static int process_owned(pid_t pid, struct process_credentials *value) {
+	if (process_credentials(pid, value) < 0 || value->permitted || value->effective || value->inheritable || value->ambient) return 0;
+	for (unsigned i = 0; i < 4; i++) if (value->uid[i] != getuid() || value->gid[i] != getgid()) return 0;
+	return 1;
+}
+
+static int attach_owned(pid_t root, long flags) {
+	struct ucred peer; socklen_t length = sizeof(peer);
+	struct process_credentials caller, child, observer;
+	if (getsockopt(3, SOL_SOCKET, SO_PEERCRED, &peer, &length) < 0 || length != sizeof(peer) ||
+		peer.pid != getppid() || peer.uid != getuid() || peer.gid != getgid() ||
+		!process_owned(peer.pid, &caller) || !process_owned(root, &child) || child.parent != (unsigned)peer.pid ||
+		process_credentials(getpid(), &observer) < 0) return -1;
+	unsigned long long extra = 1ULL << CAP_SYS_PTRACE;
+	if (!child.no_new_privileges && !(observer.effective & extra)) return -1;
+	if (observer.permitted & ~extra || observer.effective & ~extra || observer.inheritable || observer.ambient) return -1;
+	int parent = syscall(SYS_pidfd_open, peer.pid, 0), target = syscall(SYS_pidfd_open, root, 0), result = -1;
+	struct pollfd alive[2] = {{.fd = parent, .events = POLLIN}, {.fd = target, .events = POLLIN}};
+	if (parent >= 0 && target >= 0 && poll(alive, 2, 0) == 0 &&
+		ptrace(PTRACE_SEIZE, root, 0, flags & ~PTRACE_O_EXITKILL) == 0) {
+		struct __user_cap_header_struct header = {_LINUX_CAPABILITY_VERSION_3, 0};
+		struct __user_cap_data_struct empty[2] = {{0}, {0}};
+		if (syscall(SYS_capset, &header, empty) == 0 && poll(alive, 2, 0) == 0 && ptrace(PTRACE_INTERRUPT, root, 0, 0) == 0) result = 0;
+	}
+	close(parent); close(target); return result;
+}
+
+static int hold_pins(int argc, char **argv) {
+	struct process_credentials credentials;
+	if (argc != 4 || !*argv[2] || !*argv[3] || strspn(argv[2], "0123456789") != strlen(argv[2]) ||
+		strspn(argv[3], "0123456789") != strlen(argv[3]) || strtoul(argv[2], NULL, 10) < 3 || strtoul(argv[2], NULL, 10) >= INT_MAX ||
+		strtoul(argv[3], NULL, 10) > INT_MAX || !process_owned(getpid(), &credentials) || !credentials.no_new_privileges ||
+		prctl(PR_SET_PDEATHSIG, SIGKILL) < 0 || getppid() != (pid_t)strtol(argv[3], NULL, 10) ||
+		prctl(PR_SET_DUMPABLE, 1, 0, 0, 0) < 0) return 64;
+	int control = atoi(argv[2]); char byte;
+	/* Secure libc startup may fill vacant stdio even though no_new_privs suppressed file capabilities. */
+	close(0); close(1); close(2);
+	if (write(control, "R", 1) != 1) return 70;
+	while (read(control, &byte, 1) < 0 && errno == EINTR) {}
+	return 0;
+}
+
 static int trace(const char *socket_path, const char *token, const char *execution_id,
 	int skip, unsigned skip_code, int descriptors, int skip_root) {
 	struct descriptor_domain domain = {.enabled = descriptors == 1};
@@ -2922,9 +3041,9 @@ static int trace(const char *socket_path, const char *token, const char *executi
 	if (signals < 0) return 70;
 	pid_t root;
 	if (transfer(3, &root, sizeof(root), 0) < 0 || root <= 0) return 71;
-	if (ptrace(PTRACE_SEIZE, root, 0, options | (descriptors ? PTRACE_O_TRACESYSGOOD : 0)) < 0 || transfer(3, "R", 1, 1) < 0) return 72;
-	close(3);
-	int status = 0, root_status = -1, retiring = 0, draining = 0, acknowledged = 0;
+	long flags = options | (descriptors ? PTRACE_O_TRACESYSGOOD : 0);
+	if (attach_owned(root, flags) < 0) return 72;
+	int status = 0, root_status = -1, retiring = 0, draining = 0, acknowledged = 0, admitted = 0;
 	unsigned exec_events = !skip_root;
 	struct traced_process *processes = NULL;
 	domain.processes = &processes;
@@ -3043,9 +3162,17 @@ static int trace(const char *socket_path, const char *token, const char *executi
 			current->awaiting_parent = event == PTRACE_EVENT_STOP;
 		}
 		current->stopped = 1; current->listening = 0;
+		struct process_credentials credentials;
+		if (!admitted) {
+			int valid = !retiring && pid == root && event == PTRACE_EVENT_STOP && process_owned(pid, &credentials) && credentials.parent == (unsigned)getppid();
+			if (valid && ptrace(PTRACE_SETOPTIONS, root, 0, flags) < 0) goto fatal;
+			if (!valid) retiring = draining = 1;
+			(void)transfer(3, valid ? "R" : "N", 1, 1); close(3); admitted = 1;
+		}
+		if (event == PTRACE_EVENT_EXEC && !process_owned(pid, &credentials)) retiring = draining = 1;
 		if (event == PTRACE_EVENT_VFORK || event == PTRACE_EVENT_VFORK_DONE) current->vforking = event == PTRACE_EVENT_VFORK;
 		if (descriptors && delivered == (SIGTRAP | 0x80)) {
-			if (observe_descriptor_syscall(current, &domain) < 0) goto fatal;
+			if (!draining && observe_descriptor_syscall(current, &domain) < 0) goto fatal;
 			delivered = 0;
 		}
 		if (event == PTRACE_EVENT_FORK || event == PTRACE_EVENT_VFORK || event == PTRACE_EVENT_CLONE) {
@@ -3090,7 +3217,7 @@ static int trace(const char *socket_path, const char *token, const char *executi
 				else index++;
 		}
 		if (event == PTRACE_EVENT_EXEC && ++exec_events > 1) {
-			if (skip && replace_with_exit(pid, skip_code) < 0) goto fatal;
+			if (!draining && skip && replace_with_exit(pid, skip_code) < 0) goto fatal;
 			if (socket_path && !retiring) {
 				for (struct traced_process *item = processes; item; item = item->next) {
 					if (item->pid != pid) continue;
@@ -3496,11 +3623,20 @@ static int set_modified_times(void) {
 }
 
 int main(int argc, char **argv) {
-	int dispatched = image_dispatch(argc, argv);
+	if (argc > 1 && !strcmp(argv[1], "--hold-pins")) return hold_pins(argc, argv);
+	int observing = argc > 1 && (!strcmp(argv[1], "--attach") || !strcmp(argv[1], "--attach-skip-code") || !strcmp(argv[1], "--probe-observation"));
+	if ((PI_SPEC_AUTHORITY_ONLY ? !observing : getauxval(AT_SECURE)) || (observing && prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) < 0)) return 64;
+	if (argc == 2 && !strcmp(argv[1], "--probe-observation")) {
+		struct process_credentials credentials; unsigned long long extra = 1ULL << CAP_SYS_PTRACE;
+		return process_credentials(getpid(), &credentials) == 0 && !(credentials.permitted & ~extra) &&
+			!(credentials.effective & ~extra) && !credentials.inheritable && !credentials.ambient &&
+			(credentials.no_new_privileges || (credentials.effective & extra)) ? 0 : 77;
+	}
+	int dispatched = PI_SPEC_AUTHORITY_ONLY ? -1 : image_dispatch(argc, argv);
 	if (dispatched >= 0) return dispatched;
 	if (argc >= 2 && (!strcmp(argv[1], "--attach") || !strcmp(argv[1], "--attach-skip-code"))) {
 		int probe = !strcmp(argv[1], "--attach-skip-code");
-		if (probe && (argc != 3 || strspn(argv[2], "0123456789") != strlen(argv[2]) || atoi(argv[2]) > 255)) return 64;
+		if (probe && (argc != 3 || !*argv[2] || strspn(argv[2], "0123456789") != strlen(argv[2]) || strtoul(argv[2], NULL, 10) > 255)) return 64;
 		char *socket = getenv("PI_SPEC_HELD_EXEC_SOCKET"), *token = getenv("PI_SPEC_HELD_EXEC_TOKEN"), *id = getenv("PI_SPEC_HELD_EXEC_ID");
 		char *descriptors = getenv("PI_SPEC_HELD_EXEC_DESCRIPTORS"), *skip = getenv("PI_SPEC_HELD_EXEC_ROOT");
 		if (!probe && (!socket || !token || !id)) return 64;

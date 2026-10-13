@@ -38,11 +38,12 @@ const localBin = path.join(localRoot, "bin");
 const sandlock = path.join(localBin, "pi-speculative-sandlock");
 const heldExec = path.join(localBin, "pi-speculative-held-exec");
 await mkdir(localBin, { recursive: true });
-const held = await optional("Actor child handoff", installHeldExec);
-const tracing = held && await optional("Running process handoff tracer", installStrace);
+const helper = await optional("Native execution helper", installHeldExec);
+const held = helper && await optional("Actor child handoff", () => qualifyNativeStartup(heldExec));
+const tracing = helper && await optional("Running process handoff tracer", installStrace);
 const missing = await missingExecutables([...(tracing ? [] : ["strace"]), "git"]);
 let producer = false;
-if (!held)
+if (!helper)
 	console.warn("Speculative Bash producer unavailable because its transparent exec boundary is unavailable.");
 else if (missing.length)
 	console.warn(`Speculative Bash producer unavailable (missing ${missing.join(", ")}); cached Actor replay remains usable.`);
@@ -112,17 +113,17 @@ async function qualifySandlock(binary) {
 
 async function installHeldExec() {
 	const source = fileURLToPath(new URL("./linux-held-exec.c", import.meta.url));
-	return installNative(heldExec, sha256("static-pthread+shared-image+native-startup", await readFile(source)), qualifyHeldExec, async (_root, temporary) => {
+	return installNative(heldExec, sha256("static-pthread+shared-image+native-startup+authority-observer", await readFile(source)), qualifyHeldExec, async (_root, temporary) => {
 		const compiler = await executable(["cc", "gcc", "clang"]);
-		await run(compiler, ["-static", "-pthread", "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", source, "-o", temporary]);
-		await run(compiler, ["-shared", "-fPIC", "-pthread", "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", source, "-o", `${temporary}.so`]);
+		for (const [suffix, flags] of [["", ["-static"]], [".observer", ["-static", "-DPI_SPEC_AUTHORITY_ONLY=1"]], [".so", ["-shared", "-fPIC"]]])
+			await run(compiler, [...flags, "-pthread", "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", source, "-o", temporary + suffix]);
 		await copyFile(`${temporary}.so`, `${temporary}.node`, fsConstants.COPYFILE_EXCL);
-	}, [".so", ".node", ""]);
+	}, [".so", ".node", ".observer", ""]);
 }
 
 async function qualifyHeldExec(binary) {
 	await run(binary, ["--exec", "21", "pi-exec-probe", binary, "--probe-clean-fds"]);
-	await qualifyNativeStartup(binary);
+	await qualifyNativeStartup(binary, { observer: `${binary}.observer`, confined: true });
 }
 
 async function installStrace() {
