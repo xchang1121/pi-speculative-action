@@ -7,14 +7,9 @@ import os from "node:os";
 import path from "node:path";
 import { createWriteTool } from "@earendil-works/pi-coding-agent";
 import { expect, test } from "vitest";
-import { createSpeculativeActionHost } from "../src/agent-integration.ts";
-import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
-import { PatternAwareStore, patternAwareActionSemantics, patternAwareSettings } from "../src/pattern-aware.ts";
-import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
-import type { SpeculativeActionEvent } from "../src/events.ts";
+import { patternAwareSettings } from "../src/pattern-aware.ts";
 import type { ExecutionResourceMonitor } from "../src/system-resources.ts";
-import { testModel } from "./model.ts";
-import { commitBenchmarkFixture, compileBenchmarkHelper, createLinuxProcessBenchmark, holdProcessPublication, prepareLinuxProcessReuse, textOutput } from "./linux-process-fixture.ts";
+import { commitBenchmarkFixture, compileBenchmarkHelper, createLinuxProcessBenchmark, holdOwnedProcessPublication, patternProcessHost, prepareLinuxProcessReuse, textOutput } from "./linux-process-fixture.ts";
 
 /** The Actor runs `first`, then (its next step) `next`, three times; the measured episode thinks `think` ms before `actual`. A `detour`
  * step first does something else, `during` changes the workspace while the Actor thinks; `reuse` is the expected outcome. */
@@ -53,15 +48,11 @@ async function chainWorld(files: readonly (readonly [string, string])[], loops: 
 		await commitBenchmarkFixture(workspace, "chain");
 		await prepareLinuxProcessReuse(fixture);
 		const route = await fixture.prepareActorReplay(), writer = createWriteTool(workspace), tools = [fixture.tool, writer];
-		const settings = patternAwareSettings({ enabled: true, multiStepEnabled: false });
-		const events: SpeculativeActionEvent<string>[] = [];
-		const resolve = (tool: string, input: unknown) => resolvePiToolInvocation(tool, input, { cwd: workspace, environment: fixture.environment, shellPath: fixture.shellPath });
-		const host = createSpeculativeActionHost("chain", { cwd: workspace, resources, complete: async () => { throw new Error("no inference"); }, onEvent: event => { events.push(event); },
-			patternStore: new PatternAwareStore(settings, undefined, patternAwareActionSemantics(PI_ACTION_SEMANTICS, workspace)),
-			getSettings: () => ({ enabled: true, drafterEnabled: false, candidateLimit: 4, maxConcurrentActions: 4, tools: ["bash"], patternAware: settings }),
-			preflight: () => true, executionWorlds: [fixture.world, fixture.workspaceSandbox.createExecutionWorld()], resolveInvocation: resolve });
+		const { host, events, start } = patternProcessHost(fixture, "chain", { candidateLimit: 4, maxConcurrentActions: 4,
+			patternAware: patternAwareSettings({ enabled: true, multiStepEnabled: false }) },
+			{ resources, executionWorlds: [fixture.world, fixture.workspaceSandbox.createExecutionWorld()] }, tools);
 		const step = async (turnID: string, call: string | { readonly path: string; readonly content: string }, think: number | (() => Promise<unknown>), during?: string) => {
-			await host.startTurn({ turnID, tools, actorModel: testModel("actor"), actorOptions: undefined, context: { systemPrompt: "chain", messages: [], tools } });
+			await start(turnID, undefined, "chain");
 			await (typeof think === "number" ? sleep(think) : think());
 			if (during) execSync(during, { cwd: workspace, shell: "/bin/bash" });
 			const before = fixture.backend.actorMetrics(), started = performance.now();
@@ -105,15 +96,15 @@ test.skipIf(process.platform !== "linux").for(["build", "build_changed_after_pre
 	// This retention scenario needs capacity for the detour and producer; CPU preemption has separate coverage.
 	const { fixture, workspace, host, step, events } = await chainWorld([["a.txt", "alpha\n"], ["Makefile", "all:\n\t@./slow a.txt\n"]], "600000000",
 		horizon ? { initial: { cpuCount: 4, idleCpuCount: 4 }, sample: async () => ({ cpuCount: 4, idleCpuCount: 4 }) } : undefined);
-	let publication: ReturnType<typeof holdProcessPublication> | undefined;
-	await using _cleanup = onExit(async () => { publication?.close(); await host.dispose(); await fixture.dispose(); });
+	let publication: Awaited<ReturnType<typeof holdOwnedProcessPublication>> | undefined;
+	await using _cleanup = onExit(async () => { await publication?.close(); await host.dispose(); await fixture.dispose(); });
 	const command = build ? "make -s all" : `${worker} | tail -1${horizon ? `; ${worker} | tail -2` : ""}`;
 	await step("build", build ? "make -s" : `cat > a.txt <<'EOF'\nalpha\nEOF\n${worker} | tail -2`, 0);
 	if (bashMutation) {
 		await step("unchanged", "printf unchanged", 0);
 		expect(events.some(event => event.type === "candidate" && event.candidate.kind === "operation")).toBe(false);
 	}
-	if (horizon) publication = holdProcessPublication(fixture.backend);
+	if (horizon) publication = await holdOwnedProcessPublication(fixture);
 	await step("edit", bashMutation ? "printf 'alpha\\nbeta\\n' > a.txt" : { path: "a.txt", content: "alpha\nbeta\n" }, 0);
 	if (publication) {
 		await step("detour", "printf detour", () => expect.poll(publication!.reached, { timeout: 15_000 }).toBe(true));
@@ -121,7 +112,7 @@ test.skipIf(process.platform !== "linux").for(["build", "build_changed_after_pre
 		const states = () => events.filter(event => event.type === "candidate").filter(event => event.candidate.id === operation).map(event => event.state.status);
 		expect(states(), JSON.stringify(events.filter(event => event.type === "candidate" || event.type === "operation_prediction"))).toEqual(["running"]);
 		expect(events.filter(event => event.type === "operation_prediction").map(event => event.settlement)).toContainEqual(expect.objectContaining({ observation: "unobserved", cause: expect.objectContaining({ code: "operation_not_observed" }) }));
-		publication.close(); publication = undefined;
+		await publication.close(); publication = undefined;
 		await expect.poll(states, { timeout: 15_000 }).toEqual(["running", "succeeded"]);
 	}
 	// A PID-observing child has a one-shot result: the second native exec must run even after the first reuses it.

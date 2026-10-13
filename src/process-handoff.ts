@@ -369,7 +369,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 	/** Revalidate transferred bytes through the same artifact loader; a copy never extends its loan's scope. */
 	async receive(transfer: ProcessHandoffTransfer, scope: ExecutionScope | undefined,
 		adopted: (index: number, adoption: ExecutionOperationAdoption) => void): Promise<() => void> {
-		const callbacks: object[] = [];
+		const callbacks: object[] = [], received: HandoffRecord[] = [];
 		for (const [index, result] of transfer.results.entries()) {
 			const computation = TimelineInterval.restore(result.computation), resumed = result.continuation && TimelineInterval.restore(result.continuation.computation);
 			if (!computation || result.continuation && !resumed) continue;
@@ -383,11 +383,12 @@ export class ProcessHandoffRegistry<Invocation = never> {
 			const accept = (consumer: ExecutionScope) => sameScope(scope, consumer) && scope?.callID === consumer.callID;
 			callbacks.push(observe, accept);
 			const record = this.reserve(result.key, result.executablePath, new ProcessHandoffOwnership(observe, accept), result.scope);
+			received.push(record);
 			record.claimState = new Int32Array(transfer.claims, index * 4, 1);
 			this.complete(result.key, record, { candidate: result.candidate, artifacts, bytes: result.bytes, computation,
 				...(result.continuation ? { continuation: { ...result.continuation, image: Buffer.from(result.continuation.image), computation: resumed! } } : {}) });
 		}
-		return () => { callbacks.length = 0; this.clearCompleted(); };
+		return () => { callbacks.length = 0; for (const record of received) this.remove(record); };
 	}
 
 	/** Seal owned bytes before visibility; disk maintenance and persistence cannot revoke a live result. */

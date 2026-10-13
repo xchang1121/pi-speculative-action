@@ -13,7 +13,7 @@ import { LinuxProcessReuseBackend } from "../src/linux-process-backend.ts";
 import type { ProcessExecutionBinding, ProcessHandoffRegistry } from "../src/process-handoff.ts";
 import { SynchronousProcessObserver } from "../src/linux-process-sync.ts";
 import { summarizeSpeculativeTrace } from "../src/trace-summary.ts";
-import { commitBenchmarkFixture, compileBenchmarkHelper, holdProcessPublication } from "./linux-process-fixture.ts";
+import { commitBenchmarkFixture, compileBenchmarkHelper, holdOwnedProcessPublication, inspectProcessOwner } from "./linux-process-fixture.ts";
 import type { SpeculativeActionEvent } from "../src/runtime.ts";
 import { temporaryDirectories } from "./filesystem.ts";
 import { Agent, type AgentTool } from "@earendil-works/pi-agent-core";
@@ -83,19 +83,23 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 	const { session } = await createAgentSession({ cwd, agentDir, model: actor.getModel(), modelRuntime, settingsManager, resourceLoader,
 		sessionManager: SessionManager.inMemory(cwd), tools });
 	const originalPrompt = session.agent.prompt, originalContinue = session.agent.continue;
-	const published = deferred();
-	let publication: ReturnType<typeof holdProcessPublication> | undefined;
+	let inspection: ReturnType<typeof inspectProcessOwner> | undefined;
+	let publication: Awaited<ReturnType<typeof holdOwnedProcessPublication>> | undefined;
 	try {
 		await session.bindExtensions({ mode: "print", onError: error => { throw error; } });
 		if (native) {
 			let backend: LinuxProcessReuseBackend | undefined;
+			const processOwner = LinuxProcessReuseBackend.prototype.processOwner;
+			vi.spyOn(LinuxProcessReuseBackend.prototype, "processOwner").mockImplementation(function (this: LinuxProcessReuseBackend) {
+				inspection ??= inspectProcessOwner(() => processOwner.call(this)); return processOwner.call(this);
+			});
 			let inputBinding: ProcessExecutionBinding | undefined;
 			if (mode === "native-sync-lost") {
 				const attach = SynchronousProcessObserver.prototype.attach;
 				vi.spyOn(SynchronousProcessObserver.prototype, "attach").mockImplementation(function (this: SynchronousProcessObserver, request) {
 					const attachment = attach.call(this, request);
 					return { ...attachment, finish: () => { const result = attachment.finish();
-						if (result.adoptions.length) { expect(result.metrics.hits).toBe(1); expect([...new Int32Array(request.handoffs.claims)]).toContain(2);
+						if (result.adoptions.length) { expect(result.metrics.hits).toBe(1); expect(Atomics.load(new Int32Array(request.claims), 0)).toBeGreaterThan(0);
 							void Reflect.get(this, "worker").terminate(); throw new Error("lost acknowledged synchronous handoff"); }
 						return result;
 					} };
@@ -117,10 +121,15 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 			const initial = `printf initial:; ${command}; :`, remaining = `printf remaining:; ${command}; printf once >> marker`;
 			const call = (tool: string, text: string, id: string) => fauxAssistantMessage(fauxToolCall(tool, { text }, { id }), { stopReason: "toolUse" });
 			actor.setResponses([call("produce_notes", initial, "seed"), ...(inputs ? [response("read", { path: "notes.txt", offset: 2 })] : []), ...cold ? [] : [async () => {
-				if (running) publication = holdProcessPublication(backend!);
+				if (running) publication = await holdOwnedProcessPublication(inspection!);
 				if (preempted) {
-					const store = backend!.store, publish = store.withPublication.bind(store);
-					vi.spyOn(store, "withPublication").mockImplementation(async (...args) => { const result = await publish(...args); await published.promise; return result; });
+					await inspection!.inOwner(async state => {
+						const { ProvenanceCertificateStore } = await state.load("../src/reuse-store.ts"), publish = ProvenanceCertificateStore.prototype.withPublication;
+						state.publishedGate = state.deferred();
+						state.method(ProvenanceCertificateStore.prototype, "withPublication", async function (this: unknown, ...args: unknown[]) {
+							const result = await publish.apply(this, args); await state.publishedGate.promise; return result;
+						});
+					});
 				}
 				return response("write", { path: "notes.txt", content: "changed\n" });
 			}], ...(mode === "native-retired" ? [async () => {
@@ -137,7 +146,7 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 			// A named inherited input prepares a new version after the edit; adoption still checks the actual held graph.
 			const results = session.messages.filter(message => message.role === "toolResult"), reused = !stale;
 			if (mode === "native-sync-lost") {
-				expect(results.at(-1)).toMatchObject({ isError: true }); expect(JSON.stringify(results.at(-1))).toContain("synchronous native handoff failed");
+				expect(results.at(-1)).toMatchObject({ isError: true }); expect(JSON.stringify(results.at(-1))).toContain("native handoff failed");
 				expect(await readFile(path.join(cwd, "marker"), "utf8")).toBe("once"); expect(calls).toEqual(["seed", "check"]); return;
 			}
 			expect(results.at(-1)?.content, JSON.stringify(session.messages)).toEqual([{ type: "text", text: "hook:own:format_rows:remaining:" + execFileSync("./slow", ["notes.txt"], { cwd, encoding: "utf8" }) }]);
@@ -152,7 +161,7 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 			expect(adopted).toHaveLength(Number(reused && mode !== "native-retired")); if (nested && adopted.length) expect(adopted[0]).toMatchObject({ kind: "projected", projector: "owned-operation" });
 			if (mode === "native-retired") expect(predictions.filter(event => event.settlement.prediction.id === predictions[0]!.settlement.prediction.id)).toMatchObject([{ settlement: { observation: "unobserved", cause: { code: "operation_not_observed" } } }]);
 			expect(!!settled.settlement.actionKeyHash).toBe(mode !== "native-unkeyed");
-			if (publication) expect(publication.joined()).toBe(true);
+			if (publication) expect(await publication.joined()).toBe(true);
 			expect(events.filter(event => event.type === "candidate" && event.state.status === "cancelled" && event.state.cause.code === "tool_disabled" && event.state.executionMs > 0)).toEqual([]);
 			return;
 		}
@@ -225,8 +234,8 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 			for (const execute of [() => coordinator.execute({ command: "", cwd, environment: {}, onData: () => {} }), () => coordinator.operations.exec("", cwd, { onData: () => {} })]) await expect(execute()).rejects.toBe(failure);
 		});
 	} finally {
-		published.resolve(); publication?.close();
-		await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" }); session.dispose();
+		if (preempted) await inspection?.inOwner(state => state.publishedGate?.resolve()); await publication?.close();
+		await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" }); session.dispose(); inspection?.dispose();
 		expect(session.agent.prompt).toBe(originalPrompt); expect(session.agent.continue).toBe(originalContinue);
 	}
 });

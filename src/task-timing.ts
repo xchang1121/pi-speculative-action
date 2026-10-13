@@ -64,6 +64,7 @@ export class TimelineInterval {
 		const { startedAt, completedAt } = interval;
 		return interval instanceof TimelineInterval ? interval : new TimelineInterval(startedAt, completedAt, [], undefined, null);
 	}
+	static get producer(): ComputationProducer | undefined { return collecting.getStore()?.producer; }
 
 	/** Record provenance before publication; failed evaluations never transfer borrowed work to the caller. */
 	static async collect<T>(execute: () => T | Promise<T>, producer = collecting.getStore()?.producer) {

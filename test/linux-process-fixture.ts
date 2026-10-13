@@ -2,8 +2,9 @@ import { execHostText } from "../src/executable-path.ts";
 import { access, copyFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { test, vi, type TestAPI } from "vitest";
-import { deferred, onExit } from "./async.ts";
+import { MessageChannel, type Worker } from "node:worker_threads";
+import { test, type TestAPI } from "vitest";
+import { onExit } from "./async.ts";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { createBashTool, createLocalBashOperations } from "@earendil-works/pi-coding-agent";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
@@ -13,10 +14,36 @@ import { createLinuxProcessExecutionWorld } from "../src/linux-process-world.ts"
 import { PI_OPERATION_TOOLS, resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { adaptProcessToolOperations, definedProcessEnvironment, ProcessExecutionCoordinator, type ProcessExecutionRequest, type ProcessExecutor } from "../src/process-execution.ts";
 import { WorkspaceSandboxService, type WorkspaceSandboxDriver } from "../src/workspace-sandbox.ts";
-import type { ProcessHandoffRegistry } from "../src/process-handoff.ts";
-import * as scheduling from "../src/scheduler.ts";
+import { createSpeculativeActionHost, type CreateSpeculativeActionHostOptions, type SpeculativeAgentSettingsInput } from "../src/agent-integration.ts";
+import { PatternAwareStore, patternAwareSettings, patternAwareActionSemantics } from "../src/pattern-aware.ts";
+import type { SpeculativeActionEvent } from "../src/events.ts";
+import { testModel } from "./model.ts";
+import type { ProcessProvenanceCertificate } from "../src/provenance-certificate.ts";
 
 export type LinuxProcessBenchmark = Readonly<Awaited<ReturnType<typeof createLinuxProcessBenchmark>>>;
+
+export function patternProcessHost(fixture: LinuxProcessBenchmark, sessionID: string, settings: SpeculativeAgentSettingsInput,
+	options: Partial<CreateSpeculativeActionHostOptions> = {}, tools = [fixture.tool]) {
+	const events: SpeculativeActionEvent<string>[] = [], patternStore = new PatternAwareStore(patternAwareSettings(settings.patternAware), undefined,
+		patternAwareActionSemantics(PI_ACTION_SEMANTICS, fixture.workspace));
+	const host = createSpeculativeActionHost(sessionID, { cwd: fixture.workspace, patternStore,
+		complete: async () => { throw new Error("unexpected inference"); }, preflight: () => true, executionWorlds: [fixture.world],
+		getSettings: () => ({ enabled: true, drafterEnabled: false, tools: ["bash"], ...settings }),
+		resolveInvocation: (tool, input) => resolvePiToolInvocation(tool, input, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath }),
+		onEvent: event => { events.push(event); }, ...options,
+	});
+	return { host, events, patternStore,
+		start: (turnID: string, signal?: AbortSignal, systemPrompt = "unchanged") => host.startTurn({ turnID, tools, actorModel: testModel("actor"), actorOptions: undefined, context: { systemPrompt, messages: [], tools } }, signal),
+		call: (turnID: string, command: string) => ({ turnID, id: turnID, tool: "bash", args: { command }, tools }),
+	};
+}
+
+export async function recordProcessPublications(fixture: LinuxProcessBenchmark) {
+	await fixture.inOwner(async state => {
+		state.publishing = state.method((await state.load("../src/reuse-planner.ts")).ProcessReusePlanner.prototype, "publishCompleted");
+	});
+	return () => fixture.inOwner(state => state.publishing.mock.calls.map(({ arguments: [certificate] }: any) => certificate) as ProcessProvenanceCertificate[]);
+}
 
 /** Tests release their backends after assertions, failures and early skips. */
 export const processTest: ReturnType<TestAPI<{ benchmark: typeof createLinuxProcessBenchmark }>["skipIf"]> = test.extend<{ benchmark: typeof createLinuxProcessBenchmark }>({
@@ -27,27 +54,43 @@ export const processTest: ReturnType<TestAPI<{ benchmark: typeof createLinuxProc
 	},
 }).skipIf(process.platform !== "linux");
 
-/** Hold finished production before its shared writer admission until an Actor joins owned running work. */
-export function holdProcessPublication(backend: LinuxProcessReuseBackend, delayMs = 0, beforeRelease = async () => {}) {
-	const release = deferred();
-	let joined = false, reached = false, timer: ReturnType<typeof setTimeout> | undefined;
-	const handoffs = Reflect.get(backend, "handoffs") as ProcessHandoffRegistry;
-	const observing = vi.spyOn(handoffs, "observeRunning"), publish = backend.store.withPublication.bind(backend.store);
-	const publication = vi.spyOn(backend.store, "withPublication").mockImplementation(async (...args) => {
-		reached = true; await release.promise; return publish(...args);
+export async function holdOwnedProcessPublication(fixture: Pick<LinuxProcessBenchmark, "inOwner">, delayMs = 0, beforeRelease = async () => {}) {
+	await fixture.inOwner(async state => {
+		const { ProvenanceCertificateStore } = await state.load("../src/reuse-store.ts"), { ProcessHandoffRegistry } = await state.load("../src/process-handoff.ts");
+		const publication = ProvenanceCertificateStore.prototype.withPublication, observe = ProcessHandoffRegistry.prototype.observeRunning;
+		const pending = new Promise<void>(resolve => { state.release = resolve; }); state.reached = state.joined = false; state.joinedGate = state.deferred();
+		ProvenanceCertificateStore.prototype.withPublication = async function (...args: unknown[]) { state.reached = true; await pending; return publication.apply(this, args); };
+		ProcessHandoffRegistry.prototype.observeRunning = function (key: unknown, owner: any, invoke: () => Promise<boolean>) {
+			const then = owner.completion.then;
+			owner.completion.then = function (...args: unknown[]) { state.joined = true; state.joinedGate.resolve(true); return then.apply(this, args); };
+			return observe.call(this, key, owner, invoke);
+		};
+		state.closePublication = () => { state.joinedGate.resolve(false); state.release(); ProvenanceCertificateStore.prototype.withPublication = publication; ProcessHandoffRegistry.prototype.observeRunning = observe; };
 	});
-	const wait = scheduling.waitForCompletion;
-	const assessment = vi.spyOn(scheduling, "waitForCompletion").mockImplementation((promise, signal, timeoutMs) => {
-		if (observing.mock.calls.some(([, owner]) => owner.completion === promise) && !joined && !signal?.aborted) {
-			joined = true; timer = setTimeout(() => { void beforeRelease().then(release.resolve, release.reject); }, delayMs);
-		}
-		return wait(promise, signal, timeoutMs);
+	const joined = fixture.inOwner(state => state.joinedGate.promise as Promise<boolean>).then(async observed => {
+		if (!observed) return;
+		try { if (delayMs) await new Promise(resolve => setTimeout(resolve, delayMs)); await beforeRelease(); }
+		finally { await fixture.inOwner(state => state.release()); }
 	});
-	return {
-		reached: () => reached,
-		joined: () => joined,
-		close: () => { clearTimeout(timer); release.resolve(); publication.mockRestore(); assessment.mockRestore(); observing.mockRestore(); },
+	return { reached: () => fixture.inOwner(state => state.reached as boolean), joined: () => fixture.inOwner(state => state.joined as boolean),
+		close: async () => { await fixture.inOwner(state => state.closePublication()); await joined; } };
+}
+
+export function inspectProcessOwner(create: () => object) {
+	const { port1: testPort, port2 } = new MessageChannel();
+	process.execArgv.push("--import", new URL("./process-owner-fixture.mjs", import.meta.url).href);
+	try { (Reflect.get(create(), "worker") as Worker).postMessage({ processTestPort: port2 }, [port2]); }
+	finally { process.execArgv.splice(-2); }
+	testPort.unref();
+	const inOwner = <Value, Args extends unknown[]>(run: (state: Record<string, any>, ...args: Args) => Value, ...args: Args): Promise<Awaited<Value>> => {
+		const { port1, port2 } = new MessageChannel();
+		return new Promise<Awaited<Value>>((resolve, reject) => {
+			port1.once("message", ({ value, error }) => { port1.close(); if (error) reject(new Error(error)); else resolve(value); });
+			port1.once("close", () => reject(new Error("process test owner closed")));
+			testPort.postMessage({ source: run.toString(), args, reply: port2 }, [port2]);
+		});
 	};
+	return { inOwner, dispose: () => testPort.close() };
 }
 
 export async function createLinuxProcessBenchmark(
@@ -75,6 +118,7 @@ export async function createLinuxProcessBenchmark(
 		for (const suffix of ["", ".node"]) await copyFile(binary + suffix, backendOptions.heldExecBinary + suffix);
 	}
 	const backend = new LinuxProcessReuseBackend({ storeRoot, ...backendOptions });
+	const { inOwner, dispose: closeInspection } = inspectProcessOwner(() => backend.processOwner());
 	const coordinator = new ProcessExecutionCoordinator(backend.completedReplayExecutor(host, {
 		sourceRoot: workspace, invocation: request => resolvePiToolInvocation("bash", { command: request.command }, {
 			cwd: request.cwd, environment: definedProcessEnvironment(request.environment), shellPath,
@@ -104,6 +148,7 @@ export async function createLinuxProcessBenchmark(
 		environment,
 		coordinator,
 		backend,
+		inOwner,
 		world,
 		workspaceSandbox,
 		tool: tool as AgentTool, // Preserve a portable type across nested schema packages.
@@ -112,7 +157,7 @@ export async function createLinuxProcessBenchmark(
 			const replay = backend.completedReplayExecutor(host, { sourceRoot: workspace, invocation: () => undefined });
 			return { executor: { execute: (request: ProcessExecutionRequest) => backend.observeNative(workspace, request.scope, request.signal, () => replay.execute(request)) } };
 		},
-		dispose: () => disposal ??= Promise.resolve().then(() => world.dispose?.())
+		dispose: () => disposal ??= Promise.resolve().then(() => world.dispose?.()).finally(closeInspection)
 			.finally(() => workspaceSandbox.dispose()).finally(() => rm(root, { recursive: true, force: true })),
 	};
 }

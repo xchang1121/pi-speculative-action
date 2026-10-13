@@ -333,7 +333,8 @@ export class LinuxHeldExecBoundary {
 
 	/** The callback owns admission; each actual native child owns a distinct ticket and observer. */
 	async observe<Value>(options: HeldObservation, execute: () => Promise<Value>,
-		synchronous?: (gate: number, skipRoot?: boolean) => { readonly pid?: number; readonly finish: () => void }): Promise<Value> {
+		remote?: { readonly synchronous: (gate: number, skipRoot?: boolean) => { readonly pid?: number; readonly finish: () => void };
+			readonly asynchronous: (gate: number, skipRoot?: boolean) => HeldExecAttachment }): Promise<Value> {
 		if (this.closing || options.signal?.aborted) return execute();
 		const controller = new AbortController(), launches = new Set<{ readonly child: ChildProcess; readonly attachment: HeldExecAttachment }>();
 		const signal = AbortSignal.any([controller.signal, ...(options.signal ? [options.signal] : [])]);
@@ -344,9 +345,11 @@ export class LinuxHeldExecBoundary {
 		try {
 			const available = () => !closed && !signal.aborted;
 			return await startupScope.run({ skipRoot: options.skipRoot,
-				...(synchronous ? { synchronous: (start: () => unknown) => available() ? this.start(gate => synchronous(gate, startupScope.getStore()?.skipRoot), start) : start() } : {}),
+				...(remote ? { synchronous: (start: () => unknown) => available() ? this.start(gate => remote.synchronous(gate, startupScope.getStore()?.skipRoot), start) : start() } : {}),
 				launch: (child, start) => available() ? this.start(gate => {
-					const attachment = this.attach({ ...snapshot, skipRoot: startupScope.getStore()?.skipRoot }, gate);
+					const attachment = remote ? remote.asynchronous(gate, startupScope.getStore()?.skipRoot) : this.attach({ ...snapshot, skipRoot: startupScope.getStore()?.skipRoot }, gate);
+					if (remote) { signal.addEventListener("abort", attachment.retire, { once: true });
+						const settled = () => signal.removeEventListener("abort", attachment.retire); void attachment.completion.then(settled, settled); }
 					launches.add({ child, attachment }); return { pid: attachment.pid, finish: () => { if (!child.pid) attachment.retire(); } };
 				}, start) : start() }, execute);
 		} finally {

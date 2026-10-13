@@ -2,11 +2,12 @@ import path from "node:path";
 import type { ActionKey } from "./action-semantics.ts";
 import type { SpeculativeAgentExecutionWorld } from "./agent-execution-world.ts";
 import { UNRESTRICTED_PROCESS_EFFECTS } from "./effect-model.ts";
-import { LinuxProcessReuseBackend, type LinuxProcessBackendOptions, type LinuxProcessSession } from "./linux-process-backend.ts";
+import { LinuxProcessReuseBackend, type LinuxProcessBackendOptions } from "./linux-process-backend.ts";
+import { restoreNativeDependency } from "./linux-process-sync.ts";
 import { ProcessExecutionCoordinator } from "./process-execution.ts";
 import type { ProcessExecutionBinding } from "./process-handoff.ts";
 import type { ExecutionOperationBinding } from "./execution-world.ts";
-import { toolErrorSettlement, type ToolInvocation } from "./tool-settlement.ts";
+import type { ToolInvocation } from "./tool-settlement.ts";
 import { WorkspaceSandboxService, type WorkspaceSandboxOptions } from "./workspace-sandbox.ts";
 
 export interface LinuxProcessExecutionWorldOptions extends LinuxProcessBackendOptions, WorkspaceSandboxOptions {
@@ -28,7 +29,6 @@ export function createLinuxProcessExecutionWorld(
 	const { gitBinary, driver, overlayfsBinary, fusermountBinary } = options;
 	// Processes observe their inputs' times and inodes: an overlay over the workspace itself shows the Actor's own.
 	const workspaceOptions = { gitBinary, driver, overlayfsBinary, fusermountBinary, liveLower: true };
-	const roots = new Set<string>();
 	const operations = new WeakMap<ExecutionOperationBinding, { readonly binding: WeakRef<ProcessExecutionBinding>; readonly permissionKey: string }>();
 	const describeOperation = (binding: ProcessExecutionBinding, permission: ActionKey) => {
 		const reference = new WeakRef(binding);
@@ -51,7 +51,7 @@ export function createLinuxProcessExecutionWorld(
 	let backendChecked = false;
 	const qualify = async (sourceRoot: string) => {
 		const root = path.resolve(sourceRoot);
-		const selected = await workspaceSandbox.qualify(workspaceOptions, root);
+		const selected = await backend.processOwner().call<Awaited<ReturnType<WorkspaceSandboxService["qualify"]>>>("qualify", { options: workspaceOptions, cwd: root });
 		qualifiedDrivers.set(root, selected);
 		return selected;
 	};
@@ -76,7 +76,7 @@ export function createLinuxProcessExecutionWorld(
 					throw new Error("Complete host process outlet is not bound");
 				const [processFingerprint, workspaceFingerprint] = await Promise.all([
 					backend.fingerprint(),
-					cwd ? qualify(cwd).then((selected) => selected.fingerprint) : workspaceSandbox.fingerprint(workspaceOptions),
+					cwd ? qualify(cwd).then((selected) => selected.fingerprint) : backend.processOwner().call<string>("fingerprint", workspaceOptions),
 				]);
 				return `${processFingerprint}:${workspaceFingerprint}`;
 			},
@@ -106,97 +106,36 @@ export function createLinuxProcessExecutionWorld(
 				backendChecked = true;
 				const status = await backend.check();
 				if (status.state !== "ready") throw new Error(status.detail);
-				roots.add(path.resolve(cwd));
 				const selected = await qualify(cwd);
-				const prepared = await workspaceSandbox.prepare(cwd, { ...workspaceOptions, driver: selected.driver, ...(signal ? { signal } : {}) });
+				const prepared = await backend.processOwner().call<Awaited<ReturnType<WorkspaceSandboxService["prepare"]>>>("prepare", { cwd, options: { ...workspaceOptions, driver: selected.driver } }, signal);
 				qualifiedDrivers.set(path.resolve(cwd), prepared);
 			},
-			execute: (context) => backend.withProducer(async () => {
+			execute: async (context) => {
 			const operation = operationFor(context.action), invocation = operation ?? processInvocation(context.action.executionContext);
 			if (!invocation) throw new Error("execution action has no process invocation");
 			const sourceRoot = path.resolve(context.cwd);
-			roots.add(sourceRoot);
 			const selected = operation && qualifiedDrivers.get(sourceRoot) || await qualify(sourceRoot);
-			let session: LinuxProcessSession | undefined, unfinished: unknown;
-			const branch = await workspaceSandbox.fork({
-				cwd: sourceRoot,
-				action: context.action,
-				...(context.parentCheckpoint ? { parentCheckpoint: context.parentCheckpoint } : {}),
-				...workspaceOptions,
-				driver: selected.driver,
-				...(operation ? { preparation: selected } : {}),
-				executionMetrics: () => (session ? { reuse: session.metrics() } : {}),
-				validate: async () =>
-					session
-						? session.validate()
-						: {
-								status: "indeterminate",
-								cause: { stage: "freshness", code: "process_evidence_missing" },
-								metrics: { bytesRead: 0, filesRead: 0, mode: "exact" },
-							},
-				afterCapture: async (_workspace, capture) => {
-					if (!session) throw new Error("process evidence sealer is missing");
-					if (unfinished !== undefined) throw unfinished; // Nothing ran to completion to seal: keep the cause.
-					return session.seal(capture.changes);
-				},
-				execute: async (workspace) => {
-					session = await backend.open({
-						sourceRoot,
-						workspace,
-						invocation,
-						...(context.executionScope ? { scope: context.executionScope } : {}),
-						signal: context.signal,
-						onOperationAdopted: context.onOperationAdopted,
-						onOperationJoinable: context.onOperationJoinable,
-						acceptOperationScope: context.acceptOperationScope,
-					});
-					const executor = session.executor;
-					let launches = 0, exitCode: number | null | undefined;
-					try {
-						if (operation) {
-							const result = await session.executeBinding(operation);
-							// Scheduler-only output. The held native exec consumes the original ordered byte journal.
-							return { result: { content: [], details: result.suspended ? { suspended: true } : { exit: result.exit } }, isError: false };
-						}
-						const result = await options.coordinator.runWith({ execute: async (request) => {
-							launches++;
-							return { exitCode } = await executor.execute(request);
-						} }, () => context.tool.execute(context.callID, context.args as never, context.signal));
-						if (launches === 0) throw new Error("process-backed tool bypassed the process execution outlet");
-						// The virtual root already preserves logical paths. Output bytes are data, not paths to rewrite.
-						return { result, isError: false };
-					} catch (error) {
-						// A command that ran to completion and exited non-zero failed on its own terms, unlike a timeout, abort or backend fault.
-						if (launches === 1 && typeof exitCode === "number" && exitCode !== 0) return { ...toolErrorSettlement(error), exitCode };
-						unfinished = error; return toolErrorSettlement(error);
-					} finally {
-						await session.close();
-					}
-				},
+			const parent = workspaceSandbox.checkpoint(context.parentCheckpoint, sourceRoot);
+			const captured = await backend.processOwner().run({ cwd: sourceRoot, parent, scope: context.executionScope,
+				invocation: operation ? backend.serializeBinding(operation)! : invocation as NonNullable<ToolInvocation["process"]>, options: { ...workspaceOptions, driver: selected.driver } },
+				context.signal, async executor => ({ result: await options.coordinator.runWith(executor,
+					() => context.tool.execute(context.callID, context.args as never, context.signal)), isError: false }), context);
+			const branch = workspaceSandbox.branch({ cwd: sourceRoot, action: context.action, parentCheckpoint: context.parentCheckpoint, validate: captured.validate }, captured.snapshot);
+			const commit = branch.commit.bind(branch), dispose = branch.dispose?.bind(branch);
+			return Object.assign(branch, {
+				computationDependencies: captured.computations.flatMap(dependency => restoreNativeDependency(dependency) ?? []),
+				operations: Object.freeze(captured.bindings.flatMap(entry => { const binding = backend.restoreBinding(entry); return binding ? [describeOperation(binding, context.action)] : []; })),
+				commit: () => { if (operation) throw new Error("internal process output cannot commit an enclosing tool"); return captured.commit(commit); },
+				dispose: async () => { try { await dispose?.(); } finally { await captured.dispose(); } },
 			});
-			if (session) {
-				const ownership = session.ownership, commit = branch.commit.bind(branch);
-				Object.assign(branch, {
-					computationDependencies: session.computationDependencies(),
-					operations: Object.freeze(session.executionBindings().map(binding => describeOperation(binding, context.action))),
-					commit: () => {
-						if (operation) throw new Error("internal process output cannot commit an enclosing tool");
-						return ownership.commit(commit);
-					},
-				});
-			}
-			return branch;
-			}),
+			},
 		},
 		dispose: async () => {
-			const ownedRoots = [...roots];
-			roots.clear();
 			qualifiedDrivers.clear();
 			try {
 				await backend.dispose();
 			} finally {
 				if (ownsWorkspaceSandbox) await workspaceSandbox.dispose();
-				else await workspaceSandbox.closePools(ownedRoots);
 			}
 		},
 	};
