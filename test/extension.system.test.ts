@@ -24,9 +24,9 @@ afterEach(async () => { vi.unstubAllEnvs(); vi.restoreAllMocks(); await director
 
 test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-nested", "native-stale", "native-running", "native-retired", "native-unkeyed", "native-inputs", "native-inputs-stale",
 	"native-sync-producer", "native-sync-consumer", "native-sync-both", "native-sync-stale", "native-sync-lost", "native-sync-inputs", "native-sync-inputs-stale",
-	"native-sync-inputs-preempted", "native-sync-inputs-preempted-stale"] : [])])("runs the shipped extension through a real Pi session (%s)", async mode => {
+	"native-sync-inputs-preempted", "native-sync-inputs-preempted-stale", "native-cold", "native-cold-stale", "native-sync-cold", "native-sync-cold-stale"] : [])])("runs the shipped extension through a real Pi session (%s)", async mode => {
 	const enabled = mode !== "off", native = mode.startsWith("native"), running = mode === "native-running" || mode === "native-retired";
-	const stale = mode.endsWith("stale"), inputs = mode.includes("inputs"), preempted = mode.includes("preempted"), synchronous = (callID: string) => mode.startsWith("native-sync") &&
+	const stale = mode.endsWith("stale"), inputs = mode.includes("inputs"), cold = mode.includes("cold"), preempted = mode.includes("preempted"), synchronous = (callID: string) => mode.startsWith("native-sync") &&
 		(!mode.endsWith("producer") && !mode.endsWith("consumer") || callID === (mode.endsWith("producer") ? "seed" : "check"));
 	const cwd = await directories.create(native ? os.homedir() : undefined), agentDir = path.join(cwd, "agent");
 	await mkdir(agentDir); vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
@@ -101,10 +101,10 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 					} };
 				});
 			}
-			const observe = LinuxProcessReuseBackend.prototype.observeBindings, nested = !inputs && !mode.startsWith("native-sync") && !["native", "native-stale"].includes(mode);
+			const observe = LinuxProcessReuseBackend.prototype.observeBindings, nested = !cold && !inputs && !mode.startsWith("native-sync") && !["native", "native-stale"].includes(mode);
 			vi.spyOn(LinuxProcessReuseBackend.prototype, "observeBindings").mockImplementation(function (this: LinuxProcessReuseBackend, scope, execute, receive, ...args) {
 				backend = this; return observe.call(this, scope, execute, (bindings, computations) => {
-					if (inputs && scope.callID === "seed") {
+					if (scope.callID === "seed") {
 						const registry = Reflect.get(this, "handoffs") as ProcessHandoffRegistry<{ readonly executable: string }>;
 						inputBinding = bindings.find(binding => registry.resolveBinding(binding, scope)?.executable === path.join(cwd, "slow"));
 					}
@@ -116,20 +116,19 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 			const command = "./slow notes.txt" + (inputs ? " 3<notes.txt" : "");
 			const initial = `printf initial:; ${command}; :`, remaining = `printf remaining:; ${command}; printf once >> marker`;
 			const call = (tool: string, text: string, id: string) => fauxAssistantMessage(fauxToolCall(tool, { text }, { id }), { stopReason: "toolUse" });
-			actor.setResponses([call("produce_notes", initial, "seed"), ...(inputs ? [response("read", { path: "notes.txt", offset: 2 })] : []), async () => {
+			actor.setResponses([call("produce_notes", initial, "seed"), ...(inputs ? [response("read", { path: "notes.txt", offset: 2 })] : []), ...cold ? [] : [async () => {
 				if (running) publication = holdProcessPublication(backend!);
 				if (preempted) {
 					const store = backend!.store, publish = store.withPublication.bind(store);
 					vi.spyOn(store, "withPublication").mockImplementation(async (...args) => { const result = await publish(...args); await published.promise; return result; });
 				}
 				return response("write", { path: "notes.txt", content: "changed\n" });
-			}, ...(mode === "native-retired" ? [async () => {
+			}], ...(mode === "native-retired" ? [async () => {
 				await expect.poll(publication!.reached, { timeout: 5000 }).toBe(true); session.setActiveToolsByName(tools.filter(name => name !== "produce_notes"));
 				return response("read", { path: "notes.txt" });
 			}] : []), async () => {
-				if (inputs) expect(inputBinding).toBeDefined();
-				await expect.poll(() => publication ? publication.reached() : inputs ? backend!.bindingStale(inputBinding!).then(stale => !stale) :
-					events.some(event => event.type === "candidate" && event.candidate.kind === "operation" && event.state.status === "succeeded"), { timeout: 5000 }).toBe(true);
+				expect(inputBinding).toBeDefined();
+				await expect.poll(() => publication ? publication.reached() : backend!.bindingStale(inputBinding!).then(stale => !stale), { timeout: 5000 }).toBe(true);
 				await expect(readFile(path.join(cwd, "marker"))).rejects.toMatchObject({ code: "ENOENT" });
 				if (stale) await writeFile(path.join(cwd, "notes.txt"), "fresh\n");
 				return call("format_rows", remaining, "check");

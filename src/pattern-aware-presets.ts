@@ -6,7 +6,7 @@ export const PATTERN_AWARE_PRESETS = Object.freeze([
 	Object.freeze({ id: "reported-files", label: "Reported files", description: "Read files named by the latest tool results that have not been read yet.", defaultOff: false }),
 	Object.freeze({ id: "edited-file", label: "Edited files", description: "Read files the Actor just edited or wrote.", defaultOff: false }),
 	Object.freeze({ id: "recent-reads", label: "Recent reads", description: "Prepare another read of recently read files.", defaultOff: false }),
-	Object.freeze({ id: "recent-command", label: "Recent command", description: "After edits, prepare stale native work from a command the Actor actually ran.", defaultOff: false }),
+	Object.freeze({ id: "recent-command", label: "Recent command", description: "Prepare discovered native work and refresh it after input edits.", defaultOff: false }),
 	Object.freeze({ id: "reported-lines", label: "Reported lines", description: "Read around line numbers reported by tool results.", defaultOff: true }),
 	Object.freeze({ id: "companion-files", label: "Companion files", description: "Read an already observed source or test companion near the current file.", defaultOff: true }),
 	Object.freeze({ id: "failure-edits", label: "Edits after failure", description: "After a failed call, inspect recently edited files that have not been read since.", defaultOff: true }),
@@ -162,15 +162,9 @@ function companionName(target: string) {
 	if (!extension) return undefined;
 	const name = path.posix.basename(normalized, extension), marked = name.replace(/(?:\.(?:tests?|specs?)|_(?:tests?|specs?))$/iu, "").replace(/^(?:tests?|specs?)_/iu, "");
 	const stem = marked === name ? name.replace(/(?:Tests?|Specs?)$/u, "") : marked;
-	const directory = path.posix.dirname(normalized), scope: string[] = [];
-	let testDirectory = false, afterTestDirectory = false;
-	for (const part of directory.split("/")) {
-		if (isTestDirectory(part)) { testDirectory = true; afterTestDirectory = true; continue; }
-		if (afterTestDirectory && /^units?$/iu.test(part)) { afterTestDirectory = false; continue; }
-		afterTestDirectory = false;
-		scope.push(part);
-	}
-	return stem ? { directory, scope: path.posix.normalize(scope.join("/")), extension, stem, test: stem !== name || testDirectory } : undefined;
+	const directory = path.posix.dirname(normalized), parts = directory.split("/");
+	const scope = parts.filter((part, index) => !isTestDirectory(part) && !(index > 0 && isTestDirectory(parts[index - 1]!) && /^units?$/iu.test(part)));
+	return stem ? { directory, scope: path.posix.normalize(scope.join("/")), extension, stem, test: stem !== name || parts.some(isTestDirectory) } : undefined;
 }
 
 const isTestDirectory = (name: string) => /^(?:tests?|__tests__)$/iu.test(name);

@@ -74,7 +74,7 @@ function patternProcessHost(fixture: LinuxProcessBenchmark, sessionID: string, s
 		onEvent: event => { events.push(event); }, ...options,
 	});
 	return { host, events, patternStore,
-		start: (turnID: string) => host.startTurn({ turnID, tools, actorModel: testModel("actor"), actorOptions: undefined, context: { systemPrompt: "unchanged", messages: [], tools } }),
+		start: (turnID: string, signal?: AbortSignal) => host.startTurn({ turnID, tools, actorModel: testModel("actor"), actorOptions: undefined, context: { systemPrompt: "unchanged", messages: [], tools } }, signal),
 		call: (turnID: string, command: string) => ({ turnID, id: turnID, tool: "bash", args: { command }, tools }),
 	};
 }
@@ -389,7 +389,7 @@ nativeTest.for([false, true])("prepares a failed command after its reported inpu
 				expect.objectContaining(stale ? { status: "rejected", cause: expect.objectContaining({ stage: "freshness" }) } : { status: "adopted" }) }) }) }));
 	});
 
-nativeTest.for(["bash", "write", "stale", "disabled", "bash:shared", "write:shared", "stale:shared", "disabled:shared", "bash:parents", "bash:aliases", "bash:both", "bash:repeat", "write:repeat"])("reprepares changed children beyond fresh beam entries (%s)", { timeout: 20_000 }, async (scenario, { benchmark }) => {
+nativeTest.for(["bash", "write", "stale", "disabled", "bash:shared", "write:shared", "stale:shared", "disabled:shared", "bash:parents", "bash:aliases", "bash:both", "bash:repeat", "write:repeat", "bash:race"])("reprepares changed children beyond fresh beam entries (%s)", { timeout: 20_000 }, async (scenario, { benchmark }) => {
 	const [mode, layout] = scenario.split(":"), target = layout === "parents" ? "first" : "last", both = layout === "both";
 	const fixture = await benchmark("pi-rerun-frontier-", "git"), scope = { sessionID: "frontier", turnID: "seed" };
 	for (const name of ["first", "last"]) await writeFile(path.join(fixture.workspace, name), "old\n");
@@ -402,8 +402,10 @@ int main(int argc, char **argv) { if (argc != 2) return 1; int fd = open(${layou
 	const route = await fixture.prepareActorReplay(), writer = createWriteTool(fixture.workspace), tools = [fixture.tool, writer];
 	const registry = Reflect.get(fixture.backend, "handoffs") as ProcessHandoffRegistry<{ executable: string; args: readonly string[] }>;
 	const settings = { candidateLimit: 4, maxConcurrentActions: 4, patternAware: patternAwareSettings({ multiStepEnabled: false, beamWidth: 1, presets: ["recent-command"] }) };
+	const interrupted = layout === "race" ? new AbortController() : undefined, gate = interrupted && gated(2);
 	const prepared = patternProcessHost(fixture, scope.sessionID, settings, {}, tools), { events, start, call } = prepared;
 	await using host = disposable(prepared.host);
+	await using _gates = onExit(async () => { gate?.release(); });
 	const execute = (turnID: string, command: string) => host!.execute({ ...call(turnID, command), id: `${turnID}:${command}` }, AbortSignal.timeout(10_000),
 		() => fixture.coordinator.runWith(route.executor, () => fixture.tool.execute(turnID, { command })));
 	await start("seed");
@@ -413,24 +415,37 @@ int main(int argc, char **argv) { if (argc != 2) return 1; int fd = open(${layou
 	const bindings = fixture.backend.executionBindings(scope).filter(binding => registry.resolveBinding(binding, scope)?.executable.endsWith("/worker"));
 	expect(bindings).toHaveLength(2);
 	const consumed = bindings.find(binding => registry.resolveBinding(binding, scope)?.args.includes(target))!;
-	const invocation = resolvePiToolInvocation("bash", { command: "exit 92" }, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath })!.process!;
-	for (const binding of bindings) await fixture.workspaceSandbox.withWorkspace(fixture.workspace, workspace =>
-		withPreparedWorker(fixture, { sourceRoot: fixture.workspace, workspace, invocation, scope: { ...scope, turnID: "warm" } }, binding, "old\n", async () => {}), { liveLower: true });
-	expect(await Promise.all(bindings.map(binding => fixture.backend.bindingStale(binding)))).toEqual([false, false]);
-	const publishing = vi.spyOn(fixture.backend.planner, "publishCompleted"), checking = vi.spyOn(fixture.backend, "bindingStale");
-	await start("unrelated"); await execute("unrelated", "printf ignored > unrelated");
-	await expect.poll(() => checking.mock.calls.length).toBeGreaterThan(0);
-	await Promise.all(checking.mock.results.map(result => result.value)); await nextTurn();
-	expect(events.filter(event => event.type === "candidate" && event.candidate.mode === "recent-command")).toEqual([]); await host.finishTurn("unrelated");
+	await start("prepared");
+	await expect.poll(() => Promise.all(bindings.map(binding => fixture.backend.bindingStale(binding))), { timeout: 5000 }).toEqual([false, false]); await host.finishTurn("prepared");
+	const preparations = (turnID: string) => events.filter(event => event.type === "candidate" && event.turnID === turnID &&
+		event.candidate.mode === "recent-command" && bindings.some(binding => event.candidate.predictedAction.includes(binding.key)));
+	const lookup = fixture.backend.bindingStale.bind(fixture.backend), resources = await import("../src/resource-version.ts"), observeChanges = resources.observeResourceChanges;
+	using publishing = vi.spyOn(fixture.backend.planner, "publishCompleted"), changes = vi.spyOn(resources, "observeResourceChanges").mockImplementationOnce(async (...args) => {
+		const token = await observeChanges(...args); interrupted?.abort(); return token;
+	});
+	using checking = vi.spyOn(fixture.backend, "bindingStale").mockImplementation(async binding => {
+		const stale = await lookup(binding); if (!stale && gate && bindings.includes(binding)) await gate.wait(); return stale;
+	});
+	await start("unrelated", interrupted?.signal); await execute("unrelated", "printf ignored > unrelated");
+	if (interrupted) await expect.poll(() => interrupted.signal.aborted).toBe(true);
+	else {
+		await expect.poll(() => checking.mock.calls.length).toBeGreaterThan(0); await Promise.all(checking.mock.results.map(result => result.value)); await nextTurn();
+	}
+	await host.finishTurn("unrelated");
+	expect(preparations("unrelated")).toEqual([]);
 	if (mode === "disabled") settings.patternAware = patternAwareSettings({ enabled: false });
 	await start("edit");
+	if (gate) await gate.entered;
 	for (const value of layout === "repeat" ? ["new", "two"] : ["new"]) {
 		if (mode === "write") {
 			const args = { path: "last", content: `${value}\n` };
 			await host.execute({ turnID: "edit", id: `edit:${value}`, tool: "write", args, tools }, undefined, () => writer.execute("edit", args));
 		} else await execute("edit", `printf '${value}\\n' > last`);
-		if (mode !== "disabled") await expect.poll(() => events.filter(event => event.type === "candidate" && event.turnID === "edit" &&
-			event.candidate.mode === "recent-command" && event.candidate.kind === "operation" && event.state.status === "succeeded").length, { timeout: 5000 }).toBe((layout ? 2 : 1) * (value === "two" ? 2 : 1));
+		if (gate) {
+			await expect.poll(() => changes.mock.calls.length).toBe(2); await Promise.all(changes.mock.results.map(result => result.value)); await nextTurn(); gate.release();
+		}
+		if (mode !== "disabled") await expect.poll(() => preparations("edit").filter(event => event.type === "candidate" && event.state.status === "succeeded").length,
+			{ timeout: 5000 }).toBe((layout ? 2 : 1) * (value === "two" ? 2 : 1));
 	}
 	expect(publishing.mock.calls.map(([certificate]) => certificate.weakKey).sort()).toEqual(mode === "disabled" ? [] : (layout ? bindings : [consumed]).flatMap(binding => layout === "repeat" ? [binding.key, binding.key] : [binding.key]).sort());
 	if (mode === "stale") await writeFile(path.join(fixture.workspace, "last"), "bad\n");
@@ -445,7 +460,7 @@ int main(int argc, char **argv) { if (argc != 2) return 1; int fd = open(${layou
 		.toEqual(reused ? (both ? bindings : [consumed]).map(binding => binding.key).sort() : []);
 	if (reused) expect(timing.hiddenByMode).toEqual([{ source: "pattern_aware", mode: "recent-command", hiddenComputeMs: timing.hiddenComputeMs }]);
 	await host.finishTurn("edit", true);
-	if (mode === "disabled") expect(events.filter(event => event.type === "candidate" && event.candidate.mode === "recent-command")).toEqual([]);
+	if (mode === "disabled") expect(preparations("edit")).toEqual([]);
 });
 
 nativeTest.for(["sample", "file", "dup", "threads", "limit", "metadata", "identity", "pipe", "socket", "eventfd", "pipe:unavailable", "socket:unavailable", "eventfd:unavailable", "eventfd:unavailable:destroyed", "eventfd::inherited", "eventfd:unavailable:external", "eventfd::external", "eventfd:unavailable:discard", "eventfd::discard", "eventfd:unavailable:discard-nested", "eventfd::discard-nested", "eventfd:unavailable:discard-cycle"])("adopts a closed-input calculation through capture or completion (%s)", { timeout: 30_000 }, async (scenario, { benchmark }) => {

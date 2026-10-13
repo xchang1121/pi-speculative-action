@@ -29,9 +29,10 @@ type CarriedPrediction = { readonly signature: string; readonly pending: Set<Pat
 type ObservedCommand = {
 	readonly parentHash: string; readonly tool: string; readonly input: Readonly<Record<string, unknown>>; readonly schemaHash?: string;
 	readonly failure?: { readonly paths: readonly string[] };
+	request?: CommandRerunRequest;
 };
-type CommandRerunRequest = { readonly revision: number; readonly observedOnly: boolean; readonly retry?: ObservedCommand };
-type CommandRerunState = { readonly native: boolean; readonly failed: boolean; request?: CommandRerunRequest;
+type CommandRerunRequest = { readonly revision: number; readonly kind: "observed" | "workspace" | "edit" | "retry" };
+type CommandRerunState = { readonly native: boolean; readonly failed: boolean;
 	changes?: Promise<ResourceVersionToken | undefined>; preparing?: Promise<unknown> };
 
 export interface PatternPlanSourceController {
@@ -67,14 +68,17 @@ export function createPatternPlanSource({
 	const carriedPredictions = new Map<string, CarriedPrediction>();
 	const predictionBatches = new WeakMap<PatternPlanFeedback, CarriedPrediction>(), served = new WeakSet<PatternPlanFeedback>();
 	const issuedParents = new WeakSet<object>();
-	const rerunFeedback = new WeakMap<object, { readonly request: CommandRerunRequest; readonly operation?: ObservedOperation }>();
+	const rerunFeedback = new WeakMap<object, { readonly command: ObservedCommand; readonly request: CommandRerunRequest; readonly operation?: ObservedOperation }>();
 	// Capabilities stay in this session; the persisted Pattern store receives only real tool batches.
 	const operationBindings = new BoundedRecencyMap<string, ObservedOperation>(PATTERN_AWARE_DEFAULTS.maxPatterns);
 	// Exact authoritative inputs stay session-local; the persisted history may shorten large payloads.
 	const learnedCommands = new BoundedRecencyMap<string, ObservedCommand>(4);
 	let commandRerun: CommandRerunState | undefined, rerunRevision = 0;
 	let analysisTail: Promise<void> = Promise.resolve();
-	const releaseChanges = (state = commandRerun) => state?.changes && lifecycle.track(state.changes.then(token => token?.release()));
+	const releaseChanges = (state = commandRerun) => {
+		for (const command of learnedCommands.values()) command.request = undefined;
+		return state?.changes && lifecycle.track(state.changes.then(token => token?.release()));
+	};
 
 	const sourceSettings = (settings: SpeculativeActionSettings): PatternAwareSettings => {
 		const patternSettings = patternAwareSettings(settings.sourceConfig?.patternAware);
@@ -122,6 +126,12 @@ export function createPatternPlanSource({
 		}
 		return (await openedStore.lease).store;
 	};
+	const predictionStore = async (settings: PatternAwareSettings, signal?: AbortSignal) => {
+		await analysisTail;
+		if (signal?.aborted) return;
+		const store = await resolveStore(settings);
+		return signal?.aborted ? undefined : store;
+	};
 	const flushStores = async (finish = false): Promise<void> => {
 		await analysisTail;
 		const stores = providedStore ? [Promise.resolve(providedStore)] : [...ownedStores.values()].map(async lease => (await lease).store);
@@ -166,7 +176,7 @@ export function createPatternPlanSource({
 			await previous?.release();
 			if (state !== commandRerun) { await current?.release(); return undefined; }
 			if (changes && !changes.uncertain && changes.paths.some(target => !path.relative(cwd, target).split(path.sep).includes(".git")))
-				state.request = { revision: ++rerunRevision, observedOnly: state.request?.observedOnly ?? true, retry: state.request?.retry };
+				for (const command of learnedCommands.values()) command.request = { revision: ++rerunRevision, kind: command.request?.kind ?? "workspace" };
 			return current;
 		});
 		await state.changes;
@@ -174,62 +184,56 @@ export function createPatternPlanSource({
 	const planActions = (candidates: readonly PatternAwareCandidate[], store: PatternAwareStore,
 		schemaHashes: Readonly<Record<string, string>>, operationLimit: number, dependsOn?: PlanAction["dependsOn"], parentID?: string) => candidates.flatMap(candidate => {
 			const action = patternPlanAction(candidate, store, patternPlanActionID(candidate.actionIdentity, parentID), dependsOn);
-			// Both recurring predictions and background probes may reuse a root's native
-			// operations. Dependent steps still need their parent's complete tool result.
-			if (dependsOn?.length || !operationBindings.size) return [action];
-			const choices = learnedOperations(parentIdentity(candidate.tool, candidate.input, schemaHashes[candidate.tool]));
-			if (!choices.length) return [action];
-			return choices.slice(0, operationLimit).map(operation => ({ ...action,
+			// A dependent step needs its parent's result; independent predictions can share native work.
+			const choices = dependsOn?.length ? [] : learnedOperations(parentIdentity(candidate.tool, candidate.input, schemaHashes[candidate.tool])).slice(0, operationLimit);
+			return choices.length ? choices.map(operation => ({ ...action,
 				id: `${action.id}:operation:${operation.binding.identity}`, type: "operation" as const, operation: operation.binding,
 				// Waiting on its producer, it takes only capacity nothing else wants.
 				...(operation.binding.fed ? { background: true } : {}),
 				feedback: { ...action.feedback, operation },
-			}));
+			})) : [action];
 		});
 
-	/** Prepare stale native launches against the Actor's edited files, without repeating their parents' earlier setup.
-	 * Inputs that cannot reopen keep their parent ordering. Every result still requires current dependency evidence at adoption. */
+	/** Observed capabilities prepare once without predicting their parent. After edits, private inputs retain parent ordering. */
 	const reruns = async (state: CommandRerunState | undefined, schemaHashes: Readonly<Record<string, string>>) => {
 		if (!state || state !== commandRerun) return NO_RERUN;
 		// A closing observation may still be checking this request; its next decision waits for that batch.
 		const preparing = (state.preparing ?? Promise.resolve()).catch(() => {}).then(async (): Promise<typeof NO_RERUN> => {
-			const request = state.request;
-			if (state !== commandRerun || !request) return NO_RERUN;
-			const { observedOnly, retry } = request, rerun = new Map<string, PlanAction>(), parents = new Set<string>(), covered = new Set<string>();
-			const commands = [...learnedCommands.values()].reverse();
-			if (retry) commands.sort((left, right) => Number(right === retry) - Number(left === retry));
-			for (const command of commands) {
-				if (!state.native && command !== retry || command.schemaHash !== schemaHashes[command.tool]) continue;
+			if (state !== commandRerun) return NO_RERUN;
+			// One index reserves both parent predictions and the operations they cover.
+			const rerun = new Map<string, PlanAction | undefined>();
+			for (const command of [...learnedCommands.values()].reverse().sort((left, right) => Number(right.request?.kind === "retry") - Number(left.request?.kind === "retry"))) {
+				const request = command.request;
+				if (!request || (!state.native && request.kind !== "retry") || command.schemaHash !== schemaHashes[command.tool]) continue;
+				const observedOnly = request.kind === "workspace";
 				// The bounded history limits inspection; a fresh prefix must not consume the proposal's execution budget.
 				const children = learnedOperations(command.parentHash).filter(item => !observedOnly || currentOperation(item.binding));
 				const stale = (await Promise.all(children.map(async item => {
 					const changed = await item.binding.stale?.();
 					return (observedOnly ? changed === true : changed !== false) ? item : undefined;
 				}))).filter((item): item is ObservedOperation => !!item && item.binding.available !== false);
-				if (state !== commandRerun || state.request !== request) return NO_RERUN;
-				if (![...learnedCommands.values()].includes(command)) continue;
-				const fallback = command === retry && command.failure && !children.length;
-				if (!stale.length && !fallback) continue;
-				const selections = stale.filter(({ binding }) => binding.preparation === "current_workspace" && !binding.fed), mode = command === retry ? "retry-failed-command" : "recent-command";
-				parents.add(command.parentHash);
+				if (state !== commandRerun) return NO_RERUN;
+				if (command.request !== request || ![...learnedCommands.values()].includes(command)) continue;
+				const fallback = request.kind === "retry" && command.failure && !children.length;
+				if (!stale.length && !fallback) { command.request = undefined; continue; }
+				const selections = stale.filter(({ binding }) => request.kind === "observed" || binding.preparation === "current_workspace" && !binding.fed),
+					mode = request.kind === "retry" ? "retry-failed-command" : "recent-command";
+				rerun.set(command.parentHash, undefined);
 				// A whole parent orders captured inputs and supersedes any independent children it will redo.
-				if (!selections.length) for (const { binding } of children) if (!binding.fed) {
-					const id = operationID(binding); covered.add(id); rerun.delete(id);
-				}
+				if (!selections.length) for (const { binding } of children) if (!binding.fed) rerun.set(operationID(binding), undefined);
 				for (const selected of selections.length ? selections : [undefined]) {
 					const operation = selected?.binding, key = operation ? operationID(operation) : command.parentHash;
-					if (operation && covered.has(key)) continue;
-					if (operation) covered.add(key);
+					if (operation && rerun.has(key)) continue;
 					const feedback = { presetID: mode };
-					rerunFeedback.set(feedback, { request, operation: selected });
+					rerunFeedback.set(feedback, { command, request, operation: selected });
 					rerun.set(key, { id: `rerun:${request.revision}:${key}`, type: operation ? "operation" : "tool_call", ...(operation ? { operation } : {}),
 						tool: command.tool, input: command.input, horizon: 0, producesOperations: true, mode, feedback,
+						...(operation?.fed ? { background: true } : {}),
 						...(fallback ? { empiricalProbability: 0.25, conditionalProbability: 0.25 } : {}) });
 				}
 			}
-			if (!rerun.size) state.request = undefined;
-			return [[...rerun.values()], action => (!action.operation || !covered.has(operationID(action.operation))) &&
-				(action.type !== "tool_call" || !parents.has(parentIdentity(action.tool, asRecord(action.input) ?? {}, schemaHashes[action.tool])))];
+			return [[...rerun.values()].filter((action): action is PlanAction => !!action), action => (!action.operation || !rerun.has(operationID(action.operation))) &&
+				(action.type !== "tool_call" || !rerun.has(parentIdentity(action.tool, asRecord(action.input) ?? {}, schemaHashes[action.tool])))];
 		});
 		state.preparing = preparing;
 		try { return await preparing; } finally { if (state.preparing === preparing) state.preparing = undefined; }
@@ -243,10 +247,8 @@ export function createPatternPlanSource({
 		requestLifetime: "actor_decision",
 		propose: ({ startInput, data, settings, signal }) => admit(settings, async (patternSettings, rerunState) => {
 			if (!patternSettings.enabled) return undefined;
-			await analysisTail;
-			if (signal.aborted) return undefined;
-			const store = await resolveStore(patternSettings);
-			if (signal.aborted) return undefined;
+			const store = await predictionStore(patternSettings, signal);
+			if (!store) return undefined;
 			const candidates = store.predict(startInput.sessionID, data.schemaHashes, patternSettings);
 			await rerunState?.changes;
 			if (signal.aborted) return undefined;
@@ -260,10 +262,8 @@ export function createPatternPlanSource({
 				actions: [...repeated ? [] : planActions(candidates, store, data.schemaHashes, patternSettings.beamWidth).filter(apart), ...rerun] };
 		}),
 		continueFrom: ({ startInput, data, settings, batch, signal }) => admit(settings, async (patternSettings) => {
-			await analysisTail;
-			if (signal.aborted) return undefined;
-			const store = await resolveStore(patternSettings);
-			if (signal.aborted) return undefined;
+			const store = await predictionStore(patternSettings, signal);
+			if (!store) return undefined;
 			const id = `pattern:peer:${stableValueHash(batch.map(({ identity }) => identity.id))}`;
 			const candidates = store.predictAfterBatch(startInput.sessionID,
 				batch.map(({ candidate, output }) => predictedEvent(startInput, candidate, output, candidateExecutionMs(candidate))),
@@ -290,24 +290,25 @@ export function createPatternPlanSource({
 			if (!patternSettings.enabled) return undefined;
 			const schemaHash = action?.schemaHash ?? data.schemaHashes[tool];
 			const observed = eventData(tool, concrete, output, durationMs);
-			const parentHash = (operations?.length || tool === "bash") && parentIdentity(tool, concrete, schemaHash);
-			let bound = false;
-			if (parentHash) for (const binding of operations ?? []) {
-				if (binding.available === false || binding.permissionHash !== action?.hash) continue;
+			const bindings = operations?.filter(binding => binding.available !== false && binding.permissionHash === action?.hash) ?? [];
+			const parentHash = (bindings.length || tool === "bash") && parentIdentity(tool, concrete, schemaHash);
+			if (parentHash) for (const binding of bindings) {
 				const key = `${parentHash}:${binding.backend}:${binding.identity}`;
 				operationBindings.set(key, { key, parentHash, binding });
-				bound = true;
 			}
 			// A command mentioning a path is not evidence that its failure reported that file.
 			const paths = tool === "bash" && output?.isError ? [...new Set([...(extractOutputPaths(tool, {}, output.result) ?? []), ...(observed.outputLocations ?? []).map(location => location.path)]
 				.flatMap(target => resourcePath(target) ?? []))] : [];
 			const failure = paths.length ? { paths } : undefined;
-			if (parentHash && (bound || learnedCommands.get(parentHash) || patternSettings.presets.includes("retry-failed-command") && failure))
-				learnedCommands.set(parentHash, { parentHash, tool, input: observed.input, ...(schemaHash === undefined ? {} : { schemaHash }), ...(failure ? { failure } : {}) });
+			if (parentHash && (bindings.length || learnedCommands.get(parentHash) || patternSettings.presets.includes("retry-failed-command") && failure))
+				learnedCommands.set(parentHash, { parentHash, tool, input: observed.input, schemaHash, failure,
+					...(bindings.length && rerunState?.native ? { request: { revision: ++rerunRevision, kind: "observed" } } : {}) });
 			if (rerunState && rerunState === commandRerun && actionSemantics.toolNames("workspace_mutation").includes(tool)) {
 				const edited = typeof concrete.path === "string" && output && !output.isError ? resourcePath(concrete.path) : undefined;
-				const retry = rerunState.failed && edited ? [...learnedCommands.values()].reverse().find(command => command.failure?.paths.includes(edited)) : undefined;
-				rerunState.request = rerunState.native || retry ? { revision: ++rerunRevision, observedOnly: false, retry } : undefined;
+				for (const command of learnedCommands.values()) {
+					const retry = rerunState.failed && edited && command.failure?.paths.includes(edited);
+					if (rerunState.native || retry) command.request = { revision: ++rerunRevision, kind: retry ? "retry" : "edit" };
+				}
 			}
 			const key = agentBatchKey(consumeInput.sessionID, consumeInput.turnID);
 			const batch = authoritativeBatches.get(key) ?? new Map();
@@ -323,9 +324,8 @@ export function createPatternPlanSource({
 			if (!patternSettings.multiStepEnabled && !rerun.length || signal?.aborted) return undefined;
 			let actions = rerun;
 			if (patternSettings.multiStepEnabled) {
-				await analysisTail;
-				if (signal?.aborted) return undefined;
-				const store = await resolveStore(patternSettings);
+				const store = await predictionStore(patternSettings, signal);
+				if (!store) return undefined;
 				const ordered = [...batch.entries()].sort(([left], [right]) => left - right).map(([, item]) => item);
 				const candidates = store.predictAfterBatch(consumeInput.sessionID, ordered, data.schemaHashes, patternSettings);
 				if (rerunState !== commandRerun) [rerun, apart] = NO_RERUN;
@@ -344,8 +344,8 @@ export function createPatternPlanSource({
 		}),
 		onAdmitted: ({ feedback }) => {
 			if (lifecycle.sealed) return;
-			const request = rerunFeedback.get(feedback as object)?.request;
-			if (request && commandRerun?.request === request) commandRerun.request = undefined;
+			const preparation = rerunFeedback.get(feedback as object);
+			if (preparation && preparation.command.request === preparation.request) preparation.command.request = undefined;
 			const context = asPatternPlanFeedback(feedback);
 			if (context) predictionBatches.get(context)?.pending.delete(context);
 		},
@@ -406,11 +406,8 @@ export function createPatternPlanSource({
 	};
 	return {
 		source,
-		hints: ({ sessionID, schemaHashes, settings }) => admit(settings, async (patternSettings) => {
-			await analysisTail;
-			return !patternSettings.enabled ? [] : (await resolveStore(patternSettings)).predict(sessionID, schemaHashes, patternSettings)
-				.slice(0, 4).map(({ tool, input, horizon }) => ({ tool, input, horizon }));
-		}),
+		hints: ({ sessionID, schemaHashes, settings }) => admit(settings, async (patternSettings) => patternSettings.enabled
+			? (await predictionStore(patternSettings))!.predict(sessionID, schemaHashes, patternSettings).slice(0, 4).map(({ tool, input, horizon }) => ({ tool, input, horizon })) : []),
 		turnStarted: observeTurn,
 		turnFinished: observeTurn,
 		// Serving the Actor is recorded before the owning prediction settles, which credits it even when unmatched.
@@ -467,17 +464,21 @@ function patternPlanAction(candidate: PatternAwareCandidate, store: PatternAware
 const RUN_OUTPUT_LOCATION = /(?<![\w.@/\\:-])((?:[A-Za-z]:)?[\w.@-]{0,128}(?:[\\/][\w.@-]{1,128}){0,16}\.[A-Za-z]\w{0,9})(?::(\d+)|\((\d+)|",? line (\d+))/gu;
 const RUN_OUTPUT_PATH = /(?<![\w.@/\\:-])((?:[A-Za-z]:)?[\w.@-]{0,128}(?:[\\/][\w.@-]{1,128}){0,16}\.[A-Za-z]\w{0,9})(:\d|\(\d|",? line \d)?/gu;
 
+function outputPath(tool: string, input: Readonly<Record<string, unknown>>, file: string): string {
+	const root = typeof input.path === "string" && input.path ? input.path : ".";
+	return tool === "bash" || path.isAbsolute(file) ? file : tool === "grep" && path.basename(root) === file ? root : path.join(root, file);
+}
+
 /** `path:line` facts: grep's matches, and a command's reported locations (compiler errors, stack traces, test failures). */
 function extractOutputLocations(tool: string, actionInput: Readonly<Record<string, unknown>>, result: AgentToolResult<unknown> | undefined): OutputLocation[] {
 	if ((tool !== "grep" && tool !== "bash") || !result) return [];
 	const text = result.content.flatMap((item) => item.type === "text" ? [item.text] : []).join("\n");
-	const searchRoot = typeof actionInput.path === "string" && actionInput.path ? actionInput.path : ".";
 	const located = tool === "grep" ? [...text.matchAll(/^(.+?):(\d+)(?::\d+)?:/gmu)] : [...text.matchAll(RUN_OUTPUT_LOCATION)];
 	return located.slice(0, 256).flatMap(([, file, ...lines]) => {
 		const line = lines.find(Boolean);
 		const number = Number(line);
 		if (!file || !Number.isSafeInteger(number) || number < 1) return [];
-		return [{ path: tool === "bash" || path.isAbsolute(file) ? file : path.basename(searchRoot) === file ? searchRoot : path.join(searchRoot, file), line: number }];
+		return [{ path: outputPath(tool, actionInput, file), line: number }];
 	});
 }
 
@@ -487,7 +488,6 @@ function extractOutputPaths(
 	result: AgentToolResult<unknown> | undefined,
 ): readonly string[] | undefined {
 	if ((tool !== "find" && tool !== "grep" && tool !== "bash") || !result) return undefined;
-	const searchRoot = typeof actionInput.path === "string" && actionInput.path ? actionInput.path : ".";
 	const text = result.content.flatMap((item) => item.type === "text" ? [item.text] : []).join("\n");
 	if (tool === "bash") { // The files a command names as it runs, and those its output reports.
 		// A git diff names each file as a/path and b/path.
@@ -495,18 +495,9 @@ function extractOutputPaths(
 			.flatMap((match) => match[2] || /[\\/]/u.test(match[1]!) ? [diff ? match[1]!.replace(/^[ab]\//u, "") : match[1]!] : []);
 		return named.length ? [...new Set(named)].slice(0, 32) : undefined;
 	}
-	const paths = text.split(/\r?\n/)
-		.map((line) => {
-			const trimmed = line.trim();
-			if (!trimmed || trimmed.startsWith("[") || /^No files found\b/.test(trimmed)) return undefined;
-			if (tool === "find") return trimmed;
-			return /^(.*?):\d+(?::\d+)?:/.exec(trimmed)?.[1];
-		})
-		.filter((item): item is string => typeof item === "string" && item.length > 0)
-		.map((item) => {
-			if (path.isAbsolute(item)) return item;
-			if (tool === "grep" && path.basename(searchRoot) === item) return searchRoot;
-			return path.join(searchRoot, item);
-		});
+	const paths = text.split(/\r?\n/).flatMap(line => {
+		const trimmed = line.trim(), file = tool === "find" ? trimmed : /^(.*?):\d+(?::\d+)?:/.exec(trimmed)?.[1];
+		return file && !trimmed.startsWith("[") && !/^No files found\b/.test(trimmed) ? [outputPath(tool, actionInput, file)] : [];
+	});
 	return paths.length ? [...new Set(paths)] : undefined;
 }
