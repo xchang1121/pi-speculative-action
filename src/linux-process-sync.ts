@@ -23,7 +23,7 @@ export interface SynchronousProcessResult {
 	readonly metrics: WorldReuseMetrics;
 	readonly inputs?: readonly CapturedFilesystemTransfer[];
 }
-type Response = { readonly kind: "ready" } | { readonly kind: "attached"; readonly pid?: number } |
+type Response = { readonly kind: "attached"; readonly pid?: number } |
 	{ readonly kind: "result"; readonly result: SynchronousProcessResult } | { readonly kind: "error"; readonly message: string; readonly poisoned: boolean };
 
 /** Preserve producer identities; shared intervals will be translated into the receiving caller's clock. */
@@ -51,7 +51,6 @@ export class SynchronousProcessObserver {
 	private readonly clock = new Int32Array(new SharedArrayBuffer(8));
 	private readonly worker: Worker;
 	private readonly exited: Promise<void>;
-	private initialized = false;
 	private closing?: Promise<void>;
 	private failure?: Error;
 
@@ -65,7 +64,6 @@ export class SynchronousProcessObserver {
 	}
 
 	attach(request: SynchronousProcessRequest): { readonly pid?: number; readonly finish: () => SynchronousProcessResult } {
-		if (!this.initialized) { if (this.receive().kind !== "ready") throw new Error("synchronous observer did not initialize"); this.initialized = true; }
 		const buffers = request.handoffs.results.flatMap(result => [...result.artifacts.map(artifact => artifact.bytes.buffer as ArrayBuffer),
 			...(result.continuation ? [result.continuation.image.buffer as ArrayBuffer] : [])]);
 		this.port.postMessage({ kind: "attach", request }, buffers);
@@ -118,7 +116,6 @@ if (!isMainThread && workerData?.nativeProcessObserver === true) void (async () 
 				.then(completed => { release = completed.release; send({ kind: "result", result: completed.result }); }, error => send({ kind: "error", message: String(error), poisoned: isPoisonedEffectCommit(error) }))
 				.finally(() => { finish = undefined; });
 		});
-		send({ kind: "ready" });
 	} catch (error) {
 		send({ kind: "error", message: String(error), poisoned: false }); Atomics.store(clock, 1, 1); Atomics.notify(clock, 0);
 		await backend?.dispose(); port.close();

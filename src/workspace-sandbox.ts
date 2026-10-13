@@ -4,7 +4,6 @@ import { constants as fsConstants, type BigIntStats, type Stats } from "node:fs"
 import { access, chmod, copyFile, type FileHandle, link, lstat, mkdir, mkdtemp, open, readdir, rename, rm, rmdir, unlink, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { containsFilesystemPath, filesystemPathKey, relativeFilesystemPath, slash } from "./path-utils.ts";
 import { errorMessage, hasErrorCode, isMissing } from "./error-utils.ts";
 import { createCommittedResourceInputs, type SpeculativeAgentExecutionWorld, type SpeculativeToolExecutionContext } from "./agent-execution-world.ts";
@@ -2142,9 +2141,9 @@ function commitLockTargets(changes: readonly SandboxWorkspaceChange[]): string[]
 	);
 }
 
-function withCommitLocks<T>(targets: readonly string[], run: () => Promise<T>, index = 0): Promise<T> {
+async function withCommitLocks<T>(targets: readonly string[], run: () => Promise<T>, index = 0): Promise<T> {
 	const target = targets[index];
-	return target ? withFileMutationQueue(target, () => withCommitLocks(targets, run, index + 1)) : run();
+	return target ? (await import("@earendil-works/pi-coding-agent")).withFileMutationQueue(target, () => withCommitLocks(targets, run, index + 1)) : run();
 }
 
 function sameOptionalBytes(left: Uint8Array | undefined, right: Uint8Array | undefined): boolean {

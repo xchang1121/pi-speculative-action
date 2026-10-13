@@ -1465,6 +1465,9 @@ static int takePacket(int length,int peek,int truncated,char expected) {
 				raw:require('fs').readFileSync('/proc/self/environ').includes('PI_SPEC_HELD_EXEC_ID=caller-owned')}));console.error('stderr');`;
 		const credentials = { uid: process.getuid!(), gid: process.getgid!() }, launches = [[], ["uid"], ["gid"], ["uid", "gid"]] as const;
 		await writeFile(path.join(root, "no-permission"), "x", { mode: 0o600 });
+		// Native observation has no workspace commit to lock and must not initialize the entire SDK in its worker.
+		const argvLength = process.execArgv.length; process.execArgv.push("--import", `data:text/javascript,import {registerHooks} from 'node:module'; registerHooks({resolve(name,context,next){if(name==='@earendil-works/pi-coding-agent')throw new Error('unexpected SDK initialization');return next(name,context);}});`);
+		await using _observerImports = onExit(async () => { process.execArgv.splice(argvLength); });
 		await using synchronous = disposable(new LinuxProcessReuseBackend({ storeRoot: path.join(root, "sync-store"), heldExecBinary: binary }));
 		const syncScope = { sessionID: "raw", turnID: "synchronous" }, learned: ProcessExecutionBinding[] = [];
 		const observeSync = <Value>(execute: () => Value) => synchronous.observeBindings(syncScope,
