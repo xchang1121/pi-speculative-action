@@ -2865,6 +2865,11 @@ static int track_process(struct traced_process **processes, pid_t pid) {
 	return 0;
 }
 
+static void finish_observation(struct traced_process *observer, int completed) {
+	(void)transfer(observer->fd, completed ? "D\n" : "C\n", 2, 1);
+	close(observer->fd); observer->fd = -1;
+}
+
 static void release_process(struct traced_process **processes, pid_t pid, struct descriptor_domain *domain, int completed) {
 	struct traced_process **cursor = processes;
 	while (*cursor) {
@@ -2876,48 +2881,34 @@ static void release_process(struct traced_process **processes, pid_t pid, struct
 			pthread_join(observer->job->thread, NULL);
 			free_job(observer->job);
 		}
-		size_t sent = 0;
-		while (observer->fd >= 0 && sent < 2) {
-			ssize_t moved = send(observer->fd, (completed ? "D\n" : "C\n") + sent, 2 - sent, MSG_NOSIGNAL);
-			if (moved < 0 && errno == EINTR) continue;
-			if (moved <= 0) break;
-			sent += (size_t)moved;
-		}
-		close(observer->fd);
+		finish_observation(observer, completed);
 		pthread_mutex_lock(&process_list_lock); drop_descriptor_table(observer, domain); pthread_mutex_unlock(&process_list_lock);
 		free(observer);
 	}
 }
 
-/* Stop and detach every remaining tracee: native Bash returns with its shell and PTRACE_O_EXITKILL would kill them. */
-static int release_tracees(struct traced_process **processes, struct descriptor_domain *domain, int descriptors) {
-	for (struct traced_process *item = *processes; item; item = item->next) {
-		if (item->historical || (descriptors && item->stopped && !item->listening)) continue; /* Already in a ptrace-stop. */
-		item->stopped = 0;
-		if (ptrace(PTRACE_INTERRUPT, item->pid, 0, 0) < 0 && errno != ESRCH) return -1;
-	}
-	for (int status;;) {
-		struct traced_process *item = *processes;
-		while (item && (item->historical || item->stopped)) item = item->next;
-		if (!item) break;
-		pid_t pid = waitpid(-1, &status, __WALL);
-		if (pid < 0) { if (errno == EINTR) continue; if (errno != ECHILD) return -1; break; }
-		for (item = *processes; item && (item->pid != pid || item->historical);) item = item->next;
-		if (WIFEXITED(status) || WIFSIGNALED(status)) { if (item) release_process(processes, pid, domain, 1); continue; }
-		if (!item) { if (track_process(processes, pid) < 0) return -1; item = *processes; }
-		unsigned event = (unsigned)status >> 16; unsigned long child;
-		/* A fork racing the interrupt attaches a child that must be detached too. */
-		if ((event == PTRACE_EVENT_FORK || event == PTRACE_EVENT_VFORK || event == PTRACE_EVENT_CLONE) && ptrace(PTRACE_GETEVENTMSG, pid, 0, &child) == 0) {
-			struct traced_process *known = *processes;
-			while (known && known->pid != (pid_t)child) known = known->next;
-			if (!known && track_process(processes, (pid_t)child) < 0) return -1;
+/* No decision remains. Detach ready tracees; blocked vfork parents stay protected until VFORK_DONE. */
+static int release_tracees(struct traced_process **processes, struct descriptor_domain *domain, int *acknowledged) {
+	int live = 0, waiting = 0;
+	for (struct traced_process *item = *processes; item;) {
+		if (!item->historical) {
+			if (item->stopped && !item->listening && !item->awaiting_parent) {
+				if (ptrace(PTRACE_DETACH, item->pid, 0, item->delivered) < 0 && errno != ESRCH) return -1;
+				release_process(processes, item->pid, domain, 0); item = *processes; live = waiting = 0; continue;
+			}
+			live = 1;
+			if (!item->vforking) {
+				waiting = 1;
+				if (ptrace(PTRACE_INTERRUPT, item->pid, 0, 0) < 0 && errno != ESRCH && errno != EIO) return -1;
+			}
 		}
-		item->stopped = 1;
-		if (!event && WSTOPSIG(status) != SIGTRAP) item->delivered = WSTOPSIG(status);
+		item = item->next;
 	}
-	for (struct traced_process *item = *processes; item; item = item->next)
-		if (!item->historical && ptrace(PTRACE_DETACH, item->pid, 0, item->delivered) < 0 && errno != ESRCH) return -1;
-	return 0;
+	if (!waiting && !*acknowledged) {
+		for (struct traced_process *item = *processes; item; item = item->next) finish_observation(item, 0);
+		(void)transfer(STDOUT_FILENO, "R", 1, 1); close(STDOUT_FILENO); *acknowledged = 1;
+	}
+	return live;
 }
 
 static int trace(const char *socket_path, const char *token, const char *execution_id,
@@ -2925,7 +2916,7 @@ static int trace(const char *socket_path, const char *token, const char *executi
 	struct descriptor_domain domain = {.enabled = descriptors == 1};
 	pid_t barrier = 0;
 	sigset_t blocked, original;
-	sigemptyset(&blocked); sigaddset(&blocked, SIGCHLD);
+	sigemptyset(&blocked); sigaddset(&blocked, SIGCHLD); sigaddset(&blocked, SIGPIPE);
 	if (pthread_sigmask(SIG_BLOCK, &blocked, &original) != 0) return 70;
 	int signals = signalfd(-1, &blocked, SFD_CLOEXEC | SFD_NONBLOCK);
 	if (signals < 0) return 70;
@@ -2933,7 +2924,7 @@ static int trace(const char *socket_path, const char *token, const char *executi
 	if (transfer(3, &root, sizeof(root), 0) < 0 || root <= 0) return 71;
 	if (ptrace(PTRACE_SEIZE, root, 0, options | (descriptors ? PTRACE_O_TRACESYSGOOD : 0)) < 0 || transfer(3, "R", 1, 1) < 0) return 72;
 	close(3);
-	int status = 0, root_status = -1, retiring = 0;
+	int status = 0, root_status = -1, retiring = 0, draining = 0, acknowledged = 0;
 	unsigned exec_events = !skip_root;
 	struct traced_process *processes = NULL;
 	domain.processes = &processes;
@@ -2972,17 +2963,12 @@ static int trace(const char *socket_path, const char *token, const char *executi
 				free_job(job); item->job = NULL; item->armed = 0;
 				if (result == -2) goto fatal;
 				if (descriptors) { item->pending = 0; if (barrier == item->pid) barrier = 0; }
-				else if (ptrace(PTRACE_CONT, item->pid, 0, 0) < 0 && errno != ESRCH) goto fatal;
+				else { if (ptrace(PTRACE_CONT, item->pid, 0, 0) < 0 && errno != ESRCH) goto fatal; item->stopped = 0; }
 				continue;
 			} else if (received > 0 || (errno != EAGAIN && errno != EINTR)) goto fatal;
 		}
-		if (retiring) {
-			int busy = 0;
-			for (struct traced_process *item = processes; item; item = item->next) busy |= item->job != NULL;
-			if (!busy) { if (release_tracees(&processes, &domain, descriptors) < 0) goto fatal; break; }
-		}
 	manage_descriptors:
-		if (descriptors) {
+		if (descriptors && !draining) {
 			if (!barrier) for (struct traced_process *item = processes; item; item = item->next)
 				if (item->pending && !item->historical) { barrier = item->pid; break; }
 			int ready = 1;
@@ -3005,10 +2991,15 @@ static int trace(const char *socket_path, const char *token, const char *executi
 				}
 			}
 		}
-		if (root_status >= 0 && !barrier) {
+		if (retiring || (root_status >= 0 && !barrier)) {
 			int busy = 0;
 			for (struct traced_process *item = processes; item; item = item->next) busy |= item->job != NULL;
-			if (!busy) { if (release_tracees(&processes, &domain, descriptors) < 0) goto fatal; break; }
+			if (!busy) {
+				retiring = draining = 1;
+				int live = release_tracees(&processes, &domain, &acknowledged);
+				if (live < 0) goto fatal;
+				if (!live) break;
+			}
 		}
 		pid_t pid = waitpid(-1, &status, __WALL | WNOHANG | __WNOTHREAD);
 		if (pid < 0) {
@@ -3049,9 +3040,9 @@ static int trace(const char *socket_path, const char *token, const char *executi
 		if (!current) {
 			if (track_process(&processes, pid) < 0) goto fatal;
 			current = processes;
-			current->awaiting_parent = descriptors && event == PTRACE_EVENT_STOP;
+			current->awaiting_parent = event == PTRACE_EVENT_STOP;
 		}
-		current->stopped = 1;
+		current->stopped = 1; current->listening = 0;
 		if (event == PTRACE_EVENT_VFORK || event == PTRACE_EVENT_VFORK_DONE) current->vforking = event == PTRACE_EVENT_VFORK;
 		if (descriptors && delivered == (SIGTRAP | 0x80)) {
 			if (observe_descriptor_syscall(current, &domain) < 0) goto fatal;
@@ -3073,9 +3064,10 @@ static int trace(const char *socket_path, const char *token, const char *executi
 				else if (!(known->table = copy_descriptor_table(current))) goto fatal;
 			}
 		}
-		if (event == PTRACE_EVENT_STOP && delivered != SIGTRAP) {
+		if (!draining && event == PTRACE_EVENT_STOP && delivered != SIGTRAP) {
 			if (descriptors) { current->listening = 1; continue; }
 			if (ptrace(PTRACE_LISTEN, pid, 0, 0) < 0 && errno != ESRCH) goto fatal;
+			current->stopped = 0;
 			continue;
 		}
 		if (event == PTRACE_EVENT_EXEC) {
@@ -3117,8 +3109,9 @@ static int trace(const char *socket_path, const char *token, const char *executi
 			}
 		}
 		if (event != 0) delivered = 0;
-		if (descriptors) { current->delivered = delivered; continue; }
+		if (descriptors || draining) { current->delivered = delivered; continue; }
 		if (ptrace(PTRACE_CONT, pid, 0, delivered) < 0 && errno != ESRCH) goto fatal;
+		current->stopped = 0;
 	held:;
 	}
 	while (processes) release_process(&processes, processes->pid, &domain, 0);

@@ -1405,7 +1405,7 @@ static int takePacket(int length,int peek,int truncated,char expected) {
 			return new Promise<{ stdout: string; stderr: string; error?: NodeJS.ErrnoException; code: number | null; signal: NodeJS.Signals | null }>(resolve =>
 				child.once("close", (code, signal) => resolve({ stdout, stderr, error, code, signal })));
 		};
-		const observe = <Value>(callID: string, execute: () => Promise<Value>, signal?: AbortSignal) => boundary.observe({ sourceRoot: root, signal,
+		const observe = <Value>(callID: string, execute: () => Promise<Value>, signal?: AbortSignal, descriptors?: boolean | "inspect") => boundary.observe({ sourceRoot: root, signal, descriptors,
 			scope: { sessionID: "raw", turnID: "round", callID }, decide: async held => {
 				observations.push(held); await nextTurn(); return { kind: "continue", observeCompletion: duration => { completions.push(duration); } };
 			} }, execute);
@@ -1434,24 +1434,34 @@ static int takePacket(int length,int peek,int truncated,char expected) {
 			const child = childProcess.fork(path.join(root, "ipc.cjs"), [], { silent: true }), closed = collect(child), received = once(child, "message");
 			child.send("hello"); expect((await received)[0]).toEqual({ value: "hello", pid: child.pid, ppid: process.pid }); expect((await closed).code).toBe(0);
 		});
-		const cancelled = new AbortController(), entered = deferred();
-		const cancelledRun = observe("cancelled", async () => {
-			const child = childProcess.spawn("/bin/sleep", ["10"], { signal: cancelled.signal }), closed = collect(child); entered.resolve(); return closed;
-		}, cancelled.signal);
+		const cancelled = new AbortController();
+		const cancelledRun = observe("cancelled", () => collect(childProcess.spawn("/bin/sleep", ["10"], { signal: cancelled.signal })), cancelled.signal);
 		const surviving = observe("surviving", () => collect(childProcess.spawn("/bin/echo", ["survived"])));
-		await entered.promise; cancelled.abort();
+		cancelled.abort();
 		expect(await cancelledRun).toMatchObject({ signal: "SIGTERM", error: { code: "ABORT_ERR" } }); expect((await surviving).stdout).toBe("survived\n");
-		const before = observations.length, background = gated();
-		let late!: () => Promise<unknown>, finished!: ReturnType<typeof collect>;
-		const own = await observe("background", async () => {
-			const child = childProcess.spawn("/bin/sh", ["-c", "printf ready; read next; printf done"], { cwd: root }); finished = collect(child);
-			late = AsyncResource.bind(() => collect(childProcess.spawn("/bin/true")));
-			await once(child.stdout, "data"); return { resource: child, output: "own" };
-		});
-		expect(own.output).toBe("own"); expect(own.resource.exitCode).toBeNull(); expect(completions.at(-1)).toBeUndefined();
-		const keeper = observe("keeper", () => background.wait()); await background.entered;
-		await late(); expect(observations.length).toBe(before + 1); background.release(); await keeper;
-		own.resource.stdin!.end("go\n"); expect((await finished).stdout).toBe("readydone");
+		await compileBenchmarkHelper(root, { source: "lifetime.c", output: "lifetime", code: `${cHeaders("unistd.h string.h sys/wait.h")}
+int main(int n,char **v) { if(n!=2)return 90; pid_t child=!strcmp(v[1],"vfork")?vfork():fork(); if(child<0)return 91;
+	if(!child) { char byte; if(write(1,"ready",5)!=5 || read(0,&byte,1)!=1 || write(1,"done",4)!=4)_exit(92); _exit(0); }
+	int status; return waitpid(child,&status,0)!=child || status || write(1,"parent",6)!=6;
+}` });
+		for (const kind of ["fork", "vfork", "stopped"]) for (const descriptors of [undefined, "inspect", true] as const) for (const killed of [false, true]) {
+			const before = observations.length, completedBefore = completions.length, background = gated(); let late!: () => Promise<unknown>, child!: childProcess.ChildProcess, finished!: ReturnType<typeof collect>;
+			const pending = observe("background", async () => {
+				child = childProcess.spawn(path.join(root, "lifetime"), [kind], { detached: true }); finished = collect(child); child.stdin!.on("error", () => {});
+				late = AsyncResource.bind(() => collect(childProcess.spawn("/bin/true"))); await once(child.stdout!, "data");
+				if (kind === "stopped") { process.kill(-child.pid!, "SIGSTOP"); await expect.poll(() => readFile(`/proc/${child.pid}/status`, "utf8"), { timeout: 500 }).toMatch(/^State:\s+[Tt]/m); }
+				if (killed) process.kill(observations.at(-1)!.tracerPid, "SIGKILL"); return { resource: child, output: "own" };
+			}, undefined, descriptors);
+			await using _child = onExit(async () => { if (child?.exitCode === null && child.signalCode === null) try { process.kill(-child.pid!, "SIGKILL"); } catch {} await finished; await pending; });
+			expect(await scheduling.waitForCompletion(pending, undefined, 1000), `${kind}/${descriptors}/${killed}`).toMatchObject({ status: "completed", value: { resource: child, output: "own" } });
+			if (killed) { expect(await scheduling.waitForCompletion(finished, undefined, 1000)).toMatchObject({ status: "completed", value: { signal: "SIGKILL", stdout: "ready" } }); continue; }
+			expect(child.exitCode).toBeNull(); expect(child.signalCode).toBeNull(); expect(completions.slice(completedBefore)).toEqual([undefined]);
+			const keeper = observe("keeper", () => background.wait()); await background.entered;
+			await late(); expect(observations.length).toBe(before + 1); background.release(); await keeper;
+			if (kind === "stopped") { expect(await readFile(`/proc/${child.pid}/status`, "utf8")).toMatch(/^State:\s+T/m); process.kill(-child.pid!, "SIGCONT"); }
+			child.stdin!.end("go\n"); expect(await finished).toMatchObject({ code: 0, signal: null, stdout: "readydoneparent" }); expect(completions.slice(completedBefore)).toEqual([undefined]);
+			await expect.poll(() => { try { process.kill(observations.at(-1)!.tracerPid, 0); return true; } catch { return false; } }).toBe(false);
+		}
 		expect(Reflect.get(actual.ChildProcess.prototype, "spawn")).toBe(original);
 		const count = observations.length; await collect(childProcess.spawn("/bin/true")); expect(observations).toHaveLength(count);
 		for (const stop of ["waiter", "preparing", "owner"]) {
@@ -1545,19 +1555,13 @@ static int takePacket(int length,int peek,int truncated,char expected) {
 		expect(await scheduling.waitForCompletion(run(command), undefined, 900), "the shell returns without its detached descendants").toMatchObject({ status: "completed", value: { code: 7 } });
 		await expect.poll(() => readFile(completed, "utf8").catch(() => ""), { timeout: 5000 }).toBe("done\n"); // Released, not killed with the tracer.
 		await rm(pidFile);
-		let tracedChild!: childProcess.ChildProcess;
-		const stopped = observe("tracer-death", () => collect(tracedChild = childProcess.spawn("/bin/bash", ["-c", command.replace("sleep 1", "sleep 10").replace("exit 7", "wait")], { detached: true })));
-		let pid = 0;
-		try {
-			await expect.poll(async () => pid = Number(await readFile(pidFile, "utf8").catch(() => "")), { timeout: 1000 }).toBeGreaterThan(0);
-			process.kill(observations.find(held => held.scope?.callID === "tracer-death")!.tracerPid, "SIGKILL");
-			await stopped;
-			await expect.poll(async () => (await readFile(`/proc/${pid}/stat`, "utf8").catch(() => "")).match(/\) (\w) /)?.[1],
-				{ timeout: 1000, message: "killed tracer must not release its tracees to run" }).toSatisfy(state => state === undefined || state === "Z");
-		} finally {
-			tracedChild.kill("SIGKILL");
-			if (pid) try { process.kill(-pid, "SIGKILL"); } catch { /* Already reaped. */ }
-			await stopped;
+		for (const skipRoot of [false, true]) {
+			let armed!: ReturnType<typeof collect>;
+			await expect(boundary.observe({ sourceRoot: root, skipRoot, decide: async held => ({ kind: "replay", exitCode: 0, output: [],
+				commit: async () => { process.kill(held.tracerPid, "SIGKILL"); await armed; throw new Error("observer died after arming"); },
+			}) }, () => armed = collect(childProcess.spawn("/bin/sh", ["-c", `/bin/true; printf unsafe > '${root}/after-observer-death'`])))).rejects.toMatchObject({ disposition: "poisoned" });
+			expect(await armed, "armed failure must terminate the whole tree").toMatchObject({ code: null, signal: "SIGKILL", stdout: "" });
+			expect(existsSync(path.join(root, "after-observer-death"))).toBe(false);
 		}
 		const native = adaptProcessToolOperations(createLocalBashOperations({ shellPath: "/bin/bash" }));
 		const held = (options: Pick<Parameters<LinuxHeldExecBoundary["observe"]>[0], "decide" | "descriptors">, executor = native) => {

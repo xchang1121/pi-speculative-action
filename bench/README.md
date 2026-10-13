@@ -26,7 +26,7 @@ npm run bench:overlay-probe
 
 在 Windows 上可用 `wsl.exe -e bash -lc 'bash "$(wslpath "<checkout>")/scripts/wsl-verify.sh" [vitest 参数]'`：它把当前 HEAD 与工作区改动同步到 WSL 原生文件系统的克隆中，在隔离 HOME 中构建本机助手后运行测试（`PI_SPEC_WSL_WORK`/`PI_SPEC_WSL_CHECKOUT`/`PI_SPEC_WSL_HOME` 可改位置）。
 
-`PI_SPEC_SANDLOCK`、`PI_SPEC_HELD_EXEC` 可指定已经验证匹配的 binary。exec 入口直接运行进程测试，输出 Vitest 报告，检查真实退出、描述符、输出与文件效果、跨父命令 completed/running 接管、一次消费及改变输入后的回退。场景、运行器与报告格式和日常测试共用。OverlayFS 入口复用生产驱动的能力、隔离和回收测试，能力检查决定执行或带原因跳过；完整进程资格由 exec 入口验收。
+`PI_SPEC_SANDLOCK`、`PI_SPEC_HELD_EXEC` 可指定已经验证匹配的 binary。exec 入口直接运行进程测试，输出 Vitest 报告，检查真实退出、描述符、输出与文件效果、跨父命令 completed/running 接管、一次消费及改变输入后的回退。正常退出观察时，已接纳的接管先收尾，活子进程继续按原生命周期执行；阻塞于 vfork 的父进程在子进程自然结束后脱离观察，调用方无需等待它。fork/vfork、暂停后恢复、迟到回调和未完成计时共用真实调用流程验证。观察意外终止仍终止整棵未释放进程树，避免放开处于部分接管状态的共享资源；失败保持不可回退。场景、运行器与报告格式和日常测试共用。OverlayFS 入口复用生产驱动的能力、隔离和回收测试，能力检查决定执行或带原因跳过；完整进程资格由 exec 入口验收。
 
 失败时保留原错误和最小复现信息；时钟相关的采纳资格由原始观测和完整校验决定。
 

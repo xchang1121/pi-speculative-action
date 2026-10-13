@@ -335,13 +335,16 @@ export class LinuxHeldExecBoundary {
 		try {
 			gate = this.startup(0);
 			if (!Number.isInteger(gate) || gate < 0) throw new Error("native startup gate unavailable");
-			observer = startupScope.exit(() => spawn(this.shellPath, ["--attach"], { stdio: ["pipe", "ignore", "ignore", gate], env: {
+			observer = startupScope.exit(() => spawn(this.shellPath, ["--attach"], { stdio: ["pipe", "pipe", "ignore", gate], env: {
 				PI_SPEC_HELD_EXEC_SOCKET: this.socketPath, PI_SPEC_HELD_EXEC_TOKEN: this.token, PI_SPEC_HELD_EXEC_ID: execution,
 				...(options.descriptors ? { PI_SPEC_HELD_EXEC_DESCRIPTORS: options.descriptors === "inspect" ? "2" : "1" } : {}),
 				...(options.skipRoot ? { PI_SPEC_HELD_EXEC_ROOT: "skip" } : {}),
 			} }));
 			observer.on("error", () => {}); observer.stdin?.on("error", () => {}); observer.unref();
-			const done = new Promise<void>(resolve => observer!.once("close", () => resolve()));
+			const done = new Promise<void>(resolve => {
+				observer!.once("close", () => resolve());
+				observer!.stdout!.once("data", data => { if (data.toString() === "R") { observer!.stdout!.destroy(); resolve(); } });
+			});
 			const signal = AbortSignal.any([controller.signal, ...(options.signal ? [options.signal] : [])]);
 			const retire = () => {
 				if (!controller.signal.aborted) controller.abort(new Error("native observation retired"));
