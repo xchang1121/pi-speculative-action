@@ -1,9 +1,9 @@
 import { snapshotExecutionScope, type ExecutionScope, type ExecutionOperationAdoption } from "./execution-world.ts";
 import { EffectCommitFailure, effectCommitFailure } from "./effect-transaction.ts";
-import { referencedArtifacts, type ProcessProvenanceCertificate, type Sha256Digest } from "./provenance-certificate.ts";
+import { referencedArtifacts, type ArtifactReference, type ProcessProvenanceCertificate, type Sha256Digest } from "./provenance-certificate.ts";
 import type { ProvenanceCertificateStore, VerifiedArtifactClosure } from "./reuse-store.ts";
 import { immutableSnapshot, isImmutableSnapshot, stableEqual } from "./stable-json.ts";
-import { TimelineInterval } from "./task-timing.ts";
+import { TimelineInterval, type SerializedTimelineComputation } from "./task-timing.ts";
 import { waitForCompletion } from "./scheduler.ts";
 
 /** One-shot children and their enclosing branch share adoption authority. */
@@ -91,6 +91,18 @@ interface HandoffRecord extends ProcessHandoff {
 	readonly executablePath: string;
 	readonly settle: () => void;
 	readonly continuation?: ProcessContinuation;
+	/** A worker's reservation remains observable even if its result message is lost. */
+	claimState?: Int32Array;
+}
+
+export interface ProcessHandoffTransfer {
+	readonly claims: SharedArrayBuffer;
+	readonly results: readonly {
+		readonly key: Sha256Digest; readonly executablePath: string; readonly scope?: ExecutionScope;
+		readonly candidate: ProcessProvenanceCertificate; readonly bytes: number; readonly computation: SerializedTimelineComputation;
+		readonly artifacts: readonly { readonly reference: ArtifactReference; readonly bytes: Uint8Array }[];
+		readonly continuation?: { readonly image: Uint8Array; readonly physicalRoot: string; readonly computation: SerializedTimelineComputation };
+	}[];
 }
 
 export type ProcessHandoffAcquisition<Plan> =
@@ -246,8 +258,8 @@ export class ProcessHandoffRegistry<Invocation = never> {
 						const completed = [...records].reverse().flatMap((record) => {
 							const state = record.state;
 							if (state.status !== "completed" || !state.result || considered.has(record)) return [];
-							const { candidate, artifacts } = state.result, oneShot = candidate.dependencyCertificate.taints.length > 0 || !!candidate.result.continuation;
-							return oneShot && (!record.ownership.acceptsScope(record.scope, scope, request.role === "actor") || record.ownership.wholeClaimed)
+							const { candidate, artifacts } = state.result, oneShot = oneShotResult(candidate);
+							return oneShot && !this.accepts(record, scope, request.role === "actor")
 								? [] : [{ record, state, candidate, artifacts, oneShot }];
 						});
 						if (completed.length || !historyChecked) {
@@ -261,27 +273,11 @@ export class ProcessHandoffRegistry<Invocation = never> {
 							const selected = completed.find(({ candidate }) => candidate === plan?.certificate);
 							if (!selected) for (const { record, candidate } of completed) considered.set(record, candidate.id);
 							if (plan && selected && selected.record.state === selected.state && this.byKey.get(request.key)?.has(selected.record)) {
-								const { record, state, oneShot } = selected;
-								const claim = oneShot && record.ownership.acceptsScope(record.scope, scope, request.role === "actor") ? record.ownership.claimChild() : undefined;
-								if (oneShot && !claim) { considered.set(record, selected.candidate.id); continue; }
-								if (oneShot) record.state = { ...state, status: "reserved" };
-								record.borrowers++;
-								let pending = true;
+								const { record, oneShot } = selected;
+								const settle = this.claim(record, oneShot, request.role === "producer" ? request : undefined, scope);
+								if (!settle) { considered.set(record, selected.candidate.id); continue; }
 								return { kind: "hit", plan, joined: waits.length > 0, producer: record, continuation: record.continuation,
-									waiting: waits.filter(wait => wait.handoff === record).map(wait => wait.interval), settle: (consumed, forward) => {
-									if (!pending) return;
-									pending = false; claim?.(consumed); record.borrowers--;
-									if (oneShot && this.byKey.get(request.key)?.has(record)) {
-										if (consumed && forward && request.role === "producer") {
-											// Private replay moves the one-shot authority; only final consumption destroys it.
-											const next = this.reserve(request.key, request.executablePath, request.ownership, scope);
-											next.binding = record.binding; record.binding = undefined;
-											this.remove(record); this.complete(request.key, next, state.result);
-										} else if (consumed) this.releaseResult(record); else record.state = state;
-										this.wake(request.key);
-									}
-									this.trim();
-								} };
+									waiting: waits.filter(wait => wait.handoff === record).map(wait => wait.interval), settle };
 							}
 							continue;
 						}
@@ -309,6 +305,89 @@ export class ProcessHandoffRegistry<Invocation = never> {
 				}
 			}
 		} finally { for (const record of borrowed) record.borrowers--; this.trim(); }
+	}
+
+	private accepts(record: HandoffRecord, scope: ExecutionScope | undefined, salvage: boolean): boolean {
+		return !record.ownership.wholeClaimed && record.ownership.acceptsScope(record.scope, scope, salvage);
+	}
+
+	private claim(record: HandoffRecord, oneShot: boolean,
+		forwardOwner?: { readonly ownership: ProcessHandoffOwnership; readonly executablePath: string }, scope?: ExecutionScope): ((consumed: boolean, forward?: boolean) => void) | undefined {
+		const state = record.state;
+		if (state.status !== "completed") return;
+		const claim = oneShot ? record.ownership.claimChild() : undefined;
+		if (oneShot && !claim) return;
+		if (oneShot) record.state = { ...state, status: "reserved" };
+		record.borrowers++;
+		if (record.claimState) Atomics.compareExchange(record.claimState, 0, 0, 1);
+		let pending = true;
+		return (consumed, forward) => {
+			if (!pending) return;
+			pending = false; claim?.(consumed); record.borrowers--;
+			if (record.claimState) {
+				if (consumed) Atomics.store(record.claimState, 0, 2); else Atomics.compareExchange(record.claimState, 0, 1, 0);
+			}
+			if (oneShot && this.byKey.get(record.key)?.has(record)) {
+				if (consumed && forward && forwardOwner) {
+					const next = this.reserve(record.key, forwardOwner.executablePath, forwardOwner.ownership, scope);
+					next.binding = record.binding; record.binding = undefined;
+					this.remove(record); this.complete(record.key, next, state.result);
+				} else if (consumed) this.releaseResult(record); else record.state = state;
+				this.wake(record.key);
+			}
+			this.trim();
+		};
+	}
+
+	/** Loan only completed evidence; the original owner remains claimed until the caller can run again. */
+	lend(scope?: ExecutionScope) {
+		const results: ProcessHandoffTransfer["results"][number][] = [], records: HandoffRecord[] = [], settlements: ((consumed: boolean) => void)[] = [];
+		let claims: Int32Array | undefined;
+		const settle = () => settlements.forEach((release, index) => release(!!claims && Atomics.load(claims, index) !== 0));
+		try {
+			for (const record of this.records()) {
+				const state = record.state, result = state.status === "completed" ? state.result : undefined;
+				if (!result || oneShotResult(result.candidate) && !this.accepts(record, scope, true)) continue;
+				const computation = TimelineInterval.serialize(result.computation), continuation = result.continuation;
+				const resumed = continuation && TimelineInterval.serialize(continuation.computation);
+				if (!computation || continuation && !resumed) continue;
+				const release = this.claim(record, oneShotResult(result.candidate));
+				if (!release) continue;
+				settlements.push(release); records.push(record);
+				results.push({ key: record.key, executablePath: record.executablePath, scope: record.scope,
+					candidate: result.candidate, bytes: result.bytes, computation,
+					artifacts: [...new Map(referencedArtifacts(result.candidate).map(reference => [reference.digest, reference])).values()]
+						.map(reference => ({ reference, bytes: new Uint8Array(result.artifacts.read(reference)) })),
+					...(continuation ? { continuation: { image: new Uint8Array(continuation.image), physicalRoot: continuation.physicalRoot, computation: resumed! } } : {}) });
+			}
+			claims = new Int32Array(new SharedArrayBuffer(results.length * 4));
+			return { transfer: { results, claims: claims.buffer as SharedArrayBuffer }, settle, binding: (index: number) => records[index]?.binding,
+				adopted: (index: number, adoption: ExecutionOperationAdoption) => records[index]?.ownership.adopted(adoption) };
+		} catch (error) { settle(); throw error; }
+	}
+
+	/** Revalidate transferred bytes through the same artifact loader; a copy never extends its loan's scope. */
+	async receive(transfer: ProcessHandoffTransfer, scope: ExecutionScope | undefined,
+		adopted: (index: number, adoption: ExecutionOperationAdoption) => void): Promise<() => void> {
+		const callbacks: object[] = [];
+		for (const [index, result] of transfer.results.entries()) {
+			const computation = TimelineInterval.restore(result.computation), resumed = result.continuation && TimelineInterval.restore(result.continuation.computation);
+			if (!computation || result.continuation && !resumed) continue;
+			const images = new Map(result.artifacts.map(({ reference, bytes }) => [reference.digest, Buffer.from(bytes)]));
+			const artifacts = await this.store.loadArtifacts(referencedArtifacts(result.candidate), undefined, {
+				artifacts: images.size, bytes: [...images.values()].reduce((sum, bytes) => sum + bytes.length, 0),
+				read: reference => Buffer.from(images.get(reference.digest) ?? []),
+			});
+			if (!artifacts) continue;
+			const observe = (adoption: ExecutionOperationAdoption) => adopted(index, adoption);
+			const accept = (consumer: ExecutionScope) => sameScope(scope, consumer) && scope?.callID === consumer.callID;
+			callbacks.push(observe, accept);
+			const record = this.reserve(result.key, result.executablePath, new ProcessHandoffOwnership(observe, accept), result.scope);
+			record.claimState = new Int32Array(transfer.claims, index * 4, 1);
+			this.complete(result.key, record, { candidate: result.candidate, artifacts, bytes: result.bytes, computation,
+				...(result.continuation ? { continuation: { ...result.continuation, image: Buffer.from(result.continuation.image), computation: resumed! } } : {}) });
+		}
+		return () => { callbacks.length = 0; this.clearCompleted(); };
 	}
 
 	/** Seal owned bytes before visibility; disk maintenance and persistence cannot revoke a live result. */
@@ -399,4 +478,8 @@ export class ProcessHandoffRegistry<Invocation = never> {
 
 export function sameScope(left: ExecutionScope | undefined, right: ExecutionScope | undefined): boolean {
 	return Boolean(left && right && left.sessionID === right.sessionID && left.turnID === right.turnID);
+}
+
+function oneShotResult(candidate: ProcessProvenanceCertificate): boolean {
+	return candidate.dependencyCertificate.taints.length > 0 || !!candidate.result.continuation;
 }

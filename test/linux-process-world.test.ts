@@ -1409,19 +1409,59 @@ static int takePacket(int length,int peek,int truncated,char expected) {
 			scope: { sessionID: "raw", turnID: "round", callID }, decide: async held => {
 				observations.push(held); await nextTurn(); return { kind: "continue", observeCompletion: duration => { completions.push(duration); } };
 			} }, execute);
-		const code = `console.log(JSON.stringify({pid:process.pid,ppid:process.ppid,argv0:process.argv0,env:process.env.PI_SPEC_HELD_EXEC_ID,
+		const code = `console.log(JSON.stringify({pid:process.pid,ppid:process.ppid,argv0:process.argv0,uid:process.getuid(),gid:process.getgid(),env:process.env.PI_SPEC_HELD_EXEC_ID,
 				raw:require('fs').readFileSync('/proc/self/environ').includes('PI_SPEC_HELD_EXEC_ID=caller-owned')}));console.error('stderr');`;
 		const credentials = { uid: process.getuid!(), gid: process.getgid!() }, launches = [[], ["uid"], ["gid"], ["uid", "gid"]] as const;
-		await Promise.all(launches.map(fields => observe(`credentials:${fields}`, async () => {
-			const callID = `credentials:${fields}`;
-			await nextTurn(); const child = childProcess.spawn(process.execPath, ["-e", code], { ...Object.fromEntries(fields.map(field => [field, credentials[field]])), argv0: callID, env: { PI_SPEC_HELD_EXEC_ID: "caller-owned" } });
-			expect(child).toBeInstanceOf(actual.ChildProcess); const result = await collect(child);
-			expect(JSON.parse(result.stdout)).toEqual({ pid: child.pid, ppid: process.pid, argv0: callID, env: "caller-owned", raw: true });
-			expect(result).toMatchObject({ code: 0, signal: null, stderr: "stderr\n", error: undefined });
-		})));
+		await writeFile(path.join(root, "no-permission"), "x", { mode: 0o600 });
+		await using synchronous = disposable(new LinuxProcessReuseBackend({ storeRoot: path.join(root, "sync-store"), heldExecBinary: binary }));
+		const syncScope = { sessionID: "raw", turnID: "synchronous" }, learned: ProcessExecutionBinding[] = [];
+		const observeSync = <Value>(execute: () => Value) => synchronous.observeBindings(syncScope,
+			() => synchronous.observeNative(root, syncScope, undefined, async () => execute()), bindings => { learned.push(...bindings); }, true);
+		for (const sync of [false, true]) await Promise.all(launches.map(async fields => {
+			const callID = `credentials:${fields}`, options = { ...Object.fromEntries(fields.map(field => [field, credentials[field]])), argv0: callID, env: { PI_SPEC_HELD_EXEC_ID: "caller-owned" } };
+			const result = sync ? await observeSync(() => { const child = childProcess.spawnSync(process.execPath, ["-e", code], { ...options, encoding: "utf8" }); return { ...child, code: child.status }; }) :
+				await observe(callID, async () => { await nextTurn(); const child = childProcess.spawn(process.execPath, ["-e", code], options);
+					expect(child).toBeInstanceOf(actual.ChildProcess); return { ...await collect(child), pid: child.pid }; });
+			expect(JSON.parse(result.stdout)).toEqual({ ...credentials, pid: result.pid, ppid: process.pid, argv0: callID, env: "caller-owned", raw: true });
+			expect({ ...result, error: result.error }).toMatchObject({ code: 0, signal: null, stderr: "stderr\n", error: undefined });
+		}));
 		expect(observations.map(held => held.scope!.callID).sort()).toEqual(launches.map(fields => `credentials:${fields}`).sort());
 		expect(new Set(observations.map(held => held.id.split(":")[0])).size).toBe(4);
-		await writeFile(path.join(root, "no-permission"), "x", { mode: 0o600 });
+		const options = { cwd: root, encoding: "utf8" as const, stdio: ["pipe", "pipe", "pipe"] as ["pipe", "pipe", "pipe"] };
+		const outcome = (execute: () => unknown) => {
+			let value: unknown; try { value = execute(); } catch (error) { value = error; }
+			if (typeof value === "string" || Buffer.isBuffer(value)) return value;
+			const result = value as childProcess.SpawnSyncReturns<string> & NodeJS.ErrnoException;
+			return { status: result.status, signal: result.signal, code: (result.error as NodeJS.ErrnoException | undefined)?.code ?? result.code,
+				stdout: result.stdout, stderr: result.stderr, syscall: (result.error as NodeJS.ErrnoException | undefined)?.syscall ?? result.syscall };
+		};
+		const syncCalls = ["printf out; printf err >&2; exit 17", "cat", "kill -TERM $$", "sleep 1", "printf '%4096s' ''; exec /bin/sleep 1"].flatMap((command, index) => {
+			const configured = { ...options, ...(index === 1 ? { input: "stdin\n" } : index === 3 ? { timeout: 10 } : index === 4 ? { maxBuffer: 32 } : {}) };
+			return [() => childProcess.spawnSync("/bin/sh", ["-c", command], configured), () => execFileSync("/bin/sh", ["-c", command], configured),
+				() => childProcess.execSync(command, configured)];
+		});
+		for (const name of ["missing", "no-permission"]) syncCalls.push(() => childProcess.spawnSync(path.join(root, name), [], options), () => execFileSync(path.join(root, name), [], options));
+		const expected = syncCalls.map(outcome), bindingBefore = Reflect.get(process, "binding")("spawn_sync").spawn;
+		await observeSync(() => {
+			let interleaved = false; const timer = setTimeout(() => { interleaved = true; }, 0); queueMicrotask(() => { interleaved = true; });
+			try { for (const [index, call] of syncCalls.entries()) { expect(outcome(call), `synchronous case ${index}`).toEqual(expected[index]); expect(interleaved).toBe(false); } }
+			finally { clearTimeout(timer); }
+		});
+		expect(learned.length).toBeGreaterThan(0); expect(Reflect.get(process, "binding")("spawn_sync").spawn).toBe(bindingBefore);
+		learned.length = 0;
+		await observeSync(async () => {
+			expect(execFileSync("/bin/echo", ["before"], options)).toBe("before\n");
+			expect((await collect(childProcess.spawn("/bin/echo", ["middle"], options))).stdout).toBe("middle\n");
+			expect(execFileSync("/bin/echo", ["after"], options)).toBe("after\n");
+		});
+		const registry = Reflect.get(synchronous, "handoffs") as ProcessHandoffRegistry<{ args: readonly string[] }>;
+		expect(learned.map(binding => registry.resolveBinding(binding, syncScope)?.args)).toEqual([["before"], ["middle"], ["after"]]);
+		await Reflect.get(Reflect.get(synchronous, "synchronous"), "worker").terminate();
+		const requests = synchronous.actorMetrics().requests;
+		for (const restarted of [false, true]) {
+			expect(await observeSync(() => execFileSync("/bin/echo", ["alive"], options))).toBe("alive\n");
+			expect(synchronous.actorMetrics().requests > requests).toBe(restarted);
+		}
 		for (const [name, expected] of [["missing", "ENOENT"], ["no-permission", "EACCES"]]) await observe(name!, async () => {
 			const command = path.join(root, name!), child = childProcess.spawn(command);
 			expect(await collect(child)).toMatchObject({ error: { code: expected, syscall: `spawn ${command}` } }); expect(child.pid).toBeUndefined();

@@ -26,7 +26,7 @@ import { diffWorkspaceStructures, ExecutionPathProjection, hydrateWorkspaceFileE
 	type WorkspaceTransactionDiff, type WorkspaceTreeEntry } from "./process-observation.ts";
 import { definedProcessEnvironment, type ProcessRouteSnapshot, type ProcessExecutionRequest,
 	type ProcessExecutor } from "./process-execution.ts";
-import { EffectCommitFailure, isPoisonedEffectCommit } from "./effect-transaction.ts";
+import { EffectCommitFailure, effectCommitFailure, isPoisonedEffectCommit } from "./effect-transaction.ts";
 import { execHostText as execText, resolveHostExecutable } from "./executable-path.ts";
 import { assertNoSymlinkPath, cachedCapture, captureFilesystemEntry, captureStableFile, hashExecutableFile, mapFilesystem, rememberCapture, sameFilesystemIdentity, sharedWalk, walkFilesystemPath } from "./filesystem-evidence.ts";
 import { captureHeldDescriptorInputs, inspectHeldExecProcess, LinuxHeldExecBoundary, listenUnixSocket, writeProcessChannel, resolveLinuxExecHelper, type HeldExecDecision,
@@ -41,6 +41,7 @@ import type { WorkspaceTransactionOwnership } from "./workspace-transaction.ts";
 import type { ToolProcessInvocation } from "./tool-settlement.ts";
 import type { ResourceValidation } from "./settlement.ts";
 import { ProcessHandoffOwnership, ProcessHandoffRegistry, sameScope, type ProcessContinuation, type ProcessExecutionBinding, type ProcessHandoff, type ProcessHandoffAcquisition } from "./process-handoff.ts";
+import { SynchronousProcessObserver, serializeNativeDependency, restoreNativeDependency, type SynchronousProcessRequest, type SynchronousProcessResult } from "./linux-process-sync.ts";
 import { WorkspaceSandboxService, readSandboxDirectoryState, restoreModifiedTimes, sameSandboxState, useModifiedTimesHelper, type SandboxDirectoryChange, type SandboxFileChange,
 	type SandboxWorkspaceChange, type SandboxWorkspaceContext } from "./workspace-sandbox.ts";
 import { containsFilesystemPath as pathContains, relativeFilesystemPath, slash } from "./path-utils.ts";
@@ -155,6 +156,7 @@ type BoundProcessInvocation = ProcessArguments & {
 	readonly sourceRoot: string; readonly executable: string;
 	readonly outputRoute: OutputRoute; readonly producer?: ProcessProducerProof;
 };
+export type NativeProcessInvocation = BoundProcessInvocation | { readonly trackingOnly: true; readonly sourceRoot: string };
 
 interface BufferedOutput { readonly fd: 1 | 2; readonly data: Buffer; }
 
@@ -232,12 +234,15 @@ interface TopLevelCapture {
 interface SpawnOutcome { readonly code: number | null; readonly signal: NodeJS.Signals | null; readonly output: readonly BufferedOutput[]; }
 
 type ReadyProcessPlan = Exclude<ProcessReusePlan, { kind: "miss" }>;
+interface NativeObservation {
+	readonly scope: ExecutionScope; sequence: number; closed: boolean; readonly learn: boolean; pending: number;
+	readonly learned: Map<number, number>; readonly inputs?: (path: string) => Iterable<object>;
+	readonly bindings: Map<number, ProcessExecutionBinding>; readonly computations: TimelineDependency[]; readonly heldClock: ActorHeldClock;
+}
 
 /** Linux-only process substrate. Unavailable dependencies remove the route instead of weakening it. */
 export class LinuxProcessReuseBackend {
-	private readonly observations = new AsyncLocalStorage<{ scope: ExecutionScope; sequence: number; closed: boolean; learn: boolean; pending: number; learned: Map<number, number>;
-		inputs?: (path: string) => Iterable<object>; bindings: Map<number, ProcessExecutionBinding>; computations: TimelineDependency[];
-		heldClock: ActorHeldClock }>();
+	private readonly observations = new AsyncLocalStorage<NativeObservation>();
 
 	/** Keep actual completed launches and acknowledged adoptions in their enclosing native call's order. */
 	async observeBindings<Value>(scope: ExecutionScope, execute: () => Promise<Value>,
@@ -262,8 +267,9 @@ export class LinuxProcessReuseBackend {
 	private platformFingerprint?: Promise<Sha256Digest>;
 	private heldExec?: { readonly controller: AbortController; readonly ready: Promise<LinuxHeldExecBoundary>; status: ProcessRouteSnapshot };
 	private nativeRetirement?: Promise<void>;
+	private synchronous?: SynchronousProcessObserver;
 	private disposed = false;
-	private readonly handoffs: ProcessHandoffRegistry<BoundProcessInvocation | { readonly trackingOnly: true; readonly sourceRoot: string }>;
+	private readonly handoffs: ProcessHandoffRegistry<NativeProcessInvocation>;
 	private readonly actorExecutableDirectories = new Set<string>();
 	/** Executable entries of a PATH directory, by the directory's identity and the exclusions (see createProcessInterposition). */
 	private readonly executableEntries = new BoundedRecencyMap<string, readonly (readonly [name: string, file: string])[]>(64);
@@ -420,15 +426,89 @@ export class LinuxProcessReuseBackend {
 				if (ready.status === "completed") boundary = ready.value;
 			}
 		} catch { /* Optional native observation leaves the actual callback authoritative. */ }
-		return boundary ? boundary.observe(this.nativeObservation(path.resolve(sourceRoot), owner, signal), execute) : execute();
+		const options = this.nativeObservation(path.resolve(sourceRoot), owner, signal);
+		return boundary ? boundary.observe(options, execute, (gate, skipRoot) => this.attachSynchronous({ ...options, gate, skipRoot })) : execute();
+	}
+
+	private attachSynchronous(options: Pick<SynchronousProcessRequest, "gate" | "scope" | "sourceRoot" | "descriptors" | "skipRoot">) {
+		const startedAt = performance.now(), observation = this.observations.getStore(), loan = this.handoffs.lend(options.scope);
+		let observer: SynchronousProcessObserver | undefined;
+		const overhead = (start: number) => { const computation = new TimelineInterval(start, performance.now());
+			observation?.computations.push({ computation, overhead: true, shared: [computation] }); };
+		try {
+			observer = this.synchronous ??= new SynchronousProcessObserver(this.options);
+			const attachment = observer.attach({ gate: options.gate, sourceRoot: options.sourceRoot, scope: options.scope,
+				descriptors: options.descriptors, skipRoot: options.skipRoot, learn: !!observation?.learn, handoffs: loan.transfer });
+			overhead(startedAt);
+			return { pid: attachment.pid, finish: () => {
+				const finishing = performance.now();
+				try {
+					const result = attachment.finish(), sequence = observation?.sequence ?? 0;
+					if (observation) observation.sequence += result.metrics.requests;
+					for (const [key, value] of Object.entries(result.metrics)) {
+						if (typeof value === "number") this.addActor(key as CountedReuseMetric, value);
+						else if (value) this.setActorError(value);
+					}
+					for (const { index, adoption } of result.adoptions) {
+						const computation = adoption.computation && restoreNativeDependency(adoption.computation);
+						const binding = loan.binding(index);
+						if (binding && observation && !observation.closed && observation.bindings.size < this.store.limits.maxCertificates)
+							observation.bindings.set(sequence + adoption.sequence, binding);
+						try { loan.adopted(index, { ...adoption, computation }); } catch { /* Completed handoff feedback is advisory. */ }
+					}
+					if (observation && !observation.closed) {
+						for (const dependency of result.computations) { const restored = restoreNativeDependency(dependency); if (restored) observation.computations.push(restored); }
+						for (const { invocation, executionMs, key, sequence: order } of result.bindings) {
+							if (!options.scope || nativeLearningSlot(observation, executionMs, key, this.store.limits.maxCertificates) === false) continue;
+							const binding = this.handoffs.observe(key as Sha256Digest, "trackingOnly" in invocation ? options.sourceRoot : invocation.executable, options.scope, invocation, executionMs);
+							if (binding) recordNativeLearning(observation, binding, sequence + order, executionMs, this.store.limits.maxCertificates);
+						}
+					}
+				} catch (error) {
+					void observer!.close(); if (this.synchronous === observer) this.synchronous = undefined;
+					if (new Int32Array(loan.transfer.claims).some(value => value !== 0) || error && typeof error === "object" && "poisoned" in error && error.poisoned)
+						throw effectCommitFailure(new Error("synchronous native handoff failed", { cause: error }), "poisoned");
+				} finally { loan.settle(); overhead(finishing); }
+			} };
+		} catch (error) {
+			loan.settle(); overhead(startedAt); void observer?.close(); if (this.synchronous === observer) this.synchronous = undefined; throw error;
+		}
+	}
+
+	/** Worker endpoint; the normal policy, native transport and observation admission remain authoritative. */
+	async observeSynchronous(request: SynchronousProcessRequest, attached: (pid?: number) => void, finished: Promise<void>): Promise<SynchronousProcessResult> {
+		const before = this.actorMetrics(), adoptions: SynchronousProcessResult["adoptions"][number][] = [];
+		const release = await this.handoffs.receive(request.handoffs, request.scope, (index, adoption) => {
+			const computation = adoption.computation && serializeNativeDependency(adoption.computation); adoptions.push({ index, adoption: { ...adoption, computation } });
+		});
+		let bindings: SynchronousProcessResult["bindings"] = [], computations: SynchronousProcessResult["computations"] = [];
+		let observation: NativeObservation | undefined;
+		try {
+			const execute = async () => {
+				observation = this.observations.getStore();
+				const boundary = await this.heldBoundary(), options = this.nativeObservation(request.sourceRoot, request.scope);
+				const attachment = boundary.attach({ ...options, descriptors: request.descriptors, skipRoot: request.skipRoot }, request.gate);
+				attached(attachment.pid); await finished; await attachment.completion;
+			};
+			if (request.scope) await this.observeBindings(request.scope, execute, (_observed, dependencies) => {
+				bindings = [...observation!.bindings].flatMap(([sequence, binding]) => { const invocation = this.handoffs.resolveBinding(binding, request.scope);
+					return invocation ? [{ sequence, key: binding.key, executionMs: binding.executionMs, invocation }] : []; });
+				computations = dependencies.flatMap(dependency => { const serialized = serializeNativeDependency(dependency); return serialized ? [serialized] : []; });
+			}, request.learn); else await execute();
+			const metrics = { ...this.actorMetrics() };
+			for (const key of Object.keys(metrics) as (keyof WorldReuseMetrics)[]) if (key !== "lastError") metrics[key] -= before[key];
+			return { bindings, computations, adoptions, metrics };
+		} finally { release(); }
 	}
 
 	resetNativeObservation(): Promise<void> {
 		if (this.nativeRetirement) return this.nativeRetirement;
 		const heldExec = this.heldExec;
 		this.heldExec = undefined;
+		const synchronous = this.synchronous; this.synchronous = undefined;
 		heldExec?.controller.abort(new Error("held-exec initialization retired"));
 		return this.nativeRetirement = Promise.resolve(heldExec?.ready).then(boundary => boundary?.close(), () => undefined)
+			.then(() => synchronous?.close())
 			.finally(() => { this.nativeRetirement = undefined; });
 	}
 
@@ -1009,10 +1089,7 @@ export class LinuxProcessReuseBackend {
 			// and false refuses admission. Existing adoptions keep their bindings and computation receipts.
 			const slot = (durationMs: number, key?: Sha256Digest): number | false | undefined => {
 				if (!learning || observation!.closed || process.signal?.aborted || !snapshot.outputRoute || !Number.isFinite(durationMs)) return false;
-				const entries = [...observation!.learned], previous = key && entries.find(([order]) => observation!.bindings.get(order)?.key === key);
-				const victim = previous || (entries.length >= LEARNED_LAUNCHES || observation!.bindings.size >= this.store.limits.maxCertificates
-					? entries.reduce<(typeof entries)[number] | undefined>((lowest, entry) => !lowest || entry[1] < lowest[1] ? entry : lowest, undefined) : undefined);
-				return victim ? durationMs > victim[1] ? victim[0] : false : observation!.bindings.size < this.store.limits.maxCertificates ? undefined : false;
+				return nativeLearningSlot(observation!, durationMs, key, this.store.limits.maxCertificates);
 			};
 			const observe = (prototype: ExecPrototype, durationMs: number) => {
 				const weakKey = processWeakKey(prototype), replace = slot(durationMs, weakKey);
@@ -1024,10 +1101,7 @@ export class LinuxProcessReuseBackend {
 					...(snapshot.context.descriptorTypes[0] === "closed" ? { closeStdin: true } : {}),
 					...(resources ? { resources } : {}),
 				}, durationMs);
-				if (binding) {
-					if (replace !== undefined) { observation!.bindings.delete(replace); observation!.learned.delete(replace); }
-					observation!.bindings.set(order, binding); observation!.learned.set(order, durationMs);
-				}
+				if (binding) recordNativeLearning(observation!, binding, order, durationMs, this.store.limits.maxCertificates);
 			};
 			if (!available || resources && process.descriptors!.some(({ owned }) => !owned)) {
 				// Pin the executable's object now, digest it only after admission. Its original identity must still hold:
@@ -1854,6 +1928,19 @@ function recordPrototypePreparation(session: ActiveSession, computation: Timelin
 	if (!computation) return;
 	TimelineInterval.group(computation, session);
 	recordProcessDependency(session, { computation, owned: true, shared: [computation] }, pid);
+}
+
+function nativeLearningSlot(observation: NativeObservation, duration: number, key: string | undefined, limit: number): number | false | undefined {
+	const entries = [...observation.learned], previous = key && entries.find(([order]) => observation.bindings.get(order)?.key === key);
+	const victim = previous || (entries.length >= LEARNED_LAUNCHES || observation.bindings.size >= limit
+		? entries.reduce<(typeof entries)[number] | undefined>((lowest, entry) => !lowest || entry[1] < lowest[1] ? entry : lowest, undefined) : undefined);
+	return victim ? duration > victim[1] ? victim[0] : false : observation.bindings.size < limit ? undefined : false;
+}
+function recordNativeLearning(observation: NativeObservation, binding: ProcessExecutionBinding, order: number, duration: number, limit: number): void {
+	const replace = nativeLearningSlot(observation, duration, binding.key, limit);
+	if (replace === false) return;
+	if (replace !== undefined) { observation.bindings.delete(replace); observation.learned.delete(replace); }
+	observation.bindings.set(order, binding); observation.learned.set(order, duration);
 }
 
 /** Optimistic execution boundaries: control wins over sibling overlap; original producers keep their own clocks. */

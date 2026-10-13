@@ -22,9 +22,11 @@ const MAX_REQUEST_BYTES = 4 * 1024 * 1024 + 32768;
 const MAX_OUTPUT_EVENTS = 65_536;
 const MAX_OUTPUT_BYTES = 512 * 1024 * 1024;
 type NativeSpawn = (this: ChildProcess, options: object) => number;
+type NativeSyncSpawn = (this: unknown, options: object) => unknown;
 const startupScope = new AsyncLocalStorage<{
 	readonly skipRoot?: boolean;
 	readonly launch: (child: ChildProcess, start: () => number) => number;
+	readonly synchronous?: (start: () => unknown) => unknown;
 }>();
 const nativeRequire = createRequire(import.meta.url);
 const startupPrototype = nativeRequire("node:child_process").ChildProcess.prototype as { spawn: NativeSpawn };
@@ -40,7 +42,22 @@ function enterStartup(): void {
 		return scope ? scope.launch(this, start) : start();
 	};
 	startupPrototype.spawn = intercept;
-	restoreStartup = () => { if (!--startupUsers && startupPrototype.spawn === intercept) startupPrototype.spawn = original; };
+	// All three public synchronous APIs call this binding, including references imported before observation.
+	let synchronous: { spawn: NativeSyncSpawn } | undefined, originalSync: NativeSyncSpawn | undefined;
+	const interceptSync: NativeSyncSpawn = function(options) {
+		const start = () => Reflect.apply(originalSync!, this, [options]);
+		const scope = startupScope.getStore();
+		return scope?.synchronous ? scope.synchronous(start) : start();
+	};
+	try {
+		synchronous = (process as unknown as { binding(name: string): { spawn: NativeSyncSpawn } }).binding("spawn_sync");
+		originalSync = synchronous.spawn; synchronous.spawn = interceptSync;
+	} catch { /* An unavailable internal binding leaves its native route intact. */ }
+	restoreStartup = () => {
+		if (--startupUsers) return;
+		if (startupPrototype.spawn === intercept) startupPrototype.spawn = original;
+		if (synchronous?.spawn === interceptSync) synchronous.spawn = originalSync!;
+	};
 }
 
 export interface HeldExecProcess {
@@ -241,15 +258,20 @@ interface ActiveExecution {
 	readonly pending: Set<Promise<void>>;
 	readonly completion: Promise<void>;
 	readonly sockets: Set<net.Socket>;
-	readonly child: ChildProcess;
 	readonly observer: ChildProcess;
 	readonly retire: () => void;
 	failure?: Error;
 }
 
-interface HeldObservation extends Pick<ActiveExecution, "sourceRoot" | "scope" | "signal" | "decide"> {
+export interface HeldObservation extends Pick<ActiveExecution, "sourceRoot" | "scope" | "signal" | "decide"> {
 	readonly descriptors?: boolean | "inspect";
 	readonly skipRoot?: boolean;
+}
+
+export interface HeldExecAttachment {
+	readonly pid?: number;
+	readonly completion: Promise<void>;
+	readonly retire: () => void;
 }
 
 interface WireRequest {
@@ -310,70 +332,86 @@ export class LinuxHeldExecBoundary {
 	}
 
 	/** The callback owns admission; each actual native child owns a distinct ticket and observer. */
-	async observe<Value>(options: HeldObservation, execute: () => Promise<Value>): Promise<Value> {
+	async observe<Value>(options: HeldObservation, execute: () => Promise<Value>,
+		synchronous?: (gate: number, skipRoot?: boolean) => { readonly pid?: number; readonly finish: () => void }): Promise<Value> {
 		if (this.closing || options.signal?.aborted) return execute();
-		const controller = new AbortController(), launches = new Set<ActiveExecution>();
+		const controller = new AbortController(), launches = new Set<{ readonly child: ChildProcess; readonly attachment: HeldExecAttachment }>();
 		const signal = AbortSignal.any([controller.signal, ...(options.signal ? [options.signal] : [])]);
-		const snapshot = { ...options, scope: snapshotExecutionScope(options.scope), signal, decide: startupScope.exit(() => AsyncResource.bind(options.decide)) };
+		const snapshot = { ...options, scope: snapshotExecutionScope(options.scope), signal };
 		let finished!: () => void, closed = false;
 		const call = { controller, completion: new Promise<void>(resolve => { finished = resolve; }) };
 		this.calls.add(call); enterStartup();
 		try {
-			return await startupScope.run({ skipRoot: options.skipRoot, launch: (child, start) =>
-				closed || signal.aborted ? start()
-					: this.launch(child, { ...snapshot, skipRoot: startupScope.getStore()?.skipRoot }, launches, start) }, execute);
+			const available = () => !closed && !signal.aborted;
+			return await startupScope.run({ skipRoot: options.skipRoot,
+				...(synchronous ? { synchronous: (start: () => unknown) => available() ? this.start(gate => synchronous(gate, startupScope.getStore()?.skipRoot), start) : start() } : {}),
+				launch: (child, start) => available() ? this.start(gate => {
+					const attachment = this.attach({ ...snapshot, skipRoot: startupScope.getStore()?.skipRoot }, gate);
+					launches.add({ child, attachment }); return { pid: attachment.pid, finish: () => { if (!child.pid) attachment.retire(); } };
+				}, start) : start() }, execute);
 		} finally {
 			closed = true;
-			for (const launch of launches) if (!launch.child.pid || launch.child.exitCode === null && launch.child.signalCode === null) launch.retire();
-			await Promise.allSettled([...launches].map(launch => launch.completion));
+			for (const { child, attachment } of launches) if (!child.pid || child.exitCode === null && child.signalCode === null) attachment.retire();
+			const settled = await Promise.allSettled([...launches].map(launch => launch.attachment.completion));
 			this.calls.delete(call); finished(); restoreStartup!();
-			for (const launch of launches) if (launch.failure) throw launch.failure;
+			for (const result of settled) if (result.status === "rejected") throw result.reason;
 		}
 	}
 
-	private launch(child: ChildProcess, options: HeldObservation, launches: Set<ActiveExecution>, start: () => number): number {
-		let observer: ChildProcess | undefined, active: ActiveExecution | undefined;
+	private start<Value>(attach: (gate: number) => { readonly pid?: number; readonly finish: () => void }, start: () => Value): Value {
+		let attachment: ReturnType<typeof attach> | undefined;
 		let gate = -1;
-		const execution = randomBytes(24).toString("hex"), controller = new AbortController();
 		try {
 			gate = this.startup(0);
 			if (!Number.isInteger(gate) || gate < 0) throw new Error("native startup gate unavailable");
-			observer = startupScope.exit(() => spawn(this.observerBinary, ["--attach"], { stdio: ["pipe", "pipe", "ignore", gate], env: {
-				PI_SPEC_HELD_EXEC_SOCKET: this.socketPath, PI_SPEC_HELD_EXEC_TOKEN: this.token, PI_SPEC_HELD_EXEC_ID: execution,
-				...(options.descriptors ? { PI_SPEC_HELD_EXEC_DESCRIPTORS: options.descriptors === "inspect" ? "2" : "1" } : {}),
-				...(options.skipRoot ? { PI_SPEC_HELD_EXEC_ROOT: "skip" } : {}),
-			} }));
-			observer.on("error", () => {}); observer.stdin?.on("error", () => {}); observer.unref();
-			const done = new Promise<void>(resolve => {
-				observer!.once("close", () => resolve());
-				observer!.stdout!.once("data", data => { if (data.toString() === "R") { observer!.stdout!.destroy(); resolve(); } });
-			});
-			const signal = AbortSignal.any([controller.signal, ...(options.signal ? [options.signal] : [])]);
-			const retire = () => {
-				if (!controller.signal.aborted) controller.abort(new Error("native observation retired"));
-				observer?.stdin?.end(); for (const socket of active?.sockets ?? []) socket.destroy();
-			};
-			active = { ...options, signal, child, observer, retire, sequence: 0,
-				barrier: options.descriptors === "inspect" ? "inspection" : options.descriptors ? "descriptors" : "none",
-				pending: new Set(), sockets: new Set(), completion: done.then(async () => {
-					await Promise.allSettled(active!.pending); signal.removeEventListener("abort", retire); this.active.delete(execution);
-				}),
-			};
-			launches.add(active); this.active.set(execution, active); signal.addEventListener("abort", retire, { once: true });
-			if (!observer.pid || this.startup(observer.pid) !== 0) { retire(); this.startup(-1); }
+			attachment = attach(gate);
+			if (!attachment.pid || this.startup(attachment.pid) !== 0) throw new Error("native observer unavailable");
 		} catch {
-			observer?.stdin?.end(); if (gate >= 0) this.startup(-1);
+			if (gate >= 0) this.startup(-1);
+			try { attachment?.finish(); } catch { /* No authoritative child was started. */ }
+			attachment = undefined;
 		}
 		// Never catch the authoritative spawn: its synchronous failure must not rerun it.
-		try { return start(); } finally { if (gate >= 0) this.startup(-1); }
+		try { return start(); } finally { if (gate >= 0) this.startup(-1); attachment?.finish(); }
+	}
+
+	/** The gate belongs to the launching thread; an observer may serve it from another worker. */
+	attach(options: HeldObservation, gate: number): HeldExecAttachment {
+		if (this.closing) throw new Error("native observation is closing");
+		const execution = randomBytes(24).toString("hex"), controller = new AbortController();
+		const observer = startupScope.exit(() => spawn(this.observerBinary, ["--attach"], { stdio: ["pipe", "pipe", "ignore", gate], env: {
+			PI_SPEC_HELD_EXEC_SOCKET: this.socketPath, PI_SPEC_HELD_EXEC_TOKEN: this.token, PI_SPEC_HELD_EXEC_ID: execution,
+			...(options.descriptors ? { PI_SPEC_HELD_EXEC_DESCRIPTORS: options.descriptors === "inspect" ? "2" : "1" } : {}),
+			...(options.skipRoot ? { PI_SPEC_HELD_EXEC_ROOT: "skip" } : {}),
+		} }));
+		observer.on("error", () => {}); observer.stdin?.on("error", () => {}); observer.unref();
+		const done = new Promise<void>(resolve => {
+			observer.once("close", () => resolve());
+			observer.stdout!.once("data", data => { if (data.toString() === "R") { observer.stdout!.destroy(); resolve(); } });
+		});
+		const signal = AbortSignal.any([controller.signal, ...(options.signal ? [options.signal] : [])]);
+		const retire = () => {
+			if (!controller.signal.aborted) controller.abort(new Error("native observation retired"));
+			observer.stdin?.end(); for (const socket of active.sockets) socket.destroy();
+		};
+		const active: ActiveExecution = { ...options, signal, observer, retire, sequence: 0, decide: startupScope.exit(() => AsyncResource.bind(options.decide)),
+			barrier: options.descriptors === "inspect" ? "inspection" : options.descriptors ? "descriptors" : "none",
+			pending: new Set(), sockets: new Set(), completion: done.then(async () => {
+				await Promise.allSettled(active.pending); signal.removeEventListener("abort", retire); this.active.delete(execution);
+				if (active.failure) throw active.failure;
+			}),
+		};
+		active.completion.catch(() => undefined); this.active.set(execution, active); signal.addEventListener("abort", retire, { once: true });
+		return { pid: observer.pid, completion: active.completion, retire };
 	}
 
 	close(): Promise<void> {
 		return this.closing ??= Promise.resolve().then(async () => {
 			const stopped = new Promise<void>((resolve) => this.server.close(() => resolve()));
 			for (const call of this.calls) call.controller.abort(new Error("held-exec boundary disposed"));
+			const active = [...this.active.values()]; for (const execution of active) execution.retire();
 			for (const socket of this.sockets) socket.destroy();
-			await Promise.allSettled([stopped, ...[...this.calls].map(call => call.completion)]);
+			await Promise.allSettled([stopped, ...[...this.calls].map(call => call.completion), ...active.map(execution => execution.completion)]);
 			await rm(this.socketPath, { force: true }).catch(() => undefined);
 		});
 	}

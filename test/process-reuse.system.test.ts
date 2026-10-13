@@ -254,10 +254,38 @@ test.each(["existing", "new"])("selects a %s ready producer and retains its comp
 	f.registry.configure(8, 64 * 1024); await f.publish(await f.reserve(), "bounded"); await f.consume(f.actor(), "bounded");
 });
 
-test.each(["released", "consumed", "cancelled", "raced", "whole-released", "whole-consumed", "forwarded", "forwarded-stale", "forwarded-whole", "producer-consumed", "producer-released"])("settles a %s one-shot claim without losing another Actor's result", async outcome => {
+test.each(["released", "consumed", "cancelled", "raced", "whole-released", "whole-consumed", "forwarded", "forwarded-stale", "forwarded-whole", "producer-consumed", "producer-released",
+	"loan-released", "loan-consumed", "loan-lost", "loan-corrupt", "loan-stale", "loan-foreign"])("settles a %s one-shot claim without losing another Actor's result", async outcome => {
 	const f = await fixture({ gcIntervalMs: 0, orphanGraceMs: 0, maxBytes: 128 * 1024 }), ownership = new ProcessHandoffOwnership(), releaseWhole = hold();
 	const work = await f.reserve(ownership), certificate = await f.publish(work, "computed result", 1, true, new TimelineInterval(0, 10));
 	const binding = f.registry.bind(f.common.key, work, "learned invocation"), forward = outcome.startsWith("forwarded"), destination = new ProcessHandoffOwnership();
+	if (outcome.startsWith("loan-")) {
+		const scope = outcome === "loan-foreign" ? { ...f.common.scope, sessionID: "foreign" } : f.common.scope;
+		const loan = f.registry.lend(scope), transfer = structuredClone(loan.transfer);
+		expect(loan.binding(0)).toBe(outcome === "loan-foreign" ? undefined : binding);
+		const receiver = own(new ProcessHandoffRegistry<string>(f.store, 64 * 1024));
+		if (outcome !== "loan-foreign") await expect(ownership.commit(async () => {})).rejects.toMatchObject({ disposition: "recoverable" });
+		if (outcome === "loan-corrupt") transfer.results[0]!.artifacts[0]!.bytes.fill(0);
+		if (outcome === "loan-stale") await writeFile(f.input, "changed input");
+		const receiving = receiver.receive(transfer, scope, () => { throw new Error("a lookup cannot issue adoption feedback"); });
+		if (outcome === "loan-corrupt") await expect(receiving).rejects.toThrow("integrity check failed");
+		const release = outcome === "loan-corrupt" ? () => {} : await receiving;
+		expect(receiver.bindings(scope)).toEqual([]);
+		try {
+			const result = await receiver.acquire({ ...f.common, scope, role: "actor" }), accepted = ["loan-released", "loan-consumed", "loan-lost"].includes(outcome);
+			expect(result.kind).toBe(accepted ? "hit" : "miss");
+			if (result.kind === "hit") {
+				expect(f.output(result.plan)).toBe("computed result"); expect(result.producer?.computation).toBeDefined();
+				if (outcome !== "loan-lost") result.settle?.(outcome === "loan-consumed");
+			}
+			receiver.dispose(); loan.settle(); loan.settle(); // A vanished receiver cannot return its held claim as unused.
+			const used = outcome === "loan-consumed" || outcome === "loan-lost";
+			if (used) await expect(ownership.commit(async () => {})).rejects.toThrow("partially consumed");
+			await writeFile(f.input, "current input"); await f.consume(f.actor(), used ? undefined : "computed result");
+			expect(f.registry.resolveBinding(binding!, f.common.scope)).toBe("learned invocation");
+		} finally { release(); loan.settle(); }
+		return;
+	}
 	const checked = deferred(), racing = hold(), controller = new AbortController(), consumed = outcome.endsWith("consumed");
 	cleanup.push(() => controller.abort()); let settled = false;
 	const next = () => track(f.actor({ signal: controller.signal, lookup: async (...args) => {

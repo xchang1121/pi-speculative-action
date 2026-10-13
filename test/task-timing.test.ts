@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { TaskTimeline, TimelineInterval, toolSpeedup, normalizeTimelineComputation } from "../src/task-timing.ts";
+import { restoreNativeDependency, serializeNativeDependency } from "../src/linux-process-sync.ts";
 
 describe("consumed calculation and time hidden before Actor issue", () => {
 	it("records execution boundaries and diagnoses the remaining control wait", async () => {
@@ -128,6 +129,14 @@ describe("persisted computation evidence", () => {
 		expect(timing).toEqual({ toolComputeMs: 100, hiddenComputeMs: offset === undefined || offset > 0 ? 0 : offset < 0 ? 100 : 50,
 			reused: true, ...(offset === undefined ? { hiddenComputeIncomplete: true } : { adoptionWaitMs: offset === 0 ? 50 : 100 }) });
 		expect(TimelineInterval.serialize(foreign)?.nodes[0]?.timeOrigin).toBe(offset === undefined ? undefined : performance.timeOrigin + offset);
+		const prepared = new TimelineInterval(2000, 2100), dependency = serializeNativeDependency({ computation: prepared, shared: [prepared], reused: true })!;
+		const translated = (value: typeof graph) => ({ ...value, nodes: value.nodes.map(node => ({ ...node, clock: "other-worker",
+			startedAt: node.startedAt - (offset ?? 0), completedAt: node.completedAt - (offset ?? 0), timeOrigin: offset === undefined ? undefined : performance.timeOrigin + offset })) });
+		const restored = restoreNativeDependency({ ...dependency, computation: translated(dependency.computation), shared: dependency.shared!.map(translated) })!;
+		expect(new TaskTimeline(0).recordTool(new TimelineInterval(1900, 2200, [restored]), 2200)).toMatchObject({
+			toolComputeMs: offset === undefined ? undefined : 300, hiddenComputeMs: offset === undefined ? 0 : 100,
+			...(offset === undefined ? { hiddenComputeIncomplete: true } : {}) });
+		expect(restoreNativeDependency({ ...dependency, shared: [{ ...graph, root: "missing" }] })).toBeUndefined();
 	});
 
 	it("rejects malformed or cyclic graphs without issuing a successful receipt", async () => {

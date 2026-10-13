@@ -10,6 +10,7 @@ import { createSpeculativeActionHost } from "../src/agent-integration.ts";
 import { ProcessExecutionCoordinator } from "../src/process-execution.ts";
 import { currentExecutionScope } from "../src/execution-world.ts";
 import { LinuxProcessReuseBackend } from "../src/linux-process-backend.ts";
+import { SynchronousProcessObserver } from "../src/linux-process-sync.ts";
 import { commitBenchmarkFixture, compileBenchmarkHelper, holdProcessPublication } from "./linux-process-fixture.ts";
 import type { SpeculativeActionEvent } from "../src/runtime.ts";
 import { temporaryDirectories } from "./filesystem.ts";
@@ -19,8 +20,11 @@ import { deferred, onExit } from "./async.ts";
 const directories = temporaryDirectories("pi-extension-system-");
 afterEach(async () => { vi.unstubAllEnvs(); vi.restoreAllMocks(); await directories.dispose(); });
 
-test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-nested", "native-stale", "native-running", "native-retired", "native-unkeyed"] : [])])("runs the shipped extension through a real Pi session (%s)", async mode => {
+test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-nested", "native-stale", "native-running", "native-retired", "native-unkeyed",
+	"native-sync-producer", "native-sync-consumer", "native-sync-both", "native-sync-stale", "native-sync-lost"] : [])])("runs the shipped extension through a real Pi session (%s)", async mode => {
 	const enabled = mode !== "off", native = mode.startsWith("native"), running = mode === "native-running" || mode === "native-retired";
+	const stale = mode.endsWith("stale"), synchronous = (callID: string) => mode.startsWith("native-sync") &&
+		(!mode.endsWith("producer") && !mode.endsWith("consumer") || callID === (mode.endsWith("producer") ? "seed" : "check"));
 	const cwd = await directories.create(native ? os.homedir() : undefined), agentDir = path.join(cwd, "agent");
 	await mkdir(agentDir); vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
 	await writeFile(path.join(cwd, "notes.txt"), "one\ntwo\n");
@@ -46,8 +50,9 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 			expect(signal).toBe(context.signal); expect(Object.isFrozen(args)).toBe(false); calls.push(callID);
 			if (!native && !registered) { registered = true; api.registerTool(callback("read")); api.registerTool(callback("late_rows")); }
 			await new Promise(resolve => setImmediate(resolve));
-			const text = (args as { text: string }).text, output = native ? await new Promise<string>((resolve, reject) => {
-				const child = spawn("/bin/bash", ["-c", text], { cwd, env: { PATH: "/usr/local/bin:/usr/bin:/bin", HOME: os.homedir(), LANG: "C.UTF-8" }, signal, stdio: ["ignore", "pipe", "pipe"] });
+			const text = (args as { text: string }).text, options = { cwd, env: { PATH: "/usr/local/bin:/usr/bin:/bin", HOME: os.homedir(), LANG: "C.UTF-8" }, stdio: ["ignore", "pipe", "pipe"] as ["ignore", "pipe", "pipe"] };
+			const output = synchronous(callID) ? execFileSync("/bin/bash", ["-c", text], { ...options, encoding: "utf8" }) : native ? await new Promise<string>((resolve, reject) => {
+				const child = spawn("/bin/bash", ["-c", text], { ...options, signal });
 				let output = ""; for (const stream of [child.stdout, child.stderr]) stream.on("data", bytes => { output += bytes; });
 				child.once("error", reject); child.once("close", code => code ? reject(new Error(`callback exited ${code}`)) : resolve(output));
 			}) : text;
@@ -79,7 +84,18 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 		await session.bindExtensions({ mode: "print", onError: error => { throw error; } });
 		if (native) {
 			let backend: LinuxProcessReuseBackend | undefined;
-			const observe = LinuxProcessReuseBackend.prototype.observeBindings, nested = !["native", "native-stale"].includes(mode);
+			if (mode === "native-sync-lost") {
+				const attach = SynchronousProcessObserver.prototype.attach;
+				vi.spyOn(SynchronousProcessObserver.prototype, "attach").mockImplementation(function (this: SynchronousProcessObserver, request) {
+					const attachment = attach.call(this, request);
+					return { ...attachment, finish: () => { const result = attachment.finish();
+						if (result.adoptions.length) { expect(result.metrics.hits).toBe(1); expect([...new Int32Array(request.handoffs.claims)]).toContain(2);
+							void Reflect.get(this, "worker").terminate(); throw new Error("lost acknowledged synchronous handoff"); }
+						return result;
+					} };
+				});
+			}
+			const observe = LinuxProcessReuseBackend.prototype.observeBindings, nested = !mode.startsWith("native-sync") && !["native", "native-stale"].includes(mode);
 			vi.spyOn(LinuxProcessReuseBackend.prototype, "observeBindings").mockImplementation(function (this: LinuxProcessReuseBackend, scope, execute, receive, ...args) {
 				backend = this; return observe.call(this, scope, execute, (bindings, computations) => receive(nested && scope.callID === "seed" ? bindings.slice(0, 1) : bindings, computations), ...args);
 			});
@@ -96,11 +112,15 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 			}] : []), async () => {
 				await expect.poll(() => publication ? publication.reached() : events.some(event => event.type === "candidate" && event.candidate.kind === "operation" && event.state.status === "succeeded"), { timeout: 5000 }).toBe(true);
 				await expect(readFile(path.join(cwd, "marker"))).rejects.toMatchObject({ code: "ENOENT" });
-				if (mode === "native-stale") await writeFile(path.join(cwd, "notes.txt"), "fresh\n");
+				if (stale) await writeFile(path.join(cwd, "notes.txt"), "fresh\n");
 				return call("format_rows", remaining, "check");
 			}, fauxAssistantMessage("done")]);
 			await session.prompt("Produce notes, edit the input, then render the remaining work.");
-			const results = session.messages.filter(message => message.role === "toolResult"), reused = mode !== "native-stale";
+			const results = session.messages.filter(message => message.role === "toolResult"), reused = !stale;
+			if (mode === "native-sync-lost") {
+				expect(results.at(-1)).toMatchObject({ isError: true }); expect(JSON.stringify(results.at(-1))).toContain("synchronous native handoff failed");
+				expect(await readFile(path.join(cwd, "marker"), "utf8")).toBe("once"); expect(calls).toEqual(["seed", "check"]); return;
+			}
 			expect(results.at(-1)?.content, JSON.stringify(session.messages)).toEqual([{ type: "text", text: "hook:own:format_rows:remaining:" + execFileSync("./slow", ["notes.txt"], { cwd, encoding: "utf8" }) }]);
 			expect(results.every(result => !result.isError)).toBe(true); expect(await readFile(path.join(cwd, "marker"), "utf8")).toBe("once");
 			expect(calls).toEqual(["seed", "check"]); expect(prepared).toEqual([initial, remaining]);
