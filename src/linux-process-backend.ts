@@ -6,7 +6,7 @@ import { randomBytes } from "node:crypto";
 import { on, once } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
 import { constants as fsConstants } from "node:fs";
-import { access, chmod, copyFile, link, lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { access, chmod, copyFile, link, lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rm, stat, writeFile, type FileHandle } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import net from "node:net";
 import os from "node:os";
@@ -749,7 +749,7 @@ export class LinuxProcessReuseBackend {
 		// An older helper runs an unknown flag as a command, which fails.
 		if (await new Promise<boolean>(resolve => execFile(dispatcher, ["--set-modified-times"], error => resolve(!error)).stdin?.end())) useModifiedTimesHelper(dispatcher);
 		const imageLibrary = await execText(strace, ["--kill-on-exit", "-f", "-q", "-e", "trace=none", "-o", "/dev/null",
-			`--handoff-admission-library=${dispatcher}.so`, "--handoff-image=/dev/null", "--", "/bin/true"])
+			`--handoff-frontier-library=${dispatcher}.so`, "--handoff-image=/dev/null", "--", "/bin/true"])
 			.then(() => `${dispatcher}.so`, () => undefined);
 		const mountProbe = await mkdtemp(path.join(os.tmpdir(), "pi-process-view-probe-"));
 		let executionContext: ProcessExecutionContext | undefined;
@@ -806,6 +806,7 @@ export class LinuxProcessReuseBackend {
 		recordPrototypePreparation(session, preparation);
 		this.add(session, "wholeCommandMisses");
 		const sandbox = sandboxArguments({
+			...request,
 			ready,
 			cwd: logicalCwd,
 			deniedPaths: session.deniedPaths,
@@ -815,7 +816,6 @@ export class LinuxProcessReuseBackend {
 			privateWrites: path.join(session.workspace.processRoot, "private"),
 			metadataImage: session.workspace.metadataImage,
 			command: [invocation.shell, ...shellArguments(invocation, command)],
-			...(request.timeout !== undefined ? { timeoutSeconds: request.timeout } : {}),
 		});
 		const before = await session.workspace.structure.capture();
 		const traceRoot = await mkdtemp(path.join(session.workspace.processRoot, "top-trace-"));
@@ -824,19 +824,14 @@ export class LinuxProcessReuseBackend {
 		let outcome: SpawnOutcome;
 		const processStarted = performance.now();
 		try {
-			outcome = await runSpawn(
-				ready.strace,
-				traced.slice(1),
-				{
-					cwd: physicalCwd,
-					environment,
-					outputRoot: traceRoot, onOutputEndpoints: (endpoints) => { session.topLevelOutputEndpoints = endpoints; },
-					...(invocation.commandTransport === "stdin" ? { stdin: Buffer.from(command, "utf8") } : {}),
-					signal,
-					...(request.timeout !== undefined ? { timeoutSeconds: request.timeout } : {}),
-					onOutput: (event) => request.onData(event.data),
-				},
-			);
+			outcome = await runSpawn(traced, {
+				...request,
+				cwd: physicalCwd,
+				environment,
+				outputRoot: traceRoot, onOutputEndpoints: (endpoints) => { session.topLevelOutputEndpoints = endpoints; },
+				...(invocation.commandTransport === "stdin" ? { stdin: Buffer.from(command, "utf8") } : {}),
+				signal,
+			});
 			session.topLevelExecution = { prototype, outcome, observedProcessMs: Math.max(0, performance.now() - processStarted), startedAt };
 			try {
 				const after = await session.workspace.structure.capture();
@@ -1238,7 +1233,7 @@ export class LinuxProcessReuseBackend {
 		let stage = "capture", dependencyCertificate: DynamicDependencyCertificate | undefined, certificateID: Sha256Digest | undefined, unattributed: StraceObservation | undefined;
 		let continuation: ProcessContinuation | undefined, frozen: { pid: number; fd: number; writing: boolean; bytes: number } | undefined;
 		const executedStreams: { alias: number; kind: string; data: Buffer }[] = [];
-		let suspensionAttempted = false, writer: ActiveSession["writers"] extends Set<infer Writer> ? Writer | undefined : never;
+		let suspensionAttempted = false, writer: SessionWriter | undefined;
 		const failureDetail = (error: unknown) => `${errorMessage(error)}; process=${JSON.stringify({
 			stage, requestID, weakKey, scope: session.scope, workspace: session.workspace.sandboxRoot,
 			executable: prototype.executablePath, certificateID, complete: dependencyCertificate?.complete, taints: dependencyCertificate?.taints,
@@ -1246,8 +1241,7 @@ export class LinuxProcessReuseBackend {
 		try {
 			traceRoot = await mkdtemp(path.join(session.workspace.processRoot, "trace-"));
 			const tracePrefix = path.join(traceRoot, "process");
-			const logicalExecutable = session.projection.toLogical(executable);
-			const { execMounts, executables: interposedExecutables } = interception(session.interposition, executable), image = logicalExecutable;
+			const { execMounts, executables: interposedExecutables } = interception(session.interposition, executable), image = session.projection.toLogical(executable);
 			const logicalCwd = session.projection.toLogical(request.cwd), live = !!captureWorkspace && !!ready.imageLibrary;
 			descriptors = createProcessDescriptorCapture(session, traceRoot, request, live);
 			const { inputs, descriptorManifest, descriptorReportPath, descriptorImages, directoryImages, inheritedFiles, outputPipes: unchangedOutputPipes } = descriptors;
@@ -1319,7 +1313,7 @@ export class LinuxProcessReuseBackend {
 			const clockOffset = Number(process.hrtime.bigint()) / 1e6 - performance.now();
 			stage = "execution";
 			let outputEndpoints: readonly [string, string] | undefined;
-			const observe = (descriptorOffsets: ReturnType<typeof parseDescriptorOffsets> | undefined, frozen?: { pid: number; bytes: number }) => observeStrace(tracePrefix, image, session.projection.toLogical(request.cwd), { interposedExecutables, brokeredWrites: pid => brokeredWrites(session, pid, writer), privateUpper: privateUpper(session),
+			const observe = (descriptorOffsets: DescriptorOffset[] | undefined, frozen?: { pid: number; bytes: number }) => observeStrace(tracePrefix, image, logicalCwd, { interposedExecutables, brokeredWrites: pid => brokeredWrites(session, pid, writer), privateUpper: privateUpper(session),
 				...(frozen ? { frozen } : {}), ...(outputEndpoints ? { outputEndpoints } : {}),
 				unchangedOutputPipes,
 				guardFilesystemSemanticsWithin: [session.workspace.sandboxRoot, session.sourceRoot],
@@ -1334,13 +1328,7 @@ export class LinuxProcessReuseBackend {
 						queuedBytes: object.queue?.bytes, ...(object.queue && input.fd === input.image ? { queueData: Buffer.from(object.content!, "base64"), messages: object.queue.messages } : {}) }];
 				}) : undefined,
 			});
-			const readImage = async () => {
-				const file = await open(imagePath, "r");
-				try {
-					if ((await file.stat()).size > MAX_CONTINUATION_BYTES) throw new Error("continuation exceeds image size limit");
-					return await file.readFile();
-				} finally { await file.close(); }
-			};
+			const readImage = async () => (await captureStableFile(imagePath, MAX_CONTINUATION_BYTES, true, { digest: false })).content!;
 			const parseFrontier = (pid: number, reply: Buffer) => {
 				const bytes = Number(reply.readBigUInt64LE(16)), begin = Number(reply.readBigUInt64LE(24)) / 1e6 - clockOffset,
 					end = Number(reply.readBigUInt64LE(32)) / 1e6 - clockOffset, fd = reply.readInt32LE(4), syscall = reply.readInt32LE(8);
@@ -1348,7 +1336,7 @@ export class LinuxProcessReuseBackend {
 					begin < processStarted || end < begin || end > performance.now()) throw new Error("invalid native continuation frontier");
 				return { frozen: { pid, fd, writing: [1, 20, 44, 46].includes(syscall), bytes }, computation: new TimelineInterval(begin, end) };
 			};
-			outcome = await runSpawn(ready.strace, [...(live ? [`--handoff-fd=${inheritedFiles.length + 3}`, `--handoff-admission-library=${ready.imageLibrary}`, `--handoff-image=${imagePath}`] : []), ...command.slice(1)], {
+			outcome = await runSpawn([ready.strace, ...(live ? [`--handoff-fd=${inheritedFiles.length + 3}`, `--handoff-frontier-library=${ready.imageLibrary}`, `--handoff-image=${imagePath}`] : []), ...command.slice(1)], {
 				// The child writes to (and may query) these sockets; their identity lets its observation recognize them.
 				outputRoot: traceRoot, onOutputEndpoints: (endpoints) => {
 					session.nestedOutputEndpoints.add(outputEndpoints = endpoints);
@@ -1359,10 +1347,11 @@ export class LinuxProcessReuseBackend {
 				signal: AbortSignal.any([session.signal, work.signal]),
 				inheritedFiles: inheritedFiles.map(file => file.fd),
 				...(live ? { onControl: (channel: import("node:stream").Duplex, wake: () => boolean) => {
-					let suspended: Promise<boolean> | undefined;
-					releaseRunning = advancing(() => suspended ??= (async () => {
+					let suspended: Promise<boolean> | undefined, demanded = false;
+					const suspend = () => suspended ??= (async () => {
 						const executionSignal = AbortSignal.any([session.signal, work.signal]);
 						const frontier = await this.requestProcessImageAtFrontier(descriptorReportPath!, channel, wake, executionSignal, async (pid, reply, report) => {
+							if (!demanded && !(reply.readInt32LE(12) & 4)) return undefined;
 							const { frozen } = parseFrontier(pid, reply), positions = parseDescriptorOffsets(report, inputs);
 							let observation: StraceObservation | undefined;
 							try {
@@ -1374,8 +1363,8 @@ export class LinuxProcessReuseBackend {
 							} catch {}
 							// Stop capture at a blocked stream; its ownership separately decides whether to await completion.
 							const description = observation?.finalHandles?.find(handle => handle.fd === frozen.fd)?.description;
-							return reply.readInt32LE(12) & 4 && streamInputs.some(input => input.alias === description) ? false : undefined;
-						});
+							return demanded && reply.readInt32LE(12) & 4 && streamInputs.some(input => input.alias === description) ? false : undefined;
+						}, () => demanded);
 						if (!frontier) return true; // It completed while the request was advancing.
 						const { pid, reply } = frontier;
 						if (reply.readInt32LE(0) === 0) return closedStreams;
@@ -1385,7 +1374,10 @@ export class LinuxProcessReuseBackend {
 						continuation = { image: await readImage(), physicalRoot: session.workspace.sandboxRoot, computation: captured.computation };
 						frozen = captured.frozen;
 						return true;
-					})().catch(error => { this.setActorError(`actor_suspend:${errorMessage(error)}`); return false; }));
+					})().catch(error => { this.setError(session, `process_suspend:${errorMessage(error)}`); return false; });
+					releaseRunning = advancing(() => { demanded = true; if (suspended) wake(); return suspend(); });
+					// Seal waiting prefixes while the owner can publish; a synchronous consumer cannot drive that publication.
+					if (!closedStreams) void suspend();
 					return () => { releaseRunning?.(); return suspended?.then(() => {}); };
 				} } : {}),
 			});
@@ -1512,7 +1504,7 @@ export class LinuxProcessReuseBackend {
 					stage = "handoff_registration";
 					if (await this.handoffs.publish(weakKey, work, certificate, () => {
 						const { streams: _streams, ...invocation } = request;
-						const binding = this.handoffs.bind(weakKey, work, { ...invocation, cwd: logicalCwd, executable: logicalExecutable,
+						const binding = this.handoffs.bind(weakKey, work, { ...invocation, cwd: logicalCwd, executable: image,
 							sourceRoot: session.sourceRoot, outputRoute, producer: session.nestedProducer });
 						if (binding) session.executionBindings.set(requestID, binding);
 						if (continuation) return Promise.resolve(false);
@@ -1568,7 +1560,7 @@ export class LinuxProcessReuseBackend {
 
 	/** Admission observes a stopped process; safe declines keep advancing its existing request. */
 	private async requestProcessImageAtFrontier(descriptorReportPath: string, channel: import("node:stream").Duplex,
-		wake: () => boolean, signal: AbortSignal, admit: (pid: number, reply: Buffer, report: Buffer) => Promise<boolean | undefined>): Promise<{ pid: number; reply: Buffer } | undefined> {
+		wake: () => boolean, signal: AbortSignal, admit: (pid: number, reply: Buffer, report: Buffer) => Promise<boolean | undefined>, demanded: () => boolean): Promise<{ pid: number; reply: Buffer } | undefined> {
 		while (!signal.aborted && !channel.destroyed) {
 			const report = await readFile(descriptorReportPath).catch(() => Buffer.alloc(0)), ready = /\nRUNNING (\d+)\n$/.exec(report.toString("ascii"));
 			if (ready) {
@@ -1577,7 +1569,7 @@ export class LinuxProcessReuseBackend {
 				const send = (choice: number) => { request.writeInt32LE(choice); return writeProcessChannel(channel, request); };
 				let reply = Buffer.alloc(0);
 				try {
-					await send(pid); if (!wake()) throw new Error("continuation producer closed");
+					await send(demanded() ? pid : -pid); if (!wake()) throw new Error("continuation producer closed");
 					for await (const [bytes] of replies) {
 						reply = Buffer.concat([reply, bytes]);
 						if (reply.length < 40) continue;
@@ -1741,9 +1733,9 @@ function createProcessDescriptorCapture(session: ActiveSession, traceRoot: strin
 	const descriptorReportPath = needsReport ? path.join(traceRoot, "fd-offsets") : undefined;
 	const descriptorImages = new Map<number, { physical: string; logical: string; workspace: boolean; state: import("node:fs").BigIntStats }>();
 	const directoryImages: Array<readonly [string, string]> = [];
-	const inheritedFiles: Awaited<ReturnType<typeof open>>[] = [];
+	const inheritedFiles: FileHandle[] = [];
 	const outputPipes: string[] = [];
-	let descriptorReport: Awaited<ReturnType<typeof open>> | undefined;
+	let descriptorReport: FileHandle | undefined;
 	return {
 		inputs, descriptorManifest, descriptorReportPath, descriptorImages, directoryImages, inheritedFiles, outputPipes,
 		async prepare(resourceJournal: boolean): Promise<void> {
@@ -1800,7 +1792,7 @@ function createProcessDescriptorCapture(session: ActiveSession, traceRoot: strin
 				? { pipes: request.outputPipes, flags: request.outputFlags ?? [0, 0], endpoints: outputPipes } : undefined);
 			return inputs.length ? positions : undefined;
 		},
-		async captureFileEffects(store: ProvenanceCertificateStore, descriptorOffsets: ReturnType<typeof parseDescriptorOffsets> | undefined,
+		async captureFileEffects(store: ProvenanceCertificateStore, descriptorOffsets: DescriptorOffset[] | undefined,
 			after: WorkspaceStructureSnapshot, effectsComplete: boolean, journal: readonly OrderedEffectEvent[]): Promise<void> {
 			const finalObjects = new Map([...after.entries].flatMap(([name, entry]) => entry.kind === "file" && entry.object ? [[entry.object, name] as const] : []));
 			if (descriptorOffsets) for (const position of descriptorOffsets) {
@@ -1895,7 +1887,7 @@ function bufferedProcessPrototype(
 	});
 }
 
-function bindProcessDescriptors(inputs: ReturnType<typeof descriptorInputs>, positions: ReturnType<typeof parseDescriptorOffsets>, observation: StraceObservation,
+function bindProcessDescriptors(inputs: ReturnType<typeof descriptorInputs>, positions: DescriptorOffset[], observation: StraceObservation,
 	continuation?: { image: Buffer; frontier: { pid: number; fd: number; writing: boolean }; closedInput: boolean }) {
 	const handles = observation.finalHandles ?? [];
 	// Surviving queued OFDs need a current position; a continuation can prove it through an installed alias.
@@ -1941,13 +1933,15 @@ function bindProcessDescriptors(inputs: ReturnType<typeof descriptorInputs>, pos
 	return Buffer.concat([Buffer.from(`${first}\n${bound.join("\n")}\n`), image.subarray(cursor)]);
 }
 
-function parseDescriptorOffsets(report: Buffer, inputs: ReturnType<typeof descriptorInputs>, outputs?: {
-	readonly pipes: readonly [boolean, boolean]; readonly flags: readonly [number, number]; readonly endpoints: string[];
-}): Array<{
+interface DescriptorOffset {
 	fd: number; before: OFDPosition; after: OFDPosition; device: string; inode: string; afterFlags?: number;
 	content?: import("./provenance-certificate.ts").ArtifactReference;
 	detached?: { content: Buffer; mode: bigint; uid: bigint; gid: bigint; modified: bigint };
-}> {
+}
+
+function parseDescriptorOffsets(report: Buffer, inputs: ReturnType<typeof descriptorInputs>, outputs?: {
+	readonly pipes: readonly [boolean, boolean]; readonly flags: readonly [number, number]; readonly endpoints: string[];
+}): DescriptorOffset[] {
 	let cursor = 0, bytes = 0;
 	const line = () => {
 		const end = report.indexOf(10, cursor);
@@ -1955,7 +1949,7 @@ function parseDescriptorOffsets(report: Buffer, inputs: ReturnType<typeof descri
 		const value = report.toString("ascii", cursor, end); cursor = end + 1; return value;
 	};
 	if (line() !== `OFD ${inputs.length}`) throw new Error("invalid inherited OFD header");
-	const positions: ReturnType<typeof parseDescriptorOffsets> = inputs.map(input => {
+	const positions: DescriptorOffset[] = inputs.map(input => {
 		const value = line();
 		if (!/^\d+ \d+ \d+ \d+ \d+$/.test(value)) throw new Error("invalid inherited OFD result");
 		const fields = value.split(" "), [fd, flags, after] = fields.slice(0, 3).map(Number);
@@ -2136,22 +2130,18 @@ async function sourceDirectoryChanges(
 
 /** binfmt_script's interpreter (the first word after `#!`) or a little-endian ELF64's PT_INTERP. */
 export async function imageInterpreter(file: string): Promise<string | undefined> {
-	const handle = await open(file, "r").catch(() => undefined);
-	try {
-		const head = Buffer.alloc(256), read = handle ? (await handle.read(head, 0, 256, 0)).bytesRead : 0;
-		if (head.subarray(0, 2).toString("latin1") === "#!") return /^[ \t]*([^ \t\n\0]+)/.exec(head.subarray(2, read).toString("latin1"))?.[1];
-		if (read < 64 || head.readUInt32BE(0) !== 0x7f454c46 || head[4] !== 2 || head[5] !== 1) return undefined;
-		const offset = Number(head.readBigUInt64LE(32)), size = head.readUInt16LE(54), count = Math.min(head.readUInt16LE(56), 64);
-		const table = Buffer.alloc(size * count);
-		await handle!.read(table, 0, table.length, offset);
-		for (let entry = 0; size >= 56 && entry < count; entry++) {
-			if (table.readUInt32LE(entry * size) !== 3) continue;
-			const name = Buffer.alloc(Math.min(Number(table.readBigUInt64LE(entry * size + 32)), 4096));
-			await handle!.read(name, 0, name.length, Number(table.readBigUInt64LE(entry * size + 8)));
-			return name.toString("latin1").split("\0")[0] || undefined;
-		}
-	} finally {
-		await handle?.close();
+	await using handle = await open(file, "r").catch(() => undefined);
+	const head = Buffer.alloc(256), read = handle ? (await handle.read(head, 0, 256, 0)).bytesRead : 0;
+	if (head.subarray(0, 2).toString("latin1") === "#!") return /^[ \t]*([^ \t\n\0]+)/.exec(head.subarray(2, read).toString("latin1"))?.[1];
+	if (read < 64 || head.readUInt32BE(0) !== 0x7f454c46 || head[4] !== 2 || head[5] !== 1) return undefined;
+	const offset = Number(head.readBigUInt64LE(32)), size = head.readUInt16LE(54), count = Math.min(head.readUInt16LE(56), 64);
+	const table = Buffer.alloc(size * count);
+	await handle!.read(table, 0, table.length, offset);
+	for (let entry = 0; size >= 56 && entry < count; entry++) {
+		if (table.readUInt32LE(entry * size) !== 3) continue;
+		const name = Buffer.alloc(Math.min(Number(table.readBigUInt64LE(entry * size + 32)), 4096));
+		await handle!.read(name, 0, name.length, Number(table.readBigUInt64LE(entry * size + 8)));
+		return name.toString("latin1").split("\0")[0] || undefined;
 	}
 }
 
@@ -2610,9 +2600,8 @@ function interception(interposition: ActiveSession["interposition"], image?: str
 		executables: entries.flatMap(entry => [[entry.intercepted, entry.native], [entry.view, entry.native]] as const) };
 }
 
-function sandboxArguments(input: {
+function sandboxArguments(input: Pick<ProcessExecutionRequest, "cwd" | "timeout"> & {
 	readonly ready: ReadyBackend;
-	readonly cwd: string;
 	readonly deniedPaths: readonly string[];
 	readonly writablePaths: readonly string[];
 	readonly mounts: readonly SandboxMount[];
@@ -2620,13 +2609,12 @@ function sandboxArguments(input: {
 	readonly privateWrites: string;
 	readonly metadataImage?: string;
 	readonly command: readonly string[];
-	readonly timeoutSeconds?: number;
 }): readonly string[] {
 	return [
 		input.ready.sandlock,
 		...sandboxPolicyArguments(input.cwd, input.deniedPaths, input.writablePaths, input.mounts, input.execMounts, input.privateWrites),
 		...(input.metadataImage ? ["--metadata-image", input.metadataImage] : []),
-		...(input.timeoutSeconds !== undefined ? ["--timeout", String(Math.max(1, Math.ceil(input.timeoutSeconds)))] : []),
+		...(input.timeout !== undefined ? ["--timeout", String(Math.max(1, Math.ceil(input.timeout)))] : []),
 		"--",
 		...input.command,
 	];
@@ -2792,7 +2780,7 @@ async function probeExecutionContext(input: {
 		input.logicalRoot,
 		path.join(input.logicalRoot, "script-position"),
 	]);
-	const outcome = await runSpawn(input.strace, command.slice(1), { cwd: input.physicalRoot, environment: definedProcessEnvironment(process.env) });
+	const outcome = await runSpawn(command, { cwd: input.physicalRoot, environment: definedProcessEnvironment(process.env) });
 	if (outcome.signal || outcome.code !== 0) throw new Error(`process execution context probe failed${await inheritedTracer()}`);
 	const stdout = Buffer.concat(outcome.output.filter(({ fd }) => fd === 1).map(({ data }) => data)).toString();
 	const parsed = processContextFromRaw(JSON.parse(stdout) as RawProcessContext);
@@ -2812,15 +2800,10 @@ function compatibleProducer(expected: ProcessProducerProof, candidate: ProcessPr
 }
 
 async function runSpawn(
-	executable: string,
-	args: readonly string[],
-	options: {
-		readonly cwd: string;
-		readonly environment: Readonly<Record<string, string>>;
+	[executable, ...args]: readonly [string, ...string[]],
+	options: Pick<ProcessExecutionRequest, "cwd" | "environment" | "signal" | "timeout"> & {
 		readonly stdin?: Buffer;
-		readonly signal?: AbortSignal;
-		readonly timeoutSeconds?: number;
-		readonly onOutput?: (event: BufferedOutput) => void;
+		readonly onData?: (data: Buffer) => void;
 		readonly outputRoot?: string;
 		readonly onOutputEndpoints?: (endpoints: readonly [string, string]) => void;
 		readonly inheritedFiles?: readonly number[];
@@ -2828,53 +2811,50 @@ async function runSpawn(
 	},
 ): Promise<SpawnOutcome> {
 	options.signal?.throwIfAborted();
-	const channels = options.onOutputEndpoints ? await acquireOutputChannels(options.outputRoot!, options.signal) : undefined;
+	await using channels = options.onOutputEndpoints ? await acquireOutputChannels(options.outputRoot!, options.signal) : undefined;
+	options.signal?.throwIfAborted();
+	if (channels) options.onOutputEndpoints!([channels.entries[0]!.endpoint, channels.entries[1]!.endpoint]);
+	const child = spawn(executable, args, {
+		cwd: options.cwd,
+		env: options.environment,
+		detached: true,
+		stdio: [options.stdin ? "pipe" : "ignore", ...(channels ? channels.entries.map((entry) => entry.target!) : ["pipe", "pipe"] as const),
+			...(options.inheritedFiles ?? []), ...(options.onControl ? ["pipe" as const] : [])],
+	});
+	const output: BufferedOutput[] = [];
+	child.once("spawn", () => channels?.releaseWriters());
+	const append = (fd: 1 | 2, value: Buffer) => {
+		const event = { fd, data: Buffer.from(value) } as const;
+		const previous = output.at(-1);
+		if (previous?.fd === fd && previous.data.byteLength + event.data.byteLength <= 1024 * 1024) {
+			output[output.length - 1] = { fd, data: Buffer.concat([previous.data, event.data]) };
+		} else output.push(event);
+		options.onData?.(event.data);
+	};
+	const sources = channels?.entries.map((entry) => entry.source) ?? [child.stdout!, child.stderr!];
+	const drained = Promise.all(sources.map((source, index) => {
+		source.on("data", (value: Buffer) => append(index === 0 ? 1 : 2, value));
+		return finished(source, { readable: true, writable: false, cleanup: true });
+	}));
+	void drained.catch(() => undefined);
+	if (options.stdin) child.stdin?.end(options.stdin);
+	const terminate = () => { if (!child.pid) return; try { process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); } };
+	options.signal?.addEventListener("abort", terminate, { once: true });
+	let timedOut = false;
+	const timeout = options.timeout === undefined ? undefined : setTimeout(() => { timedOut = true; terminate(); }, Math.max(1, options.timeout * 1000));
+	const completed: Promise<Pick<SpawnOutcome, "code" | "signal">> = once(child, "close").then(([code, signal]) => ({ code, signal }));
+	let releaseControl: (() => void | Promise<void>) | undefined;
 	try {
-		options.signal?.throwIfAborted();
-		if (channels) options.onOutputEndpoints!([channels.entries[0]!.endpoint, channels.entries[1]!.endpoint]);
-		const child = spawn(executable, args, {
-			cwd: options.cwd,
-			env: options.environment,
-			detached: true,
-			stdio: [options.stdin ? "pipe" : "ignore", ...(channels ? channels.entries.map((entry) => entry.target!) : ["pipe", "pipe"] as const),
-				...(options.inheritedFiles ?? []), ...(options.onControl ? ["pipe" as const] : [])],
-		});
-		const output: BufferedOutput[] = [];
-		child.once("spawn", () => channels?.releaseWriters());
-		const append = (fd: 1 | 2, value: Buffer) => {
-			const event = { fd, data: Buffer.from(value) } as const;
-			const previous = output.at(-1);
-			if (previous?.fd === fd && previous.data.byteLength + event.data.byteLength <= 1024 * 1024) {
-				(output as BufferedOutput[])[output.length - 1] = { fd, data: Buffer.concat([previous.data, event.data]) };
-			} else output.push(event);
-			options.onOutput?.(event);
-		};
-		const sources = channels?.entries.map((entry) => entry.source) ?? [child.stdout!, child.stderr!];
-		const drained = Promise.all(sources.map((source, index) => {
-			source.on("data", (value: Buffer) => append(index === 0 ? 1 : 2, value));
-			return finished(source, { readable: true, writable: false, cleanup: true });
-		}));
-		void drained.catch(() => undefined);
-		if (options.stdin) child.stdin?.end(options.stdin);
-		const terminate = () => { if (!child.pid) return; try { process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); } };
-		options.signal?.addEventListener("abort", terminate, { once: true });
-		let timeout: ReturnType<typeof setTimeout> | undefined;
-		let timedOut = false;
-		if (options.timeoutSeconds !== undefined) timeout = setTimeout(() => { timedOut = true; terminate(); }, Math.max(1, options.timeoutSeconds * 1000));
-		const completed: Promise<Pick<SpawnOutcome, "code" | "signal">> = once(child, "close").then(([code, signal]) => ({ code, signal }));
-		let releaseControl: (() => void | Promise<void>) | undefined;
-		try {
-			if (options.onControl) releaseControl = options.onControl(child.stdio.at(-1) as import("node:stream").Duplex, () => child.kill("SIGUSR2"));
-			const [result] = await Promise.all([completed, drained]);
-			if (options.signal?.aborted) throw new Error("aborted");
-			if (timedOut) throw new Error(`timeout:${options.timeoutSeconds}`);
-			return { ...result, output };
-		} catch (error) { terminate(); await completed.catch(() => undefined); throw error; } finally {
-			if (timeout) clearTimeout(timeout);
-			options.signal?.removeEventListener("abort", terminate);
-			await releaseControl?.();
-		}
-	} finally { await channels?.dispose(); }
+		if (options.onControl) releaseControl = options.onControl(child.stdio.at(-1) as import("node:stream").Duplex, () => child.kill("SIGUSR2"));
+		const [result] = await Promise.all([completed, drained]);
+		if (options.signal?.aborted) throw new Error("aborted");
+		if (timedOut) throw new Error(`timeout:${options.timeout}`);
+		return { ...result, output };
+	} catch (error) { terminate(); await completed.catch(() => undefined); throw error; } finally {
+		clearTimeout(timeout);
+		options.signal?.removeEventListener("abort", terminate);
+		await releaseControl?.();
+	}
 }
 
 /** Own the write endpoints before inheritance; a running tracer may replace its descriptors. */
@@ -2886,7 +2866,7 @@ async function acquireOutputChannels(parent: string, signal?: AbortSignal) {
 	const dispose = async () => {
 		releaseWriters();
 		for (const entry of entries) entry.source.destroy();
-		await Promise.all(entries.map(({ server }) => new Promise<void>((resolve) => server.close(() => resolve()))));
+		await Promise.all(entries.map(({ server }) => closeServer(server)));
 		await directory.close();
 		await rm(root, { recursive: true, force: true });
 	};
@@ -2908,7 +2888,7 @@ async function acquireOutputChannels(parent: string, signal?: AbortSignal) {
 			if (peers.length !== 1 || !/^\d+$/.test(peers[0]![6]!)) throw new Error("output_endpoint_identity_unproven");
 			entry.endpoint = `socket:[${peers[0]![6]}]`;
 		}
-		return { entries, releaseWriters, dispose };
+		return { entries, releaseWriters, [Symbol.asyncDispose]: dispose };
 	} catch (error) { await dispose(); throw error; }
 }
 
@@ -2998,12 +2978,10 @@ function shellArguments(invocation: ToolProcessInvocation, command: string): str
 
 async function topLevelProcessPrototype(invocation: ToolProcessInvocation, request: ProcessExecutionRequest, environment: Readonly<Record<string, string>>,
 	projection: ExecutionPathProjection, platformFingerprint: Sha256Digest): Promise<ExecPrototype> {
-	const argv = [invocation.shell, ...invocation.shellArgs];
-	if (invocation.commandTransport === "argv") argv.push(request.command);
 	return createExecPrototype({
 		executablePath: invocation.shell,
 		executableDigest: await hashExecutableFile(invocation.shell, request.signal),
-		argv: argv.map((value) => projection.normalizeValue(value)),
+		argv: [invocation.shell, ...shellArguments(invocation, request.command)].map(value => projection.normalizeValue(value)),
 		logicalCwd: projection.toLogical(projection.toPhysical(request.cwd) ?? request.cwd),
 		environment,
 		umask: process.umask(),
@@ -3017,8 +2995,7 @@ async function topLevelProcessPrototype(invocation: ToolProcessInvocation, reque
 		fileDescriptorTableComplete: true,
 		inheritedFDs: [
 			{ fd: 0, type: invocation.commandTransport === "stdin" ? "pipe" : "device", flagsDigest: digestObject({ mode: "read" }), eof: true },
-			{ fd: 1, type: "pipe", flagsDigest: digestObject({ mode: "write", sink: "buffered" }) },
-			{ fd: 2, type: "pipe", flagsDigest: digestObject({ mode: "write", sink: "buffered" }) },
+			...[1, 2].map(fd => ({ fd, type: "pipe" as const, flagsDigest: digestObject({ mode: "write", sink: "buffered" }) })),
 		],
 		platformFingerprint,
 	});

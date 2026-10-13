@@ -131,7 +131,7 @@ async function installStrace() {
 	const patch = await readFile(STRACE_PATCH), sourceDigest = sha256(STRACE_SHA256, patch);
 	const qualify = async binary => {
 		await run(binary, ["--kill-on-exit", "-f", "-q", "-e", "trace=none", "-o", "/dev/null",
-			`--handoff-admission-library=${heldExec}.so`, "--handoff-image=/dev/null", "--", "/bin/true"]);
+			`--handoff-frontier-library=${heldExec}.so`, "--handoff-image=/dev/null", "--", "/bin/true"]);
 	};
 	return installNative(path.join(localBin, "pi-speculative-strace"), sourceDigest, qualify, async (buildRoot, temporary) => {
 		const git = await executable(["git"]), tar = await executable(["tar"]), make = await executable(["make"]);

@@ -20,7 +20,7 @@ export function straceCommand(
 	command: readonly string[],
 	streams = false,
 	continuation = false,
-): readonly string[] {
+): readonly [string, ...string[]] {
 	// Its sandbox launcher's threads would pay a ptrace stop per call they serve; a file's bytes are captured from the filesystem, a stream's only here.
 	return [strace, "--kill-on-exit", "--trace-children-only", "--elide-path-data", streams ? "-f" : "-ff", "-q", "-ttt", "-yy", "-v", "-s", "65535", "-e", continuation ? "trace=all" : SYSCALL_FILTER + (streams ? ",read,write,readv,writev,close,close_range,dup,dup2,dup3,eventfd,eventfd2,sendfile,vmsplice,poll,ppoll,select,pselect6,epoll_create,epoll_create1,epoll_ctl,epoll_wait,epoll_pwait,epoll_pwait2" : ""), "-o", streams ? `${tracePrefix}.stream` : tracePrefix, ...command];
 }
@@ -871,13 +871,11 @@ export interface TracedWrite { readonly paths?: readonly string[]; readonly at: 
 
 /** A trace file's bytes from `offset`, at most `limit` of them. */
 async function readTrace(file: string, offset: number, limit = Number.POSITIVE_INFINITY): Promise<Buffer> {
-	const handle = await open(file, "r");
-	try {
-		const info = await handle.stat();
-		if (!info.isFile()) throw new Error("trace is not a regular file");
-		const buffer = Buffer.allocUnsafe(Math.max(0, Math.min(limit, info.size - offset)));
-		return buffer.subarray(0, (await handle.read(buffer, 0, buffer.length, offset)).bytesRead);
-	} finally { await handle.close(); }
+	await using handle = await open(file, "r");
+	const info = await handle.stat();
+	if (!info.isFile()) throw new Error("trace is not a regular file");
+	const buffer = Buffer.allocUnsafe(Math.max(0, Math.min(limit, info.size - offset)));
+	return buffer.subarray(0, (await handle.read(buffer, 0, buffer.length, offset)).bytesRead);
 }
 
 /** A trace read as it grows, each record parsed once however often it is asked: its writes so far, and when it last named each absolute path (by name, through a

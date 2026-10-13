@@ -120,10 +120,12 @@
  	/* iovcnt */
 --- a/src/strace.c
 +++ b/src/strace.c
-@@ -27,6 +27,10 @@
+@@ -27,6 +27,12 @@
  #include <locale.h>
  #include <sys/utsname.h>
  #include <sys/prctl.h>
++#include <poll.h>
++#include <sys/syscall.h>
 +#include <sys/user.h>
 +#include <stddef.h>
 +#include <dlfcn.h>
@@ -131,7 +133,7 @@
  
  #include "kill_save_errno.h"
  #include "exitkill.h"
-@@ -838,9 +842,10 @@
+@@ -838,9 +844,10 @@
  	tprint_associated_info_end();
  }
 
@@ -145,7 +147,7 @@
  	/* If -ff, "previous tcb we printed" is always the same as current,
  	 * because we have per-tcb output files.
  	 */
-@@ -866,6 +871,13 @@
+@@ -866,6 +873,13 @@
  		}
  	}
 
@@ -159,7 +161,7 @@
  	printing_tcp = tcp;
  	set_current_tcp(tcp);
  	current_tcp->curcol = 0;
-@@ -2231,6 +2243,174 @@ add_path_trace(struct pathtrace *pt, const char *path)
+@@ -2231,6 +2245,184 @@ add_path_trace(struct pathtrace *pt, const char *path)
   * Don't want main() to inline us and defeat the reason
   * we have a separate function.
   */
@@ -189,7 +191,7 @@
 +static int (*handoff_capture)(pid_t, const char *, unsigned long, int (*)(void *), void *);
 +static int (*handoff_frontier)(long);
 +static struct tcb *pid2tcb(const int pid);
-+static pid_t handoff_pid, handoff_interrupt;
++static pid_t handoff_pid;
 +static volatile sig_atomic_t handoff_requested;
 +
 +struct handoff_reply { int32_t pid, fd, syscall, reserved; uint64_t bytes, started, frontier; };
@@ -282,6 +284,18 @@
 +    return true;
 +}
 +
++/* Readiness is observed without interrupting a partially completed I/O call. */
++static bool handoff_waiting(pid_t pid, int fd, bool writing)
++{
++    int owner = syscall(SYS_pidfd_open, pid, 0);
++    if (owner < 0) return false;
++    int copy = syscall(SYS_pidfd_getfd, owner, fd, 0); close(owner);
++    if (copy < 0) return false;
++    struct pollfd descriptor = {.fd = copy, .events = writing ? POLLOUT : POLLIN};
++    int flags = fcntl(copy, F_GETFL), ready = poll(&descriptor, 1, 0); close(copy);
++    return flags >= 0 && !(flags & O_NONBLOCK) && ready == 0;
++}
++
 +/* Entry snapshots exclude the pending call from the trace; blocked I/O snapshots restart it. */
 +static bool handoff_stop(struct tcb *tcp, bool entry)
 +{
@@ -297,12 +311,12 @@
 +    pid_t pid = handoff_pid;
 +    if (fflush(tcp->outf)) perror_msg_and_die("handoff trace flush");
 +    off_t boundary = (off_t)tcp->handoff_prefix;
-+    struct handoff_reply reply = {.pid = pid, .fd = frontier == 1 ? (int32_t)regs.rdi : -1, .syscall = regs.orig_rax, .reserved = entry ? 1 : 5, .bytes = boundary,
++    bool waiting = !entry || (frontier == 1 && handoff_waiting(pid, (int)regs.rdi, regs.orig_rax == 1 || regs.orig_rax == 20 || regs.orig_rax == 44 || regs.orig_rax == 46));
++    struct handoff_reply reply = {.pid = pid, .fd = frontier == 1 ? (int32_t)regs.rdi : -1, .syscall = regs.orig_rax, .reserved = waiting ? 5 : 1, .bytes = boundary,
 +        .started = tcp->handoff_started, .frontier = tcp->handoff_entered};
 +    int captured = boundary < 0 ? -1 : handoff_capture(pid, handoff_image, tcp->handoff_tid_state == 2 ? tcp->handoff_tid : 0, handoff_admit, &reply);
 +    if (captured > 0) {
 +        if (captured == 3 || (captured == 1 && !entry)) { handoff_pid = 0; reply.pid = 0; handoff_reply(reply); }
-+        else if (entry && frontier == 1) handoff_interrupt = pid;
 +        return false;
 +    }
 +    handoff_pid = 0;
@@ -314,39 +328,37 @@
 +
 +static void handoff_request(void)
 +{
-+    if (handoff_interrupt) {
-+        pid_t pid = handoff_interrupt; handoff_interrupt = 0;
-+        if (pid == handoff_pid && ptrace(PTRACE_INTERRUPT, pid, 0, 0) < 0) { handoff_pid = 0; handoff_reply((struct handoff_reply){0}); }
-+    }
 +    if (!handoff_requested) return;
 +    handoff_requested = 0;
 +    pid_t pid;
 +    ssize_t size = recv(handoff_fd, &pid, sizeof(pid), MSG_DONTWAIT);
-+    if (size < 0 && (errno == EAGAIN || errno == EINTR)) return;
-+    if (size != sizeof(pid) || pid <= 0 || handoff_pid) error_msg_and_die("invalid handoff request");
++    if (size < 0 && errno == EINTR) return;
++    if (size < 0 && errno == EAGAIN) { if (!handoff_pid) return; pid = handoff_pid; }
++    else if (size != sizeof(pid) || !pid || pid == INT_MIN || (handoff_pid && abs(pid) != handoff_pid)) error_msg_and_die("invalid handoff request");
++    bool interrupt = pid > 0; pid = abs(pid); /* Negative requests watch entries; a later signal demands an interrupt. */
 +    struct tcb *tcp = pid2tcb(pid);
-+    if (!tcp || tcp->handoff_tid_state == 3 || ptrace(PTRACE_INTERRUPT, pid, 0, 0) < 0) {
-+        handoff_reply((struct handoff_reply){0}); return;
-+    }
 +    handoff_pid = pid;
++    if ((tcp && tcp->handoff_tid_state == 3) || (interrupt && (!tcp || ptrace(PTRACE_INTERRUPT, pid, 0, 0) < 0))) {
++        handoff_pid = 0; handoff_reply((struct handoff_reply){0});
++    }
 +}
 +
  static void ATTRIBUTE_NOINLINE
  init(int argc, char *argv[])
  {
-@@ -2364,6 +2544,11 @@ init(int argc, char *argv[])
+@@ -2364,6 +2556,11 @@ init(int argc, char *argv[])
  		{ "help",		no_argument,	   0, 'h' },
  		{ "instruction-pointer", no_argument,      0, 'i' },
  		{ "interruptible",	required_argument, 0, 'I' },
 +		{ "handoff-fd", required_argument, 0, 0x4000 },
-+        { "handoff-admission-library", required_argument, 0, 0x4001 },
++        { "handoff-frontier-library", required_argument, 0, 0x4001 },
 +        { "handoff-image", required_argument, 0, 0x4002 },
 +        { "trace-children-only", no_argument, 0, 0x4003 },
 +        { "elide-path-data", no_argument, 0, 0x4004 },
  		{ "kill-on-exit",	no_argument,	   0, GETOPT_KILL_ON_EXIT },
  		{ "stack-trace" ,	optional_argument, 0, GETOPT_STACK },
  		{ "stack-traces" ,	optional_argument, 0, GETOPT_STACK },
-@@ -2564,6 +2749,15 @@ init(int argc, char *argv[])
+@@ -2564,6 +2761,15 @@ init(int argc, char *argv[])
  					  "by this build of strace");
  #endif
  			break;
@@ -362,7 +374,7 @@
  		case GETOPT_KILL_ON_EXIT:
  			opt_kill_on_exit = true;
  			break;
-@@ -3007,6 +3201,9 @@ init(int argc, char *argv[])
+@@ -3007,6 +3213,9 @@ init(int argc, char *argv[])
  
  	debug_msg("ptrace_setoptions = %#x", ptrace_setoptions);
  	test_ptrace_seize();
@@ -372,7 +384,7 @@
  	test_ptrace_get_syscall_info();
  
  	/*
-@@ -3288,6 +3485,12 @@ static struct tcb *
+@@ -3288,6 +3497,12 @@ static struct tcb *
  maybe_allocate_tcb(const int pid, int status)
  {
  	if (!WIFSTOPPED(status)) {
@@ -385,7 +397,7 @@
  		if (detach_on_execve && pid == strace_child) {
  			/* example: strace -bexecve sh -c 'exec true' */
  			strace_child = 0;
-@@ -3304,6 +3507,11 @@ maybe_allocate_tcb(const int pid, int status)
+@@ -3304,6 +3519,11 @@ maybe_allocate_tcb(const int pid, int status)
  		return NULL;
  	}
  	if (followfork) {
@@ -397,7 +409,7 @@
  		/* We assume it's a fork/vfork/clone child */
  		struct tcb *tcp = alloctcb(pid);
  		after_successful_attach(tcp, post_attach_sigstop);
-@@ -3588,6 +3796,7 @@ tcb_wait_tab_check_size(const size_t size)
+@@ -3588,6 +3808,7 @@ tcb_wait_tab_check_size(const size_t size)
  static const struct tcb_wait_data *
  next_event(void)
  {
@@ -405,7 +417,7 @@
  	if (interrupted)
  		return NULL;
  
-@@ -3913,6 +4122,8 @@ dispatch_event(const struct tcb_wait_data *wd)
+@@ -3913,6 +4134,8 @@ dispatch_event(const struct tcb_wait_data *wd)
  	 * around union wait fixed by glibc commit glibc-2.24~391
  	 */
  	int status = wd ? wd->status : 0;
@@ -414,7 +426,7 @@
  
  	if (current_tcp && has_seccomp_filter(current_tcp))
  		restart_op = seccomp_filter_restart_operator(current_tcp);
-@@ -3951,6 +4162,15 @@ dispatch_event(const struct tcb_wait_data *wd)
+@@ -3951,6 +4174,15 @@ dispatch_event(const struct tcb_wait_data *wd)
  		ATTRIBUTE_FALLTHROUGH;
  
  	case TE_SYSCALL_STOP:
@@ -430,7 +442,7 @@
  		if (trace_syscall(current_tcp, &restart_sig) < 0) {
  			/*
  			 * ptrace() failed in trace_syscall().
-@@ -3965,6 +4185,12 @@ dispatch_event(const struct tcb_wait_data *wd)
+@@ -3965,6 +4197,12 @@ dispatch_event(const struct tcb_wait_data *wd)
  			 */
  			return true;
  		}
@@ -443,7 +455,7 @@
  		if (has_seccomp_filter(current_tcp)) {
  			/*
  			 * Syscall and seccomp stops can happen in different
-@@ -4034,6 +4260,9 @@ dispatch_event(const struct tcb_wait_data *wd)
+@@ -4034,6 +4272,9 @@ dispatch_event(const struct tcb_wait_data *wd)
  		return true;
  
  	case TE_STOP_BEFORE_EXECVE:
@@ -453,7 +465,7 @@
  		/* The syscall succeeded, clear the flag.  */
  		current_tcp->flags &= ~TCB_CHECK_EXEC_SYSCALL;
  		/*
-@@ -4231,6 +4460,14 @@ main(int argc, char *argv[])
+@@ -4231,6 +4472,14 @@ main(int argc, char *argv[])
  {
  	setlocale(LC_ALL, "");
  	init(argc, argv);

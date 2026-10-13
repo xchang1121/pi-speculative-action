@@ -97,11 +97,12 @@ async function learnWorker(fixture: LinuxProcessBenchmark, scope: { sessionID: s
 	return { actor, execute, seed, binding: binding!, handoffs, invocation: binding! };
 }
 
-async function runningProcess(start: number, ready: (pid: number, syscall: string) => boolean | Promise<boolean>) {
+async function runningProcess(start: number, ready: (pid: number, syscall: string) => boolean | Promise<boolean>, captured?: ReadonlyMap<string, number>) {
 	let pid = 0;
 	await expect.poll(async () => {
 		for (const [, args] of vi.mocked(childProcess.spawn).mock.calls.slice(start)) {
 			const reportPath = Array.isArray(args) && args.find(arg => arg.endsWith("/fd-offsets")); if (!reportPath) continue;
+			if (captured?.has(reportPath)) { pid = captured.get(reportPath)!; return true; }
 			const report = await readFile(reportPath, "utf8").catch(() => "");
 			const match = /\nRUNNING (\d+)\n$/.exec(report); if (!match) continue;
 			const current = Number(match[1]), syscall = await readFile(`/proc/${current}/syscall`, "utf8").catch(() => "");
@@ -156,12 +157,11 @@ int main(int argc, char **argv) { FILE *f = fopen(argc > 1 ? argv[1] : "/etc/iss
 			expect(await readFile(target, "utf8")).toBe("old\n");
 		}
 		const { readFile: read } = await vi.importActual<typeof filesystem>("node:fs/promises"); let changed = false;
-		const reading = vi.spyOn(filesystem, "readFile").mockImplementation(async (...args) => {
+		using _reading = vi.spyOn(filesystem, "readFile").mockImplementation(async (...args) => {
 			const bytes = await read(...args);
 			if (!changed && String(args[0]).includes("/trace-")) { changed = true; await writeFile(target, "new\n"); }
 			return bytes;
 		});
-		await using _reading = onExit(async () => { reading.mockRestore(); });
 		await using branch = disposable(await forkReusableBash(fixture, { command: `cat '${target}'`, label: "raced", actionNamespace: "read-image-race", ...prepared }));
 		expect(changed).toBe(true); expect(textOutput(branch.output.result)).toBe("old\n");
 		expect(await branch.validate?.()).toMatchObject({ status: "stale" });
@@ -282,8 +282,7 @@ int main(int argc, char **argv) {
 
 nativeTest.for(["unusable", "one-shot", "descendant", "unusable-descendant"] as const)("rechecks failed native preparation when its observed inputs change (%s)", { timeout: 20_000 }, async (mode, { benchmark }) => {
 		const fixture = await benchmark("pi-preparation-evidence-");
-		const publishing = vi.spyOn(fixture.backend.planner, "publishCompleted");
-		await using _cleanup = onExit(async () => { publishing.mockRestore(); await fixture.dispose(); });
+		using publishing = vi.spyOn(fixture.backend.planner, "publishCompleted");
 		await writeFile(path.join(fixture.workspace, "input.txt"), "prepared\n");
 		await writeFile(path.join(fixture.workspace, "body.sh"), 'ulimit -c 0\n' + (mode === "unusable-descendant" ? "" : 'printf "prepared\\n"\n'));
 		if (mode === "unusable-descendant") await writeFile(path.join(fixture.workspace, "unusable-child.sh"),
@@ -354,15 +353,13 @@ nativeTest.for(["unusable", "one-shot", "descendant", "unusable-descendant"] as 
 
 nativeTest.for([false, true])("prepares a failed command after its reported input is edited and validates before committing (stale=%s)", { timeout: 20_000 }, async (stale, { benchmark }) => {
 		const fixture = await benchmark("pi-failed-command-");
-		let host: ReturnType<typeof createSpeculativeActionHost> | undefined;
-		await using _cleanup = onExit(async () => { await host?.dispose(); await fixture.dispose(); });
 		await writeFile(path.join(fixture.workspace, "source.txt"), "broken\n");
 		await commitBenchmarkFixture(fixture.workspace, "failed command input");
 		await prepareLinuxProcessReuse(fixture);
 		const writer = createWriteTool(fixture.workspace), tools = [fixture.tool, writer], sessionID = "failed-command";
 		const command = 'IFS= read -r value < source.txt; if [ "$value" != fixed ]; then printf "source.txt:1: expected fixed, got %s\\n" "$value"; exit 1; fi; printf "%s\\n" "$value" > generated.txt; printf "verified\\n"';
 		const prepared = patternProcessHost(fixture, sessionID, { patternAware: patternAwareSettings({ presets: ["retry-failed-command"] }) }, {}, tools), { events, start } = prepared;
-		host = prepared.host;
+		await using host = disposable(prepared.host);
 		const call = (turnID: string) => prepared.call(turnID, command);
 		await start("failure");
 		await expect(host.execute(call("failure"), undefined, () => fixture.tool.execute("failure", { command }))).rejects.toThrow("got broken");
@@ -395,8 +392,6 @@ nativeTest.for([false, true])("prepares a failed command after its reported inpu
 nativeTest.for(["bash", "write", "stale", "disabled", "bash:shared", "write:shared", "stale:shared", "disabled:shared", "bash:parents", "bash:aliases", "bash:both", "bash:repeat", "write:repeat"])("reprepares changed children beyond fresh beam entries (%s)", { timeout: 20_000 }, async (scenario, { benchmark }) => {
 	const [mode, layout] = scenario.split(":"), target = layout === "parents" ? "first" : "last", both = layout === "both";
 	const fixture = await benchmark("pi-rerun-frontier-", "git"), scope = { sessionID: "frontier", turnID: "seed" };
-	let host: ReturnType<typeof createSpeculativeActionHost> | undefined;
-	await using _cleanup = onExit(async () => { await host?.dispose(); await fixture.dispose(); });
 	for (const name of ["first", "last"]) await writeFile(path.join(fixture.workspace, name), "old\n");
 	await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker", code: `${cHeaders("fcntl.h unistd.h")}
 int main(int argc, char **argv) { if (argc != 2) return 1; int fd = open(${layout ? '"last"' : "argv[1]"}, O_RDONLY); char bytes[16];
@@ -407,7 +402,8 @@ int main(int argc, char **argv) { if (argc != 2) return 1; int fd = open(${layou
 	const route = await fixture.prepareActorReplay(), writer = createWriteTool(fixture.workspace), tools = [fixture.tool, writer];
 	const registry = Reflect.get(fixture.backend, "handoffs") as ProcessHandoffRegistry<{ executable: string; args: readonly string[] }>;
 	const settings = { candidateLimit: 4, maxConcurrentActions: 4, patternAware: patternAwareSettings({ multiStepEnabled: false, beamWidth: 1, presets: ["recent-command"] }) };
-	const prepared = patternProcessHost(fixture, scope.sessionID, settings, {}, tools), { events, start, call } = prepared; host = prepared.host;
+	const prepared = patternProcessHost(fixture, scope.sessionID, settings, {}, tools), { events, start, call } = prepared;
+	await using host = disposable(prepared.host);
 	const execute = (turnID: string, command: string) => host!.execute({ ...call(turnID, command), id: `${turnID}:${command}` }, AbortSignal.timeout(10_000),
 		() => fixture.coordinator.runWith(route.executor, () => fixture.tool.execute(turnID, { command })));
 	await start("seed");
@@ -491,7 +487,7 @@ int main(void) { int fds[2]; if (${mode === "eventfd" ? "(fds[0] = eventfd(0, 0)
 		await commitBenchmarkFixture(fixture.workspace, "Closed input prefix");
 		const scope = { sessionID: "prefix", turnID: "same" };
 		const { handoffs, actor, seed, binding, invocation } = await learnWorker(fixture, scope, `exec ./${descendant ? "launch" : "worker"}`);
-		const publishing = vi.spyOn(handoffs, "publish");
+		using publishing = vi.spyOn(handoffs, "publish");
 		await rm(path.join(fixture.workspace, "prefix-ready"));
 		await fixture.workspaceSandbox.withWorkspace(fixture.workspace, async workspace => {
 			const session = await fixture.backend.open({ sourceRoot: fixture.workspace, workspace, invocation, scope });
@@ -499,19 +495,19 @@ int main(void) { int fds[2]; if (${mode === "eventfd" ? "(fds[0] = eventfd(0, 0)
 			const acquire = handoffs.acquire.bind(handoffs), observe = handoffs.observeRunning.bind(handoffs), wait = scheduling.waitForCompletion;
 			let completion: Promise<void> | undefined, joins = 0, cancelled: Promise<unknown> | undefined;
 			const admissions: Array<{ syscall: number; accepted: boolean | undefined }> = [];
-			const acquiring = vi.spyOn(handoffs, "acquire").mockImplementation(async request => {
+			using _acquiring = vi.spyOn(handoffs, "acquire").mockImplementation(async request => {
 				const result = await acquire(request);
 				if (mode === "sample" && result.kind === "work") { completion = result.work.completion; await starting.wait(); }
 				return result;
 			});
-			const joining = vi.spyOn(scheduling, "waitForCompletion").mockImplementation((promise, signal, timeout) => {
+			using _joining = vi.spyOn(scheduling, "waitForCompletion").mockImplementation((promise, signal, timeout) => {
 				if (promise === completion) starting.release(); return wait(promise, signal, timeout);
 			});
-			const observing = vi.spyOn(handoffs, "observeRunning").mockImplementation((key, work, invoke) => observe(key, work, async () => {
+			using _observing = vi.spyOn(handoffs, "observeRunning").mockImplementation((key, work, invoke) => observe(key, work, async () => {
 				if (mode === "threads" && ++joins === 2) { controller.abort(); frontier.release(); } return invoke();
 			}));
 			const target = fixture.backend as unknown as { requestProcessImageAtFrontier(...args: unknown[]): Promise<unknown> }, request = target.requestProcessImageAtFrontier.bind(target);
-			const requesting = vi.spyOn(target, "requestProcessImageAtFrontier").mockImplementation(async (...args) => {
+			using _requesting = vi.spyOn(target, "requestProcessImageAtFrontier").mockImplementation(async (...args) => {
 				const admit = args[4] as (pid: number, reply: Buffer, report: Buffer) => Promise<boolean | undefined>;
 				args[4] = async (pid: number, reply: Buffer, report: Buffer) => {
 					const accepted = await admit(pid, reply, report); admissions.push({ syscall: reply.readInt32LE(8), accepted }); return accepted;
@@ -521,7 +517,6 @@ int main(void) { int fds[2]; if (${mode === "eventfd" ? "(fds[0] = eventfd(0, 0)
 			const spawnStart = vi.mocked(childProcess.spawn).mock.calls.length, pending = session.executeBinding(binding), settled = pending.catch(() => undefined);
 			await using _cleanup = onExit(async () => {
 				controller.abort(); starting.release(); frontier.release(); await session.close(); await settled; await cancelled;
-				acquiring.mockRestore(); joining.mockRestore(); observing.mockRestore(); requesting.mockRestore();
 			});
 			if (mode === "sample") await starting.entered;
 			else if (descendant) await runningProcess(spawnStart, (_pid, syscall) => syscall.startsWith("0 0x3 "));
@@ -550,20 +545,25 @@ int main(void) { int fds[2]; if (${mode === "eventfd" ? "(fds[0] = eventfd(0, 0)
 				if (cyclic) expect(timing.hiddenComputeMs).toBe(0); else expect(timing.hiddenComputeMs).toBeGreaterThan(0);
 			} else if (mode === "sample") expect(new TaskTimeline(issuedAt).recordTool(continuations[0]!.computation, issuedAt, true).hiddenComputeMs).toBe(0);
 		}, { liveLower: true });
-		publishing.mockRestore();
 	});
 
-	nativeTest.for(["pipe", "socket", "peer", "eventfd", "readv", "recvmsg", "writev", "mmap", "runtime", "handles", "eof", "early", "changed", "identity", "file", "cancel", "pipe:unavailable", "peer:unavailable", "eventfd:unavailable", "queue-drop", "queue-deferred", "queue-received", "queue-closed", "queue-peeked", "queue-changed", "queue-cancel", "queue-deferred:unavailable", "queue-alias", "queue-counter", "queue-stream", "queue-nested", "queue-peek-kept", "queue-stale", "queue-received-cancel", "queue-received:unavailable"])("resumes a learned running process with future input (%s)", { timeout: 60_000 }, async (scenario, { skip, benchmark }) => {
-		const [mode, unavailable] = scenario.split(":"), fixture = await benchmark("pi-live-process-", undefined, { processImages: unavailable ? false : undefined });
+	nativeTest.for(["pipe", "socket", "peer", "eventfd", "readv", "recvmsg", "writev", "mmap", "runtime", "handles", "eof", "early", "changed", "identity", "file", "cancel", "pipe:unavailable", "peer:unavailable", "eventfd:unavailable", "queue-drop", "queue-deferred", "queue-received", "queue-closed", "queue-peeked", "queue-changed", "queue-cancel", "queue-deferred:unavailable", "queue-alias", "queue-counter", "queue-stream", "queue-nested", "queue-peek-kept", "queue-stale", "queue-received-cancel", "queue-received:unavailable",
+		"pipe:sync", "changed:sync", "cancel:sync", "peer:sync", "queue-received:sync", "queue-stale:sync"])("resumes a learned process with future input (%s)", { timeout: 60_000 }, async (scenario, { skip, benchmark }) => {
+		const [mode, transport] = scenario.split(":"), unavailable = transport === "unavailable", synchronous = transport === "sync";
+		const fixture = await benchmark("pi-live-process-", undefined, { processImages: unavailable ? false : undefined });
 		const queued = mode!.startsWith("queue-"), stale = mode === "queue-stale", changed = stale || mode!.endsWith("changed"), cancelled = mode!.endsWith("cancel");
+		const sealable = !unavailable && !["identity", "peer", "file", "queue-peeked"].includes(mode!), resumed = sealable && !changed && !cancelled;
 		const received = queued && !["queue-drop", "queue-deferred", "queue-changed", "queue-cancel"].includes(mode!), alias = mode === "queue-alias";
-		const inspecting = vi.spyOn(await import("../src/linux-held-exec.ts"), "inspectHeldExecProcess");
+		using inspecting = vi.spyOn(await import("../src/linux-held-exec.ts"), "inspectHeldExecProcess");
 		const observations = new Map<string, { bindings: readonly ProcessExecutionBinding[]; computations: readonly TimelineDependency[] }>();
 		const observeBindings = fixture.backend.observeBindings.bind(fixture.backend);
-		const observing = vi.spyOn(fixture.backend, "observeBindings").mockImplementation((scope, execute, observe, learn, inputs) =>
+		using _observing = vi.spyOn(fixture.backend, "observeBindings").mockImplementation((scope, execute, observe, learn, inputs) =>
 			observeBindings(scope, execute, (bindings, computations) => { observations.set(scope.turnID, { bindings, computations }); observe(bindings, computations); }, learn, inputs));
-		let host: ReturnType<typeof createSpeculativeActionHost> | undefined;
-		await using _cleanup = onExit(async () => { observing.mockRestore(); inspecting.mockRestore(); await host?.dispose(); await fixture.dispose(); });
+		const captured = new Map<string, number>(), capture = Reflect.get(fixture.backend, "requestProcessImageAtFrontier").bind(fixture.backend);
+		let captureGate: Promise<void> | undefined;
+		using _capturing = vi.spyOn(fixture.backend as any, "requestProcessImageAtFrontier").mockImplementation(async (...args) => {
+			await captureGate; const result = await capture(...args); if (result) captured.set(args[0] as string, result.pid); return result;
+		});
 		await prepareLinuxProcessReuse(fixture);
 		if (unavailable) expect((await Reflect.get(fixture.backend, "ready")).imageLibrary).toBeUndefined();
 		if (!unavailable && !(await Reflect.get(fixture.backend, "ready")).imageLibrary) return skip("native process image capture is unavailable");
@@ -680,9 +680,11 @@ int main(int argc, char **argv) {
 		const publishing = vi.spyOn(registry, "publish"), errors = vi.spyOn(fixture.backend as any, "setError");
 		const prepared = patternProcessHost(fixture, scope.sessionID, { candidateLimit: 4, maxConcurrentActions: 4,
 			patternAware: patternAwareSettings({ enabled: true, multiStepEnabled: false, beamWidth: 4 }) }), { events, start, call } = prepared;
-		host = prepared.host;
+		await using host = disposable(prepared.host);
+		const runSync = async (command: string) => ({ details: {}, content: [{ type: "text" as const, text: childProcess.execFileSync(fixture.shellPath, ["-c", command],
+			{ cwd: fixture.workspace, env: fixture.environment, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }) }] });
 		const execute = (turnID: string, command: string, signal = AbortSignal.timeout(10_000)) => host!.execute(call(turnID, command), signal,
-				() => fixture.coordinator.runWith(route.executor, () => fixture.tool.execute(turnID, { command }, signal)));
+				() => synchronous && turnID === "prepared" ? runSync(command) : fixture.coordinator.runWith(route.executor, () => fixture.tool.execute(turnID, { command }, signal)));
 		for (const turnID of ["common-1", "common-2"]) { await start(turnID); await execute(turnID, "printf common"); await host.finishTurn(turnID); }
 		await start("seed"); const seed = await execute("seed", "printf seed; launch seed"); await host.finishTurn("seed");
 		expect(seed.content).toMatchObject([{ type: "text", text: expect.stringMatching(/^seedABC:\d+\n$/) }]);
@@ -697,51 +699,58 @@ int main(int argc, char **argv) {
 				return /^(?:running|-1 )/.test(syscall) && Number(fields[11]) + Number(fields[12]) >= 40;
 			}
 			return syscall.startsWith(mode === "handles" ? "0 0x8 " : mode === "writev" ? "20 0x4 " : mode === "readv" ? "19 0x3 " : mode === "recvmsg" ? "47 0x3 " : "0 0x3 ");
-		}).catch(error => { throw new Error(diagnostic(), { cause: error }); });
+		}, captured).catch(error => { throw new Error(diagnostic(), { cause: error }); });
+		const sealed = (turnID: string) => registry.bindings(scope).find(binding => binding.scope.turnID === turnID && registry.results(binding.key, scope).some(result => result.result.continuation));
+		if (sealable && mode !== "early") await expect.poll(() => sealed("prepared"), { timeout: 5_000 }).toBeDefined().catch(error => { throw new Error(diagnostic(), { cause: error }); });
+		const preparedBinding = sealed("prepared");
 		if (cancelled) { await host.finishTurn("prepared", true); await expect.poll(() => existsSync(`/proc/${privatePid}`)).toBe(false); }
 		const command = `printf actual; launch ${changed ? "changed" : "actual"}`;
 		const inspectionStart = inspecting.mock.calls.length;
-		const actual = cancelled ? await fixture.coordinator.runWith({ execute: request => route.executor.execute({ ...request, scope: { ...scope, turnID: "later" } }) },
+		const actual = cancelled && synchronous ? await fixture.backend.observeNative(fixture.workspace, { ...scope, turnID: "later" }, undefined, () => runSync(command)) : cancelled ? await fixture.coordinator.runWith({ execute: request => route.executor.execute({ ...request, scope: { ...scope, turnID: "later" } }) },
 			() => fixture.tool.execute("later", { command })) : await execute("prepared", command);
 		expect(actual.content, JSON.stringify(actual.content)).toEqual(seed.content.map(item => item.type === "text" ? { ...item,
 			text: item.text.replace(/^seedA/, `actual${changed ? "D" : "A"}`) } : item));
-		const resumed = !unavailable && !changed && !cancelled && !["identity", "peer", "file", "queue-peeked"].includes(mode!);
-		expect(fixture.backend.actorMetrics().joinedHits, diagnostic()).toBe(Number(resumed));
+		if (!alias) expect(fixture.backend.actorMetrics().hits, diagnostic()).toBe(Number(resumed));
+		if (!alias) expect(fixture.backend.actorMetrics().joinedHits, diagnostic()).toBe(Number(resumed && mode === "early"));
 		if (alias) expect(inspecting.mock.calls.slice(inspectionStart).some(([, , descriptors]) => [5, 13].every(slot => descriptors?.some(fd => fd.fd === slot && fd.alias === 5 && fd.offset === 2 && fd.owned)) && !descriptors?.some(fd => fd.fd === 12))).toBe(true);
 		if (queued && resumed) expect(publishing.mock.calls.some(([, , certificate]) => certificate?.prototype.inheritedFDs.some(fd => fd.installed === false))).toBe(true);
 		if (resumed) expect(publishing.mock.calls.some(([, , certificate, , continuation, computation]) => certificate?.result.continuation &&
 			continuation && computation && computation.completedAt > continuation.computation.completedAt), diagnostic()).toBe(true);
-		if (!cancelled) { if (!resumed) expect(existsSync(`/proc/${privatePid}`)).toBe(true); await host.finishTurn("prepared", true); }
+		if (!cancelled) { if (!sealable) expect(existsSync(`/proc/${privatePid}`)).toBe(true); await host.finishTurn("prepared", true); }
 		await expect.poll(() => existsSync(`/proc/${privatePid}`), { timeout: 5_000 }).toBe(false); // Retirement kills asynchronously, as for cancel.
 		if (!cancelled) expect(consumedTiming(events, "prepared").hiddenComputeMs > 0, diagnostic()).toBe(resumed);
 		if (resumed) expect(events.filter(event => event.type === "operation_prediction"), diagnostic()).toContainEqual(expect.objectContaining({ settlement: expect.objectContaining({
 			observation: "observed", match: expect.objectContaining({ matched: true, adoption: expect.objectContaining({ status: "adopted" }) }) }) }));
 		const binding = observations.get("prepared")?.bindings.find(candidate => registry.resolveBinding(candidate, scope)?.executable === path.join(fixture.workspace, "worker"));
 		if (resumed) expect(binding, diagnostic()).toMatchObject({ available: true });
+		if (resumed && preparedBinding) expect(binding, diagnostic()).toBe(preparedBinding);
 		if (resumed && ["pipe", "queue-received"].includes(mode!)) {
 			const invocation = resolvePiToolInvocation("bash", { command: "exit 92" }, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath })!.process!;
-			for (const phase of ["foreign", "fresh", "changed", "cancel", "revoked"]) await fixture.workspaceSandbox.withWorkspace(fixture.workspace, async workspace => {
+			for (const phase of ["foreign", "fresh", "changed", "cancel", "closed", "revoked"]) await fixture.workspaceSandbox.withWorkspace(fixture.workspace, async workspace => {
 				if (phase === "revoked") { await fixture.backend.storage.maintain("clear"); expect(binding!.available).toBe(false); }
-				const later = { sessionID: phase === "foreign" ? "foreign" : scope.sessionID, turnID: phase }, fresh = phase === "fresh";
+				const later = { sessionID: phase === "foreign" ? "foreign" : scope.sessionID, turnID: phase }, fresh = phase === "fresh" || phase === "closed", pending = deferred();
+				captureGate = phase === "cancel" ? pending.promise : undefined;
 				const session = await fixture.backend.open({ sourceRoot: fixture.workspace, workspace, invocation, scope: later });
 				const spawnStart = vi.mocked(childProcess.spawn).mock.calls.length, preparing = session.executeBinding(binding!);
 				void preparing.catch(() => undefined);
-				await using _cleanup = onExit(async () => { await session.close(); await preparing.catch(() => undefined); });
+				await using _cleanup = onExit(async () => { pending.resolve(); await session.close(); await preparing.catch(() => undefined); });
 				if (phase === "foreign" || phase === "revoked") { await expect(preparing).rejects.toThrow("unavailable in this scope"); return; }
-				const pid = await runningProcess(spawnStart, (_pid, syscall) => syscall.startsWith("0 0x3 "));
-				if (phase === "cancel") await session.close();
-				const before = fixture.backend.actorMetrics().joinedHits;
+				const pid = await runningProcess(spawnStart, (_pid, syscall) => syscall.startsWith("0 0x3 "), captured);
+				if (phase !== "cancel") await expect.poll(() => sealed(phase), { timeout: 5_000 }).toBeDefined().catch(error => { throw new Error(phase + diagnostic(), { cause: error }); });
+				if (phase === "closed") await preparing;
+				if (phase === "cancel" || phase === "closed") { pending.resolve(); await session.close(); }
+				const before = fixture.backend.actorMetrics().hits;
 				const repeated = await TimelineInterval.measure(() => fixture.backend.observeBindings(later,
 					() => executeProcess(fixture, route.executor, `launch ${phase === "changed" ? "changed" : "actual"}`, { scope: later, signal: AbortSignal.timeout(10_000) }), () => {}, false),
 					() => observations.get(phase)!.computations);
 				const timing = consumedTiming(repeated.computation);
 				expect(repeated.output).toEqual({ output: `${phase === "changed" ? "D" : "A"}BC:7107042143181080257\n`, exitCode: 0 });
-				expect([fixture.backend.actorMetrics().joinedHits - before, timing.hiddenComputeMs > 0], diagnostic()).toEqual([Number(fresh), fresh]);
+				expect([fixture.backend.actorMetrics().hits - before, timing.hiddenComputeMs > 0], phase + diagnostic()).toEqual([Number(fresh), fresh]);
 				if (fresh) {
 					expect(await preparing).toEqual({ output: [], suspended: true });
 					expect(observations.get(phase)!.bindings).toEqual([session.executionBindings()[0]]);
 				} else expect(observations.get(phase)!.bindings).toEqual([]);
-				expect(existsSync(`/proc/${pid}`)).toBe(phase === "changed");
+				expect(existsSync(`/proc/${pid}`)).toBe(false);
 			}, { liveLower: true });
 		}
 	});
@@ -819,18 +828,17 @@ int main(void) { char b[1024]; return syscall(SYS_getdents64, 4, b, sizeof(b)) <
 		let check: (() => Promise<boolean>) | undefined;
 		const registry = Reflect.get(fixture.backend, "handoffs") as ProcessHandoffRegistry;
 		const observe = registry.observeRunning.bind(registry), open = fixture.backend.open.bind(fixture.backend);
-		const observing = vi.spyOn(registry, "observeRunning").mockImplementation((key, owner, invoke) => {
+		using _observing = vi.spyOn(registry, "observeRunning").mockImplementation((key, owner, invoke) => {
 			const release = observe(key, owner, invoke); check = owner.advance; return release;
 		});
 		const hints = ["ignored.txt", "stable.txt", "input.txt"].map(name => path.join(fixture.workspace, name));
-		const opening = vi.spyOn(fixture.backend, "open").mockImplementation(input => {
+		using _opening = vi.spyOn(fixture.backend, "open").mockImplementation(input => {
 			workspace = input.workspace;
 			return open({ ...input, workspace: { ...input.workspace, sourceChanges: () => ({ uncertain: false, paths: hints }) } });
 		});
 		await using _cleanup = onExit(async () => {
 			if (workspace) await writeFile(path.join(workspace.sandboxRoot, "release"), "").catch(() => {});
 			await (await pending?.catch(() => undefined))?.dispose();
-			opening.mockRestore(); observing.mockRestore(); await fixture.dispose();
 		});
 		for (const file of hints) await writeFile(file, "baseline");
 		await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker", code: `${cHeaders("fcntl.h unistd.h")}
@@ -858,15 +866,13 @@ int main(void) {
 		await expect.poll(() => Boolean(workspace && existsSync(path.join(workspace.sandboxRoot, "ready"))), { timeout: 5000 }).toBe(true);
 		expect(check).toBeDefined();
 		await writeFile(hints[0]!, "unrelated"); await writeFile(hints[2]!, "predecessor");
-		const opened = vi.spyOn(filesystem, "open"), reads = opened.mock.calls.length;
-		try {
-			expect(await check!()).toBe(true); // The child's transaction starts after the shell's write.
-			await writeFile(hints[2]!, "after");
-			// A bounded trace preview can lag the separate filesystem readiness signal.
-			await expect.poll(() => check!(), { timeout: 2000 }).toBe(false);
-			expect(opened.mock.calls.slice(reads).filter(([file]) => String(file) === hints[0])).toHaveLength(0);
-			expect(fixture.backend.actorMetrics().lastError).toContain("actor_running_input_changed:");
-		} finally { opened.mockRestore(); }
+		using opened = vi.spyOn(filesystem, "open").mockClear();
+		expect(await check!()).toBe(true); // The child's transaction starts after the shell's write.
+		await writeFile(hints[2]!, "after");
+		// A bounded trace preview can lag the separate filesystem readiness signal.
+		await expect.poll(() => check!(), { timeout: 2000 }).toBe(false);
+		expect(opened.mock.calls.filter(([file]) => String(file) === hints[0])).toHaveLength(0);
+		expect(fixture.backend.actorMetrics().lastError).toContain("actor_running_input_changed:");
 		await writeFile(path.join(workspace!.sandboxRoot, "release"), "");
 		if (workspace && Reflect.get(workspace, "liveBase")) await expect(pending).rejects.toThrow("workspace changed since the sandbox started: input.txt");
 		else expect((await pending).output.result.content).toEqual([{ type: "text", text: "predecessor" }]);
@@ -874,8 +880,8 @@ int main(void) {
 
 nativeTest.for(["completed", "running", "native", "native-merged", "native-closed-input", "native-descriptors", "native-descriptors-merged", "native-null", "native-null-stdin", "native-status", "native-directory", "native-directory-entries", "native-directory-prepared-stale", "native-directory-opath", "native-directory-opath-prepared-stale", "native-pipe", "native-pipe-prepared-stale", "native-pipe-live", "native-pipe-live-prepared-stale", "native-pipe-live-mixed", "native-pipe-live-transfer", "native-pipe-producer", "native-pipe-producer-queued", "native-pipe-producer-short", "native-pipe-producer-splice", "native-socket", "native-socket-running", "native-socket-duplex", "native-socket-lifetime", "native-socket-io", "native-socket-messages", "native-socket-export", "native-socket-counter-export", "native-socket-prequeued", "native-socket-segmented", "native-socket-prefixed", "native-socket-orphan", "native-eventfd", "native-eventfd-semaphore", "native-socket-concurrent", "native-socket-half-closed", "native-socket-prepared-stale", "native-shared-table", "native-unshare", "native-prepared-stale", "native-prepared-restored"] as const)("reexecutes an owned child binding across turns without replaying its parent or stale input (%s)", { timeout: 20_000 }, async (mode, { skip, benchmark }) => {
 		const fixture = await benchmark("pi-process-binding-", mode.includes("prepared-") ? "git" : undefined); // Borrowed immutable preparations.
-		const publishing = vi.spyOn(fixture.backend.planner, "publishCompleted");
-		const errors = vi.spyOn(fixture.backend as unknown as { setError(session: unknown, message: string): void }, "setError");
+		using publishing = vi.spyOn(fixture.backend.planner, "publishCompleted");
+		using errors = vi.spyOn(fixture.backend as unknown as { setError(session: unknown, message: string): void }, "setError");
 		const native = mode.startsWith("native"), running = mode.endsWith("running"), enumerate = mode.includes("entries");
 		const reopened = mode.startsWith("native-descriptors") || ["native-directory-entries", "native-directory-opath"].includes(mode);
 		const orphan = mode.includes("orphan"), segmented = mode.includes("segmented"), prefixed = mode.endsWith("prefixed"), queueCounter = mode === "native-socket-counter-export", prequeued = orphan || segmented || prefixed || mode.endsWith("prequeued") || queueCounter;
@@ -890,7 +896,7 @@ nativeTest.for(["completed", "running", "native", "native-merged", "native-close
 		let host: ReturnType<typeof createSpeculativeActionHost> | undefined;
 		let publication: ReturnType<typeof holdProcessPublication> | undefined;
 		let restorePreparation: (() => void) | undefined;
-		await using _cleanup = onExit(async () => { publication?.close(); restorePreparation?.(); publishing.mockRestore(); errors.mockRestore(); await host?.dispose(); await fixture.dispose(); });
+		await using _cleanup = onExit(async () => { publication?.close(); restorePreparation?.(); await host?.dispose(); });
 		await writeFile(path.join(fixture.workspace, "input.txt"), "before\n");
 		if (descriptors) await writeFile(path.join(fixture.workspace, "fd.txt"), "abcdef");
 		if (mode === "native-descriptors-merged") await writeFile(path.join(fixture.workspace, "fd-other.txt"), "abcdef");
@@ -1072,14 +1078,12 @@ int main(int argc, char **argv) {
 			for (const certificate of history) await fixture.backend.store.put(certificate);
 			await writeFile(path.join(fixture.workspace, "input.txt"), "after\n");
 			await expect(validateTransferredProcessEvidence(certificate!.dependencyCertificate)).resolves.toMatchObject({ status: "stale" });
-			const validation = vi.spyOn(await import("../src/provenance-validation.ts"), "validateDynamicDependencyCertificate");
-			try {
-				for (const value of ["after", "before", "history-3", "after"]) {
-					await writeFile(path.join(fixture.workspace, "input.txt"), `${value}\n`); validation.mockClear();
-					expect(await fixture.backend.bindingStale(binding!)).toBe(value === "after");
-					expect(validation).toHaveBeenCalledOnce(); // All historical results share current evidence; every new call captures it again.
-				}
-			} finally { validation.mockRestore(); }
+			using validation = vi.spyOn(await import("../src/provenance-validation.ts"), "validateDynamicDependencyCertificate");
+			for (const value of ["after", "before", "history-3", "after"]) {
+				await writeFile(path.join(fixture.workspace, "input.txt"), `${value}\n`); validation.mockClear();
+				expect(await fixture.backend.bindingStale(binding!)).toBe(value === "after");
+				expect(validation).toHaveBeenCalledOnce(); // All historical results share current evidence; every new call captures it again.
+			}
 
 			let operationRoot = "";
 			await fixture.workspaceSandbox.withWorkspace(fixture.workspace, async workspace => {
@@ -2271,7 +2275,7 @@ int main(void) { int status; struct timespec pause = {0, 300000000}; pid_t sibli
 			expect(await prepared.validate?.()).toMatchObject({ status: "valid" });
 		} finally { await prepared.dispose(); }
 		const open = fixture.backend.open.bind(fixture.backend);
-		const racing = vi.spyOn(fixture.backend, "open").mockImplementationOnce(async input => {
+		using _racing = vi.spyOn(fixture.backend, "open").mockImplementationOnce(async input => {
 			const session = await open(input);
 			return { ...session, executeBinding: async binding => {
 				const result = await session.executeBinding(binding);
@@ -2279,7 +2283,6 @@ int main(void) { int status; struct timespec pause = {0, 300000000}; pid_t sibli
 				return result;
 			} };
 		});
-		await using _racing = onExit(async () => { racing.mockRestore(); });
 		await expect(prepareBound()).rejects.toThrow(/unrepresentable writes outside the workspace.*external_write/);
 		expect(await host("kept")).toBe("raced\n");
 	});
@@ -2306,13 +2309,14 @@ int main(void) { int fds[2], status; char queue[8]; if (pipe(fds) || fds[0] != 3
 		const fixture = await benchmark("pi-process-concurrency-");
 		const { readlink, readFile: readTrace, rm: removeFile, mkdtemp: allocateRoot } = await vi.importActual<typeof filesystem>("node:fs/promises");
 		const { spawn } = await vi.importActual<typeof childProcess>("node:child_process");
-		const kill = process.kill.bind(process), killing = vi.spyOn(process, "kill");
+		const kill = process.kill.bind(process);
+		using killing = vi.spyOn(process, "kill");
 		const open = fixture.backend.open.bind(fixture.backend);
 		let closeSession: (() => Promise<void>) | undefined;
 		let onClose: ((workspace: string, first: Promise<void>, close: () => Promise<void>) => void) | undefined;
 		const captures: WorkspaceTransactionCapture[] = [];
 		let restoreTransactions: (() => void) | undefined;
-		const opening = vi.spyOn(fixture.backend, "open").mockImplementation(async (input) => {
+		using _opening = vi.spyOn(fixture.backend, "open").mockImplementation(async (input) => {
 			if (!restoreTransactions) {
 				const begin = input.workspace.transactions.begin;
 				const recording = vi.spyOn(input.workspace.transactions, "begin").mockImplementation(async () => {
@@ -2329,7 +2333,7 @@ int main(void) { int fds[2], status; char queue[8]; if (pipe(fds) || fds[0] != 3
 		});
 		const createServer = net.createServer;
 		let broker: { server: net.Server; socket: net.Socket; path: string } | undefined;
-		const servers = vi.spyOn(net, "createServer").mockImplementation((...args) => {
+		using _servers = vi.spyOn(net, "createServer").mockImplementation((...args) => {
 			const server = createServer(...args);
 			server.on("connection", (socket) => {
 				const address = server.address();
@@ -2337,21 +2341,15 @@ int main(void) { int fds[2], status; char queue[8]; if (pipe(fds) || fds[0] != 3
 			});
 			return server;
 		});
-		const spawning = vi.mocked(childProcess.spawn);
-		const allocations = vi.mocked(filesystem.mkdtemp);
-		const sampling = vi.spyOn(filesystem, "readlink").mockImplementation((...args) => {
+		using spawning = vi.mocked(childProcess.spawn);
+		using allocations = vi.mocked(filesystem.mkdtemp);
+		using _sampling = vi.spyOn(filesystem, "readlink").mockImplementation((...args) => {
 			const tracer = spawning.mock.results.some(({ value }) => value?.pid && String(args[0]) === `/proc/${value.pid}/fd/1`);
 			return (tracer ? Promise.resolve("pipe:[0]") : readlink(...args)) as ReturnType<typeof readlink>;
 		});
 		let branch: Awaited<ReturnType<typeof forkReusableBash>> | undefined;
 		await using _cleanup = onExit(async () => {
 			restoreTransactions?.();
-			servers.mockRestore();
-			opening.mockRestore();
-			killing.mockRestore();
-			spawning.mockRestore();
-			allocations.mockRestore();
-			sampling.mockRestore();
 			await branch?.dispose();
 		});
 		await writeFile(path.join(fixture.workspace, "barrier-worker"), [
@@ -2416,14 +2414,14 @@ int main(void) { int fds[2], status; char queue[8]; if (pipe(fds) || fds[0] != 3
 			const { promise: captureStarted, resolve: reachCapture } = deferred();
 			const { promise: captureGate, resolve: releaseCapture } = deferred();
 			const { promise: captureCleanup, resolve: captureCleaned } = deferred();
-			const reading = vi.spyOn(filesystem, "readFile").mockImplementation((...args) => {
+			using _reading = vi.spyOn(filesystem, "readFile").mockImplementation((...args) => {
 				if (failure === "nested-seal" && !traceRoot && String(args[0]).includes("/trace-")) {
 					traceRoot = path.dirname(String(args[0])); reachCapture();
 					return captureGate.then(() => readTrace(...args)) as ReturnType<typeof readTrace>;
 				}
 				return readTrace(...args);
 			});
-			const removing = vi.spyOn(filesystem, "rm").mockImplementation((...args) => {
+			using _removing = vi.spyOn(filesystem, "rm").mockImplementation((...args) => {
 				if (String(args[0]) === broker?.path) socketRemoved = true;
 				const removed = removeFile(...args);
 				if (String(args[0]) === traceRoot) void removed.then(captureCleaned, captureCleaned);
@@ -2452,7 +2450,7 @@ int main(void) { int fds[2], status; char queue[8]; if (pipe(fds) || fds[0] != 3
 				if (traceRoot) await captureCleanup;
 				await Promise.allSettled(closeTasks);
 				await running.then((value) => value.dispose(), () => undefined);
-				restoreServerClose?.(); reading.mockRestore(); removing.mockRestore();
+				restoreServerClose?.();
 				onClose = undefined;
 			});
 			if (failure === "nested-abort" || failure === "session-close") {
@@ -2666,13 +2664,12 @@ int main(int argc, char **argv) {
 nativeTest.for(["git", "auto"] as const)("preserves native metadata across stat families and rejects volatile or changed results (%s)", { timeout: 120_000 }, async (driver, { benchmark }) => {
 	const fixture = await benchmark("pi-native-metadata-", driver, {}, os.homedir());
 	const actual = await vi.importActual<typeof filesystem>("node:fs/promises"), pins: filesystem.FileHandle[] = [];
-	const opening = vi.mocked(filesystem.open).mockImplementation(async (...args) => {
+	using _opening = vi.mocked(filesystem.open).mockImplementation(async (...args) => {
 		const handle = await actual.open(...args);
 		if (typeof args[1] === "number" && args[1] & 0x200000) pins.push(handle);
 		return handle;
 	});
 	await using _cleanup = onExit(async () => {
-		await using _cleanup = onExit(async () => { opening.mockRestore(); });
 		await fixture.dispose(); expect(pins.every(handle => handle.fd === -1)).toBe(true);
 	});
 	const bin = path.join(fixture.root, "host-bin"); await mkdir(bin);
