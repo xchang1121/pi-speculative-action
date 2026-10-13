@@ -335,23 +335,14 @@ export function snapshotDependency(
 	}
 }
 
+const STRUCTURE_IDENTITY_FIELDS = {
+	file: ["size", "metadataDigest", "object"], directory: ["entriesDigest", "metadataDigest"], symlink: ["targetDigest"], unsupported: ["type"],
+} satisfies { [Kind in WorkspaceStructureEntry["kind"]]: readonly (keyof Extract<WorkspaceStructureEntry, { kind: Kind }>)[] };
+
 function sameStructureEntry(left: WorkspaceStructureEntry | undefined, right: WorkspaceStructureEntry | undefined): boolean {
 	if (!left || !right || left.kind !== right.kind) return left === right;
-	switch (left.kind) {
-		case "file": {
-			const value = right as Extract<WorkspaceStructureEntry, { kind: "file" }>;
-			return left.size === value.size && left.metadataDigest === value.metadataDigest && left.object === value.object &&
-				JSON.stringify(left.aliases) === JSON.stringify(value.aliases);
-		}
-		case "directory": {
-			const value = right as Extract<WorkspaceStructureEntry, { kind: "directory" }>;
-			return left.entriesDigest === value.entriesDigest && left.metadataDigest === value.metadataDigest;
-		}
-		case "symlink":
-			return left.targetDigest === (right as Extract<WorkspaceStructureEntry, { kind: "symlink" }>).targetDigest;
-		case "unsupported":
-			return left.type === (right as Extract<WorkspaceStructureEntry, { kind: "unsupported" }>).type;
-	}
+	return STRUCTURE_IDENTITY_FIELDS[left.kind].every(field => Reflect.get(left, field) === Reflect.get(right, field)) &&
+		(left.kind !== "file" || JSON.stringify(left.aliases) === JSON.stringify((right as typeof left).aliases));
 }
 
 function changedRootMetadata(

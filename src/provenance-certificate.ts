@@ -452,9 +452,8 @@ function normalizePrototype(input: ExecPrototype): ExecPrototype {
 		.sort((left, right) => left.fd - right.fd);
 	for (const descriptor of inheritedFDs) {
 		if (descriptor.resourcePath !== undefined && !validLogicalPath(descriptor.resourcePath)) throw new Error("invalid inherited descriptor path");
-		if (descriptor.resourceAliases && (descriptor.type !== "regular" || !descriptor.resourcePath || descriptor.resourceAliases.length < 2 ||
-			!descriptor.resourceAliases.includes(descriptor.resourcePath) || descriptor.resourceAliases.some((name, index) =>
-				!validLogicalPath(name) || index > 0 && name <= descriptor.resourceAliases![index - 1]!))) throw new Error("invalid inherited descriptor aliases");
+		if (descriptor.resourceAliases && (descriptor.type !== "regular" || !descriptor.resourcePath ||
+			!validAliases(descriptor.resourceAliases, descriptor.resourcePath))) throw new Error("invalid inherited descriptor aliases");
 		if (descriptor.alias === undefined) continue;
 		const alias = inheritedFDs.find(({ fd }) => fd === descriptor.alias);
 		const object = inheritedFDs.find(({ fd }) => fd === descriptor.object);
@@ -539,54 +538,40 @@ export function dynamicDependencyIdentity(dependency: DynamicDependency): string
 
 function validateDependency(dependency: DynamicDependency): void {
 	if (!dependency || typeof dependency !== "object") throw new Error("invalid dynamic dependency");
-	if (dependency.kind === "fd") {
-		if (!Number.isSafeInteger(dependency.fd) || dependency.fd < 0 || !isSha256Digest(dependency.contentDigest)) throw new Error("invalid descriptor dependency");
-		return;
+	if (dependency.kind !== "fd" && !validLogicalPath(dependency.path)) throw new Error("invalid dependency path");
+	if (!validDependencyFields(dependency)) {
+		const kind = dependency.kind === "fd" ? "descriptor" : dependency.kind === "absence" ? "negative" : dependency.kind;
+		throw new Error(`invalid ${kind} dependency`);
 	}
-	if (!validLogicalPath(dependency.path)) throw new Error("invalid dependency path");
+}
+
+function validDependencyFields(dependency: DynamicDependency): boolean {
 	switch (dependency.kind) {
+		case "fd":
+			return Number.isSafeInteger(dependency.fd) && dependency.fd >= 0 && isSha256Digest(dependency.contentDigest);
 		case "file":
-			if (
-				!["input", "executable", "shared_object"].includes(dependency.role) || !isSha256Digest(dependency.contentDigest) ||
-				(dependency.metadataDigest !== undefined && !isSha256Digest(dependency.metadataDigest)) ||
-				(dependency.aliases !== undefined && (!Array.isArray(dependency.aliases) || dependency.aliases.length < 2 ||
-					!dependency.aliases.includes(dependency.path) || dependency.aliases.some((name, index) => !validLogicalPath(name) || index > 0 && name <= dependency.aliases![index - 1]!)))
-			) {
-				throw new Error("invalid file dependency");
-			}
-			break;
+			return ["input", "executable", "shared_object"].includes(dependency.role) && isSha256Digest(dependency.contentDigest) &&
+				optionalDigest(dependency.metadataDigest) && (dependency.aliases === undefined || validAliases(dependency.aliases, dependency.path));
 		case "directory":
-			if (
-				(dependency.entriesDigest === undefined ? dependency.metadataDigest === undefined : !isSha256Digest(dependency.entriesDigest)) ||
-				(dependency.metadataDigest !== undefined && !isSha256Digest(dependency.metadataDigest)) ||
-				!validExcludedEntries(dependency.excludedEntries)
-			) {
-				throw new Error("invalid directory dependency");
-			}
-			break;
+			return (dependency.entriesDigest === undefined ? dependency.metadataDigest !== undefined : isSha256Digest(dependency.entriesDigest)) &&
+				optionalDigest(dependency.metadataDigest) && validExcludedEntries(dependency.excludedEntries);
 		case "absence":
-			if (
-				(dependency.parentEntriesDigest !== undefined && !isSha256Digest(dependency.parentEntriesDigest)) ||
-				!validExcludedEntries(dependency.parentExcludedEntries)
-			) {
-				throw new Error("invalid negative dependency");
-			}
-			break;
+			return optionalDigest(dependency.parentEntriesDigest) && validExcludedEntries(dependency.parentExcludedEntries);
 		case "lock":
-			if (typeof dependency.exclusive !== "boolean") throw new Error("invalid lock dependency");
-			break;
+			return typeof dependency.exclusive === "boolean";
 		case "symlink":
-			if (!dependency.target || dependency.target.includes("\0") || !isSha256Digest(dependency.targetDigest)) throw new Error("invalid symlink dependency");
-			break;
+			return !!dependency.target && !dependency.target.includes("\0") && isSha256Digest(dependency.targetDigest);
 		case "metadata":
-			if (typeof dependency.followSymlinks !== "boolean" || !isSha256Digest(dependency.digest) || dependency.fields !== undefined && (!Array.isArray(dependency.fields) ||
-				!dependency.fields.length || dependency.fields.join() !== FILESYSTEM_OBSERVATION_FIELDS.filter((field) => dependency.fields!.includes(field)).join())) {
-				throw new Error("invalid metadata dependency");
-			}
-			break;
+			return typeof dependency.followSymlinks === "boolean" && isSha256Digest(dependency.digest) && (dependency.fields === undefined ||
+				Array.isArray(dependency.fields) && dependency.fields.length > 0 &&
+				dependency.fields.join() === FILESYSTEM_OBSERVATION_FIELDS.filter(field => dependency.fields!.includes(field)).join());
 		default:
 			throw new Error("invalid dynamic dependency kind");
 	}
+}
+
+function optionalDigest(value: Sha256Digest | undefined): boolean {
+	return value === undefined || isSha256Digest(value);
 }
 
 function validExcludedEntries(entries: readonly string[] | undefined): boolean {
@@ -659,8 +644,7 @@ function normalizeResult(result: ProcessResultRecord, prototype: ExecPrototype):
 			const predecessor = event.object?.before && anchor?.kind === "workspace" ? anchor.before : before;
 			if (event.operation !== undefined && (event.operation !== "write_contents" || predecessor.kind !== "file" ||
 				after.kind !== "file" || !event.object && predecessor.mode !== after.mode)) throw new Error("invalid in-place file effect");
-			if (event.aliases && (before.kind !== "file" || event.aliases.length < 2 || !event.aliases.includes(event.path) ||
-				event.aliases.some((name, index) => !validLogicalPath(name) || index > 0 && name <= event.aliases![index - 1]!))) throw new Error("invalid effect alias set");
+			if (event.aliases && (before.kind !== "file" || !validAliases(event.aliases, event.path))) throw new Error("invalid effect alias set");
 			if (!event.operation && !event.object && before.kind === after.kind && stableEqual(before, after)) throw new Error("workspace effect does not change state");
 			journal[index] = { ...event, before, after };
 		}
@@ -697,6 +681,11 @@ export function validateArtifact(reference: ArtifactReference, sizes?: Map<Sha25
 
 function validLogicalPath(value: string): boolean {
 	return typeof value === "string" && value.startsWith("/") && !value.includes("\0");
+}
+
+function validAliases(aliases: readonly string[], target: string): boolean {
+	return Array.isArray(aliases) && aliases.length >= 2 && aliases.includes(target) &&
+		aliases.every((name, index) => validLogicalPath(name) && (index === 0 || name > aliases[index - 1]!));
 }
 
 function deepFreeze<Value>(value: Value): Value {

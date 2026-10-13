@@ -144,20 +144,15 @@ export function rememberCapture(capture: StableFilesystemCapture | { readonly id
 
 /** Follow executable aliases (including /proc/PID/exe), then hash the complete pinned image. */
 export async function hashExecutableFile(target: string, signal?: AbortSignal): Promise<`sha256:${string}`> {
-	signal?.throwIfAborted();
-	const cached = cachedCapture(await fs.stat(target, { bigint: true }), target);
-	signal?.throwIfAborted(); if (cached) return `sha256:${cached.hash}`;
-	const takenAtMs = Date.now(), capture = await captureFile(target, Infinity, false, false, undefined, signal);
-	rememberCapture(capture, takenAtMs);
-	return `sha256:${capture.hash}`;
+	return `sha256:${(await captureFileDigest(target, Infinity, signal, false)).hash}`;
 }
 
 /** A dependency's content digest: an unchanged file validates by its identity (a runtime's image and libraries on every reuse). */
-export async function captureFileDigest(target: string, maxBytes = Number.POSITIVE_INFINITY, signal?: AbortSignal): Promise<StableFilesystemCapture> {
+export async function captureFileDigest(target: string, maxBytes = Number.POSITIVE_INFINITY, signal?: AbortSignal, verifyPath = true): Promise<StableFilesystemCapture> {
 	signal?.throwIfAborted();
 	const stat = await fs.stat(target, { bigint: true }), cached = Number(stat.size) <= maxBytes ? cachedCapture(stat, target) : undefined;
 	signal?.throwIfAborted(); if (cached) return cached;
-	const takenAtMs = Date.now(), capture = await captureStableFile(target, maxBytes, false, undefined, signal);
+	const takenAtMs = Date.now(), capture = await captureFile(target, maxBytes, false, verifyPath, undefined, signal);
 	rememberCapture(capture, takenAtMs);
 	return capture;
 }

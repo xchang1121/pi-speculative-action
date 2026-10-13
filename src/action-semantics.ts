@@ -218,9 +218,6 @@ export const PI_ACTION_SEMANTICS = new ActionSemanticsRegistry(([
 	canonicalize: (input, cwd) => canonicalPiAction(definition.tool, input, cwd),
 })));
 
-export const OBSERVATION_ACTION_TOOLS = Object.freeze(PI_ACTION_SEMANTICS.toolNames("observation"));
-export const WORKSPACE_MUTATION_ACTION_TOOLS = Object.freeze(PI_ACTION_SEMANTICS.toolNames("workspace_mutation"));
-export const UNBOUNDED_ACTION_TOOLS = Object.freeze(PI_ACTION_SEMANTICS.toolNames("unbounded"));
 export const KEYABLE_TOOLS = Object.freeze(PI_ACTION_SEMANTICS.toolNames());
 
 export function buildActionKey(input: {
@@ -320,10 +317,6 @@ export function readRangesShareInFlight(speculative: ActionKey, actor: ActionKey
 
 export function normalizeRelativeRoot(value: unknown, cwd: string): string | undefined {
 	return value !== undefined && typeof value !== "string" ? undefined : normalizeWorkspacePath(value ?? ".", cwd);
-}
-
-export function inferredActionEffect(tool: string): ActionEffect | undefined {
-	return PI_ACTION_SEMANTICS.effect(tool);
 }
 
 export function normalizeReadOffset(value: unknown): number {

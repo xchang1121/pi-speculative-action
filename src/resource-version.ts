@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { hash } from "node:crypto";
-import { type BigIntStats, type Stats, type FSWatcher, watch } from "node:fs";
+import { type BigIntStats, type FSWatcher, watch } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { setImmediate as watcherTurn } from "node:timers/promises";
@@ -10,6 +10,7 @@ import { containsFilesystemPath, filesystemPathKey, relativeFilesystemPath } fro
 import type { ToolFilesystemOperations, ToolFilesystemStat } from "./tool-settlement.ts";
 import { RuntimeLifecycleLane, SharedAbortScope } from "./runtime-lifecycle.ts";
 import { TimelineInterval } from "./task-timing.ts";
+import { filesystemEntryType, type FilesystemTypeEvidence } from "./provenance-certificate.ts";
 import type { ValidationMetrics } from "./settlement.ts";
 
 export type ResourceDependency = {
@@ -1112,14 +1113,9 @@ function entryIdentity(entry: import("node:fs").Dirent): string {
 	return `${specialFileType(entry)}\0${entry.name}`;
 }
 
-function specialFileType(value: Stats | BigIntStats | import("node:fs").Dirent) {
-	if (value.isFile()) return "file";
-	if (value.isDirectory()) return "directory";
-	if (value.isSymbolicLink()) return "symlink";
-	if (value.isFIFO()) return "fifo";
-	if (value.isSocket()) return "socket";
-	if (value.isCharacterDevice()) return "character_device";
-	return value.isBlockDevice() ? "block_device" : "other";
+function specialFileType(value: FilesystemTypeEvidence) {
+	const kind = filesystemEntryType(value);
+	return kind === "char" ? "character_device" : kind === "block" ? "block_device" : kind;
 }
 
 function missingResourceResolver(realRoot: string) {

@@ -38,16 +38,7 @@ export class PpmCountTrie {
 	observe(history: readonly string[], target: string, sequence = 0, halfLife = 0): void {
 		if (!target) return;
 		const lastSeen = nonNegativeInteger(sequence);
-		this.increment(this.root, target, 1, lastSeen, halfLife);
-		let current = this.root;
-		for (let index = history.length - 1; index >= Math.max(0, history.length - this.order); index--) {
-			const token = history[index];
-			if (token === undefined) continue;
-			const child = current.children.get(token) ?? node();
-			current.children.set(token, child);
-			current = child;
-			this.increment(current, target, 1, lastSeen, halfLife);
-		}
+		for (const current of this.contexts(history, true)) this.increment(current, target, 1, lastSeen, halfLife);
 	}
 
 	/** Set evidence for one exact context without implicitly changing its suffixes. */
@@ -56,13 +47,7 @@ export class PpmCountTrie {
 		const normalizedCount = positiveCount(count);
 		if (normalizedCount === undefined) return;
 		let current = this.root;
-		for (let index = context.length - 1; index >= 0; index--) {
-			const token = context[index];
-			if (token === undefined) continue;
-			const child = current.children.get(token) ?? node();
-			current.children.set(token, child);
-			current = child;
-		}
+		for (const suffix of this.contexts(context, true)) current = suffix;
 		const wasEmpty = current.total === 0;
 		const previous = current.targets.get(target)?.count ?? 0;
 		current.targets.set(target, { count: normalizedCount, lastSeen: nonNegativeInteger(lastSeen) });
@@ -75,16 +60,7 @@ export class PpmCountTrie {
 	distribution(history: readonly string[], sequence = 0, halfLife = 0): ReadonlyMap<string, number> {
 		const estimates = new Map<string, number>();
 		if (this.root.total <= 0) return estimates;
-		const suffixNodes: CountNode[] = [this.root];
-		let current = this.root;
-		for (let order = 1; order <= Math.min(history.length, this.order); order++) {
-			const token = history[history.length - order];
-			if (token === undefined) continue;
-			const child = current.children.get(token);
-			if (!child) break;
-			current = child;
-			if (current.total > 0) suffixNodes.push(current);
-		}
+		const suffixNodes = [...this.contexts(history)].filter(current => current.total > 0);
 		// PPM*: a shorter deterministic suffix has more evidence than its equally deterministic extensions.
 		const deterministic = suffixNodes.findIndex((suffix, index) => index > 0 && suffix.targets.size === 1);
 		if (deterministic >= 0) suffixNodes.length = deterministic + 1;
@@ -158,6 +134,20 @@ export class PpmCountTrie {
 		};
 		prune(this.root);
 		this.populatedContexts -= discarded.size;
+	}
+
+	/** Learning, restoration and prediction follow the same newest-first context edges. */
+	private *contexts(history: readonly string[], create = false): Generator<CountNode> {
+		let current = this.root;
+		yield current;
+		for (let index = history.length - 1; index >= Math.max(0, history.length - this.order); index--) {
+			const token = history[index];
+			if (token === undefined) continue;
+			let child = current.children.get(token);
+			if (!child && create) current.children.set(token, child = node());
+			if (!child) return;
+			yield current = child;
+		}
 	}
 
 	/** Both retention and persistence select the same ordered evidence before copying target counts. */

@@ -116,19 +116,12 @@ export function reduceSpeculativeTrace<SessionID>(
 			break;
 		}
 		case "candidate":
-			if (event.state.status === "running") next.candidateStarted++;
-			else {
-				if (event.state.status === "succeeded") {
-					next.candidateSucceeded++;
-					const reuse = event.candidate.world?.executionMetrics.reuse;
-					if (reuse) next.processReuse = addReuseMetrics(next.processReuse, reuse);
-				}
-				else {
-					if (event.state.status === "failed") next.candidateFailed++;
-					else next.candidateCancelled++;
-					next.candidateTerminalCauses = increment(current.candidateTerminalCauses, causeKey(event.state.cause));
-				}
-			}
+			next[candidateCounters[event.state.status]]++;
+			if (event.state.status === "succeeded") {
+				const reuse = event.candidate.world?.executionMetrics.reuse;
+				if (reuse) next.processReuse = addReuseMetrics(next.processReuse, reuse);
+			} else if (event.state.status !== "running")
+				next.candidateTerminalCauses = increment(current.candidateTerminalCauses, causeKey(event.state.cause));
 			break;
 		case "actor_action":
 			next.actorActions++;
@@ -149,13 +142,7 @@ export function reduceSpeculativeTrace<SessionID>(
 					next.partialResultReuseByProjector = increment(current.partialResultReuseByProjector, match.projector);
 				} else if (match.kind === "inputs") next.inputReuseHits++;
 				else next.exactReuseHits++;
-			} else {
-				if (event.settlement.provider.origin === "preview") {
-					next.actorPreviews++;
-				} else {
-					next.actorFallbacks++;
-				}
-			}
+			} else next[event.settlement.provider.origin === "preview" ? "actorPreviews" : "actorFallbacks"]++;
 			break;
 	}
 	next.hitRate = ratio(next.speculativeHits, next.actorActions);
@@ -163,6 +150,8 @@ export function reduceSpeculativeTrace<SessionID>(
 	next.adoptionYield = ratio(next.predictionsAdopted, next.predictionsMatched);
 	return next;
 }
+
+const candidateCounters = { running: "candidateStarted", succeeded: "candidateSucceeded", failed: "candidateFailed", cancelled: "candidateCancelled" } as const;
 
 export function summarizeSpeculativeTrace<SessionID>(
 	events: ReadonlyArray<SpeculativeActionEvent<SessionID>>,

@@ -218,7 +218,7 @@ export class PlanRuntime {
 
 	rearmExecution(candidateID: string): boolean {
 		let rearmed = false;
-		for (const { node } of this.mutableValues()) {
+		for (const plan of this.plans.values()) for (const node of plan.nodes.values()) {
 			if (
 				!("candidateID" in node.execution) || node.execution.candidateID !== candidateID || node.opportunity.state.status !== "pending" ||
 				!executionSettled(executionProjection(node.execution))
@@ -411,10 +411,6 @@ export class PlanRuntime {
 		return plan && node ? { plan, node } : undefined;
 	}
 
-	private mutableValues(): Array<{ readonly plan: MutablePlan; readonly node: MutableNode }> {
-		return [...this.plans.values()].flatMap((plan) => [...plan.nodes.values()].map((node) => ({ plan, node })));
-	}
-
 	private parent(proposalID: string, dependency: PlanActionDependency): MutableNode | undefined {
 		const node = this.mutable(dependency.proposalID ?? proposalID, dependency.actionID)?.node;
 		return !dependency.proposalID || node?.identity.id === dependency.identity ? node : undefined;
@@ -427,13 +423,14 @@ export class PlanRuntime {
 		const selected: PlanRuntimeNode[] = [];
 		for (const plan of this.plans.values()) for (const node of plan.nodes.values()) {
 			if (!include(node, plan)) continue;
-			const current = this.readiness(plan, node);
-			if (!readiness || current === readiness) selected.push(this.snapshot(plan, node, current));
+			const current = this.snapshot(plan, node);
+			if (!readiness || current.readiness === readiness) selected.push(current);
 		}
 		return selected;
 	}
 
-	private snapshot(plan: MutablePlan, node: MutableNode, readiness = this.readiness(plan, node)): PlanRuntimeNode {
+	private snapshot(plan: MutablePlan, node: MutableNode): PlanRuntimeNode {
+		const dependencies = this.dependencyReadiness(plan, node);
 		return Object.freeze({
 			identity: node.identity,
 			proposalID: plan.id,
@@ -446,18 +443,13 @@ export class PlanRuntime {
 			expectedDecisionSeq: node.expectedDecisionSeq,
 			latestDecisionSeq: node.latestDecisionSeq,
 			criticalPathSteps: node.criticalPathSteps,
-			dependenciesReady: this.dependencyReadiness(plan, node) === "ready",
+			dependenciesReady: dependencies === "ready",
 			execution: executionProjection(node.execution),
-			readiness,
+			readiness: node.opportunity.state.status === "settled" ? "settled"
+				: dependencies === "ready" && node.execution.status !== "deferred" ? "waiting" : dependencies,
 			prediction: node.opportunity.identity,
 			predictionState: node.opportunity.state,
 		});
-	}
-
-	private readiness(plan: MutablePlan, node: MutableNode): PlanNodeReadiness {
-		if (node.opportunity.state.status === "settled") return "settled";
-		const readiness = this.dependencyReadiness(plan, node);
-		return readiness === "ready" && node.execution.status !== "deferred" ? "waiting" : readiness;
 	}
 
 	private dependencyReadiness(plan: MutablePlan, node: MutableNode): "ready" | "waiting" | "blocked" {
