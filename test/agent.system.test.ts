@@ -1,4 +1,5 @@
 import { link, readFile, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
 import path from "node:path";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { createEditTool, createFindTool, createGrepTool, createLsTool, createReadTool, createWriteTool } from "@earendil-works/pi-coding-agent";
@@ -271,43 +272,48 @@ test.each(["ordered", "independent", "dependent"])("adopts only the proven effec
 	if (order === "independent") await expect(readFile(path.join(cwd, "unused.txt"))).rejects.toMatchObject({ code: "ENOENT" });
 });
 
-test.for(["unrelated", "changed", "descendant", "mutation"])("retains native workflow results across prompts and validates Actor changes (%s)", async (change, { skip }) => {
+test.for(["unrelated", "changed", "descendant", "mutation", "mutation-stat", "mutation-split", "mutation-stale"])("retains native workflow results across prompts and validates Actor changes (%s)", async (change, { skip }) => {
 	if (process.platform !== "linux" || process.arch !== "x64") return skip("native process backend requires x86-64 Linux");
-	const native = await createLinuxProcessBenchmark("pi-sealed-result-", change === "mutation" ? "overlayfs" : "git"), sandbox = native.workspaceSandbox;
-	const { workspace: cwd } = native;
-	await writeFile(path.join(cwd, "a.txt"), "original\n"); await writeFile(path.join(cwd, "b.txt"), "other\n");
-	await writeFile(path.join(cwd, "c.txt"), "second\n");
-	if (change === "mutation") await compileBenchmarkHelper(cwd, { source: "reader.c", output: "reader", code: "#include <fcntl.h>\n#include <unistd.h>\nint main(void){char text[64];int f=open(\"a.txt\",O_RDONLY),n=read(f,text,sizeof text);close(f);for(volatile unsigned long i=0;i<600000000ul;i++);return n<0||write(1,text,n)!=n;}\n" });
+	const mutation = change.startsWith("mutation"), metadata = change.endsWith("stat"), split = /split|stale/.test(change), stale = change.endsWith("stale");
+	const native = await createLinuxProcessBenchmark("pi-sealed-result-", mutation ? "overlayfs" : "git"), { workspace: cwd, workspaceSandbox: sandbox } = native;
+	for (const [name, text] of [["a", "original"], ["b", "other"], ["c", "second"]]) await writeFile(path.join(cwd, `${name}.txt`), text + "\n");
+	if (mutation) await compileBenchmarkHelper(cwd, { source: "reader.c", output: "reader", code: `#include <fcntl.h>\n#include <stdio.h>\n#include <sys/stat.h>\n#include <unistd.h>\nint main(void){char text[64];int f=open("a.txt",O_RDONLY),n=read(f,text,sizeof text);${metadata ? 'struct stat s;if(fstat(f,&s))return 1;dprintf(1,"%llu:%lld:%ld\\n",(unsigned long long)s.st_ino,(long long)s.st_ctim.tv_sec,s.st_ctim.tv_nsec);' : ""}close(f);for(volatile unsigned long i=0;i<600000000ul;i++);return n<0||write(1,text,n)!=n;}\n` });
 	await commitBenchmarkFixture(cwd, "Sealed result reuse");
-	let predict = change === "descendant" || change === "mutation", requests = 0; const command = change === "mutation" ? "./reader" : "cat a.txt";
-	const steps = change === "mutation" ? [{ tool: "write", input: { path: "a.txt", content: "prepared\n" } }, { tool: "bash", input: { command } }]
+	let predict = change === "descendant" || mutation, requests = 0; const prepared: string[] = [];
+	const body = mutation ? `${split ? "stat --printf='%i:%z\\n' a.txt; " : ""}./reader` : "cat a.txt", command = body + (mutation ? "; printf once >> marker" : "");
+	const steps = mutation ? [{ tool: "write", input: { path: "a.txt", content: "prepared\n" } }, { tool: "bash", input: { command } }]
 		: [{ tool: "bash", input: { command: "cat a.txt" } }, { tool: "bash", input: { command: "cat c.txt" } }];
 	const f = systemHost(cwd, [native.tool, createWriteTool(cwd)], {
-		executionWorlds: [native.world, sandbox.createExecutionWorld()],
+		executionWorlds: [{ ...native.world, speculation: { ...native.world.speculation, execute: async context => {
+			const branch = await native.world.speculation.execute(context); if (!branch.inputsOnly) prepared.push(textOutput(branch.output.result)); return branch;
+		} } }, sandbox.createExecutionWorld()],
 		resolveInvocation: (tool, input) => resolvePiToolInvocation(tool, input, { cwd, environment: native.environment, shellPath: native.shellPath }),
 		complete: async () => { requests++; return fauxAssistantMessage(fauxToolCall("speculative_workflow", { steps }), { stopReason: "toolUse" }); },
 		getSettings: () => ({ enabled: true, drafterEnabled: predict, candidateLimit: 1, drafterMaxDepth: 1,
 			tools: ["bash", "write"], patternAware: { enabled: false } }),
 	});
-	await using _cleanup = onExit(async () => { await f.dispose(); await sandbox.dispose(); await native.dispose(); });
-	const status = await native.backend.check(true);
-	if (status.state !== "ready") return skip(status.detail);
+	await using _cleanup = onExit(async () => { await f.dispose(); await native.dispose(); });
+	const status = await native.backend.check(true); if (status.state !== "ready") return skip(status.detail);
 	await f.start(); if (!predict) await f.preview("bash", { command: "cat a.txt" });
 	await f.ready(predict ? 2 : 1); predict = false;
 	expect(await readFile(path.join(cwd, "a.txt"), "utf8")).toBe("original\n");
-	if (change !== "mutation") { await f.finish(true); await f.start("next-prompt"); }
-	await f.execute("write", change === "mutation" ? steps[0]!.input : { path: change === "changed" ? "a.txt" : "b.txt", content: "updated\n" });
-	if (change === "mutation") { await f.finish(); await f.start("process"); }
-	expect(textOutput(await f.execute("bash", { command }))).toBe(change === "changed" ? "updated\n" : change === "mutation" ? "prepared\n" : "original\n");
-	if (change === "descendant") {
-		await f.finish(); await f.start("next");
-		expect(textOutput(await f.execute("bash", { command: "cat c.txt" }))).toBe("second\n");
+	await expect(readFile(path.join(cwd, "marker"))).rejects.toMatchObject({ code: "ENOENT" });
+	if (!mutation) { await f.finish(true); await f.start("next-prompt"); }
+	await f.execute("write", mutation ? steps[0]!.input : { path: change === "changed" ? "a.txt" : "b.txt", content: "updated\n" });
+	if (mutation) { await f.finish(); await f.start("process"); if (stale) await writeFile(path.join(cwd, "a.txt"), "fresh\n"); }
+	expect(await readFile(path.join(cwd, "a.txt"), "utf8")).toBe(stale ? "fresh\n" : mutation ? "prepared\n" : change === "changed" ? "updated\n" : "original\n");
+	const expected = execFileSync("/bin/bash", ["-c", body], { cwd, env: native.environment, encoding: "utf8" });
+	expect(textOutput(await f.execute("bash", { command }))).toBe(expected);
+	if (change === "descendant") { await f.finish(); await f.start("next"); expect(textOutput(await f.execute("bash", { command: "cat c.txt" }))).toBe("second\n"); }
+	await f.finish(true);
+	const actors = f.events.filter(event => event.type === "actor_action"), timing = actors.at(-1)!.computation!, fallback = metadata || split || change === "changed";
+	expect(timing.hiddenComputeMs > 0).toBe(!metadata && !stale && change !== "changed"); expect(timing.toolComputeMs).toBeGreaterThanOrEqual(timing.hiddenComputeMs);
+	expect(f.fallbacks, JSON.stringify(actors)).toEqual([...(mutation ? [] : ["write"]), ...(fallback ? ["bash"] : [])]);
+	expect(f.events.filter(event => event.type === "candidate" && event.state.status === "running")).toHaveLength(change === "descendant" || mutation ? 2 : 1);
+	if (mutation) {
+		expect(requests).toBe(1); expect(actors.map(event => event.settlement.provider.kind)).toEqual(["speculative", fallback ? "actor" : "speculative"]);
+		expect(prepared[0] === expected).toBe(!metadata && !split); expect(native.backend.actorMetrics().hits).toBe(Number(split && !stale)); expect(await readFile(path.join(cwd, "marker"), "utf8")).toBe("once");
 	}
-	if (change !== "changed") {
-		expect(f.fallbacks, JSON.stringify(f.events.filter(event => event.type === "actor_action" || event.type === "candidate"))).toEqual(change === "mutation" ? [] : ["write"]);
-		expect(f.events.filter(event => event.type === "candidate" && event.state.status === "running")).toHaveLength(change === "descendant" || change === "mutation" ? 2 : 1);
-	}
-	if (change === "mutation") { await f.finish(true); expect(requests).toBe(1); expect(f.events.filter(event => event.type === "actor_action").map(event => event.settlement.provider.kind)).toEqual(["speculative", "speculative"]); }
 });
 
 test("reconsiders restored results while sharing pending reads and retains fresh queries across turns", async () => {

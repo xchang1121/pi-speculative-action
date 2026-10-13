@@ -2698,37 +2698,23 @@ int main(int argc, char **argv) {
 		if (mutation.startsWith("rmdir")) await mkdir(path.join(fixture.workspace, "many", "d0"));
 		if (mutation.endsWith("legacy")) { expect(await readFile(path.join(fixture.workspace, "legacy-result"), "utf8")).toBe("legacy"); await rm(path.join(fixture.workspace, "legacy-result")); }
 	}
-	for (const file of ["README", "many"]) {
-		const command = `./metadata ${file} proc`; await using candidate = disposable(await produce(command));
-		// The proc link itself names the caller's descriptor; compare followed metadata only.
+	for (const [name, mode] of [["README", "proc"], ["many", "proc"], [".", ""], ["metadata-link", ""], ["dist/module.cjs", "module"], ["README", "replace"]]) {
+		const command = mode === "module" ? `node -e "console.log(require('./${name}'))"` : `./metadata ${name} ${mode === "proc" ? mode : ""}`;
+		await using candidate = disposable(await produce(command));
 		expect(candidate.output.isError, textOutput(candidate.output.result)).toBe(false);
-		const followed = (text: string) => text.trimEnd().split("\n").filter((_, index) => index !== 1 && index !== 7);
-		expect(followed(textOutput(candidate.output.result))).toEqual(followed(native(command)));
-	}
-	for (const name of [".", "metadata-link", "dist/module.cjs"]) {
-		const command = name.startsWith("dist/") ? `node -e "console.log(require('./${name}'))"` : `./metadata ${name}`; await using candidate = disposable(await produce(command));
-		expect(candidate.output.isError, textOutput(candidate.output.result)).toBe(false);
-		expect(textOutput(candidate.output.result)).toBe(native(command));
+		// A proc link names this caller's descriptor; only its followed metadata compares across processes.
+		const output = (text: string) => mode === "proc" ? text.trimEnd().split("\n").filter((_, index) => index !== 1 && index !== 7) : text;
+		expect(output(textOutput(candidate.output.result))).toEqual(output(native(command)));
+		if (mode === "proc") continue;
 		expect((await candidate.validate?.())?.status).toBe("valid");
-		if (name.startsWith("dist/")) {
-			await writeFile(path.join(fixture.workspace, name), "module.exports = 43;\n");
-			expect((await candidate.validate?.())?.status).toBe("stale");
-			continue;
-		}
-		if (name !== ".") continue;
-		const info = await filesystem.stat(fixture.workspace);
-		await filesystem.utimes(fixture.workspace, info.atime, new Date(info.mtimeMs - 2000));
+		if (mode === "module") await writeFile(path.join(fixture.workspace, name!), "module.exports = 43;\n");
+		else if (name === ".") { const info = await filesystem.stat(fixture.workspace); await filesystem.utimes(fixture.workspace, info.atime, new Date(info.mtimeMs - 2000)); }
+		else if (mode === "replace") {
+			execFileSync("python3", ["-c", 'import os; p="README"; s=os.stat(p); b=open(p,"rb").read(); q=p+".swap"; open(q,"wb").write(b); os.chmod(q,s.st_mode & 0o7777); os.utime(q, ns=(s.st_atime_ns,s.st_mtime_ns)); os.replace(q,p)'], { cwd: fixture.workspace });
+			expect(textOutput(candidate.output.result)).not.toBe(native(command));
+		} else continue;
 		expect((await candidate.validate?.())?.status).toBe("stale");
 	}
-	const branch = await produce("./metadata");
-	try {
-		expect(branch.output.isError).toBe(false);
-		expect(textOutput(branch.output.result)).toBe(native("./metadata"));
-		expect((await branch.validate?.())?.status).toBe("valid");
-		execFileSync("python3", ["-c", 'import os; p="README"; s=os.stat(p); b=open(p,"rb").read(); q=p+".swap"; open(q,"wb").write(b); os.chmod(q,s.st_mode & 0o7777); os.utime(q, ns=(s.st_atime_ns,s.st_mtime_ns)); os.replace(q,p)'], { cwd: fixture.workspace });
-		expect(textOutput(branch.output.result)).not.toBe(native("./metadata"));
-		expect((await branch.validate?.())?.status).toBe("stale");
-	} finally { await branch.dispose?.(); }
 	for (const command of [`${bin}/cat`, "git log -1 --format=%cr", 'printf "%s\\n" constant', 'printf "%s\\n" "$RANDOM"',
 		'printf "%s\\n" "$((RANDOM))"', 'v=RANDOM; printf "%s\\n" "${!v}"', 'declare -n v=RANDOM; printf "%s\\n" "$v"']) {
 		for (const actor of [false, true]) {
