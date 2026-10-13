@@ -23,7 +23,7 @@ import { certificateReplayable, createExecPrototype, digestObject, dynamicDepend
 	type Sha256Digest, type WorkspaceEffectState } from "./provenance-certificate.ts";
 import { captureAbsenceDependency, captureDirectoryDependency, captureFileDependency, observeProcessInputs,
 	validateDynamicDependencyCertificate } from "./provenance-validation.ts";
-import { diffWorkspaceStructures, ExecutionPathProjection, hydrateWorkspaceFileEntry, snapshotDependency, type WorkspaceStructureSnapshot,
+import { captureWorkspaceStructure, diffWorkspaceStructures, ExecutionPathProjection, hydrateWorkspaceFileEntry, snapshotDependency, type WorkspaceStructureSnapshot,
 	type WorkspaceTransactionDiff, type WorkspaceTreeEntry } from "./process-observation.ts";
 import { definedProcessEnvironment, type ProcessRouteSnapshot, type ProcessExecutionRequest,
 	type ProcessExecutor } from "./process-execution.ts";
@@ -334,12 +334,13 @@ export class LinuxProcessReuseBackend {
 		return invocation;
 	}
 
-	/** One captured input graph decides preparation: native filesystem reads can restart, live external queues need their producer. */
+	/** A named input can propose a fresh launch; private predecessors and live queues keep their producer ordering. */
 	operationHints(binding: ProcessExecutionBinding): Pick<ExecutionOperationBinding, "fed" | "preparation"> {
 		const invocation = this.handoffs.resolveBinding(binding, binding.scope);
 		if (!invocation || "trackingOnly" in invocation) return {};
 		const resources = invocation.resources;
-		if (!resources) return invocation.producer ? {} : { preparation: "current_workspace" };
+		if (reopensProcessInputs(invocation)) return { preparation: "current_workspace" };
+		if (!resources) return {};
 		return Object.entries(resources.objects).some(([image, object]) => object.queue?.producer === "live" &&
 			!Object.values(resources.descriptions).some(description => description.object === Number(image) && (description.flags & 3) !== 0)) ? { fed: true } : {};
 	}
@@ -356,11 +357,14 @@ export class LinuxProcessReuseBackend {
 		const invocation = this.handoffs.resolveBinding(binding, binding.scope);
 		if (!invocation || "trackingOnly" in invocation) return true;
 		return this.store.read(async signal => {
+			const projection = new ExecutionPathProjection({ sourceRoot: invocation.sourceRoot, workspaceRoot: invocation.sourceRoot });
+			const { output } = await TimelineInterval.collect(() => this.boundRequest(binding, invocation, projection, signal));
+			const key = processWeakKey(output.prototype);
 			const checked = new Set<Sha256Digest>();
-			const currentInputs = observeProcessInputs(binding.key, evidence => TimelineInterval.collect(() => validateDynamicDependencyCertificate(evidence,
+			const currentInputs = observeProcessInputs(key, evidence => TimelineInterval.collect(() => validateDynamicDependencyCertificate(evidence,
 				// This scheduling observation grants no adoption authority; failed runs also suppress repeated preparation while their inputs hold.
 				{ acceptedTaints: evidence.taints, signal })).then(result => result.output, () => undefined));
-			for (const candidates of [this.handoffs.results(binding.key, binding.scope), this.store.candidatesByWeakKey(binding.key, invocation.executable, checked, signal)]) for await (const certificate of candidates) {
+			for (const candidates of [this.handoffs.results(key, binding.scope), this.store.candidatesByWeakKey(key, invocation.executable, checked, signal)]) for await (const certificate of candidates) {
 				if (checked.has(certificate.id)) continue;
 				checked.add(certificate.id);
 				if ((await currentInputs(certificate.dependencyCertificate))?.strongKey === certificate.strongKey) return false;
@@ -960,13 +964,8 @@ export class LinuxProcessReuseBackend {
 		if (invocation.sourceRoot !== session.sourceRoot ||
 			invocation.producer && !compatibleProducer(session.nestedProducer, invocation.producer))
 			throw new Error("process execution binding is unavailable in this scope");
-		const cwd = session.projection.toPhysical(invocation.cwd), executable = session.projection.toPhysical(invocation.executable);
-		if (!cwd || !executable) throw new Error("bound process paths are unmapped");
-		const request = { ...invocation, cwd };
-		const { output: { prototype, before }, computation: preparation } = await TimelineInterval.outside(() => TimelineInterval.measure(async () => {
-			const prototype = await this.prototype(session, request, executable, invocation.outputRoute);
-			if (processWeakKey(prototype) !== binding.key) throw new Error("bound process execution context changed");
-			return { prototype, before: await session.workspace.structure.capture() };
+		const { output: { request, executable, prototype, before }, computation: preparation } = await TimelineInterval.outside(() => TimelineInterval.measure(async () => {
+			return { ...await this.boundRequest(binding, invocation, session.projection, session.signal), before: await session.workspace.structure.capture() };
 		}));
 		const resultsBefore = session.preparedResults, seedsBefore = session.preparedInputSeeds;
 		this.add(session, "requests");
@@ -990,7 +989,7 @@ export class LinuxProcessReuseBackend {
 		captureWorkspace?: (capture: Omit<TopLevelCapture, "observation">) => void, inPlace?: number, preparation?: TimelineInterval): Promise<DispatcherResponse> {
 		return measureProcess(session, async () => {
 			if (!prototype) {
-				const captured = await TimelineInterval.outside(() => TimelineInterval.measure(() => this.prototype(session, request, executable, outputRoute)));
+				const captured = await TimelineInterval.outside(() => TimelineInterval.measure(() => this.prototype(session.projection, request, executable, outputRoute)));
 				prototype = captured.output;
 				preparation = captured.computation;
 			}
@@ -1658,8 +1657,22 @@ export class LinuxProcessReuseBackend {
 		throw new Error(`executable not found: ${request.name}`);
 	}
 
-	private async prototype(session: ActiveSession, request: ProcessArguments, executable: string, outputRoute: OutputRoute): Promise<ExecPrototype> {
-		const [executableDigest, ready] = await Promise.all([hashExecutableFile(executable), this.resolveReady()]);
+	/** Retain the learned launch authority, then propose a separate input version shared by scheduling and execution. */
+	private async boundRequest(binding: ProcessExecutionBinding, invocation: BoundProcessInvocation, projection: ExecutionPathProjection, signal: AbortSignal) {
+		const cwd = projection.toPhysical(invocation.cwd), executable = projection.toPhysical(invocation.executable);
+		if (!cwd || !executable) throw new Error("bound process paths are unmapped");
+		let request = { ...invocation, cwd }, prototype = await this.prototype(projection, request, executable, invocation.outputRoute);
+		if (processWeakKey(prototype) !== binding.key) throw new Error("bound process execution context changed");
+		if (invocation.resources && reopensProcessInputs(invocation)) {
+			request = { ...request, resources: await reopenProcessResources(invocation.resources, projection, (await this.resolveReady()).dispatcher,
+				Math.min(MAX_REQUEST_BYTES / 2, this.store.limits.maxBytes), signal) };
+			prototype = await this.prototype(projection, request, executable, invocation.outputRoute, prototype.executableDigest);
+		}
+		return { request, executable, prototype };
+	}
+
+	private async prototype(projection: ExecutionPathProjection, request: ProcessArguments, executable: string, outputRoute: OutputRoute, executableDigest?: Sha256Digest): Promise<ExecPrototype> {
+		const [digest, ready] = await Promise.all([executableDigest ?? hashExecutableFile(executable), this.resolveReady()]);
 		return bufferedProcessPrototype({
 			executable,
 			argv: [request.argv0, ...request.args],
@@ -1667,8 +1680,57 @@ export class LinuxProcessReuseBackend {
 			environment: request.environment,
 			context: routedProcessContext(ready.executionContext, outputRoute, request.closeStdin, descriptorInputs(request.resources).filter(input => input.installed !== false), request.outputPipes, request.outputFlags),
 			...(request.resources ? { resources: request.resources } : {}),
-		}, session.projection, executableDigest, ready.platformFingerprint);
+		}, projection, digest, ready.platformFingerprint);
 	}
+}
+
+function reopensProcessInputs(invocation: BoundProcessInvocation): boolean {
+	return !invocation.producer && Object.values(invocation.resources?.objects ?? {}).every(object => object.type === "null" ||
+		(object.type === "regular" || object.type === "directory") && !!object.sourcePath && pathContains(invocation.sourceRoot, object.sourcePath));
+}
+
+/** Reopen paths into a new graph. Handles, shared OFDs, flags and cursors remain predictions checked at the held exec. */
+async function reopenProcessResources(graph: ProcessResourceGraph, projection: ExecutionPathProjection, dispatcher: string, remaining: number,
+	signal: AbortSignal): Promise<ProcessResourceGraph> {
+	const objects: Record<number, ProcessResourceGraph["objects"][number]> = {}, remapped = new Map<number, number>(), images = new Map<string, number>();
+	let namespace: ReturnType<typeof captureWorkspaceStructure> | undefined;
+	for (const [key, object] of Object.entries(graph.objects)) {
+		signal.throwIfAborted();
+		const id = Number(key);
+		if (object.type === "null") { objects[id] = object; continue; }
+		const logical = object.sourcePath!, physical = projection.toPhysical(logical)!;
+		await assertNoSymlinkPath(projection.workspaceRoot, physical);
+		const before = await lstat(physical, { bigint: true }), identity = `${before.dev}:${before.ino}`, previous = images.get(identity);
+		if (previous !== undefined) { remapped.set(id, previous); continue; }
+		let content: Buffer | undefined, aliases: readonly string[] | undefined;
+		if (object.type === "regular") {
+			const captured = await captureStableFile(physical, remaining, true, undefined, signal);
+			if (!sameFilesystemIdentity(before, captured.stat)) throw new Error("reopened input changed during capture");
+			content = captured.content!;
+			if (before.nlink > 1n) {
+				const snapshot = await (namespace ??= captureWorkspaceStructure(projection.workspaceRoot)), entry = snapshot.entries.get(path.relative(projection.workspaceRoot, physical));
+				if (!snapshot.complete || entry?.kind !== "file" || entry.object !== identity || entry.aliases?.length !== Number(before.nlink))
+					throw new Error("reopened input alias namespace is not closed");
+				aliases = entry.aliases.map(alias => projection.toLogical(alias)).sort();
+			}
+		} else {
+			if (!before.isDirectory()) throw new Error("reopened input type changed");
+			if (object.content !== undefined) {
+				// Enumeration cookies and inode numbers belong to the logical filesystem, not the private backing tree.
+				await assertNoSymlinkPath(projection.sourceRoot, logical);
+				content = await new Promise<Buffer>((resolve, reject) => execFile(dispatcher, ["--directory-image", logical],
+					{ encoding: "buffer", maxBuffer: remaining, signal }, (error, stdout) => error ? reject(error) : resolve(stdout)));
+			}
+		}
+		if (!sameFilesystemIdentity(before, await lstat(physical, { bigint: true }))) throw new Error("reopened input changed during capture");
+		remaining -= content?.length ?? 0;
+		if (remaining < 0) throw new Error("reopened inputs exceed capture budget");
+		objects[id] = { type: object.type, sourcePath: logical, contentDigest: sha256Digest(content ?? ""),
+			...(content ? { content: content.toString("base64") } : {}), ...(aliases ? { sourceAliases: aliases } : {}) };
+		images.set(identity, id);
+	}
+	return { ...graph, objects, descriptions: Object.fromEntries(Object.entries(graph.descriptions).map(([id, description]) =>
+		[id, { ...description, object: remapped.get(description.object) ?? description.object }])) };
 }
 
 /** Owns inherited descriptor images, their final proofs, and every handle opened during preparation. */

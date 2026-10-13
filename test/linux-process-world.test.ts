@@ -872,11 +872,12 @@ int main(void) {
 		else expect((await pending).output.result.content).toEqual([{ type: "text", text: "predecessor" }]);
 	});
 
-nativeTest.for(["completed", "running", "native", "native-merged", "native-closed-input", "native-descriptors", "native-null", "native-null-stdin", "native-status", "native-directory", "native-directory-entries", "native-directory-prepared-stale", "native-directory-opath", "native-directory-opath-prepared-stale", "native-pipe", "native-pipe-prepared-stale", "native-pipe-live", "native-pipe-live-prepared-stale", "native-pipe-live-mixed", "native-pipe-live-transfer", "native-pipe-producer", "native-pipe-producer-queued", "native-pipe-producer-short", "native-pipe-producer-splice", "native-socket", "native-socket-running", "native-socket-duplex", "native-socket-lifetime", "native-socket-io", "native-socket-messages", "native-socket-export", "native-socket-counter-export", "native-socket-prequeued", "native-socket-segmented", "native-socket-prefixed", "native-socket-orphan", "native-eventfd", "native-eventfd-semaphore", "native-socket-concurrent", "native-socket-half-closed", "native-socket-prepared-stale", "native-shared-table", "native-unshare", "native-prepared-stale", "native-prepared-restored"] as const)("reexecutes an owned child binding across turns without replaying its parent or stale input (%s)", { timeout: 20_000 }, async (mode, { skip, benchmark }) => {
+nativeTest.for(["completed", "running", "native", "native-merged", "native-closed-input", "native-descriptors", "native-descriptors-merged", "native-null", "native-null-stdin", "native-status", "native-directory", "native-directory-entries", "native-directory-prepared-stale", "native-directory-opath", "native-directory-opath-prepared-stale", "native-pipe", "native-pipe-prepared-stale", "native-pipe-live", "native-pipe-live-prepared-stale", "native-pipe-live-mixed", "native-pipe-live-transfer", "native-pipe-producer", "native-pipe-producer-queued", "native-pipe-producer-short", "native-pipe-producer-splice", "native-socket", "native-socket-running", "native-socket-duplex", "native-socket-lifetime", "native-socket-io", "native-socket-messages", "native-socket-export", "native-socket-counter-export", "native-socket-prequeued", "native-socket-segmented", "native-socket-prefixed", "native-socket-orphan", "native-eventfd", "native-eventfd-semaphore", "native-socket-concurrent", "native-socket-half-closed", "native-socket-prepared-stale", "native-shared-table", "native-unshare", "native-prepared-stale", "native-prepared-restored"] as const)("reexecutes an owned child binding across turns without replaying its parent or stale input (%s)", { timeout: 20_000 }, async (mode, { skip, benchmark }) => {
 		const fixture = await benchmark("pi-process-binding-", mode.includes("prepared-") ? "git" : undefined); // Borrowed immutable preparations.
 		const publishing = vi.spyOn(fixture.backend.planner, "publishCompleted");
 		const errors = vi.spyOn(fixture.backend as unknown as { setError(session: unknown, message: string): void }, "setError");
 		const native = mode.startsWith("native"), running = mode.endsWith("running"), enumerate = mode.includes("entries");
+		const reopened = mode.startsWith("native-descriptors") || ["native-directory-entries", "native-directory-opath"].includes(mode);
 		const orphan = mode.includes("orphan"), segmented = mode.includes("segmented"), prefixed = mode.endsWith("prefixed"), queueCounter = mode === "native-socket-counter-export", prequeued = orphan || segmented || prefixed || mode.endsWith("prequeued") || queueCounter;
 		const discovery = segmented || orphan;
 		const counter = mode.includes("eventfd"), semaphore = mode.endsWith("semaphore");
@@ -885,13 +886,14 @@ nativeTest.for(["completed", "running", "native", "native-merged", "native-close
 		const mixed = mode.endsWith("mixed"), socket = mode.includes("socket"), duplex = prequeued || exporting || lifetime || io || messages || mode.endsWith("duplex") || mode.endsWith("concurrent"), concurrent = mode.endsWith("concurrent"), pipe = mode.includes("pipe"), opath = mode.includes("opath") || mixed, launcher = counter || pipe || socket || mode === "native-shared-table" || mode === "native-unshare" || opath || enumerate;
 		const nullDevice = mixed || mode === "native-null" || mode === "native-null-stdin" || mode === "native-status";
 		const directory = mode.includes("directory") || mixed;
-		const descriptors = mode === "native-descriptors" || launcher || nullDevice || directory;
+		const descriptors = mode.startsWith("native-descriptors") || launcher || nullDevice || directory;
 		let host: ReturnType<typeof createSpeculativeActionHost> | undefined;
 		let publication: ReturnType<typeof holdProcessPublication> | undefined;
 		let restorePreparation: (() => void) | undefined;
 		await using _cleanup = onExit(async () => { publication?.close(); restorePreparation?.(); publishing.mockRestore(); errors.mockRestore(); await host?.dispose(); await fixture.dispose(); });
 		await writeFile(path.join(fixture.workspace, "input.txt"), "before\n");
 		if (descriptors) await writeFile(path.join(fixture.workspace, "fd.txt"), "abcdef");
+		if (mode === "native-descriptors-merged") await writeFile(path.join(fixture.workspace, "fd-other.txt"), "abcdef");
 		await compileBenchmarkHelper(fixture.workspace, { source: "worker.c", output: "worker", code: `#define _GNU_SOURCE
 ${cHeaders("errno.h poll.h sys/select.h sys/eventfd.h sys/syscall.h stdint.h sys/epoll.h fcntl.h stdlib.h string.h sys/socket.h sys/wait.h unistd.h")}
 ${rightsHelpers}
@@ -1037,7 +1039,7 @@ int main(int argc, char **argv) {
 		await commitBenchmarkFixture(fixture.workspace, "Bound process invocation");
 		const { executionFingerprint } = await prepareLinuxProcessReuse(fixture, { skip });
 		const scope = { sessionID: "binding", turnID: "recorded" }, later = { ...scope, turnID: "prepared" };
-		const command = (descriptors ? "exec 3<fd.txt; exec 4<&3; exec 8<fd.txt; IFS= read -r -N 1 discarded <&3; " : "") +
+		const command = (descriptors ? `exec 3<fd.txt; exec 4<&3; exec 8<${mode === "native-descriptors-merged" ? "fd-other.txt" : "fd.txt"}; IFS= read -r -N 1 discarded <&3; ` : "") +
 			(directory ? "exec 10<.; exec 11<&10; " : "") +
 			(nullDevice ? (mode === "native-null-stdin" ? "exec 0<>/dev/null; exec 6<&0; " : "exec 6<>/dev/null; ") + "exec 7<&6; " : "") +
 			"export BOUND_SECRET='private value'; " + (launcher ? "exec fd-launch parent" : "printf 'parent\\n'; exec -a bound-name worker 'private argument'") +
@@ -1133,9 +1135,14 @@ int main(int argc, char **argv) {
 		expect(seedFallback).toHaveBeenCalledTimes(native ? 1 : 0);
 		expect(fixture.backend.actorMetrics().hits, JSON.stringify({ actor: fixture.backend.actorMetrics(), producer: fixture.backend.metrics() })).toBe(0);
 		binding ??= fixture.backend.executionBindings(later).at(-1);
+		if (reopened || mode === "native-pipe-live") {
+			const registry = Reflect.get(fixture.backend, "handoffs") as ProcessHandoffRegistry<{ readonly executable: string }>;
+			binding = fixture.backend.executionBindings(later).find(candidate => registry.resolveBinding(candidate, later)?.executable === path.join(fixture.workspace, "worker"));
+		}
 		expect(binding, "a real native miss must retain its launch without publishing a result").toBeDefined();
 		if (["completed", "native", "native-merged", "native-descriptors", "native-pipe-live"].includes(mode))
-			expect(fixture.backend.operationHints(binding!).preparation).toBe(mode === "native" || mode === "native-merged" ? "current_workspace" : undefined);
+			expect(fixture.backend.operationHints(binding!).preparation).toBe(mode === "native" || mode === "native-merged" || mode === "native-descriptors" ? "current_workspace" : undefined);
+		if (mode === "native-pipe-live") expect(fixture.backend.operationHints(binding!).fed).toBe(true);
 		let retainedOperation: ExecutionOperationBinding | undefined;
 		if (mode === "native") for (const turnID of ["repeated-native-1", "repeated-native-2"]) {
 			const repeatedScope = { ...scope, turnID };
@@ -1150,6 +1157,15 @@ int main(int argc, char **argv) {
 		}
 		await expect.poll(() => patternStore.recent(scope.sessionID).map(event => event.input.command)).toEqual(["printf common", "printf common", ...(discovery ? [command] : []), command]);
 		await writeFile(path.join(fixture.workspace, "input.txt"), "newest\n");
+		if (reopened) {
+			await writeFile(path.join(fixture.workspace, "fd.txt"), "abcdeZ"); // Same size, another full object version.
+			await filesystem.link(path.join(fixture.workspace, "fd.txt"), path.join(fixture.workspace, "fd-alias.txt"));
+			if (mode === "native-descriptors-merged") {
+				await rm(path.join(fixture.workspace, "fd-other.txt"));
+				await filesystem.link(path.join(fixture.workspace, "fd.txt"), path.join(fixture.workspace, "fd-other.txt"));
+			}
+			expect(await fixture.backend.bindingStale(binding!)).toBe(true);
+		}
 		const before = fixture.backend.metrics();
 		const publicationStart = publishing.mock.calls.length;
 		if (running) publication = holdProcessPublication(fixture.backend);
@@ -1178,6 +1194,11 @@ int main(int argc, char **argv) {
 			restorePreparation?.(); restorePreparation = undefined;
 			// Every preparation is sealed before this change; no later producer can capture the replacement value.
 			await writeFile(path.join(fixture.workspace, "input.txt"), mode === "native-prepared-restored" ? "newest\n" : "changed after preparation\n");
+		}
+		if (reopened) {
+			await expect.poll(() => fixture.backend.bindingStale(binding!), { timeout: 5000 }).toBe(false);
+			expect(publishing.mock.calls.slice(publicationStart).some(([certificate]) => certificate.weakKey !== binding!.key &&
+				certificate.prototype.inheritedFDs.some(fd => fd.resourceAliases?.includes(path.join(fixture.workspace, "fd-alias.txt"))))).toBe(true);
 		}
 		expect(fixture.backend.metrics().misses).toBeGreaterThan(before.misses);
 		const changedParent = command.replace("parent", "automatic-parent");

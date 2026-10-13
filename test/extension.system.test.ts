@@ -10,6 +10,7 @@ import { createSpeculativeActionHost } from "../src/agent-integration.ts";
 import { ProcessExecutionCoordinator } from "../src/process-execution.ts";
 import { currentExecutionScope } from "../src/execution-world.ts";
 import { LinuxProcessReuseBackend } from "../src/linux-process-backend.ts";
+import type { ProcessExecutionBinding, ProcessHandoffRegistry } from "../src/process-handoff.ts";
 import { SynchronousProcessObserver } from "../src/linux-process-sync.ts";
 import { summarizeSpeculativeTrace } from "../src/trace-summary.ts";
 import { commitBenchmarkFixture, compileBenchmarkHelper, holdProcessPublication } from "./linux-process-fixture.ts";
@@ -21,10 +22,10 @@ import { deferred, onExit } from "./async.ts";
 const directories = temporaryDirectories("pi-extension-system-");
 afterEach(async () => { vi.unstubAllEnvs(); vi.restoreAllMocks(); await directories.dispose(); });
 
-test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-nested", "native-stale", "native-running", "native-retired", "native-unkeyed", "native-inputs",
-	"native-sync-producer", "native-sync-consumer", "native-sync-both", "native-sync-stale", "native-sync-lost", "native-sync-inputs"] : [])])("runs the shipped extension through a real Pi session (%s)", async mode => {
+test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-nested", "native-stale", "native-running", "native-retired", "native-unkeyed", "native-inputs", "native-inputs-stale",
+	"native-sync-producer", "native-sync-consumer", "native-sync-both", "native-sync-stale", "native-sync-lost", "native-sync-inputs", "native-sync-inputs-stale"] : [])])("runs the shipped extension through a real Pi session (%s)", async mode => {
 	const enabled = mode !== "off", native = mode.startsWith("native"), running = mode === "native-running" || mode === "native-retired";
-	const stale = mode.endsWith("stale"), synchronous = (callID: string) => mode.startsWith("native-sync") &&
+	const stale = mode.endsWith("stale"), inputs = mode.includes("inputs"), synchronous = (callID: string) => mode.startsWith("native-sync") &&
 		(!mode.endsWith("producer") && !mode.endsWith("consumer") || callID === (mode.endsWith("producer") ? "seed" : "check"));
 	const cwd = await directories.create(native ? os.homedir() : undefined), agentDir = path.join(cwd, "agent");
 	await mkdir(agentDir); vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
@@ -85,6 +86,7 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 		await session.bindExtensions({ mode: "print", onError: error => { throw error; } });
 		if (native) {
 			let backend: LinuxProcessReuseBackend | undefined;
+			let inputBinding: ProcessExecutionBinding | undefined;
 			if (mode === "native-sync-lost") {
 				const attach = SynchronousProcessObserver.prototype.attach;
 				vi.spyOn(SynchronousProcessObserver.prototype, "attach").mockImplementation(function (this: SynchronousProcessObserver, request) {
@@ -96,30 +98,38 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 					} };
 				});
 			}
-			const observe = LinuxProcessReuseBackend.prototype.observeBindings, nested = !mode.startsWith("native-sync") && !["native", "native-stale", "native-inputs"].includes(mode);
+			const observe = LinuxProcessReuseBackend.prototype.observeBindings, nested = !inputs && !mode.startsWith("native-sync") && !["native", "native-stale"].includes(mode);
 			vi.spyOn(LinuxProcessReuseBackend.prototype, "observeBindings").mockImplementation(function (this: LinuxProcessReuseBackend, scope, execute, receive, ...args) {
-				backend = this; return observe.call(this, scope, execute, (bindings, computations) => receive(nested && scope.callID === "seed" ? bindings.slice(0, 1) : bindings, computations), ...args);
+				backend = this; return observe.call(this, scope, execute, (bindings, computations) => {
+					if (inputs && scope.callID === "seed") {
+						const registry = Reflect.get(this, "handoffs") as ProcessHandoffRegistry<{ readonly executable: string }>;
+						inputBinding = bindings.find(binding => registry.resolveBinding(binding, scope)?.executable === path.join(cwd, "slow"));
+					}
+					return receive(nested && scope.callID === "seed" ? bindings.slice(0, 1) : bindings, computations);
+				}, ...args);
 			});
-			await compileBenchmarkHelper(cwd, { source: "slow.c", output: "slow", code: "#include <stdio.h>\n#include <fcntl.h>\n#include <unistd.h>\nint main(int n,char**v){int f=open(v[1],O_RDONLY);if(f<0)return 1;unsigned long h=5381;char c;while(read(f,&c,1)==1)h=h*33+c;close(f);for(volatile unsigned long i=0;i<40000000ul;i++)h^=i;printf(\"%s %lx\\n\",v[1],h);return 0;}\n" });
+			await compileBenchmarkHelper(cwd, { source: "slow.c", output: "slow", code: "#include <stdio.h>\n#include <fcntl.h>\n#include <unistd.h>\nint main(int n,char**v){int f=fcntl(3,F_GETFD)<0?open(v[1],O_RDONLY):3;if(f<0)return 1;unsigned long h=5381;char c;while(read(f,&c,1)==1)h=h*33+c;close(f);for(volatile unsigned long i=0;i<40000000ul;i++)h^=i;printf(\"%s %lx\\n\",v[1],h);return 0;}\n" });
 			await commitBenchmarkFixture(cwd, "sdk-callback");
-			const command = "./slow notes.txt" + (mode.endsWith("inputs") ? " 3<notes.txt" : "");
+			const command = "./slow notes.txt" + (inputs ? " 3<notes.txt" : "");
 			const initial = `printf initial:; ${command}; :`, remaining = `printf remaining:; ${command}; printf once >> marker`;
 			const call = (tool: string, text: string, id: string) => fauxAssistantMessage(fauxToolCall(tool, { text }, { id }), { stopReason: "toolUse" });
-			actor.setResponses([call("produce_notes", initial, "seed"), ...(mode.endsWith("inputs") ? [response("read", { path: "notes.txt", offset: 2 })] : []), async () => {
+			actor.setResponses([call("produce_notes", initial, "seed"), ...(inputs ? [response("read", { path: "notes.txt", offset: 2 })] : []), async () => {
 				if (running) publication = holdProcessPublication(backend!);
 				return response("write", { path: "notes.txt", content: "changed\n" });
 			}, ...(mode === "native-retired" ? [async () => {
 				await expect.poll(publication!.reached, { timeout: 5000 }).toBe(true); session.setActiveToolsByName(tools.filter(name => name !== "produce_notes"));
 				return response("read", { path: "notes.txt" });
 			}] : []), async () => {
-				await expect.poll(() => publication ? publication.reached() : events.some(event => event.type === "candidate" && event.candidate.kind === "operation" && event.state.status === "succeeded"), { timeout: 5000 }).toBe(true);
+				if (inputs) expect(inputBinding).toBeDefined();
+				await expect.poll(() => publication ? publication.reached() : inputs ? backend!.bindingStale(inputBinding!).then(stale => !stale) :
+					events.some(event => event.type === "candidate" && event.candidate.kind === "operation" && event.state.status === "succeeded"), { timeout: 5000 }).toBe(true);
 				await expect(readFile(path.join(cwd, "marker"))).rejects.toMatchObject({ code: "ENOENT" });
 				if (stale) await writeFile(path.join(cwd, "notes.txt"), "fresh\n");
 				return call("format_rows", remaining, "check");
 			}, fauxAssistantMessage("done")]);
 			await session.prompt("Produce notes, edit the input, then render the remaining work.");
-			// Inherited FD contents are fixed inputs; writing the pathname does not authorize replay of that old version.
-			const results = session.messages.filter(message => message.role === "toolResult"), reused = !stale && !mode.endsWith("inputs");
+			// A named inherited input prepares a new version after the edit; adoption still checks the actual held graph.
+			const results = session.messages.filter(message => message.role === "toolResult"), reused = !stale;
 			if (mode === "native-sync-lost") {
 				expect(results.at(-1)).toMatchObject({ isError: true }); expect(JSON.stringify(results.at(-1))).toContain("synchronous native handoff failed");
 				expect(await readFile(path.join(cwd, "marker"), "utf8")).toBe("once"); expect(calls).toEqual(["seed", "check"]); return;
@@ -127,7 +137,7 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 			expect(results.at(-1)?.content, JSON.stringify(session.messages)).toEqual([{ type: "text", text: "hook:own:format_rows:remaining:" + execFileSync("./slow", ["notes.txt"], { cwd, encoding: "utf8" }) }]);
 			expect(results.every(result => !result.isError)).toBe(true); expect(await readFile(path.join(cwd, "marker"), "utf8")).toBe("once");
 			expect(calls).toEqual(["seed", "check"]); expect(prepared).toEqual([initial, remaining]);
-			if (mode.endsWith("inputs")) expect(summarizeSpeculativeTrace(events).inputReuseHits).toBe(1);
+			if (inputs) expect(summarizeSpeculativeTrace(events).inputReuseHits).toBe(1);
 			const settled = events.filter(event => event.type === "actor_action").at(-1)!, timing = settled.computation!;
 			expect(backend!.actorMetrics().hits).toBe(Number(reused)); expect(timing.hiddenComputeMs > 0).toBe(reused);
 			expect((timing.hiddenByMode ?? []).reduce((total, part) => total + part.hiddenComputeMs, 0)).toBeCloseTo(timing.hiddenComputeMs, 5);

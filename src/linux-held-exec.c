@@ -3634,6 +3634,14 @@ int main(int argc, char **argv) {
 	}
 	int dispatched = PI_SPEC_AUTHORITY_ONLY ? -1 : image_dispatch(argc, argv);
 	if (dispatched >= 0) return dispatched;
+	if (argc == 3 && !strcmp(argv[1], "--directory-image")) {
+		int fd = open(argv[2], O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+		if (fd < 0) return 74;
+		unsigned char *bytes; int size = directory_bytes(fd, &bytes);
+		close(fd);
+		int result = size >= 0 && fwrite(bytes, 1, (size_t)size, stdout) == (size_t)size && fflush(stdout) == 0 ? 0 : 74;
+		free(bytes); return result;
+	}
 	if (argc >= 2 && (!strcmp(argv[1], "--attach") || !strcmp(argv[1], "--attach-skip-code"))) {
 		int probe = !strcmp(argv[1], "--attach-skip-code");
 		if (probe && (argc != 3 || !*argv[2] || strspn(argv[2], "0123456789") != strlen(argv[2]) || strtoul(argv[2], NULL, 10) > 255)) return 64;

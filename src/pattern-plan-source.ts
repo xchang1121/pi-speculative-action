@@ -188,7 +188,7 @@ export function createPatternPlanSource({
 		});
 
 	/** Prepare stale native launches against the Actor's edited files, without repeating their parents' earlier setup.
-	 * Captured-resource launches keep their parent ordering. Every result still requires current dependency evidence at adoption. */
+	 * Inputs that cannot reopen keep their parent ordering. Every result still requires current dependency evidence at adoption. */
 	const reruns = async (state: CommandRerunState | undefined, schemaHashes: Readonly<Record<string, string>>) => {
 		if (!state || state !== commandRerun) return NO_RERUN;
 		// A closing observation may still be checking this request; its next decision waits for that batch.
