@@ -13,7 +13,7 @@ import { effectCommitFailure, isPoisonedEffectCommit } from "./effect-transactio
 import type { CandidateEventDescriptor } from "./events.ts";
 import { type ExecutionOperationAdoption, type ExecutionOperationBinding, type ExecutionScope, type SpeculativeExecutionRoute, sameSpeculativeExecutionRoute, validateWorldBranch, type WorldBranch } from "./execution-world.ts";
 import type { PlanUpdate } from "./plan-proposal.ts";
-import { PlanRuntime, type PlanRuntimeNode, type PredictionOpportunity } from "./plan-runtime.ts";
+import { PlanRuntime, type PlanRuntimeNode, type PredictionOpportunity, type ClaimedPrediction } from "./plan-runtime.ts";
 import { BoundedEventQueue, PostSettlementQueue } from "./post-settlement.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
 import { cloneSharedData } from "./stable-json.ts";
@@ -340,8 +340,6 @@ interface TurnState<SessionID, Output, StartInput, StateData> extends RuntimeTur
 	actorArrivedAt?: number;
 	lifecycle: "active" | "closing" | "finished";
 }
-
-interface ClaimedPrediction { readonly node: PlanRuntimeNode; readonly opportunity: PredictionOpportunity; }
 
 interface ProjectionResource { readonly dispose: () => void | Promise<void>; references: number; }
 
@@ -1082,11 +1080,10 @@ export function makeSpeculativeActionRuntime<
 				const actorAction: ActorActionIdentity = { id: adoption.id, kind: "operation", sequence: adoption.sequence,
 					decisionSequence: turn.decisionSequence, turnID: turn.turnID };
 				candidate.actorAdopted = true; candidate.forkParent = undefined;
-				for (const node of session.plan.consumers(candidate.id)) {
-					const opportunity = session.plan.claimMatch(node.proposalID, node.action.id, actorAction, relation);
-					const settled = opportunity && session.plan.confirm(opportunity, actorAction, { status: "adopted", candidateID: candidate.id });
-					if (settled) predictionSettled(session, node, settled);
-				}
+				// Rearming execution changes its candidate ID, not the prediction of the work actually consumed.
+				const matches = session.plan.matchable(turn.decisionSequence).flatMap(node =>
+					node.action.type === "operation" && node.actionKey?.key === action.key ? maybe(session.plan.claimMatch(node, actorAction, relation)) : []);
+				confirmPredictions(session, matches, actorAction, { status: "adopted", candidateID: candidate.id });
 			};
 			const evaluation = await TimelineInterval.measure(() => adapter.executeCandidate({
 				startInput: live ?? owner,
@@ -1485,11 +1482,8 @@ export function makeSpeculativeActionRuntime<
 				return Object.freeze(prepared);
 			}
 
-			matchingPredictions = predictionMatches(state.session, actualKey, state.decisionSequence).flatMap(({ node, relation }) => {
-				const opportunity = state.session.plan.claimMatch(node.proposalID, node.action.id, identity, relation);
-				if (!opportunity) return [];
-				return [{ node, opportunity }];
-			});
+			matchingPredictions = predictionMatches(state.session, actualKey, state.decisionSequence)
+				.flatMap(({ node, relation }) => maybe(state.session.plan.claimMatch(node, identity, relation)));
 			if (preview?.actionKey && actionKeyCovers(preview.actionKey, actualKey, projectionRules)) {
 				preview.actorDemand = true;
 				const preparation = preparations.get(preview);

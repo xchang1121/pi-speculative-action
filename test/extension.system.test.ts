@@ -23,16 +23,18 @@ const directories = temporaryDirectories("pi-extension-system-");
 afterEach(async () => { vi.unstubAllEnvs(); vi.restoreAllMocks(); await directories.dispose(); });
 
 test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-nested", "native-stale", "native-running", "native-retired", "native-unkeyed", "native-inputs", "native-inputs-stale",
-	"native-sync-producer", "native-sync-consumer", "native-sync-both", "native-sync-stale", "native-sync-lost", "native-sync-inputs", "native-sync-inputs-stale"] : [])])("runs the shipped extension through a real Pi session (%s)", async mode => {
+	"native-sync-producer", "native-sync-consumer", "native-sync-both", "native-sync-stale", "native-sync-lost", "native-sync-inputs", "native-sync-inputs-stale",
+	"native-sync-inputs-preempted", "native-sync-inputs-preempted-stale"] : [])])("runs the shipped extension through a real Pi session (%s)", async mode => {
 	const enabled = mode !== "off", native = mode.startsWith("native"), running = mode === "native-running" || mode === "native-retired";
-	const stale = mode.endsWith("stale"), inputs = mode.includes("inputs"), synchronous = (callID: string) => mode.startsWith("native-sync") &&
+	const stale = mode.endsWith("stale"), inputs = mode.includes("inputs"), preempted = mode.includes("preempted"), synchronous = (callID: string) => mode.startsWith("native-sync") &&
 		(!mode.endsWith("producer") && !mode.endsWith("consumer") || callID === (mode.endsWith("producer") ? "seed" : "check"));
 	const cwd = await directories.create(native ? os.homedir() : undefined), agentDir = path.join(cwd, "agent");
 	await mkdir(agentDir); vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
 	await writeFile(path.join(cwd, "notes.txt"), "one\ntwo\n");
 	const tools = native ? ["produce_notes", "format_rows", "write", "read"] : ["read", "write", "edit", "format_rows", "late_rows"];
 	await writeFile(path.join(agentDir, "speculative-action.json"), JSON.stringify({ enabled, drafterEnabled: false,
-		patternAware: { enabled: native, multiStepEnabled: false, presets: ["recent-command"] }, tools, maxConcurrentActions: 4, predictionTimeoutMs: 10_000 }));
+		patternAware: { enabled: native, multiStepEnabled: false, presets: ["recent-command"] }, tools, candidateLimit: preempted ? 2 : undefined,
+		maxConcurrentActions: 4, predictionTimeoutMs: 10_000 }));
 	const actor = fauxProvider({ provider: "functional-actor", models: [{ id: "actor" }], tokensPerSecond: 4_000, tokenSize: { min: 1, max: 2 } });
 	const response = (name: string, args: Record<string, unknown>) => fauxAssistantMessage(fauxToolCall(name, args), { stopReason: "toolUse" });
 	actor.setResponses([
@@ -81,6 +83,7 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 	const { session } = await createAgentSession({ cwd, agentDir, model: actor.getModel(), modelRuntime, settingsManager, resourceLoader,
 		sessionManager: SessionManager.inMemory(cwd), tools });
 	const originalPrompt = session.agent.prompt, originalContinue = session.agent.continue;
+	const published = deferred();
 	let publication: ReturnType<typeof holdProcessPublication> | undefined;
 	try {
 		await session.bindExtensions({ mode: "print", onError: error => { throw error; } });
@@ -115,6 +118,10 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 			const call = (tool: string, text: string, id: string) => fauxAssistantMessage(fauxToolCall(tool, { text }, { id }), { stopReason: "toolUse" });
 			actor.setResponses([call("produce_notes", initial, "seed"), ...(inputs ? [response("read", { path: "notes.txt", offset: 2 })] : []), async () => {
 				if (running) publication = holdProcessPublication(backend!);
+				if (preempted) {
+					const store = backend!.store, publish = store.withPublication.bind(store);
+					vi.spyOn(store, "withPublication").mockImplementation(async (...args) => { const result = await publish(...args); await published.promise; return result; });
+				}
 				return response("write", { path: "notes.txt", content: "changed\n" });
 			}, ...(mode === "native-retired" ? [async () => {
 				await expect.poll(publication!.reached, { timeout: 5000 }).toBe(true); session.setActiveToolsByName(tools.filter(name => name !== "produce_notes"));
@@ -142,6 +149,7 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 			expect(backend!.actorMetrics().hits).toBe(Number(reused)); expect(timing.hiddenComputeMs > 0).toBe(reused);
 			expect((timing.hiddenByMode ?? []).reduce((total, part) => total + part.hiddenComputeMs, 0)).toBeCloseTo(timing.hiddenComputeMs, 5);
 			const predictions = events.filter(event => event.type === "operation_prediction"), adopted = predictions.flatMap(event => event.settlement.observation === "observed" && event.settlement.match.matched && event.settlement.match.adoption.status === "adopted" ? [event.settlement.match.relation] : []);
+			if (preempted && reused) expect(events.some(event => event.type === "candidate" && event.state.status === "cancelled" && event.state.cause.code === "scheduler_preempted")).toBe(true);
 			expect(adopted).toHaveLength(Number(reused && mode !== "native-retired")); if (nested && adopted.length) expect(adopted[0]).toMatchObject({ kind: "projected", projector: "owned-operation" });
 			if (mode === "native-retired") expect(predictions.filter(event => event.settlement.prediction.id === predictions[0]!.settlement.prediction.id)).toMatchObject([{ settlement: { observation: "unobserved", cause: { code: "operation_not_observed" } } }]);
 			expect(!!settled.settlement.actionKeyHash).toBe(mode !== "native-unkeyed");
@@ -218,7 +226,7 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 			for (const execute of [() => coordinator.execute({ command: "", cwd, environment: {}, onData: () => {} }), () => coordinator.operations.exec("", cwd, { onData: () => {} })]) await expect(execute()).rejects.toBe(failure);
 		});
 	} finally {
-		publication?.close();
+		published.resolve(); publication?.close();
 		await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" }); session.dispose();
 		expect(session.agent.prompt).toBe(originalPrompt); expect(session.agent.continue).toBe(originalContinue);
 	}

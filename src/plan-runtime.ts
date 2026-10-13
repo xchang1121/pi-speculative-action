@@ -46,6 +46,8 @@ export interface PlanRuntimeNode {
 	readonly predictionState: PredictionOpportunityState;
 }
 
+export interface ClaimedPrediction { readonly node: PlanRuntimeNode; readonly opportunity: PredictionOpportunity; }
+
 export type PlanRuntimePromotion =
 	| { readonly status: "scheduled"; readonly node: PlanRuntimeNode }
 	| { readonly status: "waiting" | "blocked" | "settled" | "already_dispatched" | "missing" };
@@ -263,16 +265,11 @@ export class PlanRuntime {
 		return true;
 	}
 
-	claimMatch(
-		proposalID: string,
-		actionID: string,
-		actorAction: ActorActionIdentity,
-		relation: ActionKeyMatch,
-	): PredictionOpportunity | undefined {
-		const value = this.mutable(proposalID, actionID);
-		if (!value || !this.isMatchable(value.plan, value.node, actorDecisionSequence(actorAction))) return undefined;
+	claimMatch(node: PlanRuntimeNode, actorAction: ActorActionIdentity, relation: ActionKeyMatch): ClaimedPrediction | undefined {
+		const value = this.mutable(node.proposalID, node.action.id);
+		if (value?.node.identity.id !== node.identity.id || !this.isMatchable(value.plan, value.node, actorDecisionSequence(actorAction))) return undefined;
 		const opportunity = value.node.opportunity;
-		return opportunity.claim(actorAction, relation) ? opportunity : undefined;
+		return opportunity.claim(actorAction, relation) ? { node, opportunity } : undefined;
 	}
 
 	confirm(
@@ -431,24 +428,18 @@ export class PlanRuntime {
 
 	private snapshot(plan: MutablePlan, node: MutableNode): PlanRuntimeNode {
 		const dependencies = this.dependencyReadiness(plan, node);
+		const { opportunity, execution, validDependencies: _validDependencies, ...fields } = node;
 		return Object.freeze({
-			identity: node.identity,
+			...fields,
 			proposalID: plan.id,
 			source: plan.source,
 			revision: plan.revision,
-			action: node.action,
-			...(node.actionKey ? { actionKey: node.actionKey } : {}),
-			anchorDecisionSeq: node.anchorDecisionSeq,
-			earliestDecisionSeq: node.earliestDecisionSeq,
-			expectedDecisionSeq: node.expectedDecisionSeq,
-			latestDecisionSeq: node.latestDecisionSeq,
-			criticalPathSteps: node.criticalPathSteps,
 			dependenciesReady: dependencies === "ready",
-			execution: executionProjection(node.execution),
-			readiness: node.opportunity.state.status === "settled" ? "settled"
-				: dependencies === "ready" && node.execution.status !== "deferred" ? "waiting" : dependencies,
-			prediction: node.opportunity.identity,
-			predictionState: node.opportunity.state,
+			execution: executionProjection(execution),
+			readiness: opportunity.state.status === "settled" ? "settled"
+				: dependencies === "ready" && execution.status !== "deferred" ? "waiting" : dependencies,
+			prediction: opportunity.identity,
+			predictionState: opportunity.state,
 		});
 	}
 
@@ -510,7 +501,6 @@ function newNode(proposalID: string, source: string, revision: number, action: P
 	return {
 		identity,
 		action,
-		actionKey: undefined,
 		anchorDecisionSeq,
 		earliestDecisionSeq: anchorDecisionSeq + 1,
 		expectedDecisionSeq: anchorDecisionSeq + horizon(action) + 1,
