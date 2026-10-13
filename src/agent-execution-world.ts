@@ -4,13 +4,13 @@ import path from "node:path";
 import { relativeFilesystemPath } from "./path-utils.ts";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { BigIntStats } from "node:fs";
-import { sameFilesystemIdentity, type StableFilesystemCapture } from "./filesystem-evidence.ts";
+import { CapturedFilesystemObject, sameFilesystemIdentity, type CapturedFilesystemTransfer, type StableFilesystemCapture } from "./filesystem-evidence.ts";
 import { PI_ACTION_SEMANTICS, type ActionKey, type ActionSemanticsRegistry } from "./action-semantics.ts";
 import type { ExecutionWorld, ExecutionScope, ExecutionOperationAdoption, WorldBranch, WorldOutput, WorldCheckpoint, WorldResultCapture } from "./execution-world.ts";
 import { effectCommitFailure } from "./effect-transaction.ts";
 import { effectCapabilitiesCover, RESOURCE_OBSERVATION_EFFECTS, WORKSPACE_PATH_MUTATION_EFFECTS } from "./effect-model.ts";
 import { captureResourceVersion, collectResourceComputation, invalidateResourceInputs, releaseResourceVersion, resourceProofBytes, validateResourceVersion,
-	type ResourceReadView, type ResourceInput, type ResourceObservation, type ResourceVersionToken } from "./resource-version.ts";
+	ResourceReadView, type ResourceInput, type ResourceObservation, type ResourceVersionToken } from "./resource-version.ts";
 import { cause } from "./settlement.ts";
 import type { ToolFilesystemOperations, ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
 import { TimelineInterval } from "./task-timing.ts";
@@ -39,6 +39,8 @@ export function createResourceSnapshotExecutionWorld(
 	operations?: { readonly maxBytes: () => number },
 ): AgentExecutionWorld {
 	const canObserve = process.platform !== "win32";
+	const capturesInputs = (action: ActionKey | undefined, invocation: ToolInvocation | undefined) => !!operations &&
+		(!!invocation?.captureInputs || process.platform === "linux" && (!!invocation?.process || !action || actionSemantics.effect(action) !== "observation"));
 	const route = {
 		capabilities: RESOURCE_OBSERVATION_EFFECTS.capabilities,
 		fingerprint: () => "resource-version",
@@ -53,13 +55,12 @@ export function createResourceSnapshotExecutionWorld(
 		scope: "fallback",
 		isolation: "resource_snapshot",
 		observation: { ...route, capabilities: [...(canObserve ? route.capabilities : []), ...(operations ? WORKSPACE_PATH_MUTATION_EFFECTS.capabilities : [])],
-			inputsOnly: request => { const invocation = (request.executionContext ?? request.action?.executionContext) as ToolInvocation | undefined;
-				return !!operations && !!(invocation?.captureInputs || process.platform === "linux" && invocation?.process); },
+			inputsOnly: request => capturesInputs(request.action, (request.executionContext ?? request.action?.executionContext) as ToolInvocation | undefined),
 			diagnostics: () => canObserve ? route.diagnostics() : { state: operations ? "ready" : "unavailable", detail: "Explicit input and computation bindings are available; host read windows remain unproven on Windows" },
 			capture: async (context) => {
 				const invocation = context.executionContext ?? context.action?.executionContext as ToolInvocation | undefined;
 				if (operations && invocation?.captureInputs) return invocation.captureInputs(context.action, operations.maxBytes(), context.callID);
-				const inputsOnly = process.platform === "linux" && !!operations && !!invocation?.process;
+				const inputsOnly = capturesInputs(context.action, invocation);
 				if (!inputsOnly && (!context.action || !canObserve || actionSemantics.definition(context.action)?.effect !== "observation")) throw new Error("Actor input capture requires an explicit binding");
 				const root = inputsOnly ? invocation?.filesystemRoot ?? context.cwd : context.cwd;
 				const version = await captureResourceVersion(inputsOnly ? undefined : context.action, root, actionSemantics, operations && (inputsOnly || invocation?.filesystem) ? operations.maxBytes() : undefined);
@@ -88,27 +89,61 @@ export function createResourceSnapshotExecutionWorld(
 const resourceVersions = new WeakMap<object, readonly ResourceVersionToken[]>();
 const actorResourceInputs = new AsyncLocalStorage<{ inputs: (path?: string) => Iterable<object>; maxBytes: () => number } | undefined>();
 
-/** The input capability, pinned object and current FD must all identify this content version. */
-export async function borrowResourceObject(sources: Iterable<object>, target: string, expected: BigIntStats, maxBytes: number): Promise<StableFilesystemCapture | undefined> {
-	for (const source of sources) for (const version of resourceVersions.get(source) ?? []) {
-		if (!version.view?.retained) continue;
-		try {
-			const captured = await version.view.borrowObject(target, (capture, handle) => TimelineInterval.outside(async () => {
-				if (!capture.content || capture.bytesRead > maxBytes || !sameFilesystemIdentity(expected, capture.stat) ||
-					!sameFilesystemIdentity(capture.stat, await handle.stat({ bigint: true }))) return undefined;
-				return { ...capture, content: Buffer.from(capture.content), shared: true as const };
-			}));
-			if (captured) return captured;
-		} catch { /* Revocation or a different version leaves the normal FD capture authoritative. */ }
+/** Native inputs use the same owners and exact object validation on either side of a thread boundary. */
+export class ResourceObjectInputs {
+	private readonly views: (target?: string) => Iterable<ResourceReadView>;
+	private readonly produced?: WeakSet<CapturedFilesystemObject>;
+	constructor(inputs: ((target?: string) => Iterable<object>) | ResourceReadView, produced?: WeakSet<CapturedFilesystemObject>) {
+		this.views = inputs instanceof ResourceReadView ? () => [inputs] : function* (target) {
+			for (const source of inputs(target)) for (const version of resourceVersions.get(source) ?? []) if (version.view?.retained) yield version.view;
+		};
+		this.produced = produced;
 	}
-	return undefined;
-}
-
-/** Transfer a verified pin into the existing input owner; no second resource cache. */
-export function retainResourceObject(sources: Iterable<object>, target: string, capture: StableFilesystemCapture): boolean {
-	for (const source of sources) for (const version of resourceVersions.get(source) ?? [])
-		if (version.view?.retainObject(target, capture)) return true;
-	return false;
+	async borrow(target: string, expected: BigIntStats, maxBytes: number): Promise<StableFilesystemCapture | undefined> {
+		for (const view of this.views(target)) {
+			if (!view.retained) continue;
+			try {
+				const captured = await view.borrowObject(target, (capture, handle) => TimelineInterval.outside(async () => {
+					if (!capture.content || capture.bytesRead > maxBytes || !sameFilesystemIdentity(expected, capture.stat) ||
+						!sameFilesystemIdentity(capture.stat, await handle.stat({ bigint: true }))) return undefined;
+					return { ...capture, content: Buffer.from(capture.content), shared: true as const };
+				}));
+				if (captured) return captured;
+			} catch { /* Revocation or a different version leaves the normal FD capture authoritative. */ }
+		}
+		return undefined;
+	}
+	retain(target: string, capture: StableFilesystemCapture): boolean {
+		for (const view of this.views(target)) if (view.retainObject(target, capture)) return true;
+		return false;
+	}
+	lend(maxBytes: number) {
+		const loans: { readonly transfer: CapturedFilesystemTransfer; readonly release: () => void }[] = [], pins = new Set<number>();
+		try {
+			for (const view of new Set(this.views())) for (const loan of view.lendObjects(object => !this.produced || this.produced.has(object))) {
+				if (pins.has(loan.transfer.fd) || loans.length >= 64 || loan.transfer.bytesRead > maxBytes) { loan.release(); continue; }
+				pins.add(loan.transfer.fd); maxBytes -= loan.transfer.bytesRead; loans.push(loan);
+			}
+		} catch (error) { for (const loan of loans) loan.release(); throw error; }
+		return { transfer: loans.map(loan => loan.transfer), release: () => { for (const loan of loans) loan.release(); } };
+	}
+	/** Call-local transport owns pins until acknowledged; only the caller's original version can retain the returned inputs. */
+	static receive(transfers: readonly CapturedFilesystemTransfer[], maxBytes: number) {
+		const produced = new WeakSet<CapturedFilesystemObject>();
+		const capture = (target: string, input: StableFilesystemCapture) => view.capture(target, {
+			...(input.entries ? { type: "directory" as const, entries: input.entries, objectBytes: input.bytesRead } : { type: "file" as const, content: input.content }),
+			object: input.object, computation: input.computation, realPath: input.realPath,
+		});
+		const view = new ResourceReadView(maxBytes, undefined, undefined, (target, input) => { capture(target, input); if (input.object) produced.add(input.object); });
+		for (const transfer of transfers) { const input = CapturedFilesystemObject.receive(transfer); if (input) capture(input.realPath, input); }
+		return { inputs: new ResourceObjectInputs(view, produced), dispose: () => view.dispose() };
+	}
+	receive(transfers: readonly CapturedFilesystemTransfer[]): void {
+		for (const transfer of transfers) {
+			const input = CapturedFilesystemObject.receive(transfer);
+			if (input && !this.retain(input.realPath, input)) void input.object?.dispose();
+		}
+	}
 }
 
 /** Whole queries and independent Actor inputs share proof composition; completed inputs survive consumer failure. */

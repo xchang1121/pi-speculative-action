@@ -11,7 +11,7 @@ import os from "node:os";
 import path from "node:path";
 import { effectCommitFailure, isPoisonedEffectCommit } from "./effect-transaction.ts";
 import { captureHeldDirectory, captureHeldFile, sameFilesystemIdentity } from "./filesystem-evidence.ts";
-import { borrowResourceObject, retainResourceObject } from "./agent-execution-world.ts";
+import type { ResourceObjectInputs } from "./agent-execution-world.ts";
 import { sha256Digest, isOFDPosition, type OFDPosition, RESOURCE_TRANSITIONS, type ResourceTransitionKind, type Sha256Digest, type ProcessResourceEffects, type ArtifactReference } from "./provenance-certificate.ts";
 import { containsFilesystemPath } from "./path-utils.ts";
 import { snapshotExecutionScope, type ExecutionScope } from "./execution-world.ts";
@@ -583,7 +583,7 @@ export async function inspectHeldExecProcess(pid: number, executable: string, de
 
 /** Capture one image per inode; directory anchors and null devices need no payload. Only a native lease authorizes adoption. */
 export async function captureHeldDescriptorInputs(pid: number, descriptors: readonly HeldFileDescriptor[], maxBytes: number, deniedPaths: readonly string[] = [],
-	inputs?: (path: string) => Iterable<object>, tracerPid?: number, namespaceRoot?: string): Promise<ProcessResourceGraph> {
+	inputs?: ResourceObjectInputs, tracerPid?: number, namespaceRoot?: string): Promise<ProcessResourceGraph> {
 	const handles: Array<ProcessResourceGraph["handles"][number]> = [];
 	const descriptions: Record<number, ProcessResourceGraph["descriptions"][number]> = {};
 	const objects: Record<number, ProcessResourceGraph["objects"][number]> = {};
@@ -639,10 +639,10 @@ export async function captureHeldDescriptorInputs(pid: number, descriptors: read
 					const bytes = Buffer.from(directoryHex, "hex");
 					storeObject(file, fd, { type: "directory", sourcePath: endpoint }, bytes);
 					if (inputs) {
-						const borrowed = await borrowResourceObject(inputs(endpoint), endpoint, metadata, bytes.length);
+						const borrowed = await inputs.borrow(endpoint, metadata, bytes.length);
 						if (!borrowed?.content?.equals(bytes)) {
 							const captured = await captureHeldDirectory(holder, handle, bytes, metadata, endpoint).catch(() => undefined);
-							if (captured && !retainResourceObject(inputs(endpoint), endpoint, captured)) await captured.object?.dispose();
+							if (captured && !inputs.retain(endpoint, captured)) await captured.object?.dispose();
 						}
 					}
 					continue;
@@ -651,7 +651,7 @@ export async function captureHeldDescriptorInputs(pid: number, descriptors: read
 			storeObject(file, fd, { type: descriptor.type, ...(descriptor.type === "directory" ? { sourcePath: endpoint } : {}) });
 			continue;
 		}
-		let captured = inputs && await borrowResourceObject(inputs(endpoint), endpoint, await stat(heldPath, { bigint: true }), remaining);
+		let captured = inputs && await inputs.borrow(endpoint, await stat(heldPath, { bigint: true }), remaining);
 		if (captured && !sameFilesystemIdentity(captured.stat, await stat(heldPath, { bigint: true }))) captured = undefined;
 		const borrowed = !!captured;
 		captured ??= await captureHeldFile(holder, handle, remaining, !!inputs);
@@ -678,7 +678,7 @@ export async function captureHeldDescriptorInputs(pid: number, descriptors: read
 			objects[fd] = { type: "regular", ...(sourcePath ? { sourcePath } : {}), ...(sourceAliases ? { sourceAliases } : {}),
 				contentDigest: `sha256:${captured.hash}`, content: captured.content.toString("base64") };
 			images.set(file, fd);
-			if (!borrowed && sourcePath && inputs) retained = retainResourceObject(inputs(sourcePath), sourcePath, { ...captured, realPath: sourcePath });
+			if (!borrowed && sourcePath && inputs) retained = inputs.retain(sourcePath, { ...captured, realPath: sourcePath });
 		} finally { if (!retained) await captured.object?.dispose(); }
 	}
 	for (const descriptor of descriptors) {

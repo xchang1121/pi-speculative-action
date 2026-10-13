@@ -4,6 +4,7 @@ import type { ExecutionOperationAdoption, ExecutionScope, WorldReuseMetrics } fr
 import type { ProcessHandoffTransfer } from "./process-handoff.ts";
 import type { LinuxProcessBackendOptions, NativeProcessInvocation } from "./linux-process-backend.ts";
 import { isPoisonedEffectCommit } from "./effect-transaction.ts";
+import type { CapturedFilesystemTransfer } from "./filesystem-evidence.ts";
 
 type SerializedDependency = Omit<TimelineDependency, "computation" | "shared"> & {
 	readonly computation: SerializedTimelineComputation;
@@ -13,12 +14,14 @@ export interface SynchronousProcessRequest {
 	readonly gate: number; readonly sourceRoot: string; readonly scope?: ExecutionScope;
 	readonly learn: boolean; readonly descriptors?: boolean | "inspect"; readonly skipRoot?: boolean;
 	readonly handoffs: ProcessHandoffTransfer;
+	readonly inputs?: readonly CapturedFilesystemTransfer[];
 }
 export interface SynchronousProcessResult {
 	readonly bindings: readonly { readonly sequence: number; readonly key: string; readonly executionMs: number; readonly invocation: NativeProcessInvocation }[];
 	readonly computations: readonly SerializedDependency[];
 	readonly adoptions: readonly { readonly index: number; readonly adoption: Omit<ExecutionOperationAdoption, "computation"> & { readonly computation?: SerializedDependency } }[];
 	readonly metrics: WorldReuseMetrics;
+	readonly inputs?: readonly CapturedFilesystemTransfer[];
 }
 type Response = { readonly kind: "ready" } | { readonly kind: "attached"; readonly pid?: number } |
 	{ readonly kind: "result"; readonly result: SynchronousProcessResult } | { readonly kind: "error"; readonly message: string; readonly poisoned: boolean };
@@ -87,6 +90,7 @@ export class SynchronousProcessObserver {
 		}
 		throw this.failure ?? new Error("synchronous native observer unavailable");
 	}
+	releaseInputs(): void { this.port.postMessage({ kind: "settled" }); }
 
 	close(): Promise<void> {
 		if (this.closing) return this.closing;
@@ -99,16 +103,19 @@ export class SynchronousProcessObserver {
 if (!isMainThread && workerData?.nativeProcessObserver === true) void (async () => {
 	const { port, shared, options } = workerData as { port: MessagePort; shared: SharedArrayBuffer; options: LinuxProcessBackendOptions };
 	const clock = new Int32Array(shared), send = (response: Response) => { port.postMessage(response); Atomics.add(clock, 0, 1); Atomics.notify(clock, 0); };
-	let backend: import("./linux-process-backend.ts").LinuxProcessReuseBackend | undefined, finish: (() => void) | undefined;
+	let backend: import("./linux-process-backend.ts").LinuxProcessReuseBackend | undefined, finish: (() => void) | undefined, release: (() => void | Promise<void>) | undefined;
 	try {
 		const { LinuxProcessReuseBackend } = await import("./linux-process-backend.ts"); backend = new LinuxProcessReuseBackend(options);
-		port.on("message", (message: { kind: "close" | "finished" } | { kind: "attach"; request: SynchronousProcessRequest }) => {
-			if (message.kind === "close") { void backend!.dispose().finally(() => port.close()); return; }
+		port.on("message", (message: { kind: "close" | "finished" | "settled" } | { kind: "attach"; request: SynchronousProcessRequest }) => {
+			if (message.kind === "settled" || message.kind === "close") {
+				const released = release?.(); release = undefined;
+				if (message.kind === "close") void Promise.resolve(released).then(() => backend!.dispose()).finally(() => port.close()); return;
+			}
 			if (message.kind === "finished") { finish?.(); return; }
 			if (message.kind !== "attach") return;
 			const finished = new Promise<void>(resolve => { finish = resolve; });
 			void backend!.observeSynchronous(message.request, pid => send({ kind: "attached", pid }), finished)
-				.then(result => send({ kind: "result", result }), error => send({ kind: "error", message: String(error), poisoned: isPoisonedEffectCommit(error) }))
+				.then(completed => { release = completed.release; send({ kind: "result", result: completed.result }); }, error => send({ kind: "error", message: String(error), poisoned: isPoisonedEffectCommit(error) }))
 				.finally(() => { finish = undefined; });
 		});
 		send({ kind: "ready" });

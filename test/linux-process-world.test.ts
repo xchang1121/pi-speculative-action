@@ -746,7 +746,8 @@ int main(int argc, char **argv) {
 		}
 	});
 
-nativeTest.for(["keyed", "unkeyed", "keyed-large", "unkeyed-opaque", "keyed-failed", "unkeyed-failed", "keyed-exit", "unkeyed-exit"])("transfers native tool FD inputs to filesystem tools across turns with exact invalidation (%s)", { timeout: 30_000 }, async (mode, { skip, benchmark }) => {
+nativeTest.for(["keyed", "unkeyed", "keyed-large", "unkeyed-opaque", "keyed-failed", "unkeyed-failed", "keyed-exit", "unkeyed-exit",
+	"keyed-sync", "unkeyed-sync", "keyed-sync-failed", "unkeyed-sync-exit", "keyed-mixed"])("transfers native tool FD inputs to filesystem tools across turns with exact invalidation (%s)", { timeout: 30_000 }, async (mode, { skip, benchmark }) => {
 		const name = "render_rows";
 		const fixture = await benchmark("pi-native-resource-inputs-"), observing = vi.spyOn(fixture.backend, "observeBindings");
 		const unkeyed = mode.startsWith("unkeyed"), parentOutput = { transcript: mode.endsWith("large") ? "x".repeat(128 * 1024) : "", ...(mode.endsWith("opaque") ? { callback: () => "parent-only" } : {}) };
@@ -761,22 +762,24 @@ nativeTest.for(["keyed", "unkeyed", "keyed-large", "unkeyed-opaque", "keyed-fail
 int main(void) { char b[1024]; return syscall(SYS_getdents64, 4, b, sizeof(b)) < 0 || pread(3, b, 8, 0) != 8 || write(1, b, 8) != 8; }
 ` });
 		await commitBenchmarkFixture(fixture.workspace, "Native resource input bridge"); await prepareLinuxProcessReuse(fixture);
-		const tools: (typeof fixture.tool)[] = [{ ...fixture.tool, name }, createReadTool(fixture.workspace), createGrepTool(fixture.workspace), createLsTool(fixture.workspace), createFindTool(fixture.workspace)];
+		const tools: (typeof fixture.tool)[] = [name, "consume_rows"].map(name => ({ ...fixture.tool, name }));
+		tools.push(createReadTool(fixture.workspace), createGrepTool(fixture.workspace), createLsTool(fixture.workspace), createFindTool(fixture.workspace));
 		const prepared = patternProcessHost(fixture, "native-inputs", { tools: tools.map(tool => tool.name), resourceCacheMaxEntries: 8,
 			resourceCacheMaxBytes: 32 * 1024, patternAware: patternAwareSettings({ enabled: true, multiStepEnabled: false }) }, {
 			executionWorlds: [fixture.world, createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { maxBytes: () => 1024 * 1024 })],
 			resolveInvocation: (tool, input) => {
-				const invocation = search.invocations.get(tool) ?? resolvePiToolInvocation(tool === name ? "bash" : tool, input, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath });
-				return unkeyed && tool === name ? { ...invocation!, semantics: { ...PI_ACTION_SEMANTICS.definition("bash")!, canonicalize: () => undefined } } : invocation;
+				const process = tool === name || tool === "consume_rows";
+				const invocation = search.invocations.get(tool) ?? resolvePiToolInvocation(process ? "bash" : tool, input, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath });
+				return unkeyed && process ? { ...invocation!, semantics: { ...PI_ACTION_SEMANTICS.definition("bash")!, canonicalize: () => undefined } } : invocation;
 			},
 		}, tools), { events, start } = prepared;
 		host = prepared.host;
 		const error = new Error("native producer failed after completed work"), command = "exec 3<input.txt 4<entries; worker; worker" + (mode.endsWith("exit") ? "; exit 17" : "");
 		const bash = vi.fn(async () => {
-			const output = await new Promise<{ content: { type: "text"; text: string }[] }>((resolve, reject) =>
-				childProcess.execFile(fixture.shellPath, ["-c", command], { cwd: fixture.workspace, env: fixture.environment, uid: process.getuid!(), gid: process.getgid!() }, (error, stdout) =>
-					error ? reject(error) : resolve({ content: [{ type: "text", text: stdout }] })));
-			if (mode.endsWith("failed")) throw error; return { ...output, details: parentOutput };
+			const options = { cwd: fixture.workspace, env: fixture.environment, uid: process.getuid!(), gid: process.getgid!() };
+			const output = mode.includes("sync") ? childProcess.execFileSync(fixture.shellPath, ["-c", command], options).toString() : await new Promise<string>((resolve, reject) =>
+				childProcess.execFile(fixture.shellPath, ["-c", command], options, (error, stdout) => error ? reject(error) : resolve(stdout)));
+			if (mode.endsWith("failed")) throw error; return { content: [{ type: "text" as const, text: output }], details: parentOutput };
 		});
 		await start("seed");
 		const result = host.execute({ turnID: "seed", id: "seed", tool: name, args: { command }, tools }, undefined, bash);
@@ -787,6 +790,15 @@ int main(void) { char b[1024]; return syscall(SYS_getdents64, 4, b, sizeof(b)) <
 		expect(observing.mock.calls[0]![0]).toEqual({ sessionID: "native-inputs", turnID: "seed", callID: "seed" });
 		if (unkeyed) expect(events.find(event => event.type === "actor_action")).toMatchObject({ settlement: { provider: { kind: "actor", cause: { code: "action_not_keyable" } } } });
 		await start("queries");
+		if (mode.includes("sync") || mode === "keyed-mixed") {
+			const command = "exec 3<input.txt 4<entries; worker remaining", before = fixture.backend.actorMetrics().hits;
+			const consumer = vi.fn(async () => ({ content: [{ type: "text" as const, text: "remaining:" + childProcess.execFileSync(fixture.shellPath, ["-c", command],
+				{ cwd: fixture.workspace, env: fixture.environment, encoding: "utf8" }) }], details: {} }));
+			expect(await host.execute({ turnID: "queries", id: "consumer", tool: "consume_rows", args: { command }, tools }, undefined, consumer))
+				.toMatchObject({ content: [{ type: "text", text: "remaining:one\ntwo\n" }] });
+			expect(consumer).toHaveBeenCalledOnce(); expect(fixture.backend.actorMetrics().hits).toBe(before);
+			expect(events.filter(event => event.type === "actor_action").at(-1)?.computation?.hiddenComputeMs).toBeGreaterThan(0);
+		}
 		for (const [tool, args, change] of [["read", { path: "input.txt", offset: 2 }, undefined], ["grep", { path: "input.txt", pattern: "two" }, undefined],
 			["ls", { path: "entries" }, undefined], ["find", { path: "entries", pattern: "*.txt" }, undefined], ["read", { path: "input.txt" }, "new\nvalue\n"], ["ls", { path: "entries" }, "new.txt"]] as const) {
 			if (change) await writeFile(tool === "read" ? file : path.join(fixture.workspace, "entries", change), change);

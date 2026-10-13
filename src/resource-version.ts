@@ -1,11 +1,11 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { hash } from "node:crypto";
 import { type BigIntStats, type Stats, type FSWatcher, watch } from "node:fs";
-import fs, { type FileHandle } from "node:fs/promises";
+import fs from "node:fs/promises";
 import path from "node:path";
 import { setImmediate as watcherTurn } from "node:timers/promises";
 import { type ActionKey, type ActionSemanticsRegistry, PI_ACTION_SEMANTICS, type ResourceDependencyScope } from "./action-semantics.ts";
-import { type StableFilesystemCapture, cachedCapture, captureFilesystemEntry, captureStableFile, rememberCapture, FILESYSTEM_CONCURRENCY, mapFilesystem, sameFilesystemIdentity, walkFilesystemPath } from "./filesystem-evidence.ts";
+import { type StableFilesystemCapture, type FilesystemObjectHandle, cachedCapture, captureFilesystemEntry, captureStableFile, rememberCapture, FILESYSTEM_CONCURRENCY, mapFilesystem, sameFilesystemIdentity, walkFilesystemPath } from "./filesystem-evidence.ts";
 import { containsFilesystemPath, filesystemPathKey, relativeFilesystemPath } from "./path-utils.ts";
 import type { ToolFilesystemOperations, ToolFilesystemStat } from "./tool-settlement.ts";
 import { RuntimeLifecycleLane, SharedAbortScope } from "./runtime-lifecycle.ts";
@@ -233,7 +233,7 @@ export class ResourceReadView {
 		return entry.type === "file" && entry.content !== undefined ? Buffer.from(entry.content.subarray(0, maxBytes)) : this.unproven(target);
 	};
 	/** A process borrows the same captured kernel object without inheriting the tool's OFD offset. */
-	async borrowObject<T>(target: string, consume: (capture: StableFilesystemCapture, handle: FileHandle) => Promise<T>): Promise<T | undefined> {
+	async borrowObject<T>(target: string, consume: (capture: StableFilesystemCapture, handle: FilesystemObjectHandle) => Promise<T>): Promise<T | undefined> {
 		this.assertComplete();
 		return collectResourceComputation(async () => {
 			const entry = this.sealed ? await this.get(target, this.entry(target).entry?.type === "directory" ? "names" : "content") : this.entries.get(filesystemPathKey(target));
@@ -241,6 +241,14 @@ export class ResourceReadView {
 			if (result !== undefined) TimelineInterval.use(entry?.computation);
 			return result;
 		}, result => result !== undefined);
+	}
+	/** Loan only owned pins; immutable bytes alone cannot authorize native input reuse. */
+	*lendObjects(accept: (object: NonNullable<StableFilesystemCapture["object"]>) => boolean = () => true) {
+		if (!this.retained) return;
+		for (const [target, entry] of this.entries) if (entry.object && accept(entry.object)) {
+			const loan = entry.object.lend(entry.computation);
+			if (loan) yield { ...loan, transfer: { ...loan.transfer, realPath: entry.realPath ?? target } };
+		}
 	}
 	/** Fill a pre-budgeted pin slot only with independently read, byte-identical input.
 	 * Supplied write/edit bytes alone never create kernel-object evidence. */

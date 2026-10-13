@@ -1,12 +1,17 @@
 import { createHash, randomUUID } from "node:crypto";
-import { constants, type BigIntStats, type Stats } from "node:fs";
+import { closeSync, constants, fstatSync, openSync, type BigIntStats, type Stats } from "node:fs";
 import fs, { type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { containsFilesystemPath, slash } from "./path-utils.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
-import { TimelineInterval } from "./task-timing.ts";
+import { TimelineInterval, type SerializedTimelineComputation } from "./task-timing.ts";
 
 const IDENTITY_FIELDS = ["dev", "ino", "mode", "nlink", "uid", "gid", "rdev", "size", "mtimeNs", "ctimeNs"] as const;
+type FilesystemIdentity = Pick<BigIntStats, typeof IDENTITY_FIELDS[number]>;
+export type FilesystemObjectHandle = { readonly fd: number; stat(options: { bigint: true }): Promise<BigIntStats>; close(): Promise<void> };
+export type CapturedFilesystemTransfer = Omit<StableFilesystemCapture, "stat" | "object" | "content" | "computation"> & {
+	readonly fd: number; readonly active: SharedArrayBuffer; readonly stat: FilesystemIdentity; readonly content?: Uint8Array; readonly computation?: SerializedTimelineComputation;
+};
 export const FILESYSTEM_CONCURRENCY = 12;
 
 /** Bound independent filesystem work and drain every admitted operation before propagating failure. */
@@ -41,16 +46,40 @@ export type StableFilesystemCapture = {
 /** A content version and its kernel object share one revocable borrowing lifetime. */
 export class CapturedFilesystemObject {
 	private readonly lifetime = new RuntimeLifecycleLane();
-	private readonly handle: FileHandle;
+	private readonly handle: FilesystemObjectHandle;
 	private readonly capture: StableFilesystemCapture;
-	constructor(handle: FileHandle, capture: StableFilesystemCapture) { this.handle = handle; this.capture = capture; }
-	borrow<T>(consume: (capture: StableFilesystemCapture, handle: FileHandle) => Promise<T>): Promise<T> {
+	constructor(handle: FilesystemObjectHandle, capture: StableFilesystemCapture) { this.handle = handle; this.capture = capture; }
+	borrow<T>(consume: (capture: StableFilesystemCapture, handle: FilesystemObjectHandle) => Promise<T>): Promise<T> {
 		return this.lifetime.admit(() => consume(this.capture, this.handle));
+	}
+	/** Threads share the descriptor table; the sender keeps this pin until the receiver acknowledges its own copy. */
+	lend(computation = this.capture.computation): { readonly transfer: CapturedFilesystemTransfer; readonly release: () => void } | undefined {
+		if (this.lifetime.sealed) return;
+		const active = new Int32Array(new SharedArrayBuffer(4)); Atomics.store(active, 0, 1);
+		const { object: _object, stat, content, computation: _computation, ...capture } = this.capture;
+		const transfer = { ...capture, fd: this.handle.fd, active: active.buffer, stat: Object.fromEntries(IDENTITY_FIELDS.map(key => [key, stat[key]])) as FilesystemIdentity,
+			content: content && Uint8Array.from(content), computation: computation && TimelineInterval.serialize(computation) };
+		let release!: () => void; this.lifetime.track(new Promise<void>(resolve => { release = resolve; }));
+		return { transfer, release: () => { Atomics.store(active, 0, 0); release(); } };
+	}
+	/** Synchronous import cannot dispatch caller callbacks; a fresh O_PATH descriptor preserves independent ownership. */
+	static receive(transfer: CapturedFilesystemTransfer): StableFilesystemCapture | undefined {
+		let fd: number | undefined;
+		try {
+			const active = new Int32Array(transfer.active); if (!Atomics.load(active, 0)) return;
+			fd = openSync(`/proc/self/fd/${transfer.fd}`, 0x200000);
+			const stat = fstatSync(fd, { bigint: true });
+			if (!Atomics.load(active, 0) || !sameFilesystemIdentity(transfer.stat, stat)) return;
+			const { fd: _fd, active: _active, computation, content, ...capture } = transfer, owned = fd;
+			const result = { ...capture, stat, content: content && Buffer.from(content), computation: computation && TimelineInterval.restore(computation) };
+			const object = new CapturedFilesystemObject({ fd: owned, stat: async () => fstatSync(owned, { bigint: true }), close: async () => closeSync(owned) }, result);
+			fd = undefined; return { ...result, object };
+		} catch { return undefined; } finally { if (fd !== undefined) closeSync(fd); }
 	}
 	dispose(): Promise<void> { return this.lifetime.close(async () => { await this.lifetime.drain(); await this.handle.close(); }); }
 }
 
-export function sameFilesystemIdentity(left: BigIntStats, right: BigIntStats): boolean {
+export function sameFilesystemIdentity(left: FilesystemIdentity, right: FilesystemIdentity): boolean {
 	return IDENTITY_FIELDS.every((field) => left[field] === right[field]);
 }
 

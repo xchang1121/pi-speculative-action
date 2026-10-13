@@ -7,6 +7,8 @@ import { ArtifactCAS, captureFileDependency, ProcessReusePlanner, ProvenanceCert
 	type ProcessProvenanceCertificate, type VerifiedArtifactClosure } from "../src/process-reuse.ts";
 import { ProcessHandoffOwnership, ProcessHandoffRegistry } from "../src/process-handoff.ts";
 import { effectCommitFailure } from "../src/effect-transaction.ts";
+import { CapturedFilesystemObject, captureStableFile } from "../src/filesystem-evidence.ts";
+import { ResourceObjectInputs } from "../src/agent-execution-world.ts";
 import { waitForCompletion } from "../src/scheduler.ts";
 import { TaskTimeline, TimelineInterval } from "../src/task-timing.ts";
 import { legacyCertificate, PROCESS_CERTIFICATE, storeMetadata, storePeer } from "./process-fixture.ts";
@@ -25,6 +27,29 @@ const storeAt = (...args: ConstructorParameters<typeof ProvenanceCertificateStor
 const hold = () => { const pause = gated(); cleanup.push(pause.release); return pause; };
 const track = <T>(pending: Promise<T>): Promise<T> => { const settled = pending.catch(() => undefined); cleanup.push(() => settled); return pending; };
 const peer = (...args: Parameters<typeof storePeer>) => { const owner = storePeer(...args); cleanup.push(() => { owner.child.kill(); return owner.completed.catch(() => undefined); }); return owner; };
+
+test.skipIf(process.platform !== "linux").each(["fresh", "changed-before", "changed-after", "revoked", "budget"])("keeps input loans owned through transfer and exact invalidation (%s)", async mode => {
+	const input = path.join(await directories.create(), "input"); await writeFile(input, "original");
+	const captured = await captureStableFile(input, 1024, true, { retainObject: true }), source = own(captured.object!);
+	const loan = source.lend()!, transfer = structuredClone(loan.transfer); cleanup.push(loan.release);
+	const pins = async () => (await Promise.all((await readdir("/proc/self/fd")).map(fd => filesystem.readlink(`/proc/self/fd/${fd}`).catch(() => "")))).filter(target => target === input).length;
+	expect(await pins()).toBe(1);
+	let closed = false; const closing = source.dispose().then(() => { closed = true; });
+	await nextTurn(); expect(closed).toBe(false); expect(source.lend()).toBeUndefined();
+	if (mode === "changed-before") await writeFile(input, "modified");
+	if (mode === "revoked") { loan.release(); await closing; }
+	const received = own(ResourceObjectInputs.receive([transfer], mode === "budget" ? 0 : 4096));
+	if (mode === "changed-after") await writeFile(input, "modified");
+	const result = await received.inputs.borrow(input, await filesystem.stat(input, { bigint: true }), 1024);
+	expect(result?.content?.toString()).toBe(mode === "fresh" ? "original" : undefined);
+	if (result) expect(TimelineInterval.serialize(result.computation!)?.root).toBe(TimelineInterval.serialize(captured.computation!)?.root);
+	loan.release(); await closing; expect(closed).toBe(true);
+	expect(CapturedFilesystemObject.receive(transfer)).toBeUndefined();
+	if (mode === "fresh") expect((await received.inputs.borrow(input, captured.stat, 1024))?.content?.toString()).toBe("original");
+	await received.dispose(); expect(await pins()).toBe(0);
+	expect(await received.inputs.borrow(input, captured.stat, 1024)).toBeUndefined();
+});
+
 function watchInventory(store: ProvenanceCertificateStore, pause?: ReturnType<typeof hold>) {
 	const target = store as unknown as { inventory(...args: unknown[]): Promise<unknown> }, read = target.inventory.bind(target);
 	return vi.spyOn(target, "inventory").mockImplementationOnce(async (...args) => { const snapshot = await read(...args); await pause?.wait(); return snapshot; });

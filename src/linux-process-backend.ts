@@ -16,6 +16,7 @@ import { errorMessage, isMissing as missing } from "./error-utils.ts";
 import { stableEqual } from "./stable-json.ts";
 import { TimelineInterval, type TimelineDependency } from "./task-timing.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
+import { ResourceObjectInputs } from "./agent-execution-world.ts";
 import { certificateReplayable, createExecPrototype, digestObject, dynamicDependencyIdentity, type DynamicDependency, type DynamicDependencyCertificate, type ExecPrototype,
 	type ExitOutcome, filesystemMetadataDigest, filesystemObservationDigest, ONE_SHOT_TAINTS, type OrderedEffectEvent, type OFDPosition, type ProcessProducerProof,
 	type ProcessProvenanceCertificate, type ProcessResultRecord, processWeakKey, type ProvenanceTaint, sealProcessCertificate, sha256Digest,
@@ -236,7 +237,7 @@ interface SpawnOutcome { readonly code: number | null; readonly signal: NodeJS.S
 type ReadyProcessPlan = Exclude<ProcessReusePlan, { kind: "miss" }>;
 interface NativeObservation {
 	readonly scope: ExecutionScope; sequence: number; closed: boolean; readonly learn: boolean; pending: number;
-	readonly learned: Map<number, number>; readonly inputs?: (path: string) => Iterable<object>;
+	readonly learned: Map<number, number>; readonly inputs?: ResourceObjectInputs;
 	readonly bindings: Map<number, ProcessExecutionBinding>; readonly computations: TimelineDependency[]; readonly heldClock: ActorHeldClock;
 }
 
@@ -247,9 +248,10 @@ export class LinuxProcessReuseBackend {
 	/** Keep actual completed launches and acknowledged adoptions in their enclosing native call's order. */
 	async observeBindings<Value>(scope: ExecutionScope, execute: () => Promise<Value>,
 		observe: (bindings: readonly ProcessExecutionBinding[], computations: readonly TimelineDependency[]) => void, learn = false,
-		inputs?: (path: string) => Iterable<object>): Promise<Value> {
+		inputs?: ((path?: string) => Iterable<object>) | ResourceObjectInputs): Promise<Value> {
 		const observation = { scope: snapshotExecutionScope(scope)!, sequence: 0, closed: false,
-			learn, pending: 0, learned: new Map<number, number>(), inputs, bindings: new Map<number, ProcessExecutionBinding>(), computations: [] as TimelineDependency[],
+			learn, pending: 0, learned: new Map<number, number>(), inputs: typeof inputs === "function" ? new ResourceObjectInputs(inputs) : inputs,
+			bindings: new Map<number, ProcessExecutionBinding>(), computations: [] as TimelineDependency[],
 			heldClock: new ActorHeldClock() };
 		try { return await this.observations.run(observation, execute); }
 		finally {
@@ -432,13 +434,15 @@ export class LinuxProcessReuseBackend {
 
 	private attachSynchronous(options: Pick<SynchronousProcessRequest, "gate" | "scope" | "sourceRoot" | "descriptors" | "skipRoot">) {
 		const startedAt = performance.now(), observation = this.observations.getStore(), loan = this.handoffs.lend(options.scope);
+		let inputs: ReturnType<ResourceObjectInputs["lend"]> | undefined;
 		let observer: SynchronousProcessObserver | undefined;
 		const overhead = (start: number) => { const computation = new TimelineInterval(start, performance.now());
 			observation?.computations.push({ computation, overhead: true, shared: [computation] }); };
 		try {
+			inputs = observation?.inputs?.lend(Math.min(MAX_REQUEST_BYTES / 2, this.store.limits.maxBytes));
 			observer = this.synchronous ??= new SynchronousProcessObserver(this.options);
 			const attachment = observer.attach({ gate: options.gate, sourceRoot: options.sourceRoot, scope: options.scope,
-				descriptors: options.descriptors, skipRoot: options.skipRoot, learn: !!observation?.learn, handoffs: loan.transfer });
+				descriptors: options.descriptors, skipRoot: options.skipRoot, learn: !!observation?.learn, handoffs: loan.transfer, inputs: inputs?.transfer });
 			overhead(startedAt);
 			return { pid: attachment.pid, finish: () => {
 				const finishing = performance.now();
@@ -457,6 +461,7 @@ export class LinuxProcessReuseBackend {
 						try { loan.adopted(index, { ...adoption, computation }); } catch { /* Completed handoff feedback is advisory. */ }
 					}
 					if (observation && !observation.closed) {
+						observation.inputs?.receive(result.inputs ?? []);
 						for (const dependency of result.computations) { const restored = restoreNativeDependency(dependency); if (restored) observation.computations.push(restored); }
 						for (const { invocation, executionMs, key, sequence: order } of result.bindings) {
 							if (!options.scope || nativeLearningSlot(observation, executionMs, key, this.store.limits.maxCertificates) === false) continue;
@@ -468,21 +473,24 @@ export class LinuxProcessReuseBackend {
 					void observer!.close(); if (this.synchronous === observer) this.synchronous = undefined;
 					if (new Int32Array(loan.transfer.claims).some(value => value !== 0) || error && typeof error === "object" && "poisoned" in error && error.poisoned)
 						throw effectCommitFailure(new Error("synchronous native handoff failed", { cause: error }), "poisoned");
-				} finally { loan.settle(); overhead(finishing); }
+				} finally { observer!.releaseInputs(); inputs?.release(); loan.settle(); overhead(finishing); }
 			} };
 		} catch (error) {
-			loan.settle(); overhead(startedAt); void observer?.close(); if (this.synchronous === observer) this.synchronous = undefined; throw error;
+			inputs?.release(); loan.settle(); overhead(startedAt); void observer?.close(); if (this.synchronous === observer) this.synchronous = undefined; throw error;
 		}
 	}
 
 	/** Worker endpoint; the normal policy, native transport and observation admission remain authoritative. */
-	async observeSynchronous(request: SynchronousProcessRequest, attached: (pid?: number) => void, finished: Promise<void>): Promise<SynchronousProcessResult> {
+	async observeSynchronous(request: SynchronousProcessRequest, attached: (pid?: number) => void, finished: Promise<void>) {
 		const before = this.actorMetrics(), adoptions: SynchronousProcessResult["adoptions"][number][] = [];
 		const release = await this.handoffs.receive(request.handoffs, request.scope, (index, adoption) => {
 			const computation = adoption.computation && serializeNativeDependency(adoption.computation); adoptions.push({ index, adoption: { ...adoption, computation } });
 		});
 		let bindings: SynchronousProcessResult["bindings"] = [], computations: SynchronousProcessResult["computations"] = [];
+		const maxBytes = Math.min(MAX_REQUEST_BYTES / 2, this.store.limits.maxBytes);
+		const received = request.inputs && ResourceObjectInputs.receive(request.inputs, maxBytes);
 		let observation: NativeObservation | undefined;
+		let loan: ReturnType<ResourceObjectInputs["lend"]> | undefined;
 		try {
 			const execute = async () => {
 				observation = this.observations.getStore();
@@ -494,11 +502,13 @@ export class LinuxProcessReuseBackend {
 				bindings = [...observation!.bindings].flatMap(([sequence, binding]) => { const invocation = this.handoffs.resolveBinding(binding, request.scope);
 					return invocation ? [{ sequence, key: binding.key, executionMs: binding.executionMs, invocation }] : []; });
 				computations = dependencies.flatMap(dependency => { const serialized = serializeNativeDependency(dependency); return serialized ? [serialized] : []; });
-			}, request.learn); else await execute();
+			}, request.learn, received?.inputs); else await execute();
 			const metrics = { ...this.actorMetrics() };
 			for (const key of Object.keys(metrics) as (keyof WorldReuseMetrics)[]) if (key !== "lastError") metrics[key] -= before[key];
-			return { bindings, computations, adoptions, metrics };
-		} finally { release(); }
+			loan = received?.inputs.lend(maxBytes);
+			return { result: { bindings, computations, adoptions, metrics, inputs: loan?.transfer },
+				release: () => { loan?.release(); return received?.dispose(); } };
+		} finally { release(); if (!loan) await received?.dispose(); }
 	}
 
 	resetNativeObservation(): Promise<void> {
