@@ -248,22 +248,13 @@ export type HeldExecDecision = { readonly observeTiming?: (timing: HeldExecTimin
 
 export interface LinuxHeldExecOptions { readonly storeRoot: string; readonly binary?: string; readonly observerBinary?: string; readonly signal?: AbortSignal; }
 
-interface ActiveExecution {
-	readonly barrier: HeldExecTiming["barrier"];
-	sequence: number;
+type ActiveExecution = ReturnType<LinuxHeldExecBoundary["createAttachment"]>;
+
+export interface HeldObservation {
 	readonly sourceRoot: string;
 	readonly scope?: ExecutionScope;
 	readonly signal?: AbortSignal;
 	readonly decide: (process: HeldExecProcess) => Promise<HeldExecDecision>;
-	readonly pending: Set<Promise<void>>;
-	readonly completion: Promise<void>;
-	readonly sockets: Set<net.Socket>;
-	readonly observer: ChildProcess;
-	readonly retire: () => void;
-	failure?: Error;
-}
-
-export interface HeldObservation extends Pick<ActiveExecution, "sourceRoot" | "scope" | "signal" | "decide"> {
 	readonly descriptors?: boolean | "inspect";
 	readonly skipRoot?: boolean;
 }
@@ -380,6 +371,11 @@ export class LinuxHeldExecBoundary {
 
 	/** The gate belongs to the launching thread; an observer may serve it from another worker. */
 	attach(options: HeldObservation, gate: number): HeldExecAttachment {
+		const { observer, completion, retire } = this.createAttachment(options, gate);
+		return { pid: observer.pid, completion, retire };
+	}
+
+	private createAttachment(options: HeldObservation, gate: number) {
 		if (this.closing) throw new Error("native observation is closing");
 		const execution = randomBytes(24).toString("hex"), controller = new AbortController();
 		const observer = startupScope.exit(() => spawn(this.observerBinary, ["--attach"], { stdio: ["pipe", "pipe", "ignore", gate], env: {
@@ -392,20 +388,20 @@ export class LinuxHeldExecBoundary {
 			observer.once("close", () => resolve());
 			observer.stdout!.once("data", data => { if (data.toString() === "R") { observer.stdout!.destroy(); resolve(); } });
 		});
-		const signal = AbortSignal.any([controller.signal, ...(options.signal ? [options.signal] : [])]);
-		const retire = () => {
+		const signal: AbortSignal = AbortSignal.any([controller.signal, ...(options.signal ? [options.signal] : [])]);
+		const retire = (): void => {
 			if (!controller.signal.aborted) controller.abort(new Error("native observation retired"));
 			observer.stdin?.end(); for (const socket of active.sockets) socket.destroy();
 		};
-		const active: ActiveExecution = { ...options, signal, observer, retire, sequence: 0, decide: startupScope.exit(() => AsyncResource.bind(options.decide)),
-			barrier: options.descriptors === "inspect" ? "inspection" : options.descriptors ? "descriptors" : "none",
-			pending: new Set(), sockets: new Set(), completion: done.then(async () => {
+		const active = { ...options, signal, observer, retire, sequence: 0, failure: undefined as Error | undefined, decide: startupScope.exit(() => AsyncResource.bind(options.decide)),
+			barrier: (options.descriptors === "inspect" ? "inspection" : options.descriptors ? "descriptors" : "none") as HeldExecTiming["barrier"],
+			pending: new Set<Promise<void>>(), sockets: new Set<net.Socket>(), completion: done.then(async (): Promise<void> => {
 				await Promise.allSettled(active.pending); signal.removeEventListener("abort", retire); this.active.delete(execution);
 				if (active.failure) throw active.failure;
 			}),
 		};
 		active.completion.catch(() => undefined); this.active.set(execution, active); signal.addEventListener("abort", retire, { once: true });
-		return { pid: observer.pid, completion: active.completion, retire };
+		return active;
 	}
 
 	close(): Promise<void> {

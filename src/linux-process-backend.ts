@@ -41,7 +41,7 @@ import { observeStrace, straceCommand, traceTail, type ObservedProcessPath, type
 import type { WorkspaceTransactionDelta, WorkspaceTransactionOwnership } from "./workspace-transaction.ts";
 import type { ToolProcessInvocation } from "./tool-settlement.ts";
 import type { ResourceValidation } from "./settlement.ts";
-import { ProcessHandoffOwnership, ProcessHandoffRegistry, sameScope, type ProcessContinuation, type ProcessExecutionBinding, type ProcessHandoff, type ProcessHandoffAcquisition } from "./process-handoff.ts";
+import { ProcessHandoffOwnership, ProcessHandoffRegistry, sameScope, type ProcessContinuation, type ProcessExecutionBinding, type ProcessHandoff, type ProcessHandoffAcquisition, type ProcessHandoffBorrow, type ProcessHandoffLender } from "./process-handoff.ts";
 import { SynchronousProcessObserver, serializeNativeDependency, restoreNativeDependency, type SerializedProcessBinding, type SynchronousProcessRequest, type SynchronousProcessResult } from "./linux-process-sync.ts";
 import { WorkspaceSandboxService, readSandboxDirectoryState, restoreModifiedTimes, sameSandboxState, useModifiedTimesHelper, type SandboxDirectoryChange, type SandboxFileChange,
 	type SandboxWorkspaceChange, type SandboxWorkspaceContext } from "./workspace-sandbox.ts";
@@ -181,6 +181,7 @@ interface NativeObservation {
 	readonly bindings: Map<number, ProcessExecutionBinding>; readonly computations: TimelineDependency[]; readonly heldClock: ActorHeldClock;
 	readonly metrics: MutableLinuxProcessReuseMetrics; readonly adoptions: SynchronousProcessResult["adoptions"][number][]; claims?: Int32Array;
 	effects?: Pick<WorkspaceSandboxService, "commitDelta">;
+	source?: { readonly available: Int32Array; readonly borrow: ProcessHandoffBorrow };
 }
 
 /** Linux-only process substrate. Unavailable dependencies remove the route instead of weakening it. */
@@ -223,6 +224,8 @@ export class LinuxProcessReuseBackend {
 	private readonly replayWorkspace = new WorkspaceSandboxService();
 	private disposal?: Promise<void>;
 	private producers = 0;
+	/** A conservative hint remains visible to observations started before local work existed. */
+	private readonly localSource = new Int32Array(new SharedArrayBuffer(4));
 
 	constructor(options: LinuxProcessBackendOptions) {
 		this.options = { sandlockBinary: process.env.PI_SPEC_SANDLOCK, straceBinary: process.env.PI_SPEC_STRACE,
@@ -268,15 +271,11 @@ export class LinuxProcessReuseBackend {
 	/** Aggregate backend counters retained for qualification and low-level diagnostics. */
 	metrics(): LinuxProcessReuseMetrics {
 		const metrics = { ...this.counters }, remote = this.synchronous?.metrics();
-		if (remote) for (const key of Object.keys(metrics) as (keyof WorldReuseMetrics)[]) if (key !== "lastError") metrics[key] += remote[key];
+		for (const key of Object.keys(metrics) as (keyof WorldReuseMetrics)[]) if (key !== "lastError") metrics[key] += this.actorCounters[key] + (remote?.[key] ?? 0);
 		metrics.lastError ??= remote?.lastError;
 		return Object.freeze(metrics);
 	}
-	producerMetrics(): LinuxProcessReuseMetrics {
-		const metrics = { ...this.counters };
-		for (const key of Object.keys(metrics) as (keyof WorldReuseMetrics)[]) if (key !== "lastError") metrics[key] -= this.actorCounters[key];
-		return metrics;
-	}
+	producerMetrics(): LinuxProcessReuseMetrics { return { ...this.counters }; }
 	processOwner(): SynchronousProcessObserver {
 		if (this.disposed) throw new Error("native process backend disposed");
 		return this.synchronous ??= new SynchronousProcessObserver(this.options);
@@ -348,6 +347,7 @@ export class LinuxProcessReuseBackend {
 
 	/** Keep possible publication visible through preparation, execution, and final evidence capture. */
 	async withProducer<Value>(run: () => Promise<Value>): Promise<Value> {
+		Atomics.store(this.localSource, 0, 1);
 		this.producers++;
 		try { return await run(); } finally { this.producers--; }
 	}
@@ -408,8 +408,7 @@ export class LinuxProcessReuseBackend {
 		const options = this.nativeObservation(path.resolve(sourceRoot), owner, signal);
 		return boundary ? boundary.observe(options, execute, {
 			synchronous: (gate, skipRoot) => this.attachSynchronous({ ...options, gate, skipRoot }),
-			asynchronous: (gate, skipRoot) => this.producers
-				? boundary!.attach({ ...options, skipRoot }, gate) : this.attachSynchronous({ ...options, gate, skipRoot, asynchronous: true }),
+			asynchronous: (gate, skipRoot) => this.attachSynchronous({ ...options, gate, skipRoot, asynchronous: true }),
 		}) : execute();
 	}
 
@@ -425,8 +424,9 @@ export class LinuxProcessReuseBackend {
 			observer = this.processOwner();
 			const attachment = observer.attach({ gate: options.gate, scope: options.scope, sourceRoot: options.sourceRoot, descriptors: options.descriptors,
 				skipRoot: options.skipRoot, asynchronous: options.asynchronous, learn: !!observation?.learn, handoffs: loan.transfer, inputs: inputs?.transfer,
-				owners: observer.grants(options.scope), claims: claims.buffer as SharedArrayBuffer, ordering: observation?.ordering.buffer as SharedArrayBuffer | undefined },
-				options.asynchronous ? delta => this.replayWorkspace.commitDelta(delta) : undefined);
+				owners: observer.grants(options.scope), claims: claims.buffer as SharedArrayBuffer, ordering: observation?.ordering.buffer as SharedArrayBuffer | undefined,
+				lender: options.asynchronous ? this.localSource.buffer as SharedArrayBuffer : undefined },
+				options.asynchronous ? delta => this.replayWorkspace.commitDelta(delta) : undefined, options.asynchronous ? loan.borrow : undefined);
 			overhead(startedAt);
 			const apply = (result: SynchronousProcessResult) => {
 				for (const [key, value] of Object.entries(result.metrics)) {
@@ -452,7 +452,7 @@ export class LinuxProcessReuseBackend {
 			const failed = (error: unknown) => {
 				this.setError(undefined, `native_owner:${errorMessage(error)}`);
 				void observer!.close(); if (this.synchronous === observer) this.synchronous = undefined;
-				if (Atomics.load(claims, 0) || new Int32Array(loan.transfer.claims).some(value => value !== 0) || isPoisonedEffectCommit(error))
+				if (Atomics.load(claims, 0) || loan.claimed() || isPoisonedEffectCommit(error))
 					throw effectCommitFailure(new Error("native handoff failed", { cause: error }), "poisoned");
 			};
 			const release = () => { attachment.release(); inputs?.release(); loan.settle(); };
@@ -468,12 +468,13 @@ export class LinuxProcessReuseBackend {
 	}
 
 	/** Worker endpoint; the normal policy, native transport and observation admission remain authoritative. */
-	async observeSynchronous(request: SynchronousProcessRequest, attached: (pid?: number) => void, finished: Promise<void>, commitDelta?: WorkspaceSandboxService["commitDelta"]) {
+	async observeSynchronous(request: SynchronousProcessRequest, attached: (pid?: number) => void, finished: Promise<void>, commitDelta?: WorkspaceSandboxService["commitDelta"], borrow?: ProcessHandoffLender) {
 		let observation: NativeObservation | undefined;
-		const release = await this.handoffs.receive(request.handoffs, request.scope, (index, adoption) => {
+		const receive = (transfer: SynchronousProcessRequest["handoffs"]) => this.handoffs.receive(transfer, request.scope, (index, adoption) => {
 			const computation = adoption.computation && serializeNativeDependency(adoption.computation);
 			observation?.adoptions.push({ owner: { loan: index }, adoption: { ...adoption, computation } });
 		});
+		const releases = [await receive(request.handoffs)];
 		let bindings: SynchronousProcessResult["bindings"] = [], computations: SynchronousProcessResult["computations"] = [];
 		const maxBytes = Math.min(MAX_REQUEST_BYTES / 2, this.store.limits.maxBytes);
 		const received = request.inputs && ResourceObjectInputs.receive(request.inputs, maxBytes);
@@ -483,6 +484,15 @@ export class LinuxProcessReuseBackend {
 				observation = this.observations.getStore();
 				observation!.claims = new Int32Array(request.claims);
 				if (commitDelta) observation!.effects = { commitDelta };
+				if (borrow && request.lender) {
+					const available = new Int32Array(request.lender);
+					observation!.source = { available, borrow: async (key, excluded, signal) => {
+						if (!Atomics.load(available, 0)) return;
+						const loan = await borrow(key, excluded, signal); if (!loan) return;
+						const received = await receive(loan.transfer); releases.push(received);
+						return { records: received.records, joined: loan.joined };
+					} };
+				}
 				if (request.ordering) observation!.ordering = new Int32Array(request.ordering);
 				const boundary = await this.heldBoundary(), options = this.nativeObservation(request.sourceRoot, request.scope);
 				const descriptors = options.descriptors === true || request.descriptors === true ? true : options.descriptors || request.descriptors;
@@ -498,7 +508,7 @@ export class LinuxProcessReuseBackend {
 			loan = received?.inputs.lend(maxBytes);
 			return { result: { bindings, computations, adoptions: observation!.adoptions, metrics: observation!.metrics, inputs: loan?.transfer },
 				release: () => { loan?.release(); return received?.dispose(); } };
-		} finally { release(); if (!loan) await received?.dispose(); }
+		} finally { for (const release of releases) release(); if (!loan) await received?.dispose(); }
 	}
 
 	resetNativeObservation(): Promise<void> {
@@ -581,7 +591,7 @@ export class LinuxProcessReuseBackend {
 		if (bound && bound.sourceRoot !== sourceRoot) throw new Error("bound process workspace changed");
 		const environment = (invocation ?? bound!).environment, image = invocation?.shell ?? bound!.executable;
 		const originalPath = environment.PATH ?? environment.Path ?? "";
-		const token = randomToken();
+		const token = randomBytes(32).toString("hex");
 		const candidateSocket = path.join(input.workspace.processRoot, `broker-${token.slice(0, 12)}.sock`);
 		// sockaddr_un has a byte limit even when the private workspace supports longer paths.
 		const socketPath = Buffer.byteLength(candidateSocket) < 104 ? candidateSocket : path.join("/tmp", `pi-broker-${randomBytes(16).toString("hex")}.sock`);
@@ -605,7 +615,7 @@ export class LinuxProcessReuseBackend {
 			lifecycle: new RuntimeLifecycleLane(),
 			ownership: new ProcessHandoffOwnership(input.onOperationAdopted, input.acceptOperationScope),
 			// Completed reusable children and retained live frontiers produced by this preparation.
-			preparedResults: 0, preparedInputSeeds: 0, nestedEvidence: [] as DynamicDependencyCertificate[],
+			preparedResults: 0, nestedEvidence: [] as DynamicDependencyCertificate[],
 			// Individually unattributable child observations join the command's own evidence.
 			foldedObservations: [] as StraceObservation[],
 			executionBindings: new Map<number, ProcessExecutionBinding>(), computations: [] as TimelineDependency[],
@@ -648,7 +658,14 @@ export class LinuxProcessReuseBackend {
 					session.interposition = interposition;
 					await listenUnixSocket(server, socketPath);
 					await chmod(socketPath, 0o600);
-					this.recordSessionPreparation(session, creation, new TimelineInterval(dispatchStartedAt, performance.now()));
+					const dispatch = new TimelineInterval(dispatchStartedAt, performance.now());
+					const computation = new TimelineInterval(creation.startedAt, dispatch.completedAt, [
+						{ computation: creation, owned: true, shared: [creation] }, { computation: dispatch, owned: true, shared: [dispatch] },
+					], []);
+					TimelineInterval.group(computation, session);
+					// Only recorded preparation cuts its caller's clock; work between creation and dispatch belongs to that caller.
+					session.preparation = { computation, shared: [creation, dispatch] };
+					session.computations.push({ ...session.preparation, owned: true });
 				}));
 				session.privateSince ??= Date.now();
 				return operation();
@@ -675,16 +692,6 @@ export class LinuxProcessReuseBackend {
 				} finally { this.producers--; }
 			}),
 		};
-	}
-
-	private recordSessionPreparation(session: ActiveSession, creation: TimelineInterval, dispatch: TimelineInterval): void {
-		const computation = new TimelineInterval(creation.startedAt, dispatch.completedAt, [
-			{ computation: creation, owned: true, shared: [creation] }, { computation: dispatch, owned: true, shared: [dispatch] },
-		], []);
-		TimelineInterval.group(computation, session);
-		// Only recorded preparation cuts its caller's clock; work between creation and dispatch belongs to that caller.
-		session.preparation = { computation, shared: [creation, dispatch] };
-		session.computations.push({ ...session.preparation, owned: true });
 	}
 
 	private processComputation(session: ActiveSession, startedAt: number, completedAt: number, pids?: readonly number[], preparation?: TimelineInterval): TimelineInterval {
@@ -808,8 +815,9 @@ export class LinuxProcessReuseBackend {
 		const received = parseDispatcherRequest(body);
 		if (!received || received.token !== session.token || session.lifecycle.sealed) throw new Error("invalid dispatcher request");
 		session.signal?.throwIfAborted();
-		const request = materializeDispatcherRequest(session, received);
-		if (!request) throw new Error("dispatcher cwd is unmapped");
+		const cwd = session.projection.toPhysical(received.cwd);
+		if (!cwd) throw new Error("dispatcher cwd is unmapped");
+		const request = { ...received, cwd };
 		this.add(session, "requests");
 		const requestID = session.metrics.requests;
 		const ready = await this.resolveReady();
@@ -823,7 +831,7 @@ export class LinuxProcessReuseBackend {
 			else session.bypasses.push([request.pid, reason]);
 			return { kind: "bypass", executable };
 		}
-		const { argv0, args, cwd, environment } = request;
+		const { argv0, args, environment } = request;
 		return this.executeRequest(session, { argv0, args, cwd, environment, ...(typeof resources === "object" ? { resources, streams: true as const } : {}),
 			...(eligibility.outputPipes ? { outputPipes: eligibility.outputPipes } : {}), ...(eligibility.outputFlags ? { outputFlags: eligibility.outputFlags } : {}) },
 			executable, eligibility.route, requestID, undefined, undefined, request.pid);
@@ -846,12 +854,12 @@ export class LinuxProcessReuseBackend {
 			throw new Error("process execution binding is unavailable in this scope");
 		const { output: { request, executable, prototype }, computation: preparation } = await TimelineInterval.outside(() =>
 			TimelineInterval.measure(() => this.boundRequest(binding, invocation, session.projection, session.signal)));
-		const resultsBefore = session.preparedResults, seedsBefore = session.preparedInputSeeds;
+		const resultsBefore = session.preparedResults;
 		this.add(session, "requests");
 		const result = await this.executeRequest(session, request, executable, invocation.outputRoute, session.metrics.requests, prototype, true, undefined, preparation);
 		session.signal.throwIfAborted();
 		if (!invocation.producer && !invocation.resources && result.kind === "executed" && result.reusable === false &&
-			session.preparedResults === resultsBefore && session.preparedInputSeeds === seedsBefore) {
+			session.preparedResults === resultsBefore) {
 			throw new Error(`bound process preparation produced no reusable result${session.metrics.lastError ? `: ${session.metrics.lastError.slice(0, 4096)}` : ""}`);
 		}
 		return { output: (result.output ?? []).map(({ fd, data }) => ({ fd, data: Buffer.from(data, "base64") })),
@@ -865,12 +873,10 @@ export class LinuxProcessReuseBackend {
 			const signal = AbortSignal.any([session.signal, ...(outlet?.signal ? [outlet.signal] : [])]); signal.throwIfAborted();
 			const before = captureWorkspace ? await session.workspace.structure.capture() : undefined;
 			try {
-			if (!prototype) {
-				const captured = await TimelineInterval.outside(() => TimelineInterval.measure(() => this.prototype(session.projection, request, executable, outputRoute)));
-				prototype = captured.output;
-				preparation = captured.computation;
-			}
-			const weakKey = processWeakKey(prototype), executablePath = prototype.executablePath;
+			const captured = prototype ? { output: prototype, computation: preparation }
+				: await TimelineInterval.outside(() => TimelineInterval.measure(() => this.prototype(session.projection, request, executable, outputRoute)));
+			preparation = captured.computation;
+			const observedPrototype = captured.output, weakKey = processWeakKey(observedPrototype), executablePath = observedPrototype.executablePath;
 			const acquired = await TimelineInterval.outside(() => this.handoffs.acquire({
 				key: weakKey, signal, scope: session.scope, role: "producer", ownership: session.ownership, executablePath,
 				lookup: (live, excludedCertificates, artifacts) => this.plan(weakKey, executablePath, session.projection, (candidate) => compatibleProducer(outlet ? session.producer : session.nestedProducer, candidate), { session, live, excludedCertificates, artifacts, signal }),
@@ -891,8 +897,349 @@ export class LinuxProcessReuseBackend {
 			if (acquired.kind !== "work") throw new Error("process work reservation failed");
 			this.add(session, outlet ? "wholeCommandMisses" : "misses");
 			try {
-				recordPrototypePreparation(session, preparation, inPlace);
-				return await this.executeAndPublish(session, request, executable, prototype, weakKey, outputRoute, acquired.work, requestID, captureWorkspace, inPlace, preparation, outlet);
+				if (preparation) {
+					TimelineInterval.group(preparation, session);
+					recordProcessDependency(session, { computation: preparation, owned: true, shared: [preparation] }, inPlace);
+				}
+				const work = acquired.work;
+				const ready = await this.resolveReady();
+				const started = performance.now();
+				const transaction = await session.workspace.transactions.begin();
+				let traceRoot: string | undefined;
+				let descriptors: ReturnType<typeof createProcessDescriptorCapture> | undefined;
+				let outcome: SpawnOutcome | undefined, reusable: boolean | undefined;
+				let transactionFinishing = false;
+				let releaseRunning: (() => void) | undefined, inputCheck: Promise<boolean> | undefined;
+				let stage = "capture", dependencyCertificate: DynamicDependencyCertificate | undefined, certificateID: Sha256Digest | undefined, unattributed: StraceObservation | undefined;
+				let continuation: ProcessContinuation | undefined, frozen: { pid: number; fd: number; writing: boolean; bytes: number } | undefined;
+				const executedStreams: { alias: number; kind: string; data: Buffer }[] = [];
+				let suspensionAttempted = false, writer: SessionWriter | undefined;
+				const failureDetail = (error: unknown) => `${errorMessage(error)}; process=${JSON.stringify({
+					stage, requestID, weakKey, scope: session.scope, workspace: session.workspace.sandboxRoot,
+					executable: observedPrototype.executablePath, certificateID, complete: dependencyCertificate?.complete, taints: dependencyCertificate?.taints,
+				})}`;
+				try {
+					traceRoot = await mkdtemp(path.join(session.workspace.processRoot, "trace-"));
+					const tracePrefix = path.join(traceRoot, "process");
+					const { execMounts, executables: interposedExecutables } = interception(session.interposition, executable), image = session.projection.toLogical(executable);
+					const logicalCwd = session.projection.toLogical(request.cwd), live = !!captureWorkspace && !outlet && !!ready.imageLibrary;
+					descriptors = createProcessDescriptorCapture(session, traceRoot, request, live);
+					const { inputs, descriptorManifest, descriptorReportPath, descriptorImages, directoryImages, inheritedFiles, outputPipes: unchangedOutputPipes } = descriptors;
+					const outputPipes = request.outputPipes?.some(Boolean);
+					const streamInputs = inputs.filter(input => ["pipe", "socket", "eventfd"].includes(input.type ?? ""));
+					const closedStreams = streamInputs.every(input => {
+						const peer = request.resources!.objects[input.image]!.socket?.peer;
+						return input.outside === 0 && (!peer?.connected || peer.object !== undefined);
+					});
+					const resourceJournal = live || inputs.some(input => !input.type || input.type === "eventfd" || input.type === "socket" || input.type === "pipe" && (input.flags & 3) !== 0);
+					const streamIdentity = (position: { fd: number; inode: string }) => {
+						const input = inputs.find(input => input.fd === position.fd)!;
+						return !input.type ? `file:${position.inode}` : input.type === "eventfd" ? `eventfd:${input.image}` : position.inode;
+					};
+					await descriptors.prepare(resourceJournal);
+					const changedInput = async () => {
+						const changes = session.workspace.sourceChanges?.();
+						if (!changes?.paths.length || !transaction.readBefore) return false;
+						let inputs: Set<string> | undefined;
+						for (const changed of changes.paths) {
+							const relative = relativeFilesystemPath(session.sourceRoot, changed);
+							if (relative === undefined || session.deniedPaths.some(denied => pathContains(denied, changed))) continue;
+							inputs ??= new Set((await observeStrace(tracePrefix, image, logicalCwd, { previewBytes: 1024 * 1024 }))
+								.paths.filter(observed => observed.role === "input").map(observed => path.resolve(observed.path)));
+							if (!inputs.has(changed)) continue;
+							const before = await transaction.readBefore(slash(relative), MAX_REQUEST_BYTES);
+							if (!before) continue;
+							// Only observed inputs need comparison; the transaction prestate includes predecessor effects.
+							await assertNoSymlinkPath(session.sourceRoot, changed);
+							const current = await captureStableFile(changed, MAX_REQUEST_BYTES);
+							this.add(undefined, "validationFilesRead", current.shared ? 0 : 1);
+							this.add(undefined, "validationBytesRead", current.shared ? 0 : current.bytesRead);
+							if (sha256Digest(before) === `sha256:${current.hash}`) continue;
+							this.setError(undefined, `actor_running_input_changed:${changed}`);
+							return true;
+						}
+						return false;
+					};
+					const advancing = (advance = async () => live || closedStreams) => this.handoffs.observeRunning(weakKey, work, async () =>
+						!await (inputCheck ??= changedInput().catch(() => true).finally(() => { inputCheck = undefined; })) && advance());
+					releaseRunning = advancing();
+					const imagePath = path.join(traceRoot, "continuation");
+					const command = straceCommand(ready.strace, tracePrefix, [
+						ready.sandlock,
+						// A nested child's own children are brokered as the top level's are: a build tool's compilers run in its trace otherwise.
+						...sandboxPolicyArguments(
+							logicalCwd,
+							session.deniedPaths,
+							[session.workspace.sandboxRoot, session.socketPath, ...(descriptorReportPath ? [descriptorReportPath] : []),
+								...[...descriptorImages.values()].filter(image => !image.workspace).map(image => image.physical)],
+							[{ virtualPath: session.sourceRoot, hostPath: session.workspace.sandboxRoot, readOnly: false },
+								...(session.gitDirectory ? [{ virtualPath: session.gitDirectory, hostPath: session.gitDirectory, readOnly: true }] : []), ...session.interposition.mounts],
+							execMounts, path.join(session.workspace.processRoot, "private"),
+						),
+						...(session.workspace.metadataImage ? ["--metadata-image", session.workspace.metadataImage] : []),
+						...(outlet?.timeout !== undefined ? ["--timeout", String(Math.max(1, Math.ceil(outlet.timeout)))] : []),
+						...inheritedFiles.flatMap((_, index) => ["--preserve-fd", String(index + 3)]),
+						...directoryImages.flatMap(([directory, image]) => ["--directory-image", sandboxMountArgument({ virtualPath: directory, hostPath: image, readOnly: false })]),
+						"--",
+						ready.dispatcher,
+						descriptorManifest ? "--exec-fds" : request.closeStdin ? "--exec-closed-input" : "--exec",
+						outputRoute.join("") + (outputPipes ? request.outputPipes!.map(pipe => pipe ? "p" : "s").join("") : "") + (request.outputFlags ? `,${request.outputFlags.join(",")}` : ""),
+						...(descriptorManifest ? [descriptorManifest, descriptorReportPath!] : []),
+						request.argv0,
+						image,
+						...request.args,
+					], resourceJournal, live);
+					const processStarted = performance.now();
+					session.writers.add(writer = { startedAt: Date.now(), tail: traceTail(tracePrefix, logicalCwd), ...(inPlace !== undefined ? { pid: inPlace } : {}) });
+					const clockOffset = Number(process.hrtime.bigint()) / 1e6 - performance.now();
+					stage = "execution";
+					let outputEndpoints: readonly [string, string] | undefined;
+					const observe = (descriptorOffsets: DescriptorOffset[] | undefined, frozen?: { pid: number; bytes: number }) => observeStrace(tracePrefix, image, logicalCwd, { interposedExecutables, brokeredWrites: pid => brokeredWrites(session, pid, writer), privateUpper: privateUpper(session),
+						...(frozen ? { frozen } : {}), ...(outputEndpoints ? { outputEndpoints } : {}),
+						unchangedOutputPipes,
+						guardFilesystemSemanticsWithin: [session.workspace.sandboxRoot, session.sourceRoot],
+						inheritedDirectoryImages: directoryImages.flatMap(([physical]) => [physical, session.projection.toLogical(physical)]),
+						inheritedFileImages: [...descriptorImages.values()].flatMap(image => [image.logical, image.physical])
+							.concat(inputs.some(input => input.type === "null") ? ["/dev/null"] : [])
+							.concat((descriptorOffsets ?? []).filter(position => inputs.find(input => input.fd === position.fd)!.type === "pipe").map(position => `pipe:[${position.inode}]`)),
+						inheritedStreams: resourceJournal ? descriptorOffsets?.filter(position => streamInputs.some(input => input.fd === position.fd)).map(streamIdentity) : undefined,
+						inheritedHandles: resourceJournal ? descriptorOffsets?.flatMap(position => {
+							const input = inputs.find(input => input.fd === position.fd)!, object = request.resources!.objects[input.image]!;
+							return [{ fd: input.fd, installed: input.installed, description: input.alias, inode: streamIdentity(position), flags: input.flags, outside: input.outside ?? 3, packet: !!object.socket && (object.socket.type ?? 1) !== 1,
+								queuedBytes: object.queue?.bytes, ...(object.queue && input.fd === input.image ? { queueData: Buffer.from(object.content!, "base64"), messages: object.queue.messages } : {}) }];
+						}) : undefined,
+					});
+					const readImage = async () => (await captureStableFile(imagePath, MAX_CONTINUATION_BYTES, true, { digest: false })).content!;
+					const parseFrontier = (pid: number, reply: Buffer) => {
+						const bytes = Number(reply.readBigUInt64LE(16)), begin = Number(reply.readBigUInt64LE(24)) / 1e6 - clockOffset,
+							end = Number(reply.readBigUInt64LE(32)) / 1e6 - clockOffset, fd = reply.readInt32LE(4), syscall = reply.readInt32LE(8);
+						if (reply.readInt32LE(0) !== pid || ![1, 2, 5, 6].includes(reply.readInt32LE(12)) || syscall < 0 || syscall >= 0x40000000 || !Number.isSafeInteger(bytes) || bytes <= 0 || fd < -1 ||
+							begin < processStarted || end < begin || end > performance.now()) throw new Error("invalid native continuation frontier");
+						return { frozen: { pid, fd, writing: [1, 20, 44, 46].includes(syscall), bytes }, computation: new TimelineInterval(begin, end) };
+					};
+					outcome = await runSpawn([ready.strace, ...(live ? [`--handoff-fd=${inheritedFiles.length + 3}`, `--handoff-frontier-library=${ready.imageLibrary}`, `--handoff-image=${imagePath}`] : []), ...command.slice(1)], {
+						// The child writes to (and may query) these sockets; their identity lets its observation recognize them.
+						outputRoot: traceRoot, onOutputEndpoints: (endpoints) => {
+							session.nestedOutputEndpoints.add(outputEndpoints = endpoints);
+							if (captureWorkspace) session.topLevelOutputEndpoints = endpoints;
+						},
+						cwd: request.cwd,
+						environment: request.environment,
+						signal: AbortSignal.any([session.signal, work.signal, ...(outlet?.signal ? [outlet.signal] : [])]),
+						onData: outlet?.onData, timeout: outlet?.timeout,
+						...(outlet && session.invocation?.commandTransport === "stdin" ? { stdin: Buffer.from(outlet.command, "utf8") } : {}),
+						inheritedFiles: inheritedFiles.map(file => file.fd),
+						...(live ? { onControl: (channel: import("node:stream").Duplex, wake: () => boolean) => {
+							let suspended: Promise<boolean> | undefined, demanded = false;
+							const suspend = () => suspended ??= (async () => {
+								const executionSignal = AbortSignal.any([session.signal, work.signal]);
+								const frontier = await this.requestProcessImageAtFrontier(descriptorReportPath!, channel, wake, executionSignal, async (pid, reply, report) => {
+									if (!demanded && !(reply.readInt32LE(12) & 4)) return undefined;
+									const { frozen } = parseFrontier(pid, reply), positions = parseDescriptorOffsets(report, inputs);
+									let observation: StraceObservation | undefined;
+									try {
+										observation = await observe(positions, frozen);
+										if (observation.complete) {
+											bindProcessDescriptors(inputs, positions, observation, { image: await readImage(), frontier: frozen, closedInput: !!request.closeStdin });
+											return true;
+										}
+									} catch {}
+									// Stop capture at a blocked stream; its ownership separately decides whether to await completion.
+									const description = observation?.finalHandles?.find(handle => handle.fd === frozen.fd)?.description;
+									return demanded && reply.readInt32LE(12) & 4 && streamInputs.some(input => input.alias === description) ? false : undefined;
+								}, () => demanded);
+								if (!frontier) return true; // It completed while the request was advancing.
+								const { pid, reply } = frontier;
+								if (reply.readInt32LE(0) === 0) return closedStreams;
+								suspensionAttempted = true;
+								if (reply.readInt32LE(0) !== pid) return false;
+								const captured = parseFrontier(pid, reply);
+								continuation = { image: await readImage(), physicalRoot: session.workspace.sandboxRoot, computation: captured.computation };
+								frozen = captured.frozen;
+								return true;
+							})().catch(error => { this.setError(session, `process_suspend:${errorMessage(error)}`); return false; });
+							releaseRunning = advancing(() => { demanded = true; if (suspended) wake(); return suspend(); });
+							// Seal waiting prefixes while the owner can publish; a synchronous consumer cannot drive that publication.
+							if (!closedStreams) void suspend();
+							return () => { releaseRunning?.(); return suspended?.then(() => {}); };
+						} } : {}),
+					});
+					writer.endedAt = Date.now();
+					if (outputEndpoints) session.nestedOutputEndpoints.delete(outputEndpoints);
+					// Replays write each event to the target's own descriptor, whichever outlet this route gave it.
+					outcome = { ...outcome, output: outcome.output.map(event => ({ ...event, fd: outputRoute[0] === event.fd ? 1 : 2 })) };
+					const observedProcessMs = continuation ? continuation.computation.completedAt - continuation.computation.startedAt : Math.max(0, performance.now() - processStarted);
+					releaseRunning();
+					try {
+						if (suspensionAttempted && !continuation) throw new Error("private process suspension was not sealed");
+						const descriptorOffsets = await descriptors.readPositions();
+						transactionFinishing = true;
+						const observing = observe(descriptorOffsets, frozen);
+						const roots = [session.workspace.sandboxRoot, session.sourceRoot], own = writer!;
+						const named = (target: string) => roots.flatMap(root => pathContains(root, target) ? [slash(path.relative(root, target))] : [])[0];
+						// An inherited writable workspace file is written outside any path the trace names.
+						const ownership = async (): Promise<WorkspaceTransactionOwnership | undefined> => inputs.some(input => !input.type && (input.flags & 3) !== 0) ? undefined : observing.then(async observation => {
+							// When it last looked at each workspace name; one the trace cannot place counts as seen at its end.
+							const looked = new Map<string, number>();
+							for (const [target, at] of (await own.tail!.read()).seen) { const name = named(target); if (name !== undefined) looked.set(name, Math.max(looked.get(name) ?? 0, at)); }
+							// A run brokered from its own tree, which its trace holds as a launcher, wrote on its behalf.
+							const traced = new Set(observation.pids);
+							const children = [...session.writers].filter(other => other !== own && other.pid !== undefined && traced.has(other.pid));
+							const descendants = own.descendants = [...new Set(children.flatMap(child => [child, ...child.descendants ?? []]))];
+							own.written = observation.written ?? [];
+							return { written: new Set(own.written), observed: new Map(observation.paths.flatMap(({ path: target }) => named(target) ?? []).map(name => [name, looked.get(name) ?? own.endedAt!] as const)), endedAt: own.endedAt!,
+							interfered: async (paths, until) => {
+								const targets = new Set([...paths].flatMap(name => roots.map(root => path.posix.join(root, name))));
+								for (const other of session.writers) if (other !== own && !descendants.includes(other) && other.startedAt <= until && (other.endedAt ?? Infinity) >= own.startedAt &&
+									writesWithin(other.writes ?? (await other.tail!.read()).writes, targets, own.startedAt, until)) return true;
+								return false;
+							},
+						}; });
+						const captures = [transaction.finish(ownership), observing] as const;
+						const [delta, observation] = await Promise.all(captures).catch(async (error: unknown) => {
+							// Both captures own live workspace/trace resources until they settle.
+							stage = (await Promise.allSettled(captures)).flatMap((result, index) =>
+								result.status === "rejected" ? [index === 0 ? "transaction_capture" : "trace_capture"] : []).join("+");
+							throw error;
+						});
+						own.written ??= observation.written ?? []; own.external = observation.external ?? [];
+						for (const pid of observation.resumedInterpositions ?? []) session.resumed.add(pid);
+						const boundImage = bindProcessDescriptors(inputs, descriptorOffsets ?? [], observation, continuation && {
+							image: continuation.image, frontier: frozen!, closedInput: !!request.closeStdin });
+						if (continuation) continuation = { ...continuation, image: boundImage! };
+						if (observation.incompleteReasons.length) {
+							this.setError(session, `trace:${observation.incompleteReasons.join(",")}`);
+							for (const reason of observation.incompleteReasons) session.incompleteReasons.add(`nested_trace:${reason}`);
+						}
+						if (!delta.complete) {
+							stage = "transaction_capture";
+							unattributed = observation;
+							throw new Error(`workspace transaction is incomplete: ${delta.reason}`);
+						}
+						const { before, after } = delta;
+						stage = "workspace_effects";
+						const effects = diffWorkspaceStructures(before, after, delta.changes, session.projection);
+						if (!effects.complete) unattributed = observation;
+						stage = "dependencies";
+						const observed = [observation, ...own.descendants?.flatMap(child => child.observation ?? []) ?? []];
+						const evidence = await captureDependencies(session, before, observed, effects, [...own.descendants?.flatMap(child => child.evidence ?? []) ?? [],
+							...(outlet ? [{ complete: true, dependencies: session.interposition.dependencies, taints: [] }] : [])]);
+						if (evidence.incompleteReasons.length) this.setError(session, `evidence:${evidence.incompleteReasons.join(",")}`);
+						const taints = new Set<ProvenanceTaint>(evidence.taints);
+						// Private images preserve FD/OFD relations, but cannot also represent an independently accessed pathname.
+						if (inputs.some(descriptor => !descriptorImages.get(descriptor.image)?.workspace && descriptor.sourcePath && observation.paths.some(observed =>
+							path.resolve(observed.path) === descriptor.sourcePath || observed.role !== "metadata" && pathContains(observed.path, descriptor.sourcePath!)))) {
+							taints.add("untracked_fd");
+						}
+						// A brokered descendant that did not resume in this trace ran outside it.
+						const traced = new Set(observation.pids);
+						const escaped = session.bypasses.some(([pid]) => traced.has(pid) && !observation.resumedInterpositions?.includes(pid));
+						// What it left outside the workspace commits with its workspace effects; a change no baseline can stand for does not replay.
+						const external = await privateCommits(path.join(session.workspace.processRoot, "private"), own.startedAt, observation.external ?? []);
+						if (external.unrepresentable.length) this.setError(session, `evidence:${external.unrepresentable.join(",")}`);
+						dependencyCertificate = {
+							complete: evidence.complete && !escaped && !external.unrepresentable.length,
+							dependencies: evidence.dependencies,
+							taints: [...taints],
+						};
+						stage = "artifacts";
+						await this.store.withPublication(async () => {
+							const baseResult = await captureProcessResult(this.store, outcome!, observedProcessMs,
+								[...effects.effects, ...external.changes.map(change => ({ logicalPath: slash(change.target), change }))]);
+							await descriptors!.captureFileEffects(this.store, descriptorOffsets, after, effects.complete, baseResult.journal);
+							const transitions: NonNullable<import("./provenance-certificate.ts").ProcessResourceEffects["transitions"]>[number][] = [];
+							for (const event of observation.resourceJournal ?? []) {
+								const input = inputs.find(input => streamIdentity(descriptorOffsets!.find(position => position.fd === input.fd)!) === event.inode &&
+									(event.description !== undefined ? input.alias === event.description : event.kind === "produce" ? (input.flags & 3) !== 0 :
+										!["consume", "peek"].includes(event.kind) || (input.flags & 3) !== 1));
+								if (!input) throw new Error("unbound stream transition");
+								executedStreams.push({ alias: input.alias, kind: event.kind, data: event.data });
+								transitions.push({ id: input.alias, kind: event.kind, data: await this.store.artifacts.put(event.data), ...(event.requested !== undefined ? { requested: event.requested } : {}) });
+							}
+							const { exit, ...prefixResult } = baseResult;
+							// A transferred prefix includes producing its proof and sealed image; the separate native frontier is unchanged.
+							const computation = this.processComputation(session, work.startedAt, performance.now(), observation.pids, preparation);
+							recordProcessDependency(session, { computation, owned: true, shared: [computation] }, inPlace);
+							const result: ProcessResultRecord = { ...prefixResult, ...(continuation ? { continuation: { imageDigest: sha256Digest(continuation.image), imageBytes: continuation.image.length } } : { exit: exit! }),
+								computation: TimelineInterval.serialize(computation),
+								...(descriptorOffsets ? { resources: { ...descriptorEffects(request.resources!, descriptorOffsets), ...(resourceJournal ? { transitions } : {}) } } : {}) };
+							stage = "certificate";
+							const certificate = sealProcessCertificate({ prototype: observedPrototype, producer: outlet ? session.producer : session.nestedProducer, dependencyCertificate: dependencyCertificate!, result });
+							certificateID = certificate.id;
+							// A child can read an earlier child's private output. Its parent can prove that input from the combined
+							// transaction even when this child, considered alone against the host, could not.
+							if (!evidence.sourceComplete && observation.complete && !escaped && !external.unrepresentable.length && !continuation) session.foldedObservations.push(own.observation = observation);
+							else session.nestedEvidence.push(own.evidence = certificate.dependencyCertificate);
+							if (taints.size) {
+								if (!outlet) this.add(session, "tainted");
+								// Keep the capture's existing reasons beside its categories. Diagnostic text never changes sealed evidence.
+								const reasons = (stage: string, values: readonly string[]) => values.slice(0, 4).map(value => `${stage}:${value.slice(0, 512)}${value.length > 512 ? "…" : ""}`)
+									.concat(values.length > 4 ? [`${stage}:more_reasons`] : []);
+								const detail = [`tainted:${[...taints].join(",")}`,
+									...(observation.unsupportedSyscalls?.length ? [`syscalls:${observation.unsupportedSyscalls.join(",")}${observation.unsupportedSyscallsTruncated ? ",…" : ""}`] : []),
+									...reasons("trace", observation.incompleteReasons), ...reasons("dependency", evidence.incompleteReasons),
+									...reasons("external", external.unrepresentable)].join("; ");
+								if (!outlet || !session.metrics.lastError) this.setError(session, detail.length > 4096 ? `${detail.slice(0, 4095)}…` : detail);
+							}
+							stage = "handoff_registration";
+							if (await this.handoffs.publish(weakKey, work, certificate, () => {
+								const { streams: _streams, ...invocation } = request;
+								const binding = !outlet && this.handoffs.bind(weakKey, work, { ...invocation, cwd: logicalCwd, executable: image,
+									sourceRoot: session.sourceRoot, outputRoute, producer: session.nestedProducer });
+								if (binding) session.executionBindings.set(requestID, binding);
+								if (continuation) return Promise.resolve(false);
+								stage = "history_publication";
+								return this.planner.publishCompleted(certificate, SAME_CONFINEMENT_TAINTS).catch((error: unknown) => {
+									// Optional history storage cannot invalidate already sealed execution evidence.
+									this.setError(session, `nested_publish:${failureDetail(error)}`);
+									return false;
+								});
+							}, continuation, computation)) this.add(session, outlet ? "wholeCommandPublished" : "published");
+							if (!outlet) {
+								// A sealed frontier or input seed remains useful even when its result cannot enter history.
+								reusable = !!certificate.result.continuation || certificateReplayable(certificate, [...TRANSFERRED_INPUT_TAINTS, ...SAME_CONFINEMENT_TAINTS]);
+								if (reusable || request.resources || inputs.length) session.preparedResults++;
+							}
+						});
+					} catch (error) {
+						// The process already ran. Certificate failure must never cause dispatcher fallback/re-execution.
+						const detail = failureDetail(error);
+						if (!outlet || !session.incompleteReasons.size) this.setError(session, `post_execution_capture:${detail}`);
+						// Its command captures the effects whole: what it observed joins the command's evidence, measured from the command's start.
+						if (unattributed?.complete && !unattributed.incompleteReasons.length && !continuation) session.foldedObservations.push(writer!.observation = unattributed);
+						else session.incompleteReasons.add(`nested_capture:${detail}`);
+					}
+					if (continuation) return { kind: "suspended", weakKey };
+					const exit = exitOutcome(outcome);
+					const streams = request.streams && streamSettlement(inputs, executedStreams);
+					if (streams === undefined && request.streams) {
+						this.setError(session, "stream_settlement_unrepresentable");
+						return { kind: "executed", weakKey, output: [], exit: { kind: "code", code: 125 } };
+					}
+					return { kind: "executed", weakKey, output: wireOutput(outcome.output), exit, ...(streams?.length ? { streams } : {}),
+						...(reusable !== undefined ? { reusable } : {}) };
+				} catch (error) {
+					if (stage !== "capture" || captureWorkspace || session.signal.aborted || work.signal.aborted) throw error;
+					const detail = failureDetail(error);
+					this.add(session, "bypasses");
+					this.setError(session, detail);
+					session.incompleteReasons.add(`broker:${detail}`);
+					return { kind: "bypass", executable };
+				} finally {
+					try { await descriptors?.close(); } catch (error) { this.setError(session, `descriptor_report_close:${errorMessage(error)}`); }
+					releaseRunning?.();
+					await inputCheck;
+					const durationMs = Math.max(0, performance.now() - started);
+					if (!outlet) this.add(session, "executionMs", durationMs);
+					if (!transactionFinishing) await transaction.abort().catch(() => undefined);
+					if (writer) {
+						recordSessionWrites(session, writer.pid ?? -requestID, writer);
+						writer.writes ??= await writer.tail!.read().then(tail => tail.writes, () => [{ at: writer!.startedAt, opened: true }]);
+						writer.settled = true;
+						if ([...session.writers].every(other => other.settled)) session.writers.clear();
+					}
+					if (traceRoot) await rm(traceRoot, { recursive: true, force: true }).catch(() => undefined);
+				}
 			} finally {
 				this.handoffs.complete(weakKey, acquired.work);
 			}
@@ -916,19 +1263,15 @@ export class LinuxProcessReuseBackend {
 			validation: { resolvePath: (logicalPath) => projection.toPhysical(logicalPath), ...(session ? { acceptedTaints: SAME_CONFINEMENT_TAINTS } : {}) },
 			...(live ? { live: { certificate: live, artifacts, acceptedTaints: [...TRANSFERRED_INPUT_TAINTS] } } : {}),
 		}))).output;
-		this.recordLookup(plan.lookup, session);
+		for (const [metric, value] of [["validationCandidates", plan.lookup.candidateCertificates],
+			["validationPathsets", plan.lookup.pathsetsValidated], ["validationFilesRead", plan.lookup.filesRead], ["validationBytesRead", plan.lookup.bytesRead],
+			["validationArtifactsLoaded", plan.lookup.artifactsLoaded], ["validationArtifactBytesRead", plan.lookup.artifactBytesRead]] as const) {
+			this.add(session, metric, value); }
 		if (plan.kind === "miss" && plan.lookup.candidateCertificates > 0) {
 			const detail = `reuse_miss:${plan.reasons.join(",")}${plan.changedDependencies?.length ? `:${plan.changedDependencies.join(",")}` : ""}`;
 			if (session) this.setError(session, detail); else this.setError(undefined, `actor_${detail}`);
 		}
 		return plan.kind !== "miss" ? plan : undefined;
-	}
-
-	private recordLookup(lookup: ProcessReusePlan["lookup"], session?: ActiveSession): void {
-		for (const [metric, value] of [["validationCandidates", lookup.candidateCertificates],
-			["validationPathsets", lookup.pathsetsValidated], ["validationFilesRead", lookup.filesRead], ["validationBytesRead", lookup.bytesRead],
-			["validationArtifactsLoaded", lookup.artifactsLoaded], ["validationArtifactBytesRead", lookup.artifactBytesRead]] as const) {
-			this.add(session, metric, value); }
 	}
 
 	private async decideHeldExec(process: HeldExecProcess, scope?: ExecutionScope): Promise<HeldExecDecision> {
@@ -970,7 +1313,7 @@ export class LinuxProcessReuseBackend {
 				this.add(undefined, "misses"); return measured({ kind: "continue" });
 			}
 			if (learning) { observation!.pending++; reserved = true; }
-			const available = this.handoffs.mayHaveExecutable(executablePath) || await this.store.mayHaveCertificates(executablePath, process.signal) ||
+			const available = observation?.source && Atomics.load(observation.source.available, 0) || this.handoffs.mayHaveExecutable(executablePath) || await this.store.mayHaveCertificates(executablePath, process.signal) ||
 				this.handoffs.mayHaveExecutable(executablePath);
 			// Concurrent discovery is bounded, but a full retained set never shuts discovery off for the rest of the call.
 			if (!learning && !available) { this.add(undefined, "misses"); return measured({ kind: "continue" }); }
@@ -1021,7 +1364,7 @@ export class LinuxProcessReuseBackend {
 			const prototype = bufferedProcessPrototype(snapshot, projection, digest, await this.resolvePlatformFingerprint());
 			const weakKey = processWeakKey(prototype);
 			const accepted = (producer: ProcessProducerProof) => actorReplayProducer(producer, sensitivePaths(this.options.storeRoot, this.options.deniedPaths));
-			const result = await this.handoffs.acquire({ key: weakKey, scope, signal: process.signal, role: "actor",
+			const result = await this.handoffs.acquire({ key: weakKey, scope, signal: process.signal, role: "actor", borrow: observation?.source?.borrow,
 				lookup: (live, excludedCertificates, artifacts) => this.plan(weakKey, executablePath, projection, accepted, { live, artifacts, excludedCertificates, continuation: true, signal: process.signal }) });
 			const acquired = result.kind === "hit" ? result : undefined, { plan, continuation } = acquired ?? {};
 			settle = acquired?.settle;
@@ -1103,356 +1446,6 @@ export class LinuxProcessReuseBackend {
 		return { kind: "hit", weakKey, output, exit: certificate.result.exit, ...(streams?.length ? { streams } : {}) };
 	}
 
-	private async executeAndPublish(
-		session: ActiveSession,
-		request: ProcessArguments,
-		executable: string,
-		prototype: ExecPrototype,
-		weakKey: Sha256Digest,
-		outputRoute: OutputRoute,
-		work: ProcessHandoff,
-		requestID: number,
-		captureWorkspace?: true,
-		inPlace?: number,
-		preparation?: TimelineInterval,
-		outlet?: ProcessExecutionRequest,
-	): Promise<DispatcherResponse> {
-		const ready = await this.resolveReady();
-		const started = performance.now();
-		const transaction = await session.workspace.transactions.begin();
-		let traceRoot: string | undefined;
-		let descriptors: ReturnType<typeof createProcessDescriptorCapture> | undefined;
-		let outcome: SpawnOutcome | undefined, reusable: boolean | undefined;
-		let transactionFinishing = false;
-		let releaseRunning: (() => void) | undefined, inputCheck: Promise<boolean> | undefined;
-		let stage = "capture", dependencyCertificate: DynamicDependencyCertificate | undefined, certificateID: Sha256Digest | undefined, unattributed: StraceObservation | undefined;
-		let continuation: ProcessContinuation | undefined, frozen: { pid: number; fd: number; writing: boolean; bytes: number } | undefined;
-		const executedStreams: { alias: number; kind: string; data: Buffer }[] = [];
-		let suspensionAttempted = false, writer: SessionWriter | undefined;
-		const failureDetail = (error: unknown) => `${errorMessage(error)}; process=${JSON.stringify({
-			stage, requestID, weakKey, scope: session.scope, workspace: session.workspace.sandboxRoot,
-			executable: prototype.executablePath, certificateID, complete: dependencyCertificate?.complete, taints: dependencyCertificate?.taints,
-		})}`;
-		try {
-			traceRoot = await mkdtemp(path.join(session.workspace.processRoot, "trace-"));
-			const tracePrefix = path.join(traceRoot, "process");
-			const { execMounts, executables: interposedExecutables } = interception(session.interposition, executable), image = session.projection.toLogical(executable);
-			const logicalCwd = session.projection.toLogical(request.cwd), live = !!captureWorkspace && !outlet && !!ready.imageLibrary;
-			descriptors = createProcessDescriptorCapture(session, traceRoot, request, live);
-			const { inputs, descriptorManifest, descriptorReportPath, descriptorImages, directoryImages, inheritedFiles, outputPipes: unchangedOutputPipes } = descriptors;
-			const outputPipes = request.outputPipes?.some(Boolean);
-			const streamInputs = inputs.filter(input => ["pipe", "socket", "eventfd"].includes(input.type ?? ""));
-			const closedStreams = streamInputs.every(input => {
-				const peer = request.resources!.objects[input.image]!.socket?.peer;
-				return input.outside === 0 && (!peer?.connected || peer.object !== undefined);
-			});
-			const resourceJournal = live || inputs.some(input => !input.type || input.type === "eventfd" || input.type === "socket" || input.type === "pipe" && (input.flags & 3) !== 0);
-			const streamIdentity = (position: { fd: number; inode: string }) => {
-				const input = inputs.find(input => input.fd === position.fd)!;
-				return !input.type ? `file:${position.inode}` : input.type === "eventfd" ? `eventfd:${input.image}` : position.inode;
-			};
-			await descriptors.prepare(resourceJournal);
-			const changedInput = async () => {
-				const changes = session.workspace.sourceChanges?.();
-				if (!changes?.paths.length || !transaction.readBefore) return false;
-				let inputs: Set<string> | undefined;
-				for (const changed of changes.paths) {
-					const relative = relativeFilesystemPath(session.sourceRoot, changed);
-					if (relative === undefined || session.deniedPaths.some(denied => pathContains(denied, changed))) continue;
-					inputs ??= new Set((await observeStrace(tracePrefix, image, logicalCwd, { previewBytes: 1024 * 1024 }))
-						.paths.filter(observed => observed.role === "input").map(observed => path.resolve(observed.path)));
-					if (!inputs.has(changed)) continue;
-					const before = await transaction.readBefore(slash(relative), MAX_REQUEST_BYTES);
-					if (!before) continue;
-					// Only observed inputs need comparison; the transaction prestate includes predecessor effects.
-					await assertNoSymlinkPath(session.sourceRoot, changed);
-					const current = await captureStableFile(changed, MAX_REQUEST_BYTES);
-					this.add(undefined, "validationFilesRead", current.shared ? 0 : 1);
-					this.add(undefined, "validationBytesRead", current.shared ? 0 : current.bytesRead);
-					if (sha256Digest(before) === `sha256:${current.hash}`) continue;
-					this.setError(undefined, `actor_running_input_changed:${changed}`);
-					return true;
-				}
-				return false;
-			};
-			const advancing = (advance = async () => live || closedStreams) => this.handoffs.observeRunning(weakKey, work, async () =>
-				!await (inputCheck ??= changedInput().catch(() => true).finally(() => { inputCheck = undefined; })) && advance());
-			releaseRunning = advancing();
-			const imagePath = path.join(traceRoot, "continuation");
-			const command = straceCommand(ready.strace, tracePrefix, [
-				ready.sandlock,
-				// A nested child's own children are brokered as the top level's are: a build tool's compilers run in its trace otherwise.
-				...sandboxPolicyArguments(
-					logicalCwd,
-					session.deniedPaths,
-					[session.workspace.sandboxRoot, session.socketPath, ...(descriptorReportPath ? [descriptorReportPath] : []),
-						...[...descriptorImages.values()].filter(image => !image.workspace).map(image => image.physical)],
-					[{ virtualPath: session.sourceRoot, hostPath: session.workspace.sandboxRoot, readOnly: false },
-						...(session.gitDirectory ? [{ virtualPath: session.gitDirectory, hostPath: session.gitDirectory, readOnly: true }] : []), ...session.interposition.mounts],
-					execMounts, path.join(session.workspace.processRoot, "private"),
-				),
-				...(session.workspace.metadataImage ? ["--metadata-image", session.workspace.metadataImage] : []),
-				...(outlet?.timeout !== undefined ? ["--timeout", String(Math.max(1, Math.ceil(outlet.timeout)))] : []),
-				...inheritedFiles.flatMap((_, index) => ["--preserve-fd", String(index + 3)]),
-				...directoryImages.flatMap(([directory, image]) => ["--directory-image", sandboxMountArgument({ virtualPath: directory, hostPath: image, readOnly: false })]),
-				"--",
-				ready.dispatcher,
-				descriptorManifest ? "--exec-fds" : request.closeStdin ? "--exec-closed-input" : "--exec",
-				outputRoute.join("") + (outputPipes ? request.outputPipes!.map(pipe => pipe ? "p" : "s").join("") : "") + (request.outputFlags ? `,${request.outputFlags.join(",")}` : ""),
-				...(descriptorManifest ? [descriptorManifest, descriptorReportPath!] : []),
-				request.argv0,
-				image,
-				...request.args,
-			], resourceJournal, live);
-			const processStarted = performance.now();
-			session.writers.add(writer = { startedAt: Date.now(), tail: traceTail(tracePrefix, logicalCwd), ...(inPlace !== undefined ? { pid: inPlace } : {}) });
-			const clockOffset = Number(process.hrtime.bigint()) / 1e6 - performance.now();
-			stage = "execution";
-			let outputEndpoints: readonly [string, string] | undefined;
-			const observe = (descriptorOffsets: DescriptorOffset[] | undefined, frozen?: { pid: number; bytes: number }) => observeStrace(tracePrefix, image, logicalCwd, { interposedExecutables, brokeredWrites: pid => brokeredWrites(session, pid, writer), privateUpper: privateUpper(session),
-				...(frozen ? { frozen } : {}), ...(outputEndpoints ? { outputEndpoints } : {}),
-				unchangedOutputPipes,
-				guardFilesystemSemanticsWithin: [session.workspace.sandboxRoot, session.sourceRoot],
-				inheritedDirectoryImages: directoryImages.flatMap(([physical]) => [physical, session.projection.toLogical(physical)]),
-				inheritedFileImages: [...descriptorImages.values()].flatMap(image => [image.logical, image.physical])
-					.concat(inputs.some(input => input.type === "null") ? ["/dev/null"] : [])
-					.concat((descriptorOffsets ?? []).filter(position => inputs.find(input => input.fd === position.fd)!.type === "pipe").map(position => `pipe:[${position.inode}]`)),
-				inheritedStreams: resourceJournal ? descriptorOffsets?.filter(position => streamInputs.some(input => input.fd === position.fd)).map(streamIdentity) : undefined,
-				inheritedHandles: resourceJournal ? descriptorOffsets?.flatMap(position => {
-					const input = inputs.find(input => input.fd === position.fd)!, object = request.resources!.objects[input.image]!;
-					return [{ fd: input.fd, installed: input.installed, description: input.alias, inode: streamIdentity(position), flags: input.flags, outside: input.outside ?? 3, packet: !!object.socket && (object.socket.type ?? 1) !== 1,
-						queuedBytes: object.queue?.bytes, ...(object.queue && input.fd === input.image ? { queueData: Buffer.from(object.content!, "base64"), messages: object.queue.messages } : {}) }];
-				}) : undefined,
-			});
-			const readImage = async () => (await captureStableFile(imagePath, MAX_CONTINUATION_BYTES, true, { digest: false })).content!;
-			const parseFrontier = (pid: number, reply: Buffer) => {
-				const bytes = Number(reply.readBigUInt64LE(16)), begin = Number(reply.readBigUInt64LE(24)) / 1e6 - clockOffset,
-					end = Number(reply.readBigUInt64LE(32)) / 1e6 - clockOffset, fd = reply.readInt32LE(4), syscall = reply.readInt32LE(8);
-				if (reply.readInt32LE(0) !== pid || ![1, 2, 5, 6].includes(reply.readInt32LE(12)) || syscall < 0 || syscall >= 0x40000000 || !Number.isSafeInteger(bytes) || bytes <= 0 || fd < -1 ||
-					begin < processStarted || end < begin || end > performance.now()) throw new Error("invalid native continuation frontier");
-				return { frozen: { pid, fd, writing: [1, 20, 44, 46].includes(syscall), bytes }, computation: new TimelineInterval(begin, end) };
-			};
-			outcome = await runSpawn([ready.strace, ...(live ? [`--handoff-fd=${inheritedFiles.length + 3}`, `--handoff-frontier-library=${ready.imageLibrary}`, `--handoff-image=${imagePath}`] : []), ...command.slice(1)], {
-				// The child writes to (and may query) these sockets; their identity lets its observation recognize them.
-				outputRoot: traceRoot, onOutputEndpoints: (endpoints) => {
-					session.nestedOutputEndpoints.add(outputEndpoints = endpoints);
-					if (captureWorkspace) session.topLevelOutputEndpoints = endpoints;
-				},
-				cwd: request.cwd,
-				environment: request.environment,
-				signal: AbortSignal.any([session.signal, work.signal, ...(outlet?.signal ? [outlet.signal] : [])]),
-				onData: outlet?.onData, timeout: outlet?.timeout,
-				...(outlet && session.invocation?.commandTransport === "stdin" ? { stdin: Buffer.from(outlet.command, "utf8") } : {}),
-				inheritedFiles: inheritedFiles.map(file => file.fd),
-				...(live ? { onControl: (channel: import("node:stream").Duplex, wake: () => boolean) => {
-					let suspended: Promise<boolean> | undefined, demanded = false;
-					const suspend = () => suspended ??= (async () => {
-						const executionSignal = AbortSignal.any([session.signal, work.signal]);
-						const frontier = await this.requestProcessImageAtFrontier(descriptorReportPath!, channel, wake, executionSignal, async (pid, reply, report) => {
-							if (!demanded && !(reply.readInt32LE(12) & 4)) return undefined;
-							const { frozen } = parseFrontier(pid, reply), positions = parseDescriptorOffsets(report, inputs);
-							let observation: StraceObservation | undefined;
-							try {
-								observation = await observe(positions, frozen);
-								if (observation.complete) {
-									bindProcessDescriptors(inputs, positions, observation, { image: await readImage(), frontier: frozen, closedInput: !!request.closeStdin });
-									return true;
-								}
-							} catch {}
-							// Stop capture at a blocked stream; its ownership separately decides whether to await completion.
-							const description = observation?.finalHandles?.find(handle => handle.fd === frozen.fd)?.description;
-							return demanded && reply.readInt32LE(12) & 4 && streamInputs.some(input => input.alias === description) ? false : undefined;
-						}, () => demanded);
-						if (!frontier) return true; // It completed while the request was advancing.
-						const { pid, reply } = frontier;
-						if (reply.readInt32LE(0) === 0) return closedStreams;
-						suspensionAttempted = true;
-						if (reply.readInt32LE(0) !== pid) return false;
-						const captured = parseFrontier(pid, reply);
-						continuation = { image: await readImage(), physicalRoot: session.workspace.sandboxRoot, computation: captured.computation };
-						frozen = captured.frozen;
-						return true;
-					})().catch(error => { this.setError(session, `process_suspend:${errorMessage(error)}`); return false; });
-					releaseRunning = advancing(() => { demanded = true; if (suspended) wake(); return suspend(); });
-					// Seal waiting prefixes while the owner can publish; a synchronous consumer cannot drive that publication.
-					if (!closedStreams) void suspend();
-					return () => { releaseRunning?.(); return suspended?.then(() => {}); };
-				} } : {}),
-			});
-			writer.endedAt = Date.now();
-			if (outputEndpoints) session.nestedOutputEndpoints.delete(outputEndpoints);
-			// Replays write each event to the target's own descriptor, whichever outlet this route gave it.
-			outcome = { ...outcome, output: outcome.output.map(event => ({ ...event, fd: outputRoute[0] === event.fd ? 1 : 2 })) };
-			const observedProcessMs = continuation ? continuation.computation.completedAt - continuation.computation.startedAt : Math.max(0, performance.now() - processStarted);
-			releaseRunning();
-			try {
-				if (suspensionAttempted && !continuation) throw new Error("private process suspension was not sealed");
-				const descriptorOffsets = await descriptors.readPositions();
-				transactionFinishing = true;
-				const observing = observe(descriptorOffsets, frozen);
-				const roots = [session.workspace.sandboxRoot, session.sourceRoot], own = writer!;
-				const named = (target: string) => roots.flatMap(root => pathContains(root, target) ? [slash(path.relative(root, target))] : [])[0];
-				// An inherited writable workspace file is written outside any path the trace names.
-				const ownership = async (): Promise<WorkspaceTransactionOwnership | undefined> => inputs.some(input => !input.type && (input.flags & 3) !== 0) ? undefined : observing.then(async observation => {
-					// When it last looked at each workspace name; one the trace cannot place counts as seen at its end.
-					const looked = new Map<string, number>();
-					for (const [target, at] of (await own.tail!.read()).seen) { const name = named(target); if (name !== undefined) looked.set(name, Math.max(looked.get(name) ?? 0, at)); }
-					// A run brokered from its own tree, which its trace holds as a launcher, wrote on its behalf.
-					const traced = new Set(observation.pids);
-					const children = [...session.writers].filter(other => other !== own && other.pid !== undefined && traced.has(other.pid));
-					const descendants = own.descendants = [...new Set(children.flatMap(child => [child, ...child.descendants ?? []]))];
-					own.written = observation.written ?? [];
-					return { written: new Set(own.written), observed: new Map(observation.paths.flatMap(({ path: target }) => named(target) ?? []).map(name => [name, looked.get(name) ?? own.endedAt!] as const)), endedAt: own.endedAt!,
-					interfered: async (paths, until) => {
-						const targets = new Set([...paths].flatMap(name => roots.map(root => path.posix.join(root, name))));
-						for (const other of session.writers) if (other !== own && !descendants.includes(other) && other.startedAt <= until && (other.endedAt ?? Infinity) >= own.startedAt &&
-							writesWithin(other.writes ?? (await other.tail!.read()).writes, targets, own.startedAt, until)) return true;
-						return false;
-					},
-				}; });
-				const captures = [transaction.finish(ownership), observing] as const;
-				const [delta, observation] = await Promise.all(captures).catch(async (error: unknown) => {
-					// Both captures own live workspace/trace resources until they settle.
-					stage = (await Promise.allSettled(captures)).flatMap((result, index) =>
-						result.status === "rejected" ? [index === 0 ? "transaction_capture" : "trace_capture"] : []).join("+");
-					throw error;
-				});
-				own.written ??= observation.written ?? []; own.external = observation.external ?? [];
-				for (const pid of observation.resumedInterpositions ?? []) session.resumed.add(pid);
-				const boundImage = bindProcessDescriptors(inputs, descriptorOffsets ?? [], observation, continuation && {
-					image: continuation.image, frontier: frozen!, closedInput: !!request.closeStdin });
-				if (continuation) continuation = { ...continuation, image: boundImage! };
-				if (observation.incompleteReasons.length) {
-					this.setError(session, `trace:${observation.incompleteReasons.join(",")}`);
-					for (const reason of observation.incompleteReasons) session.incompleteReasons.add(`nested_trace:${reason}`);
-				}
-				if (!delta.complete) {
-					stage = "transaction_capture";
-					unattributed = observation;
-					throw new Error(`workspace transaction is incomplete: ${delta.reason}`);
-				}
-				const { before, after } = delta;
-				stage = "workspace_effects";
-				const effects = diffWorkspaceStructures(before, after, delta.changes, session.projection);
-				if (!effects.complete) unattributed = observation;
-				stage = "dependencies";
-				const observed = [observation, ...own.descendants?.flatMap(child => child.observation ?? []) ?? []];
-				const evidence = await captureDependencies(session, before, observed, effects, [...own.descendants?.flatMap(child => child.evidence ?? []) ?? [],
-					...(outlet ? [{ complete: true, dependencies: session.interposition.dependencies, taints: [] }] : [])]);
-				if (evidence.incompleteReasons.length) this.setError(session, `evidence:${evidence.incompleteReasons.join(",")}`);
-				const taints = new Set<ProvenanceTaint>(evidence.taints);
-				// Private images preserve FD/OFD relations, but cannot also represent an independently accessed pathname.
-				if (inputs.some(descriptor => !descriptorImages.get(descriptor.image)?.workspace && descriptor.sourcePath && observation.paths.some(observed =>
-					path.resolve(observed.path) === descriptor.sourcePath || observed.role !== "metadata" && pathContains(observed.path, descriptor.sourcePath!)))) {
-					taints.add("untracked_fd");
-				}
-				// A brokered descendant that did not resume in this trace ran outside it.
-				const traced = new Set(observation.pids);
-				const escaped = session.bypasses.some(([pid]) => traced.has(pid) && !observation.resumedInterpositions?.includes(pid));
-				// What it left outside the workspace commits with its workspace effects; a change no baseline can stand for does not replay.
-				const external = await privateCommits(path.join(session.workspace.processRoot, "private"), own.startedAt, observation.external ?? []);
-				if (external.unrepresentable.length) this.setError(session, `evidence:${external.unrepresentable.join(",")}`);
-				dependencyCertificate = {
-					complete: evidence.complete && !escaped && !external.unrepresentable.length,
-					dependencies: evidence.dependencies,
-					taints: [...taints],
-				};
-				stage = "artifacts";
-				await this.store.withPublication(async () => {
-					const baseResult = await captureProcessResult(this.store, outcome!, observedProcessMs,
-						[...effects.effects, ...external.changes.map(change => ({ logicalPath: slash(change.target), change }))]);
-					await descriptors!.captureFileEffects(this.store, descriptorOffsets, after, effects.complete, baseResult.journal);
-					const transitions: NonNullable<import("./provenance-certificate.ts").ProcessResourceEffects["transitions"]>[number][] = [];
-					for (const event of observation.resourceJournal ?? []) {
-						const input = inputs.find(input => streamIdentity(descriptorOffsets!.find(position => position.fd === input.fd)!) === event.inode &&
-							(event.description !== undefined ? input.alias === event.description : event.kind === "produce" ? (input.flags & 3) !== 0 :
-								!["consume", "peek"].includes(event.kind) || (input.flags & 3) !== 1));
-						if (!input) throw new Error("unbound stream transition");
-						executedStreams.push({ alias: input.alias, kind: event.kind, data: event.data });
-						transitions.push({ id: input.alias, kind: event.kind, data: await this.store.artifacts.put(event.data), ...(event.requested !== undefined ? { requested: event.requested } : {}) });
-					}
-					const { exit, ...prefixResult } = baseResult;
-					// A transferred prefix includes producing its proof and sealed image; the separate native frontier is unchanged.
-					const computation = this.processComputation(session, work.startedAt, performance.now(), observation.pids, preparation);
-					recordProcessDependency(session, { computation, owned: true, shared: [computation] }, inPlace);
-					const result: ProcessResultRecord = { ...prefixResult, ...(continuation ? { continuation: { imageDigest: sha256Digest(continuation.image), imageBytes: continuation.image.length } } : { exit: exit! }),
-						computation: TimelineInterval.serialize(computation),
-						...(descriptorOffsets ? { resources: { ...descriptorEffects(request.resources!, descriptorOffsets), ...(resourceJournal ? { transitions } : {}) } } : {}) };
-					stage = "certificate";
-					const certificate = sealProcessCertificate({ prototype, producer: outlet ? session.producer : session.nestedProducer, dependencyCertificate: dependencyCertificate!, result });
-					certificateID = certificate.id;
-					// A child can read an earlier child's private output. Its parent can prove that input from the combined
-					// transaction even when this child, considered alone against the host, could not.
-					if (!evidence.sourceComplete && observation.complete && !escaped && !external.unrepresentable.length && !continuation) session.foldedObservations.push(own.observation = observation);
-					else session.nestedEvidence.push(own.evidence = certificate.dependencyCertificate);
-					if (taints.size) {
-						if (!outlet) this.add(session, "tainted");
-						// Keep the capture's existing reasons beside its categories. Diagnostic text never changes sealed evidence.
-						const reasons = (stage: string, values: readonly string[]) => values.slice(0, 4).map(value => `${stage}:${value.slice(0, 512)}${value.length > 512 ? "…" : ""}`)
-							.concat(values.length > 4 ? [`${stage}:more_reasons`] : []);
-						const detail = [`tainted:${[...taints].join(",")}`,
-							...(observation.unsupportedSyscalls?.length ? [`syscalls:${observation.unsupportedSyscalls.join(",")}${observation.unsupportedSyscallsTruncated ? ",…" : ""}`] : []),
-							...reasons("trace", observation.incompleteReasons), ...reasons("dependency", evidence.incompleteReasons),
-							...reasons("external", external.unrepresentable)].join("; ");
-						if (!outlet || !session.metrics.lastError) this.setError(session, detail.length > 4096 ? `${detail.slice(0, 4095)}…` : detail);
-					}
-					stage = "handoff_registration";
-					if (await this.handoffs.publish(weakKey, work, certificate, () => {
-						const { streams: _streams, ...invocation } = request;
-						const binding = !outlet && this.handoffs.bind(weakKey, work, { ...invocation, cwd: logicalCwd, executable: image,
-							sourceRoot: session.sourceRoot, outputRoute, producer: session.nestedProducer });
-						if (binding) session.executionBindings.set(requestID, binding);
-						if (continuation) return Promise.resolve(false);
-						stage = "history_publication";
-						return this.planner.publishCompleted(certificate, SAME_CONFINEMENT_TAINTS).catch((error: unknown) => {
-							// Optional history storage cannot invalidate already sealed execution evidence.
-							this.setError(session, `nested_publish:${failureDetail(error)}`);
-							return false;
-						});
-					}, continuation, computation)) this.add(session, outlet ? "wholeCommandPublished" : "published");
-					if (!outlet) reusable = this.recordPreparedResult(session, certificate, !!request.resources || inputs.length > 0);
-				});
-			} catch (error) {
-				// The process already ran. Certificate failure must never cause dispatcher fallback/re-execution.
-				const detail = failureDetail(error);
-				if (!outlet || !session.incompleteReasons.size) this.setError(session, `post_execution_capture:${detail}`);
-				// Its command captures the effects whole: what it observed joins the command's evidence, measured from the command's start.
-				if (unattributed?.complete && !unattributed.incompleteReasons.length && !continuation) session.foldedObservations.push(writer!.observation = unattributed);
-				else session.incompleteReasons.add(`nested_capture:${detail}`);
-			}
-			if (continuation) return { kind: "suspended", weakKey };
-			const exit = exitOutcome(outcome);
-			const streams = request.streams && streamSettlement(inputs, executedStreams);
-			if (streams === undefined && request.streams) {
-				this.setError(session, "stream_settlement_unrepresentable");
-				return { kind: "executed", weakKey, output: [], exit: { kind: "code", code: 125 } };
-			}
-			return { kind: "executed", weakKey, output: wireOutput(outcome.output), exit, ...(streams?.length ? { streams } : {}),
-				...(reusable !== undefined ? { reusable } : {}) };
-		} catch (error) {
-			if (stage !== "capture" || captureWorkspace || session.signal.aborted || work.signal.aborted) throw error;
-			const detail = failureDetail(error);
-			this.add(session, "bypasses");
-			this.setError(session, detail);
-			session.incompleteReasons.add(`broker:${detail}`);
-			return { kind: "bypass", executable };
-		} finally {
-			try { await descriptors?.close(); } catch (error) { this.setError(session, `descriptor_report_close:${errorMessage(error)}`); }
-			releaseRunning?.();
-			await inputCheck;
-			const durationMs = Math.max(0, performance.now() - started);
-			if (!outlet) this.add(session, "executionMs", durationMs);
-			if (!transactionFinishing) await transaction.abort().catch(() => undefined);
-			if (writer) {
-				recordSessionWrites(session, writer.pid ?? -requestID, writer);
-				writer.writes ??= await writer.tail!.read().then(tail => tail.writes, () => [{ at: writer!.startedAt, opened: true }]);
-				writer.settled = true;
-				if ([...session.writers].every(other => other.settled)) session.writers.clear();
-			}
-			if (traceRoot) await rm(traceRoot, { recursive: true, force: true }).catch(() => undefined);
-		}
-	}
-
 	/** Admission observes a stopped process; safe declines keep advancing its existing request. */
 	private async requestProcessImageAtFrontier(descriptorReportPath: string, channel: import("node:stream").Duplex,
 		wake: () => boolean, signal: AbortSignal, admit: (pid: number, reply: Buffer, report: Buffer) => Promise<boolean | undefined>, demanded: () => boolean): Promise<{ pid: number; reply: Buffer } | undefined> {
@@ -1481,17 +1474,8 @@ export class LinuxProcessReuseBackend {
 		}
 	}
 
-	private recordPreparedResult(session: ActiveSession, certificate: ProcessProvenanceCertificate, hasInputResources: boolean): boolean {
-		// A live one-shot result need not be publishable on disk. A retained continuation still owns its frontier;
-		// preparation feedback cannot replace the native contract and dependency checks at its eventual adoption.
-		const reusable = !!certificate.result.continuation || certificateReplayable(certificate, [...TRANSFERRED_INPUT_TAINTS, ...SAME_CONFINEMENT_TAINTS]);
-		if (hasInputResources) session.preparedInputSeeds++;
-		if (reusable) session.preparedResults++;
-		return reusable;
-	}
-
 	private add(session: ActiveSession | undefined, metric: CountedReuseMetric, value = 1): void {
-		this.counters[metric] += value; (session?.metrics ?? this.actorCounters)[metric] += value;
+		if (session) this.counters[metric] += value; (session?.metrics ?? this.actorCounters)[metric] += value;
 		const observation = !session && this.observations.getStore(); if (observation && !observation.closed) observation.metrics[metric] += value;
 	}
 
@@ -1968,12 +1952,6 @@ async function measureProcess<T>(session: ActiveSession, execute: () => Promise<
 	const result = await TimelineInterval.measure(execute, () => session.computations.slice(first).filter(input => processDependencyPIDs.get(input) === pid));
 	recordProcessDependency(session, { computation: result.computation, owned: true, shared: [result.computation] }, pid);
 	return result.output;
-}
-
-function recordPrototypePreparation(session: ActiveSession, computation: TimelineInterval | undefined, pid?: number): void {
-	if (!computation) return;
-	TimelineInterval.group(computation, session);
-	recordProcessDependency(session, { computation, owned: true, shared: [computation] }, pid);
 }
 
 function nativeLearningSlot(observation: NativeObservation, duration: number, key: string | undefined, limit: number): number | false | undefined {
@@ -2756,11 +2734,6 @@ function parseDispatcherRequest(body: string): DispatcherRequest | undefined {
 	}
 }
 
-function materializeDispatcherRequest(session: ActiveSession, request: DispatcherRequest): DispatcherRequest | undefined {
-	const cwd = session.projection.toPhysical(request.cwd);
-	return cwd ? { ...request, cwd } : undefined;
-}
-
 async function eligibleRequest(session: ActiveSession, request: DispatcherRequest, expectedContext: ProcessExecutionContext): Promise<RequestEligibility> {
 	if (!validProcessContext(request.context)) return { reason: "process_context_unsupported" };
 	if (!pathContains(session.workspace.sandboxRoot, request.cwd)) return { reason: "cwd_outside_workspace" };
@@ -2825,8 +2798,6 @@ function exitOutcome(outcome: SpawnOutcome): ExitOutcome {
 	if (!outcome.signal) return { kind: "code", code: outcome.code ?? 125 };
 	return { kind: "signal", signal: os.constants.signals[outcome.signal] ?? 9, coreDumped: false };
 }
-
-function randomToken(): string { return randomBytes(32).toString("hex"); }
 
 function assertInvocationMatches(invocation: ToolProcessInvocation, request: ProcessExecutionRequest): void {
 	if (request.command !== invocation.command) throw new Error("process command differs from the action execution context");

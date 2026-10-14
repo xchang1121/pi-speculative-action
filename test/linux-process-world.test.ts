@@ -497,16 +497,14 @@ int main(void) { int fds[2]; if (${mode === "eventfd" ? "(fds[0] = eventfd(0, 0)
 		await fixture.workspaceSandbox.withWorkspace(fixture.workspace, async workspace => {
 			const session = await fixture.backend.open({ sourceRoot: fixture.workspace, workspace, invocation, scope });
 			const starting = gated(), frontier = gated(), controller = new AbortController();
-			const acquire = handoffs.acquire.bind(handoffs), observe = handoffs.observeRunning.bind(handoffs), wait = scheduling.waitForCompletion;
-			let completion: Promise<void> | undefined, joins = 0, cancelled: Promise<unknown> | undefined;
+			const acquire = handoffs.acquire.bind(handoffs), observe = handoffs.observeRunning.bind(handoffs);
+			let joins = 0, cancelled: Promise<unknown> | undefined;
 			const admissions: Array<{ syscall: number; accepted: boolean | undefined }> = [];
 			using _acquiring = vi.spyOn(handoffs, "acquire").mockImplementation(async request => {
+				if (mode === "sample" && request.role === "actor") starting.release();
 				const result = await acquire(request);
-				if (mode === "sample" && result.kind === "work") { completion = result.work.completion; await starting.wait(); }
+				if (mode === "sample" && result.kind === "work") await starting.wait();
 				return result;
-			});
-			using _joining = vi.spyOn(scheduling, "waitForCompletion").mockImplementation((promise, signal, timeout) => {
-				if (promise === completion) starting.release(); return wait(promise, signal, timeout);
 			});
 			using _observing = vi.spyOn(handoffs, "observeRunning").mockImplementation((key, work, invoke) => observe(key, work, async () => {
 				if (mode === "threads" && ++joins === 2) { controller.abort(); frontier.release(); } return invoke();

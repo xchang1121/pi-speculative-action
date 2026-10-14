@@ -1,9 +1,9 @@
 import { snapshotExecutionScope, type ExecutionScope, type ExecutionOperationAdoption } from "./execution-world.ts";
 import { EffectCommitFailure, effectCommitFailure } from "./effect-transaction.ts";
-import { referencedArtifacts, type ArtifactReference, type ProcessProvenanceCertificate, type Sha256Digest } from "./provenance-certificate.ts";
+import { referencedArtifacts, type ProcessProvenanceCertificate, type Sha256Digest } from "./provenance-certificate.ts";
 import type { ProvenanceCertificateStore, VerifiedArtifactClosure } from "./reuse-store.ts";
 import { immutableSnapshot, isImmutableSnapshot, stableEqual } from "./stable-json.ts";
-import { TimelineInterval, type SerializedTimelineComputation } from "./task-timing.ts";
+import { TimelineInterval } from "./task-timing.ts";
 import { waitForCompletion } from "./scheduler.ts";
 
 /** One-shot children and their enclosing branch share adoption authority. */
@@ -14,8 +14,11 @@ export class ProcessHandoffOwnership {
 	private committing?: Promise<unknown>;
 	private readonly observer?: WeakRef<(adoption: ExecutionOperationAdoption) => void>;
 	private readonly scopeOwner?: WeakRef<(scope: ExecutionScope, salvage?: boolean) => boolean>;
+	private readonly consumer?: ExecutionScope;
 
-	constructor(observer?: (adoption: ExecutionOperationAdoption) => void, acceptScope?: (scope: ExecutionScope, salvage?: boolean) => boolean) {
+	constructor(observer?: (adoption: ExecutionOperationAdoption) => void, acceptScope?: (scope: ExecutionScope, salvage?: boolean) => boolean,
+		consumer?: ExecutionScope) {
+		this.consumer = snapshotExecutionScope(consumer);
 		if (observer) this.observer = new WeakRef(observer);
 		if (acceptScope) this.scopeOwner = new WeakRef(acceptScope);
 	}
@@ -23,6 +26,7 @@ export class ProcessHandoffOwnership {
 	/** A live owner may transfer this computation beyond its production turn; age grants no reuse authority. */
 	acceptsScope(producer: ExecutionScope | undefined, consumer: ExecutionScope | undefined, salvage = false): boolean {
 		if (!producer || !consumer || producer.sessionID !== consumer.sessionID) return false;
+		if (this.consumer) return sameScope(this.consumer, consumer) && this.consumer.callID === consumer.callID;
 		return sameScope(producer, consumer) || this.scopeOwner?.deref()?.(consumer, salvage) === true;
 	}
 
@@ -82,28 +86,14 @@ type HandoffState =
 	| { readonly status: "completed" | "reserved" | "retained"; readonly result?: { readonly candidate: ProcessProvenanceCertificate; readonly artifacts: VerifiedArtifactClosure;
 		readonly bytes: number; readonly computation: TimelineInterval; readonly continuation?: ProcessContinuation } };
 
-interface HandoffRecord extends ProcessHandoff {
-	borrowers: number;
-	readonly controller: AbortController;
-	readonly key: Sha256Digest;
-	state: HandoffState;
-	binding?: ProcessExecutionBinding;
-	readonly executablePath: string;
-	readonly settle: () => void;
-	readonly continuation?: ProcessContinuation;
-	/** A worker's reservation remains observable even if its result message is lost. */
-	claimState?: Int32Array;
-}
+type HandoffRecord = ReturnType<ProcessHandoffRegistry["reserve"]>;
 
 export interface ProcessHandoffTransfer {
-	readonly claims: SharedArrayBuffer;
-	readonly results: readonly {
-		readonly key: Sha256Digest; readonly executablePath: string; readonly scope?: ExecutionScope;
-		readonly candidate: ProcessProvenanceCertificate; readonly bytes: number; readonly computation: SerializedTimelineComputation;
-		readonly artifacts: readonly { readonly reference: ArtifactReference; readonly bytes: Uint8Array }[];
-		readonly continuation?: { readonly image: Uint8Array; readonly physicalRoot: string; readonly computation: SerializedTimelineComputation };
-	}[];
+	readonly results: Readonly<ReturnType<ProcessHandoffRegistry["lend"]>["transfer"]["results"]>;
 }
+
+export type ProcessHandoffBorrow = (key: Sha256Digest, excluded: ReadonlySet<Sha256Digest>, signal?: AbortSignal) =>
+	Promise<{ readonly records: readonly ProcessHandoff[]; readonly joined: boolean } | undefined>;
 
 export type ProcessHandoffAcquisition<Plan> =
 	| { readonly kind: "hit"; readonly plan: Plan; readonly joined: boolean; readonly producer?: ProcessHandoff; readonly continuation?: ProcessContinuation;
@@ -123,6 +113,8 @@ type AcquireOptions<Plan> = {
 	readonly scope?: ExecutionScope;
 	readonly signal?: AbortSignal;
 	readonly lookup: ProcessHandoffLookup<Plan>;
+	readonly borrow?: ProcessHandoffBorrow;
+	readonly excludeHandoff?: (handoff: ProcessHandoff) => boolean;
 } & (
 	| { readonly role: "producer"; readonly ownership: ProcessHandoffOwnership; readonly executablePath: string }
 	| { readonly role: "actor" }
@@ -131,7 +123,7 @@ type AcquireOptions<Plan> = {
 /** Owns process evidence selection and the scope of one-shot transfers. */
 export class ProcessHandoffRegistry<Invocation = never> {
 	private readonly byKey = new Map<Sha256Digest, Map<ProcessHandoff, HandoffRecord>>();
-	private readonly waiters = new Map<Sha256Digest, Set<AbortController>>();
+	private readonly waiters = new Map<Sha256Digest, Set<() => void>>();
 	private readonly invocations = new WeakMap<ProcessExecutionBinding, { readonly value: Invocation; readonly bytes: number; executionMs: number }>();
 	private readonly store: ProvenanceCertificateStore;
 	private maxCompleted: number;
@@ -243,68 +235,66 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		const waits: { readonly handoff: ProcessHandoff; readonly interval: TimelineInterval }[] = [];
 		const borrowed = new Set<HandoffRecord>();
 		const retain = (record: HandoffRecord) => { if (!borrowed.has(record)) { borrowed.add(record); record.borrowers++; } };
+		const considered = new Map<HandoffRecord, Sha256Digest>();
+		let changed = new AbortController(), historyChecked = false;
+		const wake = () => changed.abort(), waiters = this.waiters.get(request.key) ?? new Set<() => void>();
+		waiters.add(wake); this.waiters.set(request.key, waiters);
 		try {
-			while (true) {
-				if (this.disposed || request.signal?.aborted) return { kind: "miss", joined: waits.length > 0 };
-				// Observe before any asynchronous lookup; negative evidence belongs only to this unchanged pass.
-				const changed = new AbortController(), waiters = this.waiters.get(request.key) ?? new Set<AbortController>();
-				waiters.add(changed); this.waiters.set(request.key, waiters);
+			while (!this.disposed && !request.signal?.aborted) {
+				// One subscription spans the lookup; a change invalidates only this pass's negative evidence.
+				if (changed.signal.aborted) { changed = new AbortController(); historyChecked = false; considered.clear(); }
 				const stop = request.signal ? AbortSignal.any([changed.signal, request.signal]) : changed.signal;
-				const considered = new Map<HandoffRecord, Sha256Digest>();
-				let historyChecked = false;
-				try {
-					while (!stop.aborted) {
-						const records = [...this.byKey.get(request.key)?.values() ?? []];
-						const completed = [...records].reverse().flatMap((record) => {
-							const state = record.state;
-							if (state.status !== "completed" || !state.result || considered.has(record)) return [];
-							const { candidate, artifacts } = state.result, oneShot = oneShotResult(candidate);
-							return oneShot && !this.accepts(record, scope, request.role === "actor")
-								? [] : [{ record, state, candidate, artifacts, oneShot }];
-						});
-						if (completed.length || !historyChecked) {
-							historyChecked ||= !completed.length;
-							for (const { record } of completed) retain(record);
-							const plan = completed.length
-								? await request.lookup(completed.map(({ candidate }) => candidate), undefined, new Map(completed.map(({ candidate, artifacts }) => [candidate.id, artifacts])))
-								: await request.lookup(undefined, new Set(considered.values()));
-							if (this.disposed || request.signal?.aborted) return { kind: "miss", joined: waits.length > 0 };
-							if (plan && !completed.length) return { kind: "hit", plan, joined: waits.length > 0 };
-							const selected = completed.find(({ candidate }) => candidate === plan?.certificate);
-							if (!selected) for (const { record, candidate } of completed) considered.set(record, candidate.id);
-							if (plan && selected && selected.record.state === selected.state && this.byKey.get(request.key)?.has(selected.record)) {
-								const { record, oneShot } = selected;
-								const settle = this.claim(record, oneShot, request.role === "producer" ? request : undefined, scope);
-								if (!settle) { considered.set(record, selected.candidate.id); continue; }
-								return { kind: "hit", plan, joined: waits.length > 0, producer: record, continuation: record.continuation,
-									waiting: waits.filter(wait => wait.handoff === record).map(wait => wait.interval), settle };
-							}
-							continue;
-						}
-						if (request.role === "producer") return { kind: "work", work: this.reserve(request.key, request.executablePath, request.ownership, scope), joined: waits.length > 0 };
-						// Each producer advances independently; readiness never grants transfer authority.
-						await Promise.allSettled(records.filter(record => record.ownership.acceptsScope(record.scope, scope, true) &&
-							(record.state.status === "running" || record.state.status === "reserved" || record.ownership.pendingWhole)).map(async record => {
-							retain(record);
-							const running = record.state.status === "running", startedAt = performance.now();
-							if (running) {
-								const advanced = await waitForCompletion(record.advance?.() ?? Promise.resolve(true), stop);
-								if (advanced.status === "completed" && !advanced.value) return;
-							}
-							await waitForCompletion(running ? record.completion :
-								record.ownership.pendingWhole?.then(() => {}, () => {}) ?? new Promise<never>(() => {}), stop);
-							waits.push({ handoff: record, interval: new TimelineInterval(startedAt, performance.now()) });
-							changed.abort();
-						}));
-						if (!stop.aborted) return { kind: "miss", joined: waits.length > 0 };
-						break;
+				const records = [...this.byKey.get(request.key)?.values() ?? []].filter(record => !request.excludeHandoff?.(record));
+				const completed = [...records].reverse().flatMap((record) => {
+					const state = record.state;
+					if (state.status !== "completed" || !state.result || considered.has(record)) return [];
+					const { candidate, artifacts } = state.result, oneShot = oneShotResult(candidate);
+					return oneShot && !this.accepts(record, scope, request.role === "actor")
+						? [] : [{ record, state, candidate, artifacts, oneShot }];
+				});
+				if (completed.length || !historyChecked) {
+					historyChecked ||= !completed.length;
+					for (const { record } of completed) retain(record);
+					const plan = completed.length
+						? await request.lookup(completed.map(({ candidate }) => candidate), undefined, new Map(completed.map(({ candidate, artifacts }) => [candidate.id, artifacts])))
+						: await request.lookup(undefined, new Set(considered.values()));
+					if (this.disposed || request.signal?.aborted) break;
+					if (plan && !completed.length) return { kind: "hit", plan, joined: waits.length > 0 };
+					const selected = completed.find(({ candidate }) => candidate === plan?.certificate);
+					if (!selected) for (const { record, candidate } of completed) considered.set(record, candidate.id);
+					if (plan && selected && selected.record.state === selected.state && this.byKey.get(request.key)?.has(selected.record)) {
+						const { record, oneShot } = selected;
+						const settle = this.claim(record, oneShot, request.role === "producer" ? request : undefined, scope);
+						if (!settle) { considered.set(record, selected.candidate.id); continue; }
+						return { kind: "hit", plan, joined: waits.length > 0, producer: record, continuation: record.continuation,
+							waiting: waits.filter(wait => wait.handoff === record).map(wait => wait.interval), settle };
 					}
-				} finally {
-					waiters.delete(changed); if (!waiters.size) this.waiters.delete(request.key);
-					changed.abort();
+					continue;
 				}
+				if (request.role === "producer") return { kind: "work", work: this.reserve(request.key, request.executablePath, request.ownership, scope), joined: waits.length > 0 };
+				// Each producer advances independently; readiness never grants transfer authority.
+				await Promise.allSettled([...records.filter(record => record.ownership.acceptsScope(record.scope, scope, true) &&
+					(record.state.status === "running" || record.state.status === "reserved" || record.ownership.pendingWhole)).map(async record => {
+					retain(record);
+					const running = record.state.status === "running", startedAt = performance.now();
+					const ready = running ? (record.advance?.() ?? Promise.resolve(true)).then(advanced => advanced && record.completion.then(() => true))
+						: record.ownership.pendingWhole?.then(() => true, () => true) ?? new Promise<never>(() => {});
+					const advanced = await waitForCompletion(ready, stop);
+					if (advanced.status === "completed" && !advanced.value) return;
+					waits.push({ handoff: record, interval: new TimelineInterval(startedAt, performance.now()) });
+					changed.abort();
+				}), ...(request.borrow ? [(async () => {
+					const startedAt = performance.now(), imported = await request.borrow!(request.key, new Set(considered.values()), stop);
+					if (imported?.joined) for (const handoff of imported.records) waits.push({ handoff, interval: new TimelineInterval(startedAt, performance.now()) });
+					if (imported?.records.length) changed.abort();
+				})()] : [])]);
+				if (!stop.aborted) break;
 			}
-		} finally { for (const record of borrowed) record.borrowers--; this.trim(); }
+			return { kind: "miss", joined: waits.length > 0 };
+		} finally {
+			waiters.delete(wake); if (!waiters.size) this.waiters.delete(request.key); changed.abort();
+			for (const record of borrowed) record.borrowers--; this.trim();
+		}
 	}
 
 	private accepts(record: HandoffRecord, scope: ExecutionScope | undefined, salvage: boolean): boolean {
@@ -317,6 +307,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		if (state.status !== "completed") return;
 		const claim = oneShot ? record.ownership.claimChild() : undefined;
 		if (oneShot && !claim) return;
+		if (oneShot && record.claimState && Atomics.compareExchange(record.claimState, 0, 0, 1) !== 0) { claim?.(false); return; }
 		if (oneShot) record.state = { ...state, status: "reserved" };
 		record.borrowers++;
 		if (record.claimState) Atomics.compareExchange(record.claimState, 0, 0, 1);
@@ -339,38 +330,53 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		};
 	}
 
-	/** Loan only completed evidence; the original owner remains claimed until the caller can run again. */
+	/** One lending lifetime owns initial evidence and later publications until the caller settles it. */
 	lend(scope?: ExecutionScope) {
-		const results: ProcessHandoffTransfer["results"][number][] = [], records: HandoffRecord[] = [], settlements: ((consumed: boolean) => void)[] = [];
-		let claims: Int32Array | undefined;
-		const settle = () => settlements.forEach((release, index) => release(!!claims && Atomics.load(claims, index) !== 0));
+		const loans: { readonly record: HandoffRecord; readonly release: (consumed: boolean) => void; readonly claims: Int32Array }[] = [];
+		const lifetime = new AbortController();
+		const settle = () => { lifetime.abort(); for (const { release, claims } of loans) release(Atomics.load(claims, 0) !== 0); };
+		const offer = (record: HandoffRecord) => {
+			const state = record.state, result = state.status === "completed" ? state.result : undefined;
+			if (!result || oneShotResult(result.candidate) && !this.accepts(record, scope, true)) return;
+			const computation = TimelineInterval.serialize(result.computation), continuation = result.continuation;
+			const resumed = continuation && TimelineInterval.serialize(continuation.computation);
+			if (!computation || continuation && !resumed) return;
+			const id = loans.length, claims = new Int32Array(new SharedArrayBuffer(4));
+			const transferred = { id, claims: claims.buffer as SharedArrayBuffer, key: record.key, executablePath: record.executablePath, scope: record.scope,
+				candidate: result.candidate, bytes: result.bytes, computation,
+				artifacts: Object.freeze([...new Map(referencedArtifacts(result.candidate).map(reference => [reference.digest, reference])).values()]
+					.map(reference => ({ reference, bytes: new Uint8Array(result.artifacts.read(reference)) } as const))),
+				...(continuation ? { continuation: { image: new Uint8Array(continuation.image), physicalRoot: continuation.physicalRoot, computation: resumed! } as const } : {}) } as const;
+			const release = this.claim(record, oneShotResult(result.candidate));
+			if (!release) return;
+			loans.push({ record, release, claims }); return transferred;
+		};
 		try {
-			for (const record of this.records()) {
-				const state = record.state, result = state.status === "completed" ? state.result : undefined;
-				if (!result || oneShotResult(result.candidate) && !this.accepts(record, scope, true)) continue;
-				const computation = TimelineInterval.serialize(result.computation), continuation = result.continuation;
-				const resumed = continuation && TimelineInterval.serialize(continuation.computation);
-				if (!computation || continuation && !resumed) continue;
-				const release = this.claim(record, oneShotResult(result.candidate));
-				if (!release) continue;
-				settlements.push(release); records.push(record);
-				results.push({ key: record.key, executablePath: record.executablePath, scope: record.scope,
-					candidate: result.candidate, bytes: result.bytes, computation,
-					artifacts: [...new Map(referencedArtifacts(result.candidate).map(reference => [reference.digest, reference])).values()]
-						.map(reference => ({ reference, bytes: new Uint8Array(result.artifacts.read(reference)) })),
-					...(continuation ? { continuation: { image: new Uint8Array(continuation.image), physicalRoot: continuation.physicalRoot, computation: resumed! } } : {}) });
-			}
-			claims = new Int32Array(new SharedArrayBuffer(results.length * 4));
-			return { transfer: { results, claims: claims.buffer as SharedArrayBuffer }, settle, binding: (index: number) => records[index]?.binding,
-				adopted: (index: number, adoption: ExecutionOperationAdoption) => records[index]?.ownership.adopted(adoption) };
+			const results = [...this.records()].flatMap(record => offer(record) ?? []);
+			return { transfer: { results }, settle, binding: (index: number) => loans[index]?.record.binding,
+				adopted: (index: number, adoption: ExecutionOperationAdoption) => loans[index]?.record.ownership.adopted(adoption),
+				claimed: () => loans.some(({ claims }) => Atomics.load(claims, 0) !== 0),
+				borrow: async (key: Sha256Digest, excluded: ReadonlySet<Sha256Digest>, signal?: AbortSignal) => {
+					if (lifetime.signal.aborted || signal?.aborted) return;
+					const acquired = await this.acquire({ key, scope, signal: signal ? AbortSignal.any([signal, lifetime.signal]) : lifetime.signal, role: "actor",
+						excludeHandoff: handoff => loans.some(({ record }) => record === handoff), lookup: async candidates => {
+						const certificate = candidates?.find(candidate => !excluded.has(candidate.id)); return certificate && { certificate };
+					} });
+					if (acquired.kind !== "hit" || !acquired.producer) return;
+					acquired.settle?.(false);
+					if (lifetime.signal.aborted || signal?.aborted) return;
+					const record = this.byKey.get(key)?.get(acquired.producer), result = record && offer(record);
+					return result ? { transfer: { results: [result] }, joined: acquired.joined } : undefined;
+				} };
 		} catch (error) { settle(); throw error; }
 	}
 
 	/** Revalidate transferred bytes through the same artifact loader; a copy never extends its loan's scope. */
 	async receive(transfer: ProcessHandoffTransfer, scope: ExecutionScope | undefined,
-		adopted: (index: number, adoption: ExecutionOperationAdoption) => void): Promise<() => void> {
+		adopted: (index: number, adoption: ExecutionOperationAdoption) => void) {
 		const callbacks: object[] = [], received: HandoffRecord[] = [];
-		for (const [index, result] of transfer.results.entries()) {
+		const close = () => { callbacks.length = 0; for (const record of received) this.remove(record); };
+		try { for (const result of transfer.results) {
 			const computation = TimelineInterval.restore(result.computation), resumed = result.continuation && TimelineInterval.restore(result.continuation.computation);
 			if (!computation || result.continuation && !resumed) continue;
 			const images = new Map(result.artifacts.map(({ reference, bytes }) => [reference.digest, Buffer.from(bytes)]));
@@ -379,16 +385,14 @@ export class ProcessHandoffRegistry<Invocation = never> {
 				read: reference => Buffer.from(images.get(reference.digest) ?? []),
 			});
 			if (!artifacts) continue;
-			const observe = (adoption: ExecutionOperationAdoption) => adopted(index, adoption);
-			const accept = (consumer: ExecutionScope) => sameScope(scope, consumer) && scope?.callID === consumer.callID;
-			callbacks.push(observe, accept);
-			const record = this.reserve(result.key, result.executablePath, new ProcessHandoffOwnership(observe, accept), result.scope);
+			const observe = (adoption: ExecutionOperationAdoption) => adopted(result.id, adoption);
+			callbacks.push(observe);
+			const record = this.reserve(result.key, result.executablePath, new ProcessHandoffOwnership(observe, undefined, scope), result.scope);
 			received.push(record);
-			record.claimState = new Int32Array(transfer.claims, index * 4, 1);
+			record.claimState = new Int32Array(result.claims);
 			this.complete(result.key, record, { candidate: result.candidate, artifacts, bytes: result.bytes, computation,
 				...(result.continuation ? { continuation: { ...result.continuation, image: Buffer.from(result.continuation.image), computation: resumed! } } : {}) });
-		}
-		return () => { callbacks.length = 0; for (const record of received) this.remove(record); };
+		} return Object.assign(close, { records: received }); } catch (error) { close(); throw error; }
 	}
 
 	/** Seal owned bytes before visibility; disk maintenance and persistence cannot revoke a live result. */
@@ -432,17 +436,20 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		this.completedCount = 0;
 	}
 
-	private reserve(key: Sha256Digest, executablePath: string, ownership: ProcessHandoffOwnership, scope?: ExecutionScope): HandoffRecord {
+	private reserve(key: Sha256Digest, executablePath: string, ownership: ProcessHandoffOwnership, scope?: ExecutionScope) {
 		if (this.disposed) throw new Error("process handoff registry is disposed");
 		let settle!: () => void;
 		const completion = new Promise<void>((resolve) => { settle = resolve; });
-		const controller = new AbortController();
-		const record: HandoffRecord = {
-			key, completion, executablePath, scope, ownership, settle, startedAt: performance.now(), state: { status: "running" },
-			controller, signal: controller.signal, borrowers: 0,
-			get advance() { return record.state.status === "running" ? record.state.advance : undefined; },
-			get computation() { return record.state.status !== "running" ? record.state.result?.computation : undefined; },
-			get continuation() { return record.state.status !== "running" ? record.state.result?.continuation : undefined; },
+		const controller: AbortController = new AbortController();
+		const record = {
+			key, completion, executablePath, scope, ownership, settle, startedAt: performance.now(), state: { status: "running" } as HandoffState,
+			controller, signal: controller.signal as AbortSignal, borrowers: 0,
+			binding: undefined as ProcessExecutionBinding | undefined,
+			// A worker's reservation remains observable even if its result message is lost.
+			claimState: undefined as Int32Array | undefined,
+			get advance(): ProcessHandoff["advance"] { return record.state.status === "running" ? record.state.advance : undefined; },
+			get computation(): TimelineInterval | undefined { return record.state.status !== "running" ? record.state.result?.computation : undefined; },
+			get continuation(): ProcessContinuation | undefined { return record.state.status !== "running" ? record.state.result?.continuation : undefined; },
 		};
 		const records = this.byKey.get(key) ?? new Map();
 		records.set(record, record);
@@ -451,7 +458,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 	}
 
 	private *records(): IterableIterator<HandoffRecord> { for (const records of this.byKey.values()) yield* records.values(); }
-	private wake(key: Sha256Digest): void { for (const waiter of this.waiters.get(key) ?? []) waiter.abort(); }
+	private wake(key: Sha256Digest): void { for (const waiter of this.waiters.get(key) ?? []) waiter(); }
 
 	private remove(record: HandoffRecord): void {
 		this.releaseResult(record);
@@ -476,6 +483,8 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		if (record.state.status !== "running") { this.retainedBytes -= record.state.result?.bytes ?? 0; record.state = { status: "retained" }; }
 	}
 }
+
+export type ProcessHandoffLender = ReturnType<ProcessHandoffRegistry["lend"]>["borrow"];
 
 export function sameScope(left: ExecutionScope | undefined, right: ExecutionScope | undefined): boolean {
 	return Boolean(left && right && left.sessionID === right.sessionID && left.turnID === right.turnID);

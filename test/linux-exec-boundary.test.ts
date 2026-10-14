@@ -1,8 +1,9 @@
-import { onExit } from "./async.ts";
+import { disposable, onExit } from "./async.ts";
 import { lstat, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { expect } from "vitest";
 import { PROCESS_CERTIFICATE } from "./process-fixture.ts";
+import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { cHeaders, commitBenchmarkFixture, compileBenchmarkHelper, processTest,
 	executeProcess, forkReusableBash, holdOwnedProcessPublication, metricDelta, prepareLinuxProcessReuse, textOutput } from "./linux-process-fixture.ts";
 
@@ -99,6 +100,7 @@ int main(int argc, char **argv) {
 	];
 	for (const scenario of cases) {
 		const before = backend.metrics();
+		const ownerBefore = await fixture.inOwner(state => state.backend.metrics());
 		const older = scenario.name === "running" ? await produce(`: earlier-input; ${scenario.command}`) : undefined;
 		if (older) await writeFile(path.join(workspace, "input.txt"), "changed while waiting\n");
 		const publication = older ? await holdOwnedProcessPublication(fixture, 1500, () => writeFile(path.join(workspace, "input.txt"), "before\n")) : undefined;
@@ -107,7 +109,7 @@ int main(int argc, char **argv) {
 		for (const phase of scenario.name === "foreign" ? ["running", "completed"] : [publication ? "running" : "completed"]) {
 			if (phase === "running") {
 				if (publication) await expect.poll(publication.reached, { timeout: 5000 }).toBe(true);
-				else await expect.poll(() => fixture.inOwner(state => state.backend.metrics().misses as number)).toBeGreaterThan(before.misses);
+				else await expect.poll(() => fixture.inOwner(state => state.backend.metrics().misses as number)).toBeGreaterThan(ownerBefore.misses);
 			} else {
 				const branch = await pending, produced = metricDelta(before, backend.metrics());
 				if (["disposed", "completed", "security"].includes(scenario.name)) {
@@ -138,7 +140,12 @@ int main(int argc, char **argv) {
 				finally { await fixture.inOwner(state => state.deciding.mock.restore()); }
 				await rm(path.join(workspace, scenario.file!));
 			}
-			const result = await actor(`printf 'actor-parent\\n'; ${scenario.command}`, scenario.name === "foreign" ? "later" : "benchmark", scenario.name !== "descriptor");
+			const consume = () => actor(`printf 'actor-parent\\n'; ${scenario.command}`, scenario.name === "foreign" ? "later" : "benchmark", scenario.name !== "descriptor");
+			const result = ["completed", "running"].includes(scenario.name) ? await fixture.workspaceSandbox.withWorkspace(workspace, async privateWorkspace => {
+				const invocation = resolvePiToolInvocation("bash", { command: "/bin/true" }, { cwd: workspace, environment: fixture.environment, shellPath: fixture.shellPath })!.process!;
+				await using local = disposable(await backend.open({ sourceRoot: workspace, workspace: privateWorkspace, invocation, scope: { sessionID: "benchmark", turnID: "benchmark" } }));
+				expect((await executeProcess(fixture, local.executor, "/bin/true")).exitCode).toBe(0); return await consume();
+			}) : await consume();
 			if (publication) expect(await publication.joined()).toBe(true);
 			expect(result.output, scenario.name).toBe(`actor-parent\n${scenario.expected}`);
 			if (scenario.file) expect(await readFile(path.join(workspace, scenario.file), "utf8"))

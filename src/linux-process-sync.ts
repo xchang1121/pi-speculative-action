@@ -2,7 +2,7 @@ import { AsyncResource } from "node:async_hooks";
 import { MessageChannel, type MessagePort, type Transferable, Worker, isMainThread, parentPort, receiveMessageOnPort, workerData } from "node:worker_threads";
 import { TimelineInterval, type ComputationProducer, type SerializedTimelineComputation, type TimelineDependency } from "./task-timing.ts";
 import { emptyWorldReuseMetrics, type ExecutionOperationAdoption, type ExecutionScope, type WorldReuseMetrics } from "./execution-world.ts";
-import type { ProcessHandoffOwnership, ProcessHandoffTransfer } from "./process-handoff.ts";
+import type { ProcessHandoffOwnership, ProcessHandoffTransfer, ProcessHandoffLender } from "./process-handoff.ts";
 import type { LinuxProcessBackendOptions, LinuxProcessSession, NativeProcessInvocation } from "./linux-process-backend.ts";
 import { EffectCommitFailure, effectCommitFailure } from "./effect-transaction.ts";
 import type { CapturedFilesystemTransfer } from "./filesystem-evidence.ts";
@@ -24,6 +24,7 @@ export interface SynchronousProcessRequest {
 	readonly claims: SharedArrayBuffer;
 	readonly ordering?: SharedArrayBuffer;
 	readonly asynchronous?: true;
+	readonly lender?: SharedArrayBuffer;
 }
 export interface SerializedProcessBinding {
 	readonly sequence: number; readonly key: string; readonly executionMs: number; readonly invocation: NativeProcessInvocation; readonly scope: ExecutionScope;
@@ -136,16 +137,14 @@ export class SynchronousProcessObserver {
 	private readonly rpc: ReturnType<typeof createProcessRpc>;
 	private readonly owners = new Map<number, { readonly adopted?: WeakRef<(adoption: ExecutionOperationAdoption) => void>;
 		readonly accepts?: WeakRef<(scope: ExecutionScope, salvage?: boolean) => boolean> }>();
-	private readonly callbacks = new Map<number, () => Promise<unknown>>();
-	private readonly commits = new Map<number, WorkspaceSandboxService["commitDelta"]>();
+	private readonly callbacks = new Map<number, (method: string, args: never, context: RpcContext) => Promise<unknown>>();
 	private state: WorkerState = { live: false, metrics: emptyWorldReuseMetrics(), owners: [] };
 
 	constructor(options: LinuxProcessBackendOptions) {
 		this.worker = new Worker(new URL(import.meta.url), { workerData: { nativeProcessObserver: true, shared: this.clock.buffer, options },
 			execArgv: process.execArgv.filter(argument => !argument.startsWith("--input-type")) });
-		this.rpc = createProcessRpc(this.worker, this.clock, (method, args: { id: number; delta: SandboxExecutionDelta }) => {
-			if (method === "effects") { const commit = this.commits.get(args.id); if (!commit) throw new Error("native effect owner retired"); return commit(args.delta); }
-			const callback = this.callbacks.get(args.id); if (!callback) throw new Error("native work callback retired"); return callback();
+		this.rpc = createProcessRpc(this.worker, this.clock, (method, args: { id: number }, context) => {
+			const callback = this.callbacks.get(args.id); if (!callback) throw new Error("native work callback retired"); return callback(method, args as never, context);
 		}, undefined, state => {
 			this.state = state;
 			for (const id of this.owners.keys()) if (!this.callbacks.has(id) && !state.owners.includes(id)) this.owners.delete(id);
@@ -198,9 +197,13 @@ export class SynchronousProcessObserver {
 		finally { this.callbacks.delete(id); }
 	}
 
-	attach(request: SynchronousProcessRequest, commit?: WorkspaceSandboxService["commitDelta"]) {
+	attach(request: SynchronousProcessRequest, commit?: WorkspaceSandboxService["commitDelta"], borrow?: ProcessHandoffLender) {
 		const id = ++this.sequence;
-		if (commit) this.commits.set(id, AsyncResource.bind(commit));
+		this.callbacks.set(id, AsyncResource.bind(async (method, args: { delta: SandboxExecutionDelta; key: Parameters<ProcessHandoffLender>[0]; excluded: Parameters<ProcessHandoffLender>[1] }, context) => {
+			if (method === "effects" && commit) return commit(args.delta);
+			if (method === "borrow" && borrow) return borrow(args.key, args.excluded, context.signal);
+			throw new Error("native observation callback unavailable");
+		}));
 		const buffers = request.handoffs.results.flatMap(result => [...result.artifacts.map(artifact => artifact.bytes.buffer as ArrayBuffer),
 			...(result.continuation ? [result.continuation.image.buffer as ArrayBuffer] : [])]);
 		const pending = this.rpc.request<SynchronousProcessResult>("observe", { id, request }, undefined, undefined, request.asynchronous ? [] : buffers);
@@ -208,7 +211,7 @@ export class SynchronousProcessObserver {
 		const attached = pending.receive();
 		if (!("attached" in attached)) throw new Error("synchronous observer did not attach");
 		return { pid: attached.attached, completion: request.asynchronous ? pending.completion : undefined,
-			retire: () => this.rpc.notify("finished", id), release: () => { this.commits.delete(id); this.rpc.notify("settled", id); }, finish: () => {
+			retire: () => this.rpc.notify("finished", id), release: () => { this.callbacks.delete(id); this.rpc.notify("settled", id); }, finish: () => {
 				this.rpc.notify("finished", id); const completed = pending.receive();
 				if (!("value" in completed)) throw new Error("synchronous observation did not complete");
 				return completed.value as SynchronousProcessResult;
@@ -312,7 +315,8 @@ if (!isMainThread && workerData?.nativeProcessObserver === true) void (async () 
 			const finished = new Promise<void>(finish => { observations.set(id, { finish }); }); grants.set(id, request);
 			try {
 				const completed = await backend!.observeSynchronous(request, attached, finished,
-					request.asynchronous ? delta => rpc.call<ToolSettlement>("effects", { id, delta }) : undefined);
+					request.asynchronous ? delta => rpc.call<ToolSettlement>("effects", { id, delta }) : undefined,
+					request.asynchronous ? (key, excluded, signal) => rpc.call<Awaited<ReturnType<ProcessHandoffLender>>>("borrow", { id, key, excluded }, signal) : undefined);
 				observations.get(id)!.release = completed.release; return completed.result;
 			} finally { grants.delete(id); }
 		};
