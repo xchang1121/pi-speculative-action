@@ -43,7 +43,7 @@ import type { ToolProcessInvocation } from "./tool-settlement.ts";
 import type { ResourceValidation } from "./settlement.ts";
 import { ProcessHandoffOwnership, ProcessHandoffRegistry, sameScope, type ProcessContinuation, type ProcessExecutionBinding, type ProcessHandoff, type ProcessHandoffBorrow, type ProcessHandoffLender } from "./process-handoff.ts";
 import { SynchronousProcessObserver, serializeNativeDependency, restoreNativeDependency, type SerializedProcessBinding, type SynchronousProcessRequest, type SynchronousProcessResult } from "./linux-process-sync.ts";
-import { WorkspaceSandboxService, readSandboxDirectoryState, restoreModifiedTimes, sameSandboxState, useModifiedTimesHelper, type SandboxDirectoryChange, type SandboxFileChange,
+import { WorkspaceSandboxService, readSandboxDirectoryState, restoreModifiedTimes, sameSandboxState, useModifiedTimesHelper, type SandboxDirectoryChange,
 	type SandboxWorkspaceChange, type SandboxWorkspaceContext } from "./workspace-sandbox.ts";
 import { containsFilesystemPath as pathContains, relativeFilesystemPath, slash } from "./path-utils.ts";
 
@@ -763,16 +763,36 @@ export class LinuxProcessReuseBackend {
 			`--handoff-frontier-library=${dispatcher}.so`, "--handoff-image=/dev/null", "--", "/bin/true"])
 			.then(() => `${dispatcher}.so`, () => undefined);
 		const mountProbe = await mkdtemp(path.join(os.tmpdir(), "pi-process-view-probe-"));
-		let executionContext: ProcessExecutionContext | undefined;
+		let executionContext: ProcessExecutionContext;
 		try {
 			const logicalRoot = path.join(mountProbe, "logical");
 			const physicalRoot = path.join(mountProbe, "physical");
 			await Promise.all([mkdir(logicalRoot), mkdir(physicalRoot)]);
-			executionContext = await probeExecutionContext({ sandlock, strace, dispatcher, logicalRoot, physicalRoot });
+			await writeFile(path.join(physicalRoot, "script-position"), "#!/bin/sh\nexit 42\n", { mode: 0o700 });
+			const metadataImage = path.join(physicalRoot, "metadata.json"); await writeFile(metadataImage, "[]", { mode: 0o600 });
+			const command = straceCommand(strace, path.join(physicalRoot, "context"), [
+				sandlock,
+				...sandboxPolicyArguments(logicalRoot, [], [physicalRoot], [{ virtualPath: logicalRoot, hostPath: physicalRoot, readOnly: false }], [], path.join(physicalRoot, "private")),
+				"--metadata-image", metadataImage,
+				"--",
+				dispatcher,
+				"--exec",
+				"12",
+				"pi-context-probe",
+				dispatcher,
+				"--probe-context",
+				logicalRoot,
+				path.join(logicalRoot, "script-position"),
+			]);
+			const outcome = await runSpawn(command, { cwd: physicalRoot, environment: definedProcessEnvironment(process.env) });
+			if (outcome.signal || outcome.code !== 0) throw new Error(`process execution context probe failed${await inheritedTracer()}`);
+			const stdout = Buffer.concat(outcome.output.filter(({ fd }) => fd === 1).map(({ data }) => data)).toString();
+			const parsed = processContextFromRaw(JSON.parse(stdout) as RawProcessContext);
+			if (!validProcessContext(parsed)) throw new Error("process execution context probe returned invalid data");
+			executionContext = parsed;
 		} finally {
 			await rm(mountProbe, { recursive: true, force: true });
 		}
-		if (!executionContext) throw new Error("process execution context probe failed");
 		const observerFingerprint = OBSERVER_FINGERPRINT;
 		const fingerprint = digestObject({
 			observerFingerprint,
@@ -1128,9 +1148,23 @@ export class LinuxProcessReuseBackend {
 						};
 						stage = "artifacts";
 						await this.store.withPublication(async () => {
-							const baseResult = await captureProcessResult(this.store, outcome!, observedProcessMs,
-								[...effects.effects, ...external.changes.map(change => ({ logicalPath: slash(change.target), change }))]);
-							await descriptors!.captureFileEffects(this.store, descriptorOffsets, after, effects.complete, baseResult.journal);
+							const journal: OrderedEffectEvent[] = [];
+							for (const { logicalPath, change } of [...effects.effects, ...external.changes.map(change => ({ logicalPath: slash(change.target), change }))]) {
+								const state = async (side: "before" | "after"): Promise<WorkspaceEffectState> => {
+									if (change.kind === "directory") return change[side] ? { kind: "directory", ...directoryState(change[side]!) } : { kind: "absent" };
+									const content = change[side], mode = change[side === "before" ? "beforeMode" : "afterMode"];
+									if (content === undefined) return { kind: "absent" };
+									if (mode === undefined) throw new Error("transaction file mode is unavailable");
+									return { kind: "file", data: await this.store.artifacts.put(content), mode, ...(side === "after" && change.afterModified ? { modified: change.afterModified } : {}) };
+								};
+								journal.push({ sequence: journal.length, kind: "workspace", path: logicalPath, before: await state("before"), after: await state("after"),
+									...(change.kind !== "directory" ? { ...(change.operation ? { operation: change.operation } : {}),
+										...(change.object ? { object: change.object } : {}), ...(change.aliases ? { aliases: change.aliases } : {}) } : {}) });
+							}
+							for (const event of outcome!.output) {
+								journal.push({ sequence: journal.length, kind: "output", fd: event.fd, data: await this.store.artifacts.put(event.data) });
+							}
+							await descriptors!.captureFileEffects(this.store, descriptorOffsets, after, effects.complete, journal);
 							const transitions: NonNullable<import("./provenance-certificate.ts").ProcessResourceEffects["transitions"]>[number][] = [];
 							for (const event of observation.resourceJournal ?? []) {
 								const input = inputs.find(input => streamIdentity(descriptorOffsets!.find(position => position.fd === input.fd)!) === event.inode &&
@@ -1140,7 +1174,6 @@ export class LinuxProcessReuseBackend {
 								executedStreams.push({ alias: input.alias, kind: event.kind, data: event.data });
 								transitions.push({ id: input.alias, kind: event.kind, data: await this.store.artifacts.put(event.data), ...(event.requested !== undefined ? { requested: event.requested } : {}) });
 							}
-							const { exit, ...prefixResult } = baseResult;
 							// A transferred prefix includes producing its proof and sealed image; the separate native frontier is unchanged.
 							const computation = TimelineInterval.current(work.startedAt, performance.now(), [
 								...(preparation ? [{ computation: preparation, owned: true, shared: [preparation] }] : []),
@@ -1151,7 +1184,7 @@ export class LinuxProcessReuseBackend {
 							]);
 							TimelineInterval.group(computation, session);
 							recordProcessDependency(session, { computation, owned: true, shared: [computation] }, inPlace);
-							const result: ProcessResultRecord = { ...prefixResult, ...(continuation ? { continuation: { imageDigest: sha256Digest(continuation.image), imageBytes: continuation.image.length } } : { exit: exit! }),
+							const result: ProcessResultRecord = { replayProfile: "buffered_noninteractive", observedProcessMs, journal, ...(continuation ? { continuation: { imageDigest: sha256Digest(continuation.image), imageBytes: continuation.image.length } } : { exit: exitOutcome(outcome!) }),
 								computation: TimelineInterval.serialize(computation),
 								...(descriptorOffsets ? { resources: { ...descriptorEffects(request.resources!, descriptorOffsets), ...(resourceJournal ? { transitions } : {}) } } : {}) };
 							stage = "certificate";
@@ -2326,34 +2359,6 @@ async function privateReplay(storage: string, changes: readonly SandboxWorkspace
 	}
 }
 
-/** Whole commands and held children publish the same ordered, content-addressed result format. */
-async function captureProcessResult(
-	store: ProvenanceCertificateStore,
-	outcome: SpawnOutcome,
-	observedProcessMs: number,
-	effects: readonly { readonly logicalPath: string; readonly change:
-		| Pick<SandboxFileChange, "kind" | "before" | "after" | "beforeMode" | "afterMode" | "afterModified" | "operation" | "object" | "aliases">
-		| Pick<SandboxDirectoryChange, "kind" | "before" | "after"> }[],
-): Promise<Extract<ProcessResultRecord, { readonly exit: ExitOutcome }>> {
-	const journal: OrderedEffectEvent[] = [];
-	for (const { logicalPath, change } of effects) {
-		const state = async (side: "before" | "after"): Promise<WorkspaceEffectState> => {
-			if (change.kind === "directory") return change[side] ? { kind: "directory", ...directoryState(change[side]!) } : { kind: "absent" };
-			const content = change[side], mode = change[side === "before" ? "beforeMode" : "afterMode"];
-			if (content === undefined) return { kind: "absent" };
-			if (mode === undefined) throw new Error("transaction file mode is unavailable");
-			return { kind: "file", data: await store.artifacts.put(content), mode, ...(side === "after" && change.afterModified ? { modified: change.afterModified } : {}) };
-		};
-		journal.push({ sequence: journal.length, kind: "workspace", path: logicalPath, before: await state("before"), after: await state("after"),
-			...(change.kind !== "directory" ? { ...(change.operation ? { operation: change.operation } : {}),
-				...(change.object ? { object: change.object } : {}), ...(change.aliases ? { aliases: change.aliases } : {}) } : {}) });
-	}
-	for (const event of outcome.output) {
-		journal.push({ sequence: journal.length, kind: "output", fd: event.fd, data: await store.artifacts.put(event.data) });
-	}
-	return { replayProfile: "buffered_noninteractive", observedProcessMs, journal, exit: exitOutcome(outcome) };
-}
-
 function directoryState(state: NonNullable<SandboxDirectoryChange["before"]>): NonNullable<SandboxDirectoryChange["before"]> {
 	return { entriesDigest: state.entriesDigest, mode: state.mode, uid: state.uid, gid: state.gid };
 }
@@ -2515,37 +2520,6 @@ function sandboxMountArgument(mount: SandboxMount | ExecMount): string {
 		throw new Error(`Sandlock mount cannot represent ${mount.virtualPath}:${mount.hostPath}`);
 	}
 	return `${mount.virtualPath}:${mount.hostPath}${"readOnly" in mount ? (mount.readOnly ? ":ro" : ":rw") : ""}`;
-}
-
-async function probeExecutionContext(input: {
-	readonly sandlock: string;
-	readonly strace: string;
-	readonly dispatcher: string;
-	readonly logicalRoot: string;
-	readonly physicalRoot: string;
-}): Promise<ProcessExecutionContext> {
-	await writeFile(path.join(input.physicalRoot, "script-position"), "#!/bin/sh\nexit 42\n", { mode: 0o700 });
-	const metadataImage = path.join(input.physicalRoot, "metadata.json"); await writeFile(metadataImage, "[]", { mode: 0o600 });
-	const command = straceCommand(input.strace, path.join(input.physicalRoot, "context"), [
-		input.sandlock,
-		...sandboxPolicyArguments(input.logicalRoot, [], [input.physicalRoot], [{ virtualPath: input.logicalRoot, hostPath: input.physicalRoot, readOnly: false }], [], path.join(input.physicalRoot, "private")),
-		"--metadata-image", metadataImage,
-		"--",
-		input.dispatcher,
-		"--exec",
-		"12",
-		"pi-context-probe",
-		input.dispatcher,
-		"--probe-context",
-		input.logicalRoot,
-		path.join(input.logicalRoot, "script-position"),
-	]);
-	const outcome = await runSpawn(command, { cwd: input.physicalRoot, environment: definedProcessEnvironment(process.env) });
-	if (outcome.signal || outcome.code !== 0) throw new Error(`process execution context probe failed${await inheritedTracer()}`);
-	const stdout = Buffer.concat(outcome.output.filter(({ fd }) => fd === 1).map(({ data }) => data)).toString();
-	const parsed = processContextFromRaw(JSON.parse(stdout) as RawProcessContext);
-	if (!validProcessContext(parsed)) throw new Error("process execution context probe returned invalid data");
-	return parsed;
 }
 
 function speculativeProducerProof(ready: ReadyBackend, deniedPaths: readonly string[], policy = POLICY_ID): ProcessProducerProof {

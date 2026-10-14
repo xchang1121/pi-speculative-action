@@ -62,9 +62,9 @@ int main(int argc, char **argv) {
 	const produce = (command: string) => forkReusableBash(fixture, {
 		label: "producer", command, actionNamespace: "held-production", executionFingerprint,
 	});
-	const actor = async (command: string, turnID = "benchmark", held: boolean | "sync" = true) => {
+	const actor = async (command: string, turnID = "benchmark", held: boolean | "sync" = true, callID?: string) => {
 		const before = backend.actorMetrics();
-		const scope = { sessionID: "benchmark", turnID };
+		const scope = { sessionID: "benchmark", turnID, callID };
 		const output = held === "sync" ? await backend.observeNative(workspace, scope, undefined, async () => execFileSync(fixture.shellPath, ["-c", command],
 			{ cwd: workspace, env: { ...fixture.environment }, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }))
 			: held ? (await executeProcess(fixture, route.executor, command, { scope })).output : textOutput(await fixture.tool.execute("actor", { command }));
@@ -94,6 +94,7 @@ int main(int argc, char **argv) {
 		{ name: "disposed", command: "worker disposed.txt", expected: "worker:before\n", file: "disposed.txt", metrics: hit },
 		{ name: "completed", command: "worker completed.txt volatile", expected: "worker:before\n", file: "completed.txt", metrics: hit },
 		{ name: "competing", command: "worker competing.txt volatile", expected: "worker:before\n", file: "competing.txt", metrics: hit },
+		{ name: "competing-whole", command: "worker whole.txt volatile", expected: "worker:before\n", file: "whole.txt", metrics: miss },
 		{ name: "running", command: "worker joined.txt", expected: "worker:before\n", file: "joined.txt", metrics: { ...hit, joinedHits: 1 } },
 		{ name: "stale", command: "worker stale.txt", expected: "worker:after\n", file: "stale.txt", metrics: miss },
 		{ name: "cwd", command: "/bin/pwd", expected: `${workspace}\n`, metrics: hit },
@@ -105,12 +106,13 @@ int main(int argc, char **argv) {
 		{ name: "foreign", command: "worker late.txt volatile", expected: "worker:after\n", file: "late.txt", metrics: miss },
 	];
 	for (const scenario of cases) {
+		const competing = scenario.name.startsWith("competing");
 		const before = backend.metrics();
 		const ownerBefore = await fixture.inOwner(state => state.backend.metrics());
 		const older = scenario.name === "running" ? await produce(`: earlier-input; ${scenario.command}`) : undefined;
 		if (older) await writeFile(path.join(workspace, "input.txt"), "changed while waiting\n");
 		const publication = older ? await holdOwnedProcessPublication(fixture, () => writeFile(path.join(workspace, "input.txt"), "before\n")) : undefined;
-		const pending = produce(`: speculative-parent; ${scenario.name === "competing" ? "/bin/true" : scenario.command}`), settled = pending.catch(() => undefined);
+		const pending = produce(`: speculative-parent; ${competing ? "/bin/true" : scenario.command}`), settled = pending.catch(() => undefined);
 		await using _cleanup = onExit(async () => { await publication?.close(); await (await settled)?.dispose(); await older?.dispose(); });
 		for (const phase of scenario.name === "foreign" ? ["running", "completed"] : [publication ? "running" : "completed"]) {
 			if (phase === "running") {
@@ -146,16 +148,20 @@ int main(int argc, char **argv) {
 				finally { await fixture.inOwner(state => state.deciding.mock.restore()); }
 				await rm(path.join(workspace, scenario.file!));
 			}
-			const consume = () => actor(`printf 'actor-parent\\n'; ${scenario.command}`, scenario.name === "foreign" ? "later" : "benchmark", scenario.name === "competing" ? "sync" : scenario.name !== "descriptor");
-			const result = ["completed", "running", "competing"].includes(scenario.name) ? await fixture.workspaceSandbox.withWorkspace(workspace, async privateWorkspace => {
-				const command = scenario.name === "competing" ? `: local-parent; ${scenario.command}` : "/bin/true";
+			const consume = () => actor(`printf 'actor-parent\\n'; ${scenario.command}`, scenario.name === "foreign" ? "later" : "benchmark",
+				competing ? "sync" : scenario.name !== "descriptor", scenario.name === "competing-whole" ? "unrelated" : undefined);
+			const result = competing || ["completed", "running"].includes(scenario.name) ? await fixture.workspaceSandbox.withWorkspace(workspace, async privateWorkspace => {
+				const command = competing ? `: local-parent; ${scenario.command}` : "/bin/true";
 				const invocation = resolvePiToolInvocation("bash", { command }, { cwd: workspace, environment: fixture.environment, shellPath: fixture.shellPath })!.process!;
 				await using local = disposable(await backend.open({ sourceRoot: workspace, workspace: privateWorkspace, invocation, scope: { sessionID: "benchmark", turnID: "benchmark" } }));
 				expect((await executeProcess(fixture, local.executor, command)).exitCode).toBe(0);
-				if (scenario.name !== "competing") return await consume();
+				if (!competing) return await consume();
 				return backend.observeNative(workspace, { sessionID: "benchmark", turnID: "benchmark", callID: "unrelated" }, undefined, async () => {
 					const child = spawn("/bin/sleep", ["30"], { cwd: workspace, env: { ...fixture.environment }, stdio: "ignore" }), closed = once(child, "close");
-					try { return await consume(); } finally { child.kill(); await closed; }
+					try {
+						if (scenario.name === "competing-whole") await expect(local.ownership.commit(async () => "whole branch")).resolves.toBe("whole branch");
+						return await consume();
+					} finally { child.kill(); await closed; }
 				});
 			}) : await consume();
 			if (publication) expect(await publication.joined()).toBe(true);

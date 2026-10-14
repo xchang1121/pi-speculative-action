@@ -8,11 +8,11 @@ import { waitForCompletion } from "./scheduler.ts";
 
 const CLAIM = { available: 0, reserved: 1, consumed: 2 } as const;
 const LOAN = { closed: 1, consumed: 2, reader: 4 } as const;
+const BRANCH = { partial: 1, whole: 2, child: 4 } as const;
 
 /** One-shot children and their enclosing branch share adoption authority. */
 export class ProcessHandoffOwnership {
-	private state: "available" | "partial" | "whole" = "available";
-	private reservations = 0;
+	readonly authority: Int32Array<SharedArrayBuffer>;
 	private transfer?: { readonly apply: WeakRef<() => Promise<unknown>>; readonly result: Promise<unknown> };
 	private committing?: Promise<unknown>;
 	private readonly observer?: WeakRef<(adoption: ExecutionOperationAdoption) => void>;
@@ -20,7 +20,8 @@ export class ProcessHandoffOwnership {
 	private readonly consumer?: ExecutionScope;
 
 	constructor(observer?: (adoption: ExecutionOperationAdoption) => void, acceptScope?: (scope: ExecutionScope, salvage?: boolean) => boolean,
-		consumer?: ExecutionScope) {
+		consumer?: ExecutionScope, authority = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT)) {
+		this.authority = new Int32Array(authority);
 		this.consumer = snapshotExecutionScope(consumer);
 		if (observer) this.observer = new WeakRef(observer);
 		if (acceptScope) this.scopeOwner = new WeakRef(acceptScope);
@@ -36,24 +37,26 @@ export class ProcessHandoffOwnership {
 	/** Observational only; a retained certificate must not keep an expired runtime alive. */
 	adopted(adoption: ExecutionOperationAdoption): void { this.observer?.deref()?.(adoption); }
 
-	get wholeClaimed(): boolean { return this.state === "whole"; }
+	get wholeClaimed(): boolean { return !!(Atomics.load(this.authority, 0) & BRANCH.whole); }
 	get pendingWhole(): Promise<unknown> | undefined { return this.committing; }
 
 	claimChild(): ((consumed: boolean) => void) | undefined {
-		if (this.wholeClaimed) return;
-		this.reservations++;
+		for (let state = Atomics.load(this.authority, 0);; state = Atomics.load(this.authority, 0)) {
+			if (state & BRANCH.whole) return;
+			if (Atomics.compareExchange(this.authority, 0, state, state + BRANCH.child) === state) break;
+		}
 		let pending = true;
-		return consumed => { if (pending) { pending = false; this.reservations--; if (consumed) this.state = "partial"; } };
+		return consumed => { if (pending) { pending = false; if (consumed) Atomics.or(this.authority, 0, BRANCH.partial); Atomics.sub(this.authority, 0, BRANCH.child); } };
 	}
 
 	async commit<T>(apply: () => Promise<T>): Promise<T> {
 		if (this.transfer?.apply.deref() === apply) return this.transfer.result as Promise<T>;
-		if (this.state !== "available" || this.reservations) throw effectCommitFailure(new Error(this.state === "partial" ? "process execution was partially consumed" : "process execution was already claimed"), "recoverable");
-		this.state = "whole";
+		const state = Atomics.compareExchange(this.authority, 0, 0, BRANCH.whole);
+		if (state) throw effectCommitFailure(new Error(state & BRANCH.partial ? "process execution was partially consumed" : "process execution was already claimed"), "recoverable");
 		const result = Promise.resolve().then(apply).catch(error => {
-			if (error instanceof EffectCommitFailure && error.disposition === "recoverable") { this.state = "available"; this.transfer = undefined; }
+			if (error instanceof EffectCommitFailure && error.disposition === "recoverable") { Atomics.store(this.authority, 0, 0); this.transfer = undefined; }
 			throw error;
-		}).finally(() => { this.committing = undefined; });
+		}).finally(() => { if (this.committing === result) this.committing = undefined; });
 		this.committing = result;
 		this.transfer = { apply: new WeakRef(apply), result };
 		return result;
@@ -307,8 +310,8 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		forwardOwner?: { readonly ownership: ProcessHandoffOwnership; readonly executablePath: string }, scope?: ExecutionScope, loan?: Int32Array): ((consumed: boolean, forward?: boolean) => void) | undefined {
 		const state = record.state;
 		if (state.status !== "completed" || record.receipts.some(receipt => Atomics.load(receipt, 0) & LOAN.closed)) return;
-		const claim = oneShot ? record.ownership.claimChild() : undefined;
-		if (oneShot && !claim) return;
+		const claim = oneShot && !loan ? record.ownership.claimChild() : undefined;
+		if (oneShot && !loan && !claim) return;
 		if (oneShot && !loan && record.claimState && Atomics.compareExchange(record.claimState, 0, CLAIM.available, CLAIM.reserved) !== CLAIM.available) { claim?.(false); return; }
 		if (oneShot && !loan) record.state = { ...state, status: "reserved" };
 		record.borrowers++;
@@ -317,6 +320,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		const settle = (consumed: boolean, forward?: boolean) => {
 			if (!pending) return;
 			pending = false; claim?.(consumed); record.borrowers--;
+			if (oneShot && loan && consumed) Atomics.or(record.ownership.authority, 0, BRANCH.partial);
 			if (consumed) for (const receipt of loan ? [...record.receipts, loan] : record.receipts) Atomics.or(receipt, 0, LOAN.consumed);
 			for (const receipt of held) Atomics.sub(receipt, 0, LOAN.reader);
 			if (record.claimState && (!loan || consumed)) {
@@ -353,6 +357,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 			const id = loans.length, claims = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
 			if (oneShotResult(result.candidate)) record.claimState ??= new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
 			const transferred = { id, claims: [...record.receipts, claims].map(receipt => receipt.buffer as SharedArrayBuffer),
+				authority: record.ownership.authority.buffer,
 				reservation: record.claimState?.buffer as SharedArrayBuffer | undefined, key: record.key, executablePath: record.executablePath, scope: record.scope,
 				candidate: result.candidate, bytes: result.bytes, computation,
 				artifacts: Object.freeze([...new Map(referencedArtifacts(result.candidate).map(reference => [reference.digest, reference])).values()]
@@ -397,7 +402,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 			if (!artifacts) continue;
 			const observe = (adoption: ExecutionOperationAdoption) => adopted(result.id, adoption);
 			callbacks.push(observe);
-			const record = this.reserve(result.key, result.executablePath, new ProcessHandoffOwnership(observe, undefined, scope), result.scope);
+			const record = this.reserve(result.key, result.executablePath, new ProcessHandoffOwnership(observe, undefined, scope, result.authority), result.scope);
 			received.push(record);
 			record.claimState = result.reservation && new Int32Array(result.reservation);
 			record.receipts = result.claims.map(claims => new Int32Array(claims));

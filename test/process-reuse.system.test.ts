@@ -289,11 +289,12 @@ test.each(["existing", "new", "borrowed"])("selects a %s ready producer and reta
 });
 
 test.each(["released", "consumed", "cancelled", "raced", "whole-released", "whole-consumed", "forwarded", "forwarded-stale", "forwarded-whole", "producer-consumed", "producer-released",
-	"loan-released", "loan-consumed", "loan-lost", "loan-corrupt", "loan-stale", "loan-foreign", "loan-call", "loan-double", "loan-competing", "loan-retired", "loan-nested", "loan-nested-retired", "loan-local"])("settles a %s one-shot claim without losing another Actor's result", async outcome => {
+	"loan-released", "loan-consumed", "loan-lost", "loan-corrupt", "loan-stale", "loan-foreign", "loan-call", "loan-double", "loan-competing", "loan-retired", "loan-nested", "loan-nested-retired", "loan-local", "loan-whole", "loan-whole-raced", "loan-nested-whole"])("settles a %s one-shot claim without losing another Actor's result", async outcome => {
 	const f = await fixture({ gcIntervalMs: 0, orphanGraceMs: 0, maxBytes: 128 * 1024 }), ownership = new ProcessHandoffOwnership(), releaseWhole = hold();
 	const work = await f.reserve(ownership), certificate = await f.publish(work, "computed result", 1, true, new TimelineInterval(0, 10));
 	const binding = f.registry.bind(f.common.key, work, "learned invocation"), forward = outcome.startsWith("forwarded"), destination = new ProcessHandoffOwnership();
 	if (outcome.startsWith("loan-")) {
+		const whole = outcome.includes("whole"), raced = outcome === "loan-whole-raced";
 		const scope = outcome === "loan-foreign" ? { ...f.common.scope, sessionID: "foreign" } : f.common.scope;
 		const competing = outcome === "loan-competing" ? f.registry.lend({ ...scope, callID: "unrelated" }) : undefined;
 		const loan = f.registry.lend(scope); cleanup.push(loan.settle, () => competing?.settle());
@@ -301,7 +302,6 @@ test.each(["released", "consumed", "cancelled", "raced", "whole-released", "whol
 		expect(await loan.borrow(f.common.key, new Set())).toBeUndefined(); // A lending lifetime cannot wait for its own reservations.
 		expect(loan.binding(0)).toBe(outcome === "loan-foreign" ? undefined : binding);
 		const receiver = own(new ProcessHandoffRegistry<string>(f.store, 64 * 1024));
-		if (outcome !== "loan-foreign") await expect(ownership.commit(async () => {})).rejects.toMatchObject({ disposition: "recoverable" });
 		if (outcome.startsWith("loan-nested")) {
 			const relay = own(new ProcessHandoffRegistry<string>(f.store, 64 * 1024)); cleanup.push(await relay.receive(transfer, scope, () => {}));
 			const nested = relay.lend(scope); cleanup.push(nested.settle); transfer = structuredClone(nested.transfer);
@@ -314,20 +314,28 @@ test.each(["released", "consumed", "cancelled", "raced", "whole-released", "whol
 		const duplicate = outcome === "loan-double" ? own(new ProcessHandoffRegistry<string>(f.store, 64 * 1024)) : undefined;
 		if (duplicate) cleanup.push(await duplicate.receive(transfer, scope, () => {}));
 		expect(receiver.bindings(scope)).toEqual([]);
+		const apply = vi.fn(async () => { if (!whole) throw effectCommitFailure(new Error("unchanged effects"), "recoverable"); return "whole branch"; });
+		if (whole && !raced) await expect(ownership.commit(apply)).resolves.toBe("whole branch");
+		else if (!raced) await expect(ownership.commit(apply)).rejects.toMatchObject({ disposition: "recoverable" });
 		if (outcome.endsWith("retired")) loan.settle();
 		if (outcome === "loan-local") await f.consume(f.actor(), "computed result");
-		const result = await receiver.acquire({ ...f.common, scope: outcome === "loan-call" ? { ...scope, callID: "another-call" } : scope, role: "actor" }),
+		const result = await receiver.acquire({ ...f.common, scope: outcome === "loan-call" ? { ...scope, callID: "another-call" } : scope, role: "actor", lookup: async (...args) => {
+			const plan = await f.lookup(...args); if (raced && plan) await expect(ownership.commit(apply)).resolves.toBe("whole branch"); return plan;
+		} }),
 			accepted = ["loan-released", "loan-consumed", "loan-lost", "loan-double", "loan-competing", "loan-nested"].includes(outcome);
 		expect(result.kind).toBe(accepted ? "hit" : "miss");
 		if (result.kind === "hit") {
 			expect(f.output(result.plan)).toBe("computed result"); expect(result.producer?.computation).toBeDefined();
+			await expect(ownership.commit(async () => {})).rejects.toMatchObject({ disposition: "recoverable" });
 			if (duplicate) expect((await duplicate.acquire({ ...f.common, role: "actor" })).kind).toBe("miss");
 			competing?.settle();
 			if (outcome !== "loan-lost") result.settle?.(outcome !== "loan-released");
 		}
 		receiver.dispose(); loan.settle(); loan.settle(); // A vanished receiver cannot return its held claim as unused.
-		const used = accepted && outcome !== "loan-released" || outcome === "loan-local";
-		if (used) await expect(ownership.commit(async () => {})).rejects.toThrow("partially consumed");
+		const used = accepted && outcome !== "loan-released" || outcome === "loan-local" || whole;
+		if (whole) await expect(ownership.commit(apply)).resolves.toBe("whole branch");
+		else if (used) await expect(ownership.commit(async () => {})).rejects.toThrow("partially consumed");
+		expect(apply).toHaveBeenCalledOnce();
 		await writeFile(f.input, "current input"); await f.consume(f.actor(), used ? undefined : "computed result");
 		expect(f.registry.resolveBinding(binding!, f.common.scope)).toBe("learned invocation");
 		return;
