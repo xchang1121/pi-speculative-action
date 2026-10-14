@@ -107,7 +107,7 @@ test.skipIf(process.platform !== "linux").for(["build", "build_changed_after_pre
 	if (horizon) publication = await holdOwnedProcessPublication(fixture);
 	await step("edit", bashMutation ? "printf 'alpha\\nbeta\\n' > a.txt" : { path: "a.txt", content: "alpha\nbeta\n" }, 0);
 	if (publication) {
-		await step("detour", "printf detour", () => expect.poll(publication!.reached, { timeout: 15_000 }).toBe(true));
+		await step("detour", "printf detour", () => publication!.ready());
 		const operation = events.filter(event => event.type === "candidate").find(event => event.candidate.kind === "operation")!.candidate.id;
 		const states = () => events.filter(event => event.type === "candidate").filter(event => event.candidate.id === operation).map(event => event.state.status);
 		expect(states(), JSON.stringify(events.filter(event => event.type === "candidate" || event.type === "operation_prediction"))).toEqual(["running"]);

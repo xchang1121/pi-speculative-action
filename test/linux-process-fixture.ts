@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { MessageChannel, type Worker } from "node:worker_threads";
 import { test, type TestAPI } from "vitest";
-import { onExit } from "./async.ts";
+import { deferred, onExit } from "./async.ts";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { createBashTool, createLocalBashOperations } from "@earendil-works/pi-coding-agent";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
@@ -26,13 +26,15 @@ export function patternProcessHost(fixture: LinuxProcessBenchmark, sessionID: st
 	options: Partial<CreateSpeculativeActionHostOptions> = {}, tools = [fixture.tool]) {
 	const events: SpeculativeActionEvent<string>[] = [], patternStore = new PatternAwareStore(patternAwareSettings(settings.patternAware), undefined,
 		patternAwareActionSemantics(PI_ACTION_SEMANTICS, fixture.workspace));
+	let changed = deferred();
 	const host = createSpeculativeActionHost(sessionID, { cwd: fixture.workspace, patternStore,
 		complete: async () => { throw new Error("unexpected inference"); }, preflight: () => true, executionWorlds: [fixture.world],
 		getSettings: () => ({ enabled: true, drafterEnabled: false, tools: ["bash"], ...settings }),
 		resolveInvocation: (tool, input) => resolvePiToolInvocation(tool, input, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath }),
-		onEvent: event => { events.push(event); }, ...options,
+		...options, onEvent: event => { events.push(event); changed.resolve(); changed = deferred(); options.onEvent?.(event); },
 	});
 	return { host, events, patternStore,
+		waitFor: async (ready: () => boolean) => { while (!ready()) await changed.promise; },
 		start: (turnID: string, signal?: AbortSignal, systemPrompt = "unchanged") => host.startTurn({ turnID, tools, actorModel: testModel("actor"), actorOptions: undefined, context: { systemPrompt, messages: [], tools } }, signal),
 		call: (turnID: string, command: string) => ({ turnID, id: turnID, tool: "bash", args: { command }, tools }),
 	};
@@ -54,25 +56,25 @@ export const processTest: ReturnType<TestAPI<{ benchmark: typeof createLinuxProc
 	},
 }).skipIf(process.platform !== "linux");
 
-export async function holdOwnedProcessPublication(fixture: Pick<LinuxProcessBenchmark, "inOwner">, delayMs = 0, beforeRelease = async () => {}) {
+export async function holdOwnedProcessPublication(fixture: Pick<LinuxProcessBenchmark, "inOwner">, beforeRelease = async () => {}) {
 	await fixture.inOwner(async state => {
 		const { ProvenanceCertificateStore } = await state.load("../src/reuse-store.ts"), { ProcessHandoffRegistry } = await state.load("../src/process-handoff.ts");
-		const publication = ProvenanceCertificateStore.prototype.withPublication, observe = ProcessHandoffRegistry.prototype.observeRunning;
-		const pending = new Promise<void>(resolve => { state.release = resolve; }); state.reached = state.joined = false; state.joinedGate = state.deferred();
-		ProvenanceCertificateStore.prototype.withPublication = async function (...args: unknown[]) { state.reached = true; await pending; return publication.apply(this, args); };
-		ProcessHandoffRegistry.prototype.observeRunning = function (key: unknown, owner: any, invoke: () => Promise<boolean>) {
-			const then = owner.completion.then;
-			owner.completion.then = function (...args: unknown[]) { state.joined = true; state.joinedGate.resolve(true); return then.apply(this, args); };
-			return observe.call(this, key, owner, invoke);
+		const publication = ProvenanceCertificateStore.prototype.withPublication, acquire = ProcessHandoffRegistry.prototype.acquire;
+		const pending = state.deferred(); state.release = pending.resolve; state.reached = state.deferred(); state.joined = false; state.joinedGate = state.deferred();
+		ProvenanceCertificateStore.prototype.withPublication = async function (...args: unknown[]) { state.reached.resolve(); await pending.promise; return publication.apply(this, args); };
+		ProcessHandoffRegistry.prototype.acquire = async function (...args: unknown[]) {
+			const result = await acquire.apply(this, args), completion = result.kind === "work" ? result.work.completion : undefined;
+			if (completion) Object.defineProperty(result.work, "completion", { get: () => { state.joined = true; state.joinedGate.resolve(true); return completion; } });
+			return result;
 		};
-		state.closePublication = () => { state.joinedGate.resolve(false); state.release(); ProvenanceCertificateStore.prototype.withPublication = publication; ProcessHandoffRegistry.prototype.observeRunning = observe; };
+		state.closePublication = () => { state.joinedGate.resolve(false); state.release(); ProvenanceCertificateStore.prototype.withPublication = publication; ProcessHandoffRegistry.prototype.acquire = acquire; };
 	});
 	const joined = fixture.inOwner(state => state.joinedGate.promise as Promise<boolean>).then(async observed => {
 		if (!observed) return;
-		try { if (delayMs) await new Promise(resolve => setTimeout(resolve, delayMs)); await beforeRelease(); }
+		try { await beforeRelease(); }
 		finally { await fixture.inOwner(state => state.release()); }
 	});
-	return { reached: () => fixture.inOwner(state => state.reached as boolean), joined: () => fixture.inOwner(state => state.joined as boolean),
+	return { ready: () => fixture.inOwner(state => state.reached.promise as Promise<void>), joined: () => fixture.inOwner(state => state.joined as boolean),
 		close: async () => { await fixture.inOwner(state => state.closePublication()); await joined; } };
 }
 

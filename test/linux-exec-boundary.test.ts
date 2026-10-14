@@ -1,4 +1,6 @@
 import { disposable, onExit } from "./async.ts";
+import { execFileSync, spawn } from "node:child_process";
+import { once } from "node:events";
 import { lstat, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { expect } from "vitest";
@@ -60,9 +62,12 @@ int main(int argc, char **argv) {
 	const produce = (command: string) => forkReusableBash(fixture, {
 		label: "producer", command, actionNamespace: "held-production", executionFingerprint,
 	});
-	const actor = async (command: string, turnID = "benchmark", held = true) => {
+	const actor = async (command: string, turnID = "benchmark", held: boolean | "sync" = true) => {
 		const before = backend.actorMetrics();
-		const output = held ? (await executeProcess(fixture, route.executor, command, { scope: { sessionID: "benchmark", turnID } })).output : textOutput(await fixture.tool.execute("actor", { command }));
+		const scope = { sessionID: "benchmark", turnID };
+		const output = held === "sync" ? await backend.observeNative(workspace, scope, undefined, async () => execFileSync(fixture.shellPath, ["-c", command],
+			{ cwd: workspace, env: { ...fixture.environment }, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }))
+			: held ? (await executeProcess(fixture, route.executor, command, { scope })).output : textOutput(await fixture.tool.execute("actor", { command }));
 		return { output, metrics: metricDelta(before, backend.actorMetrics()) };
 	};
 	let discovered: Awaited<ReturnType<typeof produce>> | undefined;
@@ -88,6 +93,7 @@ int main(int argc, char **argv) {
 	const cases = [
 		{ name: "disposed", command: "worker disposed.txt", expected: "worker:before\n", file: "disposed.txt", metrics: hit },
 		{ name: "completed", command: "worker completed.txt volatile", expected: "worker:before\n", file: "completed.txt", metrics: hit },
+		{ name: "competing", command: "worker competing.txt volatile", expected: "worker:before\n", file: "competing.txt", metrics: hit },
 		{ name: "running", command: "worker joined.txt", expected: "worker:before\n", file: "joined.txt", metrics: { ...hit, joinedHits: 1 } },
 		{ name: "stale", command: "worker stale.txt", expected: "worker:after\n", file: "stale.txt", metrics: miss },
 		{ name: "cwd", command: "/bin/pwd", expected: `${workspace}\n`, metrics: hit },
@@ -103,12 +109,12 @@ int main(int argc, char **argv) {
 		const ownerBefore = await fixture.inOwner(state => state.backend.metrics());
 		const older = scenario.name === "running" ? await produce(`: earlier-input; ${scenario.command}`) : undefined;
 		if (older) await writeFile(path.join(workspace, "input.txt"), "changed while waiting\n");
-		const publication = older ? await holdOwnedProcessPublication(fixture, 1500, () => writeFile(path.join(workspace, "input.txt"), "before\n")) : undefined;
-		const pending = produce(`: speculative-parent; ${scenario.command}`), settled = pending.catch(() => undefined);
+		const publication = older ? await holdOwnedProcessPublication(fixture, () => writeFile(path.join(workspace, "input.txt"), "before\n")) : undefined;
+		const pending = produce(`: speculative-parent; ${scenario.name === "competing" ? "/bin/true" : scenario.command}`), settled = pending.catch(() => undefined);
 		await using _cleanup = onExit(async () => { await publication?.close(); await (await settled)?.dispose(); await older?.dispose(); });
 		for (const phase of scenario.name === "foreign" ? ["running", "completed"] : [publication ? "running" : "completed"]) {
 			if (phase === "running") {
-				if (publication) await expect.poll(publication.reached, { timeout: 5000 }).toBe(true);
+				if (publication) await publication.ready();
 				else await expect.poll(() => fixture.inOwner(state => state.backend.metrics().misses as number)).toBeGreaterThan(ownerBefore.misses);
 			} else {
 				const branch = await pending, produced = metricDelta(before, backend.metrics());
@@ -140,11 +146,17 @@ int main(int argc, char **argv) {
 				finally { await fixture.inOwner(state => state.deciding.mock.restore()); }
 				await rm(path.join(workspace, scenario.file!));
 			}
-			const consume = () => actor(`printf 'actor-parent\\n'; ${scenario.command}`, scenario.name === "foreign" ? "later" : "benchmark", scenario.name !== "descriptor");
-			const result = ["completed", "running"].includes(scenario.name) ? await fixture.workspaceSandbox.withWorkspace(workspace, async privateWorkspace => {
-				const invocation = resolvePiToolInvocation("bash", { command: "/bin/true" }, { cwd: workspace, environment: fixture.environment, shellPath: fixture.shellPath })!.process!;
+			const consume = () => actor(`printf 'actor-parent\\n'; ${scenario.command}`, scenario.name === "foreign" ? "later" : "benchmark", scenario.name === "competing" ? "sync" : scenario.name !== "descriptor");
+			const result = ["completed", "running", "competing"].includes(scenario.name) ? await fixture.workspaceSandbox.withWorkspace(workspace, async privateWorkspace => {
+				const command = scenario.name === "competing" ? `: local-parent; ${scenario.command}` : "/bin/true";
+				const invocation = resolvePiToolInvocation("bash", { command }, { cwd: workspace, environment: fixture.environment, shellPath: fixture.shellPath })!.process!;
 				await using local = disposable(await backend.open({ sourceRoot: workspace, workspace: privateWorkspace, invocation, scope: { sessionID: "benchmark", turnID: "benchmark" } }));
-				expect((await executeProcess(fixture, local.executor, "/bin/true")).exitCode).toBe(0); return await consume();
+				expect((await executeProcess(fixture, local.executor, command)).exitCode).toBe(0);
+				if (scenario.name !== "competing") return await consume();
+				return backend.observeNative(workspace, { sessionID: "benchmark", turnID: "benchmark", callID: "unrelated" }, undefined, async () => {
+					const child = spawn("/bin/sleep", ["30"], { cwd: workspace, env: { ...fixture.environment }, stdio: "ignore" }), closed = once(child, "close");
+					try { return await consume(); } finally { child.kill(); await closed; }
+				});
 			}) : await consume();
 			if (publication) expect(await publication.joined()).toBe(true);
 			expect(result.output, scenario.name).toBe(`actor-parent\n${scenario.expected}`);

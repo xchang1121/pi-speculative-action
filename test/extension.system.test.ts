@@ -133,11 +133,11 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 				}
 				return response("write", { path: "notes.txt", content: "changed\n" });
 			}], ...(mode === "native-retired" ? [async () => {
-				await expect.poll(publication!.reached, { timeout: 5000 }).toBe(true); session.setActiveToolsByName(tools.filter(name => name !== "produce_notes"));
+				await publication!.ready(); session.setActiveToolsByName(tools.filter(name => name !== "produce_notes"));
 				return response("read", { path: "notes.txt" });
 			}] : []), async () => {
 				expect(inputBinding).toBeDefined();
-				await expect.poll(() => publication ? publication.reached() : backend!.bindingStale(inputBinding!).then(stale => !stale), { timeout: 5000 }).toBe(true);
+				if (publication) await publication.ready(); else await expect.poll(() => backend!.bindingStale(inputBinding!), { timeout: 5000 }).toBe(false);
 				await expect(readFile(path.join(cwd, "marker"))).rejects.toMatchObject({ code: "ENOENT" });
 				if (stale) await writeFile(path.join(cwd, "notes.txt"), "fresh\n");
 				return call("format_rows", remaining, "check");

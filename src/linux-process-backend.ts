@@ -41,7 +41,7 @@ import { observeStrace, straceCommand, traceTail, type ObservedProcessPath, type
 import type { WorkspaceTransactionDelta, WorkspaceTransactionOwnership } from "./workspace-transaction.ts";
 import type { ToolProcessInvocation } from "./tool-settlement.ts";
 import type { ResourceValidation } from "./settlement.ts";
-import { ProcessHandoffOwnership, ProcessHandoffRegistry, sameScope, type ProcessContinuation, type ProcessExecutionBinding, type ProcessHandoff, type ProcessHandoffAcquisition, type ProcessHandoffBorrow, type ProcessHandoffLender } from "./process-handoff.ts";
+import { ProcessHandoffOwnership, ProcessHandoffRegistry, sameScope, type ProcessContinuation, type ProcessExecutionBinding, type ProcessHandoff, type ProcessHandoffBorrow, type ProcessHandoffLender } from "./process-handoff.ts";
 import { SynchronousProcessObserver, serializeNativeDependency, restoreNativeDependency, type SerializedProcessBinding, type SynchronousProcessRequest, type SynchronousProcessResult } from "./linux-process-sync.ts";
 import { WorkspaceSandboxService, readSandboxDirectoryState, restoreModifiedTimes, sameSandboxState, useModifiedTimesHelper, type SandboxDirectoryChange, type SandboxFileChange,
 	type SandboxWorkspaceChange, type SandboxWorkspaceContext } from "./workspace-sandbox.ts";
@@ -378,12 +378,6 @@ export class LinuxProcessReuseBackend {
 		if (enabled && !this.disposed && process.platform === "linux") await this.heldBoundary().catch(() => undefined);
 	}
 
-	private async nativeRequested(scope?: ExecutionScope, signal?: AbortSignal): Promise<boolean> {
-		const observation = this.observations.getStore();
-		return !!(observation?.learn && !observation.closed && sameScope(observation.scope, scope)) || this.hasReusableWork ||
-			await this.store.mayHaveCertificates(undefined, signal) || this.hasReusableWork;
-	}
-
 	private nativeObservation(sourceRoot: string, scope?: ExecutionScope, signal?: AbortSignal) {
 		let descriptors: boolean | "inspect" = this.handoffs.needsContinuationTracking(scope);
 		if (scope) for (const binding of this.handoffs.bindings(scope)) {
@@ -398,9 +392,10 @@ export class LinuxProcessReuseBackend {
 	/** Observe the native launches of the actual callback, independently of its tool name or process adapter. */
 	async observeNative<Value>(sourceRoot: string, scope: ExecutionScope | undefined, signal: AbortSignal | undefined, execute: () => Promise<Value>): Promise<Value> {
 		let boundary: LinuxHeldExecBoundary | undefined;
-		const owner = snapshotExecutionScope(scope);
+		const owner = snapshotExecutionScope(scope), observation = this.observations.getStore();
 		try {
-			if (!this.disposed && process.platform === "linux" && await this.nativeRequested(owner, signal)) {
+			if (!this.disposed && process.platform === "linux" && ((observation?.learn && !observation.closed && sameScope(observation.scope, owner)) ||
+				this.hasReusableWork || await this.store.mayHaveCertificates(undefined, signal) || this.hasReusableWork)) {
 				const ready = await waitForCompletion(this.heldBoundary(), signal);
 				if (ready.status === "completed") boundary = ready.value;
 			}
@@ -442,11 +437,8 @@ export class LinuxProcessReuseBackend {
 				if (observation && !observation.closed) {
 					observation.inputs?.receive(result.inputs ?? []);
 					for (const dependency of result.computations) { const restored = restoreNativeDependency(dependency); if (restored) observation.computations.push(restored); }
-					for (const entry of result.bindings) {
-						if (nativeLearningSlot(observation, entry.executionMs, entry.key, this.store.limits.maxCertificates) === false) continue;
-						const binding = this.restoreBinding(entry);
-						if (binding) recordNativeLearning(observation, binding, entry.sequence, entry.executionMs, this.store.limits.maxCertificates);
-					}
+					for (const entry of result.bindings) nativeLearningSlot(observation, entry.executionMs, entry.key, this.store.limits.maxCertificates,
+						() => ({ binding: this.restoreBinding(entry), order: entry.sequence }));
 				}
 			};
 			const failed = (error: unknown) => {
@@ -576,7 +568,99 @@ export class LinuxProcessReuseBackend {
 		readonly onOperationJoinable?: (available: () => boolean) => void;
 		readonly acceptOperationScope?: (scope: ExecutionScope, salvage?: boolean) => boolean;
 	}): Promise<LinuxProcessSession> {
-		return this.withProducer(() => this.createSession(input));
+		return this.withProducer(async (): Promise<LinuxProcessSession> => {
+			const { session, ready, readyAt, controller, server, image } = await this.allocateSession(input), { socketPath } = session;
+			let executionKind: "tool" | "operation" | undefined;
+			input.onOperationJoinable?.(() => !session.signal.aborted && this.handoffs.hasJoinableWork(session.ownership));
+			this.producers++;
+			let dispatch: Promise<void> | undefined;
+			const execute = <Value>(kind: NonNullable<typeof executionKind>, operation: () => Promise<Value>): Promise<Value> => {
+				if (session.lifecycle.sealed || executionKind === "operation" || executionKind && executionKind !== kind)
+					return Promise.reject(new Error("process session execution boundary is already consumed"));
+				executionKind = kind;
+				return session.lifecycle.admit(() => measureProcess(session, async () => {
+					session.signal?.throwIfAborted();
+					const dispatchStartedAt = performance.now();
+					// Bound operations can launch reusable children too; interception excludes their own image below.
+					await (dispatch ??= this.createProcessInterposition(session, ready, image).then(async interposition => {
+						session.signal?.throwIfAborted();
+						session.interposition = interposition;
+						await listenUnixSocket(server, socketPath);
+						await chmod(socketPath, 0o600);
+						const dispatch = new TimelineInterval(dispatchStartedAt, performance.now());
+						const computation = new TimelineInterval(creation.startedAt, dispatch.completedAt, [
+							{ computation: creation, owned: true, shared: [creation] }, { computation: dispatch, owned: true, shared: [dispatch] },
+						], []);
+						TimelineInterval.group(computation, session);
+						// Only recorded preparation cuts its caller's clock; work between creation and dispatch belongs to that caller.
+						session.preparation = { computation, shared: [creation, dispatch] };
+						session.computations.push({ ...session.preparation, owned: true });
+					}));
+					session.privateSince ??= Date.now();
+					return operation();
+				}));
+			};
+			const creation = new TimelineInterval(readyAt, performance.now());
+			return {
+				ownership: session.ownership,
+				computationDependencies: () => Object.freeze([...session.computations]),
+				executionBindings: () => Object.freeze([...session.executionBindings].sort(([left], [right]) => left - right).map(([, binding]) => binding)),
+				executor: { execute: request => execute("tool", async () => {
+					const { invocation } = session;
+					if (!invocation) throw new Error("process session has no whole-tool invocation");
+					if (session.lifecycle.sealed) throw new Error("Linux process session is closed");
+					assertInvocationMatches(invocation, request);
+					const physicalCwd = session.projection.toPhysical(path.resolve(request.cwd));
+					if (!pathContains(session.sourceRoot, path.resolve(request.cwd)) || !physicalCwd || !pathContains(session.workspace.sandboxRoot, physicalCwd))
+						throw new Error("process cwd is unmapped");
+					const ready = await this.resolveReady(), environment = definedProcessEnvironment(request.environment);
+					const { output: prototype, computation: preparation } = await TimelineInterval.outside(() => TimelineInterval.measure(() =>
+						topLevelProcessPrototype(invocation, request, environment, session.projection, ready.platformFingerprint)));
+					this.add(session, "wholeCommandRequests");
+					const result = await this.executeRequest(session, { argv0: invocation.shell, args: shellArguments(invocation, request.command), cwd: physicalCwd, environment },
+						invocation.shell, [1, 2], -session.metrics.wholeCommandRequests, prototype, true, undefined, preparation, request);
+					if (result.kind === "hit") for (const event of result.output ?? []) request.onData(Buffer.from(event.data, "base64"));
+					return { exitCode: result.exit?.kind === "code" ? result.exit.code : null };
+				}) },
+				executeBinding: binding => execute("operation", async () => {
+					const invocation = this.boundInvocation(binding, session.scope);
+					if (invocation.sourceRoot !== session.sourceRoot ||
+						invocation.producer && !compatibleProducer(session.nestedProducer, invocation.producer))
+						throw new Error("process execution binding is unavailable in this scope");
+					const { output: { request, executable, prototype }, computation: preparation } = await TimelineInterval.outside(() =>
+						TimelineInterval.measure(() => this.boundRequest(binding, invocation, session.projection, session.signal)));
+					const resultsBefore = session.preparedResults;
+					this.add(session, "requests");
+					const result = await this.executeRequest(session, request, executable, invocation.outputRoute, session.metrics.requests, prototype, true, undefined, preparation);
+					session.signal.throwIfAborted();
+					if (!invocation.producer && !invocation.resources && result.kind === "executed" && result.reusable === false &&
+						session.preparedResults === resultsBefore) {
+						throw new Error(`bound process preparation produced no reusable result${session.metrics.lastError ? `: ${session.metrics.lastError.slice(0, 4096)}` : ""}`);
+					}
+					return { output: (result.output ?? []).map(({ fd, data }) => ({ fd, data: Buffer.from(data, "base64") })),
+						...(result.kind === "suspended" ? { suspended: true as const } : { exit: result.exit! }) };
+				}),
+				metrics: () => Object.freeze({ ...session.metrics }),
+				seal: changes => session.sealPromise ??= this.withProducer(async () => {
+					const external = await privateCommits(path.join(session.workspace.processRoot, "private"), session.privateSince ?? 0,
+						[...[...session.completedWrites.values()].flatMap(writer => writer.external ?? []), ...session.foldedObservations.flatMap(observation => observation.external ?? [])]);
+					// Adopting without them would leave the host unlike the native run: the Actor runs it instead.
+					if (external.unrepresentable.length) throw new Error(`unrepresentable writes outside the workspace: ${external.unrepresentable.join(",")}`);
+					return [...await sealSessionEvidence(session, changes), ...external.changes];
+				}),
+				validate: () => validateTransferredProcessEvidence(session.topLevelEvidence, session.incompleteReasons),
+				close: () => session.lifecycle.close(async () => {
+					controller.abort(new Error("Linux process session closed"));
+					try {
+						await dispatch?.catch(() => undefined);
+						try { await closeServer(server); } finally {
+							await session.lifecycle.drain();
+							await rm(socketPath, { force: true }).catch(() => undefined);
+						}
+					} finally { this.producers--; }
+				}),
+			};
+		});
 	}
 
 	private async allocateSession(input: Parameters<LinuxProcessReuseBackend["open"]>[0]) {
@@ -637,73 +721,6 @@ export class LinuxProcessReuseBackend {
 			privateSince: undefined as number | undefined,
 		};
 		return { session, ready, readyAt, controller, server, image };
-	}
-
-	private async createSession(input: Parameters<LinuxProcessReuseBackend["open"]>[0]): Promise<LinuxProcessSession> {
-		const { session, ready, readyAt, controller, server, image } = await this.allocateSession(input), { socketPath } = session;
-		let executionKind: "tool" | "operation" | undefined;
-		input.onOperationJoinable?.(() => !session.signal.aborted && this.handoffs.hasJoinableWork(session.ownership));
-		this.producers++;
-		let dispatch: Promise<void> | undefined;
-		const execute = <Value>(kind: NonNullable<typeof executionKind>, operation: () => Promise<Value>): Promise<Value> => {
-			if (session.lifecycle.sealed || executionKind === "operation" || executionKind && executionKind !== kind)
-				return Promise.reject(new Error("process session execution boundary is already consumed"));
-			executionKind = kind;
-			return session.lifecycle.admit(() => measureProcess(session, async () => {
-				session.signal?.throwIfAborted();
-				const dispatchStartedAt = performance.now();
-				// Bound operations can launch reusable children too; interception excludes their own image below.
-				await (dispatch ??= this.createProcessInterposition(session, ready, image).then(async interposition => {
-					session.signal?.throwIfAborted();
-					session.interposition = interposition;
-					await listenUnixSocket(server, socketPath);
-					await chmod(socketPath, 0o600);
-					const dispatch = new TimelineInterval(dispatchStartedAt, performance.now());
-					const computation = new TimelineInterval(creation.startedAt, dispatch.completedAt, [
-						{ computation: creation, owned: true, shared: [creation] }, { computation: dispatch, owned: true, shared: [dispatch] },
-					], []);
-					TimelineInterval.group(computation, session);
-					// Only recorded preparation cuts its caller's clock; work between creation and dispatch belongs to that caller.
-					session.preparation = { computation, shared: [creation, dispatch] };
-					session.computations.push({ ...session.preparation, owned: true });
-				}));
-				session.privateSince ??= Date.now();
-				return operation();
-			}));
-		};
-		const creation = new TimelineInterval(readyAt, performance.now());
-		return {
-			ownership: session.ownership,
-			computationDependencies: () => Object.freeze([...session.computations]),
-			executionBindings: () => Object.freeze([...session.executionBindings].sort(([left], [right]) => left - right).map(([, binding]) => binding)),
-			executor: { execute: (request) => execute("tool", () => this.executeTopLevel(session, request)) },
-			executeBinding: (binding) => execute("operation", () => this.executeBinding(session, binding)),
-			metrics: () => Object.freeze({ ...session.metrics }),
-			seal: (changes) => { session.sealPromise ??= this.withProducer(() => this.seal(session, changes)); return session.sealPromise; },
-			validate: () => validateTransferredProcessEvidence(session.topLevelEvidence, session.incompleteReasons),
-			close: () => session.lifecycle.close(async () => {
-				controller.abort(new Error("Linux process session closed"));
-				try {
-					await dispatch?.catch(() => undefined);
-					try { await closeServer(server); } finally {
-						await session.lifecycle.drain();
-						await rm(socketPath, { force: true }).catch(() => undefined);
-					}
-				} finally { this.producers--; }
-			}),
-		};
-	}
-
-	private processComputation(session: ActiveSession, startedAt: number, completedAt: number, pids?: readonly number[], preparation?: TimelineInterval): TimelineInterval {
-		const computation = TimelineInterval.current(startedAt, completedAt, [
-			...(preparation ? [{ computation: preparation, owned: true, shared: [preparation] }] : []),
-			...(session.preparation ? [session.preparation] : []), ...session.computations.filter(input => {
-				const pid = processDependencyPIDs.get(input);
-				return pid !== undefined && pids?.includes(pid);
-			}),
-		]);
-		TimelineInterval.group(computation, session);
-		return computation;
 	}
 
 	dispose(): Promise<void> {
@@ -770,32 +787,6 @@ export class LinuxProcessReuseBackend {
 		return { sandlock, strace, fingerprint, platformFingerprint, observerFingerprint, executionContext, dispatcher, ...(imageLibrary ? { imageLibrary } : {}) };
 	}
 
-	private async executeTopLevel(session: ActiveSession, request: ProcessExecutionRequest): Promise<{ exitCode: number | null }> {
-		const { invocation } = session;
-		if (!invocation) throw new Error("process session has no whole-tool invocation");
-		if (session.lifecycle.sealed) throw new Error("Linux process session is closed");
-		assertInvocationMatches(invocation, request);
-		const physicalCwd = session.projection.toPhysical(path.resolve(request.cwd));
-		if (!pathContains(session.sourceRoot, path.resolve(request.cwd)) || !physicalCwd || !pathContains(session.workspace.sandboxRoot, physicalCwd))
-			throw new Error("process cwd is unmapped");
-		const ready = await this.resolveReady(), environment = definedProcessEnvironment(request.environment);
-		const { output: prototype, computation: preparation } = await TimelineInterval.outside(() => TimelineInterval.measure(() =>
-			topLevelProcessPrototype(invocation, request, environment, session.projection, ready.platformFingerprint)));
-		this.add(session, "wholeCommandRequests");
-		const result = await this.executeRequest(session, { argv0: invocation.shell, args: shellArguments(invocation, request.command), cwd: physicalCwd, environment },
-			invocation.shell, [1, 2], -session.metrics.wholeCommandRequests, prototype, true, undefined, preparation, request);
-		if (result.kind === "hit") for (const event of result.output ?? []) request.onData(Buffer.from(event.data, "base64"));
-		return { exitCode: result.exit?.kind === "code" ? result.exit.code : null };
-	}
-
-	private async seal(session: ActiveSession, changes: readonly SandboxWorkspaceChange[]): Promise<readonly SandboxWorkspaceChange[]> {
-		const external = await privateCommits(path.join(session.workspace.processRoot, "private"), session.privateSince ?? 0,
-			[...[...session.completedWrites.values()].flatMap(writer => writer.external ?? []), ...session.foldedObservations.flatMap(observation => observation.external ?? [])]);
-		// Adopting without them would leave the host unlike the native run: the Actor runs it instead.
-		if (external.unrepresentable.length) throw new Error(`unrepresentable writes outside the workspace: ${external.unrepresentable.join(",")}`);
-		return [...await sealSessionEvidence(session, changes), ...external.changes];
-	}
-
 	private serve(session: ActiveSession, socket: net.Socket): void {
 		let body = "";
 		socket.setEncoding("utf8");
@@ -847,25 +838,6 @@ export class LinuxProcessReuseBackend {
 		Math.min(MAX_REQUEST_BYTES / 2, this.store.limits.maxBytes), sensitivePaths(this.options.storeRoot, this.options.deniedPaths));
 	}
 
-	private async executeBinding(session: ActiveSession, binding: ProcessExecutionBinding) {
-		const invocation = this.boundInvocation(binding, session.scope);
-		if (invocation.sourceRoot !== session.sourceRoot ||
-			invocation.producer && !compatibleProducer(session.nestedProducer, invocation.producer))
-			throw new Error("process execution binding is unavailable in this scope");
-		const { output: { request, executable, prototype }, computation: preparation } = await TimelineInterval.outside(() =>
-			TimelineInterval.measure(() => this.boundRequest(binding, invocation, session.projection, session.signal)));
-		const resultsBefore = session.preparedResults;
-		this.add(session, "requests");
-		const result = await this.executeRequest(session, request, executable, invocation.outputRoute, session.metrics.requests, prototype, true, undefined, preparation);
-		session.signal.throwIfAborted();
-		if (!invocation.producer && !invocation.resources && result.kind === "executed" && result.reusable === false &&
-			session.preparedResults === resultsBefore) {
-			throw new Error(`bound process preparation produced no reusable result${session.metrics.lastError ? `: ${session.metrics.lastError.slice(0, 4096)}` : ""}`);
-		}
-		return { output: (result.output ?? []).map(({ fd, data }) => ({ fd, data: Buffer.from(data, "base64") })),
-			...(result.kind === "suspended" ? { suspended: true as const } : { exit: result.exit! }) };
-	}
-
 	private async executeRequest(session: ActiveSession, request: ProcessArguments, executable: string, outputRoute: OutputRoute,
 		requestID: number, prototype?: ExecPrototype,
 		captureWorkspace?: true, inPlace?: number, preparation?: TimelineInterval, outlet?: ProcessExecutionRequest): Promise<DispatcherResponse> {
@@ -883,15 +855,27 @@ export class LinuxProcessReuseBackend {
 			}));
 			if (acquired.kind === "hit" && acquired.plan.kind === "completed_replay") {
 				const plan = acquired.plan, binding = acquired.producer?.binding;
-				return TimelineInterval.outside(async () => {
-					const result = await this.replay(session, plan, weakKey, acquired, request.streams && descriptorInputs(request.resources!), inPlace, !!outlet);
+				return TimelineInterval.outside(async (): Promise<DispatcherResponse> => {
+					const { artifacts, certificate } = plan;
+					const output = wireOutput(loadOutputEvents(artifacts, certificate.result.journal)), computation = reusedComputation(certificate, acquired);
+					await replayFilesystemEffects(this.replayWorkspace, artifacts, certificate.result.journal, session.projection, session.workspace.sandboxRoot,
+						path.join(session.workspace.processRoot, "private")).then(() => acquired.settle?.(true, true), error => {
+							acquired.settle?.(!(error instanceof EffectCommitFailure && error.disposition === "recoverable")); throw error;
+						});
+					session.nestedEvidence.push(certificate.dependencyCertificate);
+					if (outlet) this.add(session, "wholeCommandHits"); else this.recordHit(acquired.producer?.scope, acquired.joined, session);
+					recordProcessDependency(session, computation, inPlace);
+					const observed = certificate.result.observedProcessMs;
+					if (observed !== undefined) this.add(session, outlet ? "wholeCommandReusedProcessMs" : "reusedProcessMs", observed);
+					const inputs = request.streams && descriptorInputs(request.resources!), streams = inputs && streamSettlement(inputs, (certificate.result.resources?.transitions ?? []).map(event => ({ alias: event.id, kind: event.kind, data: artifacts.read(event.data) })));
 					const written = {
 						external: plan.certificate.result.journal.flatMap(event => event.kind === "workspace" && !pathContains(session.sourceRoot, event.path) ? [event.path] : []),
 						written: plan.certificate.result.journal.flatMap(event => event.kind === "workspace" && pathContains(session.sourceRoot, event.path) ? [slash(path.relative(session.sourceRoot, event.path))] : []) };
 					recordSessionWrites(session, inPlace ?? -requestID, written);
 					if (inPlace !== undefined) session.writers.add({ startedAt: Date.now(), endedAt: Date.now(), writes: [], settled: true, pid: inPlace, ...written, evidence: plan.certificate.dependencyCertificate });
 					if (!outlet && binding && this.handoffs.resolveBinding(binding, session.scope)) session.executionBindings.set(requestID, binding);
-					return result;
+					return inputs && !streams ? { kind: "hit", weakKey, output: [], exit: { kind: "code", code: 125 } }
+						: { kind: "hit", weakKey, output, exit: certificate.result.exit, ...(streams?.length ? { streams } : {}) };
 				}).finally(() => acquired.settle?.(false));
 			}
 			if (acquired.kind !== "work") throw new Error("process work reservation failed");
@@ -1158,7 +1142,14 @@ export class LinuxProcessReuseBackend {
 							}
 							const { exit, ...prefixResult } = baseResult;
 							// A transferred prefix includes producing its proof and sealed image; the separate native frontier is unchanged.
-							const computation = this.processComputation(session, work.startedAt, performance.now(), observation.pids, preparation);
+							const computation = TimelineInterval.current(work.startedAt, performance.now(), [
+								...(preparation ? [{ computation: preparation, owned: true, shared: [preparation] }] : []),
+								...(session.preparation ? [session.preparation] : []), ...session.computations.filter(input => {
+									const pid = processDependencyPIDs.get(input);
+									return pid !== undefined && observation.pids?.includes(pid);
+								}),
+							]);
+							TimelineInterval.group(computation, session);
 							recordProcessDependency(session, { computation, owned: true, shared: [computation] }, inPlace);
 							const result: ProcessResultRecord = { ...prefixResult, ...(continuation ? { continuation: { imageDigest: sha256Digest(continuation.image), imageBytes: continuation.image.length } } : { exit: exit! }),
 								computation: TimelineInterval.serialize(computation),
@@ -1326,23 +1317,20 @@ export class LinuxProcessReuseBackend {
 			if (observation && !observation.closed) observation.computations.push(...capturedInputs.dependencies.filter(input => !input.owned));
 			const snapshot = { ...inspected, ...(resources ? { resources } : {}) };
 			if (!pathContains(sourceRoot, snapshot.cwd)) { this.add(undefined, "bypasses"); return measured({ kind: "continue" }); }
-			// Completion admits the most valuable launches. Undefined is a free slot, a sequence is its replacement,
-			// and false refuses admission. Existing adoptions keep their bindings and computation receipts.
-			const slot = (durationMs: number, key?: Sha256Digest): number | false | undefined => {
+			// Completion admits the most valuable launches; existing adoptions keep their bindings and computation receipts.
+			const slot = (durationMs: number, key?: Sha256Digest, create?: Parameters<typeof nativeLearningSlot>[4]): boolean => {
 				if (!learning || observation!.closed || process.signal?.aborted || !snapshot.outputRoute || !Number.isFinite(durationMs)) return false;
-				return nativeLearningSlot(observation!, durationMs, key, this.store.limits.maxCertificates);
+				return nativeLearningSlot(observation!, durationMs, key, this.store.limits.maxCertificates, create);
 			};
 			const observe = (prototype: ExecPrototype, durationMs: number) => {
-				const weakKey = processWeakKey(prototype), replace = slot(durationMs, weakKey);
-				if (replace === false) return;
-				const binding = this.handoffs.observe(weakKey, executablePath, scope!, {
+				const weakKey = processWeakKey(prototype);
+				return slot(durationMs, weakKey, () => ({ order, binding: this.handoffs.observe(weakKey, executablePath, scope!, {
 					argv0: snapshot.argv[0]!, args: snapshot.argv.slice(1), environment: snapshot.environment,
 					cwd: projection.toLogical(snapshot.cwd), executable: executablePath, sourceRoot, outputRoute: snapshot.outputRoute!,
 					...(snapshot.outputPipes?.some(Boolean) ? { outputPipes: snapshot.outputPipes } : {}), ...(outputStatusFlags(snapshot.context) ? { outputFlags: outputStatusFlags(snapshot.context) } : {}),
 					...(snapshot.context.descriptorTypes[0] === "closed" ? { closeStdin: true } : {}),
 					...(resources ? { resources } : {}),
-				}, durationMs);
-				if (binding) recordNativeLearning(observation!, binding, order, durationMs, this.store.limits.maxCertificates);
+				}, durationMs) }));
 			};
 			if (!available || resources && process.descriptors!.some(({ owned }) => !owned)) {
 				// Pin the executable's object now, digest it only after admission. Its original identity must still hold:
@@ -1426,24 +1414,6 @@ export class LinuxProcessReuseBackend {
 			this.setError(undefined, `actor_child:${errorMessage(error)}`);
 			return measured({ kind: "continue" });
 		} finally { if (!transferred) settle?.(false); if (!completing) releaseLearning(); }
-	}
-
-	private async replay(session: ActiveSession, plan: Extract<ProcessReusePlan, { kind: "completed_replay" }>, weakKey: Sha256Digest,
-		acquired: Extract<ProcessHandoffAcquisition<ReadyProcessPlan>, { kind: "hit" }>, inputs?: ReturnType<typeof descriptorInputs>, pid?: number, whole = false): Promise<DispatcherResponse> {
-		const { artifacts, certificate } = plan;
-		const output = wireOutput(loadOutputEvents(artifacts, certificate.result.journal)), computation = reusedComputation(certificate, acquired);
-		await replayFilesystemEffects(this.replayWorkspace, artifacts, certificate.result.journal, session.projection, session.workspace.sandboxRoot,
-			path.join(session.workspace.processRoot, "private")).then(() => acquired.settle?.(true, true), error => {
-				acquired.settle?.(!(error instanceof EffectCommitFailure && error.disposition === "recoverable")); throw error;
-			});
-		session.nestedEvidence.push(certificate.dependencyCertificate);
-		if (whole) this.add(session, "wholeCommandHits"); else this.recordHit(acquired.producer?.scope, acquired.joined, session);
-		recordProcessDependency(session, computation, pid);
-		const observed = certificate.result.observedProcessMs;
-		if (observed !== undefined) this.add(session, whole ? "wholeCommandReusedProcessMs" : "reusedProcessMs", observed);
-		const streams = inputs && streamSettlement(inputs, (certificate.result.resources?.transitions ?? []).map(event => ({ alias: event.id, kind: event.kind, data: artifacts.read(event.data) })));
-		if (inputs && !streams) return { kind: "hit", weakKey, output: [], exit: { kind: "code", code: 125 } };
-		return { kind: "hit", weakKey, output, exit: certificate.result.exit, ...(streams?.length ? { streams } : {}) };
 	}
 
 	/** Admission observes a stopped process; safe declines keep advancing its existing request. */
@@ -1954,17 +1924,17 @@ async function measureProcess<T>(session: ActiveSession, execute: () => Promise<
 	return result.output;
 }
 
-function nativeLearningSlot(observation: NativeObservation, duration: number, key: string | undefined, limit: number): number | false | undefined {
+function nativeLearningSlot(observation: NativeObservation, duration: number, key: string | undefined, limit: number,
+	create?: () => { readonly binding: ProcessExecutionBinding | undefined; readonly order: number }): boolean {
 	const entries = [...observation.learned], previous = key && entries.find(([order]) => observation.bindings.get(order)?.key === key);
 	const victim = previous || (entries.length >= LEARNED_LAUNCHES || observation.bindings.size >= limit
 		? entries.reduce<(typeof entries)[number] | undefined>((lowest, entry) => !lowest || entry[1] < lowest[1] ? entry : lowest, undefined) : undefined);
-	return victim ? duration > victim[1] ? victim[0] : false : observation.bindings.size < limit ? undefined : false;
-}
-function recordNativeLearning(observation: NativeObservation, binding: ProcessExecutionBinding, order: number, duration: number, limit: number): void {
-	const replace = nativeLearningSlot(observation, duration, binding.key, limit);
-	if (replace === false) return;
-	if (replace !== undefined) { observation.bindings.delete(replace); observation.learned.delete(replace); }
-	observation.bindings.set(order, binding); observation.learned.set(order, duration);
+	if (victim ? duration <= victim[1] : observation.bindings.size >= limit) return false;
+	const record = create?.();
+	if (record?.binding) {
+		if (victim) { observation.bindings.delete(victim[0]); observation.learned.delete(victim[0]); }
+		observation.bindings.set(record.order, record.binding); observation.learned.set(record.order, duration);
+	} return true;
 }
 
 /** Optimistic execution boundaries: control wins over sibling overlap; original producers keep their own clocks. */

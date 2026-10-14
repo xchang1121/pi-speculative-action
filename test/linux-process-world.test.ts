@@ -356,8 +356,8 @@ nativeTest.for([false, true])("prepares a failed command after its reported inpu
 		await start("repair");
 		const args = { path: "source.txt", content: "fixed\n" };
 		await host.execute({ turnID: "repair", id: "repair", tool: "write", args, tools }, undefined, () => writer.execute("repair", args));
-		await expect.poll(() => events.some(event => event.type === "candidate" && event.candidate.source === "pattern_aware" &&
-			event.candidate.tool === "bash" && event.state.status === "succeeded"), { timeout: 5000 }).toBe(true);
+		await prepared.waitFor(() => events.some(event => event.type === "candidate" && event.candidate.source === "pattern_aware" &&
+			event.candidate.tool === "bash" && event.state.status === "succeeded"));
 		expect(existsSync(path.join(fixture.workspace, "generated.txt"))).toBe(false);
 		await host.finishTurn("repair");
 		if (stale) await writeFile(path.join(fixture.workspace, "source.txt"), "changed\n");
@@ -404,7 +404,7 @@ int main(int argc, char **argv) { if (argc != 2) return 1; int fd = open(${layou
 	expect(bindings).toHaveLength(2);
 	const consumed = bindings.find(binding => registry.resolveBinding(binding, scope)?.args.includes(target))!;
 	await start("prepared");
-	await expect.poll(() => events.filter(event => event.type === "candidate" && event.turnID === "prepared" && event.state.status === "succeeded").length, { timeout: 5000 }).toBe(2);
+	await prepared.waitFor(() => events.filter(event => event.type === "candidate" && event.turnID === "prepared" && event.state.status === "succeeded").length === 2);
 	expect(await Promise.all(bindings.map(binding => fixture.backend.bindingStale(binding)))).toEqual([false, false]); await host.finishTurn("prepared");
 	const preparations = (turnID: string) => events.filter(event => event.type === "candidate" && event.turnID === turnID &&
 		event.candidate.mode === "recent-command" && bindings.some(binding => event.candidate.predictedAction.includes(binding.key)));
@@ -434,8 +434,8 @@ int main(int argc, char **argv) { if (argc != 2) return 1; int fd = open(${layou
 		if (gate) {
 			await expect.poll(() => changes.mock.calls.length).toBe(2); await Promise.all(changes.mock.results.map(result => result.value)); await nextTurn(); gate.release();
 		}
-		if (mode !== "disabled") await expect.poll(() => preparations("edit").filter(event => event.type === "candidate" && event.state.status === "succeeded").length,
-			{ timeout: 5000 }).toBe((layout ? 2 : 1) * (value === "two" ? 2 : 1));
+		if (mode !== "disabled") await prepared.waitFor(() => preparations("edit").filter(event => event.type === "candidate" && event.state.status === "succeeded").length ===
+			(layout ? 2 : 1) * (value === "two" ? 2 : 1));
 	}
 	expect((await publications()).map(certificate => certificate.weakKey).sort()).toEqual(mode === "disabled" ? [] : (layout ? bindings : [consumed]).flatMap(binding => layout === "repeat" ? [binding.key, binding.key] : [binding.key]).sort());
 	if (mode === "stale") await writeFile(path.join(fixture.workspace, "last"), "bad\n");
@@ -1152,8 +1152,8 @@ int main(int argc, char **argv) {
 		await start("seed");
 		if (!native) {
 			await host.previewActorCall(call("seed", command));
-			await expect.poll(() => events.some(event => event.type === "candidate" && event.turnID === "seed" &&
-				event.candidate.origin === "actor_preview" && event.state.status === "succeeded"), { timeout: 5000 }).toBe(true);
+			await prepared.waitFor(() => events.some(event => event.type === "candidate" && event.turnID === "seed" &&
+				event.candidate.origin === "actor_preview" && event.state.status === "succeeded"));
 		}
 
 		await expect.poll(() => patternStore.recent(scope.sessionID).map(event => event.input.command)).toEqual(["printf common", "printf common", ...(discovery ? [command] : [])]);
@@ -1210,18 +1210,16 @@ int main(int argc, char **argv) {
 			restorePreparation = () => fixture.inOwner(state => state.restorePreparation());
 		}
 		await start("prepared");
-		if (running) await expect.poll(publication!.reached, { timeout: 5000 }).toBe(true);
-		else await expect.poll(() => events.filter(event => event.turnID === "prepared" && (event.type === "candidate" || event.type === "operation_prediction"))
-			.map(event => event.type === "candidate" ? [event.candidate.kind, event.state.status] : event.type === "operation_prediction" ? event.settlement : undefined), { timeout: 5000 }).toContainEqual(["operation", "succeeded"]).catch(error => {
-			throw new Error(JSON.stringify({ metrics: fixture.backend.metrics(), errors: errors.mock.calls.map(call => call[1]) }), { cause: error });
-		});
+		if (running) await publication!.ready();
+		else await prepared.waitFor(() => events.some(event => event.turnID === "prepared" && event.type === "candidate" &&
+			event.candidate.kind === "operation" && event.state.status === "succeeded"));
 		if (launcher && !running) await expect.poll(async () => (await publications()).slice(publicationStart).some(certificate =>
 			certificate.prototype.executablePath === path.join(fixture.workspace, "worker")), { timeout: 5000 }).toBe(true).catch(error => {
 			throw new Error(JSON.stringify({ metrics: fixture.backend.metrics(), actor: fixture.backend.actorMetrics(), errors: errors.mock.calls.map(call => call[1]) }), { cause: error });
 		});
 		if (mode.includes("prepared-")) {
-			await expect.poll(() => events.filter(event => event.type === "candidate" && event.turnID === "prepared" &&
-				event.candidate.kind === "operation" && event.state.status === "succeeded").length).toBe(launcher ? 2 : 1);
+			await prepared.waitFor(() => events.filter(event => event.type === "candidate" && event.turnID === "prepared" &&
+				event.candidate.kind === "operation" && event.state.status === "succeeded").length === (launcher ? 2 : 1));
 			expect(await readFile(path.join(fixture.workspace, "input.txt"), "utf8")).toBe("changed during preparation\n");
 			await restorePreparation?.(); restorePreparation = undefined;
 			// Every preparation is sealed before this change; no later producer can capture the replacement value.
@@ -1238,11 +1236,9 @@ int main(int argc, char **argv) {
 			expect(await publication!.joined(), "another turn cannot wait for this one-shot producer").toBe(false);
 		}
 		const actor = vi.fn(() => fixture.coordinator.runWith(route.executor, () => fixture.tool.execute("prepared", { command: changedParent })));
-		const nativeExecution = host.execute(call("prepared", changedParent), undefined, actor);
-		void nativeExecution.catch(() => undefined);
-		if (running) await expect.poll(() => publication!.joined()).toBe(true);
 		const stalePreparation = mode.endsWith("prepared-stale");
-		expect((await nativeExecution).content).toEqual([{ type: "text", text: `automatic-parent\n${stalePreparation ? "changed after preparation\n" : "newest\n"}${suffix}` }]);
+		expect((await host.execute(call("prepared", changedParent), undefined, actor)).content).toEqual([{ type: "text", text: `automatic-parent\n${stalePreparation ? "changed after preparation\n" : "newest\n"}${suffix}` }]);
+		if (running) expect(await publication!.joined()).toBe(true);
 		expect(actor).toHaveBeenCalledOnce();
 		if (segmented || orphan) expect(fixture.backend.actorMetrics().hits).toBe(1);
 		if (orphan) expect((await publications()).some(certificate => certificate.prototype.inheritedFDs.some(fd => fd.installed === false))).toBe(true);
