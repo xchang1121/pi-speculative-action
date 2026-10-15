@@ -1784,17 +1784,22 @@ export function makeSpeculativeActionRuntime<
 		if (source.multiStepEnabled?.(context.settings, context.draft.feedback) === false) return;
 		if (context.continuationTriggers.has(trigger)) return;
 		context.continuationTriggers.add(trigger);
+		const parents = [context];
 		try {
 			const filter = source.continueOn;
 			if (trigger === "prepared" && !filter) return;
 			if (filter && !(typeof filter === "function" ? filter({ actionID: node.action.id, action: adoptedAction?.key ?? current.actionKey!,
 				feedback: context.draft.feedback, output, trigger }) : filter.includes(trigger))) return;
+			for (const id of source.continuationBatch?.({ proposalID: node.proposalID, actionID: node.action.id, feedback: context.draft.feedback }) ?? []) {
+				const identity = session.plan.get(node.proposalID, id)?.identity.id, parent = identity && session.actionContexts.get(identity);
+				if (parent && parent !== context) parents.push(parent);
+			}
 		} catch { return; } // Producer feedback cannot alter completed execution.
 		const parentDecisionSequence =
 			current.predictionState.status === "matching" ? (current.predictionState.actorAction.decisionSequence ?? current.expectedDecisionSeq) : current.expectedDecisionSeq;
 		const targetDecisionSequence = parentDecisionSequence + 1;
-		const pending = context.continuationTail
-			.then(() => requestContinuation(session, source, [context], targetDecisionSequence, (signal, reportDraftTokens) => {
+		const pending = Promise.all(parents.map(parent => parent.continuationTail))
+			.then(() => requestContinuation(session, source, parents, targetDecisionSequence, (signal, reportDraftTokens) => {
 				const revision = session.plan.reserveRevision(node.proposalID);
 				if (revision === undefined) return undefined;
 				return source.continue!({
@@ -1808,7 +1813,7 @@ export function makeSpeculativeActionRuntime<
 			.catch(() => {
 				// Continuation failure cannot revoke completed work or Actor adoption.
 			});
-		context.continuationTail = pending;
+		for (const parent of parents) parent.continuationTail = pending;
 		trackSourceTask(session, pending);
 	};
 

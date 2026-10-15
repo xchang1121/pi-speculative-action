@@ -14,6 +14,7 @@ import { cause } from "./settlement.ts";
 import { canonicalToolObservation, toolObservationContract, toolObservationKey, type ToolSettlement } from "./tool-settlement.ts";
 import type { ActionKey } from "./action-semantics.ts";
 import { SharedAbortScope } from "./runtime-lifecycle.ts";
+import { waitForCompletion } from "./scheduler.ts";
 
 interface DrafterBatch {
 	readonly model: Model<Api>;
@@ -27,7 +28,7 @@ interface DrafterPlanFeedback extends DrafterBatch {
 	readonly message: AssistantMessage;
 	readonly depth: number;
 	readonly calls: ReadonlyMap<string, DrafterCall>;
-	claimed: boolean;
+	continuation?: { readonly controller: AbortController; observations?: readonly string[] };
 }
 interface DrafterObservation { readonly message: ToolResultMessage; readonly key: string; }
 interface DrafterCall {
@@ -77,13 +78,15 @@ export function createDrafterPlanSource(input: {
 			Math.ceil((JSON.stringify(context.tools ?? []).length - JSON.stringify(batch.context.tools ?? []).length) / 4));
 		if (!drafterContextFits(batch.model, context, options.maxTokens, inputTokens)) suppress("drafter_context_limit");
 		const forced = !options.reasoning && force ? { onPayload: forceToolChoice(options.onPayload, force === true ? undefined : force) } : {};
-		const message = await budget.run({ model: batch.model, context, inputTokens, options: { ...options, ...forced, signal },
-			policy: batch.budgetPolicy, complete: input.complete, onSkipped: suppress });
-		if (!message) return undefined;
-		report?.(calculateContextTokens(message.usage));
-		if (message.stopReason === "error" || message.stopReason === "aborted")
-			throw new Error(message.errorMessage ?? `Drafter stopped with ${message.stopReason}`);
-		return message;
+		const response = await waitForCompletion(budget.run({ model: batch.model, context, inputTokens, options: { ...options, ...forced, signal },
+			policy: batch.budgetPolicy, complete: input.complete, onSkipped: suppress }).then(message => {
+			if (!message) return undefined;
+			report?.(calculateContextTokens(message.usage));
+			if (message.stopReason === "error" || message.stopReason === "aborted")
+				throw new Error(message.errorMessage ?? `Drafter stopped with ${message.stopReason}`);
+			return message;
+		}), signal);
+		return response.status === "completed" ? response.value : undefined;
 	};
 	const completeDraft = async (batch: DrafterBatch, signal: AbortSignal, report: ((tokens: number) => void) | undefined,
 		prefix: string, depth = 0, dependsOn?: PlanAction["dependsOn"]) => {
@@ -92,7 +95,7 @@ export function createDrafterPlanSource(input: {
 		const calls = message.content.filter((item): item is AgentToolCall => item.type === "toolCall");
 		if (!calls.length || new Set(calls.map(call => call.id)).size !== calls.length) return undefined;
 		const feedback: DrafterPlanFeedback = { ...batch, depth, message,
-			calls: new Map(calls.map((call, member) => [`${prefix}:${member}`, { call }])), claimed: false };
+			calls: new Map(calls.map((call, member) => [`${prefix}:${member}`, { call }])), continuation: undefined };
 		feedbacks.set(feedback, feedback);
 		return { actions: [...feedback.calls].map(([id, { call }]): PlanAction => ({ id, type: "tool_call", tool: call.name,
 			input: call.arguments, depth, feedback, dependsOn, ...probabilities(batch, call.name) })) };
@@ -125,13 +128,20 @@ export function createDrafterPlanSource(input: {
 		continueOn: ({ actionID, action, feedback, output }) => {
 			const previous = feedbacks.get(feedback as object), member = previous?.calls.get(actionID);
 			if (!previous || !member) return false;
-			if (output && member.forecast) {
-				observations.compared++; observations.matched += Number(member.forecast === toolObservationKey(output, action));
+			const result = output && privateObservation(member.call, output, action);
+			if (result && member.forecast) {
+				observations.compared++; observations.matched += Number(member.forecast === result.key);
 				member.forecast = undefined;
 			}
-			if (output) member.result = privateObservation(member.call, output, action);
+			if (result) member.result = result;
 			member.action ??= action;
-			return !previous.claimed && [...previous.calls.values()].every(member => member.action);
+			const members = [...previous.calls.values()], continuation = previous.continuation;
+			if (!members.every(member => member.action)) return false;
+			if (!continuation) return true;
+			if (!output || !members.every(member => member.result && !member.forecast) ||
+				members.every((member, index) => member.result!.key === continuation.observations?.[index])) return false;
+			continuation.controller.abort();
+			return true;
 		},
 		proposalCount: (settings) => clampCandidateLimit(settings.candidateLimit ?? DEFAULTS.candidateLimit),
 		concurrentProposalPolicy: (settings) =>
@@ -179,14 +189,17 @@ export function createDrafterPlanSource(input: {
 		},
 		continue: async ({ proposalID, revision, feedback, signal, reportDraftTokens, settings }) => {
 			const previous = feedbacks.get(feedback as object);
-			if (!previous || signal.aborted || previous.claimed) return undefined;
-			previous.claimed = true;
+			if (!previous || signal.aborted || previous.continuation && !previous.continuation.controller.signal.aborted) return undefined;
+			const continuation: NonNullable<DrafterPlanFeedback["continuation"]> = { controller: new AbortController() };
+			previous.continuation = continuation;
+			signal = AbortSignal.any([signal, continuation.controller.signal]);
 			const policy = normalizeDrafterRequestSettings(settings.sourceConfig);
 			if (previous.depth >= policy.drafterMaxDepth) return undefined;
 			const missing = [...previous.calls.values()].filter(member => !member.result);
 			if (missing.length) {
 				const context = observationContext(previous, missing);
 				const message = await completeRequest({ ...previous, budgetPolicy: policy }, context, signal, reportDraftTokens, OBSERVATION_TOOL);
+				if (signal.aborted) return undefined;
 				const pending = missing.filter(member => !member.result);
 				if (pending.length) {
 					const calls = message?.content.filter((item): item is AgentToolCall => item.type === "toolCall");
@@ -203,6 +216,7 @@ export function createDrafterPlanSource(input: {
 			if (signal.aborted) return undefined;
 			// Freeze the exact private observations used for this prediction, even if real results arrive during inference.
 			const context = continuationContext(previous.context, previous.message, [...previous.calls.values()].map(member => member.result!.message));
+			continuation.observations = [...previous.calls.values()].map(member => member.result!.key);
 			const draft = await completeDraft({ ...previous, context, budgetPolicy: policy }, signal, reportDraftTokens, `rollout:${revision}`, previous.depth + 1,
 				[...previous.calls].map(([actionID, member]) => ({ actionID, condition: "prediction", observation: member.result!.key })));
 			return draft && { proposalID, source: "drafter", revision, upsert: draft.actions };
@@ -256,7 +270,8 @@ function observationContext(batch: DrafterPlanFeedback, missing: readonly Drafte
 		return { call, tool: batch.context.tools?.find(tool => tool.name === call.name), observation: { version, content } };
 	});
 	return { ...batch.context, messages: [...batch.context.messages, { role: "user", timestamp: Date.now(),
-		content: `Predict the pending observations under their bound schemas.\n${JSON.stringify({ candidates })}` }],
+		content: `Predict the pending observations under their bound schemas.\n${JSON.stringify({ draft: batch.message.content,
+			observations: [...batch.calls.values()].flatMap(member => member.result ? [member.result.message] : []), candidates })}` }],
 		tools: [{ name: OBSERVATION_TOOL, description: "Private predicted tool observations; never executable results.", parameters: Type.Object({
 			results: Type.Array(Type.Union(candidates.map(({ call, observation }) => Type.Object({ callID: Type.Literal(call.id),
 				isError: Type.Boolean(), exitCode: Type.Optional(Type.Integer()), content: observation.content,

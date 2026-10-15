@@ -233,11 +233,14 @@ test.for(["in-place", "git"] as const)("keeps effects private, retries restored 
 	expect(await readFile(file, "utf8")).toBe("one three\n");
 });
 
-test.for(["independent", "batch", "mismatch-text", "mismatch-error", "parent-miss", "stale", "same-resource", "missing-input", "independent-create",
+test.for(["independent", "unchanged", "batch", "batch-known", "mismatch-text", "mismatch-error", "mismatch-inflight", "mismatch-budget", "parent-miss", "stale", "same-resource", "missing-input", "independent-create",
 	"budget", "depth-zero", "denied-root", "denied-child", "unknown-batch", "filtered-batch", "malformed-observation", "malformed-type", "abort-observation", "actual-before-forecast", "actual-before-malformed",
-	"request-failure", "malformed-extra", "mismatch-exit", "canonical", "canonical-mismatch", "canonical-version", "canonical-schema", "canonical-unbound", "normalizer-failure"])("executes out-of-order drafts using private observations (%s)", async mode => {
-	const cwd = await directories.create(), sandbox = new WorkspaceSandboxService(), release = deferred(), forecast = deferred(), observing = deferred();
+	"actual-before-failure", "actual-before-batch", "request-failure", "malformed-extra", "mismatch-exit", "canonical", "canonical-mismatch", "canonical-version", "canonical-schema", "canonical-unbound", "normalizer-failure"])("executes out-of-order drafts using private observations (%s)", async mode => {
+	const cwd = await directories.create(), sandbox = new WorkspaceSandboxService(), release = deferred(), forecast = deferred(), observing = deferred(), firstResult = deferred();
 	const actualFirst = mode.startsWith("actual-before-"), normalized = mode.startsWith("canonical"), wrong = mode.startsWith("mismatch") || mode === "canonical-mismatch";
+	const known = mode === "batch-known", recoverable = ["request-failure", "malformed-observation", "malformed-type", "malformed-extra"].includes(mode);
+	const inflight = mode === "mismatch-inflight", repairBudget = mode === "mismatch-budget", actualBatch = mode === "actual-before-batch";
+	const textMismatch = mode.startsWith("mismatch") && !["mismatch-error", "mismatch-exit"].includes(mode), contractChanged = ["canonical-version", "canonical-schema", "canonical-unbound"].includes(mode);
 	let version = "test-result/1", bound = true;
 	let schema = Type.Array(Type.Object({ type: Type.Literal("text"), text: Type.String({ pattern: '"artifact":"abc"' }) }));
 	const canonicalize: NonNullable<ToolObservationContract["canonicalize"]> = content => content.map(block => {
@@ -245,7 +248,7 @@ test.for(["independent", "batch", "mismatch-text", "mismatch-error", "parent-mis
 		if (block.type !== "text") return block;
 		const { duration: _duration, pid: _pid, tempPath: _tempPath, ...kept } = JSON.parse(block.text); return { ...block, text: JSON.stringify(kept) };
 	});
-	const mutation = ["same-resource", "missing-input", "independent-create"].includes(mode), dependent = mutation && mode !== "independent-create", count = mode === "batch" ? 2 : 1;
+	const mutation = ["same-resource", "missing-input", "independent-create"].includes(mode), dependent = mutation && mode !== "independent-create", count = mode.startsWith("batch") || actualBatch ? 2 : 1;
 	const read = PI_ACTION_SEMANTICS.definition("read")!, names = ["inspect_rows", "render_rows"];
 	const definitions = names.map(tool => ({ ...read, tool, epoch: tool, projectors: [] })), semantics = new ActionSemanticsRegistry([...definitions, PI_ACTION_SEMANTICS.definition("write")!]);
 	const reader = createReadTool(cwd), tools = [...names.map(name => ({ ...reader, name })), createWriteTool(cwd)] as Parameters<typeof systemHost>[1];
@@ -254,30 +257,39 @@ test.for(["independent", "batch", "mismatch-text", "mismatch-error", "parent-mis
 	for (const root of roots) if (mode !== "missing-input" && mode !== "independent-create") await writeFile(path.join(cwd, root.args.path), normalized
 		? '{"failedTests":[],"artifact":"abc","duration":14,"pid":123,"tempPath":"/tmp/actual"}\n' : "one\ntwo\nthree\n");
 	await writeFile(path.join(cwd, "child.txt"), "child\n");
+	if (wrong) await writeFile(path.join(cwd, "discarded.txt"), "discarded\n");
 	const child = { tool: names[1]!, args: { path: dependent ? "root-0.txt" : "child.txt" } };
 	const expected = await Promise.all(roots.map(root => mutation ? { content: [{ type: "text" as const, text: "Successfully wrote 9 bytes to root-0.txt" }] }
 		: reader.execute("oracle", root.args)));
 	if (normalized) expect(canonicalize(expected[0]!.content)).toEqual([{ type: "text", text: '{"failedTests":[],"artifact":"abc"}' }]);
 	const worlds = [createResourceSnapshotExecutionWorld(semantics, { maxBytes: () => 1024 * 1024 }), sandbox.createExecutionWorld({ driver: "git" })];
-	let requests = 0, drafts = 0, rootContext: import("@earendil-works/pi-ai").Context | undefined;
+	let requests = 0, drafts = 0, rootContext: import("@earendil-works/pi-ai").Context | undefined, observationSignal: AbortSignal | undefined;
 	const privateContexts: import("@earendil-works/pi-ai").Context[] = [], executed: string[] = [];
 	const settings = { tools: mode === "filtered-batch" ? [names[0]!] : undefined, drafterEnabled: true, maxConcurrentActions: 3, drafterMaxDepth: mode === "depth-zero" ? 0 : mode === "denied-child" ? 2 : 1,
-		drafterTaskMaxRequests: mode === "budget" ? 2 : 32 };
+		candidateLimit: mode === "unchanged" ? 3 : 1, predictionTimeoutMs: 30_000, drafterTaskMaxRequests: mode === "budget" ? 2 : repairBudget ? 3 : 32 };
 	const f = systemHost(cwd, tools, { actionSemantics: semantics,
 		resources: { initial: { cpuCount: 3, idleCpuCount: 3 }, sample: () => new Promise(() => {}) },
-		resolveInvocation: (tool, args) => ({ ...resolvePiToolInvocation(tool === "write" ? tool : "read", args, { cwd, environment: {} })!,
+		onEvent: event => { if ((known || actualBatch) && event.type === "candidate" && event.state.status === "succeeded" && event.candidate.tool === names[0]) firstResult.resolve(); },
+		resolveInvocation: async (tool, args) => { if (known && (args as { path: string }).path === "root-1.txt") await firstResult.promise; return { ...resolvePiToolInvocation(tool === "write" ? tool : "read", args, { cwd, environment: {} })!,
 			...(bound && tool === names[0] && (normalized || mode === "normalizer-failure") ? { observation: { ...EXACT_TOOL_OBSERVATION, version, content: normalized ? schema : undefined, canonicalize } } : {}),
-			semantics: tool === "write" ? PI_ACTION_SEMANTICS.definition(tool) : definitions[names.indexOf(tool)] }),
+			semantics: tool === "write" ? PI_ACTION_SEMANTICS.definition(tool) : definitions[names.indexOf(tool)] }; },
 		preflight: context => !(mode === "denied-root" && context.toolName !== child.tool || mode === "denied-child" && context.toolName === child.tool),
 		executionWorlds: worlds.map(world => ({ ...world, speculation: { ...world.speculation!, execute: async context => {
 			executed.push(context.toolName); const branch = await world.speculation!.execute(context);
-			if (context.toolName !== child.tool) await release.promise; return branch;
+			if (context.toolName !== child.tool && !(known && (context.args as { path: string }).path === "root-0.txt")) await release.promise;
+			if (actualBatch && (context.args as { path: string }).path === "root-0.txt") await firstResult.promise; return branch;
 		} } })),
 		complete: async (_model, context, options) => {
 			requests++; expect(options?.apiKey).toBe("shared-credential");
+			if (mode === "unchanged" && rootContext && !context.messages.length) return fauxAssistantMessage("No alternative.");
 			if (context.tools?.[0]?.name === "speculative_observations") {
+				observationSignal = options!.signal;
 				const payload = JSON.parse(String(context.messages.at(-1)!.content).split("\n").slice(1).join("\n"));
-				expect(payload.candidates.map((item: { tool: unknown }) => item.tool)).toEqual(JSON.parse(JSON.stringify(roots.map(root => tools.find(tool => tool.name === root.tool)))));
+				expect(payload.draft).toMatchObject([{ type: "thinking", thinking: "Inspect the input." }, ...roots.map((root, index) =>
+					({ type: "toolCall", id: `root-${index}`, name: root.tool, arguments: root.args }))]);
+				expect(payload.observations).toEqual(known ? [expect.objectContaining({ role: "toolResult", toolCallId: "root-0", content: expected[0]!.content })] : []);
+				const predictedRoots = known ? roots.slice(1) : roots;
+				expect(payload.candidates.map((item: { tool: unknown }) => item.tool)).toEqual(JSON.parse(JSON.stringify(predictedRoots.map(root => tools.find(tool => tool.name === root.tool)))));
 				for (const item of payload.candidates) {
 					expect(item.observation.version).toBe(normalized || mode === "normalizer-failure" ? version : "model-visible/1");
 					if (normalized) expect(item.observation.content).toEqual(JSON.parse(JSON.stringify(schema)));
@@ -285,24 +297,33 @@ test.for(["independent", "batch", "mismatch-text", "mismatch-error", "parent-mis
 				observing.resolve();
 				if (mode === "abort-observation") await new Promise((_, reject) => options!.signal!.addEventListener("abort", () => reject(options!.signal!.reason), { once: true }));
 				if (actualFirst) await forecast.promise;
-				if (mode === "request-failure") throw new Error("observation transport failure");
-				return fauxAssistantMessage(fauxToolCall("speculative_observations", { results: roots.map((_, index) => ({
+				if (mode === "request-failure" || mode === "actual-before-failure") throw new Error("observation transport failure");
+				const response = fauxAssistantMessage(fauxToolCall("speculative_observations", { results: predictedRoots.map(root => { const index = roots.indexOf(root); return {
 					callID: mode === "malformed-observation" ? "unknown" : `root-${index}`, isError: mode === "malformed-type" || mode === "actual-before-malformed" ? "false" : mode === "mismatch-error",
 					...(mode === "malformed-extra" ? { score: 1_000_000 } : {}), ...(mode === "mismatch-exit" ? { exitCode: 7 } : {}),
 					content: normalized ? [{ type: "text", text: JSON.stringify({ failedTests: mode === "canonical-mismatch" ? ["a.test.ts:3"] : [], artifact: "abc", duration: 999, pid: 456, tempPath: "/tmp/predicted" }) }]
-						: mode === "mismatch-text" || actualFirst ? [{ type: "text", text: "incorrect forecast" }] : expected[index]!.content,
-				})) }), { stopReason: "toolUse" });
+						: textMismatch || actualFirst ? [{ type: "text", text: "incorrect forecast" }] : expected[index]!.content,
+				}; }) }), { stopReason: "toolUse" });
+				return { ...response, usage: { ...response.usage, input: 11, output: 7, totalTokens: 18 } };
 			}
 			if (++drafts === 1) { rootContext = context; return fauxAssistantMessage([{ type: "thinking", thinking: "Inspect the input." },
 				...roots.map((root, index) => fauxToolCall(root.tool, root.args, { id: `root-${index}` })), ...(["unknown-batch", "filtered-batch"].includes(mode) ? [fauxToolCall(mode === "unknown-batch" ? "unavailable" : child.tool, child.args, { id: "unknown" })] : [])], { stopReason: "toolUse" }); }
-			privateContexts.push(context); return fauxAssistantMessage(fauxToolCall(child.tool, child.args, { id: "child" }), { stopReason: "toolUse" });
+			privateContexts.push(context); const discarded = wrong && privateContexts.length === 1;
+			if (inflight && discarded) { observationSignal = options!.signal; firstResult.resolve(); await forecast.promise; }
+			return fauxAssistantMessage(fauxToolCall(child.tool, discarded ? { path: "discarded.txt" } : child.args,
+				{ id: "child" }), { stopReason: "toolUse" });
 		}, getDraftOptions: () => ({ apiKey: "shared-credential" }),
 	}, settings);
-	await using _cleanup = onExit(async () => { release.resolve(); forecast.resolve(); await f.dispose(); await sandbox.dispose(); });
+	await using _cleanup = onExit(async () => { release.resolve(); forecast.resolve(); firstResult.resolve(); await f.dispose(); await sandbox.dispose(); });
 	await f.start();
 	const stopped = ["budget", "depth-zero", "denied-root", "unknown-batch", "filtered-batch", "malformed-observation", "malformed-type", "abort-observation", "normalizer-failure", "request-failure", "malformed-extra"].includes(mode), rootOnly = ["depth-zero", "denied-root", "unknown-batch", "filtered-batch"].includes(mode);
 	if (mode === "abort-observation") { await observing.promise; release.resolve(); await f.dispose(); }
-	else if (actualFirst) { await observing.promise; release.resolve(); await f.ready(count); forecast.resolve(); await f.ready(count + 1); }
+	else if (actualFirst || inflight) {
+		await (inflight ? firstResult.promise : observing.promise); release.resolve(); await f.ready(count + 1);
+		expect(f.events.some(event => event.type === "source_request" && event.request.settlement.status === "timeout")).toBe(false);
+		expect(observationSignal?.aborted).toBe(true); expect(f.host.drafterBudgetSnapshot().budget.reservedTokens).toBeGreaterThan(0); forecast.resolve();
+		await expect.poll(() => f.host.drafterBudgetSnapshot().budget.reservedTokens).toBe(0);
+	}
 	else if (stopped || mode === "denied-child") {
 		await expect.poll(() => f.events.filter(event => event.type === "source_request").length).toBeGreaterThanOrEqual(rootOnly ? 1 : 2);
 	} else if (dependent) {
@@ -311,31 +332,34 @@ test.for(["independent", "batch", "mismatch-text", "mismatch-error", "parent-mis
 		if (mode === "missing-input") await expect(readFile(path.join(cwd, "root-0.txt"))).rejects.toMatchObject({ code: "ENOENT" });
 		else expect(await readFile(path.join(cwd, "root-0.txt"), "utf8")).toBe("one\ntwo\nthree\n");
 	} else {
-		await f.ready(); expect(f.events.flatMap(event => event.type === "candidate" && event.state.status === "succeeded" ? [event.candidate.tool] : [])).toEqual([child.tool]);
+		await f.ready(known ? 2 : 1); expect(f.events.flatMap(event => event.type === "candidate" && event.state.status === "succeeded" ? [event.candidate.tool] : [])).toEqual([...(known ? [names[0]] : []), child.tool]);
 		expect(executed.filter(tool => tool !== child.tool)).toHaveLength(count);
 	}
 	expect(rootContext?.messages).toEqual([]);
 	if (stopped) expect(drafts).toBe(1);
 	else {
-		expect(privateContexts).toHaveLength(1);
+		expect(privateContexts).toHaveLength(inflight ? 2 : 1);
 		const messages = privateContexts[0]!.messages;
 		expect(messages[0]).toMatchObject({ role: "assistant", content: [{ type: "thinking", thinking: "Inspect the input." }, ...roots.map((root, index) =>
 			({ type: "toolCall", id: `root-${index}`, name: root.tool, arguments: root.args }))] });
 		expect(messages.slice(1)).toEqual(expected.map((result, index) => expect.objectContaining({ role: "toolResult", toolCallId: `root-${index}`,
 			content: normalized ? [{ type: "text", text: JSON.stringify({ failedTests: mode === "canonical-mismatch" ? ["a.test.ts:3"] : [], artifact: "abc" }) }]
-				: mode === "mismatch-text" ? [{ type: "text", text: "incorrect forecast" }] : result.content, isError: mode === "mismatch-error" })));
+				: textMismatch ? [{ type: "text", text: "incorrect forecast" }] : result.content, isError: mode === "mismatch-error" })));
 	}
 	release.resolve();
-	if (mode !== "denied-root" && mode !== "abort-observation") await f.ready(count + Number(!stopped && mode !== "denied-child"));
+	if (mode !== "denied-root" && mode !== "abort-observation") await f.ready(count + Number((!stopped || recoverable) && mode !== "denied-child") + Number(wrong && !inflight && !repairBudget));
+	if (wrong && !repairBudget || recoverable) expect(privateContexts.at(-1)!.messages.slice(1)).toEqual(expected.map((result, index) => expect.objectContaining({
+		role: "toolResult", toolCallId: `root-${index}`, content: normalized ? canonicalize(result.content) : result.content, isError: false })));
 	const { budget, observations } = f.host.drafterBudgetSnapshot();
-	const forecasted = rootOnly || actualFirst || ["malformed-observation", "malformed-type", "abort-observation", "normalizer-failure", "request-failure", "malformed-extra"].includes(mode) ? 0 : count;
+	expect(budget.reportedTokens).toBe(rootOnly || ["abort-observation", "request-failure", "actual-before-failure"].includes(mode) ? 0 : 18);
+	const forecasted = rootOnly || actualFirst || ["malformed-observation", "malformed-type", "abort-observation", "normalizer-failure", "request-failure", "malformed-extra"].includes(mode) ? 0 : count - Number(known);
 	expect(observations).toEqual({ forecasted, compared: forecasted, matched: wrong ? 0 : forecasted });
 	expect(budget.requests).toBe(requests); expect(budget.reservedTokens).toBe(0);
-	expect(requests).toBe(rootOnly ? 1 : stopped ? 2 : 3);
-	if (mode === "budget") expect(budget.skippedRequests).toBe(1);
+	expect(requests).toBe((rootOnly ? 1 : stopped && !recoverable ? 2 : wrong && !repairBudget ? 4 : 3) + (mode === "unchanged" ? 2 : 0));
+	if (mode === "budget" || repairBudget) expect(budget.skippedRequests).toBe(1);
 	if (mode === "abort-observation") expect(budget.unreportedTokens).toBeGreaterThan(0);
 	if (mode === "normalizer-failure") expect(await f.execute(roots[0]!.tool, roots[0]!.args)).toMatchObject(expected[0]!);
-	if (stopped || mode === "denied-child") return;
+	if (stopped && !recoverable || mode === "denied-child") return;
 	if (mode === "canonical-version") version = "test-result/2";
 	if (mode === "canonical-schema") schema = Type.Array(schema.items, { minItems: 1 });
 	if (mode === "canonical-unbound") bound = false;
@@ -346,12 +370,14 @@ test.for(["independent", "batch", "mismatch-text", "mismatch-error", "parent-mis
 	expect(textOutput(await f.execute(child.tool, child.args))).toBe(dependent ? "prepared\n" : mode === "stale" ? "fresh\n" : "child\n");
 	expect(f.fallbacks).toEqual([]);
 	await f.finish();
-	if (mode === "stale") expect(f.events.filter(event => event.type === "actor_action").at(-1)).toMatchObject({ computation: { hiddenComputeMs: 0 } });
-	if (wrong || ["parent-miss", "canonical-version", "canonical-schema", "canonical-unbound"].includes(mode)) expect(f.events.some(event => event.type === "prediction" && event.tool === child.tool &&
+	if (mode === "stale" || repairBudget) expect(f.events.filter(event => event.type === "actor_action").at(-1)).toMatchObject({ computation: { hiddenComputeMs: 0 } });
+	if (wrong && !repairBudget || recoverable || actualFirst || known || contractChanged) expect(f.events.filter(event => event.type === "actor_action").at(-1)!.computation!.hiddenComputeMs).toBeGreaterThan(0);
+	if (wrong && !inflight || mode === "parent-miss" || contractChanged) expect(f.events.some(event => event.type === "prediction" && event.tool === child.tool &&
 		event.settlement.observation === "unobserved" && event.settlement.cause.code === "dependency_impossible")).toBe(true);
-	else expect(f.events.some(event => event.type === "prediction" && event.tool === child.tool &&
+	if (mode !== "parent-miss" && !repairBudget) expect(f.events.some(event => event.type === "prediction" && event.tool === child.tool &&
 		event.settlement.observation === "observed" && event.settlement.match.matched)).toBe(true);
-	expect(requests).toBe(budget.requests);
+	if (inflight) expect(executed.filter(tool => tool === child.tool)).toHaveLength(1);
+	expect(requests).toBe(budget.requests + Number(contractChanged)); expect(f.host.drafterBudgetSnapshot().budget.requests).toBe(requests);
 });
 
 test.each(["ordered", "independent", "dependent"])("adopts only the proven effects of a predicted workflow across prompts (%s)", async order => {
