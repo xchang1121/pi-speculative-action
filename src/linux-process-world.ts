@@ -2,12 +2,11 @@ import path from "node:path";
 import type { ActionKey } from "./action-semantics.ts";
 import type { SpeculativeAgentExecutionWorld } from "./agent-execution-world.ts";
 import { UNRESTRICTED_PROCESS_EFFECTS } from "./effect-model.ts";
-import { LinuxProcessReuseBackend, type LinuxProcessBackendOptions } from "./linux-process-backend.ts";
-import { restoreNativeDependency } from "./linux-process-sync.ts";
+import { LinuxProcessReuseBackend, type LinuxProcessSession, type LinuxProcessBackendOptions } from "./linux-process-backend.ts";
 import { ProcessExecutionCoordinator } from "./process-execution.ts";
 import type { ProcessExecutionBinding } from "./process-handoff.ts";
 import type { ExecutionOperationBinding } from "./execution-world.ts";
-import type { ToolInvocation } from "./tool-settlement.ts";
+import { toolErrorSettlement, type ToolInvocation } from "./tool-settlement.ts";
 import { WorkspaceSandboxService, type WorkspaceSandboxOptions } from "./workspace-sandbox.ts";
 
 export interface LinuxProcessExecutionWorldOptions extends LinuxProcessBackendOptions, WorkspaceSandboxOptions {
@@ -51,7 +50,7 @@ export function createLinuxProcessExecutionWorld(
 	let backendChecked = false;
 	const qualify = async (sourceRoot: string) => {
 		const root = path.resolve(sourceRoot);
-		const selected = await backend.processOwner().call<Awaited<ReturnType<WorkspaceSandboxService["qualify"]>>>("qualify", { options: workspaceOptions, cwd: root });
+		const selected = await workspaceSandbox.qualify(workspaceOptions, root);
 		qualifiedDrivers.set(root, selected);
 		return selected;
 	};
@@ -76,7 +75,7 @@ export function createLinuxProcessExecutionWorld(
 					throw new Error("Complete host process outlet is not bound");
 				const [processFingerprint, workspaceFingerprint] = await Promise.all([
 					backend.fingerprint(),
-					cwd ? qualify(cwd).then((selected) => selected.fingerprint) : backend.processOwner().call<string>("fingerprint", workspaceOptions),
+					cwd ? qualify(cwd).then((selected) => selected.fingerprint) : workspaceSandbox.fingerprint(workspaceOptions),
 				]);
 				return `${processFingerprint}:${workspaceFingerprint}`;
 			},
@@ -107,7 +106,7 @@ export function createLinuxProcessExecutionWorld(
 				const status = await backend.check();
 				if (status.state !== "ready") throw new Error(status.detail);
 				const selected = await qualify(cwd);
-				const prepared = await backend.processOwner().call<Awaited<ReturnType<WorkspaceSandboxService["prepare"]>>>("prepare", { cwd, options: { ...workspaceOptions, driver: selected.driver } }, signal);
+				const prepared = await workspaceSandbox.prepare(cwd, { ...workspaceOptions, driver: selected.driver, signal });
 				qualifiedDrivers.set(path.resolve(cwd), prepared);
 			},
 			execute: async (context) => {
@@ -116,18 +115,37 @@ export function createLinuxProcessExecutionWorld(
 			const sourceRoot = path.resolve(context.cwd);
 			const selected = operation && qualifiedDrivers.get(sourceRoot) || await qualify(sourceRoot);
 			const parent = workspaceSandbox.checkpoint(context.parentCheckpoint, sourceRoot);
-			const captured = await backend.processOwner().run({ cwd: sourceRoot, parent, scope: context.executionScope,
-				invocation: operation ? backend.serializeBinding(operation)! : invocation as NonNullable<ToolInvocation["process"]>, options: { ...workspaceOptions, driver: selected.driver } },
-				context.signal, async executor => ({ result: await options.coordinator.runWith(executor,
-					() => context.tool.execute(context.callID, context.args as never, context.signal)), isError: false }), context);
-			const branch = workspaceSandbox.branch({ cwd: sourceRoot, action: context.action, parentCheckpoint: context.parentCheckpoint, validate: captured.validate }, captured.snapshot);
-			const commit = branch.commit.bind(branch), dispose = branch.dispose?.bind(branch);
-			return Object.assign(branch, {
-				computationDependencies: captured.computations.flatMap(dependency => restoreNativeDependency(dependency) ?? []),
-				operations: Object.freeze(captured.bindings.flatMap(entry => { const binding = backend.restoreBinding(entry); return binding ? [describeOperation(binding, context.action)] : []; })),
-				commit: () => { if (operation) throw new Error("internal process output cannot commit an enclosing tool"); return captured.commit(commit); },
-				dispose: async () => { try { await dispose?.(); } finally { await captured.dispose(); } },
-			});
+			let session: LinuxProcessSession | undefined, launches = 0, exitCode: number | null | undefined;
+			try {
+				const snapshot = await backend.withProducer(() => workspaceSandbox.capture({ ...workspaceOptions, cwd: sourceRoot, driver: selected.driver,
+					preparation: operation ? selected : undefined, executionMetrics: () => ({ reuse: session?.metrics() }),
+					validate: () => session!.validate(), afterCapture: () => session!.seal([]),
+					execute: async workspace => {
+						session = await backend.open({ sourceRoot, workspace, invocation, scope: context.executionScope, signal: context.signal,
+							onOperationAdopted: context.onOperationAdopted, acceptOperationScope: context.acceptOperationScope, onOperationJoinable: context.onOperationJoinable });
+						try {
+							if (operation) { const result = await session.executeBinding(operation);
+								return { result: { content: [], details: result.suspended ? { suspended: true } : { exit: result.exit } }, isError: false }; }
+							const result = await options.coordinator.runWith({ execute: async request => {
+								launches++; return { exitCode } = await session!.executor.execute(request);
+							} }, () => context.tool.execute(context.callID, context.args as never, context.signal));
+							if (!launches) throw new Error("process-backed tool bypassed the process execution outlet");
+							return { result, isError: false };
+						} catch (error) {
+							if (launches !== 1 || typeof exitCode !== "number" || exitCode === 0) throw error;
+							return { ...toolErrorSettlement(error), exitCode };
+						} finally { await session.close(); }
+					},
+				}, parent));
+				const branch = workspaceSandbox.branch({ cwd: sourceRoot, action: context.action, parentCheckpoint: context.parentCheckpoint, validate: () => session!.validate() }, snapshot);
+				const commit = branch.commit.bind(branch), dispose = branch.dispose?.bind(branch);
+				return Object.assign(branch, {
+					computationDependencies: session!.computationDependencies(),
+					operations: Object.freeze(session!.executionBindings().map(binding => describeOperation(binding, context.action))),
+					commit: () => { if (operation) throw new Error("internal process output cannot commit an enclosing tool"); return session!.ownership.commit(commit); },
+					dispose: async () => { try { await dispose?.(); } finally { await session!.dispose?.(); } },
+				});
+			} catch (error) { await session?.dispose?.(); throw error; }
 			},
 		},
 		dispose: async () => {

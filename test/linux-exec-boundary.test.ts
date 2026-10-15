@@ -156,7 +156,7 @@ int main(int argc, char **argv) {
 				await using local = disposable(await backend.open({ sourceRoot: workspace, workspace: privateWorkspace, invocation, scope: { sessionID: "benchmark", turnID: "benchmark" } }));
 				expect((await executeProcess(fixture, local.executor, command)).exitCode).toBe(0);
 				if (!competing) return await consume();
-				return backend.observeNative(workspace, { sessionID: "benchmark", turnID: "benchmark", callID: "unrelated" }, undefined, async () => {
+				return await backend.observeNative(workspace, { sessionID: "benchmark", turnID: "benchmark", callID: "unrelated" }, undefined, async () => {
 					const child = spawn("/bin/sleep", ["30"], { cwd: workspace, env: { ...fixture.environment }, stdio: "ignore" }), closed = once(child, "close");
 					try {
 						if (scenario.name === "competing-whole") await expect(local.ownership.commit(async () => "whole branch")).resolves.toBe("whole branch");

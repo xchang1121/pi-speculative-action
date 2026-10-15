@@ -1,4 +1,3 @@
-import { once } from "node:events";
 import fs from "node:fs/promises";
 import net from "node:net";
 import { syncBuiltinESMExports } from "node:module";
@@ -6,8 +5,9 @@ import { mock } from "node:test";
 import { parentPort, workerData } from "node:worker_threads";
 
 // Faults and inspection run where production owns the work; no production test outlet is needed.
-if (workerData?.nativeProcessObserver) {
-	const [{ processTestPort: port }] = await once(parentPort, "message"), state = {
+if (workerData?.nativeProcessObserver) parentPort.on("message", ({ processTestPort: port }) => {
+	if (!port) return;
+	const state = {
 		fs, net,
 		deferred: () => Promise.withResolvers(),
 		method: (target, key, implementation) => {
@@ -22,4 +22,4 @@ if (workerData?.nativeProcessObserver) {
 			.finally(() => reply.close());
 	});
 	port.unref();
-}
+});

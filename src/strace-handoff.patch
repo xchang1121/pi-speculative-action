@@ -1,31 +1,35 @@
 --- a/src/defs.h
 +++ b/src/defs.h
-@@ -267,6 +267,9 @@ struct inject_opts {
+@@ -267,6 +267,13 @@
  struct tcb {
  	int flags;		/* See below for TCB_ values */
  	int pid;		/* If 0, this tcb is free */
++	void *broker_job, *exec_call, *exec_files;
++	struct tcb_wait_data *exec_deferred;
++	bool exec_table_busy;
++	int broker_fd;
 +	unsigned long handoff_tid;
 +	unsigned int handoff_tid_value, handoff_tid_state;
 +	uint64_t handoff_started, handoff_entered, handoff_prefix;
  	int qual_flg;		/* qual_flags[scno] or DEFAULT_QUAL_FLAGS + RAW */
  # if SUPPORTED_PERSONALITIES > 1
  	unsigned int currpers;	/* Personality at the time of scno update */
-@@ -857,6 +860,9 @@ getfdpath(struct tcb *tcp, int fd, char *buf, unsigned bufsize)
+@@ -857,6 +864,9 @@
  	return getfdpath_pid(tcp->pid, fd, buf, bufsize, NULL);
  }
- 
+
 +/* Whether read and write data on a descriptor naming a filesystem path is left out. */
 +extern bool elide_path_data;
 +
  extern unsigned long getfdinode(struct tcb *, int);
  extern enum sock_proto getfdproto(struct tcb *, int);
- 
+
 --- a/src/io.c
 +++ b/src/io.c
 @@ -13,6 +13,23 @@
  #include <fcntl.h>
  #include <sys/uio.h>
- 
+
 +/* File bytes are captured from the filesystem itself; a stream's are only in the trace. */
 +static bool
 +path_data_elided(struct tcb *tcp, const kernel_ulong_t fd)
@@ -46,25 +50,25 @@
  SYS_FUNC(read)
  {
  	if (entering(tcp)) {
-@@ -24,7 +41,7 @@ SYS_FUNC(read)
+@@ -24,7 +41,7 @@
  		if (syserror(tcp))
  			printaddr(tcp->u_arg[1]);
  		else
 -			printstrn(tcp, tcp->u_arg[1], tcp->u_rval);
 +			print_fd_data(tcp, tcp->u_arg[0], tcp->u_arg[1], tcp->u_rval);
  		tprint_arg_next();
- 
+
  		/* count */
-@@ -40,7 +57,7 @@ SYS_FUNC(write)
+@@ -40,7 +57,7 @@
  	tprint_arg_next();
- 
+
  	/* buf */
 -	printstrn(tcp, tcp->u_arg[1], tcp->u_arg[2]);
 +	print_fd_data(tcp, tcp->u_arg[0], tcp->u_arg[1], tcp->u_arg[2]);
  	tprint_arg_next();
- 
+
  	/* count */
-@@ -155,7 +172,7 @@ SYS_FUNC(readv)
+@@ -155,7 +172,7 @@
  	} else {
  		/* iov */
  		tprint_iov_upto(tcp, tcp->u_arg[2], tcp->u_arg[1], tcp->u_rval,
@@ -73,35 +77,35 @@
  					      : iov_decode_str,
  				NULL);
  		tprint_arg_next();
-@@ -173,7 +190,7 @@ SYS_FUNC(writev)
+@@ -173,7 +190,7 @@
  	tprint_arg_next();
- 
+
  	/* iov */
 -	tprint_iov(tcp, tcp->u_arg[2], tcp->u_arg[1], iov_decode_str);
 +	tprint_iov(tcp, tcp->u_arg[2], tcp->u_arg[1], path_data_elided(tcp, tcp->u_arg[0]) ? iov_decode_addr : iov_decode_str);
  	tprint_arg_next();
- 
+
  	/* iovcnt */
-@@ -193,7 +210,7 @@ SYS_FUNC(pread)
+@@ -193,7 +210,7 @@
  		if (syserror(tcp))
  			printaddr(tcp->u_arg[1]);
  		else
 -			printstrn(tcp, tcp->u_arg[1], tcp->u_rval);
 +			print_fd_data(tcp, tcp->u_arg[0], tcp->u_arg[1], tcp->u_rval);
  		tprint_arg_next();
- 
+
  		/* count */
-@@ -213,7 +230,7 @@ SYS_FUNC(pwrite)
+@@ -213,7 +230,7 @@
  	tprint_arg_next();
- 
+
  	/* buf */
 -	printstrn(tcp, tcp->u_arg[1], tcp->u_arg[2]);
 +	print_fd_data(tcp, tcp->u_arg[0], tcp->u_arg[1], tcp->u_arg[2]);
  	tprint_arg_next();
- 
+
  	/* count */
-@@ -257,7 +274,7 @@ do_preadv(struct tcb *tcp, const int flags_arg)
- 
+@@ -257,7 +274,7 @@
+
  		/* iov */
  		tprint_iov_upto(tcp, len, tcp->u_arg[1], tcp->u_rval,
 -				syserror(tcp) ? iov_decode_addr
@@ -109,14 +113,14 @@
  					      : iov_decode_str,
  				NULL);
  		tprint_arg_next();
-@@ -295,7 +312,7 @@ do_pwritev(struct tcb *tcp, const int flags_arg)
+@@ -295,7 +312,7 @@
  	tprint_arg_next();
- 
+
  	/* iov */
 -	tprint_iov(tcp, len, tcp->u_arg[1], iov_decode_str);
 +	tprint_iov(tcp, len, tcp->u_arg[1], path_data_elided(tcp, tcp->u_arg[0]) ? iov_decode_addr : iov_decode_str);
  	tprint_arg_next();
- 
+
  	/* iovcnt */
 --- a/src/strace.c
 +++ b/src/strace.c
@@ -130,10 +134,23 @@
 +#include <stddef.h>
 +#include <dlfcn.h>
 +#include <sys/socket.h>
- 
+
  #include "kill_save_errno.h"
  #include "exitkill.h"
-@@ -838,9 +844,10 @@
+@@ -175,6 +181,12 @@
+ 	siginfo_t si;        /**< siginfo, returned by PTRACE_GETSIGINFO */
+ };
+
++static void *(*broker_start)(pid_t, const char *, int *);
++static int (*broker_finish)(void *, int);
++static const char *exec_context_source, *exec_context_name, *exec_context_comm;
++static void (*drop_exec_files)(pid_t, void **, void **, const char *, int);
++static int (*exec_call_ready)(void *);
++static int (*clone_exec_files)(void **, void **, int);
+ static struct tcb **tcbtab;
+ static unsigned int nprocs;
+ static size_t tcbtabsize;
+@@ -838,9 +850,10 @@
  	tprint_associated_info_end();
  }
 
@@ -147,7 +164,7 @@
  	/* If -ff, "previous tcb we printed" is always the same as current,
  	 * because we have per-tcb output files.
  	 */
-@@ -866,6 +873,13 @@
+@@ -866,6 +879,13 @@
  		}
  	}
 
@@ -161,13 +178,26 @@
  	printing_tcp = tcp;
  	set_current_tcp(tcp);
  	current_tcp->curcol = 0;
-@@ -2231,6 +2245,184 @@ add_path_trace(struct pathtrace *pt, const char *path)
+@@ -1098,6 +1118,9 @@
+ static void
+ droptcb(struct tcb *tcp)
+ {
++    free(tcp->exec_deferred); tcp->exec_deferred = NULL;
++    if (drop_exec_files) drop_exec_files(tcp->pid, &tcp->exec_files, &tcp->exec_call, exec_context_source, 0);
++	if (tcp->broker_job) { broker_finish(tcp->broker_job, 1); tcp->broker_job = NULL; }
+ 	if (tcp->pid == 0)
+ 		return;
+
+@@ -2231,6 +2254,213 @@
   * Don't want main() to inline us and defeat the reason
   * we have a separate function.
   */
 +static int handoff_fd = -1;
 +static bool children_only;
 +bool elide_path_data;
++static int (*prepare_exec_call)(pid_t, void **, void **, const char *);
++static int (*step_exec_call)(pid_t, void **, void **, int);
++static int (*restore_exec_context)(pid_t, const char *, const char *, const char *, void **);
 +static int thread_group(int pid)
 +{
 +    char path[64], line[256];
@@ -343,22 +373,51 @@
 +    }
 +}
 +
++static void broker_signal(int signal) { (void)signal; }
++static bool start_exec_broker(struct tcb *tcp) {
++    tcp->broker_job = broker_start(tcp->pid, exec_context_source, &tcp->broker_fd);
++    if (tcp->broker_fd == -2) error_msg_and_die("start post-exec broker for %d", tcp->pid);
++    return tcp->broker_job != NULL;
++}
++static size_t broker_jobs(struct pollfd *polling, bool settle)
++{
++    size_t count = 0;
++    for (size_t i = 0; i < tcbtabsize; i++) {
++        struct tcb *tcp = tcbtab[i];
++        if (!tcp->pid || !tcp->broker_job) continue;
++        struct pollfd ready = {.fd = tcp->broker_fd, .events = POLLIN};
++        if (settle && poll(&ready, 1, 0) > 0) {
++            int result = broker_finish(tcp->broker_job, 0); tcp->broker_job = NULL;
++            if (result < 0) error_msg_and_die("post-exec decision for %d", tcp->pid);
++            if (result > 1) {
++                struct tcb *saved = current_tcp;
++                printleader(tcp); tprints_string("pi_brokered_exec() = 0"); tprint_newline(); line_ended(); set_current_tcp(saved);
++            }
++            if (ptrace_restart(PTRACE_SYSCALL, tcp, result > 2 ? result - 2 : 0) < 0) perror_msg_and_die("post-exec resume");
++        } else { if (polling) polling[count] = ready; count++; }
++    }
++    return count;
++}
++
  static void ATTRIBUTE_NOINLINE
  init(int argc, char *argv[])
  {
-@@ -2364,6 +2556,11 @@ init(int argc, char *argv[])
+@@ -2364,6 +2594,14 @@
  		{ "help",		no_argument,	   0, 'h' },
  		{ "instruction-pointer", no_argument,      0, 'i' },
  		{ "interruptible",	required_argument, 0, 'I' },
 +		{ "handoff-fd", required_argument, 0, 0x4000 },
-+        { "handoff-frontier-library", required_argument, 0, 0x4001 },
++        { "process-library", required_argument, 0, 0x4001 },
 +        { "handoff-image", required_argument, 0, 0x4002 },
 +        { "trace-children-only", no_argument, 0, 0x4003 },
 +        { "elide-path-data", no_argument, 0, 0x4004 },
++        { "exec-context-source", required_argument, 0, 0x4005 },
++        { "exec-context-name", required_argument, 0, 0x4006 },
++        { "exec-context-comm", required_argument, 0, 0x4007 },
  		{ "kill-on-exit",	no_argument,	   0, GETOPT_KILL_ON_EXIT },
  		{ "stack-trace" ,	optional_argument, 0, GETOPT_STACK },
  		{ "stack-traces" ,	optional_argument, 0, GETOPT_STACK },
-@@ -2564,6 +2761,15 @@ init(int argc, char *argv[])
+@@ -2564,6 +2802,18 @@
  					  "by this build of strace");
  #endif
  			break;
@@ -371,20 +430,23 @@
 +        case 0x4002: handoff_image = optarg; break;
 +        case 0x4003: children_only = true; break;
 +        case 0x4004: elide_path_data = true; break;
++        case 0x4005: exec_context_source = optarg; break;
++        case 0x4006: exec_context_name = optarg; break;
++        case 0x4007: exec_context_comm = optarg; break;
  		case GETOPT_KILL_ON_EXIT:
  			opt_kill_on_exit = true;
  			break;
-@@ -3007,6 +3213,9 @@ init(int argc, char *argv[])
- 
+@@ -3007,6 +3257,9 @@
+
  	debug_msg("ptrace_setoptions = %#x", ptrace_setoptions);
  	test_ptrace_seize();
 +    if (handoff_fd >= 0 && (!use_seize || !opt_kill_on_exit || followfork != 1 || daemonized_tracer || !handoff_library || !handoff_image)) {
 +        error_msg_and_die("handoff requires seized, non-daemonized -f --kill-on-exit");
 +    }
  	test_ptrace_get_syscall_info();
- 
+
  	/*
-@@ -3288,6 +3497,12 @@ static struct tcb *
+@@ -3288,6 +3541,12 @@
  maybe_allocate_tcb(const int pid, int status)
  {
  	if (!WIFSTOPPED(status)) {
@@ -397,7 +459,7 @@
  		if (detach_on_execve && pid == strace_child) {
  			/* example: strace -bexecve sh -c 'exec true' */
  			strace_child = 0;
-@@ -3304,6 +3519,11 @@ maybe_allocate_tcb(const int pid, int status)
+@@ -3304,6 +3563,11 @@
  		return NULL;
  	}
  	if (followfork) {
@@ -409,27 +471,133 @@
  		/* We assume it's a fork/vfork/clone child */
  		struct tcb *tcp = alloctcb(pid);
  		after_successful_attach(tcp, post_attach_sigstop);
-@@ -3588,6 +3808,7 @@ tcb_wait_tab_check_size(const size_t size)
+@@ -3585,9 +3849,22 @@
+ 	}
+ }
+
++static bool exec_interposition_busy(struct tcb *tcp) {
++    if (!tcp->exec_files) return false;
++    for (unsigned index = 0; index < tcbtabsize; index++) {
++        struct tcb *peer = tcbtab[index];
++        if (peer != tcp && peer->pid && peer->exec_files == tcp->exec_files && (peer->exec_call || peer->exec_table_busy)) return true;
++    }
++    return false;
++}
++
  static const struct tcb_wait_data *
  next_event(void)
  {
++    static struct tcb_wait_data *resumed_exec;
++    free(resumed_exec); resumed_exec = NULL;
++	size_t decisions = broker_jobs(NULL, true); bool retiring_exec = false;
 +	handoff_request();
  	if (interrupted)
  		return NULL;
- 
-@@ -3913,6 +4134,8 @@ dispatch_event(const struct tcb_wait_data *wd)
+
+@@ -3619,6 +3896,16 @@
+ 		debug_msg("dequeued extra event for pid %u", tcp->pid);
+ 		goto next_event_exit;
+ 	}
++
++    for (unsigned index = 0; index < tcbtabsize; index++) {
++        tcp = tcbtab[index];
++        if (!tcp->pid || !tcp->exec_deferred) continue;
++        if (tcp->exec_deferred->te == TE_STOP_BEFORE_EXIT) {
++            if (!exec_call_ready(tcp->exec_call)) { retiring_exec = true; continue; }
++        } else if (exec_interposition_busy(tcp)) continue;
++        resumed_exec = tcp->exec_deferred; tcp->exec_deferred = NULL;
++        clear_regs(tcp); set_current_tcp(tcp); return resumed_exec;
++    }
+
+ 	/*
+ 	 * Used to exit simply when nprocs hits zero, but in this testcase:
+@@ -3663,8 +3950,21 @@
+ 	 */
+ 	int status;
+ 	struct rusage ru;
+-	int pid = wait4(-1, &status, __WALL, (cflag ? &ru : NULL));
+-	int wait_errno = errno;
++    decisions += retiring_exec;
++    sigset_t previous, blocked;
++    if (decisions) { sigemptyset(&blocked); sigaddset(&blocked, SIGCHLD); sigprocmask(SIG_BLOCK, &blocked, &previous); }
++    int pid = wait4(-1, &status, __WALL | (decisions ? WNOHANG : 0), (cflag ? &ru : NULL));
++    int wait_errno = errno;
++    if (decisions) {
++        if (pid == 0) {
++            struct pollfd *polling = xcalloc(decisions, sizeof(*polling));
++            size_t count = broker_jobs(polling, false); sigset_t waiting = previous; sigdelset(&waiting, SIGCHLD);
++            struct timespec retry = {.tv_nsec = 1000000};
++            if (ppoll(polling, count, retiring_exec ? &retry : NULL, &waiting) < 0 && errno != EINTR) perror_msg_and_die("post-exec wait");
++            free(polling);
++        }
++        sigprocmask(SIG_SETMASK, &previous, NULL);
++    }
+
+ 	/*
+ 	 * The window of opportunity to handle expirations
+@@ -3802,6 +4102,23 @@
+ 					wd->te = TE_RESTART;
+ 				}
+ 				break;
++            case PTRACE_EVENT_FORK:
++            case PTRACE_EVENT_CLONE:
++            case PTRACE_EVENT_VFORK:
++                tcp->exec_table_busy = false;
++                if (exec_context_source && !(children_only && tcp->pid == strace_child)) {
++                    if (ptrace(PTRACE_GETEVENTMSG, pid, NULL, &wd->msg) < 0) error_msg_and_die("read exec memory child for %d", pid);
++                    uint64_t flags = event == PTRACE_EVENT_VFORK ? 0x100 : 0;
++                    if (tcp->s_ent && !strcmp(tcp->s_ent->sys_name, "clone")) flags = tcp->u_arg[0];
++                    if (tcp->s_ent && !strcmp(tcp->s_ent->sys_name, "clone3") && umoven(tcp, tcp->u_arg[0], sizeof(flags), &flags) < 0)
++                        error_msg_and_die("read clone flags for %d", pid);
++                    struct tcb *child = pid2tcb(wd->msg);
++                    if (!child) child = maybe_allocate_tcb(wd->msg, status);
++                    if (!child || clone_exec_files(&tcp->exec_files, &child->exec_files, (flags & 0x400) != 0) < 0)
++                        error_msg_and_die("clone exec memory for %d", pid);
++                }
++                wd->te = TE_RESTART;
++                break;
+ 			case PTRACE_EVENT_EXEC:
+ 					/*
+ 					 * TODO: shouldn't we check for
+@@ -3882,6 +4199,15 @@
+ {
+ 	if (entering(tcp)) {
+ 		int res = syscall_entering_decode(tcp);
++        if (res == 1 && exec_context_source && !(children_only && tcp->pid == strace_child)) {
++            const char *name = tcp->s_ent->sys_name;
++            tcp->exec_table_busy = !strcmp(name, "clone") || !strcmp(name, "clone3") || !strcmp(name, "fork") || !strcmp(name, "vfork") ||
++                !strcmp(name, "unshare") || !strcmp(name, "close_range") || !strcmp(name, "close") ||
++                !strcmp(name, "dup") || !strcmp(name, "dup2") || !strcmp(name, "dup3") ||
++                !strcmp(name, "getdents") || !strcmp(name, "getdents64") ||
++                (!strcmp(name, "fcntl") && (tcp->u_arg[1] <= 2 || tcp->u_arg[1] == 1030));
++        }
++
+ 		switch (res) {
+ 		case 0:
+ 			return 0;
+@@ -3913,6 +4239,8 @@
  	 * around union wait fixed by glibc commit glibc-2.24~391
  	 */
  	int status = wd ? wd->status : 0;
 +    if (handoff_watch_stop(current_tcp, status)) return true;
 +    if (WIFSTOPPED(status) && ((unsigned)status >> 16 == PTRACE_EVENT_STOP || WSTOPSIG(status) == syscall_trap_sig) && handoff_stop(current_tcp, false)) return true;
- 
+
  	if (current_tcp && has_seccomp_filter(current_tcp))
  		restart_op = seccomp_filter_restart_operator(current_tcp);
-@@ -3951,6 +4174,15 @@ dispatch_event(const struct tcb_wait_data *wd)
+@@ -3951,7 +4279,39 @@
  		ATTRIBUTE_FALLTHROUGH;
- 
+
  	case TE_SYSCALL_STOP:
+-		if (trace_syscall(current_tcp, &restart_sig) < 0) {
++        if (!current_tcp->exec_call && entering(current_tcp) && exec_interposition_busy(current_tcp)) {
++            current_tcp->exec_deferred = copy_trace_wait_data(wd); return true;
++        }
++        if (current_tcp->exec_call || exec_context_source) {
++            int step = step_exec_call(current_tcp->pid, &current_tcp->exec_call, &current_tcp->exec_files, exiting(current_tcp));
++            if (step < 0) { if (errno == ESRCH) return true; error_msg_and_die("advance exec call for %d", current_tcp->pid); }
++            if ((step & 2) && (step & 4) && start_exec_broker(current_tcp)) return true;
++            if (step) { restart_op = PTRACE_SYSCALL; break; }
++        }
 +        if (handoff_fd >= 0 && entering(current_tcp)) {
 +            current_tcp->handoff_entered = handoff_clock();
 +            finish_pending_output(current_tcp);
@@ -439,25 +607,55 @@
 +            current_tcp->handoff_prefix = (uint64_t)prefix;
 +        }
 +        handoff_watch(current_tcp);
- 		if (trace_syscall(current_tcp, &restart_sig) < 0) {
++        bool completed_syscall = exiting(current_tcp);
++        bool completed_exec = exec_context_source && !(children_only && current_tcp->pid == strace_child) && completed_syscall && current_tcp->s_ent &&
++            (!strcmp(current_tcp->s_ent->sys_name, "execve") || !strcmp(current_tcp->s_ent->sys_name, "execveat"));
++		int traced = trace_syscall(current_tcp, &restart_sig);
++        if (completed_syscall) current_tcp->exec_table_busy = false;
++        if (completed_syscall && !syserror(current_tcp) && current_tcp->exec_files && current_tcp->s_ent &&
++            ((!strcmp(current_tcp->s_ent->sys_name, "unshare") && (current_tcp->u_arg[0] & 0x400)) ||
++             (!strcmp(current_tcp->s_ent->sys_name, "close_range") && (current_tcp->u_arg[2] & 2)))) {
++            void *files = NULL;
++            if (clone_exec_files(&current_tcp->exec_files, &files, 0) < 0) error_msg_and_die("split exec files for %d", current_tcp->pid);
++            drop_exec_files(current_tcp->pid, &current_tcp->exec_files, &current_tcp->exec_call, exec_context_source, 0);
++            current_tcp->exec_files = files;
++        }
++
++        if (traced < 0) {
  			/*
  			 * ptrace() failed in trace_syscall().
-@@ -3965,6 +4197,12 @@ dispatch_event(const struct tcb_wait_data *wd)
+ 			 * Likely a result of process disappearing mid-flight.
+@@ -3963,6 +4323,27 @@
+ 			 * we can let this process to report its death to us
+ 			 * normally, via WIFEXITED or WIFSIGNALED wait status.
  			 */
- 			return true;
- 		}
++			return true;
++		}
++        if (!completed_exec && exec_context_source && !(children_only && current_tcp->pid == strace_child) &&
++            exiting(current_tcp) && current_tcp->s_ent &&
++            (!strcmp(current_tcp->s_ent->sys_name, "execve") || !strcmp(current_tcp->s_ent->sys_name, "execveat")) &&
++            prepare_exec_call(current_tcp->pid, &current_tcp->exec_call, &current_tcp->exec_files, exec_context_source) < 0)
++            error_msg_and_die("prepare exec call for %d", current_tcp->pid);
++        if (completed_exec) {
++            if (!syserror(current_tcp)) drop_exec_files(current_tcp->pid, &current_tcp->exec_files, &current_tcp->exec_call, exec_context_source, 1);
++            if (!syserror(current_tcp)) {
++                int restored = restore_exec_context(current_tcp->pid, exec_context_source, exec_context_name, exec_context_comm, &current_tcp->exec_call);
++                if (restored < 0) error_msg_and_die("restore exec context for %d", current_tcp->pid);
++                if (restored & 1) exec_context_name = exec_context_comm = NULL;
++                if (restored & 8) { restart_op = PTRACE_SYSCALL; break; }
++                if ((restored & 2) && start_exec_broker(current_tcp)) return true;
++            }
++        }
 +        if (exiting(current_tcp) && handoff_stop(current_tcp, true)) return true;
 +		/* Once the launcher has recorded the command's start, it runs untraced too. */
 +		if (children_only && current_tcp->pid == strace_child && entering(current_tcp) && started_process(current_tcp)) {
 +			detach(current_tcp);
-+			return true;
-+		}
+ 			return true;
+ 		}
  		if (has_seccomp_filter(current_tcp)) {
- 			/*
- 			 * Syscall and seccomp stops can happen in different
-@@ -4034,6 +4272,9 @@ dispatch_event(const struct tcb_wait_data *wd)
+@@ -4034,6 +4415,9 @@
  		return true;
- 
+
  	case TE_STOP_BEFORE_EXECVE:
 +        current_tcp->handoff_tid = 0;
 +        current_tcp->handoff_tid_state = 0;
@@ -465,18 +663,34 @@
  		/* The syscall succeeded, clear the flag.  */
  		current_tcp->flags &= ~TCB_CHECK_EXEC_SYSCALL;
  		/*
-@@ -4231,6 +4472,14 @@ main(int argc, char *argv[])
+@@ -4072,6 +4456,10 @@
+ 		break;
+
+ 	case TE_STOP_BEFORE_EXIT:
++        if (current_tcp->exec_call && !exec_call_ready(current_tcp->exec_call)) {
++            current_tcp->exec_deferred = copy_trace_wait_data(wd); return true;
++        }
++        if (drop_exec_files) drop_exec_files(current_tcp->pid, &current_tcp->exec_files, &current_tcp->exec_call, exec_context_source, 0);
+ 		print_event_exit(current_tcp);
+ 		break;
+ 	}
+@@ -4231,6 +4619,19 @@
  {
  	setlocale(LC_ALL, "");
  	init(argc, argv);
 +	if (handoff_library) {
 +        void *library = dlopen(handoff_library, RTLD_NOW | RTLD_LOCAL);
-+        if (!library || !handoff_image) error_msg_and_die("invalid handoff library: %s", dlerror());
++        if (!library) error_msg_and_die("invalid handoff library: %s", dlerror());
 +        handoff_capture = dlsym(library, "pi_prepare_process_image");
 +        handoff_frontier = dlsym(library, "pi_process_image_frontier");
-+        if (!handoff_capture || !handoff_frontier) error_msg_and_die("incompatible capture ABI");
++        restore_exec_context = dlsym(library, "pi_restore_exec_context");
++        step_exec_call = dlsym(library, "pi_step_exec_call"); prepare_exec_call = dlsym(library, "pi_prepare_exec_call"); drop_exec_files = dlsym(library, "pi_drop_exec_files"); clone_exec_files = dlsym(library, "pi_clone_exec_files"); exec_call_ready = dlsym(library, "pi_exec_call_ready");
++        broker_start = dlsym(library, "pi_broker_start");
++        broker_finish = dlsym(library, "pi_broker_finish");
++        set_sighandler(SIGCHLD, broker_signal, NULL);
++        if (!exec_call_ready || !step_exec_call || !drop_exec_files || !clone_exec_files || !prepare_exec_call || !handoff_capture || !handoff_frontier || !restore_exec_context || !broker_start || !broker_finish) error_msg_and_die("incompatible capture ABI");
 +    }
 +	if (handoff_fd >= 0) set_sighandler(SIGUSR2, handoff_signal, NULL);
- 
+
  	exit_code = !nprocs;
- 
+

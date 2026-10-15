@@ -99,12 +99,13 @@ async function qualifySandlock(binary) {
 		await run(binary, ["run", "--chroot", "/", "--fs-read", "/", "--exec-mount", `/bin/false:${image}`, "--", "/bin/false"], 42);
 		await copyFile(heldExec, image);
 		await chmod(image, 0o755);
-		// The launcher reaches a broker from inside the sandbox, which answers with a zero exit in place of /bin/false.
-		const configuration = path.join(root, "configuration"), broker = net.createServer({ allowHalfOpen: true }, socket => socket.resume().on("end", () => socket.end("x 0\n")));
-		await writeFile(configuration, `${path.join(root, "broker")}\ntoken\n`);
-		await writeFile(path.join(view, ".pi-spec-dispatch"), `PI_SPEC_DISPATCH\n${configuration}\n/bin\n/bin\n`, { mode: 0o600 });
+		// Qualify the same stopped-image route used by the producer; the broker replaces /bin/false's exit.
+		const broker = net.createServer({ allowHalfOpen: true }, socket => socket.resume().on("end", () => socket.end("x 0\n")));
+		await writeFile(`${image}.configuration`, `${path.join(root, "broker")}\ntoken\n`, { mode: 0o600 });
 		await new Promise(resolve => broker.listen(path.join(root, "broker"), resolve));
-		try { await run(binary, ["run", "--chroot", "/", "--fs-read", "/", "--fs-write", path.join(root, "broker"), "--exec-mount", `/bin/false:${image}`, "--", "/bin/false"]); }
+		try { await run(path.join(localBin, "pi-speculative-strace"), ["--kill-on-exit", "--trace-children-only", "-f", "-q", "-e", "trace=none", "-o", "/dev/null",
+			`--process-library=${heldExec}.so`, `--exec-context-source=${image}`, "--",
+			binary, "run", "--chroot", "/", "--fs-read", "/", "--fs-write", path.join(root, "broker"), "--exec-mount", `/:${image}`, "--", "/bin/false"]); }
 		finally { broker.close(); }
 	} finally {
 		await rm(root, { recursive: true, force: true });
@@ -131,7 +132,7 @@ async function installStrace() {
 	const patch = await readFile(STRACE_PATCH), sourceDigest = sha256(STRACE_SHA256, patch);
 	const qualify = async binary => {
 		await run(binary, ["--kill-on-exit", "-f", "-q", "-e", "trace=none", "-o", "/dev/null",
-			`--handoff-frontier-library=${heldExec}.so`, "--handoff-image=/dev/null", "--", "/bin/true"]);
+			`--process-library=${heldExec}.so`, "--handoff-image=/dev/null", "--", "/bin/true"]);
 	};
 	return installNative(path.join(localBin, "pi-speculative-strace"), sourceDigest, qualify, async (buildRoot, temporary) => {
 		const git = await executable(["git"]), tar = await executable(["tar"]), make = await executable(["make"]);

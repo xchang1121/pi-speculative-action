@@ -18,10 +18,13 @@ export class ProcessHandoffOwnership {
 	private readonly observer?: WeakRef<(adoption: ExecutionOperationAdoption) => void>;
 	private readonly scopeOwner?: WeakRef<(scope: ExecutionScope, salvage?: boolean) => boolean>;
 	private readonly consumer?: ExecutionScope;
+	private readonly commitInOwner?: <T>(apply: () => Promise<T>) => Promise<T>;
 
 	constructor(observer?: (adoption: ExecutionOperationAdoption) => void, acceptScope?: (scope: ExecutionScope, salvage?: boolean) => boolean,
-		consumer?: ExecutionScope, authority = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT)) {
+		consumer?: ExecutionScope, authority = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT),
+		commitInOwner?: <T>(apply: () => Promise<T>) => Promise<T>) {
 		this.authority = new Int32Array(authority);
+		this.commitInOwner = commitInOwner;
 		this.consumer = snapshotExecutionScope(consumer);
 		if (observer) this.observer = new WeakRef(observer);
 		if (acceptScope) this.scopeOwner = new WeakRef(acceptScope);
@@ -51,10 +54,10 @@ export class ProcessHandoffOwnership {
 
 	async commit<T>(apply: () => Promise<T>): Promise<T> {
 		if (this.transfer?.apply.deref() === apply) return this.transfer.result as Promise<T>;
-		const state = Atomics.compareExchange(this.authority, 0, 0, BRANCH.whole);
+		const state = this.commitInOwner ? Atomics.load(this.authority, 0) || (this.committing ? BRANCH.whole : 0) : Atomics.compareExchange(this.authority, 0, 0, BRANCH.whole);
 		if (state) throw effectCommitFailure(new Error(state & BRANCH.partial ? "process execution was partially consumed" : "process execution was already claimed"), "recoverable");
-		const result = Promise.resolve().then(apply).catch(error => {
-			if (error instanceof EffectCommitFailure && error.disposition === "recoverable") { Atomics.store(this.authority, 0, 0); this.transfer = undefined; }
+		const result = Promise.resolve().then(() => this.commitInOwner ? this.commitInOwner(apply) : apply()).catch(error => {
+			if (error instanceof EffectCommitFailure && error.disposition === "recoverable") { if (!this.commitInOwner) Atomics.store(this.authority, 0, 0); this.transfer = undefined; }
 			throw error;
 		}).finally(() => { if (this.committing === result) this.committing = undefined; });
 		this.committing = result;

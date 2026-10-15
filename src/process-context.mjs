@@ -12,11 +12,8 @@ import { readFile, readlink, stat } from "node:fs/promises";
  * }} ProcessExecutionContext */
 
 /** @typedef {Record<"dev" | "ino" | "mode" | "uid" | "gid" | "rdev", string>} RawStat */
-/** @typedef {{ readonly status: string, readonly limits: string, readonly processStat: string, readonly shell: RawStat,
- * readonly descriptors: readonly { readonly fd: number, readonly stat: RawStat, readonly endpoint?: string, readonly fdinfo: string }[] }} RawProcessContext */
-
 /**
- * Read the same kernel context for a stopped Actor image as the native launcher reports for itself (processContextFromRaw).
+ * Read the kernel context while the Actor image is stopped or its dispatcher waits for the owner.
  * The caller owns the inherited table: ptrace observes it after exec. Endpoint aliases below describe
  * buffered stdio routing, not general open-file-description identity.
  * @param {number} pid
@@ -35,26 +32,13 @@ export async function captureProcessContext(pid, inheritedDescriptors, regularDe
 	/** @param {import("node:fs").BigIntStats} metadata @returns {RawStat} */
 	const fields = metadata => /** @type {RawStat} */ (Object.fromEntries(["dev", "ino", "mode", "uid", "gid", "rdev"].map(name =>
 		[name, String(metadata[/** @type {keyof typeof metadata} */ (name)])])));
-	const [status, limits, processStat, shell, descriptors] = await Promise.all([
+	const [status, limits, processStat, shell, reported] = await Promise.all([
 		readFile(`${root}/status`, "utf8"), readFile(`${root}/limits`, "utf8"), readFile(`${root}/stat`, "utf8"), stat("/bin/sh", { bigint: true }),
 		Promise.all([...new Set(inheritedDescriptors.map(Number))].sort((a, b) => a - b).map(async fd => {
 			const [metadata, endpoint, fdinfo] = await Promise.all([stat(`${root}/fd/${fd}`, { bigint: true }), readlink(`${root}/fd/${fd}`), readFile(`${root}/fdinfo/${fd}`, "utf8")]);
 			return { fd, stat: fields(metadata), endpoint, fdinfo };
 		})),
 	]);
-	return processContextFromRaw({ status, limits, processStat, shell: fields(shell), descriptors }, regularDescriptors ?? []);
-}
-
-/**
- * A context from what a process reported, fd 0 closed when absent. With `regularDescriptors` (held evidence), every
- * regular, null, directory or eventfd stream and every proven queue must match its native OFD proof.
- * Capture does not authorize reuse: the broker bypasses unsupported streams for native fallback.
- * @param {RawProcessContext} raw
- * @param {readonly HeldFileDescriptor[]} [regularDescriptors]
- * @returns {ProcessExecutionContext}
- */
-export function processContextFromRaw({ status, limits, processStat, shell, descriptors: reported }, regularDescriptors) {
-	if (!reported.every(({ fd }, index) => Number.isSafeInteger(fd) && fd >= 0 && (index === 0 || fd > reported[index - 1].fd))) throw new Error("invalid reported descriptors");
 	const descriptors = [...(reported[0]?.fd === 0 ? [] : [undefined]), ...reported].map(item => {
 		if (!item) return { fd: 0, endpoint: undefined, type: /** @type {DescriptorType} */ ("closed"), identity: "closed:0", flags: 0, queue: undefined };
 		const { fd, stat: metadata, endpoint, fdinfo: info } = item, format = BigInt(metadata.mode) & 0o170000n;
@@ -97,7 +81,7 @@ export function processContextFromRaw({ status, limits, processStat, shell, desc
 		executionDomain: "ptrace",
 		rlimits: limits.split("\n").slice(1).map(line => line.trim().split(/\s{2,}/).slice(0, 2)),
 		credentials: { uid: uid[0], euid: uid[1], gid: gid[0], egid: gid[1], groups },
-		systemMetadata: Object.fromEntries(["dev", "ino", "mode", "uid", "gid", "rdev"].map(name => [name, String(shell[/** @type {keyof RawStat} */ (name)])])),
+		systemMetadata: fields(shell),
 		signals: { blocked: field("SigBlk"), ignored: field("SigIgn") },
 		scheduling: {
 			nice: Number(processStat.slice(processStat.lastIndexOf(") ") + 2).trim().split(/\s+/)[16]),

@@ -21,6 +21,7 @@ import { testModel } from "./model.ts";
 import type { ProcessProvenanceCertificate } from "../src/provenance-certificate.ts";
 
 export type LinuxProcessBenchmark = Readonly<Awaited<ReturnType<typeof createLinuxProcessBenchmark>>>;
+process.execArgv.push("--import", new URL("./process-owner-fixture.mjs", import.meta.url).href);
 
 export function patternProcessHost(fixture: LinuxProcessBenchmark, sessionID: string, settings: SpeculativeAgentSettingsInput,
 	options: Partial<CreateSpeculativeActionHostOptions> = {}, tools = [fixture.tool]) {
@@ -56,19 +57,31 @@ export const processTest: ReturnType<TestAPI<{ benchmark: typeof createLinuxProc
 	},
 }).skipIf(process.platform !== "linux");
 
-export async function holdOwnedProcessPublication(fixture: Pick<LinuxProcessBenchmark, "inOwner">, beforeRelease = async () => {}) {
-	await fixture.inOwner(async state => {
-		const { ProvenanceCertificateStore } = await state.load("../src/reuse-store.ts"), { ProcessHandoffRegistry } = await state.load("../src/process-handoff.ts");
+export async function holdOwnedProcessPublication(fixture: Pick<LinuxProcessBenchmark, "inOwner">, beforeRelease = async () => {}, executablePath?: string) {
+	await fixture.inOwner(async (state, executablePath) => {
+		const { ProvenanceCertificateStore } = await state.load("../src/reuse-store.ts"), { ProcessHandoffRegistry } = await state.load("../src/process-handoff.ts"),
+			{ LinuxProcessReuseBackend } = await state.load("../src/linux-process-backend.ts"), { AsyncLocalStorage } = await state.load("node:async_hooks");
 		const publication = ProvenanceCertificateStore.prototype.withPublication, acquire = ProcessHandoffRegistry.prototype.acquire;
+		const execute = LinuxProcessReuseBackend.prototype.executeRequest, frames = new AsyncLocalStorage(); let held = false;
 		const pending = state.deferred(); state.release = pending.resolve; state.reached = state.deferred(); state.joined = false; state.joinedGate = state.deferred();
-		ProvenanceCertificateStore.prototype.withPublication = async function (...args: unknown[]) { state.reached.resolve(); await pending.promise; return publication.apply(this, args); };
+		LinuxProcessReuseBackend.prototype.executeRequest = function (...args: unknown[]) { return frames.run({}, () => execute.apply(this, args)); };
 		ProcessHandoffRegistry.prototype.acquire = async function (...args: unknown[]) {
-			const result = await acquire.apply(this, args), completion = result.kind === "work" ? result.work.completion : undefined;
-			if (completion) Object.defineProperty(result.work, "completion", { get: () => { state.joined = true; state.joinedGate.resolve(true); return completion; } });
+			const result = await acquire.apply(this, args), frame = frames.getStore();
+			if (frame && result.kind === "work") frame.work = result.work;
 			return result;
 		};
-		state.closePublication = () => { state.joinedGate.resolve(false); state.release(); ProvenanceCertificateStore.prototype.withPublication = publication; ProcessHandoffRegistry.prototype.acquire = acquire; };
-	});
+		ProvenanceCertificateStore.prototype.withPublication = async function (...args: unknown[]) {
+			const work = frames.getStore()?.work;
+			if (work && !held && (!executablePath || work.executablePath === executablePath)) {
+				held = true; const completion = work.completion;
+				Object.defineProperty(work, "completion", { get: () => { state.joined = true; state.joinedGate.resolve(true); return completion; } });
+				state.reached.resolve(); await pending.promise;
+			}
+			return publication.apply(this, args);
+		};
+		state.closePublication = () => { state.joinedGate.resolve(false); state.release(); ProvenanceCertificateStore.prototype.withPublication = publication;
+			ProcessHandoffRegistry.prototype.acquire = acquire; LinuxProcessReuseBackend.prototype.executeRequest = execute; };
+	}, executablePath);
 	const joined = fixture.inOwner(state => state.joinedGate.promise as Promise<boolean>).then(async observed => {
 		if (!observed) return;
 		try { await beforeRelease(); }
@@ -80,9 +93,7 @@ export async function holdOwnedProcessPublication(fixture: Pick<LinuxProcessBenc
 
 export function inspectProcessOwner(create: () => object) {
 	const { port1: testPort, port2 } = new MessageChannel();
-	process.execArgv.push("--import", new URL("./process-owner-fixture.mjs", import.meta.url).href);
-	try { (Reflect.get(create(), "worker") as Worker).postMessage({ processTestPort: port2 }, [port2]); }
-	finally { process.execArgv.splice(-2); }
+	(Reflect.get(create(), "connection").worker as Worker).postMessage({ processTestPort: port2 }, [port2]);
 	testPort.unref();
 	const inOwner = <Value, Args extends unknown[]>(run: (state: Record<string, any>, ...args: Args) => Value, ...args: Args): Promise<Awaited<Value>> => {
 		const { port1, port2 } = new MessageChannel();

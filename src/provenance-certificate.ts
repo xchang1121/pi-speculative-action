@@ -63,6 +63,8 @@ export interface InheritedFileDescriptor {
 /** Static identity known immediately before one actual exec, independent of its parent shell. */
 export interface ExecPrototype {
 	readonly executablePath: string;
+	/** Kernel invocation path and task name, distinct from the canonical image and argv[0]. */
+	readonly invocation?: readonly [path: string, comm: string];
 	readonly executableDigest: Sha256Digest;
 	/** Digest of exact argv bytes; raw arguments are deliberately not persisted. */
 	readonly argvDigest: Sha256Digest;
@@ -412,6 +414,9 @@ function normalizePrototype(input: ExecPrototype): ExecPrototype {
 		executablePath, executableDigest, argvDigest, logicalCwd, platformFingerprint, umask, processContextDigest,
 		environmentComplete, fileDescriptorTableComplete, environment: rawEnvironment, inheritedFDs: rawDescriptors, stdin: rawStdin,
 	} = input;
+	const invocation = input.invocation ?? [executablePath, Buffer.from(executablePath.split("/").at(-1)!).subarray(0, 15).toString()];
+	if (!Array.isArray(invocation) || invocation.length !== 2 || invocation.some(value => typeof value !== "string" || !value || value.includes("\0")))
+		throw new Error("invalid process invocation context");
 	const stdin = cloneSharedData({ ...rawStdin });
 	if (!environmentComplete) throw new Error("process prototype requires a complete environment");
 	if (!fileDescriptorTableComplete) throw new Error("process prototype requires a complete descriptor table");
@@ -475,7 +480,7 @@ function normalizePrototype(input: ExecPrototype): ExecPrototype {
 		throw new Error("process stdin identity is invalid");
 	}
 	const prototype: ExecPrototype = deepFreeze({
-		executablePath,
+		executablePath, invocation: [...invocation] as [string, string],
 		executableDigest,
 		argvDigest,
 		logicalCwd,

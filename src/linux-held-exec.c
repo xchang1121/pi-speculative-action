@@ -377,7 +377,7 @@ static int image_maps(pid_t pid, struct image_header *header, int capturing) {
 done:
 	fclose(input); return valid ? 0 : -1;
 }
-static int image_mm(pid_t pid, struct image_header *header) {
+static int image_mm(pid_t pid, struct image_header *header, unsigned long code) {
 	char path[64], data[8192]; unsigned long fields[53] = {0};
 	snprintf(path, sizeof(path), "/proc/%d/stat", pid);
 	FILE *file = fopen(path, "re"); if (!file) return -1;
@@ -386,8 +386,9 @@ static int image_mm(pid_t pid, struct image_header *header) {
 	unsigned index = 3;
 	for (char *part = strtok_r(position + 2, " ", &saved); part && index < 53; part = strtok_r(NULL, " ", &saved), index++)
 		if (index != 3) fields[index] = strtoull(part, NULL, 10);
-	long brk;
-	if (index < 52 || fields[20] != 1 || image_call(pid, IMAGE_SCRATCH, SYS_brk, 0, 0, 0, 0, 0, 0, &brk) < 0) return -1;
+	long brk = (long)fields[47];
+	/* A fresh ELF image has brk == start_brk until its first instruction. */
+	if (index < 52 || fields[20] != 1 || (code && image_call(pid, code, SYS_brk, 0, 0, 0, 0, 0, 0, &brk) < 0)) return -1;
 	header->mm = (struct prctl_mm_map){.start_code = fields[26], .end_code = fields[27], .start_stack = fields[28],
 		.start_data = fields[45], .end_data = fields[46], .start_brk = fields[47], .brk = (unsigned long)brk,
 		.arg_start = fields[48], .arg_end = fields[49], .env_start = fields[50], .env_end = fields[51], .exe_fd = (unsigned)-1};
@@ -396,6 +397,243 @@ static int image_mm(pid_t pid, struct image_header *header) {
 	if (size <= 0 || size >= (ssize_t)sizeof(header->auxv)) return -1;
 	header->auxv_size = (size_t)size; return 0;
 }
+/* Advance owned descriptor execution in the tracer's normal signal/event loop. */
+static int duplicate_tracee_fd(struct decision_job *job, unsigned fd);
+struct exec_files { unsigned refs; int fd, pin, pending; };
+struct exec_call {
+	struct user_regs_struct original;
+	unsigned long empty, mask, code, command;
+	struct exec_files *files;
+	int phase, eligible, lease; pid_t tid;
+};
+static struct exec_files *exec_files(void **context) {
+	if (!*context) { struct exec_files *files = calloc(1, sizeof(*files)); if (!files) return NULL; files->refs = 1; files->fd = files->pin = -1; *context = files; }
+	return *context;
+}
+int pi_clone_exec_files(void **parent, void **child, int shared) {
+	struct exec_files *files = exec_files(parent); if (!files || *child) return -1;
+	if (shared) { files->refs++; *child = files; }
+	else if (files->fd >= 0) return -1; /* Birth waits until the transient descriptor is gone. */
+	return 0;
+}
+static int exec_pin(pid_t pid, int fd) {
+	struct decision_job source = {.pid = pid, .pidfd = -1};
+	int pin = duplicate_tracee_fd(&source, (unsigned)fd), error = errno; close(source.pidfd); errno = error; return pin;
+}
+static void exec_closed(struct exec_files *files) {
+	close(files->pin); files->fd = files->pin = -1; files->pending = 0;
+}
+static int exec_restarting(long value) { return value == -512 || value == -513 || value == -514 || value == -516; }
+static int exec_record_path(char *path, size_t size, const char *source, pid_t tid) {
+	return source && snprintf(path, size, "%s.route.%d", source, tid) < (int)size ? 0 : -1;
+}
+static int exec_injected_fd(pid_t tid, const char *source) {
+	char path[PATH_MAX + 64]; FILE *file;
+	if (exec_record_path(path, sizeof(path), source, tid) < 0 || !(file = fopen(path, "re"))) return -1;
+	char *field = NULL; size_t capacity = 0; int result = -1;
+	for (unsigned index = 0; index < 5; index++) {
+		ssize_t size = getdelim(&field, &capacity, 0, file); if (size < 0 || size > 8192 || field[size - 1]) break;
+		if (index == 4) { char *end; long value = strtol(field, &end, 10); if (*field && !*end && value >= 0 && value <= INT_MAX) result = value; }
+	}
+	free(field); fclose(file); return result;
+}
+int pi_exec_call_ready(void *context) {
+	struct exec_call *call = context;
+	return !call || !call->lease || !flock(call->lease - 1, LOCK_EX | LOCK_NB);
+}
+void pi_drop_exec_files(pid_t pid, void **context, void **pending, const char *source, int executed) {
+	struct exec_files *files = *context; struct exec_call *call = *pending;
+	if (call) {
+		if (call->files && call->files->fd < 0 && call->phase == 0) call->files->fd = exec_injected_fd(call->tid, source);
+		if (call->files && call->files->fd >= 0) call->files->pending = 1;
+		if (executed && call->tid && call->tid != pid) {
+			char from[PATH_MAX + 64], to[PATH_MAX + 64];
+			if (!exec_record_path(from, sizeof(from), source, call->tid) && !exec_record_path(to, sizeof(to), source, pid)) rename(from, to);
+		}
+		if (call->lease) close(call->lease - 1);
+		free(call); *pending = NULL;
+	}
+	*context = NULL;
+	if (files && !--files->refs) { exec_closed(files); free(files); }
+}
+static int exec_mask(pid_t pid, struct exec_call *call, int blocked) {
+	unsigned long mask = ~0UL;
+	if (blocked && ptrace(PTRACE_GETSIGMASK, pid, 8, &call->mask) < 0) return -1;
+	return ptrace(PTRACE_SETSIGMASK, pid, 8, blocked ? &mask : &call->mask) == 0 ? 0 : -1;
+}
+static int exec_rewind(pid_t pid, const struct user_regs_struct *original, long number, unsigned long a, unsigned long b) {
+	struct user_regs_struct registers = *original;
+	registers.rip -= 2; registers.orig_rax = (unsigned long)-1; registers.rax = number;
+	registers.rdi = a; registers.rsi = b;
+	return ptrace(PTRACE_SETREGS, pid, 0, &registers) == 0 ? 0 : -1;
+}
+int pi_prepare_exec_call(pid_t pid, void **context, void **file_context, const char *source) {
+	struct exec_call *call = calloc(1, sizeof(*call));
+	struct user_regs_struct registers; char path[PATH_MAX + 64], name[4096]; int memory = -1, result = -1;
+	if (!call || !(call->files = exec_files(file_context)) || ptrace(PTRACE_GETREGS, pid, 0, &call->original) < 0) goto done;
+	const struct user_regs_struct *original = &call->original;
+	int at = original->orig_rax == SYS_execveat;
+	if ((!at && original->orig_rax != SYS_execve) || original->cs != 0x33 || original->rip < 2) goto done;
+	snprintf(path, sizeof(path), "/proc/%d/mem", pid); memory = open(path, O_RDONLY | O_CLOEXEC);
+	unsigned long address = at ? original->rsi : original->rdi;
+	ssize_t length = memory >= 0 ? pread(memory, name, sizeof(name), address) : -1;
+	if (length <= 0 || !memchr(name, 0, (size_t)length)) { result = 0; goto done; }
+	call->empty = address + strlen(name); call->tid = pid;
+	if (exec_record_path(path, sizeof(path), source, pid) < 0) goto done;
+	call->lease = open(path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600) + 1;
+	if (!call->lease || exec_mask(pid, call, 1) < 0) goto done;
+	registers = *original; registers.r9 = 0x5049455800000000UL | (at ? (unsigned int)original->r8 : 0);
+	if (ptrace(PTRACE_SETREGS, pid, 0, &registers) < 0) goto done;
+	*context = call; call = NULL; result = 0;
+done:
+	close(memory); if (call && call->lease) close(call->lease - 1); free(call); return result;
+}
+/* 1 consumes an internal stop, 0 exposes the completed original syscall. */
+int pi_step_exec_call(pid_t pid, void **context, void **file_context, int exiting) {
+	struct exec_call *call = *context;
+	if (!call) {
+		struct exec_files *files = *file_context;
+		if (!files || !files->pending) return 0;
+		if (files->pin < 0) files->pin = exec_pin(pid, files->fd);
+		long same = files->pin < 0 ? -1 : syscall(SYS_kcmp, pid, getpid(), KCMP_FILE, files->fd, files->pin);
+		if (same) {
+			if (same < 0 && errno != EBADF) return -1;
+			exec_closed(files); return 0;
+		}
+		call = calloc(1, sizeof(*call)); if (!call) return -1;
+		call->files = files; call->phase = exiting ? 3 : 12; files->pending = 0; *context = call;
+		if (ptrace(PTRACE_GETREGS, pid, 0, &call->original) < 0 || exec_mask(pid, call, 1) < 0) return -1;
+		if (exiting) return exec_rewind(pid, &call->original, SYS_close, files->fd, 0) == 0 ? 1 : -1;
+		struct user_regs_struct cleanup = call->original; cleanup.rax = cleanup.orig_rax = SYS_close; cleanup.rdi = files->fd;
+		return ptrace(PTRACE_SETREGS, pid, 0, &cleanup) == 0 ? 1 : -1;
+	}
+	struct user_regs_struct registers;
+	if (ptrace(PTRACE_GETREGS, pid, 0, &registers) < 0) return -1;
+	long value = (long)registers.rax;
+	if (!(call->phase & 1) && exec_restarting(value)) { call->phase--; return 1; }
+	switch (call->phase) {
+	case -1: call->phase = 0; return 1;
+	case 0:
+		if (value > 0 && value <= INT_MAX) {
+			call->files->fd = (int)value - 1;
+			if (call->files->refs > 1 && (call->files->pin = exec_pin(pid, call->files->fd)) < 0) return -1;
+			registers = call->original; registers.rip -= 2; registers.rax = SYS_execveat; registers.orig_rax = (unsigned long)-1;
+			registers.rdi = call->files->fd; registers.rsi = call->empty;
+			registers.rdx = call->original.orig_rax == SYS_execveat ? call->original.rdx : call->original.rsi;
+			registers.r10 = call->original.orig_rax == SYS_execveat ? call->original.r10 : call->original.rdx;
+			registers.r8 = AT_EMPTY_PATH; registers.r9 = 0x5049455900000000UL;
+			call->phase = 1; return ptrace(PTRACE_SETREGS, pid, 0, &registers) == 0 ? 1 : -1;
+		}
+		/* A native-path continuation already executed; errors retain the caller registers. */
+		__attribute__((fallthrough));
+	case 2:
+		if (!value) return exec_mask(pid, call, 0);
+		call->original.rax = registers.rax;
+		if (call->files->fd >= 0) { call->phase = 3; return exec_rewind(pid, &call->original, SYS_close, call->files->fd, 0) == 0 ? 1 : -1; }
+		break;
+	case 1: call->phase = 2; return 1;
+	case 3: call->phase = 4; return 1;
+	case 4: case 12: {
+		if (value) return -1;
+		exec_closed(call->files);
+		if (call->phase == 12) {
+			registers = call->original; registers.rip -= 2; registers.rax = registers.orig_rax; registers.orig_rax = (unsigned long)-1;
+			call->phase = 13; return ptrace(PTRACE_SETREGS, pid, 0, &registers) == 0 ? 1 : -1;
+		}
+		break;
+	}
+	case 7: call->phase = 8; return 1;
+	case 8:
+		if (value) return -1;
+		registers = call->original; registers.rax = SYS_prctl; registers.orig_rax = (unsigned long)-1;
+		registers.rdi = PR_SET_NAME; registers.rsi = call->command; registers.rdx = registers.r10 = registers.r8 = registers.r9 = 0;
+		call->phase = 9; return ptrace(PTRACE_SETREGS, pid, 0, &registers) == 0 ? 1 : -1;
+	case 9: call->phase = 10; return 1;
+	case 10:
+		if (value || ptrace(PTRACE_POKETEXT, pid, call->original.rip, call->code) < 0) return -1;
+		break;
+	case 11: call->phase = 12; return 1;
+	case 13: break;
+	}
+	if (exec_mask(pid, call, 0) < 0 || ptrace(PTRACE_SETREGS, pid, 0, &call->original) < 0) return -1;
+	int result = call->phase == 10 ? 2 | (call->eligible ? 4 : 0) : 0;
+	if (call->lease) close(call->lease - 1);
+	free(call); *context = NULL;
+	return result;
+}
+
+/* Restore the requested exec pathname after a confined fd exec, before the image runs. */
+int pi_restore_exec_context(pid_t pid, const char *source, const char *invoked, const char *command, void **context) {
+	struct user_regs_struct registers;
+	struct image_header *header = calloc(1, sizeof(*header));
+	unsigned long *vector = NULL, argc, word, aux, slot = 0; int result = -1, consumed = 0, eligible = 0;
+	char *arguments = NULL, *fields[32] = {0}; unsigned count = 0, prefix = 0; const char *name = NULL, *comm = NULL; FILE *record = NULL;
+	char path[PATH_MAX + 64], original[8192]; size_t argument_bytes = 0;
+	if (snprintf(path, sizeof(path), "%s.route.%d", source, pid) >= (int)sizeof(path) || !(record = fopen(path, "re"))) goto done;
+	for (; count < 32; count++) { size_t capacity = 0; ssize_t bytes = getdelim(&fields[count], &capacity, 0, record);
+		if (bytes < 0) break;
+		if (bytes > 8192 || fields[count][bytes - 1]) goto done;
+	}
+	if (ferror(record) || count < 5 || count == 32 || (strcmp(fields[0], "B") && strcmp(fields[0], "N")) || *fields[1] != '/') goto done;
+	name = fields[2]; comm = fields[3];
+	prefix = count - 5; eligible = !strcmp(fields[0], "B");
+	if (!eligible) {
+		if (invoked && strcmp(name, source)) { name = invoked; comm = command; consumed = 1; }
+	}
+	if (!comm) { comm = strrchr(name, '/'); comm = comm ? comm + 1 : name; }
+	size_t length = strlen(name) + 1, comm_length = strlen(comm) + 1;
+	if (!header || length > 8192 || ptrace(PTRACE_GETREGS, pid, 0, &registers) < 0 || registers.cs != 0x33 || image_mm(pid, header, 0) < 0) goto done;
+	for (size_t at = 0; at + 16 <= header->auxv_size; at += 16) if (*(unsigned long *)(header->auxv + at) == AT_EXECFN) { slot = at + 8; break; }
+	if (!slot) goto done;
+	snprintf(path, sizeof(path), "/proc/%d/mem", pid);
+	int memory = open(path, O_RDONLY | O_CLOEXEC); if (memory < 0) goto done;
+	ssize_t read = pread(memory, original, sizeof(original), *(unsigned long *)(header->auxv + slot)); close(memory);
+	if (read <= 0 || !memchr(original, 0, (size_t)read)) goto done;
+	if (!prefix && !strcmp(original, name)) { result = 0; goto done; }
+	if (image_memory(pid, registers.rsp, &argc, 8, 0) < 0 || argc > 1048576) goto done;
+	aux = argc + 2;
+	do { if (aux > 1048576 || image_memory(pid, registers.rsp + 8 * aux++, &word, 8, 0) < 0) goto done; } while (word);
+	size_t bytes = aux * 8 + header->auxv_size;
+	vector = malloc(bytes + 8 * prefix); if (!vector || image_memory(pid, registers.rsp, vector, bytes, 0) < 0 || memcmp(vector + aux, header->auxv, header->auxv_size)) goto done;
+	if (prefix) {
+		size_t before = header->mm.arg_end - header->mm.arg_start, added = 0;
+		if (!argc || before > 4 * 1024 * 1024) goto done;
+		for (unsigned index = 5; index < count; index++) added += strlen(fields[index]) + 1;
+		arguments = malloc(added + before); if (!arguments || image_memory(pid, header->mm.arg_start, arguments + added, before, 0) < 0) goto done;
+		size_t skipped = strnlen(arguments + added, before) + 1; if (skipped > before) goto done;
+		memmove(arguments + added, arguments + added + skipped, before - skipped); argument_bytes = added + before - skipped;
+		for (unsigned index = 5, offset = 0; index < count; index++) { size_t size = strlen(fields[index]) + 1; memcpy(arguments + offset, fields[index], size); offset += size; }
+		memmove(vector + argc + prefix, vector + argc + 1, bytes - (argc + 1) * 8);
+		vector[0] = argc + prefix - 1; aux += prefix - 1; bytes += 8 * (prefix - 1);
+	}
+	unsigned long stack = (registers.rsp - bytes - argument_bytes - length - comm_length - sizeof(header->mm) - 31) & ~15UL;
+	unsigned long args = stack + bytes, text = args + argument_bytes, mm = (text + length + comm_length + 7) & ~7UL;
+	if (prefix) {
+		size_t offset = 0;
+		for (unsigned long index = 1; index <= vector[0]; index++) { if (offset >= argument_bytes) goto done; vector[index] = args + offset; offset += strlen(arguments + offset) + 1; }
+		if (offset != argument_bytes || image_memory(pid, args, arguments, argument_bytes, 1) < 0) goto done;
+		header->mm.arg_start = args; header->mm.arg_end = text;
+	}
+	vector[aux + slot / 8] = text;
+	header->mm.auxv = (void *)(stack + aux * 8); header->mm.auxv_size = header->auxv_size; header->mm.start_stack = stack;
+	if (image_memory(pid, stack, vector, bytes, 1) < 0 || image_memory(pid, text, (void *)name, length, 1) < 0 ||
+		image_memory(pid, text + length, (void *)comm, comm_length, 1) < 0 || image_memory(pid, mm, &header->mm, sizeof(header->mm), 1) < 0) goto done;
+	struct exec_call *call = calloc(1, sizeof(*call));
+	if (!call) goto done;
+	*context = call; call->original = registers; call->original.rsp = stack; call->command = text + length;
+	call->phase = 7; call->eligible = eligible; errno = 0;
+	call->code = (unsigned long)ptrace(PTRACE_PEEKTEXT, pid, registers.rip, 0);
+	if (errno || exec_mask(pid, call, 1) < 0 || ptrace(PTRACE_POKETEXT, pid, registers.rip, (call->code & ~0xffffUL) | 0x050fUL) < 0) goto done;
+	registers.rax = SYS_prctl; registers.orig_rax = (unsigned long)-1;
+	registers.rdi = PR_SET_MM; registers.rsi = PR_SET_MM_MAP; registers.rdx = mm; registers.r10 = sizeof(header->mm); registers.r8 = registers.r9 = 0;
+	result = ptrace(PTRACE_SETREGS, pid, 0, &registers) == 0 ? 8 : -1;
+
+done:
+	if (record) fclose(record);
+	for (unsigned index = 0; index < 32; index++) free(fields[index]);
+	free(arguments); free(vector); free(header); return result < 0 ? result : result | consumed | (eligible ? 2 : 0);
+}
+
 static int image_read_backing(int fd, const struct image_map *map, void *buffer) {
 	size_t length = (size_t)(map->end - map->start), bytes = map->offset >= map->size ? 0 :
 		(size_t)(map->size - map->offset < length ? map->size - map->offset : length), moved = 0;
@@ -539,7 +777,7 @@ int pi_prepare_process_image(pid_t pid, const char *path, unsigned long watched_
 	result = admit(context); if (result) goto done;
 	/* Admission only reads the stopped process. From this point failure retires it. */
 	result = -1;
-	if (image_scratch(pid) < 0 || image_mm(pid, header) < 0) goto done;
+	if (image_scratch(pid) < 0 || image_mm(pid, header, IMAGE_SCRATCH) < 0) goto done;
 	struct iovec xstate = {.iov_base = header->xstate, .iov_len = sizeof(header->xstate)};
 	if (ptrace(PTRACE_GETREGSET, pid, NT_X86_XSTATE, &xstate) < 0 ||
 		ptrace(PTRACE_GETSIGMASK, pid, sizeof(header->sigmask), &header->sigmask) < 0) goto done;
@@ -671,6 +909,13 @@ fail:
 static int duplicate_tracee_fd(struct decision_job *job, unsigned fd) {
 	#if defined(SYS_pidfd_open) && defined(SYS_pidfd_getfd)
 	if (job->pidfd < 0) job->pidfd = (int)syscall(SYS_pidfd_open, job->pid, 0);
+    if (job->pidfd < 0) {
+        char path[64], line[256]; int group = job->pid; FILE *status;
+        snprintf(path, sizeof(path), "/proc/%d/status", job->pid);
+        if ((status = fopen(path, "re"))) { while (fgets(line, sizeof(line), status)) if (sscanf(line, "Tgid: %d", &group) == 1) break; fclose(status); }
+        if (group != job->pid && syscall(SYS_kcmp, job->pid, group, KCMP_FILES, 0, 0) == 0) job->pidfd = (int)syscall(SYS_pidfd_open, group, 0);
+    }
+
 	/* Both syscalls return CLOEXEC handles; one process pin serves the entire held decision. */
 	if (job->pidfd >= 0) return (int)syscall(SYS_pidfd_getfd, job->pidfd, fd, 0);
 	#endif
@@ -850,27 +1095,6 @@ static int has_unmodeled_descriptors(int minimum) {
 	return descriptor_numbers(getpid(), minimum, NULL, 0) < 0 ? (errno == E2BIG ? 1 : -1) : 0;
 }
 
-static int mapped_image(char *image, size_t capacity) {
-	FILE *maps = fopen("/proc/self/maps", "re");
-	char *line = NULL;
-	size_t line_capacity = 0;
-	int result = -1;
-	while (maps && getline(&line, &line_capacity, maps) >= 0) {
-		if (!strstr(line, " r-xp ")) continue;
-		char *mapped = strchr(line, '/');
-		if (!mapped) continue;
-		mapped[strcspn(mapped, "\r\n")] = 0;
-		char *deleted = strstr(mapped, " (deleted)");
-		if (deleted) *deleted = 0;
-		if (snprintf(image, capacity, "%s", mapped) >= (int)capacity) errno = ENAMETOOLONG;
-		else result = 0;
-		break;
-	}
-	if (maps) fclose(maps);
-	free(line);
-	return result;
-}
-
 /* The broker decodes a request as UTF-8, as it decoded Node's strings. */
 static void json_bytes(FILE *out, const char *value, size_t length) {
 	fputc('"', out);
@@ -883,227 +1107,155 @@ static void json_bytes(FILE *out, const char *value, size_t length) {
 	fputc('"', out);
 }
 
-static int json_file(FILE *out, const char *path) {
-	char buffer[32768];
-	ssize_t length = 0, moved = 0;
-	int fd = open(path, O_RDONLY | O_CLOEXEC);
-	if (fd < 0) return -1;
-	while (length < (ssize_t)sizeof(buffer) && ((moved = read(fd, buffer + length, sizeof(buffer) - (size_t)length)) > 0 || (moved < 0 && errno == EINTR)))
-		if (moved > 0) length += moved;
-	close(fd);
-	if (moved < 0 || length == (ssize_t)sizeof(buffer)) return -1;
-	json_bytes(out, buffer, (size_t)length);
-	return 0;
-}
-
-/* The fields Node's bigint stat reports, encoded as libuv does. */
-static int json_stat(FILE *out, int directory, const char *path, int flags) {
-	struct statx state;
-	if (statx(directory, path, flags, STATX_BASIC_STATS, &state) < 0) return -1;
-	return fprintf(out, "{\"dev\":\"%llu\",\"ino\":\"%llu\",\"mode\":\"%u\",\"uid\":\"%u\",\"gid\":\"%u\",\"rdev\":\"%llu\"}",
-		(unsigned long long)makedev(state.stx_dev_major, state.stx_dev_minor), (unsigned long long)state.stx_ino, state.stx_mode,
-		state.stx_uid, state.stx_gid, (unsigned long long)makedev(state.stx_rdev_major, state.stx_rdev_minor)) < 0 ? -1 : 0;
-}
-
-/* The kernel's view of this process for processContextFromRaw; standard streams only, fd 0 possibly closed. */
-static int raw_context(FILE *out) {
-	char path[64], target[PATH_MAX];
-	if (fputs("{\"status\":", out) < 0 || json_file(out, "/proc/self/status") < 0 || fputs(",\"limits\":", out) < 0 ||
-		json_file(out, "/proc/self/limits") < 0 || fputs(",\"processStat\":", out) < 0 || json_file(out, "/proc/self/stat") < 0 ||
-		fputs(",\"shell\":", out) < 0 || json_stat(out, AT_FDCWD, "/bin/sh", 0) < 0 || fputs(",\"descriptors\":[", out) < 0) return -1;
-	for (int fd = 0, listed = 0; fd < 3; fd++) {
-		if (fcntl(fd, F_GETFD) < 0) { if (fd == 0 && errno == EBADF) continue; return -1; }
-		if (fprintf(out, "%s{\"fd\":%d,\"stat\":", listed++ ? "," : "", fd) < 0 ||
-			json_stat(out, fd, "", AT_EMPTY_PATH) < 0) return -1;
-		snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
-		ssize_t length = readlink(path, target, sizeof(target));
-		if (length > 0 && length < (ssize_t)sizeof(target)) { fputs(",\"endpoint\":", out); json_bytes(out, target, (size_t)length); }
-		snprintf(path, sizeof(path), "/proc/self/fdinfo/%d", fd);
-		if (fputs(",\"fdinfo\":", out) < 0 || json_file(out, path) < 0 || fputc('}', out) < 0) return -1;
-	}
-	return fputs("]}", out) < 0 || ferror(out) ? -1 : 0;
-}
-
-/* Inherited pipes beyond stdio, as a brokered run's images: each end, its queue as seen now (never consumed) and its peers.
- * Anything else stays unmodeled and the image runs native in place. */
+/* The image is already installed, and stays stopped while its owner decides.
+ * Pins outlive the exchange but never the target's resumed execution. */
+struct broker_job {
+	pid_t pid; pthread_t thread;
+	int channel[2], connection, result, count, numbers[MAX_HANDLES], files[MAX_HANDLES];
+	char *request, *response; size_t request_size, response_size;
+	struct sockaddr_un address;
+};
 static int pipe_bytes(int fd, unsigned char **bytes, int *eof);
-static int own_pipe_descriptors(FILE *out) {
-	int fds[MAX_HANDLES], count = descriptor_numbers(getpid(), 3, fds, MAX_HANDLES);
-	if (count < 0) return -1;
-	for (int index = 0; index < count; index++) {
-		struct stat state, other_state; int flags = fcntl(fds[index], F_GETFL), capacity = fcntl(fds[index], F_GETPIPE_SZ), eof = 0, alias = fds[index], reader = -1;
-		unsigned char *bytes = NULL;
-		if (fstat(fds[index], &state) < 0 || !S_ISFIFO(state.st_mode) || flags < 0 || capacity <= 0) return -1;
-		for (int other = 0; other < index; other++) if (syscall(SYS_kcmp, getpid(), getpid(), KCMP_FILE, fds[index], fds[other]) == 0) { alias = fds[other]; break; }
-		/* The queue is read through an end this process already holds: reopening a writer for reading would widen its access. */
-		for (int other = 0; other < count && reader < 0; other++)
-			if ((fcntl(fds[other], F_GETFL) & O_ACCMODE) != O_WRONLY && fstat(fds[other], &other_state) == 0 && other_state.st_dev == state.st_dev && other_state.st_ino == state.st_ino) reader = fds[other];
+static int broker_pipes(FILE *out, struct broker_job *job) {
+	int described = 0;
+	for (int index = 0; index < job->count; index++) {
+		if (job->numbers[index] < 3) continue;
+		int fd = job->files[index], flags = fcntl(fd, F_GETFL), capacity = fcntl(fd, F_GETPIPE_SZ), eof = 0, alias = job->numbers[index], reader = -1;
+		struct stat state, other_state; unsigned char *bytes = NULL;
+		if (fstat(fd, &state) < 0 || !S_ISFIFO(state.st_mode) || flags < 0 || capacity <= 0) return -1;
+		for (int other = 0; other < index; other++) if (syscall(SYS_kcmp, getpid(), getpid(), KCMP_FILE, fd, job->files[other]) == 0) { alias = job->numbers[other]; break; }
+		for (int other = 0; other < job->count && reader < 0; other++)
+			if ((fcntl(job->files[other], F_GETFL) & O_ACCMODE) != O_WRONLY && fstat(job->files[other], &other_state) == 0 && other_state.st_dev == state.st_dev && other_state.st_ino == state.st_ino) reader = job->files[other];
 		int length = reader < 0 ? -1 : pipe_bytes(reader, &bytes, &eof);
 		if (length < 0) return -1;
 		fprintf(out, "%s{\"fd\":%d,\"alias\":%d,\"device\":\"%ju\",\"inode\":\"%ju\",\"flags\":%d,\"capacity\":%d,\"eof\":%s,\"queueHex\":\"",
-			index ? "," : "", fds[index], alias, (uintmax_t)state.st_dev, (uintmax_t)state.st_ino, flags, capacity, eof ? "true" : "false");
+			described++ ? "," : "", job->numbers[index], alias, (uintmax_t)state.st_dev, (uintmax_t)state.st_ino, flags, capacity, eof ? "true" : "false");
 		for (int byte = 0; byte < length; byte++) fprintf(out, "%02x", bytes[byte]);
 		fputs("\"}", out); free(bytes);
 	}
-	return count;
+	return described;
 }
-
-static int broker_request(FILE *out, const char *token, const char *invoked, int argc, char **argv, const char *descriptors) {
-	char cwd[PATH_MAX];
-	if (!getcwd(cwd, sizeof(cwd))) return -1;
-	const char *strings[] = { "{\"token\":", token, ",\"name\":", strrchr(invoked, '/') + 1, ",\"invokedPath\":", invoked, ",\"argv0\":", argv[0], ",\"cwd\":", cwd };
-	for (unsigned index = 0; index < sizeof(strings) / sizeof(*strings); index += 2) { fputs(strings[index], out); json_bytes(out, strings[index + 1], strlen(strings[index + 1])); }
-	fputs(",\"args\":[", out);
-	for (int index = 1; index < argc; index++) { if (index > 1) fputc(',', out); json_bytes(out, argv[index], strlen(argv[index])); }
-	fputs("],\"environment\":{", out);
-	int first = 1;
-	for (char **entry = environ; *entry; entry++) {
-		char *equals = strchr(*entry, '=');
-		if (!equals || equals == *entry) continue;
-		if (!first) fputc(',', out);
-		first = 0;
-		json_bytes(out, *entry, (size_t)(equals - *entry)); fputc(':', out); json_bytes(out, equals + 1, strlen(equals + 1));
-	}
-	fprintf(out, "},\"pid\":%d%s%s%s,\"context\":", (int)getpid(), descriptors ? ",\"descriptors\":[" : "", descriptors ? descriptors : "", descriptors ? "]" : "");
-	return raw_context(out) < 0 || fputc('}', out) < 0 || ferror(out) ? -1 : 0;
+static void broker_free(struct broker_job *job) {
+	for (int index = 0; index < job->count; index++) close(job->files[index]);
+	close(job->channel[0]); close(job->channel[1]); close(job->connection);
+	free(job->request); free(job->response); free(job);
 }
-
-static int broker_exchange(const char *socket_path, const char *request, size_t length, FILE *response) {
-	struct sockaddr_un address = { .sun_family = AF_UNIX };
-	if (strlen(socket_path) >= sizeof(address.sun_path)) return -1;
-	strcpy(address.sun_path, socket_path);
-	int connection = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0), result = -1;
-	if (connection < 0) return -1;
-	if (connect(connection, (struct sockaddr *)&address, sizeof(address)) < 0) goto done;
-	while (length) {
-		ssize_t sent = send(connection, request, length, MSG_NOSIGNAL);
-		if (sent < 0 && errno == EINTR) continue;
-		if (sent <= 0) goto done;
-		request += sent; length -= (size_t)sent;
-	}
-	if (shutdown(connection, SHUT_WR) < 0) goto done;
-	char buffer[65536];
-	ssize_t moved;
-	while ((moved = read(connection, buffer, sizeof(buffer))) > 0 || (moved < 0 && errno == EINTR))
-		if (moved > 0 && fwrite(buffer, 1, (size_t)moved, response) != (size_t)moved) goto done;
-	result = moved == 0 ? 0 : -1;
-done:
-	close(connection);
-	return result;
-}
-
-/* Frames "o<fd> <length>\n<bytes>" replay output; a last line "x <code>", "s <signal>" or "b" (bypass) ends it. */
-static int broker_reply(const char *at, const char *end) {
+static int broker_reply(struct broker_job *job) {
+	const char *at = job->response, *end = at + job->response_size;
 	while (at < end) {
 		const char *newline = memchr(at, '\n', (size_t)(end - at));
-		int fd, value, consumed = -1;
-		unsigned long long length;
+		int fd, value, consumed = -1; unsigned long long length;
 		if (!newline) return -1;
-		/* A brokered run's settled effect on a descriptor this launcher holds: bytes it wrote (o), or read and must find there (i). */
 		char kind = *at;
 		if ((kind == 'o' || kind == 'i') && sscanf(at + 1, "%d %llu%n", &fd, &length, &consumed) == 2 && at + 1 + consumed == newline && fd >= 1 &&
 			length <= (unsigned long long)(end - newline - 1)) {
+			int pin = -1; for (int index = 0; index < job->count; index++) if (job->numbers[index] == fd) pin = job->files[index];
+			if (pin < 0) return -1;
 			for (size_t offset = 0; kind == 'i' && offset < length; offset++) {
 				unsigned char seen;
-				if (transfer(fd, &seen, 1, 0) < 0 || seen != (unsigned char)newline[1 + offset]) return -1;
+				if (transfer(pin, &seen, 1, 0) < 0 || seen != (unsigned char)newline[1 + offset]) return -1;
 			}
-			if (kind == 'o' && transfer(fd, (void *)(newline + 1), (size_t)length, 1) < 0) return -1;
-			at = newline + 1 + length;
-			continue;
+			if (kind == 'o' && transfer(pin, (void *)(newline + 1), (size_t)length, 1) < 0) return -1;
+			at = newline + 1 + length; continue;
 		}
 		if (newline + 1 != end) return -1;
 		if (newline == at + 1 && *at == 'b') return -2;
 		if (sscanf(at, "x %d%n", &value, &consumed) == 1 && at + consumed == newline && value >= 0 && value <= 255) return value;
-		if (sscanf(at, "s %d%n", &value, &consumed) != 1 || at + consumed != newline || value <= 0 || value >= NSIG) return -1;
-		sigset_t mask;
-		sigemptyset(&mask); sigaddset(&mask, value);
-		signal(value, SIG_DFL); sigprocmask(SIG_UNBLOCK, &mask, NULL); raise(value);
-		return 128 + value;
+		return sscanf(at, "s %d%n", &value, &consumed) == 1 && at + consumed == newline && value > 0 && value < NSIG ? 256 + value : -1;
 	}
 	return -1;
 }
-
-/* Ask the broker: the exit status of a reused or brokered run, or -2 to run the native image in this traced process. */
-static int broker_dispatch(const char *configuration, const char *invoked, int argc, char **argv, const char *descriptors) {
-	char socket_path[PATH_MAX], token[256], *request = NULL, *response = NULL;
-	size_t request_size = 0, response_size = 0;
-	int result = -1;
-	FILE *file = fopen(configuration, "re"), *out = NULL, *in = NULL;
-	if (!file || !fgets(socket_path, sizeof(socket_path), file) || !fgets(token, sizeof(token), file)) goto done;
-	socket_path[strcspn(socket_path, "\n")] = token[strcspn(token, "\n")] = 0;
-	if (!(out = open_memstream(&request, &request_size))) goto done;
-	int written = broker_request(out, token, invoked, argc, argv, descriptors);
-	if (fclose(out) != 0 || written < 0 || !(in = open_memstream(&response, &response_size))) goto done;
-	written = broker_exchange(socket_path, request, request_size, in);
-	if (fclose(in) == 0 && written == 0) result = broker_reply(response, response + response_size);
-done:
-	if (file) fclose(file);
-	free(request); free(response);
-	if (result == -1) { dprintf(2, "%s: broker unavailable; refusing unobserved execution\n", strrchr(invoked, '/') + 1); result = 125; }
-	return result;
-}
-
-/* An exec-only hardlink retains the target's argv[0]; its read-only sidecar supplies routing. */
-static int image_dispatch(int argc, char **argv) {
-	char image[PATH_MAX], sidecar[PATH_MAX], invoked[PATH_MAX], native[PATH_MAX];
-	if (mapped_image(image, sizeof(image)) < 0) return -1;
-	char *separator = strrchr(image, '/');
-	if (!separator || !separator[1]) return -1;
-	char *name = separator + 1;
-	*separator = 0;
-	if (snprintf(sidecar, sizeof(sidecar), "%s/.pi-spec-dispatch", image) >= (int)sizeof(sidecar)) return 70;
-	FILE *file = fopen(sidecar, "re");
-	if (!file) return errno == ENOENT ? -1 : 70;
-	struct stat state;
-	char *line = NULL, *fields[3] = {0};
-	size_t capacity = 0;
-	int result = 70, extra;
-	if (fstat(fileno(file), &state) < 0 || !S_ISREG(state.st_mode) || state.st_uid != geteuid() || (state.st_mode & 022)) goto done;
-	for (unsigned index = 0; index < 4; index++) {
-		if (getline(&line, &capacity, file) < 0) goto done;
-		line[strcspn(line, "\r\n")] = 0;
-		if (index == 0) {
-			if (strcmp(line, "PI_SPEC_DISPATCH")) goto done;
-		} else if (*line != '/' || !(fields[index - 1] = strdup(line))) goto done;
+static void *broker_decide(void *context) {
+	struct broker_job *job = context;
+	sigset_t blocked; sigfillset(&blocked); pthread_sigmask(SIG_SETMASK, &blocked, NULL);
+	job->result = -1;
+	if (connect(job->connection, (struct sockaddr *)&job->address, sizeof(job->address)) < 0 ||
+		transfer(job->connection, job->request, job->request_size, 1) < 0 || shutdown(job->connection, SHUT_WR) < 0) goto done;
+	char bytes[65536]; ssize_t size;
+	while ((size = read(job->connection, bytes, sizeof(bytes))) > 0 || (size < 0 && errno == EINTR)) if (size > 0) {
+		if ((size_t)size > MAX_OUTPUT_BYTES - job->response_size) goto done;
+		char *grown = realloc(job->response, job->response_size + (size_t)size);
+		if (!grown) goto done;
+		job->response = grown; memcpy(grown + job->response_size, bytes, (size_t)size); job->response_size += (size_t)size;
 	}
+	if (size == 0) job->result = broker_reply(job);
+done:
+	shutdown(job->channel[1], SHUT_WR); return NULL;
+}
+void *pi_broker_start(pid_t pid, const char *source, int *notification) {
+	*notification = -1;
+	struct broker_job *job = calloc(1, sizeof(*job));
+	if (!job) return NULL;
+	job->pid = pid; job->channel[0] = job->channel[1] = job->connection = -1;
+	for (int index = 0; index < MAX_HANDLES; index++) job->files[index] = -1;
+	job->count = descriptor_numbers(pid, 0, job->numbers, MAX_HANDLES);
+	struct decision_job target = {.pid = pid, .pidfd = -1};
+	int captured = job->count >= 0, outputs = 0;
+	for (int index = 0; captured && index < job->count; index++) {
+		captured = (job->files[index] = duplicate_tracee_fd(&target, (unsigned)job->numbers[index])) >= 0;
+		if (job->numbers[index] == 1 || job->numbers[index] == 2) outputs |= 1 << job->numbers[index];
+	}
+	close(target.pidfd);
+	if (!captured || outputs != 6) { broker_free(job); return NULL; }
+	char configuration[PATH_MAX], token[256]; FILE *file = NULL, *out = NULL;
+	if (!source || snprintf(configuration, sizeof(configuration), "%s.configuration", source) >= (int)sizeof(configuration) ||
+		!(file = fopen(configuration, "re")) || !fgets(job->address.sun_path, sizeof(job->address.sun_path), file) || !fgets(token, sizeof(token), file)) goto fail;
+	job->address.sun_family = AF_UNIX;
+	job->address.sun_path[strcspn(job->address.sun_path, "\n")] = token[strcspn(token, "\n")] = 0;
 	fclose(file); file = NULL;
-	if (snprintf(invoked, sizeof(invoked), "%s/%s", fields[1], name) >= (int)sizeof(invoked) ||
-		snprintf(native, sizeof(native), "%s/%s", fields[2], name) >= (int)sizeof(native)) goto done;
-	char **spare = calloc((size_t)argc + 3, sizeof(*spare)); /* a sandbox grows argv here to run a script's interpreter */
-	if (!spare || !memcpy(spare, argv, (size_t)argc * sizeof(*argv)) || (extra = has_unmodeled_descriptors(3)) < 0) goto done;
-	char *pipes = NULL; size_t pipes_size = 0;
-	FILE *described = extra ? open_memstream(&pipes, &pipes_size) : NULL;
-	int modeled = described && own_pipe_descriptors(described) > 0;
-	if (described && fclose(described) != 0) modeled = 0;
-	/* A bypass runs the native image in place, with everything this process received. */
-	if ((extra && !modeled) || (result = broker_dispatch(fields[0], invoked, argc, argv, extra ? pipes : NULL)) == -2) {
-		free(pipes);
-		execv(native, spare);
-		result = errno == ENOENT ? 127 : 126;
-	}
-	free(pipes);
-done:
+	out = open_memstream(&job->request, &job->request_size); if (!out) goto fail;
+	fputs("{\"token\":", out); json_bytes(out, token, strlen(token)); fprintf(out, ",\"pid\":%d,\"descriptors\":[", pid);
+	int pipes = broker_pipes(out, job); fputs("]}", out); int written = ferror(out); if (fclose(out)) written = 1; out = NULL;
+	if (pipes < 0) { broker_free(job); return NULL; }
+	if (written || (job->connection = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0)) < 0 || socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, job->channel) < 0 ||
+		pthread_create(&job->thread, NULL, broker_decide, job)) goto fail;
+	*notification = job->channel[0]; return job;
+fail:
 	if (file) fclose(file);
-	free(line);
-	for (unsigned index = 0; index < 3; index++) free(fields[index]);
-	return result;
+	if (out) fclose(out);
+	broker_free(job); *notification = -2; return NULL;
+}
+/* 1 resumes native code, 2 exits with the brokered result, 2+signal delivers that signal. */
+int pi_broker_finish(void *context, int cancel) {
+	struct broker_job *job = context; int result = -1;
+	if (cancel) pthread_cancel(job->thread);
+	pthread_join(job->thread, NULL);
+	if (cancel || job->result == -2) result = 1;
+	else if (job->result >= 0) {
+		unsigned signal = job->result > 256 ? (unsigned)job->result - 256 : 0;
+		if (replace_with_exit(job->pid, signal ? 128 + signal : (unsigned)job->result) < 0) goto done;
+		if (signal) {
+			struct user_regs_struct regs; unsigned long data[5] = {0, 0, 0, 0, 1UL << (signal - 1)}; long status;
+			if (ptrace(PTRACE_GETREGS, job->pid, 0, &regs) < 0) goto done;
+			unsigned long at = (regs.rsp - sizeof(data) - 256) & ~7UL;
+			if (image_memory(job->pid, at, data, sizeof(data), 1) < 0 ||
+				(signal != SIGKILL && signal != SIGSTOP && (image_call(job->pid, 0, SYS_rt_sigaction, signal, at, 0, 8, 0, 0, &status) < 0 || status)) ||
+				image_call(job->pid, 0, SYS_rt_sigprocmask, SIG_UNBLOCK, at + 32, 0, 8, 0, 0, &status) < 0 || status) goto done;
+		}
+		result = 2 + (int)signal;
+	}
+done:
+	broker_free(job); return result;
 }
 
-/* The sandbox's context as a nested request reports it, once a script's read position is shown preserved. */
+/* Preserve the libuv launcher's empty signal mask and default dispositions. */
+static int reset_signals(void) {
+	sigset_t empty; sigemptyset(&empty);
+	if (sigprocmask(SIG_SETMASK, &empty, NULL) < 0) return -1;
+	for (int number = 1; number < NSIG; number++) signal(number, SIG_DFL);
+	return 0;
+}
+
+/* Hold the sandbox's launch context for its owner after proving a script's read position. */
 static int probe_context(const char *root, const char *script) {
-	char cwd[PATH_MAX], *text = NULL;
-	size_t size = 0;
+	char cwd[PATH_MAX], ready;
 	int status;
-	if (!getcwd(cwd, sizeof(cwd)) || strcmp(cwd, root)) return 70;
+	if (reset_signals() < 0 || !getcwd(cwd, sizeof(cwd)) || strcmp(cwd, root)) return 70;
 	pid_t child = fork();
 	if (child == 0) { execl(script, script, (char *)NULL); _exit(127); }
 	if (child < 0 || waitpid(child, &status, 0) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 42) return 71;
-	FILE *out = open_memstream(&text, &size);
-	int valid = out && raw_context(out) == 0;
-	if (out && fclose(out) != 0) valid = 0;
-	valid = valid && transfer(1, text, size, 1) == 0;
-	free(text);
-	return valid ? 0 : 70;
+	pid_t pid = getpid();
+	return transfer(3, &pid, sizeof(pid), 1) == 0 && transfer(3, &ready, 1, 0) == 0 && ready == 'R' ? 0 : 70;
 }
 
 static struct descriptor_origin descriptor_origin(struct traced_process *process, int fd) {
@@ -3632,8 +3784,6 @@ int main(int argc, char **argv) {
 			!(credentials.effective & ~extra) && !credentials.inheritable && !credentials.ambient &&
 			(credentials.no_new_privileges || (credentials.effective & extra)) ? 0 : 77;
 	}
-	int dispatched = PI_SPEC_AUTHORITY_ONLY ? -1 : image_dispatch(argc, argv);
-	if (dispatched >= 0) return dispatched;
 	if (argc == 3 && !strcmp(argv[1], "--directory-image")) {
 		int fd = open(argv[2], O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
 		if (fd < 0) return 74;
@@ -3667,15 +3817,10 @@ int main(int argc, char **argv) {
 		int routed = dup2(argv[2][1] == '0' ? discard : argv[2][1] - '0', 2) >= 0 && dup2(output, 1) >= 0;
 		close(output); close(discard);
 		if (!routed) return 70;
-		/* Preserve the former libuv outlet's empty mask and default dispositions. */
-		sigset_t empty;
-		sigemptyset(&empty);
-		if (sigprocmask(SIG_SETMASK, &empty, NULL) < 0) return 70;
-		for (int number = 1; number < NSIG; number++) signal(number, SIG_DFL);
+		if (reset_signals() < 0) return 70;
 		char *executable = argv[name + 1], *manifest = descriptors ? argv[3] : NULL, *report = descriptors ? argv[4] : NULL;
 		argv[name + 1] = argv[name];
-		/* Two spare slots after the command, as in image_dispatch: a script's exec is rewritten in place. */
-		return execute_descriptors(manifest, report, executable, memmove(argv + name - 1, argv + name + 1, (size_t)(argc - name) * sizeof(*argv)), argv[2],
+		return execute_descriptors(manifest, report, executable, argv + name + 1, argv[2],
 			!strcmp(argv[1], "--exec-closed-input"), output_flags);
 	}
 	if (argc == 4 && !strcmp(argv[1], "--probe-context")) return probe_context(argv[2], argv[3]);

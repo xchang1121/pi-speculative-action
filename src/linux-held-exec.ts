@@ -4,7 +4,7 @@ import { AsyncLocalStorage, AsyncResource } from "node:async_hooks";
 import { createRequire } from "node:module";
 import { randomBytes } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import { access, chmod, mkdir, readFile, readdir, readlink, realpath, rm, stat } from "node:fs/promises";
+import { access, chmod, mkdir, open, readFile, readdir, readlink, realpath, rm, stat } from "node:fs/promises";
 import { captureProcessContext, validProcessContext, type ProcessExecutionContext } from "./process-context.mjs";
 import net from "node:net";
 import os from "node:os";
@@ -199,6 +199,7 @@ export function descriptorEffects(graph: ProcessResourceGraph, report: readonly 
 
 export interface HeldExecSnapshot {
 	readonly executable: string;
+	readonly invocation?: readonly [path: string, comm: string];
 	/** Actual output aliasing, usable for another isolated launch after context revalidation. */
 	readonly outputRoute?: readonly [0 | 1 | 2, 0 | 1 | 2];
 	readonly outputPipes?: readonly [boolean, boolean];
@@ -551,8 +552,8 @@ export async function resolveLinuxExecHelper(binary?: string): Promise<string> {
 	return resolved;
 }
 
-/** Inspect an image while PTRACE_EVENT_EXEC guarantees it has not run a user instruction. */
-export async function inspectHeldExecProcess(pid: number, executable: string, descriptors?: readonly HeldFileDescriptor[]): Promise<HeldExecSnapshot> {
+/** Inspect the installed, stopped image; stdio mode leaves extra descriptors to the broker capture. */
+export async function inspectHeldExecProcess(pid: number, executable: string, descriptors?: readonly HeldFileDescriptor[] | "stdio"): Promise<HeldExecSnapshot & { readonly context: ProcessExecutionContext }> {
 	const root = `/proc/${pid}`;
 	const [cwd, command, environmentBytes, descriptorNames] = await Promise.all([
 		readlink(`${root}/cwd`),
@@ -560,9 +561,11 @@ export async function inspectHeldExecProcess(pid: number, executable: string, de
 		readFile(`${root}/environ`),
 		readdir(`${root}/fd`),
 	]);
-	if (!validDescriptors(descriptors)) throw new Error("invalid native descriptor context");
-	const context = await captureProcessContext(pid, descriptorNames, descriptors?.filter(descriptor => descriptor.pin === undefined));
-	if (!validProcessContext(context)) throw new Error("held process descriptors are not replayable");
+	const evidence = descriptors === "stdio" ? undefined : descriptors ?? [];
+	if (!validDescriptors(evidence)) throw new Error("invalid native descriptor context");
+	const context = await captureProcessContext(pid, descriptors === "stdio" ? descriptorNames.filter(name => /^[012]$/.test(name)) : descriptorNames,
+		evidence?.filter(descriptor => descriptor.pin === undefined));
+	if (descriptors !== "stdio" && !validProcessContext(context)) throw new Error("held process descriptors are not replayable");
 	const argv = decodeNullFields(command);
 	if (!argv.length) throw new Error("held process argv is empty");
 	const environment: Record<string, string> = {};
@@ -571,12 +574,25 @@ export async function inspectHeldExecProcess(pid: number, executable: string, de
 		if (separator < 1 || Object.hasOwn(environment, entry.slice(0, separator))) throw new Error("held process environment is not canonical");
 		environment[entry.slice(0, separator)] = entry.slice(separator + 1);
 	}
+	let invokedPath: string | undefined;
+	{
+		const auxiliary = await readFile(`${root}/auxv`), memory = await open(`${root}/mem`, "r");
+		try {
+			for (let at = 0; at + 16 <= auxiliary.length; at += 16) if (auxiliary.readBigUInt64LE(at) === 31n) {
+				const bytes = Buffer.alloc(8192), { bytesRead } = await memory.read(bytes, 0, bytes.length, Number(auxiliary.readBigUInt64LE(at + 8)));
+				const end = bytes.subarray(0, bytesRead).indexOf(0);
+				if (end >= 0) invokedPath = bytes.subarray(0, end).toString();
+				break;
+			}
+		} finally { await memory.close(); }
+		if (!invokedPath) throw new Error("held process invocation name is unavailable");
+	}
 	const [output, error] = context.outputEndpoints;
 	return {
 		executable, // A discarded stream stays discarded; a merged one keeps one outlet.
 		outputRoute: [output === "/dev/null" ? 0 : 1, error === "/dev/null" ? 0 : error === output ? 1 : 2],
 		outputPipes: [context.descriptorTypes[1] === "pipe", context.descriptorTypes[2] === "pipe"],
-		argv, cwd, environment, context,
+		argv, cwd, environment, context, invocation: [invokedPath, (await readFile(`${root}/comm`, "utf8")).replace(/\n$/, "")],
 	};
 }
 

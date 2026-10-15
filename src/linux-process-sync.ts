@@ -1,15 +1,16 @@
 import { AsyncResource } from "node:async_hooks";
-import { MessageChannel, type MessagePort, type Transferable, Worker, isMainThread, parentPort, receiveMessageOnPort, workerData } from "node:worker_threads";
+import { MessageChannel, type MessagePort, type Transferable, Worker, parentPort, receiveMessageOnPort, workerData } from "node:worker_threads";
 import { TimelineInterval, type ComputationProducer, type SerializedTimelineComputation, type TimelineDependency } from "./task-timing.ts";
 import { emptyWorldReuseMetrics, type ExecutionOperationAdoption, type ExecutionScope, type WorldReuseMetrics } from "./execution-world.ts";
-import type { ProcessHandoffOwnership, ProcessHandoffTransfer, ProcessHandoffLender } from "./process-handoff.ts";
-import type { LinuxProcessBackendOptions, LinuxProcessSession, NativeProcessInvocation } from "./linux-process-backend.ts";
+import { ProcessHandoffOwnership, type ProcessHandoffTransfer, type ProcessHandoffLender } from "./process-handoff.ts";
+import type { LinuxProcessBackendOptions, LinuxProcessReuseBackend, LinuxProcessSession, NativeProcessInvocation } from "./linux-process-backend.ts";
 import { EffectCommitFailure, effectCommitFailure } from "./effect-transaction.ts";
 import type { CapturedFilesystemTransfer } from "./filesystem-evidence.ts";
-import { WorkspaceSandboxService, type WorkspaceCheckpoint, type WorkspaceExecutionSnapshot, type WorkspaceSandboxOptions, type SandboxExecutionDelta } from "./workspace-sandbox.ts";
-import { toolErrorSettlement, type ToolProcessInvocation, type ToolSettlement } from "./tool-settlement.ts";
-import type { ProcessExecutionRequest, ProcessExecutionResult, ProcessExecutor } from "./process-execution.ts";
-import type { ResourceValidation } from "./settlement.ts";
+import type { WorkspaceSandboxService, SandboxExecutionDelta,
+	SandboxWorkspaceContext, SandboxWorkspaceObservation } from "./workspace-sandbox.ts";
+import type { WorkspaceTransactionCapture, WorkspaceTransactionDriver, WorkspaceTransactionOwnership } from "./workspace-transaction.ts";
+import { type ToolProcessInvocation, type ToolSettlement } from "./tool-settlement.ts";
+import type { ProcessExecutionRequest } from "./process-execution.ts";
 
 type SerializedDependency = Omit<TimelineDependency, "computation" | "shared"> & {
 	readonly computation: SerializedTimelineComputation;
@@ -37,14 +38,13 @@ export interface SynchronousProcessResult {
 	readonly metrics: WorldReuseMetrics;
 	readonly inputs?: readonly CapturedFilesystemTransfer[];
 }
-export interface NativeProcessWork {
-	readonly cwd: string; readonly invocation: ToolProcessInvocation | SerializedProcessBinding;
-	readonly scope?: ExecutionScope; readonly parent?: WorkspaceCheckpoint; readonly options: WorkspaceSandboxOptions;
-}
-interface CapturedProcessWork {
-	readonly snapshot: WorkspaceExecutionSnapshot; readonly bindings: readonly SerializedProcessBinding[]; readonly computations: readonly SerializedDependency[];
-}
-type WorkerState = { readonly live: boolean; readonly metrics: WorldReuseMetrics; readonly owners: readonly number[] };
+type NativeSessionInput = Parameters<LinuxProcessReuseBackend["open"]>[0];
+type SessionSnapshot = { readonly bindings: readonly SerializedProcessBinding[]; readonly computations: readonly SerializedDependency[]; readonly metrics: WorldReuseMetrics };
+const retiredSessions = new FinalizationRegistry<{ readonly owner: WeakRef<SynchronousProcessObserver>; readonly id: number; readonly signal?: AbortSignal; readonly abort: () => void }>(({ owner, id, signal, abort }) => {
+	signal?.removeEventListener("abort", abort);
+	void owner.deref()?.call("release", id).catch(() => undefined);
+});
+type WorkerState = { readonly live: boolean; readonly metrics: WorldReuseMetrics };
 type RemoteError = { readonly message: string; readonly disposition?: "recoverable" | "poisoned" };
 const remoteError = (error: unknown): RemoteError => ({ message: error instanceof Error ? error.message : String(error),
 	...(error instanceof EffectCommitFailure ? { disposition: error.disposition } : {}) });
@@ -55,7 +55,7 @@ type RpcResponse = { readonly data: Uint8Array } | { readonly attached: number |
 type RpcContext = { readonly signal: AbortSignal; readonly onData: (data: Buffer) => void; readonly attached: (pid?: number) => void };
 
 /** A request owns its reply channel; synchronous reads never dispatch the caller's callbacks. */
-function createProcessRpc(port: MessagePort | Worker, clock: Int32Array,
+function createProcessRpc(port: MessagePort, clock: Int32Array,
 	invoke: (method: string, args: never, context: RpcContext) => unknown,
 	state?: () => WorkerState, observed?: (state: WorkerState) => void) {
 	const channels = new Set<MessagePort>();
@@ -103,8 +103,87 @@ function createProcessRpc(port: MessagePort | Worker, clock: Int32Array,
 		} };
 	}
 	function track(port: MessagePort): void { channels.add(port); port.once("close", () => channels.delete(port)); }
-	function fail(error: Error): void { failure = error; for (const channel of channels) channel.close(); }
+	function fail(error: Error): void { failure = error; Atomics.store(clock, 1, 1); Atomics.notify(clock, 0); for (const channel of channels) channel.close(); }
 	return { notify, call, request, fail };
+}
+
+export const ownsNativeProcesses = workerData?.nativeProcessObserver === true;
+let nativeOwner: { readonly worker: Worker; readonly clients: Set<(error: Error) => void>; readonly exited: Promise<void> } | undefined;
+
+/** Backends keep separate registries; workspaces share one journal wherever those backends execute. */
+function connectNativeOwner(kind: "backend" | "workspace", options: LinuxProcessBackendOptions | SandboxWorkspaceObservation,
+	invoke: Parameters<typeof createProcessRpc>[2], observed?: Parameters<typeof createProcessRpc>[4]) {
+	if (!nativeOwner) {
+		const clients = new Set<(error: Error) => void>();
+		const worker = new Worker(new URL(import.meta.url), { workerData: { nativeProcessObserver: true },
+			execArgv: process.execArgv.filter(argument => !argument.startsWith("--input-type")) });
+		const owner = nativeOwner = { worker, clients, exited: new Promise<void>(resolve => worker.once("exit", () => {
+			for (const fail of clients) fail(new Error("native process owner exited"));
+			if (nativeOwner === owner) nativeOwner = undefined; resolve();
+		})) };
+		worker.on("error", error => { for (const fail of clients) fail(error); }); worker.unref();
+	}
+	const owner = nativeOwner, clock = new Int32Array(new SharedArrayBuffer(8)), { port1: port, port2 } = new MessageChannel();
+	const rpc = createProcessRpc(port, clock, invoke, undefined, observed); owner.clients.add(rpc.fail);
+	const closed = new Promise<void>(resolve => port.once("close", () => {
+		rpc.fail(new Error("native owner connection closed")); owner.clients.delete(rpc.fail);
+		if (owner.clients.size) { resolve(); return; }
+		if (nativeOwner === owner) nativeOwner = undefined;
+		owner.worker.ref(); owner.worker.postMessage({ shutdown: true }); void owner.exited.then(resolve);
+	}));
+	try { owner.worker.postMessage({ kind, options, shared: clock.buffer, port: port2 }, [port2]); port.unref(); }
+	catch (error) { port2.close(); port.close(); throw error; }
+	return { worker: owner.worker, rpc, closed, close: () => { port.ref(); rpc.notify("close"); return closed; } };
+}
+
+export function ownWorkspaceObservation(description: () => SandboxWorkspaceObservation): { readonly ready: () => Promise<string>;
+	readonly call: <Value>(method: string, args?: unknown) => Promise<Value>; readonly transactions: WorkspaceTransactionDriver } {
+	let connection: ReturnType<typeof connectNativeOwner> | undefined, initialized: Promise<string> | undefined, disposal: Promise<void> | undefined;
+	const owners = new Map<number, { readonly get: () => Promise<WorkspaceTransactionOwnership | undefined>; proof?: WorkspaceTransactionOwnership }>();
+	const ready = (): Promise<string> => {
+		if (disposal) return Promise.reject(new Error("workspace transaction driver is disposed"));
+		if (!connection) connection = connectNativeOwner("workspace", description(), async (method, args: { id: number; paths: ReadonlySet<string>; until: number }) => {
+			if (method === "hints") return description().hints;
+			const owner = owners.get(args.id); if (!owner) throw new Error("workspace interval owner retired");
+			if (method === "ownership") { const proof = owner.proof = await owner.get(); return proof && { ...proof, interfered: undefined }; }
+			if (method === "interfered" && owner.proof) return owner.proof.interfered(args.paths, args.until);
+			throw new Error("workspace interval ownership unavailable");
+		});
+		return initialized ??= connection.rpc.call<string>("ready");
+	};
+	const call = async <Value>(method: string, args?: unknown): Promise<Value> => { await ready(); return connection!.rpc.call<Value>(method, args); };
+	return { ready, call, transactions: {
+		begin: async () => {
+			const id = await call<number>("begin"); let settled = false;
+			return { readBefore: (resource, maxBytes) => call("readBefore", { id, resource, maxBytes }), abort: async () => { if (!settled) { settled = true; await call("abort", { id }); } },
+				finish: async get => { if (settled) return { complete: false, changes: [], reason: "transaction_already_settled" }; settled = true; if (get) owners.set(id, { get });
+					try { return await call("finish", { id, owned: !!get }); } finally { owners.delete(id); } } };
+		},
+		dispose: () => disposal ??= connection ? connection.rpc.call<void>("dispose").finally(() => connection!.close()) : Promise.resolve(),
+	} };
+}
+
+async function serveWorkspaceObservation(port: MessagePort, clock: Int32Array, options: SandboxWorkspaceObservation, workspaces: Map<string, SandboxWorkspaceContext>) {
+	const { restoreWorkspaceObservation } = await import("./workspace-sandbox.ts");
+	const observation = Promise.resolve().then(() => restoreWorkspaceObservation(options, () => rpc.call("hints"))), captures = new Map<number, WorkspaceTransactionCapture>(); let sequence = 0;
+	const rpc = createProcessRpc(port, clock, async (method, args: { id: number; resource: string; maxBytes: number; owned: boolean }) => {
+		const { workspace, dispose } = await observation;
+		if (method === "ready") { workspaces.set(options.id, workspace); return options.id; }
+		if (method === "begin") { const id = ++sequence; captures.set(id, await workspace.transactions.begin()); return id; }
+		if (method === "writes") { const { observeWorkspaceWrites } = await import("./linux-process-backend.ts"); return observeWorkspaceWrites(workspace, args as unknown as Parameters<typeof observeWorkspaceWrites>[1]); }
+		if (method === "dispose") return dispose();
+		if (method === "close") { workspaces.delete(options.id); rpc.fail(new Error("workspace observation closed")); port.close(); return; }
+		const capture = captures.get(args.id);
+		if (method === "readBefore") { if (!capture?.readBefore) throw new Error("workspace interval input unavailable"); return capture.readBefore(args.resource, args.maxBytes); }
+		captures.delete(args.id);
+		if (method === "abort") return capture?.abort();
+		if (method === "finish") return capture ? capture.finish(args.owned ? async () => {
+			const proof = await rpc.call<Omit<WorkspaceTransactionOwnership, "interfered"> | undefined>("ownership", { id: args.id });
+			return proof && { ...proof, interfered: (paths, until) => rpc.call("interfered", { id: args.id, paths, until }) };
+		} : undefined) : { complete: false, changes: [], reason: "transaction_already_settled" };
+		throw new Error(`unknown workspace observation operation: ${method}`);
+	});
+	void observation.catch(error => { rpc.fail(error instanceof Error ? error : new Error(String(error))); port.close(); });
 }
 
 /** Preserve producer identities; shared intervals will be translated into the receiving caller's clock. */
@@ -128,33 +207,25 @@ export function restoreNativeDependency(dependency: SerializedDependency): Timel
 
 /** Only this private channel is pumped; synchronous execution never dispatches caller callbacks. */
 export class SynchronousProcessObserver {
-	private readonly clock = new Int32Array(new SharedArrayBuffer(8));
-	private readonly worker: Worker;
-	private readonly exited: Promise<void>;
+	private readonly connection: ReturnType<typeof connectNativeOwner>;
 	private closing?: Promise<void>;
 	private failure?: Error;
 	private sequence = 0;
-	private readonly rpc: ReturnType<typeof createProcessRpc>;
+	private get rpc(): ReturnType<typeof createProcessRpc> { return this.connection.rpc; }
 	private readonly owners = new Map<number, { readonly adopted?: WeakRef<(adoption: ExecutionOperationAdoption) => void>;
 		readonly accepts?: WeakRef<(scope: ExecutionScope, salvage?: boolean) => boolean> }>();
 	private readonly callbacks = new Map<number, (method: string, args: never, context: RpcContext) => Promise<unknown>>();
-	private state: WorkerState = { live: false, metrics: emptyWorldReuseMetrics(), owners: [] };
+	private state: WorkerState = { live: false, metrics: emptyWorldReuseMetrics() };
 
 	constructor(options: LinuxProcessBackendOptions) {
-		this.worker = new Worker(new URL(import.meta.url), { workerData: { nativeProcessObserver: true, shared: this.clock.buffer, options },
-			execArgv: process.execArgv.filter(argument => !argument.startsWith("--input-type")) });
-		this.rpc = createProcessRpc(this.worker, this.clock, (method, args: { id: number }, context) => {
+		this.connection = connectNativeOwner("backend", options, (method, args: { id: number }, context) => {
 			const callback = this.callbacks.get(args.id); if (!callback) throw new Error("native work callback retired"); return callback(method, args as never, context);
-		}, undefined, state => {
+		}, state => {
 			this.state = state;
-			for (const id of this.owners.keys()) if (!this.callbacks.has(id) && !state.owners.includes(id)) this.owners.delete(id);
+			// A reply can carry adoption after consuming the last remote record; its local callback owns delivery.
+			for (const [id, owner] of this.owners) if (!owner.adopted?.deref() && !owner.accepts?.deref()) this.owners.delete(id);
 		});
-		const failed = (error: Error) => { this.failure = error; this.rpc.fail(error); };
-		this.worker.on("error", failed);
-		this.exited = new Promise(resolve => this.worker.once("exit", () => {
-			Atomics.store(this.clock, 1, 1); Atomics.notify(this.clock, 0); failed(new Error("native process owner exited")); resolve();
-		}));
-		this.worker.unref();
+		void this.connection.closed.then(() => { this.failure = new Error("native process owner closed"); });
 	}
 
 	get hasWork(): boolean { return this.state.live || this.callbacks.size > 0; }
@@ -164,37 +235,49 @@ export class SynchronousProcessObserver {
 		return scope ? [...this.owners].filter(([, owner]) => owner.accepts?.deref()?.(scope, true)).map(([id]) => id) : [];
 	}
 	adopted(id: number, adoption: ExecutionOperationAdoption): void { this.owners.get(id)?.adopted?.deref()?.(adoption); }
-
-	async run(work: NativeProcessWork, signal: AbortSignal, execute: (executor: ProcessExecutor) => Promise<ToolSettlement>,
-		callbacks: { readonly onOperationAdopted?: (adoption: ExecutionOperationAdoption) => void;
-			readonly acceptOperationScope?: (scope: ExecutionScope, salvage?: boolean) => boolean;
-			readonly onOperationJoinable?: (available: () => boolean) => void }) {
+	private retain(callbacks: Pick<NativeSessionInput, "onOperationAdopted" | "acceptOperationScope" | "onOperationJoinable" | "signal">): number {
 		const id = ++this.sequence;
 		this.owners.set(id, { adopted: callbacks.onOperationAdopted && new WeakRef(callbacks.onOperationAdopted),
 			accepts: callbacks.acceptOperationScope && new WeakRef(callbacks.acceptOperationScope) });
-		let output: ToolSettlement | undefined;
-		this.callbacks.set(id, AsyncResource.bind(async () => {
-			try { output = await execute({ execute: request => this.rpc.call<ProcessExecutionResult>("exec",
-				{ id, request: { ...request, signal: undefined, onData: undefined } }, request.signal, request.onData) }); }
-			catch (error) { output = toolErrorSettlement(error); throw error; }
-		}));
-		callbacks.onOperationJoinable?.(() => {
-			if (signal.aborted || this.failure || this.closing) return false;
-			const request = this.rpc.request<boolean>("joinable", id); void request.completion.catch(() => undefined);
-			const response = request.receive(); return "value" in response && response.value === true;
-		});
+		callbacks.onOperationJoinable?.(() => !callbacks.signal?.aborted && !this.failure && !this.closing && this.read<boolean>("joinable", id));
+		return id;
+	}
+	private read<Value>(method: string, args?: unknown): Value {
+		const request = this.rpc.request<Value>(method, args); void request.completion.catch(() => undefined);
+		const response = request.receive(); if (!("value" in response)) throw new Error("native owner did not return a value"); return response.value as Value;
+	}
+	async open(input: NativeSessionInput, workspace: string, backend: Pick<LinuxProcessReuseBackend, "serializeBinding" | "restoreBinding">): Promise<LinuxProcessSession> {
+		const { signal } = input, invocation = "environment" in input.invocation ? input.invocation : backend.serializeBinding(input.invocation);
+		if (!invocation) throw new Error("process execution binding is unavailable in this scope");
+		const id = this.retain(input), lease = { id }, abort = () => this.rpc.notify("cancel", id);
+		signal?.addEventListener("abort", abort, { once: true });
 		try {
-			const captured = await this.rpc.call<CapturedProcessWork>("capture", { id, work, producer: TimelineInterval.producer }, signal);
-			const snapshot = output ? { ...captured.snapshot, output: { ...output,
-				...(captured.snapshot.output.exitCode === undefined ? {} : { exitCode: captured.snapshot.output.exitCode }) } } : captured.snapshot;
-			return { ...captured, snapshot, validate: () => this.rpc.call<ResourceValidation>("validate", id),
-				commit: async (apply: () => Promise<ToolSettlement>) => {
-					this.callbacks.set(id, async () => { await apply(); });
-					try { await this.rpc.call<void>("commit", id); return await apply(); }
-					catch (error) { throw effectCommitFailure(error, "poisoned"); } finally { this.callbacks.delete(id); }
-				}, dispose: () => this.closing || this.failure ? Promise.resolve() : this.rpc.call<void>("release", id) };
-		} catch (error) { void this.rpc.call("release", id).catch(() => undefined); throw error; }
-		finally { this.callbacks.delete(id); }
+			const authority = await this.rpc.call<SharedArrayBuffer>("open", { id: lease.id, workspace, sourceRoot: input.sourceRoot, invocation,
+				scope: input.scope, producer: TimelineInterval.producer }, signal);
+			const call = <Value>(operation: string, value?: unknown, request?: ProcessExecutionRequest) => this.rpc.call<Value>("session", { id: lease.id, operation, value }, request?.signal, request?.onData);
+			const snapshot = () => this.read<SessionSnapshot>("snapshot", lease.id);
+			let closing: Promise<void> | undefined;
+			const ownership = new ProcessHandoffOwnership(input.onOperationAdopted, input.acceptOperationScope, undefined, authority, async <Value>(apply: () => Promise<Value>) => {
+				let value: Value; this.callbacks.set(lease.id, async () => { value = await apply(); });
+				try { await this.rpc.call("commit", lease.id); return value!; } finally { this.callbacks.delete(lease.id); }
+			});
+			retiredSessions.register(lease, { owner: new WeakRef(this), id, signal, abort }, lease);
+			return { ownership,
+				executor: { execute: request => call("execute", { ...request, signal: undefined, onData: undefined }, request) },
+				executeBinding: async binding => {
+					const value = backend.serializeBinding(binding); if (!value) throw new Error("process execution binding is unavailable in this scope");
+					const result = await call<Awaited<ReturnType<LinuxProcessSession["executeBinding"]>>>("binding", value);
+					return { ...result, output: result.output.map(event => ({ ...event, data: Buffer.from(event.data) })) };
+				},
+				metrics: () => Object.freeze(snapshot().metrics),
+				executionBindings: () => Object.freeze(snapshot().bindings.flatMap(binding => backend.restoreBinding(binding) ?? [])),
+				computationDependencies: () => Object.freeze(snapshot().computations.flatMap(dependency => restoreNativeDependency(dependency) ?? [])),
+				seal: changes => call("seal", changes), validate: () => call("validate"),
+				close: () => closing ??= call<void>("close").finally(() => signal?.removeEventListener("abort", abort)),
+				dispose: () => { retiredSessions.unregister(lease); signal?.removeEventListener("abort", abort);
+					return this.closing || this.failure ? Promise.resolve() : this.rpc.call<void>("release", lease.id); },
+			};
+		} catch (error) { signal?.removeEventListener("abort", abort); void this.rpc.call("release", lease.id).catch(() => undefined); throw error; }
 	}
 
 	attach(request: SynchronousProcessRequest, commit?: WorkspaceSandboxService["commitDelta"], borrow?: ProcessHandoffLender) {
@@ -219,81 +302,47 @@ export class SynchronousProcessObserver {
 	}
 
 	close(): Promise<void> {
-		if (this.closing) return this.closing;
-		this.worker.ref();
-		this.rpc.notify("close");
-		return this.closing = this.exited;
+		return this.closing ??= this.connection.close();
 	}
 }
 
-if (!isMainThread && workerData?.nativeProcessObserver === true) void (async () => {
-	const { shared, options } = workerData as { shared: SharedArrayBuffer; options: LinuxProcessBackendOptions };
-	const clock = new Int32Array(shared);
+async function serveNativeBackend(port: MessagePort, clock: Int32Array, options: LinuxProcessBackendOptions,
+	workspaces: ReadonlyMap<string, SandboxWorkspaceContext>) {
 	let backend: import("./linux-process-backend.ts").LinuxProcessReuseBackend | undefined;
-	const workspace = new WorkspaceSandboxService(), observations = new Map<number, { readonly finish: () => void; release?: () => void | Promise<void> }>();
+	const observations = new Map<number, { readonly finish: () => void; release?: () => void | Promise<void> }>();
 	const grants = new Map<number, { readonly scope?: ExecutionScope; readonly owners?: readonly number[] }>();
-	const works = new Map<number, { readonly signal: AbortSignal; session?: LinuxProcessSession; available?: () => boolean;
-		launches: number; exitCode?: number | null; readonly operation: boolean; readonly apply: () => Promise<void> }>();
-	const prepared = new Map<string, Awaited<ReturnType<WorkspaceSandboxService["prepare"]>>>();
+	const works = new Map<number, { readonly controller: AbortController; session?: LinuxProcessSession; available?: () => boolean;
+		dispatch?: (operation: string, value: never, context: RpcContext) => Promise<unknown>; readonly apply: () => Promise<void> }>();
 	const retained = new Map<number, { readonly ownership: WeakRef<ProcessHandoffOwnership>; readonly adopted: (adoption: ExecutionOperationAdoption) => void;
 		readonly accept: (scope: ExecutionScope) => boolean }>();
 	try {
 		const { LinuxProcessReuseBackend } = await import("./linux-process-backend.ts"); backend = new LinuxProcessReuseBackend(options);
-		const rpc = createProcessRpc(parentPort!, clock, async (method, args: unknown, context) => {
+		const rpc = createProcessRpc(port, clock, async (method, args: unknown, context) => {
 			if (method === "observe") return observe(args as { id: number; request: SynchronousProcessRequest }, context.attached);
-			if (method === "capture") {
-				const { id, work, producer } = args as { id: number; work: NativeProcessWork; producer?: ComputationProducer };
-				const entry: NonNullable<ReturnType<typeof works.get>> = { signal: context.signal, launches: 0,
-					operation: "invocation" in work.invocation, apply: () => rpc.call("apply", { id }) };
-				works.set(id, entry);
-				const adopted = (adoption: ExecutionOperationAdoption) => backend!.recordWorkerAdoption(id, adoption);
-				const accept = (scope: ExecutionScope) => [...grants.values()].some(grant => grant.scope?.sessionID === scope.sessionID &&
-					grant.scope.turnID === scope.turnID && grant.scope.callID === scope.callID && grant.owners?.includes(id));
-				const binding = "invocation" in work.invocation ? backend!.restoreBinding(work.invocation) : undefined;
-				if (entry.operation && !binding) throw new Error("native work binding expired");
-				let unfinished: unknown;
-				const { output: snapshot } = await TimelineInterval.collect(() => backend!.withProducer(() => workspace.capture({ ...work.options, cwd: work.cwd,
-					preparation: binding ? prepared.get(work.cwd) : undefined,
-					executionMetrics: () => ({ reuse: entry.session?.metrics() }), validate: () => entry.session!.validate(),
-					afterCapture: (_workspace, capture) => { if (unfinished !== undefined) throw unfinished; return entry.session!.seal(capture.changes); },
-					execute: async sandbox => {
-						const session = entry.session = await backend!.open({ sourceRoot: work.cwd, workspace: sandbox, invocation: binding ?? work.invocation as ToolProcessInvocation,
-							scope: work.scope, signal: context.signal, onOperationAdopted: adopted, acceptOperationScope: accept,
-							onOperationJoinable: available => { entry.available = available; } });
-						retained.set(id, { ownership: new WeakRef(session.ownership), adopted, accept });
-						try {
-							if (binding) { const result = await session.executeBinding(binding);
-								return { result: { content: [], details: result.suspended ? { suspended: true } : { exit: result.exit } }, isError: false }; }
-							await rpc.call("tool", { id });
-							if (!entry.launches) throw new Error("process-backed tool bypassed the process execution outlet");
-							return { result: { content: [], details: {} }, isError: false };
-						} catch (error) {
-							if (entry.launches === 1 && typeof entry.exitCode === "number" && entry.exitCode !== 0) return { ...toolErrorSettlement(error), exitCode: entry.exitCode };
-							unfinished = error; return toolErrorSettlement(error);
-						} finally { await session.close(); }
-					},
-				}, work.parent)), producer);
-				return { snapshot, bindings: entry.session!.executionBindings().flatMap(binding => backend!.serializeBinding(binding) ?? []),
-					computations: entry.session!.computationDependencies().flatMap(dependency => serializeNativeDependency(dependency) ?? []) } satisfies CapturedProcessWork;
+			if (method === "open") {
+				const { id, workspace, producer, ...input } = args as { id: number; workspace: string; producer?: ComputationProducer } & Omit<NativeSessionInput, "workspace" | "invocation"> & { invocation: ToolProcessInvocation | SerializedProcessBinding };
+				const sandbox = workspaces.get(workspace); if (!sandbox) throw new Error("native workspace owner retired");
+				const controller = new AbortController(), cancel = () => controller.abort(context.signal.reason);
+				const entry = { controller, apply: () => rpc.call<void>("apply", { id }) };
+				works.set(id, entry); context.signal.addEventListener("abort", cancel, { once: true });
+				try {
+					const invocation = "invocation" in input.invocation ? backend!.restoreBinding(input.invocation) : input.invocation;
+					if (!invocation) throw new Error("native work binding expired");
+					const { output: session } = await TimelineInterval.collect(() => openSession(id, { ...input, workspace: sandbox, invocation }), producer);
+					return session.ownership.authority.buffer;
+				} finally { context.signal.removeEventListener("abort", cancel); }
 			}
-			if (method === "exec") {
-				const { id, request } = args as { id: number; request: ProcessExecutionRequest }, entry = works.get(id);
-				if (!entry?.session) throw new Error("native work retired"); entry.launches++;
-				return { exitCode: entry.exitCode } = await entry.session.executor.execute({ ...request, ...context });
+			if (method === "session") {
+				const { id, operation, value } = args as { id: number; operation: string; value: never }, dispatch = works.get(id)?.dispatch;
+				if (!dispatch) throw new Error("native work retired"); return dispatch(operation, value, context);
 			}
-			if (method === "release") { works.delete(args as number); return; }
-			if (method === "validate" || method === "commit") {
+			if (method === "snapshot") return sessionSnapshot(args as number);
+			if (method === "cancel") { works.get(args as number)?.controller?.abort(new Error("native work cancelled")); return; }
+			if (method === "release") { const entry = works.get(args as number); works.delete(args as number); entry?.controller?.abort(new Error("native work retired")); return entry?.session?.close(); }
+			if (method === "commit") {
 				const entry = works.get(args as number); if (!entry?.session) throw new Error("native work retired");
-				if (method === "validate") return entry.session.validate();
-				if (entry.operation) throw new Error("internal process output cannot commit an enclosing tool");
-				return entry.session.ownership.commit(entry.apply);
+				return entry.session.ownership.commit(() => entry.apply());
 			}
-			if (method === "prepare" || method === "qualify") {
-				const { cwd, options } = args as { cwd: string; options: WorkspaceSandboxOptions };
-				if (method === "qualify") return workspace.qualify(options, cwd);
-				const selected = await workspace.prepare(cwd, { ...options, signal: context.signal }); prepared.set(cwd, selected); return selected;
-			}
-			if (method === "fingerprint") return workspace.fingerprint(args as WorkspaceSandboxOptions);
 			if (method === "stale") { const binding = backend!.restoreBinding(args as SerializedProcessBinding); return !binding || backend!.bindingStale(binding); }
 			if (method === "configure") { backend!.storage.configure(args as Parameters<NonNullable<typeof backend>["storage"]["configure"]>[0]); return; }
 			if (method === "maintain") return backend!.storage.maintain(args as Parameters<NonNullable<typeof backend>["storage"]["maintain"]>[0]);
@@ -304,13 +353,37 @@ if (!isMainThread && workerData?.nativeProcessObserver === true) void (async () 
 			if (method === "close") {
 				for (const observation of observations.values()) { observation.finish(); void observation.release?.(); }
 				rpc.fail(new Error("native process owner closing"));
-				return backend!.dispose().finally(() => workspace.dispose()).finally(() => parentPort!.close());
+				for (const entry of works.values()) entry.controller.abort(new Error("native process owner closing"));
+				return Promise.allSettled([...works.values()].map(entry => entry.session?.close())).then(() => backend!.dispose()).finally(() => port.close());
 			}
 			throw new Error(`unknown native work operation: ${method}`);
 		}, () => {
 			for (const [id, owner] of retained) if (!owner.ownership.deref()) retained.delete(id);
-			return { live: backend!.hasReusableWork, metrics: backend!.producerMetrics(), owners: [...retained.keys()] };
+			return { live: backend!.hasReusableWork, metrics: backend!.producerMetrics() };
 		});
+		const sessionSnapshot = (id: number): SessionSnapshot => {
+			const session = works.get(id)?.session; if (!session) throw new Error("native work retired");
+			return { metrics: session.metrics(), bindings: session.executionBindings().flatMap(binding => backend!.serializeBinding(binding) ?? []),
+				computations: session.computationDependencies().flatMap(dependency => serializeNativeDependency(dependency) ?? []) };
+		};
+		const openSession = async (id: number, input: NativeSessionInput) => {
+			const entry = works.get(id)!;
+			const adopted = (adoption: ExecutionOperationAdoption) => backend!.recordWorkerAdoption(id, adoption);
+			const accept = (scope: ExecutionScope) => [...grants.values()].some(grant => grant.scope?.sessionID === scope.sessionID &&
+				grant.scope.turnID === scope.turnID && grant.scope.callID === scope.callID && grant.owners?.includes(id));
+			const session = entry.session = await backend!.open({ ...input, signal: entry.controller.signal, onOperationAdopted: adopted, acceptOperationScope: accept,
+				onOperationJoinable: available => { entry.available = available; } });
+			if (entry.controller.signal.aborted) { await session.close(); entry.controller.signal.throwIfAborted(); }
+			retained.set(id, { ownership: new WeakRef(session.ownership), adopted, accept });
+			entry.dispatch = AsyncResource.bind(async (operation: string, value: unknown, context: RpcContext) => {
+				if (operation === "execute") return session.executor.execute({ ...value as ProcessExecutionRequest, ...context });
+				if (operation === "binding") { const binding = backend!.restoreBinding(value as SerializedProcessBinding); if (!binding) throw new Error("native work binding expired"); return session.executeBinding(binding); }
+				if (operation === "seal") return session.seal(value as Parameters<LinuxProcessSession["seal"]>[0]);
+				if (operation === "validate" || operation === "close") return session[operation]();
+				throw new Error(`unknown native session operation: ${operation}`);
+			});
+			return session;
+		};
 		const observe = async ({ id, request }: { id: number; request: SynchronousProcessRequest }, attached: RpcContext["attached"]) => {
 			const finished = new Promise<void>(finish => { observations.set(id, { finish }); }); grants.set(id, request);
 			try {
@@ -321,7 +394,15 @@ if (!isMainThread && workerData?.nativeProcessObserver === true) void (async () 
 			} finally { grants.delete(id); }
 		};
 	} catch {
-		Atomics.store(clock, 1, 1); Atomics.notify(clock, 0);
-		await backend?.dispose(); parentPort!.close();
+		await backend?.dispose(); port.close();
 	}
-})();
+}
+
+if (ownsNativeProcesses) {
+	const workspaces = new Map<string, SandboxWorkspaceContext>();
+	parentPort!.on("message", ({ kind, options, port, shutdown, shared }: { kind?: "backend" | "workspace"; options: never; port?: MessagePort; shutdown?: boolean; shared: SharedArrayBuffer }) => {
+		if (shutdown) { parentPort!.close(); return; }
+		if (port && kind === "backend") void serveNativeBackend(port, new Int32Array(shared), options, workspaces);
+		if (port && kind === "workspace") void serveWorkspaceObservation(port, new Int32Array(shared), options, workspaces);
+	});
+}

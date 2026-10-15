@@ -46,8 +46,6 @@ export interface StraceObservation {
 	readonly resourceJournal?: readonly { readonly inode: string; readonly description?: number; readonly kind: ResourceTransitionKind; readonly data: Buffer; readonly requested?: number }[];
 	readonly retainedDescriptions?: readonly number[];
 	readonly finalHandles?: readonly { readonly fd: number; readonly description?: number; readonly cloexec: boolean }[];
-	/** Processes whose every intercepted exec resumed at its native image in place. */
-	readonly resumedInterpositions?: readonly number[];
 	/** Workspace paths, relative to it, the traced processes created, removed, renamed or opened to write. */
 	readonly written?: readonly string[];
 	/** Paths outside the workspace it wrote, which a private branch took. */
@@ -57,6 +55,8 @@ export interface StraceObservation {
 }
 
 export interface StraceObservationOptions {
+	/** Exact root launch alias; the prototype separately binds the installed executable bytes. */
+	readonly launchPath?: string;
 	/** The workspace names a run brokered from a traced launcher pid wrote, its own brokered runs included. */
 	readonly brokeredWrites?: (pid: number) => readonly string[] | undefined;
 	/** The session's private branch, where a descriptor on a copy shows the copy: it stands for the host path it shadows. */
@@ -65,8 +65,6 @@ export interface StraceObservationOptions {
 	readonly previewBytes?: number;
 	/** The owned tracer sealed this complete prefix before the pending syscall's entry, while capturing the stopped target. */
 	readonly frozen?: { readonly pid: number; readonly bytes: number };
-	/** Intercepted path to native target; a later exec of the target in the same process proves descriptor-preserving bypass. */
-	readonly interposedExecutables?: readonly (readonly [intercepted: string, original: string])[];
 	/**
 	 * Workspace roots whose driver-specific unsupported errors must invalidate adoption. This keeps
 	 * a COW substrate from changing a command result when the Actor filesystem supports the syscall.
@@ -480,7 +478,7 @@ function epollEvents(text: string | undefined): Array<{ mask: number; data: stri
 	return "[" + matches.map(match => match[0]).join(", ") + "]" === text && events.every(event => event) ? events as Array<{ mask: number; data: string }> : undefined;
 }
 
-function selectTraceRoot(files: readonly TraceFile[], target: string): TraceRoot | { readonly reason: string } {
+function selectTraceRoot(files: readonly TraceFile[], target: string, initialCwd: string): TraceRoot | { readonly reason: string } {
 	const parent = new Map<number, number>();
 	const children = new Map<number, number[]>();
 	for (const file of files) {
@@ -502,7 +500,7 @@ function selectTraceRoot(files: readonly TraceFile[], target: string): TraceRoot
 	for (const file of files) {
 		const processDepth = depth.get(file.pid);
 		if (processDepth === undefined) continue;
-		const start = file.lines.findIndex((line) => successfulExec(line) && quotedStrings(line)[0] !== undefined && path.posix.resolve(quotedStrings(line)[0]!) === target);
+		const start = file.lines.findIndex((line) => successfulExec(line) && quotedStrings(line)[0] !== undefined && path.posix.resolve(initialCwd, quotedStrings(line)[0]!) === target);
 		if (start >= 0) candidates.push({ file, start, depth: processDepth });
 	}
 	if (!candidates.length) return { reason: "target_exec_not_found" };
@@ -562,8 +560,8 @@ export async function observeStrace(
 				terminated: exited !== undefined || /^\+\+\+ killed by SIG[A-Z0-9]+(?: \(core dumped\))? \+\+\+\s*$/.test(last) });
 		}
 	}
-	const target = path.posix.resolve(executablePath);
-	const root = selectTraceRoot(files, target);
+	const target = path.posix.resolve(initialCwd, executablePath);
+	const root = selectTraceRoot(files, options.launchPath ?? target, initialCwd);
 	if ("reason" in root) return { complete: false, paths: [], taints: ["trace_incomplete"], tracedProcesses: 0, incompleteReasons: [root.reason] };
 
 	const byPID = new Map(files.map((file) => [file.pid, file]));
@@ -612,9 +610,8 @@ export async function observeStrace(
 		semanticRoots.flatMap((root) => containsLogicalPath(root, target) ? [`//${path.posix.relative(root, target)}`] : [])[0];
 	const { journal: resourceJournal, handled: streamCalls, retained, finalHandles } = options.inheritedHandles?.length || options.inheritedStreams?.length
 		? resourceTransitions(selected, root.file.pid, options) : { journal: [], handled: new Set<TraceLine>(), retained: [], finalHandles: [] };
-	const interposedExecutables = new Map((options.interposedExecutables ?? []).map(([intercepted, original]) => [path.posix.resolve(intercepted), path.posix.resolve(original)]));
 	const semanticRoots = (options.guardFilesystemSemanticsWithin ?? []).map((value) => path.posix.resolve(value));
-	const { ignored: ignoredSegments, resumed: resumedInterpositions } = ignoredProcessSegments(selected, interposedExecutables);
+	const brokered = brokeredProcessSegments(selected, options);
 	const observeMetadata = (observedPath: string, followSymlinks: boolean, { digest, fields }: StatObservation) => {
 		lookupFailures.set(observedPath, undefined);
 		const identity = `metadata:${followSymlinks}:${fields?.join(",") ?? ""}:${observedPath}`;
@@ -627,7 +624,8 @@ export async function observeStrace(
 		let cwd = initial;
 		if (!cwd) { complete = false; incompleteReasons.add(`cwd_unknown:${pid}`); cwd = path.posix.resolve(initialCwd); }
 		for (let index = start; index < file.lines.length; index++) {
-			if (ignoredSegments.get(pid)?.some(([from, to]) => index >= from && index < to)) continue;
+			if (index >= (brokered.get(pid) ?? Infinity)) break;
+			if (pid === root.file.pid && index === start && options.launchPath) continue;
 			const line = file.lines[index]!;
 			if (!line) continue;
 			const spawned = spawnedPID(line);
@@ -778,12 +776,11 @@ export async function observeStrace(
 			.sort((left, right) => pathOrder(left).localeCompare(pathOrder(right)))),
 		taints: Object.freeze([...taints].sort()),
 		pids: [...selected.keys()],
-		tracedProcesses: [...selected].filter(([pid, { file, start }]) => file.lines.slice(start)
-			.some((_, offset) => !ignoredSegments.get(pid)?.some(([from, to]) => start + offset >= from && start + offset < to))).length,
+		tracedProcesses: [...selected].filter(([pid, { file, start }]) => start < Math.min(file.lines.length, brokered.get(pid) ?? Infinity)).length,
 		incompleteReasons: Object.freeze([...incompleteReasons].sort()),
 		...(unsupportedSyscalls.size ? { unsupportedSyscalls: Object.freeze([...unsupportedSyscalls].sort()) } : {}),
 		...(unsupportedSyscallsTruncated ? { unsupportedSyscallsTruncated: true as const } : {}),
-		...(resumedInterpositions.length ? { resumedInterpositions } : {}), written: [...written].map(name => name.slice(2)).sort(), external: [...external].sort(),
+		written: [...written].map(name => name.slice(2)).sort(), external: [...external].sort(),
 		locks: [...locks].map(([target, exclusive]) => ({ path: target, exclusive })),
 	};
 }
@@ -804,6 +801,7 @@ function continuationCall(line: TraceLine, initial: boolean): boolean {
 	if (call === "mmap") return (line.args[3] ?? "").split("|").every(flag => /^(?:MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED|MAP_DENYWRITE|MAP_STACK)$/.test(flag));
 	if (call === "madvise") return line.args[2] === "MADV_DONTNEED" || line.args[2] === "MADV_NOHUGEPAGE";
 	if (call === "arch_prctl") return /^ARCH_(?:SET|GET)_(?:FS|GS)$/.test(line.args[0] ?? "");
+	if (call === "prctl") return line.args[0] === "PR_GET_NAME";
 	return /^(?:read|pread64|readv|write|writev|pwrite64|lseek|open|openat|access|faccessat|newfstatat|fstat|stat|lstat|statx|readlink|readlinkat|brk|mprotect|munmap|set_tid_address|set_robust_list|rseq|prlimit64|getrandom|rt_sigaction|rt_sigprocmask|sigaltstack|dup|poll|ppoll|select|pselect6|sendto|recvfrom|sendmsg|recvmsg|shutdown|flock|rename|renameat|renameat2|unlink|unlinkat|link|linkat|mkdir|mkdirat|rmdir|chmod|fchmod|fchmodat|truncate|ftruncate)$/.test(call);
 }
 
@@ -922,51 +920,17 @@ function writesPath(line: TraceLine): boolean {
 		/^open(?:at2?)?$/.test(line.name) && /\bO_(?:WRONLY|RDWR|CREAT|TRUNC)\b/.test(line.args.join(" "));
 }
 
-function ignoredProcessSegments(selected: ReadonlyMap<number, TraceProcess>, interposedExecutables: ReadonlyMap<string, string>) {
-	const ignored = new Map<number, Array<readonly [number, number]>>(), resumed = new Set<number>();
-	if (!interposedExecutables.size) return { ignored, resumed: [] };
-	const fullyIgnored = new Map<number, number>();
-	for (const [pid, { file, start, cwd: initial }] of selected) {
-		let cwd = initial;
-		for (let index = start; index < file.lines.length; index++) {
-			const line = file.lines[index]!;
-			cwd = tracedCwd(line, cwd);
-			if (!successfulExec(line)) continue;
-			const executable = quotedStrings(line)[0];
-			const original = executable && interposedExecutables.get(tracedPath(executable, cwd) ?? "");
-			if (!original) continue;
-			// An in-place bypass: the launcher at the intercepted path next execs the original image, by its absolute path.
-			let resumedAt = index + 1;
-			while (resumedAt < file.lines.length && !successfulExec(file.lines[resumedAt]!)) resumedAt++;
-			const target = resumedAt < file.lines.length ? quotedStrings(file.lines[resumedAt]!)[0] : undefined;
-			if (target && tracedPath(target, cwd) === original) {
-				(ignored.get(pid) ?? ignored.set(pid, []).get(pid)!).push([index, resumedAt]);
-				resumed.add(pid);
-				index = resumedAt - 1;
-				continue;
-			}
-			(ignored.get(pid) ?? ignored.set(pid, []).get(pid)!).push([index, file.lines.length]);
-			fullyIgnored.set(pid, index);
-			break;
-		}
+/** Only the owned tracer can write this marker, after successful adoption and before resuming. */
+function brokeredProcessSegments(selected: ReadonlyMap<number, TraceProcess>, options: StraceObservationOptions) {
+	const brokered = new Map<number, number>();
+	for (const [pid, { file, start }] of selected) for (let index = start; index < file.lines.length; index++) {
+		const line = file.lines[index]!;
+		if (line.name !== "pi_brokered_exec") continue;
+		if (!syscallSucceeded(line) || index <= start || !successfulExec(file.lines[index - 1]!) || brokered.has(pid) || options.brokeredWrites?.(pid) === undefined ||
+			file.lines.slice(index + 1).some(next => next.failure || next.name && !/^(?:exit|exit_group|terminated)$/.test(next.name))) throw new Error(`unproven brokered exec: ${pid}`);
+		brokered.set(pid, index - 1);
 	}
-	// Anything the launcher spawned while it was dispatching belongs to its ignored segment.
-	for (const [pid, segments] of ignored) if (!fullyIgnored.has(pid)) for (const [from, to] of segments) for (const line of selected.get(pid)!.file.lines.slice(from, to)) {
-		const child = spawnedPID(line);
-		if (child && !fullyIgnored.has(child)) fullyIgnored.set(child, 0);
-	}
-	for (const [pid, start] of fullyIgnored) {
-		if (start === 0 && !ignored.has(pid)) ignored.set(pid, [[0, selected.get(pid)?.file.lines.length ?? Number.POSITIVE_INFINITY]]);
-		const file = selected.get(pid)?.file;
-		if (!file) continue;
-		for (const line of file.lines.slice(start)) {
-			const child = spawnedPID(line);
-			if (!child || fullyIgnored.has(child)) continue;
-			ignored.set(child, [[0, selected.get(child)?.file.lines.length ?? Number.POSITIVE_INFINITY]]);
-			fullyIgnored.set(child, 0);
-		}
-	}
-	return { ignored, resumed: [...resumed].filter((pid) => !fullyIgnored.has(pid)) };
+	return brokered;
 }
 
 function tracedCwd(line: TraceLine, cwd: string | undefined): string | undefined {
@@ -976,11 +940,6 @@ function tracedCwd(line: TraceLine, cwd: string | undefined): string | undefined
 	const target = quotedStrings(line)[0];
 	return target && (target.startsWith("/") || cwd) ? walkedPath(target.startsWith("/") ? target : `${cwd}/${target}`) : undefined;
 }
-
-function tracedPath(target: string, cwd: string | undefined): string | undefined {
-	return path.posix.isAbsolute(target) ? path.posix.resolve(target) : cwd ? path.posix.resolve(cwd, target) : undefined;
-}
-
 
 function successfulExec(line: TraceLine): boolean { return (line.name === "execve" || line.name === "execveat") && syscallSucceeded(line); }
 
@@ -1010,7 +969,8 @@ function syscallSucceeded(line: TraceLine): boolean { return /^(?:0x[0-9a-f]+|[0
 function confinementDenied(line: TraceLine): boolean { return /^-1 (?:EACCES|EPERM)\b/.test(line.result); }
 
 function prctlConfinementSensitive(line: TraceLine, syscall: string): boolean {
-	return syscall === "prctl" && !/^PR_SET_(?:NAME|VMA)\b/.test(line.args[0] ?? "");
+	// Exec identity seals the initial task name; querying it observes no sandbox policy.
+	return syscall === "prctl" && !/^PR_(?:GET_NAME|SET_NAME|SET_VMA)$/.test(line.args[0] ?? "");
 }
 
 function processLimitDenied(line: TraceLine, syscall: string): boolean {
