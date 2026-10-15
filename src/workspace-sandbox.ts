@@ -517,7 +517,8 @@ async function commitSandboxExecution(state: WorkspaceSandboxState, execution: S
 				// The staged files take their times while every target is checked, concurrently; nothing moves before both finish.
 				const timed = restoreModifiedTimes([...staged].map(([change, temporary]) => [temporary, change.afterModified]));
 				timed.catch(() => undefined);
-				await mapFilesystem(changes, async (change) => {
+				// Capture directories before writable file handles trigger OverlayFS copy-up and change their times.
+				for (const directories of [true, false]) await mapFilesystem(changes.filter(change => (change.kind === "directory") === directories), async (change) => {
 					// A file whose identity still stands for the bytes this change replaces needs no rereading to prove them.
 					const unchanged = change.kind !== "directory" && change.beforeIdentity && change.before
 						? await lstat(change.target, { bigint: true }).then(info => fileIdentity(info) === change.beforeIdentity ? info : undefined, () => undefined) : undefined;
