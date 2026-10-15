@@ -267,7 +267,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		}
 	}
 	const taskCompletedAt = performance.now();
-	// The Actor's transcript, calls with their results, for offline replay (bench/pattern-replay.ts).
+	// Preserve the Actor's complete transcript for inspection and external replay.
 	if (input.keepSession && input.output) await writeFile(input.output.replace(/(\.json)?$/, ".session.jsonl"),
 		[sessionManager.getHeader(), ...sessionManager.getEntries()].map((entry) => JSON.stringify(entry)).join("\n"));
 	const actorActions =Object.values(actorActionsByTool).reduce((sum, count) => sum + count, 0);

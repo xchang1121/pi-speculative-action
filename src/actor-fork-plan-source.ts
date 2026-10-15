@@ -1,4 +1,3 @@
-import { widenReadGuess } from "./action-semantics.ts";
 import type { AgentPlanSource } from "./agent-runtime-types.ts";
 import type { AssistantMessageEvent } from "@earendil-works/pi-ai";
 
@@ -36,8 +35,6 @@ interface PendingFork {
 	readonly promise: Promise<readonly ActorForkActionBatch[]>;
 	readonly resolve: (batches: readonly ActorForkActionBatch[]) => void;
 	readonly controller: AbortController;
-	/** A request can start before Runtime binds its preparation callback. */
-	preparation?: true | (() => void);
 	generatedText: string;
 	content: string;
 	reasoning: string;
@@ -72,22 +69,12 @@ export class ActorForkPlanSource {
 			const calls = (feedback as { batchCalls?: unknown } | undefined)?.batchCalls;
 			return Array.isArray(calls) && calls.every((id) => typeof id === "string") ? calls : undefined;
 		},
-		propose: async ({ startInput, data, candidateNames, signal }) => {
+		propose: async ({ startInput, signal }) => {
 			const pending = this.pending.get(startInput.turnID);
-			if (pending && !pending.settled && !pending.controller.signal.aborted) {
-				const prepare = () => data.prepareExecution?.(candidateNames, signal);
-				if (pending.preparation === true) prepare();
-				else pending.preparation = prepare;
-			}
 			const batches = await this.waitForBatches(startInput.turnID, signal);
-			const allowed = new Set(candidateNames);
-			return batches.flatMap((batch) => {
-				// As for a Drafter batch, the predictable calls of a mixed batch stay; no peer continues from a partial one.
-				const kept = batch.calls.filter((call) => allowed.has(call.tool)), whole = kept.length === batch.calls.length;
-				return kept.length ? [{ id: `self-speculation:${startInput.turnID}:${batch.id}`, source: "self-speculation", revision: 0,
-					actions: kept.map((call) => ({ id: call.id, type: "tool_call" as const, tool: call.tool, input: widenReadGuess(call.tool, call.input),
-						reuseFeedback: pending?.reuseFeedback, feedback: whole ? { batchCalls: kept.map(({ id }) => id) } : undefined })) }] : [];
-			});
+			return batches.filter(batch => batch.calls.length).map(batch => ({ id: `self-speculation:${startInput.turnID}:${batch.id}`, source: "self-speculation", revision: 0,
+				actions: batch.calls.map(call => ({ id: call.id, type: "tool_call" as const, tool: call.tool, input: call.input,
+					reuseFeedback: pending?.reuseFeedback, feedback: { batchCalls: batch.calls.map(({ id }) => id) } })) }));
 		},
 	};
 
@@ -172,16 +159,6 @@ export class ActorForkPlanSource {
 
 	probeSignal(turnID: string): AbortSignal | undefined {
 		return this.pending.get(turnID)?.controller.signal;
-	}
-
-	/** Warm only after the coordinator admits an actual sidecar request. */
-	startProbe(turnID: string): AbortSignal | undefined {
-		const pending = this.pending.get(turnID);
-		if (pending && !pending.settled && !pending.controller.signal.aborted) {
-			if (typeof pending.preparation === "function") pending.preparation();
-			pending.preparation = true;
-		}
-		return pending?.controller.signal;
 	}
 
 	finishActorStream(turnID: string): void {

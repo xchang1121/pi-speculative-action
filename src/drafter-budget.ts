@@ -29,7 +29,6 @@ export class DrafterTaskBudget {
 		readonly options?: SimpleStreamOptions;
 		readonly policy: BudgetPolicy;
 		readonly complete: (model: Model<Api>, context: Context, options?: SimpleStreamOptions) => Promise<AssistantMessage>;
-		readonly started?: () => void;
 		readonly onSkipped?: OnSkipped;
 	}): Promise<AssistantMessage | undefined> {
 		input.options?.signal?.throwIfAborted();
@@ -45,7 +44,6 @@ export class DrafterTaskBudget {
 		state.reservedTokens += reservation;
 		let reported = false;
 		try {
-			input.started?.();
 			const message = await input.complete(input.model, input.context, { ...input.options, maxTokens });
 			const tokens = calculateContextTokens(message.usage);
 			if (Number.isFinite(tokens) && tokens >= 0 && (tokens > 0 || !["error", "aborted"].includes(message.stopReason))) {

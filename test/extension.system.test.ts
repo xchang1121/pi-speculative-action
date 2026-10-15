@@ -33,7 +33,7 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 	await writeFile(path.join(cwd, "notes.txt"), "one\ntwo\n");
 	const tools = native ? ["produce_notes", "format_rows", "write", "read"] : ["read", "write", "edit", "format_rows", "late_rows"];
 	await writeFile(path.join(agentDir, "speculative-action.json"), JSON.stringify({ enabled, drafterEnabled: false,
-		patternAware: { enabled: native, multiStepEnabled: false, presets: ["recent-command"] }, tools, candidateLimit: preempted ? 2 : undefined,
+		patternAware: { enabled: false }, prepareObservedOperations: native, candidateLimit: preempted ? 2 : undefined,
 		maxConcurrentActions: 4, predictionTimeoutMs: 10_000 }));
 	const actor = fauxProvider({ provider: "functional-actor", models: [{ id: "actor" }], tokensPerSecond: 4_000, tokenSize: { min: 1, max: 2 } });
 	const response = (name: string, args: Record<string, unknown>) => fauxAssistantMessage(fauxToolCall(name, args), { stopReason: "toolUse" });

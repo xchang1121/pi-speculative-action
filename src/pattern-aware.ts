@@ -4,7 +4,7 @@ import { writeJsonFile } from "./filesystem-evidence.ts";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { type ActionKey, type ActionKeyProjector, type ActionSemanticsRegistry, actionKeyCovers, ownActionKeyProjector, widenReadGuess } from "./action-semantics.ts";
+import { type ActionKey, type ActionKeyProjector, type ActionSemanticsRegistry, actionKeyCovers, ownActionKeyProjector } from "./action-semantics.ts";
 import { BoundedRecencyMap } from "./bounded-recency-map.ts";
 import { patternSessionBudgets, type PatternPendingValidation, type PatternRecurrentAction, type PatternSessionState } from "./pattern-session-state.ts";
 import { containsLogicalPath, relativeFilesystemPath } from "./path-utils.ts";
@@ -248,7 +248,7 @@ export const PATTERN_AWARE_DEFAULTS: PatternAwareSettings = patternAwareDefaults
 const MAX_BINDING_VARIANTS = 32;
 const MAX_PATH_SOURCES = 24;
 const MAX_SPLICE_SOURCES = 4;
-/** Within the ±200-line margin a predicted read gets (widenReadGuess), so the window still covers the Actor's range. */
+/** Nearby ranges are proposal hints; sealed resource inputs prove their actual coverage. */
 const NEAR_LINE_TOLERANCE = 150;
 // Bound crash-loss while amortizing full-state serialization across active tool loops.
 // Terminal/dispose paths still flush immediately.
@@ -584,8 +584,8 @@ export class PatternAwareStore {
 		// Learned support, when there is any, speaks for an action; the built-in relations only add the ones nothing learned yet.
 		for (const structural of authoritative ? this.structuralPredictions(history, schemaHashes, continuation, settings) : []) {
 			if (predictions.has(structural.actionIdentity) || [...predictions.values()].some(existing => existing.tool === structural.tool &&
-				this.actionInputCovers(existing.tool, widenReadGuess(existing.tool, existing.input) as Record<string, unknown>, schemaHashes[existing.tool],
-					structural.tool, widenReadGuess(structural.tool, structural.input) as Record<string, unknown>, schemaHashes[structural.tool]))) continue;
+				this.actionInputCovers(existing.tool, existing.input, schemaHashes[existing.tool],
+					structural.tool, structural.input, schemaHashes[structural.tool]))) continue;
 			predictions.set(structural.actionIdentity, structural);
 		}
 		const ranked = [...predictions.values()].filter((prediction) => this.readable(prediction, history, schemaHashes.read)).sort((left, right) =>
@@ -879,8 +879,7 @@ export class PatternAwareStore {
 			this.observedActionKeys.set(sample.target, actor);
 		}
 		return this.bindingAnalysis.applyWeightedBindings(bindings, sample.context).some(({ input }) => {
-			// As the plan source widens a predicted read, so its window is judged here.
-			const speculative = this.resolveActionKey(targetTool, widenReadGuess(targetTool, input) as Record<string, unknown>, targetSchemaHash);
+			const speculative = this.resolveActionKey(targetTool, input, targetSchemaHash);
 			if (!speculative || !actor) return sameValue(input, sample.target.input);
 			return actionKeyCovers(speculative, actor, this.actionSemantics?.projectors ?? []);
 		});

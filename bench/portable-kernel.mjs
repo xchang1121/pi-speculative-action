@@ -219,7 +219,7 @@ async function qualifyPiSearch(name) {
 		assert.deepEqual(changedActor.output, stale.output); assert.equal(changed.actorCalls(), 1);
 		const paused = Promise.withResolvers(), released = Promise.withResolvers();
 		const cancelled = journey(async () => { paused.resolve(); await released.promise; }, 4); // Two units per search.
-		const disabled = { enabled: false, resourceCacheMaxEntries: 32, predictionTimeoutMs: 5000, tools: [name] };
+		const disabled = { enabled: false, resourceCacheMaxEntries: 32, predictionTimeoutMs: 5000 };
 		await cancelled.start("cancelled");
 		try {
 			assert.equal(await bounded(Promise.race([paused.promise, cancelled.candidate]), "independent Actor checkpoint"), undefined);
@@ -300,7 +300,7 @@ async function qualifySearchExtension() {
 		await fs.writeFile(path.join(cwd, "notes.txt"), "before\nneedle\nafter\n");
 		await fs.writeFile(path.join(agent, "speculative-action.json"), JSON.stringify({ enabled: false, searchExecution: "closed",
 			draftModel: "qualification-draft/qualification-draft",
-			drafterMaxDepth: 0, candidateLimit: 1, maxConcurrentActions: 1, tools: ["grep", "find"],
+			drafterMaxDepth: 0, candidateLimit: 1, maxConcurrentActions: 1,
 			patternAware: { enabled: false }, selfSpeculation: { enabled: false } }));
 		const extension = createSpeculativeActionExtension({ createHost: (sessionID, options) => createSpeculativeActionHost(sessionID, {
 			...options, onEvent: (event) => { options.onEvent?.(event);

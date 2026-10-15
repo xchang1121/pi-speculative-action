@@ -60,7 +60,7 @@ const ROOT_SETTING_INPUTS = {
 	drafterMaxTokens: positiveIntegerInput("Maximum Drafter output tokens"),
 	drafterTaskMaxRequests: positiveIntegerInput("Maximum Drafter requests per task"),
 	drafterTaskMaxTokens: positiveIntegerInput("Maximum Drafter input/output tokens per task"),
-	drafterMaxDepth: nonNegativeIntegerInput("Drafter follow-up tool steps"),
+	drafterMaxDepth: nonNegativeIntegerInput("Drafter out-of-order follow-up batches"),
 	drafterDeterministicCandidates: nonNegativeIntegerInput("Temperature-0 Drafter candidates"),
 } satisfies Partial<SettingInputDescriptors<EffectiveSpeculativeActionSettings, keyof EffectiveSpeculativeActionSettings>>;
 
@@ -128,8 +128,7 @@ export type SpeculativeActionMetrics = SpeculativeTraceSummary & {
 	readonly actorProcessReuse: WorldReuseMetrics;
 };
 
-type CapabilityState = "on" | "off" | ExecutionWorldHealthState;
-type ToolCapabilityRow = Readonly<Record<"predict" | "replay" | "observe" | "fork", CapabilityState>>;
+type ToolCapabilityRow = Readonly<Record<"replay" | "observe" | "fork", ExecutionWorldHealthState>>;
 export type ExecutionRoutesSnapshot = {
 	readonly worlds: readonly ExecutionWorldDiagnosticSnapshot[];
 	readonly actorProcessReplay?: ProcessRouteSnapshot;
@@ -184,7 +183,7 @@ export function formatSpeculativeActionStatus(input: {
 		`Model Drafter: ${settings.drafterEnabled ? "On" : "Off"}`,
 		`Drafter model: ${settings.draftModel ?? "active model"}`,
 		`Candidate requests per Actor decision: ${settings.candidateLimit}`,
-		`Model Drafter policy: ${settings.drafterMaxDepth} follow-up steps; ${settings.drafterMaxTokens} output tokens per request; ${settings.drafterTaskMaxRequests} requests / ${settings.drafterTaskMaxTokens} input+output tokens per task; ${settings.drafterDeterministicCandidates} temperature-0 candidates; sampling ${formatNumber(settings.drafterTemperatureMin)}-${formatNumber(settings.drafterTemperatureMax)}`,
+		`Model Drafter policy: ${settings.drafterMaxDepth} out-of-order follow-up batches; ${settings.drafterMaxTokens} output tokens per request; ${settings.drafterTaskMaxRequests} requests / ${settings.drafterTaskMaxTokens} input+output tokens per task; ${settings.drafterDeterministicCandidates} temperature-0 candidates; sampling ${formatNumber(settings.drafterTemperatureMin)}-${formatNumber(settings.drafterTemperatureMax)}`,
 		`Speculative resource units per session: ${settings.maxConcurrentActions}`,
 		`Scheduler: sampling ${formatDuration(settings.scheduling.resourcePollIntervalMs)}; failure circuit ${settings.scheduling.failureThreshold} failures / ${settings.scheduling.failureRetryDecisions} eligible decisions`,
 		`Storage policy: ${settings.resourceCacheMaxEntries} live results/${formatBytes(settings.resourceCacheMaxBytes)}; ${settings.executionStoreMaxEntries} reusable commands/${formatBytes(settings.executionStoreMaxBytes)}`,
@@ -192,7 +191,6 @@ export function formatSpeculativeActionStatus(input: {
 		`Learned patterns: ${settings.patternAware.enabled ? "On" : "Off"}; follow-up steps: ${settings.patternAware.multiStepEnabled ? "On" : "Off"} (alternatives/tool ${settings.patternAware.beamWidth}, depth ${settings.patternAware.maxPredictionDepth}, learn after ${settings.patternAware.minOccurrences}, gap ${settings.patternAware.maxFutureGap}, coverage ${formatPercent(settings.patternAware.futureGapCoverage)}, half-life ${settings.patternAware.decayHalfLifeEvents})`,
 		`Prebuilt modes: ${settings.patternAware.presets.length}/${PATTERN_AWARE_PRESETS.length} selected${settings.patternAware.enabled ? "" : " (inactive)"}; ${PATTERN_AWARE_PRESETS.filter(preset => settings.patternAware.presets.includes(preset.id)).map(preset => preset.label).join(", ") || "None"}`,
 		`Actor probe: ${self.enabled && self.forkEnabled ? `On (${self.forkTransport})` : "Off"}; target verification ${self.enabled ? "On" : "Off"}; early tool execution ${self.enabled && self.forkTransport !== "provider" && self.forkEnabled && self.forkActionEnabled ? self.forkTransport === "drafter" ? "On (Drafter)" : `On (tool-name confidence ≥${formatPercent(self.forkActionMinConfidence)})` : "Off"}; ${self.maxCandidates} candidates × ${self.maxDraftTokens} draft tokens; Actor Profile=${self.actorProfile}; ${self.draftFormat} (${syntaxSettingLabel(self.draftBoundary)} boundary); ${self.forkTransport === "sidecar" ? self.endpoint : FORK_TRANSPORT_LABELS[self.forkTransport]}`,
-		`Prediction tools: ${toolsSummary(settings.tools)}`,
 		`Execution routing: unified ${settings.executionRouting.primary ? "On" : "Off"}; native fallback ${settings.executionRouting.nativeFallback ? "On" : "Off"}; Actor always available`,
 		`Search execution when enabled: ${searchExecutionLabel(settings.searchExecution)}`,
 		`Tool calls reused: ${formatRatio(metrics.speculativeHits, metrics.actorActions)}; ${metrics.exactReuseHits} exact, ${metrics.partialResultReuseHits} partial, ${metrics.inputReuseHits} inputs`,
@@ -405,13 +403,12 @@ async function installController(
 		execute: (callID, input, signal, onUpdate) => definition.execute(callID, input as never, signal, onUpdate as never, latestContext),
 	}]));
 	const selectTool = (tool: AgentTool) => (isStockSdkTool(tool) && agentTools.get(tool.name)) || sdkCallbackTool(tool);
-	const registeredTools = () => new Set(pi.getAllTools().map(tool => tool.name));
 	const toolCapabilities = () => resolveToolCapabilities(
-		currentSettings, new Map(sdk.tools().map(selectTool).map(tool => [tool.name, agentTools.get(tool.name) === tool
+		new Map(sdk.tools().map(selectTool).map(tool => [tool.name, agentTools.get(tool.name) === tool
 			? (closedSearchEnabled() ? search?.profile?.invocations.get(tool.name)?.semantics : undefined)?.requirements ?? PI_ACTION_SEMANTICS.requirements(tool.name)
 			: sdkToolInvocation(tool).semantics?.requirements])), executionRoutes(),
 	);
-	const runtimeSettings = () => ({ ...currentSettings, tools: predictionTools(currentSettings, registeredTools()) });
+	const runtimeSettings = () => currentSettings;
 	const visibleMetrics = (): SpeculativeActionMetrics => ({ ...currentMetrics, actorProcessReuse: processBackend.actorMetrics() });
 	function renderFooter(): void {
 		if (!ui) return;
@@ -478,7 +475,6 @@ async function installController(
 		settingsScope: () => settingsStore.scope,
 		setSettingsScope: (scope: SpeculativeSettingsScope) => settingsStore.setScope(scope),
 		metrics: visibleMetrics,
-		registeredTools,
 		toolCapabilities,
 		recentEvents: (): readonly string[] => [...recentEvents],
 		refreshExecutionDiagnostics,
@@ -575,7 +571,7 @@ async function installController(
 		statusText: () => {
 			const effective = settings();
 			return [
-				formatSpeculativeActionStatus({ settings: { ...effective, tools: runtimeSettings().tools }, metrics: visibleMetrics() }),
+				formatSpeculativeActionStatus({ settings: effective, metrics: visibleMetrics() }),
 				formatDrafterBudgetStatus(host.drafterBudgetSnapshot()),
 				formatSelfSpeculationStatus(selfSpeculation.snapshot()),
 				executionWorldSummary(toolCapabilities(), executionRoutes()),
@@ -677,7 +673,6 @@ async function openSettings(ctx: ExtensionContext, controller: SpeculativeAction
 	const reload = () => { applied = structuredClone(controller.editableSettings()); draft = structuredClone(applied); };
 	while (true) {
 		const dirty = !isDeepStrictEqual(draft, applied);
-		const toolPolicy = toolPolicyCounts(draft, controller.registeredTools());
 		const scope = controller.settingsScope() === "global" ? "All projects" : "This project";
 		const actions = new Map<string, MenuAction>([
 			[`Enabled: ${draft.enabled ? "On" : "Off"}`, () => editor.setSettings({ ...draft, enabled: !draft.enabled })],
@@ -690,7 +685,7 @@ async function openSettings(ctx: ExtensionContext, controller: SpeculativeAction
 				}
 			}],
 			[`Prediction sources › ${sourceSummary(draft)}`, () => openPredictionSources(ctx, editor)],
-			[`Tools & execution › ${toolPolicy.enabled}/${toolPolicy.available} enabled for prediction`, () => openToolsAndExecution(ctx, editor, controller)],
+			["Tools & execution", () => openToolsAndExecution(ctx, editor, controller)],
 			["Advanced settings › tuning, decoding, scheduling, storage", () => openAdvancedSettings(ctx, editor)],
 			[`Apply changes${dirty ? " (pending)" : ""}`, async () => {
 				if (!dirty) return ctx.ui.notify("No pending speculative-action changes.", "info");
@@ -708,7 +703,7 @@ async function openSettings(ctx: ExtensionContext, controller: SpeculativeAction
 		actions.set("Restore defaults", async () => {
 			if (!await ctx.ui.confirm("Restore defaults?", "Restore tuning values while keeping the main switch and prediction-source choices?")) return;
 			const defaults = normalizeSpeculativeActionSettings(undefined), { patternAware: pattern, selfSpeculation: probe } = draft;
-			await editor.setSettings({ ...defaults, enabled: draft.enabled, drafterEnabled: draft.drafterEnabled,
+			await editor.setSettings({ ...defaults, enabled: draft.enabled, drafterEnabled: draft.drafterEnabled, tools: draft.tools, prepareObservedOperations: draft.prepareObservedOperations,
 				patternAware: { ...defaults.patternAware, enabled: pattern.enabled, multiStepEnabled: pattern.multiStepEnabled, presets: pattern.presets },
 				selfSpeculation: { ...defaults.selfSpeculation, enabled: probe.enabled, forkEnabled: probe.forkEnabled, forkActionEnabled: probe.forkActionEnabled } });
 		});
@@ -730,8 +725,20 @@ function openPredictionSources(ctx: ExtensionContext, controller: SpeculativeAct
 		const settings = controller.settings();
 		return new Map<string, MenuAction>([
 			[`Model Drafter › ${settings.drafterEnabled ? "On" : "Off"}, ${settings.draftModel ?? activeModelReference(ctx)}`, () => openDrafterSettings(ctx, controller)],
+			[`Prediction tools › ${settings.tools ? settings.tools.join(", ") || "None" : "All available"}`, () => openPredictionTools(ctx, controller)],
 			[`Actor probe › ${actorForkSummary(settings.selfSpeculation)}`, () => openActorForkSettings(ctx, controller)],
 			[`Learned patterns › ${settings.patternAware.enabled ? "On" : "Off"}, ${settings.patternAware.multiStepEnabled ? "follow-up steps" : "next step only"}, ${settings.patternAware.presets.length}/${PATTERN_AWARE_PRESETS.length} prebuilt modes selected`, () => openPatternAwareSettings(ctx, controller)],
+		]);
+	});
+}
+
+function openPredictionTools(ctx: ExtensionContext, controller: SpeculativeActionController): Promise<void> {
+	return runActionMenuLoop(ctx, "Prediction tools", () => {
+		const settings = controller.settings(), available = [...controller.toolCapabilities().keys()], selected = settings.tools ?? available;
+		return new Map<string, MenuAction>([
+			["Use all available tools", () => { const { tools, ...all } = settings; return controller.setSettings(all); }],
+			...available.map((tool): [string, MenuAction] => [`[${selected.includes(tool) ? "x" : " "}] ${tool}`, () =>
+				controller.setSettings({ ...settings, tools: selected.includes(tool) ? selected.filter(name => name !== tool) : [...selected, tool] })]),
 		]);
 	});
 }
@@ -740,7 +747,7 @@ function openAdvancedSettings(ctx: ExtensionContext, controller: SpeculativeActi
 	return runActionMenuLoop(ctx, "Advanced settings", () => {
 		const settings = controller.settings();
 		return new Map<string, MenuAction>([
-			[`Model Drafter tuning › ${settings.candidateLimit} requests, ${settings.drafterMaxDepth} follow-up steps`, () => openDrafterSettings(ctx, controller, true)],
+			[`Model Drafter tuning › ${settings.candidateLimit} requests, ${settings.drafterMaxDepth} out-of-order follow-up batches`, () => openDrafterSettings(ctx, controller, true)],
 			[`Actor probe and target verification › ${settings.selfSpeculation.forkTransport}`, () => openActorForkSettings(ctx, controller, "advanced")],
 			[`Learned-pattern tuning › ${settings.patternAware.maxPatterns} stored patterns`, () => openPatternAwareSettings(ctx, controller, "advanced")],
 			[`Scheduling and storage › ${settings.maxConcurrentActions} resource units`, () => openSchedulingAndCache(ctx, controller)],
@@ -756,10 +763,10 @@ function openDrafterSettings(ctx: ExtensionContext, controller: SpeculativeActio
 			toggle("drafterEnabled", "Enabled"),
 			[`Model › ${settings.draftModel ?? activeModelReference(ctx)}`, () => editDraftModel(ctx, controller, settings)],
 			input("candidateLimit", "Candidate requests per decision"),
-			[`Advanced settings › sampling, follow-up steps, cost control`, () => openDrafterSettings(ctx, controller, true)],
+			[`Advanced settings › sampling, out-of-order follow-up batches, cost control`, () => openDrafterSettings(ctx, controller, true)],
 		] : [
 			toggle("drafterPatternHints", "Show PatternAware's expected calls"),
-			input("drafterMaxDepth", "Follow-up tool steps"),
+			input("drafterMaxDepth", "Out-of-order follow-up batches"),
 			input("drafterMaxTokens", "Maximum output tokens"),
 			input("drafterTaskMaxRequests", "Requests per task"),
 			input("drafterTaskMaxTokens", "Input/output tokens per task"),
@@ -909,13 +916,12 @@ function openToolsAndExecution(
 ): Promise<void> {
 	return runActionMenuLoop(ctx, "Tools & execution", () => {
 		const settings = editor.settings();
-		const policy = toolPolicyCounts(settings, controller.registeredTools());
 		const refresh = async () => {
 			await recoverSpeculation(() => controller.refreshExecutionDiagnostics(true));
 			ctx.ui.notify(executionWorldSummary(controller.toolCapabilities(), controller.executionRoutes()), "info");
 		};
 		return new Map<string, MenuAction>([
-			[`Tool policy › ${policy.enabled}/${policy.available} enabled for prediction`, () => editToolPolicy(ctx, editor, controller.registeredTools())],
+			[`Prepare observed operations › ${settings.prepareObservedOperations ? "On" : "Off"}`, () => editor.setSettings({ ...settings, prepareObservedOperations: !settings.prepareObservedOperations })],
 			["Execution routes", () => openExecutionRoutes(ctx, editor, controller)],
 			["Check Linux environment", () => checkLinuxEnvironment(ctx, refresh)],
 			["Install / update Linux dependencies", () => installLinuxDependencies(ctx, refresh)],
@@ -930,7 +936,7 @@ async function openExecutionRoutes(
 ): Promise<void> {
 	await recoverSpeculation(() => controller.refreshExecutionDiagnostics(true));
 	ctx.ui.notify(
-		`Predict controls what sources may propose. Replay, Observe, and Fork are independent runtime capabilities. Order: unified environment → local safe fallback → Actor. Local routes include sealed file inputs, private workspace transactions, and qualified native processes. Diagnostics refresh enabled providers only.\n${executionWorldSummary(controller.toolCapabilities(), controller.executionRoutes())}`,
+		`Sources predict available tool calls; resource proofs and permissions determine execution and reuse. Replay, Observe, and Fork are independent runtime capabilities. Order: unified environment → local safe fallback → Actor. Local routes include sealed file inputs, private workspace transactions, and qualified native processes. Diagnostics refresh enabled providers only.\n${executionWorldSummary(controller.toolCapabilities(), controller.executionRoutes())}`,
 		"info",
 	);
 	return runActionMenuLoop(ctx, "Execution routes", () => {
@@ -966,31 +972,6 @@ async function openExecutionRoutes(
 			ctx.ui.notify(executionWorldSummary(controller.toolCapabilities(), controller.executionRoutes()), "info");
 		});
 		return actions;
-	});
-}
-
-function editToolPolicy(
-	ctx: ExtensionContext,
-	controller: SpeculativeActionController,
-	registered: ReadonlySet<string>,
-): Promise<void> {
-	return runActionMenuLoop(ctx, "Tool policy · [x] prediction on · [ ] prediction off", () => {
-		const settings = controller.settings();
-		const capabilities = controller.toolCapabilities();
-		const tools = [...new Set([...settings.tools, ...registered])].sort((left, right) => left.localeCompare(right));
-		return new Map<string, MenuAction>(tools.map((tool) => {
-			const selected = settings.tools.includes(tool);
-			const capability = capabilities.get(tool);
-			const staged = capability ? { ...capability, predict: selected ? "on" as const : "off" as const } : undefined;
-			return [`${selected ? "[x]" : "[ ]"} ${tool} · ${capabilityRowLabel(staged)}`, async () => {
-				if (!selected && !registered.has(tool)) {
-					ctx.ui.notify(`${tool} is not registered in the current Pi session.`, "warning");
-					return;
-				}
-				const next = selected ? settings.tools.filter((item) => item !== tool) : [...settings.tools, tool];
-				await controller.setSettings({ ...settings, tools: next });
-			}];
-		}));
 	});
 }
 
@@ -1156,8 +1137,8 @@ function syntaxSettingLabel(value: string): string {
 }
 
 function formatDrafterBudgetStatus(snapshot: ActionDrafterBudgetSnapshot): string {
-	const budget = snapshot.budget;
-	return `Action Drafter task budget: ${budget.requests} requests, ${budget.reportedTokens} reported + ${budget.unreportedTokens} estimated without usage + ${budget.reservedTokens} reserved tokens, ${budget.skippedRequests} requests skipped`;
+	const { budget, observations } = snapshot;
+	return `Action Drafter task budget: ${budget.requests} requests, ${budget.reportedTokens} reported + ${budget.unreportedTokens} estimated without usage + ${budget.reservedTokens} reserved tokens, ${budget.skippedRequests} requests skipped\nPrivate observations: ${observations.forecasted} forecasted, ${observations.matched}/${observations.compared} exact matches against completed speculative results`;
 }
 
 const FORK_TRANSPORT_LABELS: Readonly<Record<SelfSpeculationSettings["forkTransport"], string>> = { provider: "Provider-integrated", sidecar: "Sidecar service", drafter: "Drafter reads Actor reasoning" };
@@ -1185,7 +1166,6 @@ function activeModelReference(ctx: ExtensionContext): string {
 }
 
 function resolveToolCapabilities(
-	settings: EffectiveSpeculativeActionSettings,
 	registered: ReadonlyMap<string, ReturnType<typeof PI_ACTION_SEMANTICS.requirements>>,
 	routes: ExecutionRoutesSnapshot,
 ): ReadonlyMap<string, ToolCapabilityRow> {
@@ -1193,7 +1173,7 @@ function resolveToolCapabilities(
 	return new Map<string, ToolCapabilityRow>(
 		[...registered].map(([tool, requirements]): [string, ToolCapabilityRow] => {
 			if (!requirements) {
-				return [tool, { predict: "unavailable", replay: "unavailable", observe: "unavailable", fork: "unavailable" }];
+				return [tool, { replay: "unavailable", observe: "unavailable", fork: "unavailable" }];
 			}
 			const fork = executionCapabilityStatus(requirements, worlds, "speculation", tool);
 			const observe = executionCapabilityStatus(requirements, worlds, "observation", tool);
@@ -1202,20 +1182,9 @@ function resolveToolCapabilities(
 				observe.state,
 				...(actorProcessReplay ? [processRouteCapability(actorProcessReplay.state)] : []),
 			]);
-			return [tool, { predict: settings.tools.includes(tool) ? "on" : "off", replay, observe: observe.state, fork: fork.state }];
+			return [tool, { replay, observe: observe.state, fork: fork.state }];
 		}),
 	);
-}
-
-function predictionTools(settings: EffectiveSpeculativeActionSettings, registered: ReadonlySet<string>): readonly string[] {
-	return [...new Set(settings.tools)].filter((tool) => registered.has(tool));
-}
-
-function toolPolicyCounts(
-	settings: EffectiveSpeculativeActionSettings,
-	registered: ReadonlySet<string>,
-): { readonly enabled: number; readonly available: number } {
-	return { enabled: predictionTools(settings, registered).length, available: registered.size };
 }
 
 function bestCapabilityState(states: readonly ExecutionWorldHealthState[]): ExecutionWorldHealthState {
@@ -1242,25 +1211,12 @@ function executionRouteKind(isolation: SpeculativeExecution): string {
 	}
 }
 
-function capabilityRowLabel(row: ToolCapabilityRow | undefined): string {
-	if (!row) return "unsupported";
-	return (["predict", "replay", "observe", "fork"] as const)
-		.map((name) => `${name[0]!.toUpperCase()}${name.slice(1)} ${capabilityLabel(row[name])}`)
-		.join(" · ");
-}
-
-function capabilityLabel(state: CapabilityState): string {
+function capabilityLabel(state: ExecutionWorldHealthState): string {
 	switch (state) {
-		case "on": return "On";
-		case "off": return "Off";
 		case "ready": return "Ready";
 		case "registered": return "Check";
 		case "unavailable": return "Unavailable";
 	}
-}
-
-function toolsSummary(tools: readonly string[]): string {
-	return tools.length > 0 ? tools.join(" ") : "none";
 }
 
 function formatSpeculativeFooter(
@@ -1316,12 +1272,11 @@ function executionWorldSummary(tools: ReadonlyMap<string, ToolCapabilityRow>, ro
 function capabilityTable(tools: ReadonlyMap<string, ToolCapabilityRow>): string {
 	const rows = [...tools].map(([tool, capability]) => [
 		tool,
-		capabilityLabel(capability.predict),
 		capabilityLabel(capability.replay),
 		capabilityLabel(capability.observe),
 		capabilityLabel(capability.fork),
 	]);
-	const table = [["Tool", "Predict", "Replay", "Observe", "Fork"], ...rows];
+	const table = [["Tool", "Replay", "Observe", "Fork"], ...rows];
 	const widths = table[0]!.map((_, column) => Math.max(...table.map((row) => row[column]!.length)));
 	return table.map((row) => row.map((cell, column) => cell.padEnd(widths[column]!)).join("  ").trimEnd()).join("\n");
 }

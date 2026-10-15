@@ -1,6 +1,7 @@
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ActionKey, ActionSemanticsDefinition } from "./action-semantics.ts";
 import type { ExecutionOperationBinding, WorldResultCapture } from "./execution-world.ts";
+import { stableValueHash } from "./stable-value-hash.ts";
 
 /** Host-neutral result consumed by the speculative scheduler. */
 export interface ToolSettlement<TDetails = unknown> {
@@ -9,6 +10,9 @@ export interface ToolSettlement<TDetails = unknown> {
 	/** A process that ran to completion and exited non-zero failed on its own terms: once validated, the Actor may adopt it. */
 	readonly exitCode?: number;
 }
+
+/** UI details and message IDs are absent from the model's observation. */
+export const toolObservationKey = (output: ToolSettlement): string => stableValueHash([output.result.content, output.isError]);
 
 export function toolErrorSettlement(error: unknown): ToolSettlement {
 	return {

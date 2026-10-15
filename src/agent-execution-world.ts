@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { relativeFilesystemPath } from "./path-utils.ts";
+import { filesystemPathsOverlap, relativeFilesystemPath } from "./path-utils.ts";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { BigIntStats } from "node:fs";
 import { CapturedFilesystemObject, sameFilesystemIdentity, type CapturedFilesystemTransfer, type StableFilesystemCapture } from "./filesystem-evidence.ts";
@@ -32,6 +32,13 @@ export type SpeculativeToolExecutionContext = Parameters<NonNullable<WorldBranch
 export type ActorToolExecutionContext = Omit<SpeculativeToolExecutionContext, "action"> & { readonly action?: ActionKey; readonly executionContext?: ToolInvocation };
 export type AgentExecutionWorld = ExecutionWorld<SpeculativeToolExecutionContext, ToolSettlement, ActorToolExecutionContext>;
 export type SpeculativeAgentExecutionWorld = AgentExecutionWorld & Required<Pick<AgentExecutionWorld, "speculation">>;
+
+/** Known path independence permits early work; captured versions still decide whether its output is usable. */
+export async function filesystemExecutionDependsOn(action: ActionKey, parent: ActionKey): Promise<boolean> {
+	if (!action.resourceRoot || !parent.resourceRoot || !action.resources.length || !parent.resources.length) return true;
+	return (await Promise.all(action.resources.flatMap(target => parent.resources.map(prior =>
+		filesystemPathsOverlap(path.resolve(action.resourceRoot!, target), path.resolve(parent.resourceRoot!, prior)))))).some(Boolean);
+}
 
 /** Observe Actor reads; only explicitly bound operations may execute ahead over sealed resource data. */
 export function createResourceSnapshotExecutionWorld(
@@ -71,6 +78,7 @@ export function createResourceSnapshotExecutionWorld(
 			} },
 		...(operations ? { speculation: {
 			...route,
+			dependsOn: filesystemExecutionDependsOn,
 			fingerprint: (request) => {
 				if (request.action && !(request.action.executionContext as ToolInvocation | undefined)?.filesystem) throw new Error("Resource execution requires an explicitly bound operation");
 				return route.fingerprint();

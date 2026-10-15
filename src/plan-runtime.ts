@@ -4,7 +4,7 @@ import { immutableSnapshot, isImmutableSnapshot } from "./stable-json.ts";
 import { RESOURCE_DIMENSIONS } from "./system-resources.ts";
 import type { ActionKey, ActionKeyMatch } from "./action-semantics.ts";
 import type { CandidateExecution } from "./candidate-execution.ts";
-import type { MaterializedPlan, PlanAction, PlanActionDependency, PlanActionDependencyCondition, PlanUpdate } from "./plan-proposal.ts";
+import type { MaterializedPlan, PlanAction, PlanActionDependency, PlanUpdate } from "./plan-proposal.ts";
 import type {
 	ActorActionIdentity,
 	PlanActionIdentity,
@@ -139,6 +139,7 @@ type MutableNode = { -readonly [Key in keyof PlanNodeFields]: PlanNodeFields[Key
 	validDependencies: boolean;
 	execution: MutableNodeExecution;
 	opportunity: PredictionOpportunity;
+	observation?: string;
 };
 
 const capturedUpdates = new WeakSet<PlanUpdate>();
@@ -294,6 +295,11 @@ export class PlanRuntime {
 		return value ? this.snapshot(value.plan, value.node) : undefined;
 	}
 
+	observe(identity: PlanActionIdentity, observation: string): void {
+		const node = this.mutable(identity.proposalID, identity.actionID)?.node;
+		if (node?.identity.id === identity.id) node.observation = observation;
+	}
+
 	dependency(proposalID: string, dependency: PlanActionDependency): PlanRuntimeNode | undefined {
 		const node = this.parent(proposalID, dependency);
 		return node ? this.get(node.identity.proposalID, node.action.id) : undefined;
@@ -428,7 +434,7 @@ export class PlanRuntime {
 
 	private snapshot(plan: MutablePlan, node: MutableNode): PlanRuntimeNode {
 		const dependencies = this.dependencyReadiness(plan, node);
-		const { opportunity, execution, validDependencies: _validDependencies, ...fields } = node;
+		const { opportunity, execution, observation: _observation, validDependencies: _validDependencies, ...fields } = node;
 		return Object.freeze({
 			...fields,
 			proposalID: plan.id,
@@ -443,20 +449,27 @@ export class PlanRuntime {
 		});
 	}
 
-	private dependencyReadiness(plan: MutablePlan, node: MutableNode): "ready" | "waiting" | "blocked" {
-		if (!node.validDependencies) return "blocked";
+	private dependencyReadiness(plan: MutablePlan, node: MutableNode, matching = false): "ready" | "waiting" | "blocked" {
+		const pending = [{ plan, node }], visited = new Set<MutableNode>();
 		let readiness: "ready" | "waiting" = "ready";
-		for (const dependency of node.action.dependsOn ?? []) {
-			const parent = this.parent(plan.id, dependency);
-			const state = parent ? dependencyReadiness(parent, dependency.condition) : "blocked";
-			if (state === "blocked") return state;
-			if (state === "waiting") readiness = state;
+		while (pending.length) {
+			const current = pending.pop()!;
+			if (visited.has(current.node)) continue;
+			visited.add(current.node);
+			if (!current.node.validDependencies) return "blocked";
+			for (const dependency of current.node.action.dependsOn ?? []) {
+				const parent = this.parent(current.plan.id, dependency);
+				const state = parent ? dependencyReadiness(parent, dependency, matching && current.node === node) : "blocked";
+				if (state === "blocked") return state;
+				if (state === "waiting" && current.node === node) readiness = state;
+				pending.push({ plan: this.plans.get(parent!.identity.proposalID)!, node: parent! });
+			}
 		}
 		return readiness;
 	}
 
 	private isMatchable(plan: MutablePlan, node: MutableNode, decisionSequence: number): boolean {
-		return (node.opportunity.state.status === "pending" && node.earliestDecisionSeq <= decisionSequence && this.dependencyReadiness(plan, node) === "ready");
+		return (node.opportunity.state.status === "pending" && node.earliestDecisionSeq <= decisionSequence && this.dependencyReadiness(plan, node, true) === "ready");
 	}
 
 	private recompute(graph: PlanGraph): void {
@@ -512,7 +525,13 @@ function newNode(proposalID: string, source: string, revision: number, action: P
 	};
 }
 
-function dependencyReadiness(node: MutableNode, condition: PlanActionDependencyCondition | undefined): "ready" | "waiting" | "blocked" {
+function dependencyReadiness(node: MutableNode, dependency: PlanActionDependency, matching: boolean): "ready" | "waiting" | "blocked" {
+	const { condition, observation } = dependency;
+	if (condition === "prediction") {
+		const settlement = node.opportunity.settlement;
+		if (settlement && !predictionMatched(settlement) || node.observation !== undefined && node.observation !== observation) return "blocked";
+		return matching && (!settlement || node.observation === undefined) ? "waiting" : "ready";
+	}
 	if (condition === "actor_adopted") {
 		const settlement = node.opportunity.settlement;
 		return settlement === undefined ? "waiting" : predictionAdopted(settlement) ? "ready" : "blocked";
@@ -537,14 +556,6 @@ function freezeAdoption(adoption: PredictionAdoption): PredictionAdoption {
 
 function sameActorAction(left: ActorActionIdentity, right: ActorActionIdentity): boolean {
 	return left.kind === right.kind && left.id === right.id && left.sequence === right.sequence && left.turnID === right.turnID;
-}
-
-function canonicalCondition(
-	condition: PlanActionDependencyCondition | undefined,
-): "execution_settled" | "execution_succeeded" | "actor_adopted" {
-	if (condition === "actor_adopted") return "actor_adopted";
-	if (condition === "execution_succeeded") return "execution_succeeded";
-	return "execution_settled";
 }
 
 function executionSettled(execution: PlanNodeExecution): boolean {
@@ -579,12 +590,14 @@ function validateActions(actions: readonly PlanAction[]):
 		ids.add(source.id);
 		if (source.dependsOn) {
 			source.dependsOn = Object.freeze(
-				source.dependsOn.map(({ actionID, proposalID, identity, condition }) =>
+				source.dependsOn.map(({ actionID, proposalID, identity, condition = "execution_settled", observation }) =>
 					Object.freeze({ actionID, ...(proposalID !== undefined || identity !== undefined ? { proposalID, identity } : {}),
-						condition: canonicalCondition(condition) }),
+						condition, ...(condition === "prediction" ? { observation } : {}) }),
 				),
 			);
 			if (source.dependsOn.some((dependency) => !validToken(dependency.actionID) ||
+				!["execution_settled", "execution_succeeded", "actor_adopted", "prediction"].includes(dependency.condition!) ||
+				dependency.condition === "prediction" && !validToken(dependency.observation!) ||
 				("proposalID" in dependency && (!validToken(dependency.proposalID!) || !validToken(dependency.identity!))))) {
 				return { ok: false, reason: "invalid_dependency" };
 			}

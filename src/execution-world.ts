@@ -25,6 +25,7 @@ export const withExecutionScope = <Value>(scope: ExecutionScope | undefined, exe
 /** Tool effects are resolved independently from K(a) and prediction source. */
 export interface ExecutionWorldRequest {
 	readonly backend?: string;
+	readonly parentCheckpoint?: WorldCheckpoint;
 	readonly effect: ActionEffect;
 	readonly requirements: EffectRequirements;
 	/** Tool scope is still known during warm-up, before a concrete action key exists. */
@@ -44,6 +45,8 @@ export interface SpeculativeExecutionRoute {
 	readonly fingerprint: string;
 	/** Backend-authenticated parent state this route can materialize; never a result-freshness proof. */
 	readonly acceptsCheckpoint?: (checkpoint: WorldCheckpoint) => boolean;
+	/** Scheduling hint only; false permits preparing against the current world. */
+	readonly dependsOn?: (parent: ActionKey) => Promise<boolean>;
 }
 
 export function sameSpeculativeExecutionRoute(left: SpeculativeExecutionRoute, right: SpeculativeExecutionRoute): boolean {
@@ -290,6 +293,7 @@ export interface ExecutionWorldOperation {
 export interface ExecutionWorldSpeculation<Context, Output> extends ExecutionWorldOperation {
 	/** Explicit ancestry interoperability across routes; implementations must authenticate the checkpoint and workspace. */
 	readonly acceptsCheckpoint?: (checkpoint: WorldCheckpoint, cwd: string) => boolean;
+	readonly dependsOn?: (action: ActionKey, parent: ActionKey) => Promise<boolean>;
 	readonly execute: (context: Context) => Promise<WorldBranch<Output>>;
 }
 
@@ -455,16 +459,17 @@ export class ExecutionWorldRouter<Context, Output, ObservationContext = Context>
 				if (!operation) continue;
 				try {
 					if (!supportsTool(operation, request.action?.tool ?? request.tool)) continue;
+					const acceptsCheckpoint = kind === "speculation" && world.speculation?.acceptsCheckpoint;
+					if (request.parentCheckpoint && (!acceptsCheckpoint || !acceptsCheckpoint(request.parentCheckpoint, preparation.cwd))) continue;
 					if (!effectCapabilitiesCover(operation.capabilities, request.requirements) &&
 						!(kind === "observation" && world.observation?.inputsOnly?.(request))) continue;
 					const fingerprint = (await operation.fingerprint?.(request)) ?? `${world.id}:${world.isolation}`;
 					await operation.prepare?.(preparation);
 					this.observeRoute(world.id, kind, preparation.cwd, "ready", "Route prepared successfully");
-					const acceptsCheckpoint = kind === "speculation" && request.effect !== "observation" && world.speculation?.acceptsCheckpoint;
 					const cwd = preparation.cwd;
 					const route: SpeculativeExecutionRoute = {
 						isolation: world.isolation,
-						reuse: request.effect === "observation" ? "shared_result" : "exclusive_branch",
+						reuse: request.effect === "observation" && !request.parentCheckpoint ? "shared_result" : "exclusive_branch",
 						scope,
 						backend: world.id,
 						fingerprint,
@@ -475,6 +480,10 @@ export class ExecutionWorldRouter<Context, Output, ObservationContext = Context>
 						Object.defineProperty(route, "acceptsCheckpoint", {
 							value: (checkpoint: WorldCheckpoint) => lifetime.deref()?.sealed === false && owner.deref()?.(checkpoint, cwd) === true,
 						});
+					}
+					if (kind === "speculation" && request.action && world.speculation?.dependsOn) {
+						const action = request.action, dependsOn = world.speculation.dependsOn;
+						Object.defineProperty(route, "dependsOn", { value: (parent: ActionKey) => dependsOn(action, parent) });
 					}
 					Object.freeze(route);
 					const selection = select(world, route);

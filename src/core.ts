@@ -80,7 +80,6 @@ export {
 	type ActorActionFeedback,
 	type PredictionFeedback,
 	candidateExecutionMs,
-	candidateToolNames,
 	diagnosticAction,
 	diagnosticJson,
 	makeSpeculativeActionRuntime,

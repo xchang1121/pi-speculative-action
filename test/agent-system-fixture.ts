@@ -18,7 +18,7 @@ export function systemHost(cwd: string, tools: AgentTool[], options: Partial<Cre
 		preflight: () => true,
 		resources: { initial: { cpuCount: 2, idleCpuCount: 2 }, sample: () => new Promise(() => {}) },
 		getSettings: () => ({ enabled: true, drafterEnabled: false, candidateLimit: 1, maxConcurrentActions: 2,
-			predictionTimeoutMs: 10_000, patternAware: { enabled: false }, tools: tools.map(tool => tool.name), ...settings }),
+			predictionTimeoutMs: 10_000, patternAware: { enabled: false }, prepareObservedOperations: false, ...settings }),
 		resolveInvocation: (tool, input) => resolvePiToolInvocation(tool, input, { cwd, environment: {} }),
 		executionWorlds: [createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { maxBytes: () => 8 * 1024 * 1024 })],
 		...options,

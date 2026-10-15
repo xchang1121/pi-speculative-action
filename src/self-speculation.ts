@@ -324,7 +324,7 @@ export class SelfSpeculationCoordinator {
 		}
 		if (probe.attempt > 1) this.counters.forkRetries++;
 		this.counters.forkRequests++;
-		const signal = this.actorForkPlanSource.startProbe(state.turnID);
+		const signal = this.actorForkPlanSource.probeSignal(state.turnID);
 		const task = (settings.forkTransport === "drafter" ? this.draftedFork(state, probe, signal) : this.post(
 			settings.forkPath,
 			{

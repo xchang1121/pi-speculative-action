@@ -4,15 +4,15 @@ import { validateToolArguments } from "@earendil-works/pi-ai";
 import { type ActionProjectionRule, resolveActionProjectionRules } from "./action-key-projection.ts";
 import { buildActionKey, type ActionKey, type ActionSemanticsRegistry, PI_ACTION_SEMANTICS } from "./action-semantics.ts";
 import { createResourceSnapshotExecutionWorld, type AgentExecutionWorld, type SpeculativeToolExecutionContext } from "./agent-execution-world.ts";
-import { DEFAULTS, type DrafterRequestSettings, normalizeDrafterRequestSettings,
-	normalizeSpeculativeToolSelection } from "./common.ts";
+import { DEFAULTS, type DrafterRequestSettings, normalizeDrafterRequestSettings } from "./common.ts";
 import type { AgentConsumeInput, AgentStartInput, AgentStateData } from "./agent-runtime-types.ts";
 import { definitionSchemaHashes } from "./agent-runtime-types.ts";
 import type { ActorForkPlanSource } from "./actor-fork-plan-source.ts";
-import type { ExecutionWorldDiagnosticSnapshot, ExecutionOperationBinding, SpeculativeExecutionRoute } from "./execution-world.ts";
+import type { ExecutionWorldDiagnosticSnapshot, ExecutionOperationBinding, SpeculativeExecutionRoute, WorldCheckpoint } from "./execution-world.ts";
 import { createDrafterPlanSource } from "./drafter-plan-source.ts";
 import { PATTERN_AWARE_DEFAULTS, type PatternAwareSettings, type PatternAwareStore, patternAwareSettings } from "./pattern-aware.ts";
 import { createPatternPlanSource } from "./pattern-plan-source.ts";
+import { createExecutionPreparation } from "./execution-preparation.ts";
 import { PI_BASH_TIMEOUT_PROJECTION_RULE, PI_GREP_LITERAL_PROJECTION_RULE, piToolErrorSettlement } from "./pi-tool-invocation.ts";
 import { TimelineInterval, type TimelineDependency } from "./task-timing.ts";
 import type {
@@ -33,6 +33,7 @@ import { booleanOr, positiveInteger, positiveMilliseconds } from "./setting-inpu
 import { normalizeSchedulingSettings } from "./scheduling-settings.ts";
 import { immutableSnapshot, isImmutableSnapshot } from "./stable-json.ts";
 import type { ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
+import { toolObservationKey } from "./tool-settlement.ts";
 import { ToolExecutionGateway, type ToolOperation } from "./tool-execution-gateway.ts";
 import { createSystemResourceMonitor, type ExecutionResourceMonitor } from "./system-resources.ts";
 import { UNRESTRICTED_PROCESS_EFFECTS } from "./effect-model.ts";
@@ -44,16 +45,16 @@ type BoundActorCall = AgentConsumeInput & { readonly [ACTOR_OPERATION]?: () => P
 export interface SpeculativeAgentSettingsInput extends Partial<DrafterRequestSettings>, Partial<Omit<SpeculativeActionSettings, "sourceConfig">> {
 	readonly patternAware?: Partial<PatternAwareSettings>;
 	readonly selfSpeculation?: SelfSpeculationSettingsInput;
-	/** Prediction selection, independent of execution permissions; omitted uses the registered tools. */
-	readonly tools?: readonly string[];
 }
 
 /** Shared host/package boundary: the TUI and runtime must interpret saved policy identically. */
-export function normalizeSpeculativeAgentSettings(input: SpeculativeAgentSettingsInput = {}, allowed = DEFAULTS.tools) {
+export function normalizeSpeculativeAgentSettings(input: SpeculativeAgentSettingsInput = {}) {
 	return {
 		...normalizeDrafterRequestSettings(input),
 		enabled: booleanOr(input.enabled, DEFAULTS.enabled),
 		drafterEnabled: booleanOr(input.drafterEnabled, DEFAULTS.drafterEnabled),
+		prepareObservedOperations: booleanOr(input.prepareObservedOperations, DEFAULTS.prepareObservedOperations),
+		...(input.tools === undefined ? {} : { tools: Array.isArray(input.tools) && input.tools.every(tool => typeof tool === "string") ? [...new Set(input.tools)] : [] }),
 		candidateLimit: positiveInteger(input.candidateLimit, DEFAULTS.candidateLimit),
 		maxConcurrentActions: positiveInteger(input.maxConcurrentActions, DEFAULTS.maxConcurrentActions),
 		resourceCacheMaxEntries: positiveInteger(input.resourceCacheMaxEntries, DEFAULTS.resourceCacheMaxEntries),
@@ -62,7 +63,6 @@ export function normalizeSpeculativeAgentSettings(input: SpeculativeAgentSetting
 		scheduling: normalizeSchedulingSettings(input.scheduling),
 		patternAware: patternAwareSettings(input.patternAware ?? PATTERN_AWARE_DEFAULTS),
 		selfSpeculation: normalizeSelfSpeculationSettings(input.selfSpeculation),
-		tools: normalizeSpeculativeToolSelection(input.tools, allowed),
 	} as const;
 }
 
@@ -171,16 +171,16 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 		executionWorlds.push(createResourceSnapshotExecutionWorld(actionSemantics));
 	}
 	const executionGateway = new ToolExecutionGateway(executionWorlds, options.speculativeExecutionWorldEnabled);
-	const resolveExecutionRoute = (tool: string, signal?: AbortSignal, action?: ActionKey) => {
+	const resolveExecutionRoute = (tool: string, signal?: AbortSignal, action?: ActionKey, parentCheckpoint?: WorldCheckpoint) => {
 		const definition = actionSemantics.definition(action ?? tool);
-		return definition && executionGateway.resolve({ tool, action,
+		return definition && executionGateway.resolve({ tool, action, parentCheckpoint,
 			backend: (action?.executionContext as ToolInvocation | undefined)?.operation?.binding.backend,
 			effect: definition.effect, requirements: definition.requirements }, { cwd: options.cwd, signal });
 	};
 	const resolveSettings = async (): Promise<SpeculativeActionSettings> => {
 		const { patternAware, selfSpeculation, drafterMaxDepth, drafterMaxTokens, drafterTaskMaxRequests, drafterTaskMaxTokens,
 			drafterDeterministicCandidates, drafterTemperatureMin, drafterTemperatureMax, drafterPatternHints, ...policy } =
-			normalizeSpeculativeAgentSettings(await options.getSettings?.(), actionSemantics.toolNames());
+			normalizeSpeculativeAgentSettings(await options.getSettings?.());
 		return {
 			...policy,
 			sourceConfig: {
@@ -209,6 +209,7 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 		workspaceIdentity: options.patternWorkspaceIdentity,
 		store: options.patternStore,
 	});
+	const executionPreparation = createExecutionPreparation(options.cwd, actionSemantics);
 	const resolveBinding = async (tool: string, input: unknown, schemaHash?: string, definition?: AgentTool) => {
 		// A candidate runs its key's canonical input (a redundant `cd <cwd> &&` dropped): its invocation is resolved from that input.
 		const resolved = await options.resolveInvocation?.(tool, (() => { try { return actionSemantics.definition(tool)?.canonicalize(input, options.cwd)?.input ?? input; } catch { return input; } })(), definition);
@@ -239,7 +240,7 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 	>({
 		actionSemantics,
 		resources: options.resources ?? createSystemResourceMonitor(async () => (await options.getSettings?.())?.scheduling),
-		sources: [patternPlans.source, drafterPlans.source, ...(options.actorForkPlanSource ? [options.actorForkPlanSource.source] : [])],
+		sources: [patternPlans.source, drafterPlans.source, executionPreparation.source, ...(options.actorForkPlanSource ? [options.actorForkPlanSource.source] : [])],
 		settings: resolveSettings,
 		definitions: (input) =>
 			input.tools.map((tool) => ({ name: tool.name, description: tool.description, inputSchema: tool.parameters })),
@@ -272,7 +273,7 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 				executionContext: Object.freeze({ ...invocation, operation: Object.freeze({ binding: operation, permission: action }) }),
 			});
 		},
-		resolveExecution: ({ tool, action, signal }) => resolveExecutionRoute(tool, signal, action),
+		resolveExecution: ({ tool, action, signal, parentWorld }) => resolveExecutionRoute(tool, signal, action, parentWorld?.checkpoint),
 		captureAuthoritativeResult: async ({ startInput, consumeInput, tool: toolName, concrete, action, callID, signal }) => {
 			const tool = consumeInput.tools.find(tool => tool.name === toolName);
 			if (!tool) return undefined;
@@ -313,6 +314,7 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 				},
 			);
 		},
+		observationKey: toolObservationKey,
 		rejectCandidateOutput: ({ output }) => (output.isError && output.exitCode === undefined ? "tool_error_result" : undefined),
 		projectionRules,
 		onTurnStarted: async ({ startInput, decisionSequence, settings }) => {
@@ -408,7 +410,7 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 		finishTurn: async (turnID, terminal = false) => {
 			try {
 				await runtime.finishTurn({ sessionID, turnID, tool: "", args: {}, tools: [], terminal });
-				if (terminal) { drafterPlans.finishSession(); await patternPlans.finishSession(); }
+				if (terminal) { drafterPlans.finishSession(); await Promise.all([patternPlans.finishSession(), executionPreparation.finishSession()]); }
 			} finally {
 				const closed = await Promise.allSettled(executionWorlds.map(async world => world.finishTurn?.(turnID)));
 				const failures = closed.flatMap(result => result.status === "rejected" ? [result.reason] : []);
@@ -420,7 +422,7 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 				await runtime.disposeSession(sessionID);
 				drafterPlans.finishSession();
 				await patternPlans.finishSession();
-			} finally { try { await patternPlans.dispose(); } finally { await executionGateway.dispose(); } }
+			} finally { try { await patternPlans.dispose(); } finally { try { await executionPreparation.dispose(); } finally { await executionGateway.dispose(); } } }
 		},
 	};
 }

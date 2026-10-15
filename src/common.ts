@@ -1,5 +1,3 @@
-import { KEYABLE_TOOLS, type ActionSemanticsRegistry } from "./action-semantics.ts";
-import type { SpeculativeActionSettings } from "./runtime-contracts.ts";
 import { positiveCount } from "./number-utils.ts";
 import { booleanOr, nonNegativeInteger, nonNegativeNumber, positiveInteger, settingsParser } from "./setting-input.ts";
 
@@ -8,7 +6,7 @@ export interface DrafterToolDefinition { readonly name: string; readonly descrip
 export type DrafterRequestSettings = Readonly<typeof DRAFTER_DEFAULTS>;
 
 const { defaults: DRAFTER_DEFAULTS, parse: parseDrafterSettings } = settingsParser({
-	/** Output-informed successor actions retained after the first Drafter action. */
+	/** Successor batches predicted from private observations while earlier actions execute. */
 	drafterMaxDepth: [3, nonNegativeInteger],
 	/** Output cap for each Drafter request: one proposed tool batch never needs the Actor's answer budget. */
 	drafterMaxTokens: [4096, positiveInteger],
@@ -27,6 +25,7 @@ const { defaults: DRAFTER_DEFAULTS, parse: parseDrafterSettings } = settingsPars
 export const DEFAULTS = {
 	enabled: false,
 	drafterEnabled: true,
+	prepareObservedOperations: true,
 	...DRAFTER_DEFAULTS,
 	candidateLimit: 2,
 	maxConcurrentActions: 8,
@@ -34,22 +33,9 @@ export const DEFAULTS = {
 	resourceCacheMaxBytes: 256 * 1024 * 1024,
 	predictionTimeoutMs: 300_000,
 	thinkThreadTimeoutMs: 120_000,
-	tools: KEYABLE_TOOLS,
 };
 
 export const clampCandidateLimit = positiveCount;
-
-/** Selection is policy; invocation capabilities decide which operations can execute. */
-export function candidateToolNames(settings: SpeculativeActionSettings, _semantics?: ActionSemanticsRegistry): readonly string[] {
-	return [...new Set(settings.tools)];
-}
-
-/** Only omitted selection defaults to allowed tools; malformed input disables prediction. */
-export function normalizeSpeculativeToolSelection(value: unknown, allowed: readonly string[] = KEYABLE_TOOLS): readonly string[] {
-	const items = value === undefined ? allowed : value;
-	if (!Array.isArray(items) || !items.every((item): item is string => typeof item === "string")) return [];
-	return [...new Set(items)];
-}
 
 export function normalizeDrafterRequestSettings(value: unknown): DrafterRequestSettings {
 	const result = parseDrafterSettings(value && typeof value === "object" ? value as Record<string, unknown> : undefined);

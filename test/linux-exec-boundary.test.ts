@@ -5,7 +5,6 @@ import { lstat, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises
 import path from "node:path";
 import { expect } from "vitest";
 import { PROCESS_CERTIFICATE } from "./process-fixture.ts";
-import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { cHeaders, commitBenchmarkFixture, compileBenchmarkHelper, processTest,
 	executeProcess, forkReusableBash, holdOwnedProcessPublication, metricDelta, prepareLinuxProcessReuse, textOutput } from "./linux-process-fixture.ts";
 
@@ -152,7 +151,7 @@ int main(int argc, char **argv) {
 				competing ? "sync" : scenario.name !== "descriptor", scenario.name === "competing-whole" ? "unrelated" : undefined);
 			const result = competing || ["completed", "running"].includes(scenario.name) ? await fixture.workspaceSandbox.withWorkspace(workspace, async privateWorkspace => {
 				const command = competing ? `: local-parent; ${scenario.command}` : "/bin/true";
-				const invocation = resolvePiToolInvocation("bash", { command }, { cwd: workspace, environment: fixture.environment, shellPath: fixture.shellPath })!.process!;
+				const invocation = fixture.invocation({ command }).process!;
 				await using local = disposable(await backend.open({ sourceRoot: workspace, workspace: privateWorkspace, invocation, scope: { sessionID: "benchmark", turnID: "benchmark" } }));
 				expect((await executeProcess(fixture, local.executor, command)).exitCode).toBe(0);
 				if (!competing) return await consume();

@@ -79,7 +79,7 @@ export class SharedAbortScope extends AbortController {
 			if (this.borrowers.delete(release) && !this.borrowers.size) this.abort(signal?.reason);
 		};
 		this.borrowers.add(release);
-		signal?.addEventListener("abort", release, { once: true });
+		signal?.addEventListener("abort", release, { once: true, signal: this.signal });
 		if (signal?.aborted) release();
 		return release;
 	}

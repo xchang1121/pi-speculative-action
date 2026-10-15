@@ -184,7 +184,7 @@ nativeTest.for(["journal", "whole-released", "whole-consumed", "custom", "dispos
 			const session = await open.call(this, input); state.contexts.push(input.workspace); state.sessions.push(session); return session;
 		});
 	});
-	const command = "printf own", invocation = resolvePiToolInvocation("bash", { command }, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath })!.process!;
+	const command = "printf own", invocation = fixture.invocation({ command }).process!;
 	const running = fixture.workspaceSandbox.withWorkspace(fixture.workspace, async workspace => {
 		const interval = await workspace.transactions.begin(), begin = workspace.transactions.begin, captured = vi.fn(begin);
 		const context = mode === "custom" ? { ...workspace, transactions: { ...workspace.transactions, begin: captured } } : workspace;
@@ -251,7 +251,7 @@ int main(int argc, char **argv) { int fd = open(argv[2], O_WRONLY | O_TRUNC); if
 		});
 	});
 	await fixture.workspaceSandbox.withWorkspace(fixture.workspace, async workspace => {
-		const invocation = (command: string) => resolvePiToolInvocation("bash", { command }, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath })!.process!;
+		const invocation = (command: string) => fixture.invocation({ command }).process!;
 		const disjoint = mode.endsWith("disjoint"), custom = mode.startsWith("custom-"), live = mode.startsWith("live-"), foreign = live || mode.startsWith("foreign-"), retired = mode.includes("retired-");
 		const command = "exec ./writer A input.txt", other = `exec ./writer B ${disjoint ? "other.txt" : "input.txt"}${live ? " hold" : ""}`;
 		let captureCalls = 0;
@@ -535,7 +535,7 @@ nativeTest.for([false, true])("prepares a failed command after its reported inpu
 		await prepareLinuxProcessReuse(fixture);
 		const writer = createWriteTool(fixture.workspace), tools = [fixture.tool, writer], sessionID = "failed-command";
 		const command = 'IFS= read -r value < source.txt; if [ "$value" != fixed ]; then printf "source.txt:1: expected fixed, got %s\\n" "$value"; exit 1; fi; printf "%s\\n" "$value" > generated.txt; printf "verified\\n"';
-		const prepared = patternProcessHost(fixture, sessionID, { patternAware: patternAwareSettings({ presets: ["retry-failed-command"] }) }, {}, tools), { events, start } = prepared;
+		const prepared = patternProcessHost(fixture, sessionID, { prepareObservedOperations: false, patternAware: patternAwareSettings({ presets: ["retry-failed-command"] }) }, {}, tools), { events, start } = prepared;
 		await using host = disposable(prepared.host);
 		const call = (turnID: string) => prepared.call(turnID, command);
 		await start("failure");
@@ -578,7 +578,7 @@ int main(int argc, char **argv) { if (argc != 2) return 1; int fd = open(${layou
 	await commitBenchmarkFixture(fixture.workspace, "changed child frontier"); await prepareLinuxProcessReuse(fixture);
 	const route = await fixture.prepareActorReplay(), writer = createWriteTool(fixture.workspace), tools = [fixture.tool, writer];
 	const registry = Reflect.get(fixture.backend, "handoffs") as ProcessHandoffRegistry<{ executable: string; args: readonly string[] }>;
-	const settings = { candidateLimit: 4, maxConcurrentActions: 4, patternAware: patternAwareSettings({ multiStepEnabled: false, beamWidth: 1, presets: ["recent-command"] }) };
+	const settings = { candidateLimit: 4, maxConcurrentActions: 4, tools: [], prepareObservedOperations: true, patternAware: patternAwareSettings({ enabled: false }) };
 	const interrupted = layout === "race" ? new AbortController() : undefined, gate = interrupted && gated(2);
 	const prepared = patternProcessHost(fixture, scope.sessionID, settings, {}, tools), { events, start, call } = prepared;
 	await using host = disposable(prepared.host);
@@ -593,10 +593,11 @@ int main(int argc, char **argv) { if (argc != 2) return 1; int fd = open(${layou
 	expect(bindings).toHaveLength(2);
 	const consumed = bindings.find(binding => registry.resolveBinding(binding, scope)?.args.includes(target))!;
 	await start("prepared");
-	await prepared.waitFor(() => events.filter(event => event.type === "candidate" && event.turnID === "prepared" && event.state.status === "succeeded").length === 2);
+	await prepared.waitFor(() => bindings.every(binding => events.some(event => event.type === "candidate" && event.candidate.kind === "operation" &&
+		event.candidate.predictedAction.includes(binding.key) && event.state.status === "succeeded")));
 	expect(await Promise.all(bindings.map(binding => fixture.backend.bindingStale(binding)))).toEqual([false, false]); await host.finishTurn("prepared");
 	const preparations = (turnID: string) => events.filter(event => event.type === "candidate" && event.turnID === turnID &&
-		event.candidate.mode === "recent-command" && bindings.some(binding => event.candidate.predictedAction.includes(binding.key)));
+		event.candidate.mode === "observed-work" && bindings.some(binding => event.candidate.predictedAction.includes(binding.key)));
 	const lookup = fixture.backend.bindingStale.bind(fixture.backend), resources = await import("../src/resource-version.ts"), observeChanges = resources.observeResourceChanges;
 	const publications = await recordProcessPublications(fixture);
 	using changes = vi.spyOn(resources, "observeResourceChanges").mockImplementationOnce(async (...args) => {
@@ -612,7 +613,7 @@ int main(int argc, char **argv) { if (argc != 2) return 1; int fd = open(${layou
 	}
 	await host.finishTurn("unrelated");
 	expect(preparations("unrelated")).toEqual([]);
-	if (mode === "disabled") settings.patternAware = patternAwareSettings({ enabled: false });
+	if (mode === "disabled") settings.prepareObservedOperations = false;
 	await start("edit");
 	if (gate) await gate.entered;
 	for (const value of layout === "repeat" ? ["new", "two"] : ["new"]) {
@@ -637,7 +638,7 @@ int main(int argc, char **argv) { if (argc != 2) return 1; int fd = open(${layou
 	const receipts = new Set(TimelineInterval.serialize(computation)!.nodes.flatMap(node => node.inputs?.filter(input => input.reused).map(input => input.id) ?? []));
 	expect((await publications()).filter(certificate => receipts.has(certificate.result.computation!.root)).map(certificate => certificate.weakKey).sort())
 		.toEqual(reused ? (both ? bindings : [consumed]).map(binding => binding.key).sort() : []);
-	if (reused) expect(timing.hiddenByMode).toEqual([{ source: "pattern_aware", mode: "recent-command", hiddenComputeMs: timing.hiddenComputeMs }]);
+	if (reused) expect(timing.hiddenByMode).toEqual([{ source: "execution_preparation", mode: "observed-work", hiddenComputeMs: timing.hiddenComputeMs }]);
 	await host.finishTurn("edit", true);
 	if (mode === "disabled") expect(preparations("edit")).toEqual([]);
 });
@@ -937,7 +938,7 @@ int main(int argc, char **argv) {
 			expect(binding).toBe(fixture.backend.executionBindings(scope).find(candidate => candidate.key === preparedKey && candidate.scope.turnID === "prepared"));
 		}
 		if (resumed && ["pipe", "queue-received"].includes(mode!)) {
-			const invocation = resolvePiToolInvocation("bash", { command: "exit 92" }, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath })!.process!;
+			const invocation = fixture.invocation({ command: "exit 92" }).process!;
 			for (const phase of ["foreign", "fresh", "changed", "cancel", "closed", "revoked"]) await fixture.workspaceSandbox.withWorkspace(fixture.workspace, async workspace => {
 				if (phase === "revoked") { await fixture.backend.storage.maintain("clear"); expect(binding!.available).toBe(false); }
 				const later = { sessionID: phase === "foreign" ? "foreign" : scope.sessionID, turnID: phase }, fresh = phase === "fresh" || phase === "closed";
@@ -985,7 +986,7 @@ int main(void) { char b[1024]; return syscall(SYS_getdents64, 4, b, sizeof(b)) <
 		await commitBenchmarkFixture(fixture.workspace, "Native resource input bridge"); await prepareLinuxProcessReuse(fixture);
 		const tools: (typeof fixture.tool)[] = [name, "consume_rows"].map(name => ({ ...fixture.tool, name }));
 		tools.push(createReadTool(fixture.workspace), createGrepTool(fixture.workspace), createLsTool(fixture.workspace), createFindTool(fixture.workspace));
-		const prepared = patternProcessHost(fixture, "native-inputs", { tools: tools.map(tool => tool.name), resourceCacheMaxEntries: 8,
+		const prepared = patternProcessHost(fixture, "native-inputs", { resourceCacheMaxEntries: 8,
 			resourceCacheMaxBytes: 32 * 1024, patternAware: patternAwareSettings({ enabled: true, multiStepEnabled: false }) }, {
 			executionWorlds: [fixture.world, createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { maxBytes: () => 1024 * 1024 })],
 			resolveInvocation: (tool, input) => {
@@ -1263,14 +1264,14 @@ int main(int argc, char **argv) {
 			"export BOUND_SECRET='private value'; " + (launcher ? "exec fd-launch parent" : "printf 'parent\\n'; exec -a bound-name worker 'private argument'") +
 			(mode === "native-merged" ? " 2>&1" : mode === "native-closed-input" ? " 0<&-" : "");
 		const route = await fixture.prepareActorReplay(!native);
-		const invocation = resolvePiToolInvocation("bash", { command: "exit 92" }, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath })!.process!;
+		const invocation = fixture.invocation({ command: "exit 92" }).process!;
 		let binding: ProcessExecutionBinding | undefined;
 		if (!native) {
 			for (const value of ["before", ...Array.from({ length: 8 }, (_, version) => `history-${version}`)]) {
 				await writeFile(path.join(fixture.workspace, "input.txt"), `${value}\n`);
 				await using branch = disposable(await forkReusableBash(fixture, { command, label: value, actionNamespace: "binding", executionFingerprint, executionScope: scope }));
 				expect(branch.output).toMatchObject({ isError: false, result: { content: [{ text: `parent\n${value}\n` }] } });
-				const invocation = resolvePiToolInvocation("bash", { command }, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath })!;
+				const invocation = fixture.invocation({ command });
 				const permission = PI_ACTION_SEMANTICS.buildKey("bash", { command }, fixture.workspace, "binding", { fingerprint: executionFingerprint, context: invocation })!;
 				const binding = branch.operations![0]!;
 				for (const operation of [{ binding: Object.freeze({ ...binding }), permission }, { binding, permission: { ...permission, key: "different action with colliding hash" } }]) {
@@ -1315,7 +1316,7 @@ int main(int argc, char **argv) {
 			await writeFile(path.join(fixture.workspace, "input.txt"), "after\n");
 		}
 
-		const prepared = patternProcessHost(fixture, scope.sessionID, { candidateLimit: 4, maxConcurrentActions: 6,
+		const prepared = patternProcessHost(fixture, scope.sessionID, { tools: [], candidateLimit: 4, maxConcurrentActions: 6,
 			patternAware: patternAwareSettings({ enabled: true, multiStepEnabled: false, beamWidth: 4 }) }, {
 			// This boundary fixture budgets two native preparations plus the Actor; single-CPU live transfers are tested above.
 			resources: { initial: { cpuCount: 6, idleCpuCount: 6 }, sample: async () => ({ cpuCount: 6, idleCpuCount: 6 }) },
@@ -1439,7 +1440,7 @@ int main(int argc, char **argv) {
 		else expect(timing.hiddenComputeMs,
 			JSON.stringify({ metrics: fixture.backend.actorMetrics(), producer: fixture.backend.metrics(), bindings: fixture.backend.executionBindings(later), operations: events.filter(event => event.type === "operation_prediction") })).toBeGreaterThan(0);
 		expect(events.filter(event => event.type === "operation_prediction").filter(event => !launcher || stalePreparation || event.settlement.observation === "observed"), JSON.stringify({ operations: events.filter(event => event.type === "operation_prediction"), errors: errors.mock.calls.map(call => call[1]), metrics: fixture.backend.actorMetrics() })).toMatchObject(Array.from({ length: launcher && stalePreparation ? 2 : 1 }, () => ({ settlement: stalePreparation ? { observation: "unobserved" } : {
-			prediction: { source: "pattern_aware", kind: "operation" }, observation: "observed", match: { matched: true, adoption: { status: "adopted" } },
+			prediction: { source: "execution_preparation", kind: "operation" }, observation: "observed", match: { matched: true, adoption: { status: "adopted" } },
 		} })));
 		await expect.poll(() => patternStore.recent(scope.sessionID).map(event => event.input.command)).toEqual(["printf common", "printf common", ...(discovery ? [command] : []), command, changedParent]);
 		expect(JSON.stringify(events.filter(event => event.type === "candidate" && event.candidate.kind === "operation"))).not.toContain("private value");
@@ -2470,7 +2471,7 @@ int main(void) { int status; struct timespec pause = {0, 300000000}; pid_t sibli
 		}
 		// An independently prepared native operation has the same external-write baseline as a whole tool.
 		const args = { command: `/bin/sh -c 'printf "bound\\n" > "$1"' sh ${outside}/kept` };
-		const invocation = resolvePiToolInvocation("bash", args, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath })!;
+		const invocation = fixture.invocation(args);
 		const permission = PI_ACTION_SEMANTICS.buildKey("bash", args, fixture.workspace, "private-bound", { fingerprint: executionFingerprint, context: invocation })!;
 		const scope = { sessionID: "private-bound", turnID: "native" }, route = await fixture.prepareActorReplay();
 		let operation: ExecutionOperationBinding | undefined;

@@ -6,7 +6,6 @@ export const PATTERN_AWARE_PRESETS = Object.freeze([
 	Object.freeze({ id: "reported-files", label: "Reported files", description: "Read files named by the latest tool results that have not been read yet.", defaultOff: false }),
 	Object.freeze({ id: "edited-file", label: "Edited files", description: "Read files the Actor just edited or wrote.", defaultOff: false }),
 	Object.freeze({ id: "recent-reads", label: "Recent reads", description: "Prepare another read of recently read files.", defaultOff: false }),
-	Object.freeze({ id: "recent-command", label: "Recent command", description: "Prepare discovered native work and refresh it after input edits.", defaultOff: false }),
 	Object.freeze({ id: "reported-lines", label: "Reported lines", description: "Read around line numbers reported by tool results.", defaultOff: true }),
 	Object.freeze({ id: "companion-files", label: "Companion files", description: "Read an already observed source or test companion near the current file.", defaultOff: true }),
 	Object.freeze({ id: "failure-edits", label: "Edits after failure", description: "After a failed call, inspect recently edited files that have not been read since.", defaultOff: true }),

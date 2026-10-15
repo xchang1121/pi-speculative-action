@@ -1,67 +1,48 @@
 # Pi 投机执行
 
-通过 Pi 扩展接口接入的工具投机执行系统：在 Actor（执行当前任务的模型）发出正式工具调用前，预测后续动作并提前执行；调用到达后，验证并采纳已有计算。项目围绕三个部分组织：预测计划、统一 Runtime、隔离执行后端。
-
-## 工作流程
-
-```mermaid
-flowchart LR
-    Sources["预测来源"] -->|PlanProposal| Runtime["Runtime<br/>计划、调度与匹配"]
-    Actor["Actor 正式调用"] --> Runtime
-    Runtime --> World["ExecutionWorld<br/>隔离执行与封存"]
-    World -->|输出与证明| Runtime
-    Runtime -->|验证通过| Commit["提交并返回"]
-    Runtime -->|常规执行| Fallback["执行当前工具"]
-    Runtime -. 结算反馈 .-> Sources
-```
-
-预测来源统一生成带依赖关系的 `PlanProposal`，可随执行结果继续扩展。Runtime 按 Actor 决策进度推进计划，根据依赖、启动窗口和实时资源安排准备与执行。同一 Runtime 的各会话共用调度器，准备、投机执行与真实调用共用资源账本，Actor 优先。
-
-正式调用通过动作键和投影规则查找候选：可以采用完整或覆盖当前请求的结果，也可以在封存的固定输入版本上按当前参数重新求值。流式调用预览按同一流程验新并准备当前查询，保留结果、证明和计算回执；正式调用再次验新后采纳。已绑定动作的准备工作、排队候选和在途执行均可交给 Actor 继续推进，直至完成或接续其进程；取消、执行失败和输入失效按生命周期处理。
-
-匹配负责发现候选，采纳以执行器兼容、权限与作用域有效、实际依赖与记录版本一致为前提。提交前的验证负责选择采纳结果或按当前绑定执行工具。效果采用单次提交语义；发生部分提交或效果状态待核实的错误时，本次调用随即终止。
-
-## 代码模块
-
-| 模块 | 主要源码 | 职责 |
-| --- | --- | --- |
-| Pi 接入 | [extension.ts](./src/extension.ts)、[agent-integration.ts](./src/agent-integration.ts) | 注册扩展与设置菜单，接收模型流和工具调用，连接 Host、Runtime 与执行后端。 |
-| 预测来源 | [drafter-plan-source.ts](./src/drafter-plan-source.ts)、[pattern-plan-source.ts](./src/pattern-plan-source.ts)、[actor-fork-plan-source.ts](./src/actor-fork-plan-source.ts) | 将模型预测、历史模式和可选 Actor 探测转换为统一计划，供 Runtime 调度和反馈。 |
-| 计划与调度 | [plan-runtime.ts](./src/plan-runtime.ts)、[scheduler.ts](./src/scheduler.ts)、[system-resources.ts](./src/system-resources.ts) | 推进依赖与预测窗口，依据实时资源、调用需求和置信度安排工作，处理争用与抢占。 |
-| 候选与采纳 | [runtime-engine.ts](./src/runtime-engine.ts)、[action-semantics.ts](./src/action-semantics.ts)、[candidate-stores.ts](./src/candidate-stores.ts) | 管理会话、动作身份、候选索引、结果和输入借用；完成匹配、等待、验证与结算。 |
-| 执行协议 | [execution-world.ts](./src/execution-world.ts)、[effect-transaction.ts](./src/effect-transaction.ts)、[runtime-lifecycle.ts](./src/runtime-lifecycle.ts) | 统一后端能力、分支提交状态，以及在途任务和资源的关闭排空。 |
-| 度量 | [settlement.ts](./src/settlement.ts)、[task-timing.ts](./src/task-timing.ts)、[trace-summary.ts](./src/trace-summary.ts) | 区分预测、执行与实际采纳，按计算来源汇总复用量、工具等待和诊断事件。 |
-
-根入口导出 [Pi Host API](./src/index.ts)；[`./core`](./src/core.ts) 提供可独立使用的 Runtime，[`./process-reuse`](./src/process-reuse.ts) 提供进程证明、规划和存储接口。新增预测来源实现 `SpeculativePlanSource`；新增后端实现 `ExecutionWorld`，通过 Host 的 `executionWorlds` 注册。宿主负责在结束时调用 `host.dispose()`。
-
-## 执行方案
-
-各后端遵循同一协议：`ExecutionWorld` 提供执行或观察能力，一次执行返回 `WorldBranch`，封装输出、依赖证明、可提交效果和资源释放方法；`EffectTransaction` 管理验证与采纳状态。后端可额外提供封存输入与查询能力，使不同工具或参数复用已有输入计算。通过能力检查的执行路线可以提前执行。
-
-自定义工具通过 `bindResourceOperation(execute, root)` 显式选择共用文件操作回调，或通过 `ToolInvocation.filesystem`、`captureInputs`、`ProcessExecutionCoordinator` 提供绑定；`ExecutionWorld.observeOperations` 可独立观察调用，即使整工具没有动作键。共享输入和子计算按实际依赖、效果与所有权查找和验新，工具名称不限制复用；运行时才发现的路径也能查询现有资源。生产者退出当前工具集后，已经运行的工作与已完成资源继续由原有所有权和预算管理，尚未启动的预测重新检查可用工具。`ToolFilesystemOperations.prepare` 以共享绑定和计算键借用已完成子计算；可选资源路径仅作索引提示，无路径的计算也可被其他工具发现。`bindResourceOperation` 让正常 Actor 执行保留实际输入、写入后的内容和纯子计算；文件读取、目录列举和 `prepare` 共用查询；无整工具动作键的生产者和消费者也能发布、借用输入，持有者沿用同一索引、预算与释放生命周期。输入专用分支标记为 `inputsOnly: true`，不携带或复制父工具输出，也不授予整次结果采纳或投机执行权限；保留预算只计实际持有的资源、证明和查询结果，父工具仍收到原有输出。已完成的输入操作和纯子计算可在父工具随后报错或单次调用取消后保留；消费回调失败也不丢弃独立完成的准备工作，原错误及已执行效果保持不变，失败消费不计复用时长。输入捕获可不带输出封存，完整结果仍要求有效输出；封存开始即关闭本次输入入口。消费前在借用生命周期内精确验新，读取返回独立副本，同次调用写入后的再读仍重新验证；失败的消费不会重放效果，预算不足或超出共享根仍按原生操作完成。构建器只通过给定视图读取依赖，绑定和计算键须覆盖其他输入，共享值保持不可变。消费工具继续执行自己的格式化与剩余操作。原生子计算携带后端签发的独立效果契约，准备时仍检查当前父调用权限；整段宿主函数的隔离仍需明确绑定完整执行出口。通用工具网关在异步接纳前固定会话、轮次与调用标识，进程出口的 `execute` 和 Bash 适配器自动沿用该归属；并发调用、投机回调与共享路由准备分别管理上下文，调用标识不参与复用键。Pi SDK 注册的工具回调与已接入通用网关的调用可观察原始 `spawn`、`execFile`、`exec`、`fork` 及其同步进程 API，包括接纳前已导入的函数；调用者仍收到自己的原生返回值、错误和输出。同步调用由独立工作线程完成交接决策，可学习实际启动并消费已完成的受控成果，期间不运行调用者的异步回调。原生启动捕获的文件与目录输入可在同步和异步工具之间双向共享，普通 SDK 回调也能发布这些输入；线程传递保持原计算标识，以可撤销借用保活原描述符，接收端获取自己的描述符并精确核对对象身份，最终仍由调用者的输入所有者接纳。具备工作区命名路径的原生文件与目录输入可以重新捕获当前资源图，保留共享描述、标志、偏移与完整硬链接集合；目录沿用内核原始枚举数据。调度验新和执行准备使用同一版本键，原绑定和旧成果保持独立；实际消费者仍核对当前资源图、效果和所有权。匿名对象、外部队列与投机前置状态继续沿用原生产者约束。依赖被阻塞主线程的在途生产者仍不能加入同步路径。未接入网关的第三方函数仍需宿主接入。
-
-| 实现 | 方法与边界 |
-| --- | --- |
-| [封存资源](./src/agent-execution-world.ts) / [输入版本](./src/resource-version.ts) | 为绑定的文件工具捕获实际访问的数据，保留内容与路径证明；后续查询复用仍有效的输入，并对本次使用的依赖精确验新。受控 `find/grep` 由 [统一工具绑定](./src/pi-tool-invocation.ts) 让 Actor 与投机使用相同执行器，需显式启用。 |
-| [私有工作区](./src/workspace-sandbox.ts) / [文件事务](./src/workspace-transaction.ts) | 普通 `write/edit` 先在内存事务中执行；需要私有分支时使用 Git 或通过检查的 OverlayFS。文件效果在持锁状态下验证并提交，多步计划可沿私有分支继续执行。 |
-| [Linux 进程](./src/linux-process-world.ts) / [进程后端](./src/linux-process-backend.ts) | 用 Sandlock 隔离执行、strace 记录依赖和效果，再通过证书验证。合格的 x86-64 Linux 使用 [held-exec](./src/linux-held-exec.c) 接管已完成计算，或在支持的系统调用入口转移单线程进程、继续执行后缀。可证明等价的结果在输入与证明记录一致、生命周期有效时反复复用；含时钟、随机或进程身份等观测的结果采用一次性交接。 |
-| [ThinkThread](./src/thinkthread/execution-world.ts) | 通过固定 SDK 的快照与 `fs.run` 接入相同分支协议，文件读取可进入公共封存输入层。默认覆盖 `read/ls/write/edit`；`bash/find/grep` 由 Actor 的原生工具执行。 |
-
-结果、输入和进程句柄分别保留自己的所有权；跨轮复用以作用域与新鲜度证明为依据。独立子步骤凭自身证明即可采纳；提交后，后续工作区分支以真实状态为基线。候选库变化和临时占用释放会唤醒等待者重新选取，等待期间新增的结果也参与匹配。每次请求都依据自身证明决定采纳；提交失败后，已确认本次操作保持或恢复原有状态的请求可重新验新并重试。各条证书和产物独立验证与筛选，新发布的正确内容可修复损坏副本。已封存结果跨轮保留，采纳时按实际依赖精确验新。共享缓存目录通过跨进程事务协调发布和逐对象回收，有限的发布事务保护产物写入到证书封存的全过程；失败发布回滚元数据，统计按需清点实际文件及崩溃残留。存储打开期间周期回收覆盖一次性交接、继续执行和中途失败留下的孤立产物，按宽限期清理并在临时失败后重试。活跃交接结果独立持有证书、完整计算图、已验证产物与继续执行映像，并和调用参数共用保留预算；容量按序列化证据和载荷字节核算，预算淘汰避开正在借用的结果，释放后重新收敛。已有缓存通过独立只读连接查询已提交历史，排队与锁等待支持取消并设一秒接纳预算；尚未接纳的调用到期即可退出，接纳后的写入安全收尾再释放事务。依赖验新逐块观察取消，存储关闭等待整个查找及其文件句柄清理。单个等待者退出不会取消共享初始化；路由所有者关闭会终止并回收探测，探测进程另设十秒超时。旧缓存自动迁移，迁移提交完成后再清理旧文件。回收期间新发布或重新引用的对象保留到下一轮，容量允许短暂超额。关闭会话先停止新操作与锁等待，再排空已接纳工作并释放资源。直接使用 process-reuse API 时，以 `withPublication` 包住产物写入至证书封存，在回调外调用 `gc`、`drain` 或 `dispose`。
+Pi 扩展：在 Actor（执行任务的模型）正式调用工具前预测动作、提前执行，调用到达后验证并采纳已有计算。模型、历史模式和 Actor 探测共用计划与资源调度；实际输入、效果和所有权决定复用。
 
 ## 使用
 
 ```sh
 pi install https://github.com/xchang1121/pi-speculative-action
-# 或加载本地 checkout
 pi -e /absolute/path/to/pi-speculative-action
 ```
 
-版本与依赖见 [package.json](./package.json)。在 Pi 中运行 `/speculative-action`，开启投机、选择预测来源和工具后 **Apply changes**；在 **Tools & execution → Execution routes** 检查实际可用的后端。配置保存在 `<agent-dir>/speculative-action.json`，项目的 `.pi/speculative-action.json` 可覆盖全局设置。
+安装或加载本地 checkout 后，运行 `/speculative-action`，开启投机并选择预测来源，点击 **Apply changes**。在 **Tools & execution → Execution routes** 检查 Replay、Observe、Fork 能力。全局配置为 `<agent-dir>/speculative-action.json`，项目的 `.pi/speculative-action.json` 可覆盖它；版本与依赖见 [package.json](./package.json)。
 
-Linux / WSL 2 的 Bash 后端可从菜单检查和安装，也可在源码目录运行 `npm run setup:linux`；WSL checkout 应放在 Linux 原生文件系统。原生进程自动选用合格的 OverlayFS，回退 Git 时补齐空目录和权限；两条路径中被复制的原始对象通过持有对象和元数据映射，保持路径、文件描述符及目录枚举所见身份一致，采纳前仍精确验新。ThinkThread 使用独立的 [Profile 安装脚本](./scripts/install-thinkthread-profile.sh)，安装后在项目中运行 `tt pi-speculative-action`。Actor 常规执行承担基础工具调用，各后端在满足可用条件时承接投机工作。
+`drafterMaxDepth` 表示根批次之后最多预测多少个后继批次，0 关闭续推。动作和观测预测共用 Drafter 模型、凭据、任务请求数及 token 预算；并发根候选和 Drafter Actor 探测也使用同一账本，重试与压缩续跑不重置额度。`tools` 只筛选预测候选：省略时使用当前全部工具，空数组关闭工具候选；它不限制已观察输入和子计算的复用。
 
-原生子进程交接需要保留程序自身的提权语义。安装程序同时构建专用的 `.observer`；普通 Actor 需要通过 `PI_SPEC_HELD_EXEC_OBSERVER` 指向由管理员部署、仅具有 `CAP_SYS_PTRACE` 的专用观察器。已继承 `no_new_privs` 的 Actor 可使用无附加权限的观察器。安装探测仅在一次性进程内设置此限制，并单独报告当前 Actor 的交接资格；资格不足时原生执行、缓存命令回放和投机生产仍各自可用。通用执行 helper 和映像库始终保持无附加权限。
+Linux / WSL 2 可从菜单安装 Bash 后端，或运行 `npm run setup:linux`；WSL checkout 应位于 Linux 原生文件系统。进程后端自动选择通过检查的 OverlayFS，否则回退 Git，并在采纳前核对输入和原始对象身份。
+
+原生子进程交接须保留程序自身的提权语义。普通 Actor 通过 `PI_SPEC_HELD_EXEC_OBSERVER` 指向管理员部署、仅具有 `CAP_SYS_PTRACE` 的专用 `.observer`；已继承 `no_new_privs` 的 Actor 可使用无附加权限的观察器。安装探测只在一次性进程设置此限制。资格不足时，原生执行、缓存回放和投机生产各自保持可用；通用 helper 与映像库始终不附加权限。
+
+ThinkThread 使用 [Profile 安装脚本](./scripts/install-thinkthread-profile.sh)，随后在项目中运行 `tt pi-speculative-action`。
+
+## 预测与执行
+
+[模型 Drafter](./src/drafter-plan-source.ts)、[PatternAware](./src/pattern-plan-source.ts) 和 [Actor 探测](./src/actor-fork-plan-source.ts) 生成统一 `PlanProposal`。[Runtime](./src/runtime-engine.ts) 按 Actor 决策进度、后端给出的资源依赖及实时资源安排准备和执行，各会话共用预算，Actor 优先。PatternAware 的模式、预设、按工具契约校准和原生工具名输出用于提出候选。`prepareObservedOperations` 独立控制[已观察操作的提前准备](./src/execution-preparation.ts)，默认开启；旧 `recent-command` 预设并入这一执行选项，不再受 PatternAware 开关控制。内部工作保留父工具调用和绑定权限，与预测共用物理资源账本。
+
+Drafter 参照 [TomasuLLM](https://arxiv.org/html/2609.38201v2) 将动作预测与观测预测分开：具体调用通过准入后，在真实执行期间预测尚未完成的输出，再以私有的完整工具批次继续预测。独立后继可先执行；读写相同资源的后继等待生产者，并沿可用的私有检查点执行。真实结果若先到则直接使用。预测观测按模型可见的 `content` 和 `isError` 精确核对，失配撤销依赖它的预测；Actor 历史始终只接收真实结果。这里不实现论文的服务端 KV cache / committed restart 协议。
+
+预测血缘与复用证明分开：预测失配不使已经独立校验的真实输入或子计算失效。正式调用可采用完整结果、契约允许的投影，或在封存输入上按当前参数重算；流式预览也走同一验新流程。执行器、权限、作用域、实际依赖及记录须相容，效果只提交一次；部分提交或效果状态不明会终止本次调用。命中的在途工作等待完成，支持调用方取消。
+
+根入口提供 [Pi Host API](./src/index.ts)；[`./core`](./src/core.ts) 提供 Runtime，[`./process-reuse`](./src/process-reuse.ts) 提供进程证明与存储。新增来源实现 `SpeculativePlanSource`，从 `definitions` / 宿主数据获取当前工具；新增后端实现 `ExecutionWorld`，通过 `executionWorlds` 注册。结束时调用 `host.dispose()`。
+
+| 后端 | 方法与边界 |
+| --- | --- |
+| [封存资源](./src/agent-execution-world.ts) / [输入版本](./src/resource-version.ts) | 捕获实际文件输入、保留内容与路径证明，消费前精确验新。受控 `find/grep` 需显式启用 [统一工具绑定](./src/pi-tool-invocation.ts)。 |
+| [私有工作区](./src/workspace-sandbox.ts) / [文件事务](./src/workspace-transaction.ts) | 普通写入先在内存事务执行；硬链接与依赖链使用私有工作区。读取也能沿检查点执行，提交只包含本次操作的效果。 |
+| [Linux 进程](./src/linux-process-world.ts) | Sandlock 隔离、strace 记录依赖，证书验新；合格的 x86-64 Linux 可接管已完成计算或转移单线程进程继续后缀。时钟、随机或进程身份等观测按一次性交接处理。 |
+| [ThinkThread](./src/thinkthread/execution-world.ts) | 固定 SDK 的快照与 `fs.run` 接入分支协议，文件和目录输入进入公共复用层。默认覆盖 `read/ls/write/edit`；其余调用保留 Actor 原生执行。 |
+
+自定义文件工具可用 `bindResourceOperation(execute, root)`，或提供 `ToolInvocation.filesystem`、`captureInputs`、`ProcessExecutionCoordinator` 绑定。`ExecutionWorld.observeOperations` 可独立观察没有整工具动作键的调用。共享输入和纯子计算按实际依赖查找，工具名称与可选路径提示不构成复用权限。`ToolFilesystemOperations.prepare` 的绑定及计算键须覆盖其余输入，构建器只通过给定视图读依赖，共享值保持不可变。
+
+`inputsOnly` 分支只持有输入及证明，不复制父工具输出，也不授予整工具采纳权限。读取返回独立副本，写后再读重新验证；消费工具执行自己的格式化与剩余操作。已独立完成的输入或纯子计算可在父工具报错、单次取消、工具退出可用集合后保留；失败消费不计复用时长，也不重放效果。预算不足或超出共享根时沿用原生操作。
+
+Pi SDK 回调及接入网关的调用可观察 `spawn/execFile/exec/fork` 及其同步 API。同步交接由工作线程决策，期间不运行调用者的异步回调，也不能加入依赖被阻塞主线程的生产者。同步与异步调用可共享捕获的文件、目录输入；命名路径可重捕获当前资源图，匿名对象、外部队列与投机前置状态保留原生产者约束。第三方函数须先接入网关。
+
+结果、输入和句柄各自保留所有权，跨轮消费仍验新。缓存发布与回收由跨进程事务协调，活跃借用受预算保护；关闭先停止接纳，再排空已接纳工作和句柄。直接使用 process-reuse API 时，以 `withPublication` 包住产物写入至证书封存，在回调外调用 `gc`、`drain` 或 `dispose`。
 
 ## 开发与验证
 
@@ -73,6 +54,6 @@ npm test -- --maxWorkers=1 --no-file-parallelism
 npm run bench:check
 ```
 
-[test](./test) 以系统功能测试为主：真实 Pi 会话、文件读写与跨轮工作流、Linux 原生进程接管、磁盘缓存重开和 HTTP/socket 通信。模型回复使用确定性脚本；系统测试以交付结果、复用与副作用作为断言依据，计时数学另用少量单元测试验证。Linux 用例需要已安装的原生后端；ThinkThread 本地 wire runner 与控制协议测试覆盖本地传输行为，真实 Runtime 资格需通过实机流程验证。[验证说明](./bench/README.md) 列出后端资格、完整模型任务和计量规则。
+[系统测试](./test) 使用确定性模型回复，验证 SDK 接入、跨轮工作流、乱序执行、观测失配、共享预算与取消，以及实际输出、效果和回收。Linux 原生用例需要已安装的后端；ThinkThread 本地 wire 测试不替代真实 Runtime 资格。
 
-`toolSpeedup = T / (T - H)` 采用乐观执行边界口径：T 为本次调用实际消费的执行区间，含首次证明、封存及生产者在调用后继续完成的计算；H 为其中实际复用且在 Actor 发出调用前完成的部分。工具计算和接管控制分开计量，`adoptionWaitMs` 单列纯协调等待。该比值描述工具执行区间的复用收益；CPU 使用与任务端到端净收益通过独立测量评估。
+[验证说明](./bench/README.md) 包含后端资格、模型任务与计量口径。`toolSpeedup = T / (T - H)` 描述已消费计算的复用收益；工具等待、协调等待、CPU 与端到端净收益分别评估。工具预测和内部操作分开计数；Drafter 状态另列私有观测预测数量及与已完成投机结果的精确一致率，未完成结果不进入分母。

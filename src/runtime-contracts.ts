@@ -13,6 +13,9 @@ type TurnIdentity<SessionID> = Pick<TurnInput<SessionID>, "sessionID" | "turnID"
 
 export interface SpeculativeActionSettings {
 	readonly enabled: boolean;
+	/** Optional prediction scope; omitted means all registered tools. Never a reuse or permission boundary. */
+	readonly tools?: readonly string[];
+	readonly prepareObservedOperations?: boolean;
 	readonly drafterEnabled?: boolean;
 	readonly candidateLimit?: number;
 	readonly maxConcurrentActions?: number;
@@ -22,8 +25,6 @@ export interface SpeculativeActionSettings {
 	readonly scheduling?: Partial<import("./scheduling-settings.ts").SchedulingSettings>;
 	/** Source-owned configuration. The runtime treats every value as opaque. */
 	readonly sourceConfig?: Readonly<Record<string, unknown>>;
-	/** Tools eligible for prediction; execution isolation is resolved independently. */
-	readonly tools: readonly string[];
 }
 
 export interface SpeculativeDraftCandidate extends Omit<PlanAction, "id" | "background"> {
@@ -125,6 +126,8 @@ export interface SpeculativePlanSource<
 	StateData,
 > {
 	readonly id: string;
+	/** Preparation reuses plan admission without claiming an Agent tool forecast. */
+	readonly kind?: "prediction" | "preparation";
 	readonly enabled: (settings: SpeculativeActionSettings) => boolean;
 	readonly timeoutMs?: (settings: SpeculativeActionSettings) => number | undefined;
 	/** Stop requests that can only predict the next Actor decision once that decision arrives. */
@@ -137,7 +140,6 @@ export interface SpeculativePlanSource<
 	readonly concurrentProposalPolicy?: (settings: SpeculativeActionSettings) => "all" | "first_produced";
 	readonly propose: (input: RuntimeTurnContext<StartInput, StateData> & {
 		readonly definitions: readonly DrafterToolDefinition[];
-		readonly candidateNames: readonly string[];
 		readonly proposalIndex: number;
 		readonly proposalCount: number;
 		readonly signal: AbortSignal;
@@ -148,8 +150,8 @@ export interface SpeculativePlanSource<
 		readonly candidate: SpeculativeCandidate;
 		readonly adoptedAction?: AdoptedAction;
 		readonly revision: number;
-		readonly output: Output;
-		readonly trigger: "execution_succeeded" | "actor_adopted";
+		readonly output: Output | undefined;
+		readonly trigger: "prepared" | "execution_succeeded" | "actor_adopted";
 		readonly signal: AbortSignal;
 		readonly reportDraftTokens?: (tokens: number) => void;
 	}) => MaybePromise<PlanUpdate | readonly PlanUpdate[] | undefined>;
@@ -166,11 +168,11 @@ export interface SpeculativePlanSource<
 		readonly reportDraftTokens?: (tokens: number) => void;
 	}) => MaybePromise<PlanUpdate | readonly PlanUpdate[] | undefined>;
 	/** Collect/filter execution feedback before a continuation consumes request capacity. */
-	readonly continueOn?: readonly ("execution_succeeded" | "actor_adopted")[] | ((input: {
+	readonly continueOn?: readonly ("prepared" | "execution_succeeded" | "actor_adopted")[] | ((input: {
 		readonly actionID: string;
 		readonly feedback: unknown;
-		readonly output: Output;
-		readonly trigger: "execution_succeeded" | "actor_adopted";
+		readonly output: Output | undefined;
+		readonly trigger: "prepared" | "execution_succeeded" | "actor_adopted";
 	}) => boolean);
 	/** Request scoped OS launch observations; this grants neither execution nor result-reuse authority. */
 	readonly observesOperations?: boolean;
@@ -220,6 +222,8 @@ export interface SpeculativeActionRuntimeAdapter<
 	/** Optional host resource observations; absent for deterministic runtimes without host telemetry. */
 	readonly resources?: import("./system-resources.ts").ExecutionResourceMonitor;
 	readonly sources?: readonly SpeculativePlanSource<SessionID, Output, StartInput, ConsumeInput, StateData>[];
+	/** Canonical model-visible observation, used only to verify private prediction ancestry. */
+	readonly observationKey?: (output: Output) => string;
 	readonly settings: () => MaybePromise<SpeculativeActionSettings>;
 	readonly definitions: (input: StartInput) => readonly DrafterToolDefinition[];
 	readonly stateData: (input: StartInput) => MaybePromise<StateData>;
@@ -232,7 +236,7 @@ export interface SpeculativeActionRuntimeAdapter<
 	) => MaybePromise<ActionKey | undefined>;
 	/** Resolve the highest-priority safe execution capability for this attempt. */
 	readonly resolveExecution: (input: RuntimeTurnContext<StartInput, StateData> &
-		Omit<BoundCandidateCall, "route" | "callID" | "index">) => MaybePromise<SpeculativeExecutionRoute | undefined>;
+		Omit<BoundCandidateCall, "route" | "callID" | "index"> & { readonly parentWorld?: WorldBranch<Output> }) => MaybePromise<SpeculativeExecutionRoute | undefined>;
 	/** Snapshot freshness before fallback execution; this callback must never execute the tool. */
 	readonly captureAuthoritativeResult?: (input: RuntimeTurnContext<StartInput, StateData> &
 		Omit<BoundCandidateCall, "candidate" | "route" | "index" | "action"> & {
@@ -265,7 +269,6 @@ export interface SpeculativeActionRuntimeAdapter<
 	readonly onTurnStarted?: (input: Pick<RuntimeTurnContext<StartInput, StateData>, "startInput" | "settings"> & {
 		readonly decisionSequence: number;
 		readonly definitions: readonly DrafterToolDefinition[];
-		readonly candidateNames: readonly string[];
 		readonly signal?: AbortSignal;
 	}) => MaybePromise<void>;
 	readonly onTurnFinished?: (input: Pick<RuntimeTurnContext<StartInput, StateData>, "startInput" | "settings"> & {

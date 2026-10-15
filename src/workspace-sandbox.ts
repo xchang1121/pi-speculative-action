@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { containsFilesystemPath, filesystemPathKey, relativeFilesystemPath, slash } from "./path-utils.ts";
 import { errorMessage, hasErrorCode, isMissing } from "./error-utils.ts";
-import { createCommittedResourceInputs, type SpeculativeAgentExecutionWorld, type SpeculativeToolExecutionContext } from "./agent-execution-world.ts";
+import { createCommittedResourceInputs, filesystemExecutionDependsOn, type SpeculativeAgentExecutionWorld, type SpeculativeToolExecutionContext } from "./agent-execution-world.ts";
 import type { WorldBranch, WorldCheckpoint, WorldExecutionMetrics } from "./execution-world.ts";
 import { advanceFilesystemClock, assertNoSymlinkPath, captureFilesystemEntry, captureStableFile, fileIdentity, mapFilesystem, sameFilesystemIdentity,
 	settledIdentity, sharedWalk } from "./filesystem-evidence.ts";
@@ -424,10 +424,12 @@ function createWorkspaceSandboxFor(state: WorkspaceSandboxState, options: Worksp
 	const resolvedOptions: WorkspaceSandboxOptions = options.driver === "overlayfs" ? options : { ...options, driver: "git" };
 	const roots = new Set<string>();
 	return { id: "git_worktree", scope: "fallback", isolation: "workspace_branch", speculation: {
-			capabilities: WORKSPACE_PATH_MUTATION_EFFECTS.capabilities,
+			capabilities: [...WORKSPACE_PATH_MUTATION_EFFECTS.capabilities, "validation.resource_snapshot"],
+			dependsOn: filesystemExecutionDependsOn,
 			acceptsCheckpoint: (checkpoint, cwd) => acceptsWorkspaceCheckpoint(state, checkpoint, cwd),
-			fingerprint: async ({ action }) => {
+			fingerprint: async ({ action, effect, parentCheckpoint }) => {
 				assertWorkspaceSandboxOpen(state);
+				if (effect === "observation" && !parentCheckpoint) throw new Error("Reads use captured inputs unless based on a private checkpoint");
 				if (action && !(action.executionContext as ToolInvocation | undefined)?.filesystem) throw new Error("Workspace execution requires an explicitly bound filesystem operation");
 				return (await resolveWorkspaceDriver(state, resolvedOptions)).fingerprint;
 			},

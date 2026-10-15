@@ -1,7 +1,7 @@
 import type { ExecutionOperationBinding } from "./execution-world.ts";
 import type { HardwareResources } from "./system-resources.ts";
 
-export type PlanActionDependencyCondition = "execution_settled" | "execution_succeeded" | "actor_adopted";
+export type PlanActionDependencyCondition = "execution_settled" | "execution_succeeded" | "actor_adopted" | "prediction";
 
 /** A scheduler-visible edge. The producer may add actions in later deltas. */
 export interface PlanActionDependency {
@@ -10,6 +10,8 @@ export interface PlanActionDependency {
 	readonly proposalID?: string;
 	readonly identity?: string;
 	readonly condition?: PlanActionDependencyCondition;
+	/** Private forecast of the parent's model-visible result; never execution or reuse evidence. */
+	readonly observation?: string;
 }
 
 export interface PlanAction {

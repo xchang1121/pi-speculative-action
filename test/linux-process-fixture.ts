@@ -3,8 +3,8 @@ import { access, copyFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promise
 import os from "node:os";
 import path from "node:path";
 import { MessageChannel, type Worker } from "node:worker_threads";
-import { test, type TestAPI } from "vitest";
-import { deferred, onExit } from "./async.ts";
+import { expect, test, type TestAPI } from "vitest";
+import { onExit } from "./async.ts";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { createBashTool, createLocalBashOperations } from "@earendil-works/pi-coding-agent";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
@@ -27,15 +27,14 @@ export function patternProcessHost(fixture: LinuxProcessBenchmark, sessionID: st
 	options: Partial<CreateSpeculativeActionHostOptions> = {}, tools = [fixture.tool]) {
 	const events: SpeculativeActionEvent<string>[] = [], patternStore = new PatternAwareStore(patternAwareSettings(settings.patternAware), undefined,
 		patternAwareActionSemantics(PI_ACTION_SEMANTICS, fixture.workspace));
-	let changed = deferred();
 	const host = createSpeculativeActionHost(sessionID, { cwd: fixture.workspace, patternStore,
 		complete: async () => { throw new Error("unexpected inference"); }, preflight: () => true, executionWorlds: [fixture.world],
-		getSettings: () => ({ enabled: true, drafterEnabled: false, tools: ["bash"], ...settings }),
+		getSettings: () => ({ enabled: true, drafterEnabled: false, ...settings }),
 		resolveInvocation: (tool, input) => resolvePiToolInvocation(tool, input, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath }),
-		...options, onEvent: event => { events.push(event); changed.resolve(); changed = deferred(); options.onEvent?.(event); },
+		...options, onEvent: event => { events.push(event); options.onEvent?.(event); },
 	});
 	return { host, events, patternStore,
-		waitFor: async (ready: () => boolean) => { while (!ready()) await changed.promise; },
+		waitFor: async (ready: () => boolean) => { await expect.poll(() => ready() || events.slice(-12), { timeout: 10_000 }).toBe(true); },
 		start: (turnID: string, signal?: AbortSignal, systemPrompt = "unchanged") => host.startTurn({ turnID, tools, actorModel: testModel("actor"), actorOptions: undefined, context: { systemPrompt, messages: [], tools } }, signal),
 		call: (turnID: string, command: string) => ({ turnID, id: turnID, tool: "bash", args: { command }, tools }),
 	};
@@ -164,6 +163,7 @@ export async function createLinuxProcessBenchmark(
 		inOwner,
 		world,
 		workspaceSandbox,
+		invocation: (args: Record<string, unknown>) => resolvePiToolInvocation("bash", args, { cwd: workspace, environment, shellPath })!,
 		tool: tool as AgentTool, // Preserve a portable type across nested schema packages.
 		prepareActorReplay: async (refresh?: boolean) => {
 			if (refresh) await backend.refreshNativeObservation();
@@ -199,9 +199,9 @@ export interface ReusableBashInput {
 	readonly signal?: AbortSignal;
 }
 
-export async function forkReusableBash(fixture: Pick<LinuxProcessBenchmark, "world" | "tool" | "workspace" | "environment" | "shellPath">, input: ReusableBashInput) {
+export async function forkReusableBash(fixture: Pick<LinuxProcessBenchmark, "world" | "tool" | "workspace" | "invocation">, input: ReusableBashInput) {
 	const args = { command: input.command };
-	const invocation = resolvePiToolInvocation("bash", args, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath });
+	const invocation = fixture.invocation(args);
 	if (!invocation) throw new Error("Pi Bash invocation could not be materialized");
 	const action = PI_ACTION_SEMANTICS.buildKey("bash", args, fixture.workspace, input.actionNamespace, { fingerprint: input.executionFingerprint, context: invocation });
 	if (!action) throw new Error("Pi Bash action could not be keyed");
