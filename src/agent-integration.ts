@@ -214,6 +214,7 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 		// A candidate runs its key's canonical input (a redundant `cd <cwd> &&` dropped): its invocation is resolved from that input.
 		const resolved = await options.resolveInvocation?.(tool, (() => { try { return actionSemantics.definition(tool)?.canonicalize(input, options.cwd)?.input ?? input; } catch { return input; } })(), definition);
 		const invocation = resolved && Object.freeze({ ...resolved,
+			...(resolved.observation ? { observation: Object.freeze({ ...resolved.observation, content: immutableSnapshot(resolved.observation.content) }) } : {}),
 			...(resolved.identity !== undefined ? { identity: immutableSnapshot(resolved.identity) } : {}),
 			...(resolved.process ? { process: immutableSnapshot(resolved.process) } : {}),
 		});

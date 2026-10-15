@@ -8,15 +8,17 @@ import type { PlanAction, PlanProposal } from "./plan-proposal.ts";
 import type { PatternAwareCandidate } from "./pattern-aware.ts";
 import type { SpeculativeActionSettings } from "./runtime.ts";
 import { stableValueHash } from "./stable-value-hash.ts";
+import { immutableSnapshot } from "./stable-json.ts";
 import { SourceRequestSuppressed } from "./source-request.ts";
 import { cause } from "./settlement.ts";
-import { toolObservationKey } from "./tool-settlement.ts";
+import { canonicalToolObservation, toolObservationContract, toolObservationKey, type ToolSettlement } from "./tool-settlement.ts";
+import type { ActionKey } from "./action-semantics.ts";
 import { SharedAbortScope } from "./runtime-lifecycle.ts";
 
 interface DrafterBatch {
 	readonly model: Model<Api>;
 	readonly context: Context;
-	readonly options: SimpleStreamOptions & { readonly toolChoice?: "auto" | "required" };
+	readonly options: SimpleStreamOptions;
 	readonly key: string;
 	readonly budgetPolicy: DrafterRequestSettings;
 }
@@ -24,11 +26,15 @@ interface DrafterBatch {
 interface DrafterPlanFeedback extends DrafterBatch {
 	readonly message: AssistantMessage;
 	readonly depth: number;
-	readonly calls: ReadonlyMap<string, AgentToolCall>;
-	readonly results: Map<string, ToolResultMessage>;
-	readonly forecasts: Map<string, string>;
-	readonly prepared: Set<string>;
+	readonly calls: ReadonlyMap<string, DrafterCall>;
 	claimed: boolean;
+}
+interface DrafterObservation { readonly message: ToolResultMessage; readonly key: string; }
+interface DrafterCall {
+	readonly call: AgentToolCall;
+	action?: ActionKey;
+	result?: DrafterObservation;
+	forecast?: string;
 }
 
 export function createDrafterPlanSource(input: {
@@ -63,13 +69,14 @@ export function createDrafterPlanSource(input: {
 		batch?.lifetime.abort();
 	};
 	const completeRequest = async (batch: DrafterBatch, context: Context, signal: AbortSignal,
-		report: ((tokens: number) => void) | undefined, tool?: string) => {
+		report: ((tokens: number) => void) | undefined, force?: true | string) => {
 		signal.throwIfAborted();
-		const { options } = batch;
+		const options = { ...batch.options, maxTokens: batch.budgetPolicy.drafterMaxTokens, deferred: false,
+			sessionId: batch.options.sessionId ?? input.sessionID, cacheRetention: batch.options.cacheRetention ?? "short" as const };
 		const inputTokens = drafterInputTokens({ ...context, tools: batch.context.tools }) + Math.max(0,
 			Math.ceil((JSON.stringify(context.tools ?? []).length - JSON.stringify(batch.context.tools ?? []).length) / 4));
 		if (!drafterContextFits(batch.model, context, options.maxTokens, inputTokens)) suppress("drafter_context_limit");
-		const forced = !options.reasoning && (tool || options.toolChoice === "required") ? { onPayload: forceToolChoice(options.onPayload, tool) } : {};
+		const forced = !options.reasoning && force ? { onPayload: forceToolChoice(options.onPayload, force === true ? undefined : force) } : {};
 		const message = await budget.run({ model: batch.model, context, inputTokens, options: { ...options, ...forced, signal },
 			policy: batch.budgetPolicy, complete: input.complete, onSkipped: suppress });
 		if (!message) return undefined;
@@ -80,20 +87,20 @@ export function createDrafterPlanSource(input: {
 	};
 	const completeDraft = async (batch: DrafterBatch, signal: AbortSignal, report: ((tokens: number) => void) | undefined,
 		prefix: string, depth = 0, dependsOn?: PlanAction["dependsOn"]) => {
-		const message = await completeRequest(batch, batch.context, signal, report);
+		const message = await completeRequest(batch, batch.context, signal, report, depth === 0 ? true : undefined);
 		if (!message) return undefined;
 		const calls = message.content.filter((item): item is AgentToolCall => item.type === "toolCall");
 		if (!calls.length || new Set(calls.map(call => call.id)).size !== calls.length) return undefined;
 		const feedback: DrafterPlanFeedback = { ...batch, depth, message,
-			calls: new Map(calls.map((call, member) => [`${prefix}:${member}`, call])), results: new Map(), forecasts: new Map(), prepared: new Set(), claimed: false };
+			calls: new Map(calls.map((call, member) => [`${prefix}:${member}`, { call }])), claimed: false };
 		feedbacks.set(feedback, feedback);
-		return { actions: [...feedback.calls].map(([id, call]): PlanAction => ({ id, type: "tool_call", tool: call.name,
+		return { actions: [...feedback.calls].map(([id, { call }]): PlanAction => ({ id, type: "tool_call", tool: call.name,
 			input: call.arguments, depth, feedback, dependsOn, ...probabilities(batch, call.name) })) };
 	};
 	const source: AgentPlanSource = {
 		id: "drafter",
 		onSettled: ({ actionID, feedback, settlement }) => {
-			const batch = feedbacks.get(feedback as object), tool = batch?.calls.get(actionID)?.name;
+			const batch = feedbacks.get(feedback as object), tool = batch?.calls.get(actionID)?.call.name;
 			if (!batch || !tool || settlement.observation !== "observed") return;
 			const key = calibrationKey(batch, tool);
 			let samples = calibration.get(key);
@@ -115,17 +122,16 @@ export function createDrafterPlanSource(input: {
 			const previous = feedbacks.get(feedback as object);
 			return previous !== undefined && previous.depth < maxDepth;
 		},
-		continueOn: ({ trigger, actionID, feedback, output }) => {
-			const previous = feedbacks.get(feedback as object), call = previous?.calls.get(actionID);
-			if (!previous || !call) return false;
-			if (output && previous.forecasts.has(actionID)) {
-				observations.compared++; observations.matched += Number(previous.forecasts.get(actionID) === toolObservationKey(output));
-				previous.forecasts.delete(actionID);
+		continueOn: ({ actionID, action, feedback, output }) => {
+			const previous = feedbacks.get(feedback as object), member = previous?.calls.get(actionID);
+			if (!previous || !member) return false;
+			if (output && member.forecast) {
+				observations.compared++; observations.matched += Number(member.forecast === toolObservationKey(output, action));
+				member.forecast = undefined;
 			}
-			if (output) previous.results.set(actionID, { role: "toolResult", toolCallId: call.id, toolName: call.name,
-				content: output.result.content, isError: output.isError, timestamp: Date.now() });
-			if (trigger === "prepared") previous.prepared.add(actionID);
-			return !previous.claimed && previous.prepared.size === previous.calls.size;
+			if (output) member.result = privateObservation(member.call, output, action);
+			member.action ??= action;
+			return !previous.claimed && [...previous.calls.values()].every(member => member.action);
 		},
 		proposalCount: (settings) => clampCandidateLimit(settings.candidateLimit ?? DEFAULTS.candidateLimit),
 		concurrentProposalPolicy: (settings) =>
@@ -166,17 +172,8 @@ export function createDrafterPlanSource(input: {
 			try {
 				const prepared = await batch.ready;
 				if (!prepared || signal.aborted) return undefined;
-				const draftOptions: DrafterBatch["options"] = {
-					...prepared.options,
-					temperature: drafterRequestTemperature(proposalIndex, proposalCount, drafter),
-					maxTokens: drafter.drafterMaxTokens,
-					// Thinking providers can reject forced tool calls; preserve their normal tool decision.
-					toolChoice: prepared.options.reasoning ? "auto" : "required",
-					deferred: false,
-					sessionId: prepared.options.sessionId ?? input.sessionID,
-					cacheRetention: prepared.options.cacheRetention ?? "short",
-				};
-				draft = await completeDraft({ ...prepared, options: draftOptions }, signal, reportDraftTokens, String(proposalIndex));
+				draft = await completeDraft({ ...prepared, options: { ...prepared.options, temperature: drafterRequestTemperature(proposalIndex, proposalCount, drafter) } },
+					signal, reportDraftTokens, String(proposalIndex));
 				return draft && { id: `drafter:${startInput.turnID}:${proposalIndex}`, source: "drafter", revision: 0, ...draft };
 			} finally { if (!draft) release(); }
 		},
@@ -186,30 +183,28 @@ export function createDrafterPlanSource(input: {
 			previous.claimed = true;
 			const policy = normalizeDrafterRequestSettings(settings.sourceConfig);
 			if (previous.depth >= policy.drafterMaxDepth) return undefined;
-			const missing = [...previous.calls].filter(([id]) => !previous.results.has(id));
+			const missing = [...previous.calls.values()].filter(member => !member.result);
 			if (missing.length) {
 				const context = observationContext(previous, missing);
 				const message = await completeRequest({ ...previous, budgetPolicy: policy }, context, signal, reportDraftTokens, OBSERVATION_TOOL);
-				const calls = message?.content.filter((item): item is AgentToolCall => item.type === "toolCall");
-				try {
-					if (calls?.length === 1 && calls[0]!.name === OBSERVATION_TOOL) {
-						const values = validateToolArguments(context.tools![0]!, calls[0]!).results as (Pick<ToolResultMessage, "content" | "isError"> & { callID: string })[];
-						const results = new Map(values.map(result => [result.callID, result]));
-						if (results.size === missing.length && stableValueHash(values) === stableValueHash(calls[0]!.arguments.results)) for (const [id, call] of missing) if (!previous.results.has(id)) {
-							const { content, isError } = results.get(call.id)!;
-							const result: ToolResultMessage = { role: "toolResult", toolCallId: call.id, toolName: call.name, content, isError, timestamp: Date.now() };
-							previous.results.set(id, result); previous.forecasts.set(id, observationKey(result)); observations.forecasted++;
-						}
+				const pending = missing.filter(member => !member.result);
+				if (pending.length) {
+					const calls = message?.content.filter((item): item is AgentToolCall => item.type === "toolCall");
+					if (calls?.length !== 1 || calls[0]!.name !== OBSERVATION_TOOL) return undefined;
+					const values = validateToolArguments(context.tools![0]!, calls[0]!).results as (Pick<ToolResultMessage, "content" | "isError"> & { callID: string; exitCode?: number })[];
+					if (new Set(values.map(value => value.callID)).size !== missing.length || stableValueHash(values) !== stableValueHash(calls[0]!.arguments.results)) return undefined;
+					for (const member of pending) {
+						const { content, isError, exitCode } = values.find(value => value.callID === member.call.id)!;
+						member.result = privateObservation(member.call, { result: { content, details: {} }, isError, exitCode }, member.action);
+						member.forecast = member.result.key; observations.forecasted++;
 					}
-				} catch { /* Malformed forecasts cannot replace real results that arrived during inference. */ }
+				}
 			}
-			if (previous.results.size !== previous.calls.size || signal.aborted) return undefined;
+			if (signal.aborted) return undefined;
 			// Freeze the exact private observations used for this prediction, even if real results arrive during inference.
-			const results = new Map(previous.results);
-			const context = continuationContext(previous.context, { ...previous, results });
-			const options = { ...previous.options, toolChoice: "auto" as const };
-			const draft = await completeDraft({ ...previous, context, options, budgetPolicy: policy }, signal, reportDraftTokens, `rollout:${revision}`, previous.depth + 1,
-				[...previous.calls.keys()].map(actionID => ({ actionID, condition: "prediction", observation: observationKey(results.get(actionID)!) })));
+			const context = continuationContext(previous.context, previous.message, [...previous.calls.values()].map(member => member.result!.message));
+			const draft = await completeDraft({ ...previous, context, budgetPolicy: policy }, signal, reportDraftTokens, `rollout:${revision}`, previous.depth + 1,
+				[...previous.calls].map(([actionID, member]) => ({ actionID, condition: "prediction", observation: member.result!.key })));
 			return draft && { proposalID, source: "drafter", revision, upsert: draft.actions };
 		},
 		// A peer's executed batch, such as a fork's early calls, rolls out as the Drafter's own does: its calls and results extend the Actor context.
@@ -217,15 +212,14 @@ export function createDrafterPlanSource(input: {
 			const prepared = await batches.get(agentBatchKey(startInput.sessionID, startInput.turnID))?.ready.catch(() => undefined);
 			const drafter = normalizeDrafterRequestSettings(settings.sourceConfig), ids = peers.map((_, index) => `peer:${index}`);
 			if (!prepared || signal.aborted) return undefined;
-			const calls = new Map(peers.map(({ candidate }, index) => [ids[index]!, { type: "toolCall" as const, id: ids[index]!, name: candidate.tool, arguments: { ...candidate.input } }]));
-			const context = continuationContext(prepared.context, { calls, message: { ...fauxAssistantMessage([...calls.values()], { stopReason: "toolUse" }),
+			const calls = peers.map(({ candidate }, index) => ({ type: "toolCall" as const, id: ids[index]!, name: candidate.tool, arguments: { ...candidate.input } }));
+			const context = continuationContext(prepared.context, { ...fauxAssistantMessage(calls, { stopReason: "toolUse" }),
 				api: prepared.model.api, provider: prepared.model.provider, model: prepared.model.id },
-				results: new Map(peers.map(({ candidate, output }, index) => [ids[index]!, { ...output.result, role: "toolResult" as const,
-					toolCallId: ids[index]!, toolName: candidate.tool, isError: output.isError, timestamp: Date.now() }])) });
-			const options = { ...prepared.options, temperature: drafterRequestTemperature(0, 1, drafter), maxTokens: drafter.drafterMaxTokens, toolChoice: "auto" as const };
+				peers.map(({ candidate, output }, index) => privateObservation(calls[index]!, output, candidate.key).message));
+			const options = { ...prepared.options, temperature: drafterRequestTemperature(0, 1, drafter) };
 			const id = `drafter:peer:${stableValueHash(peers.map(({ identity }) => identity.id))}`;
-			const draft = await completeDraft({ ...prepared, context, options, budgetPolicy: drafter }, signal, reportDraftTokens, id, 1, peers.map(({ identity, output }) =>
-				({ proposalID: identity.proposalID, actionID: identity.actionID, identity: identity.id, condition: "prediction" as const, observation: toolObservationKey(output) })));
+			const draft = await completeDraft({ ...prepared, context, options, budgetPolicy: drafter }, signal, reportDraftTokens, id, 1, peers.map(({ identity, candidate, output }) =>
+				({ proposalID: identity.proposalID, actionID: identity.actionID, identity: identity.id, condition: "prediction" as const, observation: toolObservationKey(output, candidate.key) ?? "" })));
 			return draft && { id, source: "drafter", revision: 0, actions: draft.actions };
 		},
 	};
@@ -252,25 +246,33 @@ const FORCED_TOOL_CHOICE: Readonly<Record<string, unknown>> = { "anthropic-messa
 	"openai-responses": "required", "azure-openai-responses": "required", "openai-codex-responses": "required" };
 
 const OBSERVATION_TOOL = "speculative_observations";
-function observationContext(batch: DrafterPlanFeedback, missing: readonly (readonly [string, AgentToolCall])[]): Context {
+const OBSERVATION_CONTENT = Type.Array(Type.Union([
+	Type.Object({ type: Type.Literal("text"), text: Type.String() }),
+	Type.Object({ type: Type.Literal("image"), data: Type.String(), mimeType: Type.String() }),
+]));
+function observationContext(batch: DrafterPlanFeedback, missing: readonly DrafterCall[]): Context {
+	const candidates = missing.map(({ call, action }) => {
+		const { version, content = OBSERVATION_CONTENT } = toolObservationContract(action);
+		return { call, tool: batch.context.tools?.find(tool => tool.name === call.name), observation: { version, content } };
+	});
 	return { ...batch.context, messages: [...batch.context.messages, { role: "user", timestamp: Date.now(),
-		content: `Predict the exact model-visible results of the following pending tool calls, using the conversation above. These are private forecasts, not real execution. Return one ${OBSERVATION_TOOL} call with each callID, content blocks and isError. Preserve errors and exact text, whitespace and image data.\n${JSON.stringify(missing.map(([, call]) => call))}` }],
+		content: `Predict the pending observations under their bound schemas.\n${JSON.stringify({ candidates })}` }],
 		tools: [{ name: OBSERVATION_TOOL, description: "Private predicted tool observations; never executable results.", parameters: Type.Object({
-			results: Type.Array(Type.Object({ callID: Type.Union(missing.map(([, call]) => Type.Literal(call.id))), isError: Type.Boolean(),
-				content: Type.Array(Type.Union([
-					Type.Object({ type: Type.Literal("text"), text: Type.String() }),
-					Type.Object({ type: Type.Literal("image"), data: Type.String(), mimeType: Type.String() }),
-				])),
-			}), { minItems: missing.length, maxItems: missing.length }),
-		}) }] };
+			results: Type.Array(Type.Union(candidates.map(({ call, observation }) => Type.Object({ callID: Type.Literal(call.id),
+				isError: Type.Boolean(), exitCode: Type.Optional(Type.Integer()), content: observation.content,
+			}, { additionalProperties: false }))), { minItems: missing.length, maxItems: missing.length }),
+		}, { additionalProperties: false }) }] };
 }
 
-const observationKey = (result: ToolResultMessage) => toolObservationKey({ result: { content: result.content, details: {} }, isError: result.isError });
+function privateObservation(call: AgentToolCall, output: ToolSettlement, action?: ActionKey): DrafterObservation {
+	const { key, content } = canonicalToolObservation(output, action);
+	return { key, message: { role: "toolResult", toolCallId: call.id, toolName: call.name, content: immutableSnapshot(content), isError: output.isError, timestamp: Date.now() } };
+}
 
 function suppress(reason: string, detail?: string): never { throw new SourceRequestSuppressed(cause("source", reason, detail)); }
 
-function continuationContext(context: Context, batch: Pick<DrafterPlanFeedback, "message" | "calls" | "results">): Context {
-	return { ...context, messages: [...context.messages, batch.message, ...[...batch.calls.keys()].map(id => batch.results.get(id)!)] };
+function continuationContext(context: Context, message: AssistantMessage, results: ToolResultMessage[]): Context {
+	return { ...context, messages: [...context.messages, message, ...results] };
 }
 
 /** Preserve the Actor-visible history whole; a shorter Drafter skips instead of compacting it. */

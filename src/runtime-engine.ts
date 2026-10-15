@@ -1111,7 +1111,7 @@ export function makeSpeculativeActionRuntime<
 			branch = evaluation.output;
 			inputs?.dispose(); // The returned branch owns its proof before cache admission can evict sources.
 			if (!branch.inputsOnly && adapter.observationKey) {
-				for (const node of session.plan.consumers(candidate.id)) session.plan.observe(node.identity, adapter.observationKey(branch.output));
+				for (const node of session.plan.consumers(candidate.id)) session.plan.observe(node.identity, adapter.observationKey(branch.output, action) ?? "");
 				settleBlockedPlanActions(session);
 			}
 			const rejected = !branch.inputsOnly && adapter.rejectCandidateOutput?.({ output: branch.output, candidate: publicCandidate(candidate) });
@@ -1640,7 +1640,7 @@ export function makeSpeculativeActionRuntime<
 		const settlement = actorAction.settlement;
 		if (!settlement) return;
 		if (output !== undefined && adapter.observationKey) {
-			const observation = adapter.observationKey(output);
+			const observation = adapter.observationKey(output, actorAction.actionKey) ?? "";
 			for (const prediction of settlement.matchedPredictions) state.session.plan.observe(prediction, observation);
 			dispatchReady(state.session);
 		}
@@ -1774,7 +1774,7 @@ export function makeSpeculativeActionRuntime<
 		if (node.action.type === "operation") return;
 		const current = session.plan.get(node.proposalID, node.action.id);
 		if (current?.identity.id !== node.identity.id) return;
-		if (output !== undefined && adapter.observationKey) session.plan.observe(node.identity, adapter.observationKey(output));
+		if (output !== undefined && adapter.observationKey) session.plan.observe(node.identity, adapter.observationKey(output, adoptedAction?.key ?? current.actionKey) ?? "");
 		const context = session.actionContexts.get(node.identity.id);
 		const source = context ? sourcesByID.get(context.identity.source) : undefined;
 		if (context && source?.continuationBatch && trigger === "execution_succeeded") {
@@ -1787,7 +1787,8 @@ export function makeSpeculativeActionRuntime<
 		try {
 			const filter = source.continueOn;
 			if (trigger === "prepared" && !filter) return;
-			if (filter && !(typeof filter === "function" ? filter({ actionID: node.action.id, feedback: context.draft.feedback, output, trigger }) : filter.includes(trigger))) return;
+			if (filter && !(typeof filter === "function" ? filter({ actionID: node.action.id, action: adoptedAction?.key ?? current.actionKey!,
+				feedback: context.draft.feedback, output, trigger }) : filter.includes(trigger))) return;
 		} catch { return; } // Producer feedback cannot alter completed execution.
 		const parentDecisionSequence =
 			current.predictionState.status === "matching" ? (current.predictionState.actorAction.decisionSequence ?? current.expectedDecisionSeq) : current.expectedDecisionSeq;

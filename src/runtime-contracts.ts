@@ -170,6 +170,7 @@ export interface SpeculativePlanSource<
 	/** Collect/filter execution feedback before a continuation consumes request capacity. */
 	readonly continueOn?: readonly ("prepared" | "execution_succeeded" | "actor_adopted")[] | ((input: {
 		readonly actionID: string;
+		readonly action: ActionKey;
 		readonly feedback: unknown;
 		readonly output: Output | undefined;
 		readonly trigger: "prepared" | "execution_succeeded" | "actor_adopted";
@@ -223,7 +224,7 @@ export interface SpeculativeActionRuntimeAdapter<
 	readonly resources?: import("./system-resources.ts").ExecutionResourceMonitor;
 	readonly sources?: readonly SpeculativePlanSource<SessionID, Output, StartInput, ConsumeInput, StateData>[];
 	/** Canonical model-visible observation, used only to verify private prediction ancestry. */
-	readonly observationKey?: (output: Output) => string;
+	readonly observationKey?: (output: Output, action?: ActionKey) => string | undefined;
 	readonly settings: () => MaybePromise<SpeculativeActionSettings>;
 	readonly definitions: (input: StartInput) => readonly DrafterToolDefinition[];
 	readonly stateData: (input: StartInput) => MaybePromise<StateData>;

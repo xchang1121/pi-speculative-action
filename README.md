@@ -23,7 +23,9 @@ ThinkThread 使用 [Profile 安装脚本](./scripts/install-thinkthread-profile.
 
 [模型 Drafter](./src/drafter-plan-source.ts)、[PatternAware](./src/pattern-plan-source.ts) 和 [Actor 探测](./src/actor-fork-plan-source.ts) 生成统一 `PlanProposal`。[Runtime](./src/runtime-engine.ts) 按 Actor 决策进度、后端给出的资源依赖及实时资源安排准备和执行，各会话共用预算，Actor 优先。PatternAware 的模式、预设、按工具契约校准和原生工具名输出用于提出候选。`prepareObservedOperations` 独立控制[已观察操作的提前准备](./src/execution-preparation.ts)，默认开启；旧 `recent-command` 预设并入这一执行选项，不再受 PatternAware 开关控制。内部工作保留父工具调用和绑定权限，与预测共用物理资源账本。
 
-Drafter 参照 [TomasuLLM](https://arxiv.org/html/2609.38201v2) 将动作预测与观测预测分开：具体调用通过准入后，在真实执行期间预测尚未完成的输出，再以私有的完整工具批次继续预测。独立后继可先执行；读写相同资源的后继等待生产者，并沿可用的私有检查点执行。真实结果若先到则直接使用。预测观测按模型可见的 `content` 和 `isError` 精确核对，失配撤销依赖它的预测；Actor 历史始终只接收真实结果。这里不实现论文的服务端 KV cache / committed restart 协议。
+Drafter 参照 [TomasuLLM](https://arxiv.org/html/2609.38201v2) 将动作预测与观测预测分开：具体调用通过准入后，在真实执行期间预测尚未完成的输出，再以私有的完整工具批次继续预测。独立后继可先执行；读写相同资源的后继等待生产者，并沿可用的私有检查点执行。真实结果若先到则直接使用，失配撤销依赖它的预测；Actor 历史始终只接收真实结果。
+
+观测请求携带实际工具定义、调用参数和绑定的观测格式，通过严格校验后才进入私有续推。默认精确比较 `content`、`isError` 和 `exitCode`。工具可在 `ToolInvocation.observation` 显式提供 `version`、内容 schema 和纯函数 `canonicalize`；规则改变须更新版本，版本或 schema 改变会使原观测依赖失效。规范化仅用于预测上下文与比较，不改写 Actor 输出或放宽执行证明。每批使用一次观测请求；未提供论文的多候选评分与独立 OBS 模型，也不把缓存状态摘要当作当前环境证据。
 
 预测血缘与复用证明分开：预测失配不使已经独立校验的真实输入或子计算失效。正式调用可采用完整结果、契约允许的投影，或在封存输入上按当前参数重算；流式预览也走同一验新流程。执行器、权限、作用域、实际依赖及记录须相容，效果只提交一次；部分提交或效果状态不明会终止本次调用。命中的在途工作等待完成，支持调用方取消。
 
