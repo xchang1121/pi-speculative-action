@@ -541,6 +541,9 @@ export function makeSpeculativeActionRuntime<
 		return candidate;
 	};
 
+	const candidateProducer = (session: Session, candidate: Candidate) => ({ source: candidate.owner.draft.source ?? candidate.origin,
+		mode: candidate.owner.draft.mode, id: TimelineInterval.producerID(session, candidate.id) });
+
 	/** Every producer joins or registers work before yielding. Validation never grants a second launch. */
 	const admitCandidate = async (
 		session: Session,
@@ -1117,7 +1120,7 @@ export function makeSpeculativeActionRuntime<
 				onOperationJoinable: available => { candidate.operationJoinable = available; },
 				acceptOperationScope: session.acceptOperationScope,
 				...(parent ? { parentWorld: candidateBranch(parent)! } : {}),
-			}), branch => branch.computationDependencies ?? [], candidate.origin === "prediction" ? { source: draft.source ?? "cache", mode: draft.mode } : undefined);
+			}), branch => branch.computationDependencies ?? [], candidateProducer(session, candidate));
 			branch = evaluation.output;
 			inputs?.dispose(); // The returned branch owns its proof before cache admission can evict sources.
 			if (!branch.inputsOnly && adapter.observationKey) {
@@ -1598,6 +1601,7 @@ export function makeSpeculativeActionRuntime<
 				estimatedBytes: estimateValueBytes(branch.output) + inputIndexBytes(branch),
 				projectionCoverage: action && !branch.inputsOnly ? captureCoverage(action, branch.output, projectionRules) : [],
 			});
+			TimelineInterval.producedBy(toolExecution, candidateProducer(session, candidate));
 			candidate.work.start(toolExecution.startedAt);
 			if (!candidate.work.succeed(branch, toolExecution, durationMs)) return;
 			const rejected = !branch.inputsOnly && adapter.rejectCandidateOutput?.({ output: branch.output, candidate: publicCandidate(candidate) });
@@ -1659,13 +1663,10 @@ export function makeSpeculativeActionRuntime<
 			{ computation: settlement.provider.toolExecution, reused: !!selection && (selection.match.kind !== "inputs" || !!selection.projectionReused) },
 			...(selection?.projection ? [{ computation: selection.projection, reused: selection.projectionReused }] : []),
 		];
-		const reused = TimelineInterval.reusedBy(consumed);
+		const reused = TimelineInterval.reusedProducers(consumed);
 		for (const node of [...state.session.plan.unsettled(), ...matches.map(({ node }) => node)]) {
 			const context = state.session.actionContexts.get(node.identity.id);
-			const candidate = "candidateID" in node.execution && (selection?.candidate.id === node.execution.candidateID ? selection.candidate
-				: candidateStore.get(state.sessionID, node.execution.candidateID));
-			const execution = candidate ? candidate.work.execution : undefined;
-			if (context && execution?.status === "succeeded" && reused(execution.toolExecution)) context.served = true;
+			if (context && "candidateID" in node.execution && reused.has(TimelineInterval.producerID(state.session, node.execution.candidateID))) context.served = true;
 		}
 		const computation = state.session.timeline?.recordCall(consumed, actorAction.issuedAt, performance.now());
 		const key = actorAction.actionKey;

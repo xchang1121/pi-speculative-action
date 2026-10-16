@@ -16,7 +16,7 @@ export interface SerializedTimelineNode {
 	/** Explicit calculation segments; absence preserves historical continuous computation. */
 	readonly spans?: readonly { readonly startedAt: number; readonly completedAt: number }[];
 	readonly priorMs?: number;
-	readonly producer?: { readonly source: string; readonly mode?: string };
+	readonly producer?: { readonly source: string; readonly mode?: string; readonly id?: string };
 	/** Concurrency aliases only: these never select an ancestor or its other work. */
 	readonly groups?: readonly string[];
 	readonly incomplete?: true;
@@ -58,8 +58,10 @@ export function normalizeTimelineComputation(value: unknown): SerializedTimeline
 				calculation = Object.freeze(parts);
 			}
 			if (raw.producer !== undefined) {
-				if (!record(raw.producer) || !identity(raw.producer.source) || raw.producer.mode !== undefined && !identity(raw.producer.mode)) return undefined;
-				producer = Object.freeze({ source: raw.producer.source, ...(raw.producer.mode !== undefined ? { mode: raw.producer.mode as string } : {}) });
+				if (!record(raw.producer) || !identity(raw.producer.source) ||
+					raw.producer.mode !== undefined && !identity(raw.producer.mode) || raw.producer.id !== undefined && !identity(raw.producer.id)) return undefined;
+				producer = Object.freeze({ source: raw.producer.source, ...(raw.producer.mode !== undefined ? { mode: raw.producer.mode as string } : {}),
+					...(raw.producer.id !== undefined ? { id: raw.producer.id as string } : {}) });
 			}
 			let aliases: readonly string[] | undefined;
 			if (raw.groups !== undefined) {

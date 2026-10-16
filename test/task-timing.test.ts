@@ -2,6 +2,14 @@ import { describe, expect, it, vi } from "vitest";
 import { TaskTimeline, TimelineInterval, toolSpeedup, normalizeTimelineComputation } from "../src/task-timing.ts";
 import { restoreNativeDependency, serializeNativeDependency } from "../src/linux-process-sync.ts";
 
+const restore = (computation: TimelineInterval): TimelineInterval => {
+	const evidence = TimelineInterval.serialize(computation);
+	expect(evidence).toBeDefined();
+	const restored = TimelineInterval.restore(JSON.parse(JSON.stringify(evidence)));
+	expect(restored).toBeDefined();
+	return restored!;
+};
+
 describe("consumed calculation and time hidden before Actor issue", () => {
 	it("records execution boundaries and diagnoses the remaining control wait", async () => {
 		let now = 0;
@@ -13,15 +21,16 @@ describe("consumed calculation and time hidden before Actor issue", () => {
 				await TimelineInterval.outside(async () => {
 					now = 1000;
 					for (const unknown of [TimelineInterval.unknownReuse("old"), TimelineInterval.from({ startedAt: 200, completedAt: 240 })]) expect(TimelineInterval.serialize(unknown)?.nodes[0]?.producer).toBeUndefined();
-					for (const input of [borrowed, TimelineInterval.restore(TimelineInterval.serialize(borrowed))!, TimelineInterval.attempted(borrowed)]) TimelineInterval.use(input);
+					for (const input of [borrowed, restore(borrowed), TimelineInterval.attempted(borrowed)]) TimelineInterval.use(input);
 					const calculation = await TimelineInterval.measure(() => { now = 1010; });
-					expect(new TaskTimeline(0).recordTool(TimelineInterval.restore(TimelineInterval.serialize(calculation.computation))!, 100_000, true).hiddenByMode)
+					expect(new TaskTimeline(0).recordTool(restore(calculation.computation), 100_000, true).hiddenByMode)
 						.toEqual([{ ...producer, hiddenComputeMs: 10 }]);
+					expect([...TimelineInterval.reusedProducers([{ computation: restore(calculation.computation), reused: true }])]).toEqual(["live"]);
 					TimelineInterval.own(calculation.computation);
 					now = 1015;
 				});
 				now = 1025;
-			}, undefined, producer);
+			}, undefined, { ...producer, id: "live" });
 			const graph = TimelineInterval.serialize(evaluation.computation)!;
 			expect(graph.nodes.flatMap(node => node.inputs ?? []).some(input => input.overhead)).toBe(false);
 			expect(new TaskTimeline(0).recordTool(evaluation.computation, 100_000)).toMatchObject({ toolComputeMs: 70, hiddenComputeMs: 40 });
@@ -39,7 +48,7 @@ describe("consumed calculation and time hidden before Actor issue", () => {
 		const roots = [{ computation: new TimelineInterval(40, 140, [{ computation: producer, reused: true },
 			{ computation: new TimelineInterval(40, 140), overhead: true }]) }];
 		expect(timeline.recordCall(roots, 40, 140)).toMatchObject({ toolComputeMs: end, hiddenComputeMs: Math.min(40, end), adoptionWaitMs: 140 - Math.max(40, end) });
-		const restored = TimelineInterval.restore(TimelineInterval.serialize(producer))!;
+		const restored = restore(producer);
 		expect(timeline.recordCall([{ computation: restored, reused: true }], 50, 150).adoptionWaitMs).toBe(150 - Math.max(50, end));
 		expect(timeline.measure(150).adoptionWaitMs).toBe(150 - Math.max(40, end));
 		expect(timeline.recordCall([{ computation: TimelineInterval.unknownReuse("old"), reused: true }], 150, 160).adoptionWaitMs).toBeUndefined();
@@ -91,13 +100,7 @@ describe("consumed calculation and time hidden before Actor issue", () => {
 });
 
 describe("persisted computation evidence", () => {
-	const restore = (computation: TimelineInterval): TimelineInterval => {
-		const evidence = TimelineInterval.serialize(computation);
-		expect(evidence).toBeDefined();
-		const restored = TimelineInterval.restore(JSON.parse(JSON.stringify(evidence)));
-		expect(restored).toBeDefined();
-		return restored!;
-	};
+
 	const reused = (computations: readonly TimelineInterval[]) => new TaskTimeline(0).recordCall(computations.map(computation => ({ computation, reused: true })), 100_000);
 
 	it("roundtrips original input graphs, explicit exclusions and physical producer attribution", () => {
@@ -106,20 +109,16 @@ describe("persisted computation evidence", () => {
 			{ computation: child, owned: true, shared: [child] }, { computation: borrowed, reused: true },
 			{ computation: new TimelineInterval(100, 110), overhead: true },
 		]);
-		for (const [input, used, producer, others] of [
-			[child, true, parent, [borrowed]], [borrowed, true, borrowed, [parent, child]], [child, false, undefined, [parent, child]],
-		] as const) {
+		TimelineInterval.producedBy(parent, { source: "pattern", mode: "whole", id: "parent" });
+		TimelineInterval.producedBy(borrowed, { source: "drafter", mode: "input", id: "borrowed" });
+		for (const [input, used, producer] of [[child, true, "parent"], [borrowed, true, "borrowed"], [child, false, undefined]] as const) {
 			const consumer = new TimelineInterval(300, 310, [{ computation: input, reused: used }]);
 			for (const computation of [consumer, restore(consumer)]) {
-				const consumed = TimelineInterval.reusedBy([{ computation }]);
-				if (producer) expect(consumed(producer)).toBe(true);
-				for (const other of others) expect(consumed(other)).toBe(false);
-				expect(TimelineInterval.reusedBy([{ computation, overhead: true }])(parent)).toBe(false);
-				expect(TimelineInterval.reusedBy([{ computation: TimelineInterval.attempted(computation) }])(parent)).toBe(false);
+				expect([...TimelineInterval.reusedProducers([{ computation }])]).toEqual(producer ? [producer] : []);
+				expect(TimelineInterval.reusedProducers([{ computation, overhead: true }]).size).toBe(0);
+				expect(TimelineInterval.reusedProducers([{ computation: TimelineInterval.attempted(computation) }]).size).toBe(0);
 			}
 		}
-		TimelineInterval.producedBy(parent, { source: "pattern", mode: "whole" });
-		TimelineInterval.producedBy(borrowed, { source: "drafter", mode: "input" });
 		const expected = { toolComputeMs: 100, hiddenComputeMs: 100, hiddenByMode: [
 			{ source: "pattern", mode: "whole", hiddenComputeMs: 60 }, { source: "drafter", mode: "input", hiddenComputeMs: 40 },
 		] };
@@ -154,18 +153,19 @@ describe("persisted computation evidence", () => {
 	it("rejects malformed or cyclic graphs without issuing a successful receipt", async () => {
 		const graph = TimelineInterval.serialize(new TimelineInterval(10, 50))!;
 		const root = graph.nodes[0]!;
-		const invalid = [null, {}, { ...graph, version: 999 }, { ...graph, root: "absent" },
-			{ ...graph, nodes: [{ ...root, spans: [{ startedAt: 0, completedAt: 20 }] }] },
-			{ ...graph, nodes: [{ ...root, spans: [{ startedAt: 10, completedAt: 51 }] }] },
-			{ ...graph, nodes: [{ ...root, clock: undefined }] },
-			{ ...graph, nodes: [root, root] }, { ...graph, nodes: [{ ...root, completedAt: -1 }] },
-			{ ...graph, nodes: [{ ...root, startedAt: NaN }] },
-			{ ...graph, nodes: [{ ...root, timeOrigin: NaN }] },
-			{ ...graph, nodes: [{ ...root, inputs: [{ id: "child" }] }, { ...root, id: "child", timeOrigin: root.timeOrigin! + 1 }] },
-			{ ...graph, nodes: [{ ...root, inputs: [{ id: root.id }] }] },
-			{ ...graph, nodes: [{ ...root, inputs: [{ id: "absent" }] }] },
-			{ ...graph, nodes: [{ ...root, inputs: [{ id: root.id, reused: "yes" }] }] },
-		];
+		const invalid = [null, {}, { ...graph, version: 999 }, { ...graph, root: "absent" }, ...[
+			[{ ...root, spans: [{ startedAt: 0, completedAt: 20 }] }],
+			[{ ...root, spans: [{ startedAt: 10, completedAt: 51 }] }],
+			[{ ...root, clock: undefined }],
+			[root, root], [{ ...root, completedAt: -1 }],
+			[{ ...root, startedAt: NaN }],
+			[{ ...root, timeOrigin: NaN }],
+			[{ ...root, inputs: [{ id: "child" }] }, { ...root, id: "child", timeOrigin: root.timeOrigin! + 1 }],
+			[{ ...root, inputs: [{ id: root.id }] }],
+			[{ ...root, inputs: [{ id: "absent" }] }],
+			[{ ...root, inputs: [{ id: root.id, reused: "yes" }] }],
+			...["", 1, "invalid\0id"].map(id => [{ ...root, producer: { source: "drafter", id } }]),
+		].map(nodes => ({ ...graph, nodes }))];
 		const collected = await TimelineInterval.collect(() => {
 			for (const value of invalid) {
 				expect(normalizeTimelineComputation(value)).toBeUndefined();

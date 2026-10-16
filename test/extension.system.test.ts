@@ -2,7 +2,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { execFileSync, spawn } from "node:child_process";
-import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxProvider, fauxToolCall, fauxText } from "@earendil-works/pi-ai";
 import { AgentSession, convertToLlm, createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, type ExtensionAPI, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { afterEach, expect, test, vi } from "vitest";
 import { createSpeculativeActionExtension } from "../src/extension.ts";
@@ -62,9 +62,9 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 				let output = ""; for (const stream of [child.stdout, child.stderr]) stream.on("data", bytes => { output += bytes; });
 				child.once("error", reject); child.once("close", code => code ? reject(new Error(`callback exited ${code}`)) : resolve(output));
 			}) : text;
-			onUpdate?.({ content: [{ type: "text", text: "partial:" + callID }], details: { callID } });
+			onUpdate?.({ content: [fauxText("partial:" + callID)], details: { callID } });
 			if (callID === "b" || callID === "d") updated[callID].resolve();
-			return { content: [{ type: "text", text: "own:" + name + ":" + output }], details: { callID } };
+			return { content: [fauxText("own:" + name + ":" + output)], details: { callID } };
 		},
 	});
 	const events: SpeculativeActionEvent<string>[] = [];
@@ -78,7 +78,7 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 		pi.on("tool_call", event => { if (!("text" in event.input)) return; hooks.push("before:" + event.toolCallId);
 			if (event.toolCallId === "blocked") return { block: true, reason: "blocked-on-purpose" }; });
 		pi.on("tool_result", event => { if (!event.input.text) return; hooks.push("after:" + event.toolCallId);
-			return { content: [{ type: "text", text: "hook:" + (event.content[0] as { text: string }).text }] }; });
+			return { content: [fauxText("hook:" + (event.content[0] as { text: string }).text)] }; });
 	}, extension] });
 	await resourceLoader.reload();
 	const modelRuntime = await ModelRuntime.create({ authPath: path.join(agentDir, "auth.json"), modelsPath: null, refreshOnCreate: false });
@@ -157,7 +157,7 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 			expect(results.at(-1)).toMatchObject({ isError: true }); expect(JSON.stringify(results.at(-1))).toContain("native handoff failed");
 			expect(await readText(cwd, "marker")).toBe("once"); expect(calls).toEqual(["seed", "check"]); return;
 		}
-		expect(results.at(-1)?.content, JSON.stringify(session.messages)).toEqual([{ type: "text", text: "hook:own:format_rows:remaining:" + execFileSync("./slow", ["notes.txt"], { cwd, encoding: "utf8" }) }]);
+		expect(results.at(-1)?.content, JSON.stringify(session.messages)).toEqual([fauxText("hook:own:format_rows:remaining:" + execFileSync("./slow", ["notes.txt"], { cwd, encoding: "utf8" }))]);
 		expect(results.every(result => !result.isError)).toBe(true); expect(await readText(cwd, "marker")).toBe("once");
 		expect(calls).toEqual(["seed", "check"]); expect(prepared).toEqual([initial, remaining]);
 		if (inputs) expect(summarizeSpeculativeTrace(events).inputReuseHits).toBe(1);
@@ -181,15 +181,15 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 	const results = session.messages.filter(message => message.role === "toolResult");
 	expect(results).toHaveLength(4);
 	expect(results.every(message => !message.isError)).toBe(true);
-	expect(results.at(-1)?.content).toEqual([{ type: "text", text: "final\n" }]);
+	expect(results.at(-1)?.content).toEqual([fauxText("final\n")]);
 	const registry = session.agent.state.tools, read = registry.find(tool => tool.name === "read")!, originalExecute = read.execute;
 	for (const copy of [true, false]) {
 		const tool = copy ? { ...read } : read;
-		tool.execute = async function (id) { expect(this).toBe(tool); expect(currentExecutionScope()?.callID).toBe(id); return { content: [{ type: "text", text: "replaced" }], details: {} }; };
+		tool.execute = async function (id) { expect(this).toBe(tool); expect(currentExecutionScope()?.callID).toBe(id); return { content: [fauxText("replaced")], details: {} }; };
 		session.agent.state.tools = registry.map(current => current === read ? tool : current);
 		actor.setResponses([response("read", { path: "notes.txt" }), fauxAssistantMessage("done")]);
 		await session.prompt("Execute the current read implementation.");
-		expect(session.messages.filter(message => message.role === "toolResult").at(-1)?.content).toEqual([{ type: "text", text: "replaced" }]);
+		expect(session.messages.filter(message => message.role === "toolResult").at(-1)?.content).toEqual([fauxText("replaced")]);
 	}
 	read.execute = originalExecute; session.agent.state.tools = registry;
 	const originalTools = session.agent.state.tools, originalNext = session.agent.prepareNextTurnWithContext;
@@ -207,9 +207,9 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 	expect(hooks.slice(0, 2)).toEqual(["before:a", "before:b"]); expect(hooks.slice(2, 4).sort()).toEqual(["after:a", "after:b"]);
 	expect(hooks.slice(4, 7)).toEqual(["before:c", "before:d", "before:blocked"]); expect(hooks.slice(7).sort()).toEqual(["after:c", "after:d"]);
 	expect(session.messages.filter(message => message.role === "toolResult").slice(-5).map(message => [message.toolCallId, message.content, message.isError])).toEqual([
-		["a", [{ type: "text", text: "hook:own:format_rows:first:prepared" }], false], ["b", [{ type: "text", text: "hook:own:format_rows:second:prepared" }], false],
-		["c", [{ type: "text", text: "hook:own:read:third:prepared" }], false], ["d", [{ type: "text", text: "hook:own:late_rows:fourth:prepared" }], false],
-		["blocked", [{ type: "text", text: "blocked-on-purpose" }], true],
+		["a", [fauxText("hook:own:format_rows:first:prepared")], false], ["b", [fauxText("hook:own:format_rows:second:prepared")], false],
+		["c", [fauxText("hook:own:read:third:prepared")], false], ["d", [fauxText("hook:own:late_rows:fourth:prepared")], false],
+		["blocked", [fauxText("blocked-on-purpose")], true],
 	]);
 	expect(session.agent.prepareNextTurnWithContext).toBe(originalNext);
 	expect(events.filter(event => event.type === "actor_action")).toHaveLength(enabled ? 10 : 0);
@@ -218,7 +218,7 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 	const base: AgentTool = { ...read, execute: async function (id, _args, signal) {
 		expect(this).toBe(base); scopes.push(currentExecutionScope()?.sessionID);
 		if (id === "cancel") { entered.resolve(); await new Promise<void>(resolve => signal!.addEventListener("abort", () => resolve(), { once: true })); }
-		return { content: [{ type: "text", text: "base override" }], details: {} };
+		return { content: [fauxText("base override")], details: {} };
 	} };
 	const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager, noExtensions: true, extensionFactories: [extension] });
 	await loader.reload(); modelRuntime.registerNativeProvider(otherActor.provider);
@@ -235,7 +235,7 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 	actor.setResponses([response("format_rows", { text: "reloaded" }), fauxAssistantMessage("done")]);
 	otherActor.setResponses([response("read", { path: "notes.txt" }), fauxAssistantMessage("done")]);
 	await Promise.all([session.prompt("Execute after reloading extensions."), other.prompt("Read through the supplied base implementation.")]);
-	expect(other.messages.filter(message => message.role === "toolResult").at(-1)?.content).toEqual([{ type: "text", text: "base override" }]);
+	expect(other.messages.filter(message => message.role === "toolResult").at(-1)?.content).toEqual([fauxText("base override")]);
 	expect(scopes).toEqual([other.sessionId, other.sessionId]);
 	expect(calls).toHaveLength(5);
 	const failure = new Error("process launch failed"), coordinator = new ProcessExecutionCoordinator({ execute: async () => ({ exitCode: 0 }) });

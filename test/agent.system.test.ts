@@ -1,7 +1,7 @@
 import { access, link, mkdir, readFile, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import path from "node:path";
-import { fauxAssistantMessage, fauxToolCall, Type } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxToolCall, Type, fauxText, fauxThinking } from "@earendil-works/pi-ai";
 import { createEditTool, createFindTool, createGrepTool, createLsTool, createReadTool, createWriteTool } from "@earendil-works/pi-coding-agent";
 import { afterEach, expect, test } from "vitest";
 import { WorkspaceSandboxService } from "../src/workspace-sandbox.ts";
@@ -80,7 +80,7 @@ test.for(["actor", "preview", "dynamic", "dynamic-preview", "hints", "hints-prev
 			resources: pure || index && mode.startsWith("dynamic") ? [] : index && mode.startsWith("hints") ? ["selector"] : key.resources } : undefined; } }));
 	const actionSemantics = new ActionSemanticsRegistry(unknown ? definitions.slice(1) : definitions), settings = { drafterEnabled: false, resourceCacheMaxBytes: 32 * 1024,
 		...(live ? { scheduling: { heavyCpu: 1 } } : {}) }; // The pending Actor and its preview each own one slot.
-	const render = (tool: string, count: unknown, actual = true) => { if (actual) renders++; return { content: [{ type: "text" as const, text: `${tool}:${count}` }], details: { tool, ...(tool === names[0] ? parentOutput : {}) } }; };
+	const render = (tool: string, count: unknown, actual = true) => { if (actual) renders++; return { content: [fauxText(`${tool}:${count}`)], details: { tool, ...(tool === names[0] ? parentOutput : {}) } }; };
 	const count = async (read: () => Promise<unknown>, actual = true) => { const text = pure ? "one\ntwo\n" : await read(); if (actual) builds++; return metadata ? JSON.stringify(text) : String(text).trim().split("\n").length; };
 	const tools = names.map(name => ({ ...createReadTool(cwd), name, execute: async () => render(name, await count(() => readFile(file))) }));
 	const invocations = new Map(names.map((tool, index) => {
@@ -223,7 +223,7 @@ test.for(["stale", "all-stale", "binding", "failure", "cancel", "composed", "rev
 			const value = await calculate(inputs, async count => count); compositions++; return { value, bytes: 8, dispose: () => { compositionDisposals++; } };
 		}, consume, file, request.signal) : await calculate(view, consume);
 		if (index < 2) await parentGates[index]!.wait();
-		return { result: { content: [{ type: "text" as const, text: `${tool}:${count}` }], details: {} }, isError: false };
+		return { result: { content: [fauxText(`${tool}:${count}`)], details: {} }, isError: false };
 	}, cwd) }));
 	const capture = invocations[0]!.captureInputs!;
 	invocations[0]!.captureInputs = (...args) => { const result = capture(...args); revoke = result.dispose; return result; };
@@ -516,9 +516,9 @@ test.for(["independent", "unchanged", "batch", "batch-known", "mismatch-text", "
 	if (learning) await writeFile(path.join(cwd, "unused.txt"), "unused\n");
 	if (wrong) await writeFile(path.join(cwd, "discarded.txt"), "discarded\n");
 	const child = { tool: names[1]!, args: { path: dependent ? "root-0.txt" : "child.txt" } };
-	const expected = await Promise.all(roots.map(root => mutation ? { content: [{ type: "text" as const, text: "Successfully wrote 9 bytes to root-0.txt" }] }
+	const expected = await Promise.all(roots.map(root => mutation ? { content: [fauxText("Successfully wrote 9 bytes to root-0.txt")] }
 		: reader.execute("oracle", root.args)));
-	if (normalized) expect(canonicalize(expected[0]!.content)).toEqual([{ type: "text", text: '{"failedTests":[],"artifact":"abc"}' }]);
+	if (normalized) expect(canonicalize(expected[0]!.content)).toEqual([fauxText('{"failedTests":[],"artifact":"abc"}')]);
 	const worlds = [createResourceSnapshotExecutionWorld(semantics, { maxBytes: () => 1024 * 1024 }), sandbox.createExecutionWorld({ driver: "git" })];
 	let requests = 0, drafts = 0, rootContext: import("@earendil-works/pi-ai").Context | undefined, observationSignal: AbortSignal | undefined;
 	const privateContexts: import("@earendil-works/pi-ai").Context[] = [], executed: string[] = [];
@@ -547,7 +547,7 @@ test.for(["independent", "unchanged", "batch", "batch-known", "mismatch-text", "
 			if (context.tools?.[0]?.name === "speculative_observations") {
 				observationSignal = options!.signal;
 				const payload = JSON.parse(String(context.messages.at(-1)!.content).split("\n").slice(1).join("\n"));
-				expect(payload.draft).toMatchObject([{ type: "thinking", thinking: "Inspect the input." }, ...roots.map((root, index) =>
+				expect(payload.draft).toMatchObject([fauxThinking("Inspect the input."), ...roots.map((root, index) =>
 					({ type: "toolCall", id: `root-${index}`, name: root.tool, arguments: root.args }))]);
 				const partial = actualBatch && payload.observations.length > 0;
 				expect(payload.observations).toEqual(known || partial ? [expect.objectContaining({ role: "toolResult", toolCallId: `root-${Number(partial)}`, content: expected[Number(partial)]!.content })] : []);
@@ -565,12 +565,12 @@ test.for(["independent", "unchanged", "batch", "batch-known", "mismatch-text", "
 				const response = fauxAssistantMessage(fauxToolCall("speculative_observations", { results: predictedRoots.map(root => { const index = roots.indexOf(root); return {
 					callID: mode === "malformed-observation" ? "unknown" : `root-${index}`, isError: mode === "malformed-type" || mode === "actual-before-malformed" ? "false" : mode === "mismatch-error",
 					...(mode === "malformed-extra" ? { score: 1_000_000 } : {}), ...(mode === "mismatch-exit" ? { exitCode: 7 } : {}),
-					content: normalized ? [{ type: "text", text: JSON.stringify({ failedTests: mode === "canonical-mismatch" ? ["a.test.ts:3"] : [], artifact: "abc", duration: 999, pid: 456, tempPath: "/tmp/predicted" }) }]
-						: textMismatch || actualFirst ? [{ type: "text", text: "incorrect forecast" }] : expected[index]!.content,
+					content: normalized ? [fauxText(JSON.stringify({ failedTests: mode === "canonical-mismatch" ? ["a.test.ts:3"] : [], artifact: "abc", duration: 999, pid: 456, tempPath: "/tmp/predicted" }))]
+						: textMismatch || actualFirst ? [fauxText("incorrect forecast")] : expected[index]!.content,
 				}; }) }), { stopReason: "toolUse" });
 				return { ...response, usage: { ...response.usage, input: 11, output: 7, totalTokens: 18 } };
 			}
-			if (++drafts === 1) { rootContext = context; return fauxAssistantMessage([{ type: "thinking", thinking: "Inspect the input." },
+			if (++drafts === 1) { rootContext = context; return fauxAssistantMessage([fauxThinking("Inspect the input."),
 				...roots.map((root, index) => fauxToolCall(root.tool, root.args, { id: `root-${index}` })), ...(["unknown-batch", "filtered-batch"].includes(mode) ? [fauxToolCall(mode === "unknown-batch" ? "unavailable" : child.tool, child.args, { id: "unknown" })] : [])], { stopReason: "toolUse" }); }
 			privateContexts.push(context); const discarded = wrong && privateContexts.length === 1;
 			if (inflight && discarded) { observationSignal = options!.signal; firstResult.resolve(); await forecast.promise; }
@@ -604,11 +604,11 @@ test.for(["independent", "unchanged", "batch", "batch-known", "mismatch-text", "
 	else {
 		expect(privateContexts).toHaveLength(inflight ? 2 : 1);
 		const messages = privateContexts[0]!.messages;
-		expect(messages[0]).toMatchObject({ role: "assistant", content: [{ type: "thinking", thinking: "Inspect the input." }, ...roots.map((root, index) =>
+		expect(messages[0]).toMatchObject({ role: "assistant", content: [fauxThinking("Inspect the input."), ...roots.map((root, index) =>
 			({ type: "toolCall", id: `root-${index}`, name: root.tool, arguments: root.args }))] });
 		expect(messages.slice(1)).toEqual(expected.map((result, index) => expect.objectContaining({ role: "toolResult", toolCallId: `root-${index}`,
-			content: normalized ? [{ type: "text", text: JSON.stringify({ failedTests: mode === "canonical-mismatch" ? ["a.test.ts:3"] : [], artifact: "abc" }) }]
-				: textMismatch ? [{ type: "text", text: "incorrect forecast" }] : result.content, isError: mode === "mismatch-error" })));
+			content: normalized ? [fauxText(JSON.stringify({ failedTests: mode === "canonical-mismatch" ? ["a.test.ts:3"] : [], artifact: "abc" }))]
+				: textMismatch ? [fauxText("incorrect forecast")] : result.content, isError: mode === "mismatch-error" })));
 	}
 	release.resolve();
 	if (mode !== "denied-root" && mode !== "abort-observation") await f.ready(count + Number((!stopped || recoverable) && mode !== "denied-child") + Number(wrong && !inflight && !repairBudget));
@@ -692,8 +692,8 @@ test.for(["completed", "inflight", "forecast", "binding", "parent-binding", "rev
 				if (ids.length === 1 && ids[0] === "b" && !payload.observations.length) expect(JSON.stringify(context.messages)).not.toContain("a-real");
 				if (mode === "forecast" && ids.includes("a")) { forecasts.push(options!.signal!); await delayed.promise; }
 				return fauxAssistantMessage(fauxToolCall(tool, { results: payload.candidates.map(({ call }: { call: { id: string; arguments: { path: string } } }) => ({
-					callID: call.id, isError: false, content: [{ type: "text", text: call.id === "a" ? unchanged ? "a-real\n" : "a-wrong\n"
-						: call.id === "b" ? both ? "b-wrong\n" : "b-real\n" : `${call.arguments.path.replace(/\.txt$/, "")}\n` }],
+					callID: call.id, isError: false, content: [fauxText(call.id === "a" ? unchanged ? "a-real\n" : "a-wrong\n"
+						: call.id === "b" ? both ? "b-wrong\n" : "b-real\n" : `${call.arguments.path.replace(/\.txt$/, "")}\n`)],
 				})) }));
 			}
 			if (!context.messages.length) return fauxAssistantMessage(roots.map(root => fauxToolCall(names[0]!, { path: root.path }, { id: root.id })));
@@ -780,7 +780,7 @@ test.for(["dependent", "independent"])("preserves sibling resource effects outsi
 		complete: async (_model, context) => {
 			const tool = context.tools?.[0]?.name;
 			if (tool === "speculative_continuations") return fauxAssistantMessage(fauxToolCall(tool, { scopes: [["selector"]] }));
-			if (tool === "speculative_observations") return fauxAssistantMessage(fauxToolCall(tool, { results: [{ callID: "selector", isError: false, content: [{ type: "text", text: "select\n" }] }] }));
+			if (tool === "speculative_observations") return fauxAssistantMessage(fauxToolCall(tool, { results: [{ callID: "selector", isError: false, content: [fauxText("select\n")] }] }));
 			if (!context.messages.length) return fauxAssistantMessage([fauxToolCall("read", { path: "selector.txt" }, { id: "selector" }),
 				fauxToolCall("write", { path: "written.txt", content: "after\n" }, { id: "writer" })]);
 			drafted++; return fauxAssistantMessage(fauxToolCall("read", child));
@@ -817,8 +817,7 @@ test.each(["ordered", "independent", "dependent"])("adopts only the proven effec
 		complete: async (_model, context) => {
 			const observing = context.tools?.[0]?.name === "speculative_observations", index = observing ? drafted - 1 : drafted++, step = steps[index]!;
 			return fauxAssistantMessage(fauxToolCall(observing ? "speculative_observations" : step.tool,
-				observing ? { results: [{ callID: `draft-${index}`, isError: false, content: [{ type: "text",
-					text: step.tool === "write" ? `Successfully wrote ${step.input.content!.length} bytes to ${step.input.path}` : `Successfully replaced 1 block(s) in ${step.input.path}.` }] }] } : step.input,
+				observing ? { results: [{ callID: `draft-${index}`, isError: false, content: [fauxText(step.tool === "write" ? `Successfully wrote ${step.input.content!.length} bytes to ${step.input.path}` : `Successfully replaced 1 block(s) in ${step.input.path}.`)] }] } : step.input,
 				{ id: `draft-${index}` }), { stopReason: "toolUse" });
 		},
 		getSettings: () => ({ enabled: true, drafterEnabled: predict, candidateLimit: 1, maxConcurrentActions: 2,
@@ -865,7 +864,7 @@ test.for(["unrelated", "changed", "descendant", "mutation", "mutation-stat", "mu
 		complete: async (_model, context) => {
 			requests++;
 			if (context.tools?.[0]?.name === "speculative_observations") return fauxAssistantMessage(fauxToolCall("speculative_observations", {
-				results: [{ callID: "draft-0", isError: false, content: [{ type: "text", text: mutation ? "Successfully wrote 9 bytes to a.txt" : "original\n" }] }],
+				results: [{ callID: "draft-0", isError: false, content: [fauxText(mutation ? "Successfully wrote 9 bytes to a.txt" : "original\n")] }],
 			}), { stopReason: "toolUse" });
 			const step = steps[drafted]!;
 			return fauxAssistantMessage(fauxToolCall(step.tool, step.input, { id: `draft-${drafted++}` }), { stopReason: "toolUse" });

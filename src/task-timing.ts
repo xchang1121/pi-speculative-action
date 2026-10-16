@@ -34,10 +34,7 @@ const timeOrigins = new WeakMap<TimelineInterval, number>();
 const identityNamespace = randomUUID();
 let nextIdentity = 0;
 
-export interface ComputationProducer {
-	readonly source: string;
-	readonly mode?: string;
-}
+export type ComputationProducer = NonNullable<SerializedTimelineNode["producer"]>;
 export interface ModeComputationTiming { readonly source: string; readonly mode: string; readonly hiddenComputeMs: number; }
 
 /** Immutable calculation evidence; carries no Actor, candidate or output ownership. */
@@ -49,7 +46,7 @@ export class TimelineInterval {
 		producer: ComputationProducer | null = collecting.getStore()?.producer ?? null) {
 		this.startedAt = metric(startedAt);
 		this.completedAt = Math.max(this.startedAt, metric(completedAt));
-		if (producer) producers.set(this, Object.freeze({ source: producer.source, ...(producer.mode !== undefined ? { mode: producer.mode } : {}) }));
+		if (producer) producers.set(this, Object.freeze({ ...producer }));
 		if (spans) calculationSpans.set(this, Object.freeze(spans.map(TimelineInterval.from)));
 		if (inputs.length) dependencies.set(this, Object.freeze(inputs.map(input => Object.freeze({
 			computation: TimelineInterval.from(input.computation),
@@ -66,21 +63,12 @@ export class TimelineInterval {
 	}
 	static get producer(): ComputationProducer | undefined { return collecting.getStore()?.producer; }
 
-	/** Successful receipts identify the producers of consumed work, independently of selected tool names. */
-	static reusedBy(roots: readonly TimelineDependency[]): (producer: TimelineInterval) => boolean {
-		const consumed = new Set([...consumedComputations(roots).selected].filter(([, value]) => value.flags & 2).map(([id]) => id));
-		return producer => {
-			if (!consumed.size) return false;
-			const visited = new Set<TimelineInterval>(), pending = [producer];
-			while (pending.length) {
-				const current = pending.pop()!;
-				if (visited.has(current)) continue;
-				visited.add(current);
-				if (consumed.has(computationIdentity(current))) return true;
-				for (const input of dependencies.get(current) ?? []) if (input.owned && !input.overhead) pending.push(input.computation);
-			}
-			return false;
-		};
+	static producerID(owner: object, key: string): string { return `${computationIdentity(owner)}:${key}`; }
+
+	/** Successful consumption identifies physical producers before or after their enclosing tools finish. */
+	static reusedProducers(roots: readonly TimelineDependency[]): ReadonlySet<string> {
+		return new Set([...consumedComputations(roots).selected.values()].flatMap(({ flags, producer }) =>
+			flags & 2 && producer?.id ? [producer.id] : []));
 	}
 
 	/** Record provenance before publication; failed evaluations never transfer borrowed work to the caller. */
@@ -165,8 +153,7 @@ export class TimelineInterval {
 		while (pending.length) {
 			const { computation: current, producer } = pending.pop()!;
 			if (producers.has(current)) continue;
-			const owner = computationProducer(current) ?? Object.freeze({ source: producer.source,
-				...(producer.mode !== undefined ? { mode: producer.mode } : {}) });
+			const owner = computationProducer(current) ?? Object.freeze({ ...producer });
 			producers.set(current, owner);
 			for (const input of dependencies.get(current) ?? []) if (input.owned) pending.push({ computation: input.computation, producer: owner });
 		}
@@ -482,9 +469,9 @@ class ComputationGroups {
 function producerKey(producer: ComputationProducer): string { return JSON.stringify([producer.source, producer.mode]); }
 
 function mergeProducers(previous: ComputationProducer | null | undefined, current: ComputationProducer | undefined): ComputationProducer | null | undefined {
-	if (previous === null || previous && current && (previous.source !== current.source ||
-		previous.mode !== undefined && current.mode !== undefined && previous.mode !== current.mode)) return null;
-	return previous?.mode !== undefined ? previous : current?.mode !== undefined ? current : previous ?? current;
+	if (previous === null || previous && current && (["source", "mode", "id"] as const).some(key =>
+		previous[key] !== undefined && current[key] !== undefined && previous[key] !== current[key])) return null;
+	return previous && current ? { ...previous, ...current, mode: previous.mode ?? current.mode, id: previous.id ?? current.id } : previous ?? current;
 }
 
 /** Ownership passes production provenance to children; borrowed dependencies have their own owner chain. */

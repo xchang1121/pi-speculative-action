@@ -1,3 +1,4 @@
+import { fauxText } from "@earendil-works/pi-ai";
 import { readText } from "./filesystem.ts";
 import { disposable, onExit, gated, deferred, nextTurn } from "./async.ts";
 import { once } from "node:events";
@@ -138,13 +139,18 @@ if(dup3(input,100,O_CLOEXEC)<0)return 67; close(input); syscall(SYS_execveat,100
 	const prepared = await prepareLinuxProcessReuse(fixture), publications = await recordProcessPublications(fixture);
 	const command = (owner: string) => `${launched ? `./launch ${mode}:${owner} ${fd ? relative : invoked} ${argv0}` : invoked} ${invoked}`;
 	const expected = `${mode === "failed" ? "failure=2\n" : ""}${argv0}|${invoked}${mode === "script" ? "" : "|" + (mode === "alias" ? "alias" : mode === "unlinked" ? "transient" : "worker")}\n`;
-	await using branch = disposable(await forkReusableBash(fixture, { command: `printf own:; ${command("own")}`, label: mode, actionNamespace: "first-child", ...prepared }));
+	const producer = { source: "drafter", id: TimelineInterval.producerID(fixture, mode) };
+	const evaluated = await TimelineInterval.collect(() => forkReusableBash(fixture, { command: `printf own:; ${command("own")}`, label: mode, actionNamespace: "first-child", ...prepared }), producer);
+	await using branch = disposable(evaluated.output);
 	expect(textOutput(branch.output.result)).toBe(`own:${expected}`);
 	const published = (await publications()).map(certificate => certificate.prototype.executablePath);
 	expect(published, JSON.stringify({ published, operations: branch.operations, metrics: fixture.backend.metrics() })).toContain(mode === "script" ? await filesystem.realpath("/bin/sh") : mode === "unlinked" ? path.join(fixture.workspace, "transient") : executable);
 	const { executor } = await fixture.prepareActorReplay(true), before = fixture.backend.actorMetrics().hits;
 	const scope = { sessionID: "benchmark", turnID: "benchmark" };
-	expect((await executeProcess(fixture, executor, `printf actor:; ${command("actor")}`, { scope })).output).toBe(`actor:${expected}`);
+	let consumed: readonly TimelineDependency[] = [];
+	const actor = await fixture.backend.observeBindings(scope, () => executeProcess(fixture, executor, `printf actor:; ${command("actor")}`, { scope }), (_, computations) => { consumed = computations; });
+	expect(actor.output).toBe(`actor:${expected}`);
+	expect([...TimelineInterval.reusedProducers(consumed)]).toEqual([producer.id]);
 	expect(fixture.backend.actorMetrics().hits, JSON.stringify({ metrics: fixture.backend.actorMetrics(), certificates: (await publications()).map(({ prototype, dependencyCertificate }) => ({ prototype, taints: dependencyCertificate.taints })) })).toBe(before + 1);
 	if (mode !== "script" && !fd) {
 		const other = mode === "absolute" ? relative : executable;
@@ -208,12 +214,12 @@ nativeTest.for(["journal", "whole-released", "whole-consumed", "custom", "dispos
 		} else {
 			await interval.abort();
 			if (mode.startsWith("whole-")) {
-				const entered = deferred(), gate = deferred(), value = { own: () => "local result" }, released = mode === "whole-released";
-				const apply = vi.fn(async () => { entered.resolve(); await gate.promise; if (released && apply.mock.calls.length === 1) throw effectCommitFailure(new Error("unchanged"), "recoverable"); return value; });
-				const result = session.ownership.commit(apply); void result.catch(() => undefined); await entered.promise;
+				const gate = gated(), value = { own: () => "local result" }, released = mode === "whole-released";
+				const apply = vi.fn(async () => { await gate.wait(); if (released && apply.mock.calls.length === 1) throw effectCommitFailure(new Error("unchanged"), "recoverable"); return value; });
+				const result = session.ownership.commit(apply); void result.catch(() => undefined); await gate.entered;
 				expect(await fixture.inOwner(state => [!!state.sessions[0].ownership.pendingWhole, !!state.sessions[0].ownership.claimChild()])).toEqual([true, false]);
 				await expect(session.ownership.commit(async () => value)).rejects.toMatchObject({ disposition: "recoverable" });
-				gate.resolve();
+				gate.release();
 				if (released) { await expect(result).rejects.toMatchObject({ disposition: "recoverable" }); expect(await session.ownership.commit(apply)).toBe(value); }
 				else expect(await result).toBe(value);
 				expect(await session.ownership.commit(apply)).toBe(value); expect(apply).toHaveBeenCalledTimes(released ? 2 : 1);
@@ -559,7 +565,7 @@ nativeTest.for([false, true])("prepares a failed command after its reported inpu
 			await expect(result).rejects.toThrow("got changed");
 			expect(existsSync(path.join(fixture.workspace, "generated.txt"))).toBe(false);
 		} else {
-			expect((await result).content).toEqual([{ type: "text", text: "verified\n" }]);
+			expect((await result).content).toEqual([fauxText("verified\n")]);
 			expect(await readText(fixture.workspace, "generated.txt")).toBe("fixed\n");
 		}
 		await host.finishTurn("retry");
@@ -892,13 +898,13 @@ int main(int argc, char **argv) {
 		const prepared = patternProcessHost(fixture, scope.sessionID, { candidateLimit: 4, maxConcurrentActions: 4,
 			patternAware: patternAwareSettings({ enabled: true, multiStepEnabled: false, beamWidth: 4 }) }), { events, start, call } = prepared;
 		await using host = disposable(prepared.host);
-		const runSync = async (command: string) => ({ details: {}, content: [{ type: "text" as const, text: childProcess.execFileSync(fixture.shellPath, ["-c", command],
-			{ cwd: fixture.workspace, env: fixture.environment, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }) }] });
+		const runSync = async (command: string) => ({ details: {}, content: [fauxText(childProcess.execFileSync(fixture.shellPath, ["-c", command],
+			{ cwd: fixture.workspace, env: fixture.environment, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }))] });
 		const execute = (turnID: string, command: string, signal = AbortSignal.timeout(10_000)) => host!.execute(call(turnID, command), signal,
 				() => synchronous && turnID === "prepared" ? runSync(command) : fixture.coordinator.runWith(route.executor, () => fixture.tool.execute(turnID, { command }, signal)));
 		for (const turnID of ["common-1", "common-2"]) { await start(turnID); await execute(turnID, "printf common"); await host.finishTurn(turnID); }
 		await start("seed"); const seed = await execute("seed", "printf seed; launch seed"); await host.finishTurn("seed");
-		expect(seed.content).toMatchObject([{ type: "text", text: expect.stringMatching(/^seedABC:\d+\n$/) }]);
+		expect(seed.content).toMatchObject([fauxText(expect.stringMatching(/^seedABC:\d+\n$/))]);
 		await fixture.inOwner(state => state.spawn.mock.resetCalls());
 		await start("prepared");
 		const diagnostic = () => JSON.stringify({ actor: fixture.backend.actorMetrics(), producer: fixture.backend.metrics(), errors: errors.mock.calls.map(call => call[1]),
@@ -1004,23 +1010,23 @@ int main(void) { char b[1024]; return syscall(SYS_getdents64, 4, b, sizeof(b)) <
 			const options = { cwd: fixture.workspace, env: fixture.environment, uid: process.getuid!(), gid: process.getgid!() };
 			const output = mode.includes("sync") ? childProcess.execFileSync(fixture.shellPath, ["-c", command], options).toString() : await new Promise<string>((resolve, reject) =>
 				childProcess.execFile(fixture.shellPath, ["-c", command], options, (error, stdout) => error ? reject(error) : resolve(stdout)));
-			if (mode.endsWith("failed")) throw error; return { content: [{ type: "text" as const, text: output }], details: parentOutput };
+			if (mode.endsWith("failed")) throw error; return { content: [fauxText(output)], details: parentOutput };
 		});
 		await start("seed");
 		const result = host.execute({ turnID: "seed", id: "seed", tool: name, args: { command }, tools }, undefined, bash);
 		if (mode.endsWith("failed")) await expect(result).rejects.toBe(error);
 		else if (mode.endsWith("exit")) await expect(result).rejects.toThrow(/17/);
-		else expect(await result).toEqual({ content: [{ type: "text", text: "one\ntwo\none\ntwo\n" }], details: parentOutput });
+		else expect(await result).toEqual({ content: [fauxText("one\ntwo\none\ntwo\n")], details: parentOutput });
 		await host.finishTurn("seed"); expect(bash).toHaveBeenCalledOnce();
 		expect(observing.mock.calls[0]![0]).toEqual({ sessionID: "native-inputs", turnID: "seed", callID: "seed" });
 		if (unkeyed) expect(events.find(event => event.type === "actor_action")).toMatchObject({ settlement: { provider: { kind: "actor", cause: { code: "action_not_keyable" } } } });
 		await start("queries");
 		if (mode.includes("sync") || mode === "keyed-mixed") {
 			const command = "exec 3<input.txt 4<entries; worker remaining", before = fixture.backend.actorMetrics().hits;
-			const consumer = vi.fn(async () => ({ content: [{ type: "text" as const, text: "remaining:" + childProcess.execFileSync(fixture.shellPath, ["-c", command],
-				{ cwd: fixture.workspace, env: fixture.environment, encoding: "utf8" }) }], details: {} }));
+			const consumer = vi.fn(async () => ({ content: [fauxText("remaining:" + childProcess.execFileSync(fixture.shellPath, ["-c", command],
+				{ cwd: fixture.workspace, env: fixture.environment, encoding: "utf8" }))], details: {} }));
 			expect(await host.execute({ turnID: "queries", id: "consumer", tool: "consume_rows", args: { command }, tools }, undefined, consumer))
-				.toMatchObject({ content: [{ type: "text", text: "remaining:one\ntwo\n" }] });
+				.toMatchObject({ content: [fauxText("remaining:one\ntwo\n")] });
 			expect(consumer).toHaveBeenCalledOnce(); expect(fixture.backend.actorMetrics().hits).toBe(before);
 			expect(events.filter(event => event.type === "actor_action").at(-1)?.computation?.hiddenComputeMs).toBeGreaterThan(0);
 		}
@@ -1091,7 +1097,7 @@ int main(void) {
 		expect(await fixture.inOwner(state => state.backend.actorMetrics().lastError)).toContain("actor_running_input_changed:");
 		await fixture.inOwner(state => state.fs.writeFile(state.workspace.sandboxRoot + "/release", ""));
 		if (await fixture.inOwner(state => !!state.workspace.liveBase)) await expect(pending).rejects.toThrow("workspace changed since the sandbox started: input.txt");
-		else expect((await pending).output.result.content).toEqual([{ type: "text", text: "predecessor" }]);
+		else expect((await pending).output.result.content).toEqual([fauxText("predecessor")]);
 	});
 
 nativeTest.for(["completed", "running", "native", "native-merged", "native-closed-input", "native-descriptors", "native-descriptors-merged", "native-null", "native-null-stdin", "native-status", "native-directory", "native-directory-entries", "native-directory-prepared-stale", "native-directory-opath", "native-directory-opath-prepared-stale", "native-pipe", "native-pipe-prepared-stale", "native-pipe-live", "native-pipe-live-prepared-stale", "native-pipe-live-mixed", "native-pipe-live-transfer", "native-pipe-producer", "native-pipe-producer-queued", "native-pipe-producer-short", "native-pipe-producer-splice", "native-socket", "native-socket-running", "native-socket-duplex", "native-socket-lifetime", "native-socket-io", "native-socket-messages", "native-socket-export", "native-socket-counter-export", "native-socket-prequeued", "native-socket-segmented", "native-socket-prefixed", "native-socket-orphan", "native-eventfd", "native-eventfd-semaphore", "native-socket-concurrent", "native-socket-half-closed", "native-socket-prepared-stale", "native-shared-table", "native-unshare", "native-prepared-stale", "native-prepared-restored"] as const)("reexecutes an owned child binding across turns without replaying its parent or stale input (%s)", { timeout: 20_000 }, async (mode, { skip, benchmark }) => {
@@ -1339,7 +1345,7 @@ int main(int argc, char **argv) {
 			});
 			await start(coldScope.turnID);
 			const output = await host.execute(call(coldScope.turnID, command), undefined, () => fixture.coordinator.runWith(route.executor, () => fixture.tool.execute(coldScope.turnID, { command })));
-			expect(output.content).toEqual([{ type: "text", text: "parent\nafter\n" }]);
+			expect(output.content).toEqual([fauxText("parent\nafter\n")]);
 			await host.finishTurn(coldScope.turnID);
 			expect(await fixture.inOwner((state, scope) => state.registry.bindings(scope).some((binding: ProcessExecutionBinding) =>
 				state.registry.resolveBinding(binding, scope)?.trackingOnly), coldScope)).toBe(true);
@@ -1354,7 +1360,7 @@ int main(int argc, char **argv) {
 		await expect.poll(() => patternStore.recent(scope.sessionID).map(event => event.input.command)).toEqual(["printf common", "printf common", ...(discovery ? [command] : [])]);
 		const seedFallback = vi.fn(() => fixture.coordinator.runWith(route.executor, () => fixture.tool.execute("seed", { command })));
 		const suffix = mode === "native-merged" ? "stderr\n" : "";
-		expect((await host.execute(call("seed", command), undefined, seedFallback)).content).toEqual([{ type: "text", text: `parent\nafter\n${suffix}` }]);
+		expect((await host.execute(call("seed", command), undefined, seedFallback)).content).toEqual([fauxText(`parent\nafter\n${suffix}`)]);
 		await host.finishTurn("seed");
 		// The previewed whole Bash command is adopted outright once its evidence validates; a native run still binds its child.
 		expect(seedFallback).toHaveBeenCalledTimes(native ? 1 : 0);
@@ -1430,7 +1436,7 @@ int main(int argc, char **argv) {
 		}
 		const actor = vi.fn(() => fixture.coordinator.runWith(route.executor, () => fixture.tool.execute("prepared", { command: changedParent })));
 		const stalePreparation = mode.endsWith("prepared-stale");
-		expect((await host.execute(call("prepared", changedParent), undefined, actor)).content).toEqual([{ type: "text", text: `automatic-parent\n${stalePreparation ? "changed after preparation\n" : "newest\n"}${suffix}` }]);
+		expect((await host.execute(call("prepared", changedParent), undefined, actor)).content).toEqual([fauxText(`automatic-parent\n${stalePreparation ? "changed after preparation\n" : "newest\n"}${suffix}`)]);
 		if (running) expect(await publication!.joined(), JSON.stringify({ actor: fixture.backend.actorMetrics(), producer: fixture.backend.metrics(), errors: errors.mock.calls.map(call => call[1]), operations: events.filter(event => event.type === "operation_prediction") })).toBe(true);
 		expect(actor).toHaveBeenCalledOnce();
 		if (segmented || orphan) expect(fixture.backend.actorMetrics().hits).toBe(1);
@@ -2743,7 +2749,7 @@ int main(void) { int fds[2], status; char queue[8]; if (pipe(fds) || fds[0] != 3
 		await fixture.inOwner(state => { state.released = true; state.gate.resolve(); });
 		const branch = await running, captured = await fixture.inOwner(state => ({ traceRoot: state.traceRoot, executions: state.spawn.mock.calls.filter(({ arguments: [, args] }: any) => JSON.stringify(args).includes(state.traceRoot)).length, context: state.processContext, certificate: state.published[0] }));
 		await expect(stat(captured.traceRoot)).rejects.toMatchObject({ code: "ENOENT" });
-		expect(branch.output.result.content).toEqual([{ type: "text", text: "capture-once" }]);
+		expect(branch.output.result.content).toEqual([fauxText("capture-once")]);
 		expect({ executions: captured.executions, published: fixture.backend.metrics().published }).toEqual({ executions: 1, published: 0 });
 		const lastError = branch.executionMetrics.reuse?.lastError ?? "";
 		expect(lastError).toContain(error);
@@ -2825,7 +2831,7 @@ int main(int argc, char **argv) {
 			actionNamespace: "driver-semantics-test", executionFingerprint });
 		expect(branch.output.isError, JSON.stringify(branch.output)).toBe(false);
 		if (mode !== "rename") {
-			expect(branch.output.result.content).toEqual([{ type: "text", text: instanceInput ? expect.stringMatching(/^\d+\n$/) : "U" }]);
+			expect(branch.output.result.content).toEqual([fauxText(instanceInput ? expect.stringMatching(/^\d+\n$/) : "U")]);
 			const route = await fixture.prepareActorReplay(true);
 			const { output } = await executeProcess(fixture, route.executor, ": changed-parent; probe", { scope: { sessionID: "benchmark", turnID: "later" } });
 			expect(output, JSON.stringify(backend.actorMetrics())).toEqual(instanceInput ? expect.stringMatching(/^\d+\n$/) : "L");
