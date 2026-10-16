@@ -13,6 +13,8 @@ type SystemEvent<Type extends SpeculativeActionEvent<string>["type"]> = Extract<
 
 export const idleResources = (cpuCount: number) => ({ initial: { cpuCount, idleCpuCount: cpuCount }, sample: () => new Promise<never>(() => {}) });
 
+export const resourceWorld = (semantics = PI_ACTION_SEMANTICS, maxBytes = () => 1024 * 1024) => createResourceSnapshotExecutionWorld(semantics, { maxBytes });
+
 /** Exercise the same tool outlet as the extension; only the external model response is scripted. */
 export function systemHost(cwd: string, tools: AgentTool[], options: Partial<CreateSpeculativeActionHostOptions> = {},
 	settings: SpeculativeAgentSettingsInput = {}, sessionID = "system") {
@@ -29,7 +31,7 @@ export function systemHost(cwd: string, tools: AgentTool[], options: Partial<Cre
 		getSettings: () => ({ enabled: true, drafterEnabled: false, candidateLimit: 1, maxConcurrentActions: 2,
 			predictionTimeoutMs: 10_000, patternAware: { enabled: false }, prepareObservedOperations: false, ...settings }),
 		resolveInvocation: (tool, input) => resolvePiToolInvocation(tool, input, { cwd, environment: {} }),
-		executionWorlds: [createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { maxBytes: () => 8 * 1024 * 1024 })],
+		executionWorlds: [resourceWorld(PI_ACTION_SEMANTICS, () => 8 * 1024 * 1024)],
 		...options,
 		onEvent: event => { events.push(event); return options.onEvent?.(event); },
 		onCandidateMaterialized: candidate => { materialized.push(candidate); return options.onCandidateMaterialized?.(candidate); },

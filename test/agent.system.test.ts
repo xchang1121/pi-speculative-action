@@ -5,13 +5,14 @@ import { fauxAssistantMessage, fauxToolCall, Type, fauxText, fauxThinking, type 
 import { createEditTool, createFindTool, createGrepTool, createLsTool, createReadTool, createWriteTool } from "@earendil-works/pi-coding-agent";
 import { afterEach, expect, test } from "vitest";
 import { WorkspaceSandboxService } from "../src/workspace-sandbox.ts";
-import { bindResourceOperation, createResourceSnapshotExecutionWorld } from "../src/agent-execution-world.ts";
+import { bindResourceOperation } from "../src/agent-execution-world.ts";
 import { ResourceVersionManager } from "../src/resource-version.ts";
+import { TimelineInterval } from "../src/task-timing.ts";
 import { createClosedSearchProfile, resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { ActionSemanticsRegistry, PI_ACTION_SEMANTICS, type ActionSemanticsDefinition } from "../src/action-semantics.ts";
 import { PatternAwareStore, patternAwareSettings, patternAwareActionSemantics } from "../src/pattern-aware.ts";
 import { readText, temporaryDirectories } from "./filesystem.ts";
-import { expectHiddenCompute, idleResources, systemHost } from "./agent-system-fixture.ts";
+import { expectHiddenCompute, idleResources, resourceWorld, systemHost } from "./agent-system-fixture.ts";
 import { disposable, onExit, deferred, gated, nextTurn } from "./async.ts";
 import { commitBenchmarkFixture, compileBenchmarkHelper, createLinuxProcessBenchmark, textOutput } from "./linux-process-fixture.ts";
 import { EXACT_TOOL_OBSERVATION, type ToolObservationContract } from "../src/tool-settlement.ts";
@@ -19,7 +20,8 @@ import { ActorForkPlanSource } from "../src/actor-fork-plan-source.ts";
 import type { AgentPlanSource } from "../src/agent-runtime-types.ts";
 
 const writeText = (cwd: string, file: string, text: string) => writeFile(path.join(cwd, file), text);
-const toolMessage = (content: Parameters<typeof fauxAssistantMessage>[0]) => fauxAssistantMessage(content, { stopReason: "toolUse" });
+const track = <T>(pending: Promise<unknown>[], task: Promise<T>) => { pending.push(task); void task.catch(() => {}); return task; };
+const toolUse = (...args: Parameters<typeof fauxToolCall>) => fauxAssistantMessage(fauxToolCall(...args), { stopReason: "toolUse" });
 const toolReply = (...args: Parameters<typeof fauxToolCall>) => fauxAssistantMessage(fauxToolCall(...args));
 
 const directories = temporaryDirectories("pi-agent-system-");
@@ -32,7 +34,7 @@ function readDefinition(tool: string): ActionSemanticsDefinition {
 function readScenario(cwd: string, names: readonly string[], definitions = names.map(readDefinition)) {
 	const reader = createReadTool(cwd), actionSemantics = new ActionSemanticsRegistry(definitions);
 	return { reader, definitions, actionSemantics, tools: names.map(name => ({ ...reader, name })) as Parameters<typeof systemHost>[1],
-		world: createResourceSnapshotExecutionWorld(actionSemantics, { maxBytes: () => 1024 * 1024 }),
+		world: resourceWorld(actionSemantics),
 		resolveInvocation: (tool: string, input: unknown) => ({ ...resolvePiToolInvocation(tool === "write" ? tool : "read", input, { cwd, environment: {} })!, semantics: definitions.find(definition => definition.tool === tool) }) };
 }
 
@@ -48,7 +50,8 @@ const retainedScenarios = ["seed-dynamic", "seed-calculation", "mixed-producer",
 
 const withPreview = (modes: readonly string[]) => modes.flatMap(mode => [mode, `${mode}-preview`]);
 
-test.for([...["seed-dynamic", "seed-calculation", "input-read", "input-read-stale", "unkeyed-dynamic"].flatMap(mode => ["raw", "unindexed"].map(access => `${access}-${mode}`)),
+test.for([...["prediction", "preview"].flatMap(source => ["dynamic", "calculation", "input-read", "stale", "dynamic-budget", "calculation-budget", "input-read-budget"].map(mode => `live-${source}-${mode}`)),
+	...["seed-dynamic", "seed-calculation", "input-read", "input-read-stale", "unkeyed-dynamic"].flatMap(mode => ["raw", "unindexed"].map(access => `${access}-${mode}`)),
 	"actor", "preview", ...withPreview(["dynamic", "hints", "retired", "calculation", "calculation-unrelated", "calculation-hint"]), "predicted", "stale", "binding", "calculation-key",
 	...withPreview(["seed-dynamic", "seed-calculation"]), "seed-stale", "seed-binding", "seed-calculation-key", "seed-unbounded", "seed-repeat", "seed-revoke",
 	...mixedScenarios, "mixed-binding-unkeyed", ...inputScenarios(true), "unregistered-dynamic", "unregistered-mixed-producer", "late-dynamic",
@@ -60,16 +63,16 @@ test.for([...["seed-dynamic", "seed-calculation", "input-read", "input-read-stal
 	...["large", "opaque"].flatMap(output => [...retainedScenarios, "unkeyed-mixed-producer", "unkeyed-calculation-unrelated"].map(mode => `${output}-${mode}`)),
 	...["after", "after-cancel", "consume", "consume-cancel", "consume-cancel-return", "before"].flatMap(failure => [...retainedScenarios,
 		"unkeyed-mixed-stale", "unkeyed-mixed-cancel-return"].map(mode => `${failure}:${mode}`))])("shares actual inputs across independently formatted tools (%s)", async scenario => {
-	const discovery = /^(raw|unindexed)-/.exec(scenario)?.[1]; scenario = scenario.replace(/^(raw|unindexed)-/, "");
-	const live = scenario.startsWith("live-"), revoked = scenario.startsWith("live-revoked-"); scenario = scenario.replace(/^live-(?:revoked-)?/, "");
+	const prefix = /^(?:(raw|unindexed)-)?(?:(live)-(?:(prediction|preview)-|(revoked)-)?)?/.exec(scenario)!;
+	const [, discovery, live, source, revoked] = prefix; scenario = scenario.slice(prefix[0].length);
 	const parentFailure = scenario.includes(":") ? scenario.split(":")[0] : undefined, early = parentFailure === "before", parentThrows = parentFailure && !parentFailure.endsWith("return");
 	scenario = scenario.replace(/^.*:/, "");
 	const parentOutput = scenario.startsWith("large-") ? { transcript: "x".repeat(128 * 1024) } : scenario.startsWith("opaque-") ? { callback: () => "parent-only" } : {};
 	scenario = scenario.replace(/^(large|opaque)-/, "");
-	const mode = scenario.replace(/^(seed|unkeyed|unregistered|late)-/, ""), direct = mode.startsWith("input-"), listing = mode.startsWith("input-names"), changes = mode.endsWith("change"), range = mode.endsWith("range");
+	const mode = scenario.replace(/^(seed|unkeyed|unregistered|late)-/, ""), direct = mode.startsWith("input-"), listing = mode.startsWith("input-names"), changes = mode.endsWith("change"), range = mode.endsWith("range"), preview = mode.endsWith("preview");
 	const unkeyed = /^(unkeyed|unregistered|late)-/.test(scenario), unknown = scenario.startsWith("unregistered-");
 	const mixed = mode.startsWith("mixed"), rejected = mode.startsWith("rejected");
-	const seeded = live || unkeyed || scenario.startsWith("seed-") || direct && !mode.endsWith("preview") || ["mixed-producer", "mixed-budget", "mixed-outside"].includes(mode), bound = seeded || direct || mixed;
+	const seeded = !source && (live || unkeyed || scenario.startsWith("seed-") || direct && !preview || ["mixed-producer", "mixed-budget", "mixed-outside"].includes(mode)), bound = live || seeded || direct || mixed;
 	const args = { path: "input.txt" }, cwd = await directories.create(), file = path.join(mode.endsWith("outside") ? await directories.create() : cwd, "input.txt"), shared = {};
 	const metadata = /^input-(stat|type|entry|exists)/.exec(mode)?.[1], transfer = mode.endsWith("-transfer");
 	if (mode.includes("-special")) execFileSync("mkfifo", [file]); else if (!mode.includes("-missing") && !mode.endsWith("-create")) await writeFile(file, "one\ntwo\n");
@@ -80,7 +83,7 @@ test.for([...["seed-dynamic", "seed-calculation", "input-read", "input-read-stal
 	let builds = 0, renders = 0, disposed = 0, effects = 0, borrowers = 0, bindings = 0, revoke: (() => void | Promise<void>) | undefined, revokeParent: typeof revoke;
 	const pure = mode.startsWith("calculation"), unrelated = mode.includes("unrelated") || mode.startsWith("calculation-hint");
 	const stale = mode.endsWith("stale") || mode.endsWith("-create") || mode.endsWith("-deleted"), cancelled = mode.endsWith("cancel"), overlap = mode === "mixed-cancel" || mode === "mixed-overlap", failed = mode.endsWith("failure");
-	const unavailable = early || mode.endsWith("budget") || mode.endsWith("outside") || rejected, mutates = (index: number) => (direct || mixed) && index === Number(mode !== "mixed-producer");
+	const unavailable = early || mode.endsWith("budget") && !source || mode.endsWith("outside") || rejected, mutates = (index: number) => (direct || mixed) && index === Number(mode !== "mixed-producer");
 	const entered = deferred(), joined = deferred(), release = deferred(), controller = new AbortController(), actors: Promise<unknown>[] = [];
 	const parentGate = gated(), producer = new AbortController(), parentError = new Error("producer failed after independent work");
 	const names = ["count_records", "summarize_records", "other_records"], read = readDefinition("read");
@@ -89,15 +92,15 @@ test.for([...["seed-dynamic", "seed-calculation", "input-read", "input-read-stal
 		resourceScope: mutates(index) || mode === "unbounded" && !index ? undefined : "captured_inputs" as const,
 		canonicalize: (input: unknown, cwd: string) => { const key = !(index ? mode.endsWith("unkeyed") : unkeyed) && read.canonicalize(input, cwd); return key ? { ...key,
 			resources: pure || index && mode.startsWith("dynamic") ? [] : index && mode.startsWith("hints") ? ["selector"] : key.resources } : undefined; } }));
-	const actionSemantics = new ActionSemanticsRegistry(unknown ? definitions.slice(1) : definitions), settings = { drafterEnabled: false, resourceCacheMaxBytes: 32 * 1024,
-		...(live ? { scheduling: { heavyCpu: 1 } } : {}) }; // The pending Actor and its preview each own one slot.
+	const actionSemantics = new ActionSemanticsRegistry(unknown ? definitions.slice(1) : definitions), settings = { drafterEnabled: source === "prediction", resourceCacheMaxBytes: 32 * 1024,
+		...(live ? { scheduling: { heavyCpu: 1 } } : {}) }; // Each live call owns one slot.
 	const render = (tool: string, count: unknown, actual = true) => { if (actual) renders++; return { content: [fauxText(`${tool}:${count}`)], details: { tool, ...(tool === names[0] ? parentOutput : {}) } }; };
 	const count = async (read: () => Promise<unknown>, actual = true) => { const text = pure ? "one\ntwo\n" : await read(); if (actual) builds++; return metadata ? JSON.stringify(text) : String(text).trim().split("\n").length; };
 	const tools = names.map(name => ({ ...createReadTool(cwd), name, execute: async () => render(name, await count(() => readFile(file))) }));
-	const invocations = new Map(names.map((tool, index) => {
+	const invocations = names.map((tool, index) => {
 		const execute: NonNullable<import("../src/tool-settlement.ts").ToolInvocation["filesystem"]> = async (view, request) => {
 			const actual = request.callID !== "oracle";
-			const fail = (phase: string) => { if (!index && parentFailure?.startsWith(phase)) { if (parentFailure.includes("cancel")) producer.abort(parentError); if (!parentFailure.endsWith("return")) throw parentError; } }; fail("before");
+			const fail = (phase: string) => { if (!index && parentFailure?.startsWith(phase)) { if (parentFailure.includes("cancel")) producer.abort(parentError); if (parentThrows) throw parentError; } }; fail("before");
 			const build = async (inputs: typeof view) => ({ value: await count(() => inputs.readFile(file)), bytes: 8, dispose: () => { disposed++; } });
 			if (mode === "repeat" && !index) await view.prepare!(shared, "lines:v1", build, async value => value, file, request.signal);
 			const consume = async (count: unknown) => {
@@ -121,30 +124,34 @@ test.for([...["seed-dynamic", "seed-calculation", "input-read", "input-read-stal
 			};
 			const output = { isError: false, result: direct ? await consume(await count(read, actual)) : await view.prepare!(mode.includes("binding") && index || index === 2 ? definitions[index]! : shared,
 				mode === "calculation-key" && index ? "next" : "lines:v1", build, consume, mode.startsWith("calculation-hint") ? path.join(cwd, `hint-${index}`) : pure ? undefined : file, request.signal) };
-			if (actual && !index && live) await parentGate.wait();
+			if (actual && !index && live) await TimelineInterval.outside(() => parentGate.wait());
 			fail("after"); return output;
 		};
 		const binding = bound ? bindResourceOperation(execute, cwd) : { filesystem: execute, filesystemRoot: cwd };
-		return [tool, { executor: `custom:${tool}`, identity: { tool }, semantics: unknown && !index ? undefined : definitions[index], ...binding,
+		return { executor: `custom:${tool}`, identity: { tool }, semantics: unknown && !index ? undefined : definitions[index], ...binding,
 			...(binding.captureInputs ? { captureInputs: (...args: Parameters<NonNullable<typeof binding.captureInputs>>) => { const capture = binding.captureInputs!(...args); revoke = capture.dispose;
 				if (!index) revokeParent = revoke;
 				return { ...capture, seal: async () => { const branch = await capture.seal();
 					expect(branch).not.toHaveProperty("output"); await expect(branch.commit()).rejects.toMatchObject({ disposition: "recoverable" }); return discovery ? { ...branch, reconstruct: undefined, inputResources: discovery === "unindexed" ? undefined : branch.inputResources } : branch;
-				} }; } } : {}) }];
-	}));
-	const world = createResourceSnapshotExecutionWorld(actionSemantics, { maxBytes: () => mode.endsWith("budget") ? 64 : 1024 * 1024 });
+				} }; } } : {}) };
+	});
+	const world = resourceWorld(actionSemantics, () => mode.endsWith("budget") && (!source || renders > 0) ? 64 : 1024 * 1024);
 	if (rejected) { const capture = world.observation!.capture;
 		Object.assign(world.observation!, { capture: async (context: Parameters<typeof capture>[0]) => {
 			const result = await capture(context);
 			return mode === "rejected-capture" ? { ...result, inputsOnly: undefined } : { ...result, seal: async (output: Parameters<typeof result.seal>[0]) => ({ ...await result.seal(output), ...(mode === "rejected-output" ? { output } : { inputsOnly: undefined }) }) };
 		} }); }
-	const f = systemHost(cwd, tools, { actionSemantics, resolveInvocation: tool => { if (tool === names[0]) bindings++; return invocations.get(tool); },
-		complete: async () => toolMessage(fauxToolCall(names[unrelated ? 2 : 1]!, args)),
+	const f = systemHost(cwd, tools, { actionSemantics, resolveInvocation: tool => { if (tool === names[0]) bindings++; return invocations[names.indexOf(tool)]; },
+		complete: async () => toolUse(names[source ? 0 : unrelated ? 2 : 1]!, args),
 		executionWorlds: [world] }, settings);
 	await using _cleanup = onExit(async () => { controller.abort(); release.resolve(); parentGate.release(); await Promise.allSettled(actors); await f.dispose(); expect(disposed).toBe(direct ? 0 : builds - (bound ? 0 : f.fallbacks.length)); });
-	const initial = metadata ? await f.oracle(names[0]!, args, undefined, undefined, invocations.get(names[0]!)) : render(names[0]!, 2, false);
+	const reference = (index: number, count: number) => metadata ? f.oracle(names[index]!, args, undefined, undefined, invocations[index]) : render(names[index]!, count, false);
+	const initial = await reference(0, 2);
 	const late = scenario.startsWith("late-") ? tools.shift() : undefined; await f.start(); if (late) tools.unshift(late);
-	if (live) { const task = f.execute(names[0]!, args, producer.signal); void task.catch(() => {}); actors.push(task); await parentGate.entered; }
+	if (live) {
+		if (source !== "prediction") track<unknown>(actors, f[source ? "preview" : "execute"](names[0]!, args, producer.signal));
+		await parentGate.entered;
+	}
 	else if (parentThrows) await expect(f.execute(names[0]!, args, producer.signal)).rejects.toBe(parentError);
 	else if (seeded) expect(await f.execute(names[0]!, args, producer.signal)).toEqual(initial);
 	else { await f.preview(names[0]!, args); await f.ready(); }
@@ -152,15 +159,16 @@ test.for([...["seed-dynamic", "seed-calculation", "input-read", "input-read-stal
 	if (mode.startsWith("retired") || mode === "predicted") { await f.finish(); tools.shift(); settings.drafterEnabled = mode === "predicted"; await f.start("consumer"); }
 	if (mode === "predicted") await f.ready(2);
 	if (unrelated) { await f.finish(); settings.drafterEnabled = true; await f.start("unrelated"); await f.ready(seeded ? 1 : 2); await f.finish(); settings.drafterEnabled = false; await f.start("consumer"); }
-	if (mode.endsWith("preview") && !direct) { await f.preview(names[1]!, args); await expect.poll(() => renders).toBe(unrelated ? 3 : 2); }
+	if (preview && !direct) { await f.preview(names[1]!, args); await expect.poll(() => renders).toBe(unrelated ? 3 : 2); }
 	if (stale) await writeFile(listing ? path.join(path.dirname(file), "third.txt") : file, "one\ntwo\nthree\n");
 	if (mode.endsWith("-same-size")) await writeFile(file, "new\none\n");
 	if (mode.endsWith("-deleted")) await rm(file);
-	const expected = metadata ? await f.oracle(names[1]!, args, undefined, undefined, invocations.get(names[1]!)) : render(names[1]!, stale || changes ? 3 : range ? 1 : 2, false);
-	const result = f.execute(names[1]!, args, controller.signal); actors.push(result); void result.catch(() => {});
+	const expected = await reference(1, stale || changes ? 3 : range ? 1 : 2);
+	const result = track(actors, f.execute(names[1]!, args, controller.signal));
 	const finishParent = async () => {
 		parentGate.release();
-		if (parentThrows) await expect(actors[0]).rejects.toBe(parentError);
+		if (source) { if (!direct) await f.ready(); }
+		else if (parentThrows) await expect(actors[0]).rejects.toBe(parentError);
 		else expect(await actors[0]).toEqual(initial);
 	};
 	if (overlap) {
@@ -174,7 +182,7 @@ test.for([...["seed-dynamic", "seed-calculation", "input-read", "input-read-stal
 	else expect(await result).toEqual(expected);
 	expect({ builds, renders, effects }).toEqual({ builds: (direct || stale || unavailable || mode.includes("binding") || mode === "calculation-key" || mode === "revoke" ? 2 : 1) + Number(unrelated) - Number(direct && cancelled) - Number(early),
 		renders: 2 + Number(unrelated) + Number(overlap) - Number(failed || cancelled) - Number(early), effects: Number(direct || mixed) + Number(changes) + Number(overlap && !cancelled) - Number(direct && cancelled) - Number(early && mutates(0)) });
-	expect(f.fallbacks).toEqual([...(seeded ? [names[0]!] : []), ...(discovery || live && !mode.endsWith("preview") || early || mutates(1) || mode === "revoke" || rejected ? Array(1 + Number(overlap)).fill(names[1]!) : [])]);
+	expect(f.fallbacks).toEqual([...(seeded ? [names[0]!] : []), ...(discovery || live && !preview || early || mutates(1) || mode === "revoke" || rejected ? Array(1 + Number(overlap)).fill(names[1]!) : [])]);
 	if (direct && cancelled) await expect(readFile(path.join(cwd, `${names[1]}.txt`))).rejects.toMatchObject({ code: "ENOENT" });
 	else if ((direct || mixed) && !(early && mutates(0))) expect(await readText(cwd, `${names[Number(mode !== "mixed-producer")]}.txt`)).toBe(metadata ? textOutput(expected).slice(names[1]!.length + 1) : String(stale || changes ? 3 : range ? 1 : 2));
 	if (transfer) { await revokeParent!(); expect(await f.execute(names[1]!, args)).toEqual(expected); }
@@ -191,17 +199,17 @@ test.for([...["seed-dynamic", "seed-calculation", "input-read", "input-read-stal
 	if (cancelled) expectHiddenCompute(f.actors[0]!.computation!, false);
 });
 
-test.for(["weak", "full", "invalidated", "directory", "directory-full", "missing", ...process.platform === "linux" ? ["special"] : []])("retains only independently proven metadata (%s)", async mode => {
+test.for(["read", "weak", "full", "invalidated", "directory", "directory-full", "missing", ...process.platform === "linux" ? ["special"] : []])("retains only independently proven metadata (%s)", async mode => {
 	const cwd = await directories.create(), target = path.join(cwd, "input");
 	if (mode.startsWith("directory")) await mkdir(target); else if (mode === "special") execFileSync("mkfifo", [target]); else if (mode !== "missing") await writeFile(target, "one\ntwo\n");
 	const manager = new ResourceVersionManager(cwd, { watch: false }), version = await manager.capture(undefined, 32 * 1024), view = version.view!;
 	await using _original = onExit(async () => { await version.release(); });
-	await view[mode === "weak" || mode === "missing" ? "exists" : mode.startsWith("directory") ? "readdir" : "stat"](target);
+	await view[mode === "read" ? "readFile" : mode === "weak" || mode === "missing" ? "exists" : mode.startsWith("directory") ? "readdir" : "stat"](target);
 	if (["weak", "full", "invalidated", "directory-full"].includes(mode)) await view[mode === "directory-full" ? "stat" : "readFile"](target);
 	if (mode === "invalidated") view.invalidate(new Set([...version.observations].filter(([, value]) => value.scope === "content").map(([key]) => key)));
 	view.seal();
 	if (mode === "weak") await view.evaluate(input => input.stat(target), dependencies => { expect([...dependencies ?? []].map(key => version.observations.get(key)?.scope)).toContain("content"); });
-	const retained = manager.retain({ ...version, observations: new Map([...version.observations].filter(([, value]) => value.scope !== "content")) }, 32 * 1024);
+	const retained = manager.retain({ ...version, observations: new Map([...version.observations].filter(([, value]) => mode === "read" || value.scope !== "content")) }, 32 * 1024);
 	await using _retained = onExit(async () => { await retained.release(); }); await version.release();
 	expect(retained.view).toBeDefined(); expect((await manager.validate(retained)).expired).toBe(false);
 	expect(await retained.view!.exists(target)).toBe(mode !== "missing");
@@ -348,12 +356,12 @@ test.for(["reopened", "inflight", "completed", "binding", "reverse", "deep", "ad
 		await f.ready(batch.map(step => files[step]!), "pattern_aware");
 		await f.start(`consume-${batch}`); if (fallback && !poison) allowSelection = false;
 		await Promise.all(batch.map(async step => {
-			const result = f.execute(names[shared && !exact ? 4 : step]!, { path: files[unused ? 4 : step] }, controller.signal); actors.push(result); result.catch(() => {});
+			const result = track(actors, f.execute(names[shared && !exact ? 4 : step]!, { path: files[unused ? 4 : step] }, controller.signal));
 			if (fallback && !poison) {
 				await nativeGate.entered; await nextTurn(); expect(predictions(step)).toEqual([]);
 				if (closure) {
 					const closed = closure === "dispose" ? f.dispose() : closure === "disable" ? f.host.runtime.settingsChanged({ enabled: false, resourceCacheMaxEntries: 0, predictionTimeoutMs: 10_000 }) : f.finish(closure === "terminal");
-					actors.push(closed); closed.catch(() => {}); await expect.poll(() => predictions(step).length).toBe(1); nativeGate.release(); await closed;
+					track(actors, closed); await expect.poll(() => predictions(step).length).toBe(1); nativeGate.release(); await closed;
 				}
 				nativeGate.release();
 			}
@@ -412,7 +420,7 @@ test.for(["refresh", "replace", "remove", "replace-shared", "remove-shared"])("s
 	await using _cleanup = onExit(async () => { gate.release(); await Promise.allSettled(readers); await f.dispose(); });
 	await f.start(); await f.ready(); native = true;
 	const tool = shared ? "summarize_rows" : "read";
-	const result = f.execute(tool, args); readers.push(result); result.catch(() => {});
+	const result = track(readers, f.execute(tool, args));
 	await gate.entered; await nextTurn(); expect(settled).toEqual([]);
 	expect(textOutput(await f.execute("read", { path: "other.txt" }))).toBe("other.txt\n");
 	await expect.poll(() => updated).toBe(true); await nextTurn(); expect(settled.filter(item => item.feedback === "before")).toEqual([]);
@@ -426,9 +434,7 @@ test.for(["refresh", "replace", "remove", "replace-shared", "remove-shared"])("s
 
 test.for([false, true])("reconstructs shared searches after cancellation and namespace changes (cancel all: %s)", async (cancelAll, { skip }) => {
 	const cwd = await directories.create();
-	await writeText(cwd, "a.txt", "one\ntwo\nthree\n");
-	await writeText(cwd, ".ignore", "ignored.txt\n");
-	await writeText(cwd, "ignored.txt", "two ignored\n");
+	for (const [file, text] of [["a.txt", "one\ntwo\nthree\n"], [".ignore", "ignored.txt\n"], ["ignored.txt", "two ignored\n"]]) await writeText(cwd, file, text);
 	const profile = await createClosedSearchProfile(cwd);
 	if (!profile.invocations.has("grep")) { await profile.pool.dispose(); return skip("qualified rg unavailable"); }
 	const gate = gated(), joined = deferred(), controllers = [new AbortController(), new AbortController()];
@@ -463,11 +469,12 @@ test.for([false, true])("reconstructs shared searches after cancellation and nam
 		{ tool: "find", input: { pattern: "*.txt", path: "." } },
 		{ tool: "read", input: { path: "a.txt", offset: 2, limit: 1 } },
 	];
-	for (const query of queries) expect(await f.execute(query.tool, query.input)).toEqual(await f.oracle(query.tool, query.input));
+	const verify = async () => { for (const query of queries) expect(await f.execute(query.tool, query.input)).toEqual(await f.oracle(query.tool, query.input)); };
+	await verify();
 	expect(f.fallbacks).toEqual([]);
 	await writeText(cwd, "a.txt", "two changed\n");
 	await writeText(cwd, "added.txt", "two new\n");
-	for (const query of queries) expect(await f.execute(query.tool, query.input)).toEqual(await f.oracle(query.tool, query.input));
+	await verify();
 });
 
 test.for(["in-place", "git", "single-in-place", "single-git"])("keeps effects private, retries restored preimages and transfers an aborted claim (%s)", async driver => {
@@ -592,20 +599,20 @@ test.for(["independent", "unchanged", "batch", "batch-known", "mismatch-text", "
 				if (mode === "abort-observation") await new Promise((_, reject) => options!.signal!.addEventListener("abort", () => reject(options!.signal!.reason), { once: true }));
 				if (actualFirst) await forecast.promise;
 				if (mode === "request-failure" || mode === "actual-before-failure") throw new Error("observation transport failure");
-				const response = toolMessage(fauxToolCall("speculative_observations", { results: predictedRoots.map(root => { const index = roots.indexOf(root); return {
+				const response = toolUse("speculative_observations", { results: predictedRoots.map(root => { const index = roots.indexOf(root); return {
 					callID: mode === "malformed-observation" ? "unknown" : `root-${index}`, isError: mode === "malformed-type" || mode === "actual-before-malformed" ? "false" : mode === "mismatch-error",
 					...(mode === "malformed-extra" ? { score: 1_000_000 } : {}), ...(mode === "mismatch-exit" ? { exitCode: 7 } : {}),
 					content: normalized ? [fauxText(JSON.stringify({ failedTests: mode === "canonical-mismatch" ? ["a.test.ts:3"] : [], artifact: "abc", duration: 999, pid: 456, tempPath: "/tmp/predicted" }))]
 						: textMismatch || actualFirst ? [fauxText("incorrect forecast")] : expected[index]!.content,
-				}; }) }));
+				}; }) });
 				return { ...response, usage: { ...response.usage, input: 11, output: 7, totalTokens: 18 } };
 			}
-			if (++drafts === 1) { rootContext = context; return toolMessage([...rootDraft,
-				...extraCall ? [fauxToolCall(mode === "unknown-batch" ? "unavailable" : child.tool, child.args, { id: "unknown" })] : []]); }
+			if (++drafts === 1) { rootContext = context; return fauxAssistantMessage([...rootDraft,
+				...extraCall ? [fauxToolCall(mode === "unknown-batch" ? "unavailable" : child.tool, child.args, { id: "unknown" })] : []], { stopReason: "toolUse" }); }
 			privateContexts.push(context); const discarded = wrong && privateContexts.length === 1;
 			if (inflight && discarded) { observationSignal = options!.signal; firstResult.resolve(); await forecast.promise; }
-			return toolMessage(fauxToolCall(child.tool, discarded ? { path: "discarded.txt" } : child.args,
-				{ id: "child" }));
+			return toolUse(child.tool, discarded ? { path: "discarded.txt" } : child.args,
+				{ id: "child" });
 		}, getDraftOptions: () => ({ apiKey: "shared-credential" }),
 	}, settings);
 	await using _cleanup = onExit(async () => { release.resolve(); forecast.resolve(); firstResult.resolve(); await f.dispose(); await sandbox.dispose(); });
@@ -800,13 +807,12 @@ test.for(["completed", "inflight", "forecast", "binding", "parent-binding", "rev
 
 test.for(["dependent", "independent"])("preserves sibling resource effects outside observation scopes (%s)", async mode => {
 	const cwd = await directories.create(), sandbox = new WorkspaceSandboxService(), release = deferred();
-	await writeText(cwd, "selector.txt", "select\n"); await writeText(cwd, "written.txt", "before\n");
-	await writeText(cwd, "independent.txt", "independent\n");
+	for (const [file, text] of [["selector.txt", "select\n"], ["written.txt", "before\n"], ["independent.txt", "independent\n"]]) await writeText(cwd, file, text);
 	const child = { path: mode === "dependent" ? "written.txt" : "independent.txt" }, tools = [createReadTool(cwd), createWriteTool(cwd)];
 	let drafted = 0; const executed: string[] = [], settings = { drafterEnabled: true, candidateLimit: 1, drafterMaxDepth: 1, maxConcurrentActions: 3 };
-	const f = systemHost(cwd, tools as Parameters<typeof systemHost>[1], {
+	const f = systemHost(cwd, tools, {
 		resources: idleResources(3),
-		executionWorlds: [createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { maxBytes: () => 1024 * 1024 }), sandbox.createExecutionWorld({ driver: "git" })].map(world => ({ ...world, speculation: { ...world.speculation!, execute: async context => {
+		executionWorlds: [resourceWorld(), sandbox.createExecutionWorld({ driver: "git" })].map(world => ({ ...world, speculation: { ...world.speculation!, execute: async context => {
 			executed.push(String((context.args as { path: string }).path)); const branch = await world.speculation!.execute(context);
 			if (context.toolName === "write") await release.promise;
 			return branch;
@@ -850,9 +856,9 @@ test.each(["ordered", "independent", "dependent"])("adopts only the proven effec
 		} } }],
 		complete: async (_model, context) => {
 			const observing = context.tools?.[0]?.name === "speculative_observations", index = observing ? drafted - 1 : drafted++, step = steps[index]!;
-			return toolMessage(fauxToolCall(observing ? "speculative_observations" : step.tool,
+			return toolUse(observing ? "speculative_observations" : step.tool,
 				observing ? { results: [{ callID: `draft-${index}`, isError: false, content: [fauxText(step.tool === "write" ? `Successfully wrote ${step.input.content!.length} bytes to ${step.input.path}` : `Successfully replaced 1 block(s) in ${step.input.path}.`)] }] } : step.input,
-				{ id: `draft-${index}` }));
+				{ id: `draft-${index}` });
 		},
 		getSettings: () => ({ enabled: true, drafterEnabled: predict, candidateLimit: 1, maxConcurrentActions: 2,
 			drafterMaxDepth: 2, patternAware: { enabled: false } }),
@@ -897,11 +903,11 @@ test.for(["unrelated", "changed", "descendant", "mutation", "mutation-stat", "mu
 		resolveInvocation: (tool, input) => resolvePiToolInvocation(tool, input, { cwd, environment: native.environment, shellPath: native.shellPath }),
 		complete: async (_model, context) => {
 			requests++;
-			if (context.tools?.[0]?.name === "speculative_observations") return toolMessage(fauxToolCall("speculative_observations", {
+			if (context.tools?.[0]?.name === "speculative_observations") return toolUse("speculative_observations", {
 				results: [{ callID: "draft-0", isError: false, content: [fauxText(mutation ? "Successfully wrote 9 bytes to a.txt" : "original\n")] }],
-			}));
+			});
 			const step = steps[drafted]!;
-			return toolMessage(fauxToolCall(step.tool, step.input, { id: `draft-${drafted++}` }));
+			return toolUse(step.tool, step.input, { id: `draft-${drafted++}` });
 		},
 		getSettings: () => ({ enabled: true, drafterEnabled: predict, candidateLimit: 1, drafterMaxDepth: 1,
 			patternAware: { enabled: false } }),
@@ -934,7 +940,7 @@ test("reconsiders restored results while sharing pending reads and retains fresh
 	const cwd = await directories.create(), reader = createReadTool(cwd);
 	const file = path.join(cwd, "notes.txt"), original = Array.from({ length: 20 }, (_, i) => `line ${i + 1}`).join("\n");
 	await writeFile(file, original);
-	const world = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { maxBytes: () => 1024 * 1024 });
+	const world = resourceWorld();
 	const computed = gated(), entered = deferred(), controller = new AbortController();
 	const args = { path: "notes.txt", offset: 5, limit: 1 }, wide = { ...args, offset: 1, limit: 10 };
 	let runs = 0, authorizations = 0;

@@ -278,6 +278,7 @@ interface CandidateRecord<Output, StartInput = unknown, StateData = unknown> {
 	expectedDurationMs?: number;
 	estimatedBytes: number;
 	projectionCoverage: readonly ActionProjectionCoverage[];
+	inputSource?: object;
 	resultViews?: Map<string, RetainedResultView<Output>>;
 	previews?: Set<ActorPreviewRecord>;
 	onOperationAdopted?: (adoption: ExecutionOperationAdoption) => void;
@@ -498,16 +499,14 @@ export function makeSpeculativeActionRuntime<
 		return {
 			lookup: function* (path?: string): Iterable<object> {
 				if (closed || session.lifecycle.sealed || masterDisabled()) return;
-				for (const candidate of candidateStore.lookupInputs(session.id, path === undefined ? undefined : [path])) {
-					if (candidate === source || candidate.owner.draft.type !== "tool_call" || candidate.route.reuse !== "shared_result" ||
-						candidate.work.execution.status !== "succeeded" || !candidate.work.execution.output.inputSource) continue;
+				for (const candidate of [...candidateStore.lookupInputs(session.id, path === undefined ? undefined : [path]), ...candidateStore.pending(session.id)]) {
+					const inputs = candidateBranch(candidate)?.inputSource ?? candidate.inputSource;
+					if (candidate === source || candidate.owner.draft.type !== "tool_call" || candidate.route.reuse !== "shared_result" || !inputs) continue;
 					const lease = leases.get(candidate) ?? acquireCandidate(session, candidate, owner);
-					if (lease) { leases.set(candidate, lease); yield candidate.work.execution.output.inputSource; }
+					if (lease) { leases.set(candidate, lease); yield inputs; }
 				}
-				for (const state of session.turns.values()) if (actorTurnActive(state)) for (const action of state.actorActions) {
-					const source = action.inputSource;
-					if (source) yield source;
-				}
+				for (const state of session.turns.values()) if (actorTurnActive(state)) for (const action of state.actorActions)
+					if (action.inputSource) yield action.inputSource;
 			},
 			dispose: () => { closed = true; for (const lease of leases.values()) lease.release(); leases.clear(); },
 		};
@@ -1111,6 +1110,7 @@ export function makeSpeculativeActionRuntime<
 				index: candidate.owner.index,
 				signal: candidate.work.controller.signal,
 				inputs: inputs?.lookup,
+				onInputSource: inputs && (source => candidate.inputSource = source),
 				onOperationAdopted: candidate.onOperationAdopted,
 				onOperationJoinable: available => { candidate.operationJoinable = available; },
 				acceptOperationScope: session.acceptOperationScope,
@@ -1167,7 +1167,7 @@ export function makeSpeculativeActionRuntime<
 				const feedback = { reuseFeedback: draft.reuseFeedback, status: execution.status, executionMs: execution.executionMs };
 				session.effects.enqueue(() => source.onExecutionSettled?.(feedback));
 			}
-			candidate.operationJoinable = undefined;
+			candidate.inputSource = candidate.operationJoinable = undefined;
 			candidate.operationConsumers = undefined;
 			inputs?.dispose(); scheduler.complete(candidate); wakeResourceWaiters();
 		}
