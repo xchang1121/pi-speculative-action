@@ -45,6 +45,7 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 	]);
 	let api: ExtensionAPI, registered = false;
 	const calls: string[] = [], prepared: string[] = [], hooks: string[] = [], updates: string[] = [];
+	const updated = { b: deferred(), d: deferred() };
 	const callback = (name: string): ToolDefinition => ({ name, label: name, description: "Formats its own rows", executionMode: "parallel",
 		parameters: { type: "object", properties: { text: { type: "string" } }, required: ["text"] },
 		prepareArguments: input => { const text = (input as { text: string }).text; prepared.push(text);
@@ -53,6 +54,7 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 			expect(this.name).toBe(name); expect(currentExecutionScope()).toMatchObject({ sessionID: context.sessionManager.getSessionId(), callID });
 			expect(signal).toBe(context.signal); expect(Object.isFrozen(args)).toBe(false); calls.push(callID);
 			if (!native && !registered) { registered = true; api.registerTool(callback("read")); api.registerTool(callback("late_rows")); }
+			if (callID === "a" || callID === "c") await updated[callID === "a" ? "b" : "d"].promise;
 			await new Promise(resolve => setImmediate(resolve));
 			const text = (args as { text: string }).text, options = { cwd, env: { PATH: "/usr/local/bin:/usr/bin:/bin", HOME: os.homedir(), LANG: "C.UTF-8" }, stdio: ["ignore", "pipe", "pipe"] as ["ignore", "pipe", "pipe"] };
 			const output = synchronous(callID) ? execFileSync("/bin/bash", ["-c", text], { ...options, encoding: "utf8" }) : native ? await new Promise<string>((resolve, reject) => {
@@ -61,6 +63,7 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 				child.once("error", reject); child.once("close", code => code ? reject(new Error(`callback exited ${code}`)) : resolve(output));
 			}) : text;
 			onUpdate?.({ content: [{ type: "text", text: "partial:" + callID }], details: { callID } });
+			if (callID === "b" || callID === "d") updated[callID].resolve();
 			return { content: [{ type: "text", text: "own:" + name + ":" + output }], details: { callID } };
 		},
 	});
@@ -195,8 +198,9 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 		]);
 		await session.prompt("Execute the registered callbacks.");
 		expect(prepared).toEqual(["first", "second", "third", "fourth", "skip"]);
-		expect(calls).toEqual(["a", "b", "c", "d"]); expect(updates).toEqual(calls);
-		expect(hooks).toEqual(["before:a", "before:b", "after:a", "after:b", "before:c", "before:d", "before:blocked", "after:c", "after:d"]);
+		expect([calls.slice(0, 2).sort(), calls.slice(2).sort()]).toEqual([["a", "b"], ["c", "d"]]); expect(updates).toEqual(["b", "a", "d", "c"]);
+		expect(hooks.slice(0, 2)).toEqual(["before:a", "before:b"]); expect(hooks.slice(2, 4).sort()).toEqual(["after:a", "after:b"]);
+		expect(hooks.slice(4, 7)).toEqual(["before:c", "before:d", "before:blocked"]); expect(hooks.slice(7).sort()).toEqual(["after:c", "after:d"]);
 		expect(session.messages.filter(message => message.role === "toolResult").slice(-5).map(message => [message.toolCallId, message.content, message.isError])).toEqual([
 			["a", [{ type: "text", text: "hook:own:format_rows:first:prepared" }], false], ["b", [{ type: "text", text: "hook:own:format_rows:second:prepared" }], false],
 			["c", [{ type: "text", text: "hook:own:read:third:prepared" }], false], ["d", [{ type: "text", text: "hook:own:late_rows:fourth:prepared" }], false],
@@ -234,6 +238,7 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 			for (const execute of [() => coordinator.execute({ command: "", cwd, environment: {}, onData: () => {} }), () => coordinator.operations.exec("", cwd, { onData: () => {} })]) await expect(execute()).rejects.toBe(failure);
 		});
 	} finally {
+		for (const gate of Object.values(updated)) gate.resolve();
 		if (preempted) await inspection?.inOwner(state => state.publishedGate?.resolve()); await publication?.close();
 		await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" }); session.dispose(); inspection?.dispose();
 		expect(session.agent.prompt).toBe(originalPrompt); expect(session.agent.continue).toBe(originalContinue);

@@ -70,7 +70,8 @@ type CapturedResource = (
 
 type ResourceInputSource = {
 	readonly view: ResourceReadView;
-	readonly observed: (dependencies: ReadonlySet<string> | undefined) => readonly ResourceVersionToken[] | void;
+	/** Selection is side-effect free when commit is false; only accepted inputs become dependencies. */
+	readonly observed: (dependencies: ReadonlySet<string> | undefined, commit?: boolean) => readonly ResourceVersionToken[] | void;
 };
 type ResourceInputLookup = (target?: string) => Iterable<ResourceInputSource>;
 type PreparedResource = {
@@ -285,6 +286,7 @@ export class ResourceReadView {
 			const use = async (cached: PreparedResource, building = false, source?: ResourceInputSource) => {
 				cached.borrowers++;
 				const withdraw = cached.cancellation.acquire(signal);
+				let accepted = building;
 				try {
 					// A composed waiter must take its own proof references before the producer can retire.
 					if (!building && !(cached.retained && cached.destination === owner ||
@@ -293,15 +295,18 @@ export class ResourceReadView {
 						(!cached.proofs?.length || this.acceptProofs))) return undefined;
 					if (building) await cached.ready;
 					signal?.throwIfAborted();
-					if (cached.origin !== owner || !cached.dependencies) this.dependencies = undefined;
-					else if (this.dependencies) for (const dependency of cached.dependencies) this.dependencies.add(dependency);
-					const proofs = [...source ? this.observeSource(source)(cached.origin === source.view ? cached.dependencies : undefined) ?? [] : [], ...cached.proofs ?? []];
-					const transferred = this.acceptProofs && proofs.length && (source || !cached.retained || cached.destination !== owner);
-					if (transferred) { for (const proof of this.acceptProofs!(proofs)) this.collectProofs?.set(proof.observations, proof); }
+					const dependencies = cached.origin === owner && cached.dependencies && this.dependencies ? new Set([...this.dependencies, ...cached.dependencies]) : undefined;
+					const sourceDependencies = source && cached.origin === source.view ? cached.dependencies : undefined;
+					const proofs = [...source?.observed(sourceDependencies, false) ?? [], ...cached.proofs ?? []];
 					return await cached.destination.prepared!.lifetime.admit(async () => {
 						this.assertComplete(); cached.destination.assertComplete();
-						await this.validatePrepared?.([...(this.observed?.(this.dependencies) ?? []), ...proofs]);
+						await this.validatePrepared?.([...(this.observed?.(dependencies, false) ?? []), ...proofs]);
 						signal?.throwIfAborted();
+						accepted = true; this.dependencies = dependencies;
+						if (source) this.observeSource(source)(sourceDependencies);
+						// The consumer takes proof ownership before its effects; rejected sources leave no dependencies.
+						const transferred = this.acceptProofs && proofs.length && (source || !cached.retained || cached.destination !== owner);
+						if (transferred) { for (const proof of this.acceptProofs!(proofs)) this.collectProofs?.set(proof.observations, proof); }
 						const evaluation = await TimelineInterval.measure(() => consume(cached.value as Parameters<typeof consume>[0]));
 						TimelineInterval.own(evaluation.computation);
 						return TimelineInterval.outside(() => {
@@ -310,6 +315,10 @@ export class ResourceReadView {
 							return { value: evaluation.output };
 						});
 					});
+				} catch (error) {
+					if (accepted) throw error;
+					this.assertComplete(); signal?.throwIfAborted();
+					return undefined;
 				} finally {
 					withdraw();
 					if (!--cached.borrowers && !(cached.retained && !cached.revoked))
@@ -319,11 +328,10 @@ export class ResourceReadView {
 			const reused = cached && compatible(cached) && await use(cached);
 			if (reused) return reused.value;
 			for (const source of this.lookup?.() ?? []) {
+				const cached = source.view.prepared?.bindings.get(binding)?.get(key);
 				if (source.view.entries === this.entries || !source.view.retained || !source.view.sealed ||
-					!source.view.prepared?.bindings.get(binding)?.get(key)?.retained ||
-					!compatible(source.view.prepared.bindings.get(binding)?.get(key))) continue;
-				// The consumer owns transferred proofs; retiring the producer cannot revoke a completed consumption.
-				const result = await use(source.view.prepared.bindings.get(binding)!.get(key)!, false, source);
+					!cached?.retained || !compatible(cached)) continue;
+				const result = await use(cached, false, source);
 				if (result) return result.value;
 			}
 			let resource: Awaited<ReturnType<typeof build>> | undefined;
@@ -352,7 +360,7 @@ export class ResourceReadView {
 				pending.shareable = !view.foreignInputs;
 				if (pending.shareable && view.collectProofs?.size) for (const proof of view.collectProofs.values())
 					(pending.proofs ??= []).push(proof.manager.retain({ ...proof, view: undefined }));
-			}, observed => { pending.dependencies = observed; }).then(async () => {
+			}, (observed, commit) => { if (commit !== false) pending.dependencies = observed; }).then(async () => {
 				if (!resource) throw new Error("resource_preparation_missing");
 				pending.value = resource.value;
 				bytes = resource.bytes + computationBytes + resourceProofBytes(pending.proofs ?? []) + (key.length + (name?.length ?? 0)) * 2 + 192 +

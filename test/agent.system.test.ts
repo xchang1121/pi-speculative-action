@@ -151,6 +151,50 @@ test.for(["actor", "preview", "dynamic", "dynamic-preview", "hints", "hints-prev
 	if (cancelled) expect(f.events.filter(event => event.type === "actor_action")[0]?.computation?.hiddenComputeMs).toBe(0);
 });
 
+test.for(["stale", "all-stale", "binding", "failure", "cancel", "composed", "revoke"])("selects valid preparations across live producers (%s)", async mode => {
+	const cwd = await directories.create(), file = path.join(cwd, "input.txt"), extra = path.join(cwd, "extra.txt"), binding = {};
+	await writeFile(file, "one\ntwo\n"); await writeFile(extra, "before\n");
+	const names = ["prepare_count", "prepare_summary", "consume_count"], reader = createReadTool(cwd);
+	const definitions = names.map(tool => ({ ...PI_ACTION_SEMANTICS.definition("read")!, tool, epoch: tool, projectors: [] }));
+	const actionSemantics = new ActionSemanticsRegistry(definitions), tools = names.map(name => ({ ...reader, name })) as Parameters<typeof systemHost>[1];
+	const built = [deferred(), deferred()], releaseBuild = [deferred(), deferred()], exposed = [deferred(), deferred()], releaseParent = deferred();
+	const controller = new AbortController(), failure = new Error("consumer stopped after its effect"), wrapper = {};
+	let builds = 0, disposals = 0, effects = 0, compositions = 0, compositionDisposals = 0, revoke: (() => void | Promise<void>) | undefined;
+	const invocations = names.map((tool, index) => ({ semantics: definitions[index], executor: tool, ...bindResourceOperation(async (view, request) => {
+		const consume = async (count: number) => { if (index === 2) { effects++; if (mode === "cancel") controller.abort(failure); if (mode === "failure" || mode === "cancel") throw failure; } return count; };
+		const calculate = (inputs: typeof view, consume: (count: number) => Promise<number>) => inputs.prepare!(mode === "binding" && index === 1 ? definitions[1]! : binding, "line-count", async inputs => {
+			const content = await inputs.readFile(file); if (!index) await inputs.readFile(extra);
+			builds++; if (index < 2) { built[index]!.resolve(); await releaseBuild[index]!.promise; }
+			return { value: content.toString().trim().split("\n").length, bytes: 8, dispose: () => { disposals++; } };
+		}, consume, file, request.signal);
+		const count = index === 2 && mode === "composed" ? await view.prepare!(wrapper, "render", async inputs => {
+			const value = await calculate(inputs, async count => count); compositions++; return { value, bytes: 8, dispose: () => { compositionDisposals++; } };
+		}, consume, file, request.signal) : await calculate(view, consume);
+		if (index < 2) { exposed[index]!.resolve(); await releaseParent.promise; }
+		return { result: { content: [{ type: "text" as const, text: `${tool}:${count}` }], details: {} }, isError: false };
+	}, cwd) }));
+	const capture = invocations[0]!.captureInputs!;
+	invocations[0]!.captureInputs = (...args) => { const result = capture(...args); revoke = result.dispose; return result; };
+	const parents: Promise<unknown>[] = [];
+	const f = systemHost(cwd, tools, { actionSemantics, resolveInvocation: tool => invocations[names.indexOf(tool)],
+		resources: { initial: { cpuCount: 3, idleCpuCount: 3 }, sample: () => new Promise(() => {}) },
+		executionWorlds: [createResourceSnapshotExecutionWorld(actionSemantics, { maxBytes: () => 1024 * 1024 })],
+	}, { maxConcurrentActions: 3, scheduling: { heavyCpu: 1 } });
+	await using _cleanup = onExit(async () => { for (const gate of releaseBuild) gate.resolve(); releaseParent.resolve(); await Promise.allSettled(parents); await f.dispose(); expect(disposals).toBe(builds); expect(compositionDisposals).toBe(compositions); });
+	await f.start();
+	for (let index = 0; index < 2; index++) { parents.push(f.execute(names[index]!, { path: "input.txt" })); await built[index]!.promise; }
+	for (let index = 0; index < 2; index++) { releaseBuild[index]!.resolve(); await exposed[index]!.promise; }
+	expect(builds).toBe(2); await writeFile(extra, "after\n");
+	if (mode === "all-stale") await writeFile(file, "one\ntwo\nthree\n");
+	if (mode === "revoke") await revoke!();
+	const result = f.execute(names[2]!, { path: "input.txt" }, controller.signal);
+	if (mode === "failure" || mode === "cancel") await expect(result).rejects.toBe(failure);
+	else expect(textOutput(await result)).toBe(`consume_count:${mode === "all-stale" ? 3 : 2}`);
+	if (mode === "composed") expect(textOutput(await f.execute(names[2]!, { path: "input.txt" }))).toBe("consume_count:2");
+	expect(effects).toBe(mode === "composed" ? 2 : 1); expect(compositions).toBe(Number(mode === "composed"));
+	expect(builds).toBe(["all-stale", "binding"].includes(mode) ? 3 : 2);
+});
+
 test.for(["reopened", "inflight", "completed", "binding", "reverse", "deep", "added", "changed", "removed"])("retains learned continuations across authoritative batch updates (%s)", async mode => {
 	const changed = mode === "changed", removed = mode === "removed", replaces = changed || removed, added = mode === "added", deep = mode === "deep", reopen = mode === "reopened";
 	const cwd = await directories.create(), names = [reopen ? "read" : "inspect_index", reopen ? "read" : "open_record", "render_record", replaces ? "status_index" : "background_status", "summarize_record", "tail_record"];

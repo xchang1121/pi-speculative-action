@@ -168,30 +168,30 @@ async function evaluateResourceQuery<Output>(
 	let missing: Promise<ResourceVersionToken> | undefined, captured: ResourceVersionToken | undefined;
 	// Keep the initiating view first: it owns the query's root resolution, even when another source answers first.
 	const proofs = new Map<ResourceVersionToken, Map<string, ResourceObservation>>([[version, new Map()]]);
-	const observe = (token: ResourceVersionToken, dependencies: ReadonlySet<string> | undefined) => {
-		let observations = proofs.get(token);
-		if (!observations) proofs.set(token, observations = new Map());
+	const observe = (token: ResourceVersionToken, dependencies: ReadonlySet<string> | undefined, commit = true) => {
+		const observations = commit && proofs.get(token) || new Map<string, ResourceObservation>();
 		for (const key of dependencies ?? token.observations.keys()) {
 			const entry = token.observations.get(key);
 			if (!entry) throw new Error("resource_input_proof_missing");
 			observations.set(key, entry);
 		}
+		if (commit) proofs.set(token, observations);
 		return { ...token, observations, view: undefined };
 	};
-	const observeOwner = (tokens: readonly ResourceVersionToken[], dependencies: ReadonlySet<string> | undefined) =>
-		dependencies ? [observe(tokens[0]!, dependencies)] : tokens.map(token => observe(token, undefined));
+	const observeOwner = (tokens: readonly ResourceVersionToken[], dependencies: ReadonlySet<string> | undefined, commit = true) =>
+		dependencies ? [observe(tokens[0]!, dependencies, commit)] : tokens.map(token => observe(token, undefined, commit));
 	try { return await collectResourceComputation(async () => {
 		view.assertComplete(true);
 		let output: Output, completed = false, sealed: ResourceVersionToken[] | undefined;
-		try { output = await view.evaluate(execute, dependencies => observeOwner(versions, dependencies), root,
+		try { output = await view.evaluate(execute, (dependencies, commit) => observeOwner(versions, dependencies, commit), root,
 			function* (target) {
 				const owners = [versions, ...[...request.inputs?.(target) ?? []].flatMap(source => resourceVersions.has(source) ? [resourceVersions.get(source)!] : [])];
 				for (const tokens of owners) for (const token of tokens) if (token.view) yield { view: token.view,
-					observed: dependencies => dependencies ? [observe(token, dependencies)] : observeOwner(tokens, undefined) };
+					observed: (dependencies, commit) => dependencies ? [observe(token, dependencies, commit)] : observeOwner(tokens, undefined, commit) };
 			}, async () => {
 				const token = await (missing ??= captureResourceVersion(undefined, root, semantics, maxBytes).then(token => captured = token));
 				if (!token.view) throw new Error("resource_snapshot_budget_exceeded");
-				return { view: token.view, observed: dependencies => [observe(token, dependencies)] };
+				return { view: token.view, observed: (dependencies, commit) => [observe(token, dependencies, commit)] };
 			}, inputs => inputs.map(input => {
 				const proof = input.manager.retain(input); retained.push(proof); observe(proof, undefined); return proof;
 			}), validation && (async proofs => { await validateResourceInputs(proofs, true); })); completed = true;
