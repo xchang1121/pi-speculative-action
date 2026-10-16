@@ -337,10 +337,7 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 		},
 		onCandidateMaterialized: options.onCandidateMaterialized,
 		onActorActionMaterialized: options.onActorActionMaterialized,
-		onActorActionSettled: async (feedback) => {
-			patternPlans.actorActionSettled(feedback);
-			await options.onActorActionSettled?.(feedback);
-		},
+		onActorActionSettled: options.onActorActionSettled,
 		onPredictionSettled: options.onPredictionSettled,
 		onEvent: options.onEvent,
 	});

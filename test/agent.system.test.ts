@@ -195,12 +195,14 @@ test.for(["stale", "all-stale", "binding", "failure", "cancel", "composed", "rev
 	expect(builds).toBe(["all-stale", "binding"].includes(mode) ? 3 : 2);
 });
 
-test.for(["reopened", "inflight", "completed", "binding", "reverse", "deep", "added", "changed", "removed"])("retains learned continuations across authoritative batch updates (%s)", async mode => {
+test.for(["reopened", "inflight", "completed", "binding", "reverse", "deep", "added", "changed", "removed", "shared", "shared-refresh", "shared-stale", "shared-unused", "shared-native", "shared-native-stale", "shared-exact", "shared-exact-stale"])("retains learned continuations across authoritative batch updates (%s)", async mode => {
 	const changed = mode === "changed", removed = mode === "removed", replaces = changed || removed, added = mode === "added", deep = mode === "deep", reopen = mode === "reopened";
+	const shared = mode.startsWith("shared"), stale = mode.endsWith("stale"), unused = mode === "shared-unused", native = mode.includes("native"), exact = mode.includes("exact"), consumed = shared && !stale && !unused;
 	const cwd = await directories.create(), names = [reopen ? "read" : "inspect_index", reopen ? "read" : "open_record", "render_record", replaces ? "status_index" : "background_status", "summarize_record", "tail_record"];
 	const files = ["root.txt", "child.txt", "leaf.txt", "status.txt", "other.txt", "tail.txt"], reader = createReadTool(cwd);
 	for (const file of files) await writeFile(path.join(cwd, file), `${file}\n`);
-	const definitions = [...new Set(names)].map(tool => ({ ...PI_ACTION_SEMANTICS.definition("read")!, tool, epoch: `learned:${tool}`, projectors: [] }));
+	const definitions = [...new Set(names)].map(tool => ({ ...PI_ACTION_SEMANTICS.definition("read")!, tool, epoch: `learned:${tool}`, projectors: [],
+		...(native && tool === names[4] ? { canonicalize: () => undefined } : {}) }));
 	const actionSemantics = new ActionSemanticsRegistry(definitions), tools = definitions.map(({ tool: name }) => ({ ...reader, name })) as Parameters<typeof systemHost>[1];
 	const settings = patternAwareSettings({ enabled: true, minOccurrences: 2, maxContextLength: added ? 2 : 1, maxFutureGap: 0, beamWidth: added ? 2 : 1, maxPredictionDepth: 3, presets: [] });
 	const createStore = () => new PatternAwareStore(settings, path.join(cwd, "patterns.json"), patternAwareActionSemantics(actionSemantics, cwd));
@@ -221,7 +223,7 @@ test.for(["reopened", "inflight", "completed", "binding", "reverse", "deep", "ad
 		resolveInvocation: async (tool, input) => {
 			if (mode === "binding" && tool === names[2]) { bindings++; leafStarted.resolve(); await leafRelease.promise; }
 			const invocation = options.resolveInvocation(tool, input);
-			return { ...invocation, ...(tool === names[3] ? bindResourceOperation(async (view, request) => {
+			return { ...invocation, ...(native && tool === names[4] ? bindResourceOperation(invocation.filesystem!, cwd) : {}), ...(tool === names[3] ? bindResourceOperation(async (view, request) => {
 				const result = await invocation.filesystem!(view, request);
 				slowStarted.resolve(); await slowRelease.promise;
 				return result;
@@ -244,7 +246,7 @@ test.for(["reopened", "inflight", "completed", "binding", "reverse", "deep", "ad
 		expect(f.fallbacks).toEqual([]); return;
 	}
 	if (mode === "reverse") await f.execute(names[0]!, { path: files[0] });
-	slow = f.execute(names[3]!, { path: files[3] }); await slowStarted.promise;
+	if (mode !== "shared") { slow = f.execute(names[3]!, { path: files[3] }); await slowStarted.promise; }
 	if (mode !== "reverse") await f.execute(names[0]!, { path: files[0] });
 	if (mode === "completed" || deep) leafRelease.resolve();
 	await leafStarted.promise;
@@ -256,15 +258,26 @@ test.for(["reopened", "inflight", "completed", "binding", "reverse", "deep", "ad
 	if (deep) expect(predictions(5)).toEqual([]);
 	if (mode === "binding") expect(bindings).toBe(1);
 	leafRelease.resolve(); runtimeSettings.patternAware = { ...settings, enabled: false };
+	const prior = reopened.snapshot().filter(pattern => pattern.targetTool === names[1]);
+	if (stale) await writeFile(path.join(cwd, files[1]!), "changed\n");
 	f.fallbacks.length = 0;
-	for (const batch of changed ? [[4], [5]] : added ? [[1, 4], [2, 5]] : [[1], [2], ...deep ? [[5]] : []]) {
+	for (const batch of shared ? [[1]] : changed ? [[4], [5]] : added ? [[1, 4], [2, 5]] : [[1], [2], ...deep ? [[5]] : []]) {
 		for (const step of batch) await expect.poll(() => completed(step)).toBe(true);
 		await f.start(`consume-${batch}`);
-		await Promise.all(batch.map(async step => expect(textOutput(await f.execute(names[step]!, { path: files[step] }))).toBe(`${files[step]}\n`))); await f.finish();
-		if (!removed) for (const step of batch) expect(predictions(step)).toMatchObject([{ settlement: { observation: "observed", match: { matched: true } } }]);
+		await Promise.all(batch.map(async step => expect(textOutput(await f.execute(names[shared && !exact ? 4 : step]!, { path: files[unused ? 4 : step] }))).toBe(stale ? "changed\n" : `${files[unused ? 4 : step]}\n`))); await f.finish();
+		if (!removed) for (const step of batch) expect(predictions(step)).toMatchObject([{ settlement: native ? { observation: "unobserved", cause: { code: "actor_action_not_keyable" } } : { observation: "observed", match: { matched: !shared || exact } } }]);
 	}
-	expect(f.fallbacks).toEqual([]);
+	expect(f.fallbacks).toEqual(native ? [names[4]] : []);
 	if (mode !== "binding") expect(leafSignal).toBe(original);
+	if (shared) {
+		await f.dispose(); await reopened.flush(); const saved = createStore(); await saved.load();
+		expect(prior.length).toBeGreaterThan(0);
+		for (const previous of prior) expect(saved.snapshot().find(pattern => pattern.id === previous.id)?.feedback).toMatchObject({
+			observed: previous.feedback.observed + Number(!native), matched: previous.feedback.matched + Number(exact), adopted: previous.feedback.adopted + Number(consumed),
+			recentMismatchedWeight: Number(!consumed && !native && !exact), recentRejectedWeight: Number(exact && !consumed),
+			...(native ? { unobserved: { "matching:actor_action_not_keyable": 1 } } : {}),
+		});
+	}
 });
 
 test.for([false, true])("reconstructs shared searches after cancellation and namespace changes (cancel all: %s)", async (cancelAll, { skip }) => {

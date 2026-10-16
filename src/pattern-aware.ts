@@ -714,7 +714,7 @@ export class PatternAwareStore {
 		if (typeof support === "string") this.persist();
 	}
 
-	settled(support: string | PatternAwareContinuation, settlement: PredictionSettlement, served = false) {
+	settled(support: string | PatternAwareContinuation, settlement: PredictionSettlement, served?: boolean) {
 		const feedback = this.supportFeedback(support);
 		if (!feedback) return;
 		const recent = feedbackEvidence({ feedback }, this.clock, this.settings.decayHalfLifeEvents);
@@ -723,24 +723,24 @@ export class PatternAwareStore {
 		feedback.recentAdoptedWeight = recent.adopted;
 		feedback.recentRejectedWeight = recent.rejected;
 		feedback.sequence = this.clock;
+		const adopted = served ?? (settlement.observation === "observed" && settlement.match.matched && settlement.match.adoption.status === "adopted");
+		if (adopted) { feedback.adopted++; feedback.recentAdoptedWeight++; }
 		if (settlement.observation === "unobserved") {
 			const key = `${settlement.cause.stage}:${settlement.cause.code}`;
 			feedback.unobserved[key] = (feedback.unobserved[key] ?? 0) + 1;
 		} else {
 			feedback.observed++;
 			if (!settlement.match.matched) {
-				// Its candidate served a different Actor call through its inputs: useful, though not the call itself.
-				if (served) { feedback.adopted++; feedback.recentAdoptedWeight++; } else feedback.recentMismatchedWeight++;
+				if (!adopted) feedback.recentMismatchedWeight++;
 			} else {
 				feedback.matched++;
 				feedback.recentMatchedWeight++;
-				if (settlement.match.adoption.status === "adopted") {
-					feedback.adopted++;
-					feedback.recentAdoptedWeight++;
-				} else {
-					const stage = settlement.match.adoption.cause.stage;
-					feedback.rejectedAfterMatch[stage] = (feedback.rejectedAfterMatch[stage] ?? 0) + 1;
+				if (!adopted) {
 					feedback.recentRejectedWeight++;
+					if (settlement.match.adoption.status === "rejected") {
+						const stage = settlement.match.adoption.cause.stage;
+						feedback.rejectedAfterMatch[stage] = (feedback.rejectedAfterMatch[stage] ?? 0) + 1;
+					}
 				}
 			}
 		}

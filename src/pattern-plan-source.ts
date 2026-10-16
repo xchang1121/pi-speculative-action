@@ -11,7 +11,7 @@ import { acquirePatternAwareStore, type OutputLocation, type PatternAwareCandida
 	projectPatternAwareObservation } from "./pattern-aware.ts";
 import type { PlanAction } from "./plan-proposal.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
-import type { ActorActionFeedback, SpeculativeActionSettings, SpeculativeCandidate } from "./runtime.ts";
+import type { SpeculativeActionSettings, SpeculativeCandidate } from "./runtime.ts";
 import { candidateExecutionMs } from "./runtime.ts";
 import { stableValueHash } from "./stable-value-hash.ts";
 import type { ToolSettlement } from "./tool-settlement.ts";
@@ -25,7 +25,6 @@ export interface PatternPlanSourceController {
 	readonly source: AgentPlanSource;
 	readonly turnStarted: (startInput: AgentStartInput, settings: SpeculativeActionSettings) => void;
 	readonly turnFinished: (startInput: AgentStartInput, settings: SpeculativeActionSettings, terminal: boolean) => void;
-	readonly actorActionSettled: (feedback: ActorActionFeedback<string>) => void;
 	/** The calls PatternAware expects next, without proposing them. */
 	readonly hints: (input: { readonly sessionID: string; readonly schemaHashes: Readonly<Record<string, string>>; readonly settings: SpeculativeActionSettings })
 		=> Promise<readonly Pick<PatternAwareCandidate, "tool" | "input" | "horizon">[]>;
@@ -53,7 +52,7 @@ export function createPatternPlanSource({
 	const revisions = new Map<string, number>();
 	const carriedPredictions = new Map<string, CarriedPrediction>();
 	const feedbacks = new WeakMap<object, PatternPlanFeedback>();
-	const predictionBatches = new WeakMap<PatternPlanFeedback, CarriedPrediction>(), served = new WeakSet<PatternPlanFeedback>();
+	const predictionBatches = new WeakMap<PatternPlanFeedback, CarriedPrediction>();
 	const failedCommands = new BoundedRecencyMap<string, FailedCommand>(4);
 	const retryFeedback = new WeakMap<object, FailedCommand>();
 	let analysisTail: Promise<void> = Promise.resolve();
@@ -236,12 +235,12 @@ export function createPatternPlanSource({
 			if (!context) return;
 			for (const support of [context.continuation, ...context.supportingPatternIDs]) context.store.issued(support);
 		},
-		onSettled: ({ feedback, settlement }) => {
+		onSettled: ({ feedback, settlement, served }) => {
 			if (lifecycle.sealed) return;
 			const context = feedbacks.get(feedback as object);
 			const carried = context && predictionBatches.get(context);
 			if (carried && settlement.observation === "unobserved") carried.abandoned = true;
-			if (context) for (const support of [context.continuation, ...context.supportingPatternIDs]) context.store.settled(support, settlement, served.has(context));
+			if (context) for (const support of [context.continuation, ...context.supportingPatternIDs]) context.store.settled(support, settlement, served);
 		},
 		flush: () => lifecycle.run(() => flushStores()),
 	};
@@ -279,10 +278,6 @@ export function createPatternPlanSource({
 			? (await predictionStore(patternSettings))!.predict(sessionID, schemaHashes, patternSettings).slice(0, 4).map(({ tool, input, horizon }) => ({ tool, input, horizon })) : []),
 		turnStarted: observeTurn,
 		turnFinished: observeTurn,
-		// Serving the Actor is recorded before the owning prediction settles, which credits it even when unmatched.
-		actorActionSettled: ({ settlement, candidateFeedback: feedback }) => {
-			if (settlement.provider.kind === "speculative" && feedbacks.get(feedback as object)) served.add(feedback as PatternPlanFeedback);
-		},
 		finishSession: () => lifecycle.run(async () => {
 			await clearSession();
 			await flushStores(true).catch(() => {}); // Persistence failure must not change Agent lifecycle semantics.

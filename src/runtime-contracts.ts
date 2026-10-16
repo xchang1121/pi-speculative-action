@@ -212,6 +212,8 @@ export interface SpeculativePlanSource<
 	}) => MaybePromise<void>;
 	readonly onSettled?: (input: PlanActionFeedback & {
 		readonly settlement: PredictionSettlement;
+		/** Attached execution served an Actor call, including through shared inputs, across metadata updates. */
+		readonly served?: boolean;
 	}) => MaybePromise<void>;
 	readonly flush?: () => MaybePromise<void>;
 }

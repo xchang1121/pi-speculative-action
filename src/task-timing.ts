@@ -66,6 +66,23 @@ export class TimelineInterval {
 	}
 	static get producer(): ComputationProducer | undefined { return collecting.getStore()?.producer; }
 
+	/** Successful receipts identify the producers of consumed work, independently of selected tool names. */
+	static reusedBy(roots: readonly TimelineDependency[]): (producer: TimelineInterval) => boolean {
+		const consumed = new Set([...consumedComputations(roots).selected].filter(([, value]) => value.flags & 2).map(([id]) => id));
+		return producer => {
+			if (!consumed.size) return false;
+			const visited = new Set<TimelineInterval>(), pending = [producer];
+			while (pending.length) {
+				const current = pending.pop()!;
+				if (visited.has(current)) continue;
+				visited.add(current);
+				if (consumed.has(computationIdentity(current))) return true;
+				for (const input of dependencies.get(current) ?? []) if (input.owned && !input.overhead) pending.push(input.computation);
+			}
+			return false;
+		};
+	}
+
 	/** Record provenance before publication; failed evaluations never transfer borrowed work to the caller. */
 	static async collect<T>(execute: () => T | Promise<T>, producer = collecting.getStore()?.producer) {
 		const scope = { inputs: new Map<TimelineInterval, Receipt>() as Map<TimelineInterval, Receipt> | undefined, producer: producer && Object.freeze({ ...producer }) };
@@ -323,26 +340,10 @@ export class TaskTimeline {
 
 	/** Exactly one settled Actor call. Shared work counts once here; an independent later reuse counts again. */
 	recordCall(roots: readonly TimelineDependency[], issuedAt: number, completedAt?: number): ToolComputationTiming {
-		const selected = new Map<string, { computation: TimelineInterval; flags: number; producer?: ComputationProducer | null }>();
-		const visited = new Map<TimelineInterval, number>(), groups = new ComputationGroups();
-		let complete = true, hiddenComputeIncomplete = !Number.isFinite(issuedAt);
+		let { selected, groups, complete, incomplete } = consumedComputations(roots);
+		let hiddenComputeIncomplete = incomplete || !Number.isFinite(issuedAt);
 		let adoptionComplete = Number.isFinite(issuedAt) && completedAt !== undefined && Number.isFinite(completedAt) && completedAt >= issuedAt;
 		const observed: TimelineInterval[] = [];
-		const pending = roots.map(input => ({ input, inheritedReuse: false })).reverse();
-		while (pending.length) {
-			const { input, inheritedReuse } = pending.pop()!;
-			if (input.computeUncertain) { complete = false; if (inheritedReuse || input.reused) hiddenComputeIncomplete = true; }
-			if (input.overhead) continue;
-			const computation = input.computation, reused = inheritedReuse || !!input.reused, flag = reused ? 2 : 1;
-			if ((visited.get(computation) ?? 0) & flag) continue;
-			visited.set(computation, (visited.get(computation) ?? 0) | flag);
-			const key = computationIdentity(computation), previous = selected.get(key);
-			for (const group of computationGroups(computation)) groups.join(key, group);
-			selected.set(key, { computation: preferredComputation(previous?.computation, computation),
-				flags: (previous?.flags ?? 0) | flag, producer: mergeProducers(previous?.producer, computationProducer(computation)) });
-			const inputs = dependencies.get(computation) ?? [];
-			for (let index = inputs.length - 1; index >= 0; index--) pending.push({ input: inputs[index]!, inheritedReuse: reused });
-		}
 		const grouped = [new Map<string, TimelineInterval[]>(), new Map<string, TimelineInterval[]>()];
 		const attributed = new Map<string, { interval: TimelineInterval; producer?: ComputationProducer }[]>();
 		const modes = new Map<string, ModeComputationTiming>();
@@ -408,6 +409,28 @@ export class TaskTimeline {
 			hiddenComputeMs: this.hiddenComputeMs, ...(this.hiddenComputeIncomplete ? { hiddenComputeIncomplete: true as const } : {}),
 			...(this.adoptionWaits ? { adoptionWaitMs: duration(this.adoptionWaits) } : {}), toolWaitMs: duration(this.toolWaits) });
 	}
+}
+
+function consumedComputations(roots: readonly TimelineDependency[]) {
+	const selected = new Map<string, { computation: TimelineInterval; flags: number; producer?: ComputationProducer | null }>();
+	const visited = new Map<TimelineInterval, number>(), groups = new ComputationGroups();
+	let complete = true, incomplete = false;
+	const pending = roots.map(input => ({ input, inheritedReuse: false })).reverse();
+	while (pending.length) {
+		const { input, inheritedReuse } = pending.pop()!;
+		if (input.computeUncertain) { complete = false; if (inheritedReuse || input.reused) incomplete = true; }
+		if (input.overhead) continue;
+		const computation = input.computation, reused = inheritedReuse || !!input.reused, flag = reused ? 2 : 1;
+		if ((visited.get(computation) ?? 0) & flag) continue;
+		visited.set(computation, (visited.get(computation) ?? 0) | flag);
+		const key = computationIdentity(computation), previous = selected.get(key);
+		for (const group of computationGroups(computation)) groups.join(key, group);
+		selected.set(key, { computation: preferredComputation(previous?.computation, computation),
+			flags: (previous?.flags ?? 0) | flag, producer: mergeProducers(previous?.producer, computationProducer(computation)) });
+		const inputs = dependencies.get(computation) ?? [];
+		for (let index = inputs.length - 1; index >= 0; index--) pending.push({ input: inputs[index]!, inheritedReuse: reused });
+	}
+	return { selected, groups, complete, incomplete };
 }
 
 function computationIdentity(object: object): string {

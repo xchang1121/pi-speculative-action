@@ -106,6 +106,18 @@ describe("persisted computation evidence", () => {
 			{ computation: child, owned: true, shared: [child] }, { computation: borrowed, reused: true },
 			{ computation: new TimelineInterval(100, 110), overhead: true },
 		]);
+		for (const [input, used, producer, others] of [
+			[child, true, parent, [borrowed]], [borrowed, true, borrowed, [parent, child]], [child, false, undefined, [parent, child]],
+		] as const) {
+			const consumer = new TimelineInterval(300, 310, [{ computation: input, reused: used }]);
+			for (const computation of [consumer, restore(consumer)]) {
+				const consumed = TimelineInterval.reusedBy([{ computation }]);
+				if (producer) expect(consumed(producer)).toBe(true);
+				for (const other of others) expect(consumed(other)).toBe(false);
+				expect(TimelineInterval.reusedBy([{ computation, overhead: true }])(parent)).toBe(false);
+				expect(TimelineInterval.reusedBy([{ computation: TimelineInterval.attempted(computation) }])(parent)).toBe(false);
+			}
+		}
 		TimelineInterval.producedBy(parent, { source: "pattern", mode: "whole" });
 		TimelineInterval.producedBy(borrowed, { source: "drafter", mode: "input" });
 		const expected = { toolComputeMs: 100, hiddenComputeMs: 100, hiddenByMode: [

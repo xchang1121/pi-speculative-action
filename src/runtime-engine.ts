@@ -246,6 +246,7 @@ interface PlanActionContext<StartInput, StateData> extends RuntimeTurnContext<St
 	readonly identity: PlanActionIdentity;
 	readonly opportunity: PredictionOpportunity;
 	draft: SpeculativeDraftCandidate;
+	served?: boolean;
 	readonly admissionController: AbortController;
 	readonly sourceSlot: SourceRequestSlot;
 	readonly continuationSlots: Set<SourceRequestSlot>;
@@ -1536,8 +1537,8 @@ export function makeSpeculativeActionRuntime<
 					"actor_adopted",
 					{ key: actualKey, input: asConcreteInput(actualCall.input) ?? actualKey.input },
 				);
-				confirmPredictions(state.session, matchingPredictions, identity, adoption);
 				queueActorSettlement(state, input, actualCall, actorAction, selected.output, selected);
+				confirmPredictions(state.session, matchingPredictions, identity, adoption);
 				state.session.effects.enqueue(() => dispatchReady(state.session));
 				prepared.output = selected.output;
 				return Object.freeze(prepared);
@@ -1651,10 +1652,19 @@ export function makeSpeculativeActionRuntime<
 			for (const prediction of settlement.matchedPredictions) state.session.plan.observe(prediction, observation);
 			dispatchReady(state.session);
 		}
-		const computation = state.session.timeline?.recordCall([
+		const consumed = [
 			{ computation: settlement.provider.toolExecution, reused: !!selection && (selection.match.kind !== "inputs" || !!selection.projectionReused) },
 			...(selection?.projection ? [{ computation: selection.projection, reused: selection.projectionReused }] : []),
-		], actorAction.issuedAt, performance.now());
+		];
+		const reused = TimelineInterval.reusedBy(consumed);
+		for (const node of state.session.plan.unsettled()) {
+			const context = state.session.actionContexts.get(node.identity.id);
+			const candidate = "candidateID" in node.execution && (selection?.candidate.id === node.execution.candidateID ? selection.candidate
+				: candidateStore.get(state.sessionID, node.execution.candidateID));
+			const execution = candidate ? candidate.work.execution : undefined;
+			if (context && execution?.status === "succeeded" && reused(execution.toolExecution)) context.served = true;
+		}
+		const computation = state.session.timeline?.recordCall(consumed, actorAction.issuedAt, performance.now());
 		const key = actorAction.actionKey;
 		const settledCandidate = selection?.candidate;
 		const settledCandidateDescriptor = settledCandidate && (adapter.onActorActionSettled || adapter.onEvent)
@@ -1755,7 +1765,7 @@ export function makeSpeculativeActionRuntime<
 		}));
 		if (event || source?.onSettled) session.effects.enqueue(async () => {
 			if (event) session.events.enqueue(event);
-			await source?.onSettled?.({ proposalID: context.identity.proposalID, actionID: context.identity.actionID, feedback: context.draft.feedback, settlement });
+			await source?.onSettled?.({ proposalID: context.identity.proposalID, actionID: context.identity.actionID, feedback: context.draft.feedback, settlement, served: context.served === true });
 		});
 		const matched = settlement.observation === "observed" && settlement.match.matched;
 		releaseActionContext(session, node.identity.id, matched);
