@@ -22,7 +22,7 @@ import { Agent, type AgentTool } from "@earendil-works/pi-agent-core";
 import { deferred, onExit } from "./async.ts";
 import { toolUse as response } from "./model.ts";
 
-const adoptions = (settlement: PredictionSettlement) => settlement.observation === "observed" && settlement.match.matched && settlement.match.adoption.status === "adopted" ? [settlement.match.relation] : [];
+const adoptions = (settlement: PredictionSettlement) => settlement.observation === "observed" && settlement.match.matched && settlement.match.adoption.status === "adopted" ? [{ prediction: settlement.prediction, relation: settlement.match.relation }] : [];
 
 const directories = temporaryDirectories("pi-extension-system-");
 afterEach(async () => { vi.unstubAllEnvs(); vi.restoreAllMocks(); await directories.dispose(); });
@@ -70,11 +70,11 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["", "-nested", "-sta
 		},
 	});
 	const events: SpeculativeActionEvent<string>[] = [];
-	const served: boolean[] = [], prepare = operationPreparation.createExecutionPreparation;
+	const served: [string, boolean][] = [], prepare = operationPreparation.createExecutionPreparation;
 	vi.spyOn(operationPreparation, "createExecutionPreparation").mockImplementation((...args) => {
 		const owner = prepare(...args);
 		return { ...owner, source: { ...owner.source, onSettled: feedback => {
-			if (adoptions(feedback.settlement).length) served.push(feedback.served === true); return owner.source.onSettled?.(feedback);
+			if (adoptions(feedback.settlement).length) served.push([feedback.settlement.prediction.id, feedback.served === true]); return owner.source.onSettled?.(feedback);
 		} } };
 	});
 
@@ -177,8 +177,12 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["", "-nested", "-sta
 		expect((timing.hiddenByMode ?? []).reduce((total, part) => total + part.hiddenComputeMs, 0)).toBeCloseTo(timing.hiddenComputeMs, 5);
 		const predictions = events.filter(event => event.type === "operation_prediction"), adopted = predictions.flatMap(event => adoptions(event.settlement));
 		if (preempted && reused) expect(events.some(event => event.type === "candidate" && event.state.status === "cancelled" && event.state.cause.code === "scheduler_preempted")).toBe(true);
-		expect(served).toEqual(adopted.map(() => true));
-		expect(adopted).toHaveLength(Number(reused && mode !== "native-retired")); if (nested && adopted.length) expect(adopted[0]).toMatchObject({ kind: "projected", projector: "owned-operation" });
+		const credit = new Map(served), exact = { child: true, kind: "exact", distance: 0, served: true },
+			owned = { child: inputs, kind: "projected", distance: 1, projector: "owned-operation", served: true };
+		expect(served.map(([id]) => id).sort()).toEqual(adopted.map(item => item.prediction.id).sort());
+		expect(!reused || mode === "native-retired" ? [[]] : nested || inputs ? [[owned]] : [[exact], [{ ...exact, served: false }, owned]])
+			.toContainEqual(adopted.map(({ prediction, relation }) => ({ child: prediction.actionID.endsWith(inputBinding!.key), ...relation,
+				served: credit.get(prediction.id) })).sort((a, b) => a.kind.localeCompare(b.kind)));
 		if (mode === "native-retired") expect(predictions.filter(event => event.settlement.prediction.id === predictions[0]!.settlement.prediction.id)).toMatchObject([{ settlement: { observation: "unobserved", cause: { code: "operation_not_observed" } } }]);
 		expect(!!settled.settlement.actionKeyHash).toBe(mode !== "native-unkeyed");
 		if (publication) expect(await publication.joined()).toBe(true);

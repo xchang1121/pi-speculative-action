@@ -115,6 +115,7 @@ export interface ExecutionOperationAdoption {
 	readonly scope: ExecutionScope;
 	readonly id: string;
 	readonly sequence: number;
+	readonly backend: string;
 	readonly operationIdentity: string;
 	/** What producing the adopted result took, which the adopting call did not spend. */
 	readonly executionMs?: number;

@@ -21,7 +21,7 @@ import { effectCommitFailure } from "../src/effect-transaction.ts";
 import { LinuxProcessReuseBackend, validateTransferredProcessEvidence, type LinuxProcessSession } from "../src/linux-process-backend.ts";
 import { ProcessHandoffRegistry, type ProcessExecutionBinding } from "../src/process-handoff.ts";
 import { resolvePiToolInvocation, createClosedSearchProfile } from "../src/pi-tool-invocation.ts";
-import { resourceWorld } from "./agent-system-fixture.ts";
+import { expectHiddenCompute, resourceWorld } from "./agent-system-fixture.ts";
 import { summarizeSpeculativeTrace } from "../src/trace-summary.ts";
 import { adaptProcessToolOperations, ProcessExecutionCoordinator } from "../src/process-execution.ts";
 import { PROCESS_CERTIFICATE } from "./process-fixture.ts";
@@ -1125,7 +1125,8 @@ nativeTest.for(["completed", "running", ...["", "-merged", "-closed-input", "-de
 		let host: ReturnType<typeof patternProcessHost>["host"] | undefined;
 		let publication: Awaited<ReturnType<typeof holdOwnedProcessPublication>> | undefined;
 		let restorePreparation: (() => Promise<void>) | undefined;
-		await using _cleanup = onExit(async () => { await publication?.close(); await restorePreparation?.(); await host?.dispose(); });
+		const release = deferred();
+		await using _cleanup = onExit(async () => { release.resolve(); await publication?.close(); await restorePreparation?.(); await host?.dispose(); });
 		await writeFile(path.join(fixture.workspace, "input.txt"), "before\n");
 		if (descriptors) await writeFile(path.join(fixture.workspace, "fd.txt"), "abcdef");
 		if (mode === "native-descriptors-merged") await writeFile(path.join(fixture.workspace, "fd-other.txt"), "abcdef");
@@ -1337,8 +1338,17 @@ int main(int argc, char **argv) {
 			// This boundary fixture budgets two native preparations plus the Actor; single-CPU live transfers are tested above.
 			resources: { initial: { cpuCount: 6, idleCpuCount: 6 }, sample: async () => ({ cpuCount: 6, idleCpuCount: 6 }) },
 			preflight: ({ args, action }) => { expect(args).toHaveProperty("command"); expect(action.input.command).toBe((args as { command: string }).command); return true; },
+			executionWorlds: [{ ...fixture.world, speculation: { ...fixture.world.speculation, execute: async context => {
+				if (mode === "completed" && context.executionScope?.turnID === "prepared" && typeof context.action.input.operation === "string") await TimelineInterval.outside(() => release.promise);
+				return fixture.world.speculation.execute(context);
+			} } }],
 		}), { events, patternStore, start, call } = prepared;
 		host = prepared.host;
+		const operations = () => events.filter(event => event.type === "operation_prediction");
+		const succeeded = (turnID: string, kind: "operation" | "actor_preview") => events.filter(event => event.type === "candidate" &&
+			event.turnID === turnID && event.state.status === "succeeded" && (kind === "operation" ? event.candidate.kind : event.candidate.origin) === kind);
+		const diagnostic = () => JSON.stringify({ actor: fixture.backend.actorMetrics(), producer: fixture.backend.metrics(),
+			errors: errors.mock.calls.map(call => call[1]), operations: operations(), bindings: fixture.backend.executionBindings(later) });
 		for (const turnID of ["common-1", "common-2"]) {
 			await start(turnID);
 			await host.execute(call(turnID, "printf common"), undefined, () => fixture.tool.execute(turnID, { command: "printf common" }));
@@ -1360,8 +1370,7 @@ int main(int argc, char **argv) {
 		await start("seed");
 		if (!native) {
 			await host.previewActorCall(call("seed", command));
-			await prepared.waitFor(() => events.some(event => event.type === "candidate" && event.turnID === "seed" &&
-				event.candidate.origin === "actor_preview" && event.state.status === "succeeded"));
+			await prepared.waitFor(() => succeeded("seed", "actor_preview").length > 0);
 		}
 
 		await expect.poll(() => patternStore.recent(scope.sessionID).map(event => event.input.command)).toEqual(["printf common", "printf common", ...(discovery ? [command] : [])]);
@@ -1371,9 +1380,9 @@ int main(int argc, char **argv) {
 		await host.finishTurn("seed");
 		// The previewed whole Bash command is adopted outright once its evidence validates; a native run still binds its child.
 		expect(seedFallback).toHaveBeenCalledTimes(native ? 1 : 0);
-		expect(fixture.backend.actorMetrics().hits, JSON.stringify({ actor: fixture.backend.actorMetrics(), producer: fixture.backend.metrics() })).toBe(0);
+		expect(fixture.backend.actorMetrics().hits, diagnostic()).toBe(0);
 		binding ??= fixture.backend.executionBindings(later).at(-1);
-		if (reopened || mode === "native-pipe-live") {
+		if (reopened || launcher) {
 			const registry = Reflect.get(fixture.backend, "handoffs") as ProcessHandoffRegistry<{ readonly executable: string }>;
 			binding = fixture.backend.executionBindings(later).find(candidate => registry.resolveBinding(candidate, later)?.executable === path.join(fixture.workspace, "worker"));
 		}
@@ -1416,16 +1425,17 @@ int main(int argc, char **argv) {
 			restorePreparation = async () => { fault.mockRestore(); };
 		}
 		await start("prepared");
-		if (running) await publication!.ready();
-		else await prepared.waitFor(() => events.some(event => event.turnID === "prepared" && event.type === "candidate" &&
-			event.candidate.kind === "operation" && event.state.status === "succeeded"));
+		if (mode === "completed") {
+			await host.previewActorCall(call("prepared", command));
+			await prepared.waitFor(() => succeeded("prepared", "actor_preview").length > 0);
+		} else if (running) await publication!.ready();
+		else await prepared.waitFor(() => succeeded("prepared", "operation").length > 0);
 		if (launcher && !running) await expect.poll(async () => (await publications()).slice(publicationStart).some(certificate =>
 			certificate.prototype.executablePath === path.join(fixture.workspace, "worker")), { timeout: 5000 }).toBe(true).catch(error => {
-			throw new Error(JSON.stringify({ metrics: fixture.backend.metrics(), actor: fixture.backend.actorMetrics(), errors: errors.mock.calls.map(call => call[1]) }), { cause: error });
+			throw new Error(diagnostic(), { cause: error });
 		});
 		if (mode.includes("prepared-")) {
-			await prepared.waitFor(() => events.filter(event => event.type === "candidate" && event.turnID === "prepared" &&
-				event.candidate.kind === "operation" && event.state.status === "succeeded").length === (launcher ? 2 : 1));
+			await prepared.waitFor(() => succeeded("prepared", "operation").length === (launcher ? 2 : 1));
 			expect(await readText(fixture.workspace, "input.txt")).toBe("changed during preparation\n");
 			await restorePreparation?.(); restorePreparation = undefined;
 			// Every preparation is sealed before this change; no later producer can capture the replacement value.
@@ -1443,20 +1453,16 @@ int main(int argc, char **argv) {
 		}
 		const actor = vi.fn(() => fixture.coordinator.runWith(route.executor, () => fixture.tool.execute("prepared", { command: changedParent })));
 		const stalePreparation = mode.endsWith("prepared-stale");
-		const operations = () => events.filter(event => event.type === "operation_prediction");
 		expect((await host.execute(call("prepared", changedParent), undefined, actor)).content).toEqual([fauxText(`automatic-parent\n${stalePreparation ? "changed after preparation\n" : "newest\n"}${suffix}`)]);
-		if (running) expect(await publication!.joined(), JSON.stringify({ actor: fixture.backend.actorMetrics(), producer: fixture.backend.metrics(), errors: errors.mock.calls.map(call => call[1]), operations: operations() })).toBe(true);
+		if (running) expect(await publication!.joined(), diagnostic()).toBe(true);
 		expect(actor).toHaveBeenCalledOnce();
 		if (segmented || orphan) expect(fixture.backend.actorMetrics().hits).toBe(1);
 		if (orphan) expect((await publications()).some(certificate => certificate.prototype.inheritedFDs.some(fd => fd.installed === false))).toBe(true);
 		expect(fixture.backend.actorMetrics().joinedHits, JSON.stringify({ joined: await publication?.joined(), metrics: fixture.backend.actorMetrics() })).toBe(Number(running));
 		expect(fixture.backend.metrics().misses).toBeGreaterThan(before.misses);
-		await host.finishTurn("prepared");
-		const timing = consumedTiming(events, "prepared");
-		if (stalePreparation) expect(timing.hiddenComputeMs, JSON.stringify({ metrics: fixture.backend.actorMetrics(), operations: operations() })).toBe(0);
-		else expect(timing.hiddenComputeMs,
-			JSON.stringify({ metrics: fixture.backend.actorMetrics(), producer: fixture.backend.metrics(), bindings: fixture.backend.executionBindings(later), operations: operations() })).toBeGreaterThan(0);
-		expect(operations().filter(event => !launcher || stalePreparation || event.settlement.observation === "observed"), JSON.stringify({ operations: operations(), errors: errors.mock.calls.map(call => call[1]), metrics: fixture.backend.actorMetrics() })).toMatchObject(Array.from({ length: launcher && stalePreparation ? 2 : 1 }, () => ({ settlement: stalePreparation ? { observation: "unobserved" } : {
+		release.resolve(); await host.finishTurn("prepared");
+		expectHiddenCompute(consumedTiming(events, "prepared"), !stalePreparation);
+		expect(operations().filter(event => !launcher || stalePreparation || event.predictedAction?.includes(binding!.key)), diagnostic()).toMatchObject(Array.from({ length: launcher && stalePreparation ? 2 : 1 }, () => ({ settlement: stalePreparation ? { observation: "unobserved" } : {
 			prediction: { source: "execution_preparation", kind: "operation" }, observation: "observed", match: { matched: true, adoption: { status: "adopted" } },
 		} })));
 		await expect.poll(() => patternStore.recent(scope.sessionID).map(event => event.input.command)).toEqual(["printf common", "printf common", ...(discovery ? [command] : []), command, changedParent]);
