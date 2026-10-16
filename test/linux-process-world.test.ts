@@ -1100,7 +1100,7 @@ int main(void) {
 		else expect((await pending).output.result.content).toEqual([fauxText("predecessor")]);
 	});
 
-nativeTest.for(["completed", "running", "native", "native-merged", "native-closed-input", "native-descriptors", "native-descriptors-merged", "native-null", "native-null-stdin", "native-status", "native-directory", "native-directory-entries", "native-directory-prepared-stale", "native-directory-opath", "native-directory-opath-prepared-stale", "native-pipe", "native-pipe-prepared-stale", "native-pipe-live", "native-pipe-live-prepared-stale", "native-pipe-live-mixed", "native-pipe-live-transfer", "native-pipe-producer", "native-pipe-producer-queued", "native-pipe-producer-short", "native-pipe-producer-splice", "native-socket", "native-socket-running", "native-socket-duplex", "native-socket-lifetime", "native-socket-io", "native-socket-messages", "native-socket-export", "native-socket-counter-export", "native-socket-prequeued", "native-socket-segmented", "native-socket-prefixed", "native-socket-orphan", "native-eventfd", "native-eventfd-semaphore", "native-socket-concurrent", "native-socket-half-closed", "native-socket-prepared-stale", "native-shared-table", "native-unshare", "native-prepared-stale", "native-prepared-restored"] as const)("reexecutes an owned child binding across turns without replaying its parent or stale input (%s)", { timeout: 20_000 }, async (mode, { skip, benchmark }) => {
+nativeTest.for(["completed", "running", ...["", "-merged", "-closed-input", "-descriptors", "-descriptors-merged", "-null", "-null-stdin", "-status", "-directory", "-directory-entries", "-directory-prepared-stale", "-directory-opath", "-directory-opath-prepared-stale", "-pipe", "-pipe-prepared-stale", "-pipe-live", "-pipe-live-prepared-stale", "-pipe-live-mixed", "-pipe-live-transfer", "-pipe-producer", "-pipe-producer-queued", "-pipe-producer-short", "-pipe-producer-splice", "-socket", "-socket-running", "-socket-duplex", "-socket-lifetime", "-socket-io", "-socket-messages", "-socket-export", "-socket-counter-export", "-socket-prequeued", "-socket-segmented", "-socket-prefixed", "-socket-orphan", "-eventfd", "-eventfd-semaphore", "-socket-concurrent", "-socket-half-closed", "-socket-prepared-stale", "-shared-table", "-unshare", "-prepared-stale", "-prepared-restored"].map(mode => `native${mode}`)] as const)("reexecutes an owned child binding across turns without replaying its parent or stale input (%s)", { timeout: 20_000 }, async (mode, { skip, benchmark }) => {
 		const fixture = await benchmark("pi-process-binding-", mode.includes("prepared-") ? "git" : undefined); // Borrowed immutable preparations.
 		const publications = await recordProcessPublications(fixture);
 		using errors = vi.spyOn(fixture.backend as unknown as { setError(session: unknown, message: string): void }, "setError");
@@ -1436,8 +1436,9 @@ int main(int argc, char **argv) {
 		}
 		const actor = vi.fn(() => fixture.coordinator.runWith(route.executor, () => fixture.tool.execute("prepared", { command: changedParent })));
 		const stalePreparation = mode.endsWith("prepared-stale");
+		const operations = () => events.filter(event => event.type === "operation_prediction");
 		expect((await host.execute(call("prepared", changedParent), undefined, actor)).content).toEqual([fauxText(`automatic-parent\n${stalePreparation ? "changed after preparation\n" : "newest\n"}${suffix}`)]);
-		if (running) expect(await publication!.joined(), JSON.stringify({ actor: fixture.backend.actorMetrics(), producer: fixture.backend.metrics(), errors: errors.mock.calls.map(call => call[1]), operations: events.filter(event => event.type === "operation_prediction") })).toBe(true);
+		if (running) expect(await publication!.joined(), JSON.stringify({ actor: fixture.backend.actorMetrics(), producer: fixture.backend.metrics(), errors: errors.mock.calls.map(call => call[1]), operations: operations() })).toBe(true);
 		expect(actor).toHaveBeenCalledOnce();
 		if (segmented || orphan) expect(fixture.backend.actorMetrics().hits).toBe(1);
 		if (orphan) expect((await publications()).some(certificate => certificate.prototype.inheritedFDs.some(fd => fd.installed === false))).toBe(true);
@@ -1445,10 +1446,10 @@ int main(int argc, char **argv) {
 		expect(fixture.backend.metrics().misses).toBeGreaterThan(before.misses);
 		await host.finishTurn("prepared");
 		const timing = consumedTiming(events, "prepared");
-		if (stalePreparation) expect(timing.hiddenComputeMs, JSON.stringify({ metrics: fixture.backend.actorMetrics(), operations: events.filter(event => event.type === "operation_prediction") })).toBe(0);
+		if (stalePreparation) expect(timing.hiddenComputeMs, JSON.stringify({ metrics: fixture.backend.actorMetrics(), operations: operations() })).toBe(0);
 		else expect(timing.hiddenComputeMs,
-			JSON.stringify({ metrics: fixture.backend.actorMetrics(), producer: fixture.backend.metrics(), bindings: fixture.backend.executionBindings(later), operations: events.filter(event => event.type === "operation_prediction") })).toBeGreaterThan(0);
-		expect(events.filter(event => event.type === "operation_prediction").filter(event => !launcher || stalePreparation || event.settlement.observation === "observed"), JSON.stringify({ operations: events.filter(event => event.type === "operation_prediction"), errors: errors.mock.calls.map(call => call[1]), metrics: fixture.backend.actorMetrics() })).toMatchObject(Array.from({ length: launcher && stalePreparation ? 2 : 1 }, () => ({ settlement: stalePreparation ? { observation: "unobserved" } : {
+			JSON.stringify({ metrics: fixture.backend.actorMetrics(), producer: fixture.backend.metrics(), bindings: fixture.backend.executionBindings(later), operations: operations() })).toBeGreaterThan(0);
+		expect(operations().filter(event => !launcher || stalePreparation || event.settlement.observation === "observed"), JSON.stringify({ operations: operations(), errors: errors.mock.calls.map(call => call[1]), metrics: fixture.backend.actorMetrics() })).toMatchObject(Array.from({ length: launcher && stalePreparation ? 2 : 1 }, () => ({ settlement: stalePreparation ? { observation: "unobserved" } : {
 			prediction: { source: "execution_preparation", kind: "operation" }, observation: "observed", match: { matched: true, adoption: { status: "adopted" } },
 		} })));
 		await expect.poll(() => patternStore.recent(scope.sessionID).map(event => event.input.command)).toEqual(["printf common", "printf common", ...(discovery ? [command] : []), command, changedParent]);

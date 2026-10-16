@@ -18,10 +18,10 @@ import { commitBenchmarkFixture, compileBenchmarkHelper, createLinuxProcessBench
 import { EXACT_TOOL_OBSERVATION, type ToolObservationContract } from "../src/tool-settlement.ts";
 import { ActorForkPlanSource } from "../src/actor-fork-plan-source.ts";
 import type { AgentPlanSource } from "../src/agent-runtime-types.ts";
+import { toolUse } from "./model.ts";
 
 const writeText = (cwd: string, file: string, text: string) => writeFile(path.join(cwd, file), text);
 const track = <T>(pending: Promise<unknown>[], task: Promise<T>) => { pending.push(task); void task.catch(() => {}); return task; };
-const toolUse = (...args: Parameters<typeof fauxToolCall>) => fauxAssistantMessage(fauxToolCall(...args), { stopReason: "toolUse" });
 const toolReply = (...args: Parameters<typeof fauxToolCall>) => fauxAssistantMessage(fauxToolCall(...args));
 
 const directories = temporaryDirectories("pi-agent-system-");
