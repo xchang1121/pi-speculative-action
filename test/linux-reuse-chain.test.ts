@@ -44,7 +44,7 @@ async function chainWorld(files: readonly (readonly [string, string])[], loops: 
 		for (const [file, text] of [...files, [".gitignore", "slow\n"], ["slow.c", "#include <stdio.h>\n#include <fcntl.h>\n#include <unistd.h>\nint main(int argc, char **argv) { int f = open(argv[1], O_RDONLY); if (f < 0) return 1;" +
 			` unsigned long h = 5381; unsigned char c;\n while (read(f, &c, 1) == 1) h = h * 33 + c; close(f);\n for (volatile unsigned long i = 0; i < ${loops}ul; i++) h ^= i;` +
 			" if (argc > 2) getpid(); printf(\"%s %lx\\n\", argv[1], h); return 0; }\n"]] as const) await writeFile(path.join(workspace, file), text);
-		await compileBenchmarkHelper(workspace, { source: "slow.c", output: "slow" });
+		await compileBenchmarkHelper(workspace, "slow");
 		await commitBenchmarkFixture(workspace, "chain");
 		await prepareLinuxProcessReuse(fixture);
 		const route = await fixture.prepareActorReplay(), writer = createWriteTool(workspace), tools = [fixture.tool, writer];

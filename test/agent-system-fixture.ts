@@ -32,6 +32,7 @@ export function systemHost(cwd: string, tools: AgentTool[], options: Partial<Cre
 	};
 	return {
 		host, events, fallbacks, oracle: authoritative,
+		get actors(): Extract<SpeculativeActionEvent<string>, { type: "actor_action" }>[] { return events.filter(event => event.type === "actor_action"); },
 		start: async (id = "first") => {
 			turnID = id;
 			await host.startTurn({ turnID, tools, actorOptions: {}, actorModel: testModel("actor", { contextWindow: 262144 }),

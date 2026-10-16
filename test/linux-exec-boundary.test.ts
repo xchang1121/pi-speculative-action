@@ -12,7 +12,7 @@ import { cHeaders, commitBenchmarkFixture, compileBenchmarkHelper, processTest,
 	const fixture = await benchmark("pi-held-production-", driver);
 	const { backend, workspace } = fixture;
 	await writeFile(path.join(workspace, "input.txt"), "before\n");
-	await compileBenchmarkHelper(workspace, { source: "worker.c", output: "worker", code: String.raw`
+	await compileBenchmarkHelper(workspace, "worker", { code: String.raw`
 ${cHeaders("fcntl.h sys/random.h sys/prctl.h time.h sys/stat.h unistd.h")}
 int main(int argc, char **argv) {
 	if (argc > 2) {

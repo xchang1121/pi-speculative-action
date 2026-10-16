@@ -15,7 +15,7 @@ import type { ValidationMetrics } from "./settlement.ts";
 
 export type ResourceDependency = {
 	readonly path: string;
-	readonly scope: ResourceDependencyScope | "stat" | "type" | "entry" | "names" | "binding" | "resolution";
+	readonly scope: ResourceDependencyScope | "stat" | "type" | "entry" | "exists" | "names" | "binding" | "resolution";
 };
 
 export type ResourceObservation = ResourceDependency & { readonly fingerprint: string; readonly stamp?: string;
@@ -60,13 +60,12 @@ export type ResourceVersionToken = {
 };
 
 type CapturedResource = (
-	| { readonly type: "file"; readonly content?: Buffer; readonly size?: number }
+	| { readonly type: "file"; readonly content?: Buffer }
 	| { readonly type: "directory"; readonly entries?: readonly string[] }
 	| { readonly type: "alias"; readonly target?: string; readonly link: string }
-	| { readonly type: "special" }
-	| { readonly type: "missing" }) & { readonly realPath?: string; readonly dependency?: string; readonly metadataDependency?: string;
+	| { readonly type: "special" | "missing" }) & { readonly realPath?: string; readonly dependency?: string;
 		readonly object?: StableFilesystemCapture["object"] | null; readonly objectBytes?: number;
-		readonly computation?: TimelineInterval; readonly metadataComputation?: TimelineInterval };
+		readonly computation?: TimelineInterval; readonly metadata?: { readonly dependency?: string; readonly computation?: TimelineInterval; readonly size?: number } };
 
 type ResourceInputSource = {
 	readonly view: ResourceReadView;
@@ -134,16 +133,16 @@ export class ResourceReadView {
 	retainMetadata(observations: ReadonlyMap<string, ResourceObservation>, maxBytes: number): ResourceReadView | undefined {
 		this.assertComplete(true);
 		if (maxBytes <= 0) return undefined;
-		let retained: ResourceReadView | undefined;
+		// The root proof still anchors queries whose retained metadata belongs to another token.
+		let retained = this.boundary?.dependency && observations.has(this.boundary.dependency)
+			? new ResourceReadView(maxBytes, undefined, this.boundary) : undefined;
 		for (const observation of observations.values()) for (let target: string | undefined = filesystemPathKey(observation.path); target;) {
 			const entry = this.entries.get(target);
-			if (!entry || (entry.type !== "directory" && entry.type !== "alias" && entry.type !== "file") || retained?.entries.has(target)) break;
-			const dependency = entry.metadataDependency && observations.has(entry.metadataDependency) ? entry.metadataDependency : entry.dependency;
+			if (!entry || retained?.entries.has(target)) break;
+			const dependency = entry.metadata?.dependency && observations.has(entry.metadata.dependency) ? entry.metadata.dependency : entry.dependency;
 			if (!dependency || !observations.has(dependency)) break;
-			retained ??= new ResourceReadView(maxBytes, undefined,
-				this.boundary?.dependency && observations.has(this.boundary.dependency) ? this.boundary : undefined);
-			retained.capture(target, entry.type === "alias" ? entry : { type: entry.type, realPath: entry.realPath, dependency, computation: entry.metadataComputation, metadataComputation: entry.metadataComputation,
-				...(entry.type === "file" ? { size: entry.size ?? entry.content?.length } : {}) });
+			retained ??= new ResourceReadView(maxBytes);
+			retained.capture(target, resourceMetadata(entry, dependency));
 			if (!retained.retained) { void retained.dispose(); return undefined; }
 			target = entry.type === "alias" ? entry.target : undefined;
 		}
@@ -157,13 +156,13 @@ export class ResourceReadView {
 		this.inputEpoch++;
 		if (this.boundary?.dependency && dependencies.has(this.boundary.dependency)) this.boundary = undefined;
 		for (const [target, entry] of this.entries) if (!entry.dependency || dependencies.has(entry.dependency) ||
-			entry.metadataDependency && dependencies.has(entry.metadataDependency)) {
+			entry.metadata?.dependency && dependencies.has(entry.metadata.dependency)) {
 			this.releaseObject(entry);
 			if (entry.object !== undefined) this.objectCount--;
-			const dependency = entry.metadataDependency;
+			const dependency = entry.metadata?.dependency;
 			if (dependency && !dependencies.has(dependency) && entry.type !== "alias") {
-				const bytes = Buffer.byteLength(target) + Buffer.byteLength(entry.realPath ?? "") + Buffer.byteLength(dependency) * 2 + 64 + (entry.metadataComputation ? 32 : 0);
-				this.entries.set(target, { type: entry.type, realPath: entry.realPath, dependency, metadataDependency: dependency, computation: entry.metadataComputation, metadataComputation: entry.metadataComputation, bytes });
+				const bytes = Buffer.byteLength(target) + Buffer.byteLength(entry.realPath ?? "") + Buffer.byteLength(dependency) * 2 + 64 + (entry.metadata?.computation ? 32 : 0);
+				this.entries.set(target, { ...resourceMetadata(entry, dependency), bytes });
 				this.capturedBytes -= entry.bytes - bytes;
 			} else { this.entries.delete(target); this.capturedBytes -= entry.bytes; removed.push(target); }
 		}
@@ -192,19 +191,22 @@ export class ResourceReadView {
 		this.capturedBytes += bytes;
 		return true;
 	}
+	captureObject(target: string, input: StableFilesystemCapture, dependency?: string): void {
+		this.capture(target, { ...(input.entries ? { type: "directory", entries: input.entries, objectBytes: input.bytesRead } : { type: "file", content: input.content }),
+			object: input.object, computation: input.computation, realPath: input.realPath, dependency });
+	}
 	capture(target: string, entry: CapturedResource, reservedBytes = 0): void {
 		const key = filesystemPathKey(target), previous = this.entries.get(key);
 		const sameMetadata = previous?.type === entry.type && previous?.realPath === entry.realPath && entry.type !== "alias";
-		const metadataDependency = /^(entry|type|stat):/.test(entry.dependency ?? "") ? entry.dependency
-			: sameMetadata ? previous?.metadataDependency : undefined;
-		const metadataComputation = entry.metadataComputation ?? (metadataDependency === entry.dependency ? entry.computation : sameMetadata ? previous?.metadataComputation : undefined);
+		const metadata = /^(entry|type|stat|exists):/.test(entry.dependency ?? "") ? entry.metadata ?? { dependency: entry.dependency, computation: entry.computation }
+			: sameMetadata && previous?.metadata || entry.metadata;
 		// Overlapping scopes enrich one input view; a metadata observation cannot erase its payload.
-		const redundant = (entry.type === "file" && previous?.type === "file" && entry.content === undefined && (previous.content !== undefined || entry.size === undefined)) ||
+		const redundant = (entry.type === "file" && previous?.type === "file" && entry.content === undefined && (previous.content !== undefined || resourceSize(entry) === undefined)) ||
 			(entry.type === "directory" && previous?.type === "directory" && entry.entries === undefined);
-		let retained = redundant && !sameMetadata ? previous! : { ...(redundant ? previous! : entry), metadataDependency, metadataComputation };
+		let retained = redundant && !sameMetadata ? previous! : { ...(redundant ? previous! : entry), metadata };
 		const objectBytes = retained.object !== undefined ? 256 + (retained.objectBytes ?? 0) : 0;
 		let bytes = Buffer.byteLength(key) + Buffer.byteLength(retained.realPath ?? "") + Buffer.byteLength(retained.dependency ?? "") +
-			Buffer.byteLength(retained.metadataDependency ?? "") + 64 + objectBytes + 32 * (Number(!!retained.computation) + Number(!!retained.metadataComputation && retained.metadataComputation !== retained.computation)) + (retained.type === "file" ? retained.content?.length ?? 0 : retained.type === "directory"
+			Buffer.byteLength(retained.metadata?.dependency ?? "") + 64 + objectBytes + 32 * (Number(!!retained.computation) + Number(!!retained.metadata?.computation && retained.metadata.computation !== retained.computation)) + (retained.type === "file" ? retained.content?.length ?? 0 : retained.type === "directory"
 				? retained.entries?.reduce((sum, name) => sum + Buffer.byteLength(name) + 16, 0) ?? 0
 				: retained.type === "alias" ? Buffer.byteLength(retained.target ?? "") + Buffer.byteLength(retained.link) : 0);
 		if (retained.object !== undefined && (this.bytes + bytes - (previous?.bytes ?? 0) - reservedBytes > this.maxBytes ||
@@ -219,12 +221,13 @@ export class ResourceReadView {
 		this.objectCount += Number(retained.object !== undefined) - Number(previous?.object !== undefined);
 		this.entries.set(key, { ...retained, bytes });
 	}
-	exists = async (target: string): Promise<boolean> => (await this.get(target, "type")).type !== "missing";
-	stat = async (target: string, fields?: "type" | "entry"): Promise<ToolFilesystemStat> => {
-		const entry = await this.get(target, fields ?? "stat");
-		if (entry.type === "missing" || (!fields && entry.type === "file" && entry.content === undefined && entry.size === undefined)) return this.unproven(target);
-		return { isDirectory: () => entry.type === "directory", realPath: entry.realPath, size: !fields && entry.type === "file" ? entry.content?.length ?? entry.size : undefined,
-			...(fields === "entry" ? { type: entry.type === "alias" ? "symlink" : entry.type, ...(entry.type === "alias" ? { link: entry.link } : {}) } : {}) };
+	// Windows F_OK observes the final reparse point, including a dangling junction.
+	exists = async (target: string): Promise<boolean> => (await this.get(target, process.platform === "win32" ? "exists" : "type")).type !== "missing";
+	stat = async (target: string, fields?: "type" | "entry", includeSize = true): Promise<ToolFilesystemStat> => {
+		const entry = await this.get(target, fields === "entry" ? includeSize ? "entry" : "exists" : includeSize ? "stat" : "type");
+		if (entry.type === "missing") return this.unproven(target);
+		return { isDirectory: () => entry.type === "directory", size: includeSize ? resourceSize(entry) : undefined,
+			type: entry.type === "alias" ? "symlink" : entry.type, ...(entry.type === "alias" ? { link: entry.link } : { realPath: entry.realPath }) };
 	};
 	readdir = async (target: string): Promise<string[]> => {
 		const entry = await this.get(target, "names");
@@ -401,8 +404,8 @@ export class ResourceReadView {
 				} else if (filesystemPathKey(root) === filesystemPathKey(path.parse(root).root)) {
 					view.boundary = { root, physicalRoot: root };
 				} else {
-					const entry = await view.stat(root, "type");
-					if (!entry.isDirectory() || !entry.realPath) view.unproven(root);
+					const entry = await view.get(root, "type");
+					if (entry.type !== "directory" || !entry.realPath) view.unproven(root);
 					view.boundary = { root, physicalRoot: entry.realPath! };
 				}
 				const output = await operation(view);
@@ -441,7 +444,7 @@ export class ResourceReadView {
 		if (this.owner && !this.owner.sealed) await this.owner.get(target, scope);
 		if (this.load && !this.sealed) {
 			const pending = (this.pending ?? Promise.resolve()).then(() => {
-				const { entry } = this.entry(target, scope !== "entry");
+				const { entry } = this.entry(target, followsResource(scope));
 				// Existing input evidence also owns the metadata derivable from those bytes or names.
 				if (resourceCovers(entry, scope)) return;
 				return this.load!({ path: target, scope });
@@ -455,17 +458,17 @@ export class ResourceReadView {
 		try {
 			// Probe only this read; rejected aliases leave neither dependencies nor computation receipts.
 			({ entry, resolved } = this.validateInputs ? await this.evaluate(async view => {
-				const input = view.entry(target, scope !== "entry", scope);
+				const input = view.entry(target, followsResource(scope), scope);
 				if (input.entry || input.resolved !== resolved)
 					await TimelineInterval.outside(() => this.validateInputs!(this.observed?.(view.dependencies, false) ?? []));
 				return input;
 			}, observed => {
 				if (!observed) this.dependencies = undefined;
 				else if (this.dependencies) for (const dependency of observed) this.dependencies.add(dependency);
-			}, this.boundary) : this.entry(target, scope !== "entry", scope));
+			}, this.boundary) : this.entry(target, followsResource(scope), scope));
 		} catch { this.assertComplete(); }
 		if (resourceCovers(entry, scope)) {
-			TimelineInterval.use(["stat", "type", "entry"].includes(scope) ? entry?.metadataComputation : entry?.computation);
+			TimelineInterval.use(["stat", "type", "entry", "exists"].includes(scope) ? entry?.metadata?.computation : entry?.computation);
 			return entry!;
 		}
 		// The local alias proof owns this translation; the source owns the resolved resource.
@@ -521,12 +524,12 @@ export class ResourceReadView {
 		return { resolved: current };
 	}
 	private observe(entry: CapturedResource | undefined, scope?: ResourceDependency["scope"]): CapturedResource | undefined {
-		if (this.owner && this.boundary && entry?.realPath && (entry.type !== "alias" || scope === "entry") &&
+		if (this.owner && this.boundary && entry?.realPath && (entry.type !== "alias" || scope !== undefined && !followsResource(scope)) &&
 			!containsFilesystemPath(this.boundary.physicalRoot, entry.realPath)) this.unproven(entry.realPath);
 		if (entry?.type === "alias") TimelineInterval.use(entry.computation);
 		if (entry && this.dependencies) {
-			const dependency = entry.type !== "alias" && (scope === "type" || scope === "entry" || (scope === "stat" && entry.type !== "file"))
-				? entry.metadataDependency ?? entry.dependency : entry.dependency;
+			const dependency = entry.type !== "alias" && (scope === "type" || scope === "exists" || ((scope === "entry" || scope === "stat") && !(entry.type === "file" && entry.content !== undefined)))
+				? entry.metadata?.dependency ?? entry.dependency : entry.dependency;
 			if (dependency) this.dependencies.add(dependency); else this.dependencies = undefined;
 		}
 		return entry;
@@ -552,9 +555,18 @@ export async function collectResourceComputation<T>(operation: () => T | Promise
 	return evaluation.output.value;
 }
 
+const resourceSize = (entry: CapturedResource) => (entry.type === "file" ? entry.content?.length : undefined) ?? entry.metadata?.size;
+
+function resourceMetadata(entry: CapturedResource, dependency: string): CapturedResource {
+	const metadata = entry.metadata?.dependency === dependency ? entry.metadata : { dependency, computation: entry.metadata?.computation, size: entry.type === "file" ? entry.content?.length : undefined };
+	return entry.type === "alias" ? entry : { type: entry.type, realPath: entry.realPath, dependency, computation: metadata.computation, metadata };
+}
+
+const followsResource = (scope: ResourceDependency["scope"]) => scope !== "entry" && scope !== "exists";
+
 function resourceCovers(entry: CapturedResource | undefined, scope: ResourceDependency["scope"]): boolean {
-	return !!entry && (scope === "entry" || scope === "type" ||
-		(scope === "stat" && (entry.type !== "file" || entry.size !== undefined || entry.content !== undefined)) ||
+	return !!entry && (scope === "type" || scope === "exists" ||
+		((scope === "entry" || scope === "stat") && (entry.type === "missing" || resourceSize(entry) !== undefined)) ||
 		(scope === "names" && entry.type === "directory" && entry.entries !== undefined) ||
 		(scope === "content" && entry.type === "file" && entry.content !== undefined));
 }
@@ -634,7 +646,7 @@ export class ResourceVersionManager {
 		providedInputs?: ReadonlyMap<string, ResourceInput>): Promise<ResourceVersionToken> {
 		if (!this.open) throw new Error("resource_version_manager_closed");
 		if (this.snapshotExcludes.size && retainBytes !== undefined) throw new Error("resource_filtered_snapshot_not_readable");
-		const observations = new Map<string, ResourceDependency & { fingerprint: string; stamp?: string }>();
+		const observations = new Map<string, ResourceObservation>();
 		const treeObjects = this.gitObjects && dependencies?.some((dependency) => dependency.scope === "tree_content") ? new Map<string, TreeObject>() : undefined;
 		let precise: ReturnType<ResourceVersionManager["acquirePreciseWatches"]> | undefined;
 		this.references++;
@@ -645,7 +657,11 @@ export class ResourceVersionManager {
 			if (observing) await (this.ready ??= this.startWatching());
 			const physicalRoot = await fingerprintIO(() => fs.realpath(this.root));
 			const capture = async (requested: ReadonlyArray<ResourceDependency>) => {
-				const normalized = normalizeDependencies(this.root, requested).filter((dependency) => !observations.has(dependencyKey(dependency)));
+				const normalized = [...new Map(requested.map(({ path: target, scope }) => {
+					const dependency = { path: path.resolve(this.root, target), scope };
+					if (!containsFilesystemPath(this.root, dependency.path)) throw new Error(`resource dependency escapes workspace: ${target}`);
+					return [dependencyKey(dependency), dependency];
+				})).values()].filter(dependency => !observations.has(dependencyKey(dependency)));
 				if (!normalized.length) return;
 				if (observing && this.reliable) precise = this.acquirePreciseWatches(normalized);
 				for (const observation of await fingerprintDependencies(normalized, physicalRoot, this.snapshotExcludes, view,
@@ -658,8 +674,7 @@ export class ResourceVersionManager {
 						filesystemPathKey(target) !== filesystemPathKey(content.realPath) ||
 						!(content.stat.isDirectory() ? content.entries : content.stat.isFile())) return;
 					const dependency = { path: target, scope: content.entries ? "names" as const : "content" as const }, key = dependencyKey(dependency);
-					view!.capture(target, { ...(content.entries ? { type: "directory" as const, entries: content.entries, objectBytes: content.bytesRead }
-						: { type: "file" as const, content: content.content }), object: content.object, computation: content.computation, realPath: content.realPath, dependency: key });
+					view!.captureObject(target, content, key);
 					const { value, stamp } = content.entries ? fingerprintDirectory(content.stat, content.realPath, content.entries) : fingerprintFile(content);
 					observations.set(key, { ...dependency, stamp, fingerprint: digest({ path: filesystemPathKey(target), scope: dependency.scope, value }) });
 				});
@@ -885,17 +900,6 @@ export function isResourceVersionToken(value: unknown): value is ResourceVersion
 
 export function closeResourceVersionManagers() { for (const manager of managers.values()) manager.close(); managers.clear(); }
 
-function normalizeDependencies(root: string, dependencies: ReadonlyArray<ResourceDependency>) {
-	const result = new Map<string, ResourceDependency>();
-	for (const dependency of dependencies) {
-		const absolute = path.resolve(root, dependency.path);
-		if (!containsFilesystemPath(root, absolute)) throw new Error(`resource dependency escapes workspace: ${dependency.path}`);
-		const normalized = { path: absolute, scope: dependency.scope };
-		result.set(dependencyKey(normalized), normalized);
-	}
-	return [...result.values()];
-}
-
 const dependencyKey = (dependency: ResourceDependency) => `${dependency.scope}:${filesystemPathKey(dependency.path)}`;
 
 function affects(dependency: ResourceDependency, event: ResourceEvent, preciseContent: ReadonlySet<string>) {
@@ -903,7 +907,7 @@ function affects(dependency: ResourceDependency, event: ResourceEvent, preciseCo
 	if (event.type === "unknown") return true;
 	const dependencyPath = filesystemPathKey(dependency.path);
 	const changed = filesystemPathKey(event.path);
-	if (["content", "stat", "type", "entry"].includes(dependency.scope)) {
+	if (["content", "stat", "type", "entry", "exists"].includes(dependency.scope)) {
 		if (dependencyPath === changed) return true;
 		// Some recursive watchers report only the containing directory for a file write.
 		return !preciseContent.has(dependencyPath) && containsFilesystemPath(changed, dependencyPath);
@@ -934,7 +938,7 @@ function directoryObjectSlot(names: readonly string[], view?: ResourceReadView) 
 
 async function fingerprintDependencies(
 	dependencies: ReadonlyArray<ResourceDependency>, realRoot: string, excludes: ReadonlySet<string>, view?: ResourceReadView,
-	bindings?: { readonly root: string; readonly observations: Map<string, ResourceDependency & { fingerprint: string; stamp?: string }> },
+	bindings?: { readonly root: string; readonly observations: Map<string, ResourceObservation> },
 	providedInputs?: ReadonlyMap<string, ResourceInput>,
 	treeObjects?: Map<string, TreeObject>,
 ) {
@@ -955,14 +959,6 @@ async function fingerprintDependencies(
 		entries.set(key, pending); return pending;
 	};
 	if (bindings) await capture(bindings.root);
-	const captureEntry = async (target: string, scope: ResourceDependency["scope"]) => {
-		if (bindings) {
-			for await (const entry of walkFilesystemPath(target, { capture, followFinal: scope !== "entry" })) {
-				if (entry.info && !entry.info.isDirectory() && entry.link === undefined && !entry.terminal) break;
-			}
-		}
-		return capture(target);
-	};
 	return mapFilesystem(dependencies, async (dependency) => {
 		if (dependency.scope === "binding") return fingerprintBinding(dependency);
 		const key = dependencyKey(dependency);
@@ -988,7 +984,10 @@ async function fingerprintDependencies(
 		const startedAt = performance.now();
 		let captured: Awaited<ReturnType<typeof captureFilesystemEntry>>;
 		try {
-			captured = await captureEntry(target, scope);
+			if (bindings) for await (const entry of walkFilesystemPath(target, { capture, followFinal: followsResource(scope) })) {
+				if (entry.info && !entry.info.isDirectory() && entry.link === undefined && !entry.terminal) break;
+			}
+			captured = await capture(target);
 		} catch (error) {
 			if (!missingResource(error)) throw error;
 			if (providedInputs && providedInputs.get(filesystemPathKey(target)) !== null) throw error;
@@ -1012,6 +1011,9 @@ async function fingerprintDependencies(
 		// An entry name joined to a walked directory stays where the directory was proven to be.
 		if (parentReal === undefined) assertInside(realRoot, realTarget);
 		const identity = filesystemPathKey(realTarget);
+		const metadata = { dependency, computation: captured.computation };
+		const retainEntry = (entry: CapturedResource, reserved = 0) => view?.capture(target,
+			{ realPath: realTarget, ...metadata, metadata, ...entry }, reserved);
 		const grouping = aliases.get(dependency);
 		if (grouping && info.isFile() && info.nlink > 1n) {
 			const key = `${info.dev}:${info.ino}`, links = Number(info.nlink), previous = grouping.get(key);
@@ -1023,27 +1025,30 @@ async function fingerprintDependencies(
 		if (info.isSymbolicLink()) {
 			let source: string | undefined;
 			const links: unknown[] = [];
-			if (scope !== "entry") await fingerprintIO(async () => {
+			if (followsResource(scope)) await fingerprintIO(async () => {
 				for await (const entry of walkFilesystemPath(target)) {
 					source = entry.path;
 					if (entry.link !== undefined) links.push([filesystemPathKey(source), entry.link, statStamp(entry.info!)]);
 				}
 			});
 			const followed = source === undefined ? undefined : await fingerprintPath(source, scope, dependency, new Set(ancestors).add(identity), descend);
-			view?.capture(target, { type: "alias", target: source && filesystemPathKey(source), link: link!, realPath: realTarget, dependency, computation: captured.computation });
+			retainEntry({ type: "alias", target: source && filesystemPathKey(source), link: link!, metadata: { ...metadata, size: Number(info.size) } });
 			if (scope === "tree_content") treeObjects?.set(target, { mode: Number(info.mode), link: link! });
 			return {
-				value: { type: "symlink", link, mode: Number(info.mode), resolved: identity, target: followed?.value },
+				value: { type: "symlink", link, size: Number(info.size), mode: Number(info.mode), resolved: identity, target: followed?.value },
 				stamp: digest(["symlink", link, statStamp(info), links, followed?.stamp]),
 				bytesRead: followed?.bytesRead ?? 0,
 				filesRead: followed?.filesRead ?? 0,
 			};
 		}
-		if (["stat", "type", "entry"].includes(scope) || (scope === "entries" && !descend) || (["names", "entries", "tree_entries"].includes(scope) && !info.isDirectory())) {
-			view?.capture(target, { type: info.isDirectory() ? "directory" : info.isFile() ? "file" : "special", realPath: realTarget, dependency,
-				computation: supplied && "computation" in supplied ? supplied.computation : captured.computation,
-				...(scope === "stat" && info.isFile() ? { size: Number(info.size) } : {}) });
-			return stableEntry(target, info, identity, scope, parentReal !== undefined);
+		if (["stat", "type", "entry", "exists"].includes(scope) || (scope === "entries" && !descend) || (["names", "entries", "tree_entries"].includes(scope) && !info.isDirectory())) {
+			const after = parentReal === undefined ? await fingerprintIO(() => fs.lstat(target, { bigint: true })) : info;
+			if (!sameFilesystemIdentity(info, after)) throw new Error(`resource_file_changed:${target}`);
+			const size = ["stat", "entry"].includes(scope) ? Number(after.size) : undefined;
+			const computation = supplied && "computation" in supplied ? supplied.computation : captured.computation;
+			retainEntry({ type: after.isDirectory() ? "directory" : after.isFile() ? "file" : "special", computation, metadata: { dependency, computation, size } });
+			return { value: { type: specialFileType(after), mode: Number(after.mode), resolved: identity, size },
+				stamp: digest([statStamp(after), identity]), bytesRead: 0, filesRead: 0 };
 		}
 		if (info.isFile()) {
 			const key = JSON.stringify([filesystemPathKey(target), identity, statStamp(info), String(info.uid), String(info.gid)]), existing = files.get(key);
@@ -1068,9 +1073,9 @@ async function fingerprintDependencies(
 						stat: info, realPath: realTarget, retainObject: retain && view!.canRetainObject, gitBlob }));
 				if (!bytes && !content.shared) rememberCapture(content, takenAtMs);
 				assertInside(realRoot, content.realPath);
-				view?.capture(target, { type: "file", content: content.content, computation: content.computation, metadataComputation: captured.computation,
+				retainEntry({ type: "file", content: content.content, computation: content.computation,
 					object: content.object ?? (bytes && retain && view!.canRetainObject ? null : undefined),
-					realPath: content.realPath, dependency }, retain ? provided?.byteLength ?? Number(info.size) : 0);
+					realPath: content.realPath }, retain ? provided?.byteLength ?? Number(info.size) : 0);
 				return {
 					...fingerprintFile(content),
 					bytesRead: bytes || content.shared ? 0 : content.bytesRead,
@@ -1083,7 +1088,7 @@ async function fingerprintDependencies(
 		}
 		if (!info.isDirectory() || scope === "content") throw new Error(`unsupported_resource_type:${specialFileType(info)}:${target}`);
 		if (supplied && "names" in supplied && supplied.names) {
-			view?.capture(target, { type: "directory", entries: supplied.names, realPath: realTarget, dependency, computation: supplied.computation,
+			retainEntry({ type: "directory", entries: supplied.names, computation: supplied.computation, metadata: { dependency, computation: supplied.computation },
 				...directoryObjectSlot(supplied.names, view) });
 			return { ...fingerprintDirectory(info, realTarget, supplied.names), bytesRead: 0, filesRead: 0 };
 		}
@@ -1107,7 +1112,7 @@ async function fingerprintDependencies(
 			throw new Error(`resource_directory_changed:${target}`);
 		}
 		const names = selected.map(entry => entry.name);
-		view?.capture(target, { type: "directory", entries: names, realPath: realTarget, dependency, computation, metadataComputation: captured.computation, ...directoryObjectSlot(names, view) });
+		retainEntry({ type: "directory", entries: names, computation, ...directoryObjectSlot(names, view) });
 		return {
 			...fingerprintDirectory(after, realTarget, names, children),
 			bytesRead: children.reduce((total, child) => total + child.bytesRead, 0),
@@ -1123,17 +1128,6 @@ async function fingerprintBinding(dependency: ResourceDependency) {
 		stamp = digest([statStamp(info), link]);
 	} catch (error) { if (!missingResource(error)) throw error; stamp = errorCode(error); }
 	return { ...dependency, fingerprint: "binding", stamp, bytesRead: 0, filesRead: 0 };
-}
-
-async function stableEntry(target: string, before: BigIntStats, resolved: string, scope: ResourceDependency["scope"], settled = false): Promise<FingerprintResult> {
-	const after = settled ? before : await fingerprintIO(() => fs.lstat(target, { bigint: true }));
-	if (!sameFilesystemIdentity(before, after)) throw new Error(`resource_file_changed:${target}`);
-	return {
-		value: { type: specialFileType(after), mode: Number(after.mode), resolved, size: scope === "stat" && after.isFile() ? Number(after.size) : undefined },
-		stamp: digest([statStamp(after), resolved]),
-		bytesRead: 0,
-		filesRead: 0,
-	};
 }
 
 function entryIdentity(entry: import("node:fs").Dirent): string {

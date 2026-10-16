@@ -88,159 +88,158 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 	const originalPrompt = session.agent.prompt, originalContinue = session.agent.continue;
 	let inspection: ReturnType<typeof inspectProcessOwner> | undefined;
 	let publication: Awaited<ReturnType<typeof holdOwnedProcessPublication>> | undefined;
-	try {
-		await session.bindExtensions({ mode: "print", onError: error => { throw error; } });
-		if (native) {
-			let backend: LinuxProcessReuseBackend | undefined;
-			const processOwner = LinuxProcessReuseBackend.prototype.processOwner;
-			vi.spyOn(LinuxProcessReuseBackend.prototype, "processOwner").mockImplementation(function (this: LinuxProcessReuseBackend) {
-				inspection ??= inspectProcessOwner(() => processOwner.call(this)); return processOwner.call(this);
-			});
-			let inputBinding: ProcessExecutionBinding | undefined;
-			if (mode === "native-sync-lost") {
-				const attach = SynchronousProcessObserver.prototype.attach;
-				vi.spyOn(SynchronousProcessObserver.prototype, "attach").mockImplementation(function (this: SynchronousProcessObserver, request) {
-					const attachment = attach.call(this, request);
-					return { ...attachment, finish: () => { const result = attachment.finish();
-						if (result.adoptions.length) { expect(result.metrics.hits).toBe(1); expect(Atomics.load(new Int32Array(request.claims), 0)).toBeGreaterThan(0);
-							void Reflect.get(this, "worker").terminate(); throw new Error("lost acknowledged synchronous handoff"); }
-						return result;
-					} };
-				});
-			}
-			const observe = LinuxProcessReuseBackend.prototype.observeBindings, nested = !cold && !inputs && !mode.startsWith("native-sync") && !["native", "native-stale"].includes(mode);
-			vi.spyOn(LinuxProcessReuseBackend.prototype, "observeBindings").mockImplementation(function (this: LinuxProcessReuseBackend, scope, execute, receive, ...args) {
-				backend = this; return observe.call(this, scope, execute, (bindings, computations) => {
-					if (scope.callID === "seed") {
-						const registry = Reflect.get(this, "handoffs") as ProcessHandoffRegistry<{ readonly executable: string }>;
-						inputBinding = bindings.find(binding => registry.resolveBinding(binding, scope)?.executable === path.join(cwd, "slow"));
-					}
-					return receive(nested && scope.callID === "seed" ? bindings.slice(0, 1) : bindings, computations);
-				}, ...args);
-			});
-			await compileBenchmarkHelper(cwd, { source: "slow.c", output: "slow", code: "#include <stdio.h>\n#include <fcntl.h>\n#include <unistd.h>\nint main(int n,char**v){int f=fcntl(3,F_GETFD)<0?open(v[1],O_RDONLY):3;if(f<0)return 1;unsigned long h=5381;char c;while(read(f,&c,1)==1)h=h*33+c;close(f);for(volatile unsigned long i=0;i<40000000ul;i++)h^=i;printf(\"%s %lx\\n\",v[1],h);return 0;}\n" });
-			await commitBenchmarkFixture(cwd, "sdk-callback");
-			const command = "./slow notes.txt" + (inputs ? " 3<notes.txt" : "");
-			const initial = `printf initial:; ${command}; :`, remaining = `printf remaining:; ${command}; printf once >> marker`;
-			const call = (tool: string, text: string, id: string) => fauxAssistantMessage(fauxToolCall(tool, { text }, { id }), { stopReason: "toolUse" });
-			actor.setResponses([call("produce_notes", initial, "seed"), ...(inputs ? [response("read", { path: "notes.txt", offset: 2 })] : []), ...cold ? [] : [async () => {
-				if (running) publication = await holdOwnedProcessPublication(inspection!);
-				if (preempted) {
-					await inspection!.inOwner(async state => {
-						const { ProvenanceCertificateStore } = await state.load("../src/reuse-store.ts"), publish = ProvenanceCertificateStore.prototype.withPublication;
-						state.publishedGate = state.deferred();
-						state.method(ProvenanceCertificateStore.prototype, "withPublication", async function (this: unknown, ...args: unknown[]) {
-							const result = await publish.apply(this, args); await state.publishedGate.promise; return result;
-						});
-					});
-				}
-				return response("write", { path: "notes.txt", content: "changed\n" });
-			}], ...(mode === "native-retired" ? [async () => {
-				await publication!.ready(); session.setActiveToolsByName(tools.filter(name => name !== "produce_notes"));
-				return response("read", { path: "notes.txt" });
-			}] : []), async () => {
-				expect(inputBinding).toBeDefined();
-				if (publication) await publication.ready(); else await expect.poll(() => backend!.bindingStale(inputBinding!), { timeout: 5000 }).toBe(false);
-				await expect(readFile(path.join(cwd, "marker"))).rejects.toMatchObject({ code: "ENOENT" });
-				if (stale) await writeFile(path.join(cwd, "notes.txt"), "fresh\n");
-				return call("format_rows", remaining, "check");
-			}, fauxAssistantMessage("done")]);
-			await session.prompt("Produce notes, edit the input, then render the remaining work.");
-			// A named inherited input prepares a new version after the edit; adoption still checks the actual held graph.
-			const results = session.messages.filter(message => message.role === "toolResult"), reused = !stale;
-			if (mode === "native-sync-lost") {
-				expect(results.at(-1)).toMatchObject({ isError: true }); expect(JSON.stringify(results.at(-1))).toContain("native handoff failed");
-				expect(await readFile(path.join(cwd, "marker"), "utf8")).toBe("once"); expect(calls).toEqual(["seed", "check"]); return;
-			}
-			expect(results.at(-1)?.content, JSON.stringify(session.messages)).toEqual([{ type: "text", text: "hook:own:format_rows:remaining:" + execFileSync("./slow", ["notes.txt"], { cwd, encoding: "utf8" }) }]);
-			expect(results.every(result => !result.isError)).toBe(true); expect(await readFile(path.join(cwd, "marker"), "utf8")).toBe("once");
-			expect(calls).toEqual(["seed", "check"]); expect(prepared).toEqual([initial, remaining]);
-			if (inputs) expect(summarizeSpeculativeTrace(events).inputReuseHits).toBe(1);
-			const settled = events.filter(event => event.type === "actor_action").at(-1)!, timing = settled.computation!;
-			expect(backend!.actorMetrics().hits).toBe(Number(reused)); expect(timing.hiddenComputeMs > 0).toBe(reused);
-			expect((timing.hiddenByMode ?? []).reduce((total, part) => total + part.hiddenComputeMs, 0)).toBeCloseTo(timing.hiddenComputeMs, 5);
-			const predictions = events.filter(event => event.type === "operation_prediction"), adopted = predictions.flatMap(event => event.settlement.observation === "observed" && event.settlement.match.matched && event.settlement.match.adoption.status === "adopted" ? [event.settlement.match.relation] : []);
-			if (preempted && reused) expect(events.some(event => event.type === "candidate" && event.state.status === "cancelled" && event.state.cause.code === "scheduler_preempted")).toBe(true);
-			expect(adopted).toHaveLength(Number(reused && mode !== "native-retired")); if (nested && adopted.length) expect(adopted[0]).toMatchObject({ kind: "projected", projector: "owned-operation" });
-			if (mode === "native-retired") expect(predictions.filter(event => event.settlement.prediction.id === predictions[0]!.settlement.prediction.id)).toMatchObject([{ settlement: { observation: "unobserved", cause: { code: "operation_not_observed" } } }]);
-			expect(!!settled.settlement.actionKeyHash).toBe(mode !== "native-unkeyed");
-			if (publication) expect(await publication.joined()).toBe(true);
-			expect(events.filter(event => event.type === "candidate" && event.state.status === "cancelled" && event.state.cause.code === "tool_disabled" && event.state.executionMs > 0)).toEqual([]);
-			return;
-		}
-		const registeredTools = session.agent.state.tools;
-		await session.prompt("Read notes.txt, write and edit result.txt, then read the final file.");
-		expect(session.agent.state.tools).toBe(registeredTools);
-		expect(await readFile(path.join(cwd, "notes.txt"), "utf8")).toBe("one\ntwo\n");
-		expect(await readFile(path.join(cwd, "result.txt"), "utf8")).toBe("final\n");
-		const results = session.messages.filter(message => message.role === "toolResult");
-		expect(results).toHaveLength(4);
-		expect(results.every(message => !message.isError)).toBe(true);
-		expect(results.at(-1)?.content).toEqual([{ type: "text", text: "final\n" }]);
-		const registry = session.agent.state.tools, read = registry.find(tool => tool.name === "read")!, originalExecute = read.execute;
-		for (const copy of [true, false]) {
-			const tool = copy ? { ...read } : read;
-			tool.execute = async function (id) { expect(this).toBe(tool); expect(currentExecutionScope()?.callID).toBe(id); return { content: [{ type: "text", text: "replaced" }], details: {} }; };
-			session.agent.state.tools = registry.map(current => current === read ? tool : current);
-			actor.setResponses([response("read", { path: "notes.txt" }), fauxAssistantMessage("done")]);
-			await session.prompt("Execute the current read implementation.");
-			expect(session.messages.filter(message => message.role === "toolResult").at(-1)?.content).toEqual([{ type: "text", text: "replaced" }]);
-		}
-		read.execute = originalExecute; session.agent.state.tools = registry;
-		const originalTools = session.agent.state.tools, originalNext = session.agent.prepareNextTurnWithContext;
-		for (const tool of originalTools) Object.freeze(tool);
-		Object.freeze(originalTools);
-		session.subscribe(event => { if (event.type === "tool_execution_update") updates.push(event.toolCallId); });
-		actor.setResponses([
-			fauxAssistantMessage([fauxToolCall("format_rows", { text: "first" }, { id: "a" }), fauxToolCall("format_rows", { text: "second" }, { id: "b" })], { stopReason: "toolUse" }),
-			fauxAssistantMessage([fauxToolCall("read", { text: "third" }, { id: "c" }), fauxToolCall("late_rows", { text: "fourth" }, { id: "d" }),
-				fauxToolCall("format_rows", { text: "skip" }, { id: "blocked" })], { stopReason: "toolUse" }), fauxAssistantMessage("done"),
-		]);
-		await session.prompt("Execute the registered callbacks.");
-		expect(prepared).toEqual(["first", "second", "third", "fourth", "skip"]);
-		expect([calls.slice(0, 2).sort(), calls.slice(2).sort()]).toEqual([["a", "b"], ["c", "d"]]); expect(updates).toEqual(["b", "a", "d", "c"]);
-		expect(hooks.slice(0, 2)).toEqual(["before:a", "before:b"]); expect(hooks.slice(2, 4).sort()).toEqual(["after:a", "after:b"]);
-		expect(hooks.slice(4, 7)).toEqual(["before:c", "before:d", "before:blocked"]); expect(hooks.slice(7).sort()).toEqual(["after:c", "after:d"]);
-		expect(session.messages.filter(message => message.role === "toolResult").slice(-5).map(message => [message.toolCallId, message.content, message.isError])).toEqual([
-			["a", [{ type: "text", text: "hook:own:format_rows:first:prepared" }], false], ["b", [{ type: "text", text: "hook:own:format_rows:second:prepared" }], false],
-			["c", [{ type: "text", text: "hook:own:read:third:prepared" }], false], ["d", [{ type: "text", text: "hook:own:late_rows:fourth:prepared" }], false],
-			["blocked", [{ type: "text", text: "blocked-on-purpose" }], true],
-		]);
-		expect(session.agent.prepareNextTurnWithContext).toBe(originalNext);
-		expect(events.filter(event => event.type === "actor_action")).toHaveLength(enabled ? 10 : 0);
-		await session.reload(); modelRuntime.registerNativeProvider(actor.provider);
-		const entered = deferred(), scopes: (string | undefined)[] = [], otherActor = fauxProvider({ provider: "override", models: [{ id: "actor" }] });
-		const base: AgentTool = { ...read, execute: async function (id, _args, signal) {
-			expect(this).toBe(base); scopes.push(currentExecutionScope()?.sessionID);
-			if (id === "cancel") { entered.resolve(); await new Promise<void>(resolve => signal!.addEventListener("abort", () => resolve(), { once: true })); }
-			return { content: [{ type: "text", text: "base override" }], details: {} };
-		} };
-		const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager, noExtensions: true, extensionFactories: [extension] });
-		await loader.reload(); modelRuntime.registerNativeProvider(otherActor.provider);
-		const other: AgentSession = new AgentSession({ cwd, modelRuntime, settingsManager, resourceLoader: loader, sessionManager: SessionManager.inMemory(cwd),
-			initialActiveToolNames: ["read"], allowedToolNames: ["read"], baseToolsOverride: { read: base }, agent: new Agent({
-				initialState: { model: otherActor.getModel() }, convertToLlm, streamFn: modelRuntime.streamSimple.bind(modelRuntime),
-				transformContext: messages => other.extensionRunner.emitContext(messages),
-			}) });
-		await using _other = onExit(async () => { await other.abort(); await other.extensionRunner.emit({ type: "session_shutdown", reason: "quit" }); other.dispose(); });
-		await other.bindExtensions({ mode: "print" });
-		otherActor.setResponses([fauxAssistantMessage(fauxToolCall("read", { path: "notes.txt" }, { id: "cancel" }), { stopReason: "toolUse" })]);
-		const cancelled = other.prompt("Read until cancelled.");
-		await Promise.race([entered.promise, cancelled.then(() => { throw new Error("cancelled tool never entered"); })]); await other.abort(); await cancelled;
-		actor.setResponses([response("format_rows", { text: "reloaded" }), fauxAssistantMessage("done")]);
-		otherActor.setResponses([response("read", { path: "notes.txt" }), fauxAssistantMessage("done")]);
-		await Promise.all([session.prompt("Execute after reloading extensions."), other.prompt("Read through the supplied base implementation.")]);
-		expect(other.messages.filter(message => message.role === "toolResult").at(-1)?.content).toEqual([{ type: "text", text: "base override" }]);
-		expect(scopes).toEqual([other.sessionId, other.sessionId]);
-		expect(calls).toHaveLength(5);
-		const failure = new Error("process launch failed"), coordinator = new ProcessExecutionCoordinator({ execute: async () => ({ exitCode: 0 }) });
-		await coordinator.runWith({ execute: () => { throw failure; } }, async () => {
-			for (const execute of [() => coordinator.execute({ command: "", cwd, environment: {}, onData: () => {} }), () => coordinator.operations.exec("", cwd, { onData: () => {} })]) await expect(execute()).rejects.toBe(failure);
-		});
-	} finally {
+	await using _session = onExit(async () => {
 		for (const gate of Object.values(updated)) gate.resolve();
 		if (preempted) await inspection?.inOwner(state => state.publishedGate?.resolve()); await publication?.close();
 		await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" }); session.dispose(); inspection?.dispose();
 		expect(session.agent.prompt).toBe(originalPrompt); expect(session.agent.continue).toBe(originalContinue);
+	});
+	await session.bindExtensions({ mode: "print", onError: error => { throw error; } });
+	if (native) {
+		let backend: LinuxProcessReuseBackend | undefined;
+		const processOwner = LinuxProcessReuseBackend.prototype.processOwner;
+		vi.spyOn(LinuxProcessReuseBackend.prototype, "processOwner").mockImplementation(function (this: LinuxProcessReuseBackend) {
+			inspection ??= inspectProcessOwner(() => processOwner.call(this)); return processOwner.call(this);
+		});
+		let inputBinding: ProcessExecutionBinding | undefined;
+		if (mode === "native-sync-lost") {
+			const attach = SynchronousProcessObserver.prototype.attach;
+			vi.spyOn(SynchronousProcessObserver.prototype, "attach").mockImplementation(function (this: SynchronousProcessObserver, request) {
+				const attachment = attach.call(this, request);
+				return { ...attachment, finish: () => { const result = attachment.finish();
+					if (result.adoptions.length) { expect(result.metrics.hits).toBe(1); expect(Atomics.load(new Int32Array(request.claims), 0)).toBeGreaterThan(0);
+						void Reflect.get(this, "worker").terminate(); throw new Error("lost acknowledged synchronous handoff"); }
+					return result;
+				} };
+			});
+		}
+		const observe = LinuxProcessReuseBackend.prototype.observeBindings, nested = !cold && !inputs && !mode.startsWith("native-sync") && !["native", "native-stale"].includes(mode);
+		vi.spyOn(LinuxProcessReuseBackend.prototype, "observeBindings").mockImplementation(function (this: LinuxProcessReuseBackend, scope, execute, receive, ...args) {
+			backend = this; return observe.call(this, scope, execute, (bindings, computations) => {
+				if (scope.callID === "seed") {
+					const registry = Reflect.get(this, "handoffs") as ProcessHandoffRegistry<{ readonly executable: string }>;
+					inputBinding = bindings.find(binding => registry.resolveBinding(binding, scope)?.executable === path.join(cwd, "slow"));
+				}
+				return receive(nested && scope.callID === "seed" ? bindings.slice(0, 1) : bindings, computations);
+			}, ...args);
+		});
+		await compileBenchmarkHelper(cwd, "slow", { code: "#include <stdio.h>\n#include <fcntl.h>\n#include <unistd.h>\nint main(int n,char**v){int f=fcntl(3,F_GETFD)<0?open(v[1],O_RDONLY):3;if(f<0)return 1;unsigned long h=5381;char c;while(read(f,&c,1)==1)h=h*33+c;close(f);for(volatile unsigned long i=0;i<40000000ul;i++)h^=i;printf(\"%s %lx\\n\",v[1],h);return 0;}\n" });
+		await commitBenchmarkFixture(cwd, "sdk-callback");
+		const command = "./slow notes.txt" + (inputs ? " 3<notes.txt" : "");
+		const initial = `printf initial:; ${command}; :`, remaining = `printf remaining:; ${command}; printf once >> marker`;
+		const call = (tool: string, text: string, id: string) => fauxAssistantMessage(fauxToolCall(tool, { text }, { id }), { stopReason: "toolUse" });
+		actor.setResponses([call("produce_notes", initial, "seed"), ...(inputs ? [response("read", { path: "notes.txt", offset: 2 })] : []), ...cold ? [] : [async () => {
+			if (running) publication = await holdOwnedProcessPublication(inspection!);
+			if (preempted) {
+				await inspection!.inOwner(async state => {
+					const { ProvenanceCertificateStore } = await state.load("../src/reuse-store.ts"), publish = ProvenanceCertificateStore.prototype.withPublication;
+					state.publishedGate = state.deferred();
+					state.method(ProvenanceCertificateStore.prototype, "withPublication", async function (this: unknown, ...args: unknown[]) {
+						const result = await publish.apply(this, args); await state.publishedGate.promise; return result;
+					});
+				});
+			}
+			return response("write", { path: "notes.txt", content: "changed\n" });
+		}], ...(mode === "native-retired" ? [async () => {
+			await publication!.ready(); session.setActiveToolsByName(tools.filter(name => name !== "produce_notes"));
+			return response("read", { path: "notes.txt" });
+		}] : []), async () => {
+			expect(inputBinding).toBeDefined();
+			if (publication) await publication.ready(); else await expect.poll(() => backend!.bindingStale(inputBinding!), { timeout: 5000 }).toBe(false);
+			await expect(readFile(path.join(cwd, "marker"))).rejects.toMatchObject({ code: "ENOENT" });
+			if (stale) await writeFile(path.join(cwd, "notes.txt"), "fresh\n");
+			return call("format_rows", remaining, "check");
+		}, fauxAssistantMessage("done")]);
+		await session.prompt("Produce notes, edit the input, then render the remaining work.");
+		// A named inherited input prepares a new version after the edit; adoption still checks the actual held graph.
+		const results = session.messages.filter(message => message.role === "toolResult"), reused = !stale;
+		if (mode === "native-sync-lost") {
+			expect(results.at(-1)).toMatchObject({ isError: true }); expect(JSON.stringify(results.at(-1))).toContain("native handoff failed");
+			expect(await readFile(path.join(cwd, "marker"), "utf8")).toBe("once"); expect(calls).toEqual(["seed", "check"]); return;
+		}
+		expect(results.at(-1)?.content, JSON.stringify(session.messages)).toEqual([{ type: "text", text: "hook:own:format_rows:remaining:" + execFileSync("./slow", ["notes.txt"], { cwd, encoding: "utf8" }) }]);
+		expect(results.every(result => !result.isError)).toBe(true); expect(await readFile(path.join(cwd, "marker"), "utf8")).toBe("once");
+		expect(calls).toEqual(["seed", "check"]); expect(prepared).toEqual([initial, remaining]);
+		if (inputs) expect(summarizeSpeculativeTrace(events).inputReuseHits).toBe(1);
+		const settled = events.filter(event => event.type === "actor_action").at(-1)!, timing = settled.computation!;
+		expect(backend!.actorMetrics().hits).toBe(Number(reused)); expect(timing.hiddenComputeMs > 0).toBe(reused);
+		expect((timing.hiddenByMode ?? []).reduce((total, part) => total + part.hiddenComputeMs, 0)).toBeCloseTo(timing.hiddenComputeMs, 5);
+		const predictions = events.filter(event => event.type === "operation_prediction"), adopted = predictions.flatMap(event => event.settlement.observation === "observed" && event.settlement.match.matched && event.settlement.match.adoption.status === "adopted" ? [event.settlement.match.relation] : []);
+		if (preempted && reused) expect(events.some(event => event.type === "candidate" && event.state.status === "cancelled" && event.state.cause.code === "scheduler_preempted")).toBe(true);
+		expect(adopted).toHaveLength(Number(reused && mode !== "native-retired")); if (nested && adopted.length) expect(adopted[0]).toMatchObject({ kind: "projected", projector: "owned-operation" });
+		if (mode === "native-retired") expect(predictions.filter(event => event.settlement.prediction.id === predictions[0]!.settlement.prediction.id)).toMatchObject([{ settlement: { observation: "unobserved", cause: { code: "operation_not_observed" } } }]);
+		expect(!!settled.settlement.actionKeyHash).toBe(mode !== "native-unkeyed");
+		if (publication) expect(await publication.joined()).toBe(true);
+		expect(events.filter(event => event.type === "candidate" && event.state.status === "cancelled" && event.state.cause.code === "tool_disabled" && event.state.executionMs > 0)).toEqual([]);
+		return;
 	}
+	const registeredTools = session.agent.state.tools;
+	await session.prompt("Read notes.txt, write and edit result.txt, then read the final file.");
+	expect(session.agent.state.tools).toBe(registeredTools);
+	expect(await readFile(path.join(cwd, "notes.txt"), "utf8")).toBe("one\ntwo\n");
+	expect(await readFile(path.join(cwd, "result.txt"), "utf8")).toBe("final\n");
+	const results = session.messages.filter(message => message.role === "toolResult");
+	expect(results).toHaveLength(4);
+	expect(results.every(message => !message.isError)).toBe(true);
+	expect(results.at(-1)?.content).toEqual([{ type: "text", text: "final\n" }]);
+	const registry = session.agent.state.tools, read = registry.find(tool => tool.name === "read")!, originalExecute = read.execute;
+	for (const copy of [true, false]) {
+		const tool = copy ? { ...read } : read;
+		tool.execute = async function (id) { expect(this).toBe(tool); expect(currentExecutionScope()?.callID).toBe(id); return { content: [{ type: "text", text: "replaced" }], details: {} }; };
+		session.agent.state.tools = registry.map(current => current === read ? tool : current);
+		actor.setResponses([response("read", { path: "notes.txt" }), fauxAssistantMessage("done")]);
+		await session.prompt("Execute the current read implementation.");
+		expect(session.messages.filter(message => message.role === "toolResult").at(-1)?.content).toEqual([{ type: "text", text: "replaced" }]);
+	}
+	read.execute = originalExecute; session.agent.state.tools = registry;
+	const originalTools = session.agent.state.tools, originalNext = session.agent.prepareNextTurnWithContext;
+	for (const tool of originalTools) Object.freeze(tool);
+	Object.freeze(originalTools);
+	session.subscribe(event => { if (event.type === "tool_execution_update") updates.push(event.toolCallId); });
+	actor.setResponses([
+		fauxAssistantMessage([fauxToolCall("format_rows", { text: "first" }, { id: "a" }), fauxToolCall("format_rows", { text: "second" }, { id: "b" })], { stopReason: "toolUse" }),
+		fauxAssistantMessage([fauxToolCall("read", { text: "third" }, { id: "c" }), fauxToolCall("late_rows", { text: "fourth" }, { id: "d" }),
+			fauxToolCall("format_rows", { text: "skip" }, { id: "blocked" })], { stopReason: "toolUse" }), fauxAssistantMessage("done"),
+	]);
+	await session.prompt("Execute the registered callbacks.");
+	expect(prepared).toEqual(["first", "second", "third", "fourth", "skip"]);
+	expect([calls.slice(0, 2).sort(), calls.slice(2).sort()]).toEqual([["a", "b"], ["c", "d"]]); expect(updates).toEqual(["b", "a", "d", "c"]);
+	expect(hooks.slice(0, 2)).toEqual(["before:a", "before:b"]); expect(hooks.slice(2, 4).sort()).toEqual(["after:a", "after:b"]);
+	expect(hooks.slice(4, 7)).toEqual(["before:c", "before:d", "before:blocked"]); expect(hooks.slice(7).sort()).toEqual(["after:c", "after:d"]);
+	expect(session.messages.filter(message => message.role === "toolResult").slice(-5).map(message => [message.toolCallId, message.content, message.isError])).toEqual([
+		["a", [{ type: "text", text: "hook:own:format_rows:first:prepared" }], false], ["b", [{ type: "text", text: "hook:own:format_rows:second:prepared" }], false],
+		["c", [{ type: "text", text: "hook:own:read:third:prepared" }], false], ["d", [{ type: "text", text: "hook:own:late_rows:fourth:prepared" }], false],
+		["blocked", [{ type: "text", text: "blocked-on-purpose" }], true],
+	]);
+	expect(session.agent.prepareNextTurnWithContext).toBe(originalNext);
+	expect(events.filter(event => event.type === "actor_action")).toHaveLength(enabled ? 10 : 0);
+	await session.reload(); modelRuntime.registerNativeProvider(actor.provider);
+	const entered = deferred(), scopes: (string | undefined)[] = [], otherActor = fauxProvider({ provider: "override", models: [{ id: "actor" }] });
+	const base: AgentTool = { ...read, execute: async function (id, _args, signal) {
+		expect(this).toBe(base); scopes.push(currentExecutionScope()?.sessionID);
+		if (id === "cancel") { entered.resolve(); await new Promise<void>(resolve => signal!.addEventListener("abort", () => resolve(), { once: true })); }
+		return { content: [{ type: "text", text: "base override" }], details: {} };
+	} };
+	const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager, noExtensions: true, extensionFactories: [extension] });
+	await loader.reload(); modelRuntime.registerNativeProvider(otherActor.provider);
+	const other: AgentSession = new AgentSession({ cwd, modelRuntime, settingsManager, resourceLoader: loader, sessionManager: SessionManager.inMemory(cwd),
+		initialActiveToolNames: ["read"], allowedToolNames: ["read"], baseToolsOverride: { read: base }, agent: new Agent({
+			initialState: { model: otherActor.getModel() }, convertToLlm, streamFn: modelRuntime.streamSimple.bind(modelRuntime),
+			transformContext: messages => other.extensionRunner.emitContext(messages),
+		}) });
+	await using _other = onExit(async () => { await other.abort(); await other.extensionRunner.emit({ type: "session_shutdown", reason: "quit" }); other.dispose(); });
+	await other.bindExtensions({ mode: "print" });
+	otherActor.setResponses([fauxAssistantMessage(fauxToolCall("read", { path: "notes.txt" }, { id: "cancel" }), { stopReason: "toolUse" })]);
+	const cancelled = other.prompt("Read until cancelled.");
+	await Promise.race([entered.promise, cancelled.then(() => { throw new Error("cancelled tool never entered"); })]); await other.abort(); await cancelled;
+	actor.setResponses([response("format_rows", { text: "reloaded" }), fauxAssistantMessage("done")]);
+	otherActor.setResponses([response("read", { path: "notes.txt" }), fauxAssistantMessage("done")]);
+	await Promise.all([session.prompt("Execute after reloading extensions."), other.prompt("Read through the supplied base implementation.")]);
+	expect(other.messages.filter(message => message.role === "toolResult").at(-1)?.content).toEqual([{ type: "text", text: "base override" }]);
+	expect(scopes).toEqual([other.sessionId, other.sessionId]);
+	expect(calls).toHaveLength(5);
+	const failure = new Error("process launch failed"), coordinator = new ProcessExecutionCoordinator({ execute: async () => ({ exitCode: 0 }) });
+	await coordinator.runWith({ execute: () => { throw failure; } }, async () => {
+		for (const execute of [() => coordinator.execute({ command: "", cwd, environment: {}, onData: () => {} }), () => coordinator.operations.exec("", cwd, { onData: () => {} })]) await expect(execute()).rejects.toBe(failure);
+	});
 });

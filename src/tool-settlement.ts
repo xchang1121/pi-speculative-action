@@ -58,8 +58,8 @@ export interface ToolFilesystemOperations {
 	readonly readFile: (target: string, maxBytes?: number) => Promise<Buffer>;
 	readonly access: (target: string, writable?: boolean) => Promise<void>;
 	readonly exists?: (target: string) => boolean | Promise<boolean>;
-	/** File size needs its own evidence. `entry` exposes the final entry/link without following it. */
-	readonly stat?: (target: string, fields?: "type" | "entry") => ToolFilesystemStat | Promise<ToolFilesystemStat>;
+	/** `entry` does not follow the final link; includeSize=false returns only type/path fields and their evidence. */
+	readonly stat?: (target: string, fields?: "type" | "entry", includeSize?: boolean) => ToolFilesystemStat | Promise<ToolFilesystemStat>;
 	readonly readdir?: (target: string) => string[] | Promise<string[]>;
 	readonly writeFile?: (target: string, content: string) => Promise<void>;
 	readonly mkdir?: (target: string) => Promise<void>;

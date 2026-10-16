@@ -80,7 +80,7 @@ export function resolvePiToolInvocation(
 						},
 					} },
 				} : tool === "ls" ? {
-					ls: { operations: { exists: view.exists ?? denied, stat: view.stat ? (target) => view.stat!(target, "type") : denied, readdir: view.readdir ?? denied } },
+					ls: { operations: { exists: view.exists ?? denied, stat: view.stat ? (target) => view.stat!(target, "type", false) : denied, readdir: view.readdir ?? denied } },
 				} : tool === "write" ? {
 					write: { operations: { writeFile: view.writeFile ?? denied, mkdir: view.mkdir ?? denied } },
 				} : {
@@ -331,15 +331,16 @@ export async function readClosedSearchInput(source: ToolFilesystemOperations, ro
 	if (relative === ".." || relative.startsWith("../")) return fail("ENOENT");
 	let physical = root;
 	for (const segment of relative ? relative.split("/") : []) {
-		if (!(await source.stat(physical, "type")).isDirectory()) return fail("ENOTDIR");
+		if (!(await source.stat(physical, "type", false)).isDirectory()) return fail("ENOTDIR");
 		if (!(await source.readdir(physical)).includes(segment)) return fail("ENOENT");
 		physical = path.join(physical, segment);
 	}
-	const stat = await source.stat(physical, operation === "readFile" ? undefined : "type"), directory = stat.isDirectory();
+	const stat = await source.stat(physical, "type", operation === "readFile"), directory = stat.isDirectory();
 	if (operation === "stat") return { directory };
 	if (operation === "readdir") return directory ? source.readdir(physical) : fail("ENOTDIR");
 	if (directory) return fail("EISDIR");
-	assert.ok(Number.isSafeInteger(stat.size) && stat.size! >= 0, "file size is not proven by retained content");
+	// A special inode's size does not bound the bytes readable from it.
+	assert.ok((stat.type === undefined || stat.type === "file") && Number.isSafeInteger(stat.size) && stat.size! >= 0, "file size is not proven by retained content");
 	assert.ok(stat.size! <= maxBytes, "input byte budget");
 	return source.readFile(physical);
 }
@@ -412,7 +413,8 @@ async function matchCapturedGrep(view: ToolFilesystemOperations, engine: NonNull
 /** rg selects its own names/configuration over captured inputs; native reads never reach the source tree. */
 async function prepareCapturedGrep(view: ToolFilesystemOperations, cwd: string, destination: string, query: GrepInput & { path: string },
 	signal: AbortSignal, execute: SearchSelection) {
-	const { stat, exists, readdir } = view; assert.ok(stat && exists && readdir, "search input capabilities required");
+	const { exists, readdir } = view; assert.ok(view.stat && exists && readdir, "search input capabilities required");
+	const stat = (target: string, fields: "type" | "entry") => view.stat!(target, fields, false);
 	const originalCwd = cwd, originalTarget = path.resolve(cwd, query.path), rootStat = await stat(originalTarget, "type");
 	const directory = rootStat.isDirectory(), volume = path.parse(cwd).root, privateVolume = path.join(destination, "volume");
 	const realCwd = (await stat(cwd, "type")).realPath;

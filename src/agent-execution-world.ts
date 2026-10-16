@@ -12,7 +12,7 @@ import { effectCapabilitiesCover, RESOURCE_OBSERVATION_EFFECTS, WORKSPACE_PATH_M
 import { captureResourceVersion, collectResourceComputation, invalidateResourceInputs, releaseResourceVersion, resourceProofBytes, validateResourceVersion,
 	ResourceReadView, type ResourceInput, type ResourceObservation, type ResourceVersionToken } from "./resource-version.ts";
 import { cause } from "./settlement.ts";
-import type { ToolFilesystemOperations, ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
+import type { ToolFilesystemOperations, ToolFilesystemStat, ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
 import { TimelineInterval } from "./task-timing.ts";
 
 /** Host tool call supplied to any OS sandbox or safe local substitute. */
@@ -138,12 +138,8 @@ export class ResourceObjectInputs {
 	/** Call-local transport owns pins until acknowledged; only the caller's original version can retain the returned inputs. */
 	static receive(transfers: readonly CapturedFilesystemTransfer[], maxBytes: number) {
 		const produced = new WeakSet<CapturedFilesystemObject>();
-		const capture = (target: string, input: StableFilesystemCapture) => view.capture(target, {
-			...(input.entries ? { type: "directory" as const, entries: input.entries, objectBytes: input.bytesRead } : { type: "file" as const, content: input.content }),
-			object: input.object, computation: input.computation, realPath: input.realPath,
-		});
-		const view = new ResourceReadView(maxBytes, undefined, undefined, (target, input) => { capture(target, input); if (input.object) produced.add(input.object); });
-		for (const transfer of transfers) { const input = CapturedFilesystemObject.receive(transfer); if (input) capture(input.realPath, input); }
+		const view = new ResourceReadView(maxBytes, undefined, undefined, (target, input) => { view.captureObject(target, input); if (input.object) produced.add(input.object); });
+		for (const transfer of transfers) { const input = CapturedFilesystemObject.receive(transfer); if (input) view.captureObject(input.realPath, input); }
 		return { inputs: new ResourceObjectInputs(view, produced), dispose: () => view.dispose() };
 	}
 	receive(transfers: readonly CapturedFilesystemTransfer[]): void {
@@ -353,12 +349,12 @@ export function bindResourceOperation(execute: NonNullable<ToolInvocation["files
 			const host: ToolFilesystemOperations = {
 				readFile: (target, maxBytes) => read(view => view.readFile(target, maxBytes), async () => { const content = await fs.readFile(target); retain(target, content); return content.subarray(0, maxBytes); }),
 				access: (target, writable) => fs.access(target, fs.constants.R_OK | (writable ? fs.constants.W_OK : 0)),
-				exists: async target => { try { await fs.access(target); return true; } catch { return false; } },
-				stat: async (target, fields) => {
+				exists: target => read(view => view.exists(target), async () => { try { await fs.access(target); return true; } catch { return false; } }),
+				stat: (target, fields, includeSize = true) => read<ToolFilesystemStat>(view => view.stat(target, fields, includeSize), async () => {
 					const info = await (fields === "entry" ? fs.lstat(target) : fs.stat(target));
 					const type = info.isDirectory() ? "directory" : info.isFile() ? "file" : info.isSymbolicLink() ? "symlink" : "special";
-					return { isDirectory: () => info.isDirectory(), size: info.size, type, ...(type === "symlink" ? { link: await fs.readlink(target) } : { realPath: await fs.realpath(target) }) };
-				},
+					return { isDirectory: () => info.isDirectory(), size: includeSize ? info.size : undefined, type, ...(type === "symlink" ? { link: await fs.readlink(target) } : { realPath: await fs.realpath(target) }) };
+				}),
 				readdir: target => read(view => view.readdir(target), async () => { const names = await fs.readdir(target); retain(target, { names }); return names; }),
 				mkdir: async target => {
 					const created = await fs.mkdir(target, { recursive: true });

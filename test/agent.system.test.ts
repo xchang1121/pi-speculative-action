@@ -1,4 +1,4 @@
-import { link, mkdir, readFile, rename, symlink, writeFile } from "node:fs/promises";
+import { link, mkdir, readFile, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import path from "node:path";
 import { fauxAssistantMessage, fauxToolCall, Type } from "@earendil-works/pi-ai";
@@ -6,6 +6,7 @@ import { createEditTool, createFindTool, createGrepTool, createLsTool, createRea
 import { afterEach, expect, test } from "vitest";
 import { WorkspaceSandboxService } from "../src/workspace-sandbox.ts";
 import { bindResourceOperation, createResourceSnapshotExecutionWorld } from "../src/agent-execution-world.ts";
+import { ResourceVersionManager } from "../src/resource-version.ts";
 import { createClosedSearchProfile, resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { ActionSemanticsRegistry, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { PatternAwareStore, patternAwareSettings, patternAwareActionSemantics } from "../src/pattern-aware.ts";
@@ -20,9 +21,18 @@ import type { AgentPlanSource } from "../src/agent-runtime-types.ts";
 const directories = temporaryDirectories("pi-agent-system-");
 afterEach(directories.dispose);
 
+function readScenario(cwd: string, names: readonly string[], definitions = names.map(tool => ({ ...PI_ACTION_SEMANTICS.definition("read")!, tool, epoch: tool, projectors: [] }))) {
+	const reader = createReadTool(cwd), actionSemantics = new ActionSemanticsRegistry(definitions);
+	return { definitions, actionSemantics, tools: names.map(name => ({ ...reader, name })) as Parameters<typeof systemHost>[1],
+		world: createResourceSnapshotExecutionWorld(actionSemantics, { maxBytes: () => 1024 * 1024 }),
+		resolveInvocation: (tool: string, input: unknown) => ({ ...resolvePiToolInvocation("read", input, { cwd, environment: {} })!, semantics: definitions.find(definition => definition.tool === tool) }) };
+}
+
 const inputScenarios = (preview = false) => [
-	...["read", "names"].flatMap(input => ["", ...preview ? ["-preview"] : [], "-stale", "-copy", "-change", "-budget", "-outside", "-unkeyed"].map(suffix => `input-${input}${suffix}`)),
-	"input-read-range", "input-read-cancel", "input-read-failure",
+	...["read", "names", "stat", "type", "entry", "exists"].flatMap(input => ["", ...preview ? ["-preview"] : [], "-stale", "-copy", "-change", "-budget", "-outside", "-unkeyed"]
+		.filter(suffix => ["read", "names"].includes(input) || !["-copy", "-change", ...input === "exists" ? ["-stale"] : []].includes(suffix)).map(suffix => `input-${input}${suffix}`)),
+	...["read-range", "read-cancel", "read-failure", "stat-read", "entry-read", "exists-read", "stat-directory", "entry-link", "type-kind", "entry-kind",
+		"stat-same-size", "entry-same-size", "exists-missing", "exists-create", "exists-deleted", "exists-broken", ...process.platform === "linux" ? ["stat-special"] : []].map(mode => `input-${mode}`),
 ];
 const mixedScenarios = ["producer", "consumer", "stale", "failure", "budget", "outside", "revoke", "overlap", "cancel", "cancel-return", "unkeyed"].map(mode => `mixed-${mode}`);
 
@@ -31,7 +41,7 @@ test.for(["actor", "preview", "dynamic", "dynamic-preview", "hints", "hints-prev
 	"seed-dynamic", "seed-dynamic-preview", "seed-calculation", "seed-calculation-preview", "seed-stale", "seed-binding", "seed-calculation-key", "seed-unbounded", "seed-repeat", "seed-revoke",
 	...mixedScenarios, "mixed-binding-unkeyed", ...inputScenarios(true), "unregistered-dynamic", "unregistered-mixed-producer", "late-dynamic",
 	...["seed-dynamic", "seed-dynamic-preview", "seed-calculation", "seed-calculation-preview", "seed-binding", "seed-calculation-key", "mixed-producer", "mixed-consumer", "unkeyed-dynamic", "unkeyed-calculation",
-		"input-read", "input-names", "unkeyed-input-read-stale", "unkeyed-mixed-stale", "unkeyed-mixed-failure", "unkeyed-mixed-budget", "unkeyed-mixed-revoke",
+		"input-read", "input-names", "input-stat-transfer", "input-exists-missing-transfer", ...process.platform === "linux" ? ["input-stat-special-transfer"] : [], "unkeyed-input-read-stale", "unkeyed-mixed-stale", "unkeyed-mixed-failure", "unkeyed-mixed-budget", "unkeyed-mixed-revoke",
 		"unkeyed-mixed-overlap", "unkeyed-mixed-cancel", "revoked-unkeyed-mixed-overlap", "after:unkeyed-mixed-overlap", "after-cancel:unkeyed-mixed-overlap", "after:seed-calculation", "after-cancel-return:seed-calculation"].map(mode => `live-${mode}`),
 	...["dynamic", "dynamic-preview", "calculation", "calculation-preview", "calculation-unrelated", "calculation-key", "stale", "binding", "retired", "unbounded", "repeat", "revoke", "rejected-capture", "rejected-branch", "rejected-output",
 		...mixedScenarios, ...inputScenarios()].map(mode => `unkeyed-${mode}`),
@@ -48,11 +58,16 @@ test.for(["actor", "preview", "dynamic", "dynamic-preview", "hints", "hints-prev
 	const unkeyed = /^(unkeyed|unregistered|late)-/.test(scenario), unknown = scenario.startsWith("unregistered-");
 	const seeded = live || unkeyed || scenario.startsWith("seed-") || direct && !mode.endsWith("preview") || ["mixed-producer", "mixed-budget", "mixed-outside"].includes(mode), bound = seeded || direct || mode.startsWith("mixed");
 	const cwd = await directories.create(), file = path.join(mode.endsWith("outside") ? await directories.create() : cwd, "input.txt"), shared = {};
-	await writeFile(file, "one\ntwo\n"); if (listing) await writeFile(path.join(path.dirname(file), "second.txt"), "");
+	const metadata = /^input-(stat|type|entry|exists)/.exec(mode)?.[1], transfer = mode.endsWith("-transfer");
+	if (mode.includes("-special")) execFileSync("mkfifo", [file]); else if (!mode.includes("-missing") && !mode.endsWith("-create")) await writeFile(file, "one\ntwo\n");
+	if (listing) await writeFile(path.join(path.dirname(file), "second.txt"), "");
+	let metadataTarget = file;
+	if (/-(directory|link|broken)$/.test(mode)) { metadataTarget = path.join(cwd, "directory"); await mkdir(metadataTarget); if (!mode.endsWith("-directory")) {
+		const alias = path.join(cwd, "alias"); await symlink(metadataTarget, alias, "junction"); if (mode.endsWith("-broken")) await rename(metadataTarget, `${metadataTarget}-retired`); metadataTarget = alias; } }
 	let builds = 0, renders = 0, disposed = 0, effects = 0, borrowers = 0, bindings = 0, revoke: (() => void | Promise<void>) | undefined;
 	let revokeParent: typeof revoke;
 	const pure = mode.startsWith("calculation"), unrelated = mode.includes("unrelated") || mode.startsWith("calculation-hint");
-	const stale = mode.endsWith("stale"), cancelled = mode.endsWith("cancel"), overlap = mode === "mixed-cancel" || mode === "mixed-overlap", failed = mode.endsWith("failure");
+	const stale = mode.endsWith("stale") || mode.endsWith("-create") || mode.endsWith("-deleted"), cancelled = mode.endsWith("cancel"), overlap = mode === "mixed-cancel" || mode === "mixed-overlap", failed = mode.endsWith("failure");
 	const unavailable = early || mode.endsWith("budget") || mode.endsWith("outside") || mode.startsWith("rejected"), mutates = (index: number) => (direct || mode.startsWith("mixed")) && index === Number(mode !== "mixed-producer");
 	const entered = deferred(), joined = deferred(), release = deferred(), controller = new AbortController(), actors: Promise<unknown>[] = [];
 	const exposed = deferred(), parentRelease = deferred();
@@ -65,31 +80,37 @@ test.for(["actor", "preview", "dynamic", "dynamic-preview", "hints", "hints-prev
 			resources: pure || index && mode.startsWith("dynamic") ? [] : index && mode.startsWith("hints") ? ["selector"] : key.resources } : undefined; } }));
 	const actionSemantics = new ActionSemanticsRegistry(unknown ? definitions.slice(1) : definitions), settings = { drafterEnabled: false, resourceCacheMaxBytes: 32 * 1024,
 		...(live ? { scheduling: { heavyCpu: 1 } } : {}) }; // The pending Actor and its preview each own one slot.
-	const render = (tool: string, count: number) => { renders++; return { content: [{ type: "text" as const, text: `${tool}:${count}` }], details: { tool, ...(tool === names[0] ? parentOutput : {}) } }; };
-	const count = async (read: () => Promise<Buffer | string>) => { const text = pure ? "one\ntwo\n" : await read(); builds++; return text.toString().trim().split("\n").length; };
+	const render = (tool: string, count: unknown, actual = true) => { if (actual) renders++; return { content: [{ type: "text" as const, text: `${tool}:${count}` }], details: { tool, ...(tool === names[0] ? parentOutput : {}) } }; };
+	const count = async (read: () => Promise<unknown>, actual = true) => { const text = pure ? "one\ntwo\n" : await read(); if (actual) builds++; return metadata ? JSON.stringify(text) : String(text).trim().split("\n").length; };
 	const tools = names.map(name => ({ ...createReadTool(cwd), name, execute: async () => render(name, await count(() => readFile(file))) }));
 	const invocations = new Map(names.map((tool, index) => {
 		const execute: NonNullable<import("../src/tool-settlement.ts").ToolInvocation["filesystem"]> = async (view, request) => {
+			const actual = request.callID !== "oracle";
 			const fail = (phase: string) => { if (!index && parentFailure?.startsWith(phase)) { if (parentFailure.includes("cancel")) producer.abort(parentError); if (!parentFailure.endsWith("return")) throw parentError; } }; fail("before");
 			const build = async (inputs: typeof view) => ({ value: await count(() => inputs.readFile(file)), bytes: 8, dispose: () => { disposed++; } });
 			if (mode === "repeat" && !index) await view.prepare!(shared, "lines:v1", build, async value => value, file, request.signal);
-			const consume = async (count: number) => {
+			const consume = async (count: unknown) => {
 				if (mutates(index) && overlap) { if (++borrowers === 1) entered.resolve(); else joined.resolve(); await release.promise; request.signal.throwIfAborted(); }
 				if (mutates(index) && mode === "mixed-revoke" || !index && mode === "revoke") { await revoke?.(); expect(disposed).toBe(0); }
-				if (mutates(index)) { effects++; await view.writeFile!(path.join(cwd, `${tool}.txt`), String(count)); if (failed) throw new Error("consumer failed after writing"); }
-				const result = render(tool, count); if (index && mode === "mixed-cancel-return") controller.abort(); fail("consume"); return result;
+				if (actual && mutates(index)) { effects++; await view.writeFile!(path.join(cwd, `${tool}.txt`), String(count)); if (failed) throw new Error("consumer failed after writing"); }
+				const result = render(tool, count, actual); if (index && mode === "mixed-cancel-return") controller.abort(); fail("consume"); return result;
 			};
 			const read = async () => {
-				const load = () => listing ? view.readdir!(path.dirname(file)) : view.readFile(file, index && range ? 4 : undefined);
+				const load = async () => {
+					if (!metadata || !index && mode.endsWith("-read")) return listing ? view.readdir!(path.dirname(file)) : view.readFile(file, index && range ? 4 : undefined);
+					if (metadata === "exists") return view.exists!(metadataTarget);
+					const value = await view.stat!(metadataTarget, metadata === "entry" || metadata === "type" ? metadata : undefined, !mode.endsWith("-kind"));
+					return { directory: value.isDirectory(), size: value.size, type: value.type, link: value.link, realPath: value.realPath };
+				};
 				const pending = load(); if (index && cancelled) controller.abort(new Error("consumer cancelled"));
 				let value = await pending;
-				if (index && mode.endsWith("copy")) { if (Array.isArray(value)) value.push("changed"); else value.fill(0); value = await load(); }
+				if (index && mode.endsWith("copy")) { if (Array.isArray(value)) value.push("changed"); else (value as Buffer).fill(0); value = await load(); }
 				if (index && changes) { effects++; await view.writeFile!(listing ? path.join(path.dirname(file), "third.txt") : file, "one\ntwo\nthree\n"); value = await load(); }
 				return Array.isArray(value) ? value.join("\n") : value;
 			};
-			const output = { isError: false, result: direct ? await consume(await count(read)) : await view.prepare!(mode.includes("binding") && index || index === 2 ? definitions[index]! : shared,
+			const output = { isError: false, result: direct ? await consume(await count(read, actual)) : await view.prepare!(mode.includes("binding") && index || index === 2 ? definitions[index]! : shared,
 				mode === "calculation-key" && index ? "next" : "lines:v1", build, consume, mode.startsWith("calculation-hint") ? path.join(cwd, `hint-${index}`) : pure ? undefined : file, request.signal) };
-			if (!index && live) { exposed.resolve(); await parentRelease.promise; }
+			if (actual && !index && live) { exposed.resolve(); await parentRelease.promise; }
 			fail("after"); return output;
 		};
 		const binding = bound ? bindResourceOperation(execute, cwd) : { filesystem: execute, filesystemRoot: cwd };
@@ -110,10 +131,11 @@ test.for(["actor", "preview", "dynamic", "dynamic-preview", "hints", "hints-prev
 		complete: async () => fauxAssistantMessage(fauxToolCall(names[unrelated ? 2 : 1]!, { path: "input.txt" }), { stopReason: "toolUse" }),
 		executionWorlds: [world] }, settings);
 	await using _cleanup = onExit(async () => { controller.abort(); release.resolve(); parentRelease.resolve(); await Promise.allSettled(actors); await f.dispose(); expect(disposed).toBe(direct ? 0 : builds - (bound ? 0 : f.fallbacks.length)); });
+	const initial = metadata ? await f.oracle(names[0]!, { path: "input.txt" }, undefined, undefined, invocations.get(names[0]!)) : render(names[0]!, 2, false);
 	const late = scenario.startsWith("late-") ? tools.shift() : undefined; await f.start(); if (late) tools.unshift(late);
 	if (live) { const task = f.execute(names[0]!, { path: "input.txt" }, producer.signal); void task.catch(() => {}); actors.push(task); await exposed.promise; }
 	else if (parentFailure && !parentFailure.endsWith("return")) await expect(f.execute(names[0]!, { path: "input.txt" }, producer.signal)).rejects.toBe(parentError);
-	else if (seeded) expect(await f.execute(names[0]!, { path: "input.txt" }, producer.signal)).toEqual({ content: [{ type: "text", text: "count_records:2" }], details: { tool: names[0], ...parentOutput } });
+	else if (seeded) expect(await f.execute(names[0]!, { path: "input.txt" }, producer.signal)).toEqual(initial);
 	else { await f.preview(names[0]!, { path: "input.txt" }); await f.ready(); }
 	expect({ builds, renders }).toEqual({ builds: Number(!early), renders: Number(!early) });
 	if (mode.startsWith("retired") || mode === "predicted") { await f.finish(); tools.shift(); settings.drafterEnabled = mode === "predicted"; await f.start("consumer"); }
@@ -121,11 +143,14 @@ test.for(["actor", "preview", "dynamic", "dynamic-preview", "hints", "hints-prev
 	if (unrelated) { await f.finish(); settings.drafterEnabled = true; await f.start("unrelated"); await f.ready(seeded ? 1 : 2); await f.finish(); settings.drafterEnabled = false; await f.start("consumer"); }
 	if (mode.endsWith("preview") && !direct) { await f.preview(names[1]!, { path: "input.txt" }); await expect.poll(() => renders).toBe(unrelated ? 3 : 2); }
 	if (stale) await writeFile(listing ? path.join(path.dirname(file), "third.txt") : file, "one\ntwo\nthree\n");
+	if (mode.endsWith("-same-size")) await writeFile(file, "new\none\n");
+	if (mode.endsWith("-deleted")) await rm(file);
+	const expected = metadata ? await f.oracle(names[1]!, { path: "input.txt" }, undefined, undefined, invocations.get(names[1]!)) : render(names[1]!, stale || changes ? 3 : range ? 1 : 2, false);
 	const result = f.execute(names[1]!, { path: "input.txt" }, controller.signal); actors.push(result); void result.catch(() => {});
 	const finishParent = async () => {
 		parentRelease.resolve();
 		if (parentFailure && !parentFailure.endsWith("return")) await expect(actors[0]).rejects.toBe(parentError);
-		else expect(textOutput(await actors[0] as Awaited<typeof result>)).toBe("count_records:2");
+		else expect(await actors[0]).toEqual(initial);
 	};
 	if (overlap) {
 		await entered.promise; const sibling = f.execute(names[1]!, { path: "input.txt" }); actors.push(sibling); await joined.promise;
@@ -135,12 +160,13 @@ test.for(["actor", "preview", "dynamic", "dynamic-preview", "hints", "hints-prev
 		expect(textOutput(await sibling)).toBe("summarize_records:2");
 	}
 	if (failed || cancelled) await expect(result).rejects.toThrow(failed ? "consumer failed after writing" : "consumer cancelled");
-	else expect(await result).toEqual({ content: [{ type: "text", text: `summarize_records:${stale || changes ? 3 : range ? 1 : 2}` }], details: { tool: names[1] } });
+	else expect(await result).toEqual(expected);
 	expect({ builds, renders, effects }).toEqual({ builds: (direct || stale || unavailable || mode.includes("binding") || mode === "calculation-key" || mode === "revoke" ? 2 : 1) + Number(unrelated) - Number(direct && cancelled) - Number(early),
 		renders: 2 + Number(unrelated) + Number(overlap) - Number(failed || cancelled) - Number(early), effects: Number(direct || mode.startsWith("mixed")) + Number(changes) + Number(overlap && !cancelled) - Number(direct && cancelled) - Number(early && mutates(0)) });
 	expect(f.fallbacks).toEqual([...(seeded ? [names[0]!] : []), ...(live && !mode.endsWith("preview") || early || mutates(1) || mode === "revoke" || mode.startsWith("rejected") ? Array(1 + Number(overlap)).fill(names[1]!) : [])]);
 	if (direct && cancelled) await expect(readFile(path.join(cwd, `${names[1]}.txt`))).rejects.toMatchObject({ code: "ENOENT" });
-	else if ((direct || mode.startsWith("mixed")) && !(early && mutates(0))) expect(await readFile(path.join(cwd, `${names[Number(mode !== "mixed-producer")]}.txt`), "utf8")).toBe(String(stale || changes ? 3 : range ? 1 : 2));
+	else if ((direct || mode.startsWith("mixed")) && !(early && mutates(0))) expect(await readFile(path.join(cwd, `${names[Number(mode !== "mixed-producer")]}.txt`), "utf8")).toBe(metadata ? textOutput(expected).slice(names[1]!.length + 1) : String(stale || changes ? 3 : range ? 1 : 2));
+	if (transfer) { await revokeParent!(); expect(await f.execute(names[1]!, { path: "input.txt" })).toEqual(expected); }
 	if (live) {
 		if (!parentFailure || !overlap) expect(f.events.some(event => event.type === "actor_action" && event.settlement.tool === names[0])).toBe(false);
 		await finishParent();
@@ -148,9 +174,29 @@ test.for(["actor", "preview", "dynamic", "dynamic-preview", "hints", "hints-prev
 	if (unkeyed) { expect(bindings).toBe(1); expect(f.events.find(event => event.type === "actor_action" && event.settlement.tool === names[0])).toMatchObject({ settlement: { provider: { kind: "actor", cause: { code: "action_not_keyable" } } } }); }
 	if (parentFailure) expect(f.events.find(event => event.type === "actor_action" && event.settlement.tool === names[0])).toMatchObject({ settlement: { provider: { kind: "actor", isError: !parentFailure.endsWith("return") } }, computation: { hiddenComputeMs: 0 } });
 	await f.finish();
-	const timing = f.events.filter(event => event.type === "actor_action").filter(event => event.settlement.tool === names[1]).at(-1)?.computation;
+	const timing = f.actors.filter(event => event.settlement.tool === names[1]).at(-1)?.computation;
 	if (mode !== "binding") expect(timing?.hiddenComputeMs! > 0, JSON.stringify({ timing, events: f.events })).toBe(!stale && !unavailable && (!failed || direct) && !(direct && cancelled) && !["calculation-key", "revoke"].includes(mode));
-	if (cancelled) expect(f.events.filter(event => event.type === "actor_action")[0]?.computation?.hiddenComputeMs).toBe(0);
+	if (cancelled) expect(f.actors[0]?.computation?.hiddenComputeMs).toBe(0);
+});
+
+test.for(["weak", "full", "invalidated", "directory", "directory-full", "missing", ...process.platform === "linux" ? ["special"] : []])("retains only independently proven metadata (%s)", async mode => {
+	const cwd = await directories.create(), target = path.join(cwd, "input");
+	if (mode.startsWith("directory")) await mkdir(target); else if (mode === "special") execFileSync("mkfifo", [target]); else if (mode !== "missing") await writeFile(target, "one\ntwo\n");
+	const manager = new ResourceVersionManager(cwd, { watch: false }), version = await manager.capture(undefined, 32 * 1024), view = version.view!;
+	await using _original = onExit(async () => { await version.release(); });
+	await view[mode === "weak" || mode === "missing" ? "exists" : mode.startsWith("directory") ? "readdir" : "stat"](target);
+	if (["weak", "full", "invalidated", "directory-full"].includes(mode)) await view[mode === "directory-full" ? "stat" : "readFile"](target);
+	if (mode === "invalidated") view.invalidate(new Set([...version.observations].filter(([, value]) => value.scope === "content").map(([key]) => key)));
+	view.seal();
+	if (mode === "weak") await view.evaluate(input => input.stat(target), dependencies => { expect([...dependencies ?? []].map(key => version.observations.get(key)?.scope)).toContain("content"); });
+	const retained = manager.retain({ ...version, observations: new Map([...version.observations].filter(([, value]) => value.scope !== "content")) }, 32 * 1024);
+	await using _retained = onExit(async () => { await retained.release(); }); await version.release();
+	expect(retained.view).toBeDefined(); expect((await manager.validate(retained)).expired).toBe(false);
+	expect(await retained.view!.exists(target)).toBe(mode !== "missing");
+	if (["weak", "directory", "missing"].includes(mode)) await expect(retained.view!.stat(target)).rejects.toThrow("resource_access_unproven");
+	else { const actual = await retained.view!.stat(target), expected = await stat(target);
+		expect({ directory: actual.isDirectory(), size: actual.size, type: actual.type }).toEqual({ directory: expected.isDirectory(), size: expected.size,
+			type: mode === "special" ? "special" : expected.isDirectory() ? "directory" : "file" }); }
 });
 
 test.for(["stale", "all-stale", "binding", "failure", "cancel", "composed", "revoke",
@@ -160,9 +206,8 @@ test.for(["stale", "all-stale", "binding", "failure", "cancel", "composed", "rev
 	await writeFile(file, "one\ntwo\n"); await writeFile(extra, "before\n");
 	const alias = path.join(cwd, "current"), args = { path: mode === "alias" ? "current" : "input.txt" };
 	if (mode === "alias") { for (const name of ["old", "new"]) await mkdir(path.join(cwd, name)); await symlink(path.join(cwd, "old"), alias, "junction"); }
-	const names = ["prepare_count", "prepare_summary", "consume_count"], reader = createReadTool(cwd);
-	const definitions = names.map(tool => ({ ...PI_ACTION_SEMANTICS.definition("read")!, tool, epoch: tool, projectors: [], ...(input && !(["preview", "alias"].includes(mode) && tool === names[2]) ? { canonicalize: () => undefined } : {}) }));
-	const actionSemantics = new ActionSemanticsRegistry(definitions), tools = names.map(name => ({ ...reader, name })) as Parameters<typeof systemHost>[1];
+	const names = ["prepare_count", "prepare_summary", "consume_count"], { definitions, actionSemantics, tools, world } = readScenario(cwd, names,
+		names.map(tool => ({ ...PI_ACTION_SEMANTICS.definition("read")!, tool, epoch: tool, projectors: [], ...(input && !(["preview", "alias"].includes(mode) && tool === names[2]) ? { canonicalize: () => undefined } : {}) })));
 	const built = [deferred(), deferred()], releaseBuild = [deferred(), deferred()], exposed = [deferred(), deferred()], releaseParent = [deferred(), deferred()];
 	const controller = new AbortController(), failure = new Error("consumer stopped after its effect"), wrapper = {};
 	let builds = 0, disposals = 0, effects = 0, compositions = 0, compositionDisposals = 0, revoke: (() => void | Promise<void>) | undefined;
@@ -185,7 +230,7 @@ test.for(["stale", "all-stale", "binding", "failure", "cancel", "composed", "rev
 	const parents: Promise<unknown>[] = [];
 	const f = systemHost(cwd, tools, { actionSemantics, resolveInvocation: tool => invocations[names.indexOf(tool)],
 		resources: { initial: { cpuCount: 3, idleCpuCount: 3 }, sample: () => new Promise(() => {}) },
-		executionWorlds: [createResourceSnapshotExecutionWorld(actionSemantics, { maxBytes: () => 1024 * 1024 })],
+		executionWorlds: [world],
 	}, { maxConcurrentActions: 3, scheduling: { heavyCpu: 1 } });
 	await using _cleanup = onExit(async () => { for (const gate of [...releaseBuild, ...releaseParent]) gate.resolve(); await Promise.allSettled(parents); await f.dispose(); expect(disposals).toBe(builds); expect(compositionDisposals).toBe(compositions); });
 	await f.start();
@@ -207,11 +252,11 @@ test.for(["stale", "all-stale", "binding", "failure", "cancel", "composed", "rev
 	if (input && mode === "preview") await f.preview(names[2]!, args);
 	const result = f.execute(names[2]!, args, controller.signal);
 	if (mode === "failure" || mode === "cancel") await expect(result).rejects.toBe(failure);
-	else expect(textOutput(await result)).toBe(`consume_count:${input ? mode === "alias" ? 0 : mode === "fresh" ? 8 : mode === "all-stale" ? 19 : 14 : mode === "all-stale" ? 3 : 2}`);
+	else expect(textOutput(await result)).toBe(`consume_count:${input ? mode === "alias" ? (await stat(alias)).size : mode === "fresh" ? 8 : mode === "all-stale" ? 19 : 14 : mode === "all-stale" ? 3 : 2}`);
 	if (mode === "composed") expect(textOutput(await f.execute(names[2]!, args))).toBe(`consume_count:${input ? 14 : 2}`);
 	expect(effects).toBe(mode === "composed" ? 2 : 1); expect(compositions).toBe(Number(mode === "composed"));
 	expect(builds).toBe(!input && ["all-stale", "binding"].includes(mode) ? 3 : 2);
-	if (input) { await f.finish(); const timing = f.events.filter(event => event.type === "actor_action").filter(event => event.settlement.tool === names[2]).at(-1)!.computation!;
+	if (input) { await f.finish(); const timing = f.actors.filter(event => event.settlement.tool === names[2]).at(-1)!.computation!;
 		expect(timing.hiddenComputeMs > 0).toBe(!["all-stale", "alias", "failure", "cancel"].includes(mode)); expect(timing.hiddenComputeMs).toBeLessThanOrEqual(timing.toolComputeMs!); }
 });
 
@@ -221,17 +266,14 @@ test.for(["reopened", "inflight", "completed", "binding", "reverse", "deep", "ad
 	const fallback = mode.includes("fallback"), closure = mode.match(/-(close|terminal|disable|dispose)$/)?.[1], poison = mode.endsWith("poison"), failed = /failure|cancel/.test(mode);
 	const shared = mode.startsWith("shared"), stale = mode.endsWith("stale"), unused = mode === "shared-unused", native = mode.includes("native"), exact = mode.includes("exact"), consumed = shared && !stale && !unused && !closure && !poison && !mode.endsWith("before");
 	const cwd = await directories.create(), names = [reopen ? "read" : "inspect_index", reopen ? "read" : "open_record", "render_record", replaces ? "status_index" : "background_status", "summarize_record", "tail_record"];
-	const files = ["root.txt", "child.txt", "leaf.txt", "status.txt", "other.txt", "tail.txt"], reader = createReadTool(cwd);
+	const files = ["root.txt", "child.txt", "leaf.txt", "status.txt", "other.txt", "tail.txt"];
 	for (const file of files) await writeFile(path.join(cwd, file), `${file}\n`);
-	const definitions = [...new Set(names)].map(tool => ({ ...PI_ACTION_SEMANTICS.definition("read")!, tool, epoch: `learned:${tool}`, projectors: [],
-		...(native && tool === names[4] ? { canonicalize: () => undefined } : {}) }));
-	const actionSemantics = new ActionSemanticsRegistry(definitions), tools = definitions.map(({ tool: name }) => ({ ...reader, name })) as Parameters<typeof systemHost>[1];
+	const { actionSemantics, tools, world, resolveInvocation } = readScenario(cwd, [...new Set(names)], [...new Set(names)].map(tool => ({
+		...PI_ACTION_SEMANTICS.definition("read")!, tool, epoch: `learned:${tool}`, projectors: [], ...(native && tool === names[4] ? { canonicalize: () => undefined } : {}) })));
 	const settings = patternAwareSettings({ enabled: true, minOccurrences: 2, maxContextLength: added ? 2 : 1, maxFutureGap: 0, beamWidth: added ? 2 : 1, maxPredictionDepth: 3, presets: [] });
 	const createStore = () => new PatternAwareStore(settings, path.join(cwd, "patterns.json"), patternAwareActionSemantics(actionSemantics, cwd));
 	const store = createStore(); await store.load();
-	const world = createResourceSnapshotExecutionWorld(actionSemantics, { maxBytes: () => 1024 * 1024 });
-	const options = { actionSemantics, patternStore: store, executionWorlds: [world],
-		resolveInvocation: (tool: string, input: unknown) => ({ ...resolvePiToolInvocation("read", input, { cwd, environment: {} })!, semantics: definitions.find(definition => definition.tool === tool) }) };
+	const options = { actionSemantics, patternStore: store, executionWorlds: [world], resolveInvocation };
 	const chains = [[[0], [1], ...reopen ? [] : [[2]], ...deep ? [[5]] : []], ...changed || added ? [[added ? [3, 0] : [3], [4], [5]]] : []];
 	for (const chain of chains) for (let round = 0; round < 4; round++) {
 		await using training = disposable(systemHost(cwd, tools, options, { patternAware: settings }, `chain-${chain[0]}-${round}`));
@@ -313,7 +355,7 @@ test.for(["reopened", "inflight", "completed", "binding", "reverse", "deep", "ad
 	}
 	expect(f.fallbacks).toEqual(fallback && !poison ? [names[1]] : native ? [names[4]] : []);
 	if (fallback) { expect(nativeCalls).toBe(Number(!poison)); expect(commits).toBe(Number(poison));
-		const timing = f.events.filter(event => event.type === "actor_action").filter(event => event.settlement.tool === names[1]).at(-1)?.computation;
+		const timing = f.actors.filter(event => event.settlement.tool === names[1]).at(-1)?.computation;
 		if (closure || poison) expect(timing).toBeUndefined(); else { expect(timing!.hiddenComputeMs > 0).toBe(consumed); expect(timing!.hiddenComputeMs).toBeLessThanOrEqual(timing!.toolComputeMs!); } }
 	if (mode !== "binding") expect(leafSignal).toBe(original);
 	if (shared) {
@@ -361,7 +403,7 @@ test.for(["refresh", "replace", "remove"])("settles claimed consumption after a 
 	await expect.poll(() => updated).toBe(true); await nextTurn(); release.resolve(); expect(textOutput(await result)).toBe("input.txt\n");
 	await f.finish(true); expect(settled.filter(item => item.settlement.observation === "observed")).toMatchObject([{ feedback: "before", served: true,
 		settlement: { match: { matched: true, adoption: { status: "rejected" } } } }]);
-	const timing = f.events.filter(event => event.type === "actor_action").at(-1)!.computation!;
+	const timing = f.actors.at(-1)!.computation!;
 	expect(timing.hiddenComputeMs).toBeGreaterThan(0); expect(timing.hiddenComputeMs).toBeLessThanOrEqual(timing.toolComputeMs!);
 });
 
@@ -587,8 +629,8 @@ test.for(["independent", "unchanged", "batch", "batch-known", "mismatch-text", "
 	expect(textOutput(await f.execute(child.tool, child.args))).toBe(dependent ? "prepared\n" : mode === "stale" ? "fresh\n" : "child\n");
 	expect(f.fallbacks).toEqual([]);
 	await f.finish();
-	if (mode === "stale" || repairBudget) expect(f.events.filter(event => event.type === "actor_action").at(-1)).toMatchObject({ computation: { hiddenComputeMs: 0 } });
-	if (wrong && !repairBudget || recoverable || actualFirst || known || contractChanged) expect(f.events.filter(event => event.type === "actor_action").at(-1)!.computation!.hiddenComputeMs).toBeGreaterThan(0);
+	if (mode === "stale" || repairBudget) expect(f.actors.at(-1)).toMatchObject({ computation: { hiddenComputeMs: 0 } });
+	if (wrong && !repairBudget || recoverable || actualFirst || known || contractChanged) expect(f.actors.at(-1)!.computation!.hiddenComputeMs).toBeGreaterThan(0);
 	if (wrong && !inflight || mode === "parent-miss" || contractChanged) expect(f.events.some(event => event.type === "prediction" && event.tool === child.tool &&
 		event.settlement.observation === "unobserved" && event.settlement.cause.code === "dependency_impossible")).toBe(true);
 	if (mode !== "parent-miss" && !repairBudget) expect(f.events.some(event => event.type === "prediction" && event.tool === child.tool &&
@@ -601,21 +643,19 @@ test.for(["completed", "inflight", "forecast", "binding", "parent-binding", "rev
 	const cwd = await directories.create(), gates = [deferred(), deferred()], delayed = deferred();
 	const scopes = mode.endsWith("-scope") ? [["a", "b"]] : [["a"], ["b"], ["a", "b"]];
 	const unchanged = mode === "unchanged", both = mode === "both", deep = mode === "deep";
-	const names = ["inspect_rows", "render_rows"], reader = createReadTool(cwd), read = PI_ACTION_SEMANTICS.definition("read")!;
-	const definitions = names.map(tool => ({ ...read, tool, epoch: tool, projectors: [] })), semantics = new ActionSemanticsRegistry(definitions);
-	const tools = names.map(name => ({ ...reader, name })) as Parameters<typeof systemHost>[1], world = createResourceSnapshotExecutionWorld(semantics, { maxBytes: () => 1024 * 1024 });
+	const names = ["inspect_rows", "render_rows"], { actionSemantics, tools, world, resolveInvocation } = readScenario(cwd, names);
 	const roots = ["a", "b"].map(id => ({ id, path: `${id}.txt`, text: `${id}-real\n` }));
 	for (const root of roots) await writeFile(path.join(cwd, root.path), root.text);
 	for (const branch of ["a", "b", "ab"]) for (const version of ["old", "new"]) for (const suffix of ["", ".next"])
 		await writeFile(path.join(cwd, `${branch}-${version}${suffix}.txt`), `${branch}-${version}${suffix}\n`);
 	const calls: { path: string; signal: AbortSignal }[] = [], forecasts: AbortSignal[] = [], executed: string[] = [];
 	const settings = { drafterEnabled: true, candidateLimit: 1, maxConcurrentActions: 3, predictionTimeoutMs: 30_000, drafterMaxDepth: deep ? 2 : 1, drafterTaskMaxRequests: mode === "budget" ? 8 : 32 };
-	const f = systemHost(cwd, tools, { actionSemantics: semantics,
+	const f = systemHost(cwd, tools, { actionSemantics,
 		resources: { initial: { cpuCount: 3, idleCpuCount: 3 }, sample: () => new Promise(() => {}) },
 		resolveInvocation: async (tool, args) => {
 			const file = String((args as { path: string }).path);
 			if (mode === "binding" && file.includes("old") || mode === "parent-binding" && file === "b.txt") await delayed.promise;
-			return { ...resolvePiToolInvocation("read", args, { cwd, environment: {} })!, semantics: definitions[names.indexOf(tool)] };
+			return resolveInvocation(tool, args);
 		},
 		executionWorlds: [{ ...world, speculation: { ...world.speculation!, execute: async context => {
 			const file = String((context.args as { path: string }).path); executed.push(file);
@@ -699,7 +739,7 @@ test.for(["completed", "inflight", "forecast", "binding", "parent-binding", "rev
 		for (const file of ["a-new.next.txt", "b-new.next.txt", "ab-new.next.txt"]) {
 			expect(textOutput(await f.execute(names[1]!, { path: file }))).toBe(`${file.replace(/\.txt$/, "")}\n`);
 			await expect.poll(() => f.events.find(event => event.type === "actor_action" && JSON.parse(event.actualAction).input.path === file)).toMatchObject({ computation: { hiddenComputeMs: expect.any(Number) } });
-			expect(f.events.filter(event => event.type === "actor_action").at(-1)!.computation!.hiddenComputeMs).toBeGreaterThan(0);
+			expect(f.actors.at(-1)!.computation!.hiddenComputeMs).toBeGreaterThan(0);
 		}
 		expect(calls.filter(call => call.path.startsWith("b-new"))).toHaveLength(2);
 	}
@@ -744,7 +784,7 @@ test.for(["dependent", "independent"])("preserves sibling resource effects outsi
 	settings.drafterEnabled = false; await f.finish(); await f.start("child");
 	expect(textOutput(await f.execute("read", child))).toBe(mode === "dependent" ? "after\n" : "independent\n");
 	await f.finish(); expect(drafted).toBe(1);
-	expect(f.events.filter(event => event.type === "actor_action").at(-1)!.computation!.hiddenComputeMs).toBeGreaterThan(0);
+	expect(f.actors.at(-1)!.computation!.hiddenComputeMs).toBeGreaterThan(0);
 });
 
 test.each(["ordered", "independent", "dependent"])("adopts only the proven effects of a predicted workflow across prompts (%s)", async order => {
@@ -800,7 +840,7 @@ test.for(["unrelated", "changed", "descendant", "mutation", "mutation-stat", "mu
 	const mutation = change.startsWith("mutation"), metadata = change.endsWith("stat"), split = /split|stale/.test(change), stale = change.endsWith("stale");
 	const native = await createLinuxProcessBenchmark("pi-sealed-result-", mutation ? "overlayfs" : "git"), { workspace: cwd, workspaceSandbox: sandbox } = native;
 	for (const [name, text] of [["a", "original"], ["b", "other"], ["c", "second"]]) await writeFile(path.join(cwd, `${name}.txt`), text + "\n");
-	if (mutation) await compileBenchmarkHelper(cwd, { source: "reader.c", output: "reader", code: `#include <fcntl.h>\n#include <stdio.h>\n#include <sys/stat.h>\n#include <unistd.h>\nint main(void){char text[64];int f=open("a.txt",O_RDONLY),n=read(f,text,sizeof text);${metadata ? 'struct stat s;if(fstat(f,&s))return 1;dprintf(1,"%llu:%lld:%ld\\n",(unsigned long long)s.st_ino,(long long)s.st_ctim.tv_sec,s.st_ctim.tv_nsec);' : ""}close(f);for(volatile unsigned long i=0;i<600000000ul;i++);return n<0||write(1,text,n)!=n;}\n` });
+	if (mutation) await compileBenchmarkHelper(cwd, "reader", { code: `#include <fcntl.h>\n#include <stdio.h>\n#include <sys/stat.h>\n#include <unistd.h>\nint main(void){char text[64];int f=open("a.txt",O_RDONLY),n=read(f,text,sizeof text);${metadata ? 'struct stat s;if(fstat(f,&s))return 1;dprintf(1,"%llu:%lld:%ld\\n",(unsigned long long)s.st_ino,(long long)s.st_ctim.tv_sec,s.st_ctim.tv_nsec);' : ""}close(f);for(volatile unsigned long i=0;i<600000000ul;i++);return n<0||write(1,text,n)!=n;}\n` });
 	await commitBenchmarkFixture(cwd, "Sealed result reuse");
 	let predict = change === "descendant" || mutation, requests = 0, drafted = 0; const prepared: string[] = [];
 	const body = mutation ? `${split ? "stat --printf='%i:%z\\n' a.txt; " : ""}./reader` : "cat a.txt", command = body + (mutation ? "; printf once >> marker" : "");
@@ -836,7 +876,7 @@ test.for(["unrelated", "changed", "descendant", "mutation", "mutation-stat", "mu
 	expect(textOutput(await f.execute("bash", { command }))).toBe(expected);
 	if (change === "descendant") { await f.finish(); await f.start("next"); expect(textOutput(await f.execute("bash", { command: "cat c.txt" }))).toBe("second\n"); }
 	await f.finish(true);
-	const actors = f.events.filter(event => event.type === "actor_action"), timing = actors.at(-1)!.computation!, fallback = metadata || split || change === "changed";
+	const actors = f.actors, timing = actors.at(-1)!.computation!, fallback = metadata || split || change === "changed";
 	expect(timing.hiddenComputeMs > 0).toBe(!metadata && !stale && change !== "changed"); expect(timing.toolComputeMs).toBeGreaterThanOrEqual(timing.hiddenComputeMs);
 	expect(f.fallbacks, JSON.stringify(actors)).toEqual([...(mutation ? [] : ["write"]), ...(fallback ? ["bash"] : [])]);
 	expect(f.events.filter(event => event.type === "candidate" && event.state.status === "running")).toHaveLength(change === "descendant" || mutation ? 2 : 1);
@@ -876,7 +916,7 @@ test("reconsiders restored results while sharing pending reads and retains fresh
 	await writeFile(file, original); release.resolve();
 	const expected = await reader.execute("oracle", args); expect(await Promise.all(actors)).toEqual([expected, expected]);
 	await f.preview("read", { ...args, offset: 6 }); await f.finish(); await f.start("second");
-	for (const event of f.events.filter(event => event.type === "actor_action")) {
+	for (const event of f.actors) {
 		expect(event.settlement.provider).toMatchObject({ kind: "speculative", match: { kind: "exact" } }); expect(event.computation?.hiddenComputeMs).toBeGreaterThan(0);
 	}
 	for (const input of [args, wide])
@@ -888,7 +928,7 @@ test("reconsiders restored results while sharing pending reads and retains fresh
 	await writeFile(file, "prepared\n"); await f.preview("read", wide); await writeFile(file, "changed again\n");
 	expect(textOutput(await f.execute("read", wide))).toBe("changed again\n");
 	await writeFile(file, original); expect(await f.execute("read", args)).toEqual(await reader.execute("restored", args)); await f.finish();
-	const settled = f.events.filter(event => event.type === "actor_action");
+	const settled = f.actors;
 	expect(settled.at(-3)?.computation?.hiddenComputeMs).toBeGreaterThan(0);
 	expect(settled.at(-2)?.computation?.hiddenComputeMs).toBe(0);
 	expect(settled.at(-1)?.settlement.provider).toMatchObject({ kind: "speculative", match: { kind: "exact" } });

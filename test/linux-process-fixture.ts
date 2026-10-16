@@ -220,12 +220,12 @@ export async function forkReusableBash(fixture: Pick<LinuxProcessBenchmark, "wor
 }
 
 export async function compileBenchmarkHelper(
-	workspace: string,
-	input: { readonly source: string; readonly output: string; readonly arguments?: readonly string[]; readonly code?: string },
+	workspace: string, output: string,
+	{ source = `${output}.c`, arguments: compilerArguments = [], code }: { readonly source?: string; readonly arguments?: readonly string[]; readonly code?: string } = {},
 ): Promise<void> {
-	if (input.code !== undefined) await writeFile(path.join(workspace, input.source), input.code);
-	await execHostText("cc", ["-O2", "-Wall", "-Wextra", ...(input.arguments ?? []), "-o", input.output, input.source], { cwd: workspace });
-	await access(path.join(workspace, input.output));
+	if (code !== undefined) await writeFile(path.join(workspace, source), code);
+	await execHostText("cc", ["-O2", "-Wall", "-Wextra", ...compilerArguments, "-o", output, source], { cwd: workspace });
+	await access(path.join(workspace, output));
 }
 
 /** Render shared C boilerplate without changing include order or the helper's source bytes. */
