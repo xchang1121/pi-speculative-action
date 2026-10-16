@@ -1,3 +1,4 @@
+import { readText } from "./filesystem.ts";
 import { disposable, onExit, gated, deferred, nextTurn } from "./async.ts";
 import { once } from "node:events";
 import { AsyncResource } from "node:async_hooks";
@@ -91,9 +92,9 @@ async function runningProcess(fixture: LinuxProcessBenchmark, ready: (pid: numbe
 		}) as readonly (readonly [string, number | undefined])[], start);
 		for (const [reportPath, sealed] of reports) {
 			if (sealed) { pid = sealed; return true; }
-			const report = await readFile(reportPath, "utf8").catch(() => "");
+			const report = await readText(reportPath).catch(() => "");
 			const match = /\nRUNNING (\d+)\n$/.exec(report); if (!match) continue;
-			const current = Number(match[1]), syscall = await readFile(`/proc/${current}/syscall`, "utf8").catch(() => "");
+			const current = Number(match[1]), syscall = await readText(`/proc/${current}/syscall`).catch(() => "");
 			if (await ready(current, syscall)) { pid = current; return true; }
 		}
 		return false;
@@ -265,8 +266,8 @@ int main(int argc, char **argv) { int fd = open(argv[2], O_WRONLY | O_TRUNC); if
 		await using sibling = disposable(await second.open({ sourceRoot: fixture.workspace, workspace: foreign ? context : workspace, invocation: invocation(other) }));
 		const stopped = async (name: string) => {
 			let pid = 0;
-			await expect.poll(async () => { pid = Number(await readFile(path.join(workspace.sandboxRoot, name), "utf8").catch(() => "")); return pid; }, { timeout: 10_000 }).toBeGreaterThan(0);
-			await expect.poll(() => readFile(`/proc/${pid}/status`, "utf8").then(text => /^State:\s+[Tt]/m.test(text))).toBe(true); return pid;
+			await expect.poll(async () => { pid = Number(await readText(workspace.sandboxRoot, name).catch(() => "")); return pid; }, { timeout: 10_000 }).toBeGreaterThan(0);
+			await expect.poll(() => readText(`/proc/${pid}/status`).then(text => /^State:\s+[Tt]/m.test(text))).toBe(true); return pid;
 		};
 		const running = first.executor.execute({ command, cwd: fixture.workspace, environment: fixture.environment, signal: AbortSignal.timeout(15_000), onData: () => {} });
 		void running.catch(() => undefined); const pid = await stopped("pid");
@@ -329,7 +330,7 @@ int main(int argc, char **argv) { FILE *f = fopen(argc > 1 ? argv[1] : "/etc/iss
 			const before = fixture.backend.actorMetrics().hits;
 			expect((await executeProcess(fixture, route.executor, command, { scope })).output).toBe("old\n");
 			expect(fixture.backend.actorMetrics().hits - before, JSON.stringify(fixture.backend.actorMetrics())).toBe(1);
-			expect(await readFile(target, "utf8")).toBe("old\n");
+			expect(await readText(target)).toBe("old\n");
 		}
 		await fixture.inOwner((state, target) => {
 			const read = state.fs.readFile; state.changed = false;
@@ -343,7 +344,7 @@ int main(int argc, char **argv) { FILE *f = fopen(argc > 1 ? argv[1] : "/etc/iss
 		expect(await fixture.inOwner(state => state.changed)).toBe(true); expect(textOutput(branch.output.result)).toBe("old\n");
 		expect(await branch.validate?.()).toMatchObject({ status: "stale" });
 		expect(textOutput(await fixture.tool.execute("raced-actor", { command: `cat '${target}'` }))).toBe("new\n");
-		await branch.commit(); expect(await readFile(target, "utf8")).toBe("new\n");
+		await branch.commit(); expect(await readText(target)).toBe("new\n");
 	});
 
 nativeTest("admits expensive late launches by completed work within a bounded learning budget", { timeout: 30_000 }, async ({ benchmark }) => {
@@ -559,7 +560,7 @@ nativeTest.for([false, true])("prepares a failed command after its reported inpu
 			expect(existsSync(path.join(fixture.workspace, "generated.txt"))).toBe(false);
 		} else {
 			expect((await result).content).toEqual([{ type: "text", text: "verified\n" }]);
-			expect(await readFile(path.join(fixture.workspace, "generated.txt"), "utf8")).toBe("fixed\n");
+			expect(await readText(fixture.workspace, "generated.txt")).toBe("fixed\n");
 		}
 		await host.finishTurn("retry");
 		expect(fallback).toHaveBeenCalledTimes(stale ? 1 : 0);
@@ -634,7 +635,7 @@ int main(int argc, char **argv) { if (argc != 2) return 1; int fd = open(${layou
 	const before = fixture.backend.actorMetrics().hits, actual = await execute("edit", `printf actual; ${both ? "worker first; " : ""}worker ${target}`);
 	const computation = events.filter(event => event.type === "actor_action").at(-1)!.settlement.provider.toolExecution, timing = consumedTiming(computation);
 	expect(textOutput(actual)).toBe(`actual${`${mode === "stale" ? "bad" : layout === "repeat" ? "two" : "new"}\n`.repeat(both ? 2 : 1)}`);
-	expect(await readFile(path.join(fixture.workspace, "marker"), "utf8")).toBe("parent");
+	expect(await readText(fixture.workspace, "marker")).toBe("parent");
 	const reused = mode === "bash" || mode === "write";
 	expect([fixture.backend.actorMetrics().hits - before, timing.hiddenComputeMs > 0]).toEqual([reused ? both ? 2 : 1 : 0, reused]);
 	const receipts = new Set(TimelineInterval.serialize(computation)!.nodes.flatMap(node => node.inputs?.filter(input => input.reused).map(input => input.id) ?? []));
@@ -716,7 +717,7 @@ int main(void) { int fds[2]; if (${mode === "eventfd" ? "(fds[0] = eventfd(0, 0)
 			if (mode === "sample") await fixture.inOwner(state => state.starting.entered);
 			else if (descendant || synchronous) await runningProcess(fixture, async (pid, syscall) => {
 				if (!synchronous) return syscall.startsWith("0 0x3 ");
-				const stat = await readFile(`/proc/${pid}/stat`, "utf8"), fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+				const stat = await readText(`/proc/${pid}/stat`), fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
 				return /^(?:running|-1 )/.test(syscall) && Number(fields[11]) + Number(fields[12]) >= 40;
 			});
 			else await expect.poll(() => existsSync(path.join(workspace.sandboxRoot, "prefix-ready"))).toBe(true);
@@ -734,7 +735,7 @@ int main(void) { int fds[2]; if (${mode === "eventfd" ? "(fds[0] = eventfd(0, 0)
 			});
 			if (mode === "file" || mode === "dup") expect(admissions).toEqual([{ syscall: 3, accepted: undefined }, { syscall: 318, accepted: true }]);
 			const produced = await pending; expect(produced).toMatchObject(complete ? { exit: { kind: "code", code: 0 } } : { suspended: true });
-			if (synchronous) { expect(actual.output).toBe("own:" + Buffer.concat(produced.output.map(event => event.data)).toString()); expect(await readFile(path.join(fixture.workspace, "marker"), "utf8")).toBe("once"); }
+			if (synchronous) { expect(actual.output).toBe("own:" + Buffer.concat(produced.output.map(event => event.data)).toString()); expect(await readText(fixture.workspace, "marker")).toBe("once"); }
 			const continuations = publications.flatMap(({ computation }) => computation ? [TimelineInterval.restore(computation)!] : []);
 			expect(continuations).toEqual(complete ? [] : [expect.anything()]); expect(timing.reused).toBe(cyclic ? undefined : true);
 			expect(timing.toolComputeMs).toBeGreaterThanOrEqual(timing.hiddenComputeMs);
@@ -905,7 +906,7 @@ int main(int argc, char **argv) {
 			operations: events.filter(event => event.type === "operation_prediction") });
 		const privatePid = await runningProcess(fixture, async (pid, syscall) => {
 			if (mode === "early" || mode === "identity") {
-				const usage = await readFile(`/proc/${pid}/stat`, "utf8").catch(() => ""), fields = usage.slice(usage.lastIndexOf(")") + 2).split(" ");
+				const usage = await readText(`/proc/${pid}/stat`).catch(() => ""), fields = usage.slice(usage.lastIndexOf(")") + 2).split(" ");
 				return /^(?:running|-1 )/.test(syscall) && Number(fields[11]) + Number(fields[12]) >= 40;
 			}
 			return syscall.startsWith(mode === "handles" ? "0 0x8 " : mode === "writev" ? "20 0x4 " : mode === "readv" ? "19 0x3 " : mode === "recvmsg" ? "47 0x3 " : "0 0x3 ");
@@ -1412,7 +1413,7 @@ int main(int argc, char **argv) {
 		if (mode.includes("prepared-")) {
 			await prepared.waitFor(() => events.filter(event => event.type === "candidate" && event.turnID === "prepared" &&
 				event.candidate.kind === "operation" && event.state.status === "succeeded").length === (launcher ? 2 : 1));
-			expect(await readFile(path.join(fixture.workspace, "input.txt"), "utf8")).toBe("changed during preparation\n");
+			expect(await readText(fixture.workspace, "input.txt")).toBe("changed during preparation\n");
 			await restorePreparation?.(); restorePreparation = undefined;
 			// Every preparation is sealed before this change; no later producer can capture the replacement value.
 			await writeFile(path.join(fixture.workspace, "input.txt"), mode === "native-prepared-restored" ? "newest\n" : "changed after preparation\n");
@@ -1568,10 +1569,10 @@ int main(int argc,char **argv) {
 					if (mode === "hardlink-detached") { expect(existsSync(input)).toBe(false); expect(existsSync(path.join(fixture.workspace, "alias.txt"))).toBe(false); }
 					else if (hardlink) {
 						const alias = path.join(fixture.workspace, "alias.txt");
-						expect(await readFile(alias, "utf8")).toBe(writable ? `${changed ? "uvwx" : "abcd"}XY` : pathWrite ? `${changed ? "uv" : "ab"}Z${changed ? "xyz" : "def"}` : changed ? "uvwxyz" : "abcdef");
+						expect(await readText(alias)).toBe(writable ? `${changed ? "uvwx" : "abcd"}XY` : pathWrite ? `${changed ? "uv" : "ab"}Z${changed ? "xyz" : "def"}` : changed ? "uvwxyz" : "abcdef");
 						if (mode === "hardlink-rename" || mode === "hardlink-unlink") expect(existsSync(input)).toBe(false);
 						if (mode === "hardlink-rename") expect((await stat(path.join(fixture.workspace, "moved.txt"))).ino).toBe((await stat(alias)).ino);
-						if (mode === "hardlink-split") expect(await readFile(input, "utf8")).toBe("new");
+						if (mode === "hardlink-split") expect(await readText(input)).toBe("new");
 					}
 					expect(fixture.backend.actorMetrics().hits, JSON.stringify({ actor: fixture.backend.actorMetrics(), producer: session.metrics() }))
 						.toBe(hits + Number(!changed && mode !== "locks-named"));
@@ -1746,7 +1747,7 @@ int main(int n,char **v) { if(n!=2)return 90; pid_t child=!strcmp(v[1],"vfork")?
 			const pending = observe("background", async () => {
 				child = childProcess.spawn(path.join(root, "lifetime"), [kind], { detached: true }); finished = collect(child); child.stdin!.on("error", () => {});
 				late = AsyncResource.bind(() => collect(childProcess.spawn("/bin/true"))); await once(child.stdout!, "data");
-				if (kind === "stopped") { process.kill(-child.pid!, "SIGSTOP"); await expect.poll(() => readFile(`/proc/${child.pid}/status`, "utf8"), { timeout: 500 }).toMatch(/^State:\s+[Tt]/m); }
+				if (kind === "stopped") { process.kill(-child.pid!, "SIGSTOP"); await expect.poll(() => readText(`/proc/${child.pid}/status`), { timeout: 500 }).toMatch(/^State:\s+[Tt]/m); }
 				if (killed) process.kill(observations.at(-1)!.tracerPid, "SIGKILL"); return { resource: child, output: "own" };
 			}, undefined, descriptors);
 			await using _child = onExit(async () => { if (child?.exitCode === null && child.signalCode === null) try { process.kill(-child.pid!, "SIGKILL"); } catch {} await finished; await pending; });
@@ -1755,7 +1756,7 @@ int main(int n,char **v) { if(n!=2)return 90; pid_t child=!strcmp(v[1],"vfork")?
 			expect(child.exitCode).toBeNull(); expect(child.signalCode).toBeNull(); expect(completions.slice(completedBefore)).toEqual([undefined]);
 			const keeper = observe("keeper", () => background.wait()); await background.entered;
 			await late(); expect(observations.length).toBe(before + 1); background.release(); await keeper;
-			if (kind === "stopped") { expect(await readFile(`/proc/${child.pid}/status`, "utf8")).toMatch(/^State:\s+T/m); process.kill(-child.pid!, "SIGCONT"); }
+			if (kind === "stopped") { expect(await readText(`/proc/${child.pid}/status`)).toMatch(/^State:\s+T/m); process.kill(-child.pid!, "SIGCONT"); }
 			child.stdin!.end("go\n"); expect(await finished).toMatchObject({ code: 0, signal: null, stdout: "readydoneparent" }); expect(completions.slice(completedBefore)).toEqual([undefined]);
 			await expect.poll(() => { try { process.kill(observations.at(-1)!.tracerPid, 0); return true; } catch { return false; } }).toBe(false);
 		}
@@ -1773,7 +1774,7 @@ int main(int n,char **v) { if(n!=2)return 90; pid_t child=!strcmp(v[1],"vfork")?
 			};
 			try {
 				await backend.store.put(PROCESS_CERTIFICATE); const warming = stop === "preparing" ? backend.refreshNativeObservation() : undefined, first = execute(controller.signal);
-				await expect.poll(() => existsSync(marker)).toBe(true); const pid = Number(await readFile(marker, "utf8")), second = execute();
+				await expect.poll(() => existsSync(marker)).toBe(true); const pid = Number(await readText(marker)), second = execute();
 				if (stop !== "owner") {
 					controller.abort(); expect(await scheduling.waitForCompletion(first, undefined, 500)).toEqual({ status: "completed", value: "aborted" });
 					expect((await scheduling.waitForCompletion(second, undefined, 30)).status).toBe("deadline"); expect(() => process.kill(pid, 0)).not.toThrow();
@@ -1818,13 +1819,13 @@ int main(int n,char **v) { if(n!=2)return 90; pid_t child=!strcmp(v[1],"vfork")?
 			await expect.poll(() => output).toBe("abc");
 			if (producer === 1 || producer === 5) {
 				expect(await closed).toEqual([0, null]);
-			expect(await readFile(queueReport, "utf8")).toMatch(producer === 1 ? /^OFD 1\n0 0 3 / : /^OFD 1\n0 2 0 /);
+			expect(await readText(queueReport)).toMatch(producer === 1 ? /^OFD 1\n0 0 3 / : /^OFD 1\n0 2 0 /);
 			} else {
 				await new Promise(resolve => setTimeout(resolve, 30));
 				expect(completed, "exhausted active input must block, never fabricate EOF").toBe(false);
 				process.kill(-child.pid!, "SIGKILL"); await closed;
-				await expect.poll(async () => (await readFile(`/proc/${Number(childPID)}/stat`, "utf8").catch(() => "")).split(") ")[1]?.[0] ?? "").not.toMatch(/[RSDT]/);
-				expect(await readFile(queueReport, "utf8")).toMatch(/^OFD 1\n0 (?:0|2) 0 \d+ \d+\nRUNNING \d+\n$/);
+				await expect.poll(async () => (await readText(`/proc/${Number(childPID)}/stat`).catch(() => "")).split(") ")[1]?.[0] ?? "").not.toMatch(/[RSDT]/);
+				expect(await readText(queueReport)).toMatch(/^OFD 1\n0 (?:0|2) 0 \d+ \d+\nRUNNING \d+\n$/);
 			}
 		}
 		await writeFile(queueImage, "");
@@ -1850,7 +1851,7 @@ int main(int n,char **v) { if(n!=2)return 90; pid_t child=!strcmp(v[1],"vfork")?
 		const completed = path.join(root, "descendant-completed"), pidFile = path.join(root, "descendant-pid");
 		const command = `/usr/bin/setsid /bin/sh -c 'echo $$ > ${pidFile}; sleep 1; echo done > ${completed}' </dev/null >/dev/null 2>&1 & exit 7`;
 		expect(await scheduling.waitForCompletion(run(command), undefined, 900), "the shell returns without its detached descendants").toMatchObject({ status: "completed", value: { code: 7 } });
-		await expect.poll(() => readFile(completed, "utf8").catch(() => ""), { timeout: 5000 }).toBe("done\n"); // Released, not killed with the tracer.
+		await expect.poll(() => readText(completed).catch(() => ""), { timeout: 5000 }).toBe("done\n"); // Released, not killed with the tracer.
 		await rm(pidFile);
 		for (const skipRoot of [false, true]) {
 			let armed!: ReturnType<typeof collect>;
@@ -2130,7 +2131,7 @@ int main(void) { int status; struct timespec pause = {0, 300000000}; pid_t sibli
 			`IFS= read -r -N 1 a; IFS= read -r -N 1 b <&3; IFS= read -r -N 1 c <&8; printf '%s:%s:%s' "$a" "$b" "$c"; ` +
 			`(sleep 0.02; IFS= read -r -N 1 d <&3) & exit 7`], { encoding: "utf8", cwd: root });
 		expect(reproduced).toMatchObject({ status: 7, stdout: "b:c:b", stderr: "" });
-		const reportLines = (await readFile(report, "utf8")).trimEnd().split("\n");
+		const reportLines = (await readText(report)).trimEnd().split("\n");
 		expect([reportLines[0], ...reportLines.slice(1).map(line => line.split(" ").slice(0, 3).join(" "))])
 			.toEqual(["OFD 3", "0 32768 4", "3 32768 4", "8 32768 2"]);
 		const raw = (stdio: childProcess.SpawnOptions["stdio"]): typeof native => ({ execute: async request => {
@@ -2156,7 +2157,7 @@ int main(void) { int status; struct timespec pause = {0, 300000000}; pid_t sibli
 					expect(descriptors.find(({ fd }) => fd === 5)).toMatchObject({ fd: 5, alias: 5, owned: true, inode: first.inode });
 					if (shell === external) expect(descriptors.find(({ fd }) => fd === 9)).toMatchObject({ fd: 9, alias: 9, owned: false });
 					await new Promise(resolve => setTimeout(resolve, 30));
-					expect(await readFile(`/proc/${process.pid}/fdinfo/3`, "utf8")).toMatch(new RegExp(`^pos:\\s*${first.offset}$`, "m"));
+					expect(await readText(`/proc/${process.pid}/fdinfo/3`)).toMatch(new RegExp(`^pos:\\s*${first.offset}$`, "m"));
 				} catch (error) { failures.push(error); }
 				return { kind: "continue" };
 			} }, shell);
@@ -2255,7 +2256,7 @@ int main(void) { int status; struct timespec pause = {0, 300000000}; pid_t sibli
 					const pins = (await filesystem.readdir(`/proc/${process.holderPid}/fd`)).map(Number);
 					expect(pins).toContain(reference.pin); expect(pins).toHaveLength(new Set(descriptorOffsets.flatMap(fd => fd.pin === undefined ? [] : [fd.pin])).size + 1);
 					await expect(filesystem.readlink(`/proc/${process.tracerPid}/exe`)).rejects.toMatchObject({ code: "EACCES" });
-					for (const kind of ["Prm", "Eff", "Inh", "Amb"]) expect(await readFile(`/proc/${process.tracerPid}/status`, "utf8")).toMatch(new RegExp(`^Cap${kind}:\\s+0+$`, "m"));
+					for (const kind of ["Prm", "Eff", "Inh", "Amb"]) expect(await readText(`/proc/${process.tracerPid}/status`)).toMatch(new RegExp(`^Cap${kind}:\\s+0+$`, "m"));
 					pinCounts.push(pins.length);
 				}
 				expect(receiver.messages).toEqual([{ start: 1, end: 3, rights: [reference.fd, 3] }, { start: 3, end: 4, rights: [reference.fd, 3] }]);
@@ -2299,7 +2300,7 @@ int main(void) { int status; struct timespec pause = {0, 300000000}; pid_t sibli
 			const executor = replay(mode, async ({ pid, descriptors }) => {
 				const descriptorOffsets = await Promise.all([3, 4, 5].map(async fd => {
 					const info = await filesystem.stat(`/proc/${pid}/fd/${fd}`, { bigint: true });
-					const text = await readFile(`/proc/${pid}/fdinfo/${fd}`, "utf8");
+					const text = await readText(`/proc/${pid}/fdinfo/${fd}`);
 					return { fd, device: info.dev.toString(), inode: info.ino.toString(),
 						flags: Number.parseInt(/^flags:\s*([0-7]+)/m.exec(text)![1]!, 8), before: 0, after: device ? 0 : fd === 5 ? 1 : 3,
 						...(mode.startsWith("status-") && fd !== 5 ? { afterFlags: 32768 | (mode === "status-clear" ? 0 : mode === "status-unsupported" ? 0x2000 : mode === "status-conflict" && fd === 4 ? 0 : 0xc00) } : {}),
@@ -2321,7 +2322,7 @@ int main(void) { int status; struct timespec pause = {0, 300000000}; pid_t sibli
 				if (mode === "directory-replaced") { await filesystem.rename(directoryInput, `${directoryInput}-old`); await mkdir(directoryInput); }
 				if (mode === "directory-symlink") { await filesystem.rename(directoryInput, `${directoryInput}-target`); await filesystem.symlink(`${directoryInput}-target`, directoryInput); }
 				return { descriptorOffsets };
-			}, { descriptors: directory, beforeCommit: async ({ pid }) => { expect(await readFile(`/proc/${pid}/fdinfo/3`, "utf8")).toMatch(/^pos:\s*0$/m); } });
+			}, { descriptors: directory, beforeCommit: async ({ pid }) => { expect(await readText(`/proc/${pid}/fdinfo/3`)).toMatch(/^pos:\s*0$/m); } });
 			await executor.verify(`exec 3<'${target}'; exec 4<&3; exec 5<'${target}'; ${opath ? `'${descriptorProbe}' opath '${target}'` : mode === "status-clear" ? `'${descriptorProbe}' status '${input}'` : "/bin/true"}; ` +
 				(mode.startsWith("status-") ? `for fd in 3 4 5; do while read -r key value; do if [[ $key == flags: ]]; then (( (8#$value & 3072) == (${mode === "status-set" ? 3072 : 0} * (fd != 5)) )) || exit 90; fi; done </proc/self/fdinfo/$fd; done; ` : "") +
 				(device ? "printf native" : `IFS= read -r -N 1 a <&4; IFS= read -r -N 1 b <&5; IFS= read -r -N 1 c <&3; printf '%s:%s:%s' "$a" "$b" "$c"`),
@@ -2397,7 +2398,7 @@ int main(void) { int status; struct timespec pause = {0, 300000000}; pid_t sibli
 				await expect(stat(after)).rejects.toThrow();
 			} else {
 				expect(await run).toEqual({ exitCode: 0 });
-				expect(await readFile(after, "utf8")).toBe("continued");
+				expect(await readText(after)).toBe("continued");
 			}
 			expect(commit).toHaveBeenCalledOnce();
 			expect(adopted).toHaveBeenCalledTimes(disposition ? 0 : 1);
@@ -2434,7 +2435,7 @@ int main(void) { int status; struct timespec pause = {0, 300000000}; pid_t sibli
 		await using _cleanup = onExit(async () => { await fixture.dispose(); await rm(outside, { recursive: true, force: true }); });
 		for (const name of ["kept", "stay"]) await writeFile(path.join(outside, name), "old\n");
 		const { executionFingerprint } = await prepareLinuxProcessReuse(fixture);
-		const scratch = "t=$(mktemp -d) && echo t > $t/x && cat $t/x && rm -r $t", host = async (name: string) => readFile(path.join(outside, name), "utf8").catch(() => "absent");
+		const scratch = "t=$(mktemp -d) && echo t > $t/x && cat $t/x && rm -r $t", host = async (name: string) => readText(outside, name).catch(() => "absent");
 		// Written, replaced and scratch paths in one command: only the net changes commit, and only on adoption, with the times
 		// they were left. The directory holding them lists the host's entries with the branch's, and is the host's own.
 		const branch = await forkReusableBash(fixture, { label: "commit", command: `mkdir ${outside}/d && echo private > ${outside}/d/f && echo new > ${outside}/kept && cat ${outside}/d/f && ` +
@@ -2954,7 +2955,7 @@ int main(int argc, char **argv) {
 		} finally { await candidate.dispose(); }
 		if (mutation.startsWith("mkdir")) await rm(path.join(fixture.workspace, "many", "new"), { recursive: true });
 		if (mutation.startsWith("rmdir")) await mkdir(path.join(fixture.workspace, "many", "d0"));
-		if (mutation.endsWith("legacy")) { expect(await readFile(path.join(fixture.workspace, "legacy-result"), "utf8")).toBe("legacy"); await rm(path.join(fixture.workspace, "legacy-result")); }
+		if (mutation.endsWith("legacy")) { expect(await readText(fixture.workspace, "legacy-result")).toBe("legacy"); await rm(path.join(fixture.workspace, "legacy-result")); }
 	}
 	for (const [name, mode] of [["README", "proc"], ["many", "proc"], [".", ""], ["metadata-link", ""], ["dist/module.cjs", "module"], ["README", "replace"]]) {
 		const command = mode === "module" ? `node -e "console.log(require('./${name}'))"` : `./metadata ${name} ${mode === "proc" ? mode : ""}`;

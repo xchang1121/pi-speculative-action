@@ -1,7 +1,8 @@
+import { readText } from "./filesystem.ts";
 import { disposable, onExit } from "./async.ts";
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
-import { lstat, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { expect } from "vitest";
 import { PROCESS_CERTIFICATE } from "./process-fixture.ts";
@@ -165,7 +166,7 @@ int main(int argc, char **argv) {
 			}) : await consume();
 			if (publication) expect(await publication.joined()).toBe(true);
 			expect(result.output, scenario.name).toBe(`actor-parent\n${scenario.expected}`);
-			if (scenario.file) expect(await readFile(path.join(workspace, scenario.file), "utf8"))
+			if (scenario.file) expect(await readText(workspace, scenario.file))
 				.toBe(scenario.name === "descriptor" ? "descriptor" : `artifact:${["stale", "foreign"].includes(scenario.name) ? "after" : "before"}\n`);
 			expect(result.metrics, scenario.name).toMatchObject(scenario.metrics);
 			if ("hits" in scenario.metrics && scenario.metrics.hits) expect(result.metrics.reusedProcessMs).toBeGreaterThan(0);

@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants, type BigIntStats, type Stats } from "node:fs";
-import { access, chmod, copyFile, type FileHandle, link, lstat, mkdir, mkdtemp, open, readdir, rename, rm, rmdir, unlink, utimes, writeFile } from "node:fs/promises";
+import { access, chmod, copyFile, type FileHandle, link, lstat, mkdir, mkdtemp, open, readdir, realpath, rename, rm, rmdir, unlink, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { containsFilesystemPath, filesystemPathKey, relativeFilesystemPath, slash } from "./path-utils.ts";
@@ -501,7 +501,7 @@ async function commitSandboxExecution(state: WorkspaceSandboxState, execution: S
 	assertWorkspaceSandboxOpen(state);
 	const { changes } = execution;
 	const commit = withCommitLocks(
-		commitLockTargets(changes),
+		changes,
 		async () => {
 			const staged = new Map<SandboxFileChange, string>(), descriptors = new Map<SandboxFileChange, FileHandle>();
 			const baselines = new Map<SandboxWorkspaceChange, RegularFileState | SandboxDirectoryState | undefined>();
@@ -558,7 +558,9 @@ async function commitSandboxExecution(state: WorkspaceSandboxState, execution: S
 						const current = unchanged ? { content: (change as SandboxFileChange).before!, mode: Number(unchanged.mode & 0o777n), identity: unchanged }
 							: change.kind === "directory" ? await readSandboxDirectoryState(change.target) : await readRegularState(change.target);
 						baselines.set(change, current);
-						if (!sameSandboxBaseline(current, change)) throw new Error(`resource changed before commit: ${change.resource}`);
+						if (change.kind === "directory" && change.validationOnly ? !!current !== !!change.before : !sameSandboxState(current,
+							change.kind === "directory" ? change.before : change.before && { content: change.before, mode: change.beforeMode ?? 0 }))
+							throw new Error(`resource changed before commit: ${change.resource}`);
 						if (change.accessMode) await access(change.target, change.accessMode);
 						if (change.kind !== "directory" && change.aliases) await assertFileAliases(change.root, change.target, change.aliases, (current as RegularFileState | undefined)?.identity);
 						const descriptor = change.kind !== "directory" && descriptors.get(change);
@@ -664,7 +666,9 @@ async function commitSandboxExecution(state: WorkspaceSandboxState, execution: S
 				}
 				try {
 					await restoreChanges(applied, baselines);
-					await removeCreatedDirectories(createdDirectories);
+					for (const directory of [...new Set(createdDirectories)].sort((left, right) => right.length - left.length)) {
+						try { await rmdir(directory); } catch (error) { if (!isMissing(error)) throw error; }
+					}
 				} catch (rollbackError) {
 					throw effectCommitFailure(
 						new AggregateError([error, rollbackError], "sandbox commit and rollback both failed", { cause: error }),
@@ -1950,12 +1954,6 @@ export function sameSandboxState(
 	return left.entriesDigest === right.entriesDigest && left.mode === right.mode && left.uid === right.uid && left.gid === right.gid;
 }
 
-function sameSandboxBaseline(current: RegularFileState | SandboxDirectoryState | undefined, change: SandboxWorkspaceChange): boolean {
-	if (change.kind === "directory" && change.validationOnly) return Boolean(current) === Boolean(change.before);
-	return sameSandboxState(current, change.kind === "directory" ? change.before : change.before === undefined
-		? undefined : { content: change.before, mode: change.beforeMode ?? 0 });
-}
-
 async function sameDirectoryAfter(target: string, change: SandboxDirectoryChange, captureNames?: (names: readonly string[] | undefined) => void): Promise<boolean> {
 	// Native mkdir observes existence; subsequent new-entry reads/access need their own proof.
 	if (!change.operation) return sameSandboxState(await readSandboxDirectoryState(target, captureNames), change.after);
@@ -2043,7 +2041,11 @@ async function restoreChanges(
 			}
 			const file = baseline as RegularFileState | undefined;
 			if (!file) await rm(change.target, { force: true });
-			else await atomicWrite(change.target, file.content, file.mode, change.root);
+			else {
+				const temporary = await stageAtomicWrite(file.content, file.mode, change.root);
+				try { await createParentDirectories(change.root, change.target); await replaceFile(temporary, change.target, file.mode); }
+				finally { await rm(temporary, { force: true }).catch(() => undefined); }
+			}
 		} catch (error) {
 			errors.push(error);
 		}
@@ -2072,30 +2074,21 @@ function sameExecutableMode(left: number, right: number): boolean { return isExe
 
 function isExecutableMode(mode: number): boolean { return (mode & 0o111) !== 0; }
 
-async function atomicWrite(target: string, content: Uint8Array, mode: number | undefined, sourceRoot: string) {
-	const temporary = await stageAtomicWrite(content, mode, sourceRoot);
-	try { await createParentDirectories(sourceRoot, target); await replaceFile(temporary, target, mode); } finally {
-		await rm(temporary, { force: true }).catch(() => undefined);
-	}
-}
-
 async function stageAtomicWrite(content: Uint8Array, mode: number | undefined, stagingDirectory: string): Promise<string> {
 	await mkdir(stagingDirectory, { recursive: true });
 	const temporary = path.join(stagingDirectory, `${SANDBOX_STAGING_FILE_PREFIX}${randomUUID()}.tmp`);
 	const fileMode = process.platform === "win32" ? undefined : mode;
 	const handle = await open(temporary, "wx", fileMode ?? 0o600);
+	let staged = false;
 	try {
 		await handle.writeFile(content);
 		await handle.sync();
 		if (fileMode !== undefined) await handle.chmod(fileMode);
-	} catch (error) {
-		await handle.close().catch(() => undefined);
-		await rm(temporary, { force: true }).catch(() => undefined);
-		throw error;
+		staged = true; return temporary;
 	} finally {
 		await handle.close().catch(() => undefined);
+		if (!staged) await rm(temporary, { force: true }).catch(() => undefined);
 	}
-	return temporary;
 }
 
 async function createParentDirectories(sourceRoot: string, target: string, created?: string[], ensured?: Set<string>): Promise<void> {
@@ -2115,12 +2108,6 @@ async function createParentDirectories(sourceRoot: string, target: string, creat
 			}
 		}
 		ensured?.add(current);
-	}
-}
-
-async function removeCreatedDirectories(directories: readonly string[]): Promise<void> {
-	for (const directory of [...new Set(directories)].sort((left, right) => right.length - left.length)) {
-		try { await rmdir(directory); } catch (error) { if (!isMissing(error)) throw error; }
 	}
 }
 
@@ -2144,16 +2131,23 @@ async function replaceFile(temporary: string, target: string, mode?: number): Pr
 	if (mode !== undefined && process.platform !== "win32") await chmod(target, mode);
 }
 
-/** Root locks make namespace changes conflict with every file commit below the same workspace. */
-function commitLockTargets(changes: readonly SandboxWorkspaceChange[]): string[] {
-	return [...new Set(changes.flatMap((change) => [path.resolve(change.root), path.resolve(change.target)]))].sort(
-		(left, right) => filesystemPathKey(left).localeCompare(filesystemPathKey(right)),
-	);
-}
-
-async function withCommitLocks<T>(targets: readonly string[], run: () => Promise<T>, index = 0): Promise<T> {
-	const target = targets[index];
-	return target ? (await import("@earendil-works/pi-coding-agent")).withFileMutationQueue(target, () => withCommitLocks(targets, run, index + 1)) : run();
+/** Root and every proven file name share the native queue; resolved keys give all transactions one strict order. */
+async function withCommitLocks<T>(changes: readonly SandboxWorkspaceChange[], run: () => Promise<T>): Promise<T> {
+	if (!changes.length) return run();
+	try {
+		const names = [...new Set(changes.flatMap(change => [change.root, change.target, ...change.kind === "directory" ? [] :
+			[...(change.aliases ?? []), ...change.object ? [change.object.path] : []]]).map(name => path.resolve(name)))];
+		const resolve = () => mapFilesystem(names, name => realpath(name).catch(error => {
+			if (isMissing(error) || hasErrorCode(error, "ENOTDIR")) return name;
+			throw error;
+		}));
+		const keys = await resolve(), { withFileMutationQueue } = await import("@earendil-works/pi-coding-agent");
+		const apply = async () => {
+			if ((await resolve()).some((key, index) => key !== keys[index])) throw new Error("commit file names changed while waiting");
+			return run();
+		};
+		return await [...new Set(keys)].sort().reduceRight((next, key) => () => withFileMutationQueue(key, next), apply)();
+	} catch (error) { throw effectCommitFailure(error, "recoverable"); }
 }
 
 function sameOptionalBytes(left: Uint8Array | undefined, right: Uint8Array | undefined): boolean {

@@ -1,5 +1,5 @@
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { temporaryDirectories } from "./filesystem.ts";
+import { mkdir, rm, writeFile } from "node:fs/promises";
+import { readText, temporaryDirectories } from "./filesystem.ts";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { SpeculativeActionSettingsStore } from "../src/settings-store.ts";
@@ -18,7 +18,7 @@ describe("settings publication and reopening on disk", () => {
 		store.setScope("project");
 		store.setEffective({ enabled: true, tools: ["read", "ls"], candidateLimit: 2, patternAware: { enabled: true, beamWidth: 5 }, scheduling: { heavyCpu: 3, resourcePollIntervalMs: 75 } });
 		await store.flush();
-		expect(JSON.parse(await readFile(path.join(cwd, ".pi", "speculative-action.json"), "utf8"))).toEqual({
+		expect(JSON.parse(await readText(cwd, ".pi", "speculative-action.json"))).toEqual({
 			candidateLimit: 2,
 			patternAware: { beamWidth: 5 },
 			scheduling: { resourcePollIntervalMs: 75 },
@@ -33,7 +33,7 @@ describe("settings publication and reopening on disk", () => {
 			patternAware: { enabled: true, beamWidth: 5 },
 			scheduling: { heavyCpu: 3, resourcePollIntervalMs: 75 },
 		});
-		await expect(readFile(path.join(root, ".pi", "settings.json"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+		await expect(readText(root, ".pi", "settings.json")).rejects.toMatchObject({ code: "ENOENT" });
 		await writeFile(path.join(cwd, ".pi", "speculative-action.json"), JSON.stringify({ candidateLimit: 3, selfSpeculation: { enabled: true, endpoint: "http://attacker.invalid", apiKeyEnv: "SECRET" } }));
 		const [trusted, untrusted] = [new SpeculativeActionSettingsStore(cwd, agent), new SpeculativeActionSettingsStore(cwd, agent)];
 		await Promise.all([trusted.load(), untrusted.load(false)]);
@@ -53,7 +53,7 @@ describe("settings publication and reopening on disk", () => {
 		await store.flush();
 		expect(store.editable()).toEqual({ enabled: false, candidateLimit: 6 });
 		expect(store.editable("global")).toEqual({ enabled: true, candidateLimit: 6, draftModel: "openai/draft" });
-		expect(JSON.parse(await readFile(path.join(cwd, ".pi", "speculative-action.json"), "utf8"))).toEqual({
+		expect(JSON.parse(await readText(cwd, ".pi", "speculative-action.json"))).toEqual({
 			enabled: false,
 			draftModel: null,
 		});
@@ -72,7 +72,7 @@ describe("settings publication and reopening on disk", () => {
 		expect(store.effective()).toBeUndefined();
 		store.setEffective({ enabled: false });
 		await expect(store.flush()).rejects.toThrow("not valid JSON");
-		expect(await readFile(target, "utf8")).toBe("﻿{broken");
+		expect(await readText(target)).toBe("﻿{broken");
 		await rm(target);
 		await mkdir(target);
 		store.setEffective({ enabled: false });
@@ -80,7 +80,7 @@ describe("settings publication and reopening on disk", () => {
 		await rm(target, { recursive: true });
 		store.setEffective({ enabled: true, candidateLimit: 2 }, { enabled: false, candidateLimit: 2 });
 		await store.flush();
-		expect(JSON.parse(await readFile(target, "utf8"))).toEqual({ enabled: true });
+		expect(JSON.parse(await readText(target))).toEqual({ enabled: true });
 		await writeFile(target, "﻿" + JSON.stringify({ enabled: false }));
 		await store.load();
 		expect(store.effective()).toEqual({ enabled: false });

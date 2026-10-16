@@ -15,7 +15,7 @@ import { SynchronousProcessObserver } from "../src/linux-process-sync.ts";
 import { summarizeSpeculativeTrace } from "../src/trace-summary.ts";
 import { commitBenchmarkFixture, compileBenchmarkHelper, holdOwnedProcessPublication, inspectProcessOwner } from "./linux-process-fixture.ts";
 import type { SpeculativeActionEvent } from "../src/runtime.ts";
-import { temporaryDirectories } from "./filesystem.ts";
+import { readText, temporaryDirectories } from "./filesystem.ts";
 import { Agent, type AgentTool } from "@earendil-works/pi-agent-core";
 import { deferred, onExit } from "./async.ts";
 
@@ -155,10 +155,10 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 		const results = session.messages.filter(message => message.role === "toolResult"), reused = !stale;
 		if (mode === "native-sync-lost") {
 			expect(results.at(-1)).toMatchObject({ isError: true }); expect(JSON.stringify(results.at(-1))).toContain("native handoff failed");
-			expect(await readFile(path.join(cwd, "marker"), "utf8")).toBe("once"); expect(calls).toEqual(["seed", "check"]); return;
+			expect(await readText(cwd, "marker")).toBe("once"); expect(calls).toEqual(["seed", "check"]); return;
 		}
 		expect(results.at(-1)?.content, JSON.stringify(session.messages)).toEqual([{ type: "text", text: "hook:own:format_rows:remaining:" + execFileSync("./slow", ["notes.txt"], { cwd, encoding: "utf8" }) }]);
-		expect(results.every(result => !result.isError)).toBe(true); expect(await readFile(path.join(cwd, "marker"), "utf8")).toBe("once");
+		expect(results.every(result => !result.isError)).toBe(true); expect(await readText(cwd, "marker")).toBe("once");
 		expect(calls).toEqual(["seed", "check"]); expect(prepared).toEqual([initial, remaining]);
 		if (inputs) expect(summarizeSpeculativeTrace(events).inputReuseHits).toBe(1);
 		const settled = events.filter(event => event.type === "actor_action").at(-1)!, timing = settled.computation!;
@@ -176,8 +176,8 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 	const registeredTools = session.agent.state.tools;
 	await session.prompt("Read notes.txt, write and edit result.txt, then read the final file.");
 	expect(session.agent.state.tools).toBe(registeredTools);
-	expect(await readFile(path.join(cwd, "notes.txt"), "utf8")).toBe("one\ntwo\n");
-	expect(await readFile(path.join(cwd, "result.txt"), "utf8")).toBe("final\n");
+	expect(await readText(cwd, "notes.txt")).toBe("one\ntwo\n");
+	expect(await readText(cwd, "result.txt")).toBe("final\n");
 	const results = session.messages.filter(message => message.role === "toolResult");
 	expect(results).toHaveLength(4);
 	expect(results.every(message => !message.isError)).toBe(true);

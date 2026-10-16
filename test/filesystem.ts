@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -21,3 +21,5 @@ export function temporaryDirectories(prefix: string, base?: string) {
 		},
 	};
 }
+
+export const readText = (...parts: string[]) => readFile(path.join(...parts), "utf8");

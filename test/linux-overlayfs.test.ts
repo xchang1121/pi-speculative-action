@@ -1,7 +1,8 @@
+import { readText } from "./filesystem.ts";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { disposable, onExit } from "./async.ts";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -53,7 +54,7 @@ describe("Linux OverlayFS workspace substrate", () => {
 		const mounted = await mountLinuxOverlayfs({ lowerRoot, privateRoot, options });
 		await using _mounted = onExit(async () => { await mounted.close(); await rm(root, { recursive: true, force: true }); });
 		await writeFile(path.join(mounted.root, "value.txt"), "copy-up\n", "utf8");
-		expect(await readFile(path.join(lowerRoot, "value.txt"), "utf8")).toBe("lower\n");
+		expect(await readText(lowerRoot, "value.txt")).toBe("lower\n");
 		expect(
 			(await promisify(execFile)("unshare", [
 				"--user",
@@ -72,7 +73,7 @@ describe("Linux OverlayFS workspace substrate", () => {
 			const demoted = await linuxOverlayfsCapability(options);
 			expect(demoted.available).toBe(false);
 			expect(demoted.detail).toMatch(/unmount/i);
-			expect(await readFile(path.join(lowerRoot, "value.txt"), "utf8")).toBe("lower\n");
+			expect(await readText(lowerRoot, "value.txt")).toBe("lower\n");
 		}
 	});
 });

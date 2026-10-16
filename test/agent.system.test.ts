@@ -1,4 +1,4 @@
-import { link, mkdir, readFile, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { access, link, mkdir, readFile, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import path from "node:path";
 import { fauxAssistantMessage, fauxToolCall, Type } from "@earendil-works/pi-ai";
@@ -10,7 +10,7 @@ import { ResourceVersionManager } from "../src/resource-version.ts";
 import { createClosedSearchProfile, resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { ActionSemanticsRegistry, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { PatternAwareStore, patternAwareSettings, patternAwareActionSemantics } from "../src/pattern-aware.ts";
-import { temporaryDirectories } from "./filesystem.ts";
+import { readText, temporaryDirectories } from "./filesystem.ts";
 import { expectHiddenCompute, systemHost } from "./agent-system-fixture.ts";
 import { disposable, onExit, deferred, gated, nextTurn } from "./async.ts";
 import { commitBenchmarkFixture, compileBenchmarkHelper, createLinuxProcessBenchmark, textOutput } from "./linux-process-fixture.ts";
@@ -70,7 +70,7 @@ test.for(["actor", "preview", "dynamic", "dynamic-preview", "hints", "hints-prev
 	const stale = mode.endsWith("stale") || mode.endsWith("-create") || mode.endsWith("-deleted"), cancelled = mode.endsWith("cancel"), overlap = mode === "mixed-cancel" || mode === "mixed-overlap", failed = mode.endsWith("failure");
 	const unavailable = early || mode.endsWith("budget") || mode.endsWith("outside") || mode.startsWith("rejected"), mutates = (index: number) => (direct || mode.startsWith("mixed")) && index === Number(mode !== "mixed-producer");
 	const entered = deferred(), joined = deferred(), release = deferred(), controller = new AbortController(), actors: Promise<unknown>[] = [];
-	const exposed = deferred(), parentRelease = deferred();
+	const parentGate = gated();
 	const producer = new AbortController(), parentError = new Error("producer failed after independent work");
 	const names = ["count_records", "summarize_records", "other_records"], read = PI_ACTION_SEMANTICS.definition("read")!;
 	const definitions = names.map((tool, index) => ({ ...read, ...(mutates(index) ? PI_ACTION_SEMANTICS.definition("write") :
@@ -110,7 +110,7 @@ test.for(["actor", "preview", "dynamic", "dynamic-preview", "hints", "hints-prev
 			};
 			const output = { isError: false, result: direct ? await consume(await count(read, actual)) : await view.prepare!(mode.includes("binding") && index || index === 2 ? definitions[index]! : shared,
 				mode === "calculation-key" && index ? "next" : "lines:v1", build, consume, mode.startsWith("calculation-hint") ? path.join(cwd, `hint-${index}`) : pure ? undefined : file, request.signal) };
-			if (actual && !index && live) { exposed.resolve(); await parentRelease.promise; }
+			if (actual && !index && live) await parentGate.wait();
 			fail("after"); return output;
 		};
 		const binding = bound ? bindResourceOperation(execute, cwd) : { filesystem: execute, filesystemRoot: cwd };
@@ -130,10 +130,10 @@ test.for(["actor", "preview", "dynamic", "dynamic-preview", "hints", "hints-prev
 	const f = systemHost(cwd, tools, { actionSemantics, resolveInvocation: tool => { if (tool === names[0]) bindings++; return invocations.get(tool); },
 		complete: async () => fauxAssistantMessage(fauxToolCall(names[unrelated ? 2 : 1]!, { path: "input.txt" }), { stopReason: "toolUse" }),
 		executionWorlds: [world] }, settings);
-	await using _cleanup = onExit(async () => { controller.abort(); release.resolve(); parentRelease.resolve(); await Promise.allSettled(actors); await f.dispose(); expect(disposed).toBe(direct ? 0 : builds - (bound ? 0 : f.fallbacks.length)); });
+	await using _cleanup = onExit(async () => { controller.abort(); release.resolve(); parentGate.release(); await Promise.allSettled(actors); await f.dispose(); expect(disposed).toBe(direct ? 0 : builds - (bound ? 0 : f.fallbacks.length)); });
 	const initial = metadata ? await f.oracle(names[0]!, { path: "input.txt" }, undefined, undefined, invocations.get(names[0]!)) : render(names[0]!, 2, false);
 	const late = scenario.startsWith("late-") ? tools.shift() : undefined; await f.start(); if (late) tools.unshift(late);
-	if (live) { const task = f.execute(names[0]!, { path: "input.txt" }, producer.signal); void task.catch(() => {}); actors.push(task); await exposed.promise; }
+	if (live) { const task = f.execute(names[0]!, { path: "input.txt" }, producer.signal); void task.catch(() => {}); actors.push(task); await parentGate.entered; }
 	else if (parentFailure && !parentFailure.endsWith("return")) await expect(f.execute(names[0]!, { path: "input.txt" }, producer.signal)).rejects.toBe(parentError);
 	else if (seeded) expect(await f.execute(names[0]!, { path: "input.txt" }, producer.signal)).toEqual(initial);
 	else { await f.preview(names[0]!, { path: "input.txt" }); await f.ready(); }
@@ -148,7 +148,7 @@ test.for(["actor", "preview", "dynamic", "dynamic-preview", "hints", "hints-prev
 	const expected = metadata ? await f.oracle(names[1]!, { path: "input.txt" }, undefined, undefined, invocations.get(names[1]!)) : render(names[1]!, stale || changes ? 3 : range ? 1 : 2, false);
 	const result = f.execute(names[1]!, { path: "input.txt" }, controller.signal); actors.push(result); void result.catch(() => {});
 	const finishParent = async () => {
-		parentRelease.resolve();
+		parentGate.release();
 		if (parentFailure && !parentFailure.endsWith("return")) await expect(actors[0]).rejects.toBe(parentError);
 		else expect(await actors[0]).toEqual(initial);
 	};
@@ -165,7 +165,7 @@ test.for(["actor", "preview", "dynamic", "dynamic-preview", "hints", "hints-prev
 		renders: 2 + Number(unrelated) + Number(overlap) - Number(failed || cancelled) - Number(early), effects: Number(direct || mode.startsWith("mixed")) + Number(changes) + Number(overlap && !cancelled) - Number(direct && cancelled) - Number(early && mutates(0)) });
 	expect(f.fallbacks).toEqual([...(seeded ? [names[0]!] : []), ...(live && !mode.endsWith("preview") || early || mutates(1) || mode === "revoke" || mode.startsWith("rejected") ? Array(1 + Number(overlap)).fill(names[1]!) : [])]);
 	if (direct && cancelled) await expect(readFile(path.join(cwd, `${names[1]}.txt`))).rejects.toMatchObject({ code: "ENOENT" });
-	else if ((direct || mode.startsWith("mixed")) && !(early && mutates(0))) expect(await readFile(path.join(cwd, `${names[Number(mode !== "mixed-producer")]}.txt`), "utf8")).toBe(metadata ? textOutput(expected).slice(names[1]!.length + 1) : String(stale || changes ? 3 : range ? 1 : 2));
+	else if ((direct || mode.startsWith("mixed")) && !(early && mutates(0))) expect(await readText(cwd, `${names[Number(mode !== "mixed-producer")]}.txt`)).toBe(metadata ? textOutput(expected).slice(names[1]!.length + 1) : String(stale || changes ? 3 : range ? 1 : 2));
 	if (transfer) { await revokeParent!(); expect(await f.execute(names[1]!, { path: "input.txt" })).toEqual(expected); }
 	if (live) {
 		if (!parentFailure || !overlap) expect(f.actors.some(event => event.settlement.tool === names[0])).toBe(false);
@@ -208,7 +208,7 @@ test.for(["stale", "all-stale", "binding", "failure", "cancel", "composed", "rev
 	if (mode === "alias") { for (const name of ["old", "new"]) await mkdir(path.join(cwd, name)); await symlink(path.join(cwd, "old"), alias, "junction"); }
 	const names = ["prepare_count", "prepare_summary", "consume_count"], { definitions, actionSemantics, tools, world } = readScenario(cwd, names,
 		names.map(tool => ({ ...PI_ACTION_SEMANTICS.definition("read")!, tool, epoch: tool, projectors: [], ...(input && !(["preview", "alias"].includes(mode) && tool === names[2]) ? { canonicalize: () => undefined } : {}) })));
-	const built = [deferred(), deferred()], releaseBuild = [deferred(), deferred()], exposed = [deferred(), deferred()], releaseParent = [deferred(), deferred()];
+	const buildGates = [gated(), gated()], parentGates = [gated(), gated()];
 	const controller = new AbortController(), failure = new Error("consumer stopped after its effect"), wrapper = {};
 	let builds = 0, disposals = 0, effects = 0, compositions = 0, compositionDisposals = 0, revoke: (() => void | Promise<void>) | undefined;
 	const invocations = names.map((tool, index) => ({ semantics: definitions[index], executor: tool, ...bindResourceOperation(async (view, request) => {
@@ -216,13 +216,13 @@ test.for(["stale", "all-stale", "binding", "failure", "cancel", "composed", "rev
 		const calculate = (inputs: typeof view, consume: (count: number) => Promise<number>) => inputs.prepare!(input || mode === "binding" && index === 1 ? definitions[index]! : binding, "line-count", async inputs => {
 			const count = input ? (await inputs.stat!(mode === "alias" ? alias : file)).size ?? 0 : (await inputs.readFile(file)).toString().trim().split("\n").length;
 			if (!input && !index) await inputs.readFile(extra);
-			builds++; if (index < 2) { built[index]!.resolve(); await releaseBuild[index]!.promise; }
+			builds++; if (index < 2) await buildGates[index]!.wait();
 			return { value: count, bytes: 8, dispose: () => { disposals++; } };
 		}, consume, file, request.signal);
 		const count = input && index === 1 ? (await view.readFile(file)).length : index === 2 && mode === "composed" ? await view.prepare!(wrapper, "render", async inputs => {
 			const value = await calculate(inputs, async count => count); compositions++; return { value, bytes: 8, dispose: () => { compositionDisposals++; } };
 		}, consume, file, request.signal) : await calculate(view, consume);
-		if (index < 2) { exposed[index]!.resolve(); await releaseParent[index]!.promise; }
+		if (index < 2) await parentGates[index]!.wait();
 		return { result: { content: [{ type: "text" as const, text: `${tool}:${count}` }], details: {} }, isError: false };
 	}, cwd) }));
 	const capture = invocations[0]!.captureInputs!;
@@ -232,21 +232,21 @@ test.for(["stale", "all-stale", "binding", "failure", "cancel", "composed", "rev
 		resources: { initial: { cpuCount: 3, idleCpuCount: 3 }, sample: () => new Promise(() => {}) },
 		executionWorlds: [world],
 	}, { maxConcurrentActions: 3, scheduling: { heavyCpu: 1 } });
-	await using _cleanup = onExit(async () => { for (const gate of [...releaseBuild, ...releaseParent]) gate.resolve(); await Promise.allSettled(parents); await f.dispose(); expect(disposals).toBe(builds); expect(compositionDisposals).toBe(compositions); });
+	await using _cleanup = onExit(async () => { for (const gate of [...buildGates, ...parentGates]) gate.release(); await Promise.allSettled(parents); await f.dispose(); expect(disposals).toBe(builds); expect(compositionDisposals).toBe(compositions); });
 	await f.start();
 	for (let index = 0; index < 2; index++) {
 		parents.push(f.execute(names[index]!, args));
-		if (!input || !index) await built[index]!.promise;
-		if (input) { releaseBuild[index]!.resolve(); await exposed[index]!.promise; if (!index && mode !== "fresh") await writeFile(file, "one\ntwo\nthree\n"); }
+		if (!input || !index) await buildGates[index]!.entered;
+		if (input) { buildGates[index]!.release(); await parentGates[index]!.entered; if (!index && mode !== "fresh") await writeFile(file, "one\ntwo\nthree\n"); }
 	}
 	if (mode === "alias") { await rename(alias, path.join(cwd, "retired")); await symlink(path.join(cwd, "new"), alias, "junction"); }
-	for (let index = 0; index < 2; index++) { releaseBuild[index]!.resolve(); await exposed[index]!.promise; }
+	for (let index = 0; index < 2; index++) { buildGates[index]!.release(); await parentGates[index]!.entered; }
 	expect(builds).toBe(input ? 1 : 2); await writeFile(extra, "after\n");
 	if (mode === "all-stale") await writeFile(file, "one\ntwo\nthree\n");
 	if (mode === "revoke") await revoke!();
 	if (input) {
 		// The older metadata owner finishes last, ahead of the valid payload in recency order.
-		for (const index of [1, 0]) { releaseParent[index]!.resolve(); await parents[index]; }
+		for (const index of [1, 0]) { parentGates[index]!.release(); await parents[index]; }
 		if (mode === "all-stale") await writeFile(file, "one\ntwo\nthree\nfour\n");
 	}
 	if (input && mode === "preview") await f.preview(names[2]!, args);
@@ -411,14 +411,14 @@ test.for([false, true])("reconstructs shared searches after cancellation and nam
 	await writeFile(path.join(cwd, "ignored.txt"), "two ignored\n");
 	const profile = await createClosedSearchProfile(cwd);
 	if (!profile.invocations.has("grep")) { await profile.pool.dispose(); return skip("qualified rg unavailable"); }
-	const entered = deferred(), joined = deferred(), release = deferred(), controllers = [new AbortController(), new AbortController()];
+	const gate = gated(), joined = deferred(), controllers = [new AbortController(), new AbortController()];
 	let holding = false, borrowers = 0, builds = 0, shared: AbortSignal | undefined;
 	const grep = profile.invocations.get("grep")!, actors: Promise<unknown>[] = [];
 	const invocation: typeof grep = { ...grep, filesystem: (view, request) => grep.filesystem!({ ...view,
 		prepare: (binding, key, build, consume, target, signal) => {
 			if (holding && target === path.join(cwd, "a.txt") && ++borrowers === 2) joined.resolve();
 			return view.prepare!(binding, key, async (inputs, signal) => {
-				if (holding && target === path.join(cwd, "a.txt")) { builds++; shared = signal; entered.resolve(); await release.promise; }
+				if (holding && target === path.join(cwd, "a.txt")) { builds++; shared = signal; await gate.wait(); }
 				return build(inputs, signal);
 			}, consume, target, signal);
 		},
@@ -427,14 +427,14 @@ test.for([false, true])("reconstructs shared searches after cancellation and nam
 	const f = systemHost(cwd, tools, {
 		resolveInvocation: (tool, input) => tool === "grep" ? invocation : profile.invocations.get(tool) ?? resolvePiToolInvocation(tool, input, { cwd, environment: {} }),
 	});
-	await using _cleanup = onExit(async () => { for (const controller of controllers) controller.abort(); release.resolve(); await Promise.allSettled(actors); await f.dispose(); await profile.pool.dispose(); });
+	await using _cleanup = onExit(async () => { for (const controller of controllers) controller.abort(); gate.release(); await Promise.allSettled(actors); await f.dispose(); await profile.pool.dispose(); });
 	await f.start(); await f.preview("grep", { pattern: "one", path: "." }); await f.ready();
 	await f.finish(); await f.start("queries");
 	holding = true;
-	actors.push(f.execute("grep", { pattern: "two", path: ".", limit: 1 }, controllers[0]!.signal).catch(error => error)); await entered.promise;
+	actors.push(f.execute("grep", { pattern: "two", path: ".", limit: 1 }, controllers[0]!.signal).catch(error => error)); await gate.entered;
 	actors.push(f.execute("grep", { pattern: "two", path: ".", limit: 2 }, controllers[1]!.signal).catch(error => error)); await joined.promise; await nextTurn();
 	controllers[0]!.abort(); if (cancelAll) controllers[1]!.abort();
-	expect(shared?.aborted).toBe(cancelAll); release.resolve();
+	expect(shared?.aborted).toBe(cancelAll); gate.release();
 	const results = await Promise.all(actors); holding = false;
 	if (!cancelAll) expect(results[1]).toEqual(await f.oracle("grep", { pattern: "two", path: ".", limit: 2 }));
 	expect(builds).toBe(1); expect(f.fallbacks).toEqual(cancelAll ? ["grep", "grep"] : ["grep"]); f.fallbacks.length = 0;
@@ -452,9 +452,10 @@ test.for([false, true])("reconstructs shared searches after cancellation and nam
 
 test.for(["in-place", "git", "single-in-place", "single-git"])("keeps effects private, retries restored preimages and transfers an aborted claim (%s)", async driver => {
 	const cwd = await directories.create(), sandbox = new WorkspaceSandboxService(), file = path.join(cwd, "notes.txt");
-	const alias = driver.startsWith("single-") ? "notes.txt" : "alias.txt", read = () => readFile(file, "utf8");
+	const alias = driver.startsWith("single-") ? "notes.txt" : "alias.txt", read = () => readText(file);
 	await writeFile(file, "one two\n"); if (alias !== "notes.txt") await link(file, path.join(cwd, alias));
-	const gate = gated(), secondResolved = deferred(), controller = new AbortController();
+	const gate = gated(), nativeGate = gated(), secondResolved = deferred(), controller = new AbortController();
+	const native = createEditTool(cwd, { operations: { access, readFile, writeFile: async (...args) => { await nativeGate.wait(); return writeFile(...args); } } });
 	let hold = false, waiting = false, first: Promise<unknown> | undefined, second: Promise<unknown> | undefined;
 	const f = systemHost(cwd, [createEditTool(cwd), createReadTool(cwd)], {
 		executionWorlds: [sandbox.createExecutionWorld(driver.endsWith("git") ? { driver: "git", inPlaceMutations: false } : {})],
@@ -467,8 +468,9 @@ test.for(["in-place", "git", "single-in-place", "single-git"])("keeps effects pr
 		await f.preview("edit", args); await f.ready();
 		expect(await read()).toBe("one two\n");
 		await f.finish(true); await f.start("changed-input");
-		await writeFile(file, "changed two\n");
-		await f.execute("edit", args);
+		first = native.execute("native", { path: alias, edits: [{ oldText: "one", newText: "changed" }] }); await nativeGate.entered;
+		second = f.execute("edit", args); await new Promise(resolve => setTimeout(resolve, 200));
+		nativeGate.release(); await first; await second;
 		expect(await read()).toBe("changed three\n");
 		expect(textOutput(await f.execute("read", { path: alias }))).toBe("changed three\n");
 		await writeFile(file, "one two\n"); hold = true;
@@ -480,7 +482,7 @@ test.for(["in-place", "git", "single-in-place", "single-git"])("keeps effects pr
 		await f.finish(); await f.start("discard");
 		await f.preview("edit", { path: "notes.txt", edits: [{ oldText: "three", newText: "discarded" }] });
 		await f.ready(2);
-	} finally { controller.abort(); gate.release(); await Promise.allSettled([first, second]); await f.dispose(); await sandbox.dispose(); }
+	} finally { controller.abort(); gate.release(); nativeGate.release(); await Promise.allSettled([first, second]); await f.dispose(); await sandbox.dispose(); }
 	expect(await read()).toBe("one three\n");
 });
 
@@ -592,7 +594,7 @@ test.for(["independent", "unchanged", "batch", "batch-known", "mismatch-text", "
 		await expect.poll(() => drafts).toBe(2); await nextTurn(); expect(executed).not.toContain(child.tool);
 		release.resolve(); await f.ready(count + 1);
 		if (mode === "missing-input") await expect(readFile(path.join(cwd, "root-0.txt"))).rejects.toMatchObject({ code: "ENOENT" });
-		else expect(await readFile(path.join(cwd, "root-0.txt"), "utf8")).toBe("one\ntwo\nthree\n");
+		else expect(await readText(cwd, "root-0.txt")).toBe("one\ntwo\nthree\n");
 	} else {
 		await f.ready(known ? 2 : 1); expect(f.completed().map(event => event.candidate.tool)).toEqual([...(known ? [names[0]] : []), child.tool]);
 		expect(executed.filter(tool => tool !== child.tool)).toHaveLength(count);
@@ -824,14 +826,14 @@ test.each(["ordered", "independent", "dependent"])("adopts only the proven effec
 	});
 	await using _cleanup = onExit(async () => { fork.release(); await f.dispose(); await sandbox.dispose(); });
 	await f.start(); await f.ready(order === "independent" ? 2 : 3); predict = false;
-	expect(await readFile(file, "utf8")).toBe("original\n");
+	expect(await readText(file)).toBe("original\n");
 	if (order === "independent") {
 		await fork.entered; await f.execute(steps[1]!.tool, steps[1]!.input); fork.release(); await f.ready(3);
 	}
 	await f.finish(true);
 	if (order === "dependent") {
 		await f.start("missing-parent"); await expect(f.execute(steps[1]!.tool, steps[1]!.input)).rejects.toThrow();
-		expect(await readFile(file, "utf8")).toBe("original\n"); await f.finish();
+		expect(await readText(file)).toBe("original\n"); await f.finish();
 	}
 	for (const [index, step] of steps.entries()) {
 		if (order === "independent" && index < 2) continue;
@@ -840,7 +842,7 @@ test.each(["ordered", "independent", "dependent"])("adopts only the proven effec
 	}
 	expect(f.fallbacks).toEqual(order === "dependent" ? ["edit"] : []);
 	for (const name of ["notes.txt", "alias.txt"])
-		expect(await readFile(path.join(cwd, name), "utf8")).toBe(order === "independent" ? "final\n" : "final\nbeta\n");
+		expect(await readText(cwd, name)).toBe(order === "independent" ? "final\n" : "final\nbeta\n");
 	if (order === "independent") await expect(readFile(path.join(cwd, "unused.txt"))).rejects.toMatchObject({ code: "ENOENT" });
 });
 
@@ -875,12 +877,12 @@ test.for(["unrelated", "changed", "descendant", "mutation", "mutation-stat", "mu
 	const status = await native.backend.check(true); if (status.state !== "ready") return skip(status.detail);
 	await f.start(); if (!predict) await f.preview("bash", { command: "cat a.txt" });
 	await f.ready(predict ? 2 : 1); predict = false;
-	expect(await readFile(path.join(cwd, "a.txt"), "utf8")).toBe("original\n");
+	expect(await readText(cwd, "a.txt")).toBe("original\n");
 	await expect(readFile(path.join(cwd, "marker"))).rejects.toMatchObject({ code: "ENOENT" });
 	if (!mutation) { await f.finish(true); await f.start("next-prompt"); }
 	await f.execute("write", mutation ? steps[0]!.input : { path: change === "changed" ? "a.txt" : "b.txt", content: "updated\n" });
 	if (mutation) { await f.finish(); await f.start("process"); if (stale) await writeFile(path.join(cwd, "a.txt"), "fresh\n"); }
-	expect(await readFile(path.join(cwd, "a.txt"), "utf8")).toBe(stale ? "fresh\n" : mutation ? "prepared\n" : change === "changed" ? "updated\n" : "original\n");
+	expect(await readText(cwd, "a.txt")).toBe(stale ? "fresh\n" : mutation ? "prepared\n" : change === "changed" ? "updated\n" : "original\n");
 	const expected = execFileSync("/bin/bash", ["-c", body], { cwd, env: native.environment, encoding: "utf8" });
 	expect(textOutput(await f.execute("bash", { command }))).toBe(expected);
 	if (change === "descendant") { await f.finish(); await f.start("next"); expect(textOutput(await f.execute("bash", { command: "cat c.txt" }))).toBe("second\n"); }
@@ -891,7 +893,7 @@ test.for(["unrelated", "changed", "descendant", "mutation", "mutation-stat", "mu
 	expect(f.events.filter(event => event.type === "candidate" && event.state.status === "running")).toHaveLength(change === "descendant" || mutation ? 2 : 1);
 	if (mutation) {
 		expect(requests).toBeGreaterThanOrEqual(2); expect(requests).toBeLessThanOrEqual(3); expect(actors.map(event => event.settlement.provider.kind)).toEqual(["speculative", fallback ? "actor" : "speculative"]);
-		expect(prepared[0] === expected).toBe(!metadata && !split); expect(native.backend.actorMetrics().hits).toBe(Number(split && !stale)); expect(await readFile(path.join(cwd, "marker"), "utf8")).toBe("once");
+		expect(prepared[0] === expected).toBe(!metadata && !split); expect(native.backend.actorMetrics().hits).toBe(Number(split && !stale)); expect(await readText(cwd, "marker")).toBe("once");
 	}
 });
 
