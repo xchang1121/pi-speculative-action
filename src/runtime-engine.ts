@@ -1527,14 +1527,6 @@ export function makeSpeculativeActionRuntime<
 				const adoption = actorAction.settleSelection(predictionIdentities, previewed ? "preview" : "speculative");
 				if (!adoption) return Object.freeze(prepared);
 				state.actorActions.delete(actorAction);
-				if (!previewed) for (const { node } of matchingPredictions) queueContinuation(
-					state.session,
-					node,
-					selected.candidate,
-					selected.output,
-					"actor_adopted",
-					{ key: actualKey, input: asConcreteInput(actualCall.input) ?? actualKey.input },
-				);
 				queueActorSettlement(state, input, actualCall, actorAction, selected.output, selected, undefined, matchingPredictions);
 				confirmPredictions(state.session, matchingPredictions, identity, adoption);
 				state.session.effects.enqueue(() => dispatchReady(state.session));
@@ -1652,11 +1644,6 @@ export function makeSpeculativeActionRuntime<
 	): void => {
 		const settlement = actorAction.settlement;
 		if (!settlement) return;
-		if (output !== undefined && adapter.observationKey) {
-			const observation = adapter.observationKey(output, actorAction.actionKey) ?? "";
-			for (const prediction of settlement.matchedPredictions) state.session.plan.observe(prediction, observation);
-			dispatchReady(state.session);
-		}
 		const consumed = [
 			{ computation: settlement.provider.toolExecution, reused: !!selection && (selection.match.kind !== "inputs" || !!selection.projectionReused) },
 			...(selection?.projection ? [{ computation: selection.projection, reused: selection.projectionReused }] : []),
@@ -1668,9 +1655,17 @@ export function makeSpeculativeActionRuntime<
 		}
 		const computation = state.session.timeline?.recordCall(consumed, actorAction.issuedAt, performance.now());
 		const key = actorAction.actionKey;
-		const settledCandidate = selection?.candidate;
-		const settledCandidateDescriptor = settledCandidate && (adapter.onActorActionSettled || adapter.onEvent)
-			? Object.freeze(candidateEventDescriptor(settledCandidate))
+		const candidate = selection?.candidate;
+		// Credit consumed work before new observations or continuations can retire its prediction.
+		if (candidate && key && settlement.provider.kind === "speculative") for (const { node } of matches)
+			queueContinuation(state.session, node, candidate, output, "actor_adopted", { key, input: asConcreteInput(actualCall.input) ?? key.input });
+		if (output !== undefined && adapter.observationKey) {
+			const observation = adapter.observationKey(output, key) ?? "";
+			for (const prediction of settlement.matchedPredictions) state.session.plan.observe(prediction, observation);
+			dispatchReady(state.session);
+		}
+		const descriptor = candidate && (adapter.onActorActionSettled || adapter.onEvent)
+			? Object.freeze(candidateEventDescriptor(candidate))
 			: undefined;
 		const event: SpeculativeActionEvent<SessionID> | undefined = adapter.onEvent ? {
 			type: "actor_action",
@@ -1678,15 +1673,15 @@ export function makeSpeculativeActionRuntime<
 			settlement,
 			...(computation ? { computation } : {}),
 			actualAction: diagnosticAction(actorAction.tool, actualCall.input, key),
-			...(settledCandidateDescriptor ? { candidate: settledCandidateDescriptor } : {}),
+			...(descriptor ? { candidate: descriptor } : {}),
 		} : undefined;
 		if (adapter.onActorActionSettled) state.session.effects.enqueue(() => adapter.onActorActionSettled?.({
 			sessionID: state.sessionID,
 			turnID: state.turnID,
 			...(key ? { action: key } : {}),
 			settlement,
-			...(settledCandidateDescriptor ? { candidate: settledCandidateDescriptor } : {}),
-			candidateFeedback: settledCandidate?.owner.draft.feedback,
+			...(descriptor ? { candidate: descriptor } : {}),
+			candidateFeedback: candidate?.owner.draft.feedback,
 			computation,
 		}));
 		if (event) state.session.effects.enqueue(() => { state.session.events.enqueue(event); });
@@ -1696,14 +1691,14 @@ export function makeSpeculativeActionRuntime<
 				const observation = cloneSharedData({ concrete: asConcreteInput(actualCall.input) ?? {}, ...(output !== undefined ? { output } : {}) });
 				state.session.effects.enqueue(async () => {
 					if (!source.enabled(state.settings)) return;
-					const execution = settledCandidate?.work.execution;
+					const execution = candidate?.work.execution;
 					const updates = await source.observe?.({
 						...turnContext(state),
 						consumeInput: input,
 						...(key ? { action: key } : {}),
 						tool: actorAction.tool,
 						...observation,
-						operations: operations ?? (settledCandidate && candidateBranch(settledCandidate)?.operations),
+						operations: operations ?? (candidate && candidateBranch(candidate)?.operations),
 						durationMs: settlement.provider.kind === "actor" ? settlement.provider.durationMs : execution && "executionMs" in execution ? execution.executionMs : 0,
 						order: settlement.actorAction.sequence,
 						signal: state.generation.signal,

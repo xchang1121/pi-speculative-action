@@ -11,6 +11,8 @@ import { testModel } from "./model.ts";
 
 type SystemEvent<Type extends SpeculativeActionEvent<string>["type"]> = Extract<SpeculativeActionEvent<string>, { type: Type }>;
 
+export const idleResources = (cpuCount: number) => ({ initial: { cpuCount, idleCpuCount: cpuCount }, sample: () => new Promise<never>(() => {}) });
+
 /** Exercise the same tool outlet as the extension; only the external model response is scripted. */
 export function systemHost(cwd: string, tools: AgentTool[], options: Partial<CreateSpeculativeActionHostOptions> = {},
 	settings: SpeculativeAgentSettingsInput = {}, sessionID = "system") {
@@ -23,7 +25,7 @@ export function systemHost(cwd: string, tools: AgentTool[], options: Partial<Cre
 	const host = createSpeculativeActionHost(sessionID, {
 		cwd, complete: async () => fauxAssistantMessage("done"),
 		preflight: () => true,
-		resources: { initial: { cpuCount: 2, idleCpuCount: 2 }, sample: () => new Promise(() => {}) },
+		resources: idleResources(2),
 		getSettings: () => ({ enabled: true, drafterEnabled: false, candidateLimit: 1, maxConcurrentActions: 2,
 			predictionTimeoutMs: 10_000, patternAware: { enabled: false }, prepareObservedOperations: false, ...settings }),
 		resolveInvocation: (tool, input) => resolvePiToolInvocation(tool, input, { cwd, environment: {} }),
@@ -40,6 +42,7 @@ export function systemHost(cwd: string, tools: AgentTool[], options: Partial<Cre
 	};
 	return {
 		host, events, fallbacks, materialized, completed, oracle: authoritative,
+		get drafter() { return host.drafterBudgetSnapshot(); },
 		get actors(): SystemEvent<"actor_action">[] { return ofType("actor_action"); },
 		get predictions(): SystemEvent<"prediction">[] { return ofType("prediction"); },
 		start: (id = "first") => host.startTurn({ turnID: turnID = id, tools, actorOptions: {}, actorModel: testModel("actor", { contextWindow: 262144 }),
