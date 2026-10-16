@@ -1,5 +1,6 @@
 import { access, link, mkdir, readFile, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
+import { setTimeout as delay } from "node:timers/promises";
 import path from "node:path";
 import { fauxAssistantMessage, fauxToolCall, Type, fauxText, fauxThinking, type Context } from "@earendil-works/pi-ai";
 import { createEditTool, createFindTool, createGrepTool, createLsTool, createReadTool, createWriteTool } from "@earendil-works/pi-coding-agent";
@@ -258,6 +259,7 @@ test.for(["stale", "all-stale", "binding", "failure", "cancel", "composed", "rev
 		parents.push(f.execute(names[index]!, args));
 		if (!input || !index) await buildGates[index]!.entered;
 		if (input) { buildGates[index]!.release(); await parentGates[index]!.entered; if (!index && mode !== "fresh") await writeFile(file, "one\ntwo\nthree\n"); }
+		else if (!index) { buildGates[index]!.release(); await parentGates[index]!.entered; await writeFile(extra, "intermediate\n"); }
 	}
 	if (mode === "alias") { await rename(alias, path.join(cwd, "retired")); await symlink(path.join(cwd, "new"), alias, "junction"); }
 	for (let index = 0; index < 2; index++) { buildGates[index]!.release(); await parentGates[index]!.entered; }
@@ -278,6 +280,87 @@ test.for(["stale", "all-stale", "binding", "failure", "cancel", "composed", "rev
 	expect(builds).toBe(!input && ["all-stale", "binding"].includes(mode) ? 3 : 2);
 	if (input) { await f.finish(); const timing = f.actors.filter(event => event.settlement.tool === names[2]).at(-1)!.computation!;
 		expectHiddenCompute(timing, !["all-stale", "alias", "failure", "cancel"].includes(mode)); }
+});
+
+test.for([...["actor", "prediction", "preview"].flatMap(source => ["pending", "completed", "pure", "stale", "binding", "budget", "composed", "failure", "build-failure"].map(mode => `${source}:${mode}`)),
+	...["actor", "preview"].flatMap(source => ["cancel-producer", "cancel-consumer", "cancel-all"].map(mode => `${source}:${mode}`)), "actor:cycle-2", "actor:cycle-3"])
+("joins preparations across active tool owners (%s)", async scenario => {
+	const [source, mode] = scenario.split(":") as [string, string], cycle = mode.startsWith("cycle"), count = cycle ? Number(mode.slice(-1)) : 2;
+	const cwd = await directories.create(), file = path.join(cwd, "input.txt"), binding = {}, wrapper = {}, args = { path: "input.txt" };
+	await writeFile(file, "one\ntwo\n");
+	const names = Array.from({ length: count }, (_, index) => `format_${index}`), { definitions, actionSemantics, tools, world } = readScenario(cwd, names,
+		names.map(tool => ({ ...readDefinition(tool), resourceScope: "captured_inputs" })));
+	const buildGate = gated(cycle ? count : 1), parentGate = gated(), emergency = deferred<number>(), controllers = names.map(() => new AbortController()), jobs: Promise<unknown>[] = [];
+	const failure = new Error("producer failed after independent computation"), builds = names.map(() => 0), effects = names.map(() => 0);
+	let produced = 0, disposed = 0, compositions = 0, compositionDisposals = 0, joined = false, shared: AbortSignal | undefined, preparation: { borrowers: number } | undefined;
+	const resource = (value: number) => { produced++; return { value, bytes: mode === "budget" ? 2 * 1024 * 1024 : 8, dispose: () => { disposed++; } }; };
+	const invocations = names.map((tool, index) => ({ semantics: definitions[index], executor: tool, ...bindResourceOperation(async (view, request) => {
+		const read = async (inputs: typeof view) => mode === "pure" ? 2 : (await inputs.readFile(file)).toString().trim().split("\n").length;
+		const consume = async (value: number) => { effects[index]!++; return value; };
+		const calculate = (inputs: typeof view, consume: (value: number) => Promise<number>) => inputs.prepare!(index && mode === "binding" ? definitions[index]! : binding, cycle ? String(index) : "count", async (inputs, signal) => {
+			let value = await read(inputs); builds[index]!++;
+			if (!index || cycle) {
+				if (!index) { shared = signal; let owner: object = inputs;
+					while (Reflect.get(owner, "owner")) owner = Reflect.get(owner, "owner");
+					preparation = Reflect.get(owner, "prepared")?.bindings.get(binding)?.get("count"); }
+				await TimelineInterval.outside(() => buildGate.wait());
+				if (mode === "build-failure") throw failure;
+				if (cycle) {
+					const pending = inputs.prepare!(binding, String((index + 1) % count), async inputs => resource(await read(inputs)), async value => value, file, request.signal);
+					// Failed liveness checks still release all owners using an independently read value.
+					value = await Promise.race([pending, emergency.promise.then(() => value)]);
+				}
+			}
+			return resource(value);
+		}, consume, mode === "pure" ? undefined : file, request.signal);
+		const value = index && mode === "composed" ? await view.prepare!(wrapper, "render", async inputs => {
+			const value = await calculate(inputs, async count => count); compositions++;
+			return { value, bytes: 8, dispose: () => { compositionDisposals++; } };
+		}, consume, file, request.signal) : await calculate(view, consume);
+		if (!index && !cycle) { await TimelineInterval.outside(() => parentGate.wait()); if (mode === "failure") throw failure; }
+		return { result: { content: [fauxText(`${tool}:${value}`)], details: {} }, isError: false };
+	}, cwd) }));
+	let requests = 0;
+	const f = systemHost(cwd, tools, { actionSemantics, resources: idleResources(8), resolveInvocation: tool => invocations[names.indexOf(tool)], executionWorlds: [world],
+		complete: async () => requests++ ? fauxAssistantMessage("done") : toolUse(names[0]!, args),
+	}, { drafterEnabled: source === "prediction", maxConcurrentActions: 4, scheduling: { heavyCpu: 1 } });
+	await using _cleanup = onExit(async () => { buildGate.release(); parentGate.release(); emergency.resolve(2); for (const controller of controllers) controller.abort();
+		await Promise.allSettled(jobs); await f.dispose(); expect(disposed).toBe(produced); expect(compositionDisposals).toBe(compositions); });
+	await f.start();
+	if (cycle) {
+		const actors = names.map((tool, index) => track(jobs, f.execute(tool, args, controllers[index]!.signal))), timeout = new AbortController();
+		await buildGate.entered; buildGate.release();
+		const completed = await Promise.race([Promise.all(actors), delay(2_000, undefined, { signal: timeout.signal }).catch(() => undefined)]); timeout.abort();
+		expect(completed, "crossed preparations must progress before emergency completion").toBeDefined();
+		expect(completed!.map(textOutput)).toEqual(names.map(tool => `${tool}:2`)); expect(effects).toEqual(names.map(() => 1)); expect(produced).toBe(count + 1);
+		return;
+	}
+	const producer = source === "prediction" ? undefined : track<unknown>(jobs, f[source === "actor" ? "execute" : "preview"](names[0]!, args, controllers[0]!.signal));
+	await buildGate.entered;
+	if (mode === "completed") { buildGate.release(); await parentGate.entered; }
+	const consumer = track(jobs, f.execute(names[1]!, args, controllers[1]!.signal));
+	if (mode !== "completed") {
+		await expect.poll(() => { joined ||= (preparation?.borrowers ?? 0) > 1; return joined || builds[1]! > 0; }).toBe(true); expect(joined).toBe(mode !== "binding");
+		if (mode === "stale") await writeFile(file, "one\ntwo\nthree\n");
+		if (mode === "cancel-producer" || mode === "cancel-all") controllers[0]!.abort(failure);
+		if (mode === "cancel-consumer" || mode === "cancel-all") controllers[1]!.abort(failure);
+		expect(shared?.aborted).toBe(mode === "cancel-all" && source === "actor"); buildGate.release(); parentGate.release();
+	}
+	if (controllers[1]!.signal.aborted) await expect(consumer).rejects.toBe(failure);
+	else expect(textOutput(await consumer)).toBe(`${names[1]}:${mode === "stale" ? 3 : 2}`);
+	parentGate.release();
+	if (source === "actor" && (controllers[0]!.signal.aborted || mode === "failure" || mode === "build-failure")) await expect(producer).rejects.toBe(failure); else await producer;
+	if (source !== "actor") await expect.poll(() => f.events.some(event => event.type === "candidate" && ["succeeded", "failed", "cancelled"].includes(event.state.status))).toBe(true);
+	if (mode === "composed") {
+		expect(textOutput(await f.execute(names[1]!, args))).toBe(`${names[1]}:2`); expect({ builds, compositions }).toEqual({ builds: [1, 0], compositions: 1 });
+		await writeFile(file, "one\ntwo\nthree\n");
+		expect(textOutput(await f.execute(names[1]!, args))).toBe(`${names[1]}:3`); expect({ builds, compositions }).toEqual({ builds: [1, 1], compositions: 2 });
+	} else {
+		expect(builds[1]).toBe(Number(["stale", "binding", "build-failure"].includes(mode)));
+		expect(effects).toEqual([Number(mode !== "build-failure" && (source === "actor" ? !controllers[0]!.signal.aborted : mode !== "stale")), Number(!controllers[1]!.signal.aborted)]);
+	}
+	await f.finish();
+	if (!controllers[1]!.signal.aborted && !["stale", "binding", "build-failure", "composed"].includes(mode)) expectHiddenCompute(f.actors.find(event => event.settlement.tool === names[1])!.computation!, true);
 });
 
 test.for(["reopened", "inflight", "completed", "binding", "reverse", "deep", "added", "changed", "removed", "shared", "shared-refresh", "shared-stale", "shared-unused", "shared-native", "shared-native-stale", "shared-exact", "shared-exact-stale",

@@ -75,6 +75,7 @@ type ResourceInputSource = {
 type ResourceInputLookup = (target?: string) => Iterable<ResourceInputSource>;
 type PreparedResource = {
 	readonly cancellation: SharedAbortScope;
+	readonly waiting: Set<PreparedResource>;
 	computation?: TimelineInterval;
 	value?: unknown; readonly dispose: () => void | Promise<void>;
 	readonly resource?: string;
@@ -82,6 +83,15 @@ type PreparedResource = {
 	readonly origin: ResourceReadView; destination: ResourceReadView; ready?: Promise<void>; readonly declined: Promise<void>; readonly composed?: Promise<void>;
 	borrowers: number; revoked?: boolean; retained?: boolean; shareable?: boolean; proofs?: ResourceVersionToken[];
 };
+
+function preparationWaitsFor(resource: PreparedResource, target: PreparedResource): boolean {
+	const pending = new Set([resource]);
+	for (const current of pending) {
+		if (current === target) return true;
+		for (const next of current.waiting) pending.add(next);
+	}
+	return false;
+}
 
 /** Token-owned input data, not a filesystem cache or authority to execute host functions. */
 export class ResourceReadView {
@@ -104,6 +114,7 @@ export class ResourceReadView {
 	private observed?: ResourceInputSource["observed"];
 	private validateInputs?: (proofs: readonly ResourceVersionToken[]) => Promise<void>;
 	private acceptProofs?: (proofs: readonly ResourceVersionToken[]) => readonly ResourceVersionToken[];
+	private preparing?: PreparedResource;
 	private prepared?: { readonly lifetime: RuntimeLifecycleLane; readonly bindings: Map<object, Map<string, PreparedResource>> };
 	private boundary?: { readonly root: string; readonly physicalRoot: string; readonly dependency?: string };
 	private readonly maxBytes: number;
@@ -287,12 +298,13 @@ export class ResourceReadView {
 		const prepared = owner.preparations();
 		return prepared.lifetime.admit(async () => {
 			this.assertComplete();
-			const inputEpoch = owner.inputEpoch;
 			const cached = prepared.bindings.get(binding)?.get(key);
 			const compatible = (cached: PreparedResource | undefined) => cached && !cached.revoked && cached.destination.retained &&
 				(cached.retained || !cached.cancellation.signal.aborted) &&
 				cached.boundary?.root === this.boundary?.root && cached.boundary?.physicalRoot === this.boundary?.physicalRoot;
 			const use = async (cached: PreparedResource, building = false, source?: ResourceInputSource) => {
+				if (this.preparing && preparationWaitsFor(cached, this.preparing)) return undefined;
+				this.preparing?.waiting.add(cached);
 				cached.borrowers++;
 				const withdraw = cached.cancellation.acquire(signal);
 				let accepted = building;
@@ -312,10 +324,10 @@ export class ResourceReadView {
 						await this.validateInputs?.([...(this.observed?.(dependencies, false) ?? []), ...proofs]);
 						signal?.throwIfAborted();
 						accepted = true; this.dependencies = dependencies;
-						if (source) this.observeSource(source)(sourceDependencies);
-						// The consumer takes proof ownership before its effects; rejected sources leave no dependencies.
+						// Retain the validated proof before effects; its source may already have retired.
 						const transferred = this.acceptProofs && proofs.length && (source || !cached.retained || cached.destination !== owner);
-						if (transferred) { for (const proof of this.acceptProofs!(proofs)) this.collectProofs?.set(proof.observations, proof); }
+						if (transferred) { for (const proof of this.acceptProofs!(proofs)) this.collectProofs?.set(proof.observations, proof); this.onForeignInputs?.(true); }
+						else if (source) this.observeSource(source)(sourceDependencies);
 						const evaluation = await TimelineInterval.measure(() => consume(cached.value as Parameters<typeof consume>[0]));
 						TimelineInterval.own(evaluation.computation);
 						return TimelineInterval.outside(() => {
@@ -329,6 +341,7 @@ export class ResourceReadView {
 					this.assertComplete(); signal?.throwIfAborted();
 					return undefined;
 				} finally {
+					this.preparing?.waiting.delete(cached);
 					withdraw();
 					if (!--cached.borrowers && !(cached.retained && !cached.revoked))
 						await TimelineInterval.outside(() => (cached.destination.prepared?.lifetime ?? prepared.lifetime).release(cached));
@@ -339,16 +352,17 @@ export class ResourceReadView {
 			for (const source of this.lookup?.() ?? []) {
 				const cached = source.view.prepared?.bindings.get(binding)?.get(key);
 				if (source.view.entries === this.entries || !source.view.retained || !source.view.sealed ||
-					!cached?.retained || !compatible(cached)) continue;
+					!cached || !compatible(cached)) continue;
 				const result = await use(cached, false, source);
 				if (result) return result.value;
 			}
+			const inputEpoch = owner.inputEpoch; // Rejected old sources precede this new computation.
 			let resource: Awaited<ReturnType<typeof build>> | undefined;
 			let bytes = 0, computationBytes = 32;
 			let decline!: () => void;
 			let composed: (() => void) | undefined;
 			const name = target && filesystemPathKey(target);
-			const pending: PreparedResource = { resource: name, origin: owner, destination: owner, borrowers: 0, boundary: this.boundary, cancellation: new SharedAbortScope(),
+			const pending: PreparedResource = { resource: name, origin: owner, destination: owner, borrowers: 0, boundary: this.boundary, cancellation: new SharedAbortScope(), waiting: new Set(),
 				declined: new Promise<void>(resolve => { decline = resolve; }),
 				composed: this.acceptProofs && new Promise<void>(resolve => { composed = resolve; }),
 				dispose: async () => { try { await resource?.dispose(); } finally {
@@ -360,6 +374,7 @@ export class ResourceReadView {
 			if (!entries) prepared.bindings.set(binding, entries = new Map());
 			if (!entries.has(key) || !entries.get(key)!.retained && entries.get(key)!.cancellation.signal.aborted) entries.set(key, pending);
 			pending.ready = this.evaluate(async view => {
+				view.preparing = pending;
 				const foreign = view.onForeignInputs; view.onForeignInputs = transferable => { if (transferable) composed?.(); else decline(); foreign?.(transferable); };
 				view.collectProofs = this.acceptProofs ? new Map() : undefined;
 				const evaluation = await TimelineInterval.measure(() => build(view, pending.cancellation.signal));
@@ -399,7 +414,7 @@ export class ResourceReadView {
 		return collectResourceComputation(async () => {
 			const view = this.readOnly(true);
 			view.dependencies = new Set();
-			Object.assign(view, { lookup, missing, acceptProofs, observed, validateInputs, onForeignInputs: this.onForeignInputs, collectProofs: this.collectProofs });
+			Object.assign(view, { lookup, missing, acceptProofs, observed, validateInputs, onForeignInputs: this.onForeignInputs, collectProofs: this.collectProofs, preparing: this.preparing });
 			try {
 				if (typeof root === "object") view.boundary = { root: root.root, physicalRoot: root.physicalRoot };
 				else if (root === undefined || this.boundary && filesystemPathKey(root) === filesystemPathKey(this.boundary.root)) {
