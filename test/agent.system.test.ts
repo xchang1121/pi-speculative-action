@@ -470,12 +470,16 @@ test.for(["reopened", "inflight", "completed", "binding", "reverse", "deep", "ad
 	}
 });
 
-test.for(["refresh", "replace", "remove", "replace-shared", "remove-shared"])("settles claimed consumption after a late source update (%s)", async scenario => {
-	const [mode, shared] = scenario.split("-");
-	const cwd = await directories.create(), gate = gated(), args = { path: "input.txt" };
-	for (const file of ["input.txt", "other.txt"]) await writeText(cwd, file, `${file}\n`);
+test.for(["refresh", "replace", "remove", "replace-shared", "remove-shared",
+	...["first", "last", "both", "none", "stale", "failure-before", "failure-after", "cancel-before", "cancel-after"].map(mode => `early-${mode}`)])("settles claimed consumption after a late source update (%s)", async scenario => {
+	const early = scenario.startsWith("early-"), usage = scenario.slice(6), mode = early ? "remove" : scenario.split("-")[0], shared = early || scenario.endsWith("-shared");
+	const consumed = !early || !["last", "none", "stale"].includes(usage) && !usage.endsWith("before"), lateConsumed = early && ["last", "both"].includes(usage);
+	const failed = early && /failure|cancel/.test(usage), controller = new AbortController(), failure = new Error("consumer failed");
+	const cwd = await directories.create(), gate = gated(), background = gated(), args = { path: "input.txt" };
+	for (const file of ["input.txt", "other.txt", "unused.txt", "unrelated.txt"]) await writeText(cwd, file, `${file}\n`);
 	const settled: Parameters<NonNullable<AgentPlanSource["onSettled"]>>[0][] = [], readers: Promise<unknown>[] = [];
-	let native = false, updated = false;
+	const received = () => settled.filter(item => item.feedback === "before");
+	let native = false, updated = false, backgroundFinished = false;
 	const proposal = (after = false) => ({ id: "claimed", source: "late-source", revision: Number(after), actions: after && mode === "remove" ? [] : [{
 		id: "read", type: "tool_call" as const, tool: "read", input: { path: after && mode === "replace" ? "other.txt" : args.path }, feedback: after ? "after" : "before",
 	}] });
@@ -489,30 +493,48 @@ test.for(["refresh", "replace", "remove", "replace-shared", "remove-shared"])("s
 			}, onSettled: feedback => { settled.push(feedback); },
 		};
 	}();
-	const { tools, actionSemantics, world, resolveInvocation } = readScenario(cwd, ["read", "summarize_rows"]);
+	const { tools, actionSemantics, world, resolveInvocation } = readScenario(cwd, ["read", "summarize_rows", ...early ? ["background_status"] : []]);
 	const f = systemHost(cwd, tools, { actionSemantics, executionWorlds: [world], actorForkPlanSource: fork, preflight: () => !native,
 		resolveInvocation: (tool, input) => {
 			const invocation = resolveInvocation(tool, input);
 			return { ...invocation, ...bindResourceOperation(async (view, request) => {
-				const result = await invocation.filesystem!(view, request);
-				if (native && request.callID !== "oracle" && (request.args as typeof args).path !== "other.txt") await gate.wait();
-				return result;
+				const foreground = native && request.callID !== "oracle" && tool !== "background_status" && (request.args as typeof args).path !== "other.txt";
+				const before = foreground && early && usage.endsWith("before");
+				if (before) await TimelineInterval.outside(() => gate.wait());
+				const result = before ? undefined : await invocation.filesystem!(view, request);
+				if (foreground && !before) await TimelineInterval.outside(() => gate.wait());
+				if (tool === "background_status" && request.callID !== "oracle") { await TimelineInterval.outside(() => background.wait()); backgroundFinished = true; }
+				if (foreground && failed) { if (usage.startsWith("cancel")) controller.abort(failure); throw failure; }
+				return result!;
 			}, cwd) };
 		},
 	});
-	await using _cleanup = onExit(async () => { gate.release(); await Promise.allSettled(readers); await f.dispose(); });
+	await using _cleanup = onExit(async () => { gate.release(); background.release(); await Promise.allSettled(readers); await f.dispose(); });
 	await f.start(); await f.ready(); native = true;
-	const tool = shared ? "summarize_rows" : "read";
-	const result = track(readers, f.execute(tool, args));
+	const producer = f.completed()[0]!.candidate.id, backgroundArgs = { path: lateConsumed ? args.path : "unrelated.txt" };
+	if (early && usage === "stale") await writeText(cwd, args.path, "fresh\n");
+	const slow = early ? track(readers, f.execute("background_status", backgroundArgs)) : undefined; if (early) await background.entered;
+	const tool = shared ? "summarize_rows" : "read", input = early && ["last", "none"].includes(usage) ? { path: "unused.txt" } : args;
+	const result = track(readers, f.execute(tool, input, controller.signal));
 	await gate.entered; await nextTurn(); expect(settled).toEqual([]);
 	expect(textOutput(await f.execute("read", { path: "other.txt" }))).toBe("other.txt\n");
-	await expect.poll(() => updated).toBe(true); await nextTurn(); expect(settled.filter(item => item.feedback === "before")).toEqual([]);
-	gate.release(); expect(await result).toEqual(await f.oracle(tool, args));
-	await f.finish(true); expect(settled.filter(item => item.feedback === "before")).toMatchObject([{
-		served: true, settlement: !shared ? { observation: "observed", match: { matched: true, adoption: { status: "rejected" } } }
+	await expect.poll(() => updated).toBe(true); await nextTurn(); expect(received()).toEqual([]);
+	gate.release(); if (failed) await expect(result).rejects.toBe(failure); else expect(await result).toEqual(await f.oracle(tool, input));
+	if (early) {
+		await nextTurn(); expect(backgroundFinished).toBe(false);
+		if (consumed) await expect.poll(() => received().length).toBe(1);
+		else expect(received()).toEqual([]);
+		expect(backgroundFinished).toBe(false); background.release(); expect(await slow).toEqual(await f.oracle("background_status", backgroundArgs));
+	}
+	await f.finish(true); expect(received()).toMatchObject([{
+		served: consumed || lateConsumed, settlement: !shared ? { observation: "observed", match: { matched: true, adoption: { status: "rejected" } } }
 			: { observation: "unobserved", cause: { code: "superseded" } },
 	}]);
-	expectHiddenCompute(f.actors.at(-1)!.computation!, true);
+	if (!early) expectHiddenCompute(f.actors.at(-1)!.computation!, true);
+	else for (const [name, used] of [[tool, consumed], ["background_status", lateConsumed]] as const) {
+		const event = f.actors.find(event => event.settlement.tool === name)!; expectHiddenCompute(event.computation!, used);
+		expect(TimelineInterval.serialize(event.settlement.provider.toolExecution)!.nodes.some(node => node.producer?.id?.endsWith(":" + producer))).toBe(used);
+	}
 });
 
 test.for([false, true])("reconstructs shared searches after cancellation and namespace changes (cancel all: %s)", async (cancelAll, { skip }) => {
