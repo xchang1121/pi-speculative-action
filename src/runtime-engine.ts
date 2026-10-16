@@ -1761,12 +1761,17 @@ export function makeSpeculativeActionRuntime<
 		if (event) session.effects.enqueue(() => { session.events.enqueue(event); });
 		if (source?.onSettled) {
 			const pending = !context.served && context.producers.size ? [...session.turns.values()].flatMap(turn => [...turn.actorActions].map(action => action.consumption)) : [];
-			const deliver = (receipts: readonly ReadonlySet<string>[]) => { session.effects.enqueue(() => source.onSettled!({
-				proposalID: context.identity.proposalID, actionID: context.identity.actionID, feedback: context.draft.feedback, settlement,
-				served: context.served === true || [...context.producers].some(producer => receipts.some(receipt => receipt.has(producer))),
-			})); };
-			// Wait outside the effects queue, only for consumers already present at retirement.
-			if (pending.length) void Promise.all(pending).then(deliver); else deliver([]);
+			const deliver = (served: boolean) => session.effects.enqueue(() => source.onSettled!({
+				proposalID: context.identity.proposalID, actionID: context.identity.actionID, feedback: context.draft.feedback, settlement, served,
+			}));
+			// Outside the effects queue, settle once on actual consumption or after every current consumer misses.
+			if (pending.length) void new Promise<boolean>(resolve => {
+				let remaining = pending.length;
+				for (const receipt of pending) void receipt.then(reused => {
+					const served = [...context.producers].some(producer => reused.has(producer));
+					if (served || !--remaining) resolve(served);
+				});
+			}).then(deliver); else deliver(context.served === true);
 		}
 		const matched = settlement.observation === "observed" && settlement.match.matched;
 		releaseActionContext(session, node.identity.id, matched);
