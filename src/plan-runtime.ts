@@ -458,6 +458,7 @@ export class PlanRuntime {
 			visited.add(current.node);
 			if (!current.node.validDependencies) return "blocked";
 			for (const dependency of current.node.action.dependsOn ?? []) {
+				if (dependency.condition === "resource") continue;
 				const parent = this.parent(current.plan.id, dependency);
 				const state = parent ? dependencyReadiness(parent, dependency, matching && current.node === node) : "blocked";
 				if (state === "blocked") return state;
@@ -596,7 +597,7 @@ function validateActions(actions: readonly PlanAction[]):
 				),
 			);
 			if (source.dependsOn.some((dependency) => !validToken(dependency.actionID) ||
-				!["execution_settled", "execution_succeeded", "actor_adopted", "prediction"].includes(dependency.condition!) ||
+				!["execution_settled", "execution_succeeded", "actor_adopted", "prediction", "resource"].includes(dependency.condition!) ||
 				dependency.condition === "prediction" && !validToken(dependency.observation!) ||
 				("proposalID" in dependency && (!validToken(dependency.proposalID!) || !validToken(dependency.identity!))))) {
 				return { ok: false, reason: "invalid_dependency" };

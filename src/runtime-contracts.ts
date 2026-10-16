@@ -118,6 +118,12 @@ interface BoundCandidateCall {
 	readonly signal: AbortSignal;
 }
 
+/** An independently cancellable continuation that reads only these parent observations. */
+export interface PlanContinuation {
+	readonly actionIDs: readonly string[];
+	readonly feedback: unknown;
+}
+
 export interface SpeculativePlanSource<
 	SessionID,
 	Output,
@@ -150,6 +156,8 @@ export interface SpeculativePlanSource<
 		readonly candidate: SpeculativeCandidate;
 		readonly adoptedAction?: AdoptedAction;
 		readonly revision: number;
+		/** Reserve at completion when independent branches can finish out of order. */
+		readonly reserveRevision?: () => number;
 		readonly output: Output | undefined;
 		readonly trigger: "prepared" | "execution_succeeded" | "actor_adopted";
 		readonly signal: AbortSignal;
@@ -174,7 +182,7 @@ export interface SpeculativePlanSource<
 		readonly feedback: unknown;
 		readonly output: Output | undefined;
 		readonly trigger: "prepared" | "execution_succeeded" | "actor_adopted";
-	}) => boolean);
+	}) => boolean | readonly PlanContinuation[]);
 	/** Request scoped OS launch observations; this grants neither execution nor result-reuse authority. */
 	readonly observesOperations?: boolean;
 	readonly observe?: (input: RuntimeTurnContext<StartInput, StateData> & {

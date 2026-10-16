@@ -269,7 +269,7 @@ test.for(["independent", "unchanged", "batch", "batch-known", "mismatch-text", "
 		candidateLimit: mode === "unchanged" ? 3 : 1, predictionTimeoutMs: 30_000, drafterTaskMaxRequests: mode === "budget" ? 2 : repairBudget ? 3 : 32 };
 	const f = systemHost(cwd, tools, { actionSemantics: semantics,
 		resources: { initial: { cpuCount: 3, idleCpuCount: 3 }, sample: () => new Promise(() => {}) },
-		onEvent: event => { if ((known || actualBatch) && event.type === "candidate" && event.state.status === "succeeded" && event.candidate.tool === names[0]) firstResult.resolve(); },
+		onEvent: event => { if (known && event.type === "candidate" && event.state.status === "succeeded" && event.candidate.tool === names[0]) firstResult.resolve(); },
 		resolveInvocation: async (tool, args) => { if (known && (args as { path: string }).path === "root-1.txt") await firstResult.promise; return { ...resolvePiToolInvocation(tool === "write" ? tool : "read", args, { cwd, environment: {} })!,
 			...(bound && tool === names[0] && (normalized || mode === "normalizer-failure") ? { observation: { ...EXACT_TOOL_OBSERVATION, version, content: normalized ? schema : undefined, canonicalize } } : {}),
 			semantics: tool === "write" ? PI_ACTION_SEMANTICS.definition(tool) : definitions[names.indexOf(tool)] }; },
@@ -282,13 +282,18 @@ test.for(["independent", "unchanged", "batch", "batch-known", "mismatch-text", "
 		complete: async (_model, context, options) => {
 			requests++; expect(options?.apiKey).toBe("shared-credential");
 			if (mode === "unchanged" && rootContext && !context.messages.length) return fauxAssistantMessage("No alternative.");
+			if (context.tools?.[0]?.name === "speculative_continuations") return fauxAssistantMessage(fauxToolCall("speculative_continuations", {
+				scopes: [[...roots.map((_, index) => `root-${index}`), ...(["unknown-batch", "filtered-batch"].includes(mode) ? ["unknown"] : [])]],
+			}));
 			if (context.tools?.[0]?.name === "speculative_observations") {
 				observationSignal = options!.signal;
 				const payload = JSON.parse(String(context.messages.at(-1)!.content).split("\n").slice(1).join("\n"));
 				expect(payload.draft).toMatchObject([{ type: "thinking", thinking: "Inspect the input." }, ...roots.map((root, index) =>
 					({ type: "toolCall", id: `root-${index}`, name: root.tool, arguments: root.args }))]);
-				expect(payload.observations).toEqual(known ? [expect.objectContaining({ role: "toolResult", toolCallId: "root-0", content: expected[0]!.content })] : []);
-				const predictedRoots = known ? roots.slice(1) : roots;
+				const partial = actualBatch && payload.observations.length > 0;
+				expect(payload.observations).toEqual(known || partial ? [expect.objectContaining({ role: "toolResult", toolCallId: `root-${Number(partial)}`, content: expected[Number(partial)]!.content })] : []);
+				const predictedRoots = known ? roots.slice(1) : partial ? roots.slice(0, 1) : roots;
+				if (partial) firstResult.resolve();
 				expect(payload.candidates.map((item: { tool: unknown }) => item.tool)).toEqual(JSON.parse(JSON.stringify(predictedRoots.map(root => tools.find(tool => tool.name === root.tool)))));
 				for (const item of payload.candidates) {
 					expect(item.observation.version).toBe(normalized || mode === "normalizer-failure" ? version : "model-visible/1");
@@ -351,11 +356,12 @@ test.for(["independent", "unchanged", "batch", "batch-known", "mismatch-text", "
 	if (wrong && !repairBudget || recoverable) expect(privateContexts.at(-1)!.messages.slice(1)).toEqual(expected.map((result, index) => expect.objectContaining({
 		role: "toolResult", toolCallId: `root-${index}`, content: normalized ? canonicalize(result.content) : result.content, isError: false })));
 	const { budget, observations } = f.host.drafterBudgetSnapshot();
-	expect(budget.reportedTokens).toBe(rootOnly || ["abort-observation", "request-failure", "actual-before-failure"].includes(mode) ? 0 : 18);
+	expect(budget.reportedTokens).toBe(rootOnly || ["abort-observation", "request-failure", "actual-before-failure"].includes(mode) ? 0 : actualBatch ? 36 : 18);
 	const forecasted = rootOnly || actualFirst || ["malformed-observation", "malformed-type", "abort-observation", "normalizer-failure", "request-failure", "malformed-extra"].includes(mode) ? 0 : count - Number(known);
 	expect(observations).toEqual({ forecasted, compared: forecasted, matched: wrong ? 0 : forecasted });
 	expect(budget.requests).toBe(requests); expect(budget.reservedTokens).toBe(0);
-	expect(requests).toBe((rootOnly ? 1 : stopped && !recoverable ? 2 : wrong && !repairBudget ? 4 : 3) + (mode === "unchanged" ? 2 : 0));
+	expect(requests).toBe((rootOnly ? 1 : stopped && !recoverable ? 2 : wrong && !repairBudget ? 4 : 3) + (mode === "unchanged" ? 2 : 0)
+		+ Number(count > 1 || ["unknown-batch", "filtered-batch"].includes(mode)) + Number(actualBatch));
 	if (mode === "budget" || repairBudget) expect(budget.skippedRequests).toBe(1);
 	if (mode === "abort-observation") expect(budget.unreportedTokens).toBeGreaterThan(0);
 	if (mode === "normalizer-failure") expect(await f.execute(roots[0]!.tool, roots[0]!.args)).toMatchObject(expected[0]!);
@@ -378,6 +384,156 @@ test.for(["independent", "unchanged", "batch", "batch-known", "mismatch-text", "
 		event.settlement.observation === "observed" && event.settlement.match.matched)).toBe(true);
 	if (inflight) expect(executed.filter(tool => tool === child.tool)).toHaveLength(1);
 	expect(requests).toBe(budget.requests + Number(contractChanged)); expect(f.host.drafterBudgetSnapshot().budget.requests).toBe(requests);
+});
+
+test.for(["completed", "inflight", "forecast", "binding", "parent-binding", "reverse", "both", "unchanged", "malformed-scope", "duplicate-scope", "extra-scope", "budget", "stale", "deep"])("repairs only branches that read changed observations (%s)", async mode => {
+	const cwd = await directories.create(), gates = [deferred(), deferred()], delayed = deferred();
+	const scopes = mode.endsWith("-scope") ? [["a", "b"]] : [["a"], ["b"], ["a", "b"]];
+	const unchanged = mode === "unchanged", both = mode === "both", deep = mode === "deep";
+	const names = ["inspect_rows", "render_rows"], reader = createReadTool(cwd), read = PI_ACTION_SEMANTICS.definition("read")!;
+	const definitions = names.map(tool => ({ ...read, tool, epoch: tool, projectors: [] })), semantics = new ActionSemanticsRegistry(definitions);
+	const tools = names.map(name => ({ ...reader, name })) as Parameters<typeof systemHost>[1], world = createResourceSnapshotExecutionWorld(semantics, { maxBytes: () => 1024 * 1024 });
+	const roots = ["a", "b"].map(id => ({ id, path: `${id}.txt`, text: `${id}-real\n` }));
+	for (const root of roots) await writeFile(path.join(cwd, root.path), root.text);
+	for (const branch of ["a", "b", "ab"]) for (const version of ["old", "new"]) for (const suffix of ["", ".next"])
+		await writeFile(path.join(cwd, `${branch}-${version}${suffix}.txt`), `${branch}-${version}${suffix}\n`);
+	const calls: { path: string; signal: AbortSignal }[] = [], forecasts: AbortSignal[] = [], executed: string[] = [];
+	const settings = { drafterEnabled: true, candidateLimit: 1, maxConcurrentActions: 3, predictionTimeoutMs: 30_000, drafterMaxDepth: deep ? 2 : 1, drafterTaskMaxRequests: mode === "budget" ? 8 : 32 };
+	const f = systemHost(cwd, tools, { actionSemantics: semantics,
+		resources: { initial: { cpuCount: 3, idleCpuCount: 3 }, sample: () => new Promise(() => {}) },
+		resolveInvocation: async (tool, args) => {
+			const file = String((args as { path: string }).path);
+			if (mode === "binding" && file.includes("old") || mode === "parent-binding" && file === "b.txt") await delayed.promise;
+			return { ...resolvePiToolInvocation("read", args, { cwd, environment: {} })!, semantics: definitions[names.indexOf(tool)] };
+		},
+		executionWorlds: [{ ...world, speculation: { ...world.speculation!, execute: async context => {
+			const file = String((context.args as { path: string }).path); executed.push(file);
+			const result = await world.speculation!.execute(context), index = roots.findIndex(root => root.path === file);
+			if (index >= 0) await gates[index]!.promise;
+			return result;
+		} } }],
+		complete: async (_model, context, options) => {
+			const tool = context.tools?.[0]?.name;
+			if (tool === "speculative_continuations") {
+				expect(JSON.stringify(context.messages)).not.toMatch(/a-real|b-real|a-wrong|b-wrong/);
+				return fauxAssistantMessage(fauxToolCall(tool, mode === "extra-scope" ? { scopes: [["a"]], extra: "invalid" }
+					: { scopes: mode === "malformed-scope" ? [["unknown"]] : mode === "duplicate-scope" ? [["a"], ["a"]] : scopes }));
+			}
+			if (tool === "speculative_observations") {
+				const payload = JSON.parse(String(context.messages.at(-1)!.content).split("\n").slice(1).join("\n"));
+				const ids: string[] = payload.candidates.map((item: { call: { id: string } }) => item.call.id);
+				if (ids.length === 1 && ids[0] === "b" && !payload.observations.length) expect(JSON.stringify(context.messages)).not.toContain("a-real");
+				if (mode === "forecast" && ids.includes("a")) { forecasts.push(options!.signal!); await delayed.promise; }
+				return fauxAssistantMessage(fauxToolCall(tool, { results: payload.candidates.map(({ call }: { call: { id: string; arguments: { path: string } } }) => ({
+					callID: call.id, isError: false, content: [{ type: "text", text: call.id === "a" ? unchanged ? "a-real\n" : "a-wrong\n"
+						: call.id === "b" ? both ? "b-wrong\n" : "b-real\n" : `${call.arguments.path.replace(/\.txt$/, "")}\n` }],
+				})) }));
+			}
+			if (!context.messages.length) return fauxAssistantMessage(roots.map(root => fauxToolCall(names[0]!, { path: root.path }, { id: root.id })));
+			const results = context.messages.filter(message => message.role === "toolResult"), last = results.at(-1)!;
+			let file: string;
+			if (last.toolCallId.startsWith("child-")) file = `${last.toolCallId.slice(6)}.next.txt`;
+			else {
+				const visible = results.filter(result => textOutput(result) !== "Observation withheld from this continuation branch.");
+				const ids = visible.map(result => result.toolCallId), wrong = visible.some(result => textOutput(result).includes("wrong"));
+				expect(scopes).toContainEqual(ids);
+				file = `${ids.join("")}-${wrong ? "old" : "new"}.txt`;
+				if (ids.length === 1) expect(textOutput(results.find(result => result.toolCallId !== ids[0])!)).toBe("Observation withheld from this continuation branch.");
+			}
+			calls.push({ path: file, signal: options!.signal! });
+			if ((mode === "inflight" && file.includes("old") || mode === "reverse" && file === "a-old.txt") && !file.includes(".next")) await delayed.promise;
+			return fauxAssistantMessage(fauxToolCall(names[1]!, { path: file }, { id: `child-${file.replace(/\.txt$/, "")}` }));
+		},
+	}, settings);
+	await using _cleanup = onExit(async () => { for (const gate of gates) gate.resolve(); delayed.resolve(); await f.dispose(); });
+	const completed = (file: string) => f.events.find(event => event.type === "candidate" && event.state.status === "succeeded" && JSON.parse(event.candidate.predictedAction).input.path === file);
+	const ready = async (files: string[]) => { for (const file of files) await expect.poll(() => Boolean(completed(file))).toBe(true); };
+	await f.start();
+	if (mode === "forecast") { await expect.poll(() => forecasts.length).toBe(2); await ready(["b-new.txt"]); }
+	else if (mode === "parent-binding") await expect.poll(() => calls.some(call => call.path === "a-old.txt")).toBe(true);
+	else if (mode === "inflight" || mode === "binding") { await expect.poll(() => calls.length).toBe(3); await ready(["b-new.txt"]); }
+	else if (mode === "reverse") { await ready(["b-new.txt", "ab-old.txt"]); delayed.resolve(); await ready(["a-old.txt"]); }
+	else await ready(scopes.map(ids => `${ids.join("")}-${unchanged || ids.join("") === "b" && !both ? "new" : "old"}.txt`));
+	if (deep) await ready(["a-old.next.txt", "b-new.next.txt", "ab-old.next.txt"]);
+	const bCandidate = completed("b-new.txt");
+	gates[0]!.resolve(); if (both) gates[1]!.resolve();
+	if (mode === "parent-binding") { await expect.poll(() => calls.some(call => call.path === "a-new.txt")).toBe(true); expect(executed).not.toContain("b.txt"); delayed.resolve(); }
+	const expected = scopes.map(ids => `${ids.join("")}-new.txt`);
+	if (mode === "budget") await expect.poll(() => f.host.drafterBudgetSnapshot().budget.skippedRequests).toBe(2);
+	else await ready(expected);
+	if (deep) await ready(["a-new.next.txt", "ab-new.next.txt"]);
+	if (!both) expect(completed("b.txt")).toBeUndefined();
+	if (bCandidate) { expect(completed("b-new.txt")).toBe(bCandidate); expect(calls.filter(call => call.path === "b-new.txt")).toHaveLength(1);
+		expect(calls.find(call => call.path === "b-new.txt")!.signal.aborted).toBe(false); }
+	if (mode === "inflight") expect(calls.filter(call => call.path.includes("old")).every(call => call.signal.aborted)).toBe(true);
+	if (mode === "forecast") expect(forecasts.every(signal => signal.aborted)).toBe(true);
+	if (mode === "forecast" || mode === "inflight") { expect(f.host.drafterBudgetSnapshot().budget.reservedTokens).toBeGreaterThan(0); delayed.resolve(); }
+	if (mode === "binding") delayed.resolve();
+	await expect.poll(() => f.host.drafterBudgetSnapshot().budget.reservedTokens).toBe(0);
+	if (unchanged) expect(calls).toHaveLength(3);
+	gates[1]!.resolve(); await ready(["a.txt", "b.txt"]);
+	for (const root of roots) expect(textOutput(await f.execute(names[0]!, { path: root.path }))).toBe(root.text);
+	settings.drafterEnabled = false; await f.finish(); await f.start("children");
+	if (mode === "stale") await writeFile(path.join(cwd, "a-new.txt"), "fresh\n");
+	for (const file of expected) {
+		expect(textOutput(await f.execute(names[1]!, { path: file }))).toBe(mode === "stale" && file === "a-new.txt" ? "fresh\n" : `${file.replace(/\.txt$/, "")}\n`);
+		const consumed = () => f.events.find(event => event.type === "actor_action" && JSON.parse(event.actualAction).input.path === file);
+		await expect.poll(consumed).toBeDefined(); const event = consumed()!;
+		if (event.type !== "actor_action") throw new Error("Missing actual consumption");
+		if (mode === "budget" && file !== "b-new.txt" || mode === "stale" && file === "a-new.txt") expect(event.computation!.hiddenComputeMs).toBe(0);
+		else expect(event.computation!.hiddenComputeMs).toBeGreaterThan(0);
+	}
+	if (deep) {
+		await f.finish(); await f.start("grandchildren");
+		for (const file of ["a-new.next.txt", "b-new.next.txt", "ab-new.next.txt"]) {
+			expect(textOutput(await f.execute(names[1]!, { path: file }))).toBe(`${file.replace(/\.txt$/, "")}\n`);
+			await expect.poll(() => f.events.find(event => event.type === "actor_action" && JSON.parse(event.actualAction).input.path === file)).toMatchObject({ computation: { hiddenComputeMs: expect.any(Number) } });
+			expect(f.events.filter(event => event.type === "actor_action").at(-1)!.computation!.hiddenComputeMs).toBeGreaterThan(0);
+		}
+		expect(calls.filter(call => call.path.startsWith("b-new"))).toHaveLength(2);
+	}
+	await f.finish();
+	for (const file of [...(scopes.length > 1 ? ["b-new.txt"] : []), ...(deep ? ["b-new.next.txt"] : [])]) expect(f.events.filter(event =>
+		event.type === "prediction" && JSON.parse(event.predictedAction!).input.path === file)).toMatchObject([{ settlement: { observation: "observed", match: { matched: true } } }]);
+	expect(f.events.some(event => event.type === "source_request" && event.request.settlement.status === "timeout")).toBe(false);
+	if (["inflight", "forecast", "binding"].includes(mode)) expect(executed.some(file => file.includes("old"))).toBe(false);
+	if (bCandidate) expect(executed.filter(file => file === "b-new.txt")).toHaveLength(1);
+});
+
+test.for(["dependent", "independent"])("preserves sibling resource effects outside observation scopes (%s)", async mode => {
+	const cwd = await directories.create(), sandbox = new WorkspaceSandboxService(), release = deferred();
+	await writeFile(path.join(cwd, "selector.txt"), "select\n"); await writeFile(path.join(cwd, "written.txt"), "before\n");
+	await writeFile(path.join(cwd, "independent.txt"), "independent\n");
+	const child = { path: mode === "dependent" ? "written.txt" : "independent.txt" }, tools = [createReadTool(cwd), createWriteTool(cwd)];
+	const worlds = [createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { maxBytes: () => 1024 * 1024 }), sandbox.createExecutionWorld({ driver: "git" })];
+	let drafted = 0; const executed: string[] = [], settings = { drafterEnabled: true, candidateLimit: 1, drafterMaxDepth: 1, maxConcurrentActions: 3 };
+	const f = systemHost(cwd, tools as Parameters<typeof systemHost>[1], {
+		resources: { initial: { cpuCount: 3, idleCpuCount: 3 }, sample: () => new Promise(() => {}) },
+		executionWorlds: worlds.map(world => ({ ...world, speculation: { ...world.speculation!, execute: async context => {
+			executed.push(String((context.args as { path: string }).path)); const branch = await world.speculation!.execute(context);
+			if (context.toolName === "write") await release.promise;
+			return branch;
+		} } })),
+		complete: async (_model, context) => {
+			const tool = context.tools?.[0]?.name;
+			if (tool === "speculative_continuations") return fauxAssistantMessage(fauxToolCall(tool, { scopes: [["selector"]] }));
+			if (tool === "speculative_observations") return fauxAssistantMessage(fauxToolCall(tool, { results: [{ callID: "selector", isError: false, content: [{ type: "text", text: "select\n" }] }] }));
+			if (!context.messages.length) return fauxAssistantMessage([fauxToolCall("read", { path: "selector.txt" }, { id: "selector" }),
+				fauxToolCall("write", { path: "written.txt", content: "after\n" }, { id: "writer" })]);
+			drafted++; return fauxAssistantMessage(fauxToolCall("read", child));
+		},
+	}, settings);
+	await using _cleanup = onExit(async () => { release.resolve(); await f.dispose(); await sandbox.dispose(); });
+	await f.start(); await expect.poll(() => drafted).toBe(1); await nextTurn();
+	if (mode === "dependent") expect(executed.filter(file => file === child.path)).toHaveLength(1); // Only the still-pending writer.
+	else await f.ready(2);
+	release.resolve(); await f.ready(3);
+	expect(textOutput(await f.execute("read", { path: "selector.txt" }))).toBe("select\n");
+	await f.execute("write", { path: "written.txt", content: "after\n" });
+	settings.drafterEnabled = false; await f.finish(); await f.start("child");
+	expect(textOutput(await f.execute("read", child))).toBe(mode === "dependent" ? "after\n" : "independent\n");
+	await f.finish(); expect(drafted).toBe(1);
+	expect(f.events.filter(event => event.type === "actor_action").at(-1)!.computation!.hiddenComputeMs).toBeGreaterThan(0);
 });
 
 test.each(["ordered", "independent", "dependent"])("adopts only the proven effects of a predicted workflow across prompts (%s)", async order => {

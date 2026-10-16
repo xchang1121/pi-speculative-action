@@ -1,7 +1,7 @@
 import type { ExecutionOperationBinding } from "./execution-world.ts";
 import type { HardwareResources } from "./system-resources.ts";
 
-export type PlanActionDependencyCondition = "execution_settled" | "execution_succeeded" | "actor_adopted" | "prediction";
+export type PlanActionDependencyCondition = "execution_settled" | "execution_succeeded" | "actor_adopted" | "prediction" | "resource";
 
 /** A scheduler-visible edge. The producer may add actions in later deltas. */
 export interface PlanActionDependency {
@@ -9,6 +9,7 @@ export interface PlanActionDependency {
 	/** Cross-plan edges must pin the parent's immutable identity as well as its proposal. */
 	readonly proposalID?: string;
 	readonly identity?: string;
+	/** Resource edges retain execution ancestry without making its observations prediction inputs. */
 	readonly condition?: PlanActionDependencyCondition;
 	/** Private forecast of the parent's model-visible result; never execution or reuse evidence. */
 	readonly observation?: string;

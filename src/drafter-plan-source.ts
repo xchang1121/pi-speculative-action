@@ -28,14 +28,17 @@ interface DrafterPlanFeedback extends DrafterBatch {
 	readonly message: AssistantMessage;
 	readonly depth: number;
 	readonly calls: ReadonlyMap<string, DrafterCall>;
-	continuation?: { readonly controller: AbortController; observations?: readonly string[] };
+	readonly continuations: readonly { readonly actionIDs: readonly string[]; readonly feedback: DrafterContinuation }[];
+}
+interface DrafterContinuation {
+	readonly forecasts: Map<string, DrafterObservation>;
+	request?: { readonly controller: AbortController; observations?: readonly string[] };
 }
 interface DrafterObservation { readonly message: ToolResultMessage; readonly key: string; }
 interface DrafterCall {
 	readonly call: AgentToolCall;
 	action?: ActionKey;
 	result?: DrafterObservation;
-	forecast?: string;
 }
 
 export function createDrafterPlanSource(input: {
@@ -94,9 +97,22 @@ export function createDrafterPlanSource(input: {
 		if (!message) return undefined;
 		const calls = message.content.filter((item): item is AgentToolCall => item.type === "toolCall");
 		if (!calls.length || new Set(calls.map(call => call.id)).size !== calls.length) return undefined;
+		let scopes = [calls.map(call => call.id)];
+		if (calls.length > 1 && depth < batch.budgetPolicy.drafterMaxDepth) {
+			// Decide visibility before any observations exist; post-hoc dependency labels could hide inputs already read.
+			const context = scopeContext(batch, message, calls);
+			try {
+				const args = privateToolArguments(await completeRequest(batch, context, signal, report, CONTINUATION_TOOL), context);
+				if (args) scopes = args.scopes as string[][];
+			} catch { /* An unavailable or invalid scope selection conservatively reads the full batch. */ }
+		}
+		if (signal.aborted) return undefined;
+		const unique = new Map(scopes.map(scope => { const ids = calls.flatMap((call, index) => scope.includes(call.id) ? [`${prefix}:${index}`] : []); return [JSON.stringify(ids), ids]; }));
 		const feedback: DrafterPlanFeedback = { ...batch, depth, message,
-			calls: new Map(calls.map((call, member) => [`${prefix}:${member}`, { call }])), continuation: undefined };
+			calls: new Map(calls.map((call, member) => [`${prefix}:${member}`, { call }])),
+			continuations: [...unique.values()].map(actionIDs => ({ actionIDs, feedback: { forecasts: new Map() } })) };
 		feedbacks.set(feedback, feedback);
+		for (const continuation of feedback.continuations) feedbacks.set(continuation.feedback, feedback);
 		return { actions: [...feedback.calls].map(([id, { call }]): PlanAction => ({ id, type: "tool_call", tool: call.name,
 			input: call.arguments, depth, feedback, dependsOn, ...probabilities(batch, call.name) })) };
 	};
@@ -129,19 +145,22 @@ export function createDrafterPlanSource(input: {
 			const previous = feedbacks.get(feedback as object), member = previous?.calls.get(actionID);
 			if (!previous || !member) return false;
 			const result = output && privateObservation(member.call, output, action);
-			if (result && member.forecast) {
-				observations.compared++; observations.matched += Number(member.forecast === result.key);
-				member.forecast = undefined;
-			}
 			if (result) member.result = result;
 			member.action ??= action;
-			const members = [...previous.calls.values()], continuation = previous.continuation;
-			if (!members.every(member => member.action)) return false;
-			if (!continuation) return true;
-			if (!output || !members.every(member => member.result && !member.forecast) ||
-				members.every((member, index) => member.result!.key === continuation.observations?.[index])) return false;
-			continuation.controller.abort();
-			return true;
+			return previous.continuations.filter(({ actionIDs, feedback: continuation }) => {
+				if (!actionIDs.includes(actionID)) return false;
+				const forecast = continuation.forecasts.get(actionID);
+				if (result && forecast) {
+					observations.compared++; observations.matched += Number(forecast.key === result.key);
+					continuation.forecasts.delete(actionID);
+				}
+				if (!actionIDs.every(id => previous.calls.get(id)!.action)) return false;
+				const request = continuation.request;
+				if (!request) return true;
+				if (!result || result.key === request.observations?.[actionIDs.indexOf(actionID)]) return false;
+				request.controller.abort();
+				return true;
+			});
 		},
 		proposalCount: (settings) => clampCandidateLimit(settings.candidateLimit ?? DEFAULTS.candidateLimit),
 		concurrentProposalPolicy: (settings) =>
@@ -187,39 +206,41 @@ export function createDrafterPlanSource(input: {
 				return draft && { id: `drafter:${startInput.turnID}:${proposalIndex}`, source: "drafter", revision: 0, ...draft };
 			} finally { if (!draft) release(); }
 		},
-		continue: async ({ proposalID, revision, feedback, signal, reportDraftTokens, settings }) => {
+		continue: async ({ proposalID, revision, reserveRevision, feedback, signal, reportDraftTokens, settings }) => {
 			const previous = feedbacks.get(feedback as object);
-			if (!previous || signal.aborted || previous.continuation && !previous.continuation.controller.signal.aborted) return undefined;
-			const continuation: NonNullable<DrafterPlanFeedback["continuation"]> = { controller: new AbortController() };
-			previous.continuation = continuation;
-			signal = AbortSignal.any([signal, continuation.controller.signal]);
+			const branch = previous?.continuations.find(branch => branch.feedback === feedback);
+			if (!previous || !branch || signal.aborted) return undefined;
+			const continuation = branch.feedback;
+			if (continuation.request && !continuation.request.controller.signal.aborted) return undefined;
+			const request: NonNullable<DrafterContinuation["request"]> = { controller: new AbortController() };
+			continuation.request = request;
+			signal = AbortSignal.any([signal, request.controller.signal]);
 			const policy = normalizeDrafterRequestSettings(settings.sourceConfig);
 			if (previous.depth >= policy.drafterMaxDepth) return undefined;
-			const missing = [...previous.calls.values()].filter(member => !member.result);
+			const current = (id: string) => previous.calls.get(id)!.result ?? continuation.forecasts.get(id);
+			const missing = branch.actionIDs.filter(id => !current(id)).map(id => [id, previous.calls.get(id)!] as const);
 			if (missing.length) {
-				const context = observationContext(previous, missing);
+				const context = observationContext(previous, missing.map(([, member]) => member), branch.actionIDs.flatMap(id => current(id) ? [current(id)!.message] : []));
 				const message = await completeRequest({ ...previous, budgetPolicy: policy }, context, signal, reportDraftTokens, OBSERVATION_TOOL);
 				if (signal.aborted) return undefined;
-				const pending = missing.filter(member => !member.result);
-				if (pending.length) {
-					const calls = message?.content.filter((item): item is AgentToolCall => item.type === "toolCall");
-					if (calls?.length !== 1 || calls[0]!.name !== OBSERVATION_TOOL) return undefined;
-					const values = validateToolArguments(context.tools![0]!, calls[0]!).results as (Pick<ToolResultMessage, "content" | "isError"> & { callID: string; exitCode?: number })[];
-					if (new Set(values.map(value => value.callID)).size !== missing.length || stableValueHash(values) !== stableValueHash(calls[0]!.arguments.results)) return undefined;
-					for (const member of pending) {
-						const { content, isError, exitCode } = values.find(value => value.callID === member.call.id)!;
-						member.result = privateObservation(member.call, { result: { content, details: {} }, isError, exitCode }, member.action);
-						member.forecast = member.result.key; observations.forecasted++;
-					}
+				const values = privateToolArguments(message, context)?.results as (Pick<ToolResultMessage, "content" | "isError"> & { callID: string; exitCode?: number })[] | undefined;
+				if (!values || new Set(values.map(value => value.callID)).size !== missing.length) return undefined;
+				for (const [id, member] of missing) {
+					const { content, isError, exitCode } = values.find(value => value.callID === member.call.id)!;
+					continuation.forecasts.set(id, privateObservation(member.call, { result: { content, details: {} }, isError, exitCode }, member.action));
+					observations.forecasted++;
 				}
 			}
 			if (signal.aborted) return undefined;
 			// Freeze the exact private observations used for this prediction, even if real results arrive during inference.
-			const context = continuationContext(previous.context, previous.message, [...previous.calls.values()].map(member => member.result!.message));
-			continuation.observations = [...previous.calls.values()].map(member => member.result!.key);
+			const context = continuationContext(previous.context, previous.message, [...previous.calls].map(([id, { call }]) =>
+				branch.actionIDs.includes(id) ? current(id)!.message : privateObservation(call, { result: { content: [{ type: "text",
+					text: "Observation withheld from this continuation branch." }], details: {} }, isError: false }).message));
+			request.observations = branch.actionIDs.map(id => current(id)!.key);
 			const draft = await completeDraft({ ...previous, context, budgetPolicy: policy }, signal, reportDraftTokens, `rollout:${revision}`, previous.depth + 1,
-				[...previous.calls].map(([actionID, member]) => ({ actionID, condition: "prediction", observation: member.result!.key })));
-			return draft && { proposalID, source: "drafter", revision, upsert: draft.actions };
+				[...previous.calls.keys()].map(actionID => { const index = branch.actionIDs.indexOf(actionID); return { actionID,
+					...index < 0 ? { condition: "resource" as const } : { condition: "prediction" as const, observation: request.observations![index]! } }; }));
+			return draft && { proposalID, source: "drafter", revision: reserveRevision?.() ?? revision, upsert: draft.actions };
 		},
 		// A peer's executed batch, such as a fork's early calls, rolls out as the Drafter's own does: its calls and results extend the Actor context.
 		continueFrom: async ({ startInput, settings, batch: peers, signal, reportDraftTokens }) => {
@@ -260,18 +281,26 @@ const FORCED_TOOL_CHOICE: Readonly<Record<string, unknown>> = { "anthropic-messa
 	"openai-responses": "required", "azure-openai-responses": "required", "openai-codex-responses": "required" };
 
 const OBSERVATION_TOOL = "speculative_observations";
+const CONTINUATION_TOOL = "speculative_continuations";
+function scopeContext(batch: DrafterBatch, message: AssistantMessage, calls: readonly AgentToolCall[]): Context {
+	return { ...batch.context, messages: [...batch.context.messages, { role: "user", timestamp: Date.now(),
+		content: `Before seeing this batch's results, choose the observation scopes needed to predict subsequent tool calls. Each scope starts an independent continuation that can read only those call results. Use separate scopes for independent work and a joint scope when results must be combined. Do not duplicate work across scopes.\n${JSON.stringify({ draft: message.content })}` }],
+		tools: [{ name: CONTINUATION_TOOL, description: "Select the minimal sets of tool observations needed by subsequent branches.", parameters: Type.Object({
+			scopes: Type.Array(Type.Array(Type.Union(calls.map(call => Type.Literal(call.id))), { minItems: 1, uniqueItems: true }), { minItems: 1, uniqueItems: true }),
+		}, { additionalProperties: false }) }] };
+}
 const OBSERVATION_CONTENT = Type.Array(Type.Union([
 	Type.Object({ type: Type.Literal("text"), text: Type.String() }),
 	Type.Object({ type: Type.Literal("image"), data: Type.String(), mimeType: Type.String() }),
 ]));
-function observationContext(batch: DrafterPlanFeedback, missing: readonly DrafterCall[]): Context {
+function observationContext(batch: DrafterPlanFeedback, missing: readonly DrafterCall[], observations: readonly ToolResultMessage[]): Context {
 	const candidates = missing.map(({ call, action }) => {
 		const { version, content = OBSERVATION_CONTENT } = toolObservationContract(action);
 		return { call, tool: batch.context.tools?.find(tool => tool.name === call.name), observation: { version, content } };
 	});
 	return { ...batch.context, messages: [...batch.context.messages, { role: "user", timestamp: Date.now(),
 		content: `Predict the pending observations under their bound schemas.\n${JSON.stringify({ draft: batch.message.content,
-			observations: [...batch.calls.values()].flatMap(member => member.result ? [member.result.message] : []), candidates })}` }],
+			observations, candidates })}` }],
 		tools: [{ name: OBSERVATION_TOOL, description: "Private predicted tool observations; never executable results.", parameters: Type.Object({
 			results: Type.Array(Type.Union(candidates.map(({ call, observation }) => Type.Object({ callID: Type.Literal(call.id),
 				isError: Type.Boolean(), exitCode: Type.Optional(Type.Integer()), content: observation.content,
@@ -282,6 +311,13 @@ function observationContext(batch: DrafterPlanFeedback, missing: readonly Drafte
 function privateObservation(call: AgentToolCall, output: ToolSettlement, action?: ActionKey): DrafterObservation {
 	const { key, content } = canonicalToolObservation(output, action);
 	return { key, message: { role: "toolResult", toolCallId: call.id, toolName: call.name, content: immutableSnapshot(content), isError: output.isError, timestamp: Date.now() } };
+}
+
+function privateToolArguments(message: AssistantMessage | undefined, context: Context): Record<string, unknown> | undefined {
+	const calls = message?.content.filter((item): item is AgentToolCall => item.type === "toolCall"), tool = context.tools![0]!;
+	if (calls?.length !== 1 || calls[0]!.name !== tool.name) return undefined;
+	const args = validateToolArguments(tool, calls[0]!);
+	return stableValueHash(args) === stableValueHash(calls[0]!.arguments) ? args : undefined;
 }
 
 function suppress(reason: string, detail?: string): never { throw new SourceRequestSuppressed(cause("source", reason, detail)); }
