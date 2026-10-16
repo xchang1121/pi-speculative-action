@@ -496,7 +496,7 @@ export function makeSpeculativeActionRuntime<
 
 	const acquireCandidate = (session: Session, candidate: Candidate, owner: string) => candidateStore.has(session.id, candidate) ? candidate.work.acquire(owner) : undefined;
 
-	const borrowCandidateInputs = (session: Session, source: Candidate | undefined, owner: string) => {
+	const borrowResourceInputs = (session: Session, source: Candidate | undefined, owner: string) => {
 		const leases = new Map<Candidate, NonNullable<ReturnType<typeof acquireCandidate>>>();
 		let closed = false;
 		return {
@@ -507,6 +507,10 @@ export function makeSpeculativeActionRuntime<
 						candidate.work.execution.status !== "succeeded" || !candidate.work.execution.output.inputSource) continue;
 					const lease = leases.get(candidate) ?? acquireCandidate(session, candidate, owner);
 					if (lease) { leases.set(candidate, lease); yield candidate.work.execution.output.inputSource; }
+				}
+				for (const state of session.turns.values()) if (actorTurnActive(state)) for (const action of state.actorActions) {
+					const source = action.inputSource;
+					if (source) yield source;
 				}
 			},
 			dispose: () => { closed = true; for (const lease of leases.values()) lease.release(); leases.clear(); },
@@ -1076,7 +1080,7 @@ export function makeSpeculativeActionRuntime<
 		if (!action) return; // Input-only owners are already sealed and cannot launch a tool.
 		let branch: WorldBranch<Output> | undefined;
 		const inputs = candidate.owner.draft.type === "tool_call" && candidate.route.reuse === "shared_result" && !forkWorld(candidate.forkParent)
-			? borrowCandidateInputs(session, candidate, `inputs:prediction:${candidate.id}`) : undefined;
+			? borrowResourceInputs(session, candidate, `inputs:prediction:${candidate.id}`) : undefined;
 		const draft = candidate.owner.draft;
 		try {
 			const parent = forkWorld(candidate.forkParent), owner = candidate.owner.startInput;
@@ -1300,11 +1304,11 @@ export function makeSpeculativeActionRuntime<
 			: scheduler.assessCompatibility(branch.compatibility, action.executionFingerprint);
 		if (sourceCompatibility && !sourceCompatibility.compatible)
 			return { ok: false, cause: cause("compatibility", sourceCompatibility.code, sourceCompatibility.detail) };
-		let mode: "cached" | "output" | "inputs" = "cached", inputs: ReturnType<typeof borrowCandidateInputs> | undefined;
+		let mode: "cached" | "output" | "inputs" = "cached", inputs: ReturnType<typeof borrowResourceInputs> | undefined;
 		try {
 			while (!signal.aborted) {
 				if ((match.kind !== "exact" || mode === "inputs") && branch.inputSource && (mode !== "cached" || !candidate.resultViews?.has(action.key)))
-					inputs ??= borrowCandidateInputs(state.session, candidate, `inputs:query:${callKey(state.turnID, call.id ?? action.hash)}`);
+					inputs ??= borrowResourceInputs(state.session, candidate, `inputs:query:${callKey(state.turnID, call.id ?? action.hash)}`);
 				const projection = await projectOutput(candidate, action, mode === "inputs" ? { kind: "inputs", distance: match.distance } : match,
 					projectionRules, { action, args: call.input, callID: call.id ?? action.hash, signal, inputs: inputs?.lookup }, mode);
 				if (!projection.ok) return projection;
@@ -1462,12 +1466,11 @@ export function makeSpeculativeActionRuntime<
 		state.actorActions.add(actorAction);
 		state.actorObservation ??= actualKey ? identity : null;
 		let operationLearning: boolean | undefined;
-		let captureInputSource: object | undefined;
 		const prepared: PreparedActorCall<Output> & { output?: Output } = {
 			get observeOperations() { return operationLearning === true; },
 			withInputs: async execute => {
-				const inputs = borrowCandidateInputs(state.session, undefined, `inputs:actor:${identity.id}`);
-				try { return await execute(function* (target) { yield* inputs.lookup(target); if (captureInputSource) yield captureInputSource; }); } finally { inputs.dispose(); }
+				const inputs = borrowResourceInputs(state.session, undefined, `inputs:actor:${identity.id}`);
+				try { return await execute(inputs.lookup); } finally { inputs.dispose(); }
 			},
 			settle: (toolExecution, output, operations) => state.session.lifecycle.track(
 				settleActorCall(state, input, actualCall, actorAction, output, toolExecution, operations && Object.freeze([...operations]))),
@@ -1563,9 +1566,8 @@ export function makeSpeculativeActionRuntime<
 						const capture = await adapter.captureAuthoritativeResult({ ...turnContext(state), consumeInput: input,
 							tool: actualCall.tool, concrete, action: actualKey, callID: actualCall.id ?? callKey(state.turnID, actualCall.tool), signal: captureSignal });
 						if (capture) {
-							if ((actualKey || capture.inputsOnly) && capture.route.reuse === "shared_result" && !captureSignal.aborted && actorTurnActive(state) &&
-								state.actorActions.has(actorAction) && actorAction.capture(capture)) captureInputSource = capture.inputSource;
-							else state.session.lifecycle.release(capture);
+							if (!((actualKey || capture.inputsOnly) && capture.route.reuse === "shared_result" && !captureSignal.aborted && actorTurnActive(state) &&
+								state.actorActions.has(actorAction) && actorAction.capture(capture))) state.session.lifecycle.release(capture);
 						}
 					}
 				} catch { /* Optional capture cannot prevent authoritative execution. */ }

@@ -282,7 +282,7 @@ export class ResourceReadView {
 			const compatible = (cached: PreparedResource | undefined) => cached && !cached.revoked && cached.destination.retained &&
 				(cached.retained || !cached.cancellation.signal.aborted) &&
 				cached.boundary?.root === this.boundary?.root && cached.boundary?.physicalRoot === this.boundary?.physicalRoot;
-			const use = async (cached: PreparedResource, building = false) => {
+			const use = async (cached: PreparedResource, building = false, source?: ResourceInputSource) => {
 				cached.borrowers++;
 				const withdraw = cached.cancellation.acquire(signal);
 				try {
@@ -295,11 +295,12 @@ export class ResourceReadView {
 					signal?.throwIfAborted();
 					if (cached.origin !== owner || !cached.dependencies) this.dependencies = undefined;
 					else if (this.dependencies) for (const dependency of cached.dependencies) this.dependencies.add(dependency);
-					const transferred = cached.proofs?.length && (!cached.retained || cached.destination !== owner);
-					if (transferred) { for (const proof of this.acceptProofs!(cached.proofs!)) this.collectProofs?.set(proof.observations, proof); }
+					const proofs = [...source ? this.observeSource(source)(cached.origin === source.view ? cached.dependencies : undefined) ?? [] : [], ...cached.proofs ?? []];
+					const transferred = this.acceptProofs && proofs.length && (source || !cached.retained || cached.destination !== owner);
+					if (transferred) { for (const proof of this.acceptProofs!(proofs)) this.collectProofs?.set(proof.observations, proof); }
 					return await cached.destination.prepared!.lifetime.admit(async () => {
 						this.assertComplete(); cached.destination.assertComplete();
-						await this.validatePrepared?.([...(this.observed?.(this.dependencies) ?? []), ...cached.proofs ?? []]);
+						await this.validatePrepared?.([...(this.observed?.(this.dependencies) ?? []), ...proofs]);
 						signal?.throwIfAborted();
 						const evaluation = await TimelineInterval.measure(() => consume(cached.value as Parameters<typeof consume>[0]));
 						TimelineInterval.own(evaluation.computation);
@@ -321,9 +322,9 @@ export class ResourceReadView {
 				if (source.view.entries === this.entries || !source.view.retained || !source.view.sealed ||
 					!source.view.prepared?.bindings.get(binding)?.get(key)?.retained ||
 					!compatible(source.view.prepared.bindings.get(binding)?.get(key))) continue;
-				const result = await source.view.evaluate(view => view.prepare(binding, key, build, consume, undefined, signal), this.observeSource(source), this.boundary,
-					undefined, undefined, this.acceptProofs, this.validatePrepared);
-				this.assertComplete(); return result;
+				// The consumer owns transferred proofs; retiring the producer cannot revoke a completed consumption.
+				const result = await use(source.view.prepared.bindings.get(binding)!.get(key)!, false, source);
+				if (result) return result.value;
 			}
 			let resource: Awaited<ReturnType<typeof build>> | undefined;
 			let bytes = 0, computationBytes = 32;
@@ -596,9 +597,10 @@ export class ResourceVersionManager {
 	retain(token: ResourceVersionToken, metadataBytes?: number): ResourceVersionToken {
 		if (!this.open || token.manager !== this || token.root !== this.root || !token.observations.size)
 			throw new Error("resource_version_owner_changed");
-		token.view?.assertComplete(true);
+		const inputs = token.view?.retained ? token.view : undefined;
+		inputs?.assertComplete(true);
 		const observations = new Map(token.observations);
-		const view = metadataBytes === undefined ? undefined : token.view?.retainMetadata(observations, metadataBytes);
+		const view = metadataBytes === undefined ? undefined : inputs?.retainMetadata(observations, metadataBytes);
 		this.references++;
 		return { ...token, observations, view, watching: false, preciseContent: Object.freeze([]), release: releaseOnce(() => this.releaseCapture(observations, view)) };
 	}

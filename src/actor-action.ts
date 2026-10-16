@@ -60,6 +60,10 @@ export class ActorAction<Candidate extends { readonly id: string } = { readonly 
 		return this.stateValue.status === "selected" ? this.stateValue.value : undefined;
 	}
 
+	get inputSource(): object | undefined {
+		return this.stateValue.status === "awaiting_fallback" ? this.resultCapture?.inputSource : undefined;
+	}
+
 	capture(capture: AuthoritativeResultCapture<Output>): boolean {
 		if (this.stateValue.status !== "awaiting_fallback" || this.resultCapture) return false;
 		this.resultCapture = capture;
