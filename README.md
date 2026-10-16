@@ -21,7 +21,7 @@ ThinkThread 使用 [Profile 安装脚本](./scripts/install-thinkthread-profile.
 
 ## 预测与执行
 
-[模型 Drafter](./src/drafter-plan-source.ts)、[PatternAware](./src/pattern-plan-source.ts) 和 [Actor 探测](./src/actor-fork-plan-source.ts) 生成统一 `PlanProposal`。[Runtime](./src/runtime-engine.ts) 按 Actor 决策进度、后端给出的资源依赖及实时资源安排准备和执行，各会话共用预算，Actor 优先。PatternAware 的模式、预设、按工具契约校准和原生工具名输出用于提出候选。`prepareObservedOperations` 独立控制[已观察操作的提前准备](./src/execution-preparation.ts)，默认开启；旧 `recent-command` 预设并入这一执行选项，不再受 PatternAware 开关控制。内部工作保留父工具调用和绑定权限，与预测共用物理资源账本。
+[模型 Drafter](./src/drafter-plan-source.ts)、[PatternAware](./src/pattern-plan-source.ts) 和 [Actor 探测](./src/actor-fork-plan-source.ts) 生成统一 `PlanProposal`。[Runtime](./src/runtime-engine.ts) 按 Actor 决策进度、后端给出的资源依赖及实时资源安排准备和执行，各会话共用预算，Actor 优先。PatternAware 的模式、预设、按工具契约校准和原生工具名输出用于提出候选；同批晚到结果更新根预测时，保留未变动作的已有后继及匹配机会，根动作改变或移除则撤销相关后继。`prepareObservedOperations` 独立控制[已观察操作的提前准备](./src/execution-preparation.ts)，默认开启；旧 `recent-command` 预设并入这一执行选项，不再受 PatternAware 开关控制。内部工作保留父工具调用和绑定权限，与预测共用物理资源账本。
 
 Drafter 参照 [TomasuLLM](https://arxiv.org/html/2609.38201v2) 将动作预测与观测预测分开：多调用批次先选择后继各自需要的观测范围，再让分支只读取范围内的真实或预测结果；联合分支登记全部输入依赖，范围无效时保守使用整批。单调用无需选择范围。分支独立续推和取消，任一真实结果到达即可替换对应预测并重推受影响后继，其余分支保留，相同观测不重复请求。范围选择、观测和动作预测共用任务预算；请求失败或迟到也可由真实结果接管。独立后继可先执行，资源依赖沿私有检查点推进；Actor 历史始终只接收真实结果。
 

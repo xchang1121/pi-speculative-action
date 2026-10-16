@@ -151,28 +151,76 @@ test.for(["actor", "preview", "dynamic", "dynamic-preview", "hints", "hints-prev
 	if (cancelled) expect(f.events.filter(event => event.type === "actor_action")[0]?.computation?.hiddenComputeMs).toBe(0);
 });
 
-test("learns from executed tool workflows, reopens the saved state and supplies the next read", async () => {
-	const cwd = await directories.create(), state = path.join(cwd, "patterns.json");
-	await writeFile(path.join(cwd, "first.txt"), "first\n"); await writeFile(path.join(cwd, "next.txt"), "next\n");
-	const settings = patternAwareSettings({ enabled: true, minOccurrences: 2, maxContextLength: 1, maxFutureGap: 0, beamWidth: 1, presets: [] });
-	const createStore = () => new PatternAwareStore(settings, state, patternAwareActionSemantics(PI_ACTION_SEMANTICS, cwd));
+test.for(["reopened", "inflight", "completed", "binding", "reverse", "deep", "added", "changed", "removed"])("retains learned continuations across authoritative batch updates (%s)", async mode => {
+	const changed = mode === "changed", removed = mode === "removed", replaces = changed || removed, added = mode === "added", deep = mode === "deep", reopen = mode === "reopened";
+	const cwd = await directories.create(), names = [reopen ? "read" : "inspect_index", reopen ? "read" : "open_record", "render_record", replaces ? "status_index" : "background_status", "summarize_record", "tail_record"];
+	const files = ["root.txt", "child.txt", "leaf.txt", "status.txt", "other.txt", "tail.txt"], reader = createReadTool(cwd);
+	for (const file of files) await writeFile(path.join(cwd, file), `${file}\n`);
+	const definitions = [...new Set(names)].map(tool => ({ ...PI_ACTION_SEMANTICS.definition("read")!, tool, epoch: `learned:${tool}`, projectors: [] }));
+	const actionSemantics = new ActionSemanticsRegistry(definitions), tools = definitions.map(({ tool: name }) => ({ ...reader, name })) as Parameters<typeof systemHost>[1];
+	const settings = patternAwareSettings({ enabled: true, minOccurrences: 2, maxContextLength: added ? 2 : 1, maxFutureGap: 0, beamWidth: added ? 2 : 1, maxPredictionDepth: 3, presets: [] });
+	const createStore = () => new PatternAwareStore(settings, path.join(cwd, "patterns.json"), patternAwareActionSemantics(actionSemantics, cwd));
 	const store = createStore(); await store.load();
-	for (let round = 0; round < 4; round++) {
-		await using f = disposable(systemHost(cwd, [createReadTool(cwd)], { patternStore: store }, { patternAware: settings }, `training-${round}`));
-		await f.start(); await f.execute("read", { path: "first.txt" }); await f.finish();
-		await f.start("next"); await f.execute("read", { path: "next.txt" }); await f.finish(true);
+	const world = createResourceSnapshotExecutionWorld(actionSemantics, { maxBytes: () => 1024 * 1024 });
+	const options = { actionSemantics, patternStore: store, executionWorlds: [world],
+		resolveInvocation: (tool: string, input: unknown) => ({ ...resolvePiToolInvocation("read", input, { cwd, environment: {} })!, semantics: definitions.find(definition => definition.tool === tool) }) };
+	const chains = [[[0], [1], ...reopen ? [] : [[2]], ...deep ? [[5]] : []], ...changed || added ? [[added ? [3, 0] : [3], [4], [5]]] : []];
+	for (const chain of chains) for (let round = 0; round < 4; round++) {
+		await using training = disposable(systemHost(cwd, tools, options, { patternAware: settings }, `chain-${chain[0]}-${round}`));
+		for (const batch of chain) { await training.start(`step-${batch}`); await Promise.all(batch.map(step => training.execute(names[step]!, { path: files[step] }))); await training.finish(batch === chain.at(-1)); }
 	}
-	await store.flush();
-	const reopened = createStore(); await reopened.load();
-	const f = systemHost(cwd, [createReadTool(cwd)], { patternStore: reopened }, { patternAware: settings }, "learned");
-	await using _cleanup = onExit(async () => { await f.dispose(); await reopened.flush(); });
-	await f.start(); await f.execute("read", { path: "first.txt" }); await f.finish();
-	await f.start("next");
-	await expect.poll(() => f.events.some(event => event.type === "candidate" && event.candidate.source === "pattern_aware" &&
-		event.state.status === "succeeded"), { timeout: 10_000 }).toBe(true);
+	await store.flush(); const reopened = createStore(); await reopened.load();
+	const slowStarted = deferred(), slowRelease = deferred(), leafStarted = deferred(), leafRelease = deferred();
+	const runtimeSettings = { patternAware: settings, maxConcurrentActions: 3, scheduling: { heavyCpu: 1 } };
+	let leafSignal: AbortSignal | undefined, slow: Promise<unknown> | undefined, bindings = 0;
+	const f = systemHost(cwd, tools, { ...options, patternStore: reopened,
+		resolveInvocation: async (tool, input) => {
+			if (mode === "binding" && tool === names[2]) { bindings++; leafStarted.resolve(); await leafRelease.promise; }
+			const invocation = options.resolveInvocation(tool, input);
+			return { ...invocation, ...(tool === names[3] ? bindResourceOperation(async (view, request) => {
+				const result = await invocation.filesystem!(view, request);
+				slowStarted.resolve(); await slowRelease.promise;
+				return result;
+			}, cwd) : {}) };
+		},
+		executionWorlds: [{ ...world, speculation: { ...world.speculation!, execute: async context => {
+			if (context.toolName === names[2]) { leafSignal = context.signal; leafStarted.resolve(); await leafRelease.promise; context.signal.throwIfAborted(); }
+			return world.speculation!.execute(context);
+		} } }],
+	}, runtimeSettings, "late-batch");
+	await using _cleanup = onExit(async () => { slowRelease.resolve(); leafRelease.resolve(); await slow; await f.dispose(); await reopened.flush(); });
+	const completed = (step: number) => f.events.some(event => event.type === "candidate" && event.candidate.source === "pattern_aware" &&
+		event.state.status === "succeeded" && JSON.parse(event.candidate.predictedAction).input.path === files[step]);
+	const predictions = (step: number) => f.events.filter(event => event.type === "prediction" && event.tool === names[step]);
+	await f.start();
+	if (reopen) {
+		await f.execute("read", { path: files[0] }); await f.finish(); await f.start("next");
+		await expect.poll(() => completed(1)).toBe(true); f.fallbacks.length = 0;
+		expect(textOutput(await f.execute("read", { path: files[1] }))).toBe(`${files[1]}\n`);
+		expect(f.fallbacks).toEqual([]); return;
+	}
+	if (mode === "reverse") await f.execute(names[0]!, { path: files[0] });
+	slow = f.execute(names[3]!, { path: files[3] }); await slowStarted.promise;
+	if (mode !== "reverse") await f.execute(names[0]!, { path: files[0] });
+	if (mode === "completed" || deep) leafRelease.resolve();
+	await leafStarted.promise;
+	if (mode === "completed" || deep) await expect.poll(() => completed(deep ? 5 : 2)).toBe(true);
+	const original = leafSignal; slowRelease.resolve(); await slow; await nextTurn();
+	await f.finish();
+	if (mode !== "binding") expect(original?.aborted).toBe(false);
+	expect(predictions(2)).toMatchObject(replaces ? [{ settlement: { observation: "unobserved", cause: { code: "superseded" } } }] : []);
+	if (deep) expect(predictions(5)).toEqual([]);
+	if (mode === "binding") expect(bindings).toBe(1);
+	leafRelease.resolve(); runtimeSettings.patternAware = { ...settings, enabled: false };
 	f.fallbacks.length = 0;
-	expect(textOutput(await f.execute("read", { path: "next.txt" }))).toBe("next\n");
+	for (const batch of changed ? [[4], [5]] : added ? [[1, 4], [2, 5]] : [[1], [2], ...deep ? [[5]] : []]) {
+		for (const step of batch) await expect.poll(() => completed(step)).toBe(true);
+		await f.start(`consume-${batch}`);
+		await Promise.all(batch.map(async step => expect(textOutput(await f.execute(names[step]!, { path: files[step] }))).toBe(`${files[step]}\n`))); await f.finish();
+		if (!removed) for (const step of batch) expect(predictions(step)).toMatchObject([{ settlement: { observation: "observed", match: { matched: true } } }]);
+	}
 	expect(f.fallbacks).toEqual([]);
+	if (mode !== "binding") expect(leafSignal).toBe(original);
 });
 
 test.for([false, true])("reconstructs shared searches after cancellation and namespace changes (cancel all: %s)", async (cancelAll, { skip }) => {

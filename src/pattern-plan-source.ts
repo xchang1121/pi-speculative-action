@@ -221,7 +221,7 @@ export function createPatternPlanSource({
 			const id = `pattern:${consumeInput.turnID}:after`, minimum = nextRevision(consumeInput.sessionID, id);
 			const revision = reserveRevision?.(id, minimum) ?? minimum;
 			revisions.set(agentBatchKey(consumeInput.sessionID, id), revision);
-			return { id, source: "pattern_aware", revision, actions };
+			return { id, source: "pattern_aware", revision, actions, retainDescendants: true };
 		}),
 		onAdmitted: ({ feedback }) => {
 			if (lifecycle.sealed) return;

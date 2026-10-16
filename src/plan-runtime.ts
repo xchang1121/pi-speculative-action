@@ -163,7 +163,8 @@ export class PlanRuntime {
 		const validated = captured ? { ok: true as const, actions: Object.freeze(offered) } : validateActions(offered);
 		if (!validated.ok) return { accepted: false, reason: validated.reason };
 		if (remove.some((id) => !validToken(id))) return { accepted: false, reason: "invalid_action" };
-		update = Object.freeze("actions" in update ? { ...update, actions: validated.actions } : { ...update, upsert: validated.actions, remove: Object.freeze(remove) });
+		update = Object.freeze("actions" in update ? { ...update, actions: validated.actions, retainDescendants: multiStep ? update.retainDescendants : undefined }
+			: { ...update, upsert: validated.actions, remove: Object.freeze(remove) });
 		capturedUpdates.add(update);
 		return { update };
 	}
@@ -181,6 +182,17 @@ export class PlanRuntime {
 		const actions = new Map(proposal ? [] : [...current!.nodes].map(([id, node]) => [id, node.action] as const));
 		if (!proposal) for (const id of owned.remove ?? []) actions.delete(id);
 		for (const action of upserted) actions.set(action.id, action);
+		if (proposal && owned.retainDescendants === true && current) {
+			const retained = new Set<string>();
+			for (const node of current.graph.ordered) {
+				if (node.identity.proposalID !== id) continue;
+				const { action } = node, dependencies = action.dependsOn ?? [];
+				const replacement = actions.get(action.id);
+				if (dependencies.some(dependency => dependency.proposalID ? !this.parent(id, dependency) : !retained.has(dependency.actionID)) ||
+					(replacement ? !samePlanActionExecution(action, replacement) : !dependencies.some(dependency => !dependency.proposalID))) continue;
+				actions.set(action.id, replacement ?? action); retained.add(action.id);
+			}
+		}
 		const ordered = dependencyOrder(actions, (dependency) => dependency.proposalID !== id && this.parent(id, dependency) !== undefined);
 		if (!ordered) return { accepted: false, reason: "invalid_dependency" };
 		return this.commit({ id, source: owned.source, revision: owned.revision, actions, upserted, ordered, anchorDecisionSeq });

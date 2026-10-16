@@ -56,6 +56,8 @@ export interface PlanProposal {
 	readonly source: string;
 	readonly revision: number;
 	readonly actions: readonly PlanAction[];
+	/** Retain descendants of unchanged actions. Omit to replace the whole plan. */
+	readonly retainDescendants?: true;
 }
 
 /** Incremental update to a proposal. Revisions must be strictly increasing. */
@@ -69,4 +71,4 @@ export interface PlanDelta {
 
 export type PlanUpdate = PlanProposal | PlanDelta;
 
-export interface MaterializedPlan extends Required<PlanProposal> {}
+export type MaterializedPlan = Omit<PlanProposal, "retainDescendants">;
