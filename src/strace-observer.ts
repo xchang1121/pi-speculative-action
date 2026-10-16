@@ -1059,12 +1059,9 @@ function statObservationDigest(structure: string): StatObservation | undefined {
 		mtimeNs: time("st_mtime"),
 		ctimeNs: time("st_ctime"),
 	};
-	const fields = mask && FILESYSTEM_OBSERVATION_FIELDS.filter((field) => mask.includes(field));
-	if (fields && fields.length < FILESYSTEM_OBSERVATION_FIELDS.length) {
-		return fields.every((field) => evidence[field] !== undefined) ? { digest: filesystemObservationDigest(evidence, fields), fields } : undefined;
-	}
-	if (Object.values(evidence).some((value) => value === undefined)) return undefined;
-	return { digest: filesystemObservationDigest(evidence) };
+	const fields = mask ? FILESYSTEM_OBSERVATION_FIELDS.filter(field => mask.includes(field)) : FILESYSTEM_OBSERVATION_FIELDS;
+	if (fields.some(field => evidence[field] === undefined)) return undefined;
+	return { digest: filesystemObservationDigest(evidence, fields), ...(fields.length < FILESYSTEM_OBSERVATION_FIELDS.length ? { fields } : {}) };
 }
 
 function parseInteger(value: string | undefined): bigint | undefined {
