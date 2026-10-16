@@ -33,6 +33,7 @@ export class ActorAction<Candidate extends { readonly id: string } = { readonly 
 	private stateValue: ActorActionState<Candidate, Output> = Object.freeze({ status: "matching" });
 	private fallbackValue: { readonly cause: ResolutionCause; readonly candidateID?: string };
 	private resultCapture?: AuthoritativeResultCapture<Output>;
+	private fallbackSettlement?: () => void;
 
 	constructor(input: Pick<ActorAction<Candidate, Output>, "identity" | "issuedAt" | "tool" | "actionKey"> & {
 		readonly fallback: ResolutionCause;
@@ -121,12 +122,16 @@ export class ActorAction<Candidate extends { readonly id: string } = { readonly 
 
 	deferToFallback(
 		matchedPredictions: readonly PredictionIdentity[] = [],
-		fallback?: ResolutionCause,
-	): PredictionAdoption | undefined {
-		if (this.stateValue.status !== "matching") return undefined;
-		if (fallback) this.setFallback(fallback);
+		settled?: (adoption: PredictionAdoption) => void,
+	): void {
+		if (this.stateValue.status !== "matching") return;
 		this.stateValue = Object.freeze({ status: "awaiting_fallback", matchedPredictions: freezePredictions(matchedPredictions) });
-		return { status: "rejected", ...this.fallbackValue };
+		this.fallbackSettlement = settled && (() => settled({ status: "rejected", ...this.fallbackValue }));
+	}
+
+	/** Consumption is recorded first; abandonment still closes every claimed opportunity exactly once. */
+	finishFallback(): void {
+		const settled = this.fallbackSettlement; this.fallbackSettlement = undefined; settled?.();
 	}
 
 	settleActor(execution: TimelineInterval, isError: boolean): ActorActionSettlement | undefined {

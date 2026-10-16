@@ -14,6 +14,8 @@ import { systemHost } from "./agent-system-fixture.ts";
 import { disposable, onExit, deferred, nextTurn } from "./async.ts";
 import { commitBenchmarkFixture, compileBenchmarkHelper, createLinuxProcessBenchmark, textOutput } from "./linux-process-fixture.ts";
 import { EXACT_TOOL_OBSERVATION, type ToolObservationContract } from "../src/tool-settlement.ts";
+import { ActorForkPlanSource } from "../src/actor-fork-plan-source.ts";
+import type { AgentPlanSource } from "../src/agent-runtime-types.ts";
 
 const directories = temporaryDirectories("pi-agent-system-");
 afterEach(directories.dispose);
@@ -213,9 +215,11 @@ test.for(["stale", "all-stale", "binding", "failure", "cancel", "composed", "rev
 		expect(timing.hiddenComputeMs > 0).toBe(!["all-stale", "alias", "failure", "cancel"].includes(mode)); expect(timing.hiddenComputeMs).toBeLessThanOrEqual(timing.toolComputeMs!); }
 });
 
-test.for(["reopened", "inflight", "completed", "binding", "reverse", "deep", "added", "changed", "removed", "shared", "shared-refresh", "shared-stale", "shared-unused", "shared-native", "shared-native-stale", "shared-exact", "shared-exact-stale"])("retains learned continuations across authoritative batch updates (%s)", async mode => {
+test.for(["reopened", "inflight", "completed", "binding", "reverse", "deep", "added", "changed", "removed", "shared", "shared-refresh", "shared-stale", "shared-unused", "shared-native", "shared-native-stale", "shared-exact", "shared-exact-stale",
+	...["", "-stale", "-failure-before", "-cancel-before", "-failure-after", "-cancel-after", "-close", "-terminal", "-disable", "-dispose", "-poison"].map(suffix => `shared-exact-fallback${suffix}`)])("retains learned continuations across authoritative batch updates (%s)", async mode => {
 	const changed = mode === "changed", removed = mode === "removed", replaces = changed || removed, added = mode === "added", deep = mode === "deep", reopen = mode === "reopened";
-	const shared = mode.startsWith("shared"), stale = mode.endsWith("stale"), unused = mode === "shared-unused", native = mode.includes("native"), exact = mode.includes("exact"), consumed = shared && !stale && !unused;
+	const fallback = mode.includes("fallback"), closure = mode.match(/-(close|terminal|disable|dispose)$/)?.[1], poison = mode.endsWith("poison"), failed = /failure|cancel/.test(mode);
+	const shared = mode.startsWith("shared"), stale = mode.endsWith("stale"), unused = mode === "shared-unused", native = mode.includes("native"), exact = mode.includes("exact"), consumed = shared && !stale && !unused && !closure && !poison && !mode.endsWith("before");
 	const cwd = await directories.create(), names = [reopen ? "read" : "inspect_index", reopen ? "read" : "open_record", "render_record", replaces ? "status_index" : "background_status", "summarize_record", "tail_record"];
 	const files = ["root.txt", "child.txt", "leaf.txt", "status.txt", "other.txt", "tail.txt"], reader = createReadTool(cwd);
 	for (const file of files) await writeFile(path.join(cwd, file), `${file}\n`);
@@ -234,14 +238,21 @@ test.for(["reopened", "inflight", "completed", "binding", "reverse", "deep", "ad
 		for (const batch of chain) { await training.start(`step-${batch}`); await Promise.all(batch.map(step => training.execute(names[step]!, { path: files[step] }))); await training.finish(batch === chain.at(-1)); }
 	}
 	await store.flush(); const reopened = createStore(); await reopened.load();
-	const slowStarted = deferred(), slowRelease = deferred(), leafStarted = deferred(), leafRelease = deferred();
+	const slowStarted = deferred(), slowRelease = deferred(), leafStarted = deferred(), leafRelease = deferred(), nativeStarted = deferred(), nativeRelease = deferred();
+	const controller = new AbortController(), failure = new Error("consumer stopped"); let allowSelection = true, nativeCalls = 0, commits = 0;
 	const runtimeSettings = { patternAware: settings, maxConcurrentActions: 3, scheduling: { heavyCpu: 1 } };
 	let leafSignal: AbortSignal | undefined, slow: Promise<unknown> | undefined, bindings = 0;
-	const f = systemHost(cwd, tools, { ...options, patternStore: reopened,
+	const f = systemHost(cwd, tools, { ...options, patternStore: reopened, preflight: () => allowSelection,
 		resolveInvocation: async (tool, input) => {
 			if (mode === "binding" && tool === names[2]) { bindings++; leafStarted.resolve(); await leafRelease.promise; }
 			const invocation = options.resolveInvocation(tool, input);
-			return { ...invocation, ...(native && tool === names[4] ? bindResourceOperation(invocation.filesystem!, cwd) : {}), ...(tool === names[3] ? bindResourceOperation(async (view, request) => {
+			return { ...invocation, ...(native && tool === names[4] ? bindResourceOperation(invocation.filesystem!, cwd) : {}), ...(fallback && tool === names[1] ? bindResourceOperation(async (view, request) => {
+				if (allowSelection) return invocation.filesystem!(view, request);
+				nativeCalls++; nativeStarted.resolve(); await nativeRelease.promise;
+				const result = mode.endsWith("before") || closure ? undefined : await invocation.filesystem!(view, request);
+				if (failed || closure) { if (mode.includes("cancel")) controller.abort(failure); throw failure; }
+				return result!;
+			}, cwd) : {}), ...(tool === names[3] ? bindResourceOperation(async (view, request) => {
 				const result = await invocation.filesystem!(view, request);
 				slowStarted.resolve(); await slowRelease.promise;
 				return result;
@@ -249,10 +260,12 @@ test.for(["reopened", "inflight", "completed", "binding", "reverse", "deep", "ad
 		},
 		executionWorlds: [{ ...world, speculation: { ...world.speculation!, execute: async context => {
 			if (context.toolName === names[2]) { leafSignal = context.signal; leafStarted.resolve(); await leafRelease.promise; context.signal.throwIfAborted(); }
-			return world.speculation!.execute(context);
+			const branch = await world.speculation!.execute(context);
+			return poison && context.toolName === names[1] ? { ...branch, commit: async () => { commits++; throw failure; } } : branch;
 		} } }],
 	}, runtimeSettings, "late-batch");
-	await using _cleanup = onExit(async () => { slowRelease.resolve(); leafRelease.resolve(); await slow; await f.dispose(); await reopened.flush(); });
+	const actors: Promise<unknown>[] = [];
+	await using _cleanup = onExit(async () => { slowRelease.resolve(); leafRelease.resolve(); nativeRelease.resolve(); await Promise.allSettled([...actors, slow]); await f.dispose(); await reopened.flush(); });
 	const completed = (step: number) => f.events.some(event => event.type === "candidate" && event.candidate.source === "pattern_aware" &&
 		event.state.status === "succeeded" && JSON.parse(event.candidate.predictedAction).input.path === files[step]);
 	const predictions = (step: number) => f.events.filter(event => event.type === "prediction" && event.tool === names[step]);
@@ -281,11 +294,27 @@ test.for(["reopened", "inflight", "completed", "binding", "reverse", "deep", "ad
 	f.fallbacks.length = 0;
 	for (const batch of shared ? [[1]] : changed ? [[4], [5]] : added ? [[1, 4], [2, 5]] : [[1], [2], ...deep ? [[5]] : []]) {
 		for (const step of batch) await expect.poll(() => completed(step)).toBe(true);
-		await f.start(`consume-${batch}`);
-		await Promise.all(batch.map(async step => expect(textOutput(await f.execute(names[shared && !exact ? 4 : step]!, { path: files[unused ? 4 : step] }))).toBe(stale ? "changed\n" : `${files[unused ? 4 : step]}\n`))); await f.finish();
+		await f.start(`consume-${batch}`); if (fallback && !poison) allowSelection = false;
+		await Promise.all(batch.map(async step => {
+			const result = f.execute(names[shared && !exact ? 4 : step]!, { path: files[unused ? 4 : step] }, controller.signal); actors.push(result); result.catch(() => {});
+			if (fallback && !poison) {
+				await nativeStarted.promise; await nextTurn(); expect(predictions(step)).toEqual([]);
+				if (closure) {
+					const closed = closure === "dispose" ? f.dispose() : closure === "disable" ? f.host.runtime.settingsChanged({ enabled: false, resourceCacheMaxEntries: 0, predictionTimeoutMs: 10_000 }) : f.finish(closure === "terminal");
+					actors.push(closed); closed.catch(() => {}); await expect.poll(() => predictions(step).length).toBe(1); nativeRelease.resolve(); await closed;
+				}
+				nativeRelease.resolve();
+			}
+			if (poison) await expect(result).rejects.toMatchObject({ disposition: "poisoned" });
+			else if (failed || closure) await expect(result).rejects.toBe(failure);
+			else expect(textOutput(await result)).toBe(stale ? "changed\n" : `${files[unused ? 4 : step]}\n`);
+		})); await nextTurn(); if (fallback) for (const step of batch) expect(predictions(step)).toHaveLength(1); await f.finish();
 		if (!removed) for (const step of batch) expect(predictions(step)).toMatchObject([{ settlement: native ? { observation: "unobserved", cause: { code: "actor_action_not_keyable" } } : { observation: "observed", match: { matched: !shared || exact } } }]);
 	}
-	expect(f.fallbacks).toEqual(native ? [names[4]] : []);
+	expect(f.fallbacks).toEqual(fallback && !poison ? [names[1]] : native ? [names[4]] : []);
+	if (fallback) { expect(nativeCalls).toBe(Number(!poison)); expect(commits).toBe(Number(poison));
+		const timing = f.events.filter(event => event.type === "actor_action").filter(event => event.settlement.tool === names[1]).at(-1)?.computation;
+		if (closure || poison) expect(timing).toBeUndefined(); else { expect(timing!.hiddenComputeMs > 0).toBe(consumed); expect(timing!.hiddenComputeMs).toBeLessThanOrEqual(timing!.toolComputeMs!); } }
 	if (mode !== "binding") expect(leafSignal).toBe(original);
 	if (shared) {
 		await f.dispose(); await reopened.flush(); const saved = createStore(); await saved.load();
@@ -296,6 +325,44 @@ test.for(["reopened", "inflight", "completed", "binding", "reverse", "deep", "ad
 			...(native ? { unobserved: { "matching:actor_action_not_keyable": 1 } } : {}),
 		});
 	}
+});
+
+test.for(["refresh", "replace", "remove"])("settles claimed consumption after a late source update (%s)", async mode => {
+	const cwd = await directories.create(), entered = deferred(), release = deferred(), args = { path: "input.txt" };
+	for (const file of ["input.txt", "other.txt"]) await writeFile(path.join(cwd, file), `${file}\n`);
+	const settled: Parameters<NonNullable<AgentPlanSource["onSettled"]>>[0][] = [], readers: Promise<unknown>[] = [];
+	let native = false, updated = false;
+	const fork = new class extends ActorForkPlanSource {
+		override readonly source: AgentPlanSource = {
+			id: "late-source", enabled: () => true,
+			propose: () => ({ id: "claimed", source: "late-source", revision: 0, actions: [{ id: "read", type: "tool_call", tool: "read", input: args, feedback: "before" }] }),
+			observe: ({ concrete }) => {
+				if (concrete.path !== "other.txt") return;
+				updated = true; return { id: "claimed", source: "late-source", revision: 1, actions: mode === "remove" ? [] : [
+					{ id: "read", type: "tool_call", tool: "read", input: { path: mode === "replace" ? "other.txt" : args.path }, feedback: "after" }], };
+			},
+			onSettled: feedback => { settled.push(feedback); },
+		};
+	}();
+	const f = systemHost(cwd, [createReadTool(cwd)], { actorForkPlanSource: fork, preflight: () => !native,
+		resolveInvocation: (tool, input) => {
+			const invocation = resolvePiToolInvocation(tool, input, { cwd, environment: {} })!;
+			return { ...invocation, ...bindResourceOperation(async (view, request) => {
+				const result = await invocation.filesystem!(view, request);
+				if (native && (request.args as typeof args).path === args.path) { entered.resolve(); await release.promise; }
+				return result;
+			}, cwd) };
+		},
+	});
+	await using _cleanup = onExit(async () => { release.resolve(); await Promise.allSettled(readers); await f.dispose(); });
+	await f.start(); await f.ready(); native = true; const result = f.execute("read", args); readers.push(result); result.catch(() => {});
+	await entered.promise; await nextTurn(); expect(settled).toEqual([]);
+	expect(textOutput(await f.execute("read", { path: "other.txt" }))).toBe("other.txt\n");
+	await expect.poll(() => updated).toBe(true); await nextTurn(); release.resolve(); expect(textOutput(await result)).toBe("input.txt\n");
+	await f.finish(true); expect(settled.filter(item => item.settlement.observation === "observed")).toMatchObject([{ feedback: "before", served: true,
+		settlement: { match: { matched: true, adoption: { status: "rejected" } } } }]);
+	const timing = f.events.filter(event => event.type === "actor_action").at(-1)!.computation!;
+	expect(timing.hiddenComputeMs).toBeGreaterThan(0); expect(timing.hiddenComputeMs).toBeLessThanOrEqual(timing.toolComputeMs!);
 });
 
 test.for([false, true])("reconstructs shared searches after cancellation and namespace changes (cancel all: %s)", async (cancelAll, { skip }) => {

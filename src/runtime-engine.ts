@@ -1474,7 +1474,7 @@ export function makeSpeculativeActionRuntime<
 				try { return await execute(inputs.lookup); } finally { inputs.dispose(); }
 			},
 			settle: (toolExecution, output, operations) => state.session.lifecycle.track(
-				settleActorCall(state, input, actualCall, actorAction, output, toolExecution, operations && Object.freeze([...operations]))),
+				settleActorCall(state, input, actualCall, actorAction, output, toolExecution, operations && Object.freeze([...operations]), matchingPredictions)),
 		};
 		const onActorActionMaterialized = adapter.onActorActionMaterialized;
 		if (actualKey && onActorActionMaterialized) {
@@ -1490,7 +1490,7 @@ export function makeSpeculativeActionRuntime<
 			);
 		}
 
-		let matchingPredictions: ClaimedPrediction[] = [];
+		let matchingPredictions: ClaimedPrediction[] = [], terminalFailure = false;
 		const pending = new Set<Promise<void>>(), actorSignal = signal ? AbortSignal.any([signal, state.generation.signal]) : state.generation.signal;
 		const follow = (task: Promise<void>) => {
 			const tracked = task.catch(() => {}).finally(() => { pending.delete(tracked); }); pending.add(tracked);
@@ -1537,7 +1537,7 @@ export function makeSpeculativeActionRuntime<
 					"actor_adopted",
 					{ key: actualKey, input: asConcreteInput(actualCall.input) ?? actualKey.input },
 				);
-				queueActorSettlement(state, input, actualCall, actorAction, selected.output, selected);
+				queueActorSettlement(state, input, actualCall, actorAction, selected.output, selected, undefined, matchingPredictions);
 				confirmPredictions(state.session, matchingPredictions, identity, adoption);
 				state.session.effects.enqueue(() => dispatchReady(state.session));
 				prepared.output = selected.output;
@@ -1550,14 +1550,14 @@ export function makeSpeculativeActionRuntime<
 			}
 			return Object.freeze(prepared);
 		} catch (error) {
-			if (isPoisonedEffectCommit(error)) throw error;
+			if (isPoisonedEffectCommit(error)) { terminalFailure = true; throw error; }
 			return Object.freeze(prepared); // Speculation failed after matching: the native run still settles and is recorded.
 		} finally {
 			abandonActorPreview(state, preview, actorAction.fallback.cause);
-			// Claims still open after a throw settle as matched but not served, instead of staying "matching" forever.
-			const adoption = actorAction.deferToFallback(matchingPredictions.map(({ opportunity }) => opportunity.identity));
-			if (adoption) confirmPredictions(state.session, matchingPredictions, identity, adoption);
-			if (actorAction.state.status === "awaiting_fallback") {
+			actorAction.deferToFallback(matchingPredictions.map(({ opportunity }) => opportunity.identity), adoption =>
+				confirmPredictions(state.session, matchingPredictions, identity, adoption));
+			if (terminalFailure) actorAction.finishFallback();
+			else if (actorAction.state.status === "awaiting_fallback") {
 				if (!scheduler.has(actorAction)) preemptForActor(state.session);
 				state.session.effects.enqueue(() => dispatchReady(state.session));
 				try {
@@ -1617,6 +1617,7 @@ export function makeSpeculativeActionRuntime<
 		output: Output | undefined,
 		toolExecution: TimelineInterval,
 		operations?: readonly ExecutionOperationBinding[],
+		matches: readonly ClaimedPrediction[] = [],
 	): Promise<void> => {
 		if (state.session.actorRequests.delete(actorAction)) { scheduler.complete(actorAction); state.session.effects.enqueue(wakeResourceWaiters); }
 		for (const candidate of candidateStore.values(state.sessionID)) if (candidate.operationConsumers?.delete(actorAction))
@@ -1629,7 +1630,8 @@ export function makeSpeculativeActionRuntime<
 		const key = actorAction.actionKey;
 		if (key) reconcileAuthoritativeEffects(state.session, key);
 		// Authoritative feedback must enter the settlement queue before optional cache work can yield.
-		queueActorSettlement(state, input, actualCall, actorAction, output, undefined, operations);
+		try { queueActorSettlement(state, input, actualCall, actorAction, output, undefined, operations, matches); }
+		finally { actorAction.finishFallback(); }
 		if (capture && (capture.inputsOnly || output !== undefined && !outputIsError(output))) {
 			try { await retainAuthoritativeBranch(state.session, state, () => state.lifecycle === "active", actualCall, key, await capture.seal(output), durationMs, execution, capture.route); }
 			catch { state.session.lifecycle.release(capture); }
@@ -1644,6 +1646,7 @@ export function makeSpeculativeActionRuntime<
 		output: Output | undefined,
 		selection?: ActorCandidateSelection<Candidate, Output>,
 		operations?: readonly ExecutionOperationBinding[],
+		matches: readonly ClaimedPrediction[] = [],
 	): void => {
 		const settlement = actorAction.settlement;
 		if (!settlement) return;
@@ -1657,7 +1660,7 @@ export function makeSpeculativeActionRuntime<
 			...(selection?.projection ? [{ computation: selection.projection, reused: selection.projectionReused }] : []),
 		];
 		const reused = TimelineInterval.reusedBy(consumed);
-		for (const node of state.session.plan.unsettled()) {
+		for (const node of [...state.session.plan.unsettled(), ...matches.map(({ node }) => node)]) {
 			const context = state.session.actionContexts.get(node.identity.id);
 			const candidate = "candidateID" in node.execution && (selection?.candidate.id === node.execution.candidateID ? selection.candidate
 				: candidateStore.get(state.sessionID, node.execution.candidateID));
@@ -2203,7 +2206,7 @@ export function makeSpeculativeActionRuntime<
 	};
 
 	const clearActorActions = (state: Turn): void => {
-		for (const action of state.actorActions) { const capture = action.takeCapture(); if (capture) state.session.lifecycle.release(capture); }
+		for (const action of state.actorActions) { action.finishFallback(); const capture = action.takeCapture(); if (capture) state.session.lifecycle.release(capture); }
 		state.actorActions.clear();
 	};
 
@@ -2269,6 +2272,7 @@ export function makeSpeculativeActionRuntime<
 		if (!closure) return;
 		await state.session.effects.flush();
 		await completeTurnClosure(closure);
+		await state.session.effects.flush();
 	};
 
 	const finishTurn = async (input: FinishInput): Promise<void> => {
