@@ -1433,7 +1433,7 @@ export class LinuxProcessReuseBackend {
 					}
 					this.recordHit(acquired.producer?.scope, acquired.joined, undefined, scope);
 					this.add(undefined, "reusedProcessMs", plan.certificate.result.observedProcessMs ?? 0);
-					if (scope) acquired.producer?.ownership.adopted({ scope, id: process.id, sequence: order, operationIdentity: weakKey,
+					if (scope) acquired.producer?.ownership.adopted({ scope, id: process.id, sequence: order, backend: "linux_process_reuse", operationIdentity: weakKey,
 						executionMs: plan.certificate.result.observedProcessMs ?? 0, computation });
 				},
 			});

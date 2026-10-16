@@ -1085,17 +1085,18 @@ export function makeSpeculativeActionRuntime<
 			// A root fork outliving its turn runs in the live turn's scope: its own turn's snapshots and handoffs are closed.
 			const live = parent || session.turns.get(owner.turnID)?.lifecycle === "active" ? undefined
 				: [...session.turns.values()].find((turn) => turn.lifecycle === "active")?.startInput;
-			if (draft.type === "operation") candidate.onOperationAdopted = adoption => {
+			candidate.onOperationAdopted = adoption => {
 				const turn = session.turns.get(adoption.scope.turnID);
 				if (session.lifecycle.sealed || session.id !== adoption.scope.sessionID || !turn) return;
-				const relation: ActionKeyMatch = draft.operation?.identity === adoption.operationIdentity ? { kind: "exact", distance: 0 }
-					: { kind: "projected", distance: 1, projector: "owned-operation" };
 				const actorAction: ActorActionIdentity = { id: adoption.id, kind: "operation", sequence: adoption.sequence,
 					decisionSequence: turn.decisionSequence, turnID: turn.turnID };
-				candidate.actorAdopted = true; candidate.forkParent = undefined;
-				// Rearming execution changes its candidate ID, not the prediction of the work actually consumed.
-				const matches = session.plan.matchable(turn.decisionSequence).flatMap(node =>
-					node.action.type === "operation" && node.actionKey?.key === action.key ? maybe(session.plan.claimMatch(node, actorAction, relation)) : []);
+				const matches = session.plan.matchable(turn.decisionSequence).flatMap(node => {
+					const operation = node.action.operation;
+					if (node.action.type !== "operation" || !node.actionKey) return [];
+					const exact = operation?.backend === adoption.backend && operation.identity === adoption.operationIdentity;
+					return exact || node.actionKey.key === action.key ? maybe(session.plan.claimMatch(node, actorAction,
+						exact ? { kind: "exact", distance: 0 } : { kind: "projected", distance: 1, projector: "owned-operation" })) : [];
+				});
 				confirmPredictions(session, matches, actorAction, { status: "adopted", candidateID: candidate.id });
 			};
 			const evaluation = await TimelineInterval.measure(() => adapter.executeCandidate({
