@@ -159,7 +159,7 @@ function sealEffectTransaction<Output>(attempt: MutableEffectTransactionAttempt,
 	const retainedBytes = Object.getOwnPropertyDescriptor(branch, "capturedBytes")?.get?.bind(branch);
 	const validateAndCommit = shared ? branch.validateAndCommit?.bind(branch) : undefined;
 	const sealed: WorldBranch<Output> = Object.freeze({
-		...immutableSnapshot({ backend: branch.backend, resources: branch.resources, inputResources: shared && branch.reconstruct ? branch.inputResources : undefined, capturedBytes: branch.capturedBytes,
+		...immutableSnapshot({ backend: branch.backend, resources: branch.resources, inputResources: shared ? branch.inputResources : undefined, capturedBytes: branch.capturedBytes,
 			reconstructionScope: shared && branch.reconstruct && !validateAndCommit ? branch.reconstructionScope : undefined,
 			executionMetrics: branch.executionMetrics, compatibility: branch.compatibility }),
 		// Checkpoints are opaque backend-issued handles; pin the reference without cloning their owner.

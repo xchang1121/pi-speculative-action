@@ -134,7 +134,7 @@ export type WorldBranch<Output> = WorldOutput<Output> & {
 	readonly computationDependencies?: readonly TimelineDependency[];
 	readonly checkpoint?: WorldCheckpoint;
 	readonly resources: readonly string[];
-	/** Indexed names only; descendant lookup requires an explicit backend hint, never adoption authority. */
+	/** Optional lookup priority hints; neither completeness nor adoption authority. */
 	readonly inputResources?: readonly { readonly path: string; readonly descendants?: boolean }[];
 	/** Opaque backend input owner; preserved through transactions, never result adoption authority. */
 	readonly inputSource?: object;

@@ -221,7 +221,7 @@ function estimateValueBytes(value: unknown, seen = new WeakSet<object>()): numbe
 }
 
 function inputIndexBytes(branch: WorldBranch<unknown>): number {
-	return branch.reconstruct ? branch.inputResources?.reduce((bytes, input) => bytes + input.path.length * 2 + 64, 0) ?? 0 : 0;
+	return branch.inputResources?.reduce((bytes, input) => bytes + input.path.length * 2 + 64, 0) ?? 0;
 }
 
 /** Relative resources mean their key's root, never the host process working directory. */
@@ -1133,7 +1133,7 @@ export function makeSpeculativeActionRuntime<
 				return;
 			}
 			scheduler.observe(actionExecutionIdentity(action), false);
-			candidateStore.settle(session.id, candidate, candidate.work.reservation.kind === "shared", branch.reconstruct ? branch.inputResources : undefined);
+			candidateStore.settle(session.id, candidate, branch, candidate.work.reservation.kind === "shared");
 			// An exclusive result waits for its own adoption; meanwhile the unchanged bytes it read can answer other reads.
 			const budget = cacheLimits(candidate.owner.settings), preimages = candidate.work.reservation.kind === "exclusive" && budget.maxEntries > 0 && budget.maxBytes > 0
 				? await branch.takeReadInputs?.(budget.maxBytes).catch(() => undefined) : undefined;
@@ -1593,7 +1593,7 @@ export function makeSpeculativeActionRuntime<
 			if (!candidate.work.succeed(branch, toolExecution, durationMs)) return;
 			const rejected = !branch.inputsOnly && adapter.rejectCandidateOutput?.({ output: branch.output, candidate: publicCandidate(candidate) });
 			if (rejected) return;
-			candidateStore.settle(session.id, candidate, true, branch.reconstruct ? branch.inputResources : undefined);
+			candidateStore.settle(session.id, candidate, branch);
 			retained = true;
 			trimResults(session, context.settings);
 		} catch { /* Optional cache retention cannot alter the Actor outcome. */ }

@@ -42,42 +42,44 @@ const mixedScenarios = ["producer", "consumer", "stale", "failure", "budget", "o
 const retainedScenarios = ["seed-dynamic", "seed-calculation", "mixed-producer", "unkeyed-dynamic", "unkeyed-calculation", "input-read", "input-names",
 	"unkeyed-input-read-stale", "unkeyed-input-names-stale", "unkeyed-mixed-failure", "unkeyed-mixed-budget", "unkeyed-mixed-revoke", "unkeyed-revoke"];
 
-test.for(["actor", "preview", "dynamic", "dynamic-preview", "hints", "hints-preview", "retired", "retired-preview", "predicted", "stale", "binding",
-	"calculation", "calculation-preview", "calculation-unrelated", "calculation-unrelated-preview", "calculation-hint", "calculation-hint-preview", "calculation-key",
-	"seed-dynamic", "seed-dynamic-preview", "seed-calculation", "seed-calculation-preview", "seed-stale", "seed-binding", "seed-calculation-key", "seed-unbounded", "seed-repeat", "seed-revoke",
+const withPreview = (modes: readonly string[]) => modes.flatMap(mode => [mode, `${mode}-preview`]);
+
+test.for([...["seed-dynamic", "seed-calculation", "input-read", "input-read-stale", "unkeyed-dynamic"].flatMap(mode => ["raw", "unindexed"].map(access => `${access}-${mode}`)),
+	"actor", "preview", ...withPreview(["dynamic", "hints", "retired", "calculation", "calculation-unrelated", "calculation-hint"]), "predicted", "stale", "binding", "calculation-key",
+	...withPreview(["seed-dynamic", "seed-calculation"]), "seed-stale", "seed-binding", "seed-calculation-key", "seed-unbounded", "seed-repeat", "seed-revoke",
 	...mixedScenarios, "mixed-binding-unkeyed", ...inputScenarios(true), "unregistered-dynamic", "unregistered-mixed-producer", "late-dynamic",
-	...["seed-dynamic", "seed-dynamic-preview", "seed-calculation", "seed-calculation-preview", "seed-binding", "seed-calculation-key", "mixed-producer", "mixed-consumer", "unkeyed-dynamic", "unkeyed-calculation",
+	...[...withPreview(["seed-dynamic", "seed-calculation"]), "seed-binding", "seed-calculation-key", "mixed-producer", "mixed-consumer", "unkeyed-dynamic", "unkeyed-calculation",
 		"input-read", "input-names", "input-stat-transfer", "input-exists-missing-transfer", ...process.platform === "linux" ? ["input-stat-special-transfer"] : [], "unkeyed-input-read-stale", "unkeyed-mixed-stale", "unkeyed-mixed-failure", "unkeyed-mixed-budget", "unkeyed-mixed-revoke",
 		"unkeyed-mixed-overlap", "unkeyed-mixed-cancel", "revoked-unkeyed-mixed-overlap", "after:unkeyed-mixed-overlap", "after-cancel:unkeyed-mixed-overlap", "after:seed-calculation", "after-cancel-return:seed-calculation"].map(mode => `live-${mode}`),
-	...["dynamic", "dynamic-preview", "calculation", "calculation-preview", "calculation-unrelated", "calculation-key", "stale", "binding", "retired", "unbounded", "repeat", "revoke", "rejected-capture", "rejected-branch", "rejected-output",
+	...[...withPreview(["dynamic", "calculation"]), "calculation-unrelated", "calculation-key", "stale", "binding", "retired", "unbounded", "repeat", "revoke", "rejected-capture", "rejected-branch", "rejected-output",
 		...mixedScenarios, ...inputScenarios()].map(mode => `unkeyed-${mode}`),
 	...["large", "opaque"].flatMap(output => [...retainedScenarios, "unkeyed-mixed-producer", "unkeyed-calculation-unrelated"].map(mode => `${output}-${mode}`)),
 	...["after", "after-cancel", "consume", "consume-cancel", "consume-cancel-return", "before"].flatMap(failure => [...retainedScenarios,
 		"unkeyed-mixed-stale", "unkeyed-mixed-cancel-return"].map(mode => `${failure}:${mode}`))])("shares actual inputs across independently formatted tools (%s)", async scenario => {
+	const discovery = /^(raw|unindexed)-/.exec(scenario)?.[1]; scenario = scenario.replace(/^(raw|unindexed)-/, "");
 	const live = scenario.startsWith("live-"), revoked = scenario.startsWith("live-revoked-"); scenario = scenario.replace(/^live-(?:revoked-)?/, "");
-	const parentFailure = scenario.includes(":") ? scenario.split(":")[0] : undefined, early = parentFailure === "before";
+	const parentFailure = scenario.includes(":") ? scenario.split(":")[0] : undefined, early = parentFailure === "before", parentThrows = parentFailure && !parentFailure.endsWith("return");
 	scenario = scenario.replace(/^.*:/, "");
 	const parentOutput = scenario.startsWith("large-") ? { transcript: "x".repeat(128 * 1024) } : scenario.startsWith("opaque-") ? { callback: () => "parent-only" } : {};
 	scenario = scenario.replace(/^(large|opaque)-/, "");
 	const mode = scenario.replace(/^(seed|unkeyed|unregistered|late)-/, ""), direct = mode.startsWith("input-"), listing = mode.startsWith("input-names"), changes = mode.endsWith("change"), range = mode.endsWith("range");
 	const unkeyed = /^(unkeyed|unregistered|late)-/.test(scenario), unknown = scenario.startsWith("unregistered-");
-	const seeded = live || unkeyed || scenario.startsWith("seed-") || direct && !mode.endsWith("preview") || ["mixed-producer", "mixed-budget", "mixed-outside"].includes(mode), bound = seeded || direct || mode.startsWith("mixed");
-	const cwd = await directories.create(), file = path.join(mode.endsWith("outside") ? await directories.create() : cwd, "input.txt"), shared = {};
+	const mixed = mode.startsWith("mixed"), rejected = mode.startsWith("rejected");
+	const seeded = live || unkeyed || scenario.startsWith("seed-") || direct && !mode.endsWith("preview") || ["mixed-producer", "mixed-budget", "mixed-outside"].includes(mode), bound = seeded || direct || mixed;
+	const args = { path: "input.txt" }, cwd = await directories.create(), file = path.join(mode.endsWith("outside") ? await directories.create() : cwd, "input.txt"), shared = {};
 	const metadata = /^input-(stat|type|entry|exists)/.exec(mode)?.[1], transfer = mode.endsWith("-transfer");
 	if (mode.includes("-special")) execFileSync("mkfifo", [file]); else if (!mode.includes("-missing") && !mode.endsWith("-create")) await writeFile(file, "one\ntwo\n");
 	if (listing) await writeFile(path.join(path.dirname(file), "second.txt"), "");
 	let metadataTarget = file;
 	if (/-(directory|link|broken)$/.test(mode)) { metadataTarget = path.join(cwd, "directory"); await mkdir(metadataTarget); if (!mode.endsWith("-directory")) {
 		const alias = path.join(cwd, "alias"); await symlink(metadataTarget, alias, "junction"); if (mode.endsWith("-broken")) await rename(metadataTarget, `${metadataTarget}-retired`); metadataTarget = alias; } }
-	let builds = 0, renders = 0, disposed = 0, effects = 0, borrowers = 0, bindings = 0, revoke: (() => void | Promise<void>) | undefined;
-	let revokeParent: typeof revoke;
+	let builds = 0, renders = 0, disposed = 0, effects = 0, borrowers = 0, bindings = 0, revoke: (() => void | Promise<void>) | undefined, revokeParent: typeof revoke;
 	const pure = mode.startsWith("calculation"), unrelated = mode.includes("unrelated") || mode.startsWith("calculation-hint");
 	const stale = mode.endsWith("stale") || mode.endsWith("-create") || mode.endsWith("-deleted"), cancelled = mode.endsWith("cancel"), overlap = mode === "mixed-cancel" || mode === "mixed-overlap", failed = mode.endsWith("failure");
-	const unavailable = early || mode.endsWith("budget") || mode.endsWith("outside") || mode.startsWith("rejected"), mutates = (index: number) => (direct || mode.startsWith("mixed")) && index === Number(mode !== "mixed-producer");
+	const unavailable = early || mode.endsWith("budget") || mode.endsWith("outside") || rejected, mutates = (index: number) => (direct || mixed) && index === Number(mode !== "mixed-producer");
 	const entered = deferred(), joined = deferred(), release = deferred(), controller = new AbortController(), actors: Promise<unknown>[] = [];
-	const parentGate = gated();
-	const producer = new AbortController(), parentError = new Error("producer failed after independent work");
-	const names = ["count_records", "summarize_records", "other_records"], read = PI_ACTION_SEMANTICS.definition("read")!;
+	const parentGate = gated(), producer = new AbortController(), parentError = new Error("producer failed after independent work");
+	const names = ["count_records", "summarize_records", "other_records"], read = readDefinition("read");
 	const definitions = names.map((tool, index) => ({ ...read, ...(mutates(index) ? PI_ACTION_SEMANTICS.definition("write") :
 		mode === "unbounded" && !index ? PI_ACTION_SEMANTICS.definition("bash") : {}), tool, epoch: `custom:${tool}`, projectors: [],
 		resourceScope: mutates(index) || mode === "unbounded" && !index ? undefined : "captured_inputs" as const,
@@ -123,42 +125,42 @@ test.for(["actor", "preview", "dynamic", "dynamic-preview", "hints", "hints-prev
 			...(binding.captureInputs ? { captureInputs: (...args: Parameters<NonNullable<typeof binding.captureInputs>>) => { const capture = binding.captureInputs!(...args); revoke = capture.dispose;
 				if (!index) revokeParent = revoke;
 				return { ...capture, seal: async () => { const branch = await capture.seal();
-					expect(branch).not.toHaveProperty("output"); await expect(branch.commit()).rejects.toMatchObject({ disposition: "recoverable" }); return branch;
+					expect(branch).not.toHaveProperty("output"); await expect(branch.commit()).rejects.toMatchObject({ disposition: "recoverable" }); return discovery ? { ...branch, reconstruct: undefined, inputResources: discovery === "unindexed" ? undefined : branch.inputResources } : branch;
 				} }; } } : {}) }];
 	}));
 	const world = createResourceSnapshotExecutionWorld(actionSemantics, { maxBytes: () => mode.endsWith("budget") ? 64 : 1024 * 1024 });
-	if (mode.startsWith("rejected")) { const capture = world.observation!.capture;
+	if (rejected) { const capture = world.observation!.capture;
 		Object.assign(world.observation!, { capture: async (context: Parameters<typeof capture>[0]) => {
 			const result = await capture(context);
 			return mode === "rejected-capture" ? { ...result, inputsOnly: undefined } : { ...result, seal: async (output: Parameters<typeof result.seal>[0]) => ({ ...await result.seal(output), ...(mode === "rejected-output" ? { output } : { inputsOnly: undefined }) }) };
 		} }); }
 	const f = systemHost(cwd, tools, { actionSemantics, resolveInvocation: tool => { if (tool === names[0]) bindings++; return invocations.get(tool); },
-		complete: async () => fauxAssistantMessage(fauxToolCall(names[unrelated ? 2 : 1]!, { path: "input.txt" }), { stopReason: "toolUse" }),
+		complete: async () => fauxAssistantMessage(fauxToolCall(names[unrelated ? 2 : 1]!, args), { stopReason: "toolUse" }),
 		executionWorlds: [world] }, settings);
 	await using _cleanup = onExit(async () => { controller.abort(); release.resolve(); parentGate.release(); await Promise.allSettled(actors); await f.dispose(); expect(disposed).toBe(direct ? 0 : builds - (bound ? 0 : f.fallbacks.length)); });
-	const initial = metadata ? await f.oracle(names[0]!, { path: "input.txt" }, undefined, undefined, invocations.get(names[0]!)) : render(names[0]!, 2, false);
+	const initial = metadata ? await f.oracle(names[0]!, args, undefined, undefined, invocations.get(names[0]!)) : render(names[0]!, 2, false);
 	const late = scenario.startsWith("late-") ? tools.shift() : undefined; await f.start(); if (late) tools.unshift(late);
-	if (live) { const task = f.execute(names[0]!, { path: "input.txt" }, producer.signal); void task.catch(() => {}); actors.push(task); await parentGate.entered; }
-	else if (parentFailure && !parentFailure.endsWith("return")) await expect(f.execute(names[0]!, { path: "input.txt" }, producer.signal)).rejects.toBe(parentError);
-	else if (seeded) expect(await f.execute(names[0]!, { path: "input.txt" }, producer.signal)).toEqual(initial);
-	else { await f.preview(names[0]!, { path: "input.txt" }); await f.ready(); }
-	expect({ builds, renders }).toEqual({ builds: Number(!early), renders: Number(!early) });
+	if (live) { const task = f.execute(names[0]!, args, producer.signal); void task.catch(() => {}); actors.push(task); await parentGate.entered; }
+	else if (parentThrows) await expect(f.execute(names[0]!, args, producer.signal)).rejects.toBe(parentError);
+	else if (seeded) expect(await f.execute(names[0]!, args, producer.signal)).toEqual(initial);
+	else { await f.preview(names[0]!, args); await f.ready(); }
+	expect(builds).toBe(Number(!early)); expect(renders).toBe(builds);
 	if (mode.startsWith("retired") || mode === "predicted") { await f.finish(); tools.shift(); settings.drafterEnabled = mode === "predicted"; await f.start("consumer"); }
 	if (mode === "predicted") await f.ready(2);
 	if (unrelated) { await f.finish(); settings.drafterEnabled = true; await f.start("unrelated"); await f.ready(seeded ? 1 : 2); await f.finish(); settings.drafterEnabled = false; await f.start("consumer"); }
-	if (mode.endsWith("preview") && !direct) { await f.preview(names[1]!, { path: "input.txt" }); await expect.poll(() => renders).toBe(unrelated ? 3 : 2); }
+	if (mode.endsWith("preview") && !direct) { await f.preview(names[1]!, args); await expect.poll(() => renders).toBe(unrelated ? 3 : 2); }
 	if (stale) await writeFile(listing ? path.join(path.dirname(file), "third.txt") : file, "one\ntwo\nthree\n");
 	if (mode.endsWith("-same-size")) await writeFile(file, "new\none\n");
 	if (mode.endsWith("-deleted")) await rm(file);
-	const expected = metadata ? await f.oracle(names[1]!, { path: "input.txt" }, undefined, undefined, invocations.get(names[1]!)) : render(names[1]!, stale || changes ? 3 : range ? 1 : 2, false);
-	const result = f.execute(names[1]!, { path: "input.txt" }, controller.signal); actors.push(result); void result.catch(() => {});
+	const expected = metadata ? await f.oracle(names[1]!, args, undefined, undefined, invocations.get(names[1]!)) : render(names[1]!, stale || changes ? 3 : range ? 1 : 2, false);
+	const result = f.execute(names[1]!, args, controller.signal); actors.push(result); void result.catch(() => {});
 	const finishParent = async () => {
 		parentGate.release();
-		if (parentFailure && !parentFailure.endsWith("return")) await expect(actors[0]).rejects.toBe(parentError);
+		if (parentThrows) await expect(actors[0]).rejects.toBe(parentError);
 		else expect(await actors[0]).toEqual(initial);
 	};
 	if (overlap) {
-		await entered.promise; const sibling = f.execute(names[1]!, { path: "input.txt" }); actors.push(sibling); await joined.promise;
+		await entered.promise; const sibling = f.execute(names[1]!, args); actors.push(sibling); await joined.promise;
 		if (revoked) { actors.push(Promise.resolve(revokeParent!())); await nextTurn(); }
 		if (live && parentFailure) await finishParent();
 		expect(disposed).toBe(0); if (cancelled) controller.abort(new Error("consumer cancelled")); release.resolve();
@@ -167,17 +169,18 @@ test.for(["actor", "preview", "dynamic", "dynamic-preview", "hints", "hints-prev
 	if (failed || cancelled) await expect(result).rejects.toThrow(failed ? "consumer failed after writing" : "consumer cancelled");
 	else expect(await result).toEqual(expected);
 	expect({ builds, renders, effects }).toEqual({ builds: (direct || stale || unavailable || mode.includes("binding") || mode === "calculation-key" || mode === "revoke" ? 2 : 1) + Number(unrelated) - Number(direct && cancelled) - Number(early),
-		renders: 2 + Number(unrelated) + Number(overlap) - Number(failed || cancelled) - Number(early), effects: Number(direct || mode.startsWith("mixed")) + Number(changes) + Number(overlap && !cancelled) - Number(direct && cancelled) - Number(early && mutates(0)) });
-	expect(f.fallbacks).toEqual([...(seeded ? [names[0]!] : []), ...(live && !mode.endsWith("preview") || early || mutates(1) || mode === "revoke" || mode.startsWith("rejected") ? Array(1 + Number(overlap)).fill(names[1]!) : [])]);
+		renders: 2 + Number(unrelated) + Number(overlap) - Number(failed || cancelled) - Number(early), effects: Number(direct || mixed) + Number(changes) + Number(overlap && !cancelled) - Number(direct && cancelled) - Number(early && mutates(0)) });
+	expect(f.fallbacks).toEqual([...(seeded ? [names[0]!] : []), ...(discovery || live && !mode.endsWith("preview") || early || mutates(1) || mode === "revoke" || rejected ? Array(1 + Number(overlap)).fill(names[1]!) : [])]);
 	if (direct && cancelled) await expect(readFile(path.join(cwd, `${names[1]}.txt`))).rejects.toMatchObject({ code: "ENOENT" });
-	else if ((direct || mode.startsWith("mixed")) && !(early && mutates(0))) expect(await readText(cwd, `${names[Number(mode !== "mixed-producer")]}.txt`)).toBe(metadata ? textOutput(expected).slice(names[1]!.length + 1) : String(stale || changes ? 3 : range ? 1 : 2));
-	if (transfer) { await revokeParent!(); expect(await f.execute(names[1]!, { path: "input.txt" })).toEqual(expected); }
+	else if ((direct || mixed) && !(early && mutates(0))) expect(await readText(cwd, `${names[Number(mode !== "mixed-producer")]}.txt`)).toBe(metadata ? textOutput(expected).slice(names[1]!.length + 1) : String(stale || changes ? 3 : range ? 1 : 2));
+	if (transfer) { await revokeParent!(); expect(await f.execute(names[1]!, args)).toEqual(expected); }
 	if (live) {
 		if (!parentFailure || !overlap) expect(f.actors.some(event => event.settlement.tool === names[0])).toBe(false);
 		await finishParent();
 	}
-	if (unkeyed) { expect(bindings).toBe(1); expect(f.actors.find(event => event.settlement.tool === names[0])).toMatchObject({ settlement: { provider: { kind: "actor", cause: { code: "action_not_keyable" } } } }); }
-	if (parentFailure) expect(f.actors.find(event => event.settlement.tool === names[0])).toMatchObject({ settlement: { provider: { kind: "actor", isError: !parentFailure.endsWith("return") } }, computation: { hiddenComputeMs: 0 } });
+	const parent = f.actors.find(event => event.settlement.tool === names[0]);
+	if (unkeyed) { expect(bindings).toBe(1); expect(parent).toMatchObject({ settlement: { provider: { kind: "actor", cause: { code: "action_not_keyable" } } } }); }
+	if (parentFailure) expect(parent).toMatchObject({ settlement: { provider: { kind: "actor", isError: !!parentThrows } }, computation: { hiddenComputeMs: 0 } });
 	await f.finish();
 	const timing = f.actors.filter(event => event.settlement.tool === names[1]).at(-1)?.computation;
 	if (mode !== "binding") expectHiddenCompute(timing!, !stale && !unavailable && (!failed || direct) && !(direct && cancelled) && !["calculation-key", "revoke"].includes(mode));

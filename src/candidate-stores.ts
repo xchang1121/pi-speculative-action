@@ -150,15 +150,15 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 	}
 
 	/** A present input capability may own calculations without paths; retention preserves its existing identity. */
-	settle(scope: Scope, entry: Entry, shared = true, inputs?: NonNullable<WorldBranch<unknown>["inputResources"]>): void {
+	settle(scope: Scope, entry: Entry, branch: WorldBranch<unknown>, shared = true): void {
 		this.insert(scope, entry);
 		const indexed = this.record(scope, entry);
 		if (!indexed) return;
 		this.scopes.get(scope)!.pending.delete(indexed);
 		indexed.result ??= { segment: "cold", insertedAt: this.now(), actorHits: 0 };
-		if (shared && !indexed.inputs && inputs) {
+		if (shared && !indexed.inputs && (branch.inputSource || branch.reconstruct)) {
 			const partitions = this.scopes.get(scope)!.partitions;
-			for (const key of new Set(inputs.map(input => inputPartition(input.path, input.descendants)))) {
+			for (const key of new Set(branch.inputResources?.map(input => inputPartition(input.path, input.descendants)))) {
 				const members = partitions.get(key) ?? new Set();
 				members.add(indexed); partitions.set(key, members);
 				indexed.memberships.push([partitions, key]);
@@ -217,7 +217,7 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 
 	private inputRecords(scope: Scope, resources?: readonly string[]) {
 		const state = this.scopes.get(scope), inputs = new Map<IndexedEntry<Entry>, number>();
-		if (state && !resources) for (const indexed of state.entries.values()) { if (indexed.inputs) inputs.set(indexed, 0); }
+		if (state) for (const indexed of state.entries.values()) { if (indexed.inputs) inputs.set(indexed, 1024); }
 		if (state) for (const resource of resources ?? []) {
 			let current = path.resolve(resource), depth = 0;
 			for (;;) {
@@ -233,9 +233,8 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 	private lookupRecords(scope: Scope, action: ActionKey, partitions: readonly string[], requireCoverage?: (entry: Entry) => boolean, includeInputs = false) {
 		const state = this.scopes.get(scope);
 		if (!state) return [];
-		const inputs = this.inputRecords(scope, includeInputs ? action.resources.flatMap(resource =>
-			action.resourceRoot !== undefined || path.isAbsolute(resource) ? [path.resolve(action.resourceRoot ?? "", resource)] : []) : []);
-		if (includeInputs) for (const indexed of this.inputRecords(scope).keys()) { if (!inputs.has(indexed)) inputs.set(indexed, 1024); }
+		const inputs = includeInputs ? this.inputRecords(scope, action.resources.flatMap(resource =>
+			action.resourceRoot !== undefined || path.isAbsolute(resource) ? [path.resolve(action.resourceRoot ?? "", resource)] : [])) : new Map<IndexedEntry<Entry>, number>();
 		const views = includeInputs ? state.partitions.get(`view:${action.key}`) : undefined;
 		const candidates = new Set([...(state.exact.get(action.key) ?? []), ...inputs.keys(), ...(views ?? [])]);
 		for (const key of partitions) for (const indexed of state.partitions.get(key) ?? []) candidates.add(indexed);
