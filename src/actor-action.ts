@@ -17,10 +17,7 @@ export interface ActorCandidateSelection<Candidate extends { readonly id: string
 type ActorActionState<Candidate extends { readonly id: string }, Output> =
 	| { readonly status: "matching" }
 	| { readonly status: "selected"; readonly value: ActorCandidateSelection<Candidate, Output> }
-	| {
-			readonly status: "awaiting_fallback";
-			readonly matchedPredictions: readonly PredictionIdentity[];
-	  }
+	| { readonly status: "awaiting_fallback" }
 	| { readonly status: "settled"; readonly value: ActorActionSettlement };
 
 /** One owner for matching, the committed selection and exactly-once settlement. */
@@ -33,7 +30,11 @@ export class ActorAction<Candidate extends { readonly id: string } = { readonly 
 	private stateValue: ActorActionState<Candidate, Output> = Object.freeze({ status: "matching" });
 	private fallbackValue: { readonly cause: ResolutionCause; readonly candidateID?: string };
 	private resultCapture?: AuthoritativeResultCapture<Output>;
-	private fallbackSettlement?: () => void;
+	private matchedPredictions: readonly PredictionIdentity[] = [];
+	finishConsumption!: (reused?: ReadonlySet<string>) => void;
+	readonly consumption = new Promise<ReadonlySet<string>>(resolve => {
+		this.finishConsumption = (reused = new Set()) => resolve(reused);
+	});
 
 	constructor(input: Pick<ActorAction<Candidate, Output>, "identity" | "issuedAt" | "tool" | "actionKey"> & {
 		readonly fallback: ResolutionCause;
@@ -95,43 +96,34 @@ export class ActorAction<Candidate extends { readonly id: string } = { readonly 
 		this.stateValue = Object.freeze({ status: "selected", value: Object.freeze({ ...selection }) });
 	}
 
-	settleSelection(
-		matchedPredictions: readonly PredictionIdentity[],
-		provider: "speculative" | "preview",
-	): PredictionAdoption | undefined {
-		if (this.stateValue.status !== "selected") return undefined;
+	settleSelection(provider: "speculative" | "preview"): void {
+		if (this.stateValue.status !== "selected") return;
 		const selected = this.stateValue.value, candidateID = selected.candidate.id;
 		const toolExecution = TimelineInterval.from(selected.toolExecution);
-		this.finish(Object.freeze(provider === "preview" ? {
+		this.finish(Object.freeze<ActorActionProvider>({ candidateID, toolExecution, ...(provider === "preview" ? {
 			kind: "actor",
 			origin: "preview",
-			candidateID,
-			toolExecution,
 			durationMs: toolExecution.completedAt - toolExecution.startedAt,
 			isError: false,
 		} : {
 			kind: "speculative",
-			candidateID,
-			toolExecution,
 			match: Object.freeze({ ...selected.match }),
-		}), freezePredictions(matchedPredictions));
-		return provider === "preview"
-			? { status: "rejected", candidateID, cause: cause("control", "actor_preview_provider") }
-			: { status: "adopted", candidateID };
+		}) }));
 	}
 
-	deferToFallback(
-		matchedPredictions: readonly PredictionIdentity[] = [],
-		settled?: (adoption: PredictionAdoption) => void,
-	): void {
-		if (this.stateValue.status !== "matching") return;
-		this.stateValue = Object.freeze({ status: "awaiting_fallback", matchedPredictions: freezePredictions(matchedPredictions) });
-		this.fallbackSettlement = settled && (() => settled({ status: "rejected", ...this.fallbackValue }));
+	match(predictions: readonly PredictionIdentity[], settled: (adoption: PredictionAdoption) => void): void {
+		this.matchedPredictions = Object.freeze([...new Map(predictions.map(prediction => [prediction.id, Object.freeze({ ...prediction })])).values()]);
+		void this.consumption.then(() => {
+			const provider = this.settlement?.provider;
+			settled(provider?.kind === "speculative" ? { status: "adopted", candidateID: provider.candidateID } : {
+				status: "rejected", ...(provider?.origin === "preview"
+					? { candidateID: provider.candidateID, cause: cause("control", "actor_preview_provider") } : this.fallbackValue),
+			});
+		});
 	}
 
-	/** Consumption is recorded first; abandonment still closes every claimed opportunity exactly once. */
-	finishFallback(): void {
-		const settled = this.fallbackSettlement; this.fallbackSettlement = undefined; settled?.();
+	deferToFallback(): void {
+		if (this.stateValue.status === "matching") this.stateValue = Object.freeze({ status: "awaiting_fallback" });
 	}
 
 	settleActor(execution: TimelineInterval, isError: boolean): ActorActionSettlement | undefined {
@@ -144,24 +136,19 @@ export class ActorAction<Candidate extends { readonly id: string } = { readonly 
 			durationMs: toolExecution.completedAt - toolExecution.startedAt,
 			isError,
 			toolExecution,
-		}), this.stateValue.matchedPredictions);
+		}));
 	}
 
-	private finish(provider: ActorActionProvider, matchedPredictions: readonly PredictionIdentity[]): ActorActionSettlement {
+	private finish(provider: ActorActionProvider): ActorActionSettlement {
 		const settlement = Object.freeze({
 			actorAction: this.identity,
 			tool: this.tool,
 			provider,
-			matchedPredictions,
+			matchedPredictions: this.matchedPredictions,
 			...(this.actionKey ? { actionKeyHash: this.actionKey.hash } : {}),
 			rejections: Object.freeze([...this.rejections]),
 		});
 		this.stateValue = Object.freeze({ status: "settled", value: settlement });
 		return settlement;
 	}
-}
-
-function freezePredictions(predictions: readonly PredictionIdentity[]): readonly PredictionIdentity[] {
-	const unique = new Map(predictions.map((prediction) => [prediction.id, Object.freeze({ ...prediction })]));
-	return Object.freeze([...unique.values()]);
 }

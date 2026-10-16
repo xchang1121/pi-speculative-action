@@ -1501,6 +1501,8 @@ export function makeSpeculativeActionRuntime<
 
 			matchingPredictions = predictionMatches(state.session, actualKey, state.decisionSequence)
 				.flatMap(({ node, relation }) => maybe(state.session.plan.claimMatch(node, identity, relation)));
+			actorAction.match(matchingPredictions.map(({ opportunity }) => opportunity.identity), adoption =>
+				confirmPredictions(state.session, matchingPredictions, identity, adoption));
 			if (preview?.actionKey && actionKeyCovers(preview.actionKey, actualKey, projectionRules)) {
 				preview.actorDemand = true;
 				const preparation = preparations.get(preview);
@@ -1522,13 +1524,10 @@ export function makeSpeculativeActionRuntime<
 			});
 			const selected = actorAction.selection;
 			if (selected) {
-				const predictionIdentities = matchingPredictions.map(({ opportunity }) => opportunity.identity);
 				const previewed = preview?.state.status === "candidate" && preview.state.ownership === "preview" && preview.state.candidateID === selected.candidate.id;
-				const adoption = actorAction.settleSelection(predictionIdentities, previewed ? "preview" : "speculative");
-				if (!adoption) return Object.freeze(prepared);
+				actorAction.settleSelection(previewed ? "preview" : "speculative");
 				state.actorActions.delete(actorAction);
 				queueActorSettlement(state, input, actualCall, actorAction, selected.output, selected, undefined, matchingPredictions);
-				confirmPredictions(state.session, matchingPredictions, identity, adoption);
 				state.session.effects.enqueue(() => dispatchReady(state.session));
 				prepared.output = selected.output;
 				return Object.freeze(prepared);
@@ -1544,9 +1543,8 @@ export function makeSpeculativeActionRuntime<
 			return Object.freeze(prepared); // Speculation failed after matching: the native run still settles and is recorded.
 		} finally {
 			abandonActorPreview(state, preview, actorAction.fallback.cause);
-			actorAction.deferToFallback(matchingPredictions.map(({ opportunity }) => opportunity.identity), adoption =>
-				confirmPredictions(state.session, matchingPredictions, identity, adoption));
-			if (terminalFailure) actorAction.finishFallback();
+			actorAction.deferToFallback();
+			if (terminalFailure) actorAction.finishConsumption();
 			else if (actorAction.state.status === "awaiting_fallback") {
 				if (!scheduler.has(actorAction)) preemptForActor(state.session);
 				state.session.effects.enqueue(() => dispatchReady(state.session));
@@ -1624,8 +1622,7 @@ export function makeSpeculativeActionRuntime<
 		const key = actorAction.actionKey;
 		if (key) reconcileAuthoritativeEffects(state.session, key);
 		// Authoritative feedback must enter the settlement queue before optional cache work can yield.
-		try { queueActorSettlement(state, input, actualCall, actorAction, output, undefined, operations, matches); }
-		finally { actorAction.finishFallback(); }
+		queueActorSettlement(state, input, actualCall, actorAction, output, undefined, operations, matches);
 		if (capture && (capture.inputsOnly || output !== undefined && !outputIsError(output))) {
 			try { await retainAuthoritativeBranch(state.session, state, () => state.lifecycle === "active", actualCall, key, await capture.seal(output), durationMs, execution, capture.route); }
 			catch { state.session.lifecycle.release(capture); }
@@ -1649,6 +1646,7 @@ export function makeSpeculativeActionRuntime<
 			...(selection?.projection ? [{ computation: selection.projection, reused: selection.projectionReused }] : []),
 		];
 		const reused = TimelineInterval.reusedProducers(consumed);
+		actorAction.finishConsumption(reused);
 		for (const node of [...state.session.plan.unsettled(), ...matches.map(({ node }) => node)]) {
 			const context = state.session.actionContexts.get(node.identity.id);
 			if (context && "candidateID" in node.execution && reused.has(TimelineInterval.producerID(state.session, node.execution.candidateID))) context.served = true;
@@ -1746,6 +1744,7 @@ export function makeSpeculativeActionRuntime<
 		const context = session.actionContexts.get(node.identity.id);
 		if (!context) return;
 		const source = sourcesByID.get(context.identity.source);
+		const candidateID = "candidateID" in node.execution ? node.execution.candidateID : undefined;
 		const event: SpeculativeActionEvent<SessionID> | undefined = adapter.onEvent ? {
 			type: node.action.type === "operation" || source?.kind === "preparation" ? "operation_prediction" : "prediction",
 			...eventEnvelope(session, context.startInput.turnID, context.settings),
@@ -1760,16 +1759,21 @@ export function makeSpeculativeActionRuntime<
 			...(node.actionKey ? { action: node.actionKey } : {}),
 			settlement,
 		}));
-		if (event || source?.onSettled) session.effects.enqueue(async () => {
-			if (event) session.events.enqueue(event);
-			await source?.onSettled?.({ proposalID: context.identity.proposalID, actionID: context.identity.actionID, feedback: context.draft.feedback, settlement, served: context.served === true });
-		});
+		if (event) session.effects.enqueue(() => { session.events.enqueue(event); });
+		if (source?.onSettled) {
+			const producer = candidateID && TimelineInterval.producerID(session, candidateID);
+			const pending = !context.served && producer ? [...session.turns.values()].flatMap(turn => [...turn.actorActions].map(action => action.consumption)) : [];
+			const deliver = (receipts: readonly ReadonlySet<string>[]) => { session.effects.enqueue(() => source.onSettled!({
+				proposalID: context.identity.proposalID, actionID: context.identity.actionID, feedback: context.draft.feedback, settlement,
+				served: context.served === true || !!producer && receipts.some(receipt => receipt.has(producer)),
+			})); };
+			// Wait outside the effects queue, only for consumers already present at retirement.
+			if (pending.length) void Promise.all(pending).then(deliver); else deliver([]);
+		}
 		const matched = settlement.observation === "observed" && settlement.match.matched;
 		releaseActionContext(session, node.identity.id, matched);
-		if ("candidateID" in node.execution && node.execution.candidateID) {
-			const candidate = candidateStore.get(session.id, node.execution.candidateID);
-			if (candidate) retireUndemandedCandidate(session, candidate, cause("retention", "prediction_horizon_settled"));
-		}
+		const candidate = candidateID && candidateStore.get(session.id, candidateID);
+		if (candidate) retireUndemandedCandidate(session, candidate, cause("retention", "prediction_horizon_settled"));
 	};
 
 	const settleUnobserved = (session: Session, node: PlanRuntimeNode, failure: ResolutionCause): void => {
@@ -2200,7 +2204,7 @@ export function makeSpeculativeActionRuntime<
 	};
 
 	const clearActorActions = (state: Turn): void => {
-		for (const action of state.actorActions) { action.finishFallback(); state.session.lifecycle.release(action.takeCapture()); }
+		for (const action of state.actorActions) { action.finishConsumption(); state.session.lifecycle.release(action.takeCapture()); }
 		state.actorActions.clear();
 	};
 

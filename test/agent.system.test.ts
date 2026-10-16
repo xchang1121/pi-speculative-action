@@ -1,7 +1,7 @@
 import { access, link, mkdir, readFile, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import path from "node:path";
-import { fauxAssistantMessage, fauxToolCall, Type, fauxText, fauxThinking } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxToolCall, Type, fauxText, fauxThinking, type Context } from "@earendil-works/pi-ai";
 import { createEditTool, createFindTool, createGrepTool, createLsTool, createReadTool, createWriteTool } from "@earendil-works/pi-coding-agent";
 import { afterEach, expect, test } from "vitest";
 import { WorkspaceSandboxService } from "../src/workspace-sandbox.ts";
@@ -17,6 +17,10 @@ import { commitBenchmarkFixture, compileBenchmarkHelper, createLinuxProcessBench
 import { EXACT_TOOL_OBSERVATION, type ToolObservationContract } from "../src/tool-settlement.ts";
 import { ActorForkPlanSource } from "../src/actor-fork-plan-source.ts";
 import type { AgentPlanSource } from "../src/agent-runtime-types.ts";
+
+const writeText = (cwd: string, file: string, text: string) => writeFile(path.join(cwd, file), text);
+const toolMessage = (content: Parameters<typeof fauxAssistantMessage>[0]) => fauxAssistantMessage(content, { stopReason: "toolUse" });
+const toolReply = (...args: Parameters<typeof fauxToolCall>) => fauxAssistantMessage(fauxToolCall(...args));
 
 const directories = temporaryDirectories("pi-agent-system-");
 afterEach(directories.dispose);
@@ -69,7 +73,7 @@ test.for([...["seed-dynamic", "seed-calculation", "input-read", "input-read-stal
 	const args = { path: "input.txt" }, cwd = await directories.create(), file = path.join(mode.endsWith("outside") ? await directories.create() : cwd, "input.txt"), shared = {};
 	const metadata = /^input-(stat|type|entry|exists)/.exec(mode)?.[1], transfer = mode.endsWith("-transfer");
 	if (mode.includes("-special")) execFileSync("mkfifo", [file]); else if (!mode.includes("-missing") && !mode.endsWith("-create")) await writeFile(file, "one\ntwo\n");
-	if (listing) await writeFile(path.join(path.dirname(file), "second.txt"), "");
+	if (listing) await writeText(path.dirname(file), "second.txt", "");
 	let metadataTarget = file;
 	if (/-(directory|link|broken)$/.test(mode)) { metadataTarget = path.join(cwd, "directory"); await mkdir(metadataTarget); if (!mode.endsWith("-directory")) {
 		const alias = path.join(cwd, "alias"); await symlink(metadataTarget, alias, "junction"); if (mode.endsWith("-broken")) await rename(metadataTarget, `${metadataTarget}-retired`); metadataTarget = alias; } }
@@ -135,7 +139,7 @@ test.for([...["seed-dynamic", "seed-calculation", "input-read", "input-read-stal
 			return mode === "rejected-capture" ? { ...result, inputsOnly: undefined } : { ...result, seal: async (output: Parameters<typeof result.seal>[0]) => ({ ...await result.seal(output), ...(mode === "rejected-output" ? { output } : { inputsOnly: undefined }) }) };
 		} }); }
 	const f = systemHost(cwd, tools, { actionSemantics, resolveInvocation: tool => { if (tool === names[0]) bindings++; return invocations.get(tool); },
-		complete: async () => fauxAssistantMessage(fauxToolCall(names[unrelated ? 2 : 1]!, args), { stopReason: "toolUse" }),
+		complete: async () => toolMessage(fauxToolCall(names[unrelated ? 2 : 1]!, args)),
 		executionWorlds: [world] }, settings);
 	await using _cleanup = onExit(async () => { controller.abort(); release.resolve(); parentGate.release(); await Promise.allSettled(actors); await f.dispose(); expect(disposed).toBe(direct ? 0 : builds - (bound ? 0 : f.fallbacks.length)); });
 	const initial = metadata ? await f.oracle(names[0]!, args, undefined, undefined, invocations.get(names[0]!)) : render(names[0]!, 2, false);
@@ -275,7 +279,7 @@ test.for(["reopened", "inflight", "completed", "binding", "reverse", "deep", "ad
 	const shared = mode.startsWith("shared"), stale = mode.endsWith("stale"), unused = mode === "shared-unused", native = mode.includes("native"), exact = mode.includes("exact"), consumed = shared && !stale && !unused && !closure && !poison && !mode.endsWith("before");
 	const cwd = await directories.create(), names = [reopen ? "read" : "inspect_index", reopen ? "read" : "open_record", "render_record", replaces ? "status_index" : "background_status", "summarize_record", "tail_record"];
 	const files = ["root.txt", "child.txt", "leaf.txt", "status.txt", "other.txt", "tail.txt"];
-	for (const file of files) await writeFile(path.join(cwd, file), `${file}\n`);
+	for (const file of files) await writeText(cwd, file, `${file}\n`);
 	const { actionSemantics, tools, world, resolveInvocation } = readScenario(cwd, [...new Set(names)], [...new Set(names)].map(tool => ({
 		...readDefinition(tool), epoch: `learned:${tool}`, ...(native && tool === names[4] ? { canonicalize: () => undefined } : {}) })));
 	const settings = patternAwareSettings({ enabled: true, minOccurrences: 2, maxContextLength: added ? 2 : 1, maxFutureGap: 0, beamWidth: added ? 2 : 1, maxPredictionDepth: 3, presets: [] });
@@ -338,7 +342,7 @@ test.for(["reopened", "inflight", "completed", "binding", "reverse", "deep", "ad
 	if (mode === "binding") expect(bindings).toBe(1);
 	leafGate.release(); runtimeSettings.patternAware = { ...settings, enabled: false };
 	const prior = reopened.snapshot().filter(pattern => pattern.targetTool === names[1]);
-	if (stale) await writeFile(path.join(cwd, files[1]!), "changed\n");
+	if (stale) await writeText(cwd, files[1]!, "changed\n");
 	f.fallbacks.length = 0;
 	for (const batch of shared ? [[1]] : changed ? [[4], [5]] : added ? [[1, 4], [2, 5]] : [[1], [2], ...deep ? [[5]] : []]) {
 		await f.ready(batch.map(step => files[step]!), "pattern_aware");
@@ -375,48 +379,56 @@ test.for(["reopened", "inflight", "completed", "binding", "reverse", "deep", "ad
 	}
 });
 
-test.for(["refresh", "replace", "remove"])("settles claimed consumption after a late source update (%s)", async mode => {
+test.for(["refresh", "replace", "remove", "replace-shared", "remove-shared"])("settles claimed consumption after a late source update (%s)", async scenario => {
+	const [mode, shared] = scenario.split("-");
 	const cwd = await directories.create(), gate = gated(), args = { path: "input.txt" };
-	for (const file of ["input.txt", "other.txt"]) await writeFile(path.join(cwd, file), `${file}\n`);
+	for (const file of ["input.txt", "other.txt"]) await writeText(cwd, file, `${file}\n`);
 	const settled: Parameters<NonNullable<AgentPlanSource["onSettled"]>>[0][] = [], readers: Promise<unknown>[] = [];
 	let native = false, updated = false;
+	const proposal = (after = false) => ({ id: "claimed", source: "late-source", revision: Number(after), actions: after && mode === "remove" ? [] : [{
+		id: "read", type: "tool_call" as const, tool: "read", input: { path: after && mode === "replace" ? "other.txt" : args.path }, feedback: after ? "after" : "before",
+	}] });
 	const fork = new class extends ActorForkPlanSource {
 		override readonly source: AgentPlanSource = {
 			id: "late-source", enabled: () => true,
-			propose: () => ({ id: "claimed", source: "late-source", revision: 0, actions: [{ id: "read", type: "tool_call", tool: "read", input: args, feedback: "before" }] }),
+			propose: () => proposal(),
 			observe: ({ concrete }) => {
 				if (concrete.path !== "other.txt") return;
-				updated = true; return { id: "claimed", source: "late-source", revision: 1, actions: mode === "remove" ? [] : [
-					{ id: "read", type: "tool_call", tool: "read", input: { path: mode === "replace" ? "other.txt" : args.path }, feedback: "after" }], };
-			},
-			onSettled: feedback => { settled.push(feedback); },
+				updated = true; return proposal(true);
+			}, onSettled: feedback => { settled.push(feedback); },
 		};
 	}();
-	const f = systemHost(cwd, [createReadTool(cwd)], { actorForkPlanSource: fork, preflight: () => !native,
+	const { tools, actionSemantics, world, resolveInvocation } = readScenario(cwd, ["read", "summarize_rows"]);
+	const f = systemHost(cwd, tools, { actionSemantics, executionWorlds: [world], actorForkPlanSource: fork, preflight: () => !native,
 		resolveInvocation: (tool, input) => {
-			const invocation = resolvePiToolInvocation(tool, input, { cwd, environment: {} })!;
+			const invocation = resolveInvocation(tool, input);
 			return { ...invocation, ...bindResourceOperation(async (view, request) => {
 				const result = await invocation.filesystem!(view, request);
-				if (native && (request.args as typeof args).path === args.path) { await gate.wait(); }
+				if (native && request.callID !== "oracle" && (request.args as typeof args).path !== "other.txt") await gate.wait();
 				return result;
 			}, cwd) };
 		},
 	});
 	await using _cleanup = onExit(async () => { gate.release(); await Promise.allSettled(readers); await f.dispose(); });
-	await f.start(); await f.ready(); native = true; const result = f.execute("read", args); readers.push(result); result.catch(() => {});
+	await f.start(); await f.ready(); native = true;
+	const tool = shared ? "summarize_rows" : "read";
+	const result = f.execute(tool, args); readers.push(result); result.catch(() => {});
 	await gate.entered; await nextTurn(); expect(settled).toEqual([]);
 	expect(textOutput(await f.execute("read", { path: "other.txt" }))).toBe("other.txt\n");
-	await expect.poll(() => updated).toBe(true); await nextTurn(); gate.release(); expect(textOutput(await result)).toBe("input.txt\n");
-	await f.finish(true); expect(settled.filter(item => item.settlement.observation === "observed")).toMatchObject([{ feedback: "before", served: true,
-		settlement: { match: { matched: true, adoption: { status: "rejected" } } } }]);
+	await expect.poll(() => updated).toBe(true); await nextTurn(); expect(settled.filter(item => item.feedback === "before")).toEqual([]);
+	gate.release(); expect(await result).toEqual(await f.oracle(tool, args));
+	await f.finish(true); expect(settled.filter(item => item.feedback === "before")).toMatchObject([{
+		served: true, settlement: !shared ? { observation: "observed", match: { matched: true, adoption: { status: "rejected" } } }
+			: { observation: "unobserved", cause: { code: "superseded" } },
+	}]);
 	expectHiddenCompute(f.actors.at(-1)!.computation!, true);
 });
 
 test.for([false, true])("reconstructs shared searches after cancellation and namespace changes (cancel all: %s)", async (cancelAll, { skip }) => {
 	const cwd = await directories.create();
-	await writeFile(path.join(cwd, "a.txt"), "one\ntwo\nthree\n");
-	await writeFile(path.join(cwd, ".ignore"), "ignored.txt\n");
-	await writeFile(path.join(cwd, "ignored.txt"), "two ignored\n");
+	await writeText(cwd, "a.txt", "one\ntwo\nthree\n");
+	await writeText(cwd, ".ignore", "ignored.txt\n");
+	await writeText(cwd, "ignored.txt", "two ignored\n");
 	const profile = await createClosedSearchProfile(cwd);
 	if (!profile.invocations.has("grep")) { await profile.pool.dispose(); return skip("qualified rg unavailable"); }
 	const gate = gated(), joined = deferred(), controllers = [new AbortController(), new AbortController()];
@@ -453,8 +465,8 @@ test.for([false, true])("reconstructs shared searches after cancellation and nam
 	];
 	for (const query of queries) expect(await f.execute(query.tool, query.input)).toEqual(await f.oracle(query.tool, query.input));
 	expect(f.fallbacks).toEqual([]);
-	await writeFile(path.join(cwd, "a.txt"), "two changed\n");
-	await writeFile(path.join(cwd, "added.txt"), "two new\n");
+	await writeText(cwd, "a.txt", "two changed\n");
+	await writeText(cwd, "added.txt", "two new\n");
 	for (const query of queries) expect(await f.execute(query.tool, query.input)).toEqual(await f.oracle(query.tool, query.input));
 });
 
@@ -522,11 +534,11 @@ test.for(["independent", "unchanged", "batch", "batch-known", "mismatch-text", "
 	tools.push(createWriteTool(cwd));
 	const roots = Array.from({ length: count }, (_, index) => ({ tool: mutation ? "write" : names[0]!, args: mutation ? { path: "root-0.txt", content: "prepared\n" }
 		: { path: `root-${index}.txt`, offset: normalized ? 1 : 2, limit: normalized ? 10 : 1 } }));
-	for (const root of roots) if (mode !== "missing-input" && mode !== "independent-create") await writeFile(path.join(cwd, root.args.path), normalized
+	for (const root of roots) if (mode !== "missing-input" && mode !== "independent-create") await writeText(cwd, root.args.path, normalized
 		? '{"failedTests":[],"artifact":"abc","duration":14,"pid":123,"tempPath":"/tmp/actual"}\n' : "one\ntwo\nthree\n");
-	await writeFile(path.join(cwd, "child.txt"), "child\n");
-	if (learning) await writeFile(path.join(cwd, "unused.txt"), "unused\n");
-	if (wrong) await writeFile(path.join(cwd, "discarded.txt"), "discarded\n");
+	await writeText(cwd, "child.txt", "child\n");
+	if (learning) await writeText(cwd, "unused.txt", "unused\n");
+	if (wrong) await writeText(cwd, "discarded.txt", "discarded\n");
 	const child = { tool: names[1]!, args: { path: dependent ? "root-0.txt" : "child.txt" } };
 	const expected = await Promise.all(roots.map(root => mutation ? { content: [fauxText("Successfully wrote 9 bytes to root-0.txt")] }
 		: reader.execute("oracle", root.args)));
@@ -535,8 +547,8 @@ test.for(["independent", "unchanged", "batch", "batch-known", "mismatch-text", "
 		content: normalized ? predicted ? [fauxText(JSON.stringify({ failedTests: mode === "canonical-mismatch" ? ["a.test.ts:3"] : [], artifact: "abc" }))] : canonicalize(result.content)
 			: predicted && textMismatch ? [fauxText("incorrect forecast")] : result.content, isError: predicted && mode === "mismatch-error" }));
 	if (normalized) expect(canonicalize(expected[0]!.content)).toEqual([fauxText('{"failedTests":[],"artifact":"abc"}')]);
-	let requests = 0, drafts = 0, rootContext: import("@earendil-works/pi-ai").Context | undefined, observationSignal: AbortSignal | undefined;
-	const privateContexts: import("@earendil-works/pi-ai").Context[] = [], executed: string[] = [];
+	let requests = 0, drafts = 0, rootContext: Context | undefined, observationSignal: AbortSignal | undefined;
+	const privateContexts: Context[] = [], executed: string[] = [];
 	const settings = { tools: mode === "filtered-batch" ? [names[0]!] : undefined, drafterEnabled: !seeding, maxConcurrentActions: 3, drafterMaxDepth: mode === "depth-zero" ? 0 : mode === "denied-child" ? 2 : 1,
 		candidateLimit: mode === "unchanged" ? 3 : 1, predictionTimeoutMs: 30_000, drafterTaskMaxRequests: mode === "budget" ? 2 : repairBudget ? 3 : 32 };
 	const f = systemHost(cwd, tools, { actionSemantics: semantics,
@@ -560,9 +572,9 @@ test.for(["independent", "unchanged", "batch", "batch-known", "mismatch-text", "
 			requests++; expect(options?.apiKey).toBe("shared-credential");
 			if (changed && context.messages.length) return fauxAssistantMessage("done");
 			if (mode === "unchanged" && rootContext && !context.messages.length) return fauxAssistantMessage("No alternative.");
-			if (context.tools?.[0]?.name === "speculative_continuations") return fauxAssistantMessage(fauxToolCall("speculative_continuations", {
+			if (context.tools?.[0]?.name === "speculative_continuations") return toolReply("speculative_continuations", {
 				scopes: [[...roots.map((_, index) => `root-${index}`), ...extraCall ? ["unknown"] : []]],
-			}));
+			});
 			if (context.tools?.[0]?.name === "speculative_observations") {
 				observationSignal = options!.signal;
 				const payload = JSON.parse(String(context.messages.at(-1)!.content).split("\n").slice(1).join("\n"));
@@ -580,20 +592,20 @@ test.for(["independent", "unchanged", "batch", "batch-known", "mismatch-text", "
 				if (mode === "abort-observation") await new Promise((_, reject) => options!.signal!.addEventListener("abort", () => reject(options!.signal!.reason), { once: true }));
 				if (actualFirst) await forecast.promise;
 				if (mode === "request-failure" || mode === "actual-before-failure") throw new Error("observation transport failure");
-				const response = fauxAssistantMessage(fauxToolCall("speculative_observations", { results: predictedRoots.map(root => { const index = roots.indexOf(root); return {
+				const response = toolMessage(fauxToolCall("speculative_observations", { results: predictedRoots.map(root => { const index = roots.indexOf(root); return {
 					callID: mode === "malformed-observation" ? "unknown" : `root-${index}`, isError: mode === "malformed-type" || mode === "actual-before-malformed" ? "false" : mode === "mismatch-error",
 					...(mode === "malformed-extra" ? { score: 1_000_000 } : {}), ...(mode === "mismatch-exit" ? { exitCode: 7 } : {}),
 					content: normalized ? [fauxText(JSON.stringify({ failedTests: mode === "canonical-mismatch" ? ["a.test.ts:3"] : [], artifact: "abc", duration: 999, pid: 456, tempPath: "/tmp/predicted" }))]
 						: textMismatch || actualFirst ? [fauxText("incorrect forecast")] : expected[index]!.content,
-				}; }) }), { stopReason: "toolUse" });
+				}; }) }));
 				return { ...response, usage: { ...response.usage, input: 11, output: 7, totalTokens: 18 } };
 			}
-			if (++drafts === 1) { rootContext = context; return fauxAssistantMessage([...rootDraft,
-				...extraCall ? [fauxToolCall(mode === "unknown-batch" ? "unavailable" : child.tool, child.args, { id: "unknown" })] : []], { stopReason: "toolUse" }); }
+			if (++drafts === 1) { rootContext = context; return toolMessage([...rootDraft,
+				...extraCall ? [fauxToolCall(mode === "unknown-batch" ? "unavailable" : child.tool, child.args, { id: "unknown" })] : []]); }
 			privateContexts.push(context); const discarded = wrong && privateContexts.length === 1;
 			if (inflight && discarded) { observationSignal = options!.signal; firstResult.resolve(); await forecast.promise; }
-			return fauxAssistantMessage(fauxToolCall(child.tool, discarded ? { path: "discarded.txt" } : child.args,
-				{ id: "child" }), { stopReason: "toolUse" });
+			return toolMessage(fauxToolCall(child.tool, discarded ? { path: "discarded.txt" } : child.args,
+				{ id: "child" }));
 		}, getDraftOptions: () => ({ apiKey: "shared-credential" }),
 	}, settings);
 	await using _cleanup = onExit(async () => { release.resolve(); forecast.resolve(); firstResult.resolve(); await f.dispose(); await sandbox.dispose(); });
@@ -647,15 +659,15 @@ test.for(["independent", "unchanged", "batch", "batch-known", "mismatch-text", "
 	if (mode === "canonical-unbound") bound = false;
 	if (retired) {
 		changed = true; allow = !mode.endsWith("-fallback");
-		await writeFile(path.join(cwd, roots[0]!.args.path), "four\nfive\nsix\n");
-		if (stale) await writeFile(path.join(cwd, "child.txt"), "fresh\n");
+		await writeText(cwd, roots[0]!.args.path, "four\nfive\nsix\n");
+		if (stale) await writeText(cwd, "child.txt", "fresh\n");
 	}
 	if (mode === "parent-miss") await f.execute(names[0]!, { path: "child.txt" });
 	else for (const root of roots) expect(await f.execute(root.tool, root.args)).toMatchObject(retired ? await f.oracle(root.tool, root.args) : expected[roots.indexOf(root)]!);
 	const consumer = cross ? names[2]! : child.tool, args = unused ? { path: "unused.txt" } : child.args;
 	if (!retired) {
 		settings.drafterEnabled = false; await f.finish(); await f.start("child");
-		if (stale) await writeFile(path.join(cwd, "child.txt"), "fresh\n");
+		if (stale) await writeText(cwd, "child.txt", "fresh\n");
 		allow = !mode.endsWith("-fallback");
 		expect(textOutput(await f.execute(consumer, args))).toBe(dependent ? "prepared\n" : stale ? "fresh\n" : unused ? "unused\n" : "child\n");
 	}
@@ -685,9 +697,9 @@ test.for(["completed", "inflight", "forecast", "binding", "parent-binding", "rev
 	const unchanged = mode === "unchanged", both = mode === "both", deep = mode === "deep";
 	const names = ["inspect_rows", "render_rows"], { actionSemantics, tools, world, resolveInvocation } = readScenario(cwd, names);
 	const roots = ["a", "b"].map(id => ({ id, path: `${id}.txt`, text: `${id}-real\n` }));
-	for (const root of roots) await writeFile(path.join(cwd, root.path), root.text);
+	for (const root of roots) await writeText(cwd, root.path, root.text);
 	for (const branch of ["a", "b", "ab"]) for (const version of ["old", "new"]) for (const suffix of ["", ".next"])
-		await writeFile(path.join(cwd, `${branch}-${version}${suffix}.txt`), `${branch}-${version}${suffix}\n`);
+		await writeText(cwd, `${branch}-${version}${suffix}.txt`, `${branch}-${version}${suffix}\n`);
 	const calls: { path: string; signal: AbortSignal }[] = [], forecasts: AbortSignal[] = [], executed: string[] = [];
 	const settings = { drafterEnabled: true, candidateLimit: 1, maxConcurrentActions: 3, predictionTimeoutMs: 30_000, drafterMaxDepth: deep ? 2 : 1, drafterTaskMaxRequests: mode === "budget" ? 8 : 32 };
 	const f = systemHost(cwd, tools, { actionSemantics,
@@ -707,18 +719,18 @@ test.for(["completed", "inflight", "forecast", "binding", "parent-binding", "rev
 			const tool = context.tools?.[0]?.name;
 			if (tool === "speculative_continuations") {
 				expect(JSON.stringify(context.messages)).not.toMatch(/a-real|b-real|a-wrong|b-wrong/);
-				return fauxAssistantMessage(fauxToolCall(tool, mode === "extra-scope" ? { scopes: [["a"]], extra: "invalid" }
-					: { scopes: mode === "malformed-scope" ? [["unknown"]] : mode === "duplicate-scope" ? [["a"], ["a"]] : scopes }));
+				return toolReply(tool, mode === "extra-scope" ? { scopes: [["a"]], extra: "invalid" }
+					: { scopes: mode === "malformed-scope" ? [["unknown"]] : mode === "duplicate-scope" ? [["a"], ["a"]] : scopes });
 			}
 			if (tool === "speculative_observations") {
 				const payload = JSON.parse(String(context.messages.at(-1)!.content).split("\n").slice(1).join("\n"));
 				const ids: string[] = payload.candidates.map((item: { call: { id: string } }) => item.call.id);
 				if (ids.length === 1 && ids[0] === "b" && !payload.observations.length) expect(JSON.stringify(context.messages)).not.toContain("a-real");
 				if (mode === "forecast" && ids.includes("a")) { forecasts.push(options!.signal!); await delayed.promise; }
-				return fauxAssistantMessage(fauxToolCall(tool, { results: payload.candidates.map(({ call }: { call: { id: string; arguments: { path: string } } }) => ({
+				return toolReply(tool, { results: payload.candidates.map(({ call }: { call: { id: string; arguments: { path: string } } }) => ({
 					callID: call.id, isError: false, content: [fauxText(call.id === "a" ? unchanged ? "a-real\n" : "a-wrong\n"
 						: call.id === "b" ? both ? "b-wrong\n" : "b-real\n" : `${call.arguments.path.replace(/\.txt$/, "")}\n`)],
-				})) }));
+				})) });
 			}
 			if (!context.messages.length) return fauxAssistantMessage(roots.map(root => fauxToolCall(names[0]!, { path: root.path }, { id: root.id })));
 			const results = context.messages.filter(message => message.role === "toolResult"), last = results.at(-1)!;
@@ -733,7 +745,7 @@ test.for(["completed", "inflight", "forecast", "binding", "parent-binding", "rev
 			}
 			calls.push({ path: file, signal: options!.signal! });
 			if ((mode === "inflight" && file.includes("old") || mode === "reverse" && file === "a-old.txt") && !file.includes(".next")) await delayed.promise;
-			return fauxAssistantMessage(fauxToolCall(names[1]!, { path: file }, { id: `child-${file.replace(/\.txt$/, "")}` }));
+			return toolReply(names[1]!, { path: file }, { id: `child-${file.replace(/\.txt$/, "")}` });
 		},
 	}, settings);
 	await using _cleanup = onExit(async () => { for (const gate of gates) gate.resolve(); delayed.resolve(); await f.dispose(); });
@@ -763,7 +775,7 @@ test.for(["completed", "inflight", "forecast", "binding", "parent-binding", "rev
 	gates[1]!.resolve(); await f.ready(["a.txt", "b.txt"]);
 	for (const root of roots) expect(textOutput(await f.execute(names[0]!, { path: root.path }))).toBe(root.text);
 	settings.drafterEnabled = false; await f.finish(); await f.start("children");
-	if (mode === "stale") await writeFile(path.join(cwd, "a-new.txt"), "fresh\n");
+	if (mode === "stale") await writeText(cwd, "a-new.txt", "fresh\n");
 	for (const file of expected) {
 		expect(textOutput(await f.execute(names[1]!, { path: file }))).toBe(mode === "stale" && file === "a-new.txt" ? "fresh\n" : `${file.replace(/\.txt$/, "")}\n`);
 		const consumed = () => f.actors.find(event => JSON.parse(event.actualAction).input.path === file);
@@ -788,8 +800,8 @@ test.for(["completed", "inflight", "forecast", "binding", "parent-binding", "rev
 
 test.for(["dependent", "independent"])("preserves sibling resource effects outside observation scopes (%s)", async mode => {
 	const cwd = await directories.create(), sandbox = new WorkspaceSandboxService(), release = deferred();
-	await writeFile(path.join(cwd, "selector.txt"), "select\n"); await writeFile(path.join(cwd, "written.txt"), "before\n");
-	await writeFile(path.join(cwd, "independent.txt"), "independent\n");
+	await writeText(cwd, "selector.txt", "select\n"); await writeText(cwd, "written.txt", "before\n");
+	await writeText(cwd, "independent.txt", "independent\n");
 	const child = { path: mode === "dependent" ? "written.txt" : "independent.txt" }, tools = [createReadTool(cwd), createWriteTool(cwd)];
 	let drafted = 0; const executed: string[] = [], settings = { drafterEnabled: true, candidateLimit: 1, drafterMaxDepth: 1, maxConcurrentActions: 3 };
 	const f = systemHost(cwd, tools as Parameters<typeof systemHost>[1], {
@@ -801,11 +813,11 @@ test.for(["dependent", "independent"])("preserves sibling resource effects outsi
 		} } })),
 		complete: async (_model, context) => {
 			const tool = context.tools?.[0]?.name;
-			if (tool === "speculative_continuations") return fauxAssistantMessage(fauxToolCall(tool, { scopes: [["selector"]] }));
-			if (tool === "speculative_observations") return fauxAssistantMessage(fauxToolCall(tool, { results: [{ callID: "selector", isError: false, content: [fauxText("select\n")] }] }));
+			if (tool === "speculative_continuations") return toolReply(tool, { scopes: [["selector"]] });
+			if (tool === "speculative_observations") return toolReply(tool, { results: [{ callID: "selector", isError: false, content: [fauxText("select\n")] }] });
 			if (!context.messages.length) return fauxAssistantMessage([fauxToolCall("read", { path: "selector.txt" }, { id: "selector" }),
 				fauxToolCall("write", { path: "written.txt", content: "after\n" }, { id: "writer" })]);
-			drafted++; return fauxAssistantMessage(fauxToolCall("read", child));
+			drafted++; return toolReply("read", child);
 		},
 	}, settings);
 	await using _cleanup = onExit(async () => { release.resolve(); await f.dispose(); await sandbox.dispose(); });
@@ -838,9 +850,9 @@ test.each(["ordered", "independent", "dependent"])("adopts only the proven effec
 		} } }],
 		complete: async (_model, context) => {
 			const observing = context.tools?.[0]?.name === "speculative_observations", index = observing ? drafted - 1 : drafted++, step = steps[index]!;
-			return fauxAssistantMessage(fauxToolCall(observing ? "speculative_observations" : step.tool,
+			return toolMessage(fauxToolCall(observing ? "speculative_observations" : step.tool,
 				observing ? { results: [{ callID: `draft-${index}`, isError: false, content: [fauxText(step.tool === "write" ? `Successfully wrote ${step.input.content!.length} bytes to ${step.input.path}` : `Successfully replaced 1 block(s) in ${step.input.path}.`)] }] } : step.input,
-				{ id: `draft-${index}` }), { stopReason: "toolUse" });
+				{ id: `draft-${index}` }));
 		},
 		getSettings: () => ({ enabled: true, drafterEnabled: predict, candidateLimit: 1, maxConcurrentActions: 2,
 			drafterMaxDepth: 2, patternAware: { enabled: false } }),
@@ -871,7 +883,7 @@ test.for(["unrelated", "changed", "descendant", "mutation", "mutation-stat", "mu
 	if (process.platform !== "linux" || process.arch !== "x64") return skip("native process backend requires x86-64 Linux");
 	const mutation = change.startsWith("mutation"), metadata = change.endsWith("stat"), split = /split|stale/.test(change), stale = change.endsWith("stale");
 	const native = await createLinuxProcessBenchmark("pi-sealed-result-", mutation ? "overlayfs" : "git"), { workspace: cwd, workspaceSandbox: sandbox } = native;
-	for (const [name, text] of [["a", "original"], ["b", "other"], ["c", "second"]]) await writeFile(path.join(cwd, `${name}.txt`), text + "\n");
+	for (const [name, text] of [["a", "original"], ["b", "other"], ["c", "second"]]) await writeText(cwd, `${name}.txt`, text + "\n");
 	if (mutation) await compileBenchmarkHelper(cwd, "reader", { code: `#include <fcntl.h>\n#include <stdio.h>\n#include <sys/stat.h>\n#include <unistd.h>\nint main(void){char text[64];int f=open("a.txt",O_RDONLY),n=read(f,text,sizeof text);${metadata ? 'struct stat s;if(fstat(f,&s))return 1;dprintf(1,"%llu:%lld:%ld\\n",(unsigned long long)s.st_ino,(long long)s.st_ctim.tv_sec,s.st_ctim.tv_nsec);' : ""}close(f);for(volatile unsigned long i=0;i<600000000ul;i++);return n<0||write(1,text,n)!=n;}\n` });
 	await commitBenchmarkFixture(cwd, "Sealed result reuse");
 	let predict = change === "descendant" || mutation, requests = 0, drafted = 0; const prepared: string[] = [];
@@ -885,11 +897,11 @@ test.for(["unrelated", "changed", "descendant", "mutation", "mutation-stat", "mu
 		resolveInvocation: (tool, input) => resolvePiToolInvocation(tool, input, { cwd, environment: native.environment, shellPath: native.shellPath }),
 		complete: async (_model, context) => {
 			requests++;
-			if (context.tools?.[0]?.name === "speculative_observations") return fauxAssistantMessage(fauxToolCall("speculative_observations", {
+			if (context.tools?.[0]?.name === "speculative_observations") return toolMessage(fauxToolCall("speculative_observations", {
 				results: [{ callID: "draft-0", isError: false, content: [fauxText(mutation ? "Successfully wrote 9 bytes to a.txt" : "original\n")] }],
-			}), { stopReason: "toolUse" });
+			}));
 			const step = steps[drafted]!;
-			return fauxAssistantMessage(fauxToolCall(step.tool, step.input, { id: `draft-${drafted++}` }), { stopReason: "toolUse" });
+			return toolMessage(fauxToolCall(step.tool, step.input, { id: `draft-${drafted++}` }));
 		},
 		getSettings: () => ({ enabled: true, drafterEnabled: predict, candidateLimit: 1, drafterMaxDepth: 1,
 			patternAware: { enabled: false } }),
@@ -902,7 +914,7 @@ test.for(["unrelated", "changed", "descendant", "mutation", "mutation-stat", "mu
 	await expect(readFile(path.join(cwd, "marker"))).rejects.toMatchObject({ code: "ENOENT" });
 	if (!mutation) { await f.finish(true); await f.start("next-prompt"); }
 	await f.execute("write", mutation ? steps[0]!.input : { path: change === "changed" ? "a.txt" : "b.txt", content: "updated\n" });
-	if (mutation) { await f.finish(); await f.start("process"); if (stale) await writeFile(path.join(cwd, "a.txt"), "fresh\n"); }
+	if (mutation) { await f.finish(); await f.start("process"); if (stale) await writeText(cwd, "a.txt", "fresh\n"); }
 	expect(await readText(cwd, "a.txt")).toBe(stale ? "fresh\n" : mutation ? "prepared\n" : change === "changed" ? "updated\n" : "original\n");
 	const expected = execFileSync("/bin/bash", ["-c", body], { cwd, env: native.environment, encoding: "utf8" });
 	expect(textOutput(await f.execute("bash", { command }))).toBe(expected);
