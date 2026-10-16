@@ -87,6 +87,7 @@ type PreparedResource = {
 export class ResourceReadView {
 	private entries = new Map<string, CapturedResource & { readonly bytes: number }>();
 	private owner?: ResourceReadView;
+	private loadOwner = false;
 	private failure?: Error;
 	private capturedBytes = 0;
 	private objectCount = 0;
@@ -129,9 +130,14 @@ export class ResourceReadView {
 		}
 		return resources;
 	}
+	/** Read completed entries without allowing a borrower to load or seal its active owner. */
+	readOnly(load = false): ResourceReadView {
+		this.assertComplete();
+		return Object.assign(new ResourceReadView(0), { entries: this.entries, owner: this, sealed: true, boundary: this.boundary, prepared: this.prepared, loadOwner: load });
+	}
 	/** Keep proven path metadata; payloads and preparations remain with their original owner. */
 	retainMetadata(observations: ReadonlyMap<string, ResourceObservation>, maxBytes: number): ResourceReadView | undefined {
-		this.assertComplete(true);
+		this.assertComplete();
 		if (maxBytes <= 0) return undefined;
 		// The root proof still anchors queries whose retained metadata belongs to another token.
 		let retained = this.boundary?.dependency && observations.has(this.boundary.dependency)
@@ -278,7 +284,7 @@ export class ResourceReadView {
 		this.assertComplete();
 		let owner: ResourceReadView = this;
 		while (owner.owner) owner = owner.owner;
-		const prepared = owner.prepared ??= { lifetime: new RuntimeLifecycleLane(), bindings: new Map() };
+		const prepared = owner.preparations();
 		return prepared.lifetime.admit(async () => {
 			this.assertComplete();
 			const inputEpoch = owner.inputEpoch;
@@ -299,7 +305,7 @@ export class ResourceReadView {
 					if (building) await cached.ready;
 					signal?.throwIfAborted();
 					const dependencies = cached.origin === owner && cached.dependencies && this.dependencies ? new Set([...this.dependencies, ...cached.dependencies]) : undefined;
-					const sourceDependencies = source && cached.origin === source.view ? cached.dependencies : undefined;
+					const sourceDependencies = source && cached.origin.entries === source.view.entries ? cached.dependencies : undefined;
 					const proofs = [...source?.observed(sourceDependencies, false) ?? [], ...cached.proofs ?? []];
 					return await cached.destination.prepared!.lifetime.admit(async () => {
 						this.assertComplete(); cached.destination.assertComplete();
@@ -372,7 +378,7 @@ export class ResourceReadView {
 				const destination = pending.destination = owner.sealed && this.missing ? (await this.missing()).view : owner;
 				pending.cancellation.signal.throwIfAborted();
 				this.assertComplete(); destination.assertComplete();
-				const retention = destination.prepared ??= { lifetime: new RuntimeLifecycleLane(), bindings: new Map() };
+				const retention = destination.preparations();
 				if (inputEpoch === owner.inputEpoch && !destination.sealed && destination.bytes + bytes <= destination.maxBytes) {
 					let entries = retention.bindings.get(binding);
 					if (!entries) retention.bindings.set(binding, entries = new Map());
@@ -391,15 +397,12 @@ export class ResourceReadView {
 		root?: string | { readonly root: string; readonly physicalRoot: string }, lookup = this.lookup, missing = this.missing,
 		acceptProofs = this.acceptProofs, validateInputs = this.validateInputs): Promise<T> {
 		return collectResourceComputation(async () => {
-			this.assertComplete();
-			const view = new ResourceReadView(0);
-			view.entries = this.entries; view.owner = this; view.sealed = true; view.dependencies = new Set(); view.lookup = lookup; view.missing = missing;
-			view.onForeignInputs = this.onForeignInputs;
-			view.acceptProofs = acceptProofs; view.collectProofs = this.collectProofs; view.observed = observed; view.validateInputs = validateInputs;
+			const view = this.readOnly(true);
+			view.dependencies = new Set();
+			Object.assign(view, { lookup, missing, acceptProofs, observed, validateInputs, onForeignInputs: this.onForeignInputs, collectProofs: this.collectProofs });
 			try {
 				if (typeof root === "object") view.boundary = { root: root.root, physicalRoot: root.physicalRoot };
 				else if (root === undefined || this.boundary && filesystemPathKey(root) === filesystemPathKey(this.boundary.root)) {
-					view.boundary = this.boundary;
 					if (this.boundary?.dependency) view.dependencies.add(this.boundary.dependency);
 				} else if (filesystemPathKey(root) === filesystemPathKey(path.parse(root).root)) {
 					view.boundary = { root, physicalRoot: root };
@@ -424,8 +427,10 @@ export class ResourceReadView {
 	}
 	seal(): void { if (this.pending) this.failure ??= new Error("resource_snapshot_capture_pending"); this.assertComplete(); this.sealed = true; }
 	dispose(): void | Promise<void> {
-		if (!this.owner) { for (const entry of this.entries.values()) this.releaseObject(entry); this.entries.clear(); this.objectCount = 0; }
 		this.failure = new Error("resource_snapshot_disposed");
+		if (this.owner) return;
+		for (const entry of this.entries.values()) this.releaseObject(entry);
+		this.entries.clear(); this.objectCount = 0;
 		return this.disposal ??= this.prepared ? this.prepared.lifetime.close(async () => {
 			await this.prepared!.lifetime.drain();
 			await Promise.allSettled([this.pending, ...[...this.prepared!.bindings.values()].flatMap(entries => [...entries.values()].filter(resource => resource.destination === this).map(resource =>
@@ -434,14 +439,13 @@ export class ResourceReadView {
 		}) : this.pending?.then(() => {}, () => {});
 	}
 	private releaseObject(entry: CapturedResource): void {
-		if (!entry.object) return;
-		const prepared = this.prepared ??= { lifetime: new RuntimeLifecycleLane(), bindings: new Map() };
-		void prepared.lifetime.release(entry.object);
+		if (entry.object) void this.preparations().lifetime.release(entry.object);
 	}
+	private preparations() { return this.prepared ??= { lifetime: new RuntimeLifecycleLane(), bindings: new Map() }; }
 	private async get(target: string, scope: ResourceDependency["scope"]): Promise<CapturedResource> {
 		this.assertComplete();
 		if (this.owner && this.boundary && !containsFilesystemPath(this.boundary.root, target)) this.unproven(target);
-		if (this.owner && !this.owner.sealed) await this.owner.get(target, scope);
+		if (this.loadOwner && this.owner && !this.owner.sealed) await this.owner.get(target, scope);
 		if (this.load && !this.sealed) {
 			const pending = (this.pending ?? Promise.resolve()).then(() => {
 				const { entry } = this.entry(target, followsResource(scope));
@@ -558,7 +562,9 @@ export async function collectResourceComputation<T>(operation: () => T | Promise
 const resourceSize = (entry: CapturedResource) => (entry.type === "file" ? entry.content?.length : undefined) ?? entry.metadata?.size;
 
 function resourceMetadata(entry: CapturedResource, dependency: string): CapturedResource {
-	const metadata = entry.metadata?.dependency === dependency ? entry.metadata : { dependency, computation: entry.metadata?.computation, size: entry.type === "file" ? entry.content?.length : undefined };
+	const metadata = { ...entry.metadata, dependency,
+		size: entry.type === "file" && entry.content && entry.dependency === dependency ? entry.content.length
+			: entry.metadata?.dependency === dependency ? entry.metadata.size : undefined };
 	return entry.type === "alias" ? entry : { type: entry.type, realPath: entry.realPath, dependency, computation: metadata.computation, metadata };
 }
 
@@ -634,10 +640,8 @@ export class ResourceVersionManager {
 	retain(token: ResourceVersionToken, metadataBytes?: number): ResourceVersionToken {
 		if (!this.open || token.manager !== this || token.root !== this.root || !token.observations.size)
 			throw new Error("resource_version_owner_changed");
-		const inputs = token.view?.retained ? token.view : undefined;
-		inputs?.assertComplete(true);
 		const observations = new Map(token.observations);
-		const view = metadataBytes === undefined ? undefined : inputs?.retainMetadata(observations, metadataBytes);
+		const view = metadataBytes === undefined || !token.view?.retained ? undefined : token.view.retainMetadata(observations, metadataBytes);
 		this.references++;
 		return { ...token, observations, view, watching: false, preciseContent: Object.freeze([]), release: releaseOnce(() => this.releaseCapture(observations, view)) };
 	}

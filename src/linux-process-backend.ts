@@ -31,7 +31,7 @@ import { execHostText as execText, resolveHostExecutable } from "./executable-pa
 import { assertNoSymlinkPath, cachedCapture, captureFilesystemEntry, captureStableFile, hashExecutableFile, mapFilesystem, rememberCapture, sameFilesystemIdentity, sharedWalk, walkFilesystemPath } from "./filesystem-evidence.ts";
 import { captureHeldDescriptorInputs, inspectHeldExecProcess, LinuxHeldExecBoundary, listenUnixSocket, writeProcessChannel, resolveLinuxExecHelper, type HeldExecDecision,
 	type HeldExecProcess, type HeldExecSnapshot, type HeldExecTiming, type HeldExecClock, descriptorInputs, descriptorEffects, inheritedTracer, type ProcessResourceGraph } from "./linux-held-exec.ts";
-import { emptyWorldReuseMetrics, snapshotExecutionScope, type ExecutionScope, type ExecutionOperationAdoption, type ExecutionOperationBinding, type ExecutionWorldStorageControl,
+import { emptyWorldReuseMetrics, snapshotExecutionScope, type ExecutionScope, type ExecutionOperationAdoption, type ExecutionResourceContext, type ExecutionOperationBinding, type ExecutionWorldStorageControl,
 	type WorldReuseMetrics } from "./execution-world.ts";
 import { type ProcessReusePlan, ProcessReusePlanner } from "./reuse-planner.ts";
 import { ProvenanceCertificateStore, type ProvenanceStoreOptions, type VerifiedArtifactClosure } from "./reuse-store.ts";
@@ -553,15 +553,12 @@ export class LinuxProcessReuseBackend {
 		};
 	}
 
-	async open(input: {
+	async open(input: Omit<ExecutionResourceContext, "inputs" | "onInputSource"> & {
 		readonly sourceRoot: string;
 		readonly workspace: SandboxWorkspaceContext;
 		readonly invocation: ToolProcessInvocation | ProcessExecutionBinding;
 		readonly scope?: ExecutionScope;
 		readonly signal?: AbortSignal;
-		readonly onOperationAdopted?: (adoption: ExecutionOperationAdoption) => void;
-		readonly onOperationJoinable?: (available: () => boolean) => void;
-		readonly acceptOperationScope?: (scope: ExecutionScope, salvage?: boolean) => boolean;
 	}): Promise<LinuxProcessSession> {
 		return this.withProducer(async (): Promise<LinuxProcessSession> => {
 			const owner = nativeWorkspaceOwner(input.workspace);

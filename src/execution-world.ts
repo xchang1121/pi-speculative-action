@@ -122,6 +122,16 @@ export interface ExecutionOperationAdoption {
 	readonly computation?: TimelineDependency;
 }
 
+/** Backend resources remain scoped and revocable; discovery alone grants no adoption authority. */
+export interface ExecutionResourceContext {
+	readonly inputs?: (path?: string) => Iterable<object>;
+	readonly onInputSource?: (source: object) => void;
+	readonly onOperationAdopted?: (adoption: ExecutionOperationAdoption) => void;
+	/** Scheduling hint only; the backend still proves every join. */
+	readonly onOperationJoinable?: (available: () => boolean) => void;
+	readonly acceptOperationScope?: (scope: ExecutionScope, salvage?: boolean) => boolean;
+}
+
 /** Input-only owners omit output and can serve proven queries, never the source action's result or effects. */
 export type WorldOutput<Output> = { readonly output: Output; readonly inputsOnly?: never } | { readonly inputsOnly: true; readonly output?: never };
 

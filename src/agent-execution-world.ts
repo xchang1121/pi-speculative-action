@@ -6,7 +6,7 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { BigIntStats } from "node:fs";
 import { CapturedFilesystemObject, sameFilesystemIdentity, type CapturedFilesystemTransfer, type StableFilesystemCapture } from "./filesystem-evidence.ts";
 import { PI_ACTION_SEMANTICS, type ActionKey, type ActionSemanticsRegistry } from "./action-semantics.ts";
-import type { ExecutionWorld, ExecutionScope, ExecutionOperationAdoption, WorldBranch, WorldOutput, WorldCheckpoint, WorldResultCapture } from "./execution-world.ts";
+import type { ExecutionWorld, ExecutionScope, ExecutionResourceContext, WorldBranch, WorldOutput, WorldCheckpoint, WorldResultCapture } from "./execution-world.ts";
 import { effectCommitFailure } from "./effect-transaction.ts";
 import { effectCapabilitiesCover, RESOURCE_OBSERVATION_EFFECTS, WORKSPACE_PATH_MUTATION_EFFECTS } from "./effect-model.ts";
 import { captureResourceVersion, collectResourceComputation, invalidateResourceInputs, releaseResourceVersion, resourceProofBytes, validateResourceVersion,
@@ -16,15 +16,11 @@ import type { ToolFilesystemOperations, ToolFilesystemStat, ToolInvocation, Tool
 import { TimelineInterval } from "./task-timing.ts";
 
 /** Host tool call supplied to any OS sandbox or safe local substitute. */
-export type SpeculativeToolExecutionContext = Parameters<NonNullable<WorldBranch<ToolSettlement>["reconstruct"]>>[0] & {
+export type SpeculativeToolExecutionContext = Parameters<NonNullable<WorldBranch<ToolSettlement>["reconstruct"]>>[0] & ExecutionResourceContext & {
 	readonly cwd: string;
 	readonly tool: AgentTool;
 	readonly toolName: string;
 	readonly executionScope?: ExecutionScope;
-	readonly onOperationAdopted?: (adoption: ExecutionOperationAdoption) => void;
-	/** Live acquisition capability used only to avoid cancelling work the current Actor can join. */
-	readonly onOperationJoinable?: (available: () => boolean) => void;
-	readonly acceptOperationScope?: (scope: ExecutionScope, salvage?: boolean) => boolean;
 	/** Optional immutable parent state for source-neutral multi-step execution. */
 	readonly parentCheckpoint?: WorldCheckpoint;
 };
@@ -88,7 +84,7 @@ export function createResourceSnapshotExecutionWorld(
 				if (!execute || context.parentCheckpoint) throw new Error("Resource execution context is not supported");
 				const query = await evaluateResourceQuery(undefined, context, invocation?.filesystemRoot ?? context.cwd, view => execute(view, context), actionSemantics, operations.maxBytes(), true);
 				if (!query) throw new Error("resource_snapshot_budget_exceeded");
-				return resourceSnapshotBranch({ output: query.output }, query.versions, context.action, actionSemantics);
+				return resourceSnapshotBranch({ output: query.output }, query.versions, context.action, actionSemantics, query.inputSource);
 			},
 		} } : {}),
 	};
@@ -127,13 +123,14 @@ export class ResourceObjectInputs {
 	}
 	lend(maxBytes: number) {
 		const loans: { readonly transfer: CapturedFilesystemTransfer; readonly release: () => void }[] = [], pins = new Set<number>();
+		const release = () => { for (const loan of loans) loan.release(); };
 		try {
-			for (const view of new Set(this.views())) for (const loan of view.lendObjects(object => !this.produced || this.produced.has(object))) {
+			for (const view of new Set(this.views())) for (const loan of view.lendObjects(object => this.produced?.has(object) ?? true)) {
 				if (pins.has(loan.transfer.fd) || loans.length >= 64 || loan.transfer.bytesRead > maxBytes) { loan.release(); continue; }
 				pins.add(loan.transfer.fd); maxBytes -= loan.transfer.bytesRead; loans.push(loan);
 			}
-		} catch (error) { for (const loan of loans) loan.release(); throw error; }
-		return { transfer: loans.map(loan => loan.transfer), release: () => { for (const loan of loans) loan.release(); } };
+		} catch (error) { release(); throw error; }
+		return { transfer: loans.map(loan => loan.transfer), release };
 	}
 	/** Call-local transport owns pins until acknowledged; only the caller's original version can retain the returned inputs. */
 	static receive(transfers: readonly CapturedFilesystemTransfer[], maxBytes: number) {
@@ -152,16 +149,17 @@ export class ResourceObjectInputs {
 
 /** Whole queries and independent Actor inputs share proof composition; completed inputs survive consumer failure. */
 async function evaluateResourceQuery<Output>(
-	inputs: readonly ResourceVersionToken[] | undefined, request: Pick<Parameters<NonNullable<WorldBranch<ToolSettlement>["reconstruct"]>>[0], "signal" | "inputs">,
+	inputs: readonly ResourceVersionToken[] | undefined, { signal, inputs: lookup, onInputSource: publish }: ExecutionResourceContext & { readonly signal: AbortSignal },
 	root: string, execute: (view: ResourceReadView) => Promise<Output>, semantics: ActionSemanticsRegistry, maxBytes: number,
 	retainMetadata = false, validation?: "prepared" | "output", transfer?: (versions: ResourceVersionToken[]) => boolean,
 ) {
-	request.signal.throwIfAborted();
+	signal.throwIfAborted();
 	const initial = inputs ? undefined : await captureResourceVersion(undefined, root, semantics, maxBytes);
 	initial?.view?.seal();
 	const versions = inputs ?? [initial!], version = versions[0]!, view = version.view!;
 	const retained: ResourceVersionToken[] = [];
-	let missing: Promise<ResourceVersionToken> | undefined, captured: ResourceVersionToken | undefined;
+	let missing: Promise<ResourceVersionToken> | undefined, captured: ResourceVersionToken | undefined, sealed: ResourceVersionToken[] | undefined;
+	const inputSource = publish && Object.freeze({});
 	// Keep the initiating view first: it owns the query's root resolution, even when another source answers first.
 	const proofs = new Map<ResourceVersionToken, Map<string, ResourceObservation>>([[version, new Map()]]);
 	const observe = (token: ResourceVersionToken, dependencies: ReadonlySet<string> | undefined, commit = true) => {
@@ -177,15 +175,19 @@ async function evaluateResourceQuery<Output>(
 	const observeOwner = (tokens: readonly ResourceVersionToken[], dependencies: ReadonlySet<string> | undefined, commit = true) =>
 		dependencies ? [observe(tokens[0]!, dependencies, commit)] : tokens.map(token => observe(token, undefined, commit));
 	try { return await collectResourceComputation(async () => {
+		if (inputSource) { resourceVersions.set(inputSource, versions); publish!(inputSource); }
 		view.assertComplete(true);
-		let output: Output, completed = false, sealed: ResourceVersionToken[] | undefined;
+		let output: Output, completed = false;
 		try { output = await view.evaluate(execute, (dependencies, commit) => observeOwner(versions, dependencies, commit), root,
 			function* (target) {
-				const owners = [versions, ...[...request.inputs?.(target) ?? []].flatMap(source => resourceVersions.has(source) ? [resourceVersions.get(source)!] : [])];
-				for (const tokens of owners) for (const token of tokens) if (token.view) yield { view: token.view,
+				const owners = [versions, ...[...lookup?.(target) ?? []].map(source => resourceVersions.get(source) ?? [])];
+				for (const tokens of owners) for (const token of tokens) if (token.view) yield { view: token.view.readOnly(),
 					observed: (dependencies, commit) => dependencies ? [observe(token, dependencies, commit)] : observeOwner(tokens, undefined, commit) };
 			}, async () => {
-				const token = await (missing ??= captureResourceVersion(undefined, root, semantics, maxBytes).then(token => captured = token));
+				const token = await (missing ??= captureResourceVersion(undefined, root, semantics, maxBytes).then(token => {
+					if (inputSource) resourceVersions.set(inputSource, [...versions, token]);
+					return captured = token;
+				}));
 				if (!token.view) throw new Error("resource_snapshot_budget_exceeded");
 				return { view: token.view, observed: (dependencies, commit) => [observe(token, dependencies, commit)] };
 			}, inputs => inputs.map(input => {
@@ -199,21 +201,25 @@ async function evaluateResourceQuery<Output>(
 				const owned = captured ? [captured] : [];
 				for (const [token, observations] of proofs) if (observations.size && token !== captured) {
 					const selected = observations.size === token.observations.size ? token : { ...token, observations };
-					const proof = retained.includes(selected) ? selected : selected.manager.retain(retainMetadata ? selected : { ...selected, view: undefined }, retainMetadata ? maxBytes - bytes : undefined);
+					const proof = retained.includes(selected) ? selected : selected.manager.retain(selected, retainMetadata ? maxBytes - bytes : undefined);
 					if (proof !== selected) retained.push(proof);
 					owned.push(proof); bytes += proof.view?.bytes ?? 0;
 				}
-				if (retainMetadata && resourceProofBytes(owned) + bytes > maxBytes) return undefined;
 				if (completed && validation === "output") await validateResourceInputs(owned, true);
-				if (!transfer) request.signal.throwIfAborted();
-				if (!transfer || transfer(owned)) { captured = undefined; retained.length = 0; }
-				if (completed && transfer && validation !== "prepared") request.signal.throwIfAborted();
-				sealed = owned;
+				if (!transfer) signal.throwIfAborted();
+				if (!retainMetadata || resourceProofBytes(owned) + bytes <= maxBytes) {
+					if (!transfer || transfer(owned)) { captured = undefined; retained.length = 0; }
+					sealed = owned;
+				} else if (transfer) sealed = []; // Successful consumption does not require future cache retention.
+				if (completed && transfer && validation !== "prepared") signal.throwIfAborted();
 			} catch (error) { if (completed) throw error; } // Optional input retention preserves the original execution failure.
 		}); }
-		return sealed && { output, versions: sealed };
+		return sealed && { output, versions: sealed, inputSource };
 	}, branch => branch !== undefined); }
-	finally { await TimelineInterval.outside(async () => { await Promise.allSettled(retained.map(releaseResourceVersion)); await captured?.release(); await initial?.release(); }); }
+	finally { await TimelineInterval.outside(async () => {
+		if (inputSource) { if (sealed) resourceVersions.set(inputSource, sealed); else resourceVersions.delete(inputSource); }
+		await Promise.allSettled([...retained, captured, initial].map(releaseResourceVersion));
+	}); }
 }
 
 /** Committed poststates enter the same read view and exact validation as captured inputs. */
@@ -226,14 +232,13 @@ export async function createCommittedResourceInputs(
 }
 
 function resourceSnapshotBranch<Outcome extends WorldOutput<ToolSettlement>>(
-	outcome: Outcome, versions: readonly ResourceVersionToken[], action: ActionKey | undefined, semantics: ActionSemanticsRegistry,
+	outcome: Outcome, versions: readonly ResourceVersionToken[], action: ActionKey | undefined, semantics: ActionSemanticsRegistry, inputSource = Object.freeze({}),
 ) {
 	for (const version of versions) version.view?.seal();
 	if (outcome.inputsOnly && !versions.some(token => token.view?.resources.length || token.view?.hasPreparedInputs)) throw new Error("resource_inputs_empty");
 	// Input revocation releases data, not the old result's immutable freshness evidence.
 	const version = versions[0]!, proofBytes = resourceProofBytes(versions);
 	const executionFingerprint = action?.executionFingerprint;
-	const inputSource = Object.freeze({});
 	resourceVersions.set(inputSource, versions);
 	let owned: readonly ResourceVersionToken[] | undefined = versions;
 	const branch: Omit<WorldBranch<ToolSettlement>, "output" | "inputsOnly"> = {

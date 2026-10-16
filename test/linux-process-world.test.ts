@@ -21,7 +21,7 @@ import { effectCommitFailure } from "../src/effect-transaction.ts";
 import { LinuxProcessReuseBackend, validateTransferredProcessEvidence, type LinuxProcessSession } from "../src/linux-process-backend.ts";
 import { ProcessHandoffRegistry, type ProcessExecutionBinding } from "../src/process-handoff.ts";
 import { resolvePiToolInvocation, createClosedSearchProfile } from "../src/pi-tool-invocation.ts";
-import { createResourceSnapshotExecutionWorld } from "../src/agent-execution-world.ts";
+import { resourceWorld } from "./agent-system-fixture.ts";
 import { summarizeSpeculativeTrace } from "../src/trace-summary.ts";
 import { adaptProcessToolOperations, ProcessExecutionCoordinator } from "../src/process-execution.ts";
 import { PROCESS_CERTIFICATE } from "./process-fixture.ts";
@@ -997,7 +997,7 @@ int main(void) { char b[1024]; return syscall(SYS_getdents64, 4, b, sizeof(b)) <
 		tools.push(createReadTool(fixture.workspace), createGrepTool(fixture.workspace), createLsTool(fixture.workspace), createFindTool(fixture.workspace));
 		const prepared = patternProcessHost(fixture, "native-inputs", { resourceCacheMaxEntries: 8,
 			resourceCacheMaxBytes: 32 * 1024, patternAware: patternAwareSettings({ enabled: true, multiStepEnabled: false }) }, {
-			executionWorlds: [fixture.world, createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { maxBytes: () => 1024 * 1024 })],
+			executionWorlds: [fixture.world, resourceWorld()],
 			resolveInvocation: (tool, input) => {
 				const process = tool === name || tool === "consume_rows";
 				const invocation = search.invocations.get(tool) ?? resolvePiToolInvocation(process ? "bash" : tool, input, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath });

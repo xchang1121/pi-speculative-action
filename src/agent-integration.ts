@@ -297,7 +297,8 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 		},
 		authorizeCandidate: ({ stateData, tool: toolName, concrete, action, route, signal }) =>
 			checkPermission(stateData.tools.get(toolName), { toolName, args: concrete, action, route, signal: signal ?? new AbortController().signal }, true),
-		executeCandidate: async ({ startInput, data, tool: toolName, concrete, action, route, callID, signal, parentWorld, inputs, onOperationAdopted, onOperationJoinable, acceptOperationScope }) => {
+		executeCandidate: async ({ startInput, data, tool: toolName, concrete, route, parentWorld, candidate: _candidate, index: _index, ...context }) => {
+			const { action, callID, signal } = context;
 			const tool = data.tools.get(toolName);
 			if (!tool) throw new Error(`Tool ${toolName} not found`);
 			const args = structuredClone(concrete), executionScope = { sessionID: startInput.sessionID, turnID: startInput.turnID, callID };
@@ -305,12 +306,7 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 				{ tool: toolName, callID, input: args, signal, action, scope: executionScope },
 				route,
 				{
-					cwd: options.cwd, tool, toolName, args, action, callID, signal,
-					inputs,
-					onOperationAdopted,
-					onOperationJoinable,
-					acceptOperationScope,
-					executionScope,
+					...context, cwd: options.cwd, tool, toolName, args, executionScope,
 					...(parentWorld?.checkpoint ? { parentCheckpoint: parentWorld.checkpoint } : {}),
 				},
 			);
