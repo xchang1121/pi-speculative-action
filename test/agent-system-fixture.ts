@@ -5,13 +5,20 @@ import { createSpeculativeActionHost, type CreateSpeculativeActionHostOptions, t
 import { createResourceSnapshotExecutionWorld } from "../src/agent-execution-world.ts";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
-import type { SpeculativeActionEvent } from "../src/runtime.ts";
+import type { MaterializedSpeculativeCandidate, SpeculativeActionEvent } from "../src/runtime.ts";
+import type { ToolComputationTiming } from "../src/task-timing.ts";
 import { testModel } from "./model.ts";
+
+type SystemEvent<Type extends SpeculativeActionEvent<string>["type"]> = Extract<SpeculativeActionEvent<string>, { type: Type }>;
 
 /** Exercise the same tool outlet as the extension; only the external model response is scripted. */
 export function systemHost(cwd: string, tools: AgentTool[], options: Partial<CreateSpeculativeActionHostOptions> = {},
 	settings: SpeculativeAgentSettingsInput = {}, sessionID = "system") {
 	const events: SpeculativeActionEvent<string>[] = [], fallbacks: string[] = [];
+	const materialized: MaterializedSpeculativeCandidate<string>[] = [];
+	const ofType = <Type extends SpeculativeActionEvent<string>["type"]>(type: Type) => events.filter((event): event is SystemEvent<Type> => event.type === type);
+	const completed = (file?: string, source?: string): SystemEvent<"candidate">[] => ofType("candidate").filter(event => event.state.status === "succeeded" &&
+		(!source || event.candidate.source === source) && (!file || JSON.parse(event.candidate.predictedAction).input.path === file));
 	let turnID = "first", calls = 0;
 	const host = createSpeculativeActionHost(sessionID, {
 		cwd, complete: async () => fauxAssistantMessage("done"),
@@ -23,6 +30,7 @@ export function systemHost(cwd: string, tools: AgentTool[], options: Partial<Cre
 		executionWorlds: [createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { maxBytes: () => 8 * 1024 * 1024 })],
 		...options,
 		onEvent: event => { events.push(event); return options.onEvent?.(event); },
+		onCandidateMaterialized: candidate => { materialized.push(candidate); return options.onCandidateMaterialized?.(candidate); },
 	});
 	const call = (tool: string, args: Record<string, unknown>, id = `call-${++calls}`) => ({ turnID, id, tool, args, tools });
 	const authoritative = async (tool: string, args: Record<string, unknown>, signal?: AbortSignal, id = "oracle", invocation = options.resolveInvocation?.(tool, args) ?? null) => {
@@ -31,25 +39,25 @@ export function systemHost(cwd: string, tools: AgentTool[], options: Partial<Cre
 		return tools.find(candidate => candidate.name === tool)!.execute(id, args as never, signal);
 	};
 	return {
-		host, events, fallbacks, oracle: authoritative,
-		get actors(): Extract<SpeculativeActionEvent<string>, { type: "actor_action" }>[] { return events.filter(event => event.type === "actor_action"); },
-		start: async (id = "first") => {
-			turnID = id;
-			await host.startTurn({ turnID, tools, actorOptions: {}, actorModel: testModel("actor", { contextWindow: 262144 }),
-				context: { systemPrompt: "Use tools to inspect and edit these files.", messages: [], tools } });
-		},
+		host, events, fallbacks, materialized, completed, oracle: authoritative,
+		get actors(): SystemEvent<"actor_action">[] { return ofType("actor_action"); },
+		get predictions(): SystemEvent<"prediction">[] { return ofType("prediction"); },
+		start: (id = "first") => host.startTurn({ turnID: turnID = id, tools, actorOptions: {}, actorModel: testModel("actor", { contextWindow: 262144 }),
+			context: { systemPrompt: "Use tools to inspect and edit these files.", messages: [], tools } }),
 		preview: (tool: string, args: Record<string, unknown>, signal?: AbortSignal, id?: string) => host.previewActorCall(call(tool, args, id), signal),
 		execute: (tool: string, args: Record<string, unknown>, signal?: AbortSignal, id?: string) =>
 			host.execute(call(tool, args, id), signal, operation => {
 				fallbacks.push(tool);
 				return authoritative(tool, operation.input as Record<string, unknown>, operation.signal, operation.callID, operation.invocation ?? null);
 			}),
-		ready: async (count = 1) => {
-			try { await expect.poll(() => events.filter(event => event.type === "candidate" && event.state.status === "succeeded").length,
-				{ timeout: 10_000 }).toBeGreaterThanOrEqual(count); }
-			catch (cause) { throw new Error(JSON.stringify(events), { cause }); }
-		},
+		ready: (count: number | readonly string[] = 1, source?: string) => expect.poll(() => typeof count === "number" ? completed(undefined, source).length : count.filter(file => completed(file, source).length).length,
+			{ timeout: 10_000 }).toBeGreaterThanOrEqual(typeof count === "number" ? count : count.length).catch(cause => { throw new Error(JSON.stringify(events), { cause }); }),
 		finish: (terminal = false) => host.finishTurn(turnID, terminal),
 		dispose: () => host.dispose(),
 	};
+}
+
+export function expectHiddenCompute(timing: ToolComputationTiming, consumed: boolean) {
+	expect(timing.hiddenComputeMs > 0).toBe(consumed);
+	expect(timing.hiddenComputeMs).toBeLessThanOrEqual(timing.toolComputeMs!);
 }

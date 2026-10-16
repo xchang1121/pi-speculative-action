@@ -1,10 +1,13 @@
-import { runProgram as output, shellQuote } from "./command.ts";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { disposable, onExit } from "./async.ts";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { LinuxOverlayfsCapabilityRegistry, linuxOverlayfsCapability, mountLinuxOverlayfs } from "../src/linux-overlayfs.ts";
+
+const shellQuote = (value: string) => `'${value.replaceAll("'", `'\\''`)}'`;
 
 describe("Linux OverlayFS workspace substrate", () => {
 	it.each([
@@ -52,7 +55,7 @@ describe("Linux OverlayFS workspace substrate", () => {
 		await writeFile(path.join(mounted.root, "value.txt"), "copy-up\n", "utf8");
 		expect(await readFile(path.join(lowerRoot, "value.txt"), "utf8")).toBe("lower\n");
 		expect(
-			await output("unshare", [
+			(await promisify(execFile)("unshare", [
 				"--user",
 				"--map-root-user",
 				"--mount",
@@ -62,7 +65,7 @@ describe("Linux OverlayFS workspace substrate", () => {
 				"--",
 				"cat",
 				path.join(mounted.root, "value.txt"),
-			]),
+			], { encoding: "utf8" })).stdout,
 		).toBe("copy-up\n");
 		await mounted.close();
 		if (mode === "recovered") {

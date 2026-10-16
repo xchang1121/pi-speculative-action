@@ -5,6 +5,7 @@ import { RESOURCE_DIMENSIONS } from "./system-resources.ts";
 import type { ActionKey, ActionKeyMatch } from "./action-semantics.ts";
 import type { CandidateExecution } from "./candidate-execution.ts";
 import type { MaterializedPlan, PlanAction, PlanActionDependency, PlanUpdate } from "./plan-proposal.ts";
+import { predictionLearning } from "./settlement.ts";
 import type {
 	ActorActionIdentity,
 	PlanActionIdentity,
@@ -547,7 +548,7 @@ function dependencyReadiness(node: MutableNode, dependency: PlanActionDependency
 	}
 	if (condition === "actor_adopted") {
 		const settlement = node.opportunity.settlement;
-		return settlement === undefined ? "waiting" : predictionAdopted(settlement) ? "ready" : "blocked";
+		return settlement === undefined ? "waiting" : predictionLearning(settlement).adopted ? "ready" : "blocked";
 	}
 	const execution = executionProjection(node.execution);
 	if (!executionSettled(execution)) return "waiting";
@@ -558,10 +559,6 @@ function predictionMatched(settlement: PredictionSettlement | undefined): settle
 	PredictionSettlement,
 	{ readonly observation: "observed" }
 > & { readonly match: { readonly matched: true }; } { return settlement?.observation === "observed" && settlement.match.matched; }
-
-function predictionAdopted(settlement: PredictionSettlement | undefined): boolean {
-	return predictionMatched(settlement) && settlement.match.adoption.status === "adopted";
-}
 
 function freezeAdoption(adoption: PredictionAdoption): PredictionAdoption {
 	return adoption.status === "adopted" ? Object.freeze({ ...adoption }) : Object.freeze({ ...adoption, cause: Object.freeze({ ...adoption.cause }) });

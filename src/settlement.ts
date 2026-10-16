@@ -63,20 +63,24 @@ export type PredictionAdoption =
 	| { readonly status: "adopted"; readonly candidateID: string; }
 	| { readonly status: "rejected"; readonly candidateID?: string; readonly cause: ResolutionCause; };
 
-export type PredictionSettlement =
-	| { readonly prediction: PredictionIdentity; readonly observation: "unobserved"; readonly cause: ResolutionCause; }
-	| {
-			readonly prediction: PredictionIdentity;
+export type PredictionSettlement = { readonly prediction: PredictionIdentity } & (
+	| { readonly observation: "unobserved"; readonly cause: ResolutionCause; }
+	| ({
 			readonly observation: "observed";
 			readonly actorAction: ActorActionIdentity;
-			readonly match: { readonly matched: false };
-	  }
-	| {
-			readonly prediction: PredictionIdentity;
-			readonly observation: "observed";
-			readonly actorAction: ActorActionIdentity;
-			readonly match: { readonly matched: true; readonly relation: ActionKeyMatch; readonly adoption: PredictionAdoption; };
-	  };
+	  } & (
+			| { readonly match: { readonly matched: false }; }
+			| { readonly match: { readonly matched: true; readonly relation: ActionKeyMatch; readonly adoption: PredictionAdoption; }; }
+	  ))
+);
+
+/** Eligible learning samples: shared work earns adoption without inventing a tool match. */
+export function predictionLearning(settlement: PredictionSettlement, served?: boolean) {
+	const match = settlement.observation === "observed" ? settlement.match : undefined;
+	const adopted = served ?? (match?.matched === true && match.adoption.status === "adopted");
+	return { matched: match?.matched || !adopted ? match?.matched : undefined,
+		adopted: adopted || match?.matched ? adopted : undefined };
+}
 
 export type SourceRequestSettlement =
 	| { readonly status: "produced"; readonly proposalCount: number }
@@ -106,30 +110,26 @@ export interface SettledSourceRequest {
 
 export interface CandidateRejection { readonly candidateID: string; readonly match: ActionKeyMatch; readonly cause: ResolutionCause; }
 
-export type ActorActionProvider =
+export type ActorActionProvider = { readonly toolExecution: TimelineInterval } & (
 	| {
 			readonly kind: "speculative";
 			readonly candidateID: string;
 			readonly match: ActionKeyMatch;
-			readonly toolExecution: TimelineInterval;
 	  }
-	| {
-			readonly kind: "actor";
+	| ({ readonly kind: "actor"; readonly durationMs: number } & (
+		{
 			readonly origin: "fallback";
 			readonly cause: ResolutionCause;
 			readonly candidateID?: string;
-			readonly durationMs: number;
 			readonly isError: boolean;
-			readonly toolExecution: TimelineInterval;
 	  }
 	| {
-			readonly kind: "actor";
 			readonly origin: "preview";
 			readonly candidateID: string;
-			readonly durationMs: number;
 			readonly isError: false;
-			readonly toolExecution: TimelineInterval;
-	  };
+	  }
+	))
+);
 
 export interface ActorActionSettlement {
 	readonly actorAction: ActorActionIdentity;

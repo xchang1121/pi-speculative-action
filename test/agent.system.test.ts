@@ -11,8 +11,8 @@ import { createClosedSearchProfile, resolvePiToolInvocation } from "../src/pi-to
 import { ActionSemanticsRegistry, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { PatternAwareStore, patternAwareSettings, patternAwareActionSemantics } from "../src/pattern-aware.ts";
 import { temporaryDirectories } from "./filesystem.ts";
-import { systemHost } from "./agent-system-fixture.ts";
-import { disposable, onExit, deferred, nextTurn } from "./async.ts";
+import { expectHiddenCompute, systemHost } from "./agent-system-fixture.ts";
+import { disposable, onExit, deferred, gated, nextTurn } from "./async.ts";
 import { commitBenchmarkFixture, compileBenchmarkHelper, createLinuxProcessBenchmark, textOutput } from "./linux-process-fixture.ts";
 import { EXACT_TOOL_OBSERVATION, type ToolObservationContract } from "../src/tool-settlement.ts";
 import { ActorForkPlanSource } from "../src/actor-fork-plan-source.ts";
@@ -168,11 +168,11 @@ test.for(["actor", "preview", "dynamic", "dynamic-preview", "hints", "hints-prev
 	else if ((direct || mode.startsWith("mixed")) && !(early && mutates(0))) expect(await readFile(path.join(cwd, `${names[Number(mode !== "mixed-producer")]}.txt`), "utf8")).toBe(metadata ? textOutput(expected).slice(names[1]!.length + 1) : String(stale || changes ? 3 : range ? 1 : 2));
 	if (transfer) { await revokeParent!(); expect(await f.execute(names[1]!, { path: "input.txt" })).toEqual(expected); }
 	if (live) {
-		if (!parentFailure || !overlap) expect(f.events.some(event => event.type === "actor_action" && event.settlement.tool === names[0])).toBe(false);
+		if (!parentFailure || !overlap) expect(f.actors.some(event => event.settlement.tool === names[0])).toBe(false);
 		await finishParent();
 	}
-	if (unkeyed) { expect(bindings).toBe(1); expect(f.events.find(event => event.type === "actor_action" && event.settlement.tool === names[0])).toMatchObject({ settlement: { provider: { kind: "actor", cause: { code: "action_not_keyable" } } } }); }
-	if (parentFailure) expect(f.events.find(event => event.type === "actor_action" && event.settlement.tool === names[0])).toMatchObject({ settlement: { provider: { kind: "actor", isError: !parentFailure.endsWith("return") } }, computation: { hiddenComputeMs: 0 } });
+	if (unkeyed) { expect(bindings).toBe(1); expect(f.actors.find(event => event.settlement.tool === names[0])).toMatchObject({ settlement: { provider: { kind: "actor", cause: { code: "action_not_keyable" } } } }); }
+	if (parentFailure) expect(f.actors.find(event => event.settlement.tool === names[0])).toMatchObject({ settlement: { provider: { kind: "actor", isError: !parentFailure.endsWith("return") } }, computation: { hiddenComputeMs: 0 } });
 	await f.finish();
 	const timing = f.actors.filter(event => event.settlement.tool === names[1]).at(-1)?.computation;
 	if (mode !== "binding") expect(timing?.hiddenComputeMs! > 0, JSON.stringify({ timing, events: f.events })).toBe(!stale && !unavailable && (!failed || direct) && !(direct && cancelled) && !["calculation-key", "revoke"].includes(mode));
@@ -257,7 +257,7 @@ test.for(["stale", "all-stale", "binding", "failure", "cancel", "composed", "rev
 	expect(effects).toBe(mode === "composed" ? 2 : 1); expect(compositions).toBe(Number(mode === "composed"));
 	expect(builds).toBe(!input && ["all-stale", "binding"].includes(mode) ? 3 : 2);
 	if (input) { await f.finish(); const timing = f.actors.filter(event => event.settlement.tool === names[2]).at(-1)!.computation!;
-		expect(timing.hiddenComputeMs > 0).toBe(!["all-stale", "alias", "failure", "cancel"].includes(mode)); expect(timing.hiddenComputeMs).toBeLessThanOrEqual(timing.toolComputeMs!); }
+		expectHiddenCompute(timing, !["all-stale", "alias", "failure", "cancel"].includes(mode)); }
 });
 
 test.for(["reopened", "inflight", "completed", "binding", "reverse", "deep", "added", "changed", "removed", "shared", "shared-refresh", "shared-stale", "shared-unused", "shared-native", "shared-native-stale", "shared-exact", "shared-exact-stale",
@@ -280,72 +280,70 @@ test.for(["reopened", "inflight", "completed", "binding", "reverse", "deep", "ad
 		for (const batch of chain) { await training.start(`step-${batch}`); await Promise.all(batch.map(step => training.execute(names[step]!, { path: files[step] }))); await training.finish(batch === chain.at(-1)); }
 	}
 	await store.flush(); const reopened = createStore(); await reopened.load();
-	const slowStarted = deferred(), slowRelease = deferred(), leafStarted = deferred(), leafRelease = deferred(), nativeStarted = deferred(), nativeRelease = deferred();
+	const slowGate = gated(), leafGate = gated(), nativeGate = gated();
 	const controller = new AbortController(), failure = new Error("consumer stopped"); let allowSelection = true, nativeCalls = 0, commits = 0;
 	const runtimeSettings = { patternAware: settings, maxConcurrentActions: 3, scheduling: { heavyCpu: 1 } };
 	let leafSignal: AbortSignal | undefined, slow: Promise<unknown> | undefined, bindings = 0;
 	const f = systemHost(cwd, tools, { ...options, patternStore: reopened, preflight: () => allowSelection,
 		resolveInvocation: async (tool, input) => {
-			if (mode === "binding" && tool === names[2]) { bindings++; leafStarted.resolve(); await leafRelease.promise; }
+			if (mode === "binding" && tool === names[2]) { bindings++; await leafGate.wait(); }
 			const invocation = options.resolveInvocation(tool, input);
 			return { ...invocation, ...(native && tool === names[4] ? bindResourceOperation(invocation.filesystem!, cwd) : {}), ...(fallback && tool === names[1] ? bindResourceOperation(async (view, request) => {
 				if (allowSelection) return invocation.filesystem!(view, request);
-				nativeCalls++; nativeStarted.resolve(); await nativeRelease.promise;
+				nativeCalls++; await nativeGate.wait();
 				const result = mode.endsWith("before") || closure ? undefined : await invocation.filesystem!(view, request);
 				if (failed || closure) { if (mode.includes("cancel")) controller.abort(failure); throw failure; }
 				return result!;
 			}, cwd) : {}), ...(tool === names[3] ? bindResourceOperation(async (view, request) => {
 				const result = await invocation.filesystem!(view, request);
-				slowStarted.resolve(); await slowRelease.promise;
+				await slowGate.wait();
 				return result;
 			}, cwd) : {}) };
 		},
 		executionWorlds: [{ ...world, speculation: { ...world.speculation!, execute: async context => {
-			if (context.toolName === names[2]) { leafSignal = context.signal; leafStarted.resolve(); await leafRelease.promise; context.signal.throwIfAborted(); }
+			if (context.toolName === names[2]) { leafSignal = context.signal; await leafGate.wait(); context.signal.throwIfAborted(); }
 			const branch = await world.speculation!.execute(context);
 			return poison && context.toolName === names[1] ? { ...branch, commit: async () => { commits++; throw failure; } } : branch;
 		} } }],
 	}, runtimeSettings, "late-batch");
 	const actors: Promise<unknown>[] = [];
-	await using _cleanup = onExit(async () => { slowRelease.resolve(); leafRelease.resolve(); nativeRelease.resolve(); await Promise.allSettled([...actors, slow]); await f.dispose(); await reopened.flush(); });
-	const completed = (step: number) => f.events.some(event => event.type === "candidate" && event.candidate.source === "pattern_aware" &&
-		event.state.status === "succeeded" && JSON.parse(event.candidate.predictedAction).input.path === files[step]);
-	const predictions = (step: number) => f.events.filter(event => event.type === "prediction" && event.tool === names[step]);
+	await using _cleanup = onExit(async () => { slowGate.release(); leafGate.release(); nativeGate.release(); await Promise.allSettled([...actors, slow]); await f.dispose(); await reopened.flush(); });
+	const predictions = (step: number) => f.predictions.filter(event => event.tool === names[step]);
 	await f.start();
 	if (reopen) {
 		await f.execute("read", { path: files[0] }); await f.finish(); await f.start("next");
-		await expect.poll(() => completed(1)).toBe(true); f.fallbacks.length = 0;
+		await f.ready([files[1]!], "pattern_aware"); f.fallbacks.length = 0;
 		expect(textOutput(await f.execute("read", { path: files[1] }))).toBe(`${files[1]}\n`);
 		expect(f.fallbacks).toEqual([]); return;
 	}
 	if (mode === "reverse") await f.execute(names[0]!, { path: files[0] });
-	if (mode !== "shared") { slow = f.execute(names[3]!, { path: files[3] }); await slowStarted.promise; }
+	if (mode !== "shared") { slow = f.execute(names[3]!, { path: files[3] }); await slowGate.entered; }
 	if (mode !== "reverse") await f.execute(names[0]!, { path: files[0] });
-	if (mode === "completed" || deep) leafRelease.resolve();
-	await leafStarted.promise;
-	if (mode === "completed" || deep) await expect.poll(() => completed(deep ? 5 : 2)).toBe(true);
-	const original = leafSignal; slowRelease.resolve(); await slow; await nextTurn();
+	if (mode === "completed" || deep) leafGate.release();
+	await leafGate.entered;
+	if (mode === "completed" || deep) await f.ready([files[deep ? 5 : 2]!], "pattern_aware");
+	const original = leafSignal; slowGate.release(); await slow; await nextTurn();
 	await f.finish();
 	if (mode !== "binding") expect(original?.aborted).toBe(false);
 	expect(predictions(2)).toMatchObject(replaces ? [{ settlement: { observation: "unobserved", cause: { code: "superseded" } } }] : []);
 	if (deep) expect(predictions(5)).toEqual([]);
 	if (mode === "binding") expect(bindings).toBe(1);
-	leafRelease.resolve(); runtimeSettings.patternAware = { ...settings, enabled: false };
+	leafGate.release(); runtimeSettings.patternAware = { ...settings, enabled: false };
 	const prior = reopened.snapshot().filter(pattern => pattern.targetTool === names[1]);
 	if (stale) await writeFile(path.join(cwd, files[1]!), "changed\n");
 	f.fallbacks.length = 0;
 	for (const batch of shared ? [[1]] : changed ? [[4], [5]] : added ? [[1, 4], [2, 5]] : [[1], [2], ...deep ? [[5]] : []]) {
-		for (const step of batch) await expect.poll(() => completed(step)).toBe(true);
+		await f.ready(batch.map(step => files[step]!), "pattern_aware");
 		await f.start(`consume-${batch}`); if (fallback && !poison) allowSelection = false;
 		await Promise.all(batch.map(async step => {
 			const result = f.execute(names[shared && !exact ? 4 : step]!, { path: files[unused ? 4 : step] }, controller.signal); actors.push(result); result.catch(() => {});
 			if (fallback && !poison) {
-				await nativeStarted.promise; await nextTurn(); expect(predictions(step)).toEqual([]);
+				await nativeGate.entered; await nextTurn(); expect(predictions(step)).toEqual([]);
 				if (closure) {
 					const closed = closure === "dispose" ? f.dispose() : closure === "disable" ? f.host.runtime.settingsChanged({ enabled: false, resourceCacheMaxEntries: 0, predictionTimeoutMs: 10_000 }) : f.finish(closure === "terminal");
-					actors.push(closed); closed.catch(() => {}); await expect.poll(() => predictions(step).length).toBe(1); nativeRelease.resolve(); await closed;
+					actors.push(closed); closed.catch(() => {}); await expect.poll(() => predictions(step).length).toBe(1); nativeGate.release(); await closed;
 				}
-				nativeRelease.resolve();
+				nativeGate.release();
 			}
 			if (poison) await expect(result).rejects.toMatchObject({ disposition: "poisoned" });
 			else if (failed || closure) await expect(result).rejects.toBe(failure);
@@ -356,7 +354,7 @@ test.for(["reopened", "inflight", "completed", "binding", "reverse", "deep", "ad
 	expect(f.fallbacks).toEqual(fallback && !poison ? [names[1]] : native ? [names[4]] : []);
 	if (fallback) { expect(nativeCalls).toBe(Number(!poison)); expect(commits).toBe(Number(poison));
 		const timing = f.actors.filter(event => event.settlement.tool === names[1]).at(-1)?.computation;
-		if (closure || poison) expect(timing).toBeUndefined(); else { expect(timing!.hiddenComputeMs > 0).toBe(consumed); expect(timing!.hiddenComputeMs).toBeLessThanOrEqual(timing!.toolComputeMs!); } }
+		if (closure || poison) expect(timing).toBeUndefined(); else expectHiddenCompute(timing!, consumed); }
 	if (mode !== "binding") expect(leafSignal).toBe(original);
 	if (shared) {
 		await f.dispose(); await reopened.flush(); const saved = createStore(); await saved.load();
@@ -370,7 +368,7 @@ test.for(["reopened", "inflight", "completed", "binding", "reverse", "deep", "ad
 });
 
 test.for(["refresh", "replace", "remove"])("settles claimed consumption after a late source update (%s)", async mode => {
-	const cwd = await directories.create(), entered = deferred(), release = deferred(), args = { path: "input.txt" };
+	const cwd = await directories.create(), gate = gated(), args = { path: "input.txt" };
 	for (const file of ["input.txt", "other.txt"]) await writeFile(path.join(cwd, file), `${file}\n`);
 	const settled: Parameters<NonNullable<AgentPlanSource["onSettled"]>>[0][] = [], readers: Promise<unknown>[] = [];
 	let native = false, updated = false;
@@ -391,20 +389,19 @@ test.for(["refresh", "replace", "remove"])("settles claimed consumption after a 
 			const invocation = resolvePiToolInvocation(tool, input, { cwd, environment: {} })!;
 			return { ...invocation, ...bindResourceOperation(async (view, request) => {
 				const result = await invocation.filesystem!(view, request);
-				if (native && (request.args as typeof args).path === args.path) { entered.resolve(); await release.promise; }
+				if (native && (request.args as typeof args).path === args.path) { await gate.wait(); }
 				return result;
 			}, cwd) };
 		},
 	});
-	await using _cleanup = onExit(async () => { release.resolve(); await Promise.allSettled(readers); await f.dispose(); });
+	await using _cleanup = onExit(async () => { gate.release(); await Promise.allSettled(readers); await f.dispose(); });
 	await f.start(); await f.ready(); native = true; const result = f.execute("read", args); readers.push(result); result.catch(() => {});
-	await entered.promise; await nextTurn(); expect(settled).toEqual([]);
+	await gate.entered; await nextTurn(); expect(settled).toEqual([]);
 	expect(textOutput(await f.execute("read", { path: "other.txt" }))).toBe("other.txt\n");
-	await expect.poll(() => updated).toBe(true); await nextTurn(); release.resolve(); expect(textOutput(await result)).toBe("input.txt\n");
+	await expect.poll(() => updated).toBe(true); await nextTurn(); gate.release(); expect(textOutput(await result)).toBe("input.txt\n");
 	await f.finish(true); expect(settled.filter(item => item.settlement.observation === "observed")).toMatchObject([{ feedback: "before", served: true,
 		settlement: { match: { matched: true, adoption: { status: "rejected" } } } }]);
-	const timing = f.actors.at(-1)!.computation!;
-	expect(timing.hiddenComputeMs).toBeGreaterThan(0); expect(timing.hiddenComputeMs).toBeLessThanOrEqual(timing.toolComputeMs!);
+	expectHiddenCompute(f.actors.at(-1)!.computation!, true);
 });
 
 test.for([false, true])("reconstructs shared searches after cancellation and namespace changes (cancel all: %s)", async (cancelAll, { skip }) => {
@@ -456,11 +453,11 @@ test.for([false, true])("reconstructs shared searches after cancellation and nam
 test.for(["in-place", "git"] as const)("keeps effects private, retries restored preimages and transfers an aborted claim (%s)", async driver => {
 	const cwd = await directories.create(), sandbox = new WorkspaceSandboxService(), file = path.join(cwd, "notes.txt");
 	await writeFile(file, "one two\n"); await link(file, path.join(cwd, "alias.txt"));
-	const entered = deferred(), release = deferred(), secondResolved = deferred(), controller = new AbortController();
+	const gate = gated(), secondResolved = deferred(), controller = new AbortController();
 	let hold = false, waiting = false, first: Promise<unknown> | undefined, second: Promise<unknown> | undefined;
 	const f = systemHost(cwd, [createEditTool(cwd), createReadTool(cwd)], {
 		executionWorlds: [sandbox.createExecutionWorld(driver === "git" ? { driver, inPlaceMutations: false } : {})],
-		preflight: async () => { if (hold) { hold = false; waiting = true; entered.resolve(); await release.promise; } return true; },
+		preflight: async () => { if (hold) { hold = false; waiting = true; await gate.wait(); } return true; },
 		resolveInvocation: (tool, input) => { if (waiting) secondResolved.resolve(); return resolvePiToolInvocation(tool, input, { cwd, environment: {} }); },
 	});
 	try {
@@ -474,22 +471,25 @@ test.for(["in-place", "git"] as const)("keeps effects private, retries restored 
 		expect(await readFile(file, "utf8")).toBe("changed three\n");
 		expect(textOutput(await f.execute("read", { path: "alias.txt" }))).toBe("changed three\n");
 		await writeFile(file, "one two\n"); hold = true;
-		first = f.execute("edit", args, controller.signal).catch(error => error); await entered.promise;
+		first = f.execute("edit", args, controller.signal).catch(error => error); await gate.entered;
 		second = f.execute("edit", args); await secondResolved.promise; await new Promise<void>(setImmediate);
 		expect(f.fallbacks.filter(tool => tool === "edit")).toEqual(["edit"]); expect(await readFile(file, "utf8")).toBe("one two\n");
-		controller.abort(); release.resolve(); await first; await second;
+		controller.abort(); gate.release(); await first; await second;
 		expect(await readFile(file, "utf8")).toBe("one three\n"); expect(f.fallbacks.filter(tool => tool === "edit")).toEqual(["edit", "edit"]);
 		await f.finish(); await f.start("discard");
 		await f.preview("edit", { path: "notes.txt", edits: [{ oldText: "three", newText: "discarded" }] });
 		await f.ready(2);
-	} finally { controller.abort(); release.resolve(); await Promise.allSettled([first, second]); await f.dispose(); await sandbox.dispose(); }
+	} finally { controller.abort(); gate.release(); await Promise.allSettled([first, second]); await f.dispose(); await sandbox.dispose(); }
 	expect(await readFile(file, "utf8")).toBe("one three\n");
 });
 
 test.for(["independent", "unchanged", "batch", "batch-known", "mismatch-text", "mismatch-error", "mismatch-inflight", "mismatch-budget", "parent-miss", "stale", "same-resource", "missing-input", "independent-create",
 	"budget", "depth-zero", "denied-root", "denied-child", "unknown-batch", "filtered-batch", "malformed-observation", "malformed-type", "abort-observation", "actual-before-forecast", "actual-before-malformed",
-	"actual-before-failure", "actual-before-batch", "request-failure", "malformed-extra", "mismatch-exit", "canonical", "canonical-mismatch", "canonical-version", "canonical-schema", "canonical-unbound", "normalizer-failure"])("executes out-of-order drafts using private observations (%s)", async mode => {
+	"actual-before-failure", "actual-before-batch", "request-failure", "malformed-extra", "mismatch-exit", "canonical", "canonical-mismatch", "canonical-version", "canonical-schema", "canonical-unbound", "normalizer-failure",
+	...["whole", "fallback", "cross-tool", "unkeyed", "unused", "stale", "unkeyed-unused", "unkeyed-stale"].map(mode => `learning-${mode}`)])("executes out-of-order drafts using private observations (%s)", async mode => {
 	const cwd = await directories.create(), sandbox = new WorkspaceSandboxService(), release = deferred(), forecast = deferred(), observing = deferred(), firstResult = deferred();
+	const learning = mode.startsWith("learning-"), cross = /learning-(cross-tool|unkeyed)/.test(mode), stale = mode.endsWith("stale"), unused = mode.endsWith("unused");
+	let allow = true;
 	const actualFirst = mode.startsWith("actual-before-"), normalized = mode.startsWith("canonical"), wrong = mode.startsWith("mismatch") || mode === "canonical-mismatch";
 	const known = mode === "batch-known", recoverable = ["request-failure", "malformed-observation", "malformed-type", "malformed-extra"].includes(mode);
 	const inflight = mode === "mismatch-inflight", repairBudget = mode === "mismatch-budget", actualBatch = mode === "actual-before-batch";
@@ -502,14 +502,15 @@ test.for(["independent", "unchanged", "batch", "batch-known", "mismatch-text", "
 		const { duration: _duration, pid: _pid, tempPath: _tempPath, ...kept } = JSON.parse(block.text); return { ...block, text: JSON.stringify(kept) };
 	});
 	const mutation = ["same-resource", "missing-input", "independent-create"].includes(mode), dependent = mutation && mode !== "independent-create", count = mode.startsWith("batch") || actualBatch ? 2 : 1;
-	const read = PI_ACTION_SEMANTICS.definition("read")!, names = ["inspect_rows", "render_rows"];
-	const definitions = names.map(tool => ({ ...read, tool, epoch: tool, projectors: [] })), semantics = new ActionSemanticsRegistry([...definitions, PI_ACTION_SEMANTICS.definition("write")!]);
+	const read = PI_ACTION_SEMANTICS.definition("read")!, names = ["inspect_rows", "render_rows", ...learning ? ["format_rows"] : []];
+	const definitions = names.map((tool, index) => ({ ...read, tool, epoch: tool, projectors: [], ...(index === 2 && mode.includes("unkeyed") ? { canonicalize: () => undefined } : {}) })), semantics = new ActionSemanticsRegistry([...definitions, PI_ACTION_SEMANTICS.definition("write")!]);
 	const reader = createReadTool(cwd), tools = [...names.map(name => ({ ...reader, name })), createWriteTool(cwd)] as Parameters<typeof systemHost>[1];
 	const roots = Array.from({ length: count }, (_, index) => ({ tool: mutation ? "write" : names[0]!, args: mutation ? { path: "root-0.txt", content: "prepared\n" }
 		: { path: `root-${index}.txt`, offset: normalized ? 1 : 2, limit: normalized ? 10 : 1 } }));
 	for (const root of roots) if (mode !== "missing-input" && mode !== "independent-create") await writeFile(path.join(cwd, root.args.path), normalized
 		? '{"failedTests":[],"artifact":"abc","duration":14,"pid":123,"tempPath":"/tmp/actual"}\n' : "one\ntwo\nthree\n");
 	await writeFile(path.join(cwd, "child.txt"), "child\n");
+	if (learning) await writeFile(path.join(cwd, "unused.txt"), "unused\n");
 	if (wrong) await writeFile(path.join(cwd, "discarded.txt"), "discarded\n");
 	const child = { tool: names[1]!, args: { path: dependent ? "root-0.txt" : "child.txt" } };
 	const expected = await Promise.all(roots.map(root => mutation ? { content: [{ type: "text" as const, text: "Successfully wrote 9 bytes to root-0.txt" }] }
@@ -523,10 +524,12 @@ test.for(["independent", "unchanged", "batch", "batch-known", "mismatch-text", "
 	const f = systemHost(cwd, tools, { actionSemantics: semantics,
 		resources: { initial: { cpuCount: 3, idleCpuCount: 3 }, sample: () => new Promise(() => {}) },
 		onEvent: event => { if (known && event.type === "candidate" && event.state.status === "succeeded" && event.candidate.tool === names[0]) firstResult.resolve(); },
-		resolveInvocation: async (tool, args) => { if (known && (args as { path: string }).path === "root-1.txt") await firstResult.promise; return { ...resolvePiToolInvocation(tool === "write" ? tool : "read", args, { cwd, environment: {} })!,
+		resolveInvocation: async (tool, args) => { if (known && (args as { path: string }).path === "root-1.txt") await firstResult.promise;
+			const invocation = resolvePiToolInvocation(tool === "write" ? tool : "read", args, { cwd, environment: {} })!;
+			return { ...invocation, ...(learning ? bindResourceOperation(invocation.filesystem!, cwd) : {}),
 			...(bound && tool === names[0] && (normalized || mode === "normalizer-failure") ? { observation: { ...EXACT_TOOL_OBSERVATION, version, content: normalized ? schema : undefined, canonicalize } } : {}),
 			semantics: tool === "write" ? PI_ACTION_SEMANTICS.definition(tool) : definitions[names.indexOf(tool)] }; },
-		preflight: context => !(mode === "denied-root" && context.toolName !== child.tool || mode === "denied-child" && context.toolName === child.tool),
+		preflight: context => allow && !(mode === "denied-root" && context.toolName !== child.tool || mode === "denied-child" && context.toolName === child.tool),
 		executionWorlds: worlds.map(world => ({ ...world, speculation: { ...world.speculation!, execute: async context => {
 			executed.push(context.toolName); const branch = await world.speculation!.execute(context);
 			if (context.toolName !== child.tool && !(known && (context.args as { path: string }).path === "root-0.txt")) await release.promise;
@@ -590,7 +593,7 @@ test.for(["independent", "unchanged", "batch", "batch-known", "mismatch-text", "
 		if (mode === "missing-input") await expect(readFile(path.join(cwd, "root-0.txt"))).rejects.toMatchObject({ code: "ENOENT" });
 		else expect(await readFile(path.join(cwd, "root-0.txt"), "utf8")).toBe("one\ntwo\nthree\n");
 	} else {
-		await f.ready(known ? 2 : 1); expect(f.events.flatMap(event => event.type === "candidate" && event.state.status === "succeeded" ? [event.candidate.tool] : [])).toEqual([...(known ? [names[0]] : []), child.tool]);
+		await f.ready(known ? 2 : 1); expect(f.completed().map(event => event.candidate.tool)).toEqual([...(known ? [names[0]] : []), child.tool]);
 		expect(executed.filter(tool => tool !== child.tool)).toHaveLength(count);
 	}
 	expect(rootContext?.messages).toEqual([]);
@@ -625,18 +628,28 @@ test.for(["independent", "unchanged", "batch", "batch-known", "mismatch-text", "
 	if (mode === "parent-miss") await f.execute(names[0]!, { path: "child.txt" });
 	else for (const root of roots) expect(await f.execute(root.tool, root.args)).toMatchObject(expected[roots.indexOf(root)]!);
 	settings.drafterEnabled = false; await f.finish(); await f.start("child");
-	if (mode === "stale") await writeFile(path.join(cwd, "child.txt"), "fresh\n");
-	expect(textOutput(await f.execute(child.tool, child.args))).toBe(dependent ? "prepared\n" : mode === "stale" ? "fresh\n" : "child\n");
-	expect(f.fallbacks).toEqual([]);
+	if (stale) await writeFile(path.join(cwd, "child.txt"), "fresh\n");
+	const consumer = cross ? names[2]! : child.tool, args = unused ? { path: "unused.txt" } : child.args;
+	allow = mode !== "learning-fallback";
+	expect(textOutput(await f.execute(consumer, args))).toBe(dependent ? "prepared\n" : stale ? "fresh\n" : unused ? "unused\n" : "child\n");
+	expect(f.fallbacks).toEqual(!allow || mode.includes("unkeyed") ? [consumer] : []);
 	await f.finish();
-	if (mode === "stale" || repairBudget) expect(f.actors.at(-1)).toMatchObject({ computation: { hiddenComputeMs: 0 } });
+	if (stale || repairBudget || unused) expect(f.actors.at(-1)).toMatchObject({ computation: { hiddenComputeMs: 0 } });
 	if (wrong && !repairBudget || recoverable || actualFirst || known || contractChanged) expect(f.actors.at(-1)!.computation!.hiddenComputeMs).toBeGreaterThan(0);
-	if (wrong && !inflight || mode === "parent-miss" || contractChanged) expect(f.events.some(event => event.type === "prediction" && event.tool === child.tool &&
+	if (wrong && !inflight || mode === "parent-miss" || contractChanged) expect(f.predictions.some(event => event.tool === child.tool &&
 		event.settlement.observation === "unobserved" && event.settlement.cause.code === "dependency_impossible")).toBe(true);
-	if (mode !== "parent-miss" && !repairBudget) expect(f.events.some(event => event.type === "prediction" && event.tool === child.tool &&
+	if (mode !== "parent-miss" && !repairBudget && !cross && !unused) expect(f.predictions.some(event => event.tool === child.tool &&
 		event.settlement.observation === "observed" && event.settlement.match.matched)).toBe(true);
 	if (inflight) expect(executed.filter(tool => tool === child.tool)).toHaveLength(1);
 	expect(requests).toBe(budget.requests + Number(contractChanged)); expect(f.host.drafterBudgetSnapshot().budget.requests).toBe(requests);
+	if (learning) {
+		expectHiddenCompute(f.actors.at(-1)!.computation!, !stale && !unused);
+		allow = true; settings.drafterEnabled = true; settings.drafterMaxDepth = 0; await f.start("learning");
+		await expect.poll(() => f.materialized.find(candidate => candidate.turnID === "learning")).toMatchObject({
+			empiricalProbability: cross ? 0.5 : unused ? 1 / 3 : 2 / 3,
+			adoptionProbability: !stale && !unused ? 2 / 3 : cross || unused ? 0.5 : 1 / 3,
+		});
+	}
 });
 
 test.for(["completed", "inflight", "forecast", "binding", "parent-binding", "reverse", "both", "unchanged", "malformed-scope", "duplicate-scope", "extra-scope", "budget", "stale", "deep"])("repairs only branches that read changed observations (%s)", async mode => {
@@ -697,24 +710,22 @@ test.for(["completed", "inflight", "forecast", "binding", "parent-binding", "rev
 		},
 	}, settings);
 	await using _cleanup = onExit(async () => { for (const gate of gates) gate.resolve(); delayed.resolve(); await f.dispose(); });
-	const completed = (file: string) => f.events.find(event => event.type === "candidate" && event.state.status === "succeeded" && JSON.parse(event.candidate.predictedAction).input.path === file);
-	const ready = async (files: string[]) => { for (const file of files) await expect.poll(() => Boolean(completed(file))).toBe(true); };
 	await f.start();
-	if (mode === "forecast") { await expect.poll(() => forecasts.length).toBe(2); await ready(["b-new.txt"]); }
+	if (mode === "forecast") { await expect.poll(() => forecasts.length).toBe(2); await f.ready(["b-new.txt"]); }
 	else if (mode === "parent-binding") await expect.poll(() => calls.some(call => call.path === "a-old.txt")).toBe(true);
-	else if (mode === "inflight" || mode === "binding") { await expect.poll(() => calls.length).toBe(3); await ready(["b-new.txt"]); }
-	else if (mode === "reverse") { await ready(["b-new.txt", "ab-old.txt"]); delayed.resolve(); await ready(["a-old.txt"]); }
-	else await ready(scopes.map(ids => `${ids.join("")}-${unchanged || ids.join("") === "b" && !both ? "new" : "old"}.txt`));
-	if (deep) await ready(["a-old.next.txt", "b-new.next.txt", "ab-old.next.txt"]);
-	const bCandidate = completed("b-new.txt");
+	else if (mode === "inflight" || mode === "binding") { await expect.poll(() => calls.length).toBe(3); await f.ready(["b-new.txt"]); }
+	else if (mode === "reverse") { await f.ready(["b-new.txt", "ab-old.txt"]); delayed.resolve(); await f.ready(["a-old.txt"]); }
+	else await f.ready(scopes.map(ids => `${ids.join("")}-${unchanged || ids.join("") === "b" && !both ? "new" : "old"}.txt`));
+	if (deep) await f.ready(["a-old.next.txt", "b-new.next.txt", "ab-old.next.txt"]);
+	const bCandidate = f.completed("b-new.txt")[0];
 	gates[0]!.resolve(); if (both) gates[1]!.resolve();
 	if (mode === "parent-binding") { await expect.poll(() => calls.some(call => call.path === "a-new.txt")).toBe(true); expect(executed).not.toContain("b.txt"); delayed.resolve(); }
 	const expected = scopes.map(ids => `${ids.join("")}-new.txt`);
 	if (mode === "budget") await expect.poll(() => f.host.drafterBudgetSnapshot().budget.skippedRequests).toBe(2);
-	else await ready(expected);
-	if (deep) await ready(["a-new.next.txt", "ab-new.next.txt"]);
-	if (!both) expect(completed("b.txt")).toBeUndefined();
-	if (bCandidate) { expect(completed("b-new.txt")).toBe(bCandidate); expect(calls.filter(call => call.path === "b-new.txt")).toHaveLength(1);
+	else await f.ready(expected);
+	if (deep) await f.ready(["a-new.next.txt", "ab-new.next.txt"]);
+	if (!both) expect(f.completed("b.txt")[0]).toBeUndefined();
+	if (bCandidate) { expect(f.completed("b-new.txt")[0]).toBe(bCandidate); expect(calls.filter(call => call.path === "b-new.txt")).toHaveLength(1);
 		expect(calls.find(call => call.path === "b-new.txt")!.signal.aborted).toBe(false); }
 	if (mode === "inflight") expect(calls.filter(call => call.path.includes("old")).every(call => call.signal.aborted)).toBe(true);
 	if (mode === "forecast") expect(forecasts.every(signal => signal.aborted)).toBe(true);
@@ -722,15 +733,14 @@ test.for(["completed", "inflight", "forecast", "binding", "parent-binding", "rev
 	if (mode === "binding") delayed.resolve();
 	await expect.poll(() => f.host.drafterBudgetSnapshot().budget.reservedTokens).toBe(0);
 	if (unchanged) expect(calls).toHaveLength(3);
-	gates[1]!.resolve(); await ready(["a.txt", "b.txt"]);
+	gates[1]!.resolve(); await f.ready(["a.txt", "b.txt"]);
 	for (const root of roots) expect(textOutput(await f.execute(names[0]!, { path: root.path }))).toBe(root.text);
 	settings.drafterEnabled = false; await f.finish(); await f.start("children");
 	if (mode === "stale") await writeFile(path.join(cwd, "a-new.txt"), "fresh\n");
 	for (const file of expected) {
 		expect(textOutput(await f.execute(names[1]!, { path: file }))).toBe(mode === "stale" && file === "a-new.txt" ? "fresh\n" : `${file.replace(/\.txt$/, "")}\n`);
-		const consumed = () => f.events.find(event => event.type === "actor_action" && JSON.parse(event.actualAction).input.path === file);
+		const consumed = () => f.actors.find(event => JSON.parse(event.actualAction).input.path === file);
 		await expect.poll(consumed).toBeDefined(); const event = consumed()!;
-		if (event.type !== "actor_action") throw new Error("Missing actual consumption");
 		if (mode === "budget" && file !== "b-new.txt" || mode === "stale" && file === "a-new.txt") expect(event.computation!.hiddenComputeMs).toBe(0);
 		else expect(event.computation!.hiddenComputeMs).toBeGreaterThan(0);
 	}
@@ -738,14 +748,13 @@ test.for(["completed", "inflight", "forecast", "binding", "parent-binding", "rev
 		await f.finish(); await f.start("grandchildren");
 		for (const file of ["a-new.next.txt", "b-new.next.txt", "ab-new.next.txt"]) {
 			expect(textOutput(await f.execute(names[1]!, { path: file }))).toBe(`${file.replace(/\.txt$/, "")}\n`);
-			await expect.poll(() => f.events.find(event => event.type === "actor_action" && JSON.parse(event.actualAction).input.path === file)).toMatchObject({ computation: { hiddenComputeMs: expect.any(Number) } });
+			await expect.poll(() => f.actors.find(event => JSON.parse(event.actualAction).input.path === file)).toMatchObject({ computation: { hiddenComputeMs: expect.any(Number) } });
 			expect(f.actors.at(-1)!.computation!.hiddenComputeMs).toBeGreaterThan(0);
 		}
 		expect(calls.filter(call => call.path.startsWith("b-new"))).toHaveLength(2);
 	}
 	await f.finish();
-	for (const file of [...(scopes.length > 1 ? ["b-new.txt"] : []), ...(deep ? ["b-new.next.txt"] : [])]) expect(f.events.filter(event =>
-		event.type === "prediction" && JSON.parse(event.predictedAction!).input.path === file)).toMatchObject([{ settlement: { observation: "observed", match: { matched: true } } }]);
+	for (const file of [...(scopes.length > 1 ? ["b-new.txt"] : []), ...(deep ? ["b-new.next.txt"] : [])]) expect(f.predictions.filter(event => JSON.parse(event.predictedAction!).input.path === file)).toMatchObject([{ settlement: { observation: "observed", match: { matched: true } } }]);
 	expect(f.events.some(event => event.type === "source_request" && event.request.settlement.status === "timeout")).toBe(false);
 	if (["inflight", "forecast", "binding"].includes(mode)) expect(executed.some(file => file.includes("old"))).toBe(false);
 	if (bCandidate) expect(executed.filter(file => file === "b-new.txt")).toHaveLength(1);
@@ -796,10 +805,10 @@ test.each(["ordered", "independent", "dependent"])("adopts only the proven effec
 		{ tool: "edit", input: { path: "notes.txt", edits: [{ oldText: "omega", newText: "final" }] } },
 	];
 	let predict = true, drafted = 0;
-	const world = sandbox.createExecutionWorld({ driver: "git" }), fork = deferred(), release = deferred();
+	const world = sandbox.createExecutionWorld({ driver: "git" }), fork = gated();
 	const f = systemHost(cwd, [createWriteTool(cwd), createEditTool(cwd)], {
 		executionWorlds: [{ ...world, speculation: { ...world.speculation, execute: async context => {
-			if (order === "independent" && (context.args as { path: string }).path === "notes.txt" && context.toolName === "edit") { fork.resolve(); await release.promise; }
+			if (order === "independent" && (context.args as { path: string }).path === "notes.txt" && context.toolName === "edit") await fork.wait();
 			return world.speculation.execute(context);
 		} } }],
 		complete: async (_model, context) => {
@@ -812,11 +821,11 @@ test.each(["ordered", "independent", "dependent"])("adopts only the proven effec
 		getSettings: () => ({ enabled: true, drafterEnabled: predict, candidateLimit: 1, maxConcurrentActions: 2,
 			drafterMaxDepth: 2, patternAware: { enabled: false } }),
 	});
-	await using _cleanup = onExit(async () => { release.resolve(); await f.dispose(); await sandbox.dispose(); });
+	await using _cleanup = onExit(async () => { fork.release(); await f.dispose(); await sandbox.dispose(); });
 	await f.start(); await f.ready(order === "independent" ? 2 : 3); predict = false;
 	expect(await readFile(file, "utf8")).toBe("original\n");
 	if (order === "independent") {
-		await fork.promise; await f.execute(steps[1]!.tool, steps[1]!.input); release.resolve(); await f.ready(3);
+		await fork.entered; await f.execute(steps[1]!.tool, steps[1]!.input); fork.release(); await f.ready(3);
 	}
 	await f.finish(true);
 	if (order === "dependent") {
@@ -877,7 +886,7 @@ test.for(["unrelated", "changed", "descendant", "mutation", "mutation-stat", "mu
 	if (change === "descendant") { await f.finish(); await f.start("next"); expect(textOutput(await f.execute("bash", { command: "cat c.txt" }))).toBe("second\n"); }
 	await f.finish(true);
 	const actors = f.actors, timing = actors.at(-1)!.computation!, fallback = metadata || split || change === "changed";
-	expect(timing.hiddenComputeMs > 0).toBe(!metadata && !stale && change !== "changed"); expect(timing.toolComputeMs).toBeGreaterThanOrEqual(timing.hiddenComputeMs);
+	expectHiddenCompute(timing, !metadata && !stale && change !== "changed");
 	expect(f.fallbacks, JSON.stringify(actors)).toEqual([...(mutation ? [] : ["write"]), ...(fallback ? ["bash"] : [])]);
 	expect(f.events.filter(event => event.type === "candidate" && event.state.status === "running")).toHaveLength(change === "descendant" || mutation ? 2 : 1);
 	if (mutation) {
@@ -891,7 +900,7 @@ test("reconsiders restored results while sharing pending reads and retains fresh
 	const file = path.join(cwd, "notes.txt"), original = Array.from({ length: 20 }, (_, i) => `line ${i + 1}`).join("\n");
 	await writeFile(file, original);
 	const world = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { maxBytes: () => 1024 * 1024 });
-	const computed = deferred(), release = deferred(), entered = deferred(), controller = new AbortController();
+	const computed = gated(), entered = deferred(), controller = new AbortController();
 	const args = { path: "notes.txt", offset: 5, limit: 1 }, wide = { ...args, offset: 1, limit: 10 };
 	let runs = 0, authorizations = 0;
 	const f = systemHost(cwd, [reader, createWriteTool(cwd)], {
@@ -902,18 +911,18 @@ test("reconsiders restored results while sharing pending reads and retains fresh
 		},
 		executionWorlds: [{ ...world, speculation: { ...world.speculation!, execute: async context => {
 			const first = ++runs === 1, branch = await world.speculation!.execute(context);
-			if (!first) { computed.resolve(); await release.promise; } return first ? { ...branch, reconstruct: undefined, reconstructionScope: undefined,
+			if (!first) await computed.wait(); return first ? { ...branch, reconstruct: undefined, reconstructionScope: undefined,
 				validate: async () => { const result = await branch.validate!(); if (result.status === "stale") entered.resolve(); return result; },
 			} : branch;
 		} } }],
 	});
 	let actors: Promise<unknown>[] = [];
-	await using _cleanup = onExit(async () => { controller.abort(); release.resolve(); await Promise.allSettled(actors); await f.dispose(); });
+	await using _cleanup = onExit(async () => { controller.abort(); computed.release(); await Promise.allSettled(actors); await f.dispose(); });
 	await f.start(); await f.preview("read", args); await f.ready();
 	await writeFile(file, original.replaceAll("line", "edit"));
-	await f.preview("read", wide); await computed.promise;
+	await f.preview("read", wide); await computed.entered;
 	actors = [1, 2].map(() => f.execute("read", args, controller.signal).catch(error => error)); await entered.promise;
-	await writeFile(file, original); release.resolve();
+	await writeFile(file, original); computed.release();
 	const expected = await reader.execute("oracle", args); expect(await Promise.all(actors)).toEqual([expected, expected]);
 	await f.preview("read", { ...args, offset: 6 }); await f.finish(); await f.start("second");
 	for (const event of f.actors) {

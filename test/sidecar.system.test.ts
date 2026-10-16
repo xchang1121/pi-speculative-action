@@ -2,7 +2,6 @@ import { createServer } from "node:http";
 import { afterEach, expect, test, vi } from "vitest";
 import { createActorForkPlanSource } from "../src/actor-fork-plan-source.ts";
 import { SelfSpeculationCoordinator, SELF_SPECULATION_DEFAULTS } from "../src/self-speculation.ts";
-import { forkReceipt } from "./fork.ts";
 import { testModel } from "./model.ts";
 
 afterEach(() => vi.unstubAllEnvs());
@@ -16,11 +15,11 @@ test.each(["valid", "low confidence", "HTTP failure"])("runs a sidecar fork over
 		response.setHeader("content-type", "application/json");
 		const fork = request.url === SELF_SPECULATION_DEFAULTS.forkPath;
 		if (fork && mode === "HTTP failure") { response.writeHead(503); response.end('{}'); return; }
-		response.end(JSON.stringify(fork ? forkReceipt([{
+		response.end(JSON.stringify(fork ? { details: { bundle: { candidates: [{
 			sources: ["self-speculation"],
 			tool_calls: [{ name: "read", arguments: { path: "notes.txt" } }],
 			fork: { logprobs: { token_count: 2, mean: -0.03, tool_name: { minimum_probability: mode === "low confidence" ? 0.1 : 0.95 } } },
-		}]) : { capabilities: { fork: true, logprobs: true, provider: true }, ok: true }));
+		}] } } } : { capabilities: { fork: true, logprobs: true, provider: true }, ok: true }));
 	});
 	await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
 	const address = server.address(); if (!address || typeof address === "string") throw new Error("missing HTTP address");

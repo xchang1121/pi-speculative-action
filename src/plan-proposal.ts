@@ -32,7 +32,7 @@ export interface PlanAction {
 	/** Latest Actor tool batches before this prediction becomes a miss. Defaults to horizon. */
 	readonly latestHorizon?: number;
 	readonly empiricalProbability?: number;
-	/** Chance a matched prediction can actually be adopted; independent of prediction precision. */
+	/** Chance prepared work is consumed, including shared inputs; independent of prediction precision. */
 	readonly adoptionProbability?: number;
 	readonly conditionalProbability?: number;
 	readonly confidence?: number;

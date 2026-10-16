@@ -10,7 +10,7 @@ import type { SpeculativeActionSettings } from "./runtime.ts";
 import { stableValueHash } from "./stable-value-hash.ts";
 import { immutableSnapshot } from "./stable-json.ts";
 import { SourceRequestSuppressed } from "./source-request.ts";
-import { cause } from "./settlement.ts";
+import { cause, predictionLearning } from "./settlement.ts";
 import { canonicalToolObservation, toolObservationContract, toolObservationKey, type ToolSettlement } from "./tool-settlement.ts";
 import type { ActionKey } from "./action-semantics.ts";
 import { SharedAbortScope } from "./runtime-lifecycle.ts";
@@ -63,10 +63,6 @@ export function createDrafterPlanSource(input: {
 	const calibrationKey = (batch: DrafterBatch, tool: string) => JSON.stringify([batch.key, tool]);
 	const probability = (samples: readonly number[] = []) => (samples.reduce((sum, value) => sum + value, 0) + 1) / (samples.length + 2);
 	const observe = (samples: number[], outcome: boolean) => { samples.push(Number(outcome)); if (samples.length > 32) samples.shift(); };
-	const probabilities = (batch: DrafterBatch, tool: string) => {
-		const samples = calibration.get(calibrationKey(batch, tool));
-		return { empiricalProbability: probability(samples?.matches), adoptionProbability: probability(samples?.adoptions) };
-	};
 	const finishBatch = (key: string) => {
 		const batch = batches.get(key);
 		batches.delete(key);
@@ -113,19 +109,23 @@ export function createDrafterPlanSource(input: {
 			continuations: [...unique.values()].map(actionIDs => ({ actionIDs, feedback: { forecasts: new Map() } })) };
 		feedbacks.set(feedback, feedback);
 		for (const continuation of feedback.continuations) feedbacks.set(continuation.feedback, feedback);
-		return { actions: [...feedback.calls].map(([id, { call }]): PlanAction => ({ id, type: "tool_call", tool: call.name,
-			input: call.arguments, depth, feedback, dependsOn, ...probabilities(batch, call.name) })) };
+		return { actions: [...feedback.calls].map(([id, { call }]): PlanAction => {
+			const samples = calibration.get(calibrationKey(batch, call.name));
+			return { id, type: "tool_call", tool: call.name, input: call.arguments, depth, feedback, dependsOn,
+				empiricalProbability: probability(samples?.matches), adoptionProbability: probability(samples?.adoptions) };
+		}) };
 	};
 	const source: AgentPlanSource = {
 		id: "drafter",
-		onSettled: ({ actionID, feedback, settlement }) => {
+		onSettled: ({ actionID, feedback, settlement, served }) => {
 			const batch = feedbacks.get(feedback as object), tool = batch?.calls.get(actionID)?.call.name;
-			if (!batch || !tool || settlement.observation !== "observed") return;
+			const { matched, adopted } = predictionLearning(settlement, served);
+			if (!batch || !tool || matched === undefined && adopted === undefined) return;
 			const key = calibrationKey(batch, tool);
 			let samples = calibration.get(key);
 			if (!samples) { samples = { matches: [], adoptions: [] }; calibration.set(key, samples); }
-			observe(samples.matches, settlement.match.matched);
-			if (settlement.match.matched) observe(samples.adoptions, settlement.match.adoption.status === "adopted");
+			if (matched !== undefined) observe(samples.matches, matched);
+			if (adopted !== undefined) observe(samples.adoptions, adopted);
 		},
 		enabled: (settings) => (settings.drafterEnabled ?? DEFAULTS.drafterEnabled) && settings.tools?.length !== 0,
 		timeoutMs: (settings) => settings.predictionTimeoutMs,

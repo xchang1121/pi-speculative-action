@@ -9,7 +9,7 @@ import { BoundedRecencyMap } from "./bounded-recency-map.ts";
 import { patternSessionBudgets, type PatternPendingValidation, type PatternRecurrentAction, type PatternSessionState } from "./pattern-session-state.ts";
 import { containsLogicalPath, relativeFilesystemPath } from "./path-utils.ts";
 import { PpmCountTrie, type PpmCountTrieRow } from "./ppm-count-trie.ts";
-import type { PredictionSettlement, ResolutionStage } from "./settlement.ts";
+import { predictionLearning, type PredictionSettlement, type ResolutionStage } from "./settlement.ts";
 import { asRecord, isObject, stableEqual as sameValue, stableStringify } from "./stable-json.ts";
 import { booleanOr, nonNegativeInteger, positiveInteger, probability as probabilitySetting, settingsParser } from "./setting-input.ts";
 import { PATTERN_AWARE_PRESETS, patternPresetActions, type PatternAwarePresetID } from "./pattern-aware-presets.ts";
@@ -718,31 +718,21 @@ export class PatternAwareStore {
 		const feedback = this.supportFeedback(support);
 		if (!feedback) return;
 		const recent = feedbackEvidence({ feedback }, this.clock, this.settings.decayHalfLifeEvents);
-		feedback.recentMatchedWeight = recent.matched;
-		feedback.recentMismatchedWeight = recent.mismatched;
-		feedback.recentAdoptedWeight = recent.adopted;
-		feedback.recentRejectedWeight = recent.rejected;
+		const { matched, adopted } = predictionLearning(settlement, served);
+		feedback.recentMatchedWeight = recent.matched + Number(matched === true);
+		feedback.recentMismatchedWeight = recent.mismatched + Number(matched === false);
+		feedback.recentAdoptedWeight = recent.adopted + Number(adopted === true);
+		feedback.recentRejectedWeight = recent.rejected + Number(adopted === false);
 		feedback.sequence = this.clock;
-		const adopted = served ?? (settlement.observation === "observed" && settlement.match.matched && settlement.match.adoption.status === "adopted");
-		if (adopted) { feedback.adopted++; feedback.recentAdoptedWeight++; }
+		feedback.adopted += Number(adopted === true);
+		feedback.matched += Number(matched === true);
+		feedback.observed += Number(settlement.observation === "observed");
 		if (settlement.observation === "unobserved") {
 			const key = `${settlement.cause.stage}:${settlement.cause.code}`;
 			feedback.unobserved[key] = (feedback.unobserved[key] ?? 0) + 1;
-		} else {
-			feedback.observed++;
-			if (!settlement.match.matched) {
-				if (!adopted) feedback.recentMismatchedWeight++;
-			} else {
-				feedback.matched++;
-				feedback.recentMatchedWeight++;
-				if (!adopted) {
-					feedback.recentRejectedWeight++;
-					if (settlement.match.adoption.status === "rejected") {
-						const stage = settlement.match.adoption.cause.stage;
-						feedback.rejectedAfterMatch[stage] = (feedback.rejectedAfterMatch[stage] ?? 0) + 1;
-					}
-				}
-			}
+		} else if (settlement.match.matched && !adopted && settlement.match.adoption.status === "rejected") {
+			const stage = settlement.match.adoption.cause.stage;
+			feedback.rejectedAfterMatch[stage] = (feedback.rejectedAfterMatch[stage] ?? 0) + 1;
 		}
 		if (typeof support === "string") this.persist();
 	}
@@ -2097,13 +2087,13 @@ function patternRank(pattern: MutablePattern, clock: number, halfLife: number) {
 	);
 }
 
-function feedbackEvidence(pattern: Pick<MutablePattern, "feedback">, clock: number, halfLife: number) {
-	const weight = recencyWeight(pattern.feedback.sequence, clock, halfLife);
+function feedbackEvidence({ feedback }: Pick<MutablePattern, "feedback">, clock: number, halfLife: number) {
+	const weight = recencyWeight(feedback.sequence, clock, halfLife);
 	return {
-		matched: pattern.feedback.recentMatchedWeight * weight,
-		mismatched: pattern.feedback.recentMismatchedWeight * weight,
-		adopted: pattern.feedback.recentAdoptedWeight * weight,
-		rejected: pattern.feedback.recentRejectedWeight * weight,
+		matched: feedback.recentMatchedWeight * weight,
+		mismatched: feedback.recentMismatchedWeight * weight,
+		adopted: feedback.recentAdoptedWeight * weight,
+		rejected: feedback.recentRejectedWeight * weight,
 	};
 }
 
