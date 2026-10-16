@@ -5,7 +5,7 @@ import { cause, type ResourceValidation, zeroValidationMetrics } from "./settlem
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
 import { errorMessage as errorDetail } from "./error-utils.ts";
 import { immutableSnapshot } from "./stable-json.ts";
-import type { TimelineDependency } from "./task-timing.ts";
+import { TimelineInterval, type TimelineDependency } from "./task-timing.ts";
 
 /** Concrete isolation used for one speculative execution. */
 export type SpeculativeExecution = "runtime_sandbox" | "resource_snapshot" | "workspace_branch";
@@ -200,7 +200,7 @@ export interface WorldResultCapture<Output> {
 	readonly dispose: () => void | Promise<void>;
 }
 
-export interface CapturedExecutionWorldResult<Output> {
+export interface CapturedExecutionWorldResult<Output> extends Pick<WorldBranch<Output>, "computationDependencies"> {
 	readonly route: SpeculativeExecutionRoute;
 	readonly capture: WorldResultCapture<Output>;
 }
@@ -366,7 +366,9 @@ export class ExecutionWorldRouter<Context, Output, ObservationContext = Context>
 	}
 
 	fork(route: SpeculativeExecutionRoute, context: Context): Promise<WorldBranch<Output>> {
-		const world = this.world(route);
+		const world = this.worldsByID.get(route.backend);
+		if (!world || world.scope !== route.scope || world.isolation !== route.isolation)
+			throw new Error(`Execution world ${route.backend} is unavailable for ${route.isolation}`);
 		if (!this.speculationEnabled(world.id)) throw new Error(`Execution world ${world.id} is disabled by routing policy`);
 		if (!world.speculation) throw new Error(`Execution world ${world.id} does not provide speculative execution`);
 		return this.lifecycle.admit(() => world.speculation!.execute(context));
@@ -396,11 +398,11 @@ export class ExecutionWorldRouter<Context, Output, ObservationContext = Context>
 			request,
 			preparation,
 			async (world, route) => {
-				const capture = await world.observation!.capture(context);
+				const { output: capture, dependencies: computationDependencies } = await TimelineInterval.collect(() => world.observation!.capture(context));
 				if ((!request.action || !effectCapabilitiesCover(world.observation!.capabilities, request.requirements)) && !capture.inputsOnly) {
 					await capture.dispose(); throw new Error("input_only_capture_required");
 				}
-				return Object.freeze({ route: capture.inputsOnly ? Object.freeze({ ...route, reuse: "shared_result" as const }) : route, capture });
+				return Object.freeze({ route: capture.inputsOnly ? Object.freeze({ ...route, reuse: "shared_result" as const }) : route, capture, computationDependencies });
 			},
 		));
 	}
@@ -432,14 +434,6 @@ export class ExecutionWorldRouter<Context, Output, ObservationContext = Context>
 				return Object.freeze({ id: world.id, scope: world.scope, isolation: world.isolation, ...speculation, ...(observation ? { observation } : {}) });
 			}),
 		));
-	}
-
-	private world(route: SpeculativeExecutionRoute): ExecutionWorld<Context, Output, ObservationContext> {
-		const world = this.worldsByID.get(route.backend);
-		if (!world || world.scope !== route.scope || world.isolation !== route.isolation) {
-			throw new Error(`Execution world ${route.backend} is unavailable for ${route.isolation}`);
-		}
-		return world;
 	}
 
 	private async select<Selected>(
@@ -486,8 +480,7 @@ export class ExecutionWorldRouter<Context, Output, ObservationContext = Context>
 						Object.defineProperty(route, "dependsOn", { value: (parent: ActionKey) => dependsOn(action, parent) });
 					}
 					Object.freeze(route);
-					const selection = select(world, route);
-					const selected = isPromiseLike(selection) ? await selection : selection;
+					const selected = await select(world, route);
 					if (selected !== undefined) return selected;
 				} catch (error) {
 					if (preparation.signal?.aborted) throw error;
@@ -540,9 +533,4 @@ export class ExecutionWorldRouter<Context, Output, ObservationContext = Context>
 
 function supportsTool(operation: { readonly tools?: readonly string[] }, tool: string | undefined): boolean {
 	return tool === undefined || operation.tools === undefined || operation.tools.includes(tool);
-}
-
-
-function isPromiseLike<Value>(value: Value | Promise<Value>): value is Promise<Value> {
-	return Boolean(value && typeof value === "object" && "then" in value && typeof value.then === "function");
 }

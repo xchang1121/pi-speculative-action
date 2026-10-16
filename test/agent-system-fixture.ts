@@ -58,6 +58,6 @@ export function systemHost(cwd: string, tools: AgentTool[], options: Partial<Cre
 }
 
 export function expectHiddenCompute(timing: ToolComputationTiming, consumed: boolean) {
-	expect(timing.hiddenComputeMs > 0).toBe(consumed);
+	if (consumed) expect(timing.hiddenComputeMs).toBeGreaterThan(0); else expect(timing.hiddenComputeMs).toBe(0);
 	expect(timing.hiddenComputeMs).toBeLessThanOrEqual(timing.toolComputeMs!);
 }

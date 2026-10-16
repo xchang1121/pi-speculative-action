@@ -2,7 +2,7 @@ import type { ActionProjectionRule } from "./action-key-projection.ts";
 import type { ActionKey, ActionSemanticsRegistry } from "./action-semantics.ts";
 import type { DrafterToolDefinition } from "./common.ts";
 import type { CandidateEventDescriptor, SpeculativeActionEvent } from "./events.ts";
-import type { ExecutionOperationAdoption, ExecutionOperationBinding, ExecutionScope, SpeculativeExecutionRoute, WorldBranch, WorldResultCapture } from "./execution-world.ts";
+import type { CapturedExecutionWorldResult, ExecutionOperationAdoption, ExecutionOperationBinding, ExecutionScope, SpeculativeExecutionRoute, WorldBranch, WorldResultCapture } from "./execution-world.ts";
 import type { PlanAction, PlanProposal, PlanUpdate } from "./plan-proposal.ts";
 import type { ActorActionIdentity, ActorActionSettlement, PlanActionIdentity, PredictionSettlement, SettledSourceRequest } from "./settlement.ts";
 import type { TimelineInterval, ToolComputationTiming } from "./task-timing.ts";
@@ -48,9 +48,7 @@ export interface SpeculativeCandidate extends Pick<PlanAction, "tool" | "empiric
 }
 
 /** A pre-Actor freshness baseline that can promote the Actor's own result into the shared cache. */
-export interface AuthoritativeResultCapture<Output> extends WorldResultCapture<Output> {
-	readonly route: SpeculativeExecutionRoute;
-}
+export interface AuthoritativeResultCapture<Output> extends WorldResultCapture<Output>, Omit<CapturedExecutionWorldResult<Output>, "capture"> {}
 
 /** A validated, concrete prediction suitable for a target-model draft verifier. */
 export interface MaterializedSpeculativeCandidate<SessionID> extends Pick<PlanAction,

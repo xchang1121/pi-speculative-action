@@ -61,7 +61,7 @@ export class ToolExecutionGateway<Context, Output, ObservationContext = Context>
 		context: ObservationContext,
 	): Promise<CapturedExecutionWorldResult<Output> | undefined> {
 		const captured = await super.captureAuthoritativeResult(request, preparation, context);
-		return captured && Object.freeze({ route: captured.route, capture: this.transactions.capture(
+		return captured && Object.freeze({ ...captured, capture: this.transactions.capture(
 			this.transactions.begin({ tool: request.action?.tool ?? request.tool ?? "", callID: request.callID, route: captured.route }), captured.capture) });
 	}
 

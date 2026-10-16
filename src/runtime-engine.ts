@@ -208,11 +208,6 @@ function candidateEventDescriptor<Output>(candidate: CandidateRecord<Output>): C
 	};
 }
 
-function executionDuration<Output>(candidate: CandidateRecord<Output> | undefined): number {
-	const execution = candidate?.work.execution;
-	return execution && "executionMs" in execution ? execution.executionMs : 0;
-}
-
 function estimateValueBytes(value: unknown, seen = new WeakSet<object>()): number {
 	if (value === null || value === undefined) return 0;
 	if (typeof value === "string") return value.length * 2;
@@ -1628,6 +1623,9 @@ export function makeSpeculativeActionRuntime<
 			retireUndemandedCandidate(state.session, candidate, cause("retention", "prediction_horizon_settled"));
 		if (!state.actorActions.delete(actorAction)) return;
 		const capture = actorAction.takeCapture();
+		// Captured inputs add no second tool clock.
+		if (capture?.computationDependencies?.length) toolExecution = new TimelineInterval(toolExecution.startedAt, toolExecution.completedAt,
+			[{ computation: toolExecution, owned: true }, ...capture.computationDependencies], [], null);
 		const settlement = actorAction.settleActor(toolExecution, outputIsError(output));
 		if (!settlement) { state.session.lifecycle.release(capture); return; }
 		const execution = settlement.provider.toolExecution, durationMs = execution.completedAt - execution.startedAt;
@@ -1698,6 +1696,7 @@ export function makeSpeculativeActionRuntime<
 				const observation = cloneSharedData({ concrete: asConcreteInput(actualCall.input) ?? {}, ...(output !== undefined ? { output } : {}) });
 				state.session.effects.enqueue(async () => {
 					if (!source.enabled(state.settings)) return;
+					const execution = settledCandidate?.work.execution;
 					const updates = await source.observe?.({
 						...turnContext(state),
 						consumeInput: input,
@@ -1705,8 +1704,7 @@ export function makeSpeculativeActionRuntime<
 						tool: actorAction.tool,
 						...observation,
 						operations: operations ?? (settledCandidate && candidateBranch(settledCandidate)?.operations),
-						durationMs:
-							settlement.provider.kind === "actor" ? settlement.provider.durationMs : executionDuration(settledCandidate),
+						durationMs: settlement.provider.kind === "actor" ? settlement.provider.durationMs : execution && "executionMs" in execution ? execution.executionMs : 0,
 						order: settlement.actorAction.sequence,
 						signal: state.generation.signal,
 						reserveRevision: (proposalID, minimum) => state.session.plan.reserveRevision(proposalID, minimum) ?? minimum,
@@ -2207,7 +2205,7 @@ export function makeSpeculativeActionRuntime<
 	};
 
 	const clearActorActions = (state: Turn): void => {
-		for (const action of state.actorActions) { action.finishFallback(); const capture = action.takeCapture(); if (capture) state.session.lifecycle.release(capture); }
+		for (const action of state.actorActions) { action.finishFallback(); state.session.lifecycle.release(action.takeCapture()); }
 		state.actorActions.clear();
 	};
 

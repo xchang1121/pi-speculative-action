@@ -288,7 +288,7 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 					executionScope: { sessionID: startInput.sessionID, turnID: startInput.turnID },
 				},
 			);
-			return captured && { route: captured.route, ...captured.capture };
+			return captured && { route: captured.route, computationDependencies: captured.computationDependencies, ...captured.capture };
 		},
 		actual: (input) => ({ id: input.id, tool: input.tool, input: input.args }),
 		preflightCandidate: ({ data, tool: toolName, concrete, action, route, signal }) => {

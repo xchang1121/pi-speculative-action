@@ -8,7 +8,7 @@ import { WorkspaceSandboxService } from "../src/workspace-sandbox.ts";
 import { bindResourceOperation, createResourceSnapshotExecutionWorld } from "../src/agent-execution-world.ts";
 import { ResourceVersionManager } from "../src/resource-version.ts";
 import { createClosedSearchProfile, resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
-import { ActionSemanticsRegistry, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
+import { ActionSemanticsRegistry, PI_ACTION_SEMANTICS, type ActionSemanticsDefinition } from "../src/action-semantics.ts";
 import { PatternAwareStore, patternAwareSettings, patternAwareActionSemantics } from "../src/pattern-aware.ts";
 import { readText, temporaryDirectories } from "./filesystem.ts";
 import { expectHiddenCompute, systemHost } from "./agent-system-fixture.ts";
@@ -21,9 +21,13 @@ import type { AgentPlanSource } from "../src/agent-runtime-types.ts";
 const directories = temporaryDirectories("pi-agent-system-");
 afterEach(directories.dispose);
 
-function readScenario(cwd: string, names: readonly string[], definitions = names.map(tool => ({ ...PI_ACTION_SEMANTICS.definition("read")!, tool, epoch: tool, projectors: [] }))) {
+function readDefinition(tool: string): ActionSemanticsDefinition {
+	return { ...PI_ACTION_SEMANTICS.definition("read")!, tool, epoch: tool, projectors: [] };
+}
+
+function readScenario(cwd: string, names: readonly string[], definitions = names.map(readDefinition)) {
 	const reader = createReadTool(cwd), actionSemantics = new ActionSemanticsRegistry(definitions);
-	return { definitions, actionSemantics, tools: names.map(name => ({ ...reader, name })) as Parameters<typeof systemHost>[1],
+	return { reader, definitions, actionSemantics, tools: names.map(name => ({ ...reader, name })) as Parameters<typeof systemHost>[1],
 		world: createResourceSnapshotExecutionWorld(actionSemantics, { maxBytes: () => 1024 * 1024 }),
 		resolveInvocation: (tool: string, input: unknown) => ({ ...resolvePiToolInvocation("read", input, { cwd, environment: {} })!, semantics: definitions.find(definition => definition.tool === tool) }) };
 }
@@ -35,6 +39,8 @@ const inputScenarios = (preview = false) => [
 		"stat-same-size", "entry-same-size", "exists-missing", "exists-create", "exists-deleted", "exists-broken", ...process.platform === "linux" ? ["stat-special"] : []].map(mode => `input-${mode}`),
 ];
 const mixedScenarios = ["producer", "consumer", "stale", "failure", "budget", "outside", "revoke", "overlap", "cancel", "cancel-return", "unkeyed"].map(mode => `mixed-${mode}`);
+const retainedScenarios = ["seed-dynamic", "seed-calculation", "mixed-producer", "unkeyed-dynamic", "unkeyed-calculation", "input-read", "input-names",
+	"unkeyed-input-read-stale", "unkeyed-input-names-stale", "unkeyed-mixed-failure", "unkeyed-mixed-budget", "unkeyed-mixed-revoke", "unkeyed-revoke"];
 
 test.for(["actor", "preview", "dynamic", "dynamic-preview", "hints", "hints-preview", "retired", "retired-preview", "predicted", "stale", "binding",
 	"calculation", "calculation-preview", "calculation-unrelated", "calculation-unrelated-preview", "calculation-hint", "calculation-hint-preview", "calculation-key",
@@ -45,10 +51,9 @@ test.for(["actor", "preview", "dynamic", "dynamic-preview", "hints", "hints-prev
 		"unkeyed-mixed-overlap", "unkeyed-mixed-cancel", "revoked-unkeyed-mixed-overlap", "after:unkeyed-mixed-overlap", "after-cancel:unkeyed-mixed-overlap", "after:seed-calculation", "after-cancel-return:seed-calculation"].map(mode => `live-${mode}`),
 	...["dynamic", "dynamic-preview", "calculation", "calculation-preview", "calculation-unrelated", "calculation-key", "stale", "binding", "retired", "unbounded", "repeat", "revoke", "rejected-capture", "rejected-branch", "rejected-output",
 		...mixedScenarios, ...inputScenarios()].map(mode => `unkeyed-${mode}`),
-	...["large", "opaque"].flatMap(output => ["seed-dynamic", "seed-calculation", "mixed-producer", "unkeyed-dynamic", "unkeyed-calculation", "unkeyed-mixed-producer", "input-read", "input-names",
-		"unkeyed-input-read-stale", "unkeyed-input-names-stale", "unkeyed-mixed-failure", "unkeyed-mixed-budget", "unkeyed-mixed-revoke", "unkeyed-revoke", "unkeyed-calculation-unrelated"].map(mode => `${output}-${mode}`)),
-	...["after", "after-cancel", "consume", "consume-cancel", "consume-cancel-return", "before"].flatMap(failure => ["seed-dynamic", "seed-calculation", "mixed-producer", "input-read", "input-names", "unkeyed-dynamic", "unkeyed-calculation",
-		"unkeyed-input-read-stale", "unkeyed-input-names-stale", "unkeyed-mixed-stale", "unkeyed-mixed-failure", "unkeyed-mixed-cancel-return", "unkeyed-mixed-budget", "unkeyed-mixed-revoke", "unkeyed-revoke"].map(mode => `${failure}:${mode}`))])("shares actual inputs across independently formatted tools (%s)", async scenario => {
+	...["large", "opaque"].flatMap(output => [...retainedScenarios, "unkeyed-mixed-producer", "unkeyed-calculation-unrelated"].map(mode => `${output}-${mode}`)),
+	...["after", "after-cancel", "consume", "consume-cancel", "consume-cancel-return", "before"].flatMap(failure => [...retainedScenarios,
+		"unkeyed-mixed-stale", "unkeyed-mixed-cancel-return"].map(mode => `${failure}:${mode}`))])("shares actual inputs across independently formatted tools (%s)", async scenario => {
 	const live = scenario.startsWith("live-"), revoked = scenario.startsWith("live-revoked-"); scenario = scenario.replace(/^live-(?:revoked-)?/, "");
 	const parentFailure = scenario.includes(":") ? scenario.split(":")[0] : undefined, early = parentFailure === "before";
 	scenario = scenario.replace(/^.*:/, "");
@@ -175,8 +180,8 @@ test.for(["actor", "preview", "dynamic", "dynamic-preview", "hints", "hints-prev
 	if (parentFailure) expect(f.actors.find(event => event.settlement.tool === names[0])).toMatchObject({ settlement: { provider: { kind: "actor", isError: !parentFailure.endsWith("return") } }, computation: { hiddenComputeMs: 0 } });
 	await f.finish();
 	const timing = f.actors.filter(event => event.settlement.tool === names[1]).at(-1)?.computation;
-	if (mode !== "binding") expect(timing?.hiddenComputeMs! > 0, JSON.stringify({ timing, events: f.events })).toBe(!stale && !unavailable && (!failed || direct) && !(direct && cancelled) && !["calculation-key", "revoke"].includes(mode));
-	if (cancelled) expect(f.actors[0]?.computation?.hiddenComputeMs).toBe(0);
+	if (mode !== "binding") expectHiddenCompute(timing!, !stale && !unavailable && (!failed || direct) && !(direct && cancelled) && !["calculation-key", "revoke"].includes(mode));
+	if (cancelled) expectHiddenCompute(f.actors[0]!.computation!, false);
 });
 
 test.for(["weak", "full", "invalidated", "directory", "directory-full", "missing", ...process.platform === "linux" ? ["special"] : []])("retains only independently proven metadata (%s)", async mode => {
@@ -207,7 +212,7 @@ test.for(["stale", "all-stale", "binding", "failure", "cancel", "composed", "rev
 	const alias = path.join(cwd, "current"), args = { path: mode === "alias" ? "current" : "input.txt" };
 	if (mode === "alias") { for (const name of ["old", "new"]) await mkdir(path.join(cwd, name)); await symlink(path.join(cwd, "old"), alias, "junction"); }
 	const names = ["prepare_count", "prepare_summary", "consume_count"], { definitions, actionSemantics, tools, world } = readScenario(cwd, names,
-		names.map(tool => ({ ...PI_ACTION_SEMANTICS.definition("read")!, tool, epoch: tool, projectors: [], ...(input && !(["preview", "alias"].includes(mode) && tool === names[2]) ? { canonicalize: () => undefined } : {}) })));
+		names.map(tool => ({ ...readDefinition(tool), ...(input && !(["preview", "alias"].includes(mode) && tool === names[2]) ? { canonicalize: () => undefined } : {}) })));
 	const buildGates = [gated(), gated()], parentGates = [gated(), gated()];
 	const controller = new AbortController(), failure = new Error("consumer stopped after its effect"), wrapper = {};
 	let builds = 0, disposals = 0, effects = 0, compositions = 0, compositionDisposals = 0, revoke: (() => void | Promise<void>) | undefined;
@@ -269,7 +274,7 @@ test.for(["reopened", "inflight", "completed", "binding", "reverse", "deep", "ad
 	const files = ["root.txt", "child.txt", "leaf.txt", "status.txt", "other.txt", "tail.txt"];
 	for (const file of files) await writeFile(path.join(cwd, file), `${file}\n`);
 	const { actionSemantics, tools, world, resolveInvocation } = readScenario(cwd, [...new Set(names)], [...new Set(names)].map(tool => ({
-		...PI_ACTION_SEMANTICS.definition("read")!, tool, epoch: `learned:${tool}`, projectors: [], ...(native && tool === names[4] ? { canonicalize: () => undefined } : {}) })));
+		...readDefinition(tool), epoch: `learned:${tool}`, ...(native && tool === names[4] ? { canonicalize: () => undefined } : {}) })));
 	const settings = patternAwareSettings({ enabled: true, minOccurrences: 2, maxContextLength: added ? 2 : 1, maxFutureGap: 0, beamWidth: added ? 2 : 1, maxPredictionDepth: 3, presets: [] });
 	const createStore = () => new PatternAwareStore(settings, path.join(cwd, "patterns.json"), patternAwareActionSemantics(actionSemantics, cwd));
 	const store = createStore(); await store.load();
@@ -489,10 +494,10 @@ test.for(["in-place", "git", "single-in-place", "single-git"])("keeps effects pr
 test.for(["independent", "unchanged", "batch", "batch-known", "mismatch-text", "mismatch-error", "mismatch-inflight", "mismatch-budget", "parent-miss", "stale", "same-resource", "missing-input", "independent-create",
 	"budget", "depth-zero", "denied-root", "denied-child", "unknown-batch", "filtered-batch", "malformed-observation", "malformed-type", "abort-observation", "actual-before-forecast", "actual-before-malformed",
 	"actual-before-failure", "actual-before-batch", "request-failure", "malformed-extra", "mismatch-exit", "canonical", "canonical-mismatch", "canonical-version", "canonical-schema", "canonical-unbound", "normalizer-failure",
-	...["whole", "fallback", "cross-tool", "unkeyed", "unused", "stale", "unkeyed-unused", "unkeyed-stale"].map(mode => `learning-${mode}`)])("executes out-of-order drafts using private observations (%s)", async mode => {
+	...["", ...process.platform !== "win32" ? ["captured-"] : []].flatMap(prefix => ["whole", "fallback", "cross-tool", "unkeyed", "unused", "stale", "unkeyed-unused", "unkeyed-stale"].map(mode => `learning-${prefix}${mode}`))])("executes out-of-order drafts using private observations (%s)", async mode => {
 	const cwd = await directories.create(), sandbox = new WorkspaceSandboxService(), release = deferred(), forecast = deferred(), observing = deferred(), firstResult = deferred();
-	const learning = mode.startsWith("learning-"), cross = /learning-(cross-tool|unkeyed)/.test(mode), stale = mode.endsWith("stale"), unused = mode.endsWith("unused");
-	let allow = true;
+	const learning = mode.startsWith("learning-"), captured = mode.startsWith("learning-captured-"), cross = learning && /cross-tool|unkeyed/.test(mode), stale = mode.endsWith("stale"), unused = mode.endsWith("unused");
+	let allow = true, seeding = captured;
 	const actualFirst = mode.startsWith("actual-before-"), normalized = mode.startsWith("canonical"), wrong = mode.startsWith("mismatch") || mode === "canonical-mismatch";
 	const known = mode === "batch-known", recoverable = ["request-failure", "malformed-observation", "malformed-type", "malformed-extra"].includes(mode);
 	const inflight = mode === "mismatch-inflight", repairBudget = mode === "mismatch-budget", actualBatch = mode === "actual-before-batch";
@@ -505,9 +510,10 @@ test.for(["independent", "unchanged", "batch", "batch-known", "mismatch-text", "
 		const { duration: _duration, pid: _pid, tempPath: _tempPath, ...kept } = JSON.parse(block.text); return { ...block, text: JSON.stringify(kept) };
 	});
 	const mutation = ["same-resource", "missing-input", "independent-create"].includes(mode), dependent = mutation && mode !== "independent-create", count = mode.startsWith("batch") || actualBatch ? 2 : 1;
-	const read = PI_ACTION_SEMANTICS.definition("read")!, names = ["inspect_rows", "render_rows", ...learning ? ["format_rows"] : []];
-	const definitions = names.map((tool, index) => ({ ...read, tool, epoch: tool, projectors: [], ...(index === 2 && mode.includes("unkeyed") ? { canonicalize: () => undefined } : {}) })), semantics = new ActionSemanticsRegistry([...definitions, PI_ACTION_SEMANTICS.definition("write")!]);
-	const reader = createReadTool(cwd), tools = [...names.map(name => ({ ...reader, name })), createWriteTool(cwd)] as Parameters<typeof systemHost>[1];
+	const names = ["inspect_rows", "render_rows", ...learning ? ["format_rows"] : []];
+	const { definitions, actionSemantics: semantics, tools, world, reader } = readScenario(cwd, names, [...names.map((tool, index) => ({ ...readDefinition(tool),
+		...(index === 2 && mode.includes("unkeyed") ? { canonicalize: () => undefined } : {}) })), PI_ACTION_SEMANTICS.definition("write")!]);
+	tools.push(createWriteTool(cwd));
 	const roots = Array.from({ length: count }, (_, index) => ({ tool: mutation ? "write" : names[0]!, args: mutation ? { path: "root-0.txt", content: "prepared\n" }
 		: { path: `root-${index}.txt`, offset: normalized ? 1 : 2, limit: normalized ? 10 : 1 } }));
 	for (const root of roots) if (mode !== "missing-input" && mode !== "independent-create") await writeFile(path.join(cwd, root.args.path), normalized
@@ -519,17 +525,17 @@ test.for(["independent", "unchanged", "batch", "batch-known", "mismatch-text", "
 	const expected = await Promise.all(roots.map(root => mutation ? { content: [fauxText("Successfully wrote 9 bytes to root-0.txt")] }
 		: reader.execute("oracle", root.args)));
 	if (normalized) expect(canonicalize(expected[0]!.content)).toEqual([fauxText('{"failedTests":[],"artifact":"abc"}')]);
-	const worlds = [createResourceSnapshotExecutionWorld(semantics, { maxBytes: () => 1024 * 1024 }), sandbox.createExecutionWorld({ driver: "git" })];
+	const worlds = [world, sandbox.createExecutionWorld({ driver: "git" })];
 	let requests = 0, drafts = 0, rootContext: import("@earendil-works/pi-ai").Context | undefined, observationSignal: AbortSignal | undefined;
 	const privateContexts: import("@earendil-works/pi-ai").Context[] = [], executed: string[] = [];
-	const settings = { tools: mode === "filtered-batch" ? [names[0]!] : undefined, drafterEnabled: true, maxConcurrentActions: 3, drafterMaxDepth: mode === "depth-zero" ? 0 : mode === "denied-child" ? 2 : 1,
+	const settings = { tools: mode === "filtered-batch" ? [names[0]!] : undefined, drafterEnabled: !seeding, maxConcurrentActions: 3, drafterMaxDepth: mode === "depth-zero" ? 0 : mode === "denied-child" ? 2 : 1,
 		candidateLimit: mode === "unchanged" ? 3 : 1, predictionTimeoutMs: 30_000, drafterTaskMaxRequests: mode === "budget" ? 2 : repairBudget ? 3 : 32 };
 	const f = systemHost(cwd, tools, { actionSemantics: semantics,
 		resources: { initial: { cpuCount: 3, idleCpuCount: 3 }, sample: () => new Promise(() => {}) },
 		onEvent: event => { if (known && event.type === "candidate" && event.state.status === "succeeded" && event.candidate.tool === names[0]) firstResult.resolve(); },
 		resolveInvocation: async (tool, args) => { if (known && (args as { path: string }).path === "root-1.txt") await firstResult.promise;
 			const invocation = resolvePiToolInvocation(tool === "write" ? tool : "read", args, { cwd, environment: {} })!;
-			return { ...invocation, ...(learning ? bindResourceOperation(invocation.filesystem!, cwd) : {}),
+			return { ...invocation, ...(learning && !seeding ? bindResourceOperation(invocation.filesystem!, cwd) : {}),
 			...(bound && tool === names[0] && (normalized || mode === "normalizer-failure") ? { observation: { ...EXACT_TOOL_OBSERVATION, version, content: normalized ? schema : undefined, canonicalize } } : {}),
 			semantics: tool === "write" ? PI_ACTION_SEMANTICS.definition(tool) : definitions[names.indexOf(tool)] }; },
 		preflight: context => allow && !(mode === "denied-root" && context.toolName !== child.tool || mode === "denied-child" && context.toolName === child.tool),
@@ -579,6 +585,8 @@ test.for(["independent", "unchanged", "batch", "batch-known", "mismatch-text", "
 		}, getDraftOptions: () => ({ apiKey: "shared-credential" }),
 	}, settings);
 	await using _cleanup = onExit(async () => { release.resolve(); forecast.resolve(); firstResult.resolve(); await f.dispose(); await sandbox.dispose(); });
+	if (seeding) { await f.start("seed"); expect(await f.execute(child.tool, child.args)).toEqual(await f.oracle(child.tool, child.args)); await f.finish(); }
+	seeding = false; settings.drafterEnabled = true;
 	await f.start();
 	const stopped = ["budget", "depth-zero", "denied-root", "unknown-batch", "filtered-batch", "malformed-observation", "malformed-type", "abort-observation", "normalizer-failure", "request-failure", "malformed-extra"].includes(mode), rootOnly = ["depth-zero", "denied-root", "unknown-batch", "filtered-batch"].includes(mode);
 	if (mode === "abort-observation") { await observing.promise; release.resolve(); await f.dispose(); }
@@ -596,7 +604,8 @@ test.for(["independent", "unchanged", "batch", "batch-known", "mismatch-text", "
 		if (mode === "missing-input") await expect(readFile(path.join(cwd, "root-0.txt"))).rejects.toMatchObject({ code: "ENOENT" });
 		else expect(await readText(cwd, "root-0.txt")).toBe("one\ntwo\nthree\n");
 	} else {
-		await f.ready(known ? 2 : 1); expect(f.completed().map(event => event.candidate.tool)).toEqual([...(known ? [names[0]] : []), child.tool]);
+		if (captured) await expect.poll(() => f.materialized.some(candidate => candidate.tool === child.tool)).toBe(true);
+		await f.ready(captured ? 0 : known ? 2 : 1); expect(f.completed().map(event => event.candidate.tool)).toEqual(captured ? [] : [...(known ? [names[0]] : []), child.tool]);
 		expect(executed.filter(tool => tool !== child.tool)).toHaveLength(count);
 	}
 	expect(rootContext?.messages).toEqual([]);
@@ -611,7 +620,7 @@ test.for(["independent", "unchanged", "batch", "batch-known", "mismatch-text", "
 				: textMismatch ? [fauxText("incorrect forecast")] : result.content, isError: mode === "mismatch-error" })));
 	}
 	release.resolve();
-	if (mode !== "denied-root" && mode !== "abort-observation") await f.ready(count + Number((!stopped || recoverable) && mode !== "denied-child") + Number(wrong && !inflight && !repairBudget));
+	if (mode !== "denied-root" && mode !== "abort-observation") await f.ready(count + Number(!captured && (!stopped || recoverable) && mode !== "denied-child") + Number(wrong && !inflight && !repairBudget));
 	if (wrong && !repairBudget || recoverable) expect(privateContexts.at(-1)!.messages.slice(1)).toEqual(expected.map((result, index) => expect.objectContaining({
 		role: "toolResult", toolCallId: `root-${index}`, content: normalized ? canonicalize(result.content) : result.content, isError: false })));
 	const { budget, observations } = f.host.drafterBudgetSnapshot();
@@ -633,12 +642,12 @@ test.for(["independent", "unchanged", "batch", "batch-known", "mismatch-text", "
 	settings.drafterEnabled = false; await f.finish(); await f.start("child");
 	if (stale) await writeFile(path.join(cwd, "child.txt"), "fresh\n");
 	const consumer = cross ? names[2]! : child.tool, args = unused ? { path: "unused.txt" } : child.args;
-	allow = mode !== "learning-fallback";
+	allow = !mode.endsWith("-fallback");
 	expect(textOutput(await f.execute(consumer, args))).toBe(dependent ? "prepared\n" : stale ? "fresh\n" : unused ? "unused\n" : "child\n");
-	expect(f.fallbacks).toEqual(!allow || mode.includes("unkeyed") ? [consumer] : []);
+	expect(f.fallbacks).toEqual([...captured ? [child.tool] : [], ...!allow || mode.includes("unkeyed") ? [consumer] : []]);
 	await f.finish();
-	if (stale || repairBudget || unused) expect(f.actors.at(-1)).toMatchObject({ computation: { hiddenComputeMs: 0 } });
-	if (wrong && !repairBudget || recoverable || actualFirst || known || contractChanged) expect(f.actors.at(-1)!.computation!.hiddenComputeMs).toBeGreaterThan(0);
+	if (stale || repairBudget || unused) expectHiddenCompute(f.actors.at(-1)!.computation!, false);
+	if (wrong && !repairBudget || recoverable || actualFirst || known || contractChanged) expectHiddenCompute(f.actors.at(-1)!.computation!, true);
 	if (wrong && !inflight || mode === "parent-miss" || contractChanged) expect(f.predictions.some(event => event.tool === child.tool &&
 		event.settlement.observation === "unobserved" && event.settlement.cause.code === "dependency_impossible")).toBe(true);
 	if (mode !== "parent-miss" && !repairBudget && !cross && !unused) expect(f.predictions.some(event => event.tool === child.tool &&
@@ -744,15 +753,14 @@ test.for(["completed", "inflight", "forecast", "binding", "parent-binding", "rev
 		expect(textOutput(await f.execute(names[1]!, { path: file }))).toBe(mode === "stale" && file === "a-new.txt" ? "fresh\n" : `${file.replace(/\.txt$/, "")}\n`);
 		const consumed = () => f.actors.find(event => JSON.parse(event.actualAction).input.path === file);
 		await expect.poll(consumed).toBeDefined(); const event = consumed()!;
-		if (mode === "budget" && file !== "b-new.txt" || mode === "stale" && file === "a-new.txt") expect(event.computation!.hiddenComputeMs).toBe(0);
-		else expect(event.computation!.hiddenComputeMs).toBeGreaterThan(0);
+		expectHiddenCompute(event.computation!, !(mode === "budget" && file !== "b-new.txt" || mode === "stale" && file === "a-new.txt"));
 	}
 	if (deep) {
 		await f.finish(); await f.start("grandchildren");
 		for (const file of ["a-new.next.txt", "b-new.next.txt", "ab-new.next.txt"]) {
 			expect(textOutput(await f.execute(names[1]!, { path: file }))).toBe(`${file.replace(/\.txt$/, "")}\n`);
 			await expect.poll(() => f.actors.find(event => JSON.parse(event.actualAction).input.path === file)).toMatchObject({ computation: { hiddenComputeMs: expect.any(Number) } });
-			expect(f.actors.at(-1)!.computation!.hiddenComputeMs).toBeGreaterThan(0);
+			expectHiddenCompute(f.actors.at(-1)!.computation!, true);
 		}
 		expect(calls.filter(call => call.path.startsWith("b-new"))).toHaveLength(2);
 	}
@@ -796,7 +804,7 @@ test.for(["dependent", "independent"])("preserves sibling resource effects outsi
 	settings.drafterEnabled = false; await f.finish(); await f.start("child");
 	expect(textOutput(await f.execute("read", child))).toBe(mode === "dependent" ? "after\n" : "independent\n");
 	await f.finish(); expect(drafted).toBe(1);
-	expect(f.actors.at(-1)!.computation!.hiddenComputeMs).toBeGreaterThan(0);
+	expectHiddenCompute(f.actors.at(-1)!.computation!, true);
 });
 
 test.each(["ordered", "independent", "dependent"])("adopts only the proven effects of a predicted workflow across prompts (%s)", async order => {
@@ -927,7 +935,7 @@ test("reconsiders restored results while sharing pending reads and retains fresh
 	const expected = await reader.execute("oracle", args); expect(await Promise.all(actors)).toEqual([expected, expected]);
 	await f.preview("read", { ...args, offset: 6 }); await f.finish(); await f.start("second");
 	for (const event of f.actors) {
-		expect(event.settlement.provider).toMatchObject({ kind: "speculative", match: { kind: "exact" } }); expect(event.computation?.hiddenComputeMs).toBeGreaterThan(0);
+		expect(event.settlement.provider).toMatchObject({ kind: "speculative", match: { kind: "exact" } }); expectHiddenCompute(event.computation!, true);
 	}
 	for (const input of [args, wide])
 		expect(await f.execute("read", input)).toEqual(await reader.execute("reference", input));
@@ -939,7 +947,7 @@ test("reconsiders restored results while sharing pending reads and retains fresh
 	expect(textOutput(await f.execute("read", wide))).toBe("changed again\n");
 	await writeFile(file, original); expect(await f.execute("read", args)).toEqual(await reader.execute("restored", args)); await f.finish();
 	const settled = f.actors;
-	expect(settled.at(-3)?.computation?.hiddenComputeMs).toBeGreaterThan(0);
-	expect(settled.at(-2)?.computation?.hiddenComputeMs).toBe(0);
+	expectHiddenCompute(settled.at(-3)!.computation!, true);
+	expectHiddenCompute(settled.at(-2)!.computation!, false);
 	expect(settled.at(-1)?.settlement.provider).toMatchObject({ kind: "speculative", match: { kind: "exact" } });
 });
