@@ -516,34 +516,6 @@ async function commitSandboxExecution(state: WorkspaceSandboxState, execution: S
 						staged.set(change, await stageAtomicWrite(change.after, change.afterMode, change.root));
 					}
 				});
-				// The staged files take their times while every target is checked, concurrently; nothing moves before both finish.
-				const timed = restoreModifiedTimes([...staged].map(([change, temporary]) => [temporary, change.afterModified]));
-				timed.catch(() => undefined);
-				// Capture directories before writable file handles trigger OverlayFS copy-up and change their times.
-				for (const directories of [true, false]) await mapFilesystem(changes.filter(change => (change.kind === "directory") === directories), async (change) => {
-					// A file whose identity still stands for the bytes this change replaces needs no rereading to prove them.
-					const unchanged = change.kind !== "directory" && change.beforeIdentity && change.before
-						? await lstat(change.target, { bigint: true }).then(info => fileIdentity(info) === change.beforeIdentity ? info : undefined, () => undefined) : undefined;
-					const current = unchanged ? { content: (change as SandboxFileChange).before!, mode: Number(unchanged.mode & 0o777n), identity: unchanged }
-						: change.kind === "directory" ? await readSandboxDirectoryState(change.target) : await readRegularState(change.target);
-					baselines.set(change, current);
-					if (!sameSandboxBaseline(current, change)) throw new Error(`resource changed before commit: ${change.resource}`);
-					if (change.accessMode) await access(change.target, change.accessMode);
-					if (change.kind !== "directory" && change.aliases) await assertFileAliases(change.root, change.target, change.aliases, (current as RegularFileState | undefined)?.identity);
-					if (!change.validationOnly && change.kind !== "directory" && change.operation && !change.object) {
-						if (change.after === undefined) throw new Error("A content write cannot delete a file");
-						const before = current as RegularFileState | undefined;
-						if (before) {
-							const descriptor = await open(change.target, fsConstants.O_RDWR | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0));
-							descriptors.set(change, descriptor);
-							const identity = await descriptor.stat({ bigint: true });
-							if (identity.nlink !== BigInt(change.aliases?.length ?? 1) || !before.identity || !sameFilesystemIdentity(before.identity, identity)) {
-								throw new Error(`content write identity is not representable: ${change.resource}`);
-							}
-						}
-					}
-				});
-				await timed;
 				for (const change of changes) if (change.kind !== "directory" && change.object) {
 					const reference = change.object, key = `${Number(reference.before)}:${reference.path}`;
 					const source = changes.find(candidate => candidate.target === reference.path);
@@ -562,13 +534,42 @@ async function commitSandboxExecution(state: WorkspaceSandboxState, execution: S
 					} else if (!sameOptionalBytes(source.after, change.after) || source.afterMode !== change.afterMode) throw new Error("inconsistent linked contents");
 					objects.set(key, group);
 				}
-				for (const [key, group] of objects) if (key.startsWith("1:")) {
-					const before = baselines.get(group.source) as RegularFileState;
-					group.handle = await open(group.source.target, (group.write ? fsConstants.O_RDWR : fsConstants.O_RDONLY) | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0));
-					descriptors.set(group.source, group.handle);
-					const identity = await group.handle.stat({ bigint: true });
-					if (!before.identity || identity.nlink !== BigInt(group.source.aliases?.length ?? 1) || !sameFilesystemIdentity(before.identity, identity)) throw new Error("file object predecessor changed");
+				// The staged files take their times while every target is checked, concurrently; nothing moves before both finish.
+				const timed = restoreModifiedTimes([...staged].map(([change, temporary]) => [temporary, change.afterModified]));
+				timed.catch(() => undefined);
+				// Capture directories before writable file handles trigger OverlayFS copy-up and change their times.
+				for (const directories of [true, false]) {
+					const phase = changes.filter(change => (change.kind === "directory") === directories);
+					// Acquire every handle before reading any file: opening an alias can update their shared identity.
+					if (!directories) await mapFilesystem(phase, async change => {
+						const group = objects.get("1:" + change.target), writing = change.kind !== "directory" && !change.validationOnly && change.operation && !change.object;
+						if (writing && change.after === undefined) throw new Error("A content write cannot delete a file");
+						if (change.kind !== "directory" && (group || writing && change.before !== undefined)) {
+							if (!(await lstat(change.target)).isFile()) throw new Error("file object predecessor is not regular");
+							const descriptor = await open(change.target, (writing || group?.write ? fsConstants.O_RDWR : fsConstants.O_RDONLY) |
+								(fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0));
+							descriptors.set(change, descriptor); if (group) group.handle = descriptor;
+						}
+					});
+					await mapFilesystem(phase, async change => {
+						// A file whose identity still stands for the bytes this change replaces needs no rereading to prove them.
+						const unchanged = change.kind !== "directory" && change.beforeIdentity && change.before
+							? await lstat(change.target, { bigint: true }).then(info => fileIdentity(info) === change.beforeIdentity ? info : undefined, () => undefined) : undefined;
+						const current = unchanged ? { content: (change as SandboxFileChange).before!, mode: Number(unchanged.mode & 0o777n), identity: unchanged }
+							: change.kind === "directory" ? await readSandboxDirectoryState(change.target) : await readRegularState(change.target);
+						baselines.set(change, current);
+						if (!sameSandboxBaseline(current, change)) throw new Error(`resource changed before commit: ${change.resource}`);
+						if (change.accessMode) await access(change.target, change.accessMode);
+						if (change.kind !== "directory" && change.aliases) await assertFileAliases(change.root, change.target, change.aliases, (current as RegularFileState | undefined)?.identity);
+						const descriptor = change.kind !== "directory" && descriptors.get(change);
+						if (descriptor) {
+							const before = current as RegularFileState | undefined, identity = await descriptor.stat({ bigint: true });
+							if (!before?.identity || identity.nlink !== BigInt(change.aliases?.length ?? 1) || !sameFilesystemIdentity(before.identity, identity))
+								throw new Error("file object predecessor changed: " + change.resource);
+						}
+					});
 				}
+				await timed;
 				// Pin every source name before any destination is removed or replaced; cycles use the same transaction.
 				for (const change of changes) if (change.kind !== "directory" && change.object) {
 					const reference = change.object, group = objects.get(`${Number(reference.before)}:${reference.path}`)!;
@@ -589,7 +590,9 @@ async function commitSandboxExecution(state: WorkspaceSandboxState, execution: S
 					if (group.write) { await group.handle!.truncate(0); await group.handle!.writeFile(group.write.after!); }
 					if (group.mode !== undefined && process.platform !== "win32") await group.handle!.chmod(group.mode);
 				}
-				for (const change of orderSandboxChanges(changes)) {
+				for (const change of orderWorkspaceChanges(changes.filter(change => !change.validationOnly), change => ({
+					change, depth: slash(change.resource).split("/").filter(Boolean).length, key: filesystemPathKey(change.target),
+				}))) {
 					await assertCommitTarget(change);
 					if (change.kind === "directory") {
 						if (!change.after) { await rmdir(change.target); applied.push(change); }
@@ -2139,14 +2142,6 @@ export async function restoreModifiedTimes(files: readonly (readonly [target: st
 async function replaceFile(temporary: string, target: string, mode?: number): Promise<void> {
 	await rename(temporary, target);
 	if (mode !== undefined && process.platform !== "win32") await chmod(target, mode);
-}
-
-function orderSandboxChanges(changes: readonly SandboxWorkspaceChange[]): SandboxWorkspaceChange[] {
-	return orderWorkspaceChanges(changes.filter(change => !change.validationOnly), change => ({
-		change,
-		depth: slash(change.resource).split("/").filter(Boolean).length,
-		key: filesystemPathKey(change.target),
-	}));
 }
 
 /** Root locks make namespace changes conflict with every file commit below the same workspace. */

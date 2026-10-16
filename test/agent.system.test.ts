@@ -450,13 +450,14 @@ test.for([false, true])("reconstructs shared searches after cancellation and nam
 	for (const query of queries) expect(await f.execute(query.tool, query.input)).toEqual(await f.oracle(query.tool, query.input));
 });
 
-test.for(["in-place", "git"] as const)("keeps effects private, retries restored preimages and transfers an aborted claim (%s)", async driver => {
+test.for(["in-place", "git", "single-in-place", "single-git"])("keeps effects private, retries restored preimages and transfers an aborted claim (%s)", async driver => {
 	const cwd = await directories.create(), sandbox = new WorkspaceSandboxService(), file = path.join(cwd, "notes.txt");
-	await writeFile(file, "one two\n"); await link(file, path.join(cwd, "alias.txt"));
+	const alias = driver.startsWith("single-") ? "notes.txt" : "alias.txt", read = () => readFile(file, "utf8");
+	await writeFile(file, "one two\n"); if (alias !== "notes.txt") await link(file, path.join(cwd, alias));
 	const gate = gated(), secondResolved = deferred(), controller = new AbortController();
 	let hold = false, waiting = false, first: Promise<unknown> | undefined, second: Promise<unknown> | undefined;
 	const f = systemHost(cwd, [createEditTool(cwd), createReadTool(cwd)], {
-		executionWorlds: [sandbox.createExecutionWorld(driver === "git" ? { driver, inPlaceMutations: false } : {})],
+		executionWorlds: [sandbox.createExecutionWorld(driver.endsWith("git") ? { driver: "git", inPlaceMutations: false } : {})],
 		preflight: async () => { if (hold) { hold = false; waiting = true; await gate.wait(); } return true; },
 		resolveInvocation: (tool, input) => { if (waiting) secondResolved.resolve(); return resolvePiToolInvocation(tool, input, { cwd, environment: {} }); },
 	});
@@ -464,23 +465,23 @@ test.for(["in-place", "git"] as const)("keeps effects private, retries restored 
 		await f.start();
 		const args = { path: "notes.txt", edits: [{ oldText: "two", newText: "three" }] };
 		await f.preview("edit", args); await f.ready();
-		expect(await readFile(file, "utf8")).toBe("one two\n");
+		expect(await read()).toBe("one two\n");
 		await f.finish(true); await f.start("changed-input");
 		await writeFile(file, "changed two\n");
 		await f.execute("edit", args);
-		expect(await readFile(file, "utf8")).toBe("changed three\n");
-		expect(textOutput(await f.execute("read", { path: "alias.txt" }))).toBe("changed three\n");
+		expect(await read()).toBe("changed three\n");
+		expect(textOutput(await f.execute("read", { path: alias }))).toBe("changed three\n");
 		await writeFile(file, "one two\n"); hold = true;
 		first = f.execute("edit", args, controller.signal).catch(error => error); await gate.entered;
-		second = f.execute("edit", args); await secondResolved.promise; await new Promise<void>(setImmediate);
-		expect(f.fallbacks.filter(tool => tool === "edit")).toEqual(["edit"]); expect(await readFile(file, "utf8")).toBe("one two\n");
+		second = f.execute("edit", args); await secondResolved.promise; await nextTurn();
+		expect(f.fallbacks.filter(tool => tool === "edit")).toEqual(["edit"]); expect(await read()).toBe("one two\n");
 		controller.abort(); gate.release(); await first; await second;
-		expect(await readFile(file, "utf8")).toBe("one three\n"); expect(f.fallbacks.filter(tool => tool === "edit")).toEqual(["edit", "edit"]);
+		expect(await read()).toBe("one three\n"); expect(f.fallbacks.filter(tool => tool === "edit")).toEqual(["edit", "edit"]);
 		await f.finish(); await f.start("discard");
 		await f.preview("edit", { path: "notes.txt", edits: [{ oldText: "three", newText: "discarded" }] });
 		await f.ready(2);
 	} finally { controller.abort(); gate.release(); await Promise.allSettled([first, second]); await f.dispose(); await sandbox.dispose(); }
-	expect(await readFile(file, "utf8")).toBe("one three\n");
+	expect(await read()).toBe("one three\n");
 });
 
 test.for(["independent", "unchanged", "batch", "batch-known", "mismatch-text", "mismatch-error", "mismatch-inflight", "mismatch-budget", "parent-miss", "stale", "same-resource", "missing-input", "independent-create",
@@ -812,9 +813,9 @@ test.each(["ordered", "independent", "dependent"])("adopts only the proven effec
 			return world.speculation.execute(context);
 		} } }],
 		complete: async (_model, context) => {
-			const index = context.tools?.[0]?.name === "speculative_observations" ? drafted - 1 : drafted++, step = steps[index]!;
-			return fauxAssistantMessage(fauxToolCall(context.tools?.[0]?.name === "speculative_observations" ? "speculative_observations" : step.tool,
-				context.tools?.[0]?.name === "speculative_observations" ? { results: [{ callID: `draft-${index}`, isError: false, content: [{ type: "text",
+			const observing = context.tools?.[0]?.name === "speculative_observations", index = observing ? drafted - 1 : drafted++, step = steps[index]!;
+			return fauxAssistantMessage(fauxToolCall(observing ? "speculative_observations" : step.tool,
+				observing ? { results: [{ callID: `draft-${index}`, isError: false, content: [{ type: "text",
 					text: step.tool === "write" ? `Successfully wrote ${step.input.content!.length} bytes to ${step.input.path}` : `Successfully replaced 1 block(s) in ${step.input.path}.` }] }] } : step.input,
 				{ id: `draft-${index}` }), { stopReason: "toolUse" });
 		},
@@ -838,9 +839,8 @@ test.each(["ordered", "independent", "dependent"])("adopts only the proven effec
 		await f.execute(step.tool, step.input); await f.finish();
 	}
 	expect(f.fallbacks).toEqual(order === "dependent" ? ["edit"] : []);
-	const expected = order === "independent" ? "final\n" : "final\nbeta\n";
-	expect(await readFile(file, "utf8")).toBe(expected);
-	expect(await readFile(path.join(cwd, "alias.txt"), "utf8")).toBe(expected);
+	for (const name of ["notes.txt", "alias.txt"])
+		expect(await readFile(path.join(cwd, name), "utf8")).toBe(order === "independent" ? "final\n" : "final\nbeta\n");
 	if (order === "independent") await expect(readFile(path.join(cwd, "unused.txt"))).rejects.toMatchObject({ code: "ENOENT" });
 });
 
