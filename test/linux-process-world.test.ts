@@ -467,12 +467,14 @@ int main(int argc, char **argv) {
 	});
 
 nativeTest.for(["unusable", "one-shot", "descendant", "unusable-descendant"] as const)("rechecks failed native preparation when its observed inputs change (%s)", { timeout: 20_000 }, async (mode, { benchmark }) => {
-		const fixture = await benchmark("pi-preparation-evidence-");
+		const fixture = await benchmark("pi-preparation-evidence-", undefined, {}, os.homedir());
 		const publications = await recordProcessPublications(fixture);
-		await writeFile(path.join(fixture.workspace, "input.txt"), "prepared\n");
-		await writeFile(path.join(fixture.workspace, "body.sh"), 'ulimit -c 0\n' + (mode === "unusable-descendant" ? "" : 'printf "prepared\\n"\n'));
-		if (mode === "unusable-descendant") await writeFile(path.join(fixture.workspace, "unusable-child.sh"),
-			'i=0; while [ "$i" -lt 10000 ]; do i=$((i + 1)); done\nulimit -c 0\nprintf "prepared\\n"\n');
+		const failedChild = mode === "unusable-descendant", print = 'printf "prepared\\n"\n';
+		const write = (file: string, content: string) => writeFile(path.join(fixture.workspace, file), content);
+		await write("input.txt", "prepared\n");
+		await write("body.sh", 'ulimit -c 0\n' + (failedChild ? "" : print));
+		if (failedChild) await write("unusable-child.sh",
+			'i=0; while [ "$i" -lt 10000 ]; do i=$((i + 1)); done\nulimit -c 0\n' + print);
 		if (mode === "one-shot") {
 			await compileBenchmarkHelper(fixture.workspace, "one-shot", { code: '#include <stdio.h>\n#include <unistd.h>\nint main(void) { usleep(20000); printf("prepared:%ld\\n", (long)getpid()); return 0; }\n' });
 		}
@@ -482,11 +484,12 @@ nativeTest.for(["unusable", "one-shot", "descendant", "unusable-descendant"] as 
 		// Changing a process limit is an existing unsupported syscall observation. Only this child changes its limit.
 		const script = 'i=0; while [ "$i" -lt 10000 ]; do i=$((i + 1)); done; ' +
 			(mode === "descendant" ? "ulimit -c 0; /bin/cat input.txt; :" :
-				mode === "unusable-descendant" ? ". ./body.sh; /bin/bash ./unusable-child.sh; :" : ". ./body.sh");
+				failedChild ? ". ./body.sh; /bin/bash ./unusable-child.sh; :" : ". ./body.sh");
 		const command = mode === "one-shot" ? "exec ./one-shot" : `exec /bin/sh -c '${script}'`;
 		const expectedOutput = mode === "one-shot" ? expect.stringMatching(/^prepared:\d+\n$/) : "prepared\n";
 		const handoffs = Reflect.get(fixture.backend, "handoffs") as ProcessHandoffRegistry<{ readonly args: readonly string[]; readonly executable: string }>;
 		let binding: ProcessExecutionBinding | undefined, childBinding: ProcessExecutionBinding | undefined;
+		const expectStale = (value: boolean, current = binding!) => expect(fixture.backend.bindingStale(current)).resolves.toBe(value);
 		const observe = () => fixture.backend.observeBindings(scope, () => executeProcess(fixture, route.executor, command, { scope }), bindings => {
 			binding = bindings.find(candidate => {
 				const invocation = handoffs.resolveBinding(candidate, scope);
@@ -499,33 +502,37 @@ nativeTest.for(["unusable", "one-shot", "descendant", "unusable-descendant"] as 
 		expect(fixture.backend.operationHints(binding!).preparation).toBe("current_workspace");
 		// The session excludes its shell from interposition. Keep the selected parent excluded, not the distinct child under test.
 		const invocation = resolvePiToolInvocation("bash", { command: "exit 97" }, { cwd: fixture.workspace, environment: fixture.environment,
-			shellPath: mode === "unusable-descendant" ? "/bin/sh" : fixture.shellPath })!.process!;
+			shellPath: failedChild ? "/bin/sh" : fixture.shellPath })!.process!;
 		const prepare = () => fixture.workspaceSandbox.withWorkspace(fixture.workspace, workspace =>
 			withPreparedWorker(fixture, { sourceRoot: fixture.workspace, workspace, invocation, scope: { ...scope, turnID: "prepared" } }, binding!, expectedOutput, async session => {
 				if (mode === "descendant") expect(session.executionBindings().some(child => child.available && child.key !== binding!.key)).toBe(true);
 			}, false), { liveLower: true });
-		if (mode === "unusable" || mode === "unusable-descendant") {
+		const expectUnusable = () => expect(prepare()).rejects.toThrow("bound process preparation produced no reusable result");
+		if (mode === "unusable" || failedChild) {
 			const before = fixture.backend.metrics().requests;
-			await expect(prepare()).rejects.toThrow("bound process preparation produced no reusable result");
+			await expectUnusable();
 			expect(binding!.available).toBe(true);
-			expect(await fixture.backend.bindingStale(binding!)).toBe(false);
+			await expectStale(false);
 			expect(fixture.backend.metrics().lastError).toContain("unsupported_syscall");
-			if (mode === "unusable-descendant") {
+			if (failedChild) {
 				expect(fixture.backend.metrics().requests - before).toBe(2);
 				expect((await publications()).map(certificate => certificate.dependencyCertificate.taints))
 					.toEqual([expect.arrayContaining(["unsupported_syscall"]), expect.arrayContaining(["unsupported_syscall"])]);
 				expect(childBinding).toBeDefined();
-				expect(await fixture.backend.bindingStale(childBinding!)).toBe(false);
+				await expectStale(false, childBinding!);
+				await mkdir(path.join(fixture.root, "sibling"));
+				await expectStale(true); await expectStale(true, childBinding!);
+				await expectUnusable(); await expectStale(false); await expectStale(false, childBinding!);
 			}
-			await writeFile(path.join(fixture.workspace, "input.txt"), "arbitrary edit\n");
+			await write("input.txt", "arbitrary edit\n");
 			expect((await observe()).output).toBe("prepared\n");
-			expect(await fixture.backend.bindingStale(binding!)).toBe(false); // An unrelated edit cannot revive unchanged failure inputs.
-			await writeFile(path.join(fixture.workspace, "body.sh"), mode === "unusable-descendant" ? "" : 'printf "prepared\\n"\n');
-			if (childBinding) await writeFile(path.join(fixture.workspace, "unusable-child.sh"), 'printf "prepared\\n"\n');
-			expect(await fixture.backend.bindingStale(binding!)).toBe(true);
-			if (childBinding) expect(await fixture.backend.bindingStale(childBinding)).toBe(true);
+			await expectStale(false); // An unrelated edit cannot revive unchanged failure inputs.
+			await write("body.sh", failedChild ? "" : print);
+			if (childBinding) await write("unusable-child.sh", print);
+			await expectStale(true);
+			if (childBinding) await expectStale(true, childBinding);
 			await prepare();
-			expect(await fixture.backend.bindingStale(binding!)).toBe(false);
+			await expectStale(false);
 		} else {
 			await prepare();
 			expect(binding!.available).toBe(true);
