@@ -242,6 +242,8 @@ interface PlanActionContext<StartInput, StateData> extends RuntimeTurnContext<St
 	readonly opportunity: PredictionOpportunity;
 	draft: SpeculativeDraftCandidate;
 	served?: boolean;
+	// Rearming replaces execution, but earlier work can still serve an Actor.
+	readonly producers: Set<string>;
 	readonly admissionController: AbortController;
 	readonly sourceSlot: SourceRequestSlot;
 	readonly continuationSlots: Set<SourceRequestSlot>;
@@ -809,7 +811,7 @@ export function makeSpeculativeActionRuntime<
 					identity: node.identity,
 					opportunity: session.plan.opportunity(node.proposalID, node.action.id)!,
 					...turnContext(scope),
-					draft: planActionDraft(node),
+					draft: planActionDraft(node), producers: new Set(),
 					admissionController,
 					sourceSlot: scope.slot,
 					continuationTriggers: new Set(),
@@ -996,15 +998,13 @@ export function makeSpeculativeActionRuntime<
 					const current = session.plan.get(node.proposalID, node.action.id);
 					return !session.lifecycle.sealed && current?.identity.id === node.identity.id &&
 						current.predictionState.status !== "settled" && current.execution.status === "scheduled";
-				}, (candidate, created) => {
-					if (!created) attachNode(session, node, candidate);
-					else { session.plan.attachExecution(node.proposalID, node.action.id, candidate.id, candidate.work); startQueuedCandidates(session); }
-				});
+				}, candidate => attachNode(session, node, candidate));
 		}).finally(() => { context.launch = undefined; }));
 	};
 
 	const attachNode = (session: Session, node: PlanRuntimeNode, candidate: Candidate): void => {
 		if (!session.plan.attachExecution(node.proposalID, node.action.id, candidate.id, candidate.work)) return;
+		session.actionContexts.get(node.identity.id)?.producers.add(TimelineInterval.producerID(session, candidate.id));
 		const forecasts = forecastsForCandidate(session, candidate);
 		const scheduled = scheduler.refresh(candidate, forecasts) ?? scheduler.evaluate(forecasts);
 		candidate.expectedDurationMs = scheduled.expectedDurationMs;
@@ -1647,10 +1647,8 @@ export function makeSpeculativeActionRuntime<
 		];
 		const reused = TimelineInterval.reusedProducers(consumed);
 		actorAction.finishConsumption(reused);
-		for (const node of [...state.session.plan.unsettled(), ...matches.map(({ node }) => node)]) {
-			const context = state.session.actionContexts.get(node.identity.id);
-			if (context && "candidateID" in node.execution && reused.has(TimelineInterval.producerID(state.session, node.execution.candidateID))) context.served = true;
-		}
+		for (const context of state.session.actionContexts.values())
+			context.served ||= [...context.producers].some(producer => reused.has(producer));
 		const computation = state.session.timeline?.recordCall(consumed, actorAction.issuedAt, performance.now());
 		const key = actorAction.actionKey;
 		const candidate = selection?.candidate;
@@ -1761,11 +1759,10 @@ export function makeSpeculativeActionRuntime<
 		}));
 		if (event) session.effects.enqueue(() => { session.events.enqueue(event); });
 		if (source?.onSettled) {
-			const producer = candidateID && TimelineInterval.producerID(session, candidateID);
-			const pending = !context.served && producer ? [...session.turns.values()].flatMap(turn => [...turn.actorActions].map(action => action.consumption)) : [];
+			const pending = !context.served && context.producers.size ? [...session.turns.values()].flatMap(turn => [...turn.actorActions].map(action => action.consumption)) : [];
 			const deliver = (receipts: readonly ReadonlySet<string>[]) => { session.effects.enqueue(() => source.onSettled!({
 				proposalID: context.identity.proposalID, actionID: context.identity.actionID, feedback: context.draft.feedback, settlement,
-				served: context.served === true || !!producer && receipts.some(receipt => receipt.has(producer)),
+				served: context.served === true || [...context.producers].some(producer => receipts.some(receipt => receipt.has(producer))),
 			})); };
 			// Wait outside the effects queue, only for consumers already present at retirement.
 			if (pending.length) void Promise.all(pending).then(deliver); else deliver([]);

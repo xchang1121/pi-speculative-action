@@ -11,6 +11,8 @@ import { ProcessExecutionCoordinator } from "../src/process-execution.ts";
 import { currentExecutionScope } from "../src/execution-world.ts";
 import { LinuxProcessReuseBackend } from "../src/linux-process-backend.ts";
 import type { ProcessExecutionBinding, ProcessHandoffRegistry } from "../src/process-handoff.ts";
+import * as operationPreparation from "../src/execution-preparation.ts";
+import type { PredictionSettlement } from "../src/settlement.ts";
 import { SynchronousProcessObserver } from "../src/linux-process-sync.ts";
 import { summarizeSpeculativeTrace } from "../src/trace-summary.ts";
 import { commitBenchmarkFixture, compileBenchmarkHelper, holdOwnedProcessPublication, inspectProcessOwner } from "./linux-process-fixture.ts";
@@ -18,13 +20,14 @@ import type { SpeculativeActionEvent } from "../src/runtime.ts";
 import { readText, temporaryDirectories } from "./filesystem.ts";
 import { Agent, type AgentTool } from "@earendil-works/pi-agent-core";
 import { deferred, onExit } from "./async.ts";
+import { toolUse as response } from "./model.ts";
+
+const adoptions = (settlement: PredictionSettlement) => settlement.observation === "observed" && settlement.match.matched && settlement.match.adoption.status === "adopted" ? [settlement.match.relation] : [];
 
 const directories = temporaryDirectories("pi-extension-system-");
 afterEach(async () => { vi.unstubAllEnvs(); vi.restoreAllMocks(); await directories.dispose(); });
 
-test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-nested", "native-stale", "native-running", "native-retired", "native-unkeyed", "native-inputs", "native-inputs-stale",
-	"native-sync-producer", "native-sync-consumer", "native-sync-both", "native-sync-stale", "native-sync-lost", "native-sync-inputs", "native-sync-inputs-stale",
-	"native-sync-inputs-preempted", "native-sync-inputs-preempted-stale", "native-cold", "native-cold-stale", "native-sync-cold", "native-sync-cold-stale"] : [])])("runs the shipped extension through a real Pi session (%s)", async mode => {
+test.each(["off", "on", ...(process.platform === "linux" ? ["", "-nested", "-stale", "-running", "-retired", "-unkeyed", "-inputs", "-inputs-stale", "-sync-producer", "-sync-consumer", "-sync-both", "-sync-stale", "-sync-lost", "-sync-inputs", "-sync-inputs-stale", "-sync-inputs-preempted", "-sync-inputs-preempted-stale", "-cold", "-cold-stale", "-sync-cold", "-sync-cold-stale"].map(mode => `native${mode}`) : [])])("runs the shipped extension through a real Pi session (%s)", async mode => {
 	const enabled = mode !== "off", native = mode.startsWith("native"), running = mode === "native-running" || mode === "native-retired";
 	const stale = mode.endsWith("stale"), inputs = mode.includes("inputs"), cold = mode.includes("cold"), preempted = mode.includes("preempted"), synchronous = (callID: string) => mode.startsWith("native-sync") &&
 		(!mode.endsWith("producer") && !mode.endsWith("consumer") || callID === (mode.endsWith("producer") ? "seed" : "check"));
@@ -36,7 +39,6 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 		patternAware: { enabled: false }, prepareObservedOperations: native, candidateLimit: preempted ? 2 : undefined,
 		maxConcurrentActions: 4, predictionTimeoutMs: 10_000 }));
 	const actor = fauxProvider({ provider: "functional-actor", models: [{ id: "actor" }], tokensPerSecond: 4_000, tokenSize: { min: 1, max: 2 } });
-	const response = (name: string, args: Record<string, unknown>) => fauxAssistantMessage(fauxToolCall(name, args), { stopReason: "toolUse" });
 	actor.setResponses([
 		response("read", { path: "notes.txt" }),
 		response("write", { path: "result.txt", content: "first\n" }),
@@ -68,6 +70,14 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 		},
 	});
 	const events: SpeculativeActionEvent<string>[] = [];
+	const served: boolean[] = [], prepare = operationPreparation.createExecutionPreparation;
+	vi.spyOn(operationPreparation, "createExecutionPreparation").mockImplementation((...args) => {
+		const owner = prepare(...args);
+		return { ...owner, source: { ...owner.source, onSettled: feedback => {
+			if (adoptions(feedback.settlement).length) served.push(feedback.served === true); return owner.source.onSettled?.(feedback);
+		} } };
+	});
+
 	const extension = createSpeculativeActionExtension({ createHost: (id, options) => createSpeculativeActionHost(id, {
 		...options, resources: { initial: { cpuCount: 4, idleCpuCount: 4 }, sample: () => new Promise(() => {}) },
 		onEvent: event => { events.push(event); return options.onEvent?.(event); },
@@ -86,6 +96,7 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 	const { session } = await createAgentSession({ cwd, agentDir, model: actor.getModel(), modelRuntime, settingsManager, resourceLoader,
 		sessionManager: SessionManager.inMemory(cwd), tools });
 	const originalPrompt = session.agent.prompt, originalContinue = session.agent.continue;
+	const toolResults = (owner = session) => owner.messages.filter(message => message.role === "toolResult");
 	let inspection: ReturnType<typeof inspectProcessOwner> | undefined;
 	let publication: Awaited<ReturnType<typeof holdOwnedProcessPublication>> | undefined;
 	await using _session = onExit(async () => {
@@ -127,7 +138,7 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 		await commitBenchmarkFixture(cwd, "sdk-callback");
 		const command = "./slow notes.txt" + (inputs ? " 3<notes.txt" : "");
 		const initial = `printf initial:; ${command}; :`, remaining = `printf remaining:; ${command}; printf once >> marker`;
-		const call = (tool: string, text: string, id: string) => fauxAssistantMessage(fauxToolCall(tool, { text }, { id }), { stopReason: "toolUse" });
+		const call = (tool: string, text: string, id: string) => response(tool, { text }, { id });
 		actor.setResponses([call("produce_notes", initial, "seed"), ...(inputs ? [response("read", { path: "notes.txt", offset: 2 })] : []), ...cold ? [] : [async () => {
 			if (running) publication = await holdOwnedProcessPublication(inspection!);
 			if (preempted) {
@@ -152,7 +163,7 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 		}, fauxAssistantMessage("done")]);
 		await session.prompt("Produce notes, edit the input, then render the remaining work.");
 		// A named inherited input prepares a new version after the edit; adoption still checks the actual held graph.
-		const results = session.messages.filter(message => message.role === "toolResult"), reused = !stale;
+		const results = toolResults(), reused = !stale;
 		if (mode === "native-sync-lost") {
 			expect(results.at(-1)).toMatchObject({ isError: true }); expect(JSON.stringify(results.at(-1))).toContain("native handoff failed");
 			expect(await readText(cwd, "marker")).toBe("once"); expect(calls).toEqual(["seed", "check"]); return;
@@ -164,8 +175,9 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 		const settled = events.filter(event => event.type === "actor_action").at(-1)!, timing = settled.computation!;
 		expect(backend!.actorMetrics().hits).toBe(Number(reused)); expect(timing.hiddenComputeMs > 0).toBe(reused);
 		expect((timing.hiddenByMode ?? []).reduce((total, part) => total + part.hiddenComputeMs, 0)).toBeCloseTo(timing.hiddenComputeMs, 5);
-		const predictions = events.filter(event => event.type === "operation_prediction"), adopted = predictions.flatMap(event => event.settlement.observation === "observed" && event.settlement.match.matched && event.settlement.match.adoption.status === "adopted" ? [event.settlement.match.relation] : []);
+		const predictions = events.filter(event => event.type === "operation_prediction"), adopted = predictions.flatMap(event => adoptions(event.settlement));
 		if (preempted && reused) expect(events.some(event => event.type === "candidate" && event.state.status === "cancelled" && event.state.cause.code === "scheduler_preempted")).toBe(true);
+		expect(served).toEqual(adopted.map(() => true));
 		expect(adopted).toHaveLength(Number(reused && mode !== "native-retired")); if (nested && adopted.length) expect(adopted[0]).toMatchObject({ kind: "projected", projector: "owned-operation" });
 		if (mode === "native-retired") expect(predictions.filter(event => event.settlement.prediction.id === predictions[0]!.settlement.prediction.id)).toMatchObject([{ settlement: { observation: "unobserved", cause: { code: "operation_not_observed" } } }]);
 		expect(!!settled.settlement.actionKeyHash).toBe(mode !== "native-unkeyed");
@@ -178,7 +190,7 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 	expect(session.agent.state.tools).toBe(registeredTools);
 	expect(await readText(cwd, "notes.txt")).toBe("one\ntwo\n");
 	expect(await readText(cwd, "result.txt")).toBe("final\n");
-	const results = session.messages.filter(message => message.role === "toolResult");
+	const results = toolResults();
 	expect(results).toHaveLength(4);
 	expect(results.every(message => !message.isError)).toBe(true);
 	expect(results.at(-1)?.content).toEqual([fauxText("final\n")]);
@@ -189,7 +201,7 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 		session.agent.state.tools = registry.map(current => current === read ? tool : current);
 		actor.setResponses([response("read", { path: "notes.txt" }), fauxAssistantMessage("done")]);
 		await session.prompt("Execute the current read implementation.");
-		expect(session.messages.filter(message => message.role === "toolResult").at(-1)?.content).toEqual([fauxText("replaced")]);
+		expect(toolResults().at(-1)?.content).toEqual([fauxText("replaced")]);
 	}
 	read.execute = originalExecute; session.agent.state.tools = registry;
 	const originalTools = session.agent.state.tools, originalNext = session.agent.prepareNextTurnWithContext;
@@ -206,7 +218,7 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 	expect([calls.slice(0, 2).sort(), calls.slice(2).sort()]).toEqual([["a", "b"], ["c", "d"]]); expect(updates).toEqual(["b", "a", "d", "c"]);
 	expect(hooks.slice(0, 2)).toEqual(["before:a", "before:b"]); expect(hooks.slice(2, 4).sort()).toEqual(["after:a", "after:b"]);
 	expect(hooks.slice(4, 7)).toEqual(["before:c", "before:d", "before:blocked"]); expect(hooks.slice(7).sort()).toEqual(["after:c", "after:d"]);
-	expect(session.messages.filter(message => message.role === "toolResult").slice(-5).map(message => [message.toolCallId, message.content, message.isError])).toEqual([
+	expect(toolResults().slice(-5).map(message => [message.toolCallId, message.content, message.isError])).toEqual([
 		["a", [fauxText("hook:own:format_rows:first:prepared")], false], ["b", [fauxText("hook:own:format_rows:second:prepared")], false],
 		["c", [fauxText("hook:own:read:third:prepared")], false], ["d", [fauxText("hook:own:late_rows:fourth:prepared")], false],
 		["blocked", [fauxText("blocked-on-purpose")], true],
@@ -229,13 +241,13 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["native", "native-ne
 		}) });
 	await using _other = onExit(async () => { await other.abort(); await other.extensionRunner.emit({ type: "session_shutdown", reason: "quit" }); other.dispose(); });
 	await other.bindExtensions({ mode: "print" });
-	otherActor.setResponses([fauxAssistantMessage(fauxToolCall("read", { path: "notes.txt" }, { id: "cancel" }), { stopReason: "toolUse" })]);
+	otherActor.setResponses([response("read", { path: "notes.txt" }, { id: "cancel" })]);
 	const cancelled = other.prompt("Read until cancelled.");
 	await Promise.race([entered.promise, cancelled.then(() => { throw new Error("cancelled tool never entered"); })]); await other.abort(); await cancelled;
 	actor.setResponses([response("format_rows", { text: "reloaded" }), fauxAssistantMessage("done")]);
 	otherActor.setResponses([response("read", { path: "notes.txt" }), fauxAssistantMessage("done")]);
 	await Promise.all([session.prompt("Execute after reloading extensions."), other.prompt("Read through the supplied base implementation.")]);
-	expect(other.messages.filter(message => message.role === "toolResult").at(-1)?.content).toEqual([fauxText("base override")]);
+	expect(toolResults(other).at(-1)?.content).toEqual([fauxText("base override")]);
 	expect(scopes).toEqual([other.sessionId, other.sessionId]);
 	expect(calls).toHaveLength(5);
 	const failure = new Error("process launch failed"), coordinator = new ProcessExecutionCoordinator({ execute: async () => ({ exitCode: 0 }) });
