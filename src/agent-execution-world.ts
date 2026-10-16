@@ -194,7 +194,7 @@ async function evaluateResourceQuery<Output>(
 				return { view: token.view, observed: (dependencies, commit) => [observe(token, dependencies, commit)] };
 			}, inputs => inputs.map(input => {
 				const proof = input.manager.retain(input); retained.push(proof); observe(proof, undefined); return proof;
-			}), validation && (async proofs => { await validateResourceInputs(proofs, true); })); completed = true;
+			}), async proofs => { await validateResourceInputs(proofs, true); }); completed = true;
 		} finally { await TimelineInterval.outside(async () => {
 			if (!completed && !transfer) return;
 			try {

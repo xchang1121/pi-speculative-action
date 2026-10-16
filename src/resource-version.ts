@@ -102,7 +102,7 @@ export class ResourceReadView {
 	private onForeignInputs?: (transferable: boolean) => void;
 	private collectProofs?: Map<ResourceVersionToken["observations"], ResourceVersionToken>;
 	private observed?: ResourceInputSource["observed"];
-	private validatePrepared?: (proofs: readonly ResourceVersionToken[]) => Promise<void>;
+	private validateInputs?: (proofs: readonly ResourceVersionToken[]) => Promise<void>;
 	private acceptProofs?: (proofs: readonly ResourceVersionToken[]) => readonly ResourceVersionToken[];
 	private prepared?: { readonly lifetime: RuntimeLifecycleLane; readonly bindings: Map<object, Map<string, PreparedResource>> };
 	private boundary?: { readonly root: string; readonly physicalRoot: string; readonly dependency?: string };
@@ -300,7 +300,7 @@ export class ResourceReadView {
 					const proofs = [...source?.observed(sourceDependencies, false) ?? [], ...cached.proofs ?? []];
 					return await cached.destination.prepared!.lifetime.admit(async () => {
 						this.assertComplete(); cached.destination.assertComplete();
-						await this.validatePrepared?.([...(this.observed?.(dependencies, false) ?? []), ...proofs]);
+						await this.validateInputs?.([...(this.observed?.(dependencies, false) ?? []), ...proofs]);
 						signal?.throwIfAborted();
 						accepted = true; this.dependencies = dependencies;
 						if (source) this.observeSource(source)(sourceDependencies);
@@ -360,7 +360,7 @@ export class ResourceReadView {
 				pending.shareable = !view.foreignInputs;
 				if (pending.shareable && view.collectProofs?.size) for (const proof of view.collectProofs.values())
 					(pending.proofs ??= []).push(proof.manager.retain({ ...proof, view: undefined }));
-			}, (observed, commit) => { if (commit !== false) pending.dependencies = observed; }).then(async () => {
+			}, (observed, commit) => { if (commit !== false) pending.dependencies = observed; else if (observed) return this.observed?.(observed, false); }).then(async () => {
 				if (!resource) throw new Error("resource_preparation_missing");
 				pending.value = resource.value;
 				bytes = resource.bytes + computationBytes + resourceProofBytes(pending.proofs ?? []) + (key.length + (name?.length ?? 0)) * 2 + 192 +
@@ -386,13 +386,13 @@ export class ResourceReadView {
 	/** Each evaluation owns its proof and failures while borrowing the input lifetime. */
 	async evaluate<T>(operation: (view: ResourceReadView) => Promise<T>, observed?: ResourceInputSource["observed"],
 		root?: string | { readonly root: string; readonly physicalRoot: string }, lookup = this.lookup, missing = this.missing,
-		acceptProofs = this.acceptProofs, validatePrepared = this.validatePrepared): Promise<T> {
+		acceptProofs = this.acceptProofs, validateInputs = this.validateInputs): Promise<T> {
 		return collectResourceComputation(async () => {
 			this.assertComplete();
 			const view = new ResourceReadView(0);
 			view.entries = this.entries; view.owner = this; view.sealed = true; view.dependencies = new Set(); view.lookup = lookup; view.missing = missing;
 			view.onForeignInputs = this.onForeignInputs;
-			view.acceptProofs = acceptProofs; view.collectProofs = this.collectProofs; view.observed = observed; view.validatePrepared = validatePrepared;
+			view.acceptProofs = acceptProofs; view.collectProofs = this.collectProofs; view.observed = observed; view.validateInputs = validateInputs;
 			try {
 				if (typeof root === "object") view.boundary = { root: root.root, physicalRoot: root.physicalRoot };
 				else if (root === undefined || this.boundary && filesystemPathKey(root) === filesystemPathKey(this.boundary.root)) {
@@ -451,7 +451,19 @@ export class ResourceReadView {
 			catch (error) { throw this.failure ??= error instanceof Error ? error : new Error(String(error)); }
 			finally { if (this.pending === pending) this.pending = undefined; }
 		}
-		const { entry, resolved } = this.entry(target, scope !== "entry", scope);
+		let entry: CapturedResource | undefined, resolved = filesystemPathKey(target);
+		try {
+			// Probe only this read; rejected aliases leave neither dependencies nor computation receipts.
+			({ entry, resolved } = this.validateInputs ? await this.evaluate(async view => {
+				const input = view.entry(target, scope !== "entry", scope);
+				if (input.entry || input.resolved !== resolved)
+					await TimelineInterval.outside(() => this.validateInputs!(this.observed?.(view.dependencies, false) ?? []));
+				return input;
+			}, observed => {
+				if (!observed) this.dependencies = undefined;
+				else if (this.dependencies) for (const dependency of observed) this.dependencies.add(dependency);
+			}, this.boundary) : this.entry(target, scope !== "entry", scope));
+		} catch { this.assertComplete(); }
 		if (resourceCovers(entry, scope)) {
 			TimelineInterval.use(["stat", "type", "entry"].includes(scope) ? entry?.metadataComputation : entry?.computation);
 			return entry!;
@@ -464,7 +476,11 @@ export class ResourceReadView {
 				// The caller already owns the boundary proof; the source contributes only its resource evidence.
 				const boundary = this.boundary && query !== target
 					? { root: this.boundary.physicalRoot, physicalRoot: this.boundary.physicalRoot } : this.boundary;
-				return await source.view.evaluate(view => view.get(query, scope), this.observeSource(source), boundary);
+				return await source.view.evaluate(async view => {
+					const entry = await view.get(query, scope);
+					await TimelineInterval.outside(() => this.validateInputs?.(source.observed(view.dependencies, false) ?? []));
+					return entry;
+				}, this.observeSource(source), boundary);
 			} catch { /* An indexed name alone grants no coverage; another sealed owner may supply it. */ }
 		}
 		if (this.missing) {
@@ -476,8 +492,9 @@ export class ResourceReadView {
 		return this.unproven(target);
 	}
 	private observeSource(source: ResourceInputSource) {
-		return (dependencies: ReadonlySet<string> | undefined) => {
-			const proofs = source.observed(dependencies);
+		return (dependencies: ReadonlySet<string> | undefined, commit = true) => {
+			const proofs = source.observed(dependencies, commit);
+			if (!commit) return proofs;
 			if (this.collectProofs && proofs?.length) {
 				for (const proof of proofs) this.collectProofs.set(proof.observations, proof);
 				this.onForeignInputs?.(true);

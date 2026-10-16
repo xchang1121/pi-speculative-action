@@ -1,4 +1,4 @@
-import { link, readFile, writeFile } from "node:fs/promises";
+import { link, mkdir, readFile, rename, symlink, writeFile } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import path from "node:path";
 import { fauxAssistantMessage, fauxToolCall, Type } from "@earendil-works/pi-ai";
@@ -135,7 +135,7 @@ test.for(["actor", "preview", "dynamic", "dynamic-preview", "hints", "hints-prev
 	if (failed || cancelled) await expect(result).rejects.toThrow(failed ? "consumer failed after writing" : "consumer cancelled");
 	else expect(await result).toEqual({ content: [{ type: "text", text: `summarize_records:${stale || changes ? 3 : range ? 1 : 2}` }], details: { tool: names[1] } });
 	expect({ builds, renders, effects }).toEqual({ builds: (direct || stale || unavailable || mode.includes("binding") || mode === "calculation-key" || mode === "revoke" ? 2 : 1) + Number(unrelated) - Number(direct && cancelled) - Number(early),
-		renders: 2 + Number(mode === "stale") + Number(unrelated) + Number(overlap) - Number(failed || cancelled) - Number(early), effects: Number(direct || mode.startsWith("mixed")) + Number(changes) + Number(overlap && !cancelled) - Number(direct && cancelled) - Number(early && mutates(0)) });
+		renders: 2 + Number(unrelated) + Number(overlap) - Number(failed || cancelled) - Number(early), effects: Number(direct || mode.startsWith("mixed")) + Number(changes) + Number(overlap && !cancelled) - Number(direct && cancelled) - Number(early && mutates(0)) });
 	expect(f.fallbacks).toEqual([...(seeded ? [names[0]!] : []), ...(live && !mode.endsWith("preview") || early || mutates(1) || mode === "revoke" || mode.startsWith("rejected") ? Array(1 + Number(overlap)).fill(names[1]!) : [])]);
 	if (direct && cancelled) await expect(readFile(path.join(cwd, `${names[1]}.txt`))).rejects.toMatchObject({ code: "ENOENT" });
 	else if ((direct || mode.startsWith("mixed")) && !(early && mutates(0))) expect(await readFile(path.join(cwd, `${names[Number(mode !== "mixed-producer")]}.txt`), "utf8")).toBe(String(stale || changes ? 3 : range ? 1 : 2));
@@ -151,26 +151,31 @@ test.for(["actor", "preview", "dynamic", "dynamic-preview", "hints", "hints-prev
 	if (cancelled) expect(f.events.filter(event => event.type === "actor_action")[0]?.computation?.hiddenComputeMs).toBe(0);
 });
 
-test.for(["stale", "all-stale", "binding", "failure", "cancel", "composed", "revoke"])("selects valid preparations across live producers (%s)", async mode => {
+test.for(["stale", "all-stale", "binding", "failure", "cancel", "composed", "revoke",
+	...["preview", "fresh", "stale", "all-stale", "alias", "failure", "cancel", "composed", "revoke"].map(mode => `input-${mode}`)])("selects valid preparations across live producers (%s)", async mode => {
+	const input = mode.startsWith("input-"); mode = mode.replace(/^input-/, "");
 	const cwd = await directories.create(), file = path.join(cwd, "input.txt"), extra = path.join(cwd, "extra.txt"), binding = {};
 	await writeFile(file, "one\ntwo\n"); await writeFile(extra, "before\n");
+	const alias = path.join(cwd, "current"), args = { path: mode === "alias" ? "current" : "input.txt" };
+	if (mode === "alias") { for (const name of ["old", "new"]) await mkdir(path.join(cwd, name)); await symlink(path.join(cwd, "old"), alias, "junction"); }
 	const names = ["prepare_count", "prepare_summary", "consume_count"], reader = createReadTool(cwd);
-	const definitions = names.map(tool => ({ ...PI_ACTION_SEMANTICS.definition("read")!, tool, epoch: tool, projectors: [] }));
+	const definitions = names.map(tool => ({ ...PI_ACTION_SEMANTICS.definition("read")!, tool, epoch: tool, projectors: [], ...(input && !(["preview", "alias"].includes(mode) && tool === names[2]) ? { canonicalize: () => undefined } : {}) }));
 	const actionSemantics = new ActionSemanticsRegistry(definitions), tools = names.map(name => ({ ...reader, name })) as Parameters<typeof systemHost>[1];
-	const built = [deferred(), deferred()], releaseBuild = [deferred(), deferred()], exposed = [deferred(), deferred()], releaseParent = deferred();
+	const built = [deferred(), deferred()], releaseBuild = [deferred(), deferred()], exposed = [deferred(), deferred()], releaseParent = [deferred(), deferred()];
 	const controller = new AbortController(), failure = new Error("consumer stopped after its effect"), wrapper = {};
 	let builds = 0, disposals = 0, effects = 0, compositions = 0, compositionDisposals = 0, revoke: (() => void | Promise<void>) | undefined;
 	const invocations = names.map((tool, index) => ({ semantics: definitions[index], executor: tool, ...bindResourceOperation(async (view, request) => {
 		const consume = async (count: number) => { if (index === 2) { effects++; if (mode === "cancel") controller.abort(failure); if (mode === "failure" || mode === "cancel") throw failure; } return count; };
-		const calculate = (inputs: typeof view, consume: (count: number) => Promise<number>) => inputs.prepare!(mode === "binding" && index === 1 ? definitions[1]! : binding, "line-count", async inputs => {
-			const content = await inputs.readFile(file); if (!index) await inputs.readFile(extra);
+		const calculate = (inputs: typeof view, consume: (count: number) => Promise<number>) => inputs.prepare!(input || mode === "binding" && index === 1 ? definitions[index]! : binding, "line-count", async inputs => {
+			const count = input ? (await inputs.stat!(mode === "alias" ? alias : file)).size ?? 0 : (await inputs.readFile(file)).toString().trim().split("\n").length;
+			if (!input && !index) await inputs.readFile(extra);
 			builds++; if (index < 2) { built[index]!.resolve(); await releaseBuild[index]!.promise; }
-			return { value: content.toString().trim().split("\n").length, bytes: 8, dispose: () => { disposals++; } };
+			return { value: count, bytes: 8, dispose: () => { disposals++; } };
 		}, consume, file, request.signal);
-		const count = index === 2 && mode === "composed" ? await view.prepare!(wrapper, "render", async inputs => {
+		const count = input && index === 1 ? (await view.readFile(file)).length : index === 2 && mode === "composed" ? await view.prepare!(wrapper, "render", async inputs => {
 			const value = await calculate(inputs, async count => count); compositions++; return { value, bytes: 8, dispose: () => { compositionDisposals++; } };
 		}, consume, file, request.signal) : await calculate(view, consume);
-		if (index < 2) { exposed[index]!.resolve(); await releaseParent.promise; }
+		if (index < 2) { exposed[index]!.resolve(); await releaseParent[index]!.promise; }
 		return { result: { content: [{ type: "text" as const, text: `${tool}:${count}` }], details: {} }, isError: false };
 	}, cwd) }));
 	const capture = invocations[0]!.captureInputs!;
@@ -180,19 +185,32 @@ test.for(["stale", "all-stale", "binding", "failure", "cancel", "composed", "rev
 		resources: { initial: { cpuCount: 3, idleCpuCount: 3 }, sample: () => new Promise(() => {}) },
 		executionWorlds: [createResourceSnapshotExecutionWorld(actionSemantics, { maxBytes: () => 1024 * 1024 })],
 	}, { maxConcurrentActions: 3, scheduling: { heavyCpu: 1 } });
-	await using _cleanup = onExit(async () => { for (const gate of releaseBuild) gate.resolve(); releaseParent.resolve(); await Promise.allSettled(parents); await f.dispose(); expect(disposals).toBe(builds); expect(compositionDisposals).toBe(compositions); });
+	await using _cleanup = onExit(async () => { for (const gate of [...releaseBuild, ...releaseParent]) gate.resolve(); await Promise.allSettled(parents); await f.dispose(); expect(disposals).toBe(builds); expect(compositionDisposals).toBe(compositions); });
 	await f.start();
-	for (let index = 0; index < 2; index++) { parents.push(f.execute(names[index]!, { path: "input.txt" })); await built[index]!.promise; }
+	for (let index = 0; index < 2; index++) {
+		parents.push(f.execute(names[index]!, args));
+		if (!input || !index) await built[index]!.promise;
+		if (input) { releaseBuild[index]!.resolve(); await exposed[index]!.promise; if (!index && mode !== "fresh") await writeFile(file, "one\ntwo\nthree\n"); }
+	}
+	if (mode === "alias") { await rename(alias, path.join(cwd, "retired")); await symlink(path.join(cwd, "new"), alias, "junction"); }
 	for (let index = 0; index < 2; index++) { releaseBuild[index]!.resolve(); await exposed[index]!.promise; }
-	expect(builds).toBe(2); await writeFile(extra, "after\n");
+	expect(builds).toBe(input ? 1 : 2); await writeFile(extra, "after\n");
 	if (mode === "all-stale") await writeFile(file, "one\ntwo\nthree\n");
 	if (mode === "revoke") await revoke!();
-	const result = f.execute(names[2]!, { path: "input.txt" }, controller.signal);
+	if (input) {
+		// The older metadata owner finishes last, ahead of the valid payload in recency order.
+		for (const index of [1, 0]) { releaseParent[index]!.resolve(); await parents[index]; }
+		if (mode === "all-stale") await writeFile(file, "one\ntwo\nthree\nfour\n");
+	}
+	if (input && mode === "preview") await f.preview(names[2]!, args);
+	const result = f.execute(names[2]!, args, controller.signal);
 	if (mode === "failure" || mode === "cancel") await expect(result).rejects.toBe(failure);
-	else expect(textOutput(await result)).toBe(`consume_count:${mode === "all-stale" ? 3 : 2}`);
-	if (mode === "composed") expect(textOutput(await f.execute(names[2]!, { path: "input.txt" }))).toBe("consume_count:2");
+	else expect(textOutput(await result)).toBe(`consume_count:${input ? mode === "alias" ? 0 : mode === "fresh" ? 8 : mode === "all-stale" ? 19 : 14 : mode === "all-stale" ? 3 : 2}`);
+	if (mode === "composed") expect(textOutput(await f.execute(names[2]!, args))).toBe(`consume_count:${input ? 14 : 2}`);
 	expect(effects).toBe(mode === "composed" ? 2 : 1); expect(compositions).toBe(Number(mode === "composed"));
-	expect(builds).toBe(["all-stale", "binding"].includes(mode) ? 3 : 2);
+	expect(builds).toBe(!input && ["all-stale", "binding"].includes(mode) ? 3 : 2);
+	if (input) { await f.finish(); const timing = f.events.filter(event => event.type === "actor_action").filter(event => event.settlement.tool === names[2]).at(-1)!.computation!;
+		expect(timing.hiddenComputeMs > 0).toBe(!["all-stale", "alias", "failure", "cancel"].includes(mode)); expect(timing.hiddenComputeMs).toBeLessThanOrEqual(timing.toolComputeMs!); }
 });
 
 test.for(["reopened", "inflight", "completed", "binding", "reverse", "deep", "added", "changed", "removed", "shared", "shared-refresh", "shared-stale", "shared-unused", "shared-native", "shared-native-stale", "shared-exact", "shared-exact-stale"])("retains learned continuations across authoritative batch updates (%s)", async mode => {
