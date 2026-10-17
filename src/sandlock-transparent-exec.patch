@@ -73,7 +73,7 @@ index 96309ec..f30b2a3 100644
          if policy.workdir.is_none() {
              return Err(anyhow!("--dry-run requires --workdir"));
 diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/src/chroot/dispatch.rs
-index 6e4ab93..4234add 100644
+index 6e4ab93..3e50a6c 100644
 --- a/crates/sandlock-core/src/chroot/dispatch.rs
 +++ b/crates/sandlock-core/src/chroot/dispatch.rs
 @@ -47,9 +47,10 @@
@@ -1118,7 +1118,7 @@ index 6e4ab93..4234add 100644
      )
      .is_err()
      {
-@@ -1111,348 +1445,409 @@ pub(crate) async fn handle_chroot_write(
+@@ -1111,348 +1445,408 @@ pub(crate) async fn handle_chroot_write(
      notif_fd: RawFd,
      ctx: &ChrootCtx<'_>,
  ) -> NotifAction {
@@ -1314,6 +1314,14 @@ index 6e4ab93..4234add 100644
 +    format!("{:016x}", hash.finish()) // Every indexed row also verifies its full pathname: collisions grant no proof.
 +}
 +
++fn stat_fields(s: &libc::stat, birth: i128) -> [i128; 14] {
++    [s.st_dev as i128, s.st_ino as i128, s.st_mode as i128, s.st_nlink as i128, s.st_uid as i128, s.st_gid as i128,
++        s.st_rdev as i128, s.st_size as i128, s.st_blksize as i128, s.st_blocks as i128,
++        s.st_atime as i128 * 1_000_000_000 + s.st_atime_nsec as i128,
++        s.st_mtime as i128 * 1_000_000_000 + s.st_mtime_nsec as i128,
++        s.st_ctime as i128 * 1_000_000_000 + s.st_ctime_nsec as i128, birth]
++}
++
 +fn descriptor_fields(fd: RawFd) -> std::io::Result<[i128; 14]> {
 +    let mut s: libc::stat = unsafe { std::mem::zeroed() };
 +    if unsafe { libc::fstat(fd, &mut s) } != 0 { return Err(std::io::Error::last_os_error()); }
@@ -1321,11 +1329,7 @@ index 6e4ab93..4234add 100644
 +    let birth = if unsafe { libc::statx(fd, c"".as_ptr(), libc::AT_EMPTY_PATH, libc::STATX_BTIME, &mut x) } == 0 {
 +        x.stx_btime.tv_sec as i128 * 1_000_000_000 + x.stx_btime.tv_nsec as i128
 +    } else { 0 };
-+    Ok([s.st_dev as i128, s.st_ino as i128, s.st_mode as i128, s.st_nlink as i128, s.st_uid as i128, s.st_gid as i128,
-+        s.st_rdev as i128, s.st_size as i128, s.st_blksize as i128, s.st_blocks as i128,
-+        s.st_atime as i128 * 1_000_000_000 + s.st_atime_nsec as i128,
-+        s.st_mtime as i128 * 1_000_000_000 + s.st_mtime_nsec as i128,
-+        s.st_ctime as i128 * 1_000_000_000 + s.st_ctime_nsec as i128, birth])
++    Ok(stat_fields(&s, birth))
 +}
 +
 +fn input_links(name: &str, original: &str) -> std::io::Result<Vec<(String, String)>> {
@@ -1784,12 +1788,7 @@ index 6e4ab93..4234add 100644
 +    }
 +
 +    fn stat(&self, state: &mut libc::stat) {
-+        let mut fields = [state.st_dev as i128, state.st_ino as i128, state.st_mode as i128, state.st_nlink as i128,
-+            state.st_uid as i128, state.st_gid as i128, state.st_rdev as i128, state.st_size as i128,
-+            state.st_blksize as i128, state.st_blocks as i128,
-+            state.st_atime as i128 * 1_000_000_000 + state.st_atime_nsec as i128,
-+            state.st_mtime as i128 * 1_000_000_000 + state.st_mtime_nsec as i128,
-+            state.st_ctime as i128 * 1_000_000_000 + state.st_ctime_nsec as i128, 0];
++        let mut fields = stat_fields(state, 0);
 +        self.project(&mut fields);
 +        state.st_dev = fields[0] as _; state.st_ino = fields[1] as _; state.st_mode = fields[2] as _;
 +        state.st_nlink = fields[3] as _; state.st_uid = fields[4] as _; state.st_gid = fields[5] as _;
@@ -1837,7 +1836,7 @@ index 6e4ab93..4234add 100644
 
      // Let libc lay the struct out. Hand-packing it in field order is an
      // x86_64 assumption: aarch64 and riscv64 put st_mode and st_nlink before
-@@ -1476,6 +1871,11 @@ fn stat_and_write(notif: &SeccompNotif, notif_fd: RawFd, path: &Path) -> NotifAc
+@@ -1476,6 +1870,11 @@ fn stat_and_write(notif: &SeccompNotif, notif_fd: RawFd, path: &Path) -> NotifAc
          return NotifAction::Errno(last_errno(libc::ENOENT));
      }
 
@@ -1849,7 +1848,7 @@ index 6e4ab93..4234add 100644
      let bytes = unsafe {
          std::slice::from_raw_parts(
              &st as *const libc::stat as *const u8,
-@@ -1488,6 +1888,8 @@ fn stat_and_write(notif: &SeccompNotif, notif_fd: RawFd, path: &Path) -> NotifAc
+@@ -1488,6 +1887,8 @@ fn stat_and_write(notif: &SeccompNotif, notif_fd: RawFd, path: &Path) -> NotifAc
      NotifAction::ReturnValue(0)
  }
 
@@ -1858,7 +1857,7 @@ index 6e4ab93..4234add 100644
  pub(crate) async fn handle_chroot_stat(
      notif: &SeccompNotif,
      _chroot_state: &Arc<Mutex<ChrootState>>,
-@@ -1496,98 +1898,101 @@ pub(crate) async fn handle_chroot_stat(
+@@ -1496,98 +1897,101 @@ pub(crate) async fn handle_chroot_stat(
      ctx: &ChrootCtx<'_>,
  ) -> NotifAction {
      let nr = notif.data.nr as i64;
@@ -2036,7 +2035,7 @@ index 6e4ab93..4234add 100644
          return NotifAction::Continue;
      }
      NotifAction::ReturnValue(0)
-@@ -1687,7 +2092,7 @@ pub(crate) async fn handle_chroot_readlink(
+@@ -1687,7 +2091,7 @@ pub(crate) async fn handle_chroot_readlink(
      // (needed because memfd-backed binaries would show "/memfd:sandlock-exec" otherwise).
      if path == format!("{}/exe", own_proc) {
          let cs = chroot_state.lock().await;
@@ -2045,7 +2044,7 @@ index 6e4ab93..4234add 100644
              let s = exe.to_string_lossy();
              return write_target(s.as_bytes());
          }
-@@ -1704,8 +2109,8 @@ pub(crate) async fn handle_chroot_readlink(
+@@ -1704,8 +2108,8 @@ pub(crate) async fn handle_chroot_readlink(
      // readlink must read the link itself, never what it points at, which is
      // exactly what the no-follow resolver gives.
      let (host_path, _) = match resolve_chroot_path_nofollow(notif, dirfd, &path, ctx) {
@@ -2056,7 +2055,7 @@ index 6e4ab93..4234add 100644
      };
 
      // COW
-@@ -1716,7 +2121,12 @@ pub(crate) async fn handle_chroot_readlink(
+@@ -1716,7 +2120,12 @@ pub(crate) async fn handle_chroot_readlink(
              if cow.matches(&host_str) {
                  let target = match cow.handle_readlink(&host_str) {
                      Some(t) => t,
@@ -2070,7 +2069,7 @@ index 6e4ab93..4234add 100644
                  };
                  drop(cs);
                  return write_target(target.as_bytes());
-@@ -1726,7 +2136,7 @@ pub(crate) async fn handle_chroot_readlink(
+@@ -1726,7 +2135,7 @@ pub(crate) async fn handle_chroot_readlink(
 
      let target = match std::fs::read_link(&host_path) {
          Ok(t) => t,
@@ -2079,7 +2078,7 @@ index 6e4ab93..4234add 100644
      };
 
      // Strip chroot/mount prefix from absolute targets
-@@ -1742,96 +2152,8 @@ pub(crate) async fn handle_chroot_readlink(
+@@ -1742,96 +2151,8 @@ pub(crate) async fn handle_chroot_readlink(
  // xattr handler
  // ============================================================
 
@@ -2178,7 +2177,7 @@ index 6e4ab93..4234add 100644
  pub(crate) async fn handle_chroot_xattr(
      notif: &SeccompNotif,
      _chroot_state: &Arc<Mutex<ChrootState>>,
-@@ -1839,100 +2161,60 @@ pub(crate) async fn handle_chroot_xattr(
+@@ -1839,100 +2160,60 @@ pub(crate) async fn handle_chroot_xattr(
      notif_fd: RawFd,
      ctx: &ChrootCtx<'_>,
  ) -> NotifAction {
@@ -2325,7 +2324,7 @@ index 6e4ab93..4234add 100644
  }
 
  // ============================================================
-@@ -1940,18 +2222,15 @@ pub(crate) async fn handle_chroot_xattr(
+@@ -1940,18 +2221,15 @@ pub(crate) async fn handle_chroot_xattr(
  // ============================================================
 
  pub(crate) async fn handle_chroot_getdents(
@@ -2351,7 +2350,7 @@ index 6e4ab93..4234add 100644
  }
 
  // ============================================================
-@@ -2043,6 +2322,20 @@ pub(crate) async fn handle_chroot_fchdir(
+@@ -2043,6 +2321,20 @@ pub(crate) async fn handle_chroot_fchdir(
      NotifAction::Continue
  }
 
@@ -2372,7 +2371,7 @@ index 6e4ab93..4234add 100644
  // ============================================================
  // getcwd handler
  // ============================================================
-@@ -2092,12 +2385,38 @@ pub(crate) async fn handle_chroot_statfs(
+@@ -2092,12 +2384,38 @@ pub(crate) async fn handle_chroot_statfs(
          None => return NotifAction::Continue,
      };
 
@@ -2415,7 +2414,7 @@ index 6e4ab93..4234add 100644
          Ok(c) => c,
          Err(a) => return a,
      };
-@@ -2118,327 +2437,6 @@ pub(crate) async fn handle_chroot_statfs(
+@@ -2118,327 +2436,6 @@ pub(crate) async fn handle_chroot_statfs(
      NotifAction::ReturnValue(0)
  }
 
@@ -2743,7 +2742,7 @@ index 6e4ab93..4234add 100644
  #[cfg(test)]
  mod self_rewrite_tests {
      use super::canon_proc_self;
-@@ -2475,13 +2473,19 @@ mod mount_ro_tests {
+@@ -2475,13 +2472,19 @@ mod mount_ro_tests {
          writable: &'a [PathBuf],
          processes: &'a Arc<ProcessIndex>,
      ) -> ChrootCtx<'a> {
@@ -2763,7 +2762,7 @@ index 6e4ab93..4234add 100644
              processes,
          }
      }
-@@ -2511,3 +2515,52 @@ mod mount_ro_tests {
+@@ -2511,3 +2514,52 @@ mod mount_ro_tests {
          assert!(c.can_write(Path::new("/data/file")));
      }
  }
