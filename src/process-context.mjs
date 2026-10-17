@@ -61,7 +61,7 @@ export async function captureProcessContext(pid, inheritedDescriptors, regularDe
 			flags: Number.parseInt(flags, 8) & ~0o2000000,
 		};
 	});
-	const [input, output, error] = descriptors;
+	const [, output, error] = descriptors;
 	if (!output || output.fd !== 1 || !error || error.fd !== 2) throw new Error("reported process lacks its output streams");
 	/** @param {string} name */
 	const field = name => {
@@ -73,8 +73,6 @@ export async function captureProcessContext(pid, inheritedDescriptors, regularDe
 	if (uid.length !== 4 || gid.length !== 4) throw new Error("held process credentials are incomplete");
 	if (!groups.includes(gid[1])) groups.push(gid[1]);
 	groups.sort((left, right) => left - right);
-	/** @type {Map<string, number>} */
-	const aliases = new Map();
 	/** @type {Map<string, number>} */
 	const queues = new Map();
 	const semantic = {
@@ -88,17 +86,15 @@ export async function captureProcessContext(pid, inheritedDescriptors, regularDe
 			cpus: field("Cpus_allowed_list"), memoryNodes: field("Mems_allowed_list"),
 		},
 		descriptors: descriptors.map(({ endpoint, identity, ...descriptor }) => {
-			if (!aliases.has(identity)) aliases.set(identity, aliases.size);
 			if (descriptor.queue && !queues.has(descriptor.queue)) queues.set(descriptor.queue, descriptor.fd);
 			// routedProcessContext reproduces this key order, including its /dev/null discard outlet.
-			return { fd: descriptor.fd, type: descriptor.type, flags: descriptor.flags, alias: aliases.get(identity),
+			return { fd: descriptor.fd, type: descriptor.type, flags: descriptor.flags, alias: identity,
 				...(descriptor.queue ? { queue: queues.get(descriptor.queue) } : {}), ...(descriptor.type === "device" ? { endpoint } : {}) };
 		}),
 	};
 	return {
 		...contextKeys(semantic),
 		umask: Number.parseInt(field("Umask"), 8),
-		descriptorTypes: [input.type, output.type, error.type],
 		outputEndpoints: [output.endpoint ?? "", error.endpoint ?? ""],
 		...(regularDescriptors?.length ? { regularDescriptors } : {}),
 	};
@@ -140,18 +136,11 @@ export function routedProcessContext(context, route, closeStdin = false, regular
 		else if (descriptor.fd > 2) descriptors.push(entry);
 		else throw new Error("inherited output descriptor cannot use buffered routing");
 	}
-	const aliases = new Map();
-	for (const descriptor of descriptors) {
-		if (!aliases.has(descriptor.alias)) aliases.set(descriptor.alias, aliases.size);
-		descriptor.alias = aliases.get(descriptor.alias);
-	}
 	// libuv resets the signal mask and dispositions for every spawned target.
 	const signals = { blocked: semantic.signals.blocked.replace(/[0-9a-f]/gi, "0"), ignored: semantic.signals.ignored.replace(/[0-9a-f]/gi, "0") };
 	return {
 		...context,
 		...contextKeys({ ...semantic, executionDomain: "ptrace", signals, descriptors }),
-		descriptorTypes: [regularDescriptors?.find(({ fd }) => fd === 0)?.type ?? (regularDescriptors?.some(({ fd }) => fd === 0) ? "regular" : closeStdin ? "closed" : context.descriptorTypes[0]),
-			outputPipes?.[0] ? "pipe" : route[0] ? context.descriptorTypes[route[0]] : "device", outputPipes?.[1] ? "pipe" : route[1] ? context.descriptorTypes[route[1]] : "device"],
 		...(regularDescriptors?.length ? { regularDescriptors } : {}),
 	};
 }
@@ -185,10 +174,17 @@ function discardFlags() {
 	return nullOutputFlags;
 }
 
-/** @param {{ credentials: Record<string, unknown>, [key: string]: unknown }} semantic */
+/** @param {{ credentials: Record<string, unknown>, descriptors: readonly { type: DescriptorType, alias: unknown }[], [key: string]: unknown }} semantic */
 function contextKeys(semantic) {
+	const aliases = new Map();
+	for (const descriptor of semantic.descriptors) {
+		if (!aliases.has(descriptor.alias)) aliases.set(descriptor.alias, aliases.size);
+		descriptor.alias = aliases.get(descriptor.alias);
+	}
 	const launch = { ...semantic, credentials: { ...semantic.credentials, groups: "broker-preserved" }, signals: "broker-normalized" };
-	return { key: JSON.stringify(semantic), launchKey: JSON.stringify(launch) };
+	const [input, output, error] = semantic.descriptors;
+	return { key: JSON.stringify(semantic), launchKey: JSON.stringify(launch),
+		descriptorTypes: /** @type {ProcessExecutionContext["descriptorTypes"]} */ ([input.type, output.type, error.type]) };
 }
 
 /** @param {string} value */
