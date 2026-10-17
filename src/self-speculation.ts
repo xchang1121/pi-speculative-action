@@ -781,52 +781,30 @@ function parseVerificationOutcome(
 	const steps = (rawSteps ?? []).map((value, index) => {
 		const step = record(value);
 		if (!step) throw new Error("self-speculation verification step must be an object");
-		const draftedTokens = requiredVerificationInteger(step.drafted_tokens, "drafted_tokens", true);
-		const acceptedTokens = requiredVerificationInteger(step.accepted_tokens, "accepted_tokens");
-		const rejectedTokens = optionalVerificationInteger(step.rejected_tokens, "rejected_tokens") ??
-			draftedTokens - acceptedTokens;
-		if (acceptedTokens > draftedTokens || acceptedTokens + rejectedTokens !== draftedTokens)
-			throw new Error("self-speculation verification step token counts are inconsistent");
-		const candidateIndex = optionalVerificationInteger(step.candidate_index, "candidate_index") ?? index;
+		const tokens = verificationTokenCounts(step);
+		const candidateIndex = verificationNumber(step, "candidate_index") ?? index;
 		const candidateID = step.candidate_id === undefined || step.candidate_id === null ? undefined : nonEmptyString(step.candidate_id);
 		if (step.candidate_id !== undefined && step.candidate_id !== null && !candidateID)
 			throw new Error("self-speculation verification candidate_id must be a non-empty string");
-		const candidateIDs = [...new Set([
-			...(candidateID ? [candidateID] : []),
-			...array(step.candidate_ids).map(nonEmptyString).filter((value): value is string => value !== undefined),
-		])];
-		const reportedSources = array(step.sources)
-			.map(nonEmptyString)
-			.filter((value): value is string => value !== undefined);
+		const candidateIDs = uniqueStrings([candidateID, ...array(step.candidate_ids)]);
+		const reportedSources = uniqueStrings(step.sources);
 		const sources = reportedSources.length
-			? [...new Set(reportedSources)]
+			? reportedSources
 			: [...new Set(candidateIDs.flatMap((id) => [...(reportedCandidates.get(id)?.sources ?? [])].sort()))];
 		return Object.freeze({
 			candidateIndex,
 			...(candidateID ? { candidateID } : {}),
 			candidateIDs: Object.freeze(candidateIDs),
 			sources: Object.freeze(sources),
-			draftedTokens,
-			acceptedTokens,
-			rejectedTokens,
+			...tokens,
 		});
 	});
 	const stepDraftedTokens = steps.reduce((total, step) => total + step.draftedTokens, 0);
 	const stepAcceptedTokens = steps.reduce((total, step) => total + step.acceptedTokens, 0);
 	const stepRejectedTokens = steps.reduce((total, step) => total + step.rejectedTokens, 0);
-	const speculativeSteps = optionalVerificationInteger(verification.num_spec_steps, "num_spec_steps") ?? steps.length;
-	const draftedTokens = optionalVerificationInteger(verification.num_draft_tokens, "num_draft_tokens") ??
-		stepDraftedTokens;
-	const acceptedTokens = optionalVerificationInteger(
-		verification.num_accepted_draft_tokens,
-		"num_accepted_draft_tokens",
-	) ?? stepAcceptedTokens;
-	const rejectedTokens = optionalVerificationInteger(
-		verification.num_rejected_draft_tokens,
-		"num_rejected_draft_tokens",
-	) ?? draftedTokens - acceptedTokens;
-	if (acceptedTokens > draftedTokens || acceptedTokens + rejectedTokens !== draftedTokens)
-		throw new Error("self-speculation verification token counts are inconsistent");
+	const speculativeSteps = verificationNumber(verification, "num_spec_steps") ?? steps.length;
+	const tokens = verificationTokenCounts(verification, { draftedTokens: stepDraftedTokens, acceptedTokens: stepAcceptedTokens });
+	const { draftedTokens, acceptedTokens, rejectedTokens } = tokens;
 	if (
 		steps.length > 0 &&
 		(speculativeSteps !== steps.length ||
@@ -835,18 +813,14 @@ function parseVerificationOutcome(
 			rejectedTokens !== stepRejectedTokens)
 	)
 		throw new Error("self-speculation verification totals do not match its steps");
-	const unresolvedProposals = optionalVerificationInteger(verification.unresolved_proposals, "unresolved_proposals") ?? 0;
-	const unresolvedDraftTokens = optionalVerificationInteger(verification.unresolved_draft_tokens, "unresolved_draft_tokens") ?? 0;
-	const meanAcceptanceLength = optionalVerificationNumber(
-		verification.mean_acceptance_length,
-		"mean_acceptance_length",
-	) ?? (speculativeSteps > 0 ? 1 + acceptedTokens / speculativeSteps : 1);
+	const unresolvedProposals = verificationNumber(verification, "unresolved_proposals") ?? 0;
+	const unresolvedDraftTokens = verificationNumber(verification, "unresolved_draft_tokens") ?? 0;
+	const meanAcceptanceLength = verificationNumber(verification, "mean_acceptance_length", false) ??
+		(speculativeSteps > 0 ? 1 + acceptedTokens / speculativeSteps : 1);
 	return Object.freeze({
 		requestID,
 		speculativeSteps,
-		draftedTokens,
-		acceptedTokens,
-		rejectedTokens,
+		...tokens,
 		acceptanceRate: draftedTokens > 0 ? acceptedTokens / draftedTokens : 0,
 		meanAcceptanceLength,
 		unresolvedProposals,
@@ -855,23 +829,29 @@ function parseVerificationOutcome(
 	});
 }
 
-function optionalVerificationNumber(value: unknown, field: string): number | undefined {
+function verificationTokenCounts(value: Readonly<Record<string, unknown>>, totals?: { draftedTokens: number; acceptedTokens: number }) {
+	const draftedTokens = totals ? verificationNumber(value, "num_draft_tokens") ?? totals.draftedTokens
+		: requiredVerificationInteger(value, "drafted_tokens", true);
+	const acceptedTokens = totals ? verificationNumber(value, "num_accepted_draft_tokens") ?? totals.acceptedTokens
+		: requiredVerificationInteger(value, "accepted_tokens");
+	const rejectedTokens = verificationNumber(value, totals ? "num_rejected_draft_tokens" : "rejected_tokens") ?? draftedTokens - acceptedTokens;
+	if (acceptedTokens > draftedTokens || acceptedTokens + rejectedTokens !== draftedTokens)
+		throw new Error(`self-speculation verification ${totals ? "" : "step "}token counts are inconsistent`);
+	return { draftedTokens, acceptedTokens, rejectedTokens };
+}
+
+function verificationNumber(record: Readonly<Record<string, unknown>>, field: string, integer = true): number | undefined {
+	const value = record[field];
 	if (value === undefined || value === null) return undefined;
 	if (typeof value !== "number" || !Number.isFinite(value) || value < 0)
 		throw new Error(`self-speculation verification ${field} must be a non-negative number`);
+	if (integer && !Number.isSafeInteger(value))
+		throw new Error(`self-speculation verification ${field} must be an integer`);
 	return value;
 }
 
-function optionalVerificationInteger(value: unknown, field: string): number | undefined {
-	const number = optionalVerificationNumber(value, field);
-	if (number === undefined) return undefined;
-	if (!Number.isSafeInteger(number))
-		throw new Error(`self-speculation verification ${field} must be an integer`);
-	return number;
-}
-
-function requiredVerificationInteger(value: unknown, field: string, positive = false): number {
-	const number = optionalVerificationInteger(value, field);
+function requiredVerificationInteger(value: Readonly<Record<string, unknown>>, field: string, positive = false): number {
+	const number = verificationNumber(value, field);
 	if (number === undefined || (positive && number === 0))
 		throw new Error(
 			`self-speculation verification ${field} must be ${positive ? "positive" : "present"}`,
