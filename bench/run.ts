@@ -16,6 +16,7 @@ import { createSpeculativeActionExtension, type SpeculativeActionExtensionDepend
 import type { DrafterTaskBudget } from "../src/drafter-budget.ts";
 import type { SpeculativeActionEvent } from "../src/runtime.ts";
 import { summarizeSpeculativeTrace } from "../src/trace-summary.ts";
+import { incrementCounts } from "../src/number-utils.ts";
 import { TaskTimeline, toolSpeedup } from "../src/task-timing.ts";
 
 const DATASET_ROWS =
@@ -219,11 +220,12 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	});
 	await session.bindExtensions({ mode: "print" });
 	let turns = 0;
-	const actorActionsByTool: Record<string, number> = {}, toolTimeline = new TaskTimeline(taskStartedAt);
+	let actorActionsByTool: Record<string, number> = {};
+	const toolTimeline = new TaskTimeline(taskStartedAt);
 	const toolWaits = new Map<string, { startedAt: number; completedAt?: number; finish: (completedAt: number) => void }>();
 	session.subscribe((event) => {
 		if (event.type === "tool_execution_start") {
-			increment(actorActionsByTool, event.toolName);
+			actorActionsByTool = incrementCounts(actorActionsByTool, [event.toolName]);
 			const startedAt = performance.now();
 			toolWaits.set(event.toolCallId, { startedAt, finish: toolTimeline.startToolWait(startedAt) });
 		}
@@ -428,10 +430,6 @@ function patchFiles(patch: string): string[] {
 }
 
 function lines(value: string): string[] { return value .split(/\r?\n/) .map((line) => line.trim()) .filter(Boolean); }
-
-function increment(counts: Record<string, number>, key: string): void {
-	counts[key] = (counts[key] ?? 0) + 1;
-}
 
 function numberOption(option: string, kind: "positive integer" | "non-negative integer" | "non-negative number" = "positive integer"): number {
 	const parsed = Number(Reflect.get(values, option));
