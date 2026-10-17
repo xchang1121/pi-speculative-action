@@ -417,7 +417,7 @@ function normalizePrototype(input: ExecPrototype): ExecPrototype {
 			return present ? { name, present: true as const, valueDigest: valueDigest! } : { name, present: false as const };
 		})
 		.sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0);
-	const descriptors = new Set<number>();
+	const descriptors = new Map<number, InheritedFileDescriptor>();
 	const inheritedFDs = [...rawDescriptors]
 		.map((source) => {
 			const fd = cloneSharedData({ ...source });
@@ -425,7 +425,7 @@ function normalizePrototype(input: ExecPrototype): ExecPrototype {
 				throw new Error("process prototype descriptor table is invalid");
 			}
 			if (fd.installed !== undefined && (fd.installed !== false || fd.fd < 3 || fd.alias !== fd.fd)) throw new Error("invalid queued OFD projection");
-			descriptors.add(fd.fd);
+			descriptors.set(fd.fd, fd);
 			for (const digest of [fd.endpointDigest, fd.contentDigest]) {
 				if (digest !== undefined && !isSha256Digest(digest)) throw new Error("process descriptor digest is invalid");
 			}
@@ -437,8 +437,8 @@ function normalizePrototype(input: ExecPrototype): ExecPrototype {
 		if (descriptor.resourceAliases && (descriptor.type !== "regular" || !descriptor.resourcePath ||
 			!validAliases(descriptor.resourceAliases, descriptor.resourcePath))) throw new Error("invalid inherited descriptor aliases");
 		if (descriptor.alias === undefined) continue;
-		const alias = inheritedFDs.find(({ fd }) => fd === descriptor.alias);
-		const object = inheritedFDs.find(({ fd }) => fd === descriptor.object);
+		const alias = descriptors.get(descriptor.alias);
+		const object = descriptors.get(descriptor.object!);
 		if (!["regular", "null", "directory", "pipe", "socket", "eventfd"].includes(descriptor.type) || !isOFDPosition(descriptor.offset) ||
 			(descriptor.type === "pipe" || descriptor.type === "socket" || descriptor.type === "eventfd") && (descriptor.offset !== 0 || !isSha256Digest(descriptor.contentDigest)) ||
 			descriptor.type === "null" && (descriptor.offset !== 0 || descriptor.contentDigest !== sha256Digest("")) ||
