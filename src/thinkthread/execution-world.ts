@@ -84,27 +84,20 @@ export function createThinkThreadExecutionWorld(
 
 	const prepare = async (cwd: string): Promise<PreparedWorld> => {
 		lifetime.signal.throwIfAborted();
-		if (!prepared) {
-			const attempt = prepareWorld(cwd, options.clientFactory).catch((error) => {
-				if (prepared === attempt) prepared = undefined;
-				throw error;
-			});
-			prepared = attempt;
-		}
-		return prepared;
+		return prepared ??= prepareWorld(cwd, options.clientFactory).catch((error) => {
+			prepared = undefined;
+			throw error;
+		});
 	};
 	const fingerprint = async (request?: ExecutionWorldRequest): Promise<string> => {
 		if (request?.action) toolName(request.action.tool);
 		const settings = runnerSettings(request?.action, autoResizeImages);
-		if (!runnerFingerprint) {
-			const attempt = (options.runnerFingerprint
-				? Promise.resolve(options.runnerFingerprint)
-				: hashFile(runnerPath)).catch((error) => {
-				if (runnerFingerprint === attempt) runnerFingerprint = undefined;
-				throw error;
-			});
-			runnerFingerprint = attempt;
-		}
+		runnerFingerprint ??= (options.runnerFingerprint
+			? Promise.resolve(options.runnerFingerprint)
+			: hashFile(runnerPath)).catch((error) => {
+			runnerFingerprint = undefined;
+			throw error;
+		});
 		return (await Promise.all([
 			"thinkthread-fs", snapshotInputs ? "sealed-inputs" : "runner",
 			import("@thinkthread/agent-posix").then((sdk) => sdk.CONTRACT_FINGERPRINT),
