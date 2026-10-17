@@ -208,7 +208,7 @@ type PersistedState = {
 	readonly sequenceCounts: ReadonlyArray<PpmCountTrieRow>;
 };
 
-type PatternSample = { readonly context: ReadonlyArray<PatternAwareEvent>; readonly target: PatternAwareEvent; readonly gap: number; };
+type PatternSample = { readonly context: ReadonlyArray<PatternAwareEvent>; readonly target: PatternAwareEvent; };
 
 type PatternPool = {
 	readonly key: string;
@@ -883,7 +883,7 @@ export class PatternAwareStore {
 			samples: [],
 		};
 		// Internal contexts are immutable; preserving identity lets binding inference reuse its WeakMap cache.
-		const sample = { context, target, gap };
+		const sample = { context, target };
 		pool.samples.push(sample);
 		const sampleLimit = patternPoolSampleLimit(this.settings);
 		const removed = pool.samples.length > sampleLimit ? pool.samples.splice(0, pool.samples.length - sampleLimit) : [];
@@ -917,19 +917,15 @@ export class PatternAwareStore {
 			if (dependencies.length === 0) {
 				this.patternSupportSessions.set(id, new Set(support.map((sample) => sample.target.sessionID)));
 			} else this.patternSupportSessions.delete(id);
+			const lastSeenSequence = support.reduce((latest, { target }) => Math.max(latest, target.sequence), -Infinity);
 			const observed = {
 				bindings,
 				dependencies,
-				gapCounts: {} as Record<string, number>,
-				gapLastSeen: {} as Record<string, number>,
+				gapCounts: { [gap]: support.length },
+				gapLastSeen: { [gap]: lastSeenSequence },
 				occurrences: support.length,
-				lastSeenSequence: -Infinity,
+				lastSeenSequence,
 			};
-			for (const { gap, target } of support) {
-				observed.gapCounts[gap] = (observed.gapCounts[gap] ?? 0) + 1;
-				observed.gapLastSeen[gap] = Math.max(observed.gapLastSeen[gap] ?? 0, target.sequence);
-				observed.lastSeenSequence = Math.max(observed.lastSeenSequence, target.sequence);
-			}
 			const existing = this.patterns.get(id);
 			if (existing) { Object.assign(existing, observed); continue; }
 			this.patterns.set(id, {
@@ -1116,7 +1112,7 @@ export class PatternAwareStore {
 					samples: pool.samples.slice(-sampleLimit).map((sample) => ({
 						context: sample.context.map(reference),
 						target: reference(sample.target),
-						gap: sample.gap,
+						gap: pool.gap,
 					})),
 				}),
 			);
@@ -1530,18 +1526,12 @@ class PatternBindingAnalysis {
 		}
 		if (includeComposites && targetIsPath && typeof target === "string") {
 			const normalizedTarget = normalizePath(target);
-			const joinMatches = new Map<string, Map<string, boolean>>();
+			const joins = new Map<string, typeof pathSources>();
 			for (const left of pathSources) {
-				for (const right of pathSources) {
+				let matches = joins.get(left.value);
+				if (!matches) joins.set(left.value, matches = pathSources.filter(right => joinPath(left.value, right.value) === normalizedTarget));
+				for (const right of matches) {
 					if (left === right) continue;
-					const matchesByRight = joinMatches.get(left.value) ?? new Map<string, boolean>();
-					joinMatches.set(left.value, matchesByRight);
-					let matches = matchesByRight.get(right.value);
-					if (matches === undefined) {
-						matches = joinPath(left.value, right.value) === normalizedTarget;
-						matchesByRight.set(right.value, matches);
-					}
-					if (!matches) continue;
 					yield { type: "join", operation: "join_path", left: left.binding, right: right.binding };
 				}
 			}
@@ -2164,7 +2154,7 @@ function mutablePools(eventsValue: ReadonlyArray<unknown>, pools: ReadonlyArray<
 			const context = sample.context.map((id) => events[id as number]);
 			const target = events[sample.target as number];
 			if (!target || context.some((event) => !event)) return [];
-			return [{ context: context as PatternAwareEvent[], target, gap: record.gap as number }];
+			return [{ context: context as PatternAwareEvent[], target }];
 		});
 		if (!samples.length) return [];
 		const context = structuredClone(record.context) as PatternAwareEventSignature[];
