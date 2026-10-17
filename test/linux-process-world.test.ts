@@ -313,6 +313,34 @@ int main(int argc, char **argv) { int fd = open(argv[2], O_WRONLY | O_TRUNC); if
 	});
 });
 
+nativeTest("preserves access syscall arguments and empty-path descriptors", { timeout: 30_000 }, async ({ benchmark }) => {
+	const fixture = await benchmark("pi-access-", "git");
+	await writeFile(path.join(fixture.workspace, "input"), "readable");
+	await filesystem.symlink("missing", path.join(fixture.workspace, "dangling"));
+	await compileBenchmarkHelper(fixture.workspace, "access-check", { code: String.raw`#define _GNU_SOURCE
+${cHeaders("errno.h fcntl.h stdio.h sys/syscall.h unistd.h")}
+static void check(long call, int fd, const char *path, int mode, int flags) {
+ errno = 0; long result = syscall(call, fd, path, mode, flags); printf("%ld %d\n", result, errno);
+}
+int main(void) {
+ int fd = open("input", O_PATH), held = open("held", O_CREAT | O_RDWR, 0600); if (fd < 0 || held < 0 || unlink("held")) return 1;
+ const char *paths[] = {"input", "missing", NULL}; int fds[] = {fd, held, -1};
+ for (unsigned i = 0; i < 3; i++) {
+  check(SYS_faccessat2, AT_FDCWD, paths[i], 8, 0); check(SYS_faccessat2, AT_FDCWD, paths[i], F_OK, 0x40000000);
+  check(SYS_faccessat2, fds[i], "", R_OK, AT_EMPTY_PATH); check(SYS_faccessat2, fds[i], "", F_OK, 0);
+  check(SYS_faccessat2, fds[i], "child", F_OK, 0);
+ }
+ check(SYS_faccessat, AT_FDCWD, "input", R_OK, 0x40000000); check(SYS_faccessat, AT_FDCWD, "missing", -1, 0);
+ check(SYS_faccessat2, AT_FDCWD, "dangling", F_OK, 0); check(SYS_faccessat2, AT_FDCWD, "dangling", F_OK, AT_SYMLINK_NOFOLLOW);
+ check(SYS_faccessat2, AT_FDCWD, "input", R_OK | W_OK, AT_EACCESS); check(SYS_faccessat2, AT_FDCWD, "input", X_OK, AT_EMPTY_PATH);
+ close(fd); close(held); return 0;
+}` });
+	const expected = childProcess.execFileSync(path.join(fixture.workspace, "access-check"), { cwd: fixture.workspace, encoding: "utf8" });
+	await fixture.prepare();
+	await using branch = disposable(await fixture.fork("./access-check"));
+	expect(textOutput(branch.output.result)).toBe(expected);
+});
+
 nativeTest("proves external reads from their opened image and never commits a read copy", { timeout: 30_000 }, async ({ benchmark }) => {
 		const fixture = await benchmark("pi-read-image-", "git"), outside = await mkdtemp(path.join(os.tmpdir(), "pi-read-image-host-"));
 		const target = path.join(outside, "input"), alias = path.join(outside, "alias");
