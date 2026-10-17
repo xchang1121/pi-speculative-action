@@ -228,38 +228,35 @@ export function processWeakKey(prototype: ExecPrototype): Sha256Digest {
 export function dependencyPathsetKey(certificate: DynamicDependencyCertificate): Sha256Digest {
 	return digestObject(
 		normalizeDependencies(certificate.dependencies).map((dependency) => {
+			if (dependency.kind === "fd") return { kind: dependency.kind, fd: dependency.fd };
+			const identity = { kind: dependency.kind, path: dependency.path };
 			switch (dependency.kind) {
 				case "file":
 					return {
-						kind: dependency.kind,
-						path: dependency.path,
+						...identity,
 						role: dependency.role,
 						metadata: dependency.metadataDigest !== undefined,
 						...(dependency.aliases ? { aliases: dependency.aliases } : {}),
 					};
 				case "directory":
 					return {
-						kind: dependency.kind,
-						path: dependency.path,
+						...identity,
 						metadata: dependency.metadataDigest !== undefined,
 						excludedEntries: dependency.excludedEntries ?? [],
 						...(dependency.entriesDigest === undefined ? { listed: false } : {}),
 					};
 				case "absence":
 					return {
-						kind: dependency.kind,
-						path: dependency.path,
+						...identity,
 						captureParent: dependency.parentEntriesDigest !== undefined,
 						parentExcludedEntries: dependency.parentExcludedEntries ?? [],
 					};
 				case "symlink":
-					return { kind: dependency.kind, path: dependency.path };
+					return identity;
 				case "lock":
-					return { kind: dependency.kind, path: dependency.path, exclusive: dependency.exclusive };
+					return { ...identity, exclusive: dependency.exclusive };
 				case "metadata":
-					return { kind: dependency.kind, path: dependency.path, followSymlinks: dependency.followSymlinks, ...(dependency.fields ? { fields: dependency.fields } : {}) };
-				case "fd":
-					return { kind: dependency.kind, fd: dependency.fd };
+					return { ...identity, followSymlinks: dependency.followSymlinks, ...(dependency.fields ? { fields: dependency.fields } : {}) };
 			}
 		}),
 	);

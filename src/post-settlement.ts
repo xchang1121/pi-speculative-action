@@ -1,3 +1,4 @@
+/// <reference lib="es2024.promise" />
 import { isSafeCount } from "./number-utils.ts";
 export type PostSettlementFailureHandler = (error: unknown) => void;
 
@@ -12,8 +13,7 @@ export class BoundedEventQueue<Event> {
 	private readonly deliver: (event: Event) => void | Promise<void>;
 	private readonly onFailure: PostSettlementFailureHandler;
 	private readonly pending = new Set<{ readonly value: Event }>();
-	private readonly idleWaiters = new Set<() => void>();
-	private active = false;
+	private idle?: PromiseWithResolvers<void>;
 	private closed = false;
 	private droppedValue = 0;
 
@@ -35,7 +35,7 @@ export class BoundedEventQueue<Event> {
 			return false;
 		}
 		this.pending.add({ value: event });
-		if (!this.active) void this.drain();
+		if (this.pending.size === 1) void this.drain();
 		return true;
 	}
 
@@ -48,8 +48,7 @@ export class BoundedEventQueue<Event> {
 	}
 
 	async flush(): Promise<void> {
-		if (!this.pending.size) return;
-		await new Promise<void>((resolve) => { this.idleWaiters.add(resolve); });
+		if (this.pending.size) await (this.idle ??= Promise.withResolvers<void>()).promise;
 	}
 
 	/** Seal delivery; callers may detach from an already bounded backlog during runtime disposal. */
@@ -59,7 +58,6 @@ export class BoundedEventQueue<Event> {
 	}
 
 	private async drain(): Promise<void> {
-		this.active = true;
 		try {
 			// A Set retains insertion order while admitting reentrant work without shifting a backlog.
 			for (const next of this.pending) {
@@ -75,10 +73,8 @@ export class BoundedEventQueue<Event> {
 				this.pending.delete(next);
 			}
 		} finally {
-			// The empty-queue check and release are synchronous; enqueued callbacks drain in the loop.
-			this.active = false;
-			for (const resolve of this.idleWaiters) resolve();
-			this.idleWaiters.clear();
+			this.idle?.resolve();
+			this.idle = undefined;
 		}
 	}
 }
