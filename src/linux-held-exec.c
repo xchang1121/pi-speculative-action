@@ -240,6 +240,28 @@ static int read_line(int fd, char *buffer, size_t capacity) {
 	return -1;
 }
 
+static int process_open(pid_t pid, const char *name, int flags) {
+	char path[64]; snprintf(path, sizeof(path), "/proc/%d/%s", pid, name);
+	return open(path, flags);
+}
+static FILE *process_file(pid_t pid, const char *name) {
+	char path[64]; snprintf(path, sizeof(path), "/proc/%d/%s", pid, name);
+	return fopen(path, "re");
+}
+static FILE *descriptor_file(pid_t pid, int fd) {
+	char path[64]; snprintf(path, sizeof(path), "/proc/%ld/fdinfo/%d", (long)pid, fd);
+	return fopen(path, "re");
+}
+static int descriptor_stat(pid_t pid, int fd, struct stat *state) {
+	char path[64]; snprintf(path, sizeof(path), "/proc/%ld/fd/%d", (long)pid, fd);
+	return stat(path, state);
+}
+/* Reopening procfs creates a new description; it never substitutes for an OFD duplicate. */
+static int reopen_descriptor(int fd, int flags) {
+	char path[64]; snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
+	return open(path, flags);
+}
+
 /* A continuation carries private userspace state, never another process's PID or
  * kernel handles. The existing resource transaction supplies the authoritative
  * OFDs before this image resumes at its blocked read. */
@@ -293,8 +315,7 @@ static int image_wait(pid_t pid, int *status) {
 	return result == pid && WIFSTOPPED(*status) ? 0 : -1;
 }
 static int image_memory(pid_t pid, uint64_t address, void *data, size_t bytes, int writing) {
-	char path[64]; snprintf(path, sizeof(path), "/proc/%d/mem", pid);
-	int fd = open(path, (writing ? O_RDWR : O_RDONLY) | O_CLOEXEC);
+	int fd = process_open(pid, "mem", (writing ? O_RDWR : O_RDONLY) | O_CLOEXEC);
 	if (fd < 0) return -1;
 	size_t moved = 0;
 	while (moved < bytes) {
@@ -340,8 +361,8 @@ static int image_scratch(pid_t pid) {
 		image_memory(pid, IMAGE_SCRATCH, code, sizeof(code), 1) == 0 ? 0 : -1;
 }
 static int image_maps(pid_t pid, struct image_header *header, int capturing) {
-	char path[64], line[8192]; snprintf(path, sizeof(path), "/proc/%d/smaps", pid);
-	FILE *input = fopen(path, "re"); if (!input) return -1;
+	char line[8192];
+	FILE *input = process_file(pid, "smaps"); if (!input) return -1;
 	int valid = 0, checked = 1;
 	struct image_map *map = NULL;
 	while (fgets(line, sizeof(line), input)) {
@@ -378,9 +399,8 @@ done:
 	fclose(input); return valid ? 0 : -1;
 }
 static int image_mm(pid_t pid, struct image_header *header, unsigned long code) {
-	char path[64], data[8192]; unsigned long fields[53] = {0};
-	snprintf(path, sizeof(path), "/proc/%d/stat", pid);
-	FILE *file = fopen(path, "re"); if (!file) return -1;
+	char data[8192]; unsigned long fields[53] = {0};
+	FILE *file = process_file(pid, "stat"); if (!file) return -1;
 	int valid = fgets(data, sizeof(data), file) != NULL; fclose(file); if (!valid) return -1;
 	char *position = strrchr(data, ')'), *saved; if (!position) return -1;
 	unsigned index = 3;
@@ -392,7 +412,7 @@ static int image_mm(pid_t pid, struct image_header *header, unsigned long code) 
 	header->mm = (struct prctl_mm_map){.start_code = fields[26], .end_code = fields[27], .start_stack = fields[28],
 		.start_data = fields[45], .end_data = fields[46], .start_brk = fields[47], .brk = (unsigned long)brk,
 		.arg_start = fields[48], .arg_end = fields[49], .env_start = fields[50], .env_end = fields[51], .exe_fd = (unsigned)-1};
-	snprintf(path, sizeof(path), "/proc/%d/auxv", pid); int fd = open(path, O_RDONLY | O_CLOEXEC); if (fd < 0) return -1;
+	int fd = process_open(pid, "auxv", O_RDONLY | O_CLOEXEC); if (fd < 0) return -1;
 	ssize_t size = read(fd, header->auxv, sizeof(header->auxv)); close(fd);
 	if (size <= 0 || size >= (ssize_t)sizeof(header->auxv)) return -1;
 	header->auxv_size = (size_t)size; return 0;
@@ -474,7 +494,7 @@ int pi_prepare_exec_call(pid_t pid, void **context, void **file_context, const c
 	const struct user_regs_struct *original = &call->original;
 	int at = original->orig_rax == SYS_execveat;
 	if ((!at && original->orig_rax != SYS_execve) || original->cs != 0x33 || original->rip < 2) goto done;
-	snprintf(path, sizeof(path), "/proc/%d/mem", pid); memory = open(path, O_RDONLY | O_CLOEXEC);
+	memory = process_open(pid, "mem", O_RDONLY | O_CLOEXEC);
 	unsigned long address = at ? original->rsi : original->rdi;
 	ssize_t length = memory >= 0 ? pread(memory, name, sizeof(name), address) : -1;
 	if (length <= 0 || !memchr(name, 0, (size_t)length)) { result = 0; goto done; }
@@ -585,8 +605,7 @@ int pi_restore_exec_context(pid_t pid, const char *source, const char *invoked, 
 	if (!header || length > 8192 || ptrace(PTRACE_GETREGS, pid, 0, &registers) < 0 || registers.cs != 0x33 || image_mm(pid, header, 0) < 0) goto done;
 	for (size_t at = 0; at + 16 <= header->auxv_size; at += 16) if (*(unsigned long *)(header->auxv + at) == AT_EXECFN) { slot = at + 8; break; }
 	if (!slot) goto done;
-	snprintf(path, sizeof(path), "/proc/%d/mem", pid);
-	int memory = open(path, O_RDONLY | O_CLOEXEC); if (memory < 0) goto done;
+	int memory = process_open(pid, "mem", O_RDONLY | O_CLOEXEC); if (memory < 0) goto done;
 	ssize_t read = pread(memory, original, sizeof(original), *(unsigned long *)(header->auxv + slot)); close(memory);
 	if (read <= 0 || !memchr(original, 0, (size_t)read)) goto done;
 	if (!prefix && !strcmp(original, name)) { result = 0; goto done; }
@@ -649,8 +668,7 @@ static int image_read_backing(int fd, const struct image_map *map, void *buffer)
 /* pagemap's file-page bit is available without PFNs. Equal bytes alone cannot
  * distinguish an untouched file page from a private page written back to its old value. */
 static int image_cow(pid_t pid, uint64_t start, size_t length, unsigned char *cow) {
-	char path[64]; snprintf(path, sizeof(path), "/proc/%d/pagemap", pid);
-	int fd = open(path, O_RDONLY | O_CLOEXEC); if (fd < 0) return -1;
+	int fd = process_open(pid, "pagemap", O_RDONLY | O_CLOEXEC); if (fd < 0) return -1;
 	uint64_t pages[256]; size_t count = length / 4096, moved = 0;
 	while (moved < count) {
 		size_t chunk = count - moved < 256 ? count - moved : 256;
@@ -685,9 +703,8 @@ static int descriptor_numbers(pid_t pid, int minimum, int *fds, unsigned capacit
 
 /* Read installed state, never a tracee's mutable result/control buffer. */
 static int descriptor_info(pid_t pid, int fd, int64_t *position) {
-	char name[64], line[256]; unsigned flags; int result = -1; int64_t offset = -1;
-	snprintf(name, sizeof(name), "/proc/%ld/fdinfo/%d", (long)pid, fd);
-	FILE *file = fopen(name, "re"); if (!file) return -1;
+	char line[256]; unsigned flags; int result = -1; int64_t offset = -1;
+	FILE *file = descriptor_file(pid, fd); if (!file) return -1;
 	while (fgets(line, sizeof(line), file)) {
 		if (sscanf(line, "flags: %o", &flags) == 1 && flags <= INT_MAX) result = (int)flags;
 		if (position) sscanf(line, "pos: %" SCNd64, &offset);
@@ -701,8 +718,8 @@ static int image_descriptors(pid_t pid, struct process_image *image) {
 	int fds[MAX_HANDLES], count = descriptor_numbers(pid, 0, fds, MAX_HANDLES - image->fd_count);
 	if (count < 0) return -1;
 	for (int i = 0; i < count; i++) {
-		char path[64]; struct stat state; snprintf(path, sizeof(path), "/proc/%d/fd/%d", pid, fds[i]);
-		if (stat(path, &state) < 0) return -1;
+		struct stat state;
+		if (descriptor_stat(pid, fds[i], &state) < 0) return -1;
 		unsigned index = image->fd_count++;
 		image->fds[index].fd = fds[i]; image->fds[index].flags = descriptor_info(pid, fds[i], &image->fds[index].offset);
 		image->fds[index].device = state.st_dev; image->fds[index].inode = state.st_ino;
@@ -725,8 +742,8 @@ struct process_credentials {
 };
 
 static int process_credentials(pid_t pid, struct process_credentials *value) {
-	char filename[64], line[256]; snprintf(filename, sizeof(filename), "/proc/%d/status", pid);
-	FILE *input = fopen(filename, "re"); if (!input) return -1;
+	char line[256];
+	FILE *input = process_file(pid, "status"); if (!input) return -1;
 	unsigned fields = 0;
 	while (fgets(line, sizeof(line), input)) {
 		if (sscanf(line, "PPid: %u", &value->parent) == 1) fields |= 1;
@@ -886,8 +903,7 @@ static int image_load(struct decision_job *job, size_t length, const char *physi
 		 * the temporary pathname used to reconstruct its private producer. */
 		for (unsigned fd = 0; fd < image->fd_count && image->files[i] < 0; fd++) if (image->fds[fd].device == map->device && image->fds[fd].inode == map->inode)
 			for (unsigned pin = 0; pin < job->capture_count; pin++) if (job->captures[pin].descriptor == image->fds[fd].source) {
-				char path[64]; snprintf(path, sizeof(path), "/proc/self/fd/%d", job->captures[pin].duplicate);
-				image->files[i] = open(path, O_RDONLY | O_CLOEXEC); break;
+				image->files[i] = reopen_descriptor(job->captures[pin].duplicate, O_RDONLY | O_CLOEXEC); break;
 			}
 		struct stat state;
 		if (image->files[i] < 0) image->files[i] = open(map->path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
@@ -910,9 +926,8 @@ static int duplicate_tracee_fd(struct decision_job *job, unsigned fd) {
 	#if defined(SYS_pidfd_open) && defined(SYS_pidfd_getfd)
 	if (job->pidfd < 0) job->pidfd = (int)syscall(SYS_pidfd_open, job->pid, 0);
     if (job->pidfd < 0) {
-        char path[64], line[256]; int group = job->pid; FILE *status;
-        snprintf(path, sizeof(path), "/proc/%d/status", job->pid);
-        if ((status = fopen(path, "re"))) { while (fgets(line, sizeof(line), status)) if (sscanf(line, "Tgid: %d", &group) == 1) break; fclose(status); }
+        char line[256]; int group = job->pid; FILE *status = process_file(job->pid, "status");
+        if (status) { while (fgets(line, sizeof(line), status)) if (sscanf(line, "Tgid: %d", &group) == 1) break; fclose(status); }
         if (group != job->pid && syscall(SYS_kcmp, job->pid, group, KCMP_FILES, 0, 0) == 0) job->pidfd = (int)syscall(SYS_pidfd_open, group, 0);
     }
 
@@ -1322,8 +1337,8 @@ static int compare_locks(const void *a, const void *b) {
 }
 
 static int capture_file_locks(pid_t pid, int fd, struct file_locks *locks) {
-	char path[64], line[512]; snprintf(path, sizeof(path), "/proc/%ld/fdinfo/%d", (long)pid, fd);
-	FILE *file = fopen(path, "re"); if (!file) return -1;
+	char line[512];
+	FILE *file = descriptor_file(pid, fd); if (!file) return -1;
 	int result = 0;
 	while (fgets(line, sizeof(line), file)) if (!strncmp(line, "lock:", 5)) {
 		struct ofd_lock lock; dev_t device; ino_t inode;
@@ -1344,9 +1359,8 @@ static int set_file_lock(int fd, struct ofd_lock lock) {
 /* Anonymous inode numbers alone cannot distinguish event counters. fdinfo supplies
  * a kernel-assigned object ID and a non-consuming state observation. */
 static unsigned event_state(pid_t pid, int fd, uint64_t *value, unsigned *semaphore) {
-	char name[64], line[256]; unsigned id = 0, found = 0; uint64_t count = 0; unsigned mode = 0;
-	snprintf(name, sizeof(name), "/proc/%ld/fdinfo/%d", (long)pid, fd);
-	FILE *file = fopen(name, "re");
+	char line[256]; unsigned id = 0, found = 0; uint64_t count = 0; unsigned mode = 0;
+	FILE *file = descriptor_file(pid, fd);
 	while (file && fgets(line, sizeof(line), file)) {
 		if (sscanf(line, "eventfd-count: %" SCNx64, &count) == 1) found |= 1;
 		if (sscanf(line, "eventfd-id: %u", &id) == 1) found |= 2;
@@ -1366,9 +1380,8 @@ static int same_object(const struct file_position *left, const struct file_posit
 /* Object history grants no OFD identity. Foreign ancestry is sticky, including
  * inode recycling: it can only refuse a later proof, never manufacture one. */
 static unsigned remember_object(struct descriptor_domain *domain, pid_t pid, int fd, int foreign) {
-	char name[64]; struct stat state;
-	snprintf(name, sizeof(name), "/proc/%ld/fd/%d", (long)pid, fd);
-	if (stat(name, &state) < 0) { domain->incomplete = 1; return 0; }
+	struct stat state;
+	if (descriptor_stat(pid, fd, &state) < 0) { domain->incomplete = 1; return 0; }
 	unsigned event = !(state.st_mode & S_IFMT) ? event_state(pid, fd, NULL, NULL) : 0;
 	unsigned index = 0;
 	while (index < domain->object_count && !(domain->objects[index].device == state.st_dev &&
@@ -1606,10 +1619,9 @@ static off_t descriptor_seek(int fd, int flags, off_t offset, int whence) {
 /* Read a separate directory OFD so snapshots never consume the shared cursor.
  * Kernel cookies and inode numbers remain raw 64-bit values. Padding is not data. */
 static int directory_bytes(int fd, unsigned char **bytes) {
-	char path[64]; struct stat before, after; int result = -1;
+	struct stat before, after; int result = -1;
 	*bytes = NULL;
-	snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
-	int reader = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	int reader = reopen_descriptor(fd, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
 	if (reader < 0) return -1;
 	if (fstat(reader, &before) < 0 || !(*bytes = calloc(MAX_INPUT_BYTES + 1, 1))) goto done;
 	size_t used = 0; int64_t previous_cookie = 0;
@@ -1651,8 +1663,7 @@ static int pipe_bytes(int fd, unsigned char **bytes, int *eof) {
 	if (!length) return 0;
 	if (pipe2(fds, O_CLOEXEC | O_NONBLOCK) < 0) return -1;
 	if ((fcntl(fd, F_GETFL) & O_ACCMODE) == O_WRONLY) {
-		char name[64]; snprintf(name, sizeof(name), "/proc/self/fd/%d", fd);
-		reader = open(name, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+		reader = reopen_descriptor(fd, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
 	}
 	int capacity = fcntl(fd, F_GETPIPE_SZ);
 	if (capacity > 0 && (fcntl(fds[1], F_GETPIPE_SZ) >= capacity || fcntl(fds[1], F_SETPIPE_SZ, capacity) >= capacity) &&
@@ -1932,9 +1943,7 @@ static int queue_owners_locked(struct decision_job *job) {
 				if (!object || !object->messages) continue;
 				state = (struct stat){.st_dev = object->device, .st_ino = object->inode, .st_mode = S_IFSOCK};
 			} else {
-				char name[64];
-				snprintf(name, sizeof(name), "/proc/%ld/fd/%d", (long)process->pid, fds[index]);
-				if (stat(name, &state) < 0) return -1;
+				if (descriptor_stat(process->pid, fds[index], &state) < 0) return -1;
 				if (!S_ISFIFO(state.st_mode) && !S_ISSOCK(state.st_mode)) continue;
 				if (add_reference(job, &state, descriptor_info(process->pid, fds[index], NULL), -1) < 0) return -1;
 			}
@@ -1984,9 +1993,8 @@ static int outside_references_locked(struct decision_job *job, int pin) {
 		if (count < 0) return unknown;
 		for (int index = 0; index < count; index++) {
 			if (!description) {
-				char name[64]; struct stat current;
-				snprintf(name, sizeof(name), "/proc/%ld/fd/%d", (long)process->pid, fds[index]);
-				if (stat(name, &current) < 0) return unknown;
+				struct stat current;
+				if (descriptor_stat(process->pid, fds[index], &current) < 0) return unknown;
 				if (current.st_dev == state.st_dev && current.st_ino == state.st_ino) {
 					int flags = descriptor_info(process->pid, fds[index], NULL); if (flags < 0) return unknown;
 					access |= (flags & O_ACCMODE) + 1;
@@ -2331,8 +2339,8 @@ static int closed_lock_object(struct decision_job *job, int pin) {
 		int fds[MAX_HANDLES], count = descriptor_numbers(process->pid, 0, fds, MAX_HANDLES);
 		if (!process->table || !process->table->complete || count < 0) return 0;
 		for (int index = 0; index < count; index++) {
-			char name[64]; struct stat state; snprintf(name, sizeof(name), "/proc/%ld/fd/%d", (long)process->pid, fds[index]);
-			if (stat(name, &state) < 0) return 0;
+			struct stat state;
+			if (descriptor_stat(process->pid, fds[index], &state) < 0) return 0;
 			if (state.st_dev != object->device || state.st_ino != object->inode) continue;
 			unsigned represented = 0;
 			while (represented < job->position_count && syscall(SYS_kcmp, process->pid, getpid(), KCMP_FILE, fds[index], job->positions[represented].duplicate) != 0) represented++;
@@ -2378,8 +2386,7 @@ static int prepare_lock_graph(struct decision_job *job, int *fds, const int *sel
 		unsigned previous = 0; while (previous < index && !same_object(position, &job->positions[previous])) previous++;
 		int object = previous < index ? fds[previous] : memfd_create("pi-resource-locks", MFD_CLOEXEC);
 		if (object < 0) return -1;
-		char path[64]; snprintf(path, sizeof(path), "/proc/self/fd/%d", object);
-		fds[index] = open(path, (position->flags & (O_ACCMODE | O_PATH)) | O_CLOEXEC);
+		fds[index] = reopen_descriptor(object, (position->flags & (O_ACCMODE | O_PATH)) | O_CLOEXEC);
 		if (previous == index) close(object);
 		if (fds[index] < 0) return -1;
 	}
@@ -3000,10 +3007,9 @@ static int actor_decision(struct decision_job *job) {
 			}
 		}
 		if (!position->stream && !position->directory && position->content_length >= 0) {
-			char path[64]; struct stat state;
-			snprintf(path, sizeof(path), "/proc/self/fd/%d", position->duplicate);
+			struct stat state;
 			pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-			position->writer = open(path, O_WRONLY | O_CLOEXEC);
+			position->writer = reopen_descriptor(position->duplicate, O_WRONLY | O_CLOEXEC);
 			pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
 			if (position->writer < 0 || fstat(position->writer, &state) < 0 ||
 				(uintmax_t)state.st_dev != position->device || (uintmax_t)state.st_ino != position->inode) goto decline;
@@ -3563,8 +3569,7 @@ static int execute_descriptors(const char *manifest, const char *report, char *e
 					fd = fcntl(image->producer, F_DUPFD_CLOEXEC, minimum);
 					if (fd >= 0 && fcntl(fd, F_SETFL, position->flags) < 0) { close(fd); goto done; }
 				} else {
-					snprintf(line, sizeof(line), "/proc/self/fd/%d", image->duplicate);
-					fd = open(line, position->flags | O_CLOEXEC);
+					fd = reopen_descriptor(image->duplicate, position->flags | O_CLOEXEC);
 				}
 			} else {
 				int fds[2], valid = 1; struct file_position *peer = NULL;
@@ -3595,8 +3600,7 @@ static int execute_descriptors(const char *manifest, const char *report, char *e
 				close(fds[1]); fd = fds[0]; position->object = (int)index;
 				if (!valid) { close(fd); goto done; }
 				if (position->stream < 4 && (position->flags & 0x8000)) {
-					snprintf(line, sizeof(line), "/proc/self/fd/%d", fd);
-					int reopened = open(line, position->flags | O_CLOEXEC); close(fd); fd = reopened;
+					int reopened = reopen_descriptor(fd, position->flags | O_CLOEXEC); close(fd); fd = reopened;
 				}
 			}
 			if (fd < 0) goto done;

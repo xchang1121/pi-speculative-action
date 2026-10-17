@@ -44,6 +44,19 @@ static inline int wait_child(pid_t child) {
 static inline int read_text(int fd, void *bytes, const char *expected) {
 	size_t length = strlen(expected);
 	return read(fd, bytes, length) != (ssize_t)length || memcmp(bytes, expected, length);
+}
+static inline int move_fd(int source, int target) {
+	if (source < 0 || dup2(source, target) < 0) return 1;
+	if (source != target) close(source);
+	return 0;
+}
+static inline int wait_gate(int gate[2]) {
+	char byte; close(gate[1]);
+	if (read(gate[0], &byte, 1) != 1) return 1;
+	close(gate[0]); return 0;
+}
+static inline void burn_cpu(unsigned long iterations) {
+	for (volatile unsigned long i = 0; i < iterations; ++i) {}
 }`;
 
 const rightsHelpers = `${processChecks}
@@ -639,10 +652,11 @@ nativeTest.for(["bash", "write", "stale", "disabled", "bash:shared", "write:shar
 	const [mode, layout] = scenario.split(":"), target = layout === "parents" ? "first" : "last", both = layout === "both";
 	const fixture = await benchmark("pi-rerun-frontier-", "git"), scope = { sessionID: "frontier", turnID: "seed" };
 	for (const name of ["first", "last"]) await writeFile(path.join(fixture.workspace, name), "old\n");
-	await compileBenchmarkHelper(fixture.workspace, "worker", { code: `${cHeaders("fcntl.h unistd.h")}
+	await compileBenchmarkHelper(fixture.workspace, "worker", { code: `${cHeaders("fcntl.h")}
+${processChecks}
 int main(int argc, char **argv) { if (argc != 2) return 1; int fd = open(${layout ? '"last"' : "argv[1]"}, O_RDONLY); char bytes[16];
  int length = read(fd, bytes, sizeof(bytes)); if (length < 0 || close(fd)) return 2;
- for (volatile unsigned long i = 0; i < 40000000ul; ++i) {} return write(1, bytes, (size_t)length) != length; }
+ burn_cpu(40000000ul); return write(1, bytes, (size_t)length) != length; }
 ` });
 	await commitBenchmarkFixture(fixture.workspace, "changed child frontier"); await fixture.prepare();
 	const route = await fixture.prepareActorReplay(), writer = createWriteTool(fixture.workspace), tools = [fixture.tool, writer];
@@ -738,16 +752,16 @@ int main(void) {
 }
 ` });
 		if (descendant) await compileBenchmarkHelper(fixture.workspace, "launch", { code: `#define _GNU_SOURCE
-${cHeaders("sys/eventfd.h sys/wait.h sys/mman.h")}
+${cHeaders("sys/eventfd.h sys/mman.h")}
 ${rightsHelpers}
 int main(void) { int fds[2]; if (${mode === "eventfd" ? "(fds[0] = eventfd(0, 0)) < 0 || (fds[1] = dup(fds[0])) < 0" : mode === "socket" ? "socketpair(AF_UNIX, SOCK_STREAM, 0, fds)" : "pipe(fds)"} || fds[0] != 3 || fds[1] != 4) return 61;
  ${queue && queue !== "external" ? `int queues[2]; if (socketpair(AF_UNIX, SOCK_STREAM, 0, queues)) return 63;
  int reference = ${discarded ? queue !== "discard" ? `wrap_queue(memfd_create("queued-file", MFD_CLOEXEC), ${Number(cyclic)})` : 'memfd_create("queued-file", MFD_CLOEXEC)' : "-1"};
  if (${discarded ? "reference < 0 || " : ""}pass(queues[0], "x", 1, &reference, ${discarded ? 1 : 0}, 0)${discarded ? " || close(reference)" : ""}) return 63;` : ""}
- ${queue === "external" ? `int gate[2]; char byte; if (wrap_queue(wrap_queue(eventfd(5, EFD_CLOEXEC), 0), 0) < 0 || pipe2(gate, O_CLOEXEC)) return 64;
+ ${queue === "external" ? `int gate[2]; if (wrap_queue(wrap_queue(eventfd(5, EFD_CLOEXEC), 0), 0) < 0 || pipe2(gate, O_CLOEXEC)) return 64;
  pid_t child = fork(); if (child < 0) return 65;
  if (child) { close(3); close(4); close(gate[0]); if (write(gate[1], "x", 1) != 1) return 66; close(gate[1]); return wait_child(child); }
- close(gate[1]); if (read(gate[0], &byte, 1) != 1) return 66; close(gate[0]);` : ""}
+ if (wait_gate(gate)) return 66;` : ""}
  close_range(${queue === "inherited" || discarded ? 7 : 5}, ~0U, 0); execlp("worker", "worker", NULL); return 62; }
 ` });
 		await commitBenchmarkFixture(fixture.workspace, "Closed input prefix");
@@ -846,7 +860,7 @@ int main(void) { int fds[2]; if (${mode === "eventfd" ? "(fds[0] = eventfd(0, 0)
 		if (unavailable) expect((await Reflect.get(fixture.backend, "ready")).imageLibrary).toBeUndefined();
 		if (!unavailable && !(await Reflect.get(fixture.backend, "ready")).imageLibrary) return skip("native process image capture is unavailable");
 		await compileBenchmarkHelper(fixture.workspace, "worker", { arguments: ["-pthread"], code: `#define _GNU_SOURCE
-${cHeaders("unistd.h stdio.h stdint.h sys/syscall.h sys/uio.h sys/socket.h sys/mman.h pthread.h signal.h stdlib.h string.h fcntl.h errno.h")}
+${cHeaders("stdio.h stdint.h sys/syscall.h sys/uio.h sys/mman.h pthread.h signal.h stdlib.h errno.h")}
 ${rightsHelpers}
 #define INPUT_FD ${mode === "handles" ? 8 : 3}
 #define ACK_FD ${mode === "handles" ? 3 : 4}
@@ -864,7 +878,7 @@ static ssize_t next_input(void *bytes, size_t length) {
  ${mode === "recvmsg" ? "struct msghdr message = {.msg_iov = parts, .msg_iovlen = 2}; return recvmsg(INPUT_FD, &message, 0);" : mode === "readv" ? "return readv(INPUT_FD, parts, 2);" : "(void)parts; return read(INPUT_FD, bytes, length);"}
 }
 int main(${alias ? "int argc, char **argv" : "void"}) {
- ${alias ? `if (argc > 1) { char byte; return strcmp(argv[1], "verify") || fcntl(12, F_GETFD) != -1 || errno != EBADF || fcntl(13, F_GETFD) || lseek(5, 0, SEEK_CUR) != 2 || lseek(13, 0, SEEK_CUR) != 2 || read(5, &byte, 1) != 1 || byte != 'c' || lseek(13, 0, SEEK_CUR) != 3 ? 86 : 37; }` : ""}
+ ${alias ? `if (argc > 1) { char byte; return strcmp(argv[1], "verify") || fcntl(12, F_GETFD) != -1 || errno != EBADF || fcntl(13, F_GETFD) || lseek(5, 0, SEEK_CUR) != 2 || lseek(13, 0, SEEK_CUR) != 2 || read_text(5, &byte, "c") || lseek(13, 0, SEEK_CUR) != 3 ? 86 : 37; }` : ""}
  ${mode === "identity" || mode === "peer" ? "pid_t identity = getpid();" : mode === "file" ? "int temporary = open(\"/dev/null\", O_RDONLY); if (temporary < 0) return 86;" : ""}
  ${mode === "runtime" ? `char *heap = malloc(65536); if (!heap) return 78; memset(heap, 'H', 65536); local = 23;
  stack_t stack = {.ss_sp = alternate, .ss_size = sizeof(alternate)};
@@ -894,12 +908,12 @@ int main(${alias ? "int argc, char **argv" : "void"}) {
  unsigned used = 1; ssize_t n; while ((n = next_input(input + used, sizeof(input) - used)) > 0) used += n;
  if (n || used != 3 || (input[0] != 'A' && input[0] != 'D') || input[1] != 'B' || input[2] != 'C') return 73;`}
  ${mode === "queue-peek-kept" ? "int queued_alias; if (take(5, 'x', &queued_alias, 1, 0, 0) || close(5) || lseek(queued_alias, 0, SEEK_CUR) != 1 || close(queued_alias)) return 86;" : ""}
- ${queued && !["queue-drop", "queue-closed"].includes(mode!) ? `if ((received < 0 && (take(5, 'x', &received, 1, 0, 0) || close(5))) || ${received && mode !== "queue-counter" ? "read(received, &byte, 1) != 1 || byte != 'b'" : `read(received, &counter, 8) != 8 || counter != ${received ? 7 : 3}`} ${alias ? "|| fcntl(5, F_GETFD) || fcntl(12, F_GETFD) != FD_CLOEXEC || !(fcntl(5, F_GETFL) & O_APPEND) || !(fcntl(12, F_GETFL) & O_APPEND) || lseek(12, 0, SEEK_CUR) != 2" : "|| close(received)"}) return 86;` : "(void)byte; (void)received;"}
+ ${queued && !["queue-drop", "queue-closed"].includes(mode!) ? `if ((received < 0 && (take(5, 'x', &received, 1, 0, 0) || close(5))) || ${received && mode !== "queue-counter" ? 'read_text(received, &byte, "b")' : `read(received, &counter, 8) != 8 || counter != ${received ? 7 : 3}`} ${alias ? "|| fcntl(5, F_GETFD) || fcntl(12, F_GETFD) != FD_CLOEXEC || !(fcntl(5, F_GETFL) & O_APPEND) || !(fcntl(12, F_GETFL) & O_APPEND) || lseek(12, 0, SEEK_CUR) != 2" : "|| close(received)"}) return 86;` : "(void)byte; (void)received;"}
  ${alias ? "for (int fd = 6; fd < 64; fd++) if (fd != 12 && fd != 13 && (fcntl(fd, F_GETFD) != -1 || errno != EBADF)) return 86;" : ""}
  if (getpid() != syscall(SYS_gettid) ${mode === "identity" || mode === "peer" ? "|| identity != getpid()" : mode === "file" ? "|| close(temporary)" : ""}) return 74;
  ${mode === "handles" ? `if (fcntl(4, F_GETFD) != -1 || errno != EBADF || fcntl(8, F_GETFD) != FD_CLOEXEC ||
-     fcntl(12, F_GETFD) != FD_CLOEXEC || !(fcntl(12, F_GETFL) & O_APPEND) || read(12, bytes, 1) != 1 || bytes[0] != 'c' ||
-     lseek(6, 0, SEEK_CUR) || read(6, bytes, 1) != 1 || bytes[0] != 'a') return 85;` : ""}
+     fcntl(12, F_GETFD) != FD_CLOEXEC || !(fcntl(12, F_GETFL) & O_APPEND) || read_text(12, bytes, "c") ||
+     lseek(6, 0, SEEK_CUR) || read_text(6, bytes, "a")) return 85;` : ""}
  ${mode === "runtime" ? `heap = realloc(heap, 262144); if (!heap || local != 23 || pthread_kill(pthread_self(), SIGUSR1) || !delivered || future_stack(32) != 8448) return 80;
  for (unsigned i = 0; i < 65536; i++) if (heap[i] != 'H') return 81; free(heap);
  pthread_t thread; void *returned; if (pthread_create(&thread, NULL, future_thread, NULL) || pthread_join(thread, &returned) || returned != (void *)1) return 82;` : ""}
@@ -909,7 +923,7 @@ int main(${alias ? "int argc, char **argv" : "void"}) {
 }
 ` });
 		await compileBenchmarkHelper(fixture.workspace, "launch", { code: `#define _GNU_SOURCE
-${cHeaders("unistd.h fcntl.h stdio.h string.h stdlib.h stdint.h sys/socket.h sys/eventfd.h sys/mman.h sys/wait.h")}
+${cHeaders("stdio.h stdlib.h stdint.h sys/eventfd.h sys/mman.h")}
 ${rightsHelpers}
 int main(int argc, char **argv) {
  if (argc != 2) return 60;
@@ -941,9 +955,9 @@ int main(int argc, char **argv) {
  ${mode === "eof" ? `if (read(ack[0], &ready, 1) != 0) return 65;
  char chunk[4096]; unsigned total = 0; while (total < 131072) { ssize_t size = read(output[0], chunk, sizeof(chunk));
  if (size <= 0) return 65; for (ssize_t i = 0; i < size; i++) if (chunk[i] != 'P') return 65; total += (unsigned)size; }
- if (total != 131072) return 65;` : "if (read(ack[0], &ready, 1) != 1 || ready != 'R') return 65;"}
+ if (total != 131072) return 65;` : 'if (read_text(ack[0], &ready, "R")) return 65;'}
  ${mode === "mmap" ? `for (unsigned i = 0; i < 3; i++) if (pwrite(backing, "B", 1, i * 4096) != 1) return 65;` : ""}
- ${mode === "eventfd" ? `counter = 2; if (write(in[1], &counter, 8) != 8 || read(ack[0], &ready, 1) != 1 || ready != 'S') return 66;
+ ${mode === "eventfd" ? `counter = 2; if (write(in[1], &counter, 8) != 8 || read_text(ack[0], &ready, "S")) return 66;
  counter = 3; if (write(in[1], &counter, 8) != 8) return 67;` : `if (write(in[1], "B", 1) != 1) return 66;
  usleep(1000); if (write(in[1], "C", 1) != 1) return 67;`}
  close(in[1]); close(ack[0]);
@@ -1184,7 +1198,7 @@ nativeTest.for(["completed", "running", ...["", "-merged", "-closed-input", "-de
 		if (descriptors) await writeFile(path.join(fixture.workspace, "fd.txt"), "abcdef");
 		if (mode === "native-descriptors-merged") await writeFile(path.join(fixture.workspace, "fd-other.txt"), "abcdef");
 		await compileBenchmarkHelper(fixture.workspace, "worker", { code: `#define _GNU_SOURCE
-${cHeaders("errno.h poll.h sys/select.h sys/eventfd.h sys/syscall.h stdint.h sys/epoll.h fcntl.h stdlib.h string.h sys/socket.h sys/wait.h unistd.h")}
+${cHeaders("errno.h poll.h sys/select.h sys/eventfd.h sys/syscall.h stdint.h sys/epoll.h stdlib.h")}
 ${rightsHelpers}
 ${enumerate ? `static int count_directory(int fd) {
 	char entries[64]; int count = 0; ssize_t length;
@@ -1203,21 +1217,21 @@ int main(int argc, char **argv) {
 	int flags = fcntl(pair[0], F_GETFL), peer = fcntl(pair[1], F_GETFL);
 	if (flags < 0 || peer < 0 || !(flags & O_NONBLOCK) || (peer & O_NONBLOCK) || close(pair[0]) || close(pair[1])) return 205;
 	}` : ""}
-	for (volatile unsigned long iteration = 0; iteration < ${running ? 500000000 : native ? 50000000 : 0}ul; ++iteration) {}
+	burn_cpu(${running ? 500000000 : native ? 50000000 : 0}ul);
 	${orphan ? `{ if (fcntl(9, F_GETFD) != -1 || errno != EBADF || fcntl(15, F_GETFD) != -1 || errno != EBADF) return 187;
 	int received[7]; char byte;
 	for (int peek = 1; peek >= 0; peek--) {
 		if (take(3, 'q', received, 7, peek, 0) || read(received[3], &byte, 1) != -1 || errno != EAGAIN) return 189;
 		if (peek) for (int index = 0; index < 7; index++) close(received[index]);
 	}
-	if (read(received[0], &byte, 1) != 1 || byte != 'b' || lseek(received[1], 0, SEEK_CUR) != 2 ||
+	if (read_text(received[0], &byte, "b") || lseek(received[1], 0, SEEK_CUR) != 2 ||
 		fcntl(received[0], F_SETFL, O_NONBLOCK) || !(fcntl(received[1], F_GETFL) & O_NONBLOCK)) return 190;
 	close(received[0]); close(received[1]);
 	uint64_t count; if (read(received[2], &count, 8) != 8 || count != 5) return 191;
 	count = 7; if (write(received[2], &count, 8) != 8 || read(received[2], &count, 8) != 8 || count != 7) return 192; close(received[2]);
 	if (write(received[4], "x", 1) != 1) return 193;
 	close(received[4]);
-	if (read(received[3], &byte, 1) != 1 || byte != 'x' || read(received[3], &byte, 1) != 0) return 194;
+	if (read_text(received[3], &byte, "x") || read(received[3], &byte, 1) != 0) return 194;
 	close(received[3]);
 	int peer, alias;
 	if (take(received[5], 'D', &peer, 1, 0, 0) || take(peer, 'C', &alias, 1, 0, 0) || pass(alias, "Z", 1, &received[6], 1, 0)) return 195;
@@ -1225,8 +1239,8 @@ int main(int argc, char **argv) {
 	close(root); close(alias); close(received[5]);
 	if (read(peer, &byte, 1) != 0) return 197;
 	close(peer); close(received[6]); }` : ""}
-	${prefixed ? 'char gap; if (read(3, &gap, 1) != 1 || gap != 76) return 180;' : ""}
-	${segmented ? 'char gap; if (read(3, &gap, 1) != 1 || gap != 76) return 180; int received[2]; char byte; for (int segment = 0; segment < 2; segment++) { for (int peek = 1; peek >= 0; peek--) { if (take(3, segment ? 116 : 113, received, 2, peek, 0)) return 181; if (!peek && !segment && (read(received[0], &byte, 1) != 1 || byte != 98)) return 183; close(received[0]); close(received[1]); } if (!segment && (read(3, &gap, 1) != 1 || gap != 73)) return 184; }' : prequeued && !orphan ? 'int received[2]; char byte; for (int peek = 1; peek >= 0; peek--) { if (take(3, 113, received, 2, peek, 0)) return 153; if (recv(received[1], &byte, 1, MSG_PEEK) != 1 || byte != (peek ? 113 : 98)) return 155; ' + (queueCounter ? 'if (!peek) { uint64_t count; if (read(received[0], &count, 8) != 8 || count != 5) return 158; count = 7; if (write(21, &count, 8) != 8) return 159; }' : 'if (!peek && (read(received[0], &byte, 1) != 1 || byte != 98)) return 156;') + ' close(received[0]); close(received[1]); }' : ""}
+	${prefixed ? 'char gap; if (read_text(3, &gap, "L")) return 180;' : ""}
+	${segmented ? 'char gap; if (read_text(3, &gap, "L")) return 180; int received[2]; char byte; for (int segment = 0; segment < 2; segment++) { for (int peek = 1; peek >= 0; peek--) { if (take(3, segment ? 116 : 113, received, 2, peek, 0)) return 181; if (!peek && !segment && read_text(received[0], &byte, "b")) return 183; close(received[0]); close(received[1]); } if (!segment && read_text(3, &gap, "I")) return 184; }' : prequeued && !orphan ? 'int received[2]; char byte; for (int peek = 1; peek >= 0; peek--) { if (take(3, 113, received, 2, peek, 0)) return 153; if (recv(received[1], &byte, 1, MSG_PEEK) != 1 || byte != (peek ? 113 : 98)) return 155; ' + (queueCounter ? 'if (!peek) { uint64_t count; if (read(received[0], &count, 8) != 8 || count != 5) return 158; count = 7; if (write(21, &count, 8) != 8) return 159; }' : 'if (!peek && read_text(received[0], &byte, "b")) return 156;') + ' close(received[0]); close(received[1]); }' : ""}
 	${exporting ? `{ int passed = 3; if (fcntl(3, F_SETFL, O_NONBLOCK) || pass(3, "x", 1, &passed, 1, 0)) return 132; close(0); close(3); close(4); close(8); char text[32]; int fd = open("input.txt", O_RDONLY); ssize_t length = read(fd, text, sizeof(text)); return length <= 0 || write(1, text, (size_t)length) != length; }` : ""}
 	${mode === "native-closed-input" ? 'char probe; if (read(0, &probe, 1) != -1 || errno != EBADF) return 72;' : ""}
 	${io ? 'struct pollfd ready = {.fd = 3, .events = POLLIN | POLLOUT}; if (poll(&ready, 1, 0) != 1 || ready.revents != (POLLIN | POLLOUT) || fcntl(3, F_SETFL, O_NONBLOCK)) return 114; fd_set rd, wr; FD_ZERO(&rd); FD_ZERO(&wr); FD_SET(3, &rd); FD_SET(3, &wr); struct timeval timeout = {0}; if (select(4, &rd, &wr, 0, &timeout) != 2 || !FD_ISSET(3, &rd) || !FD_ISSET(3, &wr)) return 118; int ep = epoll_create1(EPOLL_CLOEXEC); struct epoll_event registration = {.events = EPOLLIN | EPOLLONESHOT, .data.u64 = 42}, readyEvents[2]; if (ep < 0 || epoll_ctl(ep, EPOLL_CTL_ADD, 3, &registration) || epoll_wait(ep, readyEvents, 2, 0) != 1 || readyEvents[0].events != EPOLLIN || readyEvents[0].data.u64 != 42 || epoll_wait(ep, readyEvents, 2, 0) != 0 || epoll_ctl(ep, EPOLL_CTL_MOD, 3, &registration) || epoll_wait(ep, readyEvents, 2, 0) != 1 || epoll_ctl(ep, EPOLL_CTL_DEL, 3, 0)) return 119; registration.events = EPOLLIN | EPOLLET; if (epoll_ctl(ep, EPOLL_CTL_ADD, 3, &registration) || epoll_wait(ep, readyEvents, 2, 0) != 1 || epoll_wait(ep, readyEvents, 2, 0) != 0 || epoll_ctl(ep, EPOLL_CTL_MOD, 3, &registration) || epoll_wait(ep, readyEvents, 2, 0) != 1) return 125; close(ep);' : ""}
@@ -1283,15 +1297,15 @@ int main(int argc, char **argv) {
 ` });
 		if (launcher) {
 			await compileBenchmarkHelper(fixture.workspace, "fd-launch", { arguments: ["-pthread", "-Werror"], code: `#define _GNU_SOURCE
-${cHeaders("fcntl.h pthread.h sys/syscall.h stdlib.h errno.h stdint.h sys/eventfd.h sched.h string.h sys/socket.h sys/wait.h stdio.h unistd.h")}
-static void *duplicate(void *unused) { (void)unused; if (dup2(3, 9) < 0) _exit(73); return 0; }
+${cHeaders("pthread.h sys/syscall.h stdlib.h errno.h stdint.h sys/eventfd.h sched.h stdio.h")}
 ${rightsHelpers}
+static void *duplicate(void *unused) { (void)unused; if (dup2(3, 9) < 0) _exit(73); return 0; }
 int main(int argc, char **argv) {
 	if (argc != 2) return 74;
 	pthread_t worker; if (pthread_create(&worker, 0, duplicate, 0) || pthread_join(worker, 0)) return 75;
 	${mode === "native-unshare" ? "if (unshare(CLONE_FILES)) return 77;" : ""}
 	${opath ? 'int directory = open(".", O_PATH | O_DIRECTORY), file = open("fd.txt", O_PATH);\n\tif (directory < 0 || file < 0 || dup2(directory, 10) < 0 || dup2(directory, 11) < 0 || dup2(file, 12) < 0) return 79;\n\tclose(directory); if (file != 12) close(file);' : ""}
-	${pipe ? 'int fds[2]; if (pipe2(fds, O_CLOEXEC) || write(fds[1], "bcaXYZ", 6) != 6) return 80; ' + (mode.includes("pipe-live") ? '' : 'close(fds[1]); ') + 'if (dup2(fds[0], 0) < 0) return 81; close(fds[0]); if (dup2(0, 3) < 0 || dup2(0, 4) < 0) return 82; int reopened = open("/proc/self/fd/0", O_RDONLY); if (reopened < 0 || dup2(reopened, 8) < 0) return 83; if (reopened != 8) close(reopened);' : ""}
+	${pipe ? 'int fds[2]; if (pipe2(fds, O_CLOEXEC) || write(fds[1], "bcaXYZ", 6) != 6) return 80; ' + (mode.includes("pipe-live") ? '' : 'close(fds[1]); ') + 'if (dup2(fds[0], 0) < 0) return 81; close(fds[0]); if (dup2(0, 3) < 0 || dup2(0, 4) < 0) return 82; int reopened = open("/proc/self/fd/0", O_RDONLY); if (move_fd(reopened, 8)) return 83;' : ""}
 	${mixed ? 'int writable = open("anonymous", O_RDWR | O_CREAT | O_EXCL, 0600); if (writable < 0 || unlink("anonymous") || write(writable, "abcdef", 6) != 6 || lseek(writable, 0, SEEK_SET) != 0 || dup2(writable, 16) < 0 || dup2(writable, 17) < 0) return 87; close(writable); int reader = open("/proc/self/fd/16", O_RDONLY); if (reader < 0 || dup2(reader, 18) < 0) return 88; close(reader);' : ""}
 	${socket ? 'int fds[2]; if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds) || ' + (prequeued ? '0' : 'write(fds[1], "bcaXYZ", 6) != 6') + ' || dup2(fds[0], 0) < 0) return 95; close(fds[0]); if (dup2(0, 3) < 0 || dup2(0, 4) < 0 || dup2(0, 8) < 0) return 96;' + (mode === "native-socket-half-closed" ? ' if (shutdown(fds[1], SHUT_WR)) return 97;' : '') : ""}
 	${queueCounter ? 'int counter = eventfd(5, EFD_NONBLOCK | EFD_CLOEXEC); if (counter < 0 || dup2(counter, 20) < 0 || dup2(counter, 21) < 0) return 160; close(counter);' : ""}
@@ -1308,13 +1322,13 @@ int main(int argc, char **argv) {
 	${counter ? 'int counter = eventfd(5, EFD_CLOEXEC | EFD_NONBLOCK' + (semaphore ? ' | EFD_SEMAPHORE' : '') + '), full = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK); uint64_t count = UINT64_MAX - 2; if (counter < 0 || full < 0 || write(full, &count, 8) != 8 || dup2(counter, 20) < 0 || dup2(counter, 21) < 0 || dup2(full, 22) < 0) return 149; close(counter); close(full);' : ""}
 	${lifetime || exporting ? 'int gate[2]; if (pipe2(gate, O_CLOEXEC)) return 109;' : ""}
 	puts(argv[1]); fflush(stdout);
-	${enumerate ? 'int anchor = open(".", O_PATH | O_DIRECTORY); if (anchor < 0 || dup2(anchor, 6) < 0) return 175; if (anchor != 6) close(anchor); char entries[24]; int independent = open(".", O_RDONLY | O_DIRECTORY); if (independent < 0 || dup2(independent, 13) < 0 || syscall(SYS_getdents64, 10, entries, sizeof(entries)) != 24) return 168; if (independent != 13) close(independent); char captured[39]; for (int index = 0; index < 19; index++) snprintf(captured + 2 * index, 3, "%02x", (unsigned char)entries[index]); if (setenv("BOUND_DIRECTORY_ENTRY", captured, 1)) return 178; pid_t reader = fork(); if (reader < 0) return 169; if (reader) { if (wait_child(reader) || lseek(10, 0, SEEK_CUR) <= 9007199254740991LL || lseek(11, 0, SEEK_CUR) != lseek(10, 0, SEEK_CUR) || lseek(13, 0, SEEK_CUR) <= 0 || lseek(13, 0, SEEK_CUR) == lseek(10, 0, SEEK_CUR)) return 170; return 0; }' : ""}
+	${enumerate ? 'int anchor = open(".", O_PATH | O_DIRECTORY); if (move_fd(anchor, 6)) return 175; char entries[24]; int independent = open(".", O_RDONLY | O_DIRECTORY); if (independent < 0 || dup2(independent, 13) < 0 || syscall(SYS_getdents64, 10, entries, sizeof(entries)) != 24) return 168; if (independent != 13) close(independent); char captured[39]; for (int index = 0; index < 19; index++) snprintf(captured + 2 * index, 3, "%02x", (unsigned char)entries[index]); if (setenv("BOUND_DIRECTORY_ENTRY", captured, 1)) return 178; pid_t reader = fork(); if (reader < 0) return 169; if (reader) { if (wait_child(reader) || lseek(10, 0, SEEK_CUR) <= 9007199254740991LL || lseek(11, 0, SEEK_CUR) != lseek(10, 0, SEEK_CUR) || lseek(13, 0, SEEK_CUR) <= 0 || lseek(13, 0, SEEK_CUR) == lseek(10, 0, SEEK_CUR)) return 170; return 0; }' : ""}
 	${mode === "native-pipe-live-transfer" ? `int sockets[2], passed[] = {0, 3, 4, 8};
 	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) || pass(sockets[0], "x", 1, passed, 4, 0)) return 89;
 	close(sockets[0]);` : ""}
 	${counter ? 'pid_t child = fork(); if (child < 0) return 150; if (child) { if (wait_child(child)) return 151; uint64_t count, total = 0; while (read(21, &count, 8) == 8) total += count; if (errno != EAGAIN || total != ' + (semaphore ? 11 : 7) + ' || !(fcntl(20, F_GETFL) & O_NONBLOCK) || read(22, &count, 8) != -1 || errno != EAGAIN) return 152; return 0; }' : ""}
 	${pipe || socket ? 'pid_t child = fork(); if (child < 0) return 84; ' + (exporting ? 'if (child) { close(0); close(3); close(4); close(8); close(gate[0]); if (write(gate[1], "x", 1) != 1) return 133; close(gate[1]); if (wait_child(child)) return 134; char text[6]; int received; if (take_text(14, "peerx", 5, &received, 1, 0, 0)) return 135; if (!(fcntl(received, F_GETFL) & O_NONBLOCK) || read_text(received, text, "bcaXYZ")) return 136; close(received); ' + (queueCounter ? 'uint64_t count; if (read(20, &count, 8) != 8 || count != 7) return 161; ' : '') + 'return 0; } ' : '') + (lifetime ? 'if (child) { close(0); close(3); close(4); close(8); close(14); close(fds[1]); close(gate[0]); if (write(gate[1], "x", 1) != 1) return 110; close(gate[1]); return wait_child(child); } ' : '') + 'if (child) { char tail[3]; if (wait_child(child) || ' + (mixed ? 'lseek(16, 0, SEEK_CUR) != 4 || lseek(18, 0, SEEK_CUR) != 0 || pread(18, tail, 1, 2) != 1 || tail[0] != 81 || !(fcntl(3, F_GETFL) & O_NONBLOCK) || !(fcntl(4, F_GETFL) & O_NONBLOCK) || (fcntl(8, F_GETFL) & O_NONBLOCK) || ' : '') + 'read(3, tail, 1) != 1 || read(4, tail + 1, 1) != 1 || read(8, tail + 2, 1) != 1 || tail[0] != \'X\' || tail[1] != \'Y\' || tail[2] != \'Z\') return 85; ' + (orphan ? 'int remaining; if (take(3, 84, &remaining, 1, 0, 0) || lseek(remaining, 0, SEEK_CUR) != 2 || !(fcntl(remaining, F_GETFL) & O_NONBLOCK)) return 200; close(remaining); ' : '') + (socket || pipeOutput ? 'char reply[6]; ' + (shortWrite ? 'char head[4091]; if (read(15, head, sizeof(head)) != sizeof(head)) return 122; for (unsigned index = 0; index < sizeof(head); index++) if (head[index] != 90) return 123; ' : '') + (transferIO ? 'if (read_text(15, reply, "bcabca")) return 131; ' : '') + (queuedOutput ? 'if (read_text(15, reply, "start")) return 113; ' : '') + (duplex ? 'if (read_text(0, reply, "back") || read(0, reply, 1) != 0) return 102; ' : 'if (read_text(' + (socket ? 'fds[1]' : '15') + ', reply, "' + (shortWrite ? 'ZZZZZ' : 'reply') + '")) return 98; ') + (socket ? 'if (read(fds[1], reply, 1) != 0) return 99; ' : '') : '') + 'return 0; }' : ""}
-	${lifetime || exporting ? 'char ready; close(gate[1]); if (read(gate[0], &ready, 1) != 1) return 111; close(gate[0]);' : ""}
+	${lifetime || exporting ? 'if (wait_gate(gate)) return 111;' : ""}
 	${exporting ? 'close(14);' : ""}
 	${mode === "native-pipe-live-transfer" ? `for (unsigned index = 0; index < 4; index++) close(passed[index]);
 	int received[4], saved[4]; if (take(sockets[1], 'x', received, 4, 0, 0)) return 91;
@@ -1531,9 +1545,10 @@ int main(int argc, char **argv) {
 nativeTest.for(["temporary", "persistent", "descendant", "merged", "stale"])("seals output pipe status before reusing a child (%s)", { timeout: 30_000 }, async (mode, { benchmark }) => {
 		const fixture = await benchmark("pi-output-status-", "git", {});
 		await writeFile(path.join(fixture.workspace, "input.txt"), "before\n");
-		await compileBenchmarkHelper(fixture.workspace, "worker", { code: `${cHeaders("fcntl.h unistd.h")}
+		await compileBenchmarkHelper(fixture.workspace, "worker", { code: `${cHeaders("fcntl.h")}
+${processChecks}
 int main(void) {
-	for (volatile unsigned long i = 0; i < 20000000ul; ++i) {}
+	burn_cpu(20000000ul);
 	int fd = dup(${mode === "merged" ? 2 : 1}), flags = fcntl(fd, F_GETFL);
 	if (fd < 0 || flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK)) return 71;
 	${mode === "descendant" ? 'int child = fork(); if (child < 0) return 72; if (child) return 0;' : ""}
@@ -1595,29 +1610,29 @@ int main(void) {
 	${mode === "hardlink-rename" ? 'if (rename("input.txt", "moved.txt")) return 73;' : mode === "hardlink-unlink" ? 'if (unlink("input.txt")) return 73;' : mode === "hardlink-split" ? 'if (unlink("input.txt")) return 73; int replacement = open("input.txt", O_WRONLY | O_CREAT, 0600); if (replacement < 0 || write(replacement, "new", 3) != 3) return 73; close(replacement);' : ""}
 	${mode === "hardlink-detached" ? 'if (unlink("input.txt") || unlink("alias.txt")) return 73;' : ""}
 	${writable ? 'if (write(4, "XY", 2) != 2) return 72;' : pathWrite ? `int fd = open("${hardlink ? "alias.txt" : "input.txt"}", O_WRONLY); if (pwrite(fd, "Z", 1, 2) != 1) return 72; close(fd);` : ""}
-	${closing ? `int gate[2];char byte;if(pipe2(gate,O_CLOEXEC))return 77;pid_t child=fork();if(child<0)return 77;
-	if(!child){close(gate[1]);if(read(gate[0],&byte,1)!=1)_exit(78);close(gate[0]);close(3);close(4);_exit(0);}
+	${closing ? `int gate[2];if(pipe2(gate,O_CLOEXEC))return 77;pid_t child=fork();if(child<0)return 77;
+	if(!child){if(wait_gate(gate))_exit(78);close(3);close(4);_exit(0);}
 	close(gate[0]);if(close(3) || close(4) || query(8,10,3,F_RDLCK,10,3) || flock(8,LOCK_EX|LOCK_NB)!=-1 || errno!=EAGAIN)return 77;
 	if(write(gate[1],"x",1)!=1 || close(gate[1]))return 77;
 	if(wait_child(child) || query(8,10,3,F_UNLCK,10,3) || flock(8,LOCK_EX|LOCK_NB) || flock(8,LOCK_UN))return 77;` : ""}
-	for (volatile unsigned long i = 0; i < 50000000ul; ++i) {}
+	burn_cpu(50000000ul);
 	return write(1, bytes, sizeof(bytes)) != sizeof(bytes);
 }
 ` });
 		const body = `IFS= read -r -N 1 discard <&3; IFS= read -r -N 1 discard <&8; locker init; printf '%s\\n' "$1"; worker; IFS= read -r -N 1 a <&4; IFS= read -r -N 1 b <&8; printf 'tail:%s:%s\\n' "$a" "$b"; locker check`;
 		if (memory) {
 			await compileBenchmarkHelper(fixture.workspace, "fd-memory", { code: lockHelpers + `
-${cHeaders("sys/mman.h sys/wait.h stdio.h")}
+${cHeaders("sys/mman.h stdio.h")}
 ${rightsHelpers}
 int main(int argc,char **argv) {
 	char bytes[6];int input=open("input.txt",O_RDONLY);if(argc!=2 || input<0 || read(input,bytes,6)!=6)return 80;close(input);
 	${mode === "locks-close-queues" ? 'int queues[2]; struct iovec vector = {bytes, 1}; struct msghdr message = {.msg_iov = &vector, .msg_iovlen = 1}; if (socketpair(AF_UNIX, SOCK_STREAM, 0, queues) || sendmsg(queues[0], &message, 0) != 1 || close(queues[0]) || close(queues[1])) return 88;' : ""}
-	int fd=memfd_create("lock-input",0);if(fd<0 || write(fd,bytes,6)!=6 || lseek(fd,0,SEEK_SET)!=0 || dup2(fd,3)<0)return 81;
-	if(fd!=3)close(fd);if(dup2(3,4)<0)return 82;fd=open("/proc/self/fd/3",O_RDWR);if(fd<0 || dup2(fd,8)<0)return 83;if(fd!=8)close(fd);
+	int fd=memfd_create("lock-input",0);if(fd<0 || write(fd,bytes,6)!=6 || lseek(fd,0,SEEK_SET)!=0 || move_fd(fd,3))return 81;
+	if(dup2(3,4)<0)return 82;fd=open("/proc/self/fd/3",O_RDWR);if(move_fd(fd,8))return 83;
 	${mode === "locks-close-nested" ? 'if (wrap_queue(wrap_queue(memfd_create("unrelated", MFD_CLOEXEC), 0), 0) < 0) return 88;' : ""}
 	${closing ? `int gate[2];char byte;if(pipe2(gate,O_CLOEXEC) || lseek(3,1,SEEK_SET)!=1 || lseek(8,1,SEEK_SET)!=1 || lock(3,F_WRLCK,2,4) || flock(3,LOCK_SH|LOCK_NB))return 84;
 	puts(argv[1]);fflush(stdout);pid_t child=fork();if(child<0)return 85;
-	if(!child){close(gate[1]);if(read(gate[0],&byte,1)!=1)_exit(86);close(gate[0]);execl("./worker","worker",(char *)0);_exit(86);}
+	if(!child){if(wait_gate(gate))_exit(86);execl("./worker","worker",(char *)0);_exit(86);}
 	close(gate[0]);close(3);close(4);if(write(gate[1],"x",1)!=1)return 86;close(gate[1]);
 	if(wait_child(child) || read(8,&byte,1)!=1 || query(8,10,3,F_UNLCK,10,3) || flock(8,LOCK_EX|LOCK_NB) || flock(8,LOCK_UN))return 87;
 	printf("tail::%c\\n",byte);return 0;` : `execl("/bin/bash","bash","-c",${JSON.stringify(body)},"fd-memory",argv[1],(char *)0);return 84;`}
@@ -1662,7 +1677,7 @@ nativeTest.for(["SOCK_DGRAM", "SOCK_SEQPACKET", "SOCK_DGRAM:close", "SOCK_SEQPAC
 		const fixture = await benchmark("pi-packet-binding-");
 		await writeFile(path.join(fixture.workspace, "input.txt"), "abcdef");
 		const helpers = `#define _GNU_SOURCE
-${cHeaders("sys/socket.h sys/wait.h poll.h errno.h fcntl.h stdio.h string.h unistd.h")}
+${cHeaders("poll.h errno.h stdio.h")}
 ${rightsHelpers}
 static int passPacket(const char *bytes, int length) { int fd = 9; return pass(20, bytes, length, &fd, 1, MSG_NOSIGNAL); }
 static int takePacket(int length,int peek,int truncated,char expected) {
@@ -1688,16 +1703,16 @@ static int takePacket(int length,int peek,int truncated,char expected) {
 	if(${type === "SOCK_DGRAM" ? "recv(20,bytes,1,MSG_DONTWAIT)!=-1 || errno!=EAGAIN" : "recv(20,bytes,1,0)!=0"})return 75;
 	${closing ? "if(close(20) || close(21))return 76;" : ""}
 	ready.revents=0;if(poll(&ready,1,0)!=1 || ready.revents!=${type === "SOCK_DGRAM" ? "POLLIN" : "(POLLIN|POLLHUP)"})return 77;
-	for(volatile unsigned long i=0;i<200000000ul;i++){}
+	burn_cpu(200000000ul);
 	return write(1,"packets\\n",8)!=8;
 }
 ` });
 		await compileBenchmarkHelper(fixture.workspace, "fd-launch", { code: helpers + `int main(int argc,char **argv) {
 	if(argc!=2)return 80;int pair[2],gate[2];char byte;
 	if(socketpair(AF_UNIX,${type}|SOCK_CLOEXEC|SOCK_NONBLOCK,0,pair) || dup2(pair[0],20)<0 || dup2(pair[0],21)<0 || dup2(pair[1],22)<0)return 81;
-	close(pair[0]);close(pair[1]);int fd=open("input.txt",O_RDONLY);if(fd<0 || dup2(fd,9)<0)return 82;if(fd!=9)close(fd);
+	close(pair[0]);close(pair[1]);int fd=open("input.txt",O_RDONLY);if(move_fd(fd,9))return 82;
 	if(pipe2(gate,O_CLOEXEC))return 83;puts(argv[1]);fflush(stdout);pid_t child=fork();if(child<0)return 83;
-	if(!child){close(gate[1]);if(read(gate[0],&byte,1)!=1)_exit(84);close(gate[0]);execl("./worker","worker",(char *)0);_exit(84);}
+	if(!child){if(wait_gate(gate))_exit(84);execl("./worker","worker",(char *)0);_exit(84);}
 	close(gate[0]);${closing ? "close(20);close(21);" : ""}if(write(gate[1],"x",1)!=1)return 84;close(gate[1]);
 	if(wait_child(child) || lseek(9,0,SEEK_CUR)!=2 || takePacket(4,0,0,'c') || lseek(9,0,SEEK_CUR)!=3)return 85;
 	if(${type === "SOCK_DGRAM" ? "recv(22,&byte,1,MSG_DONTWAIT)!=-1 || errno!=EAGAIN" : "recv(22,&byte,1,0)!=0"})return 86;
@@ -1975,7 +1990,7 @@ int main(int n,char **v) { if(n!=2)return 90; pid_t child=!strcmp(v[1],"vfork")?
 		};
 		const descriptorProbe = path.join(root, "descriptor-probe");
 		await compileBenchmarkHelper(root, "descriptor-probe", { arguments: ["-pthread", "-Werror"], code: `#define _GNU_SOURCE
-${cHeaders("pthread.h sched.h stdlib.h poll.h stdio.h stdint.h sys/file.h sys/stat.h sys/syscall.h sys/wait.h sys/eventfd.h sys/mman.h")}
+${cHeaders("pthread.h sched.h stdlib.h poll.h stdio.h stdint.h sys/file.h sys/stat.h sys/syscall.h sys/eventfd.h sys/mman.h")}
 ${rightsHelpers}
 static void exec_true(void) { char *command[] = {"true", 0}; execv("/bin/true", command); }
 static int fork_true(void) {
@@ -2038,7 +2053,7 @@ static int queue_owners(char **argv) {
 	}
 	if (pipe2(gate, O_CLOEXEC)) return 75;
 	pid_t child = fork(); if (child < 0) return 75;
-	if (!child) { close(gate[1]); if (read(gate[0], &byte, 1) != 1) return 76; close(gate[0]); exec_true(); return 76; }
+	if (!child) { if (wait_gate(gate)) return 76; exec_true(); return 76; }
 	if (state) { close(20); close(21); } if (local) { close(channel[0]); close(channel[1]); }
 	close(gate[0]); if (write(gate[1], "x", 1) != 1) return 77; close(gate[1]);
 	if (wait_child(child)) return 78;
@@ -2152,7 +2167,7 @@ int main(int argc, char **argv) {
 		if (writer < 0 || pthread_join(worker, 0)) return 82;
 		close(writer); unlink(fifo);
 		if (fork_true()) return 83;
-		int fd = open(argv[2], O_RDONLY); if (fd < 0 || dup2(fd, 3) < 0) return 84; if (fd != 3) close(fd);
+		int fd = open(argv[2], O_RDONLY); if (move_fd(fd, 3)) return 84;
 	} else if (aliases(0)) return 75;
 	exec_true(); return 76;
 }
