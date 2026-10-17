@@ -15,7 +15,7 @@ import { type ExecutionOperationAdoption, type ExecutionOperationBinding, type E
 import type { PlanUpdate } from "./plan-proposal.ts";
 import { PlanRuntime, type PlanRuntimeNode, type PredictionOpportunity, type ClaimedPrediction } from "./plan-runtime.ts";
 import { BoundedEventQueue, PostSettlementQueue } from "./post-settlement.ts";
-import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
+import { PendingTasks, RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
 import { cloneSharedData } from "./stable-json.ts";
 import { containsLogicalPath } from "./path-utils.ts";
 import type {
@@ -305,7 +305,7 @@ interface SessionState<SessionID, Output, StartInput, StateData> {
 	readonly events: BoundedEventQueue<SpeculativeActionEvent<SessionID>>;
 	readonly actionContexts: Map<string, PlanActionContext<StartInput, StateData>>;
 	readonly sourceSlots: Set<SourceRequestSlot>;
-	readonly sourceTasks: Set<Promise<unknown>>;
+	readonly sourceTasks: PendingTasks;
 	readonly turns: Map<string, TurnState<SessionID, Output, StartInput, StateData>>;
 	/** Fallback execution can outlive turn retirement; only its physical settlement returns these units. */
 	readonly actorRequests: Set<object>;
@@ -466,7 +466,7 @@ export function makeSpeculativeActionRuntime<
 			events: new BoundedEventQueue(RUNTIME_EVENT_QUEUE_CAPACITY, (event) => adapter.onEvent?.(event)),
 			actionContexts: new Map(),
 			sourceSlots: new Set(),
-			sourceTasks: new Set(),
+			sourceTasks: new PendingTasks(),
 			turns: new Map(),
 			settings,
 			sequence: 0,
@@ -692,15 +692,6 @@ export function makeSpeculativeActionRuntime<
 
 	const releaseAllSourceSlots = (session: Session, failure: ResolutionCause): void => { for (const slot of [...session.sourceSlots]) releaseSourceSlot(session, slot, failure); };
 
-	const trackSourceTask = <Value>(session: Session, task: Promise<Value>): Promise<Value> => {
-		session.sourceTasks.add(task);
-		void task.finally(() => session.sourceTasks.delete(task))
-			.catch(() => {
-				// Request failure is already represented by its source settlement.
-			});
-		return task;
-	};
-
 	const launchSourceRequests = (state: Turn): void => {
 		for (const source of sources) {
 			if (!source.enabled(state.settings)) continue;
@@ -725,7 +716,7 @@ export function makeSpeculativeActionRuntime<
 						proposalCount: count,
 						signal, reportDraftTokens,
 					}));
-				trackSourceTask(state.session, pending);
+				state.session.sourceTasks.track(pending);
 			}
 		}
 	};
@@ -745,7 +736,7 @@ export function makeSpeculativeActionRuntime<
 			request: slot.request,
 			generation: slot.generation,
 			timeoutMs: source.timeoutMs?.(scope.settings),
-			produce: (signal) => trackSourceTask(session, Promise.resolve(produce(signal, reportDraftTokens))),
+			produce: (signal) => session.sourceTasks.track(Promise.resolve(produce(signal, reportDraftTokens))),
 			count: (value) => asUpdates(value).length,
 		}).then(async (settled) => {
 			const request = { ...settled, draftTokens };
@@ -1704,7 +1695,7 @@ export function makeSpeculativeActionRuntime<
 					if (state.lifecycle !== "active" || !state.generation.active || target <= state.session.decisionSequence || !asUpdates(updates).length) return;
 					// Real observations remain ordered; their next-decision preparation survives normal turn closure.
 					const slot = claimSourceSlot(state.session, source.id, state.turnID, target, 1, "observation", true, state.signal);
-					if (slot) void trackSourceTask(state.session, admitUpdates(
+					if (slot) void state.session.sourceTasks.track(admitUpdates(
 						{ ...turnContext(state), session: state.session, slot }, source, updates,
 					).finally(() => releaseSourceRequest(state.session, slot)));
 				});
@@ -1841,7 +1832,7 @@ export function makeSpeculativeActionRuntime<
 				// Continuation failure cannot revoke completed work or Actor adoption.
 			});
 			if (!scoped) for (const parent of parents) continuationTails.set(parent!, pending);
-			trackSourceTask(session, pending);
+			session.sourceTasks.track(pending);
 		}
 	};
 
@@ -1892,7 +1883,7 @@ export function makeSpeculativeActionRuntime<
 				const update = await peer.continueFrom!({ ...turnContext(context), batch, signal, reportDraftTokens });
 				return signal.aborted ? undefined : update;
 			}).catch(() => { /* Peer prediction cannot revoke the completed parent batch. */ });
-			trackSourceTask(session, pending);
+			session.sourceTasks.track(pending);
 		}
 	};
 
@@ -2251,7 +2242,7 @@ export function makeSpeculativeActionRuntime<
 		const planFailure = terminal ? cause("control", "session_terminal") : failure;
 		for (const node of session.plan.unsettled()) settleUnobserved(session, node, planFailure);
 		session.plan.clear();
-		while (session.sourceTasks.size) await Promise.allSettled(session.sourceTasks);
+		await session.sourceTasks.drain();
 		await session.effects.flush();
 		for (const closure of closures) await completeTurnClosure(closure);
 

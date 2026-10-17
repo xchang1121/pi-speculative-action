@@ -9,6 +9,7 @@ import { EvidenceLedger } from "./self-speculation-evidence.ts";
 import { asRecord as record, isRecord, stableStringify } from "./stable-json.ts";
 import { isFiniteNumber, isSafeCount, finiteNumber, nonNegativeFinite, nonNegativeCount } from "./number-utils.ts";
 import { booleanOr, nonNegativeNumber, positiveInteger, positiveMilliseconds, probability, settingsParser } from "./setting-input.ts";
+import { PendingTasks } from "./runtime-lifecycle.ts";
 
 /** A hosted API cannot fork the Actor's decode: `drafter` has the Drafter read the Actor's reasoning so far instead. */
 export type SelfSpeculationForkTransport = "provider" | "sidecar" | "drafter";
@@ -151,7 +152,7 @@ export class SelfSpeculationCoordinator {
 	private readonly capabilities = new Map<string, ControlPlaneCapabilities>();
 	private readonly decoderEvidence = new EvidenceLedger(4, 2);
 	private readonly actionEvidence = new EvidenceLedger(2, 1);
-	private readonly background = new Set<Promise<void>>();
+	private readonly background = new PendingTasks();
 	private readonly pendingCandidates = new Map<number, Map<string, CandidateRecord>>();
 	private active?: TurnState;
 	private latestStartedDecisionSequence = 0;
@@ -362,7 +363,7 @@ export class SelfSpeculationCoordinator {
 				if (this.active === state && !state.ended) this.scheduleActorProbe(state);
 			});
 		state.forkTask = task;
-		this.track(task);
+		this.background.track(task);
 	}
 
 	/** The Drafter reads the Actor's reasoning so far and names the calls it expects next; no logprobs gate them. */
@@ -418,12 +419,7 @@ export class SelfSpeculationCoordinator {
 		this.active = undefined;
 		if (state && preserveForRetry && state.candidates.size) {
 			// The active decision owns its bundle exclusively; outstanding submissions keep the old snapshot.
-			this.pendingCandidates.set(state.decisionSequence, new Map([...state.candidates].map(([key, candidate]) => [key, {
-				...candidate,
-				input: structuredClone(candidate.input),
-				sources: new Set(candidate.sources),
-				provenance: candidate.provenance.map((item) => ({ ...item })),
-			}])));
+			this.pendingCandidates.set(state.decisionSequence, structuredClone(state.candidates));
 		}
 		if (!state?.requestID || state.settings.forkTransport === "drafter") return;
 		const pending = [state.flushTask, state.forkTask].filter((task): task is Promise<void> => task !== undefined);
@@ -432,7 +428,7 @@ export class SelfSpeculationCoordinator {
 				this.post(state.settings.clearPath, { version: 1, request_id: state.requestID }, state.settings),
 			)
 			.then((receipt) => this.recordVerification(receipt, state));
-		this.track(cleanup);
+		this.background.track(cleanup);
 	}
 
 	snapshot() {
@@ -493,7 +489,7 @@ export class SelfSpeculationCoordinator {
 		}
 	}
 
-	async dispose(): Promise<void> { this.reset(); while (this.background.size) await Promise.allSettled([...this.background]); }
+	async dispose(): Promise<void> { this.reset(); await this.background.drain(); }
 
 	private scheduleFlush(state: TurnState): void {
 		if (!state.requestID || state.flushTask || state.settings.forkTransport === "drafter" || this.capabilities.get(controlPlaneKey(state.settings))?.candidates === false) return;
@@ -501,7 +497,7 @@ export class SelfSpeculationCoordinator {
 			state.flushTask = undefined;
 			if (state.dirty && state.requestID && this.active === state) this.scheduleFlush(state);
 		});
-		this.track(state.flushTask);
+		this.background.track(state.flushTask);
 	}
 
 	private async flush(state: TurnState): Promise<void> {
@@ -623,7 +619,7 @@ export class SelfSpeculationCoordinator {
 				if (declared) this.capabilities.set(key, Object.fromEntries((["fork", "candidates", "logprobs", "provider"] as const)
 					.map((name) => [name, declared[name] === true])));
 			}).catch(() => undefined);
-		this.track(task);
+		this.background.track(task);
 	}
 
 	private async post(
@@ -653,12 +649,6 @@ export class SelfSpeculationCoordinator {
 		}
 	}
 
-	private track(task: Promise<void>): void {
-		this.background.add(task);
-		void task
-			.catch(() => undefined)
-			.finally(() => this.background.delete(task));
-	}
 }
 
 function providerPayload(

@@ -1,3 +1,20 @@
+/** Tracks owned asynchronous work, including tasks added while earlier work settles. */
+export class PendingTasks {
+	private readonly work = new Set<Promise<unknown>>();
+
+	track<Value>(task: Promise<Value>): Promise<Value> {
+		if (this.work.has(task)) return task;
+		this.work.add(task);
+		const settled = () => { this.work.delete(task); };
+		void task.then(settled, settled);
+		return task;
+	}
+
+	async drain(): Promise<void> {
+		while (this.work.size) await Promise.allSettled(this.work);
+	}
+}
+
 /**
  * Serializes lifecycle mutations for one reusable runtime session.
  *
@@ -5,10 +22,9 @@
  * synchronously, runs exactly one final operation after already-admitted work, and makes later
  * callers join that same completion instead of starting a second teardown.
  */
-export class RuntimeLifecycleLane {
+export class RuntimeLifecycleLane extends PendingTasks {
 	private tail: Promise<void> = Promise.resolve();
 	private closeTask?: Promise<void>;
-	private readonly work = new Set<Promise<unknown>>();
 	private readonly released = new WeakMap<object, Promise<void>>();
 
 	get sealed(): boolean {
@@ -38,14 +54,6 @@ export class RuntimeLifecycleLane {
 		return this.track(this.enqueue(operation));
 	}
 
-	track<Value>(task: Promise<Value>): Promise<Value> {
-		if (this.work.has(task)) return task;
-		this.work.add(task);
-		const settled = () => { this.work.delete(task); };
-		void task.then(settled, settled);
-		return task;
-	}
-
 	release(resource?: { readonly dispose: () => void | Promise<void> }): Promise<void> {
 		if (!resource) return Promise.resolve();
 		const existing = this.released.get(resource);
@@ -55,10 +63,6 @@ export class RuntimeLifecycleLane {
 		}));
 		this.released.set(resource, task);
 		return task;
-	}
-
-	async drain(): Promise<void> {
-		while (this.work.size) await Promise.allSettled(this.work);
 	}
 
 	private enqueue<Value>(operation: () => Value | Promise<Value>): Promise<Value> {
