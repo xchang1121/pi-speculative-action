@@ -1,4 +1,4 @@
-import { isSafeCount } from "./number-utils.ts";
+import { isFiniteNumber, isSafeCount } from "./number-utils.ts";
 /** Stored values never coerce text; interactive parsers below separately enforce strict input. */
 export function positiveInteger<F extends number | undefined>(value: unknown, fallback: F): number | F {
 	return typeof value === "number" && Number.isSafeInteger(Math.floor(value)) && value >= 1 ? Math.floor(value) : fallback;
@@ -15,11 +15,11 @@ export function milliseconds(value: unknown, fallback: number): number {
 export const positiveMilliseconds = (value: unknown, fallback: number): number => milliseconds(value, fallback) || fallback;
 
 export function nonNegativeNumber<F extends number | undefined>(value: unknown, fallback: F): number | F {
-	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : fallback;
+	return isFiniteNumber(value) && value >= 0 ? value : fallback;
 }
 
 export function probability<F extends number | undefined>(value: unknown, fallback: F): number | F {
-	return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1 ? value : fallback;
+	return isFiniteNumber(value) && value >= 0 && value <= 1 ? value : fallback;
 }
 
 export function booleanOr(value: unknown, fallback: boolean): boolean {

@@ -1,4 +1,4 @@
-import { clampProbability, finiteNumber, isSafeCount, nonNegativeFinite } from "./number-utils.ts";
+import { clampProbability, finiteNumber, isFiniteNumber, isSafeCount, nonNegativeFinite } from "./number-utils.ts";
 import { hash as cryptoHash } from "node:crypto";
 import { writeJsonFile } from "./filesystem-evidence.ts";
 import fs from "node:fs/promises";
@@ -1208,7 +1208,7 @@ export function asPatternAwareRuntimeContext(value: unknown): PatternAwareRuntim
 	if (!(record?.store instanceof PatternAwareStore)) return;
 	const continuation = asRecord(record.continuation);
 	if (!continuation || !Array.isArray(continuation.history) || !Array.isArray(continuation.visitedPatternIDs)) return;
-	if (typeof continuation.pathProbability !== "number" || !Number.isFinite(continuation.pathProbability) || continuation.pathProbability < 0 ||
+	if (!isFiniteNumber(continuation.pathProbability) || continuation.pathProbability < 0 ||
 		continuation.pathProbability > 1) return;
 	return value as PatternAwareRuntimeContext;
 }
@@ -2289,8 +2289,4 @@ function boundedEventPayload(event: PatternAwareEventInput): PatternAwareEventIn
 
 function probability(pattern: Pick<MutablePattern, "historicalMatches" | "historicalOpportunities">) {
 	return Math.max(0, Math.min(1, pattern.historicalMatches / Math.max(1, pattern.historicalOpportunities)));
-}
-
-function isFiniteNumber(value: unknown): value is number {
-	return typeof value === "number" && Number.isFinite(value);
 }

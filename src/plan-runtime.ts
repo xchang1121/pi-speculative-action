@@ -1,4 +1,4 @@
-import { isSafeCount, nonNegativeCount as sequence, nonNegativeFinite as finiteMetric } from "./number-utils.ts";
+import { isFiniteNumber, isSafeCount, nonNegativeCount as sequence, nonNegativeFinite as finiteMetric } from "./number-utils.ts";
 import { isDeepStrictEqual } from "node:util";
 import { immutableSnapshot, isImmutableSnapshot } from "./stable-json.ts";
 import { RESOURCE_DIMENSIONS } from "./system-resources.ts";
@@ -610,7 +610,7 @@ function validateActions(actions: readonly PlanAction[]):
 			if (source.resourceDemand && typeof source.resourceDemand === "object") {
 				const entries = Object.entries(source.resourceDemand);
 				if (entries.some(([key, value]) => !RESOURCE_DIMENSIONS.includes(key as typeof RESOURCE_DIMENSIONS[number]) ||
-					typeof value !== "number" || !Number.isFinite(value) || value < 0)) return { ok: false, reason: "invalid_action" };
+					!isFiniteNumber(value) || value < 0)) return { ok: false, reason: "invalid_action" };
 				source.resourceDemand = Object.freeze(Object.fromEntries(entries));
 			}
 			source.input = immutableSnapshot(source.input);

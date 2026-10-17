@@ -7,7 +7,7 @@ import type { ActionKey } from "./action-semantics.ts";
 import type { ActorActionSettlement } from "./settlement.ts";
 import { EvidenceLedger } from "./self-speculation-evidence.ts";
 import { asRecord as record, isRecord, stableStringify } from "./stable-json.ts";
-import { isSafeCount, finiteNumber, nonNegativeFinite, nonNegativeCount } from "./number-utils.ts";
+import { isFiniteNumber, isSafeCount, finiteNumber, nonNegativeFinite, nonNegativeCount } from "./number-utils.ts";
 import { booleanOr, nonNegativeNumber, positiveInteger, positiveMilliseconds, probability, settingsParser } from "./setting-input.ts";
 
 /** A hosted API cannot fork the Actor's decode: `drafter` has the Drafter read the Actor's reasoning so far instead. */
@@ -843,7 +843,7 @@ function verificationTokenCounts(value: Readonly<Record<string, unknown>>, total
 function verificationNumber(record: Readonly<Record<string, unknown>>, field: string, integer = true): number | undefined {
 	const value = record[field];
 	if (value === undefined || value === null) return undefined;
-	if (typeof value !== "number" || !Number.isFinite(value) || value < 0)
+	if (!isFiniteNumber(value) || value < 0)
 		throw new Error(`self-speculation verification ${field} must be a non-negative number`);
 	if (integer && !Number.isSafeInteger(value))
 		throw new Error(`self-speculation verification ${field} must be an integer`);

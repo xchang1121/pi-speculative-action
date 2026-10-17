@@ -6,7 +6,7 @@ import { ActorAction, type ActorCandidateSelection } from "./actor-action.ts";
 import { CandidateExecution, type CandidateReservation } from "./candidate-execution.ts";
 import { CandidateStore, resultCacheRecency } from "./candidate-stores.ts";
 import { clampCandidateLimit, DEFAULTS, type DrafterToolDefinition } from "./common.ts";
-import { nonNegativeFinite as finiteMetric, positiveCount } from "./number-utils.ts";
+import { finiteNumber, nonNegativeFinite as finiteMetric, positiveCount } from "./number-utils.ts";
 import { errorDetail } from "./error-utils.ts";
 import { diagnosticAction } from "./diagnostics.ts";
 import { effectCommitFailure, isPoisonedEffectCommit } from "./effect-transaction.ts";
@@ -71,9 +71,7 @@ function concurrentLimit(settings: SpeculativeActionSettings): number {
 }
 
 function cacheByteLimit(settings: SpeculativeActionSettings): number {
-	return typeof settings.resourceCacheMaxBytes === "number" && Number.isFinite(settings.resourceCacheMaxBytes)
-		? Math.max(1, Math.floor(settings.resourceCacheMaxBytes))
-		: DEFAULTS.resourceCacheMaxBytes;
+	return positiveCount(finiteNumber(settings.resourceCacheMaxBytes) ?? DEFAULTS.resourceCacheMaxBytes);
 }
 
 function cacheLimits(settings: SpeculativeActionSettings) {
