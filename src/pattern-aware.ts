@@ -1316,8 +1316,9 @@ class PatternBindingAnalysis {
 			let selected: PatternAwareBinding | undefined, selectedReplay = -1;
 			// Preserve direct/composite/fallback order and first-best ties without replaying candidates twice.
 			for (const candidate of uniqueBy(candidates(this), bindingStructureKey)) {
+				const proposed = { ...bindings, [encodedPath]: candidate };
 				const replay = samples.reduce(
-					(matches, sample, index) => matches + Number(this.bindingMatches(candidate, sample.context, targets[index])),
+					(matches, sample) => matches + Number(this.bindingMatches(proposed, sample.context, sample.target.input)),
 					0,
 				);
 				if (replay <= selectedReplay) continue;
@@ -1406,7 +1407,7 @@ class PatternBindingAnalysis {
 			group.members.push([decodePath(encoded), binding, rows]);
 		}
 		return groups.map(({ members }) => {
-			const values = [...uniqueBy(joinBindingRows(members.map(([, , rows]) => rows)).map(row => row.values), stableStringify)];
+			const values = [...uniqueBy([...joinBindingRows(members.map(([, , rows]) => rows))].map(row => row.values), stableStringify)];
 			// Exact, injective fields identify joint choices; agreeing marginals count the same observations once.
 			const evidence = members.flatMap(([, binding], member) => {
 				if (!binding.variantCounts || members.length > 1 && binding.type === "near") return [];
@@ -1430,9 +1431,32 @@ class PatternBindingAnalysis {
 		const key = "bindings:" + mode + Number(targetIsPath) + Number(targetIsLine) + ":" + typeof target + ":" +
 			(typeof target === "string" ? target : stableStringify(target));
 		return this.memo(context, key, () => {
-			const bindings = this.inferCandidateBindings(context, target, mode !== "direct", targetIsPath, targetIsLine);
+			const bindings = this.correlatedBindings(this.inferCandidateBindings(context, target, mode !== "direct", targetIsPath, targetIsLine));
 			if (mode === "first") for (const binding of bindings) return [binding];
 			return [...uniqueBy(bindings, bindingStructureKey)];
+		});
+	}
+
+	private *correlatedBindings(bindings: Iterable<PatternAwareBinding>): Generator<PatternAwareBinding, undefined> {
+		for (const binding of bindings) {
+			const correlated = this.correlateLocations(binding);
+			if (correlated !== binding) yield correlated;
+			yield binding;
+		}
+	}
+
+	private correlateLocations(binding: PatternAwareBinding): PatternAwareBinding {
+		return this.memo(binding, "correlated-locations", () => {
+			if (binding.type === "event" && binding.field === "outputLocations") {
+				const item = binding.path.findIndex(segment => typeof segment === "number");
+				if (item >= 0) return { type: "each", relativeEvent: binding.relativeEvent, field: binding.field,
+					path: binding.path.slice(0, item), itemPath: binding.path.slice(item + 1) };
+			}
+			const children = bindingChildren(binding), sources = children.map(source => this.correlateLocations(source));
+			if (sources.every((source, index) => source === children[index])) return binding;
+			return binding.type === "join" ? { ...binding, left: sources[0]!, right: sources[1]! }
+				: binding.type === "coalesce" || binding.type === "splice" ? { ...binding, sources }
+					: "source" in binding ? { ...binding, source: sources[0]! } : binding;
 		});
 	}
 
@@ -1459,15 +1483,13 @@ class PatternBindingAnalysis {
 				}
 			} else {
 				for (const [sourcePath, source] of this.leaves(value)) {
-					const item = sourcePath.findIndex((segment) => typeof segment === "number");
-					const direct: PatternAwareBinding = field === "outputLocations" && item >= 0
-						? { type: "each", relativeEvent, field, path: sourcePath.slice(0, item), itemPath: sourcePath.slice(item + 1) }
-						: { type: "event", relativeEvent, field, path: sourcePath };
+					const direct: PatternAwareBinding = { type: "event", relativeEvent, field, path: sourcePath };
 					const pathSource = typeof source === "string" && isPathSource(field, sourcePath, source);
 					if (sameValue(source, target) && (!targetIsPath || pathSource)) yield direct;
+					const item = sourcePath.findIndex((segment) => typeof segment === "number");
 					if (targetIsLine && field === "outputLocations" && sourcePath.at(-1) === "line" && item >= 0 && typeof source === "number" &&
 						typeof target === "number" && source !== target && Math.abs(source - target) <= NEAR_LINE_TOLERANCE) {
-						yield { type: "near", tolerance: NEAR_LINE_TOLERANCE, source: direct };
+						yield { type: "near", tolerance: NEAR_LINE_TOLERANCE, source: { type: "each", relativeEvent, field, path: sourcePath.slice(0, item), itemPath: sourcePath.slice(item + 1) } };
 					}
 					if (typeof source !== "string" || typeof target !== "string") continue;
 					// A path target templates only a rewrite of another file's name; other targets never template a bare name.
@@ -1565,7 +1587,7 @@ class PatternBindingAnalysis {
 		}
 		const children = bindingChildren(binding).map(source => this.bindingRows(source, context));
 		if (binding.type === "near") return children[0]!;
-		return joinBindingRows(children).flatMap(({ values, sources }) => {
+		return [...joinBindingRows(children)].flatMap(({ values, sources }) => {
 			if (!values.every((value): value is string => typeof value === "string")) return [];
 			const first = values[0]!;
 			const result = binding.type === "join" ? [joinPath(first, values[1]!)]
@@ -1576,8 +1598,12 @@ class PatternBindingAnalysis {
 		});
 	}
 
-	bindingMatches(binding: PatternAwareBinding, context: ReadonlyArray<PatternAwareEvent>, target: unknown) {
-		return this.bindingValues(binding, context).some((value) => bindingValueMatches(binding, value, target));
+	bindingMatches(bindings: Readonly<Record<string, PatternAwareBinding>>, context: ReadonlyArray<PatternAwareEvent>, target: Readonly<Record<string, unknown>>) {
+		const groups = Object.entries(bindings).map(([encoded, binding]) => {
+			const expected = getPath(target, decodePath(encoded));
+			return this.bindingRows(binding, context).filter(row => bindingValueMatches(binding, row.values[0], expected));
+		});
+		return !joinBindingRows(groups).next().done;
 	}
 
 	*leaves(value: unknown, segments: PatternAwarePath = []): Generator<readonly [PatternAwarePath, unknown], undefined> {
@@ -1638,11 +1664,18 @@ const MISSING = Symbol("missing");
 type BindingRow = { readonly values: readonly unknown[]; readonly sources: ReadonlyMap<string, number> };
 
 /** A source row is an identity, even when two rows contain the same value. */
-function joinBindingRows(groups: readonly (readonly BindingRow[])[]): BindingRow[] {
-	return groups.reduce<BindingRow[]>((rows, group) => rows.flatMap(left => group.flatMap(right =>
-		[...right.sources].some(([source, index]) => left.sources.has(source) && left.sources.get(source) !== index) ? []
-			: [{ values: [...left.values, ...right.values], sources: new Map([...left.sources, ...right.sources]) }])),
-	[{ values: [], sources: new Map() }]);
+function* joinBindingRows(groups: readonly (readonly BindingRow[])[]): Generator<BindingRow, undefined> {
+	const pending: Array<{ group: number; row: BindingRow }> = [{ group: 0, row: { values: [], sources: new Map() } }];
+	while (pending.length) {
+		const { group, row } = pending.pop()!;
+		if (group === groups.length) { yield row; continue; }
+		const choices = groups[group]!;
+		for (let index = choices.length - 1; index >= 0; index--) {
+			const next = choices[index]!;
+			if ([...next.sources].some(([source, position]) => row.sources.has(source) && row.sources.get(source) !== position)) continue;
+			pending.push({ group: group + 1, row: { values: [...row.values, ...next.values], sources: new Map([...row.sources, ...next.sources]) } });
+		}
+	}
 }
 
 function bindingChildren(binding: PatternAwareBinding): readonly PatternAwareBinding[] {

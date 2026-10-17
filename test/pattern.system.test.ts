@@ -57,6 +57,21 @@ test.each([
 	}
 });
 
+test.each([false, true])("learns complete argument relations with a single prediction (cross-row %s)", crossRow => {
+	const store = new PatternAwareStore({ ...PATTERN_AWARE_DEFAULTS, presets: [], maxContextLength: 1, maxFutureGap: 0, beamWidth: 1 });
+	for (let index = 0; index < 4; index++) {
+		const context = { ...locations, sessionID: String(index), outputLocations: [
+			{ path: `src/a${index}.ts`, line: 3 + 100 * index }, { path: `src/b${index}.ts`, line: 17 + 100 * index },
+		] };
+		store.observe(context);
+		store.observe({ ...context, tool: "custom-read", input: { path: `test/a${index}.ts`, offset: (crossRow ? 17 : 3) + 100 * index }, outputLocations: undefined });
+		store.finishSession(context.sessionID);
+	}
+	const predicted = store.predictAfterBatch("unseen", [{ ...locations, sessionID: "unseen",
+		outputLocations: [{ path: "src/c.ts", line: 5 }, { path: "src/d.ts", line: 21 }] }]);
+	expect(predicted.map(({ input }) => input)).toEqual([{ path: "test/c.ts", offset: crossRow ? 21 : 5 }]);
+});
+
 test("correlates repeated collection references within a composite and keeps independent collections independent", () => {
 	const basename: PatternAwareBinding = { type: "transform", operation: "basename", source };
 	const command: PatternAwareBinding = { type: "splice", sources: [source, basename], parts: ["check ", " --name ", ""] };
