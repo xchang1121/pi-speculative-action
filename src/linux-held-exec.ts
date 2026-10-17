@@ -569,7 +569,7 @@ export async function inspectHeldExecProcess(pid: number, executable: string, de
 	if (descriptors !== "stdio" && !validProcessContext(context)) throw new Error("held process descriptors are not replayable");
 	const argv = decodeNullFields(command);
 	if (!argv.length) throw new Error("held process argv is empty");
-	const environment: Record<string, string> = {};
+	const environment: Record<string, string> = Object.create(null);
 	for (const entry of decodeNullFields(environmentBytes)) {
 		const separator = entry.indexOf("=");
 		if (separator < 1 || Object.hasOwn(environment, entry.slice(0, separator))) throw new Error("held process environment is not canonical");

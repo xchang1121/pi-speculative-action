@@ -12,18 +12,16 @@ import { orderWorkspaceChanges, type WorkspaceRegularDelta } from "./workspace-t
 
 export type { WorkspaceStructureEntry, WorkspaceStructureSnapshot, WorkspaceTreeEntry } from "./workspace-state.ts";
 
-export interface ExecutionPathProjectionOptions { readonly sourceRoot: string; readonly workspaceRoot: string; readonly privateRoot?: string; }
+export interface ExecutionPathProjectionOptions { readonly sourceRoot: string; readonly workspaceRoot: string; }
 
 /** Stable logical paths keep certificates independent of disposable worktree names. */
 export class ExecutionPathProjection {
 	readonly sourceRoot: string;
 	readonly workspaceRoot: string;
-	readonly privateRoot?: string;
 
 	constructor(options: ExecutionPathProjectionOptions) {
 		this.sourceRoot = path.resolve(options.sourceRoot);
 		this.workspaceRoot = path.resolve(options.workspaceRoot);
-		this.privateRoot = options.privateRoot ? path.resolve(options.privateRoot) : undefined;
 	}
 
 	toLogical(physicalPath: string): string {
@@ -38,12 +36,6 @@ export class ExecutionPathProjection {
 		if (relative === undefined) return logical;
 		const physical = path.resolve(this.workspaceRoot, relative);
 		return containsFilesystemPath(this.workspaceRoot, physical) ? physical : undefined;
-	}
-
-	normalizeValue(value: string): string {
-		let normalized = replacePath(value, this.workspaceRoot, this.sourceRoot);
-		if (this.privateRoot) normalized = replacePath(normalized, this.privateRoot, "/.pi-private-world");
-		return slash(normalized);
 	}
 
 	isWorkspacePhysical(physicalPath: string): boolean { return containsFilesystemPath(this.workspaceRoot, physicalPath); }
@@ -376,11 +368,4 @@ export function statChangeDigest(stat: Stats | BigIntStats): Sha256Digest {
 		links: Number(stat.nlink),
 		type: stat.isFile() ? "file" : stat.isDirectory() ? "directory" : stat.isSymbolicLink() ? "symlink" : "other",
 	});
-}
-
-function replacePath(value: string, from: string, to: string): string {
-	const variants = [from, slash(from)];
-	let replaced = value;
-	for (const variant of variants) replaced = replaced.split(variant).join(to);
-	return replaced;
 }

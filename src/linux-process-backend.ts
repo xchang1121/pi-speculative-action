@@ -666,7 +666,7 @@ export class LinuxProcessReuseBackend {
 		const readyAt = performance.now();
 		input.signal?.throwIfAborted();
 		const sourceRoot = path.resolve(input.sourceRoot);
-		const projection = new ExecutionPathProjection({ sourceRoot, workspaceRoot: input.workspace.sandboxRoot, privateRoot: input.workspace.processRoot });
+		const projection = new ExecutionPathProjection({ sourceRoot, workspaceRoot: input.workspace.sandboxRoot });
 		const invocation = "environment" in input.invocation ? input.invocation : undefined;
 		const bound = "environment" in input.invocation ? undefined : this.boundInvocation(input.invocation, input.scope);
 		if (bound && bound.sourceRoot !== sourceRoot) throw new Error("bound process workspace changed");
@@ -1715,11 +1715,11 @@ function bufferedProcessPrototype(
 	const input = inputs.find(({ fd }) => fd === 0);
 	return createExecPrototype({
 		executablePath: projection.toLogical(snapshot.executable),
-		...(snapshot.invocation ? { invocation: [projection.normalizeValue(snapshot.invocation[0]), snapshot.invocation[1]] as const } : {}),
+		invocation: snapshot.invocation,
 		executableDigest,
-		argv: snapshot.argv.map((value) => projection.normalizeValue(value)),
+		argv: snapshot.argv,
 		logicalCwd: projection.toLogical(snapshot.cwd),
-		environment: Object.fromEntries(Object.entries(snapshot.environment).map(([name, value]) => [name, projection.normalizeValue(value)])),
+		environment: snapshot.environment,
 		umask: context.umask,
 		processContextDigest: sha256Digest(context.key),
 		stdin: input ? { type: "bytes", digest: input.contentDigest, eof: snapshot.resources!.objects[input.image]!.queue?.eof ?? true } : { type: "closed", eof: true },
@@ -2592,7 +2592,7 @@ async function topLevelProcessPrototype(invocation: ToolProcessInvocation, reque
 	return createExecPrototype({
 		executablePath: invocation.shell,
 		executableDigest: await hashExecutableFile(invocation.shell, request.signal),
-		argv: [invocation.shell, ...shellArguments(invocation, request.command)].map(value => projection.normalizeValue(value)),
+		argv: [invocation.shell, ...shellArguments(invocation, request.command)],
 		logicalCwd: projection.toLogical(projection.toPhysical(request.cwd) ?? request.cwd),
 		environment,
 		umask: process.umask(),

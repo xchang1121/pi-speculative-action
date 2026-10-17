@@ -121,6 +121,21 @@ async function withPreparedWorker(fixture: LinuxProcessBenchmark, input: Paramet
 }
 
 describe("Linux process ExecutionWorld", () => {
+nativeTest.for(["argv", "MODE", "__proto__"])("preserves literal workspace text in %s", async (field, { benchmark }) => {
+	const fixture = await benchmark("pi-literal-input-", "git"); await fixture.prepare();
+	await fixture.workspaceSandbox.withWorkspace(fixture.workspace, async workspace => {
+		const sessions: LinuxProcessSession[] = []; await using _sessions = onExit(async () => { for (const session of sessions) await session.close(); });
+		for (const literal of [workspace.sandboxRoot, fixture.workspace, workspace.processRoot, "/.pi-private-world"]) {
+			const environment = { ...fixture.environment, ...(field === "argv" ? {} : { [field]: literal }) };
+			const command = field === "argv" ? `printf '%s\\n' '${literal}'` : `printf own:; /usr/bin/printenv ${field}; true`;
+			const invocation = { ...fixture.invocation({ command }).process!, environment };
+			const session = await fixture.backend.open({ sourceRoot: fixture.workspace, workspace, invocation, scope: { sessionID: "literal", turnID: "one" } }); sessions.push(session);
+			const actual = await executeProcess({ ...fixture, environment }, session.executor, command);
+			expect(actual, JSON.stringify({ literal, actual })).toEqual({ exitCode: 0, output: `${field === "argv" ? "" : "own:"}${literal}\n` });
+		}
+	});
+});
+
 nativeTest.for(["path", "nested", "script", "alias", "absolute", "argv0", "fd", "unlinked", "thread", "failed"])("exposes and adopts a first unseen child (%s)", { timeout: 30_000 }, async (mode, { benchmark }) => {
 	const fixture = await benchmark("pi-first-child-", "git"), directory = mode === "path" ? "" : "nested";
 	await mkdir(path.join(fixture.workspace, "nested"));
