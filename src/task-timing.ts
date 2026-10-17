@@ -328,7 +328,7 @@ export class TaskTimeline {
 		let hiddenComputeIncomplete = incomplete || !Number.isFinite(issuedAt);
 		let adoptionComplete = Number.isFinite(issuedAt) && completedAt !== undefined && Number.isFinite(completedAt) && completedAt >= issuedAt;
 		const observed: TimelineInterval[] = [];
-		const grouped = [new Map<string, TimelineInterval[]>(), new Map<string, TimelineInterval[]>()];
+		const grouped = new Map<string, TimelineInterval[]>();
 		const attributed = new Map<string, { interval: TimelineInterval; producer?: ComputationProducer }[]>();
 		const modes = new Map<string, ModeComputationTiming>();
 		const credit = (producer: ComputationProducer | null | undefined, duration: number): void => {
@@ -356,11 +356,9 @@ export class TaskTimeline {
 			if (adoptionComplete) for (const span of all) observed.push({ startedAt: span.startedAt + issuedAt - cutoff, completedAt: span.completedAt + issuedAt - cutoff });
 			const hidden = flags & 2 && Number.isFinite(cutoff) ? all.filter(span => span.startedAt < cutoff)
 				.map(span => ({ startedAt: span.startedAt, completedAt: Math.min(span.completedAt, cutoff) })) : [];
-			for (const [index, intervals] of [all, hidden].entries()) {
-				const group = grouped[index]!.get(owner) ?? [];
-				for (const interval of intervals) group.push(interval);
-				grouped[index]!.set(owner, group);
-			}
+			const group = grouped.get(owner) ?? [];
+			for (const interval of all) group.push(interval);
+			grouped.set(owner, group);
 			if (flags & 2) {
 				reused = true;
 				if (priorMs > 0 || all.length > 0 && !Number.isFinite(cutoff)) hiddenComputeIncomplete = true;
@@ -369,8 +367,8 @@ export class TaskTimeline {
 				attributed.set(owner, group);
 			}
 		}
-		for (const [index, groupsByOwner] of grouped.entries()) for (const all of groupsByOwner.values()) totals[index]! += unionDuration(all);
-		for (const spans of attributed.values()) attributeUnion(spans, credit, producerKey);
+		for (const all of grouped.values()) totals[0]! += unionDuration(all);
+		for (const spans of attributed.values()) totals[1]! += attributeUnion(spans, credit, producerKey);
 		const hiddenByMode = Object.freeze([...modes.values()].map(value => Object.freeze(value)));
 		const adoption = complete && adoptionComplete ? exclusiveIntervals(new TimelineInterval(issuedAt, completedAt!), observed) : undefined;
 		if (adoption) { for (const interval of adoption) this.adoptionWaits?.push(interval); } else this.adoptionWaits = undefined;
@@ -483,19 +481,21 @@ function computationProducer(computation: TimelineInterval): ComputationProducer
 
 /** The same owner union as H; an overlapping segment with conflicting or missing provenance stays unassigned. */
 function attributeUnion<T>(spans: readonly { interval: TimelineInterval; producer?: T }[],
-	credit: (producer: T, duration: number) => void, keyOf: (producer: T) => unknown): void {
+	credit: (producer: T, duration: number) => void, keyOf: (producer: T) => unknown): number {
 	const points = spans.flatMap(({ interval, producer }) => [
 		{ at: interval.startedAt, delta: 1, producer }, { at: interval.completedAt, delta: -1, producer },
 	]).sort((left, right) => left.at - right.at);
 	const active = new Map<unknown, { producer: T; count: number }>();
-	let previous = 0, unknown = 0;
+	let previous = 0, unknown = 0, total = 0;
 	for (const point of points) {
+		if (point.at > previous && (unknown > 0 || active.size)) total += point.at - previous;
 		if (point.at > previous && unknown === 0 && active.size === 1) credit(active.values().next().value!.producer, point.at - previous);
 		previous = point.at;
 		if (!point.producer) { unknown += point.delta; continue; }
 		const key = keyOf(point.producer), count = (active.get(key)?.count ?? 0) + point.delta;
 		if (count) active.set(key, { producer: point.producer, count }); else active.delete(key);
 	}
+	return total;
 }
 
 function exclusiveIntervals(interval: TimelineInterval, shared: readonly TimelineInterval[]): TimelineInterval[] {
