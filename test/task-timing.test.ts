@@ -184,6 +184,7 @@ describe("persisted computation evidence", () => {
 			[{ ...root, spans: [{ startedAt: 0, completedAt: 20 }] }],
 			[{ ...root, spans: [{ startedAt: 10, completedAt: 51 }] }],
 			[{ ...root, clock: undefined }],
+			[{ ...root, groups: new Array(1) }],
 			[root, root], [{ ...root, completedAt: -1 }],
 			[{ ...root, startedAt: NaN }],
 			[{ ...root, timeOrigin: NaN }],

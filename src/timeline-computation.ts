@@ -33,12 +33,14 @@ export interface SerializedTimelineNode {
 	}[];
 }
 
+const INPUT_FLAGS = ["owned", "reused", "overhead", "computeUncertain"] as const;
+
 /** Validate complete telemetry and order dependencies before consumers; invalid evidence does not invalidate replay. */
 export function normalizeTimelineComputation(value: unknown): SerializedTimelineComputation | undefined {
 	try {
 		if (!record(value) || ![1, 2, 3].includes(value.version as number) || !identity(value.root) || !Array.isArray(value.nodes) ||
 			!value.nodes.length) return undefined;
-		const nodes: SerializedTimelineNode[] = [], byID = new Map<string, SerializedTimelineNode>();
+		const byID = new Map<string, SerializedTimelineNode>();
 		const origins = new Map<string, number>();
 		for (const raw of value.nodes) {
 			if (!record(raw) || !identity(raw.id) || !identity(raw.clock) || byID.has(raw.id) || !endpoints(raw) ||
@@ -49,17 +51,10 @@ export function normalizeTimelineComputation(value: unknown): SerializedTimeline
 				origins.set(raw.clock, raw.timeOrigin as number);
 			}
 			let producer: SerializedTimelineNode["producer"];
-			let calculation: SerializedTimelineNode["spans"];
-			if (raw.spans !== undefined) {
-				if (!Array.isArray(raw.spans)) return undefined;
-				const parts: NonNullable<SerializedTimelineNode["spans"]>[number][] = [];
-				for (const part of raw.spans) {
-					if (!record(part) || !endpoints(part) || (part.startedAt as number) < (raw.startedAt as number) ||
-						(part.completedAt as number) > (raw.completedAt as number)) return undefined;
-					parts.push(Object.freeze({ startedAt: part.startedAt as number, completedAt: part.completedAt as number }));
-				}
-				calculation = Object.freeze(parts);
-			}
+			const calculation = records(raw.spans, part => {
+				if (!endpoints(part) || part.startedAt < raw.startedAt || part.completedAt > raw.completedAt) throw new Error();
+				return { startedAt: part.startedAt, completedAt: part.completedAt };
+			});
 			if (raw.producer !== undefined) {
 				if (!record(raw.producer) || !identity(raw.producer.source) ||
 					raw.producer.mode !== undefined && !identity(raw.producer.mode) || raw.producer.id !== undefined && !identity(raw.producer.id)) return undefined;
@@ -68,40 +63,30 @@ export function normalizeTimelineComputation(value: unknown): SerializedTimeline
 			}
 			let aliases: readonly string[] | undefined;
 			if (raw.groups !== undefined) {
-				if (!Array.isArray(raw.groups) || !raw.groups.every(identity)) return undefined;
+				if (!Array.isArray(raw.groups)) return undefined;
 				aliases = Object.freeze([...new Set<string>(raw.groups)]);
+				if (!aliases.every(identity)) return undefined;
 			}
-			const inputs: NonNullable<SerializedTimelineNode["inputs"]>[number][] = [];
-			if (raw.inputs !== undefined) {
-				if (!Array.isArray(raw.inputs)) return undefined;
-				for (const input of raw.inputs) {
-					if (!record(input) || !identity(input.id) || ["owned", "reused", "overhead", "computeUncertain"].some(
-						key => input[key] !== undefined && typeof input[key] !== "boolean")) return undefined;
-					const shared: { readonly clock: string; readonly startedAt: number; readonly completedAt: number }[] = [];
-					if (input.shared !== undefined) {
-						if (!Array.isArray(input.shared)) return undefined;
-						for (const span of input.shared) {
-							if (!record(span) || !identity(span.clock) || !endpoints(span)) return undefined;
-							shared.push(Object.freeze({ clock: span.clock, startedAt: span.startedAt as number, completedAt: span.completedAt as number }));
-						}
-					}
-					inputs.push(Object.freeze({ id: input.id, ...(input.owned ? { owned: true as const } : {}),
-						...(input.reused ? { reused: true as const } : {}), ...(input.overhead ? { overhead: true as const } : {}),
-						...(input.computeUncertain ? { computeUncertain: true as const } : {}),
-						...(input.shared !== undefined ? { shared: Object.freeze(shared) } : {}) }));
-				}
-			}
-			const node = Object.freeze({ id: raw.id, clock: raw.clock, startedAt: raw.startedAt as number, completedAt: raw.completedAt as number,
+			const inputs = records(raw.inputs, input => {
+				if (!identity(input.id) || INPUT_FLAGS.some(key => input[key] !== undefined && typeof input[key] !== "boolean")) throw new Error();
+				const shared = records(input.shared, span => {
+					if (!identity(span.clock) || !endpoints(span)) throw new Error();
+					return { clock: span.clock, startedAt: span.startedAt, completedAt: span.completedAt };
+				});
+				return { id: input.id, ...Object.fromEntries(INPUT_FLAGS.filter(key => input[key]).map(key => [key, true])),
+					...(shared ? { shared } : {}) };
+			});
+			const node = Object.freeze({ id: raw.id, clock: raw.clock, startedAt: raw.startedAt, completedAt: raw.completedAt,
 				...(raw.timeOrigin !== undefined ? { timeOrigin: raw.timeOrigin as number } : {}),
 				...(calculation ? { spans: calculation } : {}),
 				...(raw.priorMs !== undefined ? { priorMs: raw.priorMs as number } : {}), ...(producer ? { producer } : {}),
 				...(aliases?.length ? { groups: aliases } : {}), ...(raw.incomplete ? { incomplete: true as const } : {}),
-				...(inputs.length ? { inputs: Object.freeze(inputs) } : {}) });
-			nodes.push(node); byID.set(node.id, node);
+				...(inputs?.length ? { inputs } : {}) });
+			byID.set(node.id, node);
 		}
 		if (!byID.has(value.root)) return undefined;
 		const owned = new Map<string, string>();
-		for (const node of nodes) for (const input of node.inputs ?? []) {
+		for (const node of byID.values()) for (const input of node.inputs ?? []) {
 			if (!byID.has(input.id)) return undefined;
 			if (input.owned) {
 				if (owned.has(input.id) && owned.get(input.id) !== node.id) return undefined;
@@ -109,11 +94,22 @@ export function normalizeTimelineComputation(value: unknown): SerializedTimeline
 			}
 		}
 		const ordered = dependencyOrder([byID.get(value.root)!], node => [...node.inputs ?? []].reverse().map(input => byID.get(input.id)));
-		if (!ordered || ordered.length !== nodes.length) return undefined;
+		if (!ordered || ordered.length !== byID.size) return undefined;
 		return Object.freeze({ version: value.version as 1 | 2 | 3, root: value.root, nodes: Object.freeze(ordered) });
 	} catch { return undefined; }
 }
 
+function records<Value extends object>(value: unknown, normalize: (item: Record<string, unknown>) => Value): readonly Readonly<Value>[] | undefined {
+	if (value === undefined) return undefined;
+	if (!Array.isArray(value)) throw new Error();
+	return Object.freeze(Array.from(value, item => {
+		if (!record(item)) throw new Error();
+		return Object.freeze(normalize(item));
+	}));
+}
+
 function identity(value: unknown): value is string { return typeof value === "string" && value.length > 0 && !value.includes("\0"); }
 function duration(value: unknown): value is number { return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= Number.MAX_SAFE_INTEGER; }
-function endpoints(value: Record<string, unknown>): boolean { return duration(value.startedAt) && duration(value.completedAt) && value.completedAt >= value.startedAt; }
+function endpoints(value: Record<string, unknown>): value is Record<string, unknown> & Pick<SerializedTimelineNode, "startedAt" | "completedAt"> {
+	return duration(value.startedAt) && duration(value.completedAt) && value.completedAt >= value.startedAt;
+}
