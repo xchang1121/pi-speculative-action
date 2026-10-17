@@ -1405,9 +1405,19 @@ class PatternBindingAnalysis {
 			for (const source of sources) group.sources.add(source);
 			group.members.push([decodePath(encoded), binding, rows]);
 		}
-		return groups.map(({ members }) => ({ targetPaths: members.map(([targetPath]) => targetPath),
-			values: [...uniqueBy(joinBindingRows(members.map(([, , rows]) => rows)).map(row => row.values), stableStringify)],
-			counts: members.length === 1 ? members[0]![1].variantCounts : undefined }));
+		return groups.map(({ members }) => {
+			const values = [...uniqueBy(joinBindingRows(members.map(([, , rows]) => rows)).map(row => row.values), stableStringify)];
+			// Exact, injective fields identify joint choices; agreeing marginals count the same observations once.
+			const evidence = members.flatMap(([, binding], member) => {
+				if (!binding.variantCounts || members.length > 1 && binding.type === "near") return [];
+				const keys = values.map(value => stableStringify(value[member]));
+				if (new Set(keys).size !== values.length) return [];
+				const indices = new Map(this.bindingValues(binding, context).map((value, index) => [stableStringify(value), index]));
+				return [Object.fromEntries(keys.map((key, index) => [index, variantCount(binding.variantCounts!, indices.get(key)!)]))];
+			});
+			return { targetPaths: members.map(([targetPath]) => targetPath), values,
+				counts: evidence.every(counts => sameValue(counts, evidence[0])) ? evidence[0] : undefined };
+		});
 	}
 
 	candidateBindings(

@@ -39,6 +39,10 @@ test.each([
 ] satisfies PatternAwareBinding[])("keeps each location's path and line together through $type", binding => {
 	expect(applyBindingsVariants({ '["path"]': binding, '["offset"]': { type: "near", source: eachLocation("line"), tolerance: 150 } }, [locations]))
 		.toEqual([{ path: "src/a.ts", offset: 3 }, { path: "src/b.ts", offset: 17 }]);
+	expect(applyBindingsVariants({ '["path"]': { ...binding, variantCounts: { 1: 8 } },
+		'["offset"]': { ...eachLocation("line"), variantCounts: { 1: 8 } } }, [locations], 1)).toEqual([{ path: "src/b.ts", offset: 17 }]);
+	expect(applyBindingsVariants({ '["path"]': { ...binding, variantCounts: { 1: 8 } },
+		'["offset"]': { type: "near", source: eachLocation("line"), tolerance: 150, variantCounts: { 0: 8 } } }, [locations], 1)).toEqual([{ path: "src/b.ts", offset: 17 }]);
 });
 
 test.each([
