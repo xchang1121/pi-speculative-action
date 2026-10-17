@@ -18,7 +18,7 @@ export interface CandidateLookup<Entry> {
 
 interface IndexedEntry<Entry> {
 	readonly entry: Entry;
-	readonly memberships: Array<readonly [Map<string, Set<IndexedEntry<Entry>>>, string]>;
+	readonly memberships: Set<string>;
 	inputs?: boolean;
 	recency: number;
 	result?: ResultCacheEvidence;
@@ -27,7 +27,7 @@ interface IndexedEntry<Entry> {
 interface IndexedScope<Entry> {
 	readonly entries: Map<string, IndexedEntry<Entry>>;
 	readonly pending: Set<IndexedEntry<Entry>>;
-	readonly exact: Map<string, Set<IndexedEntry<Entry>>>;
+	/** Tagged exact/input/view keys and JSON projection keys occupy disjoint namespaces. */
 	readonly partitions: Map<string, Set<IndexedEntry<Entry>>>;
 }
 
@@ -111,18 +111,16 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 		const indexed = this.record(scope, entry), state = this.scopes.get(scope);
 		if (!indexed || !state || !resources.length) return;
 		const keys = new Set(resources.flatMap(resource => [inputPartition(resource), inputPartition(resource, true)]));
-		this.unindex(indexed, (index, key) => index === state.partitions && keys.has(key));
+		this.unindex(state, indexed, key => keys.has(key));
 	}
 
 	/** Sealed queries remain addressable after their reconstruction inputs are revoked. */
 	indexView(scope: Scope, entry: Entry, actionKey: string, retained: boolean): void {
 		const indexed = this.record(scope, entry), state = this.scopes.get(scope);
 		if (!indexed || !state) return;
-		const key = `view:${actionKey}`, members = state.partitions.get(key) ?? new Set();
-		if (!retained) this.unindex(indexed, (index, name) => index === state.partitions && name === key);
-		else if (!members.has(indexed)) {
-			members.add(indexed); state.partitions.set(key, members); indexed.memberships.push([state.partitions, key]);
-		}
+		const key = `view:${actionKey}`;
+		if (retained) this.index(state, indexed, [key]);
+		else this.unindex(state, indexed, name => name === key);
 		this.notify(scope);
 	}
 
@@ -131,7 +129,7 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 		if (!indexed || !state) return false;
 		state.entries.delete(entry.id);
 		state.pending.delete(indexed);
-		this.unindex(indexed);
+		this.unindex(state, indexed);
 		if (!state.entries.size) this.scopes.delete(scope);
 		this.notify(scope);
 		return true;
@@ -157,12 +155,7 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 		this.scopes.get(scope)!.pending.delete(indexed);
 		indexed.result ??= { segment: "cold", insertedAt: this.now(), actorHits: 0 };
 		if (shared && !indexed.inputs && (branch.inputSource || branch.reconstruct)) {
-			const partitions = this.scopes.get(scope)!.partitions;
-			for (const key of new Set(branch.inputResources?.map(input => inputPartition(input.path, input.descendants)))) {
-				const members = partitions.get(key) ?? new Set();
-				members.add(indexed); partitions.set(key, members);
-				indexed.memberships.push([partitions, key]);
-			}
+			this.index(this.scopes.get(scope)!, indexed, branch.inputResources?.map(input => inputPartition(input.path, input.descendants)) ?? []);
 			indexed.inputs = true;
 		}
 		this.notify(scope);
@@ -203,16 +196,21 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 		return record?.entry === entry ? record : undefined;
 	}
 
-	private unindex(indexed: IndexedEntry<Entry>, remove?: (index: Map<string, Set<IndexedEntry<Entry>>>, key: string) => boolean): void {
-		let kept = 0;
-		for (const membership of indexed.memberships) {
-			const [index, key] = membership;
-			if (remove && !remove(index, key)) { indexed.memberships[kept++] = membership; continue; }
-			const members = index.get(key)!;
-			members.delete(indexed);
-			if (!members.size) index.delete(key);
+	private index(state: IndexedScope<Entry>, indexed: IndexedEntry<Entry>, keys: Iterable<string>): void {
+		for (const key of keys) {
+			const members = state.partitions.get(key) ?? new Set();
+			members.add(indexed); state.partitions.set(key, members); indexed.memberships.add(key);
 		}
-		indexed.memberships.length = kept;
+	}
+
+	private unindex(state: IndexedScope<Entry>, indexed: IndexedEntry<Entry>, remove: (key: string) => boolean = () => true): void {
+		for (const key of indexed.memberships) {
+			if (!remove(key)) continue;
+			const members = state.partitions.get(key)!;
+			members.delete(indexed);
+			if (!members.size) state.partitions.delete(key);
+			indexed.memberships.delete(key);
+		}
 	}
 
 	private inputRecords(scope: Scope, resources?: readonly string[]) {
@@ -236,7 +234,7 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 		const inputs = includeInputs ? this.inputRecords(scope, action.resources.flatMap(resource =>
 			action.resourceRoot !== undefined || path.isAbsolute(resource) ? [path.resolve(action.resourceRoot ?? "", resource)] : [])) : new Map<IndexedEntry<Entry>, number>();
 		const views = includeInputs ? state.partitions.get(`view:${action.key}`) : undefined;
-		const candidates = new Set([...(state.exact.get(action.key) ?? []), ...inputs.keys(), ...(views ?? [])]);
+		const candidates = new Set([...(state.partitions.get(`exact:${action.key}`) ?? []), ...inputs.keys(), ...(views ?? [])]);
 		for (const key of partitions) for (const indexed of state.partitions.get(key) ?? []) candidates.add(indexed);
 		const ranked: (CandidateLookup<Entry> & { readonly indexed: IndexedEntry<Entry> })[] = [];
 		for (const indexed of candidates) {
@@ -253,18 +251,13 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 	}
 
 	private add(scope: Scope, entry: Entry, partitions: readonly string[]): Entry | undefined {
-		const state: IndexedScope<Entry> = this.scopes.get(scope) ?? { entries: new Map(), pending: new Set(), exact: new Map(), partitions: new Map() };
+		const state: IndexedScope<Entry> = this.scopes.get(scope) ?? { entries: new Map(), pending: new Set(), partitions: new Map() };
 		const existing = state.entries.get(entry.id);
 		if (existing) return existing.entry;
-		const memberships = [...(entry.key ? [[state.exact, entry.key.key] as const] : []), ...partitions.map((key) => [state.partitions, key] as const)];
-		const indexed: IndexedEntry<Entry> = { entry, memberships, recency: this.sequence++ };
+		const indexed: IndexedEntry<Entry> = { entry, memberships: new Set(), recency: this.sequence++ };
 		state.entries.set(entry.id, indexed);
 		state.pending.add(indexed);
-		for (const [index, key] of memberships) {
-			const members = index.get(key) ?? new Set();
-			members.add(indexed);
-			index.set(key, members);
-		}
+		this.index(state, indexed, [...(entry.key ? [`exact:${entry.key.key}`] : []), ...partitions]);
 		this.scopes.set(scope, state);
 		this.notify(scope);
 		return undefined;
