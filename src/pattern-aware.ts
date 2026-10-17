@@ -1258,14 +1258,12 @@ class PatternBindingAnalysis {
 
 	private valueIndex(value: unknown) {
 		return this.memo(value, "value-index", () => {
-			const index = new Map<string, { leaves: PatternAwarePath[]; collections: CollectionLocation[] }>();
+			const index = new Map<string, PatternAwarePath[]>();
 			for (const [path, item] of this.leaves(value)) {
 				const key = stableStringify(item);
 				let locations = index.get(key);
-				if (!locations) index.set(key, locations = { leaves: [], collections: [] });
-				locations.leaves.push(path);
-				const collection = path.findIndex(segment => typeof segment === "number");
-				if (collection >= 0) locations.collections.push({ path: path.slice(0, collection), itemPath: path.slice(collection + 1) });
+				if (!locations) index.set(key, locations = []);
+				locations.push(path);
 			}
 			return index;
 		});
@@ -1448,9 +1446,7 @@ class PatternBindingAnalysis {
 	private correlateLocations(binding: PatternAwareBinding): PatternAwareBinding {
 		return this.memo(binding, "correlated-locations", () => {
 			if (binding.type === "event" && binding.field === "outputLocations") {
-				const item = binding.path.findIndex(segment => typeof segment === "number");
-				if (item >= 0) return { type: "each", relativeEvent: binding.relativeEvent, field: binding.field,
-					path: binding.path.slice(0, item), itemPath: binding.path.slice(item + 1) };
+				return collectionBinding(binding) ?? binding;
 			}
 			const children = bindingChildren(binding), sources = children.map(source => this.correlateLocations(source));
 			if (sources.every((source, index) => source === children[index])) return binding;
@@ -1471,13 +1467,17 @@ class PatternBindingAnalysis {
 		const spliceSources: Array<{ readonly binding: PatternAwareBinding; readonly value: string }> = [];
 		const targetKey = stableStringify(target), tokens = includeComposites && !targetIsPath && typeof target === "string" ? pathTokens(target) : [];
 		for (const [relativeEvent, field, value] of reverseContextFields(context)) {
-			const indexed = includeComposites ? undefined : this.valueIndex(value).get(targetKey);
+			const indexed = () => this.valueIndex(value).get(targetKey) ?? [];
 			// A reported location binds by item, not position, so its path and line are applied together.
-			const collections = () => collectionBindings(
-				(includeComposites ? this.valueIndex(value).get(targetKey) : indexed)?.collections ?? [], relativeEvent, field, target, targetIsPath);
+			function* collections() {
+				for (const path of indexed()) {
+					const binding = collectionBinding({ relativeEvent, field, path });
+					if (binding && !(targetIsPath && typeof target === "string" && !isPathSource(field, [...binding.path, ...binding.itemPath], target))) yield binding;
+				}
+			}
 			if (field === "outputLocations") yield* collections();
 			if (!includeComposites) {
-				for (const sourcePath of indexed?.leaves ?? []) {
+				for (const sourcePath of indexed()) {
 					if (targetIsPath && typeof target === "string" && !isPathSource(field, sourcePath, target)) continue;
 					yield { type: "event", relativeEvent, field, path: sourcePath };
 				}
@@ -1486,10 +1486,10 @@ class PatternBindingAnalysis {
 					const direct: PatternAwareBinding = { type: "event", relativeEvent, field, path: sourcePath };
 					const pathSource = typeof source === "string" && isPathSource(field, sourcePath, source);
 					if (sameValue(source, target) && (!targetIsPath || pathSource)) yield direct;
-					const item = sourcePath.findIndex((segment) => typeof segment === "number");
-					if (targetIsLine && field === "outputLocations" && sourcePath.at(-1) === "line" && item >= 0 && typeof source === "number" &&
+					if (targetIsLine && field === "outputLocations" && sourcePath.at(-1) === "line" && typeof source === "number" &&
 						typeof target === "number" && source !== target && Math.abs(source - target) <= NEAR_LINE_TOLERANCE) {
-						yield { type: "near", tolerance: NEAR_LINE_TOLERANCE, source: { type: "each", relativeEvent, field, path: sourcePath.slice(0, item), itemPath: sourcePath.slice(item + 1) } };
+						const collection = collectionBinding(direct);
+						if (collection) yield { type: "near", tolerance: NEAR_LINE_TOLERANCE, source: collection };
 					}
 					if (typeof source !== "string" || typeof target !== "string") continue;
 					// A path target templates only a rewrite of another file's name; other targets never template a bare name.
@@ -1708,19 +1708,10 @@ function* reverseContextFields(
 	}
 }
 
-type CollectionLocation = { readonly path: PatternAwarePath; readonly itemPath: PatternAwarePath };
-
-function* collectionBindings(
-	items: ReadonlyArray<CollectionLocation>,
-	relativeEvent: number,
-	field: PatternAwareDependencySource["field"],
-	target: unknown,
-	targetIsPath: boolean,
-): Generator<PatternAwareBinding, undefined> {
-	for (const item of items) {
-		if (targetIsPath && typeof target === "string" && !isPathSource(field, [...item.path, ...item.itemPath], target)) continue;
-		yield { type: "each", relativeEvent, field, path: item.path, itemPath: item.itemPath };
-	}
+function collectionBinding(binding: PatternAwareDependencySource) {
+	const item = binding.path.findIndex(segment => typeof segment === "number");
+	return item < 0 ? undefined : { type: "each" as const, relativeEvent: binding.relativeEvent, field: binding.field,
+		path: binding.path.slice(0, item), itemPath: binding.path.slice(item + 1) };
 }
 
 function structuredOutput(value: unknown): unknown {
