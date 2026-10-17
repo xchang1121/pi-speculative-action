@@ -1101,15 +1101,11 @@ export class PatternAwareStore {
 	private portable(pattern: MutablePattern) {
 		const free = (binding: PatternAwareBinding, targetPath: PatternAwarePath): boolean => {
 			const text = (value: string) => !/[\\/]/u.test(value);
-			switch (binding.type) {
-				case "constant": return !requiresProvenance(targetPath, binding.value) && (typeof binding.value !== "string" || text(binding.value));
-				case "template": return text(binding.prefix) && text(binding.suffix) && free(binding.source, targetPath);
-				case "splice": return binding.parts.every(text) && binding.sources.every((source) => free(source, targetPath));
-				case "coalesce": return binding.sources.every((source) => free(source, targetPath));
-				case "join": return free(binding.left, targetPath) && free(binding.right, targetPath);
-				case "event": case "each": return true;
-				default: return free(binding.source, targetPath);
-			}
+			const own = binding.type === "constant" ? !requiresProvenance(targetPath, binding.value) && (typeof binding.value !== "string" || text(binding.value))
+				: binding.type === "template" ? text(binding.prefix) && text(binding.suffix)
+				: binding.type === "splice" ? binding.parts.every(text)
+				: binding.type === "rebase" ? text(binding.from) && text(binding.to) : true;
+			return own && bindingChildren(binding).every(source => free(source, targetPath));
 		};
 		return pattern.occurrences >= this.settings.minOccurrences && Object.entries(pattern.bindings).every(([encoded, binding]) => free(binding, decodePath(encoded)));
 	}
@@ -1436,25 +1432,25 @@ class PatternBindingAnalysis {
 		return variants;
 	}
 
-	/** Target paths bound item by item to one collection move together (a location's path with its line); the rest vary alone. */
+	/** Connected collection references form one choice, including references nested inside composite bindings. */
 	private bindingUnits(bindings: Readonly<Record<string, PatternAwareBinding>>, context: ReadonlyArray<PatternAwareEvent>) {
-		const collection = (binding: PatternAwareBinding) => binding.type === "each" ? binding : binding.type === "near" && binding.source.type === "each" ? binding.source : undefined;
-		const groups = new Map<string, Array<readonly [PatternAwarePath, PatternAwareBinding]>>();
+		const groups: Array<{ sources: Set<string>; members: Array<readonly [PatternAwarePath, PatternAwareBinding, readonly BindingRow[]]> }> = [];
 		for (const [encoded, binding] of Object.entries(bindings)) {
-			const items = collection(binding), key = items ? stableStringify([items.relativeEvent, items.field, items.path]) : encoded;
-			(groups.get(key) ?? groups.set(key, []).get(key)!).push([decodePath(encoded), binding]);
-		}
-		return [...groups.values()].map((members) => {
-			if (members.length === 1) {
-				const [[targetPath, binding]] = members as [readonly [PatternAwarePath, PatternAwareBinding]];
-				return { targetPaths: [targetPath], values: this.bindingValues(binding, context).map((value) => [value]), counts: binding.variantCounts };
+			const rows = this.bindingRows(binding, context), sources = new Set(rows.flatMap(row => [...row.sources.keys()]));
+			const connected = groups.filter(group => [...sources].some(source => group.sources.has(source)));
+			const group = connected[0] ?? { sources, members: [] };
+			if (!connected.length) groups.push(group);
+			for (const other of connected.slice(1)) {
+				group.members.push(...other.members);
+				for (const source of other.sources) group.sources.add(source);
+				groups.splice(groups.indexOf(other), 1);
 			}
-			const source = collection(members[0]![1])!, event = context[context.length + source.relativeEvent];
-			const listed = event ? getPath(event[source.field], source.path) : MISSING, rows = Array.isArray(listed) ? listed : [];
-			const values = rows.map((row) => members.map(([, binding]) => getPath(row, collection(binding)!.itemPath)))
-				.filter((row) => row.every((value) => value !== MISSING));
-			return { targetPaths: members.map(([targetPath]) => targetPath), values: [...uniqueBy(values, stableStringify)], counts: undefined };
-		});
+			for (const source of sources) group.sources.add(source);
+			group.members.push([decodePath(encoded), binding, rows]);
+		}
+		return groups.map(({ members }) => ({ targetPaths: members.map(([targetPath]) => targetPath),
+			values: [...uniqueBy(joinBindingRows(members.map(([, , rows]) => rows)).map(row => row.values), stableStringify)],
+			counts: members.length === 1 ? members[0]![1].variantCounts : undefined }));
 	}
 
 	candidateBindings(
@@ -1578,48 +1574,43 @@ class PatternBindingAnalysis {
 	}
 
 	bindingValues(binding: PatternAwareBinding, context: ReadonlyArray<PatternAwareEvent>): ReadonlyArray<unknown> {
-		return this.memo(context, binding, () => this.evaluateBindingValues(binding, context));
+		const rows = this.bindingRows(binding, context);
+		return this.memo(rows, "values", () => [...uniqueBy(rows.map(row => row.values[0]), stableStringify)]);
 	}
 
-	evaluateBindingValues(binding: PatternAwareBinding, context: ReadonlyArray<PatternAwareEvent>): ReadonlyArray<unknown> {
-		if (binding.type === "constant") return [binding.value];
-		if (binding.type === "near") return this.bindingValues(binding.source, context);
-		if (binding.type === "coalesce") {
-			for (const source of binding.sources) {
-				const values = this.bindingValues(source, context);
-				if (values.length) return values;
-			}
-			return [];
-		}
-		let values: ReadonlyArray<unknown>;
+	private bindingRows(binding: PatternAwareBinding, context: ReadonlyArray<PatternAwareEvent>): readonly BindingRow[] {
+		return this.memo(context, binding, () => this.evaluateBindingRows(binding, context));
+	}
+
+	private evaluateBindingRows(binding: PatternAwareBinding, context: ReadonlyArray<PatternAwareEvent>): readonly BindingRow[] {
+		const row = (value: unknown, sources: ReadonlyMap<string, number> = new Map()): BindingRow => ({ values: [value], sources });
+		if (binding.type === "constant") return [row(binding.value)];
 		if (binding.type === "event" || binding.type === "each") {
-			const index = context.length + binding.relativeEvent;
-			const event = context[index];
+			const event = context[context.length + binding.relativeEvent];
 			if (!event) return [];
 			const collection = getPath(event[binding.field], binding.path);
-			if (binding.type === "event") return collection === MISSING ? [] : [collection];
-			values = Array.isArray(collection)
-				? collection.map((item) => getPath(item, binding.itemPath)).filter((value) => value !== MISSING) : [];
-		} else if (binding.type === "join") {
-			const left = this.bindingValues(binding.left, context);
-			const right = this.bindingValues(binding.right, context);
-			values = left.flatMap((leftValue) =>
-				right.flatMap((rightValue) =>
-					typeof leftValue === "string" && typeof rightValue === "string" ? [joinPath(leftValue, rightValue)] : [],
-				),
-			);
-		} else if (binding.type === "splice") {
-			values = binding.sources.reduce<string[]>((texts, source, index) => texts.flatMap((text) => this.bindingValues(source, context)
-				.flatMap((value) => typeof value === "string" ? [`${text}${value}${binding.parts[index + 1]}`] : [])), [binding.parts[0]!]);
-		} else if (binding.type === "rebase") {
-			values = this.bindingValues(binding.source, context).flatMap((value) => typeof value === "string" ? rebase(value, binding.from, binding.to) : []);
-		} else if (binding.type === "template" || binding.type === "transform") {
-			values = this.bindingValues(binding.source, context).flatMap((value) =>
-				typeof value === "string" ? [binding.type === "template"
-					? `${binding.prefix}${value}${binding.suffix}` : transform(binding.operation, value)] : [],
-			);
-		} else return [];
-		return [...uniqueBy(values, stableStringify)];
+			if (binding.type === "event") return collection === MISSING ? [] : [row(collection)];
+			const key = stableStringify([binding.relativeEvent, binding.field, binding.path]);
+			return Array.isArray(collection) ? collection.flatMap((item, index) => {
+				const value = getPath(item, binding.itemPath);
+				return value === MISSING ? [] : [row(value, new Map([[key, index]]))];
+			}) : [];
+		}
+		if (binding.type === "coalesce") {
+			for (const source of binding.sources) { const rows = this.bindingRows(source, context); if (rows.length) return rows; }
+			return [];
+		}
+		const children = bindingChildren(binding).map(source => this.bindingRows(source, context));
+		if (binding.type === "near") return children[0]!;
+		return joinBindingRows(children).flatMap(({ values, sources }) => {
+			if (!values.every((value): value is string => typeof value === "string")) return [];
+			const first = values[0]!;
+			const result = binding.type === "join" ? [joinPath(first, values[1]!)]
+				: binding.type === "splice" ? [values.reduce((text, value, index) => text + value + binding.parts[index + 1], binding.parts[0]!)]
+				: binding.type === "rebase" ? rebase(first, binding.from, binding.to)
+				: [binding.type === "template" ? binding.prefix + first + binding.suffix : transform(binding.operation, first)];
+			return result.map(value => row(value, sources));
+		});
 	}
 
 	bindingMatches(binding: PatternAwareBinding, context: ReadonlyArray<PatternAwareEvent>, target: unknown) {
@@ -1680,6 +1671,22 @@ function hasSufficientBindingProvenance(bindings: Readonly<Record<string, Patter
 }
 
 const MISSING = Symbol("missing");
+
+type BindingRow = { readonly values: readonly unknown[]; readonly sources: ReadonlyMap<string, number> };
+
+/** A source row is an identity, even when two rows contain the same value. */
+function joinBindingRows(groups: readonly (readonly BindingRow[])[]): BindingRow[] {
+	return groups.reduce<BindingRow[]>((rows, group) => rows.flatMap(left => group.flatMap(right =>
+		[...right.sources].some(([source, index]) => left.sources.has(source) && left.sources.get(source) !== index) ? []
+			: [{ values: [...left.values, ...right.values], sources: new Map([...left.sources, ...right.sources]) }])),
+	[{ values: [], sources: new Map() }]);
+}
+
+function bindingChildren(binding: PatternAwareBinding): readonly PatternAwareBinding[] {
+	return binding.type === "constant" || binding.type === "event" || binding.type === "each" ? []
+		: binding.type === "coalesce" || binding.type === "splice" ? binding.sources
+		: binding.type === "join" ? [binding.left, binding.right] : [binding.source];
+}
 
 export function applyBindings(
 	bindings: Readonly<Record<string, PatternAwareBinding>>,
@@ -1818,9 +1825,7 @@ function analyzeBindings(bindings: Readonly<Record<string, PatternAwareBinding>>
 				field: node.field, path: node.path, ...(node.type === "each" ? { itemPath: node.itemPath } : {}) });
 			else {
 				analysis.complexity++;
-				if (node.type === "coalesce" || node.type === "splice") node.sources.forEach(visit);
-				else if (node.type === "join") { visit(node.left); visit(node.right); }
-				else visit(node.source);
+				bindingChildren(node).forEach(visit);
 			}
 		};
 		visit(binding);
