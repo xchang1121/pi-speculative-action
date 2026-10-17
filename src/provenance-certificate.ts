@@ -204,18 +204,12 @@ export interface ProcessPrototypeInput extends Omit<ExecPrototype, "argvDigest" 
 	readonly environment: Readonly<Record<string, string | undefined>>;
 }
 
-/** A shell's own bookkeeping: its nesting level differs between a command it execs in place and one it forks, and `cd <cwd> &&`
- * sets the previous directory. Only a shell, or a tool printing its environment, reads it back. */
-const SHELL_BOOKKEEPING = new Set(["SHLVL", "OLDPWD"]), READS_SHELL_BOOKKEEPING = /\/(?:bash|sh|dash|zsh|ksh|env|printenv)$/;
-
 export function createExecPrototype(input: ProcessPrototypeInput): ExecPrototype {
 	const { argv, ...identity } = input;
-	const rawEnvironment = READS_SHELL_BOOKKEEPING.test(input.executablePath) ? input.environment
-		: Object.fromEntries(Object.entries(input.environment).filter(([name]) => !SHELL_BOOKKEEPING.has(name)));
 	const argvDigest = sha256Digest(argv instanceof Uint8Array ? argv : Buffer.from(stableStringify(argv), "utf8"));
 	return normalizePrototype({
 		...identity, argvDigest, environmentComplete: true,
-		environment: Object.entries(rawEnvironment).map(([name, value]): SemanticEnvironmentEntry =>
+		environment: Object.entries(input.environment).map(([name, value]): SemanticEnvironmentEntry =>
 			value === undefined ? { name, present: false } : { name, present: true, valueDigest: sha256Digest(Buffer.from(value, "utf8")) },
 		),
 	});

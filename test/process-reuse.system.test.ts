@@ -3,7 +3,7 @@ import * as filesystem from "node:fs/promises";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, expect, test, vi } from "vitest";
-import { ArtifactCAS, captureFileDependency, ProcessReusePlanner, ProvenanceCertificateStore, referencedArtifacts, sealProcessCertificate, sha256Digest,
+import { ArtifactCAS, captureFileDependency, createExecPrototype, processWeakKey, ProcessReusePlanner, ProvenanceCertificateStore, referencedArtifacts, sealProcessCertificate, sha256Digest,
 	type ProcessProvenanceCertificate, type VerifiedArtifactClosure } from "../src/process-reuse.ts";
 import { ProcessHandoffOwnership, ProcessHandoffRegistry } from "../src/process-handoff.ts";
 import { effectCommitFailure } from "../src/effect-transaction.ts";
@@ -27,6 +27,13 @@ const storeAt = (...args: ConstructorParameters<typeof ProvenanceCertificateStor
 const hold = () => { const pause = gated(); cleanup.push(pause.release); return pause; };
 const track = <T>(pending: Promise<T>): Promise<T> => { const settled = pending.catch(() => undefined); cleanup.push(() => settled); return pending; };
 const peer = (...args: Parameters<typeof storePeer>) => { const owner = storePeer(...args); cleanup.push(() => { owner.child.kill(); return owner.completed.catch(() => undefined); }); return owner; };
+
+test.each(["MODE", "SHLVL", "OLDPWD"])("includes %s in an arbitrary executable's identity", name => {
+	const keys = [undefined, "", "before", "after"].map(value => processWeakKey(createExecPrototype({
+		...PROCESS_CERTIFICATE.prototype, argv: ["tool"], environment: { [name]: value },
+	})));
+	expect(new Set(keys).size).toBe(4);
+});
 
 test.skipIf(process.platform !== "linux").each(["fresh", "changed-before", "changed-after", "revoked", "budget"])("keeps input loans owned through transfer and exact invalidation (%s)", async mode => {
 	const input = path.join(await directories.create(), "input"); await writeFile(input, "original");
