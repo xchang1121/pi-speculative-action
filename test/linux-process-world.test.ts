@@ -37,7 +37,17 @@ vi.mock("node:child_process", { spy: true });
 vi.mock("node:fs/promises", { spy: true });
 const nativeTest = process.arch === "x64" ? test : test.skip;
 
-const rightsHelpers = `${cHeaders("fcntl.h sys/socket.h string.h unistd.h")}
+const processChecks = `${cHeaders("sys/wait.h string.h unistd.h")}
+static inline int wait_child(pid_t child) {
+	int status; return waitpid(child, &status, 0) != child || status;
+}
+static inline int read_text(int fd, void *bytes, const char *expected) {
+	size_t length = strlen(expected);
+	return read(fd, bytes, length) != (ssize_t)length || memcmp(bytes, expected, length);
+}`;
+
+const rightsHelpers = `${processChecks}
+${cHeaders("fcntl.h sys/socket.h")}
 static inline int pass(int fd, const char *text, int length, const int *rights, int count, int flags) {
 	char control[CMSG_SPACE(8 * sizeof(int))] = {0}; struct iovec vector = {(void *)text, (size_t)length};
 	struct mmsghdr message = {.msg_hdr = {.msg_iov = &vector, .msg_iovlen = 1, .msg_control = control, .msg_controllen = CMSG_SPACE((size_t)count * sizeof(int))}};
@@ -706,7 +716,8 @@ nativeTest.for(["sample", "file", "dup", "threads", "limit", "metadata", "identi
 		const [mode, transport, queue] = scenario.split(":"), unavailable = transport === "unavailable", synchronous = transport === "sync", fixture = await benchmark("pi-prefix-process-", "git", { processImages: unavailable ? false : undefined });
 		const descendant = mode === "pipe" || mode === "socket" || mode === "eventfd", complete = descendant || mode === "identity", discarded = queue?.startsWith("discard"), cyclic = queue === "discard-cycle", capturable = !unavailable;
 		await compileBenchmarkHelper(fixture.workspace, "worker", { arguments: ["-pthread"], code: `#define _GNU_SOURCE
-${cHeaders("unistd.h sys/syscall.h sys/random.h sys/resource.h sys/stat.h sys/wait.h sys/prctl.h pthread.h stdio.h stdint.h fcntl.h string.h")}
+${cHeaders("sys/syscall.h sys/random.h sys/resource.h sys/stat.h sys/prctl.h pthread.h stdio.h stdint.h fcntl.h")}
+${processChecks}
 static void *thread(void *unused) { return unused; }
 int main(void) {
  ${mode === "sample" ? 'char name[17]={0}; if(prctl(PR_GET_NAME,name) || strcmp(name,"worker")) return 80;' : ""}
@@ -716,7 +727,7 @@ int main(void) {
  ${descendant ? "pid_t child = fork(); if (child < 0) return 78; if (!child) { if (close(3)) _exit(79);" : ""}
  volatile uint64_t hash = 1; for (unsigned i = 0; i < ${synchronous ? 1500000000 : 800000000}; i++) hash = hash * 33 + i;
  ${descendant ? `if (write(4, &hash, sizeof(hash)) != sizeof(hash) || close(4)) _exit(79); _exit(0); }
- uint64_t hash; int status; if (close(4) || read(3, &hash, sizeof(hash)) != sizeof(hash) || close(3) || waitpid(child, &status, 0) != child || status) return 79;` : ""}
+ uint64_t hash; if (close(4) || read(3, &hash, sizeof(hash)) != sizeof(hash) || close(3) || wait_child(child)) return 79;` : ""}
  ${mode === "file" || mode === "dup" ? "if (close(fd)) return 77;" : ""}
  ${mode === "metadata" ? "struct stat state; if (fstat(STDOUT_FILENO, &state) || !state.st_ino) return 76;" : ""}
  ${mode === "threads" ? "pthread_t worker; void *result; if (pthread_create(&worker, NULL, thread, (void *)37) || pthread_join(worker, &result) || result != (void *)37) return 72;" : "(void)thread;"}
@@ -735,7 +746,7 @@ int main(void) { int fds[2]; if (${mode === "eventfd" ? "(fds[0] = eventfd(0, 0)
  if (${discarded ? "reference < 0 || " : ""}pass(queues[0], "x", 1, &reference, ${discarded ? 1 : 0}, 0)${discarded ? " || close(reference)" : ""}) return 63;` : ""}
  ${queue === "external" ? `int gate[2]; char byte; if (wrap_queue(wrap_queue(eventfd(5, EFD_CLOEXEC), 0), 0) < 0 || pipe2(gate, O_CLOEXEC)) return 64;
  pid_t child = fork(); if (child < 0) return 65;
- if (child) { close(3); close(4); close(gate[0]); if (write(gate[1], "x", 1) != 1) return 66; close(gate[1]); int status; return waitpid(child, &status, 0) != child || status; }
+ if (child) { close(3); close(4); close(gate[0]); if (write(gate[1], "x", 1) != 1) return 66; close(gate[1]); return wait_child(child); }
  close(gate[1]); if (read(gate[0], &byte, 1) != 1) return 66; close(gate[0]);` : ""}
  close_range(${queue === "inherited" || discarded ? 7 : 5}, ~0U, 0); execlp("worker", "worker", NULL); return 62; }
 ` });
@@ -869,7 +880,7 @@ int main(${alias ? "int argc, char **argv" : "void"}) {
  ${alias ? "if (dup3(received, 5, 0) != 5 || fcntl(received, F_DUPFD_CLOEXEC, 12) != 12 || dup3(received, 13, 0) != 13 || close(received) || fcntl(5, F_SETFL, O_APPEND)) return 86; received = 5;" : ""}` : ""}
  if (${mode === "eventfd" ? "read(3, &counter, 8) != 8 || counter != 1" : "read(3, input, 1) != 1"}) return 71;
  ${stale ? "if (byte == 'x') input[0] = 'D';" : ""}
- ${mode === "handles" ? `char bytes[2]; if (read(5, bytes, 2) != 2 || memcmp(bytes, "ab", 2) || lseek(6, 0, SEEK_CUR) != 2 || lseek(7, 0, SEEK_CUR)) return 83;
+ ${mode === "handles" ? `char bytes[2]; if (read_text(5, bytes, "ab") || lseek(6, 0, SEEK_CUR) != 2 || lseek(7, 0, SEEK_CUR)) return 83;
  if (fcntl(5, F_DUPFD_CLOEXEC, 12) != 12 || close(5) || close(6) || dup2(7, 6) != 6 || close(7) ||
      dup2(3, 8) != 8 || close(3) || dup2(4, 3) != 3 || close(4) || fcntl(8, F_SETFD, FD_CLOEXEC) ||
      fcntl(12, F_SETFL, O_APPEND)) return 84;` : ""}
@@ -1185,10 +1196,10 @@ ${enumerate ? `static int count_directory(int fd) {
 int main(int argc, char **argv) {
 	if (argc != 2 || strcmp(argv[0], "bound-name") || strcmp(argv[1], "private argument") ||
 		!getenv("BOUND_SECRET") || strcmp(getenv("BOUND_SECRET"), "private value")) return 71;
-	${mode === "native" ? `{ int pair[2], status; if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair)) return 201;
+	${mode === "native" ? `{ int pair[2]; if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair)) return 201;
 	pid_t child = fork(); if (child < 0) return 202;
 	if (!child) _exit(fcntl(pair[0], F_SETFL, O_RDWR | O_NONBLOCK) ? 203 : 0);
-	if (waitpid(child, &status, 0) != child || status) return 204;
+	if (wait_child(child)) return 204;
 	int flags = fcntl(pair[0], F_GETFL), peer = fcntl(pair[1], F_GETFL);
 	if (flags < 0 || peer < 0 || !(flags & O_NONBLOCK) || (peer & O_NONBLOCK) || close(pair[0]) || close(pair[1])) return 205;
 	}` : ""}
@@ -1226,7 +1237,7 @@ int main(int argc, char **argv) {
 	int ep = epoll_create1(EPOLL_CLOEXEC); struct epoll_event registration = {.events = EPOLLIN | EPOLLONESHOT, .data.u64 = 42}, readyEvent;
 	if (ep < 0 || epoll_ctl(ep, EPOLL_CTL_ADD, 21, &registration) || epoll_wait(ep, &readyEvent, 1, 0) != 1 || readyEvent.events != EPOLLIN || readyEvent.data.u64 != 42 || epoll_wait(ep, &readyEvent, 1, 0) != 0) return 140; close(ep);
 	if (fcntl(20, F_SETFL, 0) || (fcntl(21, F_GETFL) & O_NONBLOCK) || fcntl(21, F_SETFL, O_NONBLOCK) || read(21, count, 8) != 8 || count[0] != ${semaphore ? 1 : 2}) return 141;
-	${semaphore ? 'pid_t forked = fork(); if (forked < 0) return 142; if (!forked) return read(20, count, 8) != 8 || count[0] != 1; int waited; if (waitpid(forked, &waited, 0) != forked || waited) return 143;' : ''}
+	${semaphore ? 'pid_t forked = fork(); if (forked < 0) return 142; if (!forked) return read(20, count, 8) != 8 || count[0] != 1; if (wait_child(forked)) return 143;' : ''}
 	count[0] = 7; if (write(20, count, 8) != 8) return 144;
 	count[0] = 1; if (write(22, count, 8) != 8) return 145;
 	ready.fd = 22; if (poll(&ready, 1, 0) != 1 || ready.revents != POLLIN || write(22, count, 8) != -1 || errno != EAGAIN) return 146;
@@ -1237,9 +1248,9 @@ int main(int argc, char **argv) {
 	${socket ? 'char preview; if (recv(3, &preview, 1, MSG_PEEK) != 1 || preview != \'b\') return 106;' : ""}
 	${transferIO ? 'if (tee(3, 14, 3, SPLICE_F_NONBLOCK) != 3 || splice(3, 0, 14, 0, 3, SPLICE_F_NONBLOCK) != 3) return 130;' : descriptors ? 'char a, b, c; if (read(3, &a, 1) != 1 || read(4, &b, 1) != 1 || read(8, &c, 1) != 1 || a != \'b\' || b != \'c\' || c != \'a\') return 72;' : ""}
 	${descriptors ? 'int alias = dup(4); if (alias < 0 || fcntl(alias, F_GETFL) != fcntl(3, F_GETFL) || (fcntl(8, F_GETFL) & O_ACCMODE) != ' + (socket ? 'O_RDWR' : 'O_RDONLY') + ') return 74; close(alias);' : ""}
-	${socket ? (duplex ? 'char peer[5]; if (read(14, peer, 4) != 4 || memcmp(peer, "peer", 4)) return 100; ' + (messages ? 'int passed[2] = {9, 4}; char value; if (pass(3, "M", 1, passed, 2, MSG_NOSIGNAL)) return 126; close(9); int received[2]; for (int peek = 1; peek >= 0; peek--) { if (take(14, 77, received, 2, peek, 0)) return 127; if (recv(received[1], &value, 1, MSG_PEEK) != 1 || value != 88) return 128; if (!peek && (read(received[0], &value, 1) != 1 || value != 98)) return 129; close(received[0]); close(received[1]); } ' : '') + (io ? 'char absent; if (recv(14, &absent, 1, MSG_DONTWAIT) != -1 || errno != EAGAIN) return 115; struct pollfd empty = {.fd = 14, .events = POLLIN}; if (poll(&empty, 1, 0) != 0 || empty.revents) return 116; ' : '') + (concurrent ? 'pid_t child = fork(); if (child < 0) return 103; if (!child) { size_t length = 0; while (length < 5) { ssize_t size = read(14, peer + length, 5 - length); if (size <= 0) return 104; length += (size_t)size; } return memcmp(peer, "reply", 5) || write(14, "back", 4) != 4 || shutdown(14, SHUT_WR); } ' : '') : '') + 'if (write(3, "re", 2) != 2 || write(4, "ply", 3) != 3 || ' + (lifetime ? '0' : 'shutdown(4, SHUT_WR)') + ') return 94;' + (duplex ? concurrent ? ' int status; if (waitpid(child, &status, 0) != child || status) return 105;' : ' if (read(14, peer, 5) != 5 || memcmp(peer, "reply", 5) || write(14, "back", 4) != 4 || ' + (lifetime ? '0' : 'shutdown(14, SHUT_WR)') + ') return 101;' : '') : pipeOutput ? shortWrite ? 'char payload[8192]; memset(payload, 90, sizeof(payload)); if (write(14, payload, sizeof(payload)) != 4096 || write(14, payload, 1) != -1 || errno != EAGAIN) return 120;' : 'if (write(14, "re", 2) != 2 || write(14, "ply", 3) != 3) return 94;' : ""}
+	${socket ? (duplex ? 'char peer[5]; if (read_text(14, peer, "peer")) return 100; ' + (messages ? 'int passed[2] = {9, 4}; char value; if (pass(3, "M", 1, passed, 2, MSG_NOSIGNAL)) return 126; close(9); int received[2]; for (int peek = 1; peek >= 0; peek--) { if (take(14, 77, received, 2, peek, 0)) return 127; if (recv(received[1], &value, 1, MSG_PEEK) != 1 || value != 88) return 128; if (!peek && (read(received[0], &value, 1) != 1 || value != 98)) return 129; close(received[0]); close(received[1]); } ' : '') + (io ? 'char absent; if (recv(14, &absent, 1, MSG_DONTWAIT) != -1 || errno != EAGAIN) return 115; struct pollfd empty = {.fd = 14, .events = POLLIN}; if (poll(&empty, 1, 0) != 0 || empty.revents) return 116; ' : '') + (concurrent ? 'pid_t child = fork(); if (child < 0) return 103; if (!child) { size_t length = 0; while (length < 5) { ssize_t size = read(14, peer + length, 5 - length); if (size <= 0) return 104; length += (size_t)size; } return memcmp(peer, "reply", 5) || write(14, "back", 4) != 4 || shutdown(14, SHUT_WR); } ' : '') : '') + 'if (write(3, "re", 2) != 2 || write(4, "ply", 3) != 3 || ' + (lifetime ? '0' : 'shutdown(4, SHUT_WR)') + ') return 94;' + (duplex ? concurrent ? ' if (wait_child(child)) return 105;' : ' if (read_text(14, peer, "reply") || write(14, "back", 4) != 4 || ' + (lifetime ? '0' : 'shutdown(14, SHUT_WR)') + ') return 101;' : '') : pipeOutput ? shortWrite ? 'char payload[8192]; memset(payload, 90, sizeof(payload)); if (write(14, payload, sizeof(payload)) != 4096 || write(14, payload, 1) != -1 || errno != EAGAIN) return 120;' : 'if (write(14, "re", 2) != 2 || write(14, "ply", 3) != 3) return 94;' : ""}
 	${io ? 'ready = (struct pollfd){.fd = 14, .events = POLLIN | POLLOUT | POLLRDHUP}; if (poll(&ready, 1, 0) != 1 || ready.revents != (POLLIN | POLLOUT | POLLRDHUP | POLLHUP)) return 117; if (send(3, "!", 1, MSG_NOSIGNAL) != -1 || errno != EPIPE) return 124;' : ""}
-	${lifetime ? 'char rest[8]; if (read(3, rest, 7) != 7 || memcmp(rest, "XYZback", 7)) return 107; close(0); close(3); close(4); close(8); if (read(14, rest, 1) != 0) return 108;' : ""}
+	${lifetime ? 'char rest[8]; if (read_text(3, rest, "XYZback")) return 107; close(0); close(3); close(4); close(8); if (read(14, rest, 1) != 0) return 108;' : ""}
 	${nullDevice ? 'char byte; if (write(6, "discard", 7) != 7 || read(7, &byte, 1) != 0 || lseek(6, 100, SEEK_SET) != 0 || fcntl(6, F_GETFL) != fcntl(7, F_GETFL)) return 75;' : ""}
 	${mode === "native-status" || mixed ? 'if (fcntl(3, F_SETFL, fcntl(3, F_GETFL) | O_NONBLOCK) || fcntl(6, F_SETFL, fcntl(6, F_GETFL) | O_APPEND | O_NONBLOCK) || !(fcntl(4, F_GETFL) & O_NONBLOCK) || (fcntl(8, F_GETFL) & O_NONBLOCK)) return 77;' : ""}
 	${mode === "native-null-stdin" ? 'if (read(0, &byte, 1) != 0) return 76;' : ""}
@@ -1252,7 +1263,7 @@ int main(int argc, char **argv) {
 	if (lseek(11, 0, SEEK_SET) != 0) return 163;
 	pid_t reader = fork(); if (reader < 0) return 164;
 	if (!reader) return syscall(SYS_getdents64, 11, entries, 24) != 24;
-	int waited; if (waitpid(reader, &waited, 0) != reader || waited || lseek(10, 0, SEEK_CUR) != start) return 165;
+	int waited; if (wait_child(reader) || lseek(10, 0, SEEK_CUR) != start) return 165;
 	if (lseek(13, 0, SEEK_SET) != 0 || lseek(10, 0, SEEK_SET) != 0 || syscall(SYS_getdents, 13, repeated, 24) != 24 || syscall(SYS_getdents64, 10, entries, 24) != 24 || memcmp(entries, repeated, 18) || strcmp(entries + 19, repeated + 18) || entries[18] != repeated[23]) return 166;
 	const char *captured = getenv("BOUND_DIRECTORY_ENTRY"); if (!captured || strlen(captured) != 38) return 176;
 	for (int index = 0; index < 19; index++) { char hex[] = {captured[2 * index], captured[2 * index + 1], 0}; if ((unsigned char)entries[index] != strtoul(hex, 0, 16)) return 177; }
@@ -1297,12 +1308,12 @@ int main(int argc, char **argv) {
 	${counter ? 'int counter = eventfd(5, EFD_CLOEXEC | EFD_NONBLOCK' + (semaphore ? ' | EFD_SEMAPHORE' : '') + '), full = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK); uint64_t count = UINT64_MAX - 2; if (counter < 0 || full < 0 || write(full, &count, 8) != 8 || dup2(counter, 20) < 0 || dup2(counter, 21) < 0 || dup2(full, 22) < 0) return 149; close(counter); close(full);' : ""}
 	${lifetime || exporting ? 'int gate[2]; if (pipe2(gate, O_CLOEXEC)) return 109;' : ""}
 	puts(argv[1]); fflush(stdout);
-	${enumerate ? 'int anchor = open(".", O_PATH | O_DIRECTORY); if (anchor < 0 || dup2(anchor, 6) < 0) return 175; if (anchor != 6) close(anchor); char entries[24]; int independent = open(".", O_RDONLY | O_DIRECTORY); if (independent < 0 || dup2(independent, 13) < 0 || syscall(SYS_getdents64, 10, entries, sizeof(entries)) != 24) return 168; if (independent != 13) close(independent); char captured[39]; for (int index = 0; index < 19; index++) snprintf(captured + 2 * index, 3, "%02x", (unsigned char)entries[index]); if (setenv("BOUND_DIRECTORY_ENTRY", captured, 1)) return 178; pid_t reader = fork(); if (reader < 0) return 169; if (reader) { int waited; if (waitpid(reader, &waited, 0) != reader || waited || lseek(10, 0, SEEK_CUR) <= 9007199254740991LL || lseek(11, 0, SEEK_CUR) != lseek(10, 0, SEEK_CUR) || lseek(13, 0, SEEK_CUR) <= 0 || lseek(13, 0, SEEK_CUR) == lseek(10, 0, SEEK_CUR)) return 170; return 0; }' : ""}
+	${enumerate ? 'int anchor = open(".", O_PATH | O_DIRECTORY); if (anchor < 0 || dup2(anchor, 6) < 0) return 175; if (anchor != 6) close(anchor); char entries[24]; int independent = open(".", O_RDONLY | O_DIRECTORY); if (independent < 0 || dup2(independent, 13) < 0 || syscall(SYS_getdents64, 10, entries, sizeof(entries)) != 24) return 168; if (independent != 13) close(independent); char captured[39]; for (int index = 0; index < 19; index++) snprintf(captured + 2 * index, 3, "%02x", (unsigned char)entries[index]); if (setenv("BOUND_DIRECTORY_ENTRY", captured, 1)) return 178; pid_t reader = fork(); if (reader < 0) return 169; if (reader) { if (wait_child(reader) || lseek(10, 0, SEEK_CUR) <= 9007199254740991LL || lseek(11, 0, SEEK_CUR) != lseek(10, 0, SEEK_CUR) || lseek(13, 0, SEEK_CUR) <= 0 || lseek(13, 0, SEEK_CUR) == lseek(10, 0, SEEK_CUR)) return 170; return 0; }' : ""}
 	${mode === "native-pipe-live-transfer" ? `int sockets[2], passed[] = {0, 3, 4, 8};
 	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) || pass(sockets[0], "x", 1, passed, 4, 0)) return 89;
 	close(sockets[0]);` : ""}
-	${counter ? 'pid_t child = fork(); if (child < 0) return 150; if (child) { int status; if (waitpid(child, &status, 0) != child || status) return 151; uint64_t count, total = 0; while (read(21, &count, 8) == 8) total += count; if (errno != EAGAIN || total != ' + (semaphore ? 11 : 7) + ' || !(fcntl(20, F_GETFL) & O_NONBLOCK) || read(22, &count, 8) != -1 || errno != EAGAIN) return 152; return 0; }' : ""}
-	${pipe || socket ? 'pid_t child = fork(); if (child < 0) return 84; ' + (exporting ? 'if (child) { close(0); close(3); close(4); close(8); close(gate[0]); if (write(gate[1], "x", 1) != 1) return 133; close(gate[1]); int status; if (waitpid(child, &status, 0) != child || status) return 134; char text[6]; int received; if (take_text(14, "peerx", 5, &received, 1, 0, 0)) return 135; if (!(fcntl(received, F_GETFL) & O_NONBLOCK) || read(received, text, 6) != 6 || memcmp(text, "bcaXYZ", 6)) return 136; close(received); ' + (queueCounter ? 'uint64_t count; if (read(20, &count, 8) != 8 || count != 7) return 161; ' : '') + 'return 0; } ' : '') + (lifetime ? 'if (child) { close(0); close(3); close(4); close(8); close(14); close(fds[1]); close(gate[0]); if (write(gate[1], "x", 1) != 1) return 110; close(gate[1]); int status; return waitpid(child, &status, 0) != child || status; } ' : '') + 'if (child) { int status; char tail[3]; if (waitpid(child, &status, 0) != child || status || ' + (mixed ? 'lseek(16, 0, SEEK_CUR) != 4 || lseek(18, 0, SEEK_CUR) != 0 || pread(18, tail, 1, 2) != 1 || tail[0] != 81 || !(fcntl(3, F_GETFL) & O_NONBLOCK) || !(fcntl(4, F_GETFL) & O_NONBLOCK) || (fcntl(8, F_GETFL) & O_NONBLOCK) || ' : '') + 'read(3, tail, 1) != 1 || read(4, tail + 1, 1) != 1 || read(8, tail + 2, 1) != 1 || tail[0] != \'X\' || tail[1] != \'Y\' || tail[2] != \'Z\') return 85; ' + (orphan ? 'int remaining; if (take(3, 84, &remaining, 1, 0, 0) || lseek(remaining, 0, SEEK_CUR) != 2 || !(fcntl(remaining, F_GETFL) & O_NONBLOCK)) return 200; close(remaining); ' : '') + (socket || pipeOutput ? 'char reply[6]; ' + (shortWrite ? 'char head[4091]; if (read(15, head, sizeof(head)) != sizeof(head)) return 122; for (unsigned index = 0; index < sizeof(head); index++) if (head[index] != 90) return 123; ' : '') + (transferIO ? 'if (read(15, reply, 6) != 6 || memcmp(reply, "bcabca", 6)) return 131; ' : '') + (queuedOutput ? 'if (read(15, reply, 5) != 5 || memcmp(reply, "start", 5)) return 113; ' : '') + (duplex ? 'if (read(0, reply, 4) != 4 || memcmp(reply, "back", 4) || read(0, reply, 1) != 0) return 102; ' : 'if (read(' + (socket ? 'fds[1]' : '15') + ', reply, 5) != 5 || memcmp(reply, "' + (shortWrite ? 'ZZZZZ' : 'reply') + '", 5)) return 98; ') + (socket ? 'if (read(fds[1], reply, 1) != 0) return 99; ' : '') : '') + 'return 0; }' : ""}
+	${counter ? 'pid_t child = fork(); if (child < 0) return 150; if (child) { if (wait_child(child)) return 151; uint64_t count, total = 0; while (read(21, &count, 8) == 8) total += count; if (errno != EAGAIN || total != ' + (semaphore ? 11 : 7) + ' || !(fcntl(20, F_GETFL) & O_NONBLOCK) || read(22, &count, 8) != -1 || errno != EAGAIN) return 152; return 0; }' : ""}
+	${pipe || socket ? 'pid_t child = fork(); if (child < 0) return 84; ' + (exporting ? 'if (child) { close(0); close(3); close(4); close(8); close(gate[0]); if (write(gate[1], "x", 1) != 1) return 133; close(gate[1]); if (wait_child(child)) return 134; char text[6]; int received; if (take_text(14, "peerx", 5, &received, 1, 0, 0)) return 135; if (!(fcntl(received, F_GETFL) & O_NONBLOCK) || read_text(received, text, "bcaXYZ")) return 136; close(received); ' + (queueCounter ? 'uint64_t count; if (read(20, &count, 8) != 8 || count != 7) return 161; ' : '') + 'return 0; } ' : '') + (lifetime ? 'if (child) { close(0); close(3); close(4); close(8); close(14); close(fds[1]); close(gate[0]); if (write(gate[1], "x", 1) != 1) return 110; close(gate[1]); return wait_child(child); } ' : '') + 'if (child) { char tail[3]; if (wait_child(child) || ' + (mixed ? 'lseek(16, 0, SEEK_CUR) != 4 || lseek(18, 0, SEEK_CUR) != 0 || pread(18, tail, 1, 2) != 1 || tail[0] != 81 || !(fcntl(3, F_GETFL) & O_NONBLOCK) || !(fcntl(4, F_GETFL) & O_NONBLOCK) || (fcntl(8, F_GETFL) & O_NONBLOCK) || ' : '') + 'read(3, tail, 1) != 1 || read(4, tail + 1, 1) != 1 || read(8, tail + 2, 1) != 1 || tail[0] != \'X\' || tail[1] != \'Y\' || tail[2] != \'Z\') return 85; ' + (orphan ? 'int remaining; if (take(3, 84, &remaining, 1, 0, 0) || lseek(remaining, 0, SEEK_CUR) != 2 || !(fcntl(remaining, F_GETFL) & O_NONBLOCK)) return 200; close(remaining); ' : '') + (socket || pipeOutput ? 'char reply[6]; ' + (shortWrite ? 'char head[4091]; if (read(15, head, sizeof(head)) != sizeof(head)) return 122; for (unsigned index = 0; index < sizeof(head); index++) if (head[index] != 90) return 123; ' : '') + (transferIO ? 'if (read_text(15, reply, "bcabca")) return 131; ' : '') + (queuedOutput ? 'if (read_text(15, reply, "start")) return 113; ' : '') + (duplex ? 'if (read_text(0, reply, "back") || read(0, reply, 1) != 0) return 102; ' : 'if (read_text(' + (socket ? 'fds[1]' : '15') + ', reply, "' + (shortWrite ? 'ZZZZZ' : 'reply') + '")) return 98; ') + (socket ? 'if (read(fds[1], reply, 1) != 0) return 99; ' : '') : '') + 'return 0; }' : ""}
 	${lifetime || exporting ? 'char ready; close(gate[1]); if (read(gate[0], &ready, 1) != 1) return 111; close(gate[0]);' : ""}
 	${exporting ? 'close(14);' : ""}
 	${mode === "native-pipe-live-transfer" ? `for (unsigned index = 0; index < 4; index++) close(passed[index]);
@@ -1573,7 +1584,8 @@ static int query(int fd,int start,int length,int type,int foundStart,int foundLe
 	return query(8,2,4,F_UNLCK,2,4) || query(8,10,3,F_RDLCK,10,3) || flock(8,LOCK_EX|LOCK_NB)!=-1 || errno!=EAGAIN;
 }` });
 		}
-		await compileBenchmarkHelper(fixture.workspace, "worker", { code: (locks ? lockHelpers : "") + `${cHeaders("unistd.h sys/wait.h fcntl.h")}
+		await compileBenchmarkHelper(fixture.workspace, "worker", { code: (locks ? lockHelpers : "") + `${cHeaders("fcntl.h")}
+${processChecks}
 int main(void) {
 	char bytes[6] = {0, 0, 0, ':', 0, '\\n'};
 	if (read(3, bytes, 2) != 2 || read(4, bytes + 2, 1) != 1 || read(8, bytes + 4, 1) != 1) return 71;
@@ -1586,8 +1598,8 @@ int main(void) {
 	${closing ? `int gate[2];char byte;if(pipe2(gate,O_CLOEXEC))return 77;pid_t child=fork();if(child<0)return 77;
 	if(!child){close(gate[1]);if(read(gate[0],&byte,1)!=1)_exit(78);close(gate[0]);close(3);close(4);_exit(0);}
 	close(gate[0]);if(close(3) || close(4) || query(8,10,3,F_RDLCK,10,3) || flock(8,LOCK_EX|LOCK_NB)!=-1 || errno!=EAGAIN)return 77;
-	if(write(gate[1],"x",1)!=1 || close(gate[1]))return 77;int status;
-	if(waitpid(child,&status,0)!=child || status || query(8,10,3,F_UNLCK,10,3) || flock(8,LOCK_EX|LOCK_NB) || flock(8,LOCK_UN))return 77;` : ""}
+	if(write(gate[1],"x",1)!=1 || close(gate[1]))return 77;
+	if(wait_child(child) || query(8,10,3,F_UNLCK,10,3) || flock(8,LOCK_EX|LOCK_NB) || flock(8,LOCK_UN))return 77;` : ""}
 	for (volatile unsigned long i = 0; i < 50000000ul; ++i) {}
 	return write(1, bytes, sizeof(bytes)) != sizeof(bytes);
 }
@@ -1606,8 +1618,8 @@ int main(int argc,char **argv) {
 	${closing ? `int gate[2];char byte;if(pipe2(gate,O_CLOEXEC) || lseek(3,1,SEEK_SET)!=1 || lseek(8,1,SEEK_SET)!=1 || lock(3,F_WRLCK,2,4) || flock(3,LOCK_SH|LOCK_NB))return 84;
 	puts(argv[1]);fflush(stdout);pid_t child=fork();if(child<0)return 85;
 	if(!child){close(gate[1]);if(read(gate[0],&byte,1)!=1)_exit(86);close(gate[0]);execl("./worker","worker",(char *)0);_exit(86);}
-	close(gate[0]);close(3);close(4);if(write(gate[1],"x",1)!=1)return 86;close(gate[1]);int status;
-	if(waitpid(child,&status,0)!=child || status || read(8,&byte,1)!=1 || query(8,10,3,F_UNLCK,10,3) || flock(8,LOCK_EX|LOCK_NB) || flock(8,LOCK_UN))return 87;
+	close(gate[0]);close(3);close(4);if(write(gate[1],"x",1)!=1)return 86;close(gate[1]);
+	if(wait_child(child) || read(8,&byte,1)!=1 || query(8,10,3,F_UNLCK,10,3) || flock(8,LOCK_EX|LOCK_NB) || flock(8,LOCK_UN))return 87;
 	printf("tail::%c\\n",byte);return 0;` : `execl("/bin/bash","bash","-c",${JSON.stringify(body)},"fd-memory",argv[1],(char *)0);return 84;`}
 }` });
 		}
@@ -1667,7 +1679,7 @@ static int takePacket(int length,int peek,int truncated,char expected) {
 		await compileBenchmarkHelper(fixture.workspace, "worker", { code: helpers + `int main(void) {
 	char bytes[8];struct pollfd ready={.fd=22,.events=POLLIN};
 	if(passPacket("",0) || read(22,bytes,0)!=0 || poll(&ready,1,0)!=1 || takePacket(0,1,0,0) || takePacket(0,0,0,'a'))return 70;
-	if(write(21,"abcdef",6)!=6 || read(22,bytes,2)!=2 || memcmp(bytes,"ab",2))return 71;
+	if(write(21,"abcdef",6)!=6 || read_text(22, bytes, "ab"))return 71;
 	if(send(20,"XY",2,0)!=2 || recv(22,bytes,8,0)!=2 || memcmp(bytes,"XY",2))return 72;
 	struct iovec vector={bytes,0};struct msghdr message={.msg_iov=&vector,.msg_iovlen=1};
 	if(send(20,"truncate",8,0)!=8 || recv(22,bytes,2,MSG_PEEK|MSG_TRUNC)!=8 || memcmp(bytes,"tr",2) || recvmsg(22,&message,MSG_TRUNC)!=8 || !(message.msg_flags&MSG_TRUNC))return 74;
@@ -1687,7 +1699,7 @@ static int takePacket(int length,int peek,int truncated,char expected) {
 	if(pipe2(gate,O_CLOEXEC))return 83;puts(argv[1]);fflush(stdout);pid_t child=fork();if(child<0)return 83;
 	if(!child){close(gate[1]);if(read(gate[0],&byte,1)!=1)_exit(84);close(gate[0]);execl("./worker","worker",(char *)0);_exit(84);}
 	close(gate[0]);${closing ? "close(20);close(21);" : ""}if(write(gate[1],"x",1)!=1)return 84;close(gate[1]);
-	int status;if(waitpid(child,&status,0)!=child || status || lseek(9,0,SEEK_CUR)!=2 || takePacket(4,0,0,'c') || lseek(9,0,SEEK_CUR)!=3)return 85;
+	if(wait_child(child) || lseek(9,0,SEEK_CUR)!=2 || takePacket(4,0,0,'c') || lseek(9,0,SEEK_CUR)!=3)return 85;
 	if(${type === "SOCK_DGRAM" ? "recv(22,&byte,1,MSG_DONTWAIT)!=-1 || errno!=EAGAIN" : "recv(22,&byte,1,0)!=0"})return 86;
 	return 0;
 }
@@ -1799,10 +1811,10 @@ static int takePacket(int length,int peek,int truncated,char expected) {
 		const surviving = observe("surviving", () => collect(childProcess.spawn("/bin/echo", ["survived"])));
 		cancelled.abort();
 		expect(await cancelledRun).toMatchObject({ signal: "SIGTERM", error: { code: "ABORT_ERR" } }); expect((await surviving).stdout).toBe("survived\n");
-		await compileBenchmarkHelper(root, "lifetime", { code: `${cHeaders("unistd.h string.h sys/wait.h")}
+		await compileBenchmarkHelper(root, "lifetime", { code: `${processChecks}
 int main(int n,char **v) { if(n!=2)return 90; pid_t child=!strcmp(v[1],"vfork")?vfork():fork(); if(child<0)return 91;
 	if(!child) { char byte; if(write(1,"ready",5)!=5 || read(0,&byte,1)!=1 || write(1,"done",4)!=4)_exit(92); _exit(0); }
-	int status; return waitpid(child,&status,0)!=child || status || write(1,"parent",6)!=6;
+	return wait_child(child) || write(1,"parent",6)!=6;
 }` });
 		for (const kind of ["fork", "vfork", "stopped"]) for (const descriptors of [undefined, "inspect", true] as const) for (const killed of [false, true]) {
 			const before = observations.length, completedBefore = completions.length, background = gated(); let late!: () => Promise<unknown>, child!: childProcess.ChildProcess, finished!: ReturnType<typeof collect>;
@@ -1969,7 +1981,7 @@ static void exec_true(void) { char *command[] = {"true", 0}; execv("/bin/true", 
 static int fork_true(void) {
 	pid_t child = fork(); if (child < 0) return 1;
 	if (!child) { exec_true(); _exit(76); }
-	int status; return waitpid(child, &status, 0) != child || status;
+	return wait_child(child);
 }
 static int packet_capture(char **argv) {
 	int pair[2],offset=0;char bytes[4];
@@ -2029,7 +2041,7 @@ static int queue_owners(char **argv) {
 	if (!child) { close(gate[1]); if (read(gate[0], &byte, 1) != 1) return 76; close(gate[0]); exec_true(); return 76; }
 	if (state) { close(20); close(21); } if (local) { close(channel[0]); close(channel[1]); }
 	close(gate[0]); if (write(gate[1], "x", 1) != 1) return 77; close(gate[1]);
-	int status; if (waitpid(child, &status, 0) != child || status) return 78;
+	if (wait_child(child)) return 78;
 	if (type == 's') { struct pollfd ready = {.fd = data[1], .events = POLLIN | POLLRDHUP}; if (poll(&ready, 1, 0) < 0 || ((state == 1 || state >= 7) && ready.revents)) return 79; }
 	if (state && !local && state != 6) { if (take(channel[1], 'x', &fd, 1, 0, 0)) return 80; } else fd = 20;
 	if (state >= 7 && !local) { int nested = fd, rights[2]; if (take(nested, 'x', rights, state == 10 ? 2 : 1, 0, 0)) return 80; close(nested); fd = rights[0]; if (state == 10) close(rights[1]); }
@@ -2063,7 +2075,7 @@ int main(int argc, char **argv) {
 	for (unsigned index = 0; argc > 1 && index < sizeof(probes) / sizeof(*probes); index++) if (!strcmp(argv[1], probes[index].name)) return argc == probes[index].argc ? probes[index].run(argv + 1) : 70;
 	if (argc != 3) return 70;
 	if (!strncmp(argv[1], "rights", 6) || !strcmp(argv[1], "pidfd")) {
-		int sockets[2], status, copying = !strcmp(argv[1], "pidfd"); char byte = 'x';
+		int sockets[2], copying = !strcmp(argv[1], "pidfd"); char byte = 'x';
 		if (socketpair(AF_UNIX, strstr(argv[1], "batch") ? SOCK_SEQPACKET : SOCK_STREAM, 0, sockets)) return 93;
 		pid_t child = fork(); if (child < 0) return 94;
 		if ((child != 0) != copying) {
@@ -2081,7 +2093,7 @@ int main(int argc, char **argv) {
 			int passed[] = {3, 3, 8};
 			if (pass(sockets[0], &byte, 1, passed, 3, strstr(argv[1], "batch") ? -1 : 0)) return 97;
 			if (strstr(argv[1], "orphan")) { close(8); if (shutdown(sockets[0], SHUT_WR)) return 108; }
-			close(sockets[0]); if (waitpid(child, &status, 0) != child || status) return 98;
+			close(sockets[0]); if (wait_child(child)) return 98;
 			return 0;
 		}
 		close(sockets[0]); close(3); close(9); int received[3], saved[3];
@@ -2098,7 +2110,7 @@ int main(int argc, char **argv) {
 			if (fcntl(received[index], F_GETFD) != FD_CLOEXEC || (saved[index] = fcntl(received[index], F_DUPFD_CLOEXEC, 100)) < 0) return 105;
 			close(received[index]);
 		}
-		if (copying && (write(sockets[1], &byte, 1) != 1 || waitpid(child, &status, 0) != child || status)) return 106;
+		if (copying && (write(sockets[1], &byte, 1) != 1 || wait_child(child))) return 106;
 		close(sockets[1]);
 		if (dup2(saved[0], 3) < 0 || dup2(saved[1], 65) < 0 || dup2(saved[2], 67) < 0 || dup3(saved[0], 66, O_CLOEXEC) < 0) return 107;
 		for (int index = 0; index < 3; index++) close(saved[index]);
@@ -2126,10 +2138,10 @@ int main(int argc, char **argv) {
 		if (fcntl(66, F_GETFD) != FD_CLOEXEC) return 80;
 		free(stack);
 	} else if (!strncmp(argv[1], "unshare", 7) || !strncmp(argv[1], "range-", 6)) {
-		char *stack = malloc(65536); int status;
+		char *stack = malloc(65536);
 		if (aliases(0)) return 75;
 		pid_t child = stack ? clone(split_exec, stack + 65536, CLONE_FILES | SIGCHLD, argv[1]) : -1;
-		if (child < 0 || waitpid(child, &status, 0) != child || status) return 89;
+		if (child < 0 || wait_child(child)) return 89;
 		if (fcntl(65, F_GETFD) != 0 || fcntl(66, F_GETFD) != FD_CLOEXEC || fcntl(67, F_GETFD) != 0) return 90;
 		if ((fcntl(68, F_GETFD) >= 0) != (!strcmp(argv[1], "unshare-noop") || !strcmp(argv[1], "range-invalid"))) return 91;
 		free(stack);
@@ -2150,11 +2162,12 @@ int main(int argc, char **argv) {
 			expect(await executor.execute(`exec '${descriptorProbe}' packet ${type}`)).toEqual({ exitCode: 0 });
 		}
 		// A vfork parent cannot stop until its child execs: a sibling's exec decision must not wait for it (cargo build scripts hung).
-		await compileBenchmarkHelper(root, "spawner", { code: `#include <sys/syscall.h>\n#include <sys/wait.h>\n#include <time.h>\n#include <unistd.h>
-int main(void) { int status; struct timespec pause = {0, 300000000}; pid_t sibling = fork(), child;
+		await compileBenchmarkHelper(root, "spawner", { code: `${cHeaders("sys/syscall.h time.h")}
+${processChecks}
+int main(void) { struct timespec pause = {0, 300000000}; pid_t sibling = fork(), child;
 	if (!sibling) { usleep(50000); execl("/bin/true", "true", (char *)0); _exit(1); }
 	if (!(child = vfork())) { syscall(SYS_nanosleep, &pause, 0); execl("/bin/true", "true", (char *)0); _exit(1); }
-	return waitpid(child, &status, 0) != child || status || waitpid(sibling, &status, 0) != sibling || status; }\n` });
+	return wait_child(child) || wait_child(sibling); }\n` });
 		expect(await held({ descriptors: true, decide: async () => ({ kind: "continue" }) }).execute("exec ./spawner")).toEqual({ exitCode: 0 });
 		const compat = path.join(root, "compat32");
 		await writeFile(`${compat}.s`, ".global _start\n_start: movl $1, %eax; movl $7, %ebx; int $0x80\n");
@@ -2566,10 +2579,11 @@ int main(void) { int status; struct timespec pause = {0, 300000000}; pid_t sibli
 		const fixture = await benchmark("pi-pipe-settle-");
 		await compileBenchmarkHelper(fixture.workspace, "pipe-child", { code: "#include <unistd.h>\nint main(void) { char byte; return read(3, &byte, 1) != 1 || byte != 'a' || write(4, \"cX\", 2) != 2; }\n" });
 		// Both ends reach the child; the parent reads what the queue holds once it exits.
-		await compileBenchmarkHelper(fixture.workspace, "piper", { code: `#include <stdio.h>\n#include <sys/wait.h>\n#include <unistd.h>
-int main(void) { int fds[2], status; char queue[8]; if (pipe(fds) || fds[0] != 3 || write(4, "ab", 2) != 2) return 90; pid_t child = fork();
+		await compileBenchmarkHelper(fixture.workspace, "piper", { code: `${cHeaders("stdio.h")}
+${processChecks}
+int main(void) { int fds[2]; char queue[8]; if (pipe(fds) || fds[0] != 3 || write(4, "ab", 2) != 2) return 90; pid_t child = fork();
 	if (!child) { execlp("pipe-child", "pipe-child", (char *)0); _exit(91); }
-	if (waitpid(child, &status, 0) != child || status) return 92; close(4); ssize_t length = read(3, queue, sizeof(queue));
+	if (wait_child(child)) return 92; close(4); ssize_t length = read(3, queue, sizeof(queue));
 	return length < 0 || printf("%.*s\\n", (int)length, queue) < 0; }\n` });
 		await fixture.prepare();
 		for (const label of ["executed", "replayed"]) {
