@@ -3,7 +3,7 @@ import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import { temporaryDirectories } from "./filesystem.ts";
 import { PpmCountTrie } from "../src/ppm-count-trie.ts";
-import { applyBindingsVariants, PatternAwareStore, PATTERN_AWARE_DEFAULTS, type PatternAwareBinding, type PatternAwareEvent } from "../src/pattern-aware.ts";
+import { applyBindingsVariants, inferBindings, PatternAwareStore, PATTERN_AWARE_DEFAULTS, type PatternAwareBinding, type PatternAwareEvent } from "../src/pattern-aware.ts";
 
 const directories = temporaryDirectories("pi-pattern-system-");
 afterEach(directories.dispose);
@@ -39,6 +39,18 @@ test.each([
 ] satisfies PatternAwareBinding[])("keeps each location's path and line together through $type", binding => {
 	expect(applyBindingsVariants({ '["path"]': binding, '["offset"]': { type: "near", source: eachLocation("line"), tolerance: 150 } }, [locations]))
 		.toEqual([{ path: "src/a.ts", offset: 3 }, { path: "src/b.ts", offset: 17 }]);
+});
+
+test.each([
+	["path", "test/a.ts", "test/b.ts"], ["path", "src/a.test.ts", "src/b.test.ts"], ["path", "a", "b"],
+	["command", "inspect src/a.ts", "inspect src/b.ts"],
+])("infers correlated location rewrites for %s = %s", (field, first, second) => {
+	for (const offset of [3, 4]) {
+		const bindings = inferBindings([locations], { [field]: first, offset });
+		const expected = [{ [field]: first, offset: 3 }, { [field]: second, offset: 17 }];
+		expect(applyBindingsVariants(bindings, [locations])).toEqual(expected);
+		expect(applyBindingsVariants(bindings, [{ ...locations, outputLocations: [...locations.outputLocations!].reverse() }])).toEqual([...expected].reverse());
+	}
 });
 
 test("correlates repeated collection references within a composite and keeps independent collections independent", () => {

@@ -1449,13 +1449,15 @@ class PatternBindingAnalysis {
 				}
 			} else {
 				for (const [sourcePath, source] of this.leaves(value)) {
-					const direct: PatternAwareBinding = { type: "event", relativeEvent, field, path: sourcePath };
+					const item = sourcePath.findIndex((segment) => typeof segment === "number");
+					const direct: PatternAwareBinding = field === "outputLocations" && item >= 0
+						? { type: "each", relativeEvent, field, path: sourcePath.slice(0, item), itemPath: sourcePath.slice(item + 1) }
+						: { type: "event", relativeEvent, field, path: sourcePath };
 					const pathSource = typeof source === "string" && isPathSource(field, sourcePath, source);
 					if (sameValue(source, target) && (!targetIsPath || pathSource)) yield direct;
-					const item = sourcePath.findIndex((segment) => typeof segment === "number");
 					if (targetIsLine && field === "outputLocations" && sourcePath.at(-1) === "line" && item >= 0 && typeof source === "number" &&
 						typeof target === "number" && source !== target && Math.abs(source - target) <= NEAR_LINE_TOLERANCE) {
-						yield { type: "near", tolerance: NEAR_LINE_TOLERANCE, source: { type: "each", relativeEvent, field, path: sourcePath.slice(0, item), itemPath: sourcePath.slice(item + 1) } };
+						yield { type: "near", tolerance: NEAR_LINE_TOLERANCE, source: direct };
 					}
 					if (typeof source !== "string" || typeof target !== "string") continue;
 					// A path target templates only a rewrite of another file's name; other targets never template a bare name.
