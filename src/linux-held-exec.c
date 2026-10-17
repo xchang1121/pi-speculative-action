@@ -1107,6 +1107,15 @@ static void json_bytes(FILE *out, const char *value, size_t length) {
 	fputc('"', out);
 }
 
+static void json_hex(FILE *out, const unsigned char *bytes, size_t length) {
+	fputc('"', out);
+	for (size_t index = 0; index < length; index++) {
+		putc_unlocked("0123456789abcdef"[bytes[index] >> 4], out);
+		putc_unlocked("0123456789abcdef"[bytes[index] & 15], out);
+	}
+	fputc('"', out);
+}
+
 /* The image is already installed, and stays stopped while its owner decides.
  * Pins outlive the exchange but never the target's resumed execution. */
 struct broker_job {
@@ -1128,10 +1137,10 @@ static int broker_pipes(FILE *out, struct broker_job *job) {
 			if ((fcntl(job->files[other], F_GETFL) & O_ACCMODE) != O_WRONLY && fstat(job->files[other], &other_state) == 0 && other_state.st_dev == state.st_dev && other_state.st_ino == state.st_ino) reader = job->files[other];
 		int length = reader < 0 ? -1 : pipe_bytes(reader, &bytes, &eof);
 		if (length < 0) return -1;
-		fprintf(out, "%s{\"fd\":%d,\"alias\":%d,\"device\":\"%ju\",\"inode\":\"%ju\",\"flags\":%d,\"capacity\":%d,\"eof\":%s,\"queueHex\":\"",
+		fprintf(out, "%s{\"fd\":%d,\"alias\":%d,\"device\":\"%ju\",\"inode\":\"%ju\",\"flags\":%d,\"capacity\":%d,\"eof\":%s,\"queueHex\":",
 			described++ ? "," : "", job->numbers[index], alias, (uintmax_t)state.st_dev, (uintmax_t)state.st_ino, flags, capacity, eof ? "true" : "false");
-		for (int byte = 0; byte < length; byte++) fprintf(out, "%02x", bytes[byte]);
-		fputs("\"}", out); free(bytes);
+		json_hex(out, bytes, (size_t)length);
+		fputc('}', out); free(bytes);
 	}
 	return described;
 }
@@ -2041,6 +2050,7 @@ fail:
 /* The entire owned tree is stopped until this job retires. Capture the reachable
  * closure before calculating external owners, including rooted queue cycles. */
 static int descriptor_context(struct decision_job *job, char *line, size_t capacity) {
+	FILE *out = NULL;
 	int installed[MAX_HANDLES], total = descriptor_numbers(job->pid, 0, installed, MAX_HANDLES), next = 3;
 	if (total < 0 || !(job->captures = calloc(MAX_POSITIONS, sizeof(*job->captures)))) return -1;
 	for (int index = 0; index < total; index++) {
@@ -2123,62 +2133,62 @@ static int descriptor_context(struct decision_job *job, char *line, size_t capac
 				if (!job->captures[other].outside && job->captures[other].alias == rights->fds[right]) { job->captures[other].outside = 3; external[count++] = other; }
 		}
 	}
-	size_t used = 0;
+	/* w+ also terminates an empty descriptor list. This thread exclusively owns the stream. */
+	out = fmemopen(line, capacity, "w+"); if (!out) goto fail;
 	for (unsigned index = 0; index < job->capture_count; index++) {
 		struct file_position *capture = &job->captures[index];
 		int pin = capture->duplicate, owned = capture->installed ? !job->domain->escaped && !job->domain->uncertain && job->process->table &&
 			!job->process->table->active && descriptor_origin(job->process, capture->descriptor).id != 0 : owned_pin(job->domain, pin);
 		struct stat state; if (fstat(pin, &state) < 0) goto fail;
-		int length = snprintf(line + used, capacity - used,
+		fprintf(out,
 			"%s{\"fd\":%d,\"alias\":%d,\"device\":\"%ju\",\"inode\":\"%ju\",\"flags\":%d,\"offset\":%s%jd%s,\"owned\":%s%s",
 			index ? "," : "", capture->descriptor, capture->alias, capture->device, capture->inode, capture->flags,
 			capture->before > 9007199254740991LL ? "\"" : "", (intmax_t)capture->before, capture->before > 9007199254740991LL ? "\"" : "", owned ? "true" : "false",
 			capture->event ? ",\"type\":\"eventfd\"" : capture->stream ? (S_ISSOCK(state.st_mode) ? ",\"type\":\"socket\"" : ",\"type\":\"pipe\"") : null_device(&state) ? ",\"type\":\"null\"" : capture->directory ? ",\"type\":\"directory\"" : "");
-		if (length < 0 || (size_t)length + 512 >= capacity - used) goto fail;
-		used += (size_t)length;
-		if (!capture->installed) used += (size_t)sprintf(line + used, ",\"pin\":%d", pin);
+		if (!capture->installed) fprintf(out, ",\"pin\":%d", pin);
 		if (S_ISREG(state.st_mode) || capture->event) {
-			used += (size_t)sprintf(line + used, ",\"outside\":%d", capture->outside);
+			fprintf(out, ",\"outside\":%d", capture->outside);
 		}
 		if (capture->locks.count) {
-			if (capture->locks.count * 128UL + 512 >= capacity - used) goto fail;
-			used += (size_t)sprintf(line + used, ",\"locks\":[");
+			fputs(",\"locks\":[", out);
 			for (unsigned index = 0; index < capture->locks.count; index++) {
 				struct ofd_lock *lock = &capture->locks.entries[index];
-				used += (size_t)sprintf(line + used, "%s{\"kind\":%d,\"type\":%d,\"start\":\"%" PRId64 "\",\"length\":\"%" PRId64 "\"}", index ? "," : "", lock->kind, lock->type, lock->start, lock->length);
+				fprintf(out, "%s{\"kind\":%d,\"type\":%d,\"start\":\"%" PRId64 "\",\"length\":\"%" PRId64 "\"}", index ? "," : "", lock->kind, lock->type, lock->start, lock->length);
 			}
-			line[used++] = ']';
+			fputc(']', out);
 		}
 		if (capture->event) {
 			uint64_t value; unsigned semaphore;
 			if (event_state(getpid(), pin, &value, &semaphore) != capture->event) goto fail;
-			used += (size_t)sprintf(line + used, ",\"counter\":{\"id\":%u,\"value\":\"%" PRIu64 "\",\"semaphore\":%u}", capture->event - 1, value, semaphore);
+			fprintf(out, ",\"counter\":{\"id\":%u,\"value\":\"%" PRIu64 "\",\"semaphore\":%u}", capture->event - 1, value, semaphore);
 		} else if ((capture->directory && !(capture->flags & O_PATH)) || capture->stream) {
-			if ((size_t)capture->content_length * 2 + 512 + capture->messages.count * (64 + MAX_POSITIONS * 16) >= capacity - used) goto fail;
-			used += (size_t)sprintf(line + used, ",\"%s\":\"", capture->directory ? "directoryHex" : "queueHex");
-			for (int64_t byte = 0; byte < capture->content_length; byte++) {
-				line[used++] = "0123456789abcdef"[capture->content[byte] >> 4]; line[used++] = "0123456789abcdef"[capture->content[byte] & 15];
-			}
-			line[used++] = '"';
-			if (capture->stream) used += (size_t)sprintf(line + used, ",\"eof\":%s,\"capacity\":%d,\"outside\":%d", capture->eof ? "true" : "false", capture->capacity, endpoint_outside[index]);
+			fprintf(out, ",\"%s\":", capture->directory ? "directoryHex" : "queueHex");
+			json_hex(out, capture->content, (size_t)capture->content_length);
+			if (capture->stream) fprintf(out, ",\"eof\":%s,\"capacity\":%d,\"outside\":%d", capture->eof ? "true" : "false", capture->capacity, endpoint_outside[index]);
 			if (capture->messages.count) {
-				used += (size_t)sprintf(line + used, ",\"messages\":[");
+				fputs(",\"messages\":[", out);
 				for (unsigned message = 0; message < capture->messages.count; message++) {
 					const struct queue_message *entry = &capture->messages.entries[message];
-					used += (size_t)sprintf(line + used, "%s{\"start\":%zu,\"end\":%zu,\"rights\":[", message ? "," : "", entry->start, entry->end);
-					for (unsigned right = 0; right < entry->rights.count; right++) used += (size_t)sprintf(line + used, "%s%d", right ? "," : "", entry->rights.fds[right]);
-					used += (size_t)sprintf(line + used, "]}");
+					fprintf(out, "%s{\"start\":%zu,\"end\":%zu,\"rights\":[", message ? "," : "", entry->start, entry->end);
+					for (unsigned right = 0; right < entry->rights.count; right++) fprintf(out, "%s%d", right ? "," : "", entry->rights.fds[right]);
+					fputs("]}", out);
 				}
-				line[used++] = ']';
+				fputc(']', out);
 			}
-			if (capture->stream >= 4) used += (size_t)sprintf(line + used, ",\"socket\":{\"shutdown\":%d,\"peerShutdown\":%d,\"peerInode\":%u,\"peerQueued\":%d,\"allocated\":%d,\"type\":%u}",
+			if (capture->stream >= 4) fprintf(out, ",\"socket\":{\"shutdown\":%d,\"peerShutdown\":%d,\"peerInode\":%u,\"peerQueued\":%d,\"allocated\":%d,\"type\":%u}",
 				capture->shutdown, capture->peer_shutdown, capture->peer_inode, capture->peer_queued, capture->allocated, capture->socket_type);
 		}
-		line[used++] = '}';
+		fputc('}', out);
+		if (ferror(out)) goto fail;
 	}
-	line[used] = 0;
+	long written = ftell(out);
+	int failed = ferror(out) || written < 0 || (size_t)written >= capacity;
+	if (fclose(out)) failed = 1;
+	out = NULL;
+	if (failed) goto fail;
 	return 0;
 fail:
+	if (out) fclose(out);
 	discard_captures(job);
 	return -1;
 }
