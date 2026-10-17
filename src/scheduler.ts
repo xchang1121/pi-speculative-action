@@ -12,19 +12,10 @@ export interface ExecutionIdentity {
 }
 
 /** Current work and dependency facts. Duration is an explicit bound for this execution, never a learned service time. */
-export interface PredictionForecast extends ExecutionIdentity {
-	readonly expectedDurationMs?: number;
-	readonly elapsedMs?: number;
+export interface PredictionForecast extends ExecutionIdentity, Partial<Omit<ScheduledWork, "resources" | "resourceUnits">> {
 	readonly resourceDemand?: number | HardwareResources;
-	readonly decisionBatchesUntilCall?: number;
-	readonly criticalPathSteps?: number;
 	readonly hitProbability?: number;
-	readonly confidence?: number;
 	readonly adoptionProbability?: number;
-	readonly background?: boolean;
-	readonly actorDemand?: boolean;
-	readonly actorHint?: boolean;
-	readonly dependenciesResolved?: boolean;
 }
 
 export interface ScheduledWork {

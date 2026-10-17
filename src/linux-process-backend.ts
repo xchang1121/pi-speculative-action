@@ -31,7 +31,7 @@ import { EffectCommitFailure, effectCommitFailure, isPoisonedEffectCommit } from
 import { execHostText as execText, resolveHostExecutable } from "./executable-path.ts";
 import { assertNoSymlinkPath, cachedCapture, captureFilesystemEntry, captureStableFile, hashExecutableFile, mapFilesystem, rememberCapture, sameFilesystemIdentity, sharedWalk, walkFilesystemPath } from "./filesystem-evidence.ts";
 import { captureHeldDescriptorInputs, inspectHeldExecProcess, LinuxHeldExecBoundary, listenUnixSocket, writeProcessChannel, resolveLinuxExecHelper, type HeldExecDecision,
-	type HeldExecProcess, type HeldExecSnapshot, type HeldExecTiming, type HeldExecClock, descriptorInputs, descriptorEffects, inheritedTracer, type ProcessResourceGraph } from "./linux-held-exec.ts";
+	type HeldExecProcess, type HeldExecSnapshot, type HeldExecTiming, type HeldExecClock, type HeldFileDescriptor, descriptorInputs, descriptorEffects, inheritedTracer, type ProcessResourceGraph } from "./linux-held-exec.ts";
 import { emptyWorldReuseMetrics, snapshotExecutionScope, type ExecutionScope, type ExecutionOperationAdoption, type ExecutionResourceContext, type ExecutionOperationBinding, type ExecutionWorldStorageControl,
 	type WorldReuseMetrics } from "./execution-world.ts";
 import { type ProcessReusePlan, ProcessReusePlanner } from "./reuse-planner.ts";
@@ -127,8 +127,7 @@ interface DispatcherRequest {
 	/** The successfully installed image, held before its first user instruction. */
 	readonly pid: number;
 	/** Inherited pipes beyond stdio as the launcher sees them now: each end, and its queue unconsumed. */
-	readonly descriptors?: readonly { readonly fd: number; readonly alias: number; readonly device: string; readonly inode: string; readonly flags: number;
-		readonly capacity: number; readonly eof: boolean; readonly queueHex: string }[];
+	readonly descriptors?: readonly Required<Pick<HeldFileDescriptor, "fd" | "alias" | "device" | "inode" | "flags" | "capacity" | "eof" | "queueHex">>[];
 }
 
 /** The outlet each target output uses; 0 discards into /dev/null. */

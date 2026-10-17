@@ -39,7 +39,7 @@ export interface SynchronousProcessResult {
 	readonly inputs?: readonly CapturedFilesystemTransfer[];
 }
 type NativeSessionInput = Parameters<LinuxProcessReuseBackend["open"]>[0];
-type SessionSnapshot = { readonly bindings: readonly SerializedProcessBinding[]; readonly computations: readonly SerializedDependency[]; readonly metrics: WorldReuseMetrics };
+type SessionSnapshot = Pick<SynchronousProcessResult, "bindings" | "computations" | "metrics">;
 const retiredSessions = new FinalizationRegistry<{ readonly owner: WeakRef<SynchronousProcessObserver>; readonly id: number; readonly signal?: AbortSignal; readonly abort: () => void }>(({ owner, id, signal, abort }) => {
 	signal?.removeEventListener("abort", abort);
 	void owner.deref()?.call("release", id).catch(() => undefined);

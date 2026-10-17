@@ -167,7 +167,7 @@ export type PatternAwareContinuation = {
 
 export type PatternAwareRuntimeContext = { readonly store: PatternAwareStore; readonly continuation: PatternAwareContinuation; };
 
-export type PatternAwareObservation = { readonly output?: unknown; readonly outputPaths?: ReadonlyArray<string>; readonly outputLocations?: ReadonlyArray<OutputLocation> };
+export type PatternAwareObservation = Pick<PatternAwareEventInput, "output" | "outputPaths" | "outputLocations">;
 
 type MutablePattern = {
 	id: string;
