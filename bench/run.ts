@@ -1,7 +1,7 @@
 import { safeName } from "./suite-report.ts";
 import { parsePatternPresets } from "./pattern-options.ts";
 import { benchmarkTraceReport, slowCallReport } from "./trace-report.ts";
-import { execFile } from "node:child_process";
+import { execHostFile } from "../src/executable-path.ts";
 import { mkdtemp, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -448,13 +448,9 @@ function required(value: string | undefined, option: string): string {
 async function exists(value: string): Promise<boolean> { try { await stat(value); return true; } catch { return false; } }
 
 function command(file: string, args: readonly string[], cwd?: string): Promise<CommandResult> {
-	return new Promise((resolve, reject) => {
-		execFile(file, args, { cwd, env: benchmarkShellEnvironment(), maxBuffer: 32 * 1024 * 1024 }, (error, stdout, stderr) => {
-			if (error) {
-				reject(new Error(`${file} ${args.join(" ")} failed: ${stderr || error.message}`));
-				return;
-			}
-			resolve({ stdout, stderr });
+	return execHostFile(file, args, { cwd, env: benchmarkShellEnvironment(), maxBuffer: 32 * 1024 * 1024 })
+		.catch(error => {
+			if (error.stderr === undefined) throw error;
+			throw new Error(`${file} ${args.join(" ")} failed: ${error.stderr || error.message}`);
 		});
-	});
 }

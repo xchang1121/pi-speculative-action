@@ -1,12 +1,9 @@
-import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import path from "node:path";
-import { promisify } from "node:util";
-
-const execFileAsync = promisify(execFile);
+import { execHostFile } from "./executable-path.ts";
 
 async function gitOutput(cwd: string, args: readonly string[]): Promise<string> {
-	const { stdout } = await execFileAsync("git", ["--no-optional-locks", "-C", cwd, ...args], {
+	const { stdout } = await execHostFile("git", ["--no-optional-locks", "-C", cwd, ...args], {
 		encoding: "utf8",
 		windowsHide: true,
 	});

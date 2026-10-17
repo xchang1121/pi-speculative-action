@@ -1,5 +1,5 @@
 import { isSafeCount } from "./number-utils.ts";
-import { execFile } from "node:child_process";
+import { execHostFile } from "./executable-path.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants, type BigIntStats, type Stats } from "node:fs";
 import { access, chmod, copyFile, type FileHandle, link, lstat, mkdir, mkdtemp, open, readdir, realpath, rename, rm, rmdir, unlink, utimes, writeFile } from "node:fs/promises";
@@ -2120,11 +2120,14 @@ export const useModifiedTimesHelper = (binary: string) => { modifiedTimesHelper 
  * microseconds, so on Linux, whose traces record them, the helper or else coreutils touch sets them; elsewhere a file keeps its commit's time. */
 export async function restoreModifiedTimes(files: readonly (readonly [target: string, modified: string | undefined])[]): Promise<void> {
 	const times = files.flatMap(([target, modified]) => /^\d+$/.test(modified ?? "") ? [[modified!.padStart(10, "0").slice(0, -9), modified!.slice(-9).padStart(9, "0"), target]] : []);
-	if (process.platform === "linux" && modifiedTimesHelper && times.length) return new Promise<void>((resolve, reject) => execFile(modifiedTimesHelper!, ["--set-modified-times"],
-		error => error ? reject(error) : resolve()).stdin?.end(times.map(([seconds, nanoseconds, target]) => `${seconds} ${nanoseconds} ${target}\0`).join("")));
+	if (process.platform === "linux" && modifiedTimesHelper && times.length) {
+		const pending = execHostFile(modifiedTimesHelper, ["--set-modified-times"]);
+		pending.child.stdin?.end(times.map(([seconds, nanoseconds, target]) => `${seconds} ${nanoseconds} ${target}\0`).join(""));
+		await pending; return;
+	}
 	const pairs = times.flatMap(([seconds, nanoseconds, target]) => [`@${seconds}.${nanoseconds}`, target!]);
-	for (let start = 0; process.platform === "linux" && start < pairs.length; start += 1024) await new Promise<void>((resolve, reject) => execFile("sh",
-		["-c", 'while [ $# -gt 0 ]; do touch -chm -d "$1" -- "$2" || exit; shift 2; done', "sh", ...pairs.slice(start, start + 1024)], error => error ? reject(error) : resolve()));
+	for (let start = 0; process.platform === "linux" && start < pairs.length; start += 1024) await execHostFile("sh",
+		["-c", 'while [ $# -gt 0 ]; do touch -chm -d "$1" -- "$2" || exit; shift 2; done', "sh", ...pairs.slice(start, start + 1024)]);
 }
 
 async function replaceFile(temporary: string, target: string, mode?: number): Promise<void> {
@@ -2161,11 +2164,11 @@ function parseNullList(value: Uint8Array): string[] { return value.toString().sp
 /** The existing process owner binds each private repository/index once, preserving per-call cwd and limits. */
 function bindGit(command: string, cwd: string, prefix: readonly string[] = []) {
 	const bound = [...prefix];
-	return (input: readonly string[], options: { cwd?: string; environment?: Readonly<Record<string, string>>; maxBuffer?: number; input?: Buffer } = {}): Promise<Buffer> => new Promise((resolve, reject) => {
+	return (input: readonly string[], options: { cwd?: string; environment?: Readonly<Record<string, string>>; maxBuffer?: number; input?: Buffer } = {}): Promise<Buffer> => {
 		const args = [...bound, ...input];
-		execFile(
+		const pending = execHostFile(
 			command,
-			[...args],
+			args,
 			{
 				cwd: options.cwd ?? cwd,
 				env: {
@@ -2178,18 +2181,14 @@ function bindGit(command: string, cwd: string, prefix: readonly string[] = []) {
 				encoding: "buffer",
 				maxBuffer: options.maxBuffer ?? 64 * 1024 * 1024,
 			},
-			(error, stdout, stderr) => {
-				if (error) {
-					const detail = Buffer.from(stderr).toString("utf8").trim() || error.message;
-					const shown = args.slice(0, 16).join(" ");
-					const omitted = Math.max(0, args.length - 16);
-					reject(
-						new Error(`${command} ${shown}${omitted ? ` … (${omitted} args omitted)` : ""} failed: ${detail}`),
-					);
-					return;
-				}
-				resolve(Buffer.from(stdout));
-			},
-		).stdin?.end(options.input);
-	});
+		);
+		pending.child.stdin?.end(options.input);
+		return pending.then(({ stdout }) => stdout, error => {
+			if (error.stderr === undefined) throw error;
+			const detail = error.stderr.toString("utf8").trim() || error.message;
+			const shown = args.slice(0, 16).join(" ");
+			const omitted = Math.max(0, args.length - 16);
+			throw new Error(`${command} ${shown}${omitted ? ` … (${omitted} args omitted)` : ""} failed: ${detail}`);
+		});
+	};
 }

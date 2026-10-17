@@ -360,12 +360,10 @@ export class ResourceReadView {
 			const inputEpoch = owner.inputEpoch; // Rejected old sources precede this new computation.
 			let resource: Awaited<ReturnType<typeof build>> | undefined;
 			let bytes = 0, computationBytes = 32;
-			let decline!: () => void;
-			let composed: (() => void) | undefined;
+			const declined = Promise.withResolvers<void>(), composed = this.acceptProofs && Promise.withResolvers<void>();
 			const name = target && filesystemPathKey(target);
 			const pending: PreparedResource = { resource: name, origin: owner, destination: owner, borrowers: 0, boundary: this.boundary, cancellation: new SharedAbortScope(), waiting: new Set(),
-				declined: new Promise<void>(resolve => { decline = resolve; }),
-				composed: this.acceptProofs && new Promise<void>(resolve => { composed = resolve; }),
+				declined: declined.promise, composed: composed?.promise,
 				dispose: async () => { try { await resource?.dispose(); } finally {
 					if (prepared.bindings.get(binding)?.get(key) === pending) prepared.bindings.get(binding)!.delete(key);
 					await Promise.allSettled(pending.proofs?.map(proof => proof.release()) ?? []);
@@ -376,7 +374,7 @@ export class ResourceReadView {
 			if (!entries.has(key) || !entries.get(key)!.retained && entries.get(key)!.cancellation.signal.aborted) entries.set(key, pending);
 			pending.ready = this.evaluate(async view => {
 				view.preparing = pending;
-				const foreign = view.onForeignInputs; view.onForeignInputs = transferable => { if (transferable) composed?.(); else decline(); foreign?.(transferable); };
+				const foreign = view.onForeignInputs; view.onForeignInputs = transferable => { if (transferable) composed?.resolve(); else declined.resolve(); foreign?.(transferable); };
 				view.collectProofs = this.acceptProofs ? new Map() : undefined;
 				const evaluation = await TimelineInterval.measure(() => build(view, pending.cancellation.signal));
 				resource = evaluation.output; pending.computation = TimelineInterval.own(evaluation.computation);
@@ -404,7 +402,7 @@ export class ResourceReadView {
 				}
 				// The origin keeps a borrowed lookup; the destination owns its bytes and disposal.
 			});
-			void pending.ready.finally(() => { decline(); composed?.(); }).catch(() => {});
+			void pending.ready.finally(() => { declined.resolve(); composed?.resolve(); }).catch(() => {});
 			return (await use(pending, true))!.value;
 		});
 	});

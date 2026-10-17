@@ -1,4 +1,5 @@
 import { isSafeCount } from "./number-utils.ts";
+import { isUtf8 } from "node:buffer";
 import { spawn, type ChildProcess } from "node:child_process";
 import { on, once } from "node:events";
 import { AsyncLocalStorage, AsyncResource } from "node:async_hooks";
@@ -281,7 +282,7 @@ interface WireRequest {
 export class LinuxHeldExecBoundary {
 	private readonly token = randomBytes(32).toString("hex");
 	private readonly active = new Map<string, ActiveExecution>();
-	private readonly calls = new Set<{ readonly controller: AbortController; readonly completion: Promise<void> }>();
+	private readonly calls = new Set<PromiseWithResolvers<void> & { readonly controller: AbortController }>();
 	private readonly server: net.Server;
 	private readonly sockets = new Set<net.Socket>();
 	private readonly socketPath: string;
@@ -332,8 +333,8 @@ export class LinuxHeldExecBoundary {
 		const controller = new AbortController(), launches = new Set<{ readonly child: ChildProcess; readonly attachment: HeldExecAttachment }>();
 		const signal = AbortSignal.any([controller.signal, ...(options.signal ? [options.signal] : [])]);
 		const snapshot = { ...options, scope: snapshotExecutionScope(options.scope), signal };
-		let finished!: () => void, closed = false;
-		const call = { controller, completion: new Promise<void>(resolve => { finished = resolve; }) };
+		let closed = false;
+		const call = { controller, ...Promise.withResolvers<void>() };
 		this.calls.add(call); enterStartup();
 		try {
 			const available = () => !closed && !signal.aborted;
@@ -349,7 +350,7 @@ export class LinuxHeldExecBoundary {
 			closed = true;
 			for (const { child, attachment } of launches) if (!child.pid || child.exitCode === null && child.signalCode === null) attachment.retire();
 			const settled = await Promise.allSettled([...launches].map(launch => launch.attachment.completion));
-			this.calls.delete(call); finished(); restoreStartup!();
+			this.calls.delete(call); call.resolve(); restoreStartup!();
 			for (const result of settled) if (result.status === "rejected") throw result.reason;
 		}
 	}
@@ -412,7 +413,7 @@ export class LinuxHeldExecBoundary {
 			for (const call of this.calls) call.controller.abort(new Error("held-exec boundary disposed"));
 			const active = [...this.active.values()]; for (const execution of active) execution.retire();
 			for (const socket of this.sockets) socket.destroy();
-			await Promise.allSettled([stopped, ...[...this.calls].map(call => call.completion), ...active.map(execution => execution.completion)]);
+			await Promise.allSettled([stopped, ...[...this.calls].map(call => call.promise), ...active.map(execution => execution.completion)]);
 			await rm(this.socketPath, { force: true }).catch(() => undefined);
 		});
 	}
@@ -424,8 +425,7 @@ export class LinuxHeldExecBoundary {
 		let decision: HeldExecDecision | undefined, native: HeldExecClock | undefined;
 		let completedAt: number | undefined, committedAt: number | undefined;
 		let outcome: HeldExecTiming["outcome"] = "declined";
-		let release!: () => void;
-		const pending = new Promise<void>((resolve) => { release = resolve; });
+		const { promise: pending, resolve: release } = Promise.withResolvers<void>();
 		try {
 			const request = parseRequest(await readLine(socket));
 			active = request?.token === this.token ? this.active.get(request.execution) : undefined;
@@ -707,11 +707,9 @@ export async function captureHeldDescriptorInputs(pid: number, descriptors: read
 }
 
 function decodeNullFields(bytes: Buffer): string[] {
+	if (!isUtf8(bytes)) throw new Error("held process metadata is not valid UTF-8");
 	const fields = bytes.toString("utf8").split("\0");
 	if (fields.at(-1) === "") fields.pop();
-	if (!Buffer.from(`${fields.join("\0")}${bytes.at(-1) === 0 ? "\0" : ""}`, "utf8").equals(bytes)) {
-		throw new Error("held process metadata is not valid UTF-8");
-	}
 	return fields;
 }
 

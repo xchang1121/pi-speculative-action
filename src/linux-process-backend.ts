@@ -28,7 +28,7 @@ import { captureWorkspaceStructure, diffWorkspaceStructures, ExecutionPathProjec
 import { definedProcessEnvironment, type ProcessRouteSnapshot, type ProcessExecutionRequest,
 	type ProcessExecutor } from "./process-execution.ts";
 import { EffectCommitFailure, effectCommitFailure, isPoisonedEffectCommit } from "./effect-transaction.ts";
-import { execHostText as execText, resolveHostExecutable } from "./executable-path.ts";
+import { execHostFile, execHostText as execText, resolveHostExecutable } from "./executable-path.ts";
 import { assertNoSymlinkPath, cachedCapture, captureFilesystemEntry, captureStableFile, hashExecutableFile, mapFilesystem, rememberCapture, sameFilesystemIdentity, sharedWalk, walkFilesystemPath } from "./filesystem-evidence.ts";
 import { captureHeldDescriptorInputs, inspectHeldExecProcess, LinuxHeldExecBoundary, listenUnixSocket, writeProcessChannel, resolveLinuxExecHelper, type HeldExecDecision,
 	type HeldExecProcess, type HeldExecSnapshot, type HeldExecTiming, type HeldExecClock, type HeldFileDescriptor, descriptorInputs, descriptorEffects, inheritedTracer, type ProcessResourceGraph } from "./linux-held-exec.ts";
@@ -1564,8 +1564,7 @@ async function reopenProcessResources(graph: ProcessResourceGraph, projection: E
 			if (object.content !== undefined) {
 				// Enumeration cookies and inode numbers belong to the logical filesystem, not the private backing tree.
 				await assertNoSymlinkPath(projection.sourceRoot, logical);
-				content = await new Promise<Buffer>((resolve, reject) => execFile(dispatcher, ["--directory-image", logical],
-					{ encoding: "buffer", maxBuffer: remaining, signal }, (error, stdout) => error ? reject(error) : resolve(stdout)));
+				content = (await execHostFile(dispatcher, ["--directory-image", logical], { encoding: "buffer", maxBuffer: remaining, signal })).stdout;
 			}
 		}
 		if (!sameFilesystemIdentity(before, await lstat(physical, { bigint: true }))) throw new Error("reopened input changed during capture");

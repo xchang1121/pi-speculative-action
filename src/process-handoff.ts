@@ -457,8 +457,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 
 	private reserve(key: Sha256Digest, executablePath: string, ownership: ProcessHandoffOwnership, scope?: ExecutionScope) {
 		if (this.disposed) throw new Error("process handoff registry is disposed");
-		let settle!: () => void;
-		const completion = new Promise<void>((resolve) => { settle = resolve; });
+		const { promise: completion, resolve: settle } = Promise.withResolvers<void>();
 		const controller: AbortController = new AbortController();
 		const record = {
 			key, completion, executablePath, scope, ownership, settle, startedAt: performance.now(), state: { status: "running" } as HandoffState,

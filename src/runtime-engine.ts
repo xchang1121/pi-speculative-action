@@ -925,8 +925,8 @@ export function makeSpeculativeActionRuntime<
 	const prepareWithinResources = (owner: object, input: Omit<Preparation, "active" | "completion" | "complete">): Promise<void> => {
 		const signal = input.controller.signal;
 		if (signal.aborted) return Promise.resolve();
-		let resolve!: () => void;
-		const entry: Preparation = { ...input, active: false, completion: new Promise<void>(done => { resolve = done; }),
+		const { promise: completion, resolve } = Promise.withResolvers<void>();
+		const entry: Preparation = { ...input, active: false, completion,
 			complete: () => { signal.removeEventListener("abort", aborted); scheduler.complete(entry); preparations.delete(owner); resolve(); wakeResourceWaiters(); } };
 		const aborted = () => {
 			entry.fail(signal.reason ?? cause("control", "preparation_aborted"));

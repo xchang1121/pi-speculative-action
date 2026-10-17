@@ -81,8 +81,7 @@ export class ActorForkPlanSource {
 
 	startTurn(turnID: string, reuseFeedback?: unknown): void {
 		this.closeTurn(turnID);
-		let resolve!: (batches: readonly ActorForkActionBatch[]) => void;
-		const promise = new Promise<readonly ActorForkActionBatch[]>((settle) => { resolve = settle; });
+		const { promise, resolve } = Promise.withResolvers<readonly ActorForkActionBatch[]>();
 		this.pending.set(turnID, {
 			schedule: this.schedule,
 			reuseFeedback,

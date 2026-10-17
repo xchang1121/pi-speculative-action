@@ -36,11 +36,11 @@ export interface CandidateReservationLease {
 /** Owns execution and reservation as independent, monotonic facts. */
 export class CandidateExecution<Output> {
 	readonly controller: AbortController;
-	readonly completion: Promise<CandidateExecutionSettlement<Output>>;
+	private readonly completionState = Promise.withResolvers<CandidateExecutionSettlement<Output>>();
+	readonly completion = this.completionState.promise;
 	private readonly released?: () => void;
 	private executionValue: CandidateExecutionState<Output> = Object.freeze({ status: "queued" });
 	private reservationValue: CandidateReservation;
-	private settleCompletion!: (settlement: CandidateExecutionSettlement<Output>) => void;
 
 	constructor(reuse: "shared" | "exclusive", controller = new AbortController(), released?: () => void) {
 		this.controller = controller;
@@ -49,7 +49,6 @@ export class CandidateExecution<Output> {
 			reuse === "shared"
 				? Object.freeze({ kind: "shared", owners: Object.freeze([]) })
 				: Object.freeze({ kind: "exclusive", status: "available" });
-		this.completion = new Promise(resolve => { this.settleCompletion = resolve; });
 	}
 
 	get execution(): CandidateExecutionState<Output> {
@@ -119,7 +118,7 @@ export class CandidateExecution<Output> {
 		const owned = settlement.status === "succeeded" ? { ...settlement, toolExecution: TimelineInterval.from(settlement.toolExecution) }
 			: { ...settlement, cause: Object.freeze({ ...settlement.cause }) };
 		this.executionValue = Object.freeze({ ...owned, executionMs: metric(owned.executionMs) });
-		this.settleCompletion(this.executionValue);
+		this.completionState.resolve(this.executionValue);
 		return true;
 	}
 }

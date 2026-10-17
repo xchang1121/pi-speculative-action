@@ -59,7 +59,7 @@ export class CapturedFilesystemObject {
 		const { object: _object, stat, content, computation: _computation, ...capture } = this.capture;
 		const transfer = { ...capture, fd: this.handle.fd, active: active.buffer, stat: Object.fromEntries(IDENTITY_FIELDS.map(key => [key, stat[key]])) as FilesystemIdentity,
 			content: content && Uint8Array.from(content), computation: computation && TimelineInterval.serialize(computation) };
-		let release!: () => void; this.lifetime.track(new Promise<void>(resolve => { release = resolve; }));
+		const { promise, resolve: release } = Promise.withResolvers<void>(); this.lifetime.track(promise);
 		return { transfer, release: () => { Atomics.store(active, 0, 0); release(); } };
 	}
 	/** Synchronous import cannot dispatch caller callbacks; a fresh O_PATH descriptor preserves independent ownership. */
