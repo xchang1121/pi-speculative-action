@@ -26,8 +26,7 @@ interface IndexedEntry<Entry> {
 
 interface IndexedScope<Entry> {
 	readonly entries: Map<string, IndexedEntry<Entry>>;
-	readonly pending: Set<IndexedEntry<Entry>>;
-	/** Tagged exact/input/view keys and JSON projection keys occupy disjoint namespaces. */
+	/** Pending work, tagged exact/input/view keys and JSON projections occupy disjoint namespaces. */
 	readonly partitions: Map<string, Set<IndexedEntry<Entry>>>;
 }
 
@@ -111,7 +110,7 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 		const indexed = this.record(scope, entry), state = this.scopes.get(scope);
 		if (!indexed || !state || !resources.length) return;
 		const keys = new Set(resources.flatMap(resource => [inputPartition(resource), inputPartition(resource, true)]));
-		this.unindex(state, indexed, key => keys.has(key));
+		this.unindex(state, indexed, keys);
 	}
 
 	/** Sealed queries remain addressable after their reconstruction inputs are revoked. */
@@ -120,7 +119,7 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 		if (!indexed || !state) return;
 		const key = `view:${actionKey}`;
 		if (retained) this.index(state, indexed, [key]);
-		else this.unindex(state, indexed, name => name === key);
+		else this.unindex(state, indexed, [key]);
 		this.notify(scope);
 	}
 
@@ -128,7 +127,6 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 		const indexed = this.record(scope, entry), state = this.scopes.get(scope);
 		if (!indexed || !state) return false;
 		state.entries.delete(entry.id);
-		state.pending.delete(indexed);
 		this.unindex(state, indexed);
 		if (!state.entries.size) this.scopes.delete(scope);
 		this.notify(scope);
@@ -144,7 +142,7 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 	}
 
 	pending(scope: Scope): Entry[] {
-		return [...(this.scopes.get(scope)?.pending ?? [])].map(({ entry }) => entry);
+		return [...(this.scopes.get(scope)?.partitions.get("pending") ?? [])].map(({ entry }) => entry);
 	}
 
 	/** A present input capability may own calculations without paths; retention preserves its existing identity. */
@@ -152,7 +150,7 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 		this.insert(scope, entry);
 		const indexed = this.record(scope, entry);
 		if (!indexed) return;
-		this.scopes.get(scope)!.pending.delete(indexed);
+		this.unindex(this.scopes.get(scope)!, indexed, ["pending"]);
 		indexed.result ??= { segment: "cold", insertedAt: this.now(), actorHits: 0 };
 		if (shared && !indexed.inputs && (branch.inputSource || branch.reconstruct)) {
 			this.index(this.scopes.get(scope)!, indexed, branch.inputResources?.map(input => inputPartition(input.path, input.descendants)) ?? []);
@@ -203,12 +201,11 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 		}
 	}
 
-	private unindex(state: IndexedScope<Entry>, indexed: IndexedEntry<Entry>, remove: (key: string) => boolean = () => true): void {
-		for (const key of indexed.memberships) {
-			if (!remove(key)) continue;
-			const members = state.partitions.get(key)!;
-			members.delete(indexed);
-			if (!members.size) state.partitions.delete(key);
+	private unindex(state: IndexedScope<Entry>, indexed: IndexedEntry<Entry>, keys: Iterable<string> = indexed.memberships): void {
+		for (const key of keys) {
+			const members = state.partitions.get(key);
+			members?.delete(indexed);
+			if (!members?.size) state.partitions.delete(key);
 			indexed.memberships.delete(key);
 		}
 	}
@@ -251,13 +248,12 @@ export class CandidateStore<Scope, Entry extends CandidateStoreEntry> {
 	}
 
 	private add(scope: Scope, entry: Entry, partitions: readonly string[]): Entry | undefined {
-		const state: IndexedScope<Entry> = this.scopes.get(scope) ?? { entries: new Map(), pending: new Set(), partitions: new Map() };
+		const state: IndexedScope<Entry> = this.scopes.get(scope) ?? { entries: new Map(), partitions: new Map() };
 		const existing = state.entries.get(entry.id);
 		if (existing) return existing.entry;
 		const indexed: IndexedEntry<Entry> = { entry, memberships: new Set(), recency: this.sequence++ };
 		state.entries.set(entry.id, indexed);
-		state.pending.add(indexed);
-		this.index(state, indexed, [...(entry.key ? [`exact:${entry.key.key}`] : []), ...partitions]);
+		this.index(state, indexed, ["pending", ...(entry.key ? [`exact:${entry.key.key}`] : []), ...partitions]);
 		this.scopes.set(scope, state);
 		this.notify(scope);
 		return undefined;
