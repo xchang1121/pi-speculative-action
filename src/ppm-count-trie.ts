@@ -12,7 +12,6 @@ type TargetCount = { count: number; lastSeen: number };
 type ContextCounts = {
 	readonly context: readonly string[];
 	readonly targets: Map<string, TargetCount>;
-	total: number;
 	lastSeen: number;
 };
 
@@ -34,27 +33,25 @@ export class PpmCountTrie {
 			const current = this.context(context);
 			// Advance all sufficient statistics before adding the new observation.
 			if (halfLife > 0 && lastSeen > current.lastSeen) {
-				current.total = 0;
 				for (const value of current.targets.values()) {
-					value.count = safeCount(decayedCount(value, lastSeen, halfLife));
+					value.count = decayedCount(value, lastSeen, halfLife);
 					value.lastSeen = lastSeen;
-					current.total = safeCount(current.total + value.count, Number.MAX_VALUE / 2);
 				}
 			}
 			const previous = current.targets.get(target);
-			this.put(current, target, safeCount((previous?.count ?? 0) + 1), Math.max(previous?.lastSeen ?? 0, lastSeen));
+			this.put(current, target, Math.min(Number.MAX_SAFE_INTEGER, (previous?.count ?? 0) + 1), Math.max(previous?.lastSeen ?? 0, lastSeen));
 		}
 	}
 
 	/** Replace one exact context's evidence, without changing any suffix counts. */
 	setCount(context: readonly string[], target: string, count: number, lastSeen = 0): void {
 		if (target && context.length <= this.order && Number.isFinite(count) && count > 0)
-			this.put(this.context(context), target, safeCount(count), nonNegativeCount(lastSeen));
+			this.put(this.context(context), target, Math.min(Number.MAX_SAFE_INTEGER, count), nonNegativeCount(lastSeen));
 	}
 
 	distribution(history: readonly string[], sequence = 0, halfLife = 0): ReadonlyMap<string, number> {
 		const estimates = new Map<string, number>();
-		if (!this.counts.get("[]")?.total) return estimates;
+		if (!this.counts.has("[]")) return estimates;
 		const suffixes = [...this.suffixes(history)].flatMap(context => this.counts.get(JSON.stringify(context)) ?? []);
 		// Prefer the shortest deterministic suffix to its equally deterministic extensions.
 		const deterministic = suffixes.findIndex((suffix, index) => index > 0 && suffix.targets.size === 1);
@@ -111,27 +108,22 @@ export class PpmCountTrie {
 	private context(context: readonly string[]): ContextCounts {
 		const key = JSON.stringify(context);
 		let current = this.counts.get(key);
-		if (!current) this.counts.set(key, current = { context: [...context], targets: new Map(), total: 0, lastSeen: 0 });
+		if (!current) this.counts.set(key, current = { context: [...context], targets: new Map(), lastSeen: 0 });
 		return current;
 	}
 
 	private put(current: ContextCounts, target: string, count: number, lastSeen: number): void {
-		const previous = current.targets.get(target);
-		current.total = safeCount(current.total + count - (previous?.count ?? 0), Number.MAX_VALUE / 2);
 		current.targets.set(target, { count, lastSeen });
 		current.lastSeen = Math.max(current.lastSeen, lastSeen);
 	}
 
 	private ranked() {
-		return [...this.counts].sort(([leftKey, left], [rightKey, right]) =>
+		return [...this.counts].map(([key, row]) => [key, row, [...row.targets.values()].reduce((sum, value) => sum + value.count, 0)] as const)
+			.sort(([leftKey, left, leftTotal], [rightKey, right, rightTotal]) =>
 			Number(right.context.length === 0) - Number(left.context.length === 0) ||
-			right.total - left.total || right.context.length - left.context.length ||
+			rightTotal - leftTotal || right.context.length - left.context.length ||
 			right.lastSeen - left.lastSeen || leftKey.localeCompare(rightKey));
 	}
-}
-
-function safeCount(value: number, maximum = Number.MAX_SAFE_INTEGER): number {
-	return Math.min(maximum, Math.max(0, Number.isFinite(value) ? value : maximum));
 }
 
 function decayedCount(value: TargetCount, sequence: number, halfLife: number): number {

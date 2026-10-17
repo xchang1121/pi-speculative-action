@@ -79,3 +79,11 @@ test.each([1, 8, 64])("keeps bounded learned suffixes through persistence and fu
 	expect(probabilities.every(value => Number.isFinite(value) && value > 0 && value < 1)).toBe(true);
 	expect(probabilities.reduce((sum, value) => sum + value, 0)).toBeLessThanOrEqual(1);
 });
+
+test("restores replacement counts without losing probability or retention priority", () => {
+	const model = new PpmCountTrie(1), row = (context: string[], count: number) => ({ context, counts: { read: count }, lastSeen: 0 });
+	model.restore([row([], Number.MAX_SAFE_INTEGER), row([], 0.25), row(["strong"], Number.MAX_SAFE_INTEGER), row(["strong"], 0.25), row(["weak"], 0.125)]);
+	expect(model.distribution([]).get("read")).toBeCloseTo(0.2);
+	model.trim(2);
+	expect(model.snapshot().map(row => row.context)).toEqual([[], ["strong"]]);
+});
