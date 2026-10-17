@@ -173,29 +173,43 @@ function reassembleSyscalls(lines: readonly string[], pid: number, order?: reado
  * fork copies them. This is the same journal used for queue effects, not another replay path. */
 function resourceTransitions(processes: ReadonlyMap<number, TraceProcess>, root: number, options: StraceObservationOptions) {
 	const handles = options.inheritedHandles ?? [];
-	type Handle = { inode: string; description?: number; access: number; cloexec: boolean; packet?: boolean; epoll?: Map<string, { handle: Handle; mask: number; data: string; armed: boolean; generation?: number }> };
-	const descriptions = new Map<number, Handle>(handles.map(handle =>
-		[handle.fd, { inode: handle.inode, description: handle.description ?? handle.fd, access: (handle.flags & 3) + 1, cloexec: false, packet: handle.packet }]));
+	type Handle = { object: Resource; description?: number; access: number; cloexec: boolean; packet?: boolean; epoll?: Map<string, { handle: Handle; mask: number; data: string; armed: boolean; generation?: number }> };
+	type Resource = { inode: string; outside?: number; peer?: Resource; generation: number; read: number; end?: number; content?: Buffer };
+	const resources = new Map<string, Resource>();
+	const descriptions = new Map<number, Handle>();
+	const resource = (inode: string): Resource => {
+		let state = resources.get(inode);
+		if (!state) resources.set(inode, state = { inode, generation: 0, read: 0 });
+		return state;
+	};
+	for (const handle of handles) {
+		const state = resource(handle.inode);
+		state.outside = handle.outside; state.end = handle.queuedBytes ?? 0;
+		if (handle.queueData) state.content = handle.queueData;
+		descriptions.set(handle.fd, { object: state, description: handle.description ?? handle.fd, access: (handle.flags & 3) + 1, cloexec: false, packet: handle.packet });
+	}
 	const tables = new Map<number, Map<number, Handle>>([[root, new Map(handles.filter(handle => handle.installed !== false)
 		.map(handle => [handle.fd, descriptions.get(handle.fd)!]))]]);
-	const outside = new Map(handles.map(handle => [handle.inode, handle.outside]));
 	const journal: Array<NonNullable<StraceObservation["resourceJournal"]>[number] & { order: number }> = [];
 	const handled = new Set<TraceLine>();
-	const peers = new Map<string, string>(), generations = new Map<string, number>();
-	const cursors = new Map<string, { read: number; end: number }>(handles.map(handle => [handle.inode, { read: 0, end: handle.queuedBytes ?? 0 }]));
-	const contents = new Map(handles.filter(handle => handle.queueData).map(handle => [handle.inode, handle.queueData!]));
-	const messages: Array<{ inode: string; start: number; end: number; rights: Handle[] }> = handles.flatMap(handle => (handle.messages ?? []).map(message => ({
-		inode: handle.inode, start: message.start, end: message.end, rights: message.rights.map(fd => {
+	const messages: Array<{ object: Resource | undefined; start: number; end: number; rights: Handle[] }> = handles.flatMap(handle => (handle.messages ?? []).map(message => ({
+		object: resource(handle.inode), start: message.start, end: message.end, rights: message.rights.map(fd => {
 			const reference = descriptions.get(fd);
 			if (!reference) throw new Error("unproven queued descriptor");
 			return reference;
 		}),
 	})));
-	const wake = (inode: string | undefined) => { if (inode !== undefined) generations.set(inode, (generations.get(inode) ?? 0) + 1); };
+	const wake = (object: Resource | undefined) => { if (object) object.generation++; };
+	const append = (object: Resource | undefined, data: Buffer) => {
+		if (!object) return;
+		if (object.content) object.content = Buffer.concat([object.content, data]);
+		if (object.end !== undefined) object.end += data.length;
+		wake(object);
+	};
 	const references = () => {
-		const masks = new Map<string, number>(), descriptions = new Map<number | undefined, Handle>();
+		const masks = new Map<Resource, number>(), descriptions = new Map<number | undefined, Handle>();
 		for (const handle of [...new Set(tables.values())].flatMap(table => [...table.values()]).concat(messages.flatMap(message => message.rights))) {
-			masks.set(handle.inode, (masks.get(handle.inode) ?? 0) | handle.access);
+			masks.set(handle.object, (masks.get(handle.object) ?? 0) | handle.access);
 			descriptions.set(handle.description, handle);
 		}
 		return { masks, descriptions };
@@ -209,48 +223,45 @@ function resourceTransitions(processes: ReadonlyMap<number, TraceProcess>, root:
 		let before = lifetime || messages.length && /^(?:read|readv|recvfrom|recvmsg)$/.test(line.name) ? references() : undefined;
 		const endpoint = (argument: string | undefined): Handle | undefined => {
 			const file = table!.get(Number.parseInt(argument ?? "", 10));
-			if (file?.inode.startsWith("file:") && /^\d+<\//.test(argument ?? "")) return file;
+			if (file?.object.inode.startsWith("file:") && /^\d+<\//.test(argument ?? "")) return file;
 			const counter = /^(\d+)<anon_inode:\[eventfd\]>$/.exec(argument ?? "");
 			if (counter) {
 				const handle = table!.get(Number(counter[1]));
-				if (handle?.inode.startsWith("eventfd:")) { peers.set(handle.inode, handle.inode); return handle; }
+				if (handle?.object.inode.startsWith("eventfd:")) { handle.object.peer = handle.object; return handle; }
 				return;
 			}
 			const match = /^(\d+)<(?:pipe|UNIX(?:-[A-Z]+)?):\[(\d+)(?:->(\d+))?\]>$/.exec(argument ?? "");
 			if (!match || !options.inheritedStreams?.includes(match[2]!)) return;
-			if (match[3]) { peers.set(match[2]!, match[3]); peers.set(match[3], match[2]!); }
-			else if (argument!.includes("<pipe:")) peers.set(match[2]!, match[2]!);
+			const object = resource(match[2]!);
+			if (match[3]) { object.peer = resource(match[3]); object.peer.peer = object; }
+			else if (argument!.includes("<pipe:")) object.peer = object;
 			const origin = table!.get(Number(match[1]));
-			return origin?.inode === match[2] ? origin : { inode: match[2]!, access: 3, cloexec: false };
+			return origin?.object === object ? origin : { object, access: 3, cloexec: false };
 		};
 		const emit = (handle: Handle, kind: ResourceTransitionKind, data: Buffer, requested?: number) => {
-			journal.push({ order: line.order!, inode: handle.inode, description: handle.description, kind, data, ...(requested !== undefined ? { requested } : {}) }); handled.add(line);
+			const state = handle.object, peer = state.peer;
+			journal.push({ order: line.order!, inode: state.inode, description: handle.description, kind, data, ...(requested !== undefined ? { requested } : {}) }); handled.add(line);
 			const length = kind.endsWith("_message") ? data.length - 4 - 4 * data.readUInt32LE() : data.length;
 			if (kind === "consume" || kind === "receive_message") {
-				const packet = handle.packet ? messages.find(message => message.inode === handle.inode) : undefined;
+				const packet = handle.packet ? messages.find(message => message.object === state) : undefined;
 				const consumed = packet ? packet.end - packet.start : length;
-				const bytes = contents.get(handle.inode); if (bytes) contents.set(handle.inode, bytes.subarray(consumed));
-				const cursor = cursors.get(handle.inode);
-				if (cursor) { cursor.read += consumed; for (let index = messages.length - 1; index >= 0; index--)
-					if (packet ? messages[index] === packet : messages[index]!.inode === handle.inode && messages[index]!.start < cursor.read) messages.splice(index, 1); }
+				if (state.content) state.content = state.content.subarray(consumed);
+				if (state.end !== undefined) { state.read += consumed; for (let index = messages.length - 1; index >= 0; index--)
+					if (packet ? messages[index] === packet : messages[index]!.object === state && messages[index]!.start < state.read) messages.splice(index, 1); }
 			}
 			if (kind === "produce" || kind === "send_message") {
-				const cursor = cursors.get(peers.get(handle.inode) ?? "");
-				if (kind === "produce" && handle.packet && cursor) messages.push({ inode: peers.get(handle.inode)!, start: cursor.end, end: cursor.end + length, rights: [] });
-				if (cursor) cursor.end += length;
-				const peer = peers.get(handle.inode), bytes = peer && contents.get(peer);
-				if (peer && bytes) contents.set(peer, Buffer.concat([bytes, data.subarray(data.length - length)]));
+				if (kind === "produce" && handle.packet && peer?.end !== undefined) messages.push({ object: peer, start: peer.end, end: peer.end + length, rights: [] });
+				append(peer, data.subarray(data.length - length));
 			}
-			if (kind === "produce" || kind === "send_message" || kind === "shutdown") wake(peers.get(handle.inode));
-			if (kind === "shutdown") wake(handle.inode);
+			if (kind === "shutdown") { wake(peer); wake(state); }
 		};
 		const readiness = (handle: Handle, requested: number, returned: number, projection = 0) => {
 			const data = Buffer.alloc(12); data.writeUInt32LE(requested); data.writeUInt32LE(returned, 4); data.writeUInt32LE(projection, 8); emit(handle, "ready", data);
 		};
 		const stream = endpoint(line.args[0]), syscall = line.name;
-		if (stream?.inode.startsWith("file:")) { const operation = fileLockTransition(line); if (operation) emit(stream, "lock", operation); }
-		if (stream && !stream.inode.startsWith("file:")) {
-			const counter = stream.inode.startsWith("eventfd:");
+		if (stream?.object.inode.startsWith("file:")) { const operation = fileLockTransition(line); if (operation) emit(stream, "lock", operation); }
+		if (stream && !stream.object.inode.startsWith("file:")) {
+			const object = stream.object, counter = object.inode.startsWith("eventfd:");
 			const flags = line.args[3] ?? "";
 			const produced = syscall === "write" || syscall === "writev" || syscall === "sendto" && /^(?:0|MSG_(?:NOSIGNAL|DONTWAIT))(?:\|MSG_(?:NOSIGNAL|DONTWAIT))*$/.test(flags) && line.args[4] === "NULL" && line.args[5] === "0";
 			const consumed = syscall === "read" || syscall === "readv" || syscall === "recvfrom" && /^(?:0|MSG_(?:PEEK|DONTWAIT|WAITALL|TRUNC))(?:\|MSG_(?:PEEK|DONTWAIT|WAITALL|TRUNC))*$/.test(flags) && line.args[4] === "NULL" && /^(?:NULL|0x0)$/.test(line.args[5] ?? "");
@@ -261,7 +272,7 @@ function resourceTransitions(processes: ReadonlyMap<number, TraceProcess>, root:
 			if ((produced || consumed) && /^\? ERESTARTSYS\b/.test(line.result)) handled.add(line);
 			else if ((produced || consumed) && data && /^\d+$/.test(line.result)) {
 				const returned = Number(line.result), truncated = /MSG_TRUNC/.test(flags);
-				const packet = truncated && stream.packet ? messages.find(message => message.inode === stream.inode) : undefined;
+				const packet = truncated && stream.packet ? messages.find(message => message.object === object) : undefined;
 				const length = truncated ? Math.min(returned, requested) : returned;
 				if ((!truncated || packet && returned === packet.end - packet.start) &&
 					(produced ? data.length === requested && length <= requested && length <= 4096 : data.length === length)) {
@@ -282,19 +293,19 @@ function resourceTransitions(processes: ReadonlyMap<number, TraceProcess>, root:
 			if ((syscall === "sendmsg" || syscall === "recvmsg") && /^\d+$/.test(line.result)) {
 				const sent = syscall === "sendmsg", message = streamMessage(line.args[1]), returned = Number(line.result), flags = line.args[2] ?? "";
 				const truncated = /MSG_TRUNC/.test(flags), length = truncated && message ? Math.min(returned, message.length) : returned;
-				const packet = truncated && stream.packet ? messages.find(message => message.inode === stream.inode) : undefined;
+				const packet = truncated && stream.packet ? messages.find(message => message.object === object) : undefined;
 				if (message && (!truncated || packet && returned === packet.end - packet.start) && (stream.packet || !message.truncated) && /^(?:0|MSG_(?:NOSIGNAL|DONTWAIT|PEEK|WAITALL|CMSG_CLOEXEC|TRUNC))(?:\|MSG_(?:NOSIGNAL|DONTWAIT|PEEK|WAITALL|CMSG_CLOEXEC|TRUNC))*$/.test(flags) &&
 					(sent ? !/PEEK|WAITALL|CMSG_CLOEXEC|TRUNC/.test(flags) && message.data.length === message.length && length <= message.length && length <= 4096 :
 						!/NOSIGNAL/.test(flags) && message.data.length === length)) {
-					const peer = peers.get(stream.inode), cursor = cursors.get(stream.inode);
-					const pending = messages.find(message => message.inode === stream.inode && (stream.packet || message.start < (cursor?.read ?? 0) + length));
+					const { peer } = object;
+					const pending = messages.find(message => message.object === object && (stream.packet || message.start < object.read + length));
 					const rights = sent ? message.rights.map(fd => table!.get(fd)) : pending?.rights ?? [];
 					if (rights.length === message.rights.length && rights.every(handle => handle?.description !== undefined) &&
-						(sent ? !rights.length || !!peer && (length > 0 || stream.packet) : message.rights.every(fd => !table!.has(fd)))) {
+						(sent ? !rights.length || !!peer?.inode && (length > 0 || stream.packet) : message.rights.every(fd => !table!.has(fd)))) {
 						const handles = rights as Handle[], data = Buffer.alloc(4 + 4 * handles.length + length);
 						data.writeUInt32LE(handles.length); handles.forEach((handle, index) => data.writeUInt32LE(handle.description!, 4 + 4 * index));
 						message.data.copy(data, 4 + 4 * handles.length, 0, length);
-						if (sent && (handles.length || stream.packet)) { const start = cursors.get(peer!)?.end ?? 0; messages.push({ inode: peer!, start, end: start + length, rights: handles }); }
+						if (sent && (handles.length || stream.packet)) { const start = peer?.end ?? 0; messages.push({ object: peer, start, end: start + length, rights: handles }); }
 						if (!sent) handles.forEach((handle, index) => table!.set(message.rights[index]!, { ...handle, cloexec: /MSG_CMSG_CLOEXEC/.test(flags) }));
 						emit(stream, sent ? "send_message" : /MSG_PEEK/.test(flags) ? "peek_message" : "receive_message", data, message.length);
 					}
@@ -303,16 +314,14 @@ function resourceTransitions(processes: ReadonlyMap<number, TraceProcess>, root:
 		}
 		if ((syscall === "splice" || syscall === "tee") && stream?.description !== undefined && /^\d+$/.test(line.result)) {
 			const moved = syscall === "splice", target = endpoint(line.args[moved ? 2 : 1]), length = Number(line.result), requested = Number(line.args[moved ? 4 : 2]);
-			const bytes = contents.get(stream.inode), flags = line.args[moved ? 5 : 3];
-			if (target && stream.inode !== target.inode && bytes && length <= bytes.length && length <= requested && length <= 4096 &&
+			const state = stream.object, bytes = state.content, flags = line.args[moved ? 5 : 3];
+			if (target && state !== target.object && bytes && length <= bytes.length && length <= requested && length <= 4096 &&
 				/^(?:0|SPLICE_F_(?:MOVE|MORE|NONBLOCK))(?:\|SPLICE_F_(?:MOVE|MORE|NONBLOCK))*$/.test(flags ?? "") &&
 				(!moved || line.args[1] === "NULL" && line.args[3] === "NULL")) {
 				const data = Buffer.alloc(4 + length); data.writeUInt32LE(stream.description); bytes.copy(data, 4, 0, length);
 				emit(target, moved ? "splice" : "tee", data, requested);
-				const destination = contents.get(target.inode); if (destination) contents.set(target.inode, Buffer.concat([destination, bytes.subarray(0, length)]));
-				const end = cursors.get(target.inode); if (end) end.end += length;
-				if (moved) { contents.set(stream.inode, bytes.subarray(length)); const cursor = cursors.get(stream.inode); if (cursor) cursor.read += length; }
-				wake(target.inode);
+				append(target.object, bytes.subarray(0, length));
+				if (moved) { state.content = bytes.subarray(length); if (state.end !== undefined) state.read += length; }
 			}
 		}
 		if (syscall === "poll" || syscall === "ppoll") {
@@ -343,7 +352,7 @@ function resourceTransitions(processes: ReadonlyMap<number, TraceProcess>, root:
 		}
 		const poller = table.get(Number.parseInt(line.args[0] ?? "", 10))?.epoll;
 		if (/^epoll_create(?:1)?$/.test(syscall) && syscallSucceeded(line)) {
-			table.set(Number.parseInt(line.result, 10), { inode: `epoll:${line.order}`, access: 3, cloexec: /EPOLL_CLOEXEC/.test(line.args[0] ?? ""), epoll: new Map() }); handled.add(line);
+			table.set(Number.parseInt(line.result, 10), { object: resource(`epoll:${line.order}`), access: 3, cloexec: /EPOLL_CLOEXEC/.test(line.args[0] ?? ""), epoll: new Map() }); handled.add(line);
 		} else if (syscall === "epoll_ctl" && poller && syscallSucceeded(line)) {
 			const handle = endpoint(line.args[2]), event = epollEvent(line.args[3]);
 			if (handle && handle.description !== undefined) {
@@ -357,13 +366,13 @@ function resourceTransitions(processes: ReadonlyMap<number, TraceProcess>, root:
 		} else if (/^epoll_(?:wait|pwait|pwait2)$/.test(syscall) && poller && /^\d+$/.test(line.result)) {
 			const returned = Number(line.result), events = epollEvents(line.args[1]);
 			const registrations = [...poller.values()].filter(value => value.armed &&
-				(!(value.mask & 0x80000000) || value.generation !== (generations.get(value.handle.inode) ?? 0)));
+				(!(value.mask & 0x80000000) || value.generation !== value.handle.object.generation));
 			if (events && events.length === returned && returned <= Number(line.args[2]) && new Set(registrations.map(entry => entry.data)).size === registrations.length &&
 				events.every(event => registrations.some(entry => entry.data === event.data))) {
 				for (const entry of registrations) {
 					const event = events.find(event => event.data === entry.data);
 					if (event || returned < Number(line.args[2])) readiness(entry.handle, entry.mask & ~0xc0000000, event?.mask ?? 0);
-					if (event && (entry.mask & 0x80000000)) entry.generation = generations.get(entry.handle.inode) ?? 0;
+					if (event && (entry.mask & 0x80000000)) entry.generation = entry.handle.object.generation;
 					if (event && (entry.mask & 0x40000000)) entry.armed = false;
 				}
 				handled.add(line);
@@ -395,16 +404,16 @@ function resourceTransitions(processes: ReadonlyMap<number, TraceProcess>, root:
 		if (!before) continue;
 		let after = references();
 		for (;;) {
-			for (const [description, handle] of before.descriptions) if (description !== undefined && !after.descriptions.has(description) && handle.inode.startsWith("file:"))
-				journal.push({ order: line.order, inode: handle.inode, description, kind: "release", data: Buffer.from([3]) });
-			for (const [inode, mask] of before.masks) {
-				const released = mask & ~(after.masks.get(inode) ?? 0) & ~(outside.get(inode) ?? 3);
-				if (released && options.inheritedStreams?.includes(inode)) { journal.push({ order: line.order, inode, kind: "release", data: Buffer.from([released]) }); wake(peers.get(inode)); }
+			for (const [description, handle] of before.descriptions) if (description !== undefined && !after.descriptions.has(description) && handle.object.inode.startsWith("file:"))
+				journal.push({ order: line.order, inode: handle.object.inode, description, kind: "release", data: Buffer.from([3]) });
+			for (const [state, mask] of before.masks) {
+				const released = mask & ~(after.masks.get(state) ?? 0) & ~(state.outside ?? 3);
+				if (released && options.inheritedStreams?.includes(state.inode)) { journal.push({ order: line.order, inode: state.inode, kind: "release", data: Buffer.from([released]) }); wake(state.peer); }
 			}
 			// Destroyed receivers drop their rights before the newly unowned objects.
 			// An external or cyclic reference still keeps its queue alive.
 			const count = messages.length;
-			for (let index = count - 1; index >= 0; index--) if (!after.masks.has(messages[index]!.inode) && outside.get(messages[index]!.inode) === 0) messages.splice(index, 1);
+			for (let index = count - 1; index >= 0; index--) if (messages[index]!.object?.outside === 0 && !after.masks.has(messages[index]!.object!)) messages.splice(index, 1);
 			if (messages.length === count) break;
 			before = after; after = references();
 		}
