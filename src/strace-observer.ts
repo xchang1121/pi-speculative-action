@@ -1,3 +1,4 @@
+import { isSafeCount } from "./number-utils.ts";
 import { open, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { containsLogicalPath } from "./path-utils.ts";
@@ -530,14 +531,14 @@ export async function observeStrace(
 	const prefix = `${path.basename(tracePrefix)}.`;
 	const files: TraceFile[] = [];
 	let remaining = options.frozen?.bytes ?? options.previewBytes, frontier = false;
-	if (remaining !== undefined && (!Number.isSafeInteger(remaining) || remaining < 0)) throw new Error("invalid trace preview budget");
+	if (remaining !== undefined && (!isSafeCount(remaining))) throw new Error("invalid trace preview budget");
 	for (const name of await readdir(directory)) {
 		if (remaining === 0) break;
 		if (!name.startsWith(prefix)) continue;
 		const pid = Number.parseInt(name.slice(prefix.length), 10);
 		const ordered = name === `${prefix}stream`;
 		if (options.frozen && !ordered) throw new Error("continuation requires one ordered trace");
-		if (!ordered && (!Number.isSafeInteger(pid) || pid <= 0)) continue;
+		if (!ordered && (!isSafeCount(pid, 1))) continue;
 		const target = path.join(directory, name), bytes = remaining === undefined ? await readFile(target) : await readTrace(target, 0, remaining);
 		if (remaining !== undefined) remaining -= bytes.length;
 		let contents = bytes.toString("utf8");
@@ -632,10 +633,10 @@ export async function observeStrace(
 			if (spawned) opened.set(spawned, new Set(opened.get(pid)));
 			const own = opened.get(pid) ?? opened.set(pid, new Set()).get(pid)!, result = Number.parseInt(line.result ?? "", 10);
 			// Files and pipes the traced processes created stay private to them, through duplication and inheritance.
-			if (/^(?:open|openat|openat2|creat)$/.test(line.name) && Number.isSafeInteger(result) && result >= 0) { own.add(result); if (writesPath(line)) writable.add(absoluteDescriptorPath(line.result) ?? ""); }
+			if (/^(?:open|openat|openat2|creat)$/.test(line.name) && isSafeCount(result)) { own.add(result); if (writesPath(line)) writable.add(absoluteDescriptorPath(line.result) ?? ""); }
 			else if (/^pipe2?$/.test(line.name) && result === 0) for (const pipe of (line.args[0] ?? "").matchAll(/<pipe:\[(\d+)\]>/g)) ownPipes.add(pipe[1]!);
 			else if (line.name === "socketpair" && result === 0) for (const end of (line.args[3] ?? "").matchAll(/<UNIX(?:-[A-Z]+)?:\[(\d+)/g)) ownPipes.add(end[1]!);
-			else if (/^dup[23]?$|^fcntl(?:64)?$/.test(line.name) && (line.name.startsWith("dup") || /^F_DUPFD/.test(line.args[1] ?? "")) && Number.isSafeInteger(result) && result >= 0) {
+			else if (/^dup[23]?$|^fcntl(?:64)?$/.test(line.name) && (line.name.startsWith("dup") || /^F_DUPFD/.test(line.args[1] ?? "")) && isSafeCount(result)) {
 				if (own.has(Number.parseInt(line.args[0] ?? "", 10))) own.add(result); else own.delete(result);
 			} else if (line.name === "close") own.delete(Number.parseInt(line.args[0] ?? "", 10));
 			else if (line.name === "close_range" && result === 0 && !line.args[2]?.includes("CLOSE_RANGE_CLOEXEC"))
@@ -946,7 +947,7 @@ function successfulExec(line: TraceLine): boolean { return (line.name === "execv
 function spawnedPID(line: TraceLine): number | undefined {
 	if (!["clone", "clone3", "fork", "vfork"].includes(line.name)) return undefined;
 	const pid = Number(line.result);
-	return Number.isSafeInteger(pid) && pid > 0 ? pid : undefined;
+	return isSafeCount(pid, 1) ? pid : undefined;
 }
 
 function sharesFilesystem(line: TraceLine): boolean | undefined {

@@ -1,3 +1,4 @@
+import { isSafeCount } from "./number-utils.ts";
 import path from "node:path";
 import type { PatternAwareEvent } from "./pattern-aware.ts";
 import { asRecord } from "./stable-json.ts";
@@ -51,7 +52,7 @@ export function patternPresetActions(
 		const lines = new Map<string, number[]>();
 		let count = 0;
 		for (const event of [...batch].reverse()) for (const location of event.outputLocations ?? []) {
-			if (count >= 8 || typeof location.path !== "string" || !positiveInteger(location.line)) continue;
+			if (count >= 8 || typeof location.path !== "string" || !isSafeCount(location.line, 1)) continue;
 			const identity = readIdentity(location.path);
 			if (!identity) continue;
 			const previous = lines.get(identity) ?? [];
@@ -103,15 +104,15 @@ export function patternPresetActions(
 			if (seen.size >= 2 || event.tool !== "read" || event.outcome !== "success" || typeof event.input.path !== "string") continue;
 			const output = asRecord(event.output), details = asRecord(output?.details);
 			const truncation = asRecord(output?.truncation) ?? asRecord(details?.truncation);
-			if (truncation?.truncated !== true || truncation.firstLineExceedsLimit || !positiveInteger(truncation.outputLines) ||
-				!positiveInteger(truncation.totalLines) || truncation.totalLines <= truncation.outputLines) continue;
+			if (truncation?.truncated !== true || truncation.firstLineExceedsLimit || !isSafeCount(truncation.outputLines, 1) ||
+				!isSafeCount(truncation.totalLines, 1) || truncation.totalLines <= truncation.outputLines) continue;
 			const offset = event.input.offset ?? 1;
-			if (!positiveInteger(offset)) continue;
+			if (!isSafeCount(offset, 1)) continue;
 			const next = offset + truncation.outputLines, identity = readIdentity(event.input.path);
 			if (!Number.isSafeInteger(next) || !identity || seen.has(identity) || readSince(identity, event.sequence)) continue;
 			seen.add(identity);
 			ranked.push({ kind: "continuation", presetID: "continue-read", tool: "read", input: { path: event.input.path, offset: next,
-				...(positiveInteger(event.input.limit) ? { limit: event.input.limit } : {}) }, prior: 0.15 / seen.size });
+				...(isSafeCount(event.input.limit, 1) ? { limit: event.input.limit } : {}) }, prior: 0.15 / seen.size });
 		}
 	}
 	if (presets.includes("recheck-search")) {
@@ -150,10 +151,6 @@ export function patternPresetActions(
 
 function reportedPaths(event: PatternAwareEvent): string[] {
 	return [...event.outputPaths ?? [], ...(event.outputLocations ?? []).map(location => location.path)].slice(0, 256);
-}
-
-function positiveInteger(value: unknown): value is number {
-	return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
 
 function companionName(target: string) {

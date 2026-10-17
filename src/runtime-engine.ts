@@ -1512,7 +1512,8 @@ export function makeSpeculativeActionRuntime<
 			} else if (preview?.state.status === "pending") {
 				abandonActorPreview(state, preview, cause("matching", "preview_intent_changed")); preview = undefined;
 			}
-			for (const { node } of matchingPredictions) follow(promoteForActor(state.session, node, actorSignal));
+			// Reserve existing work before new preparation can preempt it for the same Actor demand.
+			for (const { node } of matchingPredictions) follow(Promise.resolve().then(() => promoteForActor(state.session, node, actorSignal)));
 			await selectActorCandidate({
 				state,
 				consumeInput: input,

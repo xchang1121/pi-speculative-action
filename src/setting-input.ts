@@ -1,3 +1,4 @@
+import { isSafeCount } from "./number-utils.ts";
 /** Stored values never coerce text; interactive parsers below separately enforce strict input. */
 export function positiveInteger<F extends number | undefined>(value: unknown, fallback: F): number | F {
 	return typeof value === "number" && Number.isSafeInteger(Math.floor(value)) && value >= 1 ? Math.floor(value) : fallback;
@@ -9,7 +10,7 @@ export function nonNegativeInteger(value: unknown, fallback: number): number {
 
 /** Node timers otherwise turn an overflowing delay into a 1 ms timeout. */
 export function milliseconds(value: unknown, fallback: number): number {
-	return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 2_147_483_647 ? value : fallback;
+	return isSafeCount(value, 0, 2_147_483_647) ? value : fallback;
 }
 export const positiveMilliseconds = (value: unknown, fallback: number): number => milliseconds(value, fallback) || fallback;
 
@@ -73,11 +74,11 @@ function numericInput(title: string, valid: (value: number) => boolean, error: s
 }
 
 export function positiveIntegerInput(title: string, options: NumericInputOptions = {}): SettingInputDescriptor<number> {
-	return numericInput(title, (value) => Number.isSafeInteger(value) && value > 0, `${title} must be a positive integer.`, options);
+	return numericInput(title, (value) => isSafeCount(value, 1), `${title} must be a positive integer.`, options);
 }
 
 export function nonNegativeIntegerInput(title: string): SettingInputDescriptor<number> {
-	return numericInput(title, (value) => Number.isSafeInteger(value) && value >= 0, `${title} must be a non-negative integer.`);
+	return numericInput(title, (value) => isSafeCount(value), `${title} must be a non-negative integer.`);
 }
 
 export function millisecondsInput(title: string): SettingInputDescriptor<number> {

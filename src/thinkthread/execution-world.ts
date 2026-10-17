@@ -1,3 +1,4 @@
+import { isSafeCount } from "../number-utils.ts";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { access, lstat, readFile } from "node:fs/promises";
@@ -379,7 +380,7 @@ async function captureSnapshotInputs(world: PreparedWorld, context: SpeculativeT
 			const name = slash(relative) || ".", entry = await world.client.fs.snapshotStat({ snapshotId, path: name });
 			if (!("kind" in entry)) return undefined;
 			if (entry.kind === "file" && dependencies.some(dependency => dependency.path === name && dependency.scope === "content")) {
-				if (typeof world.client.fs.snapshotPread !== "function" || !Number.isSafeInteger(entry.len) || entry.len < 0 ||
+				if (typeof world.client.fs.snapshotPread !== "function" || !isSafeCount(entry.len) ||
 					(totalBytes += entry.len + 2 * Buffer.byteLength(target) + 64) > MAX_INPUT_BYTES) return undefined;
 				files.set(target, { kind: "file", path: name, bytes: entry.len });
 			} else if (entry.kind === "directory" && dependencies.some(dependency => dependency.path === name && dependency.scope === "entries")) {
@@ -389,7 +390,7 @@ async function captureSnapshotInputs(world: PreparedWorld, context: SpeculativeT
 				do {
 					context.signal.throwIfAborted();
 					const page = await world.client.fs.snapshotReaddir({ snapshotId, path: name, limit: DIFF_PAGE_LIMIT, ...(cursor ? { cursor } : {}) });
-					if (!Number.isSafeInteger(page.totalEntries) || page.totalEntries < 0 || total !== undefined && total !== page.totalEntries) return undefined;
+					if (!isSafeCount(page.totalEntries) || total !== undefined && total !== page.totalEntries) return undefined;
 					total = page.totalEntries;
 					for (const child of page.entries) {
 						const childPath = child.path.utf8, raw = Buffer.from(child.path.bytesBase64, "base64");

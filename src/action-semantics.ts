@@ -5,7 +5,7 @@ import { relativeFilesystemPath, sameFilesystemPath, slash } from "./path-utils.
 import { type EffectRequirements, normalizeEffectRequirements, effectRequirements, RESOURCE_OBSERVATION_EFFECTS, UNRESTRICTED_PROCESS_EFFECTS,
 	WORKSPACE_PATH_MUTATION_EFFECTS } from "./effect-model.ts";
 import { asRecord, immutableSnapshot, isImmutableSnapshot, stableStringify } from "./stable-json.ts";
-import { finiteNumber } from "./number-utils.ts";
+import { finiteNumber, isSafeCount } from "./number-utils.ts";
 import { positiveInteger, nonNegativeInteger } from "./setting-input.ts";
 
 /** Observable effects of an action, independent of any concrete isolation backend. */
@@ -447,7 +447,7 @@ function normalizeWorkspacePath(value: string, cwd: string, reading = false): st
 }
 
 function validOptionalInteger(value: unknown, minimum: number): boolean {
-	return value === undefined || (typeof value === "number" && Number.isSafeInteger(value) && value >= minimum);
+	return value === undefined || isSafeCount(value, minimum);
 }
 
 function fastHash(value: string): string {

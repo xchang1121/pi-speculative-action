@@ -1,3 +1,4 @@
+import { isSafeCount } from "./number-utils.ts";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
@@ -332,7 +333,7 @@ function extractOutputLocations(tool: string, actionInput: Readonly<Record<strin
 	return located.slice(0, 256).flatMap(([, file, ...lines]) => {
 		const line = lines.find(Boolean);
 		const number = Number(line);
-		if (!file || !Number.isSafeInteger(number) || number < 1) return [];
+		if (!file || !isSafeCount(number, 1)) return [];
 		return [{ path: outputPath(tool, actionInput, file), line: number }];
 	});
 }

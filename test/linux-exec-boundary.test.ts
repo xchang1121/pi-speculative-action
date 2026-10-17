@@ -7,7 +7,7 @@ import path from "node:path";
 import { expect } from "vitest";
 import { PROCESS_CERTIFICATE } from "./process-fixture.ts";
 import { cHeaders, commitBenchmarkFixture, compileBenchmarkHelper, processTest,
-	executeProcess, forkReusableBash, holdOwnedProcessPublication, metricDelta, prepareLinuxProcessReuse, textOutput } from "./linux-process-fixture.ts";
+	executeProcess, holdOwnedProcessPublication, metricDelta, textOutput } from "./linux-process-fixture.ts";
 
 (process.arch === "x64" ? processTest : processTest.skip).for(["git", "auto"] as const)("preserves held-child output, effects and one-shot authority across parent commands (%s)", { timeout: 30_000 }, async (driver, { benchmark, skip }) => {
 	const fixture = await benchmark("pi-held-production-", driver);
@@ -57,11 +57,9 @@ int main(int argc, char **argv) {
 	await Promise.all([writeFile(path.join(workspace, "d", "e", ".keep"), ""), writeFile(path.join(workspace, "data.txt"), "v1\n"), writeFile(path.join(workspace, "d", "data.txt"), "nested\n"),
 		symlink("data.txt", path.join(workspace, "data.link")), symlink("d/e", path.join(workspace, "sub"))]);
 	await commitBenchmarkFixture(workspace, "Pi Held Exec Qualification");
-	const { executionFingerprint } = await prepareLinuxProcessReuse(fixture, { skip });
+	await fixture.prepare({ skip });
 	const route = await fixture.prepareActorReplay();
-	const produce = (command: string) => forkReusableBash(fixture, {
-		label: "producer", command, actionNamespace: "held-production", executionFingerprint,
-	});
+	const produce = (command: string) => fixture.fork(command);
 	const actor = async (command: string, turnID = "benchmark", held: boolean | "sync" = true, callID?: string) => {
 		const before = backend.actorMetrics();
 		const scope = { sessionID: "benchmark", turnID, callID };

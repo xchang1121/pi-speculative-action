@@ -1,3 +1,4 @@
+import { isSafeCount } from "./number-utils.ts";
 import type { AgentPlanSource } from "./agent-runtime-types.ts";
 import type { AssistantMessageEvent } from "@earendil-works/pi-ai";
 
@@ -55,7 +56,7 @@ export class ActorForkPlanSource {
 	get schedule(): ActorProbeSchedule {
 		const normalized = { ...ACTOR_PROBE_SCHEDULE, ...(typeof this.configuration === "function" ? this.configuration() : this.configuration) };
 		for (const [field, value] of Object.entries(normalized)) {
-			if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${field} must be a positive integer`);
+			if (!isSafeCount(value, 1)) throw new Error(`${field} must be a positive integer`);
 		}
 		return Object.freeze(normalized);
 	}

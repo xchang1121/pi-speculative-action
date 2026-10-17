@@ -1,7 +1,8 @@
-import { nonNegativeCount as sequence, nonNegativeFinite as finiteMetric } from "./number-utils.ts";
+import { isSafeCount, nonNegativeCount as sequence, nonNegativeFinite as finiteMetric } from "./number-utils.ts";
 import { isDeepStrictEqual } from "node:util";
 import { immutableSnapshot, isImmutableSnapshot } from "./stable-json.ts";
 import { RESOURCE_DIMENSIONS } from "./system-resources.ts";
+import { dependencyOrder } from "./dependency-order.ts";
 import type { ActionKey, ActionKeyMatch } from "./action-semantics.ts";
 import type { CandidateExecution } from "./candidate-execution.ts";
 import type { MaterializedPlan, PlanAction, PlanActionDependency, PlanUpdate } from "./plan-proposal.ts";
@@ -155,8 +156,8 @@ export class PlanRuntime {
 		if (captured && multiStep) return { update };
 		update = { ...update };
 		const id = "actions" in update ? update.id : update.proposalID;
-		if (!validIdentity(id, update.source)) return { accepted: false, reason: "invalid_identity" };
-		if (!validRevision(update.revision)) return { accepted: false, reason: "invalid_revision" };
+		if (!(validToken(id) && validToken(update.source))) return { accepted: false, reason: "invalid_identity" };
+		if (!isSafeCount(update.revision)) return { accepted: false, reason: "invalid_revision" };
 		const remove = "actions" in update ? [] : [...(update.remove ?? [])];
 		const offered = "actions" in update
 			? multiStep ? update.actions : update.actions.filter((action) => finiteMetric(action.horizon) === 0 && (action.dependsOn?.length ?? 0) === 0)
@@ -194,7 +195,8 @@ export class PlanRuntime {
 				actions.set(action.id, replacement ?? action); retained.add(action.id);
 			}
 		}
-		const ordered = dependencyOrder(actions, (dependency) => dependency.proposalID !== id && this.parent(id, dependency) !== undefined);
+		const ordered = dependencyOrder(actions.values(), action => (action.dependsOn ?? []).flatMap(dependency =>
+			dependency.proposalID ? dependency.proposalID !== id && this.parent(id, dependency) ? [] : [undefined] : [actions.get(dependency.actionID)]));
 		if (!ordered) return { accepted: false, reason: "invalid_dependency" };
 		return this.commit({ id, source: owned.source, revision: owned.revision, actions, upserted, ordered, anchorDecisionSeq });
 	}
@@ -398,19 +400,9 @@ export class PlanRuntime {
 		this.plans.set(next.id, next);
 		graph.plans.add(next);
 		for (const plan of graph.plans) plan.graph = graph;
-		const visited = new Set<MutableNode>(), ordered: MutableNode[] = [];
-		const visit = (node: MutableNode): void => {
-			if (visited.has(node)) return;
-			visited.add(node);
-			for (const dependency of node.action.dependsOn ?? []) {
-				const parent = this.parent(node.identity.proposalID, dependency);
-				if (parent) visit(parent);
-			}
-			ordered.push(node);
-		};
 		// Only plans sharing dependency ancestry need a common order and settlement pass.
-		for (const plan of graph.plans) for (const node of plan.nodes.values()) visit(node);
-		graph.ordered = ordered;
+		graph.ordered = dependencyOrder([...graph.plans].flatMap(plan => [...plan.nodes.values()]), node =>
+			(node.action.dependsOn ?? []).flatMap(dependency => this.parent(node.identity.proposalID, dependency) ?? []))!;
 		this.recompute(graph);
 		return {
 			accepted: true,
@@ -520,7 +512,7 @@ export class PlanRuntime {
 function newNode(proposalID: string, source: string, revision: number, action: PlanAction, anchorDecisionSeq: number): MutableNode {
 	const identity: PlanActionIdentity = Object.freeze({
 		...(action.type === "operation" ? { kind: "operation" as const } : {}),
-		id: planNodeID(source, proposalID, action.id, revision),
+		id: JSON.stringify([source, proposalID, action.id, revision]),
 		source,
 		proposalID,
 		actionID: action.id,
@@ -631,24 +623,6 @@ function validateActions(actions: readonly PlanAction[]):
 	return { ok: true, actions: Object.freeze(result) };
 }
 
-function dependencyOrder(actions: ReadonlyMap<string, PlanAction>, external: (dependency: PlanActionDependency) => boolean): readonly PlanAction[] | undefined {
-	const visiting = new Set<string>();
-	const ordered = new Map<string, PlanAction>();
-	const visit = (actionID: string): boolean => {
-		if (ordered.has(actionID)) return true;
-		const action = actions.get(actionID);
-		if (!action || visiting.has(actionID)) return false;
-		visiting.add(actionID);
-		for (const dependency of action.dependsOn ?? []) {
-			if (!(dependency.proposalID ? external(dependency) : visit(dependency.actionID))) return false;
-		}
-		visiting.delete(actionID);
-		ordered.set(actionID, action);
-		return true;
-	};
-	return [...actions.keys()].every(visit) ? [...ordered.values()] : undefined;
-}
-
 function samePlanActionExecution(left: PlanAction, right: PlanAction): boolean {
 	if (left.type !== right.type || left.operation !== right.operation || left.tool !== right.tool || !isDeepStrictEqual(left.input, right.input)) return false;
 	// Owned dependency records have canonical fields; opaque IDs must not use locale ordering.
@@ -663,18 +637,10 @@ function samePlanActionExecution(left: PlanAction, right: PlanAction): boolean {
 	return counts.size === 0;
 }
 
-function planNodeID(source: string, proposalID: string, actionID: string, revision: number): string {
-	return JSON.stringify([source, proposalID, actionID, revision]);
-}
-
 function horizon(action: PlanAction): number { return sequence(action.horizon ?? 0); }
 
 function latestHorizon(action: PlanAction): number { return Math.max(horizon(action), sequence(action.latestHorizon ?? action.horizon ?? 0)); }
 
 function actorDecisionSequence(action: ActorActionIdentity): number { return sequence(action.decisionSequence ?? action.sequence); }
 
-function validIdentity(proposalID: string, source: string): boolean { return validToken(proposalID) && validToken(source); }
-
 function validToken(value: string): boolean { return typeof value === "string" && value.length > 0 && value.trim() === value; }
-
-function validRevision(value: number): boolean { return Number.isSafeInteger(value) && value >= 0; }

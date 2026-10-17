@@ -1,3 +1,4 @@
+import { isSafeCount } from "./number-utils.ts";
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants, type BigIntStats, type Stats } from "node:fs";
@@ -1085,7 +1086,7 @@ async function createGitWorkspaceTransactionDriver(workspace: ReturnType<typeof 
 			return {
 				readBefore: (resource, maxBytes) => withWorkspaceLock(lock, async () => {
 					if (!active.has(capture) || capture.contaminated || !capture.before || capture.unknown.has(resource)) throw new Error("workspace transaction input is unavailable");
-					if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new Error("workspace transaction input budget is invalid");
+					if (!isSafeCount(maxBytes)) throw new Error("workspace transaction input budget is invalid");
 					if (capture.before.entries.get(resource)?.kind !== "file") return undefined;
 					const state = capture.frontier.has(resource) ? capture.frontier.get(resource) : await workspace.readBase(resource, maxBytes);
 					if (state && state.content.byteLength > maxBytes) throw new Error("workspace transaction input exceeds capture limit");

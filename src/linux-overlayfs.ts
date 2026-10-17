@@ -85,7 +85,7 @@ export class LinuxOverlayfsCapabilityRegistry {
 	capability(options: LinuxOverlayfsOptions = {}): Promise<LinuxOverlayfsCapability> {
 		if (this.disposed) return Promise.reject(new Error("Linux OverlayFS capability registry is disposed"));
 		if (this.disabledDetail) return Promise.resolve({ available: false, detail: this.disabledDetail });
-		return this.memoized(this.requests, overlayfsCapabilityKey(options), () => this.resolveCapability(options)).then(
+		return this.memoized(this.requests, `${options.overlayfsBinary ?? "auto"}\0${options.fusermountBinary ?? "auto"}`, () => this.resolveCapability(options)).then(
 			(capability) => this.currentCapability(capability),
 		);
 	}
@@ -121,7 +121,7 @@ export class LinuxOverlayfsCapabilityRegistry {
 		if (process.platform !== "linux") return { available: false, detail: "Linux host required for OverlayFS" };
 		let resolved: ResolvedOverlayfs;
 		try { resolved = await resolveOverlayfs(options); } catch (error) { return { available: false, detail: errorMessage(error) }; }
-		return this.memoized(this.resolved, resolvedCapabilityKey(resolved), () => probeLinuxOverlayfs(resolved));
+		return this.memoized(this.resolved, [resolved.binary, resolved.fusermountBinary, resolved.kernel, resolved.version].join("\0"), () => probeLinuxOverlayfs(resolved));
 	}
 
 	private currentCapability(capability: LinuxOverlayfsCapability): LinuxOverlayfsCapability {
@@ -463,14 +463,6 @@ async function resolveOverlayfs(options: LinuxOverlayfsOptions): Promise<Resolve
 	const fusermountBinary = await resolveHostExecutable(options.fusermountBinary, "fusermount3", [], ["fusermount"]);
 	const [version, kernel] = await Promise.all([execText(binary, ["--version"]), readFile("/proc/sys/kernel/osrelease", "utf8")]);
 	return { binary, fusermountBinary, version, kernel };
-}
-
-function overlayfsCapabilityKey(options: LinuxOverlayfsOptions): string {
-	return `${options.overlayfsBinary ?? "auto"}\0${options.fusermountBinary ?? "auto"}`;
-}
-
-function resolvedCapabilityKey(resolved: ResolvedOverlayfs): string {
-	return [resolved.binary, resolved.fusermountBinary, resolved.kernel, resolved.version].join("\0");
 }
 
 function availableCapabilityKey(

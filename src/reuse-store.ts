@@ -159,7 +159,7 @@ export class ProvenanceCertificateStore {
 	async findByWeakKey(weakKey: Sha256Digest, executablePath: string, excludedCertificates?: ReadonlySet<Sha256Digest>): Promise<readonly ProcessProvenanceCertificate[]> {
 		const certificates: ProcessProvenanceCertificate[] = [];
 		for await (const certificate of this.candidatesByWeakKey(weakKey, executablePath, excludedCertificates)) certificates.push(certificate);
-		return certificates.sort((left, right) => right.createdAt - left.createdAt || right.id.localeCompare(left.id));
+		return certificates;
 	}
 
 	/** Indexes only select candidates; every yielded certificate still verifies its complete identity. */

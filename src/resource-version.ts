@@ -1,3 +1,4 @@
+import { isSafeCount } from "./number-utils.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { hash } from "node:crypto";
 import { type BigIntStats, type FSWatcher, watch } from "node:fs";
@@ -197,7 +198,7 @@ export class ResourceReadView {
 	reserve(bytes: number): boolean {
 		if (this.sealed) throw new Error("resource_snapshot_not_capturing");
 		if (this.failure) { if (this.load) throw this.failure; return false; }
-		if (!Number.isSafeInteger(bytes) || bytes < 0) throw new Error("resource_snapshot_budget_invalid");
+		if (!isSafeCount(bytes)) throw new Error("resource_snapshot_budget_invalid");
 		if (this.bytes + bytes > this.maxBytes) {
 			this.failure = new Error("resource_snapshot_budget_exceeded");
 			for (const entry of this.entries.values()) this.releaseObject(entry);
@@ -389,7 +390,7 @@ export class ResourceReadView {
 				pending.value = resource.value;
 				bytes = resource.bytes + computationBytes + resourceProofBytes(pending.proofs ?? []) + (key.length + (name?.length ?? 0)) * 2 + 192 +
 					[...pending.dependencies ?? []].reduce((sum, name) => sum + name.length * 2 + 64, 0);
-				if (!Number.isSafeInteger(resource.bytes) || resource.bytes < 0) throw new Error("resource_snapshot_budget_invalid");
+				if (!isSafeCount(resource.bytes)) throw new Error("resource_snapshot_budget_invalid");
 				const destination = pending.destination = owner.sealed && this.missing ? (await this.missing()).view : owner;
 				pending.cancellation.signal.throwIfAborted();
 				this.assertComplete(); destination.assertComplete();

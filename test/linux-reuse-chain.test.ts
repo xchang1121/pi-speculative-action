@@ -9,7 +9,7 @@ import { createWriteTool } from "@earendil-works/pi-coding-agent";
 import { expect, test } from "vitest";
 import { patternAwareSettings } from "../src/pattern-aware.ts";
 import type { ExecutionResourceMonitor } from "../src/system-resources.ts";
-import { commitBenchmarkFixture, compileBenchmarkHelper, createLinuxProcessBenchmark, holdOwnedProcessPublication, patternProcessHost, prepareLinuxProcessReuse, textOutput } from "./linux-process-fixture.ts";
+import { commitBenchmarkFixture, compileBenchmarkHelper, createLinuxProcessBenchmark, holdOwnedProcessPublication, patternProcessHost, textOutput } from "./linux-process-fixture.ts";
 
 /** The Actor runs `first`, then (its next step) `next`, three times; the measured episode thinks `think` ms before `actual`. A `detour`
  * step first does something else, `during` changes the workspace while the Actor thinks; `reuse` is the expected outcome. */
@@ -46,7 +46,7 @@ async function chainWorld(files: readonly (readonly [string, string])[], loops: 
 			" if (argc > 2) getpid(); printf(\"%s %lx\\n\", argv[1], h); return 0; }\n"]] as const) await writeFile(path.join(workspace, file), text);
 		await compileBenchmarkHelper(workspace, "slow");
 		await commitBenchmarkFixture(workspace, "chain");
-		await prepareLinuxProcessReuse(fixture);
+		await fixture.prepare();
 		const route = await fixture.prepareActorReplay(), writer = createWriteTool(workspace), tools = [fixture.tool, writer];
 		const { host, events, start } = patternProcessHost(fixture, "chain", { candidateLimit: 4, maxConcurrentActions: 4,
 			patternAware: patternAwareSettings({ enabled: true, multiStepEnabled: false }) },
@@ -64,15 +64,16 @@ async function chainWorld(files: readonly (readonly [string, string])[], loops: 
 			expect(timing!.toolComputeMs!).toBeGreaterThanOrEqual(timing!.hiddenComputeMs);
 			expect(timing!.adoptionWaitMs!).toBeGreaterThanOrEqual(0); expect(timing!.adoptionWaitMs!).toBeLessThanOrEqual(ms);
 			await host.finishTurn(turnID);
-			return { ms, text: textOutput(result as never), hits: after.hits - before.hits, hiddenMs: timing!.hiddenComputeMs };
+			return { ms, text: textOutput(result as never), hits: after.hits - before.hits, reused: timing!.reused === true, hiddenMs: timing!.hiddenComputeMs };
 		};
 		return { fixture, workspace, host, step, tools, events };
 	} catch (error) { await fixture.dispose(); throw error; }
 }
 
-test.skipIf(process.platform !== "linux" || !process.env.PI_SPEC_REUSE_CHAIN)("reuse chain", { timeout: 3_600_000 }, async () => {
+test.skipIf(process.platform !== "linux")("reuse chain", { timeout: 3_600_000 }, async () => {
 	const rows: string[] = [];
 	for (const [name, scenario] of Object.entries(SCENARIOS)) {
+		if (!process.env.PI_SPEC_REUSE_CHAIN && name !== "running, a later turn") continue;
 		const { fixture, workspace, host, step } = await chainWorld([["a.txt", "alpha\nbeta\n"], ["b.txt", "gamma\n"], ["c.txt", "c\n"],
 			["Makefile", "all:\n\t@./slow a.txt\n\t@wc -l < b.txt\n"], ["check.sh", "set -e\ngrep -c a a.txt\n./slow b.txt\n"],
 			["stats.py", "text = open('a.txt').read()\ns = 0\nfor i in range(20_000_000): s += i % 7\nprint(len(text.split()), s)\n"],
@@ -84,9 +85,12 @@ test.skipIf(process.platform !== "linux" || !process.env.PI_SPEC_REUSE_CHAIN)("r
 		const command = (scenario.actual ?? scenario.next).replace("WORKSPACE", workspace);
 		const measured = await step("measured", command, scenario.detour ? 100 : scenario.think ?? 4000, scenario.during);
 		const started = performance.now(), native = execSync(command, { cwd: workspace, encoding: "utf8", shell: "/bin/bash" }), nativeMs = performance.now() - started;
-		rows.push(`${name.padEnd(26)} native ${nativeMs.toFixed(0).padStart(5)} ms  Actor ${measured.ms.toFixed(0).padStart(5)} ms  ${measured.hits ? "reused" : "native"}`);
+		rows.push(`${name.padEnd(26)} native ${nativeMs.toFixed(0).padStart(5)} ms  Actor ${measured.ms.toFixed(0).padStart(5)} ms  hidden ${measured.hiddenMs.toFixed(0)} ms`);
 		expect(measured.text.trim(), name).toBe(native.trim());
-		expect(measured.hits > 0, name).toBe(scenario.reuse);
+		// A stale branch may be replaced after arrival; consuming that new work hides no earlier calculation.
+		expect(measured.hiddenMs > 0, name).toBe(scenario.reuse);
+		if (scenario.reuse) expect(measured.reused, name).toBe(true);
+		else expect(measured.hits, name).toBe(0);
 	}
 	console.log(rows.join("\n"));
 });

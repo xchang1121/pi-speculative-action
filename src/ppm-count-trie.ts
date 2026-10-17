@@ -38,7 +38,7 @@ export class PpmCountTrie {
 				for (const value of current.targets.values()) {
 					value.count = safeCount(decayedCount(value, lastSeen, halfLife));
 					value.lastSeen = lastSeen;
-					current.total = safeTotal(current.total + value.count);
+					current.total = safeCount(current.total + value.count, Number.MAX_VALUE / 2);
 				}
 			}
 			const previous = current.targets.get(target);
@@ -117,7 +117,7 @@ export class PpmCountTrie {
 
 	private put(current: ContextCounts, target: string, count: number, lastSeen: number): void {
 		const previous = current.targets.get(target);
-		current.total = safeTotal(current.total + count - (previous?.count ?? 0));
+		current.total = safeCount(current.total + count - (previous?.count ?? 0), Number.MAX_VALUE / 2);
 		current.targets.set(target, { count, lastSeen });
 		current.lastSeen = Math.max(current.lastSeen, lastSeen);
 	}
@@ -130,12 +130,7 @@ export class PpmCountTrie {
 	}
 }
 
-function safeCount(value: number): number {
-	return Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Number.isFinite(value) ? value : Number.MAX_SAFE_INTEGER));
-}
-
-function safeTotal(value: number): number {
-	const maximum = Number.MAX_VALUE / 2;
+function safeCount(value: number, maximum = Number.MAX_SAFE_INTEGER): number {
 	return Math.min(maximum, Math.max(0, Number.isFinite(value) ? value : maximum));
 }
 

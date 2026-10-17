@@ -7,7 +7,7 @@ import type { ActionKey } from "./action-semantics.ts";
 import type { ActorActionSettlement } from "./settlement.ts";
 import { EvidenceLedger } from "./self-speculation-evidence.ts";
 import { asRecord as record, isRecord, stableStringify } from "./stable-json.ts";
-import { finiteNumber, nonNegativeFinite, nonNegativeCount } from "./number-utils.ts";
+import { isSafeCount, finiteNumber, nonNegativeFinite, nonNegativeCount } from "./number-utils.ts";
 import { booleanOr, nonNegativeNumber, positiveInteger, positiveMilliseconds, probability, settingsParser } from "./setting-input.ts";
 
 /** A hosted API cannot fork the Actor's decode: `drafter` has the Drafter read the Actor's reasoning so far instead. */
@@ -179,7 +179,7 @@ export class SelfSpeculationCoordinator {
 	startTurn(turnID: string, model: Model<Api>, context: Context, decisionSequence: number): void {
 		this.closeActive(true);
 		const settings = this.settings();
-		if (!settings.enabled || !Number.isSafeInteger(decisionSequence) || decisionSequence < 1) {
+		if (!settings.enabled || !isSafeCount(decisionSequence, 1)) {
 			this.pendingCandidates.clear();
 			this.acceptingCandidates = false;
 			return;
@@ -204,7 +204,7 @@ export class SelfSpeculationCoordinator {
 			agreedForkKeys: new Set(),
 			matchedForkKeys: new Set(),
 			reportedCandidates: new Map(),
-			modelKey: modelKey(model),
+			modelKey: JSON.stringify([model.provider, model.api, model.id]),
 			ended: false,
 		};
 		this.actorForkPlanSource.startTurn(turnID);
@@ -231,7 +231,7 @@ export class SelfSpeculationCoordinator {
 		const state = this.active;
 		if (!this.settings().enabled || !this.acceptingCandidates) return;
 		const targetDecisionSequence = candidate.expectedDecisionSequence;
-		if (!Number.isSafeInteger(targetDecisionSequence) || targetDecisionSequence < 1) return;
+		if (!isSafeCount(targetDecisionSequence, 1)) return;
 		if (state && targetDecisionSequence < state.decisionSequence) return;
 		if (!state && targetDecisionSequence < this.latestStartedDecisionSequence) return;
 		const candidates =
@@ -759,10 +759,6 @@ function modelPayload(model: Model<Api>): Readonly<Record<string, unknown>> {
 	return { provider: model.provider, api: model.api, id: model.id };
 }
 
-function modelKey(model: Model<Api>): string {
-	return JSON.stringify([model.provider, model.api, model.id]);
-}
-
 const originOf = (value: string | undefined) => URL.canParse(value ?? "") ? new URL(value!).origin : undefined;
 
 function decoderEvidenceContext(state: TurnState, tool: string, source: string) {
@@ -925,8 +921,7 @@ function parsedSidecarActionCall(value: unknown, fallbackIndex: number) {
 	const tool = nonEmptyString(call?.name);
 	const input = record(call?.arguments);
 	if (!tool || !input) return undefined;
-	const observedIndex = finiteNumber(call?.index);
-	const index = observedIndex !== undefined && Number.isSafeInteger(observedIndex) && observedIndex >= 0 ? observedIndex : fallbackIndex;
+	const index = isSafeCount(call?.index) ? call.index : fallbackIndex;
 	const callID = nonEmptyString(call?.call_id);
 	const format = nonEmptyString(call?.format);
 	return { index, ...(callID ? { callID } : {}), ...(format ? { format } : {}), tool, input: structuredClone(input) };

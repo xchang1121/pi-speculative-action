@@ -42,23 +42,26 @@ const SECRET_VARIABLE = /(?:API_KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)/i;
 
 interface CommandResult { readonly stdout: string; readonly stderr: string; }
 
+const numericSettings = {
+	drafterMaxDepth: "non-negative integer", candidateLimit: "positive integer",
+	drafterTaskMaxRequests: "positive integer", drafterTaskMaxTokens: "positive integer",
+	drafterDeterministicCandidates: "non-negative integer", drafterTemperatureMin: "non-negative number",
+	drafterTemperatureMax: "non-negative number", maxConcurrentActions: "positive integer",
+} as const;
+type NumericSetting = keyof typeof numericSettings;
+const numericNames = Object.keys(numericSettings) as NumericSetting[];
+const optionName = (name: string) => name.replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`);
+
 const { values } = parseArgs({
 	options: {
+		...Object.fromEntries(numericNames.map(name => [optionName(name), { type: "string" as const, default: String(DEFAULTS[name]) }])),
 		instance: { type: "string" },
 		label: { type: "string", default: "baseline" },
 		actor: { type: "string", default: "deepseek/deepseek-v4-pro" },
 		drafter: { type: "string", default: "deepseek/deepseek-v4-flash" },
 		// Every model request goes through this endpoint instead (a pi-llm-tape recorder or replayer).
 		"model-base-url": { type: "string" },
-		"drafter-max-depth": { type: "string", default: String(DEFAULTS.drafterMaxDepth) },
-		"candidate-limit": { type: "string", default: String(DEFAULTS.candidateLimit) },
 		"drafter-max-tokens": { type: "string" },
-		"drafter-task-max-requests": { type: "string", default: String(DEFAULTS.drafterTaskMaxRequests) },
-		"drafter-task-max-tokens": { type: "string", default: String(DEFAULTS.drafterTaskMaxTokens) },
-		"drafter-deterministic-candidates": { type: "string", default: String(DEFAULTS.drafterDeterministicCandidates) },
-		"drafter-temperature-min": { type: "string", default: String(DEFAULTS.drafterTemperatureMin) },
-		"drafter-temperature-max": { type: "string", default: String(DEFAULTS.drafterTemperatureMax) },
-		"max-concurrent-actions": { type: "string", default: String(DEFAULTS.maxConcurrentActions) },
 		"max-turns": { type: "string", default: "128" },
 		"timeout-ms": { type: "string", default: "900000" },
 		"repo-cache": { type: "string" },
@@ -84,19 +87,12 @@ const instance = required(values.instance, "--instance");
 const repoCache = path.resolve(values["repo-cache"] ?? path.join(os.tmpdir(), "pi-speculative-ablation-cache"));
 const runRoot = path.resolve(values["run-root"] ?? path.join(os.tmpdir(), "pi-speculative-ablation-runs"));
 const options = {
+	...Object.fromEntries(numericNames.map(name => [name, numberOption(optionName(name), numericSettings[name])])) as Record<NumericSetting, number>,
 	instance,
 	label: values.label ?? "baseline",
 	actor: model(values.actor ?? "deepseek/deepseek-v4-pro"),
 	drafter: model(values.drafter ?? "deepseek/deepseek-v4-flash"),
-	drafterMaxDepth: numberOption("drafter-max-depth", "non-negative integer"),
-	candidateLimit: numberOption("candidate-limit"),
 	...(values["drafter-max-tokens"] !== undefined ? { drafterMaxTokens: numberOption("drafter-max-tokens") } : {}),
-	drafterTaskMaxRequests: numberOption("drafter-task-max-requests"),
-	drafterTaskMaxTokens: numberOption("drafter-task-max-tokens"),
-	drafterDeterministicCandidates: numberOption("drafter-deterministic-candidates", "non-negative integer"),
-	drafterTemperatureMin: numberOption("drafter-temperature-min", "non-negative number"),
-	drafterTemperatureMax: numberOption("drafter-temperature-max", "non-negative number"),
-	maxConcurrentActions: numberOption("max-concurrent-actions"),
 	maxTurns: numberOption("max-turns"),
 	timeoutMs: numberOption("timeout-ms"),
 	repoCache,
@@ -180,12 +176,9 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	const agentDir = input.patternState ?? path.join(task.runDirectory, "agent");
 	await mkdir(agentDir, { recursive: true });
 	await writeFile(path.join(agentDir, "speculative-action.json"), JSON.stringify({
-		enabled: input.speculationEnabled, drafterEnabled: input.drafterEnabled, drafterMaxDepth: input.drafterMaxDepth,
+		...Object.fromEntries(numericNames.map(name => [name, input[name]])),
+		enabled: input.speculationEnabled, drafterEnabled: input.drafterEnabled, drafterPatternHints: input.drafterPatternHints,
 		...(input.drafterMaxTokens !== undefined ? { drafterMaxTokens: input.drafterMaxTokens } : {}),
-		drafterTaskMaxRequests: input.drafterTaskMaxRequests,
-		drafterTaskMaxTokens: input.drafterTaskMaxTokens,
-		drafterDeterministicCandidates: input.drafterDeterministicCandidates, drafterTemperatureMin: input.drafterTemperatureMin, drafterPatternHints: input.drafterPatternHints,
-		drafterTemperatureMax: input.drafterTemperatureMax, candidateLimit: input.candidateLimit, maxConcurrentActions: input.maxConcurrentActions,
 		predictionTimeoutMs: input.timeoutMs, patternAware: { enabled: input.patternAware,
 			...(input.patternPresets !== undefined ? { presets: input.patternPresets } : {}) },
 		...(input.selfSpeculation ? { selfSpeculation: { enabled: true, forkTransport: "drafter" } } : {}), draftModel: `${input.drafter.provider}/${input.drafter.id}`,
@@ -440,8 +433,8 @@ function increment(counts: Record<string, number>, key: string): void {
 	counts[key] = (counts[key] ?? 0) + 1;
 }
 
-function numberOption(option: keyof typeof values, kind: "positive integer" | "non-negative integer" | "non-negative number" = "positive integer"): number {
-	const parsed = Number(values[option]);
+function numberOption(option: string, kind: "positive integer" | "non-negative integer" | "non-negative number" = "positive integer"): number {
+	const parsed = Number(Reflect.get(values, option));
 	if (!Number.isFinite(parsed) || (kind !== "non-negative number" && !Number.isInteger(parsed)) ||
 		(kind === "positive integer" ? parsed <= 0 : parsed < 0)) throw new Error(`--${option} must be a ${kind}`);
 	return parsed;

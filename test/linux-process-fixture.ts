@@ -19,6 +19,7 @@ import { PatternAwareStore, patternAwareSettings, patternAwareActionSemantics } 
 import type { SpeculativeActionEvent } from "../src/events.ts";
 import { testModel } from "./model.ts";
 import type { ProcessProvenanceCertificate } from "../src/provenance-certificate.ts";
+import type { ExecutionScope } from "../src/execution-world.ts";
 
 export type LinuxProcessBenchmark = Readonly<Awaited<ReturnType<typeof createLinuxProcessBenchmark>>>;
 process.execArgv.push("--import", new URL("./process-owner-fixture.mjs", import.meta.url).href);
@@ -152,6 +153,8 @@ export async function createLinuxProcessBenchmark(
 		spawnHook: (context) => ({ ...context, env: { ...environment } }),
 	});
 	let disposal: Promise<void> | undefined;
+	let executionFingerprint: string | undefined, calls = 0;
+	const invocation = (args: Record<string, unknown>) => resolvePiToolInvocation("bash", args, { cwd: workspace, environment, shellPath })!;
 	return {
 		root,
 		workspace,
@@ -163,8 +166,30 @@ export async function createLinuxProcessBenchmark(
 		inOwner,
 		world,
 		workspaceSandbox,
-		invocation: (args: Record<string, unknown>) => resolvePiToolInvocation("bash", args, { cwd: workspace, environment, shellPath })!,
+		invocation,
 		tool: tool as AgentTool, // Preserve a portable type across nested schema packages.
+		prepare: async ({ workspaceDriver: driver, includeWorkspaceFingerprint, skip }: {
+			readonly workspaceDriver?: WorkspaceSandboxDriver; readonly includeWorkspaceFingerprint?: boolean; readonly skip?: (reason: string) => void;
+		} = {}) => {
+			const status = await backend.check(true);
+			if (status.state !== "ready") { skip?.(status.detail); throw new Error(status.detail); }
+			if (!status.sandlockBinary || !status.straceBinary) throw new Error("Linux process backend omitted ready binaries");
+			const workspaceFingerprint = includeWorkspaceFingerprint ? await workspaceSandbox.fingerprint({ driver: driver ?? "auto" }, workspace) : undefined;
+			await world.speculation.prepare?.({ cwd: workspace });
+			const backendFingerprint = await backend.fingerprint();
+			return { executionFingerprint: executionFingerprint = workspaceFingerprint ? `${backendFingerprint}:${workspaceFingerprint}` : backendFingerprint };
+		},
+		fork: async (command: string, options: { readonly namespace?: string; readonly executionScope?: ExecutionScope; readonly signal?: AbortSignal } = {}) => {
+			if (!executionFingerprint) throw new Error("Prepare the process fixture before forking");
+			const args = { command }, action = PI_ACTION_SEMANTICS.buildKey("bash", args, workspace, options.namespace ?? "benchmark", {
+				fingerprint: executionFingerprint, context: invocation(args),
+			});
+			if (!action) throw new Error("Pi Bash action could not be keyed");
+			const branch = await world.speculation.execute({ cwd: workspace, tool, toolName: "bash", args, action, callID: `bench-${++calls}`,
+				signal: options.signal ?? new AbortController().signal, executionScope: options.executionScope ?? { sessionID: "benchmark", turnID: "benchmark" } });
+			if (branch.inputsOnly) { await branch.dispose(); throw new Error("Bash fork must produce its tool result"); }
+			return branch;
+		},
 		prepareActorReplay: async (refresh?: boolean) => {
 			if (refresh) await backend.refreshNativeObservation();
 			const replay = backend.completedReplayExecutor(host, { sourceRoot: workspace, invocation: () => undefined });
@@ -173,50 +198,6 @@ export async function createLinuxProcessBenchmark(
 		dispose: () => disposal ??= Promise.resolve().then(() => world.dispose?.()).finally(closeInspection)
 			.finally(() => workspaceSandbox.dispose()).finally(() => rm(root, { recursive: true, force: true })),
 	};
-}
-
-export async function prepareLinuxProcessReuse(
-	fixture: LinuxProcessBenchmark,
-	options: { readonly workspaceDriver?: WorkspaceSandboxDriver; readonly includeWorkspaceFingerprint?: boolean; readonly skip?: (reason: string) => void } = {},
-) {
-	const status = await fixture.backend.check(true);
-	if (status.state !== "ready") { options.skip?.(status.detail); throw new Error(status.detail); }
-	if (!status.sandlockBinary || !status.straceBinary) throw new Error("Linux process backend omitted ready binaries");
-	const workspaceFingerprint = options.includeWorkspaceFingerprint
-		? await fixture.workspaceSandbox.fingerprint({ driver: options.workspaceDriver ?? "auto" }, fixture.workspace)
-		: undefined;
-	await fixture.world.speculation.prepare?.({ cwd: fixture.workspace });
-	const backendFingerprint = await fixture.backend.fingerprint();
-	return { executionFingerprint: workspaceFingerprint ? `${backendFingerprint}:${workspaceFingerprint}` : backendFingerprint };
-}
-
-export interface ReusableBashInput {
-	readonly label: string;
-	readonly command: string;
-	readonly actionNamespace: string;
-	readonly executionFingerprint: string;
-	readonly executionScope?: { readonly sessionID: string; readonly turnID: string };
-	readonly signal?: AbortSignal;
-}
-
-export async function forkReusableBash(fixture: Pick<LinuxProcessBenchmark, "world" | "tool" | "workspace" | "invocation">, input: ReusableBashInput) {
-	const args = { command: input.command };
-	const invocation = fixture.invocation(args);
-	if (!invocation) throw new Error("Pi Bash invocation could not be materialized");
-	const action = PI_ACTION_SEMANTICS.buildKey("bash", args, fixture.workspace, input.actionNamespace, { fingerprint: input.executionFingerprint, context: invocation });
-	if (!action) throw new Error("Pi Bash action could not be keyed");
-	const branch = await fixture.world.speculation.execute({
-		cwd: fixture.workspace,
-		tool: fixture.tool,
-		toolName: "bash",
-		args,
-		action,
-		callID: `bench-${input.label}`,
-		signal: input.signal ?? new AbortController().signal,
-		executionScope: input.executionScope ?? { sessionID: "benchmark", turnID: "benchmark" },
-	});
-	if (branch.inputsOnly) { await branch.dispose(); throw new Error("Bash fork must produce its tool result"); }
-	return branch;
 }
 
 export async function compileBenchmarkHelper(

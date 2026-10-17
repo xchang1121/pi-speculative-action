@@ -1,3 +1,4 @@
+import { isSafeCount } from "./number-utils.ts";
 import { captureProcessContext, outputStatusFlags, routedProcessContext, validProcessContext, type ProcessExecutionContext } from "./process-context.mjs";
 import { execFile, spawn } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -1029,7 +1030,7 @@ export class LinuxProcessReuseBackend {
 					const parseFrontier = (pid: number, reply: Buffer) => {
 						const bytes = Number(reply.readBigUInt64LE(16)), begin = Number(reply.readBigUInt64LE(24)) / 1e6 - clockOffset,
 							end = Number(reply.readBigUInt64LE(32)) / 1e6 - clockOffset, fd = reply.readInt32LE(4), syscall = reply.readInt32LE(8);
-						if (reply.readInt32LE(0) !== pid || ![1, 2, 5, 6].includes(reply.readInt32LE(12)) || syscall < 0 || syscall >= 0x40000000 || !Number.isSafeInteger(bytes) || bytes <= 0 || fd < -1 ||
+						if (reply.readInt32LE(0) !== pid || ![1, 2, 5, 6].includes(reply.readInt32LE(12)) || syscall < 0 || syscall >= 0x40000000 || !isSafeCount(bytes, 1) || fd < -1 ||
 							begin < processStarted || end < begin || end > performance.now()) throw new Error("invalid native continuation frontier");
 						return { frozen: { pid, fd, writing: [1, 20, 44, 46].includes(syscall), bytes }, computation: new TimelineInterval(begin, end) };
 					};
@@ -1824,8 +1825,7 @@ function parseDescriptorOffsets(report: Buffer, inputs: ReturnType<typeof descri
 		if (!/^F \d+ \d+ \d+ \d+ -?\d+ \d+ \d+$/.test(value)) throw new Error("invalid detached file image");
 		const [, fd, mode, uid, gid, seconds, nanos, length] = value.split(" "), size = Number(length);
 		const input = inputs.find(input => input.fd === Number(fd)), position = positions.find(position => position.fd === Number(fd));
-		if (!input || input.type || input.fd !== input.image || !position || position.detached || !Number.isSafeInteger(size) ||
-			size < 0 || (bytes += size) > MAX_REQUEST_BYTES / 2 || cursor + size >= report.length || report[cursor + size] !== 10 || Number(nanos) >= 1e9) throw new Error("unbound detached file image");
+		if (!input || input.type || input.fd !== input.image || !position || position.detached || !isSafeCount(size) || (bytes += size) > MAX_REQUEST_BYTES / 2 || cursor + size >= report.length || report[cursor + size] !== 10 || Number(nanos) >= 1e9) throw new Error("unbound detached file image");
 		position.detached = { content: report.subarray(cursor, cursor + size), mode: BigInt(mode!), uid: BigInt(uid!), gid: BigInt(gid!), modified: BigInt(seconds!) * 1_000_000_000n + BigInt(nanos!) };
 		cursor += size + 1;
 	}
@@ -2551,7 +2551,7 @@ function parseDispatcherRequest(body: string): Pick<DispatcherRequest, "token" |
 		const value: unknown = JSON.parse(body.trim());
 		if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
 		const request = value as Partial<DispatcherRequest>;
-		return typeof request.token === "string" && Number.isSafeInteger(request.pid) && request.pid! > 0 &&
+		return typeof request.token === "string" && isSafeCount(request.pid, 1) &&
 			(request.descriptors === undefined || Array.isArray(request.descriptors) && request.descriptors.length <= 64 && request.descriptors.every(entry => entry &&
 				[entry.fd, entry.alias, entry.flags, entry.capacity].every(Number.isSafeInteger) && entry.fd > 2 && typeof entry.eof === "boolean" &&
 				[entry.device, entry.inode].every(value => typeof value === "string" && /^\d+$/.test(value)) && typeof entry.queueHex === "string" && /^(?:[0-9a-f]{2})*$/.test(entry.queueHex)))

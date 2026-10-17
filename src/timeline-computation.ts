@@ -1,3 +1,6 @@
+import { dependencyOrder } from "./dependency-order.ts";
+import { isRecord as record } from "./stable-json.ts";
+
 /** Complete observational evidence, independent of replay authority and output identity. */
 export interface SerializedTimelineComputation {
 	readonly version: 1 | 2 | 3;
@@ -105,22 +108,12 @@ export function normalizeTimelineComputation(value: unknown): SerializedTimeline
 				owned.set(input.id, node.id);
 			}
 		}
-		const visiting = new Set<string>(), visited = new Set<string>(), ordered: SerializedTimelineNode[] = [];
-		const pending = [{ id: value.root, finished: false }];
-		while (pending.length) {
-			const { id, finished } = pending.pop()!, node = byID.get(id)!;
-			if (finished) { visiting.delete(id); visited.add(id); ordered.push(node); continue; }
-			if (visited.has(id)) continue;
-			if (visiting.has(id)) return undefined;
-			visiting.add(id); pending.push({ id, finished: true });
-			for (const input of node.inputs ?? []) pending.push({ id: input.id, finished: false });
-		}
-		if (visited.size !== nodes.length) return undefined;
+		const ordered = dependencyOrder([byID.get(value.root)!], node => [...node.inputs ?? []].reverse().map(input => byID.get(input.id)));
+		if (!ordered || ordered.length !== nodes.length) return undefined;
 		return Object.freeze({ version: value.version as 1 | 2 | 3, root: value.root, nodes: Object.freeze(ordered) });
 	} catch { return undefined; }
 }
 
-function record(value: unknown): value is Record<string, unknown> { return !!value && typeof value === "object" && !Array.isArray(value); }
 function identity(value: unknown): value is string { return typeof value === "string" && value.length > 0 && !value.includes("\0"); }
 function duration(value: unknown): value is number { return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= Number.MAX_SAFE_INTEGER; }
 function endpoints(value: Record<string, unknown>): boolean { return duration(value.startedAt) && duration(value.completedAt) && value.completedAt >= value.startedAt; }

@@ -1,3 +1,8 @@
+/** Validate discrete quantities without coercing, rounding or clamping malformed evidence. */
+export function isSafeCount(value: unknown, minimum = 0, maximum = Number.MAX_SAFE_INTEGER): value is number {
+	return Number.isSafeInteger(value) && (value as number) >= minimum && (value as number) <= maximum;
+}
+
 /** Clamp measured values; non-finite and missing evidence contributes zero. */
 export function nonNegativeFinite(value: unknown): number {
 	return typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : 0;

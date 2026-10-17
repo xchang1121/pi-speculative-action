@@ -1,3 +1,4 @@
+import { isSafeCount } from "./number-utils.ts";
 export type PostSettlementFailureHandler = (error: unknown) => void;
 
 /**
@@ -21,7 +22,7 @@ export class BoundedEventQueue<Event> {
 		deliver: (event: Event) => void | Promise<void>,
 		onFailure: PostSettlementFailureHandler = () => {},
 	) {
-		if (!Number.isSafeInteger(capacity) || capacity < 1) throw new Error("event queue capacity must be positive");
+		if (!isSafeCount(capacity, 1)) throw new Error("event queue capacity must be positive");
 		this.capacityValue = capacity;
 		this.deliver = deliver;
 		this.onFailure = onFailure;

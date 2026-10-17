@@ -1,4 +1,4 @@
-import { clampProbability, finiteNumber, nonNegativeFinite } from "./number-utils.ts";
+import { clampProbability, finiteNumber, isSafeCount, nonNegativeFinite } from "./number-utils.ts";
 import { hash as cryptoHash } from "node:crypto";
 import { writeJsonFile } from "./filesystem-evidence.ts";
 import fs from "node:fs/promises";
@@ -220,8 +220,6 @@ type PatternPool = {
 	patternIDs?: string[];
 };
 
-type TrieNode = { readonly children: Map<string, TrieNode>; readonly patterns: Set<MutablePattern>; };
-
 const { defaults: patternAwareDefaults, parse: parsePatternSettings } = settingsParser({
 	enabled: [true, booleanOr],
 	/** Built-in relations are selectable independently of the patterns learned from real calls. */
@@ -256,39 +254,6 @@ const PERSIST_CHECKPOINT_INTERVAL_MS = 30_000;
 /** Longer strings and lists are neither bindable nor worth their memory, persisted bytes and analysis caches. */
 const PATTERN_VALUE_MAX_CHARS = 4096, PATTERN_VALUE_MAX_ITEMS = 256;
 
-class PredictiveContextTrie {
-	private readonly root: TrieNode = { children: new Map(), patterns: new Set() };
-
-	insert(pattern: MutablePattern) {
-		let node = this.root;
-		for (let index = pattern.context.length - 1; index >= 0; index--) {
-			const token = trieToken(pattern.context[index]!);
-			const child = node.children.get(token) ?? { children: new Map(), patterns: new Set() };
-			node.children.set(token, child);
-			node = child;
-		}
-		node.patterns.add(pattern);
-	}
-
-	*matching(history: ReadonlyArray<PatternAwareEvent>, starts?: ReadonlySet<number>) {
-		let node = this.root;
-		for (let index = history.length - 1; index >= 0; index--) {
-			const token = trieToken(signature(history[index]!));
-			const child = node.children.get(token);
-			if (!child) break;
-			node = child;
-			if (!node.patterns.size || starts?.has(index) === false) continue;
-			const context = history.slice(index);
-			// Trie edges already match tool/outcome/operation; output shapes retain wildcard semantics.
-			const shapes = context.map((event) => signature(event).outputShape);
-			for (const pattern of node.patterns) {
-				if (pattern.context.every((expected, offset) => expected.outputShape === undefined ||
-					shapes[offset] === undefined || shapes[offset] === expected.outputShape)) yield { pattern, context };
-			}
-		}
-	}
-}
-
 export class PatternAwareStore {
 	private readonly patterns = new Map<string, MutablePattern>();
 	private readonly bindingAnalysis = new PatternBindingAnalysis();
@@ -301,9 +266,8 @@ export class PatternAwareStore {
 	private readonly structuralFeedback = new Map<PatternAwarePresetID, MutablePatternFeedback>();
 	private readonly resolvedActionKeys: BoundedRecencyMap<string, ActionKey | null>;
 	private readonly patternSupportSessions = new Map<string, ReadonlySet<string>>();
-	private trie = new PredictiveContextTrie();
+	private contexts?: Map<string, MutablePattern[]>;
 	private sequenceModel: PpmCountTrie;
-	private indexDirty = true;
 	private clock = 0;
 	private write?: Promise<void>;
 	private dirty = false;
@@ -335,7 +299,7 @@ export class PatternAwareStore {
 		const portable = this.portableFile ? await readPatterns(this.portableFile) : [];
 		for (const pattern of portable) if (!this.patterns.has(pattern.id) && this.portable(pattern) && pattern.context.length <= this.settings.maxContextLength)
 			this.patterns.set(pattern.id, { ...pattern, lastSeenSequence: this.clock });
-		if (portable.length) { this.indexDirty = true; this.trimPatterns(); }
+		if (portable.length) { this.contexts = undefined; this.trimPatterns(); }
 	}
 
 	private async loadWorkspace() {
@@ -364,7 +328,7 @@ export class PatternAwareStore {
 		}
 		this.sequenceModel.restore(parsed.sequenceCounts);
 		this.sequenceModel.trim(this.settings.maxPatterns);
-		this.indexDirty = true;
+		this.contexts = undefined;
 		this.trimPools();
 		this.trimPatterns();
 	}
@@ -432,7 +396,7 @@ export class PatternAwareStore {
 		this.patterns.set(pattern.id, pattern);
 		this.patternSupportSessions.delete(pattern.id);
 		this.clock = Math.max(this.clock, pattern.lastSeenSequence);
-		this.indexDirty = true;
+		this.contexts = undefined;
 		this.trimPatterns();
 		this.persist();
 		return true;
@@ -501,8 +465,7 @@ export class PatternAwareStore {
 		if (continuation.visitedPatternIDs.length >= settings.maxPredictionDepth) return [];
 		const activeSessionID = history.at(-1)?.sessionID;
 		const groups = new Map< string, Array<{ readonly pattern: MutablePattern; readonly input: Record<string, unknown>; variantProbability: number; }> >();
-		this.ensureIndex();
-		for (const { pattern, context } of this.trie.matching(history, this.contextStarts(history))) {
+		for (const { pattern, context } of this.matchingPatterns(history)) {
 			const patternID = pattern.id;
 			if (continuation.visitedPatternIDs.includes(patternID) || !structurallyEligible(pattern, settings)) continue;
 			const supportingSessions = this.patternSupportSessions.get(patternID);
@@ -768,11 +731,24 @@ export class PatternAwareStore {
 		}
 	}
 
-	private ensureIndex() {
-		if (!this.indexDirty) return;
-		this.trie = new PredictiveContextTrie();
-		for (const pattern of this.patterns.values()) this.trie.insert(pattern);
-		this.indexDirty = false;
+	/** Index only populated contexts; prediction and learning use the same suffix and wildcard rules. */
+	private *matchingPatterns(history: readonly PatternAwareEvent[]) {
+		if (!this.contexts) {
+			this.contexts = new Map();
+			for (const pattern of this.patterns.values()) {
+				const key = JSON.stringify(pattern.context.map(trieToken)), group = this.contexts.get(key) ?? [];
+				group.push(pattern); this.contexts.set(key, group);
+			}
+		}
+		const signatures = history.map(signature), tokens = signatures.map(trieToken), starts = this.contextStarts(history);
+		for (let index = history.length - 1; index >= 0; index--) {
+			if (starts?.has(index) === false) continue;
+			const patterns = this.contexts.get(JSON.stringify(tokens.slice(index)));
+			if (!patterns) continue;
+			const context = history.slice(index);
+			for (const pattern of patterns) if (pattern.context.every((expected, offset) => expected.outputShape === undefined ||
+				signatures[index + offset]!.outputShape === undefined || signatures[index + offset]!.outputShape === expected.outputShape)) yield { pattern, context };
+		}
 	}
 
 	private observeRecurrentAction(session: PatternSessionState<PatternAwareEvent>, event: PatternAwareEvent) {
@@ -920,7 +896,7 @@ export class PatternAwareStore {
 			(pool.patternIDs ?? []).some((patternID) => (this.patterns.get(patternID)?.occurrences ?? this.settings.minOccurrences) < this.settings.minOccurrences);
 		if (pool.samples.length < this.settings.minOccurrences && !probationary) { this.retirePoolPatterns(pool, new Set()); return; }
 		const minimumSupport = probationary ? pool.samples.length : this.settings.minOccurrences;
-		const constantSupport = bindingEvidenceThreshold(this.settings);
+		const constantSupport = Math.max(4, this.settings.minOccurrences * 2);
 		const candidates = new Map<string, Record<string, PatternAwareBinding>>();
 		const remember = (bindings: Record<string, PatternAwareBinding> | undefined) => {
 			if (!bindings || (!firstRecurrenceProbe && !hasSufficientBindingProvenance(bindings, pool.samples, constantSupport))) return;
@@ -963,10 +939,10 @@ export class PatternAwareStore {
 				...observed,
 				...(target.schemaHash ? { targetSchemaHash: target.schemaHash } : {}),
 				historicalOpportunities: this.controlOpportunities(pool),
-				historicalMatches: controlOpportunityCount(support),
+				historicalMatches: new Set(support.map((sample) => controlOpportunityID(sample.target))).size,
 				feedback: emptyPatternFeedback(observed.lastSeenSequence),
 			});
-			this.indexDirty = true;
+			this.contexts = undefined;
 		}
 		this.retirePoolPatterns(pool, retained);
 	}
@@ -995,7 +971,7 @@ export class PatternAwareStore {
 	}
 
 	private removePattern(patternID: string) {
-		if (this.patterns.delete(patternID)) this.indexDirty = true;
+		if (this.patterns.delete(patternID)) this.contexts = undefined;
 		this.patternSupportSessions.delete(patternID);
 		for (const session of this.sessions.values()) {
 			if (session.pending.some(item => item.patternID === patternID)) session.pending = session.pending.filter(item => item.patternID !== patternID);
@@ -1026,8 +1002,7 @@ export class PatternAwareStore {
 		const pending = [...session.pending];
 		const triggerSequence = history.at(-1)?.sequence;
 		if (triggerSequence === undefined) return;
-		this.ensureIndex();
-		for (const { pattern, context } of this.trie.matching(history, this.contextStarts(history))) {
+		for (const { pattern, context } of this.matchingPatterns(history)) {
 			if (!structurallyEligible(pattern, this.settings)) continue;
 			if (pending.some((item) => item.patternID === pattern.id && item.triggerSequence === triggerSequence)) continue;
 			pending.push({
@@ -2181,10 +2156,10 @@ function mutablePools(eventsValue: ReadonlyArray<unknown>, pools: ReadonlyArray<
 		const record = asRecord(value);
 		if (!record || !Array.isArray(record.samples) || typeof record.key !== "string" ||
 			typeof record.targetTool !== "string" || !Array.isArray(record.context) ||
-			!record.context.every(isEventSignature) || !isNonNegativeInteger(record.gap)) return [];
+			!record.context.every(isEventSignature) || !isSafeCount(record.gap)) return [];
 		const samples = record.samples.flatMap((item) => {
 			const sample = asRecord(item);
-			if (!sample || !Array.isArray(sample.context) || !sample.context.every(isNonNegativeInteger) || !isNonNegativeInteger(sample.target) ||
+			if (!sample || !Array.isArray(sample.context) || !sample.context.every(value => isSafeCount(value)) || !isSafeCount(sample.target) ||
 				sample.gap !== record.gap) return [];
 			const context = sample.context.map((id) => events[id as number]);
 			const target = events[sample.target as number];
@@ -2207,10 +2182,6 @@ function mutablePools(eventsValue: ReadonlyArray<unknown>, pools: ReadonlyArray<
 	});
 }
 
-function isNonNegativeInteger(value: unknown): value is number {
-	return Number.isSafeInteger(value) && (value as number) >= 0;
-}
-
 function patternPoolKey(context: ReadonlyArray<PatternAwareEventSignature>, targetTool: string, targetSchemaHash: string | undefined, gap: number) {
 	return hash(stableStringify({ context, targetTool, targetSchemaHash, gap }));
 }
@@ -2225,16 +2196,8 @@ function controlOpportunityID(event: PatternAwareEvent) {
 		: persistedEventIdentity(event);
 }
 
-function controlOpportunityCount(samples: ReadonlyArray<PatternSample>) {
-	return new Set(samples.map((sample) => controlOpportunityID(sample.target))).size;
-}
-
 function patternPoolSampleLimit(settings: Pick<PatternAwareSettings, "minOccurrences" | "maxContextLength">) {
 	return Math.max(settings.minOccurrences * 4, settings.maxContextLength * 4);
-}
-
-function bindingEvidenceThreshold(settings: Pick<PatternAwareSettings, "minOccurrences">) {
-	return Math.max(4, settings.minOccurrences * 2);
 }
 
 function isEventSignature(value: unknown): value is PatternAwareEventSignature {
@@ -2290,7 +2253,7 @@ function isPatternAwarePath(value: unknown): value is PatternAwarePath {
 	return (
 		Array.isArray(value) &&
 		value.every(
-			(segment) => typeof segment === "string" || (Number.isSafeInteger(segment) && (segment as number) >= 0),
+			(segment) => typeof segment === "string" || isSafeCount(segment),
 		)
 	);
 }

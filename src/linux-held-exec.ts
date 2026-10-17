@@ -1,3 +1,4 @@
+import { isSafeCount } from "./number-utils.ts";
 import { spawn, type ChildProcess } from "node:child_process";
 import { on, once } from "node:events";
 import { AsyncLocalStorage, AsyncResource } from "node:async_hooks";
@@ -96,7 +97,7 @@ function validQueueMessages(messages: readonly QueueMessage[] | undefined, bytes
 	for (const message of messages) {
 		if (!message || !Number.isSafeInteger(message.start) || !Number.isSafeInteger(message.end) ||
 			message.start < end || message.end <= message.start || message.end > bytes || !Array.isArray(message.rights) || !message.rights.length ||
-			message.rights.some((fd: number) => !Number.isInteger(fd) || fd < 0 || fd > 0x7fffffff)) return false;
+			message.rights.some((fd: number) => !isSafeCount(fd, 0, 0x7fffffff))) return false;
 		end = message.end; rights += message.rights.length;
 	}
 	return rights <= 64;
@@ -181,7 +182,7 @@ export function descriptorEffects(graph: ProcessResourceGraph, report: readonly 
 	for (const [index, handle] of inputs.entries()) {
 		const position = report[index]!, ofd = graph.descriptions[handle.alias]!, object = graph.objects[ofd.object]!;
 		if (position.fd !== handle.fd || position.before !== (ofd.position ?? 0) || !isOFDPosition(position.after) ||
-			position.afterFlags !== undefined && (!Number.isSafeInteger(position.afterFlags) || position.afterFlags < 0 || position.afterFlags > 0x7fffffff ||
+			position.afterFlags !== undefined && (!isSafeCount(position.afterFlags, 0, 0x7fffffff) ||
 				((position.afterFlags ^ ofd.flags) & ~0xc00))) throw new Error("invalid resource transition");
 		const previous = descriptions.get(handle.alias), shared = objects.get(ofd.object);
 		if (previous && (previous.position?.after !== (ofd.position === undefined ? undefined : position.after) || previous.flags !== position.afterFlags) ||
@@ -461,7 +462,7 @@ export class LinuxHeldExecBoundary {
 				positions.reduce((sum, position) => sum + (position.content?.length ?? 0) + Buffer.byteLength(position.path ?? ""), 0) +
 				(continuation?.image.length ?? 0) + physicalRoot.length + sourceRoot.length;
 			const descriptors = new Set<number>();
-			if (!Number.isSafeInteger(code) || code < 0 || code > (continuation ? 256 : 255) ||
+			if (!isSafeCount(code, 0, continuation ? 256 : 255) ||
 				continuation && (!Buffer.isBuffer(continuation.image) || !continuation.image.length || continuation.image.length > 65 * 1024 * 1024 ||
 					!path.isAbsolute(continuation.physicalRoot) || continuation.physicalRoot.includes("\0") || physicalRoot.length >= 4096 || sourceRoot.length >= 4096) ||
 				decision.output.length > MAX_OUTPUT_EVENTS || total > MAX_OUTPUT_BYTES || positions.length > 64 || positions.some(position => {
@@ -469,15 +470,15 @@ export class LinuxHeldExecBoundary {
 					return duplicate || position.path !== undefined && (typeof position.path !== "string" || !path.isAbsolute(position.path) || position.path.includes("\0") || Buffer.byteLength(position.path) >= 4096) ||
 						!validQueueMessages(position.messages, position.content?.length ?? 0) ||
 						position.content !== undefined && !Buffer.isBuffer(position.content) ||
-						![position.capacity ?? 0, position.event ?? 0, ...Object.values(position.socket ?? {})].every(value => Number.isSafeInteger(value) && value >= 0) || (position.event ?? 0) > 0x80000000 ||
+						![position.capacity ?? 0, position.event ?? 0, ...Object.values(position.socket ?? {})].every(value => isSafeCount(value)) || (position.event ?? 0) > 0x80000000 ||
 						![position.before, position.after].every(isOFDPosition) ||
-						![position.fd, position.flags, position.afterFlags].every(value => Number.isSafeInteger(value) && value >= 0) ||
+						![position.fd, position.flags, position.afterFlags].every(value => isSafeCount(value)) ||
 						((position.flags ^ position.afterFlags) & ~0xc00) !== 0 ||
 						position.fd > 0x7fffffff || position.flags > 0x7fffffff || position.afterFlags > 0x7fffffff || ![position.device, position.inode].every(value =>
 							typeof value === "string" && /^(0|[1-9][0-9]{0,19})$/.test(value) && BigInt(value) <= 0xffffffffffffffffn);
 				}) || resourceEvents.length > 1024 || resourceEvents.some(event => !descriptors.has(event.fd) ||
 					!RESOURCE_TRANSITIONS.includes(event.kind) || !Buffer.isBuffer(event.data) || event.data.length > 2 * 1024 * 1024 ||
-					event.requested !== undefined && (!Number.isSafeInteger(event.requested) || event.requested < 0 || event.requested > 2 * 1024 * 1024))) return void socket.end("C\n");
+					event.requested !== undefined && (!isSafeCount(event.requested, 0, 2 * 1024 * 1024)))) return void socket.end("C\n");
 			// Once a proposal is delivered the peer may arm its exit stub, even if its ACK is lost.
 			prepared = true;
 			await writeProcessChannel(socket, Buffer.from(`P ${code} ${decision.output.length} ${total} ${positions.length} ${resourceEvents.length} ${continuation?.image.length ?? 0} ${physicalRoot.length} ${sourceRoot.length}\n`));
@@ -613,7 +614,7 @@ export async function captureHeldDescriptorInputs(pid: number, descriptors: read
 	let namespace: ReturnType<typeof captureWorkspaceStructure> | undefined;
 	for (const descriptor of descriptors) {
 		const { fd, alias: representative, flags, offset } = descriptor;
-		if (descriptor.pin !== undefined && (!Number.isSafeInteger(tracerPid) || tracerPid! <= 0)) throw new Error("queued OFD has no authenticated holder");
+		if (descriptor.pin !== undefined && (!isSafeCount(tracerPid, 1))) throw new Error("queued OFD has no authenticated holder");
 		const holder = descriptor.pin === undefined ? pid : tracerPid!, handle = descriptor.pin ?? fd;
 		const heldPath = `/proc/${holder}/fd/${handle}`;
 		if ((descriptor.flags & 3) === 3 || descriptor.fd === 1 || descriptor.fd === 2) throw new Error("unsupported inherited descriptor effects");
@@ -718,8 +719,8 @@ function parseRequest(line: string): WireRequest | undefined {
 	try {
 		const value = JSON.parse(line) as Partial<WireRequest>;
 		return /^[0-9a-f]{64}$/.test(value.token ?? "") &&
-			/^[0-9a-f]{48}$/.test(value.execution ?? "") && Number.isSafeInteger(value.pid) && value.pid! > 0 &&
-			Number.isSafeInteger(value.tracer) && value.tracer! > 0 && (value.holder === undefined || Number.isSafeInteger(value.holder) && value.holder! >= 0) &&
+			/^[0-9a-f]{48}$/.test(value.execution ?? "") && isSafeCount(value.pid, 1) &&
+			isSafeCount(value.tracer, 1) && (value.holder === undefined || isSafeCount(value.holder)) &&
 			(value.trackQueues === undefined || value.trackQueues === true && value.descriptors === undefined) &&
 			validDescriptors(value.descriptors) ? value as WireRequest : undefined;
 	} catch {
@@ -733,18 +734,18 @@ function validDescriptors(descriptors: WireRequest["descriptors"]): boolean {
 	let previous = -1;
 	const aliases = new Map<number, HeldFileDescriptor>();
 	for (const descriptor of descriptors) {
-		if (descriptor?.pin !== undefined && (!Number.isSafeInteger(descriptor.pin) || descriptor.pin < 0 || descriptor.pin > 0x7fffffff || descriptor.alias !== descriptor.fd)) return false;
+		if (descriptor?.pin !== undefined && (!isSafeCount(descriptor.pin, 0, 0x7fffffff) || descriptor.alias !== descriptor.fd)) return false;
 		if (!descriptor || descriptor.type !== undefined && !["null", "directory", "pipe", "socket", "eventfd"].includes(descriptor.type) || descriptor.type !== undefined && descriptor.type !== "directory" && descriptor.offset !== 0 ||
 			!validOFDLocks(descriptor.locks) || descriptor.locks !== undefined && (descriptor.type !== undefined || descriptor.fd !== descriptor.alias) ||
 			(descriptor.type === "directory" && !(descriptor.flags & 0x200000) ? typeof descriptor.directoryHex !== "string" || descriptor.directoryHex.length > 4 * 1024 * 1024 || !/^(?:[0-9a-f]{2})*$/.test(descriptor.directoryHex) : descriptor.directoryHex !== undefined) ||
-			(descriptor.type === "eventfd" ? !descriptor.counter || !Number.isInteger(descriptor.counter.id) || descriptor.counter.id < 0 || descriptor.counter.id > 0x7fffffff ||
+			(descriptor.type === "eventfd" ? !descriptor.counter || !isSafeCount(descriptor.counter.id, 0, 0x7fffffff) ||
 				!/^(0|[1-9][0-9]{0,19})$/.test(descriptor.counter.value) || BigInt(descriptor.counter.value) >= 0xffffffffffffffffn || ![0, 1].includes(descriptor.counter.semaphore) : descriptor.counter !== undefined) ||
-			(descriptor.outside !== undefined && (!Number.isInteger(descriptor.outside) || descriptor.outside < 0 || descriptor.outside > 3 ||
+			(descriptor.outside !== undefined && (!isSafeCount(descriptor.outside, 0, 3) ||
 				(descriptor.type !== undefined && descriptor.type !== "eventfd" ? !["pipe", "socket"].includes(descriptor.type) : descriptor.outside !== 0 && descriptor.outside !== 3))) ||
 			(descriptor.messages !== undefined && (descriptor.type !== "socket" || !validQueueMessages(descriptor.messages, (descriptor.queueHex?.length ?? 0) / 2))) ||
-			(descriptor.type === "pipe" || descriptor.type === "socket" ? typeof descriptor.eof !== "boolean" || typeof descriptor.queueHex !== "string" || descriptor.queueHex.length > 4 * 1024 * 1024 || descriptor.queueHex.length % 2 !== 0 || !/^[0-9a-f]*$/.test(descriptor.queueHex) || !Number.isSafeInteger(descriptor.capacity) || descriptor.capacity! < 4096 : descriptor.queueHex !== undefined || descriptor.eof !== undefined || descriptor.capacity !== undefined) ||
-			(descriptor.type === "socket" ? !descriptor.socket || ![1, 2, 5].includes(descriptor.socket.type ?? 1) || ![descriptor.socket.shutdown, descriptor.socket.peerShutdown].every(value => Number.isInteger(value) && value >= 0 && value <= 3) || ![descriptor.socket.peerInode, descriptor.socket.peerQueued, descriptor.socket.allocated].every(value => Number.isSafeInteger(value) && value >= 0) : descriptor.socket !== undefined) ||
-			!isOFDPosition(descriptor.offset) || ![descriptor.fd, descriptor.alias, descriptor.flags].every(value => Number.isSafeInteger(value) && value >= 0) ||
+			(descriptor.type === "pipe" || descriptor.type === "socket" ? typeof descriptor.eof !== "boolean" || typeof descriptor.queueHex !== "string" || descriptor.queueHex.length > 4 * 1024 * 1024 || descriptor.queueHex.length % 2 !== 0 || !/^[0-9a-f]*$/.test(descriptor.queueHex) || !isSafeCount(descriptor.capacity, 4096) : descriptor.queueHex !== undefined || descriptor.eof !== undefined || descriptor.capacity !== undefined) ||
+			(descriptor.type === "socket" ? !descriptor.socket || ![1, 2, 5].includes(descriptor.socket.type ?? 1) || ![descriptor.socket.shutdown, descriptor.socket.peerShutdown].every(value => isSafeCount(value, 0, 3)) || ![descriptor.socket.peerInode, descriptor.socket.peerQueued, descriptor.socket.allocated].every(value => isSafeCount(value)) : descriptor.socket !== undefined) ||
+			!isOFDPosition(descriptor.offset) || ![descriptor.fd, descriptor.alias, descriptor.flags].every(value => isSafeCount(value)) ||
 			descriptor.fd <= previous || descriptor.fd > 0x7fffffff || descriptor.alias > descriptor.fd || descriptor.flags > 0x7fffffff ||
 			typeof descriptor.owned !== "boolean" || ![descriptor.device, descriptor.inode].every(value =>
 				typeof value === "string" && /^(0|[1-9][0-9]{0,19})$/.test(value) && BigInt(value) <= 0xffffffffffffffffn)) return false;

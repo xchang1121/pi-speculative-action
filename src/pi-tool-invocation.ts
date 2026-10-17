@@ -1,3 +1,4 @@
+import { isSafeCount } from "./number-utils.ts";
 import { createReadToolDefinition, createBashToolDefinition, createEditToolDefinition,
 	createWriteToolDefinition, createGrepToolDefinition, createFindToolDefinition, createLsToolDefinition,
 	getAgentDir, getShellConfig, VERSION, type ExtensionContext, type ToolsOptions } from "@earendil-works/pi-coding-agent";
@@ -340,7 +341,7 @@ export async function readClosedSearchInput(source: ToolFilesystemOperations, ro
 	if (operation === "readdir") return directory ? source.readdir(physical) : fail("ENOTDIR");
 	if (directory) return fail("EISDIR");
 	// A special inode's size does not bound the bytes readable from it.
-	assert.ok((stat.type === undefined || stat.type === "file") && Number.isSafeInteger(stat.size) && stat.size! >= 0, "file size is not proven by retained content");
+	assert.ok((stat.type === undefined || stat.type === "file") && isSafeCount(stat.size), "file size is not proven by retained content");
 	assert.ok(stat.size! <= maxBytes, "input byte budget");
 	return source.readFile(physical);
 }

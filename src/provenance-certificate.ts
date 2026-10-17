@@ -1,5 +1,6 @@
-import { nonNegativeCount as finiteTimestamp } from "./number-utils.ts";
+import { isSafeCount, nonNegativeCount as finiteTimestamp } from "./number-utils.ts";
 import { hash, webcrypto } from "node:crypto";
+import type { BigIntStats, Stats } from "node:fs";
 import { cloneSharedData, stableEqual, stableStringify } from "./stable-json.ts";
 import type { WorkspaceFileMutation } from "./workspace-state.ts";
 import { normalizeTimelineComputation, type SerializedTimelineComputation } from "./task-timing.ts";
@@ -7,31 +8,16 @@ import { normalizeTimelineComputation, type SerializedTimelineComputation } from
 /** Decimal strings preserve filesystem cookies beyond JavaScript's exact integer range. */
 export type OFDPosition = number | string;
 export function isOFDPosition(value: unknown): value is OFDPosition {
-	return typeof value === "number" ? Number.isSafeInteger(value) && value >= 0 :
+	return typeof value === "number" ? isSafeCount(value) :
 		typeof value === "string" && /^[1-9][0-9]{15,18}$/.test(value) && BigInt(value) > BigInt(Number.MAX_SAFE_INTEGER) && BigInt(value) <= 0x7fffffffffffffffn;
 }
 export type Sha256Digest = `sha256:${string}`;
 
-export interface FilesystemTypeEvidence {
-	readonly isFile: () => boolean;
-	readonly isDirectory: () => boolean;
-	readonly isSymbolicLink: () => boolean;
-	readonly isSocket: () => boolean;
-	readonly isFIFO: () => boolean;
-	readonly isCharacterDevice: () => boolean;
-	readonly isBlockDevice: () => boolean;
-}
+export interface FilesystemTypeEvidence extends Readonly<Pick<Stats,
+	"isFile" | "isDirectory" | "isSymbolicLink" | "isSocket" | "isFIFO" | "isCharacterDevice" | "isBlockDevice">> {}
 
-export interface FilesystemMetadataEvidence {
-	readonly mode: number | bigint;
-	readonly uid: number | bigint;
-	readonly gid: number | bigint;
-	readonly size: number | bigint;
-	readonly nlink: number | bigint;
-	readonly isFile: () => boolean;
-	readonly isDirectory: () => boolean;
-	readonly isSymbolicLink: () => boolean;
-}
+export interface FilesystemMetadataEvidence extends Readonly<Pick<Stats | BigIntStats,
+	"mode" | "uid" | "gid" | "size" | "nlink" | "isFile" | "isDirectory" | "isSymbolicLink">> {}
 
 /** Reading a file moves its access time under relatime, so an observation never proves one (RU3). */
 export const FILESYSTEM_OBSERVATION_FIELDS = ["dev", "ino", "mode", "nlink", "uid", "gid", "rdev", "size", "blksize", "blocks", "mtimeNs", "ctimeNs"] as const;
@@ -423,7 +409,7 @@ function normalizePrototype(input: ExecPrototype): ExecPrototype {
 	if (!validLogicalPath(executablePath) || !validLogicalPath(logicalCwd) || typeof platformFingerprint !== "string" || !platformFingerprint) {
 		throw new Error("process prototype identity is incomplete");
 	}
-	if (!Number.isSafeInteger(umask) || umask < 0 || umask > 0o777) throw new Error("process prototype umask is invalid");
+	if (!isSafeCount(umask, 0, 0o777)) throw new Error("process prototype umask is invalid");
 	for (const digest of [executableDigest, argvDigest, processContextDigest]) {
 		if (!isSha256Digest(digest)) throw new Error("process prototype contains an invalid digest");
 	}
@@ -444,7 +430,7 @@ function normalizePrototype(input: ExecPrototype): ExecPrototype {
 	const inheritedFDs = [...rawDescriptors]
 		.map((source) => {
 			const fd = cloneSharedData({ ...source });
-			if (!Number.isSafeInteger(fd.fd) || fd.fd < 0 || descriptors.has(fd.fd) || !isSha256Digest(fd.flagsDigest)) {
+			if (!isSafeCount(fd.fd) || descriptors.has(fd.fd) || !isSha256Digest(fd.flagsDigest)) {
 				throw new Error("process prototype descriptor table is invalid");
 			}
 			if (fd.installed !== undefined && (fd.installed !== false || fd.fd < 3 || fd.alias !== fd.fd)) throw new Error("invalid queued OFD projection");
@@ -553,7 +539,7 @@ function validateDependency(dependency: DynamicDependency): void {
 function validDependencyFields(dependency: DynamicDependency): boolean {
 	switch (dependency.kind) {
 		case "fd":
-			return Number.isSafeInteger(dependency.fd) && dependency.fd >= 0 && isSha256Digest(dependency.contentDigest);
+			return isSafeCount(dependency.fd) && isSha256Digest(dependency.contentDigest);
 		case "file":
 			return ["input", "executable", "shared_object"].includes(dependency.role) && isSha256Digest(dependency.contentDigest) &&
 				optionalDigest(dependency.metadataDigest) && (dependency.aliases === undefined || validAliases(dependency.aliases, dependency.path));
@@ -591,7 +577,7 @@ function normalizeResult(result: ProcessResultRecord, prototype: ExecPrototype):
 	const computation = normalizeTimelineComputation(result.computation);
 	if (result.replayProfile !== "buffered_noninteractive") throw new Error("unsupported replay profile");
 	if (result.continuation && (result.exit !== undefined || !isSha256Digest(result.continuation.imageDigest) ||
-		!Number.isSafeInteger(result.continuation.imageBytes) || result.continuation.imageBytes <= 0 || result.continuation.imageBytes > 65 * 1024 * 1024))
+		!isSafeCount(result.continuation.imageBytes, 1, 65 * 1024 * 1024)))
 		throw new Error("invalid process continuation");
 	if (!result.continuation && !result.exit) throw new Error("process has neither exit nor continuation");
 	if (result.observedProcessMs !== undefined && (!Number.isFinite(result.observedProcessMs) || result.observedProcessMs < 0)) {
@@ -610,13 +596,13 @@ function normalizeResult(result: ProcessResultRecord, prototype: ExecPrototype):
 			const descriptor = descriptions[index]!;
 			if (effect.id !== descriptor.fd || (descriptor.type === "regular" || descriptor.type === "directory"
 				? !effect.position || effect.position.before !== descriptor.offset || !isOFDPosition(effect.position.after)
-				: effect.position !== undefined) || effect.flags !== undefined && (!Number.isSafeInteger(effect.flags) || effect.flags < 0 || effect.flags > 0x7fffffff))
+				: effect.position !== undefined) || effect.flags !== undefined && (!isSafeCount(effect.flags, 0, 0x7fffffff)))
 				throw new Error("invalid inherited OFD state transition");
 		});
 		resources.objects.forEach((effect, index) => {
 			const descriptor = objects[index]!;
 			if (effect.id !== descriptor.fd || (descriptor.type === "pipe" || descriptor.type === "socket"
-				? !Number.isSafeInteger(effect.consumed) || effect.consumed! < 0 : effect.consumed !== undefined) ||
+				? !isSafeCount(effect.consumed) : effect.consumed !== undefined) ||
 				effect.content !== undefined && descriptor.type !== "regular") throw new Error("invalid inherited OFD object transition");
 			if (effect.content) validateArtifact(effect.content, artifactSizes);
 		});
@@ -624,7 +610,7 @@ function normalizeResult(result: ProcessResultRecord, prototype: ExecPrototype):
 		for (const event of resources.transitions ?? []) {
 			const descriptor = descriptions.find(descriptor => descriptor.fd === event.id);
 			if (!descriptor || !(descriptor.type === "regular" ? event.kind === "lock" || event.kind === "release" : ["pipe", "socket", "eventfd"].includes(descriptor.type) && event.kind !== "lock") || !RESOURCE_TRANSITIONS.includes(event.kind) ||
-				event.requested !== undefined && (!Number.isSafeInteger(event.requested) || event.requested < 0 || event.requested > 2 * 1024 * 1024 || event.kind === "produce" && event.requested < event.data.size) ||
+				event.requested !== undefined && (!isSafeCount(event.requested, 0, 2 * 1024 * 1024) || event.kind === "produce" && event.requested < event.data.size) ||
 				event.data.size > (event.kind === "produce" ? 4096 : 2 * 1024 * 1024) ||
 				(event.kind === "shutdown" || event.kind === "release") && (event.data.size !== 1 || event.kind === "shutdown" && descriptor.type !== "socket") ||
 				event.kind.endsWith("_message") && (descriptor.type !== "socket" || event.data.size < 4) ||
@@ -636,7 +622,7 @@ function normalizeResult(result: ProcessResultRecord, prototype: ExecPrototype):
 	}
 	for (let index = 0; index < journal.length; index++) {
 		const event = journal[index]!;
-		if (!Number.isSafeInteger(event.sequence) || event.sequence < 0) throw new Error("invalid effect sequence");
+		if (!isSafeCount(event.sequence)) throw new Error("invalid effect sequence");
 		if (index > 0 && event.sequence === journal[index - 1]!.sequence) throw new Error("duplicate effect sequence");
 		if (event.kind === "output") validateArtifact(event.data, artifactSizes);
 		else {
@@ -666,11 +652,11 @@ function normalizeResult(result: ProcessResultRecord, prototype: ExecPrototype):
 
 function normalizeWorkspaceEffectState(state: WorkspaceEffectState, artifactSizes: Map<Sha256Digest, number>): WorkspaceEffectState {
 	if (state.kind === "absent") return { kind: "absent" };
-	if (!Number.isSafeInteger(state.mode) || state.mode < 0 || state.mode > 0o777) throw new Error("invalid workspace effect mode");
+	if (!isSafeCount(state.mode, 0, 0o777)) throw new Error("invalid workspace effect mode");
 	if (state.kind === "file" && state.modified !== undefined && !/^(?:0|[1-9]\d{0,19})$/.test(state.modified)) throw new Error("invalid workspace effect time");
 	if (state.kind === "file") { validateArtifact(state.data, artifactSizes); return { ...state, data: { ...state.data } }; }
 	if (
-		!isSha256Digest(state.entriesDigest) || !Number.isSafeInteger(state.uid) || state.uid < 0 || !Number.isSafeInteger(state.gid) || state.gid < 0
+		!isSha256Digest(state.entriesDigest) || !isSafeCount(state.uid) || !isSafeCount(state.gid)
 	) {
 		throw new Error("invalid directory effect state");
 	}
@@ -678,7 +664,7 @@ function normalizeWorkspaceEffectState(state: WorkspaceEffectState, artifactSize
 }
 
 export function validateArtifact(reference: ArtifactReference, sizes?: Map<Sha256Digest, number>): void {
-	if (!reference || !isSha256Digest(reference.digest) || !Number.isSafeInteger(reference.size) || reference.size < 0) throw new Error("invalid effect artifact");
+	if (!reference || !isSha256Digest(reference.digest) || !isSafeCount(reference.size)) throw new Error("invalid effect artifact");
 	const previousSize = sizes?.get(reference.digest);
 	if (previousSize !== undefined && previousSize !== reference.size) throw new Error("conflicting effect artifact sizes");
 	sizes?.set(reference.digest, reference.size);
