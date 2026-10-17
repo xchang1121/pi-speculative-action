@@ -3,10 +3,34 @@ import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import { temporaryDirectories } from "./filesystem.ts";
 import { PpmCountTrie } from "../src/ppm-count-trie.ts";
+import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
+import { createPatternPlanSource } from "../src/pattern-plan-source.ts";
+import { testModel } from "./model.ts";
 import { applyBindingsVariants, inferBindings, PatternAwareStore, PATTERN_AWARE_DEFAULTS, type PatternAwareBinding, type PatternAwareEvent } from "../src/pattern-aware.ts";
 
 const directories = temporaryDirectories("pi-pattern-system-");
 afterEach(directories.dispose);
+
+test("scopes reserved observation revisions to each PatternAware turn", async () => {
+	const settings = { enabled: true, resourceCacheMaxEntries: 1, predictionTimeoutMs: 1000, sourceConfig: { patternAware: { presets: [] } } };
+	const turn = { sessionID: "revisions", turnID: "same" };
+	const startInput = { ...turn, tools: [], actorModel: testModel("actor"), actorOptions: undefined, context: { messages: [] } };
+	const controller = createPatternPlanSource({ sessionID: turn.sessionID, cwd: process.cwd(), actionSemantics: PI_ACTION_SEMANTICS,
+		projectionRules: [], store: new PatternAwareStore({ ...PATTERN_AWARE_DEFAULTS, presets: [] }) });
+	try {
+		for (let round = 0; round < 2; round++) {
+			controller.turnStarted(startInput, settings);
+			for (const [extra, revision] of [[0, 0], [5, 6], [0, 7]]) {
+				const update = await controller.source.observe!({ startInput, settings, data: { tools: new Map(), schemaHashes: {} },
+					consumeInput: { ...turn, id: "call", tool: "inspect", args: {}, tools: [] }, tool: "inspect", concrete: {}, durationMs: 1, order: 0,
+					reserveRevision: (_id, minimum) => minimum + extra! });
+				expect(update).toMatchObject({ revision });
+			}
+			controller.turnFinished(startInput, settings, false);
+			await controller.source.flush?.();
+		}
+	} finally { await controller.dispose(); }
+});
 
 test.each(["from", "to"])("rejects workspace paths hidden in a portable rebase's %s", async field => {
 	const file = path.join(await directories.create(), "portable.json");

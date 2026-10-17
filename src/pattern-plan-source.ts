@@ -19,6 +19,7 @@ import type { ToolSettlement } from "./tool-settlement.ts";
 
 type PatternPlanFeedback = PatternAwareRuntimeContext & Pick<PatternAwareCandidate, "supportingPatternIDs">;
 type CarriedPrediction = { readonly signature: string; readonly pending: Set<PatternPlanFeedback>; abandoned: boolean };
+type PatternTurn = { readonly events: Map<number, PatternAwareEventInput>; revision: number; observationRevision: number };
 type FailedCommand = { readonly id: string; readonly tool: string; readonly input: Readonly<Record<string, unknown>>; readonly schemaHash?: string;
 	readonly paths: readonly string[]; requested: boolean };
 
@@ -49,13 +50,10 @@ export function createPatternPlanSource({
 	let openedStore: { readonly key: string; readonly lease: Promise<PatternAwareStoreLease> } | undefined;
 	const ownedStores = new Map<string, Promise<PatternAwareStoreLease>>();
 	const lifecycle = new RuntimeLifecycleLane();
-	const authoritativeBatches = new Map<string, Map<number, PatternAwareEventInput>>();
-	const revisions = new Map<string, number>();
+	const turns = new Map<string, PatternTurn>();
 	const carriedPredictions = new Map<string, CarriedPrediction>();
-	const feedbacks = new WeakMap<object, PatternPlanFeedback>();
-	const predictionBatches = new WeakMap<PatternPlanFeedback, CarriedPrediction>();
+	const feedbacks = new WeakMap<object, { readonly context?: PatternPlanFeedback; carried?: CarriedPrediction; readonly retry?: FailedCommand }>();
 	const failedCommands = new BoundedRecencyMap<string, FailedCommand>(4);
-	const retryFeedback = new WeakMap<object, FailedCommand>();
 	let analysisTail: Promise<void> = Promise.resolve();
 	const sourceSettings = (settings: SpeculativeActionSettings): PatternAwareSettings => {
 		const pattern = patternAwareSettings(settings.sourceConfig?.patternAware);
@@ -66,11 +64,11 @@ export function createPatternPlanSource({
 		try { const pattern = sourceSettings(settings); return lifecycle.admit(() => operation(pattern)); }
 		catch (error) { return Promise.reject(error); }
 	};
-	const nextRevision = (sessionID: string, turnID: string): number => {
+	const turnState = (sessionID: string, turnID: string): PatternTurn => {
 		const key = agentBatchKey(sessionID, turnID);
-		const revision = (revisions.get(key) ?? -1) + 1;
-		revisions.set(key, revision);
-		return revision;
+		let turn = turns.get(key);
+		if (!turn) turns.set(key, turn = { events: new Map(), revision: -1, observationRevision: -1 });
+		return turn;
 	};
 	const resolveStore = async (patternSettings: PatternAwareSettings): Promise<PatternAwareStore> => {
 		if (providedStore) return providedStore;
@@ -127,12 +125,12 @@ export function createPatternPlanSource({
 	const planActions = (candidates: readonly PatternAwareCandidate[], store: PatternAwareStore,
 		dependsOn?: PlanAction["dependsOn"], parentID?: string) => candidates.map(candidate => {
 			const action = patternPlanAction(candidate, store, patternPlanActionID(candidate.actionIdentity, parentID), dependsOn);
-			feedbacks.set(action.feedback, action.feedback); return action;
+			feedbacks.set(action.feedback, { context: action.feedback }); return action;
 		});
 	const retries = (schemas: Readonly<Record<string, string>>): PlanAction[] => [...failedCommands.values()].flatMap(command => {
 		if (!command.requested || command.schemaHash !== schemas[command.tool]) return [];
 		const feedback = {};
-		retryFeedback.set(feedback, command);
+		feedbacks.set(feedback, { retry: command });
 		return [{ id: `retry:${command.id}`, type: "tool_call", tool: command.tool, input: command.input, horizon: 0,
 			mode: "retry-failed-command", empiricalProbability: 0.25, conditionalProbability: 0.25, feedback }];
 	});
@@ -144,6 +142,7 @@ export function createPatternPlanSource({
 		requestLifetime: "actor_decision",
 		propose: ({ startInput, data, settings, signal }) => admit(settings, async (patternSettings) => {
 			if (!patternSettings.enabled) return undefined;
+			const turn = turnState(startInput.sessionID, startInput.turnID);
 			const store = await predictionStore(patternSettings, signal);
 			if (!store) return undefined;
 			const candidates = store.predict(startInput.sessionID, data.schemaHashes, patternSettings);
@@ -152,7 +151,7 @@ export function createPatternPlanSource({
 			carriedPredictions.delete(startInput.sessionID);
 			const repeated = !candidates.length || carried?.signature === patternPredictionSignature(candidates) && !carried.pending.size && !carried.abandoned;
 			if (repeated && !retry.length) return undefined;
-			return { id: `pattern:${startInput.turnID}`, source: "pattern_aware", revision: nextRevision(startInput.sessionID, startInput.turnID),
+			return { id: `pattern:${startInput.turnID}`, source: "pattern_aware", revision: ++turn.revision,
 				actions: [...repeated ? [] : planActions(candidates, store), ...retry] };
 		}),
 		continueFrom: ({ startInput, data, settings, batch, signal }) => admit(settings, async (patternSettings) => {
@@ -171,7 +170,7 @@ export function createPatternPlanSource({
 		}),
 		continue: ({ startInput, data, settings, candidate, adoptedAction, proposalID, actionID, revision, feedback, output, trigger, signal }) => admit(settings, async (patternSettings) => {
 			if (signal.aborted || output === undefined) return undefined;
-			const context = feedbacks.get(feedback as object);
+			const context = feedbacks.get(feedback as object)?.context;
 			if (!context) return undefined;
 			const next = context.store.continue(context.continuation, predictedEvent(startInput, adoptedAction ?? candidate, output, candidateExecutionMs(candidate)),
 				data.schemaHashes, trigger === "actor_adopted", patternSettings);
@@ -196,13 +195,11 @@ export function createPatternPlanSource({
 				const edited = action && actionSemantics.effect(action) === "workspace_mutation" && typeof concrete.path === "string" && output && !output.isError ? resourcePath(concrete.path) : undefined;
 				if (edited) for (const command of failedCommands.values()) if (command.paths.includes(edited)) command.requested = true;
 			}
-			const key = agentBatchKey(consumeInput.sessionID, consumeInput.turnID);
-			const batch = authoritativeBatches.get(key) ?? new Map();
+			const turn = turnState(consumeInput.sessionID, consumeInput.turnID), batch = turn.events;
 			batch.set(order, { sessionID: consumeInput.sessionID, turnID: consumeInput.turnID, ...observed,
 				...(schemaHash === undefined ? {} : { schemaHash }),
 				learnTarget: data.tools.has(tool),
 			});
-			authoritativeBatches.set(key, batch);
 			let actions = retries(data.schemaHashes);
 			if (!patternSettings.multiStepEnabled && !actions.length || signal?.aborted) return undefined;
 			if (patternSettings.multiStepEnabled) {
@@ -213,33 +210,31 @@ export function createPatternPlanSource({
 				const predicted = planActions(candidates, store);
 				// An observation can finish after its turn closes, or lose individual actions during admission.
 				const carried = { signature: patternPredictionSignature(candidates), pending: new Set(predicted.map((action) => action.feedback)), abandoned: false };
-				for (const action of predicted) predictionBatches.set(action.feedback, carried);
+				for (const action of predicted) feedbacks.get(action.feedback)!.carried = carried;
 				carriedPredictions.set(consumeInput.sessionID, carried);
 				actions = [...predicted, ...actions];
 			}
 			// Its own namespace never supersedes the turn's still-pending predictions; the runtime's revision covers continuations.
-			const id = `pattern:${consumeInput.turnID}:after`, minimum = nextRevision(consumeInput.sessionID, id);
+			const id = `pattern:${consumeInput.turnID}:after`, minimum = ++turn.observationRevision;
 			const revision = reserveRevision?.(id, minimum) ?? minimum;
-			revisions.set(agentBatchKey(consumeInput.sessionID, id), revision);
+			turn.observationRevision = revision;
 			return { id, source: "pattern_aware", revision, actions, retainDescendants: true };
 		}),
 		onAdmitted: ({ feedback }) => {
 			if (lifecycle.sealed) return;
-			const retry = retryFeedback.get(feedback as object);
-			if (retry) retry.requested = false;
-			const context = feedbacks.get(feedback as object);
-			if (context) predictionBatches.get(context)?.pending.delete(context);
+			const state = feedbacks.get(feedback as object);
+			if (state?.retry) state.retry.requested = false;
+			if (state?.context) state.carried?.pending.delete(state.context);
 		},
 		onIssued: ({ feedback }) => {
 			if (lifecycle.sealed) return;
-			const context = feedbacks.get(feedback as object);
+			const context = feedbacks.get(feedback as object)?.context;
 			if (!context) return;
 			for (const support of [context.continuation, ...context.supportingPatternIDs]) context.store.issued(support);
 		},
 		onSettled: ({ feedback, settlement, served }) => {
 			if (lifecycle.sealed) return;
-			const context = feedbacks.get(feedback as object);
-			const carried = context && predictionBatches.get(context);
+			const { context, carried } = feedbacks.get(feedback as object) ?? {};
 			if (carried && settlement.observation === "unobserved") carried.abandoned = true;
 			if (context) for (const support of [context.continuation, ...context.supportingPatternIDs]) context.store.settled(support, settlement, served);
 		},
@@ -249,9 +244,8 @@ export function createPatternPlanSource({
 	const observeTurn = (startInput: AgentStartInput, settings: SpeculativeActionSettings, terminal?: boolean): void => {
 		if (lifecycle.sealed) return;
 		const key = agentBatchKey(startInput.sessionID, startInput.turnID);
-		const batch = authoritativeBatches.get(key);
-		authoritativeBatches.delete(key);
-		revisions.delete(key);
+		const batch = turns.get(key)?.events;
+		turns.delete(key);
 		if (terminal) carriedPredictions.delete(startInput.sessionID);
 		const patternSettings = sourceSettings(settings);
 		if (!settings.enabled || !patternSettings.enabled || lifecycle.sealed) { carriedPredictions.delete(startInput.sessionID); return; }
@@ -270,8 +264,11 @@ export function createPatternPlanSource({
 	};
 	const clearSession = async () => {
 		await lifecycle.drain();
-		for (const entries of [revisions, carriedPredictions, failedCommands]) entries.clear();
-		for (const [key, batch] of authoritativeBatches) if (batch.values().next().value?.sessionID === sessionID) authoritativeBatches.delete(key);
+		for (const entries of [carriedPredictions, failedCommands]) entries.clear();
+		for (const [key, turn] of turns) {
+			turn.revision = turn.observationRevision = -1;
+			if (!turn.events.size || turn.events.values().next().value?.sessionID === sessionID) turns.delete(key);
+		}
 	};
 	return {
 		source,
@@ -289,7 +286,7 @@ export function createPatternPlanSource({
 			const leases = [...ownedStores.values()];
 			ownedStores.clear();
 			openedStore = undefined;
-			authoritativeBatches.clear();
+			turns.clear();
 			await Promise.allSettled(leases.map(async lease => (await lease).release()));
 		}),
 	};
