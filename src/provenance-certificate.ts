@@ -1,7 +1,7 @@
 import { isSafeCount, nonNegativeCount as finiteTimestamp } from "./number-utils.ts";
 import { hash, webcrypto } from "node:crypto";
 import type { BigIntStats, Stats } from "node:fs";
-import { cloneSharedData, stableEqual, stableStringify } from "./stable-json.ts";
+import { cloneSharedData, isRecord, stableEqual, stableStringify } from "./stable-json.ts";
 import type { WorkspaceFileMutation } from "./workspace-state.ts";
 import { normalizeTimelineComputation, type SerializedTimelineComputation } from "./task-timing.ts";
 
@@ -285,7 +285,7 @@ export function sealProcessCertificate(input: {
 }
 
 export function parseProcessCertificate(value: unknown): ProcessProvenanceCertificate | undefined {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	if (!isRecord(value)) return undefined;
 	const candidate = value as Partial<ProcessProvenanceCertificate>;
 	if (!isSha256Digest(candidate.id) || !candidate.prototype || !candidate.producer || !candidate.dependencyCertificate || !candidate.result) return undefined;
 	try {

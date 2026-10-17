@@ -8,6 +8,7 @@ import type { ProcessExecutionBinding } from "./process-handoff.ts";
 import type { ExecutionOperationBinding } from "./execution-world.ts";
 import { toolErrorSettlement, type ToolInvocation } from "./tool-settlement.ts";
 import { WorkspaceSandboxService, type WorkspaceSandboxOptions } from "./workspace-sandbox.ts";
+import { isRecord } from "./stable-json.ts";
 
 export interface LinuxProcessExecutionWorldOptions extends LinuxProcessBackendOptions, WorkspaceSandboxOptions {
 	readonly coordinator: ProcessExecutionCoordinator;
@@ -160,8 +161,8 @@ export function createLinuxProcessExecutionWorld(
 }
 
 function processInvocation(value: unknown): ToolInvocation["process"] | undefined {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-	const processValue = (value as ToolInvocation).process;
+	if (!isRecord(value)) return undefined;
+	const processValue = value.process as ToolInvocation["process"];
 	if (
 		!processValue || typeof processValue.command !== "string" || typeof processValue.cwd !== "string" || typeof processValue.shell !== "string" ||
 		!Array.isArray(processValue.shellArgs) ||

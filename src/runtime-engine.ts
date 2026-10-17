@@ -16,7 +16,7 @@ import type { PlanUpdate } from "./plan-proposal.ts";
 import { PlanRuntime, type PlanRuntimeNode, type PredictionOpportunity, type ClaimedPrediction } from "./plan-runtime.ts";
 import { BoundedEventQueue, PostSettlementQueue } from "./post-settlement.ts";
 import { PendingTasks, RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
-import { cloneSharedData } from "./stable-json.ts";
+import { asRecord, cloneSharedData } from "./stable-json.ts";
 import { containsLogicalPath } from "./path-utils.ts";
 import type {
 	AdoptedAction,
@@ -105,8 +105,7 @@ function planActionDraft(node: PlanRuntimeNode): SpeculativeDraftCandidate {
 }
 
 function asConcreteInput(value: unknown): Record<string, unknown> | undefined {
-	if (value === undefined || value === null) return {};
-	return typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+	return value === undefined || value === null ? {} : asRecord(value);
 }
 
 function publicCandidate<Output>(candidate: CandidateRecord<Output>): SpeculativeCandidate {

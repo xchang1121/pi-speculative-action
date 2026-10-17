@@ -13,7 +13,7 @@ import os from "node:os";
 import path from "node:path";
 import { finished } from "node:stream/promises";
 import { errorMessage, isMissing as missing } from "./error-utils.ts";
-import { stableEqual } from "./stable-json.ts";
+import { isRecord, stableEqual } from "./stable-json.ts";
 import { TimelineInterval, type TimelineDependency } from "./task-timing.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
 import { ResourceObjectInputs } from "./agent-execution-world.ts";
@@ -2547,7 +2547,7 @@ function streamSettlement(inputs: ReturnType<typeof descriptorInputs>, events: r
 function parseDispatcherRequest(body: string): Pick<DispatcherRequest, "token" | "pid" | "descriptors"> | undefined {
 	try {
 		const value: unknown = JSON.parse(body.trim());
-		if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+		if (!isRecord(value)) return undefined;
 		const request = value as Partial<DispatcherRequest>;
 		return typeof request.token === "string" && isSafeCount(request.pid, 1) &&
 			(request.descriptors === undefined || Array.isArray(request.descriptors) && request.descriptors.length <= 64 && request.descriptors.every(entry => entry &&
