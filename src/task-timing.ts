@@ -192,25 +192,20 @@ export class TimelineInterval {
 			for (let index = inputs.length - 1; index >= 0; index--) pending.push(inputs[index]!.computation);
 		}
 		const reachable = new Set<string>(), remaining = [computationIdentity(computation)];
+		const nodes: unknown[] = [];
 		while (remaining.length) {
 			const id = remaining.pop()!;
 			if (reachable.has(id)) continue;
 			reachable.add(id);
-			for (const input of evidence(selected.get(id)!.computation).inputs ?? []) remaining.push(computationIdentity(input.computation));
-		}
-		const nodes: SerializedTimelineNode[] = [];
-		for (const [id, { computation: current, groups, producer }] of selected) {
-			if (!reachable.has(id)) continue;
+			const { computation: current, groups, producer } = selected.get(id)!;
 			const { priorMs, spans, incomplete, inputs } = evidence(current);
+			for (const input of inputs ?? []) remaining.push(computationIdentity(input.computation));
 			nodes.push({ id, clock: computationClock(current), startedAt: current.startedAt, completedAt: current.completedAt,
-				...(computationTimeOrigin(current) !== undefined ? { timeOrigin: computationTimeOrigin(current) } : {}),
-				...(spans ? { spans: spans.map(({ startedAt, completedAt }) => ({ startedAt, completedAt })) } : {}),
-				...(priorMs ? { priorMs } : {}), ...(producer ? { producer } : {}), ...(groups.size ? { groups: [...groups] } : {}),
-				...(incomplete ? { incomplete } : {}),
+				timeOrigin: computationTimeOrigin(current), spans, priorMs: priorMs || undefined, producer: producer ?? undefined,
+				groups: [...groups], incomplete,
 				inputs: (inputs ?? []).map(input => ({ id: computationIdentity(input.computation),
-					...(input.owned && computationIdentity(evidence(input.computation).owner ?? current) === id ? { owned: true as const } : {}),
-					...(input.reused ? { reused: true as const } : {}),
-					...(input.overhead ? { overhead: true as const } : {}), ...(input.computeUncertain ? { computeUncertain: true as const } : {}),
+					owned: !!input.owned && computationIdentity(evidence(input.computation).owner ?? current) === id,
+					reused: !!input.reused, overhead: !!input.overhead, computeUncertain: !!input.computeUncertain,
 					shared: (input.shared ?? []).map(part => ({ clock: computationClock(part), startedAt: part.startedAt, completedAt: part.completedAt })),
 				})),
 			});
