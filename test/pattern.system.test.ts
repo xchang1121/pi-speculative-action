@@ -11,6 +11,27 @@ import { applyBindingsVariants, inferBindings, PatternAwareStore, PATTERN_AWARE_
 const directories = temporaryDirectories("pi-pattern-system-");
 afterEach(directories.dispose);
 
+test.each([1, 2])("preserves constant prediction support when another session chose %s", async mode => {
+	const file = path.join(await directories.create(), "support.json");
+	const settings = { ...PATTERN_AWARE_DEFAULTS, presets: [], maxContextLength: 1, maxFutureGap: 0 };
+	let store = new PatternAwareStore(settings, file);
+	await store.load();
+	const event = (sessionID: string, turnID: string, tool = "inspect", input = {}) =>
+		({ sessionID, turnID, tool, input, outcome: "success" as const, durationMs: 1 });
+	for (const [session, choice, count] of [["first", 1, 4], ["second", mode, 1]] as const) for (let index = 0; index < count; index++) {
+		store.observe(event(session, String(index)));
+		store.observe(event(session, String(index), "choose", { mode: choice }));
+		store.finishSession(session);
+	}
+	const assertSupport = () => {
+		for (const session of ["first", "unseen"]) expect(store.predictAfterBatch(session, [event(session, "new")]).map(candidate => candidate.input))
+			.toEqual(session === "first" || mode === 1 ? [{ mode: 1 }] : []);
+	};
+	assertSupport(); await store.flush();
+	store = new PatternAwareStore(settings, file);
+	await store.load(); assertSupport();
+});
+
 test("scopes reserved observation revisions to each PatternAware turn", async () => {
 	const settings = { enabled: true, resourceCacheMaxEntries: 1, predictionTimeoutMs: 1000, sourceConfig: { patternAware: { presets: [] } } };
 	const turn = { sessionID: "revisions", turnID: "same" };

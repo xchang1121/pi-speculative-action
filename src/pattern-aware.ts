@@ -318,8 +318,9 @@ export class PatternAwareStore {
 			this.pools.set(pool.key, pool);
 			this.addControlOpportunities(pool, pool.samples, 1);
 			for (const patternID of pool.patternIDs ?? []) {
-				if (this.patterns.get(patternID)?.dependencies.length === 0) {
-					this.patternSupportSessions.set(patternID, new Set(pool.samples.map((sample) => sample.target.sessionID)));
+				const pattern = this.patterns.get(patternID);
+				if (pattern?.dependencies.length === 0) {
+					this.patternSupportSessions.set(patternID, new Set(this.supportingSamples(pattern.bindings, pool).map((sample) => sample.target.sessionID)));
 				}
 			}
 			for (const sample of pool.samples) {
@@ -822,36 +823,34 @@ export class PatternAwareStore {
 		}
 	}
 
-	private bindingsCoverSample(
+	private supportingSamples(
 		bindings: Readonly<Record<string, PatternAwareBinding>>,
-		targetTool: string,
-		targetSchemaHash: string | undefined,
-		sample: PatternSample,
+		{ targetTool, targetSchemaHash, samples }: PatternPool,
 	) {
-		if (targetTool !== sample.target.tool) return false;
-		let actor = this.observedActionKeys.get(sample.target);
-		if (actor === undefined && !this.observedActionKeys.has(sample.target)) {
-			actor = this.resolveActionKey(sample.target.tool, sample.target.input, sample.target.schemaHash ?? targetSchemaHash) ?? null;
-			this.observedActionKeys.set(sample.target, actor);
-		}
-		return this.bindingAnalysis.applyWeightedBindings(bindings, sample.context).some(({ input }) => {
-			const speculative = this.resolveActionKey(targetTool, input, targetSchemaHash);
-			if (!speculative || !actor) return sameValue(input, sample.target.input);
-			return actionKeyCovers(speculative, actor, this.actionSemantics?.projectors ?? []);
+		return samples.filter(sample => {
+			if (targetTool !== sample.target.tool) return false;
+			let actor = this.observedActionKeys.get(sample.target);
+			if (actor === undefined && !this.observedActionKeys.has(sample.target)) {
+				actor = this.resolveActionKey(sample.target.tool, sample.target.input, sample.target.schemaHash ?? targetSchemaHash) ?? null;
+				this.observedActionKeys.set(sample.target, actor);
+			}
+			return this.bindingAnalysis.applyWeightedBindings(bindings, sample.context).some(({ input }) => {
+				const speculative = this.resolveActionKey(targetTool, input, targetSchemaHash);
+				if (!speculative || !actor) return sameValue(input, sample.target.input);
+				return actionKeyCovers(speculative, actor, this.actionSemantics?.projectors ?? []);
+			});
 		});
 	}
 
 	private minimizeProjectedBindings(bindings: Readonly<Record<string, PatternAwareBinding>>, pool: PatternPool) {
-		const supportingSamples = (candidate: Readonly<Record<string, PatternAwareBinding>>) =>
-			pool.samples.filter((sample) => this.bindingsCoverSample(candidate, pool.targetTool, pool.targetSchemaHash, sample));
-		if (!this.actionSemantics) return { bindings, support: supportingSamples(bindings) };
+		if (!this.actionSemantics) return { bindings, support: this.supportingSamples(bindings, pool) };
 		const minimized = { ...bindings };
-		let support = supportingSamples(minimized);
+		let support = this.supportingSamples(minimized, pool);
 		for (const key of Object.keys(bindings)) {
 			const binding = minimized[key];
 			if (!binding) continue;
 			delete minimized[key];
-			const next = supportingSamples(minimized);
+			const next = this.supportingSamples(minimized, pool);
 			if (next.length > support.length || (support.length > 0 && next.length === support.length)) {
 				support = next;
 				continue;
