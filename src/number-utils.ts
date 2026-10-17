@@ -23,3 +23,10 @@ export function finiteNumber(value: unknown): number | undefined {
 export function clampProbability(value: number): number {
 	return Math.max(0, Math.min(1, Number.isFinite(value) ? value : 0));
 }
+
+/** Copy and increment own data keys; arbitrary names never address inherited properties. */
+export function incrementCounts(target: Readonly<Record<string, number>>, keys: readonly string[]): Record<string, number> {
+	const counts = { ...Object.fromEntries(keys.map(key => [key, 0])), ...target };
+	for (const key of keys) counts[key]!++;
+	return counts;
+}

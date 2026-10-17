@@ -1,4 +1,5 @@
 import type { SpeculativeActionEvent } from "../src/events.ts";
+import { incrementCounts } from "../src/number-utils.ts";
 
 type TraceEvent<SessionID, Kind extends SpeculativeActionEvent<SessionID>["type"]> =
 	Omit<Extract<SpeculativeActionEvent<SessionID>, { readonly type: Kind }>, "cache" | "sessionID">;
@@ -18,10 +19,11 @@ export function benchmarkTraceReport<SessionID>(
 		? [{ event, provider: event.settlement.provider }] : []);
 	const native = actors.flatMap((event) => event.settlement.provider.kind === "actor"
 		? [{ tool: event.settlement.tool, origin: event.settlement.provider.origin }] : []);
-	const predictionsBySource: Record<string, { settled: number; observed: number; matched: number; adopted: number }> = {};
+	const predictionsBySource = new Map<string, { settled: number; observed: number; matched: number; adopted: number }>();
 	for (const { type, settlement } of predictions) {
 		if (type !== "prediction") continue;
-		const counts = (predictionsBySource[settlement.prediction.source] ??= { settled: 0, observed: 0, matched: 0, adopted: 0 });
+		const counts = predictionsBySource.get(settlement.prediction.source) ?? { settled: 0, observed: 0, matched: 0, adopted: 0 };
+		predictionsBySource.set(settlement.prediction.source, counts);
 		counts.settled++;
 		if (settlement.observation === "unobserved") continue;
 		counts.observed++;
@@ -30,7 +32,7 @@ export function benchmarkTraceReport<SessionID>(
 		if (settlement.match.adoption.status === "adopted") counts.adopted++;
 	}
 	return {
-		predictionsBySource,
+		predictionsBySource: Object.fromEntries(predictionsBySource),
 		sourceRequestKinds: countBy(requests, (event) => event.request.request.kind),
 		sourceRequestsBySource: countBy(requests, (event) => event.request.request.source),
 		candidateStartsBySource: countBy(candidates, (event) => event.candidate.source),
@@ -58,11 +60,7 @@ function traceEvents<SessionID, Kind extends SpeculativeActionEvent<SessionID>["
 }
 
 function countBy<Value>(values: readonly Value[], key: (value: Value) => string, counts: Record<string, number> = {}) {
-	for (const value of values) {
-		const name = key(value);
-		counts[name] = (counts[name] ?? 0) + 1;
-	}
-	return counts;
+	return incrementCounts(counts, values.map(key));
 }
 
 /** Wall-clock ranking for diagnosis, independent of the computation speedup denominator. */

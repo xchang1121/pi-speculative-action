@@ -1,4 +1,4 @@
-import { nonNegativeFinite as metric } from "./number-utils.ts";
+import { incrementCounts as increment, nonNegativeFinite as metric } from "./number-utils.ts";
 import type { SpeculativeActionEvent, SpeculativeCacheSnapshot } from "./events.ts";
 import { emptyWorldReuseMetrics, type WorldReuseMetrics } from "./execution-world.ts";
 import type { ResolutionCause } from "./settlement.ts";
@@ -173,12 +173,6 @@ function ratio(numerator: number, denominator: number): number {
 /** Parallel counters per key: each flag increments its own position. */
 function tally(target: Readonly<Record<string, readonly number[]>>, key: string, ...flags: boolean[]): Record<string, readonly number[]> {
 	return { ...target, [key]: flags.map((flag, index) => (target[key]?.[index] ?? 0) + Number(flag)) };
-}
-
-function increment(target: Readonly<Record<string, number>>, keys: readonly string[]): Record<string, number> {
-	const counts = { ...Object.fromEntries(keys.map(key => [key, 0])), ...target };
-	for (const key of keys) counts[key]!++;
-	return counts;
 }
 
 function addMode(target: ModesBySource, source: string, mode: string, delta: Partial<ModeTraceSummary>): ModesBySource {

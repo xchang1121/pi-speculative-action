@@ -3,6 +3,7 @@ import { TaskTimeline, TimelineInterval, toolSpeedup, normalizeTimelineComputati
 import { restoreNativeDependency, serializeNativeDependency } from "../src/linux-process-sync.ts";
 import { emptySpeculativeTraceSummary, summarizeSpeculativeTrace } from "../src/trace-summary.ts";
 import type { SpeculativeActionEvent } from "../src/events.ts";
+import { benchmarkTraceReport } from "../bench/trace-report.ts";
 
 it("counts arbitrary projector names as trace data", () => {
 	for (const projector of ["constructor", "__proto__", "toString", "rows"]) {
@@ -17,6 +18,14 @@ it("counts arbitrary projector names as trace data", () => {
 		expect(summary.partialResultReuseByProjector).toEqual({ [projector]: 2 });
 		expect(summary.actorCandidateRejections).toEqual({ [`matching:${projector}`]: 4 });
 		expect(summary.actorActionsByTool).toEqual({ [projector]: [2, 2] });
+		const prediction: SpeculativeActionEvent<string> = { ...event, type: "prediction", settlement: {
+			prediction: { id: "prediction", source: projector, proposalID: "proposal", actionID: "action" },
+			observation: "unobserved", cause: { stage: "control", code: "turn_closed" },
+		} };
+		const report = benchmarkTraceReport([event, event, prediction, prediction], { [projector]: 3 }, false);
+		expect(report.speculativeHitsByTool).toEqual({ [projector]: 2 });
+		expect(report.predictionsBySource).toEqual({ [projector]: { settled: 2, observed: 0, matched: 0, adopted: 0 } });
+		expect(report.actorFallbacksByTool).toEqual({ [projector]: 3 });
 	}
 });
 
