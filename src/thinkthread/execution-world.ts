@@ -233,7 +233,6 @@ async function forkThinkThreadWorld(
 		if (run.targetSnapshotId) {
 			target = world.pool.ownSnapshot({
 				snapshotId: run.targetSnapshotId,
-				logicalBytes: Math.max(0, run.changedBytes ?? 0),
 			});
 		}
 		context.signal.throwIfAborted();
