@@ -19,6 +19,15 @@ export class BoundedRecencyMap<Key, Value> {
 		return value;
 	}
 
+	/** Cache factory results, including undefined; factory errors propagate. */
+	getOrCreate(key: Key, create: () => Value): Value {
+		const cached = this.get(key);
+		if (cached !== undefined || this.entriesValue.has(key)) return cached as Value;
+		const value = create();
+		this.set(key, value);
+		return value;
+	}
+
 	set(key: Key, value: Value): { readonly key: Key; readonly value: Value } | undefined {
 		this.entriesValue.delete(key);
 		this.entriesValue.set(key, value);

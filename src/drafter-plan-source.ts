@@ -122,8 +122,7 @@ export function createDrafterPlanSource(input: {
 			const { matched, adopted } = predictionLearning(settlement, served);
 			if (!batch || !tool || matched === undefined && adopted === undefined) return;
 			const key = calibrationKey(batch, tool);
-			let samples = calibration.get(key);
-			if (!samples) { samples = { matches: [], adoptions: [] }; calibration.set(key, samples); }
+			const samples = calibration.getOrCreate(key, () => ({ matches: [], adoptions: [] }));
 			if (matched !== undefined) observe(samples.matches, matched);
 			if (adopted !== undefined) observe(samples.adoptions, adopted);
 		},

@@ -264,7 +264,7 @@ export class PatternAwareStore {
 	private readonly observedActionKeys = new WeakMap<PatternAwareEvent, ActionKey | null>();
 	private readonly recurrentFeedback = new WeakMap<PatternRecurrentAction | PatternAwareContinuation, MutablePatternFeedback>();
 	private readonly structuralFeedback = new Map<PatternAwarePresetID, MutablePatternFeedback>();
-	private readonly resolvedActionKeys: BoundedRecencyMap<string, ActionKey | null>;
+	private readonly resolvedActionKeys: BoundedRecencyMap<string, ActionKey | undefined>;
 	private readonly patternSupportSessions = new Map<string, ReadonlySet<string>>();
 	private contexts?: Map<string, MutablePattern[]>;
 	private sequenceModel: PpmCountTrie;
@@ -814,22 +814,12 @@ export class PatternAwareStore {
 
 	private resolveActionKey(tool: string, input: Readonly<Record<string, unknown>>, schemaHash: string | undefined) {
 		if (!this.actionSemantics) return undefined;
-		let cacheKey: string;
 		try {
-			cacheKey = hash(stableStringify([tool, schemaHash, input]));
+			const cacheKey = hash(stableStringify([tool, schemaHash, input]));
+			return this.resolvedActionKeys.getOrCreate(cacheKey, () => this.actionSemantics!.actionKey(tool, input, schemaHash));
 		} catch {
 			return undefined;
 		}
-		const cached = this.resolvedActionKeys.get(cacheKey);
-		if (cached !== undefined) return cached ?? undefined;
-		let resolved: ActionKey | undefined;
-		try {
-			resolved = this.actionSemantics.actionKey(tool, input, schemaHash);
-		} catch {
-			return undefined;
-		}
-		this.resolvedActionKeys.set(cacheKey, resolved ?? null);
-		return resolved;
 	}
 
 	private bindingsCoverSample(
@@ -1257,17 +1247,13 @@ export function projectPatternAwareObservation(output: unknown, outputPaths: Rea
 
 /** Derived state belongs to one analyzer; public helpers get a fresh scope for mutable caller data. */
 class PatternBindingAnalysis {
-	private readonly derived = new WeakMap<object, BoundedRecencyMap<unknown, readonly [unknown]>>();
+	private readonly derived = new WeakMap<object, BoundedRecencyMap<unknown, unknown>>();
 
 	private memo<Value>(owner: unknown, key: unknown, create: () => Value): Value {
 		if (!isObject(owner)) return create();
 		let cache = this.derived.get(owner);
 		if (!cache) this.derived.set(owner, cache = new BoundedRecencyMap(128));
-		const cached = cache.get(key);
-		if (cached) return cached[0] as Value;
-		const value = create();
-		cache.set(key, [value]);
-		return value;
+		return cache.getOrCreate(key, create) as Value;
 	}
 
 	private valueIndex(value: unknown) {
@@ -1836,8 +1822,6 @@ const PATH_OPERATION_CACHE_LIMIT = 128;
 const normalizedPaths = new BoundedRecencyMap<string, string>(PATH_OPERATION_CACHE_LIMIT);
 const joinedPaths = new BoundedRecencyMap<string, string>(PATH_OPERATION_CACHE_LIMIT);
 
-function cachePathResult(cache: BoundedRecencyMap<string, string>, key: string, value: string) { cache.set(key, value); return value; }
-
 /** The directory swap turning `source` into `target` when both end in the same file name (and possibly more segments). */
 function rebaseBetween(source: string, target: string): { from: string; to: string } | undefined {
 	const left = normalizePath(source).split("/"), right = normalizePath(target).split("/");
@@ -1859,18 +1843,14 @@ function rebase(value: string, from: string, to: string): string[] {
 }
 
 function joinPath(left: string, right: string) {
-	const key = `${left.length}:${left}${right}`;
-	const cached = joinedPaths.get(key);
-	if (cached !== undefined) return cached;
-	const root = normalizePath(left);
-	const output = normalizePath(right);
-	const result =
-		containsLogicalPath(root, output)
+	return joinedPaths.getOrCreate(`${left.length}:${left}${right}`, () => {
+		const root = normalizePath(left), output = normalizePath(right);
+		return containsLogicalPath(root, output)
 			? output
 			: path.posix.basename(root) === output
 				? root
 				: normalizePath(path.join(root, output));
-	return cachePathResult(joinedPaths, key, result);
+	});
 }
 
 function getPath(value: unknown, segments: PatternAwarePath): unknown {
@@ -2270,17 +2250,15 @@ function decodePath(value: string): PatternAwarePath {
 	return parsePath(value) ?? [];
 }
 
-const parsedPaths = new BoundedRecencyMap<string, PatternAwarePath | null>(PATH_OPERATION_CACHE_LIMIT);
+const parsedPaths = new BoundedRecencyMap<string, PatternAwarePath | undefined>(PATH_OPERATION_CACHE_LIMIT);
 
 function parsePath(value: string): PatternAwarePath | undefined {
-	const cached = parsedPaths.get(value);
-	if (cached !== undefined) return cached ?? undefined;
-	try {
-		const parsed: unknown = JSON.parse(value);
-		const result = isPatternAwarePath(parsed) ? parsed : null;
-		parsedPaths.set(value, result);
-		return result ?? undefined;
-	} catch { parsedPaths.set(value, null); return undefined; }
+	return parsedPaths.getOrCreate(value, () => {
+		try {
+			const parsed: unknown = JSON.parse(value);
+			return isPatternAwarePath(parsed) ? parsed : undefined;
+		} catch { return undefined; }
+	});
 }
 
 function uniqueStrings(values: ReadonlyArray<string>) {
@@ -2288,9 +2266,7 @@ function uniqueStrings(values: ReadonlyArray<string>) {
 }
 
 function normalizePath(value: string) {
-	const cached = normalizedPaths.get(value);
-	if (cached !== undefined) return cached;
-	return cachePathResult(normalizedPaths, value, path.normalize(value).replaceAll("\\", "/"));
+	return normalizedPaths.getOrCreate(value, () => path.normalize(value).replaceAll("\\", "/"));
 }
 
 function hash(value: string) {
