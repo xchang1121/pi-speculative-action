@@ -618,10 +618,11 @@ export async function observeStrace(
 	const observeMetadata = (observedPath: string, followSymlinks: boolean, { digest, fields }: StatObservation) => {
 		lookupFailures.set(observedPath, undefined);
 		const identity = `metadata:${followSymlinks}:${fields?.join(",") ?? ""}:${observedPath}`;
-		if (external.has(observedPath) && metadata.has(identity)) return;
+		const afterWrite = external.has(observedPath) || written.has(workspaceName(observedPath) ?? "");
+		if (afterWrite && metadata.has(identity)) return;
 		const previous = metadata.get(identity);
 		if (previous && previous.digest !== digest) changedMetadata.add(observedPath);
-		metadata.set(identity, { path: observedPath, role: "metadata", followSymlinks, digest, ...(fields ? { fields } : {}), ...(external.has(observedPath) ? { afterWrite: true } : {}) });
+		metadata.set(identity, { path: observedPath, role: "metadata", followSymlinks, digest, ...(fields ? { fields } : {}), ...(afterWrite ? { afterWrite: true } : {}) });
 	};
 	for (const [pid, { lines, start, cwd: initial, fs }] of selected) {
 		// -ff files cannot order another task's chdir against this task's pathname lookup.

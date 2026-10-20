@@ -452,6 +452,7 @@ nativeTest("reuses private overwrites against the child's actual prestate", { ti
 	await fixture.compile("overwrite", { code: `${cHeaders("fcntl.h unistd.h string.h sys/stat.h stdio.h")}
 static int identity(struct stat s) { char text[32]; int n = snprintf(text, sizeof(text), "%llu:", (unsigned long long)s.st_ino); return write(1, text, n) != n; }
 int main(int argc, char **argv) { if (argc < 2) return 1; int fd; char bytes[64]; struct stat s;
+ if (argc == 3 && argv[2][0] == '=') { fd = open(argv[1], O_WRONLY | O_CREAT | O_TRUNC, 0600); return fd < 0 || write(fd, argv[2]+1, strlen(argv[2]+1)) != (ssize_t)strlen(argv[2]+1) || close(fd); }
  if (argc == 4) { if (!strcmp(argv[2], "race")) { fd = open(argv[1], O_WRONLY); if (fd < 0) return 6;
    char ready[4096]; snprintf(ready, sizeof(ready), "%s.ready", argv[3]); int signal = open(ready, O_WRONLY | O_CREAT, 0600); if (signal < 0 || close(signal)) return 7;
    while (access(argv[3], F_OK)) usleep(1000); return write(fd, "raced", 5) != 5 || ftruncate(fd, 5) || close(fd); }
@@ -465,38 +466,34 @@ int main(int argc, char **argv) { if (argc < 2) return 1; int fd; char bytes[64]
 	await fixture.prepare(); const route = await fixture.prepareActorReplay(), scope = { sessionID: "private-prestate", turnID: "actor" };
 	for (const mode of ["existing", "created", "changed", "deleted", "deleted-changed", "absent", "appeared"]) {
 		const target = path.join(outside, mode), removed = mode.startsWith("deleted"), absent = ["created", "absent", "appeared"].includes(mode), changed = mode.endsWith("changed") || mode === "appeared";
-		const command = `./overwrite '${target}'${removed ? " delete" : ""}`, prefix = ["absent", "appeared"].includes(mode) ? "" : `printf prepared > '${target}'; `;
+		const command = `./overwrite '${target}'${removed ? " delete" : ""}`, prefix = ["absent", "appeared"].includes(mode) ? "" : `./overwrite '${target}' =prepared; `;
 		if (!absent) await writeFile(target, "old");
 		await using branch = disposable(await fixture.fork(`: producer; ${prefix}${command}`, { executionScope: scope }));
 		expect(textOutput(branch.output.result)).toBe(`${prefix ? "prepared" : ""}done\n`);
 		expect(await readText(target).catch(() => "absent")).toBe(absent ? "absent" : "old");
-		const validation = await branch.validate?.(); expect(validation, JSON.stringify({ mode, validation, metrics: fixture.backend.metrics() })).toMatchObject({ status: prefix ? "indeterminate" : "valid" });
-		if (prefix) expect(JSON.stringify(validation)).toContain(`metadata_after_write:metadata:follow:${target}`);
+		const validation = await branch.validate?.(); expect(validation, JSON.stringify({ mode, validation, metrics: fixture.backend.metrics() })).toMatchObject({ status: "valid" });
 		const before = fixture.backend.actorMetrics().hits;
 		if (mode === "appeared") await writeFile(target, "changed");
 		expect(await executeProcess(fixture, route.executor, `: actor; ${changed ? prefix.replace("prepared", "changed") : prefix}${command}`, { scope })).toEqual({ exitCode: 0, output: `${changed ? "changed" : prefix ? "prepared" : ""}done\n` });
 		expect(await readText(target).catch(() => "absent")).toBe(removed ? "absent" : "after\n");
-		expect(fixture.backend.actorMetrics().hits - before, JSON.stringify({ mode, metrics: fixture.backend.metrics() })).toBe(changed ? 0 : 1);
+		expect(fixture.backend.actorMetrics().hits - before, JSON.stringify({ mode, metrics: fixture.backend.metrics() })).toBe(changed ? 0 : prefix ? 2 : 1);
 	}
-	for (const mode of ["stat", "stat-after", "stat-created"]) {
-		const inspected = path.join(outside, mode), replacement = path.join(outside, "replacement"), absent = mode === "stat-created";
-		const inspect = `./overwrite '${inspected}' ${mode === "stat" ? "stat" : "stat-after"}`;
+	for (const mode of ["stat", "stat-after", "stat-created", "stat-created-child", "stat-created-child-workspace"]) {
+		const inspected = path.join(mode.endsWith("workspace") ? fixture.workspace : outside, mode), replacement = path.join(outside, "replacement"), absent = mode.startsWith("stat-created");
+		const child = mode.includes("child"), inspect = `${child ? `./overwrite '${inspected}' =same; ` : ""}./overwrite '${inspected}' ${mode === "stat" || child ? "stat" : "stat-after"}`;
 		if (!absent) await writeFile(inspected, "same");
 		await using metadata = disposable(await fixture.fork(`: producer; ${inspect}`, { executionScope: scope }));
 		const oldIdentity = await filesystem.stat(inspected).then(info => info.ino, () => undefined);
-		if (mode === "stat") {
-			expect(textOutput(metadata.output.result)).toBe(`${oldIdentity}:samedone\n`);
-			expect(await metadata.validate?.()).toMatchObject({ status: "valid" });
-		} else {
-			expect(textOutput(metadata.output.result)).toMatch(absent ? /^\d+:done\n$/ : /^same\d+:done\n$/);
-			expect(await metadata.validate?.()).toMatchObject({ status: "indeterminate", cause: { detail: expect.stringContaining(`metadata_after_write:metadata:follow:${inspected}`) } });
-		}
+		const expected = mode === "stat" ? `${oldIdentity}:samedone\n` : expect.stringMatching(child ? /^\d+:samedone\n$/ : absent ? /^\d+:done\n$/ : /^same\d+:done\n$/);
+		expect(textOutput(metadata.output.result)).toEqual(expected);
+		expect(await metadata.validate?.()).toMatchObject(mode === "stat" ? { status: "valid" } : child ? { status: "stale", cause: { detail: expect.stringContaining(inspected) } }
+			: { status: "indeterminate", cause: { detail: expect.stringContaining(`metadata_after_write:metadata:follow:${inspected}`) } });
 		if (!absent) { await writeFile(replacement, "same"); await filesystem.rename(replacement, inspected); }
 		const replacementIdentity = await filesystem.stat(inspected).then(info => info.ino, () => undefined); if (!absent) expect(replacementIdentity).not.toBe(oldIdentity);
 		const metadataHits = fixture.backend.actorMetrics().hits, actual = await executeProcess(fixture, route.executor, `: actor; ${inspect}`, { scope });
 		const newIdentity = replacementIdentity ?? (await filesystem.stat(inspected)).ino;
-		expect(actual).toEqual({ exitCode: 0, output: mode === "stat" ? `${newIdentity}:samedone\n` : `${absent ? "" : "same"}${newIdentity}:done\n` });
-		expect(fixture.backend.actorMetrics().hits - metadataHits, mode).toBe(0);
+		expect(actual).toEqual({ exitCode: 0, output: mode === "stat" || child ? `${newIdentity}:samedone\n` : `${absent ? "" : "same"}${newIdentity}:done\n` });
+		expect(fixture.backend.actorMetrics().hits - metadataHits, mode).toBe(child ? 1 : 0);
 	}
 	const target = path.join(outside, "raced"), marker = path.join(outside, "marker"), command = `./overwrite '${target}' slow '${marker}'`, prefix = `printf prepared > '${target}'; `;
 	await writeFile(target, "old");
@@ -734,10 +731,10 @@ nativeTest.for([false, true])("prepares a failed command after its reported inpu
 			expect(await fixture.read("generated.txt")).toBe("fixed\n");
 		}
 		await host.finishTurn("retry");
-		expect(fallback).toHaveBeenCalledTimes(stale ? 1 : 0);
+		expect(fallback).toHaveBeenCalledTimes(1);
 		expect(events.filter(event => event.type === "prediction")).toContainEqual(expect.objectContaining({ settlement:
 			expect.objectContaining({ observation: "observed", match: expect.objectContaining({ matched: true, adoption:
-				expect.objectContaining(stale ? { status: "rejected", cause: expect.objectContaining({ stage: "freshness" }) } : { status: "adopted" }) }) }) }));
+			expect.objectContaining({ status: "rejected", cause: expect.objectContaining({ stage: "freshness", ...(stale ? {} : { detail: expect.stringContaining("metadata_after_write") }) }) }) }) }) }));
 	});
 
 nativeTest.for(["bash", "write", "stale", "disabled", "bash:shared", "write:shared", "stale:shared", "disabled:shared", "bash:parents", "bash:aliases", "bash:both", "bash:repeat", "write:repeat", "bash:race"])("reprepares changed children beyond fresh beam entries (%s)", { timeout: 20_000 }, async (scenario, { benchmark }) => {
@@ -2266,12 +2263,13 @@ int main(void) { struct timespec pause = {0, 300000000}; pid_t sibling = fork(),
 			await expect(raced.commit()).rejects.toThrow();
 			expect(await host("kept")).toBe("raced\n");
 		} finally { await raced.dispose?.(); }
-		// Successors read prior children's private writes; the whole transaction proves them without publishing native history.
+		// A successor that also stats a new object keeps its identity constraint; the Actor settles that object natively.
 		for (const label of ["prepared", "fresh"]) {
-			const before = fixture.backend.metrics(); await using child = disposable(await fixture.fork(`/bin/sh -c 'printf "g\\n" > "$1"' sh ${outside}/g && cat ${outside}/g`));
+			const before = fixture.backend.metrics(), command = `/bin/sh -c 'printf "g\\n" > "$1"' sh ${outside}/g && cat ${outside}/g`;
+			await using child = disposable(await fixture.fork(command));
 			expect([textOutput(child.output.result), await host("g"), fixture.backend.metrics().hits > before.hits], JSON.stringify(fixture.backend.metrics())).toEqual(["g\n", "absent", false]);
-			const validation = await child.validate?.(); expect(validation, JSON.stringify({ validation, metrics: fixture.backend.metrics() })).toMatchObject({ status: "valid" });
-			if (label === "fresh") { await child.commit(); expect(await host("g")).toBe("g\n"); }
+			const validation = await child.validate?.(); expect(validation, JSON.stringify({ validation, metrics: fixture.backend.metrics() })).toMatchObject({ status: "stale", cause: { detail: `${outside}/g` } });
+			if (label === "fresh") expect([textOutput(await fixture.tool.execute("created-actor", { command })), await host("g")]).toEqual(["g\n", "g\n"]);
 		}
 		// An independently prepared native operation has the same external-write baseline as a whole tool.
 		const args = { command: `/bin/sh -c 'printf "bound\\n" > "$1"' sh ${outside}/kept` };
@@ -2611,7 +2609,7 @@ int main(int argc, char **argv, char **envp) {
 ${cHeaders("fcntl.h sys/file.h unistd.h")}
 int main(int argc, char **argv) {
 	(void)argv; int fd = open(${JSON.stringify(external ? target : "source/value.txt")}, O_RDWR); if (fd < 0) return 2;
-	if (argc > 2 && (write(fd, "prepared\\n", 9) != 9 || ftruncate(fd, 9))) return 6;
+	if (argc > 2) return write(fd, "prepared\\n", 9) != 9 || ftruncate(fd, 9) ? 6 : 0;
 	struct flock lock = {.l_type=F_WRLCK, .l_whence=SEEK_SET}; char value;
 	if (argc == 2) {
 		if (${mode.endsWith("flock") ? "flock(fd, LOCK_EX)" : "fcntl(fd, F_SETLK, &lock)"} < 0) return 3;
@@ -2632,7 +2630,7 @@ int main(int argc, char **argv) {
 			}
 		}
 		await fixture.prepare({ includeWorkspaceFingerprint: true });
-		const command = mode === "rename" ? "mv source moved && mkdir shut && chmod 600 shut" : `probe${external ? " prepare private" : ""}`;
+		const command = mode === "rename" ? "mv source moved && mkdir shut && chmod 600 shut" : `${external ? "probe prepare private && " : ""}probe`;
 		branch = await fixture.fork(command);
 		expect(branch.output.isError, JSON.stringify(branch.output)).toBe(false);
 		// Check before the Actor writes: the host's holder alone must invalidate the granted lock.

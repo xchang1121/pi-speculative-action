@@ -654,8 +654,7 @@ export class LinuxProcessReuseBackend {
 				metrics: () => Object.freeze({ ...session.metrics }),
 				seal: _changes => session.sealPromise ??= this.withProducer(async () => {
 					await session.lifecycle.drain();
-					const external = await privateCommits(session, session.privateSince ?? 0,
-						sessionWriters(session).flatMap(writer => writer.external ?? []));
+					const external = await privateCommits(session, session.privateSince ?? 0, sessionWriters(session));
 					// Adopting without them would leave the host unlike the native run: the Actor runs it instead.
 					if (!external.complete) throw new Error(`unrepresentable writes outside the workspace: external_write:${[...external.before].find(([, value]) => !value)?.[0]}`);
 					return [...await sealSessionEvidence(session, external), ...external.changes];
@@ -1161,8 +1160,7 @@ export class LinuxProcessReuseBackend {
 						if (!effects.complete) unattributed = observation;
 						stage = "dependencies";
 						const observed = [observation, ...own.descendants?.flatMap(child => child.observation ?? []) ?? []];
-						const external = await privateCommits(session, own.startedAt,
-							observed.flatMap(part => part.external ?? []), privateBefore, [own, ...own.descendants ?? []]);
+						const external = await privateCommits(session, own.startedAt, [own, ...own.descendants ?? []], privateBefore);
 						const evidence = await captureDependencies(session, before, observed, effects, external, own.descendants?.flatMap(child => child.evidence ?? []), privateBefore);
 						if (evidence.incompleteReasons.length) this.setError(session, `evidence:${evidence.incompleteReasons.join(",")}`);
 						const taints = new Set<ProvenanceTaint>(evidence.taints);
@@ -2000,24 +1998,24 @@ async function captureDependencies(session: ActiveSession, snapshot: WorkspaceSt
 		}
 		dependencies.set(identity, dependency);
 	};
-	// Child inputs following earlier writes depend on the enclosing transaction's prestate.
+	// Rebase owned inputs; metadata survives unless its private object vanished within this transaction.
 	const changed = new Set(effects.effects.map(effect => effect.logicalPath));
 	const atStart = async (dependency: DynamicDependency) => {
-		if (dependency.kind !== "fd" && dependency.kind !== "lock" && external.before.has(dependency.path)) {
-			const initial = external.before.get(dependency.path);
-			return dependency.kind === "metadata" && initial?.kind !== "absence" ? dependency : initial;
+		if (dependency.kind !== "fd" && dependency.kind !== "lock" && dependency.kind !== "metadata" && external.before.has(dependency.path)) {
+			return external.before.get(dependency.path);
 		}
 		const physical = dependency.kind === "fd" ? undefined : session.projection.toPhysical(dependency.path);
 		const relative = physical && relativeFilesystemPath(snapshot.root, physical);
 		if (dependency.kind === "fd" || !physical || relative === undefined || session.workspace.observationExcludes.includes(relative.split(path.sep)[0]!)) return dependency;
 		const entry = snapshot.entries.get(relative), up = relativeFilesystemPath(snapshot.root, path.dirname(physical)), parent = up === undefined ? undefined : snapshot.entries.get(up);
-		if (dependency.kind === "metadata" && parentWrites.has(physical)) return entry?.kind === "directory" && entry.observed ? { ...dependency,
-			digest: filesystemObservationDigest(session.workspace.projectMetadata?.(entry.observed) ?? entry.observed, dependency.fields) } : dependency;
-		const same = dependency.kind === "absence" ? !entry && (dependency.parentEntriesDigest === undefined || parent?.kind === "directory" && parent.entriesDigest === dependency.parentEntriesDigest)
+		if (dependency.kind === "metadata" && parentWrites.has(physical) && entry?.kind === "directory" && entry.observed) return { ...dependency,
+			digest: filesystemObservationDigest(session.workspace.projectMetadata?.(entry.observed) ?? entry.observed, dependency.fields) };
+		const same = dependency.kind === "metadata" ? !!entry || changed.has(dependency.path) || !created.has(physical)
+			: dependency.kind === "absence" ? !entry && (dependency.parentEntriesDigest === undefined || parent?.kind === "directory" && parent.entriesDigest === dependency.parentEntriesDigest)
 			: dependency.kind === "directory" ? entry?.kind === "directory" && entry.metadataDigest === dependency.metadataDigest && (dependency.entriesDigest ?? entry.entriesDigest) === entry.entriesDigest
 			: dependency.kind === "symlink" ? entry?.kind === "symlink" && entry.target === dependency.target
 			: dependency.kind === "lock" ? entry?.kind === "file"
-			: !changed.has(dependency.path) && (dependency.kind === "metadata" ? entry !== undefined : entry?.kind === "file" && entry.metadataDigest === dependency.metadataDigest);
+			: !changed.has(dependency.path) && entry?.kind === "file" && entry.metadataDigest === dependency.metadataDigest;
 		return same ? dependency : workspaceDependency(physical, dependency.path, dependency.kind === "file" ? dependency.role : "input", dependency.kind === "directory" && !!dependency.entriesDigest);
 	};
 
@@ -2086,14 +2084,14 @@ async function captureDependencies(session: ActiveSession, snapshot: WorkspaceSt
 		if (/^\/dev\/u?random$/.test(observedPath)) { taints.add("random"); continue; } // Entropy, as getrandom(2) reads it.
 		if (/^\/sys\/(?:devices\/system\/cpu|fs\/cgroup)(?:\/|$)|^\/proc\/(?:meminfo|version|version_signature|cpuinfo|stat|loadavg|uptime)$/.test(observedPath)) { taints.add("clock"); continue; }
 		if (item.role === "metadata") {
-			if (created.has(path.resolve(physical))) continue; // Its own writes set what it saw of them.
 			const { role, path: _path, afterWrite, ...metadata } = item;
 			const dependency = { ...metadata, kind: role,
 				path: session.projection.isWorkspacePhysical(physical) ? session.projection.toLogical(physical) : slash(physical) };
+			const input = await atStart(dependency);
 			const identity = dynamicDependencyIdentity(dependency);
 			// A missing slot needs these fields bound before the write, possibly by a brokered child.
-			if (afterWrite) { if (!dependencies.has(identity)) dependencies.set(identity, undefined); }
-			else add(await atStart(dependency));
+			if (afterWrite && input?.kind === "metadata") { if (!dependencies.has(identity)) dependencies.set(identity, undefined); }
+			else add(input);
 			continue;
 		}
 		if (STABLE_SANDBOX_DEVICES.has(observedPath)) continue;
@@ -2392,11 +2390,11 @@ async function privateInputImages(session: ActiveSession, needed: ReadonlySet<st
 	return images;
 }
 
-/** The same prestate authorizes child reuse and its effect journal; the enclosing session starts over the host. */
-async function privateCommits(session: ActiveSession, since: number, candidates: Iterable<string>, prestate?: PrivatePrestate, owned: readonly SessionWriter[] = []) {
+/** Rebase every owned writer, including children retained as certificates, onto this run's private or host prestate. */
+async function privateCommits(session: ActiveSession, since: number, owned: readonly SessionWriter[], prestate?: PrivatePrestate) {
 	const { upper, deleted } = await privateBranch(path.join(session.processRoot, "private")), stat = (target: string) => lstat(target, { bigint: true }).catch(() => undefined);
 	const changes: SandboxWorkspaceChange[] = [], before = new Map<string, DynamicDependency | undefined>();
-	for (const target of new Set([...candidates].map(name => path.posix.resolve(name)))) {
+	for (const target of new Set(owned.flatMap(writer => writer.external ?? []).map(name => path.posix.resolve(name)))) {
 		if (STABLE_SANDBOX_DEVICES.has(target)) continue;
 		const copy = path.join(upper, target), [own, native] = await Promise.all([stat(copy), stat(target)]);
 		const prior = prestate?.entries.get(target), initial = prior ?? (prestate?.deleted(target) ? undefined : native);

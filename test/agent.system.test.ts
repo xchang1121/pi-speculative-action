@@ -1142,13 +1142,13 @@ test.for(["unrelated", "changed", "descendant", "mutation", "mutation-stat", "mu
 	expect(textOutput(await f.execute("bash", { command }))).toBe(expected);
 	if (change === "descendant") { await f.finish(); await f.start("next"); expect(textOutput(await f.execute("bash", { command: "cat c.txt" }))).toBe("second\n"); }
 	await f.finish(true);
-	const actors = f.actors, timing = actors.at(-1)!.computation!, fallback = metadata || split || change === "changed";
+	const actors = f.actors, timing = actors.at(-1)!.computation!, fallback = mutation || change === "changed";
 	expectHiddenCompute(timing, !metadata && !stale && change !== "changed");
 	expect(f.fallbacks, JSON.stringify(actors)).toEqual([...(mutation ? [] : ["write"]), ...(fallback ? ["bash"] : [])]);
 	expect(f.events.filter(event => event.type === "candidate" && event.state.status === "running")).toHaveLength(change === "descendant" || mutation ? 2 : 1);
 	if (mutation) {
 		expect(requests).toBeGreaterThanOrEqual(2); expect(requests).toBeLessThanOrEqual(3); expect(actors.map(event => event.settlement.provider.kind)).toEqual(["speculative", fallback ? "actor" : "speculative"]);
-		expect(prepared[0] === expected).toBe(!metadata && !split); expect(native.backend.actorMetrics().hits).toBe(Number(split && !stale)); expect(await readText(cwd, "marker")).toBe("once");
+		expect(prepared[0] === expected).toBe(!metadata && !split); expect(native.backend.actorMetrics().hits).toBe(Number(!metadata && !stale)); expect(await readText(cwd, "marker")).toBe("once");
 	}
 });
 
