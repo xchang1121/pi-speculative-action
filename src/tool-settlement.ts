@@ -4,6 +4,7 @@ import type { ActionKey, ActionSemanticsDefinition } from "./action-semantics.ts
 import type { ExecutionOperationBinding, WorldResultCapture } from "./execution-world.ts";
 import { stableValueHash } from "./stable-value-hash.ts";
 import { immutableSnapshot } from "./stable-json.ts";
+import type { ToolFilesystemOperations } from "./resource-version.ts";
 
 /** Host-neutral result consumed by the speculative scheduler. */
 export interface ToolSettlement<TDetails = unknown> {
@@ -49,24 +50,6 @@ export interface ToolProcessInvocation {
 	readonly shellArgs: readonly string[];
 	readonly commandTransport: "argv" | "stdin";
 	readonly timeout?: number;
-}
-
-export type ToolFilesystemStat = { isDirectory: () => boolean; size?: number; type?: "file" | "directory" | "symlink" | "special"; link?: string; realPath?: string };
-
-/** Filesystem capabilities supplied by an execution world, never ambient host defaults. */
-export interface ToolFilesystemOperations {
-	readonly readFile: (target: string, maxBytes?: number) => Promise<Buffer>;
-	readonly access: (target: string, writable?: boolean) => Promise<void>;
-	readonly exists?: (target: string) => boolean | Promise<boolean>;
-	/** `entry` does not follow the final link; includeSize=false returns only type/path fields and their evidence. */
-	readonly stat?: (target: string, fields?: "type" | "entry", includeSize?: boolean) => ToolFilesystemStat | Promise<ToolFilesystemStat>;
-	readonly readdir?: (target: string) => string[] | Promise<string[]>;
-	readonly writeFile?: (target: string, content: string) => Promise<void>;
-	readonly mkdir?: (target: string) => Promise<void>;
-	/** Build is pure and reads only view inputs; binding/key cover other inputs and values stay immutable. Resource is a hint; signal owns this consumer. */
-	readonly prepare?: <Value, Result>(binding: object, key: string,
-		build: (view: ToolFilesystemOperations, signal: AbortSignal) => Promise<{ readonly value: Value; readonly bytes: number; readonly dispose: () => void | Promise<void> }>,
-		consume: (value: Value) => Promise<Result>, resource?: string, signal?: AbortSignal) => Promise<Result>;
 }
 
 /** Identity of the concrete tool executor. */

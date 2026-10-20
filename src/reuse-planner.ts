@@ -1,5 +1,5 @@
-import { certificateReplayable, isSha256Digest, type ProcessProducerProof,
-	type ProcessProvenanceCertificate, type ProvenanceTaint, referencedArtifacts, type Sha256Digest } from "./provenance-certificate.ts";
+import { certificateReplayable, type ProcessProducerProof, type ProcessProvenanceCertificate, type ProvenanceTaint, referencedArtifacts } from "./provenance-certificate.ts";
+import { isSha256Digest, type Sha256Digest } from "./stable-value-hash.ts";
 import { observeProcessInputs, type ProvenanceValidation, type ProvenanceValidationContext, validateDynamicDependencyCertificate } from "./provenance-validation.ts";
 import { ProvenanceCertificateStore, type VerifiedArtifactClosure } from "./reuse-store.ts";
 

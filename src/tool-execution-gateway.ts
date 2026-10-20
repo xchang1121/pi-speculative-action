@@ -1,5 +1,4 @@
 import type { ActionKey } from "./action-semantics.ts";
-import type { ToolInvocation } from "./tool-settlement.ts";
 const REUSED_FAILURE = Symbol("reused tool failure");
 import { TimelineInterval, type TimelineDependency } from "./task-timing.ts";
 import { EffectTransactionCoordinator, type EffectTransaction, isPoisonedEffectCommit } from "./effect-transaction.ts";
@@ -22,8 +21,6 @@ export interface ToolOperation {
 	readonly signal?: AbortSignal;
 	/** Present after the caller has resolved the canonical action identity. */
 	readonly action?: ActionKey;
-	/** The Actor owns its selected executor even when no reusable action key can be constructed. */
-	readonly invocation?: ToolInvocation;
 }
 
 export type AuthoritativeToolExecutor<Output> = (operation: ToolOperation) => Promise<Output>;

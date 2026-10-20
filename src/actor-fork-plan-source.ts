@@ -1,3 +1,4 @@
+import { isSafeCount } from "./number-utils.ts";
 import type { AgentPlanSource } from "./agent-runtime-types.ts";
 import type { AssistantMessageEvent } from "@earendil-works/pi-ai";
 
@@ -55,7 +56,7 @@ export class ActorForkPlanSource {
 	get schedule(): ActorProbeSchedule {
 		const normalized = { ...ACTOR_PROBE_SCHEDULE, ...(typeof this.configuration === "function" ? this.configuration() : this.configuration) };
 		for (const [field, value] of Object.entries(normalized)) {
-			if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${field} must be a positive integer`);
+			if (!isSafeCount(value, 1)) throw new Error(`${field} must be a positive integer`);
 		}
 		return Object.freeze(normalized);
 	}
@@ -80,8 +81,7 @@ export class ActorForkPlanSource {
 
 	startTurn(turnID: string, reuseFeedback?: unknown): void {
 		this.closeTurn(turnID);
-		let resolve!: (batches: readonly ActorForkActionBatch[]) => void;
-		const promise = new Promise<readonly ActorForkActionBatch[]>((settle) => { resolve = settle; });
+		const { promise, resolve } = Promise.withResolvers<readonly ActorForkActionBatch[]>();
 		this.pending.set(turnID, {
 			schedule: this.schedule,
 			reuseFeedback,

@@ -6,14 +6,14 @@ import { lstat, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { expect } from "vitest";
 import { PROCESS_CERTIFICATE } from "./process-fixture.ts";
-import { cHeaders, commitBenchmarkFixture, compileBenchmarkHelper, processTest,
-	executeProcess, forkReusableBash, holdOwnedProcessPublication, metricDelta, prepareLinuxProcessReuse, textOutput } from "./linux-process-fixture.ts";
+import { cHeaders, processTest,
+	executeProcess, holdOwnedProcessPublication, metricDelta, textOutput } from "./linux-process-fixture.ts";
 
 (process.arch === "x64" ? processTest : processTest.skip).for(["git", "auto"] as const)("preserves held-child output, effects and one-shot authority across parent commands (%s)", { timeout: 30_000 }, async (driver, { benchmark, skip }) => {
 	const fixture = await benchmark("pi-held-production-", driver);
 	const { backend, workspace } = fixture;
 	await writeFile(path.join(workspace, "input.txt"), "before\n");
-	await compileBenchmarkHelper(workspace, "worker", { code: String.raw`
+	await fixture.compile("worker", { code: String.raw`
 ${cHeaders("fcntl.h sys/random.h sys/prctl.h time.h sys/stat.h unistd.h")}
 int main(int argc, char **argv) {
 	if (argc > 2) {
@@ -56,12 +56,10 @@ int main(int argc, char **argv) {
 	await mkdir(path.join(workspace, "d", "e"), { recursive: true });
 	await Promise.all([writeFile(path.join(workspace, "d", "e", ".keep"), ""), writeFile(path.join(workspace, "data.txt"), "v1\n"), writeFile(path.join(workspace, "d", "data.txt"), "nested\n"),
 		symlink("data.txt", path.join(workspace, "data.link")), symlink("d/e", path.join(workspace, "sub"))]);
-	await commitBenchmarkFixture(workspace, "Pi Held Exec Qualification");
-	const { executionFingerprint } = await prepareLinuxProcessReuse(fixture, { skip });
+	await fixture.commit("Pi Held Exec Qualification");
+	await fixture.prepare({ skip });
 	const route = await fixture.prepareActorReplay();
-	const produce = (command: string) => forkReusableBash(fixture, {
-		label: "producer", command, actionNamespace: "held-production", executionFingerprint,
-	});
+	const produce = (command: string) => fixture.fork(command);
 	const actor = async (command: string, turnID = "benchmark", held: boolean | "sync" = true, callID?: string) => {
 		const before = backend.actorMetrics();
 		const scope = { sessionID: "benchmark", turnID, callID };
@@ -99,6 +97,12 @@ int main(int argc, char **argv) {
 		{ name: "stale", command: "worker stale.txt", expected: "worker:after\n", file: "stale.txt", metrics: miss },
 		{ name: "cwd", command: "/bin/pwd", expected: `${workspace}\n`, metrics: hit },
 		{ name: "security", command: "worker unused probe", expected: "nnp:0\n", metrics: { ...miss, lastError: expect.stringContaining("certificate_tainted") } },
+		{ name: "hard-limit", command: "ulimit -H -s 65536; /bin/sh -c 'ulimit -H -s'", expected: "65536\n", metrics: miss },
+		{ name: "core-limit", command: "/bin/sh -c 'ulimit -H -c'", expected: execFileSync("/bin/sh", ["-c", "ulimit -H -c"], { encoding: "utf8" }), metrics: miss },
+		{ name: "proc-limits", command: "/bin/cat /proc/self/limits", expected: await readText("/proc/self/limits"), metrics: miss },
+		{ name: "soft-limit", command: "ulimit -S -s 65536; /bin/sh -c 'ulimit -S -s'", expected: "65536\n", metrics: hit },
+		{ name: "soft-changed", command: "ulimit -S -s 65536; /bin/sh -c 'ulimit -S -s'", actorCommand: "ulimit -S -s 32768; /bin/sh -c 'ulimit -S -s'", expected: "32768\n", metrics: miss },
+		{ name: "soft-unlimited", command: "ulimit -S -s unlimited; /bin/sh -c 'ulimit -S -s'", expected: "unlimited\n", metrics: hit },
 		{ name: "inode", command: "worker unused inode", expected: (await lstat(path.join(workspace, "input.txt"), { bigint: true })).ino.toString(16).padStart(16, "0") + "\n", metrics: hit },
 		{ name: "descriptor", command: descriptor, expected: "descriptor-ok", file: "descriptor.txt", metrics: { wholeCommandHits: 0 } },
 		{ name: "link", command: "head -n 1 data.link", expected: "v2\n", metrics: miss },
@@ -125,9 +129,8 @@ int main(int argc, char **argv) {
 					expect(produced.published).toBe(0);
 				}
 				if (scenario.name === "security") expect(textOutput(branch.output.result)).toBe("nnp:1\n");
-				if (scenario.name === "cwd") expect(textOutput(branch.output.result)).toBe(scenario.expected);
+				if (["cwd", "descriptor", "hard-limit", "soft-limit", "soft-unlimited"].includes(scenario.name)) expect(textOutput(branch.output.result)).toBe(scenario.expected);
 				if (scenario.name === "descriptor") {
-					expect(textOutput(branch.output.result)).toBe("descriptor-ok");
 					expect((await branch.validate?.())?.status).toBe("valid"); // The clock read by date makes this a one-shot transfer.
 					expect(produced.wholeCommandPublished).toBe(0);
 				}
@@ -148,7 +151,7 @@ int main(int argc, char **argv) {
 				finally { await fixture.inOwner(state => state.deciding.mock.restore()); }
 				await rm(path.join(workspace, scenario.file!));
 			}
-			const consume = () => actor(`printf 'actor-parent\\n'; ${scenario.command}`, scenario.name === "foreign" ? "later" : "benchmark",
+			const consume = () => actor(`printf 'actor-parent\\n'; ${"actorCommand" in scenario ? scenario.actorCommand : scenario.command}`, scenario.name === "foreign" ? "later" : "benchmark",
 				competing ? "sync" : scenario.name !== "descriptor", scenario.name === "competing-whole" ? "unrelated" : undefined);
 			const result = competing || ["completed", "running"].includes(scenario.name) ? await fixture.workspaceSandbox.withWorkspace(workspace, async privateWorkspace => {
 				const command = competing ? `: local-parent; ${scenario.command}` : "/bin/true";

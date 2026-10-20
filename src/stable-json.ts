@@ -1,3 +1,4 @@
+import { isFiniteNumber, isSafeCount } from "./number-utils.ts";
 import { types } from "node:util";
 
 /** A field-addressable object; this is not a proof of plain or immutable data. */
@@ -27,7 +28,7 @@ const immutableSnapshots = new WeakSet<object>();
 export function isImmutableSnapshot(value: unknown): boolean {
 	return isObject(value) ? immutableSnapshots.has(value) : value === undefined || value === null ||
 		typeof value === "string" || typeof value === "boolean" ||
-		(typeof value === "number" && Number.isFinite(value) && !Object.is(value, -0));
+		(isFiniteNumber(value) && !Object.is(value, -0));
 }
 
 /** Each invocation owns its structured values, including already sealed data. */
@@ -125,7 +126,7 @@ function serialize(value: unknown): string | undefined {
 
 function isArrayIndex(value: string) {
 	const index = Number(value);
-	return Number.isInteger(index) && index >= 0 && index < 0xffff_ffff && String(index) === value;
+	return isSafeCount(index, 0, 4294967294) && String(index) === value;
 }
 
 export function isObject(value: unknown): value is object {

@@ -1,6 +1,6 @@
 import path from "node:path";
 import type { ActionSemanticsRegistry } from "./action-semantics.ts";
-import type { AgentPlanSource } from "./agent-runtime-types.ts";
+import type { AgentPlanSource, AgentRuntime } from "./agent-runtime-types.ts";
 import { BoundedRecencyMap } from "./bounded-recency-map.ts";
 import { DEFAULTS } from "./common.ts";
 import type { ExecutionOperationBinding } from "./execution-world.ts";
@@ -23,11 +23,10 @@ export function createExecutionPreparation(cwd: string, semantics: ActionSemanti
 	const current = (binding: ExecutionOperationBinding) => binding.available !== false && binding.preparation === "current_workspace" && !binding.fed && !!binding.stale;
 	const operationID = (binding: ExecutionOperationBinding) => `${binding.backend}:${binding.identity}`;
 	const release = (owner = state) => {
-		for (const command of commands.values()) command.request = undefined;
 		return owner?.changes && lifetime.track(owner.changes.then(token => token?.release()));
 	};
 	const configure = (settings: SpeculativeActionSettings) => {
-		if (lifetime.sealed || !settings.enabled || !(settings.prepareObservedOperations ?? DEFAULTS.prepareObservedOperations)) { release(); state = undefined; }
+		if (lifetime.sealed || !settings.enabled || settings.reuseEnabled === false || !(settings.prepareObservedOperations ?? DEFAULTS.prepareObservedOperations)) { release(); state = undefined; }
 		else state ??= {};
 		return state;
 	};
@@ -90,16 +89,21 @@ export function createExecutionPreparation(cwd: string, semantics: ActionSemanti
 		return { id, source: "execution_preparation", revision: reserve?.(id, next) ?? next, actions };
 	};
 	const source: AgentPlanSource = {
-		id: "execution_preparation", kind: "preparation", requestLifetime: "actor_decision", observesOperations: true,
+		id: "execution_preparation", kind: "preparation", requestLifetime: "actor_decision",
 		enabled: settings => !!configure(settings),
 		propose: ({ settings, startInput, data, signal }) => {
 			const owner = configure(settings);
-			return owner ? lifetime.admit(() => proposal(owner, startInput.turnID, data.schemaHashes, signal)) : undefined;
+			return owner ? lifetime.admit(async () => {
+				if (!owner.changes) await observeWorkspace(owner);
+				return proposal(owner, startInput.turnID, data.schemaHashes, signal);
+			}) : undefined;
 		},
-		observe: ({ settings, action, tool, concrete, operations: observed, consumeInput, data, signal, reserveRevision }) => {
-			const owner = configure(settings);
-			if (!owner) return;
-			return lifetime.admit(async () => {
+	};
+	const clear = async () => { await lifetime.drain(); const owner = state; state = undefined; await release(owner); operations.clear(); commands.clear(); };
+	return { source, connect: (runtime: AgentRuntime) => runtime.subscribe({
+		actor_observed: event => lifetime.admit(async () => {
+				const { settings, action, tool, concrete, operations: observed, consumeInput, data, signal } = event;
+				const owner = configure(settings);
 				const bindings = observed?.filter(binding => binding.available !== false && binding.permissionHash === action?.hash) ?? [];
 				if (bindings.length) {
 					const schemaHash = action!.schemaHash, parent = action!.hash;
@@ -108,20 +112,21 @@ export function createExecutionPreparation(cwd: string, semantics: ActionSemanti
 				}
 				if (action && semantics.effect(action) === "workspace_mutation")
 					for (const command of commands.values()) command.request = { revision: ++revision, kind: "edit" };
-				await observeWorkspace(owner);
-				return proposal(owner, `${consumeInput.turnID}:after`, data.schemaHashes, signal, reserveRevision);
-			});
-		},
-		onAdmitted: ({ feedback: token }) => {
+				if (owner) {
+					await observeWorkspace(owner);
+					await runtime.submitPlan(event.startInput, await proposal(owner, `${consumeInput.turnID}:after`, data.schemaHashes, signal,
+						(id, minimum) => runtime.reservePlanRevision(event.sessionID, id, minimum)));
+				}
+			}),
+		prediction_admitted: ({ feedback: token }) => {
 			const prepared = feedback.get(token as object);
 			if (prepared && prepared.command.request === prepared.request) prepared.command.request = undefined;
 		},
-		onSettled: ({ feedback: token, settlement }) => {
+		prediction_feedback: ({ feedback: token, settlement }) => {
 			const operation = feedback.get(token as object)?.operation;
 			if (operation && settlement.observation === "unobserved" && settlement.cause.stage === "execution" &&
 				!current(operation.binding) && operations.get(operation.key) === operation) operations.delete(operation.key);
 		},
-	};
-	const clear = async () => { await lifetime.drain(); const owner = state; state = undefined; await release(owner); operations.clear(); commands.clear(); };
-	return { source, finishSession: () => lifetime.run(clear), dispose: () => lifetime.close(clear) };
+		session_closed: () => lifetime.run(clear),
+	}), dispose: () => lifetime.close(clear) };
 }

@@ -46,7 +46,7 @@ export const UNRESTRICTED_PROCESS_EFFECTS = effectRequirements(
 );
 
 export function effectRequirements(...capabilities: readonly EffectCapability[]): EffectRequirements {
-	return Object.freeze({ capabilities: Object.freeze(normalizeCapabilities(capabilities)) });
+	return Object.freeze({ capabilities: Object.freeze([...new Set(capabilities)].sort()) });
 }
 
 export function effectCapabilitiesCover(
@@ -60,8 +60,4 @@ export function effectCapabilitiesCover(
 
 export function normalizeEffectRequirements(requirements: EffectRequirements): EffectRequirements {
 	return effectRequirements(...requirements.capabilities);
-}
-
-function normalizeCapabilities(capabilities: readonly EffectCapability[]): EffectCapability[] {
-	return [...new Set(capabilities)].sort();
 }

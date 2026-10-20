@@ -73,9 +73,13 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["", "-nested", "-sta
 	const served: [string, boolean][] = [], prepare = operationPreparation.createExecutionPreparation;
 	vi.spyOn(operationPreparation, "createExecutionPreparation").mockImplementation((...args) => {
 		const owner = prepare(...args);
-		return { ...owner, source: { ...owner.source, onSettled: feedback => {
-			if (adoptions(feedback.settlement).length) served.push([feedback.settlement.prediction.id, feedback.served === true]); return owner.source.onSettled?.(feedback);
-		} } };
+		return { ...owner, connect: runtime => {
+			const disconnect = owner.connect(runtime), unsubscribe = runtime.subscribe({ prediction_feedback: feedback => {
+				if (feedback.settlement.prediction.source === owner.source.id && adoptions(feedback.settlement).length)
+					served.push([feedback.settlement.prediction.id, feedback.served]);
+			} });
+			return () => { disconnect(); unsubscribe(); };
+		} };
 	});
 
 	const extension = createSpeculativeActionExtension({ createHost: (id, options) => createSpeculativeActionHost(id, {
@@ -108,8 +112,9 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["", "-nested", "-sta
 	await session.bindExtensions({ mode: "print", onError: error => { throw error; } });
 	if (native) {
 		let backend: LinuxProcessReuseBackend | undefined;
-		const processOwner = LinuxProcessReuseBackend.prototype.processOwner;
-		vi.spyOn(LinuxProcessReuseBackend.prototype, "processOwner").mockImplementation(function (this: LinuxProcessReuseBackend) {
+		const ownerPrototype = LinuxProcessReuseBackend.prototype as unknown as { processOwner(): SynchronousProcessObserver };
+		const processOwner = ownerPrototype.processOwner;
+		vi.spyOn(ownerPrototype, "processOwner").mockImplementation(function (this: LinuxProcessReuseBackend) {
 			inspection ??= inspectProcessOwner(() => processOwner.call(this)); return processOwner.call(this);
 		});
 		let inputBinding: ProcessExecutionBinding | undefined;
@@ -119,7 +124,7 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["", "-nested", "-sta
 				const attachment = attach.call(this, request);
 				return { ...attachment, finish: () => { const result = attachment.finish();
 					if (result.adoptions.length) { expect(result.metrics.hits).toBe(1); expect(Atomics.load(new Int32Array(request.claims), 0)).toBeGreaterThan(0);
-						void Reflect.get(this, "worker").terminate(); throw new Error("lost acknowledged synchronous handoff"); }
+						void Reflect.get(this, "connection").worker.terminate(); throw new Error("lost acknowledged synchronous handoff"); }
 					return result;
 				} };
 			});
@@ -173,7 +178,7 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["", "-nested", "-sta
 		expect(calls).toEqual(["seed", "check"]); expect(prepared).toEqual([initial, remaining]);
 		if (inputs) expect(summarizeSpeculativeTrace(events).inputReuseHits).toBe(1);
 		const settled = events.filter(event => event.type === "actor_action").at(-1)!, timing = settled.computation!;
-		expect(backend!.actorMetrics().hits).toBe(Number(reused)); expect(timing.hiddenComputeMs > 0).toBe(reused);
+		expect(backend!.actorMetrics().hits).toBe(Number(reused)); expect(timing.hiddenComputeMs > 0, JSON.stringify({ timing, reuse: backend!.actorMetrics() })).toBe(reused);
 		expect((timing.hiddenByMode ?? []).reduce((total, part) => total + part.hiddenComputeMs, 0)).toBeCloseTo(timing.hiddenComputeMs, 5);
 		const predictions = events.filter(event => event.type === "operation_prediction"), adopted = predictions.flatMap(event => adoptions(event.settlement));
 		if (preempted && reused) expect(events.some(event => event.type === "candidate" && event.state.status === "cancelled" && event.state.cause.code === "scheduler_preempted")).toBe(true);
@@ -228,7 +233,7 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["", "-nested", "-sta
 		["blocked", [fauxText("blocked-on-purpose")], true],
 	]);
 	expect(session.agent.prepareNextTurnWithContext).toBe(originalNext);
-	expect(events.filter(event => event.type === "actor_action")).toHaveLength(enabled ? 10 : 0);
+	expect(events.filter(event => event.type === "actor_action")).toHaveLength(10);
 	await session.reload(); modelRuntime.registerNativeProvider(actor.provider);
 	const entered = deferred(), scopes: (string | undefined)[] = [], otherActor = fauxProvider({ provider: "override", models: [{ id: "actor" }] });
 	const base: AgentTool = { ...read, execute: async function (id, _args, signal) {

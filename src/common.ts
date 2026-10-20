@@ -24,6 +24,7 @@ const { defaults: DRAFTER_DEFAULTS, parse: parseDrafterSettings } = settingsPars
 
 export const DEFAULTS = {
 	enabled: false,
+	reuseEnabled: true,
 	drafterEnabled: true,
 	prepareObservedOperations: true,
 	...DRAFTER_DEFAULTS,

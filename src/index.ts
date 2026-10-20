@@ -16,4 +16,6 @@ export { LinuxProcessReuseBackend, type LinuxProcessBackendOptions, type LinuxPr
 export { adaptProcessToolOperations, ProcessExecutionCoordinator, type ProcessExecutionRequest, type ProcessExecutionResult, type ProcessExecutor, type ProcessToolOperations } from "./process-execution.ts";
 export { WorkspaceSandboxService, type WorkspaceSandboxOptions } from "./workspace-sandbox.ts";
 export { type PiToolInvocationOptions, resolvePiToolInvocation } from "./pi-tool-invocation.ts";
-export { EXACT_TOOL_OBSERVATION, type ToolObservationContract, type ToolFilesystemOperations, type ToolInvocation, type ToolProcessInvocation, type ToolSettlement } from "./tool-settlement.ts";
+export { EXACT_TOOL_OBSERVATION, type ToolObservationContract, type ToolInvocation, type ToolProcessInvocation, type ToolSettlement } from "./tool-settlement.ts";
+export type { ToolFilesystemOperations } from "./resource-version.ts";
+export type { AgentRuntime, AgentRuntimeEvents } from "./agent-runtime-types.ts";

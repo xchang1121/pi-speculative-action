@@ -1,7 +1,8 @@
-import { nonNegativeCount as sequence, nonNegativeFinite as finiteMetric } from "./number-utils.ts";
+import { isFiniteNumber, isSafeCount, nonNegativeCount as sequence, nonNegativeFinite as finiteMetric } from "./number-utils.ts";
 import { isDeepStrictEqual } from "node:util";
 import { immutableSnapshot, isImmutableSnapshot } from "./stable-json.ts";
 import { RESOURCE_DIMENSIONS } from "./system-resources.ts";
+import { dependencyOrder } from "./dependency-order.ts";
 import type { ActionKey, ActionKeyMatch } from "./action-semantics.ts";
 import type { CandidateExecution } from "./candidate-execution.ts";
 import type { MaterializedPlan, PlanAction, PlanActionDependency, PlanUpdate } from "./plan-proposal.ts";
@@ -155,8 +156,8 @@ export class PlanRuntime {
 		if (captured && multiStep) return { update };
 		update = { ...update };
 		const id = "actions" in update ? update.id : update.proposalID;
-		if (!validIdentity(id, update.source)) return { accepted: false, reason: "invalid_identity" };
-		if (!validRevision(update.revision)) return { accepted: false, reason: "invalid_revision" };
+		if (!(validToken(id) && validToken(update.source))) return { accepted: false, reason: "invalid_identity" };
+		if (!isSafeCount(update.revision)) return { accepted: false, reason: "invalid_revision" };
 		const remove = "actions" in update ? [] : [...(update.remove ?? [])];
 		const offered = "actions" in update
 			? multiStep ? update.actions : update.actions.filter((action) => finiteMetric(action.horizon) === 0 && (action.dependsOn?.length ?? 0) === 0)
@@ -194,7 +195,8 @@ export class PlanRuntime {
 				actions.set(action.id, replacement ?? action); retained.add(action.id);
 			}
 		}
-		const ordered = dependencyOrder(actions, (dependency) => dependency.proposalID !== id && this.parent(id, dependency) !== undefined);
+		const ordered = dependencyOrder(actions.values(), action => (action.dependsOn ?? []).flatMap(dependency =>
+			dependency.proposalID ? dependency.proposalID !== id && this.parent(id, dependency) ? [] : [undefined] : [actions.get(dependency.actionID)]));
 		if (!ordered) return { accepted: false, reason: "invalid_dependency" };
 		return this.commit({ id, source: owned.source, revision: owned.revision, actions, upserted, ordered, anchorDecisionSeq });
 	}
@@ -214,19 +216,19 @@ export class PlanRuntime {
 	}
 
 	promote(proposalID: string, actionID: string): PlanRuntimePromotion {
-		const value = this.mutable(proposalID, actionID);
-		if (!value) return { status: "missing" };
-		const snapshot = this.snapshot(value.plan, value.node);
+		const node = this.mutable(proposalID, actionID);
+		if (!node) return { status: "missing" };
+		const snapshot = this.snapshot(node);
 		if (snapshot.readiness === "settled") return { status: "settled" };
 		if (snapshot.readiness === "blocked") return { status: "blocked" };
-		if (value.node.execution.status !== "deferred") return { status: "already_dispatched" };
+		if (node.execution.status !== "deferred") return { status: "already_dispatched" };
 		if (snapshot.readiness === "waiting") return { status: "waiting" };
-		value.node.execution = { status: "scheduled" };
-		return { status: "scheduled", node: this.snapshot(value.plan, value.node) };
+		node.execution = { status: "scheduled" };
+		return { status: "scheduled", node: this.snapshot(node) };
 	}
 
 	defer(proposalID: string, actionID: string): boolean {
-		const node = this.mutable(proposalID, actionID)?.node;
+		const node = this.mutable(proposalID, actionID);
 		if (node?.execution.status !== "scheduled") return false;
 		node.execution = { status: "deferred" };
 		return true;
@@ -248,7 +250,7 @@ export class PlanRuntime {
 	}
 
 	bindActionKey(identity: PlanActionIdentity, actionKey: ActionKey): boolean {
-		const node = this.mutable(identity.proposalID, identity.actionID)?.node;
+		const node = this.mutable(identity.proposalID, identity.actionID);
 		if (node?.identity.id !== identity.id || node.actionKey || node.execution.status !== "deferred" || node.opportunity.state.status === "settled") return false;
 		node.actionKey = actionKey;
 		node.execution = { status: "preparing" };
@@ -256,14 +258,14 @@ export class PlanRuntime {
 	}
 
 	finishPreparation(identity: PlanActionIdentity, blocked?: ResolutionCause): boolean {
-		const node = this.mutable(identity.proposalID, identity.actionID)?.node;
+		const node = this.mutable(identity.proposalID, identity.actionID);
 		if (node?.identity.id !== identity.id || node.execution.status !== "preparing" || node.opportunity.state.status === "settled") return false;
 		node.execution = blocked ? { status: "execution_blocked", cause: Object.freeze({ ...blocked }) } : { status: "deferred" };
 		return true;
 	}
 
 	attachExecution(proposalID: string, actionID: string, candidateID: string, owner: PlanExecutionOwner): boolean {
-		const node = this.mutable(proposalID, actionID)?.node;
+		const node = this.mutable(proposalID, actionID);
 		if (!node || (node.execution.status !== "deferred" && node.execution.status !== "scheduled")) return false;
 		const attachment = { status: "attached" as const, candidateID, owner };
 		node.execution = attachment;
@@ -273,16 +275,16 @@ export class PlanRuntime {
 
 	/** Preparation and dependency rejection own no physical execution or candidate ID. */
 	rejectExecution(identity: PlanActionIdentity, failure: ResolutionCause): boolean {
-		const node = this.mutable(identity.proposalID, identity.actionID)?.node;
+		const node = this.mutable(identity.proposalID, identity.actionID);
 		if (node?.identity.id !== identity.id || !["deferred", "preparing", "scheduled"].includes(node.execution.status)) return false;
 		node.execution = Object.freeze({ status: "failed", cause: Object.freeze({ ...failure }) });
 		return true;
 	}
 
 	claimMatch(node: PlanRuntimeNode, actorAction: ActorActionIdentity, relation: ActionKeyMatch): ClaimedPrediction | undefined {
-		const value = this.mutable(node.proposalID, node.action.id);
-		if (value?.node.identity.id !== node.identity.id || !this.isMatchable(value.plan, value.node, actorDecisionSequence(actorAction))) return undefined;
-		const opportunity = value.node.opportunity;
+		const current = this.mutable(node.proposalID, node.action.id);
+		if (current?.identity.id !== node.identity.id || !this.isMatchable(current, actorDecisionSequence(actorAction))) return undefined;
+		const opportunity = current.opportunity;
 		return opportunity.claim(actorAction, relation) ? { node, opportunity } : undefined;
 	}
 
@@ -293,23 +295,22 @@ export class PlanRuntime {
 	): PredictionSettlement | undefined {
 		const finalized = opportunity.confirm(actorAction, adoption);
 		if (!finalized) return undefined;
-		const current = this.mutable(opportunity.identity.proposalID, opportunity.identity.actionID);
-		if (current?.node.opportunity === opportunity) this.recompute(current.plan.graph);
+		const plan = this.plans.get(opportunity.identity.proposalID);
+		if (plan?.nodes.get(opportunity.identity.actionID)?.opportunity === opportunity) this.recompute(plan.graph);
 		return finalized;
 	}
 
 	miss(proposalID: string, actionID: string, actorAction: ActorActionIdentity): PredictionSettlement | undefined {
-		const value = this.mutable(proposalID, actionID);
-		return value?.node.opportunity.miss(actorAction);
+		return this.mutable(proposalID, actionID)?.opportunity.miss(actorAction);
 	}
 
 	get(proposalID: string, actionID: string): PlanRuntimeNode | undefined {
-		const value = this.mutable(proposalID, actionID);
-		return value ? this.snapshot(value.plan, value.node) : undefined;
+		const node = this.mutable(proposalID, actionID);
+		return node ? this.snapshot(node) : undefined;
 	}
 
 	observe(identity: PlanActionIdentity, observation: string): void {
-		const node = this.mutable(identity.proposalID, identity.actionID)?.node;
+		const node = this.mutable(identity.proposalID, identity.actionID);
 		if (node?.identity.id === identity.id) node.observation = observation;
 	}
 
@@ -319,16 +320,14 @@ export class PlanRuntime {
 	}
 
 	opportunity(proposalID: string, actionID: string): PredictionOpportunity | undefined {
-		return this.mutable(proposalID, actionID)?.node.opportunity;
+		return this.mutable(proposalID, actionID)?.opportunity;
 	}
-
-	values(): readonly PlanRuntimeNode[] { return this.select(); }
 
 	pending(): readonly PlanRuntimeNode[] { return this.select((node) => node.opportunity.state.status === "pending"); }
 
 	matchable(decisionSequence: number): readonly PlanRuntimeNode[] {
 		const sequence = Math.max(0, Math.floor(decisionSequence));
-		return this.select((node, plan) => this.isMatchable(plan, node, sequence));
+		return this.select((node) => this.isMatchable(node, sequence));
 	}
 
 	unsettled(): readonly PlanRuntimeNode[] { return this.select((node) => node.opportunity.state.status !== "settled"); }
@@ -366,7 +365,7 @@ export class PlanRuntime {
 		const removed = current ? [...current.nodes.keys()].filter((id) => !input.actions.has(id)) : [];
 		const retiredIDs = new Set([...removed, ...replaced]);
 		const retired: PlanRuntimeNode[] = [];
-		if (current) { for (const id of retiredIDs) { const node = current.nodes.get(id); if (node) retired.push(this.snapshot(current, node)); } }
+		if (current) { for (const id of retiredIDs) { const node = current.nodes.get(id); if (node) retired.push(this.snapshot(node)); } }
 
 		const anchor = sequence(input.anchorDecisionSeq);
 		const nodes = new Map<string, MutableNode>();
@@ -398,19 +397,9 @@ export class PlanRuntime {
 		this.plans.set(next.id, next);
 		graph.plans.add(next);
 		for (const plan of graph.plans) plan.graph = graph;
-		const visited = new Set<MutableNode>(), ordered: MutableNode[] = [];
-		const visit = (node: MutableNode): void => {
-			if (visited.has(node)) return;
-			visited.add(node);
-			for (const dependency of node.action.dependsOn ?? []) {
-				const parent = this.parent(node.identity.proposalID, dependency);
-				if (parent) visit(parent);
-			}
-			ordered.push(node);
-		};
 		// Only plans sharing dependency ancestry need a common order and settlement pass.
-		for (const plan of graph.plans) for (const node of plan.nodes.values()) visit(node);
-		graph.ordered = ordered;
+		graph.ordered = dependencyOrder([...graph.plans].flatMap(plan => [...plan.nodes.values()]), node =>
+			(node.action.dependsOn ?? []).flatMap(dependency => this.parent(node.identity.proposalID, dependency) ?? []))!;
 		this.recompute(graph);
 		return {
 			accepted: true,
@@ -421,32 +410,30 @@ export class PlanRuntime {
 		};
 	}
 
-	private mutable(proposalID: string, actionID: string): { readonly plan: MutablePlan; readonly node: MutableNode } | undefined {
-		const plan = this.plans.get(proposalID);
-		const node = plan?.nodes.get(actionID);
-		return plan && node ? { plan, node } : undefined;
+	private mutable(proposalID: string, actionID: string): MutableNode | undefined {
+		return this.plans.get(proposalID)?.nodes.get(actionID);
 	}
 
 	private parent(proposalID: string, dependency: PlanActionDependency): MutableNode | undefined {
-		const node = this.mutable(dependency.proposalID ?? proposalID, dependency.actionID)?.node;
+		const node = this.mutable(dependency.proposalID ?? proposalID, dependency.actionID);
 		return !dependency.proposalID || node?.identity.id === dependency.identity ? node : undefined;
 	}
 
 	private select(
-		include: (node: MutableNode, plan: MutablePlan) => boolean = () => true,
+		include: (node: MutableNode) => boolean = () => true,
 		readiness?: PlanNodeReadiness,
 	): readonly PlanRuntimeNode[] {
 		const selected: PlanRuntimeNode[] = [];
 		for (const plan of this.plans.values()) for (const node of plan.nodes.values()) {
-			if (!include(node, plan)) continue;
-			const current = this.snapshot(plan, node);
+			if (!include(node)) continue;
+			const current = this.snapshot(node);
 			if (!readiness || current.readiness === readiness) selected.push(current);
 		}
 		return selected;
 	}
 
-	private snapshot(plan: MutablePlan, node: MutableNode): PlanRuntimeNode {
-		const dependencies = this.dependencyReadiness(plan, node);
+	private snapshot(node: MutableNode): PlanRuntimeNode {
+		const plan = this.plans.get(node.identity.proposalID)!, dependencies = this.dependencyReadiness(node);
 		const { opportunity, execution, observation: _observation, validDependencies: _validDependencies, ...fields } = node;
 		return Object.freeze({
 			...fields,
@@ -462,28 +449,28 @@ export class PlanRuntime {
 		});
 	}
 
-	private dependencyReadiness(plan: MutablePlan, node: MutableNode, matching = false): "ready" | "waiting" | "blocked" {
-		const pending = [{ plan, node }], visited = new Set<MutableNode>();
+	private dependencyReadiness(node: MutableNode, matching = false): "ready" | "waiting" | "blocked" {
+		const pending = [node], visited = new Set<MutableNode>();
 		let readiness: "ready" | "waiting" = "ready";
 		while (pending.length) {
 			const current = pending.pop()!;
-			if (visited.has(current.node)) continue;
-			visited.add(current.node);
-			if (!current.node.validDependencies) return "blocked";
-			for (const dependency of current.node.action.dependsOn ?? []) {
+			if (visited.has(current)) continue;
+			visited.add(current);
+			if (!current.validDependencies) return "blocked";
+			for (const dependency of current.action.dependsOn ?? []) {
 				if (dependency.condition === "resource") continue;
-				const parent = this.parent(current.plan.id, dependency);
-				const state = parent ? dependencyReadiness(parent, dependency, matching && current.node === node) : "blocked";
+				const parent = this.parent(current.identity.proposalID, dependency);
+				const state = parent ? dependencyReadiness(parent, dependency, matching && current === node) : "blocked";
 				if (state === "blocked") return state;
-				if (state === "waiting" && current.node === node) readiness = state;
-				pending.push({ plan: this.plans.get(parent!.identity.proposalID)!, node: parent! });
+				if (state === "waiting" && current === node) readiness = state;
+				pending.push(parent!);
 			}
 		}
 		return readiness;
 	}
 
-	private isMatchable(plan: MutablePlan, node: MutableNode, decisionSequence: number): boolean {
-		return (node.opportunity.state.status === "pending" && node.earliestDecisionSeq <= decisionSequence && this.dependencyReadiness(plan, node, true) === "ready");
+	private isMatchable(node: MutableNode, decisionSequence: number): boolean {
+		return (node.opportunity.state.status === "pending" && node.earliestDecisionSeq <= decisionSequence && this.dependencyReadiness(node, true) === "ready");
 	}
 
 	private recompute(graph: PlanGraph): void {
@@ -520,7 +507,7 @@ export class PlanRuntime {
 function newNode(proposalID: string, source: string, revision: number, action: PlanAction, anchorDecisionSeq: number): MutableNode {
 	const identity: PlanActionIdentity = Object.freeze({
 		...(action.type === "operation" ? { kind: "operation" as const } : {}),
-		id: planNodeID(source, proposalID, action.id, revision),
+		id: JSON.stringify([source, proposalID, action.id, revision]),
 		source,
 		proposalID,
 		actionID: action.id,
@@ -618,7 +605,7 @@ function validateActions(actions: readonly PlanAction[]):
 			if (source.resourceDemand && typeof source.resourceDemand === "object") {
 				const entries = Object.entries(source.resourceDemand);
 				if (entries.some(([key, value]) => !RESOURCE_DIMENSIONS.includes(key as typeof RESOURCE_DIMENSIONS[number]) ||
-					typeof value !== "number" || !Number.isFinite(value) || value < 0)) return { ok: false, reason: "invalid_action" };
+					!isFiniteNumber(value) || value < 0)) return { ok: false, reason: "invalid_action" };
 				source.resourceDemand = Object.freeze(Object.fromEntries(entries));
 			}
 			source.input = immutableSnapshot(source.input);
@@ -629,24 +616,6 @@ function validateActions(actions: readonly PlanAction[]):
 		return { ok: false, reason: "invalid_action" };
 	}
 	return { ok: true, actions: Object.freeze(result) };
-}
-
-function dependencyOrder(actions: ReadonlyMap<string, PlanAction>, external: (dependency: PlanActionDependency) => boolean): readonly PlanAction[] | undefined {
-	const visiting = new Set<string>();
-	const ordered = new Map<string, PlanAction>();
-	const visit = (actionID: string): boolean => {
-		if (ordered.has(actionID)) return true;
-		const action = actions.get(actionID);
-		if (!action || visiting.has(actionID)) return false;
-		visiting.add(actionID);
-		for (const dependency of action.dependsOn ?? []) {
-			if (!(dependency.proposalID ? external(dependency) : visit(dependency.actionID))) return false;
-		}
-		visiting.delete(actionID);
-		ordered.set(actionID, action);
-		return true;
-	};
-	return [...actions.keys()].every(visit) ? [...ordered.values()] : undefined;
 }
 
 function samePlanActionExecution(left: PlanAction, right: PlanAction): boolean {
@@ -663,18 +632,10 @@ function samePlanActionExecution(left: PlanAction, right: PlanAction): boolean {
 	return counts.size === 0;
 }
 
-function planNodeID(source: string, proposalID: string, actionID: string, revision: number): string {
-	return JSON.stringify([source, proposalID, actionID, revision]);
-}
-
 function horizon(action: PlanAction): number { return sequence(action.horizon ?? 0); }
 
 function latestHorizon(action: PlanAction): number { return Math.max(horizon(action), sequence(action.latestHorizon ?? action.horizon ?? 0)); }
 
 function actorDecisionSequence(action: ActorActionIdentity): number { return sequence(action.decisionSequence ?? action.sequence); }
 
-function validIdentity(proposalID: string, source: string): boolean { return validToken(proposalID) && validToken(source); }
-
 function validToken(value: string): boolean { return typeof value === "string" && value.length > 0 && value.trim() === value; }
-
-function validRevision(value: number): boolean { return Number.isSafeInteger(value) && value >= 0; }

@@ -33,18 +33,3 @@ export function resolveActionProjectionRules<Output>(
 	}
 	return [...unique.values()];
 }
-
-/** In-memory-only metadata; symbol keys never leak into persisted tool-result details. */
-export const READ_RANGE_COVERAGE_DETAILS_KEY: unique symbol = Symbol("pi.speculative.readRange");
-
-/** Compact descriptor for the text prefix already present in Pi's read output. */
-export interface ReadRangeCoverage {
-	readonly kind: "text";
-	readonly startLine: number;
-	readonly endLineExclusive: number;
-	readonly totalLines: number;
-	/** UTF-16 length of the file payload before any continuation notice. */
-	readonly payloadTextLength: number;
-	readonly maxLines: number;
-	readonly maxBytes: number;
-}

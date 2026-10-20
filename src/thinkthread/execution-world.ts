@@ -1,3 +1,4 @@
+import { isSafeCount } from "../number-utils.ts";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { access, lstat, readFile } from "node:fs/promises";
@@ -83,27 +84,20 @@ export function createThinkThreadExecutionWorld(
 
 	const prepare = async (cwd: string): Promise<PreparedWorld> => {
 		lifetime.signal.throwIfAborted();
-		if (!prepared) {
-			const attempt = prepareWorld(cwd, options.clientFactory).catch((error) => {
-				if (prepared === attempt) prepared = undefined;
-				throw error;
-			});
-			prepared = attempt;
-		}
-		return prepared;
+		return prepared ??= prepareWorld(cwd, options.clientFactory).catch((error) => {
+			prepared = undefined;
+			throw error;
+		});
 	};
 	const fingerprint = async (request?: ExecutionWorldRequest): Promise<string> => {
 		if (request?.action) toolName(request.action.tool);
 		const settings = runnerSettings(request?.action, autoResizeImages);
-		if (!runnerFingerprint) {
-			const attempt = (options.runnerFingerprint
-				? Promise.resolve(options.runnerFingerprint)
-				: hashFile(runnerPath)).catch((error) => {
-				if (runnerFingerprint === attempt) runnerFingerprint = undefined;
-				throw error;
-			});
-			runnerFingerprint = attempt;
-		}
+		runnerFingerprint ??= (options.runnerFingerprint
+			? Promise.resolve(options.runnerFingerprint)
+			: hashFile(runnerPath)).catch((error) => {
+			runnerFingerprint = undefined;
+			throw error;
+		});
 		return (await Promise.all([
 			"thinkthread-fs", snapshotInputs ? "sealed-inputs" : "runner",
 			import("@thinkthread/agent-posix").then((sdk) => sdk.CONTRACT_FINGERPRINT),
@@ -239,7 +233,6 @@ async function forkThinkThreadWorld(
 		if (run.targetSnapshotId) {
 			target = world.pool.ownSnapshot({
 				snapshotId: run.targetSnapshotId,
-				logicalBytes: Math.max(0, run.changedBytes ?? 0),
 			});
 		}
 		context.signal.throwIfAborted();
@@ -379,7 +372,7 @@ async function captureSnapshotInputs(world: PreparedWorld, context: SpeculativeT
 			const name = slash(relative) || ".", entry = await world.client.fs.snapshotStat({ snapshotId, path: name });
 			if (!("kind" in entry)) return undefined;
 			if (entry.kind === "file" && dependencies.some(dependency => dependency.path === name && dependency.scope === "content")) {
-				if (typeof world.client.fs.snapshotPread !== "function" || !Number.isSafeInteger(entry.len) || entry.len < 0 ||
+				if (typeof world.client.fs.snapshotPread !== "function" || !isSafeCount(entry.len) ||
 					(totalBytes += entry.len + 2 * Buffer.byteLength(target) + 64) > MAX_INPUT_BYTES) return undefined;
 				files.set(target, { kind: "file", path: name, bytes: entry.len });
 			} else if (entry.kind === "directory" && dependencies.some(dependency => dependency.path === name && dependency.scope === "entries")) {
@@ -389,7 +382,7 @@ async function captureSnapshotInputs(world: PreparedWorld, context: SpeculativeT
 				do {
 					context.signal.throwIfAborted();
 					const page = await world.client.fs.snapshotReaddir({ snapshotId, path: name, limit: DIFF_PAGE_LIMIT, ...(cursor ? { cursor } : {}) });
-					if (!Number.isSafeInteger(page.totalEntries) || page.totalEntries < 0 || total !== undefined && total !== page.totalEntries) return undefined;
+					if (!isSafeCount(page.totalEntries) || total !== undefined && total !== page.totalEntries) return undefined;
 					total = page.totalEntries;
 					for (const child of page.entries) {
 						const childPath = child.path.utf8, raw = Buffer.from(child.path.bytesBase64, "base64");

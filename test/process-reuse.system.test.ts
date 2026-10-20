@@ -3,13 +3,16 @@ import * as filesystem from "node:fs/promises";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, expect, test, vi } from "vitest";
-import { ArtifactCAS, captureFileDependency, ProcessReusePlanner, ProvenanceCertificateStore, referencedArtifacts, sealProcessCertificate, sha256Digest,
-	type ProcessProvenanceCertificate, type VerifiedArtifactClosure } from "../src/process-reuse.ts";
+import {
+	ArtifactCAS, captureFileDependency, createExecPrototype, processWeakKey, ProcessReusePlanner, ProvenanceCertificateStore, referencedArtifacts,
+	sealProcessCertificate, sha256Digest, type ProcessProvenanceCertificate, type VerifiedArtifactClosure,
+} from "../src/process-reuse.ts";
 import { ProcessHandoffOwnership, ProcessHandoffRegistry } from "../src/process-handoff.ts";
 import { effectCommitFailure } from "../src/effect-transaction.ts";
-import { CapturedFilesystemObject, captureStableFile } from "../src/filesystem-evidence.ts";
+import { CapturedFilesystemObject, cachedCapture, captureFileDigest, captureStableFile, hashExecutableFile } from "../src/filesystem-evidence.ts";
 import { ResourceObjectInputs } from "../src/agent-execution-world.ts";
-import { waitForCompletion } from "../src/scheduler.ts";
+import { waitForCompletion } from "../src/runtime-lifecycle.ts";
+import { observeStrace, traceTail, writesWithin } from "../src/strace-observer.ts";
 import { TaskTimeline, TimelineInterval } from "../src/task-timing.ts";
 import { legacyCertificate, PROCESS_CERTIFICATE, storeMetadata, storePeer } from "./process-fixture.ts";
 import { temporaryDirectories } from "./filesystem.ts";
@@ -28,7 +31,134 @@ const hold = () => { const pause = gated(); cleanup.push(pause.release); return 
 const track = <T>(pending: Promise<T>): Promise<T> => { const settled = pending.catch(() => undefined); cleanup.push(() => settled); return pending; };
 const peer = (...args: Parameters<typeof storePeer>) => { const owner = storePeer(...args); cleanup.push(() => { owner.child.kill(); return owner.completed.catch(() => undefined); }); return owner; };
 
-test.skipIf(process.platform !== "linux").each(["fresh", "changed-before", "changed-after", "revoked", "budget"])("keeps input loans owned through transfer and exact invalidation (%s)", async mode => {
+async function processTrace(content: string, suffix = "101") {
+	const prefix = path.join(await directories.create(), "process"), trace = `${prefix}.${suffix}`, tail = traceTail(prefix, "/work");
+	await writeFile(trace, content);
+	return { prefix, trace, tail, append: async (content: string) => { await filesystem.appendFile(trace, content); return tail.read(); } };
+}
+
+test("distinguishes adding a sibling from removing and restoring a pathname binding", async () => {
+	const { tail, append } = await processTrace('1.000000 openat(AT_FDCWD, "input", O_RDONLY) = 3</work/input>\n1.000001 openat(AT_FDCWD, "output", O_WRONLY|O_CREAT, 0600) = 4</work/output>\n');
+	expect((await tail.read()).unsafe).toBe(false);
+	expect(writesWithin(tail.writes, new Set(["/work/input"]), 0, 2000)).toBe(false);
+	expect(writesWithin(tail.writes, new Set(["/work/output"]), 0, 2000)).toBe(true);
+	expect((await append('1.000002 rename("/work", "/held") = -1 EACCES (Permission denied)\n')).unsafe).toBe(false);
+	await append('1.000003 rename("/work", "/held") = 0\n1.000004 rename("/held", "/work") = 0\n');
+	expect(writesWithin(tail.writes, new Set(["/work"]), 0, 2000)).toBe(true);
+	expect((await tail.read()).writes).toHaveLength(3);
+});
+
+test.each(["partial", "unparsed", "unstamped", "read-error", "short-read", "truncated"])("keeps incomplete namespace evidence unsafe after retry (%s)", async mode => {
+	const { trace, tail, append } = await processTrace(mode === "partial" ? '1.000000 rename("/work"' : mode === "unparsed" ? "1.000000 ???\n" : mode === "unstamped" ? "???\n" : "1.000000 +++ exited with 0 +++\n");
+	if (mode === "read-error") {
+		vi.spyOn(filesystem, "open").mockRejectedValueOnce(new Error("trace unavailable"));
+		await expect(tail.read()).rejects.toThrow("trace unavailable");
+	} else if (mode === "short-read") {
+		const handle = await filesystem.open(trace, "r");
+		vi.spyOn(handle, "read").mockResolvedValueOnce({ bytesRead: 0, buffer: Buffer.alloc(0) } as never);
+		vi.spyOn(filesystem, "open").mockResolvedValueOnce(handle);
+		await expect(tail.read()).rejects.toThrow("trace changed while reading");
+	} else if (mode === "truncated") {
+		await tail.read(); await writeFile(trace, "");
+		await expect(tail.read()).rejects.toThrow("trace shrank");
+	} else expect((await tail.read()).unsafe).toBe(true);
+	expect((await append(mode === "partial" ? ', "/held") = 0\n' : "1.000001 +++ exited with 0 +++\n")).unsafe).toBe(true);
+});
+
+test.each([
+	["write", '3</work/input>, "new", 3', "3"], ["writev", '3</work/input>, [{iov_base="new", iov_len=3}], 1', "3"],
+	["pwrite64", '3</work/input>, "new", 3, 0', "3"], ["pwritev", '3</work/input>, [{iov_base="new", iov_len=3}], 1, 0', "3"],
+	["pwritev2", '3</work/input>, [{iov_base="new", iov_len=3}], 1, 0, 0', "3"], ["ftruncate", "3</work/input>, 3", "0"],
+	["fchmod", "3</work/input>, 0600", "0"], ["fchown", "3</work/input>, 1000, 1000", "0"], ["fallocate", "3</work/input>, 0, 0, 4096", "0"],
+	["sendfile", "3</work/input>, 4</work/source>, NULL, 3", "3"], ["copy_file_range", "4</work/source>, NULL, 3</work/input>, NULL, 3, 0", "3"],
+	["splice", "4<pipe:[17]>, NULL, 3</work/input>, NULL, 3, 0", "3"],
+	["mmap", "NULL, 4096, PROT_READ|PROT_WRITE, MAP_SHARED, 3</work/input>, 0", "0x7f000000"],
+	["mmap", "NULL, 4096, PROT_READ, MAP_SHARED, 3</work/input>, 0", "0x7f000000"],
+])("tracks writes through an already open file description (%s, %s)", async (call, args, result) => {
+	const { tail } = await processTrace(`1.000000 ${call}(${args}) = ${result}\n`);
+	await tail.read(); expect(tail.unsafe).toBe(false);
+	expect(writesWithin(tail.writes, new Set(["/work/input"]), 0, 2000)).toBe(true);
+	expect(writesWithin(tail.writes, new Set(["/work/input"]), 1500, 2000)).toBe(call === "mmap");
+	expect(writesWithin(tail.writes, new Set(["/work/other"]), 0, 2000)).toBe(false);
+});
+
+test.each(["3", "3<pipe:[17]>", '3</work/input>'])("keeps unresolved descriptor writes conservative (%s)", async descriptor => {
+	const { tail } = await processTrace(`1.000000 write(${descriptor}, "new", 3) = 3\n`); await tail.read();
+	expect(writesWithin(tail.writes, new Set(["/work/input"]), 0, 2000)).toBe(descriptor !== "3<pipe:[17]>");
+	expect(writesWithin(tail.writes, new Set(["/unrelated"]), 0, 2000)).toBe(descriptor === "3");
+});
+
+test("keeps an empty process trace in execution root selection", async () => {
+	const { prefix } = await processTrace('1.000000 execve("/tools/worker", ["worker"], []) = 0\n1.000001 +++ exited with 0 +++\n');
+	await writeFile(`${prefix}.100`, "");
+	expect((await observeStrace(prefix, "/tools/worker", "/elsewhere")).incompleteReasons).toEqual(["trace_root_ambiguous:100,101"]);
+});
+
+test.each(["wait4", "waitid", "waitpid"].flatMap(call => ["partial", "resumed"].map(mode => ({ call, mode }))))("does not mistake a pending process wait for namespace mutation ($call, $mode)", async ({ call, mode }) => {
+	const begin = `101 1.000000 ${call}(${call === "waitid" ? "P_PID, " : ""}42, `, end = `NULL, ${call === "waitid" ? "WEXITED" : "0"}${call === "waitpid" ? "" : ", NULL"}) = ${call === "waitid" ? 0 : 42}\n`;
+	const { tail, append } = await processTrace(begin + (mode === "resumed" ? "<unfinished ...>\n102 1.000001 +++ exited with 0 +++\n" : ""), "stream");
+	expect((await tail.read()).unsafe).toBe(false);
+	expect((await append((mode === "resumed" ? `101 1.000002 <... ${call} resumed>` : "") + end)).unsafe).toBe(false);
+	expect(tail.writes).toEqual([]);
+	expect((await append('101 1.000003 rename("/work"')).unsafe).toBe(true);
+});
+
+test.each([
+	{ reason: "unmodeled_metadata:getdents64:101", calls: ["getdents64(3, [], 4096) = 0"] },
+	{ reason: "unparsed_metadata:stat:101", calls: ['stat("/work/input", {st_mode=S_IFREG|0644}) = 0'] },
+	{ reason: "metadata_changed:/work/input", calls: [1, 2].map(size => `statx(AT_FDCWD, "/work/input", AT_SYMLINK_NOFOLLOW, STATX_SIZE, {stx_mask=STATX_SIZE, stx_size=${size}}) = 0`) },
+])("derives trace completeness from every recorded rejection ($reason)", async ({ calls, reason }) => {
+	const { prefix } = await processTrace(['1.000000 execve("/tools/worker", ["worker"], []) = 0', ...calls.map((call, index) => `1.00000${index + 1} ${call}`), "1.000009 +++ exited with 0 +++\n"].join("\n"));
+	const observed = await observeStrace(prefix, "/tools/worker", "/work");
+	expect(observed.incompleteReasons).toContain(reason);
+	expect(observed.complete).toBe(false);
+	expect(observed.taints).toContain("trace_incomplete");
+});
+
+test.each(['3</tools>, "worker", ["worker"], [], 0', '3</tools/worker>, "", ["worker"], [], AT_EMPTY_PATH'])("selects execveat by its directory or descriptor binding (%s)", async args => {
+	const { prefix } = await processTrace(`1.000000 execveat(${args}) = 0\n1.000001 +++ exited with 0 +++\n`);
+	const observed = await observeStrace(prefix, "/tools/worker", "/elsewhere");
+	expect(observed.incompleteReasons).toEqual([]);
+	expect(observed.paths).toContainEqual({ path: "/tools/worker", role: "executable" });
+});
+
+test("tracks shared cwd and resumed writes across growing ordered trace chunks", async () => {
+	const { tail, append } = await processTrace('101 1.000000 clone(flags=CLONE_FS|SIGCHLD) = 102\n102 1.000001 chdir("/new") = 0\n101 1.000002 openat(AT_FDCWD, "output", O_WRONLY|O_CREAT, 0600) = 3</new/output>\n', "stream");
+	await tail.read();
+	expect(writesWithin(tail.writes, new Set(["/new/output"]), 0, 2000)).toBe(true);
+	await append('102 1.000003 renameat(AT_FDCWD, "/new", AT_FDCWD, "/held" <unfinished ...>\n');
+	await append('102 1.000004 <... renameat resumed>) = 0\n');
+	expect(writesWithin(tail.writes, new Set(["/held"]), 0, 2000)).toBe(true);
+	expect(tail.writes).toHaveLength(2);
+	expect(tail.unsafe).toBe(true);
+});
+
+test.each(["MODE", "SHLVL", "OLDPWD"])("includes %s in an arbitrary executable's identity", name => {
+	const keys = [undefined, "", "before", "after"].map(value => processWeakKey(createExecPrototype({
+		...PROCESS_CERTIFICATE.prototype, argv: ["tool"], environment: { [name]: value },
+	})));
+	expect(new Set(keys).size).toBe(4);
+});
+
+test("keeps file admission and change detection after a digest is cached", async () => {
+	const input = path.join(await directories.create(), "input"); await writeFile(input, "original");
+	await new Promise(resolve => setTimeout(resolve, 2100)); // Settle even a filesystem with coarse timestamps.
+	const bytes = await captureStableFile(input, 1024, true, { digest: false });
+	expect(bytes.content?.toString()).toBe("original"); expect(cachedCapture(bytes.stat, input)).toBeUndefined();
+	const captured = await captureStableFile(input, 1024);
+	expect(await captureFileDigest(input)).toMatchObject({ hash: captured.hash, shared: true });
+	if (process.platform === "linux") {
+		const alias = `${input}-alias`; await filesystem.symlink(input, alias);
+		await expect(captureFileDigest(alias)).rejects.toThrow("not_regular_file");
+		expect(await hashExecutableFile(alias)).toBe(`sha256:${captured.hash}`);
+	}
+	await writeFile(input, "modified");
+	expect((await captureFileDigest(input)).hash).toBe(sha256Digest("modified").slice("sha256:".length));
+	await expect(captureFileDigest(input, 7)).rejects.toThrow("file_too_large");
+	await expect(captureFileDigest(input, 1024, AbortSignal.abort(new Error("cancelled")))).rejects.toThrow("cancelled");
+});
+
+test.skipIf(process.platform !== "linux").each(["fresh", "changed-before", "changed-after", "revoked", "budget", "rejected"])("keeps input loans owned through transfer and exact invalidation (%s)", async mode => {
 	const input = path.join(await directories.create(), "input"); await writeFile(input, "original");
 	const captured = await captureStableFile(input, 1024, true, { retainObject: true }), source = own(captured.object!);
 	const loan = source.lend()!, transfer = structuredClone(loan.transfer); cleanup.push(loan.release);
@@ -40,8 +170,10 @@ test.skipIf(process.platform !== "linux").each(["fresh", "changed-before", "chan
 	if (mode === "revoked") { loan.release(); await closing; }
 	const received = own(ResourceObjectInputs.receive([transfer], mode === "budget" ? 0 : 4096));
 	if (mode === "changed-after") await writeFile(input, "modified");
-	const result = await received.inputs.borrow(input, await filesystem.stat(input, { bigint: true }), 1024);
+	const expected = await filesystem.stat(input, { bigint: true });
+	const { output: result, dependencies } = await TimelineInterval.collect(() => received.inputs.borrow(input, expected, 1024, () => mode !== "rejected"));
 	expect(result?.content?.toString()).toBe(mode === "fresh" ? "original" : undefined);
+	expect(dependencies.length > 0).toBe(mode === "fresh");
 	if (result) expect(TimelineInterval.serialize(result.computation!)?.root).toBe(TimelineInterval.serialize(captured.computation!)?.root);
 	loan.release(); await closing; expect(closed).toBe(true);
 	expect(CapturedFilesystemObject.receive(transfer)).toBeUndefined();

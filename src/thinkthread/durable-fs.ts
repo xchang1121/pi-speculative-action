@@ -91,10 +91,6 @@ export class DurableFsExecutor {
 		);
 	}
 
-	cleanupBacklog(): number {
-		return this.pendingCloses.size;
-	}
-
 	async drainCleanup(rounds = 3): Promise<number> {
 		for (let round = 0; round < rounds && this.pendingCloses.size > 0; round++) {
 			await Promise.all([...this.pendingCloses].map((requestID) => this.close(requestID)));

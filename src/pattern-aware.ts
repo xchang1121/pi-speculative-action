@@ -1,4 +1,4 @@
-import { clampProbability, finiteNumber, nonNegativeFinite } from "./number-utils.ts";
+import { clampProbability, finiteNumber, isFiniteNumber, isSafeCount, nonNegativeFinite } from "./number-utils.ts";
 import { hash as cryptoHash } from "node:crypto";
 import { writeJsonFile } from "./filesystem-evidence.ts";
 import fs from "node:fs/promises";
@@ -165,9 +165,8 @@ export type PatternAwareContinuation = {
 	readonly pathProbability: number;
 };
 
-export type PatternAwareRuntimeContext = { readonly store: PatternAwareStore; readonly continuation: PatternAwareContinuation; };
 
-export type PatternAwareObservation = { readonly output?: unknown; readonly outputPaths?: ReadonlyArray<string>; readonly outputLocations?: ReadonlyArray<OutputLocation> };
+export type PatternAwareObservation = Pick<PatternAwareEventInput, "output" | "outputPaths" | "outputLocations">;
 
 type MutablePattern = {
 	id: string;
@@ -208,7 +207,7 @@ type PersistedState = {
 	readonly sequenceCounts: ReadonlyArray<PpmCountTrieRow>;
 };
 
-type PatternSample = { readonly context: ReadonlyArray<PatternAwareEvent>; readonly target: PatternAwareEvent; readonly gap: number; };
+type PatternSample = { readonly context: ReadonlyArray<PatternAwareEvent>; readonly target: PatternAwareEvent; };
 
 type PatternPool = {
 	readonly key: string;
@@ -220,10 +219,8 @@ type PatternPool = {
 	patternIDs?: string[];
 };
 
-type TrieNode = { readonly children: Map<string, TrieNode>; readonly patterns: Set<MutablePattern>; };
-
 const { defaults: patternAwareDefaults, parse: parsePatternSettings } = settingsParser({
-	enabled: [true, booleanOr],
+	enabled: [true, booleanOr], // Prediction policy only; authoritative observations always train.
 	/** Built-in relations are selectable independently of the patterns learned from real calls. */
 	presets: [Object.freeze(PATTERN_AWARE_PRESETS.filter(preset => !preset.defaultOff).map(preset => preset.id)), presetSelection],
 	/** Admit future-gap/preparation candidates and expand completed predictions into a multi-step frontier. */
@@ -256,39 +253,6 @@ const PERSIST_CHECKPOINT_INTERVAL_MS = 30_000;
 /** Longer strings and lists are neither bindable nor worth their memory, persisted bytes and analysis caches. */
 const PATTERN_VALUE_MAX_CHARS = 4096, PATTERN_VALUE_MAX_ITEMS = 256;
 
-class PredictiveContextTrie {
-	private readonly root: TrieNode = { children: new Map(), patterns: new Set() };
-
-	insert(pattern: MutablePattern) {
-		let node = this.root;
-		for (let index = pattern.context.length - 1; index >= 0; index--) {
-			const token = trieToken(pattern.context[index]!);
-			const child = node.children.get(token) ?? { children: new Map(), patterns: new Set() };
-			node.children.set(token, child);
-			node = child;
-		}
-		node.patterns.add(pattern);
-	}
-
-	*matching(history: ReadonlyArray<PatternAwareEvent>, starts?: ReadonlySet<number>) {
-		let node = this.root;
-		for (let index = history.length - 1; index >= 0; index--) {
-			const token = trieToken(signature(history[index]!));
-			const child = node.children.get(token);
-			if (!child) break;
-			node = child;
-			if (!node.patterns.size || starts?.has(index) === false) continue;
-			const context = history.slice(index);
-			// Trie edges already match tool/outcome/operation; output shapes retain wildcard semantics.
-			const shapes = context.map((event) => signature(event).outputShape);
-			for (const pattern of node.patterns) {
-				if (pattern.context.every((expected, offset) => expected.outputShape === undefined ||
-					shapes[offset] === undefined || shapes[offset] === expected.outputShape)) yield { pattern, context };
-			}
-		}
-	}
-}
-
 export class PatternAwareStore {
 	private readonly patterns = new Map<string, MutablePattern>();
 	private readonly bindingAnalysis = new PatternBindingAnalysis();
@@ -299,11 +263,10 @@ export class PatternAwareStore {
 	private readonly observedActionKeys = new WeakMap<PatternAwareEvent, ActionKey | null>();
 	private readonly recurrentFeedback = new WeakMap<PatternRecurrentAction | PatternAwareContinuation, MutablePatternFeedback>();
 	private readonly structuralFeedback = new Map<PatternAwarePresetID, MutablePatternFeedback>();
-	private readonly resolvedActionKeys: BoundedRecencyMap<string, ActionKey | null>;
+	private readonly resolvedActionKeys: BoundedRecencyMap<string, ActionKey | undefined>;
 	private readonly patternSupportSessions = new Map<string, ReadonlySet<string>>();
-	private trie = new PredictiveContextTrie();
+	private contexts?: Map<string, MutablePattern[]>;
 	private sequenceModel: PpmCountTrie;
-	private indexDirty = true;
 	private clock = 0;
 	private write?: Promise<void>;
 	private dirty = false;
@@ -335,7 +298,7 @@ export class PatternAwareStore {
 		const portable = this.portableFile ? await readPatterns(this.portableFile) : [];
 		for (const pattern of portable) if (!this.patterns.has(pattern.id) && this.portable(pattern) && pattern.context.length <= this.settings.maxContextLength)
 			this.patterns.set(pattern.id, { ...pattern, lastSeenSequence: this.clock });
-		if (portable.length) { this.indexDirty = true; this.trimPatterns(); }
+		if (portable.length) { this.contexts = undefined; this.trimPatterns(); }
 	}
 
 	private async loadWorkspace() {
@@ -354,8 +317,9 @@ export class PatternAwareStore {
 			this.pools.set(pool.key, pool);
 			this.addControlOpportunities(pool, pool.samples, 1);
 			for (const patternID of pool.patternIDs ?? []) {
-				if (this.patterns.get(patternID)?.dependencies.length === 0) {
-					this.patternSupportSessions.set(patternID, new Set(pool.samples.map((sample) => sample.target.sessionID)));
+				const pattern = this.patterns.get(patternID);
+				if (pattern?.dependencies.length === 0) {
+					this.patternSupportSessions.set(patternID, new Set(this.supportingSamples(pattern.bindings, pool).map((sample) => sample.target.sessionID)));
 				}
 			}
 			for (const sample of pool.samples) {
@@ -364,13 +328,13 @@ export class PatternAwareStore {
 		}
 		this.sequenceModel.restore(parsed.sequenceCounts);
 		this.sequenceModel.trim(this.settings.maxPatterns);
-		this.indexDirty = true;
+		this.contexts = undefined;
 		this.trimPools();
 		this.trimPatterns();
 	}
 
 	observe(input: PatternAwareEventInput) {
-		if (this.settings.enabled) this.observeEvents(structuredClone([input]));
+		this.observeEvents(structuredClone([input]));
 	}
 
 	observeBatch(inputs: ReadonlyArray<PatternAwareEventInput>) {
@@ -379,7 +343,6 @@ export class PatternAwareStore {
 	}
 
 	private observeEvents(inputs: ReadonlyArray<PatternAwareEventInput>, batchID?: string) {
-		if (!this.settings.enabled) return;
 		const first = inputs[0];
 		if (!first) return;
 		const events = inputs.map((input, index): PatternAwareEvent => ({ ...boundedEventPayload(input), sequence: ++this.clock,
@@ -410,32 +373,13 @@ export class PatternAwareStore {
 	}
 
 	observeTurn() {
-		if (this.settings.enabled) this.clock++;
+		this.clock++;
 	}
 
 	finishSession(sessionID: string) {
 		const session = this.sessions.get(sessionID);
 		if (session) { this.sessions.delete(sessionID); this.finishSessionState(session); }
 		this.persist();
-	}
-
-	ingestTrace(trace: ReadonlyArray<PatternAwareEventInput>) {
-		const sessions = new Set<string>();
-		for (const event of trace) this.observe(event);
-		for (const event of trace) sessions.add(event.sessionID);
-		for (const sessionID of sessions) this.finishSession(sessionID);
-	}
-
-	registerValidatedPattern(input: PatternAwarePattern) {
-		const pattern = mutablePattern(input);
-		if (!pattern || !structurallyEligible(pattern, this.settings)) return false;
-		this.patterns.set(pattern.id, pattern);
-		this.patternSupportSessions.delete(pattern.id);
-		this.clock = Math.max(this.clock, pattern.lastSeenSequence);
-		this.indexDirty = true;
-		this.trimPatterns();
-		this.persist();
-		return true;
 	}
 
 	predict(sessionID: string, schemaHashes: Readonly<Record<string, string>> = {}, predictionSettings: PatternAwareSettings = this.settings) {
@@ -501,8 +445,7 @@ export class PatternAwareStore {
 		if (continuation.visitedPatternIDs.length >= settings.maxPredictionDepth) return [];
 		const activeSessionID = history.at(-1)?.sessionID;
 		const groups = new Map< string, Array<{ readonly pattern: MutablePattern; readonly input: Record<string, unknown>; variantProbability: number; }> >();
-		this.ensureIndex();
-		for (const { pattern, context } of this.trie.matching(history, this.contextStarts(history))) {
+		for (const { pattern, context } of this.matchingPatterns(history)) {
 			const patternID = pattern.id;
 			if (continuation.visitedPatternIDs.includes(patternID) || !structurallyEligible(pattern, settings)) continue;
 			const supportingSessions = this.patternSupportSessions.get(patternID);
@@ -768,11 +711,24 @@ export class PatternAwareStore {
 		}
 	}
 
-	private ensureIndex() {
-		if (!this.indexDirty) return;
-		this.trie = new PredictiveContextTrie();
-		for (const pattern of this.patterns.values()) this.trie.insert(pattern);
-		this.indexDirty = false;
+	/** Index only populated contexts; prediction and learning use the same suffix and wildcard rules. */
+	private *matchingPatterns(history: readonly PatternAwareEvent[]) {
+		if (!this.contexts) {
+			this.contexts = new Map();
+			for (const pattern of this.patterns.values()) {
+				const key = JSON.stringify(pattern.context.map(trieToken)), group = this.contexts.get(key) ?? [];
+				group.push(pattern); this.contexts.set(key, group);
+			}
+		}
+		const signatures = history.map(signature), tokens = signatures.map(trieToken), starts = this.contextStarts(history);
+		for (let index = history.length - 1; index >= 0; index--) {
+			if (starts?.has(index) === false) continue;
+			const patterns = this.contexts.get(JSON.stringify(tokens.slice(index)));
+			if (!patterns) continue;
+			const context = history.slice(index);
+			for (const pattern of patterns) if (pattern.context.every((expected, offset) => expected.outputShape === undefined ||
+				signatures[index + offset]!.outputShape === undefined || signatures[index + offset]!.outputShape === expected.outputShape)) yield { pattern, context };
+		}
 	}
 
 	private observeRecurrentAction(session: PatternSessionState<PatternAwareEvent>, event: PatternAwareEvent) {
@@ -838,54 +794,42 @@ export class PatternAwareStore {
 
 	private resolveActionKey(tool: string, input: Readonly<Record<string, unknown>>, schemaHash: string | undefined) {
 		if (!this.actionSemantics) return undefined;
-		let cacheKey: string;
 		try {
-			cacheKey = hash(stableStringify([tool, schemaHash, input]));
+			const cacheKey = hash(stableStringify([tool, schemaHash, input]));
+			return this.resolvedActionKeys.getOrCreate(cacheKey, () => this.actionSemantics!.actionKey(tool, input, schemaHash));
 		} catch {
 			return undefined;
 		}
-		const cached = this.resolvedActionKeys.get(cacheKey);
-		if (cached !== undefined) return cached ?? undefined;
-		let resolved: ActionKey | undefined;
-		try {
-			resolved = this.actionSemantics.actionKey(tool, input, schemaHash);
-		} catch {
-			return undefined;
-		}
-		this.resolvedActionKeys.set(cacheKey, resolved ?? null);
-		return resolved;
 	}
 
-	private bindingsCoverSample(
+	private supportingSamples(
 		bindings: Readonly<Record<string, PatternAwareBinding>>,
-		targetTool: string,
-		targetSchemaHash: string | undefined,
-		sample: PatternSample,
+		{ targetTool, targetSchemaHash, samples }: PatternPool,
 	) {
-		if (targetTool !== sample.target.tool) return false;
-		let actor = this.observedActionKeys.get(sample.target);
-		if (actor === undefined && !this.observedActionKeys.has(sample.target)) {
-			actor = this.resolveActionKey(sample.target.tool, sample.target.input, sample.target.schemaHash ?? targetSchemaHash) ?? null;
-			this.observedActionKeys.set(sample.target, actor);
-		}
-		return this.bindingAnalysis.applyWeightedBindings(bindings, sample.context).some(({ input }) => {
-			const speculative = this.resolveActionKey(targetTool, input, targetSchemaHash);
-			if (!speculative || !actor) return sameValue(input, sample.target.input);
-			return actionKeyCovers(speculative, actor, this.actionSemantics?.projectors ?? []);
+		return samples.filter(sample => {
+			if (targetTool !== sample.target.tool) return false;
+			let actor = this.observedActionKeys.get(sample.target);
+			if (actor === undefined && !this.observedActionKeys.has(sample.target)) {
+				actor = this.resolveActionKey(sample.target.tool, sample.target.input, sample.target.schemaHash ?? targetSchemaHash) ?? null;
+				this.observedActionKeys.set(sample.target, actor);
+			}
+			return this.bindingAnalysis.applyWeightedBindings(bindings, sample.context).some(({ input }) => {
+				const speculative = this.resolveActionKey(targetTool, input, targetSchemaHash);
+				if (!speculative || !actor) return sameValue(input, sample.target.input);
+				return actionKeyCovers(speculative, actor, this.actionSemantics?.projectors ?? []);
+			});
 		});
 	}
 
 	private minimizeProjectedBindings(bindings: Readonly<Record<string, PatternAwareBinding>>, pool: PatternPool) {
-		const supportingSamples = (candidate: Readonly<Record<string, PatternAwareBinding>>) =>
-			pool.samples.filter((sample) => this.bindingsCoverSample(candidate, pool.targetTool, pool.targetSchemaHash, sample));
-		if (!this.actionSemantics) return { bindings, support: supportingSamples(bindings) };
+		if (!this.actionSemantics) return { bindings, support: this.supportingSamples(bindings, pool) };
 		const minimized = { ...bindings };
-		let support = supportingSamples(minimized);
+		let support = this.supportingSamples(minimized, pool);
 		for (const key of Object.keys(bindings)) {
 			const binding = minimized[key];
 			if (!binding) continue;
 			delete minimized[key];
-			const next = supportingSamples(minimized);
+			const next = this.supportingSamples(minimized, pool);
 			if (next.length > support.length || (support.length > 0 && next.length === support.length)) {
 				support = next;
 				continue;
@@ -907,7 +851,7 @@ export class PatternAwareStore {
 			samples: [],
 		};
 		// Internal contexts are immutable; preserving identity lets binding inference reuse its WeakMap cache.
-		const sample = { context, target, gap };
+		const sample = { context, target };
 		pool.samples.push(sample);
 		const sampleLimit = patternPoolSampleLimit(this.settings);
 		const removed = pool.samples.length > sampleLimit ? pool.samples.splice(0, pool.samples.length - sampleLimit) : [];
@@ -920,7 +864,7 @@ export class PatternAwareStore {
 			(pool.patternIDs ?? []).some((patternID) => (this.patterns.get(patternID)?.occurrences ?? this.settings.minOccurrences) < this.settings.minOccurrences);
 		if (pool.samples.length < this.settings.minOccurrences && !probationary) { this.retirePoolPatterns(pool, new Set()); return; }
 		const minimumSupport = probationary ? pool.samples.length : this.settings.minOccurrences;
-		const constantSupport = bindingEvidenceThreshold(this.settings);
+		const constantSupport = Math.max(4, this.settings.minOccurrences * 2);
 		const candidates = new Map<string, Record<string, PatternAwareBinding>>();
 		const remember = (bindings: Record<string, PatternAwareBinding> | undefined) => {
 			if (!bindings || (!firstRecurrenceProbe && !hasSufficientBindingProvenance(bindings, pool.samples, constantSupport))) return;
@@ -941,19 +885,15 @@ export class PatternAwareStore {
 			if (dependencies.length === 0) {
 				this.patternSupportSessions.set(id, new Set(support.map((sample) => sample.target.sessionID)));
 			} else this.patternSupportSessions.delete(id);
+			const lastSeenSequence = support.reduce((latest, { target }) => Math.max(latest, target.sequence), -Infinity);
 			const observed = {
 				bindings,
 				dependencies,
-				gapCounts: {} as Record<string, number>,
-				gapLastSeen: {} as Record<string, number>,
+				gapCounts: { [gap]: support.length },
+				gapLastSeen: { [gap]: lastSeenSequence },
 				occurrences: support.length,
-				lastSeenSequence: -Infinity,
+				lastSeenSequence,
 			};
-			for (const { gap, target } of support) {
-				observed.gapCounts[gap] = (observed.gapCounts[gap] ?? 0) + 1;
-				observed.gapLastSeen[gap] = Math.max(observed.gapLastSeen[gap] ?? 0, target.sequence);
-				observed.lastSeenSequence = Math.max(observed.lastSeenSequence, target.sequence);
-			}
 			const existing = this.patterns.get(id);
 			if (existing) { Object.assign(existing, observed); continue; }
 			this.patterns.set(id, {
@@ -963,10 +903,10 @@ export class PatternAwareStore {
 				...observed,
 				...(target.schemaHash ? { targetSchemaHash: target.schemaHash } : {}),
 				historicalOpportunities: this.controlOpportunities(pool),
-				historicalMatches: controlOpportunityCount(support),
+				historicalMatches: new Set(support.map((sample) => controlOpportunityID(sample.target))).size,
 				feedback: emptyPatternFeedback(observed.lastSeenSequence),
 			});
-			this.indexDirty = true;
+			this.contexts = undefined;
 		}
 		this.retirePoolPatterns(pool, retained);
 	}
@@ -995,7 +935,7 @@ export class PatternAwareStore {
 	}
 
 	private removePattern(patternID: string) {
-		if (this.patterns.delete(patternID)) this.indexDirty = true;
+		if (this.patterns.delete(patternID)) this.contexts = undefined;
 		this.patternSupportSessions.delete(patternID);
 		for (const session of this.sessions.values()) {
 			if (session.pending.some(item => item.patternID === patternID)) session.pending = session.pending.filter(item => item.patternID !== patternID);
@@ -1026,8 +966,7 @@ export class PatternAwareStore {
 		const pending = [...session.pending];
 		const triggerSequence = history.at(-1)?.sequence;
 		if (triggerSequence === undefined) return;
-		this.ensureIndex();
-		for (const { pattern, context } of this.trie.matching(history, this.contextStarts(history))) {
+		for (const { pattern, context } of this.matchingPatterns(history)) {
 			if (!structurallyEligible(pattern, this.settings)) continue;
 			if (pending.some((item) => item.patternID === pattern.id && item.triggerSequence === triggerSequence)) continue;
 			pending.push({
@@ -1101,15 +1040,11 @@ export class PatternAwareStore {
 	private portable(pattern: MutablePattern) {
 		const free = (binding: PatternAwareBinding, targetPath: PatternAwarePath): boolean => {
 			const text = (value: string) => !/[\\/]/u.test(value);
-			switch (binding.type) {
-				case "constant": return !requiresProvenance(targetPath, binding.value) && (typeof binding.value !== "string" || text(binding.value));
-				case "template": return text(binding.prefix) && text(binding.suffix) && free(binding.source, targetPath);
-				case "splice": return binding.parts.every(text) && binding.sources.every((source) => free(source, targetPath));
-				case "coalesce": return binding.sources.every((source) => free(source, targetPath));
-				case "join": return free(binding.left, targetPath) && free(binding.right, targetPath);
-				case "event": case "each": return true;
-				default: return free(binding.source, targetPath);
-			}
+			const own = binding.type === "constant" ? !requiresProvenance(targetPath, binding.value) && (typeof binding.value !== "string" || text(binding.value))
+				: binding.type === "template" ? text(binding.prefix) && text(binding.suffix)
+				: binding.type === "splice" ? binding.parts.every(text)
+				: binding.type === "rebase" ? text(binding.from) && text(binding.to) : true;
+			return own && bindingChildren(binding).every(source => free(source, targetPath));
 		};
 		return pattern.occurrences >= this.settings.minOccurrences && Object.entries(pattern.bindings).every(([encoded, binding]) => free(binding, decodePath(encoded)));
 	}
@@ -1145,7 +1080,7 @@ export class PatternAwareStore {
 					samples: pool.samples.slice(-sampleLimit).map((sample) => ({
 						context: sample.context.map(reference),
 						target: reference(sample.target),
-						gap: sample.gap,
+						gap: pool.gap,
 					})),
 				}),
 			);
@@ -1239,23 +1174,6 @@ export function patternAwarePersistenceFile(workspace: string, stateDirectory?: 
 	return path.join(root, "pattern-aware", `${hash(path.resolve(workspace))}.json`);
 }
 
-export function patternAwareRuntimeContext(
-	store: PatternAwareStore,
-	candidate: Pick<PatternAwareCandidate, "continuation">,
-): PatternAwareRuntimeContext {
-	return { store, continuation: candidate.continuation };
-}
-
-export function asPatternAwareRuntimeContext(value: unknown): PatternAwareRuntimeContext | undefined {
-	const record = asRecord(value);
-	if (!(record?.store instanceof PatternAwareStore)) return;
-	const continuation = asRecord(record.continuation);
-	if (!continuation || !Array.isArray(continuation.history) || !Array.isArray(continuation.visitedPatternIDs)) return;
-	if (typeof continuation.pathProbability !== "number" || !Number.isFinite(continuation.pathProbability) || continuation.pathProbability < 0 ||
-		continuation.pathProbability > 1) return;
-	return value as PatternAwareRuntimeContext;
-}
-
 /** What kind of failure a failed call reports: its exit code and the first recognizable error kind. */
 export function failureClass(text: string): string {
 	const exit = /exited with code (\d+)/u.exec(text)?.[1];
@@ -1290,29 +1208,23 @@ export function projectPatternAwareObservation(output: unknown, outputPaths: Rea
 
 /** Derived state belongs to one analyzer; public helpers get a fresh scope for mutable caller data. */
 class PatternBindingAnalysis {
-	private readonly derived = new WeakMap<object, BoundedRecencyMap<unknown, readonly [unknown]>>();
+	private readonly derived = new WeakMap<object, BoundedRecencyMap<unknown, unknown>>();
 
 	private memo<Value>(owner: unknown, key: unknown, create: () => Value): Value {
 		if (!isObject(owner)) return create();
 		let cache = this.derived.get(owner);
 		if (!cache) this.derived.set(owner, cache = new BoundedRecencyMap(128));
-		const cached = cache.get(key);
-		if (cached) return cached[0] as Value;
-		const value = create();
-		cache.set(key, [value]);
-		return value;
+		return cache.getOrCreate(key, create) as Value;
 	}
 
 	private valueIndex(value: unknown) {
 		return this.memo(value, "value-index", () => {
-			const index = new Map<string, { leaves: PatternAwarePath[]; collections: CollectionLocation[] }>();
+			const index = new Map<string, PatternAwarePath[]>();
 			for (const [path, item] of this.leaves(value)) {
 				const key = stableStringify(item);
 				let locations = index.get(key);
-				if (!locations) index.set(key, locations = { leaves: [], collections: [] });
-				locations.leaves.push(path);
-				const collection = path.findIndex(segment => typeof segment === "number");
-				if (collection >= 0) locations.collections.push({ path: path.slice(0, collection), itemPath: path.slice(collection + 1) });
+				if (!locations) index.set(key, locations = []);
+				locations.push(path);
 			}
 			return index;
 		});
@@ -1363,8 +1275,9 @@ class PatternBindingAnalysis {
 			let selected: PatternAwareBinding | undefined, selectedReplay = -1;
 			// Preserve direct/composite/fallback order and first-best ties without replaying candidates twice.
 			for (const candidate of uniqueBy(candidates(this), bindingStructureKey)) {
+				const proposed = { ...bindings, [encodedPath]: candidate };
 				const replay = samples.reduce(
-					(matches, sample, index) => matches + Number(this.bindingMatches(candidate, sample.context, targets[index])),
+					(matches, sample) => matches + Number(this.bindingMatches(proposed, sample.context, sample.target.input)),
 					0,
 				);
 				if (replay <= selectedReplay) continue;
@@ -1436,24 +1349,34 @@ class PatternBindingAnalysis {
 		return variants;
 	}
 
-	/** Target paths bound item by item to one collection move together (a location's path with its line); the rest vary alone. */
+	/** Connected collection references form one choice, including references nested inside composite bindings. */
 	private bindingUnits(bindings: Readonly<Record<string, PatternAwareBinding>>, context: ReadonlyArray<PatternAwareEvent>) {
-		const collection = (binding: PatternAwareBinding) => binding.type === "each" ? binding : binding.type === "near" && binding.source.type === "each" ? binding.source : undefined;
-		const groups = new Map<string, Array<readonly [PatternAwarePath, PatternAwareBinding]>>();
+		const groups: Array<{ sources: Set<string>; members: Array<readonly [PatternAwarePath, PatternAwareBinding, readonly BindingRow[]]> }> = [];
 		for (const [encoded, binding] of Object.entries(bindings)) {
-			const items = collection(binding), key = items ? stableStringify([items.relativeEvent, items.field, items.path]) : encoded;
-			(groups.get(key) ?? groups.set(key, []).get(key)!).push([decodePath(encoded), binding]);
-		}
-		return [...groups.values()].map((members) => {
-			if (members.length === 1) {
-				const [[targetPath, binding]] = members as [readonly [PatternAwarePath, PatternAwareBinding]];
-				return { targetPaths: [targetPath], values: this.bindingValues(binding, context).map((value) => [value]), counts: binding.variantCounts };
+			const rows = this.bindingRows(binding, context), sources = new Set(rows.flatMap(row => [...row.sources.keys()]));
+			const connected = groups.filter(group => [...sources].some(source => group.sources.has(source)));
+			const group = connected[0] ?? { sources, members: [] };
+			if (!connected.length) groups.push(group);
+			for (const other of connected.slice(1)) {
+				group.members.push(...other.members);
+				for (const source of other.sources) group.sources.add(source);
+				groups.splice(groups.indexOf(other), 1);
 			}
-			const source = collection(members[0]![1])!, event = context[context.length + source.relativeEvent];
-			const listed = event ? getPath(event[source.field], source.path) : MISSING, rows = Array.isArray(listed) ? listed : [];
-			const values = rows.map((row) => members.map(([, binding]) => getPath(row, collection(binding)!.itemPath)))
-				.filter((row) => row.every((value) => value !== MISSING));
-			return { targetPaths: members.map(([targetPath]) => targetPath), values: [...uniqueBy(values, stableStringify)], counts: undefined };
+			for (const source of sources) group.sources.add(source);
+			group.members.push([decodePath(encoded), binding, rows]);
+		}
+		return groups.map(({ members }) => {
+			const values = [...uniqueBy([...joinBindingRows(members.map(([, , rows]) => rows))].map(row => row.values), stableStringify)];
+			// Exact, injective fields identify joint choices; agreeing marginals count the same observations once.
+			const evidence = members.flatMap(([, binding], member) => {
+				if (!binding.variantCounts || members.length > 1 && binding.type === "near") return [];
+				const keys = values.map(value => stableStringify(value[member]));
+				if (new Set(keys).size !== values.length) return [];
+				const indices = new Map(this.bindingValues(binding, context).map((value, index) => [stableStringify(value), index]));
+				return [Object.fromEntries(keys.map((key, index) => [index, variantCount(binding.variantCounts!, indices.get(key)!)]))];
+			});
+			return { targetPaths: members.map(([targetPath]) => targetPath), values,
+				counts: evidence.every(counts => sameValue(counts, evidence[0])) ? evidence[0] : undefined };
 		});
 	}
 
@@ -1467,9 +1390,30 @@ class PatternBindingAnalysis {
 		const key = "bindings:" + mode + Number(targetIsPath) + Number(targetIsLine) + ":" + typeof target + ":" +
 			(typeof target === "string" ? target : stableStringify(target));
 		return this.memo(context, key, () => {
-			const bindings = this.inferCandidateBindings(context, target, mode !== "direct", targetIsPath, targetIsLine);
+			const bindings = this.correlatedBindings(this.inferCandidateBindings(context, target, mode !== "direct", targetIsPath, targetIsLine));
 			if (mode === "first") for (const binding of bindings) return [binding];
 			return [...uniqueBy(bindings, bindingStructureKey)];
+		});
+	}
+
+	private *correlatedBindings(bindings: Iterable<PatternAwareBinding>): Generator<PatternAwareBinding, undefined> {
+		for (const binding of bindings) {
+			const correlated = this.correlateLocations(binding);
+			if (correlated !== binding) yield correlated;
+			yield binding;
+		}
+	}
+
+	private correlateLocations(binding: PatternAwareBinding): PatternAwareBinding {
+		return this.memo(binding, "correlated-locations", () => {
+			if (binding.type === "event" && binding.field === "outputLocations") {
+				return collectionBinding(binding) ?? binding;
+			}
+			const children = bindingChildren(binding), sources = children.map(source => this.correlateLocations(source));
+			if (sources.every((source, index) => source === children[index])) return binding;
+			return binding.type === "join" ? { ...binding, left: sources[0]!, right: sources[1]! }
+				: binding.type === "coalesce" || binding.type === "splice" ? { ...binding, sources }
+					: "source" in binding ? { ...binding, source: sources[0]! } : binding;
 		});
 	}
 
@@ -1484,13 +1428,17 @@ class PatternBindingAnalysis {
 		const spliceSources: Array<{ readonly binding: PatternAwareBinding; readonly value: string }> = [];
 		const targetKey = stableStringify(target), tokens = includeComposites && !targetIsPath && typeof target === "string" ? pathTokens(target) : [];
 		for (const [relativeEvent, field, value] of reverseContextFields(context)) {
-			const indexed = includeComposites ? undefined : this.valueIndex(value).get(targetKey);
+			const indexed = () => this.valueIndex(value).get(targetKey) ?? [];
 			// A reported location binds by item, not position, so its path and line are applied together.
-			const collections = () => collectionBindings(
-				(includeComposites ? this.valueIndex(value).get(targetKey) : indexed)?.collections ?? [], relativeEvent, field, target, targetIsPath);
+			function* collections() {
+				for (const path of indexed()) {
+					const binding = collectionBinding({ relativeEvent, field, path });
+					if (binding && !(targetIsPath && typeof target === "string" && !isPathSource(field, [...binding.path, ...binding.itemPath], target))) yield binding;
+				}
+			}
 			if (field === "outputLocations") yield* collections();
 			if (!includeComposites) {
-				for (const sourcePath of indexed?.leaves ?? []) {
+				for (const sourcePath of indexed()) {
 					if (targetIsPath && typeof target === "string" && !isPathSource(field, sourcePath, target)) continue;
 					yield { type: "event", relativeEvent, field, path: sourcePath };
 				}
@@ -1499,10 +1447,10 @@ class PatternBindingAnalysis {
 					const direct: PatternAwareBinding = { type: "event", relativeEvent, field, path: sourcePath };
 					const pathSource = typeof source === "string" && isPathSource(field, sourcePath, source);
 					if (sameValue(source, target) && (!targetIsPath || pathSource)) yield direct;
-					const item = sourcePath.findIndex((segment) => typeof segment === "number");
-					if (targetIsLine && field === "outputLocations" && sourcePath.at(-1) === "line" && item >= 0 && typeof source === "number" &&
+					if (targetIsLine && field === "outputLocations" && sourcePath.at(-1) === "line" && typeof source === "number" &&
 						typeof target === "number" && source !== target && Math.abs(source - target) <= NEAR_LINE_TOLERANCE) {
-						yield { type: "near", tolerance: NEAR_LINE_TOLERANCE, source: { type: "each", relativeEvent, field, path: sourcePath.slice(0, item), itemPath: sourcePath.slice(item + 1) } };
+						const collection = collectionBinding(direct);
+						if (collection) yield { type: "near", tolerance: NEAR_LINE_TOLERANCE, source: collection };
 					}
 					if (typeof source !== "string" || typeof target !== "string") continue;
 					// A path target templates only a rewrite of another file's name; other targets never template a bare name.
@@ -1559,18 +1507,12 @@ class PatternBindingAnalysis {
 		}
 		if (includeComposites && targetIsPath && typeof target === "string") {
 			const normalizedTarget = normalizePath(target);
-			const joinMatches = new Map<string, Map<string, boolean>>();
+			const joins = new Map<string, typeof pathSources>();
 			for (const left of pathSources) {
-				for (const right of pathSources) {
+				let matches = joins.get(left.value);
+				if (!matches) joins.set(left.value, matches = pathSources.filter(right => joinPath(left.value, right.value) === normalizedTarget));
+				for (const right of matches) {
 					if (left === right) continue;
-					const matchesByRight = joinMatches.get(left.value) ?? new Map<string, boolean>();
-					joinMatches.set(left.value, matchesByRight);
-					let matches = matchesByRight.get(right.value);
-					if (matches === undefined) {
-						matches = joinPath(left.value, right.value) === normalizedTarget;
-						matchesByRight.set(right.value, matches);
-					}
-					if (!matches) continue;
 					yield { type: "join", operation: "join_path", left: left.binding, right: right.binding };
 				}
 			}
@@ -1578,52 +1520,51 @@ class PatternBindingAnalysis {
 	}
 
 	bindingValues(binding: PatternAwareBinding, context: ReadonlyArray<PatternAwareEvent>): ReadonlyArray<unknown> {
-		return this.memo(context, binding, () => this.evaluateBindingValues(binding, context));
+		const rows = this.bindingRows(binding, context);
+		return this.memo(rows, "values", () => [...uniqueBy(rows.map(row => row.values[0]), stableStringify)]);
 	}
 
-	evaluateBindingValues(binding: PatternAwareBinding, context: ReadonlyArray<PatternAwareEvent>): ReadonlyArray<unknown> {
-		if (binding.type === "constant") return [binding.value];
-		if (binding.type === "near") return this.bindingValues(binding.source, context);
-		if (binding.type === "coalesce") {
-			for (const source of binding.sources) {
-				const values = this.bindingValues(source, context);
-				if (values.length) return values;
-			}
-			return [];
-		}
-		let values: ReadonlyArray<unknown>;
+	private bindingRows(binding: PatternAwareBinding, context: ReadonlyArray<PatternAwareEvent>): readonly BindingRow[] {
+		return this.memo(context, binding, () => this.evaluateBindingRows(binding, context));
+	}
+
+	private evaluateBindingRows(binding: PatternAwareBinding, context: ReadonlyArray<PatternAwareEvent>): readonly BindingRow[] {
+		const row = (value: unknown, sources: ReadonlyMap<string, number> = new Map()): BindingRow => ({ values: [value], sources });
+		if (binding.type === "constant") return [row(binding.value)];
 		if (binding.type === "event" || binding.type === "each") {
-			const index = context.length + binding.relativeEvent;
-			const event = context[index];
+			const event = context[context.length + binding.relativeEvent];
 			if (!event) return [];
 			const collection = getPath(event[binding.field], binding.path);
-			if (binding.type === "event") return collection === MISSING ? [] : [collection];
-			values = Array.isArray(collection)
-				? collection.map((item) => getPath(item, binding.itemPath)).filter((value) => value !== MISSING) : [];
-		} else if (binding.type === "join") {
-			const left = this.bindingValues(binding.left, context);
-			const right = this.bindingValues(binding.right, context);
-			values = left.flatMap((leftValue) =>
-				right.flatMap((rightValue) =>
-					typeof leftValue === "string" && typeof rightValue === "string" ? [joinPath(leftValue, rightValue)] : [],
-				),
-			);
-		} else if (binding.type === "splice") {
-			values = binding.sources.reduce<string[]>((texts, source, index) => texts.flatMap((text) => this.bindingValues(source, context)
-				.flatMap((value) => typeof value === "string" ? [`${text}${value}${binding.parts[index + 1]}`] : [])), [binding.parts[0]!]);
-		} else if (binding.type === "rebase") {
-			values = this.bindingValues(binding.source, context).flatMap((value) => typeof value === "string" ? rebase(value, binding.from, binding.to) : []);
-		} else if (binding.type === "template" || binding.type === "transform") {
-			values = this.bindingValues(binding.source, context).flatMap((value) =>
-				typeof value === "string" ? [binding.type === "template"
-					? `${binding.prefix}${value}${binding.suffix}` : transform(binding.operation, value)] : [],
-			);
-		} else return [];
-		return [...uniqueBy(values, stableStringify)];
+			if (binding.type === "event") return collection === MISSING ? [] : [row(collection)];
+			const key = stableStringify([binding.relativeEvent, binding.field, binding.path]);
+			return Array.isArray(collection) ? collection.flatMap((item, index) => {
+				const value = getPath(item, binding.itemPath);
+				return value === MISSING ? [] : [row(value, new Map([[key, index]]))];
+			}) : [];
+		}
+		if (binding.type === "coalesce") {
+			for (const source of binding.sources) { const rows = this.bindingRows(source, context); if (rows.length) return rows; }
+			return [];
+		}
+		const children = bindingChildren(binding).map(source => this.bindingRows(source, context));
+		if (binding.type === "near") return children[0]!;
+		return [...joinBindingRows(children)].flatMap(({ values, sources }) => {
+			if (!values.every((value): value is string => typeof value === "string")) return [];
+			const first = values[0]!;
+			const result = binding.type === "join" ? [joinPath(first, values[1]!)]
+				: binding.type === "splice" ? [values.reduce((text, value, index) => text + value + binding.parts[index + 1], binding.parts[0]!)]
+				: binding.type === "rebase" ? rebase(first, binding.from, binding.to)
+				: [binding.type === "template" ? binding.prefix + first + binding.suffix : transform(binding.operation, first)];
+			return result.map(value => row(value, sources));
+		});
 	}
 
-	bindingMatches(binding: PatternAwareBinding, context: ReadonlyArray<PatternAwareEvent>, target: unknown) {
-		return this.bindingValues(binding, context).some((value) => bindingValueMatches(binding, value, target));
+	bindingMatches(bindings: Readonly<Record<string, PatternAwareBinding>>, context: ReadonlyArray<PatternAwareEvent>, target: Readonly<Record<string, unknown>>) {
+		const groups = Object.entries(bindings).map(([encoded, binding]) => {
+			const expected = getPath(target, decodePath(encoded));
+			return this.bindingRows(binding, context).filter(row => bindingValueMatches(binding, row.values[0], expected));
+		});
+		return !joinBindingRows(groups).next().done;
 	}
 
 	*leaves(value: unknown, segments: PatternAwarePath = []): Generator<readonly [PatternAwarePath, unknown], undefined> {
@@ -1681,11 +1622,27 @@ function hasSufficientBindingProvenance(bindings: Readonly<Record<string, Patter
 
 const MISSING = Symbol("missing");
 
-export function applyBindings(
-	bindings: Readonly<Record<string, PatternAwareBinding>>,
-	context: ReadonlyArray<PatternAwareEvent>,
-): Record<string, unknown> | undefined {
-	return applyBindingsVariants(bindings, context, 1)[0];
+type BindingRow = { readonly values: readonly unknown[]; readonly sources: ReadonlyMap<string, number> };
+
+/** A source row is an identity, even when two rows contain the same value. */
+function* joinBindingRows(groups: readonly (readonly BindingRow[])[]): Generator<BindingRow, undefined> {
+	const pending: Array<{ group: number; row: BindingRow }> = [{ group: 0, row: { values: [], sources: new Map() } }];
+	while (pending.length) {
+		const { group, row } = pending.pop()!;
+		if (group === groups.length) { yield row; continue; }
+		const choices = groups[group]!;
+		for (let index = choices.length - 1; index >= 0; index--) {
+			const next = choices[index]!;
+			if ([...next.sources].some(([source, position]) => row.sources.has(source) && row.sources.get(source) !== position)) continue;
+			pending.push({ group: group + 1, row: { values: [...row.values, ...next.values], sources: new Map([...row.sources, ...next.sources]) } });
+		}
+	}
+}
+
+function bindingChildren(binding: PatternAwareBinding): readonly PatternAwareBinding[] {
+	return binding.type === "constant" || binding.type === "event" || binding.type === "each" ? []
+		: binding.type === "coalesce" || binding.type === "splice" ? binding.sources
+		: binding.type === "join" ? [binding.left, binding.right] : [binding.source];
 }
 
 function variantCount(counts: Readonly<Record<string, number>>, index: number): number {
@@ -1705,19 +1662,10 @@ function* reverseContextFields(
 	}
 }
 
-type CollectionLocation = { readonly path: PatternAwarePath; readonly itemPath: PatternAwarePath };
-
-function* collectionBindings(
-	items: ReadonlyArray<CollectionLocation>,
-	relativeEvent: number,
-	field: PatternAwareDependencySource["field"],
-	target: unknown,
-	targetIsPath: boolean,
-): Generator<PatternAwareBinding, undefined> {
-	for (const item of items) {
-		if (targetIsPath && typeof target === "string" && !isPathSource(field, [...item.path, ...item.itemPath], target)) continue;
-		yield { type: "each", relativeEvent, field, path: item.path, itemPath: item.itemPath };
-	}
+function collectionBinding(binding: PatternAwareDependencySource) {
+	const item = binding.path.findIndex(segment => typeof segment === "number");
+	return item < 0 ? undefined : { type: "each" as const, relativeEvent: binding.relativeEvent, field: binding.field,
+		path: binding.path.slice(0, item), itemPath: binding.path.slice(item + 1) };
 }
 
 function structuredOutput(value: unknown): unknown {
@@ -1818,9 +1766,7 @@ function analyzeBindings(bindings: Readonly<Record<string, PatternAwareBinding>>
 				field: node.field, path: node.path, ...(node.type === "each" ? { itemPath: node.itemPath } : {}) });
 			else {
 				analysis.complexity++;
-				if (node.type === "coalesce" || node.type === "splice") node.sources.forEach(visit);
-				else if (node.type === "join") { visit(node.left); visit(node.right); }
-				else visit(node.source);
+				bindingChildren(node).forEach(visit);
 			}
 		};
 		visit(binding);
@@ -1866,8 +1812,6 @@ const PATH_OPERATION_CACHE_LIMIT = 128;
 const normalizedPaths = new BoundedRecencyMap<string, string>(PATH_OPERATION_CACHE_LIMIT);
 const joinedPaths = new BoundedRecencyMap<string, string>(PATH_OPERATION_CACHE_LIMIT);
 
-function cachePathResult(cache: BoundedRecencyMap<string, string>, key: string, value: string) { cache.set(key, value); return value; }
-
 /** The directory swap turning `source` into `target` when both end in the same file name (and possibly more segments). */
 function rebaseBetween(source: string, target: string): { from: string; to: string } | undefined {
 	const left = normalizePath(source).split("/"), right = normalizePath(target).split("/");
@@ -1889,18 +1833,14 @@ function rebase(value: string, from: string, to: string): string[] {
 }
 
 function joinPath(left: string, right: string) {
-	const key = `${left.length}:${left}${right}`;
-	const cached = joinedPaths.get(key);
-	if (cached !== undefined) return cached;
-	const root = normalizePath(left);
-	const output = normalizePath(right);
-	const result =
-		containsLogicalPath(root, output)
+	return joinedPaths.getOrCreate(`${left.length}:${left}${right}`, () => {
+		const root = normalizePath(left), output = normalizePath(right);
+		return containsLogicalPath(root, output)
 			? output
 			: path.posix.basename(root) === output
 				? root
 				: normalizePath(path.join(root, output));
-	return cachePathResult(joinedPaths, key, result);
+	});
 }
 
 function getPath(value: unknown, segments: PatternAwarePath): unknown {
@@ -2176,15 +2116,15 @@ function mutablePools(eventsValue: ReadonlyArray<unknown>, pools: ReadonlyArray<
 		const record = asRecord(value);
 		if (!record || !Array.isArray(record.samples) || typeof record.key !== "string" ||
 			typeof record.targetTool !== "string" || !Array.isArray(record.context) ||
-			!record.context.every(isEventSignature) || !isNonNegativeInteger(record.gap)) return [];
+			!record.context.every(isEventSignature) || !isSafeCount(record.gap)) return [];
 		const samples = record.samples.flatMap((item) => {
 			const sample = asRecord(item);
-			if (!sample || !Array.isArray(sample.context) || !sample.context.every(isNonNegativeInteger) || !isNonNegativeInteger(sample.target) ||
+			if (!sample || !Array.isArray(sample.context) || !sample.context.every(value => isSafeCount(value)) || !isSafeCount(sample.target) ||
 				sample.gap !== record.gap) return [];
 			const context = sample.context.map((id) => events[id as number]);
 			const target = events[sample.target as number];
 			if (!target || context.some((event) => !event)) return [];
-			return [{ context: context as PatternAwareEvent[], target, gap: record.gap as number }];
+			return [{ context: context as PatternAwareEvent[], target }];
 		});
 		if (!samples.length) return [];
 		const context = structuredClone(record.context) as PatternAwareEventSignature[];
@@ -2202,10 +2142,6 @@ function mutablePools(eventsValue: ReadonlyArray<unknown>, pools: ReadonlyArray<
 	});
 }
 
-function isNonNegativeInteger(value: unknown): value is number {
-	return Number.isSafeInteger(value) && (value as number) >= 0;
-}
-
 function patternPoolKey(context: ReadonlyArray<PatternAwareEventSignature>, targetTool: string, targetSchemaHash: string | undefined, gap: number) {
 	return hash(stableStringify({ context, targetTool, targetSchemaHash, gap }));
 }
@@ -2220,16 +2156,8 @@ function controlOpportunityID(event: PatternAwareEvent) {
 		: persistedEventIdentity(event);
 }
 
-function controlOpportunityCount(samples: ReadonlyArray<PatternSample>) {
-	return new Set(samples.map((sample) => controlOpportunityID(sample.target))).size;
-}
-
 function patternPoolSampleLimit(settings: Pick<PatternAwareSettings, "minOccurrences" | "maxContextLength">) {
 	return Math.max(settings.minOccurrences * 4, settings.maxContextLength * 4);
-}
-
-function bindingEvidenceThreshold(settings: Pick<PatternAwareSettings, "minOccurrences">) {
-	return Math.max(4, settings.minOccurrences * 2);
 }
 
 function isEventSignature(value: unknown): value is PatternAwareEventSignature {
@@ -2285,7 +2213,7 @@ function isPatternAwarePath(value: unknown): value is PatternAwarePath {
 	return (
 		Array.isArray(value) &&
 		value.every(
-			(segment) => typeof segment === "string" || (Number.isSafeInteger(segment) && (segment as number) >= 0),
+			(segment) => typeof segment === "string" || isSafeCount(segment),
 		)
 	);
 }
@@ -2312,17 +2240,15 @@ function decodePath(value: string): PatternAwarePath {
 	return parsePath(value) ?? [];
 }
 
-const parsedPaths = new BoundedRecencyMap<string, PatternAwarePath | null>(PATH_OPERATION_CACHE_LIMIT);
+const parsedPaths = new BoundedRecencyMap<string, PatternAwarePath | undefined>(PATH_OPERATION_CACHE_LIMIT);
 
 function parsePath(value: string): PatternAwarePath | undefined {
-	const cached = parsedPaths.get(value);
-	if (cached !== undefined) return cached ?? undefined;
-	try {
-		const parsed: unknown = JSON.parse(value);
-		const result = isPatternAwarePath(parsed) ? parsed : null;
-		parsedPaths.set(value, result);
-		return result ?? undefined;
-	} catch { parsedPaths.set(value, null); return undefined; }
+	return parsedPaths.getOrCreate(value, () => {
+		try {
+			const parsed: unknown = JSON.parse(value);
+			return isPatternAwarePath(parsed) ? parsed : undefined;
+		} catch { return undefined; }
+	});
 }
 
 function uniqueStrings(values: ReadonlyArray<string>) {
@@ -2330,9 +2256,7 @@ function uniqueStrings(values: ReadonlyArray<string>) {
 }
 
 function normalizePath(value: string) {
-	const cached = normalizedPaths.get(value);
-	if (cached !== undefined) return cached;
-	return cachePathResult(normalizedPaths, value, path.normalize(value).replaceAll("\\", "/"));
+	return normalizedPaths.getOrCreate(value, () => path.normalize(value).replaceAll("\\", "/"));
 }
 
 function hash(value: string) {
@@ -2355,8 +2279,4 @@ function boundedEventPayload(event: PatternAwareEventInput): PatternAwareEventIn
 
 function probability(pattern: Pick<MutablePattern, "historicalMatches" | "historicalOpportunities">) {
 	return Math.max(0, Math.min(1, pattern.historicalMatches / Math.max(1, pattern.historicalOpportunities)));
-}
-
-function isFiniteNumber(value: unknown): value is number {
-	return typeof value === "number" && Number.isFinite(value);
 }

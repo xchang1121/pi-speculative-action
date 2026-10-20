@@ -13,9 +13,23 @@ pi -e /absolute/path/to/pi-speculative-action
 
 `drafterMaxDepth` 表示根批次之后最多预测多少个后继批次，0 关闭续推。动作和观测预测共用 Drafter 模型、凭据、任务请求数及 token 预算；并发根候选和 Drafter Actor 探测也使用同一账本，重试与压缩续跑不重置额度。`tools` 只筛选预测候选：省略时使用当前全部工具，空数组关闭工具候选；它不限制已观察输入和子计算的复用。
 
+`/speculative-action` 主菜单提供两个开关：**Speculative production**（`enabled`，默认关闭）控制额外产物的提前生产，包括调用预测、流式预览和已观察操作的准备；**Cache & reuse**（`reuseEnabled`，默认开启）控制工具、子计算和资源的缓存与采纳。只开后者时，直接执行也会积累可复用成果。关闭复用后，调用直接执行，停止新增准备与缓存；既有持久记录可通过存储菜单单独清理，已进入提交阶段的调用正常完成。两个开关都不关闭实际调用的观察与模式学习。各预测来源的开关只停止该来源的新预测，不清空成果，也不切断已认领调用的反馈。`prepareObservedOperations` 单独选择是否准备已观察操作；会话释放由 `host.dispose()` 负责。
+
 Linux / WSL 2 可从菜单安装 Bash 后端，或运行 `npm run setup:linux`；WSL checkout 应位于 Linux 原生文件系统。进程后端自动选择通过检查的 OverlayFS，否则回退 Git，并在采纳前核对输入和原始对象身份。
 
 原生子进程交接须保留程序自身的提权语义。普通 Actor 通过 `PI_SPEC_HELD_EXEC_OBSERVER` 指向管理员部署、仅具有 `CAP_SYS_PTRACE` 的专用 `.observer`；已继承 `no_new_privs` 的 Actor 可使用无附加权限的观察器。安装探测只在一次性进程设置此限制。资格不足时，原生执行、缓存回放和投机生产各自保持可用；通用 helper 与映像库始终不附加权限。
+
+普通用户运行 `npm run setup:linux` 后，可由管理员部署刚编译的专用观察器：
+
+```sh
+observer=/usr/local/libexec/pi-speculative-action/pi-speculative-held-exec.observer
+sudo install -d -o root -g root -m 0755 /usr/local/libexec/pi-speculative-action
+sudo install -o root -g "$(id -gn)" -m 0750 "$HOME/.local/bin/pi-speculative-held-exec.observer" "$observer"
+sudo setcap cap_sys_ptrace=ep "$observer"
+export PI_SPEC_HELD_EXEC_OBSERVER="$observer"
+```
+
+将最后一行改为完整路径后写入 shell 启动文件，重开终端并重启 Pi，再检查 **Execution routes → Observe**。更新 helper 后也要重新部署观察器。WSL 2 可通过 `wsl -d <发行版> -u root` 执行管理员步骤，此时源路径和组名须填写普通用户的值；编译、Pi 和测试仍使用普通用户。无需修改系统 `ptrace_scope` 或给整个 Pi 进程设置 `no_new_privs`。
 
 ThinkThread 使用 [Profile 安装脚本](./scripts/install-thinkthread-profile.sh)，随后在项目中运行 `tt pi-speculative-action`。
 
@@ -29,7 +43,9 @@ Drafter 参照 [TomasuLLM](https://arxiv.org/html/2609.38201v2) 将动作预测�
 
 预测血缘与复用证明分开：预测失配不使已经独立校验的真实输入或子计算失效。正式调用可采用完整结果、契约允许的投影，或在封存输入上按当前参数重算；流式预览也走同一验新流程。执行器、权限、作用域、实际依赖及记录须相容，效果只提交一次；部分提交或效果状态不明会终止本次调用。命中的在途工作等待完成，支持调用方取消。
 
-根入口提供 [Pi Host API](./src/index.ts)；[`./core`](./src/core.ts) 提供 Runtime，[`./process-reuse`](./src/process-reuse.ts) 提供进程证明与存储。新增来源实现 `SpeculativePlanSource`，从 `definitions` / 宿主数据获取当前工具；新增后端实现 `ExecutionWorld`，通过 `executionWorlds` 注册。结束时调用 `host.dispose()`。
+根入口提供 [Pi Host API](./src/index.ts)；[`./core`](./src/core.ts) 提供 Runtime，[`./process-reuse`](./src/process-reuse.ts) 提供进程证明与存储。新增来源实现 `SpeculativePlanSource`，只提出计划或续推，从 `definitions` / 宿主数据获取当前工具。观察、归因与学习通过 `runtime.subscribe()` 订阅 `actor_observed`、`prediction_feedback`、`execution_settled` 等类型化事件，返回函数用于退订；订阅异常相互隔离，学习队列在 Actor 结算之外按序排空。来源标识用于反馈与诊断，缓存按实际证明、使用情况和资源预算保留成果。观察者需要提出计划时显式调用 `submitPlan(event.startInput, update)`，运行时重新检查来源开关和轮次身份，拒绝过期提案。新增后端实现 `ExecutionWorld`，通过 `executionWorlds` 注册。结束时调用 `host.dispose()`。
+
+模块内部按所有权引用契约：哈希与文件系统证据不依赖进程证书，资源视图拥有文件操作契约，核心网关不引用 Pi 的调用类型，异步等待不依赖调度器。预测源交换调用事实而不引用另一来源的存储类型；宿主明确传入模型服务，Pattern 提示由宿主内部连接。`SpeculativeCandidate` 只暴露调用事实与可选 `executionMs`，不暴露内部工作、预留或状态机层级。原生线程的通信与连接生命周期由 [native-owner](./src/native-owner.ts) 管理，[native-worker](./src/native-worker.ts) 组合工作区与进程后端，各自的业务协议留在所属模块；这些内部模块不作为包入口导出。
 
 | 后端 | 方法与边界 |
 | --- | --- |

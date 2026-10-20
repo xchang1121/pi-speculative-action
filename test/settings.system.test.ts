@@ -13,12 +13,13 @@ describe("settings publication and reopening on disk", () => {
 		const { root, agent, cwd } = await fixture();
 		const store = new SpeculativeActionSettingsStore(cwd, agent);
 		await store.load();
-		store.setEffective({ enabled: true, tools: ["read", "ls"], candidateLimit: 4, patternAware: { beamWidth: 2, enabled: true }, scheduling: { heavyCpu: 3, resourcePollIntervalMs: 50 } });
+		store.setEffective({ enabled: true, reuseEnabled: true, tools: ["read", "ls"], candidateLimit: 4, patternAware: { beamWidth: 2, enabled: true }, scheduling: { heavyCpu: 3, resourcePollIntervalMs: 50 } });
 		await store.flush();
 		store.setScope("project");
-		store.setEffective({ enabled: true, tools: ["read", "ls"], candidateLimit: 2, patternAware: { enabled: true, beamWidth: 5 }, scheduling: { heavyCpu: 3, resourcePollIntervalMs: 75 } });
+		store.setEffective({ enabled: true, reuseEnabled: false, tools: ["read", "ls"], candidateLimit: 2, patternAware: { enabled: true, beamWidth: 5 }, scheduling: { heavyCpu: 3, resourcePollIntervalMs: 75 } });
 		await store.flush();
 		expect(JSON.parse(await readText(cwd, ".pi", "speculative-action.json"))).toEqual({
+			reuseEnabled: false,
 			candidateLimit: 2,
 			patternAware: { beamWidth: 5 },
 			scheduling: { resourcePollIntervalMs: 75 },
@@ -29,6 +30,7 @@ describe("settings publication and reopening on disk", () => {
 		expect(reloaded.scope).toBe("project");
 		expect(reloaded.effective()).toMatchObject({
 			enabled: true,
+			reuseEnabled: false,
 			candidateLimit: 2,
 			patternAware: { enabled: true, beamWidth: 5 },
 			scheduling: { heavyCpu: 3, resourcePollIntervalMs: 75 },

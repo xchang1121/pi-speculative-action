@@ -1,6 +1,35 @@
 import { describe, expect, it, vi } from "vitest";
 import { TaskTimeline, TimelineInterval, toolSpeedup, normalizeTimelineComputation } from "../src/task-timing.ts";
 import { restoreNativeDependency, serializeNativeDependency } from "../src/linux-process-sync.ts";
+import { emptySpeculativeTraceSummary, summarizeSpeculativeTrace } from "../src/trace-summary.ts";
+import type { SpeculativeActionEvent } from "../src/events.ts";
+import { benchmarkTraceReport } from "../bench/trace-report.ts";
+
+it("counts arbitrary projector names as trace data", () => {
+	for (const projector of ["constructor", "__proto__", "toString", "rows"]) {
+		const event: SpeculativeActionEvent<string> = { type: "actor_action", sessionID: "trace", turnID: "turn", timestamp: 0,
+			cache: emptySpeculativeTraceSummary().cache, actualAction: "", settlement: {
+				actorAction: { id: "call", sequence: 1, turnID: "turn" }, tool: projector, matchedPredictions: [],
+				rejections: [0, 1].map(() => ({ candidateID: "rejected", match: { kind: "exact", distance: 0 }, cause: { stage: "matching", code: projector } })),
+				provider: { kind: "speculative", candidateID: "candidate", toolExecution: new TimelineInterval(0, 1),
+					match: { kind: "projected", distance: 1, projector } },
+			} };
+		const summary = summarizeSpeculativeTrace([event, event]);
+		expect(summary.partialResultReuseByProjector).toEqual({ [projector]: 2 });
+		expect(summary.actorCandidateRejections).toEqual({ [`matching:${projector}`]: 4 });
+		expect(summary.actorActionsByTool).toEqual({ [projector]: [2, 2] });
+		const prediction: SpeculativeActionEvent<string> = { ...event, type: "prediction", settlement: {
+			prediction: { id: "prediction", source: projector, proposalID: "proposal", actionID: "action" },
+			observation: "unobserved", cause: { stage: "control", code: "turn_closed" },
+		} };
+		const fallback: typeof event = { ...event, settlement: { ...event.settlement, provider: { kind: "actor", origin: "fallback",
+			durationMs: 1, isError: false, cause: { stage: "matching", code: "no_candidate" }, toolExecution: new TimelineInterval(0, 1) } } };
+		const report = benchmarkTraceReport([event, event, prediction, prediction, fallback]);
+		expect(report.speculativeHitsByTool).toEqual({ [projector]: 2 });
+		expect(report.predictionsBySource).toEqual({ [projector]: { settled: 2, observed: 0, matched: 0, adopted: 0 } });
+		expect(report.actorFallbacksByTool).toEqual({ [projector]: 1 });
+	}
+});
 
 const restore = (computation: TimelineInterval): TimelineInterval => {
 	const evidence = TimelineInterval.serialize(computation);
@@ -157,6 +186,7 @@ describe("persisted computation evidence", () => {
 			[{ ...root, spans: [{ startedAt: 0, completedAt: 20 }] }],
 			[{ ...root, spans: [{ startedAt: 10, completedAt: 51 }] }],
 			[{ ...root, clock: undefined }],
+			[{ ...root, groups: new Array(1) }],
 			[root, root], [{ ...root, completedAt: -1 }],
 			[{ ...root, startedAt: NaN }],
 			[{ ...root, timeOrigin: NaN }],

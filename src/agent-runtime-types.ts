@@ -1,6 +1,7 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import type { Api, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
-import type { ActualToolCall, SpeculativePlanSource, TurnInput } from "./runtime.ts";
+import type { Api, AssistantMessage, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
+import type { DrafterTaskBudget } from "./drafter-budget.ts";
+import type { ActualToolCall, SpeculativePlanSource, SpeculativeActionRuntime, RuntimeEventMap, TurnInput } from "./runtime.ts";
 import { stableValueHash } from "./stable-value-hash.ts";
 import type { ToolSettlement } from "./tool-settlement.ts";
 
@@ -14,6 +15,17 @@ export interface DraftOptionsContext {
 export type DraftModelSelection =
 	| Model<Api>
 	| ((actorModel: Model<Api>) => Model<Api> | undefined | Promise<Model<Api> | undefined>);
+
+/** Model services supplied by the host; prediction hints remain private source wiring. */
+export interface DrafterModelOptions {
+	/** Defaults to the Actor model when omitted or unresolved. */
+	readonly draftModel?: DraftModelSelection;
+	/** Resolve request options, including credentials for a different provider. */
+	readonly getDraftOptions?: (context: DraftOptionsContext) => SimpleStreamOptions | Promise<SimpleStreamOptions>;
+	readonly complete: (model: Model<Api>, context: Context, options?: SimpleStreamOptions) => Promise<AssistantMessage>;
+	/** Share reservations with other model requests in the same user task. */
+	readonly drafterBudget?: DrafterTaskBudget;
+}
 
 export interface AgentStartInput extends Pick<DraftOptionsContext, "actorModel" | "actorOptions">, Omit<TurnInput<string>, "terminal"> {
 	readonly context: Context;
@@ -34,9 +46,11 @@ export type AgentPlanSource = SpeculativePlanSource<
 	string,
 	ToolSettlement,
 	AgentStartInput,
-	AgentConsumeInput,
 	AgentStateData
 >;
+
+export type AgentRuntime = SpeculativeActionRuntime<string, ToolSettlement, AgentStartInput, AgentConsumeInput, AgentConsumeInput, AgentStateData>;
+export type AgentRuntimeEvents = RuntimeEventMap<string, ToolSettlement, AgentStartInput, AgentConsumeInput, AgentStateData>;
 
 export function agentBatchKey(sessionID: string, turnID: string): string {
 	return JSON.stringify([sessionID, turnID]);

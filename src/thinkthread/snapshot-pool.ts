@@ -10,104 +10,21 @@ interface ActiveTurn {
 	closed: boolean;
 }
 
-class SnapshotResource {
-	readonly id: FsSnapshotId;
-	readonly logicalBytes: number;
-	readonly computation?: TimelineInterval;
-	private readonly remove: (snapshotID: FsSnapshotId) => Promise<void>;
-	private references = 0;
-	private removal?: Promise<void>;
+type SnapshotData = { readonly snapshotId: FsSnapshotId; readonly computation?: TimelineInterval };
+type SnapshotResource = SnapshotData & { references: number; removal?: Promise<void> };
 
-	constructor(
-		view: { readonly snapshotId: FsSnapshotId; readonly logicalBytes: number; readonly computation?: TimelineInterval },
-		remove: (snapshotID: FsSnapshotId) => Promise<void>,
-	) {
-		this.id = view.snapshotId;
-		this.logicalBytes = view.logicalBytes;
-		this.computation = view.computation;
-		this.remove = remove;
-	}
-
-	retain(): SnapshotLease {
-		if (this.removal) throw new Error(`ThinkThread snapshot ${this.id} is already being removed`);
-		this.references++;
-		return new SnapshotLease(this);
-	}
-
-	async release(): Promise<void> {
-		if (this.references <= 0) return;
-		this.references--;
-		if (this.references !== 0) return;
-		await this.cleanup();
-	}
-
-	async cleanup(): Promise<void> {
-		if (this.references !== 0) return;
-		if (!this.removal) {
-			const removal = this.remove(this.id);
-			this.removal = removal;
-			removal.catch(() => {
-				if (this.removal === removal) this.removal = undefined;
-			});
-		}
-		await this.removal;
-	}
-}
-
-export class SnapshotLease {
+export interface SnapshotLease {
 	readonly resource: SnapshotResource;
-	private released = false;
-
-	constructor(resource: SnapshotResource) {
-		this.resource = resource;
-	}
-
-	get id(): FsSnapshotId {
-		return this.resource.id;
-	}
-
-	get computation(): TimelineInterval | undefined { return this.resource.computation; }
-
-	retain(): SnapshotLease {
-		return this.resource.retain();
-	}
-
-	async release(): Promise<void> {
-		if (this.released) return;
-		this.released = true;
-		await this.resource.release();
-	}
-}
-
-export class ThinkThreadCheckpoint implements WorldCheckpoint {
-	readonly backend = "ThinkThread";
-	readonly id: string;
-	readonly lineage: string;
-	readonly depth: number;
-	private readonly snapshot: SnapshotLease;
-	private readonly owner: object;
-
-	constructor(snapshot: SnapshotLease, lineage: string, depth: number, owner: object) {
-		this.snapshot = snapshot;
-		this.id = snapshot.id;
-		this.lineage = lineage;
-		this.depth = depth;
-		this.owner = owner;
-	}
-
-	retainSnapshot(): SnapshotLease {
-		return this.snapshot.retain();
-	}
-
-	belongsTo(owner: object): boolean {
-		return this.owner === owner;
-	}
+	readonly id: FsSnapshotId;
+	readonly computation?: TimelineInterval;
+	retain(): SnapshotLease;
+	release(): Promise<void>;
 }
 
 export class ThinkThreadSnapshotPool {
 	private readonly durable: DurableFsExecutor;
 	private readonly resources = new Map<FsSnapshotId, SnapshotResource>();
-	private readonly identity = {};
+	private readonly checkpoints = new WeakMap<WorldCheckpoint, SnapshotLease>();
 	private active?: ActiveTurn;
 	private disposed = false;
 
@@ -147,35 +64,37 @@ export class ThinkThreadSnapshotPool {
 		readonly lineage: string;
 		readonly depth: number;
 	} {
+		const snapshot = this.checkpoints.get(checkpoint);
 		if (
-			!(checkpoint instanceof ThinkThreadCheckpoint) ||
+			!snapshot ||
 			checkpoint.backend !== "ThinkThread" ||
-			!checkpoint.belongsTo(this.identity) ||
 			!this.resources.has(checkpoint.id as FsSnapshotId)
 		) {
 			throw new Error("Execution world checkpoint belongs to another backend");
 		}
 		return {
-			lease: checkpoint.retainSnapshot(),
+			lease: snapshot.retain(),
 			lineage: checkpoint.lineage,
 			depth: checkpoint.depth,
 		};
 	}
 
-	checkpoint(snapshot: SnapshotLease, lineage: string, depth: number): ThinkThreadCheckpoint {
+	checkpoint(snapshot: SnapshotLease, lineage: string, depth: number): WorldCheckpoint {
 		if (this.resources.get(snapshot.id) !== snapshot.resource) {
 			throw new Error(`ThinkThread snapshot ${snapshot.id} is not owned by this execution world`);
 		}
-		return new ThinkThreadCheckpoint(snapshot, lineage, depth, this.identity);
+		const checkpoint = { backend: "ThinkThread", id: snapshot.id, lineage, depth };
+		this.checkpoints.set(checkpoint, snapshot);
+		return checkpoint;
 	}
 
-	ownSnapshot(view: { readonly snapshotId: FsSnapshotId; readonly logicalBytes: number; readonly computation?: TimelineInterval }): SnapshotLease {
+	ownSnapshot(view: SnapshotData): SnapshotLease {
 		if (this.resources.has(view.snapshotId)) {
 			throw new Error(`ThinkThread snapshot ${view.snapshotId} is already owned by this execution world`);
 		}
-		const resource = new SnapshotResource(view, (snapshotID) => this.remove(snapshotID));
+		const resource = { snapshotId: view.snapshotId, computation: view.computation, references: 0 };
 		this.resources.set(view.snapshotId, resource);
-		return resource.retain();
+		return this.retain(resource);
 	}
 
 	async invalidate(): Promise<void> {
@@ -197,7 +116,7 @@ export class ThinkThreadSnapshotPool {
 		this.disposed = true;
 		await this.finishActive();
 		for (let round = 0; round < 3 && this.resources.size > 0; round++) {
-			await Promise.allSettled([...this.resources.values()].map((resource) => resource.cleanup()));
+			await Promise.allSettled([...this.resources.values()].map((resource) => this.cleanup(resource)));
 		}
 		await this.durable.drainCleanup();
 	}
@@ -215,8 +134,28 @@ export class ThinkThreadSnapshotPool {
 		if (turn.base) await (await turn.base).release();
 	}
 
-	private async remove(snapshotID: FsSnapshotId): Promise<void> {
-		await this.durable.snapshotRemove(snapshotID);
-		this.resources.delete(snapshotID);
+	private retain(resource: SnapshotResource): SnapshotLease {
+		if (resource.removal) throw new Error(`ThinkThread snapshot ${resource.snapshotId} is already being removed`);
+		resource.references++;
+		let released = false;
+		return {
+			resource, id: resource.snapshotId, computation: resource.computation,
+			retain: () => this.retain(resource),
+			release: async () => {
+				if (released) return;
+				released = true;
+				if (--resource.references === 0) await this.cleanup(resource);
+			},
+		};
+	}
+
+	private async cleanup(resource: SnapshotResource): Promise<void> {
+		if (resource.references !== 0) return;
+		if (!resource.removal) {
+			const removal = this.durable.snapshotRemove(resource.snapshotId).then(() => { this.resources.delete(resource.snapshotId); });
+			resource.removal = removal;
+			void removal.catch(() => { if (resource.removal === removal) resource.removal = undefined; });
+		}
+		await resource.removal;
 	}
 }

@@ -1,9 +1,10 @@
 import { nonNegativeCount as finiteCount } from "./number-utils.ts";
 import { nonNegativeNumber } from "./setting-input.ts";
 import { errorDetail } from "./error-utils.ts";
-import type { ResolutionCause, SettledSourceRequest, SourceRequestIdentity, SourceRequestSettlement } from "./settlement.ts";
-import { cause } from "./settlement.ts";
-import { waitForCompletion } from "./scheduler.ts";
+import {
+	type ResolutionCause, type SettledSourceRequest, type SourceRequestIdentity, type SourceRequestSettlement, cause,
+} from "./settlement.ts";
+import { waitForCompletion } from "./runtime-lifecycle.ts";
 
 /** A deliberate source admission decision; it produced no proposal and is not a provider failure. */
 export class SourceRequestSuppressed extends Error {

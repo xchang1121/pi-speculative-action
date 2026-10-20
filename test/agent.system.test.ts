@@ -15,18 +15,120 @@ import { PatternAwareStore, patternAwareSettings, patternAwareActionSemantics } 
 import { readText, temporaryDirectories } from "./filesystem.ts";
 import { expectHiddenCompute, idleResources, resourceWorld, systemHost } from "./agent-system-fixture.ts";
 import { disposable, onExit, deferred, gated, nextTurn } from "./async.ts";
-import { commitBenchmarkFixture, compileBenchmarkHelper, createLinuxProcessBenchmark, textOutput } from "./linux-process-fixture.ts";
-import { EXACT_TOOL_OBSERVATION, type ToolObservationContract } from "../src/tool-settlement.ts";
+import { createLinuxProcessBenchmark, textOutput } from "./linux-process-fixture.ts";
+import { EXACT_TOOL_OBSERVATION, type ToolObservationContract, type ToolInvocation } from "../src/tool-settlement.ts";
 import { ActorForkPlanSource } from "../src/actor-fork-plan-source.ts";
-import type { AgentPlanSource } from "../src/agent-runtime-types.ts";
+import type { AgentPlanSource, AgentRuntimeEvents } from "../src/agent-runtime-types.ts";
 import { toolUse } from "./model.ts";
 
 const writeText = (cwd: string, file: string, text: string) => writeFile(path.join(cwd, file), text);
 const track = <T>(pending: Promise<unknown>[], task: Promise<T>) => { pending.push(task); void task.catch(() => {}); return task; };
 const toolReply = (...args: Parameters<typeof fauxToolCall>) => fauxAssistantMessage(fauxToolCall(...args));
+const resourceInvocation = (cwd: string, tool: string, input: unknown) => {
+	const invocation = resolvePiToolInvocation(tool, input, { cwd, environment: {} })!;
+	return { ...invocation, ...bindResourceOperation(invocation.filesystem!, cwd) };
+};
 
 const directories = temporaryDirectories("pi-agent-system-");
 afterEach(directories.dispose);
+
+test.each([[false, true], [true, true], [false, false], [true, false]])("observes and reuses work with prediction sources off (production %s, reuse %s)", async (enabled, reuseEnabled) => {
+	const cwd = await directories.create(), tools = [createReadTool(cwd)], learning: boolean[] = [];
+	for (const name of ["a", "b"]) await writeText(cwd, `${name}.txt`, name);
+	const settings = { enabled, reuseEnabled, drafterEnabled: false, prepareObservedOperations: false,
+		patternAware: { enabled: false, presets: [], minOccurrences: 1, maxContextLength: 1, maxFutureGap: 0 } };
+	const store = new PatternAwareStore(patternAwareSettings(settings.patternAware)), world = resourceWorld();
+	const f = systemHost(cwd, tools, { patternStore: store, resolveInvocation: (tool, input) => resourceInvocation(cwd, tool, input), executionWorlds: [{ ...world,
+		observeOperations: (context, execute, observe) => { expect(context.reuseEnabled).toBe(reuseEnabled); learning.push(context.learn === true); return world.observeOperations!(context, execute, observe); },
+	}] }, settings);
+	await using _cleanup = onExit(f.dispose);
+	let failures = 0;
+	const observed: string[] = [];
+	const unsubscribe = f.host.runtime.subscribe({ actor_observed: event => {
+		failures++; event.concrete.path = "poison"; event.output?.result.content.splice(0); throw new Error("observer failed");
+	} });
+	f.host.runtime.subscribe({ actor_observed: event => { observed.push(String(event.concrete.path)); } });
+	for (const turn of ["first", "second"]) {
+		await f.start(turn);
+		for (const name of ["a", "b"]) expect(textOutput(await f.execute("read", { path: `${name}.txt` }))).toBe(name);
+		await f.finish();
+		unsubscribe();
+	}
+	expect(failures).toBe(2);
+	expect(observed).toEqual(["a.txt", "b.txt", "a.txt", "b.txt"]);
+	expect(f.fallbacks).toEqual(Array(reuseEnabled ? 1 : 4).fill("read"));
+	expect(learning).toEqual(Array(reuseEnabled ? 1 : 4).fill(true));
+	expect(store.snapshot().length).toBeGreaterThan(0);
+	expect(f.materialized).toEqual([]);
+});
+
+test.each(["global", "source", "reuse"])("keeps independent production, reuse and feedback after disabling %s", async toggle => {
+	const cwd = await directories.create(), tools = [createReadTool(cwd)];
+	await writeText(cwd, "input.txt", "policy");
+	const settings = { enabled: true, reuseEnabled: true, drafterEnabled: true, drafterMaxDepth: 0 };
+	const f = systemHost(cwd, tools, { complete: async () => toolReply("read", { path: "input.txt" }),
+		resolveInvocation: (tool, input) => resourceInvocation(cwd, tool, input) }, settings);
+	await using _cleanup = onExit(f.dispose);
+	const feedback: AgentRuntimeEvents["prediction_feedback"][] = [], observations: string[] = [];
+	f.host.runtime.subscribe({ prediction_feedback: event => { feedback.push(event); },
+		actor_observed: event => { observations.push(event.tool); } });
+	await f.start(); await f.ready();
+	settings[toggle === "global" ? "enabled" : toggle === "source" ? "drafterEnabled" : "reuseEnabled"] = false;
+	await f.host.runtime.settingsChanged({ ...settings, prepareObservedOperations: false, resourceCacheMaxEntries: 512, predictionTimeoutMs: 10_000,
+		sourceConfig: { patternAware: { enabled: false } } });
+	await nextTurn(); expect(feedback).toEqual([]);
+	expect(textOutput(await f.execute("read", { path: "input.txt" }))).toBe("policy"); await f.finish();
+	if (toggle !== "reuse") {
+		expect(f.fallbacks).toEqual([]);
+		expect(f.actors[0]?.candidate?.source).toBe("drafter");
+		expect(feedback).toMatchObject([{ served: true, settlement: { prediction: { source: "drafter" }, observation: "observed", match: { matched: true } } }]);
+		await f.start("after"); await f.finish();
+		expect(f.materialized).toHaveLength(1);
+		return;
+	}
+	await f.start("uncached");
+	await expect.poll(() => f.materialized.length).toBe(2);
+	expect(textOutput(await f.execute("read", { path: "input.txt" }))).toBe("policy"); await f.finish();
+	expect(f.completed()).toHaveLength(1);
+	expect(feedback).toHaveLength(2);
+	expect(feedback.every(event => !event.served && event.settlement.observation === "observed")).toBe(true);
+	settings.enabled = false; settings.reuseEnabled = true;
+	await f.start("direct");
+	for (let i = 0; i < 2; i++) expect(textOutput(await f.execute("read", { path: "input.txt" }))).toBe("policy");
+	await f.finish();
+	expect(f.fallbacks).toEqual(["read", "read", "read"]);
+	expect(observations).toEqual(["read", "read", "read", "read"]);
+});
+
+test("prepares previously observed work independently of prediction and preparation switches", async () => {
+	const cwd = await directories.create(), tools = [createReadTool(cwd)], world = resourceWorld(), learning: boolean[] = [];
+	const settings = { enabled: false, drafterEnabled: false, prepareObservedOperations: false };
+	await writeText(cwd, "input.txt", "observed");
+	const f = systemHost(cwd, tools, { speculativeExecutionWorldEnabled: () => settings.prepareObservedOperations,
+		resolveInvocation: (tool, input) => resourceInvocation(cwd, tool, input),
+		executionWorlds: [{ ...world,
+			observeOperations: async (context, execute, observe) => {
+				const output = await world.observeOperations!(context, execute, observe);
+				learning.push(context.learn === true && context.enabled === true);
+				if (context.action) observe([Object.freeze({ backend: world.id, identity: "observed-read", permissionHash: context.action.hash,
+					semantics: PI_ACTION_SEMANTICS.definition("read")!, executionMs: 1, stale: async () => true })]);
+				return output;
+			},
+			speculation: { ...world.speculation!, execute: async context => {
+				const operation = (context.action.executionContext as ToolInvocation).operation!;
+				expect(operation.permission.hash).toBe(operation.binding.permissionHash);
+				return world.speculation!.execute({ ...context, action: operation.permission, args: operation.permission.input });
+			} },
+		}],
+	}, settings);
+	await using _cleanup = onExit(f.dispose);
+	await f.start(); expect(textOutput(await f.execute("read", { path: "input.txt" }))).toBe("observed"); await f.finish();
+	expect(learning).toEqual([true]); expect(f.completed()).toEqual([]);
+	settings.enabled = settings.prepareObservedOperations = true;
+	await f.start("prepare"); await f.ready(1, "execution_preparation"); await f.finish();
+	expect(f.completed().map(event => event.candidate.kind)).toEqual(["operation"]);
+	expect(f.materialized).toEqual([]);
+});
 
 function readDefinition(tool: string): ActionSemanticsDefinition {
 	return { ...PI_ACTION_SEMANTICS.definition("read")!, tool, epoch: tool, projectors: [] };
@@ -53,6 +155,7 @@ const withPreview = (modes: readonly string[]) => modes.flatMap(mode => [mode, `
 
 test.for([...["prediction", "preview"].flatMap(source => ["dynamic", "calculation", "input-read", "stale", "dynamic-budget", "calculation-budget", "input-read-budget"].map(mode => `live-${source}-${mode}`)),
 	...["seed-dynamic", "seed-calculation", "input-read", "input-read-stale", "unkeyed-dynamic"].flatMap(mode => ["raw", "unindexed"].map(access => `${access}-${mode}`)),
+	...["seed-calculation", "seed-dynamic", "input-read"].map(mode => `disabled-${mode}`),
 	"actor", "preview", ...withPreview(["dynamic", "hints", "retired", "calculation", "calculation-unrelated", "calculation-hint"]), "predicted", "stale", "binding", "calculation-key",
 	...withPreview(["seed-dynamic", "seed-calculation"]), "seed-stale", "seed-binding", "seed-calculation-key", "seed-unbounded", "seed-repeat", "seed-revoke",
 	...mixedScenarios, "mixed-binding-unkeyed", ...inputScenarios(true), "unregistered-dynamic", "unregistered-mixed-producer", "late-dynamic",
@@ -64,8 +167,8 @@ test.for([...["prediction", "preview"].flatMap(source => ["dynamic", "calculatio
 	...["large", "opaque"].flatMap(output => [...retainedScenarios, "unkeyed-mixed-producer", "unkeyed-calculation-unrelated"].map(mode => `${output}-${mode}`)),
 	...["after", "after-cancel", "consume", "consume-cancel", "consume-cancel-return", "before"].flatMap(failure => [...retainedScenarios,
 		"unkeyed-mixed-stale", "unkeyed-mixed-cancel-return"].map(mode => `${failure}:${mode}`))])("shares actual inputs across independently formatted tools (%s)", async scenario => {
-	const prefix = /^(?:(raw|unindexed)-)?(?:(live)-(?:(prediction|preview)-|(revoked)-)?)?/.exec(scenario)!;
-	const [, discovery, live, source, revoked] = prefix; scenario = scenario.slice(prefix[0].length);
+	const prefix = /^(?:(disabled)-)?(?:(raw|unindexed)-)?(?:(live)-(?:(prediction|preview)-|(revoked)-)?)?/.exec(scenario)!;
+	const [, noReuse, discovery, live, source, revoked] = prefix; scenario = scenario.slice(prefix[0].length);
 	const parentFailure = scenario.includes(":") ? scenario.split(":")[0] : undefined, early = parentFailure === "before", parentThrows = parentFailure && !parentFailure.endsWith("return");
 	scenario = scenario.replace(/^.*:/, "");
 	const parentOutput = scenario.startsWith("large-") ? { transcript: "x".repeat(128 * 1024) } : scenario.startsWith("opaque-") ? { callback: () => "parent-only" } : {};
@@ -84,7 +187,7 @@ test.for([...["prediction", "preview"].flatMap(source => ["dynamic", "calculatio
 	let builds = 0, renders = 0, disposed = 0, effects = 0, borrowers = 0, bindings = 0, revoke: (() => void | Promise<void>) | undefined, revokeParent: typeof revoke;
 	const pure = mode.startsWith("calculation"), unrelated = mode.includes("unrelated") || mode.startsWith("calculation-hint");
 	const stale = mode.endsWith("stale") || mode.endsWith("-create") || mode.endsWith("-deleted"), cancelled = mode.endsWith("cancel"), overlap = mode === "mixed-cancel" || mode === "mixed-overlap", failed = mode.endsWith("failure");
-	const unavailable = early || mode.endsWith("budget") && !source || mode.endsWith("outside") || rejected, mutates = (index: number) => (direct || mixed) && index === Number(mode !== "mixed-producer");
+	const unavailable = !!noReuse || early || mode.endsWith("budget") && !source || mode.endsWith("outside") || rejected, mutates = (index: number) => (direct || mixed) && index === Number(mode !== "mixed-producer");
 	const entered = deferred(), joined = deferred(), release = deferred(), controller = new AbortController(), actors: Promise<unknown>[] = [];
 	const parentGate = gated(), producer = new AbortController(), parentError = new Error("producer failed after independent work");
 	const names = ["count_records", "summarize_records", "other_records"], read = readDefinition("read");
@@ -93,7 +196,7 @@ test.for([...["prediction", "preview"].flatMap(source => ["dynamic", "calculatio
 		resourceScope: mutates(index) || mode === "unbounded" && !index ? undefined : "captured_inputs" as const,
 		canonicalize: (input: unknown, cwd: string) => { const key = !(index ? mode.endsWith("unkeyed") : unkeyed) && read.canonicalize(input, cwd); return key ? { ...key,
 			resources: pure || index && mode.startsWith("dynamic") ? [] : index && mode.startsWith("hints") ? ["selector"] : key.resources } : undefined; } }));
-	const actionSemantics = new ActionSemanticsRegistry(unknown ? definitions.slice(1) : definitions), settings = { drafterEnabled: source === "prediction", resourceCacheMaxBytes: 32 * 1024,
+	const actionSemantics = new ActionSemanticsRegistry(unknown ? definitions.slice(1) : definitions), settings = { enabled: !seeded || preview, reuseEnabled: !noReuse, drafterEnabled: source === "prediction", resourceCacheMaxBytes: 32 * 1024,
 		...(live ? { scheduling: { heavyCpu: 1 } } : {}) }; // Each live call owns one slot.
 	const render = (tool: string, count: unknown, actual = true) => { if (actual) renders++; return { content: [fauxText(`${tool}:${count}`)], details: { tool, ...(tool === names[0] ? parentOutput : {}) } }; };
 	const count = async (read: () => Promise<unknown>, actual = true) => { const text = pure ? "one\ntwo\n" : await read(); if (actual) builds++; return metadata ? JSON.stringify(text) : String(text).trim().split("\n").length; };
@@ -159,7 +262,7 @@ test.for([...["prediction", "preview"].flatMap(source => ["dynamic", "calculatio
 	expect(builds).toBe(Number(!early)); expect(renders).toBe(builds);
 	if (mode.startsWith("retired") || mode === "predicted") { await f.finish(); tools.shift(); settings.drafterEnabled = mode === "predicted"; await f.start("consumer"); }
 	if (mode === "predicted") await f.ready(2);
-	if (unrelated) { await f.finish(); settings.drafterEnabled = true; await f.start("unrelated"); await f.ready(seeded ? 1 : 2); await f.finish(); settings.drafterEnabled = false; await f.start("consumer"); }
+	if (unrelated) { await f.finish(); settings.enabled = settings.drafterEnabled = true; await f.start("unrelated"); await f.ready(seeded ? 1 : 2); await f.finish(); settings.drafterEnabled = false; await f.start("consumer"); }
 	if (preview && !direct) { await f.preview(names[1]!, args); await expect.poll(() => renders).toBe(unrelated ? 3 : 2); }
 	if (stale) await writeFile(listing ? path.join(path.dirname(file), "third.txt") : file, "one\ntwo\nthree\n");
 	if (mode.endsWith("-same-size")) await writeFile(file, "new\none\n");
@@ -183,7 +286,7 @@ test.for([...["prediction", "preview"].flatMap(source => ["dynamic", "calculatio
 	else expect(await result).toEqual(expected);
 	expect({ builds, renders, effects }).toEqual({ builds: (direct || stale || unavailable || mode.includes("binding") || mode === "calculation-key" || mode === "revoke" ? 2 : 1) + Number(unrelated) - Number(direct && cancelled) - Number(early),
 		renders: 2 + Number(unrelated) + Number(overlap) - Number(failed || cancelled) - Number(early), effects: Number(direct || mixed) + Number(changes) + Number(overlap && !cancelled) - Number(direct && cancelled) - Number(early && mutates(0)) });
-	expect(f.fallbacks).toEqual([...(seeded ? [names[0]!] : []), ...(discovery || live && !preview || early || mutates(1) || mode === "revoke" || rejected ? Array(1 + Number(overlap)).fill(names[1]!) : [])]);
+	expect(f.fallbacks).toEqual([...(seeded ? [names[0]!] : []), ...(noReuse || discovery || live && !preview || early || mutates(1) || mode === "revoke" || rejected ? Array(1 + Number(overlap)).fill(names[1]!) : [])]);
 	if (direct && cancelled) await expect(readFile(path.join(cwd, `${names[1]}.txt`))).rejects.toMatchObject({ code: "ENOENT" });
 	else if ((direct || mixed) && !(early && mutates(0))) expect(await readText(cwd, `${names[Number(mode !== "mixed-producer")]}.txt`)).toBe(metadata ? textOutput(expected).slice(names[1]!.length + 1) : String(stale || changes ? 3 : range ? 1 : 2));
 	if (transfer) { await revokeParent!(); expect(await f.execute(names[1]!, args)).toEqual(expected); }
@@ -366,7 +469,7 @@ test.for([...["actor", "prediction", "preview"].flatMap(source => ["pending", "c
 test.for(["reopened", "inflight", "completed", "binding", "reverse", "deep", "added", "changed", "removed", "shared", "shared-refresh", "shared-stale", "shared-unused", "shared-native", "shared-native-stale", "shared-exact", "shared-exact-stale",
 	...["", "-stale", "-failure-before", "-cancel-before", "-failure-after", "-cancel-after", "-close", "-terminal", "-disable", "-dispose", "-poison"].map(suffix => `shared-exact-fallback${suffix}`)])("retains learned continuations across authoritative batch updates (%s)", async mode => {
 	const changed = mode === "changed", removed = mode === "removed", replaces = changed || removed, added = mode === "added", deep = mode === "deep", reopen = mode === "reopened";
-	const fallback = mode.includes("fallback"), closure = mode.match(/-(close|terminal|disable|dispose)$/)?.[1], poison = mode.endsWith("poison"), failed = /failure|cancel/.test(mode);
+	const fallback = mode.includes("fallback"), closure = mode.match(/-(close|terminal|dispose)$/)?.[1], disabled = mode.endsWith("-disable"), poison = mode.endsWith("poison"), failed = /failure|cancel/.test(mode);
 	const shared = mode.startsWith("shared"), stale = mode.endsWith("stale"), unused = mode === "shared-unused", native = mode.includes("native"), exact = mode.includes("exact"), consumed = shared && !stale && !unused && !closure && !poison && !mode.endsWith("before");
 	const cwd = await directories.create(), names = [reopen ? "read" : "inspect_index", reopen ? "read" : "open_record", "render_record", replaces ? "status_index" : "background_status", "summarize_record", "tail_record"];
 	const files = ["root.txt", "child.txt", "leaf.txt", "status.txt", "other.txt", "tail.txt"];
@@ -431,7 +534,8 @@ test.for(["reopened", "inflight", "completed", "binding", "reverse", "deep", "ad
 	expect(predictions(2)).toMatchObject(replaces ? [{ settlement: { observation: "unobserved", cause: { code: "superseded" } } }] : []);
 	if (deep) expect(predictions(5)).toEqual([]);
 	if (mode === "binding") expect(bindings).toBe(1);
-	leafGate.release(); runtimeSettings.patternAware = { ...settings, enabled: false };
+	leafGate.release(); if (mode === "binding") await f.ready([files[2]!], "pattern_aware");
+	runtimeSettings.patternAware = { ...settings, enabled: false };
 	const prior = reopened.snapshot().filter(pattern => pattern.targetTool === names[1]);
 	if (stale) await writeText(cwd, files[1]!, "changed\n");
 	f.fallbacks.length = 0;
@@ -442,8 +546,12 @@ test.for(["reopened", "inflight", "completed", "binding", "reverse", "deep", "ad
 			const result = track(actors, f.execute(names[shared && !exact ? 4 : step]!, { path: files[unused ? 4 : step] }, controller.signal));
 			if (fallback && !poison) {
 				await nativeGate.entered; await nextTurn(); expect(predictions(step)).toEqual([]);
-				if (closure) {
-					const closed = closure === "dispose" ? f.dispose() : closure === "disable" ? f.host.runtime.settingsChanged({ enabled: false, resourceCacheMaxEntries: 0, predictionTimeoutMs: 10_000 }) : f.finish(closure === "terminal");
+				if (disabled) {
+					await f.host.runtime.settingsChanged({ enabled: false, prepareObservedOperations: false, resourceCacheMaxEntries: 512, predictionTimeoutMs: 10_000,
+						sourceConfig: { patternAware: { ...settings, enabled: false } } });
+					expect(predictions(step)).toEqual([]);
+				} else if (closure) {
+					const closed = closure === "dispose" ? f.dispose() : f.finish(closure === "terminal");
 					track(actors, closed); await expect.poll(() => predictions(step).length).toBe(1); nativeGate.release(); await closed;
 				}
 				nativeGate.release();
@@ -477,7 +585,7 @@ test.for(["refresh", "replace", "remove", "replace-shared", "remove-shared",
 	const failed = early && /failure|cancel/.test(usage), controller = new AbortController(), failure = new Error("consumer failed");
 	const cwd = await directories.create(), gate = gated(), background = gated(), args = { path: "input.txt" };
 	for (const file of ["input.txt", "other.txt", "unused.txt", "unrelated.txt"]) await writeText(cwd, file, `${file}\n`);
-	const settled: Parameters<NonNullable<AgentPlanSource["onSettled"]>>[0][] = [], readers: Promise<unknown>[] = [];
+	const settled: AgentRuntimeEvents["prediction_feedback"][] = [], readers: Promise<unknown>[] = [];
 	const received = () => settled.filter(item => item.feedback === "before");
 	let native = false, updated = false, backgroundFinished = false;
 	const proposal = (after = false) => ({ id: "claimed", source: "late-source", revision: Number(after), actions: after && mode === "remove" ? [] : [{
@@ -487,10 +595,6 @@ test.for(["refresh", "replace", "remove", "replace-shared", "remove-shared",
 		override readonly source: AgentPlanSource = {
 			id: "late-source", enabled: () => true,
 			propose: () => proposal(),
-			observe: ({ concrete }) => {
-				if (concrete.path !== "other.txt") return;
-				updated = true; return proposal(true);
-			}, onSettled: feedback => { settled.push(feedback); },
 		};
 	}();
 	const { tools, actionSemantics, world, resolveInvocation } = readScenario(cwd, ["read", "summarize_rows", ...early ? ["background_status"] : []]);
@@ -508,6 +612,13 @@ test.for(["refresh", "replace", "remove", "replace-shared", "remove-shared",
 				return result!;
 			}, cwd) };
 		},
+	});
+	f.host.runtime.subscribe({
+		actor_observed: async ({ startInput, concrete }) => {
+			if (concrete.path !== "other.txt") return;
+			updated = true; await f.host.runtime.submitPlan(startInput, proposal(true));
+		},
+		prediction_feedback: feedback => { settled.push(feedback); },
 	});
 	await using _cleanup = onExit(async () => { gate.release(); background.release(); await Promise.allSettled(readers); await f.dispose(); });
 	await f.start(); await f.ready(); native = true;
@@ -995,8 +1106,8 @@ test.for(["unrelated", "changed", "descendant", "mutation", "mutation-stat", "mu
 	const mutation = change.startsWith("mutation"), metadata = change.endsWith("stat"), split = /split|stale/.test(change), stale = change.endsWith("stale");
 	const native = await createLinuxProcessBenchmark("pi-sealed-result-", mutation ? "overlayfs" : "git"), { workspace: cwd, workspaceSandbox: sandbox } = native;
 	for (const [name, text] of [["a", "original"], ["b", "other"], ["c", "second"]]) await writeText(cwd, `${name}.txt`, text + "\n");
-	if (mutation) await compileBenchmarkHelper(cwd, "reader", { code: `#include <fcntl.h>\n#include <stdio.h>\n#include <sys/stat.h>\n#include <unistd.h>\nint main(void){char text[64];int f=open("a.txt",O_RDONLY),n=read(f,text,sizeof text);${metadata ? 'struct stat s;if(fstat(f,&s))return 1;dprintf(1,"%llu:%lld:%ld\\n",(unsigned long long)s.st_ino,(long long)s.st_ctim.tv_sec,s.st_ctim.tv_nsec);' : ""}close(f);for(volatile unsigned long i=0;i<600000000ul;i++);return n<0||write(1,text,n)!=n;}\n` });
-	await commitBenchmarkFixture(cwd, "Sealed result reuse");
+	if (mutation) await native.compile("reader", { code: `#include <fcntl.h>\n#include <stdio.h>\n#include <sys/stat.h>\n#include <unistd.h>\nint main(void){char text[64];int f=open("a.txt",O_RDONLY),n=read(f,text,sizeof text);${metadata ? 'struct stat s;if(fstat(f,&s))return 1;dprintf(1,"%llu:%lld:%ld\\n",(unsigned long long)s.st_ino,(long long)s.st_ctim.tv_sec,s.st_ctim.tv_nsec);' : ""}close(f);for(volatile unsigned long i=0;i<600000000ul;i++);return n<0||write(1,text,n)!=n;}\n` });
+	await native.commit("Sealed result reuse");
 	let predict = change === "descendant" || mutation, requests = 0, drafted = 0; const prepared: string[] = [];
 	const body = mutation ? `${split ? "stat --printf='%i:%z\\n' a.txt; " : ""}./reader` : "cat a.txt", command = body + (mutation ? "; printf once >> marker" : "");
 	const steps = mutation ? [{ tool: "write", input: { path: "a.txt", content: "prepared\n" } }, { tool: "bash", input: { command } }]

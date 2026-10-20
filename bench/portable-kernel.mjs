@@ -94,7 +94,7 @@ async function qualifyPiSearch(name) {
 			}, authoritative: (request) => { counts.actor++; return bound.authoritative(request); } };
 		const probe = searchJourney({ cwd: root, name, tools, args, invocation, world: resources,
 			settings: { maxConcurrentActions: capacity },
-			// Keep the paused producer until explicit disable, independently of the runner's CPU affinity.
+			// Keep the paused producer until explicit disposal, independently of the runner's CPU affinity.
 			resources: capacity > 1 ? { initial: { cpuCount: capacity, idleCpuCount: capacity },
 				sample: async () => ({ cpuCount: capacity, idleCpuCount: capacity }) } : undefined,
 		});
@@ -228,12 +228,13 @@ async function qualifyPiSearch(name) {
 			const fallback = await cancelled.actor("independent", different);
 			assert.deepEqual(fallback.output, direct.result); assert.equal(fallback.settlement.provider.kind, "actor");
 			assert.equal(await Promise.race([cancelled.candidate, Promise.resolve("still running")]), "still running");
-			const disabling = cancelled.host.runtime.settingsChanged(disabled);
-			assert.equal(await Promise.race([disabling, Promise.resolve("pending")]), "pending", "disable must retain the paused input owner");
-			released.resolve(); await bounded(disabling, "disable cleanup");
+			await cancelled.host.runtime.settingsChanged(disabled);
+			assert.equal(await Promise.race([cancelled.candidate, Promise.resolve("still running")]), "still running", "prediction disable retains running work");
+			const disposing = cancelled.host.runtime.disposeSession("search-qualification");
+			assert.equal(await Promise.race([disposing, Promise.resolve("pending")]), "pending", "disposal must retain the paused input owner");
+			released.resolve(); await bounded(disposing, "session cleanup");
 		} finally { released.resolve(); }
 		assert.equal((await bounded(cancelled.candidate, "cancelled candidate")).status, "cancelled");
-		await cancelled.host.runtime.settingsChanged({ ...disabled, enabled: true });
 		await cancelled.start("recovery", false);
 		assert.deepEqual((await cancelled.actor("recovery")).output, stale.output); assert.equal(cancelled.actorCalls(), 2);
 		const arrivals = { actor: Promise.withResolvers(), producer: Promise.withResolvers() }, drain = Promise.withResolvers();
@@ -276,7 +277,7 @@ async function qualifySearchExtension() {
 	let selected, candidate, settlement, session;
 	const native = (name, args) => createPiToolDefinitions(cwd).get(name).execute("expected", args, undefined, undefined, session.extensionRunner.createContext());
 	const choices = new Map(Object.entries({
-		"Speculative action": ["Tools & execution", "Enabled", "Apply changes", "Close"],
+		"Speculative action": ["Tools & execution", "Speculative production", "Apply changes", "Close"],
 		"Tools & execution": ["Execution routes", "Back"], "Execution routes": ["Search execution", "Back"],
 		"Search execution": ["Captured search"],
 	}));
@@ -336,10 +337,18 @@ async function qualifySearchExtension() {
 		}
 		await command("status"); await invoke(...selected);
 		await command("off");
+		settlement = Promise.withResolvers();
 		assert.deepEqual(await invoke(...selected), await native(...selected));
+		assert.equal((await bounded(settlement.promise, "reuse with predictions off")).provider.kind, "speculative");
+		choices.set("Speculative action", ["Cache & reuse", "Apply changes", "Close"]);
+		await command(""); settlement = Promise.withResolvers();
+		assert.deepEqual(await invoke(...selected), await native(...selected));
+		assert.equal((await bounded(settlement.promise, "reuse disabled through TUI")).provider.kind, "actor");
 		await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
-		assert.equal(JSON.parse(await fs.readFile(path.join(agent, "speculative-action.json"))).searchExecution, "captured");
-		return { results, appliedThroughTui: true, noExtraSetup: true, obsoleteSettingsUseNative: true, refreshRetiresWorker: true, disabledNativeActor: true };
+		const saved = JSON.parse(await fs.readFile(path.join(agent, "speculative-action.json")));
+		assert.equal(saved.searchExecution, "captured"); assert.equal(saved.reuseEnabled, false);
+		return { results, appliedThroughTui: true, noExtraSetup: true, obsoleteSettingsUseNative: true, refreshRetiresWorker: true,
+			predictionsOffRetainsReuse: true, reuseSwitchPersists: true };
 	} finally {
 		try { await session?.extensionRunner.emit({ type: "session_shutdown", reason: "quit" }); session?.dispose(); }
 		finally {

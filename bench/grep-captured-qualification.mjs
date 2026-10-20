@@ -66,8 +66,8 @@ async function qualifyCaptured(cwd, profile, args, expected, changed, rejected =
   const observeInputs = (view) => ({ ...view,
     readFile: (target, ...options) => { reads.add(path.relative(cwd, target)); return view.readFile(target, ...options); },
     readdir: (target) => { enumerated.add(path.relative(cwd, target).split(path.sep).join("/")); return view.readdir(target); },
-    ...(view.prepare ? { prepare: (binding, key, build, consume, target) =>
-      view.prepare(binding, key, (borrowed) => build(observeInputs(borrowed)), consume, target) } : {}),
+    ...(view.prepare ? { prepare: (binding, key, build, ...options) =>
+      view.prepare(binding, key, (borrowed, signal) => build(observeInputs(borrowed), signal), ...options) } : {}),
   });
   const invocation = { ...bound, filesystem: (view, request) => {
     executions++;

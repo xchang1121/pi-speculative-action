@@ -240,6 +240,28 @@ static int read_line(int fd, char *buffer, size_t capacity) {
 	return -1;
 }
 
+static int process_open(pid_t pid, const char *name, int flags) {
+	char path[64]; snprintf(path, sizeof(path), "/proc/%d/%s", pid, name);
+	return open(path, flags);
+}
+static FILE *process_file(pid_t pid, const char *name) {
+	char path[64]; snprintf(path, sizeof(path), "/proc/%d/%s", pid, name);
+	return fopen(path, "re");
+}
+static FILE *descriptor_file(pid_t pid, int fd) {
+	char path[64]; snprintf(path, sizeof(path), "/proc/%ld/fdinfo/%d", (long)pid, fd);
+	return fopen(path, "re");
+}
+static int descriptor_stat(pid_t pid, int fd, struct stat *state) {
+	char path[64]; snprintf(path, sizeof(path), "/proc/%ld/fd/%d", (long)pid, fd);
+	return stat(path, state);
+}
+/* Reopening procfs creates a new description; it never substitutes for an OFD duplicate. */
+static int reopen_descriptor(int fd, int flags) {
+	char path[64]; snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
+	return open(path, flags);
+}
+
 /* A continuation carries private userspace state, never another process's PID or
  * kernel handles. The existing resource transaction supplies the authoritative
  * OFDs before this image resumes at its blocked read. */
@@ -262,6 +284,7 @@ struct image_header {
 	struct { uint64_t pointer; uint32_t size, signature, flags, pad; } rseq;
 	struct { unsigned long handler, flags, restorer, mask; } actions[65];
 	stack_t alternate;
+	struct rlimit limits[RLIM_NLIMITS];
 };
 struct process_image {
 	struct image_header header;
@@ -293,21 +316,22 @@ static int image_wait(pid_t pid, int *status) {
 	return result == pid && WIFSTOPPED(*status) ? 0 : -1;
 }
 static int image_memory(pid_t pid, uint64_t address, void *data, size_t bytes, int writing) {
-	char path[64]; snprintf(path, sizeof(path), "/proc/%d/mem", pid);
-	int fd = open(path, (writing ? O_RDWR : O_RDONLY) | O_CLOEXEC);
+	int fd = process_open(pid, "mem", (writing ? O_RDWR : O_RDONLY) | O_CLOEXEC);
 	if (fd < 0) return -1;
-	size_t moved = 0;
-	while (moved < bytes) {
-		ssize_t size = writing ? pwrite(fd, (char *)data + moved, bytes - moved, (off_t)(address + moved)) :
-			pread(fd, (char *)data + moved, bytes - moved, (off_t)(address + moved));
-		if (size < 0 && errno == EINTR) continue;
-		if (size <= 0) break;
-		moved += (size_t)size;
-	}
-	close(fd); return moved == bytes ? 0 : -1;
+	int result = lseek(fd, (off_t)address, SEEK_SET) == (off_t)address ? transfer(fd, data, bytes, writing) : -1;
+	close(fd); return result;
 }
-static int image_call(pid_t pid, unsigned long at, long number, unsigned long a, unsigned long b,
-	unsigned long c, unsigned long d, unsigned long e, unsigned long f, long *result) {
+/* Confinement owns CORE/NPROC; elapsed CPU and realtime budgets are not in the image. */
+static int image_limits(pid_t pid, struct image_header *header, int writing) {
+	for (unsigned resource = 0; resource < RLIM_NLIMITS; resource++) if (resource != RLIMIT_CORE && resource != RLIMIT_NPROC) {
+		struct rlimit *limit = &header->limits[resource];
+		if ((!writing && prlimit(pid, resource, NULL, limit)) || limit->rlim_cur > limit->rlim_max ||
+			((resource == RLIMIT_CPU || resource == RLIMIT_RTTIME) && limit->rlim_cur != RLIM_INFINITY) ||
+			(writing && prlimit(pid, resource, limit, NULL))) return -1;
+	}
+	return 0;
+}
+static long image_invoke(pid_t pid, unsigned long at, long number, const unsigned long args[6]) {
 	struct user_regs_struct saved, call;
 	if (ptrace(PTRACE_GETREGS, pid, 0, &saved) < 0) return -1;
 	call = saved;
@@ -317,31 +341,27 @@ static int image_call(pid_t pid, unsigned long at, long number, unsigned long a,
 		if (errno || ptrace(PTRACE_POKETEXT, pid, at, (original & ~0xffffffUL) | 0xcc050fUL) < 0) return -1;
 	}
 	call.rip = at; call.rax = number; call.orig_rax = (unsigned long)-1;
-	call.rdi = a; call.rsi = b; call.rdx = c; call.r10 = d; call.r8 = e; call.r9 = f;
-	int unmapping = at == IMAGE_SCRATCH && number == SYS_munmap && a == IMAGE_SCRATCH;
+	call.rdi = args[0]; call.rsi = args[1]; call.rdx = args[2]; call.r10 = args[3]; call.r8 = args[4]; call.r9 = args[5];
+	int unmapping = at == IMAGE_SCRATCH && number == SYS_munmap && args[0] == IMAGE_SCRATCH;
 	if (ptrace(PTRACE_SETREGS, pid, 0, &call) < 0) return -1;
 	for (unsigned step = 0; step < (unmapping ? 2U : 1U); step++)
 		if (ptrace(unmapping ? PTRACE_SYSCALL : PTRACE_CONT, pid, 0, 0) < 0 || image_wait(pid, &status) < 0 ||
 			WSTOPSIG(status) != (unmapping ? SIGTRAP | 0x80 : SIGTRAP) || (unsigned)status >> 16) return -1;
-	if (ptrace(PTRACE_GETREGS, pid, 0, &call) < 0 || call.rip != at + (unmapping ? 2 : 3)) return -1;
-	if (bootstrap && ptrace(PTRACE_POKETEXT, pid, at, original) < 0) return -1;
-	if (ptrace(PTRACE_SETREGS, pid, 0, &saved) < 0) return -1;
-	*result = (long)call.rax; return 0;
+	if (ptrace(PTRACE_GETREGS, pid, 0, &call) < 0 || call.rip != at + (unmapping ? 2 : 3) ||
+		(bootstrap && ptrace(PTRACE_POKETEXT, pid, at, original) < 0) || ptrace(PTRACE_SETREGS, pid, 0, &saved) < 0) return -1;
+	return (long)call.rax;
 }
-static int image_syscall(pid_t pid, long number, unsigned long a, unsigned long b,
-	unsigned long c, unsigned long d, unsigned long e, unsigned long f, long expected) {
-	long result;
-	return image_call(pid, IMAGE_SCRATCH, number, a, b, c, d, e, f, &result) == 0 && result == expected ? 0 : -1;
-}
+#define image_call(pid, at, number, ...) image_invoke(pid, at, number, (unsigned long[6]){__VA_ARGS__})
+#define image_syscall(pid, number, ...) image_call(pid, IMAGE_SCRATCH, number, __VA_ARGS__)
 static int image_scratch(pid_t pid) {
-	long result; unsigned char code[] = {0x0f, 0x05, 0xcc};
+	unsigned char code[] = {0x0f, 0x05, 0xcc};
 	return image_call(pid, 0, SYS_mmap, IMAGE_SCRATCH, 8192, PROT_READ | PROT_WRITE | PROT_EXEC,
-		MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, (unsigned long)-1, 0, &result) == 0 && result == IMAGE_SCRATCH &&
+		MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1) == IMAGE_SCRATCH &&
 		image_memory(pid, IMAGE_SCRATCH, code, sizeof(code), 1) == 0 ? 0 : -1;
 }
 static int image_maps(pid_t pid, struct image_header *header, int capturing) {
-	char path[64], line[8192]; snprintf(path, sizeof(path), "/proc/%d/smaps", pid);
-	FILE *input = fopen(path, "re"); if (!input) return -1;
+	char line[8192];
+	FILE *input = process_file(pid, "smaps"); if (!input) return -1;
 	int valid = 0, checked = 1;
 	struct image_map *map = NULL;
 	while (fgets(line, sizeof(line), input)) {
@@ -378,9 +398,8 @@ done:
 	fclose(input); return valid ? 0 : -1;
 }
 static int image_mm(pid_t pid, struct image_header *header, unsigned long code) {
-	char path[64], data[8192]; unsigned long fields[53] = {0};
-	snprintf(path, sizeof(path), "/proc/%d/stat", pid);
-	FILE *file = fopen(path, "re"); if (!file) return -1;
+	char data[8192]; unsigned long fields[53] = {0};
+	FILE *file = process_file(pid, "stat"); if (!file) return -1;
 	int valid = fgets(data, sizeof(data), file) != NULL; fclose(file); if (!valid) return -1;
 	char *position = strrchr(data, ')'), *saved; if (!position) return -1;
 	unsigned index = 3;
@@ -388,11 +407,11 @@ static int image_mm(pid_t pid, struct image_header *header, unsigned long code) 
 		if (index != 3) fields[index] = strtoull(part, NULL, 10);
 	long brk = (long)fields[47];
 	/* A fresh ELF image has brk == start_brk until its first instruction. */
-	if (index < 52 || fields[20] != 1 || (code && image_call(pid, code, SYS_brk, 0, 0, 0, 0, 0, 0, &brk) < 0)) return -1;
+	if (index < 52 || fields[20] != 1 || (code && (brk = image_call(pid, code, SYS_brk, 0)) < 0)) return -1;
 	header->mm = (struct prctl_mm_map){.start_code = fields[26], .end_code = fields[27], .start_stack = fields[28],
 		.start_data = fields[45], .end_data = fields[46], .start_brk = fields[47], .brk = (unsigned long)brk,
 		.arg_start = fields[48], .arg_end = fields[49], .env_start = fields[50], .env_end = fields[51], .exe_fd = (unsigned)-1};
-	snprintf(path, sizeof(path), "/proc/%d/auxv", pid); int fd = open(path, O_RDONLY | O_CLOEXEC); if (fd < 0) return -1;
+	int fd = process_open(pid, "auxv", O_RDONLY | O_CLOEXEC); if (fd < 0) return -1;
 	ssize_t size = read(fd, header->auxv, sizeof(header->auxv)); close(fd);
 	if (size <= 0 || size >= (ssize_t)sizeof(header->auxv)) return -1;
 	header->auxv_size = (size_t)size; return 0;
@@ -474,7 +493,7 @@ int pi_prepare_exec_call(pid_t pid, void **context, void **file_context, const c
 	const struct user_regs_struct *original = &call->original;
 	int at = original->orig_rax == SYS_execveat;
 	if ((!at && original->orig_rax != SYS_execve) || original->cs != 0x33 || original->rip < 2) goto done;
-	snprintf(path, sizeof(path), "/proc/%d/mem", pid); memory = open(path, O_RDONLY | O_CLOEXEC);
+	memory = process_open(pid, "mem", O_RDONLY | O_CLOEXEC);
 	unsigned long address = at ? original->rsi : original->rdi;
 	ssize_t length = memory >= 0 ? pread(memory, name, sizeof(name), address) : -1;
 	if (length <= 0 || !memchr(name, 0, (size_t)length)) { result = 0; goto done; }
@@ -585,8 +604,7 @@ int pi_restore_exec_context(pid_t pid, const char *source, const char *invoked, 
 	if (!header || length > 8192 || ptrace(PTRACE_GETREGS, pid, 0, &registers) < 0 || registers.cs != 0x33 || image_mm(pid, header, 0) < 0) goto done;
 	for (size_t at = 0; at + 16 <= header->auxv_size; at += 16) if (*(unsigned long *)(header->auxv + at) == AT_EXECFN) { slot = at + 8; break; }
 	if (!slot) goto done;
-	snprintf(path, sizeof(path), "/proc/%d/mem", pid);
-	int memory = open(path, O_RDONLY | O_CLOEXEC); if (memory < 0) goto done;
+	int memory = process_open(pid, "mem", O_RDONLY | O_CLOEXEC); if (memory < 0) goto done;
 	ssize_t read = pread(memory, original, sizeof(original), *(unsigned long *)(header->auxv + slot)); close(memory);
 	if (read <= 0 || !memchr(original, 0, (size_t)read)) goto done;
 	if (!prefix && !strcmp(original, name)) { result = 0; goto done; }
@@ -636,27 +654,19 @@ done:
 
 static int image_read_backing(int fd, const struct image_map *map, void *buffer) {
 	size_t length = (size_t)(map->end - map->start), bytes = map->offset >= map->size ? 0 :
-		(size_t)(map->size - map->offset < length ? map->size - map->offset : length), moved = 0;
+		(size_t)(map->size - map->offset < length ? map->size - map->offset : length);
 	memset(buffer, 0, length);
-	while (moved < bytes) {
-		ssize_t size = pread(fd, (char *)buffer + moved, bytes - moved, (off_t)(map->offset + moved));
-		if (size < 0 && errno == EINTR) continue;
-		if (size <= 0) return -1;
-		moved += (size_t)size;
-	}
-	return 0;
+	return !bytes || (lseek(fd, (off_t)map->offset, SEEK_SET) == (off_t)map->offset && transfer(fd, buffer, bytes, 0) == 0) ? 0 : -1;
 }
 /* pagemap's file-page bit is available without PFNs. Equal bytes alone cannot
  * distinguish an untouched file page from a private page written back to its old value. */
 static int image_cow(pid_t pid, uint64_t start, size_t length, unsigned char *cow) {
-	char path[64]; snprintf(path, sizeof(path), "/proc/%d/pagemap", pid);
-	int fd = open(path, O_RDONLY | O_CLOEXEC); if (fd < 0) return -1;
+	int fd = process_open(pid, "pagemap", O_RDONLY | O_CLOEXEC); if (fd < 0) return -1;
 	uint64_t pages[256]; size_t count = length / 4096, moved = 0;
 	while (moved < count) {
 		size_t chunk = count - moved < 256 ? count - moved : 256;
-		ssize_t size = pread(fd, pages, chunk * sizeof(*pages), (off_t)((start / 4096 + moved) * sizeof(*pages)));
-		if (size < 0 && errno == EINTR) continue;
-		if (size != (ssize_t)(chunk * sizeof(*pages))) break;
+		if (lseek(fd, (off_t)((start / 4096 + moved) * sizeof(*pages)), SEEK_SET) < 0 ||
+			transfer(fd, pages, chunk * sizeof(*pages), 0) < 0) break;
 		for (size_t i = 0; i < chunk; i++) {
 			if (!(pages[i] & (UINT64_C(1) << 63))) { close(fd); return -1; }
 			cow[moved + i] = !(pages[i] & (UINT64_C(1) << 61));
@@ -685,9 +695,8 @@ static int descriptor_numbers(pid_t pid, int minimum, int *fds, unsigned capacit
 
 /* Read installed state, never a tracee's mutable result/control buffer. */
 static int descriptor_info(pid_t pid, int fd, int64_t *position) {
-	char name[64], line[256]; unsigned flags; int result = -1; int64_t offset = -1;
-	snprintf(name, sizeof(name), "/proc/%ld/fdinfo/%d", (long)pid, fd);
-	FILE *file = fopen(name, "re"); if (!file) return -1;
+	char line[256]; unsigned flags; int result = -1; int64_t offset = -1;
+	FILE *file = descriptor_file(pid, fd); if (!file) return -1;
 	while (fgets(line, sizeof(line), file)) {
 		if (sscanf(line, "flags: %o", &flags) == 1 && flags <= INT_MAX) result = (int)flags;
 		if (position) sscanf(line, "pos: %" SCNd64, &offset);
@@ -701,8 +710,8 @@ static int image_descriptors(pid_t pid, struct process_image *image) {
 	int fds[MAX_HANDLES], count = descriptor_numbers(pid, 0, fds, MAX_HANDLES - image->fd_count);
 	if (count < 0) return -1;
 	for (int i = 0; i < count; i++) {
-		char path[64]; struct stat state; snprintf(path, sizeof(path), "/proc/%d/fd/%d", pid, fds[i]);
-		if (stat(path, &state) < 0) return -1;
+		struct stat state;
+		if (descriptor_stat(pid, fds[i], &state) < 0) return -1;
 		unsigned index = image->fd_count++;
 		image->fds[index].fd = fds[i]; image->fds[index].flags = descriptor_info(pid, fds[i], &image->fds[index].offset);
 		image->fds[index].device = state.st_dev; image->fds[index].inode = state.st_ino;
@@ -725,8 +734,8 @@ struct process_credentials {
 };
 
 static int process_credentials(pid_t pid, struct process_credentials *value) {
-	char filename[64], line[256]; snprintf(filename, sizeof(filename), "/proc/%d/status", pid);
-	FILE *input = fopen(filename, "re"); if (!input) return -1;
+	char line[256];
+	FILE *input = process_file(pid, "status"); if (!input) return -1;
 	unsigned fields = 0;
 	while (fgets(line, sizeof(line), input)) {
 		if (sscanf(line, "PPid: %u", &value->parent) == 1) fields |= 1;
@@ -751,7 +760,7 @@ static int image_status(pid_t pid, int consumer) {
 }
 static int image_write(int output, pid_t pid, struct process_image *image, int complete) {
 	struct image_header *header = &image->header;
-	if (dprintf(output, "PIIMAGE %d %u %zu %" PRIu64 "\n", pid, image->fd_count, complete ? sizeof(*header) : 0, complete ? header->length : 0) < 0) return -1;
+	if (dprintf(output, "PIIMAGE4 %d %u %zu %" PRIu64 "\n", pid, image->fd_count, complete ? sizeof(*header) : 0, complete ? header->length : 0) < 0) return -1;
 	for (unsigned i = 0; i < image->fd_count; i++) if (dprintf(output, "%d %d %" PRId64 " %ju %ju %d\n", image->fds[i].fd,
 		image->fds[i].flags, image->fds[i].offset, image->fds[i].device, image->fds[i].inode, image->fds[i].fd) < 0) return -1;
 	return !complete || (transfer(output, header, sizeof(*header), 1) == 0 && transfer(output, image->data, (size_t)header->length, 1) == 0) ? 0 : -1;
@@ -763,7 +772,7 @@ int pi_prepare_process_image(pid_t pid, const char *path, unsigned long watched_
 	if (ptrace(PTRACE_GETREGS, pid, 0, &header->registers) < 0 || header->registers.cs != 0x33 ||
 		!pi_process_image_frontier(header->registers.orig_rax) || ((long)header->registers.rax != -ENOSYS &&
 			(pi_process_image_frontier(header->registers.orig_rax) != 1 || ((long)header->registers.rax != -512 && (long)header->registers.rax != -514))) ||
-		image_status(pid, 0) < 0) goto done;
+		image_status(pid, 0) < 0 || image_limits(pid, header, 0) < 0) goto done;
 	unsigned long original; unsigned char bootstrap_cow[2]; unsigned short instruction;
 	uint64_t bootstrap = header->registers.rip & ~UINT64_C(4095);
 	size_t bootstrap_length = ((header->registers.rip + sizeof(original) - 1) & ~UINT64_C(4095)) - bootstrap + 4096;
@@ -782,13 +791,12 @@ int pi_prepare_process_image(pid_t pid, const char *path, unsigned long watched_
 	if (ptrace(PTRACE_GETREGSET, pid, NT_X86_XSTATE, &xstate) < 0 ||
 		ptrace(PTRACE_GETSIGMASK, pid, sizeof(header->sigmask), &header->sigmask) < 0) goto done;
 	header->xstate_size = xstate.iov_len;
-	for (unsigned signal = 1; signal <= 64; signal++) if (signal != SIGKILL && signal != SIGSTOP) {
-		if (image_syscall(pid, SYS_rt_sigaction, signal, 0, IMAGE_SCRATCH + 4096, 8, 0, 0, 0) < 0 ||
-			image_memory(pid, IMAGE_SCRATCH + 4096, &header->actions[signal], sizeof(header->actions[signal]), 0) < 0) goto done;
-	}
-	if (image_syscall(pid, SYS_sigaltstack, 0, IMAGE_SCRATCH + 4096, 0, 0, 0, 0, 0) < 0 ||
+	for (unsigned signal = 1; signal <= 64; signal++) if (signal != SIGKILL && signal != SIGSTOP &&
+		image_syscall(pid, SYS_rt_sigaction, signal, 0, IMAGE_SCRATCH + 4096 + signal * sizeof(*header->actions), 8) != 0) goto done;
+	if (image_memory(pid, IMAGE_SCRATCH + 4096, header->actions, sizeof(header->actions), 0) < 0 ||
+		image_syscall(pid, SYS_sigaltstack, 0, IMAGE_SCRATCH + 4096) != 0 ||
 		image_memory(pid, IMAGE_SCRATCH + 4096, &header->alternate, sizeof(header->alternate), 0) < 0 || (header->alternate.ss_flags & SS_ONSTACK) ||
-		image_syscall(pid, SYS_prctl, PR_GET_TID_ADDRESS, IMAGE_SCRATCH + 4096, 0, 0, 0, 0, 0) < 0 ||
+		image_syscall(pid, SYS_prctl, PR_GET_TID_ADDRESS, IMAGE_SCRATCH + 4096) != 0 ||
 		image_memory(pid, IMAGE_SCRATCH + 4096, &header->clear_tid, sizeof(header->clear_tid), 0) < 0 ||
 		syscall(SYS_get_robust_list, pid, &header->robust, &header->robust_length) < 0 ||
 		ptrace((enum __ptrace_request)0x420f, pid, sizeof(header->rseq), &header->rseq) != sizeof(header->rseq)) goto done;
@@ -829,7 +837,7 @@ int pi_prepare_process_image(pid_t pid, const char *path, unsigned long watched_
 			offset += length / 4096;
 		}
 	}
-	header->magic = UINT64_C(0x50494d4147453033);
+	header->magic = UINT64_C(0x50494d4147453034);
 	if (ftruncate(output, 0) < 0 || lseek(output, 0, SEEK_SET) != 0) goto done;
 	result = image_write(output, pid, image, 1);
 done:
@@ -850,7 +858,7 @@ static int image_load(struct decision_job *job, size_t length, const char *physi
 	struct process_image *image = job->image;
 	struct image_reader input = {.cursor = image->allocation, .remaining = length};
 	struct image_header *header = &image->header; char line[MAX_LINE]; size_t header_size; uint64_t bytes;
-	if (image_line(&input, line, sizeof(line)) < 0 || sscanf(line, "PIIMAGE %d %u %zu %" SCNu64, &image->producer,
+	if (image_line(&input, line, sizeof(line)) < 0 || sscanf(line, "PIIMAGE4 %d %u %zu %" SCNu64, &image->producer,
 		&image->fd_count, &header_size, &bytes) != 4 || image->producer <= 0 || image->fd_count > MAX_HANDLES ||
 		header_size != sizeof(*header) || bytes > IMAGE_BYTES) goto fail;
 	for (unsigned i = 0; i < image->fd_count; i++) if (image_line(&input, line, sizeof(line)) < 0 ||
@@ -859,7 +867,7 @@ static int image_load(struct decision_job *job, size_t length, const char *physi
 		image->fds[i].fd < 0 || image->fds[i].fd == INT_MAX || image->fds[i].source < 0 || image->fds[i].flags < 0 || image->fds[i].offset < 0) goto fail;
 	if (input.remaining != sizeof(*header) + bytes) goto fail;
 	memcpy(header, input.cursor, sizeof(*header));
-	if (header->magic != UINT64_C(0x50494d4147453033) || header->length != bytes ||
+	if (header->magic != UINT64_C(0x50494d4147453034) || header->length != bytes ||
 		!header->count || header->count > IMAGE_MAPS || !header->xstate_size || header->xstate_size > sizeof(header->xstate) ||
 		!header->auxv_size || header->auxv_size > sizeof(header->auxv) || header->mm.auxv || header->mm.exe_fd != (unsigned)-1 ||
 		header->registers.cs != 0x33 || header->registers.orig_rax != (unsigned long)-1 || !pi_process_image_frontier(header->registers.rax) ||
@@ -886,8 +894,7 @@ static int image_load(struct decision_job *job, size_t length, const char *physi
 		 * the temporary pathname used to reconstruct its private producer. */
 		for (unsigned fd = 0; fd < image->fd_count && image->files[i] < 0; fd++) if (image->fds[fd].device == map->device && image->fds[fd].inode == map->inode)
 			for (unsigned pin = 0; pin < job->capture_count; pin++) if (job->captures[pin].descriptor == image->fds[fd].source) {
-				char path[64]; snprintf(path, sizeof(path), "/proc/self/fd/%d", job->captures[pin].duplicate);
-				image->files[i] = open(path, O_RDONLY | O_CLOEXEC); break;
+				image->files[i] = reopen_descriptor(job->captures[pin].duplicate, O_RDONLY | O_CLOEXEC); break;
 			}
 		struct stat state;
 		if (image->files[i] < 0) image->files[i] = open(map->path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
@@ -910,9 +917,8 @@ static int duplicate_tracee_fd(struct decision_job *job, unsigned fd) {
 	#if defined(SYS_pidfd_open) && defined(SYS_pidfd_getfd)
 	if (job->pidfd < 0) job->pidfd = (int)syscall(SYS_pidfd_open, job->pid, 0);
     if (job->pidfd < 0) {
-        char path[64], line[256]; int group = job->pid; FILE *status;
-        snprintf(path, sizeof(path), "/proc/%d/status", job->pid);
-        if ((status = fopen(path, "re"))) { while (fgets(line, sizeof(line), status)) if (sscanf(line, "Tgid: %d", &group) == 1) break; fclose(status); }
+        char line[256]; int group = job->pid; FILE *status = process_file(job->pid, "status");
+        if (status) { while (fgets(line, sizeof(line), status)) if (sscanf(line, "Tgid: %d", &group) == 1) break; fclose(status); }
         if (group != job->pid && syscall(SYS_kcmp, job->pid, group, KCMP_FILES, 0, 0) == 0) job->pidfd = (int)syscall(SYS_pidfd_open, group, 0);
     }
 
@@ -941,7 +947,7 @@ static int image_sources(pid_t pid, const int *pins, unsigned count, int *source
 	const unsigned long address = IMAGE_SCRATCH + 4096;
 	struct decision_job target = {.pid = pid, .pidfd = -1};
 	int channel[2] = {-1, -1}, sender = -1, result = -1;
-	if (image_syscall(pid, SYS_socketpair, AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0, address, 0, 0, 0) < 0 ||
+	if (image_syscall(pid, SYS_socketpair, AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0, address) != 0 ||
 		image_memory(pid, address, channel, sizeof(channel), 0) < 0 || (sender = duplicate_tracee_fd(&target, (unsigned)channel[1])) < 0) goto done;
 	packet.vector = (struct iovec){.iov_base = &packet.byte, .iov_len = 1};
 	packet.message = (struct msghdr){.msg_iov = &packet.vector, .msg_iovlen = 1, .msg_control = packet.control.bytes,
@@ -955,7 +961,7 @@ static int image_sources(pid_t pid, const int *pins, unsigned count, int *source
 	packet.message.msg_control = (void *)(address + offsetof(struct image_message, control));
 	memset(&packet.control, 0, sizeof(packet.control));
 	if (image_memory(pid, address, &packet, sizeof(packet), 1) < 0 ||
-		image_syscall(pid, SYS_recvmsg, channel[0], address, MSG_DONTWAIT | MSG_CMSG_CLOEXEC, 0, 0, 0, 1) < 0 ||
+		image_syscall(pid, SYS_recvmsg, channel[0], address, MSG_DONTWAIT | MSG_CMSG_CLOEXEC) != 1 ||
 		image_memory(pid, address, &packet, sizeof(packet), 0) < 0) goto done;
 	header = (struct cmsghdr *)packet.control.bytes;
 	if (packet.byte || (packet.message.msg_flags & (MSG_CTRUNC | MSG_TRUNC | MSG_OOB)) ||
@@ -968,7 +974,7 @@ static int image_sources(pid_t pid, const int *pins, unsigned count, int *source
 	result = 0;
 done:
 	close(sender); close(target.pidfd);
-	for (unsigned end = 0; end < 2; end++) if (channel[end] >= 0 && image_syscall(pid, SYS_close, channel[end], 0, 0, 0, 0, 0, 0) < 0) result = -1;
+	for (unsigned end = 0; end < 2; end++) if (channel[end] >= 0 && image_syscall(pid, SYS_close, channel[end]) != 0) result = -1;
 	return result;
 }
 
@@ -986,18 +992,19 @@ static int image_handles(pid_t pid, struct decision_job *job) {
 		const struct file_position *position = resource_position(job, source);
 		if (position) source = sources[position - job->positions];
 		else if (source >= 3) return -1;
-		if (image_call(pid, IMAGE_SCRATCH, SYS_fcntl, source, F_DUPFD_CLOEXEC, minimum, 0, 0, 0, &pins[i]) < 0 || pins[i] < minimum || pins[i] >= INT_MAX) return -1;
+		pins[i] = image_syscall(pid, SYS_fcntl, source, F_DUPFD_CLOEXEC, minimum);
+		if (pins[i] < minimum || pins[i] >= INT_MAX) return -1;
 		minimum = (int)pins[i] + 1;
 	}
-	for (unsigned p = 0; p < job->position_count; p++) if (image_syscall(pid, SYS_close, sources[p], 0, 0, 0, 0, 0, 0) < 0) return -1;
-	for (unsigned i = 0; i < image->fd_count; i++) if (image_syscall(pid, SYS_dup3, (unsigned long)pins[i], image->fds[i].fd,
-		image->fds[i].flags & O_CLOEXEC, 0, 0, 0, image->fds[i].fd) < 0) return -1;
+	for (unsigned p = 0; p < job->position_count; p++) if (image_syscall(pid, SYS_close, sources[p]) != 0) return -1;
+	for (unsigned i = 0; i < image->fd_count; i++) if (image_syscall(pid, SYS_dup3, pins[i], image->fds[i].fd,
+		image->fds[i].flags & O_CLOEXEC) != image->fds[i].fd) return -1;
 	for (int i = 0; i < count; i++) {
 		unsigned next = 0;
 		while (next < image->fd_count && image->fds[next].fd != current[i]) next++;
-		if (next == image->fd_count && image_syscall(pid, SYS_close, current[i], 0, 0, 0, 0, 0, 0) < 0) return -1;
+		if (next == image->fd_count && image_syscall(pid, SYS_close, current[i]) != 0) return -1;
 	}
-	for (unsigned i = 0; i < image->fd_count; i++) if (image_syscall(pid, SYS_close, (unsigned long)pins[i], 0, 0, 0, 0, 0, 0) < 0) return -1;
+	for (unsigned i = 0; i < image->fd_count; i++) if (image_syscall(pid, SYS_close, pins[i]) != 0) return -1;
 	return 0;
 }
 static int image_restore(pid_t pid, struct decision_job *job) {
@@ -1008,10 +1015,10 @@ static int image_restore(pid_t pid, struct decision_job *job) {
 	/* A forked qualification child may inherit an rseq registration. Exec clears it
 	 * in the actual consumer; unregister before removing either old image. */
 	if (ptrace((enum __ptrace_request)0x420f, pid, sizeof(initial->rseq), &initial->rseq) != sizeof(initial->rseq)) goto done;
-	if (initial->rseq.pointer && image_syscall(pid, SYS_rseq, initial->rseq.pointer, initial->rseq.size, 1, initial->rseq.signature, 0, 0, 0) < 0) goto done;
+	if (initial->rseq.pointer && image_syscall(pid, SYS_rseq, initial->rseq.pointer, initial->rseq.size, 1, initial->rseq.signature) != 0) goto done;
 	for (unsigned i = 0; i < initial->count; i++) if (!image_special(&initial->maps[i])) {
 		const struct image_map *map = &initial->maps[i];
-		if (image_syscall(pid, SYS_munmap, map->start, map->end - map->start, 0, 0, 0, 0, 0) < 0) goto done;
+		if (image_syscall(pid, SYS_munmap, map->start, map->end - map->start) != 0) goto done;
 	}
 	for (unsigned i = 0; i < initial->count; i++) if (image_special(&initial->maps[i]) && strcmp(initial->maps[i].path, "[vsyscall]")) {
 		const struct image_map *map = &initial->maps[i]; unsigned target = 0;
@@ -1019,7 +1026,7 @@ static int image_restore(pid_t pid, struct decision_job *job) {
 		if (target == header->count) goto done;
 		const struct image_map *next = &header->maps[target]; if (map->end - map->start != next->end - next->start) goto done;
 		if (map->start != next->start && image_syscall(pid, SYS_mremap, map->start, map->end - map->start,
-			next->end - next->start, MREMAP_MAYMOVE | MREMAP_FIXED, next->start, 0, (long)next->start) < 0) goto done;
+			next->end - next->start, MREMAP_MAYMOVE | MREMAP_FIXED, next->start) != (long)next->start) goto done;
 	}
 	for (unsigned i = 0; i < header->count; i++) {
 		struct image_map *map = &header->maps[i]; if (image_special(map)) continue;
@@ -1028,13 +1035,13 @@ static int image_restore(pid_t pid, struct decision_job *job) {
 			if (image_sources(pid, &image->files[i], 1, &fd) < 0) goto done;
 		} else { flags |= MAP_ANONYMOUS; if (!strcmp(map->path, "[stack]")) flags |= MAP_GROWSDOWN; }
 		size_t length = (size_t)(map->end - map->start);
-		if (image_syscall(pid, SYS_mmap, map->start, length, PROT_READ | PROT_WRITE, flags, (unsigned long)fd, map->offset, (long)map->start) < 0 ||
-			(fd >= 0 && image_syscall(pid, SYS_close, (unsigned long)fd, 0, 0, 0, 0, 0, 0) < 0)) goto done;
+		if (image_syscall(pid, SYS_mmap, map->start, length, PROT_READ | PROT_WRITE, flags, fd, map->offset) != (long)map->start ||
+			(fd >= 0 && image_syscall(pid, SYS_close, fd) != 0)) goto done;
 		if (!map->file) { if (image_memory(pid, map->start, image->data + offset, length, 1) < 0) goto done; }
 		else for (size_t page = 0; page < length / 4096; page++) if (image->data[offset + 2 * length + page] &&
 			image_memory(pid, map->start + page * 4096, image->data + offset + page * 4096, 4096, 1) < 0) goto done;
-		if (image_syscall(pid, SYS_mprotect, map->start, length, map->prot, 0, 0, 0, 0) < 0 ||
-			(map->no_huge_pages && image_syscall(pid, SYS_madvise, map->start, length, MADV_NOHUGEPAGE, 0, 0, 0, 0) < 0)) goto done;
+		if (image_syscall(pid, SYS_mprotect, map->start, length, map->prot) != 0 ||
+			(map->no_huge_pages && image_syscall(pid, SYS_madvise, map->start, length, MADV_NOHUGEPAGE) != 0)) goto done;
 		offset += length * (1 + map->file) + map->file * (length / 4096);
 	}
 	if (header->clear_tid) {
@@ -1042,24 +1049,22 @@ static int image_restore(pid_t pid, struct decision_job *job) {
 		if (image_memory(pid, header->clear_tid, &original, sizeof(original), 0) < 0 || original != image->producer ||
 			image_memory(pid, header->clear_tid, &pid, sizeof(pid), 1) < 0) goto done;
 	}
-	if (image_syscall(pid, SYS_set_tid_address, header->clear_tid, 0, 0, 0, 0, 0, pid) < 0 ||
-		(header->robust && image_syscall(pid, SYS_set_robust_list, header->robust, header->robust_length, 0, 0, 0, 0, 0) < 0) ||
-		(header->rseq.pointer && image_syscall(pid, SYS_rseq, header->rseq.pointer, header->rseq.size, 0, header->rseq.signature, 0, 0, 0) < 0)) goto done;
-	if (image_handles(pid, job) < 0) goto done;
-	for (unsigned signal = 1; signal <= 64; signal++) if (signal != SIGKILL && signal != SIGSTOP) {
-		if (image_memory(pid, IMAGE_SCRATCH + 4096, &header->actions[signal], sizeof(header->actions[signal]), 1) < 0 ||
-			image_syscall(pid, SYS_rt_sigaction, signal, IMAGE_SCRATCH + 4096, 0, 8, 0, 0, 0) < 0) goto done;
-	}
+	if (image_syscall(pid, SYS_set_tid_address, header->clear_tid) != pid ||
+		(header->robust && image_syscall(pid, SYS_set_robust_list, header->robust, header->robust_length) != 0) ||
+		(header->rseq.pointer && image_syscall(pid, SYS_rseq, header->rseq.pointer, header->rseq.size, 0, header->rseq.signature) != 0)) goto done;
+	if (image_handles(pid, job) < 0 || image_memory(pid, IMAGE_SCRATCH + 4096, header->actions, sizeof(header->actions), 1) < 0) goto done;
+	for (unsigned signal = 1; signal <= 64; signal++) if (signal != SIGKILL && signal != SIGSTOP &&
+		image_syscall(pid, SYS_rt_sigaction, signal, IMAGE_SCRATCH + 4096 + signal * sizeof(*header->actions), 0, 8) != 0) goto done;
 	struct prctl_mm_map mm = header->mm; mm.auxv = (void *)(IMAGE_SCRATCH + 4096); mm.auxv_size = header->auxv_size;
 	if (image_memory(pid, IMAGE_SCRATCH + 4096, &header->alternate, sizeof(header->alternate), 1) < 0 ||
-		image_syscall(pid, SYS_sigaltstack, IMAGE_SCRATCH + 4096, 0, 0, 0, 0, 0, 0) < 0 ||
+		image_syscall(pid, SYS_sigaltstack, IMAGE_SCRATCH + 4096) != 0 ||
 		image_memory(pid, IMAGE_SCRATCH + 4096, header->auxv, header->auxv_size, 1) < 0 ||
 		image_memory(pid, IMAGE_SCRATCH + 256, &mm, sizeof(mm), 1) < 0 ||
-		image_syscall(pid, SYS_prctl, PR_SET_MM, PR_SET_MM_MAP, IMAGE_SCRATCH + 256, sizeof(mm), 0, 0, 0) < 0 ||
+		image_syscall(pid, SYS_prctl, PR_SET_MM, PR_SET_MM_MAP, IMAGE_SCRATCH + 256, sizeof(mm)) != 0 ||
 		ptrace(PTRACE_SETREGS, pid, 0, &header->registers) < 0 ||
-		image_syscall(pid, SYS_munmap, IMAGE_SCRATCH, 8192, 0, 0, 0, 0, 0) < 0) goto done;
+		image_syscall(pid, SYS_munmap, IMAGE_SCRATCH, 8192) != 0) goto done;
 	struct iovec xstate = {.iov_base = header->xstate, .iov_len = header->xstate_size};
-	if (ptrace(PTRACE_SETREGSET, pid, NT_X86_XSTATE, &xstate) < 0 ||
+	if (image_limits(pid, header, 1) < 0 || ptrace(PTRACE_SETREGSET, pid, NT_X86_XSTATE, &xstate) < 0 ||
 		ptrace(PTRACE_SETSIGMASK, pid, sizeof(header->sigmask), &header->sigmask) < 0 ||
 		ptrace(PTRACE_SETREGS, pid, 0, &header->registers) < 0) goto done;
 	result = 0;
@@ -1107,6 +1112,15 @@ static void json_bytes(FILE *out, const char *value, size_t length) {
 	fputc('"', out);
 }
 
+static void json_hex(FILE *out, const unsigned char *bytes, size_t length) {
+	fputc('"', out);
+	for (size_t index = 0; index < length; index++) {
+		putc_unlocked("0123456789abcdef"[bytes[index] >> 4], out);
+		putc_unlocked("0123456789abcdef"[bytes[index] & 15], out);
+	}
+	fputc('"', out);
+}
+
 /* The image is already installed, and stays stopped while its owner decides.
  * Pins outlive the exchange but never the target's resumed execution. */
 struct broker_job {
@@ -1128,10 +1142,10 @@ static int broker_pipes(FILE *out, struct broker_job *job) {
 			if ((fcntl(job->files[other], F_GETFL) & O_ACCMODE) != O_WRONLY && fstat(job->files[other], &other_state) == 0 && other_state.st_dev == state.st_dev && other_state.st_ino == state.st_ino) reader = job->files[other];
 		int length = reader < 0 ? -1 : pipe_bytes(reader, &bytes, &eof);
 		if (length < 0) return -1;
-		fprintf(out, "%s{\"fd\":%d,\"alias\":%d,\"device\":\"%ju\",\"inode\":\"%ju\",\"flags\":%d,\"capacity\":%d,\"eof\":%s,\"queueHex\":\"",
+		fprintf(out, "%s{\"fd\":%d,\"alias\":%d,\"device\":\"%ju\",\"inode\":\"%ju\",\"flags\":%d,\"capacity\":%d,\"eof\":%s,\"queueHex\":",
 			described++ ? "," : "", job->numbers[index], alias, (uintmax_t)state.st_dev, (uintmax_t)state.st_ino, flags, capacity, eof ? "true" : "false");
-		for (int byte = 0; byte < length; byte++) fprintf(out, "%02x", bytes[byte]);
-		fputs("\"}", out); free(bytes);
+		json_hex(out, bytes, (size_t)length);
+		fputc('}', out); free(bytes);
 	}
 	return described;
 }
@@ -1225,12 +1239,12 @@ int pi_broker_finish(void *context, int cancel) {
 		unsigned signal = job->result > 256 ? (unsigned)job->result - 256 : 0;
 		if (replace_with_exit(job->pid, signal ? 128 + signal : (unsigned)job->result) < 0) goto done;
 		if (signal) {
-			struct user_regs_struct regs; unsigned long data[5] = {0, 0, 0, 0, 1UL << (signal - 1)}; long status;
+			struct user_regs_struct regs; unsigned long data[5] = {0, 0, 0, 0, 1UL << (signal - 1)};
 			if (ptrace(PTRACE_GETREGS, job->pid, 0, &regs) < 0) goto done;
 			unsigned long at = (regs.rsp - sizeof(data) - 256) & ~7UL;
 			if (image_memory(job->pid, at, data, sizeof(data), 1) < 0 ||
-				(signal != SIGKILL && signal != SIGSTOP && (image_call(job->pid, 0, SYS_rt_sigaction, signal, at, 0, 8, 0, 0, &status) < 0 || status)) ||
-				image_call(job->pid, 0, SYS_rt_sigprocmask, SIG_UNBLOCK, at + 32, 0, 8, 0, 0, &status) < 0 || status) goto done;
+				(signal != SIGKILL && signal != SIGSTOP && image_call(job->pid, 0, SYS_rt_sigaction, signal, at, 0, 8) != 0) ||
+				image_call(job->pid, 0, SYS_rt_sigprocmask, SIG_UNBLOCK, at + 32, 0, 8) != 0) goto done;
 		}
 		result = 2 + (int)signal;
 	}
@@ -1313,8 +1327,8 @@ static int compare_locks(const void *a, const void *b) {
 }
 
 static int capture_file_locks(pid_t pid, int fd, struct file_locks *locks) {
-	char path[64], line[512]; snprintf(path, sizeof(path), "/proc/%ld/fdinfo/%d", (long)pid, fd);
-	FILE *file = fopen(path, "re"); if (!file) return -1;
+	char line[512];
+	FILE *file = descriptor_file(pid, fd); if (!file) return -1;
 	int result = 0;
 	while (fgets(line, sizeof(line), file)) if (!strncmp(line, "lock:", 5)) {
 		struct ofd_lock lock; dev_t device; ino_t inode;
@@ -1335,9 +1349,8 @@ static int set_file_lock(int fd, struct ofd_lock lock) {
 /* Anonymous inode numbers alone cannot distinguish event counters. fdinfo supplies
  * a kernel-assigned object ID and a non-consuming state observation. */
 static unsigned event_state(pid_t pid, int fd, uint64_t *value, unsigned *semaphore) {
-	char name[64], line[256]; unsigned id = 0, found = 0; uint64_t count = 0; unsigned mode = 0;
-	snprintf(name, sizeof(name), "/proc/%ld/fdinfo/%d", (long)pid, fd);
-	FILE *file = fopen(name, "re");
+	char line[256]; unsigned id = 0, found = 0; uint64_t count = 0; unsigned mode = 0;
+	FILE *file = descriptor_file(pid, fd);
 	while (file && fgets(line, sizeof(line), file)) {
 		if (sscanf(line, "eventfd-count: %" SCNx64, &count) == 1) found |= 1;
 		if (sscanf(line, "eventfd-id: %u", &id) == 1) found |= 2;
@@ -1357,9 +1370,8 @@ static int same_object(const struct file_position *left, const struct file_posit
 /* Object history grants no OFD identity. Foreign ancestry is sticky, including
  * inode recycling: it can only refuse a later proof, never manufacture one. */
 static unsigned remember_object(struct descriptor_domain *domain, pid_t pid, int fd, int foreign) {
-	char name[64]; struct stat state;
-	snprintf(name, sizeof(name), "/proc/%ld/fd/%d", (long)pid, fd);
-	if (stat(name, &state) < 0) { domain->incomplete = 1; return 0; }
+	struct stat state;
+	if (descriptor_stat(pid, fd, &state) < 0) { domain->incomplete = 1; return 0; }
 	unsigned event = !(state.st_mode & S_IFMT) ? event_state(pid, fd, NULL, NULL) : 0;
 	unsigned index = 0;
 	while (index < domain->object_count && !(domain->objects[index].device == state.st_dev &&
@@ -1597,10 +1609,9 @@ static off_t descriptor_seek(int fd, int flags, off_t offset, int whence) {
 /* Read a separate directory OFD so snapshots never consume the shared cursor.
  * Kernel cookies and inode numbers remain raw 64-bit values. Padding is not data. */
 static int directory_bytes(int fd, unsigned char **bytes) {
-	char path[64]; struct stat before, after; int result = -1;
+	struct stat before, after; int result = -1;
 	*bytes = NULL;
-	snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
-	int reader = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	int reader = reopen_descriptor(fd, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
 	if (reader < 0) return -1;
 	if (fstat(reader, &before) < 0 || !(*bytes = calloc(MAX_INPUT_BYTES + 1, 1))) goto done;
 	size_t used = 0; int64_t previous_cookie = 0;
@@ -1642,8 +1653,7 @@ static int pipe_bytes(int fd, unsigned char **bytes, int *eof) {
 	if (!length) return 0;
 	if (pipe2(fds, O_CLOEXEC | O_NONBLOCK) < 0) return -1;
 	if ((fcntl(fd, F_GETFL) & O_ACCMODE) == O_WRONLY) {
-		char name[64]; snprintf(name, sizeof(name), "/proc/self/fd/%d", fd);
-		reader = open(name, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+		reader = reopen_descriptor(fd, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
 	}
 	int capacity = fcntl(fd, F_GETPIPE_SZ);
 	if (capacity > 0 && (fcntl(fds[1], F_GETPIPE_SZ) >= capacity || fcntl(fds[1], F_SETPIPE_SZ, capacity) >= capacity) &&
@@ -1923,9 +1933,7 @@ static int queue_owners_locked(struct decision_job *job) {
 				if (!object || !object->messages) continue;
 				state = (struct stat){.st_dev = object->device, .st_ino = object->inode, .st_mode = S_IFSOCK};
 			} else {
-				char name[64];
-				snprintf(name, sizeof(name), "/proc/%ld/fd/%d", (long)process->pid, fds[index]);
-				if (stat(name, &state) < 0) return -1;
+				if (descriptor_stat(process->pid, fds[index], &state) < 0) return -1;
 				if (!S_ISFIFO(state.st_mode) && !S_ISSOCK(state.st_mode)) continue;
 				if (add_reference(job, &state, descriptor_info(process->pid, fds[index], NULL), -1) < 0) return -1;
 			}
@@ -1975,9 +1983,8 @@ static int outside_references_locked(struct decision_job *job, int pin) {
 		if (count < 0) return unknown;
 		for (int index = 0; index < count; index++) {
 			if (!description) {
-				char name[64]; struct stat current;
-				snprintf(name, sizeof(name), "/proc/%ld/fd/%d", (long)process->pid, fds[index]);
-				if (stat(name, &current) < 0) return unknown;
+				struct stat current;
+				if (descriptor_stat(process->pid, fds[index], &current) < 0) return unknown;
 				if (current.st_dev == state.st_dev && current.st_ino == state.st_ino) {
 					int flags = descriptor_info(process->pid, fds[index], NULL); if (flags < 0) return unknown;
 					access |= (flags & O_ACCMODE) + 1;
@@ -2041,6 +2048,7 @@ fail:
 /* The entire owned tree is stopped until this job retires. Capture the reachable
  * closure before calculating external owners, including rooted queue cycles. */
 static int descriptor_context(struct decision_job *job, char *line, size_t capacity) {
+	FILE *out = NULL;
 	int installed[MAX_HANDLES], total = descriptor_numbers(job->pid, 0, installed, MAX_HANDLES), next = 3;
 	if (total < 0 || !(job->captures = calloc(MAX_POSITIONS, sizeof(*job->captures)))) return -1;
 	for (int index = 0; index < total; index++) {
@@ -2123,62 +2131,62 @@ static int descriptor_context(struct decision_job *job, char *line, size_t capac
 				if (!job->captures[other].outside && job->captures[other].alias == rights->fds[right]) { job->captures[other].outside = 3; external[count++] = other; }
 		}
 	}
-	size_t used = 0;
+	/* w+ also terminates an empty descriptor list. This thread exclusively owns the stream. */
+	out = fmemopen(line, capacity, "w+"); if (!out) goto fail;
 	for (unsigned index = 0; index < job->capture_count; index++) {
 		struct file_position *capture = &job->captures[index];
 		int pin = capture->duplicate, owned = capture->installed ? !job->domain->escaped && !job->domain->uncertain && job->process->table &&
 			!job->process->table->active && descriptor_origin(job->process, capture->descriptor).id != 0 : owned_pin(job->domain, pin);
 		struct stat state; if (fstat(pin, &state) < 0) goto fail;
-		int length = snprintf(line + used, capacity - used,
+		fprintf(out,
 			"%s{\"fd\":%d,\"alias\":%d,\"device\":\"%ju\",\"inode\":\"%ju\",\"flags\":%d,\"offset\":%s%jd%s,\"owned\":%s%s",
 			index ? "," : "", capture->descriptor, capture->alias, capture->device, capture->inode, capture->flags,
 			capture->before > 9007199254740991LL ? "\"" : "", (intmax_t)capture->before, capture->before > 9007199254740991LL ? "\"" : "", owned ? "true" : "false",
 			capture->event ? ",\"type\":\"eventfd\"" : capture->stream ? (S_ISSOCK(state.st_mode) ? ",\"type\":\"socket\"" : ",\"type\":\"pipe\"") : null_device(&state) ? ",\"type\":\"null\"" : capture->directory ? ",\"type\":\"directory\"" : "");
-		if (length < 0 || (size_t)length + 512 >= capacity - used) goto fail;
-		used += (size_t)length;
-		if (!capture->installed) used += (size_t)sprintf(line + used, ",\"pin\":%d", pin);
+		if (!capture->installed) fprintf(out, ",\"pin\":%d", pin);
 		if (S_ISREG(state.st_mode) || capture->event) {
-			used += (size_t)sprintf(line + used, ",\"outside\":%d", capture->outside);
+			fprintf(out, ",\"outside\":%d", capture->outside);
 		}
 		if (capture->locks.count) {
-			if (capture->locks.count * 128UL + 512 >= capacity - used) goto fail;
-			used += (size_t)sprintf(line + used, ",\"locks\":[");
+			fputs(",\"locks\":[", out);
 			for (unsigned index = 0; index < capture->locks.count; index++) {
 				struct ofd_lock *lock = &capture->locks.entries[index];
-				used += (size_t)sprintf(line + used, "%s{\"kind\":%d,\"type\":%d,\"start\":\"%" PRId64 "\",\"length\":\"%" PRId64 "\"}", index ? "," : "", lock->kind, lock->type, lock->start, lock->length);
+				fprintf(out, "%s{\"kind\":%d,\"type\":%d,\"start\":\"%" PRId64 "\",\"length\":\"%" PRId64 "\"}", index ? "," : "", lock->kind, lock->type, lock->start, lock->length);
 			}
-			line[used++] = ']';
+			fputc(']', out);
 		}
 		if (capture->event) {
 			uint64_t value; unsigned semaphore;
 			if (event_state(getpid(), pin, &value, &semaphore) != capture->event) goto fail;
-			used += (size_t)sprintf(line + used, ",\"counter\":{\"id\":%u,\"value\":\"%" PRIu64 "\",\"semaphore\":%u}", capture->event - 1, value, semaphore);
+			fprintf(out, ",\"counter\":{\"id\":%u,\"value\":\"%" PRIu64 "\",\"semaphore\":%u}", capture->event - 1, value, semaphore);
 		} else if ((capture->directory && !(capture->flags & O_PATH)) || capture->stream) {
-			if ((size_t)capture->content_length * 2 + 512 + capture->messages.count * (64 + MAX_POSITIONS * 16) >= capacity - used) goto fail;
-			used += (size_t)sprintf(line + used, ",\"%s\":\"", capture->directory ? "directoryHex" : "queueHex");
-			for (int64_t byte = 0; byte < capture->content_length; byte++) {
-				line[used++] = "0123456789abcdef"[capture->content[byte] >> 4]; line[used++] = "0123456789abcdef"[capture->content[byte] & 15];
-			}
-			line[used++] = '"';
-			if (capture->stream) used += (size_t)sprintf(line + used, ",\"eof\":%s,\"capacity\":%d,\"outside\":%d", capture->eof ? "true" : "false", capture->capacity, endpoint_outside[index]);
+			fprintf(out, ",\"%s\":", capture->directory ? "directoryHex" : "queueHex");
+			json_hex(out, capture->content, (size_t)capture->content_length);
+			if (capture->stream) fprintf(out, ",\"eof\":%s,\"capacity\":%d,\"outside\":%d", capture->eof ? "true" : "false", capture->capacity, endpoint_outside[index]);
 			if (capture->messages.count) {
-				used += (size_t)sprintf(line + used, ",\"messages\":[");
+				fputs(",\"messages\":[", out);
 				for (unsigned message = 0; message < capture->messages.count; message++) {
 					const struct queue_message *entry = &capture->messages.entries[message];
-					used += (size_t)sprintf(line + used, "%s{\"start\":%zu,\"end\":%zu,\"rights\":[", message ? "," : "", entry->start, entry->end);
-					for (unsigned right = 0; right < entry->rights.count; right++) used += (size_t)sprintf(line + used, "%s%d", right ? "," : "", entry->rights.fds[right]);
-					used += (size_t)sprintf(line + used, "]}");
+					fprintf(out, "%s{\"start\":%zu,\"end\":%zu,\"rights\":[", message ? "," : "", entry->start, entry->end);
+					for (unsigned right = 0; right < entry->rights.count; right++) fprintf(out, "%s%d", right ? "," : "", entry->rights.fds[right]);
+					fputs("]}", out);
 				}
-				line[used++] = ']';
+				fputc(']', out);
 			}
-			if (capture->stream >= 4) used += (size_t)sprintf(line + used, ",\"socket\":{\"shutdown\":%d,\"peerShutdown\":%d,\"peerInode\":%u,\"peerQueued\":%d,\"allocated\":%d,\"type\":%u}",
+			if (capture->stream >= 4) fprintf(out, ",\"socket\":{\"shutdown\":%d,\"peerShutdown\":%d,\"peerInode\":%u,\"peerQueued\":%d,\"allocated\":%d,\"type\":%u}",
 				capture->shutdown, capture->peer_shutdown, capture->peer_inode, capture->peer_queued, capture->allocated, capture->socket_type);
 		}
-		line[used++] = '}';
+		fputc('}', out);
+		if (ferror(out)) goto fail;
 	}
-	line[used] = 0;
+	long written = ftell(out);
+	int failed = ferror(out) || written < 0 || (size_t)written >= capacity;
+	if (fclose(out)) failed = 1;
+	out = NULL;
+	if (failed) goto fail;
 	return 0;
 fail:
+	if (out) fclose(out);
 	discard_captures(job);
 	return -1;
 }
@@ -2321,8 +2329,8 @@ static int closed_lock_object(struct decision_job *job, int pin) {
 		int fds[MAX_HANDLES], count = descriptor_numbers(process->pid, 0, fds, MAX_HANDLES);
 		if (!process->table || !process->table->complete || count < 0) return 0;
 		for (int index = 0; index < count; index++) {
-			char name[64]; struct stat state; snprintf(name, sizeof(name), "/proc/%ld/fd/%d", (long)process->pid, fds[index]);
-			if (stat(name, &state) < 0) return 0;
+			struct stat state;
+			if (descriptor_stat(process->pid, fds[index], &state) < 0) return 0;
 			if (state.st_dev != object->device || state.st_ino != object->inode) continue;
 			unsigned represented = 0;
 			while (represented < job->position_count && syscall(SYS_kcmp, process->pid, getpid(), KCMP_FILE, fds[index], job->positions[represented].duplicate) != 0) represented++;
@@ -2368,8 +2376,7 @@ static int prepare_lock_graph(struct decision_job *job, int *fds, const int *sel
 		unsigned previous = 0; while (previous < index && !same_object(position, &job->positions[previous])) previous++;
 		int object = previous < index ? fds[previous] : memfd_create("pi-resource-locks", MFD_CLOEXEC);
 		if (object < 0) return -1;
-		char path[64]; snprintf(path, sizeof(path), "/proc/self/fd/%d", object);
-		fds[index] = open(path, (position->flags & (O_ACCMODE | O_PATH)) | O_CLOEXEC);
+		fds[index] = reopen_descriptor(object, (position->flags & (O_ACCMODE | O_PATH)) | O_CLOEXEC);
 		if (previous == index) close(object);
 		if (fds[index] < 0) return -1;
 	}
@@ -2990,10 +2997,9 @@ static int actor_decision(struct decision_job *job) {
 			}
 		}
 		if (!position->stream && !position->directory && position->content_length >= 0) {
-			char path[64]; struct stat state;
-			snprintf(path, sizeof(path), "/proc/self/fd/%d", position->duplicate);
+			struct stat state;
 			pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-			position->writer = open(path, O_WRONLY | O_CLOEXEC);
+			position->writer = reopen_descriptor(position->duplicate, O_WRONLY | O_CLOEXEC);
 			pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
 			if (position->writer < 0 || fstat(position->writer, &state) < 0 ||
 				(uintmax_t)state.st_dev != position->device || (uintmax_t)state.st_ino != position->inode) goto decline;
@@ -3452,7 +3458,7 @@ static int descriptor_report(int output, struct file_position *positions, unsign
 	}
 	return 0;
 }
-static int execute_descriptors(const char *manifest, const char *report, char *executable, char **command, const char *route, unsigned closed_input, const int *output_flags) {
+static int execute_descriptors(const char *manifest, const char *report, char *executable, char **command, const char *route, unsigned closed_input, const int *output_flags, const rlim_t *stack_limit) {
 	struct file_position positions[MAX_POSITIONS];
 	struct output_relay relays[2] = {{.source = -1, .writer = -1, .destination = 1}, {.source = -1, .writer = -1, .destination = 2}};
 	struct { int flags; uintmax_t inode; } output_state[2] = {{.flags = -1}, {.flags = -1}};
@@ -3553,8 +3559,7 @@ static int execute_descriptors(const char *manifest, const char *report, char *e
 					fd = fcntl(image->producer, F_DUPFD_CLOEXEC, minimum);
 					if (fd >= 0 && fcntl(fd, F_SETFL, position->flags) < 0) { close(fd); goto done; }
 				} else {
-					snprintf(line, sizeof(line), "/proc/self/fd/%d", image->duplicate);
-					fd = open(line, position->flags | O_CLOEXEC);
+					fd = reopen_descriptor(image->duplicate, position->flags | O_CLOEXEC);
 				}
 			} else {
 				int fds[2], valid = 1; struct file_position *peer = NULL;
@@ -3585,8 +3590,7 @@ static int execute_descriptors(const char *manifest, const char *report, char *e
 				close(fds[1]); fd = fds[0]; position->object = (int)index;
 				if (!valid) { close(fd); goto done; }
 				if (position->stream < 4 && (position->flags & 0x8000)) {
-					snprintf(line, sizeof(line), "/proc/self/fd/%d", fd);
-					int reopened = open(line, position->flags | O_CLOEXEC); close(fd); fd = reopened;
+					int reopened = reopen_descriptor(fd, position->flags | O_CLOEXEC); close(fd); fd = reopened;
 				}
 			}
 			if (fd < 0) goto done;
@@ -3673,6 +3677,10 @@ static int execute_descriptors(const char *manifest, const char *report, char *e
 		for (int fd = 1; fd <= 2; fd++) {
 			int flags = output_flags[fd - 1] < 0 ? 0 : fcntl(fd, F_GETFL);
 			if (flags < 0 || (output_flags[fd - 1] >= 0 && fcntl(fd, F_SETFL, (flags & ~(O_APPEND | O_NONBLOCK)) | (output_flags[fd - 1] & (O_APPEND | O_NONBLOCK))) < 0)) _exit(70);
+		}
+		if (stack_limit) {
+			struct rlimit limit; if (getrlimit(RLIMIT_STACK, &limit) < 0) _exit(70);
+			limit.rlim_cur = *stack_limit; if (setrlimit(RLIMIT_STACK, &limit) < 0) _exit(70);
 		}
 		execv(executable, command);
 		_exit(errno == ENOENT ? 127 : 126);
@@ -3806,6 +3814,13 @@ int main(int argc, char **argv) {
 		/* ",<stdout>,<stderr>": status flags the target's outputs carry natively, its parent's own (make's O_APPEND). */
 		char *suffix = argc > 2 ? strchr(argv[2], ',') : NULL;
 		if (suffix && (*suffix++ = 0, sscanf(suffix, "%d,%d", &output_flags[0], &output_flags[1]) != 2 || output_flags[0] < 0 || output_flags[1] < 0)) return 64;
+		char *stack = argc > 2 ? strchr(argv[2], ':') : NULL;
+		rlim_t stack_limit = 0;
+		if (stack) {
+			*stack++ = 0; char *end = stack + strlen(stack); errno = 0;
+			stack_limit = !strcmp(stack, "unlimited") ? RLIM_INFINITY : strtoull(stack, &end, 10);
+			if ((!isdigit((unsigned char)*stack) && strcmp(stack, "unlimited")) || *end || errno) return 64;
+		}
 		if (argc < name + 2 || strspn(argv[2], "012") != 2 ||
 			(strlen(argv[2]) != 2 && (!descriptors || strlen(argv[2]) != 4 || strspn(argv[2] + 2, "ps") != 2 ||
 				(argv[2][0] == argv[2][1] && argv[2][2] != argv[2][3])))) return 64;
@@ -3821,7 +3836,7 @@ int main(int argc, char **argv) {
 		char *executable = argv[name + 1], *manifest = descriptors ? argv[3] : NULL, *report = descriptors ? argv[4] : NULL;
 		argv[name + 1] = argv[name];
 		return execute_descriptors(manifest, report, executable, argv + name + 1, argv[2],
-			!strcmp(argv[1], "--exec-closed-input"), output_flags);
+			!strcmp(argv[1], "--exec-closed-input"), output_flags, stack ? &stack_limit : NULL);
 	}
 	if (argc == 4 && !strcmp(argv[1], "--probe-context")) return probe_context(argv[2], argv[3]);
 	if (argc == 2 && !strcmp(argv[1], "--set-modified-times")) return set_modified_times();

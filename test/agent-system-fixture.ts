@@ -34,8 +34,8 @@ export function systemHost(cwd: string, tools: AgentTool[], options: Partial<Cre
 		executionWorlds: [resourceWorld(PI_ACTION_SEMANTICS, () => 8 * 1024 * 1024)],
 		...options,
 		onEvent: event => { events.push(event); return options.onEvent?.(event); },
-		onCandidateMaterialized: candidate => { materialized.push(candidate); return options.onCandidateMaterialized?.(candidate); },
 	});
+	host.runtime.subscribe({ candidate_materialized: candidate => { materialized.push(candidate); } });
 	const call = (tool: string, args: Record<string, unknown>, id = `call-${++calls}`) => ({ turnID, id, tool, args, tools });
 	const authoritative = async (tool: string, args: Record<string, unknown>, signal?: AbortSignal, id = "oracle", invocation = options.resolveInvocation?.(tool, args) ?? null) => {
 		const bound = await invocation;

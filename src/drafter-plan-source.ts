@@ -1,11 +1,13 @@
 import { BoundedRecencyMap } from "./bounded-recency-map.ts";
 import { calculateContextTokens, type AgentToolCall } from "@earendil-works/pi-agent-core";
-import { clampThinkingLevel, fauxAssistantMessage, Type, validateToolArguments, type Api, type AssistantMessage, type Context, type Model, type SimpleStreamOptions, type ToolResultMessage } from "@earendil-works/pi-ai";
+import {
+	clampThinkingLevel, fauxAssistantMessage, Type, validateToolArguments, type Api, type AssistantMessage, type Context, type Model,
+	type SimpleStreamOptions, type ToolResultMessage,
+} from "@earendil-works/pi-ai";
 import { clampCandidateLimit, DEFAULTS, drafterRequestTemperature, normalizeDrafterRequestSettings, type DrafterRequestSettings } from "./common.ts";
-import { DrafterTaskBudget, drafterInputTokens, drafterOpportunityKey } from "./drafter-budget.ts";
-import { agentBatchKey, type AgentPlanSource, type DraftModelSelection, type DraftOptionsContext } from "./agent-runtime-types.ts";
+import { DrafterTaskBudget, drafterInputTokens, drafterOpportunityKey, type DrafterBudgetSnapshot } from "./drafter-budget.ts";
+import { agentBatchKey, type AgentPlanSource, type AgentRuntime, type DrafterModelOptions } from "./agent-runtime-types.ts";
 import type { PlanAction, PlanProposal } from "./plan-proposal.ts";
-import type { PatternAwareCandidate } from "./pattern-aware.ts";
 import type { SpeculativeActionSettings } from "./runtime.ts";
 import { stableValueHash } from "./stable-value-hash.ts";
 import { immutableSnapshot } from "./stable-json.ts";
@@ -13,8 +15,7 @@ import { SourceRequestSuppressed } from "./source-request.ts";
 import { cause, predictionLearning } from "./settlement.ts";
 import { canonicalToolObservation, toolObservationContract, toolObservationKey, type ToolSettlement } from "./tool-settlement.ts";
 import type { ActionKey } from "./action-semantics.ts";
-import { SharedAbortScope } from "./runtime-lifecycle.ts";
-import { waitForCompletion } from "./scheduler.ts";
+import { SharedAbortScope, waitForCompletion } from "./runtime-lifecycle.ts";
 
 interface DrafterBatch {
 	readonly model: Model<Api>;
@@ -41,18 +42,15 @@ interface DrafterCall {
 	result?: DrafterObservation;
 }
 
-export function createDrafterPlanSource(input: {
+export interface DrafterPlanSnapshot {
+	readonly budget: DrafterBudgetSnapshot;
+	readonly observations: { readonly forecasted: number; readonly compared: number; readonly matched: number };
+}
+
+export function createDrafterPlanSource(input: DrafterModelOptions & {
 	readonly sessionID: string;
-	/** Drafter model. Defaults to the actor model when omitted or unresolved. */
-	readonly draftModel?: DraftModelSelection;
-	/** Resolve drafter request options, including credentials when using a different provider. */
-	readonly getDraftOptions?: (context: DraftOptionsContext) => SimpleStreamOptions | Promise<SimpleStreamOptions>;
-	/** Provider completion used by the drafter. */
-	readonly complete: (model: Model<Api>, context: Context, options?: SimpleStreamOptions) => Promise<AssistantMessage>;
-	/** Share this ledger with other model Drafter requests in the same user task. */
-	readonly drafterBudget?: DrafterTaskBudget;
 	readonly patternHints?: (input: { readonly sessionID: string; readonly schemaHashes: Readonly<Record<string, string>>; readonly settings: SpeculativeActionSettings })
-		=> Promise<readonly Pick<PatternAwareCandidate, "tool" | "input" | "horizon">[]>;
+		=> Promise<readonly { readonly tool: string; readonly input: Readonly<Record<string, unknown>>; readonly horizon: number }[]>;
 }) {
 	const batches = new Map<string, { lifetime: SharedAbortScope; ready: Promise<DrafterBatch | undefined> }>();
 	const budget = input.drafterBudget ?? new DrafterTaskBudget();
@@ -117,16 +115,6 @@ export function createDrafterPlanSource(input: {
 	};
 	const source: AgentPlanSource = {
 		id: "drafter",
-		onSettled: ({ actionID, feedback, settlement, served }) => {
-			const batch = feedbacks.get(feedback as object), tool = batch?.calls.get(actionID)?.call.name;
-			const { matched, adopted } = predictionLearning(settlement, served);
-			if (!batch || !tool || matched === undefined && adopted === undefined) return;
-			const key = calibrationKey(batch, tool);
-			let samples = calibration.get(key);
-			if (!samples) { samples = { matches: [], adoptions: [] }; calibration.set(key, samples); }
-			if (matched !== undefined) observe(samples.matches, matched);
-			if (adopted !== undefined) observe(samples.adoptions, adopted);
-		},
 		enabled: (settings) => (settings.drafterEnabled ?? DEFAULTS.drafterEnabled) && settings.tools?.length !== 0,
 		timeoutMs: (settings) => settings.predictionTimeoutMs,
 		requestLifetime: "turn",
@@ -261,9 +249,19 @@ export function createDrafterPlanSource(input: {
 
 	return {
 		source,
-		snapshot: () => ({ budget: budget.snapshot(), observations: { ...observations } }),
-		finishTurn: (sessionID: string, turnID: string) => { finishBatch(agentBatchKey(sessionID, turnID)); },
-		finishSession: () => { for (const key of batches.keys()) finishBatch(key); budget.finishTask(); },
+		connect: (runtime: AgentRuntime) => runtime.subscribe({
+			prediction_feedback: ({ actionID, feedback, settlement, served }) => {
+				const batch = feedbacks.get(feedback as object), tool = batch?.calls.get(actionID)?.call.name;
+				const { matched, adopted } = predictionLearning(settlement, served);
+				if (!batch || !tool || matched === undefined && adopted === undefined) return;
+				const key = calibrationKey(batch, tool), samples = calibration.getOrCreate(key, () => ({ matches: [], adoptions: [] }));
+				if (matched !== undefined) observe(samples.matches, matched);
+				if (adopted !== undefined) observe(samples.adoptions, adopted);
+			},
+			turn_finished: ({ startInput }) => { finishBatch(agentBatchKey(startInput.sessionID, startInput.turnID)); },
+			session_closed: () => { for (const key of batches.keys()) finishBatch(key); budget.finishTask(); },
+		}),
+		snapshot: (): DrafterPlanSnapshot => ({ budget: budget.snapshot(), observations: { ...observations } }),
 	};
 }
 

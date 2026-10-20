@@ -1,6 +1,14 @@
-import type { FilesystemObservationEvidence, Sha256Digest } from "./provenance-certificate.ts";
+import type { FilesystemObservationEvidence } from "./filesystem-evidence.ts";
+import type { Sha256Digest } from "./stable-value-hash.ts";
 
 interface WorkspaceEntryChange { readonly changeDigest: Sha256Digest; readonly changeTimeMs: number; }
+
+export interface WorkspaceDirectoryState {
+	readonly entriesDigest: Sha256Digest;
+	readonly mode: number;
+	readonly uid: number;
+	readonly gid: number;
+}
 
 export type WorkspaceTreeEntry = WorkspaceEntryChange & (
 	| {
@@ -18,16 +26,12 @@ export type WorkspaceTreeEntry = WorkspaceEntryChange & (
 			readonly modified?: string;
 			readonly ownership?: string;
 	  }
-	| {
+	| ({
 			readonly kind: "directory";
 			/** Kernel prestate for observations made after this operation changed the directory's entries. */
 			readonly observed?: FilesystemObservationEvidence;
-			readonly entriesDigest: Sha256Digest;
 			readonly metadataDigest: Sha256Digest;
-			readonly mode: number;
-			readonly uid: number;
-			readonly gid: number;
-	  }
+	  } & WorkspaceDirectoryState)
 	| { readonly kind: "symlink"; readonly target: string; readonly targetDigest: Sha256Digest; }
 	| { readonly kind: "unsupported"; readonly type: string; });
 

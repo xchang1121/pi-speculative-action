@@ -12,19 +12,10 @@ export interface ExecutionIdentity {
 }
 
 /** Current work and dependency facts. Duration is an explicit bound for this execution, never a learned service time. */
-export interface PredictionForecast extends ExecutionIdentity {
-	readonly expectedDurationMs?: number;
-	readonly elapsedMs?: number;
+export interface PredictionForecast extends ExecutionIdentity, Partial<Omit<ScheduledWork, "resources" | "resourceUnits">> {
 	readonly resourceDemand?: number | HardwareResources;
-	readonly decisionBatchesUntilCall?: number;
-	readonly criticalPathSteps?: number;
 	readonly hitProbability?: number;
-	readonly confidence?: number;
 	readonly adoptionProbability?: number;
-	readonly background?: boolean;
-	readonly actorDemand?: boolean;
-	readonly actorHint?: boolean;
-	readonly dependenciesResolved?: boolean;
 }
 
 export interface ScheduledWork {
@@ -39,28 +30,6 @@ export interface ScheduledWork {
 	readonly actorDemand: boolean;
 	readonly actorHint: boolean;
 	readonly dependenciesResolved: boolean;
-}
-
-export type CompletionWaitResult<T> = { readonly status: "completed"; readonly value: T } | { readonly status: "aborted" } | { readonly status: "deadline" };
-
-/** Actor joins supply cancellation only; source production and teardown may impose their own deadline. */
-export function waitForCompletion<T>(promise: Promise<T>, signal?: AbortSignal): Promise<Exclude<CompletionWaitResult<T>, { status: "deadline" }>>;
-export function waitForCompletion<T>(promise: Promise<T>, signal: AbortSignal | undefined, timeoutMs: number | undefined): Promise<CompletionWaitResult<T>>;
-export async function waitForCompletion<T>(promise: Promise<T>, signal?: AbortSignal, timeoutMs?: number): Promise<CompletionWaitResult<T>> {
-	if (signal?.aborted) { void promise.catch(() => undefined); return { status: "aborted" }; }
-	const bounded = timeoutMs !== undefined && Number.isFinite(timeoutMs);
-	if (!signal && !bounded) return { status: "completed", value: await promise };
-	return new Promise((resolve, reject) => {
-		let settled = false, timer: ReturnType<typeof setTimeout> | undefined;
-		const finish = (complete: () => void) => {
-			if (settled) return;
-			settled = true; clearTimeout(timer); signal?.removeEventListener("abort", aborted); complete();
-		};
-		const aborted = () => finish(() => resolve({ status: "aborted" }));
-		signal?.addEventListener("abort", aborted, { once: true });
-		if (bounded) timer = setTimeout(() => finish(() => resolve({ status: "deadline" })), Math.max(0, timeoutMs));
-		void promise.then(value => finish(() => resolve({ status: "completed", value })), error => finish(() => reject(error)));
-	});
 }
 
 type Role = "execution" | "preparation" | "actor";
@@ -94,7 +63,6 @@ export class SpeculationScheduler<Job extends object> {
 	private readonly failures = new BoundedRecencyMap<string, { count: number; decisions: WeakMap<object, { sequence: number; probes: number; allowed: boolean }> }>(1024);
 	private sequence = 0;
 	private decisionSequence = 0;
-	private hardware?: ExecutionResourceSnapshot;
 	private capacity: HardwareResources = {};
 	private admission: HardwareResources = {};
 	private timer?: ReturnType<typeof setTimeout>;
@@ -185,12 +153,6 @@ export class SpeculationScheduler<Job extends object> {
 	}
 
 	snapshot(owner?: object): readonly SchedulerEntry<Job>[] { return [...this.entries.values()].filter(entry => !owner || entry.scope.owner === owner); }
-	inspect() {
-		const usage = { actorUnits: 0, preparationUnits: 0, executionUnits: 0 }, reserved: HardwareResources = {};
-		for (const entry of this.entries.values()) { usage[`${entry.role}Units`] += entry.work.resourceUnits; add(reserved, entry.work.resources); }
-		return this.hardware && { ...this.hardware, admissionCapacity: this.admission.cpu ?? 0, ...usage, reserved, capacity: { ...this.capacity }, available: { ...this.admission } };
-	}
-
 	watch(delay = this.options.pollIntervalMs?.() ?? SCHEDULING_DEFAULTS.resourcePollIntervalMs): void {
 		if (!this.options.resources || this.timer || this.sampling || !this.options.active?.()) return;
 		this.timer = setTimeout(() => {
@@ -222,7 +184,6 @@ export class SpeculationScheduler<Job extends object> {
 	}
 	private updateResources(snapshot: ExecutionResourceSnapshot): void {
 		if (!Number.isFinite(snapshot.cpuCount) || snapshot.cpuCount < 1) return;
-		this.hardware = snapshot;
 		this.capacity = { ...snapshot.capacity, cpu: units(snapshot.cpuCount) };
 		const allocated: HardwareResources = {};
 		for (const entry of this.entries.values()) add(allocated, entry.work.resources);

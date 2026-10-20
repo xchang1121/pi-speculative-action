@@ -1,29 +1,41 @@
-import { execFile } from "node:child_process";
+import { isSafeCount } from "./number-utils.ts";
+import { execHostFile } from "./executable-path.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants, type BigIntStats, type Stats } from "node:fs";
-import { access, chmod, copyFile, type FileHandle, link, lstat, mkdir, mkdtemp, open, readdir, realpath, rename, rm, rmdir, unlink, utimes, writeFile } from "node:fs/promises";
+import {
+	access, chmod, copyFile, type FileHandle, link, lstat, mkdir, mkdtemp, open, readdir, realpath, rename, rm, rmdir, unlink, utimes, writeFile,
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { containsFilesystemPath, filesystemPathKey, relativeFilesystemPath, slash } from "./path-utils.ts";
 import { errorMessage, hasErrorCode, isMissing } from "./error-utils.ts";
-import { createCommittedResourceInputs, filesystemExecutionDependsOn, type SpeculativeAgentExecutionWorld, type SpeculativeToolExecutionContext } from "./agent-execution-world.ts";
+import {
+	createCommittedResourceInputs, filesystemExecutionDependsOn, type SpeculativeAgentExecutionWorld, type SpeculativeToolExecutionContext,
+} from "./agent-execution-world.ts";
 import type { WorldBranch, WorldCheckpoint, WorldExecutionMetrics } from "./execution-world.ts";
-import { advanceFilesystemClock, assertNoSymlinkPath, captureFilesystemEntry, captureStableFile, fileIdentity, mapFilesystem, sameFilesystemIdentity,
-	settledIdentity, sharedWalk } from "./filesystem-evidence.ts";
+import {
+	advanceFilesystemClock, assertNoSymlinkPath, captureFilesystemEntry, captureStableFile, fileIdentity, mapFilesystem, sameFilesystemIdentity,
+	settledIdentity, sharedWalk, FILESYSTEM_OBSERVATION_FIELDS, FILESYSTEM_METADATA_FIELDS as SNAPSHOT_METADATA_FIELDS, type FilesystemObservationEvidence,
+} from "./filesystem-evidence.ts";
 import { WORKSPACE_PATH_MUTATION_EFFECTS } from "./effect-model.ts";
 import { EffectCommit, effectCommitFailure } from "./effect-transaction.ts";
-import { LinuxOverlayfsCapabilityRegistry, LinuxOverlayfsUnsafeCleanupError, mountLinuxOverlayfs, openLinuxAnonymousWorkspaceFile,
-	type LinuxOverlayfsMount, type LinuxOverlayfsOptions } from "./linux-overlayfs.ts";
-import { captureWorkspaceStructure, captureWorkspaceStructureEntry, statChangeDigest, workspaceStructureSnapshot, directoryEntriesDigest,
-	type WorkspaceStructureEntry, type WorkspaceStructureSnapshot } from "./process-observation.ts";
+import {
+	LinuxOverlayfsCapabilityRegistry, LinuxOverlayfsUnsafeCleanupError, mountLinuxOverlayfs, openLinuxAnonymousWorkspaceFile,
+	type LinuxOverlayfsMount, type LinuxOverlayfsOptions,
+} from "./linux-overlayfs.ts";
+import {
+	captureWorkspaceStructure, captureWorkspaceStructureEntry, statChangeDigest, workspaceStructureSnapshot, directoryEntriesDigest,
+	type WorkspaceStructureEntry, type WorkspaceStructureSnapshot,
+} from "./process-observation.ts";
 import { ResourceVersionManager, type ResourceChangeSet, type ResourceVersionToken, type ResourceInput } from "./resource-version.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
-import { FILESYSTEM_OBSERVATION_FIELDS, type FilesystemObservationEvidence } from "./provenance-certificate.ts";
 import type { ResourceValidation } from "./settlement.ts";
 import type { ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
-import { deferredWorkspaceTransactionDriver, orderWorkspaceChanges, type WorkspaceRegularDelta, type WorkspaceStructureDriver,
-	type WorkspaceTransactionCapture, type WorkspaceTransactionDelta, type WorkspaceTransactionDriver, type WorkspaceTransactionOwnership } from "./workspace-transaction.ts";
-import { ownWorkspaceObservation, ownsNativeProcesses } from "./linux-process-sync.ts";
+import {
+	deferredWorkspaceTransactionDriver, orderWorkspaceChanges, type WorkspaceRegularDelta, type WorkspaceStructureDriver,
+	type WorkspaceTransactionCapture, type WorkspaceTransactionDelta, type WorkspaceTransactionDriver, type WorkspaceTransactionOwnership,
+} from "./workspace-transaction.ts";
+import { connectNativeOwner, ownsNativeProcesses } from "./native-owner.ts";
 
 interface SandboxChangeTarget {
 	readonly root: string;
@@ -39,12 +51,7 @@ export interface SandboxFileChange extends SandboxChangeTarget, Omit<WorkspaceRe
 	readonly kind?: "file";
 }
 
-export interface SandboxDirectoryState {
-	readonly entriesDigest: Extract<WorkspaceStructureEntry, { readonly kind: "directory" }>["entriesDigest"];
-	readonly mode: number;
-	readonly uid: number;
-	readonly gid: number;
-}
+export type SandboxDirectoryState = import("./workspace-state.ts").WorkspaceDirectoryState;
 
 export interface SandboxDirectoryChange extends SandboxChangeTarget {
 	readonly kind: "directory";
@@ -365,8 +372,6 @@ export class WorkspaceSandboxService {
 		return commitSandboxExecution(this.state, { output: delta.output, changes: ownSandboxChanges(delta.changes) });
 	}
 
-	closePools(roots?: readonly string[]): Promise<void> { return closeWorkspaceSandboxPoolsFor(this.state, roots); }
-
 	dispose(): Promise<void> {
 		return this.state.lifetime.close(async () => {
 			await this.state.lifetime.drain();
@@ -510,7 +515,7 @@ async function commitSandboxExecution(state: WorkspaceSandboxState, execution: S
 			let nativeStarted = false;
 			try {
 				// Nothing has moved yet: every target is checked at this one moment, over one walk of the directories they share.
-				const capture = sharedWalk(); await mapFilesystem(changes, change => assertCommitTarget(change, capture));
+				const capture = sharedWalk(captureFilesystemEntry); await mapFilesystem(changes, change => assertCommitTarget(change, capture));
 				await mapFilesystem(changes, async (change) => {
 					if (!change.validationOnly && change.kind !== "directory" && !change.operation && !change.object && change.after !== undefined) {
 						staged.set(change, await stageAtomicWrite(change.after, change.afterMode, change.root));
@@ -977,7 +982,6 @@ async function createPrivateSandboxWorkspace(state: WorkspaceSandboxState, cwd: 
 
 /** Git owns bytes and links, while an OS snapshot also owns empty directories and object metadata.
  * Pin every translated object until disposal: unlink/recreate must never reuse a saved inode mapping. */
-const SNAPSHOT_METADATA_FIELDS = ["dev", "ino", "mode", "nlink", "uid", "gid", "rdev", "size", "blksize", "blocks", "atimeNs", "mtimeNs", "ctimeNs", "birthtimeNs"] as const;
 async function captureSnapshotMetadata(sourceRoot: string, copied?: readonly string[]) {
 	const original = new Map<string, BigIntStats>();
 	if (copied) await mapFilesystem([...new Set(copied)], async resource => { original.set(resource, await lstat(path.join(sourceRoot, resource), { bigint: true })); });
@@ -1085,7 +1089,7 @@ async function createGitWorkspaceTransactionDriver(workspace: ReturnType<typeof 
 			return {
 				readBefore: (resource, maxBytes) => withWorkspaceLock(lock, async () => {
 					if (!active.has(capture) || capture.contaminated || !capture.before || capture.unknown.has(resource)) throw new Error("workspace transaction input is unavailable");
-					if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new Error("workspace transaction input budget is invalid");
+					if (!isSafeCount(maxBytes)) throw new Error("workspace transaction input budget is invalid");
 					if (capture.before.entries.get(resource)?.kind !== "file") return undefined;
 					const state = capture.frontier.has(resource) ? capture.frontier.get(resource) : await workspace.readBase(resource, maxBytes);
 					if (state && state.content.byteLength > maxBytes) throw new Error("workspace transaction input exceeds capture limit");
@@ -1697,7 +1701,7 @@ async function collectSandboxChanges(workspace: ReturnType<typeof createWorkspac
 	const detected = frontier ?? (workspace.overlay ? await collectOverlayChangeResources(workspace) : await collectGitChangeResources(workspace));
 	const resources = [...new Set([...detected, ...(frontier ? [] : workspace.baselineFrontier.keys())])].filter((resource) => !isSnapshotExcluded(slash(resource))).sort();
 	// Changed files share their directories: each is walked once, and the files are read concurrently.
-	const capture = sharedWalk();
+	const capture = sharedWalk(captureFilesystemEntry);
 	return (await mapFilesystem(resources, async (resource): Promise<readonly SandboxFileChange[]> => {
 		if (!resource || path.isAbsolute(resource) || resource.split("/").includes("..")) throw new Error(`invalid sandbox change path: ${resource}`);
 		const target = path.resolve(workspace.sourceRoot, resource), sandboxTarget = path.resolve(workspace.sandboxRoot, resource);
@@ -2119,11 +2123,14 @@ export const useModifiedTimesHelper = (binary: string) => { modifiedTimesHelper 
  * microseconds, so on Linux, whose traces record them, the helper or else coreutils touch sets them; elsewhere a file keeps its commit's time. */
 export async function restoreModifiedTimes(files: readonly (readonly [target: string, modified: string | undefined])[]): Promise<void> {
 	const times = files.flatMap(([target, modified]) => /^\d+$/.test(modified ?? "") ? [[modified!.padStart(10, "0").slice(0, -9), modified!.slice(-9).padStart(9, "0"), target]] : []);
-	if (process.platform === "linux" && modifiedTimesHelper && times.length) return new Promise<void>((resolve, reject) => execFile(modifiedTimesHelper!, ["--set-modified-times"],
-		error => error ? reject(error) : resolve()).stdin?.end(times.map(([seconds, nanoseconds, target]) => `${seconds} ${nanoseconds} ${target}\0`).join("")));
+	if (process.platform === "linux" && modifiedTimesHelper && times.length) {
+		const pending = execHostFile(modifiedTimesHelper, ["--set-modified-times"]);
+		pending.child.stdin?.end(times.map(([seconds, nanoseconds, target]) => `${seconds} ${nanoseconds} ${target}\0`).join(""));
+		await pending; return;
+	}
 	const pairs = times.flatMap(([seconds, nanoseconds, target]) => [`@${seconds}.${nanoseconds}`, target!]);
-	for (let start = 0; process.platform === "linux" && start < pairs.length; start += 1024) await new Promise<void>((resolve, reject) => execFile("sh",
-		["-c", 'while [ $# -gt 0 ]; do touch -chm -d "$1" -- "$2" || exit; shift 2; done', "sh", ...pairs.slice(start, start + 1024)], error => error ? reject(error) : resolve()));
+	for (let start = 0; process.platform === "linux" && start < pairs.length; start += 1024) await execHostFile("sh",
+		["-c", 'while [ $# -gt 0 ]; do touch -chm -d "$1" -- "$2" || exit; shift 2; done', "sh", ...pairs.slice(start, start + 1024)]);
 }
 
 async function replaceFile(temporary: string, target: string, mode?: number): Promise<void> {
@@ -2160,11 +2167,11 @@ function parseNullList(value: Uint8Array): string[] { return value.toString().sp
 /** The existing process owner binds each private repository/index once, preserving per-call cwd and limits. */
 function bindGit(command: string, cwd: string, prefix: readonly string[] = []) {
 	const bound = [...prefix];
-	return (input: readonly string[], options: { cwd?: string; environment?: Readonly<Record<string, string>>; maxBuffer?: number; input?: Buffer } = {}): Promise<Buffer> => new Promise((resolve, reject) => {
+	return (input: readonly string[], options: { cwd?: string; environment?: Readonly<Record<string, string>>; maxBuffer?: number; input?: Buffer } = {}): Promise<Buffer> => {
 		const args = [...bound, ...input];
-		execFile(
+		const pending = execHostFile(
 			command,
-			[...args],
+			args,
 			{
 				cwd: options.cwd ?? cwd,
 				env: {
@@ -2177,18 +2184,41 @@ function bindGit(command: string, cwd: string, prefix: readonly string[] = []) {
 				encoding: "buffer",
 				maxBuffer: options.maxBuffer ?? 64 * 1024 * 1024,
 			},
-			(error, stdout, stderr) => {
-				if (error) {
-					const detail = Buffer.from(stderr).toString("utf8").trim() || error.message;
-					const shown = args.slice(0, 16).join(" ");
-					const omitted = Math.max(0, args.length - 16);
-					reject(
-						new Error(`${command} ${shown}${omitted ? ` … (${omitted} args omitted)` : ""} failed: ${detail}`),
-					);
-					return;
-				}
-				resolve(Buffer.from(stdout));
-			},
-		).stdin?.end(options.input);
-	});
+		);
+		pending.child.stdin?.end(options.input);
+		return pending.then(({ stdout }) => stdout, error => {
+			if (error.stderr === undefined) throw error;
+			const detail = error.stderr.toString("utf8").trim() || error.message;
+			const shown = args.slice(0, 16).join(" ");
+			const omitted = Math.max(0, args.length - 16);
+			throw new Error(`${command} ${shown}${omitted ? ` … (${omitted} args omitted)` : ""} failed: ${detail}`);
+		});
+	};
+}
+
+function ownWorkspaceObservation(description: () => SandboxWorkspaceObservation): { readonly ready: () => Promise<string>;
+	readonly call: <Value>(method: string, args?: unknown) => Promise<Value>; readonly transactions: WorkspaceTransactionDriver } {
+	let connection: ReturnType<typeof connectNativeOwner> | undefined, initialized: Promise<string> | undefined, disposal: Promise<void> | undefined;
+	const owners = new Map<number, { readonly get: () => Promise<WorkspaceTransactionOwnership | undefined>; proof?: WorkspaceTransactionOwnership }>();
+	const ready = (): Promise<string> => {
+		if (disposal) return Promise.reject(new Error("workspace transaction driver is disposed"));
+		if (!connection) connection = connectNativeOwner("workspace", description(), async (method, args: { id: number; paths: ReadonlySet<string>; until: number }) => {
+			if (method === "hints") return description().hints;
+			const owner = owners.get(args.id); if (!owner) throw new Error("workspace interval owner retired");
+			if (method === "ownership") { const proof = owner.proof = await owner.get(); return proof && { ...proof, interfered: undefined }; }
+			if (method === "interfered" && owner.proof) return owner.proof.interfered(args.paths, args.until);
+			throw new Error("workspace interval ownership unavailable");
+		});
+		return initialized ??= connection.rpc.call<string>("ready");
+	};
+	const call = async <Value>(method: string, args?: unknown): Promise<Value> => { await ready(); return connection!.rpc.call<Value>(method, args); };
+	return { ready, call, transactions: {
+		begin: async () => {
+			const id = await call<number>("begin"); let settled = false;
+			return { readBefore: (resource, maxBytes) => call("readBefore", { id, resource, maxBytes }), abort: async () => { if (!settled) { settled = true; await call("abort", { id }); } },
+				finish: async get => { if (settled) return { complete: false, changes: [], reason: "transaction_already_settled" }; settled = true; if (get) owners.set(id, { get });
+					try { return await call("finish", { id, owned: !!get }); } finally { owners.delete(id); } } };
+		},
+		dispose: () => disposal ??= connection ? connection.rpc.call<void>("dispose").finally(() => connection!.close()) : Promise.resolve(),
+	} };
 }

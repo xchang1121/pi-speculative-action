@@ -1,8 +1,10 @@
-import { open, readFile, readdir } from "node:fs/promises";
+import { isSafeCount } from "./number-utils.ts";
+import { open, readdir } from "node:fs/promises";
 import path from "node:path";
 import { containsLogicalPath } from "./path-utils.ts";
-import { type DependencyRole, FILESYSTEM_OBSERVATION_FIELDS, type FilesystemObservationField, filesystemObservationDigest, type ProvenanceTaint,
-	type Sha256Digest, type ResourceTransitionKind } from "./provenance-certificate.ts";
+import { type DependencyRole, type ProvenanceTaint, type ResourceTransitionKind } from "./provenance-certificate.ts";
+import { FILESYSTEM_OBSERVATION_FIELDS, type FilesystemObservationField, filesystemObservationDigest } from "./filesystem-evidence.ts";
+import { type Sha256Digest } from "./stable-value-hash.ts";
 
 const CONFINEMENT_SENSITIVE_SYSCALLS = new Set([
 	"seccomp", "capget", "capset", "mount", "umount2", "pivot_root", "swapon", "swapoff", "reboot",
@@ -11,7 +13,7 @@ const CONFINEMENT_SENSITIVE_SYSCALLS = new Set([
 	"process_vm_writev", "open_by_handle_at", "name_to_handle_at", "quotactl", "acct", "lookup_dcookie",
 	"io_setup", "io_submit", "io_uring_setup", "io_uring_enter", "io_uring_register", "personality",
 ]);
-const SYSCALL_FILTER = `trace=%file,%process,%network,%ipc,getpid,getppid,getsid,getpgid,clock_gettime,gettimeofday,time,getrandom,sysinfo,times,getrusage,getrlimit,setrlimit,prlimit64,fchdir,fallocate,pipe2,splice,tee,ioctl,prctl,fstat,fstatfs,getdents,getdents64,fcntl,fcntl64,flock,close,close_range,dup,dup2,dup3,${[...CONFINEMENT_SENSITIVE_SYSCALLS].join(",")}`;
+const SYSCALL_FILTER = `trace=%file,%process,%network,%ipc,%desc,getpid,getppid,getsid,getpgid,clock_gettime,gettimeofday,time,getrandom,sysinfo,times,getrusage,getrlimit,setrlimit,prlimit64,prctl,mmap,${[...CONFINEMENT_SENSITIVE_SYSCALLS].join(",")}`;
 
 /** One production trace shape shared by execution and dependency-ablation paths. */
 export function straceCommand(
@@ -22,7 +24,7 @@ export function straceCommand(
 	continuation = false,
 ): readonly [string, ...string[]] {
 	// Its sandbox launcher's threads would pay a ptrace stop per call they serve; a file's bytes are captured from the filesystem, a stream's only here.
-	return [strace, "--kill-on-exit", "--trace-children-only", "--elide-path-data", streams ? "-f" : "-ff", "-q", "-ttt", "-yy", "-v", "-s", "65535", "-e", continuation ? "trace=all" : SYSCALL_FILTER + (streams ? ",read,write,readv,writev,eventfd,eventfd2,sendfile,vmsplice,poll,ppoll,select,pselect6,epoll_create,epoll_create1,epoll_ctl,epoll_wait,epoll_pwait,epoll_pwait2" : ""), "-o", streams ? `${tracePrefix}.stream` : tracePrefix, ...command];
+	return [strace, "--kill-on-exit", "--trace-children-only", "--elide-path-data", streams ? "-f" : "-ff", "-q", "-ttt", "-yy", "-v", "-s", "65535", "-e", continuation ? "trace=all" : SYSCALL_FILTER, "-o", streams ? `${tracePrefix}.stream` : tracePrefix, ...command];
 }
 
 export type ObservedProcessPath =
@@ -30,7 +32,7 @@ export type ObservedProcessPath =
 	| { readonly path: string; readonly role: DependencyRole; readonly listed?: true;
 		/** Uniform non-writing lookup error; the dependency walker must independently prove the failing component. */
 		readonly lookupFailure?: "ENOENT" | "ENOTDIR" }
-	| { readonly path: string; readonly role: "metadata"; readonly followSymlinks: boolean; readonly digest: Sha256Digest; readonly fields?: readonly FilesystemObservationField[] };
+	| ({ readonly path: string; readonly role: "metadata"; readonly followSymlinks: boolean; readonly afterWrite?: true } & StatObservation);
 
 export interface StraceObservation {
 	readonly complete: boolean;
@@ -82,9 +84,9 @@ export interface StraceObservationOptions {
 	readonly inheritedHandles?: readonly { readonly fd: number; readonly installed?: false; readonly description?: number; readonly inode: string; readonly flags: number; readonly outside: number; readonly queuedBytes?: number; readonly queueData?: Buffer; readonly packet?: boolean; readonly messages?: readonly import("./linux-held-exec.ts").QueueMessage[] }[];
 }
 
-interface TraceFile { readonly pid: number; readonly lines: readonly TraceLine[]; readonly terminated: boolean; readonly exitCode?: number; }
+interface TraceFile { readonly pid: number; readonly lines: readonly TraceLine[]; }
 
-type TraceRoot = { readonly file: TraceFile; readonly start: number };
+type TraceRoot = TraceFile & { readonly start: number };
 interface TraceProcess extends TraceRoot { readonly cwd: string | undefined; readonly fs: { shared: boolean; changed: boolean }; }
 interface TraceLine {
 	readonly order?: number;
@@ -96,9 +98,6 @@ interface TraceLine {
 const TRACE_DELIMITERS: Readonly<Record<string, string>> = { "(": ")", "[": "]", "{": "}", "<": ">" }, QUOTED_RUN = /(?:[^"\\]|\\.)+/ys, ANNOTATION_RUN = /(?:[^<>\\]|\\.)+/ys, PLAIN_RUN = /[^"\\()[\]{}<>,/]+/y;
 
 /** Delimit once: quoted paths and descriptor annotations are data, never syscall syntax; what means nothing where it stands is passed whole. */
-/** -ttt stamps each record with its wall-clock start, which orders overlapping workspace writers. */
-const untimed = (line: string) => line.replace(/^\d+\.\d+ /, "");
-
 function parseTraceLine(line: string): TraceLine {
 	if (/^\+\+\+ (?:exited with \d+|killed by SIG[A-Z0-9]+(?: \(core dumped\))?) \+\+\+\s*$/.test(line)) return { name: "terminated", args: [], result: "0" };
 	const head = /^\s*([a-zA-Z0-9_]+)\(/.exec(line);
@@ -144,62 +143,92 @@ function parseTraceLine(line: string): TraceLine {
 	return failure;
 }
 
-function reassembleSyscalls(lines: readonly string[], pid: number, order?: readonly number[]): readonly TraceLine[] {
-	const pending = new Map<string, Array<{ text: string; order?: number }>>();
-	const complete: TraceLine[] = [];
-	for (const [index, line] of lines.entries()) {
-		const append = (text: string, sequence = order?.[index]) => complete.push({ ...parseTraceLine(text), ...(sequence !== undefined ? { order: sequence } : {}) });
-		const unfinished = line.includes("<unfinished ...>") ? /^\s*([a-zA-Z0-9_]+)\(.*\s<unfinished \.\.\.>\s*$/.exec(line) : null;
-		if (unfinished) {
-			const name = unfinished[1]!;
-			(pending.get(name) ?? pending.set(name, []).get(name)!).push({ text: line.replace(/\s*<unfinished \.\.\.>\s*$/, ""), order: order?.[index] });
-			continue;
+type TraceRecord = TraceLine & { readonly pid: number; readonly at: number; readonly text: string };
+
+function appendGrouped<Key, Value>(groups: Map<Key, Value[]>, key: Key, value: Value): void {
+	(groups.get(key) ?? groups.set(key, []).get(key)!).push(value);
+}
+
+/** One decoder for complete transcripts and growing tails; unfinished calls retain their entry time across reads. */
+function traceDecoder() {
+	const pending = new Map<string, { text: string; pid: number; at: number; order?: number }[]>(), times = new Map<number, number>();
+	let sequence = 0;
+	return (contents: string, filePID?: number, growing = false) => {
+		const rows = contents.split(/\r?\n/), complete = new Map<number, TraceRecord[]>();
+		if (filePID !== undefined) complete.set(filePID, []);
+		for (const [index, raw] of rows.entries()) {
+			const order = filePID === undefined ? sequence++ : undefined;
+			if (!raw.trim()) continue;
+			const process = filePID === undefined ? /^(\d+)\s+(.*)$/.exec(raw) : [raw, String(filePID), raw];
+			if (!process) throw new Error("invalid ordered trace record");
+			const stamp = /^(\d+\.\d+) (.*)$/.exec(process[2]!), text = stamp?.[2] ?? process[2]!;
+			const current = { pid: Number(process[1]), at: stamp ? Number(stamp[1]) * 1000 : NaN, order };
+			const fragment = growing && index === rows.length - 1;
+			current.at = Math.max(times.get(current.pid) ?? 0, current.at); times.set(current.pid, current.at);
+			const unfinished = /^\s*([a-zA-Z0-9_]+)\(.*\s<unfinished \.\.\.>\s*$/.exec(text), resumed = /^\s*<\.\.\.\s*([a-zA-Z0-9_]+) resumed>(.*)$/.exec(text);
+			const name = unfinished?.[1] ?? resumed?.[1], key = `${current.pid}:${name}`;
+			if (unfinished && !fragment) {
+				appendGrouped(pending, key, { ...current, text: text.replace(/\s*<unfinished \.\.\.>\s*$/, "") });
+				continue;
+			}
+			const prefix = !fragment && resumed && pending.get(key)?.shift();
+			if (pending.get(key)?.length === 0) pending.delete(key);
+			const line = resumed ? prefix ? parseTraceLine(`${prefix.text}${resumed[2]}`)
+				: { name: name!, args: [], result: "", failure: `resumed_without_unfinished:${key}` } : parseTraceLine(text);
+			appendGrouped(complete, current.pid, { ...current, ...line, ...(fragment ? { failure: "partial" } : {}), text, ...(prefix ? { at: prefix.at,
+				order: /^(?:write|writev|sendto|sendmsg|fork|vfork|clone|clone3)$/.test(name!) ? prefix.order : order } : {}) });
 		}
-		const resumed = /^\s*<\.\.\.\s*([a-zA-Z0-9_]+) resumed>(.*)$/.exec(line);
-		if (!resumed) { append(line); continue; }
-		const name = resumed[1]!;
-		const queue = pending.get(name);
-		const prefix = queue?.shift();
-		if (!prefix) complete.push({ name, args: [], result: "", failure: `resumed_without_unfinished:${pid}:${name}` });
-		else append(`${prefix.text}${resumed[2]}`, /^(?:write|writev|sendto|sendmsg|fork|vfork|clone|clone3)$/.test(name) ? prefix.order : order?.[index]);
-		if (queue?.length === 0) pending.delete(name);
-	}
-	for (const name of pending.keys()) complete.push({ name, args: [], result: "", failure: `unfinished:${pid}:${name}` });
-	return complete;
+		for (const [key, calls] of pending) appendGrouped(complete, calls[0]!.pid, { ...calls[0]!, name: key.slice(key.indexOf(":") + 1), args: [], result: "", failure: `unfinished:${key}` });
+		return complete;
+	};
 }
 
 /** Reduce handle lifetimes to object releases. Aliases and CLONE_FILES share references;
  * fork copies them. This is the same journal used for queue effects, not another replay path. */
 function resourceTransitions(processes: ReadonlyMap<number, TraceProcess>, root: number, options: StraceObservationOptions) {
 	const handles = options.inheritedHandles ?? [];
-	type Handle = { inode: string; description?: number; access: number; cloexec: boolean; packet?: boolean; epoll?: Map<string, { handle: Handle; mask: number; data: string; armed: boolean; generation?: number }> };
-	const descriptions = new Map<number, Handle>(handles.map(handle =>
-		[handle.fd, { inode: handle.inode, description: handle.description ?? handle.fd, access: (handle.flags & 3) + 1, cloexec: false, packet: handle.packet }]));
+	type Handle = { object: Resource; description?: number; access: number; cloexec: boolean; packet?: boolean; epoll?: Map<string, { handle: Handle; mask: number; data: string; armed: boolean; generation?: number }> };
+	type Resource = { inode: string; outside?: number; peer?: Resource; generation: number; read: number; end?: number; content?: Buffer };
+	const resources = new Map<string, Resource>();
+	const descriptions = new Map<number, Handle>();
+	const resource = (inode: string): Resource => {
+		let state = resources.get(inode);
+		if (!state) resources.set(inode, state = { inode, generation: 0, read: 0 });
+		return state;
+	};
+	for (const handle of handles) {
+		const state = resource(handle.inode);
+		state.outside = handle.outside; state.end = handle.queuedBytes ?? 0;
+		if (handle.queueData) state.content = handle.queueData;
+		descriptions.set(handle.fd, { object: state, description: handle.description ?? handle.fd, access: (handle.flags & 3) + 1, cloexec: false, packet: handle.packet });
+	}
 	const tables = new Map<number, Map<number, Handle>>([[root, new Map(handles.filter(handle => handle.installed !== false)
 		.map(handle => [handle.fd, descriptions.get(handle.fd)!]))]]);
-	const outside = new Map(handles.map(handle => [handle.inode, handle.outside]));
 	const journal: Array<NonNullable<StraceObservation["resourceJournal"]>[number] & { order: number }> = [];
 	const handled = new Set<TraceLine>();
-	const peers = new Map<string, string>(), generations = new Map<string, number>();
-	const cursors = new Map<string, { read: number; end: number }>(handles.map(handle => [handle.inode, { read: 0, end: handle.queuedBytes ?? 0 }]));
-	const contents = new Map(handles.filter(handle => handle.queueData).map(handle => [handle.inode, handle.queueData!]));
-	const messages: Array<{ inode: string; start: number; end: number; rights: Handle[] }> = handles.flatMap(handle => (handle.messages ?? []).map(message => ({
-		inode: handle.inode, start: message.start, end: message.end, rights: message.rights.map(fd => {
+	const messages: Array<{ object: Resource | undefined; start: number; end: number; rights: Handle[] }> = handles.flatMap(handle => (handle.messages ?? []).map(message => ({
+		object: resource(handle.inode), start: message.start, end: message.end, rights: message.rights.map(fd => {
 			const reference = descriptions.get(fd);
 			if (!reference) throw new Error("unproven queued descriptor");
 			return reference;
 		}),
 	})));
-	const wake = (inode: string | undefined) => { if (inode !== undefined) generations.set(inode, (generations.get(inode) ?? 0) + 1); };
+	const wake = (object: Resource | undefined) => { if (object) object.generation++; };
+	const append = (object: Resource | undefined, data: Buffer) => {
+		if (!object) return;
+		if (object.content) object.content = Buffer.concat([object.content, data]);
+		if (object.end !== undefined) object.end += data.length;
+		wake(object);
+	};
 	const references = () => {
-		const masks = new Map<string, number>(), descriptions = new Map<number | undefined, Handle>();
+		const masks = new Map<Resource, number>(), descriptions = new Map<number | undefined, Handle>();
 		for (const handle of [...new Set(tables.values())].flatMap(table => [...table.values()]).concat(messages.flatMap(message => message.rights))) {
-			masks.set(handle.inode, (masks.get(handle.inode) ?? 0) | handle.access);
+			masks.set(handle.object, (masks.get(handle.object) ?? 0) | handle.access);
 			descriptions.set(handle.description, handle);
 		}
 		return { masks, descriptions };
 	};
-	const records = [...processes].flatMap(([pid, process]) => process.file.lines.slice(process.start).map(line => ({ pid, line })))
+	const records = [...processes].flatMap(([pid, process]) => process.lines.slice(process.start).map(line => ({ pid, line })))
 		.sort((a, b) => (a.line.order ?? Infinity) - (b.line.order ?? Infinity));
 	for (const { pid, line } of records) {
 		let table = tables.get(pid);
@@ -208,48 +237,45 @@ function resourceTransitions(processes: ReadonlyMap<number, TraceProcess>, root:
 		let before = lifetime || messages.length && /^(?:read|readv|recvfrom|recvmsg)$/.test(line.name) ? references() : undefined;
 		const endpoint = (argument: string | undefined): Handle | undefined => {
 			const file = table!.get(Number.parseInt(argument ?? "", 10));
-			if (file?.inode.startsWith("file:") && /^\d+<\//.test(argument ?? "")) return file;
+			if (file?.object.inode.startsWith("file:") && /^\d+<\//.test(argument ?? "")) return file;
 			const counter = /^(\d+)<anon_inode:\[eventfd\]>$/.exec(argument ?? "");
 			if (counter) {
 				const handle = table!.get(Number(counter[1]));
-				if (handle?.inode.startsWith("eventfd:")) { peers.set(handle.inode, handle.inode); return handle; }
+				if (handle?.object.inode.startsWith("eventfd:")) { handle.object.peer = handle.object; return handle; }
 				return;
 			}
 			const match = /^(\d+)<(?:pipe|UNIX(?:-[A-Z]+)?):\[(\d+)(?:->(\d+))?\]>$/.exec(argument ?? "");
 			if (!match || !options.inheritedStreams?.includes(match[2]!)) return;
-			if (match[3]) { peers.set(match[2]!, match[3]); peers.set(match[3], match[2]!); }
-			else if (argument!.includes("<pipe:")) peers.set(match[2]!, match[2]!);
+			const object = resource(match[2]!);
+			if (match[3]) { object.peer = resource(match[3]); object.peer.peer = object; }
+			else if (argument!.includes("<pipe:")) object.peer = object;
 			const origin = table!.get(Number(match[1]));
-			return origin?.inode === match[2] ? origin : { inode: match[2]!, access: 3, cloexec: false };
+			return origin?.object === object ? origin : { object, access: 3, cloexec: false };
 		};
 		const emit = (handle: Handle, kind: ResourceTransitionKind, data: Buffer, requested?: number) => {
-			journal.push({ order: line.order!, inode: handle.inode, description: handle.description, kind, data, ...(requested !== undefined ? { requested } : {}) }); handled.add(line);
+			const state = handle.object, peer = state.peer;
+			journal.push({ order: line.order!, inode: state.inode, description: handle.description, kind, data, ...(requested !== undefined ? { requested } : {}) }); handled.add(line);
 			const length = kind.endsWith("_message") ? data.length - 4 - 4 * data.readUInt32LE() : data.length;
 			if (kind === "consume" || kind === "receive_message") {
-				const packet = handle.packet ? messages.find(message => message.inode === handle.inode) : undefined;
+				const packet = handle.packet ? messages.find(message => message.object === state) : undefined;
 				const consumed = packet ? packet.end - packet.start : length;
-				const bytes = contents.get(handle.inode); if (bytes) contents.set(handle.inode, bytes.subarray(consumed));
-				const cursor = cursors.get(handle.inode);
-				if (cursor) { cursor.read += consumed; for (let index = messages.length - 1; index >= 0; index--)
-					if (packet ? messages[index] === packet : messages[index]!.inode === handle.inode && messages[index]!.start < cursor.read) messages.splice(index, 1); }
+				if (state.content) state.content = state.content.subarray(consumed);
+				if (state.end !== undefined) { state.read += consumed; for (let index = messages.length - 1; index >= 0; index--)
+					if (packet ? messages[index] === packet : messages[index]!.object === state && messages[index]!.start < state.read) messages.splice(index, 1); }
 			}
 			if (kind === "produce" || kind === "send_message") {
-				const cursor = cursors.get(peers.get(handle.inode) ?? "");
-				if (kind === "produce" && handle.packet && cursor) messages.push({ inode: peers.get(handle.inode)!, start: cursor.end, end: cursor.end + length, rights: [] });
-				if (cursor) cursor.end += length;
-				const peer = peers.get(handle.inode), bytes = peer && contents.get(peer);
-				if (peer && bytes) contents.set(peer, Buffer.concat([bytes, data.subarray(data.length - length)]));
+				if (kind === "produce" && handle.packet && peer?.end !== undefined) messages.push({ object: peer, start: peer.end, end: peer.end + length, rights: [] });
+				append(peer, data.subarray(data.length - length));
 			}
-			if (kind === "produce" || kind === "send_message" || kind === "shutdown") wake(peers.get(handle.inode));
-			if (kind === "shutdown") wake(handle.inode);
+			if (kind === "shutdown") { wake(peer); wake(state); }
 		};
 		const readiness = (handle: Handle, requested: number, returned: number, projection = 0) => {
 			const data = Buffer.alloc(12); data.writeUInt32LE(requested); data.writeUInt32LE(returned, 4); data.writeUInt32LE(projection, 8); emit(handle, "ready", data);
 		};
 		const stream = endpoint(line.args[0]), syscall = line.name;
-		if (stream?.inode.startsWith("file:")) { const operation = fileLockTransition(line); if (operation) emit(stream, "lock", operation); }
-		if (stream && !stream.inode.startsWith("file:")) {
-			const counter = stream.inode.startsWith("eventfd:");
+		if (stream?.object.inode.startsWith("file:")) { const operation = fileLockTransition(line); if (operation) emit(stream, "lock", operation); }
+		if (stream && !stream.object.inode.startsWith("file:")) {
+			const object = stream.object, counter = object.inode.startsWith("eventfd:");
 			const flags = line.args[3] ?? "";
 			const produced = syscall === "write" || syscall === "writev" || syscall === "sendto" && /^(?:0|MSG_(?:NOSIGNAL|DONTWAIT))(?:\|MSG_(?:NOSIGNAL|DONTWAIT))*$/.test(flags) && line.args[4] === "NULL" && line.args[5] === "0";
 			const consumed = syscall === "read" || syscall === "readv" || syscall === "recvfrom" && /^(?:0|MSG_(?:PEEK|DONTWAIT|WAITALL|TRUNC))(?:\|MSG_(?:PEEK|DONTWAIT|WAITALL|TRUNC))*$/.test(flags) && line.args[4] === "NULL" && /^(?:NULL|0x0)$/.test(line.args[5] ?? "");
@@ -260,7 +286,7 @@ function resourceTransitions(processes: ReadonlyMap<number, TraceProcess>, root:
 			if ((produced || consumed) && /^\? ERESTARTSYS\b/.test(line.result)) handled.add(line);
 			else if ((produced || consumed) && data && /^\d+$/.test(line.result)) {
 				const returned = Number(line.result), truncated = /MSG_TRUNC/.test(flags);
-				const packet = truncated && stream.packet ? messages.find(message => message.inode === stream.inode) : undefined;
+				const packet = truncated && stream.packet ? messages.find(message => message.object === object) : undefined;
 				const length = truncated ? Math.min(returned, requested) : returned;
 				if ((!truncated || packet && returned === packet.end - packet.start) &&
 					(produced ? data.length === requested && length <= requested && length <= 4096 : data.length === length)) {
@@ -281,19 +307,19 @@ function resourceTransitions(processes: ReadonlyMap<number, TraceProcess>, root:
 			if ((syscall === "sendmsg" || syscall === "recvmsg") && /^\d+$/.test(line.result)) {
 				const sent = syscall === "sendmsg", message = streamMessage(line.args[1]), returned = Number(line.result), flags = line.args[2] ?? "";
 				const truncated = /MSG_TRUNC/.test(flags), length = truncated && message ? Math.min(returned, message.length) : returned;
-				const packet = truncated && stream.packet ? messages.find(message => message.inode === stream.inode) : undefined;
+				const packet = truncated && stream.packet ? messages.find(message => message.object === object) : undefined;
 				if (message && (!truncated || packet && returned === packet.end - packet.start) && (stream.packet || !message.truncated) && /^(?:0|MSG_(?:NOSIGNAL|DONTWAIT|PEEK|WAITALL|CMSG_CLOEXEC|TRUNC))(?:\|MSG_(?:NOSIGNAL|DONTWAIT|PEEK|WAITALL|CMSG_CLOEXEC|TRUNC))*$/.test(flags) &&
 					(sent ? !/PEEK|WAITALL|CMSG_CLOEXEC|TRUNC/.test(flags) && message.data.length === message.length && length <= message.length && length <= 4096 :
 						!/NOSIGNAL/.test(flags) && message.data.length === length)) {
-					const peer = peers.get(stream.inode), cursor = cursors.get(stream.inode);
-					const pending = messages.find(message => message.inode === stream.inode && (stream.packet || message.start < (cursor?.read ?? 0) + length));
+					const { peer } = object;
+					const pending = messages.find(message => message.object === object && (stream.packet || message.start < object.read + length));
 					const rights = sent ? message.rights.map(fd => table!.get(fd)) : pending?.rights ?? [];
 					if (rights.length === message.rights.length && rights.every(handle => handle?.description !== undefined) &&
-						(sent ? !rights.length || !!peer && (length > 0 || stream.packet) : message.rights.every(fd => !table!.has(fd)))) {
+						(sent ? !rights.length || !!peer?.inode && (length > 0 || stream.packet) : message.rights.every(fd => !table!.has(fd)))) {
 						const handles = rights as Handle[], data = Buffer.alloc(4 + 4 * handles.length + length);
 						data.writeUInt32LE(handles.length); handles.forEach((handle, index) => data.writeUInt32LE(handle.description!, 4 + 4 * index));
 						message.data.copy(data, 4 + 4 * handles.length, 0, length);
-						if (sent && (handles.length || stream.packet)) { const start = cursors.get(peer!)?.end ?? 0; messages.push({ inode: peer!, start, end: start + length, rights: handles }); }
+						if (sent && (handles.length || stream.packet)) { const start = peer?.end ?? 0; messages.push({ object: peer, start, end: start + length, rights: handles }); }
 						if (!sent) handles.forEach((handle, index) => table!.set(message.rights[index]!, { ...handle, cloexec: /MSG_CMSG_CLOEXEC/.test(flags) }));
 						emit(stream, sent ? "send_message" : /MSG_PEEK/.test(flags) ? "peek_message" : "receive_message", data, message.length);
 					}
@@ -302,16 +328,14 @@ function resourceTransitions(processes: ReadonlyMap<number, TraceProcess>, root:
 		}
 		if ((syscall === "splice" || syscall === "tee") && stream?.description !== undefined && /^\d+$/.test(line.result)) {
 			const moved = syscall === "splice", target = endpoint(line.args[moved ? 2 : 1]), length = Number(line.result), requested = Number(line.args[moved ? 4 : 2]);
-			const bytes = contents.get(stream.inode), flags = line.args[moved ? 5 : 3];
-			if (target && stream.inode !== target.inode && bytes && length <= bytes.length && length <= requested && length <= 4096 &&
+			const state = stream.object, bytes = state.content, flags = line.args[moved ? 5 : 3];
+			if (target && state !== target.object && bytes && length <= bytes.length && length <= requested && length <= 4096 &&
 				/^(?:0|SPLICE_F_(?:MOVE|MORE|NONBLOCK))(?:\|SPLICE_F_(?:MOVE|MORE|NONBLOCK))*$/.test(flags ?? "") &&
 				(!moved || line.args[1] === "NULL" && line.args[3] === "NULL")) {
 				const data = Buffer.alloc(4 + length); data.writeUInt32LE(stream.description); bytes.copy(data, 4, 0, length);
 				emit(target, moved ? "splice" : "tee", data, requested);
-				const destination = contents.get(target.inode); if (destination) contents.set(target.inode, Buffer.concat([destination, bytes.subarray(0, length)]));
-				const end = cursors.get(target.inode); if (end) end.end += length;
-				if (moved) { contents.set(stream.inode, bytes.subarray(length)); const cursor = cursors.get(stream.inode); if (cursor) cursor.read += length; }
-				wake(target.inode);
+				append(target.object, bytes.subarray(0, length));
+				if (moved) { state.content = bytes.subarray(length); if (state.end !== undefined) state.read += length; }
 			}
 		}
 		if (syscall === "poll" || syscall === "ppoll") {
@@ -342,7 +366,7 @@ function resourceTransitions(processes: ReadonlyMap<number, TraceProcess>, root:
 		}
 		const poller = table.get(Number.parseInt(line.args[0] ?? "", 10))?.epoll;
 		if (/^epoll_create(?:1)?$/.test(syscall) && syscallSucceeded(line)) {
-			table.set(Number.parseInt(line.result, 10), { inode: `epoll:${line.order}`, access: 3, cloexec: /EPOLL_CLOEXEC/.test(line.args[0] ?? ""), epoll: new Map() }); handled.add(line);
+			table.set(Number.parseInt(line.result, 10), { object: resource(`epoll:${line.order}`), access: 3, cloexec: /EPOLL_CLOEXEC/.test(line.args[0] ?? ""), epoll: new Map() }); handled.add(line);
 		} else if (syscall === "epoll_ctl" && poller && syscallSucceeded(line)) {
 			const handle = endpoint(line.args[2]), event = epollEvent(line.args[3]);
 			if (handle && handle.description !== undefined) {
@@ -356,13 +380,13 @@ function resourceTransitions(processes: ReadonlyMap<number, TraceProcess>, root:
 		} else if (/^epoll_(?:wait|pwait|pwait2)$/.test(syscall) && poller && /^\d+$/.test(line.result)) {
 			const returned = Number(line.result), events = epollEvents(line.args[1]);
 			const registrations = [...poller.values()].filter(value => value.armed &&
-				(!(value.mask & 0x80000000) || value.generation !== (generations.get(value.handle.inode) ?? 0)));
+				(!(value.mask & 0x80000000) || value.generation !== value.handle.object.generation));
 			if (events && events.length === returned && returned <= Number(line.args[2]) && new Set(registrations.map(entry => entry.data)).size === registrations.length &&
 				events.every(event => registrations.some(entry => entry.data === event.data))) {
 				for (const entry of registrations) {
 					const event = events.find(event => event.data === entry.data);
 					if (event || returned < Number(line.args[2])) readiness(entry.handle, entry.mask & ~0xc0000000, event?.mask ?? 0);
-					if (event && (entry.mask & 0x80000000)) entry.generation = generations.get(entry.handle.inode) ?? 0;
+					if (event && (entry.mask & 0x80000000)) entry.generation = entry.handle.object.generation;
 					if (event && (entry.mask & 0x40000000)) entry.armed = false;
 				}
 				handled.add(line);
@@ -394,16 +418,16 @@ function resourceTransitions(processes: ReadonlyMap<number, TraceProcess>, root:
 		if (!before) continue;
 		let after = references();
 		for (;;) {
-			for (const [description, handle] of before.descriptions) if (description !== undefined && !after.descriptions.has(description) && handle.inode.startsWith("file:"))
-				journal.push({ order: line.order, inode: handle.inode, description, kind: "release", data: Buffer.from([3]) });
-			for (const [inode, mask] of before.masks) {
-				const released = mask & ~(after.masks.get(inode) ?? 0) & ~(outside.get(inode) ?? 3);
-				if (released && options.inheritedStreams?.includes(inode)) { journal.push({ order: line.order, inode, kind: "release", data: Buffer.from([released]) }); wake(peers.get(inode)); }
+			for (const [description, handle] of before.descriptions) if (description !== undefined && !after.descriptions.has(description) && handle.object.inode.startsWith("file:"))
+				journal.push({ order: line.order, inode: handle.object.inode, description, kind: "release", data: Buffer.from([3]) });
+			for (const [state, mask] of before.masks) {
+				const released = mask & ~(after.masks.get(state) ?? 0) & ~(state.outside ?? 3);
+				if (released && options.inheritedStreams?.includes(state.inode)) { journal.push({ order: line.order, inode: state.inode, kind: "release", data: Buffer.from([released]) }); wake(state.peer); }
 			}
 			// Destroyed receivers drop their rights before the newly unowned objects.
 			// An external or cyclic reference still keeps its queue alive.
 			const count = messages.length;
-			for (let index = count - 1; index >= 0; index--) if (!after.masks.has(messages[index]!.inode) && outside.get(messages[index]!.inode) === 0) messages.splice(index, 1);
+			for (let index = count - 1; index >= 0; index--) if (messages[index]!.object?.outside === 0 && !after.masks.has(messages[index]!.object!)) messages.splice(index, 1);
 			if (messages.length === count) break;
 			before = after; after = references();
 		}
@@ -479,8 +503,7 @@ function epollEvents(text: string | undefined): Array<{ mask: number; data: stri
 }
 
 function selectTraceRoot(files: readonly TraceFile[], target: string, initialCwd: string): TraceRoot | { readonly reason: string } {
-	const parent = new Map<number, number>();
-	const children = new Map<number, number[]>();
+	const parent = new Map<number, number>(), children = new Map<number, number[]>();
 	for (const file of files) {
 		for (const line of file.lines) {
 			const child = spawnedPID(line);
@@ -488,7 +511,7 @@ function selectTraceRoot(files: readonly TraceFile[], target: string, initialCwd
 			const existing = parent.get(child);
 			if (existing !== undefined && existing !== file.pid) return { reason: `process_parent_ambiguous:${child}` };
 			parent.set(child, file.pid);
-			(children.get(file.pid) ?? children.set(file.pid, []).get(file.pid)!).push(child);
+			appendGrouped(children, file.pid, child);
 		}
 	}
 	const roots = files.filter((file) => !parent.has(file.pid));
@@ -500,17 +523,17 @@ function selectTraceRoot(files: readonly TraceFile[], target: string, initialCwd
 	for (const file of files) {
 		const processDepth = depth.get(file.pid);
 		if (processDepth === undefined) continue;
-		const start = file.lines.findIndex((line) => successfulExec(line) && quotedStrings(line)[0] !== undefined && path.posix.resolve(initialCwd, quotedStrings(line)[0]!) === target);
-		if (start >= 0) candidates.push({ file, start, depth: processDepth });
+		const start = file.lines.findIndex(line => successfulExec(line) && syscallPaths(line, initialCwd)?.some(name => path.posix.resolve(name) === target));
+		if (start >= 0) candidates.push({ ...file, start, depth: processDepth });
 	}
 	if (!candidates.length) return { reason: "target_exec_not_found" };
 	const shallowest = Math.min(...candidates.map((candidate) => candidate.depth));
 	const matches = candidates.filter((candidate) => candidate.depth === shallowest);
-	if (matches.length !== 1) return { reason: `target_exec_ambiguous:${matches.map(({ file }) => file.pid).sort().join(",")}` };
+	if (matches.length !== 1) return { reason: `target_exec_ambiguous:${matches.map(file => file.pid).sort().join(",")}` };
 	const match = matches[0]!;
 	// exec does not unshare CLONE_FS. An excluded task must not retain authority over the target cwd.
 	if (files.some((file) => file.lines.some((line, index) => spawnedPID(line) && sharesFilesystem(line) !== false &&
-		(spawnedPID(line) === match.file.pid || (file === match.file && index < match.start))))) {
+		(spawnedPID(line) === match.pid || (file.pid === match.pid && index < match.start))))) {
 		return { reason: "target_filesystem_context_unproven" };
 	}
 	return match;
@@ -526,38 +549,19 @@ export async function observeStrace(
 	initialCwd: string,
 	options: StraceObservationOptions = {},
 ): Promise<StraceObservation> {
-	const directory = path.dirname(tracePrefix);
-	const prefix = `${path.basename(tracePrefix)}.`;
 	const files: TraceFile[] = [];
 	let remaining = options.frozen?.bytes ?? options.previewBytes, frontier = false;
-	if (remaining !== undefined && (!Number.isSafeInteger(remaining) || remaining < 0)) throw new Error("invalid trace preview budget");
-	for (const name of await readdir(directory)) {
-		if (remaining === 0) break;
-		if (!name.startsWith(prefix)) continue;
-		const pid = Number.parseInt(name.slice(prefix.length), 10);
-		const ordered = name === `${prefix}stream`;
-		if (options.frozen && !ordered) throw new Error("continuation requires one ordered trace");
-		if (!ordered && (!Number.isSafeInteger(pid) || pid <= 0)) continue;
-		const target = path.join(directory, name), bytes = remaining === undefined ? await readFile(target) : await readTrace(target, 0, remaining);
-		if (remaining !== undefined) remaining -= bytes.length;
-		let contents = bytes.toString("utf8");
+	if (remaining !== undefined && (!isSafeCount(remaining))) throw new Error("invalid trace preview budget");
+	for await (const chunk of traceChunks(tracePrefix, undefined, remaining)) {
+		if (options.frozen && chunk.pid !== undefined) throw new Error("continuation requires one ordered trace");
+		remaining = chunk.remaining;
+		let contents = chunk.bytes.toString("utf8");
 		if (options.privateUpper) contents = contents.replaceAll(`<${options.privateUpper}/`, "</");
-		const groups = new Map<number, { lines: string[]; order?: number[] }>();
-		if (!ordered) groups.set(pid, { lines: contents.split(/\r?\n/).map(untimed) });
-		else for (const [order, line] of contents.split(/\r?\n/).entries()) {
-			if (!line.trim()) continue;
-			const match = /^(\d+)\s+(.*)$/.exec(line);
-			if (!match) throw new Error("invalid ordered trace record");
-			const process = Number(match[1]), group = groups.get(process) ?? { lines: [], order: [] };
-			group.lines.push(untimed(match[2]!)); group.order!.push(order); groups.set(process, group);
-		}
-		for (const [pid, group] of groups) {
+		for (const [pid, lines] of traceDecoder()(contents, chunk.pid)) {
 			if (options.frozen?.pid === pid) {
-				frontier = contents.endsWith("\n") && !group.lines.some(line => /^--- /.test(line));
+				frontier = contents.endsWith("\n") && !lines.some(line => /^--- /.test(line.text));
 			}
-			const last = group.lines.filter(line => line.trim()).at(-1) ?? "", exited = /^\+\+\+ exited with (\d+) \+\+\+\s*$/.exec(last)?.[1];
-			files.push({ pid, lines: reassembleSyscalls(group.lines, pid, group.order), ...(exited === undefined ? {} : { exitCode: Number(exited) }),
-				terminated: exited !== undefined || /^\+\+\+ killed by SIG[A-Z0-9]+(?: \(core dumped\))? \+\+\+\s*$/.test(last) });
+			files.push({ pid, lines });
 		}
 	}
 	const target = path.posix.resolve(initialCwd, executablePath);
@@ -565,27 +569,26 @@ export async function observeStrace(
 	if ("reason" in root) return { complete: false, paths: [], taints: ["trace_incomplete"], tracedProcesses: 0, incompleteReasons: [root.reason] };
 
 	const byPID = new Map(files.map((file) => [file.pid, file]));
-	const selected = new Map<number, TraceProcess>([[root.file.pid, { ...root, cwd: path.posix.resolve(initialCwd), fs: { shared: false, changed: false } }]]);
-	let complete = options.previewBytes === undefined;
-	const incompleteReasons = new Set<string>(complete ? [] : ["preview_only"]);
-	if (options.frozen && (!frontier || root.file.pid !== options.frozen.pid || remaining !== 0)) { complete = false; incompleteReasons.add("continuation_frontier_unproven"); }
+	const selected = new Map<number, TraceProcess>([[root.pid, { ...root, cwd: path.posix.resolve(initialCwd), fs: { shared: false, changed: false } }]]);
+	const incomplete = new Set<string>(options.previewBytes === undefined ? [] : ["preview_only"]);
+	if (options.frozen && (!frontier || root.pid !== options.frozen.pid || remaining !== 0)) incomplete.add("continuation_frontier_unproven");
 	for (const [pid, process] of selected) {
-		if (!process.file.terminated && options.frozen?.pid !== pid) { complete = false; incompleteReasons.add(`process_exit_unproven:${pid}`); }
+		if (process.lines.at(-1)?.name !== "terminated" && options.frozen?.pid !== pid) incomplete.add(`process_exit_unproven:${pid}`);
 		let cwd = process.cwd;
-		for (const line of process.file.lines.slice(process.start)) {
+		for (const line of process.lines.slice(process.start)) {
 			if (process.fs.shared && (line.name === "chdir" || line.name === "fchdir") && syscallSucceeded(line)) process.fs.changed = true;
 			cwd = tracedCwd(line, cwd);
 			const child = spawnedPID(line);
 			if (!child || selected.has(child)) continue;
 			const childFile = byPID.get(child);
-			if (!childFile) { complete = false; incompleteReasons.add(`child_trace_missing:${child}`); continue; }
+			if (!childFile) { incomplete.add(`child_trace_missing:${child}`); continue; }
 			const shared = sharesFilesystem(line);
-			if (shared === undefined) { complete = false; incompleteReasons.add(`clone_flags_unparsed:${pid}`); }
+			if (shared === undefined) incomplete.add(`clone_flags_unparsed:${pid}`);
 			if (shared !== false) process.fs.shared = true;
-			selected.set(child, { file: childFile, start: 0, cwd, fs: shared === false ? { shared: false, changed: false } : process.fs });
+			selected.set(child, { ...childFile, start: 0, cwd, fs: shared === false ? { shared: false, changed: false } : process.fs });
 		}
 	}
-	if (options.frozen && selected.size !== 1) { complete = false; incompleteReasons.add("continuation_process_tree"); }
+	if (options.frozen && selected.size !== 1) incomplete.add("continuation_process_tree");
 
 	const paths = new Map<string, DependencyRole>(), listedPaths = new Set<string>(), metadata = new Map<string, Extract<ObservedProcessPath, { role: "metadata" }>>();
 	const lookupFailures = new Map<string, "ENOENT" | "ENOTDIR" | undefined>();
@@ -609,95 +612,104 @@ export async function observeStrace(
 	const locks = new Map<string, boolean>(), changedMetadata = new Set<string>(), written = new Set<string>(), writable = new Set<string>(), external = new Set<string>(), workspaceName = (target: string) =>
 		semanticRoots.flatMap((root) => containsLogicalPath(root, target) ? [`//${path.posix.relative(root, target)}`] : [])[0];
 	const { journal: resourceJournal, handled: streamCalls, retained, finalHandles } = options.inheritedHandles?.length || options.inheritedStreams?.length
-		? resourceTransitions(selected, root.file.pid, options) : { journal: [], handled: new Set<TraceLine>(), retained: [], finalHandles: [] };
+		? resourceTransitions(selected, root.pid, options) : { journal: [], handled: new Set<TraceLine>(), retained: [], finalHandles: [] };
 	const semanticRoots = (options.guardFilesystemSemanticsWithin ?? []).map((value) => path.posix.resolve(value));
 	const brokered = brokeredProcessSegments(selected, options);
 	const observeMetadata = (observedPath: string, followSymlinks: boolean, { digest, fields }: StatObservation) => {
 		lookupFailures.set(observedPath, undefined);
 		const identity = `metadata:${followSymlinks}:${fields?.join(",") ?? ""}:${observedPath}`;
-		if (metadata.get(identity)?.digest !== undefined && metadata.get(identity)?.digest !== digest) changedMetadata.add(observedPath);
-		metadata.set(identity, { path: observedPath, role: "metadata", followSymlinks, digest, ...(fields ? { fields } : {}) });
+		if (external.has(observedPath) && metadata.has(identity)) return;
+		const previous = metadata.get(identity);
+		if (previous && previous.digest !== digest) changedMetadata.add(observedPath);
+		metadata.set(identity, { path: observedPath, role: "metadata", followSymlinks, digest, ...(fields ? { fields } : {}), ...(external.has(observedPath) ? { afterWrite: true } : {}) });
 	};
-	for (const [pid, { file, start, cwd: initial, fs }] of selected) {
+	for (const [pid, { lines, start, cwd: initial, fs }] of selected) {
 		// -ff files cannot order another task's chdir against this task's pathname lookup.
-		if (fs.changed) { complete = false; incompleteReasons.add("shared_cwd_mutation"); continue; }
+		if (fs.changed) { incomplete.add("shared_cwd_mutation"); continue; }
 		let cwd = initial;
-		if (!cwd) { complete = false; incompleteReasons.add(`cwd_unknown:${pid}`); cwd = path.posix.resolve(initialCwd); }
-		for (let index = start; index < file.lines.length; index++) {
+		if (!cwd) { incomplete.add(`cwd_unknown:${pid}`); cwd = path.posix.resolve(initialCwd); }
+		for (let index = start; index < lines.length; index++) {
 			if (index >= (brokered.get(pid) ?? Infinity)) break;
-			if (pid === root.file.pid && index === start && options.launchPath) continue;
-			const line = file.lines[index]!;
-			if (!line) continue;
+			if (pid === root.pid && index === start && options.launchPath) continue;
+			const line = lines[index]!;
 			const spawned = spawnedPID(line);
 			if (spawned) opened.set(spawned, new Set(opened.get(pid)));
 			const own = opened.get(pid) ?? opened.set(pid, new Set()).get(pid)!, result = Number.parseInt(line.result ?? "", 10);
 			// Files and pipes the traced processes created stay private to them, through duplication and inheritance.
-			if (/^(?:open|openat|openat2|creat)$/.test(line.name) && Number.isSafeInteger(result) && result >= 0) { own.add(result); if (writesPath(line)) writable.add(absoluteDescriptorPath(line.result) ?? ""); }
+			if (/^(?:open|openat|openat2|creat)$/.test(line.name) && isSafeCount(result)) { own.add(result); if (writesPath(line)) writable.add(absoluteDescriptorPath(line.result) ?? ""); }
 			else if (/^pipe2?$/.test(line.name) && result === 0) for (const pipe of (line.args[0] ?? "").matchAll(/<pipe:\[(\d+)\]>/g)) ownPipes.add(pipe[1]!);
 			else if (line.name === "socketpair" && result === 0) for (const end of (line.args[3] ?? "").matchAll(/<UNIX(?:-[A-Z]+)?:\[(\d+)/g)) ownPipes.add(end[1]!);
-			else if (/^dup[23]?$|^fcntl(?:64)?$/.test(line.name) && (line.name.startsWith("dup") || /^F_DUPFD/.test(line.args[1] ?? "")) && Number.isSafeInteger(result) && result >= 0) {
+			else if (/^dup[23]?$|^fcntl(?:64)?$/.test(line.name) && (line.name.startsWith("dup") || /^F_DUPFD/.test(line.args[1] ?? "")) && isSafeCount(result)) {
 				if (own.has(Number.parseInt(line.args[0] ?? "", 10))) own.add(result); else own.delete(result);
 			} else if (line.name === "close") own.delete(Number.parseInt(line.args[0] ?? "", 10));
 			else if (line.name === "close_range" && result === 0 && !line.args[2]?.includes("CLOSE_RANGE_CLOEXEC"))
 				for (const fd of own) if (fd >= Number(line.args[0]) && fd <= (/^~0/.test(line.args[1] ?? "") ? Infinity : Number(line.args[1]))) own.delete(fd);
-			if (line.failure) { complete = false; incompleteReasons.add(line.failure); continue; }
-			const syscall = line.name;
+			if (line.failure) { incomplete.add(line.failure); continue; }
+			const { name: syscall, args } = line, succeeded = syscallSucceeded(line);
 			if (!syscall) continue;
-			if (options.frozen && !continuationCall(line, index === start)) {
-				complete = false; incompleteReasons.add(`continuation_state:${syscall}`);
-			}
+			// Descriptor images have their own sealed effects; explicitly naming one still observes its pathname.
+			const observedPaths = syscallPaths(line, cwd)?.filter(target => !options.inheritedFileImages?.includes(target) ||
+				!(writesPath(line) || syscall === "mmap") || PATH_ARGUMENTS[syscall]?.some(([pathname]) => pathname !== undefined));
+			if (options.frozen && !continuationCall(line, index === start)) incomplete.add(`continuation_state:${syscall}`);
 			if (syscall === "getpid" || syscall === "getppid" || syscall === "getsid" || syscall === "getpgid") { taints.add("pid_observation"); }
-			const endpoint = /^\d+<(?:pipe|UNIX(?:-[A-Z]+)?):\[(\d+)(?:->\d+)?\]>$/.exec(line.args[0] ?? "")?.[1];
-			const stream = endpoint && options.inheritedStreams?.includes(endpoint) || options.inheritedStreams?.some(inode => inode.startsWith("eventfd:")) && /^\d+<anon_inode:\[eventfd\]>$/.test(line.args[0] ?? "");
+			const endpoint = /^\d+<(?:pipe|UNIX(?:-[A-Z]+)?):\[(\d+)(?:->\d+)?\]>$/.exec(args[0] ?? "")?.[1];
+			const stream = endpoint && options.inheritedStreams?.includes(endpoint) || options.inheritedStreams?.some(inode => inode.startsWith("eventfd:")) && /^\d+<anon_inode:\[eventfd\]>$/.test(args[0] ?? "");
 			const streamCall = streamCalls.has(line);
 			if (stream && /^(?:read|write|readv|writev|sendto|recvfrom|sendfile|vmsplice)$/.test(syscall) && !streamCall) unsupported(syscall);
 			if (options.inheritedStreams?.length && /^(?:poll|ppoll|select|pselect6|epoll_.*)$/.test(syscall) && !streamCall && !internalPoll(line, ownPipes)) unsupported(syscall);
 			// A local socket reaches another process only once connected: a refused path (an NSS cache that is absent here) is a
 			// pathname dependency, validated absent where the Actor runs.
-			const refused = syscall === "connect" && /^-1 (?:ENOENT|ECONNREFUSED|EACCES)\b/.test(line.result) ? /\bsun_path="(\/[^"]+)"/.exec(line.args[1] ?? "")?.[1] : undefined;
+			const refused = syscall === "connect" && /^-1 (?:ENOENT|ECONNREFUSED|EACCES)\b/.test(line.result) ? /\bsun_path="(\/[^"]+)"/.exec(args[1] ?? "")?.[1] : undefined;
 			if (refused) { observePath(refused, "input", /^-1 ENOENT\b/.test(line.result) ? "ENOENT" : undefined); continue; }
-			const output = !!options.outputEndpoints?.includes(`socket:[${/^\d+<UNIX-STREAM:\[(\d+)/.exec(line.args[0] ?? "")?.[1]}]`);
+			const output = !!options.outputEndpoints?.includes(`socket:[${/^\d+<UNIX-STREAM:\[(\d+)/.exec(args[0] ?? "")?.[1]}]`);
 			const outputQuery = output && /^(?:getsockname|getpeername|getsockopt)$/.test(syscall);
 			// Created pairs stay within the tree only while they neither open another connection nor send to another address.
-			const localCall = endpoint && ownPipes.has(endpoint) && (syscall === "sendto" ? line.args[4] === "NULL" && line.args[5] === "0"
-				: syscall === "sendmsg" ? streamMessage(line.args[1]) !== undefined : !/^(?:connect|bind|listen|accept|accept4|sendmmsg)$/.test(syscall));
-			if (NETWORK_SYSCALLS.has(syscall) && !nonSocketQuery(line) && !streamCall && !outputQuery && !(/^socket(?:pair)?$/.test(syscall) && /^AF_UNIX\b/.test(line.args[0] ?? "")) &&
+			const localCall = endpoint && ownPipes.has(endpoint) && (syscall === "sendto" ? args[4] === "NULL" && args[5] === "0"
+				: syscall === "sendmsg" ? streamMessage(args[1]) !== undefined : !/^(?:connect|bind|listen|accept|accept4|sendmmsg)$/.test(syscall));
+			if (NETWORK_SYSCALLS.has(syscall) && !nonSocketQuery(line) && !streamCall && !outputQuery && !(/^socket(?:pair)?$/.test(syscall) && /^AF_UNIX\b/.test(args[0] ?? "")) &&
 				!localCall) taints.add("network");
 			if (IPC_SYSCALLS.has(syscall)) taints.add("ipc");
 			// Descriptor-local state is internal; reproduced OFD flags are sealed with their final offsets. A lock taken without waiting,
 			// or a query that found the range free, depends only on no one else holding one, which a replay probes; a refusal, or a
 			// holder found, saw another. One taken by waiting ends the same way natively, however long it waited; a release reveals nothing.
-			const record = /^fcntl(?:64)?$/.test(syscall) ? /^F_(?:OFD_)?(GETLK|SETLK|SETLKW)(?:64)?$/.exec(line.args[1] ?? "")?.[1] : undefined;
-			const lock = syscall === "flock" ? /\bLOCK_NB\b/.test(line.args[1] ?? "") && /\bLOCK_(SH|EX)\b/.exec(line.args[1] ?? "")?.[1]
-				: record && record !== "SETLKW" && /\bl_type=F_(RD|WR|UN)LCK\b/.exec(line.args[2] ?? "")?.[1], locked = absoluteDescriptorPath(line.args[0]);
+			const record = /^fcntl(?:64)?$/.test(syscall) ? /^F_(?:OFD_)?(GETLK|SETLK|SETLKW)(?:64)?$/.exec(args[1] ?? "")?.[1] : undefined;
+			const lock = syscall === "flock" ? /\bLOCK_NB\b/.test(args[1] ?? "") && /\bLOCK_(SH|EX)\b/.exec(args[1] ?? "")?.[1]
+				: record && record !== "SETLKW" && /\bl_type=F_(RD|WR|UN)LCK\b/.exec(args[2] ?? "")?.[1], locked = absoluteDescriptorPath(args[0]);
 			if (lock && !streamCall && (record === "GETLK" || lock !== "UN")) {
-				if (locked && syscallSucceeded(line) && (record === "GETLK") === (lock === "UN")) locks.set(locked, locks.get(locked) || lock !== "SH" && lock !== "RD");
+				if (locked && succeeded && (record === "GETLK") === (lock === "UN")) locks.set(locked, locks.get(locked) || lock !== "SH" && lock !== "RD");
 				else taints.add("ipc");
 			}
 			if (/^fcntl(?:64)?$/.test(syscall) && !record) {
-				const command = line.args[1] ?? "";
+				const command = args[1] ?? "";
 				if (!/^F_(?:GETFD|SETFD|DUPFD|DUPFD_CLOEXEC)$/.test(command) &&
 					// A descriptor this process opened reports the flags it chose; an inherited one's flags need evidence.
 					// Standard streams' status flags are part of the pinned execution context.
-					!(command === "F_GETFL" && (own.has(Number.parseInt(line.args[0] ?? "", 10)) || /^[012]</.test(line.args[0] ?? ""))) && !((command === "F_GETFL" || command === "F_SETFL" && syscallSucceeded(line) &&
-						(line.args[2] ?? "").split("|").every(flag => /^(?:O_(?:RDONLY|WRONLY|RDWR|APPEND|NONBLOCK|NDELAY|LARGEFILE|DIRECTORY|DSYNC|SYNC|NOFOLLOW)|0)$/.test(flag))) &&
-						(options.inheritedFileImages?.includes(absoluteDescriptorPath(line.args[0]) ?? /^\d+<(pipe:\[\d+\])>$/.exec(line.args[0] ?? "")?.[1] ?? "") || stream || output ||
-							options.unchangedOutputPipes?.includes(/^\d+<(pipe:\[\d+\])>$/.exec(line.args[0] ?? "")?.[1] ?? "") ||
-							own.has(Number.parseInt(line.args[0] ?? "", 10)) || ownPipes.has(endpoint ?? ""))))
+					!(command === "F_GETFL" && (own.has(Number.parseInt(args[0] ?? "", 10)) || /^[012]</.test(args[0] ?? ""))) && !((command === "F_GETFL" || command === "F_SETFL" && succeeded &&
+						(args[2] ?? "").split("|").every(flag => /^(?:O_(?:RDONLY|WRONLY|RDWR|APPEND|NONBLOCK|NDELAY|LARGEFILE|DIRECTORY|DSYNC|SYNC|NOFOLLOW)|0)$/.test(flag))) &&
+						(options.inheritedFileImages?.includes(absoluteDescriptorPath(args[0]) ?? /^\d+<(pipe:\[\d+\])>$/.exec(args[0] ?? "")?.[1] ?? "") || stream || output ||
+							options.unchangedOutputPipes?.includes(/^\d+<(pipe:\[\d+\])>$/.exec(args[0] ?? "")?.[1] ?? "") ||
+							own.has(Number.parseInt(args[0] ?? "", 10)) || ownPipes.has(endpoint ?? ""))))
 					unsupported(syscall);
 			}
 			// An unprivileged process holds no capabilities, sandboxed or not (the observer runs as the Actor's user).
-			const noCapabilities = syscall === "capget" && process.getuid?.() !== 0 && /\{effective=0, permitted=0, inheritable=0\}\) = 0$/.test(`${line.args.join(", ")}) = ${line.result}`);
+			const noCapabilities = syscall === "capget" && process.getuid?.() !== 0 && /\{effective=0, permitted=0, inheritable=0\}\) = 0$/.test(`${args.join(", ")}) = ${line.result}`);
+			const limit = syscall === "prlimit64" ? args[1] : /^(?:getrlimit|setrlimit)$/.test(syscall) ? args[0] : undefined;
 			// A refused io_uring leaves libuv on epoll and its thread pool: the same results, every file call traced.
 			if (syscall === "io_uring_setup" && /^-1 EPERM\b/.test(line.result)) continue;
-			if (!noCapabilities && (CONFINEMENT_SENSITIVE_SYSCALLS.has(syscall) || prctlConfinementSensitive(line, syscall) || confinementDenied(line) || processLimitDenied(line, syscall))) {
+			if (!noCapabilities && (CONFINEMENT_SENSITIVE_SYSCALLS.has(syscall) || /^-1 (?:EACCES|EPERM)\b/.test(line.result) ||
+				syscall === "prctl" && !/^PR_(?:GET_NAME|SET_NAME|SET_VMA)$/.test(args[0] ?? "") ||
+				["clone", "clone3", "fork", "vfork"].includes(syscall) && /^-1 EAGAIN\b/.test(line.result) ||
+				limit === "RLIMIT_CORE" && syscall !== "setrlimit" && succeeded)) {
 				taints.add("confinement_observation");
 			}
 			// A time set on a file the tree opened for writing reaches its effects, which carry each file's modification time.
-			if (/^(?:utime|utimes|utimensat|futimesat)$/.test(syscall) && !(syscallPaths(line, syscall, cwd) ?? [""]).every(target => writable.has(target))) unsupported(syscall);
+			if (/^(?:utime|utimes|utimensat|futimesat)$/.test(syscall) && !(observedPaths ?? [""]).every(target => writable.has(target))) unsupported(syscall);
 			if (
-				resourceLimitMutation(line, syscall) || UNMODELED_FILE_SEMANTICS_SYSCALLS.has(syscall) && !streamCall ||
-				(syscall === "pipe2" && /O_DIRECT|O_EXCL/.test(line.args[1] ?? "")) ||
+				// Even a failed setter can mutate a limit; sandbox caps and foreign limits are unmodeled.
+				(syscall === "setrlimit" || syscall === "prlimit64" && args[2] !== "NULL") &&
+					(syscall === "prlimit64" && args[0] !== "0" || limit === "RLIMIT_NPROC" || limit === "RLIMIT_CORE") ||
+				UNMODELED_FILE_SEMANTICS_SYSCALLS.has(syscall) && !streamCall ||
+				(syscall === "pipe2" && /O_DIRECT|O_EXCL/.test(args[1] ?? "")) ||
 				(syscall === "ioctl" && unmodeledFileIoctl(line))
 			) {
 				unsupported(syscall);
@@ -705,43 +717,40 @@ export async function observeStrace(
 			// A filesystem's statistics vary over time like the clock, whose taint every trace carries; the sandbox reports the one a
 			// native run sees, the workspace's own included.
 			if (/^f?statfs$/.test(syscall)) continue;
-			const listed = /^getdents(?:64)?$/.test(syscall) ? absoluteDescriptorPath(line.args[0]) : undefined;
+			const listed = /^getdents(?:64)?$/.test(syscall) ? absoluteDescriptorPath(args[0]) : undefined;
 			const directoryImage = !!listed && !!options.inheritedDirectoryImages?.includes(listed);
 			// A listed directory's entry set is its dependency; readdir order and d_ino are volatile identity, as a descriptor's is.
-			const listing = !!listed && !directoryImage && syscallSucceeded(line);
+			const listing = !!listed && !directoryImage && succeeded;
 			if (listing) { taints.add("descriptor_observation"); listedPaths.add(listed!); if (paths.get(listed!) !== "executable") paths.set(listed!, "input"); }
-			if (UNMODELED_METADATA_SYSCALLS.has(syscall) && !listing && (syscallSucceeded(line) ? !directoryImage : directoryImage)) {
+			if (UNMODELED_METADATA_SYSCALLS.has(syscall) && !listing && (succeeded ? !directoryImage : directoryImage)) {
 				unsupported(syscall);
-				incompleteReasons.add(`unmodeled_metadata:${syscall}:${pid}`);
+				incomplete.add(`unmodeled_metadata:${syscall}:${pid}`);
 			}
-			if (semanticRoots.length && workspaceDriverSemanticGap(line, syscall, cwd, semanticRoots)) {
-				complete = false;
+			if (semanticRoots.length && workspaceDriverSemanticGap(line, observedPaths, semanticRoots)) {
 				unsupported(syscall);
-				incompleteReasons.add(`filesystem_semantics:${syscall}:${pid}`);
+				incomplete.add(`filesystem_semantics:${syscall}:${pid}`);
 			}
-			if (syscallSucceeded(line) && writesPath(line)) for (const target of syscallPaths(line, syscall, cwd) ?? []) { const name = workspaceName(target); if (name) written.add(name); else external.add(target); }
+			if (succeeded && writesPath(line)) for (const target of observedPaths ?? []) { const name = workspaceName(target); if (name) written.add(name); else external.add(target); }
 			const [structure, flags] = MODELED_METADATA_SYSCALLS.get(syscall) ?? [];
-			if (structure && syscallSucceeded(line)) {
+			if (structure && succeeded) {
 				// A recreated null device has the same I/O semantics, but may have a different device-node inode.
-				if (/<char 1:3>>$/.test(line.args[0] ?? "")) { taints.add("descriptor_observation"); continue; }
-				const metadataPaths = syscallPaths(line, syscall, cwd) ?? [];
+				if (/<char 1:3>>$/.test(args[0] ?? "")) { taints.add("descriptor_observation"); continue; }
 				// The returned ABI fields are the observation. Program names and argv cannot prove a field unused.
-				const observed = statObservationDigest(line.args[structure] ?? "");
-				if (!metadataPaths.length || !observed) {
+				const observed = statObservationDigest(args[structure] ?? "");
+				if (!observedPaths?.length || !observed) {
 					// fstat, or an empty *at name, of a pipe or socket
-					if (descriptorTarget(line) && !quotedArgument(line.args[1])) taints.add("descriptor_observation");
-					else { unsupported(syscall); incompleteReasons.add(`unparsed_metadata:${syscall}:${pid}`); }
+					if (descriptorTarget(line) && !quotedArgument(args[1])) taints.add("descriptor_observation");
+					else { unsupported(syscall); incomplete.add(`unparsed_metadata:${syscall}:${pid}`); }
 				}
 				if (observed && observed.fields?.length !== 0) {
-					const followSymlinks = syscall !== "lstat" && !(flags && /\bAT_SYMLINK_NOFOLLOW\b/.test(line.args[flags] ?? ""));
-					for (const metadataPath of metadataPaths) observeMetadata(metadataPath, followSymlinks, observed);
+					const followSymlinks = syscall !== "lstat" && !(flags && /\bAT_SYMLINK_NOFOLLOW\b/.test(args[flags] ?? ""));
+					for (const metadataPath of observedPaths ?? []) observeMetadata(metadataPath, followSymlinks, observed);
 				}
 				continue;
 			}
 			if (!PATH_ARGUMENTS[syscall]) continue;
 			const role: DependencyRole = syscall === "execve" || syscall === "execveat" ? "executable" : "input";
-			const observedPaths = syscallPaths(line, syscall, cwd);
-			if (!observedPaths) { complete = false; incompleteReasons.add(`unresolved_pathname:${syscall}:${pid}`); }
+			if (!observedPaths) incomplete.add(`unresolved_pathname:${syscall}:${pid}`);
 			const nonEmpty = /^(?:rmdir|unlinkat|rename(?:at2?)?)$/.test(syscall) && /^-1 (?:ENOTEMPTY|EEXIST)\b/.test(line.result);
 			// Creating a name can fail on its parent; a multi-path syscall does not identify the failed operand.
 			const failure = observedPaths?.length === 1 && !writesPath(line) ? /^-1 (ENOENT|ENOTDIR)\b/.exec(line.result)?.[1] as "ENOENT" | "ENOTDIR" | undefined : undefined;
@@ -749,10 +758,10 @@ export async function observeStrace(
 				observePath(observed, role, failure);
 				if (nonEmpty) listedPaths.add(observed);
 			}
-			if ((syscall === "chdir" || syscall === "fchdir") && syscallSucceeded(line)) {
+			if ((syscall === "chdir" || syscall === "fchdir") && succeeded) {
 				const changed = tracedCwd(line, cwd);
 				if (changed) cwd = changed;
-				else { complete = false; incompleteReasons.add(`${syscall}_unparsed:${pid}`); }
+				else incomplete.add(`${syscall}_unparsed:${pid}`);
 			}
 		}
 	}
@@ -763,11 +772,11 @@ export async function observeStrace(
 	const touched = new Set([...external, ...[...written].flatMap(name => semanticRoots.map(root => path.posix.join(root, name.slice(2))))]
 		.flatMap(target => [target, path.posix.dirname(target)]));
 	for (const observed of changedMetadata) if (!touched.has(observed)) {
-		taints.add("mutable_input"); incompleteReasons.add(`metadata_changed:${observed}`);
+		taints.add("mutable_input"); incomplete.add(`metadata_changed:${observed}`);
 	}
-	if (!complete) taints.add("trace_incomplete");
+	if (incomplete.size) taints.add("trace_incomplete");
 	return {
-		complete,
+		complete: !incomplete.size,
 		...(options.inheritedHandles || options.inheritedStreams ? { resourceJournal: resourceJournal.sort((a, b) => a.order - b.order).map(({ order, ...event }) => event), retainedDescriptions: retained,
 			...(options.frozen ? { finalHandles } : {}) } : {}),
 		paths: Object.freeze([...[...paths].map(([observedPath, role]) => ({ path: observedPath, role: sharedObjectRole(observedPath, role),
@@ -776,8 +785,8 @@ export async function observeStrace(
 			.sort((left, right) => pathOrder(left).localeCompare(pathOrder(right)))),
 		taints: Object.freeze([...taints].sort()),
 		pids: [...selected.keys()],
-		tracedProcesses: [...selected].filter(([pid, { file, start }]) => start < Math.min(file.lines.length, brokered.get(pid) ?? Infinity)).length,
-		incompleteReasons: Object.freeze([...incompleteReasons].sort()),
+		tracedProcesses: [...selected].filter(([pid, { lines, start }]) => start < Math.min(lines.length, brokered.get(pid) ?? Infinity)).length,
+		incompleteReasons: Object.freeze([...incomplete].sort()),
 		...(unsupportedSyscalls.size ? { unsupportedSyscalls: Object.freeze([...unsupportedSyscalls].sort()) } : {}),
 		...(unsupportedSyscallsTruncated ? { unsupportedSyscallsTruncated: true as const } : {}),
 		written: [...written].map(name => name.slice(2)).sort(), external: [...external].sort(),
@@ -792,17 +801,19 @@ function pathOrder(item: ObservedProcessPath): string {
 /** State retained across the frontier must be in the image or the common resource
  * journal. The final table is bound back to its original OFDs before handoff. */
 function continuationCall(line: TraceLine, initial: boolean): boolean {
-	const call = line.name;
-	const fd = Number.parseInt(line.args[0] ?? "", 10);
+	const { name: call, args } = line;
+	const fd = Number.parseInt(args[/^dup[23]$/.test(call) ? 1 : 0] ?? "", 10);
 	if (/^(?:execve|execveat)$/.test(call)) return initial;
-	if (call === "close" || call === "close_range") return fd >= 3;
-	if (call === "fcntl" || call === "fcntl64") return fd >= 3 || line.args[1] !== "F_SETFD";
-	if (/^dup[23]$/.test(call)) return Number.parseInt(line.args[1] ?? "", 10) >= 3;
-	if (call === "mmap") return (line.args[3] ?? "").split("|").every(flag => /^(?:MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED|MAP_DENYWRITE|MAP_STACK)$/.test(flag));
-	if (call === "madvise") return line.args[2] === "MADV_DONTNEED" || line.args[2] === "MADV_NOHUGEPAGE";
-	if (call === "arch_prctl") return /^ARCH_(?:SET|GET)_(?:FS|GS)$/.test(line.args[0] ?? "");
-	if (call === "prctl") return line.args[0] === "PR_GET_NAME";
-	return /^(?:read|pread64|readv|write|writev|pwrite64|lseek|open|openat|access|faccessat|newfstatat|fstat|stat|lstat|statx|readlink|readlinkat|brk|mprotect|munmap|set_tid_address|set_robust_list|rseq|prlimit64|getrandom|rt_sigaction|rt_sigprocmask|sigaltstack|dup|poll|ppoll|select|pselect6|sendto|recvfrom|sendmsg|recvmsg|shutdown|flock|rename|renameat|renameat2|unlink|unlinkat|link|linkat|mkdir|mkdirat|rmdir|chmod|fchmod|fchmodat|truncate|ftruncate)$/.test(call);
+	if (/^(?:close|close_range|dup[23])$/.test(call)) return fd >= 3;
+	if (call === "fcntl" || call === "fcntl64") return fd >= 3 || args[1] !== "F_SETFD";
+	if (call === "prlimit64" && args[2] === "NULL") return true;
+	if (call === "setrlimit" || call === "prlimit64" && args[0] === "0")
+		return /^RLIMIT_(?:FSIZE|DATA|STACK|RSS|NOFILE|MEMLOCK|AS|LOCKS|SIGPENDING|MSGQUEUE|NICE|RTPRIO)$/.test(args[call === "prlimit64" ? 1 : 0] ?? "");
+	if (call === "mmap") return (args[3] ?? "").split("|").every(flag => /^(?:MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED|MAP_DENYWRITE|MAP_STACK)$/.test(flag));
+	if (call === "madvise") return args[2] === "MADV_DONTNEED" || args[2] === "MADV_NOHUGEPAGE";
+	if (call === "arch_prctl") return /^ARCH_(?:SET|GET)_(?:FS|GS)$/.test(args[0] ?? "");
+	if (call === "prctl") return args[0] === "PR_GET_NAME";
+	return /^(?:read|pread64|readv|write|writev|pwrite64|lseek|open|openat|access|faccessat|newfstatat|fstat|stat|lstat|statx|readlink|readlinkat|brk|mprotect|munmap|set_tid_address|set_robust_list|rseq|getrlimit|getrandom|rt_sigaction|rt_sigprocmask|sigaltstack|dup|poll|ppoll|select|pselect6|sendto|recvfrom|sendmsg|recvmsg|shutdown|flock|rename|renameat|renameat2|unlink|unlinkat|link|linkat|mkdir|mkdirat|rmdir|chmod|fchmod|fchmodat|truncate|ftruncate)$/.test(call);
 }
 
 /** Kernel argument positions own pathname identity; each *at operand has its own directory binding.
@@ -817,6 +828,8 @@ const PATH_ARGUMENTS: Readonly<Record<string, readonly (readonly [pathname: numb
 	["linkat", [[1, 0, true], [3, 2]]],
 	["symlinkat", [[2, 1]]],
 	["fchdir fstat fstatfs", [[undefined, 0]]],
+	["write writev pwrite64 pwritev pwritev2 ftruncate fchmod fchown fallocate sendfile", [[undefined, 0]]],
+	["copy_file_range splice", [[undefined, 2]]], ["tee", [[undefined, 1]]], ["mmap", [[undefined, 4]]],
 ] as const).flatMap(([names, positions]) => names.split(" ").map((name) => [name, positions])));
 
 const MODELED_METADATA_SYSCALLS = new Map<string, readonly [structure: number, flags?: number]>([["stat", [1]], ["lstat", [1]], ["fstat", [1]], ["newfstatat", [2, 3]], ["statx", [4, 2]]]);
@@ -835,9 +848,9 @@ function unmodeledFileIoctl(line: TraceLine): boolean {
 	return UNMODELED_MUTATING_IOCTL.test(line.args[1] ?? "") || absoluteDescriptorPath(line.args[0]) !== undefined;
 }
 
-function workspaceDriverSemanticGap(line: TraceLine, syscall: string, cwd: string, roots: readonly string[]): boolean {
+function workspaceDriverSemanticGap(line: TraceLine, paths: readonly string[] | undefined, roots: readonly string[]): boolean {
 	if (!DRIVER_SEMANTIC_GAP_RESULT.test(line.result)) return false;
-	const referenced = new Set(syscallPaths(line, syscall, cwd));
+	const referenced = new Set(paths);
 	for (const argument of line.args) { const target = absoluteDescriptorPath(argument); if (target) referenced.add(target); }
 	return [...referenced].some((candidate) => roots.some((root) => containsLogicalPath(root, candidate)));
 }
@@ -853,13 +866,6 @@ function nonSocketQuery(line: TraceLine): boolean {
 }
 
 
-function resourceLimitMutation(line: TraceLine, syscall: string): boolean {
-	if (!syscallSucceeded(line) || syscall === "prlimit64" && line.args[2] === "NULL") return false;
-	// A process sets its own limits within the hard ones its context pins; only the sandbox's process and core caps differ from native.
-	const own = syscall === "setrlimit" ? line.args[0] : syscall === "prlimit64" && line.args[0] === "0" ? line.args[1] : undefined;
-	return own === undefined ? syscall === "prlimit64" : own === "RLIMIT_NPROC" || own === "RLIMIT_CORE";
-}
-
 /** A poll that only checks descriptors are open, or waits on pipes the traced processes made, observes nothing outside them. */
 function internalPoll(line: TraceLine, ownPipes: ReadonlySet<string>): boolean {
 	const entries = /^p?poll$/.test(line.name) ? [...(line.args[0] ?? "").matchAll(/\{fd=\d+(<.*?>)?, events=([^}]+)\}/g)] : [];
@@ -867,47 +873,57 @@ function internalPoll(line: TraceLine, ownPipes: ReadonlySet<string>): boolean {
 }
 
 /** A traced execution's workspace writes so far (it may still run), stamped in wall-clock ms; an unresolvable name is undefined. */
-export interface TracedWrite { readonly paths?: readonly string[]; readonly at: number; readonly opened: boolean }
+export interface TracedWrite { readonly paths?: readonly string[]; readonly at: number; readonly opened: boolean; readonly mapped?: true }
 
-/** A trace file's bytes from `offset`, at most `limit` of them. */
-async function readTrace(file: string, offset: number, limit = Number.POSITIVE_INFINITY): Promise<Buffer> {
-	await using handle = await open(file, "r");
-	const info = await handle.stat();
-	if (!info.isFile()) throw new Error("trace is not a regular file");
-	const buffer = Buffer.allocUnsafe(Math.max(0, Math.min(limit, info.size - offset)));
-	return buffer.subarray(0, (await handle.read(buffer, 0, buffer.length, offset)).bytesRead);
+/** Read complete or growing transcripts through one bounded inventory; only newline-terminated records advance a tail. */
+async function* traceChunks(tracePrefix: string, offsets = new Map<string, number>(), remaining = Infinity) {
+	const directory = path.dirname(tracePrefix), prefix = `${path.basename(tracePrefix)}.`;
+	for (const name of await readdir(directory)) {
+		if (!remaining) break;
+		if (!name.startsWith(prefix)) continue;
+		const pid = name === `${prefix}stream` ? undefined : Number(name.slice(prefix.length));
+		if (pid !== undefined && !isSafeCount(pid, 1)) throw new Error("invalid trace filename");
+		await using handle = await open(path.join(directory, name), "r");
+		const info = await handle.stat(), offset = offsets.get(name) ?? 0;
+		if (!info.isFile() || info.size < offset) throw new Error("trace shrank or is not a regular file");
+		const buffer = Buffer.allocUnsafe(Math.min(remaining, info.size - offset));
+		const bytes = buffer.subarray(0, (await handle.read(buffer, 0, buffer.length, offset)).bytesRead), complete = bytes.lastIndexOf(10) + 1;
+		if (bytes.length !== buffer.length) throw new Error("trace changed while reading");
+		offsets.set(name, offset + complete); remaining -= bytes.length;
+		yield { pid, bytes, remaining };
+	}
 }
 
 /** A trace read as it grows, each record parsed once however often it is asked: its writes so far, and when it last named each absolute path (by name, through a
  * descriptor, or against the cwd its process followed from `cwd`, unknown until its fork is on record; a failed lookup names one too), in wall-clock milliseconds. */
-export interface TraceTail { readonly writes: readonly TracedWrite[]; readonly seen: ReadonlyMap<string, number>; read(): Promise<TraceTail> }
+export interface TraceTail { readonly writes: readonly TracedWrite[]; readonly seen: ReadonlyMap<string, number>; readonly unsafe: boolean; read(): Promise<TraceTail> }
 
 export function traceTail(tracePrefix: string, cwd: string): TraceTail {
-	const directory = path.dirname(tracePrefix), prefix = `${path.basename(tracePrefix)}.`, writes: TracedWrite[] = [], seen = new Map<string, number>(), offsets = new Map<string, number>(),
-		cwds = new Map<number, { cwd?: string }>(); // One process's cwd, or several's a fork let share it.
-	let reading: Promise<unknown> = Promise.resolve(), root: number | undefined;
+	const writes: TracedWrite[] = [], seen = new Map<string, number>(), offsets = new Map<string, number>(),
+		cwds = new Map<number, { cwd?: string }>(), decode = traceDecoder(); // One process's cwd, or several's a fork let share it.
+	let reading: Promise<unknown> = Promise.resolve(), root: number | undefined, unsafe = false;
 	const advance = async () => {
-		const records: Array<{ readonly pid: number; readonly at: number; readonly line: TraceLine }> = [];
-		for (const name of (await readdir(directory).catch(() => [] as string[])).filter(name => name.startsWith(prefix))) {
-			// A record strace is still writing waits for its newline; a clock stepped back must not reorder a process's own.
-			const offset = offsets.get(name) ?? 0, bytes = await readTrace(path.join(directory, name), offset).catch(() => Buffer.alloc(0)), complete = bytes.lastIndexOf(10) + 1;
-			offsets.set(name, offset + complete);
-			let last = 0;
-			for (const record of bytes.toString("utf8", 0, complete).split("\n")) {
-				const stamped = /^(?:(\d+) +)?(\d+\.\d+) (.*)$/.exec(record), line = stamped && parseTraceLine(stamped[3]!);
-				if (line) records.push({ pid: Number(stamped[1] ?? name.slice(prefix.length)), at: last = Math.max(last, Number(stamped[2]) * 1000), line });
-			}
+		const records: TraceRecord[] = [];
+		for await (const { pid, bytes } of traceChunks(tracePrefix, offsets)) {
+			for (const lines of decode(bytes.toString("utf8"), pid, true).values()) for (const line of lines) records.push(line);
 		}
 		records.sort((a, b) => a.at - b.at); root ??= records[0]?.pid; // A fork precedes its child's records, a chdir the forks after it; the first is the root's.
-		for (const { pid, at, line } of records) {
-			const process = cwds.get(pid) ?? (pid === root ? cwds.set(pid, { cwd }).get(pid) : undefined), paths = syscallPaths(line, line.name, process?.cwd ?? ""), child = spawnedPID(line);
-			if (syscallSucceeded(line) && writesPath(line)) writes.push({ ...(paths?.every(target => target.startsWith("/")) ? { paths } : {}), at, opened: /^open(?:at2?)?$/.test(line.name) });
+		for (const line of records) {
+			const { pid, at } = line;
+			// Path mutations are journaled below. Waiting or installing an image cannot itself mutate file data or names.
+			unsafe ||= !Number.isFinite(at) || !!line.failure && !/^(?:wait(?:4|id|pid)|execve(?:at)?)$/.test(line.name) || syscallSucceeded(line) &&
+				(/^(?:mount|umount2?|move_mount|pivot_root|chroot|setns|unshare|io_uring_setup|io_submit|[fl]?setxattr|[fl]?removexattr)$/.test(line.name) || line.name === "ioctl" && unmodeledFileIoctl(line));
+			if (line.failure) continue;
+			const process = cwds.get(pid) ?? (pid === root ? cwds.set(pid, { cwd }).get(pid) : undefined), paths = syscallPaths(line, process?.cwd ?? ""), child = spawnedPID(line);
+			const mapped = line.name === "mmap" && /\bMAP_SHARED(?:_VALIDATE)?\b/.test(line.args[3] ?? "");
+			if (syscallSucceeded(line) && (writesPath(line) || mapped)) writes.push({ ...(paths?.every(target => target.startsWith("/")) ? { paths } : {}), at,
+				opened: /^open(?:at2?)?$/.test(line.name) || line.name === "mmap", ...(line.name === "mmap" ? { mapped: true } : {}) });
 			for (const target of [...paths ?? [], ...line.args.flatMap(arg => absoluteDescriptorPath(arg) ?? [])]) if (target.startsWith("/")) seen.set(target, Math.max(seen.get(target) ?? 0, at));
 			if (process) process.cwd = tracedCwd(line, process.cwd);
 			if (child && !cwds.has(child)) { const shared = sharesFilesystem(line); cwds.set(child, shared && process ? process : { cwd: shared === false ? process?.cwd : undefined }); }
 		}
 	};
-	return { writes, seen, read() { const next = reading.then(advance); reading = next.catch(() => undefined); return next.then(() => this); } };
+	return { writes, seen, get unsafe() { return unsafe; }, read() { const next = reading.then(advance); reading = next.catch(() => { unsafe = true; }); return next.then(() => this); } };
 }
 
 /** Whether writes reached `targets` within [since, until], or held one open to write by `until`. An unresolvable write counts. */
@@ -916,29 +932,26 @@ export function writesWithin(writes: readonly TracedWrite[], targets: ReadonlySe
 }
 
 function writesPath(line: TraceLine): boolean {
-	return /^(?:creat|truncate|rename|renameat2?|link|linkat|symlink|symlinkat|mknod|mknodat|unlink|unlinkat|mkdir|mkdirat|rmdir|utimes?|utimensat|futimesat)$/.test(line.name) ||
+	return /^(?:creat|truncate|rename|renameat2?|link|linkat|symlink|symlinkat|mknod|mknodat|unlink|unlinkat|mkdir|mkdirat|rmdir|utimes?|utimensat|futimesat|chmod|fchmodat|chown|fchownat|writev?|pwrite(?:64|v2?)|ftruncate|fchmod|fchown|fallocate|sendfile|copy_file_range|splice|tee)$/.test(line.name) ||
+		line.name === "mmap" && /\bPROT_WRITE\b/.test(line.args[2] ?? "") && /\bMAP_SHARED(?:_VALIDATE)?\b/.test(line.args[3] ?? "") ||
 		/^open(?:at2?)?$/.test(line.name) && /\bO_(?:WRONLY|RDWR|CREAT|TRUNC)\b/.test(line.args.join(" "));
 }
 
 /** Only the owned tracer can write this marker, after successful adoption and before resuming. */
 function brokeredProcessSegments(selected: ReadonlyMap<number, TraceProcess>, options: StraceObservationOptions) {
 	const brokered = new Map<number, number>();
-	for (const [pid, { file, start }] of selected) for (let index = start; index < file.lines.length; index++) {
-		const line = file.lines[index]!;
+	for (const [pid, { lines, start }] of selected) for (let index = start; index < lines.length; index++) {
+		const line = lines[index]!;
 		if (line.name !== "pi_brokered_exec") continue;
-		if (!syscallSucceeded(line) || index <= start || !successfulExec(file.lines[index - 1]!) || brokered.has(pid) || options.brokeredWrites?.(pid) === undefined ||
-			file.lines.slice(index + 1).some(next => next.failure || next.name && !/^(?:exit|exit_group|terminated)$/.test(next.name))) throw new Error(`unproven brokered exec: ${pid}`);
+		if (!syscallSucceeded(line) || index <= start || !successfulExec(lines[index - 1]!) || brokered.has(pid) || options.brokeredWrites?.(pid) === undefined ||
+			lines.slice(index + 1).some(next => next.failure || next.name && !/^(?:exit|exit_group|terminated)$/.test(next.name))) throw new Error(`unproven brokered exec: ${pid}`);
 		brokered.set(pid, index - 1);
 	}
 	return brokered;
 }
 
 function tracedCwd(line: TraceLine, cwd: string | undefined): string | undefined {
-	if (!syscallSucceeded(line)) return cwd;
-	if (line.name === "fchdir") return absoluteDescriptorPath(line.args[0]);
-	if (line.name !== "chdir") return cwd;
-	const target = quotedStrings(line)[0];
-	return target && (target.startsWith("/") || cwd) ? walkedPath(target.startsWith("/") ? target : `${cwd}/${target}`) : undefined;
+	return syscallSucceeded(line) && /^(?:chdir|fchdir)$/.test(line.name) ? syscallPaths(line, cwd ?? "")?.[0] : cwd;
 }
 
 function successfulExec(line: TraceLine): boolean { return (line.name === "execve" || line.name === "execveat") && syscallSucceeded(line); }
@@ -946,7 +959,7 @@ function successfulExec(line: TraceLine): boolean { return (line.name === "execv
 function spawnedPID(line: TraceLine): number | undefined {
 	if (!["clone", "clone3", "fork", "vfork"].includes(line.name)) return undefined;
 	const pid = Number(line.result);
-	return Number.isSafeInteger(pid) && pid > 0 ? pid : undefined;
+	return isSafeCount(pid, 1) ? pid : undefined;
 }
 
 function sharesFilesystem(line: TraceLine): boolean | undefined {
@@ -966,23 +979,12 @@ function sharesFilesystem(line: TraceLine): boolean | undefined {
 
 function syscallSucceeded(line: TraceLine): boolean { return /^(?:0x[0-9a-f]+|[0-9]+)(?:\b|<)/i.test(line.result); }
 
-function confinementDenied(line: TraceLine): boolean { return /^-1 (?:EACCES|EPERM)\b/.test(line.result); }
-
-function prctlConfinementSensitive(line: TraceLine, syscall: string): boolean {
-	// Exec identity seals the initial task name; querying it observes no sandbox policy.
-	return syscall === "prctl" && !/^PR_(?:GET_NAME|SET_NAME|SET_VMA)$/.test(line.args[0] ?? "");
-}
-
-function processLimitDenied(line: TraceLine, syscall: string): boolean {
-	return ["clone", "clone3", "fork", "vfork"].includes(syscall) && /^-1 EAGAIN\b/.test(line.result);
-}
-
-function syscallPaths(line: TraceLine, syscall: string, cwd: string): readonly string[] | undefined {
-	const paths = (PATH_ARGUMENTS[syscall] ?? []).map(([pathname, dirfd, descriptorPath]) => {
+function syscallPaths(line: TraceLine, cwd: string): readonly string[] | undefined {
+	const paths = (PATH_ARGUMENTS[line.name] ?? []).map(([pathname, dirfd, descriptorPath]) => {
 		// strace names AT_FDCWD by the kernel's cwd, which a sandbox serving chdir itself never moves: the traced cwd is the process's.
 		const descriptor = dirfd === undefined ? undefined : line.args[dirfd], current = dirfd === undefined || /^(?:AT_FDCWD|-100)(?:<|$)/.test(descriptor ?? "");
 		if (pathname === undefined || descriptorPath && /^(?:""|NULL)$/.test(line.args[pathname] ?? "")) {
-			const target = current ? cwd : absoluteDescriptorPath(descriptor); return target ? [target] : current ? undefined : [];
+			const target = current ? cwd : absoluteDescriptorPath(descriptor); return target ? [target] : current || /^\d+$/.test(descriptor ?? "") ? undefined : [];
 		}
 		const value = quotedArgument(line.args[pathname]);
 		if (value?.startsWith("/")) return [walkedPath(value)]; // Absolute names ignore dirfd, even an invalid one.
@@ -1083,10 +1085,6 @@ function parseInteger(value: string | undefined): bigint | undefined {
 /** Linux's userspace-compatible new_encode_dev layout. */
 function linuxDevice(major: bigint, minor: bigint): bigint {
 	return ((major & 0xfffn) << 8n) | (minor & 0xffn) | ((minor & ~0xffn) << 12n) | ((major & ~0xfffn) << 32n);
-}
-
-function quotedStrings(line: TraceLine): string[] {
-	return line.args.flatMap((argument) => { const value = quotedArgument(argument); return value === undefined ? [] : [value]; });
 }
 
 function quotedArgument(argument: string | undefined): string | undefined {

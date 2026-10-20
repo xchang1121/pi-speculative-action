@@ -1,4 +1,5 @@
 import type { AssistantMessageEvent } from "@earendil-works/pi-ai";
+import { asRecord } from "./stable-json.ts";
 
 export type ActorStreamPreview =
 	| { readonly type: "tool"; readonly tool: string }
@@ -76,10 +77,7 @@ export class ActorStreamPreviewTracker {
 
 function jsonObject(value: string): Record<string, unknown> | undefined {
 	try {
-		const parsed: unknown = JSON.parse(value);
-		return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
-			? (parsed as Record<string, unknown>)
-			: undefined;
+		return asRecord(JSON.parse(value));
 	} catch {
 		return undefined;
 	}

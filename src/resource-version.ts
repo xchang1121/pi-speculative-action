@@ -1,3 +1,4 @@
+import { isSafeCount } from "./number-utils.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { hash } from "node:crypto";
 import { type BigIntStats, type FSWatcher, watch } from "node:fs";
@@ -5,13 +6,32 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { setImmediate as watcherTurn } from "node:timers/promises";
 import { type ActionKey, type ActionSemanticsRegistry, PI_ACTION_SEMANTICS, type ResourceDependencyScope } from "./action-semantics.ts";
-import { type StableFilesystemCapture, type FilesystemObjectHandle, cachedCapture, captureFilesystemEntry, captureStableFile, rememberCapture, FILESYSTEM_CONCURRENCY, mapFilesystem, sameFilesystemIdentity, walkFilesystemPath } from "./filesystem-evidence.ts";
+import {
+	type StableFilesystemCapture, type FilesystemObjectHandle, cachedCapture, captureFilesystemEntry, captureStableFile,
+	FILESYSTEM_CONCURRENCY, mapFilesystem, sameFilesystemIdentity, walkFilesystemPath, filesystemEntryType, type FilesystemTypeEvidence,
+} from "./filesystem-evidence.ts";
 import { containsFilesystemPath, filesystemPathKey, relativeFilesystemPath } from "./path-utils.ts";
-import type { ToolFilesystemOperations, ToolFilesystemStat } from "./tool-settlement.ts";
 import { RuntimeLifecycleLane, SharedAbortScope } from "./runtime-lifecycle.ts";
 import { TimelineInterval } from "./task-timing.ts";
-import { filesystemEntryType, type FilesystemTypeEvidence } from "./provenance-certificate.ts";
 import type { ValidationMetrics } from "./settlement.ts";
+
+export type ToolFilesystemStat = { isDirectory: () => boolean; size?: number; type?: "file" | "directory" | "symlink" | "special"; link?: string; realPath?: string };
+
+/** Filesystem capabilities supplied by an execution world, never ambient host defaults. */
+export interface ToolFilesystemOperations {
+	readonly readFile: (target: string, maxBytes?: number) => Promise<Buffer>;
+	readonly access: (target: string, writable?: boolean) => Promise<void>;
+	readonly exists?: (target: string) => boolean | Promise<boolean>;
+	/** `entry` does not follow the final link; includeSize=false returns only type/path fields and their evidence. */
+	readonly stat?: (target: string, fields?: "type" | "entry", includeSize?: boolean) => ToolFilesystemStat | Promise<ToolFilesystemStat>;
+	readonly readdir?: (target: string) => string[] | Promise<string[]>;
+	readonly writeFile?: (target: string, content: string) => Promise<void>;
+	readonly mkdir?: (target: string) => Promise<void>;
+	/** Build is pure and reads only view inputs; binding/key cover other inputs and values stay immutable. Resource is a hint; signal owns this consumer. */
+	readonly prepare?: <Value, Result>(binding: object, key: string,
+		build: (view: ToolFilesystemOperations, signal: AbortSignal) => Promise<{ readonly value: Value; readonly bytes: number; readonly dispose: () => void | Promise<void> }>,
+		consume: (value: Value) => Promise<Result>, resource?: string, signal?: AbortSignal) => Promise<Result>;
+}
 
 export type ResourceDependency = {
 	readonly path: string;
@@ -197,7 +217,7 @@ export class ResourceReadView {
 	reserve(bytes: number): boolean {
 		if (this.sealed) throw new Error("resource_snapshot_not_capturing");
 		if (this.failure) { if (this.load) throw this.failure; return false; }
-		if (!Number.isSafeInteger(bytes) || bytes < 0) throw new Error("resource_snapshot_budget_invalid");
+		if (!isSafeCount(bytes)) throw new Error("resource_snapshot_budget_invalid");
 		if (this.bytes + bytes > this.maxBytes) {
 			this.failure = new Error("resource_snapshot_budget_exceeded");
 			for (const entry of this.entries.values()) this.releaseObject(entry);
@@ -359,12 +379,10 @@ export class ResourceReadView {
 			const inputEpoch = owner.inputEpoch; // Rejected old sources precede this new computation.
 			let resource: Awaited<ReturnType<typeof build>> | undefined;
 			let bytes = 0, computationBytes = 32;
-			let decline!: () => void;
-			let composed: (() => void) | undefined;
+			const declined = Promise.withResolvers<void>(), composed = this.acceptProofs && Promise.withResolvers<void>();
 			const name = target && filesystemPathKey(target);
 			const pending: PreparedResource = { resource: name, origin: owner, destination: owner, borrowers: 0, boundary: this.boundary, cancellation: new SharedAbortScope(), waiting: new Set(),
-				declined: new Promise<void>(resolve => { decline = resolve; }),
-				composed: this.acceptProofs && new Promise<void>(resolve => { composed = resolve; }),
+				declined: declined.promise, composed: composed?.promise,
 				dispose: async () => { try { await resource?.dispose(); } finally {
 					if (prepared.bindings.get(binding)?.get(key) === pending) prepared.bindings.get(binding)!.delete(key);
 					await Promise.allSettled(pending.proofs?.map(proof => proof.release()) ?? []);
@@ -375,7 +393,7 @@ export class ResourceReadView {
 			if (!entries.has(key) || !entries.get(key)!.retained && entries.get(key)!.cancellation.signal.aborted) entries.set(key, pending);
 			pending.ready = this.evaluate(async view => {
 				view.preparing = pending;
-				const foreign = view.onForeignInputs; view.onForeignInputs = transferable => { if (transferable) composed?.(); else decline(); foreign?.(transferable); };
+				const foreign = view.onForeignInputs; view.onForeignInputs = transferable => { if (transferable) composed?.resolve(); else declined.resolve(); foreign?.(transferable); };
 				view.collectProofs = this.acceptProofs ? new Map() : undefined;
 				const evaluation = await TimelineInterval.measure(() => build(view, pending.cancellation.signal));
 				resource = evaluation.output; pending.computation = TimelineInterval.own(evaluation.computation);
@@ -389,7 +407,7 @@ export class ResourceReadView {
 				pending.value = resource.value;
 				bytes = resource.bytes + computationBytes + resourceProofBytes(pending.proofs ?? []) + (key.length + (name?.length ?? 0)) * 2 + 192 +
 					[...pending.dependencies ?? []].reduce((sum, name) => sum + name.length * 2 + 64, 0);
-				if (!Number.isSafeInteger(resource.bytes) || resource.bytes < 0) throw new Error("resource_snapshot_budget_invalid");
+				if (!isSafeCount(resource.bytes)) throw new Error("resource_snapshot_budget_invalid");
 				const destination = pending.destination = owner.sealed && this.missing ? (await this.missing()).view : owner;
 				pending.cancellation.signal.throwIfAborted();
 				this.assertComplete(); destination.assertComplete();
@@ -403,7 +421,7 @@ export class ResourceReadView {
 				}
 				// The origin keeps a borrowed lookup; the destination owns its bytes and disposal.
 			});
-			void pending.ready.finally(() => { decline(); composed?.(); }).catch(() => {});
+			void pending.ready.finally(() => { declined.resolve(); composed?.resolve(); }).catch(() => {});
 			return (await use(pending, true))!.value;
 		});
 	});
@@ -917,8 +935,6 @@ export function isResourceVersionToken(value: unknown): value is ResourceVersion
 	);
 }
 
-export function closeResourceVersionManagers() { for (const manager of managers.values()) manager.close(); managers.clear(); }
-
 const dependencyKey = (dependency: ResourceDependency) => `${dependency.scope}:${filesystemPathKey(dependency.path)}`;
 
 function affects(dependency: ResourceDependency, event: ResourceEvent, preciseContent: ReadonlySet<string>) {
@@ -1085,12 +1101,11 @@ async function fingerprintDependencies(
 				const bytes = provided && Buffer.from(provided);
 				// Supplied bytes own data, never a host observation window; adoption validates them exactly.
 				// A file unchanged since an earlier read of it, by the racy-git rule, needs no read unless its bytes are retained.
-				const gitBlob = scope === "tree_content" && treeObjects !== undefined, takenAtMs = Date.now();
+				const gitBlob = scope === "tree_content" && treeObjects !== undefined;
 				const content: StableFilesystemCapture = bytes ? { content: bytes, bytesRead: bytes.length, hash: hash("sha256", bytes), stat: info, realPath: realTarget,
 					computation: supplied && "computation" in supplied ? supplied.computation : undefined }
 					: !retain && cachedCapture(info, realTarget, gitBlob) || await fingerprintIO(() => captureStableFile(target, retain ? Number(info.size) : undefined, retain, {
 						stat: info, realPath: realTarget, retainObject: retain && view!.canRetainObject, gitBlob }));
-				if (!bytes && !content.shared) rememberCapture(content, takenAtMs);
 				assertInside(realRoot, content.realPath);
 				retainEntry({ type: "file", content: content.content, computation: content.computation,
 					object: content.object ?? (bytes && retain && view!.canRetainObject ? null : undefined),

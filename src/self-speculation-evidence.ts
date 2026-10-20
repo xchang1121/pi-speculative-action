@@ -1,3 +1,4 @@
+import { isSafeCount } from "./number-utils.ts";
 import { stableStringify } from "./stable-json.ts";
 
 interface EvidenceState {
@@ -18,8 +19,8 @@ export class EvidenceLedger {
 	}
 
 	observe(context: object, trials: number, successes: number): void {
-		if (!Number.isSafeInteger(trials) || trials <= 0) return;
-		if (!Number.isSafeInteger(successes) || successes < 0 || successes > trials) return;
+		if (!isSafeCount(trials, 1)) return;
+		if (!isSafeCount(successes, 0, trials)) return;
 		const key = stableStringify(context);
 		const state = this.states.get(key) ?? { observations: 0, trials: 0, successes: 0 };
 		state.observations++;

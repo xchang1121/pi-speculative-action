@@ -324,7 +324,7 @@ interface ExecutionWorldLifecycle<Context, Output, ObservationContext> {
 	readonly observation?: ExecutionWorldObservation<ObservationContext, Output>;
 	/** Observe proven internal work inside exactly one native Actor call; never seals its whole result. */
 	readonly observeOperations?: <Value>(request: { readonly action: ActionKey | undefined; readonly scope: ExecutionScope; readonly learn?: boolean;
-		readonly inputs?: (path?: string) => Iterable<object>; readonly cwd?: string; readonly signal?: AbortSignal; readonly enabled?: boolean },
+		readonly inputs?: (path?: string) => Iterable<object>; readonly cwd?: string; readonly signal?: AbortSignal; readonly enabled?: boolean; readonly reuseEnabled?: boolean },
 		execute: () => Promise<Value>, observe: (bindings: readonly ExecutionOperationBinding[], computations?: readonly TimelineDependency[]) => void) => Promise<Value>;
 	/** Retire preparation invalidated by an Actor mutation before its successors may launch. */
 	readonly actorFallbackSettled?: () => Promise<void>;
@@ -387,13 +387,11 @@ export class ExecutionWorldRouter<Context, Output, ObservationContext = Context>
 
 	observeOperations<Value>(action: ActionKey | undefined, scope: ExecutionScope, execute: () => Promise<Value>,
 		observe: (bindings: readonly ExecutionOperationBinding[], computations?: readonly TimelineDependency[]) => void, learn = false,
-		inputs?: (path?: string) => Iterable<object>, context?: { readonly cwd: string; readonly signal?: AbortSignal }): Promise<Value> {
+		inputs?: (path?: string) => Iterable<object>, context?: { readonly cwd: string; readonly signal?: AbortSignal; readonly reuseEnabled?: boolean }): Promise<Value> {
 		for (const world of this.worldsByID.values()) {
 			if (!world.observeOperations) continue;
-			let enabled = false;
-			try { enabled = this.speculationEnabled(world.id); } catch { /* Optional observation cannot deny the Actor call. */ }
 			const next = execute;
-			execute = () => world.observeOperations!({ action, scope, learn: learn && enabled, inputs, enabled, ...context }, next, observe);
+			execute = () => world.observeOperations!({ action, scope, learn, inputs, enabled: true, ...context }, next, observe);
 		}
 		return execute();
 	}

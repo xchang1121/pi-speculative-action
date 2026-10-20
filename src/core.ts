@@ -1,7 +1,7 @@
 /** Host-neutral speculative runtime surface. Pi adapters live in the root and extension entries. */
 export {
-	type ActionProjectionCoverage, type ActionProjectionRule, type ReadRangeCoverage,
-	READ_RANGE_ACTION_KEY_PROJECTOR, READ_RANGE_COVERAGE_DETAILS_KEY, readRangesShareInFlight,
+	type ActionProjectionCoverage, type ActionProjectionRule,
+	READ_RANGE_ACTION_KEY_PROJECTOR, readRangesShareInFlight,
 } from "./action-key-projection.ts";
 export {
 	type ActionEffect,
@@ -63,7 +63,6 @@ export * from "./tool-execution-gateway.ts";
 export type * from "./plan-proposal.ts";
 export {
 	captureResourceVersion,
-	closeResourceVersionManagers,
 	type ResourceChangeSet,
 	type ResourceDependency,
 	type ResourceValidationMetrics,
@@ -78,6 +77,9 @@ export {
 	type AuthoritativeResultCapture,
 	type CandidatePreflight,
 	type ActorActionFeedback,
+	type ActorObservation,
+	type RuntimeEventMap,
+	type RuntimeTurnContext,
 	type PredictionFeedback,
 	candidateExecutionMs,
 	diagnosticAction,
@@ -92,7 +94,6 @@ export {
 	type MaterializedActorAction,
 	type MaterializedSpeculativeCandidate,
 	type SpeculativePlanSource,
-	type SpeculativeRuntimeInspection,
 } from "./runtime.ts";
 export {
 	type ActorActionIdentity,

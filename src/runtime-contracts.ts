@@ -2,17 +2,23 @@ import type { ActionProjectionRule } from "./action-key-projection.ts";
 import type { ActionKey, ActionSemanticsRegistry } from "./action-semantics.ts";
 import type { DrafterToolDefinition } from "./common.ts";
 import type { CandidateEventDescriptor, SpeculativeActionEvent } from "./events.ts";
-import type { CapturedExecutionWorldResult, ExecutionResourceContext, ExecutionOperationBinding, SpeculativeExecutionRoute, WorldBranch, WorldResultCapture } from "./execution-world.ts";
+import type {
+	CapturedExecutionWorldResult, ExecutionResourceContext, ExecutionOperationBinding, SpeculativeExecutionRoute, WorldBranch, WorldResultCapture,
+} from "./execution-world.ts";
 import type { PlanAction, PlanProposal, PlanUpdate } from "./plan-proposal.ts";
 import type { ActorActionIdentity, ActorActionSettlement, PlanActionIdentity, PredictionSettlement, SettledSourceRequest } from "./settlement.ts";
 import type { TimelineInterval, ToolComputationTiming } from "./task-timing.ts";
+import type { RuntimeEventHandlers } from "./post-settlement.ts";
 
 export type { SpeculativeActionEvent, SpeculativeCacheSnapshot } from "./events.ts";
 
 type TurnIdentity<SessionID> = Pick<TurnInput<SessionID>, "sessionID" | "turnID">;
 
 export interface SpeculativeActionSettings {
+	/** Enable speculative production, including call predictions and observed-operation preparation. */
 	readonly enabled: boolean;
+	/** Cache and adopt reusable work. Omitted defaults to true; observation and learning stay active. */
+	readonly reuseEnabled?: boolean;
 	/** Optional prediction scope; omitted means all registered tools. Never a reuse or permission boundary. */
 	readonly tools?: readonly string[];
 	readonly prepareObservedOperations?: boolean;
@@ -42,7 +48,8 @@ export interface SpeculativeCandidate extends Pick<PlanAction, "tool" | "empiric
 	readonly id: string;
 	readonly key?: ActionKey;
 	readonly input: Readonly<Record<string, unknown>>;
-	readonly work?: { readonly execution?: { readonly executionMs?: number } };
+	/** Elapsed execution time once settled; runtime work and reservation state stay private. */
+	readonly executionMs?: number;
 	readonly source?: string;
 	readonly planDependencies?: PlanAction["dependsOn"];
 }
@@ -126,7 +133,6 @@ export interface SpeculativePlanSource<
 	SessionID,
 	Output,
 	StartInput extends TurnInput<SessionID>,
-	ConsumeInput extends TurnInput<SessionID>,
 	StateData,
 > {
 	readonly id: string;
@@ -136,8 +142,6 @@ export interface SpeculativePlanSource<
 	readonly timeoutMs?: (settings: SpeculativeActionSettings) => number | undefined;
 	/** Stop requests that can only predict the next Actor decision once that decision arrives. */
 	readonly requestLifetime?: "actor_decision" | "turn";
-	/** Synchronous policy timing for still-owned requests; feedback cannot delay admission. */
-	readonly onRequestSettled?: (request: SettledSourceRequest) => void;
 	readonly multiStepEnabled?: (settings: SpeculativeActionSettings, feedback?: unknown) => boolean;
 	readonly proposalCount?: (settings: SpeculativeActionSettings) => number;
 	/** Admission policy for concurrent initial proposals targeting one Actor decision. */
@@ -181,42 +185,44 @@ export interface SpeculativePlanSource<
 		readonly output: Output | undefined;
 		readonly trigger: "prepared" | "execution_succeeded" | "actor_adopted";
 	}) => boolean | readonly PlanContinuation[]);
-	/** Request scoped OS launch observations; this grants neither execution nor result-reuse authority. */
-	readonly observesOperations?: boolean;
-	readonly observe?: (input: RuntimeTurnContext<StartInput, StateData> & {
-		readonly consumeInput: ConsumeInput;
-		readonly action?: ActionKey;
-		readonly tool: string;
-		readonly concrete: Record<string, unknown>;
-		readonly output?: Output;
-		readonly operations?: readonly ExecutionOperationBinding[];
-		readonly durationMs: number;
-		readonly order: number;
-		/** Aborted once the turn closes: learning still applies, but its updates would be dropped. */
-		readonly signal?: AbortSignal;
-		/** A revision above `minimum` that no continuation of this proposal holds; `minimum` itself before it exists. */
-		readonly reserveRevision?: (proposalID: string, minimum: number) => number;
-	}) => MaybePromise<PlanUpdate | readonly PlanUpdate[] | undefined>;
-	/** Runs for every pending action accepted from an update, including retained identities. Binding can still reject it. */
-	readonly onAdmitted?: (input: PlanActionFeedback) => MaybePromise<void>;
-	readonly onIssued?: (input: PlanActionFeedback) => MaybePromise<void>;
-	/** Once per started physical execution, charged only to its owner, including failures and cancellations.
-	 * Uses settled execution time (cancellation stops at the abort request, excluding later cleanup).
-	 * Queued work that never starts and other predictions sharing its execution incur no additional cost. */
-	readonly onExecutionSettled?: (input: {
-		readonly reuseFeedback: unknown;
-		readonly status: "succeeded" | "failed" | "cancelled";
-		readonly executionMs: number;
-	}) => MaybePromise<void>;
-	readonly onSettled?: (input: PlanActionFeedback & {
-		readonly settlement: PredictionSettlement;
-		/** Attached execution served an Actor call, including through shared inputs, across metadata updates. */
-		readonly served?: boolean;
-	}) => MaybePromise<void>;
-	readonly flush?: () => MaybePromise<void>;
 }
 
 interface PlanActionFeedback { readonly proposalID: string; readonly actionID: string; readonly feedback: unknown; }
+
+/** Authoritative observations are available to learners even while every prediction source is off. */
+export interface ActorObservation<SessionID, Output, StartInput, ConsumeInput, StateData> extends ActorActionFeedback<SessionID>, RuntimeTurnContext<StartInput, StateData> {
+	readonly consumeInput: ConsumeInput;
+	readonly tool: string;
+	readonly concrete: Record<string, unknown>;
+	readonly output?: Output;
+	readonly operations?: readonly ExecutionOperationBinding[];
+	readonly durationMs: number;
+	readonly order: number;
+	readonly signal?: AbortSignal;
+}
+
+/** Typed policy events retain attribution without granting execution, reuse or prediction authority. */
+export interface RuntimeEventMap<SessionID, Output, StartInput, ConsumeInput, StateData> {
+	readonly turn_started: RuntimeTurnContext<StartInput, StateData> & {
+		readonly decisionSequence: number; readonly definitions: readonly DrafterToolDefinition[]; readonly signal?: AbortSignal;
+	};
+	readonly turn_finished: Pick<RuntimeTurnContext<StartInput, StateData>, "startInput" | "settings"> & { readonly terminal: boolean };
+	readonly session_closed: { readonly sessionID: SessionID; readonly terminal: boolean };
+	readonly candidate_materialized: MaterializedSpeculativeCandidate<SessionID>;
+	readonly actor_materialized: MaterializedActorAction<SessionID>;
+	readonly actor_settled: ActorActionFeedback<SessionID>;
+	readonly actor_observed: ActorObservation<SessionID, Output, StartInput, ConsumeInput, StateData>;
+	readonly prediction_admitted: PlanActionFeedback & { readonly source: string; readonly issued: boolean };
+	readonly prediction_settled: PredictionFeedback<SessionID>;
+	/** Delivered after claimed work is consumed or released, independently of source enablement. */
+	readonly prediction_feedback: PlanActionFeedback & { readonly settlement: PredictionSettlement; readonly served: boolean };
+	/** Once per physical execution; shared predictions do not incur another production cost. */
+	readonly execution_settled: TurnIdentity<SessionID> & {
+		readonly candidate: CandidateEventDescriptor; readonly reuseFeedback: unknown;
+		readonly status: "succeeded" | "failed" | "cancelled"; readonly executionMs: number;
+	};
+	readonly source_request: TurnIdentity<SessionID> & { readonly request: SettledSourceRequest };
+}
 
 export interface ActualToolCall { readonly id?: string; readonly tool: string; readonly input: unknown; }
 
@@ -230,7 +236,7 @@ export interface SpeculativeActionRuntimeAdapter<
 	readonly actionSemantics?: ActionSemanticsRegistry;
 	/** Optional host resource observations; absent for deterministic runtimes without host telemetry. */
 	readonly resources?: import("./system-resources.ts").ExecutionResourceMonitor;
-	readonly sources?: readonly SpeculativePlanSource<SessionID, Output, StartInput, ConsumeInput, StateData>[];
+	readonly sources?: readonly SpeculativePlanSource<SessionID, Output, StartInput, StateData>[];
 	/** Canonical model-visible observation, used only to verify private prediction ancestry. */
 	readonly observationKey?: (output: Output, action?: ActionKey) => string | undefined;
 	readonly settings: () => MaybePromise<SpeculativeActionSettings>;
@@ -267,56 +273,25 @@ export interface SpeculativeActionRuntimeAdapter<
 		readonly output: Output;
 		readonly candidate: SpeculativeCandidate;
 	}) => string | undefined;
-	readonly onTurnStarted?: (input: Pick<RuntimeTurnContext<StartInput, StateData>, "startInput" | "settings"> & {
-		readonly decisionSequence: number;
-		readonly definitions: readonly DrafterToolDefinition[];
-		readonly signal?: AbortSignal;
-	}) => MaybePromise<void>;
-	readonly onTurnFinished?: (input: Pick<RuntimeTurnContext<StartInput, StateData>, "startInput" | "settings"> & {
-		readonly terminal: boolean;
-	}) => MaybePromise<void>;
-	/** Best-effort side channel; failures cannot affect candidate admission or Actor behavior. */
-	readonly onCandidateMaterialized?: (candidate: MaterializedSpeculativeCandidate<SessionID>) => MaybePromise<void>;
-	/** Best-effort identity side channel; failures cannot affect Actor matching or execution. */
-	readonly onActorActionMaterialized?: (action: MaterializedActorAction<SessionID>) => MaybePromise<void>;
-	/** Best-effort policy feedback; failures cannot affect Actor settlement or source learning. */
-	readonly onActorActionSettled?: (feedback: ActorActionFeedback<SessionID>) => MaybePromise<void>;
-	/** Best-effort policy feedback; failures cannot affect prediction or source settlement. */
-	readonly onPredictionSettled?: (feedback: PredictionFeedback<SessionID>) => MaybePromise<void>;
 	readonly onEvent?: (event: SpeculativeActionEvent<SessionID>) => MaybePromise<void>;
-}
-
-export interface SpeculativeRuntimeInspection {
-	readonly resources?: import("./system-resources.ts").ExecutionResourceSnapshot & {
-		readonly reserved: import("./system-resources.ts").HardwareResources;
-		readonly admissionCapacity: number;
-		readonly actorUnits: number;
-		readonly preparationUnits: number;
-		readonly executionUnits: number;
-		readonly queuedPreparations: number;
-	};
-	readonly activeTurns: number;
-	readonly exclusiveCandidates: number;
-	readonly sharedCandidates: number;
-	readonly pendingPredictions: number;
-	readonly deferredPlanActions: number;
-	readonly activePlanActions: number;
-	readonly executionBlockedPlanActions: number;
-	readonly blockedPlanActions: number;
-	readonly pendingTelemetryEvents: number;
-	readonly droppedTelemetryEvents: number;
 }
 
 /** One execution owns its reuse result and exactly-once fallback settlement, independent of caller IDs. */
 export interface PreparedActorCall<Output> {
 	readonly output?: Output;
 	readonly observeOperations?: boolean;
+	readonly reuseEnabled?: boolean;
 	/** Internal Actor operations borrow the same input owners as predicted tool calls. */
-	readonly withInputs?: <Value>(execute: (inputs: (path?: string) => Iterable<object>) => Promise<Value>) => Promise<Value>;
+	readonly withInputs?: <Value>(execute: (inputs?: (path?: string) => Iterable<object>) => Promise<Value>) => Promise<Value>;
 	readonly settle: (toolExecution: TimelineInterval, output?: Output, operations?: readonly ExecutionOperationBinding[]) => Promise<void>;
 }
 
-export interface SpeculativeActionRuntime<SessionID, Output, StartInput, ConsumeInput, FinishInput> {
+export interface SpeculativeActionRuntime<SessionID, Output, StartInput, ConsumeInput, FinishInput, StateData = unknown> {
+	/** Subscribe independently of proposal sources; unsubscribe prevents future delivery. Failures are isolated. */
+	readonly subscribe: (handlers: RuntimeEventHandlers<RuntimeEventMap<SessionID, Output, StartInput, ConsumeInput, StateData>>) => () => void;
+	/** Explicit proposal command. Late or disabled producers cannot publish into a completed decision. */
+	readonly submitPlan: (turn: StartInput, updates: PlanUpdate | readonly PlanUpdate[] | undefined) => Promise<void>;
+	readonly reservePlanRevision: (sessionID: SessionID, proposalID: string, minimum: number) => number;
 	/** Measure the complete authoritative call against its originating task, including errors and fallback. */
 	readonly trackActorTool: <Value>(sessionID: SessionID, execute: (issuedAt: number) => Promise<Value>) => Promise<Value>;
 	readonly startTurn: (input: StartInput, signal?: AbortSignal) => Promise<void>;
@@ -333,5 +308,4 @@ export interface SpeculativeActionRuntime<SessionID, Output, StartInput, Consume
 	readonly settingsChanged: (settings: SpeculativeActionSettings) => Promise<void>;
 	readonly disposeSession: (sessionID: SessionID) => Promise<void>;
 	readonly dispose: () => Promise<void>;
-	readonly inspect: (sessionID?: SessionID) => SpeculativeRuntimeInspection;
 }

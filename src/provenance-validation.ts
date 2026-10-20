@@ -1,11 +1,16 @@
 import { directoryEntriesDigest } from "./process-observation.ts";
 import { lstat, readFile, stat } from "node:fs/promises";
 import path from "node:path";
-import { captureFileDigest, captureFilesystemEntry, mapFilesystem, sameFilesystemIdentity } from "./filesystem-evidence.ts";
+import {
+	captureFileDigest, captureFilesystemEntry, mapFilesystem, sameFilesystemIdentity, filesystemMetadataDigest, filesystemObservationDigest,
+	sharedWalk, type FilesystemObservationField,
+} from "./filesystem-evidence.ts";
 import { errorMessage, isMissing as missing } from "./error-utils.ts";
-import { dependencyPathsetKey, type DynamicDependency, type DynamicDependencyCertificate, filesystemMetadataDigest, filesystemObservationDigest,
-	type FilesystemObservationField, type ProcessProvenanceCertificate, processStrongKey, type ProvenanceTaint, sha256Digest,
-	type Sha256Digest } from "./provenance-certificate.ts";
+import {
+	dependencyPathsetKey, type DependencyRole, type DynamicDependency, type DynamicDependencyCertificate, type ProcessProvenanceCertificate, processStrongKey,
+	type ProvenanceTaint,
+} from "./provenance-certificate.ts";
+import { sha256Digest, type Sha256Digest } from "./stable-value-hash.ts";
 
 export interface ProvenanceValidationContext {
 	readonly signal?: AbortSignal;
@@ -36,16 +41,11 @@ export type ProvenanceValidation =
 /** One lookup, one projection: share current observations, never a previous certificate's validity or a previous lookup's inputs. */
 export function observeProcessInputs(weakKey: Sha256Digest,
 	capture: (evidence: DynamicDependencyCertificate) => Promise<DynamicDependencyValidation | undefined>) {
-	const observations = new Map<string, Promise<Extract<ProvenanceValidation, { status: "valid" }> | undefined>>();
-	return (evidence: DynamicDependencyCertificate) => {
-		if (!evidence.complete) return Promise.resolve(undefined);
-		const key = `${evidence.taints.join(",")}:${dependencyPathsetKey(evidence)}`;
-		let observation = observations.get(key);
-		if (!observation) observations.set(key, observation = capture(evidence).then(result => result && result.status !== "indeterminate"
-			? { status: "valid" as const, strongKey: processStrongKey(weakKey, { complete: true, dependencies: result.dependencies, taints: [] }),
-				dependencies: result.dependencies, filesRead: result.filesRead, bytesRead: result.bytesRead } : undefined));
-		return observation;
-	};
+	const observe = sharedWalk((evidence: DynamicDependencyCertificate) => capture(evidence).then(result => result && result.status !== "indeterminate"
+		? { status: "valid" as const, strongKey: processStrongKey(weakKey, { complete: true, dependencies: result.dependencies, taints: [] }),
+			dependencies: result.dependencies, filesRead: result.filesRead, bytesRead: result.bytesRead } : undefined),
+		evidence => `${evidence.taints.join(",")}:${dependencyPathsetKey(evidence)}`);
+	return (evidence: DynamicDependencyCertificate) => evidence.complete ? observe(evidence) : Promise.resolve(undefined);
 }
 
 type DependencyField = { [Kind in DynamicDependency["kind"]]: keyof Extract<DynamicDependency, { kind: Kind }> }[DynamicDependency["kind"]];
@@ -81,9 +81,9 @@ export async function validateDynamicDependencyCertificate(
 	const current: DynamicDependency[] = [];
 	const changed: string[] = [];
 	// Independent observations: checked concurrently, settled in certificate order (the strong key hashes that order).
-	const expectations = structuredClone(certificate.dependencies), listings = new Map<string, ReturnType<typeof captureFilesystemEntry>>();
+	const expectations = structuredClone(certificate.dependencies);
 	// Names missing from one directory, or its own entries, share one listing of it within a validation.
-	const list = (target: string) => listings.get(target) ?? listings.set(target, captureFilesystemEntry(target, "directory")).get(target)!;
+	const list = sharedWalk(target => captureFilesystemEntry(target, "directory"));
 	const checks = await mapFilesystem(expectations, async (expected): Promise<{ observed?: DynamicDependency; missing?: true } | string> => {
 		try {
 			if (expected.kind === "fd") {
@@ -149,7 +149,7 @@ export async function captureMetadataDependency(
 export async function captureFileDependency(
 	physicalPath: string,
 	logicalPath: string,
-	role: Extract<DynamicDependency, { kind: "file" }>["role"] = "input",
+	role: DependencyRole = "input",
 	options: { readonly includeMetadata?: boolean; readonly maxFileBytes?: number; readonly aliases?: readonly string[]; readonly signal?: AbortSignal;
 		readonly resolvePath?: ProvenanceValidationContext["resolvePath"] } = {},
 ): Promise<{ readonly dependency: Extract<DynamicDependency, { kind: "file" }>; readonly bytesRead: number; readonly filesRead: number }> {
@@ -213,11 +213,10 @@ export async function captureAbsenceDependency(
 	try { await lstat(physicalPath); return undefined; } catch (error) {
 		if (!missing(error)) throw error;
 	}
-	if (!captureParent) return { kind: "absence", path: logicalPath };
-	const parentPhysical = path.dirname(physicalPath);
-	const parentLogical = path.posix.dirname(logicalPath.replaceAll("\\", "/"));
-	const parent = await captureDirectoryDependency(parentPhysical, parentLogical, false, parentExcludedEntries, true, list);
-	return { kind: "absence", path: logicalPath, parentEntriesDigest: parent.entriesDigest, ...(parent.excludedEntries ? { parentExcludedEntries: parent.excludedEntries } : {}) };
+	const parent = captureParent ? await captureDirectoryDependency(path.dirname(physicalPath),
+		path.posix.dirname(logicalPath.replaceAll("\\", "/")), false, parentExcludedEntries, true, list) : undefined;
+	return { kind: "absence", path: logicalPath, ...(parent ? { parentEntriesDigest: parent.entriesDigest,
+		...(parent.excludedEntries ? { parentExcludedEntries: parent.excludedEntries } : {}) } : {}) };
 }
 
 export async function captureSymlinkDependency(
@@ -226,5 +225,5 @@ export async function captureSymlinkDependency(
 ): Promise<Extract<DynamicDependency, { kind: "symlink" }>> {
 	const { link: target } = await captureFilesystemEntry(physicalPath);
 	if (target === undefined) throw new Error("not_symlink");
-	return { kind: "symlink", path: logicalPath, target, targetDigest: sha256Digest(Buffer.from(target, "utf8")) };
+	return { kind: "symlink", path: logicalPath, target, targetDigest: sha256Digest(target) };
 }

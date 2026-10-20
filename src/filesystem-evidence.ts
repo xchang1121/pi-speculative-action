@@ -1,3 +1,4 @@
+import { digestObject, type Sha256Digest } from "./stable-value-hash.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { closeSync, constants, fstatSync, openSync, type BigIntStats, type Stats } from "node:fs";
 import fs, { type FileHandle } from "node:fs/promises";
@@ -5,6 +6,44 @@ import path from "node:path";
 import { containsFilesystemPath, slash } from "./path-utils.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
 import { TimelineInterval, type SerializedTimelineComputation } from "./task-timing.ts";
+
+export interface FilesystemTypeEvidence extends Readonly<Pick<Stats,
+	"isFile" | "isDirectory" | "isSymbolicLink" | "isSocket" | "isFIFO" | "isCharacterDevice" | "isBlockDevice">> {}
+
+export interface FilesystemMetadataEvidence extends Readonly<Pick<Stats | BigIntStats,
+	"mode" | "uid" | "gid" | "size" | "nlink">> {}
+
+/** Native metadata images use this field order. */
+export const FILESYSTEM_METADATA_FIELDS = ["dev", "ino", "mode", "nlink", "uid", "gid", "rdev", "size", "blksize", "blocks", "atimeNs", "mtimeNs", "ctimeNs", "birthtimeNs"] as const;
+/** Reading changes atime under relatime; stat's observed fields also exclude birth time. */
+export const FILESYSTEM_OBSERVATION_FIELDS = Object.freeze(FILESYSTEM_METADATA_FIELDS.filter(field => field !== "atimeNs" && field !== "birthtimeNs"));
+export type FilesystemObservationField = typeof FILESYSTEM_OBSERVATION_FIELDS[number];
+export type FilesystemObservationEvidence = { readonly [Field in FilesystemObservationField]: bigint };
+
+export function filesystemEntryType(entry: FilesystemTypeEvidence): string {
+	return entry.isFile()
+		? "file"
+		: entry.isDirectory()
+			? "directory"
+			: entry.isSymbolicLink()
+				? "symlink"
+				: entry.isSocket() ? "socket" : entry.isFIFO() ? "fifo" : entry.isCharacterDevice() ? "char" : entry.isBlockDevice() ? "block" : "other";
+}
+
+export function filesystemMetadataDigest(stat: FilesystemMetadataEvidence): Sha256Digest {
+	const type = Number(stat.mode) & 0o170000;
+	return digestObject({
+		mode: Number(stat.mode),
+		uid: Number(stat.uid),
+		gid: Number(stat.gid),
+		...(type === 0o100000 ? { size: Number(stat.size), links: Number(stat.nlink) } : {}),
+		type: type === 0o100000 ? "file" : type === 0o040000 ? "directory" : type === 0o120000 ? "symlink" : "other",
+	});
+}
+
+export function filesystemObservationDigest(stat: Partial<FilesystemObservationEvidence>, fields: readonly FilesystemObservationField[] = FILESYSTEM_OBSERVATION_FIELDS): Sha256Digest {
+	return digestObject(Object.fromEntries(fields.map((field) => [field, String(stat[field])])));
+}
 
 const IDENTITY_FIELDS = ["dev", "ino", "mode", "nlink", "uid", "gid", "rdev", "size", "mtimeNs", "ctimeNs"] as const;
 type FilesystemIdentity = Pick<BigIntStats, typeof IDENTITY_FIELDS[number]>;
@@ -59,7 +98,7 @@ export class CapturedFilesystemObject {
 		const { object: _object, stat, content, computation: _computation, ...capture } = this.capture;
 		const transfer = { ...capture, fd: this.handle.fd, active: active.buffer, stat: Object.fromEntries(IDENTITY_FIELDS.map(key => [key, stat[key]])) as FilesystemIdentity,
 			content: content && Uint8Array.from(content), computation: computation && TimelineInterval.serialize(computation) };
-		let release!: () => void; this.lifetime.track(new Promise<void>(resolve => { release = resolve; }));
+		const { promise, resolve: release } = Promise.withResolvers<void>(); this.lifetime.track(promise);
 		return { transfer, release: () => { Atomics.store(active, 0, 0); release(); } };
 	}
 	/** Synchronous import cannot dispatch caller callbacks; a fresh O_PATH descriptor preserves independent ownership. */
@@ -106,17 +145,6 @@ export async function advanceFilesystemClock(clock: FileHandle, boundary: number
 	}
 }
 
-/** One regular-file identity owns admission, descriptor reads, and the final path proof. */
-export function captureStableFile(
-	target: string,
-	maxBytes = Number.POSITIVE_INFINITY,
-	retainContent = false,
-	observed?: Parameters<typeof captureFile>[4], // Without a digest when only the bytes and their identity are kept.
-	signal?: AbortSignal,
-): Promise<StableFilesystemCapture> {
-	return captureFile(target, maxBytes, retainContent, true, observed, signal);
-}
-
 /** File digests by kernel identity and change times (userspace cannot set a ctime). An entry is trusted once the file's last change
  * precedes its digest by more than one timestamp tick, so a same-size rewrite inside that tick cannot reuse it (the racy-git rule). */
 const fileDigests = new Map<string, { readonly hash: string; readonly blob?: string; readonly takenAtMs: number }>();
@@ -150,16 +178,14 @@ export async function hashExecutableFile(target: string, signal?: AbortSignal): 
 /** A dependency's content digest: an unchanged file validates by its identity (a runtime's image and libraries on every reuse). */
 export async function captureFileDigest(target: string, maxBytes = Number.POSITIVE_INFINITY, signal?: AbortSignal, verifyPath = true): Promise<StableFilesystemCapture> {
 	signal?.throwIfAborted();
-	const stat = await fs.stat(target, { bigint: true }), cached = Number(stat.size) <= maxBytes ? cachedCapture(stat, target) : undefined;
+	const stat = await (verifyPath ? fs.lstat : fs.stat)(target, { bigint: true }), cached = Number(stat.size) <= maxBytes ? cachedCapture(stat, target) : undefined;
 	signal?.throwIfAborted(); if (cached) return cached;
-	const takenAtMs = Date.now(), capture = await captureFile(target, maxBytes, false, verifyPath, undefined, signal);
-	rememberCapture(capture, takenAtMs);
-	return capture;
+	return captureStableFile(target, maxBytes, false, { verifyPath }, signal);
 }
 
 /** Read a held descriptor through a separate OFD, preserving its shared position. */
 export function captureHeldFile(pid: number, fd: number, maxBytes: number, retainObject = false): Promise<StableFilesystemCapture> {
-	return captureFile(`/proc/${pid}/fd/${fd}`, maxBytes, true, false, { retainObject });
+	return captureStableFile(`/proc/${pid}/fd/${fd}`, maxBytes, true, { retainObject, verifyPath: false });
 }
 
 /** Import the helper's complete getdents64 image without enumerating the directory again. */
@@ -187,9 +213,11 @@ export async function captureHeldDirectory(pid: number, fd: number, content: Buf
 	} catch (error) { await handle.close(); throw error; }
 }
 
-async function captureFile(target: string, maxBytes: number, retainContent: boolean, verifyPath: boolean,
-	observed?: Partial<Pick<StableFilesystemCapture, "stat" | "realPath">> & { readonly retainObject?: boolean; readonly gitBlob?: boolean; readonly digest?: false }, signal?: AbortSignal): Promise<StableFilesystemCapture> {
-	signal?.throwIfAborted(); const startedAt = performance.now();
+/** Pin and hash one file, verifying its final identity before cache publication or transfer. */
+export async function captureStableFile(target: string, maxBytes = Number.POSITIVE_INFINITY, retainContent = false,
+	observed?: Partial<Pick<StableFilesystemCapture, "stat" | "realPath">> & { readonly retainObject?: boolean; readonly gitBlob?: boolean; readonly digest?: false; readonly verifyPath?: boolean },
+	signal?: AbortSignal): Promise<StableFilesystemCapture> {
+	signal?.throwIfAborted(); const startedAt = performance.now(), takenAtMs = Date.now(), verifyPath = observed?.verifyPath !== false;
 	// O_PATH pins even executable aliases without admitting I/O on a raced-in FIFO or device.
 	let binding = process.platform === "linux" && (process.arch === "x64" || process.arch === "arm64")
 		? await fs.open(target, 0x200000 | (verifyPath ? constants.O_NOFOLLOW : 0)) : undefined;
@@ -205,15 +233,31 @@ async function captureFile(target: string, maxBytes: number, retainContent: bool
 		handle = await fs.open(binding ? `/proc/self/fd/${binding.fd}` : target,
 			constants.O_RDONLY | (binding || !verifyPath ? 0 : constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
 		if (!sameFilesystemIdentity(before, await handle.stat({ bigint: true }))) throw new Error("file_changed_during_capture");
-		// Never borrow another capture's ongoing read: bytes read before this stat can predate a same-size rewrite
-		// that coarse timestamps leave with the same identity.
-		const captured = await readFileContents(handle, before, maxBytes, retainContent, signal, observed?.gitBlob, observed?.digest);
-		const after = captured.stat;
+		// Another pending read may precede a same-tick rewrite; read under this identity.
+		const hash = observed?.digest !== false ? createHash("sha256") : undefined, blob = observed?.gitBlob ? createHash("sha1").update(`blob ${before.size}\0`) : undefined;
+		const content = retainContent ? Buffer.allocUnsafe(Number(before.size)) : undefined;
+		const buffer = Buffer.allocUnsafe(content ? 1 : Math.max(1, Math.min(Number(before.size), 1024 * 1024)));
+		let bytesRead = 0;
+		for (;;) {
+			signal?.throwIfAborted();
+			const chunk = content && bytesRead < content.length ? content.subarray(bytesRead) : buffer;
+			const { bytesRead: size } = await handle.read(chunk);
+			if (size === 0) break;
+			bytesRead += size;
+			if (bytesRead > maxBytes) throw new Error(`file_too_large:${bytesRead}`);
+			if (bytesRead > Number(before.size)) throw new Error("file_changed_during_capture");
+			hash?.update(chunk.subarray(0, size)); blob?.update(chunk.subarray(0, size));
+		}
+		const after = await handle.stat({ bigint: true });
+		signal?.throwIfAborted();
+		if (bytesRead !== Number(before.size) || !sameFilesystemIdentity(before, after)) throw new Error("file_changed_during_capture");
 		if (verifyPath) {
 			const [afterPath, pathStat] = await Promise.all([fs.realpath(target), fs.lstat(target, { bigint: true })]);
 			if (beforePath !== afterPath || !sameFilesystemIdentity(after, pathStat)) throw new Error("file_changed_during_capture");
 		}
-		const result = { ...captured, realPath: beforePath, computation: TimelineInterval.own(new TimelineInterval(startedAt, performance.now())) };
+		const result = { hash: hash?.digest("hex") ?? "", bytesRead, stat: after, ...(content ? { content } : {}), ...(blob ? { blob: blob.digest("hex") } : {}),
+			realPath: beforePath, computation: TimelineInterval.own(new TimelineInterval(startedAt, performance.now())) };
+		if (hash) rememberCapture(result, takenAtMs);
 		if (observed?.retainObject && retainContent && binding) {
 			await handle.close(); handle = undefined;
 			const object = new CapturedFilesystemObject(binding, result); binding = undefined;
@@ -223,27 +267,6 @@ async function captureFile(target: string, maxBytes: number, retainContent: bool
 	} catch (error) { signal?.throwIfAborted(); throw error; } finally {
 		try { await handle?.close(); } finally { await binding?.close(); }
 	}
-}
-
-async function readFileContents(handle: FileHandle, before: BigIntStats, maxBytes: number, retainContent: boolean, signal?: AbortSignal, gitBlob = false, digest = true) {
-	const hash = digest ? createHash("sha256") : undefined, blob = gitBlob ? createHash("sha1").update(`blob ${before.size}\0`) : undefined;
-	const content = retainContent ? Buffer.allocUnsafe(Number(before.size)) : undefined;
-	const buffer = Buffer.allocUnsafe(content ? 1 : Math.max(1, Math.min(Number(before.size), 1024 * 1024)));
-	let bytesRead = 0;
-	for (;;) {
-		signal?.throwIfAborted();
-		const chunk = content && bytesRead < content.length ? content.subarray(bytesRead) : buffer;
-		const { bytesRead: size } = await handle.read(chunk);
-		if (size === 0) break;
-		bytesRead += size;
-		if (bytesRead > maxBytes) throw new Error(`file_too_large:${bytesRead}`);
-		if (bytesRead > Number(before.size)) throw new Error("file_changed_during_capture");
-		hash?.update(chunk.subarray(0, size)); blob?.update(chunk.subarray(0, size));
-	}
-	const after = await handle.stat({ bigint: true });
-	signal?.throwIfAborted();
-	if (bytesRead !== Number(before.size) || !sameFilesystemIdentity(before, after)) { throw new Error("file_changed_during_capture"); }
-	return { hash: hash?.digest("hex") ?? "", bytesRead, stat: after, ...(content ? { content } : {}), ...(blob ? { blob: blob.digest("hex") } : {}) };
 }
 
 /** Own a directory listing or link target together with its stable entry identity. */
@@ -291,7 +314,13 @@ export async function* walkFilesystemPath(target: string, options: { readonly st
 }
 
 /** Walks taken at one moment share the entries they pass: each is captured once. */
-export const sharedWalk = (walked = new Map<string, ReturnType<typeof captureFilesystemEntry>>()) => (target: string) => walked.get(target) ?? walked.set(target, captureFilesystemEntry(target)).get(target)!;
+export function sharedWalk<Capture, Input = string>(capture: (target: Input) => Capture, key: (target: Input) => string = String) {
+	const walked = new Map<string, Capture>();
+	return (target: Input) => {
+		const name = key(target);
+		return walked.get(name) ?? walked.set(name, capture(target)).get(name)!;
+	};
+}
 
 export async function assertNoSymlinkPath(root: string, target: string, capture?: typeof captureFilesystemEntry): Promise<void> {
 	const resolvedRoot = path.resolve(root), resolvedTarget = path.resolve(target);

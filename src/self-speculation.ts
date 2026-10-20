@@ -7,8 +7,10 @@ import type { ActionKey } from "./action-semantics.ts";
 import type { ActorActionSettlement } from "./settlement.ts";
 import { EvidenceLedger } from "./self-speculation-evidence.ts";
 import { asRecord as record, isRecord, stableStringify } from "./stable-json.ts";
-import { finiteNumber, nonNegativeFinite, nonNegativeCount } from "./number-utils.ts";
+import { isFiniteNumber, isSafeCount, finiteNumber, nonNegativeFinite, nonNegativeCount } from "./number-utils.ts";
 import { booleanOr, nonNegativeNumber, positiveInteger, positiveMilliseconds, probability, settingsParser } from "./setting-input.ts";
+import { PendingTasks } from "./runtime-lifecycle.ts";
+import { BoundedRecencyMap } from "./bounded-recency-map.ts";
 
 /** A hosted API cannot fork the Actor's decode: `drafter` has the Drafter read the Actor's reasoning so far instead. */
 export type SelfSpeculationForkTransport = "provider" | "sidecar" | "drafter";
@@ -151,7 +153,8 @@ export class SelfSpeculationCoordinator {
 	private readonly capabilities = new Map<string, ControlPlaneCapabilities>();
 	private readonly decoderEvidence = new EvidenceLedger(4, 2);
 	private readonly actionEvidence = new EvidenceLedger(2, 1);
-	private readonly background = new Set<Promise<void>>();
+	private readonly actionModels = new BoundedRecencyMap<string, string>(128);
+	private readonly background = new PendingTasks();
 	private readonly pendingCandidates = new Map<number, Map<string, CandidateRecord>>();
 	private active?: TurnState;
 	private latestStartedDecisionSequence = 0;
@@ -179,7 +182,9 @@ export class SelfSpeculationCoordinator {
 	startTurn(turnID: string, model: Model<Api>, context: Context, decisionSequence: number): void {
 		this.closeActive(true);
 		const settings = this.settings();
-		if (!settings.enabled || !Number.isSafeInteger(decisionSequence) || decisionSequence < 1) {
+		const modelKey = JSON.stringify([model.provider, model.api, model.id]);
+		this.actionModels.set(turnID, modelKey);
+		if (!settings.enabled || !isSafeCount(decisionSequence, 1)) {
 			this.pendingCandidates.clear();
 			this.acceptingCandidates = false;
 			return;
@@ -204,7 +209,7 @@ export class SelfSpeculationCoordinator {
 			agreedForkKeys: new Set(),
 			matchedForkKeys: new Set(),
 			reportedCandidates: new Map(),
-			modelKey: modelKey(model),
+			modelKey,
 			ended: false,
 		};
 		this.actorForkPlanSource.startTurn(turnID);
@@ -231,7 +236,7 @@ export class SelfSpeculationCoordinator {
 		const state = this.active;
 		if (!this.settings().enabled || !this.acceptingCandidates) return;
 		const targetDecisionSequence = candidate.expectedDecisionSequence;
-		if (!Number.isSafeInteger(targetDecisionSequence) || targetDecisionSequence < 1) return;
+		if (!isSafeCount(targetDecisionSequence, 1)) return;
 		if (state && targetDecisionSequence < state.decisionSequence) return;
 		if (!state && targetDecisionSequence < this.latestStartedDecisionSequence) return;
 		const candidates =
@@ -362,7 +367,7 @@ export class SelfSpeculationCoordinator {
 				if (this.active === state && !state.ended) this.scheduleActorProbe(state);
 			});
 		state.forkTask = task;
-		this.track(task);
+		this.background.track(task);
 	}
 
 	/** The Drafter reads the Actor's reasoning so far and names the calls it expects next; no logprobs gate them. */
@@ -392,11 +397,12 @@ export class SelfSpeculationCoordinator {
 
 	/** Feed semantic prediction adoption into decoder ranking without touching token evidence. */
 	observePredictionSettlement(feedback: PredictionFeedback<string>): void {
-		const state = this.active;
 		const settlement = feedback.settlement;
-		if (!state || settlement.observation !== "observed") return;
+		if (settlement.observation !== "observed") return;
+		const model = this.actionModels.get(settlement.actorAction.turnID);
+		if (!model) return;
 		const adopted = settlement.match.matched && settlement.match.adoption.status === "adopted";
-		this.actionEvidence.observe(actionEvidenceContext(state, feedback.tool, settlement.prediction.source), 1, adopted ? 1 : 0);
+		this.actionEvidence.observe({ model, tool: feedback.tool, source: settlement.prediction.source }, 1, adopted ? 1 : 0);
 	}
 
 	endTurn(): void {
@@ -418,12 +424,7 @@ export class SelfSpeculationCoordinator {
 		this.active = undefined;
 		if (state && preserveForRetry && state.candidates.size) {
 			// The active decision owns its bundle exclusively; outstanding submissions keep the old snapshot.
-			this.pendingCandidates.set(state.decisionSequence, new Map([...state.candidates].map(([key, candidate]) => [key, {
-				...candidate,
-				input: structuredClone(candidate.input),
-				sources: new Set(candidate.sources),
-				provenance: candidate.provenance.map((item) => ({ ...item })),
-			}])));
+			this.pendingCandidates.set(state.decisionSequence, structuredClone(state.candidates));
 		}
 		if (!state?.requestID || state.settings.forkTransport === "drafter") return;
 		const pending = [state.flushTask, state.forkTask].filter((task): task is Promise<void> => task !== undefined);
@@ -432,7 +433,7 @@ export class SelfSpeculationCoordinator {
 				this.post(state.settings.clearPath, { version: 1, request_id: state.requestID }, state.settings),
 			)
 			.then((receipt) => this.recordVerification(receipt, state));
-		this.track(cleanup);
+		this.background.track(cleanup);
 	}
 
 	snapshot() {
@@ -493,7 +494,7 @@ export class SelfSpeculationCoordinator {
 		}
 	}
 
-	async dispose(): Promise<void> { this.reset(); while (this.background.size) await Promise.allSettled([...this.background]); }
+	async dispose(): Promise<void> { this.reset(); await this.background.drain(); }
 
 	private scheduleFlush(state: TurnState): void {
 		if (!state.requestID || state.flushTask || state.settings.forkTransport === "drafter" || this.capabilities.get(controlPlaneKey(state.settings))?.candidates === false) return;
@@ -501,7 +502,7 @@ export class SelfSpeculationCoordinator {
 			state.flushTask = undefined;
 			if (state.dirty && state.requestID && this.active === state) this.scheduleFlush(state);
 		});
-		this.track(state.flushTask);
+		this.background.track(state.flushTask);
 	}
 
 	private async flush(state: TurnState): Promise<void> {
@@ -623,7 +624,7 @@ export class SelfSpeculationCoordinator {
 				if (declared) this.capabilities.set(key, Object.fromEntries((["fork", "candidates", "logprobs", "provider"] as const)
 					.map((name) => [name, declared[name] === true])));
 			}).catch(() => undefined);
-		this.track(task);
+		this.background.track(task);
 	}
 
 	private async post(
@@ -653,12 +654,6 @@ export class SelfSpeculationCoordinator {
 		}
 	}
 
-	private track(task: Promise<void>): void {
-		this.background.add(task);
-		void task
-			.catch(() => undefined)
-			.finally(() => this.background.delete(task));
-	}
 }
 
 function providerPayload(
@@ -759,10 +754,6 @@ function modelPayload(model: Model<Api>): Readonly<Record<string, unknown>> {
 	return { provider: model.provider, api: model.api, id: model.id };
 }
 
-function modelKey(model: Model<Api>): string {
-	return JSON.stringify([model.provider, model.api, model.id]);
-}
-
 const originOf = (value: string | undefined) => URL.canParse(value ?? "") ? new URL(value!).origin : undefined;
 
 function decoderEvidenceContext(state: TurnState, tool: string, source: string) {
@@ -785,52 +776,30 @@ function parseVerificationOutcome(
 	const steps = (rawSteps ?? []).map((value, index) => {
 		const step = record(value);
 		if (!step) throw new Error("self-speculation verification step must be an object");
-		const draftedTokens = requiredVerificationInteger(step.drafted_tokens, "drafted_tokens", true);
-		const acceptedTokens = requiredVerificationInteger(step.accepted_tokens, "accepted_tokens");
-		const rejectedTokens = optionalVerificationInteger(step.rejected_tokens, "rejected_tokens") ??
-			draftedTokens - acceptedTokens;
-		if (acceptedTokens > draftedTokens || acceptedTokens + rejectedTokens !== draftedTokens)
-			throw new Error("self-speculation verification step token counts are inconsistent");
-		const candidateIndex = optionalVerificationInteger(step.candidate_index, "candidate_index") ?? index;
+		const tokens = verificationTokenCounts(step);
+		const candidateIndex = verificationNumber(step, "candidate_index") ?? index;
 		const candidateID = step.candidate_id === undefined || step.candidate_id === null ? undefined : nonEmptyString(step.candidate_id);
 		if (step.candidate_id !== undefined && step.candidate_id !== null && !candidateID)
 			throw new Error("self-speculation verification candidate_id must be a non-empty string");
-		const candidateIDs = [...new Set([
-			...(candidateID ? [candidateID] : []),
-			...array(step.candidate_ids).map(nonEmptyString).filter((value): value is string => value !== undefined),
-		])];
-		const reportedSources = array(step.sources)
-			.map(nonEmptyString)
-			.filter((value): value is string => value !== undefined);
+		const candidateIDs = uniqueStrings([candidateID, ...array(step.candidate_ids)]);
+		const reportedSources = uniqueStrings(step.sources);
 		const sources = reportedSources.length
-			? [...new Set(reportedSources)]
+			? reportedSources
 			: [...new Set(candidateIDs.flatMap((id) => [...(reportedCandidates.get(id)?.sources ?? [])].sort()))];
 		return Object.freeze({
 			candidateIndex,
 			...(candidateID ? { candidateID } : {}),
 			candidateIDs: Object.freeze(candidateIDs),
 			sources: Object.freeze(sources),
-			draftedTokens,
-			acceptedTokens,
-			rejectedTokens,
+			...tokens,
 		});
 	});
 	const stepDraftedTokens = steps.reduce((total, step) => total + step.draftedTokens, 0);
 	const stepAcceptedTokens = steps.reduce((total, step) => total + step.acceptedTokens, 0);
 	const stepRejectedTokens = steps.reduce((total, step) => total + step.rejectedTokens, 0);
-	const speculativeSteps = optionalVerificationInteger(verification.num_spec_steps, "num_spec_steps") ?? steps.length;
-	const draftedTokens = optionalVerificationInteger(verification.num_draft_tokens, "num_draft_tokens") ??
-		stepDraftedTokens;
-	const acceptedTokens = optionalVerificationInteger(
-		verification.num_accepted_draft_tokens,
-		"num_accepted_draft_tokens",
-	) ?? stepAcceptedTokens;
-	const rejectedTokens = optionalVerificationInteger(
-		verification.num_rejected_draft_tokens,
-		"num_rejected_draft_tokens",
-	) ?? draftedTokens - acceptedTokens;
-	if (acceptedTokens > draftedTokens || acceptedTokens + rejectedTokens !== draftedTokens)
-		throw new Error("self-speculation verification token counts are inconsistent");
+	const speculativeSteps = verificationNumber(verification, "num_spec_steps") ?? steps.length;
+	const tokens = verificationTokenCounts(verification, { draftedTokens: stepDraftedTokens, acceptedTokens: stepAcceptedTokens });
+	const { draftedTokens, acceptedTokens, rejectedTokens } = tokens;
 	if (
 		steps.length > 0 &&
 		(speculativeSteps !== steps.length ||
@@ -839,18 +808,14 @@ function parseVerificationOutcome(
 			rejectedTokens !== stepRejectedTokens)
 	)
 		throw new Error("self-speculation verification totals do not match its steps");
-	const unresolvedProposals = optionalVerificationInteger(verification.unresolved_proposals, "unresolved_proposals") ?? 0;
-	const unresolvedDraftTokens = optionalVerificationInteger(verification.unresolved_draft_tokens, "unresolved_draft_tokens") ?? 0;
-	const meanAcceptanceLength = optionalVerificationNumber(
-		verification.mean_acceptance_length,
-		"mean_acceptance_length",
-	) ?? (speculativeSteps > 0 ? 1 + acceptedTokens / speculativeSteps : 1);
+	const unresolvedProposals = verificationNumber(verification, "unresolved_proposals") ?? 0;
+	const unresolvedDraftTokens = verificationNumber(verification, "unresolved_draft_tokens") ?? 0;
+	const meanAcceptanceLength = verificationNumber(verification, "mean_acceptance_length", false) ??
+		(speculativeSteps > 0 ? 1 + acceptedTokens / speculativeSteps : 1);
 	return Object.freeze({
 		requestID,
 		speculativeSteps,
-		draftedTokens,
-		acceptedTokens,
-		rejectedTokens,
+		...tokens,
 		acceptanceRate: draftedTokens > 0 ? acceptedTokens / draftedTokens : 0,
 		meanAcceptanceLength,
 		unresolvedProposals,
@@ -859,23 +824,29 @@ function parseVerificationOutcome(
 	});
 }
 
-function optionalVerificationNumber(value: unknown, field: string): number | undefined {
+function verificationTokenCounts(value: Readonly<Record<string, unknown>>, totals?: { draftedTokens: number; acceptedTokens: number }) {
+	const draftedTokens = totals ? verificationNumber(value, "num_draft_tokens") ?? totals.draftedTokens
+		: requiredVerificationInteger(value, "drafted_tokens", true);
+	const acceptedTokens = totals ? verificationNumber(value, "num_accepted_draft_tokens") ?? totals.acceptedTokens
+		: requiredVerificationInteger(value, "accepted_tokens");
+	const rejectedTokens = verificationNumber(value, totals ? "num_rejected_draft_tokens" : "rejected_tokens") ?? draftedTokens - acceptedTokens;
+	if (acceptedTokens > draftedTokens || acceptedTokens + rejectedTokens !== draftedTokens)
+		throw new Error(`self-speculation verification ${totals ? "" : "step "}token counts are inconsistent`);
+	return { draftedTokens, acceptedTokens, rejectedTokens };
+}
+
+function verificationNumber(record: Readonly<Record<string, unknown>>, field: string, integer = true): number | undefined {
+	const value = record[field];
 	if (value === undefined || value === null) return undefined;
-	if (typeof value !== "number" || !Number.isFinite(value) || value < 0)
+	if (!isFiniteNumber(value) || value < 0)
 		throw new Error(`self-speculation verification ${field} must be a non-negative number`);
+	if (integer && !Number.isSafeInteger(value))
+		throw new Error(`self-speculation verification ${field} must be an integer`);
 	return value;
 }
 
-function optionalVerificationInteger(value: unknown, field: string): number | undefined {
-	const number = optionalVerificationNumber(value, field);
-	if (number === undefined) return undefined;
-	if (!Number.isSafeInteger(number))
-		throw new Error(`self-speculation verification ${field} must be an integer`);
-	return number;
-}
-
-function requiredVerificationInteger(value: unknown, field: string, positive = false): number {
-	const number = optionalVerificationInteger(value, field);
+function requiredVerificationInteger(value: Readonly<Record<string, unknown>>, field: string, positive = false): number {
+	const number = verificationNumber(value, field);
 	if (number === undefined || (positive && number === 0))
 		throw new Error(
 			`self-speculation verification ${field} must be ${positive ? "positive" : "present"}`,
@@ -925,8 +896,7 @@ function parsedSidecarActionCall(value: unknown, fallbackIndex: number) {
 	const tool = nonEmptyString(call?.name);
 	const input = record(call?.arguments);
 	if (!tool || !input) return undefined;
-	const observedIndex = finiteNumber(call?.index);
-	const index = observedIndex !== undefined && Number.isSafeInteger(observedIndex) && observedIndex >= 0 ? observedIndex : fallbackIndex;
+	const index = isSafeCount(call?.index) ? call.index : fallbackIndex;
 	const callID = nonEmptyString(call?.call_id);
 	const format = nonEmptyString(call?.format);
 	return { index, ...(callID ? { callID } : {}), ...(format ? { format } : {}), tool, input: structuredClone(input) };

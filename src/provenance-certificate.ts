@@ -1,43 +1,16 @@
-import { nonNegativeCount as finiteTimestamp } from "./number-utils.ts";
-import { hash, webcrypto } from "node:crypto";
-import { cloneSharedData, stableEqual, stableStringify } from "./stable-json.ts";
-import type { WorkspaceFileMutation } from "./workspace-state.ts";
+import { type Sha256Digest, sha256Digest, digestObject, isSha256Digest } from "./stable-value-hash.ts";
+import { FILESYSTEM_OBSERVATION_FIELDS, type FilesystemObservationField } from "./filesystem-evidence.ts";
+import { isSafeCount, nonNegativeCount as finiteTimestamp } from "./number-utils.ts";
+import { cloneSharedData, isRecord, stableEqual, stableStringify } from "./stable-json.ts";
+import type { WorkspaceDirectoryState, WorkspaceFileMutation } from "./workspace-state.ts";
 import { normalizeTimelineComputation, type SerializedTimelineComputation } from "./task-timing.ts";
 
 /** Decimal strings preserve filesystem cookies beyond JavaScript's exact integer range. */
 export type OFDPosition = number | string;
 export function isOFDPosition(value: unknown): value is OFDPosition {
-	return typeof value === "number" ? Number.isSafeInteger(value) && value >= 0 :
+	return typeof value === "number" ? isSafeCount(value) :
 		typeof value === "string" && /^[1-9][0-9]{15,18}$/.test(value) && BigInt(value) > BigInt(Number.MAX_SAFE_INTEGER) && BigInt(value) <= 0x7fffffffffffffffn;
 }
-export type Sha256Digest = `sha256:${string}`;
-
-export interface FilesystemTypeEvidence {
-	readonly isFile: () => boolean;
-	readonly isDirectory: () => boolean;
-	readonly isSymbolicLink: () => boolean;
-	readonly isSocket: () => boolean;
-	readonly isFIFO: () => boolean;
-	readonly isCharacterDevice: () => boolean;
-	readonly isBlockDevice: () => boolean;
-}
-
-export interface FilesystemMetadataEvidence {
-	readonly mode: number | bigint;
-	readonly uid: number | bigint;
-	readonly gid: number | bigint;
-	readonly size: number | bigint;
-	readonly nlink: number | bigint;
-	readonly isFile: () => boolean;
-	readonly isDirectory: () => boolean;
-	readonly isSymbolicLink: () => boolean;
-}
-
-/** Reading a file moves its access time under relatime, so an observation never proves one (RU3). */
-export const FILESYSTEM_OBSERVATION_FIELDS = ["dev", "ino", "mode", "nlink", "uid", "gid", "rdev", "size", "blksize", "blocks", "mtimeNs", "ctimeNs"] as const;
-export type FilesystemObservationField = typeof FILESYSTEM_OBSERVATION_FIELDS[number];
-export type FilesystemObservationEvidence = { readonly [Field in FilesystemObservationField]: bigint };
-
 export interface ArtifactReference { readonly digest: Sha256Digest; readonly size: number; }
 
 export interface SemanticEnvironmentEntry { readonly name: string; readonly present: boolean; readonly valueDigest?: Sha256Digest; }
@@ -158,13 +131,7 @@ export type WorkspaceEffectState =
 	| { readonly kind: "absent" }
 	/** `modified` is the file's modification time in nanoseconds, which a replay restores. */
 	| { readonly kind: "file"; readonly data: ArtifactReference; readonly mode: number; readonly modified?: string }
-	| {
-			readonly kind: "directory";
-			readonly entriesDigest: Sha256Digest;
-			readonly mode: number;
-			readonly uid: number;
-			readonly gid: number;
-	  };
+	| ({ readonly kind: "directory" } & WorkspaceDirectoryState);
 
 export type OrderedEffectEvent =
 	| { readonly sequence: number; readonly kind: "output"; readonly fd: 1 | 2; readonly data: ArtifactReference }
@@ -218,19 +185,13 @@ export interface ProcessPrototypeInput extends Omit<ExecPrototype, "argvDigest" 
 	readonly environment: Readonly<Record<string, string | undefined>>;
 }
 
-/** A shell's own bookkeeping: its nesting level differs between a command it execs in place and one it forks, and `cd <cwd> &&`
- * sets the previous directory. Only a shell, or a tool printing its environment, reads it back. */
-const SHELL_BOOKKEEPING = new Set(["SHLVL", "OLDPWD"]), READS_SHELL_BOOKKEEPING = /\/(?:bash|sh|dash|zsh|ksh|env|printenv)$/;
-
 export function createExecPrototype(input: ProcessPrototypeInput): ExecPrototype {
 	const { argv, ...identity } = input;
-	const rawEnvironment = READS_SHELL_BOOKKEEPING.test(input.executablePath) ? input.environment
-		: Object.fromEntries(Object.entries(input.environment).filter(([name]) => !SHELL_BOOKKEEPING.has(name)));
-	const argvDigest = sha256Digest(argv instanceof Uint8Array ? argv : Buffer.from(stableStringify(argv), "utf8"));
+	const argvDigest = sha256Digest(argv instanceof Uint8Array ? argv : stableStringify(argv));
 	return normalizePrototype({
 		...identity, argvDigest, environmentComplete: true,
-		environment: Object.entries(rawEnvironment).map(([name, value]): SemanticEnvironmentEntry =>
-			value === undefined ? { name, present: false } : { name, present: true, valueDigest: sha256Digest(Buffer.from(value, "utf8")) },
+		environment: Object.entries(input.environment).map(([name, value]): SemanticEnvironmentEntry =>
+			value === undefined ? { name, present: false } : { name, present: true, valueDigest: sha256Digest(value) },
 		),
 	});
 }
@@ -242,38 +203,35 @@ export function processWeakKey(prototype: ExecPrototype): Sha256Digest {
 export function dependencyPathsetKey(certificate: DynamicDependencyCertificate): Sha256Digest {
 	return digestObject(
 		normalizeDependencies(certificate.dependencies).map((dependency) => {
+			if (dependency.kind === "fd") return { kind: dependency.kind, fd: dependency.fd };
+			const identity = { kind: dependency.kind, path: dependency.path };
 			switch (dependency.kind) {
 				case "file":
 					return {
-						kind: dependency.kind,
-						path: dependency.path,
+						...identity,
 						role: dependency.role,
 						metadata: dependency.metadataDigest !== undefined,
 						...(dependency.aliases ? { aliases: dependency.aliases } : {}),
 					};
 				case "directory":
 					return {
-						kind: dependency.kind,
-						path: dependency.path,
+						...identity,
 						metadata: dependency.metadataDigest !== undefined,
 						excludedEntries: dependency.excludedEntries ?? [],
 						...(dependency.entriesDigest === undefined ? { listed: false } : {}),
 					};
 				case "absence":
 					return {
-						kind: dependency.kind,
-						path: dependency.path,
+						...identity,
 						captureParent: dependency.parentEntriesDigest !== undefined,
 						parentExcludedEntries: dependency.parentExcludedEntries ?? [],
 					};
 				case "symlink":
-					return { kind: dependency.kind, path: dependency.path };
+					return identity;
 				case "lock":
-					return { kind: dependency.kind, path: dependency.path, exclusive: dependency.exclusive };
+					return { ...identity, exclusive: dependency.exclusive };
 				case "metadata":
-					return { kind: dependency.kind, path: dependency.path, followSymlinks: dependency.followSymlinks, ...(dependency.fields ? { fields: dependency.fields } : {}) };
-				case "fd":
-					return { kind: dependency.kind, fd: dependency.fd };
+					return { ...identity, followSymlinks: dependency.followSymlinks, ...(dependency.fields ? { fields: dependency.fields } : {}) };
 			}
 		}),
 	);
@@ -283,11 +241,7 @@ export function processStrongKey(weakKey: Sha256Digest, certificate: DynamicDepe
 	return digestObject({ weakKey, dependencies: normalizeDependencies(certificate.dependencies) });
 }
 
-export function sealProcessCertificate(input: {
-	readonly prototype: ExecPrototype;
-	readonly producer: ProcessProducerProof;
-	readonly dependencyCertificate: DynamicDependencyCertificate;
-	readonly result: ProcessResultRecord;
+export function sealProcessCertificate(input: Pick<ProcessProvenanceCertificate, "prototype" | "producer" | "dependencyCertificate" | "result"> & {
 	readonly createdAt?: number;
 }): ProcessProvenanceCertificate {
 	const prototype = normalizePrototype(input.prototype);
@@ -308,7 +262,7 @@ export function sealProcessCertificate(input: {
 }
 
 export function parseProcessCertificate(value: unknown): ProcessProvenanceCertificate | undefined {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	if (!isRecord(value)) return undefined;
 	const candidate = value as Partial<ProcessProvenanceCertificate>;
 	if (!isSha256Digest(candidate.id) || !candidate.prototype || !candidate.producer || !candidate.dependencyCertificate || !candidate.result) return undefined;
 	try {
@@ -365,46 +319,6 @@ export function certificateReplayable(
 	);
 }
 
-export function sha256Digest(value: string | Uint8Array): Sha256Digest {
-	return `sha256:${hash("sha256", value)}`;
-}
-
-/** The same digest; large content is hashed on the thread pool, leaving the event loop free. */
-export const sha256DigestAsync = async (value: Uint8Array): Promise<Sha256Digest> => value.byteLength < 65_536 ? sha256Digest(value)
-	: `sha256:${Buffer.from(await webcrypto.subtle.digest("SHA-256", value)).toString("hex")}`;
-
-export function digestObject(value: unknown): Sha256Digest {
-	return sha256Digest(Buffer.from(stableStringify(value), "utf8"));
-}
-
-export function filesystemEntryType(entry: FilesystemTypeEvidence): string {
-	return entry.isFile()
-		? "file"
-		: entry.isDirectory()
-			? "directory"
-			: entry.isSymbolicLink()
-				? "symlink"
-				: entry.isSocket() ? "socket" : entry.isFIFO() ? "fifo" : entry.isCharacterDevice() ? "char" : entry.isBlockDevice() ? "block" : "other";
-}
-
-export function filesystemMetadataDigest(stat: FilesystemMetadataEvidence): Sha256Digest {
-	return digestObject({
-		mode: Number(stat.mode),
-		uid: Number(stat.uid),
-		gid: Number(stat.gid),
-		...(stat.isFile() ? { size: Number(stat.size), links: Number(stat.nlink) } : {}),
-		type: stat.isFile() ? "file" : stat.isDirectory() ? "directory" : stat.isSymbolicLink() ? "symlink" : "other",
-	});
-}
-
-export function filesystemObservationDigest(stat: Partial<FilesystemObservationEvidence>, fields: readonly FilesystemObservationField[] = FILESYSTEM_OBSERVATION_FIELDS): Sha256Digest {
-	return digestObject(Object.fromEntries(fields.map((field) => [field, String(stat[field])])));
-}
-
-export function isSha256Digest(value: unknown): value is Sha256Digest {
-	return typeof value === "string" && /^sha256:[0-9a-f]{64}$/.test(value);
-}
-
 // Only this module's owned, validated records may skip capture, never arbitrary frozen inputs.
 const normalizedPrototypes = new WeakSet<ExecPrototype>();
 
@@ -423,7 +337,7 @@ function normalizePrototype(input: ExecPrototype): ExecPrototype {
 	if (!validLogicalPath(executablePath) || !validLogicalPath(logicalCwd) || typeof platformFingerprint !== "string" || !platformFingerprint) {
 		throw new Error("process prototype identity is incomplete");
 	}
-	if (!Number.isSafeInteger(umask) || umask < 0 || umask > 0o777) throw new Error("process prototype umask is invalid");
+	if (!isSafeCount(umask, 0, 0o777)) throw new Error("process prototype umask is invalid");
 	for (const digest of [executableDigest, argvDigest, processContextDigest]) {
 		if (!isSha256Digest(digest)) throw new Error("process prototype contains an invalid digest");
 	}
@@ -440,15 +354,15 @@ function normalizePrototype(input: ExecPrototype): ExecPrototype {
 			return present ? { name, present: true as const, valueDigest: valueDigest! } : { name, present: false as const };
 		})
 		.sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0);
-	const descriptors = new Set<number>();
+	const descriptors = new Map<number, InheritedFileDescriptor>();
 	const inheritedFDs = [...rawDescriptors]
 		.map((source) => {
 			const fd = cloneSharedData({ ...source });
-			if (!Number.isSafeInteger(fd.fd) || fd.fd < 0 || descriptors.has(fd.fd) || !isSha256Digest(fd.flagsDigest)) {
+			if (!isSafeCount(fd.fd) || descriptors.has(fd.fd) || !isSha256Digest(fd.flagsDigest)) {
 				throw new Error("process prototype descriptor table is invalid");
 			}
 			if (fd.installed !== undefined && (fd.installed !== false || fd.fd < 3 || fd.alias !== fd.fd)) throw new Error("invalid queued OFD projection");
-			descriptors.add(fd.fd);
+			descriptors.set(fd.fd, fd);
 			for (const digest of [fd.endpointDigest, fd.contentDigest]) {
 				if (digest !== undefined && !isSha256Digest(digest)) throw new Error("process descriptor digest is invalid");
 			}
@@ -460,8 +374,8 @@ function normalizePrototype(input: ExecPrototype): ExecPrototype {
 		if (descriptor.resourceAliases && (descriptor.type !== "regular" || !descriptor.resourcePath ||
 			!validAliases(descriptor.resourceAliases, descriptor.resourcePath))) throw new Error("invalid inherited descriptor aliases");
 		if (descriptor.alias === undefined) continue;
-		const alias = inheritedFDs.find(({ fd }) => fd === descriptor.alias);
-		const object = inheritedFDs.find(({ fd }) => fd === descriptor.object);
+		const alias = descriptors.get(descriptor.alias);
+		const object = descriptors.get(descriptor.object!);
 		if (!["regular", "null", "directory", "pipe", "socket", "eventfd"].includes(descriptor.type) || !isOFDPosition(descriptor.offset) ||
 			(descriptor.type === "pipe" || descriptor.type === "socket" || descriptor.type === "eventfd") && (descriptor.offset !== 0 || !isSha256Digest(descriptor.contentDigest)) ||
 			descriptor.type === "null" && (descriptor.offset !== 0 || descriptor.contentDigest !== sha256Digest("")) ||
@@ -553,7 +467,7 @@ function validateDependency(dependency: DynamicDependency): void {
 function validDependencyFields(dependency: DynamicDependency): boolean {
 	switch (dependency.kind) {
 		case "fd":
-			return Number.isSafeInteger(dependency.fd) && dependency.fd >= 0 && isSha256Digest(dependency.contentDigest);
+			return isSafeCount(dependency.fd) && isSha256Digest(dependency.contentDigest);
 		case "file":
 			return ["input", "executable", "shared_object"].includes(dependency.role) && isSha256Digest(dependency.contentDigest) &&
 				optionalDigest(dependency.metadataDigest) && (dependency.aliases === undefined || validAliases(dependency.aliases, dependency.path));
@@ -591,7 +505,7 @@ function normalizeResult(result: ProcessResultRecord, prototype: ExecPrototype):
 	const computation = normalizeTimelineComputation(result.computation);
 	if (result.replayProfile !== "buffered_noninteractive") throw new Error("unsupported replay profile");
 	if (result.continuation && (result.exit !== undefined || !isSha256Digest(result.continuation.imageDigest) ||
-		!Number.isSafeInteger(result.continuation.imageBytes) || result.continuation.imageBytes <= 0 || result.continuation.imageBytes > 65 * 1024 * 1024))
+		!isSafeCount(result.continuation.imageBytes, 1, 65 * 1024 * 1024)))
 		throw new Error("invalid process continuation");
 	if (!result.continuation && !result.exit) throw new Error("process has neither exit nor continuation");
 	if (result.observedProcessMs !== undefined && (!Number.isFinite(result.observedProcessMs) || result.observedProcessMs < 0)) {
@@ -610,13 +524,13 @@ function normalizeResult(result: ProcessResultRecord, prototype: ExecPrototype):
 			const descriptor = descriptions[index]!;
 			if (effect.id !== descriptor.fd || (descriptor.type === "regular" || descriptor.type === "directory"
 				? !effect.position || effect.position.before !== descriptor.offset || !isOFDPosition(effect.position.after)
-				: effect.position !== undefined) || effect.flags !== undefined && (!Number.isSafeInteger(effect.flags) || effect.flags < 0 || effect.flags > 0x7fffffff))
+				: effect.position !== undefined) || effect.flags !== undefined && (!isSafeCount(effect.flags, 0, 0x7fffffff)))
 				throw new Error("invalid inherited OFD state transition");
 		});
 		resources.objects.forEach((effect, index) => {
 			const descriptor = objects[index]!;
 			if (effect.id !== descriptor.fd || (descriptor.type === "pipe" || descriptor.type === "socket"
-				? !Number.isSafeInteger(effect.consumed) || effect.consumed! < 0 : effect.consumed !== undefined) ||
+				? !isSafeCount(effect.consumed) : effect.consumed !== undefined) ||
 				effect.content !== undefined && descriptor.type !== "regular") throw new Error("invalid inherited OFD object transition");
 			if (effect.content) validateArtifact(effect.content, artifactSizes);
 		});
@@ -624,7 +538,7 @@ function normalizeResult(result: ProcessResultRecord, prototype: ExecPrototype):
 		for (const event of resources.transitions ?? []) {
 			const descriptor = descriptions.find(descriptor => descriptor.fd === event.id);
 			if (!descriptor || !(descriptor.type === "regular" ? event.kind === "lock" || event.kind === "release" : ["pipe", "socket", "eventfd"].includes(descriptor.type) && event.kind !== "lock") || !RESOURCE_TRANSITIONS.includes(event.kind) ||
-				event.requested !== undefined && (!Number.isSafeInteger(event.requested) || event.requested < 0 || event.requested > 2 * 1024 * 1024 || event.kind === "produce" && event.requested < event.data.size) ||
+				event.requested !== undefined && (!isSafeCount(event.requested, 0, 2 * 1024 * 1024) || event.kind === "produce" && event.requested < event.data.size) ||
 				event.data.size > (event.kind === "produce" ? 4096 : 2 * 1024 * 1024) ||
 				(event.kind === "shutdown" || event.kind === "release") && (event.data.size !== 1 || event.kind === "shutdown" && descriptor.type !== "socket") ||
 				event.kind.endsWith("_message") && (descriptor.type !== "socket" || event.data.size < 4) ||
@@ -636,7 +550,7 @@ function normalizeResult(result: ProcessResultRecord, prototype: ExecPrototype):
 	}
 	for (let index = 0; index < journal.length; index++) {
 		const event = journal[index]!;
-		if (!Number.isSafeInteger(event.sequence) || event.sequence < 0) throw new Error("invalid effect sequence");
+		if (!isSafeCount(event.sequence)) throw new Error("invalid effect sequence");
 		if (index > 0 && event.sequence === journal[index - 1]!.sequence) throw new Error("duplicate effect sequence");
 		if (event.kind === "output") validateArtifact(event.data, artifactSizes);
 		else {
@@ -666,11 +580,11 @@ function normalizeResult(result: ProcessResultRecord, prototype: ExecPrototype):
 
 function normalizeWorkspaceEffectState(state: WorkspaceEffectState, artifactSizes: Map<Sha256Digest, number>): WorkspaceEffectState {
 	if (state.kind === "absent") return { kind: "absent" };
-	if (!Number.isSafeInteger(state.mode) || state.mode < 0 || state.mode > 0o777) throw new Error("invalid workspace effect mode");
+	if (!isSafeCount(state.mode, 0, 0o777)) throw new Error("invalid workspace effect mode");
 	if (state.kind === "file" && state.modified !== undefined && !/^(?:0|[1-9]\d{0,19})$/.test(state.modified)) throw new Error("invalid workspace effect time");
 	if (state.kind === "file") { validateArtifact(state.data, artifactSizes); return { ...state, data: { ...state.data } }; }
 	if (
-		!isSha256Digest(state.entriesDigest) || !Number.isSafeInteger(state.uid) || state.uid < 0 || !Number.isSafeInteger(state.gid) || state.gid < 0
+		!isSha256Digest(state.entriesDigest) || !isSafeCount(state.uid) || !isSafeCount(state.gid)
 	) {
 		throw new Error("invalid directory effect state");
 	}
@@ -678,7 +592,7 @@ function normalizeWorkspaceEffectState(state: WorkspaceEffectState, artifactSize
 }
 
 export function validateArtifact(reference: ArtifactReference, sizes?: Map<Sha256Digest, number>): void {
-	if (!reference || !isSha256Digest(reference.digest) || !Number.isSafeInteger(reference.size) || reference.size < 0) throw new Error("invalid effect artifact");
+	if (!reference || !isSha256Digest(reference.digest) || !isSafeCount(reference.size)) throw new Error("invalid effect artifact");
 	const previousSize = sizes?.get(reference.digest);
 	if (previousSize !== undefined && previousSize !== reference.size) throw new Error("conflicting effect artifact sizes");
 	sizes?.set(reference.digest, reference.size);

@@ -24,20 +24,16 @@ export interface ValidationMetrics {
 	readonly mode: "watcher" | "exact";
 }
 
-export type ResourceValidation =
-	| { readonly status: "valid"; readonly metrics: ValidationMetrics }
-	| {
+export type ResourceValidation = { readonly metrics: ValidationMetrics } & (
+	| { readonly status: "valid" }
+	| ({ readonly cause: ResolutionCause & { readonly stage: "freshness" } } & (
+		{
 			readonly status: "stale";
-			readonly cause: ResolutionCause & { readonly stage: "freshness" };
-			readonly metrics: ValidationMetrics;
 			/** Changed inputs were revoked while independent computations survived; one observation rebuild may help. */
 			readonly reconstruct?: true;
-	  }
-	| {
-			readonly status: "indeterminate";
-			readonly cause: ResolutionCause & { readonly stage: "freshness" };
-			readonly metrics: ValidationMetrics;
-	  };
+		} | { readonly status: "indeterminate" }
+	))
+);
 
 export interface PlanActionIdentity {
 	readonly kind?: "operation";

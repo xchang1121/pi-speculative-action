@@ -1,46 +1,38 @@
 import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
-import type { Api, Context, Model } from "@earendil-works/pi-ai";
 import { validateToolArguments } from "@earendil-works/pi-ai";
 import { type ActionProjectionRule, resolveActionProjectionRules } from "./action-key-projection.ts";
 import { buildActionKey, type ActionKey, type ActionSemanticsRegistry, PI_ACTION_SEMANTICS } from "./action-semantics.ts";
 import { createResourceSnapshotExecutionWorld, type AgentExecutionWorld, type SpeculativeToolExecutionContext } from "./agent-execution-world.ts";
 import { DEFAULTS, type DrafterRequestSettings, normalizeDrafterRequestSettings } from "./common.ts";
-import type { AgentConsumeInput, AgentStartInput, AgentStateData } from "./agent-runtime-types.ts";
-import { definitionSchemaHashes } from "./agent-runtime-types.ts";
+import {
+	type AgentConsumeInput, type AgentStartInput, type AgentStateData, type AgentRuntime, type DrafterModelOptions, definitionSchemaHashes,
+} from "./agent-runtime-types.ts";
 import type { ActorForkPlanSource } from "./actor-fork-plan-source.ts";
 import type { ExecutionWorldDiagnosticSnapshot, ExecutionOperationBinding, SpeculativeExecutionRoute, WorldCheckpoint } from "./execution-world.ts";
-import { createDrafterPlanSource } from "./drafter-plan-source.ts";
+import { createDrafterPlanSource, type DrafterPlanSnapshot } from "./drafter-plan-source.ts";
 import { PATTERN_AWARE_DEFAULTS, type PatternAwareSettings, type PatternAwareStore, patternAwareSettings } from "./pattern-aware.ts";
 import { createPatternPlanSource } from "./pattern-plan-source.ts";
 import { createExecutionPreparation } from "./execution-preparation.ts";
 import { PI_BASH_TIMEOUT_PROJECTION_RULE, PI_GREP_LITERAL_PROJECTION_RULE, piToolErrorSettlement } from "./pi-tool-invocation.ts";
 import { TimelineInterval, type TimelineDependency } from "./task-timing.ts";
-import type {
-	CandidatePreflight,
-	ActorActionFeedback,
-	MaterializedActorAction,
-	MaterializedSpeculativeCandidate,
-	PredictionFeedback,
-	PreparedActorCall,
-	SpeculativeActionEvent,
-	SpeculativeActionRuntime,
-	SpeculativeActionSettings,
+import {
+	type CandidatePreflight,
+	type PreparedActorCall, type SpeculativeActionEvent, type SpeculativeActionSettings, makeSpeculativeActionRuntime,
 } from "./runtime.ts";
 import { normalizeSelfSpeculationSettings, type SelfSpeculationSettingsInput } from "./self-speculation.ts";
-import { makeSpeculativeActionRuntime } from "./runtime.ts";
 import { stableValueHash } from "./stable-value-hash.ts";
 import { booleanOr, positiveInteger, positiveMilliseconds } from "./setting-input.ts";
 import { normalizeSchedulingSettings } from "./scheduling-settings.ts";
 import { immutableSnapshot, isImmutableSnapshot } from "./stable-json.ts";
-import type { ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
-import { toolObservationKey } from "./tool-settlement.ts";
+import { type ToolInvocation, type ToolSettlement, toolObservationKey } from "./tool-settlement.ts";
 import { ToolExecutionGateway, type ToolOperation } from "./tool-execution-gateway.ts";
 import { createSystemResourceMonitor, type ExecutionResourceMonitor } from "./system-resources.ts";
 import { UNRESTRICTED_PROCESS_EFFECTS } from "./effect-model.ts";
 
 const ACTOR_OPERATION = Symbol("actor-operation");
 const RAW_ACTOR_CALL = Symbol("raw-actor-call");
-type BoundActorCall = AgentConsumeInput & { readonly [ACTOR_OPERATION]?: () => Promise<ToolOperation>; readonly [RAW_ACTOR_CALL]?: true };
+type AgentToolOperation = ToolOperation & { readonly invocation?: ToolInvocation };
+type BoundActorCall = AgentConsumeInput & { readonly [ACTOR_OPERATION]?: () => Promise<AgentToolOperation>; readonly [RAW_ACTOR_CALL]?: true };
 
 export interface SpeculativeAgentSettingsInput extends Partial<DrafterRequestSettings>, Partial<Omit<SpeculativeActionSettings, "sourceConfig">> {
 	readonly patternAware?: Partial<PatternAwareSettings>;
@@ -52,6 +44,7 @@ export function normalizeSpeculativeAgentSettings(input: SpeculativeAgentSetting
 	return {
 		...normalizeDrafterRequestSettings(input),
 		enabled: booleanOr(input.enabled, DEFAULTS.enabled),
+		reuseEnabled: booleanOr(input.reuseEnabled, DEFAULTS.reuseEnabled),
 		drafterEnabled: booleanOr(input.drafterEnabled, DEFAULTS.drafterEnabled),
 		prepareObservedOperations: booleanOr(input.prepareObservedOperations, DEFAULTS.prepareObservedOperations),
 		...(input.tools === undefined ? {} : { tools: Array.isArray(input.tools) && input.tools.every(tool => typeof tool === "string") ? [...new Set(input.tools)] : [] }),
@@ -72,14 +65,14 @@ export interface SpeculativeAgentPreflightContext extends Pick<SpeculativeToolEx
 
 export type { DraftOptionsContext } from "./agent-runtime-types.ts";
 
-export interface CreateSpeculativeActionHostOptions extends Omit<Parameters<typeof createDrafterPlanSource>[0], "sessionID"> {
+export interface CreateSpeculativeActionHostOptions extends DrafterModelOptions {
 	/** Override host observations for embedding or deterministic tests. */
 	readonly resources?: ExecutionResourceMonitor;
 	/** Canonical K(a), projection, and resource-version semantics for this host. */
 	readonly actionSemantics?: ActionSemanticsRegistry;
 	/** Workspace root used for action canonicalization and resource validation. */
 	readonly cwd: string;
-	/** Runtime settings. The feature remains disabled when omitted. */
+	/** Runtime settings. Speculative production defaults off; caching, reuse and observation default on. */
 	readonly getSettings?: () => SpeculativeAgentSettingsInput | Promise<SpeculativeAgentSettingsInput>;
 	/** Bind the concrete executor used by both speculative and Actor calls; rejection fails this invocation. */
 	readonly resolveInvocation?: (tool: string, input: unknown, definition?: AgentTool) => ToolInvocation | undefined | Promise<ToolInvocation | undefined>;
@@ -102,33 +95,12 @@ export interface CreateSpeculativeActionHostOptions extends Omit<Parameters<type
 	readonly patternWorkspaceIdentity?: string;
 	/** Optional injected store, primarily for embedding and deterministic tests. */
 	readonly patternStore?: PatternAwareStore | Promise<PatternAwareStore>;
-	/** Starts request-scoped inference integration before prediction sources launch. */
-	readonly onTurnStarted?: (input: {
-		readonly turnID: string;
-		readonly actorModel: Model<Api>;
-		readonly context: Context;
-		readonly decisionSequence: number;
-	}) => void | Promise<void>;
-	/** Receives every validated K(a) as a concrete tool call, independent of execution isolation. */
-	readonly onCandidateMaterialized?: (candidate: MaterializedSpeculativeCandidate<string>) => void | Promise<void>;
-	/** Receives the exact Runtime-owned K(a) of each authoritative Actor call. */
-	readonly onActorActionMaterialized?: (action: MaterializedActorAction<string>) => void | Promise<void>;
-	/** Receives authoritative adoption and realized execution-ahead feedback. */
-	readonly onActorActionSettled?: (feedback: ActorActionFeedback<string>) => void | Promise<void>;
-	/** Receives observed prediction matches and adoption independently of decoder verification. */
-	readonly onPredictionSettled?: (feedback: PredictionFeedback<string>) => void | Promise<void>;
 	readonly onEvent?: (event: SpeculativeActionEvent<string>) => void | Promise<void>;
 }
 
 export interface SpeculativeActionHost {
 	readonly sessionID: string;
-	readonly runtime: SpeculativeActionRuntime<
-		string,
-		ToolSettlement,
-		AgentStartInput,
-		AgentConsumeInput,
-		AgentConsumeInput
-	>;
+	readonly runtime: AgentRuntime;
 	readonly executionWorldDiagnostics: (refresh?: boolean) => Promise<readonly ExecutionWorldDiagnosticSnapshot[]>;
 	readonly startTurn: (input: Omit<AgentStartInput, "sessionID">, signal?: AbortSignal) => Promise<void>;
 	readonly previewActorTool: (input: { readonly turnID: string; readonly tool: string }, signal?: AbortSignal) => Promise<void>;
@@ -138,7 +110,7 @@ export interface SpeculativeActionHost {
 	readonly execute: (
 		input: SpeculativeToolExecutionInput,
 		signal: AbortSignal | undefined,
-		executor: (operation: ToolOperation) => Promise<AgentToolResult<unknown>>,
+		executor: (operation: AgentToolOperation) => Promise<AgentToolResult<unknown>>,
 	) => Promise<AgentToolResult<unknown>>;
 	readonly finishTurn: (turnID: string, terminal?: boolean) => Promise<void>;
 	readonly drafterBudgetSnapshot: () => ActionDrafterBudgetSnapshot;
@@ -154,7 +126,7 @@ export interface SpeculativeToolExecutionInput {
 	readonly tools: readonly AgentTool[];
 }
 
-export type ActionDrafterBudgetSnapshot = ReturnType<ReturnType<typeof createDrafterPlanSource>["snapshot"]>;
+export type ActionDrafterBudgetSnapshot = DrafterPlanSnapshot;
 
 export { patternPlanActionID } from "./pattern-plan-source.ts";
 
@@ -196,8 +168,11 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 		};
 	};
 	const drafterPlans = createDrafterPlanSource({
-		...options,
 		sessionID,
+		draftModel: options.draftModel,
+		getDraftOptions: options.getDraftOptions,
+		complete: options.complete,
+		drafterBudget: options.drafterBudget,
 		patternHints: (hint) => patternPlans.hints(hint),
 	});
 	const patternPlans = createPatternPlanSource({
@@ -314,29 +289,11 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 		observationKey: toolObservationKey,
 		rejectCandidateOutput: ({ output }) => (output.isError && output.exitCode === undefined ? "tool_error_result" : undefined),
 		projectionRules,
-		onTurnStarted: async ({ startInput, decisionSequence, settings }) => {
-			try {
-				await options.onTurnStarted?.({
-					turnID: startInput.turnID,
-					actorModel: startInput.actorModel,
-					context: startInput.context,
-					decisionSequence,
-				});
-			} catch {
-				// Optional inference integration cannot prevent source launch or Actor execution.
-			}
-			patternPlans.turnStarted(startInput, settings);
-		},
-		onTurnFinished: ({ startInput, settings, terminal }) => {
-			drafterPlans.finishTurn(startInput.sessionID, startInput.turnID);
-			patternPlans.turnFinished(startInput, settings, terminal);
-		},
-		onCandidateMaterialized: options.onCandidateMaterialized,
-		onActorActionMaterialized: options.onActorActionMaterialized,
-		onActorActionSettled: options.onActorActionSettled,
-		onPredictionSettled: options.onPredictionSettled,
 		onEvent: options.onEvent,
 	});
+	const disconnect = [
+		patternPlans.connect(runtime), drafterPlans.connect(runtime), executionPreparation.connect(runtime),
+	];
 
 	return {
 		sessionID,
@@ -348,14 +305,14 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 		previewActorCall: (input, signal) => runtime.previewActorCall({ ...input, sessionID, [RAW_ACTOR_CALL]: true } as BoundActorCall, signal),
 		execute: (input, signal, executor) => runtime.trackActorTool(sessionID, async issuedAt => {
 			const scope = input.turnID ? { sessionID, turnID: input.turnID, ...(input.id !== undefined ? { callID: input.id } : {}) } : undefined;
-			const operation: ToolOperation = {
+			const operation: AgentToolOperation = {
 				tool: input.tool,
 				scope,
 				input: immutableSnapshot(input.args),
 				...(input.id ? { callID: input.id } : {}),
 				...(signal ? { signal } : {}),
 			};
-			let binding: Promise<ToolOperation> | undefined;
+			let binding: Promise<AgentToolOperation> | undefined;
 			// One invocation owns its binding; prepare after Actor arrival so timing includes binding cost.
 			const bind = () => binding ??= (async () => {
 				const tool = input.tools.find((tool) => tool.name === input.tool);
@@ -372,7 +329,7 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 					() => executor(bound), (bindings, dependencies) => {
 						if (bindings.length) (operations ??= []).push(...bindings);
 						if (dependencies) computations.push(...dependencies);
-					}, prepared?.observeOperations, inputs, { cwd: options.cwd, signal }) : executor(bound);
+					}, prepared?.observeOperations, inputs, { cwd: options.cwd, signal, reuseEnabled: prepared?.reuseEnabled }) : executor(bound);
 				try { return await (prepared?.withInputs ? prepared.withInputs(execute) : execute()); }
 				finally {
 					if ((bound.invocation?.semantics ?? actionSemantics.definition(bound.action ?? bound.tool))?.effect !== "observation") {
@@ -404,7 +361,6 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 		finishTurn: async (turnID, terminal = false) => {
 			try {
 				await runtime.finishTurn({ sessionID, turnID, tool: "", args: {}, tools: [], terminal });
-				if (terminal) { drafterPlans.finishSession(); await Promise.all([patternPlans.finishSession(), executionPreparation.finishSession()]); }
 			} finally {
 				const closed = await Promise.allSettled(executionWorlds.map(async world => world.finishTurn?.(turnID)));
 				const failures = closed.flatMap(result => result.status === "rejected" ? [result.reason] : []);
@@ -414,9 +370,10 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 		dispose: async () => {
 			try {
 				await runtime.disposeSession(sessionID);
-				drafterPlans.finishSession();
-				await patternPlans.finishSession();
-			} finally { try { await patternPlans.dispose(); } finally { try { await executionPreparation.dispose(); } finally { await executionGateway.dispose(); } } }
+			} finally {
+				for (const unsubscribe of disconnect) unsubscribe();
+				try { await patternPlans.dispose(); } finally { try { await executionPreparation.dispose(); } finally { await executionGateway.dispose(); } }
+			}
 		},
 	};
 }

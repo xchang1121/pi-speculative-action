@@ -1,7 +1,7 @@
 import { safeName } from "./suite-report.ts";
 import { parsePatternPresets } from "./pattern-options.ts";
 import { benchmarkTraceReport, slowCallReport } from "./trace-report.ts";
-import { execFile } from "node:child_process";
+import { execHostFile } from "../src/executable-path.ts";
 import { mkdtemp, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -16,6 +16,7 @@ import { createSpeculativeActionExtension, type SpeculativeActionExtensionDepend
 import type { DrafterTaskBudget } from "../src/drafter-budget.ts";
 import type { SpeculativeActionEvent } from "../src/runtime.ts";
 import { summarizeSpeculativeTrace } from "../src/trace-summary.ts";
+import { incrementCounts } from "../src/number-utils.ts";
 import { TaskTimeline, toolSpeedup } from "../src/task-timing.ts";
 
 const DATASET_ROWS =
@@ -42,23 +43,26 @@ const SECRET_VARIABLE = /(?:API_KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)/i;
 
 interface CommandResult { readonly stdout: string; readonly stderr: string; }
 
+const numericSettings = {
+	drafterMaxDepth: "non-negative integer", candidateLimit: "positive integer",
+	drafterTaskMaxRequests: "positive integer", drafterTaskMaxTokens: "positive integer",
+	drafterDeterministicCandidates: "non-negative integer", drafterTemperatureMin: "non-negative number",
+	drafterTemperatureMax: "non-negative number", maxConcurrentActions: "positive integer",
+} as const;
+type NumericSetting = keyof typeof numericSettings;
+const numericNames = Object.keys(numericSettings) as NumericSetting[];
+const optionName = (name: string) => name.replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`);
+
 const { values } = parseArgs({
 	options: {
+		...Object.fromEntries(numericNames.map(name => [optionName(name), { type: "string" as const, default: String(DEFAULTS[name]) }])),
 		instance: { type: "string" },
 		label: { type: "string", default: "baseline" },
 		actor: { type: "string", default: "deepseek/deepseek-v4-pro" },
 		drafter: { type: "string", default: "deepseek/deepseek-v4-flash" },
 		// Every model request goes through this endpoint instead (a pi-llm-tape recorder or replayer).
 		"model-base-url": { type: "string" },
-		"drafter-max-depth": { type: "string", default: String(DEFAULTS.drafterMaxDepth) },
-		"candidate-limit": { type: "string", default: String(DEFAULTS.candidateLimit) },
 		"drafter-max-tokens": { type: "string" },
-		"drafter-task-max-requests": { type: "string", default: String(DEFAULTS.drafterTaskMaxRequests) },
-		"drafter-task-max-tokens": { type: "string", default: String(DEFAULTS.drafterTaskMaxTokens) },
-		"drafter-deterministic-candidates": { type: "string", default: String(DEFAULTS.drafterDeterministicCandidates) },
-		"drafter-temperature-min": { type: "string", default: String(DEFAULTS.drafterTemperatureMin) },
-		"drafter-temperature-max": { type: "string", default: String(DEFAULTS.drafterTemperatureMax) },
-		"max-concurrent-actions": { type: "string", default: String(DEFAULTS.maxConcurrentActions) },
 		"max-turns": { type: "string", default: "128" },
 		"timeout-ms": { type: "string", default: "900000" },
 		"repo-cache": { type: "string" },
@@ -84,19 +88,12 @@ const instance = required(values.instance, "--instance");
 const repoCache = path.resolve(values["repo-cache"] ?? path.join(os.tmpdir(), "pi-speculative-ablation-cache"));
 const runRoot = path.resolve(values["run-root"] ?? path.join(os.tmpdir(), "pi-speculative-ablation-runs"));
 const options = {
+	...Object.fromEntries(numericNames.map(name => [name, numberOption(optionName(name), numericSettings[name])])) as Record<NumericSetting, number>,
 	instance,
 	label: values.label ?? "baseline",
 	actor: model(values.actor ?? "deepseek/deepseek-v4-pro"),
 	drafter: model(values.drafter ?? "deepseek/deepseek-v4-flash"),
-	drafterMaxDepth: numberOption("drafter-max-depth", "non-negative integer"),
-	candidateLimit: numberOption("candidate-limit"),
 	...(values["drafter-max-tokens"] !== undefined ? { drafterMaxTokens: numberOption("drafter-max-tokens") } : {}),
-	drafterTaskMaxRequests: numberOption("drafter-task-max-requests"),
-	drafterTaskMaxTokens: numberOption("drafter-task-max-tokens"),
-	drafterDeterministicCandidates: numberOption("drafter-deterministic-candidates", "non-negative integer"),
-	drafterTemperatureMin: numberOption("drafter-temperature-min", "non-negative number"),
-	drafterTemperatureMax: numberOption("drafter-temperature-max", "non-negative number"),
-	maxConcurrentActions: numberOption("max-concurrent-actions"),
 	maxTurns: numberOption("max-turns"),
 	timeoutMs: numberOption("timeout-ms"),
 	repoCache,
@@ -180,12 +177,9 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	const agentDir = input.patternState ?? path.join(task.runDirectory, "agent");
 	await mkdir(agentDir, { recursive: true });
 	await writeFile(path.join(agentDir, "speculative-action.json"), JSON.stringify({
-		enabled: input.speculationEnabled, drafterEnabled: input.drafterEnabled, drafterMaxDepth: input.drafterMaxDepth,
+		...Object.fromEntries(numericNames.map(name => [name, input[name]])),
+		enabled: input.speculationEnabled, drafterEnabled: input.drafterEnabled, drafterPatternHints: input.drafterPatternHints,
 		...(input.drafterMaxTokens !== undefined ? { drafterMaxTokens: input.drafterMaxTokens } : {}),
-		drafterTaskMaxRequests: input.drafterTaskMaxRequests,
-		drafterTaskMaxTokens: input.drafterTaskMaxTokens,
-		drafterDeterministicCandidates: input.drafterDeterministicCandidates, drafterTemperatureMin: input.drafterTemperatureMin, drafterPatternHints: input.drafterPatternHints,
-		drafterTemperatureMax: input.drafterTemperatureMax, candidateLimit: input.candidateLimit, maxConcurrentActions: input.maxConcurrentActions,
 		predictionTimeoutMs: input.timeoutMs, patternAware: { enabled: input.patternAware,
 			...(input.patternPresets !== undefined ? { presets: input.patternPresets } : {}) },
 		...(input.selfSpeculation ? { selfSpeculation: { enabled: true, forkTransport: "drafter" } } : {}), draftModel: `${input.drafter.provider}/${input.drafter.id}`,
@@ -226,11 +220,12 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 	});
 	await session.bindExtensions({ mode: "print" });
 	let turns = 0;
-	const actorActionsByTool: Record<string, number> = {}, toolTimeline = new TaskTimeline(taskStartedAt);
+	let actorActionsByTool: Record<string, number> = {};
+	const toolTimeline = new TaskTimeline(taskStartedAt);
 	const toolWaits = new Map<string, { startedAt: number; completedAt?: number; finish: (completedAt: number) => void }>();
 	session.subscribe((event) => {
 		if (event.type === "tool_execution_start") {
-			increment(actorActionsByTool, event.toolName);
+			actorActionsByTool = incrementCounts(actorActionsByTool, [event.toolName]);
 			const startedAt = performance.now();
 			toolWaits.set(event.toolCallId, { startedAt, finish: toolTimeline.startToolWait(startedAt) });
 		}
@@ -272,14 +267,14 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 		[sessionManager.getHeader(), ...sessionManager.getEntries()].map((entry) => JSON.stringify(entry)).join("\n"));
 	const actorActions =Object.values(actorActionsByTool).reduce((sum, count) => sum + count, 0);
 	const summary = summarizeSpeculativeTrace(events);
-	const { sourceRequestTrace, predictionTrace, candidateTrace, actorActionTrace, ...dimensions } = benchmarkTraceReport(events, actorActionsByTool, input.speculationEnabled);
+	const { sourceRequestTrace, predictionTrace, candidateTrace, actorActionTrace, ...dimensions } = benchmarkTraceReport(events);
 	const toolWaitMs = toolTimeline.measure(taskCompletedAt).toolWaitMs;
 	const waitTrace = [...toolWaits].map(([id, { startedAt, completedAt }]) => ({ id, startedAt: performance.timeOrigin + startedAt,
 		completedAt: completedAt === undefined ? undefined : performance.timeOrigin + completedAt }));
 	const { calls: slowCalls, ...slowCallCoverage } = slowCallReport(events, waitTrace);
-	// SDK-only runs expose raw waits; complete calculation diagnostics come from extension task events.
-	const computation = input.speculationEnabled && summary.tasks ? summary : { toolComputeMs: undefined,
-		hiddenComputeMs: input.speculationEnabled ? undefined : 0, hiddenComputeIncomplete: undefined, adoptionWaitMs: undefined };
+	// Calculation and reuse diagnostics remain available with call predictions disabled.
+	const computation = summary.tasks ? summary : { toolComputeMs: undefined,
+		hiddenComputeMs: undefined, hiddenComputeIncomplete: undefined, adoptionWaitMs: undefined };
 	const changedFiles = lines((await command("git", ["-C", task.workspace, "diff", "--name-only"])).stdout);
 	const goldFiles = patchFiles(task.row.patch);
 	const testPatchFiles = patchFiles(task.row.test_patch);
@@ -324,7 +319,7 @@ async function runTask(task: PreparedTask, input: BenchmarkOptions) {
 			fullyHidden: !computation.hiddenComputeIncomplete && Number.isFinite(computation.toolComputeMs) && computation.toolComputeMs === computation.hiddenComputeMs && (computation.hiddenComputeMs ?? 0) > 0,
 			actorActions,
 			actorActionsByTool,
-			actorFallbacks: input.speculationEnabled ? summary.actorFallbacks : actorActions,
+			actorFallbacks: summary.actorFallbacks,
 			hitRate: actorActions ? summary.speculativeHits / actorActions : 0,
 			...summarizeUsage("actor", session.messages.filter((message) => message.role === "assistant")),
 			...summarizeUsage("drafter", drafterPredictionTrace),
@@ -436,12 +431,8 @@ function patchFiles(patch: string): string[] {
 
 function lines(value: string): string[] { return value .split(/\r?\n/) .map((line) => line.trim()) .filter(Boolean); }
 
-function increment(counts: Record<string, number>, key: string): void {
-	counts[key] = (counts[key] ?? 0) + 1;
-}
-
-function numberOption(option: keyof typeof values, kind: "positive integer" | "non-negative integer" | "non-negative number" = "positive integer"): number {
-	const parsed = Number(values[option]);
+function numberOption(option: string, kind: "positive integer" | "non-negative integer" | "non-negative number" = "positive integer"): number {
+	const parsed = Number(Reflect.get(values, option));
 	if (!Number.isFinite(parsed) || (kind !== "non-negative number" && !Number.isInteger(parsed)) ||
 		(kind === "positive integer" ? parsed <= 0 : parsed < 0)) throw new Error(`--${option} must be a ${kind}`);
 	return parsed;
@@ -455,13 +446,9 @@ function required(value: string | undefined, option: string): string {
 async function exists(value: string): Promise<boolean> { try { await stat(value); return true; } catch { return false; } }
 
 function command(file: string, args: readonly string[], cwd?: string): Promise<CommandResult> {
-	return new Promise((resolve, reject) => {
-		execFile(file, args, { cwd, env: benchmarkShellEnvironment(), maxBuffer: 32 * 1024 * 1024 }, (error, stdout, stderr) => {
-			if (error) {
-				reject(new Error(`${file} ${args.join(" ")} failed: ${stderr || error.message}`));
-				return;
-			}
-			resolve({ stdout, stderr });
+	return execHostFile(file, args, { cwd, env: benchmarkShellEnvironment(), maxBuffer: 32 * 1024 * 1024 })
+		.catch(error => {
+			if (error.stderr === undefined) throw error;
+			throw new Error(`${file} ${args.join(" ")} failed: ${error.stderr || error.message}`);
 		});
-	});
 }

@@ -10,9 +10,9 @@ import type { ExecutionWorld, ExecutionScope, ExecutionResourceContext, WorldBra
 import { effectCommitFailure } from "./effect-transaction.ts";
 import { effectCapabilitiesCover, RESOURCE_OBSERVATION_EFFECTS, WORKSPACE_PATH_MUTATION_EFFECTS } from "./effect-model.ts";
 import { captureResourceVersion, collectResourceComputation, invalidateResourceInputs, releaseResourceVersion, resourceProofBytes, validateResourceVersion,
-	ResourceReadView, type ResourceInput, type ResourceObservation, type ResourceVersionToken } from "./resource-version.ts";
+	ResourceReadView, type ResourceInput, type ResourceObservation, type ResourceVersionToken, type ToolFilesystemOperations, type ToolFilesystemStat } from "./resource-version.ts";
 import { cause } from "./settlement.ts";
-import type { ToolFilesystemOperations, ToolFilesystemStat, ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
+import type { ToolInvocation, ToolSettlement } from "./tool-settlement.ts";
 import { TimelineInterval } from "./task-timing.ts";
 
 /** Host tool call supplied to any OS sandbox or safe local substitute. */
@@ -104,13 +104,13 @@ export class ResourceObjectInputs {
 		};
 		this.produced = produced;
 	}
-	async borrow(target: string, expected: BigIntStats, maxBytes: number): Promise<StableFilesystemCapture | undefined> {
+	async borrow(target: string, expected: BigIntStats, maxBytes: number, accept: (capture: StableFilesystemCapture) => boolean | Promise<boolean> = () => true): Promise<StableFilesystemCapture | undefined> {
 		for (const view of this.views(target)) {
 			if (!view.retained) continue;
 			try {
 				const captured = await view.borrowObject(target, (capture, handle) => TimelineInterval.outside(async () => {
 					if (!capture.content || capture.bytesRead > maxBytes || !sameFilesystemIdentity(expected, capture.stat) ||
-						!sameFilesystemIdentity(capture.stat, await handle.stat({ bigint: true }))) return undefined;
+						!sameFilesystemIdentity(capture.stat, await handle.stat({ bigint: true })) || !await accept(capture)) return undefined;
 					return { ...capture, content: Buffer.from(capture.content), shared: true as const };
 				}));
 				if (captured) return captured;

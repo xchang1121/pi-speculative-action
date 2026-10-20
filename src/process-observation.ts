@@ -3,27 +3,27 @@ import { lstat, readdir, readlink } from "node:fs/promises";
 import path from "node:path";
 import { containsFilesystemPath, relativeFilesystemPath, slash } from "./path-utils.ts";
 import { isMissing } from "./error-utils.ts";
-import type { StableFilesystemCapture } from "./filesystem-evidence.ts";
-import { FILESYSTEM_CONCURRENCY, mapFilesystem } from "./filesystem-evidence.ts";
-import type { DynamicDependency, FilesystemTypeEvidence, Sha256Digest } from "./provenance-certificate.ts";
-import { digestObject, FILESYSTEM_OBSERVATION_FIELDS, filesystemEntryType, filesystemMetadataDigest, sha256Digest, sha256DigestAsync, type FilesystemObservationEvidence } from "./provenance-certificate.ts";
+import {
+	type StableFilesystemCapture, FILESYSTEM_CONCURRENCY, mapFilesystem, type FilesystemTypeEvidence, FILESYSTEM_OBSERVATION_FIELDS,
+	filesystemEntryType, filesystemMetadataDigest, type FilesystemObservationEvidence,
+} from "./filesystem-evidence.ts";
+import type { DynamicDependency } from "./provenance-certificate.ts";
+import { type Sha256Digest, digestObject, sha256Digest, sha256DigestAsync } from "./stable-value-hash.ts";
 import type { WorkspaceStructureEntry, WorkspaceStructureSnapshot, WorkspaceTreeEntry } from "./workspace-state.ts";
 import { orderWorkspaceChanges, type WorkspaceRegularDelta } from "./workspace-transaction.ts";
 
 export type { WorkspaceStructureEntry, WorkspaceStructureSnapshot, WorkspaceTreeEntry } from "./workspace-state.ts";
 
-export interface ExecutionPathProjectionOptions { readonly sourceRoot: string; readonly workspaceRoot: string; readonly privateRoot?: string; }
+export interface ExecutionPathProjectionOptions { readonly sourceRoot: string; readonly workspaceRoot: string; }
 
 /** Stable logical paths keep certificates independent of disposable worktree names. */
 export class ExecutionPathProjection {
 	readonly sourceRoot: string;
 	readonly workspaceRoot: string;
-	readonly privateRoot?: string;
 
 	constructor(options: ExecutionPathProjectionOptions) {
 		this.sourceRoot = path.resolve(options.sourceRoot);
 		this.workspaceRoot = path.resolve(options.workspaceRoot);
-		this.privateRoot = options.privateRoot ? path.resolve(options.privateRoot) : undefined;
 	}
 
 	toLogical(physicalPath: string): string {
@@ -40,16 +40,10 @@ export class ExecutionPathProjection {
 		return containsFilesystemPath(this.workspaceRoot, physical) ? physical : undefined;
 	}
 
-	normalizeValue(value: string): string {
-		let normalized = replacePath(value, this.workspaceRoot, this.sourceRoot);
-		if (this.privateRoot) normalized = replacePath(normalized, this.privateRoot, "/.pi-private-world");
-		return slash(normalized);
-	}
-
 	isWorkspacePhysical(physicalPath: string): boolean { return containsFilesystemPath(this.workspaceRoot, physicalPath); }
 }
 
-export interface WorkspaceStructureCaptureOptions { readonly maxFiles?: number; readonly exclude?: readonly string[]; readonly observeStat?: (relative: string, stat: BigIntStats) => void; }
+export interface WorkspaceStructureCaptureOptions { readonly maxFiles?: number; readonly exclude?: readonly string[]; readonly observeStat?: (relative: string, stat: BigIntStats) => void | Promise<void>; }
 
 /** Capture inode and directory semantics without reading regular-file contents. */
 export async function captureWorkspaceStructure(root: string, options: WorkspaceStructureCaptureOptions = {}): Promise<WorkspaceStructureSnapshot> {
@@ -64,7 +58,7 @@ export async function captureWorkspaceStructure(root: string, options: Workspace
 		cursor += batch.length;
 		const captured = await mapFilesystem(batch, async (relative) => {
 			const target = path.join(absoluteRoot, relative), stat = await lstat(target, { bigint: true });
-			options.observeStat?.(relative, stat);
+			await options.observeStat?.(relative, stat);
 			const children = !relative || stat.isDirectory() ? await readdir(target, { withFileTypes: true }) : [];
 			const entry = await captureExistingWorkspaceStructureEntry(target, stat, relative ? [] : [...excludes], children);
 			return { relative, entry, children };
@@ -80,6 +74,18 @@ export async function captureWorkspaceStructure(root: string, options: Workspace
 		}
 	}
 	return workspaceStructureSnapshot(absoluteRoot, entries, complete);
+}
+
+export function captureWorkspaceFileAliases(root?: string) {
+	let namespace: ReturnType<typeof captureWorkspaceStructure> | undefined;
+	return async (target: string, stat: BigIntStats): Promise<readonly string[] | undefined> => {
+		if (stat.nlink <= 1n) return undefined;
+		if (!root || !containsFilesystemPath(root, target)) throw new Error("file alias namespace is unavailable");
+		const snapshot = await (namespace ??= captureWorkspaceStructure(root)), entry = snapshot.entries.get(path.relative(root, target));
+		if (!snapshot.complete || entry?.kind !== "file" || entry.object !== `${stat.dev}:${stat.ino}` || entry.aliases?.length !== Number(stat.nlink))
+			throw new Error("file alias namespace is not closed");
+		return entry.aliases;
+	};
 }
 
 /** Resolve namespace aliases in the same captured structure, including layered mutation frontiers. */
@@ -121,7 +127,7 @@ async function captureExistingWorkspaceStructureEntry(
 	const change = { changeDigest: statChangeDigest(stat), changeTimeMs: statMilliseconds(stat, "ctime") };
 	if (stat.isSymbolicLink()) {
 		const linkTarget = await readlink(target);
-		return { kind: "symlink", target: linkTarget, targetDigest: sha256Digest(Buffer.from(linkTarget, "utf8")), ...change };
+		return { kind: "symlink", target: linkTarget, targetDigest: sha256Digest(linkTarget), ...change };
 	}
 	if (stat.isDirectory()) {
 		const excluded = new Set(excludeEntries);
@@ -376,11 +382,4 @@ export function statChangeDigest(stat: Stats | BigIntStats): Sha256Digest {
 		links: Number(stat.nlink),
 		type: stat.isFile() ? "file" : stat.isDirectory() ? "directory" : stat.isSymbolicLink() ? "symlink" : "other",
 	});
-}
-
-function replacePath(value: string, from: string, to: string): string {
-	const variants = [from, slash(from)];
-	let replaced = value;
-	for (const variant of variants) replaced = replaced.split(variant).join(to);
-	return replaced;
 }

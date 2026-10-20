@@ -1,34 +1,16 @@
 import { readText } from "./filesystem.ts";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { disposable, onExit } from "./async.ts";
+import { onExit } from "./async.ts";
 import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { LinuxOverlayfsCapabilityRegistry, linuxOverlayfsCapability, mountLinuxOverlayfs } from "../src/linux-overlayfs.ts";
+import { linuxOverlayfsCapability, mountLinuxOverlayfs } from "../src/linux-overlayfs.ts";
 
 const shellQuote = (value: string) => `'${value.replaceAll("'", `'\\''`)}'`;
 
 describe("Linux OverlayFS workspace substrate", () => {
-	it.each([
-		["bounds request aliases and releases lifecycle-owned capability state", false],
-		["fails the registry closed instead of evicting degraded driver identities", true],
-	] as const)("%s", async (_name, degraded) => {
-		await using registry = disposable(new LinuxOverlayfsCapabilityRegistry(degraded ? { degradedCapacity: 1 } : { requestCapacity: 4, resolvedCapacity: 2, negativeTtlMs: 60_000 }));
-		if (degraded) {
-			for (const [id, detail] of [["one", "first unsafe mount"], ["two", "second unsafe mount"]]) registry.markDegraded({
-				available: true, binary: `/driver/${id}`, fusermountBinary: `/unmount/${id}`, fingerprint: id, detail: "ready",
-			}, detail);
-		} else await Promise.all(Array.from({ length: 128 }, (_, index) => registry.capability({ overlayfsBinary: path.join(os.tmpdir(), `missing-overlay-${index}`) })));
-		expect(registry.inspect()).toMatchObject(degraded ? { degradedEntries: 0, disabled: true } : { requestEntries: 4, disabled: false, disposed: false });
-		expect(registry.inspect().resolvedEntries).toBeLessThanOrEqual(2);
-		if (degraded) await expect(registry.capability()).resolves.toMatchObject({ available: false, detail: expect.stringMatching(/registry disabled/i) });
-		registry.dispose();
-		expect(registry.inspect()).toEqual({ requestEntries: 0, resolvedEntries: 0, degradedEntries: 0, disabled: degraded, disposed: true });
-		await expect(registry.capability()).rejects.toThrow("registry is disposed");
-	});
-
 	it.for(["normal", "recovered"])("proves copy-on-write isolation and namespace visibility through %s unmount", async (mode, { skip }) => {
 		const capability = await linuxOverlayfsCapability();
 		if (!capability.available) return skip(capability.detail);

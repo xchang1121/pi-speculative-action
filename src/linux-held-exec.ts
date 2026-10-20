@@ -1,3 +1,5 @@
+import { isSafeCount } from "./number-utils.ts";
+import { isUtf8 } from "node:buffer";
 import { spawn, type ChildProcess } from "node:child_process";
 import { on, once } from "node:events";
 import { AsyncLocalStorage, AsyncResource } from "node:async_hooks";
@@ -5,17 +7,20 @@ import { createRequire } from "node:module";
 import { randomBytes } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import { access, chmod, mkdir, open, readFile, readdir, readlink, realpath, rm, stat } from "node:fs/promises";
-import { captureProcessContext, validProcessContext, type ProcessExecutionContext } from "./process-context.mjs";
+import { captureProcessContext, processLaunchOptions, validProcessContext, type ProcessExecutionContext, type ProcessLaunchOptions } from "./process-context.mjs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { effectCommitFailure, isPoisonedEffectCommit } from "./effect-transaction.ts";
 import { captureHeldDirectory, captureHeldFile, sameFilesystemIdentity } from "./filesystem-evidence.ts";
 import type { ResourceObjectInputs } from "./agent-execution-world.ts";
-import { sha256Digest, isOFDPosition, type OFDPosition, RESOURCE_TRANSITIONS, type ResourceTransitionKind, type Sha256Digest, type ProcessResourceEffects, type ArtifactReference } from "./provenance-certificate.ts";
+import { sha256Digest, type Sha256Digest } from "./stable-value-hash.ts";
+import {
+	isOFDPosition, type OFDPosition, RESOURCE_TRANSITIONS, type ResourceTransitionKind, type ProcessResourceEffects, type ArtifactReference,
+} from "./provenance-certificate.ts";
 import { containsFilesystemPath } from "./path-utils.ts";
 import { snapshotExecutionScope, type ExecutionScope } from "./execution-world.ts";
-import { captureWorkspaceStructure } from "./process-observation.ts";
+import { captureWorkspaceFileAliases } from "./process-observation.ts";
 import { qualifyNativeStartup } from "./process-startup.mjs";
 
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024 + 32768;
@@ -96,7 +101,7 @@ function validQueueMessages(messages: readonly QueueMessage[] | undefined, bytes
 	for (const message of messages) {
 		if (!message || !Number.isSafeInteger(message.start) || !Number.isSafeInteger(message.end) ||
 			message.start < end || message.end <= message.start || message.end > bytes || !Array.isArray(message.rights) || !message.rights.length ||
-			message.rights.some((fd: number) => !Number.isInteger(fd) || fd < 0 || fd > 0x7fffffff)) return false;
+			message.rights.some((fd: number) => !isSafeCount(fd, 0, 0x7fffffff))) return false;
 		end = message.end; rights += message.rights.length;
 	}
 	return rights <= 64;
@@ -181,7 +186,7 @@ export function descriptorEffects(graph: ProcessResourceGraph, report: readonly 
 	for (const [index, handle] of inputs.entries()) {
 		const position = report[index]!, ofd = graph.descriptions[handle.alias]!, object = graph.objects[ofd.object]!;
 		if (position.fd !== handle.fd || position.before !== (ofd.position ?? 0) || !isOFDPosition(position.after) ||
-			position.afterFlags !== undefined && (!Number.isSafeInteger(position.afterFlags) || position.afterFlags < 0 || position.afterFlags > 0x7fffffff ||
+			position.afterFlags !== undefined && (!isSafeCount(position.afterFlags, 0, 0x7fffffff) ||
 				((position.afterFlags ^ ofd.flags) & ~0xc00))) throw new Error("invalid resource transition");
 		const previous = descriptions.get(handle.alias), shared = objects.get(ofd.object);
 		if (previous && (previous.position?.after !== (ofd.position === undefined ? undefined : position.after) || previous.flags !== position.afterFlags) ||
@@ -197,12 +202,9 @@ export function descriptorEffects(graph: ProcessResourceGraph, report: readonly 
 	return { descriptions: [...descriptions.values()], objects: [...objects.values()] };
 }
 
-export interface HeldExecSnapshot {
+export interface HeldExecSnapshot extends Partial<ProcessLaunchOptions> {
 	readonly executable: string;
 	readonly invocation?: readonly [path: string, comm: string];
-	/** Actual output aliasing, usable for another isolated launch after context revalidation. */
-	readonly outputRoute?: readonly [0 | 1 | 2, 0 | 1 | 2];
-	readonly outputPipes?: readonly [boolean, boolean];
 	readonly argv: readonly string[];
 	readonly cwd: string;
 	readonly environment: Readonly<Record<string, string>>;
@@ -280,7 +282,7 @@ interface WireRequest {
 export class LinuxHeldExecBoundary {
 	private readonly token = randomBytes(32).toString("hex");
 	private readonly active = new Map<string, ActiveExecution>();
-	private readonly calls = new Set<{ readonly controller: AbortController; readonly completion: Promise<void> }>();
+	private readonly calls = new Set<PromiseWithResolvers<void> & { readonly controller: AbortController }>();
 	private readonly server: net.Server;
 	private readonly sockets = new Set<net.Socket>();
 	private readonly socketPath: string;
@@ -331,8 +333,8 @@ export class LinuxHeldExecBoundary {
 		const controller = new AbortController(), launches = new Set<{ readonly child: ChildProcess; readonly attachment: HeldExecAttachment }>();
 		const signal = AbortSignal.any([controller.signal, ...(options.signal ? [options.signal] : [])]);
 		const snapshot = { ...options, scope: snapshotExecutionScope(options.scope), signal };
-		let finished!: () => void, closed = false;
-		const call = { controller, completion: new Promise<void>(resolve => { finished = resolve; }) };
+		let closed = false;
+		const call = { controller, ...Promise.withResolvers<void>() };
 		this.calls.add(call); enterStartup();
 		try {
 			const available = () => !closed && !signal.aborted;
@@ -348,7 +350,7 @@ export class LinuxHeldExecBoundary {
 			closed = true;
 			for (const { child, attachment } of launches) if (!child.pid || child.exitCode === null && child.signalCode === null) attachment.retire();
 			const settled = await Promise.allSettled([...launches].map(launch => launch.attachment.completion));
-			this.calls.delete(call); finished(); restoreStartup!();
+			this.calls.delete(call); call.resolve(); restoreStartup!();
 			for (const result of settled) if (result.status === "rejected") throw result.reason;
 		}
 	}
@@ -411,7 +413,7 @@ export class LinuxHeldExecBoundary {
 			for (const call of this.calls) call.controller.abort(new Error("held-exec boundary disposed"));
 			const active = [...this.active.values()]; for (const execution of active) execution.retire();
 			for (const socket of this.sockets) socket.destroy();
-			await Promise.allSettled([stopped, ...[...this.calls].map(call => call.completion), ...active.map(execution => execution.completion)]);
+			await Promise.allSettled([stopped, ...[...this.calls].map(call => call.promise), ...active.map(execution => execution.completion)]);
 			await rm(this.socketPath, { force: true }).catch(() => undefined);
 		});
 	}
@@ -423,8 +425,7 @@ export class LinuxHeldExecBoundary {
 		let decision: HeldExecDecision | undefined, native: HeldExecClock | undefined;
 		let completedAt: number | undefined, committedAt: number | undefined;
 		let outcome: HeldExecTiming["outcome"] = "declined";
-		let release!: () => void;
-		const pending = new Promise<void>((resolve) => { release = resolve; });
+		const { promise: pending, resolve: release } = Promise.withResolvers<void>();
 		try {
 			const request = parseRequest(await readLine(socket));
 			active = request?.token === this.token ? this.active.get(request.execution) : undefined;
@@ -461,7 +462,7 @@ export class LinuxHeldExecBoundary {
 				positions.reduce((sum, position) => sum + (position.content?.length ?? 0) + Buffer.byteLength(position.path ?? ""), 0) +
 				(continuation?.image.length ?? 0) + physicalRoot.length + sourceRoot.length;
 			const descriptors = new Set<number>();
-			if (!Number.isSafeInteger(code) || code < 0 || code > (continuation ? 256 : 255) ||
+			if (!isSafeCount(code, 0, continuation ? 256 : 255) ||
 				continuation && (!Buffer.isBuffer(continuation.image) || !continuation.image.length || continuation.image.length > 65 * 1024 * 1024 ||
 					!path.isAbsolute(continuation.physicalRoot) || continuation.physicalRoot.includes("\0") || physicalRoot.length >= 4096 || sourceRoot.length >= 4096) ||
 				decision.output.length > MAX_OUTPUT_EVENTS || total > MAX_OUTPUT_BYTES || positions.length > 64 || positions.some(position => {
@@ -469,15 +470,15 @@ export class LinuxHeldExecBoundary {
 					return duplicate || position.path !== undefined && (typeof position.path !== "string" || !path.isAbsolute(position.path) || position.path.includes("\0") || Buffer.byteLength(position.path) >= 4096) ||
 						!validQueueMessages(position.messages, position.content?.length ?? 0) ||
 						position.content !== undefined && !Buffer.isBuffer(position.content) ||
-						![position.capacity ?? 0, position.event ?? 0, ...Object.values(position.socket ?? {})].every(value => Number.isSafeInteger(value) && value >= 0) || (position.event ?? 0) > 0x80000000 ||
+						![position.capacity ?? 0, position.event ?? 0, ...Object.values(position.socket ?? {})].every(value => isSafeCount(value)) || (position.event ?? 0) > 0x80000000 ||
 						![position.before, position.after].every(isOFDPosition) ||
-						![position.fd, position.flags, position.afterFlags].every(value => Number.isSafeInteger(value) && value >= 0) ||
+						![position.fd, position.flags, position.afterFlags].every(value => isSafeCount(value)) ||
 						((position.flags ^ position.afterFlags) & ~0xc00) !== 0 ||
 						position.fd > 0x7fffffff || position.flags > 0x7fffffff || position.afterFlags > 0x7fffffff || ![position.device, position.inode].every(value =>
 							typeof value === "string" && /^(0|[1-9][0-9]{0,19})$/.test(value) && BigInt(value) <= 0xffffffffffffffffn);
 				}) || resourceEvents.length > 1024 || resourceEvents.some(event => !descriptors.has(event.fd) ||
 					!RESOURCE_TRANSITIONS.includes(event.kind) || !Buffer.isBuffer(event.data) || event.data.length > 2 * 1024 * 1024 ||
-					event.requested !== undefined && (!Number.isSafeInteger(event.requested) || event.requested < 0 || event.requested > 2 * 1024 * 1024))) return void socket.end("C\n");
+					event.requested !== undefined && (!isSafeCount(event.requested, 0, 2 * 1024 * 1024)))) return void socket.end("C\n");
 			// Once a proposal is delivered the peer may arm its exit stub, even if its ACK is lost.
 			prepared = true;
 			await writeProcessChannel(socket, Buffer.from(`P ${code} ${decision.output.length} ${total} ${positions.length} ${resourceEvents.length} ${continuation?.image.length ?? 0} ${physicalRoot.length} ${sourceRoot.length}\n`));
@@ -568,7 +569,7 @@ export async function inspectHeldExecProcess(pid: number, executable: string, de
 	if (descriptors !== "stdio" && !validProcessContext(context)) throw new Error("held process descriptors are not replayable");
 	const argv = decodeNullFields(command);
 	if (!argv.length) throw new Error("held process argv is empty");
-	const environment: Record<string, string> = {};
+	const environment: Record<string, string> = Object.create(null);
 	for (const entry of decodeNullFields(environmentBytes)) {
 		const separator = entry.indexOf("=");
 		if (separator < 1 || Object.hasOwn(environment, entry.slice(0, separator))) throw new Error("held process environment is not canonical");
@@ -587,11 +588,8 @@ export async function inspectHeldExecProcess(pid: number, executable: string, de
 		} finally { await memory.close(); }
 		if (!invokedPath) throw new Error("held process invocation name is unavailable");
 	}
-	const [output, error] = context.outputEndpoints;
 	return {
-		executable, // A discarded stream stays discarded; a merged one keeps one outlet.
-		outputRoute: [output === "/dev/null" ? 0 : 1, error === "/dev/null" ? 0 : error === output ? 1 : 2],
-		outputPipes: [context.descriptorTypes[1] === "pipe", context.descriptorTypes[2] === "pipe"],
+		executable, ...processLaunchOptions(context),
 		argv, cwd, environment, context, invocation: [invokedPath, (await readFile(`${root}/comm`, "utf8")).replace(/\n$/, "")],
 	};
 }
@@ -604,16 +602,16 @@ export async function captureHeldDescriptorInputs(pid: number, descriptors: read
 	const objects: Record<number, ProcessResourceGraph["objects"][number]> = {};
 	const images = new Map<string, number>();
 	let remaining = maxBytes;
-	const storeObject = (file: string, fd: number, object: Omit<ProcessResourceGraph["objects"][number], "contentDigest" | "content">, bytes?: Buffer) => {
+	const storeObject = (file: string, fd: number, object: Omit<ProcessResourceGraph["objects"][number], "contentDigest" | "content">, bytes?: Buffer, digest?: Sha256Digest) => {
 		remaining -= bytes?.length ?? 0;
 		if (remaining < 0) throw new Error(`inherited ${object.type} exceeds input budget`);
-		objects[fd] = { ...object, contentDigest: sha256Digest(bytes ?? ""), ...(bytes ? { content: bytes.toString("base64") } : {}) };
+		objects[fd] = { ...object, contentDigest: digest ?? sha256Digest(bytes ?? ""), ...(bytes ? { content: bytes.toString("base64") } : {}) };
 		images.set(file, fd);
 	};
-	let namespace: ReturnType<typeof captureWorkspaceStructure> | undefined;
+	const aliases = captureWorkspaceFileAliases(namespaceRoot);
 	for (const descriptor of descriptors) {
 		const { fd, alias: representative, flags, offset } = descriptor;
-		if (descriptor.pin !== undefined && (!Number.isSafeInteger(tracerPid) || tracerPid! <= 0)) throw new Error("queued OFD has no authenticated holder");
+		if (descriptor.pin !== undefined && (!isSafeCount(tracerPid, 1))) throw new Error("queued OFD has no authenticated holder");
 		const holder = descriptor.pin === undefined ? pid : tracerPid!, handle = descriptor.pin ?? fd;
 		const heldPath = `/proc/${holder}/fd/${handle}`;
 		if ((descriptor.flags & 3) === 3 || descriptor.fd === 1 || descriptor.fd === 2) throw new Error("unsupported inherited descriptor effects");
@@ -654,8 +652,8 @@ export async function captureHeldDescriptorInputs(pid: number, descriptors: read
 					const bytes = Buffer.from(directoryHex, "hex");
 					storeObject(file, fd, { type: "directory", sourcePath: endpoint }, bytes);
 					if (inputs) {
-						const borrowed = await inputs.borrow(endpoint, metadata, bytes.length);
-						if (!borrowed?.content?.equals(bytes)) {
+						const borrowed = await inputs.borrow(endpoint, metadata, bytes.length, capture => !!capture.content?.equals(bytes));
+						if (!borrowed) {
 							const captured = await captureHeldDirectory(holder, handle, bytes, metadata, endpoint).catch(() => undefined);
 							if (captured && !inputs.retain(endpoint, captured)) await captured.object?.dispose();
 						}
@@ -666,8 +664,8 @@ export async function captureHeldDescriptorInputs(pid: number, descriptors: read
 			storeObject(file, fd, { type: descriptor.type, ...(descriptor.type === "directory" ? { sourcePath: endpoint } : {}) });
 			continue;
 		}
-		let captured = inputs && await inputs.borrow(endpoint, await stat(heldPath, { bigint: true }), remaining);
-		if (captured && !sameFilesystemIdentity(captured.stat, await stat(heldPath, { bigint: true }))) captured = undefined;
+		let captured = inputs && await inputs.borrow(endpoint, await stat(heldPath, { bigint: true }), remaining,
+			async capture => sameFilesystemIdentity(capture.stat, await stat(heldPath, { bigint: true })));
 		const borrowed = !!captured;
 		captured ??= await captureHeldFile(holder, handle, remaining, !!inputs);
 		let retained = borrowed;
@@ -676,23 +674,13 @@ export async function captureHeldDescriptorInputs(pid: number, descriptors: read
 				throw new Error("held descriptor identity changed");
 			}
 			const sourcePath = captured.stat.nlink ? endpoint : undefined;
-			let sourceAliases: readonly string[] | undefined;
-			if (captured.stat.nlink > 1n) {
-				if (!namespaceRoot || !containsFilesystemPath(namespaceRoot, endpoint)) throw new Error("inherited descriptor alias namespace is unavailable");
-				const snapshot = await (namespace ??= captureWorkspaceStructure(namespaceRoot));
-				const entry = snapshot.entries.get(path.relative(namespaceRoot, endpoint));
-				if (!snapshot.complete || entry?.kind !== "file" || entry.object !== `${captured.stat.dev}:${captured.stat.ino}` ||
-					entry.aliases?.length !== Number(captured.stat.nlink)) throw new Error("inherited descriptor alias namespace is not closed");
-				sourceAliases = entry.aliases;
-			}
+			const sourceAliases = await aliases(endpoint, captured.stat);
 			if (sourcePath) {
 				const metadata = await stat(sourcePath, { bigint: true });
 				if (metadata.dev !== captured.stat.dev || metadata.ino !== captured.stat.ino) throw new Error("held descriptor pathname changed");
 			}
-			remaining -= captured.content.byteLength;
-			objects[fd] = { type: "regular", ...(sourcePath ? { sourcePath } : {}), ...(sourceAliases ? { sourceAliases } : {}),
-				contentDigest: `sha256:${captured.hash}`, content: captured.content.toString("base64") };
-			images.set(file, fd);
+			storeObject(file, fd, { type: "regular", ...(sourcePath ? { sourcePath } : {}), ...(sourceAliases ? { sourceAliases } : {}) },
+				captured.content, `sha256:${captured.hash}`);
 			if (!borrowed && sourcePath && inputs) retained = inputs.retain(sourcePath, { ...captured, realPath: sourcePath });
 		} finally { if (!retained) await captured.object?.dispose(); }
 	}
@@ -706,11 +694,9 @@ export async function captureHeldDescriptorInputs(pid: number, descriptors: read
 }
 
 function decodeNullFields(bytes: Buffer): string[] {
+	if (!isUtf8(bytes)) throw new Error("held process metadata is not valid UTF-8");
 	const fields = bytes.toString("utf8").split("\0");
 	if (fields.at(-1) === "") fields.pop();
-	if (!Buffer.from(`${fields.join("\0")}${bytes.at(-1) === 0 ? "\0" : ""}`, "utf8").equals(bytes)) {
-		throw new Error("held process metadata is not valid UTF-8");
-	}
 	return fields;
 }
 
@@ -718,8 +704,8 @@ function parseRequest(line: string): WireRequest | undefined {
 	try {
 		const value = JSON.parse(line) as Partial<WireRequest>;
 		return /^[0-9a-f]{64}$/.test(value.token ?? "") &&
-			/^[0-9a-f]{48}$/.test(value.execution ?? "") && Number.isSafeInteger(value.pid) && value.pid! > 0 &&
-			Number.isSafeInteger(value.tracer) && value.tracer! > 0 && (value.holder === undefined || Number.isSafeInteger(value.holder) && value.holder! >= 0) &&
+			/^[0-9a-f]{48}$/.test(value.execution ?? "") && isSafeCount(value.pid, 1) &&
+			isSafeCount(value.tracer, 1) && (value.holder === undefined || isSafeCount(value.holder)) &&
 			(value.trackQueues === undefined || value.trackQueues === true && value.descriptors === undefined) &&
 			validDescriptors(value.descriptors) ? value as WireRequest : undefined;
 	} catch {
@@ -733,18 +719,18 @@ function validDescriptors(descriptors: WireRequest["descriptors"]): boolean {
 	let previous = -1;
 	const aliases = new Map<number, HeldFileDescriptor>();
 	for (const descriptor of descriptors) {
-		if (descriptor?.pin !== undefined && (!Number.isSafeInteger(descriptor.pin) || descriptor.pin < 0 || descriptor.pin > 0x7fffffff || descriptor.alias !== descriptor.fd)) return false;
+		if (descriptor?.pin !== undefined && (!isSafeCount(descriptor.pin, 0, 0x7fffffff) || descriptor.alias !== descriptor.fd)) return false;
 		if (!descriptor || descriptor.type !== undefined && !["null", "directory", "pipe", "socket", "eventfd"].includes(descriptor.type) || descriptor.type !== undefined && descriptor.type !== "directory" && descriptor.offset !== 0 ||
 			!validOFDLocks(descriptor.locks) || descriptor.locks !== undefined && (descriptor.type !== undefined || descriptor.fd !== descriptor.alias) ||
 			(descriptor.type === "directory" && !(descriptor.flags & 0x200000) ? typeof descriptor.directoryHex !== "string" || descriptor.directoryHex.length > 4 * 1024 * 1024 || !/^(?:[0-9a-f]{2})*$/.test(descriptor.directoryHex) : descriptor.directoryHex !== undefined) ||
-			(descriptor.type === "eventfd" ? !descriptor.counter || !Number.isInteger(descriptor.counter.id) || descriptor.counter.id < 0 || descriptor.counter.id > 0x7fffffff ||
+			(descriptor.type === "eventfd" ? !descriptor.counter || !isSafeCount(descriptor.counter.id, 0, 0x7fffffff) ||
 				!/^(0|[1-9][0-9]{0,19})$/.test(descriptor.counter.value) || BigInt(descriptor.counter.value) >= 0xffffffffffffffffn || ![0, 1].includes(descriptor.counter.semaphore) : descriptor.counter !== undefined) ||
-			(descriptor.outside !== undefined && (!Number.isInteger(descriptor.outside) || descriptor.outside < 0 || descriptor.outside > 3 ||
+			(descriptor.outside !== undefined && (!isSafeCount(descriptor.outside, 0, 3) ||
 				(descriptor.type !== undefined && descriptor.type !== "eventfd" ? !["pipe", "socket"].includes(descriptor.type) : descriptor.outside !== 0 && descriptor.outside !== 3))) ||
 			(descriptor.messages !== undefined && (descriptor.type !== "socket" || !validQueueMessages(descriptor.messages, (descriptor.queueHex?.length ?? 0) / 2))) ||
-			(descriptor.type === "pipe" || descriptor.type === "socket" ? typeof descriptor.eof !== "boolean" || typeof descriptor.queueHex !== "string" || descriptor.queueHex.length > 4 * 1024 * 1024 || descriptor.queueHex.length % 2 !== 0 || !/^[0-9a-f]*$/.test(descriptor.queueHex) || !Number.isSafeInteger(descriptor.capacity) || descriptor.capacity! < 4096 : descriptor.queueHex !== undefined || descriptor.eof !== undefined || descriptor.capacity !== undefined) ||
-			(descriptor.type === "socket" ? !descriptor.socket || ![1, 2, 5].includes(descriptor.socket.type ?? 1) || ![descriptor.socket.shutdown, descriptor.socket.peerShutdown].every(value => Number.isInteger(value) && value >= 0 && value <= 3) || ![descriptor.socket.peerInode, descriptor.socket.peerQueued, descriptor.socket.allocated].every(value => Number.isSafeInteger(value) && value >= 0) : descriptor.socket !== undefined) ||
-			!isOFDPosition(descriptor.offset) || ![descriptor.fd, descriptor.alias, descriptor.flags].every(value => Number.isSafeInteger(value) && value >= 0) ||
+			(descriptor.type === "pipe" || descriptor.type === "socket" ? typeof descriptor.eof !== "boolean" || typeof descriptor.queueHex !== "string" || descriptor.queueHex.length > 4 * 1024 * 1024 || descriptor.queueHex.length % 2 !== 0 || !/^[0-9a-f]*$/.test(descriptor.queueHex) || !isSafeCount(descriptor.capacity, 4096) : descriptor.queueHex !== undefined || descriptor.eof !== undefined || descriptor.capacity !== undefined) ||
+			(descriptor.type === "socket" ? !descriptor.socket || ![1, 2, 5].includes(descriptor.socket.type ?? 1) || ![descriptor.socket.shutdown, descriptor.socket.peerShutdown].every(value => isSafeCount(value, 0, 3)) || ![descriptor.socket.peerInode, descriptor.socket.peerQueued, descriptor.socket.allocated].every(value => isSafeCount(value)) : descriptor.socket !== undefined) ||
+			!isOFDPosition(descriptor.offset) || ![descriptor.fd, descriptor.alias, descriptor.flags].every(value => isSafeCount(value)) ||
 			descriptor.fd <= previous || descriptor.fd > 0x7fffffff || descriptor.alias > descriptor.fd || descriptor.flags > 0x7fffffff ||
 			typeof descriptor.owned !== "boolean" || ![descriptor.device, descriptor.inode].every(value =>
 				typeof value === "string" && /^(0|[1-9][0-9]{0,19})$/.test(value) && BigInt(value) <= 0xffffffffffffffffn)) return false;

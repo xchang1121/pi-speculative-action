@@ -1,4 +1,4 @@
-import { nonNegativeFinite as metric } from "./number-utils.ts";
+import { incrementCounts as increment, nonNegativeFinite as metric } from "./number-utils.ts";
 import type { SpeculativeActionEvent, SpeculativeCacheSnapshot } from "./events.ts";
 import { emptyWorldReuseMetrics, type WorldReuseMetrics } from "./execution-world.ts";
 import type { ResolutionCause } from "./settlement.ts";
@@ -93,7 +93,7 @@ export function reduceSpeculativeTrace<SessionID>(
 		case "source_request":
 			next.sourceRequests++;
 			next.totalDraftTokens = Math.max(next.totalDraftTokens, metric(event.totalDraftTokens));
-			next.sourceOutcomes = increment(current.sourceOutcomes, event.request.settlement.status);
+			next.sourceOutcomes = increment(current.sourceOutcomes, [event.request.settlement.status]);
 			if (event.request.settlement.status === "error" || event.request.settlement.status === "timeout") {
 				const { cause } = event.request.settlement;
 				next.lastSourceFailure = `${event.request.request.source} ${causeKey(cause)}${cause.detail ? ` ${cause.detail.slice(0, 200)}` : ""}`;
@@ -103,7 +103,7 @@ export function reduceSpeculativeTrace<SessionID>(
 			next.predictionsSettled++;
 			const settlement = event.settlement;
 			if (settlement.observation === "unobserved") {
-				next.predictionUnobserved = increment(current.predictionUnobserved, causeKey(settlement.cause));
+				next.predictionUnobserved = increment(current.predictionUnobserved, [causeKey(settlement.cause)]);
 				break;
 			}
 			next.predictionsObserved++;
@@ -112,7 +112,7 @@ export function reduceSpeculativeTrace<SessionID>(
 			if (!settlement.match.matched) break;
 			next.predictionsMatched++;
 			if (settlement.match.adoption.status === "adopted") next.predictionsAdopted++;
-			else next.predictionRejectedAfterMatch = increment(current.predictionRejectedAfterMatch, causeKey(settlement.match.adoption.cause));
+			else next.predictionRejectedAfterMatch = increment(current.predictionRejectedAfterMatch, [causeKey(settlement.match.adoption.cause)]);
 			break;
 		}
 		case "candidate":
@@ -121,25 +121,19 @@ export function reduceSpeculativeTrace<SessionID>(
 				const reuse = event.candidate.world?.executionMetrics.reuse;
 				if (reuse) next.processReuse = addReuseMetrics(next.processReuse, reuse);
 			} else if (event.state.status !== "running")
-				next.candidateTerminalCauses = increment(current.candidateTerminalCauses, causeKey(event.state.cause));
+				next.candidateTerminalCauses = increment(current.candidateTerminalCauses, [causeKey(event.state.cause)]);
 			break;
 		case "actor_action":
 			next.actorActions++;
 			next.actorActionsByTool = tally(current.actorActionsByTool, event.settlement.tool, true, event.settlement.provider.kind === "speculative");
-			if (event.settlement.rejections.length) {
-				const counts = { ...current.actorCandidateRejections };
-				for (const rejection of event.settlement.rejections) {
-					const key = causeKey(rejection.cause);
-					counts[key] = (counts[key] ?? 0) + 1;
-				}
-				next.actorCandidateRejections = counts;
-			}
+			if (event.settlement.rejections.length) next.actorCandidateRejections = increment(current.actorCandidateRejections,
+				event.settlement.rejections.map(rejection => causeKey(rejection.cause)));
 			if (event.settlement.provider.kind === "speculative") {
 				next.speculativeHits++;
 				const match = event.settlement.provider.match;
 				if (match.kind === "projected") {
 					next.partialResultReuseHits++;
-					next.partialResultReuseByProjector = increment(current.partialResultReuseByProjector, match.projector);
+					next.partialResultReuseByProjector = increment(current.partialResultReuseByProjector, [match.projector]);
 				} else if (match.kind === "inputs") next.inputReuseHits++;
 				else next.exactReuseHits++;
 			} else next[event.settlement.provider.origin === "preview" ? "actorPreviews" : "actorFallbacks"]++;
@@ -179,10 +173,6 @@ function ratio(numerator: number, denominator: number): number {
 /** Parallel counters per key: each flag increments its own position. */
 function tally(target: Readonly<Record<string, readonly number[]>>, key: string, ...flags: boolean[]): Record<string, readonly number[]> {
 	return { ...target, [key]: flags.map((flag, index) => (target[key]?.[index] ?? 0) + Number(flag)) };
-}
-
-function increment(target: Readonly<Record<string, number>>, key: string): Record<string, number> {
-	return { ...target, [key]: (target[key] ?? 0) + 1 };
 }
 
 function addMode(target: ModesBySource, source: string, mode: string, delta: Partial<ModeTraceSummary>): ModesBySource {

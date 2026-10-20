@@ -1,4 +1,5 @@
-import { createExecPrototype, sealProcessCertificate, sha256Digest, type ProcessProvenanceCertificate } from "../src/provenance-certificate.ts";
+import { createExecPrototype, sealProcessCertificate, type ProcessProvenanceCertificate } from "../src/provenance-certificate.ts";
+import { sha256Digest } from "../src/stable-value-hash.ts";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { mkdir, writeFile } from "node:fs/promises";

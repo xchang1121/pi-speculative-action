@@ -10,6 +10,8 @@ import { readFile, readlink, stat } from "node:fs/promises";
  * readonly outputEndpoints: readonly [string, string]
  * readonly regularDescriptors?: readonly (Pick<HeldFileDescriptor, "fd" | "alias" | "flags" | "offset" | "type"> & { readonly image?: number })[]
  * }} ProcessExecutionContext */
+/** @typedef {{ readonly outputRoute: readonly [0 | 1 | 2, 0 | 1 | 2], readonly closeStdin?: boolean,
+ * readonly outputPipes?: readonly [boolean, boolean], readonly outputFlags?: readonly [number, number], readonly stackLimit?: string }} ProcessLaunchOptions */
 
 /** @typedef {Record<"dev" | "ino" | "mode" | "uid" | "gid" | "rdev", string>} RawStat */
 /**
@@ -61,7 +63,7 @@ export async function captureProcessContext(pid, inheritedDescriptors, regularDe
 			flags: Number.parseInt(flags, 8) & ~0o2000000,
 		};
 	});
-	const [input, output, error] = descriptors;
+	const [, output, error] = descriptors;
 	if (!output || output.fd !== 1 || !error || error.fd !== 2) throw new Error("reported process lacks its output streams");
 	/** @param {string} name */
 	const field = name => {
@@ -74,12 +76,11 @@ export async function captureProcessContext(pid, inheritedDescriptors, regularDe
 	if (!groups.includes(gid[1])) groups.push(gid[1]);
 	groups.sort((left, right) => left - right);
 	/** @type {Map<string, number>} */
-	const aliases = new Map();
-	/** @type {Map<string, number>} */
 	const queues = new Map();
 	const semantic = {
 		executionDomain: "ptrace",
-		rlimits: limits.split("\n").slice(1).map(line => line.trim().split(/\s{2,}/).slice(0, 2)),
+		// Core's hard cap is confinement; observing it is guarded by the trace.
+		rlimits: limits.trim().split("\n").slice(1).map(line => line.trim().split(/\s{2,}/).slice(0, line.startsWith("Max core file size") ? 2 : 3)),
 		credentials: { uid: uid[0], euid: uid[1], gid: gid[0], egid: gid[1], groups },
 		systemMetadata: fields(shell),
 		signals: { blocked: field("SigBlk"), ignored: field("SigIgn") },
@@ -88,17 +89,15 @@ export async function captureProcessContext(pid, inheritedDescriptors, regularDe
 			cpus: field("Cpus_allowed_list"), memoryNodes: field("Mems_allowed_list"),
 		},
 		descriptors: descriptors.map(({ endpoint, identity, ...descriptor }) => {
-			if (!aliases.has(identity)) aliases.set(identity, aliases.size);
 			if (descriptor.queue && !queues.has(descriptor.queue)) queues.set(descriptor.queue, descriptor.fd);
-			// routedProcessContext reproduces this key order, including its /dev/null discard outlet.
-			return { fd: descriptor.fd, type: descriptor.type, flags: descriptor.flags, alias: aliases.get(identity),
+			// routedProcessIdentity reproduces this key order, including its /dev/null discard outlet.
+			return { fd: descriptor.fd, type: descriptor.type, flags: descriptor.flags, alias: identity,
 				...(descriptor.queue ? { queue: queues.get(descriptor.queue) } : {}), ...(descriptor.type === "device" ? { endpoint } : {}) };
 		}),
 	};
 	return {
 		...contextKeys(semantic),
 		umask: Number.parseInt(field("Umask"), 8),
-		descriptorTypes: [input.type, output.type, error.type],
 		outputEndpoints: [output.endpoint ?? "", error.endpoint ?? ""],
 		...(regularDescriptors?.length ? { regularDescriptors } : {}),
 	};
@@ -107,32 +106,37 @@ export async function captureProcessContext(pid, inheritedDescriptors, regularDe
 /** Status flags a launcher sets again on a target's routed outputs (its parent's own, like make's O_APPEND); the rest pin the stream. */
 const OUTPUT_STATUS_FLAGS = 0o2000 | 0o4000;
 
-/** The status flags of a context's standard outputs a launcher can set again, when either has one. @param {Pick<ProcessExecutionContext, "key">} context @returns {[number, number] | undefined} */
-export function outputStatusFlags(context) {
-	const [, output, error] = JSON.parse(context.key).descriptors, flags = /** @type {[number, number]} */ ([output.flags & OUTPUT_STATUS_FLAGS, error.flags & OUTPUT_STATUS_FLAGS]);
-	return flags.some(Boolean) ? flags : undefined;
+/** Reproducible launch state, shared by held-child dispatch and learned bindings. @param {ProcessExecutionContext} context @param {readonly string[]} [endpoints] @returns {ProcessLaunchOptions | undefined} */
+export function processLaunchOptions(context, endpoints) {
+	const semantic = JSON.parse(context.key), [, output, error] = semantic.descriptors;
+	const flags = /** @type {[number, number]} */ ([output.flags & OUTPUT_STATUS_FLAGS, error.flags & OUTPUT_STATUS_FLAGS]);
+	const pipes = /** @type {[boolean, boolean]} */ (context.outputEndpoints.map(endpoint => /^pipe:\[\d+\]$/.test(endpoint) && !endpoints?.includes(endpoint)));
+	const outlets = endpoints ?? context.outputEndpoints;
+	/** @param {string} endpoint @param {1 | 2} fd */
+	const route = (endpoint, fd) => endpoint === "/dev/null" ? 0 : pipes[fd - 1] ? fd === 2 && endpoint === context.outputEndpoints[0] ? 1 : fd
+		: endpoint === outlets[0] ? 1 : endpoint === outlets[1] ? 2 : undefined;
+	const stdout = route(context.outputEndpoints[0], 1), stderr = route(context.outputEndpoints[1], 2);
+	if (stdout === undefined || stderr === undefined) return;
+	return { outputRoute: [stdout, stderr], closeStdin: context.descriptorTypes[0] === "closed",
+		...(pipes.some(Boolean) ? { outputPipes: pipes } : {}), ...(flags.some(Boolean) ? { outputFlags: flags } : {}),
+		stackLimit: semantic.rlimits.find(/** @param {string[]} limit */ limit => limit[0] === "Max stack size")[1] };
 }
 
-/** @param {ProcessExecutionContext} context @param {readonly [0 | 1 | 2, 0 | 1 | 2]} route 0 discards into /dev/null @param {boolean} closeStdin @param {ProcessExecutionContext["regularDescriptors"]} [regularDescriptors] @param {readonly [boolean, boolean]} [outputPipes] @param {readonly [number, number]} [outputFlags] @returns {ProcessExecutionContext} */
-export function routedProcessContext(context, route, closeStdin = false, regularDescriptors, outputPipes, outputFlags) {
+/** The launch's identity after restoring its streams and stack limit. @param {ProcessExecutionContext} context @param {ProcessLaunchOptions} launch @param {ProcessExecutionContext["regularDescriptors"]} [regularDescriptors] */
+export function routedProcessIdentity(context, { outputRoute: route, closeStdin, outputPipes, outputFlags, stackLimit }, regularDescriptors) {
 	const semantic = JSON.parse(context.key);
 	if (!semantic.credentials || !semantic.signals ||
 		![semantic.signals.blocked, semantic.signals.ignored].every(value => typeof value === "string" && /^[0-9a-f]+$/i.test(value)) ||
 		!Array.isArray(semantic.descriptors) || semantic.descriptors.length !== 3) throw new Error("invalid probed execution context");
-	/** @param {0 | 1 | 2} outlet */
-	const output = outlet => outlet ? semantic.descriptors[outlet] : { fd: 0, type: "device", flags: discardFlags(), alias: 0, endpoint: "/dev/null" };
 	// Aliases number identities by first use; as in capture, every unproven null device shares one.
-	/** @param {{ type?: string, endpoint?: string }} descriptor @param {unknown} identity */
-	const identity = (descriptor, identity) => descriptor.type === "device" && descriptor.endpoint === "/dev/null" ? "/dev/null" : identity;
-	const descriptors = [
-		closeStdin ? { fd: 0, type: "closed", flags: 0, alias: 0 } : { ...semantic.descriptors[0], alias: identity(semantic.descriptors[0], 0) },
-		{ ...output(route[0]), fd: 1, alias: identity(output(route[0]), `outlet:${route[0]}`) },
-		{ ...output(route[1]), fd: 2, alias: identity(output(route[1]), `outlet:${route[1]}`) },
-	];
-	for (let index = 0; index < 2; index++) {
-		if (outputPipes?.[index]) Object.assign(descriptors[index + 1], { type: "pipe", flags: 1 });
-		if (outputFlags) descriptors[index + 1].flags = descriptors[index + 1].flags & ~OUTPUT_STATUS_FLAGS | outputFlags[index] & OUTPUT_STATUS_FLAGS;
-	}
+	const descriptors = [0, ...route].map((outlet, fd) => {
+		const descriptor = !fd && closeStdin ? { fd, type: "closed", flags: 0, alias: 0 } : fd && !outlet
+			? { fd, type: "device", flags: discardFlags(), alias: 0, endpoint: "/dev/null" } : semantic.descriptors[outlet];
+		const entry = { ...descriptor, fd, alias: descriptor.type === "device" && descriptor.endpoint === "/dev/null" ? "/dev/null" : fd ? `outlet:${outlet}` : 0 };
+		if (fd && outputPipes?.[fd - 1]) Object.assign(entry, { type: "pipe", flags: 1 });
+		if (fd && outputFlags) entry.flags = entry.flags & ~OUTPUT_STATUS_FLAGS | outputFlags[fd - 1] & OUTPUT_STATUS_FLAGS;
+		return entry;
+	});
 	for (const descriptor of regularDescriptors ?? []) {
 		const entry = { fd: descriptor.fd, type: descriptor.type ?? "regular", flags: descriptor.flags, alias: `ofd:${descriptor.alias}`,
 			...(descriptor.type === "pipe" || descriptor.type === "socket" ? { queue: descriptor.image } : {}) };
@@ -140,20 +144,10 @@ export function routedProcessContext(context, route, closeStdin = false, regular
 		else if (descriptor.fd > 2) descriptors.push(entry);
 		else throw new Error("inherited output descriptor cannot use buffered routing");
 	}
-	const aliases = new Map();
-	for (const descriptor of descriptors) {
-		if (!aliases.has(descriptor.alias)) aliases.set(descriptor.alias, aliases.size);
-		descriptor.alias = aliases.get(descriptor.alias);
-	}
 	// libuv resets the signal mask and dispositions for every spawned target.
 	const signals = { blocked: semantic.signals.blocked.replace(/[0-9a-f]/gi, "0"), ignored: semantic.signals.ignored.replace(/[0-9a-f]/gi, "0") };
-	return {
-		...context,
-		...contextKeys({ ...semantic, executionDomain: "ptrace", signals, descriptors }),
-		descriptorTypes: [regularDescriptors?.find(({ fd }) => fd === 0)?.type ?? (regularDescriptors?.some(({ fd }) => fd === 0) ? "regular" : closeStdin ? "closed" : context.descriptorTypes[0]),
-			outputPipes?.[0] ? "pipe" : route[0] ? context.descriptorTypes[route[0]] : "device", outputPipes?.[1] ? "pipe" : route[1] ? context.descriptorTypes[route[1]] : "device"],
-		...(regularDescriptors?.length ? { regularDescriptors } : {}),
-	};
+	if (stackLimit !== undefined) semantic.rlimits.find(/** @param {string[]} limit */ limit => limit[0] === "Max stack size")[1] = stackLimit;
+	return { ...contextKeys({ ...semantic, executionDomain: "ptrace", signals, descriptors }), umask: context.umask };
 }
 
 /** @param {unknown} value @returns {value is ProcessExecutionContext} */
@@ -185,10 +179,16 @@ function discardFlags() {
 	return nullOutputFlags;
 }
 
-/** @param {{ credentials: Record<string, unknown>, [key: string]: unknown }} semantic */
+/** @param {{ credentials: Record<string, unknown>, descriptors: readonly { type: DescriptorType, alias: unknown }[], [key: string]: unknown }} semantic */
 function contextKeys(semantic) {
+	const aliases = new Map();
+	for (const descriptor of semantic.descriptors) {
+		if (!aliases.has(descriptor.alias)) aliases.set(descriptor.alias, aliases.size);
+		descriptor.alias = aliases.get(descriptor.alias);
+	}
 	const launch = { ...semantic, credentials: { ...semantic.credentials, groups: "broker-preserved" }, signals: "broker-normalized" };
-	return { key: JSON.stringify(semantic), launchKey: JSON.stringify(launch) };
+	return { key: JSON.stringify(semantic), launchKey: JSON.stringify(launch),
+		descriptorTypes: /** @type {[DescriptorType, DescriptorType, DescriptorType]} */ (semantic.descriptors.slice(0, 3).map(({ type }) => type)) };
 }
 
 /** @param {string} value */

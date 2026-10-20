@@ -1,10 +1,11 @@
 import { snapshotExecutionScope, type ExecutionScope, type ExecutionOperationAdoption } from "./execution-world.ts";
 import { EffectCommitFailure, effectCommitFailure } from "./effect-transaction.ts";
-import { referencedArtifacts, type ProcessProvenanceCertificate, type Sha256Digest } from "./provenance-certificate.ts";
+import { referencedArtifacts, type ProcessProvenanceCertificate } from "./provenance-certificate.ts";
+import { type Sha256Digest } from "./stable-value-hash.ts";
 import type { ProvenanceCertificateStore, VerifiedArtifactClosure } from "./reuse-store.ts";
 import { immutableSnapshot, isImmutableSnapshot, stableEqual } from "./stable-json.ts";
 import { TimelineInterval } from "./task-timing.ts";
-import { waitForCompletion } from "./scheduler.ts";
+import { waitForCompletion } from "./runtime-lifecycle.ts";
 
 const CLAIM = { available: 0, reserved: 1, consumed: 2 } as const;
 const LOAN = { closed: 1, consumed: 2, reader: 4 } as const;
@@ -457,8 +458,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 
 	private reserve(key: Sha256Digest, executablePath: string, ownership: ProcessHandoffOwnership, scope?: ExecutionScope) {
 		if (this.disposed) throw new Error("process handoff registry is disposed");
-		let settle!: () => void;
-		const completion = new Promise<void>((resolve) => { settle = resolve; });
+		const { promise: completion, resolve: settle } = Promise.withResolvers<void>();
 		const controller: AbortController = new AbortController();
 		const record = {
 			key, completion, executablePath, scope, ownership, settle, startedAt: performance.now(), state: { status: "running" } as HandoffState,

@@ -4,7 +4,13 @@ import type { DrafterRequestSettings } from "./common.ts";
 import { stableValueHash } from "./stable-value-hash.ts";
 
 type BudgetPolicy = Pick<DrafterRequestSettings, "drafterTaskMaxRequests" | "drafterTaskMaxTokens">;
-export type DrafterBudgetSnapshot = Readonly<ReturnType<DrafterTaskBudget["snapshot"]>>;
+export interface DrafterBudgetSnapshot {
+	readonly requests: number;
+	readonly reportedTokens: number;
+	readonly unreportedTokens: number;
+	readonly reservedTokens: number;
+	readonly skippedRequests: number;
+}
 type Suppression = "drafter_request_limit" | "drafter_token_limit" | "drafter_context_limit";
 type OnSkipped = (reason: Suppression, detail?: string) => void;
 
@@ -58,7 +64,7 @@ export class DrafterTaskBudget {
 	}
 
 	finishTask(): void { this.finished = true; }
-	snapshot() { return { ...this.state }; }
+	snapshot(): DrafterBudgetSnapshot { return { ...this.state }; }
 	private skip(reason: Suppression, onSkipped?: OnSkipped, detail?: string): undefined { this.state.skippedRequests++; onSkipped?.(reason, detail); return undefined; }
 	private spent() { return this.state.reportedTokens + this.state.unreportedTokens + this.state.reservedTokens; }
 	private empty() { return { requests: 0, reportedTokens: 0, unreportedTokens: 0, reservedTokens: 0, skippedRequests: 0 }; }

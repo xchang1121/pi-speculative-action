@@ -1,82 +1,70 @@
-import { clampProbability, nonNegativeCount as nonNegativeInteger } from "./number-utils.ts";
+import { clampProbability, nonNegativeCount } from "./number-utils.ts";
 
 export type PpmCountTrieRow = {
 	readonly context: readonly string[];
 	readonly counts: Readonly<Record<string, number>>;
 	readonly lastSeen: number;
+	/** Older snapshots use the context timestamp for every target. */
+	readonly targetLastSeen?: Readonly<Record<string, number>>;
 };
 
-type TargetCount = { count: number; lastSeen: number; };
-
-type CountNode = {
-	readonly children: Map<string, CountNode>;
+type TargetCount = { count: number; lastSeen: number };
+type ContextCounts = {
+	readonly context: readonly string[];
 	readonly targets: Map<string, TargetCount>;
-	total: number;
 	lastSeen: number;
 };
 
-/**
- * Bounded-order context count trie with interpolated PPM escape.
- *
- * Context edges are stored newest-event first, so querying every suffix costs
- * O(maxOrder). Counts belong to exact context nodes; observing one transition
- * updates the root and every suffix order exactly once.
- */
+/** Bounded suffix evidence with interpolated PPM escape. Only populated contexts own state. */
 export class PpmCountTrie {
-	private root = node();
-	private populatedContexts = 0;
+	private readonly counts = new Map<string, ContextCounts>();
 	private readonly order: number;
 
 	constructor(maxOrder: number) {
-		this.order = nonNegativeInteger(maxOrder);
+		this.order = nonNegativeCount(maxOrder);
 	}
 
-	get size(): number {
-		return this.populatedContexts;
-	}
+	get size(): number { return this.counts.size; }
 
 	observe(history: readonly string[], target: string, sequence = 0, halfLife = 0): void {
 		if (!target) return;
-		const lastSeen = nonNegativeInteger(sequence);
-		for (const current of this.contexts(history, true)) this.increment(current, target, 1, lastSeen, halfLife);
+		const lastSeen = nonNegativeCount(sequence);
+		for (const context of this.suffixes(history)) {
+			const current = this.context(context);
+			// Advance all sufficient statistics before adding the new observation.
+			if (halfLife > 0 && lastSeen > current.lastSeen) {
+				for (const value of current.targets.values()) {
+					value.count = decayedCount(value, lastSeen, halfLife);
+					value.lastSeen = lastSeen;
+				}
+			}
+			const previous = current.targets.get(target);
+			this.put(current, target, Math.min(Number.MAX_SAFE_INTEGER, (previous?.count ?? 0) + 1), Math.max(previous?.lastSeen ?? 0, lastSeen));
+		}
 	}
 
-	/** Set evidence for one exact context without implicitly changing its suffixes. */
+	/** Replace one exact context's evidence, without changing any suffix counts. */
 	setCount(context: readonly string[], target: string, count: number, lastSeen = 0): void {
-		if (!target || context.length > this.order) return;
-		const normalizedCount = positiveCount(count);
-		if (normalizedCount === undefined) return;
-		let current = this.root;
-		for (const suffix of this.contexts(context, true)) current = suffix;
-		const wasEmpty = current.total === 0;
-		const previous = current.targets.get(target)?.count ?? 0;
-		current.targets.set(target, { count: normalizedCount, lastSeen: nonNegativeInteger(lastSeen) });
-		current.total = safeTotal(current.total + normalizedCount - previous);
-		current.lastSeen = Math.max(current.lastSeen, nonNegativeInteger(lastSeen));
-		if (wasEmpty && current.total > 0) this.populatedContexts++;
+		if (target && context.length <= this.order && Number.isFinite(count) && count > 0)
+			this.put(this.context(context), target, Math.min(Number.MAX_SAFE_INTEGER, count), nonNegativeCount(lastSeen));
 	}
 
-	/** Compute the suffix evidence once for every competing target in this prediction frontier. */
 	distribution(history: readonly string[], sequence = 0, halfLife = 0): ReadonlyMap<string, number> {
 		const estimates = new Map<string, number>();
-		if (this.root.total <= 0) return estimates;
-		const suffixNodes = [...this.contexts(history)].filter(current => current.total > 0);
-		// PPM*: a shorter deterministic suffix has more evidence than its equally deterministic extensions.
-		const deterministic = suffixNodes.findIndex((suffix, index) => index > 0 && suffix.targets.size === 1);
-		if (deterministic >= 0) suffixNodes.length = deterministic + 1;
-
+		if (!this.counts.has("[]")) return estimates;
+		const suffixes = [...this.suffixes(history)].flatMap(context => this.counts.get(JSON.stringify(context)) ?? []);
+		// Prefer the shortest deterministic suffix to its equally deterministic extensions.
+		const deterministic = suffixes.findIndex((suffix, index) => index > 0 && suffix.targets.size === 1);
+		if (deterministic >= 0) suffixes.length = deterministic + 1;
 		let remaining = 1;
-		for (const suffix of suffixNodes.reverse()) {
+		for (const suffix of suffixes.reverse()) {
 			const weighted = [...suffix.targets].map(([target, value]) => [target, decayedCount(value, sequence, halfLife)] as const);
 			const total = weighted.reduce((sum, [, count]) => sum + count, 0);
 			const distinct = weighted.filter(([, count]) => count > 0).length;
 			if (total <= 0 || distinct <= 0) continue;
-			const denominator = total + distinct;
-			for (const [target, count] of weighted) {
-				if (count <= 0) continue;
-				estimates.set(target, (estimates.get(target) ?? 0) + remaining * (count / denominator));
-			}
-			remaining *= distinct / denominator;
+			for (const [target, count] of weighted) if (count > 0)
+				estimates.set(target, (estimates.get(target) ?? 0) + remaining * (count / (total + distinct)));
+			remaining *= distinct / (total + distinct);
 		}
 		for (const [target, probability] of estimates) estimates.set(target, clampProbability(probability));
 		return estimates;
@@ -84,24 +72,24 @@ export class PpmCountTrie {
 
 	snapshot(maxContexts = Number.POSITIVE_INFINITY): readonly PpmCountTrieRow[] {
 		const limit = Number.isFinite(maxContexts) ? Math.max(1, Math.floor(maxContexts)) : Number.POSITIVE_INFINITY;
-		return this.rankedContexts().slice(0, limit).map(({ node, context }) => ({
-			context,
-			counts: Object.fromEntries([...node.targets].sort(([left], [right]) => left.localeCompare(right))
-				.map(([target, value]) => [target, value.count])),
-			lastSeen: node.lastSeen,
+		return this.ranked().slice(0, limit).map(([, row]) => ({
+			context: [...row.context],
+			counts: Object.fromEntries([...row.targets].sort(([left], [right]) => left.localeCompare(right)).map(([target, value]) => [target, value.count])),
+			lastSeen: row.lastSeen,
+			...([...row.targets.values()].some(value => value.lastSeen !== row.lastSeen)
+				? { targetLastSeen: Object.fromEntries([...row.targets].map(([target, value]) => [target, value.lastSeen])) } : {}),
 		}));
 	}
 
 	restore(rows: readonly unknown[]): void {
-		this.root = node();
-		this.populatedContexts = 0;
+		this.counts.clear();
 		for (const value of rows) {
-			const row = countRow(value);
-			if (!row || row.context.length > this.order) continue;
-			for (const [target, count] of Object.entries(row.counts)) {
-				if (typeof count !== "number") continue;
-				this.setCount(row.context, target, count, row.lastSeen);
-			}
+			const row = value as Partial<PpmCountTrieRow> | null;
+			if (!row || !Array.isArray(row.context) || !row.context.every(token => typeof token === "string") ||
+				!row.counts || typeof row.counts !== "object" || Array.isArray(row.counts)) continue;
+			for (const [target, count] of Object.entries(row.counts))
+				this.setCount(row.context, target, count, typeof row.targetLastSeen?.[target] === "number"
+					? row.targetLastSeen[target] : typeof row.lastSeen === "number" ? row.lastSeen : 0);
 		}
 	}
 
@@ -109,122 +97,36 @@ export class PpmCountTrie {
 		const limit = Math.max(1, Math.floor(maxContexts));
 		if (this.size <= limit) return;
 		if (!Number.isFinite(limit)) { this.restore(this.snapshot(limit)); return; }
-		const discarded = new Set(this.rankedContexts().slice(limit).map((item) => item.node));
-		const prune = (current: CountNode): void => {
-			if (discarded.has(current)) {
-				current.targets.clear();
-				current.total = 0;
-				current.lastSeen = 0;
-			} else if (current.total > 0) {
-				// Preserve snapshot/restore's target order and shared context timestamp.
-				const lastSeen = current.lastSeen;
-				const targets = [...current.targets].sort(([left], [right]) => left.localeCompare(right));
-				current.targets.clear();
-				current.total = 0;
-				for (const [target, value] of targets) {
-					value.lastSeen = lastSeen;
-					current.targets.set(target, value);
-					current.total = safeTotal(current.total + value.count);
-				}
-			}
-			for (const [token, child] of current.children) {
-				prune(child);
-				if (child.total === 0 && child.children.size === 0) current.children.delete(token);
-			}
-		};
-		prune(this.root);
-		this.populatedContexts -= discarded.size;
+		for (const [key] of this.ranked().slice(limit)) this.counts.delete(key);
 	}
 
-	/** Learning, restoration and prediction follow the same newest-first context edges. */
-	private *contexts(history: readonly string[], create = false): Generator<CountNode> {
-		let current = this.root;
-		yield current;
-		for (let index = history.length - 1; index >= Math.max(0, history.length - this.order); index--) {
-			const token = history[index];
-			if (token === undefined) continue;
-			let child = current.children.get(token);
-			if (!child && create) current.children.set(token, child = node());
-			if (!child) return;
-			yield current = child;
-		}
+	private *suffixes(history: readonly string[]) {
+		for (let length = 0; length <= Math.min(history.length, this.order); length++)
+			yield history.slice(history.length - length);
 	}
 
-	/** Both retention and persistence select the same ordered evidence before copying target counts. */
-	private rankedContexts() {
-		const rows: Array<{ node: CountNode; context: readonly string[]; key: string }> = [];
-		const collect = (current: CountNode, reverseContext: readonly string[]): void => {
-			if (current.total > 0) {
-				const context = [...reverseContext].reverse();
-				rows.push({ node: current, context, key: contextKey(context) });
-			}
-			for (const [token, child] of current.children) collect(child, [...reverseContext, token]);
-		};
-		collect(this.root, []);
-		return rows.sort((left, right) =>
-			Number(right.node === this.root) - Number(left.node === this.root) ||
-			right.node.total - left.node.total || right.context.length - left.context.length ||
-			right.node.lastSeen - left.node.lastSeen || left.key.localeCompare(right.key));
+	private context(context: readonly string[]): ContextCounts {
+		const key = JSON.stringify(context);
+		let current = this.counts.get(key);
+		if (!current) this.counts.set(key, current = { context: [...context], targets: new Map(), lastSeen: 0 });
+		return current;
 	}
 
-	private increment(current: CountNode, target: string, count: number, lastSeen: number, halfLife: number): void {
-		const wasEmpty = current.total === 0;
-		// Move every sufficient statistic to the new event time before adding evidence.
-		if (halfLife > 0 && lastSeen > current.lastSeen) {
-			current.total = 0;
-			for (const value of current.targets.values()) {
-				value.count = safeCount(decayedCount(value, lastSeen, halfLife));
-				value.lastSeen = lastSeen;
-				current.total = safeTotal(current.total + value.count);
-			}
-		}
-		const previous = current.targets.get(target);
-		const nextCount = safeCount((previous?.count ?? 0) + count);
-		current.targets.set(target, { count: nextCount, lastSeen: Math.max(previous?.lastSeen ?? 0, lastSeen) });
-		current.total = safeTotal(current.total + nextCount - (previous?.count ?? 0));
+	private put(current: ContextCounts, target: string, count: number, lastSeen: number): void {
+		current.targets.set(target, { count, lastSeen });
 		current.lastSeen = Math.max(current.lastSeen, lastSeen);
-		if (wasEmpty) this.populatedContexts++;
+	}
+
+	private ranked() {
+		return [...this.counts].map(([key, row]) => [key, row, [...row.targets.values()].reduce((sum, value) => sum + value.count, 0)] as const)
+			.sort(([leftKey, left, leftTotal], [rightKey, right, rightTotal]) =>
+			Number(right.context.length === 0) - Number(left.context.length === 0) ||
+			rightTotal - leftTotal || right.context.length - left.context.length ||
+			right.lastSeen - left.lastSeen || leftKey.localeCompare(rightKey));
 	}
 }
 
-function node(): CountNode {
-	return { children: new Map(), targets: new Map(), total: 0, lastSeen: 0 };
-}
-
-function positiveCount(value: number): number | undefined {
-	return Number.isFinite(value) && value > 0 ? safeCount(value) : undefined;
-}
-
-function safeCount(value: number): number {
-	return Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Number.isFinite(value) ? value : Number.MAX_SAFE_INTEGER));
-}
-
-function safeTotal(value: number): number {
-	const maximum = Number.MAX_VALUE / 2;
-	return Math.min(maximum, Math.max(0, Number.isFinite(value) ? value : maximum));
-}
-
-function decayedCount(value: TargetCount | undefined, sequence: number, halfLife: number): number {
-	if (!value) return 0;
-	if (!Number.isFinite(sequence) || !Number.isFinite(halfLife) || halfLife <= 0) return value.count;
-	return value.count * 2 ** (-Math.max(0, sequence - value.lastSeen) / halfLife);
-}
-
-function validContext(value: unknown): value is readonly string[] {
-	return Array.isArray(value) && value.every((item) => typeof item === "string");
-}
-
-function countRow(value: unknown): PpmCountTrieRow | undefined {
-	if (!value || typeof value !== "object") return undefined;
-	const row = value as { context?: unknown; counts?: unknown; lastSeen?: unknown };
-	if (!validContext(row.context) || !row.counts || typeof row.counts !== "object" || Array.isArray(row.counts)) return undefined;
-	return {
-		context: row.context,
-		counts: row.counts as Record<string, number>,
-		lastSeen: typeof row.lastSeen === "number" ? row.lastSeen : 0,
-	};
-}
-
-function contextKey(context: readonly string[]): string {
-	return JSON.stringify(context);
+function decayedCount(value: TargetCount, sequence: number, halfLife: number): number {
+	return !Number.isFinite(sequence) || !Number.isFinite(halfLife) || halfLife <= 0 ? value.count
+		: value.count * 2 ** (-Math.max(0, sequence - value.lastSeen) / halfLife);
 }

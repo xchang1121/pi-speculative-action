@@ -1,3 +1,42 @@
+export type CompletionWaitResult<T> = { readonly status: "completed"; readonly value: T } | { readonly status: "aborted" } | { readonly status: "deadline" };
+
+/** Actor joins supply cancellation only; source production and teardown may impose their own deadline. */
+export function waitForCompletion<T>(promise: Promise<T>, signal?: AbortSignal): Promise<Exclude<CompletionWaitResult<T>, { status: "deadline" }>>;
+export function waitForCompletion<T>(promise: Promise<T>, signal: AbortSignal | undefined, timeoutMs: number | undefined): Promise<CompletionWaitResult<T>>;
+export async function waitForCompletion<T>(promise: Promise<T>, signal?: AbortSignal, timeoutMs?: number): Promise<CompletionWaitResult<T>> {
+	if (signal?.aborted) { void promise.catch(() => undefined); return { status: "aborted" }; }
+	const bounded = timeoutMs !== undefined && Number.isFinite(timeoutMs);
+	if (!signal && !bounded) return { status: "completed", value: await promise };
+	return new Promise((resolve, reject) => {
+		let settled = false, timer: ReturnType<typeof setTimeout> | undefined;
+		const finish = (complete: () => void) => {
+			if (settled) return;
+			settled = true; clearTimeout(timer); signal?.removeEventListener("abort", aborted); complete();
+		};
+		const aborted = () => finish(() => resolve({ status: "aborted" }));
+		signal?.addEventListener("abort", aborted, { once: true });
+		if (bounded) timer = setTimeout(() => finish(() => resolve({ status: "deadline" })), Math.max(0, timeoutMs));
+		void promise.then(value => finish(() => resolve({ status: "completed", value })), error => finish(() => reject(error)));
+	});
+}
+
+/** Tracks owned asynchronous work, including tasks added while earlier work settles. */
+export class PendingTasks {
+	private readonly work = new Set<Promise<unknown>>();
+
+	track<Value>(task: Promise<Value>): Promise<Value> {
+		if (this.work.has(task)) return task;
+		this.work.add(task);
+		const settled = () => { this.work.delete(task); };
+		void task.then(settled, settled);
+		return task;
+	}
+
+	async drain(): Promise<void> {
+		while (this.work.size) await Promise.allSettled(this.work);
+	}
+}
+
 /**
  * Serializes lifecycle mutations for one reusable runtime session.
  *
@@ -5,10 +44,9 @@
  * synchronously, runs exactly one final operation after already-admitted work, and makes later
  * callers join that same completion instead of starting a second teardown.
  */
-export class RuntimeLifecycleLane {
+export class RuntimeLifecycleLane extends PendingTasks {
 	private tail: Promise<void> = Promise.resolve();
 	private closeTask?: Promise<void>;
-	private readonly work = new Set<Promise<unknown>>();
 	private readonly released = new WeakMap<object, Promise<void>>();
 
 	get sealed(): boolean {
@@ -38,14 +76,6 @@ export class RuntimeLifecycleLane {
 		return this.track(this.enqueue(operation));
 	}
 
-	track<Value>(task: Promise<Value>): Promise<Value> {
-		if (this.work.has(task)) return task;
-		this.work.add(task);
-		const settled = () => { this.work.delete(task); };
-		void task.then(settled, settled);
-		return task;
-	}
-
 	release(resource?: { readonly dispose: () => void | Promise<void> }): Promise<void> {
 		if (!resource) return Promise.resolve();
 		const existing = this.released.get(resource);
@@ -55,10 +85,6 @@ export class RuntimeLifecycleLane {
 		}));
 		this.released.set(resource, task);
 		return task;
-	}
-
-	async drain(): Promise<void> {
-		while (this.work.size) await Promise.allSettled(this.work);
 	}
 
 	private enqueue<Value>(operation: () => Value | Promise<Value>): Promise<Value> {

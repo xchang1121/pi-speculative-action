@@ -36,6 +36,12 @@ test.each(["valid", "low confidence", "HTTP failure"])("runs a sidecar fork over
 		coordinator.observeActorOutput({ type: "text_delta", contentIndex: 0, delta: "Inspect the file.", partial: undefined as never });
 		const calls = (await batches).flatMap(batch => batch.calls.map(({ tool, input }) => ({ tool, input })));
 		expect(calls).toEqual(mode === "valid" ? [{ tool: "read", input: { path: "notes.txt" } }] : []);
+		settings.enabled = false; coordinator.reset();
+		coordinator.observePredictionSettlement({ sessionID: "session", turnID: "turn", tool: "read", settlement: {
+			prediction: { id: "prediction", source: "self-speculation", proposalID: "proposal", actionID: "action" },
+			observation: "observed", actorAction: { id: "call", sequence: 1, decisionSequence: 1, turnID: "turn" }, match: { matched: false },
+		} });
+		expect(coordinator.snapshot().actionEvidenceObservations).toBe(1);
 		await coordinator.dispose();
 		const fork = requests.find(request => request.path === settings.forkPath);
 		expect(fork?.body).toMatchObject({ request_id: "actor-request", context: { provider_payload: payload } });

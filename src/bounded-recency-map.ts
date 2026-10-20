@@ -1,14 +1,10 @@
 /** Fixed-entry LRU map used for derived state that is always safe to recompute. */
 export class BoundedRecencyMap<Key, Value> {
 	private readonly entriesValue = new Map<Key, Value>();
-	readonly capacity: number;
+	private readonly capacity: number;
 
 	constructor(capacity: number) {
 		this.capacity = Math.max(1, Math.floor(capacity));
-	}
-
-	get size(): number {
-		return this.entriesValue.size;
 	}
 
 	get(key: Key): Value | undefined {
@@ -16,6 +12,15 @@ export class BoundedRecencyMap<Key, Value> {
 		if (value === undefined && !this.entriesValue.has(key)) return undefined;
 		this.entriesValue.delete(key);
 		this.entriesValue.set(key, value as Value);
+		return value;
+	}
+
+	/** Cache factory results, including undefined; factory errors propagate. */
+	getOrCreate(key: Key, create: () => Value): Value {
+		const cached = this.get(key);
+		if (cached !== undefined || this.entriesValue.has(key)) return cached as Value;
+		const value = create();
+		this.set(key, value);
 		return value;
 	}
 

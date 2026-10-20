@@ -1,53 +1,77 @@
-import { captureProcessContext, outputStatusFlags, routedProcessContext, validProcessContext, type ProcessExecutionContext } from "./process-context.mjs";
+import { isSafeCount } from "./number-utils.ts";
+import { captureProcessContext, processLaunchOptions, routedProcessIdentity, validProcessContext, type ProcessExecutionContext, type ProcessLaunchOptions } from "./process-context.mjs";
 import { execFile, spawn } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomBytes } from "node:crypto";
 import { on, once } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
-import { constants as fsConstants } from "node:fs";
+import { constants as fsConstants, readFileSync, type BigIntStats } from "node:fs";
 import { chmod, copyFile, lstat, mkdir, mkdtemp, open, readFile, readdir, readlink, rm, stat, writeFile, type FileHandle } from "node:fs/promises";
-import { readFileSync } from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { finished } from "node:stream/promises";
 import { errorMessage, isMissing as missing } from "./error-utils.ts";
-import { stableEqual } from "./stable-json.ts";
+import { isRecord, stableEqual } from "./stable-json.ts";
 import { TimelineInterval, type TimelineDependency } from "./task-timing.ts";
-import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
+import { RuntimeLifecycleLane, waitForCompletion } from "./runtime-lifecycle.ts";
 import { ResourceObjectInputs } from "./agent-execution-world.ts";
-import { certificateReplayable, createExecPrototype, digestObject, dynamicDependencyIdentity, type DynamicDependency, type DynamicDependencyCertificate, type ExecPrototype,
-	type ExitOutcome, filesystemMetadataDigest, filesystemObservationDigest, ONE_SHOT_TAINTS, type OrderedEffectEvent, type OFDPosition, type ProcessProducerProof,
-	type ProcessProvenanceCertificate, type ProcessResultRecord, processWeakKey, type ProvenanceTaint, sealProcessCertificate, sha256Digest,
-	type Sha256Digest, type WorkspaceEffectState } from "./provenance-certificate.ts";
-import { captureAbsenceDependency, captureDirectoryDependency, captureFileDependency, observeProcessInputs,
-	validateDynamicDependencyCertificate } from "./provenance-validation.ts";
-import { captureWorkspaceStructure, diffWorkspaceStructures, ExecutionPathProjection, hydrateWorkspaceFileEntry, snapshotDependency, type WorkspaceStructureSnapshot,
-	type WorkspaceTransactionDiff, type WorkspaceTreeEntry } from "./process-observation.ts";
+import {
+	certificateReplayable, createExecPrototype, dynamicDependencyIdentity, type DependencyRole, type DynamicDependency, type DynamicDependencyCertificate,
+	type ExecPrototype, type ExitOutcome, ONE_SHOT_TAINTS, type OrderedEffectEvent, type OFDPosition, type ProcessProducerProof,
+	type ProcessProvenanceCertificate, type ProcessResultRecord, processWeakKey, type ProvenanceTaint, sealProcessCertificate,
+	type WorkspaceEffectState,
+} from "./provenance-certificate.ts";
+import { digestObject, sha256Digest, type Sha256Digest } from "./stable-value-hash.ts";
+import {
+	filesystemMetadataDigest, filesystemObservationDigest, FILESYSTEM_METADATA_FIELDS, assertNoSymlinkPath, captureFileDigest, captureFilesystemEntry, captureStableFile,
+	hashExecutableFile, mapFilesystem, rememberCapture, sameFilesystemIdentity, sharedWalk, walkFilesystemPath, type StableFilesystemCapture,
+} from "./filesystem-evidence.ts";
+import {
+	captureAbsenceDependency, captureDirectoryDependency, captureFileDependency, observeProcessInputs, validateDynamicDependencyCertificate,
+} from "./provenance-validation.ts";
+import {
+	captureWorkspaceStructure, captureWorkspaceFileAliases, diffWorkspaceStructures, ExecutionPathProjection, hydrateWorkspaceFileEntry, snapshotDependency,
+	type WorkspaceStructureSnapshot, type WorkspaceTransactionDiff,
+} from "./process-observation.ts";
 import { definedProcessEnvironment, type ProcessRouteSnapshot, type ProcessExecutionRequest,
 	type ProcessExecutor } from "./process-execution.ts";
 import { EffectCommitFailure, effectCommitFailure, isPoisonedEffectCommit } from "./effect-transaction.ts";
-import { execHostText as execText, resolveHostExecutable } from "./executable-path.ts";
-import { assertNoSymlinkPath, cachedCapture, captureFilesystemEntry, captureStableFile, hashExecutableFile, mapFilesystem, rememberCapture, sameFilesystemIdentity, sharedWalk, walkFilesystemPath } from "./filesystem-evidence.ts";
-import { captureHeldDescriptorInputs, inspectHeldExecProcess, LinuxHeldExecBoundary, listenUnixSocket, writeProcessChannel, resolveLinuxExecHelper, type HeldExecDecision,
-	type HeldExecProcess, type HeldExecSnapshot, type HeldExecTiming, type HeldExecClock, descriptorInputs, descriptorEffects, inheritedTracer, type ProcessResourceGraph } from "./linux-held-exec.ts";
-import { emptyWorldReuseMetrics, snapshotExecutionScope, type ExecutionScope, type ExecutionOperationAdoption, type ExecutionResourceContext, type ExecutionOperationBinding, type ExecutionWorldStorageControl,
-	type WorldReuseMetrics } from "./execution-world.ts";
+import { execHostFile, execHostText as execText, resolveHostExecutable } from "./executable-path.ts";
+import {
+	captureHeldDescriptorInputs, inspectHeldExecProcess, LinuxHeldExecBoundary, listenUnixSocket, writeProcessChannel, resolveLinuxExecHelper,
+	type HeldExecDecision, type HeldExecProcess, type HeldExecSnapshot, type HeldExecTiming, type HeldExecClock, type HeldFileDescriptor,
+	descriptorInputs, descriptorEffects, inheritedTracer, type ProcessResourceGraph,
+} from "./linux-held-exec.ts";
+import {
+	emptyWorldReuseMetrics, snapshotExecutionScope, type ExecutionScope, type ExecutionOperationAdoption, type ExecutionResourceContext,
+	type ExecutionOperationBinding, type ExecutionWorldStorageControl, type WorldReuseMetrics,
+} from "./execution-world.ts";
 import { type ProcessReusePlan, ProcessReusePlanner } from "./reuse-planner.ts";
 import { ProvenanceCertificateStore, type ProvenanceStoreOptions, type VerifiedArtifactClosure } from "./reuse-store.ts";
-import { waitForCompletion } from "./scheduler.ts";
-import { observeStrace, straceCommand, traceTail, type ObservedProcessPath, type StraceObservation, type TraceTail, type TracedWrite, writesWithin } from "./strace-observer.ts";
+import {
+	observeStrace, straceCommand, traceTail, type StraceObservation, type TraceTail, type TracedWrite, writesWithin,
+} from "./strace-observer.ts";
 import type { WorkspaceTransactionCapture, WorkspaceTransactionDelta, WorkspaceTransactionOwnership } from "./workspace-transaction.ts";
 import type { ToolProcessInvocation } from "./tool-settlement.ts";
 import type { ResourceValidation } from "./settlement.ts";
-import { ProcessHandoffOwnership, ProcessHandoffRegistry, sameScope, type ProcessContinuation, type ProcessExecutionBinding, type ProcessHandoff, type ProcessHandoffBorrow, type ProcessHandoffLender } from "./process-handoff.ts";
-import { SynchronousProcessObserver, serializeNativeDependency, restoreNativeDependency, type SerializedProcessBinding, type SynchronousProcessRequest, type SynchronousProcessResult } from "./linux-process-sync.ts";
-import { WorkspaceSandboxService, nativeWorkspaceOwner, nativeWorkspaceObservation, readSandboxDirectoryState, restoreModifiedTimes, sameSandboxState, useModifiedTimesHelper, type SandboxDirectoryChange,
-	type SandboxWorkspaceChange, type SandboxWorkspaceContext } from "./workspace-sandbox.ts";
+import {
+	ProcessHandoffOwnership, ProcessHandoffRegistry, sameScope, type ProcessContinuation, type ProcessExecutionBinding, type ProcessHandoff,
+	type ProcessHandoffBorrow, type ProcessHandoffLender,
+} from "./process-handoff.ts";
+import {
+	SynchronousProcessObserver, serializeNativeDependency, restoreNativeDependency, type SerializedProcessBinding, type SynchronousProcessRequest,
+	type SynchronousProcessResult,
+} from "./linux-process-sync.ts";
+import {
+	WorkspaceSandboxService, nativeWorkspaceOwner, nativeWorkspaceObservation, readSandboxDirectoryState, restoreModifiedTimes, sameSandboxState,
+	useModifiedTimesHelper, type SandboxDirectoryState, type SandboxWorkspaceChange, type SandboxWorkspaceContext,
+} from "./workspace-sandbox.ts";
 import { containsFilesystemPath as pathContains, relativeFilesystemPath, slash } from "./path-utils.ts";
 
 // Certificates are meaningful only under the implementation that collected and authorized their proof.
-const OBSERVER_FINGERPRINT = digestObject(["linux-process-backend", "strace-observer", "reuse-planner", "reuse-store", "provenance-certificate", "provenance-validation"]
+const OBSERVER_FINGERPRINT = digestObject(["linux-process-backend", "strace-observer", "reuse-planner", "reuse-store",
+	"provenance-certificate", "provenance-validation", "filesystem-evidence", "stable-value-hash"]
 	.map(name => sha256Digest(readFileSync(new URL(`./${name}.${import.meta.url.endsWith(".ts") ? "ts" : "js"}`, import.meta.url)))));
 const POLICY_ID = "sandlock-virtual-root-transparent-exec-creation-mode";
 const LEAF_POLICY_ID = "sandlock-virtual-workspace-leaf-creation-mode";
@@ -111,40 +135,31 @@ export interface LinuxProcessSession {
 
 type ReadyBackend = Awaited<ReturnType<LinuxProcessReuseBackend["probe"]>>;
 
-interface SandboxMount { readonly virtualPath: string; readonly hostPath: string; readonly readOnly: boolean; }
-
 interface ExecMount { readonly virtualPath: string; readonly hostPath: string; }
 
-interface DispatcherRequest {
+interface SandboxMount extends ExecMount { readonly readOnly: boolean; }
+
+interface DispatcherRequest extends Required<Pick<HeldExecSnapshot, "invocation" | "cwd" | "environment">> {
 	readonly token: string;
-	readonly invocation: readonly [path: string, comm: string];
 	readonly argv0: string;
 	readonly args: readonly string[];
-	readonly cwd: string;
-	readonly environment: Readonly<Record<string, string>>;
 	readonly context: ProcessExecutionContext;
 	/** The successfully installed image, held before its first user instruction. */
 	readonly pid: number;
 	/** Inherited pipes beyond stdio as the launcher sees them now: each end, and its queue unconsumed. */
-	readonly descriptors?: readonly { readonly fd: number; readonly alias: number; readonly device: string; readonly inode: string; readonly flags: number;
-		readonly capacity: number; readonly eof: boolean; readonly queueHex: string }[];
+	readonly descriptors?: readonly Required<Pick<HeldFileDescriptor, "fd" | "alias" | "device" | "inode" | "flags" | "capacity" | "eof" | "queueHex">>[];
 }
 
-/** The outlet each target output uses; 0 discards into /dev/null. */
-type OutputRoute = readonly [0 | 1 | 2, 0 | 1 | 2];
-type RequestEligibility = { readonly route: OutputRoute; readonly outputPipes?: readonly [boolean, boolean]; readonly outputFlags?: readonly [number, number] } | { readonly reason: string };
 /** A brokered run's net effect on an inherited pipe of one repeated byte, applied by the launcher to its own end. */
 type StreamSettlement = { readonly fd: number; readonly kind: "i" | "o"; readonly data: Buffer };
-type ProcessArguments = Pick<DispatcherRequest, "argv0" | "args" | "cwd" | "environment"> & {
+type ProcessArguments = Pick<DispatcherRequest, "argv0" | "args" | "cwd" | "environment"> & ProcessLaunchOptions & {
 	readonly invocation?: readonly [path: string, comm: string];
 	readonly imageSource?: string;
-	readonly closeStdin?: boolean; readonly resources?: ProcessResourceGraph; readonly outputPipes?: readonly [boolean, boolean]; readonly streams?: true; // inherited pipes the launcher holds and settles
-	/** Status flags its parent set on its outputs, which its launcher sets again. */
-	readonly outputFlags?: readonly [number, number];
+	readonly resources?: ProcessResourceGraph; readonly streams?: true; // inherited pipes the launcher holds and settles
 };
 type BoundProcessInvocation = ProcessArguments & {
 	readonly sourceRoot: string; readonly executable: string;
-	readonly outputRoute: OutputRoute; readonly producer?: ProcessProducerProof;
+	readonly producer?: ProcessProducerProof;
 };
 export type NativeProcessInvocation = BoundProcessInvocation | { readonly trackingOnly: true; readonly sourceRoot: string };
 
@@ -152,9 +167,8 @@ interface BufferedOutput { readonly fd: 1 | 2; readonly data: Buffer; }
 
 interface DispatcherResponse {
 	readonly kind: "hit" | "executed" | "bypass" | "suspended";
-	readonly output?: readonly { readonly fd: 1 | 2; readonly data: string }[];
+	readonly output?: readonly BufferedOutput[];
 	readonly exit?: ExitOutcome;
-	readonly weakKey?: Sha256Digest;
 	readonly streams?: readonly StreamSettlement[];
 	/** Present only after a sealed result was registered; independent of optional disk publication. */
 	readonly reusable?: boolean;
@@ -162,7 +176,7 @@ interface DispatcherResponse {
 
 /** A brokered run writing into a session's workspace: its launcher's pid and, once known, what it and the runs brokered from its tree wrote. */
 interface SessionWriter {
-	readonly id: string; readonly owner: string; readonly startedAt: number; endedAt?: number; writes?: readonly TracedWrite[]; tail?: TraceTail;
+	readonly id: string; readonly owner: string; readonly startedAt: number; endedAt?: number; writes?: readonly TracedWrite[]; tail?: TraceTail; unsafe?: boolean;
 	readonly pid?: number; written?: readonly string[]; external?: readonly string[]; descendants?: readonly SessionWriter[];
 	observed?: ReadonlyMap<string, number>; evidence?: DynamicDependencyCertificate; observation?: StraceObservation;
 }
@@ -170,12 +184,14 @@ interface SessionWriter {
 const workspaceWriters = new WeakMap<SandboxWorkspaceContext["transactions"], Set<SessionWriter>>();
 
 type ActiveSession = Awaited<ReturnType<LinuxProcessReuseBackend["allocateSession"]>>["session"];
+type PrivatePrestate = Awaited<ReturnType<typeof privateBranch>> & { readonly startedAt: number; readonly entries: Map<string, BigIntStats>; readonly files: Map<string, StableFilesystemCapture>; structure?: WorkspaceStructureSnapshot };
 
 interface SpawnOutcome { readonly code: number | null; readonly signal: NodeJS.Signals | null; readonly output: readonly BufferedOutput[]; }
 
 type ReadyProcessPlan = Exclude<ProcessReusePlan, { kind: "miss" }>;
 interface NativeObservation {
 	readonly scope?: ExecutionScope; ordering: Int32Array; closed: boolean; readonly learn: boolean; pending: number;
+	readonly reuseEnabled: boolean;
 	readonly learned: Map<number, number>; readonly inputs?: ResourceObjectInputs;
 	readonly bindings: Map<number, ProcessExecutionBinding>; readonly computations: TimelineDependency[]; readonly heldClock: ActorHeldClock;
 	readonly metrics: MutableLinuxProcessReuseMetrics; readonly adoptions: SynchronousProcessResult["adoptions"][number][]; claims?: Int32Array;
@@ -190,11 +206,11 @@ export class LinuxProcessReuseBackend {
 	/** Keep actual completed launches and acknowledged adoptions in their enclosing native call's order. */
 	async observeBindings<Value>(scope: ExecutionScope, execute: () => Promise<Value>,
 		observe: (bindings: readonly ProcessExecutionBinding[], computations: readonly TimelineDependency[]) => void, learn = false,
-		inputs?: ((path?: string) => Iterable<object>) | ResourceObjectInputs): Promise<Value> {
+		inputs?: ((path?: string) => Iterable<object>) | ResourceObjectInputs, reuseEnabled = true): Promise<Value> {
 		const observation: NativeObservation = { scope: snapshotExecutionScope(scope), ordering: new Int32Array(new SharedArrayBuffer(4)), closed: false,
-			learn, pending: 0, learned: new Map<number, number>(), inputs: typeof inputs === "function" ? new ResourceObjectInputs(inputs) : inputs,
+			learn, reuseEnabled, pending: 0, learned: new Map<number, number>(), inputs: !reuseEnabled ? undefined : typeof inputs === "function" ? new ResourceObjectInputs(inputs) : inputs,
 			bindings: new Map<number, ProcessExecutionBinding>(), computations: [] as TimelineDependency[],
-			heldClock: new ActorHeldClock(), metrics: { ...emptyWorldReuseMetrics() }, adoptions: [] };
+			heldClock: new ActorHeldClock(), metrics: emptyWorldReuseMetrics(), adoptions: [] };
 		try { return await this.observations.run(observation, execute); }
 		finally {
 			observation.closed = true;
@@ -214,8 +230,8 @@ export class LinuxProcessReuseBackend {
 	private synchronous?: SynchronousProcessObserver;
 	private disposed = false;
 	private readonly handoffs: ProcessHandoffRegistry<NativeProcessInvocation>;
-	private readonly counters: MutableLinuxProcessReuseMetrics = { ...emptyWorldReuseMetrics() };
-	private readonly actorCounters: MutableLinuxProcessReuseMetrics = { ...emptyWorldReuseMetrics() };
+	private readonly counters: MutableLinuxProcessReuseMetrics = emptyWorldReuseMetrics();
+	private readonly actorCounters: MutableLinuxProcessReuseMetrics = emptyWorldReuseMetrics();
 	private readonly replayWorkspace = new WorkspaceSandboxService();
 	private disposal?: Promise<void>;
 	private producers = 0;
@@ -271,7 +287,7 @@ export class LinuxProcessReuseBackend {
 		return Object.freeze(metrics);
 	}
 	producerMetrics(): LinuxProcessReuseMetrics { return { ...this.counters }; }
-	processOwner(): SynchronousProcessObserver {
+	private processOwner(): SynchronousProcessObserver {
 		if (this.disposed) throw new Error("native process backend disposed");
 		return this.synchronous ??= new SynchronousProcessObserver(this.options);
 	}
@@ -413,7 +429,7 @@ export class LinuxProcessReuseBackend {
 			inputs = observation?.inputs?.lend(Math.min(MAX_REQUEST_BYTES / 2, this.store.limits.maxBytes));
 			observer = this.processOwner();
 			const attachment = observer.attach({ gate: options.gate, scope: options.scope, sourceRoot: options.sourceRoot, descriptors: options.descriptors,
-				skipRoot: options.skipRoot, asynchronous: options.asynchronous, learn: !!observation?.learn, handoffs: loan.transfer, inputs: inputs?.transfer,
+				skipRoot: options.skipRoot, asynchronous: options.asynchronous, learn: !!observation?.learn, reuseEnabled: observation?.reuseEnabled, handoffs: loan.transfer, inputs: inputs?.transfer,
 				owners: observer.grants(options.scope), claims: claims.buffer as SharedArrayBuffer, ordering: observation?.ordering.buffer as SharedArrayBuffer | undefined,
 				lender: options.asynchronous ? this.localSource.buffer as SharedArrayBuffer : undefined },
 				options.asynchronous ? delta => this.replayWorkspace.commitDelta(delta) : undefined, options.asynchronous ? loan.borrow : undefined);
@@ -491,7 +507,7 @@ export class LinuxProcessReuseBackend {
 			await this.observeBindings(request.scope!, execute, (_observed, dependencies) => {
 				bindings = [...observation!.bindings].flatMap(([sequence, binding]) => this.serializeBinding(binding, sequence) ?? []);
 				computations = dependencies.flatMap(dependency => { const serialized = serializeNativeDependency(dependency); return serialized ? [serialized] : []; });
-			}, request.learn && !!request.scope, received?.inputs);
+			}, request.learn && !!request.scope, received?.inputs, request.reuseEnabled);
 			loan = received?.inputs.lend(maxBytes);
 			return { result: { bindings, computations, adoptions: observation!.adoptions, metrics: observation!.metrics, inputs: loan?.transfer },
 				release: () => { loan?.release(); return received?.dispose(); } };
@@ -516,7 +532,7 @@ export class LinuxProcessReuseBackend {
 		const acceptProducer = (producer: ProcessProducerProof) => actorReplayProducer(producer, sensitivePaths(this.options.storeRoot, this.options.deniedPaths));
 		return {
 			execute: async (request) => {
-				if (this.disposed || process.platform !== "linux" || !pathContains(sourceRoot, request.cwd)) return execute(request);
+				if (this.disposed || this.observations.getStore()?.reuseEnabled === false || process.platform !== "linux" || !pathContains(sourceRoot, request.cwd)) return execute(request);
 				this.add(undefined, "wholeCommandRequests");
 				const result = await TimelineInterval.outside(async () => {
 				let committed = false;
@@ -532,7 +548,7 @@ export class LinuxProcessReuseBackend {
 					const plan = await this.plan(weakKey, prototype.executablePath, projection, acceptProducer, { signal: request.signal });
 					if (this.disposed || !plan?.certificate.result.exit) return;
 					request.signal?.throwIfAborted();
-					await replayFilesystemEffects(this.replayWorkspace, plan.artifacts, plan.certificate.result.journal, projection, sourceRoot);
+					await replayFilesystemEffects(this.replayWorkspace, plan.artifacts, plan.certificate.result.journal, projection);
 					committed = true;
 					for (const event of loadOutputEvents(plan.artifacts, plan.certificate.result.journal)) request.onData(event.data);
 					const observation = this.observations.getStore();
@@ -612,37 +628,37 @@ export class LinuxProcessReuseBackend {
 					const { output: prototype, computation: preparation } = await TimelineInterval.outside(() => TimelineInterval.measure(() =>
 						topLevelProcessPrototype(invocation, request, environment, session.projection, ready.platformFingerprint)));
 					this.add(session, "wholeCommandRequests");
-					const result = await this.executeRequest(session, { argv0: invocation.shell, args: shellArguments(invocation, request.command), cwd: physicalCwd, environment },
-						invocation.shell, [1, 2], -session.metrics.wholeCommandRequests, prototype, true, undefined, preparation, request);
-					if (result.kind === "hit") for (const event of result.output ?? []) request.onData(Buffer.from(event.data, "base64"));
+					const result = await this.executeRequest(session, { argv0: invocation.shell, args: shellArguments(invocation, request.command), cwd: physicalCwd, environment, outputRoute: [1, 2] },
+						invocation.shell, -session.metrics.wholeCommandRequests, prototype, true, undefined, preparation, request);
+					if (result.kind === "hit") for (const event of result.output ?? []) request.onData(event.data);
 					return { exitCode: result.exit?.kind === "code" ? result.exit.code : null };
 				}) },
 				executeBinding: binding => execute("operation", async () => {
 					const invocation = this.boundInvocation(binding, session.scope);
 					if (invocation.sourceRoot !== session.sourceRoot ||
-						invocation.producer && !compatibleProducer(session.nestedProducer, invocation.producer))
+						invocation.producer && !stableEqual(session.nestedProducer, invocation.producer))
 						throw new Error("process execution binding is unavailable in this scope");
 					const { output: { request, executable, prototype }, computation: preparation } = await TimelineInterval.outside(() =>
 						TimelineInterval.measure(() => this.boundRequest(binding, invocation, session.projection, session.signal)));
 					const resultsBefore = session.preparedResults;
 					this.add(session, "requests");
-					const result = await this.executeRequest(session, request, executable, invocation.outputRoute, session.metrics.requests, prototype, true, undefined, preparation);
+					const result = await this.executeRequest(session, request, executable, session.metrics.requests, prototype, true, undefined, preparation);
 					session.signal.throwIfAborted();
 					if (!invocation.producer && !invocation.resources && result.kind === "executed" && result.reusable === false &&
 						session.preparedResults === resultsBefore) {
-						throw new Error(`bound process preparation produced no reusable result${session.metrics.lastError ? `: ${session.metrics.lastError.slice(0, 4096)}` : ""}`);
+						throw new Error(`bound process preparation produced no reusable result${session.metrics.lastError ? `: ${session.metrics.lastError}` : ""}`);
 					}
-					return { output: (result.output ?? []).map(({ fd, data }) => ({ fd, data: Buffer.from(data, "base64") })),
+					return { output: result.output ?? [],
 						...(result.kind === "suspended" ? { suspended: true as const } : { exit: result.exit! }) };
 				}),
 				metrics: () => Object.freeze({ ...session.metrics }),
 				seal: _changes => session.sealPromise ??= this.withProducer(async () => {
 					await session.lifecycle.drain();
-					const external = await privateCommits(path.join(session.processRoot, "private"), session.privateSince ?? 0,
+					const external = await privateCommits(session, session.privateSince ?? 0,
 						sessionWriters(session).flatMap(writer => writer.external ?? []));
 					// Adopting without them would leave the host unlike the native run: the Actor runs it instead.
-					if (external.unrepresentable.length) throw new Error(`unrepresentable writes outside the workspace: ${external.unrepresentable.join(",")}`);
-					return [...await sealSessionEvidence(session), ...external.changes];
+					if (!external.complete) throw new Error(`unrepresentable writes outside the workspace: external_write:${[...external.before].find(([, value]) => !value)?.[0]}`);
+					return [...await sealSessionEvidence(session, external), ...external.changes];
 				}),
 				validate: () => validateTransferredProcessEvidence(session.topLevelEvidence, session.incompleteReasons),
 				close: () => session.lifecycle.close(async () => {
@@ -666,7 +682,7 @@ export class LinuxProcessReuseBackend {
 		const readyAt = performance.now();
 		input.signal?.throwIfAborted();
 		const sourceRoot = path.resolve(input.sourceRoot);
-		const projection = new ExecutionPathProjection({ sourceRoot, workspaceRoot: input.workspace.sandboxRoot, privateRoot: input.workspace.processRoot });
+		const projection = new ExecutionPathProjection({ sourceRoot, workspaceRoot: input.workspace.sandboxRoot });
 		const invocation = "environment" in input.invocation ? input.invocation : undefined;
 		const bound = "environment" in input.invocation ? undefined : this.boundInvocation(input.invocation, input.scope);
 		if (bound && bound.sourceRoot !== sourceRoot) throw new Error("bound process workspace changed");
@@ -703,7 +719,7 @@ export class LinuxProcessReuseBackend {
 			tracers: new Set<number>(),
 			// Concurrent writers retain their live trace or settled writes for ownership attribution.
 			writers: workspaceWriterRecords(input.workspace), observationOwner: nativeWorkspaceObservation(input.workspace),
-			metrics: { ...emptyWorldReuseMetrics() },
+			metrics: emptyWorldReuseMetrics() as MutableLinuxProcessReuseMetrics,
 			transaction: undefined as Promise<WorkspaceTransactionCapture> | undefined,
 			capture: undefined as Promise<WorkspaceTransactionDelta> | undefined,
 			topLevelEvidence: undefined as DynamicDependencyCertificate | undefined,
@@ -847,12 +863,11 @@ export class LinuxProcessReuseBackend {
 			this.add(session, "requests");
 			const requestID = session.metrics.requests, ready = await this.resolveReady();
 			const resources = request.descriptors?.length ? await this.inheritedPipes(request).catch((error: unknown) => `inherited_pipes:${errorMessage(error)}`) : undefined;
-			const eligibility = typeof resources === "string" ? { reason: resources } : await eligibleRequest(session, request, ready.executionContext);
-			if ("reason" in eligibility) { this.add(session, "bypasses"); return { kind: "bypass" }; }
+			const eligibility = typeof resources === "string" ? resources : eligibleRequest(session, request, ready.executionContext);
+			if (typeof eligibility === "string") { this.setError(session, `process_bypass:${eligibility}`, "bypasses"); return { kind: "bypass" }; }
 			const { argv0, args, environment, invocation } = request;
-			return await this.executeRequest(session, { argv0, args, cwd, environment, invocation, imageSource, ...(request.context.descriptorTypes[0] === "closed" ? { closeStdin: true } : {}), ...(typeof resources === "object" ? { resources, streams: true as const } : {}),
-				...(eligibility.outputPipes ? { outputPipes: eligibility.outputPipes } : {}), ...(eligibility.outputFlags ? { outputFlags: eligibility.outputFlags } : {}) },
-				executable, eligibility.route, requestID, undefined, undefined, request.pid);
+			return await this.executeRequest(session, { argv0, args, cwd, environment, invocation, imageSource, ...eligibility,
+				...(typeof resources === "object" ? { resources, streams: true as const } : {}) }, executable, requestID, undefined, undefined, request.pid);
 		} finally { await image.close(); }
 	}
 
@@ -866,24 +881,25 @@ export class LinuxProcessReuseBackend {
 		Math.min(MAX_REQUEST_BYTES / 2, this.store.limits.maxBytes), sensitivePaths(this.options.storeRoot, this.options.deniedPaths));
 	}
 
-	private async executeRequest(session: ActiveSession, request: ProcessArguments, executable: string, outputRoute: OutputRoute,
+	private async executeRequest(session: ActiveSession, request: ProcessArguments, executable: string,
 		requestID: number, prototype?: ExecPrototype,
 		captureWorkspace?: true, inPlace?: number, preparation?: TimelineInterval, outlet?: ProcessExecutionRequest): Promise<DispatcherResponse> {
 		return measureProcess(session, async () => {
+			const { outputRoute } = request;
 			const signal = AbortSignal.any([session.signal, ...(outlet?.signal ? [outlet.signal] : [])]); signal.throwIfAborted();
 			const captured = prototype ? { output: prototype, computation: preparation }
-				: await TimelineInterval.outside(() => TimelineInterval.measure(() => this.prototype(session.projection, request, executable, outputRoute)));
+				: await TimelineInterval.outside(() => TimelineInterval.measure(() => this.prototype(session.projection, request, executable)));
 			preparation = captured.computation;
 			const observedPrototype = captured.output, weakKey = processWeakKey(observedPrototype), executablePath = observedPrototype.executablePath;
 			const acquired = await TimelineInterval.outside(() => this.handoffs.acquire({
 				key: weakKey, signal, scope: session.scope, role: "producer", ownership: session.ownership, executablePath,
-				lookup: (live, excludedCertificates, artifacts) => this.plan(weakKey, executablePath, session.projection, (candidate) => compatibleProducer(outlet ? session.producer : session.nestedProducer, candidate), { session, live, excludedCertificates, artifacts, signal }),
+				lookup: (live, excludedCertificates, artifacts) => this.plan(weakKey, executablePath, session.projection, candidate => stableEqual(outlet ? session.producer : session.nestedProducer, candidate), { session, live, excludedCertificates, artifacts, signal }),
 			}));
 			if (acquired.kind === "hit" && acquired.plan.kind === "completed_replay") {
 				const plan = acquired.plan, binding = acquired.producer?.binding;
 				return TimelineInterval.outside(async (): Promise<DispatcherResponse> => {
 					const { artifacts, certificate } = plan;
-					const output = wireOutput(loadOutputEvents(artifacts, certificate.result.journal)), computation = reusedComputation(certificate, acquired);
+					const output = loadOutputEvents(artifacts, certificate.result.journal), computation = reusedComputation(certificate, acquired);
 					const paths = certificate.result.journal.flatMap(event => event.kind === "workspace" ? [event.path] : []), startedAt = Date.now();
 					const writer: SessionWriter = { id: `${session.token}:${requestID}`, owner: session.token, startedAt, pid: inPlace, evidence: certificate.dependencyCertificate,
 						external: paths.filter(target => !pathContains(session.sourceRoot, target)),
@@ -893,7 +909,7 @@ export class LinuxProcessReuseBackend {
 							? [[slash(path.relative(session.sourceRoot, dependency.path)), startedAt] as const] : [])) };
 					session.writers.add(writer);
 					await shareSessionWriter(session, writer);
-					await replayFilesystemEffects(this.replayWorkspace, artifacts, certificate.result.journal, session.projection, session.workspace.sandboxRoot,
+					await replayFilesystemEffects(this.replayWorkspace, artifacts, certificate.result.journal, session.projection,
 						path.join(session.processRoot, "private")).then(() => acquired.settle?.(true, true), error => {
 							writer.observed = undefined; acquired.settle?.(!(error instanceof EffectCommitFailure && error.disposition === "recoverable")); throw error;
 						}).finally(async () => { writer.endedAt = Date.now(); await shareSessionWriter(session, writer); });
@@ -903,8 +919,8 @@ export class LinuxProcessReuseBackend {
 					if (observed !== undefined) this.add(session, outlet ? "wholeCommandReusedProcessMs" : "reusedProcessMs", observed);
 					const inputs = request.streams && descriptorInputs(request.resources!), streams = inputs && streamSettlement(inputs, (certificate.result.resources?.transitions ?? []).map(event => ({ alias: event.id, kind: event.kind, data: artifacts.read(event.data) })));
 					if (!outlet && binding && this.handoffs.resolveBinding(binding, session.scope)) session.executionBindings.set(requestID, binding);
-					return inputs && !streams ? { kind: "hit", weakKey, output: [], exit: { kind: "code", code: 125 } }
-						: { kind: "hit", weakKey, output, exit: certificate.result.exit, ...(streams?.length ? { streams } : {}) };
+					return inputs && !streams ? { kind: "hit", output: [], exit: { kind: "code", code: 125 } }
+						: { kind: "hit", output, exit: certificate.result.exit, ...(streams?.length ? { streams } : {}) };
 				}).finally(() => acquired.settle?.(false));
 			}
 			if (acquired.kind !== "work") throw new Error("process work reservation failed");
@@ -933,6 +949,18 @@ export class LinuxProcessReuseBackend {
 				})}`;
 				try {
 					traceRoot = await mkdtemp(path.join(session.processRoot, "trace-"));
+					const privateBefore: PrivatePrestate = { startedAt: Date.now(), ...await privateBranch(path.join(session.processRoot, "private")), entries: new Map(), files: new Map() };
+					await mapFilesystem(sessionWriters(session), async writer => writer.tail?.read());
+					let remaining = 128 * 1024 * 1024;
+					privateBefore.structure = await captureWorkspaceStructure(privateBefore.upper, { exclude: [], observeStat: async (name, stat) => {
+						if (privateBefore.entries.size >= 100_000) throw new Error("private snapshot exceeds its capture limit");
+						const target = path.resolve("/", name); privateBefore.entries.set(target, stat);
+						// A later write can overwrite the native image's working inode as well as a newly created private file.
+						if (stat.isFile() && stat.size <= BigInt(Math.min(32 * 1024 * 1024, remaining))) {
+							remaining -= Number(stat.size);
+							privateBefore.files.set(target, await captureStableFile(path.join(privateBefore.upper, name), Number(stat.size), true, { stat }));
+						}
+					} }).catch(error => { if (!missing(error) || privateBefore.entries.size) throw error; return undefined; });
 					const tracePrefix = path.join(traceRoot, "process");
 					const image = session.projection.toLogical(executable), [invokedPath, comm] = observedPrototype.invocation!, dispatcher = session.interposition;
 					const launchPath = request.imageSource ?? image, logicalCwd = session.projection.toLogical(request.cwd), live = !!captureWorkspace && !outlet && !!ready.imageLibrary;
@@ -998,7 +1026,8 @@ export class LinuxProcessReuseBackend {
 						"--",
 						dispatcher,
 						descriptorManifest ? "--exec-fds" : request.closeStdin ? "--exec-closed-input" : "--exec",
-						outputRoute.join("") + (outputPipes ? request.outputPipes!.map(pipe => pipe ? "p" : "s").join("") : "") + (request.outputFlags ? `,${request.outputFlags.join(",")}` : ""),
+						outputRoute.join("") + (outputPipes ? request.outputPipes!.map(pipe => pipe ? "p" : "s").join("") : "") +
+							(request.stackLimit !== undefined ? `:${request.stackLimit}` : "") + (request.outputFlags ? `,${request.outputFlags.join(",")}` : ""),
 						...(descriptorManifest ? [descriptorManifest, descriptorReportPath!] : []),
 						request.argv0,
 						launchPath,
@@ -1029,7 +1058,7 @@ export class LinuxProcessReuseBackend {
 					const parseFrontier = (pid: number, reply: Buffer) => {
 						const bytes = Number(reply.readBigUInt64LE(16)), begin = Number(reply.readBigUInt64LE(24)) / 1e6 - clockOffset,
 							end = Number(reply.readBigUInt64LE(32)) / 1e6 - clockOffset, fd = reply.readInt32LE(4), syscall = reply.readInt32LE(8);
-						if (reply.readInt32LE(0) !== pid || ![1, 2, 5, 6].includes(reply.readInt32LE(12)) || syscall < 0 || syscall >= 0x40000000 || !Number.isSafeInteger(bytes) || bytes <= 0 || fd < -1 ||
+						if (reply.readInt32LE(0) !== pid || ![1, 2, 5, 6].includes(reply.readInt32LE(12)) || syscall < 0 || syscall >= 0x40000000 || !isSafeCount(bytes, 1) || fd < -1 ||
 							begin < processStarted || end < begin || end > performance.now()) throw new Error("invalid native continuation frontier");
 						return { frozen: { pid, fd, writing: [1, 20, 44, 46].includes(syscall), bytes }, computation: new TimelineInterval(begin, end) };
 					};
@@ -1132,7 +1161,9 @@ export class LinuxProcessReuseBackend {
 						if (!effects.complete) unattributed = observation;
 						stage = "dependencies";
 						const observed = [observation, ...own.descendants?.flatMap(child => child.observation ?? []) ?? []];
-						const evidence = await captureDependencies(session, before, observed, effects, own.descendants?.flatMap(child => child.evidence ?? []));
+						const external = await privateCommits(session, own.startedAt,
+							observed.flatMap(part => part.external ?? []), privateBefore, [own, ...own.descendants ?? []]);
+						const evidence = await captureDependencies(session, before, observed, effects, external, own.descendants?.flatMap(child => child.evidence ?? []), privateBefore);
 						if (evidence.incompleteReasons.length) this.setError(session, `evidence:${evidence.incompleteReasons.join(",")}`);
 						const taints = new Set<ProvenanceTaint>(evidence.taints);
 						// Private images preserve FD/OFD relations, but cannot also represent an independently accessed pathname.
@@ -1140,11 +1171,8 @@ export class LinuxProcessReuseBackend {
 							path.resolve(observed.path) === descriptor.sourcePath || observed.role !== "metadata" && pathContains(observed.path, descriptor.sourcePath!)))) {
 							taints.add("untracked_fd");
 						}
-						// What it left outside the workspace commits with its workspace effects; a change no baseline can stand for does not replay.
-						const external = await privateCommits(path.join(session.processRoot, "private"), own.startedAt, observation.external ?? []);
-						if (external.unrepresentable.length) this.setError(session, `evidence:${external.unrepresentable.join(",")}`);
 						dependencyCertificate = {
-							complete: evidence.complete && !external.unrepresentable.length,
+							complete: evidence.complete,
 							dependencies: evidence.dependencies,
 							taints: [...taints],
 						};
@@ -1191,21 +1219,21 @@ export class LinuxProcessReuseBackend {
 								...(descriptorOffsets ? { resources: { ...descriptorEffects(request.resources!, descriptorOffsets), ...(resourceJournal ? { transitions } : {}) } } : {}) };
 							stage = "certificate";
 							const certificate = sealProcessCertificate({ prototype: observedPrototype, producer: outlet ? session.producer : session.nestedProducer, dependencyCertificate: dependencyCertificate!, result });
+							const transferable = certificateReplayable(certificate, [...TRANSFERRED_INPUT_TAINTS, ...SAME_CONFINEMENT_TAINTS]);
 							certificateID = certificate.id;
 							// A child can read an earlier child's private output. Its parent can prove that input from the combined
 							// transaction even when this child, considered alone against the host, could not.
-							if (!evidence.sourceComplete && observation.complete && !external.unrepresentable.length && !continuation) own.observation = observation;
+							if (!evidence.sourceComplete && observation.complete && external.complete && !continuation) own.observation = observation;
 							else own.evidence = certificate.dependencyCertificate;
 							if (taints.size) {
 								if (!outlet) this.add(session, "tainted");
-								// Keep the capture's existing reasons beside its categories. Diagnostic text never changes sealed evidence.
-								const reasons = (stage: string, values: readonly string[]) => values.slice(0, 4).map(value => `${stage}:${value.slice(0, 512)}${value.length > 512 ? "…" : ""}`)
+								// Transferable input categories must not hide existing failures. Diagnostics never change sealed evidence.
+								const reasons = (stage: string, values: readonly string[]) => values.slice(0, 4).map(value => `${stage}:${value}`)
 									.concat(values.length > 4 ? [`${stage}:more_reasons`] : []);
 								const detail = [`tainted:${[...taints].join(",")}`,
 									...(observation.unsupportedSyscalls?.length ? [`syscalls:${observation.unsupportedSyscalls.join(",")}${observation.unsupportedSyscallsTruncated ? ",…" : ""}`] : []),
-									...reasons("trace", observation.incompleteReasons), ...reasons("dependency", evidence.incompleteReasons),
-									...reasons("external", external.unrepresentable)].join("; ");
-								if (!outlet || !session.metrics.lastError) this.setError(session, detail.length > 4096 ? `${detail.slice(0, 4095)}…` : detail);
+									...reasons("trace", observation.incompleteReasons), ...reasons("dependency", evidence.incompleteReasons)].join("; ");
+								if (!session.metrics.lastError || !outlet && !transferable) this.setError(session, detail);
 							}
 							stage = "handoff_registration";
 							if (await this.handoffs.publish(weakKey, work, certificate, () => {
@@ -1223,7 +1251,7 @@ export class LinuxProcessReuseBackend {
 							}, continuation, computation)) this.add(session, outlet ? "wholeCommandPublished" : "published");
 							if (!outlet) {
 								// A sealed frontier or input seed remains useful even when its result cannot enter history.
-								reusable = !!certificate.result.continuation || certificateReplayable(certificate, [...TRANSFERRED_INPUT_TAINTS, ...SAME_CONFINEMENT_TAINTS]);
+								reusable = !!certificate.result.continuation || transferable;
 								if (reusable || request.resources || inputs.length) session.preparedResults++;
 							}
 						});
@@ -1235,20 +1263,18 @@ export class LinuxProcessReuseBackend {
 						if (unattributed?.complete && !unattributed.incompleteReasons.length && !continuation) writer!.observation = unattributed;
 						else session.incompleteReasons.add(`nested_capture:${detail}`);
 					}
-					if (continuation) return { kind: "suspended", weakKey };
+					if (continuation) return { kind: "suspended" };
 					const exit = exitOutcome(outcome);
 					const streams = request.streams && streamSettlement(inputs, executedStreams);
 					if (streams === undefined && request.streams) {
 						this.setError(session, "stream_settlement_unrepresentable");
-						return { kind: "executed", weakKey, output: [], exit: { kind: "code", code: 125 } };
+						return { kind: "executed", output: [], exit: { kind: "code", code: 125 } };
 					}
-					return { kind: "executed", weakKey, output: wireOutput(outcome.output), exit, ...(streams?.length ? { streams } : {}),
+					return { kind: "executed", output: outcome.output, exit, ...(streams?.length ? { streams } : {}),
 						...(reusable !== undefined ? { reusable } : {}) };
 				} catch (error) {
 					if (stage !== "capture" || captureWorkspace || session.signal.aborted || work.signal.aborted) throw error;
-					const detail = failureDetail(error);
-					this.add(session, "bypasses");
-					this.setError(session, detail);
+					this.setError(session, failureDetail(error), "bypasses");
 					return { kind: "bypass" };
 				} finally {
 					try { await descriptors?.close(); } catch (error) { this.setError(session, `descriptor_report_close:${errorMessage(error)}`); }
@@ -1259,7 +1285,8 @@ export class LinuxProcessReuseBackend {
 					if (!transactionFinishing) await transaction.abort().catch(() => undefined);
 					if (writer) {
 						writer.endedAt ??= Date.now();
-						writer.writes ??= await writer.tail!.read().then(tail => tail.writes, () => [{ at: writer!.startedAt, opened: true }]);
+						writer.writes ??= await writer.tail!.read().then(tail => { writer!.unsafe = tail.unsafe; return tail.writes; },
+							() => [{ at: writer!.startedAt, opened: true }]);
 						await shareSessionWriter(session, writer).catch(error => { session.incompleteReasons.add(`writer_capture:${errorMessage(error)}`); });
 						writer.tail = undefined;
 					}
@@ -1334,32 +1361,27 @@ export class LinuxProcessReuseBackend {
 				this.add(undefined, "misses"); return measured({ kind: "continue" });
 			}
 			if (learning) { observation!.pending++; reserved = true; }
-			const available = observation?.source && Atomics.load(observation.source.available, 0) || this.handoffs.mayHaveExecutable(executablePath) || await this.store.mayHaveCertificates(executablePath, process.signal) ||
-				this.handoffs.mayHaveExecutable(executablePath);
+			const available = observation?.reuseEnabled !== false && (observation?.source && Atomics.load(observation.source.available, 0) ||
+				this.handoffs.mayHaveExecutable(executablePath) || await this.store.mayHaveCertificates(executablePath, process.signal) || this.handoffs.mayHaveExecutable(executablePath));
 			// Concurrent discovery is bounded, but a full retained set never shuts discovery off for the rest of the call.
 			if (!learning && !available) { this.add(undefined, "misses"); return measured({ kind: "continue" }); }
 			const inspected = await inspectHeldExecProcess(process.pid, executable, process.descriptors);
-			const capturedInputs = await TimelineInterval.collect(() => process.descriptors?.length
+			const capturedInputs = await TimelineInterval.collect(() => observation?.reuseEnabled !== false && process.descriptors?.length
 				? captureHeldDescriptorInputs(process.pid, process.descriptors, Math.min(MAX_REQUEST_BYTES / 2, this.store.limits.maxBytes),
 					sensitivePaths(this.options.storeRoot, this.options.deniedPaths), observation?.closed ? undefined : observation?.inputs, process.holderPid ?? process.tracerPid, sourceRoot) : undefined);
 			const resources = capturedInputs.output;
-			// Fresh descriptor capture is held-boundary validation. Borrowed inputs retain their original work receipt.
-			if (observation && !observation.closed) observation.computations.push(...capturedInputs.dependencies.filter(input => !input.owned));
 			const snapshot = { ...inspected, ...(resources ? { resources } : {}) };
-			if (!pathContains(sourceRoot, snapshot.cwd)) { this.add(undefined, "bypasses"); return measured({ kind: "continue" }); }
+			if (!pathContains(sourceRoot, snapshot.cwd)) { this.setError(undefined, "actor_bypass:cwd_outside_workspace", "bypasses"); return measured({ kind: "continue" }); }
 			// Completion admits the most valuable launches; existing adoptions keep their bindings and computation receipts.
 			const slot = (durationMs: number, key?: Sha256Digest, create?: Parameters<typeof nativeLearningSlot>[4]): boolean => {
 				if (!learning || observation!.closed || process.signal?.aborted || !snapshot.outputRoute || !Number.isFinite(durationMs)) return false;
 				return nativeLearningSlot(observation!, durationMs, key, this.store.limits.maxCertificates, create);
 			};
 			const observe = (prototype: ExecPrototype, durationMs: number) => {
-				const weakKey = processWeakKey(prototype);
+				const weakKey = processWeakKey(prototype), { argv, context: _context, ...invocation } = snapshot;
 				return slot(durationMs, weakKey, () => ({ order, binding: this.handoffs.observe(weakKey, executablePath, scope!, {
-					argv0: snapshot.argv[0]!, args: snapshot.argv.slice(1), environment: snapshot.environment, invocation: snapshot.invocation,
+					...invocation, argv0: argv[0]!, args: argv.slice(1),
 					cwd: projection.toLogical(snapshot.cwd), executable: executablePath, sourceRoot, outputRoute: snapshot.outputRoute!,
-					...(snapshot.outputPipes?.some(Boolean) ? { outputPipes: snapshot.outputPipes } : {}), ...(outputStatusFlags(snapshot.context) ? { outputFlags: outputStatusFlags(snapshot.context) } : {}),
-					...(snapshot.context.descriptorTypes[0] === "closed" ? { closeStdin: true } : {}),
-					...(resources ? { resources } : {}),
 				}, durationMs) }));
 			};
 			if (!available || resources && process.descriptors!.some(({ owned }) => !owned)) {
@@ -1418,7 +1440,7 @@ export class LinuxProcessReuseBackend {
 				commit: async () => {
 					try {
 						process.signal?.throwIfAborted();
-						await replayFilesystemEffects(observation?.effects ?? this.replayWorkspace, plan.artifacts, plan.certificate.result.journal, projection, sourceRoot);
+						await replayFilesystemEffects(observation?.effects ?? this.replayWorkspace, plan.artifacts, plan.certificate.result.journal, projection);
 					} catch (error) {
 						this.setError(undefined, `actor_child_commit:${errorMessage(error)}`);
 						throw error;
@@ -1429,7 +1451,8 @@ export class LinuxProcessReuseBackend {
 					if (observation && !observation.closed && sameScope(observation.scope, scope)) {
 						if (binding && this.handoffs.resolveBinding(binding, scope) && observation.bindings.size < this.store.limits.maxCertificates)
 							observation.bindings.set(order, binding);
-						observation.computations.push(computation);
+						// Native acknowledgement consumes borrowed inputs; lookup alone is validation.
+						observation.computations.push(...capturedInputs.dependencies.filter(input => !input.owned), computation);
 					}
 					this.recordHit(acquired.producer?.scope, acquired.joined, undefined, scope);
 					this.add(undefined, "reusedProcessMs", plan.certificate.result.observedProcessMs ?? 0);
@@ -1440,8 +1463,7 @@ export class LinuxProcessReuseBackend {
 			transferred = true;
 			return decision;
 		} catch (error) {
-			this.add(undefined, "bypasses");
-			this.setError(undefined, `actor_child:${errorMessage(error)}`);
+			this.setError(undefined, `actor_child:${errorMessage(error)}`, "bypasses");
 			return measured({ kind: "continue" });
 		} finally { if (!transferred) settle?.(false); if (!completing) releaseLearning(); }
 	}
@@ -1489,7 +1511,9 @@ export class LinuxProcessReuseBackend {
 			producer && scope ? sameScope(producer, scope) ? "sameTurnHits" : "crossTurnHits" : "unattributedHits"] as const) this.add(session, metric);
 	}
 
-	private setError(session: ActiveSession | undefined, detail: string): void {
+	private setError(session: ActiveSession | undefined, detail: string, countedAs?: CountedReuseMetric): void {
+		if (countedAs) this.add(session, countedAs);
+		detail = detail.length > 4096 ? `${detail.slice(0, 4095)}…` : detail;
 		this.counters.lastError = detail; (session?.metrics ?? this.actorCounters).lastError = detail;
 		const observation = !session && this.observations.getStore(); if (observation && !observation.closed) observation.metrics.lastError = detail;
 	}
@@ -1507,30 +1531,26 @@ export class LinuxProcessReuseBackend {
 	private async boundRequest(binding: ProcessExecutionBinding, invocation: BoundProcessInvocation, projection: ExecutionPathProjection, signal: AbortSignal) {
 		const cwd = projection.toPhysical(invocation.cwd), executable = projection.toPhysical(invocation.executable);
 		if (!cwd || !executable) throw new Error("bound process paths are unmapped");
-		let request = { ...invocation, cwd }, prototype = await this.prototype(projection, request, executable, invocation.outputRoute);
+		let request = { ...invocation, cwd }, prototype = await this.prototype(projection, request, executable);
 		if (processWeakKey(prototype) !== binding.key) throw new Error("bound process execution context changed");
 		if (invocation.resources && reopensProcessInputs(invocation)) {
 			request = { ...request, resources: await reopenProcessResources(invocation.resources, projection, (await this.resolveReady()).dispatcher,
 				Math.min(MAX_REQUEST_BYTES / 2, this.store.limits.maxBytes), signal) };
-			prototype = await this.prototype(projection, request, executable, invocation.outputRoute, prototype.executableDigest);
+			prototype = await this.prototype(projection, request, executable, prototype.executableDigest);
 		}
 		return { request, executable, prototype };
 	}
 
-	private async prototype(projection: ExecutionPathProjection, request: ProcessArguments, executable: string, outputRoute: OutputRoute, executableDigest?: Sha256Digest): Promise<ExecPrototype> {
+	private async prototype(projection: ExecutionPathProjection, request: ProcessArguments, executable: string, executableDigest?: Sha256Digest): Promise<ExecPrototype> {
 		const [digest, ready] = await Promise.all([executableDigest ?? hashExecutableFile(request.imageSource ?? executable), this.resolveReady()]);
 		return bufferedProcessPrototype({
-			executable, invocation: request.invocation,
-			argv: [request.argv0, ...request.args],
-			cwd: request.cwd,
-			environment: request.environment,
-			context: routedProcessContext(ready.executionContext, outputRoute, request.closeStdin, descriptorInputs(request.resources).filter(input => input.installed !== false), request.outputPipes, request.outputFlags),
-			...(request.resources ? { resources: request.resources } : {}),
+			...request, executable, argv: [request.argv0, ...request.args],
+			context: routedProcessIdentity(ready.executionContext, request, descriptorInputs(request.resources).filter(input => input.installed !== false)),
 		}, projection, digest, ready.platformFingerprint);
 	}
 }
 
-function reopensProcessInputs(invocation: BoundProcessInvocation): boolean {
+function reopensProcessInputs(invocation: BoundProcessInvocation) {
 	return !invocation.producer && Object.values(invocation.resources?.objects ?? {}).every(object => object.type === "null" ||
 		(object.type === "regular" || object.type === "directory") && !!object.sourcePath && pathContains(invocation.sourceRoot, object.sourcePath));
 }
@@ -1539,7 +1559,7 @@ function reopensProcessInputs(invocation: BoundProcessInvocation): boolean {
 async function reopenProcessResources(graph: ProcessResourceGraph, projection: ExecutionPathProjection, dispatcher: string, remaining: number,
 	signal: AbortSignal): Promise<ProcessResourceGraph> {
 	const objects: Record<number, ProcessResourceGraph["objects"][number]> = {}, remapped = new Map<number, number>(), images = new Map<string, number>();
-	let namespace: ReturnType<typeof captureWorkspaceStructure> | undefined;
+	const fileAliases = captureWorkspaceFileAliases(projection.workspaceRoot);
 	for (const [key, object] of Object.entries(graph.objects)) {
 		signal.throwIfAborted();
 		const id = Number(key);
@@ -1553,19 +1573,13 @@ async function reopenProcessResources(graph: ProcessResourceGraph, projection: E
 			const captured = await captureStableFile(physical, remaining, true, undefined, signal);
 			if (!sameFilesystemIdentity(before, captured.stat)) throw new Error("reopened input changed during capture");
 			content = captured.content!;
-			if (before.nlink > 1n) {
-				const snapshot = await (namespace ??= captureWorkspaceStructure(projection.workspaceRoot)), entry = snapshot.entries.get(path.relative(projection.workspaceRoot, physical));
-				if (!snapshot.complete || entry?.kind !== "file" || entry.object !== identity || entry.aliases?.length !== Number(before.nlink))
-					throw new Error("reopened input alias namespace is not closed");
-				aliases = entry.aliases.map(alias => projection.toLogical(alias)).sort();
-			}
+			aliases = (await fileAliases(physical, before))?.map(alias => projection.toLogical(alias)).sort();
 		} else {
 			if (!before.isDirectory()) throw new Error("reopened input type changed");
 			if (object.content !== undefined) {
 				// Enumeration cookies and inode numbers belong to the logical filesystem, not the private backing tree.
 				await assertNoSymlinkPath(projection.sourceRoot, logical);
-				content = await new Promise<Buffer>((resolve, reject) => execFile(dispatcher, ["--directory-image", logical],
-					{ encoding: "buffer", maxBuffer: remaining, signal }, (error, stdout) => error ? reject(error) : resolve(stdout)));
+				content = (await execHostFile(dispatcher, ["--directory-image", logical], { encoding: "buffer", maxBuffer: remaining, signal })).stdout;
 			}
 		}
 		if (!sameFilesystemIdentity(before, await lstat(physical, { bigint: true }))) throw new Error("reopened input changed during capture");
@@ -1709,34 +1723,30 @@ function bufferedProcessPrototype(
 	projection: ExecutionPathProjection,
 	executableDigest: Sha256Digest,
 	platformFingerprint: string,
-): ExecPrototype {
+) {
 	const { context } = snapshot;
 	const inputs = descriptorInputs(snapshot.resources);
 	const input = inputs.find(({ fd }) => fd === 0);
 	return createExecPrototype({
 		executablePath: projection.toLogical(snapshot.executable),
-		...(snapshot.invocation ? { invocation: [projection.normalizeValue(snapshot.invocation[0]), snapshot.invocation[1]] as const } : {}),
+		invocation: snapshot.invocation,
 		executableDigest,
-		argv: snapshot.argv.map((value) => projection.normalizeValue(value)),
+		argv: snapshot.argv,
 		logicalCwd: projection.toLogical(snapshot.cwd),
-		environment: Object.fromEntries(Object.entries(snapshot.environment).map(([name, value]) => [name, projection.normalizeValue(value)])),
+		environment: snapshot.environment,
 		umask: context.umask,
 		processContextDigest: sha256Digest(context.key),
 		stdin: input ? { type: "bytes", digest: input.contentDigest, eof: snapshot.resources!.objects[input.image]!.queue?.eof ?? true } : { type: "closed", eof: true },
 		fileDescriptorTableComplete: true,
-		inheritedFDs: [...context.descriptorTypes.map((type, fd) => ({
-			fd,
-			type,
-			flagsDigest: sha256Digest(`${context.key}\0${fd}`),
-			...(fd === 0 ? { eof: true } : {}),
-		})), ...inputs.filter(({ fd }) => fd > 2).map(({ fd }) => ({ fd, type: "regular" as const,
-			flagsDigest: sha256Digest(`${context.key}\0${fd}`) }))].map(descriptor => {
-			const input = inputs.find(({ fd }) => fd === descriptor.fd);
-			return input ? { ...descriptor, flagsDigest: input.locks || (!input.type || input.type === "eventfd") && input.outside !== undefined ? digestObject({ flags: input.flags, locks: input.locks, outside: input.outside }) : sha256Digest(String(input.flags)), ...(input.installed === false ? { installed: false as const } : {}), type: input.type ?? descriptor.type, alias: input.alias, object: input.image, contentDigest: input.contentDigest, offset: input.offset,
-				eof: snapshot.resources!.objects[input.image]!.queue?.eof,
-				...(snapshot.resources!.objects[input.image]!.queue ? { endpointDigest: digestObject({ queue: snapshot.resources!.objects[input.image]!.queue, socket: snapshot.resources!.objects[input.image]!.socket }) } : {}),
+		inheritedFDs: [...context.descriptorTypes.keys(), ...inputs.filter(input => input.fd > 2).map(input => input.fd)].map(fd => {
+			const input = inputs.find(input => input.fd === fd), type = input?.type ?? context.descriptorTypes[fd] ?? "regular";
+			if (!input) return { fd, type, flagsDigest: sha256Digest(`${context.key}\0${fd}`), ...(fd === 0 ? { eof: true } : {}) };
+			const { queue, socket } = snapshot.resources!.objects[input.image]!;
+			return { fd, type, flagsDigest: input.locks || (!input.type || input.type === "eventfd") && input.outside !== undefined ? digestObject({ flags: input.flags, locks: input.locks, outside: input.outside }) : sha256Digest(String(input.flags)),
+				...(input.installed === false ? { installed: false as const } : {}), alias: input.alias, object: input.image, contentDigest: input.contentDigest, offset: input.offset, eof: queue?.eof,
+				...(queue ? { endpointDigest: digestObject({ queue, socket }) } : {}),
 				...(input.sourcePath ? { resourcePath: projection.toLogical(input.sourcePath) } : {}),
-				...(input.sourceAliases ? { resourceAliases: input.sourceAliases.map(name => projection.toLogical(name)).sort() } : {}) } : descriptor;
+				...(input.sourceAliases ? { resourceAliases: input.sourceAliases.map(name => projection.toLogical(name)).sort() } : {}) };
 		}),
 		platformFingerprint,
 	});
@@ -1756,9 +1766,9 @@ function bindProcessDescriptors(inputs: ReturnType<typeof descriptorInputs>, pos
 		if (end < 0 || end - cursor > 256) throw new Error("invalid continuation header");
 		const text = image.toString("ascii", cursor, end); cursor = end + 1; return text;
 	};
-	const first = line(), header = /^PIIMAGE (\d+) (\d+) (\d+) (\d+)$/.exec(first);
+	const first = line(), header = /^PIIMAGE4 (\d+) (\d+) (\d+) (\d+)$/.exec(first);
 	if (!header || Number(header[1]) !== frontier.pid || Number(header[2]) > 256) throw new Error("unbound continuation image");
-	const records = new Map<number, string[]>(), bound: string[] = [], descriptions = new Map<number, string[]>();
+	const records = new Map<number, string[]>(), descriptions = new Map<number, string[]>();
 	for (let index = 0; index < Number(header[2]); index++) {
 		const row = line(), match = /^(\d+) \d+ \d+ \d+ \d+ \d+$/.exec(row), fd = Number(match?.[1]);
 		if (!match || !Number.isSafeInteger(fd) || records.has(fd)) throw new Error("invalid continuation FD table");
@@ -1773,7 +1783,7 @@ function bindProcessDescriptors(inputs: ReturnType<typeof descriptorInputs>, pos
 			if (previous && previous.join(" ") !== state.join(" ")) throw new Error("continuation shared OFD diverged");
 			descriptions.set(input.alias, state); fields[5] = String(input.fd);
 		} else if (fd > 2 || fd === 0 && closedInput) throw new Error("unbound continuation handle");
-		records.set(fd, fields); bound.push(fields.join(" "));
+		records.set(fd, fields);
 	}
 	const pending = inputs.find(input => input.fd === Number(records.get(frontier.fd)?.[5]));
 	if (frontier.fd >= 0 && !pending && !([1, 2].includes(frontier.fd) && frontier.writing) ||
@@ -1785,7 +1795,7 @@ function bindProcessDescriptors(inputs: ReturnType<typeof descriptorInputs>, pos
 		const after = Number(state[1]); position.after = Number.isSafeInteger(after) ? after : state[1]!;
 		position.afterFlags = Number(state[0]) !== input.flags ? Number(state[0]) : undefined;
 	}
-	return Buffer.concat([Buffer.from(`${first}\n${bound.join("\n")}\n`), image.subarray(cursor)]);
+	return Buffer.concat([Buffer.from(`${first}\n${[...records.values()].map(row => row.join(" ")).join("\n")}\n`), image.subarray(cursor)]);
 }
 
 interface DescriptorOffset {
@@ -1824,8 +1834,7 @@ function parseDescriptorOffsets(report: Buffer, inputs: ReturnType<typeof descri
 		if (!/^F \d+ \d+ \d+ \d+ -?\d+ \d+ \d+$/.test(value)) throw new Error("invalid detached file image");
 		const [, fd, mode, uid, gid, seconds, nanos, length] = value.split(" "), size = Number(length);
 		const input = inputs.find(input => input.fd === Number(fd)), position = positions.find(position => position.fd === Number(fd));
-		if (!input || input.type || input.fd !== input.image || !position || position.detached || !Number.isSafeInteger(size) ||
-			size < 0 || (bytes += size) > MAX_REQUEST_BYTES / 2 || cursor + size >= report.length || report[cursor + size] !== 10 || Number(nanos) >= 1e9) throw new Error("unbound detached file image");
+		if (!input || input.type || input.fd !== input.image || !position || position.detached || !isSafeCount(size) || (bytes += size) > MAX_REQUEST_BYTES / 2 || cursor + size >= report.length || report[cursor + size] !== 10 || Number(nanos) >= 1e9) throw new Error("unbound detached file image");
 		position.detached = { content: report.subarray(cursor, cursor + size), mode: BigInt(mode!), uid: BigInt(uid!), gid: BigInt(gid!), modified: BigInt(seconds!) * 1_000_000_000n + BigInt(nanos!) };
 		cursor += size + 1;
 	}
@@ -1833,12 +1842,12 @@ function parseDescriptorOffsets(report: Buffer, inputs: ReturnType<typeof descri
 	return positions;
 }
 
-function recordProcessDependency(session: ActiveSession, dependency: TimelineDependency, pid?: number): void {
+function recordProcessDependency(session: ActiveSession, dependency: TimelineDependency, pid?: number) {
 	if (pid !== undefined) processDependencyPIDs.set(dependency, pid);
 	session.computations.push(dependency);
 }
 
-async function measureProcess<T>(session: ActiveSession, execute: () => Promise<T>, pid?: number): Promise<T> {
+async function measureProcess<T>(session: ActiveSession, execute: () => Promise<T>, pid?: number) {
 	const first = session.computations.length;
 	const result = await TimelineInterval.measure(execute, () => session.computations.slice(first).filter(input => processDependencyPIDs.get(input) === pid));
 	recordProcessDependency(session, { computation: result.computation, owned: true, shared: [result.computation] }, pid);
@@ -1846,7 +1855,7 @@ async function measureProcess<T>(session: ActiveSession, execute: () => Promise<
 }
 
 function nativeLearningSlot(observation: NativeObservation, duration: number, key: string | undefined, limit: number,
-	create?: () => { readonly binding: ProcessExecutionBinding | undefined; readonly order: number }): boolean {
+	create?: () => { readonly binding: ProcessExecutionBinding | undefined; readonly order: number }) {
 	const entries = [...observation.learned], previous = key && entries.find(([order]) => observation.bindings.get(order)?.key === key);
 	const victim = previous || (entries.length >= LEARNED_LAUNCHES || observation.bindings.size >= limit
 		? entries.reduce<(typeof entries)[number] | undefined>((lowest, entry) => !lowest || entry[1] < lowest[1] ? entry : lowest, undefined) : undefined);
@@ -1890,37 +1899,30 @@ function reusedComputation(certificate: ProcessProvenanceCertificate,
 	return { computation, shared: acquired?.waiting, reused: true };
 }
 
-async function sealSessionEvidence(session: ActiveSession): Promise<readonly SandboxWorkspaceChange[]> {
+async function sealSessionEvidence(session: ActiveSession, external: Awaited<ReturnType<typeof privateCommits>>) {
 	const capture = await captureSessionInterval(session);
+	session.topLevelEvidence = { complete: false, dependencies: [], taints: ["trace_incomplete"] };
 	if (!capture.complete) {
 		session.incompleteReasons.add(`top_capture:${capture.reason}`);
-		session.topLevelEvidence = { complete: false, dependencies: [], taints: ["trace_incomplete"] };
 		return [];
 	}
 	const effects = diffWorkspaceStructures(capture.before, capture.after, capture.changes, session.projection);
 	if (!effects.complete) {
 		session.incompleteReasons.add(`top_effects:${effects.reason ?? "incomplete"}`);
-		session.topLevelEvidence = { complete: false, dependencies: [], taints: ["trace_incomplete"] };
 		throw new Error(`top-level workspace effects are incomplete: ${effects.reason ?? "unknown"}`);
 	}
-	const committedChanges = await mapFilesystem(effects.effects, async ({ relativePath, change }): Promise<SandboxWorkspaceChange> => {
-		const resource = slash(path.normalize(relativePath)), target = path.resolve(session.sourceRoot, resource);
-		if (!pathContains(session.sourceRoot, target) || target === path.resolve(session.sourceRoot)) throw new Error(`effect escapes source workspace: ${relativePath}`);
-		if (change.kind !== "directory") return { ...change, root: session.sourceRoot, target, resource };
-		const before = change.before ? directoryState(change.before) : undefined;
-		if (!sameSandboxState(await readSandboxDirectoryState(target), before))
-			throw new Error(`${before === undefined ? "directory creation baseline changed" : "source directory differs from execution baseline"}: ${resource}`);
-		return { kind: "directory", root: session.sourceRoot, target, resource, before, after: change.after && directoryState(change.after) };
+	const committedChanges = effects.effects.map(({ logicalPath: target, relativePath, change }): SandboxWorkspaceChange => {
+		const address = { root: session.sourceRoot, target, resource: slash(relativePath) };
+		return change.kind !== "directory" ? { ...change, ...address } : { kind: "directory", ...address,
+			before: change.before && directoryState(change.before), after: change.after && directoryState(change.after) };
 	});
 	try {
 		const writers = sessionWriters(session), evidence = await captureDependencies(session, capture.before, writers.flatMap(writer => writer.observation ?? []), effects,
-			writers.flatMap(writer => writer.evidence ?? []),
-			writers.flatMap(writer => writer.external ?? []));
+			external, writers.flatMap(writer => writer.evidence ?? []));
 		for (const reason of evidence.incompleteReasons) session.incompleteReasons.add(`top_evidence:${reason}`);
 		session.topLevelEvidence = { ...evidence, complete: evidence.complete && session.incompleteReasons.size === 0 };
 	} catch (error) {
 		session.incompleteReasons.add(`top_seal:${errorMessage(error)}`);
-		session.topLevelEvidence = { complete: false, dependencies: [], taints: ["trace_incomplete"] };
 	}
 	return committedChanges;
 }
@@ -1943,70 +1945,74 @@ export async function imageInterpreter(file: string): Promise<string | undefined
 }
 
 async function captureDependencies(session: ActiveSession, snapshot: WorkspaceStructureSnapshot, observations: readonly StraceObservation[], effects: WorkspaceTransactionDiff,
-	runs: readonly DynamicDependencyCertificate[] = [], additionalExternal: readonly string[] = []) {
+	external: Awaited<ReturnType<typeof privateCommits>>, runs: readonly DynamicDependencyCertificate[] = [], privateBefore?: PrivatePrestate) {
 	if (!effects.complete) throw new Error(`workspace effects are incomplete: ${effects.reason}`);
-	const observed = observations.flatMap(part => part.paths), external = [...additionalExternal, ...observations.flatMap(part => part.external ?? [])],
+	const observed = observations.flatMap(part => part.paths),
 		locks = observations.flatMap(part => part.locks ?? []), written = observations.flatMap(part => part.written ?? []);
-	// The workspace as the run found it: the structure it began with, and the bytes its own writes replaced.
+	// Transaction structure and retained write preimages describe the run's starting state.
 	const deltas = new Map(effects.effects.flatMap(({ relativePath, change }) => change.kind === "directory" ? [] : [[relativePath, change] as const]));
-	const cached = new Map<string, Promise<WorkspaceTreeEntry | undefined>>();
+	const captureBefore = sharedWalk(async (relative: string) => {
+		const structure = snapshot.entries.get(relative);
+		if (!structure || structure.kind !== "file") return structure;
+		const delta = deltas.get(relative), before = delta?.before, takenAtMs = Date.now();
+		const captured = before ? undefined : await captureFileDigest(structure.contentPath ?? path.resolve(snapshot.root, relative), structure.size);
+		const hydrated = await hydrateWorkspaceFileEntry(structure, before ?? captured!);
+		if (!hydrated) throw new Error(`transaction baseline changed: ${relative}`);
+		if (delta?.beforeIdentity) rememberCapture({ identity: delta.beforeIdentity, hash: hydrated.digest.slice("sha256:".length) }, takenAtMs);
+		return hydrated;
+	});
 	const before = (physicalPath: string) => {
 		const relative = relativeFilesystemPath(snapshot.root, physicalPath);
-		if (relative === undefined) return Promise.reject(new Error(`workspace dependency escapes snapshot: ${physicalPath}`));
-		if (!cached.has(relative)) cached.set(relative, (async () => {
-			const structure = snapshot.entries.get(relative);
-			if (!structure || structure.kind !== "file") return structure;
-			const delta = deltas.get(relative), before = delta?.before, takenAtMs = Date.now();
-			const target = structure.contentPath ?? path.resolve(snapshot.root, relative);
-			// The same settled identity already used by exact adoption can stand for repeated preparation hashing.
-			// A symlink or changed inode/size/mtime/ctime misses; hydration still proves the transaction's prestate.
-			const captured = before ? undefined : cachedCapture(await lstat(target, { bigint: true }), target) ?? await captureStableFile(target, structure.size);
-			const hydrated = await hydrateWorkspaceFileEntry(structure, before ?? captured!);
-			if (!hydrated) throw new Error(`transaction baseline changed: ${relative}`);
-			// Its digest stands for the file again when an adoption validates it (see cachedCapture): bytes read under a settled identity stand for that.
-			if (captured && !captured.shared || delta?.beforeIdentity) rememberCapture(captured ?? { identity: delta!.beforeIdentity!, hash: hydrated.digest.slice("sha256:".length) }, takenAtMs);
-			return hydrated;
-		})());
-		return cached.get(relative)!;
+		return relative === undefined ? Promise.reject(new Error(`workspace dependency escapes snapshot: ${physicalPath}`)) : captureBefore(relative);
 	};
 	// A name it created itself depends only on having been free, not on everything else its directory held.
 	const created = new Set(written.map(name => path.resolve(session.workspace.sandboxRoot, name)));
 	const parentWrites = new Set([...created].map(name => path.dirname(name)));
-	const metadataBefore = (physical: string, dependency: Extract<DynamicDependency, { kind: "metadata" }>) => {
-		const relative = relativeFilesystemPath(snapshot.root, physical), entry = relative === undefined ? undefined : snapshot.entries.get(relative);
-		return parentWrites.has(physical) && entry?.kind === "directory" && entry.observed ? { ...dependency,
-			digest: filesystemObservationDigest(session.workspace.projectMetadata?.(entry.observed) ?? entry.observed, dependency.fields) } : dependency;
-	};
-	const workspaceDependency = async (physical: string, logical: string, role: Exclude<ObservedProcessPath["role"], "metadata">, listed = true) => {
+	const exclusions = (target: string) => path.resolve(target) === path.resolve(session.workspace.sandboxRoot) ? session.workspace.observationExcludes : undefined;
+	const workspaceDependency = async (physical: string, logical: string, role: DependencyRole, listed = true) => {
 		const [entry, parent] = await Promise.all([before(physical),
 			path.resolve(physical) === path.resolve(session.workspace.sandboxRoot) || created.has(path.resolve(physical)) ? undefined : before(path.dirname(physical))]);
 		return snapshotDependency(logical, entry?.kind === "file" && entry.aliases ? { ...entry,
 			aliases: entry.aliases.map(name => session.projection.toLogical(name)).sort() } : entry, parent, role, {
-			excludedEntries: workspaceMetadataExclusions(session, physical),
-			parentExcludedEntries: workspaceMetadataExclusions(session, path.dirname(physical)), listed,
+			excludedEntries: exclusions(physical),
+			parentExcludedEntries: exclusions(path.dirname(physical)), listed,
 		});
 	};
-	const dependencies = new Map<string, DynamicDependency>();
-	const taints = new Set<ProvenanceTaint>(observations.flatMap(part => part.taints));
+	const dependencies = new Map<string, DynamicDependency | undefined>();
+	const taints = new Set<ProvenanceTaint>([...observations, ...runs].flatMap(part => part.taints));
 	const incompleteReasons = new Set(observations.flatMap(part => part.incompleteReasons));
 	let complete = observations.every(part => part.complete);
 	if (!complete) taints.add("trace_incomplete");
 	const add = (dependency: DynamicDependency | undefined, reason = "dependency_unavailable") => {
-		if (!dependency) { complete = false; incompleteReasons.add(reason); return; }
+		if (!dependency) { incompleteReasons.add(reason); return; }
 		const identity = dynamicDependencyIdentity(dependency);
 		const existing = dependencies.get(identity);
-		if (existing?.kind === "file" && dependency.kind === "file" && (existing.role === "executable" || dependency.role !== "executable")) return;
+		if (existing?.kind === "file" && dependency.kind === "file" && stableEqual({ ...existing, role: dependency.role }, dependency)) {
+			if (existing.role !== "executable" && dependency.role === "executable") dependencies.set(identity, dependency);
+			return;
+		}
+		// A listing adds evidence to reaching the same directory; neither observation may replace conflicting evidence.
+		if (existing?.kind === dependency.kind && (dependency.kind === "directory" || dependency.kind === "absence") && Object.entries(dependency).every(([key, value]) =>
+			!(key in existing) || stableEqual(Reflect.get(existing, key), value))) { dependencies.set(identity, { ...existing, ...dependency }); return; }
+		if (existing && !stableEqual(existing, dependency)) {
+			incompleteReasons.add(`dependency_changed_during_execution:${identity}`);
+			return;
+		}
 		dependencies.set(identity, dependency);
 	};
-	// A run saw the workspace through the command's earlier writes: where what it saw is not how the command found a path,
-	// the command depended on that path's state at its start.
+	// Child inputs following earlier writes depend on the enclosing transaction's prestate.
 	const changed = new Set(effects.effects.map(effect => effect.logicalPath));
 	const atStart = async (dependency: DynamicDependency) => {
+		if (dependency.kind !== "fd" && dependency.kind !== "lock" && external.before.has(dependency.path)) {
+			const initial = external.before.get(dependency.path);
+			return dependency.kind === "metadata" && initial?.kind !== "absence" ? dependency : initial;
+		}
 		const physical = dependency.kind === "fd" ? undefined : session.projection.toPhysical(dependency.path);
 		const relative = physical && relativeFilesystemPath(snapshot.root, physical);
 		if (dependency.kind === "fd" || !physical || relative === undefined || session.workspace.observationExcludes.includes(relative.split(path.sep)[0]!)) return dependency;
-		if (dependency.kind === "metadata" && parentWrites.has(physical)) return metadataBefore(physical, dependency);
 		const entry = snapshot.entries.get(relative), up = relativeFilesystemPath(snapshot.root, path.dirname(physical)), parent = up === undefined ? undefined : snapshot.entries.get(up);
+		if (dependency.kind === "metadata" && parentWrites.has(physical)) return entry?.kind === "directory" && entry.observed ? { ...dependency,
+			digest: filesystemObservationDigest(session.workspace.projectMetadata?.(entry.observed) ?? entry.observed, dependency.fields) } : dependency;
 		const same = dependency.kind === "absence" ? !entry && (dependency.parentEntriesDigest === undefined || parent?.kind === "directory" && parent.entriesDigest === dependency.parentEntriesDigest)
 			: dependency.kind === "directory" ? entry?.kind === "directory" && entry.metadataDigest === dependency.metadataDigest && (dependency.entriesDigest ?? entry.entriesDigest) === entry.entriesDigest
 			: dependency.kind === "symlink" ? entry?.kind === "symlink" && entry.target === dependency.target
@@ -2017,18 +2023,26 @@ async function captureDependencies(session: ActiveSession, snapshot: WorkspaceSt
 
 	// Kernel pathname walk over the baseline: links are recorded and expanded in place and `..` leaves the directory
 	// actually reached. Sandlock collapses `..` first, so another result means the sandbox read another object.
-	const walk = async (logical: string, follow: boolean) => {
+	const walk = async (logical: string, follow: boolean, absent = false) => {
 		const pending = logical.split("/").filter(Boolean), links: string[] = [];
 		let current = "/";
 		for (let segment = pending.shift(); segment !== undefined; segment = pending.shift()) {
 			if (segment === "..") { current = path.posix.dirname(current); continue; }
-			const next = path.posix.join(current, segment);
+			let next = path.posix.join(current, segment);
 			// The repository is the workspace's own, mounted read-only (also when reached through the overlay): the host walk captures it.
 			const repository = session.projection.isWorkspacePhysical(next) ? session.projection.toLogical(next) : next;
-			if (session.gitDirectory && pathContains(session.gitDirectory, repository)) return { path: path.posix.join(repository, ...pending), links };
-			const physical = pathContains(session.sourceRoot, next) ? session.projection.toPhysical(next) : undefined;
+			const inRepository = session.gitDirectory && pathContains(session.gitDirectory, repository);
+			if (inRepository) next = repository;
+			const physical = !inRepository && pathContains(session.sourceRoot, next) ? session.projection.toPhysical(next) : undefined;
 			const entry = physical ? await before(physical) : undefined;
 			if (entry?.kind === "file" && pending.length) return { path: next, links, blocked: true as const };
+			// A failed lookup needs both its original prefixes and the normalized target to retain their observed states.
+			if (absent && pending.includes("..") && entry?.kind !== "symlink") {
+				const prefix = physical ? await workspaceDependency(physical, next, "input", false)
+					: await captureDirectoryDependency(next, next, false, [], false).catch(error => missing(error) ? captureAbsenceDependency(path.join(privateUpper(session), next), next, false) : undefined);
+				if (prefix?.kind !== "directory" && (prefix?.kind !== "absence" || created.has(physical ?? next) || own.has(next))) return;
+				add(prefix);
+			}
 			if (entry?.kind !== "symlink" || !pending.length && !follow) { current = next; continue; }
 			if (links.push(next) > 40) return undefined;
 			pending.unshift(...entry.target.split("/").filter(Boolean));
@@ -2036,21 +2050,19 @@ async function captureDependencies(session: ActiveSession, snapshot: WorkspaceSt
 		}
 		return { path: current, links };
 	};
-	const own = new Set(external.flatMap(target => [path.resolve(target), path.dirname(path.resolve(target))]));
+	const own = new Set([...external.before.keys()].flatMap(target => [target, path.dirname(target)]));
 	// A lock on a file it made itself no one else could have held; on one that was there, another holder would have refused it.
 	for (const lock of locks) if (await (session.projection.isWorkspacePhysical(lock.path) ? before(lock.path) : lstat(lock.path).catch(() => undefined))) {
 		add({ kind: "lock", path: session.projection.isWorkspacePhysical(lock.path) ? session.projection.toLogical(lock.path) : slash(lock.path), exclusive: lock.exclusive });
 	}
-	const pending = [...observed], seenImages = new Set<string>(), hostPaths = new Map<string, { physical: string; role: Exclude<ObservedProcessPath["role"], "metadata">; listed: boolean; absent: boolean }>();
+	const pending = [...observed], seenImages = new Set<string>(), hostPaths = new Map<string, { physical: string; role: DependencyRole; listed: boolean; absent: boolean }>();
 	for (let item = pending.shift(); item; item = pending.shift()) {
-		const follow = item.role !== "metadata" || item.followSymlinks, walked = await walk(item.path, follow);
-		// A failed walk depends on its blocking file and links, not on an absent leaf. Only the same
-		// ENOTDIR on every observation proves that walk; older sandboxes reported ENOENT instead.
-		if (walked?.blocked && (item.role === "metadata" || item.lookupFailure !== "ENOTDIR")) {
-			add(undefined, `pathname_not_directory:${item.path}${item.role !== "metadata" && item.lookupFailure ? `:observed_${item.lookupFailure}` : ""}`); continue;
-		}
+		const absent = item.role !== "metadata" && item.lookupFailure === "ENOENT";
+		const follow = item.role !== "metadata" || item.followSymlinks, walked = await walk(item.path, follow, absent);
+		// A blocking file must reproduce the observed ENOTDIR; every other walk must reach the same object after normalization.
 		const normalized = !walked?.blocked && item.path.split("/").includes("..") ? await walk(path.posix.normalize(item.path), follow) : walked;
-		if (!walked || normalized?.blocked && !walked.blocked || walked.path !== normalized?.path) {
+		if (!walked || walked.blocked && (item.role === "metadata" || item.lookupFailure !== "ENOTDIR") ||
+			normalized?.blocked && !walked.blocked || walked.path !== normalized?.path) {
 			add(undefined, `pathname_walk:${item.path}`); continue;
 		}
 		for (const link of item.role === "metadata" ? [] : walked.links) add(await workspaceDependency(session.projection.toPhysical(link)!, link, "input"));
@@ -2066,22 +2078,22 @@ async function captureDependencies(session: ActiveSession, snapshot: WorkspaceSt
 		}
 		if (KERNEL_CONFIGURATION.test(observedPath)) continue; // Changes only with the kernel's own configuration, like the clock.
 		// What it wrote outside the workspace, and the directories holding those names, rest on its effects' baselines.
-		if (own.has(physical)) continue;
+		if (own.has(physical) && (item.role !== "metadata" || !external.before.has(physical))) continue;
 		// A process reading its own state, or the host's CPU and cgroup limits, observes this one run like the clock or its pid.
-		if (/^\/proc\/(?:self|thread-self|\d+)(?:\/|$)/.test(observedPath)) { taints.add("pid_observation"); continue; }
+		if (/^\/proc\/(?:self|thread-self|\d+)(?:\/|$)/.test(observedPath)) { taints.add(observedPath.endsWith("/limits") ? "confinement_observation" : "pid_observation"); continue; }
 		// Reopening an inherited descriptor reaches what that descriptor carries, like a jobserver pipe, not a host file.
 		if (/^\/dev\/fd\/\d+$/.test(observedPath)) { taints.add("descriptor_observation"); continue; }
 		if (/^\/dev\/u?random$/.test(observedPath)) { taints.add("random"); continue; } // Entropy, as getrandom(2) reads it.
 		if (/^\/sys\/(?:devices\/system\/cpu|fs\/cgroup)(?:\/|$)|^\/proc\/(?:meminfo|version|version_signature|cpuinfo|stat|loadavg|uptime)$/.test(observedPath)) { taints.add("clock"); continue; }
 		if (item.role === "metadata") {
 			if (created.has(path.resolve(physical))) continue; // Its own writes set what it saw of them.
-			add(await atStart(metadataBefore(physical, {
-				kind: "metadata",
-				path: session.projection.isWorkspacePhysical(physical) ? session.projection.toLogical(physical) : slash(physical),
-				followSymlinks: item.followSymlinks,
-				digest: item.digest,
-				...(item.fields ? { fields: item.fields } : {}),
-			})));
+			const { role, path: _path, afterWrite, ...metadata } = item;
+			const dependency = { ...metadata, kind: role,
+				path: session.projection.isWorkspacePhysical(physical) ? session.projection.toLogical(physical) : slash(physical) };
+			const identity = dynamicDependencyIdentity(dependency);
+			// A missing slot needs these fields bound before the write, possibly by a brokered child.
+			if (afterWrite) { if (!dependencies.has(identity)) dependencies.set(identity, undefined); }
+			else add(await atStart(dependency));
 			continue;
 		}
 		if (STABLE_SANDBOX_DEVICES.has(observedPath)) continue;
@@ -2095,31 +2107,33 @@ async function captureDependencies(session: ActiveSession, snapshot: WorkspaceSt
 		}
 		const key = `${item.role}\0${physical}`, previous = hostPaths.get(key);
 		hostPaths.set(key, { physical, role: item.role, listed: !!item.listed || !!previous?.listed,
-			absent: item.lookupFailure === "ENOENT" && !item.path.split("/").includes("..") && previous?.absent !== false });
+			absent: absent && previous?.absent !== false });
 	}
-	// Host files are independent of each other and of the workspace: capture them concurrently (walking what they share once), add them in trace order.
-	const capture = sharedWalk(), images = await privateInputImages(path.join(session.processRoot, "private"), new Set([...hostPaths.values()].map(item => item.physical)));
-	for (const captured of await mapFilesystem([...hostPaths.values()], ({ physical, role, listed, absent }) =>
-		(async () => {
-			const image = images.get(physical);
-			if (!image) return captureHostPath(physical, role, listed, absent, capture);
-			if (!image.unchanged) return undefined;
-			return [...image.links, { kind: "file", path: slash(image.path), role, contentDigest: `sha256:${image.hash}`,
-				metadataDigest: filesystemMetadataDigest(image.original) }] satisfies DynamicDependency[];
-		})().then(value => ({ physical, value }), (error: unknown) => ({ physical, error })))) {
-		if ("error" in captured) { complete = false; taints.add("trace_incomplete"); incompleteReasons.add(`capture:${captured.physical}:${errorMessage(captured.error)}`); }
+	// Capture independent external inputs concurrently, preserving trace order.
+	const capture = sharedWalk(captureFilesystemEntry), images = await privateInputImages(session, new Set([...hostPaths.values()].map(item => item.physical)), privateBefore);
+	for (const captured of await mapFilesystem([...hostPaths.values()], async ({ physical, role, listed, absent }) => {
+		try { return { physical, value: images.has(physical) ? images.get(physical)?.map(dependency => dependency.kind === "file" ? { ...dependency, role } : dependency)
+			: await captureHostPath(physical, role, listed, absent, capture) }; }
+		catch (error) { return { physical, error }; }
+	})) {
+		if ("error" in captured) { taints.add("trace_incomplete"); add(undefined, `capture:${captured.physical}:${errorMessage(captured.error)}`); }
 		else if (captured.value) for (const dependency of captured.value) add(dependency);
 		else { taints.add("mutable_input"); add(undefined, `mutable:${captured.physical}`); }
 	}
 	for (const effect of effects.effects) {
 		const physical = session.projection.toPhysical(effect.logicalPath);
-		if (!physical) { complete = false; incompleteReasons.add(`effect_unmapped:${effect.logicalPath}`); continue; }
+		if (!physical) { add(undefined, `effect_unmapped:${effect.logicalPath}`); continue; }
 		add(await workspaceDependency(physical, effect.logicalPath, "input"));
 	}
-	const rebased = await mapFilesystem(runs, async run =>
-		({ ...run, dependencies: (await mapFilesystem(run.dependencies, atStart)).flatMap(dependency => dependency ?? (add(undefined, "start_state_unavailable"), [])) }));
-	const certificate = mergeDependencyEvidence([{ complete, dependencies: [...dependencies.values()], taints: [...taints] }, ...rebased], incompleteReasons);
-	return { ...certificate, sourceComplete: complete, incompleteReasons: [...incompleteReasons] };
+	for (const [target, dependency] of external.before) add(dependency, `external_write:${target}`);
+	const rebased = (await mapFilesystem(runs.flatMap(run => run.dependencies), atStart))
+		.flatMap(dependency => dependency ?? (add(undefined, "start_state_unavailable"), []));
+	for (const [identity, dependency] of dependencies) if (!dependency && !rebased.some(dependency => dynamicDependencyIdentity(dependency) === identity)) add(undefined, `metadata_after_write:${identity}`);
+	const sourceComplete = complete && incompleteReasons.size === 0;
+	complete &&= runs.every(run => run.complete);
+	for (const dependency of rebased) add(dependency);
+	return { complete: complete && incompleteReasons.size === 0, sourceComplete, dependencies: Object.freeze([...dependencies.values()].flatMap(value => value ?? [])),
+		taints: Object.freeze([...taints]), incompleteReasons: [...incompleteReasons] };
 }
 
 const STABLE_SANDBOX_DEVICES = new Set(["/dev/null", "/dev/tty", "/dev/zero", "/dev/full"]);
@@ -2128,25 +2142,21 @@ const CONTENT_ADDRESSED_GIT = /^objects\/(?:[0-9a-f]{2}\/[0-9a-f]{38}(?:[0-9a-f]
 const KERNEL_CONFIGURATION = /^\/proc\/(?:filesystems|mounts|sys\/vm\/overcommit_memory)$|^\/sys\/kernel\/mm\/transparent_hugepage\//;
 const SAME_CONFINEMENT_TAINTS = ["confinement_observation"] as const;
 
-function workspaceMetadataExclusions(session: ActiveSession, target: string): readonly string[] | undefined {
-	return path.resolve(target) === path.resolve(session.workspace.sandboxRoot) ? session.workspace.observationExcludes : undefined;
-}
-
-async function captureHostPath(physicalPath: string, role: Exclude<ObservedProcessPath["role"], "metadata">, listed: boolean, absent: boolean,
-	capture?: (target: string) => ReturnType<typeof captureFilesystemEntry>): Promise<readonly DynamicDependency[] | undefined> {
+async function captureHostPath(physicalPath: string, role: DependencyRole, listed: boolean, absent: boolean,
+	capture: typeof captureFilesystemEntry) {
 	// A uniformly failed lookup depends on this exact name remaining absent, including under mutable roots.
 	if (absent) {
 		const dependency = await captureAbsenceDependency(physicalPath, slash(physicalPath), false);
 		return dependency ? [dependency] : undefined;
 	}
 	const dependencies: DynamicDependency[] = [];
-	for await (const { path: current, info, link, terminal } of walkFilesystemPath(path.resolve(physicalPath), capture ? { capture } : {})) {
+	for await (const { path: current, info, link, terminal } of walkFilesystemPath(path.resolve(physicalPath), { capture })) {
 		// What exists under these roots changes without a trace; absence was independently proved above.
 		if (["/proc", "/sys", "/dev", "/run", "/tmp", "/var/tmp"].some((root) => pathContains(root, current)) && (!pathContains("/run", current) || info && terminal)) return undefined;
 		if (!info) return undefined;
 		// Root's files, and this user's own outside the workspace (a PATH through ~/.local or nvm), validate exactly; no one else may write them.
 		if (info.uid !== 0n && info.uid !== BigInt(process.getuid?.() ?? -1) || (link === undefined && (info.mode & 0o022n) !== 0n)) return undefined;
-		if (link !== undefined) dependencies.push({ kind: "symlink", path: slash(current), target: link, targetDigest: sha256Digest(Buffer.from(link, "utf8")) });
+		if (link !== undefined) dependencies.push({ kind: "symlink", path: slash(current), target: link, targetDigest: sha256Digest(link) });
 		else if (terminal && info.isFile()) dependencies.push((await captureFileDependency(current, slash(current), role, { includeMetadata: true })).dependency);
 		// A listing reveals names; a program that stats the directory records that metadata on its own.
 		else if (terminal && info.isDirectory()) dependencies.push(await captureDirectoryDependency(current, slash(current), !listed, [], listed));
@@ -2161,34 +2171,27 @@ async function replayFilesystemEffects(
 	artifacts: VerifiedArtifactClosure,
 	journal: readonly OrderedEffectEvent[],
 	projection: ExecutionPathProjection,
-	workspaceRoot: string,
 	privateStorage?: string,
-): Promise<void> {
-	const changes: SandboxWorkspaceChange[] = [];
+) {
+	const changes: SandboxWorkspaceChange[] = [], { workspaceRoot } = projection;
 	for (const event of journal) {
 		if (event.kind === "output") continue;
 		const target = projection.toPhysical(event.path), inside = !!target && pathContains(workspaceRoot, target);
 		if (!target || target === path.resolve(workspaceRoot) || !inside && pathContains(projection.sourceRoot, target)) {
 			throw new Error(`replay effect escapes workspace: ${event.path}`);
 		}
-		const root = inside ? workspaceRoot : await hostRoot(target), resource = slash(path.relative(root, target));
+		const root = inside ? workspaceRoot : await hostRoot(target), address = { root, target, resource: slash(path.relative(root, target)) };
 		if (event.before.kind === "directory" || event.after.kind === "directory") {
-			if (event.before.kind !== "absent" && event.before.kind !== "directory") throw new Error(`unsupported replay type change: ${event.path}`);
-			if (event.after.kind !== "absent" && event.after.kind !== "directory") throw new Error(`unsupported replay type change: ${event.path}`);
+			if ([event.before, event.after].some(state => state.kind !== "absent" && state.kind !== "directory")) throw new Error(`unsupported replay type change: ${event.path}`);
 			changes.push({
-				kind: "directory",
-				root,
-				target,
-				resource,
+				...address, kind: "directory",
 				...(event.before.kind === "directory" ? { before: directoryState(event.before) } : {}),
 				...(event.after.kind === "directory" ? { after: directoryState(event.after) } : {}),
 			});
 			continue;
 		}
 		changes.push({
-			root,
-			target,
-			resource,
+			...address,
 			...(event.operation ? { operation: event.operation } : {}),
 			...(event.object ? { object: { ...event.object, path: projection.toPhysical(event.object.path)! } } : {}),
 			...(event.aliases ? { aliases: event.aliases.map(name => projection.toPhysical(name)!) } : {}),
@@ -2204,7 +2207,7 @@ async function replayFilesystemEffects(
 
 /** Apply changes in a session's private branch as its sandboxes would have: over the merged view's state, into its upper
  * directory, a removal of a host object as a whiteout its sandboxes read. */
-async function privateReplay(storage: string, changes: readonly SandboxWorkspaceChange[]): Promise<void> {
+async function privateReplay(storage: string, changes: readonly SandboxWorkspaceChange[]) {
 	const { upper, log, deleted } = await privateBranch(storage);
 	const merged = async (target: string) => (await lstat(path.join(upper, target)).then(() => path.join(upper, target), () => undefined)) ?? (deleted(target) ? undefined : target);
 	for (const change of changes) {
@@ -2231,17 +2234,13 @@ async function privateReplay(storage: string, changes: readonly SandboxWorkspace
 	}
 }
 
-function directoryState(state: NonNullable<SandboxDirectoryChange["before"]>): NonNullable<SandboxDirectoryChange["before"]> {
-	return { entriesDigest: state.entriesDigest, mode: state.mode, uid: state.uid, gid: state.gid };
+function directoryState({ entriesDigest, mode, uid, gid }: SandboxDirectoryState) {
+	return { entriesDigest, mode, uid, gid };
 }
 
 /** Output events carry the target's own descriptor. */
-function loadOutputEvents(artifacts: VerifiedArtifactClosure, journal: readonly OrderedEffectEvent[]): readonly BufferedOutput[] {
+function loadOutputEvents(artifacts: VerifiedArtifactClosure, journal: readonly OrderedEffectEvent[]) {
 	return journal.flatMap(event => event.kind === "output" ? [{ fd: event.fd, data: artifacts.read(event.data) }] : []);
-}
-
-function wireOutput(output: readonly BufferedOutput[]): readonly { readonly fd: 1 | 2; readonly data: string }[] {
-	return output.map((event) => ({ fd: event.fd, data: event.data.toString("base64") }));
 }
 
 function sandboxPolicyArguments(
@@ -2251,7 +2250,7 @@ function sandboxPolicyArguments(
 	mounts: readonly SandboxMount[],
 	execMounts: readonly ExecMount[],
 	privateWrites: string,
-): readonly string[] {
+) {
 	return [
 		"run",
 		"--chroot",
@@ -2275,14 +2274,14 @@ function sandboxPolicyArguments(
 }
 
 /** What the brokered run a traced launcher `pid` started wrote, with its own descendants; a run never answers for itself. */
-function brokeredWrites(session: ActiveSession, pid: number, self?: SessionWriter): readonly string[] | undefined {
+function brokeredWrites(session: ActiveSession, pid: number, self?: SessionWriter) {
 	const writers = sessionWriters(session).filter(writer => writer !== self && writer.pid === pid);
 	return writers.length && writers.every(writer => writer.written) ? [...new Set(writers.flatMap(writer => writer.written!))] : undefined;
 }
 
 const sessionWriters = (session: ActiveSession) => [...session.writers].filter(writer => writer.owner === session.token);
 
-function workspaceWriterRecords(workspace: SandboxWorkspaceContext): Set<SessionWriter> {
+function workspaceWriterRecords(workspace: SandboxWorkspaceContext) {
 	const writers = workspaceWriters.get(workspace.transactions) ?? new Set<SessionWriter>();
 	workspaceWriters.set(workspace.transactions, writers); return writers;
 }
@@ -2305,7 +2304,7 @@ export async function observeWorkspaceWrites(workspace: SandboxWorkspaceContext,
 	return false;
 }
 
-async function shareSessionWriter(session: ActiveSession, { id, owner, startedAt, endedAt, writes }: SessionWriter, trace?: WorkspaceWriterTransfer["trace"]): Promise<void> {
+async function shareSessionWriter(session: ActiveSession, { id, owner, startedAt, endedAt, writes }: SessionWriter, trace?: WorkspaceWriterTransfer["trace"]) {
 	await session.observationOwner?.call("writes", { writer: { id, owner, startedAt, endedAt, writes, trace } });
 }
 
@@ -2333,90 +2332,123 @@ async function privateBranch(storage: string) {
 	const upper = path.join(storage, "writes", "upper"), log = path.join(storage, "writes", "deleted.log");
 	const deletions = (await readFile(log, "utf8").catch(() => "")).split("\n").filter(Boolean)
 		.map(line => `/${line.replace(/\\(.)/g, (_, escaped: string) => escaped === "n" ? "\n" : escaped === "r" ? "\r" : escaped)}`);
-	return { upper, log, deletions, deleted: (target: string) => deletions.some(entry => target === entry || target.startsWith(`${entry}/`)) };
+	return { upper, log, deleted: (target: string) => deletions.some(entry => target === entry || target.startsWith(`${entry}/`)) };
 }
 
 /** The nearest directory above `target` the host holds: where a change outside the workspace stages and commits. */
-async function hostRoot(target: string): Promise<string> {
+async function hostRoot(target: string) {
 	for (let directory = path.dirname(target); ; directory = path.dirname(directory)) {
 		if ((await lstat(directory).catch(() => undefined))?.isDirectory() || directory === path.dirname(directory)) return directory;
 	}
 }
 
-/** Native opens pin these bytes before exposing a descriptor; no post-execution host read can replace that proof. */
-async function privateInputImages(storage: string, needed?: ReadonlySet<string>) {
-	const root = path.join(storage, "writes", "inputs"), indexes = await readdir(path.join(root, "paths")).catch(error => {
+/** Native images prove first reads; retained preimages prove earlier writes, with traced interference excluded. */
+async function privateInputImages(session: ActiveSession, needed: ReadonlySet<string>, before?: PrivatePrestate, effects = false) {
+	const root = path.join(session.processRoot, "private", "writes", "inputs"), indexes = await readdir(path.join(root, "paths")).catch(error => {
 		if (missing(error)) return []; throw error;
 	});
 	if (indexes.length > 8192) throw new Error("input image index bound exceeded");
-	const fields = ["dev", "ino", "mode", "nlink", "uid", "gid", "rdev", "size", "blksize", "blocks", "atimeNs", "mtimeNs", "ctimeNs", "birthtimeNs"] as const;
+	const fields = FILESYSTEM_METADATA_FIELDS;
 	const decode = (values: unknown) => {
 		if (!Array.isArray(values) || values.length !== fields.length || values.some(value => typeof value !== "string" || !/^-?\d{1,40}$/.test(value)))
 			throw new Error("invalid input image identity");
 		return Object.fromEntries(fields.map((field, index) => [field, BigInt(values[index])])) as Record<typeof fields[number], bigint>;
 	};
-	const capture = async (key: string) => {
+	const upper = privateUpper(session), predecessors = new Set<string>();
+	const file = (target: string, hash: string, metadata: Pick<BigIntStats, "mode" | "uid" | "gid" | "size" | "nlink">): DynamicDependency => {
+		if (before?.files.has(target)) predecessors.add(target);
+		return { kind: "file", path: slash(target), role: "input", contentDigest: `sha256:${hash}`, metadataDigest: filesystemMetadataDigest(metadata) };
+	};
+	const capture = sharedWalk(async (key: string) => {
 		const directory = path.join(root, key), row = JSON.parse(await readFile(path.join(directory, "proof.json"), "utf8")) as { path: string; physical: unknown; original: unknown };
 		const original = decode(row.original), physical = decode(row.physical);
 		if (!path.isAbsolute(row.path) || (original.mode & 0o170000n) !== 0o100000n || original.nlink !== 1n || original.size < 0n || original.size > 32n * 1024n * 1024n)
 			throw new Error("invalid input image proof");
-		const [baseline, working] = await Promise.all([captureStableFile(path.join(directory, "baseline"), Number(original.size)), captureStableFile(path.join(directory, "working"), 32 * 1024 * 1024)]);
+		const [baseline, working] = await Promise.all([captureFileDigest(path.join(directory, "baseline"), Number(original.size)), captureFileDigest(path.join(directory, "working"), 32 * 1024 * 1024)]);
 		if (baseline.stat.size !== original.size || working.stat.dev !== physical.dev || working.stat.ino !== physical.ino) throw new Error("input image owner changed");
-		return { path: row.path, hash: baseline.hash, physical, original: { ...original, isFile: () => true, isDirectory: () => false, isSymbolicLink: () => false },
-			unchanged: working.hash === baseline.hash && working.stat.mode === physical.mode && working.stat.uid === physical.uid && working.stat.gid === physical.gid &&
-				working.stat.mtimeNs === physical.mtimeNs && working.stat.ctimeNs === physical.ctimeNs };
-	};
-	const captured = new Map<string, ReturnType<typeof capture>>(), images = new Map<string, Awaited<ReturnType<typeof capture>> & { links: Extract<DynamicDependency, { kind: "symlink" }>[] }>();
+		const previous = before?.files.get(row.path);
+		if (previous && (previous.stat.dev !== physical.dev || previous.stat.ino !== physical.ino)) return undefined;
+		return previous ? file(row.path, previous.hash, { ...previous.stat, nlink: original.nlink + previous.stat.nlink - physical.nlink })
+			: !before?.entries.has(row.path) && working.hash === baseline.hash && sameFilesystemIdentity(working.stat, physical) ? file(row.path, baseline.hash, original) : undefined;
+	});
+	const images = new Map<string, DynamicDependency[] | undefined>();
 	for (const name of indexes) {
 		if (!/^[0-9a-f]{16}\.json$/.test(name)) throw new Error("invalid input image index");
 		const index = JSON.parse(await readFile(path.join(root, "paths", name), "utf8")) as { path: string; image: string; ambiguous?: boolean; sealed?: boolean; links: [string, string][] };
-		if (needed && !needed.has(index.path)) continue;
+		if (!needed.has(index.path)) continue;
 		if (!path.isAbsolute(index.path) || index.ambiguous || !index.sealed || !/^[0-9a-f]{16}$/.test(index.image) || !Array.isArray(index.links) || index.links.length > 40 ||
 			index.links.some(link => !Array.isArray(link) || link.length !== 2 || !path.isAbsolute(link[0]) || typeof link[1] !== "string")) throw new Error("unsealed input image");
-		if (!captured.has(index.image)) captured.set(index.image, capture(index.image));
-		images.set(index.path, { ...await captured.get(index.image)!, links: index.links.map(([path, target]) => ({ kind: "symlink", path, target, targetDigest: sha256Digest(target) })) });
+		const input = await capture(index.image);
+		images.set(index.path, input ? [...index.links.map(([path, target]): DynamicDependency => ({ kind: "symlink", path, target, targetDigest: sha256Digest(target) })), input] : undefined);
 	}
+	for (const target of needed) if (!images.has(target)) {
+		if (before?.entries.has(target) || await lstat(path.join(upper, target)).then(() => true, error => { if (!missing(error)) throw error; return false; })) {
+			const previous = before?.entries.get(target)?.nlink === 1n && before.files.get(target);
+			images.set(target, previous ? [file(target, previous.hash, previous.stat)] : undefined);
+		}
+	}
+	if (!effects && predecessors.size && await privateInterference(session, predecessors, before!.startedAt))
+		for (const [target, dependencies] of images) if (dependencies?.some(dependency => dependency.kind === "file" && predecessors.has(dependency.path))) images.set(target, undefined);
 	return images;
 }
 
-/** Private changes stand over the host state they replace; unchanged read images have no effects to commit. */
-async function privateCommits(storage: string, since: number, candidates: Iterable<string>) {
-	const { upper, deleted } = await privateBranch(storage), stat = (target: string) => lstat(target, { bigint: true }).catch(() => undefined);
-	const changes: SandboxWorkspaceChange[] = [], unrepresentable: string[] = [];
+/** The same prestate authorizes child reuse and its effect journal; the enclosing session starts over the host. */
+async function privateCommits(session: ActiveSession, since: number, candidates: Iterable<string>, prestate?: PrivatePrestate, owned: readonly SessionWriter[] = []) {
+	const { upper, deleted } = await privateBranch(path.join(session.processRoot, "private")), stat = (target: string) => lstat(target, { bigint: true }).catch(() => undefined);
+	const changes: SandboxWorkspaceChange[] = [], before = new Map<string, DynamicDependency | undefined>();
 	for (const target of new Set([...candidates].map(name => path.posix.resolve(name)))) {
+		if (STABLE_SANDBOX_DEVICES.has(target)) continue;
 		const copy = path.join(upper, target), [own, native] = await Promise.all([stat(copy), stat(target)]);
-		if (!own && !(native && deleted(target)) || own?.isDirectory() && native?.isDirectory()) continue;
-		const file = async (at: string, info?: Awaited<ReturnType<typeof stat>>) => info?.isFile() ? { content: await readFile(at), mode: Number(info.mode) & 0o7777, modified: String(info.mtimeNs) } : undefined;
-		const [after, before] = await Promise.all([file(copy, own), file(target, native)]);
-		if (after && before && Buffer.from(after.content).equals(before.content) && after.mode === before.mode && after.modified === before.modified) continue;
-		if (native && Number(native.ctimeMs) > since || own && !own.isFile() && !own.isDirectory() || native && !native.isFile() && !native.isDirectory()) {
-			unrepresentable.push(`external_write:${target}`); continue;
-		}
+		const prior = prestate?.entries.get(target), initial = prior ?? (prestate?.deleted(target) ? undefined : native);
+		before.set(target, undefined);
+		if (!prior && native && Number(native.ctimeMs) > since || [own, initial].some(info => info && !info.isFile() && !info.isDirectory()) ||
+			prior?.isFile() && !prestate!.files.has(target)) continue;
+		const file = (at: string, info?: BigIntStats) => info?.isFile() ? captureStableFile(at, MAX_CAPTURE_BYTES, true, { stat: info }) : undefined;
+		const [afterFile, beforeFile] = await Promise.all([file(copy, own), prestate?.files.get(target) ?? file(target, initial)]);
+		const entry = prestate?.structure?.entries.get(target.slice(1)), beforeDirectory = initial?.isDirectory()
+			? prior ? entry?.kind === "directory" ? directoryState(entry) : undefined : await readSandboxDirectoryState(target) : undefined;
+		before.set(target, beforeFile ? { kind: "file", path: target, role: "input", contentDigest: `sha256:${beforeFile.hash}`, metadataDigest: filesystemMetadataDigest(initial!) }
+			: beforeDirectory ? { kind: "directory", path: target, entriesDigest: beforeDirectory.entriesDigest, metadataDigest: filesystemMetadataDigest(initial!) } : { kind: "absence", path: target });
+		if (!own && !deleted(target) || own?.isDirectory() && initial?.isDirectory() || afterFile && beforeFile && afterFile.hash === beforeFile.hash && own!.mode === initial!.mode && own!.mtimeNs === initial!.mtimeNs) continue;
 		const root = await hostRoot(target), resource = slash(path.relative(root, target));
-		changes.push(own?.isDirectory() || native?.isDirectory()
-			? { kind: "directory", root, target, resource, ...(native ? { before: (await readSandboxDirectoryState(target))! } : {}), ...(own ? { operation: "mkdir" as const, after: (await readSandboxDirectoryState(copy))! } : {}) }
-			: { root, target, resource, ...(before ? { before: before.content, beforeMode: before.mode } : {}), ...(after ? { after: after.content, afterMode: after.mode, afterModified: after.modified } : {}) });
+		changes.push(own?.isDirectory() || initial?.isDirectory()
+			? { kind: "directory", root, target, resource, before: beforeDirectory, ...(own ? { operation: "mkdir" as const, after: (await readSandboxDirectoryState(copy))! } : {}) }
+			: { root, target, resource, ...(beforeFile ? { before: beforeFile.content!, beforeMode: Number(initial!.mode) & 0o7777 } : {}), ...(afterFile ? { after: afterFile.content!, afterMode: Number(own!.mode) & 0o7777, afterModified: String(own!.mtimeNs) } : {}) });
 	}
-	return { changes, unrepresentable };
+	if (prestate) for (const [target, dependencies] of await privateInputImages(session,
+		new Set([...prestate.files.keys()].filter(target => before.has(target))), prestate, true)) {
+		before.set(target, dependencies?.find(dependency => dependency.kind === "file" && dependency.path === target));
+	}
+	if (prestate && before.size && await privateInterference(session, new Set(before.keys()), prestate.startedAt, owned)) for (const target of before.keys()) before.set(target, undefined);
+	return { changes, before, complete: [...before.values()].every(Boolean) };
+}
+
+/** The entry is flushed before a syscall runs; a partial entry seen at capture start stays unsafe after completion. */
+async function privateInterference(session: ActiveSession, paths: ReadonlySet<string>, since: number, owned: readonly SessionWriter[] = []) {
+	const targets = new Set<string>(), until = Date.now();
+	for (const target of paths) for (let name = target; ; name = path.dirname(name)) {
+		targets.add(name); targets.add(path.join(privateUpper(session), name)); if (name === "/") break;
+	}
+	for (const writer of sessionWriters(session)) if (!owned.includes(writer) && (writer.endedAt ?? Infinity) >= since) {
+		const tail = writer.tail ? await writer.tail.read() : writer;
+		if (tail.unsafe || !tail.writes || writesWithin(tail.writes.filter(write => !write.paths || write.at >= since || write.mapped), targets, since, until)) return true;
+	}
+	return false;
 }
 
 /** A filesystem mount names its access; an exec mount only its image. */
-function sandboxMountArgument(mount: SandboxMount | ExecMount): string {
+function sandboxMountArgument(mount: SandboxMount | ExecMount) {
 	if (!path.isAbsolute(mount.virtualPath) || !path.isAbsolute(mount.hostPath) || [mount.virtualPath, mount.hostPath].some((value) => value.includes(":"))) {
 		throw new Error(`Sandlock mount cannot represent ${mount.virtualPath}:${mount.hostPath}`);
 	}
 	return `${mount.virtualPath}:${mount.hostPath}${"readOnly" in mount ? (mount.readOnly ? ":ro" : ":rw") : ""}`;
 }
 
-function speculativeProducerProof(ready: ReadyBackend, deniedPaths: readonly string[], policy = POLICY_ID): ProcessProducerProof {
+function speculativeProducerProof(ready: ReadyBackend, deniedPaths: readonly string[], policy = POLICY_ID) {
 	return Object.freeze({
 		observer: { provider: "strace", fingerprint: ready.observerFingerprint },
 		execution: { authority: "speculative", confinement: { provider: "sandlock", fingerprint: digestObject({ policy, deniedPaths }) } },
 	} satisfies ProcessProducerProof);
-}
-
-function compatibleProducer(expected: ProcessProducerProof, candidate: ProcessProducerProof): boolean {
-	return expected.execution.authority === "speculative" && stableEqual(expected, candidate);
 }
 
 async function runSpawn(
@@ -2516,15 +2548,15 @@ async function acquireOutputChannels(parent: string, signal?: AbortSignal) {
 }
 
 /** The native launcher's framing: output as "o<fd> <length>\n<bytes>", then "x <code>", "s <signal number>" or "b" (bypass in place). */
-function wireResponse(response: DispatcherResponse): Buffer {
-	const frames = (response.output ?? []).flatMap(({ fd, data }) => [Buffer.from(`o${fd} ${Buffer.byteLength(data, "base64")}\n`), Buffer.from(data, "base64")]);
+function wireResponse(response: DispatcherResponse) {
+	const frames = [...(response.output ?? []).map(event => ({ ...event, kind: "o" })), ...response.streams ?? []];
 	const exit = response.exit, end = response.kind === "bypass" ? "b" : exit?.kind === "signal" ? `s ${exit.signal}` : `x ${exit?.kind === "code" ? exit.code : 125}`;
-	return Buffer.concat([...frames, ...(response.streams ?? []).flatMap(({ fd, kind, data }) => [Buffer.from(`${kind}${fd} ${data.length}\n`), data]), Buffer.from(`${end}\n`)]);
+	return Buffer.concat([...frames.flatMap(({ fd, kind, data }) => [Buffer.from(`${kind}${fd} ${data.length}\n`), data]), Buffer.from(`${end}\n`)]);
 }
 
 /** The launcher's settlement of each inherited pipe: read back the shortest queue prefix, then write the suffix, that leave the queue as
  * the run left it. A queue of one repeated byte (a jobserver's tokens) usually needs neither. Undefined when the run did more than a queue can. */
-function streamSettlement(inputs: ReturnType<typeof descriptorInputs>, events: readonly { readonly alias: number; readonly kind: string; readonly data: Buffer }[]): StreamSettlement[] | undefined {
+function streamSettlement(inputs: ReturnType<typeof descriptorInputs>, events: readonly { readonly alias: number; readonly kind: string; readonly data: Buffer }[]) {
 	const queues = new Map<number, { readonly initial: Buffer; queue: Buffer }>();
 	for (const input of inputs) if (input.type === "pipe" && !queues.has(input.image)) queues.set(input.image, { initial: Buffer.from(input.content ?? "", "base64"), queue: Buffer.from(input.content ?? "", "base64") });
 	for (const { alias, kind, data } of events) {
@@ -2546,12 +2578,12 @@ function streamSettlement(inputs: ReturnType<typeof descriptorInputs>, events: r
 	return settlement;
 }
 
-function parseDispatcherRequest(body: string): Pick<DispatcherRequest, "token" | "pid" | "descriptors"> | undefined {
+function parseDispatcherRequest(body: string) {
 	try {
 		const value: unknown = JSON.parse(body.trim());
-		if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+		if (!isRecord(value)) return undefined;
 		const request = value as Partial<DispatcherRequest>;
-		return typeof request.token === "string" && Number.isSafeInteger(request.pid) && request.pid! > 0 &&
+		return typeof request.token === "string" && isSafeCount(request.pid, 1) &&
 			(request.descriptors === undefined || Array.isArray(request.descriptors) && request.descriptors.length <= 64 && request.descriptors.every(entry => entry &&
 				[entry.fd, entry.alias, entry.flags, entry.capacity].every(Number.isSafeInteger) && entry.fd > 2 && typeof entry.eof === "boolean" &&
 				[entry.device, entry.inode].every(value => typeof value === "string" && /^\d+$/.test(value)) && typeof entry.queueHex === "string" && /^(?:[0-9a-f]{2})*$/.test(entry.queueHex)))
@@ -2561,39 +2593,34 @@ function parseDispatcherRequest(body: string): Pick<DispatcherRequest, "token" |
 	}
 }
 
-async function eligibleRequest(session: ActiveSession, request: DispatcherRequest, expectedContext: ProcessExecutionContext): Promise<RequestEligibility> {
-	if (!validProcessContext(request.context)) return { reason: "process_context_unsupported" };
-	if (!pathContains(session.workspace.sandboxRoot, request.cwd)) return { reason: "cwd_outside_workspace" };
-	if (request.args.length > 4096) return { reason: "argument_count_limit" };
-	if (request.args.reduce((sum, value) => sum + Buffer.byteLength(value), 0) > 1024 * 1024) return { reason: "argument_bytes_limit" };
-	if (!session.topLevelOutputEndpoints) return { reason: "output_endpoint_capture_missing" };
-	if (request.context.outputEndpoints.some((endpoint) => !endpoint)) return { reason: "request_output_endpoint_missing" };
+function eligibleRequest(session: ActiveSession, request: DispatcherRequest, expectedContext: ProcessExecutionContext) {
+	if (!validProcessContext(request.context)) return "process_context_unsupported";
+	if (!pathContains(session.workspace.sandboxRoot, request.cwd)) return "cwd_outside_workspace";
+	if (request.args.length > 4096) return "argument_count_limit";
+	if (request.args.reduce((sum, value) => sum + Buffer.byteLength(value), 0) > 1024 * 1024) return "argument_bytes_limit";
+	if (!session.topLevelOutputEndpoints) return "output_endpoint_capture_missing";
+	if (request.context.outputEndpoints.some((endpoint) => !endpoint)) return "request_output_endpoint_missing";
 	// The launch key below still checks a discarded descriptor's type and flags. Both outlets belong to one captured process.
 	const endpoints = [session.topLevelOutputEndpoints, ...session.nestedOutputEndpoints].find(pair =>
 		request.context.outputEndpoints.every(endpoint => pair.includes(endpoint) || endpoint === "/dev/null")) ?? session.topLevelOutputEndpoints;
-	// A pipe another traced process reads (a build tool's compiler output) keeps its descriptor: the launcher writes there.
-	const pipes = request.context.outputEndpoints.map(endpoint => /^pipe:\[\d+\]$/.test(endpoint) && !endpoints.includes(endpoint)) as [boolean, boolean];
-	const routeOf = (endpoint: string, fd: 1 | 2) => pipes[fd - 1] ? fd === 2 && endpoint === request.context.outputEndpoints[0] ? 1 : fd
-		: endpoint === endpoints[0] ? 1 : endpoint === endpoints[1] ? 2 : endpoint === "/dev/null" ? 0 : undefined;
-	const route = [routeOf(request.context.outputEndpoints[0], 1), routeOf(request.context.outputEndpoints[1], 2)] as const;
-	if (route[0] === undefined || route[1] === undefined) return { reason: `output_endpoint_mismatch:${JSON.stringify({ expected: endpoints, observed: request.context.outputEndpoints })}` };
-	const outputRoute: OutputRoute = [route[0], route[1]], outputFlags = outputStatusFlags(request.context);
-	const context = routedProcessContext(expectedContext, outputRoute, request.context.descriptorTypes[0] === "closed", undefined, pipes.some(Boolean) ? pipes : undefined, outputFlags);
-	if (request.context.launchKey !== context.launchKey) return { reason: "launch_key_mismatch" };
-	if (request.context.umask !== context.umask) return { reason: "umask_mismatch" };
-	return { route: outputRoute, ...(pipes.some(Boolean) ? { outputPipes: pipes } : {}), ...(outputFlags ? { outputFlags } : {}) };
+	const launch = processLaunchOptions(request.context, endpoints);
+	if (!launch) return "output_endpoint_mismatch";
+	const context = routedProcessIdentity(expectedContext, launch);
+	if (request.context.launchKey !== context.launchKey) return "launch_key_mismatch";
+	if (request.context.umask !== context.umask) return "umask_mismatch";
+	return launch;
 }
 
-function shellArguments(invocation: ToolProcessInvocation, command: string): string[] {
+function shellArguments(invocation: ToolProcessInvocation, command: string) {
 	return invocation.commandTransport === "argv" ? [...invocation.shellArgs, command] : [...invocation.shellArgs];
 }
 
 async function topLevelProcessPrototype(invocation: ToolProcessInvocation, request: ProcessExecutionRequest, environment: Readonly<Record<string, string>>,
-	projection: ExecutionPathProjection, platformFingerprint: Sha256Digest): Promise<ExecPrototype> {
+	projection: ExecutionPathProjection, platformFingerprint: Sha256Digest) {
 	return createExecPrototype({
 		executablePath: invocation.shell,
 		executableDigest: await hashExecutableFile(invocation.shell, request.signal),
-		argv: [invocation.shell, ...shellArguments(invocation, request.command)].map(value => projection.normalizeValue(value)),
+		argv: [invocation.shell, ...shellArguments(invocation, request.command)],
 		logicalCwd: projection.toLogical(projection.toPhysical(request.cwd) ?? request.cwd),
 		environment,
 		umask: process.umask(),
@@ -2613,7 +2640,7 @@ async function topLevelProcessPrototype(invocation: ToolProcessInvocation, reque
 	});
 }
 
-function actorReplayProducer(producer: ProcessProducerProof, deniedPaths: readonly string[]): boolean {
+function actorReplayProducer(producer: ProcessProducerProof, deniedPaths: readonly string[]) {
 	if (producer.observer.provider !== "strace" || producer.observer.fingerprint !== OBSERVER_FINGERPRINT) return false;
 	const confinement = producer.execution.authority === "actor" ? undefined : producer.execution.confinement;
 	return !confinement || confinement.provider === "sandlock" && [POLICY_ID, LEAF_POLICY_ID].some((policy) => confinement.fingerprint === digestObject({ policy, deniedPaths }));
@@ -2626,11 +2653,14 @@ function exitOutcome(outcome: SpawnOutcome): ExitOutcome {
 	return { kind: "signal", signal: os.constants.signals[outcome.signal] ?? 9, coreDumped: false };
 }
 
-function assertInvocationMatches(invocation: ToolProcessInvocation, request: ProcessExecutionRequest): void {
-	if (request.command !== invocation.command) throw new Error("process command differs from the action execution context");
-	if (path.resolve(request.cwd) !== path.resolve(invocation.cwd)) throw new Error("process cwd differs from the action execution context");
-	if (request.timeout !== invocation.timeout) throw new Error("process timeout differs from the action execution context");
-	if (!stableEqual(definedProcessEnvironment(request.environment), invocation.environment)) throw new Error("process environment differs from the action execution context");
+function assertInvocationMatches(invocation: ToolProcessInvocation, request: ProcessExecutionRequest) {
+	const matches = {
+		command: request.command === invocation.command,
+		cwd: path.resolve(request.cwd) === path.resolve(invocation.cwd),
+		timeout: request.timeout === invocation.timeout,
+		environment: stableEqual(definedProcessEnvironment(request.environment), invocation.environment),
+	};
+	for (const [field, valid] of Object.entries(matches)) if (!valid) throw new Error(`process ${field} differs from the action execution context`);
 }
 
 export async function validateTransferredProcessEvidence(
@@ -2652,60 +2682,23 @@ export async function validateTransferredProcessEvidence(
 	};
 }
 
-function mergeDependencyEvidence(certificates: readonly DynamicDependencyCertificate[], incompleteReasons: Set<string>): DynamicDependencyCertificate {
-	const dependencies = new Map<string, DynamicDependency>();
-	const taints = new Set<ProvenanceTaint>();
-	let complete = certificates.length > 0;
-	for (const certificate of certificates) {
-		complete &&= certificate.complete;
-		for (const taint of certificate.taints) taints.add(taint);
-		for (const dependency of certificate.dependencies) {
-			const identity = dynamicDependencyIdentity(dependency);
-			const existing = dependencies.get(identity);
-			if (
-				existing?.kind === "file" && dependency.kind === "file" && existing.contentDigest === dependency.contentDigest &&
-				existing.metadataDigest === dependency.metadataDigest && stableEqual(existing.aliases, dependency.aliases)
-			) {
-				if (existing.role !== "executable" && dependency.role === "executable") dependencies.set(identity, dependency);
-				continue;
-			}
-			// One run listed a directory, or the one holding a missing name, that another only reached: both saw the same state.
-			if (existing?.kind === dependency.kind && (dependency.kind === "directory" || dependency.kind === "absence") && Object.entries(dependency).every(([key, value]) =>
-				!(key in existing) || stableEqual(Reflect.get(existing, key), value))) { dependencies.set(identity, { ...existing, ...dependency }); continue; }
-			if (existing && !stableEqual(existing, dependency)) {
-				complete = false;
-				incompleteReasons.add(`dependency_changed_during_execution:${identity}`);
-				continue;
-			}
-			dependencies.set(identity, dependency);
-		}
-	}
-	return { complete: complete && incompleteReasons.size === 0, dependencies: Object.freeze([...dependencies.values()]), taints: Object.freeze([...taints]) };
-}
-
-function sensitivePaths(storeRoot: string, additional: readonly string[] | undefined): readonly string[] {
-	const home = os.homedir();
-	return Object.freeze(
-		[
-			storeRoot,
-			path.join(home, ".ssh"),
-			path.join(home, ".gnupg"),
-			path.join(home, ".aws"),
-			path.join(home, ".azure"),
-			path.join(home, ".kube"),
-			path.join(home, ".docker", "config.json"),
-			path.join(home, ".config", "gcloud"),
-			path.join(home, ".config", "gh", "hosts.yml"),
-			path.join(home, ".git-credentials"),
-			path.join(home, ".netrc"),
-			path.join(home, ".npmrc"),
-			path.join(home, ".pypirc"),
-			path.join(home, ".pi", "agent", "auth.json"),
-			path.join(home, ".codex", "auth.json"),
-			...(additional ?? []),
-		]
-			.filter((value) => path.isAbsolute(value))
-			.map((value) => path.resolve(value))
-			.filter((value, index, values) => values.indexOf(value) === index),
-	);
+function sensitivePaths(storeRoot: string, additional: readonly string[] | undefined) {
+	const home = os.homedir(), credentials = [
+		".ssh",
+		".gnupg",
+		".aws",
+		".azure",
+		".kube",
+		".docker/config.json",
+		".config/gcloud",
+		".config/gh/hosts.yml",
+		".git-credentials",
+		".netrc",
+		".npmrc",
+		".pypirc",
+		".pi/agent/auth.json",
+		".codex/auth.json",
+	].map(name => path.join(home, name));
+	return Object.freeze([...new Set([storeRoot, ...credentials, ...additional ?? []]
+		.filter(path.isAbsolute).map(value => path.resolve(value)))]);
 }

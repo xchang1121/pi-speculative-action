@@ -6,5 +6,5 @@ export { diagnosticAction, diagnosticJson, redactDiagnostics } from "./diagnosti
 export type * from "./runtime-contracts.ts";
 
 export function candidateExecutionMs(candidate: SpeculativeCandidate): number {
-	return nonNegativeFinite(candidate.work?.execution?.executionMs);
+	return nonNegativeFinite(candidate.executionMs);
 }

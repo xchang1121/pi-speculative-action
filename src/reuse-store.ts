@@ -4,14 +4,16 @@ import { mkdir, open, readFile, readdir, rename, rm, stat, utimes, writeFile } f
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { setTimeout as delay } from "node:timers/promises";
-import { type ArtifactReference, certificateReplayable, isSha256Digest, parseProcessCertificate, type ProcessProvenanceCertificate,
-	type ProvenanceTaint, referencedArtifacts, sha256DigestAsync, type Sha256Digest, validateArtifact } from "./provenance-certificate.ts";
+import {
+	type ArtifactReference, certificateReplayable, parseProcessCertificate, type ProcessProvenanceCertificate, type ProvenanceTaint,
+	referencedArtifacts, validateArtifact,
+} from "./provenance-certificate.ts";
+import { isSha256Digest, sha256DigestAsync, type Sha256Digest } from "./stable-value-hash.ts";
 import { stableStringify } from "./stable-json.ts";
 import { nonNegativeNumber, positiveInteger } from "./setting-input.ts";
 import { isMissing as missing } from "./error-utils.ts";
 import { mapFilesystem } from "./filesystem-evidence.ts";
-import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
-import { waitForCompletion } from "./scheduler.ts";
+import { RuntimeLifecycleLane, waitForCompletion } from "./runtime-lifecycle.ts";
 
 export interface ProvenanceStoreLimits { readonly maxCertificates: number; readonly maxBytes: number; }
 
@@ -159,7 +161,7 @@ export class ProvenanceCertificateStore {
 	async findByWeakKey(weakKey: Sha256Digest, executablePath: string, excludedCertificates?: ReadonlySet<Sha256Digest>): Promise<readonly ProcessProvenanceCertificate[]> {
 		const certificates: ProcessProvenanceCertificate[] = [];
 		for await (const certificate of this.candidatesByWeakKey(weakKey, executablePath, excludedCertificates)) certificates.push(certificate);
-		return certificates.sort((left, right) => right.createdAt - left.createdAt || right.id.localeCompare(left.id));
+		return certificates;
 	}
 
 	/** Indexes only select candidates; every yielded certificate still verifies its complete identity. */

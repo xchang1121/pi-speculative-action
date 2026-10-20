@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -132,13 +133,7 @@ function validateResult(value: unknown, file: string): StoredResult {
 	return result as StoredResult;
 }
 
-function execute(file: string, args: readonly string[]): Promise<void> {
-	return new Promise((resolve, reject) => {
-		const child = spawn(file, args, { stdio: "inherit", env: process.env });
-		child.once("error", reject);
-		child.once("exit", (code, signal) => {
-			if (code === 0) resolve();
-			else reject(new Error(`Benchmark runner exited with ${signal ?? code}`));
-		});
-	});
+async function execute(file: string, args: readonly string[]): Promise<void> {
+	const [code, signal] = await once(spawn(file, args, { stdio: "inherit", env: process.env }), "exit");
+	if (code !== 0) throw new Error(`Benchmark runner exited with ${signal ?? code}`);
 }
