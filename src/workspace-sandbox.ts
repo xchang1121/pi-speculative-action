@@ -39,6 +39,7 @@ import {
 } from "./workspace-transaction.ts";
 import { connectNativeOwner, ownsNativeProcesses } from "./native-owner.ts";
 import { nativeFilesystem } from "./process-startup.mjs";
+import { projectFileMutation } from "./workspace-state.ts";
 
 interface SandboxChangeTarget {
 	readonly root: string;
@@ -673,19 +674,15 @@ async function commitSandboxExecution(state: WorkspaceSandboxState, execution: S
 				if (inputs) for (const change of changes) if (!change.validationOnly && change.after)
 					createdEntries.get(path.dirname(change.target))?.push(path.basename(change.target));
 				// Directories are read at once; what their listings retain is decided in order.
-				const directories = changes.filter((change): change is SandboxDirectoryChange => !change.validationOnly && change.kind === "directory" && !!change.after);
-				const listed = await mapFilesystem(directories, async change => {
-					let listing: { names?: readonly string[] } | undefined;
-					return { same: await sameDirectoryAfter(change.target, change, inputs && (names => { listing = { names: names ?? createdEntries.get(change.target) }; })), listing };
-				});
-				directories.forEach((change, index) => {
-					const { same, listing } = listed[index]!;
-					if (!same) throw new Error(`directory changed while committing: ${change.resource}`);
-					if (!inputs || !listing) return;
-					const bytes = listing.names?.reduce((sum, name) => sum + name.length * 2 + 16, 0) ?? 0, retain = directoryBytes + bytes <= WORKSPACE_TRANSACTION_MAX_BYTES;
+				const listed = await mapFilesystem(changes.filter((change): change is SandboxDirectoryChange => !change.validationOnly && change.kind === "directory" && !!change.after),
+					async change => ({ change, names: await verifySandboxDirectoryAfter(change) }));
+				for (const { change, names: observed } of listed) {
+					if (!inputs) continue;
+					const names = observed ?? createdEntries.get(change.target);
+					const bytes = names?.reduce((sum, name) => sum + name.length * 2 + 16, 0) ?? 0, retain = directoryBytes + bytes <= WORKSPACE_TRANSACTION_MAX_BYTES;
 					if (retain) directoryBytes += bytes;
-					inputs.set(change.target, { names: retain ? listing.names : undefined });
-				});
+					inputs.set(change.target, { names: retain ? names : undefined });
+				}
 			} catch (error) {
 				inputs?.clear();
 				if (nativeStarted || applied.some((change) => change.kind !== "directory" && (change.operation || change.aliases))) {
@@ -975,7 +972,7 @@ async function createPrivateSandboxWorkspace(state: WorkspaceSandboxState, cwd: 
 				for (const alias of aliases.slice(1)) await link(path.join(upper, aliases[0]!), path.join(upper, alias));
 			}
 			const copied = ["", ...directories, ...aliasGroups.flat()];
-			if (!liveBase && aliasGroups.length) metadata = await preserveSnapshotMetadata(lowerRoot, upper, processRoot, false, await captureSnapshotMetadata(lowerRoot, copied), pinObject);
+			if (!liveBase) metadata = await preserveSnapshotMetadata(lowerRoot, upper, processRoot, false, await captureSnapshotMetadata(lowerRoot, copied), pinObject);
 			const mounted = await mountLinuxOverlayfs({ lowerRoot: lowerName ? path.dirname(lowerRoot) : lowerRoot,
 				privateRoot: overlayStorageRoot, options: overlayOptions, capabilityRegistry: state.overlayfsCapabilities });
 			overlay = { ...mounted, root: path.join(mounted.root, lowerName), upperRoot: upper };
@@ -1049,7 +1046,7 @@ async function preserveSnapshotMetadata(sourceRoot: string, sandboxRoot: string,
 		if (!current) await mkdir(target);
 		else if (!current.isDirectory()) throw new Error(`snapshot directory type changed: ${resource}`);
 	}
-	const rows: [BigIntStats, BigIntStats][] = [], objects = new Map<string, string>();
+	const translated: [string, BigIntStats][] = [], rows: [BigIntStats, BigIntStats][] = [], objects = new Map<string, string>();
 	// Set parent modes last so a read-only directory cannot prevent its own snapshot from being populated.
 	for (const resource of names.reverse()) {
 		const source = original.get(resource)!, target = path.join(sandboxRoot, resource);
@@ -1061,6 +1058,10 @@ async function preserveSnapshotMetadata(sourceRoot: string, sandboxRoot: string,
 		if (!source.isSymbolicLink()) await chmod(target, Number(source.mode & 0o7777n));
 		if (process.platform === "linux" || !source.isSymbolicLink()) await (source.isSymbolicLink() ? lutimes : utimes)(target, source.atime, source.mtime);
 		objects.set(`${current.dev}:${current.ino}`, `${source.dev}:${source.ino}`);
+		translated.push([target, source]);
+	}
+	await restoreModifiedTimes(translated.map(([target, source]) => [target, String(source.mtimeNs)]));
+	for (const [target, source] of translated) {
 		if (!native && (!pin || !source.isFile())) continue;
 		const physical = await pin!(target);
 		if (native) rows.push([physical, source]);
@@ -1673,29 +1674,22 @@ async function withPrivateSandboxWorkspace<T>(state: WorkspaceSandboxState, cwd:
 async function materializeCheckpoint(workspace: PrivateSandboxWorkspace, checkpoint: WorkspaceCheckpoint): Promise<void> {
 	const lineage: WorkspaceCheckpoint[] = [];
 	for (let current: WorkspaceCheckpoint | undefined = checkpoint; current; current = current.parent) { lineage.push(current); }
-	lineage.reverse();
-	// Committing cuts ancestry. Allocation may precede adoption, so prove this baseline contains the adopted root.
-	const root = lineage[0]!;
-	const adopted = root.committed && (await mapFilesystem(root.changes.filter(change => !change.validationOnly), async change => {
-		const target = path.resolve(workspace.sandboxRoot, change.resource);
-		await assertNoSymlinkPath(workspace.sandboxRoot, target);
-		if (change.kind === "directory") return sameDirectoryAfter(target, change).catch(() => false);
-		if (change.object) return false;
-		const current = await readRegularState(target);
-		if (change.aliases) await assertFileAliases(workspace.sandboxRoot, target,
-			change.aliases.map(alias => path.resolve(workspace.sandboxRoot, path.relative(root.sourceRoot, alias))), current?.identity);
-		return sameSandboxState(current, change.after === undefined ? undefined : { content: change.after, mode: change.afterMode ?? change.beforeMode ?? 0 }) &&
-			(change.afterModified === undefined || String(current?.identity?.mtimeNs) === change.afterModified);
-	})).every(Boolean);
-	for (const ancestor of lineage.slice(adopted ? 1 : 0)) {
-		const project = (name: string) => {
+	for (const ancestor of lineage.reverse()) {
+		const changes = ownSandboxChanges(ancestor.changes, name => {
 			const relative = relativeFilesystemPath(ancestor.sourceRoot, name);
 			if (relative === undefined) throw new Error("checkpoint object escapes workspace");
 			return path.resolve(workspace.sandboxRoot, relative);
-		};
-		const changes = ownSandboxChanges(ancestor.changes.map(change => ({ ...change, root: workspace.sandboxRoot, target: project(change.target),
-			...(change.kind !== "directory" ? { ...(change.object ? { object: { ...change.object, path: project(change.object.path) } } : {}),
-				...(change.aliases ? { aliases: change.aliases.map(project) } : {}) } : {}) })));
+		});
+		// Allocation may precede commit: prove the resulting bytes, namespace and times before skipping an adopted root.
+		if (ancestor.committed && (await mapFilesystem(changes.filter(change => !change.validationOnly), async change => {
+			await assertCommitTarget(change);
+			if (change.kind === "directory") { await verifySandboxDirectoryAfter(change); return true; }
+			const current = await readRegularState(change.target);
+			if (change.after !== undefined) await assertFileAliases(change.root, change.target,
+				change.afterAliases ?? (change.operation ? change.aliases : undefined) ?? [change.target], current?.identity);
+			return sameSandboxState(current, change.after === undefined ? undefined : { content: change.after, mode: change.afterMode ?? change.beforeMode ?? 0 }) &&
+				(process.platform !== "linux" || change.afterModified === undefined || String(current?.identity?.mtimeNs) === change.afterModified);
+		}).catch(() => [false])).every(Boolean)) continue;
 		workspace.recycle?.written.push(...writtenPaths(changes));
 		await commitSandboxExecution(workspace.pool.owner, { output: { result: { content: [], details: {} }, isError: false }, changes });
 		for (const change of changes) if (!change.validationOnly && change.kind !== "directory") {
@@ -1855,7 +1849,7 @@ async function assertCommitTarget(change: SandboxWorkspaceChange, capture?: type
 	if (change.kind === "directory" && change.operation && (change.before || !change.after)) {
 		throw new Error("Native directory creation requires an absent baseline and a sealed result");
 	}
-	if (change.kind !== "directory") for (const name of [...(change.aliases ?? []), ...(change.object ? [change.object.path] : [])]) {
+	if (change.kind !== "directory") for (const name of [...(change.aliases ?? []), ...(change.afterAliases ?? []), ...(change.object ? [change.object.path] : [])]) {
 		if (!path.isAbsolute(name) || !containsFilesystemPath(root, name) || path.resolve(name) === root) throw new Error("file object name escapes workspace");
 	}
 	await assertNoSymlinkPath(root, target, capture);
@@ -1897,12 +1891,13 @@ export function sameSandboxState(
 	return left.entriesDigest === right.entriesDigest && left.mode === right.mode && left.uid === right.uid && left.gid === right.gid;
 }
 
-async function sameDirectoryAfter(target: string, change: SandboxDirectoryChange, captureNames?: (names: readonly string[] | undefined) => void): Promise<boolean> {
+async function verifySandboxDirectoryAfter(change: SandboxDirectoryChange): Promise<readonly string[] | undefined> {
 	// Native mkdir observes existence; subsequent new-entry reads/access need their own proof.
-	if (!change.operation) return sameSandboxState(await readSandboxDirectoryState(target, captureNames), change.after);
-	const directory = (await lstat(target)).isDirectory();
-	if (directory) captureNames?.(undefined);
-	return directory;
+	let names: readonly string[] | undefined;
+	const same = change.operation ? (await lstat(change.target)).isDirectory()
+		: sameSandboxState(await readSandboxDirectoryState(change.target, captured => { names = captured; }), change.after);
+	if (!same) throw new Error(`directory changed while committing: ${change.resource}`);
+	return names;
 }
 
 function assertExistingInputPolicy(change: SandboxWorkspaceChange): void {
@@ -1920,7 +1915,7 @@ function sandboxChangeBytes(change: SandboxWorkspaceChange | undefined): number 
 }
 
 /** Take ownership once, before cleanup or commit locks can yield to a retained caller reference. */
-function ownSandboxChanges(changes: readonly SandboxWorkspaceChange[]): SandboxWorkspaceChange[] {
+function ownSandboxChanges(changes: readonly SandboxWorkspaceChange[], project = (name: string) => path.resolve(name)): SandboxWorkspaceChange[] {
 	const result = new Map<string, SandboxWorkspaceChange>();
 	for (const change of changes) {
 		const key = filesystemPathKey(change.target);
@@ -1930,32 +1925,23 @@ function ownSandboxChanges(changes: readonly SandboxWorkspaceChange[]): SandboxW
 			filesystemPathKey(previous.root) !== filesystemPathKey(change.root) ||
 			(previous.kind === "directory") !== (change.kind === "directory") || previous.validationOnly !== change.validationOnly ||
 			previous.operation !== change.operation || previous.kind !== "directory" && change.kind !== "directory" &&
-				(JSON.stringify(previous.object) !== JSON.stringify(change.object) || JSON.stringify(previous.aliases) !== JSON.stringify(change.aliases))
+				JSON.stringify(projectFileMutation(previous)) !== JSON.stringify(projectFileMutation(change))
 		) {
 			throw new Error(`inconsistent sandbox baseline: ${change.resource}`);
 		}
-		if (previous.kind === "directory" && change.kind === "directory") {
-			if (!sameSandboxState(previous.before, change.before)) throw new Error(`inconsistent sandbox baseline: ${change.resource}`);
-			result.set(key, { ...change, before: previous.before, accessMode: (previous.accessMode ?? 0) | (change.accessMode ?? 0) });
-			continue;
-		}
-		const previousFile = previous as SandboxFileChange;
-		const changeFile = change as SandboxFileChange;
-		if (
-			!sameOptionalBytes(previousFile.before, changeFile.before) ||
-			(previousFile.beforeMode !== undefined && changeFile.beforeMode !== undefined && !sameExecutableMode(previousFile.beforeMode, changeFile.beforeMode))
-		) {
-			throw new Error(`inconsistent sandbox baseline: ${change.resource}`);
-		}
-		result.set(key, { ...changeFile, before: previousFile.before, beforeMode: previousFile.beforeMode, beforeIdentity: previousFile.beforeIdentity,
-			accessMode: (previous.accessMode ?? 0) | (change.accessMode ?? 0) });
+		const same = previous.kind === "directory" && change.kind === "directory" ? sameSandboxState(previous.before, change.before)
+			: previous.kind !== "directory" && change.kind !== "directory" && sameOptionalBytes(previous.before, change.before) &&
+				(previous.beforeMode === undefined || change.beforeMode === undefined || sameExecutableMode(previous.beforeMode, change.beforeMode));
+		if (!same) throw new Error(`inconsistent sandbox baseline: ${change.resource}`);
+		const baseline = previous.kind === "directory" ? { before: previous.before }
+			: { before: previous.before, beforeMode: previous.beforeMode, beforeIdentity: previous.beforeIdentity };
+		result.set(key, { ...change, ...baseline, accessMode: (previous.accessMode ?? 0) | (change.accessMode ?? 0) } as SandboxWorkspaceChange);
 	}
 	return [...result.values()].map((change): SandboxWorkspaceChange => {
-		const target = { root: path.resolve(change.root), target: path.resolve(change.target) };
+		const target = { root: project(change.root), target: project(change.target) };
 		return change.kind === "directory"
 			? { ...change, ...target, before: change.before && { ...change.before }, after: change.after && { ...change.after } }
-			: { ...change, ...target, ...(change.object ? { object: { ...change.object, path: path.resolve(change.object.path) } } : {}),
-				...(change.aliases ? { aliases: change.aliases.map(name => path.resolve(name)) } : {}),
+			: { ...change, ...target, ...projectFileMutation(change, project),
 				before: change.before && Buffer.from(change.before), after: change.after && Buffer.from(change.after) };
 	}).sort((left, right) =>
 		filesystemPathKey(left.target).localeCompare(filesystemPathKey(right.target)),

@@ -221,7 +221,8 @@ export function diffWorkspaceStructures(
 		if (delta) {
 			const reason = regularDeltaFailure(relativePath, previous, current, delta);
 			if (reason) return { effects: [], complete: false, reason };
-			let change: WorkspaceRegularDelta = current?.kind === "file" ? { ...delta, afterModified: current.modified } : delta;
+			let change: WorkspaceRegularDelta = current?.kind === "file" ? { ...delta, afterModified: current.modified,
+				afterAliases: (current.aliases ?? [path.join(after.root, relativePath)]).map(name => projection.toLogical(name)).sort() } : delta;
 			if (previous?.kind === "file") change = { ...change,
 				aliases: (previous.aliases ?? [path.join(before.root, relativePath)]).map(name => projection.toLogical(name)).sort() };
 			if (current?.kind === "file" && current.object) {

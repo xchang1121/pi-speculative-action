@@ -693,7 +693,7 @@ test.for([false, true])("reconstructs shared searches after cancellation and nam
 	await verify();
 });
 
-test.for(["in-place", "git", "single-in-place", "single-git"])("keeps effects private, retries restored preimages and transfers an aborted claim (%s)", async driver => {
+test.for(["in-place", "git", "single-in-place", "single-git", "checkpoint-git", "single-checkpoint-git"])("keeps effects private, retries restored preimages and transfers an aborted claim (%s)", async driver => {
 	const cwd = await directories.create(), sandbox = new WorkspaceSandboxService(), file = path.join(cwd, "notes.txt");
 	const alias = driver.startsWith("single-") ? "notes.txt" : "alias.txt", read = () => readText(file);
 	await writeFile(file, "one two\n"); if (alias !== "notes.txt") await link(file, path.join(cwd, alias));
@@ -707,12 +707,17 @@ test.for(["in-place", "git", "single-in-place", "single-git"])("keeps effects pr
 	});
 	try {
 		const original = (await stat(file, { bigint: true })).ino;
+		let parent: ReturnType<typeof sandbox.checkpoint>;
 		for (const content of ["raw write\n", "one two\n"]) {
 			const before = await read(), captured = await sandbox.capture({ cwd, driver: "git", execute: async workspace => {
 				await writeFile(path.join(workspace.sandboxRoot, "notes.txt"), content);
 				return { result: { content: [], details: {} }, isError: false };
-			} });
-			expect(await read()).toBe(before); await sandbox.commitDelta(captured);
+			} }, parent);
+			expect(await read()).toBe(before);
+			if (driver.includes("checkpoint")) {
+				const branch = sandbox.branch({ cwd, action: PI_ACTION_SEMANTICS.buildKey("write", { path: "notes.txt", content }, cwd, "checkpoint")! }, captured);
+				await branch.commit(); parent = sandbox.checkpoint(branch.checkpoint, cwd); await branch.dispose();
+			} else await sandbox.commitDelta(captured);
 			for (const name of new Set([file, path.join(cwd, alias)])) expect((await stat(name, { bigint: true })).ino).toBe(original);
 		}
 		await f.start();

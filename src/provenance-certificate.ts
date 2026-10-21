@@ -563,7 +563,8 @@ function normalizeResult(result: ProcessResultRecord, prototype: ExecPrototype):
 			const predecessor = event.object?.before && anchor?.kind === "workspace" ? anchor.before : before;
 			if (event.operation !== undefined && (event.operation !== "write_contents" || predecessor.kind !== "file" ||
 				after.kind !== "file" || !event.object && predecessor.mode !== after.mode)) throw new Error("invalid in-place file effect");
-			if (event.aliases && (before.kind !== "file" || !validAliases(event.aliases, event.path))) throw new Error("invalid effect alias set");
+			for (const [aliases, state] of [[event.aliases, before], [event.afterAliases, after]] as const)
+				if (aliases !== undefined && (state.kind !== "file" || !validAliases(aliases, event.path))) throw new Error("invalid effect alias set");
 			if (!event.operation && !event.object && before.kind === after.kind && stableEqual(before, after)) throw new Error("workspace effect does not change state");
 			journal[index] = { ...event, before, after };
 		}

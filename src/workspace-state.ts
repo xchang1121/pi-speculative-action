@@ -50,4 +50,11 @@ export interface WorkspaceFileMutation {
 	readonly operation?: "write_contents";
 	readonly object?: { readonly path: string; readonly before: boolean };
 	readonly aliases?: readonly string[];
+	/** Closed names of the resulting object, independent of its predecessor's names. */
+	readonly afterAliases?: readonly string[];
+}
+
+export function projectFileMutation({ operation, object, aliases, afterAliases }: WorkspaceFileMutation, project = (name: string) => name): WorkspaceFileMutation {
+	return Object.fromEntries(Object.entries({ operation, object: object && { ...object, path: project(object.path) },
+		aliases: aliases?.map(project), afterAliases: afterAliases?.map(project) }).filter(([, value]) => value !== undefined));
 }

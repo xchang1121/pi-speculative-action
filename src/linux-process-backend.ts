@@ -69,10 +69,11 @@ import {
 	type SandboxDirectoryState, type SandboxWorkspaceChange, type SandboxWorkspaceContext,
 } from "./workspace-sandbox.ts";
 import { containsFilesystemPath as pathContains, relativeFilesystemPath, slash } from "./path-utils.ts";
+import { projectFileMutation } from "./workspace-state.ts";
 
 // Certificates are meaningful only under the implementation that collected and authorized their proof.
 const OBSERVER_FINGERPRINT = digestObject(["linux-process-backend", "strace-observer", "reuse-planner", "reuse-store",
-	"provenance-certificate", "provenance-validation", "filesystem-evidence", "stable-value-hash"]
+	"provenance-certificate", "provenance-validation", "filesystem-evidence", "stable-value-hash", "workspace-state"]
 	.map(name => sha256Digest(readFileSync(new URL(`./${name}.${import.meta.url.endsWith(".ts") ? "ts" : "js"}`, import.meta.url)))));
 const POLICY_ID = "sandlock-virtual-root-transparent-exec-creation-mode";
 const LEAF_POLICY_ID = "sandlock-virtual-workspace-leaf-creation-mode";
@@ -1190,8 +1191,7 @@ export class LinuxProcessReuseBackend {
 									return { kind: "file", data: await this.store.artifacts.put(content), mode, ...(side === "after" && change.afterModified ? { modified: change.afterModified } : {}) };
 								};
 								journal.push({ sequence: journal.length, kind: "workspace", path: logicalPath, before: await state("before"), after: await state("after"),
-									...(change.kind !== "directory" ? { ...(change.operation ? { operation: change.operation } : {}),
-										...(change.object ? { object: change.object } : {}), ...(change.aliases ? { aliases: change.aliases } : {}) } : {}) });
+									...(change.kind !== "directory" ? projectFileMutation(change) : {}) });
 							}
 							for (const event of outcome!.output) {
 								journal.push({ sequence: journal.length, kind: "output", fd: event.fd, data: await this.store.artifacts.put(event.data) });
@@ -2190,9 +2190,7 @@ async function replayFilesystemEffects(
 		}
 		changes.push({
 			...address,
-			...(event.operation ? { operation: event.operation } : {}),
-			...(event.object ? { object: { ...event.object, path: projection.toPhysical(event.object.path)! } } : {}),
-			...(event.aliases ? { aliases: event.aliases.map(name => projection.toPhysical(name)!) } : {}),
+			...projectFileMutation(event, name => projection.toPhysical(name)!),
 			...(event.before.kind === "file" ? { before: artifacts.read(event.before.data), beforeMode: event.before.mode } : {}),
 			...(event.after.kind === "file" ? { after: artifacts.read(event.after.data), afterMode: event.after.mode, afterModified: event.after.modified } : {}),
 		});
