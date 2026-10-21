@@ -1,8 +1,9 @@
 import { isSafeCount } from "./number-utils.ts";
 import { captureProcessContext, processLaunchOptions, routedProcessIdentity, validProcessContext, type ProcessExecutionContext, type ProcessLaunchOptions } from "./process-context.mjs";
-import { execFile, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomBytes } from "node:crypto";
+import { nativeProcessLibrary } from "./process-startup.mjs";
 import { on, once } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
 import { constants as fsConstants, readFileSync, type BigIntStats } from "node:fs";
@@ -65,7 +66,7 @@ import {
 } from "./linux-process-sync.ts";
 import {
 	WorkspaceSandboxService, nativeWorkspaceOwner, nativeWorkspaceObservation, readSandboxDirectoryState, restoreModifiedTimes, sameSandboxState,
-	useModifiedTimesHelper, type SandboxDirectoryState, type SandboxWorkspaceChange, type SandboxWorkspaceContext,
+	type SandboxDirectoryState, type SandboxWorkspaceChange, type SandboxWorkspaceContext,
 } from "./workspace-sandbox.ts";
 import { containsFilesystemPath as pathContains, relativeFilesystemPath, slash } from "./path-utils.ts";
 
@@ -766,8 +767,7 @@ export class LinuxProcessReuseBackend {
 			execText(sandlock, ["check"]), hashExecutableFile(sandlock), hashExecutableFile(strace), this.resolvePlatformFingerprint(),
 		]);
 		if (!sandlockCheck.includes("Status:         OK")) throw new Error("Sandlock kernel protections are unavailable");
-		// An older helper runs an unknown flag as a command, which fails.
-		if (await new Promise<boolean>(resolve => execFile(dispatcher, ["--set-modified-times"], error => resolve(!error)).stdin?.end())) useModifiedTimesHelper(dispatcher);
+		nativeProcessLibrary(dispatcher);
 		const qualifyLibrary = (file: string) => execText(strace, ["--kill-on-exit", "-f", "-q", "-e", "trace=none", "-o", "/dev/null",
 			`--process-library=${file}`, "--handoff-image=/dev/null", "--", "/bin/true"]).then(() => file);
 		const imageLibrary = await qualifyLibrary(`${dispatcher}.so`).catch(() => undefined);

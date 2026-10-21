@@ -8,7 +8,7 @@ import { setImmediate as watcherTurn } from "node:timers/promises";
 import { type ActionKey, type ActionSemanticsRegistry, PI_ACTION_SEMANTICS, type ResourceDependencyScope } from "./action-semantics.ts";
 import {
 	type StableFilesystemCapture, type FilesystemObjectHandle, cachedCapture, captureFilesystemEntry, captureStableFile,
-	FILESYSTEM_CONCURRENCY, mapFilesystem, sameFilesystemIdentity, walkFilesystemPath, filesystemEntryType, type FilesystemTypeEvidence,
+	FILESYSTEM_CONCURRENCY, mapFilesystem, sameFilesystemIdentity, walkFilesystemPath, filesystemEntryType, type FilesystemTypeEvidence, readFilesystemDirectory,
 } from "./filesystem-evidence.ts";
 import { containsFilesystemPath, filesystemPathKey, relativeFilesystemPath } from "./path-utils.ts";
 import { RuntimeLifecycleLane, SharedAbortScope } from "./runtime-lifecycle.ts";
@@ -1126,7 +1126,7 @@ async function fingerprintDependencies(
 				...directoryObjectSlot(supplied.names, view) });
 			return { ...fingerprintDirectory(info, realTarget, supplied.names), bytesRead: 0, filesRead: 0 };
 		}
-		const enumerationStarted = performance.now(), entries = await fingerprintIO(() => fs.readdir(target, { withFileTypes: true }));
+		const enumerationStarted = performance.now(), entries = await fingerprintIO(() => readFilesystemDirectory(target));
 		const computation = TimelineInterval.own(new TimelineInterval(enumerationStarted, performance.now()));
 		const selected = excludes.size && (scope === "tree_content" || scope === "tree_entries") ? entries.filter((entry) => !excludes.has(entry.name)) : entries;
 		const descendants = new Set(ancestors).add(identity);
@@ -1135,7 +1135,7 @@ async function fingerprintDependencies(
 			return { name: entry.name, ...child };
 		});
 		const [afterEntries, after] = await Promise.all([
-			fingerprintIO(() => fs.readdir(target, { withFileTypes: true })),
+			fingerprintIO(() => readFilesystemDirectory(target)),
 			fingerprintIO(() => fs.lstat(target, { bigint: true })),
 		]);
 		if (
@@ -1164,7 +1164,7 @@ async function fingerprintBinding(dependency: ResourceDependency) {
 	return { ...dependency, fingerprint: "binding", stamp, bytesRead: 0, filesRead: 0 };
 }
 
-function entryIdentity(entry: import("node:fs").Dirent): string {
+function entryIdentity(entry: FilesystemTypeEvidence & { readonly name: string }): string {
 	return `${specialFileType(entry)}\0${entry.name}`;
 }
 

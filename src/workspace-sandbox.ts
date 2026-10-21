@@ -3,10 +3,12 @@ import { execHostFile } from "./executable-path.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants, type BigIntStats, type Stats } from "node:fs";
 import {
-	access, chmod, copyFile, type FileHandle, link, lstat, mkdir, mkdtemp, open, readdir, realpath, rename, rm, rmdir, unlink, utimes, writeFile,
+	access, chmod, copyFile, type FileHandle, link, lstat, lutimes, mkdir, mkdtemp, open, realpath, rename, rm, rmdir, unlink, utimes, writeFile,
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { containsFilesystemPath, filesystemPathKey, relativeFilesystemPath, slash } from "./path-utils.ts";
 import { errorMessage, hasErrorCode, isMissing } from "./error-utils.ts";
 import {
@@ -14,7 +16,7 @@ import {
 } from "./agent-execution-world.ts";
 import type { WorldBranch, WorldCheckpoint, WorldExecutionMetrics } from "./execution-world.ts";
 import {
-	advanceFilesystemClock, assertNoSymlinkPath, captureFilesystemEntry, captureStableFile, fileIdentity, mapFilesystem, sameFilesystemIdentity,
+	advanceFilesystemClock, assertNoSymlinkPath, captureFilesystemEntry, captureStableFile, fileIdentity, mapFilesystem, sameFilesystemIdentity, readFilesystemDirectory, openFilesystemFile,
 	settledIdentity, sharedWalk, FILESYSTEM_OBSERVATION_FIELDS, FILESYSTEM_METADATA_FIELDS as SNAPSHOT_METADATA_FIELDS, type FilesystemObservationEvidence,
 } from "./filesystem-evidence.ts";
 import { WORKSPACE_PATH_MUTATION_EFFECTS } from "./effect-model.ts";
@@ -36,6 +38,7 @@ import {
 	type WorkspaceTransactionCapture, type WorkspaceTransactionDelta, type WorkspaceTransactionDriver, type WorkspaceTransactionOwnership,
 } from "./workspace-transaction.ts";
 import { connectNativeOwner, ownsNativeProcesses } from "./native-owner.ts";
+import { nativeFilesystem } from "./process-startup.mjs";
 
 interface SandboxChangeTarget {
 	readonly root: string;
@@ -104,7 +107,7 @@ export interface SandboxWorkspaceContext {
 /** Storage remains pinned by its allocator; only the observation owner reconstructs its journal. */
 export interface SandboxWorkspaceObservation {
 	readonly id: string; readonly sourceRoot: string; readonly sandboxRoot: string; readonly processRoot: string;
-	readonly gitBinary: string; readonly repository: string; readonly gitDirectory: string; readonly commit: string;
+	readonly gitBinary: string; readonly repository: string; readonly commit: string;
 	readonly baselineFrontier: Map<string, RegularFileState | undefined>; readonly sourceDevice: bigint;
 	readonly metadata?: Pick<Awaited<ReturnType<typeof preserveSnapshotMetadata>>, "image" | "objects" | "mappings" | "modes">;
 	readonly modes?: ReadonlyMap<string, number>;
@@ -125,7 +128,7 @@ const workspaceCapability = (workspace: SandboxWorkspaceContext) => [workspace.s
 	workspace.transactions, workspace.transactions.begin, workspace.transactions.dispose, workspace.captureChanges, workspace.sourceChanges];
 
 interface WorkspaceObservation extends SandboxWorkspaceContext, SandboxWorkspaceObservation {
-	readonly baseGit: ReturnType<typeof bindGit>; readonly indexGit: ReturnType<typeof bindGit>;
+	readonly baseGit: ReturnType<typeof bindGit>;
 	readonly readBase: (resource: string, maxBytes: number) => Promise<RegularFileState | undefined>;
 	readonly openTransactionClock: () => Promise<FileHandle>; readonly transactionClockLinks: 0 | 1; readonly transactionClockRoots: readonly string[];
 }
@@ -149,7 +152,6 @@ function createWorkspaceObservation(data: SandboxWorkspaceObservation, sourceCha
 				dev: data.sourceDevice, ino: source.ino, nlink: links < 0n ? 0n : links } as FilesystemObservationEvidence;
 		},
 		captureChanges: (frontier: readonly string[]) => collectSandboxChanges(workspace, frontier),
-		indexGit: bindGit(data.gitBinary, data.sandboxRoot, ["--git-dir", data.gitDirectory, "--work-tree", data.sandboxRoot]),
 		readBase: async (resource: string, maxBytes: number) => {
 			if (data.liveBase) return readLiveBase(data.liveBase, resource, maxBytes);
 			const state = await readGitTreeRegularState(baseGit, data.commit, resource, maxBytes), mode = (data.metadata?.modes ?? data.modes)?.get(slash(resource));
@@ -218,7 +220,6 @@ interface PreparedGitWorkspace {
 	readonly sandboxRoot: string;
 	readonly processRoot: string;
 	readonly commit: string;
-	readonly gitDirectory: string;
 	readonly aliases: readonly (readonly string[])[];
 	readonly dispose: () => Promise<void>;
 }
@@ -900,7 +901,7 @@ async function createPrivateSandboxWorkspace(state: WorkspaceSandboxState, cwd: 
 		const baseline = liveBase ? { commit: "", tree: "", version: cursor!, aliases: [] } : prepared?.repository === pool && typeof preparation === "object" &&
 			preparation.driver === driver ? prepared.baseline : await acquireSandboxBaseline(pool, preparation === capturedWorkspaceInputs);
 		const { commit } = baseline;
-		let sandboxRoot: string, processRoot: string, gitDirectory: string, transactionClockPath: string;
+		let sandboxRoot: string, processRoot: string, transactionClockPath: string;
 		let transactionClockLinks: 0 | 1, transactionClockRoots: readonly string[], overlayDevice: string | undefined;
 		if (driver === "overlayfs") {
 			// Only a snapshot lower needs the baseline checked out.
@@ -930,12 +931,11 @@ async function createPrivateSandboxWorkspace(state: WorkspaceSandboxState, cwd: 
 				privateRoot: overlayStorageRoot, options: overlayOptions, capabilityRegistry: state.overlayfsCapabilities });
 			overlay = { ...mounted, root: path.join(mounted.root, lowerName), upperRoot: upper };
 			// FUSE overlays count a file's links by the names they have loaded: list each alias's directory before anything stats one.
-			for (const directory of new Set(aliasGroups.flat().map(name => path.dirname(name)))) await readdir(path.join(overlay.root, directory));
+			for (const directory of new Set(aliasGroups.flat().map(name => path.dirname(name)))) await readFilesystemDirectory(path.join(overlay.root, directory));
 			overlayDevice = String((await lstat(overlay.root, { bigint: true })).dev);
 			sandboxRoot = overlay.root;
 			if (liveBase && aliasGroups.length) metadata = await preserveSnapshotMetadata(sourceRoot, sandboxRoot, processRoot, true,
 				await captureSnapshotMetadata(sourceRoot, copied));
-			gitDirectory = sharedBaseline?.gitDirectory ?? path.join(overlayStorageRoot, "no-index"); // OverlayFS journals its own changes.
 			transactionClockPath = mounted.upperRoot; transactionClockLinks = 0;
 			// A live lower may sit on another filesystem; its files' own identities, checked on every read, fence it instead.
 			transactionClockRoots = Object.freeze([...liveBase ? [] : [sharedBaseline!.sandboxRoot], mounted.upperRoot, mounted.workRoot]);
@@ -946,7 +946,7 @@ async function createPrivateSandboxWorkspace(state: WorkspaceSandboxState, cwd: 
 			// a filesystem-tool worktree is itself reset for the next one when it returns.
 			if ((overlayOptions as Partial<SandboxWorkspaceBranchOptions>).action && preparation !== capturedWorkspaceInputs) prepareNextSandbox(pool, baseline);
 			attached = prepared;
-			({ sandboxRoot, processRoot, gitDirectory } = prepared);
+			({ sandboxRoot, processRoot } = prepared);
 			metadata = await preserveSnapshotMetadata(sourceRoot, sandboxRoot, processRoot, process.platform === "linux" && !!overlayOptions.liveLower);
 			transactionClockPath = path.join(prepared.processRoot, "workspace-transaction.clock");
 			transactionClockLinks = 1;
@@ -954,7 +954,7 @@ async function createPrivateSandboxWorkspace(state: WorkspaceSandboxState, cwd: 
 		}
 		const sourceChanges = () => pool.versions.changesSince(baseline.version);
 		const data: SandboxWorkspaceObservation = {
-			id: randomUUID(), sourceRoot, sandboxRoot, processRoot, gitBinary, gitDirectory, repository: path.join(pool.parent, "snapshot.git"), commit,
+			id: randomUUID(), sourceRoot, sandboxRoot, processRoot, gitBinary, repository: path.join(pool.parent, "snapshot.git"), commit,
 			baselineFrontier: new Map(), sourceDevice: (await lstat(sourceRoot, { bigint: true })).dev,
 			metadata: metadata && { image: metadata.image, objects: metadata.objects, mappings: metadata.mappings, modes: metadata.modes }, modes: sharedBaseline?.modes,
 			liveBase: liveBase || undefined, overlay: overlay && { upperRoot: overlay.upperRoot, device: overlayDevice!, baseline: liveBase || await overlayBaselineStructure(sharedBaseline!) },
@@ -1005,7 +1005,6 @@ async function preserveSnapshotMetadata(sourceRoot: string, sandboxRoot: string,
 			else if (!current.isDirectory()) throw new Error(`snapshot directory type changed: ${resource}`);
 		}
 		const rows: [BigIntStats, BigIntStats][] = [], objects = new Map<string, string>();
-		const fields = SNAPSHOT_METADATA_FIELDS;
 		// Set parent modes last so a read-only directory cannot prevent its own snapshot from being populated.
 		for (const resource of names.reverse()) {
 			const source = original.get(resource)!, target = path.join(sandboxRoot, resource);
@@ -1014,7 +1013,8 @@ async function preserveSnapshotMetadata(sourceRoot: string, sandboxRoot: string,
 			if (objects.has(`${current.dev}:${current.ino}`)) continue;
 			if ((source.mode & 0o170000n) !== (current.mode & 0o170000n)) throw new Error(`snapshot object type changed: ${resource}`);
 			if (source.uid !== current.uid || source.gid !== current.gid) throw new Error(`snapshot object ownership differs: ${resource}`);
-			if (!source.isSymbolicLink()) { await chmod(target, Number(source.mode & 0o7777n)); await utimes(target, source.atime, source.mtime); }
+			if (!source.isSymbolicLink()) await chmod(target, Number(source.mode & 0o7777n));
+			if (process.platform === "linux" || !source.isSymbolicLink()) await (source.isSymbolicLink() ? lutimes : utimes)(target, source.atime, source.mtime);
 			objects.set(`${current.dev}:${current.ino}`, `${source.dev}:${source.ino}`);
 			if (!native) continue;
 			const handle = await open(target, 0x200000 | fsConstants.O_NOFOLLOW); // Linux O_PATH also pins symlinks and unreadable objects.
@@ -1027,7 +1027,7 @@ async function preserveSnapshotMetadata(sourceRoot: string, sandboxRoot: string,
 			const parent = await open(path.dirname(sandboxRoot), 0x200000 | fsConstants.O_NOFOLLOW); handles.push(parent);
 			const physicalParent = await parent.stat({ bigint: true }), sourceParent = await lstat(path.dirname(sourceRoot), { bigint: true });
 			rows.push([physicalParent, sourceParent]);
-			await writeFile(image, JSON.stringify(rows.map(row => row.map(stat => fields.map(field => String(stat[field]))))), { flag: "wx", mode: 0o600 });
+			await writeFile(image, JSON.stringify(rows.map(row => row.map(stat => SNAPSHOT_METADATA_FIELDS.map(field => String(stat[field]))))), { flag: "wx", mode: 0o600 });
 		}
 		const mappings = new Map(rows.map(row => [`${row[0].dev}:${row[0].ino}`, row]));
 		return { image, objects, mappings, modes: new Map([...original].map(([name, stat]) => [slash(name), process.platform === "win32" ? 0 : Number(stat.mode & 0o777n)])), dispose };
@@ -1295,7 +1295,7 @@ async function createSandboxRepository(owner: WorkspaceSandboxState, sourceRoot:
 		await writeFile(path.join(repository, "config"), "\n[core]\n\tautocrlf = false\n\tlongpaths = true\n\tattributesFile = /dev/null\n", { flag: "a" });
 		await writeFile(path.join(repository, "info", "attributes"), "* -text -eol -filter -ident -working-tree-encoding\n");
 		return {
-			owner, sourceRoot, parent, gitBinary, git, index: bindGit(gitBinary, sourceRoot, ["--git-dir", repository, "--work-tree", sourceRoot]),
+			owner, sourceRoot, parent, gitBinary, git,
 			versions: new ResourceVersionManager(sourceRoot, { snapshotExcludes: SNAPSHOT_EXCLUDES, gitObjects: true }),
 			active: 0, idleWaiters: new Set<() => void>(), lock: Promise.resolve(), overlayBaselines: new Map<string, Promise<SharedOverlayBaseline>>(),
 			// Unsafe live-mount storage is detached from allocation and retained for OS-level recovery.
@@ -1312,17 +1312,12 @@ async function acquireSandboxBaseline(repository: PooledGitRepository, warmup = 
 			// Quiet notifications reuse preparation; fresh allocations check exact evidence below.
 			const changes = warmup ? repository.versions.changesSince(baseline.version) : undefined;
 			if (changes && !changes.uncertain && !changes.paths.length) return baseline;
-			// A preparation owns an immutable namespace. Borrowers prove the captured alias set at adoption.
-			if (warmup && !(await sandboxIndexChanges(repository)).length) return baseline;
-			if (!warmup && [...baseline.version.observations.values()].some(entry => entry.scope === "tree_content")) {
-				const [version, paths] = await Promise.all([repository.versions.validate(baseline.version), sandboxIndexChanges(repository)]);
-				if (!version.expired && !paths.length) return baseline;
-			}
+			if (!(await repository.versions.validate(baseline.version)).expired) return baseline;
 		}
-		for (let attempt = 0, rebuild = false; attempt < 3; attempt++) {
+		for (let attempt = 0; attempt < 3; attempt++) {
 			// Preparation owns immutable bytes, not source freshness. Actual allocations capture exact
 			// evidence; borrowed process preparations validate their observed inputs and effects at adoption.
-			const version = await repository.versions.capture([{ path: repository.sourceRoot, scope: warmup ? "tree_entries" : "tree_content" }]);
+			const version = await repository.versions.capture([{ path: repository.sourceRoot, scope: "tree_content" }]);
 			try {
 				const aliases = [...version.observations.values()].flatMap(entry => entry.aliases ?? []).map(group => {
 					if (group.paths.length !== group.links) throw new Error("workspace hardlink namespace is not closed");
@@ -1332,19 +1327,12 @@ async function acquireSandboxBaseline(repository: PooledGitRepository, warmup = 
 						return relative;
 					});
 				});
-				// Events and Git stat data can both miss changes: a changed baseline stages the captured objects, or owns a fresh index.
-				// A preparation proves nothing (adoption checks what it read), so it keeps the index and lets Git's stat check stage.
-				if (rebuild || !baseline || !(await stageTreeObjects(repository, version))) {
-					if (rebuild || !baseline || !warmup) await repository.index(["read-tree", "--empty"]);
-					await repository.index(["add", "-f", "-A", "--", ...snapshotPathspecs()]);
-				}
-				const tree = (await repository.index(["write-tree"])).toString("utf8").trim();
+				if (!(await stageTreeObjects(repository, version))) continue;
+				const tree = (await repository.git(["write-tree"])).toString("utf8").trim();
 				// Baselines are independent snapshots: a parent chain would keep every replaced copy reachable.
 				const commit = tree === baseline?.tree && JSON.stringify(aliases) === JSON.stringify(baseline.aliases) ? baseline.commit
 					: (await repository.git(["commit-tree", tree, "-m", "speculative baseline"], { environment: SANDBOX_AUTHOR_ENVIRONMENT })).toString("utf8").trim();
 				if (!warmup && (await repository.versions.validate(version)).expired) continue;
-				// An ABA during staging can restore captured source bytes after Git copied different bytes.
-				if (!warmup && (await sandboxIndexChanges(repository)).length) { rebuild = true; continue; }
 				if (commit !== baseline?.commit) await repository.git(["update-ref", "refs/heads/baseline", commit]);
 				if (commit !== baseline?.commit && Date.now() >= (repository.prunedAt ?? 0) + SANDBOX_PRUNE_INTERVAL_MS) {
 					repository.prunedAt = Date.now(); // The grace keeps objects that concurrent workspace staging has not referenced yet.
@@ -1361,39 +1349,57 @@ async function acquireSandboxBaseline(repository: PooledGitRepository, warmup = 
 	});
 }
 
-/**
- * Stage only what differs from the previous baseline's index, by the Git objects the exact capture hashed from the same bytes.
- * Whatever `add -f -A` might stage otherwise (a gitlink, a Windows link, bytes that moved on since capture) rebuilds instead.
- */
+/** Stage only changed objects through the shared inode reader, verifying Git imported the exact captured bytes. */
 async function stageTreeObjects(repository: PooledGitRepository, version: ResourceVersionToken): Promise<boolean> {
-	if (!version.treeObjects) return false;
-	const staged = new Map((await repository.index(["ls-files", "-s", "-z"])).toString("utf8").split("\0").flatMap((record) => {
-		const match = /^(\d{6}) ([0-9a-f]{40}) \d\t(.+)$/su.exec(record);
-		return match ? [[match[3]!, { mode: match[1]!, blob: match[2]! }] as const] : [];
-	}));
-	const desired = new Map<string, { readonly mode: string; readonly blob: string; readonly link?: string }>();
-	for (const [target, object] of version.treeObjects) {
-		const relative = relativeFilesystemPath(repository.sourceRoot, target), name = relative && slash(relative);
-		if (!name || isSnapshotExcluded(name)) continue;
-		if (object.link !== undefined && process.platform === "win32" || name.includes("\n")) return false;
-		desired.set(name, object.link !== undefined ? { mode: "120000", blob: gitBlobID(Buffer.from(object.link)), link: object.link }
-			: { mode: process.platform === "win32" ? staged.get(name)?.mode ?? "100644" : object.mode & 0o100 ? "100755" : "100644", blob: object.blob });
+	const staged = gitTreeEntries(await repository.git(["ls-files", "-s", "-z"])), desired = capturedGitTree(version, staged);
+	const changed = changedGitEntries(staged, desired).flatMap(name => desired.has(name) ? [[name, desired.get(name)!] as const] : []);
+	async function* objects() {
+		for (const [index, [name, entry]] of changed.entries()) {
+			const link = entry.link === undefined ? undefined : Buffer.from(entry.link), reader = link ? undefined : await openFilesystemFile(path.join(repository.sourceRoot, name));
+			try {
+				const size = link?.length ?? Number(reader!.stat.size);
+				if (!Number.isSafeInteger(size)) throw new Error("Git input size is not representable");
+				yield Buffer.from(`blob\nmark :${index + 1}\ndata ${size}\n`);
+				if (link) yield link;
+				else if (size) yield* reader!.handle.createReadStream({ autoClose: false, end: size - 1 });
+				if (reader && !sameFilesystemIdentity(reader.stat, await reader.handle.stat({ bigint: true }))) throw new Error("Git input changed while staging");
+				yield Buffer.from(`\nget-mark :${index + 1}\n`);
+			} finally { try { await reader?.handle.close(); } finally { await reader?.binding?.close(); } }
+		}
+		yield Buffer.from("done\n");
 	}
-	if ([...staged.values()].some((entry) => entry.mode === "160000")) return false;
-	const changed = [...desired].filter(([name, entry]) => staged.get(name)?.mode !== entry.mode || staged.get(name)?.blob !== entry.blob);
-	const files = changed.flatMap(([name, entry]) => entry.link === undefined ? [name] : []);
-	const written = files.length ? (await repository.index(["hash-object", "-w", "--no-filters", "--stdin-paths"], { input: Buffer.from(`${files.join("\n")}\n`) }))
-		.toString("utf8").trim().split("\n") : [];
-	if (written.some((blob, index) => blob !== desired.get(files[index]!)!.blob)) return false;
-	for (const [, { link }] of changed) if (link !== undefined) await repository.index(["hash-object", "-w", "--stdin"], { input: Buffer.from(link) });
+	const written = changed.length ? (await repository.git(["fast-import", "--quiet", "--done"], { input: objects() })).toString("utf8").trim().split("\n") : [];
+	if (written.length !== changed.length || written.some((blob, index) => blob !== changed[index]![1].blob)) return false;
 	const updates = [...changed.map(([name, entry]) => `${entry.mode} ${entry.blob}\t${name}\0`),
 		...[...staged.keys()].filter((name) => !desired.has(name)).map((name) => `0 ${"0".repeat(40)}\t${name}\0`)];
-	if (updates.length) await repository.index(["update-index", "-z", "--index-info"], { input: Buffer.from(updates.join("")) });
+	if (updates.length) await repository.git(["update-index", "-z", "--index-info"], { input: Buffer.from(updates.join("")) });
 	return true;
 }
 
 function gitBlobID(bytes: Buffer): string {
 	return createHash("sha1").update(`blob ${bytes.length}\0`).update(bytes).digest("hex");
+}
+
+type GitTreeEntry = { readonly mode: string; readonly blob: string; readonly link?: string };
+function gitTreeEntries(output: Buffer): Map<string, GitTreeEntry> {
+	if (output.length && output.at(-1) !== 0) throw new Error("unterminated Git tree entry");
+	return new Map(parseNullList(output).map(record => {
+		const match = /^(\d{6}) (?:blob |commit )?([0-9a-f]{40})(?: 0)?\t(.+)$/su.exec(record);
+		if (!match) throw new Error("invalid Git tree entry");
+		return [match[3]!, { mode: match[1]!, blob: match[2]! }];
+	}));
+}
+function capturedGitTree(version: ResourceVersionToken, baseline: ReadonlyMap<string, GitTreeEntry>): Map<string, GitTreeEntry> {
+	if (!version.treeObjects) throw new Error("Git input tree is unavailable");
+	return new Map([...version.treeObjects].flatMap(([target, object]) => {
+		const relative = relativeFilesystemPath(version.root, target), name = relative && slash(relative);
+		return !name || isSnapshotExcluded(name) ? [] : [[name, object.link !== undefined
+			? { mode: "120000", blob: gitBlobID(Buffer.from(object.link)), link: object.link }
+			: { mode: process.platform === "win32" ? baseline.get(name)?.mode ?? "100644" : object.mode & 0o100 ? "100755" : "100644", blob: object.blob }]];
+	}));
+}
+function changedGitEntries(before: ReadonlyMap<string, GitTreeEntry>, after: ReadonlyMap<string, GitTreeEntry>): string[] {
+	return [...new Set([...before.keys(), ...after.keys()])].filter(name => before.get(name)?.mode !== after.get(name)?.mode || before.get(name)?.blob !== after.get(name)?.blob);
 }
 
 async function ensurePreparedSandbox(repository: PooledGitRepository, baseline: NonNullable<PooledGitRepository["baseline"]>, signal?: AbortSignal): Promise<void> {
@@ -1441,7 +1447,7 @@ async function attachSandboxWorkspace(repository: PooledGitRepository, baseline:
 			throw new Error("private Git workspace ownership is unavailable");
 		}
 		let disposal: Promise<void> | undefined;
-		return { sandboxRoot, processRoot, commit, gitDirectory, aliases, dispose: () => disposal ??= (async () => {
+		return { sandboxRoot, processRoot, commit, aliases, dispose: () => disposal ??= (async () => {
 			// Keep the Git name reserved until its workspace is gone. A retired owner must never delete a reused name.
 			await removeOwnedTree(processRoot); await rm(gitDirectory, { recursive: true, force: true });
 		})() };
@@ -1463,7 +1469,7 @@ async function linkSandboxAliases(sandboxRoot: string, groups: readonly (readonl
 const removeOwnedTree = (target: string): Promise<void> => rm(target, { recursive: true, force: true }).catch(async (error: unknown) => {
 	if (!hasErrorCode(error, "EACCES")) throw error;
 	const grant = async (directory: string): Promise<void> => { if (!(await lstat(directory).catch(() => undefined))?.isDirectory()) return; await chmod(directory, 0o700).catch(() => {});
-		for (const entry of await readdir(directory, { withFileTypes: true }).catch(() => [])) if (entry.isDirectory()) await grant(path.join(directory, entry.name)); };
+		for (const entry of await readFilesystemDirectory(directory).catch(() => [])) if (entry.isDirectory()) await grant(path.join(directory, entry.name)); };
 	await grant(target); await rm(target, { recursive: true, force: true });
 });
 
@@ -1511,7 +1517,7 @@ async function acquireOverlayBaseline(
 	return withWorkspaceLock(repository, async () => {
 		const original = await captureSnapshotMetadata(repository.sourceRoot), identity = createHash("sha256").update(commit);
 		for (const [name, stat] of [...original].sort(([a], [b]) => a.localeCompare(b)))
-			identity.update(JSON.stringify([name, ...SNAPSHOT_METADATA_FIELDS.filter(field => field !== "atimeNs").map(field => String(stat[field]))]));
+			identity.update(JSON.stringify([name, ...SNAPSHOT_METADATA_FIELDS.map(field => String(stat[field]))]));
 		const key = identity.digest("hex");
 		for (const [candidateCommit, pending] of repository.overlayBaselines) {
 			if (candidateCommit === key) continue;
@@ -1549,16 +1555,6 @@ function overlayBaselineStructure(baseline: SharedOverlayBaseline): Promise<Work
 }
 
 function releaseOverlayBaseline(baseline: SharedOverlayBaseline): void { baseline.active = Math.max(0, baseline.active - 1); }
-
-async function sandboxIndexChanges(repository: PooledGitRepository): Promise<string[]> {
-	const [tracked, untracked] = await Promise.all([
-		// Porcelain refreshes stat-only changes; fresh allocations also validate exact resources.
-		repository.index(["diff", "--name-only", "--no-renames", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none", "-z", "--"]),
-		repository.index(["ls-files", "--others", "-z", "--"]),
-	]);
-	return [...new Set([...parseNullList(tracked), ...parseNullList(untracked)])].filter((file) => !isSnapshotExcluded(slash(file)))
-		.map((file) => path.resolve(repository.sourceRoot, file));
-}
 
 function withWorkspaceLock<T>(owner: { lock: Promise<void> }, run: () => Promise<T>): Promise<T> {
 	const pending = owner.lock.then(run);
@@ -1635,14 +1631,6 @@ function throwIfAborted(signal?: AbortSignal): void {
 	throw signal.reason instanceof Error ? signal.reason : new Error("sandbox preparation aborted");
 }
 
-function snapshotPathspecs(): string[] {
-	return [
-		".",
-		...SNAPSHOT_EXCLUDES.flatMap((item) => [`:(glob,exclude)**/${item}`, `:(glob,exclude)**/${item}/**`]),
-		`:(glob,exclude)**/${SANDBOX_STAGING_FILE_PREFIX}*.tmp`,
-	];
-}
-
 /** Case-insensitive volumes, and win32 trailing dots and spaces, spell the same excluded entry differently. */
 const snapshotSegment = process.platform === "win32" ? (segment: string) => segment.replace(/[. ]+$/u, "").toLowerCase()
 	: process.platform === "darwin" ? (segment: string) => segment.toLowerCase() : (segment: string) => segment;
@@ -1715,16 +1703,13 @@ async function collectSandboxChanges(workspace: ReturnType<typeof createWorkspac
 }
 
 async function collectGitChangeResources(workspace: ReturnType<typeof createWorkspaceObservation>): Promise<readonly string[]> {
-	const options = { environment: { GIT_OPTIONAL_LOCKS: "0" } };
-	const tracked = await workspace.indexGit(["diff", "--name-only", "--no-renames", "-z", workspace.commit, "--"], options);
-	const untracked = await workspace.indexGit(["ls-files", "--others", "-z", "--"], options);
-	if (process.platform === "win32") {
-		const untrackedRoots = await workspace.indexGit(["ls-files", "--others", "--directory", "-z", "--"], options);
-		for (const resource of parseNullList(untrackedRoots)) {
-			if (slash(resource).endsWith("/")) await assertNoDirectoryLinks(workspace.sandboxRoot, resource);
-		}
-	}
-	return Object.freeze([...new Set([...parseNullList(tracked), ...parseNullList(untracked)])]);
+	const versions = new ResourceVersionManager(workspace.sandboxRoot, { watch: false, snapshotExcludes: SNAPSHOT_EXCLUDES, gitObjects: true });
+	let version: ResourceVersionToken | undefined;
+	try {
+		version = await versions.capture([{ path: workspace.sandboxRoot, scope: "tree_content" }]);
+		const baseline = gitTreeEntries(await workspace.baseGit(["ls-tree", "-r", "-z", workspace.commit]));
+		return changedGitEntries(baseline, capturedGitTree(version, baseline));
+	} finally { await version?.release(); versions.close(); }
 }
 
 interface OverlayStructureRemoval { readonly resource: string; readonly descendantsOnly: boolean; }
@@ -1790,7 +1775,7 @@ async function walkOverlayUpper(upperRoot: string, journal: string, observe: (en
 	let entries = 0;
 	const visit = async (directory: string, relativeDirectory: string): Promise<void> => {
 		const subdirectories: (readonly [string, string])[] = [];
-		const children = await readdir(directory, { withFileTypes: true }).catch(error => {
+		const children = await readFilesystemDirectory(directory).catch(error => {
 			if (directory === upperRoot && isMissing(error)) return []; // A live lower has no upper until the first copy-up.
 			throw error;
 		});
@@ -1831,17 +1816,11 @@ async function collectOverlayChangeResources(
 	const resources = new Set<string>();
 	const addBaselineSubtree = async (resource: string) => {
 		const prefix = resource || ".", within = resource ? `${path.normalize(resource)}${path.sep}` : "";
-		const tree = workspace.liveBase ? [...workspace.liveBase.entries].flatMap(([name, entry]) => entry.kind !== "directory" && name.startsWith(within) ? [`\t${slash(name)}`] : [])
-			: parseNullList(await workspace.baseGit(["ls-tree", "-r", "-z", "--full-tree", workspace.commit, "--", prefix], { environment: { GIT_OPTIONAL_LOCKS: "0" } }));
-		for (const record of tree) {
-			const separator = record.indexOf("\t");
-			if (separator === -1) throw new Error(`invalid Git subtree entry: ${resource}`);
-			const candidate = record.slice(separator + 1);
-			if (candidate && !isSnapshotExcluded(slash(candidate))) resources.add(candidate);
-		}
-		const normalized = resource ? `${path.normalize(resource)}${path.sep}` : "";
+		const tree = workspace.liveBase ? [...workspace.liveBase.entries].flatMap(([name, entry]) => entry.kind !== "directory" && name.startsWith(within) ? [slash(name)] : [])
+			: parseNullList(await workspace.baseGit(["ls-tree", "-r", "-z", "--name-only", "--full-tree", workspace.commit, "--", prefix]));
+		for (const candidate of tree) if (candidate && !isSnapshotExcluded(slash(candidate))) resources.add(candidate);
 		for (const candidate of workspace.baselineFrontier.keys()) {
-			if (candidate === resource || (!resource || path.normalize(candidate).startsWith(normalized))) { resources.add(candidate); }
+			if (candidate === resource || (!resource || path.normalize(candidate).startsWith(within))) { resources.add(candidate); }
 		}
 	};
 	await walkOverlayUpper(workspace.overlay.upperRoot, "change journal", async (entry) => {
@@ -1877,34 +1856,14 @@ async function readLiveBase(base: WorkspaceStructureSnapshot, resource: string, 
 
 async function readGitTreeRegularState(git: ReturnType<typeof bindGit>, tree: string, resource: string,
 	maxBytes = WORKSPACE_TRANSACTION_MAX_BYTES): Promise<RegularFileState | undefined> {
-	const entry = await git(["ls-tree", "-z", tree, "--", resource]);
-	if (entry.length === 0) return undefined;
-	const terminator = entry.indexOf(0);
-	if (terminator === -1) throw new Error(`invalid Git transaction entry: ${resource}`);
-	const metadata = entry.subarray(0, terminator).toString("utf8").split("\t", 1)[0];
-	const [mode, kind, hash] = metadata.split(" ");
-	if ((mode !== "100644" && mode !== "100755") || kind !== "blob") {
-		throw new Error(`workspace transaction resource is not a regular file: ${resource}`);
-	}
-	if (!hash) throw new Error(`invalid Git transaction blob: ${resource}`);
-	const content = await git(["cat-file", "blob", hash], { maxBuffer: Math.max(1, Math.min(WORKSPACE_TRANSACTION_MAX_BYTES, maxBytes) + 1) });
+	const entry = gitTreeEntries(await git(["ls-tree", "-z", tree, "--", resource])).get(slash(resource));
+	if (!entry) return undefined;
+	if (entry.mode !== "100644" && entry.mode !== "100755") throw new Error(`workspace transaction resource is not a regular file: ${resource}`);
+	const content = await git(["cat-file", "blob", entry.blob], { maxBuffer: Math.max(1, Math.min(WORKSPACE_TRANSACTION_MAX_BYTES, maxBytes) + 1) });
 	if (content.byteLength > maxBytes) throw new Error(`Git transaction blob exceeds capture limit: ${resource}`);
-	return { content, mode: process.platform === "win32" ? 0 : mode === "100755" ? 0o755 : 0o644 };
+	return { content, mode: process.platform === "win32" ? 0 : entry.mode === "100755" ? 0o755 : 0o644 };
 }
 
-
-async function assertNoDirectoryLinks(root: string, relative: string): Promise<void> {
-	const normalized = slash(relative).replace(/\/+$/, "");
-	if (!normalized || isSnapshotExcluded(normalized)) return;
-	const target = path.resolve(root, normalized);
-	await assertNoSymlinkPath(root, target);
-	for (const entry of await readdir(target, { withFileTypes: true })) {
-		const child = slash(path.join(normalized, entry.name));
-		if (isSnapshotExcluded(child)) continue;
-		if (entry.isSymbolicLink()) throw new Error(`sandbox path contains symlink: ${child}`);
-		if (entry.isDirectory()) await assertNoDirectoryLinks(root, child);
-	}
-}
 
 async function assertCommitTarget(change: SandboxWorkspaceChange, capture?: typeof captureFilesystemEntry): Promise<void> {
 	const root = path.resolve(change.root);
@@ -2115,20 +2074,17 @@ async function createParentDirectories(sourceRoot: string, target: string, creat
 	}
 }
 
-let modifiedTimesHelper: string | undefined;
-/** A native helper that sets them all in one process (`--set-modified-times`, linux-held-exec.c). */
-export const useModifiedTimesHelper = (binary: string) => { modifiedTimesHelper = binary; };
-
 /** Give files back the modification times their producers left, which later readers may have observed. Node sets only
- * microseconds, so on Linux, whose traces record them, the helper or else coreutils touch sets them; elsewhere a file keeps its commit's time. */
+ * microseconds, so Linux uses the shared native binding or coreutils; elsewhere a file keeps its commit's time. */
 export async function restoreModifiedTimes(files: readonly (readonly [target: string, modified: string | undefined])[]): Promise<void> {
 	const times = files.flatMap(([target, modified]) => /^\d+$/.test(modified ?? "") ? [[modified!.padStart(10, "0").slice(0, -9), modified!.slice(-9).padStart(9, "0"), target]] : []);
-	if (process.platform === "linux" && modifiedTimesHelper && times.length) {
-		const pending = execHostFile(modifiedTimesHelper, ["--set-modified-times"]);
-		pending.child.stdin?.end(times.map(([seconds, nanoseconds, target]) => `${seconds} ${nanoseconds} ${target}\0`).join(""));
-		await pending; return;
-	}
-	const pairs = times.flatMap(([seconds, nanoseconds, target]) => [`@${seconds}.${nanoseconds}`, target!]);
+	const pairs = times.flatMap(([seconds, nanoseconds, target]) => {
+		if (!nativeFilesystem) return [`@${seconds}.${nanoseconds}`, target!];
+		const record = Buffer.concat([Buffer.alloc(16), Buffer.from(`${target}\0`)]);
+		record.writeBigInt64LE(BigInt(seconds!), 0); record.writeBigInt64LE(BigInt(nanoseconds!), 8);
+		if (nativeFilesystem(-3, record) !== 0) throw new Error(`could not restore modification time: ${target}`);
+		return [];
+	});
 	for (let start = 0; process.platform === "linux" && start < pairs.length; start += 1024) await execHostFile("sh",
 		["-c", 'while [ $# -gt 0 ]; do touch -chm -d "$1" -- "$2" || exit; shift 2; done', "sh", ...pairs.slice(start, start + 1024)]);
 }
@@ -2166,9 +2122,8 @@ function parseNullList(value: Uint8Array): string[] { return value.toString().sp
 
 /** The existing process owner binds each private repository/index once, preserving per-call cwd and limits. */
 function bindGit(command: string, cwd: string, prefix: readonly string[] = []) {
-	const bound = [...prefix];
-	return (input: readonly string[], options: { cwd?: string; environment?: Readonly<Record<string, string>>; maxBuffer?: number; input?: Buffer } = {}): Promise<Buffer> => {
-		const args = [...bound, ...input];
+	return (input: readonly string[], options: { cwd?: string; environment?: Readonly<Record<string, string>>; maxBuffer?: number; input?: Buffer | AsyncIterable<Buffer> } = {}): Promise<Buffer> => {
+		const args = [...prefix, ...input];
 		const pending = execHostFile(
 			command,
 			args,
@@ -2185,8 +2140,10 @@ function bindGit(command: string, cwd: string, prefix: readonly string[] = []) {
 				maxBuffer: options.maxBuffer ?? 64 * 1024 * 1024,
 			},
 		);
-		pending.child.stdin?.end(options.input);
-		return pending.then(({ stdout }) => stdout, error => {
+		const inputFinished = options.input && !Buffer.isBuffer(options.input) ? pipeline(Readable.from(options.input), pending.child.stdin!)
+			: Promise.resolve(pending.child.stdin?.end(options.input));
+		return Promise.all([pending, inputFinished]).then(([{ stdout }]) => stdout, async error => {
+			await Promise.allSettled([pending, inputFinished]);
 			if (error.stderr === undefined) throw error;
 			const detail = error.stderr.toString("utf8").trim() || error.message;
 			const shown = args.slice(0, 16).join(" ");

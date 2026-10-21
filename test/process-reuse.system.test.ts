@@ -107,6 +107,7 @@ test.each([
 	{ reason: "unmodeled_metadata:getdents64:101", calls: ["getdents64(3, [], 4096) = 0"] },
 	{ reason: "unparsed_metadata:stat:101", calls: ['stat("/work/input", {st_mode=S_IFREG|0644}) = 0'] },
 	{ reason: "metadata_changed:/work/input", calls: [1, 2].map(size => `statx(AT_FDCWD, "/work/input", AT_SYMLINK_NOFOLLOW, STATX_SIZE, {stx_mask=STATX_SIZE, stx_size=${size}}) = 0`) },
+	{ reason: "metadata_changed:/work/accessed", calls: [1, 2].map(time => `statx(AT_FDCWD, "/work/accessed", 0, STATX_ATIME, {stx_mask=STATX_ATIME, stx_atime={tv_sec=${time}, tv_nsec=0}}) = 0`) },
 ])("derives trace completeness from every recorded rejection ($reason)", async ({ calls, reason }) => {
 	const { prefix } = await processTrace(['1.000000 execve("/tools/worker", ["worker"], []) = 0', ...calls.map((call, index) => `1.00000${index + 1} ${call}`), "1.000009 +++ exited with 0 +++\n"].join("\n"));
 	const observed = await observeStrace(prefix, "/tools/worker", "/work");

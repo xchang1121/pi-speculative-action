@@ -6,6 +6,8 @@ import path from "node:path";
 import { containsFilesystemPath, slash } from "./path-utils.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
 import { TimelineInterval, type SerializedTimelineComputation } from "./task-timing.ts";
+import { nativeFilesystem } from "./process-startup.mjs";
+import { getSystemErrorName } from "node:util";
 
 export interface FilesystemTypeEvidence extends Readonly<Pick<Stats,
 	"isFile" | "isDirectory" | "isSymbolicLink" | "isSocket" | "isFIFO" | "isCharacterDevice" | "isBlockDevice">> {}
@@ -15,20 +17,14 @@ export interface FilesystemMetadataEvidence extends Readonly<Pick<Stats | BigInt
 
 /** Native metadata images use this field order. */
 export const FILESYSTEM_METADATA_FIELDS = ["dev", "ino", "mode", "nlink", "uid", "gid", "rdev", "size", "blksize", "blocks", "atimeNs", "mtimeNs", "ctimeNs", "birthtimeNs"] as const;
-/** Reading changes atime under relatime; stat's observed fields also exclude birth time. */
-export const FILESYSTEM_OBSERVATION_FIELDS = Object.freeze(FILESYSTEM_METADATA_FIELDS.filter(field => field !== "atimeNs" && field !== "birthtimeNs"));
+/** Every field returned by stat is observable, including access time changed by reads. */
+export const FILESYSTEM_OBSERVATION_FIELDS = Object.freeze(FILESYSTEM_METADATA_FIELDS.filter(field => field !== "birthtimeNs"));
 export type FilesystemObservationField = typeof FILESYSTEM_OBSERVATION_FIELDS[number];
 export type FilesystemObservationEvidence = { readonly [Field in FilesystemObservationField]: bigint };
 
-export function filesystemEntryType(entry: FilesystemTypeEvidence): string {
-	return entry.isFile()
-		? "file"
-		: entry.isDirectory()
-			? "directory"
-			: entry.isSymbolicLink()
-				? "symlink"
-				: entry.isSocket() ? "socket" : entry.isFIFO() ? "fifo" : entry.isCharacterDevice() ? "char" : entry.isBlockDevice() ? "block" : "other";
-}
+const FILESYSTEM_TYPES = [["file", "isFile", 8], ["directory", "isDirectory", 4], ["symlink", "isSymbolicLink", 10],
+	["socket", "isSocket", 12], ["fifo", "isFIFO", 1], ["char", "isCharacterDevice", 2], ["block", "isBlockDevice", 6]] as const;
+export function filesystemEntryType(entry: FilesystemTypeEvidence): string { return FILESYSTEM_TYPES.find(([, check]) => entry[check]())?.[0] ?? "other"; }
 
 export function filesystemMetadataDigest(stat: FilesystemMetadataEvidence): Sha256Digest {
 	const type = Number(stat.mode) & 0o170000;
@@ -183,21 +179,44 @@ export async function captureFileDigest(target: string, maxBytes = Number.POSITI
 	return captureStableFile(target, maxBytes, false, { verifyPath }, signal);
 }
 
-/** Import the helper's complete getdents64 image without enumerating the directory again. */
-export async function captureHeldDirectory(pid: number, fd: number, content: Buffer, stat: BigIntStats, realPath: string): Promise<StableFilesystemCapture> {
-	const startedAt = performance.now();
-	const names: Buffer[] = [];
+function directoryImage(content: Buffer) {
+	const entries: (FilesystemTypeEvidence & { readonly name: string })[] = [];
 	for (let offset = 0; offset < content.length;) {
 		if (content.length - offset < 24) throw new Error("invalid_directory_image");
 		const length = content.readUInt16LE(offset + 16), end = offset + length, zero = content.indexOf(0, offset + 19);
 		if (length < 24 || length % 8 || end > content.length || zero < offset + 20 || zero >= end) throw new Error("invalid_directory_image");
 		const name = content.subarray(offset + 19, zero), decoded = name.toString("utf8");
 		if (decoded.includes("/") || !Buffer.from(decoded).equals(name)) throw new Error("unrepresentable_directory_name");
-		if (decoded !== "." && decoded !== "..") names.push(name);
+		const type = content[offset + 18];
+		if (decoded !== "." && decoded !== "..") entries.push({ name: decoded,
+			...Object.fromEntries(FILESYSTEM_TYPES.map(([, check, code]) => [check, () => code === type])) } as typeof entries[number]);
 		offset = end;
 	}
-	names.sort(Buffer.compare);
-	const entries = names.map(name => name.toString("utf8"));
+	return entries.sort((a, b) => Buffer.compare(Buffer.from(a.name), Buffer.from(b.name)));
+}
+
+/** Observe a directory through an independent OFD without advancing owned input access times. */
+export async function readFilesystemDirectory(target: string): Promise<(FilesystemTypeEvidence & { readonly name: string })[]> {
+	if (!nativeFilesystem) return fs.readdir(target, { withFileTypes: true });
+	const handle = await fs.open(target, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOATIME).catch(error => {
+		if (error.code !== "EPERM") throw error;
+		return fs.open(target, constants.O_RDONLY | constants.O_DIRECTORY);
+	});
+	try {
+		const entries: ReturnType<typeof directoryImage> = [], buffer = Buffer.allocUnsafe(32 * 1024);
+		for (;;) {
+			const count = nativeFilesystem(handle.fd, buffer);
+			if (count < 0) throw Object.assign(new Error("directory read failed"), { code: getSystemErrorName(count) });
+			if (!count) return entries.sort((a, b) => Buffer.compare(Buffer.from(a.name), Buffer.from(b.name)));
+			entries.push(...await mapFilesystem(directoryImage(buffer.subarray(0, count)), async entry =>
+				filesystemEntryType(entry) === "other" ? Object.assign(await fs.lstat(path.join(target, entry.name)), { name: entry.name }) : entry));
+		}
+	} finally { await handle.close(); }
+}
+
+/** Import the helper's complete getdents64 image without enumerating the directory again. */
+export async function captureHeldDirectory(pid: number, fd: number, content: Buffer, stat: BigIntStats, realPath: string): Promise<StableFilesystemCapture> {
+	const startedAt = performance.now(), entries = directoryImage(content).map(entry => entry.name);
 	if (new Set(entries).size !== entries.length || !stat.isDirectory()) throw new Error("invalid_directory_image");
 	const handle = await fs.open(`/proc/${pid}/fd/${fd}`, 0x200000);
 	try {
@@ -208,26 +227,35 @@ export async function captureHeldDirectory(pid: number, fd: number, content: Buf
 	} catch (error) { await handle.close(); throw error; }
 }
 
+/** Open an independent reader on one regular inode without changing owned inputs' access times. */
+export async function openFilesystemFile(target: string, verifyPath = true) {
+	// O_PATH pins even executable aliases without admitting I/O on a raced-in FIFO or device.
+	const binding = process.platform === "linux" && (process.arch === "x64" || process.arch === "arm64")
+		? await fs.open(target, 0x200000 | (verifyPath ? constants.O_NOFOLLOW : 0)) : undefined;
+	let handle: FileHandle | undefined;
+	try {
+		const before = binding ? await binding.stat({ bigint: true }) : await (verifyPath ? fs.lstat : fs.stat)(target, { bigint: true });
+		if (!before.isFile()) throw new Error("not_regular_file");
+		handle = await fs.open(binding ? `/proc/self/fd/${binding.fd}` : target,
+			constants.O_RDONLY | (binding || !verifyPath ? 0 : constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0)
+			| (binding && before.uid === BigInt(process.getuid!()) ? constants.O_NOATIME : 0));
+		if (!sameFilesystemIdentity(before, await handle.stat({ bigint: true }))) throw new Error("file_changed_during_capture");
+		return { handle, binding, stat: before };
+	} catch (error) { try { await handle?.close(); } finally { await binding?.close(); } throw error; }
+}
+
 /** Pin and hash one file, verifying its final identity before cache publication or transfer. */
 export async function captureStableFile(target: string, maxBytes = Number.POSITIVE_INFINITY, retainContent = false,
 	observed?: Partial<Pick<StableFilesystemCapture, "stat" | "realPath">> & { readonly retainObject?: boolean; readonly gitBlob?: boolean; readonly digest?: false; readonly verifyPath?: boolean },
 	signal?: AbortSignal): Promise<StableFilesystemCapture> {
 	signal?.throwIfAborted(); const startedAt = performance.now(), takenAtMs = Date.now(), verifyPath = observed?.verifyPath !== false;
-	// O_PATH pins even executable aliases without admitting I/O on a raced-in FIFO or device.
-	let binding = process.platform === "linux" && (process.arch === "x64" || process.arch === "arm64")
-		? await fs.open(target, 0x200000 | (verifyPath ? constants.O_NOFOLLOW : 0)) : undefined;
-	let handle: FileHandle | undefined;
+	let { handle, binding, stat: before } = await openFilesystemFile(target, verifyPath);
 	try {
-		const before = binding ? await binding.stat({ bigint: true }) : observed?.stat ?? await (verifyPath ? fs.lstat : fs.stat)(target, { bigint: true });
-		if (!before.isFile()) throw new Error("not_regular_file");
 		if (binding && ((before.dev >> 8n & 0xfffn) | (before.dev >> 32n & ~0xfffn)) && !kernelTicks.has(before.dev)) // A major number: not a reusable anonymous one.
 			kernelTicks.set(before.dev, KERNEL_TICK_FILESYSTEMS.has((await fs.statfs(`/proc/self/fd/${binding.fd}`)).type));
 		if (observed?.stat && !sameFilesystemIdentity(observed.stat, before)) throw new Error("file_changed_during_capture");
 		const beforePath = verifyPath ? observed?.realPath ?? await fs.realpath(target) : target;
 		if (Number.isFinite(maxBytes) && before.size > BigInt(Math.floor(maxBytes))) throw new Error(`file_too_large:${before.size}`);
-		handle = await fs.open(binding ? `/proc/self/fd/${binding.fd}` : target,
-			constants.O_RDONLY | (binding || !verifyPath ? 0 : constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
-		if (!sameFilesystemIdentity(before, await handle.stat({ bigint: true }))) throw new Error("file_changed_during_capture");
 		// Another pending read may precede a same-tick rewrite; read under this identity.
 		const hash = observed?.digest !== false ? createHash("sha256") : undefined, blob = observed?.gitBlob ? createHash("sha1").update(`blob ${before.size}\0`) : undefined;
 		const content = retainContent ? Buffer.allocUnsafe(Number(before.size)) : undefined;
@@ -254,13 +282,12 @@ export async function captureStableFile(target: string, maxBytes = Number.POSITI
 			realPath: beforePath, computation: TimelineInterval.own(new TimelineInterval(startedAt, performance.now())) };
 		if (hash) rememberCapture(result, takenAtMs);
 		if (observed?.retainObject && retainContent && binding) {
-			await handle.close(); handle = undefined;
 			const object = new CapturedFilesystemObject(binding, result); binding = undefined;
 			return { ...result, object };
 		}
 		return result;
 	} catch (error) { signal?.throwIfAborted(); throw error; } finally {
-		try { await handle?.close(); } finally { await binding?.close(); }
+		try { await handle.close(); } finally { await binding?.close(); }
 	}
 }
 
@@ -269,7 +296,7 @@ export async function captureFilesystemEntry(target: string, read?: "directory" 
 	const startedAt = performance.now();
 	const before = await fs.lstat(target, { bigint: true });
 	const link = before.isSymbolicLink() ? await fs.readlink(target) : undefined;
-	const entries = read === "directory" && before.isDirectory() ? await fs.readdir(target, { withFileTypes: true }) : undefined;
+	const entries = read === "directory" && before.isDirectory() ? await readFilesystemDirectory(target) : undefined;
 	const info = link !== undefined || read !== undefined ? await fs.lstat(target, { bigint: true }) : before;
 	if (!sameFilesystemIdentity(before, info)) throw new Error(`${link !== undefined ? "symlink" : "directory"}_changed_during_capture`);
 	return { info, link, entries, computation: TimelineInterval.own(new TimelineInterval(startedAt, performance.now())) };

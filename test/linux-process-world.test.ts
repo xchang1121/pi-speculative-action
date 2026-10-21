@@ -639,6 +639,9 @@ nativeTest.for(["unusable", "one-shot", "descendant", "unusable-descendant"] as 
 			await fixture.compile("one-shot", { code: '#include <stdio.h>\n#include <unistd.h>\nint main(void) { usleep(20000); printf("prepared:%ld\\n", (long)getpid()); return 0; }\n' });
 		}
 		await fixture.commit("Preparation evidence");
+		// This failure-cache case keeps script metadata unchanged by the child's own reads.
+		const scriptPath = path.join(fixture.workspace, "unusable-child.sh");
+		if (failedChild) await filesystem.utimes(scriptPath, Date.now() / 1000 + 3600, (await stat(scriptPath)).mtime);
 		await fixture.prepare();
 		const route = await fixture.prepareActorReplay(), scope = { sessionID: "preparation-evidence", turnID: "native" };
 		// Changing a process limit is an existing unsupported syscall observation. Only this child changes its limit.
@@ -2409,7 +2412,9 @@ int main(void) { int fds[2]; char queue[8]; if (pipe(fds) || fds[0] != 3 || writ
 			"if ( : > \"$1/slot\" ) 2>/dev/null; then self=one other=two; else self=two other=one; fi",
 			": > \"$1/$self\"", "while [ ! -e \"$1/$other\" ]; do :; done",
 		].join("\n"));
-		await chmod(path.join(fixture.workspace, "barrier-worker"), 0o755);
+		const barrierWorker = path.join(fixture.workspace, "barrier-worker");
+		await chmod(barrierWorker, 0o755);
+		await filesystem.utimes(barrierWorker, Date.now() / 1000 + 3600, (await stat(barrierWorker)).mtime); // Keep concurrent readers' metadata stable.
 		// Scripts keep their own path as $0 and resolve relative modules, directly or through a bypass's shadow.
 		for (const [name, script] of [["redirect-worker", "#!/bin/sh\nprintf 'redirected %s\\n' \"$0\""], ["route-worker", "#!/bin/sh\nprintf 'out\\n'; printf 'err\\n' >&2"],
 			["bin.js", "#!/usr/bin/env node\nconsole.log(require('./lib.js'));"], ["lib.js", "module.exports = 'lib';"]]) {
@@ -2688,10 +2693,11 @@ nativeTest.for(["git", "auto"] as const)("preserves native metadata across stat 
 	await filesystem.symlink("d0", path.join(fixture.workspace, "many", "alias"));
 	await fixture.compile("metadata", { code: String.raw`#define _GNU_SOURCE
 ${cHeaders("dirent.h fcntl.h stdio.h string.h sys/mman.h sys/stat.h sys/syscall.h sys/sysmacros.h unistd.h")}
-static void emit(struct stat *s) { printf("%llu %llu %lld %o %llu\n", (unsigned long long)s->st_dev, (unsigned long long)s->st_ino, (long long)s->st_size, s->st_mode, (unsigned long long)s->st_nlink); }
+static void emit(struct stat *s) { printf("%llu %llu %lld %o %llu %lld:%ld\n", (unsigned long long)s->st_dev, (unsigned long long)s->st_ino, (long long)s->st_size, s->st_mode, (unsigned long long)s->st_nlink, (long long)s->st_atim.tv_sec, s->st_atim.tv_nsec); }
 int main(int argc, char **argv) {
 	const char *name = argc > 1 ? argv[1] : "README";
-	struct stat s; struct statx x; int fd = open(name, O_RDONLY);
+	struct stat s; struct statx x;
+	int fd = open(name, O_RDONLY);
 	if (fd < 0) { perror("open"); return 1; }
 	if (argc > 2 && !strcmp(argv[2], "legacy")) {
 		char target[32] = {0};
@@ -2728,7 +2734,7 @@ int main(int argc, char **argv) {
 	if (syscall(SYS_fstat, fd, &s)) return 5; emit(&s);
 	for (int mode = 0; mode < 3; mode++) {
 		if (statx(mode == 1 ? fd : AT_FDCWD, mode == 1 ? "" : name, mode == 1 ? AT_EMPTY_PATH : mode == 2 ? AT_SYMLINK_NOFOLLOW : 0, STATX_BASIC_STATS, &x)) return 6;
-		printf("%llu %llu %lld %o %u\n", (unsigned long long)makedev(x.stx_dev_major, x.stx_dev_minor), (unsigned long long)x.stx_ino, (long long)x.stx_size, x.stx_mode, x.stx_nlink);
+		printf("%llu %llu %lld %o %u %lld:%u\n", (unsigned long long)makedev(x.stx_dev_major, x.stx_dev_minor), (unsigned long long)x.stx_ino, (long long)x.stx_size, x.stx_mode, x.stx_nlink, (long long)x.stx_atime.tv_sec, x.stx_atime.tv_nsec);
 	}
 	return close(fd);
 }
@@ -2739,6 +2745,11 @@ int main(int argc, char **argv) {
 	childProcess.execFileSync("git", ["commit", "--amend", "--no-edit", "--date", stamp], { cwd: fixture.workspace, env: { ...process.env, GIT_COMMITTER_DATE: stamp } });
 	await fixture.prepare();
 	let turn = 0;
+	// Positive metadata cases keep access times stable across both executions and their directory reads.
+	for (const name of ["", ...await filesystem.readdir(fixture.workspace, { recursive: true })]) {
+		const target = path.join(fixture.workspace, name), info = await filesystem.lstat(target);
+		await filesystem.lutimes(target, Date.now() / 1000 + 3600, info.mtime);
+	}
 	const produce = (command: string) => fixture.fork(command, { executionScope: { sessionID: "metadata", turnID: String(turn++) } });
 	const native = (command: string) => childProcess.execFileSync("/bin/bash", ["-c", command], { cwd: fixture.workspace, env: { ...fixture.environment }, encoding: "utf8" });
 	const publication = vi.spyOn(filesystem, "writeFile").mockImplementation(async (...args) => {
@@ -2770,8 +2781,9 @@ int main(int argc, char **argv) {
 		if (mutation.startsWith("rmdir")) await mkdir(path.join(fixture.workspace, "many", "d0"));
 		if (mutation.endsWith("legacy")) { expect(await fixture.read("legacy-result")).toBe("legacy"); await rm(path.join(fixture.workspace, "legacy-result")); }
 	}
-	for (const [name, mode] of [["README", "proc"], ["many", "proc"], [".", ""], ["metadata-link", ""], ["dist/module.cjs", "module"], ["README", "replace"]]) {
-		const command = mode === "module" ? `node -e "console.log(require('./${name}'))"` : `./metadata ${name} ${mode === "proc" ? mode : ""}`;
+	for (const [name, mode] of [["README", "proc"], ["many", "proc"], [".", ""], ["metadata-link", ""], ["dist/module.cjs", "module"], ["README", "replace"], [path.join(fixture.workspace, "README"), "atime"], [`${bin}/cat`, "atime"]]) {
+		if (mode === "atime") await filesystem.utimes(name!, 0, 0);
+		const command = mode === "module" ? `node -e "console.log(require('./${name}'))"` : `./metadata '${name}' ${mode === "proc" ? mode : ""}`;
 		await using candidate = disposable(await produce(command));
 		expect(candidate.output.isError, textOutput(candidate.output.result)).toBe(false);
 		// A proc link names this caller's descriptor; only its followed metadata compares across processes.
@@ -2780,11 +2792,12 @@ int main(int argc, char **argv) {
 		if (mode === "proc") continue;
 		expect((await candidate.validate?.())?.status).toBe("valid");
 		if (mode === "module") await fixture.write(name!, "module.exports = 43;\n");
+		else if (mode === "atime") await filesystem.readFile(name!);
 		else if (name === ".") { const info = await filesystem.stat(fixture.workspace); await filesystem.utimes(fixture.workspace, info.atime, new Date(info.mtimeMs - 2000)); }
 		else if (mode === "replace") {
 			childProcess.execFileSync("python3", ["-c", 'import os; p="README"; s=os.stat(p); b=open(p,"rb").read(); q=p+".swap"; open(q,"wb").write(b); os.chmod(q,s.st_mode & 0o7777); os.utime(q, ns=(s.st_atime_ns,s.st_mtime_ns)); os.replace(q,p)'], { cwd: fixture.workspace });
-			expect(textOutput(candidate.output.result)).not.toBe(native(command));
 		} else continue;
+		if (mode === "replace" || mode === "atime") expect(textOutput(candidate.output.result)).not.toBe(native(command));
 		expect((await candidate.validate?.())?.status).toBe("stale");
 	}
 	for (const command of [`${bin}/cat`, "git log -1 --format=%cr", 'printf "%s\\n" constant', 'printf "%s\\n" "$RANDOM"',

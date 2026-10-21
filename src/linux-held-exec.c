@@ -10,6 +10,7 @@
 #include <sys/auxv.h>
 #include <ctype.h>
 #include <errno.h>
+#include <endian.h>
 #include <fcntl.h>
 #include <sys/eventfd.h>
 #include <limits.h>
@@ -56,6 +57,7 @@ typedef void *napi_env, *napi_value, *napi_callback_info;
 typedef napi_value (*napi_callback)(napi_env, napi_callback_info);
 extern int napi_get_cb_info(napi_env, napi_callback_info, size_t *, napi_value *, napi_value *, void **) __attribute__((weak));
 extern int napi_get_value_int32(napi_env, napi_value, int32_t *) __attribute__((weak));
+extern int napi_get_buffer_info(napi_env, napi_value, void **, size_t *) __attribute__((weak));
 extern int napi_create_int32(napi_env, int32_t, napi_value *) __attribute__((weak));
 extern int napi_create_function(napi_env, const char *, size_t, napi_callback, void *, napi_value *) __attribute__((weak));
 static __thread int startup_gate[2] = {-1, -1};
@@ -85,10 +87,27 @@ static void register_startup(void) { startup_registered = pthread_atfork(NULL, N
 /* Open a gate (0), bind its observer PID (>0), or release the parent ends (-1).
  * Thread-local state cannot lend one worker's launch to another callback. */
 static napi_value startup_bridge(napi_env env, napi_callback_info info) {
-	size_t count = 1; napi_value argument, result; int32_t operation, value = -1;
-	if (napi_get_cb_info(env, info, &count, &argument, NULL, NULL) || count != 1 ||
-		napi_get_value_int32(env, argument, &operation)) return NULL;
-	if (!operation && startup_gate[0] < 0) {
+	size_t count = 2; napi_value arguments[2], result; int32_t operation, value = -1;
+	if (napi_get_cb_info(env, info, &count, arguments, NULL, NULL) || !count ||
+		napi_get_value_int32(env, arguments[0], &operation)) return NULL;
+	if (count == 2) {
+		void *bytes; size_t length;
+		if (napi_get_buffer_info(env, arguments[1], &bytes, &length) || length > 1024 * 1024) return NULL;
+		if (operation == -3) {
+			/* Two little-endian int64 values followed by one terminated path; keep its access time. */
+			uint64_t fields[2];
+			if (length < sizeof(fields) + 2 || strnlen((char *)bytes + sizeof(fields), length - sizeof(fields)) != length - sizeof(fields) - 1) return NULL;
+			memcpy(fields, bytes, sizeof(fields));
+			struct timespec times[2] = {{ .tv_nsec = UTIME_OMIT }, { .tv_sec = (int64_t)le64toh(fields[0]), .tv_nsec = (int64_t)le64toh(fields[1]) }};
+			if (times[1].tv_nsec < 0 || times[1].tv_nsec > 999999999) return NULL;
+			value = utimensat(AT_FDCWD, (char *)bytes + sizeof(fields), times, AT_SYMLINK_NOFOLLOW);
+			if (value < 0 && errno == ENOENT) value = 0;
+		} else {
+			if (length < 24) return NULL;
+			value = syscall(SYS_getdents64, operation, bytes, length);
+		}
+		if (value < 0) value = -errno;
+	} else if (!operation && startup_gate[0] < 0) {
 		if (!socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, startup_gate)) value = startup_gate[1];
 	} else if (operation > 0 && startup_gate[0] >= 0 && !startup_observer) {
 		startup_observer = operation; close(startup_gate[1]); startup_gate[1] = -1; value = 0;
@@ -102,7 +121,7 @@ static napi_value startup_bridge(napi_env env, napi_callback_info info) {
 
 napi_value napi_register_module_v1(napi_env env, napi_value exports) {
 	(void)exports; napi_value result;
-	if (!napi_create_function || !napi_get_cb_info || !napi_get_value_int32 || !napi_create_int32 ||
+	if (!napi_create_function || !napi_get_cb_info || !napi_get_value_int32 || !napi_create_int32 || !napi_get_buffer_info ||
 		pthread_once(&startup_registration, register_startup) || !startup_registered) return NULL;
 	return napi_create_function(env, "startup", (size_t)-1, startup_bridge, NULL, &result) ? NULL : result;
 }
@@ -3767,21 +3786,6 @@ done:
 	return result;
 }
 
-/* `touch -chm -d @SECONDS.NANOSECONDS PATH` for every "SECONDS NANOSECONDS PATH\0" record on stdin, in one process. */
-static int set_modified_times(void) {
-	char *record = NULL, *end = NULL;
-	size_t capacity = 0;
-	int status = 0;
-	while (!status && getdelim(&record, &capacity, 0, stdin) > 0) {
-		struct timespec times[2] = { { .tv_nsec = UTIME_OMIT }, { .tv_sec = (time_t)strtoll(record, &end, 10) } };
-		times[1].tv_nsec = *end == ' ' ? strtol(end + 1, &end, 10) : -1;
-		if (*end != ' ' || times[1].tv_nsec < 0 || times[1].tv_nsec > 999999999) status = 64;
-		else if (utimensat(AT_FDCWD, end + 1, times, AT_SYMLINK_NOFOLLOW) && errno != ENOENT) status = 1;
-	}
-	free(record);
-	return status;
-}
-
 int main(int argc, char **argv) {
 	if (argc > 1 && !strcmp(argv[1], "--hold-pins")) return hold_pins(argc, argv);
 	int observing = argc > 1 && (!strcmp(argv[1], "--attach") || !strcmp(argv[1], "--attach-skip-code") || !strcmp(argv[1], "--probe-observation"));
@@ -3839,7 +3843,6 @@ int main(int argc, char **argv) {
 			!strcmp(argv[1], "--exec-closed-input"), output_flags, stack ? &stack_limit : NULL);
 	}
 	if (argc == 4 && !strcmp(argv[1], "--probe-context")) return probe_context(argv[2], argv[3]);
-	if (argc == 2 && !strcmp(argv[1], "--set-modified-times")) return set_modified_times();
 	if (argc == 2 && !strcmp(argv[1], "--probe-clean-fds")) {
 		int extra = has_unmodeled_descriptors(3);
 		return extra < 0 ? 70 : extra ? 65 : 0;

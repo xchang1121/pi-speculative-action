@@ -1,11 +1,11 @@
-import type { BigIntStats, Dirent, Stats } from "node:fs";
-import { lstat, readdir, readlink } from "node:fs/promises";
+import type { BigIntStats, Stats } from "node:fs";
+import { lstat, readlink } from "node:fs/promises";
 import path from "node:path";
 import { containsFilesystemPath, relativeFilesystemPath, slash } from "./path-utils.ts";
 import { isMissing } from "./error-utils.ts";
 import {
 	type StableFilesystemCapture, FILESYSTEM_CONCURRENCY, mapFilesystem, type FilesystemTypeEvidence, FILESYSTEM_OBSERVATION_FIELDS,
-	filesystemEntryType, filesystemMetadataDigest, type FilesystemObservationEvidence,
+	filesystemEntryType, filesystemMetadataDigest, type FilesystemObservationEvidence, readFilesystemDirectory,
 } from "./filesystem-evidence.ts";
 import type { DynamicDependency } from "./provenance-certificate.ts";
 import { type Sha256Digest, digestObject, sha256Digest, sha256DigestAsync } from "./stable-value-hash.ts";
@@ -59,7 +59,7 @@ export async function captureWorkspaceStructure(root: string, options: Workspace
 		const captured = await mapFilesystem(batch, async (relative) => {
 			const target = path.join(absoluteRoot, relative), stat = await lstat(target, { bigint: true });
 			await options.observeStat?.(relative, stat);
-			const children = !relative || stat.isDirectory() ? await readdir(target, { withFileTypes: true }) : [];
+			const children = !relative || stat.isDirectory() ? await readFilesystemDirectory(target) : [];
 			const entry = await captureExistingWorkspaceStructureEntry(target, stat, relative ? [] : [...excludes], children);
 			return { relative, entry, children };
 		});
@@ -122,7 +122,7 @@ async function captureExistingWorkspaceStructureEntry(
 	target: string,
 	stat: BigIntStats,
 	excludeEntries: readonly string[] = [],
-	children?: readonly Dirent[],
+	children?: Awaited<ReturnType<typeof readFilesystemDirectory>>,
 ): Promise<WorkspaceStructureEntry> {
 	const change = { changeDigest: statChangeDigest(stat), changeTimeMs: statMilliseconds(stat, "ctime") };
 	if (stat.isSymbolicLink()) {
@@ -131,7 +131,7 @@ async function captureExistingWorkspaceStructureEntry(
 	}
 	if (stat.isDirectory()) {
 		const excluded = new Set(excludeEntries);
-		const entries = (children ?? await readdir(target, { withFileTypes: true })).filter((entry) => !excluded.has(entry.name));
+		const entries = (children ?? await readFilesystemDirectory(target)).filter((entry) => !excluded.has(entry.name));
 		return {
 			kind: "directory",
 			observed: Object.fromEntries(FILESYSTEM_OBSERVATION_FIELDS.map(field => [field, stat[field]])) as FilesystemObservationEvidence,

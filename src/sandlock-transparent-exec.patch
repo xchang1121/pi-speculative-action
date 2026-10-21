@@ -1435,11 +1435,11 @@ index 6e4ab93..3e50a6c 100644
 +            // ownership, the original object remains the read source and no input image grants it new authority.
 +            if unsafe { libc::fchown(writable.as_raw_fd(), original[4] as _, original[5] as _) } != 0 { return Err(invalid()); }
 +            fs::write(&usage_path, format!("{} {}", bytes + original[7] as u64 * 2, count + 1))?;
-+            let mut source = OpenOptions::new().read(true).open(format!("/proc/self/fd/{}", source.as_raw_fd()))?;
++            let mut source = OpenOptions::new().read(true).custom_flags(libc::O_NOATIME).open(format!("/proc/self/fd/{}", source.as_raw_fd()))?;
 +            let mut captured = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&baseline)?;
 +            let bytes = std::io::copy(&mut std::io::Read::by_ref(&mut source).take(original[7] as u64 + 1), &mut captured)?;
 +            let after = descriptor_fields(source.as_raw_fd())?;
-+            if bytes != original[7] as u64 || (0..14).filter(|i| *i != 10).any(|i| original[i] != after[i]) { return Err(invalid()); }
++            if bytes != original[7] as u64 || original != after { return Err(invalid()); }
 +            captured.set_permissions(fs::Permissions::from_mode(0o400))?;
 +            fs::copy(&baseline, &working)?;
 +            writable.set_permissions(fs::Permissions::from_mode(original[2] as u32 & 0o7777))?;

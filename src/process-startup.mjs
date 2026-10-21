@@ -6,6 +6,14 @@ import { access, realpath } from "node:fs/promises";
 import { constants } from "node:fs";
 
 const requireNative = createRequire(import.meta.url), qualification = fileURLToPath(import.meta.url);
+/** @type {((fd: number, buffer: Buffer) => number) | undefined} */
+export let nativeFilesystem;
+/** @param {string} binary */
+export function nativeProcessLibrary(binary) {
+	const startup = requireNative(`${binary}.node`);
+	if (startup(-1, Buffer.alloc(24)) !== -9) throw new Error("native directory reader unavailable");
+	nativeFilesystem = startup; return startup;
+}
 
 /** Qualify the same Node/libuv path in a disposable group without occupying the host's launch gate.
  * @param {string} binary
@@ -27,14 +35,14 @@ export async function qualifyNativeStartup(binary, options = {}) {
 	try {
 		const code = await closed;
 		if (code !== 0) throw new Error(code === 77 ? "native observation requires a qualified PI_SPEC_HELD_EXEC_OBSERVER or inherited no_new_privs" : "native startup interception unavailable");
-		signal.throwIfAborted(); return { startup: requireNative(`${binary}.node`), observer };
+		signal.throwIfAborted(); return { startup: nativeProcessLibrary(binary), observer };
 	} finally { signal.removeEventListener("abort", abort); abort(); await closed; clearTimeout(force); }
 }
 
 if (process.argv[1] === qualification) {
 	// Group cancellation kills the probe children; this parent stays to reap them.
 	process.on("SIGTERM", () => {});
-	const binary = process.argv[2], startup = requireNative(`${binary}.node`), observerBinary = process.argv[3];
+	const binary = process.argv[2], startup = nativeProcessLibrary(binary), observerBinary = process.argv[3];
 	if (process.argv[4] === "confined" && startup(-2) !== 0) throw new Error("private startup qualification unavailable");
 	const probe = spawnSync(observerBinary, ["--probe-observation"], { stdio: "ignore" });
 	if (probe.status !== 0) process.exit(probe.status ?? 70);

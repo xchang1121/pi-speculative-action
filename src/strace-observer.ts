@@ -1019,10 +1019,9 @@ const STAT_MODE_BITS: Readonly<Record<string, bigint>> = { S_IFSOCK: 0o140000n, 
 /** Normalize the successful kernel stat structure printed by strace -v; statx prints the same fields under its own names. */
 type StatObservation = { readonly digest: Sha256Digest; readonly fields?: readonly FilesystemObservationField[] };
 
-/** statx fills what its mask reports and a caller reads only what it asked for; fields outside the stat structure are
- * ignored, and an unknown flag leaves every field required. */
+/** Statx masks select returned fields; unknown bits require the full stat image. */
 const STATX_FIELD_MASKS: Readonly<Record<string, readonly FilesystemObservationField[]>> = { STATX_TYPE: ["mode"], STATX_MODE: ["mode"],
-	STATX_NLINK: ["nlink"], STATX_UID: ["uid"], STATX_GID: ["gid"], STATX_ATIME: [], STATX_MTIME: ["mtimeNs"], STATX_CTIME: ["ctimeNs"],
+	STATX_NLINK: ["nlink"], STATX_UID: ["uid"], STATX_GID: ["gid"], STATX_ATIME: ["atimeNs"], STATX_MTIME: ["mtimeNs"], STATX_CTIME: ["ctimeNs"],
 	STATX_INO: ["ino"], STATX_SIZE: ["size"], STATX_BLOCKS: ["blocks"], STATX_BASIC_STATS: FILESYSTEM_OBSERVATION_FIELDS, STATX_ALL: FILESYSTEM_OBSERVATION_FIELDS,
 	...Object.fromEntries(["MNT_ID", "MNT_ID_UNIQUE", "BTIME", "DIOALIGN", "DIO_READ_ALIGN", "SUBVOL", "WRITE_ATOMIC"].map((flag) => [`STATX_${flag}`, []])) };
 
@@ -1048,21 +1047,12 @@ function statObservationDigest(structure: string): StatObservation | undefined {
 		const seconds = field(name), nanos = field(`${name}_nsec`);
 		return seconds === undefined || nanos === undefined ? undefined : seconds * 1_000_000_000n + nanos;
 	};
-	const evidence = {
-		dev: device("st_dev"),
-		ino: field("st_ino"),
-		mode,
-		nlink: field("st_nlink"),
-		uid: field("st_uid"),
-		gid: field("st_gid"),
-		rdev: device("st_rdev"),
-		size: field("st_size"),
-		blksize: field("st_blksize"),
-		blocks: field("st_blocks"),
-		mtimeNs: time("st_mtime"),
-		ctimeNs: time("st_ctime"),
-	};
 	const fields = mask ? FILESYSTEM_OBSERVATION_FIELDS.filter(field => mask.includes(field)) : FILESYSTEM_OBSERVATION_FIELDS;
+	const evidence = Object.fromEntries(fields.map(name => [name,
+		name === "mode" ? mode
+		: name === "dev" || name === "rdev" ? device(`st_${name}`)
+		: name.endsWith("Ns") ? time(`st_${name.slice(0, -2)}`) : field(`st_${name}`),
+	]));
 	if (fields.some(field => evidence[field] === undefined)) return undefined;
 	return { digest: filesystemObservationDigest(evidence, fields), ...(fields.length < FILESYSTEM_OBSERVATION_FIELDS.length ? { fields } : {}) };
 }
