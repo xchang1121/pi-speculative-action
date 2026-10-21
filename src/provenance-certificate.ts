@@ -603,7 +603,7 @@ function validLogicalPath(value: string): boolean {
 }
 
 function validAliases(aliases: readonly string[], target: string): boolean {
-	return Array.isArray(aliases) && aliases.length >= 2 && aliases.includes(target) &&
+	return Array.isArray(aliases) && aliases.includes(target) &&
 		aliases.every((name, index) => validLogicalPath(name) && (index === 0 || name > aliases[index - 1]!));
 }
 

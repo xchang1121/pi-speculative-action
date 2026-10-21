@@ -148,7 +148,7 @@ async function captureExistingWorkspaceStructureEntry(
 			kind: "file",
 			metadataDigest: filesystemMetadataDigest(stat),
 			...change,
-			mode: Number(stat.mode & 0o777n),
+			mode: process.platform === "win32" ? 0 : Number(stat.mode & 0o777n),
 			size: Number(stat.size),
 			links: Number(stat.nlink),
 			object: `${stat.dev}:${stat.ino}`,
@@ -222,7 +222,8 @@ export function diffWorkspaceStructures(
 			const reason = regularDeltaFailure(relativePath, previous, current, delta);
 			if (reason) return { effects: [], complete: false, reason };
 			let change: WorkspaceRegularDelta = current?.kind === "file" ? { ...delta, afterModified: current.modified } : delta;
-			if (previous?.kind === "file" && previous.aliases) change = { ...change, aliases: previous.aliases.map(name => projection.toLogical(name)).sort() };
+			if (previous?.kind === "file") change = { ...change,
+				aliases: (previous.aliases ?? [path.join(before.root, relativePath)]).map(name => projection.toLogical(name)).sort() };
 			if (current?.kind === "file" && current.object) {
 				const original = originals.get(current.object), anchor = original ?? results.get(current.object)!;
 				if (original !== undefined || anchor !== relativePath) {

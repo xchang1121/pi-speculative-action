@@ -235,6 +235,7 @@ nativeTest.for(["journal", "whole-released", "whole-consumed", "custom", "dispos
 	});
 	const command = "printf own", invocation = fixture.invocation({ command }).process!;
 	const running = fixture.workspaceSandbox.withWorkspace(fixture.workspace, async workspace => {
+		if (mode === "journal") await chmod(path.join(workspace.sandboxRoot, "input.txt"), 0o600);
 		const interval = await workspace.transactions.begin(), begin = workspace.transactions.begin, captured = vi.fn(begin);
 		const context = mode === "custom" ? { ...workspace, transactions: { ...workspace.transactions, begin: captured } } : workspace;
 		await using session = disposable(await fixture.backend.open({ sourceRoot: fixture.workspace, workspace: context, invocation }));
@@ -249,6 +250,7 @@ nativeTest.for(["journal", "whole-released", "whole-consumed", "custom", "dispos
 			await writeFile(path.join(workspace.sandboxRoot, "input.txt"), "after");
 			const interfered = vi.fn(async () => false), delta = await next.finish(async () => ({ written: new Set(["input.txt"]), observed: new Map(), endedAt: Date.now(), interfered }));
 			expect(delta.complete).toBe(true); expect(delta.changes.map(change => [change.relativePath, Buffer.from(change.before!).toString(), Buffer.from(change.after!).toString()])).toEqual([["input.txt", "before", "after"]]);
+			expect(delta.changes.map(change => [change.beforeMode, change.afterMode])).toEqual([[0o600, 0o600]]);
 			expect(interfered).toHaveBeenCalledOnce(); await fixture.inOwner(state => state.other.abort());
 		} else {
 			await interval.abort();

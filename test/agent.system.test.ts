@@ -706,6 +706,15 @@ test.for(["in-place", "git", "single-in-place", "single-git"])("keeps effects pr
 		resolveInvocation: (tool, input) => { if (waiting) secondResolved.resolve(); return resolvePiToolInvocation(tool, input, { cwd, environment: {} }); },
 	});
 	try {
+		const original = (await stat(file, { bigint: true })).ino;
+		for (const content of ["raw write\n", "one two\n"]) {
+			const before = await read(), captured = await sandbox.capture({ cwd, driver: "git", execute: async workspace => {
+				await writeFile(path.join(workspace.sandboxRoot, "notes.txt"), content);
+				return { result: { content: [], details: {} }, isError: false };
+			} });
+			expect(await read()).toBe(before); await sandbox.commitDelta(captured);
+			for (const name of new Set([file, path.join(cwd, alias)])) expect((await stat(name, { bigint: true })).ino).toBe(original);
+		}
 		await f.start();
 		const args = { path: "notes.txt", edits: [{ oldText: "two", newText: "three" }] };
 		await f.preview("edit", args); await f.ready();

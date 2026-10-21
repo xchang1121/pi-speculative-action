@@ -65,7 +65,7 @@ import {
 	type SynchronousProcessResult,
 } from "./linux-process-sync.ts";
 import {
-	WorkspaceSandboxService, nativeWorkspaceOwner, nativeWorkspaceObservation, readSandboxDirectoryState, restoreModifiedTimes, sameSandboxState,
+	WorkspaceSandboxService, nativeWorkspaceOwner, nativeWorkspaceObservation, readSandboxDirectoryState, restoreModifiedTimes, sameSandboxState, sandboxWorkspaceChanges,
 	type SandboxDirectoryState, type SandboxWorkspaceChange, type SandboxWorkspaceContext,
 } from "./workspace-sandbox.ts";
 import { containsFilesystemPath as pathContains, relativeFilesystemPath, slash } from "./path-utils.ts";
@@ -1913,11 +1913,7 @@ async function sealSessionEvidence(session: ActiveSession, external: Awaited<Ret
 		session.incompleteReasons.add(`top_effects:${effects.reason ?? "incomplete"}`);
 		throw new Error(`top-level workspace effects are incomplete: ${effects.reason ?? "unknown"}`);
 	}
-	const committedChanges = effects.effects.map(({ logicalPath: target, relativePath, change }): SandboxWorkspaceChange => {
-		const address = { root: session.sourceRoot, target, resource: slash(relativePath) };
-		return change.kind !== "directory" ? { ...change, ...address } : { kind: "directory", ...address,
-			before: change.before && directoryState(change.before), after: change.after && directoryState(change.after) };
-	});
+	const committedChanges = sandboxWorkspaceChanges(session.sourceRoot, effects);
 	try {
 		const writers = sessionWriters(session), evidence = await captureDependencies(session, capture.before, writers.flatMap(writer => writer.observation ?? []), effects,
 			external, writers.flatMap(writer => writer.evidence ?? []));
