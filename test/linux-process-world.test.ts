@@ -275,11 +275,12 @@ nativeTest.for(["journal", "whole-released", "whole-consumed", "custom", "dispos
 	if (mode === "dispose") await expect(running).rejects.toMatchObject({ errors: [{ message: "journal cleanup sentinel" }] }); else await running;
 });
 
-nativeTest.for(["conflict", "disjoint", "custom-conflict", "custom-disjoint", "foreign-conflict", "foreign-disjoint", "live-conflict", "live-disjoint", "sealing-disjoint", "retired-conflict", "retired-disjoint", "custom-retired-conflict", "custom-retired-disjoint"])("attributes %s writes across public workspace sessions", { timeout: 30_000 }, async (mode, { benchmark }) => {
+nativeTest.for(["conflict", "disjoint", "alias-conflict", "alias-disjoint", "custom-conflict", "custom-disjoint", "foreign-conflict", "foreign-disjoint", "live-conflict", "live-disjoint", "sealing-disjoint", "retired-conflict", "retired-disjoint", "custom-retired-conflict", "custom-retired-disjoint"])("attributes %s writes across public workspace sessions", { timeout: 30_000 }, async (mode, { benchmark }) => {
 	const fixture = await benchmark("pi-public-writer-", "git");
 	await fixture.write("input.txt", "base");
 	await fixture.write("other.txt", "base");
 	await fixture.write("other-pid", "");
+	if (mode.startsWith("alias-")) await filesystem.link(path.join(fixture.workspace, "input.txt"), path.join(fixture.workspace, "z-alias.txt"));
 	if (mode.includes("retired-")) await fixture.write("pid", "");
 	await fixture.compile("writer", { code: `${cHeaders("fcntl.h signal.h stdio.h unistd.h")}
 int main(int argc, char **argv) { int fd = open(argv[2], O_WRONLY | O_TRUNC); if (fd < 0 || write(fd, argv[1], 1) != 1) return 1; close(fd);
@@ -303,8 +304,8 @@ int main(int argc, char **argv) { int fd = open(argv[2], O_WRONLY | O_TRUNC); if
 	});
 	await fixture.workspaceSandbox.withWorkspace(fixture.workspace, async workspace => {
 		const invocation = (command: string) => fixture.invocation({ command }).process!;
-		const disjoint = mode.endsWith("disjoint"), custom = mode.startsWith("custom-"), live = mode.startsWith("live-"), foreign = live || mode.startsWith("foreign-"), retired = mode.includes("retired-");
-		const command = "exec ./writer A input.txt", other = `exec ./writer B ${disjoint ? "other.txt" : "input.txt"}${live ? " hold" : ""}`;
+		const disjoint = mode.endsWith("disjoint"), aliased = mode.startsWith("alias-"), custom = mode.startsWith("custom-"), live = mode.startsWith("live-"), foreign = live || mode.startsWith("foreign-"), retired = mode.includes("retired-");
+		const command = "exec ./writer A input.txt", other = `exec ./writer B ${disjoint ? "other.txt" : aliased ? "z-alias.txt" : "input.txt"}${live ? " hold" : ""}`;
 		let captureCalls = 0;
 		const context = { ...workspace, transactions: { ...workspace.transactions, begin: async () => {
 			captureCalls++; return workspace.transactions.begin();
@@ -348,7 +349,7 @@ int main(int argc, char **argv) { int fd = open(argv[2], O_WRONLY | O_TRUNC); if
 			expect(changes).toEqual([]); expect(await first.validate()).toMatchObject({ status: "indeterminate" });
 		} else {
 			if (!custom) expect(own.length).toBeGreaterThan(0); expect(own.every(capture => capture.complete), JSON.stringify(captures)).toBe(true);
-			expect(changes.map(change => change.resource).sort()).toEqual(["input.txt", "pid"]);
+			expect(changes.map(change => change.resource).sort()).toEqual(["input.txt", "pid", ...aliased ? ["z-alias.txt"] : []]);
 			expect(await first.validate()).toMatchObject({ status: "valid" });
 		}
 	});

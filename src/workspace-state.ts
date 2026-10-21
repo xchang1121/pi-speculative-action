@@ -1,5 +1,5 @@
 import type { FilesystemObservationEvidence } from "./filesystem-evidence.ts";
-import type { Sha256Digest } from "./stable-value-hash.ts";
+import { digestObject, type Sha256Digest } from "./stable-value-hash.ts";
 
 interface WorkspaceEntryChange { readonly changeDigest: Sha256Digest; readonly changeTimeMs: number; }
 
@@ -43,6 +43,16 @@ export interface WorkspaceStructureSnapshot {
 	readonly root: string;
 	readonly entries: ReadonlyMap<string, WorkspaceStructureEntry>;
 	readonly complete: boolean;
+}
+
+const aliasIdentities = new WeakMap<readonly string[], Sha256Digest>();
+
+/** A captured alias group is shared by its names; compare its immutable namespace once. */
+export function workspaceAliasIdentity(aliases: readonly string[] | undefined): Sha256Digest | undefined {
+	if (!aliases) return;
+	const identity = aliasIdentities.get(aliases) ?? digestObject(aliases);
+	if (Object.isFrozen(aliases)) aliasIdentities.set(aliases, identity);
+	return identity;
 }
 
 /** A name refers to an object from either endpoint of the same workspace transaction. */

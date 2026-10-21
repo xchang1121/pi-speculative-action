@@ -9,7 +9,7 @@ import {
 } from "./filesystem-evidence.ts";
 import type { DynamicDependency } from "./provenance-certificate.ts";
 import { type Sha256Digest, digestObject, sha256Digest, sha256DigestAsync } from "./stable-value-hash.ts";
-import type { WorkspaceStructureEntry, WorkspaceStructureSnapshot, WorkspaceTreeEntry } from "./workspace-state.ts";
+import { workspaceAliasIdentity, type WorkspaceStructureEntry, type WorkspaceStructureSnapshot, type WorkspaceTreeEntry } from "./workspace-state.ts";
 import { orderWorkspaceChanges, type WorkspaceRegularDelta } from "./workspace-transaction.ts";
 
 export type { WorkspaceStructureEntry, WorkspaceStructureSnapshot, WorkspaceTreeEntry } from "./workspace-state.ts";
@@ -347,10 +347,11 @@ const STRUCTURE_IDENTITY_FIELDS = {
 	file: ["size", "metadataDigest", "object"], directory: ["entriesDigest", "metadataDigest"], symlink: ["targetDigest"], unsupported: ["type"],
 } satisfies { [Kind in WorkspaceStructureEntry["kind"]]: readonly (keyof Extract<WorkspaceStructureEntry, { kind: Kind }>)[] };
 
-function sameStructureEntry(left: WorkspaceStructureEntry | undefined, right: WorkspaceStructureEntry | undefined): boolean {
-	if (!left || !right || left.kind !== right.kind) return left === right;
-	return STRUCTURE_IDENTITY_FIELDS[left.kind].every(field => Reflect.get(left, field) === Reflect.get(right, field)) &&
-		(left.kind !== "file" || JSON.stringify(left.aliases) === JSON.stringify((right as typeof left).aliases));
+export function sameStructureEntry(left: WorkspaceStructureEntry | undefined, right: WorkspaceStructureEntry | undefined, identity: "semantic" | "change" = "semantic"): boolean {
+	if (left === right) return true;
+	if (!left || !right || left.kind !== right.kind) return false;
+	return (identity === "change" ? left.changeDigest === right.changeDigest : STRUCTURE_IDENTITY_FIELDS[left.kind].every(field => Reflect.get(left, field) === Reflect.get(right, field))) &&
+		(left.kind !== "file" || workspaceAliasIdentity(left.aliases) === workspaceAliasIdentity((right as typeof left).aliases));
 }
 
 function changedRootMetadata(

@@ -73,7 +73,7 @@ import { projectFileMutation } from "./workspace-state.ts";
 
 // Certificates are meaningful only under the implementation that collected and authorized their proof.
 const OBSERVER_FINGERPRINT = digestObject(["linux-process-backend", "strace-observer", "reuse-planner", "reuse-store",
-	"provenance-certificate", "provenance-validation", "filesystem-evidence", "stable-value-hash", "workspace-state"]
+	"provenance-certificate", "provenance-validation", "filesystem-evidence", "stable-value-hash", "workspace-state", "workspace-sandbox", "process-observation"]
 	.map(name => sha256Digest(readFileSync(new URL(`./${name}.${import.meta.url.endsWith(".ts") ? "ts" : "js"}`, import.meta.url)))));
 const POLICY_ID = "sandlock-virtual-root-transparent-exec-creation-mode";
 const LEAF_POLICY_ID = "sandlock-virtual-workspace-leaf-creation-mode";

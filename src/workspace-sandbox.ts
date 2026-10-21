@@ -26,8 +26,8 @@ import {
 	type LinuxOverlayfsMount, type LinuxOverlayfsOptions,
 } from "./linux-overlayfs.ts";
 import {
-	captureWorkspaceStructure, captureWorkspaceStructureEntry, statChangeDigest, workspaceStructureSnapshot, directoryEntriesDigest, diffWorkspaceStructures, ExecutionPathProjection,
-	type WorkspaceStructureEntry, type WorkspaceStructureSnapshot, type WorkspaceTransactionDiff,
+	captureWorkspaceStructure, captureWorkspaceStructureEntry, statChangeDigest, sameStructureEntry, workspaceStructureSnapshot, directoryEntriesDigest, diffWorkspaceStructures, ExecutionPathProjection,
+	type WorkspaceStructureSnapshot, type WorkspaceTransactionDiff,
 } from "./process-observation.ts";
 import { ResourceVersionManager, type ResourceChangeSet, type ResourceVersionToken, type ResourceInput } from "./resource-version.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
@@ -111,7 +111,7 @@ export interface SandboxWorkspaceObservation {
 	readonly gitBinary: string; readonly repository: string; readonly commit: string;
 	readonly baselineFrontier: Map<string, RegularFileState | undefined>; readonly sourceDevice: bigint;
 	readonly initialStructure: WorkspaceStructureSnapshot;
-	readonly metadata?: Pick<Awaited<ReturnType<typeof preserveSnapshotMetadata>>, "image" | "objects" | "mappings" | "modes">;
+	readonly metadata?: Awaited<ReturnType<typeof preserveSnapshotMetadata>>;
 	readonly modes?: ReadonlyMap<string, number>;
 	readonly liveBase?: WorkspaceStructureSnapshot;
 	readonly overlay?: { readonly upperRoot: string; readonly device: string; readonly baseline: WorkspaceStructureSnapshot };
@@ -259,27 +259,32 @@ interface AutoWorkspaceDriverDecision {
 }
 
 
-function regularStructureTransitions(before: WorkspaceStructureSnapshot, after: WorkspaceStructureSnapshot): { readonly complete: true; readonly paths: readonly string[] } | { readonly complete: false; readonly reason: string } {
-	if (!before.complete || !after.complete) return { complete: false, reason: "workspace_structure_limit" };
+function regularStructureTransitions(before: WorkspaceStructureSnapshot, after: WorkspaceStructureSnapshot): readonly string[] {
+	if (!before.complete || !after.complete) throw new Error("workspace_structure_limit");
 	const paths: string[] = [];
 	for (const relativePath of [...new Set([...before.entries.keys(), ...after.entries.keys()])].sort()) {
 		if (!relativePath) continue;
 		const previous = before.entries.get(relativePath), current = after.entries.get(relativePath), kind = previous?.kind ?? current?.kind;
-		if (sameChangeIdentity(previous, current)) continue;
+		if (sameStructureEntry(previous, current, "change")) continue;
 		if (previous && current && previous.kind !== current.kind || kind !== "file" && kind !== "directory")
-			return { complete: false, reason: `unsupported_workspace_transition:${relativePath}` };
+			throw new Error(`unsupported_workspace_transition:${relativePath}`);
 		if (kind === "file") paths.push(relativePath);
 	}
-	return { complete: true, paths: Object.freeze(paths) };
+	return Object.freeze(paths);
 }
 
-function sameChangeIdentity(left: WorkspaceStructureEntry | undefined, right: WorkspaceStructureEntry | undefined): boolean {
-	return left === right || (!!left && !!right && left.kind === right.kind && left.changeDigest === right.changeDigest);
+function workspaceAncestors(resource: string): string[] {
+	const names: string[] = [];
+	for (let current = path.normalize(resource); ; current = path.dirname(current)) {
+		if (path.parse(current).root || current === "..") throw new Error("workspace ownership path escapes workspace");
+		names.push(current === "." ? "" : current);
+		if (current === ".") return names;
+	}
 }
 
 function sameWorkspaceChangeSnapshot(left: WorkspaceStructureSnapshot, right: WorkspaceStructureSnapshot): boolean {
 	if (!left.complete || !right.complete || left.entries.size !== right.entries.size) return false;
-	for (const [relativePath, entry] of left.entries) { if (!sameChangeIdentity(entry, right.entries.get(relativePath))) return false; }
+	for (const [relativePath, entry] of left.entries) { if (!sameStructureEntry(entry, right.entries.get(relativePath), "change")) return false; }
 	return true;
 }
 
@@ -740,8 +745,7 @@ async function captureSandboxWorkspace(state: WorkspaceSandboxState, options: Om
 
 async function captureWorkspaceChanges(workspace: WorkspaceObservation, before: WorkspaceStructureSnapshot): Promise<readonly SandboxWorkspaceChange[]> {
 	const after = await workspace.structure.capture(), transitions = regularStructureTransitions(before, after);
-	if (!transitions.complete) throw new Error(transitions.reason);
-	const deltas = (await collectSandboxChanges(workspace, transitions.paths)).map(({ resource: relativePath, ...change }) => ({ ...change, relativePath }));
+	const deltas = (await collectSandboxChanges(workspace, transitions)).map(({ resource: relativePath, ...change }) => ({ ...change, relativePath }));
 	const effects = diffWorkspaceStructures(before, after, deltas, new ExecutionPathProjection({ sourceRoot: workspace.sourceRoot, workspaceRoot: workspace.sandboxRoot }));
 	if (!sameWorkspaceChangeSnapshot(after, await workspace.structure.capture())) throw new Error("workspace changed while capturing effects");
 	return sandboxWorkspaceChanges(workspace.sourceRoot, effects);
@@ -775,7 +779,7 @@ async function prepareSandboxWorkspaceFor(state: WorkspaceSandboxState, cwd: str
 		if (resolved.driver !== "overlayfs") await ensurePreparedSandbox(repository, baseline!, options.signal);
 		else if (baseline) {
 			const overlay = await acquireOverlayBaseline(repository, baseline);
-			try { throwIfAborted(options.signal); await overlayBaselineStructure(overlay); } finally { releaseOverlayBaseline(overlay); }
+			try { throwIfAborted(options.signal); await (overlay.structure ??= captureOwnedWorkspaceStructure(overlay.sandboxRoot)); } finally { releaseOverlayBaseline(overlay); }
 		}
 		throwIfAborted(options.signal);
 		const prepared = Object.freeze({ ...resolved });
@@ -965,7 +969,7 @@ async function createPrivateSandboxWorkspace(state: WorkspaceSandboxState, cwd: 
 				? [[entry.aliases.join("\0"), entry.aliases.map(name => path.relative(liveBase!.root, name))] as const] : [])).values()] : baseline.aliases;
 			for (const aliases of aliasGroups) {
 				for (const name of aliases) {
-					for (let parent = path.dirname(name); parent !== "."; parent = path.dirname(parent)) directories.add(parent);
+					for (const parent of workspaceAncestors(path.dirname(name))) if (parent) directories.add(parent);
 					await mkdir(path.dirname(path.join(upper, name)), { recursive: true });
 				}
 				await copyFile(path.join(lowerRoot, aliases[0]!), path.join(upper, aliases[0]!), fsConstants.COPYFILE_FICLONE);
@@ -999,12 +1003,12 @@ async function createPrivateSandboxWorkspace(state: WorkspaceSandboxState, cwd: 
 			transactionClockRoots = Object.freeze([prepared.sandboxRoot, prepared.processRoot]);
 		}
 		const sourceChanges = () => pool.versions.changesSince(baseline.version);
-		const storage = { sandboxRoot, overlay: overlay && { upperRoot: overlay.upperRoot, device: overlayDevice!, baseline: liveBase || await overlayBaselineStructure(sharedBaseline!) },
+		const storage = { sandboxRoot, overlay: overlay && { upperRoot: overlay.upperRoot, device: overlayDevice!, baseline: liveBase || await (sharedBaseline!.structure ??= captureOwnedWorkspaceStructure(sharedBaseline!.sandboxRoot)) },
 			clock: { path: transactionClockPath, links: transactionClockLinks, roots: transactionClockRoots } };
 		const data: SandboxWorkspaceObservation = {
 			...storage, initialStructure: await captureSandboxStructure(storage, true), id: randomUUID(), sourceRoot, processRoot, gitBinary, repository: path.join(pool.parent, "snapshot.git"), commit,
 			baselineFrontier: new Map(), sourceDevice: (await lstat(sourceRoot, { bigint: true })).dev,
-			metadata: metadata && { image: metadata.image, objects: metadata.objects, mappings: metadata.mappings, modes: metadata.modes }, modes: sharedBaseline?.modes,
+			metadata, modes: sharedBaseline?.modes,
 			liveBase: liveBase || undefined,
 			hints: sourceChanges(),
 		};
@@ -1088,7 +1092,7 @@ async function createGitWorkspaceTransactionDriver(workspace: ReturnType<typeof 
 		const last = attempt >= WORKSPACE_TRANSACTION_STABILITY_ATTEMPTS, snapshot = await workspace.structure.capture().catch((error: unknown) => { if (last || !isMissing(error)) throw error; });
 		return snapshot && (snapshot.complete || last) ? snapshot : captureStructure(attempt + 1);
 	}, frontier = new Map(workspace.baselineFrontier);
-	let lastStructure = await captureStructure();
+	let lastStructure = workspace.initialStructure;
 	let retainedBytes = [...frontier.values()].reduce((total, state) => total + (state?.content.byteLength ?? 0), 0);
 	const active = new Set<Capture>(), lock = { lock: Promise.resolve() }, unknown = new Set<string>(); // Bytes last seen while others wrote.
 	let poisonReason = lastStructure.complete ? undefined : "workspace_structure_limit";
@@ -1097,13 +1101,7 @@ async function createGitWorkspaceTransactionDriver(workspace: ReturnType<typeof 
 	if (!poisonReason) {
 		try {
 			clock = await openWorkspaceChangeClock(workspace);
-			await advanceWorkspaceChangeClock(clock, lastStructure);
-			const transitions = regularStructureTransitions(workspace.initialStructure, lastStructure);
-			if (!transitions.complete) throw new Error(transitions.reason);
-			await captureTransitions(transitions.paths, lastStructure);
-			const verified = await captureStructure();
-			if (!sameWorkspaceChangeSnapshot(lastStructure, verified)) { throw new Error("workspace changed while initializing transaction clock"); }
-			lastStructure = verified;
+			await captureBefore();
 		} catch (error) {
 			poisonReason = `workspace_transaction_clock:${errorMessage(error)}`;
 		}
@@ -1113,19 +1111,11 @@ async function createGitWorkspaceTransactionDriver(workspace: ReturnType<typeof 
 		withWorkspaceLock(lock, async () => {
 			const overlapped = active.size > 0;
 			for (const other of active) other.overlapped = true;
-			let before: WorkspaceStructureSnapshot | undefined, racing: readonly string[] = [];
-			if (!poisonReason) {
-				try {
-					try { before = await captureFencedBefore(); }
-					catch (error) {
-						if (!overlapped || poisonReason) throw error;
-						({ before, racing } = await captureOpenBefore());
-					}
-				} catch (error) {
-					poisonReason = `workspace_transaction_sync:${errorMessage(error)}`;
-				}
-			}
-			const capture: Capture = { contaminated: false, overlapped, before, frontier: new Map(frontier), unknown: new Set(unknown), racing };
+			const start = poisonReason ? undefined : await captureBefore(overlapped).catch(error => {
+				poisonReason = `workspace_transaction_sync:${errorMessage(error)}`;
+				return undefined;
+			});
+			const capture: Capture = { contaminated: false, overlapped, before: start?.before, frontier: new Map(frontier), unknown: new Set(unknown), racing: start?.racing ?? [] };
 			active.add(capture);
 			return {
 				readBefore: (resource, maxBytes) => withWorkspaceLock(lock, async () => {
@@ -1140,20 +1130,8 @@ async function createGitWorkspaceTransactionDriver(workspace: ReturnType<typeof 
 			};
 		});
 
-	/** While other intervals write, no start is stable: what changes around the fence is foreign to this one, and unread. */
-	async function captureOpenBefore(): Promise<{ readonly before: WorkspaceStructureSnapshot; readonly racing: readonly string[] }> {
-		const current = await captureStructure();
-		await advanceWorkspaceChangeClock(clock, current);
-		const before = await captureStructure(), racing = regularStructureTransitions(current, before);
-		if (!racing.complete) throw new Error(racing.reason);
-		markUnread(before);
-		return { before, racing: racing.paths };
-	}
-
 	function markUnread(current: WorkspaceStructureSnapshot): void {
-		const moved = regularStructureTransitions(lastStructure, current);
-		if (!moved.complete) { poisonReason = moved.reason; return; }
-		for (const resource of moved.paths) unknown.add(resource);
+		for (const resource of regularStructureTransitions(lastStructure, current)) unknown.add(resource);
 		lastStructure = current;
 	}
 
@@ -1174,9 +1152,7 @@ async function createGitWorkspaceTransactionDriver(workspace: ReturnType<typeof 
 				}
 				const capturedAt = Date.now();
 				markUnread(after);
-				const transitions = regularStructureTransitions(capture.before, after);
-				return transitions.complete ? { after, capturedAt, paths: transitions.paths }
-					: { complete: false, changes: [], reason: transitions.reason, before: capture.before, after };
+				return { after, capturedAt, paths: regularStructureTransitions(capture.before, after) };
 			} catch (error) {
 				return { complete: false, changes: [], reason: `workspace_transaction_capture:${errorMessage(error)}`, before: capture.before };
 			}
@@ -1186,23 +1162,31 @@ async function createGitWorkspaceTransactionDriver(workspace: ReturnType<typeof 
 			? await ownership!().catch(() => undefined) : { written: new Set(paths), observed: new Map(), endedAt: capturedAt, interfered: async () => false };
 		const incomplete = (reason: string) => ({ complete: false, changes: [], reason, before, after });
 		if (!owned) return incomplete("overlapping_workspace_transaction");
-		// What lies under a directory it made or moved in (a session directory renamed on completion) is its own too.
-		const mine = (resource: string): boolean => owned.written.has(resource) || resource.includes("/") && mine(path.posix.dirname(resource));
+		// A writer owns the objects it named at either endpoint, including every alias and moved descendant.
+		const named = (resource: string) => workspaceAncestors(resource).some(name => owned.written.has(name) || owned.written.has(slash(name)));
+		const objects = new Set<string>();
+		for (const snapshot of [before, after]) for (const [name, entry] of snapshot.entries)
+			if (entry.kind === "file" && entry.object && named(name)) objects.add(entry.object);
+		const mine = (resource: string) => named(resource) || [before, after].some(snapshot => {
+			const entry = snapshot.entries.get(resource); return entry?.kind === "file" && !!entry.object && objects.has(entry.object);
+		});
+		const own = paths.filter(mine), ownNames = new Set(own), racing = new Set(capture.racing);
 		// A foreign change reaches what it saw only if it came no later than its last look at the name or at the directory holding it.
 		const seen = (resource: string) => Math.max(owned.observed.get(resource) ?? -Infinity, owned.observed.get(path.dirname(resource).replace(/^\.$/, "")) ?? -Infinity);
-		for (const foreign of [...capture.racing, ...paths.filter(resource => !mine(resource))]) {
-			const changed = capture.racing.includes(foreign) ? undefined : after.entries.get(foreign)?.changeTimeMs;
+		for (const foreign of new Set([...racing, ...paths.filter(resource => !ownNames.has(resource))])) {
+			const changed = racing.has(foreign) ? undefined : after.entries.get(foreign)?.changeTimeMs;
 			if (seen(foreign) > -Infinity && (changed === undefined || Math.floor(changed) <= seen(foreign))) return incomplete(`overlapping_workspace_input:${foreign}`);
 		}
-		const own = paths.filter(mine);
 		const late = own.find(resource => Math.floor(after.entries.get(resource)?.changeTimeMs ?? -Infinity) > owned.endedAt);
 		if (late !== undefined) return incomplete(`overlapping_workspace_write:${late}`);
-		if (own.length && await owned.interfered(new Set(own), capturedAt)) return incomplete("overlapping_workspace_write");
-		const changes: WorkspaceRegularDelta[] = [], entries = new Map(before.entries);
+		const targets = new Set([...owned.written, ...own].flatMap(workspaceAncestors));
+		if (targets.size && await owned.interfered(targets, capturedAt)) return incomplete("overlapping_workspace_write");
+		let changes: WorkspaceRegularDelta[];
+		const entries = new Map(before.entries);
 		try {
 			let beforeBytes = 0, afterBytes = 0;
 			// Its own paths' endpoints are independent reads; they are judged in order, the first that fails deciding.
-			const endpoints = await mapFilesystem(own, async (relativePath): Promise<string | { readonly previous?: RegularFileState; readonly current?: RegularFileState }> => {
+			const captured = await mapFilesystem(own, async (relativePath): Promise<string | WorkspaceRegularDelta> => {
 				if (capture.unknown.has(relativePath) && before.entries.get(relativePath)?.kind === "file") return `overlapping_workspace_before:${relativePath}`;
 				// Bytes last seen stand for a file only while it was there when this interval began.
 				const previous = before.entries.get(relativePath)?.kind !== "file" ? undefined
@@ -1210,43 +1194,51 @@ async function createGitWorkspaceTransactionDriver(workspace: ReturnType<typeof 
 				const entry = after.entries.get(relativePath);
 				beforeBytes += previous?.content.byteLength ?? 0; afterBytes += entry?.kind === "file" ? entry.size : 0;
 				if (Math.max(beforeBytes, afterBytes) > WORKSPACE_TRANSACTION_MAX_BYTES) return "workspace transaction exceeds capture limit";
-				if (entry?.kind !== "file") return { previous };
-				const current = await readRegularState(path.resolve(sandboxRoot, relativePath), WORKSPACE_TRANSACTION_MAX_BYTES);
-				return !current?.identity || statChangeDigest(current.identity) !== entry.changeDigest ? `overlapping_workspace_write:${relativePath}` : { previous, current };
+				const current = entry?.kind === "file" ? await readRegularState(path.resolve(sandboxRoot, relativePath), WORKSPACE_TRANSACTION_MAX_BYTES) : undefined;
+				if (entry?.kind === "file" && (!current?.identity || statChangeDigest(current.identity) !== entry.changeDigest)) return `overlapping_workspace_write:${relativePath}`;
+				return { relativePath, ...(previous ? { before: previous.content, beforeMode: previous.mode } : {}),
+					...(current ? { after: current.content, afterMode: current.mode } : {}) };
 			});
-			for (const [index, relativePath] of own.entries()) {
-				const endpoint = endpoints[index]!;
-				if (typeof endpoint === "string") return incomplete(endpoint);
-				const { previous, current } = endpoint;
-				if (current) entries.set(relativePath, after.entries.get(relativePath)!); else entries.delete(relativePath);
-				changes.push({ relativePath, ...(previous ? { before: previous.content, beforeMode: previous.mode } : {}),
-					...(current ? { after: current.content, afterMode: current.mode } : {}) });
-			}
+			const failure = captured.find((change): change is string => typeof change === "string");
+			if (failure !== undefined) return incomplete(failure);
+			changes = captured as WorkspaceRegularDelta[];
 			if (!capture.overlapped && !sameWorkspaceChangeSnapshot(after, await captureStructure())) return incomplete("workspace changed while sealing transaction endpoint");
 		} catch (error) { return incomplete(`workspace_transaction_capture:${errorMessage(error)}`); }
-		// Directories this interval made or removed are its own too; everything else stays as it began.
+		// Both object names and their owned directories advance together; everything else stays as it began.
 		for (const name of new Set([...before.entries.keys(), ...after.entries.keys()])) {
 			const entry = after.entries.get(name), previous = before.entries.get(name);
-			if (!mine(name) || (entry ?? previous)?.kind !== "directory") continue;
+			if (!ownNames.has(name) && ((entry ?? previous)?.kind !== "directory" || !mine(name))) continue;
 			if (entry) entries.set(name, entry); else entries.delete(name);
 		}
 		return { complete: true, changes, before, after: capture.overlapped ? workspaceStructureSnapshot(after.root, entries, after.complete) : after };
 	}
 
-	async function captureFencedBefore(): Promise<WorkspaceStructureSnapshot> {
-		for (let attempt = 0; attempt < WORKSPACE_TRANSACTION_STABILITY_ATTEMPTS; attempt++) {
+	async function captureBefore(overlapped = false): Promise<{ readonly before: WorkspaceStructureSnapshot; readonly racing: readonly string[] }> {
+		try {
+			for (let attempt = 0; attempt < WORKSPACE_TRANSACTION_STABILITY_ATTEMPTS; attempt++) {
+				const current = await captureStructure();
+				await advanceWorkspaceChangeClock(clock, current);
+				const fenced = await captureStructure();
+				if (!sameWorkspaceChangeSnapshot(current, fenced)) continue;
+				markUnread(fenced);
+				// Quiet again: retain every endpoint that moved since the last known frontier.
+				await captureTransitions([...unknown], fenced);
+				unknown.clear();
+				const verified = await captureStructure();
+				if (!sameWorkspaceChangeSnapshot(fenced, verified)) continue;
+				lastStructure = verified;
+				return { before: verified, racing: [] };
+			}
+			throw new Error("workspace did not stabilize before transaction execution");
+		} catch (error) {
+			if (!overlapped) throw error;
+			// A still-moving start keeps its racing names unread until their writers can prove ownership.
 			const current = await captureStructure();
 			await advanceWorkspaceChangeClock(clock, current);
-			const fenced = await captureStructure();
-			if (!sameWorkspaceChangeSnapshot(current, fenced)) continue;
-			await synchronizeFrontier(fenced);
-			if (poisonReason) throw new Error(poisonReason);
-			const verified = await captureStructure();
-			if (!sameWorkspaceChangeSnapshot(fenced, verified)) continue;
-			lastStructure = verified;
-			return verified;
+			const before = await captureStructure(), racing = regularStructureTransitions(current, before);
+			markUnread(before);
+			return { before, racing };
 		}
-		throw new Error("workspace did not stabilize before transaction execution");
 	}
 
 	const abort = (capture: Capture): Promise<void> => withWorkspaceLock(lock, async () => { if (active.delete(capture)) for (const other of active) other.contaminated = true; });
@@ -1258,15 +1250,6 @@ async function createGitWorkspaceTransactionDriver(workspace: ReturnType<typeof 
 		clock = undefined;
 		await closingClock?.handle.close();
 	});
-
-	async function synchronizeFrontier(current: WorkspaceStructureSnapshot): Promise<void> {
-		const transitions = regularStructureTransitions(lastStructure, current);
-		lastStructure = current;
-		if (!transitions.complete) { poisonReason = transitions.reason; return; }
-		// Quiet again: what was written while intervals overlapped is read now.
-		await captureTransitions([...new Set([...transitions.paths, ...unknown])], current);
-		unknown.clear();
-	}
 
 	async function captureTransitions(paths: readonly string[], after: WorkspaceStructureSnapshot): Promise<void> {
 		// The lock and overlap rejection keep this frontier unchanged, and each file the size its snapshot took, throughout the interval: read those at once.
@@ -1562,16 +1545,13 @@ async function acquireOverlayBaseline(
 	});
 }
 
-function overlayBaselineStructure(baseline: SharedOverlayBaseline): Promise<WorkspaceStructureSnapshot> {
-	baseline.structure ??= captureWorkspaceStructure(baseline.sandboxRoot, {
-		maxFiles: WORKSPACE_TRANSACTION_MAX_FILES,
-		exclude: SNAPSHOT_EXCLUDES,
-	}).then(snapshot => Object.freeze({ ...snapshot,
+async function captureOwnedWorkspaceStructure(root: string): Promise<WorkspaceStructureSnapshot> {
+	const snapshot = await captureWorkspaceStructure(root, { maxFiles: WORKSPACE_TRANSACTION_MAX_FILES, exclude: SNAPSHOT_EXCLUDES });
+	return Object.freeze({ ...snapshot,
 		// The lower stat identity belongs to this owned resource, not the merged mount's device.
 		entries: new Map([...snapshot.entries].map(([resource, entry]) => [resource,
 			entry.kind === "file" ? { ...entry, contentPath: path.join(snapshot.root, resource) } : entry])),
-	}));
-	return baseline.structure;
+	});
 }
 
 function releaseOverlayBaseline(baseline: SharedOverlayBaseline): void { baseline.active = Math.max(0, baseline.active - 1); }
@@ -1717,8 +1697,6 @@ async function collectSandboxChanges(workspace: ReturnType<typeof createWorkspac
 
 interface OverlayStructureRemoval { readonly resource: string; readonly descendantsOnly: boolean; }
 
-interface OverlayStructureFrontier { readonly refresh: ReadonlySet<string>; readonly removals: readonly OverlayStructureRemoval[]; }
-
 type OverlayUpperEntry =
 	| { readonly kind: "opaque" | "directory" | "whiteout"; readonly resource: string }
 	| { readonly kind: "leaf"; readonly resource: string; readonly regular: boolean };
@@ -1734,13 +1712,8 @@ async function captureOverlayWorkspaceStructure(sandboxRoot: string, { baseline,
 	for (const removal of frontier.removals) {
 		const normalized = path.normalize(removal.resource);
 		const prefix = normalized ? `${normalized}${path.sep}` : "";
-		for (const candidate of [...entries.keys()]) {
-			if (
-				(removal.descendantsOnly && prefix && candidate.startsWith(prefix)) ||
-				(!removal.descendantsOnly && (candidate === normalized || (prefix && candidate.startsWith(prefix))))
-			) {
-				entries.delete(candidate);
-			}
+		for (const candidate of entries.keys()) {
+			if (prefix && candidate.startsWith(prefix) || !removal.descendantsOnly && candidate === normalized) entries.delete(candidate);
 		}
 	}
 	const refresh = [...frontier.refresh].sort(comparePathDepth), refreshed = await mapFilesystem(refresh, resource => {
@@ -1753,13 +1726,10 @@ async function captureOverlayWorkspaceStructure(sandboxRoot: string, { baseline,
 	return workspaceStructureSnapshot(sandboxRoot, entries, baseline.complete && files <= WORKSPACE_TRANSACTION_MAX_FILES);
 }
 
-async function inspectOverlayStructureFrontier(upperRoot: string): Promise<OverlayStructureFrontier> {
+async function inspectOverlayStructureFrontier(upperRoot: string) {
 	const refresh = new Set<string>([""]);
 	const removals: OverlayStructureRemoval[] = [];
-	const addAncestors = (resource: string, includeSelf: boolean) => {
-		let current = includeSelf ? path.normalize(resource) : path.dirname(path.normalize(resource));
-		for (;;) { const relative = current === "." ? "" : current; refresh.add(relative); if (!relative) break; current = path.dirname(relative); }
-	};
+	const addAncestors = (resource: string, includeSelf: boolean) => workspaceAncestors(includeSelf ? resource : path.dirname(resource)).forEach(name => refresh.add(name));
 	await walkOverlayUpper(upperRoot, "structure frontier", (entry) => {
 		if (entry.kind === "opaque" || entry.kind === "whiteout") {
 			removals.push({ resource: entry.resource, descendantsOnly: entry.kind === "opaque" });
@@ -1810,10 +1780,8 @@ async function captureLiveBase(pool: PooledGitRepository): Promise<WorkspaceStru
 	const cached = pool.liveBase, changes = cached && pool.versions.changesSince(cached.version);
 	if (cached && changes && !changes.uncertain && !changes.paths.length) return cached.structure;
 	const version = await pool.versions.observeChanges();
-	const structure = await captureWorkspaceStructure(pool.sourceRoot, { maxFiles: WORKSPACE_TRANSACTION_MAX_FILES, exclude: SNAPSHOT_EXCLUDES });
-	if (!structure.complete) { version.release(); return undefined; }
-	const live = Object.freeze({ ...structure, entries: new Map([...structure.entries].map(([resource, entry]) =>
-		[resource, entry.kind === "file" ? { ...entry, contentPath: path.join(pool.sourceRoot, resource) } : entry])) });
+	const live = await captureOwnedWorkspaceStructure(pool.sourceRoot);
+	if (!live.complete) { version.release(); return undefined; }
 	if (pool.liveBase !== cached) version.release();
 	else { cached?.version.release(); pool.liveBase = { version, structure: live }; }
 	return live;
