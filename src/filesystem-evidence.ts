@@ -183,11 +183,6 @@ export async function captureFileDigest(target: string, maxBytes = Number.POSITI
 	return captureStableFile(target, maxBytes, false, { verifyPath }, signal);
 }
 
-/** Read a held descriptor through a separate OFD, preserving its shared position. */
-export function captureHeldFile(pid: number, fd: number, maxBytes: number, retainObject = false): Promise<StableFilesystemCapture> {
-	return captureStableFile(`/proc/${pid}/fd/${fd}`, maxBytes, true, { retainObject, verifyPath: false });
-}
-
 /** Import the helper's complete getdents64 image without enumerating the directory again. */
 export async function captureHeldDirectory(pid: number, fd: number, content: Buffer, stat: BigIntStats, realPath: string): Promise<StableFilesystemCapture> {
 	const startedAt = performance.now();

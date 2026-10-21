@@ -231,11 +231,7 @@ nativeTest.for(["journal", "whole-released", "whole-consumed", "custom", "dispos
 	await using _second = onExit(() => second.dispose());
 	await fixture.write("input.txt", "before");
 	await fixture.inOwner(async state => {
-		const { LinuxProcessReuseBackend } = await state.load("../src/linux-process-backend.ts"), open = LinuxProcessReuseBackend.prototype.open;
-		state.contexts = []; state.sessions = [];
-		state.method(LinuxProcessReuseBackend.prototype, "open", async function (this: any, input: any) {
-			const session = await open.call(this, input); state.contexts.push(input.workspace); state.sessions.push(session); return session;
-		});
+		state.opened = state.method((await state.load("../src/linux-process-backend.ts")).LinuxProcessReuseBackend.prototype, "open");
 	});
 	const command = "printf own", invocation = fixture.invocation({ command }).process!;
 	const running = fixture.workspaceSandbox.withWorkspace(fixture.workspace, async workspace => {
@@ -244,12 +240,12 @@ nativeTest.for(["journal", "whole-released", "whole-consumed", "custom", "dispos
 		await using session = disposable(await fixture.backend.open({ sourceRoot: fixture.workspace, workspace: context, invocation }));
 		await using _sibling = disposable(await second.open({ sourceRoot: fixture.workspace, workspace, invocation }));
 		if (mode === "journal") {
-			await fixture.inOwner(async state => { state.intervals = await Promise.all(state.contexts.map((workspace: any) => workspace.transactions.begin())); await state.intervals[0].abort(); });
+			await fixture.inOwner(async state => { state.intervals = await Promise.all(state.opened.mock.calls.map((call: any) => call.arguments[0].workspace.transactions.begin())); await state.intervals[0].abort(); });
 			expect(await interval.finish()).toMatchObject({ complete: false, reason: "overlapping_workspace_transaction" });
 			expect(await fixture.inOwner(state => state.intervals[1].finish())).toMatchObject({ complete: false, reason: "overlapping_workspace_transaction" });
 			const next = await workspace.transactions.begin();
 			expect(Buffer.from((await next.readBefore!("input.txt", 6))!).toString()).toBe("before");
-			await fixture.inOwner(async state => { state.other = await state.contexts[1].transactions.begin(); });
+			await fixture.inOwner(async state => { state.other = await state.opened.mock.calls[1].arguments[0].workspace.transactions.begin(); });
 			await writeFile(path.join(workspace.sandboxRoot, "input.txt"), "after");
 			const interfered = vi.fn(async () => false), delta = await next.finish(async () => ({ written: new Set(["input.txt"]), observed: new Map(), endedAt: Date.now(), interfered }));
 			expect(delta.complete).toBe(true); expect(delta.changes.map(change => [change.relativePath, Buffer.from(change.before!).toString(), Buffer.from(change.after!).toString()])).toEqual([["input.txt", "before", "after"]]);
@@ -260,7 +256,7 @@ nativeTest.for(["journal", "whole-released", "whole-consumed", "custom", "dispos
 				const gate = gated(), value = { own: () => "local result" }, released = mode === "whole-released";
 				const apply = vi.fn(async () => { await gate.wait(); if (released && apply.mock.calls.length === 1) throw effectCommitFailure(new Error("unchanged"), "recoverable"); return value; });
 				const result = session.ownership.commit(apply); void result.catch(() => undefined); await gate.entered;
-				expect(await fixture.inOwner(state => [!!state.sessions[0].ownership.pendingWhole, !!state.sessions[0].ownership.claimChild()])).toEqual([true, false]);
+				expect(await fixture.inOwner(async state => { const { ownership } = await state.opened.mock.calls[0].result; return [!!ownership.pendingWhole, !!ownership.claimChild()]; })).toEqual([true, false]);
 				await expect(session.ownership.commit(async () => value)).rejects.toMatchObject({ disposition: "recoverable" });
 				gate.release();
 				if (released) { await expect(result).rejects.toMatchObject({ disposition: "recoverable" }); expect(await session.ownership.commit(apply)).toBe(value); }
@@ -269,7 +265,7 @@ nativeTest.for(["journal", "whole-released", "whole-consumed", "custom", "dispos
 			} else if (mode === "custom") {
 				expect(await executeProcess(fixture, session.executor, command)).toEqual({ exitCode: 0, output: "own" }); expect(captured).toHaveBeenCalledTimes(2);
 			} else await fixture.inOwner(state => {
-				const driver = state.contexts[0].transactions, dispose = driver.dispose;
+				const driver = state.opened.mock.calls[0].arguments[0].workspace.transactions, dispose = driver.dispose;
 				driver.dispose = async () => { await dispose(); throw new Error("journal cleanup sentinel"); };
 			});
 		}
@@ -459,11 +455,20 @@ int main(int argc, char **argv) { if (argc < 2) return 1; int fd; char bytes[64]
   fd = open(argv[3], O_WRONLY | O_CREAT, 0600); if (fd < 0 || close(fd)) return 2; usleep(200000); }
  if (argc == 3 && !strcmp(argv[2], "stat") && (stat(argv[1], &s) || identity(s))) return 4;
  fd = open(argv[1], O_RDONLY); if (fd >= 0) { ssize_t n = read(fd, bytes, sizeof(bytes)); if (n < 0 || write(1, bytes, n) != n || close(fd)) return 3; }
+ if (argc == 3 && !strcmp(argv[2], "read")) { usleep(2100000); return 0; }
  if (argc == 3 && !strcmp(argv[2], "delete")) return unlink(argv[1]) || write(1, "done\\n", 5) != 5;
  fd = open(argv[1], O_WRONLY | O_CREAT | O_TRUNC, 0600);
  return fd < 0 || write(fd, "after\\n", 6) != 6 || (argc == 3 && fstat(fd, &s)) ||
   (argc == 3 && !strcmp(argv[2], "stat-after") && identity(s)) || close(fd) || write(1, "done\\n", 5) != 5; }\n` });
 	await fixture.prepare(); const route = await fixture.prepareActorReplay(), scope = { sessionID: "private-prestate", turnID: "actor" };
+	const pooled = path.join(outside, "pooled"), read = `./overwrite '${pooled}' read; `;
+	await fixture.inOwner(state => { state.opened = state.method(state.fs, "open"); });
+	await using snapshot = disposable(await fixture.fork(`./overwrite '${pooled}' =prepared; ${read.repeat(3)}:`));
+	expect(textOutput(snapshot.output.result)).toBe("prepared".repeat(3)); expect(await snapshot.validate?.()).toMatchObject({ status: "valid" });
+	await snapshot.commit(); expect(await readText(pooled)).toBe("prepared");
+	expect(await fixture.inOwner((state, target) => state.opened.mock.calls.filter((call: any) =>
+		String(call.arguments[0]).includes("/writes/upper/") && String(call.arguments[0]).endsWith(target) && call.stack.stack.includes("observeStat")).length, pooled)).toBeLessThanOrEqual(2);
+	await fixture.inOwner(state => state.opened.mock.restore());
 	for (const mode of ["existing", "created", "changed", "deleted", "deleted-changed", "absent", "appeared"]) {
 		const target = path.join(outside, mode), removed = mode.startsWith("deleted"), absent = ["created", "absent", "appeared"].includes(mode), changed = mode.endsWith("changed") || mode === "appeared";
 		const command = `./overwrite '${target}'${removed ? " delete" : ""}`, prefix = ["absent", "appeared"].includes(mode) ? "" : `./overwrite '${target}' =prepared; `;
@@ -831,17 +836,13 @@ nativeTest.for(["async", "sync"])("credits borrowed descriptor inputs only after
 	await using _cleanup = onExit(async () => { await view.dispose(); await fixture.dispose(); });
 	const captured = await TimelineInterval.collect(() => captureStableFile(target, 4096, true, { retainObject: true }), producer);
 	view.captureObject(target, captured.output); view.seal();
-	await fixture.inOwner(async (state, target) => {
-		const { ResourceObjectInputs } = await state.load("../src/agent-execution-world.ts"), borrow = ResourceObjectInputs.prototype.borrow;
-		state.borrowedInputs = 0;
-		state.method(ResourceObjectInputs.prototype, "borrow", async function (this: unknown, ...args: unknown[]) {
-			const result = await borrow.apply(this, args); if (result && args[0] === target) state.borrowedInputs++; return result;
-		});
-	}, target);
+	await fixture.inOwner(async state => {
+		state.borrowedInputs = state.method((await state.load("../src/agent-execution-world.ts")).ResourceObjectInputs.prototype, "borrow");
+	});
 	const registry = Reflect.get(fixture.backend, "handoffs") as ProcessHandoffRegistry<{ executable: string }>;
 	let binding: ProcessExecutionBinding | undefined;
 	const actor = async (reused: boolean) => {
-		await fixture.inOwner(state => { state.borrowedInputs = 0; });
+		await fixture.inOwner(state => state.borrowedInputs.mock.resetCalls());
 		let dependencies: readonly TimelineDependency[] = [];
 		const before = fixture.backend.actorMetrics().hits, actual = await TimelineInterval.measure(() => fixture.backend.observeBindings(scope,
 			() => mode === "sync" ? fixture.backend.observeNative(fixture.workspace, scope, undefined, async () => childProcess.execFileSync(fixture.shellPath, ["-c", command],
@@ -851,7 +852,7 @@ nativeTest.for(["async", "sync"])("credits borrowed descriptor inputs only after
 			true, new ResourceObjectInputs(view)), () => dependencies);
 		expect(actual.output).toBe("original\n"); expect(fixture.backend.actorMetrics().hits - before,
 			JSON.stringify({ reused, actor: fixture.backend.actorMetrics(), producer: fixture.backend.metrics() })).toBe(Number(reused));
-		expect(await fixture.inOwner(state => state.borrowedInputs)).toBeGreaterThan(0);
+		expect(await fixture.inOwner(async (state, target) => (await Promise.all(state.borrowedInputs.mock.calls.filter((call: any) => call.arguments[0] === target).map((call: any) => call.result))).filter(Boolean).length, target)).toBeGreaterThan(0);
 		expect(consumedTiming(actual.computation).hiddenComputeMs > 0).toBe(reused);
 		expect(TimelineInterval.reusedProducers(dependencies).has(producer.id)).toBe(reused);
 	};
@@ -2338,7 +2339,7 @@ int main(void) { int fds[2]; char queue[8]; if (pipe(fds) || fds[0] != 3 || writ
 			const { LinuxProcessReuseBackend } = await state.load("../src/linux-process-backend.ts"), { default: path } = await state.load("node:path");
 			const { default: childProcess } = await state.load("node:child_process"), { existsSync } = await state.load("node:fs");
 			const { readlink, open: openFile, rm, mkdtemp } = state.fs, spawn = childProcess.spawn, kill = process.kill.bind(process), open = LinuxProcessReuseBackend.prototype.open, createServer = state.net.createServer;
-			state.captures = []; state.allocated = []; state.spawned = []; state.killed = []; state.traces = [];
+			state.captures = []; state.allocated = []; state.killed = []; state.traces = [];
 			state.method(process, "kill", (...args: Parameters<typeof process.kill>) => { state.killed.push(args); return kill(...args); });
 			state.method(LinuxProcessReuseBackend.prototype, "open", async function (this: unknown, input: any) {
 				if (!state.recorded) {
@@ -2363,10 +2364,9 @@ int main(void) { int fds[2]; char queue[8]; if (pipe(fds) || fds[0] != 3 || writ
 					if (typeof address === "string" && /^(?:pi-)?broker-/.test(path.basename(address))) state.broker = { server, socket, path: address }; });
 				return server;
 			});
-			state.method(childProcess, "spawn", (...args: any[]) => {
+			state.spawned = state.method(childProcess, "spawn", (...args: any[]) => {
 				const trace = JSON.stringify(args[1]).includes("/trace-"), top = trace && ++state.launches === 1, mode = state.mode;
 				const child = spawn(...(top && mode === "spawn" ? [path.join(root, "missing-executable"), args[1], args[2]] : args));
-				state.spawned.push(child);
 				if (top && mode === "abort") child.once("spawn", () => state.controller.abort());
 				if (top && mode === "session-close" || trace && !top && mode?.startsWith("nested-")) {
 					state.child = child; state.childClosed = new Promise<void>(resolve => child.once("close", () => resolve()));
@@ -2384,7 +2384,7 @@ int main(void) { int fds[2]; char queue[8]; if (pipe(fds) || fds[0] != 3 || writ
 				}
 				const value = await mkdtemp(...args); state.allocated.push(value); if (trace) state.traces.push(value); return value;
 			});
-			state.method(state.fs, "readlink", (...args: unknown[]) => state.spawned.some((child: any) => child.pid && String(args[0]) === `/proc/${child.pid}/fd/1`)
+			state.method(state.fs, "readlink", (...args: unknown[]) => state.spawned.mock.calls.some(({ result: child }: any) => child?.pid && String(args[0]) === `/proc/${child.pid}/fd/1`)
 				? Promise.resolve("pipe:[0]") : readlink(...args));
 			state.method(state.fs, "open", (...args: unknown[]) => {
 				if (state.mode === "nested-seal" && !state.traceRoot && String(args[0]).startsWith(state.traces[1] + "/process.")) {

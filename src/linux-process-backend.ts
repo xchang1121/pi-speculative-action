@@ -24,7 +24,7 @@ import {
 } from "./provenance-certificate.ts";
 import { digestObject, sha256Digest, type Sha256Digest } from "./stable-value-hash.ts";
 import {
-	filesystemMetadataDigest, filesystemObservationDigest, FILESYSTEM_METADATA_FIELDS, assertNoSymlinkPath, captureFileDigest, captureFilesystemEntry, captureStableFile,
+	filesystemMetadataDigest, filesystemObservationDigest, FILESYSTEM_METADATA_FIELDS, assertNoSymlinkPath, cachedCapture, captureFileDigest, captureFilesystemEntry, captureStableFile,
 	hashExecutableFile, mapFilesystem, rememberCapture, sameFilesystemIdentity, sharedWalk, walkFilesystemPath, type StableFilesystemCapture,
 } from "./filesystem-evidence.ts";
 import {
@@ -669,7 +669,7 @@ export class LinuxProcessReuseBackend {
 							await captureSessionInterval(session);
 							await rm(socketPath, { force: true }).catch(() => undefined);
 						}
-					} finally { this.producers--; }
+					} finally { session.privateFiles.clear(); this.producers--; }
 				}),
 			};
 		});
@@ -728,6 +728,7 @@ export class LinuxProcessReuseBackend {
 			sealPromise: undefined as Promise<readonly SandboxWorkspaceChange[]> | undefined,
 			// When the top level began writing into the private branch.
 			privateSince: undefined as number | undefined,
+			privateFiles: new Map<string, StableFilesystemCapture>(),
 		};
 		return { session, ready, readyAt, controller, server };
 	}
@@ -948,7 +949,8 @@ export class LinuxProcessReuseBackend {
 				})}`;
 				try {
 					traceRoot = await mkdtemp(path.join(session.processRoot, "trace-"));
-					const privateBefore: PrivatePrestate = { startedAt: Date.now(), ...await privateBranch(path.join(session.processRoot, "private")), entries: new Map(), files: new Map() };
+					const previous = session.privateFiles;
+					const privateBefore: PrivatePrestate = { startedAt: Date.now(), ...await privateBranch(path.join(session.processRoot, "private")), entries: new Map(), files: session.privateFiles = new Map() };
 					await mapFilesystem(sessionWriters(session), async writer => writer.tail?.read());
 					let remaining = 128 * 1024 * 1024;
 					privateBefore.structure = await captureWorkspaceStructure(privateBefore.upper, { exclude: [], observeStat: async (name, stat) => {
@@ -957,7 +959,9 @@ export class LinuxProcessReuseBackend {
 						// A later write can overwrite the native image's working inode as well as a newly created private file.
 						if (stat.isFile() && stat.size <= BigInt(Math.min(32 * 1024 * 1024, remaining))) {
 							remaining -= Number(stat.size);
-							privateBefore.files.set(target, await captureStableFile(path.join(privateBefore.upper, name), Number(stat.size), true, { stat }));
+							const retained = previous.get(target), physical = path.join(privateBefore.upper, name);
+							privateBefore.files.set(target, retained && sameFilesystemIdentity(retained.stat, stat) && cachedCapture(stat, physical)?.hash === retained.hash
+								? retained : await captureStableFile(physical, Number(stat.size), true, { stat }));
 						}
 					} }).catch(error => { if (!missing(error) || privateBefore.entries.size) throw error; return undefined; });
 					const tracePrefix = path.join(traceRoot, "process");

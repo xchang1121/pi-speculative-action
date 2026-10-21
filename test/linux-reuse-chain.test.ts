@@ -8,7 +8,7 @@ import path from "node:path";
 import { createWriteTool } from "@earendil-works/pi-coding-agent";
 import { expect, test } from "vitest";
 import { patternAwareSettings } from "../src/pattern-aware.ts";
-import type { ExecutionResourceMonitor } from "../src/system-resources.ts";
+import { idleResources } from "./agent-system-fixture.ts";
 import { createLinuxProcessBenchmark, holdOwnedProcessPublication, patternProcessHost, textOutput } from "./linux-process-fixture.ts";
 
 /** The Actor runs `first`, then (its next step) `next`, three times; the measured episode thinks `think` ms before `actual`. A `detour`
@@ -36,7 +36,7 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 /** A committed workspace holding `files` and `./slow` (`loops` rounds of CPU over a file's bytes: a stand-in for a test run or a
  * build step), a host over it with PatternAware alone, and one Actor step, a command or a write: prediction starts with it and
  * runs while the Actor model generates for `think` ms. */
-async function chainWorld(files: readonly (readonly [string, string])[], loops: string, resources?: ExecutionResourceMonitor) {
+async function chainWorld(files: readonly (readonly [string, string])[], loops: string) {
 	// Under the user's home, as a real workspace is: /tmp is each sandbox's own, so what a runtime observes of the workspace's parents
 	// there (Node's package.json probes) could never be validated.
 	const fixture = await createLinuxProcessBenchmark("pi-chain-", "overlayfs", {}, path.join(os.homedir(), ".cache", "pi-speculative-action", "chain")), { workspace } = fixture;
@@ -48,9 +48,10 @@ async function chainWorld(files: readonly (readonly [string, string])[], loops: 
 		await fixture.commit("chain");
 		await fixture.prepare();
 		const route = await fixture.prepareActorReplay(), writer = createWriteTool(workspace), tools = [fixture.tool, writer];
+		// Retained producers need capacity alongside the Actor; CPU preemption has separate coverage.
 		const { host, events, start } = patternProcessHost(fixture, "chain", { candidateLimit: 4, maxConcurrentActions: 4,
 			patternAware: patternAwareSettings({ enabled: true, multiStepEnabled: false }) },
-			{ resources, executionWorlds: [fixture.world, fixture.workspaceSandbox.createExecutionWorld()] }, tools);
+			{ resources: idleResources(4), executionWorlds: [fixture.world, fixture.workspaceSandbox.createExecutionWorld()] }, tools);
 		const step = async (turnID: string, call: string | { readonly path: string; readonly content: string }, think: number | (() => Promise<unknown>), during?: string) => {
 			await start(turnID, undefined, "chain");
 			await (typeof think === "number" ? sleep(think) : think());
@@ -97,9 +98,7 @@ test.skipIf(process.platform !== "linux")("reuse chain", { timeout: 3_600_000 },
 
 test.skipIf(process.platform !== "linux").for(["build", "build_changed_after_preparation", "current_workspace", "changed_after_preparation", "after_horizon", "changed_after_horizon", "bash_mutation", "bash_changed_after_preparation"] as const)("prepares learned work after an Actor edit (%s)", { timeout: 120_000 }, async mode => {
 	const horizon = mode.endsWith("horizon"), stale = mode.includes("changed_"), bashMutation = mode.startsWith("bash_"), build = mode.startsWith("build"), worker = `./slow a.txt${horizon ? " identity" : ""}`;
-	// This retention scenario needs capacity for the detour and producer; CPU preemption has separate coverage.
-	const { fixture, workspace, host, step, events } = await chainWorld([["a.txt", "alpha\n"], ["Makefile", "all:\n\t@./slow a.txt\n"]], "600000000",
-		horizon ? { initial: { cpuCount: 4, idleCpuCount: 4 }, sample: async () => ({ cpuCount: 4, idleCpuCount: 4 }) } : undefined);
+	const { fixture, workspace, host, step, events } = await chainWorld([["a.txt", "alpha\n"], ["Makefile", "all:\n\t@./slow a.txt\n"]], "600000000");
 	let publication: Awaited<ReturnType<typeof holdOwnedProcessPublication>> | undefined;
 	await using _cleanup = onExit(async () => { await publication?.close(); await host.dispose(); await fixture.dispose(); });
 	const command = build ? "make -s all" : `${worker} | tail -1${horizon ? `; ${worker} | tail -2` : ""}`;

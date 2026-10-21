@@ -12,7 +12,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { effectCommitFailure, isPoisonedEffectCommit } from "./effect-transaction.ts";
-import { captureHeldDirectory, captureHeldFile, sameFilesystemIdentity } from "./filesystem-evidence.ts";
+import { captureHeldDirectory, captureStableFile, sameFilesystemIdentity } from "./filesystem-evidence.ts";
 import type { ResourceObjectInputs } from "./agent-execution-world.ts";
 import { sha256Digest, type Sha256Digest } from "./stable-value-hash.ts";
 import {
@@ -667,7 +667,7 @@ export async function captureHeldDescriptorInputs(pid: number, descriptors: read
 		let captured = inputs && await inputs.borrow(endpoint, await stat(heldPath, { bigint: true }), remaining,
 			async capture => sameFilesystemIdentity(capture.stat, await stat(heldPath, { bigint: true })));
 		const borrowed = !!captured;
-		captured ??= await captureHeldFile(holder, handle, remaining, !!inputs);
+		captured ??= await captureStableFile(heldPath, remaining, true, { retainObject: !!inputs, verifyPath: false });
 		let retained = borrowed;
 		try {
 			if (String(captured.stat.dev) !== descriptor.device || String(captured.stat.ino) !== descriptor.inode || !captured.content) {
