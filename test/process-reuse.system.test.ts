@@ -210,12 +210,12 @@ async function fixture(options: ConstructorParameters<typeof ProvenanceCertifica
 		event.kind === "output" ? plan.artifacts.read(event.data).toString() : "").join("") : undefined;
 	const common = { key: request.weakKey, scope: { sessionID: "system", turnID: "one" }, lookup };
 	const reserve = async (ownership = new ProcessHandoffOwnership()) => {
-		const result = await registry.acquire({ ...common, ownership, role: "producer", executablePath: request.executablePath });
+		const result = await registry.acquire({ ...common, producer: { ownership, executablePath: request.executablePath } });
 		if (result.kind !== "work") throw new Error("expected producer");
 		registry.observeRunning(common.key, result.work, async () => false);
 		return result.work;
 	};
-	const actor = (options: { signal?: AbortSignal; lookup?: typeof lookup } = {}) => registry.acquire({ ...common, role: "actor", ...options });
+	const actor = (options: { signal?: AbortSignal; lookup?: typeof lookup } = {}) => registry.acquire({ ...common, ...options });
 	const publish = (work: Awaited<ReturnType<typeof reserve>>, value: string, createdAt = 1, oneShot = true, computation?: TimelineInterval) => store.withPublication(async () => {
 		const produced = await produce(value, createdAt, oneShot), certificate = computation ? sealProcessCertificate({ ...produced,
 			result: { ...produced.result, computation: TimelineInterval.serialize(computation) } }) : produced;
@@ -371,7 +371,7 @@ test.each(["existing", "new", "borrowed"])("selects a %s ready producer and reta
 	const loan = arrival === "borrowed" ? f.registry.lend(f.common.scope) : undefined;
 	const receiver = loan && own(new ProcessHandoffRegistry<string>(f.store, 64 * 1024));
 	if (loan) cleanup.push(loan.settle);
-	const actor = track(receiver && loan ? receiver.acquire({ ...f.common, signal: AbortSignal.timeout(5000), role: "actor", borrow: async (key, excluded, signal) => {
+	const actor = track(receiver && loan ? receiver.acquire({ ...f.common, signal: AbortSignal.timeout(5000), borrow: async (key, excluded, signal) => {
 		const borrowed = await loan.borrow(key, excluded, signal); if (!borrowed) return;
 		const received = await receiver.receive(structuredClone(borrowed.transfer), f.common.scope, () => {}); cleanup.push(received);
 		return { records: received.records, joined: borrowed.joined };
@@ -386,7 +386,7 @@ test.each(["existing", "new", "borrowed"])("selects a %s ready producer and reta
 	entered.release(); const later = await f.reserve();
 	const graph = new TimelineInterval(0, 10, Array.from({ length: 8192 }, (_, index) => ({ computation: new TimelineInterval(index, index + 1), reused: true })));
 	f.registry.configure(8, 8 * 1024 * 1024);
-	const slow = await f.publish(first, "slow result", 2, false, graph); await f.consume(f.actor(), "slow result");
+	const slow = await f.publish(first, "slow result", 2, false, graph); await f.consume(f.registry.acquire({ ...f.common, producer: { ownership: first.ownership, executablePath: f.request.executablePath } }), "slow result");
 	await writeFile(f.input, "changed input"); const changed = await f.produce("changed result", 3, true), lookup = vi.fn(f.lookup);
 	await f.consume(f.actor({ lookup }), undefined); expect(lookup).toHaveBeenCalledTimes(2);
 	const restore = async () => {
@@ -424,6 +424,7 @@ test.each(["released", "consumed", "cancelled", "raced", "whole-released", "whol
 	"loan-released", "loan-consumed", "loan-lost", "loan-corrupt", "loan-stale", "loan-foreign", "loan-call", "loan-double", "loan-competing", "loan-retired", "loan-nested", "loan-nested-retired", "loan-local", "loan-whole", "loan-whole-raced", "loan-nested-whole"])("settles a %s one-shot claim without losing another Actor's result", async outcome => {
 	const f = await fixture({ gcIntervalMs: 0, orphanGraceMs: 0, maxBytes: 128 * 1024 }), ownership = new ProcessHandoffOwnership(), releaseWhole = hold();
 	const work = await f.reserve(ownership), certificate = await f.publish(work, "computed result", 1, true, new TimelineInterval(0, 10));
+	const repeated = await f.reserve(ownership); f.registry.complete(f.common.key, repeated);
 	const binding = f.registry.bind(f.common.key, work, "learned invocation"), forward = outcome.startsWith("forwarded"), destination = new ProcessHandoffOwnership();
 	if (outcome.startsWith("loan-")) {
 		const whole = outcome.includes("whole"), raced = outcome === "loan-whole-raced";
@@ -451,7 +452,7 @@ test.each(["released", "consumed", "cancelled", "raced", "whole-released", "whol
 		else if (!raced) await expect(ownership.commit(apply)).rejects.toMatchObject({ disposition: "recoverable" });
 		if (outcome.endsWith("retired")) loan.settle();
 		if (outcome === "loan-local") await f.consume(f.actor(), "computed result");
-		const result = await receiver.acquire({ ...f.common, scope: outcome === "loan-call" ? { ...scope, callID: "another-call" } : scope, role: "actor", lookup: async (...args) => {
+		const result = await receiver.acquire({ ...f.common, scope: outcome === "loan-call" ? { ...scope, callID: "another-call" } : scope, lookup: async (...args) => {
 			const plan = await f.lookup(...args); if (raced && plan) await expect(ownership.commit(apply)).resolves.toBe("whole branch"); return plan;
 		} }),
 			accepted = ["loan-released", "loan-consumed", "loan-lost", "loan-double", "loan-competing", "loan-nested"].includes(outcome);
@@ -459,7 +460,7 @@ test.each(["released", "consumed", "cancelled", "raced", "whole-released", "whol
 		if (result.kind === "hit") {
 			expect(f.output(result.plan)).toBe("computed result"); expect(result.producer?.computation).toBeDefined();
 			await expect(ownership.commit(async () => {})).rejects.toMatchObject({ disposition: "recoverable" });
-			if (duplicate) expect((await duplicate.acquire({ ...f.common, role: "actor" })).kind).toBe("miss");
+			if (duplicate) expect((await duplicate.acquire(f.common)).kind).toBe("miss");
 			competing?.settle();
 			if (outcome !== "loan-lost") result.settle?.(outcome !== "loan-released");
 		}
@@ -482,7 +483,7 @@ test.each(["released", "consumed", "cancelled", "raced", "whole-released", "whol
 	const whole = outcome.startsWith("whole") ? track(ownership.commit(async () => {
 		await releaseWhole.wait(); if (!consumed) throw effectCommitFailure(new Error("unchanged effects"), "recoverable");
 	}).catch(error => { expect(error.disposition).toBe("recoverable"); })) : undefined;
-	const first = whole ? undefined : await (forward || outcome.startsWith("producer") ? f.registry.acquire({ ...f.common, role: "producer", ownership: destination, executablePath: f.request.executablePath }) : f.actor());
+	const first = whole ? undefined : await (forward || outcome.startsWith("producer") ? f.registry.acquire({ ...f.common, producer: { ownership: destination, executablePath: f.request.executablePath } }) : f.actor());
 	if (first && first.kind !== "hit") throw new Error("expected first claim");
 	const second = earlier ?? next(); racing.release(); await checked.promise; await nextTurn(); expect(settled).toBe(false);
 	vi.spyOn(f.store, "gc").mockRejectedValueOnce(new Error("transient collection failure"));

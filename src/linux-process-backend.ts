@@ -891,7 +891,7 @@ export class LinuxProcessReuseBackend {
 			preparation = captured.computation;
 			const observedPrototype = captured.output, weakKey = processWeakKey(observedPrototype), executablePath = observedPrototype.executablePath;
 			const acquired = await TimelineInterval.outside(() => this.handoffs.acquire({
-				key: weakKey, signal, scope: session.scope, role: "producer", ownership: session.ownership, executablePath,
+				key: weakKey, signal, scope: session.scope, producer: { ownership: session.ownership, executablePath },
 				lookup: (live, excludedCertificates, artifacts) => this.plan(weakKey, executablePath, session.projection, candidate => stableEqual(outlet ? session.producer : session.nestedProducer, candidate), { session, live, excludedCertificates, artifacts, signal }),
 			}));
 			if (acquired.kind === "hit" && acquired.plan.kind === "completed_replay") {
@@ -1402,7 +1402,7 @@ export class LinuxProcessReuseBackend {
 			const prototype = bufferedProcessPrototype(snapshot, projection, digest, await this.resolvePlatformFingerprint());
 			const weakKey = processWeakKey(prototype);
 			const accepted = (producer: ProcessProducerProof) => actorReplayProducer(producer, sensitivePaths(this.options.storeRoot, this.options.deniedPaths));
-			const result = await this.handoffs.acquire({ key: weakKey, scope, signal: process.signal, role: "actor", borrow: observation?.source?.borrow,
+			const result = await this.handoffs.acquire({ key: weakKey, scope, signal: process.signal, borrow: observation?.source?.borrow,
 				lookup: (live, excludedCertificates, artifacts) => this.plan(weakKey, executablePath, projection, accepted, { live, artifacts, excludedCertificates, continuation: true, signal: process.signal }) });
 			const acquired = result.kind === "hit" ? result : undefined, { plan, continuation } = acquired ?? {};
 			settle = acquired?.settle;

@@ -695,6 +695,11 @@ nativeTest.for(["unusable", "one-shot", "descendant", "unusable-descendant"] as 
 				expect(fixture.backend.metrics().published).toBe(0);
 				expect((await publications()).find(certificate => certificate.weakKey === binding!.key)?.dependencyCertificate.taints)
 					.toEqual(expect.arrayContaining(["clock", "random", "pid_observation"]));
+				await using branch = disposable(await fixture.fork("./one-shot; ./one-shot; :"));
+				const lines = textOutput(branch.output.result).trim().split("\n");
+				expect(lines).toEqual([expect.stringMatching(/^prepared:\d+$/), expect.stringMatching(/^prepared:\d+$/)]);
+				expect(new Set(lines).size).toBe(2);
+				await branch.commit();
 			}
 		}
 	});
@@ -961,7 +966,7 @@ int main(void) { int fds[2]; if (${mode === "eventfd" ? "(fds[0] = eventfd(0, 0)
 				state.starting = gated(); state.frontier = gated(); state.cancel = state.deferred(); state.cancelled = state.deferred(); state.admissions = []; state.joins = 0;
 				state.spawn = state.method((await state.load("node:child_process")).default, "spawn"); state.publishing = state.method(registry, "publish");
 				state.method(registry, "acquire", async function (this: unknown, options: any) {
-					if (mode === "sample" && options.role === "actor") state.starting.release();
+					if (mode === "sample" && !options.producer) state.starting.release();
 					const result = await acquire.call(this, options); if (mode === "sample" && result.kind === "work") await state.starting.wait(); return result;
 				});
 				state.method(registry, "observeRunning", function (this: unknown, key: unknown, work: unknown, invoke: () => unknown) { return observe.call(this, key, work, async () => {
