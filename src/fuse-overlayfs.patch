@@ -1,0 +1,16 @@
+diff --git a/main.c b/main.c
+index 41e71a7..29245de 100644
+--- a/main.c
++++ b/main.c
+@@ -1012,7 +1012,10 @@ rpl_stat (fuse_req_t req, struct ovl_node *node, int fd, const char *path, struc
+   st->st_gid = find_mapping (st->st_gid, data, true, false);
+   st->st_ino = get_st_ino (node, data);
+ 
+-  if (node->loaded && node->n_links > 0)
++  /* The last removed node survives for open handles, not as a directory entry. */
++  if (node->hidden)
++    st->st_nlink = 0;
++  else if (node->loaded && node->n_links > 0)
+     st->st_nlink = node->n_links;
+   else if (node_dirp (node))
+     {

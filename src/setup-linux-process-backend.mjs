@@ -14,20 +14,18 @@ import { qualifyNativeStartup } from "./process-startup.mjs";
 const SANDLOCK_REVISION = "f6a3e39b31afa80f66609c8af8ae5b2582f628e8";
 const SANDLOCK_REPOSITORY = "https://github.com/multikernel/sandlock.git";
 const SANDLOCK_PATCH = fileURLToPath(new URL("./sandlock-transparent-exec.patch", import.meta.url));
-const STRACE_RELEASE = "6.8";
-const STRACE_SHA256 = "ba6950a96824cdf93a584fa04f0a733896d2a6bc5f0ad9ffe505d9b41e970149";
-const STRACE_PATCH = fileURLToPath(new URL("./strace-handoff.patch", import.meta.url));
-const FUSE_OVERLAYFS_RELEASE = "v1.18";
-const FUSE_OVERLAYFS_ASSETS = Object.freeze({
-	x64: {
-		name: "fuse-overlayfs-x86_64",
-		sha256: "56b0ae0aeb8abb308b068af2f137ed8d1bd239f4f27e21672ff0def861eea1e8",
+const ARCHIVES = {
+	strace: {
+		target: "pi-speculative-strace", url: "https://strace.io/files/6.8/strace-6.8.tar.xz",
+		sha256: "ba6950a96824cdf93a584fa04f0a733896d2a6bc5f0ad9ffe505d9b41e970149", patch: "strace-handoff.patch",
+		configure: ["--enable-mpers=no", "--without-libunwind", "--without-libdw"], artifact: "src/strace",
 	},
-	arm64: {
-		name: "fuse-overlayfs-aarch64",
-		sha256: "82fed736197b2a881a822e5357b488796f654e8371ce8573a1592331510a0133",
+	overlayfs: {
+		target: "fuse-overlayfs", url: "https://codeload.github.com/containers/fuse-overlayfs/tar.gz/refs/tags/v1.18",
+		sha256: "fdd1896c8de35a15eb14444d7880be81d635fcbbc4ad162d8bc3ccf5627aa8c7", patch: "fuse-overlayfs.patch",
+		configure: [], artifact: "fuse-overlayfs", environment: { LDFLAGS: "-static", LIBS: "-ldl" },
 	},
-});
+};
 
 if (process.platform !== "linux") {
 	throw new Error("The process-reuse backend must be installed from Linux or WSL 2.");
@@ -129,45 +127,43 @@ async function qualifyHeldExec(binary) {
 
 async function installStrace() {
 	if (process.arch !== "x64") throw new Error("running process capture requires x86-64 Linux");
-	const patch = await readFile(STRACE_PATCH), sourceDigest = sha256(STRACE_SHA256, patch);
-	const qualify = async binary => {
-		await run(binary, ["--kill-on-exit", "-f", "-q", "-e", "trace=none", "-o", "/dev/null",
-			`--process-library=${heldExec}.so`, "--handoff-image=/dev/null", "--", "/bin/true"]);
-	};
-	return installNative(path.join(localBin, "pi-speculative-strace"), sourceDigest, qualify, async (buildRoot, temporary) => {
-		const git = await executable(["git"]), tar = await executable(["tar"]), make = await executable(["make"]);
-		const archive = path.join(buildRoot, "source.tar.xz"), source = path.join(buildRoot, `strace-${STRACE_RELEASE}`);
-		await writeFile(archive, await downloadPinned(`https://strace.io/files/${STRACE_RELEASE}/strace-${STRACE_RELEASE}.tar.xz`, STRACE_SHA256));
-		await run(tar, ["-xJf", archive, "-C", buildRoot]);
-		await run(git, ["-C", source, "apply", "--whitespace=error-all", STRACE_PATCH]);
-		await run(path.join(source, "configure"), ["--enable-mpers=no", "--without-libunwind", "--without-libdw"], 0, source);
-		await run(make, ["-j", String(Math.min(4, os.availableParallelism()))], 0, source);
-		await copyFile(path.join(source, "src", "strace"), temporary, fsConstants.COPYFILE_EXCL);
-	});
+	return installArchive(ARCHIVES.strace, binary => run(binary, ["--kill-on-exit", "-f", "-q", "-e", "trace=none", "-o", "/dev/null",
+		`--process-library=${heldExec}.so`, "--handoff-image=/dev/null", "--", "/bin/true"]));
 }
 
 async function installFuseOverlayfs() {
-	const target = path.join(localBin, "fuse-overlayfs");
-	const asset = FUSE_OVERLAYFS_ASSETS[process.arch];
-	if (!asset) throw new Error(`no pinned fuse-overlayfs asset for ${process.arch}`);
-	return installNative(target, asset.sha256, binary => run(binary, ["--version"]), async (_root, temporary) => {
-		await access("/dev/fuse", fsConstants.R_OK | fsConstants.W_OK);
-		await executable(["fusermount3", "fusermount"]);
-		const url = `https://github.com/containers/fuse-overlayfs/releases/download/${FUSE_OVERLAYFS_RELEASE}/${asset.name}`;
-		console.log(`Installing fuse-overlayfs ${FUSE_OVERLAYFS_RELEASE} into ${localRoot} ...`);
-		await writeFile(temporary, await downloadPinned(url, asset.sha256), { mode: 0o700, flag: "wx" });
-	}, [""], true);
+	await access("/dev/fuse", fsConstants.R_OK | fsConstants.W_OK);
+	await executable(["fusermount3", "fusermount"]);
+	return installArchive(ARCHIVES.overlayfs, binary => run(binary, ["--version"]));
+}
+
+/** Pin both upstream bytes and the local patch, with the same build and replacement lifecycle. */
+async function installArchive(specification, qualify) {
+	const patch = fileURLToPath(new URL(specification.patch, import.meta.url));
+	return installNative(path.join(localBin, specification.target), sha256(JSON.stringify(specification), await readFile(patch)), qualify, async (root, temporary) => {
+		const [git, tar, make] = await Promise.all(["git", "tar", "make"].map(name => executable([name])));
+		const archive = path.join(root, "source.archive"), source = path.join(root, "source");
+		await writeFile(archive, await downloadPinned(specification.url, specification.sha256));
+		await mkdir(source);
+		await run(tar, ["-xf", archive, "-C", source, "--strip-components=1", "--no-same-owner", "--no-same-permissions"]);
+		await run(git, ["-C", source, "apply", "--whitespace=error-all", patch]);
+		if (!await access(path.join(source, "configure")).then(() => true, () => false))
+			await run(await executable(["autoreconf"]), ["-fiv"], 0, source);
+		await run(path.join(source, "configure"), specification.configure, 0, source, specification.environment);
+		await run(make, ["-j", String(Math.min(4, os.availableParallelism()))], 0, source, specification.environment);
+		await copyFile(path.join(source, specification.artifact), temporary, fsConstants.COPYFILE_EXCL);
+	});
 }
 
 /** Qualify a complete artifact set before replacement; publish the executable after its libraries. */
-async function installNative(target, sourceDigest, qualify, build, suffixes = [""], pinned = false) {
+async function installNative(target, sourceDigest, qualify, build, suffixes = [""]) {
 	const stamp = `${target}.sha256`, digest = async binary => sha256(...await Promise.all(suffixes.map(suffix => readFile(binary + suffix))));
 	try {
 		const current = await digest(target);
-		if (pinned ? current !== sourceDigest : (await readFile(stamp, "utf8")).trim() !== `${sourceDigest}:${current}`) throw new Error("installation changed");
+		if ((await readFile(stamp, "utf8")).trim() !== `${sourceDigest}:${current}`) throw new Error("installation changed");
 		await qualify(target); console.log(`${path.basename(target)} ready: ${target}`);
 		return;
-	} catch { /* Rebuild the exact packaged source or download the pinned artifact. */ }
+	} catch { /* Rebuild the exact pinned source and packaged patch. */ }
 	const root = await mkdtemp(path.join(os.tmpdir(), `${path.basename(target)}-`));
 	const temporary = `${target}.${process.pid}.tmp`;
 	try {
@@ -175,9 +171,8 @@ async function installNative(target, sourceDigest, qualify, build, suffixes = ["
 		await chmod(temporary, 0o755);
 		await qualify(temporary);
 		const installed = await digest(temporary);
-		if (pinned && installed !== sourceDigest) throw new Error("artifact changed after qualification");
 		for (const suffix of suffixes) await rename(temporary + suffix, target + suffix);
-		if (!pinned) await writeFile(stamp, `${sourceDigest}:${installed}\n`, { mode: 0o600 });
+		await writeFile(stamp, `${sourceDigest}:${installed}\n`, { mode: 0o600 });
 	} finally {
 		await Promise.all([rm(root, { recursive: true, force: true }), ...suffixes.map(suffix => rm(temporary + suffix, { force: true }))]);
 	}
@@ -222,7 +217,7 @@ async function downloadPinned(url, expected) {
 	return bytes;
 }
 
-async function run(command, args, expected = 0, cwd) {
-	const [code, signal] = await once(spawn(command, args, { stdio: "inherit", cwd }), "exit");
+async function run(command, args, expected = 0, cwd, environment) {
+	const [code, signal] = await once(spawn(command, args, { stdio: "inherit", cwd, env: { ...process.env, ...environment } }), "exit");
 	if (code !== expected || signal !== null) throw new Error(`${command} failed (${signal ?? code ?? "unknown"})`);
 }
