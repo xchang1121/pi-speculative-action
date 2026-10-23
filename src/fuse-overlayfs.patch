@@ -1,8 +1,15 @@
-diff --git a/main.c b/main.c
-index 41e71a7..29245de 100644
 --- a/main.c
 +++ b/main.c
-@@ -1012,7 +1012,10 @@ rpl_stat (fuse_req_t req, struct ovl_node *node, int fd, const char *path, struc
+@@ -240,6 +240,8 @@
+     offsetof (struct ovl_data, squash_to_gid), 1 },
+   { "ino32_t",
+     offsetof (struct ovl_data, ino_t_32), 1 },
++  { "preserve_hardlinks",
++    offsetof (struct ovl_data, preserve_hardlinks), 1 },
+   { "static_nlink",
+     offsetof (struct ovl_data, static_nlink), 1 },
+   { "volatile", /* native overlay supports "volatile" to mean fsync=0.  */
+@@ -1012,7 +1014,10 @@
    st->st_gid = find_mapping (st->st_gid, data, true, false);
    st->st_ino = get_st_ino (node, data);
  
@@ -14,3 +21,134 @@ index 41e71a7..29245de 100644
      st->st_nlink = node->n_links;
    else if (node_dirp (node))
      {
+@@ -1317,7 +1322,7 @@
+             }
+         }
+ 
+-      if (n->layer->low)
++      if (n->layer->low && (! lo->preserve_hardlinks || ! S_ISREG (mode)))
+         {
+           struct ovl_ino *new_ino;
+ 
+@@ -1836,7 +1841,11 @@
+ 
+       dp = it->ds->opendir (it, path);
+       if (dp == NULL)
+-        continue;
++        {
++          if (lo->preserve_hardlinks && ! lo->se)
++            return NULL;
++          continue;
++        }
+ 
+       for (;;)
+         {
+@@ -3203,7 +3212,7 @@
+   if (override_mode (src->layer, sfd, NULL, NULL, &st) < 0 && errno != ENODATA && errno != EOPNOTSUPP)
+     return -1;
+ 
+-  ret = create_directory (lo, get_upper_layer (lo)->fd, src->path, times, src->parent, src->layer, sfd, st.st_uid, st.st_gid, st.st_mode, false, NULL);
++  ret = create_directory (lo, get_upper_layer (lo)->fd, src->path, times, src->parent, src->layer, sfd, st.st_uid, st.st_gid, st.st_mode | (lo->preserve_hardlinks && ! lo->se ? 0700 : 0), false, NULL);
+   if (ret == 0)
+     {
+       src->layer = get_upper_layer (lo);
+@@ -3316,7 +3325,7 @@
+       goto success;
+     }
+ 
+-  ret = sfd = node->layer->ds->openat (node->layer, node->path, O_RDONLY | O_NONBLOCK, 0);
++  ret = sfd = node->layer->ds->openat (node->layer, node->path, O_RDONLY | O_NONBLOCK | (lo->preserve_hardlinks ? O_NOATIME : 0), 0);
+   if (sfd < 0)
+     goto exit;
+ 
+@@ -5811,6 +5820,60 @@
+   return plugins;
+ }
+ 
++/* Complete the visible alias namespace before any inode reaches the kernel.
++   Every shared object then has one upper inode, including held read handles. */
++static int
++load_hardlink_tree (struct ovl_data *lo, struct ovl_node *directory, size_t *entries)
++{
++  struct ovl_node *node;
++  directory = reload_dir (lo, directory);
++  if (directory == NULL)
++    return -1;
++  for (node = hash_get_first (directory->children); node; node = hash_get_next (directory->children, node))
++    {
++      if (++*entries > 100000)
++        { errno = E2BIG; return -1; }
++      if (! node->whiteout && node_dirp (node) && load_hardlink_tree (lo, node, entries) < 0)
++        return -1;
++    }
++  return 0;
++}
++
++static int
++materialize_hardlinks (struct ovl_data *lo)
++{
++  struct ovl_ino *ino;
++  size_t entries = 0;
++  if (load_hardlink_tree (lo, lo->root, &entries) < 0)
++    return -1;
++  for (ino = hash_get_first (lo->inodes); ino; ino = hash_get_next (lo->inodes, ino))
++    {
++      struct ovl_node *node, *first = ino->node;
++      if (! S_ISREG (ino->mode) || first->next_link == NULL)
++        continue;
++      for (node = first; node; node = node->next_link)
++        if (node->layer == get_upper_layer (lo))
++          first = node;
++      if (get_node_up (lo, first) == NULL)
++        return -1;
++      for (node = ino->node; node; node = node->next_link)
++        {
++          if (node->layer == get_upper_layer (lo))
++            continue;
++          if (get_node_up (lo, node->parent) == NULL
++              || linkat (node_dirfd (first), first->path, get_upper_layer (lo)->fd, node->path, 0) < 0)
++            return -1;
++          node->layer = get_upper_layer (lo);
++        }
++    }
++  /* Copy-up needs writable ancestors only until initialization has completed. */
++  for (ino = hash_get_first (lo->inodes); ino; ino = hash_get_next (lo->inodes, ino))
++    if (node_dirp (ino->node) && ino->node->layer == get_upper_layer (lo)
++        && fchmodat (get_upper_layer (lo)->fd, ino->node->path, ino->mode & 07777, 0) < 0)
++      return -1;
++  return 0;
++}
++
+ int
+ main (int argc, char *argv[])
+ {
+@@ -6077,6 +6140,8 @@
+ 
+   umask (0);
+   disable_locking = ! lo.threaded;
++  if (lo.preserve_hardlinks && materialize_hardlinks (&lo) < 0)
++    error (EXIT_FAILURE, errno, "cannot materialize hardlinks");
+ 
+   se = fuse_session_new (&args, &ovl_oper, sizeof (ovl_oper), &lo);
+   lo.se = se;
+--- a/fuse-overlayfs.h
++++ b/fuse-overlayfs.h
+@@ -106,6 +106,7 @@
+   int squash_to_uid;
+   int squash_to_gid;
+   int static_nlink;
++  int preserve_hardlinks;
+   int ino_passthrough;
+   int nfs_filehandles;
+   int ino_t_32;
+--- a/direct.c
++++ b/direct.c
+@@ -134,7 +134,7 @@
+   cleanup_close int cleanup_fd = -1;
+   DIR *dp = NULL;
+ 
+-  cleanup_fd = TEMP_FAILURE_RETRY (safe_openat (l->fd, path, O_DIRECTORY, 0));
++  cleanup_fd = TEMP_FAILURE_RETRY (safe_openat (l->fd, path, O_DIRECTORY | (l->low && l->ovl_data->preserve_hardlinks ? O_NOATIME : 0), 0));
+   if (cleanup_fd < 0)
+     return NULL;
+ 

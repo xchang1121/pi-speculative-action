@@ -43,7 +43,7 @@ export class ExecutionPathProjection {
 	isWorkspacePhysical(physicalPath: string): boolean { return containsFilesystemPath(this.workspaceRoot, physicalPath); }
 }
 
-export interface WorkspaceStructureCaptureOptions { readonly maxFiles?: number; readonly exclude?: readonly string[]; readonly observeStat?: (relative: string, stat: BigIntStats) => void | Promise<void>; }
+export interface WorkspaceStructureCaptureOptions { readonly maxFiles?: number; readonly exclude?: readonly string[]; readonly observeStat?: (relative: string, stat: BigIntStats) => void | Promise<void>; readonly visitEntry?: (relative: string, entry: FilesystemTypeEvidence) => boolean | Promise<boolean>; }
 
 /** Capture inode and directory semantics without reading regular-file contents. */
 export async function captureWorkspaceStructure(root: string, options: WorkspaceStructureCaptureOptions = {}): Promise<WorkspaceStructureSnapshot> {
@@ -69,6 +69,7 @@ export async function captureWorkspaceStructure(root: string, options: Workspace
 				if (!relative && excludes.has(child.name)) continue;
 				if (files + 1 > maxFiles) { complete = false; continue; }
 				files++;
+				if (options.visitEntry && !await options.visitEntry(path.join(relative, child.name), child)) continue;
 				pending.push(path.join(relative, child.name));
 			}
 		}

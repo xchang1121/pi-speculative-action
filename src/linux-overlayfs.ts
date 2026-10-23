@@ -1,7 +1,7 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import { lstat, mkdir, mkdtemp, open, readFile, rm, writeFile, type FileHandle } from "node:fs/promises";
+import { link, lstat, mkdir, mkdtemp, open, readFile, rename, rm, writeFile, type FileHandle } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { BoundedRecencyMap } from "./bounded-recency-map.ts";
@@ -10,7 +10,7 @@ import { advanceFilesystemClock, hashExecutableFile, mapFilesystem } from "./fil
 import { errorMessage, isMissing } from "./error-utils.ts";
 import { waitForCompletion } from "./runtime-lifecycle.ts";
 
-const OVERLAY_OPTIONS_EPOCH = "fuse-overlayfs-cow";
+const OVERLAY_OPTIONS_EPOCH = "fuse-overlayfs-hardlinks-cow";
 const OVERLAY_READY_TIMEOUT_MS = 5_000;
 const OVERLAY_EXIT_TIMEOUT_MS = 2_000;
 const MAX_DIAGNOSTIC_BYTES = 16 * 1024;
@@ -45,7 +45,7 @@ export async function openLinuxAnonymousWorkspaceFile(root: string): Promise<Fil
 	return open(root, fsConstants.O_WRONLY | LINUX_O_TMPFILE, 0o600);
 }
 
-interface ResolvedOverlayfs { readonly binary: string; readonly fusermountBinary: string; readonly version: string; readonly kernel: string; readonly binaryDigest: string; }
+type ResolvedOverlayfs = Omit<Extract<LinuxOverlayfsCapability, { readonly available: true }>, "available">;
 
 interface LinuxOverlayfsCapabilityCacheEntry { readonly pending: Promise<LinuxOverlayfsCapability>; expiresAt?: number; }
 
@@ -57,20 +57,24 @@ export class LinuxOverlayfsCapabilityRegistry {
 	private disabledDetail?: string;
 	private disposed = false;
 
-	capability(options: LinuxOverlayfsOptions = {}): Promise<LinuxOverlayfsCapability> {
-		if (this.disposed) return Promise.reject(new Error("Linux OverlayFS capability registry is disposed"));
-		if (this.disabledDetail) return Promise.resolve({ available: false, detail: this.disabledDetail });
-		return this.memoized(this.requests, `${options.overlayfsBinary ?? "auto"}\0${options.fusermountBinary ?? "auto"}`, () => this.resolveCapability(options)).then(
-			(capability) => this.currentCapability(capability),
-		);
+	async capability(options: LinuxOverlayfsOptions = {}): Promise<LinuxOverlayfsCapability> {
+		if (this.disposed) throw new Error("Linux OverlayFS capability registry is disposed");
+		if (this.disabledDetail) return { available: false, detail: this.disabledDetail };
+		const capability = await this.memoized(this.requests, `${options.overlayfsBinary ?? "auto"}\0${options.fusermountBinary ?? "auto"}`, async () => {
+			if (process.platform !== "linux") return { available: false, detail: "Linux host required for OverlayFS" };
+			let resolved: ResolvedOverlayfs;
+			try { resolved = await resolveOverlayfs(options); } catch (error) { return { available: false, detail: errorMessage(error) }; }
+			return this.memoized(this.resolved, availableCapabilityKey(resolved), () => probeLinuxOverlayfs(resolved));
+		});
+		const detail = this.disabledDetail ?? (capability.available ? this.degraded.get(availableCapabilityKey(capability)) : undefined);
+		return detail ? { available: false, detail } : capability;
 	}
 
 	markDegraded(capability: Extract<LinuxOverlayfsCapability, { readonly available: true }>, detail: string): void {
 		if (this.disposed || this.disabledDetail) return;
 		const key = availableCapabilityKey(capability);
 		const disabled = `fuse-overlayfs driver disabled: ${detail}`;
-		if (this.degraded.has(key)) { this.degraded.set(key, disabled); return; }
-		if (this.degraded.size >= DEFAULT_DEGRADED_CAPACITY) {
+		if (!this.degraded.has(key) && this.degraded.size >= DEFAULT_DEGRADED_CAPACITY) {
 			this.disabledDetail = `fuse-overlayfs registry disabled after ${DEFAULT_DEGRADED_CAPACITY + 1} driver degradations`;
 			this.requests.clear();
 			this.resolved.clear();
@@ -81,20 +85,6 @@ export class LinuxOverlayfsCapabilityRegistry {
 	}
 
 	dispose(): void { if (this.disposed) return; this.disposed = true; this.requests.clear(); this.resolved.clear(); this.degraded.clear(); }
-
-	private async resolveCapability(options: LinuxOverlayfsOptions): Promise<LinuxOverlayfsCapability> {
-		if (process.platform !== "linux") return { available: false, detail: "Linux host required for OverlayFS" };
-		let resolved: ResolvedOverlayfs;
-		try { resolved = await resolveOverlayfs(options); } catch (error) { return { available: false, detail: errorMessage(error) }; }
-		return this.memoized(this.resolved, [resolved.binary, resolved.fusermountBinary, resolved.kernel, resolved.version, resolved.binaryDigest].join("\0"), () => probeLinuxOverlayfs(resolved));
-	}
-
-	private currentCapability(capability: LinuxOverlayfsCapability): LinuxOverlayfsCapability {
-		if (this.disabledDetail) return { available: false, detail: this.disabledDetail };
-		if (!capability.available) return capability;
-		const detail = this.degraded.get(availableCapabilityKey(capability));
-		return detail ? { available: false, detail } : capability;
-	}
 
 	private memoized(
 		cache: BoundedRecencyMap<string, LinuxOverlayfsCapabilityCacheEntry>,
@@ -134,60 +124,39 @@ export async function mountLinuxOverlayfs(input: {
 	const capabilityRegistry = input.capabilityRegistry ?? defaultCapabilityRegistry;
 	const capability = await capabilityRegistry.capability(input.options);
 	if (!capability.available) throw new Error(capability.detail);
-	const layout = overlayDirectories(input.privateRoot), { upperRoot, workRoot } = layout;
-	await mapFilesystem(Object.values(layout), directory => mkdir(directory, { recursive: true }));
-	const [lower, upper, work] = await Promise.all([lstat(input.lowerRoot), lstat(upperRoot), lstat(workRoot)]);
-	if (!lower.isDirectory() || !upper.isDirectory() || !work.isDirectory() || lower.dev !== upper.dev || upper.dev !== work.dev) {
-		throw new Error("OverlayFS lower, upper, and work roots must share one backing filesystem");
-	}
-	return startLinuxOverlayfs({
-		binary: capability.binary,
-		fusermountBinary: capability.fusermountBinary,
-		lowerRoot: input.lowerRoot,
-		...layout,
-		onDegraded: (detail) => { capabilityRegistry.markDegraded(capability, detail); },
-	});
-}
-
-function overlayDirectories(parent: string): Omit<LinuxOverlayfsMount, "close"> {
-	return { upperRoot: path.join(parent, "upper"), workRoot: path.join(parent, "work"), root: path.join(parent, "workspace") };
+	return startLinuxOverlayfs({ ...capability, ...input, onDegraded: detail => capabilityRegistry.markDegraded(capability, detail) });
 }
 
 async function probeLinuxOverlayfs(resolved: ResolvedOverlayfs): Promise<LinuxOverlayfsCapability> {
 	const probeRoot = await mkdtemp(path.join(os.tmpdir(), "pi-fuse-overlayfs-probe-"));
 	const lowerRoot = path.join(probeRoot, "lower");
 	const privateRoot = path.join(probeRoot, "private");
-	const layout = overlayDirectories(privateRoot), { upperRoot, workRoot, root } = layout;
 	const marker = randomUUID();
 	let mounted: LinuxOverlayfsMount | undefined;
 	let safeToRemove = true;
 	let degradedDetail: string | undefined;
-	let outcome: LinuxOverlayfsCapability;
+	let failure: string | undefined;
 	try {
-		await mapFilesystem([lowerRoot, ...Object.values(layout)], directory => mkdir(directory, { recursive: true }));
+		await mkdir(lowerRoot);
 		await mapFilesystem([["copy-up.txt", `${marker}\n`], ["whiteout.txt", "remove\n"]],
 			([name, content]) => writeFile(path.join(lowerRoot, name), content, "utf8"));
+		await link(path.join(lowerRoot, "copy-up.txt"), path.join(lowerRoot, "copy-up-alias.txt"));
 		await mkdir(path.join(lowerRoot, "replaced"));
 		await writeFile(path.join(lowerRoot, "replaced", "lower.txt"), "lower\n", "utf8");
-		mounted = await startLinuxOverlayfs({
-			binary: resolved.binary,
-			fusermountBinary: resolved.fusermountBinary,
-			lowerRoot,
-			...layout,
-			onDegraded: (detail) => { degradedDetail = detail; },
-		});
+		mounted = await startLinuxOverlayfs({ ...resolved, lowerRoot, privateRoot, onDegraded: detail => { degradedDetail = detail; } });
+		const { root, upperRoot } = mounted;
 		await expectContent(path.join(root, "copy-up.txt"), `${marker}\n`);
 		const [lowerIdentity, mountedIdentity, mountedRoot] = await Promise.all([
 			lstat(path.join(lowerRoot, "copy-up.txt"), { bigint: true }), lstat(path.join(root, "copy-up.txt"), { bigint: true }), lstat(root, { bigint: true }),
 		]);
-		if (lowerIdentity.ino !== mountedIdentity.ino || mountedRoot.dev !== mountedIdentity.dev) throw new Error("OverlayFS inode projection is unavailable");
+		if (lowerIdentity.ino !== mountedIdentity.ino || mountedRoot.dev !== mountedIdentity.dev || mountedIdentity.nlink !== 2n) throw new Error("OverlayFS inode projection is unavailable");
+		await rename(path.join(root, "copy-up.txt"), path.join(root, "copy-up-alias.txt"));
 		// Open descriptors survive whiteouts and removals, with no remaining visible links.
 		await mapFilesystem(["whiteout.txt", "replaced"], async name => {
-			const target = path.join(root, name), held = await open(target, fsConstants.O_RDONLY);
-			try {
-				await rm(target, { recursive: true });
-				if ((await held.stat()).nlink !== 0) throw new Error("OverlayFS retained an unlinked object's link count");
-			} finally { await held.close(); }
+			const target = path.join(root, name);
+			await using held = await open(target, fsConstants.O_RDONLY);
+			await rm(target, { recursive: true });
+			if ((await held.stat()).nlink !== 0) throw new Error("OverlayFS retained an unlinked object's link count");
 		});
 		await mapFilesystem([["copy-up.txt", "changed\n"], ["created.txt", "created\n"]],
 			([name, content]) => writeFile(path.join(root, name), content));
@@ -195,15 +164,15 @@ async function probeLinuxOverlayfs(resolved: ResolvedOverlayfs): Promise<LinuxOv
 		await writeFile(path.join(root, "replaced", "created.txt"), "created\n", "utf8");
 		await expectContent(path.join(lowerRoot, "copy-up.txt"), `${marker}\n`);
 		await expectContent(path.join(root, "copy-up.txt"), "changed\n");
+		await expectContent(path.join(root, "copy-up-alias.txt"), "changed\n");
 		const copiedIdentity = await lstat(path.join(root, "copy-up.txt"), { bigint: true });
 		if (copiedIdentity.dev !== mountedIdentity.dev || copiedIdentity.ino !== mountedIdentity.ino) throw new Error("OverlayFS copy-up changed object identity");
-		const clock = await openLinuxAnonymousWorkspaceFile(upperRoot);
-		try {
-			const backing = await Promise.all([lowerRoot, upperRoot, workRoot].map(directory => lstat(directory)));
+		{
+			await using clock = await openLinuxAnonymousWorkspaceFile(upperRoot);
 			const [workspace, anonymous, ...beforeEntries] = await Promise.all([lstat(root), clock.stat(),
 				...["copy-up.txt", "created.txt", "replaced"].map(name => lstat(path.join(root, name)))]);
 			if (!workspace.isDirectory() || !anonymous.isFile() || anonymous.nlink !== 0 ||
-				!backing.every(directory => directory.isDirectory() && directory.dev === anonymous.dev))
+				(await lstat(upperRoot)).dev !== anonymous.dev)
 				throw new Error("OverlayFS backing roots do not share an anonymous transaction-clock filesystem");
 			const priorBoundary = Math.max(workspace.ctimeMs, ...beforeEntries.map((entry) => entry.ctimeMs));
 			await advanceFilesystemClock(clock, priorBoundary, anonymous);
@@ -215,149 +184,84 @@ async function probeLinuxOverlayfs(resolved: ResolvedOverlayfs): Promise<LinuxOv
 			}
 			await advanceFilesystemClock(clock, Math.max(changedRoot.ctimeMs, changedFile.ctimeMs), anonymous);
 			await rm(orderProbe);
-		} finally {
-			await clock.close();
 		}
-		await expectMissing(path.join(root, "whiteout.txt"));
+		const removed = await lstat(path.join(root, "whiteout.txt")).catch(error => { if (!isMissing(error)) throw error; });
+		if (removed) throw new Error("OverlayFS whiteout remained visible");
 		const whiteout = await lstat(path.join(upperRoot, "whiteout.txt"));
 		if (!whiteout.isCharacterDevice() || whiteout.rdev !== 0) throw new Error("OverlayFS whiteout encoding is unsupported");
 		if (!(await lstat(path.join(upperRoot, "replaced", ".wh..wh..opq"))).isFile()) {
 			throw new Error("OverlayFS opaque-directory encoding is unsupported");
 		}
-		const fingerprint = [OVERLAY_OPTIONS_EPOCH, process.arch, resolved.kernel.trim(), resolved.version.trim().replaceAll(/\s+/g, " "), resolved.binaryDigest].join(":");
-		outcome = {
-			available: true,
-			binary: resolved.binary,
-			fusermountBinary: resolved.fusermountBinary,
-			fingerprint,
-			detail: `ready (${resolved.version.split(/\r?\n/)[0]?.trim() ?? "fuse-overlayfs"})`,
-		};
 	} catch (error) {
 		safeToRemove = !(error instanceof LinuxOverlayfsUnsafeCleanupError);
-		outcome = { available: false, detail: `fuse-overlayfs probe failed: ${errorMessage(error)}` };
+		failure = `fuse-overlayfs probe failed: ${errorMessage(error)}`;
 	} finally {
-		if (mounted) {
-			try {
-				await mounted.close();
-			} catch (error) {
-				safeToRemove = false;
-				outcome = { available: false, detail: `fuse-overlayfs probe cleanup failed: ${errorMessage(error)}` };
-			}
+		try { await mounted?.close(); } catch (error) {
+			safeToRemove = false;
+			failure = `fuse-overlayfs probe cleanup failed: ${errorMessage(error)}`;
 		}
-		if (degradedDetail) outcome = { available: false, detail: `fuse-overlayfs probe cleanup degraded: ${degradedDetail}` };
+		if (degradedDetail) failure = `fuse-overlayfs probe cleanup degraded: ${degradedDetail}`;
 		if (safeToRemove) await rm(probeRoot, { recursive: true, force: true }).catch(() => undefined);
 	}
-	return outcome;
+	return failure ? { available: false, detail: failure } : { available: true, ...resolved };
 }
 
-async function startLinuxOverlayfs(input: {
-	readonly binary: string;
-	readonly fusermountBinary: string;
-	readonly lowerRoot: string;
-	readonly upperRoot: string;
-	readonly workRoot: string;
-	readonly root: string;
+async function startLinuxOverlayfs(input: ResolvedOverlayfs & {
+	readonly privateRoot: string; readonly lowerRoot: string;
 	readonly onDegraded?: (detail: string) => void;
 }): Promise<LinuxOverlayfsMount> {
-	for (const value of [input.lowerRoot, input.upperRoot, input.workRoot]) assertOverlayOptionPath(value);
-	const child = spawn(
-		input.binary,
-		["-f", "-o", `clone_fd,lowerdir=${input.lowerRoot},upperdir=${input.upperRoot},workdir=${input.workRoot}`, input.root],
-		{ stdio: ["pipe", "pipe", "pipe"] },
-	);
-	let processError: Error | undefined;
-	child.on("error", (error) => {
-		processError ??= error;
-	});
-	child.stdin.on("error", () => {
-		// The FUSE process does not consume stdin; a concurrent exit may close the pipe first.
-	});
-	const processClosed = new Promise<void>((resolve) => {
-		child.once("close", () => resolve());
-	});
-	let diagnostics = "";
-	for (const stream of [child.stdout, child.stderr]) {
-		stream.setEncoding("utf8");
-		stream.on("data", (chunk: string) => {
-			diagnostics = `${diagnostics}${chunk}`.slice(-MAX_DIAGNOSTIC_BYTES);
-		});
-	}
-	try {
-		await waitForMount(child, input.root, () => processError, () => diagnostics);
-	} catch (error) {
-		input.onDegraded?.(`mount startup failed: ${errorMessage(error)}`);
+	const { privateRoot, lowerRoot, binary, fusermountBinary, onDegraded } = input;
+	const root = path.join(privateRoot, "workspace"), upperRoot = path.join(privateRoot, "upper"), workRoot = path.join(privateRoot, "work");
+	for (const value of [lowerRoot, upperRoot, workRoot]) assertOverlayOptionPath(value);
+	await mapFilesystem([root, upperRoot, workRoot], directory => mkdir(directory, { recursive: true }));
+	const backing = await Promise.all([lowerRoot, upperRoot, workRoot].map(directory => lstat(directory)));
+	if (!backing.every(directory => directory.isDirectory() && directory.dev === backing[0]!.dev))
+		throw new Error("OverlayFS lower, upper, and work roots must share one backing filesystem");
+	const child = spawn(binary, ["-f", "-o", `clone_fd,preserve_hardlinks,lowerdir=${lowerRoot},upperdir=${upperRoot},workdir=${workRoot}`, root],
+		{ stdio: ["ignore", "pipe", "pipe"] });
+	let processError: Error | undefined, diagnostics = "", closing: Promise<void> | undefined;
+	child.on("error", error => { processError ??= error; });
+	const processClosed = new Promise<void>(resolve => child.once("close", () => resolve()));
+	for (const stream of [child.stdout, child.stderr])
+		stream.setEncoding("utf8").on("data", (chunk: string) => { diagnostics = (diagnostics + chunk).slice(-MAX_DIAGNOSTIC_BYTES); });
+	const failure = (reason: string) => new Error(`fuse-overlayfs ${reason}; ${diagnostics.trim()}`);
+	const exited = async () => (await waitForCompletion(processClosed, undefined, OVERLAY_EXIT_TIMEOUT_MS)).status === "completed";
+	// Startup failure and ordinary disposal share the same idempotent teardown.
+	const close = (): Promise<void> => closing ??= (async () => {
+		const failures: string[] = [];
+		const unmount = async (phase: string) => {
+			if (await mountedAsFuseOverlayfs(root)) try { await execText(fusermountBinary, ["-u", root]); }
+			catch (error) { failures.push(`${phase}: ${errorMessage(error)}`); return false; }
+			return true;
+		};
 		try {
-			await closeMount(child, processClosed, input.fusermountBinary, input.root, () => diagnostics);
-		} catch (cleanupError) {
-			throw new LinuxOverlayfsUnsafeCleanupError(
-				"fuse-overlayfs startup failed and its backing storage could not be released safely",
-				new AggregateError([error, cleanupError]),
-			);
+			const normal = await unmount("normal unmount failed and required process termination");
+			if (!normal) child.kill("SIGKILL");
+			if (!await exited()) {
+				child.kill("SIGKILL");
+				if (!await exited()) failures.push("FUSE process did not report closure after SIGKILL");
+			}
+			if (!normal) await unmount("post-termination unmount failed");
+			if (!await waitForMountState(root, false, OVERLAY_EXIT_TIMEOUT_MS))
+				throw failure(["remained mounted after process shutdown", ...failures].join("; "));
+			if (failures.length) onDegraded?.(failures.join("; "));
+		} catch (error) { onDegraded?.(`unsafe unmount failure: ${errorMessage(error)}`); throw error; }
+	})();
+	try {
+		const ready = await waitForMountState(root, true, OVERLAY_READY_TIMEOUT_MS, () => {
+			if (processError) throw failure(`failed before mount was ready: ${errorMessage(processError)}`);
+			if (child.exitCode !== null || child.signalCode !== null) throw failure("exited before mount was ready");
+		});
+		if (!ready) throw failure("mount timed out");
+		return { root, upperRoot, workRoot, close };
+	} catch (error) {
+		onDegraded?.(`mount startup failed: ${errorMessage(error)}`);
+		try { await close(); } catch (cleanupError) {
+			throw new LinuxOverlayfsUnsafeCleanupError("fuse-overlayfs startup failed and its backing storage could not be released safely",
+				new AggregateError([error, cleanupError]));
 		}
 		throw error;
 	}
-	let closed: Promise<void> | undefined;
-	return {
-		root: input.root,
-		upperRoot: input.upperRoot,
-		workRoot: input.workRoot,
-		close: () => {
-			closed ??= (async () => {
-				try {
-					const degraded = await closeMount(child, processClosed, input.fusermountBinary, input.root, () => diagnostics);
-					if (degraded) input.onDegraded?.(degraded);
-				} catch (error) { input.onDegraded?.(`unsafe unmount failure: ${errorMessage(error)}`); throw error; }
-			})();
-			return closed;
-		},
-	};
-}
-
-async function waitForMount(child: ChildProcessWithoutNullStreams, mountRoot: string, processError: () => Error | undefined, diagnostics: () => string): Promise<void> {
-	const ready = await waitForMountState(mountRoot, true, OVERLAY_READY_TIMEOUT_MS, () => {
-		const failure = processError();
-		if (failure) throw new Error(`fuse-overlayfs failed before mount was ready: ${errorMessage(failure)}; ${diagnostics().trim()}`);
-		if (child.exitCode !== null || child.signalCode !== null) throw new Error(`fuse-overlayfs exited before mount was ready: ${diagnostics().trim()}`);
-	});
-	if (!ready) throw new Error(`fuse-overlayfs mount timed out: ${diagnostics().trim()}`);
-}
-
-async function closeMount(
-	child: ChildProcessWithoutNullStreams,
-	processClosed: Promise<void>,
-	fusermountBinary: string,
-	mountRoot: string,
-	diagnostics: () => string,
-): Promise<string | undefined> {
-	let unmountError: unknown;
-	let recoveryUnmountError: unknown;
-	if (await mountedAsFuseOverlayfs(mountRoot)) {
-		try { await execText(fusermountBinary, ["-u", mountRoot]); } catch (error) { unmountError = error; child.kill("SIGKILL"); }
-	}
-	child.stdin.end();
-	const waitForClose = () => waitForCompletion(processClosed, undefined, OVERLAY_EXIT_TIMEOUT_MS);
-	let processShutdownDegraded = false;
-	if ((await waitForClose()).status !== "completed") {
-		child.kill("SIGKILL");
-		processShutdownDegraded = (await waitForClose()).status !== "completed";
-	}
-	if (unmountError && (await mountedAsFuseOverlayfs(mountRoot))) {
-		try { await execText(fusermountBinary, ["-u", mountRoot]); } catch (error) { recoveryUnmountError = error; }
-	}
-	if (!(await waitForMountState(mountRoot, false, OVERLAY_EXIT_TIMEOUT_MS))) {
-		const normalFailure = unmountError ? `; normal unmount failed: ${errorMessage(unmountError)}` : "";
-		const recoveryFailure = recoveryUnmountError
-			? `; post-termination unmount failed: ${errorMessage(recoveryUnmountError)}`
-			: "";
-		throw new Error(
-			`fuse-overlayfs remained mounted after process shutdown${normalFailure}${recoveryFailure}; ${diagnostics().trim()}`,
-		);
-	}
-	const degraded = [
-		unmountError ? `normal unmount failed and required process termination: ${errorMessage(unmountError)}` : undefined,
-		processShutdownDegraded ? "FUSE process did not report closure after SIGKILL" : undefined,
-	].filter((detail): detail is string => Boolean(detail));
-	return degraded.length ? degraded.join("; ") : undefined;
 }
 
 async function waitForMountState(mountRoot: string, mounted: boolean, timeout: number, pending?: () => void): Promise<boolean> {
@@ -396,11 +300,13 @@ async function resolveOverlayfs(options: LinuxOverlayfsOptions): Promise<Resolve
 	);
 	const fusermountBinary = await resolveHostExecutable(options.fusermountBinary, "fusermount3", [], ["fusermount"]);
 	const [version, kernel, binaryDigest] = await Promise.all([execText(binary, ["--version"]), readFile("/proc/sys/kernel/osrelease", "utf8"), hashExecutableFile(binary)]);
-	return { binary, fusermountBinary, version, kernel, binaryDigest };
+	return { binary, fusermountBinary,
+		fingerprint: [OVERLAY_OPTIONS_EPOCH, process.arch, kernel.trim(), version.trim().replaceAll(/\s+/g, " "), binaryDigest].join(":"),
+		detail: `ready (${version.split(/\r?\n/)[0]?.trim() ?? "fuse-overlayfs"})` };
 }
 
 function availableCapabilityKey(
-	capability: Extract<LinuxOverlayfsCapability, { readonly available: true }>,
+	capability: ResolvedOverlayfs,
 ): string {
 	return `${capability.binary}\0${capability.fusermountBinary}\0${capability.fingerprint}`;
 }
@@ -409,13 +315,6 @@ const execText = (executable: string, args: readonly string[]) => execHostText(e
 
 async function expectContent(target: string, expected: string): Promise<void> {
 	if (await readFile(target, "utf8") !== expected) throw new Error(`OverlayFS content mismatch: ${target}`);
-}
-
-async function expectMissing(target: string): Promise<void> {
-	try { await lstat(target); throw new Error(`expected path to be absent: ${target}`); } catch (error) {
-		if (isMissing(error)) return;
-		throw error;
-	}
 }
 
 function assertOverlayOptionPath(value: string): void {

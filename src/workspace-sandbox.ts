@@ -3,7 +3,7 @@ import { execHostFile } from "./executable-path.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants, type BigIntStats } from "node:fs";
 import {
-	access, chmod, copyFile, type FileHandle, link, lstat, lutimes, mkdir, mkdtemp, open, realpath, rename, rm, rmdir, unlink, utimes, writeFile,
+	access, chmod, type FileHandle, link, lstat, lutimes, mkdir, mkdtemp, open, realpath, rename, rm, rmdir, unlink, utimes, writeFile,
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -959,33 +959,13 @@ async function createPrivateSandboxWorkspace(state: WorkspaceSandboxState, cwd: 
 			overlayStorageRoot = await mkdtemp(path.join(pool.parent, "overlay-storage-"));
 			processRoot = path.join(overlayStorageRoot, "process");
 			await mkdir(processRoot);
-			// Lower-layer copy-up can split hardlinks. Materialize only shared objects in the private upper layer, with the times
-			// the lower shows: build tools compare them.
-			const directories = new Set<string>(), lowerRoot = liveBase ? sourceRoot : sharedBaseline!.sandboxRoot;
-			// A FUSE mount root has the private upper's identity. Keep a live workspace below it so root stat observations
-			// see the original directory, just as its children do, until the operation actually changes that directory.
-			const lowerName = liveBase ? path.basename(lowerRoot) : "", upper = path.join(overlayStorageRoot, "upper", lowerName);
-			const aliasGroups = liveBase ? [...new Map([...liveBase.entries.values()].flatMap(entry => entry.kind === "file" && entry.aliases
-				? [[entry.aliases.join("\0"), entry.aliases.map(name => path.relative(liveBase!.root, name))] as const] : [])).values()] : baseline.aliases;
-			for (const aliases of aliasGroups) {
-				for (const name of aliases) {
-					for (const parent of workspaceAncestors(path.dirname(name))) if (parent) directories.add(parent);
-					await mkdir(path.dirname(path.join(upper, name)), { recursive: true });
-				}
-				await copyFile(path.join(lowerRoot, aliases[0]!), path.join(upper, aliases[0]!), fsConstants.COPYFILE_FICLONE);
-				for (const alias of aliases.slice(1)) await link(path.join(upper, aliases[0]!), path.join(upper, alias));
-			}
-			const copied = ["", ...directories, ...aliasGroups.flat()];
-			if (!liveBase) metadata = await preserveSnapshotMetadata(lowerRoot, upper, processRoot, false, await captureSnapshotMetadata(lowerRoot, copied), pinObject);
-			const mounted = await mountLinuxOverlayfs({ lowerRoot: lowerName ? path.dirname(lowerRoot) : lowerRoot,
+			const lowerRoot = liveBase ? sourceRoot : sharedBaseline!.sandboxRoot, upper = path.join(overlayStorageRoot, "upper");
+			const mounted = overlay = await mountLinuxOverlayfs({ lowerRoot,
 				privateRoot: overlayStorageRoot, options: overlayOptions, capabilityRegistry: state.overlayfsCapabilities });
-			overlay = { ...mounted, root: path.join(mounted.root, lowerName), upperRoot: upper };
-			// FUSE overlays count a file's links by the names they have loaded: list each alias's directory before anything stats one.
-			for (const directory of new Set(aliasGroups.flat().map(name => path.dirname(name)))) await readFilesystemDirectory(path.join(overlay.root, directory));
-			overlayDevice = String((await lstat(overlay.root, { bigint: true })).dev);
 			sandboxRoot = overlay.root;
-			if (liveBase && aliasGroups.length) metadata = await preserveSnapshotMetadata(sourceRoot, sandboxRoot, processRoot, true,
-				await captureSnapshotMetadata(sourceRoot, copied), pinObject);
+			metadata = await preserveSnapshotMetadata(lowerRoot, liveBase ? sandboxRoot : upper, processRoot, !!liveBase,
+				await captureSnapshotMetadata(lowerRoot, upper), pinObject);
+			overlayDevice = String((await lstat(overlay.root, { bigint: true })).dev);
 			transactionClockPath = mounted.upperRoot; transactionClockLinks = 0;
 			// A live lower may sit on another filesystem; its files' own identities, checked on every read, fence it instead.
 			transactionClockRoots = Object.freeze([...liveBase ? [] : [sharedBaseline!.sandboxRoot], mounted.upperRoot, mounted.workRoot]);
@@ -1034,11 +1014,11 @@ async function createPrivateSandboxWorkspace(state: WorkspaceSandboxState, cwd: 
 
 /** Git owns bytes and links, while an OS snapshot also owns empty directories and object metadata.
  * Pin every translated object until disposal: unlink/recreate must never reuse a saved inode mapping. */
-async function captureSnapshotMetadata(sourceRoot: string, copied?: readonly string[]) {
+async function captureSnapshotMetadata(sourceRoot: string, copiedRoot = sourceRoot) {
 	const original = new Map<string, BigIntStats>();
-	if (copied) await mapFilesystem([...new Set(copied)], async resource => { original.set(resource, await lstat(path.join(sourceRoot, resource), { bigint: true })); });
-	else if (!(await captureWorkspaceStructure(sourceRoot, { maxFiles: WORKSPACE_TRANSACTION_MAX_FILES, exclude: SNAPSHOT_EXCLUDES,
-		observeStat: (resource, stat) => { original.set(resource, stat); } })).complete) throw new Error("snapshot metadata namespace is incomplete");
+	if (!(await captureWorkspaceStructure(copiedRoot, { maxFiles: WORKSPACE_TRANSACTION_MAX_FILES, exclude: SNAPSHOT_EXCLUDES,
+		observeStat: async (resource, stat) => { original.set(resource, copiedRoot === sourceRoot ? stat : await lstat(path.join(sourceRoot, resource), { bigint: true })); }
+	})).complete) throw new Error("snapshot metadata namespace is incomplete");
 	return original;
 }
 async function preserveSnapshotMetadata(sourceRoot: string, sandboxRoot: string, processRoot: string, native: boolean,
@@ -1697,10 +1677,6 @@ async function collectSandboxChanges(workspace: ReturnType<typeof createWorkspac
 
 interface OverlayStructureRemoval { readonly resource: string; readonly descendantsOnly: boolean; }
 
-type OverlayUpperEntry =
-	| { readonly kind: "opaque" | "directory" | "whiteout"; readonly resource: string }
-	| { readonly kind: "leaf"; readonly resource: string; readonly regular: boolean };
-
 /**
  * Reconstruct the complete logical structure from one immutable lower snapshot plus the typed upper
  * journal. Only upper paths and their ancestor directories require fresh merged-view syscalls.
@@ -1716,7 +1692,7 @@ async function captureOverlayWorkspaceStructure(sandboxRoot: string, { baseline,
 			if (prefix && candidate.startsWith(prefix) || !removal.descendantsOnly && candidate === normalized) entries.delete(candidate);
 		}
 	}
-	const refresh = [...frontier.refresh].sort(comparePathDepth), refreshed = await mapFilesystem(refresh, resource => {
+	const refresh = [...frontier.refresh], refreshed = await mapFilesystem(refresh, resource => {
 		const target = resource ? path.resolve(sandboxRoot, resource) : sandboxRoot;
 		if (!containsFilesystemPath(sandboxRoot, target)) throw new Error(`OverlayFS frontier escapes workspace: ${resource}`);
 		return captureWorkspaceStructureEntry(target, resource ? [] : SNAPSHOT_EXCLUDES);
@@ -1727,55 +1703,28 @@ async function captureOverlayWorkspaceStructure(sandboxRoot: string, { baseline,
 }
 
 async function inspectOverlayStructureFrontier(upperRoot: string) {
-	const refresh = new Set<string>([""]);
-	const removals: OverlayStructureRemoval[] = [];
-	const addAncestors = (resource: string, includeSelf: boolean) => workspaceAncestors(includeSelf ? resource : path.dirname(resource)).forEach(name => refresh.add(name));
-	await walkOverlayUpper(upperRoot, "structure frontier", (entry) => {
-		if (entry.kind === "opaque" || entry.kind === "whiteout") {
-			removals.push({ resource: entry.resource, descendantsOnly: entry.kind === "opaque" });
-			addAncestors(entry.resource, entry.kind === "opaque");
-			return;
+	const refresh = new Set<string>([""]), removals: OverlayStructureRemoval[] = [];
+	const addAncestors = (resource: string) => workspaceAncestors(resource).forEach(name => refresh.add(name));
+	const snapshot = await captureWorkspaceStructure(upperRoot, { maxFiles: WORKSPACE_TRANSACTION_MAX_FILES, visitEntry: async (relative, entry) => {
+		const resource = slash(relative), name = path.basename(resource), parent = path.dirname(resource);
+		if (isSnapshotExcluded(resource)) return false;
+		if (name === ".wh..wh..opq") {
+			removals.push({ resource: parent === "." ? "" : parent, descendantsOnly: true }); addAncestors(parent); return false;
 		}
-		if (entry.kind === "leaf" && !entry.regular) throw new Error(`unsupported OverlayFS upper inode: ${entry.resource}`);
-		addAncestors(entry.resource, true);
-	});
+		if (name.startsWith(".wh.")) throw new Error(`unsupported OverlayFS whiteout encoding: ${name}`);
+		if (entry.isCharacterDevice()) {
+			if ((await lstat(path.join(upperRoot, relative))).rdev !== 0) throw new Error(`unsupported OverlayFS device entry: ${resource}`);
+			removals.push({ resource, descendantsOnly: false }); addAncestors(parent); return false;
+		}
+		if (!entry.isDirectory() && !entry.isFile()) throw new Error(`unsupported OverlayFS upper inode: ${resource}`);
+		addAncestors(resource);
+		return entry.isDirectory();
+	} }).catch(error => { if (isMissing(error) && error.path === upperRoot) return undefined; throw error; });
+	if (snapshot && !snapshot.complete) throw new Error("OverlayFS structure frontier is incomplete");
 	return { refresh, removals: Object.freeze(removals) };
 }
 
-async function walkOverlayUpper(upperRoot: string, journal: string, observe: (entry: OverlayUpperEntry) => void | Promise<void>): Promise<void> {
-	let entries = 0;
-	const visit = async (directory: string, relativeDirectory: string): Promise<void> => {
-		const subdirectories: (readonly [string, string])[] = [];
-		const children = await readFilesystemDirectory(directory).catch(error => {
-			if (directory === upperRoot && isMissing(error)) return []; // A live lower has no upper until the first copy-up.
-			throw error;
-		});
-		for (const child of children) {
-			if (++entries > WORKSPACE_TRANSACTION_MAX_FILES) throw new Error(`OverlayFS ${journal} exceeds file limit`);
-			if (child.name === ".wh..wh..opq") { await observe({ kind: "opaque", resource: relativeDirectory }); continue; }
-			if (child.name.startsWith(".wh.")) throw new Error(`unsupported OverlayFS whiteout encoding: ${child.name}`);
-			const resource = slash(relativeDirectory ? path.join(relativeDirectory, child.name) : child.name);
-			if (isSnapshotExcluded(resource)) continue;
-			// The entry's own type decides; only a whiteout's device number needs its inode.
-			const target = path.join(directory, child.name);
-			if (child.isDirectory()) { await observe({ kind: "directory", resource }); subdirectories.push([target, resource]); }
-			else if (child.isCharacterDevice()) {
-				if ((await lstat(target)).rdev !== 0) throw new Error(`unsupported OverlayFS device entry: ${resource}`);
-				await observe({ kind: "whiteout", resource });
-			} else await observe({ kind: "leaf", resource, regular: child.isFile() });
-		}
-		await Promise.all(subdirectories.map(([target, resource]) => visit(target, resource))); // Sibling directories are read concurrently.
-	};
-	await visit(upperRoot, "");
-}
-
-function comparePathDepth(left: string, right: string): number {
-	const depth = (value: string) => value.split(path.sep).filter(Boolean).length;
-	return depth(left) - depth(right) || left.localeCompare(right);
-}
-
-/** The workspace's own structure for a live lower; undefined keeps the snapshot (copy-up splits hard links, and a
- * truncated walk cannot vouch for what it skipped). */
+/** The workspace's own structure for a live lower; undefined keeps the snapshot when a truncated walk cannot vouch for what it skipped. */
 async function captureLiveBase(pool: PooledGitRepository): Promise<WorkspaceStructureSnapshot | undefined> {
 	const cached = pool.liveBase, changes = cached && pool.versions.changesSince(cached.version);
 	if (cached && changes && !changes.uncertain && !changes.paths.length) return cached.structure;

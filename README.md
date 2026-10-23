@@ -15,7 +15,7 @@ pi -e /absolute/path/to/pi-speculative-action
 
 `/speculative-action` 主菜单提供两个开关：**Speculative production**（`enabled`，默认关闭）控制额外产物的提前生产，包括调用预测、流式预览和已观察操作的准备；**Cache & reuse**（`reuseEnabled`，默认开启）控制工具、子计算和资源的缓存与采纳。只开后者时，直接执行也会积累可复用成果。关闭复用后，调用直接执行，停止新增准备与缓存；既有持久记录可通过存储菜单单独清理，已进入提交阶段的调用正常完成。两个开关都不关闭实际调用的观察与模式学习。各预测来源的开关只停止该来源的新预测，不清空成果，也不切断已认领调用的反馈。`prepareObservedOperations` 单独选择是否准备已观察操作；会话释放由 `host.dispose()` 负责。
 
-Linux / WSL 2 可从菜单安装 Bash 后端，或运行 `npm run setup:linux`；WSL checkout 应位于 Linux 原生文件系统。进程后端自动选择通过检查的 OverlayFS，否则回退 Git，并在采纳前核对输入和原始对象身份。OverlayFS 从校验后的固定源代码及随包补丁构建，需要 C 编译器、make、autoconf、automake、libtool、pkg-config 和包含静态库的 libfuse3 开发包；补丁修正删除最后一个路径后仍持有对象的链接数，二进制内容进入执行指纹。
+Linux / WSL 2 可从菜单安装 Bash 后端，或运行 `npm run setup:linux`；WSL checkout 应位于 Linux 原生文件系统。进程后端自动选择通过检查的 OverlayFS，否则回退 Git，并在采纳前核对输入和原始对象身份。OverlayFS 从校验后的固定源代码及随包补丁构建，需要 C 编译器、make、autoconf、automake、libtool、pkg-config 和包含静态库的 libfuse3 开发包；补丁在挂载前将工作区内普通文件的硬链接组复制为同一私有对象，保留跨目录别名、重命名及持有句柄的链接数；复制硬链接时不更新源文件访问时间，二进制内容进入执行指纹。
 
 原生子进程交接须保留程序自身的提权语义。普通 Actor 通过 `PI_SPEC_HELD_EXEC_OBSERVER` 指向管理员部署、仅具有 `CAP_SYS_PTRACE` 的专用 `.observer`；已继承 `no_new_privs` 的 Actor 可使用无附加权限的观察器。安装探测只在一次性进程设置此限制。资格不足时，原生执行、缓存回放和投机生产各自保持可用；通用 helper 与映像库始终不附加权限。
 
