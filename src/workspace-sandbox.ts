@@ -17,6 +17,7 @@ import {
 import type { WorldBranch, WorldCheckpoint, WorldExecutionMetrics } from "./execution-world.ts";
 import {
 	advanceFilesystemClock, assertNoSymlinkPath, captureFilesystemEntry, captureStableFile, fileIdentity, mapFilesystem, sameFilesystemIdentity, readFilesystemDirectory, openFilesystemFile,
+	withFilesystemReadView,
 	settledIdentity, sharedWalk, pinFilesystemObject, FILESYSTEM_OBSERVATION_FIELDS, FILESYSTEM_METADATA_FIELDS as SNAPSHOT_METADATA_FIELDS, type FilesystemObservationEvidence,
 } from "./filesystem-evidence.ts";
 import { WORKSPACE_PATH_MUTATION_EFFECTS } from "./effect-model.ts";
@@ -766,7 +767,7 @@ async function prepareSandboxWorkspaceFor(state: WorkspaceSandboxState, cwd: str
 	options: PrepareSandboxWorkspaceOptions): Promise<QualifiedWorkspaceSandboxDriver> {
 	throwIfAborted(options.signal);
 	const sourceRoot = path.resolve(cwd);
-	await assertNoSymlinkPath(sourceRoot, sourceRoot);
+	await withFilesystemReadView(undefined, view => assertNoSymlinkPath(sourceRoot, sourceRoot, (target, read) => captureFilesystemEntry(target, read, view)));
 	throwIfAborted(options.signal);
 	const repository = await acquireSandboxRepository(state, sourceRoot, options.gitBinary ?? "git");
 	try {
@@ -906,7 +907,7 @@ async function createPrivateSandboxWorkspace(state: WorkspaceSandboxState, cwd: 
 	driver: Exclude<WorkspaceSandboxDriver, "auto">, overlayOptions: WorkspaceSandboxOptions,
 	preparation?: SandboxPreparation) {
 	const sourceRoot = path.resolve(cwd);
-	await assertNoSymlinkPath(sourceRoot, sourceRoot);
+	await withFilesystemReadView(undefined, view => assertNoSymlinkPath(sourceRoot, sourceRoot, (target, read) => captureFilesystemEntry(target, read, view)));
 	const pool = await acquireSandboxRepository(state, sourceRoot, gitBinary);
 	let attached: PreparedGitWorkspace | undefined;
 	let sharedBaseline: SharedOverlayBaseline | undefined;
@@ -987,7 +988,7 @@ async function createPrivateSandboxWorkspace(state: WorkspaceSandboxState, cwd: 
 			clock: { path: transactionClockPath, links: transactionClockLinks, roots: transactionClockRoots } };
 		const data: SandboxWorkspaceObservation = {
 			...storage, initialStructure: await captureSandboxStructure(storage, true), id: randomUUID(), sourceRoot, processRoot, gitBinary, repository: path.join(pool.parent, "snapshot.git"), commit,
-			baselineFrontier: new Map(), sourceDevice: (await lstat(sourceRoot, { bigint: true })).dev,
+			baselineFrontier: new Map(), sourceDevice: (await withFilesystemReadView(undefined, view => view.stat(sourceRoot))).dev,
 			metadata, modes: sharedBaseline?.modes,
 			liveBase: liveBase || undefined,
 			hints: sourceChanges(),
@@ -1015,11 +1016,13 @@ async function createPrivateSandboxWorkspace(state: WorkspaceSandboxState, cwd: 
 /** Git owns bytes and links, while an OS snapshot also owns empty directories and object metadata.
  * Pin every translated object until disposal: unlink/recreate must never reuse a saved inode mapping. */
 async function captureSnapshotMetadata(sourceRoot: string, copiedRoot = sourceRoot) {
-	const original = new Map<string, BigIntStats>();
-	if (!(await captureWorkspaceStructure(copiedRoot, { maxFiles: WORKSPACE_TRANSACTION_MAX_FILES, exclude: SNAPSHOT_EXCLUDES,
-		observeStat: async (resource, stat) => { original.set(resource, copiedRoot === sourceRoot ? stat : await lstat(path.join(sourceRoot, resource), { bigint: true })); }
-	})).complete) throw new Error("snapshot metadata namespace is incomplete");
-	return original;
+	return withFilesystemReadView(undefined, async view => {
+		const original = new Map<string, BigIntStats>();
+		if (!(await captureWorkspaceStructure(copiedRoot, { maxFiles: WORKSPACE_TRANSACTION_MAX_FILES, exclude: SNAPSHOT_EXCLUDES, view,
+			observeStat: async (resource, stat) => { original.set(resource, copiedRoot === sourceRoot ? stat : await view.stat(path.join(sourceRoot, resource))); }
+		})).complete) throw new Error("snapshot metadata namespace is incomplete");
+		return original;
+	});
 }
 async function preserveSnapshotMetadata(sourceRoot: string, sandboxRoot: string, processRoot: string, native: boolean,
 	captured?: ReadonlyMap<string, BigIntStats>, pin?: (target: string) => Promise<BigIntStats>) {
@@ -1052,7 +1055,7 @@ async function preserveSnapshotMetadata(sourceRoot: string, sandboxRoot: string,
 	}
 	const image = native ? path.join(processRoot, "metadata.json") : undefined;
 	if (image) {
-		rows.push([await pin!(path.dirname(sandboxRoot)), await lstat(path.dirname(sourceRoot), { bigint: true })]);
+		rows.push([await pin!(path.dirname(sandboxRoot)), await withFilesystemReadView(undefined, view => view.stat(path.dirname(sourceRoot)))]);
 		await writeFile(image, JSON.stringify(rows.map(row => row.map(stat => SNAPSHOT_METADATA_FIELDS.map(field => String(stat[field]))))), { flag: "wx", mode: 0o600 });
 	}
 	const mappings = new Map(rows.map(row => [`${row[0].dev}:${row[0].ino}`, row]));
@@ -1334,29 +1337,31 @@ async function acquireSandboxBaseline(repository: PooledGitRepository, warmup = 
 
 /** Stage only changed objects through the shared inode reader, verifying Git imported the exact captured bytes. */
 async function stageTreeObjects(repository: PooledGitRepository, version: ResourceVersionToken): Promise<boolean> {
-	const staged = gitTreeEntries(await repository.git(["ls-files", "-s", "-z"])), desired = capturedGitTree(version, staged);
-	const changed = changedGitEntries(staged, desired).flatMap(name => desired.has(name) ? [[name, desired.get(name)!] as const] : []);
-	async function* objects() {
-		for (const [index, [name, entry]] of changed.entries()) {
-			const link = entry.link === undefined ? undefined : Buffer.from(entry.link), reader = link ? undefined : await openFilesystemFile(path.join(repository.sourceRoot, name));
-			try {
-				const size = link?.length ?? Number(reader!.stat.size);
-				if (!Number.isSafeInteger(size)) throw new Error("Git input size is not representable");
-				yield Buffer.from(`blob\nmark :${index + 1}\ndata ${size}\n`);
-				if (link) yield link;
-				else if (size) yield* reader!.handle.createReadStream({ autoClose: false, end: size - 1 });
-				if (reader && !sameFilesystemIdentity(reader.stat, await reader.handle.stat({ bigint: true }))) throw new Error("Git input changed while staging");
-				yield Buffer.from(`\nget-mark :${index + 1}\n`);
-			} finally { try { await reader?.handle.close(); } finally { await reader?.binding?.close(); } }
+	return withFilesystemReadView(undefined, async view => {
+		const staged = gitTreeEntries(await repository.git(["ls-files", "-s", "-z"])), desired = capturedGitTree(version, staged);
+		const changed = changedGitEntries(staged, desired).flatMap(name => desired.has(name) ? [[name, desired.get(name)!] as const] : []);
+		async function* objects() {
+			for (const [index, [name, entry]] of changed.entries()) {
+				const link = entry.link === undefined ? undefined : Buffer.from(entry.link), reader = link ? undefined : await openFilesystemFile(path.join(repository.sourceRoot, name), true, view);
+				try {
+					const size = link?.length ?? Number(reader!.stat.size);
+					if (!Number.isSafeInteger(size)) throw new Error("Git input size is not representable");
+					yield Buffer.from(`blob\nmark :${index + 1}\ndata ${size}\n`);
+					if (link) yield link;
+					else if (size) yield* reader!.handle.createReadStream({ autoClose: false, end: size - 1 });
+					if (reader && !sameFilesystemIdentity(reader.stat, await reader.handle.stat({ bigint: true }))) throw new Error("Git input changed while staging");
+					yield Buffer.from(`\nget-mark :${index + 1}\n`);
+				} finally { try { await reader?.handle.close(); } finally { await reader?.binding?.close(); } }
+			}
+			yield Buffer.from("done\n");
 		}
-		yield Buffer.from("done\n");
-	}
-	const written = changed.length ? (await repository.git(["fast-import", "--quiet", "--done"], { input: objects() })).toString("utf8").trim().split("\n") : [];
-	if (written.length !== changed.length || written.some((blob, index) => blob !== changed[index]![1].blob)) return false;
-	const updates = [...changed.map(([name, entry]) => `${entry.mode} ${entry.blob}\t${name}\0`),
-		...[...staged.keys()].filter((name) => !desired.has(name)).map((name) => `0 ${"0".repeat(40)}\t${name}\0`)];
-	if (updates.length) await repository.git(["update-index", "-z", "--index-info"], { input: Buffer.from(updates.join("")) });
-	return true;
+		const written = changed.length ? (await repository.git(["fast-import", "--quiet", "--done"], { input: objects() })).toString("utf8").trim().split("\n") : [];
+		if (written.length !== changed.length || written.some((blob, index) => blob !== changed[index]![1].blob)) return false;
+		const updates = [...changed.map(([name, entry]) => `${entry.mode} ${entry.blob}\t${name}\0`),
+			...[...staged.keys()].filter((name) => !desired.has(name)).map((name) => `0 ${"0".repeat(40)}\t${name}\0`)];
+		if (updates.length) await repository.git(["update-index", "-z", "--index-info"], { input: Buffer.from(updates.join("")) });
+		return true;
+	});
 }
 
 function gitBlobID(bytes: Buffer): string {
@@ -1526,7 +1531,7 @@ async function acquireOverlayBaseline(
 }
 
 async function captureOwnedWorkspaceStructure(root: string): Promise<WorkspaceStructureSnapshot> {
-	const snapshot = await captureWorkspaceStructure(root, { maxFiles: WORKSPACE_TRANSACTION_MAX_FILES, exclude: SNAPSHOT_EXCLUDES });
+	const snapshot = await withFilesystemReadView(undefined, view => captureWorkspaceStructure(root, { maxFiles: WORKSPACE_TRANSACTION_MAX_FILES, exclude: SNAPSHOT_EXCLUDES, view }));
 	return Object.freeze({ ...snapshot,
 		// The lower stat identity belongs to this owned resource, not the merged mount's device.
 		entries: new Map([...snapshot.entries].map(([resource, entry]) => [resource,
@@ -1654,18 +1659,20 @@ async function materializeCheckpoint(workspace: PrivateSandboxWorkspace, checkpo
 }
 
 async function collectSandboxChanges(workspace: ReturnType<typeof createWorkspaceObservation>, frontier: readonly string[]): Promise<readonly SandboxFileChange[]> {
-	const resources = [...new Set(frontier)].filter((resource) => !isSnapshotExcluded(slash(resource))).sort();
-	// Changed files share their directories: each is walked once, and the files are read concurrently.
-	const capture = sharedWalk(captureFilesystemEntry);
-	return mapFilesystem(resources, async (resource): Promise<SandboxFileChange> => {
-		if (!resource || path.isAbsolute(resource) || resource.split("/").includes("..")) throw new Error(`invalid sandbox change path: ${resource}`);
-		const target = path.resolve(workspace.sourceRoot, resource), sandboxTarget = path.resolve(workspace.sandboxRoot, resource);
-		if (!containsFilesystemPath(workspace.sourceRoot, target) || !containsFilesystemPath(workspace.sandboxRoot, sandboxTarget)) throw new Error(`sandbox change escapes workspace: ${resource}`);
-		await Promise.all([assertNoSymlinkPath(workspace.sourceRoot, target, capture), assertNoSymlinkPath(workspace.sandboxRoot, sandboxTarget, capture)]);
-		const [before, after] = await Promise.all([workspace.baselineFrontier.has(resource) ? workspace.baselineFrontier.get(resource)
-			: workspace.readBase(resource, 64 * 1024 * 1024), readRegularState(sandboxTarget)]);
-		return { root: workspace.sourceRoot, target, resource, before: before?.content, after: after?.content, beforeMode: before?.mode,
-			afterMode: after?.mode, afterModified: after?.identity && String(after.identity.mtimeNs), ...(before?.settled ? { beforeIdentity: before.settled } : {}) };
+	return withFilesystemReadView(undefined, async view => {
+		const resources = [...new Set(frontier)].filter((resource) => !isSnapshotExcluded(slash(resource))).sort();
+		// Changed files share their directories: each is walked once, and the files are read concurrently.
+		const capture = sharedWalk(captureFilesystemEntry), source = sharedWalk(target => captureFilesystemEntry(target, undefined, view));
+		return mapFilesystem(resources, async (resource): Promise<SandboxFileChange> => {
+			if (!resource || path.isAbsolute(resource) || resource.split("/").includes("..")) throw new Error(`invalid sandbox change path: ${resource}`);
+			const target = path.resolve(workspace.sourceRoot, resource), sandboxTarget = path.resolve(workspace.sandboxRoot, resource);
+			if (!containsFilesystemPath(workspace.sourceRoot, target) || !containsFilesystemPath(workspace.sandboxRoot, sandboxTarget)) throw new Error(`sandbox change escapes workspace: ${resource}`);
+			await Promise.all([assertNoSymlinkPath(workspace.sourceRoot, target, source), assertNoSymlinkPath(workspace.sandboxRoot, sandboxTarget, capture)]);
+			const [before, after] = await Promise.all([workspace.baselineFrontier.has(resource) ? workspace.baselineFrontier.get(resource)
+				: workspace.readBase(resource, 64 * 1024 * 1024), readRegularState(sandboxTarget)]);
+			return { root: workspace.sourceRoot, target, resource, before: before?.content, after: after?.content, beforeMode: before?.mode,
+				afterMode: after?.mode, afterModified: after?.identity && String(after.identity.mtimeNs), ...(before?.settled ? { beforeIdentity: before.settled } : {}) };
+		});
 	});
 }
 
@@ -1734,7 +1741,7 @@ async function captureLiveBase(pool: PooledGitRepository): Promise<WorkspaceStru
 async function readLiveBase(base: WorkspaceStructureSnapshot, resource: string, maxBytes: number): Promise<RegularFileState | undefined> {
 	const entry = base.entries.get(resource);
 	if (entry?.kind !== "file") return undefined;
-	const takenAtMs = Date.now(), captured = await captureStableFile(entry.contentPath ?? path.join(base.root, resource), maxBytes, true, { digest: false });
+	const takenAtMs = Date.now(), captured = await withFilesystemReadView(undefined, view => captureStableFile(entry.contentPath ?? path.join(base.root, resource), maxBytes, true, { digest: false, view }));
 	if (statChangeDigest(captured.stat) !== entry.changeDigest) throw new Error(`workspace changed since the sandbox started: ${resource}`);
 	return { content: captured.content!, mode: Number(captured.stat.mode & 0o777n), settled: settledIdentity(captured.stat, takenAtMs) };
 }

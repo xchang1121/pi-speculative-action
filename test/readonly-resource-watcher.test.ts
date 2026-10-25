@@ -1,16 +1,48 @@
 import { expect, test } from "vitest";
-import { link, lstat, lutimes, mkdir, mkdtemp, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { link, lstat, lutimes, mkdir, mkdtemp, readFile, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import * as filesystemEvidence from "../src/filesystem-evidence.ts";
 import { nativeProcessLibrary } from "../src/process-startup.mjs";
 import { ResourceVersionManager, type ResourceVersionToken } from "../src/resource-version.ts";
+import { WorkspaceSandboxService, type SandboxWorkspaceContext } from "../src/workspace-sandbox.ts";
 
 const linux = test.skipIf(process.platform !== "linux" || !process.env.PI_SPEC_HELD_EXEC);
 const metadata = async (paths: readonly string[]) => Promise.all(paths.map(async target => {
   const stat = await lstat(target, { bigint: true });
   return { target, fields: Object.fromEntries(filesystemEvidence.FILESYSTEM_METADATA_FIELDS.map(field => [field, String(stat[field])])) };
 }));
+
+linux.for(["allocate", "adopt", "failure"])("preserves source metadata through workspace preparation and actual adoption (%s)", { timeout: 30_000 }, async mode => {
+  const fixture = await mkdtemp(path.join(os.tmpdir(), "pi-readonly-workspace-")), parent = path.join(fixture, "real");
+  const route = path.join(fixture, "route"), physical = path.join(parent, "source"), root = path.join(route, "source");
+  const directory = path.join(physical, "directory"), file = path.join(directory, "input"), alias = path.join(physical, "alias"), broken = path.join(physical, "broken");
+  const service = new WorkspaceSandboxService();
+  try {
+    await mkdir(directory, { recursive: true }); await writeFile(file, "original\n");
+    await symlink("real", route); await symlink("directory/input", alias); await symlink("missing", broken);
+    for (const target of [physical, directory, file]) await utimes(target, 915148800, 946684800);
+    for (const target of [route, alias, broken]) await lutimes(target, 915148800, 946684800);
+    const paths = [physical, directory, file, route, alias, broken], before = await metadata(paths);
+    const execute = async (workspace: SandboxWorkspaceContext) => {
+      expect((await readFile(path.join(workspace.sandboxRoot, "alias"))).toString()).toBe("original\n");
+      if (mode !== "allocate") await writeFile(path.join(workspace.sandboxRoot, "directory/input"), "adopted\n");
+      if (mode === "failure") throw new Error("discard private changes");
+      return { result: { content: [], details: {} }, isError: false };
+    };
+    const snapshot = mode === "adopt" ? await service.capture({ cwd: root, driver: "git", execute }) : undefined;
+    if (mode === "allocate") await service.withWorkspace(root, execute);
+    if (mode === "failure") await expect(service.capture({ cwd: root, driver: "git", execute })).rejects.toThrow("discard private changes");
+    const after = await metadata(paths), changed = after.flatMap((entry, index) => Object.entries(entry.fields).flatMap(([field, value]) =>
+      value === before[index]!.fields[field] ? [] : [{ target: entry.target, field, before: before[index]!.fields[field], after: value }]));
+    expect(changed).toEqual([]);
+    if (snapshot) {
+      await service.commitDelta(snapshot);
+      expect((await readFile(file)).toString()).toBe("adopted\n");
+      expect((await readFile(alias)).toString()).toBe("adopted\n");
+    }
+  } finally { await service.dispose(); await rm(fixture, { recursive: true, force: true }); }
+});
 
 linux("starting recursive resource observation preserves inode and symlink metadata", { timeout: 30_000 }, async () => {
   nativeProcessLibrary(process.env.PI_SPEC_HELD_EXEC!);

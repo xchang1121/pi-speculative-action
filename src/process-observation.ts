@@ -1,11 +1,10 @@
 import type { BigIntStats, Stats } from "node:fs";
-import { lstat, readlink } from "node:fs/promises";
 import path from "node:path";
 import { containsFilesystemPath, relativeFilesystemPath, slash } from "./path-utils.ts";
 import { isMissing } from "./error-utils.ts";
 import {
 	type StableFilesystemCapture, FILESYSTEM_CONCURRENCY, mapFilesystem, type FilesystemTypeEvidence, FILESYSTEM_OBSERVATION_FIELDS,
-	filesystemEntryType, filesystemMetadataDigest, type FilesystemObservationEvidence, readFilesystemDirectory,
+	filesystemEntryType, filesystemMetadataDigest, type FilesystemObservationEvidence, captureFilesystemEntry, type FilesystemReadView,
 } from "./filesystem-evidence.ts";
 import type { DynamicDependency } from "./provenance-certificate.ts";
 import { type Sha256Digest, digestObject, sha256Digest, sha256DigestAsync } from "./stable-value-hash.ts";
@@ -43,7 +42,7 @@ export class ExecutionPathProjection {
 	isWorkspacePhysical(physicalPath: string): boolean { return containsFilesystemPath(this.workspaceRoot, physicalPath); }
 }
 
-export interface WorkspaceStructureCaptureOptions { readonly maxFiles?: number; readonly exclude?: readonly string[]; readonly observeStat?: (relative: string, stat: BigIntStats) => void | Promise<void>; readonly visitEntry?: (relative: string, entry: FilesystemTypeEvidence) => boolean | Promise<boolean>; }
+export interface WorkspaceStructureCaptureOptions { readonly maxFiles?: number; readonly exclude?: readonly string[]; readonly observeStat?: (relative: string, stat: BigIntStats) => void | Promise<void>; readonly visitEntry?: (relative: string, entry: FilesystemTypeEvidence) => boolean | Promise<boolean>; readonly view?: FilesystemReadView; }
 
 /** Capture inode and directory semantics without reading regular-file contents. */
 export async function captureWorkspaceStructure(root: string, options: WorkspaceStructureCaptureOptions = {}): Promise<WorkspaceStructureSnapshot> {
@@ -57,10 +56,11 @@ export async function captureWorkspaceStructure(root: string, options: Workspace
 		const batch = pending.slice(cursor, cursor + FILESYSTEM_CONCURRENCY);
 		cursor += batch.length;
 		const captured = await mapFilesystem(batch, async (relative) => {
-			const target = path.join(absoluteRoot, relative), stat = await lstat(target, { bigint: true });
-			await options.observeStat?.(relative, stat);
-			const children = !relative || stat.isDirectory() ? await readFilesystemDirectory(target) : [];
-			const entry = await captureExistingWorkspaceStructureEntry(target, stat, relative ? [] : [...excludes], children);
+			const captured = await captureFilesystemEntry(path.join(absoluteRoot, relative), "directory", options.view);
+			if (!relative && !captured.info.isDirectory()) throw Object.assign(new Error("workspace root is not a directory"), { code: "ENOTDIR" });
+			await options.observeStat?.(relative, captured.info);
+			const children = captured.entries ?? [];
+			const entry = captureExistingWorkspaceStructureEntry(captured, relative ? [] : [...excludes]);
 			return { relative, entry, children };
 		});
 		for (const { relative, entry, children } of captured) {
@@ -113,26 +113,23 @@ export function workspaceStructureSnapshot(root: string, entries: Map<string, Wo
 export async function captureWorkspaceStructureEntry(
 	target: string,
 	excludeEntries: readonly string[] = [],
+	view?: FilesystemReadView,
 ): Promise<WorkspaceStructureEntry | undefined> {
-	let stat: BigIntStats;
-	try { stat = await lstat(target, { bigint: true }); } catch (error) { if (isMissing(error)) return undefined; throw error; }
-	return captureExistingWorkspaceStructureEntry(target, stat, excludeEntries);
+	try { return captureExistingWorkspaceStructureEntry(await captureFilesystemEntry(target, "directory", view), excludeEntries); }
+	catch (error) { if (isMissing(error)) return undefined; throw error; }
 }
 
-async function captureExistingWorkspaceStructureEntry(
-	target: string,
-	stat: BigIntStats,
+function captureExistingWorkspaceStructureEntry(
+	{ info: stat, link: linkTarget, entries: children }: Awaited<ReturnType<typeof captureFilesystemEntry>>,
 	excludeEntries: readonly string[] = [],
-	children?: Awaited<ReturnType<typeof readFilesystemDirectory>>,
-): Promise<WorkspaceStructureEntry> {
+): WorkspaceStructureEntry {
 	const change = { changeDigest: statChangeDigest(stat), changeTimeMs: statMilliseconds(stat, "ctime") };
 	if (stat.isSymbolicLink()) {
-		const linkTarget = await readlink(target);
-		return { kind: "symlink", target: linkTarget, targetDigest: sha256Digest(linkTarget), ...change };
+		return { kind: "symlink", target: linkTarget!, targetDigest: sha256Digest(linkTarget!), ...change };
 	}
 	if (stat.isDirectory()) {
 		const excluded = new Set(excludeEntries);
-		const entries = (children ?? await readFilesystemDirectory(target)).filter((entry) => !excluded.has(entry.name));
+		const entries = children!.filter((entry) => !excluded.has(entry.name));
 		return {
 			kind: "directory",
 			observed: Object.fromEntries(FILESYSTEM_OBSERVATION_FIELDS.map(field => [field, stat[field]])) as FilesystemObservationEvidence,
