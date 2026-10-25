@@ -1074,7 +1074,7 @@ async function createGitWorkspaceTransactionDriver(workspace: ReturnType<typeof 
 	}, frontier = new Map(workspace.baselineFrontier);
 	let lastStructure = workspace.initialStructure;
 	let retainedBytes = [...frontier.values()].reduce((total, state) => total + (state?.content.byteLength ?? 0), 0);
-	const active = new Set<Capture>(), lock = { lock: Promise.resolve() }, unknown = new Set<string>(); // Bytes last seen while others wrote.
+	const active = new Set<Capture>(), lock = new RuntimeLifecycleLane(), unknown = new Set<string>(); // Bytes last seen while others wrote.
 	let poisonReason = lastStructure.complete ? undefined : "workspace_structure_limit";
 	let clock: Awaited<ReturnType<typeof openWorkspaceChangeClock>> | undefined;
 
@@ -1088,7 +1088,7 @@ async function createGitWorkspaceTransactionDriver(workspace: ReturnType<typeof 
 	}
 
 	const begin = (): Promise<WorkspaceTransactionCapture> =>
-		withWorkspaceLock(lock, async () => {
+		lock.serialize(async () => {
 			const overlapped = active.size > 0;
 			for (const other of active) other.overlapped = true;
 			const start = poisonReason ? undefined : await captureBefore(overlapped).catch(error => {
@@ -1098,7 +1098,7 @@ async function createGitWorkspaceTransactionDriver(workspace: ReturnType<typeof 
 			const capture: Capture = { contaminated: false, overlapped, before: start?.before, frontier: new Map(frontier), unknown: new Set(unknown), racing: start?.racing ?? [] };
 			active.add(capture);
 			return {
-				readBefore: (resource, maxBytes) => withWorkspaceLock(lock, async () => {
+				readBefore: (resource, maxBytes) => lock.serialize(async () => {
 					if (!active.has(capture) || capture.contaminated || !capture.before || capture.unknown.has(resource)) throw new Error("workspace transaction input is unavailable");
 					if (!isSafeCount(maxBytes)) throw new Error("workspace transaction input budget is invalid");
 					if (capture.before.entries.get(resource)?.kind !== "file") return undefined;
@@ -1120,7 +1120,7 @@ async function createGitWorkspaceTransactionDriver(workspace: ReturnType<typeof 
 	 * must not reach what it observed, and nothing may touch its own paths after it ended or while it ran.
 	 */
 	async function finish(capture: Capture, ownership?: () => Promise<WorkspaceTransactionOwnership | undefined>): Promise<WorkspaceTransactionDelta> {
-		const settled = await withWorkspaceLock(lock, async (): Promise<WorkspaceTransactionDelta | { readonly after: WorkspaceStructureSnapshot; readonly capturedAt: number; readonly paths: readonly string[] }> => {
+		const settled = await lock.serialize(async (): Promise<WorkspaceTransactionDelta | { readonly after: WorkspaceStructureSnapshot; readonly capturedAt: number; readonly paths: readonly string[] }> => {
 			if (!active.delete(capture)) return { complete: false, changes: [], reason: "transaction_already_settled" };
 			if (capture.contaminated || capture.overlapped && !ownership) return { complete: false, changes: [], reason: "overlapping_workspace_transaction" };
 			if (!capture.before) return { complete: false, changes: [], reason: poisonReason ?? "workspace_transaction_unavailable" };
@@ -1221,9 +1221,9 @@ async function createGitWorkspaceTransactionDriver(workspace: ReturnType<typeof 
 		}
 	}
 
-	const abort = (capture: Capture): Promise<void> => withWorkspaceLock(lock, async () => { if (active.delete(capture)) for (const other of active) other.contaminated = true; });
+	const abort = (capture: Capture): Promise<void> => lock.serialize(async () => { if (active.delete(capture)) for (const other of active) other.contaminated = true; });
 
-	const dispose = (): Promise<void> => withWorkspaceLock(lock, async () => {
+	const dispose = (): Promise<void> => lock.serialize(async () => {
 		for (const capture of active) capture.contaminated = true;
 		active.clear();
 		const closingClock = clock;
@@ -1280,7 +1280,7 @@ async function createSandboxRepository(owner: WorkspaceSandboxState, sourceRoot:
 		return {
 			owner, sourceRoot, parent, gitBinary, git,
 			versions: new ResourceVersionManager(sourceRoot, { snapshotExcludes: SNAPSHOT_EXCLUDES, gitObjects: true }),
-			active: 0, idleWaiters: new Set<() => void>(), lock: Promise.resolve(), overlayBaselines: new Map<string, Promise<SharedOverlayBaseline>>(),
+			active: 0, idleWaiters: new Set<() => void>(), lock: new RuntimeLifecycleLane(), overlayBaselines: new Map<string, Promise<SharedOverlayBaseline>>(),
 			// Unsafe live-mount storage is detached from allocation and retained for OS-level recovery.
 			quarantined: false,
 		};
@@ -1289,7 +1289,7 @@ async function createSandboxRepository(owner: WorkspaceSandboxState, sourceRoot:
 
 async function acquireSandboxBaseline(repository: PooledGitRepository, warmup = false): Promise<NonNullable<PooledGitRepository["baseline"]>> {
 	// The pool owns this shared baseline; callers cancel before private workspace allocation.
-	return withWorkspaceLock(repository, async () => {
+	return repository.lock.serialize(async () => {
 		const baseline = repository.baseline;
 		if (baseline) {
 			// Quiet notifications reuse preparation; fresh allocations check exact evidence below.
@@ -1497,7 +1497,7 @@ async function acquireOverlayBaseline(
 	snapshot: NonNullable<PooledGitRepository["baseline"]>,
 ): Promise<SharedOverlayBaseline> {
 	const { commit } = snapshot;
-	return withWorkspaceLock(repository, async () => {
+	return repository.lock.serialize(async () => {
 		const original = await captureSnapshotMetadata(repository.sourceRoot), identity = createHash("sha256").update(commit);
 		for (const [name, stat] of [...original].sort(([a], [b]) => a.localeCompare(b)))
 			identity.update(JSON.stringify([name, ...SNAPSHOT_METADATA_FIELDS.map(field => String(stat[field]))]));
@@ -1535,12 +1535,6 @@ async function captureOwnedWorkspaceStructure(root: string): Promise<WorkspaceSt
 }
 
 function releaseOverlayBaseline(baseline: SharedOverlayBaseline): void { baseline.active = Math.max(0, baseline.active - 1); }
-
-function withWorkspaceLock<T>(owner: { lock: Promise<void> }, run: () => Promise<T>): Promise<T> {
-	const pending = owner.lock.then(run);
-	owner.lock = pending.then(() => undefined, () => undefined);
-	return pending;
-}
 
 function releaseSandboxRepository(repository: PooledGitRepository): void {
 	repository.active = Math.max(0, repository.active - 1);
