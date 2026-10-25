@@ -26,7 +26,7 @@ import {
 import { digestObject, sha256Digest, type Sha256Digest } from "./stable-value-hash.ts";
 import {
 	filesystemMetadataDigest, filesystemObservationDigest, FILESYSTEM_METADATA_FIELDS, assertNoSymlinkPath, cachedCapture, captureFileDigest, captureFilesystemEntry, captureStableFile,
-	hashExecutableFile, mapFilesystem, rememberCapture, sameFilesystemIdentity, sharedWalk, walkFilesystemPath, type StableFilesystemCapture,
+	hashExecutableFile, mapFilesystem, withFilesystemReadView, FilesystemReadView, rememberCapture, sameFilesystemIdentity, sharedWalk, walkFilesystemPath, type StableFilesystemCapture,
 } from "./filesystem-evidence.ts";
 import {
 	captureAbsenceDependency, captureDirectoryDependency, captureFileDependency, observeProcessInputs, validateDynamicDependencyCertificate,
@@ -1308,10 +1308,12 @@ export class LinuxProcessReuseBackend {
 			session?: ActiveSession; live?: readonly ProcessProvenanceCertificate[]; artifacts?: ReadonlyMap<Sha256Digest, VerifiedArtifactClosure>; excludedCertificates?: ReadonlySet<Sha256Digest>; continuation?: boolean; signal?: AbortSignal;
 		} = {},
 	): Promise<ReadyProcessPlan | undefined> {
+		await using privateReads = session ? FilesystemReadView.ambient() : undefined;
 		// Proof reads belong to the caller's excluded lookup interval, even when file capture emits owned receipts.
 		const plan = (await TimelineInterval.collect(() => this.planner.plan({ weakKey, executablePath, acceptProducer, excludedCertificates, signal,
 			contract: { sink: "buffered", orderedJournal: true, transactionalEffects: true, ...(continuation ? { continuation: true as const } : {}) },
-			validation: { resolvePath: (logicalPath) => projection.toPhysical(logicalPath), ...(session ? { acceptedTaints: SAME_CONFINEMENT_TAINTS } : {}) },
+			validation: { resolvePath: (logicalPath) => projection.toPhysical(logicalPath), ...(session ? { acceptedTaints: SAME_CONFINEMENT_TAINTS,
+				readView: (physical: string) => projection.isWorkspacePhysical(physical) ? privateReads : undefined } : {}) },
 			...(live ? { live: { certificate: live, artifacts, acceptedTaints: [...TRANSFERRED_INPUT_TAINTS] } } : {}),
 		}))).output;
 		for (const [metric, value] of [["validationCandidates", plan.lookup.candidateCertificates],
@@ -1946,6 +1948,7 @@ export async function imageInterpreter(file: string): Promise<string | undefined
 async function captureDependencies(session: ActiveSession, snapshot: WorkspaceStructureSnapshot, observations: readonly StraceObservation[], effects: WorkspaceTransactionDiff,
 	external: Awaited<ReturnType<typeof privateCommits>>, runs: readonly DynamicDependencyCertificate[] = [], privateBefore?: PrivatePrestate) {
 	if (!effects.complete) throw new Error(`workspace effects are incomplete: ${effects.reason}`);
+	await using privateReads = FilesystemReadView.ambient();
 	const observed = observations.flatMap(part => part.paths),
 		locks = observations.flatMap(part => part.locks ?? []), written = observations.flatMap(part => part.written ?? []);
 	// Transaction structure and retained write preimages describe the run's starting state.
@@ -2038,7 +2041,7 @@ async function captureDependencies(session: ActiveSession, snapshot: WorkspaceSt
 			// A failed lookup needs both its original prefixes and the normalized target to retain their observed states.
 			if (absent && pending.includes("..") && entry?.kind !== "symlink") {
 				const prefix = physical ? await workspaceDependency(physical, next, "input", false)
-					: await captureDirectoryDependency(next, next, false, [], false).catch(error => missing(error) ? captureAbsenceDependency(path.join(privateUpper(session), next), next, false) : undefined);
+					: await captureDirectoryDependency(next, next, false, [], false).catch(error => missing(error) ? captureAbsenceDependency(path.join(privateUpper(session), next), next, false, [], undefined, privateReads) : undefined);
 				if (prefix?.kind !== "directory" && (prefix?.kind !== "absence" || created.has(physical ?? next) || own.has(next))) return;
 				add(prefix);
 			}
@@ -2109,16 +2112,18 @@ async function captureDependencies(session: ActiveSession, snapshot: WorkspaceSt
 			absent: absent && previous?.absent !== false });
 	}
 	// Capture independent external inputs concurrently, preserving trace order.
-	const capture = sharedWalk(captureFilesystemEntry), images = await privateInputImages(session, new Set([...hostPaths.values()].map(item => item.physical)), privateBefore);
-	for (const captured of await mapFilesystem([...hostPaths.values()], async ({ physical, role, listed, absent }) => {
-		try { return { physical, value: images.has(physical) ? images.get(physical)?.map(dependency => dependency.kind === "file" ? { ...dependency, role } : dependency)
-			: await captureHostPath(physical, role, listed, absent, capture) }; }
-		catch (error) { return { physical, error }; }
-	})) {
-		if ("error" in captured) { taints.add("trace_incomplete"); add(undefined, `capture:${captured.physical}:${errorMessage(captured.error)}`); }
-		else if (captured.value) for (const dependency of captured.value) add(dependency);
-		else { taints.add("mutable_input"); add(undefined, `mutable:${captured.physical}`); }
-	}
+	await withFilesystemReadView(undefined, async view => {
+		const capture = sharedWalk(target => captureFilesystemEntry(target, undefined, view)), images = await privateInputImages(session, new Set([...hostPaths.values()].map(item => item.physical)), privateBefore);
+		for (const captured of await mapFilesystem([...hostPaths.values()], async ({ physical, role, listed, absent }) => {
+			try { return { physical, value: images.has(physical) ? images.get(physical)?.map(dependency => dependency.kind === "file" ? { ...dependency, role } : dependency)
+				: await captureHostPath(physical, role, listed, absent, capture, view) }; }
+			catch (error) { return { physical, error }; }
+		})) {
+			if ("error" in captured) { taints.add("trace_incomplete"); add(undefined, `capture:${captured.physical}:${errorMessage(captured.error)}`); }
+			else if (captured.value) for (const dependency of captured.value) add(dependency);
+			else { taints.add("mutable_input"); add(undefined, `mutable:${captured.physical}`); }
+		}
+	});
 	for (const effect of effects.effects) {
 		const physical = session.projection.toPhysical(effect.logicalPath);
 		if (!physical) { add(undefined, `effect_unmapped:${effect.logicalPath}`); continue; }
@@ -2142,23 +2147,23 @@ const KERNEL_CONFIGURATION = /^\/proc\/(?:filesystems|mounts|sys\/vm\/overcommit
 const SAME_CONFINEMENT_TAINTS = ["confinement_observation"] as const;
 
 async function captureHostPath(physicalPath: string, role: DependencyRole, listed: boolean, absent: boolean,
-	capture: typeof captureFilesystemEntry) {
+	capture: typeof captureFilesystemEntry, view: FilesystemReadView) {
 	// A uniformly failed lookup depends on this exact name remaining absent, including under mutable roots.
 	if (absent) {
-		const dependency = await captureAbsenceDependency(physicalPath, slash(physicalPath), false);
+		const dependency = await captureAbsenceDependency(physicalPath, slash(physicalPath), false, [], undefined, view);
 		return dependency ? [dependency] : undefined;
 	}
 	const dependencies: DynamicDependency[] = [];
-	for await (const { path: current, info, link, terminal } of walkFilesystemPath(path.resolve(physicalPath), { capture })) {
+	for await (const { path: current, info, link, terminal } of walkFilesystemPath(path.resolve(physicalPath), { capture, view })) {
 		// What exists under these roots changes without a trace; absence was independently proved above.
 		if (["/proc", "/sys", "/dev", "/run", "/tmp", "/var/tmp"].some((root) => pathContains(root, current)) && (!pathContains("/run", current) || info && terminal)) return undefined;
 		if (!info) return undefined;
 		// Root's files, and this user's own outside the workspace (a PATH through ~/.local or nvm), validate exactly; no one else may write them.
 		if (info.uid !== 0n && info.uid !== BigInt(process.getuid?.() ?? -1) || (link === undefined && (info.mode & 0o022n) !== 0n)) return undefined;
 		if (link !== undefined) dependencies.push({ kind: "symlink", path: slash(current), target: link, targetDigest: sha256Digest(link) });
-		else if (terminal && info.isFile()) dependencies.push((await captureFileDependency(current, slash(current), role, { includeMetadata: true })).dependency);
+		else if (terminal && info.isFile()) dependencies.push((await captureFileDependency(current, slash(current), role, { includeMetadata: true, view })).dependency);
 		// A listing reveals names; a program that stats the directory records that metadata on its own.
-		else if (terminal && info.isDirectory()) dependencies.push(await captureDirectoryDependency(current, slash(current), !listed, [], listed));
+		else if (terminal && info.isDirectory()) dependencies.push(await captureDirectoryDependency(current, slash(current), !listed, [], listed, undefined, view));
 		else if (!info.isFile() && !info.isDirectory()) throw new Error("unsupported host dependency");
 	}
 	return dependencies;

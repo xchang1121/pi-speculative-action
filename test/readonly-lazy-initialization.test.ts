@@ -26,6 +26,11 @@ linux.for(["environment-directory", "configured-watcher"] as const)("initializes
         const startup = await import(workerData.startup);
         const filesystem = await import(workerData.filesystem);
         const { ResourceVersionManager } = await import(workerData.resources);
+        const { validateDynamicDependencyCertificate } = await import(workerData.provenance);
+        const input = { contentDigest: "sha256:" + "0".repeat(64), eof: true };
+        const descriptor = await validateDynamicDependencyCertificate({ complete: true, taints: [], dependencies: [{ kind: "fd", fd: 0, ...input }] },
+          { fileDescriptors: new Map([[0, input]]) });
+        const empty = await validateDynamicDependencyCertificate({ complete: true, taints: [], dependencies: [] });
         const initial = Boolean(startup.nativeFilesystem);
         if (workerData.mode === "configured-watcher") startup.configureNativeFilesystem(workerData.binary);
         const manager = new ResourceVersionManager(workerData.root);
@@ -38,19 +43,20 @@ linux.for(["environment-directory", "configured-watcher"] as const)("initializes
           const link = await view.readlink(workerData.pointer);
           token ??= await manager.observeChanges();
           parentPort.postMessage({ initial, loaded: Boolean(startup.nativeFilesystem), binary: startup.nativeFilesystemBinary(),
-            names: entries.map(entry => entry.name), link, watching: token.watching });
+            names: entries.map(entry => entry.name), link, watching: token.watching, descriptor: descriptor.status, empty: empty.status });
         } finally { await token?.release(); manager.close(); await view?.close(); }
       })().catch(error => { parentPort.postMessage({ error: String(error.stack ?? error) }); });
     `, { eval: true, workerData: { mode, binary, root, pointer,
       startup: new URL("../src/process-startup.mjs", import.meta.url).href,
       filesystem: new URL("../src/filesystem-evidence.ts", import.meta.url).href,
+      provenance: new URL("../src/provenance-validation.ts", import.meta.url).href,
       resources: new URL("../src/resource-version.ts", import.meta.url).href },
       env: { ...process.env, PI_SPEC_HELD_EXEC: mode === "configured-watcher" ? path.join(fixture, "missing-default-helper") : binary } });
     const result = await new Promise<Record<string, unknown>>((resolve, reject) => {
       worker!.once("message", resolve); worker!.once("error", reject);
       worker!.once("exit", code => { if (code !== 0) reject(new Error(`standalone capture worker exited ${code}`)); });
     });
-    expect(result).toEqual({ initial: false, loaded: true, binary, names: ["input", "pointer"], link: "input", watching: true });
+    expect(result).toEqual({ initial: false, loaded: true, binary, names: ["input", "pointer"], link: "input", watching: true, descriptor: "valid", empty: "valid" });
     expect(await snapshot()).toEqual(before);
   } finally { await worker?.terminate(); await rm(fixture, { recursive: true, force: true }); }
 });

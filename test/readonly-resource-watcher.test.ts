@@ -6,12 +6,68 @@ import * as filesystemEvidence from "../src/filesystem-evidence.ts";
 import { nativeProcessLibrary } from "../src/process-startup.mjs";
 import { ResourceVersionManager, type ResourceVersionToken } from "../src/resource-version.ts";
 import { WorkspaceSandboxService, type SandboxWorkspaceContext } from "../src/workspace-sandbox.ts";
+import { captureAbsenceDependency, captureDirectoryDependency, captureFileDependency, captureMetadataDependency, captureSymlinkDependency, validateDynamicDependencyCertificate } from "../src/provenance-validation.ts";
+import { ProcessReusePlanner, ProvenanceCertificateStore, sealProcessCertificate } from "../src/process-reuse.ts";
+import { PROCESS_CERTIFICATE } from "./process-fixture.ts";
 
 const linux = test.skipIf(process.platform !== "linux" || !process.env.PI_SPEC_HELD_EXEC);
 const metadata = async (paths: readonly string[]) => Promise.all(paths.map(async target => {
   const stat = await lstat(target, { bigint: true });
   return { target, fields: Object.fromEntries(filesystemEvidence.FILESYSTEM_METADATA_FIELDS.map(field => [field, String(stat[field])])) };
 }));
+
+linux.for(["capture", "validate", "replay"])("preserves source metadata through dependency evidence and persisted replay (%s)", { timeout: 30_000 }, async mode => {
+  nativeProcessLibrary(process.env.PI_SPEC_HELD_EXEC!);
+  const fixture = await mkdtemp(path.join(os.tmpdir(), "pi-readonly-evidence-")), root = path.join(fixture, "real/source"), routeLink = path.join(fixture, "route"), route = path.join(routeLink, "source");
+  const file = path.join(root, "input"), alias = path.join(root, "alias"), symbolic = path.join(root, "symbolic"), broken = path.join(root, "broken");
+  const logical = (name: string) => path.join(route, name), aliases = [logical("input"), logical("alias")].sort();
+  const capture = async () => ({ complete: true, taints: [], dependencies: [
+    (await captureFileDependency(logical("input"), logical("input"), "input", { includeMetadata: true, aliases })).dependency,
+    await captureDirectoryDependency(route, route, true, ["symbolic"], true),
+    await captureDirectoryDependency(logical("empty"), logical("empty"), false, [], false),
+    (await captureAbsenceDependency(logical("absent"), logical("absent"), true, ["symbolic"]))!,
+    (await captureAbsenceDependency(logical("broken/child"), logical("broken/child"), false))!,
+    await captureSymlinkDependency(logical("symbolic"), logical("symbolic")),
+    await captureSymlinkDependency(logical("broken"), logical("broken")),
+    await captureMetadataDependency(logical("symbolic"), logical("symbolic"), true, ["mode", "size"]),
+    await captureMetadataDependency(logical("symbolic"), logical("symbolic"), false, ["mode", "size"]),
+  ] });
+  let store: ProvenanceCertificateStore | undefined;
+  try {
+    await mkdir(path.join(root, "empty"), { recursive: true }); await writeFile(file, "original\n"); await link(file, alias);
+    await symlink("real", routeLink); await symlink("input", symbolic); await symlink("missing", broken);
+    // Prepare validation fixtures before setting the source's deliberately old access times.
+    const prepared = mode === "capture" ? undefined : await capture();
+    for (const target of [root, file]) await utimes(target, 915148800, 946684800);
+    for (const target of [routeLink, symbolic, broken]) await lutimes(target, 915148800, 946684800);
+    const paths = [root, file, alias, routeLink, symbolic, broken], before = await metadata(paths);
+    const evidence = prepared ?? await capture();
+    expect(evidence.dependencies[0]).toMatchObject({ aliases });
+    if (mode === "replay") {
+      store = new ProvenanceCertificateStore(path.join(fixture, "store"));
+      const data = await store.artifacts.put("reused output\n");
+      const certificate = sealProcessCertificate({ ...PROCESS_CERTIFICATE, dependencyCertificate: evidence,
+        result: { replayProfile: "buffered_noninteractive", journal: [{ sequence: 0, kind: "output", fd: 1, data }], exit: { kind: "code", code: 0 } } });
+      expect(await new ProcessReusePlanner({ store }).publishCompleted(certificate)).toBe(true);
+      await store.dispose(); store = new ProvenanceCertificateStore(path.join(fixture, "store"));
+      const plan = await new ProcessReusePlanner({ store }).plan({ weakKey: certificate.weakKey, executablePath: certificate.prototype.executablePath,
+        contract: { sink: "buffered", orderedJournal: true, transactionalEffects: true } });
+      expect(plan.kind).toBe("completed_replay");
+      if (plan.kind === "completed_replay") expect(plan.artifacts.read(data).toString()).toBe("reused output\n");
+    } else if (mode === "validate") expect((await validateDynamicDependencyCertificate(evidence)).status).toBe("valid");
+    expect(await metadata(paths)).toEqual(before);
+    await expect(captureMetadataDependency(logical("broken"), logical("broken"), true)).rejects.toMatchObject({ code: "ENOENT" });
+    const failed = await validateDynamicDependencyCertificate({ ...evidence, dependencies: [
+      { ...evidence.dependencies.find(dependency => dependency.kind === "symlink")!, path: logical("input") },
+    ] });
+    expect(failed.status).toBe("indeterminate");
+    expect(await metadata(paths)).toEqual(before);
+    await writeFile(file, "changed\n");
+    const changed = await metadata(paths);
+    expect((await validateDynamicDependencyCertificate(evidence)).status).toBe("stale");
+    expect(await metadata(paths)).toEqual(changed);
+  } finally { await store?.dispose(); await rm(fixture, { recursive: true, force: true }); }
+});
 
 linux.for(["allocate", "adopt", "failure"])("preserves source metadata through workspace preparation and actual adoption (%s)", { timeout: 30_000 }, async mode => {
   const fixture = await mkdtemp(path.join(os.tmpdir(), "pi-readonly-workspace-")), parent = path.join(fixture, "real");
