@@ -1,13 +1,13 @@
 import { isSafeCount } from "./number-utils.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { hash } from "node:crypto";
-import { type BigIntStats, type FSWatcher, watch } from "node:fs";
-import fs from "node:fs/promises";
+import { type BigIntStats, type FSWatcher, watch, closeSync, constants, fstatSync, readlinkSync } from "node:fs";
+import { ensureNativeFilesystem, nativeFilesystem } from "./process-startup.mjs";
 import path from "node:path";
 import { setImmediate as watcherTurn } from "node:timers/promises";
 import { type ActionKey, type ActionSemanticsRegistry, PI_ACTION_SEMANTICS, type ResourceDependencyScope } from "./action-semantics.ts";
 import {
-	type StableFilesystemCapture, type FilesystemObjectHandle, cachedCapture, captureFilesystemEntry, captureStableFile,
+	type StableFilesystemCapture, type FilesystemObjectHandle, type FilesystemReadView, openFilesystemReadView, withFilesystemReadView, cachedCapture, captureFilesystemEntry, captureStableFile,
 	FILESYSTEM_CONCURRENCY, mapFilesystem, sameFilesystemIdentity, walkFilesystemPath, filesystemEntryType, type FilesystemTypeEvidence, readFilesystemDirectory,
 } from "./filesystem-evidence.ts";
 import { containsFilesystemPath, filesystemPathKey, relativeFilesystemPath } from "./path-utils.ts";
@@ -614,12 +614,73 @@ type ResourceEvent = { readonly epoch: number; readonly path: string; readonly t
 
 const MAX_EVENT_HISTORY = 4096;
 
+type ResourceWatcher = Pick<FSWatcher, "close"> & { readonly settle?: () => Promise<void> };
+
+/** Linux's recursive Node watcher performs ordinary stat/readdir calls. Install
+ * nonrecursive inode watches through the read view instead, and rescan renamed
+ * subtrees through one fresh view. Symbolic links are covered by their parent. */
+async function watchReadonlyFilesystem(root: string, changed: (target: string, type: "change" | "rename") => void,
+	failed: (error: Error) => void): Promise<ResourceWatcher> {
+	const watched = new Map<string, { readonly watcher: FSWatcher; readonly identity: string }>(), dirty = new Set([root]);
+	let closed = false, pending: Promise<void> | undefined, failure: Error | undefined;
+	const close = () => { if (!closed) { closed = true; for (const entry of watched.values()) entry.watcher.close(); watched.clear(); } };
+	const fail = (error: Error) => { if (!closed) { failure = error; close(); failed(error); } };
+	const refresh = (): Promise<void> => {
+		if (closed) return failure ? Promise.reject(failure) : Promise.resolve();
+		return pending ??= (async () => {
+			while (dirty.size && !closed) {
+				const roots = [...dirty]; dirty.clear();
+				await using filesystem = await openFilesystemReadView();
+				const sourceRoot = await filesystem.realpath(root);
+				for (const subtree of roots) {
+					const seen = new Set<string>(), paths = [subtree];
+					for (let cursor = 0; cursor < paths.length && !closed; cursor++) {
+						const target = paths[cursor]; let descriptor: number | undefined;
+						try {
+							descriptor = filesystem.open(target, 0x200000 | (target === root ? 0 : constants.O_NOFOLLOW));
+							const stat = fstatSync(descriptor, { bigint: true });
+							if (stat.isSymbolicLink()) continue;
+							if (!containsFilesystemPath(sourceRoot, readlinkSync(`/proc/self/fd/${descriptor}`))) throw new Error("filesystem watcher directory escaped its root");
+							seen.add(target);
+							const identity = `${stat.dev}:${stat.ino}`, prior = watched.get(target), directory = stat.isDirectory();
+							if (prior?.identity !== identity) {
+								prior?.watcher.close();
+								const watcher = watch(`/proc/self/fd/${descriptor}`, (event, filename) => {
+									if (closed) return;
+									changed(directory && filename ? path.join(target, filename.toString()) : target, event);
+									if (event === "rename") {
+										changed(target, event); dirty.add(directory ? target : path.dirname(target));
+										void refresh().catch(fail);
+									}
+								});
+								watcher.on("error", fail); watched.set(target, { watcher, identity });
+							}
+							if (directory) for (const { name } of await readFilesystemDirectory(target, filesystem)) paths.push(path.join(target, name));
+						} catch (error) { if (!missingResource(error)) throw error; }
+						finally { if (descriptor !== undefined) closeSync(descriptor); }
+					}
+					if (closed) break;
+					for (const [target, entry] of watched) if (containsFilesystemPath(subtree, target) && !seen.has(target)) {
+						entry.watcher.close(); watched.delete(target);
+					}
+				}
+				await filesystem.verify([...roots, sourceRoot]);
+			}
+			if (failure) throw failure;
+		})().finally(() => { pending = undefined; });
+	};
+	try {
+		await refresh();
+		return { close, settle: async () => { do { await refresh(); } while (pending || !closed && dirty.size); } };
+	} catch (error) { close(); throw error; }
+}
+
 export class ResourceVersionManager {
 	private epoch = 0;
 	private readonly events: ResourceEvent[] = [];
 	private readonly preciseWatches = new Map<string, { readonly watcher: FSWatcher; references: number }>();
 	private references = 0;
-	private watcher?: FSWatcher;
+	private watcher?: ResourceWatcher;
 	private reliable = false;
 	private ready?: Promise<void>;
 	private open = true;
@@ -644,11 +705,13 @@ export class ResourceVersionManager {
 
 	private async startWatching() {
 		try {
-			this.watcher = watch(this.root, { recursive: true }, (event, filename) => {
-				const changed = filename ? path.resolve(this.root, filename) : this.root;
-				this.changed(changed, event);
-			});
-			this.watcher.on("error", () => { this.reliable = false; this.changed(this.root, "unknown"); });
+			const failed = () => { this.reliable = false; this.changed(this.root, "unknown"); };
+			if (nativeFilesystem) this.watcher = await watchReadonlyFilesystem(this.root, (target, event) => this.changed(target, event), failed);
+			else {
+				const watcher = watch(this.root, { recursive: true }, (event, filename) => this.changed(filename ? path.resolve(this.root, filename) : this.root, event));
+				watcher.on("error", failed); this.watcher = watcher;
+			}
+			if (!this.open) { this.watcher?.close(); this.watcher = undefined; return; }
 			this.reliable = true;
 			await watcherTurn();
 		} catch {
@@ -685,14 +748,15 @@ export class ResourceVersionManager {
 		if (this.snapshotExcludes.size && retainBytes !== undefined) throw new Error("resource_filtered_snapshot_not_readable");
 		const observations = new Map<string, ResourceObservation>();
 		const treeObjects = this.gitObjects && dependencies?.some((dependency) => dependency.scope === "tree_content") ? new Map<string, TreeObject>() : undefined;
-		let precise: ReturnType<ResourceVersionManager["acquirePreciseWatches"]> | undefined;
+		let precise: Awaited<ReturnType<ResourceVersionManager["acquirePreciseWatches"]>> | undefined;
 		this.references++;
 		let view: ResourceReadView | undefined;
 		const observing = dependencies !== undefined && !providedInputs;
 		const release = releaseOnce(() => this.releaseCapture(observations, view, precise));
 		try {
-			if (observing) await (this.ready ??= this.startWatching());
-			const physicalRoot = await fingerprintIO(() => fs.realpath(this.root));
+			await ensureNativeFilesystem();
+			if (observing) { await (this.ready ??= this.startWatching()); await this.watcher?.settle?.(); }
+			const physicalRoot = await fingerprintIO(() => withFilesystemReadView(undefined, filesystem => filesystem.realpath(this.root)));
 			const capture = async (requested: ReadonlyArray<ResourceDependency>) => {
 				const normalized = [...new Map(requested.map(({ path: target, scope }) => {
 					const dependency = { path: path.resolve(this.root, target), scope };
@@ -700,7 +764,7 @@ export class ResourceVersionManager {
 					return [dependencyKey(dependency), dependency];
 				})).values()].filter(dependency => !observations.has(dependencyKey(dependency)));
 				if (!normalized.length) return;
-				if (observing && this.reliable) precise = this.acquirePreciseWatches(normalized);
+				if (observing && this.reliable) precise = await this.acquirePreciseWatches(normalized);
 				for (const observation of await fingerprintDependencies(normalized, physicalRoot, this.snapshotExcludes, view,
 					observing && !this.snapshotExcludes.size ? { root: this.root, observations } : undefined, providedInputs, treeObjects)) observations.set(dependencyKey(observation), observation);
 			};
@@ -718,7 +782,8 @@ export class ResourceVersionManager {
 			if (view) observations.set(boundaryKey, { ...boundary, stamp: filesystemPathKey(physicalRoot),
 				fingerprint: digest({ path: filesystemPathKey(this.root), scope: "resolution", value: filesystemPathKey(physicalRoot) }) });
 			if (dependencies) await capture(dependencies);
-			if (observing) await watcherTurn();
+			if (observing) { await watcherTurn(); await this.watcher?.settle?.(); }
+			if (!this.open) throw new Error("resource_version_manager_closed");
 			const retained = view?.retained ? view : undefined;
 			if (dependencies) retained?.seal();
 			return {
@@ -806,7 +871,8 @@ export class ResourceVersionManager {
 		if (this.events.length > MAX_EVENT_HISTORY) this.events.splice(0, this.events.length - MAX_EVENT_HISTORY);
 	}
 
-	private acquirePreciseWatches(dependencies: ReadonlyArray<ResourceDependency>) {
+	private async acquirePreciseWatches(dependencies: ReadonlyArray<ResourceDependency>) {
+		return withFilesystemReadView(undefined, async filesystem => {
 		const paths: string[] = [];
 		for (const target of new Set(
 			dependencies.filter((dependency) => dependency.scope === "content").map((dependency) => dependency.path),
@@ -815,7 +881,11 @@ export class ResourceVersionManager {
 			const existing = this.preciseWatches.get(key);
 			if (existing) { existing.references++; paths.push(target); continue; }
 			try {
-				const watcher = watch(target, (event) => this.changed(target, event));
+				let descriptor: number | undefined, watcher: FSWatcher;
+				try {
+					if (nativeFilesystem) descriptor = filesystem.open(target, 0x200000);
+					watcher = watch(descriptor === undefined ? target : `/proc/self/fd/${descriptor}`, (event) => this.changed(target, event));
+				} finally { if (descriptor !== undefined) closeSync(descriptor); }
 				watcher.on("error", () => { this.reliable = false; this.changed(target, "unknown"); });
 				this.preciseWatches.set(key, { watcher, references: 1 });
 				paths.push(target);
@@ -837,6 +907,7 @@ export class ResourceVersionManager {
 				}
 			}),
 		};
+		}, async result => result.release());
 	}
 
 }
@@ -975,15 +1046,16 @@ async function fingerprintDependencies(
 	dependencies: ReadonlyArray<ResourceDependency>, realRoot: string, excludes: ReadonlySet<string>, view?: ResourceReadView,
 	bindings?: { readonly root: string; readonly observations: Map<string, ResourceObservation> },
 	providedInputs?: ReadonlyMap<string, ResourceInput>,
-	treeObjects?: Map<string, TreeObject>,
-) {
-	const files = new Map<string, Promise<FingerprintResult & { readonly blob?: string }>>(), nearestExisting = missingResourceResolver(realRoot);
+	treeObjects?: Map<string, TreeObject>, filesystem?: FilesystemReadView,
+): Promise<(ResourceObservation & { readonly bytesRead: number; readonly filesRead: number })[]> {
+	if (!filesystem) return withFilesystemReadView(undefined, active => fingerprintDependencies(dependencies, realRoot, excludes, view, bindings, providedInputs, treeObjects, active));
+	const files = new Map<string, Promise<FingerprintResult & { readonly blob?: string }>>(), nearestExisting = missingResourceResolver(realRoot, filesystem);
 	const aliases = new Map<string, Map<string, { paths: Set<string>; links: number }>>();
 	const entries = new Map<string, ReturnType<typeof captureFilesystemEntry>>();
 	const capture = (target: string) => {
 		const key = filesystemPathKey(target), previous = entries.get(key);
 		if (previous) return previous;
-		const pending = fingerprintIO(() => captureFilesystemEntry(target)).then((entry) => {
+		const pending = fingerprintIO(() => captureFilesystemEntry(target, undefined, filesystem)).then((entry) => {
 			// Eager captures own namespace evidence; ordinary validation joins only pending reads.
 			if (bindings && (entry.info.isDirectory() || entry.link !== undefined)) {
 				const dependency = { path: target, scope: "binding" as const };
@@ -995,11 +1067,11 @@ async function fingerprintDependencies(
 	};
 	if (bindings) await capture(bindings.root);
 	return mapFilesystem(dependencies, async (dependency) => {
-		if (dependency.scope === "binding") return fingerprintBinding(dependency);
+		if (dependency.scope === "binding") return fingerprintBinding(dependency, filesystem);
 		const key = dependencyKey(dependency);
 		if (dependency.scope === "tree_content" || dependency.scope === "tree_entries") aliases.set(key, new Map());
 		const { value, ...metrics } = dependency.scope === "resolution"
-			? await fingerprintIO(async () => { const resolved = filesystemPathKey(await fs.realpath(dependency.path)); return { value: resolved, stamp: resolved, bytesRead: 0, filesRead: 0 }; })
+			? await fingerprintIO(async () => { const resolved = filesystemPathKey(await filesystem.realpath(dependency.path)); return { value: resolved, stamp: resolved, bytesRead: 0, filesRead: 0 }; })
 			: await fingerprintPath(dependency.path, dependency.scope, key);
 		const groups = [...(aliases.get(key)?.values() ?? [])].map(group => Object.freeze({ links: group.links, paths: Object.freeze([...group.paths].sort()) }))
 			.sort((left, right) => left.paths[0]! < right.paths[0]! ? -1 : 1);
@@ -1019,7 +1091,7 @@ async function fingerprintDependencies(
 		const startedAt = performance.now();
 		let captured: Awaited<ReturnType<typeof captureFilesystemEntry>>;
 		try {
-			if (bindings) for await (const entry of walkFilesystemPath(target, { capture, followFinal: followsResource(scope) })) {
+			if (bindings) for await (const entry of walkFilesystemPath(target, { capture, followFinal: followsResource(scope), view: filesystem })) {
 				if (entry.info && !entry.info.isDirectory() && entry.link === undefined && !entry.terminal) break;
 			}
 			captured = await capture(target);
@@ -1041,8 +1113,8 @@ async function fingerprintDependencies(
 		if (providedInputs && !(suppliedContent ? info.isFile() : supplied && ("type" in supplied ? specialFileType(info) === supplied.type : info.isDirectory())))
 			throw new Error(suppliedContent ? "resource_input_not_regular" : "resource_input_type_changed");
 		const realTarget = info.isSymbolicLink()
-			? path.join(parentReal ?? await fingerprintIO(() => fs.realpath(path.dirname(target))), path.basename(target))
-			: parentReal === undefined ? await fingerprintIO(() => fs.realpath(target)) : path.join(parentReal, path.basename(target));
+			? path.join(parentReal ?? await fingerprintIO(() => filesystem!.realpath(path.dirname(target))), path.basename(target))
+			: parentReal === undefined ? await fingerprintIO(() => filesystem!.realpath(target)) : path.join(parentReal, path.basename(target));
 		// An entry name joined to a walked directory stays where the directory was proven to be.
 		if (parentReal === undefined) assertInside(realRoot, realTarget);
 		const identity = filesystemPathKey(realTarget);
@@ -1061,7 +1133,7 @@ async function fingerprintDependencies(
 			let source: string | undefined;
 			const links: unknown[] = [];
 			if (followsResource(scope)) await fingerprintIO(async () => {
-				for await (const entry of walkFilesystemPath(target)) {
+				for await (const entry of walkFilesystemPath(target, { view: filesystem })) {
 					source = entry.path;
 					if (entry.link !== undefined) links.push([filesystemPathKey(source), entry.link, statStamp(entry.info!)]);
 				}
@@ -1077,7 +1149,7 @@ async function fingerprintDependencies(
 			};
 		}
 		if (["stat", "type", "entry", "exists"].includes(scope) || (scope === "entries" && !descend) || (["names", "entries", "tree_entries"].includes(scope) && !info.isDirectory())) {
-			const after = parentReal === undefined ? await fingerprintIO(() => fs.lstat(target, { bigint: true })) : info;
+			const after = parentReal === undefined ? await fingerprintIO(() => filesystem!.stat(target)) : info;
 			if (!sameFilesystemIdentity(info, after)) throw new Error(`resource_file_changed:${target}`);
 			const size = ["stat", "entry"].includes(scope) ? Number(after.size) : undefined;
 			const computation = supplied && "computation" in supplied ? supplied.computation : captured.computation;
@@ -1105,7 +1177,7 @@ async function fingerprintDependencies(
 				const content: StableFilesystemCapture = bytes ? { content: bytes, bytesRead: bytes.length, hash: hash("sha256", bytes), stat: info, realPath: realTarget,
 					computation: supplied && "computation" in supplied ? supplied.computation : undefined }
 					: !retain && cachedCapture(info, realTarget, gitBlob) || await fingerprintIO(() => captureStableFile(target, retain ? Number(info.size) : undefined, retain, {
-						stat: info, realPath: realTarget, retainObject: retain && view!.canRetainObject, gitBlob }));
+						stat: info, realPath: realTarget, retainObject: retain && view!.canRetainObject, gitBlob, view: filesystem }));
 				assertInside(realRoot, content.realPath);
 				retainEntry({ type: "file", content: content.content, computation: content.computation,
 					object: content.object ?? (bytes && retain && view!.canRetainObject ? null : undefined),
@@ -1126,7 +1198,7 @@ async function fingerprintDependencies(
 				...directoryObjectSlot(supplied.names, view) });
 			return { ...fingerprintDirectory(info, realTarget, supplied.names), bytesRead: 0, filesRead: 0 };
 		}
-		const enumerationStarted = performance.now(), entries = await fingerprintIO(() => readFilesystemDirectory(target));
+		const enumerationStarted = performance.now(), entries = await fingerprintIO(() => readFilesystemDirectory(target, filesystem));
 		const computation = TimelineInterval.own(new TimelineInterval(enumerationStarted, performance.now()));
 		const selected = excludes.size && (scope === "tree_content" || scope === "tree_entries") ? entries.filter((entry) => !excludes.has(entry.name)) : entries;
 		const descendants = new Set(ancestors).add(identity);
@@ -1135,8 +1207,8 @@ async function fingerprintDependencies(
 			return { name: entry.name, ...child };
 		});
 		const [afterEntries, after] = await Promise.all([
-			fingerprintIO(() => readFilesystemDirectory(target)),
-			fingerprintIO(() => fs.lstat(target, { bigint: true })),
+			fingerprintIO(() => readFilesystemDirectory(target, filesystem)),
+			fingerprintIO(() => filesystem!.stat(target)),
 		]);
 		if (
 			!after.isDirectory() ||
@@ -1155,10 +1227,10 @@ async function fingerprintDependencies(
 	}
 }
 
-async function fingerprintBinding(dependency: ResourceDependency) {
+async function fingerprintBinding(dependency: ResourceDependency, filesystem: FilesystemReadView) {
 	let stamp: string;
 	try {
-		const { info, link } = await fingerprintIO(() => captureFilesystemEntry(dependency.path, "identity"));
+		const { info, link } = await fingerprintIO(() => captureFilesystemEntry(dependency.path, "identity", filesystem));
 		stamp = digest([statStamp(info), link]);
 	} catch (error) { if (!missingResource(error)) throw error; stamp = errorCode(error); }
 	return { ...dependency, fingerprint: "binding", stamp, bytesRead: 0, filesRead: 0 };
@@ -1173,7 +1245,7 @@ function specialFileType(value: FilesystemTypeEvidence) {
 	return kind === "char" ? "character_device" : kind === "block" ? "block_device" : kind;
 }
 
-function missingResourceResolver(realRoot: string) {
+function missingResourceResolver(realRoot: string, filesystem: FilesystemReadView) {
 	// Negative queries commonly share ancestors. Join only concurrent reads in this proof batch;
 	// settled observations are never cached for another query or Actor validation.
 	type Resolution = { readonly realPath: string; readonly fingerprint: string };
@@ -1184,8 +1256,8 @@ function missingResourceResolver(realRoot: string) {
 		const task = (async () => {
 			try {
 				const [real, stat] = await Promise.all([
-					fingerprintIO(() => fs.realpath(current)),
-					fingerprintIO(() => fs.lstat(current, { bigint: true })),
+					fingerprintIO(() => filesystem.realpath(current)),
+					fingerprintIO(() => filesystem.stat(current)),
 				]);
 				assertInside(realRoot, real);
 				return { realPath: filesystemPathKey(real), fingerprint: digest([filesystemPathKey(real), statStamp(stat)]) };

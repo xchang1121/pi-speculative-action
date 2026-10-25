@@ -4,15 +4,53 @@ import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { access, realpath } from "node:fs/promises";
 import { constants } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 const requireNative = createRequire(import.meta.url), qualification = fileURLToPath(import.meta.url);
-/** @type {((fd: number, buffer: Buffer) => number) | undefined} */
+/** @type {((fd: number, buffer?: Buffer, adopt?: (fd: number) => number) => number) | undefined} */
 export let nativeFilesystem;
+/** @type {string | undefined} */
+let configuredFilesystemBinary;
+/** @type {string | undefined} */
+let loadedFilesystemBinary;
+/** @type {Promise<NonNullable<typeof nativeFilesystem>> | undefined} */
+let filesystemInitialization;
+
+/** @param {string | undefined} [binary] */
+export function configureNativeFilesystem(binary) {
+	if (binary !== undefined && !nativeFilesystem) configuredFilesystemBinary = binary;
+}
+
+export function nativeFilesystemBinary() { return loadedFilesystemBinary ?? configuredFilesystemBinary; }
+
+/** Resolve the native helper shared by resource capture, transparent dispatch and Actor handoff.
+ * @param {string | undefined} [binary]
+ */
+export async function resolveLinuxExecHelper(binary) {
+	if (process.platform !== "linux") throw new Error("Linux required");
+	const resolved = await realpath(binary ?? path.join(os.homedir(), ".local", "bin", "pi-speculative-held-exec"));
+	await access(resolved, constants.X_OK); return resolved;
+}
+
+/** Linux source capture cannot fall back to ordinary reads before a backend happens to initialize. */
+export async function ensureNativeFilesystem() {
+	if (process.platform !== "linux") return undefined;
+	const qualify = () => {
+		if (!nativeFilesystem || nativeFilesystem(-11) !== 2) throw new Error("qualified native filesystem reader unavailable; rebuild the Linux backend");
+		return nativeFilesystem;
+	};
+	if (nativeFilesystem) return qualify();
+	return filesystemInitialization ??= resolveLinuxExecHelper(configuredFilesystemBinary ?? process.env.PI_SPEC_HELD_EXEC).then(binary => {
+		if (!nativeFilesystem) nativeProcessLibrary(binary);
+		return qualify();
+	}).finally(() => { filesystemInitialization = undefined; });
+}
 /** @param {string} binary */
 export function nativeProcessLibrary(binary) {
 	const startup = requireNative(`${binary}.node`);
 	if (startup(-1, Buffer.alloc(24)) !== -9) throw new Error("native directory reader unavailable");
-	nativeFilesystem = startup; return startup;
+	nativeFilesystem = startup; loadedFilesystemBinary = binary; return startup;
 }
 
 /** Qualify the same Node/libuv path in a disposable group without occupying the host's launch gate.

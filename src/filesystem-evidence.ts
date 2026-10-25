@@ -1,12 +1,12 @@
 import { digestObject, type Sha256Digest } from "./stable-value-hash.ts";
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, constants, fstatSync, openSync, type BigIntStats, type Stats } from "node:fs";
+import { closeSync, constants, fstatSync, openSync, readlinkSync, type BigIntStats, type Stats } from "node:fs";
 import fs, { type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { containsFilesystemPath, slash } from "./path-utils.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
 import { TimelineInterval, type SerializedTimelineComputation } from "./task-timing.ts";
-import { nativeFilesystem } from "./process-startup.mjs";
+import { ensureNativeFilesystem, nativeFilesystem } from "./process-startup.mjs";
 import { windowsFilesystem } from "./windows-filesystem.mjs";
 import { getSystemErrorName } from "node:util";
 
@@ -63,6 +63,142 @@ export async function pinFilesystemObject(target: string): Promise<{ readonly st
 	try { return { stat: await handle.stat({ bigint: true }), close: () => handle.close() }; }
 	catch (error) { await handle.close(); throw error; }
 }
+/** One capture owns one detached read-only root. Cloning changes mount identity, never inode identity. */
+export class FilesystemReadView {
+	private descriptor: number | undefined;
+	private readonly mounts: string;
+	private readonly observed = new Set<string>();
+	private closed = false;
+	private readonly reader: typeof nativeFilesystem;
+	private constructor(descriptor: number | undefined, mounts: string, reader = nativeFilesystem) { this.descriptor = descriptor; this.mounts = mounts; this.reader = reader; }
+	static ambient(): FilesystemReadView { return new FilesystemReadView(undefined, ""); }
+	static async open(): Promise<FilesystemReadView> {
+		const reader = await ensureNativeFilesystem();
+		if (!reader) return FilesystemReadView.ambient();
+		const mounts = await fs.readFile("/proc/self/mountinfo", "utf8");
+		const descriptor = reader(-5, Buffer.alloc(0), fd => adoptFilesystemDescriptor(fd, 0x200000));
+		if (!Number.isInteger(descriptor)) throw new Error("native read-only filesystem view unavailable");
+		if (descriptor < 0) throw filesystemReadError("read-only filesystem view unavailable", descriptor);
+		const view = new FilesystemReadView(descriptor, mounts, reader);
+		try { await view.verify(["/"]); return view; } catch (error) { await view.close(); throw error; }
+	}
+	/** Caller owns the returned raw descriptor. Only use while this view is open. */
+	open(target: string, flags: number): number {
+		if (this.closed || this.descriptor === undefined || !this.reader) throw new Error("read-only filesystem view is closed or unavailable");
+		const absolute = path.isAbsolute(target) ? target : `${process.cwd()}/${target}`;
+		if (absolute.includes("\0")) throw new Error("invalid filesystem pathname");
+		this.observed.add(absolute);
+		const descriptor = openFilesystemDescriptor(this.reader, this.descriptor, absolute, flags);
+		try {
+			this.observed.add(readlinkSync(`/proc/self/fd/${descriptor}`));
+			return descriptor;
+		} catch (error) { closeSync(descriptor); throw error; }
+	}
+	async pin(target: string, follow = false): Promise<FilesystemObjectHandle> {
+		if (this.closed) throw new Error("read-only filesystem view is closed");
+		if (this.descriptor === undefined) return fs.open(target, 0x200000 | (follow ? 0 : constants.O_NOFOLLOW));
+		const descriptor = this.open(target, 0x200000 | (follow ? 0 : constants.O_NOFOLLOW));
+		return filesystemDescriptorHandle(descriptor);
+	}
+	async stat(target: string, follow = false): Promise<BigIntStats> {
+		if (this.closed) throw new Error("read-only filesystem view is closed");
+		if (this.descriptor === undefined) return (follow ? fs.stat : fs.lstat)(target, { bigint: true });
+		const handle = await this.pin(target, follow);
+		try { return await handle.stat({ bigint: true }); } finally { await handle.close(); }
+	}
+	async realpath(target: string): Promise<string> {
+		if (this.closed) throw new Error("read-only filesystem view is closed");
+		if (this.descriptor === undefined) return fs.realpath(target);
+		const handle = await this.pin(target, true);
+		try { return readlinkSync(`/proc/self/fd/${handle.fd}`); } finally { await handle.close(); }
+	}
+	async readlink(target: string): Promise<string> {
+		if (this.closed) throw new Error("read-only filesystem view is closed");
+		if (this.descriptor === undefined) return fs.readlink(target);
+		const handle = await this.pin(target);
+		try {
+			for (let capacity = 4096; capacity <= 512 * 1024; capacity *= 2) {
+				const buffer = Buffer.allocUnsafe(capacity + 4); buffer.writeInt32LE(handle.fd);
+				const count = this.reader!(-7, buffer);
+				if (!Number.isInteger(count) || count > capacity) throw new Error("native read-only filesystem readlink unavailable");
+				if (count < 0) throw filesystemReadError("read-only filesystem readlink failed", count);
+				if (count < capacity) {
+					const bytes = buffer.subarray(4, 4 + count), link = bytes.toString("utf8");
+					if (!Buffer.from(link).equals(bytes)) throw new Error("unrepresentable_symlink_target");
+					return link;
+				}
+			}
+			throw new Error("filesystem symlink target is too large");
+		} finally { await handle.close(); }
+	}
+	async readDirectory(target: string): Promise<FileHandle> {
+		if (this.closed) throw new Error("read-only filesystem view is closed");
+		if (this.descriptor === undefined) return fs.open(target, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOATIME).catch(error => {
+			if (error.code !== "EPERM") throw error;
+			return fs.open(target, constants.O_RDONLY | constants.O_DIRECTORY);
+		});
+		const descriptor = this.open(target, constants.O_RDONLY | constants.O_DIRECTORY);
+		try { return await fs.open(`/proc/self/fd/${descriptor}`, constants.O_RDONLY | constants.O_DIRECTORY); } finally { closeSync(descriptor); }
+	}
+	/** Observe lookup ancestors by default; explicit roots also include mounts below them. */
+	async verify(targets?: Iterable<string>): Promise<void> {
+		if (this.closed) throw new Error("read-only filesystem view is closed");
+		if (this.descriptor === undefined) return;
+		const paths = [...(targets ?? this.observed)].map(target => path.resolve(target));
+		const relevant = (image: string) => image.split("\n").filter(line => {
+			const mount = (line.split(" ")[4] ?? "").replace(/\\([0-7]{3})/g, (_match, octal: string) => String.fromCharCode(Number.parseInt(octal, 8)));
+			return mount && paths.some(target => containsFilesystemPath(mount, target) || targets !== undefined && containsFilesystemPath(target, mount));
+		}).sort().join("\n");
+		if (relevant(this.mounts) !== relevant(await fs.readFile("/proc/self/mountinfo", "utf8"))) throw new Error("filesystem mount topology changed during capture");
+	}
+	async close(): Promise<void> { if (!this.closed) { this.closed = true; if (this.descriptor !== undefined) closeSync(this.descriptor); this.descriptor = undefined; } }
+	[Symbol.asyncDispose](): Promise<void> { return this.close(); }
+}
+
+function filesystemDescriptorHandle(fd: number): FilesystemObjectHandle {
+	let closed = false;
+	return { fd, stat: async () => {
+		if (closed) throw filesystemReadError("filesystem object lease is closed", -9);
+		return fstatSync(fd, { bigint: true });
+	}, close: async () => { if (!closed) { closed = true; closeSync(fd); } } };
+}
+
+function openFilesystemDescriptor(reader: NonNullable<typeof nativeFilesystem>, root: number, target: string, flags: number): number {
+	const request = Buffer.alloc(9 + Buffer.byteLength(target));
+	request.writeInt32LE(root); request.writeUInt32LE(flags, 4); request.write(target, 8);
+	const descriptor = reader(-6, request, fd => adoptFilesystemDescriptor(fd, flags));
+	if (!Number.isInteger(descriptor)) throw new Error("native filesystem open unavailable");
+	if (descriptor < 0) throw filesystemReadError(`filesystem open failed: ${target} (flags=${flags})`, descriptor);
+	return descriptor;
+}
+
+/** Node owns the adopted descriptor, including worker teardown. The native callback closes its
+ * temporary descriptor before returning, including when this callback throws. Reopening a fresh
+ * OFD here loses no read offset, and following the proc magic link keeps an O_PATH link. */
+function adoptFilesystemDescriptor(nativeDescriptor: number, flags: number): number {
+	let descriptor: number | undefined;
+	try {
+		descriptor = openSync(`/proc/self/fd/${nativeDescriptor}`, flags & ~constants.O_NOFOLLOW);
+		if (!sameFilesystemIdentity(fstatSync(nativeDescriptor, { bigint: true }), fstatSync(descriptor, { bigint: true }))) throw new Error("filesystem descriptor adoption changed identity");
+	} catch (error) { if (descriptor !== undefined) { closeSync(descriptor); descriptor = undefined; } throw error; }
+	return descriptor;
+}
+
+function filesystemReadError(message: string, error: number): NodeJS.ErrnoException {
+	const code = getSystemErrorName(error);
+	return Object.assign(new Error(`${message}: ${code}`), { code });
+}
+
+export const openFilesystemReadView = () => FilesystemReadView.open();
+
+/** Reuse a caller's view, or create and verify exactly one view for this capture. */
+export async function withFilesystemReadView<T>(view: FilesystemReadView | undefined, capture: (view: FilesystemReadView) => Promise<T>, discard?: (result: T) => Promise<unknown>): Promise<T> {
+	if (view) return capture(view);
+	await using owned = await openFilesystemReadView();
+	const result = await capture(owned);
+	try { await owned.verify(); return result; } catch (error) { try { await discard?.(result); } finally { throw error; } }
+}
+
 export type CapturedFilesystemTransfer = Omit<StableFilesystemCapture, "stat" | "object" | "content" | "computation"> & {
 	readonly fd: number; readonly active: SharedArrayBuffer; readonly stat: FilesystemIdentity; readonly content?: Uint8Array; readonly computation?: SerializedTimelineComputation;
 };
@@ -191,11 +327,12 @@ export async function hashExecutableFile(target: string, signal?: AbortSignal): 
 }
 
 /** A dependency's content digest: an unchanged file validates by its identity (a runtime's image and libraries on every reuse). */
-export async function captureFileDigest(target: string, maxBytes = Number.POSITIVE_INFINITY, signal?: AbortSignal, verifyPath = true): Promise<StableFilesystemCapture> {
+export async function captureFileDigest(target: string, maxBytes = Number.POSITIVE_INFINITY, signal?: AbortSignal, verifyPath = true, view?: FilesystemReadView): Promise<StableFilesystemCapture> {
+	view ??= FilesystemReadView.ambient();
 	signal?.throwIfAborted();
-	const stat = await (verifyPath ? fs.lstat : fs.stat)(target, { bigint: true }), cached = Number(stat.size) <= maxBytes ? cachedCapture(stat, target) : undefined;
+	const stat = await view.stat(target, !verifyPath), cached = Number(stat.size) <= maxBytes ? cachedCapture(stat, target) : undefined;
 	signal?.throwIfAborted(); if (cached) return cached;
-	return captureStableFile(target, maxBytes, false, { verifyPath }, signal);
+	return captureStableFile(target, maxBytes, false, { verifyPath, view }, signal);
 }
 
 function directoryImage(content: Buffer) {
@@ -215,12 +352,10 @@ function directoryImage(content: Buffer) {
 }
 
 /** Observe a directory through an independent OFD without advancing owned input access times. */
-export async function readFilesystemDirectory(target: string): Promise<(FilesystemTypeEvidence & { readonly name: string })[]> {
+export async function readFilesystemDirectory(target: string, view?: FilesystemReadView): Promise<(FilesystemTypeEvidence & { readonly name: string })[]> {
 	if (!nativeFilesystem) return fs.readdir(target, { withFileTypes: true });
-	const handle = await fs.open(target, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOATIME).catch(error => {
-		if (error.code !== "EPERM") throw error;
-		return fs.open(target, constants.O_RDONLY | constants.O_DIRECTORY);
-	});
+	view ??= FilesystemReadView.ambient();
+	const handle = await view.readDirectory(target);
 	try {
 		const entries: ReturnType<typeof directoryImage> = [], buffer = Buffer.allocUnsafe(32 * 1024);
 		for (;;) {
@@ -228,32 +363,34 @@ export async function readFilesystemDirectory(target: string): Promise<(Filesyst
 			if (count < 0) throw Object.assign(new Error("directory read failed"), { code: getSystemErrorName(count) });
 			if (!count) return entries.sort((a, b) => Buffer.compare(Buffer.from(a.name), Buffer.from(b.name)));
 			entries.push(...await mapFilesystem(directoryImage(buffer.subarray(0, count)), async entry =>
-				filesystemEntryType(entry) === "other" ? Object.assign(await fs.lstat(path.join(target, entry.name)), { name: entry.name }) : entry));
+				filesystemEntryType(entry) === "other" ? Object.assign(await view.stat(path.join(target, entry.name)), { name: entry.name }) : entry));
 		}
 	} finally { await handle.close(); }
 }
 
 /** Import the helper's complete getdents64 image without enumerating the directory again. */
-export async function captureHeldDirectory(pid: number, fd: number, content: Buffer, stat: BigIntStats, realPath: string): Promise<StableFilesystemCapture> {
+export async function captureHeldDirectory(pid: number, fd: number, content: Buffer, stat: BigIntStats, realPath: string, view?: FilesystemReadView): Promise<StableFilesystemCapture> {
+	view ??= FilesystemReadView.ambient();
 	const startedAt = performance.now(), entries = directoryImage(content).map(entry => entry.name);
 	if (new Set(entries).size !== entries.length || !stat.isDirectory()) throw new Error("invalid_directory_image");
 	const handle = await fs.open(`/proc/${pid}/fd/${fd}`, 0x200000);
 	try {
 		if (!sameFilesystemIdentity(stat, await handle.stat({ bigint: true })) ||
-			!sameFilesystemIdentity(stat, await fs.stat(realPath, { bigint: true }))) throw new Error("directory_changed_during_capture");
+			!sameFilesystemIdentity(stat, await view.stat(realPath, true))) throw new Error("directory_changed_during_capture");
 		const capture = { content, entries, stat, realPath, bytesRead: content.length, hash: createHash("sha256").update(content).digest("hex"), computation: TimelineInterval.own(new TimelineInterval(startedAt, performance.now())) };
 		return { ...capture, object: new CapturedFilesystemObject(handle, capture) };
 	} catch (error) { await handle.close(); throw error; }
 }
 
 /** Open an independent reader on one regular inode without changing owned inputs' access times. */
-export async function openFilesystemFile(target: string, verifyPath = true) {
+export async function openFilesystemFile(target: string, verifyPath = true, view?: FilesystemReadView): Promise<{ handle: FileHandle; binding: FilesystemObjectHandle | undefined; stat: BigIntStats }> {
+	view ??= FilesystemReadView.ambient();
 	// O_PATH pins even executable aliases without admitting I/O on a raced-in FIFO or device.
 	const binding = process.platform === "linux" && (process.arch === "x64" || process.arch === "arm64")
-		? await fs.open(target, 0x200000 | (verifyPath ? constants.O_NOFOLLOW : 0)) : undefined;
+		? await view.pin(target, !verifyPath) : undefined;
 	let handle: FileHandle | undefined;
 	try {
-		const before = binding ? await binding.stat({ bigint: true }) : await (verifyPath ? fs.lstat : fs.stat)(target, { bigint: true });
+		const before = binding ? await binding.stat({ bigint: true }) : await view.stat(target, !verifyPath);
 		if (!before.isFile()) throw new Error("not_regular_file");
 		handle = await fs.open(binding ? `/proc/self/fd/${binding.fd}` : target,
 			constants.O_RDONLY | (binding || !verifyPath ? 0 : constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0)
@@ -265,15 +402,16 @@ export async function openFilesystemFile(target: string, verifyPath = true) {
 
 /** Pin and hash one file, verifying its final identity before cache publication or transfer. */
 export async function captureStableFile(target: string, maxBytes = Number.POSITIVE_INFINITY, retainContent = false,
-	observed?: Partial<Pick<StableFilesystemCapture, "stat" | "realPath">> & { readonly retainObject?: boolean; readonly gitBlob?: boolean; readonly digest?: false; readonly verifyPath?: boolean },
+	observed?: Partial<Pick<StableFilesystemCapture, "stat" | "realPath">> & { readonly retainObject?: boolean; readonly gitBlob?: boolean; readonly digest?: false; readonly verifyPath?: boolean; readonly view?: FilesystemReadView },
 	signal?: AbortSignal): Promise<StableFilesystemCapture> {
+	const view = observed?.view ?? FilesystemReadView.ambient();
 	signal?.throwIfAborted(); const startedAt = performance.now(), takenAtMs = Date.now(), verifyPath = observed?.verifyPath !== false;
-	let { handle, binding, stat: before } = await openFilesystemFile(target, verifyPath);
+	let { handle, binding, stat: before } = await openFilesystemFile(target, verifyPath, view);
 	try {
 		if (binding && ((before.dev >> 8n & 0xfffn) | (before.dev >> 32n & ~0xfffn)) && !kernelTicks.has(before.dev)) // A major number: not a reusable anonymous one.
 			kernelTicks.set(before.dev, KERNEL_TICK_FILESYSTEMS.has((await fs.statfs(`/proc/self/fd/${binding.fd}`)).type));
 		if (observed?.stat && !sameFilesystemIdentity(observed.stat, before)) throw new Error("file_changed_during_capture");
-		const beforePath = verifyPath ? observed?.realPath ?? await fs.realpath(target) : target;
+		const beforePath = verifyPath ? observed?.realPath ?? await view.realpath(target) : target;
 		if (Number.isFinite(maxBytes) && before.size > BigInt(Math.floor(maxBytes))) throw new Error(`file_too_large:${before.size}`);
 		// Another pending read may precede a same-tick rewrite; read under this identity.
 		const hash = observed?.digest !== false ? createHash("sha256") : undefined, blob = observed?.gitBlob ? createHash("sha1").update(`blob ${before.size}\0`) : undefined;
@@ -294,7 +432,7 @@ export async function captureStableFile(target: string, maxBytes = Number.POSITI
 		signal?.throwIfAborted();
 		if (bytesRead !== Number(before.size) || !sameFilesystemIdentity(before, after)) throw new Error("file_changed_during_capture");
 		if (verifyPath) {
-			const [afterPath, pathStat] = await Promise.all([fs.realpath(target), fs.lstat(target, { bigint: true })]);
+			const [afterPath, pathStat] = await Promise.all([view.realpath(target), view.stat(target)]);
 			if (beforePath !== afterPath || !sameFilesystemIdentity(after, pathStat)) throw new Error("file_changed_during_capture");
 		}
 		const result = { hash: hash?.digest("hex") ?? "", bytesRead, stat: after, ...(content ? { content } : {}), ...(blob ? { blob: blob.digest("hex") } : {}),
@@ -311,33 +449,39 @@ export async function captureStableFile(target: string, maxBytes = Number.POSITI
 }
 
 /** Own a directory listing or link target together with its stable entry identity. */
-export async function captureFilesystemEntry(target: string, read?: "directory" | "identity") {
+export async function captureFilesystemEntry(target: string, read?: "directory" | "identity", view?: FilesystemReadView): Promise<{
+	info: BigIntStats; link: string | undefined; entries: Awaited<ReturnType<typeof readFilesystemDirectory>> | undefined; computation: TimelineInterval;
+}> {
+	view ??= FilesystemReadView.ambient();
 	const startedAt = performance.now();
-	const before = await fs.lstat(target, { bigint: true });
-	const link = before.isSymbolicLink() ? await fs.readlink(target) : undefined;
-	const entries = read === "directory" && before.isDirectory() ? await readFilesystemDirectory(target) : undefined;
-	const info = link !== undefined || read !== undefined ? await fs.lstat(target, { bigint: true }) : before;
+	const before = await view.stat(target);
+	const link = before.isSymbolicLink() ? await view.readlink(target) : undefined;
+	const entries = read === "directory" && before.isDirectory() ? await readFilesystemDirectory(target, view) : undefined;
+	const info = link !== undefined || read !== undefined ? await view.stat(target) : before;
 	if (!sameFilesystemIdentity(before, info)) throw new Error(`${link !== undefined ? "symlink" : "directory"}_changed_during_capture`);
 	return { info, link, entries, computation: TimelineInterval.own(new TimelineInterval(startedAt, performance.now())) };
 }
 
 /** Resolve link targets component by component, retaining each stable namespace observation. */
-export async function* walkFilesystemPath(target: string, options: { readonly start?: string; readonly followFinal?: boolean; readonly capture?: typeof captureFilesystemEntry } = {}) {
+export async function* walkFilesystemPath(target: string, options: { readonly start?: string; readonly followFinal?: boolean; readonly capture?: typeof captureFilesystemEntry; readonly view?: FilesystemReadView } = {}) {
+	await using owned = options.view ? undefined : FilesystemReadView.ambient();
+	const view = options.view ?? owned!;
 	const start = options.start ?? path.parse(target).root;
 	let current = start, links = 0;
 	const pending = target.slice(start.length).split(path.sep).filter(Boolean);
 	for (;;) {
 		let captured: Awaited<ReturnType<typeof captureFilesystemEntry>> | undefined;
-		try { captured = await (options.capture ?? captureFilesystemEntry)(current); }
+		try { captured = await (options.capture ?? captureFilesystemEntry)(current, undefined, view); }
 		catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
 		const { info, link } = captured ?? {}, terminal = pending.length === 0 && (link === undefined || options.followFinal === false);
 		if (links && (!info || terminal)) {
 			// Magic links name kernel handles; their displayed pathname need not identify that object.
-			const actual = await (options.followFinal === false ? fs.lstat : fs.stat)(target, { bigint: true }).catch((error: NodeJS.ErrnoException) => {
+			const actual = await view.stat(target, options.followFinal !== false).catch((error: NodeJS.ErrnoException) => {
 				if (error.code !== "ENOENT") throw error;
 			});
 			if (info ? !actual || !sameFilesystemIdentity(info, actual) : actual) throw new Error("filesystem_link_resolution_changed");
 		}
+		await view.verify();
 		yield { path: current, info, link, terminal };
 		if (!info || terminal) return;
 		if (link !== undefined) {

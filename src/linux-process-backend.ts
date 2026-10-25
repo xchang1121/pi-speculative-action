@@ -3,7 +3,7 @@ import { captureProcessContext, processLaunchOptions, routedProcessIdentity, val
 import { spawn } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomBytes } from "node:crypto";
-import { nativeProcessLibrary } from "./process-startup.mjs";
+import { configureNativeFilesystem, nativeProcessLibrary } from "./process-startup.mjs";
 import { on, once } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
 import { constants as fsConstants, readFileSync, type BigIntStats } from "node:fs";
@@ -243,6 +243,7 @@ export class LinuxProcessReuseBackend {
 	constructor(options: LinuxProcessBackendOptions) {
 		this.options = { sandlockBinary: process.env.PI_SPEC_SANDLOCK, straceBinary: process.env.PI_SPEC_STRACE,
 			heldExecBinary: process.env.PI_SPEC_HELD_EXEC, heldExecObserverBinary: process.env.PI_SPEC_HELD_EXEC_OBSERVER, ...options };
+		configureNativeFilesystem(this.options.heldExecBinary);
 		this.store = new ProvenanceCertificateStore(options.storeRoot, { ...options.store, acceptedTaints: SAME_CONFINEMENT_TAINTS });
 		this.planner = new ProcessReusePlanner({ store: this.store });
 		this.handoffs = new ProcessHandoffRegistry(this.store, Math.min(MAX_CONTINUATION_BYTES, this.store.limits.maxBytes));

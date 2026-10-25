@@ -5,11 +5,9 @@ import { on, once } from "node:events";
 import { AsyncLocalStorage, AsyncResource } from "node:async_hooks";
 import { createRequire } from "node:module";
 import { randomBytes } from "node:crypto";
-import { constants as fsConstants } from "node:fs";
-import { access, chmod, mkdir, open, readFile, readdir, readlink, realpath, rm, stat } from "node:fs/promises";
+import { chmod, mkdir, open, readFile, readdir, readlink, rm, stat } from "node:fs/promises";
 import { captureProcessContext, processLaunchOptions, validProcessContext, type ProcessExecutionContext, type ProcessLaunchOptions } from "./process-context.mjs";
 import net from "node:net";
-import os from "node:os";
 import path from "node:path";
 import { effectCommitFailure, isPoisonedEffectCommit } from "./effect-transaction.ts";
 import { captureHeldDirectory, captureStableFile, sameFilesystemIdentity } from "./filesystem-evidence.ts";
@@ -21,7 +19,8 @@ import {
 import { containsFilesystemPath } from "./path-utils.ts";
 import { snapshotExecutionScope, type ExecutionScope } from "./execution-world.ts";
 import { captureWorkspaceFileAliases } from "./process-observation.ts";
-import { qualifyNativeStartup } from "./process-startup.mjs";
+import { qualifyNativeStartup, resolveLinuxExecHelper } from "./process-startup.mjs";
+export { resolveLinuxExecHelper } from "./process-startup.mjs";
 
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024 + 32768;
 const MAX_OUTPUT_EVENTS = 65_536;
@@ -543,14 +542,6 @@ async function observeCompletion(socket: net.Socket,
 		socket.end();
 	}
 	return clock;
-}
-
-/** Resolve the native helper shared by transparent dispatch and x86-64 Actor handoff. */
-export async function resolveLinuxExecHelper(binary?: string): Promise<string> {
-	if (process.platform !== "linux") throw new Error("Linux required");
-	const resolved = await realpath(binary ?? path.join(os.homedir(), ".local", "bin", "pi-speculative-held-exec"));
-	await access(resolved, fsConstants.X_OK);
-	return resolved;
 }
 
 /** Inspect the installed, stopped image; stdio mode leaves extra descriptors to the broker capture. */

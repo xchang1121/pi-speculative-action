@@ -18,6 +18,9 @@
 #include <linux/audit.h>
 #include <linux/kcmp.h>
 #include <linux/magic.h>
+#include <linux/mount.h>
+#include <linux/openat2.h>
+#include <sys/mount.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 #include <linux/sock_diag.h>
@@ -60,6 +63,8 @@ extern int napi_get_value_int32(napi_env, napi_value, int32_t *) __attribute__((
 extern int napi_get_buffer_info(napi_env, napi_value, void **, size_t *) __attribute__((weak));
 extern int napi_create_int32(napi_env, int32_t, napi_value *) __attribute__((weak));
 extern int napi_create_function(napi_env, const char *, size_t, napi_callback, void *, napi_value *) __attribute__((weak));
+extern int napi_get_undefined(napi_env, napi_value *) __attribute__((weak));
+extern int napi_call_function(napi_env, napi_value, napi_value, size_t, const napi_value *, napi_value *) __attribute__((weak));
 static __thread int startup_gate[2] = {-1, -1};
 static __thread pid_t startup_observer;
 static pthread_once_t startup_registration = PTHREAD_ONCE_INIT;
@@ -84,13 +89,74 @@ static void startup_child(void) {
 
 static void register_startup(void) { startup_registered = pthread_atfork(NULL, NULL, startup_child) == 0; }
 
+/* One detached read-only mount tree per capture. The raw child never enters
+ * libc's atfork launch gate and uses no allocator, stdio, or inherited locks. */
+static int readonly_root(void) {
+	int channel[2], descriptor = -1, error = 0, status = 0;
+	char uid[48], gid[48];
+	int uid_length = snprintf(uid, sizeof(uid), "0 %u 1\n", getuid()), gid_length = snprintf(gid, sizeof(gid), "0 %u 1\n", getgid());
+	if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, channel)) return -1;
+	pid_t parent = getpid(), child = syscall(SYS_clone, SIGCHLD, 0, NULL, NULL, 0);
+	if (child == 0) {
+		close(channel[0]);
+		if (syscall(SYS_prctl, PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0) || getppid() != parent ||
+			syscall(SYS_unshare, CLONE_NEWUSER | CLONE_NEWNS)) { error = errno ? errno : ECHILD; goto publish; }
+		const char *names[] = {"/proc/self/uid_map", "/proc/self/setgroups", "/proc/self/gid_map"};
+		const char *values[] = {uid, "deny", gid};
+		int lengths[] = {uid_length, 4, gid_length};
+		for (unsigned i = 0; i < 3; i++) {
+			int fd = syscall(SYS_openat, AT_FDCWD, names[i], O_WRONLY | O_CLOEXEC, 0);
+			if (fd < 0) { if (i == 1 && errno == ENOENT) continue; error = errno; goto publish; }
+			ssize_t count = syscall(SYS_write, fd, values[i], lengths[i]); error = count == lengths[i] ? 0 : errno ? errno : EIO;
+			close(fd); if (error) goto publish;
+		}
+		if (syscall(SYS_mount, NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)) { error = errno; goto publish; }
+		descriptor = syscall(SYS_open_tree, AT_FDCWD, "/", OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC | AT_RECURSIVE);
+		if (descriptor < 0) { error = errno; goto publish; }
+		struct mount_attr attributes = {.attr_set = MOUNT_ATTR_RDONLY};
+		if (syscall(SYS_mount_setattr, descriptor, "", AT_EMPTY_PATH | AT_RECURSIVE, &attributes, sizeof(attributes))) error = errno;
+	publish:;
+		char control[CMSG_SPACE(sizeof(descriptor))] = {0};
+		struct iovec data = {.iov_base = &error, .iov_len = sizeof(error)};
+		struct msghdr message = {.msg_iov = &data, .msg_iovlen = 1};
+		if (!error) {
+			message.msg_control = control; message.msg_controllen = sizeof(control);
+			struct cmsghdr *header = CMSG_FIRSTHDR(&message);
+			header->cmsg_level = SOL_SOCKET; header->cmsg_type = SCM_RIGHTS; header->cmsg_len = CMSG_LEN(sizeof(descriptor));
+			*(int *)CMSG_DATA(header) = descriptor;
+		}
+		(void)syscall(SYS_sendmsg, channel[1], &message, MSG_NOSIGNAL);
+		syscall(SYS_exit_group, 0); __builtin_unreachable();
+	}
+	if (child < 0) error = errno;
+	close(channel[1]);
+	if (child < 0) { close(channel[0]); errno = error; return -1; }
+	char control[CMSG_SPACE(sizeof(descriptor))] = {0};
+	struct iovec data = {.iov_base = &error, .iov_len = sizeof(error)};
+	struct msghdr message = {.msg_iov = &data, .msg_iovlen = 1, .msg_control = control, .msg_controllen = sizeof(control)};
+	ssize_t count; do { count = recvmsg(channel[0], &message, MSG_CMSG_CLOEXEC); } while (count < 0 && errno == EINTR);
+	if (count != sizeof(error) || message.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) error = EIO;
+	struct cmsghdr *header = CMSG_FIRSTHDR(&message);
+	if (header && header->cmsg_level == SOL_SOCKET && header->cmsg_type == SCM_RIGHTS && header->cmsg_len == CMSG_LEN(sizeof(descriptor)))
+		descriptor = *(int *)CMSG_DATA(header);
+	close(channel[0]);
+	pid_t reaped; do { reaped = waitpid(child, &status, 0); } while (reaped < 0 && errno == EINTR);
+	if (reaped != child || !WIFEXITED(status) || WEXITSTATUS(status) || descriptor < 0) error = error ? error : EIO;
+	if (error) { if (descriptor >= 0) close(descriptor); errno = error; return -1; }
+	struct statfs filesystem;
+	if (fstatfs(descriptor, &filesystem)) error = errno;
+	else if (filesystem.f_type != EXT4_SUPER_MAGIC) error = EXDEV;
+	if (error) { close(descriptor); errno = error; return -1; }
+	return descriptor;
+}
+
 /* Open a gate (0), bind its observer PID (>0), or release the parent ends (-1).
  * Thread-local state cannot lend one worker's launch to another callback. */
 static napi_value startup_bridge(napi_env env, napi_callback_info info) {
-	size_t count = 2; napi_value arguments[2], result; int32_t operation, value = -1;
+	size_t count = 3; napi_value arguments[3], result; int32_t operation, value = -1;
 	if (napi_get_cb_info(env, info, &count, arguments, NULL, NULL) || !count ||
 		napi_get_value_int32(env, arguments[0], &operation)) return NULL;
-	if (count == 2) {
+	if (count >= 2) {
 		void *bytes; size_t length;
 		if (napi_get_buffer_info(env, arguments[1], &bytes, &length) || length > 1024 * 1024) return NULL;
 		if (operation == -3) {
@@ -102,11 +168,42 @@ static napi_value startup_bridge(napi_env env, napi_callback_info info) {
 			if (times[1].tv_nsec < 0 || times[1].tv_nsec > 999999999) return NULL;
 			value = utimensat(AT_FDCWD, (char *)bytes + sizeof(fields), times, AT_SYMLINK_NOFOLLOW);
 			if (value < 0 && errno == ENOENT) value = 0;
+		} else if (operation == -5) {
+			if (length) return NULL;
+			value = readonly_root();
+		} else if (operation == -6) {
+			/* Root fd and open flags, followed by one terminated absolute path. */
+			uint32_t fields[2];
+			if (length < 10 || strnlen((char *)bytes + 8, length - 8) != length - 9) return NULL;
+			memcpy(fields, bytes, sizeof(fields));
+			if (le32toh(fields[1]) & ~(O_PATH | O_NOFOLLOW | O_DIRECTORY | O_NONBLOCK | O_NOATIME | O_CLOEXEC)) { errno = EINVAL; value = -1; }
+			else {
+				struct open_how how = {.flags = le32toh(fields[1]) | O_CLOEXEC,
+					.resolve = RESOLVE_IN_ROOT | RESOLVE_NO_XDEV};
+				value = syscall(SYS_openat2, (int32_t)le32toh(fields[0]), (char *)bytes + 8, &how, sizeof(how));
+			}
+		} else if (operation == -7) {
+			uint32_t fd; if (length < 5) return NULL; memcpy(&fd, bytes, sizeof(fd));
+			struct stat entry;
+			if (fstat((int32_t)le32toh(fd), &entry)) value = -1;
+			else if (!S_ISLNK(entry.st_mode)) { errno = EINVAL; value = -1; }
+			else value = syscall(SYS_readlinkat, (int32_t)le32toh(fd), "", (char *)bytes + 4, length - 4);
+
 		} else {
 			if (length < 24) return NULL;
 			value = syscall(SYS_getdents64, operation, bytes, length);
 		}
+		if (value >= 0 && (operation == -5 || operation == -6)) {
+			/* Native ownership never crosses this synchronous call. Node tracks the adopted
+			 * duplicate even if its worker terminates while the JavaScript callback runs. */
+			napi_value fd, receiver;
+			int failed = count != 3 || napi_create_int32(env, value, &fd) || napi_get_undefined(env, &receiver) ||
+				napi_call_function(env, receiver, arguments[2], 1, &fd, &result);
+			close(value); return failed ? NULL : result;
+		}
 		if (value < 0) value = -errno;
+	} else if (operation == -11) {
+		value = 2; /* Filesystem ABI: synchronous adoption, ext4 read-only root, no mount crossings. */
 	} else if (!operation && startup_gate[0] < 0) {
 		if (!socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, startup_gate)) value = startup_gate[1];
 	} else if (operation > 0 && startup_gate[0] >= 0 && !startup_observer) {
@@ -121,7 +218,7 @@ static napi_value startup_bridge(napi_env env, napi_callback_info info) {
 
 napi_value napi_register_module_v1(napi_env env, napi_value exports) {
 	(void)exports; napi_value result;
-	if (!napi_create_function || !napi_get_cb_info || !napi_get_value_int32 || !napi_create_int32 || !napi_get_buffer_info ||
+	if (!napi_create_function || !napi_get_cb_info || !napi_get_value_int32 || !napi_create_int32 || !napi_get_buffer_info || !napi_get_undefined || !napi_call_function ||
 		pthread_once(&startup_registration, register_startup) || !startup_registered) return NULL;
 	return napi_create_function(env, "startup", (size_t)-1, startup_bridge, NULL, &result) ? NULL : result;
 }
