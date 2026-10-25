@@ -32,7 +32,7 @@ import { patternAwareSettings } from "../src/pattern-aware.ts";
 import type { SpeculativeActionEvent } from "../src/events.ts";
 import { TaskTimeline, TimelineInterval, type TimelineDependency } from "../src/task-timing.ts";
 import { ResourceObjectInputs } from "../src/agent-execution-world.ts";
-import { captureStableFile } from "../src/filesystem-evidence.ts";
+import { captureStableFile, FILESYSTEM_METADATA_FIELDS } from "../src/filesystem-evidence.ts";
 import { ResourceReadView } from "../src/resource-version.ts";
 import {
 	compileBenchmarkHelper, cHeaders, processTest as test, executeProcess, holdOwnedProcessPublication, patternProcessHost,
@@ -1697,6 +1697,13 @@ int main(int argc, char **argv) {
 			});
 			restorePreparation = async () => { fault.mockRestore(); };
 		}
+		const sourceMetadata = async () => Promise.all(["", "fd.txt", "fd-alias.txt"].map(async name => {
+			const entry = await filesystem.lstat(path.join(fixture.workspace, name), { bigint: true });
+			return Object.fromEntries(FILESYSTEM_METADATA_FIELDS.map(field => [field, String(entry[field])]));
+		}));
+		// Input-graph capture must preserve its source objects before the Actor uses them.
+		if (enumerate) await filesystem.utimes(fixture.workspace, 1, (await filesystem.stat(fixture.workspace)).mtime);
+		const sourceBeforePreparation = enumerate ? await sourceMetadata() : undefined;
 		await start("prepared");
 		if (mode === "completed") {
 			await host.previewActorCall(call("prepared", command));
@@ -1719,6 +1726,7 @@ int main(int argc, char **argv) {
 			expect((await publications()).slice(publicationStart).some(certificate => certificate.weakKey !== binding!.key &&
 				certificate.prototype.inheritedFDs.some(fd => fd.resourceAliases?.includes(path.join(fixture.workspace, "fd-alias.txt"))))).toBe(true);
 		}
+		if (enumerate) expect(await sourceMetadata()).toEqual(sourceBeforePreparation);
 		const changedParent = command.replace("parent", "automatic-parent");
 		if (running) {
 			expect((await executeProcess(fixture, route.executor, changedParent, { scope: { ...scope, turnID: "foreign" } })).output).toBe("automatic-parent\nnewest\n");

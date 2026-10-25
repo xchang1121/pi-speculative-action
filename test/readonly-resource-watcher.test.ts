@@ -237,6 +237,20 @@ linux("captures, consumes and revalidates resource inputs without changing sourc
     await expect(filesystem.pin(cycle, true)).rejects.toMatchObject({ code: "ELOOP" });
     await expect(filesystem.pin(path.join(file, "child"), true)).rejects.toMatchObject({ code: "ENOTDIR" });
     await expect(filesystem.readlink(nonUtf8)).rejects.toThrow("unrepresentable_symlink_target");
+    const image = await filesystemEvidence.readFilesystemDirectoryImage(directory, 4096, undefined, filesystem);
+    expect(await filesystemEvidence.readFilesystemDirectoryImage(directory, image.length)).toEqual(image);
+    const entries: string[] = []; let cookie = 0n;
+    for (let offset = 0; offset < image.length;) {
+      const end = offset + image.readUInt16LE(offset + 16), zero = image.indexOf(0, offset + 19), next = image.readBigInt64LE(offset + 8);
+      expect(next > cookie).toBe(true); cookie = next;
+      expect(image.subarray(zero + 1, end).every(byte => byte === 0)).toBe(true);
+      const name = image.toString("utf8", offset + 19, zero);
+      if (name === "input") expect(image.readBigUInt64LE(offset)).toBe((await lstat(file, { bigint: true })).ino);
+      entries.push(name); offset = end;
+    }
+    expect(entries.sort()).toEqual([".", "..", "input"]);
+    await expect(filesystemEvidence.readFilesystemDirectoryImage(directory, image.length - 1)).rejects.toThrow("capture budget");
+    await expect(filesystemEvidence.readFilesystemDirectoryImage(directory, 4096, AbortSignal.abort(new Error("cancelled")))).rejects.toThrow("cancelled");
     expect(await metadata(paths)).toEqual(before);
     await rename(file, path.join(directory, "old")); await writeFile(file, "replacement\n");
     expect((await inputs.readFile(relative)).toString()).toBe("source\n");

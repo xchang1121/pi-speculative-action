@@ -371,7 +371,7 @@ export async function captureFileDigest(target: string, maxBytes = Number.POSITI
 	return captureStableFile(target, maxBytes, false, { verifyPath, view }, signal);
 }
 
-function directoryImage(content: Buffer) {
+function directoryImage(content: Buffer, cursor?: { cookie: bigint }) {
 	const entries: (FilesystemTypeEvidence & { readonly name: string })[] = [];
 	for (let offset = 0; offset < content.length;) {
 		if (content.length - offset < 24) throw new Error("invalid_directory_image");
@@ -379,6 +379,11 @@ function directoryImage(content: Buffer) {
 		if (length < 24 || length % 8 || end > content.length || zero < offset + 20 || zero >= end) throw new Error("invalid_directory_image");
 		const name = content.subarray(offset + 19, zero), decoded = name.toString("utf8");
 		if (decoded.includes("/") || !Buffer.from(decoded).equals(name)) throw new Error("unrepresentable_directory_name");
+		if (cursor) {
+			const cookie = content.readBigInt64LE(offset + 8);
+			if (cookie <= cursor.cookie) throw new Error("invalid_directory_image");
+			cursor.cookie = cookie; content.fill(0, zero + 1, end);
+		}
 		const type = content[offset + 18];
 		if (decoded !== "." && decoded !== "..") entries.push({ name: decoded,
 			...Object.fromEntries(FILESYSTEM_TYPES.map(([, check, code]) => [check, () => code === type])) } as typeof entries[number]);
@@ -393,15 +398,48 @@ export async function readFilesystemDirectory(target: string, view?: FilesystemR
 	view ??= FilesystemReadView.ambient();
 	const handle = await view.readDirectory(target);
 	try {
-		const entries: ReturnType<typeof directoryImage> = [], buffer = Buffer.allocUnsafe(32 * 1024);
-		for (;;) {
-			const count = nativeFilesystem(handle.fd, buffer);
-			if (count < 0) throw Object.assign(new Error("directory read failed"), { code: getSystemErrorName(count) });
-			if (!count) return entries.sort((a, b) => Buffer.compare(Buffer.from(a.name), Buffer.from(b.name)));
-			entries.push(...await mapFilesystem(directoryImage(buffer.subarray(0, count)), async entry =>
-				filesystemEntryType(entry) === "other" ? Object.assign(await view.stat(path.join(target, entry.name)), { name: entry.name }) : entry));
-		}
+		const entries: ReturnType<typeof directoryImage> = [];
+		for await (const content of readDirectoryChunks(handle)) entries.push(...await mapFilesystem(directoryImage(content), async entry =>
+			filesystemEntryType(entry) === "other" ? Object.assign(await view.stat(path.join(target, entry.name)), { name: entry.name }) : entry));
+		return entries.sort((a, b) => Buffer.compare(Buffer.from(a.name), Buffer.from(b.name)));
 	} finally { await handle.close(); }
+}
+
+/** The yielded buffer is borrowed until the next read; callers retain only admitted bytes. */
+async function* readDirectoryChunks(handle: FileHandle, maxBytes = Infinity, signal?: AbortSignal) {
+	const buffer = Buffer.allocUnsafe(32 * 1024); let used = 0;
+	for (;;) {
+		signal?.throwIfAborted();
+		const count = nativeFilesystem!(handle.fd, buffer);
+		if (!Number.isInteger(count) || count > buffer.length) throw new Error("invalid_directory_read");
+		if (count < 0) throw filesystemReadError("directory read failed", count);
+		if (!count) return;
+		used += count; if (used > maxBytes) throw new Error("directory image exceeds capture budget");
+		yield buffer.subarray(0, count);
+	}
+}
+
+/** Preserve the source filesystem's raw cookies and inode numbers using an independent read-only OFD. */
+export async function readFilesystemDirectoryImage(target: string, maxBytes: number, signal?: AbortSignal, view?: FilesystemReadView): Promise<Buffer> {
+	signal?.throwIfAborted();
+	if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new Error("invalid directory capture budget");
+	return withFilesystemReadView(view, async source => {
+		if (!nativeFilesystem) throw new Error("native directory image unavailable");
+		const handle = await source.readDirectory(target);
+		try {
+			const before = await handle.stat({ bigint: true }), chunks: Buffer[] = [], names = new Set<string>(), cursor = { cookie: 0n };
+			for await (const content of readDirectoryChunks(handle, maxBytes, signal)) {
+				for (const entry of directoryImage(content, cursor)) {
+					if (names.has(entry.name)) throw new Error("invalid_directory_image");
+					names.add(entry.name);
+				}
+				chunks.push(Buffer.from(content));
+			}
+			if (!sameFilesystemIdentity(before, await handle.stat({ bigint: true })) ||
+				!sameFilesystemIdentity(before, await source.stat(target, true))) throw new Error("directory_changed_during_capture");
+			return Buffer.concat(chunks);
+		} finally { await handle.close(); }
+	});
 }
 
 /** Import the helper's complete getdents64 image without enumerating the directory again. */

@@ -27,7 +27,7 @@ import {
 import { digestObject, sha256Digest, type Sha256Digest } from "./stable-value-hash.ts";
 import {
 	filesystemMetadataDigest, filesystemObservationDigest, FILESYSTEM_METADATA_FIELDS, assertNoSymlinkPath, cachedCapture, captureFileDigest, captureFilesystemEntry, captureStableFile,
-	hashExecutableFile, mapFilesystem, withFilesystemReadView, FilesystemReadView, rememberCapture, sameFilesystemIdentity, sharedWalk, walkFilesystemPath, type StableFilesystemCapture,
+	hashExecutableFile, mapFilesystem, readFilesystemDirectoryImage, withFilesystemReadView, FilesystemReadView, rememberCapture, sameFilesystemIdentity, sharedWalk, walkFilesystemPath, type StableFilesystemCapture,
 } from "./filesystem-evidence.ts";
 import {
 	captureAbsenceDependency, captureDirectoryDependency, captureFileDependency, observeProcessInputs, validateDynamicDependencyCertificate,
@@ -39,7 +39,7 @@ import {
 import { definedProcessEnvironment, type ProcessRouteSnapshot, type ProcessExecutionRequest,
 	type ProcessExecutor } from "./process-execution.ts";
 import { EffectCommitFailure, effectCommitFailure, isPoisonedEffectCommit } from "./effect-transaction.ts";
-import { execHostFile, execHostText as execText, resolveHostExecutable } from "./executable-path.ts";
+import { execHostText as execText, resolveHostExecutable } from "./executable-path.ts";
 import {
 	captureHeldDescriptorInputs, inspectHeldExecProcess, LinuxHeldExecBoundary, listenUnixSocket, writeProcessChannel, resolveLinuxExecHelper,
 	type HeldExecDecision, type HeldExecProcess, type HeldExecSnapshot, type HeldExecTiming, type HeldExecClock, type HeldFileDescriptor,
@@ -1542,7 +1542,7 @@ export class LinuxProcessReuseBackend {
 		let request = { ...invocation, cwd }, prototype = await this.prototype(projection, request, executable);
 		if (processWeakKey(prototype) !== binding.key) throw new Error("bound process execution context changed");
 		if (invocation.resources && reopensProcessInputs(invocation)) {
-			request = { ...request, resources: await reopenProcessResources(invocation.resources, projection, (await this.resolveReady()).dispatcher,
+			request = { ...request, resources: await reopenProcessResources(invocation.resources, projection,
 				Math.min(MAX_REQUEST_BYTES / 2, this.store.limits.maxBytes), signal) };
 			prototype = await this.prototype(projection, request, executable, prototype.executableDigest);
 		}
@@ -1564,7 +1564,7 @@ function reopensProcessInputs(invocation: BoundProcessInvocation) {
 }
 
 /** Reopen paths into a new graph. Handles, shared OFDs, flags and cursors remain predictions checked at the held exec. */
-async function reopenProcessResources(graph: ProcessResourceGraph, projection: ExecutionPathProjection, dispatcher: string, remaining: number,
+async function reopenProcessResources(graph: ProcessResourceGraph, projection: ExecutionPathProjection, remaining: number,
 	signal: AbortSignal): Promise<ProcessResourceGraph> {
 	const objects: Record<number, ProcessResourceGraph["objects"][number]> = {}, remapped = new Map<number, number>(), images = new Map<string, number>();
 	const fileAliases = captureWorkspaceFileAliases(projection.workspaceRoot);
@@ -1586,8 +1586,10 @@ async function reopenProcessResources(graph: ProcessResourceGraph, projection: E
 			if (!before.isDirectory()) throw new Error("reopened input type changed");
 			if (object.content !== undefined) {
 				// Enumeration cookies and inode numbers belong to the logical filesystem, not the private backing tree.
-				await assertNoSymlinkPath(projection.sourceRoot, logical);
-				content = (await execHostFile(dispatcher, ["--directory-image", logical], { encoding: "buffer", maxBuffer: remaining, signal })).stdout;
+				content = await withFilesystemReadView(undefined, async source => {
+					await assertNoSymlinkPath(projection.sourceRoot, logical, (target, info) => captureFilesystemEntry(target, info, source));
+					return readFilesystemDirectoryImage(logical, remaining, signal, source);
+				});
 			}
 		}
 		if (!sameFilesystemIdentity(before, await lstat(physical, { bigint: true }))) throw new Error("reopened input changed during capture");
