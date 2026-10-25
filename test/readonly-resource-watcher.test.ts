@@ -1,5 +1,5 @@
 import { expect, test } from "vitest";
-import { link, lstat, lutimes, mkdir, mkdtemp, readFile, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import fs, { link, lstat, lutimes, mkdir, mkdtemp, readFile, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import * as filesystemEvidence from "../src/filesystem-evidence.ts";
@@ -12,6 +12,7 @@ import { createWriteTool } from "@earendil-works/pi-coding-agent";
 import { captureAbsenceDependency, captureDirectoryDependency, captureFileDependency, captureMetadataDependency, captureSymlinkDependency, validateDynamicDependencyCertificate } from "../src/provenance-validation.ts";
 import { ProcessReusePlanner, ProvenanceCertificateStore, sealProcessCertificate } from "../src/process-reuse.ts";
 import { PROCESS_CERTIFICATE } from "./process-fixture.ts";
+import { linuxOverlayfsCapability, mountLinuxOverlayfs, type LinuxOverlayfsMount } from "../src/linux-overlayfs.ts";
 
 const linux = test.skipIf(process.platform !== "linux" || !process.env.PI_SPEC_HELD_EXEC);
 const metadata = async (paths: readonly string[]) => Promise.all(paths.map(async target => {
@@ -247,6 +248,66 @@ linux("captures, consumes and revalidates resource inputs without changing sourc
 
 linux("rejects mount crossings before reading an unqualified filesystem", { timeout: 30_000 }, async () => {
   nativeProcessLibrary(process.env.PI_SPEC_HELD_EXEC!);
-  await using filesystem = await filesystemEvidence.openFilesystemReadView();
-  await expect(filesystem.pin("/proc/self/status", true)).rejects.toMatchObject({ code: "EXDEV" });
+  expect((await linuxOverlayfsCapability()).available).toBe(true);
+  const fixture = await mkdtemp(path.join(os.tmpdir(), "pi-readonly-mounts-")), source = path.join(fixture, "source");
+  const input = path.join(source, "input"), route = path.join(source, "route");
+  const lowerRoot = path.join(fixture, "lower"), privateRoot = path.join(fixture, "private"), mountRoot = path.join(privateRoot, "workspace");
+  let mounted: LinuxOverlayfsMount | undefined;
+  const mount = async () => { mounted = await mountLinuxOverlayfs({ lowerRoot, privateRoot }); };
+  const unmount = async () => { await mounted!.close(); mounted = undefined; };
+  // Change a real mount at the initial snapshot boundary; never synthesize mountinfo content.
+  const openDuring = async (change: () => Promise<void>) => {
+    const original = fs.readFile;
+    let armed = true;
+    fs.readFile = (async (...args: Parameters<typeof readFile>) => {
+      const image = await original(...args);
+      if (armed && args[0] === "/proc/self/mountinfo") { armed = false; await change(); }
+      return image;
+    }) as typeof readFile;
+    try { return await filesystemEvidence.openFilesystemReadView(); }
+    finally { fs.readFile = original; }
+  };
+  const capture = async (view: filesystemEvidence.FilesystemReadView) => {
+    expect((await filesystemEvidence.captureStableFile(input, 1024, true, { view })).content?.toString()).toBe("source\n");
+    await view.verify();
+  };
+  try {
+    await mkdir(source); await mkdir(lowerRoot); await mkdir(mountRoot, { recursive: true });
+    await writeFile(input, "source\n"); await writeFile(path.join(lowerRoot, "input"), "mounted\n");
+    await writeFile(path.join(mountRoot, "input"), "underlying\n"); await symlink(mountRoot, route);
+    for (const target of [source, input]) await utimes(target, 915148800, 946684800);
+    await lutimes(route, 915148800, 946684800);
+    const paths = [source, input, route], before = await metadata(paths);
+    {
+      await using view = await openDuring(mount);
+      await capture(view);
+      await expect(view.verify([fixture])).rejects.toThrow("mount topology changed");
+      await view.verify();
+      await expect(view.pin(path.join(route, "input"), true)).rejects.toMatchObject({ code: "EXDEV" });
+      await expect(view.pin(path.join(mountRoot, "input"), true)).rejects.toMatchObject({ code: "EXDEV" });
+      await expect(view.verify()).rejects.toThrow("mount topology changed");
+    }
+    {
+      await using view = await openDuring(unmount);
+      await capture(view);
+      await expect(view.pin("/proc/self/status", true)).rejects.toMatchObject({ code: "EXDEV" });
+      await view.verify();
+      const handle = await view.pin(path.join(mountRoot, "input"), true); await handle.close();
+      await expect(view.verify()).rejects.toThrow("mount topology changed");
+    }
+    {
+      await using view = await filesystemEvidence.openFilesystemReadView();
+      const handle = await view.pin(path.join(route, "input"), true); await handle.close();
+      await view.verify(); await mount();
+      await expect(view.verify()).rejects.toThrow("mount topology changed");
+    }
+    await unmount();
+    {
+      await using view = await filesystemEvidence.openFilesystemReadView();
+      await expect(view.pin(path.join(mountRoot, "missing"), true)).rejects.toMatchObject({ code: "ENOENT" });
+      await view.verify(); await mount();
+      await expect(view.verify()).rejects.toThrow("mount topology changed");
+    }
+    expect(await metadata(paths)).toEqual(before);
+  } finally { await mounted?.close(); await rm(fixture, { recursive: true, force: true }); }
 });

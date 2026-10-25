@@ -74,7 +74,7 @@ export async function pinFilesystemObject(target: string): Promise<{ readonly st
 export class FilesystemReadView {
 	private descriptor: number | undefined;
 	private readonly mounts: string;
-	private readonly observed = new Set<string>();
+	private readonly observed = new Set<string>(["/"]);
 	private closed = false;
 	private readonly reader: typeof nativeFilesystem;
 	private constructor(descriptor: number | undefined, mounts: string, reader = nativeFilesystem) { this.descriptor = descriptor; this.mounts = mounts; this.reader = reader; }
@@ -87,7 +87,7 @@ export class FilesystemReadView {
 		if (!Number.isInteger(descriptor)) throw new Error("native read-only filesystem view unavailable");
 		if (descriptor < 0) throw filesystemReadError("read-only filesystem view unavailable", descriptor);
 		const view = new FilesystemReadView(descriptor, mounts, reader);
-		try { await view.verify(["/"]); return view; } catch (error) { await view.close(); throw error; }
+		try { await view.verify(); return view; } catch (error) { await view.close(); throw error; }
 	}
 	/** Caller owns the returned raw descriptor. Only use while this view is open. */
 	open(target: string, flags: number): number {
