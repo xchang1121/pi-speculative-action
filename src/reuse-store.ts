@@ -5,16 +5,18 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { setTimeout as delay } from "node:timers/promises";
 import {
-	type ArtifactReference, certificateReplayable, parseProcessCertificate, type ProcessProvenanceCertificate, type ProvenanceTaint,
-	referencedArtifacts, validateArtifact,
+	certificateReplayable, parseProcessCertificate, type ProcessProvenanceCertificate, type ProvenanceTaint,
+	referencedArtifacts,
 } from "./provenance-certificate.ts";
-import { isSha256Digest, sha256DigestAsync, type Sha256Digest } from "./stable-value-hash.ts";
+import { type ArtifactReference, validateArtifact } from "./artifact-reference.ts";
+import { digestObject, isSha256Digest, sha256DigestAsync, type Sha256Digest } from "./stable-value-hash.ts";
 import { stableStringify } from "./stable-json.ts";
 import { nonNegativeNumber, positiveInteger } from "./setting-input.ts";
 import { isMissing as missing } from "./error-utils.ts";
 import { mapFilesystem } from "./filesystem-evidence.ts";
 import { RuntimeLifecycleLane, waitForCompletion } from "./runtime-lifecycle.ts";
 
+/** maxCertificates is the shared metadata-record limit, including persistent input versions. */
 export interface ProvenanceStoreLimits { readonly maxCertificates: number; readonly maxBytes: number; }
 
 export interface ProvenanceStoreOptions extends Partial<ProvenanceStoreLimits> {
@@ -25,10 +27,16 @@ export interface ProvenanceStoreOptions extends Partial<ProvenanceStoreLimits> {
 
 export interface ProvenanceStoreStats {
 	readonly certificates: number; readonly artifacts: number; readonly orphanArtifacts: number;
+	readonly inputVersions: number;
 	readonly totalBytes: number; readonly overBudget: boolean;
 }
 
-export interface ProvenanceStoreGCResult { readonly removedCertificates: number; readonly removedArtifacts: number; readonly removedBytes: number; }
+export interface ProvenanceStoreGCResult { readonly removedCertificates: number; readonly removedArtifacts: number; readonly removedBytes: number; readonly removedInputVersions: number; }
+
+export interface StoredInputVersion {
+	readonly id: Sha256Digest; readonly createdAt: number; readonly schema: 1;
+	readonly payload: unknown; readonly artifacts: readonly ArtifactReference[];
+}
 
 export const DEFAULT_PROVENANCE_STORE_LIMITS: ProvenanceStoreLimits = Object.freeze({ maxCertificates: 4_096, maxBytes: 2 * 1024 * 1024 * 1024 });
 
@@ -158,6 +166,27 @@ export class ProvenanceCertificateStore {
 		}, [], false, signal);
 	}
 
+	/** Input metadata shares certificate publication, retention, and crash recovery; it grants no execution authority. */
+	async putInputVersion(payload: unknown, artifacts: readonly ArtifactReference[]): Promise<StoredInputVersion> {
+		const body = { schema: 1 as const, createdAt: Date.now(), payload, artifacts }, id = digestObject(body);
+		const record = decodeInputVersion(stableStringify({ ...body, id }));
+		if (!record) throw new Error("invalid persistent input version");
+		return this.exclusive(async database => {
+			await mapFilesystem(record.artifacts, async reference => {
+				if (!await this.artifacts.has(reference)) throw new Error(`input version references missing artifact ${reference.digest}`);
+			});
+			database.prepare("INSERT OR REPLACE INTO input_versions VALUES (?, ?)").run(id, stableStringify(record)); return record;
+		}, [`input:${id}`, ...record.artifacts.map(reference => this.objectKey(this.artifacts.artifactPath(reference.digest)))]);
+	}
+	getInputVersion(id: Sha256Digest): Promise<StoredInputVersion | undefined> {
+		digestHex(id);
+		return this.exclusive(async database => {
+			const value = database.prepare("SELECT value FROM input_versions WHERE id = ?").get(id)?.value, record = decodeInputVersion(value);
+			if (value !== undefined && record?.id !== id) throw new Error(`input version integrity check failed for ${id}`);
+			return record;
+		}, [], false);
+	}
+
 	async findByWeakKey(weakKey: Sha256Digest, executablePath: string, excludedCertificates?: ReadonlySet<Sha256Digest>): Promise<readonly ProcessProvenanceCertificate[]> {
 		const certificates: ProcessProvenanceCertificate[] = [];
 		for await (const certificate of this.candidatesByWeakKey(weakKey, executablePath, excludedCertificates)) certificates.push(certificate);
@@ -184,9 +213,10 @@ export class ProvenanceCertificateStore {
 	/** Physical snapshots include uncommitted crash debris; a metadata revision cannot cache them. */
 	async stats(_refresh = false): Promise<ProvenanceStoreStats> {
 		const limits = this.limits;
-		const inventory = await this.inventory(), referenced = new Set(inventory.certificates.flatMap(({ certificate }) => certificate && certificateReplayable(certificate, this.acceptedTaints) ? referencedArtifacts(certificate).map(reference => reference.digest) : []));
+		const inventory = await this.inventory(), referenced = new Set(inventory.roots.flatMap(record => record.references?.map(reference => reference.digest) ?? []));
 		const totalBytes = inventory.objects.reduce((total, record) => total + record.bytes, 0), artifacts = inventory.objects.filter(record => record.path).length;
-		return Object.freeze({ certificates: inventory.certificates.length, artifacts, totalBytes, orphanArtifacts: artifacts - [...referenced].filter(digest => inventory.artifacts.has(digest)).length, overBudget: inventory.certificates.length > limits.maxCertificates || totalBytes > limits.maxBytes });
+		return Object.freeze({ certificates: inventory.roots.filter(record => record.kind === "certificate").length, inputVersions: inventory.roots.filter(record => record.kind === "input").length,
+			artifacts, totalBytes, orphanArtifacts: artifacts - [...referenced].filter(digest => inventory.artifacts.has(digest)).length, overBudget: inventory.roots.length > limits.maxCertificates || totalBytes > limits.maxBytes });
 	}
 
 	gc(): Promise<ProvenanceStoreGCResult> {
@@ -221,18 +251,18 @@ export class ProvenanceCertificateStore {
 		return this.exclusive(async database => {
 			const before = await this.inventory(database);
 			await mapFilesystem(await this.payloadRoots(), root => rm(root, { recursive: true, force: true }));
-			database.exec("DELETE FROM certificates; DELETE FROM changes WHERE path <> ''");
-			return { removedCertificates: before.certificates.length, removedArtifacts: before.objects.filter(record => record.path).length, removedBytes: before.objects.reduce((total, record) => total + record.bytes, 0) };
+			database.exec("DELETE FROM certificates; DELETE FROM input_versions; DELETE FROM changes WHERE path <> ''");
+			return { removedCertificates: before.roots.filter(record => record.kind === "certificate").length, removedInputVersions: before.roots.filter(record => record.kind === "input").length,
+				removedArtifacts: before.objects.filter(record => record.path).length, removedBytes: before.objects.reduce((total, record) => total + record.bytes, 0) };
 		}, [".clear"]);
 	}
 
 	private async collect(inventory: StoreInventory, revision: number): Promise<ProvenanceStoreGCResult> {
-		const retained = new Set<string>(), result = { removedCertificates: 0, removedArtifacts: 0, removedBytes: 0 }, cutoff = Date.now() - this.orphanGraceMs;
+		const retained = new Set<string>(), result = { removedCertificates: 0, removedInputVersions: 0, removedArtifacts: 0, removedBytes: 0 }, cutoff = Date.now() - this.orphanGraceMs;
 		let retainedBytes = 0, retainedCertificates = 0;
-		for (const record of [...inventory.certificates].sort((left, right) => (right.certificate?.createdAt ?? 0) - (left.certificate?.createdAt ?? 0))) {
-			const certificate = record.certificate;
-			if (!certificate || !certificateReplayable(certificate, this.acceptedTaints)) continue;
-			const references = referencedArtifacts(certificate).map(reference => inventory.artifacts.get(reference.digest)?.bytes === reference.size ? inventory.artifacts.get(reference.digest) : undefined);
+		for (const record of [...inventory.roots].sort((left, right) => right.createdAt - left.createdAt)) {
+			if (!record.references) continue;
+			const references = record.references.map(reference => inventory.artifacts.get(reference.digest)?.bytes === reference.size ? inventory.artifacts.get(reference.digest) : undefined);
 			if (references.some(reference => !reference)) continue;
 			const addedBytes = record.bytes + references.reduce((total, reference) => total + (retained.has(reference!.key) ? 0 : reference!.bytes), 0);
 			if (retainedCertificates >= this.limits.maxCertificates || retainedBytes + addedBytes > this.limits.maxBytes) continue;
@@ -248,9 +278,11 @@ export class ProvenanceCertificateStore {
 				if (current) {
 					await rm(record.path, { force: true }); result.removedArtifacts++; result.removedBytes += current.size;
 				}
-			} else if (record.key.startsWith("certificate:")) {
-				const removed = Number(database.prepare("DELETE FROM certificates WHERE id = ?").run(record.key.slice("certificate:".length)).changes);
-				result.removedCertificates += removed; result.removedBytes += removed ? record.bytes : 0;
+			} else if (/^(certificate|input):/.test(record.key)) {
+				const certificate = record.key.startsWith("certificate:"), table = certificate ? "certificates" : "input_versions";
+				const removed = Number(database.prepare(`DELETE FROM ${table} WHERE id = ?`).run(record.key.slice(record.key.indexOf(":") + 1)).changes);
+				if (certificate) result.removedCertificates += removed; else result.removedInputVersions += removed;
+				result.removedBytes += removed ? record.bytes : 0;
 			}
 			database.prepare("DELETE FROM changes WHERE path = ?").run(record.key);
 		});
@@ -259,14 +291,17 @@ export class ProvenanceCertificateStore {
 	}
 
 	private async inventory(control?: DatabaseSync): Promise<StoreInventory> {
-		const read = (database: DatabaseSync) => database.prepare("SELECT id, value FROM certificates").all().map(({ id, value }) => {
-			const certificate = decodeCertificate(value);
-			return { key: `certificate:${id}`, bytes: Buffer.byteLength(String(value)), modifiedAt: 0, certificate: certificate?.id === id ? certificate : undefined };
-		});
-		const metadata = (database: DatabaseSync) => ({ certificates: read(database), keys: database.prepare("SELECT path FROM changes WHERE path NOT IN ('', '.clear')").all() });
-		const { certificates, keys } = control ? metadata(control) : await this.exclusive(async database => metadata(database), [], false);
+		const read = (database: DatabaseSync): StoredRoot[] => (["certificate", "input"] as const).flatMap(kind =>
+			database.prepare(`SELECT id, value FROM ${kind === "certificate" ? "certificates" : "input_versions"}`).all().map(({ id, value }) => {
+				const record = kind === "certificate" ? decodeCertificate(value) : decodeInputVersion(value), valid = record?.id === id;
+				const references = !valid ? undefined : kind === "input" ? (record as StoredInputVersion).artifacts
+					: certificateReplayable(record as ProcessProvenanceCertificate, this.acceptedTaints) ? referencedArtifacts(record as ProcessProvenanceCertificate) : undefined;
+				return { key: `${kind}:${id}`, kind, bytes: Buffer.byteLength(String(value)), modifiedAt: 0, createdAt: record?.createdAt ?? 0, references };
+			}));
+		const metadata = (database: DatabaseSync) => ({ roots: read(database), keys: database.prepare("SELECT path FROM changes WHERE path NOT IN ('', '.clear')").all() });
+		const { roots: records, keys } = control ? metadata(control) : await this.exclusive(async database => metadata(database), [], false);
 		const roots = await this.payloadRoots(), paths = (await mapFilesystem(roots, filesUnder)).flat(), artifacts = new Map<Sha256Digest, StoredFile>();
-		const objects: StoredFile[] = [...certificates, ...(await mapFilesystem(paths, async target => {
+		const objects: StoredFile[] = [...records, ...(await mapFilesystem(paths, async target => {
 			const value = await stat(target).catch(error => { if (!missing(error)) throw error; }), key = this.objectKey(target), match = /^cas\/sha256\/([0-9a-f]{2})\/([0-9a-f]{62})$/.exec(key);
 			if (!value) return [];
 			const digest = match ? `sha256:${match[1]}${match[2]}` as Sha256Digest : undefined, record = { key, path: target, bytes: value.size, modifiedAt: value.mtimeMs, digest };
@@ -274,7 +309,7 @@ export class ProvenanceCertificateStore {
 		})).flat()];
 		const present = new Set(objects.map(record => record.key));
 		for (const { path: key } of keys) if (typeof key === "string" && !present.has(key)) objects.push({ key, bytes: 0, modifiedAt: 0 });
-		return { certificates, artifacts, objects, retiredRoots: roots.slice(1) };
+		return { roots: records, artifacts, objects, retiredRoots: roots.slice(1) };
 	}
 	private async payloadRoots(): Promise<readonly string[]> {
 		return [this.artifacts.root, ...(await readdir(this.root)).filter(name => /^\.clear-[0-9a-f-]{36}$/.test(name)).map(name => path.join(this.root, name))];
@@ -317,8 +352,8 @@ export class ProvenanceCertificateStore {
 		try {
 			database.exec("PRAGMA synchronous=NORMAL");
 			const version = Number(await sqliteReady(() => database.prepare("PRAGMA user_version").get()?.user_version, signal));
-			if (version === 2) return database;
-			if (version > 2) throw new Error(`unsupported provenance store version ${version}`);
+			if (version === 3) return database;
+			if (version > 3) throw new Error(`unsupported provenance store version ${version}`);
 			await sqliteReady(() => database.exec("PRAGMA auto_vacuum=FULL; PRAGMA journal_mode=WAL"), signal);
 			await sqliteReady(() => database.exec("BEGIN IMMEDIATE"), signal);
 			database.exec("CREATE TABLE IF NOT EXISTS changes(path TEXT PRIMARY KEY, revision INTEGER NOT NULL); INSERT OR IGNORE INTO changes VALUES ('', 0); CREATE TABLE IF NOT EXISTS certificates(id TEXT PRIMARY KEY, value TEXT NOT NULL, weakKey TEXT NOT NULL, executable TEXT NOT NULL, createdAt REAL NOT NULL); CREATE INDEX IF NOT EXISTS candidates ON certificates(executable, weakKey, createdAt DESC, id DESC)");
@@ -336,13 +371,16 @@ export class ProvenanceCertificateStore {
 				await mapFilesystem(["certificates", "indexes"], segment => rm(path.join(this.root, segment), { recursive: true, force: true }));
 				database.exec("PRAGMA user_version=2; COMMIT");
 			}
+			await sqliteReady(() => database.exec("BEGIN IMMEDIATE"), signal);
+			database.exec("CREATE TABLE IF NOT EXISTS input_versions(id TEXT PRIMARY KEY, value TEXT NOT NULL); PRAGMA user_version=3; COMMIT");
 			return database;
 		} catch (error) { database.close(); throw error; }
 	}
 }
 
 interface StoredFile { readonly key: string; readonly path?: string; readonly bytes: number; readonly modifiedAt: number; readonly digest?: Sha256Digest; }
-interface StoreInventory { readonly certificates: readonly (StoredFile & { readonly certificate: ProcessProvenanceCertificate | undefined })[]; readonly artifacts: ReadonlyMap<Sha256Digest, StoredFile>; readonly objects: readonly StoredFile[]; readonly retiredRoots: readonly string[]; }
+interface StoredRoot extends StoredFile { readonly kind: "certificate" | "input"; readonly references?: readonly ArtifactReference[]; readonly createdAt: number; }
+interface StoreInventory { readonly roots: readonly StoredRoot[]; readonly artifacts: ReadonlyMap<Sha256Digest, StoredFile>; readonly objects: readonly StoredFile[]; readonly retiredRoots: readonly string[]; }
 
 async function filesUnder(root: string): Promise<readonly string[]> {
 	try { return (await readdir(root, { recursive: true, withFileTypes: true })).filter(entry => entry.isFile()).map(entry => path.join(entry.parentPath, entry.name)); }
@@ -378,6 +416,18 @@ async function publishImmutable(target: string, bytes: Uint8Array): Promise<bool
 
 function decodeCertificate(value: unknown): ProcessProvenanceCertificate | undefined {
 	try { return typeof value === "string" ? parseProcessCertificate(JSON.parse(value)) : undefined; } catch { return undefined; }
+}
+
+function decodeInputVersion(value: unknown): StoredInputVersion | undefined {
+	try {
+		if (typeof value !== "string" || Buffer.byteLength(value) > 8 * 1024 * 1024) return;
+		const record = JSON.parse(value) as StoredInputVersion, { id, ...body } = record;
+		if (record.schema !== 1 || !Number.isFinite(record.createdAt) || !isSha256Digest(id) || digestObject(body) !== id ||
+			!Array.isArray(record.artifacts) || record.artifacts.length > 65536) return;
+		const sizes = new Map<Sha256Digest, number>(); for (const reference of record.artifacts) validateArtifact(reference, sizes);
+		if (sizes.size !== record.artifacts.length) return;
+		return record;
+	} catch { return undefined; }
 }
 
 function readOptional(target: string, signal?: AbortSignal) { return readFile(target, { signal }).catch((error): undefined => { if (!missing(error)) throw error; }); }

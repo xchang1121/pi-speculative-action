@@ -66,6 +66,10 @@ Pi SDK 回调及接入网关的调用可观察 `spawn/execFile/exec/fork` 及其
 
 结果、输入和句柄各自保留所有权，跨轮消费仍验新。缓存发布与回收由跨进程事务协调，活跃借用受预算保护；关闭先停止接纳，再排空已接纳工作和句柄。直接使用 process-reuse API 时，以 `withPublication` 包住产物写入至证书封存，在回调外调用 `gc`、`drain` 或 `dispose`。
 
+Linux 输入版本可显式配置 `ResourceVersionManager(root, { persistentInputs: { store, limits } })`，其中 `store` 是现有 `ProvenanceCertificateStore`，缓存目录必须位于源树之外。`capture(dependencies, retainBytes)` 保留分块输入，`persist(token)` 返回记录摘要；重启后用新 manager 调用 `restore(id, retainBytes)`，完整核对内容和当前路径观察后才返回新的输入令牌。记录缺失或源已变化时返回 `undefined`，损坏记录拒绝恢复。`view.readFile(path, maxBytes)` 读取有界前缀，`view.readFileRange(path, offset, length)` 支持逐块消费；使用结束后等待 `token.release()`。此选项目前只适用于上述已验证 Linux 输入闭包，扩展默认配置仍使用原内存输入策略。
+
+分块输入默认每块 1 MiB、单文件逻辑上限 2 GiB、每视图唯一保存块上限 1 GiB、块句柄上限 1024、单次返回上限 16 MiB；`retainBytes` 另限输入元数据，I/O 按视图串行且使用固定块缓冲。首次捕获全量读取，完整冷校验也可能重新读取源；零块编码保留逻辑字节，不承诺物理稀疏布局。活跃输入用新的块 FD 保活，清理缓存不撤销它们；每次读取校验摘要。SQLite 存储升级至版本 3，所有共享该目录的客户端应使用兼容版本，`maxCertificates` 共同限制证书和输入记录。该路径不持久化准备回调、计时收据或原生对象权限，也不恢复旧监听窗口；原生工作区的大文件写入捕获和断电持久性保证尚未由此实现。
+
 ## 开发与验证
 
 ```sh

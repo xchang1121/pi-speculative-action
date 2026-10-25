@@ -4,6 +4,8 @@ import { isSafeCount, nonNegativeCount as finiteTimestamp } from "./number-utils
 import { cloneSharedData, isRecord, stableEqual, stableStringify } from "./stable-json.ts";
 import type { WorkspaceDirectoryState, WorkspaceFileMutation } from "./workspace-state.ts";
 import { normalizeTimelineComputation, type SerializedTimelineComputation } from "./task-timing.ts";
+import { type ArtifactReference, validateArtifact } from "./artifact-reference.ts";
+export { type ArtifactReference, validateArtifact } from "./artifact-reference.ts";
 
 /** Decimal strings preserve filesystem cookies beyond JavaScript's exact integer range. */
 export type OFDPosition = number | string;
@@ -11,7 +13,6 @@ export function isOFDPosition(value: unknown): value is OFDPosition {
 	return typeof value === "number" ? isSafeCount(value) :
 		typeof value === "string" && /^[1-9][0-9]{15,18}$/.test(value) && BigInt(value) > BigInt(Number.MAX_SAFE_INTEGER) && BigInt(value) <= 0x7fffffffffffffffn;
 }
-export interface ArtifactReference { readonly digest: Sha256Digest; readonly size: number; }
 
 export interface SemanticEnvironmentEntry { readonly name: string; readonly present: boolean; readonly valueDigest?: Sha256Digest; }
 
@@ -590,13 +591,6 @@ function normalizeWorkspaceEffectState(state: WorkspaceEffectState, artifactSize
 		throw new Error("invalid directory effect state");
 	}
 	return { ...state };
-}
-
-export function validateArtifact(reference: ArtifactReference, sizes?: Map<Sha256Digest, number>): void {
-	if (!reference || !isSha256Digest(reference.digest) || !isSafeCount(reference.size)) throw new Error("invalid effect artifact");
-	const previousSize = sizes?.get(reference.digest);
-	if (previousSize !== undefined && previousSize !== reference.size) throw new Error("conflicting effect artifact sizes");
-	sizes?.set(reference.digest, reference.size);
 }
 
 function validLogicalPath(value: string): boolean {

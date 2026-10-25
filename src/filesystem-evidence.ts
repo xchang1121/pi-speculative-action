@@ -402,9 +402,11 @@ export async function openFilesystemFile(target: string, verifyPath = true, view
 
 /** Pin and hash one file, verifying its final identity before cache publication or transfer. */
 export async function captureStableFile(target: string, maxBytes = Number.POSITIVE_INFINITY, retainContent = false,
-	observed?: Partial<Pick<StableFilesystemCapture, "stat" | "realPath">> & { readonly retainObject?: boolean; readonly gitBlob?: boolean; readonly digest?: false; readonly verifyPath?: boolean; readonly view?: FilesystemReadView },
+	observed?: Partial<Pick<StableFilesystemCapture, "stat" | "realPath">> & { readonly retainObject?: boolean; readonly gitBlob?: boolean; readonly digest?: false; readonly verifyPath?: boolean; readonly view?: FilesystemReadView;
+		readonly onChunk?: (bytes: Buffer) => Promise<void> },
 	signal?: AbortSignal): Promise<StableFilesystemCapture> {
 	const view = observed?.view ?? FilesystemReadView.ambient();
+	if (retainContent && observed?.onChunk) throw new Error("content capture requires one storage strategy");
 	signal?.throwIfAborted(); const startedAt = performance.now(), takenAtMs = Date.now(), verifyPath = observed?.verifyPath !== false;
 	let { handle, binding, stat: before } = await openFilesystemFile(target, verifyPath, view);
 	try {
@@ -427,6 +429,7 @@ export async function captureStableFile(target: string, maxBytes = Number.POSITI
 			if (bytesRead > maxBytes) throw new Error(`file_too_large:${bytesRead}`);
 			if (bytesRead > Number(before.size)) throw new Error("file_changed_during_capture");
 			hash?.update(chunk.subarray(0, size)); blob?.update(chunk.subarray(0, size));
+			if (observed?.onChunk) await observed.onChunk(chunk.subarray(0, size));
 		}
 		const after = await handle.stat({ bigint: true });
 		signal?.throwIfAborted();

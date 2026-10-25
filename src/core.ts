@@ -65,6 +65,7 @@ export {
 	captureResourceVersion,
 	type ResourceChangeSet,
 	type ResourceDependency,
+	type ResourceInputPersistence,
 	type ResourceValidationMetrics,
 	ResourceVersionManager,
 	type ResourceVersionToken,
@@ -73,6 +74,7 @@ export {
 	resourceDependencies,
 	validateResourceVersion,
 } from "./resource-version.ts";
+export type { ContentChunkLimits } from "./content-chunks.ts";
 export {
 	type AuthoritativeResultCapture,
 	type CandidatePreflight,
