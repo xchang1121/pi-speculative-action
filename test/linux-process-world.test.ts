@@ -253,6 +253,32 @@ nativeTest.for(["journal", "whole-released", "whole-consumed", "custom", "dispos
 			expect(delta.complete).toBe(true); expect(await Promise.all(delta.changes.map(async change => [change.relativePath, (await readContent(change.before!)).toString(), (await readContent(change.after!)).toString()]))).toEqual([["input.txt", "before", "after"]]);
 			expect(delta.changes.map(change => [change.beforeMode, change.afterMode])).toEqual([[0o600, 0o600]]);
 			expect(interfered).toHaveBeenCalledOnce(); await fixture.inOwner(state => state.other.abort());
+			for (const phase of ["once", "always", "io"]) {
+				const capture = await workspace.transactions.begin();
+				await fixture.inOwner(async (state, phase) => {
+					const { FilesystemReadView } = await state.load("../src/filesystem-evidence.ts"), readDirectory = FilesystemReadView.prototype.readDirectory;
+					const root = state.opened.mock.calls[0].arguments[0].workspace.sandboxRoot;
+					state.reads = state.mutations = 0;
+					state.captureRead = state.method(FilesystemReadView.prototype, "readDirectory", async function(this: unknown, ...args: unknown[]) {
+						if (args[0] === root) {
+							state.reads++;
+							if (phase === "io") throw Object.assign(new Error("directory capture I/O sentinel"), { code: "EIO" });
+							// A real namespace change invalidates the before/after identity, independent of timestamp resolution.
+							if (phase === "always" || state.reads === 1) await state.fs.mkdir(`${root}/capture-${phase}-${++state.mutations}`);
+						}
+						return readDirectory.apply(this, args);
+					});
+				}, phase);
+				const result = await capture.finish().finally(() => fixture.inOwner(state => state.captureRead.mock.restore()));
+				const counts = await fixture.inOwner(state => ({ reads: state.reads, mutations: state.mutations }));
+				if (phase === "once") {
+					expect(result.complete, result.complete ? undefined : result.reason).toBe(true); expect(result.after?.entries.has("capture-once-1")).toBe(true);
+					expect(counts.mutations).toBe(1); expect(counts.reads).toBeGreaterThanOrEqual(2);
+				} else {
+					expect(result).toMatchObject({ complete: false, changes: [], reason: `workspace_transaction_capture:${phase === "io" ? "directory capture I/O sentinel" : "directory_changed_during_capture"}` });
+					expect(counts).toEqual(phase === "io" ? { reads: 1, mutations: 0 } : { reads: 3, mutations: 3 });
+				}
+			}
 		} else {
 			await interval.abort();
 			if (mode.startsWith("whole-")) {

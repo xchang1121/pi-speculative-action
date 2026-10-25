@@ -10,6 +10,9 @@ import { ensureNativeFilesystem, nativeFilesystem } from "./process-startup.mjs"
 import { windowsFilesystem } from "./windows-filesystem.mjs";
 import { getSystemErrorName } from "node:util";
 
+/** An unaccepted observation crossed an object version and may be captured again as a whole. */
+export class FilesystemCaptureChangedError extends Error {}
+
 export interface FilesystemTypeEvidence extends Readonly<Pick<Stats,
 	"isFile" | "isDirectory" | "isSymbolicLink" | "isSocket" | "isFIFO" | "isCharacterDevice" | "isBlockDevice">> {}
 
@@ -436,7 +439,7 @@ export async function readFilesystemDirectoryImage(target: string, maxBytes: num
 				chunks.push(Buffer.from(content));
 			}
 			if (!sameFilesystemIdentity(before, await handle.stat({ bigint: true })) ||
-				!sameFilesystemIdentity(before, await source.stat(target, true))) throw new Error("directory_changed_during_capture");
+				!sameFilesystemIdentity(before, await source.stat(target, true))) throw new FilesystemCaptureChangedError("directory_changed_during_capture");
 			return Buffer.concat(chunks);
 		} finally { await handle.close(); }
 	});
@@ -450,7 +453,7 @@ export async function captureHeldDirectory(pid: number, fd: number, content: Buf
 	const handle = await fs.open(`/proc/${pid}/fd/${fd}`, 0x200000);
 	try {
 		if (!sameFilesystemIdentity(stat, await handle.stat({ bigint: true })) ||
-			!sameFilesystemIdentity(stat, await view.stat(realPath, true))) throw new Error("directory_changed_during_capture");
+			!sameFilesystemIdentity(stat, await view.stat(realPath, true))) throw new FilesystemCaptureChangedError("directory_changed_during_capture");
 		const capture = { content, entries, stat, realPath, bytesRead: content.length, hash: createHash("sha256").update(content).digest("hex"), computation: TimelineInterval.own(new TimelineInterval(startedAt, performance.now())) };
 		return { ...capture, object: new CapturedFilesystemObject(handle, capture) };
 	} catch (error) { await handle.close(); throw error; }
@@ -469,7 +472,7 @@ export async function openFilesystemFile(target: string, verifyPath = true, view
 		handle = await fs.open(binding ? `/proc/self/fd/${binding.fd}` : target,
 			constants.O_RDONLY | (binding || !verifyPath ? 0 : constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0)
 			| (binding && before.uid === BigInt(process.getuid!()) ? constants.O_NOATIME : 0));
-		if (!sameFilesystemIdentity(before, await handle.stat({ bigint: true }))) throw new Error("file_changed_during_capture");
+		if (!sameFilesystemIdentity(before, await handle.stat({ bigint: true }))) throw new FilesystemCaptureChangedError("file_changed_during_capture");
 		return { handle, binding, stat: before };
 	} catch (error) { try { await handle?.close(); } finally { await binding?.close(); } throw error; }
 }
@@ -486,7 +489,7 @@ export async function captureStableFile(target: string, maxBytes = Number.POSITI
 	try {
 		if (binding && ((before.dev >> 8n & 0xfffn) | (before.dev >> 32n & ~0xfffn)) && !kernelTicks.has(before.dev)) // A major number: not a reusable anonymous one.
 			kernelTicks.set(before.dev, KERNEL_TICK_FILESYSTEMS.has((await fs.statfs(`/proc/self/fd/${binding.fd}`)).type));
-		if (observed?.stat && !sameFilesystemIdentity(observed.stat, before)) throw new Error("file_changed_during_capture");
+		if (observed?.stat && !sameFilesystemIdentity(observed.stat, before)) throw new FilesystemCaptureChangedError("file_changed_during_capture");
 		const beforePath = verifyPath ? observed?.realPath ?? await view.realpath(target) : target;
 		if (Number.isFinite(maxBytes) && before.size > BigInt(Math.floor(maxBytes))) throw new Error(`file_too_large:${before.size}`);
 		// Another pending read may precede a same-tick rewrite; read under this identity.
@@ -501,16 +504,16 @@ export async function captureStableFile(target: string, maxBytes = Number.POSITI
 			if (size === 0) break;
 			bytesRead += size;
 			if (bytesRead > maxBytes) throw new Error(`file_too_large:${bytesRead}`);
-			if (bytesRead > Number(before.size)) throw new Error("file_changed_during_capture");
+			if (bytesRead > Number(before.size)) throw new FilesystemCaptureChangedError("file_changed_during_capture");
 			hash?.update(chunk.subarray(0, size)); blob?.update(chunk.subarray(0, size));
 			if (observed?.onChunk) await observed.onChunk(chunk.subarray(0, size));
 		}
 		const after = await handle.stat({ bigint: true });
 		signal?.throwIfAborted();
-		if (bytesRead !== Number(before.size) || !sameFilesystemIdentity(before, after)) throw new Error("file_changed_during_capture");
+		if (bytesRead !== Number(before.size) || !sameFilesystemIdentity(before, after)) throw new FilesystemCaptureChangedError("file_changed_during_capture");
 		if (verifyPath) {
 			const [afterPath, pathStat] = await Promise.all([view.realpath(target), view.stat(target)]);
-			if (beforePath !== afterPath || !sameFilesystemIdentity(after, pathStat)) throw new Error("file_changed_during_capture");
+			if (beforePath !== afterPath || !sameFilesystemIdentity(after, pathStat)) throw new FilesystemCaptureChangedError("file_changed_during_capture");
 		}
 		const result = { hash: hash?.digest("hex") ?? "", bytesRead, stat: after, ...(content ? { content } : {}), ...(blob ? { blob: blob.digest("hex") } : {}),
 			realPath: beforePath, computation: TimelineInterval.own(new TimelineInterval(startedAt, performance.now())) };
@@ -535,7 +538,7 @@ export async function captureFilesystemEntry(target: string, read?: "directory" 
 	const link = before.isSymbolicLink() ? await view.readlink(target) : undefined;
 	const entries = read === "directory" && before.isDirectory() ? await readFilesystemDirectory(target, view) : undefined;
 	const info = link !== undefined || read !== undefined ? await view.stat(target) : before;
-	if (!sameFilesystemIdentity(before, info)) throw new Error(`${link !== undefined ? "symlink" : "directory"}_changed_during_capture`);
+	if (!sameFilesystemIdentity(before, info)) throw new FilesystemCaptureChangedError(`${link !== undefined ? "symlink" : "directory"}_changed_during_capture`);
 	return { info, link, entries, computation: TimelineInterval.own(new TimelineInterval(startedAt, performance.now())) };
 }
 

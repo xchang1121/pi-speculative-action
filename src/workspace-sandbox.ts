@@ -21,7 +21,7 @@ import {
 import type { WorldBranch, WorldCheckpoint, WorldExecutionMetrics } from "./execution-world.ts";
 import {
 	advanceFilesystemClock, assertNoSymlinkPath, captureFilesystemEntry, captureStableFile, fileIdentity, mapFilesystem, sameFilesystemIdentity, readFilesystemDirectory, openFilesystemFile,
-	withFilesystemReadView, openFilesystemReadView, FilesystemReadView,
+	withFilesystemReadView, openFilesystemReadView, FilesystemReadView, FilesystemCaptureChangedError,
 	settledIdentity, sharedWalk, pinFilesystemObject, openAnonymousFilesystemFile, FILESYSTEM_OBSERVATION_FIELDS, FILESYSTEM_METADATA_FIELDS as SNAPSHOT_METADATA_FIELDS, type FilesystemObservationEvidence,
 } from "./filesystem-evidence.ts";
 import { WORKSPACE_PATH_MUTATION_EFFECTS } from "./effect-model.ts";
@@ -1172,9 +1172,9 @@ async function createGitWorkspaceTransactionDriver(workspace: ReturnType<typeof 
 		readonly frontier: ReadonlyMap<string, RegularFileState | undefined>; readonly unknown: ReadonlySet<string>; readonly racing: readonly string[];
 	}
 	const { sandboxRoot } = workspace;
-	// Another process linking or removing a file can leave one capture short of its names, or without a name it listed: capture again.
+	// Discard the entire unaccepted snapshot if a name disappears or an observed object changes during capture.
 	const captureStructure = async (attempt = 1): Promise<WorkspaceStructureSnapshot> => {
-		const last = attempt >= WORKSPACE_TRANSACTION_STABILITY_ATTEMPTS, snapshot = await workspace.structure.capture().catch((error: unknown) => { if (last || !isMissing(error)) throw error; });
+		const last = attempt >= WORKSPACE_TRANSACTION_STABILITY_ATTEMPTS, snapshot = await workspace.structure.capture().catch((error: unknown) => { if (last || !(isMissing(error) || error instanceof FilesystemCaptureChangedError)) throw error; });
 		return snapshot && (snapshot.complete || last) ? snapshot : captureStructure(attempt + 1);
 	}, frontier = new Map(workspace.baselineFrontier);
 	let lastStructure = workspace.initialStructure;
