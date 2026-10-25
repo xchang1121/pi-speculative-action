@@ -1,4 +1,5 @@
 import type { BigIntStats, Stats } from "node:fs";
+import { contentDigest, sameContent, type ContentVersion } from "./content-chunks.ts";
 import path from "node:path";
 import { containsFilesystemPath, relativeFilesystemPath, slash } from "./path-utils.ts";
 import { isMissing } from "./error-utils.ts";
@@ -7,7 +8,7 @@ import {
 	filesystemEntryType, filesystemMetadataDigest, type FilesystemObservationEvidence, captureFilesystemEntry, type FilesystemReadView,
 } from "./filesystem-evidence.ts";
 import type { DynamicDependency } from "./provenance-certificate.ts";
-import { type Sha256Digest, digestObject, sha256Digest, sha256DigestAsync } from "./stable-value-hash.ts";
+import { type Sha256Digest, digestObject, sha256Digest } from "./stable-value-hash.ts";
 import { workspaceAliasIdentity, type WorkspaceStructureEntry, type WorkspaceStructureSnapshot, type WorkspaceTreeEntry } from "./workspace-state.ts";
 import { orderWorkspaceChanges, type WorkspaceRegularDelta } from "./workspace-transaction.ts";
 
@@ -230,7 +231,7 @@ export function diffWorkspaceStructures(
 					change = { ...change, object: { path: projection.toLogical(path.join(after.root, anchor)), before: original !== undefined } };
 				}
 				const source = original === undefined ? undefined : before.entries.get(original);
-				if (source?.kind === "file" && (source.modified !== current.modified || Buffer.compare(byPath.get(anchor)!.before!, delta.after!) !== 0)) {
+				if (source?.kind === "file" && (source.modified !== current.modified || !sameContent(byPath.get(anchor)!.before, delta.after))) {
 					change = { ...change, operation: "write_contents" };
 				}
 			}
@@ -269,12 +270,12 @@ export function diffWorkspaceStructures(
 }
 
 export async function hydrateWorkspaceFileEntry(entry: Extract<WorkspaceStructureEntry, { readonly kind: "file" }>,
-	content: Uint8Array | StableFilesystemCapture): Promise<Extract<WorkspaceTreeEntry, { readonly kind: "file" }> | undefined> {
+	content: ContentVersion | StableFilesystemCapture): Promise<Extract<WorkspaceTreeEntry, { readonly kind: "file" }> | undefined> {
 	if ("hash" in content) {
 		if (statChangeDigest(content.stat) !== entry.changeDigest) return undefined;
 		return { ...entry, digest: `sha256:${content.hash}` };
 	}
-	return content.byteLength === entry.size ? { ...entry, digest: await sha256DigestAsync(content) } : undefined;
+	return content.byteLength === entry.size ? { ...entry, digest: contentDigest(content) } : undefined;
 }
 
 function regularDeltaFailure(

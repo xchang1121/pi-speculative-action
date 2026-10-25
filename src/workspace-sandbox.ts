@@ -1,3 +1,7 @@
+import { spawn } from "node:child_process";
+import { ChunkedContent, ContentChunkPool, captureContent, contentMemory, ownContent, readContent, sameContent, writeContent,
+	lendContentChanges, receiveContentChanges, type ContentChangesTransfer, type ContentVersion } from "./content-chunks.ts";
+import { ProvenanceCertificateStore } from "./reuse-store.ts";
 import { isSafeCount } from "./number-utils.ts";
 import { execHostFile } from "./executable-path.ts";
 import { createHash, randomUUID } from "node:crypto";
@@ -18,12 +22,12 @@ import type { WorldBranch, WorldCheckpoint, WorldExecutionMetrics } from "./exec
 import {
 	advanceFilesystemClock, assertNoSymlinkPath, captureFilesystemEntry, captureStableFile, fileIdentity, mapFilesystem, sameFilesystemIdentity, readFilesystemDirectory, openFilesystemFile,
 	withFilesystemReadView, openFilesystemReadView, FilesystemReadView,
-	settledIdentity, sharedWalk, pinFilesystemObject, FILESYSTEM_OBSERVATION_FIELDS, FILESYSTEM_METADATA_FIELDS as SNAPSHOT_METADATA_FIELDS, type FilesystemObservationEvidence,
+	settledIdentity, sharedWalk, pinFilesystemObject, openAnonymousFilesystemFile, FILESYSTEM_OBSERVATION_FIELDS, FILESYSTEM_METADATA_FIELDS as SNAPSHOT_METADATA_FIELDS, type FilesystemObservationEvidence,
 } from "./filesystem-evidence.ts";
 import { WORKSPACE_PATH_MUTATION_EFFECTS } from "./effect-model.ts";
 import { EffectCommit, effectCommitFailure, isPoisonedEffectCommit } from "./effect-transaction.ts";
 import {
-	LinuxOverlayfsCapabilityRegistry, LinuxOverlayfsUnsafeCleanupError, mountLinuxOverlayfs, openLinuxAnonymousWorkspaceFile,
+	LinuxOverlayfsCapabilityRegistry, LinuxOverlayfsUnsafeCleanupError, mountLinuxOverlayfs,
 	type LinuxOverlayfsMount, type LinuxOverlayfsOptions,
 } from "./linux-overlayfs.ts";
 import {
@@ -68,11 +72,11 @@ export interface SandboxDirectoryChange extends SandboxChangeTarget {
 
 export type SandboxWorkspaceChange = SandboxFileChange | SandboxDirectoryChange;
 
-interface RegularFileState { readonly content: Uint8Array; readonly mode: number; readonly identity?: BigIntStats; readonly settled?: string; }
+interface RegularFileState { readonly content: ContentVersion; readonly mode: number; readonly identity?: BigIntStats; readonly settled?: string; }
 
 export interface SandboxExecutionDelta { readonly output: ToolSettlement; readonly changes: readonly SandboxWorkspaceChange[]; }
 
-export interface WorkspaceExecutionSnapshot extends SandboxExecutionDelta { readonly executionMetrics: WorldExecutionMetrics; }
+export interface WorkspaceExecutionSnapshot extends SandboxExecutionDelta { readonly executionMetrics: WorldExecutionMetrics; readonly dispose?: () => Promise<void>; }
 
 export type WorkspaceSandboxDriver = "auto" | "git" | "overlayfs";
 
@@ -87,6 +91,7 @@ export interface WorkspaceSandboxOptions extends LinuxOverlayfsOptions {
 }
 
 export interface SandboxWorkspaceContext {
+	readonly contents?: ContentChunkPool;
 	readonly sourceRoot: string;
 	readonly sandboxRoot: string;
 	readonly processRoot: string;
@@ -120,6 +125,12 @@ export interface SandboxWorkspaceObservation {
 	readonly hints: ResourceChangeSet;
 }
 
+export interface SandboxWorkspaceTransfer {
+	readonly data: Omit<SandboxWorkspaceObservation, "baselineFrontier">;
+	readonly baseline: ContentChangesTransfer<{ readonly resource: string; readonly before?: ContentVersion; readonly mode?: number; readonly settled?: string }>;
+	readonly storeRoot?: string;
+}
+
 const workspaceOwners = new Map<string, { readonly capability: readonly unknown[]; readonly observation: ReturnType<typeof ownWorkspaceObservation> }>();
 export function nativeWorkspaceOwner(workspace: SandboxWorkspaceContext): Promise<string> | undefined {
 	const owner = workspaceOwners.get(workspace.sandboxRoot);
@@ -131,16 +142,16 @@ const workspaceCapability = (workspace: SandboxWorkspaceContext) => [workspace.s
 	workspace.transactions, workspace.transactions.begin, workspace.transactions.dispose, workspace.captureChanges, workspace.sourceChanges];
 
 interface WorkspaceObservation extends SandboxWorkspaceContext, SandboxWorkspaceObservation {
-	readonly readBase: (resource: string, maxBytes: number) => Promise<RegularFileState | undefined>;
+	readonly readBase: (resource: string, maxBytes?: number) => Promise<RegularFileState | undefined>;
 }
 
-function createWorkspaceObservation(data: SandboxWorkspaceObservation, sourceChanges: () => ResourceChangeSet): WorkspaceObservation {
+function createWorkspaceObservation(data: SandboxWorkspaceObservation, sourceChanges: () => ResourceChangeSet, contents?: ContentChunkPool): WorkspaceObservation {
 	let workspace!: WorkspaceObservation;
 	const baseGit = bindGit(data.gitBinary, path.dirname(data.repository), ["--git-dir", data.repository]);
 	const structure: WorkspaceStructureDriver = { capture: () => captureSandboxStructure(data) };
 	const transactions = deferredWorkspaceTransactionDriver(() => createGitWorkspaceTransactionDriver(workspace));
 	workspace = {
-		...data, structure, transactions, sourceChanges, observationExcludes: SNAPSHOT_EXCLUDES,
+		...data, contents, structure, transactions, sourceChanges, observationExcludes: SNAPSHOT_EXCLUDES,
 		metadataImage: data.metadata?.image, metadataObjects: data.metadata?.image ? data.metadata.objects : undefined,
 		projectMetadata: (stat: FilesystemObservationEvidence): FilesystemObservationEvidence => {
 			const row = data.metadata?.mappings.get(`${stat.dev}:${stat.ino}`);
@@ -151,9 +162,9 @@ function createWorkspaceObservation(data: SandboxWorkspaceObservation, sourceCha
 				dev: data.sourceDevice, ino: source.ino, nlink: links < 0n ? 0n : links } as FilesystemObservationEvidence;
 		},
 		captureChanges: (frontier: readonly string[]) => collectSandboxChanges(workspace, frontier),
-		readBase: async (resource: string, maxBytes: number) => {
-			if (data.liveBase) return readLiveBase(data.liveBase, resource, maxBytes);
-			const state = await readGitTreeRegularState(baseGit, data.commit, resource, maxBytes), mode = data.metadata?.modes.get(slash(resource)) ?? data.modes?.get(slash(resource));
+		readBase: async (resource: string, maxBytes = contents?.limits.maxLogicalBytes ?? WORKSPACE_TRANSACTION_MAX_MEMORY_BYTES) => {
+			if (data.liveBase) return readLiveBase(data.liveBase, resource, maxBytes, contents);
+			const state = await readGitTreeRegularState(baseGit, data.commit, resource, maxBytes, contents), mode = data.metadata?.modes.get(slash(resource)) ?? data.modes?.get(slash(resource));
 			return state && mode !== undefined ? { ...state, mode } : state;
 		},
 	};
@@ -171,7 +182,7 @@ async function captureSandboxStructure(data: Pick<SandboxWorkspaceObservation, "
 }
 
 async function openWorkspaceChangeClock({ sandboxRoot, clock }: Pick<SandboxWorkspaceObservation, "sandboxRoot" | "clock">) {
-	const handle = await (clock.links === 0 ? openLinuxAnonymousWorkspaceFile(clock.path)
+	const handle = await (clock.links === 0 ? openAnonymousFilesystemFile(clock.path)
 		: open(clock.path, fsConstants.O_WRONLY | fsConstants.O_CREAT | (fsConstants.O_NOFOLLOW ?? 0), 0o600));
 	try {
 		const [workspaceInfo, clockInfo, ...rootInfo] = await Promise.all([lstat(sandboxRoot), handle.stat(), ...clock.roots.map(root => lstat(root))]);
@@ -191,14 +202,24 @@ async function advanceWorkspaceChangeClock(clock: Awaited<ReturnType<typeof open
 	await advanceFilesystemClock(clock.handle, boundary, clock.identity);
 }
 
-export async function restoreWorkspaceObservation(data: SandboxWorkspaceObservation, hints: () => Promise<ResourceChangeSet>) {
-	const versions = new ResourceVersionManager(data.sourceRoot), cursor = await versions.observeChanges();
+export async function restoreWorkspaceObservation(transfer: SandboxWorkspaceTransfer, hints: () => Promise<ResourceChangeSet>) {
+	const versions = new ResourceVersionManager(transfer.data.sourceRoot), cursor = await versions.observeChanges();
+	const store = transfer.storeRoot ? new ProvenanceCertificateStore(transfer.storeRoot) : undefined, contents = store && new ContentChunkPool(store);
+	const release = contents?.retain();
+	let workspace: WorkspaceObservation | undefined, disposal: Promise<void> | undefined;
 	// Start the new notification window before reading the allocator's existing one, leaving no transfer gap.
-	try { data = { ...data, hints: await hints() }; } catch (error) { cursor.release(); versions.close(); throw error; }
-	const workspace = createWorkspaceObservation(data, () => {
-		const changes = versions.changesSince(cursor); return { uncertain: changes.uncertain || data.hints.uncertain, paths: [...new Set([...data.hints.paths, ...changes.paths])] };
-	});
-	return { workspace, dispose: () => workspace.transactions.dispose().finally(() => { cursor.release(); versions.close(); }) };
+	const dispose = () => disposal ??= (async () => { try { await workspace?.transactions.dispose(); } finally {
+		cursor.release(); versions.close(); await release?.(); await store?.dispose();
+	} })();
+	try {
+		const baseline = await receiveContentChanges(transfer.baseline, contents);
+		const data: SandboxWorkspaceObservation = { ...transfer.data, hints: await hints(), baselineFrontier: new Map(baseline.map(entry =>
+			[entry.resource, entry.before === undefined ? undefined : { content: entry.before, mode: entry.mode!, settled: entry.settled }])) };
+		workspace = createWorkspaceObservation(data, () => {
+			const changes = versions.changesSince(cursor); return { uncertain: changes.uncertain || data.hints.uncertain, paths: [...new Set([...data.hints.paths, ...changes.paths])] };
+		}, contents);
+		return { workspace, dispose };
+	} catch (error) { await dispose(); throw error; }
 }
 
 export interface SandboxWorkspaceBranchOptions extends WorkspaceSandboxOptions {
@@ -222,6 +243,9 @@ export interface PrepareSandboxWorkspaceOptions extends WorkspaceSandboxOptions 
 type PrivateSandboxWorkspace = Awaited<ReturnType<typeof createPrivateSandboxWorkspace>>;
 
 interface WorkspaceSandboxState {
+	store?: ProvenanceCertificateStore;
+	storage?: Promise<{ readonly store: ProvenanceCertificateStore; readonly ownedRoot?: string }>;
+	readonly contents: Set<ContentChunkPool>;
 	readonly repositories: Map<string, Promise<PooledGitRepository>>;
 	/** Checkpoint identity and bytes belong to one service, including its sibling execution worlds. */
 	readonly checkpoints: WeakMap<WorldCheckpoint, WorkspaceCheckpoint>;
@@ -293,9 +317,9 @@ function sameWorkspaceChangeSnapshot(left: WorkspaceStructureSnapshot, right: Wo
 // replaced by the private repository and commit's own temporary files are internal.
 const SNAPSHOT_EXCLUDES = [".git"] as const;
 const SANDBOX_REPOSITORY_IDLE_MS = 5 * 60 * 1000;
-/** Replaced baselines stay referenced only by live workspaces; aged loose objects are the rest of their copies. */
+/** Replaced baselines stay referenced only by live workspaces; expired unreferenced objects are collected. */
 const SANDBOX_PRUNE_INTERVAL_MS = 5 * 60 * 1000;
-const WORKSPACE_TRANSACTION_MAX_BYTES = 512 * 1024 * 1024;
+const WORKSPACE_TRANSACTION_MAX_MEMORY_BYTES = 512 * 1024 * 1024;
 const WORKSPACE_TRANSACTION_MAX_FILES = 100_000;
 const WORKSPACE_TRANSACTION_STABILITY_ATTEMPTS = 3;
 const SANDBOX_STAGING_FILE_PREFIX = ".pi-speculative-";
@@ -317,6 +341,9 @@ export interface WorkspaceCheckpoint {
 	readonly changes: readonly SandboxWorkspaceChange[];
 	committed: boolean;
 }
+
+// A handed-out checkpoint outlives its branch. Service disposal also closes every pool.
+const retiredWorkspaceCheckpoints = new FinalizationRegistry<() => Promise<void>>(release => { void release().catch(() => {}); });
 
 function acceptsWorkspaceCheckpoint(state: WorkspaceSandboxState, checkpoint: WorldCheckpoint, cwd: string): boolean {
 	const owned = state.checkpoints.get(checkpoint);
@@ -347,10 +374,14 @@ type SandboxPreparation = QualifiedWorkspaceSandboxDriver | typeof capturedWorks
 export class WorkspaceSandboxService {
 	private readonly state: WorkspaceSandboxState = {
 		repositories: new Map(),
+		contents: new Set(),
 		checkpoints: new WeakMap(),
 		lifetime: new RuntimeLifecycleLane(),
 		overlayfsCapabilities: new LinuxOverlayfsCapabilityRegistry(),
 	};
+
+	constructor(store?: ProvenanceCertificateStore) { this.state.store = store; }
+	useContentStore(store: ProvenanceCertificateStore): void { if (!this.state.storage) this.state.store = store; }
 
 	async fingerprint(options: WorkspaceSandboxOptions = {}, sourceRoot?: string): Promise<string> {
 		assertWorkspaceSandboxOpen(this.state);
@@ -398,16 +429,40 @@ export class WorkspaceSandboxService {
 
 	async commitDelta(delta: SandboxExecutionDelta, privateView?: FilesystemReadView): Promise<ToolSettlement> {
 		assertWorkspaceSandboxOpen(this.state);
-		return commitSandboxExecution(this.state, { output: delta.output, changes: ownSandboxChanges(delta.changes) }, undefined, privateView);
+		const changes = ownSandboxChanges(delta.changes), release = retainWorkspaceChanges(changes);
+		try { return await commitSandboxExecution(this.state, { output: delta.output, changes }, undefined, privateView); }
+		finally { await release(); }
 	}
 
 	dispose(): Promise<void> {
 		return this.state.lifetime.close(async () => {
 			await this.state.lifetime.drain();
 			try { await closeWorkspaceSandboxPoolsNow(this.state); }
-			finally { this.state.overlayfsCapabilities.dispose(); }
+			finally {
+				this.state.overlayfsCapabilities.dispose();
+				await Promise.allSettled([...this.state.contents].map(pool => pool.dispose())); this.state.contents.clear();
+				const storage = await this.state.storage;
+				if (storage?.ownedRoot) { await storage.store.dispose(); await removeOwnedTree(storage.ownedRoot); }
+			}
 		});
 	}
+}
+
+async function createWorkspaceContentPool(state: WorkspaceSandboxState): Promise<ContentChunkPool | undefined> {
+	assertWorkspaceSandboxOpen(state);
+	if (process.platform !== "linux") return undefined;
+	for (const pool of state.contents) if (pool.closed) state.contents.delete(pool);
+	const { store } = await (state.storage ??= state.store ? Promise.resolve({ store: state.store }) :
+		mkdtemp(path.join(os.tmpdir(), "pi-workspace-content-")).then(ownedRoot => ({ store: new ProvenanceCertificateStore(ownedRoot), ownedRoot })));
+	const pool = new ContentChunkPool(store);
+	state.contents.add(pool); return pool;
+}
+
+function retainWorkspaceChanges(changes: readonly SandboxWorkspaceChange[]): () => Promise<void> {
+	const pools = new Set(changes.flatMap(change => change.kind === "directory" ? [] : [change.before, change.after])
+		.filter((value): value is ChunkedContent => value instanceof ChunkedContent).map(value => value.pool));
+	const releases = [...pools].map(pool => pool.retain());
+	return async () => { await Promise.all(releases.map(release => release())); };
 }
 
 async function resolveWorkspaceDriver(state: WorkspaceSandboxState, options: WorkspaceSandboxOptions, sourceRoot?: string,
@@ -490,31 +545,44 @@ function workspaceBranch(snapshot: WorkspaceExecutionSnapshot, sourceRoot: strin
 	const { changes } = snapshot, { executionFingerprint } = action, backend = "git_worktree", id = randomUUID();
 	const checkpoint = Object.freeze({ backend, id, lineage: parent?.token.lineage ?? id, depth: (parent?.token.depth ?? -1) + 1 });
 	const retained: WorkspaceCheckpoint = { token: checkpoint, sourceRoot, parent, changes, committed: false };
+	retiredWorkspaceCheckpoints.register(checkpoint, retainWorkspaceChanges(changes));
 	owner.checkpoints.set(checkpoint, retained);
 	const commit = new EffectCommit<ToolSettlement>();
 	const inputs = new Map<string, ResourceInput>();
+	const release = snapshot.dispose ?? retainWorkspaceChanges(changes);
 	let disposed = false, readInputs = false, transferred: ReturnType<NonNullable<WorldBranch<ToolSettlement>["takeCommittedInputs"]>> | undefined;
+	let disposal: Promise<void> | undefined, reading: ReturnType<NonNullable<WorldBranch<ToolSettlement>["takeReadInputs"]>> | undefined;
 	return {
 		backend, checkpoint, output: snapshot.output, validate,
 		resources: Object.freeze([...new Set(changes.filter((change) => !change.validationOnly).map((change) => change.resource))]),
 		capturedBytes: changes.reduce((total, change) => total + sandboxChangeBytes(change), 0),
 		executionMetrics: Object.freeze({ ...snapshot.executionMetrics }),
 		compatibility: Object.freeze({ status: "compatible" as const, backend, executionFingerprint }),
-		commit: () => commit.run(() => commitSandboxExecution(owner, snapshot, inputs).then(output => {
+		commit: () => commit.run(() => {
+			if (disposed) throw effectCommitFailure(new Error("workspace branch is disposed"), "recoverable");
+			return commitSandboxExecution(owner, snapshot, inputs).then(output => {
 			// A proven commit anchors future forks in the live workspace, independently of unadopted ancestors.
 			retained.committed = true; retained.parent = undefined; if (disposed) inputs.clear(); return output;
-		})),
-		takeReadInputs: async (maxBytes) => {
+		}); }),
+		takeReadInputs: maxBytes => {
+			if (reading) return Promise.resolve(undefined);
+			return reading = (async () => {
 			// Every file this branch read keeps its pre-image until commit; each serves reads while it stays unchanged.
-			const preimages = new Map<string, ResourceInput>(changes.flatMap((change) => change.kind !== "directory" && change.before && !change.aliases && textual(change.before) ? [[change.target, change.before]] : []));
-			if (disposed || commit.result || readInputs || !preimages.size) return undefined;
+			if (disposed || commit.result || readInputs) return undefined;
 			readInputs = true;
+			const preimages = new Map<string, ResourceInput>();
+			for (const change of changes) if (change.kind !== "directory" && change.before && !change.aliases && await textual(change.before)) preimages.set(change.target, change.before);
+			if (!preimages.size || disposed) return undefined;
 			const inputs = await createCommittedResourceInputs(action, sourceRoot, preimages, maxBytes).catch(() => undefined);
 			// Stamped only now: each file must still hold the bytes it was read with, or the owner would vouch for stale ones.
-			const current = inputs && await withFilesystemReadView(undefined, view => Promise.all([...preimages].map(async ([target, before]) => sameOptionalBytes((await readRegularState(target, undefined, view))?.content, before as Uint8Array))))
+			const current = inputs && await withFilesystemReadView(undefined, view => Promise.all([...preimages].map(async ([target, before]) => {
+				const content = before as ContentVersion;
+				return sameContent((await readRegularState(target, undefined, view, content instanceof ChunkedContent ? content.pool : undefined))?.content, content);
+			})))
 				.catch(async error => { await inputs.dispose(); throw error; });
-			if (inputs && current?.every(Boolean)) return inputs;
+			if (inputs && !disposed && current?.every(Boolean)) return inputs;
 			await inputs?.dispose(); return undefined;
+			})();
 		},
 		takeCommittedInputs: async (maxBytes) => {
 			if (disposed || !retained.committed || transferred) return undefined;
@@ -527,7 +595,8 @@ function workspaceBranch(snapshot: WorkspaceExecutionSnapshot, sourceRoot: strin
 				} finally { inputs.clear(); }
 			})();
 		},
-		dispose() { disposed = true; inputs.clear(); return transferred?.then(() => {}, () => {}); },
+		dispose() { disposed = true; inputs.clear();
+			return disposal ??= Promise.allSettled([commit.result, reading, transferred]).then(release); },
 	};
 }
 
@@ -535,7 +604,10 @@ async function commitSandboxExecution(state: WorkspaceSandboxState, execution: S
 	inputs?: Map<string, ResourceInput>, privateView?: FilesystemReadView): Promise<ToolSettlement> {
 	assertWorkspaceSandboxOpen(state);
 	const { changes } = execution;
+	let release: (() => Promise<void>) | undefined;
 	const commit = (async () => {
+		const contents = await createWorkspaceContentPool(state).catch(error => { throw effectCommitFailure(error, "recoverable"); });
+		release = contents?.retain();
 		await using source = privateView ? undefined : await openFilesystemReadView().catch(error => { throw effectCommitFailure(error, "recoverable"); });
 		const view = privateView ?? source!, readonlySource = !privateView && process.platform === "linux";
 		return await withCommitLocks(
@@ -576,14 +648,14 @@ async function commitSandboxExecution(state: WorkspaceSandboxState, execution: S
 						const group = objects.get(key) ?? { source };
 						if (reference.before) {
 							if (change.operation) {
-								if (group.write && (!sameOptionalBytes(group.write.after, change.after) || group.write.afterMode !== change.afterMode)) throw new Error("inconsistent object contents");
+								if (group.write && (!sameContent(group.write.after, change.after) || group.write.afterMode !== change.afterMode)) throw new Error("inconsistent object contents");
 								group.write = change;
-							} else if (!sameOptionalBytes(source.before, change.after)) throw new Error("object change lacks a write");
+							} else if (!sameContent(source.before, change.after)) throw new Error("object change lacks a write");
 							if (source.beforeMode !== change.afterMode) {
 								if (group.mode !== undefined && group.mode !== change.afterMode) throw new Error("inconsistent object permissions");
 								group.mode = change.afterMode;
 							}
-						} else if (!sameOptionalBytes(source.after, change.after) || source.afterMode !== change.afterMode) throw new Error("inconsistent linked contents");
+						} else if (!sameContent(source.after, change.after) || source.afterMode !== change.afterMode) throw new Error("inconsistent linked contents");
 						objects.set(key, group);
 					}
 					// Capture directories before writable file handles trigger OverlayFS copy-up and change their times.
@@ -596,7 +668,7 @@ async function commitSandboxExecution(state: WorkspaceSandboxState, execution: S
 							const unchanged = change.kind !== "directory" && change.beforeIdentity && change.before
 								? await view.stat(change.target).then(info => fileIdentity(info) === change.beforeIdentity ? info : undefined, () => undefined) : undefined;
 							const current = unchanged ? { content: (change as SandboxFileChange).before!, mode: Number(unchanged.mode & 0o777n), identity: unchanged }
-								: change.kind === "directory" ? await readSandboxDirectoryState(change.target, undefined, view) : await readRegularState(change.target, undefined, view);
+								: change.kind === "directory" ? await readSandboxDirectoryState(change.target, undefined, view) : await readRegularState(change.target, undefined, view, contents);
 							baselines.set(change, current);
 							if (change.kind === "directory" && change.validationOnly ? !!current !== !!change.before : !sameSandboxState(current,
 								change.kind === "directory" ? change.before : change.before && { content: change.before, mode: change.beforeMode ?? 0 }))
@@ -635,7 +707,7 @@ async function commitSandboxExecution(state: WorkspaceSandboxState, execution: S
 					}
 					for (const group of objects.values()) if (group.write || group.mode !== undefined) {
 						nativeStarted = true;
-						if (group.write) { await group.handle!.truncate(0); await group.handle!.writeFile(group.write.after!); }
+						if (group.write) await writeContent(group.handle!, group.write.after!, group.source.before);
 						if (group.mode !== undefined && process.platform !== "win32") await group.handle!.chmod(group.mode);
 					}
 					for (const change of orderWorkspaceChanges(changes.filter(change => !change.validationOnly), change => ({
@@ -660,13 +732,13 @@ async function commitSandboxExecution(state: WorkspaceSandboxState, execution: S
 							// Native writes are authoritative from their first file effect; created parents still roll back.
 							await createParentDirectories(change.root, change.target, view, createdDirectories, parents);
 							let descriptor = descriptors.get(change);
-							if (descriptor) { applied.push(change); await descriptor.truncate(0); }
+							if (descriptor) { applied.push(change); }
 							else {
 								// Exclusive creation already gives an empty file; only existing files need truncation.
 								descriptor = await open(change.target, "wx", 0o666);
 								descriptors.set(change, descriptor); applied.push(change);
 							}
-							await descriptor.writeFile(change.after!);
+							await writeContent(descriptor, change.after!, change.before);
 							continue;
 						}
 						applied.push(change);
@@ -697,7 +769,7 @@ async function commitSandboxExecution(state: WorkspaceSandboxState, execution: S
 					for (const { change, names: observed } of listed) {
 						if (!inputs) continue;
 						const names = observed ?? createdEntries.get(change.target);
-						const bytes = names?.reduce((sum, name) => sum + name.length * 2 + 16, 0) ?? 0, retain = directoryBytes + bytes <= WORKSPACE_TRANSACTION_MAX_BYTES;
+						const bytes = names?.reduce((sum, name) => sum + name.length * 2 + 16, 0) ?? 0, retain = directoryBytes + bytes <= WORKSPACE_TRANSACTION_MAX_MEMORY_BYTES;
 						if (retain) directoryBytes += bytes;
 						inputs.set(change.target, { names: retain ? names : undefined });
 					}
@@ -708,7 +780,7 @@ async function commitSandboxExecution(state: WorkspaceSandboxState, execution: S
 						throw effectCommitFailure(error, "poisoned", "native file write began; its effects cannot be safely replayed or rolled back");
 					}
 					try {
-						await restoreChanges(applied, baselines, view);
+						await restoreChanges(applied, baselines, view, contents);
 						for (const directory of [...new Set(createdDirectories)].sort((left, right) => right.length - left.length)) {
 							try { await rmdir(directory); } catch (error) { if (!isMissing(error)) throw error; }
 						}
@@ -726,13 +798,13 @@ async function commitSandboxExecution(state: WorkspaceSandboxState, execution: S
 					const failure = closed.find((result) => result.status === "rejected");
 					if (failure) throw effectCommitFailure(failure.reason, "poisoned", "native file descriptor cleanup failed; completion is unknown");
 				}
-				if (inputs) for (const change of changes) if (!change.validationOnly && (change.kind === "directory" ? !change.after : textual(change.after)))
+				if (inputs) for (const change of changes) if (!change.validationOnly && (change.kind === "directory" ? !change.after : await textual(change.after)))
 					inputs.set(change.target, change.kind === "directory" ? null : change.after ?? null);
 				return execution.output;
 			},
 			view,
 		);
-	})().catch(error => { throw effectCommitFailure(error, "poisoned"); });
+	})().catch(error => { throw effectCommitFailure(error, "poisoned"); }).finally(() => release?.());
 	return state.lifetime.track(commit);
 }
 
@@ -746,17 +818,24 @@ async function forkSandboxWorkspaceFor(state: WorkspaceSandboxState, options: Sa
 async function captureSandboxWorkspace(state: WorkspaceSandboxState, options: Omit<SandboxWorkspaceBranchOptions, "action" | "parentCheckpoint">,
 	parent?: WorkspaceCheckpoint, preparation: SandboxPreparation | undefined = options.validate ? options.preparation : undefined): Promise<WorkspaceExecutionSnapshot> {
 	const sourceRoot = path.resolve(options.cwd);
-	const resolvedDriver = await resolveWorkspaceDriver(state, options.driver === "auto" || options.driver === undefined ? { ...options, driver: "git" } : options);
-	return withPrivateSandboxWorkspace(state, sourceRoot, options.gitBinary ?? "git", resolvedDriver.driver, options,
-		async (workspace) => {
-			const before = parent ? await captureSandboxStructure(workspace, true) : workspace.initialStructure;
-			const result = await options.execute(workspace);
-			const captured = "output" in result ? result : { output: result, changes: await captureWorkspaceChanges(workspace, before) };
-			const changes = ownSandboxChanges((await options.afterCapture?.(workspace, captured)) ?? captured.changes);
-			if (workspace.recycle && "output" in result) { workspace.recycle.written.push(...writtenPaths(changes)); workspace.recycle.settled = true; }
-			return { output: captured.output, changes, executionMetrics: { ...options.executionMetrics?.() } };
-		},
-		parent, preparation);
+	const ancestors: SandboxWorkspaceChange[] = [];
+	for (let checkpoint = parent; checkpoint; checkpoint = checkpoint.parent) ancestors.push(...checkpoint.changes);
+	const releaseParent = retainWorkspaceChanges(ancestors);
+	let capturedSnapshot: WorkspaceExecutionSnapshot | undefined;
+	try {
+		const resolvedDriver = await resolveWorkspaceDriver(state, options.driver === "auto" || options.driver === undefined ? { ...options, driver: "git" } : options);
+		return await withPrivateSandboxWorkspace(state, sourceRoot, options.gitBinary ?? "git", resolvedDriver.driver, options,
+			async (workspace) => {
+				const before = parent ? await captureSandboxStructure(workspace, true) : workspace.initialStructure;
+				const result = await options.execute(workspace);
+				const captured = "output" in result ? result : { output: result, changes: await captureWorkspaceChanges(workspace, before) };
+				const changes = ownSandboxChanges((await options.afterCapture?.(workspace, captured)) ?? captured.changes);
+				if (workspace.recycle && "output" in result) { workspace.recycle.written.push(...writtenPaths(changes)); workspace.recycle.settled = true; }
+				return capturedSnapshot = { output: captured.output, changes, executionMetrics: { ...options.executionMetrics?.() }, dispose: retainWorkspaceChanges([...changes, ...ancestors]) };
+			},
+			parent, preparation);
+	} catch (error) { await capturedSnapshot?.dispose?.(); throw error; }
+	finally { await releaseParent(); }
 }
 
 async function captureWorkspaceChanges(workspace: WorkspaceObservation, before: WorkspaceStructureSnapshot): Promise<readonly SandboxWorkspaceChange[]> {
@@ -813,19 +892,20 @@ async function executeMutation(state: WorkspaceSandboxState, context: Speculativ
 	const sourceRoot = path.resolve(context.cwd);
 	// Root mutations keep writes in memory; hard links and chained actions need a private workspace.
 	if (!context.parentCheckpoint && options.inPlaceMutations !== false) try {
-		return workspaceBranch(await executeFilesystemMutation(context, execute), sourceRoot, context.action, state);
+		return workspaceBranch(await executeFilesystemMutation(state, context, execute), sourceRoot, context.action, state);
 	} catch (error) { if (error !== LINKED_INPUT) throw error; }
 	return forkSandboxWorkspaceFor(state, {
 		cwd: sourceRoot, action: context.action, parentCheckpoint: context.parentCheckpoint, ...options,
-		execute: workspace => executeFilesystemMutation(context, execute, workspace),
+		execute: workspace => executeFilesystemMutation(state, context, execute, workspace),
 	}, capturedWorkspaceInputs);
 }
 
 const LINKED_INPUT = new Error("linked workspace input");
 
 /** Both substrates capture the same operation delta; only a private workspace performs speculative writes. */
-async function executeFilesystemMutation(context: SpeculativeToolExecutionContext, execute: NonNullable<ToolInvocation["filesystem"]>,
+async function executeFilesystemMutation(state: WorkspaceSandboxState, context: SpeculativeToolExecutionContext, execute: NonNullable<ToolInvocation["filesystem"]>,
 	workspace?: SandboxWorkspaceContext): Promise<WorkspaceExecutionSnapshot> {
+	const contents = workspace?.contents ?? await createWorkspaceContentPool(state), release = contents?.retain();
 	return withFilesystemReadView(undefined, async source => {
 		const sourceRoot = path.resolve(context.cwd);
 		await using privateReads = workspace ? FilesystemReadView.ambient() : undefined;
@@ -838,7 +918,7 @@ async function executeFilesystemMutation(context: SpeculativeToolExecutionContex
 		});
 		const record = (key: string, change: SandboxWorkspaceChange) => {
 			const retained = bytes - sandboxChangeBytes(changes.get(key)) + sandboxChangeBytes(change);
-			if (retained > WORKSPACE_TRANSACTION_MAX_BYTES || (!changes.has(key) && changes.size >= WORKSPACE_TRANSACTION_MAX_FILES))
+			if (retained > WORKSPACE_TRANSACTION_MAX_MEMORY_BYTES || (!changes.has(key) && changes.size >= WORKSPACE_TRANSACTION_MAX_FILES))
 				throw new Error("Workspace operation exceeds its capture budget");
 			changes.set(key, change); bytes = retained;
 		};
@@ -856,7 +936,7 @@ async function executeFilesystemMutation(context: SpeculativeToolExecutionContex
 			// Reuse the preimage until a private write requires reading the new physical state.
 			const before = previous && (!workspace || previous.validationOnly)
 				? previous.before === undefined ? undefined : { content: previous.before, mode: previous.beforeMode! }
-				: await readRegularState(file, WORKSPACE_TRANSACTION_MAX_BYTES, view);
+				: await readRegularState(file, undefined, view, contents);
 			let aliases: readonly string[] | undefined;
 			if (!previous && before && "identity" in before && before.identity && before.identity.nlink > 1n) {
 				if (!workspace) throw LINKED_INPUT;
@@ -885,7 +965,7 @@ async function executeFilesystemMutation(context: SpeculativeToolExecutionContex
 					const { captured, content } = await fileInput(logical);
 					if (content === undefined) throw new Error("Workspace input does not exist");
 					assertExistingInputPolicy(captured);
-					return Buffer.from(content.subarray(0, limit));
+					return readContent(content, 0, Math.min(content.byteLength, limit ?? content.byteLength));
 				}),
 				access: (logical, writable) => track(async () => {
 					const { file, key } = await located(logical), known = changes.get(key), mode = fsConstants.R_OK | (writable ? fsConstants.W_OK : 0);
@@ -899,7 +979,7 @@ async function executeFilesystemMutation(context: SpeculativeToolExecutionContex
 				writeFile: (logical, content) => track(async () => {
 					const { file, key, captured } = await fileInput(logical);
 					// Even an equal-content native write performs permission checks and touches the inode.
-					record(key, { ...captured, accessMode: changes.get(key)?.accessMode, validationOnly: undefined, after: Buffer.from(content), operation: "write_contents" });
+					record(key, { ...captured, accessMode: changes.get(key)?.accessMode, validationOnly: undefined, after: contents ? await captureContent(contents, content) : Buffer.from(content), operation: "write_contents" });
 					if (workspace) await writeFile(file, content, "utf8");
 				}),
 				mkdir: (logical) => track(async () => {
@@ -913,13 +993,13 @@ async function executeFilesystemMutation(context: SpeculativeToolExecutionContex
 		if (workspace) for (const [key, change] of changes) {
 			if (change.kind === "directory" && !change.validationOnly) record(key, { ...change, after: await readSandboxDirectoryState((await located(change.target)).file, undefined, view) });
 			else if (change.kind !== "directory" && !change.validationOnly &&
-				!sameOptionalBytes((await readRegularState((await located(change.target)).file, undefined, view))?.content, change.after)) {
+				!sameContent((await readRegularState((await located(change.target)).file, undefined, view, contents))?.content, change.after)) {
 				throw new Error("Workspace writes did not settle to their declared bytes");
 			}
 		}
 		const captured = [...changes.values()];
-		return { output, changes: workspace ? captured : ownSandboxChanges(captured), executionMetrics: {} };
-	});
+		return { output, changes: workspace ? captured : ownSandboxChanges(captured), executionMetrics: {}, dispose: workspace ? undefined : retainWorkspaceChanges(captured) };
+	}).finally(release);
 }
 
 async function createPrivateSandboxWorkspace(state: WorkspaceSandboxState, cwd: string, gitBinary: string,
@@ -928,6 +1008,7 @@ async function createPrivateSandboxWorkspace(state: WorkspaceSandboxState, cwd: 
 	const sourceRoot = path.resolve(cwd);
 	await withFilesystemReadView(undefined, view => assertNoSymlinkPath(sourceRoot, sourceRoot, (target, read) => captureFilesystemEntry(target, read, view)));
 	const pool = await acquireSandboxRepository(state, sourceRoot, gitBinary);
+	let contents: ContentChunkPool | undefined, releaseContents: (() => Promise<void>) | undefined;
 	let attached: PreparedGitWorkspace | undefined;
 	let sharedBaseline: SharedOverlayBaseline | undefined;
 	let overlay: LinuxOverlayfsMount | undefined;
@@ -944,6 +1025,7 @@ async function createPrivateSandboxWorkspace(state: WorkspaceSandboxState, cwd: 
 	const dispose = (unsafe = false): Promise<void> => disposal ??= (async () => {
 		const failures: unknown[] = [];
 		await workspace?.transactions.dispose().catch((error) => failures.push(error));
+		await releaseContents?.().catch(error => failures.push(error));
 		if (workspace) workspaceOwners.delete(workspace.sandboxRoot);
 		const closed = await Promise.allSettled(pins.splice(0).map(handle => handle.close()));
 		failures.push(...closed.flatMap(result => result.status === "rejected" ? [result.reason] : []));
@@ -964,6 +1046,7 @@ async function createPrivateSandboxWorkspace(state: WorkspaceSandboxState, cwd: 
 		if (failures.length) throw new AggregateError(failures, "sandbox workspace cleanup failed");
 	})();
 	try {
+		contents = await createWorkspaceContentPool(state); releaseContents = contents?.retain();
 		const prepared = typeof preparation === "object" ? preparedWorkspaceBaselines.get(preparation) : undefined;
 		// A live lower is the workspace itself: what changed since now stands in for a baseline of its bytes.
 		cursor = driver === "overlayfs" && overlayOptions.liveLower ? await pool.versions.observeChanges() : undefined;
@@ -1012,8 +1095,8 @@ async function createPrivateSandboxWorkspace(state: WorkspaceSandboxState, cwd: 
 			liveBase: liveBase || undefined,
 			hints: sourceChanges(),
 		};
-		const observation = createWorkspaceObservation(data, sourceChanges);
-		const remote = process.platform === "linux" && !ownsNativeProcesses ? ownWorkspaceObservation(() => ({ ...data, hints: sourceChanges() })) : undefined;
+		const observation = createWorkspaceObservation(data, sourceChanges, contents);
+		const remote = process.platform === "linux" && !ownsNativeProcesses ? ownWorkspaceObservation(() => ({ ...data, hints: sourceChanges() }), contents) : undefined;
 		const allocated = {
 			...observation, transactions: remote?.transactions ?? observation.transactions, pool, dispose, pinObject,
 			// Bound filesystem writes record their paths so the pool can reset this worktree.
@@ -1095,7 +1178,7 @@ async function createGitWorkspaceTransactionDriver(workspace: ReturnType<typeof 
 		return snapshot && (snapshot.complete || last) ? snapshot : captureStructure(attempt + 1);
 	}, frontier = new Map(workspace.baselineFrontier);
 	let lastStructure = workspace.initialStructure;
-	let retainedBytes = [...frontier.values()].reduce((total, state) => total + (state?.content.byteLength ?? 0), 0);
+	let retainedBytes = [...frontier.values()].reduce((total, state) => total + contentMemory(state?.content), 0);
 	const active = new Set<Capture>(), lock = new RuntimeLifecycleLane(), unknown = new Set<string>(); // Bytes last seen while others wrote.
 	let poisonReason = lastStructure.complete ? undefined : "workspace_structure_limit";
 	let clock: Awaited<ReturnType<typeof openWorkspaceChangeClock>> | undefined;
@@ -1126,7 +1209,7 @@ async function createGitWorkspaceTransactionDriver(workspace: ReturnType<typeof 
 					if (capture.before.entries.get(resource)?.kind !== "file") return undefined;
 					const state = capture.frontier.has(resource) ? capture.frontier.get(resource) : await workspace.readBase(resource, maxBytes);
 					if (state && state.content.byteLength > maxBytes) throw new Error("workspace transaction input exceeds capture limit");
-					return state && Uint8Array.from(state.content);
+					return state && readContent(state.content, 0, state.content.byteLength);
 				}),
 				finish: (ownership) => finish(capture, ownership), abort: () => abort(capture),
 			};
@@ -1192,11 +1275,11 @@ async function createGitWorkspaceTransactionDriver(workspace: ReturnType<typeof 
 				if (capture.unknown.has(relativePath) && before.entries.get(relativePath)?.kind === "file") return `overlapping_workspace_before:${relativePath}`;
 				// Bytes last seen stand for a file only while it was there when this interval began.
 				const previous = before.entries.get(relativePath)?.kind !== "file" ? undefined
-					: capture.frontier.has(relativePath) ? capture.frontier.get(relativePath) : await workspace.readBase(relativePath, WORKSPACE_TRANSACTION_MAX_BYTES);
+					: capture.frontier.has(relativePath) ? capture.frontier.get(relativePath) : await workspace.readBase(relativePath);
 				const entry = after.entries.get(relativePath);
-				beforeBytes += previous?.content.byteLength ?? 0; afterBytes += entry?.kind === "file" ? entry.size : 0;
-				if (Math.max(beforeBytes, afterBytes) > WORKSPACE_TRANSACTION_MAX_BYTES) return "workspace transaction exceeds capture limit";
-				const current = entry?.kind === "file" ? await readRegularState(path.resolve(sandboxRoot, relativePath), WORKSPACE_TRANSACTION_MAX_BYTES) : undefined;
+				const current = entry?.kind === "file" ? await readRegularState(path.resolve(sandboxRoot, relativePath), undefined, undefined, workspace.contents) : undefined;
+				beforeBytes += contentMemory(previous?.content); afterBytes += contentMemory(current?.content);
+				if (Math.max(beforeBytes, afterBytes) > WORKSPACE_TRANSACTION_MAX_MEMORY_BYTES) return "workspace transaction exceeds memory budget";
 				if (entry?.kind === "file" && (!current?.identity || statChangeDigest(current.identity) !== entry.changeDigest)) return `overlapping_workspace_write:${relativePath}`;
 				return { relativePath, ...(previous ? { before: previous.content, beforeMode: previous.mode } : {}),
 					...(current ? { after: current.content, afterMode: current.mode } : {}) };
@@ -1256,12 +1339,12 @@ async function createGitWorkspaceTransactionDriver(workspace: ReturnType<typeof 
 	async function captureTransitions(paths: readonly string[], after: WorkspaceStructureSnapshot): Promise<void> {
 		// The lock and overlap rejection keep this frontier unchanged, and each file the size its snapshot took, throughout the interval: read those at once.
 		const sizes = paths.map(relativePath => { const entry = after.entries.get(relativePath); return entry?.kind === "file" ? entry.size : undefined; });
-		if (sizes.reduce<number>((total, size) => total + (size ?? 0), 0) > WORKSPACE_TRANSACTION_MAX_BYTES) throw new Error("workspace transaction after-state exceeds capture limit");
-		const currents = await mapFilesystem([...paths.keys()], async index => sizes[index] === undefined ? undefined : readRegularState(path.resolve(sandboxRoot, paths[index]!), sizes[index]));
+		if (!workspace.contents && sizes.reduce<number>((total, size) => total + (size ?? 0), 0) > WORKSPACE_TRANSACTION_MAX_MEMORY_BYTES) throw new Error("workspace transaction after-state exceeds capture limit");
+		const currents = await mapFilesystem([...paths.keys()], async index => sizes[index] === undefined ? undefined : readRegularState(path.resolve(sandboxRoot, paths[index]!), sizes[index], undefined, workspace.contents));
 		for (const [index, relativePath] of paths.entries()) {
-			const current = currents[index], unchangedBytes = retainedBytes - (frontier.get(relativePath)?.content.byteLength ?? 0);
-			if (unchangedBytes + (current?.content.byteLength ?? 0) > WORKSPACE_TRANSACTION_MAX_BYTES) throw new Error("workspace transaction after-state exceeds capture limit");
-			retainedBytes = unchangedBytes + (current?.content.byteLength ?? 0);
+			const current = currents[index], unchangedBytes = retainedBytes - contentMemory(frontier.get(relativePath)?.content);
+			if (unchangedBytes + contentMemory(current?.content) > WORKSPACE_TRANSACTION_MAX_MEMORY_BYTES) throw new Error("workspace transaction after-state exceeds capture limit");
+			retainedBytes = unchangedBytes + contentMemory(current?.content);
 			frontier.set(relativePath, current);
 		}
 	}
@@ -1295,9 +1378,11 @@ async function createSandboxRepository(owner: WorkspaceSandboxState, sourceRoot:
 	const git = bindGit(gitBinary, parent, ["--git-dir", repository]);
 	try {
 		await bindGit(gitBinary, parent)(["init", "--bare", "--template=", repository]);
-		// This private snapshot stores raw bytes; caller configuration and attributes cannot transform them.
+		// This private snapshot stores raw bytes. Keep blobs packed so Git reads use bounded mapping windows.
 		await mkdir(path.join(repository, "info"), { recursive: true });
-		await writeFile(path.join(repository, "config"), "\n[core]\n\tautocrlf = false\n\tlongpaths = true\n\tattributesFile = /dev/null\n", { flag: "a" });
+		await writeFile(path.join(repository, "config"), "\n[core]\n\tautocrlf = false\n\tlongpaths = true\n\tattributesFile = /dev/null\n" +
+			"\tbigFileThreshold = 16m\n\tpackedGitWindowSize = 16m\n\tpackedGitLimit = 32m\n" +
+			"[fastimport]\n\tunpackLimit = 0\n[pack]\n\tthreads = 1\n\twindowMemory = 16m\n", { flag: "a" });
 		await writeFile(path.join(repository, "info", "attributes"), "* -text -eol -filter -ident -working-tree-encoding\n");
 		return {
 			owner, sourceRoot, parent, gitBinary, git,
@@ -1341,7 +1426,7 @@ async function acquireSandboxBaseline(repository: PooledGitRepository, warmup = 
 				if (commit !== baseline?.commit) await repository.git(["update-ref", "refs/heads/baseline", commit]);
 				if (commit !== baseline?.commit && Date.now() >= (repository.prunedAt ?? 0) + SANDBOX_PRUNE_INTERVAL_MS) {
 					repository.prunedAt = Date.now(); // The grace keeps objects that concurrent workspace staging has not referenced yet.
-					await repository.git(["prune", "--expire=5.minutes.ago"]).catch(() => undefined);
+					await repository.git(["gc", "--cruft", "--quiet", "--prune=5.minutes.ago"]).catch(() => undefined);
 				}
 				repository.baseline = { commit, tree, version, aliases };
 				baseline?.version.release();
@@ -1663,7 +1748,7 @@ async function materializeCheckpoint(workspace: PrivateSandboxWorkspace, checkpo
 		if (ancestor.committed && (await mapFilesystem(changes.filter(change => !change.validationOnly), async change => {
 			await assertCommitTarget(change);
 			if (change.kind === "directory") { await verifySandboxDirectoryAfter(change); return true; }
-			const current = await readRegularState(change.target);
+			const current = await readRegularState(change.target, undefined, view, workspace.contents);
 			if (change.after !== undefined) await assertFileAliases(change.root, change.target,
 				change.afterAliases ?? (change.operation ? change.aliases : undefined) ?? [change.target], current?.identity);
 			return sameSandboxState(current, change.after === undefined ? undefined : { content: change.after, mode: change.afterMode ?? change.beforeMode ?? 0 }) &&
@@ -1673,7 +1758,7 @@ async function materializeCheckpoint(workspace: PrivateSandboxWorkspace, checkpo
 		await commitSandboxExecution(workspace.pool.owner, { output: { result: { content: [], details: {} }, isError: false }, changes }, undefined, view);
 		for (const change of changes) if (!change.validationOnly && change.kind !== "directory") {
 			if (change.after !== undefined) await workspace.pinObject(change.target);
-			workspace.baselineFrontier.set(path.normalize(change.resource), await readRegularState(change.target));
+			workspace.baselineFrontier.set(path.normalize(change.resource), await readRegularState(change.target, undefined, view, workspace.contents));
 		}
 	}
 }
@@ -1689,7 +1774,7 @@ async function collectSandboxChanges(workspace: ReturnType<typeof createWorkspac
 			if (!containsFilesystemPath(workspace.sourceRoot, target) || !containsFilesystemPath(workspace.sandboxRoot, sandboxTarget)) throw new Error(`sandbox change escapes workspace: ${resource}`);
 			await Promise.all([assertNoSymlinkPath(workspace.sourceRoot, target, source), assertNoSymlinkPath(workspace.sandboxRoot, sandboxTarget, capture)]);
 			const [before, after] = await Promise.all([workspace.baselineFrontier.has(resource) ? workspace.baselineFrontier.get(resource)
-				: workspace.readBase(resource, 64 * 1024 * 1024), readRegularState(sandboxTarget)]);
+				: workspace.readBase(resource), readRegularState(sandboxTarget, undefined, undefined, workspace.contents)]);
 			return { root: workspace.sourceRoot, target, resource, before: before?.content, after: after?.content, beforeMode: before?.mode,
 				afterMode: after?.mode, afterModified: after?.identity && String(after.identity.mtimeNs), ...(before?.settled ? { beforeIdentity: before.settled } : {}) };
 		});
@@ -1758,20 +1843,24 @@ async function captureLiveBase(pool: PooledGitRepository): Promise<WorkspaceStru
 }
 
 /** A lower file read now is the one the workspace started from only while its identity is unchanged. */
-async function readLiveBase(base: WorkspaceStructureSnapshot, resource: string, maxBytes: number): Promise<RegularFileState | undefined> {
+async function readLiveBase(base: WorkspaceStructureSnapshot, resource: string, maxBytes: number, contents?: ContentChunkPool): Promise<RegularFileState | undefined> {
 	const entry = base.entries.get(resource);
 	if (entry?.kind !== "file") return undefined;
-	const takenAtMs = Date.now(), captured = await withFilesystemReadView(undefined, view => captureStableFile(entry.contentPath ?? path.join(base.root, resource), maxBytes, true, { digest: false, view }));
-	if (statChangeDigest(captured.stat) !== entry.changeDigest) throw new Error(`workspace changed since the sandbox started: ${resource}`);
-	return { content: captured.content!, mode: Number(captured.stat.mode & 0o777n), settled: settledIdentity(captured.stat, takenAtMs) };
+	const takenAtMs = Date.now(), captured = await withFilesystemReadView(undefined, view => readRegularState(entry.contentPath ?? path.join(base.root, resource), maxBytes, view, contents));
+	if (!captured?.identity || statChangeDigest(captured.identity) !== entry.changeDigest) throw new Error(`workspace changed since the sandbox started: ${resource}`);
+	return { ...captured, settled: settledIdentity(captured.identity, takenAtMs) };
 }
 
 async function readGitTreeRegularState(git: ReturnType<typeof bindGit>, tree: string, resource: string,
-	maxBytes = WORKSPACE_TRANSACTION_MAX_BYTES): Promise<RegularFileState | undefined> {
+	maxBytes = WORKSPACE_TRANSACTION_MAX_MEMORY_BYTES, contents?: ContentChunkPool): Promise<RegularFileState | undefined> {
 	const entry = gitTreeEntries(await git(["ls-tree", "-z", tree, "--", resource])).get(slash(resource));
 	if (!entry) return undefined;
 	if (entry.mode !== "100644" && entry.mode !== "100755") throw new Error(`workspace transaction resource is not a regular file: ${resource}`);
-	const content = await git(["cat-file", "blob", entry.blob], { maxBuffer: Math.max(1, Math.min(WORKSPACE_TRANSACTION_MAX_BYTES, maxBytes) + 1) });
+	const content = contents ? (await contents.capture(async sink => {
+		const hash = createHash("sha256"); let bytesRead = 0;
+		await git(["cat-file", "blob", entry.blob], { maxBuffer: maxBytes, onChunk: async chunk => { hash.update(chunk); bytesRead += chunk.length; await sink(chunk); } });
+		return { bytesRead, hash: hash.digest("hex") };
+	})).content : await git(["cat-file", "blob", entry.blob], { maxBuffer: Math.max(1, Math.min(WORKSPACE_TRANSACTION_MAX_MEMORY_BYTES, maxBytes) + 1) });
 	if (content.byteLength > maxBytes) throw new Error(`Git transaction blob exceeds capture limit: ${resource}`);
 	return { content, mode: process.platform === "win32" ? 0 : entry.mode === "100755" ? 0o755 : 0o644 };
 }
@@ -1793,10 +1882,12 @@ async function assertCommitTarget(change: SandboxWorkspaceChange, capture?: type
 	await assertNoSymlinkPath(root, target, capture);
 }
 
-async function readRegularState(target: string, maxBytes = Number.POSITIVE_INFINITY, view?: FilesystemReadView): Promise<RegularFileState | undefined> {
+async function readRegularState(target: string, maxBytes?: number, view?: FilesystemReadView, contents?: ContentChunkPool): Promise<RegularFileState | undefined> {
 	try {
-		const captured = await captureStableFile(target, maxBytes, true, { digest: false, view });
-		return { content: captured.content!, mode: process.platform === "win32" ? 0 : Number(captured.stat.mode & 0o777n), identity: captured.stat };
+		const limit = Math.min(maxBytes ?? Infinity, contents?.limits.maxLogicalBytes ?? WORKSPACE_TRANSACTION_MAX_MEMORY_BYTES);
+		const streamed = contents && await contents.capture(onChunk => captureStableFile(target, limit, false, { view, onChunk }));
+		const captured = streamed ? streamed.capture : await captureStableFile(target, limit, true, { digest: false, view });
+		return { content: streamed ? streamed.content : captured.content!, mode: process.platform === "win32" ? 0 : Number(captured.stat.mode & 0o777n), identity: captured.stat };
 	} catch (error) { if (isMissing(error)) return undefined; throw error; }
 }
 
@@ -1825,7 +1916,7 @@ export function sameSandboxState(
 ): boolean {
 	if (!left || !right) return left === right;
 	if ("content" in left || "content" in right) return "content" in left && "content" in right &&
-		Buffer.compare(left.content, right.content) === 0 && (right.mode === 0 || sameExecutableMode(left.mode, right.mode));
+		sameContent(left.content, right.content) && (right.mode === 0 || sameExecutableMode(left.mode, right.mode));
 	return left.entriesDigest === right.entriesDigest && left.mode === right.mode && left.uid === right.uid && left.gid === right.gid;
 }
 
@@ -1846,10 +1937,10 @@ function assertExistingInputPolicy(change: SandboxWorkspaceChange): void {
 
 
 /** Tool reads serve text: bytes holding a NUL among their first 8000 (git's binary test) are never kept as an input. */
-const textual = (content: Uint8Array | undefined) => !content?.subarray(0, 8000).includes(0);
+const textual = async (content: ContentVersion | undefined) => !content || !(await readContent(content, 0, Math.min(8000, content.byteLength))).includes(0);
 
 function sandboxChangeBytes(change: SandboxWorkspaceChange | undefined): number {
-	return !change || change.kind === "directory" ? 0 : (change.before?.byteLength ?? 0) + (change.after?.byteLength ?? 0);
+	return !change || change.kind === "directory" ? 0 : contentMemory(change.before) + contentMemory(change.after);
 }
 
 /** Take ownership once, before cleanup or commit locks can yield to a retained caller reference. */
@@ -1868,7 +1959,7 @@ function ownSandboxChanges(changes: readonly SandboxWorkspaceChange[], project =
 			throw new Error(`inconsistent sandbox baseline: ${change.resource}`);
 		}
 		const same = previous.kind === "directory" && change.kind === "directory" ? sameSandboxState(previous.before, change.before)
-			: previous.kind !== "directory" && change.kind !== "directory" && sameOptionalBytes(previous.before, change.before) &&
+			: previous.kind !== "directory" && change.kind !== "directory" && sameContent(previous.before, change.before) &&
 				(previous.beforeMode === undefined || change.beforeMode === undefined || sameExecutableMode(previous.beforeMode, change.beforeMode));
 		if (!same) throw new Error(`inconsistent sandbox baseline: ${change.resource}`);
 		const baseline = previous.kind === "directory" ? { before: previous.before }
@@ -1880,7 +1971,7 @@ function ownSandboxChanges(changes: readonly SandboxWorkspaceChange[], project =
 		return change.kind === "directory"
 			? { ...change, ...target, before: change.before && { ...change.before }, after: change.after && { ...change.after } }
 			: { ...change, ...target, ...projectFileMutation(change, project),
-				before: change.before && Buffer.from(change.before), after: change.after && Buffer.from(change.after) };
+				before: ownContent(change.before), after: ownContent(change.after) };
 	}).sort((left, right) =>
 		filesystemPathKey(left.target).localeCompare(filesystemPathKey(right.target)),
 	);
@@ -1890,6 +1981,7 @@ async function restoreChanges(
 	changes: readonly SandboxWorkspaceChange[],
 	baselines: ReadonlyMap<SandboxWorkspaceChange, RegularFileState | SandboxDirectoryState | undefined>,
 	view: FilesystemReadView,
+	contents?: ContentChunkPool,
 ): Promise<void> {
 	const errors: unknown[] = [];
 	for (const change of [...changes].reverse()) {
@@ -1921,7 +2013,7 @@ async function restoreChanges(
 	for (const change of changes) {
 		try {
 			const baseline = baselines.get(change);
-			const current = change.kind === "directory" ? await readSandboxDirectoryState(change.target, undefined, view) : await readRegularState(change.target, undefined, view);
+			const current = change.kind === "directory" ? await readSandboxDirectoryState(change.target, undefined, view) : await readRegularState(change.target, undefined, view, contents);
 			if (!sameSandboxState(current, baseline)) throw new Error(`sandbox rollback did not restore: ${change.resource}`);
 		} catch (error) {
 			errors.push(error);
@@ -1942,14 +2034,14 @@ function sameExecutableMode(left: number, right: number): boolean { return isExe
 
 function isExecutableMode(mode: number): boolean { return (mode & 0o111) !== 0; }
 
-async function stageAtomicWrite(content: Uint8Array, mode: number | undefined, stagingDirectory: string): Promise<string> {
+async function stageAtomicWrite(content: ContentVersion, mode: number | undefined, stagingDirectory: string): Promise<string> {
 	await mkdir(stagingDirectory, { recursive: true });
 	const temporary = path.join(stagingDirectory, `${SANDBOX_STAGING_FILE_PREFIX}${randomUUID()}.tmp`);
 	const fileMode = process.platform === "win32" ? undefined : mode;
 	const handle = await open(temporary, "wx", fileMode ?? 0o600);
 	let staged = false;
 	try {
-		await handle.writeFile(content);
+		await writeContent(handle, content);
 		await handle.sync();
 		if (fileMode !== undefined) await handle.chmod(fileMode);
 		staged = true; return temporary;
@@ -2018,68 +2110,71 @@ async function withCommitLocks<T>(changes: readonly SandboxWorkspaceChange[], ru
 	} catch (error) { throw effectCommitFailure(error, "recoverable"); }
 }
 
-function sameOptionalBytes(left: Uint8Array | undefined, right: Uint8Array | undefined): boolean {
-	if (left === undefined || right === undefined) return left === right;
-	return Buffer.compare(left, right) === 0;
-}
 
 function parseNullList(value: Uint8Array): string[] { return value.toString().split("\0").filter(Boolean).map((item) => slash(item)); }
 
 /** The existing process owner binds each private repository/index once, preserving per-call cwd and limits. */
 function bindGit(command: string, cwd: string, prefix: readonly string[] = []) {
-	return (input: readonly string[], options: { cwd?: string; environment?: Readonly<Record<string, string>>; maxBuffer?: number; input?: Buffer | AsyncIterable<Buffer> } = {}): Promise<Buffer> => {
+	return async (input: readonly string[], options: { cwd?: string; environment?: Readonly<Record<string, string>>; maxBuffer?: number;
+		input?: Buffer | AsyncIterable<Buffer>; onChunk?: (chunk: Buffer) => Promise<void> } = {}): Promise<Buffer> => {
 		const args = [...prefix, ...input];
-		const pending = execHostFile(
-			command,
-			args,
-			{
-				cwd: options.cwd ?? cwd,
-				env: {
-					...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.toUpperCase().startsWith("GIT_"))),
-					GIT_CONFIG_GLOBAL: "/dev/null",
-					GIT_CONFIG_NOSYSTEM: "1",
-					GIT_ATTR_NOSYSTEM: "1",
-					...options.environment,
-				},
-				encoding: "buffer",
-				maxBuffer: options.maxBuffer ?? 64 * 1024 * 1024,
-			},
-		);
-		const inputFinished = options.input && !Buffer.isBuffer(options.input) ? pipeline(Readable.from(options.input), pending.child.stdin!)
-			: Promise.resolve(pending.child.stdin?.end(options.input));
-		return Promise.all([pending, inputFinished]).then(([{ stdout }]) => stdout, async error => {
-			await Promise.allSettled([pending, inputFinished]);
-			if (error.stderr === undefined) throw error;
-			const detail = error.stderr.toString("utf8").trim() || error.message;
-			const shown = args.slice(0, 16).join(" ");
-			const omitted = Math.max(0, args.length - 16);
-			throw new Error(`${command} ${shown}${omitted ? ` … (${omitted} args omitted)` : ""} failed: ${detail}`);
-		});
+		const child = spawn(command, args, { cwd: options.cwd ?? cwd, windowsHide: true, stdio: ["pipe", "pipe", "pipe"], env: {
+			...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.toUpperCase().startsWith("GIT_"))),
+			GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_ATTR_NOSYSTEM: "1", ...options.environment,
+		} });
+		let stderr = "";
+		child.stderr.on("data", chunk => { if (stderr.length < 65536) stderr += String(chunk).slice(0, 65536 - stderr.length); });
+		const exited = new Promise<void>((resolve, reject) => { child.once("error", reject); child.once("close", code =>
+			code === 0 ? resolve() : reject(new Error(`${command} ${args.slice(0, 16).join(" ")} failed (${code}): ${stderr.trim()}`))); });
+		const inputFinished = options.input && !Buffer.isBuffer(options.input) ? pipeline(Readable.from(options.input), child.stdin)
+			: new Promise<void>((resolve, reject) => { child.stdin.once("error", reject); child.stdin.end(options.input, resolve); });
+		const output = (async () => {
+			const chunks: Buffer[] = []; let size = 0;
+			for await (const value of child.stdout) {
+				const chunk = value as Buffer; size += chunk.length;
+				if (size > (options.maxBuffer ?? 64 * 1024 * 1024)) throw new Error("Git output exceeds capture budget");
+				if (options.onChunk) await options.onChunk(chunk); else chunks.push(chunk);
+			}
+			return Buffer.concat(chunks);
+		})();
+		try { return (await Promise.all([output, inputFinished, exited]))[0]; }
+		catch (error) { child.kill(); await Promise.allSettled([output, inputFinished, exited]); throw error; }
 	};
 }
 
-function ownWorkspaceObservation(description: () => SandboxWorkspaceObservation): { readonly ready: () => Promise<string>;
+function ownWorkspaceObservation(description: () => SandboxWorkspaceObservation, contents?: ContentChunkPool): { readonly ready: () => Promise<string>;
 	readonly call: <Value>(method: string, args?: unknown) => Promise<Value>; readonly transactions: WorkspaceTransactionDriver } {
 	let connection: ReturnType<typeof connectNativeOwner> | undefined, initialized: Promise<string> | undefined, disposal: Promise<void> | undefined;
 	const owners = new Map<number, { readonly get: () => Promise<WorkspaceTransactionOwnership | undefined>; proof?: WorkspaceTransactionOwnership }>();
 	const ready = (): Promise<string> => {
 		if (disposal) return Promise.reject(new Error("workspace transaction driver is disposed"));
-		if (!connection) connection = connectNativeOwner("workspace", description(), async (method, args: { id: number; paths: ReadonlySet<string>; until: number }) => {
+		if (!connection) {
+			const { baselineFrontier, ...data } = description(), loan = lendContentChanges([...baselineFrontier].map(([resource, entry]) =>
+				({ resource, before: entry?.content, mode: entry?.mode, settled: entry?.settled })));
+			try { connection = connectNativeOwner("workspace", { data, baseline: loan.transfer, storeRoot: contents?.storeRoot } satisfies SandboxWorkspaceTransfer, async (method, args: { id: number; paths: ReadonlySet<string>; until: number }) => {
 			if (method === "hints") return description().hints;
 			const owner = owners.get(args.id); if (!owner) throw new Error("workspace interval owner retired");
 			if (method === "ownership") { const proof = owner.proof = await owner.get(); return proof && { ...proof, interfered: undefined }; }
 			if (method === "interfered" && owner.proof) return owner.proof.interfered(args.paths, args.until);
 			throw new Error("workspace interval ownership unavailable");
-		});
-		return initialized ??= connection.rpc.call<string>("ready");
+			});
+				initialized = connection.rpc.call<string>("ready").finally(loan.release);
+			} catch (error) { loan.release(); throw error; }
+		}
+		return initialized!;
 	};
-	const call = async <Value>(method: string, args?: unknown): Promise<Value> => { await ready(); return connection!.rpc.call<Value>(method, args); };
+	const call = async <Value>(method: string, args?: unknown, decode?: (value: unknown) => Promise<Value>): Promise<Value> => {
+		await ready(); return connection!.rpc.call<Value>(method, args, undefined, undefined, decode);
+	};
 	return { ready, call, transactions: {
 		begin: async () => {
 			const id = await call<number>("begin"); let settled = false;
 			return { readBefore: (resource, maxBytes) => call("readBefore", { id, resource, maxBytes }), abort: async () => { if (!settled) { settled = true; await call("abort", { id }); } },
 				finish: async get => { if (settled) return { complete: false, changes: [], reason: "transaction_already_settled" }; settled = true; if (get) owners.set(id, { get });
-					try { return await call("finish", { id, owned: !!get }); } finally { owners.delete(id); } } };
+					try { return await call("finish", { id, owned: !!get }, async value => {
+						const delta = value as Omit<WorkspaceTransactionDelta, "changes"> & { readonly changes: ContentChangesTransfer<WorkspaceRegularDelta> };
+						return { ...delta, changes: await receiveContentChanges(delta.changes, contents) } as WorkspaceTransactionDelta;
+					}); } finally { owners.delete(id); } } };
 		},
 		dispose: () => disposal ??= connection ? connection.rpc.call<void>("dispose").finally(() => connection!.close()) : Promise.resolve(),
 	} };

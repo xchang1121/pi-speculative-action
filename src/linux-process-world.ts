@@ -26,6 +26,7 @@ export function createLinuxProcessExecutionWorld(
 	const backend = options.backend ?? new LinuxProcessReuseBackend(options);
 	const workspaceSandbox = options.workspaceSandbox ?? new WorkspaceSandboxService();
 	const ownsWorkspaceSandbox = options.workspaceSandbox === undefined;
+	workspaceSandbox.useContentStore(backend.store);
 	const { gitBinary, driver, overlayfsBinary, fusermountBinary } = options;
 	// Processes observe their inputs' times and inodes: an overlay over the workspace itself shows the Actor's own.
 	const workspaceOptions = { gitBinary, driver, overlayfsBinary, fusermountBinary, liveLower: true };

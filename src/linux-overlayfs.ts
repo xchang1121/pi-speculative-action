@@ -1,12 +1,12 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import { link, lstat, mkdir, mkdtemp, open, readFile, rename, rm, writeFile, type FileHandle } from "node:fs/promises";
+import { link, lstat, mkdir, mkdtemp, open, readFile, rename, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { BoundedRecencyMap } from "./bounded-recency-map.ts";
 import { execHostText, resolveHostExecutable } from "./executable-path.ts";
-import { advanceFilesystemClock, hashExecutableFile, mapFilesystem } from "./filesystem-evidence.ts";
+import { advanceFilesystemClock, hashExecutableFile, mapFilesystem, openAnonymousFilesystemFile } from "./filesystem-evidence.ts";
 import { errorMessage, isMissing } from "./error-utils.ts";
 import { waitForCompletion } from "./runtime-lifecycle.ts";
 
@@ -18,8 +18,6 @@ const DEFAULT_REQUEST_CACHE_CAPACITY = 32;
 const DEFAULT_RESOLVED_CACHE_CAPACITY = 8;
 const DEFAULT_DEGRADED_CAPACITY = 16;
 const DEFAULT_NEGATIVE_CACHE_TTL_MS = 30_000;
-// asm-generic/fcntl.h: __O_TMPFILE (020000000) | O_DIRECTORY (00200000).
-const LINUX_O_TMPFILE = 0o20200000;
 
 export interface LinuxOverlayfsOptions { readonly overlayfsBinary?: string; readonly fusermountBinary?: string; }
 
@@ -37,12 +35,6 @@ export interface LinuxOverlayfsMount {
 /** The backing directories must remain alive because a FUSE mount could not be proven closed. */
 export class LinuxOverlayfsUnsafeCleanupError extends Error {
 	constructor(message: string, cause: unknown) { super(message, { cause }); this.name = "LinuxOverlayfsUnsafeCleanupError"; }
-}
-
-/** Open an unnamed regular inode in private backing storage without exposing a control path. */
-export async function openLinuxAnonymousWorkspaceFile(root: string): Promise<FileHandle> {
-	if (process.platform !== "linux") throw new Error("anonymous workspace files require Linux");
-	return open(root, fsConstants.O_WRONLY | LINUX_O_TMPFILE, 0o600);
 }
 
 type ResolvedOverlayfs = Omit<Extract<LinuxOverlayfsCapability, { readonly available: true }>, "available">;
@@ -168,7 +160,7 @@ async function probeLinuxOverlayfs(resolved: ResolvedOverlayfs): Promise<LinuxOv
 		const copiedIdentity = await lstat(path.join(root, "copy-up.txt"), { bigint: true });
 		if (copiedIdentity.dev !== mountedIdentity.dev || copiedIdentity.ino !== mountedIdentity.ino) throw new Error("OverlayFS copy-up changed object identity");
 		{
-			await using clock = await openLinuxAnonymousWorkspaceFile(upperRoot);
+			await using clock = await openAnonymousFilesystemFile(upperRoot);
 			const [workspace, anonymous, ...beforeEntries] = await Promise.all([lstat(root), clock.stat(),
 				...["copy-up.txt", "created.txt", "replaced"].map(name => lstat(path.join(root, name)))]);
 			if (!workspace.isDirectory() || !anonymous.isFile() || anonymous.nlink !== 0 ||

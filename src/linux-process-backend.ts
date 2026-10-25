@@ -1,3 +1,4 @@
+import { ContentChunkPool, DEFAULT_CONTENT_LIMITS, contentDigest, publishContent, restoreArtifactContent, writeContent } from "./content-chunks.ts";
 import { isSafeCount } from "./number-utils.ts";
 import { captureProcessContext, processLaunchOptions, routedProcessIdentity, validProcessContext, type ProcessExecutionContext, type ProcessLaunchOptions } from "./process-context.mjs";
 import { spawn } from "node:child_process";
@@ -234,7 +235,7 @@ export class LinuxProcessReuseBackend {
 	private readonly handoffs: ProcessHandoffRegistry<NativeProcessInvocation>;
 	private readonly counters: MutableLinuxProcessReuseMetrics = emptyWorldReuseMetrics();
 	private readonly actorCounters: MutableLinuxProcessReuseMetrics = emptyWorldReuseMetrics();
-	private readonly replayWorkspace = new WorkspaceSandboxService();
+	private readonly replayWorkspace: WorkspaceSandboxService;
 	private disposal?: Promise<void>;
 	private producers = 0;
 	/** A conservative hint remains visible to observations started before local work existed. */
@@ -245,6 +246,7 @@ export class LinuxProcessReuseBackend {
 			heldExecBinary: process.env.PI_SPEC_HELD_EXEC, heldExecObserverBinary: process.env.PI_SPEC_HELD_EXEC_OBSERVER, ...options };
 		configureNativeFilesystem(this.options.heldExecBinary);
 		this.store = new ProvenanceCertificateStore(options.storeRoot, { ...options.store, acceptedTaints: SAME_CONFINEMENT_TAINTS });
+		this.replayWorkspace = new WorkspaceSandboxService(this.store);
 		this.planner = new ProcessReusePlanner({ store: this.store });
 		this.handoffs = new ProcessHandoffRegistry(this.store, Math.min(MAX_CONTINUATION_BYTES, this.store.limits.maxBytes));
 		this.storage = {
@@ -292,7 +294,7 @@ export class LinuxProcessReuseBackend {
 	producerMetrics(): LinuxProcessReuseMetrics { return { ...this.counters }; }
 	private processOwner(): SynchronousProcessObserver {
 		if (this.disposed) throw new Error("native process backend disposed");
-		return this.synchronous ??= new SynchronousProcessObserver(this.options);
+		return this.synchronous ??= new SynchronousProcessObserver(this.options, this.store);
 	}
 	serializeBinding(binding: ProcessExecutionBinding, sequence = 0): SerializedProcessBinding | undefined {
 		const invocation = this.handoffs.resolveBinding(binding, binding.scope);
@@ -539,6 +541,7 @@ export class LinuxProcessReuseBackend {
 				this.add(undefined, "wholeCommandRequests");
 				const result = await TimelineInterval.outside(async () => {
 				let committed = false;
+				let plan: Awaited<ReturnType<LinuxProcessReuseBackend["plan"]>>;
 				try {
 					request.signal?.throwIfAborted();
 					const invocation = options.invocation(request);
@@ -548,10 +551,10 @@ export class LinuxProcessReuseBackend {
 					const platformFingerprint = await this.resolvePlatformFingerprint();
 					const prototype = (await TimelineInterval.collect(() => topLevelProcessPrototype(invocation, request, definedProcessEnvironment(request.environment), projection, platformFingerprint))).output;
 					const weakKey = processWeakKey(prototype);
-					const plan = await this.plan(weakKey, prototype.executablePath, projection, acceptProducer, { signal: request.signal });
+					plan = await this.plan(weakKey, prototype.executablePath, projection, acceptProducer, { signal: request.signal });
 					if (this.disposed || !plan?.certificate.result.exit) return;
 					request.signal?.throwIfAborted();
-					await replayFilesystemEffects(this.replayWorkspace, plan.artifacts, plan.certificate.result.journal, projection);
+					await replayFilesystemEffects(this.replayWorkspace, this.store, plan.artifacts, plan.certificate.result.journal, projection);
 					committed = true;
 					for (const event of loadOutputEvents(plan.artifacts, plan.certificate.result.journal)) request.onData(event.data);
 					const observation = this.observations.getStore();
@@ -563,7 +566,7 @@ export class LinuxProcessReuseBackend {
 				} catch (error) {
 					this.setError(undefined, `actor_replay:${errorMessage(error)}`);
 					if (committed || isPoisonedEffectCommit(error)) throw error;
-				}
+				} finally { await plan?.artifacts.dispose(); }
 				});
 				if (result) return result;
 				this.add(undefined, "wholeCommandMisses");
@@ -739,9 +742,9 @@ export class LinuxProcessReuseBackend {
 	dispose(): Promise<void> {
 		if (this.disposal) return this.disposal;
 		this.disposed = true;
-		this.handoffs.dispose();
+		const handoffs = this.handoffs.dispose();
 		const store = this.store.dispose();
-		return this.disposal = this.resetNativeObservation().finally(() => Promise.all([this.replayWorkspace.dispose(), store]));
+		return this.disposal = this.resetNativeObservation().finally(() => Promise.all([this.replayWorkspace.dispose(), store, handoffs]));
 	}
 
 	private async resolveReady(): Promise<ReadyBackend> {
@@ -911,7 +914,7 @@ export class LinuxProcessReuseBackend {
 							? [[slash(path.relative(session.sourceRoot, dependency.path)), startedAt] as const] : [])) };
 					session.writers.add(writer);
 					await shareSessionWriter(session, writer);
-					await replayFilesystemEffects(this.replayWorkspace, artifacts, certificate.result.journal, session.projection,
+					await replayFilesystemEffects(this.replayWorkspace, this.store, artifacts, certificate.result.journal, session.projection,
 						path.join(session.processRoot, "private")).then(() => acquired.settle?.(true, true), error => {
 							writer.observed = undefined; acquired.settle?.(!(error instanceof EffectCommitFailure && error.disposition === "recoverable")); throw error;
 						}).finally(async () => { writer.endedAt = Date.now(); await shareSessionWriter(session, writer); });
@@ -1189,7 +1192,7 @@ export class LinuxProcessReuseBackend {
 									const content = change[side], mode = change[side === "before" ? "beforeMode" : "afterMode"];
 									if (content === undefined) return { kind: "absent" };
 									if (mode === undefined) throw new Error("transaction file mode is unavailable");
-									return { kind: "file", data: await this.store.artifacts.put(content), mode, ...(side === "after" && change.afterModified ? { modified: change.afterModified } : {}) };
+									return { kind: "file", data: await publishContent(content, this.store), mode, ...(side === "after" && change.afterModified ? { modified: change.afterModified } : {}) };
 								};
 								journal.push({ sequence: journal.length, kind: "workspace", path: logicalPath, before: await state("before"), after: await state("after"),
 									...(change.kind !== "directory" ? projectFileMutation(change) : {}) });
@@ -1445,7 +1448,7 @@ export class LinuxProcessReuseBackend {
 				commit: async () => {
 					try {
 						process.signal?.throwIfAborted();
-						await replayFilesystemEffects(observation?.effects ?? this.replayWorkspace, plan.artifacts, plan.certificate.result.journal, projection);
+						await replayFilesystemEffects(observation?.effects ?? this.replayWorkspace, this.store, plan.artifacts, plan.certificate.result.journal, projection);
 					} catch (error) {
 						this.setError(undefined, `actor_child_commit:${errorMessage(error)}`);
 						throw error;
@@ -2172,40 +2175,44 @@ async function captureHostPath(physicalPath: string, role: DependencyRole, liste
 
 async function replayFilesystemEffects(
 	owner: Pick<WorkspaceSandboxService, "commitDelta">,
+	store: ProvenanceCertificateStore,
 	artifacts: VerifiedArtifactClosure,
 	journal: readonly OrderedEffectEvent[],
 	projection: ExecutionPathProjection,
 	privateStorage?: string,
 ) {
 	await using privateReads = privateStorage ? FilesystemReadView.ambient() : undefined;
-	const changes: SandboxWorkspaceChange[] = [], { workspaceRoot } = projection;
-	for (const event of journal) {
-		if (event.kind === "output") continue;
-		const target = projection.toPhysical(event.path), inside = !!target && pathContains(workspaceRoot, target);
-		if (!target || target === path.resolve(workspaceRoot) || !inside && pathContains(projection.sourceRoot, target)) {
-			throw new Error(`replay effect escapes workspace: ${event.path}`);
-		}
-		const root = inside ? workspaceRoot : await hostRoot(target), address = { root, target, resource: slash(path.relative(root, target)) };
-		if (event.before.kind === "directory" || event.after.kind === "directory") {
-			if ([event.before, event.after].some(state => state.kind !== "absent" && state.kind !== "directory")) throw new Error(`unsupported replay type change: ${event.path}`);
+	const contents = new ContentChunkPool(store);
+	try {
+		const changes: SandboxWorkspaceChange[] = [], { workspaceRoot } = projection;
+		for (const event of journal) {
+			if (event.kind === "output") continue;
+			const target = projection.toPhysical(event.path), inside = !!target && pathContains(workspaceRoot, target);
+			if (!target || target === path.resolve(workspaceRoot) || !inside && pathContains(projection.sourceRoot, target)) {
+				throw new Error(`replay effect escapes workspace: ${event.path}`);
+			}
+			const root = inside ? workspaceRoot : await hostRoot(target), address = { root, target, resource: slash(path.relative(root, target)) };
+			if (event.before.kind === "directory" || event.after.kind === "directory") {
+				if ([event.before, event.after].some(state => state.kind !== "absent" && state.kind !== "directory")) throw new Error(`unsupported replay type change: ${event.path}`);
+				changes.push({
+					...address, kind: "directory",
+					...(event.before.kind === "directory" ? { before: directoryState(event.before) } : {}),
+					...(event.after.kind === "directory" ? { after: directoryState(event.after) } : {}),
+				});
+				continue;
+			}
 			changes.push({
-				...address, kind: "directory",
-				...(event.before.kind === "directory" ? { before: directoryState(event.before) } : {}),
-				...(event.after.kind === "directory" ? { after: directoryState(event.after) } : {}),
+				...address,
+				...projectFileMutation(event, name => projection.toPhysical(name)!),
+				...(event.before.kind === "file" ? { before: await restoreArtifactContent(contents, event.before.data, artifacts), beforeMode: event.before.mode } : {}),
+				...(event.after.kind === "file" ? { after: await restoreArtifactContent(contents, event.after.data, artifacts), afterMode: event.after.mode, afterModified: event.after.modified } : {}),
 			});
-			continue;
 		}
-		changes.push({
-			...address,
-			...projectFileMutation(event, name => projection.toPhysical(name)!),
-			...(event.before.kind === "file" ? { before: artifacts.read(event.before.data), beforeMode: event.before.mode } : {}),
-			...(event.after.kind === "file" ? { after: artifacts.read(event.after.data), afterMode: event.after.mode, afterModified: event.after.modified } : {}),
-		});
-	}
-	// Inside a speculative session, what lies outside the workspace belongs to its private branch until adoption.
-	const external = privateStorage ? changes.filter(change => !pathContains(workspaceRoot, change.target)) : [];
-	if (external.length) await privateReplay(privateStorage!, external);
-	if (changes.length > external.length) await owner.commitDelta({ output: { result: { content: [], details: {} }, isError: false }, changes: changes.filter(change => !external.includes(change)) }, privateReads);
+		// Inside a speculative session, what lies outside the workspace belongs to its private branch until adoption.
+		const external = privateStorage ? changes.filter(change => !pathContains(workspaceRoot, change.target)) : [];
+		if (external.length) await privateReplay(privateStorage!, external);
+		if (changes.length > external.length) await owner.commitDelta({ output: { result: { content: [], details: {} }, isError: false }, changes: changes.filter(change => !external.includes(change)) }, privateReads);
+	} finally { await contents.dispose(); }
 }
 
 /** Apply changes in a session's private branch as its sandboxes would have: over the merged view's state, into its upper
@@ -2215,8 +2222,11 @@ async function privateReplay(storage: string, changes: readonly SandboxWorkspace
 	const merged = async (target: string) => (await lstat(path.join(upper, target)).then(() => path.join(upper, target), () => undefined)) ?? (deleted(target) ? undefined : target);
 	for (const change of changes) {
 		const current = await merged(change.target);
+		const captured = current && change.kind !== "directory" ? await captureStableFile(current, undefined, false) : undefined;
+		if (captured && change.kind !== "directory" && (!change.before || captured.bytesRead !== change.before.byteLength || `sha256:${captured.hash}` !== contentDigest(change.before)))
+			throw new Error(`resource changed before replay: ${change.target}`);
 		const state = current === undefined ? undefined : change.kind === "directory" ? await readSandboxDirectoryState(current)
-			: await readFile(current).then(async content => ({ content, mode: Number((await lstat(current)).mode) & 0o7777 }), () => undefined);
+			: { content: change.before!, mode: Number(captured!.stat.mode) & 0o7777 };
 		if (!sameSandboxState(state, change.kind === "directory" ? change.before : change.before && { content: change.before, mode: change.beforeMode! })) {
 			throw new Error(`resource changed before replay: ${change.target}`);
 		}
@@ -2226,7 +2236,11 @@ async function privateReplay(storage: string, changes: readonly SandboxWorkspace
 		if (change.kind === "directory" ? change.after : change.after !== undefined) {
 			await mkdir(path.dirname(copy), { recursive: true });
 			if (change.kind === "directory") await mkdir(copy, { recursive: true });
-			else { await writeFile(copy, change.after!); await chmod(copy, change.afterMode ?? 0o644); await restoreModifiedTimes([[copy, change.afterModified]]); }
+			else {
+				const handle = await open(copy, "w");
+				try { await writeContent(handle, change.after!); } finally { await handle.close(); }
+				await chmod(copy, change.afterMode ?? 0o644); await restoreModifiedTimes([[copy, change.afterModified]]);
+			}
 			continue;
 		}
 		await rm(copy, { recursive: true, force: true });
@@ -2674,7 +2688,7 @@ export async function validateTransferredProcessEvidence(
 		return { status: "indeterminate", cause: { stage: "freshness", code: "process_evidence_missing" }, metrics: { bytesRead: 0, filesRead: 0, mode: "exact" } };
 	}
 	const blockingTaints = evidence.taints.filter((taint) => !TRANSFERRED_INPUT_TAINTS.has(taint));
-	const validation = await validateDynamicDependencyCertificate({ ...evidence, taints: blockingTaints }, { maxFileBytes: MAX_CAPTURE_BYTES });
+	const validation = await validateDynamicDependencyCertificate({ ...evidence, taints: blockingTaints }, { maxFileBytes: DEFAULT_CONTENT_LIMITS.maxLogicalBytes });
 	const metrics = { bytesRead: validation.bytesRead, filesRead: validation.filesRead, mode: "exact" as const };
 	if (validation.status === "valid") return { status: "valid", metrics };
 	if (validation.status === "stale") return { status: "stale", cause: { stage: "freshness", code: "process_dependency_changed", detail: validation.changed.join(",") }, metrics };

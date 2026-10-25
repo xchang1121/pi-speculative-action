@@ -1,6 +1,7 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { readSync } from "node:fs";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { mkdir, open, readFile, readdir, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, readdir, rename, rm, stat, utimes, writeFile, type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { setTimeout as delay } from "node:timers/promises";
@@ -9,12 +10,13 @@ import {
 	referencedArtifacts,
 } from "./provenance-certificate.ts";
 import { type ArtifactReference, validateArtifact } from "./artifact-reference.ts";
-import { digestObject, isSha256Digest, sha256DigestAsync, type Sha256Digest } from "./stable-value-hash.ts";
+import { digestObject, isSha256Digest, sha256Digest, sha256DigestAsync, type Sha256Digest } from "./stable-value-hash.ts";
 import { stableStringify } from "./stable-json.ts";
 import { nonNegativeNumber, positiveInteger } from "./setting-input.ts";
 import { isMissing as missing } from "./error-utils.ts";
-import { mapFilesystem } from "./filesystem-evidence.ts";
+import { FilesystemObjectLease, mapFilesystem, openAnonymousFilesystemFile, type FilesystemObjectTransfer } from "./filesystem-evidence.ts";
 import { RuntimeLifecycleLane, waitForCompletion } from "./runtime-lifecycle.ts";
+import { isSafeCount } from "./number-utils.ts";
 
 /** maxCertificates is the shared metadata-record limit, including persistent input versions. */
 export interface ProvenanceStoreLimits { readonly maxCertificates: number; readonly maxBytes: number; }
@@ -47,6 +49,7 @@ const DEFAULT_ORPHAN_GRACE_MS = 5 * 60_000;
 export class ArtifactCAS {
 	readonly root: string;
 	private readonly publish: typeof publishImmutable;
+	private readonly readers = new Set<ArtifactReadView>();
 
 	constructor(root: string, publish = publishImmutable) { this.root = path.resolve(root); this.publish = publish; }
 
@@ -69,26 +72,13 @@ export class ArtifactCAS {
 	}
 
 	/** Load and integrity-check a complete effect closure before any replay side effect begins. */
-	async load(references: readonly ArtifactReference[], signal?: AbortSignal, retained?: VerifiedArtifactClosure): Promise<VerifiedArtifactClosure | undefined> {
-		signal?.throwIfAborted();
-		const sizes = new Map<Sha256Digest, number>();
-		for (const reference of references) validateArtifact(reference, sizes);
-		const values = new Map<Sha256Digest, Buffer>();
-		for (const [digest, size] of sizes) {
-			signal?.throwIfAborted();
-			const reference = { digest, size }, value = retained ? await verifyArtifact(reference, Buffer.from(retained.read(reference))) : await this.get(reference, signal);
-			if (!value) return undefined;
-			values.set(digest, value);
-		}
-		signal?.throwIfAborted();
-		return Object.freeze({ artifacts: values.size, bytes: [...values.values()].reduce((total, value) => total + value.byteLength, 0),
-			read: ({ digest, size }: ArtifactReference): Buffer => {
-				const value = values.get(digest);
-				if (!value || value.byteLength !== size) throw new Error(`artifact is outside the verified closure: ${digest}`);
-				return Buffer.from(value);
-			},
-		});
+	async load(references: readonly ArtifactReference[], signal?: AbortSignal, retained?: VerifiedArtifactClosure, limits?: Partial<ArtifactReadLimits>): Promise<VerifiedArtifactClosure | undefined> {
+		const view = new ArtifactReadView(this, limits, () => this.readers.delete(view)), loan = retained?.lend(); let complete = false;
+		this.readers.add(view);
+		try { complete = await view.restore(references, loan?.transfer, signal); return complete ? view : undefined; }
+		finally { loan?.release(); if (!complete) await view.dispose(); }
 	}
+	async dispose(): Promise<void> { await Promise.all([...this.readers].map(view => view.dispose())); }
 
 	artifactPath(digest: Sha256Digest): string {
 		const hex = digestHex(digest); return path.join(this.root, "sha256", hex.slice(0, 2), hex.slice(2));
@@ -99,6 +89,146 @@ export interface VerifiedArtifactClosure {
 	readonly artifacts: number; readonly bytes: number;
 	/** Each consumer owns its copy; callbacks cannot mutate a retained result's verified bytes. */
 	readonly read: (reference: ArtifactReference) => Buffer;
+	readonly readRange: (reference: ArtifactReference, offset: number, length: number) => Promise<Buffer>;
+	readonly memoryBytes: number;
+	readonly lend: () => { readonly transfer: readonly ArtifactTransfer[]; readonly release: () => void };
+	readonly dispose: () => Promise<void>;
+}
+
+export type ArtifactTransfer = { readonly reference: ArtifactReference } & ({ readonly object: FilesystemObjectTransfer } | { readonly bytes: Uint8Array });
+const ARTIFACT_BLOCK_BYTES = 1024 * 1024;
+interface ArtifactReadLimits { readonly maxReadBytes: number; readonly maxStoredBytes: number; readonly maxOpenChunks: number; }
+
+/** One verified content lease, shared by effect closures and input chunks. Linux owns objects; other adapters retain their existing byte images. */
+export class ArtifactReadView implements VerifiedArtifactClosure {
+	private readonly lifetime = new RuntimeLifecycleLane();
+	private readonly values = new Map<Sha256Digest, { readonly reference: ArtifactReference; readonly blocks: readonly Sha256Digest[];
+		readonly object?: FilesystemObjectLease; readonly image?: Buffer }>();
+	private readonly cas: ArtifactCAS;
+	private readonly released?: () => void;
+	private readonly limits: ArtifactReadLimits;
+	constructor(cas: ArtifactCAS, limits: Partial<ArtifactReadLimits> = {}, released?: () => void) {
+		this.cas = cas; this.released = released;
+		this.limits = Object.freeze({ maxReadBytes: limits.maxReadBytes ?? 64 * ARTIFACT_BLOCK_BYTES,
+			maxStoredBytes: limits.maxStoredBytes ?? 2 ** 31, maxOpenChunks: limits.maxOpenChunks ?? 1024 });
+		if (Object.values(this.limits).some(value => !isSafeCount(value)) || this.limits.maxReadBytes > 2 ** 30 || this.limits.maxOpenChunks > 65536)
+			throw new Error("invalid artifact lease budget");
+	}
+	get maxReadBytes(): number { return this.limits.maxReadBytes; }
+	get artifacts(): number { return this.values.size; }
+	get bytes(): number { return [...this.values.values()].reduce((sum, value) => sum + value.reference.size, 0); }
+	get memoryBytes(): number { return [...this.values.values()].reduce((sum, value) => sum + 160 + value.blocks.length * 80 + (value.image?.length ?? 0), 0); }
+	has(reference: ArtifactReference): boolean { return this.values.get(reference.digest)?.reference.size === reference.size; }
+	checkBudget(reference: ArtifactReference): void {
+		validateArtifact(reference);
+		if (!this.has(reference) && (this.bytes + reference.size > this.limits.maxStoredBytes || this.artifacts >= this.limits.maxOpenChunks))
+			throw new Error("artifact stored-byte or descriptor budget exceeded");
+	}
+	async restore(references: readonly ArtifactReference[], transfers?: readonly ArtifactTransfer[], signal?: AbortSignal): Promise<boolean> {
+		const sizes = new Map<Sha256Digest, number>(); for (const reference of references) validateArtifact(reference, sizes);
+		const supplied = transfers && new Map(transfers.map(value => [value.reference.digest, value]));
+		if (supplied && supplied.size !== transfers!.length) throw new Error("duplicate artifact transfer");
+		for (const [digest, size] of sizes) {
+			const retained = supplied?.get(digest);
+			if (supplied && !retained || !await this.add({ digest, size }, signal, retained)) return false;
+		}
+		signal?.throwIfAborted(); return true;
+	}
+	add(reference: ArtifactReference, signal?: AbortSignal, supplied?: ArtifactTransfer): Promise<boolean> {
+		return this.lifetime.serialize(async () => {
+			signal?.throwIfAborted(); validateArtifact(reference);
+			if (this.values.has(reference.digest)) { if (!this.has(reference)) throw new Error("conflicting artifact size"); return true; }
+			this.checkBudget(reference);
+			if (supplied && (supplied.reference.digest !== reference.digest || supplied.reference.size !== reference.size)) throw new Error("artifact transfer identity mismatch");
+			let object: FilesystemObjectLease | undefined, image: Buffer | undefined, snapshot: FileHandle | undefined;
+			try {
+				if (supplied && "bytes" in supplied || process.platform !== "linux") {
+					image = supplied && "bytes" in supplied ? Buffer.from(supplied.bytes) : await this.cas.get(reference, signal);
+					if (!image) return false;
+					if (image.length !== reference.size) throw new Error("artifact integrity check failed: length");
+				} else {
+					const imported = supplied && "object" in supplied ? FilesystemObjectLease.receive(supplied.object, true) : undefined;
+					if (supplied && !imported) return false;
+					const handle = imported?.handle ?? await open(this.cas.artifactPath(reference.digest), "r").catch(error => { if (!missing(error)) throw error; return undefined; });
+					if (!handle) return false;
+					try {
+						const stat = imported?.stat ?? await handle.stat({ bigint: true });
+						if (!stat.isFile() || stat.size !== BigInt(reference.size)) throw new Error("artifact integrity check failed: length");
+						object = new FilesystemObjectLease(handle, stat, true);
+					} catch (error) { await handle.close(); throw error; }
+					// A named CAS inode can be damaged in place. A lease owns verified bytes independently of that name and object.
+					if (!imported) snapshot = await openAnonymousFilesystemFile(this.cas.root);
+				}
+				const hash = createHash("sha256"), blocks: Sha256Digest[] = [];
+				for (let offset = 0; offset < reference.size; offset += ARTIFACT_BLOCK_BYTES) {
+					signal?.throwIfAborted();
+					const block = await this.block({ reference, object, image, blocks: [] }, offset / ARTIFACT_BLOCK_BYTES, false);
+					hash.update(block); blocks.push(await sha256DigestAsync(block));
+					if (snapshot) for (let written = 0; written < block.length;) {
+						const { bytesWritten } = await snapshot.write(block, written, block.length - written, offset + written);
+						if (!bytesWritten) throw new Error("artifact snapshot write made no progress"); written += bytesWritten;
+					}
+				}
+				if (`sha256:${hash.digest("hex")}` !== reference.digest) throw new Error(`artifact integrity check failed for ${reference.digest}`);
+				if (snapshot) {
+					const handle = await open(`/proc/self/fd/${snapshot.fd}`, "r"), source = object;
+					try { object = new FilesystemObjectLease(handle, await handle.stat({ bigint: true }), true); }
+					catch (error) { await handle.close(); throw error; }
+					await source!.dispose();
+				}
+				signal?.throwIfAborted(); this.values.set(reference.digest, { reference: Object.freeze({ ...reference }), object, image, blocks }); object = undefined;
+				return true;
+			} finally { try { await snapshot?.close(); } finally { await object?.dispose(); } }
+		});
+	}
+	read(reference: ArtifactReference): Buffer {
+		if (this.lifetime.sealed) throw new Error("artifact lease is closed");
+		const value = this.value(reference); this.range(reference, 0, reference.size);
+		const result = Buffer.allocUnsafe(reference.size);
+		for (let offset = 0; offset < result.length; offset += ARTIFACT_BLOCK_BYTES) {
+			const block = result.subarray(offset, Math.min(result.length, offset + ARTIFACT_BLOCK_BYTES));
+			if (value.image) value.image.copy(block, 0, offset, offset + block.length);
+			else for (let count = 0; count < block.length;) { const read = readSync(value.object!.handle.fd, block, count, block.length - count, offset + count); if (!read) throw new Error("artifact truncated"); count += read; }
+			if (sha256Digest(block) !== value.blocks[offset / ARTIFACT_BLOCK_BYTES]) throw new Error("artifact integrity check failed");
+		}
+		return result;
+	}
+	readRange(reference: ArtifactReference, offset: number, length: number): Promise<Buffer> {
+		return this.lifetime.serialize(async () => {
+			const value = this.value(reference); this.range(reference, offset, length); const result = Buffer.allocUnsafe(length);
+			for (let copied = 0; copied < length;) {
+				const position = offset + copied, index = Math.floor(position / ARTIFACT_BLOCK_BYTES), start = position % ARTIFACT_BLOCK_BYTES;
+				const block = await this.block(value, index), count = Math.min(length - copied, block.length - start);
+				block.copy(result, copied, start, start + count); copied += count;
+			}
+			return result;
+		});
+	}
+	lend() {
+		if (this.lifetime.sealed) throw new Error("artifact lease is closed");
+		const loans: { readonly release: () => void }[] = [], transfer: ArtifactTransfer[] = [];
+		const release = () => { for (const loan of loans) loan.release(); };
+		try { for (const { reference, object, image } of this.values.values()) {
+			if (image) transfer.push({ reference, bytes: Uint8Array.from(image) });
+			else { const loan = object!.lend(); if (!loan) throw new Error("artifact object lease is closed"); loans.push(loan); transfer.push({ reference, object: loan.transfer }); }
+		} return { transfer, release }; } catch (error) { release(); throw error; }
+	}
+	dispose(): Promise<void> { return this.lifetime.close(async () => { await this.lifetime.drain(); await Promise.allSettled([...this.values.values()].map(value => value.object?.dispose())); this.values.clear(); this.released?.(); }); }
+	private value(reference: ArtifactReference) {
+		const value = this.values.get(reference.digest);
+		if (!value || value.reference.size !== reference.size) throw new Error(`artifact is outside the verified closure: ${reference.digest}`); return value;
+	}
+	private range(reference: ArtifactReference, offset: number, length: number): void {
+		if (!isSafeCount(offset) || !isSafeCount(length) || offset + length > reference.size || length > this.maxReadBytes) throw new Error("artifact read budget exceeded");
+	}
+	private async block(value: ArtifactReadView["values"] extends Map<unknown, infer Value> ? Value : never, index: number, verify = true): Promise<Buffer> {
+		const offset = index * ARTIFACT_BLOCK_BYTES, size = Math.min(ARTIFACT_BLOCK_BYTES, value.reference.size - offset), buffer = Buffer.allocUnsafe(size);
+		if (value.image) value.image.copy(buffer, 0, offset, offset + size);
+		else await value.object!.borrow(async handle => {
+			for (let count = 0; count < size;) { const { bytesRead } = await handle.read!(buffer, count, size - count, offset + count); if (!bytesRead) throw new Error("artifact truncated"); count += bytesRead; }
+		});
+		if (verify && await sha256DigestAsync(buffer) !== value.blocks[index]) throw new Error("artifact integrity check failed"); return buffer;
+	}
 }
 
 /** Certificate metadata and its indexes share one cross-process transaction; immutable payloads remain in the CAS. */
@@ -135,7 +265,7 @@ export class ProvenanceCertificateStore {
 		});
 	}
 	loadArtifacts(references: readonly ArtifactReference[], signal?: AbortSignal, retained?: VerifiedArtifactClosure): Promise<VerifiedArtifactClosure | undefined> {
-		return this.read(signal => this.artifacts.load(references, signal, retained), signal);
+		return this.read(signal => this.artifacts.load(references, signal, retained, { maxStoredBytes: this.limits.maxBytes }), signal);
 	}
 	/** A finite publication owns its payloads until sealing; other processes cannot collect between its writes. */
 	withPublication<T>(operation: () => Promise<T>): Promise<T> { return this.exclusive(() => operation()); }
@@ -236,7 +366,7 @@ export class ProvenanceCertificateStore {
 	dispose(): Promise<void> {
 		this.stopped.abort(new Error("provenance store is closed"));
 		clearTimeout(this.maintenance); this.maintenance = undefined;
-		return this.lifecycle.close(async () => { await this.lifecycle.drain(); this.closeDatabase(); });
+		return this.lifecycle.close(async () => { await this.lifecycle.drain(); await this.artifacts.dispose(); this.closeDatabase(); });
 	}
 	private closeDatabase(): void {
 		clearTimeout(this.maintenance); this.maintenance = undefined;

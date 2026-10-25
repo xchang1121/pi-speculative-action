@@ -15,7 +15,7 @@ import { containsFilesystemPath, filesystemPathKey, relativeFilesystemPath } fro
 import { RuntimeLifecycleLane, SharedAbortScope } from "./runtime-lifecycle.ts";
 import { TimelineInterval } from "./task-timing.ts";
 import type { ValidationMetrics } from "./settlement.ts";
-import { ChunkedContent, ContentChunkPool, parseContentManifest, type ContentChunkLimits, type ChunkedContentManifest } from "./content-chunks.ts";
+import { ChunkedContent, ContentChunkPool, parseContentManifest, contentDigest, contentMemory, type ContentVersion, type ContentChunkLimits, type ChunkedContentManifest } from "./content-chunks.ts";
 import type { ProvenanceCertificateStore } from "./reuse-store.ts";
 import { validateArtifact, type ArtifactReference } from "./artifact-reference.ts";
 import { isSha256Digest, sha256Digest, type Sha256Digest } from "./stable-value-hash.ts";
@@ -50,11 +50,11 @@ export type ResourceObservation = ResourceDependency & { readonly fingerprint: s
 	readonly aliases?: readonly { readonly paths: readonly string[]; readonly links: number }[] };
 
 /** Supplied bytes and poststates remain proposals until exact adoption validation. */
-export type ResourceInput = Uint8Array | { readonly content: Uint8Array; readonly computation: TimelineInterval } |
+export type ResourceInput = ContentVersion | { readonly content: ContentVersion; readonly computation: TimelineInterval } |
 	{ readonly names?: readonly string[]; readonly computation?: TimelineInterval } |
 	{ readonly type: "file" | "directory"; readonly computation?: TimelineInterval } | null;
 
-const inputContent = (input: ResourceInput | undefined) => input instanceof Uint8Array ? input : input && "content" in input ? input.content : undefined;
+const inputContent = (input: ResourceInput | undefined) => input instanceof Uint8Array || input instanceof ChunkedContent ? input : input && "content" in input ? input.content : undefined;
 
 export type ResourceValidationMetrics = ValidationMetrics;
 
@@ -246,6 +246,7 @@ export class ResourceReadView {
 	private readonly load?: (dependency: ResourceDependency) => Promise<void>;
 	private readonly observeObject?: (target: string, capture: StableFilesystemCapture) => void;
 	readonly contents?: ContentChunkPool;
+	private readonly contentOwners = new Map<ContentChunkPool, { readonly dispose: () => Promise<void> }>();
 	readonly verifyingInputs: boolean;
 	constructor(maxBytes: number, load?: (dependency: ResourceDependency) => Promise<void>, boundary?: ResourceReadView["boundary"],
 		observeObject?: ResourceReadView["observeObject"], storage?: ContentChunkPool | "verify") {
@@ -256,6 +257,7 @@ export class ResourceReadView {
 		this.observeObject = observeObject;
 		this.contents = storage instanceof ContentChunkPool ? storage : undefined;
 		this.verifyingInputs = storage === "verify";
+		if (this.contents) this.retainContentPool(this.contents);
 	}
 	get bytes(): number { return this.capturedBytes; }
 	get remainingBytes(): number { return Math.max(0, this.maxBytes - this.capturedBytes); }
@@ -365,6 +367,7 @@ export class ResourceReadView {
 		this.capturedBytes += Math.min(0, additional);
 		if (previous?.object && retained.object !== previous.object) this.releaseObject(previous);
 		this.objectCount += Number(retained.object !== undefined) - Number(previous?.object !== undefined);
+		if (retained.type === "file" && retained.content instanceof ChunkedContent) this.retainContentPool(retained.content.pool);
 		this.entries.set(key, { ...retained, bytes });
 	}
 	// Windows F_OK observes the final reparse point, including a dangling junction.
@@ -645,7 +648,8 @@ export class ResourceReadView {
 	dispose(): void | Promise<void> {
 		this.failure = new Error("resource_snapshot_disposed");
 		if (this.owner) return;
-		if (this.contents) void this.preparations().lifetime.release(this.contents);
+		for (const owner of this.contentOwners.values()) void this.preparations().lifetime.release(owner);
+		this.contentOwners.clear();
 		for (const entry of this.entries.values()) this.releaseObject(entry);
 		this.entries.clear(); this.objectCount = 0;
 		return this.disposal ??= this.prepared ? this.prepared.lifetime.close(async () => {
@@ -654,6 +658,9 @@ export class ResourceReadView {
 				this.prepared!.lifetime.release(resource)))]);
 			this.prepared!.bindings.clear();
 		}) : this.pending?.then(() => {}, () => {});
+	}
+	private retainContentPool(pool: ContentChunkPool): void {
+		if (!this.contentOwners.has(pool)) this.contentOwners.set(pool, { dispose: pool.retain() });
 	}
 	private releaseObject(entry: CapturedResource): void {
 		if (entry.object) void this.preparations().lifetime.release(entry.object);
@@ -914,7 +921,7 @@ export class ResourceVersionManager {
 		if (dependencies?.length === 0 || (!dependencies && retainBytes === undefined)) throw new Error("resource_dependencies_unproven");
 		if (providedInputs && retainBytes === undefined) throw new Error("resource_snapshot_budget_invalid");
 		return this.captureToken(dependencies, retainBytes, providedInputs && new Map([...providedInputs]
-			.map(([target, input]) => [filesystemPathKey(path.resolve(this.root, target)), input && !(input instanceof Uint8Array)
+			.map(([target, input]) => [filesystemPathKey(path.resolve(this.root, target)), input && !(input instanceof Uint8Array) && !(input instanceof ChunkedContent)
 				? "names" in input ? { ...input, names: input.names && [...input.names] } : { ...input } : input])));
 	}
 
@@ -1425,23 +1432,23 @@ async function fingerprintDependencies(
 				// Join concurrent reads of this identity; a settled capture stands for a later read only below, by the file's identity.
 				const provided = suppliedContent;
 				const chunked = !provided && view?.contents;
-				const reserved = chunked ? 96 + Math.ceil(Number(info.size) / (1024 * 1024)) * 112 : provided?.byteLength ?? Number(info.size);
+				const reserved = chunked ? 96 + Math.ceil(Number(info.size) / (1024 * 1024)) * 112 : provided ? contentMemory(provided) : Number(info.size);
 				const retain = !view?.verifyingInputs && (view?.reserve(reserved) ?? false);
 				if ((provided || chunked) && !retain) throw new Error("resource_snapshot_budget_exceeded");
-				const bytes = provided && Buffer.from(provided);
+				const bytes = provided && (provided instanceof ChunkedContent ? provided : Buffer.from(provided));
 				// Supplied bytes own data, never a host observation window; adoption validates them exactly.
 				// A file unchanged since an earlier read of it, by the racy-git rule, needs no read unless its bytes are retained.
 				const gitBlob = scope === "tree_content" && treeObjects !== undefined;
 				const streamed = chunked && await chunked.capture(onChunk => fingerprintIO(() => captureStableFile(target, chunked.limits.maxLogicalBytes, false,
 					{ stat: info, realPath: realTarget, gitBlob, view: filesystem, onChunk })));
-				const content: StableFilesystemCapture = streamed ? streamed.capture : bytes ? { content: bytes, bytesRead: bytes.length, hash: hash("sha256", bytes), stat: info, realPath: realTarget,
+				const content: StableFilesystemCapture = streamed ? streamed.capture : bytes ? { content: bytes instanceof ChunkedContent ? undefined : bytes, bytesRead: bytes.length, hash: contentDigest(bytes).slice(7), stat: info, realPath: realTarget,
 					computation: supplied && "computation" in supplied ? supplied.computation : undefined }
 					: !retain && cachedCapture(info, realTarget, gitBlob) || await fingerprintIO(() => captureStableFile(target, retain ? Number(info.size) : undefined, retain, {
 						stat: info, realPath: realTarget, retainObject: retain && view!.canRetainObject, gitBlob, view: filesystem }));
 				assertInside(realRoot, content.realPath);
-				retainEntry({ type: "file", content: streamed ? streamed.content : content.content, computation: content.computation,
+				retainEntry({ type: "file", content: streamed ? streamed.content : bytes ?? content.content, computation: content.computation,
 					version: view?.verifyingInputs ? { hash: content.hash, size: content.bytesRead } : undefined,
-					object: content.object ?? (bytes && retain && view!.canRetainObject ? null : undefined),
+					object: content.object ?? (bytes instanceof Buffer && retain && view!.canRetainObject ? null : undefined),
 					realPath: content.realPath }, retain ? reserved : 0);
 				return {
 					...fingerprintFile(content),

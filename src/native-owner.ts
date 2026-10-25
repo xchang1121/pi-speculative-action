@@ -8,7 +8,9 @@ const restoreError = (error: RemoteError) => error.disposition ? effectCommitFai
 
 type RpcResponse<State> = { readonly data: Uint8Array } | { readonly attached: number | undefined } |
 	{ readonly value?: unknown; readonly error?: RemoteError; readonly state?: State };
-export type NativeRpcContext = { readonly signal: AbortSignal; readonly onData: (data: Buffer) => void; readonly attached: (pid?: number) => void };
+export type NativeRpcContext = { readonly signal: AbortSignal; readonly onData: (data: Buffer) => void; readonly attached: (pid?: number) => void;
+	/** Reply-owned loans remain valid through the receiver's asynchronous verification. */
+	readonly retain: (release: () => void) => void };
 
 /** A request owns its reply channel; synchronous reads never dispatch the caller's callbacks. */
 export function createNativeRpc<State = never>(port: MessagePort, clock: Int32Array,
@@ -18,17 +20,20 @@ export function createNativeRpc<State = never>(port: MessagePort, clock: Int32Ar
 	let failure: Error | undefined;
 	port.on("message", ({ method, args, reply }: { method: string; args: never; reply?: MessagePort }) => {
 		const controller = new AbortController(), cancel = () => controller.abort(new Error("native work cancelled"));
-		if (reply) { track(reply); reply.on("message", cancel); reply.once("close", cancel); }
+		const retained: (() => void)[] = [], release = () => { for (const close of retained.splice(0)) close(); };
+		if (reply) { track(reply); reply.on("message", cancel); reply.once("close", () => { cancel(); release(); }); }
 		const send = (response: RpcResponse<State>) => { reply?.postMessage(response); Atomics.add(clock, 0, 1); Atomics.notify(clock, 0); };
 		void Promise.resolve().then(() => { if (failure) throw failure;
-			return invoke(method, args, { signal: controller.signal, onData: data => send({ data }), attached: pid => send({ attached: pid }) }); })
-			.then(value => send({ value, state: state?.() })).catch(error => send({ error: remoteError(error), state: state?.() })).finally(() => reply?.close());
+			return invoke(method, args, { signal: controller.signal, onData: data => send({ data }), attached: pid => send({ attached: pid }),
+				retain: close => { if (!reply || controller.signal.aborted) close(); else retained.push(close); } }); })
+			.then(value => send({ value, state: state?.() })).catch(error => { release(); send({ error: remoteError(error), state: state?.() }); })
+			.finally(() => { if (!retained.length) reply?.close(); });
 	});
 	function notify(method: string, args?: unknown): void { port.postMessage({ method, args }); }
-	function call<Value>(method: string, args?: unknown, signal?: AbortSignal, onData?: (data: Buffer) => void): Promise<Value> {
-		try { return request<Value>(method, args, signal, onData).completion; } catch (error) { return Promise.reject(error); }
+	function call<Value>(method: string, args?: unknown, signal?: AbortSignal, onData?: (data: Buffer) => void, decode?: (value: unknown) => Value | Promise<Value>): Promise<Value> {
+		try { return request<Value>(method, args, signal, onData, [], decode).completion; } catch (error) { return Promise.reject(error); }
 	}
-	function request<Value>(method: string, args?: unknown, signal?: AbortSignal, onData?: (data: Buffer) => void, transfers: readonly Transferable[] = []) {
+	function request<Value>(method: string, args?: unknown, signal?: AbortSignal, onData?: (data: Buffer) => void, transfers: readonly Transferable[] = [], decode?: (value: unknown) => Value | Promise<Value>) {
 		if (failure) throw failure; signal?.throwIfAborted();
 		const { port1, port2 } = new MessageChannel(), cancel = () => port1.postMessage(undefined); track(port1);
 		let failed: { error: unknown } | undefined, settle!: (response: RpcResponse<State>) => void;
@@ -37,7 +42,8 @@ export function createNativeRpc<State = never>(port: MessagePort, clock: Int32Ar
 				if ("attached" in response) return;
 				if ("data" in response) { try { if (!failed) onData?.(Buffer.from(response.data)); } catch (error) { failed = { error }; cancel(); } return; }
 				if (response.state) observed?.(response.state);
-				if (failed || response.error) reject(failed ? failed.error : restoreError(response.error!)); else resolve(response.value as Value);
+				if (failed || response.error) reject(failed ? failed.error : restoreError(response.error!));
+				else { try { resolve(decode ? decode(response.value) : response.value as Value); } catch (error) { reject(error); } }
 			};
 			port1.on("message", settle); port1.once("close", () => reject(failure ?? new Error("native work channel closed")));
 			signal?.addEventListener("abort", cancel, { once: true });

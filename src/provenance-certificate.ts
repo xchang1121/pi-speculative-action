@@ -4,7 +4,7 @@ import { isSafeCount, nonNegativeCount as finiteTimestamp } from "./number-utils
 import { cloneSharedData, isRecord, stableEqual, stableStringify } from "./stable-json.ts";
 import type { WorkspaceDirectoryState, WorkspaceFileMutation } from "./workspace-state.ts";
 import { normalizeTimelineComputation, type SerializedTimelineComputation } from "./task-timing.ts";
-import { type ArtifactReference, validateArtifact } from "./artifact-reference.ts";
+import { type ArtifactReference, validateArtifact, parseContentManifest, type ChunkedContentManifest } from "./artifact-reference.ts";
 export { type ArtifactReference, validateArtifact } from "./artifact-reference.ts";
 
 /** Decimal strings preserve filesystem cookies beyond JavaScript's exact integer range. */
@@ -131,7 +131,7 @@ export interface DynamicDependencyCertificate {
 export type WorkspaceEffectState =
 	| { readonly kind: "absent" }
 	/** `modified` is the file's modification time in nanoseconds, which a replay restores. */
-	| { readonly kind: "file"; readonly data: ArtifactReference; readonly mode: number; readonly modified?: string }
+	| { readonly kind: "file"; readonly data: ArtifactReference | ChunkedContentManifest; readonly mode: number; readonly modified?: string }
 	| ({ readonly kind: "directory" } & WorkspaceDirectoryState);
 
 export type OrderedEffectEvent =
@@ -289,7 +289,8 @@ export function referencedArtifacts(certificate: ProcessProvenanceCertificate): 
 	for (const event of certificate.result.journal) {
 		if (event.kind === "output") unique.set(event.data.digest, event.data);
 		else for (const state of [event.before, event.after]) {
-			if (state.kind === "file") unique.set(state.data.digest, state.data);
+			if (state.kind === "file") for (const reference of "chunks" in state.data ? state.data.chunks : [state.data])
+				if (reference) unique.set(reference.digest, reference);
 		}
 	}
 	for (const object of certificate.result.resources?.objects ?? []) if (object.content) unique.set(object.content.digest, object.content);
@@ -584,7 +585,14 @@ function normalizeWorkspaceEffectState(state: WorkspaceEffectState, artifactSize
 	if (state.kind === "absent") return { kind: "absent" };
 	if (!isSafeCount(state.mode, 0, 0o777)) throw new Error("invalid workspace effect mode");
 	if (state.kind === "file" && state.modified !== undefined && !/^(?:0|[1-9]\d{0,19})$/.test(state.modified)) throw new Error("invalid workspace effect time");
-	if (state.kind === "file") { validateArtifact(state.data, artifactSizes); return { ...state, data: { ...state.data } }; }
+	if (state.kind === "file") {
+		if (state.data && "chunks" in state.data) {
+			const data = parseContentManifest(state.data);
+			for (const reference of data.chunks) if (reference) validateArtifact(reference, artifactSizes);
+			return { ...state, data };
+		}
+		validateArtifact(state.data, artifactSizes); return { ...state, data: { ...state.data } };
+	}
 	if (
 		!isSha256Digest(state.entriesDigest) || !isSafeCount(state.uid) || !isSafeCount(state.gid)
 	) {

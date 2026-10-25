@@ -7,6 +7,9 @@ import type { LinuxProcessBackendOptions, LinuxProcessReuseBackend, LinuxProcess
 import type { CapturedFilesystemTransfer } from "./filesystem-evidence.ts";
 import type { WorkspaceSandboxService, SandboxExecutionDelta } from "./workspace-sandbox.ts";
 import type { ProcessExecutionRequest } from "./process-execution.ts";
+import { ContentChunkPool, receiveContentChanges, type ContentChangesTransfer } from "./content-chunks.ts";
+import type { ProvenanceCertificateStore } from "./reuse-store.ts";
+import type { SandboxWorkspaceChange } from "./workspace-sandbox.ts";
 
 type SerializedDependency = Omit<TimelineDependency, "computation" | "shared"> & {
 	readonly computation: SerializedTimelineComputation;
@@ -63,6 +66,7 @@ export function restoreNativeDependency(dependency: SerializedDependency): Timel
 /** Only this private channel is pumped; synchronous execution never dispatches caller callbacks. */
 export class SynchronousProcessObserver {
 	private readonly connection: ReturnType<typeof connectNativeOwner<WorkerState>>;
+	private readonly store: ProvenanceCertificateStore;
 	private closing?: Promise<void>;
 	private failure?: Error;
 	private sequence = 0;
@@ -72,7 +76,8 @@ export class SynchronousProcessObserver {
 	private readonly callbacks = new Map<number, (method: string, args: never, context: NativeRpcContext) => Promise<unknown>>();
 	private state: WorkerState = { live: false, metrics: emptyWorldReuseMetrics() };
 
-	constructor(options: LinuxProcessBackendOptions) {
+	constructor(options: LinuxProcessBackendOptions, store: ProvenanceCertificateStore) {
+		this.store = store;
 		this.connection = connectNativeOwner<WorkerState>("backend", options, (method, args: { id: number }, context) => {
 			const callback = this.callbacks.get(args.id); if (!callback) throw new Error("native work callback retired"); return callback(method, args as never, context);
 		}, state => {
@@ -109,7 +114,8 @@ export class SynchronousProcessObserver {
 		try {
 			const authority = await this.rpc.call<SharedArrayBuffer>("open", { id: lease.id, workspace, sourceRoot: input.sourceRoot, invocation,
 				scope: input.scope, producer: TimelineInterval.producer }, signal);
-			const call = <Value>(operation: string, value?: unknown, request?: ProcessExecutionRequest) => this.rpc.call<Value>("session", { id: lease.id, operation, value }, request?.signal, request?.onData);
+			const call = <Value>(operation: string, value?: unknown, request?: ProcessExecutionRequest, decode?: (value: unknown) => Promise<Value>) =>
+				this.rpc.call<Value>("session", { id: lease.id, operation, value }, request?.signal, request?.onData, decode);
 			const snapshot = () => this.read<SessionSnapshot>("snapshot", lease.id);
 			let closing: Promise<void> | undefined;
 			const ownership = new ProcessHandoffOwnership(input.onOperationAdopted, input.acceptOperationScope, undefined, authority, async <Value>(apply: () => Promise<Value>) => {
@@ -127,7 +133,8 @@ export class SynchronousProcessObserver {
 				metrics: () => Object.freeze(snapshot().metrics),
 				executionBindings: () => Object.freeze(snapshot().bindings.flatMap(binding => backend.restoreBinding(binding) ?? [])),
 				computationDependencies: () => Object.freeze(snapshot().computations.flatMap(dependency => restoreNativeDependency(dependency) ?? [])),
-				seal: changes => call("seal", changes), validate: () => call("validate"),
+				seal: _changes => call("seal", [], undefined, value => receiveContentChanges(value as ContentChangesTransfer<SandboxWorkspaceChange>, input.workspace.contents)),
+				validate: () => call("validate"),
 				close: () => closing ??= call<void>("close").finally(() => signal?.removeEventListener("abort", abort)),
 				dispose: () => { retiredSessions.unregister(lease); signal?.removeEventListener("abort", abort);
 					return this.closing || this.failure ? Promise.resolve() : this.rpc.call<void>("release", lease.id); },
@@ -137,12 +144,16 @@ export class SynchronousProcessObserver {
 
 	attach(request: SynchronousProcessRequest, commit?: WorkspaceSandboxService["commitDelta"], borrow?: ProcessHandoffLender) {
 		const id = ++this.sequence;
-		this.callbacks.set(id, AsyncResource.bind(async (method, args: { delta: SandboxExecutionDelta; key: Parameters<ProcessHandoffLender>[0]; excluded: Parameters<ProcessHandoffLender>[1] }, context) => {
-			if (method === "effects" && commit) return commit(args.delta);
+		this.callbacks.set(id, AsyncResource.bind(async (method, args: { delta: Omit<SandboxExecutionDelta, "changes"> & { changes: ContentChangesTransfer<SandboxWorkspaceChange> }; key: Parameters<ProcessHandoffLender>[0]; excluded: Parameters<ProcessHandoffLender>[1] }, context) => {
+			if (method === "effects" && commit) {
+				const contents = new ContentChunkPool(this.store);
+				try { return await commit({ ...args.delta, changes: await receiveContentChanges(args.delta.changes, contents) }); }
+				finally { await contents.dispose(); }
+			}
 			if (method === "borrow" && borrow) return borrow(args.key, args.excluded, context.signal);
 			throw new Error("native observation callback unavailable");
 		}));
-		const buffers = request.handoffs.results.flatMap(result => [...result.artifacts.map(artifact => artifact.bytes.buffer as ArrayBuffer),
+		const buffers = request.handoffs.results.flatMap(result => [...result.artifacts.flatMap(artifact => "bytes" in artifact ? [artifact.bytes.buffer as ArrayBuffer] : []),
 			...(result.continuation ? [result.continuation.image.buffer as ArrayBuffer] : [])]);
 		const pending = this.rpc.request<SynchronousProcessResult>("observe", { id, request }, undefined, undefined, request.asynchronous ? [] : buffers);
 		void pending.completion.catch(() => undefined);

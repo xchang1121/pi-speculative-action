@@ -1,4 +1,5 @@
 import { fauxText } from "@earendil-works/pi-ai";
+import { readContent } from "../src/content-chunks.ts";
 import { readText } from "./filesystem.ts";
 import { disposable, onExit, gated, deferred, nextTurn } from "./async.ts";
 import { once } from "node:events";
@@ -249,7 +250,7 @@ nativeTest.for(["journal", "whole-released", "whole-consumed", "custom", "dispos
 			await fixture.inOwner(async state => { state.other = await state.opened.mock.calls[1].arguments[0].workspace.transactions.begin(); });
 			await writeFile(path.join(workspace.sandboxRoot, "input.txt"), "after");
 			const interfered = vi.fn(async () => false), delta = await next.finish(async () => ({ written: new Set(["input.txt"]), observed: new Map(), endedAt: Date.now(), interfered }));
-			expect(delta.complete).toBe(true); expect(delta.changes.map(change => [change.relativePath, Buffer.from(change.before!).toString(), Buffer.from(change.after!).toString()])).toEqual([["input.txt", "before", "after"]]);
+			expect(delta.complete).toBe(true); expect(await Promise.all(delta.changes.map(async change => [change.relativePath, (await readContent(change.before!)).toString(), (await readContent(change.after!)).toString()]))).toEqual([["input.txt", "before", "after"]]);
 			expect(delta.changes.map(change => [change.beforeMode, change.afterMode])).toEqual([[0o600, 0o600]]);
 			expect(interfered).toHaveBeenCalledOnce(); await fixture.inOwner(state => state.other.abort());
 		} else {
@@ -326,7 +327,7 @@ int main(int argc, char **argv) { int fd = open(argv[2], O_WRONLY | O_TRUNC); if
 			expect(await executeProcess(fixture, sibling.executor, other)).toEqual({ exitCode: 0, output: "" });
 			const changes = await sibling.seal([]);
 			expect(changes.map(change => change.resource), JSON.stringify({ captures: await fixture.inOwner(state => state.captures), validation: await sibling.validate() })).toEqual([disjoint ? "other.txt" : "input.txt"]);
-			expect(changes.map(change => change.kind === "directory" ? [] : [Buffer.from(change.before!).toString(), Buffer.from(change.after!).toString()])).toEqual([[disjoint ? "base" : "A", "B"]]);
+			expect(await Promise.all(changes.map(async change => change.kind === "directory" ? [] : [(await readContent(change.before!)).toString(), (await readContent(change.after!)).toString()]))).toEqual([[disjoint ? "base" : "A", "B"]]);
 			if (!disjoint) { expect(await sibling.validate()).toMatchObject({ status: "stale" }); await fixture.write("input.txt", "A"); }
 			const validation = await sibling.validate(); expect(validation, JSON.stringify(validation)).toMatchObject({ status: "valid" });
 			return;
@@ -584,12 +585,12 @@ nativeTest.for(["missing", "appeared", "file", "blocked", "symlink", "lexical", 
 			await rm(root, { recursive: true, force: true });
 		});
 		fixture = await benchmark("command-", "git");
-		await fixture.inOwner((state, mode, target) => {
-			const lstat = state.fs.lstat;
+		await fixture.inOwner(async (state, mode, target) => {
+			const { FilesystemReadView } = await state.load("../src/filesystem-evidence.ts"), stat = FilesystemReadView.prototype.stat;
 			state.listening = state.method(state.net.Server.prototype, "listen"); state.permissions = state.method(state.fs, "chmod");
-			state.method(state.fs, "lstat", async (...args: unknown[]) => {
+			state.method(FilesystemReadView.prototype, "stat", async function(this: unknown, ...args: unknown[]) {
 				if (mode === "appeared" && String(args[0]) === target) await state.fs.writeFile(target, "appeared");
-				return lstat(...args);
+				return Reflect.apply(stat, this, args);
 			});
 		}, mode, target);
 		await fixture.write("input.txt", "input\n");
@@ -613,6 +614,7 @@ int main(int argc, char **argv) {
 			await using branch = disposable(await fixture.fork(command));
 			expect(textOutput(branch.output.result)).toBe(mode.startsWith("socket") ? `${mode.endsWith("blocked") ? 20 : privateWrite || mode === "socket-listening" || mode === "socket-file" ? 13 : 2}\n` : "prepared");
 			if (!privateWrite) expect(await branch.validate?.()).toMatchObject({ status: absent || mode === "file" ? "valid" : "indeterminate" });
+			if (mode === "appeared") expect(await readText(target)).toBe("appeared");
 			if (privateWrite) await expect(filesystem.access(target)).rejects.toMatchObject({ code: "ENOENT" });
 			expect(connections).toBe(0);
 			if (absent) {
@@ -1574,11 +1576,16 @@ int main(int argc, char **argv) {
 			for (const certificate of history) await fixture.backend.store.put(certificate);
 			await fixture.write("input.txt", "after\n");
 			await expect(validateTransferredProcessEvidence(certificate!.dependencyCertificate)).resolves.toMatchObject({ status: "stale" });
-			await fixture.inOwner(state => { state.validation = state.method(state.fs, "open"); });
+			await fixture.inOwner(state => {
+				const open = state.fs.open; state.validationPaths = [];
+				state.method(state.fs, "open", async (...args: unknown[]) => {
+					const handle = await open(...args); state.validationPaths.push(await state.fs.readlink(`/proc/self/fd/${handle.fd}`)); return handle;
+				});
+			});
 			for (const value of ["after", "before", "history-3", "after"]) {
-				await fixture.write("input.txt", `${value}\n`); await fixture.inOwner(state => state.validation.mock.resetCalls());
+				await fixture.write("input.txt", `${value}\n`); await fixture.inOwner(state => { state.validationPaths = []; });
 				expect(await fixture.backend.bindingStale(binding!)).toBe(value === "after");
-				expect(await fixture.inOwner((state, target) => state.validation.mock.calls.filter(({ arguments: [file] }: { arguments: unknown[] }) => file === target).length,
+				expect(await fixture.inOwner((state, target) => state.validationPaths.filter((file: string) => file === target).length,
 					path.join(fixture.workspace, "input.txt"))).toBe(1); // History shares one pinned read; each lookup captures it again.
 			}
 

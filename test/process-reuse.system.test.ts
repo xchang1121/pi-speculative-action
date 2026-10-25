@@ -405,9 +405,12 @@ test.each(["existing", "new", "borrowed"])("selects a %s ready producer and reta
 	await writeFile(target, "damage"); await utimes(target, new Date(0), new Date(0)); await peer(f.root, undefined, [], "collect").completed;
 	expect(await f.store.artifacts.get(reference)).toBeUndefined(); expect(f.output(borrowed.plan)).toBe("slow result");
 	borrowed.plan.artifacts.read(reference).fill(0); expect(f.output(borrowed.plan)).toBe("slow result");
-	const mutable = Buffer.from("slow result"), source = { ...borrowed.plan.artifacts, read: () => { queueMicrotask(() => mutable.fill(0)); return mutable; } };
-	expect(f.output(await f.lookup([slow], undefined, new Map([[slow.id, source]])))).toBe("slow result");
-	expect(await f.lookup([slow], undefined, new Map([[slow.id, { ...borrowed.plan.artifacts, read: () => Buffer.alloc(reference.size) }]]))).toBeUndefined();
+	const mutable = Buffer.from("slow result"), contentLoan = vi.spyOn(borrowed.plan.artifacts, "lend").mockImplementation(() => {
+		queueMicrotask(() => mutable.fill(0)); return { transfer: [{ reference, bytes: Buffer.from(mutable) }], release: () => {} };
+	});
+	expect(f.output(await f.lookup([slow], undefined, new Map([[slow.id, borrowed.plan.artifacts]])))).toBe("slow result");
+	contentLoan.mockImplementation(() => ({ transfer: [{ reference, bytes: Buffer.alloc(reference.size) }], release: () => {} }));
+	expect(await f.lookup([slow], undefined, new Map([[slow.id, borrowed.plan.artifacts]]))).toBeUndefined(); contentLoan.mockRestore();
 	f.registry.configure(8, 1); expect(f.registry.results(f.request.weakKey, { sessionID: "system", turnID: "one" })).toHaveLength(1);
 	expect(first.computation).toBe(graph);
 	borrowed.settle?.(false); expect(f.registry.hasResults).toBe(false);
@@ -419,6 +422,19 @@ test.each(["existing", "new", "borrowed"])("selects a %s ready producer and reta
 	await f.registry.publish(f.request.weakKey, oversized, metadata, async () => false, undefined, arrival !== "existing" ? graph : undefined);
 	expect(f.registry.hasResults).toBe(false); expect(oversized.computation).toBeUndefined();
 	f.registry.configure(8, 64 * 1024); await f.publish(await f.reserve(), "bounded"); await f.consume(f.actor(), "bounded");
+	f.registry.clearCompleted(); f.store.configure({ maxBytes: 8192 });
+	for (let index = 0; index < 3; index++) {
+		const acquired = await f.registry.acquire({ ...f.common, lookup: async () => undefined,
+			producer: { ownership: new ProcessHandoffOwnership(), executablePath: f.request.executablePath } });
+		if (acquired.kind !== "work") throw new Error("expected producer");
+		await f.registry.publish(f.common.key, acquired.work, await f.produce(String(index).repeat(4096), index + 10, true), async () => false);
+	}
+	const retained = () => f.registry.results(f.common.key, f.common.scope);
+	expect(retained()).toHaveLength(2); expect(retained().map(certificate => certificate.createdAt)).toEqual([12, 11]);
+	expect(retained().flatMap(referencedArtifacts).reduce((sum, reference) => sum + reference.size, 0)).toBe(8192);
+	f.store.configure({ maxBytes: 4096 }); f.registry.configure(8);
+	expect(retained()).toHaveLength(1);
+	await f.consume(f.actor(), "2".repeat(4096));
 });
 
 test.each(["released", "consumed", "cancelled", "raced", "whole-released", "whole-consumed", "forwarded", "forwarded-stale", "forwarded-whole", "producer-consumed", "producer-released",
@@ -440,7 +456,14 @@ test.each(["released", "consumed", "cancelled", "raced", "whole-released", "whol
 			const relay = own(new ProcessHandoffRegistry<string>(f.store, 64 * 1024)); cleanup.push(await relay.receive(transfer, scope, () => {}));
 			const nested = relay.lend(scope); cleanup.push(nested.settle); transfer = structuredClone(nested.transfer);
 		}
-		if (outcome === "loan-corrupt") transfer.results[0]!.artifacts[0]!.bytes.fill(0);
+		if (outcome === "loan-corrupt") {
+			const artifact = transfer.results[0]!.artifacts[0]!;
+			if ("bytes" in artifact) artifact.bytes.fill(0);
+			else {
+				const corrupt = own((await f.store.loadArtifacts([await f.store.artifacts.put(Buffer.alloc(artifact.reference.size))]))!), loan = corrupt.lend(); cleanup.push(loan.release);
+				Object.assign(artifact, loan.transfer[0], { reference: artifact.reference });
+			}
+		}
 		if (outcome === "loan-stale") await writeFile(f.input, "changed input");
 		const receiving = receiver.receive(transfer, scope, () => { throw new Error("a lookup cannot issue adoption feedback"); });
 		if (outcome === "loan-corrupt") await expect(receiving).rejects.toThrow("integrity check failed");

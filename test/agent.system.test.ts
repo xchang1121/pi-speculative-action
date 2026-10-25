@@ -741,6 +741,12 @@ test.for(["in-place", "git", "single-in-place", "single-git", "checkpoint-git", 
 		await f.ready(2);
 	} finally { controller.abort(); gate.release(); nativeGate.release(); await Promise.allSettled([first, second]); await f.dispose(); await sandbox.dispose(); }
 	expect(await read()).toBe("one three\n");
+	const retiring = new WorkspaceSandboxService(), aliases = [...new Set([file, path.join(cwd, alias)])];
+	const adopted = retiring.commitDelta({ output: { result: { content: [], details: {} }, isError: false }, changes: [{ root: cwd, target: file, resource: "notes.txt",
+		before: Buffer.from("one three\n"), after: Buffer.from("one final\n"), beforeMode: 0o644, afterMode: 0o644, operation: "write_contents", aliases }] });
+	const retired = retiring.dispose();
+	try { await adopted; } finally { await retired; }
+	for (const name of aliases) expect(await readText(name)).toBe("one final\n");
 });
 
 test.for(["independent", "unchanged", "batch", "batch-known", "mismatch-text", "mismatch-error", "mismatch-inflight", "mismatch-budget", "parent-miss", "stale", "same-resource", "missing-input", "independent-create",

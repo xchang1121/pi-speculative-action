@@ -1,5 +1,6 @@
 import { afterEach, expect, test, vi } from "vitest";
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { promisify } from "node:util";
 import { mkdir, mkdtemp, open, lstat, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import * as filesystem from "node:fs/promises";
@@ -8,7 +9,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ArtifactReference } from "../src/artifact-reference.ts";
 import type { Sha256Digest } from "../src/stable-value-hash.ts";
-import { ContentChunkPool, CONTENT_CHUNK_BYTES } from "../src/content-chunks.ts";
+import { ContentChunkPool, CONTENT_CHUNK_BYTES, captureContent } from "../src/content-chunks.ts";
 import { FILESYSTEM_METADATA_FIELDS } from "../src/filesystem-evidence.ts";
 import { ResourceVersionManager, type ResourceVersionToken } from "../src/resource-version.ts";
 import { ProvenanceCertificateStore } from "../src/reuse-store.ts";
@@ -151,7 +152,7 @@ linux("keeps active content across clear, republishes its roots, and rejects sta
 		const record = (await f.store.getInputVersion(second))!, target = f.store.artifacts.artifactPath(record.artifacts[0]!.digest);
 		await writeFile(target, "corrupted bytes!");
 		await expect(f.manager.restore(second, memoryBudget)).rejects.toThrow(/integrity/);
-		await expect(restored!.view!.readFile(file)).rejects.toThrow(/integrity/);
+		expect((await restored!.view!.readFile(file)).toString()).toBe("original content");
 		await restored!.release(); await expect(restored!.view!.readFile(file)).rejects.toThrow(/disposed/);
 	} finally { await f.close(); }
 });
@@ -161,14 +162,14 @@ linux("drains admitted chunk reads before releasing pins and immediately revokes
 	const native = await vi.importActual<typeof filesystem>("node:fs/promises");
 	vi.spyOn(filesystem, "open").mockImplementation(async (...args) => {
 		const handle = await native.open(...args);
-		if (String(args[0]).startsWith(f.store.artifacts.root) && args[1] === "r") opened.push(handle);
+		if (args[1] === "r" && (String(args[0]).startsWith(f.store.artifacts.root) || String(args[0]).startsWith("/proc/self/fd/"))) opened.push(handle);
 		return handle;
 	});
 	try {
 		await writeFile(file, "admitted input");
 		const token = await f.manager.capture([{ path: file, scope: "content" }], memoryBudget); f.tokens.push(token);
-		expect(opened.length).toBe(1);
-		for (const handle of opened) {
+		const active = opened.filter(handle => handle.fd !== -1); expect(active).toHaveLength(1);
+		for (const handle of active) {
 			const read = handle.read;
 			vi.spyOn(handle, "read").mockImplementation(async (...args) => { const result = await Reflect.apply(read, handle, args); await pause.wait(); return result; });
 		}
@@ -179,6 +180,42 @@ linux("drains admitted chunk reads before releasing pins and immediately revokes
 		pause.release(); expect((await reading).toString()).toBe("admitted input"); await closing;
 		expect(opened.every(handle => handle.fd === -1)).toBe(true);
 	} finally { pause.release(); await f.close(); }
+});
+
+linux("shares immutable chunk versions across publication, borrowing, damage, collection and cold loading", async () => {
+	const f = await fixture(), pool = new ContentChunkPool(f.store), receiver = new ContentChunkPool(f.store), release = pool.retain();
+	const opened: filesystem.FileHandle[] = [], native = await vi.importActual<typeof filesystem>("node:fs/promises"), pause = gated();
+	vi.spyOn(filesystem, "open").mockImplementation(async (...args) => {
+		const handle = await native.open(...args); opened.push(handle); return handle;
+	});
+	try {
+		const text = "x".repeat(CONTENT_CHUNK_BYTES - 1) + "😀end", content = await captureContent(pool, text);
+		expect((await content.read()).toString()).toBe(text);
+		const capturing = pool.capture(async sink => { await pause.wait(); await sink(Buffer.from("overlap")); return { bytesRead: 7, hash: createHash("sha256").update("overlap").digest("hex") }; });
+		const publishing = f.store.withPublication(async () => { pause.release(); await content.publish(); });
+		await Promise.all([capturing, publishing]);
+		const loan = pool.lend(); let borrowed;
+		try { borrowed = await receiver.restore(content.manifest, loan.transfer); } finally { loan.release(); }
+		const references = content.manifest.chunks.filter((value): value is ArtifactReference => value !== null);
+		await writeFile(f.store.artifacts.artifactPath(references[0]!.digest), "damaged");
+		expect((await content.read()).toString()).toBe(text); expect((await borrowed.read()).toString()).toBe(text);
+		const rejected = new ContentChunkPool(f.store);
+		try { await expect(rejected.restore(content.manifest)).rejects.toThrow(/integrity/); } finally { await rejected.dispose(); }
+		await f.store.clear(); await release(); expect(pool.openChunks).toBe(0);
+		expect((await borrowed.read()).toString()).toBe(text);
+		const saved = await f.store.withPublication(async () => { await borrowed.publish(); return f.store.putInputVersion(borrowed.manifest, references); });
+		const cold = JSON.parse((await promisify(execFile)(process.execPath, ["--input-type=module", "-e", `
+			import { ContentChunkPool } from ${JSON.stringify(new URL("../src/content-chunks.ts", import.meta.url).href)};
+			import { ProvenanceCertificateStore } from ${JSON.stringify(new URL("../src/reuse-store.ts", import.meta.url).href)};
+			const store = new ProvenanceCertificateStore(${JSON.stringify(f.cache)}), pool = new ContentChunkPool(store);
+			try { const record = await store.getInputVersion(${JSON.stringify(saved.id)}), content = await pool.restore(record.payload);
+				console.log(JSON.stringify({ pid: process.pid, text: (await content.read()).toString(), bytes: pool.storedBytes }));
+			} finally { await pool.dispose(); await store.dispose(); }
+		`], { maxBuffer: 4 * CONTENT_CHUNK_BYTES })).stdout);
+		expect(cold.pid).not.toBe(process.pid); expect(cold.text).toBe(text); expect(cold.bytes).toBe(Buffer.byteLength(text));
+		await receiver.dispose(); expect(receiver.openChunks).toBe(0);
+		expect(opened.length).toBeGreaterThan(0); expect(opened.every(handle => handle.fd === -1)).toBe(true);
+	} finally { pause.release(); await pool.dispose(); await receiver.dispose(); await f.close(); }
 });
 
 linux("binds restored input values to their observations even when a publisher seals inconsistent data", async () => {

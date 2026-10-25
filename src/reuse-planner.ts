@@ -95,7 +95,7 @@ export class ProcessReusePlanner {
 			let artifacts: VerifiedArtifactClosure | undefined;
 			try { artifacts = await this.store.loadArtifacts(referencedArtifacts(certificate), signal, request.live?.artifacts?.get(certificate.id)); }
 			catch { reasons.add("artifact_unreadable"); continue; }
-			signal.throwIfAborted();
+			if (signal.aborted) { await artifacts?.dispose(); signal.throwIfAborted(); }
 			if (!artifacts) { reasons.add("artifact_missing"); continue; }
 			metrics.artifactsLoaded += artifacts.artifacts; metrics.artifactBytesRead += artifacts.bytes;
 			const kind = certificate.result.continuation ? "running_resume" : "completed_replay";

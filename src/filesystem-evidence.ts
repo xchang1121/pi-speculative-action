@@ -1,6 +1,6 @@
 import { digestObject, type Sha256Digest } from "./stable-value-hash.ts";
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, constants, fstatSync, openSync, readlinkSync, type BigIntStats, type Stats } from "node:fs";
+import { closeSync, constants, fstatSync, openSync, read, readlinkSync, type BigIntStats, type Stats } from "node:fs";
 import fs, { type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { containsFilesystemPath, slash } from "./path-utils.ts";
@@ -44,7 +44,14 @@ export function filesystemObservationDigest(stat: Partial<FilesystemObservationE
 
 const IDENTITY_FIELDS = ["dev", "ino", "mode", "nlink", "uid", "gid", "rdev", "size", "mtimeNs", "ctimeNs"] as const;
 type FilesystemIdentity = Pick<BigIntStats, typeof IDENTITY_FIELDS[number]>;
-export type FilesystemObjectHandle = { readonly fd: number; stat(options: { bigint: true }): Promise<BigIntStats>; close(): Promise<void> };
+export type FilesystemObjectHandle = { readonly fd: number; stat(options: { bigint: true }): Promise<BigIntStats>; close(): Promise<void>;
+	read?(buffer: Buffer, offset: number, length: number, position: number): Promise<{ readonly bytesRead: number }> };
+
+/** Open an unnamed regular inode in private backing storage without exposing a control path. */
+export async function openAnonymousFilesystemFile(root: string): Promise<FileHandle> {
+	if (process.platform !== "linux") throw new Error("anonymous filesystem files require Linux");
+	return fs.open(root, constants.O_WRONLY | 0o20200000, 0o600); // __O_TMPFILE | O_DIRECTORY
+}
 
 /** Retain identity without retaining a pathname or copying bytes. The caller owns the returned lease. */
 export async function pinFilesystemObject(target: string): Promise<{ readonly stat: BigIntStats; close(): Promise<void> }> {
@@ -199,8 +206,8 @@ export async function withFilesystemReadView<T>(view: FilesystemReadView | undef
 	try { await owned.verify(); return result; } catch (error) { try { await discard?.(result); } finally { throw error; } }
 }
 
-export type CapturedFilesystemTransfer = Omit<StableFilesystemCapture, "stat" | "object" | "content" | "computation"> & {
-	readonly fd: number; readonly active: SharedArrayBuffer; readonly stat: FilesystemIdentity; readonly content?: Uint8Array; readonly computation?: SerializedTimelineComputation;
+export type CapturedFilesystemTransfer = Omit<StableFilesystemCapture, "stat" | "object" | "content" | "computation"> & FilesystemObjectTransfer & {
+	readonly stat: FilesystemIdentity; readonly content?: Uint8Array; readonly computation?: SerializedTimelineComputation;
 };
 export const FILESYSTEM_CONCURRENCY = 12;
 
@@ -233,40 +240,69 @@ export type StableFilesystemCapture = {
 	readonly blob?: string;
 };
 
-/** A content version and its kernel object share one revocable borrowing lifetime. */
-export class CapturedFilesystemObject {
+export interface FilesystemObjectTransfer {
+	readonly fd: number; readonly active: SharedArrayBuffer; readonly process: number;
+	readonly identity: Readonly<Pick<BigIntStats, "dev" | "ino">>; readonly readable: boolean;
+}
+
+/** Kernel-object ownership is independent of content and observation proofs. Loans only cross this process's thread boundary. */
+export class FilesystemObjectLease {
 	private readonly lifetime = new RuntimeLifecycleLane();
-	private readonly handle: FilesystemObjectHandle;
-	private readonly capture: StableFilesystemCapture;
-	constructor(handle: FilesystemObjectHandle, capture: StableFilesystemCapture) { this.handle = handle; this.capture = capture; }
-	borrow<T>(consume: (capture: StableFilesystemCapture, handle: FilesystemObjectHandle) => Promise<T>): Promise<T> {
-		return this.lifetime.admit(() => consume(this.capture, this.handle));
+	readonly handle: FilesystemObjectHandle;
+	private readonly identity: Readonly<Pick<BigIntStats, "dev" | "ino">>;
+	private readonly readable: boolean;
+	constructor(handle: FilesystemObjectHandle, identity: Readonly<Pick<BigIntStats, "dev" | "ino">>, readable = false) {
+		this.handle = handle; this.identity = identity; this.readable = readable;
 	}
-	/** Threads share the descriptor table; the sender keeps this pin until the receiver acknowledges its own copy. */
-	lend(computation = this.capture.computation): { readonly transfer: CapturedFilesystemTransfer; readonly release: () => void } | undefined {
-		if (this.lifetime.sealed) return;
+	borrow<T>(consume: (handle: FilesystemObjectHandle) => Promise<T>): Promise<T> { return this.lifetime.admit(() => consume(this.handle)); }
+	lend(): { readonly transfer: FilesystemObjectTransfer; readonly release: () => void } | undefined {
+		if (this.lifetime.sealed || process.platform !== "linux") return;
 		const active = new Int32Array(new SharedArrayBuffer(4)); Atomics.store(active, 0, 1);
-		const { object: _object, stat, content, computation: _computation, ...capture } = this.capture;
-		const transfer = { ...capture, fd: this.handle.fd, active: active.buffer, stat: Object.fromEntries(IDENTITY_FIELDS.map(key => [key, stat[key]])) as FilesystemIdentity,
-			content: content && Uint8Array.from(content), computation: computation && TimelineInterval.serialize(computation) };
-		const { promise, resolve: release } = Promise.withResolvers<void>(); this.lifetime.track(promise);
-		return { transfer, release: () => { Atomics.store(active, 0, 0); release(); } };
+		const transfer = { fd: this.handle.fd, active: active.buffer, process: process.pid, readable: this.readable,
+			identity: { dev: this.identity.dev, ino: this.identity.ino } };
+		const { promise, resolve } = Promise.withResolvers<void>(); this.lifetime.track(promise);
+		return { transfer, release: () => { Atomics.store(active, 0, 0); resolve(); } };
 	}
-	/** Synchronous import cannot dispatch caller callbacks; a fresh O_PATH descriptor preserves independent ownership. */
-	static receive(transfer: CapturedFilesystemTransfer): StableFilesystemCapture | undefined {
+	/** Reopen independently, then check both object identity and the still-active borrowing authority. */
+	static receive(transfer: FilesystemObjectTransfer, readable = false): { readonly handle: FilesystemObjectHandle; readonly stat: BigIntStats } | undefined {
 		let fd: number | undefined;
 		try {
+			if (process.platform !== "linux" || transfer.process !== process.pid || readable && !transfer.readable) return;
 			const active = new Int32Array(transfer.active); if (!Atomics.load(active, 0)) return;
-			fd = openSync(`/proc/self/fd/${transfer.fd}`, 0x200000);
+			fd = openSync(`/proc/self/fd/${transfer.fd}`, readable ? constants.O_RDONLY : 0x200000);
 			const stat = fstatSync(fd, { bigint: true });
-			if (!Atomics.load(active, 0) || !sameFilesystemIdentity(transfer.stat, stat)) return;
-			const { fd: _fd, active: _active, computation, content, ...capture } = transfer, owned = fd;
-			const result = { ...capture, stat, content: content && Buffer.from(content), computation: computation && TimelineInterval.restore(computation) };
-			const object = new CapturedFilesystemObject({ fd: owned, stat: async () => fstatSync(owned, { bigint: true }), close: async () => closeSync(owned) }, result);
-			fd = undefined; return { ...result, object };
+			if (!Atomics.load(active, 0) || transfer.identity.dev !== stat.dev || transfer.identity.ino !== stat.ino) return;
+			const owned = fd; fd = undefined;
+			return { stat, handle: { fd: owned, stat: async () => fstatSync(owned, { bigint: true }), close: async () => closeSync(owned),
+				read: (buffer, offset, length, position) => new Promise((resolve, reject) => read(owned, buffer, offset, length, position,
+					(error, bytesRead) => error ? reject(error) : resolve({ bytesRead }))) } };
 		} catch { return undefined; } finally { if (fd !== undefined) closeSync(fd); }
 	}
 	dispose(): Promise<void> { return this.lifetime.close(async () => { await this.lifetime.drain(); await this.handle.close(); }); }
+}
+
+/** A source observation owns a kernel-object lease; the observation alone never grants borrowing authority. */
+export class CapturedFilesystemObject {
+	private readonly object: FilesystemObjectLease;
+	private readonly capture: StableFilesystemCapture;
+	constructor(handle: FilesystemObjectHandle, capture: StableFilesystemCapture) { this.object = new FilesystemObjectLease(handle, capture.stat); this.capture = capture; }
+	borrow<T>(consume: (capture: StableFilesystemCapture, handle: FilesystemObjectHandle) => Promise<T>): Promise<T> { return this.object.borrow(handle => consume(this.capture, handle)); }
+	lend(computation = this.capture.computation): { readonly transfer: CapturedFilesystemTransfer; readonly release: () => void } | undefined {
+		const loan = this.object.lend(); if (!loan) return;
+		const { object: _object, stat, content, computation: _computation, ...capture } = this.capture;
+		return { release: loan.release, transfer: { ...capture, ...loan.transfer, stat: Object.fromEntries(IDENTITY_FIELDS.map(key => [key, stat[key]])) as FilesystemIdentity,
+			content: content && Uint8Array.from(content), computation: computation && TimelineInterval.serialize(computation) } };
+	}
+	static receive(transfer: CapturedFilesystemTransfer): StableFilesystemCapture | undefined {
+		const object = FilesystemObjectLease.receive(transfer); if (!object) return;
+		try {
+			if (!sameFilesystemIdentity(transfer.stat, object.stat)) throw new Error("source object changed");
+			const { fd: _fd, active: _active, process: _process, readable: _readable, identity: _identity, computation, content, ...capture } = transfer;
+			const result = { ...capture, stat: object.stat, content: content && Buffer.from(content), computation: computation && TimelineInterval.restore(computation) };
+			return { ...result, object: new CapturedFilesystemObject(object.handle, result) };
+		} catch { void object.handle.close(); return; }
+	}
+	dispose(): Promise<void> { return this.object.dispose(); }
 }
 
 export function sameFilesystemIdentity(left: FilesystemIdentity, right: FilesystemIdentity): boolean {

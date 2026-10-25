@@ -5,7 +5,8 @@ import { TimelineInterval, type ComputationProducer } from "./task-timing.ts";
 import type { ExecutionOperationAdoption, ExecutionScope } from "./execution-world.ts";
 import { ProcessHandoffOwnership, type ProcessHandoffLender } from "./process-handoff.ts";
 import { LinuxProcessReuseBackend, observeWorkspaceWrites, type LinuxProcessBackendOptions, type LinuxProcessSession } from "./linux-process-backend.ts";
-import { restoreWorkspaceObservation, type SandboxWorkspaceContext, type SandboxWorkspaceObservation } from "./workspace-sandbox.ts";
+import { restoreWorkspaceObservation, type SandboxWorkspaceContext, type SandboxWorkspaceTransfer } from "./workspace-sandbox.ts";
+import { lendContentChanges } from "./content-chunks.ts";
 import type { WorkspaceTransactionCapture, WorkspaceTransactionOwnership } from "./workspace-transaction.ts";
 import type { ToolProcessInvocation, ToolSettlement } from "./tool-settlement.ts";
 import type { ProcessExecutionRequest } from "./process-execution.ts";
@@ -15,23 +16,30 @@ import { serializeNativeDependency, type SynchronousProcessRequest, type Synchro
 type NativeSessionInput = Parameters<LinuxProcessReuseBackend["open"]>[0];
 type SessionSnapshot = Pick<SynchronousProcessResult, "bindings" | "computations" | "metrics">;
 
-async function serveWorkspaceObservation(port: MessagePort, clock: Int32Array, options: SandboxWorkspaceObservation, workspaces: Map<string, SandboxWorkspaceContext>) {
+async function serveWorkspaceObservation(port: MessagePort, clock: Int32Array, options: SandboxWorkspaceTransfer, workspaces: Map<string, SandboxWorkspaceContext>) {
 	const observation = Promise.resolve().then(() => restoreWorkspaceObservation(options, () => rpc.call("hints"))), captures = new Map<number, WorkspaceTransactionCapture>(); let sequence = 0;
-	const rpc = createNativeRpc(port, clock, async (method, args: { id: number; resource: string; maxBytes: number; owned: boolean }): Promise<unknown> => {
+	const rpc = createNativeRpc(port, clock, async (method, args: { id: number; resource: string; maxBytes: number; owned: boolean }, context): Promise<unknown> => {
 		const { workspace, dispose } = await observation;
-		if (method === "ready") { workspaces.set(options.id, workspace); return options.id; }
+		if (method === "ready") { workspaces.set(options.data.id, workspace); return options.data.id; }
 		if (method === "begin") { const id = ++sequence; captures.set(id, await workspace.transactions.begin()); return id; }
 		if (method === "writes") { return observeWorkspaceWrites(workspace, args as unknown as Parameters<typeof observeWorkspaceWrites>[1]); }
 		if (method === "dispose") return dispose();
-		if (method === "close") { workspaces.delete(options.id); rpc.fail(new Error("workspace observation closed")); port.close(); return; }
+		if (method === "close") {
+			workspaces.delete(options.data.id);
+			try { await dispose(); } finally { rpc.fail(new Error("workspace observation closed")); port.close(); }
+			return;
+		}
 		const capture = captures.get(args.id);
 		if (method === "readBefore") { if (!capture?.readBefore) throw new Error("workspace interval input unavailable"); return capture.readBefore(args.resource, args.maxBytes); }
 		captures.delete(args.id);
 		if (method === "abort") return capture?.abort();
-		if (method === "finish") return capture ? capture.finish(args.owned ? async () => {
-			const proof = await rpc.call<Omit<WorkspaceTransactionOwnership, "interfered"> | undefined>("ownership", { id: args.id });
-			return proof && { ...proof, interfered: (paths, until) => rpc.call("interfered", { id: args.id, paths, until }) };
-		} : undefined) : { complete: false, changes: [], reason: "transaction_already_settled" };
+		if (method === "finish") {
+			const delta = capture ? await capture.finish(args.owned ? async () => {
+				const proof = await rpc.call<Omit<WorkspaceTransactionOwnership, "interfered"> | undefined>("ownership", { id: args.id });
+				return proof && { ...proof, interfered: (paths, until) => rpc.call("interfered", { id: args.id, paths, until }) };
+			} : undefined) : { complete: false, changes: [], reason: "transaction_already_settled" };
+			const loan = lendContentChanges(delta.changes); context.retain(loan.release); return { ...delta, changes: loan.transfer };
+		}
 		throw new Error(`unknown workspace observation operation: ${method}`);
 	});
 	void observation.catch(error => { rpc.fail(error instanceof Error ? error : new Error(String(error))); port.close(); });
@@ -109,7 +117,10 @@ async function serveNativeBackend(port: MessagePort, clock: Int32Array, options:
 			entry.dispatch = AsyncResource.bind(async (operation: string, value: unknown, context: NativeRpcContext) => {
 				if (operation === "execute") return session.executor.execute({ ...value as ProcessExecutionRequest, ...context });
 				if (operation === "binding") { const binding = backend!.restoreBinding(value as SerializedProcessBinding); if (!binding) throw new Error("native work binding expired"); return session.executeBinding(binding); }
-				if (operation === "seal") return session.seal(value as Parameters<LinuxProcessSession["seal"]>[0]);
+				if (operation === "seal") {
+					const loan = lendContentChanges(await session.seal(value as Parameters<LinuxProcessSession["seal"]>[0]));
+					context.retain(loan.release); return loan.transfer;
+				}
 				if (operation === "validate" || operation === "close") return session[operation]();
 				throw new Error(`unknown native session operation: ${operation}`);
 			});
@@ -119,7 +130,11 @@ async function serveNativeBackend(port: MessagePort, clock: Int32Array, options:
 			const finished = new Promise<void>(finish => { observations.set(id, { finish }); }); grants.set(id, request);
 			try {
 				const completed = await backend!.observeSynchronous(request, attached, finished,
-					request.asynchronous ? delta => rpc.call<ToolSettlement>("effects", { id, delta }) : undefined,
+					request.asynchronous ? async delta => {
+						const loan = lendContentChanges(delta.changes);
+						try { return await rpc.call<ToolSettlement>("effects", { id, delta: { ...delta, changes: loan.transfer } }); }
+						finally { loan.release(); }
+					} : undefined,
 					request.asynchronous ? (key, excluded, signal) => rpc.call<Awaited<ReturnType<ProcessHandoffLender>>>("borrow", { id, key, excluded }, signal) : undefined);
 				observations.get(id)!.release = completed.release; return completed.result;
 			} finally { grants.delete(id); }
