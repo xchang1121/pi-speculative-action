@@ -3,7 +3,7 @@ import { execHostFile } from "./executable-path.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants, type BigIntStats } from "node:fs";
 import {
-	access, chmod, type FileHandle, link, lstat, lutimes, mkdir, mkdtemp, open, realpath, rename, rm, rmdir, unlink, utimes, writeFile,
+	access, chmod, type FileHandle, link, lstat, lutimes, mkdir, mkdtemp, open, rename, rm, rmdir, unlink, utimes, writeFile,
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -17,11 +17,11 @@ import {
 import type { WorldBranch, WorldCheckpoint, WorldExecutionMetrics } from "./execution-world.ts";
 import {
 	advanceFilesystemClock, assertNoSymlinkPath, captureFilesystemEntry, captureStableFile, fileIdentity, mapFilesystem, sameFilesystemIdentity, readFilesystemDirectory, openFilesystemFile,
-	withFilesystemReadView,
+	withFilesystemReadView, openFilesystemReadView, FilesystemReadView,
 	settledIdentity, sharedWalk, pinFilesystemObject, FILESYSTEM_OBSERVATION_FIELDS, FILESYSTEM_METADATA_FIELDS as SNAPSHOT_METADATA_FIELDS, type FilesystemObservationEvidence,
 } from "./filesystem-evidence.ts";
 import { WORKSPACE_PATH_MUTATION_EFFECTS } from "./effect-model.ts";
-import { EffectCommit, effectCommitFailure } from "./effect-transaction.ts";
+import { EffectCommit, effectCommitFailure, isPoisonedEffectCommit } from "./effect-transaction.ts";
 import {
 	LinuxOverlayfsCapabilityRegistry, LinuxOverlayfsUnsafeCleanupError, mountLinuxOverlayfs, openLinuxAnonymousWorkspaceFile,
 	type LinuxOverlayfsMount, type LinuxOverlayfsOptions,
@@ -396,9 +396,9 @@ export class WorkspaceSandboxService {
 		return await withPrivateSandboxWorkspace(this.state, cwd, config.gitBinary ?? "git", "git", config, run);
 	}
 
-	async commitDelta(delta: SandboxExecutionDelta): Promise<ToolSettlement> {
+	async commitDelta(delta: SandboxExecutionDelta, privateView?: FilesystemReadView): Promise<ToolSettlement> {
 		assertWorkspaceSandboxOpen(this.state);
-		return commitSandboxExecution(this.state, { output: delta.output, changes: ownSandboxChanges(delta.changes) });
+		return commitSandboxExecution(this.state, { output: delta.output, changes: ownSandboxChanges(delta.changes) }, undefined, privateView);
 	}
 
 	dispose(): Promise<void> {
@@ -511,7 +511,8 @@ function workspaceBranch(snapshot: WorkspaceExecutionSnapshot, sourceRoot: strin
 			readInputs = true;
 			const inputs = await createCommittedResourceInputs(action, sourceRoot, preimages, maxBytes).catch(() => undefined);
 			// Stamped only now: each file must still hold the bytes it was read with, or the owner would vouch for stale ones.
-			const current = inputs && await Promise.all([...preimages].map(async ([target, before]) => sameOptionalBytes((await readRegularState(target))?.content, before as Uint8Array)));
+			const current = inputs && await withFilesystemReadView(undefined, view => Promise.all([...preimages].map(async ([target, before]) => sameOptionalBytes((await readRegularState(target, undefined, view))?.content, before as Uint8Array))))
+				.catch(async error => { await inputs.dispose(); throw error; });
 			if (inputs && current?.every(Boolean)) return inputs;
 			await inputs?.dispose(); return undefined;
 		},
@@ -531,193 +532,207 @@ function workspaceBranch(snapshot: WorkspaceExecutionSnapshot, sourceRoot: strin
 }
 
 async function commitSandboxExecution(state: WorkspaceSandboxState, execution: SandboxExecutionDelta,
-	inputs?: Map<string, ResourceInput>): Promise<ToolSettlement> {
+	inputs?: Map<string, ResourceInput>, privateView?: FilesystemReadView): Promise<ToolSettlement> {
 	assertWorkspaceSandboxOpen(state);
 	const { changes } = execution;
-	const commit = withCommitLocks(
-		changes,
-		async () => {
-			const staged = new Map<SandboxFileChange, string>(), descriptors = new Map<SandboxFileChange, FileHandle>();
-			const baselines = new Map<SandboxWorkspaceChange, RegularFileState | SandboxDirectoryState | undefined>();
-			const applied: SandboxWorkspaceChange[] = [], createdDirectories: string[] = [], parents = new Set<string>();
-			const objects = new Map<string, { source: SandboxFileChange; write?: SandboxFileChange; handle?: FileHandle; mode?: number }>();
-			let nativeStarted = false;
-			try {
-				// Nothing has moved yet: every target is checked at this one moment, over one walk of the directories they share.
-				const capture = sharedWalk(captureFilesystemEntry); await mapFilesystem(changes, change => assertCommitTarget(change, capture));
-				await mapFilesystem(changes, async (change) => {
-					if (!change.validationOnly && change.kind !== "directory" && !change.operation && !change.object && change.after !== undefined) {
-						staged.set(change, await stageAtomicWrite(change.after, change.afterMode, change.root));
+	const commit = (async () => {
+		await using source = privateView ? undefined : await openFilesystemReadView().catch(error => { throw effectCommitFailure(error, "recoverable"); });
+		const view = privateView ?? source!, readonlySource = !privateView && process.platform === "linux";
+		return await withCommitLocks(
+			changes,
+			async () => {
+				const staged = new Map<SandboxFileChange, string>(), descriptors = new Map<SandboxFileChange, FileHandle>();
+				const baselines = new Map<SandboxWorkspaceChange, RegularFileState | SandboxDirectoryState | undefined>();
+				const applied: SandboxWorkspaceChange[] = [], createdDirectories: string[] = [], parents = new Set<string>();
+				const objects = new Map<string, { source: SandboxFileChange; write?: SandboxFileChange; handle?: FileHandle; mode?: number }>();
+				const openDescriptors = (phase: readonly SandboxWorkspaceChange[]) => mapFilesystem(phase, async change => {
+					const group = objects.get("1:" + change.target), writing = change.kind !== "directory" && !change.validationOnly && change.operation && !change.object;
+					if (writing && change.after === undefined) throw new Error("A content write cannot delete a file");
+					if (change.kind !== "directory" && (group || writing && change.before !== undefined)) {
+						if (!(await view.stat(change.target)).isFile()) throw new Error("file object predecessor is not regular");
+						const descriptor = await open(change.target, (writing || group?.write ? fsConstants.O_RDWR : fsConstants.O_RDONLY) |
+							(fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0));
+						descriptors.set(change, descriptor); if (group) group.handle = descriptor;
 					}
 				});
-				for (const change of changes) if (change.kind !== "directory" && change.object) {
-					const reference = change.object, key = `${Number(reference.before)}:${reference.path}`;
-					const source = changes.find(candidate => candidate.target === reference.path);
-					if (!source || source.kind === "directory" || change.after === undefined ||
-						(reference.before ? source.before === undefined : source.after === undefined || source.object)) throw new Error("file object anchor is unavailable");
-					const group = objects.get(key) ?? { source };
-					if (reference.before) {
-						if (change.operation) {
-							if (group.write && (!sameOptionalBytes(group.write.after, change.after) || group.write.afterMode !== change.afterMode)) throw new Error("inconsistent object contents");
-							group.write = change;
-						} else if (!sameOptionalBytes(source.before, change.after)) throw new Error("object change lacks a write");
-						if (source.beforeMode !== change.afterMode) {
-							if (group.mode !== undefined && group.mode !== change.afterMode) throw new Error("inconsistent object permissions");
-							group.mode = change.afterMode;
-						}
-					} else if (!sameOptionalBytes(source.after, change.after) || source.afterMode !== change.afterMode) throw new Error("inconsistent linked contents");
-					objects.set(key, group);
-				}
-				// The staged files take their times while every target is checked, concurrently; nothing moves before both finish.
-				const timed = restoreModifiedTimes([...staged].map(([change, temporary]) => [temporary, change.afterModified]));
-				timed.catch(() => undefined);
-				// Capture directories before writable file handles trigger OverlayFS copy-up and change their times.
-				for (const directories of [true, false]) {
-					const phase = changes.filter(change => (change.kind === "directory") === directories);
-					// Acquire every handle before reading any file: opening an alias can update their shared identity.
-					if (!directories) await mapFilesystem(phase, async change => {
-						const group = objects.get("1:" + change.target), writing = change.kind !== "directory" && !change.validationOnly && change.operation && !change.object;
-						if (writing && change.after === undefined) throw new Error("A content write cannot delete a file");
-						if (change.kind !== "directory" && (group || writing && change.before !== undefined)) {
-							if (!(await lstat(change.target)).isFile()) throw new Error("file object predecessor is not regular");
-							const descriptor = await open(change.target, (writing || group?.write ? fsConstants.O_RDWR : fsConstants.O_RDONLY) |
-								(fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0));
-							descriptors.set(change, descriptor); if (group) group.handle = descriptor;
-						}
-					});
-					await mapFilesystem(phase, async change => {
-						// A file whose identity still stands for the bytes this change replaces needs no rereading to prove them.
-						const unchanged = change.kind !== "directory" && change.beforeIdentity && change.before
-							? await lstat(change.target, { bigint: true }).then(info => fileIdentity(info) === change.beforeIdentity ? info : undefined, () => undefined) : undefined;
-						const current = unchanged ? { content: (change as SandboxFileChange).before!, mode: Number(unchanged.mode & 0o777n), identity: unchanged }
-							: change.kind === "directory" ? await readSandboxDirectoryState(change.target) : await readRegularState(change.target);
-						baselines.set(change, current);
-						if (change.kind === "directory" && change.validationOnly ? !!current !== !!change.before : !sameSandboxState(current,
-							change.kind === "directory" ? change.before : change.before && { content: change.before, mode: change.beforeMode ?? 0 }))
-							throw new Error(`resource changed before commit: ${change.resource}`);
-						if (change.accessMode) await access(change.target, change.accessMode);
-						if (change.kind !== "directory" && change.aliases) await assertFileAliases(change.root, change.target, change.aliases, (current as RegularFileState | undefined)?.identity);
-						const descriptor = change.kind !== "directory" && descriptors.get(change);
-						if (descriptor) {
-							const before = current as RegularFileState | undefined, identity = await descriptor.stat({ bigint: true });
-							if (!before?.identity || identity.nlink !== BigInt(change.aliases?.length ?? 1) || !sameFilesystemIdentity(before.identity, identity))
-								throw new Error("file object predecessor changed: " + change.resource);
-						}
-					});
-				}
-				await timed;
-				// Pin every source name before any destination is removed or replaced; cycles use the same transaction.
-				for (const change of changes) if (change.kind !== "directory" && change.object) {
-					const reference = change.object, group = objects.get(`${Number(reference.before)}:${reference.path}`)!;
-					const prior = baselines.get(change) as RegularFileState | undefined;
-					const sourceState = baselines.get(group.source) as RegularFileState | undefined;
-					if (reference.before && prior?.identity && sourceState?.identity && prior.identity.dev === sourceState.identity.dev && prior.identity.ino === sourceState.identity.ino) continue;
-					const source = reference.before ? reference.path : staged.get(group.source)!;
-					const temporary = path.join(change.root, `${SANDBOX_STAGING_FILE_PREFIX}${randomUUID()}.tmp`);
-					if (reference.before) nativeStarted = true;
-					await link(source, temporary); staged.set(change, temporary);
-					if (reference.before) {
-						const linked = await lstat(temporary, { bigint: true });
-						if (linked.dev !== sourceState!.identity!.dev || linked.ino !== sourceState!.identity!.ino) throw new Error("file object changed while linking");
+				const verifyDescriptor = async (change: SandboxWorkspaceChange) => {
+					const descriptor = change.kind !== "directory" && descriptors.get(change);
+					if (descriptor) {
+						const before = baselines.get(change) as RegularFileState | undefined, identity = await descriptor.stat({ bigint: true });
+						if (!before?.identity || identity.nlink !== BigInt(change.aliases?.length ?? 1) || !sameFilesystemIdentity(before.identity, identity))
+							throw new Error("file object predecessor changed: " + change.resource);
 					}
-				}
-				for (const group of objects.values()) if (group.write || group.mode !== undefined) {
-					nativeStarted = true;
-					if (group.write) { await group.handle!.truncate(0); await group.handle!.writeFile(group.write.after!); }
-					if (group.mode !== undefined && process.platform !== "win32") await group.handle!.chmod(group.mode);
-				}
-				for (const change of orderWorkspaceChanges(changes.filter(change => !change.validationOnly), change => ({
-					change, depth: slash(change.resource).split("/").filter(Boolean).length, key: filesystemPathKey(change.target),
-				}))) {
-					await assertCommitTarget(change);
-					if (change.kind === "directory") {
-						if (!change.after) { await rmdir(change.target); applied.push(change); }
-						else if (!change.before) {
-							await createParentDirectories(change.root, change.target, createdDirectories, parents);
-							await mkdir(change.target, change.operation ? undefined : { mode: change.after.mode });
-							applied.push(change);
-							if (!change.operation && process.platform !== "win32") await chmod(change.target, change.after.mode);
-						} else if (process.platform !== "win32" && change.before.mode !== change.after.mode) {
-							await chmod(change.target, change.after.mode);
-							applied.push(change);
-						}
-						continue;
-					}
-					if (change.object && !staged.has(change)) continue;
-					if (change.operation && !change.object) {
-						// Native writes are authoritative from their first file effect; created parents still roll back.
-						await createParentDirectories(change.root, change.target, createdDirectories, parents);
-						let descriptor = descriptors.get(change);
-						if (descriptor) { applied.push(change); await descriptor.truncate(0); }
-						else {
-							// Exclusive creation already gives an empty file; only existing files need truncation.
-							descriptor = await open(change.target, "wx", 0o666);
-							descriptors.set(change, descriptor); applied.push(change);
-						}
-						await descriptor.writeFile(change.after!);
-						continue;
-					}
-					applied.push(change);
-					const temporary = staged.get(change);
-					if (temporary) {
-						await createParentDirectories(change.root, change.target, createdDirectories, parents);
-						const mode = resolveCommitMode(baselines.get(change) as RegularFileState | undefined, change);
-						try { await replaceFile(temporary, change.target, mode); }
-						catch (error) {
-							if (process.platform !== "win32" || !(change.object || change.aliases) || !hasErrorCode(error, "EPERM")) throw error;
-							// NTFS can deny replacement of an open name while allowing its unlink. Retained handles stay on the old object.
-							nativeStarted = true; await unlink(change.target); await replaceFile(temporary, change.target, mode);
-						}
-						staged.delete(change);
-					} else {
-						await rm(change.target, { force: true });
-					}
-				}
-				await restoreModifiedTimes(changes.flatMap(change => change.kind !== "directory" && change.operation ? [[change.target, change.afterModified] as const] : []));
-				let directoryBytes = 0;
-				const createdEntries = new Map((inputs ? changes : []).filter(change => change.kind === "directory" && change.operation && change.after)
-					.map(change => [change.target, [] as string[]]));
-				if (inputs) for (const change of changes) if (!change.validationOnly && change.after)
-					createdEntries.get(path.dirname(change.target))?.push(path.basename(change.target));
-				// Directories are read at once; what their listings retain is decided in order.
-				const listed = await mapFilesystem(changes.filter((change): change is SandboxDirectoryChange => !change.validationOnly && change.kind === "directory" && !!change.after),
-					async change => ({ change, names: await verifySandboxDirectoryAfter(change) }));
-				for (const { change, names: observed } of listed) {
-					if (!inputs) continue;
-					const names = observed ?? createdEntries.get(change.target);
-					const bytes = names?.reduce((sum, name) => sum + name.length * 2 + 16, 0) ?? 0, retain = directoryBytes + bytes <= WORKSPACE_TRANSACTION_MAX_BYTES;
-					if (retain) directoryBytes += bytes;
-					inputs.set(change.target, { names: retain ? names : undefined });
-				}
-			} catch (error) {
-				inputs?.clear();
-				if (nativeStarted || applied.some((change) => change.kind !== "directory" && (change.operation || change.aliases))) {
-					throw effectCommitFailure(error, "poisoned", "native file write began; its effects cannot be safely replayed or rolled back");
-				}
+				};
+				let nativeStarted = false;
 				try {
-					await restoreChanges(applied, baselines);
-					for (const directory of [...new Set(createdDirectories)].sort((left, right) => right.length - left.length)) {
-						try { await rmdir(directory); } catch (error) { if (!isMissing(error)) throw error; }
+					// Nothing has moved yet: every target is checked at this one moment, over one walk of the directories they share.
+					const capture = sharedWalk(target => captureFilesystemEntry(target, undefined, view)); await mapFilesystem(changes, change => assertCommitTarget(change, capture));
+
+					for (const change of changes) if (change.kind !== "directory" && change.object) {
+						const reference = change.object, key = `${Number(reference.before)}:${reference.path}`;
+						const source = changes.find(candidate => candidate.target === reference.path);
+						if (!source || source.kind === "directory" || change.after === undefined ||
+							(reference.before ? source.before === undefined : source.after === undefined || source.object)) throw new Error("file object anchor is unavailable");
+						const group = objects.get(key) ?? { source };
+						if (reference.before) {
+							if (change.operation) {
+								if (group.write && (!sameOptionalBytes(group.write.after, change.after) || group.write.afterMode !== change.afterMode)) throw new Error("inconsistent object contents");
+								group.write = change;
+							} else if (!sameOptionalBytes(source.before, change.after)) throw new Error("object change lacks a write");
+							if (source.beforeMode !== change.afterMode) {
+								if (group.mode !== undefined && group.mode !== change.afterMode) throw new Error("inconsistent object permissions");
+								group.mode = change.afterMode;
+							}
+						} else if (!sameOptionalBytes(source.after, change.after) || source.afterMode !== change.afterMode) throw new Error("inconsistent linked contents");
+						objects.set(key, group);
 					}
-				} catch (rollbackError) {
-					throw effectCommitFailure(
-						new AggregateError([error, rollbackError], "sandbox commit and rollback both failed", { cause: error }),
-						"poisoned",
-						"sandbox commit failed and the original workspace could not be fully restored",
-					);
+					// Capture directories before writable file handles trigger OverlayFS copy-up and change their times.
+					for (const directories of [true, false]) {
+						const phase = changes.filter(change => (change.kind === "directory") === directories);
+						// Ambient adapters settle copy-up or read metadata with their handles held; qualified source views need no such preparation.
+						if (!directories && !readonlySource) await openDescriptors(phase);
+						await mapFilesystem(phase, async change => {
+							// A file whose identity still stands for the bytes this change replaces needs no rereading to prove them.
+							const unchanged = change.kind !== "directory" && change.beforeIdentity && change.before
+								? await view.stat(change.target).then(info => fileIdentity(info) === change.beforeIdentity ? info : undefined, () => undefined) : undefined;
+							const current = unchanged ? { content: (change as SandboxFileChange).before!, mode: Number(unchanged.mode & 0o777n), identity: unchanged }
+								: change.kind === "directory" ? await readSandboxDirectoryState(change.target, undefined, view) : await readRegularState(change.target, undefined, view);
+							baselines.set(change, current);
+							if (change.kind === "directory" && change.validationOnly ? !!current !== !!change.before : !sameSandboxState(current,
+								change.kind === "directory" ? change.before : change.before && { content: change.before, mode: change.beforeMode ?? 0 }))
+								throw new Error(`resource changed before commit: ${change.resource}`);
+							if (change.accessMode) await access(await view.realpath(change.target), change.accessMode);
+							if (change.kind !== "directory" && change.aliases) await assertFileAliases(change.root, change.target, change.aliases, (current as RegularFileState | undefined)?.identity, view);
+							await verifyDescriptor(change);
+						});
+					}
+					await view.verify();
+					// Read-only source proofs finish before opening writable objects; every adapter validates before staging names.
+					if (readonlySource) {
+						await openDescriptors(changes.filter(change => change.kind !== "directory"));
+						await mapFilesystem(changes, verifyDescriptor);
+					}
+					await mapFilesystem(changes, async (change) => {
+						if (!change.validationOnly && change.kind !== "directory" && !change.operation && !change.object && change.after !== undefined) {
+							staged.set(change, await stageAtomicWrite(change.after, change.afterMode, change.root));
+						}
+					});
+					await restoreModifiedTimes([...staged].map(([change, temporary]) => [temporary, change.afterModified]));
+					// Pin every source name before any destination is removed or replaced; cycles use the same transaction.
+					for (const change of changes) if (change.kind !== "directory" && change.object) {
+						const reference = change.object, group = objects.get(`${Number(reference.before)}:${reference.path}`)!;
+						const prior = baselines.get(change) as RegularFileState | undefined;
+						const sourceState = baselines.get(group.source) as RegularFileState | undefined;
+						if (reference.before && prior?.identity && sourceState?.identity && prior.identity.dev === sourceState.identity.dev && prior.identity.ino === sourceState.identity.ino) continue;
+						const source = reference.before ? reference.path : staged.get(group.source)!;
+						const temporary = path.join(change.root, `${SANDBOX_STAGING_FILE_PREFIX}${randomUUID()}.tmp`);
+						if (reference.before) nativeStarted = true;
+						await link(source, temporary); staged.set(change, temporary);
+						if (reference.before) {
+							const linked = await view.stat(temporary);
+							if (linked.dev !== sourceState!.identity!.dev || linked.ino !== sourceState!.identity!.ino) throw new Error("file object changed while linking");
+						}
+					}
+					for (const group of objects.values()) if (group.write || group.mode !== undefined) {
+						nativeStarted = true;
+						if (group.write) { await group.handle!.truncate(0); await group.handle!.writeFile(group.write.after!); }
+						if (group.mode !== undefined && process.platform !== "win32") await group.handle!.chmod(group.mode);
+					}
+					for (const change of orderWorkspaceChanges(changes.filter(change => !change.validationOnly), change => ({
+						change, depth: slash(change.resource).split("/").filter(Boolean).length, key: filesystemPathKey(change.target),
+					}))) {
+						await assertCommitTarget(change, (target, read) => captureFilesystemEntry(target, read, view));
+						if (change.kind === "directory") {
+							if (!change.after) { await rmdir(change.target); applied.push(change); }
+							else if (!change.before) {
+								await createParentDirectories(change.root, change.target, view, createdDirectories, parents);
+								await mkdir(change.target, change.operation ? undefined : { mode: change.after.mode });
+								applied.push(change);
+								if (!change.operation && process.platform !== "win32") await chmod(change.target, change.after.mode);
+							} else if (process.platform !== "win32" && change.before.mode !== change.after.mode) {
+								await chmod(change.target, change.after.mode);
+								applied.push(change);
+							}
+							continue;
+						}
+						if (change.object && !staged.has(change)) continue;
+						if (change.operation && !change.object) {
+							// Native writes are authoritative from their first file effect; created parents still roll back.
+							await createParentDirectories(change.root, change.target, view, createdDirectories, parents);
+							let descriptor = descriptors.get(change);
+							if (descriptor) { applied.push(change); await descriptor.truncate(0); }
+							else {
+								// Exclusive creation already gives an empty file; only existing files need truncation.
+								descriptor = await open(change.target, "wx", 0o666);
+								descriptors.set(change, descriptor); applied.push(change);
+							}
+							await descriptor.writeFile(change.after!);
+							continue;
+						}
+						applied.push(change);
+						const temporary = staged.get(change);
+						if (temporary) {
+							await createParentDirectories(change.root, change.target, view, createdDirectories, parents);
+							const mode = resolveCommitMode(baselines.get(change) as RegularFileState | undefined, change);
+							try { await replaceFile(temporary, change.target, mode); }
+							catch (error) {
+								if (process.platform !== "win32" || !(change.object || change.aliases) || !hasErrorCode(error, "EPERM")) throw error;
+								// NTFS can deny replacement of an open name while allowing its unlink. Retained handles stay on the old object.
+								nativeStarted = true; await unlink(change.target); await replaceFile(temporary, change.target, mode);
+							}
+							staged.delete(change);
+						} else {
+							await rm(change.target, { force: true });
+						}
+					}
+					await restoreModifiedTimes(changes.flatMap(change => change.kind !== "directory" && change.operation ? [[change.target, change.afterModified] as const] : []));
+					let directoryBytes = 0;
+					const createdEntries = new Map((inputs ? changes : []).filter(change => change.kind === "directory" && change.operation && change.after)
+						.map(change => [change.target, [] as string[]]));
+					if (inputs) for (const change of changes) if (!change.validationOnly && change.after)
+						createdEntries.get(path.dirname(change.target))?.push(path.basename(change.target));
+					// Directories are read at once; what their listings retain is decided in order.
+					const listed = await mapFilesystem(changes.filter((change): change is SandboxDirectoryChange => !change.validationOnly && change.kind === "directory" && !!change.after),
+						async change => ({ change, names: await verifySandboxDirectoryAfter(change, view) }));
+					for (const { change, names: observed } of listed) {
+						if (!inputs) continue;
+						const names = observed ?? createdEntries.get(change.target);
+						const bytes = names?.reduce((sum, name) => sum + name.length * 2 + 16, 0) ?? 0, retain = directoryBytes + bytes <= WORKSPACE_TRANSACTION_MAX_BYTES;
+						if (retain) directoryBytes += bytes;
+						inputs.set(change.target, { names: retain ? names : undefined });
+					}
+					try { await view.verify(); } catch (error) { throw effectCommitFailure(error, nativeStarted || applied.length ? "poisoned" : "recoverable"); }
+				} catch (error) {
+					inputs?.clear();
+					if (nativeStarted || isPoisonedEffectCommit(error) || applied.some((change) => change.kind !== "directory" && (change.operation || change.aliases))) {
+						throw effectCommitFailure(error, "poisoned", "native file write began; its effects cannot be safely replayed or rolled back");
+					}
+					try {
+						await restoreChanges(applied, baselines, view);
+						for (const directory of [...new Set(createdDirectories)].sort((left, right) => right.length - left.length)) {
+							try { await rmdir(directory); } catch (error) { if (!isMissing(error)) throw error; }
+						}
+					} catch (rollbackError) {
+						throw effectCommitFailure(
+							new AggregateError([error, rollbackError], "sandbox commit and rollback both failed", { cause: error }),
+							"poisoned",
+							"sandbox commit failed and the original workspace could not be fully restored",
+						);
+					}
+					throw effectCommitFailure(error, "recoverable");
+				} finally {
+					const closed = await Promise.allSettled([...descriptors.values()].map((descriptor) => descriptor.close()));
+					await Promise.all([...staged.values()].map((temporary) => rm(temporary, { force: true }).catch(() => undefined)));
+					const failure = closed.find((result) => result.status === "rejected");
+					if (failure) throw effectCommitFailure(failure.reason, "poisoned", "native file descriptor cleanup failed; completion is unknown");
 				}
-				throw effectCommitFailure(error, "recoverable");
-			} finally {
-				const closed = await Promise.allSettled([...descriptors.values()].map((descriptor) => descriptor.close()));
-				await Promise.all([...staged.values()].map((temporary) => rm(temporary, { force: true }).catch(() => undefined)));
-				const failure = closed.find((result) => result.status === "rejected");
-				if (failure) throw effectCommitFailure(failure.reason, "poisoned", "native file descriptor cleanup failed; completion is unknown");
-			}
-			if (inputs) for (const change of changes) if (!change.validationOnly && (change.kind === "directory" ? !change.after : textual(change.after)))
-				inputs.set(change.target, change.kind === "directory" ? null : change.after ?? null);
-			return execution.output;
-		},
-	);
+				if (inputs) for (const change of changes) if (!change.validationOnly && (change.kind === "directory" ? !change.after : textual(change.after)))
+					inputs.set(change.target, change.kind === "directory" ? null : change.after ?? null);
+				return execution.output;
+			},
+			view,
+		);
+	})().catch(error => { throw effectCommitFailure(error, "poisoned"); });
 	return state.lifetime.track(commit);
 }
 
@@ -811,96 +826,100 @@ const LINKED_INPUT = new Error("linked workspace input");
 /** Both substrates capture the same operation delta; only a private workspace performs speculative writes. */
 async function executeFilesystemMutation(context: SpeculativeToolExecutionContext, execute: NonNullable<ToolInvocation["filesystem"]>,
 	workspace?: SandboxWorkspaceContext): Promise<WorkspaceExecutionSnapshot> {
-	const sourceRoot = path.resolve(context.cwd);
-	const changes = new Map<string, SandboxWorkspaceChange>(), lifetime = new RuntimeLifecycleLane();
-	let bytes = 0, failure: { error: unknown } | undefined, namespace: Promise<WorkspaceStructureSnapshot> | undefined;
-	// A request the tool swallowed still fails the run; requests after it returns are refused.
-	const track = <T>(run: () => Promise<T>): Promise<T> => lifetime.admit(async () => {
-		try { context.signal.throwIfAborted(); return await run(); } catch (error) { failure ??= { error }; throw error; }
+	return withFilesystemReadView(undefined, async source => {
+		const sourceRoot = path.resolve(context.cwd);
+		await using privateReads = workspace ? FilesystemReadView.ambient() : undefined;
+		const view = privateReads ?? source;
+		const changes = new Map<string, SandboxWorkspaceChange>(), lifetime = new RuntimeLifecycleLane();
+		let bytes = 0, failure: { error: unknown } | undefined, namespace: Promise<WorkspaceStructureSnapshot> | undefined;
+		// A request the tool swallowed still fails the run; requests after it returns are refused.
+		const track = <T>(run: () => Promise<T>): Promise<T> => lifetime.admit(async () => {
+			try { context.signal.throwIfAborted(); return await run(); } catch (error) { failure ??= { error }; throw error; }
+		});
+		const record = (key: string, change: SandboxWorkspaceChange) => {
+			const retained = bytes - sandboxChangeBytes(changes.get(key)) + sandboxChangeBytes(change);
+			if (retained > WORKSPACE_TRANSACTION_MAX_BYTES || (!changes.has(key) && changes.size >= WORKSPACE_TRANSACTION_MAX_FILES))
+				throw new Error("Workspace operation exceeds its capture budget");
+			changes.set(key, change); bytes = retained;
+		};
+		const located = async (logical: string) => {
+			const relative = relativeFilesystemPath(sourceRoot, logical);
+			if (relative === undefined || isSnapshotExcluded(slash(relative))) throw new Error("Filesystem operation is outside the workspace view");
+			const target = path.resolve(sourceRoot, relative), file = path.resolve(workspace?.sandboxRoot ?? sourceRoot, relative);
+			await Promise.all([assertNoSymlinkPath(sourceRoot, target, (target, read) => captureFilesystemEntry(target, read, source)), ...(workspace ? [assertNoSymlinkPath(workspace.sandboxRoot, file, (target, read) => captureFilesystemEntry(target, read, view))] : [])]);
+			context.signal.throwIfAborted();
+			return { file, key: filesystemPathKey(target), root: sourceRoot, target, resource: slash(relative) };
+		};
+		const fileInput = async (logical: string) => {
+			const { file, key, ...identity } = await located(logical), previous = changes.get(key);
+			if (previous?.kind === "directory") throw new Error("Workspace file input changed type");
+			// Reuse the preimage until a private write requires reading the new physical state.
+			const before = previous && (!workspace || previous.validationOnly)
+				? previous.before === undefined ? undefined : { content: previous.before, mode: previous.beforeMode! }
+				: await readRegularState(file, WORKSPACE_TRANSACTION_MAX_BYTES, view);
+			let aliases: readonly string[] | undefined;
+			if (!previous && before && "identity" in before && before.identity && before.identity.nlink > 1n) {
+				if (!workspace) throw LINKED_INPUT;
+				const snapshot = await (namespace ??= workspace.structure.capture()), entry = snapshot.entries.get(path.relative(workspace.sandboxRoot, file));
+				if (!snapshot.complete || entry?.kind !== "file" || entry.aliases?.length !== Number(before.identity.nlink))
+					throw new Error("workspace file alias namespace is not closed");
+				aliases = entry.aliases.map(name => path.resolve(sourceRoot, path.relative(workspace.sandboxRoot, name)));
+			}
+			const captured: SandboxFileChange = previous ?? { ...identity, validationOnly: true, before: before?.content, beforeMode: before?.mode, ...(aliases ? { aliases } : {}) };
+			record(key, captured);
+			return { file, key, captured, content: !workspace && !captured.validationOnly ? captured.after : before?.content };
+		};
+		const directoryInput = async (logical: string) => {
+			const { file, key, ...identity } = await located(logical), previous = changes.get(key);
+			if (previous && previous.kind !== "directory") throw new Error("Workspace directory input changed type");
+			const before = previous && !workspace ? previous.before ?? previous.after : await readSandboxDirectoryState(file, undefined, view);
+			// An in-memory mkdir needs only existence; a private mkdir captures its actual final directory state below.
+			if (!previous) record(key, { ...identity, kind: "directory", before, ...(before ? { validationOnly: true } : {
+				operation: "mkdir", ...(!workspace ? { after: { entriesDigest: directoryEntriesDigest([]), mode: 0o755, uid: 0, gid: 0 } } : {}) }) });
+			return { file, key, before };
+		};
+		let output: ToolSettlement;
+		try {
+			output = await execute({
+				readFile: (logical, limit) => track(async () => {
+					const { captured, content } = await fileInput(logical);
+					if (content === undefined) throw new Error("Workspace input does not exist");
+					assertExistingInputPolicy(captured);
+					return Buffer.from(content.subarray(0, limit));
+				}),
+				access: (logical, writable) => track(async () => {
+					const { file, key } = await located(logical), known = changes.get(key), mode = fsConstants.R_OK | (writable ? fsConstants.W_OK : 0);
+					const directory = !workspace && known ? known.kind === "directory" : (await view.stat(file)).isDirectory();
+					await (directory ? directoryInput(logical) : fileInput(logical));
+					const captured = changes.get(key)!;
+					assertExistingInputPolicy(captured);
+					await access(await view.realpath(file), mode);
+					if (captured.before !== undefined) record(key, { ...captured, accessMode: (captured.accessMode ?? 0) | mode });
+				}),
+				writeFile: (logical, content) => track(async () => {
+					const { file, key, captured } = await fileInput(logical);
+					// Even an equal-content native write performs permission checks and touches the inode.
+					record(key, { ...captured, accessMode: changes.get(key)?.accessMode, validationOnly: undefined, after: Buffer.from(content), operation: "write_contents" });
+					if (workspace) await writeFile(file, content, "utf8");
+				}),
+				mkdir: (logical) => track(async () => {
+					for (let directory = path.resolve(logical); ; directory = path.dirname(directory)) {
+						if ((await directoryInput(directory)).before || directory === sourceRoot) break;
+					}
+					if (workspace) await mkdir((await located(logical)).file, { recursive: true });
+				}),
+			}, context);
+		} finally { await lifetime.close(() => {}); if (failure) throw failure.error; context.signal.throwIfAborted(); }
+		if (workspace) for (const [key, change] of changes) {
+			if (change.kind === "directory" && !change.validationOnly) record(key, { ...change, after: await readSandboxDirectoryState((await located(change.target)).file, undefined, view) });
+			else if (change.kind !== "directory" && !change.validationOnly &&
+				!sameOptionalBytes((await readRegularState((await located(change.target)).file, undefined, view))?.content, change.after)) {
+				throw new Error("Workspace writes did not settle to their declared bytes");
+			}
+		}
+		const captured = [...changes.values()];
+		return { output, changes: workspace ? captured : ownSandboxChanges(captured), executionMetrics: {} };
 	});
-	const record = (key: string, change: SandboxWorkspaceChange) => {
-		const retained = bytes - sandboxChangeBytes(changes.get(key)) + sandboxChangeBytes(change);
-		if (retained > WORKSPACE_TRANSACTION_MAX_BYTES || (!changes.has(key) && changes.size >= WORKSPACE_TRANSACTION_MAX_FILES))
-			throw new Error("Workspace operation exceeds its capture budget");
-		changes.set(key, change); bytes = retained;
-	};
-	const located = async (logical: string) => {
-		const relative = relativeFilesystemPath(sourceRoot, logical);
-		if (relative === undefined || isSnapshotExcluded(slash(relative))) throw new Error("Filesystem operation is outside the workspace view");
-		const target = path.resolve(sourceRoot, relative), file = path.resolve(workspace?.sandboxRoot ?? sourceRoot, relative);
-		await Promise.all([assertNoSymlinkPath(sourceRoot, target), ...(workspace ? [assertNoSymlinkPath(workspace.sandboxRoot, file)] : [])]);
-		context.signal.throwIfAborted();
-		return { file, key: filesystemPathKey(target), root: sourceRoot, target, resource: slash(relative) };
-	};
-	const fileInput = async (logical: string) => {
-		const { file, key, ...identity } = await located(logical), previous = changes.get(key);
-		if (previous?.kind === "directory") throw new Error("Workspace file input changed type");
-		// Reuse the preimage until a private write requires reading the new physical state.
-		const before = previous && (!workspace || previous.validationOnly)
-			? previous.before === undefined ? undefined : { content: previous.before, mode: previous.beforeMode! }
-			: await readRegularState(file, WORKSPACE_TRANSACTION_MAX_BYTES);
-		let aliases: readonly string[] | undefined;
-		if (!previous && before && "identity" in before && before.identity && before.identity.nlink > 1n) {
-			if (!workspace) throw LINKED_INPUT;
-			const snapshot = await (namespace ??= workspace.structure.capture()), entry = snapshot.entries.get(path.relative(workspace.sandboxRoot, file));
-			if (!snapshot.complete || entry?.kind !== "file" || entry.aliases?.length !== Number(before.identity.nlink))
-				throw new Error("workspace file alias namespace is not closed");
-			aliases = entry.aliases.map(name => path.resolve(sourceRoot, path.relative(workspace.sandboxRoot, name)));
-		}
-		const captured: SandboxFileChange = previous ?? { ...identity, validationOnly: true, before: before?.content, beforeMode: before?.mode, ...(aliases ? { aliases } : {}) };
-		record(key, captured);
-		return { file, key, captured, content: !workspace && !captured.validationOnly ? captured.after : before?.content };
-	};
-	const directoryInput = async (logical: string) => {
-		const { file, key, ...identity } = await located(logical), previous = changes.get(key);
-		if (previous && previous.kind !== "directory") throw new Error("Workspace directory input changed type");
-		const before = previous && !workspace ? previous.before ?? previous.after : await readSandboxDirectoryState(file);
-		// An in-memory mkdir needs only existence; a private mkdir captures its actual final directory state below.
-		if (!previous) record(key, { ...identity, kind: "directory", before, ...(before ? { validationOnly: true } : {
-			operation: "mkdir", ...(!workspace ? { after: { entriesDigest: directoryEntriesDigest([]), mode: 0o755, uid: 0, gid: 0 } } : {}) }) });
-		return { file, key, before };
-	};
-	let output: ToolSettlement;
-	try {
-		output = await execute({
-			readFile: (logical, limit) => track(async () => {
-				const { captured, content } = await fileInput(logical);
-				if (content === undefined) throw new Error("Workspace input does not exist");
-				assertExistingInputPolicy(captured);
-				return Buffer.from(content.subarray(0, limit));
-			}),
-			access: (logical, writable) => track(async () => {
-				const { file, key } = await located(logical), known = changes.get(key), mode = fsConstants.R_OK | (writable ? fsConstants.W_OK : 0);
-				const directory = !workspace && known ? known.kind === "directory" : (await lstat(file)).isDirectory();
-				await (directory ? directoryInput(logical) : fileInput(logical));
-				const captured = changes.get(key)!;
-				assertExistingInputPolicy(captured);
-				await access(file, mode);
-				if (captured.before !== undefined) record(key, { ...captured, accessMode: (captured.accessMode ?? 0) | mode });
-			}),
-			writeFile: (logical, content) => track(async () => {
-				const { file, key, captured } = await fileInput(logical);
-				// Even an equal-content native write performs permission checks and touches the inode.
-				record(key, { ...captured, accessMode: changes.get(key)?.accessMode, validationOnly: undefined, after: Buffer.from(content), operation: "write_contents" });
-				if (workspace) await writeFile(file, content, "utf8");
-			}),
-			mkdir: (logical) => track(async () => {
-				for (let directory = path.resolve(logical); ; directory = path.dirname(directory)) {
-					if ((await directoryInput(directory)).before || directory === sourceRoot) break;
-				}
-				if (workspace) await mkdir((await located(logical)).file, { recursive: true });
-			}),
-		}, context);
-	} finally { await lifetime.close(() => {}); if (failure) throw failure.error; context.signal.throwIfAborted(); }
-	if (workspace) for (const [key, change] of changes) {
-		if (change.kind === "directory" && !change.validationOnly) record(key, { ...change, after: await readSandboxDirectoryState((await located(change.target)).file) });
-		else if (change.kind !== "directory" && !change.validationOnly &&
-			!sameOptionalBytes((await readRegularState((await located(change.target)).file))?.content, change.after)) {
-			throw new Error("Workspace writes did not settle to their declared bytes");
-		}
-	}
-	const captured = [...changes.values()];
-	return { output, changes: workspace ? captured : ownSandboxChanges(captured), executionMetrics: {} };
 }
 
 async function createPrivateSandboxWorkspace(state: WorkspaceSandboxState, cwd: string, gitBinary: string,
@@ -1631,6 +1650,7 @@ async function withPrivateSandboxWorkspace<T>(state: WorkspaceSandboxState, cwd:
 }
 
 async function materializeCheckpoint(workspace: PrivateSandboxWorkspace, checkpoint: WorkspaceCheckpoint): Promise<void> {
+	await using view = FilesystemReadView.ambient();
 	const lineage: WorkspaceCheckpoint[] = [];
 	for (let current: WorkspaceCheckpoint | undefined = checkpoint; current; current = current.parent) { lineage.push(current); }
 	for (const ancestor of lineage.reverse()) {
@@ -1650,7 +1670,7 @@ async function materializeCheckpoint(workspace: PrivateSandboxWorkspace, checkpo
 				(process.platform !== "linux" || change.afterModified === undefined || String(current?.identity?.mtimeNs) === change.afterModified);
 		}).catch(() => [false])).every(Boolean)) continue;
 		workspace.recycle?.written.push(...writtenPaths(changes));
-		await commitSandboxExecution(workspace.pool.owner, { output: { result: { content: [], details: {} }, isError: false }, changes });
+		await commitSandboxExecution(workspace.pool.owner, { output: { result: { content: [], details: {} }, isError: false }, changes }, undefined, view);
 		for (const change of changes) if (!change.validationOnly && change.kind !== "directory") {
 			if (change.after !== undefined) await workspace.pinObject(change.target);
 			workspace.baselineFrontier.set(path.normalize(change.resource), await readRegularState(change.target));
@@ -1773,25 +1793,25 @@ async function assertCommitTarget(change: SandboxWorkspaceChange, capture?: type
 	await assertNoSymlinkPath(root, target, capture);
 }
 
-async function readRegularState(target: string, maxBytes = Number.POSITIVE_INFINITY): Promise<RegularFileState | undefined> {
+async function readRegularState(target: string, maxBytes = Number.POSITIVE_INFINITY, view?: FilesystemReadView): Promise<RegularFileState | undefined> {
 	try {
-		const captured = await captureStableFile(target, maxBytes, true, { digest: false });
+		const captured = await captureStableFile(target, maxBytes, true, { digest: false, view });
 		return { content: captured.content!, mode: process.platform === "win32" ? 0 : Number(captured.stat.mode & 0o777n), identity: captured.stat };
 	} catch (error) { if (isMissing(error)) return undefined; throw error; }
 }
 
-async function assertFileAliases(root: string, target: string, aliases: readonly string[], identity?: BigIntStats): Promise<void> {
+async function assertFileAliases(root: string, target: string, aliases: readonly string[], identity?: BigIntStats, view = FilesystemReadView.ambient()): Promise<void> {
 	if (!identity || identity.nlink !== BigInt(aliases.length) || !aliases.includes(target)) throw new Error("file alias set changed");
 	for (const alias of aliases) {
-		await assertNoSymlinkPath(root, alias);
-		if (!sameFilesystemIdentity(identity, await lstat(alias, { bigint: true }))) throw new Error("file alias identity changed");
+		await assertNoSymlinkPath(root, alias, (target, read) => captureFilesystemEntry(target, read, view));
+		if (!sameFilesystemIdentity(identity, await view.stat(alias))) throw new Error("file alias identity changed");
 	}
 }
 
 /** Capture a directory without following links and reject concurrent namespace changes. */
-export async function readSandboxDirectoryState(target: string, captureNames?: (names: readonly string[]) => void): Promise<SandboxDirectoryState | undefined> {
+export async function readSandboxDirectoryState(target: string, captureNames?: (names: readonly string[]) => void, view?: FilesystemReadView): Promise<SandboxDirectoryState | undefined> {
 	try {
-		const { info, entries } = await captureFilesystemEntry(target, "directory");
+		const { info, entries } = await captureFilesystemEntry(target, "directory", view);
 		if (!entries) throw new Error(`sandbox resource is not a real directory: ${target}`);
 		captureNames?.(entries.map(entry => entry.name));
 		return { entriesDigest: directoryEntriesDigest(entries), mode: Number(info.mode & 0o777n), uid: Number(info.uid), gid: Number(info.gid) };
@@ -1809,11 +1829,11 @@ export function sameSandboxState(
 	return left.entriesDigest === right.entriesDigest && left.mode === right.mode && left.uid === right.uid && left.gid === right.gid;
 }
 
-async function verifySandboxDirectoryAfter(change: SandboxDirectoryChange): Promise<readonly string[] | undefined> {
+async function verifySandboxDirectoryAfter(change: SandboxDirectoryChange, view = FilesystemReadView.ambient()): Promise<readonly string[] | undefined> {
 	// Native mkdir observes existence; subsequent new-entry reads/access need their own proof.
 	let names: readonly string[] | undefined;
-	const same = change.operation ? (await lstat(change.target)).isDirectory()
-		: sameSandboxState(await readSandboxDirectoryState(change.target, captured => { names = captured; }), change.after);
+	const same = change.operation ? (await view.stat(change.target)).isDirectory()
+		: sameSandboxState(await readSandboxDirectoryState(change.target, captured => { names = captured; }, view), change.after);
 	if (!same) throw new Error(`directory changed while committing: ${change.resource}`);
 	return names;
 }
@@ -1869,19 +1889,20 @@ function ownSandboxChanges(changes: readonly SandboxWorkspaceChange[], project =
 async function restoreChanges(
 	changes: readonly SandboxWorkspaceChange[],
 	baselines: ReadonlyMap<SandboxWorkspaceChange, RegularFileState | SandboxDirectoryState | undefined>,
+	view: FilesystemReadView,
 ): Promise<void> {
 	const errors: unknown[] = [];
 	for (const change of [...changes].reverse()) {
 		try {
-			await assertCommitTarget(change);
+			await assertCommitTarget(change, (target, read) => captureFilesystemEntry(target, read, view));
 			const baseline = baselines.get(change);
 			if (change.kind === "directory") {
 				const directory = baseline as SandboxDirectoryState | undefined;
 				if (!directory) {
 					try { await rmdir(change.target); } catch (error) { if (!isMissing(error)) throw error; }
 				} else {
-					const current = await readSandboxDirectoryState(change.target);
-					if (!current) { await createParentDirectories(change.root, change.target); await mkdir(change.target, { mode: directory.mode }); }
+					const current = await readSandboxDirectoryState(change.target, undefined, view);
+					if (!current) { await createParentDirectories(change.root, change.target, view); await mkdir(change.target, { mode: directory.mode }); }
 					if (process.platform !== "win32") await chmod(change.target, directory.mode);
 				}
 				continue;
@@ -1890,7 +1911,7 @@ async function restoreChanges(
 			if (!file) await rm(change.target, { force: true });
 			else {
 				const temporary = await stageAtomicWrite(file.content, file.mode, change.root);
-				try { await createParentDirectories(change.root, change.target); await replaceFile(temporary, change.target, file.mode); }
+				try { await createParentDirectories(change.root, change.target, view); await replaceFile(temporary, change.target, file.mode); }
 				finally { await rm(temporary, { force: true }).catch(() => undefined); }
 			}
 		} catch (error) {
@@ -1900,7 +1921,7 @@ async function restoreChanges(
 	for (const change of changes) {
 		try {
 			const baseline = baselines.get(change);
-			const current = change.kind === "directory" ? await readSandboxDirectoryState(change.target) : await readRegularState(change.target);
+			const current = change.kind === "directory" ? await readSandboxDirectoryState(change.target, undefined, view) : await readRegularState(change.target, undefined, view);
 			if (!sameSandboxState(current, baseline)) throw new Error(`sandbox rollback did not restore: ${change.resource}`);
 		} catch (error) {
 			errors.push(error);
@@ -1938,7 +1959,7 @@ async function stageAtomicWrite(content: Uint8Array, mode: number | undefined, s
 	}
 }
 
-async function createParentDirectories(sourceRoot: string, target: string, created?: string[], ensured?: Set<string>): Promise<void> {
+async function createParentDirectories(sourceRoot: string, target: string, view: FilesystemReadView, created?: string[], ensured?: Set<string>): Promise<void> {
 	const root = path.resolve(sourceRoot);
 	const parent = path.dirname(path.resolve(target));
 	const relative = relativeFilesystemPath(root, parent);
@@ -1949,7 +1970,7 @@ async function createParentDirectories(sourceRoot: string, target: string, creat
 		if (ensured?.has(current)) continue; // This commit made or found it real; each change's own path check precedes this.
 		try { await mkdir(current); created?.push(current); } catch (error) {
 			if (!hasErrorCode(error, "EEXIST")) throw error;
-			const info = await lstat(current);
+			const info = await view.stat(current);
 			if (info.isSymbolicLink() || !info.isDirectory()) {
 				throw new Error(`sandbox commit parent is not a real directory: ${current}`, { cause: error });
 			}
@@ -1979,12 +2000,12 @@ async function replaceFile(temporary: string, target: string, mode?: number): Pr
 }
 
 /** Root and every proven file name share the native queue; resolved keys give all transactions one strict order. */
-async function withCommitLocks<T>(changes: readonly SandboxWorkspaceChange[], run: () => Promise<T>): Promise<T> {
+async function withCommitLocks<T>(changes: readonly SandboxWorkspaceChange[], run: () => Promise<T>, view: FilesystemReadView): Promise<T> {
 	if (!changes.length) return run();
 	try {
 		const names = [...new Set(changes.flatMap(change => [change.root, change.target, ...change.kind === "directory" ? [] :
 			[...(change.aliases ?? []), ...change.object ? [change.object.path] : []]]).map(name => path.resolve(name)))];
-		const resolve = () => mapFilesystem(names, name => realpath(name).catch(error => {
+		const resolve = () => mapFilesystem(names, name => view.realpath(name).catch(error => {
 			if (isMissing(error) || hasErrorCode(error, "ENOTDIR")) return name;
 			throw error;
 		}));

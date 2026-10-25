@@ -5,7 +5,10 @@ import path from "node:path";
 import * as filesystemEvidence from "../src/filesystem-evidence.ts";
 import { nativeProcessLibrary } from "../src/process-startup.mjs";
 import { ResourceVersionManager, type ResourceVersionToken } from "../src/resource-version.ts";
-import { WorkspaceSandboxService, type SandboxWorkspaceContext } from "../src/workspace-sandbox.ts";
+import { WorkspaceSandboxService, readSandboxDirectoryState, type SandboxWorkspaceContext, type SandboxWorkspaceChange } from "../src/workspace-sandbox.ts";
+import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
+import type { ToolInvocation } from "../src/tool-settlement.ts";
+import { createWriteTool } from "@earendil-works/pi-coding-agent";
 import { captureAbsenceDependency, captureDirectoryDependency, captureFileDependency, captureMetadataDependency, captureSymlinkDependency, validateDynamicDependencyCertificate } from "../src/provenance-validation.ts";
 import { ProcessReusePlanner, ProvenanceCertificateStore, sealProcessCertificate } from "../src/process-reuse.ts";
 import { PROCESS_CERTIFICATE } from "./process-fixture.ts";
@@ -15,6 +18,57 @@ const metadata = async (paths: readonly string[]) => Promise.all(paths.map(async
   const stat = await lstat(target, { bigint: true });
   return { target, fields: Object.fromEntries(filesystemEvidence.FILESYSTEM_METADATA_FIELDS.map(field => [field, String(stat[field])])) };
 }));
+
+linux.for(["proposal", "proposal-failure", "validate", "stale-native", "stale-replace", "adopt"])("preserves source metadata until adoption passes its preflight (%s)", { timeout: 30_000 }, async mode => {
+  nativeProcessLibrary(process.env.PI_SPEC_HELD_EXEC!);
+  const fixture = await mkdtemp(path.join(os.tmpdir(), "pi-readonly-adoption-")), physical = path.join(fixture, "real/source"), route = path.join(fixture, "route");
+  const root = path.join(route, "source"), file = path.join(physical, "input"), alias = path.join(physical, "alias"), symbolic = path.join(physical, "symbolic"), broken = path.join(physical, "broken");
+  const target = path.join(root, "input"), service = new WorkspaceSandboxService(), world = service.createExecutionWorld();
+  let branch: Awaited<ReturnType<typeof world.speculation.execute>> | undefined;
+  try {
+    await mkdir(physical, { recursive: true }); await writeFile(file, "original\n");
+    if (mode.startsWith("proposal")) await writeFile(alias, "independent\n"); else await link(file, alias);
+    await symlink("real", route); await symlink("input", symbolic); await symlink("missing", broken);
+    const directory = await readSandboxDirectoryState(root), identity = await lstat(file, { bigint: true });
+    for (const name of [physical, file, alias]) await utimes(name, 915148800, 946684800);
+    for (const name of [route, symbolic, broken]) await lutimes(name, 915148800, 946684800);
+    const paths = [physical, file, alias, route, symbolic, broken], before = await metadata(paths);
+    const output = { result: { content: [], details: {} }, isError: false };
+    if (mode.startsWith("proposal")) {
+      const execute: NonNullable<ToolInvocation["filesystem"]> = async operations => {
+        await operations.access(root); await operations.access(target, true);
+        expect((await operations.readFile(target)).toString()).toBe("original\n");
+        await operations.writeFile!(target, "adopted\n");
+        if (mode === "proposal-failure") throw new Error("discard proposal");
+        return output;
+      };
+      const args = { path: "input", content: "adopted\n" }, action = PI_ACTION_SEMANTICS.buildKey("write", args, root, "readonly", { fingerprint: "readonly-contract", context: { filesystem: execute } })!;
+      const pending = world.speculation.execute({ cwd: root, tool: createWriteTool(root), toolName: "write", args, action, callID: "readonly", signal: new AbortController().signal });
+      if (mode === "proposal-failure") await expect(pending).rejects.toThrow("discard proposal");
+      else {
+        branch = await pending; if (branch.inputsOnly) throw new Error("mutation produced input-only evidence");
+        const inputs = await branch.takeReadInputs?.(64 * 1024); expect(inputs).toBeDefined(); await inputs?.dispose();
+      }
+      expect(await metadata(paths)).toEqual(before);
+      if (branch && !branch.inputsOnly) { expect(await branch.commit()).toEqual(output); expect(await readFile(file, "utf8")).toBe("adopted\n"); }
+    } else {
+      const changes: SandboxWorkspaceChange[] = [
+        { root, target: root, resource: "", kind: "directory", validationOnly: true, before: directory },
+        { root, target, resource: "input", before: Buffer.from(mode.startsWith("stale") ? "stale\n" : "original\n"), beforeMode: Number(identity.mode & 0o777n),
+          aliases: [target, path.join(root, "alias")].sort(), ...(mode === "validate" ? { validationOnly: true } : { after: Buffer.from("adopted\n"), ...(mode === "stale-replace" ? {} : { operation: "write_contents" }) }) },
+      ];
+      const pending = service.commitDelta({ output, changes });
+      if (mode.startsWith("stale")) await expect(pending).rejects.toMatchObject({ disposition: "recoverable", message: expect.stringContaining("resource changed before commit") });
+      else expect(await pending).toEqual(output);
+      if (mode !== "adopt") expect(await metadata(paths)).toEqual(before);
+      else {
+        expect((await metadata(paths))[0]).toEqual(before[0]);
+        expect((await lstat(file, { bigint: true })).ino).toBe(identity.ino);
+        expect(await readFile(file, "utf8")).toBe("adopted\n"); expect(await readFile(alias, "utf8")).toBe("adopted\n");
+      }
+    }
+  } finally { await branch?.dispose(); await world.dispose?.(); await service.dispose(); await rm(fixture, { recursive: true, force: true }); }
+});
 
 linux.for(["capture", "validate", "replay"])("preserves source metadata through dependency evidence and persisted replay (%s)", { timeout: 30_000 }, async mode => {
   nativeProcessLibrary(process.env.PI_SPEC_HELD_EXEC!);

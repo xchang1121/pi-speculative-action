@@ -2177,6 +2177,7 @@ async function replayFilesystemEffects(
 	projection: ExecutionPathProjection,
 	privateStorage?: string,
 ) {
+	await using privateReads = privateStorage ? FilesystemReadView.ambient() : undefined;
 	const changes: SandboxWorkspaceChange[] = [], { workspaceRoot } = projection;
 	for (const event of journal) {
 		if (event.kind === "output") continue;
@@ -2204,7 +2205,7 @@ async function replayFilesystemEffects(
 	// Inside a speculative session, what lies outside the workspace belongs to its private branch until adoption.
 	const external = privateStorage ? changes.filter(change => !pathContains(workspaceRoot, change.target)) : [];
 	if (external.length) await privateReplay(privateStorage!, external);
-	if (changes.length > external.length) await owner.commitDelta({ output: { result: { content: [], details: {} }, isError: false }, changes: changes.filter(change => !external.includes(change)) });
+	if (changes.length > external.length) await owner.commitDelta({ output: { result: { content: [], details: {} }, isError: false }, changes: changes.filter(change => !external.includes(change)) }, privateReads);
 }
 
 /** Apply changes in a session's private branch as its sandboxes would have: over the merged view's state, into its upper
