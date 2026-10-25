@@ -59,7 +59,7 @@ export class ArtifactCAS {
 
 	async get(reference: ArtifactReference, signal?: AbortSignal): Promise<Buffer | undefined> {
 		validateArtifact(reference);
-		return verifyArtifact(reference, await readOptional(this.artifactPath(reference.digest), signal));
+		return verifyArtifact(reference, await readOptional(this.artifactPath(reference.digest), reference.size, signal));
 	}
 
 	/** Availability hint only; publication and adoption verify content. */
@@ -398,7 +398,7 @@ async function sqliteReady<T>(run: () => T, signal: AbortSignal): Promise<T> {
 }
 /** Preserve verified objects; a new complete publication atomically replaces a corrupt copy. */
 async function publishImmutable(target: string, bytes: Uint8Array): Promise<boolean> {
-	if ((await readOptional(target))?.equals(bytes)) {
+	if ((await readOptional(target, bytes.byteLength))?.equals(bytes)) {
 		const now = new Date(); // Referencing the same object restarts its orphan grace.
 		try { await utimes(target, now, now); return false; } catch (error) { if (!missing(error)) throw error; }
 	}
@@ -430,7 +430,21 @@ function decodeInputVersion(value: unknown): StoredInputVersion | undefined {
 	} catch { return undefined; }
 }
 
-function readOptional(target: string, signal?: AbortSignal) { return readFile(target, { signal }).catch((error): undefined => { if (!missing(error)) throw error; }); }
+/** One extra byte proves a size mismatch without loading an arbitrarily enlarged corrupt object. */
+async function readOptional(target: string, size: number, signal?: AbortSignal): Promise<Buffer | undefined> {
+	signal?.throwIfAborted();
+	const file = await open(target, "r").catch((error): undefined => { if (!missing(error)) throw error; });
+	if (!file) return;
+	try {
+		const bytes = Buffer.allocUnsafe(size + 1); let offset = 0;
+		while (offset < bytes.length) {
+			signal?.throwIfAborted();
+			const { bytesRead } = await file.read(bytes, offset, bytes.length - offset, offset);
+			if (!bytesRead) break; offset += bytesRead;
+		}
+		signal?.throwIfAborted(); return bytes.subarray(0, offset);
+	} finally { await file.close(); }
+}
 
 async function verifyArtifact(reference: ArtifactReference, bytes?: Buffer): Promise<Buffer | undefined> {
 	if (bytes && (bytes.byteLength !== reference.size || await sha256DigestAsync(bytes) !== reference.digest)) throw new Error(`artifact integrity check failed for ${reference.digest}`);

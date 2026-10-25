@@ -7,7 +7,7 @@ import { BASH_TIMEOUT_ACTION_KEY_PROJECTOR, GREP_LITERAL_ACTION_KEY_PROJECTOR, g
 import type { ActionProjectionRule } from "./action-key-projection.ts";
 import { asRecord } from "./stable-json.ts";
 import { RESOURCE_OBSERVATION_EFFECTS } from "./effect-model.ts";
-import { captureResourceVersion, type ToolFilesystemOperations } from "./resource-version.ts";
+import { captureResourceVersion, createSerializablePreparationBinding, type ToolFilesystemOperations } from "./resource-version.ts";
 import { relativeFilesystemPath, sameFilesystemPath, slash } from "./path-utils.ts";
 import fs from "node:fs/promises";
 import process from "node:process";
@@ -269,7 +269,10 @@ async function prepareGrepEngine(home: string, profile: { readonly versions: Rea
 			({ data }) => { assert.ok((bytes += data.length) <= 8192, "rg version budget"); version.push(data); });
 		signal.throwIfAborted(); assert.equal(result.code, 0);
 		assert.equal(Buffer.concat(version).toString().match(/^ripgrep (\S+)/)?.[1], qualifiedVersion, "rg version requires qualification");
-		return { root: owned, identity: Object.freeze({ sha256: binary.hash, platform: process.platform, arch: process.arch, environment, flags }),
+		const identity = Object.freeze({ sha256: binary.hash, platform: process.platform, arch: process.arch, environment, flags });
+		const matchesBinding: object = createSerializablePreparationBinding({ engine: identity, node: process.version,
+			loaded: [matchCapturedGrep, runCapturedSearchProcess, prepareGrepEngine].map(fn => Function.prototype.toString.call(fn)) }, acceptsGrepMatches);
+		return { root: owned, identity, matchesBinding,
 			execute: (stage: "actor" | "selection" | "producer", cwd: string, args: readonly string[], signal: AbortSignal, emit: (output: SearchOutput) => void) =>
 				runCapturedSearchProcess(executable, [...flags, ...(stage === "actor" ? [] : ["--no-ignore-parent"]), ...(stage === "producer" ? ["--no-ignore"] : []), ...args], cwd, environment, signal, emit),
 			release: async () => { assert.equal(path.dirname(owned), path.resolve(os.tmpdir())); await fs.rm(owned, { recursive: true, force: true }); },
@@ -352,6 +355,13 @@ type SearchSelection = (cwd: string, args: readonly string[], signal: AbortSigna
 type PreparedGrep = { readonly root: string; readonly cwd: string; readonly path: string;
 	readonly files: readonly { readonly source: string; readonly path: string }[] };
 
+function acceptsGrepMatches(value: unknown): boolean {
+	return Array.isArray(value) && value.every(match => match && typeof match === "object" && Object.keys(match).length === 2 &&
+		Number.isSafeInteger(match.line_number) && match.line_number > 0 && match.lines && typeof match.lines === "object" &&
+		Object.keys(match.lines).length === 1 && (typeof match.lines.text === "string" && match.lines.bytes === undefined ||
+			typeof match.lines.bytes === "string" && match.lines.text === undefined));
+}
+
 /** Match content once per explicit regex contract; Pi still owns limits, context and result formatting. */
 async function matchCapturedGrep(view: ToolFilesystemOperations, engine: NonNullable<Awaited<ReturnType<typeof prepareGrepEngine>>>,
 	prepared: PreparedGrep, query: GrepInput, signal: AbortSignal, emit: (output: SearchOutput) => void) {
@@ -400,7 +410,7 @@ async function matchCapturedGrep(view: ToolFilesystemOperations, engine: NonNull
 			const value = await enqueue(file.source, inputs, signal);
 			return { value, bytes: JSON.stringify(value).length * 2 + value.length * 64, dispose: () => {} };
 		};
-		return view.prepare ? view.prepare(engine, JSON.stringify([file.source, query.pattern, !!query.ignoreCase, !!query.literal]),
+		return view.prepare ? view.prepare(engine.matchesBinding, JSON.stringify([file.source, query.pattern, !!query.ignoreCase, !!query.literal]),
 			build, async value => value, file.source, signal) : build(view, signal).then(resource => resource.value);
 	});
 	try {

@@ -1,6 +1,7 @@
 import { isSafeCount } from "./number-utils.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { hash } from "node:crypto";
+import { types } from "node:util";
 import { type BigIntStats, type FSWatcher, watch, closeSync, constants, fstatSync, readlinkSync } from "node:fs";
 import { ensureNativeFilesystem, nativeFilesystem } from "./process-startup.mjs";
 import path from "node:path";
@@ -16,8 +17,9 @@ import { TimelineInterval } from "./task-timing.ts";
 import type { ValidationMetrics } from "./settlement.ts";
 import { ChunkedContent, ContentChunkPool, parseContentManifest, type ContentChunkLimits, type ChunkedContentManifest } from "./content-chunks.ts";
 import type { ProvenanceCertificateStore } from "./reuse-store.ts";
-import type { ArtifactReference } from "./artifact-reference.ts";
-import type { Sha256Digest } from "./stable-value-hash.ts";
+import { validateArtifact, type ArtifactReference } from "./artifact-reference.ts";
+import { isSha256Digest, sha256Digest, type Sha256Digest } from "./stable-value-hash.ts";
+import { stableStringify } from "./stable-json.ts";
 
 export type ToolFilesystemStat = { isDirectory: () => boolean; size?: number; type?: "file" | "directory" | "symlink" | "special"; link?: string; realPath?: string };
 
@@ -100,7 +102,54 @@ type ResourceInputSource = {
 };
 type PersistentResourceEntry = readonly [string, Omit<CapturedResource, "computation" | "object" | "objectBytes" | "metadata" | "content"> & {
 	readonly content?: ChunkedContentManifest; readonly metadata?: { readonly dependency?: string; readonly size?: number }; readonly entries?: readonly string[]; readonly target?: string; readonly link?: string }];
-type PersistentResourcePayload = { readonly root: string; readonly physicalRoot: string; readonly observations: readonly ResourceObservation[]; readonly entries: readonly PersistentResourceEntry[] };
+type PersistentPreparation = { readonly binding: Sha256Digest; readonly key: string; readonly resource?: string;
+	readonly dependencies: readonly string[]; readonly value: ArtifactReference };
+type PersistentResourcePayload = { readonly root: string; readonly physicalRoot: string; readonly observations: readonly ResourceObservation[];
+	readonly entries: readonly PersistentResourceEntry[]; readonly preparations: readonly PersistentPreparation[] };
+
+const MAX_PREPARATION_DATA_BYTES = 1024 * 1024;
+const preparationBindings = new WeakMap<object, { readonly id: Sha256Digest; readonly accepts: (value: unknown) => boolean }>();
+/** Internal adapters must audit their complete pure closure; registering an arbitrary callback does not prove it pure. */
+export function createSerializablePreparationBinding(implementation: unknown, accepts: (value: unknown) => boolean): object {
+	const binding = Object.freeze({});
+	preparationBindings.set(binding, { accepts, id: sha256Digest(stableStringify({ implementation, codec: "prepared-json-v1",
+		loaded: [snapshotPreparation, accepts].map(fn => Function.prototype.toString.call(fn)) })) });
+	return binding;
+}
+
+/** Own a bounded, lossless JSON tree without invoking getters or flattening opaque resources. */
+function snapshotPreparation(value: unknown): { readonly value: unknown; readonly data: Buffer } | undefined {
+	let remaining = MAX_PREPARATION_DATA_BYTES, nodes = 0;
+	const seen = new WeakSet<object>(), budget = Symbol(), invalid = () => { throw new Error("resource_preparation_data_invalid"); };
+	const charge = (value: string) => { if (value.length > remaining || (remaining -= Buffer.byteLength(value)) < 0) throw budget; };
+	const copy = (item: unknown, depth: number): unknown => {
+		if (++nodes > 65536 || depth > 64) throw budget;
+		if (item === null || typeof item === "boolean" || typeof item === "number" && Number.isFinite(item) && !Object.is(item, -0)) { charge(JSON.stringify(item)); return item; }
+		if (typeof item === "string") { if (item.length > remaining) throw budget; charge(JSON.stringify(item)); return item; }
+		if (!item || typeof item !== "object" || types.isProxy(item) || seen.has(item)) return invalid();
+		const array = Array.isArray(item), keys = Reflect.ownKeys(item);
+		if (Object.getPrototypeOf(item) !== (array ? Array.prototype : Object.prototype) ||
+			array && (keys.length !== item.length + 1 || keys.some((key, index) => key !== (index === item.length ? "length" : String(index))))) return invalid();
+		seen.add(item); charge(array ? "[]" : "{}");
+		const owned = array ? [] : {};
+		for (const key of keys) {
+			if (array && key === "length") continue;
+			const property = Object.getOwnPropertyDescriptor(item, key)!;
+			if (typeof key !== "string" || !property.enumerable || !("value" in property)) return invalid();
+			if (key.length > remaining) throw budget;
+			charge(array ? "," : JSON.stringify(key) + ":,");
+			Object.defineProperty(owned, key, { value: copy(property.value, depth + 1), enumerable: true });
+		}
+		return Object.freeze(owned);
+	};
+	try { const owned = copy(value, 0); return { value: owned, data: Buffer.from(stableStringify(owned)) }; }
+	catch (error) { if (error !== budget) throw error; return undefined; }
+}
+
+// Includes the decoded tree, encoded bytes and transient decoding copies, not just the CAS payload.
+const preparationDataBytes = (size: number) => size * 64 + 512;
+const preparationMetadataBytes = (key: string, resource: string | undefined, dependencies: Iterable<string>) =>
+	(key.length + (resource?.length ?? 0)) * 2 + 192 + [...dependencies].reduce((sum, name) => sum + name.length * 2 + 64, 0);
 
 function parsePersistentResourcePayload(value: unknown, root: string): PersistentResourcePayload {
 	const payload = value as PersistentResourcePayload, invalid = () => { throw new Error("invalid persistent input closure"); };
@@ -134,14 +183,26 @@ function parsePersistentResourcePayload(value: unknown, root: string): Persisten
 			...(entry.content ? { content: parseContentManifest(entry.content) } : {}),
 			...(entry.type === "directory" ? { entries: entry.entries && [...entry.entries] } : entry.type === "alias" ? { link: entry.link, target: entry.target } : {}) }];
 	});
-	return { root, physicalRoot: payload.physicalRoot, observations: payload.observations, entries };
+	const preparations = payload.preparations ?? [], identities = new Set<string>();
+	if (!Array.isArray(preparations) || preparations.length > 65536) return invalid();
+	for (const preparation of preparations) {
+		if (!preparation || !isSha256Digest(preparation.binding) || typeof preparation.key !== "string" || preparation.key.length > 65536 ||
+			preparation.resource !== undefined && (!absolute(preparation.resource) || !containsFilesystemPath(root, preparation.resource)) ||
+			!Array.isArray(preparation.dependencies) || !preparation.dependencies.length || preparation.dependencies.length > keys.size ||
+			new Set(preparation.dependencies).size !== preparation.dependencies.length || preparation.dependencies.some((key: unknown) => typeof key !== "string" || !keys.has(key)) ||
+			!preparation.dependencies.includes(dependencyKey({ path: root, scope: "resolution" }))) return invalid();
+		validateArtifact(preparation.value);
+		if (preparation.value.size > MAX_PREPARATION_DATA_BYTES) return invalid();
+		const identity = JSON.stringify([preparation.binding, preparation.key]); if (identities.has(identity)) return invalid(); identities.add(identity);
+	}
+	return { root, physicalRoot: payload.physicalRoot, observations: payload.observations, entries, preparations };
 }
 type ResourceInputLookup = (target?: string) => Iterable<ResourceInputSource>;
 type PreparedResource = {
 	readonly cancellation: SharedAbortScope;
 	readonly waiting: Set<PreparedResource>;
 	computation?: TimelineInterval;
-	value?: unknown; readonly dispose: () => void | Promise<void>;
+	value?: unknown; data?: Buffer; readonly dispose: () => void | Promise<void>;
 	readonly resource?: string;
 	dependencies?: ReadonlySet<string>; readonly boundary?: { readonly root: string; readonly physicalRoot: string };
 	readonly origin: ResourceReadView; destination: ResourceReadView; ready?: Promise<void>; readonly declined: Promise<void>; readonly composed?: Promise<void>;
@@ -179,7 +240,7 @@ export class ResourceReadView {
 	private validateInputs?: (proofs: readonly ResourceVersionToken[]) => Promise<void>;
 	private acceptProofs?: (proofs: readonly ResourceVersionToken[]) => readonly ResourceVersionToken[];
 	private preparing?: PreparedResource;
-	private prepared?: { readonly lifetime: RuntimeLifecycleLane; readonly bindings: Map<object, Map<string, PreparedResource>> };
+	private prepared?: { readonly lifetime: RuntimeLifecycleLane; readonly bindings: Map<object | Sha256Digest, Map<string, PreparedResource>> };
 	private boundary?: { readonly root: string; readonly physicalRoot: string; readonly dependency?: string };
 	private readonly maxBytes: number;
 	private readonly load?: (dependency: ResourceDependency) => Promise<void>;
@@ -371,9 +432,10 @@ export class ResourceReadView {
 		let owner: ResourceReadView = this;
 		while (owner.owner) owner = owner.owner;
 		const prepared = owner.preparations();
+		const registration = preparationBindings.get(binding), identity = registration?.id ?? binding;
 		return prepared.lifetime.admit(async () => {
 			this.assertComplete();
-			const cached = prepared.bindings.get(binding)?.get(key);
+			const cached = prepared.bindings.get(identity)?.get(key);
 			const compatible = (cached: PreparedResource | undefined) => cached && !cached.revoked && cached.destination.retained &&
 				(cached.retained || !cached.cancellation.signal.aborted) &&
 				cached.boundary?.root === this.boundary?.root && cached.boundary?.physicalRoot === this.boundary?.physicalRoot;
@@ -391,6 +453,7 @@ export class ResourceReadView {
 						(!cached.proofs?.length || this.acceptProofs))) return undefined;
 					if (building) await cached.ready;
 					signal?.throwIfAborted();
+					if (registration && !registration.accepts(cached.value)) throw new Error("resource_preparation_data_invalid");
 					const dependencies = cached.origin === owner && cached.dependencies && this.dependencies ? new Set([...this.dependencies, ...cached.dependencies]) : undefined;
 					const sourceDependencies = source && cached.origin.entries === source.view.entries ? cached.dependencies : undefined;
 					const proofs = [...source?.observed(sourceDependencies, false) ?? [], ...cached.proofs ?? []];
@@ -425,7 +488,7 @@ export class ResourceReadView {
 			const reused = cached && compatible(cached) && await use(cached);
 			if (reused) return reused.value;
 			for (const source of this.lookup?.() ?? []) {
-				const cached = source.view.prepared?.bindings.get(binding)?.get(key);
+				const cached = source.view.prepared?.bindings.get(identity)?.get(key);
 				if (source.view.entries === this.entries || !source.view.retained || !source.view.sealed ||
 					!cached || !compatible(cached)) continue;
 				const result = await use(cached, false, source);
@@ -439,12 +502,13 @@ export class ResourceReadView {
 			const pending: PreparedResource = { resource: name, origin: owner, destination: owner, borrowers: 0, boundary: this.boundary, cancellation: new SharedAbortScope(), waiting: new Set(),
 				declined: declined.promise, composed: composed?.promise,
 				dispose: async () => { try { await resource?.dispose(); } finally {
-					if (prepared.bindings.get(binding)?.get(key) === pending) prepared.bindings.get(binding)!.delete(key);
+					if (prepared.bindings.get(identity)?.get(key) === pending) prepared.bindings.get(identity)!.delete(key);
 					await Promise.allSettled(pending.proofs?.map(proof => proof.release()) ?? []);
 					if (pending.retained) pending.destination.capturedBytes -= bytes;
+					pending.value = undefined; pending.data = undefined;
 				} } };
-			let entries = prepared.bindings.get(binding);
-			if (!entries) prepared.bindings.set(binding, entries = new Map());
+			let entries = prepared.bindings.get(identity);
+			if (!entries) prepared.bindings.set(identity, entries = new Map());
 			if (!entries.has(key) || !entries.get(key)!.retained && entries.get(key)!.cancellation.signal.aborted) entries.set(key, pending);
 			pending.ready = this.evaluate(async view => {
 				view.preparing = pending;
@@ -459,17 +523,19 @@ export class ResourceReadView {
 					(pending.proofs ??= []).push(proof.manager.retain({ ...proof, view: undefined }));
 			}, (observed, commit) => { if (commit !== false) pending.dependencies = observed; else if (observed) return this.observed?.(observed, false); }).then(async () => {
 				if (!resource) throw new Error("resource_preparation_missing");
-				pending.value = resource.value;
-				bytes = resource.bytes + computationBytes + resourceProofBytes(pending.proofs ?? []) + (key.length + (name?.length ?? 0)) * 2 + 192 +
-					[...pending.dependencies ?? []].reduce((sum, name) => sum + name.length * 2 + 64, 0);
+				if (registration && !registration.accepts(resource.value)) throw new Error("resource_preparation_data_invalid");
+				const data = registration && snapshotPreparation(resource.value);
+				pending.value = data ? data.value : resource.value; pending.data = data?.data;
+				bytes = (data ? preparationDataBytes(data.data.length) : resource.bytes) + computationBytes + resourceProofBytes(pending.proofs ?? []) +
+					preparationMetadataBytes(key, name, pending.dependencies ?? []);
 				if (!isSafeCount(resource.bytes)) throw new Error("resource_snapshot_budget_invalid");
 				const destination = pending.destination = owner.sealed && this.missing ? (await this.missing()).view : owner;
 				pending.cancellation.signal.throwIfAborted();
 				this.assertComplete(); destination.assertComplete();
 				const retention = destination.preparations();
 				if (inputEpoch === owner.inputEpoch && !destination.sealed && destination.bytes + bytes <= destination.maxBytes) {
-					let entries = retention.bindings.get(binding);
-					if (!entries) retention.bindings.set(binding, entries = new Map());
+					let entries = retention.bindings.get(identity);
+					if (!entries) retention.bindings.set(identity, entries = new Map());
 					if (!entries.has(key) || entries.get(key) === pending) {
 						pending.retained = true; entries.set(key, pending); destination.capturedBytes += bytes;
 					}
@@ -524,8 +590,8 @@ export class ResourceReadView {
 			const actual = current.entries.get(target); return actual !== undefined && digest(value(entry)) === digest(value(actual));
 		});
 	}
-	/** Persistent data carries no object pins, preparations, callbacks, or historical timing receipts. */
-	async persistentEntries(): Promise<readonly PersistentResourceEntry[]> {
+	/** Persist owned data only; object pins, live resources, callbacks and timing receipts stay with this owner. */
+	async persistentSnapshot(observations: ReadonlyMap<string, ResourceObservation>, store: ProvenanceCertificateStore) {
 		this.assertComplete(true);
 		if (!this.contents) throw new Error("persistent input storage is not configured");
 		const entries: PersistentResourceEntry[] = [];
@@ -543,7 +609,37 @@ export class ResourceReadView {
 			entries.push([target, { type, realPath, dependency, metadata, ...(content ? { content } : {}),
 				...(type === "directory" ? { entries: entry.entries } : type === "alias" ? { target: entry.target, link: entry.link } : {}) }]);
 		}
-		this.assertComplete(true); return entries;
+		const preparations: PersistentPreparation[] = [];
+		for (const [binding, values] of this.prepared?.bindings ?? []) for (const [key, prepared] of values) {
+			if (!this.boundary || typeof binding !== "string" || !prepared.retained || prepared.revoked || !prepared.data || prepared.origin !== this || prepared.destination !== this ||
+				prepared.proofs?.length || !prepared.shareable || !prepared.dependencies || key.length > 65536 ||
+				prepared.resource && !containsFilesystemPath(this.boundary.root, prepared.resource) ||
+				prepared.boundary?.root !== this.boundary?.root || prepared.boundary?.physicalRoot !== this.boundary?.physicalRoot ||
+				!this.boundary?.dependency || !prepared.dependencies.has(this.boundary.dependency) || [...prepared.dependencies].some(key => !observations.has(key))) continue;
+			preparations.push({ binding, key, resource: prepared.resource, dependencies: [...prepared.dependencies], value: await store.artifacts.put(prepared.data) });
+		}
+		this.assertComplete(true); return { entries, preparations };
+	}
+	/** Restore into the same preparation table with fresh cancellation and lifetime state, never old execution authority. */
+	async restorePreparations(preparations: readonly PersistentPreparation[], store: ProvenanceCertificateStore): Promise<void> {
+		for (const preparation of preparations) {
+			this.assertComplete();
+			const { binding, key, resource, dependencies, value } = preparation;
+			const bytes = preparationDataBytes(value.size) + preparationMetadataBytes(key, resource, dependencies);
+			if (!this.reserve(bytes)) this.assertComplete();
+			const data = await store.artifacts.get(value);
+			if (!data) throw new Error("persistent preparation artifact missing");
+			const snapshot = snapshotPreparation(JSON.parse(data.toString("utf8")));
+			if (!snapshot || !snapshot.data.equals(data)) throw new Error("resource_preparation_data_invalid");
+			if (!this.reserve(0)) this.assertComplete();
+			const prepared = this.preparations();
+			let entries = prepared.bindings.get(binding); if (!entries) prepared.bindings.set(binding, entries = new Map());
+			const restored: PreparedResource = { resource, dependencies: new Set(dependencies), boundary: this.boundary,
+				origin: this, destination: this, borrowers: 0, retained: true, shareable: true, cancellation: new SharedAbortScope(), waiting: new Set(),
+				ready: Promise.resolve(), declined: Promise.resolve(), value: snapshot.value, data: snapshot.data,
+				dispose: () => { if (entries!.get(key) === restored) entries!.delete(key); this.capturedBytes -= bytes; restored.value = undefined; restored.data = undefined; } };
+			entries.set(key, restored);
+		}
 	}
 	seal(): void { if (this.pending) this.failure ??= new Error("resource_snapshot_capture_pending"); this.assertComplete(); this.sealed = true; }
 	dispose(): void | Promise<void> {
@@ -830,11 +926,12 @@ export class ResourceVersionManager {
 		if (!this.open || token.manager !== this || token.root !== this.root || !token.view || !this.persistentInputs) throw new Error("persistent input owner changed");
 		await this.assertPersistentStore();
 		return this.persistentInputs.store.withPublication(async () => {
-			const entries = await token.view!.persistentEntries();
 			const observations = [...token.observations.values()].filter(observation => observation.scope !== "binding");
-			const payload: PersistentResourcePayload = { root: this.root, physicalRoot: token.physicalRoot, observations, entries };
+			const { entries, preparations } = await token.view!.persistentSnapshot(new Map(observations.map(observation => [dependencyKey(observation), observation])), this.persistentInputs!.store);
+			const payload: PersistentResourcePayload = { root: this.root, physicalRoot: token.physicalRoot, observations, entries, preparations };
 			const references = new Map<Sha256Digest, ArtifactReference>();
 			for (const [, entry] of entries) for (const reference of entry.content?.chunks ?? []) if (reference) references.set(reference.digest, reference);
+			for (const preparation of preparations) references.set(preparation.value.digest, preparation.value);
 			token.view!.assertComplete(true);
 			if (!this.open || !observations.length) throw new Error("persistent input owner changed");
 			return (await this.persistentInputs!.store.putInputVersion(payload, [...references.values()])).id;
@@ -862,7 +959,9 @@ export class ResourceVersionManager {
 					view.capture(target, { ...entry, ...(content ? { content } : {}) } as CapturedResource);
 					view.assertComplete();
 				}
+				for (const preparation of payload.preparations) validateArtifact(preparation.value, references);
 				if (record.artifacts.length !== references.size || record.artifacts.some(reference => references.get(reference.digest) !== reference.size)) throw new Error("persistent input artifact closure mismatch");
+				await view.restorePreparations(payload.preparations, store);
 				view.seal();
 				const token: ResourceVersionToken = { root: this.root, physicalRoot: payload.physicalRoot, observations, epoch: this.epoch,
 					watching: false, preciseContent: Object.freeze([]), manager: this, view, inputView: new WeakRef(view), release };

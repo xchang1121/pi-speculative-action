@@ -5,6 +5,9 @@ import { mkdir, mkdtemp, open, lstat, rm, symlink, utimes, writeFile } from "nod
 import * as filesystem from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+import type { ArtifactReference } from "../src/artifact-reference.ts";
+import type { Sha256Digest } from "../src/stable-value-hash.ts";
 import { ContentChunkPool, CONTENT_CHUNK_BYTES } from "../src/content-chunks.ts";
 import { FILESYSTEM_METADATA_FIELDS } from "../src/filesystem-evidence.ts";
 import { ResourceVersionManager, type ResourceVersionToken } from "../src/resource-version.ts";
@@ -29,6 +32,78 @@ async function fixture() {
 		for (const token of tokens) await token.release(); manager.close(); await store.dispose(); await rm(base, { recursive: true, force: true });
 	} };
 }
+const searchFixture = async (f: Awaited<ReturnType<typeof fixture>>, mode: string, id = "") => JSON.parse((await promisify(execFile)(process.execPath,
+	["--import", "tsx", fileURLToPath(new URL("./persistent-preparation-fixture.ts", import.meta.url)), mode, f.root, f.cache, id])).stdout);
+
+linux("recovers a pure search computation under a fresh native binding", { timeout: 120_000 }, async () => {
+	const f = await fixture(), file = path.join(f.root, "input");
+	const run = (mode: string, id = "") => searchFixture(f, mode, id);
+	try {
+		await writeFile(file, "one\ntwo\nthree\ntwo again\n");
+		for (const target of [f.root, file]) await utimes(target, 915148800, 946684800);
+		const before = await metadata([f.root, file]), captured = await run("produce");
+		expect(captured).toMatchObject({ matches: 1, nativeMatches: 1, expired: false });
+		const restored = await run("restore", captured.id);
+		expect(restored.pid).not.toBe(captured.pid); expect(restored.output).toEqual(captured.output);
+		expect(restored, JSON.stringify({ captured, restored })).toMatchObject({ restored: true, prepared: 1, matches: 0, nativeMatches: 0, materializations: 1, expired: false, watching: false });
+		const variants = await run("variants", captured.id);
+		expect(variants.variants.map((item: { matches: number; nativeMatches: number }) => [item.matches, item.nativeMatches])).toEqual([[0, 0], [1, 1], [1, 1], [1, 1]]);
+		expect(variants.variants[0].output).not.toEqual(captured.output); expect(variants.variants[1].output).not.toEqual(captured.output);
+		for (const mode of ["environment", "cancel", "clear", "release"]) {
+			const next = await run(mode, captured.id);
+			expect(next, mode).toMatchObject({ restored: true, matches: mode === "environment" ? 1 : 0, nativeMatches: mode === "environment" ? 1 : 0, released: mode === "release" });
+			if (mode !== "release") expect(next.output).toEqual(captured.output);
+			if (mode === "clear") { expect(next.prepared).toBe(1); captured.id = next.id; }
+		}
+		expect(await metadata([f.root, file])).toEqual(before);
+	} finally { await f.close(); }
+});
+
+linux("rejects incomplete, corrupt, over-budget and stale persistent preparation closures", async () => {
+	const f = await fixture(), file = path.join(f.root, "input");
+	try {
+		await writeFile(file, "one\ntwo\nthree\n");
+		const captured = await searchFixture(f, "produce"), record = (await f.store.getInputVersion(captured.id))!;
+		type Payload = { preparations: { binding: Sha256Digest; key: string; resource?: string; dependencies: string[]; value: ArtifactReference }[] };
+		const preparation = (record.payload as Payload).preparations[0]!;
+		expect(preparation).toBeDefined(); expect(record.artifacts).toContainEqual(preparation.value);
+		await storePeer(f.cache, undefined, [], "collect").completed;
+		expect(await f.store.artifacts.get(preparation.value)).toBeDefined();
+		for (const field of ["dependency", "duplicate", "artifact", "resource", "codec"] as const) {
+			const payload = structuredClone(record.payload) as Payload, value = payload.preparations[0]!;
+			let artifacts = [...record.artifacts];
+			if (field === "dependency") value.dependencies.push("content:unknown");
+			else if (field === "duplicate") payload.preparations.push(value);
+			else if (field === "resource") value.resource = path.dirname(f.root);
+			else {
+				artifacts = artifacts.filter(reference => reference.digest !== value.value.digest);
+				if (field === "codec") { value.value = await f.store.artifacts.put('{"x":1,"x":2}'); artifacts.push(value.value); }
+			}
+			const proposed = await f.store.putInputVersion(payload, artifacts);
+			await expect(f.manager.restore(proposed.id, 8 * 1024 * 1024), field).rejects.toThrow(/closure|data_invalid/);
+		}
+		await expect(f.manager.restore(captured.id, 1024)).rejects.toThrow(/budget/);
+		const restored = (await f.manager.restore(captured.id, 8 * 1024 * 1024))!; f.tokens.push(restored);
+		expect(restored.view!.hasPreparedInputs).toBe(true);
+		await expect(restored.view!.restorePreparations((record.payload as Payload).preparations, f.store)).rejects.toThrow(/not_capturing/);
+		const artifact = f.store.artifacts.artifactPath(preparation.value.digest), original = (await f.store.artifacts.get(preparation.value))!;
+		await writeFile(artifact, Buffer.alloc(original.length, 32));
+		await expect(f.manager.restore(captured.id, 8 * 1024 * 1024)).rejects.toThrow(/integrity/);
+		const oversized = await open(artifact, "r+"); try { await oversized.truncate(64 * CONTENT_CHUNK_BYTES); } finally { await oversized.close(); }
+		const starting = process.memoryUsage().rss; let peak = starting;
+		const sample = setInterval(() => { peak = Math.max(peak, process.memoryUsage().rss); }, 1);
+		try { await expect(f.manager.restore(captured.id, 8 * 1024 * 1024)).rejects.toThrow(/integrity/); }
+		finally { clearInterval(sample); }
+		const growth = Math.max(peak, process.memoryUsage().rss) - starting;
+		console.info(JSON.stringify({ oversizedPreparationBytes: 64 * CONTENT_CHUNK_BYTES, expectedBytes: original.length, peakRSSGrowth: growth }));
+		expect(growth).toBeLessThan(32 * CONTENT_CHUNK_BYTES);
+		await rm(artifact); await expect(f.manager.restore(captured.id, 8 * 1024 * 1024)).rejects.toThrow(/missing/);
+		await f.store.artifacts.put(original); await writeFile(file, "changed source\n");
+		expect(await f.manager.restore(captured.id, 8 * 1024 * 1024)).toBeUndefined();
+		expect((await f.manager.validate(restored)).expired).toBe(true);
+		await restored.release(); expect(restored.view!.hasPreparedInputs).toBe(false);
+	} finally { await f.close(); }
+});
 
 linux("recovers actual input bytes, names, aliases and current proofs in a cold process", async () => {
 	const f = await fixture(), file = path.join(f.root, "input"), alias = path.join(f.root, "alias");
