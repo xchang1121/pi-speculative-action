@@ -1,0 +1,35 @@
+{
+  "platform": "win32",
+  "architecture": "x64",
+  "napi": 8,
+  "sourceSha256": "90b7f8093da4387504dbf6451d3823573a09113a580db88652f1025a2c753571",
+  "binarySha256": "8584650a243b3feb3920d08db2370fe5035cb2ac34b618e0f1b29221939a80c4",
+  "compiler": "x86_64-w64-mingw32-gcc-posix (GCC) 13-posix",
+  "flags": [
+    "-std=c11",
+    "-shared",
+    "-O2",
+    "-s",
+    "-Wall",
+    "-Wextra",
+    "-Werror",
+    "-static-libgcc",
+    "-Wl,--no-insert-timestamp",
+    "-Wl,--image-base,0x180000000"
+  ],
+  "imports": [
+    "napi_check_object_type_tag",
+    "napi_create_buffer_copy",
+    "napi_create_int32",
+    "napi_create_object",
+    "napi_define_properties",
+    "napi_get_cb_info",
+    "napi_get_undefined",
+    "napi_get_value_string_utf16",
+    "napi_throw_error",
+    "napi_throw_type_error",
+    "napi_type_tag_object",
+    "napi_unwrap",
+    "napi_wrap"
+  ]
+}

@@ -7,6 +7,7 @@ import { containsFilesystemPath, slash } from "./path-utils.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
 import { TimelineInterval, type SerializedTimelineComputation } from "./task-timing.ts";
 import { nativeFilesystem } from "./process-startup.mjs";
+import { windowsFilesystem } from "./windows-filesystem.mjs";
 import { getSystemErrorName } from "node:util";
 
 export interface FilesystemTypeEvidence extends Readonly<Pick<Stats,
@@ -44,6 +45,24 @@ export function filesystemObservationDigest(stat: Partial<FilesystemObservationE
 const IDENTITY_FIELDS = ["dev", "ino", "mode", "nlink", "uid", "gid", "rdev", "size", "mtimeNs", "ctimeNs"] as const;
 type FilesystemIdentity = Pick<BigIntStats, typeof IDENTITY_FIELDS[number]>;
 export type FilesystemObjectHandle = { readonly fd: number; stat(options: { bigint: true }): Promise<BigIntStats>; close(): Promise<void> };
+
+/** Retain identity without retaining a pathname or copying bytes. The caller owns the returned lease. */
+export async function pinFilesystemObject(target: string): Promise<{ readonly stat: BigIntStats; close(): Promise<void> }> {
+	target = path.resolve(target);
+	if (process.platform === "win32") {
+		if (!/^[a-z]:[\\/]/i.test(target)) throw new Error("object leases require a local NTFS path");
+		const provider = windowsFilesystem(), lease = provider.pin(path.toNamespacedPath(target));
+		try {
+			const stat = await fs.lstat(target, { bigint: true }), identity = provider.identity(lease);
+			const inode = BigInt(identity.readUInt32LE(4)) << 32n | BigInt(identity.readUInt32LE(8));
+			if (stat.dev !== BigInt(identity.readUInt32LE(0)) || stat.ino !== inode || stat.isSymbolicLink()) throw new Error("filesystem_object_binding_changed");
+			return { stat, close: async () => provider.close(lease) };
+		} catch (error) { provider.close(lease); throw error; }
+	}
+	const handle = await fs.open(target, process.platform === "linux" ? 0x200000 | constants.O_NOFOLLOW : constants.O_RDONLY);
+	try { return { stat: await handle.stat({ bigint: true }), close: () => handle.close() }; }
+	catch (error) { await handle.close(); throw error; }
+}
 export type CapturedFilesystemTransfer = Omit<StableFilesystemCapture, "stat" | "object" | "content" | "computation"> & {
 	readonly fd: number; readonly active: SharedArrayBuffer; readonly stat: FilesystemIdentity; readonly content?: Uint8Array; readonly computation?: SerializedTimelineComputation;
 };

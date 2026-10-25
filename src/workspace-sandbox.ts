@@ -17,7 +17,7 @@ import {
 import type { WorldBranch, WorldCheckpoint, WorldExecutionMetrics } from "./execution-world.ts";
 import {
 	advanceFilesystemClock, assertNoSymlinkPath, captureFilesystemEntry, captureStableFile, fileIdentity, mapFilesystem, sameFilesystemIdentity, readFilesystemDirectory, openFilesystemFile,
-	settledIdentity, sharedWalk, FILESYSTEM_OBSERVATION_FIELDS, FILESYSTEM_METADATA_FIELDS as SNAPSHOT_METADATA_FIELDS, type FilesystemObservationEvidence,
+	settledIdentity, sharedWalk, pinFilesystemObject, FILESYSTEM_OBSERVATION_FIELDS, FILESYSTEM_METADATA_FIELDS as SNAPSHOT_METADATA_FIELDS, type FilesystemObservationEvidence,
 } from "./filesystem-evidence.ts";
 import { WORKSPACE_PATH_MUTATION_EFFECTS } from "./effect-model.ts";
 import { EffectCommit, effectCommitFailure } from "./effect-transaction.ts";
@@ -914,10 +914,10 @@ async function createPrivateSandboxWorkspace(state: WorkspaceSandboxState, cwd: 
 	let overlayStorageRoot: string | undefined, cursor: ResourceVersionToken | undefined;
 	let metadata: Awaited<ReturnType<typeof preserveSnapshotMetadata>> | undefined;
 	// Baselines and checkpoints share one owner; Linux O_PATH also retains unreadable objects without reading them.
-	const pins: FileHandle[] = [];
+	const pins: Awaited<ReturnType<typeof pinFilesystemObject>>[] = [];
 	const pinObject = async (target: string) => {
-		const handle = await open(target, process.platform === "linux" ? 0x200000 | fsConstants.O_NOFOLLOW : fsConstants.O_RDONLY);
-		pins.push(handle); return handle.stat({ bigint: true });
+		const lease = await pinFilesystemObject(target);
+		pins.push(lease); return lease.stat;
 	};
 	let workspace!: PrivateSandboxWorkspace;
 	let disposal: Promise<void> | undefined;
@@ -1648,7 +1648,7 @@ async function materializeCheckpoint(workspace: PrivateSandboxWorkspace, checkpo
 		await commitSandboxExecution(workspace.pool.owner, { output: { result: { content: [], details: {} }, isError: false }, changes });
 		for (const change of changes) if (!change.validationOnly && change.kind !== "directory") {
 			if (change.after !== undefined) await workspace.pinObject(change.target);
-			workspace.baselineFrontier.set(change.resource, await readRegularState(change.target));
+			workspace.baselineFrontier.set(path.normalize(change.resource), await readRegularState(change.target));
 		}
 	}
 }

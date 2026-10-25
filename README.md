@@ -17,6 +17,8 @@ pi -e /absolute/path/to/pi-speculative-action
 
 Linux / WSL 2 可从菜单安装 Bash 后端，或运行 `npm run setup:linux`；WSL checkout 应位于 Linux 原生文件系统。进程后端自动选择通过检查的 OverlayFS，否则回退 Git，并在采纳前核对输入和原始对象身份。OverlayFS 从校验后的固定源代码及随包补丁构建，需要 C 编译器、make、autoconf、automake、libtool、pkg-config 和包含静态库的 libfuse3 开发包；补丁在挂载前将工作区内普通文件的硬链接组复制为同一私有对象，保留跨目录别名、重命名及持有句柄的链接数；复制硬链接时不更新源文件访问时间，二进制内容进入执行指纹。
 
+Windows x64 的私有工作区使用随包提供的 NTFS 对象租约：保留对象身份时仍允许父目录重命名，不额外占用硬链接名。资格范围是普通用户可按文件 ID 打开的本地 NTFS 文件和目录，不含重解析点、网络路径、其他架构或文件系统。租约只保活对象，不冻结内容，也不作为跨进程恢复权限。构建者可在 Linux/WSL 使用既有 MinGW-w64 和 Node N-API 头文件运行 `PI_SPEC_WINDOWS_TOOLCHAIN=/path/to/toolchain/usr npm run build:windows`；源码、构建脚本、二进制和构建摘要均随包交付，使用者无需编译或安装系统组件。
+
 原生子进程交接须保留程序自身的提权语义。普通 Actor 通过 `PI_SPEC_HELD_EXEC_OBSERVER` 指向管理员部署、仅具有 `CAP_SYS_PTRACE` 的专用 `.observer`；已继承 `no_new_privs` 的 Actor 可使用无附加权限的观察器。安装探测只在一次性进程设置此限制。资格不足时，原生执行、缓存回放和投机生产各自保持可用；通用 helper 与映像库始终不附加权限。
 
 普通用户运行 `npm run setup:linux` 后，可由管理员部署刚编译的专用观察器：
