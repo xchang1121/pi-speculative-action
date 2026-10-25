@@ -68,13 +68,8 @@ export class ContentChunkPool {
 		return this.lifetime.serialize(async () => {
 			const manifest = parseContentManifest(value);
 			if (manifest.size > this.limits.maxLogicalBytes) throw new Error("content logical budget exceeded");
-			if (transfers) {
-				const supplied = new Map(transfers.map(value => [value.reference.digest, value]));
-				if (supplied.size !== transfers.length) throw new Error("duplicate artifact transfer");
-				for (const reference of manifest.chunks) if (reference) {
-					const retained = supplied.get(reference.digest);
-					if (!retained || !await this.artifacts.add(reference, undefined, retained)) throw new Error("content transfer is unavailable");
-				}
+			if (transfers && !await this.artifacts.restore(manifest.chunks.filter(reference => reference !== null), transfers)) {
+				throw new Error("content transfer is unavailable");
 			}
 			const digest = createHash("sha256");
 			for (let index = 0; index < manifest.chunks.length; index++) {
