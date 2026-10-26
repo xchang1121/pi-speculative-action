@@ -3,15 +3,16 @@ import { createReadToolDefinition, createBashToolDefinition, createEditToolDefin
 	createWriteToolDefinition, createGrepToolDefinition, createFindToolDefinition, createLsToolDefinition,
 	getAgentDir, getShellConfig, VERSION, type ExtensionContext, type ToolsOptions } from "@earendil-works/pi-coding-agent";
 import { toolErrorSettlement, type ToolInvocation, type ToolSettlement } from "./tool-settlement.ts";
-import { BASH_TIMEOUT_ACTION_KEY_PROJECTOR, GREP_LITERAL_ACTION_KEY_PROJECTOR, grepLiteralMatches, PI_ACTION_SEMANTICS, resolvePiToolPath, type ActionSemanticsDefinition } from "./action-semantics.ts";
+import { BASH_TIMEOUT_ACTION_KEY_PROJECTOR, GREP_LITERAL_ACTION_KEY_PROJECTOR, grepLiteralMatches, PI_ACTION_SEMANTICS, type ActionSemanticsDefinition } from "./action-semantics.ts";
 import type { ActionProjectionRule } from "./action-key-projection.ts";
 import { asRecord } from "./stable-json.ts";
 import { RESOURCE_OBSERVATION_EFFECTS } from "./effect-model.ts";
 import { captureResourceVersion, createSerializablePreparationBinding, type ToolFilesystemOperations } from "./resource-version.ts";
-import { relativeFilesystemPath, sameFilesystemPath, slash } from "./path-utils.ts";
+import { relativeFilesystemPath, slash } from "./path-utils.ts";
 import fs from "node:fs/promises";
 import process from "node:process";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { createRequire, registerHooks } from "node:module";
 import type { Worker } from "node:worker_threads";
 import { randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
@@ -63,17 +64,17 @@ export function resolvePiToolInvocation(
 		const modelSupportsImages = options.modelSupportsImages ?? true;
 		// Shared with the ThinkThread runner's binding check.
 		const executor = "pi.filesystem.local";
+		const requested = tool === "read" ? asRecord(input)?.path : undefined;
 		const invocation: ToolInvocation = {
 			executor,
 			filesystemRoot: cwd,
+			...(typeof requested === "string" ? { filesystemResources: readResourcePaths(requested, cwd) } : {}),
 			identity: { executor, cwd, version: VERSION, autoResizeImages, modelSupportsImages },
 			filesystem: async (view, request) => {
 				const denied = (): never => { throw new Error("Filesystem operation is not authorized by this execution world"); };
-				// Pi guesses filename variants with host access(); the view proves only the file chosen, so a guess never answers.
-				let guessed = false;
 				const scoped: ToolsOptions = tool === "read" ? {
 					read: { autoResizeImages, operations: {
-						access: (target) => { guessed ||= !sameFilesystemPath(target, resolvePiToolPath(String(asRecord(request.args)?.path), cwd)); return view.access(target); },
+						access: view.access,
 						readFile: view.readFile,
 						detectImageMimeType: async (target) => {
 							const mime = await import(new URL("./utils/mime.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href);
@@ -87,13 +88,13 @@ export function resolvePiToolInvocation(
 				} : {
 					edit: { operations: { readFile: view.readFile, access: (target) => view.access(target, true), writeFile: view.writeFile ?? denied } },
 				};
-				const definition = toolFactories[tool as PiToolName](cwd, scoped[tool as PiToolName] as never);
+				const factory = tool === "read" ? resourceReadBindings().factory : toolFactories[tool as PiToolName];
+				const definition = factory(cwd, scoped[tool as PiToolName] as never);
 				// The qualified stock read executor consults only model.input, never other context fields.
 				const context = { model: { input: modelSupportsImages ? ["image"] : [] } } as ExtensionContext;
 				// Stock cancellation can reject before its internal operation and image worker finish.
-				const result = await settleFilesystemOperation<ToolSettlement["result"]>(() =>
+				const result = await settleFilesystemOperation<ToolSettlement["result"]>(view, () =>
 					definition.execute(request.callID, request.args as never, undefined, undefined, context), request.signal);
-				if (guessed) throw new Error("resource_access_unproven:read_path_variant");
 				return { result, isError: false };
 			},
 		};
@@ -149,24 +150,72 @@ export function piToolErrorSettlement(tool: string, error: unknown): ToolSettlem
 	return code === undefined ? toolErrorSettlement(error) : { ...toolErrorSettlement(error), exitCode: Number(code) };
 }
 
-const filesystemWorkers = new AsyncLocalStorage<Promise<void>[]>();
+type FilesystemCall = { workers: Promise<void>[]; exists?: ToolFilesystemOperations["exists"]; paths?: string[]; failure?: unknown };
+const filesystemCalls = new AsyncLocalStorage<FilesystemCall>();
 let filesystemExecutions = 0;
 const ownFilesystemWorker = (worker: Worker) => {
-	filesystemWorkers.getStore()?.push(new Promise<void>((resolve) => worker.once("exit", () => resolve())));
+	filesystemCalls.getStore()?.workers.push(new Promise<void>((resolve) => worker.once("exit", () => resolve())));
 };
 
+function readResourcePaths(input: string, cwd: string): readonly string[] {
+	const paths: string[] = [];
+	filesystemCalls.run({ workers: [], paths }, () => resourceReadBindings().resolveReadPath(input, cwd));
+	return Object.freeze([...new Set(paths)]);
+}
+
+let boundRead: { factory: typeof createReadToolDefinition; resolveReadPath: (input: string, cwd: string) => string } | undefined;
+/** Bind the installed resolver's host dependencies; its selection and stock output code stay unchanged. */
+function resourceReadBindings(): NonNullable<typeof boundRead> {
+	if (boundRead) return boundRead;
+	const original = new URL("./core/tools/read.js", import.meta.resolve("@earendil-works/pi-coding-agent"));
+	const paths = new URL("./path-utils.js", original), slot = `piResourceRead_${randomUUID()}`, entry = `pi-resource-read:${slot}`;
+	// require() drops URL queries from its cache key, so these instances need distinct pathnames.
+	const read = new URL(`./${slot}-read.mjs`, original).href, resolver = new URL(`./${slot}-paths.mjs`, original).href;
+	const capability = new URL(`./${slot}-access.mjs`, original).href;
+	Object.defineProperty(globalThis, slot, { configurable: true, value: { accessSync: (target: string, mode: number) => {
+		const paths = filesystemCalls.getStore()?.paths; assert.ok(paths, "read path enumeration has no owner");
+		assert.equal(mode, fs.constants.F_OK); paths.push(target); throw new Error("enumerate potential paths");
+	}, access: async (target: string, mode: number) => {
+		const call = filesystemCalls.getStore(); assert.ok(call, "read path has no owning invocation");
+		if ("failure" in call) throw call.failure;
+		let exists: boolean;
+		try {
+			assert.equal(mode, fs.constants.F_OK);
+			if (!call.exists) throw new Error("Filesystem operation is not authorized by this execution world");
+			exists = await call.exists(target);
+		} catch (error) { call.failure = error; throw error; }
+		if (!exists) throw Object.assign(new Error("missing resource"), { code: "ENOENT" });
+	} } });
+	let hooks: ReturnType<typeof registerHooks> | undefined;
+	try {
+		hooks = registerHooks({ resolve(specifier, context, next) {
+			const url = specifier === entry ? read : specifier === `${entry}:paths` || context.parentURL === read && specifier === "./path-utils.js" ? resolver
+				: context.parentURL === resolver && ["node:fs/promises", "node:fs"].includes(specifier) ? capability : undefined;
+			return url ? { url, format: "module", shortCircuit: true } : next(specifier, context);
+		}, load(url, context, next) {
+			if (url === capability) return { format: "module", source: `export { constants } from 'node:fs'; export const { access, accessSync } = globalThis[${JSON.stringify(slot)}];`, shortCircuit: true };
+			return next(url === read ? original.href : url === resolver ? paths.href : url, context);
+		} });
+		const require = createRequire(import.meta.url);
+		return boundRead = { factory: require(entry).createReadToolDefinition, resolveReadPath: require(`${entry}:paths`).resolveReadPath };
+	} finally { hooks?.deregister(); Reflect.deleteProperty(globalThis, slot); }
+}
+
 /** Only the qualified stock filesystem contract runs here; unrelated Actor workers keep their owner. */
-async function settleFilesystemOperation<Result>(operation: () => Promise<Result>, signal?: AbortSignal): Promise<Result> {
+async function settleFilesystemOperation<Result>(view: ToolFilesystemOperations, operation: () => Promise<Result>, signal?: AbortSignal): Promise<Result> {
 	signal?.throwIfAborted();
 	const workers: Promise<void>[] = [];
+	const call: FilesystemCall = { workers, exists: view.exists };
 	if (filesystemExecutions++ === 0) process.on("worker", ownFilesystemWorker);
 	let result: Result;
-	try { result = await filesystemWorkers.run(workers, operation); }
+	try { result = await filesystemCalls.run(call, operation); }
 	finally {
 		// Node queues its worker-created event on nextTick, even if the tool already resolved.
 		await new Promise<void>((resolve) => process.nextTick(resolve));
 		while (workers.length) await Promise.all(workers.splice(0));
 		if (--filesystemExecutions === 0) process.off("worker", ownFilesystemWorker);
+		// Stock pathExists catches access errors; an unproven observation must still reject the whole call.
+		if ("failure" in call) throw call.failure;
 	}
 	signal?.throwIfAborted();
 	return result;

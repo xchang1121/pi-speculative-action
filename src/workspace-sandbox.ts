@@ -958,6 +958,13 @@ async function executeFilesystemMutation(state: WorkspaceSandboxState, context: 
 				operation: "mkdir", ...(!workspace ? { after: { entriesDigest: directoryEntriesDigest([]), mode: 0o755, uid: 0, gid: 0 } } : {}) }) });
 			return { file, key, before };
 		};
+		const input = async (logical: string) => {
+			const { file, key } = await located(logical), known = changes.get(key);
+			const directory = !workspace && known ? known.kind === "directory"
+				: (await view.stat(file).catch(error => { if (!isMissing(error)) throw error; }))?.isDirectory();
+			const exists = directory ? (await directoryInput(logical)).before !== undefined : (await fileInput(logical)).content !== undefined;
+			return { file, key, exists };
+		};
 		let output: ToolSettlement;
 		try {
 			output = await execute({
@@ -968,14 +975,13 @@ async function executeFilesystemMutation(state: WorkspaceSandboxState, context: 
 					return readContent(content, 0, Math.min(content.byteLength, limit ?? content.byteLength));
 				}),
 				access: (logical, writable) => track(async () => {
-					const { file, key } = await located(logical), known = changes.get(key), mode = fsConstants.R_OK | (writable ? fsConstants.W_OK : 0);
-					const directory = !workspace && known ? known.kind === "directory" : (await view.stat(file)).isDirectory();
-					await (directory ? directoryInput(logical) : fileInput(logical));
+					const { file, key } = await input(logical), mode = fsConstants.R_OK | (writable ? fsConstants.W_OK : 0);
 					const captured = changes.get(key)!;
 					assertExistingInputPolicy(captured);
 					await access(await view.realpath(file), mode);
 					if (captured.before !== undefined) record(key, { ...captured, accessMode: (captured.accessMode ?? 0) | mode });
 				}),
+				exists: logical => track(async () => (await input(logical)).exists),
 				writeFile: (logical, content) => track(async () => {
 					const { file, key, captured } = await fileInput(logical);
 					// Even an equal-content native write performs permission checks and touches the inode.

@@ -31,9 +31,11 @@ export type SpeculativeAgentExecutionWorld = AgentExecutionWorld & Required<Pick
 
 /** Known path independence permits early work; captured versions still decide whether its output is usable. */
 export async function filesystemExecutionDependsOn(action: ActionKey, parent: ActionKey): Promise<boolean> {
-	if (!action.resourceRoot || !parent.resourceRoot || !action.resources.length || !parent.resources.length) return true;
-	return (await Promise.all(action.resources.flatMap(target => parent.resources.map(prior =>
-		filesystemPathsOverlap(path.resolve(action.resourceRoot!, target), path.resolve(parent.resourceRoot!, prior)))))).some(Boolean);
+	const paths = (key: ActionKey) => (key.executionContext as ToolInvocation | undefined)?.filesystemResources ??
+		(key.resourceRoot ? key.resources.map(target => path.resolve(key.resourceRoot!, target)) : []);
+	const current = paths(action), previous = paths(parent);
+	if (!current.length || !previous.length) return true;
+	return (await Promise.all(current.flatMap(target => previous.map(prior => filesystemPathsOverlap(target, prior))))).some(Boolean);
 }
 
 /** Observe Actor reads; only explicitly bound operations may execute ahead over sealed resource data. */

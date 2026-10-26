@@ -8,7 +8,9 @@ import { ResourceVersionManager, type ResourceVersionToken } from "../src/resour
 import { WorkspaceSandboxService, readSandboxDirectoryState, type SandboxWorkspaceContext, type SandboxWorkspaceChange } from "../src/workspace-sandbox.ts";
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import type { ToolInvocation } from "../src/tool-settlement.ts";
-import { createWriteTool } from "@earendil-works/pi-coding-agent";
+import { createReadTool, createWriteTool } from "@earendil-works/pi-coding-agent";
+import { createResourceSnapshotExecutionWorld } from "../src/agent-execution-world.ts";
+import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { captureAbsenceDependency, captureDirectoryDependency, captureFileDependency, captureMetadataDependency, captureSymlinkDependency, validateDynamicDependencyCertificate } from "../src/provenance-validation.ts";
 import { ProcessReusePlanner, ProvenanceCertificateStore, sealProcessCertificate } from "../src/process-reuse.ts";
 import { PROCESS_CERTIFICATE } from "./process-fixture.ts";
@@ -31,11 +33,7 @@ linux.for(["proposal", "proposal-failure", "validate", "stale-native", "stale-re
     if (mode.startsWith("proposal")) await writeFile(alias, "independent\n"); else await link(file, alias);
     await symlink("real", route); await symlink("input", symbolic); await symlink("missing", broken);
     const directory = await readSandboxDirectoryState(root), identity = await lstat(file, { bigint: true });
-    const queryArgs = { path: "input" }, read: NonNullable<ToolInvocation["filesystem"]> = async operations => ({
-      result: { content: [{ type: "text", text: (await operations.readFile(target)).toString() }], details: {} }, isError: false,
-    });
-    // Resolve the invocation before setting the source's measurement timestamps.
-    const queryAction = PI_ACTION_SEMANTICS.buildKey("read", queryArgs, root, "readonly", { fingerprint: "readonly-query", context: { filesystem: read, filesystemRoot: root } })!;
+    const queryArgs = { path: "input" }, invocation = resolvePiToolInvocation("read", queryArgs, { cwd: root, environment: {} })!;
     for (const name of [physical, file, alias]) await utimes(name, 915148800, 946684800);
     for (const name of [route, symbolic, broken]) await lutimes(name, 915148800, 946684800);
     const paths = [physical, file, alias, route, symbolic, broken], before = await metadata(paths);
@@ -54,6 +52,7 @@ linux.for(["proposal", "proposal-failure", "validate", "stale-native", "stale-re
       else {
         branch = await pending; if (branch.inputsOnly) throw new Error("mutation produced input-only evidence");
         const inputs = await branch.takeReadInputs?.(64 * 1024); expect(inputs).toBeDefined();
+        const queryAction = PI_ACTION_SEMANTICS.buildKey("read", queryArgs, root, "readonly", { fingerprint: "readonly-query", context: invocation })!;
         const capture = vi.spyOn(ResourceVersionManager.prototype, "capture").mockRejectedValue(new Error("unexpected source recapture"));
         let query: Awaited<ReturnType<NonNullable<NonNullable<typeof inputs>["reconstruct"]>>>;
         try {
@@ -82,6 +81,50 @@ linux.for(["proposal", "proposal-failure", "validate", "stale-native", "stale-re
       }
     }
   } finally { await branch?.dispose(); await world.dispose?.(); await service.dispose(); await rm(fixture, { recursive: true, force: true }); }
+});
+
+linux("proves stock read choices, prior absences and actual input reuse without source effects", { timeout: 30_000 }, async () => {
+  nativeProcessLibrary(process.env.PI_SPEC_HELD_EXEC!);
+  const fixture = await mkdtemp(path.join(os.tmpdir(), "pi-readonly-choices-")), physical = path.join(fixture, "real/source"), route = path.join(fixture, "route");
+  const root = path.join(route, "source"), world = createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { maxBytes: () => 128 * 1024 });
+  const names = ["Capture d'écran 1 PM.txt", "Capture d'écran 1\u202FPM.txt", "Capture d'e\u0301cran 1 PM.txt", "Capture d’écran 1 PM.txt", "Capture d’e\u0301cran 1 PM.txt"];
+  const args = { path: names[0]! }, signal = new AbortController().signal, tool = createReadTool(root);
+  let branch: Awaited<ReturnType<NonNullable<typeof world.speculation>["execute"]>> | undefined;
+  try {
+    await mkdir(physical, { recursive: true }); await symlink("real", route);
+    await writeFile(path.join(physical, names[4]!), "choice 4\n");
+    const oracle = await tool.execute("oracle", args);
+    for (const target of [physical, path.join(physical, names[4]!)]) await utimes(target, 915148800, 946684800);
+    await lutimes(route, 915148800, 946684800);
+    for (let selected = 4; selected >= 0; selected--) {
+      if (selected !== 4) await writeFile(path.join(physical, names[selected]!), `choice ${selected}\n`);
+      const paths = [physical, route, ...names.slice(selected).map(name => path.join(physical, name))], before = await metadata(paths);
+      if (branch) { expect(await branch.validate!()).toMatchObject({ status: "stale" }); await branch.dispose(); }
+      expect(await metadata(paths)).toEqual(before);
+      const invocation = resolvePiToolInvocation("read", args, { cwd: root, environment: {} })!;
+      const action = PI_ACTION_SEMANTICS.buildKey("read", args, root, "readonly", { fingerprint: "readonly-choices", context: invocation });
+      expect(action).toBeDefined(); expect(await metadata(paths)).toEqual(before);
+      const request = { cwd: root, tool, toolName: "read", args, action: action!, callID: `choice-${selected}`, signal };
+      branch = await world.speculation!.execute(request);
+      if (branch.inputsOnly) throw new Error("read did not produce a result");
+      expect(branch.output.result.content).toEqual([{ type: "text", text: `choice ${selected}\n` }]);
+      if (selected === 4) expect(branch.output.result).toEqual(oracle);
+      expect(await branch.validate!()).toMatchObject({ status: "valid" });
+      const capture = vi.spyOn(ResourceVersionManager.prototype, "capture").mockRejectedValue(new Error("unexpected source recapture"));
+      let query: Awaited<ReturnType<NonNullable<typeof branch.reconstruct>>>;
+      try {
+        query = await branch.reconstruct!({ ...request, callID: `reused-${selected}` });
+        expect(query).toBeDefined(); expect(await query!.validate!()).toMatchObject({ status: "valid" });
+        expect(query!.output).toEqual(branch.output); expect(capture).not.toHaveBeenCalled();
+      } finally { capture.mockRestore(); await query?.dispose?.(); }
+      expect(await branch.commit()).toEqual(branch.output); expect(await metadata(paths)).toEqual(before);
+      const denied = new Error("read permission sentinel");
+      await expect(invocation.filesystem!({ readFile: async () => Buffer.from("must not publish"), access: async () => {}, exists: async () => { throw denied; } }, request)).rejects.toBe(denied);
+      await expect(invocation.filesystem!({ readFile: async () => Buffer.from("must not publish"), access: async () => {} }, request)).rejects.toThrow("not authorized");
+      await expect(invocation.filesystem!({ readFile: async () => Buffer.from("must not publish"), access: async () => {} }, { ...request, signal: AbortSignal.abort(denied) })).rejects.toBe(denied);
+      expect(await metadata(paths)).toEqual(before);
+    }
+  } finally { await branch?.dispose(); await world.dispose?.(); await rm(fixture, { recursive: true, force: true }); }
 });
 
 linux.for(["capture", "validate", "replay"])("preserves source metadata through dependency evidence and persisted replay (%s)", { timeout: 30_000 }, async mode => {

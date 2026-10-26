@@ -65,6 +65,8 @@ export interface ToolInvocation {
 	readonly process?: ToolProcessInvocation;
 	/** Explicit read-only input boundary; omitted operations remain confined to the host workspace. */
 	readonly filesystemRoot?: string;
+	/** Absolute potential access paths for ordering only; captured observations still decide validity. */
+	readonly filesystemResources?: readonly string[];
 	/** Explicit selected Actor semantics; the host invokes this inside its original execution callback. */
 	readonly authoritative?: (request: Parameters<NonNullable<ToolInvocation["filesystem"]>>[1]) => Promise<ToolSettlement>;
 	/** Arm bounded input and pure-computation retention in the selected Actor executor, without replaying effects. */

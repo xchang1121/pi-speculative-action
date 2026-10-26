@@ -4,11 +4,12 @@ import { setTimeout as delay } from "node:timers/promises";
 import path from "node:path";
 import { fauxAssistantMessage, fauxToolCall, Type, fauxText, fauxThinking, type Context } from "@earendil-works/pi-ai";
 import { createEditTool, createFindTool, createGrepTool, createLsTool, createReadTool, createWriteTool } from "@earendil-works/pi-coding-agent";
-import { afterEach, expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 import { WorkspaceSandboxService } from "../src/workspace-sandbox.ts";
-import { bindResourceOperation } from "../src/agent-execution-world.ts";
-import { ResourceVersionManager } from "../src/resource-version.ts";
+import { bindResourceOperation, filesystemExecutionDependsOn } from "../src/agent-execution-world.ts";
+import { ResourceReadView, ResourceVersionManager } from "../src/resource-version.ts";
 import { TimelineInterval } from "../src/task-timing.ts";
+import { filesystemPathKey } from "../src/path-utils.ts";
 import { createClosedSearchProfile, resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { ActionSemanticsRegistry, PI_ACTION_SEMANTICS, type ActionSemanticsDefinition } from "../src/action-semantics.ts";
 import { PatternAwareStore, patternAwareSettings, patternAwareActionSemantics } from "../src/pattern-aware.ts";
@@ -28,6 +29,30 @@ const resourceInvocation = (cwd: string, tool: string, input: unknown) => {
 	const invocation = resolvePiToolInvocation(tool, input, { cwd, environment: {} })!;
 	return { ...invocation, ...bindResourceOperation(invocation.filesystem!, cwd) };
 };
+
+function capturedReadProof() {
+	const entries: Parameters<ResourceReadView["capture"]>[1][] = [], capture = ResourceReadView.prototype.capture;
+	const spy = vi.spyOn(ResourceReadView.prototype, "capture").mockImplementation(function(this: ResourceReadView, target, entry, reserved) {
+		entries.push(entry); return capture.call(this, target, entry, reserved);
+	});
+	return { [Symbol.dispose]: () => spy.mockRestore(), onlyExistence: (event: ReturnType<typeof systemHost>["actors"][number], target: string) => {
+		const observed = new Set(entries.filter(entry => entry.dependency === `${process.platform === "win32" ? "exists" : "type"}:${filesystemPathKey(target)}` && entry.computation)
+			.map(entry => TimelineInterval.serialize(entry.computation!)!.root));
+		const graph = TimelineInterval.serialize(event.settlement.provider.toolExecution)!;
+		const nodes = new Map(graph.nodes.map(node => [node.id, node])), seen = new Set<string>(), reused = new Set<string>();
+		const pending = [{ id: graph.root, borrowed: false }];
+		while (pending.length) {
+			const { id, borrowed } = pending.pop()!, key = `${id}:${borrowed}`;
+			if (seen.has(key)) continue;
+			seen.add(key); if (borrowed) reused.add(id);
+			for (const edge of nodes.get(id)!.inputs ?? []) if (!edge.overhead) pending.push({ id: edge.id, borrowed: borrowed || !!edge.reused });
+		}
+		expect(reused.size).toBeGreaterThan(0);
+		// Every borrowed node must be the platform's captured F_OK observation, never old content or a containing tool.
+		for (const id of reused) expect(observed.has(id)).toBe(true);
+		expectHiddenCompute(event.computation!, true);
+	} };
+}
 
 const directories = temporaryDirectories("pi-agent-system-");
 afterEach(directories.dispose);
@@ -470,7 +495,8 @@ test.for(["reopened", "inflight", "completed", "binding", "reverse", "deep", "ad
 	...["", "-stale", "-failure-before", "-cancel-before", "-failure-after", "-cancel-after", "-close", "-terminal", "-disable", "-dispose", "-poison"].map(suffix => `shared-exact-fallback${suffix}`)])("retains learned continuations across authoritative batch updates (%s)", async mode => {
 	const changed = mode === "changed", removed = mode === "removed", replaces = changed || removed, added = mode === "added", deep = mode === "deep", reopen = mode === "reopened";
 	const fallback = mode.includes("fallback"), closure = mode.match(/-(close|terminal|dispose)$/)?.[1], disabled = mode.endsWith("-disable"), poison = mode.endsWith("poison"), failed = /failure|cancel/.test(mode);
-	const shared = mode.startsWith("shared"), stale = mode.endsWith("stale"), unused = mode === "shared-unused", native = mode.includes("native"), exact = mode.includes("exact"), consumed = shared && !stale && !unused && !closure && !poison && !mode.endsWith("before");
+	const shared = mode.startsWith("shared"), stale = mode.endsWith("stale"), unused = mode === "shared-unused", native = mode.includes("native"), exact = mode.includes("exact"), consumed = shared && !unused && !closure && !poison && !mode.endsWith("before");
+	using reads = capturedReadProof();
 	const cwd = await directories.create(), names = [reopen ? "read" : "inspect_index", reopen ? "read" : "open_record", "render_record", replaces ? "status_index" : "background_status", "summarize_record", "tail_record"];
 	const files = ["root.txt", "child.txt", "leaf.txt", "status.txt", "other.txt", "tail.txt"];
 	for (const file of files) await writeText(cwd, file, `${file}\n`);
@@ -568,6 +594,7 @@ test.for(["reopened", "inflight", "completed", "binding", "reverse", "deep", "ad
 		if (closure || poison) expect(timing).toBeUndefined(); else expectHiddenCompute(timing!, consumed); }
 	if (mode !== "binding") expect(leafSignal).toBe(original);
 	if (shared) {
+		if (stale) reads.onlyExistence(f.actors.at(-1)!, path.join(cwd, files[1]!));
 		await f.dispose(); await reopened.flush(); const saved = createStore(); await saved.load();
 		expect(prior.length).toBeGreaterThan(0);
 		for (const previous of prior) expect(saved.snapshot().find(pattern => pattern.id === previous.id)?.feedback).toMatchObject({
@@ -581,7 +608,8 @@ test.for(["reopened", "inflight", "completed", "binding", "reverse", "deep", "ad
 test.for(["refresh", "replace", "remove", "replace-shared", "remove-shared",
 	...["first", "last", "both", "none", "stale", "failure-before", "failure-after", "cancel-before", "cancel-after"].map(mode => `early-${mode}`)])("settles claimed consumption after a late source update (%s)", async scenario => {
 	const early = scenario.startsWith("early-"), usage = scenario.slice(6), mode = early ? "remove" : scenario.split("-")[0], shared = early || scenario.endsWith("-shared");
-	const consumed = !early || !["last", "none", "stale"].includes(usage) && !usage.endsWith("before"), lateConsumed = early && ["last", "both"].includes(usage);
+	const consumed = !early || !["last", "none"].includes(usage) && !usage.endsWith("before"), lateConsumed = early && ["last", "both"].includes(usage);
+	using reads = capturedReadProof();
 	const failed = early && /failure|cancel/.test(usage), controller = new AbortController(), failure = new Error("consumer failed");
 	const cwd = await directories.create(), gate = gated(), background = gated(), args = { path: "input.txt" };
 	for (const file of ["input.txt", "other.txt", "unused.txt", "unrelated.txt"]) await writeText(cwd, file, `${file}\n`);
@@ -644,6 +672,7 @@ test.for(["refresh", "replace", "remove", "replace-shared", "remove-shared",
 	if (!early) expectHiddenCompute(f.actors.at(-1)!.computation!, true);
 	else for (const [name, used] of [[tool, consumed], ["background_status", lateConsumed]] as const) {
 		const event = f.actors.find(event => event.settlement.tool === name)!; expectHiddenCompute(event.computation!, used);
+		if (usage === "stale" && name === tool) reads.onlyExistence(event, path.join(cwd, args.path));
 		expect(TimelineInterval.serialize(event.settlement.provider.toolExecution)!.nodes.some(node => node.producer?.id?.endsWith(":" + producer))).toBe(used);
 	}
 });
@@ -757,6 +786,8 @@ test.for(["independent", "unchanged", "batch", "batch-known", "mismatch-text", "
 	const cwd = await directories.create(), sandbox = new WorkspaceSandboxService(), release = deferred(), forecast = deferred(), observing = deferred(), firstResult = deferred();
 	const learning = mode.startsWith("learning-"), captured = mode.startsWith("learning-captured-"), cross = learning && /cross-tool|unkeyed/.test(mode), stale = mode.endsWith("stale"), unused = mode.endsWith("unused");
 	const retired = mode.startsWith("learning-retired-");
+	const partial = !captured && (stale || retired && unused);
+	using reads = capturedReadProof();
 	let allow = true, seeding = captured, changed = false;
 	const actualFirst = mode.startsWith("actual-before-"), normalized = mode.startsWith("canonical"), wrong = mode.startsWith("mismatch") || mode === "canonical-mismatch";
 	const known = mode === "batch-known", recoverable = ["request-failure", "malformed-observation", "malformed-type", "malformed-extra"].includes(mode);
@@ -916,7 +947,8 @@ test.for(["independent", "unchanged", "batch", "batch-known", "mismatch-text", "
 	}
 	expect(f.fallbacks).toEqual([...captured ? [child.tool] : [], ...!allow || mode.includes("unkeyed") ? [retired ? names[0] : consumer] : []]);
 	await f.finish();
-	if (stale || repairBudget || unused) expectHiddenCompute(f.actors.at(-1)!.computation!, false);
+	if (partial) reads.onlyExistence(f.actors.at(-1)!, path.join(cwd, retired ? roots[0]!.args.path : child.args.path));
+	else if (stale || repairBudget || unused) expectHiddenCompute(f.actors.at(-1)!.computation!, false);
 	if (wrong && !repairBudget || recoverable || actualFirst || known || contractChanged) expectHiddenCompute(f.actors.at(-1)!.computation!, true);
 	if (retired || wrong && !inflight || mode === "parent-miss" || contractChanged) expect(f.predictions.some(event => event.tool === child.tool &&
 		event.settlement.observation === "unobserved" && event.settlement.cause.code === "dependency_impossible")).toBe(true);
@@ -925,11 +957,11 @@ test.for(["independent", "unchanged", "batch", "batch-known", "mismatch-text", "
 	if (inflight) expect(executed.filter(tool => tool === child.tool)).toHaveLength(1);
 	expect(requests).toBe(budget.requests + Number(contractChanged || retired && allow)); expect(f.drafter.budget.requests).toBe(requests);
 	if (learning) {
-		expectHiddenCompute(f.actors.at(-1)!.computation!, !stale && !unused);
+		expectHiddenCompute(f.actors.at(-1)!.computation!, partial || !stale && !unused);
 		allow = true; settings.drafterEnabled = true; settings.drafterMaxDepth = 0; await f.start("learning");
 		await expect.poll(() => f.materialized.find(candidate => candidate.turnID === "learning")).toMatchObject({
 			empiricalProbability: cross || retired ? 0.5 : unused ? 1 / 3 : 2 / 3,
-			adoptionProbability: !stale && !unused ? 2 / 3 : cross || unused || retired ? 0.5 : 1 / 3,
+			adoptionProbability: !stale && !unused || partial && !retired ? 2 / 3 : cross || unused || retired ? 0.5 : 1 / 3,
 		});
 	}
 });
@@ -938,6 +970,7 @@ test.for(["completed", "inflight", "forecast", "binding", "parent-binding", "rev
 	const cwd = await directories.create(), gates = [deferred(), deferred()], delayed = deferred();
 	const scopes = mode.endsWith("-scope") ? [["a", "b"]] : [["a"], ["b"], ["a", "b"]];
 	const unchanged = mode === "unchanged", both = mode === "both", deep = mode === "deep";
+	using reads = capturedReadProof();
 	const names = ["inspect_rows", "render_rows"], { actionSemantics, tools, world, resolveInvocation } = readScenario(cwd, names);
 	const roots = ["a", "b"].map(id => ({ id, path: `${id}.txt`, text: `${id}-real\n` }));
 	for (const root of roots) await writeText(cwd, root.path, root.text);
@@ -1023,7 +1056,8 @@ test.for(["completed", "inflight", "forecast", "binding", "parent-binding", "rev
 		expect(textOutput(await f.execute(names[1]!, { path: file }))).toBe(mode === "stale" && file === "a-new.txt" ? "fresh\n" : `${file.replace(/\.txt$/, "")}\n`);
 		const consumed = () => f.actors.find(event => JSON.parse(event.actualAction).input.path === file);
 		await expect.poll(consumed).toBeDefined(); const event = consumed()!;
-		expectHiddenCompute(event.computation!, !(mode === "budget" && file !== "b-new.txt" || mode === "stale" && file === "a-new.txt"));
+		if (mode === "stale" && file === "a-new.txt") reads.onlyExistence(event, path.join(cwd, file));
+		else expectHiddenCompute(event.computation!, !(mode === "budget" && file !== "b-new.txt"));
 	}
 	if (deep) {
 		await f.finish(); await f.start("grandchildren");
@@ -1041,10 +1075,15 @@ test.for(["completed", "inflight", "forecast", "binding", "parent-binding", "rev
 	if (bCandidate) expect(executed.filter(file => file === "b-new.txt")).toHaveLength(1);
 });
 
-test.for(["dependent", "independent"])("preserves sibling resource effects outside observation scopes (%s)", async mode => {
+test.for(["dependent", "independent", "filename-variant"])("preserves sibling resource effects outside observation scopes (%s)", async mode => {
 	const cwd = await directories.create(), sandbox = new WorkspaceSandboxService(), release = deferred();
-	for (const [file, text] of [["selector.txt", "select\n"], ["written.txt", "before\n"], ["independent.txt", "independent\n"]]) await writeText(cwd, file, text);
-	const child = { path: mode === "dependent" ? "written.txt" : "independent.txt" }, tools = [createReadTool(cwd), createWriteTool(cwd)];
+	const dependent = mode !== "independent", written = mode === "filename-variant" ? "written’s.txt" : "written.txt";
+	for (const [file, text] of [["selector.txt", "select\n"], [written, "before\n"], ["independent.txt", "independent\n"]]) await writeText(cwd, file, text);
+	const child = { path: dependent ? mode === "filename-variant" ? "written's.txt" : written : "independent.txt" }, tools = [createReadTool(cwd), createWriteTool(cwd)];
+	const key = (tool: string, input: unknown) => PI_ACTION_SEMANTICS.buildKey(tool, input, cwd, "ordering", {
+		fingerprint: tool, context: resolvePiToolInvocation(tool, input, { cwd, environment: {} }),
+	})!;
+	expect(await filesystemExecutionDependsOn(key("read", child), key("write", { path: written, content: "after\n" }))).toBe(dependent);
 	let drafted = 0; const executed: string[] = [], settings = { drafterEnabled: true, candidateLimit: 1, drafterMaxDepth: 1, maxConcurrentActions: 3 };
 	const f = systemHost(cwd, tools, {
 		resources: idleResources(3),
@@ -1058,19 +1097,19 @@ test.for(["dependent", "independent"])("preserves sibling resource effects outsi
 			if (tool === "speculative_continuations") return toolReply(tool, { scopes: [["selector"]] });
 			if (tool === "speculative_observations") return toolReply(tool, { results: [{ callID: "selector", isError: false, content: [fauxText("select\n")] }] });
 			if (!context.messages.length) return fauxAssistantMessage([fauxToolCall("read", { path: "selector.txt" }, { id: "selector" }),
-				fauxToolCall("write", { path: "written.txt", content: "after\n" }, { id: "writer" })]);
+				fauxToolCall("write", { path: written, content: "after\n" }, { id: "writer" })]);
 			drafted++; return toolReply("read", child);
 		},
 	}, settings);
 	await using _cleanup = onExit(async () => { release.resolve(); await f.dispose(); await sandbox.dispose(); });
 	await f.start(); await expect.poll(() => drafted).toBe(1); await nextTurn();
-	if (mode === "dependent") expect(executed.filter(file => file === child.path)).toHaveLength(1); // Only the still-pending writer.
+	if (dependent) expect(executed.filter(file => file === written || file === child.path)).toHaveLength(1); // Only the still-pending writer.
 	else await f.ready(2);
 	release.resolve(); await f.ready(3);
 	expect(textOutput(await f.execute("read", { path: "selector.txt" }))).toBe("select\n");
-	await f.execute("write", { path: "written.txt", content: "after\n" });
+	await f.execute("write", { path: written, content: "after\n" });
 	settings.drafterEnabled = false; await f.finish(); await f.start("child");
-	expect(textOutput(await f.execute("read", child))).toBe(mode === "dependent" ? "after\n" : "independent\n");
+	expect(textOutput(await f.execute("read", child))).toBe(dependent ? "after\n" : "independent\n");
 	await f.finish(); expect(drafted).toBe(1);
 	expectHiddenCompute(f.actors.at(-1)!.computation!, true);
 });
