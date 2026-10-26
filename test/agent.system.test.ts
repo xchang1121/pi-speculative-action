@@ -19,6 +19,7 @@ import { disposable, onExit, deferred, gated, nextTurn } from "./async.ts";
 import { createLinuxProcessBenchmark, textOutput } from "./linux-process-fixture.ts";
 import { EXACT_TOOL_OBSERVATION, type ToolObservationContract, type ToolInvocation } from "../src/tool-settlement.ts";
 import { ActorForkPlanSource } from "../src/actor-fork-plan-source.ts";
+import { PlanRuntime } from "../src/plan-runtime.ts";
 import type { AgentPlanSource, AgentRuntimeEvents } from "../src/agent-runtime-types.ts";
 import { toolUse } from "./model.ts";
 
@@ -781,8 +782,10 @@ test.for(["in-place", "git", "single-in-place", "single-git", "checkpoint-git", 
 test.for(["independent", "unchanged", "batch", "batch-known", "mismatch-text", "mismatch-error", "mismatch-inflight", "mismatch-budget", "parent-miss", "stale", "same-resource", "missing-input", "independent-create",
 	"budget", "depth-zero", "denied-root", "denied-child", "unknown-batch", "filtered-batch", "malformed-observation", "malformed-type", "abort-observation", "actual-before-forecast", "actual-before-malformed",
 	"actual-before-failure", "actual-before-batch", "request-failure", "malformed-extra", "mismatch-exit", "canonical", "canonical-mismatch", "canonical-version", "canonical-schema", "canonical-unbound", "normalizer-failure",
+	...["canonical-version", "canonical-schema", "canonical-unbound"].map(mode => `${mode}-disabled`),
 	...["whole", "fallback", "unused", "stale"].map(mode => `learning-retired-${mode}`),
-	...["", ...process.platform !== "win32" ? ["captured-"] : []].flatMap(prefix => ["whole", "fallback", "cross-tool", "unkeyed", "unused", "stale", "unkeyed-unused", "unkeyed-stale"].map(mode => `learning-${prefix}${mode}`))])("executes out-of-order drafts using private observations (%s)", async mode => {
+	...["", ...process.platform !== "win32" ? ["captured-"] : []].flatMap(prefix => ["whole", "fallback", "cross-tool", "unkeyed", "unused", "stale", "unkeyed-unused", "unkeyed-stale"].map(mode => `learning-${prefix}${mode}`))])("executes out-of-order drafts using private observations (%s)", async scenario => {
+	const disabledRepair = scenario.endsWith("-disabled"), mode = disabledRepair ? scenario.slice(0, -9) : scenario;
 	const cwd = await directories.create(), sandbox = new WorkspaceSandboxService(), release = deferred(), forecast = deferred(), observing = deferred(), firstResult = deferred();
 	const learning = mode.startsWith("learning-"), captured = mode.startsWith("learning-captured-"), cross = learning && /cross-tool|unkeyed/.test(mode), stale = mode.endsWith("stale"), unused = mode.endsWith("unused");
 	const retired = mode.startsWith("learning-retired-");
@@ -823,12 +826,20 @@ test.for(["independent", "unchanged", "batch", "batch-known", "mismatch-text", "
 	if (normalized) expect(canonicalize(expected[0]!.content)).toEqual([fauxText('{"failedTests":[],"artifact":"abc"}')]);
 	let requests = 0, drafts = 0, rootContext: Context | undefined, observationSignal: AbortSignal | undefined;
 	const privateContexts: Context[] = [], executed: string[] = [];
+	const repairBinding = gated(), repairAttached = deferred(), attach = PlanRuntime.prototype.attachExecution;
+	const attachment = contractChanged && vi.spyOn(PlanRuntime.prototype, "attachExecution").mockImplementation(function(this: PlanRuntime, ...args) {
+		const attached = attach.apply(this, args);
+		if (attached && drafts >= 3 && this.get(args[0], args[1])?.action.tool === child.tool) repairAttached.resolve();
+		return attached;
+	});
+	await using _attachment = onExit(async () => { if (attachment) attachment.mockRestore(); });
 	const settings = { tools: mode === "filtered-batch" ? [names[0]!] : undefined, drafterEnabled: !seeding, maxConcurrentActions: 3, drafterMaxDepth: mode === "depth-zero" ? 0 : mode === "denied-child" ? 2 : 1,
 		candidateLimit: mode === "unchanged" ? 3 : 1, predictionTimeoutMs: 30_000, drafterTaskMaxRequests: mode === "budget" ? 2 : repairBudget ? 3 : 32 };
 	const f = systemHost(cwd, tools, { actionSemantics: semantics,
 		resources: idleResources(3),
 		onEvent: event => { if (known && event.type === "candidate" && event.state.status === "succeeded" && event.candidate.tool === names[0]) firstResult.resolve(); },
 		resolveInvocation: async (tool, args) => { if (known && (args as { path: string }).path === "root-1.txt") await firstResult.promise;
+			if (contractChanged && tool === child.tool && drafts >= 3) await repairBinding.wait();
 			const invocation = resolveInvocation(tool, args);
 			return { ...invocation, ...(learning && !seeding ? bindResourceOperation(retired && tool === names[0] ? async (view, request) => {
 				const result = await invocation.filesystem!(view, request), text = textOutput(result.result);
@@ -882,7 +893,7 @@ test.for(["independent", "unchanged", "batch", "batch-known", "mismatch-text", "
 				{ id: "child" });
 		}, getDraftOptions: () => ({ apiKey: "shared-credential" }),
 	}, settings);
-	await using _cleanup = onExit(async () => { release.resolve(); forecast.resolve(); firstResult.resolve(); await f.dispose(); await sandbox.dispose(); });
+	await using _cleanup = onExit(async () => { repairBinding.release(); release.resolve(); forecast.resolve(); firstResult.resolve(); await f.dispose(); await sandbox.dispose(); });
 	if (seeding) { await f.start("seed"); expect(await f.execute(child.tool, child.args)).toEqual(await f.oracle(child.tool, child.args)); await f.finish(); }
 	seeding = false; settings.drafterEnabled = true;
 	await f.start();
@@ -939,8 +950,14 @@ test.for(["independent", "unchanged", "batch", "batch-known", "mismatch-text", "
 	if (mode === "parent-miss") await f.execute(names[0]!, { path: "child.txt" });
 	else for (const root of roots) expect(await f.execute(root.tool, root.args)).toMatchObject(retired ? await f.oracle(root.tool, root.args) : expected[roots.indexOf(root)]!);
 	const consumer = cross ? names[2]! : child.tool, args = unused ? { path: "unused.txt" } : child.args;
+	if (contractChanged) {
+		await repairBinding.entered;
+		// Repair is asynchronous after Actor settlement; fix which side of source closure owns admission.
+		if (!disabledRepair) { repairBinding.release(); await repairAttached.promise; }
+	}
 	if (!retired) {
 		settings.drafterEnabled = false; await f.finish(); await f.start("child");
+		if (disabledRepair) repairBinding.release();
 		if (stale) await writeText(cwd, "child.txt", "fresh\n");
 		allow = !mode.endsWith("-fallback");
 		expect(textOutput(await f.execute(consumer, args))).toBe(dependent ? "prepared\n" : stale ? "fresh\n" : unused ? "unused\n" : "child\n");
@@ -952,9 +969,13 @@ test.for(["independent", "unchanged", "batch", "batch-known", "mismatch-text", "
 	if (wrong && !repairBudget || recoverable || actualFirst || known || contractChanged) expectHiddenCompute(f.actors.at(-1)!.computation!, true);
 	if (retired || wrong && !inflight || mode === "parent-miss" || contractChanged) expect(f.predictions.some(event => event.tool === child.tool &&
 		event.settlement.observation === "unobserved" && event.settlement.cause.code === "dependency_impossible")).toBe(true);
-	if (mode !== "parent-miss" && !retired && !repairBudget && !cross && !unused) expect(f.predictions.some(event => event.tool === child.tool &&
+	if (!disabledRepair && mode !== "parent-miss" && !retired && !repairBudget && !cross && !unused) expect(f.predictions.some(event => event.tool === child.tool &&
 		event.settlement.observation === "observed" && event.settlement.match.matched)).toBe(true);
-	if (inflight) expect(executed.filter(tool => tool === child.tool)).toHaveLength(1);
+	if (disabledRepair) expect(f.predictions.filter(event => event.tool === child.tool).map(event => event.settlement)).toMatchObject([
+		{ observation: "unobserved", cause: { code: "dependency_impossible" } },
+		{ observation: "unobserved", cause: { code: "source_disabled" } },
+	]);
+	if (inflight || contractChanged) expect(executed.filter(tool => tool === child.tool)).toHaveLength(1);
 	expect(requests).toBe(budget.requests + Number(contractChanged || retired && allow)); expect(f.drafter.budget.requests).toBe(requests);
 	if (learning) {
 		expectHiddenCompute(f.actors.at(-1)!.computation!, partial || !stale && !unused);
