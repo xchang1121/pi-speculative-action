@@ -1,10 +1,10 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { filesystemPathsOverlap, relativeFilesystemPath } from "./path-utils.ts";
+import { containsFilesystemPath, relativeFilesystemPath } from "./path-utils.ts";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { BigIntStats } from "node:fs";
-import { CapturedFilesystemObject, sameFilesystemIdentity, type CapturedFilesystemTransfer, type StableFilesystemCapture } from "./filesystem-evidence.ts";
+import { CapturedFilesystemObject, mapFilesystem, sameFilesystemIdentity, withFilesystemReadView, type CapturedFilesystemTransfer, type StableFilesystemCapture } from "./filesystem-evidence.ts";
 import { PI_ACTION_SEMANTICS, type ActionKey, type ActionSemanticsRegistry } from "./action-semantics.ts";
 import type { ExecutionWorld, ExecutionScope, ExecutionResourceContext, WorldBranch, WorldOutput, WorldCheckpoint, WorldResultCapture } from "./execution-world.ts";
 import { effectCommitFailure } from "./effect-transaction.ts";
@@ -35,7 +35,22 @@ export async function filesystemExecutionDependsOn(action: ActionKey, parent: Ac
 		(key.resourceRoot ? key.resources.map(target => path.resolve(key.resourceRoot!, target)) : []);
 	const current = paths(action), previous = paths(parent);
 	if (!current.length || !previous.length) return true;
-	return (await Promise.all(current.flatMap(target => previous.map(prior => filesystemPathsOverlap(target, prior))))).some(Boolean);
+	const overlaps = (left: string, right: string) => containsFilesystemPath(left, right) || containsFilesystemPath(right, left);
+	if (current.some(target => previous.some(prior => overlaps(target, prior)))) return true;
+	try {
+		return await withFilesystemReadView(undefined, async view => {
+			const resolved = new Map(await mapFilesystem([...new Set([...current, ...previous])], async target => {
+				const info = await view.stat(target, true).catch(error => { if (error.code !== "ENOENT") throw error; });
+				const real = await view.realpath(target).catch(error => { if (error.code !== "ENOENT") throw error;
+					return view.realpath(path.dirname(target)).then(parent => path.join(parent, path.basename(target))); });
+				return [target, { info, real }] as const;
+			}));
+			return current.some(target => previous.some(prior => {
+				const a = resolved.get(target)!, b = resolved.get(prior)!;
+				return !!(a.info && b.info && a.info.ino !== 0n && a.info.dev === b.info.dev && a.info.ino === b.info.ino) || overlaps(a.real, b.real);
+			}));
+		});
+	} catch { return true; }
 }
 
 /** Observe Actor reads; only explicitly bound operations may execute ahead over sealed resource data. */

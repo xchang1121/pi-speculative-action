@@ -9,7 +9,7 @@ import { WorkspaceSandboxService, readSandboxDirectoryState, type SandboxWorkspa
 import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import type { ToolInvocation } from "../src/tool-settlement.ts";
 import { createReadTool, createWriteTool } from "@earendil-works/pi-coding-agent";
-import { createResourceSnapshotExecutionWorld } from "../src/agent-execution-world.ts";
+import { createResourceSnapshotExecutionWorld, filesystemExecutionDependsOn } from "../src/agent-execution-world.ts";
 import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { captureAbsenceDependency, captureDirectoryDependency, captureFileDependency, captureMetadataDependency, captureSymlinkDependency, validateDynamicDependencyCertificate } from "../src/provenance-validation.ts";
 import { ProcessReusePlanner, ProvenanceCertificateStore, sealProcessCertificate } from "../src/process-reuse.ts";
@@ -37,6 +37,32 @@ linux.for(["proposal", "proposal-failure", "validate", "stale-native", "stale-re
     for (const name of [physical, file, alias]) await utimes(name, 915148800, 946684800);
     for (const name of [route, symbolic, broken]) await lutimes(name, 915148800, 946684800);
     const paths = [physical, file, alias, route, symbolic, broken], before = await metadata(paths);
+    const key = (target: string) => PI_ACTION_SEMANTICS.buildKey("read", { path: target }, fixture, "ordering")!;
+    for (const [left, right, dependent] of [
+      [path.join(root, "symbolic"), file, true], [target, alias, !mode.startsWith("proposal")],
+      [path.join(root, "missing"), path.join(physical, "missing"), true],
+      [path.join(root, "missing"), path.join(physical, "other-missing"), false],
+      [path.join(root, "symbolic"), physical, true], [path.join(root, "broken/child"), file, true],
+    ] as const) expect(await filesystemExecutionDependsOn(key(left), key(right))).toBe(dependent);
+    expect(await metadata(paths)).toEqual(before);
+    if (mode === "proposal-failure") {
+      const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>(), queried: string[] = [];
+      const stat = filesystemEvidence.FilesystemReadView.prototype.stat, close = filesystemEvidence.FilesystemReadView.prototype.close;
+      let closed = 0, pending: Promise<boolean> | undefined;
+      const statSpy = vi.spyOn(filesystemEvidence.FilesystemReadView.prototype, "stat").mockImplementation(async function(this: filesystemEvidence.FilesystemReadView, target, follow) {
+        queried.push(target); if (target === file) { entered.resolve(); await release.promise; }
+        return stat.call(this, target, follow);
+      });
+      const closeSpy = vi.spyOn(filesystemEvidence.FilesystemReadView.prototype, "close").mockImplementation(function(this: filesystemEvidence.FilesystemReadView) { closed++; return close.call(this); });
+      try {
+        const action = { ...key(file), executionContext: { executor: "ordering-contract", filesystemResources: [file, path.join(file, "child"), file] } };
+        pending = filesystemExecutionDependsOn(action, key(alias));
+        await entered.promise; await new Promise<void>(resolve => setImmediate(resolve));
+        expect(closed).toBe(0); release.resolve(); expect(await pending).toBe(true);
+        expect(closed).toBe(1); expect(queried.filter(target => target === file)).toHaveLength(1);
+      } finally { release.resolve(); await pending; statSpy.mockRestore(); closeSpy.mockRestore(); }
+      expect(await metadata(paths)).toEqual(before);
+    }
     const output = { result: { content: [], details: {} }, isError: false };
     if (mode.startsWith("proposal")) {
       const execute: NonNullable<ToolInvocation["filesystem"]> = async operations => {

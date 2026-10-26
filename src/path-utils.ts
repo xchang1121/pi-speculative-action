@@ -1,5 +1,4 @@
 import path from "node:path";
-import fs from "node:fs/promises";
 
 export const slash = (value: string): string => path.sep === "/" ? value : value.replaceAll(path.sep, "/");
 
@@ -32,19 +31,6 @@ export function relativeFilesystemPath(root: string, target: string): string | u
 }
 
 export const containsFilesystemPath = (root: string, target: string): boolean => relativeFilesystemPath(root, target) !== undefined;
-
-/** Scheduling hint only: aliases wait for their producer; uncertain names stay conservative. Adoption still proves versions. */
-export async function filesystemPathsOverlap(left: string, right: string): Promise<boolean> {
-	if (containsFilesystemPath(left, right) || containsFilesystemPath(right, left)) return true;
-	try {
-		const [[a, ap], [b, bp]] = await Promise.all([left, right].map(target => Promise.all([
-			fs.stat(target, { bigint: true }).catch(error => { if (error.code !== "ENOENT") throw error; }),
-			fs.realpath(target).catch(error => { if (error.code !== "ENOENT") throw error;
-				return fs.realpath(path.dirname(target)).then(parent => path.join(parent, path.basename(target))); }),
-		])));
-		return !!(a && b && a.ino !== 0n && a.dev === b.dev && a.ino === b.ino) || containsFilesystemPath(ap, bp) || containsFilesystemPath(bp, ap);
-	} catch { return true; }
-}
 
 export function containsLogicalPath(root: string, target: string): boolean {
 	const relative = path.posix.relative(normalizeLogicalPath(root), normalizeLogicalPath(target));
