@@ -22,6 +22,81 @@ const metadata = async (paths: readonly string[]) => Promise.all(paths.map(async
   return { target, fields: Object.fromEntries(filesystemEvidence.FILESYSTEM_METADATA_FIELDS.map(field => [field, String(stat[field])])) };
 }));
 
+linux.for(["file", "directory", "missing", "handoff"])("settles admitted source queries before releasing their owner (%s)", { timeout: 30_000 }, async mode => {
+  nativeProcessLibrary(process.env.PI_SPEC_HELD_EXEC!);
+  const root = await mkdtemp(path.join(os.tmpdir(), "pi-readonly-drain-")), file = path.join(root, "input"), alias = path.join(root, "alias"), missing = path.join(root, "missing");
+  const service = new WorkspaceSandboxService(), world = service.createExecutionWorld(), manager = new ResourceVersionManager(root, { watch: false });
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>(), delayed: Promise<unknown>[] = [];
+  const failure = Object.assign(new Error("source query I/O sentinel"), { code: "EIO" }), output = { result: { content: [], details: {} }, isError: false };
+  let branch: Awaited<ReturnType<typeof world.speculation.execute>> | undefined, token: ResourceVersionToken | undefined;
+  let busy: filesystemEvidence.FilesystemReadView | undefined, closed = 0, resumedClosed = 0, realpaths = 0, directories = 0, missingSeen = false, stamped = false, settled = false;
+  const pause = <T>(view: filesystemEvidence.FilesystemReadView, run: () => Promise<T>) => {
+    busy = view; entered.resolve();
+    const task = release.promise.then(() => { resumedClosed += closed; return run(); }); delayed.push(task); return task;
+  };
+  const proto = filesystemEvidence.FilesystemReadView.prototype, originals = { realpath: proto.realpath, stat: proto.stat, readDirectory: proto.readDirectory, pin: proto.pin, close: proto.close };
+  const capture = ResourceVersionManager.prototype.capture;
+  try {
+    await writeFile(file, "source\n"); await writeFile(alias, "independent\n");
+    if (mode === "handoff") {
+      const execute: NonNullable<ToolInvocation["filesystem"]> = async operations => {
+        await operations.readFile(file); await operations.readFile(alias); await operations.writeFile!(file, "adopted\n"); return output;
+      };
+      const args = { path: "input", content: "adopted\n" }, action = PI_ACTION_SEMANTICS.buildKey("write", args, root, "drain", { fingerprint: "drain-contract", context: { filesystem: execute } })!;
+      branch = await world.speculation.execute({ cwd: root, tool: createWriteTool(root), toolName: "write", args, action, callID: "drain", signal: new AbortController().signal });
+    }
+    for (const target of [root, file, alias]) await utimes(target, 915148800, 946684800);
+    const before = await metadata([root, file, alias]);
+    const spies = [
+      vi.spyOn(proto, "realpath").mockImplementation(function(this: filesystemEvidence.FilesystemReadView, target) {
+        if (mode === "missing" && target === missing) missingSeen = true;
+        if (mode === "file" && target === file && ++realpaths === 2 || mode === "missing" && target === root && missingSeen)
+          return pause(this, () => originals.realpath.call(this, target));
+        return originals.realpath.call(this, target);
+      }),
+      vi.spyOn(proto, "stat").mockImplementation(async function(this: filesystemEvidence.FilesystemReadView, target, follow) {
+        if (mode === "file" && target === file && realpaths === 2 || mode === "directory" && target === root && directories === 2 || mode === "missing" && target === root && busy === this) throw failure;
+        return originals.stat.call(this, target, follow);
+      }),
+      vi.spyOn(proto, "readDirectory").mockImplementation(function(this: filesystemEvidence.FilesystemReadView, target) {
+        return mode === "directory" && target === root && ++directories === 2 ? pause(this, () => originals.readDirectory.call(this, target)) : originals.readDirectory.call(this, target);
+      }),
+      vi.spyOn(proto, "pin").mockImplementation(async function(this: filesystemEvidence.FilesystemReadView, target, follow) {
+        if (mode === "handoff" && stamped) {
+          if (target === alias) throw failure;
+          if (target === file) return pause(this, () => originals.pin.call(this, target, follow));
+        }
+        return originals.pin.call(this, target, follow);
+      }),
+      vi.spyOn(proto, "close").mockImplementation(function(this: filesystemEvidence.FilesystemReadView) { if (this === busy) closed++; return originals.close.call(this); }),
+      vi.spyOn(ResourceVersionManager.prototype, "capture").mockImplementation(async function(this: ResourceVersionManager, ...args) {
+        const result = await capture.apply(this, args); stamped = true; return result;
+      }),
+    ];
+    const operation = mode === "file" ? filesystemEvidence.withFilesystemReadView(undefined, view => filesystemEvidence.captureStableFile(file, 1024, true, { view }))
+      : mode === "handoff" ? branch!.takeReadInputs!(64 * 1024)
+      : manager.capture([{ path: mode === "directory" ? root : missing, scope: mode === "directory" ? "names" : "exists" }], 64 * 1024);
+    const pending = operation.then(value => ({ value }), error => ({ error })).finally(() => { settled = true; });
+    try {
+      await entered.promise;
+      for (let turn = 0; turn < 4; turn++) await new Promise<void>(resolve => setImmediate(resolve));
+      expect({ settled, closed }).toEqual({ settled: false, closed: 0 });
+      release.resolve(); expect(await pending).toEqual({ error: failure });
+      expect({ closed, resumedClosed }).toEqual({ closed: 1, resumedClosed: 0 });
+    } finally { release.resolve(); await pending; await Promise.allSettled(delayed); for (const spy of spies) spy.mockRestore(); }
+    expect(await metadata([root, file, alias])).toEqual(before);
+    if (mode === "file") expect((await filesystemEvidence.withFilesystemReadView(undefined, view => filesystemEvidence.captureStableFile(file, 1024, true, { view }))).content?.toString()).toBe("source\n");
+    else if (mode !== "handoff") {
+      token = await manager.capture(undefined, 64 * 1024);
+      if (mode === "directory") expect(await token.view!.readdir(root)).toEqual(["alias", "input"]);
+      else expect(await token.view!.exists(missing)).toBe(false);
+      token.view!.seal(); expect((await manager.validate(token)).expired).toBe(false);
+    }
+    expect(await metadata([root, file, alias])).toEqual(before);
+    if (branch && !branch.inputsOnly) { expect(await branch.commit()).toEqual(output); expect(await readFile(file, "utf8")).toBe("adopted\n"); }
+  } finally { release.resolve(); await token?.release(); await branch?.dispose(); await world.dispose?.(); await service.dispose(); manager.close(); await rm(root, { recursive: true, force: true }); }
+});
+
 linux.for(["proposal", "proposal-failure", "validate", "stale-native", "stale-replace", "adopt"])("preserves source metadata until adoption passes its preflight (%s)", { timeout: 30_000 }, async mode => {
   nativeProcessLibrary(process.env.PI_SPEC_HELD_EXEC!);
   const fixture = await mkdtemp(path.join(os.tmpdir(), "pi-readonly-adoption-")), physical = path.join(fixture, "real/source"), route = path.join(fixture, "route");

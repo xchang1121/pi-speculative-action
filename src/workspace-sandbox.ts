@@ -575,10 +575,10 @@ function workspaceBranch(snapshot: WorkspaceExecutionSnapshot, sourceRoot: strin
 			if (!preimages.size || disposed) return undefined;
 			const inputs = await createCommittedResourceInputs(action, sourceRoot, preimages, maxBytes).catch(() => undefined);
 			// Stamped only now: each file must still hold the bytes it was read with, or the owner would vouch for stale ones.
-			const current = inputs && await withFilesystemReadView(undefined, view => Promise.all([...preimages].map(async ([target, before]) => {
+			const current = inputs && await withFilesystemReadView(undefined, view => mapFilesystem([...preimages], async ([target, before]) => {
 				const content = before as ContentVersion;
 				return sameContent((await readRegularState(target, undefined, view, content instanceof ChunkedContent ? content.pool : undefined))?.content, content);
-			})))
+			}))
 				.catch(async error => { await inputs.dispose(); throw error; });
 			if (inputs && !disposed && current?.every(Boolean)) return inputs;
 			await inputs?.dispose(); return undefined;
@@ -926,7 +926,8 @@ async function executeFilesystemMutation(state: WorkspaceSandboxState, context: 
 			const relative = relativeFilesystemPath(sourceRoot, logical);
 			if (relative === undefined || isSnapshotExcluded(slash(relative))) throw new Error("Filesystem operation is outside the workspace view");
 			const target = path.resolve(sourceRoot, relative), file = path.resolve(workspace?.sandboxRoot ?? sourceRoot, relative);
-			await Promise.all([assertNoSymlinkPath(sourceRoot, target, (target, read) => captureFilesystemEntry(target, read, source)), ...(workspace ? [assertNoSymlinkPath(workspace.sandboxRoot, file, (target, read) => captureFilesystemEntry(target, read, view))] : [])]);
+			await assertNoSymlinkPath(sourceRoot, target, (target, read) => captureFilesystemEntry(target, read, source));
+			if (workspace) await assertNoSymlinkPath(workspace.sandboxRoot, file, (target, read) => captureFilesystemEntry(target, read, view));
 			context.signal.throwIfAborted();
 			return { file, key: filesystemPathKey(target), root: sourceRoot, target, resource: slash(relative) };
 		};
@@ -1778,9 +1779,10 @@ async function collectSandboxChanges(workspace: ReturnType<typeof createWorkspac
 			if (!resource || path.isAbsolute(resource) || resource.split("/").includes("..")) throw new Error(`invalid sandbox change path: ${resource}`);
 			const target = path.resolve(workspace.sourceRoot, resource), sandboxTarget = path.resolve(workspace.sandboxRoot, resource);
 			if (!containsFilesystemPath(workspace.sourceRoot, target) || !containsFilesystemPath(workspace.sandboxRoot, sandboxTarget)) throw new Error(`sandbox change escapes workspace: ${resource}`);
-			await Promise.all([assertNoSymlinkPath(workspace.sourceRoot, target, source), assertNoSymlinkPath(workspace.sandboxRoot, sandboxTarget, capture)]);
-			const [before, after] = await Promise.all([workspace.baselineFrontier.has(resource) ? workspace.baselineFrontier.get(resource)
-				: workspace.readBase(resource), readRegularState(sandboxTarget, undefined, undefined, workspace.contents)]);
+			await assertNoSymlinkPath(workspace.sourceRoot, target, source);
+			await assertNoSymlinkPath(workspace.sandboxRoot, sandboxTarget, capture);
+			const before = workspace.baselineFrontier.has(resource) ? workspace.baselineFrontier.get(resource) : await workspace.readBase(resource);
+			const after = await readRegularState(sandboxTarget, undefined, undefined, workspace.contents);
 			return { root: workspace.sourceRoot, target, resource, before: before?.content, after: after?.content, beforeMode: before?.mode,
 				afterMode: after?.mode, afterModified: after?.identity && String(after.identity.mtimeNs), ...(before?.settled ? { beforeIdentity: before.settled } : {}) };
 		});

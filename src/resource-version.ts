@@ -1471,10 +1471,8 @@ async function fingerprintDependencies(
 			const child = await fingerprintPath(path.join(target, entry.name), scope, dependency, descendants, scope !== "entries", realTarget);
 			return { name: entry.name, ...child };
 		});
-		const [afterEntries, after] = await Promise.all([
-			fingerprintIO(() => readFilesystemDirectory(target, filesystem)),
-			fingerprintIO(() => filesystem!.stat(target)),
-		]);
+		const afterEntries = await fingerprintIO(() => readFilesystemDirectory(target, filesystem));
+		const after = await fingerprintIO(() => filesystem!.stat(target));
 		if (
 			!after.isDirectory() ||
 			!sameFilesystemIdentity(info, after) ||
@@ -1520,10 +1518,8 @@ function missingResourceResolver(realRoot: string, filesystem: FilesystemReadVie
 		if (existing) return existing;
 		const task = (async () => {
 			try {
-				const [real, stat] = await Promise.all([
-					fingerprintIO(() => filesystem.realpath(current)),
-					fingerprintIO(() => filesystem.stat(current)),
-				]);
+				const real = await fingerprintIO(() => filesystem.realpath(current));
+				const stat = await fingerprintIO(() => filesystem.stat(current));
 				assertInside(realRoot, real);
 				return { realPath: filesystemPathKey(real), fingerprint: digest([filesystemPathKey(real), statStamp(stat)]) };
 			} catch (error) {

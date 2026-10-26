@@ -512,7 +512,8 @@ export async function captureStableFile(target: string, maxBytes = Number.POSITI
 		signal?.throwIfAborted();
 		if (bytesRead !== Number(before.size) || !sameFilesystemIdentity(before, after)) throw new FilesystemCaptureChangedError("file_changed_during_capture");
 		if (verifyPath) {
-			const [afterPath, pathStat] = await Promise.all([view.realpath(target), view.stat(target)]);
+			const afterPath = await view.realpath(target);
+			const pathStat = await view.stat(target);
 			if (beforePath !== afterPath || !sameFilesystemIdentity(after, pathStat)) throw new FilesystemCaptureChangedError("file_changed_during_capture");
 		}
 		const result = { hash: hash?.digest("hex") ?? "", bytesRead, stat: after, ...(content ? { content } : {}), ...(blob ? { blob: blob.digest("hex") } : {}),
