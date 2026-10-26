@@ -1,4 +1,5 @@
 import { readdir, unlink, utimes, writeFile } from "node:fs/promises";
+import { closeSync, constants, fstatSync, openSync } from "node:fs";
 import * as filesystem from "node:fs/promises";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -9,7 +10,7 @@ import {
 } from "../src/process-reuse.ts";
 import { ProcessHandoffOwnership, ProcessHandoffRegistry } from "../src/process-handoff.ts";
 import { effectCommitFailure } from "../src/effect-transaction.ts";
-import { CapturedFilesystemObject, cachedCapture, captureFileDigest, captureStableFile, hashExecutableFile } from "../src/filesystem-evidence.ts";
+import { CapturedFilesystemObject, FilesystemObjectLease, cachedCapture, captureFileDigest, captureStableFile, hashExecutableFile, openFilesystemReadView, type FilesystemReadView } from "../src/filesystem-evidence.ts";
 import { ResourceObjectInputs } from "../src/agent-execution-world.ts";
 import { waitForCompletion } from "../src/runtime-lifecycle.ts";
 import { observeStrace, traceTail, writesWithin } from "../src/strace-observer.ts";
@@ -157,6 +158,54 @@ test("keeps file admission and change detection after a digest is cached", async
 	expect((await captureFileDigest(input)).hash).toBe(sha256Digest("modified").slice("sha256:".length));
 	await expect(captureFileDigest(input, 7)).rejects.toThrow("file_too_large");
 	await expect(captureFileDigest(input, 1024, AbortSignal.abort(new Error("cancelled")))).rejects.toThrow("cancelled");
+});
+
+test.skipIf(process.platform !== "linux").for(["pin", "metadata", "content"])("keeps a closed object handle separate from a reused descriptor (%s)", async mode => {
+	const input = path.join(await directories.create(), "input"), moved = `${input}-moved`, readable = mode === "content";
+	const entered = deferred(), release = deferred(), gaps: number[] = [];
+	let view: FilesystemReadView | undefined, source: FilesystemObjectLease | undefined, receiver: FilesystemObjectLease | undefined;
+	let loan: ReturnType<FilesystemObjectLease["lend"]>, replacement: number | undefined, borrowing: Promise<void> | undefined, closing: Promise<void> | undefined;
+	try {
+		await writeFile(input, "original");
+		let handle, identity;
+		if (mode === "pin") { view = await openFilesystemReadView(); handle = await view.pin(input); identity = await handle.stat({ bigint: true }); }
+		else {
+			const opened = await filesystem.open(input, readable ? constants.O_RDONLY | constants.O_NOATIME : 0x200000);
+			identity = await opened.stat({ bigint: true }); source = new FilesystemObjectLease(opened, identity, readable);
+			loan = source.lend(); expect(loan).toBeDefined();
+			if (!readable) expect(FilesystemObjectLease.receive(structuredClone(loan!.transfer), true)).toBeUndefined();
+			expect(FilesystemObjectLease.receive({ ...structuredClone(loan!.transfer), process: process.pid + 1 }, readable)).toBeUndefined();
+			const received = FilesystemObjectLease.receive(structuredClone(loan!.transfer), readable); expect(received).toBeDefined(); handle = received!.handle;
+		}
+		const original = handle, descriptor = original.fd;
+		receiver = new FilesystemObjectLease(original, identity, readable);
+		await filesystem.rename(input, moved); await writeFile(input, "replacement");
+		let closed = false;
+		borrowing = receiver.borrow(async handle => {
+			entered.resolve(); await release.promise;
+			const current = await handle.stat({ bigint: true }); expect([current.dev, current.ino]).toEqual([identity.dev, identity.ino]);
+			if (readable) { const bytes = Buffer.alloc(8); expect((await handle.read!(bytes, 0, bytes.length, 0)).bytesRead).toBe(8); expect(bytes.toString()).toBe("original"); }
+		});
+		closing = receiver.dispose().then(() => { closed = true; });
+		await entered.promise; await nextTurn(); expect(closed).toBe(false); expect(receiver.lend()).toBeUndefined();
+		release.resolve(); await borrowing; await closing; expect(closed).toBe(true);
+		replacement = openSync(input, constants.O_RDONLY);
+		while (replacement < descriptor) { gaps.push(replacement); replacement = openSync(input, constants.O_RDONLY); }
+		expect(replacement).toBe(descriptor);
+		const identityAfterReuse = fstatSync(replacement, { bigint: true }); expect(identityAfterReuse.ino).not.toBe(identity.ino);
+		const queries = await Promise.allSettled([original.stat({ bigint: true }), ...readable ? [original.read!(Buffer.alloc(11), 0, 11, 0)] : []]);
+		let duplicateClose = "ok", replacementAlive = false;
+		try { await original.close(); } catch (error) { duplicateClose = (error as NodeJS.ErrnoException).code ?? String(error); }
+		try { replacementAlive = fstatSync(replacement, { bigint: true }).ino === identityAfterReuse.ino; } catch (error) { if ((error as NodeJS.ErrnoException).code !== "EBADF") throw error; replacement = undefined; }
+		expect({ queries: queries.map(result => result.status === "rejected" ? result.reason.code : "fulfilled"), duplicateClose, replacementAlive })
+			.toEqual({ queries: readable ? ["EBADF", "EBADF"] : ["EBADF"], duplicateClose: "ok", replacementAlive: true });
+		expect((await filesystem.readFile(input)).toString()).toBe("replacement");
+	} finally {
+		release.resolve(); await Promise.allSettled([borrowing, closing]);
+		if (replacement !== undefined) closeSync(replacement);
+		for (const descriptor of gaps) closeSync(descriptor);
+		await receiver?.dispose(); loan?.release(); await source?.dispose(); await view?.close();
+	}
 });
 
 test.skipIf(process.platform !== "linux").each(["fresh", "changed-before", "changed-after", "revoked", "budget", "rejected"])("keeps input loans owned through transfer and exact invalidation (%s)", async mode => {

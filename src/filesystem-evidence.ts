@@ -165,12 +165,15 @@ export class FilesystemReadView {
 	[Symbol.asyncDispose](): Promise<void> { return this.close(); }
 }
 
-function filesystemDescriptorHandle(fd: number): FilesystemObjectHandle {
+function filesystemDescriptorHandle(fd: number, readable = false): FilesystemObjectHandle {
 	let closed = false;
+	const assertOpen = () => { if (closed) throw filesystemReadError("filesystem object lease is closed", -9); };
 	return { fd, stat: async () => {
-		if (closed) throw filesystemReadError("filesystem object lease is closed", -9);
+		assertOpen();
 		return fstatSync(fd, { bigint: true });
-	}, close: async () => { if (!closed) { closed = true; closeSync(fd); } } };
+	}, read: readable ? (buffer, offset, length, position) => new Promise((resolve, reject) => {
+		assertOpen(); read(fd, buffer, offset, length, position, (error, bytesRead) => error ? reject(error) : resolve({ bytesRead }));
+	}) : undefined, close: async () => { if (!closed) { closed = true; closeSync(fd); } } };
 }
 
 function openFilesystemDescriptor(reader: NonNullable<typeof nativeFilesystem>, root: number, target: string, flags: number): number {
@@ -276,9 +279,7 @@ export class FilesystemObjectLease {
 			const stat = fstatSync(fd, { bigint: true });
 			if (!Atomics.load(active, 0) || transfer.identity.dev !== stat.dev || transfer.identity.ino !== stat.ino) return;
 			const owned = fd; fd = undefined;
-			return { stat, handle: { fd: owned, stat: async () => fstatSync(owned, { bigint: true }), close: async () => closeSync(owned),
-				read: (buffer, offset, length, position) => new Promise((resolve, reject) => read(owned, buffer, offset, length, position,
-					(error, bytesRead) => error ? reject(error) : resolve({ bytesRead }))) } };
+			return { stat, handle: filesystemDescriptorHandle(owned, readable) };
 		} catch { return undefined; } finally { if (fd !== undefined) closeSync(fd); }
 	}
 	dispose(): Promise<void> { return this.lifetime.close(async () => { await this.lifetime.drain(); await this.handle.close(); }); }
