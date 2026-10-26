@@ -11,7 +11,8 @@ import type { ArtifactReference } from "../src/artifact-reference.ts";
 import type { Sha256Digest } from "../src/stable-value-hash.ts";
 import { ContentChunkPool, CONTENT_CHUNK_BYTES, captureContent } from "../src/content-chunks.ts";
 import { FILESYSTEM_METADATA_FIELDS } from "../src/filesystem-evidence.ts";
-import { ResourceVersionManager, type ResourceVersionToken } from "../src/resource-version.ts";
+import { ResourceVersionManager, captureResourceVersion, type ResourceVersionToken } from "../src/resource-version.ts";
+import { TimelineInterval } from "../src/task-timing.ts";
 import { ProvenanceCertificateStore } from "../src/reuse-store.ts";
 import { waitForCompletion } from "../src/runtime-lifecycle.ts";
 import { gated } from "./async.ts";
@@ -191,6 +192,26 @@ linux("shares immutable chunk versions across publication, borrowing, damage, co
 	try {
 		const text = "x".repeat(CONTENT_CHUNK_BYTES - 1) + "😀end", content = await captureContent(pool, text);
 		expect((await content.read()).toString()).toBe(text);
+		const file = path.join(f.root, "input"), bytes = Buffer.from(text), computation = new TimelineInterval(0, 1);
+		await writeFile(file, bytes);
+		for (const target of [f.root, file]) await utimes(target, 915148800, 946684800);
+		const before = await metadata([f.root, file]);
+		for (const input of [bytes, content, { content: bytes, computation }, { content, computation }]) {
+			const token = await captureResourceVersion(undefined, f.root, undefined, 2 * CONTENT_CHUNK_BYTES, new Map([[file, input]]));
+			f.tokens.push(token); const view = token.view!; view.seal();
+			expect(token.watching).toBe(false); expect((await token.manager.validate(token)).expired).toBe(false);
+			expect((await view.readFile(file)).toString()).toBe(text); expect(await view.readFile(file, 0)).toEqual(Buffer.alloc(0));
+			expect((await view.readFileRange(file, CONTENT_CHUNK_BYTES - 1, 4)).toString()).toBe("😀");
+			expect((await view.readFileRange(file, bytes.length - 3, 20)).toString()).toBe("end");
+			expect(await view.readFileRange(file, bytes.length + 1, 20)).toEqual(Buffer.alloc(0));
+			for (const invalid of [-1, 0.5, NaN, Infinity]) {
+				await expect(view.readFile(file, invalid)).rejects.toThrow(/read budget/);
+				await expect(view.readFileRange(file, invalid, 1)).rejects.toThrow(/read budget/);
+				await expect(view.readFileRange(file, 0, invalid)).rejects.toThrow(/read budget/);
+			}
+			const borrow = vi.fn(async () => 1); expect(await view.borrowObject(file, borrow)).toBeUndefined(); expect(borrow).not.toHaveBeenCalled();
+		}
+		expect(await metadata([f.root, file])).toEqual(before);
 		const capturing = pool.capture(async sink => { await pause.wait(); await sink(Buffer.from("overlap")); return { bytesRead: 7, hash: createHash("sha256").update("overlap").digest("hex") }; });
 		const publishing = f.store.withPublication(async () => { pause.release(); await content.publish(); });
 		await Promise.all([capturing, publishing]);
@@ -201,7 +222,14 @@ linux("shares immutable chunk versions across publication, borrowing, damage, co
 		expect((await content.read()).toString()).toBe(text); expect((await borrowed.read()).toString()).toBe(text);
 		const rejected = new ContentChunkPool(f.store);
 		try { await expect(rejected.restore(content.manifest)).rejects.toThrow(/integrity/); } finally { await rejected.dispose(); }
-		await f.store.clear(); await release(); expect(pool.openChunks).toBe(0);
+		await f.store.clear(); await release(); expect(pool.openChunks).toBeGreaterThan(0);
+		for (const token of f.tokens) expect((await token.view!.readFileRange(file, CONTENT_CHUNK_BYTES - 1, 7)).toString()).toBe("😀end");
+		expect(await metadata([f.root, file])).toEqual(before);
+		await writeFile(file, "changed"); const changed = await metadata([f.root, file]);
+		for (const token of f.tokens) expect((await token.manager.validate(token)).expired).toBe(true);
+		expect(await metadata([f.root, file])).toEqual(changed);
+		for (const token of f.tokens) { await token.release(); await expect(token.view!.readFile(file)).rejects.toThrow(/disposed/); }
+		expect(pool.openChunks).toBe(0);
 		expect((await borrowed.read()).toString()).toBe(text);
 		const saved = await f.store.withPublication(async () => { await borrowed.publish(); return f.store.putInputVersion(borrowed.manifest, references); });
 		const cold = JSON.parse((await promisify(execFile)(process.execPath, ["--input-type=module", "-e", `

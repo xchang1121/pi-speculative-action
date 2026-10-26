@@ -15,7 +15,7 @@ import { containsFilesystemPath, filesystemPathKey, relativeFilesystemPath } fro
 import { RuntimeLifecycleLane, SharedAbortScope } from "./runtime-lifecycle.ts";
 import { TimelineInterval } from "./task-timing.ts";
 import type { ValidationMetrics } from "./settlement.ts";
-import { ChunkedContent, ContentChunkPool, parseContentManifest, contentDigest, contentMemory, type ContentVersion, type ContentChunkLimits, type ChunkedContentManifest } from "./content-chunks.ts";
+import { ChunkedContent, ContentChunkPool, parseContentManifest, contentDigest, contentMemory, readContent, type ContentVersion, type ContentChunkLimits, type ChunkedContentManifest } from "./content-chunks.ts";
 import type { ProvenanceCertificateStore } from "./reuse-store.ts";
 import { validateArtifact, type ArtifactReference } from "./artifact-reference.ts";
 import { isSha256Digest, sha256Digest, type Sha256Digest } from "./stable-value-hash.ts";
@@ -54,7 +54,8 @@ export type ResourceInput = ContentVersion | { readonly content: ContentVersion;
 	{ readonly names?: readonly string[]; readonly computation?: TimelineInterval } |
 	{ readonly type: "file" | "directory"; readonly computation?: TimelineInterval } | null;
 
-const inputContent = (input: ResourceInput | undefined) => input instanceof Uint8Array || input instanceof ChunkedContent ? input : input && "content" in input ? input.content : undefined;
+const isInputContent = (input: ResourceInput | undefined): input is ContentVersion => input instanceof Uint8Array || input instanceof ChunkedContent;
+const inputContent = (input: ResourceInput | undefined) => isInputContent(input) ? input : input && "content" in input ? input.content : undefined;
 
 export type ResourceValidationMetrics = ValidationMetrics;
 
@@ -354,7 +355,7 @@ export class ResourceReadView {
 		let retained = redundant && !sameMetadata ? previous! : { ...(redundant ? previous! : entry), metadata };
 		const objectBytes = retained.object !== undefined ? 256 + (retained.objectBytes ?? 0) : 0;
 		let bytes = Buffer.byteLength(key) + Buffer.byteLength(retained.realPath ?? "") + Buffer.byteLength(retained.dependency ?? "") +
-			Buffer.byteLength(retained.metadata?.dependency ?? "") + 64 + objectBytes + 32 * (Number(!!retained.computation) + Number(!!retained.metadata?.computation && retained.metadata.computation !== retained.computation)) + (retained.type === "file" ? retained.content instanceof ChunkedContent ? retained.content.memoryBytes : retained.content?.length ?? (retained.version ? 96 : 0) : retained.type === "directory"
+			Buffer.byteLength(retained.metadata?.dependency ?? "") + 64 + objectBytes + 32 * (Number(!!retained.computation) + Number(!!retained.metadata?.computation && retained.metadata.computation !== retained.computation)) + (retained.type === "file" ? retained.content ? contentMemory(retained.content) : retained.version ? 96 : 0 : retained.type === "directory"
 				? retained.entries?.reduce((sum, name) => sum + Buffer.byteLength(name) + 16, 0) ?? 0
 				: retained.type === "alias" ? Buffer.byteLength(retained.target ?? "") + Buffer.byteLength(retained.link) : 0);
 		if (retained.object !== undefined && (this.bytes + bytes - (previous?.bytes ?? 0) - reservedBytes > this.maxBytes ||
@@ -382,16 +383,12 @@ export class ResourceReadView {
 		const entry = await this.get(target, "names");
 		return entry.type === "directory" && entry.entries ? [...entry.entries] : this.unproven(target);
 	};
-	readFile = async (target: string, maxBytes?: number): Promise<Buffer> => {
-		const entry = await this.get(target, "content");
-		if (entry.type !== "file" || entry.content === undefined) return this.unproven(target);
-		return entry.content instanceof ChunkedContent ? entry.content.read(maxBytes) : Buffer.from(entry.content.subarray(0, maxBytes));
-	};
+	readFile = (target: string, maxBytes?: number): Promise<Buffer> => this.readFileRange(target, 0, maxBytes ?? Number.MAX_SAFE_INTEGER);
 	readFileRange = async (target: string, offset: number, length: number): Promise<Buffer> => {
 		if (!isSafeCount(offset) || !isSafeCount(length)) throw new Error("invalid content read budget");
 		const entry = await this.get(target, "content");
 		if (entry.type !== "file" || entry.content === undefined) return this.unproven(target);
-		return entry.content instanceof ChunkedContent ? entry.content.readRange(offset, length) : Buffer.from(entry.content.subarray(offset, Math.min(entry.content.length, offset + length)));
+		return readContent(entry.content, offset, length);
 	};
 	/** A process borrows the same captured kernel object without inheriting the tool's OFD offset. */
 	async borrowObject<T>(target: string, consume: (capture: StableFilesystemCapture, handle: FilesystemObjectHandle) => Promise<T>): Promise<T | undefined> {
@@ -921,7 +918,7 @@ export class ResourceVersionManager {
 		if (dependencies?.length === 0 || (!dependencies && retainBytes === undefined)) throw new Error("resource_dependencies_unproven");
 		if (providedInputs && retainBytes === undefined) throw new Error("resource_snapshot_budget_invalid");
 		return this.captureToken(dependencies, retainBytes, providedInputs && new Map([...providedInputs]
-			.map(([target, input]) => [filesystemPathKey(path.resolve(this.root, target)), input && !(input instanceof Uint8Array) && !(input instanceof ChunkedContent)
+			.map(([target, input]) => [filesystemPathKey(path.resolve(this.root, target)), input && !isInputContent(input)
 				? "names" in input ? { ...input, names: input.names && [...input.names] } : { ...input } : input])));
 	}
 
@@ -1187,7 +1184,7 @@ export function resourceDependencies(action: ActionKey, root: string, actionSema
 export async function captureResourceVersion(action: ActionKey | undefined, root: string,
 	actionSemantics: ActionSemanticsRegistry = PI_ACTION_SEMANTICS, retainBytes?: number, providedInputs?: ReadonlyMap<string, ResourceInput>) {
 	const dependencies = providedInputs ? [...providedInputs].map(([path, input]): ResourceDependency => ({ path,
-		scope: input && !(input instanceof Uint8Array) && !("content" in input) ? "names" in input && input.names ? "names" : "type" : "content" }))
+		scope: input === null || inputContent(input) ? "content" : "names" in input && input.names ? "names" : "type" }))
 		: action ? resourceDependencies(action, root, actionSemantics) : undefined;
 	if (dependencies?.length === 0 || (!dependencies && retainBytes === undefined)) throw new Error("resource_dependencies_unproven");
 	return resourceManager(root).capture(dependencies, retainBytes, providedInputs);

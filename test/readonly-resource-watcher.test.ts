@@ -1,4 +1,4 @@
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import fs, { link, lstat, lutimes, mkdir, mkdtemp, readFile, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -31,6 +31,11 @@ linux.for(["proposal", "proposal-failure", "validate", "stale-native", "stale-re
     if (mode.startsWith("proposal")) await writeFile(alias, "independent\n"); else await link(file, alias);
     await symlink("real", route); await symlink("input", symbolic); await symlink("missing", broken);
     const directory = await readSandboxDirectoryState(root), identity = await lstat(file, { bigint: true });
+    const queryArgs = { path: "input" }, read: NonNullable<ToolInvocation["filesystem"]> = async operations => ({
+      result: { content: [{ type: "text", text: (await operations.readFile(target)).toString() }], details: {} }, isError: false,
+    });
+    // Resolve the invocation before setting the source's measurement timestamps.
+    const queryAction = PI_ACTION_SEMANTICS.buildKey("read", queryArgs, root, "readonly", { fingerprint: "readonly-query", context: { filesystem: read, filesystemRoot: root } })!;
     for (const name of [physical, file, alias]) await utimes(name, 915148800, 946684800);
     for (const name of [route, symbolic, broken]) await lutimes(name, 915148800, 946684800);
     const paths = [physical, file, alias, route, symbolic, broken], before = await metadata(paths);
@@ -48,7 +53,15 @@ linux.for(["proposal", "proposal-failure", "validate", "stale-native", "stale-re
       if (mode === "proposal-failure") await expect(pending).rejects.toThrow("discard proposal");
       else {
         branch = await pending; if (branch.inputsOnly) throw new Error("mutation produced input-only evidence");
-        const inputs = await branch.takeReadInputs?.(64 * 1024); expect(inputs).toBeDefined(); await inputs?.dispose();
+        const inputs = await branch.takeReadInputs?.(64 * 1024); expect(inputs).toBeDefined();
+        const capture = vi.spyOn(ResourceVersionManager.prototype, "capture").mockRejectedValue(new Error("unexpected source recapture"));
+        let query: Awaited<ReturnType<NonNullable<NonNullable<typeof inputs>["reconstruct"]>>>;
+        try {
+          query = await inputs!.reconstruct!({ action: queryAction, args: queryArgs, callID: "readonly-query", signal: new AbortController().signal });
+          expect(query).toBeDefined(); expect(await query!.validate!()).toMatchObject({ status: "valid" });
+          expect(query!.output).toMatchObject({ result: { content: [{ type: "text", text: "original\n" }] } });
+          expect(capture).not.toHaveBeenCalled();
+        } finally { capture.mockRestore(); await query?.dispose?.(); await inputs!.dispose(); }
       }
       expect(await metadata(paths)).toEqual(before);
       if (branch && !branch.inputsOnly) { expect(await branch.commit()).toEqual(output); expect(await readFile(file, "utf8")).toBe("adopted\n"); }
