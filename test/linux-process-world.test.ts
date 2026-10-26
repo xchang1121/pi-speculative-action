@@ -276,7 +276,8 @@ nativeTest.for(["journal", "whole-released", "whole-consumed", "custom", "dispos
 					expect(counts.mutations).toBe(1); expect(counts.reads).toBeGreaterThanOrEqual(2);
 				} else {
 					expect(result).toMatchObject({ complete: false, changes: [], reason: `workspace_transaction_capture:${phase === "io" ? "directory capture I/O sentinel" : "directory_changed_during_capture"}` });
-					expect(counts).toEqual(phase === "io" ? { reads: 1, mutations: 0 } : { reads: 3, mutations: 3 });
+					// Three capture attempts each compare two complete directory images.
+					expect(counts).toEqual(phase === "io" ? { reads: 1, mutations: 0 } : { reads: 6, mutations: 6 });
 				}
 			}
 		} else {

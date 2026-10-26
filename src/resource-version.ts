@@ -9,7 +9,7 @@ import { setImmediate as watcherTurn } from "node:timers/promises";
 import { type ActionKey, type ActionSemanticsRegistry, PI_ACTION_SEMANTICS, type ResourceDependencyScope } from "./action-semantics.ts";
 import {
 	type StableFilesystemCapture, type FilesystemObjectHandle, type FilesystemReadView, openFilesystemReadView, withFilesystemReadView, cachedCapture, captureFilesystemEntry, captureStableFile,
-	FILESYSTEM_CONCURRENCY, mapFilesystem, sameFilesystemIdentity, walkFilesystemPath, filesystemEntryType, type FilesystemTypeEvidence, readFilesystemDirectory,
+	FILESYSTEM_CONCURRENCY, mapFilesystem, sameFilesystemIdentity, walkFilesystemPath, filesystemEntryType, type FilesystemTypeEvidence, captureFilesystemDirectory, readFilesystemDirectory,
 } from "./filesystem-evidence.ts";
 import { containsFilesystemPath, filesystemPathKey, relativeFilesystemPath } from "./path-utils.ts";
 import { RuntimeLifecycleLane, SharedAbortScope } from "./runtime-lifecycle.ts";
@@ -1463,27 +1463,19 @@ async function fingerprintDependencies(
 				...directoryObjectSlot(supplied.names, view) });
 			return { ...fingerprintDirectory(info, realTarget, supplied.names), bytesRead: 0, filesRead: 0 };
 		}
-		const enumerationStarted = performance.now(), entries = await fingerprintIO(() => readFilesystemDirectory(target, filesystem));
-		const computation = TimelineInterval.own(new TimelineInterval(enumerationStarted, performance.now()));
-		const selected = excludes.size && (scope === "tree_content" || scope === "tree_entries") ? entries.filter((entry) => !excludes.has(entry.name)) : entries;
-		const descendants = new Set(ancestors).add(identity);
-		const children = scope === "names" ? [] : await mapFilesystem([...selected].sort((left, right) => left.name.localeCompare(right.name)), async (entry) => {
-			const child = await fingerprintPath(path.join(target, entry.name), scope, dependency, descendants, scope !== "entries", realTarget);
-			return { name: entry.name, ...child };
-		});
-		const afterEntries = await fingerprintIO(() => readFilesystemDirectory(target, filesystem));
-		const after = await fingerprintIO(() => filesystem!.stat(target));
-		if (
-			!after.isDirectory() ||
-			!sameFilesystemIdentity(info, after) ||
-			!sameValues(entries.map(entryIdentity), afterEntries.map(entryIdentity))
-		) {
-			throw new Error(`resource_directory_changed:${target}`);
-		}
-		const names = selected.map(entry => entry.name);
-		retainEntry({ type: "directory", entries: names, computation, ...directoryObjectSlot(names, view) });
+		const directory = await captureFilesystemDirectory(target, { view: filesystem, stat: info, io: fingerprintIO, visit: async entries => {
+			const selected = excludes.size && (scope === "tree_content" || scope === "tree_entries") ? entries.filter((entry) => !excludes.has(entry.name)) : entries;
+			const descendants = new Set(ancestors).add(identity);
+			const children = scope === "names" ? [] : await mapFilesystem([...selected].sort((left, right) => left.name.localeCompare(right.name)), async (entry) => {
+				const child = await fingerprintPath(path.join(target, entry.name), scope, dependency, descendants, scope !== "entries", realTarget);
+				return { name: entry.name, ...child };
+			});
+			return { names: selected.map(entry => entry.name), children };
+		} });
+		const { names, children } = directory.value!;
+		retainEntry({ type: "directory", entries: names, computation: directory.computation, ...directoryObjectSlot(names, view) });
 		return {
-			...fingerprintDirectory(after, realTarget, names, children),
+			...fingerprintDirectory(directory.info, realTarget, names, children),
 			bytesRead: children.reduce((total, child) => total + child.bytesRead, 0),
 			filesRead: children.reduce((total, child) => total + child.filesRead, 0),
 		};
@@ -1497,10 +1489,6 @@ async function fingerprintBinding(dependency: ResourceDependency, filesystem: Fi
 		stamp = digest([statStamp(info), link]);
 	} catch (error) { if (!missingResource(error)) throw error; stamp = errorCode(error); }
 	return { ...dependency, fingerprint: "binding", stamp, bytesRead: 0, filesRead: 0 };
-}
-
-function entryIdentity(entry: FilesystemTypeEvidence & { readonly name: string }): string {
-	return `${specialFileType(entry)}\0${entry.name}`;
 }
 
 function specialFileType(value: FilesystemTypeEvidence) {

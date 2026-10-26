@@ -530,6 +530,32 @@ export async function captureStableFile(target: string, maxBytes = Number.POSITI
 	}
 }
 
+/** Observe children inside the same directory capture. I/O admission never spans the child traversal. */
+export async function captureFilesystemDirectory<Value = undefined>(target: string, options: {
+	readonly view?: FilesystemReadView;
+	readonly stat?: BigIntStats;
+	readonly io?: <Result>(read: () => Promise<Result>) => Promise<Result>;
+	readonly visit?: (entries: readonly (FilesystemTypeEvidence & { readonly name: string })[]) => Promise<Value>;
+} = {}) {
+	return withFilesystemReadView(options.view, async view => {
+		const io = options.io ?? (<Result>(read: () => Promise<Result>) => read());
+		const before = options.stat ?? await io(() => view.stat(target));
+		if (!before.isDirectory()) throw new Error("not_directory");
+		const startedAt = performance.now(), entries = await io(() => readFilesystemDirectory(target, view));
+		const computation = TimelineInterval.own(new TimelineInterval(startedAt, performance.now()));
+		const identity = (entry: FilesystemTypeEvidence & { readonly name: string }) => `${filesystemEntryType(entry)}\0${entry.name}`;
+		const image = entries.map(identity);
+		const value = await options.visit?.(entries);
+		const afterEntries = await io(() => readFilesystemDirectory(target, view));
+		const info = await io(() => view.stat(target));
+		if (!info.isDirectory() || !sameFilesystemIdentity(before, info) || image.length !== afterEntries.length ||
+			image.some((entry, index) => entry !== identity(afterEntries[index]!))) {
+			throw new FilesystemCaptureChangedError("directory_changed_during_capture");
+		}
+		return { info, entries, computation, value };
+	});
+}
+
 /** Own a directory listing or link target together with its stable entry identity. */
 export async function captureFilesystemEntry(target: string, read?: "directory" | "identity", view?: FilesystemReadView): Promise<{
 	info: BigIntStats; link: string | undefined; entries: Awaited<ReturnType<typeof readFilesystemDirectory>> | undefined; computation: TimelineInterval;
@@ -537,11 +563,14 @@ export async function captureFilesystemEntry(target: string, read?: "directory" 
 	view ??= FilesystemReadView.ambient();
 	const startedAt = performance.now();
 	const before = await view.stat(target);
+	if (read === "directory" && before.isDirectory()) {
+		const { info, entries, computation } = await captureFilesystemDirectory(target, { view, stat: before });
+		return { info, entries, link: undefined, computation };
+	}
 	const link = before.isSymbolicLink() ? await view.readlink(target) : undefined;
-	const entries = read === "directory" && before.isDirectory() ? await readFilesystemDirectory(target, view) : undefined;
 	const info = link !== undefined || read !== undefined ? await view.stat(target) : before;
 	if (!sameFilesystemIdentity(before, info)) throw new FilesystemCaptureChangedError(`${link !== undefined ? "symlink" : "directory"}_changed_during_capture`);
-	return { info, link, entries, computation: TimelineInterval.own(new TimelineInterval(startedAt, performance.now())) };
+	return { info, link, entries: undefined, computation: TimelineInterval.own(new TimelineInterval(startedAt, performance.now())) };
 }
 
 /** Resolve link targets component by component, retaining each stable namespace observation. */

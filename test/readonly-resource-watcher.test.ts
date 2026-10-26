@@ -367,6 +367,30 @@ linux("closing during watcher initialization rejects the pending observation", {
   } finally { manager.close(); await rm(root, { recursive: true, force: true }); }
 });
 
+test("captures nested directory observations across the filesystem concurrency limit", { timeout: 30_000 }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "pi-directory-observation-")), manager = new ResourceVersionManager(root, { watch: false });
+  const names = Array.from({ length: filesystemEvidence.FILESYSTEM_CONCURRENCY + 1 }, (_, index) => String(index).padStart(3, "0"));
+  let token: ResourceVersionToken | undefined;
+  try {
+    for (const name of names) {
+      await mkdir(path.join(root, name, "nested"), { recursive: true });
+      await writeFile(path.join(root, name, "nested/input"), name);
+    }
+    token = await manager.capture([{ path: root, scope: "tree_content" }], 256 * 1024);
+    const view = token.view!;
+    expect(await view.readdir(root)).toEqual(names);
+    for (const name of names) {
+      expect(await view.readdir(path.join(root, name))).toEqual(["nested"]);
+      expect((await view.readFile(path.join(root, name, "nested/input"))).toString()).toBe(name);
+    }
+    view.seal();
+    expect((await manager.validate(token)).expired).toBe(false);
+    await writeFile(path.join(root, names[0]!, "nested/input"), "new");
+    expect((await view.readFile(path.join(root, names[0]!, "nested/input"))).toString()).toBe(names[0]);
+    expect((await manager.validate(token)).expired).toBe(true);
+  } finally { await token?.release(); manager.close(); await rm(root, { recursive: true, force: true }); }
+});
+
 linux("captures, consumes and revalidates resource inputs without changing source metadata", { timeout: 30_000 }, async () => {
   nativeProcessLibrary(process.env.PI_SPEC_HELD_EXEC!);
   const root = await mkdtemp(path.join(os.tmpdir(), "pi-readonly-inputs-")), directory = path.join(root, "directory");
