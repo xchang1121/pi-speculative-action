@@ -264,6 +264,28 @@ linux("drains admitted chunk reads before releasing pins and immediately revokes
 		await expect(token.view!.readFile(file)).rejects.toThrow(/disposed/); await f.store.clear();
 		pause.release(); expect((await reading).toString()).toBe("admitted input"); await closing;
 		expect(opened.every(handle => handle.fd === -1)).toBe(true);
+		const pool = new ContentChunkPool(f.store), staging = gated(), block = Buffer.alloc(CONTENT_CHUNK_BYTES, 7);
+		const capturing = pool.capture(async sink => { await sink(block); await staging.wait();
+			return { bytesRead: block.length, hash: createHash("sha256").update(block).digest("hex") }; });
+		try {
+			await staging.entered; expect(pool.openChunks).toBe(1);
+			const stopping = f.store.dispose();
+			expect((await waitForCompletion(stopping, undefined, 30)).status).toBe("deadline");
+			await expect(captureContent(pool, "late")).rejects.toThrow(/closed/);
+			const cancelled = expect(capturing).rejects.toThrow(/closed/); staging.release(); await cancelled; await stopping;
+		} finally { staging.release(); await capturing.catch(() => undefined); await pool.dispose(); }
+		expect(pool.openChunks).toBe(0); expect(opened.every(handle => handle.fd === -1)).toBe(true);
+		const publisher = new ProvenanceCertificateStore(f.cache), publishedPool = new ContentChunkPool(publisher), admitted = gated();
+		const publication = publisher.withPublication(async () => { await admitted.wait();
+			const content = await captureContent(publishedPool, "admitted publication"); await content.publish(); return content; });
+		try {
+			await admitted.entered; const stopping = publisher.dispose();
+			expect((await waitForCompletion(stopping, undefined, 30)).status).toBe("deadline");
+			admitted.release(); const content = await publication; await stopping;
+			expect((await content.read()).toString()).toBe("admitted publication");
+			expect(await filesystem.readFile(publisher.artifacts.artifactPath(content.manifest.chunks[0]!.digest), "utf8")).toBe("admitted publication");
+		} finally { admitted.release(); await publication.catch(() => undefined); await publishedPool.dispose(); await publisher.dispose(); }
+		expect(opened.every(handle => handle.fd === -1)).toBe(true);
 	} finally { pause.release(); await f.close(); }
 });
 
@@ -274,12 +296,20 @@ linux("shares immutable chunk versions across publication, borrowing, damage, co
 		const handle = await native.open(...args); opened.push(handle); return handle;
 	});
 	try {
-		const text = "x".repeat(CONTENT_CHUNK_BYTES - 1) + "😀end", content = await captureContent(pool, text);
-		expect((await content.read()).toString()).toBe(text);
+		const text = "x".repeat(CONTENT_CHUNK_BYTES - 1) + "😀end";
 		const file = path.join(f.root, "input"), bytes = Buffer.from(text), computation = new TimelineInterval(0, 1);
 		await writeFile(file, bytes);
 		for (const target of [f.root, file]) await utimes(target, 915148800, 946684800);
-		const before = await metadata([f.root, file]);
+		const before = await metadata([f.root, file]), beforeCapture = await metadata([path.dirname(f.root), f.root, file]);
+		const captured = await f.manager.capture([{ path: file, scope: "content" }], memoryBudget); f.tokens.push(captured);
+		expect((await captured.view!.readFile(file)).toString()).toBe(text);
+		const content = await captureContent(pool, text);
+		expect((await content.read()).toString()).toBe(text);
+		const loan = pool.lend(); let borrowed;
+		try { borrowed = await receiver.restore(content.manifest, loan.transfer); } finally { loan.release(); }
+		expect((await borrowed.read()).toString()).toBe(text);
+		await expect(lstat(f.cache)).rejects.toMatchObject({ code: "ENOENT" });
+		expect(await metadata([path.dirname(f.root), f.root, file])).toEqual(beforeCapture);
 		for (const input of [bytes, content, { content: bytes, computation }, { content, computation }]) {
 			const token = await captureResourceVersion(undefined, f.root, undefined, 2 * CONTENT_CHUNK_BYTES, new Map([[file, input]]));
 			f.tokens.push(token); const view = token.view!; view.seal();
@@ -299,8 +329,6 @@ linux("shares immutable chunk versions across publication, borrowing, damage, co
 		const capturing = pool.capture(async sink => { await pause.wait(); await sink(Buffer.from("overlap")); return { bytesRead: 7, hash: createHash("sha256").update("overlap").digest("hex") }; });
 		const publishing = f.store.withPublication(async () => { pause.release(); await content.publish(); });
 		await Promise.all([capturing, publishing]);
-		const loan = pool.lend(); let borrowed;
-		try { borrowed = await receiver.restore(content.manifest, loan.transfer); } finally { loan.release(); }
 		const references = content.manifest.chunks.filter((value): value is ArtifactReference => value !== null);
 		await writeFile(f.store.artifacts.artifactPath(references[0]!.digest), "damaged");
 		expect((await content.read()).toString()).toBe(text); expect((await borrowed.read()).toString()).toBe(text);

@@ -146,6 +146,7 @@ export class ArtifactReadView implements VerifiedArtifactClosure {
 					image = supplied && "bytes" in supplied ? Buffer.from(supplied.bytes) : await this.cas.get(reference, signal);
 					if (!image) return false;
 					if (image.length !== reference.size) throw new Error("artifact integrity check failed: length");
+					if (process.platform === "linux") snapshot = await openAnonymousFilesystemFile(this.cas.root);
 				} else {
 					const imported = supplied && "object" in supplied ? FilesystemObjectLease.receive(supplied.object, true) : undefined;
 					if (supplied && !imported) return false;
@@ -174,7 +175,7 @@ export class ArtifactReadView implements VerifiedArtifactClosure {
 					const handle = await open(`/proc/self/fd/${snapshot.fd}`, "r"), source = object;
 					try { object = new FilesystemObjectLease(handle, await handle.stat({ bigint: true }), true); }
 					catch (error) { await handle.close(); throw error; }
-					await source!.dispose();
+					await source?.dispose(); image = undefined;
 				}
 				signal?.throwIfAborted(); this.values.set(reference.digest, { reference: Object.freeze({ ...reference }), object, image, blocks }); object = undefined;
 				return true;
@@ -260,9 +261,12 @@ export class ProvenanceCertificateStore {
 	get signal(): AbortSignal { return this.stopped.signal; }
 	/** Own the complete read, including input proofs and their handle cleanup. */
 	read<T>(operation: (signal: AbortSignal) => Promise<T>, signal?: AbortSignal): Promise<T> {
-		return this.lifecycle.admit(() => {
-			const combined = AbortSignal.any([this.signal, ...(signal ? [signal] : [])]); combined.throwIfAborted(); return operation(combined);
-		});
+		const execute = () => {
+			const combined = AbortSignal.any([...(this.publication.getStore()?.active ? [] : [this.signal]), ...(signal ? [signal] : [])]);
+			combined.throwIfAborted(); return operation(combined);
+		};
+		// An admitted publication owns its remaining finite reads through shutdown.
+		return this.publication.getStore()?.active ? this.lifecycle.track(Promise.resolve().then(execute)) : this.lifecycle.admit(execute);
 	}
 	loadArtifacts(references: readonly ArtifactReference[], signal?: AbortSignal, retained?: VerifiedArtifactClosure): Promise<VerifiedArtifactClosure | undefined> {
 		return this.read(signal => this.artifacts.load(references, signal, retained, { maxStoredBytes: this.limits.maxBytes }), signal);

@@ -53,7 +53,22 @@ export type FilesystemObjectHandle = { readonly fd: number; stat(options: { bigi
 /** Open an unnamed regular inode in private backing storage without exposing a control path. */
 export async function openAnonymousFilesystemFile(root: string): Promise<FileHandle> {
 	if (process.platform !== "linux") throw new Error("anonymous filesystem files require Linux");
-	return fs.open(root, constants.O_WRONLY | 0o20200000, 0o600); // __O_TMPFILE | O_DIRECTORY
+	return withFilesystemReadView(undefined, async view => {
+		const { ancestor } = await resolveFilesystemDestination(root, view);
+		return fs.open(ancestor, constants.O_WRONLY | 0o20200000, 0o600); // __O_TMPFILE | O_DIRECTORY
+	}, handle => handle.close());
+}
+
+/** Resolve a proposed destination through its existing ancestors without creating any names. */
+export async function resolveFilesystemDestination(target: string, view: FilesystemReadView): Promise<{ path: string; ancestor: string }> {
+	target = path.resolve(target); let ancestor = target;
+	for (;;) {
+		try { const resolved = await view.realpath(ancestor); return { path: path.resolve(resolved, path.relative(ancestor, target)), ancestor: resolved }; }
+		catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT" || ancestor === path.dirname(ancestor)) throw error;
+			ancestor = path.dirname(ancestor);
+		}
+	}
 }
 
 /** Retain identity without retaining a pathname or copying bytes. The caller owns the returned lease. */

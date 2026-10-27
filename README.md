@@ -72,6 +72,8 @@ Pi SDK 回调及接入网关的调用可观察 `spawn/execFile/exec/fork` 及其
 
 Linux 输入版本可显式配置 `ResourceVersionManager(root, { persistentInputs: { store, limits } })`，其中 `store` 是现有 `ProvenanceCertificateStore`，缓存目录必须位于源树之外。`capture(dependencies, retainBytes)` 保留分块输入，`persist(token)` 返回记录摘要；重启后用新 manager 调用 `restore(id, retainBytes)`，完整核对内容和当前路径观察后才返回新的输入令牌。记录缺失或源已变化时返回 `undefined`，损坏记录拒绝恢复。`view.readFile(path, maxBytes)` 读取有界前缀，`view.readFileRange(path, offset, length)` 支持逐块消费；使用结束后等待 `token.release()`。此选项目前只适用于上述已验证 Linux 输入闭包，扩展默认配置仍使用原内存输入策略。
 
+Linux 分块捕获先保存在现有匿名文件租约中，不创建缓存目录、数据库或命名 CAS 文件；完整租约传递也无需发布。显式 `publish` 或 `persist` 才把数据和根写入同一 SQLite/CAS。匿名 backing 使用缓存路径最近的现存物理目录，仍受保存字节量、描述符和读取预算限制；该目录的文件系统须支持 `O_TMPFILE`。恢复发现仍可能初始化或更新 store，不能将它当作对任意源名称空间无写入的操作，原源树隔离限制继续生效。
+
 不另存记录 ID 时，可用 `for await (const { id, token } of manager.recover(retainBytes, { maxCandidates, signal }))` 发现同一源根的已有输入和纯计算。发现先取得有限候选快照，再逐条走相同恢复验证；调用方负责释放每个返回的 token。默认最多检查当前记录预算与 4096 的较小值，显式 `maxCandidates` 为 1–65536，其他源根和无效行也计入该扫描上限。新增记录留给下次扫描，损坏、过期或已清理的候选不阻止检查其他记录；取消与关闭会终结扫描，并释放尚未交付的租约。当前实现绑定与实际查询仍在消费时验证，恢复不授予旧调用的执行权限，也不把历史耗时当作恢复计算。
 
 同一输入记录也保存已登记、闭包完整的纯计算数据，目前接入逐文件 rg 匹配。使用 `capture(undefined, retainBytes)` 按需捕获，完成查询并调用 `token.view.seal()` 后再持久化；冷恢复重新核对输入和当前实现绑定，匹配成功值可跨进程消费。绑定覆盖实际加载代码、Node 版本、rg 二进制及环境和查询参数；临时目录仍由新 owner 重建。只保存属于同一输入记录的有界不可变 JSON 数据，单项编码最多 1 MiB，按编码长度的 64 倍加固定开销计入 `retainBytes`；超出保留预算的结果仍可供当次调用使用。任意回调、外部资源或不完整的跨根输入闭包不因此获得持久恢复能力。

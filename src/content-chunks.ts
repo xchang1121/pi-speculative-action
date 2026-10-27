@@ -36,7 +36,7 @@ export class ContentChunkPool {
 	}
 	lend() { return this.artifacts.lend(); }
 	async capture<T extends { readonly bytesRead: number; readonly hash: string }>(read: (sink: (chunk: Buffer) => Promise<void>) => Promise<T>): Promise<{ capture: T; content: ChunkedContent }> {
-		return this.lifetime.serialize(async () => {
+		return this.store.read(signal => this.lifetime.serialize(async () => {
 			const chunks: (ArtifactReference | null)[] = [], buffer = Buffer.allocUnsafe(CONTENT_CHUNK_BYTES);
 			let offset = 0, size = 0;
 			const flush = async () => {
@@ -44,12 +44,12 @@ export class ContentChunkPool {
 				if (bytes.equals((zeroChunk ??= Buffer.alloc(CONTENT_CHUNK_BYTES)).subarray(0, offset))) chunks.push(null);
 				else {
 					const reference = { digest: await sha256DigestAsync(bytes), size: bytes.length };
-					this.artifacts.checkBudget(reference);
-					await this.store.withPublication(async () => { await this.store.artifacts.put(bytes); await this.pin(reference); }); chunks.push(reference);
+					await this.artifacts.add(reference, signal, { reference, bytes }); chunks.push(reference);
 				}
 				offset = 0;
 			};
 			const capture = await read(async chunk => {
+				signal.throwIfAborted();
 				if (size + chunk.length > this.limits.maxLogicalBytes) throw new Error("content logical budget exceeded");
 				size += chunk.length;
 				for (let cursor = 0; cursor < chunk.length;) {
@@ -59,26 +59,28 @@ export class ContentChunkPool {
 				}
 			});
 			if (offset) await flush();
+			signal.throwIfAborted();
 			if (size !== capture.bytesRead) throw new Error("content capture size mismatch");
 			return { capture, content: new ChunkedContent(this, parseContentManifest({ size, digest: `sha256:${capture.hash}`, chunks })) };
-		});
+		}));
 	}
 	/** Reopen and verify every block and the complete digest before granting a cold input lease. */
 	restore(value: unknown, transfers?: readonly ArtifactTransfer[]): Promise<ChunkedContent> {
-		return this.lifetime.serialize(async () => {
+		return this.store.read(signal => this.lifetime.serialize(async () => {
 			const manifest = parseContentManifest(value);
 			if (manifest.size > this.limits.maxLogicalBytes) throw new Error("content logical budget exceeded");
-			if (transfers && !await this.artifacts.restore(manifest.chunks.filter(reference => reference !== null), transfers)) {
+			if (transfers && !await this.artifacts.restore(manifest.chunks.filter(reference => reference !== null), transfers, signal)) {
 				throw new Error("content transfer is unavailable");
 			}
 			const digest = createHash("sha256");
 			for (let index = 0; index < manifest.chunks.length; index++) {
-				const reference = manifest.chunks[index]; if (reference) await this.store.withPublication(() => this.pin(reference));
+				signal.throwIfAborted();
+				const reference = manifest.chunks[index]; if (reference && !this.artifacts.has(reference)) await this.store.withPublication(() => this.pin(reference));
 				digest.update(await this.block(manifest, index));
 			}
 			if (`sha256:${digest.digest("hex")}` !== manifest.digest) throw new Error("content manifest integrity check failed");
 			return new ChunkedContent(this, manifest);
-		});
+		}));
 	}
 	/** Renew roots under the caller's publication transaction, even after GC unlinked our pinned blocks. */
 	publish(manifest: ChunkedContentManifest, store = this.store): Promise<void> {

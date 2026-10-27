@@ -23,9 +23,9 @@ processTest.for([{ megabytes: 2, dense: false, label: "2 MiB" }, { megabytes: 60
 	const retainedFiles = async () => {
 		const files = await Promise.all((await filesystem.readdir("/proc/self/fd")).map(async fd => {
 			const target = `/proc/self/fd/${fd}`, name = await filesystem.readlink(target).catch(() => "");
-			if (!name.startsWith(fixture.root + "/") || !name.includes("/cas/#")) return;
+			if (!name.startsWith(fixture.root + "/") || !/\/#\d+ \(deleted\)$/.test(name)) return;
 			const info = await filesystem.stat(target).catch(() => undefined);
-			return info && { object: `${info.dev}:${info.ino}`, logical: info.size, physical: info.blocks * 512 };
+			return info?.isFile() && info.nlink === 0 ? { object: `${info.dev}:${info.ino}`, logical: info.size, physical: info.blocks * 512 } : undefined;
 		}));
 		return files.filter(file => file !== undefined);
 	};

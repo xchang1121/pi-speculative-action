@@ -9,7 +9,7 @@ import { setImmediate as watcherTurn } from "node:timers/promises";
 import { type ActionKey, type ActionSemanticsRegistry, PI_ACTION_SEMANTICS, type ResourceDependencyScope } from "./action-semantics.ts";
 import {
 	type StableFilesystemCapture, type FilesystemObjectHandle, type FilesystemReadView, openFilesystemReadView, withFilesystemReadView, cachedCapture, captureFilesystemEntry, captureStableFile,
-	FILESYSTEM_CONCURRENCY, mapFilesystem, sameFilesystemIdentity, walkFilesystemPath, filesystemEntryType, type FilesystemTypeEvidence, captureFilesystemDirectory, readFilesystemDirectory,
+	FILESYSTEM_CONCURRENCY, mapFilesystem, sameFilesystemIdentity, walkFilesystemPath, filesystemEntryType, type FilesystemTypeEvidence, captureFilesystemDirectory, readFilesystemDirectory, resolveFilesystemDestination,
 } from "./filesystem-evidence.ts";
 import { containsFilesystemPath, filesystemPathKey, relativeFilesystemPath } from "./path-utils.ts";
 import { RuntimeLifecycleLane, SharedAbortScope } from "./runtime-lifecycle.ts";
@@ -1019,12 +1019,7 @@ export class ResourceVersionManager {
 	private async assertPersistentStore(): Promise<void> {
 		if (!this.persistentInputs) return;
 		await withFilesystemReadView(undefined, async filesystem => {
-			const root = await filesystem.realpath(this.root), cache = this.persistentInputs!.store.root;
-			let ancestor = cache, resolved: string;
-			for (;;) {
-				try { resolved = path.resolve(await filesystem.realpath(ancestor), path.relative(ancestor, cache)); break; }
-				catch (error) { if (errorCode(error) !== "ENOENT" || ancestor === path.dirname(ancestor)) throw error; ancestor = path.dirname(ancestor); }
-			}
+			const root = await filesystem.realpath(this.root), { path: resolved } = await resolveFilesystemDestination(this.persistentInputs!.store.root, filesystem);
 			if (containsFilesystemPath(root, resolved) || containsFilesystemPath(resolved, root)) throw new Error("persistent input cache must be outside its source tree");
 		});
 	}
