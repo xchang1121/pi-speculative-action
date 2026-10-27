@@ -4,8 +4,12 @@ import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { access, realpath } from "node:fs/promises";
 import { constants } from "node:fs";
+import { AsyncLocalStorage } from "node:async_hooks";
 import os from "node:os";
 import path from "node:path";
+
+/** @type {AsyncLocalStorage<{skipRoot?: boolean, launch: (child: import('node:child_process').ChildProcess, start: () => number) => number, synchronous?: (start: () => unknown) => unknown}>} */
+export const startupScope = new AsyncLocalStorage();
 
 const requireNative = createRequire(import.meta.url), qualification = fileURLToPath(import.meta.url);
 /** @type {((fd: number, buffer?: Buffer, adopt?: (fd: number) => number) => number) | undefined} */

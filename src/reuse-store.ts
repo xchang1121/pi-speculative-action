@@ -3,7 +3,7 @@ import { readSync } from "node:fs";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { mkdir, open, readFile, readdir, rename, rm, stat, utimes, writeFile, type FileHandle } from "node:fs/promises";
 import path from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import { DatabaseSync, type SQLInputValue, type SQLOutputValue } from "node:sqlite";
 import { setTimeout as delay } from "node:timers/promises";
 import {
 	certificateReplayable, parseProcessCertificate, type ProcessProvenanceCertificate, type ProvenanceTaint,
@@ -17,12 +17,15 @@ import { isMissing as missing } from "./error-utils.ts";
 import { FilesystemObjectLease, mapFilesystem, openAnonymousFilesystemFile, openFilesystemFile, withFilesystemReadView, type FilesystemObjectTransfer } from "./filesystem-evidence.ts";
 import { RuntimeLifecycleLane, waitForCompletion } from "./runtime-lifecycle.ts";
 import { isSafeCount } from "./number-utils.ts";
+import { SQLiteReadOwner } from "./sqlite-read.ts";
 
 /** maxCertificates is the shared metadata-record limit, including persistent input versions. */
 export interface ProvenanceStoreLimits { readonly maxCertificates: number; readonly maxBytes: number; }
 
 export interface ProvenanceStoreOptions extends Partial<ProvenanceStoreLimits> {
 	readonly gcIntervalMs?: number; readonly orphanGraceMs?: number;
+	/** Independent of retention: over-budget stores must still be readable for collection. */
+	readonly maxReadBytes?: number;
 	/** Taints the publisher accepted: retention and stats keep what its lookups can still replay. */
 	readonly acceptedTaints?: readonly ProvenanceTaint[];
 }
@@ -241,13 +244,14 @@ export class ProvenanceCertificateStore {
 	private readonly gcIntervalMs: number;
 	private readonly orphanGraceMs: number;
 	private readonly acceptedTaints: readonly ProvenanceTaint[];
+	private readonly maxReadBytes: number;
 	private readonly lifecycle = new RuntimeLifecycleLane();
 	private readonly stopped = new AbortController();
 	private collection?: Promise<ProvenanceStoreGCResult>;
 	private maintenance?: NodeJS.Timeout;
 	private readonly publication = new AsyncLocalStorage<{ database: DatabaseSync; touched: Set<string>; active: boolean }>();
 	private control?: DatabaseSync;
-	private reader?: DatabaseSync;
+	private reader?: SQLiteReadOwner;
 
 	constructor(root: string, options: ProvenanceStoreOptions = {}) {
 		this.root = path.resolve(root); this.configure(options);
@@ -256,6 +260,7 @@ export class ProvenanceCertificateStore {
 		this.gcIntervalMs = nonNegativeNumber(options.gcIntervalMs, DEFAULT_GC_INTERVAL_MS);
 		this.orphanGraceMs = nonNegativeNumber(options.orphanGraceMs, DEFAULT_ORPHAN_GRACE_MS);
 		this.acceptedTaints = Object.freeze([...options.acceptedTaints ?? []]);
+		this.maxReadBytes = positiveInteger(options.maxReadBytes, DEFAULT_PROVENANCE_STORE_LIMITS.maxBytes);
 	}
 
 	get limits(): ProvenanceStoreLimits { return this.limitsValue; }
@@ -292,13 +297,11 @@ export class ProvenanceCertificateStore {
 		}, touched);
 	}
 
-	get(id: Sha256Digest, signal?: AbortSignal): Promise<ProcessProvenanceCertificate | undefined> {
+	async get(id: Sha256Digest, signal?: AbortSignal): Promise<ProcessProvenanceCertificate | undefined> {
 		digestHex(id);
-		return this.exclusive(async database => {
-			const value = database.prepare("SELECT value FROM certificates WHERE id = ?").get(id)?.value, certificate = decodeCertificate(value);
-			if (value !== undefined && certificate?.id !== id) throw new Error(`certificate integrity check failed for ${id}`);
-			return certificate;
-		}, [], false, signal);
+		const value = (await this.query("SELECT value FROM certificates WHERE id = ?", [id], true, signal))[0]?.value, certificate = decodeCertificate(value);
+		if (value !== undefined && certificate?.id !== id) throw new Error(`certificate integrity check failed for ${id}`);
+		return certificate;
 	}
 
 	/** Input metadata shares certificate publication, retention, and crash recovery; it grants no execution authority. */
@@ -313,18 +316,16 @@ export class ProvenanceCertificateStore {
 			database.prepare("INSERT OR REPLACE INTO input_versions VALUES (?, ?)").run(id, stableStringify(record)); return record;
 		}, [`input:${id}`, ...record.artifacts.map(reference => this.objectKey(this.artifacts.artifactPath(reference.digest)))]);
 	}
-	getInputVersion(id: Sha256Digest, signal?: AbortSignal): Promise<StoredInputVersion | undefined> {
+	async getInputVersion(id: Sha256Digest, signal?: AbortSignal): Promise<StoredInputVersion | undefined> {
 		digestHex(id);
-		return this.existing(async database => {
-			const value = database.prepare("SELECT value FROM input_versions WHERE id = ?").get(id)?.value, record = decodeInputVersion(value);
-			if (value !== undefined && record?.id !== id) throw new Error(`input version integrity check failed for ${id}`);
-			return record;
-		}, () => undefined, signal);
+		const value = (await this.query("SELECT value FROM input_versions WHERE id = ?", [id], false, signal))[0]?.value, record = decodeInputVersion(value);
+		if (value !== undefined && record?.id !== id) throw new Error(`input version integrity check failed for ${id}`);
+		return record;
 	}
 	/** Finite discovery hints, newest publication first; every row still needs current input and CAS validation. */
 	async *candidatesInputVersions(limit: number, signal?: AbortSignal): AsyncGenerator<StoredInputVersion> {
 		if (!Number.isSafeInteger(limit) || limit < 1 || limit > 65536) throw new Error("invalid input discovery limit");
-		const candidates = await this.existing(async database => database.prepare("SELECT id FROM input_versions ORDER BY rowid DESC LIMIT ?").all(limit), () => [], signal);
+		const candidates = await this.query("SELECT id FROM input_versions ORDER BY rowid DESC LIMIT ?", [limit], false, signal);
 		for (const { id } of candidates) {
 			signal?.throwIfAborted(); this.signal.throwIfAborted();
 			if (!isSha256Digest(id)) continue;
@@ -344,7 +345,7 @@ export class ProvenanceCertificateStore {
 
 	/** Indexes only select candidates; every yielded certificate still verifies its complete identity. */
 	async *candidatesByWeakKey(weakKey: Sha256Digest, executablePath: string, excludedCertificates?: ReadonlySet<Sha256Digest>, signal?: AbortSignal): AsyncGenerator<ProcessProvenanceCertificate> {
-		const candidates = await this.exclusive(async database => database.prepare("SELECT id FROM certificates WHERE weakKey = ? AND executable = ? ORDER BY createdAt DESC, id DESC").all(weakKey, executablePath), [], false, signal);
+		const candidates = await this.query("SELECT id FROM certificates WHERE weakKey = ? AND executable = ? ORDER BY createdAt DESC, id DESC", [weakKey, executablePath], true, signal);
 		for (const { id } of candidates) {
 			signal?.throwIfAborted();
 			if (!isSha256Digest(id) || excludedCertificates?.has(id)) continue;
@@ -355,7 +356,7 @@ export class ProvenanceCertificateStore {
 
 	/** An unavailable optional cache is a miss; live handoffs have their own availability check. */
 	async mayHaveCertificates(executablePath?: string, signal?: AbortSignal): Promise<boolean> {
-		try { return await this.exclusive(async database => Boolean(executablePath === undefined ? database.prepare("SELECT 1 FROM certificates LIMIT 1").get() : database.prepare("SELECT 1 FROM certificates WHERE executable = ? LIMIT 1").get(executablePath)), [], false, signal); }
+		try { return Boolean((await this.query(executablePath === undefined ? "SELECT 1 FROM certificates LIMIT 1" : "SELECT 1 FROM certificates WHERE executable = ? LIMIT 1", executablePath === undefined ? [] : [executablePath], true, signal)).length); }
 		catch { return false; }
 	}
 
@@ -371,7 +372,8 @@ export class ProvenanceCertificateStore {
 	gc(): Promise<ProvenanceStoreGCResult> {
 		// Later publications are marked in the shared transaction log, so this finite inventory never restarts.
 		return this.collection ??= this.publication.exit(() => this.lifecycle.admit(async () => {
-			const revision = await this.exclusive(async database => changeRevision(database), [], false); return this.collect(await this.inventory(), revision);
+			const revision = Number((await this.query("SELECT revision FROM changes WHERE path = ''", [], true))[0]?.revision ?? 0);
+			return this.collect(await this.inventory(), revision);
 		}).finally(() => { this.collection = undefined; }));
 	}
 
@@ -385,11 +387,12 @@ export class ProvenanceCertificateStore {
 	dispose(): Promise<void> {
 		this.stopped.abort(new Error("provenance store is closed"));
 		clearTimeout(this.maintenance); this.maintenance = undefined;
-		return this.lifecycle.close(async () => { await this.lifecycle.drain(); await this.artifacts.dispose(); this.closeDatabase(); });
+		return this.lifecycle.close(async () => { await this.lifecycle.drain(); await this.artifacts.dispose(); await this.closeDatabase(); });
 	}
-	private closeDatabase(): void {
+	private async closeDatabase(): Promise<void> {
 		clearTimeout(this.maintenance); this.maintenance = undefined;
-		this.reader?.close(); this.reader = undefined; this.control?.close(); this.control = undefined;
+		const reader = this.reader; this.reader = undefined;
+		await reader?.dispose(); this.control?.close(); this.control = undefined;
 	}
 	private maintain(): void {
 		if (!this.control || this.maintenance || this.lifecycle.sealed) return;
@@ -440,15 +443,16 @@ export class ProvenanceCertificateStore {
 	}
 
 	private async inventory(control?: DatabaseSync): Promise<StoreInventory> {
-		const read = (database: DatabaseSync): StoredRoot[] => (["certificate", "input"] as const).flatMap(kind =>
-			database.prepare(`SELECT id, value FROM ${kind === "certificate" ? "certificates" : "input_versions"}`).all().map(({ id, value }) => {
+		const read = (sql: string) => control ? Promise.resolve(control.prepare(sql).all()) : this.query(sql, [], true);
+		const records: StoredRoot[] = (await read("SELECT 'certificate' AS kind, id, value FROM certificates UNION ALL SELECT 'input', id, value FROM input_versions"))
+			.map(({ kind: storedKind, id, value }) => {
+				const kind = storedKind === "certificate" ? "certificate" : "input";
 				const record = kind === "certificate" ? decodeCertificate(value) : decodeInputVersion(value), valid = record?.id === id;
 				const references = !valid ? undefined : kind === "input" ? (record as StoredInputVersion).artifacts
 					: certificateReplayable(record as ProcessProvenanceCertificate, this.acceptedTaints) ? referencedArtifacts(record as ProcessProvenanceCertificate) : undefined;
 				return { key: `${kind}:${id}`, kind, bytes: Buffer.byteLength(String(value)), modifiedAt: 0, createdAt: record?.createdAt ?? 0, references };
-			}));
-		const metadata = (database: DatabaseSync) => ({ roots: read(database), keys: database.prepare("SELECT path FROM changes WHERE path NOT IN ('', '.clear')").all() });
-		const { roots: records, keys } = control ? metadata(control) : await this.exclusive(async database => metadata(database), [], false);
+			});
+		const keys = await read("SELECT path FROM changes WHERE path NOT IN ('', '.clear')");
 		const roots = await this.payloadRoots(), paths = (await mapFilesystem(roots, filesUnder)).flat(), artifacts = new Map<Sha256Digest, StoredFile>();
 		const objects: StoredFile[] = [...records, ...(await mapFilesystem(paths, async target => {
 			const value = await stat(target).catch(error => { if (!missing(error)) throw error; }), key = this.objectKey(target), match = /^cas\/sha256\/([0-9a-f]{2})\/([0-9a-f]{62})$/.exec(key);
@@ -465,29 +469,19 @@ export class ProvenanceCertificateStore {
 	}
 
 	private objectKey(target: string): string { return path.relative(this.root, target).split(path.sep).join("/"); }
-	/** Existing input records need neither schema migration nor publication ownership. WAL access still needs cache isolation. */
-	private existing<T>(operation: (database: DatabaseSync) => Promise<T>, absent: () => T, signal?: AbortSignal): Promise<T> {
+	/** Every committed read owns fresh SQLite state. Legacy migration remains an explicit writer operation. */
+	private query(sql: string, parameters: SQLInputValue[], migrate: boolean, signal?: AbortSignal): Promise<Record<string, SQLOutputValue>[]> {
 		return this.read(async signal => {
 			const publication = this.publication.getStore();
-			if (publication?.active) return operation(publication.database);
-			if (!this.reader) {
-				const target = path.join(this.root, "metadata.sqlite"); let database: DatabaseSync;
-				try { database = new DatabaseSync(target, { readOnly: true }); }
-				catch (error) {
-					if ((Number((error as { errcode?: number }).errcode) & 0xff) === 14 &&
-						!await stat(target).catch(cause => { if (!missing(cause)) throw cause; return undefined; })) {
-						signal.throwIfAborted(); return absent();
-					}
-					throw error;
-				}
-				try {
-					const version = Number(database.prepare("PRAGMA user_version").get()?.user_version);
-					if (version < 3) return absent();
-					if (version !== 3) throw new Error(`unsupported provenance store version ${version}`);
-					this.reader = database;
-				} finally { if (this.reader !== database) database.close(); }
+			if (publication?.active) return publication.database.prepare(sql).all(...parameters);
+			const reader = this.reader ??= new SQLiteReadOwner(this.root);
+			let rows = await reader.read(sql, parameters, this.maxReadBytes, signal);
+			if (rows === undefined && migrate) {
+				await this.exclusive(async () => {}, [], false, signal);
+				rows = await reader.read(sql, parameters, this.maxReadBytes, signal);
+				if (rows === undefined) throw new Error("provenance store metadata is unavailable");
 			}
-			signal.throwIfAborted(); return operation(this.reader);
+			signal.throwIfAborted(); return rows ?? [];
 		}, signal);
 	}
 	private async exclusive<T>(operation: (database: DatabaseSync) => Promise<T>, touched: readonly string[] = [], mutate = true, signal?: AbortSignal): Promise<T> {
@@ -497,8 +491,6 @@ export class ProvenanceCertificateStore {
 			for (const key of touched) publication.touched.add(key);
 			return value;
 		}
-		// WAL readers see committed history without waiting behind a producer that an Actor may need to join.
-		if (!mutate && this.control) return this.existing(operation, () => { throw new Error("provenance store metadata is unavailable"); }, signal);
 		const admission = AbortSignal.any([this.stopped.signal, AbortSignal.timeout(1_000), ...(signal ? [signal] : [])]);
 		let admitted = false;
 		const task = this.lifecycle.serialize(async () => {

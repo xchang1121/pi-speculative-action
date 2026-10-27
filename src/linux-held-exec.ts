@@ -2,7 +2,7 @@ import { isSafeCount } from "./number-utils.ts";
 import { isUtf8 } from "node:buffer";
 import { spawn, type ChildProcess } from "node:child_process";
 import { on, once } from "node:events";
-import { AsyncLocalStorage, AsyncResource } from "node:async_hooks";
+import { AsyncResource } from "node:async_hooks";
 import { createRequire } from "node:module";
 import { randomBytes } from "node:crypto";
 import { chmod, mkdir, open, readFile, readdir, readlink, rm, stat } from "node:fs/promises";
@@ -19,7 +19,7 @@ import {
 import { containsFilesystemPath } from "./path-utils.ts";
 import { snapshotExecutionScope, type ExecutionScope } from "./execution-world.ts";
 import { captureWorkspaceFileAliases } from "./process-observation.ts";
-import { qualifyNativeStartup, resolveLinuxExecHelper } from "./process-startup.mjs";
+import { qualifyNativeStartup, resolveLinuxExecHelper, startupScope } from "./process-startup.mjs";
 export { resolveLinuxExecHelper } from "./process-startup.mjs";
 
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024 + 32768;
@@ -27,11 +27,6 @@ const MAX_OUTPUT_EVENTS = 65_536;
 const MAX_OUTPUT_BYTES = 512 * 1024 * 1024;
 type NativeSpawn = (this: ChildProcess, options: object) => number;
 type NativeSyncSpawn = (this: unknown, options: object) => unknown;
-const startupScope = new AsyncLocalStorage<{
-	readonly skipRoot?: boolean;
-	readonly launch: (child: ChildProcess, start: () => number) => number;
-	readonly synchronous?: (start: () => unknown) => unknown;
-}>();
 const nativeRequire = createRequire(import.meta.url);
 const startupPrototype = nativeRequire("node:child_process").ChildProcess.prototype as { spawn: NativeSpawn };
 let startupUsers = 0, starting = false, restoreStartup: (() => void) | undefined;

@@ -14,6 +14,10 @@ import { qualifyNativeStartup } from "./process-startup.mjs";
 const SANDLOCK_REVISION = "f6a3e39b31afa80f66609c8af8ae5b2582f628e8";
 const SANDLOCK_REPOSITORY = "https://github.com/multikernel/sandlock.git";
 const SANDLOCK_PATCH = fileURLToPath(new URL("./sandlock-transparent-exec.patch", import.meta.url));
+const SQLITE_HEADERS = {
+	"sqlite3.h": "919e7f2e8ed1d8f56ac17b412b8971c76aa5d1a879752cc6058f75e7d5910e1d",
+	"sqlite3ext.h": "ac9645e5c9ff0cf176efdd6e75cb5e98f46295d38e02db5c4d208826a39ab4be",
+};
 const ARCHIVES = {
 	strace: {
 		target: "pi-speculative-strace", url: "https://strace.io/files/6.8/strace-6.8.tar.xz",
@@ -35,21 +39,24 @@ const localRoot = path.join(os.homedir(), ".local");
 const localBin = path.join(localRoot, "bin");
 const sandlock = path.join(localBin, "pi-speculative-sandlock");
 const heldExec = path.join(localBin, "pi-speculative-held-exec");
-await mkdir(localBin, { recursive: true });
-const helper = await optional("Native execution helper", installHeldExec);
-const held = helper && await optional("Actor child handoff", () => qualifyNativeStartup(heldExec));
-const tracing = helper && await optional("Running process handoff tracer", installStrace);
-const missing = await missingExecutables([...(tracing ? [] : ["strace"]), "git"]);
-let producer = false;
-if (!helper)
-	console.warn("Speculative Bash producer unavailable because its transparent exec boundary is unavailable.");
-else if (missing.length)
-	console.warn(`Speculative Bash producer unavailable (missing ${missing.join(", ")}); cached Actor replay remains usable.`);
-else producer = await optional("Speculative Bash producer", installSandlock);
-const overlay = await optional("OverlayFS workspace optimization", installFuseOverlayfs);
-console.log(
-	`Linux reuse setup complete: cached command replay ready; child handoff ${held ? "ready" : "unavailable"}; running process capture ${tracing ? "ready" : "unavailable"}; speculative producer ${producer ? "ready" : "unavailable"}; OverlayFS ${overlay ? "ready" : "unavailable"}.`,
-);
+if (process.argv[1] === fileURLToPath(import.meta.url)) await setup();
+async function setup() {
+	await mkdir(localBin, { recursive: true });
+	const helper = await optional("Native execution helper", installHeldExec);
+	const held = helper && await optional("Actor child handoff", () => qualifyNativeStartup(heldExec));
+	const tracing = helper && await optional("Running process handoff tracer", installStrace);
+	const missing = await missingExecutables([...(tracing ? [] : ["strace"]), "git"]);
+	let producer = false;
+	if (!helper)
+		console.warn("Speculative Bash producer unavailable because its transparent exec boundary is unavailable.");
+	else if (missing.length)
+		console.warn(`Speculative Bash producer unavailable (missing ${missing.join(", ")}); cached Actor replay remains usable.`);
+	else producer = await optional("Speculative Bash producer", installSandlock);
+	const overlay = await optional("OverlayFS workspace optimization", installFuseOverlayfs);
+	console.log(
+		`Linux reuse setup complete: cached command replay ready; child handoff ${held ? "ready" : "unavailable"}; running process capture ${tracing ? "ready" : "unavailable"}; speculative producer ${producer ? "ready" : "unavailable"}; OverlayFS ${overlay ? "ready" : "unavailable"}.`,
+	);
+}
 
 async function installSandlock() {
 	return installNative(sandlock, sha256(SANDLOCK_REVISION, await readFile(SANDLOCK_PATCH)), qualifySandlock, async (buildRoot, temporary) => {
@@ -110,19 +117,24 @@ async function qualifySandlock(binary) {
 	}
 }
 
-async function installHeldExec() {
+export async function installHeldExec(target = heldExec) {
 	const source = fileURLToPath(new URL("./linux-held-exec.c", import.meta.url));
-	return installNative(heldExec, sha256("static-pthread+shared-image+native-startup+authority-observer", await readFile(source)), qualifyHeldExec, async (_root, temporary) => {
+	const sqlite = fileURLToPath(new URL("./sqlite-read-vfs.c", import.meta.url));
+	return installNative(target, sha256("static-pthread+shared-image+native-startup+authority-observer+sqlite-read", JSON.stringify(SQLITE_HEADERS), await readFile(source), await readFile(sqlite)), qualifyHeldExec, async (root, temporary) => {
 		const compiler = await executable(["cc", "gcc", "clang"]);
 		for (const [suffix, flags] of [["", ["-static"]], [".observer", ["-static", "-DPI_SPEC_AUTHORITY_ONLY=1"]], [".so", ["-shared", "-fPIC"]]])
 			await run(compiler, [...flags, "-pthread", "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", source, "-o", temporary + suffix]);
 		await copyFile(`${temporary}.so`, `${temporary}.node`, fsConstants.COPYFILE_EXCL);
-	}, [".so", ".node", ".observer", ""]);
+		for (const [name, digest] of Object.entries(SQLITE_HEADERS))
+			await writeFile(path.join(root, name), await downloadPinned(`https://raw.githubusercontent.com/nodejs/node/v24.20.0/deps/sqlite/${name}`, digest));
+		await run(compiler, ["-shared", "-fPIC", "-pthread", "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-I", root, sqlite, "-o", `${temporary}.sqlite`]);
+	}, [".so", ".node", ".sqlite", ".observer", ""]);
 }
 
 async function qualifyHeldExec(binary) {
 	await run(binary, ["--exec", "21", "pi-exec-probe", binary, "--probe-clean-fds"]);
 	await qualifyNativeStartup(binary, { observer: `${binary}.observer`, confined: true });
+	await run(process.execPath, ["--input-type=module", "-e", "import{DatabaseSync}from'node:sqlite';const db=new DatabaseSync(':memory:',{allowExtension:true});try{db.loadExtension(process.argv[1]);db.prepare('SELECT sqlite_version()').get()}finally{db.close()}", `${binary}.sqlite`]);
 }
 
 async function installStrace() {

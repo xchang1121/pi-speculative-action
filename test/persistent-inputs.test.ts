@@ -7,6 +7,7 @@ import * as filesystem from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { DatabaseSync } from "node:sqlite";
 import type { ArtifactReference } from "../src/artifact-reference.ts";
 import type { Sha256Digest } from "../src/stable-value-hash.ts";
 import { ContentChunkPool, CONTENT_CHUNK_BYTES, captureContent } from "../src/content-chunks.ts";
@@ -122,6 +123,45 @@ linux("discovers a finite set of current input closures and releases undispatche
 		storeMetadata(f.cache, database => database.exec("PRAGMA user_version=2"));
 		const original = await f.manager.capture([{ path: file, scope: "content" }], memoryBudget); f.tokens.push(original);
 		let id = await f.manager.persist(original); const record = (await f.store.getInputVersion(id))!;
+		// One store can be both a publisher and a reader. Its SQLite SHM must not
+		// be borrowed by internal reads, even when all new descriptors are read-only.
+		const state = async () => {
+			const paths = [f.cache, ...["", "-wal", "-shm", "-journal"].map(suffix => path.join(f.cache, "metadata.sqlite" + suffix))];
+			const fields = await Promise.all(paths.map(async target => {
+				try { return (await metadata([target]))[0]; } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; return null; }
+			}));
+			// Closing an ordinary source FD in this process would release SQLite's POSIX locks.
+			const { stdout } = await promisify(execFile)(process.execPath, ["--input-type=module", "-e", `
+				import { openSync, readFileSync, closeSync, constants } from 'node:fs'; import { createHash } from 'node:crypto';
+				console.log(JSON.stringify(process.argv.slice(1).map(target => { let fd;
+					try { fd = openSync(target, constants.O_RDONLY | constants.O_NOATIME); return createHash('sha256').update(readFileSync(fd)).digest('hex'); }
+					catch (error) { if (error.code !== 'ENOENT') throw error; return null; } finally { if (fd !== undefined) closeSync(fd); }
+				})));`, ...paths.slice(1)]);
+			return { fields, bytes: JSON.parse(stdout) as (string | null)[] };
+		};
+		for (const phase of ["cold", "warm", "transaction", "stale-reader"] as const) {
+			const pause = gated(); let held: Promise<void> | undefined, old: DatabaseSync | undefined;
+			try {
+				if (phase === "cold") await f.store.drain();
+				else if (phase === "warm") await f.store.withPublication(async () => {});
+				else if (phase === "transaction") {
+					held = f.store.withPublication(async () => {
+						await f.store.putInputVersion({ uncommitted: "x".repeat(180000) }, []); await pause.wait(); throw new Error("read fixture rollback");
+					}); void held.catch(() => {}); await pause.entered;
+				} else {
+					old = new DatabaseSync(path.join(f.cache, "metadata.sqlite")); old.exec("BEGIN");
+					old.prepare("SELECT revision FROM changes WHERE path = ''").get();
+					await f.store.putInputVersion({ isolationProbe: true }, []);
+				}
+				for (const target of [f.cache, ...["", "-wal", "-shm"].map(suffix => path.join(f.cache, "metadata.sqlite" + suffix))])
+					await utimes(target, 915148800, 946684800).catch(error => { if (error.code !== "ENOENT") throw error; });
+				const before = await state(), restored = await f.manager.restore(id, memoryBudget); f.tokens.push(restored!);
+				expect((await restored!.view!.readFile(file)).toString()).toBe("discoverable input");
+				for await (const value of f.store.candidatesInputVersions(8)) expect(value.payload).not.toHaveProperty("uncommitted");
+				expect(await state(), phase).toEqual(before);
+			} finally { pause.release(); await held?.catch(error => { expect(error.message).toBe("read fixture rollback"); }); old?.close(); }
+		}
+		await f.store.clear(); id = await f.manager.persist(original);
 		const revision = () => storeMetadata(f.cache, database => database.prepare("SELECT revision FROM changes WHERE path = ''").get()!.revision);
 		const beforeRevision = revision(); await f.store.drain();
 		const publisher = storePeer(f.cache);

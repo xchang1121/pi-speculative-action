@@ -40,6 +40,7 @@
 #include <sys/mman.h>
 #include <sys/signalfd.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <sys/ptrace.h>
@@ -150,6 +151,75 @@ static int readonly_root(void) {
 	return descriptor;
 }
 
+/* Only the isolated database reader calls this operation. Opening/closing a
+ * database outside SQLite must never cancel the host process's POSIX locks. */
+static int snapshot_database(int directory, uint64_t maximum) {
+	int source = -1, snapshot = -1, error = 0, masked = 0, leased = 0;
+	struct stat info, named;
+	struct statvfs mount;
+	sigset_t signals, previous;
+	sigemptyset(&signals); sigaddset(&signals, SIGIO);
+	source = openat(directory, "metadata.sqlite", O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
+	if (source < 0) return -1;
+	if (fstat(source, &info) || fstatvfs(source, &mount)) goto fail;
+	if (!S_ISREG(info.st_mode) || info.st_uid != getuid()) { errno = EPERM; goto fail; }
+	if (!(mount.f_flag & ST_RDONLY)) { errno = EROFS; goto fail; }
+	struct statfs filesystem;
+	if (fstatfs(source, &filesystem)) goto fail;
+	if (filesystem.f_type != EXT4_SUPER_MAGIC) { errno = EXDEV; goto fail; }
+	error = pthread_sigmask(SIG_BLOCK, &signals, &previous);
+	if (error) goto done;
+	masked = 1;
+	struct f_owner_ex owner = {.type = F_OWNER_TID, .pid = (pid_t)syscall(SYS_gettid)};
+	if (fcntl(source, F_SETOWN_EX, &owner) || fcntl(source, F_SETLEASE, F_RDLCK)) goto fail;
+	leased = 1;
+	if (fstat(source, &info) || fstatat(directory, "metadata.sqlite", &named, AT_SYMLINK_NOFOLLOW)) goto fail;
+	if (info.st_dev != named.st_dev || info.st_ino != named.st_ino) { errno = ESTALE; goto fail; }
+	const char *auxiliary[] = {"metadata.sqlite-wal", "metadata.sqlite-journal"};
+	for (unsigned index = 0; index < 2; index++) {
+		if (!fstatat(directory, auxiliary[index], &named, AT_SYMLINK_NOFOLLOW)) { errno = EBUSY; goto fail; }
+		if (errno != ENOENT) goto fail;
+	}
+	if (info.st_size < 0 || (uint64_t)info.st_size > maximum) { errno = EFBIG; goto fail; }
+	snapshot = memfd_create("pi-sqlite-read-snapshot", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+	if (snapshot < 0) goto fail;
+	char buffer[65536]; off_t offset = 0;
+	while (offset < info.st_size) {
+		if (fcntl(source, F_GETLEASE) != F_RDLCK) { errno = EAGAIN; goto fail; }
+		size_t amount = (uint64_t)(info.st_size - offset) < sizeof(buffer) ? (size_t)(info.st_size - offset) : sizeof(buffer);
+		ssize_t count = pread(source, buffer, amount, offset);
+		if (count < 0) { if (errno == EINTR) continue; goto fail; }
+		if (!count) { errno = EIO; goto fail; }
+		for (ssize_t written = 0; written < count;) {
+			ssize_t next = write(snapshot, buffer + written, (size_t)(count - written));
+			if (next < 0) { if (errno == EINTR) continue; goto fail; }
+			if (!next) { errno = EIO; goto fail; }
+			written += next;
+		}
+		offset += count;
+	}
+	if (fstatat(directory, "metadata.sqlite", &named, AT_SYMLINK_NOFOLLOW)) goto fail;
+	if (info.st_dev != named.st_dev || info.st_ino != named.st_ino) { errno = ESTALE; goto fail; }
+	if (fcntl(source, F_GETLEASE) != F_RDLCK) { errno = EAGAIN; goto fail; }
+	if (fcntl(snapshot, F_ADD_SEALS, F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL)) goto fail;
+	goto done;
+fail:
+	error = errno;
+done:
+	if (leased && fcntl(source, F_SETLEASE, F_UNLCK) && !error) error = errno;
+	close(source);
+	if (masked) {
+		/* Lease removal serializes with break notification. Consume it before
+		 * restoring the original mask; no SIGIO handler is installed in Node. */
+		struct timespec now = {0};
+		while (sigtimedwait(&signals, NULL, &now) >= 0 || errno == EINTR) {}
+		int restored = pthread_sigmask(SIG_SETMASK, &previous, NULL);
+		if (!error) error = restored;
+	}
+	if (error) { if (snapshot >= 0) close(snapshot); errno = error; return -1; }
+	return snapshot;
+}
+
 /* Open a gate (0), bind its observer PID (>0), or release the parent ends (-1).
  * Thread-local state cannot lend one worker's launch to another callback. */
 static napi_value startup_bridge(napi_env env, napi_callback_info info) {
@@ -182,6 +252,11 @@ static napi_value startup_bridge(napi_env env, napi_callback_info info) {
 					.resolve = RESOLVE_IN_ROOT | RESOLVE_NO_XDEV};
 				value = syscall(SYS_openat2, (int32_t)le32toh(fields[0]), (char *)bytes + 8, &how, sizeof(how));
 			}
+		} else if (operation == -12) {
+			uint32_t directory; uint64_t maximum;
+			if (length != 12) return NULL;
+			memcpy(&directory, bytes, 4); memcpy(&maximum, (char *)bytes + 4, 8);
+			value = snapshot_database((int32_t)le32toh(directory), le64toh(maximum));
 		} else if (operation == -7) {
 			uint32_t fd; if (length < 5) return NULL; memcpy(&fd, bytes, sizeof(fd));
 			struct stat entry;
@@ -193,7 +268,7 @@ static napi_value startup_bridge(napi_env env, napi_callback_info info) {
 			if (length < 24) return NULL;
 			value = syscall(SYS_getdents64, operation, bytes, length);
 		}
-		if (value >= 0 && (operation == -5 || operation == -6)) {
+		if (value >= 0 && (operation == -5 || operation == -6 || operation == -12)) {
 			/* Native ownership never crosses this synchronous call. Node tracks the adopted
 			 * duplicate even if its worker terminates while the JavaScript callback runs. */
 			napi_value fd, receiver;
