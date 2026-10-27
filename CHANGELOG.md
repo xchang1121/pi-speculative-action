@@ -2,6 +2,7 @@
 
 ## 当前版本
 
+- 纳入固定上游源码构建的 `0.84.1-speculative.1` 配套 SDK，提供运行接纳、原工具批次恢复、最终消息结算与可等待关闭的公开接缝。九个包、源码补丁、摘要和重建脚本随仓库交付；恢复进入工具管线时重绑同一 Host。已验证的 SDK 协议不等于扩展默认具备通用持久检查点恢复。
 - 收紧模块边界：通用哈希、文件系统证据和异步等待回归各自基础模块；原生线程通信与业务组合分离，解除工作区和进程代理的运行时循环依赖。预测预设与 Drafter 不再引用 PatternAware 的完整实现类型，宿主配置明确声明模型服务。`core` 的 `ToolOperation` 不再暴露 Pi 调用绑定；绑定由 Host 的执行回调提供，核心类型检查不再加载 Pi SDK。
 - `SpeculativeCandidate` 的耗时字段由 `work.execution.executionMs` 改为直接的 `executionMs`；`candidateExecutionMs(candidate)` 调用方式不变。删除宿主选项中被内部接线覆盖、从未生效的 `patternHints`。
 - 删除 Runtime 聚合调试快照及其内部遍历链；宿主的五个转发回调统一改用 `runtime.subscribe()`。移除闲置的 PatternAware 旧包装接口、read 范围覆盖标记和跨会话全局资源关闭入口。远程 Actor 推测协议与 ThinkThread 集成保持可用。

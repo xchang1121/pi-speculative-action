@@ -37,6 +37,9 @@ export class PendingTasks {
 	}
 }
 
+/** An opaque token accepted only by its issuing lane while the held operation is active. */
+export type LifecycleSettlement = object;
+
 /**
  * Serializes lifecycle mutations for one reusable runtime session.
  *
@@ -48,6 +51,8 @@ export class RuntimeLifecycleLane extends PendingTasks {
 	private tail: Promise<void> = Promise.resolve();
 	private closeTask?: Promise<void>;
 	private readonly released = new WeakMap<object, Promise<void>>();
+	private settlements?: PendingTasks;
+	private readonly activeSettlements = new WeakSet<LifecycleSettlement>();
 
 	get sealed(): boolean {
 		return this.closeTask !== undefined;
@@ -58,10 +63,20 @@ export class RuntimeLifecycleLane extends PendingTasks {
 	}
 
 	close(operation: () => void | Promise<void>): Promise<void> {
-		this.closeTask ??= this.enqueue(async () => {
+		const finish = async () => {
 			try { await operation(); } finally { await this.drain(); }
-		});
+		};
+		this.closeTask ??= this.settlements ? this.settlements.drain().then(() => this.enqueue(finish)) : this.enqueue(finish);
 		return this.closeTask;
+	}
+
+	/** A claimed effect may settle through the existing queue before final teardown. */
+	hold<Value>(operation: (settlement: LifecycleSettlement) => Promise<Value>): Promise<Value> {
+		const settlement = Object.freeze({});
+		return (this.settlements ??= new PendingTasks()).track(this.admit(async () => {
+			this.activeSettlements.add(settlement);
+			try { return await operation(settlement); } finally { this.activeSettlements.delete(settlement); }
+		}));
 	}
 
 	/** New borrowers require an open owner; tracked continuations may still drain after sealing. */
@@ -71,8 +86,9 @@ export class RuntimeLifecycleLane extends PendingTasks {
 	}
 
 	/** Fresh proofs run in order; closing waits for proofs already admitted to this lane. */
-	serialize<Value>(operation: () => Value | Promise<Value>): Promise<Value> {
-		if (this.sealed) return Promise.reject(new Error("execution lifetime is closed"));
+	serialize<Value>(operation: () => Value | Promise<Value>, settlement?: LifecycleSettlement): Promise<Value> {
+		if (settlement !== undefined ? !this.activeSettlements.has(settlement) : this.sealed)
+			return Promise.reject(new Error(settlement !== undefined ? "execution settlement is closed or belongs to another lifetime" : "execution lifetime is closed"));
 		return this.track(this.enqueue(operation));
 	}
 

@@ -4,6 +4,7 @@ coverage/
 .artifacts/
 *.log
 *.tgz
+!/vendor/pi-sdk/*.tgz
 *.tsbuildinfo
 /bench/results/
 .env

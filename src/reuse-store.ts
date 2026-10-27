@@ -15,7 +15,7 @@ import { stableStringify } from "./stable-json.ts";
 import { nonNegativeNumber, positiveInteger } from "./setting-input.ts";
 import { isMissing as missing } from "./error-utils.ts";
 import { FilesystemObjectLease, mapFilesystem, openAnonymousFilesystemFile, type FilesystemObjectTransfer } from "./filesystem-evidence.ts";
-import { RuntimeLifecycleLane, waitForCompletion } from "./runtime-lifecycle.ts";
+import { RuntimeLifecycleLane, waitForCompletion, type LifecycleSettlement } from "./runtime-lifecycle.ts";
 import { isSafeCount } from "./number-utils.ts";
 
 /** maxCertificates is the shared metadata-record limit, including persistent input versions. */
@@ -446,7 +446,8 @@ export class ProvenanceCertificateStore {
 	}
 
 	private objectKey(target: string): string { return path.relative(this.root, target).split(path.sep).join("/"); }
-	private async exclusive<T>(operation: (database: DatabaseSync) => Promise<T>, touched: readonly string[] = [], mutate = true, signal?: AbortSignal): Promise<T> {
+	private async exclusive<T>(operation: (database: DatabaseSync) => Promise<T>, touched: readonly string[] = [], mutate = true, signal?: AbortSignal,
+		settlement?: LifecycleSettlement): Promise<T> {
 		const publication = this.publication.getStore();
 		if (publication?.active) {
 			const value = await operation(publication.database);
@@ -455,7 +456,7 @@ export class ProvenanceCertificateStore {
 		}
 		// WAL readers see committed history without waiting behind a producer that an Actor may need to join.
 		if (!mutate && this.control) return this.read(() => operation(this.reader ??= new DatabaseSync(path.join(this.root, "metadata.sqlite"), { readOnly: true })), signal);
-		const admission = AbortSignal.any([this.stopped.signal, AbortSignal.timeout(1_000), ...(signal ? [signal] : [])]);
+		const admission = AbortSignal.any([...(settlement ? [] : [this.stopped.signal]), AbortSignal.timeout(1_000), ...(signal ? [signal] : [])]);
 		let admitted = false;
 		const task = this.lifecycle.serialize(async () => {
 			admission.throwIfAborted(); const database = this.control ??= await this.open(admission);
@@ -471,7 +472,7 @@ export class ProvenanceCertificateStore {
 				database.exec("COMMIT"); return value;
 			} catch (error) { if (database.isTransaction) database.exec("ROLLBACK"); throw error; }
 			finally { publication.active = false; }
-		});
+		}, settlement);
 		const result = await waitForCompletion(task, admission);
 		if (result.status !== "completed") { if (admitted) return task; throw admission.reason; }
 		return result.value;
