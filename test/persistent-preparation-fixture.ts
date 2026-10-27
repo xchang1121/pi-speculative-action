@@ -13,6 +13,7 @@ const store = new ProvenanceCertificateStore(cache, { orphanGraceMs: 0 });
 const manager = new ResourceVersionManager(root, { watch: false, persistentInputs: { store } });
 const profile = await createClosedSearchProfile(root), invocation = profile.invocations.get("grep");
 let token: ResourceVersionToken | undefined, matches = 0, materializations = 0, nativeMatches = 0;
+let selected = saved;
 const spawn = childProcess.spawn;
 childProcess.spawn = ((...args: Parameters<typeof spawn>) => {
   if (Array.isArray(args[1]) && args[1].includes("--json")) nativeMatches++;
@@ -21,7 +22,9 @@ childProcess.spawn = ((...args: Parameters<typeof spawn>) => {
 syncBuiltinESMExports();
 try {
   assert.ok(invocation, "qualified native grep is required for this contract");
-  token = mode === "produce" ? await manager.capture(undefined, 8 * 1024 * 1024) : await manager.restore(saved, 8 * 1024 * 1024);
+  if (mode === "discover") {
+    for await (const recovered of manager.recover(8 * 1024 * 1024)) { token = recovered.token; selected = recovered.id; break; }
+  } else token = mode === "produce" ? await manager.capture(undefined, 8 * 1024 * 1024) : await manager.restore(saved, 8 * 1024 * 1024);
   if (!token) console.log(JSON.stringify({ pid: process.pid, restored: false, matches, nativeMatches }));
   else {
     const file = path.join(root, "input");
@@ -55,7 +58,7 @@ try {
       await assert.rejects(() => view.readFile(file), /disposed/);
       resume.resolve(); await assert.rejects(() => reading, /disposed/); await closing;
     } else { query = { pattern: "two", path: file, limit: 20, ignoreCase: false, literal: false }; output = await execute(); view.seal(); }
-    const id = mode === "produce" || mode === "clear" ? await manager.persist(token) : saved;
+    const id = mode === "produce" || mode === "clear" ? await manager.persist(token) : selected;
     const record = await store.getInputVersion(id), prepared = (record?.payload as { preparations?: readonly unknown[] } | undefined)?.preparations?.length ?? 0;
     console.log(JSON.stringify({ pid: process.pid, restored: mode !== "produce", id, prepared, matches, materializations, nativeMatches, output, variants,
       released: mode === "release", expired: (await manager.validate(token)).expired, watching: token.watching }));

@@ -16,7 +16,7 @@ import { TimelineInterval } from "../src/task-timing.ts";
 import { ProvenanceCertificateStore } from "../src/reuse-store.ts";
 import { waitForCompletion } from "../src/runtime-lifecycle.ts";
 import { gated } from "./async.ts";
-import { storePeer } from "./process-fixture.ts";
+import { storeMetadata, storePeer } from "./process-fixture.ts";
 
 vi.mock("node:fs/promises", { spy: true });
 afterEach(() => vi.restoreAllMocks());
@@ -48,6 +48,9 @@ linux("recovers a pure search computation under a fresh native binding", { timeo
 		const restored = await run("restore", captured.id);
 		expect(restored.pid).not.toBe(captured.pid); expect(restored.output).toEqual(captured.output);
 		expect(restored, JSON.stringify({ captured, restored })).toMatchObject({ restored: true, prepared: 1, matches: 0, nativeMatches: 0, materializations: 1, expired: false, watching: false });
+		const discovered = await run("discover");
+		expect(discovered.pid).not.toBe(captured.pid); expect(discovered.output).toEqual(captured.output);
+		expect(discovered).toMatchObject({ id: captured.id, restored: true, prepared: 1, matches: 0, nativeMatches: 0, materializations: 1, expired: false, watching: false });
 		const variants = await run("variants", captured.id);
 		expect(variants.variants.map((item: { matches: number; nativeMatches: number }) => [item.matches, item.nativeMatches])).toEqual([[0, 0], [1, 1], [1, 1], [1, 1]]);
 		expect(variants.variants[0].output).not.toEqual(captured.output); expect(variants.variants[1].output).not.toEqual(captured.output);
@@ -58,6 +61,47 @@ linux("recovers a pure search computation under a fresh native binding", { timeo
 			if (mode === "clear") { expect(next.prepared).toBe(1); captured.id = next.id; }
 		}
 		expect(await metadata([f.root, file])).toEqual(before);
+	} finally { await f.close(); }
+});
+
+linux("discovers a finite set of current input closures and releases undispatched leases on cancellation or close", async () => {
+	const f = await fixture(), file = path.join(f.root, "input");
+	try {
+		await writeFile(file, "discoverable input");
+		const original = await f.manager.capture([{ path: file, scope: "content" }], memoryBudget); f.tokens.push(original);
+		const id = await f.manager.persist(original), record = (await f.store.getInputVersion(id))!;
+		const payload = record.payload as Record<string, unknown>;
+		await f.store.putInputVersion({ ...payload, root: path.dirname(f.root) }, record.artifacts);
+		await f.store.putInputVersion({ ...payload, observations: [] }, record.artifacts);
+		const corrupt = await f.store.putInputVersion({ ...payload, corrupt: true }, record.artifacts);
+		storeMetadata(f.cache, database => database.prepare("UPDATE input_versions SET value = '{' WHERE id = ?").run(corrupt.id));
+		await expect(f.store.getInputVersion(corrupt.id)).rejects.toThrow(/integrity/);
+		await expect(f.manager.recover(memoryBudget, { maxCandidates: 1 }).next()).resolves.toMatchObject({ done: true });
+		for (const maxCandidates of [0, -1, 1.5, 65537]) await expect(f.manager.recover(memoryBudget, { maxCandidates }).next()).rejects.toThrow(/limit/);
+		const iterator = f.manager.recover(memoryBudget), first = await iterator.next();
+		expect(first.done).toBe(false); expect(first.value!.id).toBe(id);
+		const recovered = first.value!.token; f.tokens.push(recovered);
+		expect((await recovered.view!.readFile(file)).toString()).toBe("discoverable input");
+		await f.store.putInputVersion({ ...payload, later: true }, record.artifacts);
+		await expect(iterator.next()).resolves.toMatchObject({ done: true });
+		const recovery = f.manager.restore.bind(f.manager);
+		for (const mode of ["cancel", "close"] as const) {
+			const entered = Promise.withResolvers<void>(), resume = Promise.withResolvers<void>(), controller = new AbortController();
+			let pendingToken: ResourceVersionToken | undefined;
+			const spy = vi.spyOn(f.manager, "restore").mockImplementationOnce(async (...args) => {
+				pendingToken = await recovery(...args); entered.resolve(); await resume.promise; return pendingToken;
+			});
+			const pending = f.manager.recover(memoryBudget, { signal: controller.signal }).next();
+			try {
+				await entered.promise;
+				if (mode === "cancel") controller.abort(); else f.manager.close();
+				resume.resolve();
+				await expect(pending).rejects.toThrow(mode === "cancel" ? /abort/i : /owner changed/);
+				expect(pendingToken).toBeDefined(); await expect(pendingToken!.view!.readFile(file)).rejects.toThrow(/disposed/);
+			} finally { resume.resolve(); await pending.catch(() => undefined); spy.mockRestore(); }
+		}
+		await f.store.clear();
+		expect((await recovered.view!.readFile(file)).toString()).toBe("discoverable input");
 	} finally { await f.close(); }
 });
 
@@ -148,6 +192,7 @@ linux("keeps active content across clear, republishes its roots, and rejects sta
 		expect((await restored!.view!.readFile(file)).toString()).toBe("original content");
 		await writeFile(file, "changed contents");
 		expect((await f.manager.validate(restored!)).expired).toBe(true); expect(await f.manager.restore(second, memoryBudget)).toBeUndefined();
+		await expect(f.manager.recover(memoryBudget).next()).resolves.toMatchObject({ done: true });
 		expect((await restored!.view!.readFile(file)).toString()).toBe("original content");
 		await writeFile(file, "original content");
 		const record = (await f.store.getInputVersion(second))!, target = f.store.artifacts.artifactPath(record.artifacts[0]!.digest);
@@ -308,7 +353,10 @@ linux("rejects source-overlapping caches and each exhausted input budget without
 			try { await expect(manager.capture([{ path: file, scope: "content" }], memoryBudget)).rejects.toThrow(/too_large|budget/); } finally { manager.close(); }
 		}
 		const cache = new ProvenanceCertificateStore(path.join(f.root, "cache")), manager = new ResourceVersionManager(f.root, { persistentInputs: { store: cache } });
-		try { await expect(manager.capture([{ path: file, scope: "content" }], memoryBudget)).rejects.toThrow(/outside its source/); }
+		try {
+			await expect(manager.capture([{ path: file, scope: "content" }], memoryBudget)).rejects.toThrow(/outside its source/);
+			await expect(manager.recover(memoryBudget).next()).rejects.toThrow(/outside its source/);
+		}
 		finally { manager.close(); await cache.dispose(); }
 		await expect(lstat(path.join(f.root, "cache"))).rejects.toMatchObject({ code: "ENOENT" });
 		const pool = new ContentChunkPool(f.store); await pool.dispose();

@@ -977,6 +977,31 @@ export class ResourceVersionManager {
 		});
 	}
 
+	/** Discover existing input closures without a separate ID index. The caller owns every yielded token. */
+	async *recover(retainBytes: number, options: { readonly maxCandidates?: number; readonly signal?: AbortSignal } = {}):
+		AsyncGenerator<{ readonly id: Sha256Digest; readonly token: ResourceVersionToken }> {
+		if (!this.open || !this.persistentInputs || this.snapshotExcludes.size) throw new Error("persistent input owner changed");
+		if (!Number.isFinite(retainBytes) || retainBytes < 0) throw new Error("resource_snapshot_budget_invalid");
+		const { store } = this.persistentInputs, { signal } = options;
+		signal?.throwIfAborted(); await this.assertPersistentStore();
+		for await (const record of store.candidatesInputVersions(options.maxCandidates ?? Math.min(store.limits.maxCertificates, 4096), signal)) {
+			signal?.throwIfAborted(); store.signal.throwIfAborted();
+			if (!this.open) throw new Error("persistent input owner changed");
+			if ((record.payload as Partial<PersistentResourcePayload> | null)?.root !== this.root) continue;
+			let token: ResourceVersionToken | undefined;
+			try {
+				token = await this.restore(record.id, retainBytes);
+				signal?.throwIfAborted(); store.signal.throwIfAborted();
+				if (!this.open) throw new Error("persistent input owner changed");
+			} catch (error) {
+				await token?.release(); signal?.throwIfAborted(); store.signal.throwIfAborted();
+				if (!this.open) throw error;
+				continue; // An unavailable cache record cannot hide another independently valid input closure.
+			}
+			if (token) yield Object.freeze({ id: record.id, token });
+		}
+	}
+
 	/** Resolve existing ancestors before creating the cache: persistent capture must not write into its source. */
 	private async assertPersistentStore(): Promise<void> {
 		if (!this.persistentInputs) return;

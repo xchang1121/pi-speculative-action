@@ -308,13 +308,27 @@ export class ProvenanceCertificateStore {
 			database.prepare("INSERT OR REPLACE INTO input_versions VALUES (?, ?)").run(id, stableStringify(record)); return record;
 		}, [`input:${id}`, ...record.artifacts.map(reference => this.objectKey(this.artifacts.artifactPath(reference.digest)))]);
 	}
-	getInputVersion(id: Sha256Digest): Promise<StoredInputVersion | undefined> {
+	getInputVersion(id: Sha256Digest, signal?: AbortSignal): Promise<StoredInputVersion | undefined> {
 		digestHex(id);
 		return this.exclusive(async database => {
 			const value = database.prepare("SELECT value FROM input_versions WHERE id = ?").get(id)?.value, record = decodeInputVersion(value);
 			if (value !== undefined && record?.id !== id) throw new Error(`input version integrity check failed for ${id}`);
 			return record;
-		}, [], false);
+		}, [], false, signal);
+	}
+	/** Finite discovery hints, newest publication first; every row still needs current input and CAS validation. */
+	async *candidatesInputVersions(limit: number, signal?: AbortSignal): AsyncGenerator<StoredInputVersion> {
+		if (!Number.isSafeInteger(limit) || limit < 1 || limit > 65536) throw new Error("invalid input discovery limit");
+		const candidates = await this.exclusive(async database => database.prepare("SELECT id FROM input_versions ORDER BY rowid DESC LIMIT ?").all(limit), [], false, signal);
+		for (const { id } of candidates) {
+			signal?.throwIfAborted(); this.signal.throwIfAborted();
+			if (!isSha256Digest(id)) continue;
+			const record = await this.getInputVersion(id, signal).catch(() => {
+				signal?.throwIfAborted(); this.signal.throwIfAborted(); return undefined;
+			});
+			signal?.throwIfAborted(); this.signal.throwIfAborted();
+			if (record) yield record;
+		}
 	}
 
 	async findByWeakKey(weakKey: Sha256Digest, executablePath: string, excludedCertificates?: ReadonlySet<Sha256Digest>): Promise<readonly ProcessProvenanceCertificate[]> {
