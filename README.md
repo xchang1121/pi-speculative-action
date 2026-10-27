@@ -5,7 +5,7 @@ Pi 扩展：在 Actor（执行任务的模型）正式调用工具前预测动�
 ## 使用
 
 ```sh
-git clone --branch speculative-action https://github.com/xchang1121/pi.git pi-speculative-action
+git clone --branch speculative-action https://github.com/xchang1121/pi-speculative-action.git pi-speculative-action
 cd pi-speculative-action
 npm ci --ignore-scripts
 npm run build

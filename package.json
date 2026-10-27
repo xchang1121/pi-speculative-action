@@ -105,12 +105,12 @@
 	"license": "MIT",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/xchang1121/pi.git"
+		"url": "git+https://github.com/xchang1121/pi-speculative-action.git"
 	},
 	"bugs": {
-		"url": "https://github.com/xchang1121/pi/issues"
+		"url": "https://github.com/xchang1121/pi-speculative-action/issues"
 	},
-	"homepage": "https://github.com/xchang1121/pi#readme",
+	"homepage": "https://github.com/xchang1121/pi-speculative-action#readme",
 	"engines": {
 		"node": ">=22.19.0"
 	},
