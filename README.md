@@ -5,16 +5,15 @@ Pi 扩展：在 Actor（执行任务的模型）正式调用工具前预测动�
 ## 使用
 
 ```sh
-git clone --branch speculative-action https://github.com/xchang1121/pi-speculative-action.git pi-speculative-action
-cd pi-speculative-action
-npm ci --ignore-scripts
-npm run build
-npm exec -- pi -e ./src/extension.ts
+pi install git:github.com/xchang1121/pi-speculative-action@speculative-action
+pi
 ```
 
-本版本使用仓库附带的 `0.84.1-speculative.1` 配套 SDK。上述命令安装锁定的九个包，并启动同一 checkout 中的 Pi；已有全局 Pi 进程需要退出后改用这个入口。源码补丁、包摘要、重建方法和公开执行控制器的边界见[配套 SDK 说明](./vendor/pi-sdk/README.md)。公开接缝已交付，扩展的通用持久检查点恢复尚未启用。
+本项目采用纯扩展部署，使用未修改的 Pi；开发依赖和兼容验证基线为原版 `0.84.1`。也可用 `pi -e /absolute/path/to/pi-speculative-action` 加载本地 checkout。
 
-启动后运行 `/speculative-action`，开启投机并选择预测来源，点击 **Apply changes**。在 **Tools & execution → Execution routes** 检查 Replay、Observe、Fork 能力。全局配置为 `<agent-dir>/speculative-action.json`，项目的 `.pi/speculative-action.json` 可覆盖它；版本与依赖见 [package.json](./package.json)。
+安装或加载本地 checkout 后，运行 `/speculative-action`，开启投机并选择预测来源，点击 **Apply changes**。在 **Tools & execution → Execution routes** 检查 Replay、Observe、Fork 能力。全局配置为 `<agent-dir>/speculative-action.json`，项目的 `.pi/speculative-action.json` 可覆盖它；版本与依赖见 [package.json](./package.json)。
+
+恢复工作针对扩展自身的计算和资源：持久数据经完整性、当前输入与实现绑定验证后，由后续工具调用采用。当前已验证的输入版本和纯子计算范围见下文；自有检查点的生产恢复仍在完善。**不支持宿主级透明续跑**，包括原 Pi 会话中断工具批次的原样续接、覆盖其他扩展全部回调的运行接管，以及原工具最终消息的完整跨重启交付协议。未知副作用不会自动重做；任意原生进程、多线程和断电恢复也尚未得到证明。
 
 `drafterMaxDepth` 表示根批次之后最多预测多少个后继批次，0 关闭续推。动作和观测预测共用 Drafter 模型、凭据、任务请求数及 token 预算；并发根候选和 Drafter Actor 探测也使用同一账本，重试与压缩续跑不重置额度。`tools` 只筛选预测候选：省略时使用当前全部工具，空数组关闭工具候选；它不限制已观察输入和子计算的复用。
 
@@ -84,7 +83,7 @@ Linux 输入版本可显式配置 `ResourceVersionManager(root, { persistentInpu
 ## 开发与验证
 
 ```sh
-npm ci --ignore-scripts
+npm ci
 npm run check
 npm run build
 npm test -- --maxWorkers=1 --no-file-parallelism
@@ -92,7 +91,5 @@ npm run bench:check
 ```
 
 [系统测试](./test) 使用确定性模型回复，验证 SDK 接入、跨轮工作流、乱序执行、观测失配、共享预算与取消，以及实际输出、效果和回收。Linux 原生用例需要已安装的后端；ThinkThread 本地 wire 测试不替代真实 Runtime 资格。
-
-[SDK 跨进程契约](./bench/sdk-companion/README.md) 在普通 Linux/WSL 用户下验证公开执行控制器、原工具批次恢复、一次消费与最终回执；模型使用固定回复，工具效果与存储使用独立临时目录。
 
 [验证说明](./bench/README.md) 包含后端资格、模型任务与计量口径。`toolSpeedup = T / (T - H)` 描述已消费计算的复用收益；工具等待、协调等待、CPU 与端到端净收益分别评估。工具预测和内部操作分开计数；Drafter 状态另列私有观测预测数量及与已完成投机结果的精确一致率，未完成结果不进入分母。

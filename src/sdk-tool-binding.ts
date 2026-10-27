@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
-import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
+import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { AgentSession, VERSION, type ExtensionContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { stableValueHash } from "./stable-value-hash.ts";
 import { asRecord } from "./stable-json.ts";
@@ -8,7 +8,7 @@ import { UNRESTRICTED_PROCESS_EFFECTS } from "./effect-model.ts";
 import type { ToolInvocation } from "./tool-settlement.ts";
 
 type Execute = (tool: AgentTool, args: Parameters<AgentTool["execute"]>) => ReturnType<AgentTool["execute"]>;
-type Turn = { readonly tools: readonly AgentTool[]; execute?: Execute; preparing?: Promise<void>; closed?: boolean };
+type Turn = { readonly tools: readonly AgentTool[]; execute?: Execute; closed?: boolean };
 type Run = { readonly session: AgentSession; turn?: Turn };
 type Definition = { readonly definition: ToolDefinition; readonly execute: ToolDefinition["execute"]; readonly schema: string; readonly stock: boolean };
 type Registered = Definition & { readonly executeTool: AgentTool["execute"]; readonly prepare: AgentTool["prepareArguments"] };
@@ -35,7 +35,7 @@ function createBroker() {
 			if (!binding) {
 				// In the qualified SDK, baseToolsOverride definitions discard renderers; custom tools have their own source.
 				binding = { definition, execute: definition.execute, schema: stableValueHash(definition.parameters),
-					stock: VERSION === "0.84.1-speculative.1" && sources.get(tool.name) === "builtin" && !!definition.renderCall && !!definition.renderResult };
+					stock: VERSION === "0.84.1" && sources.get(tool.name) === "builtin" && !!definition.renderCall && !!definition.renderResult };
 				definitions.set(definition, binding);
 			}
 			tools.set(tool, { ...binding, executeTool: tool.execute, prepare: tool.prepareArguments });
@@ -77,12 +77,12 @@ export function currentSdkTurn(context: ExtensionContext): Turn | undefined {
 	return run?.session.sessionManager === context.sessionManager && run.session.agent.signal === context.signal ? run.turn : undefined;
 }
 
-export function attachSdkTools(context: ExtensionContext, initialize?: (messages: AgentMessage[]) => Promise<void>) {
+export function attachSdkTools(context: ExtensionContext) {
 	const session = broker.sessions.getStore();
 	if (!session || session.sessionManager !== context.sessionManager) return { tools: (): readonly AgentTool[] => [], dispose: () => {} };
 	const agent = session.agent, restores: (() => void)[] = [];
 	let attached = true;
-	for (const name of ["prompt", "continue", "resumeTools"] as const) {
+	for (const name of ["prompt", "continue"] as const) {
 		const descriptor = Object.getOwnPropertyDescriptor(agent, name), original = agent[name];
 		const wrapped = async function (this: typeof agent, ...args: never[]) {
 			if (!attached || this !== agent || agent.signal) return Reflect.apply(original, this, args);
@@ -93,13 +93,8 @@ export function attachSdkTools(context: ExtensionContext, initialize?: (messages
 				if (run.turn) run.turn.closed = true;
 				const turn: Turn = { tools: tools.slice() }; run.turn = turn;
 				return tools.map(tool => ({ ...tool, prepareArguments: tool.prepareArguments?.bind(tool),
-					execute: async (...args: Parameters<AgentTool["execute"]>) => {
-						if (attached && !turn.closed) {
-							if (!turn.execute && initialize) turn.preparing ??= initialize(session.messages);
-							await turn.preparing;
-						}
-						return attached && !turn.closed && turn.execute ? turn.execute(tool, args) : tool.execute(...args);
-					} }));
+					execute: (...args: Parameters<AgentTool["execute"]>) => attached && !turn.closed && turn.execute
+						? turn.execute(tool, args) : tool.execute(...args) }));
 			};
 			return broker.runs.run(run, async () => {
 				const next = agent.prepareNextTurnWithContext, fallback = agent.prepareNextTurn;

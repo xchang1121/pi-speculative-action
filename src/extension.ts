@@ -597,7 +597,7 @@ async function installController(
 			});
 		},
 	} as const;
-	const sdk = attachSdkTools(context, messages => controller.startTurn(messages, context));
+	const sdk = attachSdkTools(context);
 	await recoverSpeculation(() => refreshExecutionDiagnostics());
 	return controller;
 }

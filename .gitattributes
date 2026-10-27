@@ -5,4 +5,3 @@
 *.jpeg binary
 *.gif binary
 *.webp binary
-/vendor/pi-sdk/*.tgz binary
