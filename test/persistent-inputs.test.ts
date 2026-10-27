@@ -107,8 +107,57 @@ linux("discovers a finite set of current input closures and releases undispatche
 	const f = await fixture(), file = path.join(f.root, "input");
 	try {
 		await writeFile(file, "discoverable input");
+		const initial = await metadata([path.dirname(f.root), f.root, file]);
+		await expect(f.manager.recover(memoryBudget).next()).resolves.toMatchObject({ done: true });
+		await expect(f.manager.restore(`sha256:${"0".repeat(64)}`, memoryBudget)).resolves.toBeUndefined();
+		await expect(lstat(f.cache)).rejects.toMatchObject({ code: "ENOENT" });
+		expect(await metadata([path.dirname(f.root), f.root, file])).toEqual(initial);
+		await f.store.withPublication(async () => {}); await f.store.drain();
+		storeMetadata(f.cache, database => database.exec("DROP TABLE input_versions; PRAGMA user_version=2"));
+		await expect(f.manager.recover(memoryBudget).next()).resolves.toMatchObject({ done: true });
+		expect(storeMetadata(f.cache, database => database.prepare("PRAGMA user_version").get()!.user_version)).toBe(2);
+		storeMetadata(f.cache, database => database.exec("PRAGMA user_version=4"));
+		await expect(f.manager.recover(memoryBudget).next()).rejects.toThrow(/unsupported provenance store version 4/);
+		storeMetadata(f.cache, database => database.exec("PRAGMA user_version=2"));
 		const original = await f.manager.capture([{ path: file, scope: "content" }], memoryBudget); f.tokens.push(original);
-		const id = await f.manager.persist(original), record = (await f.store.getInputVersion(id))!;
+		let id = await f.manager.persist(original); const record = (await f.store.getInputVersion(id))!;
+		const revision = () => storeMetadata(f.cache, database => database.prepare("SELECT revision FROM changes WHERE path = ''").get()!.revision);
+		const beforeRevision = revision(); await f.store.drain();
+		const publisher = storePeer(f.cache);
+		try {
+			expect(await publisher.noticed).toBe("held");
+			const restored = await f.manager.restore(id, memoryBudget); f.tokens.push(restored!);
+			expect((await restored!.view!.readFile(file)).toString()).toBe("discoverable input");
+			expect(revision()).toBe(beforeRevision);
+		} finally { publisher.child.kill("SIGKILL"); await publisher.completed.catch(() => undefined); }
+		const native = await vi.importActual<typeof filesystem>("node:fs/promises");
+		for (const mode of ["missing", "acquired", "cancel", "close"] as const) {
+			const current = await f.manager.persist(original), pause = gated(), controller = new AbortController();
+			const store = mode === "close" ? new ProvenanceCertificateStore(f.cache) : f.store;
+			const manager = mode === "close" ? new ResourceVersionManager(f.root, { watch: false, persistentInputs: { store } }) : f.manager;
+			let waiting = true, handle: filesystem.FileHandle | undefined, closing: Promise<void> | undefined;
+			const opening = vi.spyOn(filesystem, "open").mockImplementation(async (...args) => {
+				if (!waiting || !String(args[0]).startsWith(f.store.artifacts.root) || args[1] !== "r") return native.open(...args);
+				waiting = false; handle = mode === "missing" ? undefined : await native.open(...args);
+				await pause.wait(); return handle ?? native.open(...args);
+			});
+			const restoring = manager.restore(current, memoryBudget, controller.signal);
+			const outcome = restoring.then(token => ({ token, error: undefined }), error => ({ token: undefined, error }));
+			try {
+				await pause.entered;
+				if (mode === "cancel") controller.abort();
+				else if (mode === "close") { closing = store.dispose(); expect((await waitForCompletion(closing, undefined, 30)).status).toBe("deadline"); }
+				else await f.store.clear();
+				pause.release();
+				const result = await outcome;
+				if (mode === "acquired") {
+					expect(result.error).toBeUndefined(); f.tokens.push(result.token!);
+					expect((await result.token!.view!.readFile(file)).toString()).toBe("discoverable input");
+				} else { expect(result.token).toBeUndefined(); expect(String(result.error)).toMatch(mode === "missing" ? /unavailable/ : mode === "cancel" ? /abort/i : /closed/); }
+				await closing; if (handle) expect(handle.fd).toBe(-1);
+			} finally { pause.release(); await outcome; opening.mockRestore(); if (store !== f.store) { manager.close(); await store.dispose(); } }
+		}
+		await f.store.clear(); id = await f.manager.persist(original);
 		const payload = record.payload as Record<string, unknown>;
 		await f.store.putInputVersion({ ...payload, root: path.dirname(f.root) }, record.artifacts);
 		await f.store.putInputVersion({ ...payload, observations: [] }, record.artifacts);
@@ -141,6 +190,7 @@ linux("discovers a finite set of current input closures and releases undispatche
 		}
 		await f.store.clear();
 		expect((await recovered.view!.readFile(file)).toString()).toBe("discoverable input");
+		expect(await metadata([f.root, file])).toEqual(initial.slice(1));
 	} finally { await f.close(); }
 });
 

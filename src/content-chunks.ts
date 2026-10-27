@@ -65,7 +65,7 @@ export class ContentChunkPool {
 		}));
 	}
 	/** Reopen and verify every block and the complete digest before granting a cold input lease. */
-	restore(value: unknown, transfers?: readonly ArtifactTransfer[]): Promise<ChunkedContent> {
+	restore(value: unknown, transfers?: readonly ArtifactTransfer[], signal?: AbortSignal): Promise<ChunkedContent> {
 		return this.store.read(signal => this.lifetime.serialize(async () => {
 			const manifest = parseContentManifest(value);
 			if (manifest.size > this.limits.maxLogicalBytes) throw new Error("content logical budget exceeded");
@@ -75,12 +75,14 @@ export class ContentChunkPool {
 			const digest = createHash("sha256");
 			for (let index = 0; index < manifest.chunks.length; index++) {
 				signal.throwIfAborted();
-				const reference = manifest.chunks[index]; if (reference && !this.artifacts.has(reference)) await this.store.withPublication(() => this.pin(reference));
+				const reference = manifest.chunks[index];
+				if (reference && !await this.artifacts.add(reference, signal)) throw new Error("content chunk is unavailable");
 				digest.update(await this.block(manifest, index));
 			}
 			if (`sha256:${digest.digest("hex")}` !== manifest.digest) throw new Error("content manifest integrity check failed");
+			signal.throwIfAborted();
 			return new ChunkedContent(this, manifest);
-		}));
+		}), signal);
 	}
 	/** Renew roots under the caller's publication transaction, even after GC unlinked our pinned blocks. */
 	publish(manifest: ChunkedContentManifest, store = this.store): Promise<void> {
@@ -112,9 +114,6 @@ export class ContentChunkPool {
 		return this.lifetime.close(async () => {
 			await this.lifetime.drain(); await this.artifacts.dispose();
 		});
-	}
-	private async pin(reference: ArtifactReference): Promise<void> {
-		if (!await this.artifacts.add(reference)) throw new Error("content chunk is unavailable");
 	}
 	private async block(manifest: ChunkedContentManifest, index: number): Promise<Buffer> {
 		const reference = manifest.chunks[index], size = Math.min(CONTENT_CHUNK_BYTES, manifest.size - index * CONTENT_CHUNK_BYTES);

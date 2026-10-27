@@ -314,16 +314,16 @@ export class ProvenanceCertificateStore {
 	}
 	getInputVersion(id: Sha256Digest, signal?: AbortSignal): Promise<StoredInputVersion | undefined> {
 		digestHex(id);
-		return this.exclusive(async database => {
+		return this.existing(async database => {
 			const value = database.prepare("SELECT value FROM input_versions WHERE id = ?").get(id)?.value, record = decodeInputVersion(value);
 			if (value !== undefined && record?.id !== id) throw new Error(`input version integrity check failed for ${id}`);
 			return record;
-		}, [], false, signal);
+		}, () => undefined, signal);
 	}
 	/** Finite discovery hints, newest publication first; every row still needs current input and CAS validation. */
 	async *candidatesInputVersions(limit: number, signal?: AbortSignal): AsyncGenerator<StoredInputVersion> {
 		if (!Number.isSafeInteger(limit) || limit < 1 || limit > 65536) throw new Error("invalid input discovery limit");
-		const candidates = await this.exclusive(async database => database.prepare("SELECT id FROM input_versions ORDER BY rowid DESC LIMIT ?").all(limit), [], false, signal);
+		const candidates = await this.existing(async database => database.prepare("SELECT id FROM input_versions ORDER BY rowid DESC LIMIT ?").all(limit), () => [], signal);
 		for (const { id } of candidates) {
 			signal?.throwIfAborted(); this.signal.throwIfAborted();
 			if (!isSha256Digest(id)) continue;
@@ -464,6 +464,31 @@ export class ProvenanceCertificateStore {
 	}
 
 	private objectKey(target: string): string { return path.relative(this.root, target).split(path.sep).join("/"); }
+	/** Existing input records need neither schema migration nor publication ownership. WAL access still needs cache isolation. */
+	private existing<T>(operation: (database: DatabaseSync) => Promise<T>, absent: () => T, signal?: AbortSignal): Promise<T> {
+		return this.read(async signal => {
+			const publication = this.publication.getStore();
+			if (publication?.active) return operation(publication.database);
+			if (!this.reader) {
+				const target = path.join(this.root, "metadata.sqlite"); let database: DatabaseSync;
+				try { database = new DatabaseSync(target, { readOnly: true }); }
+				catch (error) {
+					if ((Number((error as { errcode?: number }).errcode) & 0xff) === 14 &&
+						!await stat(target).catch(cause => { if (!missing(cause)) throw cause; return undefined; })) {
+						signal.throwIfAborted(); return absent();
+					}
+					throw error;
+				}
+				try {
+					const version = Number(database.prepare("PRAGMA user_version").get()?.user_version);
+					if (version < 3) return absent();
+					if (version !== 3) throw new Error(`unsupported provenance store version ${version}`);
+					this.reader = database;
+				} finally { if (this.reader !== database) database.close(); }
+			}
+			signal.throwIfAborted(); return operation(this.reader);
+		}, signal);
+	}
 	private async exclusive<T>(operation: (database: DatabaseSync) => Promise<T>, touched: readonly string[] = [], mutate = true, signal?: AbortSignal): Promise<T> {
 		const publication = this.publication.getStore();
 		if (publication?.active) {
@@ -472,7 +497,7 @@ export class ProvenanceCertificateStore {
 			return value;
 		}
 		// WAL readers see committed history without waiting behind a producer that an Actor may need to join.
-		if (!mutate && this.control) return this.read(() => operation(this.reader ??= new DatabaseSync(path.join(this.root, "metadata.sqlite"), { readOnly: true })), signal);
+		if (!mutate && this.control) return this.existing(operation, () => { throw new Error("provenance store metadata is unavailable"); }, signal);
 		const admission = AbortSignal.any([this.stopped.signal, AbortSignal.timeout(1_000), ...(signal ? [signal] : [])]);
 		let admitted = false;
 		const task = this.lifecycle.serialize(async () => {

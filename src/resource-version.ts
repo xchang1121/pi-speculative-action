@@ -634,13 +634,13 @@ export class ResourceReadView {
 		this.assertComplete(true); return { entries, preparations };
 	}
 	/** Restore into the same preparation table with fresh cancellation and lifetime state, never old execution authority. */
-	async restorePreparations(preparations: readonly PersistentPreparation[], store: ProvenanceCertificateStore): Promise<void> {
+	async restorePreparations(preparations: readonly PersistentPreparation[], store: ProvenanceCertificateStore, signal?: AbortSignal): Promise<void> {
 		for (const preparation of preparations) {
 			this.assertComplete();
 			const { binding, key, resource, dependencies, value } = preparation;
 			const bytes = preparationDataBytes(value.size) + preparationMetadataBytes(key, resource, dependencies);
 			if (!this.reserve(bytes)) this.assertComplete();
-			const data = await store.artifacts.get(value);
+			const data = await store.artifacts.get(value, signal);
 			if (!data) throw new Error("persistent preparation artifact missing");
 			const snapshot = snapshotPreparation(JSON.parse(data.toString("utf8")));
 			if (!snapshot || !snapshot.data.equals(data)) throw new Error("resource_preparation_data_invalid");
@@ -956,12 +956,12 @@ export class ResourceVersionManager {
 	}
 
 	/** Cold recovery grants a new input lease only after content integrity and current query validation. */
-	async restore(id: Sha256Digest, retainBytes: number): Promise<ResourceVersionToken | undefined> {
+	async restore(id: Sha256Digest, retainBytes: number, signal?: AbortSignal): Promise<ResourceVersionToken | undefined> {
 		if (!this.open || !this.persistentInputs || this.snapshotExcludes.size) throw new Error("persistent input owner changed");
 		await this.assertPersistentStore();
 		const { store, limits } = this.persistentInputs;
-		return store.withPublication(async () => {
-			const record = await store.getInputVersion(id); if (!record) return;
+		return store.read(async signal => {
+			const record = await store.getInputVersion(id, signal); if (!record) return;
 			const payload = parsePersistentResourcePayload(record.payload, this.root);
 			const observations = new Map(payload.observations.map(observation => [dependencyKey(observation), observation]));
 			const contents = new ContentChunkPool(store, limits), view = new ResourceReadView(retainBytes, undefined,
@@ -971,23 +971,24 @@ export class ResourceVersionManager {
 			try {
 				const references = new Map<Sha256Digest, number>();
 				for (const [target, entry] of payload.entries) {
-					const content = entry.content && await contents.restore(entry.content);
+					const content = entry.content && await contents.restore(entry.content, undefined, signal);
 					for (const reference of content?.manifest.chunks ?? []) if (reference) references.set(reference.digest, reference.size);
 					view.capture(target, { ...entry, ...(content ? { content } : {}) } as CapturedResource);
 					view.assertComplete();
 				}
 				for (const preparation of payload.preparations) validateArtifact(preparation.value, references);
 				if (record.artifacts.length !== references.size || record.artifacts.some(reference => references.get(reference.digest) !== reference.size)) throw new Error("persistent input artifact closure mismatch");
-				await view.restorePreparations(payload.preparations, store);
+				await view.restorePreparations(payload.preparations, store, signal);
 				view.seal();
 				const token: ResourceVersionToken = { root: this.root, physicalRoot: payload.physicalRoot, observations, epoch: this.epoch,
 					watching: false, preciseContent: Object.freeze([]), manager: this, view, inputView: new WeakRef(view), release };
 				const proof = new ResourceReadView(retainBytes, undefined, undefined, undefined, "verify");
 				try { if ((await this.inspect(token, false, proof)).expired) { await release(); return; } }
 				finally { await proof.dispose(); }
+				signal.throwIfAborted(); if (!this.open) throw new Error("persistent input owner changed");
 				return token;
 			} catch (error) { await release(); throw error; }
-		});
+		}, signal);
 	}
 
 	/** Discover existing input closures without a separate ID index. The caller owns every yielded token. */
@@ -1003,7 +1004,7 @@ export class ResourceVersionManager {
 			if ((record.payload as Partial<PersistentResourcePayload> | null)?.root !== this.root) continue;
 			let token: ResourceVersionToken | undefined;
 			try {
-				token = await this.restore(record.id, retainBytes);
+				token = await this.restore(record.id, retainBytes, signal);
 				signal?.throwIfAborted(); store.signal.throwIfAborted();
 				if (!this.open) throw new Error("persistent input owner changed");
 			} catch (error) {
