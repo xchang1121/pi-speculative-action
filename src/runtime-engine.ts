@@ -1580,7 +1580,7 @@ export function makeSpeculativeActionRuntime<
 		if (key) reconcileAuthoritativeEffects(state.session, key);
 		// Authoritative feedback must enter the settlement queue before optional cache work can yield.
 		queueActorSettlement(state, input, actualCall, actorAction, output, undefined, operations, matches);
-		if (capture && (capture.inputsOnly || output !== undefined && !outputIsError(output))) {
+		if (capture && (capture.inputsOnly || capture.inputSource || output !== undefined && !outputIsError(output))) {
 			try { await retainAuthoritativeBranch(state.session, state, () => state.lifecycle === "active", actualCall, key, await capture.seal(output), durationMs, execution, capture.route); }
 			catch { state.session.lifecycle.release(capture); }
 		} else if (capture) state.session.lifecycle.release(capture);
@@ -2235,7 +2235,8 @@ export function makeSpeculativeActionRuntime<
 		trimResults(session, settings);
 	};
 
-	const settingsChanged = async (settings: SpeculativeActionSettings): Promise<void> => {
+	const settingsChanged = async (input?: SpeculativeActionSettings): Promise<void> => {
+		const settings = input ?? await adapter.settings();
 		await Promise.all([...sessionStates.values()].map(session => session.lifecycle.run(() => applySettings(session, settings))));
 	};
 	const disposeSession = async (sessionID: SessionID): Promise<void> => {

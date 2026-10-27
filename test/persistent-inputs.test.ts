@@ -13,9 +13,12 @@ import type { Sha256Digest } from "../src/stable-value-hash.ts";
 import { ContentChunkPool, CONTENT_CHUNK_BYTES, captureContent } from "../src/content-chunks.ts";
 import { FILESYSTEM_METADATA_FIELDS } from "../src/filesystem-evidence.ts";
 import * as evidence from "../src/filesystem-evidence.ts";
-import { ResourceVersionManager, captureResourceVersion, createSerializablePreparationBinding, validateResourceVersion, type ResourceVersionToken } from "../src/resource-version.ts";
+import { ResourceInputSession, ResourceVersionManager, captureResourceVersion, createSerializablePreparationBinding, resourceProofBytes, validateResourceVersion, type ResourceVersionToken } from "../src/resource-version.ts";
+import { bindResourceOperation } from "../src/agent-execution-world.ts";
+import { PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { TimelineInterval } from "../src/task-timing.ts";
 import { ProvenanceCertificateStore } from "../src/reuse-store.ts";
+import { acquirePatternAwareStore, PATTERN_AWARE_DEFAULTS } from "../src/pattern-aware.ts";
 import { waitForCompletion } from "../src/runtime-lifecycle.ts";
 import { gated } from "./async.ts";
 import { storeMetadata, storePeer } from "./process-fixture.ts";
@@ -37,7 +40,7 @@ async function fixture() {
 	} };
 }
 const searchFixture = async (f: Awaited<ReturnType<typeof fixture>>, mode: string, id = "") => JSON.parse((await promisify(execFile)(process.execPath,
-	["--import", "tsx", fileURLToPath(new URL("./persistent-preparation-fixture.ts", import.meta.url)), mode, f.root, f.cache, id])).stdout);
+	[fileURLToPath(new URL("./persistent-preparation-fixture.ts", import.meta.url)), mode, f.root, f.cache, id])).stdout);
 
 linux("recovers a pure search computation under a fresh native binding", { timeout: 120_000 }, async () => {
 	const f = await fixture(), file = path.join(f.root, "input");
@@ -69,6 +72,113 @@ linux("recovers a pure search computation under a fresh native binding", { timeo
 		expect(recovered.pid).not.toBe(composed.pid); expect(recovered.output).toEqual(composed.output); expect(composed.output).toEqual(captured.output);
 		expect(await metadata([f.root, file])).toEqual(before);
 	} finally { await f.close(); }
+});
+
+linux("shares input retention budgets across discovered records, nested queries and parallel borrowers", async () => {
+	const f = await fixture(), files = ["one", "two", "six"].map(name => path.join(f.root, name));
+	try {
+		const ids: Sha256Digest[] = [];
+		for (const [index, file] of files.entries()) {
+			await writeFile(file, Buffer.alloc(CONTENT_CHUNK_BYTES, index + 1));
+			const token = await f.manager.capture([{ path: file, scope: "content" }], memoryBudget);
+			try { ids.push(await f.manager.persist(token)); } finally { await token.release(); }
+		}
+		const sample = (await f.manager.restore(ids[0]!, memoryBudget))!;
+		const bytes = resourceProofBytes([sample]) + sample.view!.bytes; await sample.release();
+		const before = await metadata([f.root, ...files]);
+		for (const limit of ["memory", "stored", "chunks"] as const) {
+			const session = new ResourceInputSession({ store: f.store, limits: {
+				maxStoredBytes: (limit === "stored" ? 2 : 3) * CONTENT_CHUNK_BYTES, maxOpenChunks: limit === "chunks" ? 2 : 3,
+			} }, limit === "memory" ? bytes * 2 + 64 : memoryBudget);
+			try {
+				const tokens = await session.run(() => session.recover(f.root, new AbortController().signal));
+				expect(tokens).toHaveLength(2);
+				expect(session.bytes).toBeLessThanOrEqual(session.maxBytes);
+				expect(session.contents.storedBytes).toBeLessThanOrEqual(session.contents.limits.maxStoredBytes);
+				expect(session.contents.openChunks).toBeLessThanOrEqual(session.contents.limits.maxOpenChunks);
+				for (const token of tokens) {
+					const file = token.view!.resources.find(resource => files.includes(resource.path))!.path;
+					expect((await token.view!.readFile(file, 1))[0]).toBe(files.indexOf(file) + 1);
+				}
+			} finally { await session.dispose(); }
+			expect(session.bytes).toBe(0); expect(session.contents.closed).toBe(true);
+		}
+		const owner = new ResourceInputSession({ store: f.store }, memoryBudget), borrower = new ResourceInputSession({ store: f.store }, bytes * 2 + 64);
+		const token = await owner.capture(undefined, f.root, PI_ACTION_SEMANTICS, memoryBudget);
+		await token.view!.readFile(files[0]!, 1); token.view!.seal();
+		try {
+			const proofs = await borrower.run(() => borrower.run(() => Promise.all(Array.from({ length: 8 }, async () => {
+				try { return borrower.retain(token, memoryBudget); } catch { return undefined; }
+			}))));
+			expect(proofs.filter(Boolean).length).toBeGreaterThan(0); expect(proofs.filter(Boolean).length).toBeLessThan(8);
+			expect(borrower.bytes).toBeLessThanOrEqual(borrower.maxBytes);
+			await Promise.allSettled(proofs.map(proof => proof?.release())); expect(borrower.bytes).toBe(0);
+		} finally { await token.release(); await owner.dispose(); await borrower.dispose(); }
+		expect(await metadata([f.root, ...files])).toEqual(before);
+	} finally { await f.close(); }
+});
+
+linux("keeps consumption once through automatic publication failure, cancellation and capture close", async () => {
+	const f = await fixture(), file = path.join(f.root, "input"), marker = path.join(f.root, "consumed"), alias = path.join(f.root, "alias");
+	await mkdir(f.cache); const store = new ProvenanceCertificateStore(f.cache, { reservedRoot: true });
+	const binding = createSerializablePreparationBinding("automatic-input-consumption", value => typeof value === "string");
+	try {
+		await writeFile(file, "input\n"); await writeFile(marker, ""); await symlink("input", alias); await lutimes(alias, 915148800, 946684800);
+		for (const target of [path.dirname(f.root), f.root, file]) await utimes(target, 915148800, 946684800);
+		const before = await metadata([path.dirname(f.root), f.root, file, alias]);
+		let builds = 0, consumers = 0;
+		for (const state of ["publish", "recover", "publication-fails", "consumer-fails", "cancelled", "closed"] as const) {
+			const controller = new AbortController(), session = new ResourceInputSession({ store, internalCache: true }, memoryBudget);
+			let closing: Promise<void> | undefined;
+			const bound = bindResourceOperation(async inputs => { await inputs.access(alias); return { isError: false, result: { details: undefined, content: [{ type: "text" as const,
+				text: await inputs.prepare!(binding, state === "recover" ? "publish" : state, async view => {
+					builds++; return { value: (await view.readFile(file)).toString(), bytes: 32, dispose() {} };
+				}, async value => {
+					consumers++; await filesystem.appendFile(marker, "once\n");
+					if (state === "consumer-fails") throw new Error("consumer failed after effect");
+					if (state === "closed") closing = Promise.resolve(active.dispose());
+					return value as string;
+				}, file, controller.signal) }] } }; }, path.parse(f.root).root);
+			const active = bound.captureInputs!(undefined, memoryBudget, state, session);
+			const failing = state === "publication-fails" ? vi.spyOn(store, "putInputVersion").mockRejectedValue(new Error("publication failed")) : undefined;
+			const previous = consumers, previousBuilds = builds;
+			try {
+				if (state === "cancelled") controller.abort();
+				const result = bound.authoritative!({ args: {}, callID: state, signal: controller.signal });
+				if (state === "consumer-fails" || state === "cancelled") await expect(result).rejects.toThrow();
+				else {
+					expect((await result).result.content).toEqual([{ type: "text", text: "input\n" }]);
+					if (state !== "closed") {
+						const branch = await Promise.resolve(active.seal()).catch(error => {
+							expect(state, "only recovered computation without new input payload can decline retention").toBe("recover");
+							expect(error.message).toBe("resource_inputs_empty"); return undefined;
+						});
+						await branch?.dispose();
+					}
+				}
+				expect(consumers - previous).toBe(state === "cancelled" ? 0 : 1);
+				if (state === "recover") expect(builds).toBe(previousBuilds);
+				if (failing) expect(failing).toHaveBeenCalled();
+			} finally { failing?.mockRestore(); await active.dispose(); await closing; }
+			expect(session.bytes).toBe(0); expect(session.contents.closed).toBe(true);
+		}
+		expect(await filesystem.readFile(marker, "utf8")).toBe("once\n".repeat(consumers));
+		expect(await metadata([path.dirname(f.root), f.root, file, alias])).toEqual(before);
+		await mkdir(path.join(f.cache, "pattern-aware"));
+		const learned = await acquirePatternAwareStore(f.root, PATTERN_AWARE_DEFAULTS, f.cache, undefined, true);
+		learned.store.observe({ sessionID: "owned", turnID: "one", tool: "read", input: {}, outcome: "success", durationMs: 1 });
+		await learned.store.flush();
+		expect((await filesystem.readdir(path.join(f.cache, "pattern-aware"))).length).toBe(2);
+		await store.dispose(); await filesystem.rename(f.cache, f.cache + "-retired");
+		const absent = new ProvenanceCertificateStore(f.cache, { reservedRoot: true }), ancestors = await metadata([path.dirname(f.root), f.root]);
+		try {
+			await expect(absent.artifacts.put("unavailable")).rejects.toThrow();
+			learned.store.observe({ sessionID: "owned", turnID: "two", tool: "read", input: {}, outcome: "success", durationMs: 1 });
+			await expect(learned.store.flush()).rejects.toMatchObject({ code: "ENOENT" });
+		} finally { await absent.dispose(); await learned.release().catch(() => undefined); }
+		await expect(lstat(f.cache)).rejects.toMatchObject({ code: "ENOENT" });
+		expect(await metadata([path.dirname(f.root), f.root])).toEqual(ancestors);
+	} finally { await store.dispose(); await f.close(); }
 });
 
 linux("closes composed preparations over the original and destination versions after the original view retires", async () => {

@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { mkdir, realpath } from "node:fs/promises";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
@@ -13,7 +14,7 @@ import { DrafterTaskBudget } from "./drafter-budget.ts";
 import { toolSpeedup } from "./task-timing.ts";
 import { forceToolChoice } from "./drafter-plan-source.ts";
 import { DEFAULTS } from "./common.ts";
-import { PATTERN_AWARE_PRESETS, type PatternAwareSettings } from "./pattern-aware.ts";
+import { PATTERN_AWARE_PRESETS, patternAwarePersistenceFile, type PatternAwareSettings } from "./pattern-aware.ts";
 import { createClosedSearchProfile, createPiToolDefinitions, PI_CLOSED_SEARCH_TOOLS, PI_OPERATION_TOOLS, resolvePiToolInvocation } from "./pi-tool-invocation.ts";
 import { LinuxProcessReuseBackend } from "./linux-process-backend.ts";
 import { checkLinuxEnvironment, installLinuxDependencies } from "./linux-setup.ts";
@@ -353,7 +354,14 @@ async function installController(
 		autoResizeImages: piToolSettings.autoResizeImages,
 		settings,
 	}) ?? [];
-	const processBackend = new LinuxProcessReuseBackend({ storeRoot: path.join(getAgentDir(), "speculative-action", "process-reuse") });
+	let storeRoot = path.join(getAgentDir(), "speculative-action", "process-reuse");
+	try {
+		await Promise.all([storeRoot, path.dirname(patternAwarePersistenceFile(patternWorkspaceIdentity, getAgentDir()))]
+			.map(root => mkdir(root, { recursive: true, mode: 0o700 })));
+		storeRoot = await realpath(storeRoot);
+	}
+	catch { /* An unavailable cache cannot prevent the original tools from running. */ }
+	const processBackend = new LinuxProcessReuseBackend({ storeRoot, store: { reservedRoot: true } });
 	const rawProcessExecutor = adaptProcessToolOperations(createLocalBashOperations({ shellPath: getShellConfig(piToolSettings.shellPath).shell }));
 	const completedReplay = processBackend.completedReplayExecutor(rawProcessExecutor, {
 		sourceRoot: context.cwd, invocation: request => resolvePiToolInvocation("bash", { command: request.command, timeout: request.timeout }, {
@@ -371,11 +379,12 @@ async function installController(
 				coordinator: processCoordinator,
 				tools: PI_OPERATION_TOOLS.process,
 				backend: processBackend,
-				storeRoot: path.join(getAgentDir(), "speculative-action", "process-reuse"),
+				storeRoot,
 				workspaceSandbox,
 			}),
 			workspaceSandbox.createExecutionWorld(),
-			createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { maxBytes: () => currentSettings.resourceCacheMaxBytes }),
+			createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { maxBytes: () => currentSettings.resourceCacheMaxBytes,
+				persistentInputs: { store: processBackend.store, internalCache: true } }),
 		]),
 	];
 	const primaryExecutionWorldIDs = new Set(primaryExecutionWorlds.map((world) => world.id));
@@ -442,6 +451,7 @@ async function installController(
 		speculativeExecutionWorldEnabled,
 		actorForkPlanSource: selfSpeculation.actorForkPlanSource,
 		patternStateDirectory: getAgentDir(),
+		patternStoreReservedRoot: true,
 		patternWorkspaceIdentity,
 		onEvent: (event) => {
 			currentMetrics = reduceSpeculativeTrace(currentMetrics, event);
@@ -468,7 +478,7 @@ async function installController(
 		// A failed provider cannot detach preparation from refresh or shutdown ownership.
 		const [, , diagnostics] = await Promise.all(preparations).finally(() => Promise.allSettled(preparations));
 		executionDiagnostics = diagnostics;
-		await recoverSpeculation(() => host.runtime.settingsChanged(runtimeSettings()));
+		await recoverSpeculation(() => host.runtime.settingsChanged());
 		renderFooter();
 	});
 

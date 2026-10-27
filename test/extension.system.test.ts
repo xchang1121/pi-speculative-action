@@ -108,6 +108,7 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["", "-nested", "-sta
 		if (preempted) await inspection?.inOwner(state => state.publishedGate?.resolve()); await publication?.close();
 		await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" }); session.dispose(); inspection?.dispose();
 		expect(session.agent.prompt).toBe(originalPrompt); expect(session.agent.continue).toBe(originalContinue);
+		expect(events.filter(event => event.type === "candidate" && event.candidate.source === "pattern_aware")).toEqual([]);
 	});
 	await session.bindExtensions({ mode: "print", onError: error => { throw error; } });
 	if (native) {

@@ -67,7 +67,7 @@ export function resolvePiToolInvocation(
 		const requested = tool === "read" ? asRecord(input)?.path : undefined;
 		const invocation: ToolInvocation = {
 			executor,
-			filesystemRoot: cwd,
+			filesystemRoot: path.parse(cwd).root,
 			...(typeof requested === "string" ? { filesystemResources: readResourcePaths(requested, cwd) } : {}),
 			identity: { executor, cwd, version: VERSION, autoResizeImages, modelSupportsImages },
 			filesystem: async (view, request) => {
@@ -98,7 +98,8 @@ export function resolvePiToolInvocation(
 				return { result, isError: false };
 			},
 		};
-		return PI_OPERATION_TOOLS.workspace.includes(tool) ? { ...invocation, ...bindResourceOperation(invocation.filesystem!, cwd) } : invocation;
+		return { ...invocation, ...bindResourceOperation(invocation.filesystem!, invocation.filesystemRoot!, undefined,
+			PI_ACTION_SEMANTICS.definition(tool)?.effect === "observation") };
 	}
 	if (!PI_OPERATION_TOOLS.process.includes(tool) || !input || typeof input !== "object" || Array.isArray(input)) return undefined;
 	const record = input as Record<string, unknown>;
@@ -293,9 +294,8 @@ export async function createClosedSearchProfile(cwd: string) {
 			}, request.signal);
 			invocations.set(tool, Object.freeze({
 				executor: profile.id, identity: Object.freeze({ profile, cwd, home, ...(engine ? { engine: engine.identity } : {}) }),
-				filesystemRoot: engine ? path.parse(cwd).root : cwd,
 				semantics: semantics.get(tool),
-				authoritative: (request) => execute(request), filesystem: (view, request) => execute(request, view),
+				...bindResourceOperation((view, request) => execute(request, view), path.parse(cwd).root, request => execute(request), true),
 			} satisfies ToolInvocation));
 		}
 		return { profile, pool, invocations: invocations as ReadonlyMap<string, ToolInvocation> };

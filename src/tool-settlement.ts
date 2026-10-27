@@ -4,7 +4,7 @@ import type { ActionKey, ActionSemanticsDefinition } from "./action-semantics.ts
 import type { ExecutionOperationBinding, WorldResultCapture } from "./execution-world.ts";
 import { stableValueHash } from "./stable-value-hash.ts";
 import { immutableSnapshot } from "./stable-json.ts";
-import type { ToolFilesystemOperations } from "./resource-version.ts";
+import type { ResourceInputSession, ToolFilesystemOperations } from "./resource-version.ts";
 
 /** Host-neutral result consumed by the speculative scheduler. */
 export interface ToolSettlement<TDetails = unknown> {
@@ -70,7 +70,7 @@ export interface ToolInvocation {
 	/** Explicit selected Actor semantics; the host invokes this inside its original execution callback. */
 	readonly authoritative?: (request: Parameters<NonNullable<ToolInvocation["filesystem"]>>[1]) => Promise<ToolSettlement>;
 	/** Arm bounded input and pure-computation retention in the selected Actor executor, without replaying effects. */
-	readonly captureInputs?: (action: ActionKey | undefined, maxBytes: number, callID: string) => WorldResultCapture<ToolSettlement>;
+	readonly captureInputs?: (action: ActionKey | undefined, maxBytes: number, callID: string, inputs?: ResourceInputSession) => WorldResultCapture<ToolSettlement>;
 	/** Explicit trusted operation binding; never permission to call the supplied host tool. */
 	readonly filesystem?: (
 		view: ToolFilesystemOperations,

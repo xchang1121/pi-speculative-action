@@ -102,13 +102,13 @@ export async function createClosedSearchKernel() {
 	const exports = Object.keys(await import("node:child_process")).filter((name) => name !== "default");
 	for (const name of exports) outlet[name] ??= () => { throw new Error(`process capability not granted: ${name}`); };
 	globalThis.__closedSearchProcess = outlet;
-	const module = new URL("./closed-search-process-capability.mjs", import.meta.url).href;
-	const source = `export const { ${exports.join(",")} } = globalThis.__closedSearchProcess; export default globalThis.__closedSearchProcess;`;
+	const module = new URL("./closed-search-process-capability.cjs", import.meta.url).href;
+	const source = exports.map(name => `exports.${name} = globalThis.__closedSearchProcess.${name};`).join("\n");
 	const manager = new URL("./utils/tools-manager.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href;
 	registerHooks({ resolve(specifier, context, next) {
-		return ["child_process", "node:child_process"].includes(specifier) ? { url: module, format: "module", shortCircuit: true } : next(specifier, context);
+		return ["child_process", "node:child_process"].includes(specifier) ? { url: module, format: "commonjs", shortCircuit: true } : next(specifier, context);
 	}, load(url, context, next) {
-		if (url === module) return { format: "module", source, shortCircuit: true };
+		if (url === module) return { format: "commonjs", source, shortCircuit: true };
 		if (url === manager) return { format: "module", source: "export const { getToolPath } = globalThis.__closedSearchProcess; export const ensureTool = getToolPath;", shortCircuit: true };
 		return next(url, context);
 	} });

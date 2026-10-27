@@ -277,8 +277,10 @@ export class PatternAwareStore {
 	/** Shared by every workspace: validated patterns with no workspace path in them, learned in one and usable in all. */
 	private readonly portableFile?: string;
 	private readonly actionSemantics?: PatternAwareActionSemantics;
+	private readonly reservedRoot: boolean;
 
-	constructor(settings: PatternAwareSettings, persistenceFile?: string, actionSemantics?: PatternAwareActionSemantics, portableFile?: string) {
+	constructor(settings: PatternAwareSettings, persistenceFile?: string, actionSemantics?: PatternAwareActionSemantics, portableFile?: string,
+		reservedRoot = false) {
 		settings = { ...settings, presets: presetSelection(settings.presets, patternAwareDefaults.presets) };
 		this.settings = settings;
 		this.sessionBudgets = patternSessionBudgets(settings.maxPatterns);
@@ -287,6 +289,7 @@ export class PatternAwareStore {
 		this.sequenceModel = new PpmCountTrie(settings.maxContextLength);
 		this.persistenceFile = persistenceFile;
 		this.portableFile = portableFile;
+		this.reservedRoot = reservedRoot;
 		this.actionSemantics = actionSemantics && { ...actionSemantics, projectors: actionSemantics.projectors?.map(ownActionKeyProjector) };
 	}
 
@@ -703,7 +706,7 @@ export class PatternAwareStore {
 				this.dirty = false;
 				// Learned events quote tool inputs and outputs: keep them owner-readable only.
 				await writeJsonFile(target, { patterns: this.snapshot(), ...this.persistedLearningState(),
-					sequenceCounts: this.sequenceModel.snapshot(this.settings.maxPatterns) } satisfies PersistedState, undefined, 0o600);
+					sequenceCounts: this.sequenceModel.snapshot(this.settings.maxPatterns) } satisfies PersistedState, undefined, 0o600, this.reservedRoot);
 				if (this.portableFile) await this.sharePortable(this.portableFile);
 			}).catch((error) => { this.dirty = true; throw error; })
 				.finally(() => { this.write = undefined; });
@@ -1033,7 +1036,7 @@ export class PatternAwareStore {
 		for (const pattern of this.patterns.values()) if (this.portable(pattern)) merged.set(pattern.id, pattern);
 		const kept = [...merged.values()].sort((left, right) => patternRank(right, this.clock, this.settings.decayHalfLifeEvents) -
 			patternRank(left, this.clock, this.settings.decayHalfLifeEvents)).slice(0, this.settings.maxPatterns);
-		await writeJsonFile(file, { patterns: kept.map((pattern) => readonlyPattern(pattern, this.clock, this.settings.decayHalfLifeEvents)) }, undefined, 0o600);
+		await writeJsonFile(file, { patterns: kept.map((pattern) => readonlyPattern(pattern, this.clock, this.settings.decayHalfLifeEvents)) }, undefined, 0o600, this.reservedRoot);
 	}
 
 	/** Validated, and free of the workspace it was learned in: no path constant, no path in a template's or splice's literal text. */
@@ -1095,7 +1098,7 @@ export type PatternAwareStoreLease = { readonly store: PatternAwareStore; readon
 const stores = new Map<string, PooledPatternAwareStore>();
 
 export async function acquirePatternAwareStore(workspace: string, settings: PatternAwareSettings, stateDirectory?: string,
-	actionSemantics?: PatternAwareActionSemantics): Promise<PatternAwareStoreLease> {
+	actionSemantics?: PatternAwareActionSemantics, reservedRoot = false): Promise<PatternAwareStoreLease> {
 	settings = { ...settings };
 	actionSemantics = actionSemantics && { ...actionSemantics };
 	const analyzerKey = patternAwareAnalyzerKey(settings);
@@ -1104,11 +1107,11 @@ export async function acquirePatternAwareStore(workspace: string, settings: Patt
 	}
 	const semanticsKey = actionSemantics ? JSON.stringify(actionSemantics.namespace) : "default";
 	const file = configuredPersistenceFile(patternAwarePersistenceFile(workspace, stateDirectory), analyzerKey, semanticsKey);
-	const poolKey = `${file}\0${analyzerKey}\0${semanticsKey}`;
+	const poolKey = `${file}\0${analyzerKey}\0${semanticsKey}\0${reservedRoot}`;
 	let pooled = stores.get(poolKey);
 	if (!pooled) {
 		const portable = path.join(path.dirname(file), `portable.${hash(analyzerKey).slice(0, 12)}.json`);
-		const store = Promise.resolve(new PatternAwareStore(settings, file, actionSemantics, portable)).then(async (value) => {
+		const store = Promise.resolve(new PatternAwareStore(settings, file, actionSemantics, portable, reservedRoot)).then(async (value) => {
 			await value.load();
 			return value;
 		});

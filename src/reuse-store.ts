@@ -24,6 +24,8 @@ export interface ProvenanceStoreLimits { readonly maxCertificates: number; reado
 
 export interface ProvenanceStoreOptions extends Partial<ProvenanceStoreLimits> {
 	readonly gcIntervalMs?: number; readonly orphanGraceMs?: number;
+	/** Configuration already reserved this root; runtime publication must never recreate its ancestors. */
+	readonly reservedRoot?: boolean;
 	/** Independent of retention: over-budget stores must still be readable for collection. */
 	readonly maxReadBytes?: number;
 	/** Taints the publisher accepted: retention and stats keep what its lookups can still replay. */
@@ -245,6 +247,7 @@ export class ProvenanceCertificateStore {
 	private readonly orphanGraceMs: number;
 	private readonly acceptedTaints: readonly ProvenanceTaint[];
 	private readonly maxReadBytes: number;
+	private readonly reservedRoot: boolean;
 	private readonly lifecycle = new RuntimeLifecycleLane();
 	private readonly stopped = new AbortController();
 	private collection?: Promise<ProvenanceStoreGCResult>;
@@ -255,8 +258,9 @@ export class ProvenanceCertificateStore {
 
 	constructor(root: string, options: ProvenanceStoreOptions = {}) {
 		this.root = path.resolve(root); this.configure(options);
+		this.reservedRoot = options.reservedRoot === true;
 		this.artifacts = new ArtifactCAS(path.join(this.root, "cas"), (target, bytes) =>
-			this.exclusive(() => publishImmutable(target, bytes), [this.objectKey(target)]));
+			this.exclusive(() => publishImmutable(target, bytes, this.reservedRoot ? this.root : undefined), [this.objectKey(target)]));
 		this.gcIntervalMs = nonNegativeNumber(options.gcIntervalMs, DEFAULT_GC_INTERVAL_MS);
 		this.orphanGraceMs = nonNegativeNumber(options.orphanGraceMs, DEFAULT_ORPHAN_GRACE_MS);
 		this.acceptedTaints = Object.freeze([...options.acceptedTaints ?? []]);
@@ -514,7 +518,8 @@ export class ProvenanceCertificateStore {
 	}
 
 	private async open(signal: AbortSignal): Promise<DatabaseSync> {
-		await mkdir(this.root, { recursive: true }); const database = new DatabaseSync(path.join(this.root, "metadata.sqlite"));
+		if (!this.reservedRoot) await mkdir(this.root, { recursive: true });
+		const database = new DatabaseSync(path.join(this.root, "metadata.sqlite"));
 		try {
 			database.exec("PRAGMA synchronous=NORMAL");
 			const version = Number(await sqliteReady(() => database.prepare("PRAGMA user_version").get()?.user_version, signal));
@@ -563,12 +568,21 @@ async function sqliteReady<T>(run: () => T, signal: AbortSignal): Promise<T> {
 	} }
 }
 /** Preserve verified objects; a new complete publication atomically replaces a corrupt copy. */
-async function publishImmutable(target: string, bytes: Uint8Array): Promise<boolean> {
+async function publishImmutable(target: string, bytes: Uint8Array, reservedRoot?: string): Promise<boolean> {
 	if ((await readOptional(target, bytes.byteLength))?.equals(bytes)) {
 		const now = new Date(); // Referencing the same object restarts its orphan grace.
 		try { await utimes(target, now, now); return false; } catch (error) { if (!missing(error)) throw error; }
 	}
-	await mkdir(path.dirname(target), { recursive: true });
+	if (!reservedRoot) await mkdir(path.dirname(target), { recursive: true });
+	else {
+		const relative = path.relative(reservedRoot, path.dirname(target));
+		if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) throw new Error("artifact publication escapes reserved cache");
+		let directory = reservedRoot;
+		for (const segment of relative.split(path.sep)) {
+			directory = path.join(directory, segment);
+			await mkdir(directory).catch(error => { if (error.code !== "EEXIST") throw error; });
+		}
+	}
 	const temporary = path.join(path.dirname(target), `.${path.basename(target)}.${process.pid}.${randomUUID()}.tmp`);
 	// Exclusive creation grants cleanup ownership; an existing temporary belongs to another publisher.
 	const file = await open(temporary, "wx");

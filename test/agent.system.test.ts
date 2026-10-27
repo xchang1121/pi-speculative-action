@@ -58,6 +58,27 @@ function capturedReadProof() {
 const directories = temporaryDirectories("pi-agent-system-");
 afterEach(directories.dispose);
 
+test.skipIf(process.platform === "win32")("retains independent inputs after a qualified observation fails", async () => {
+	const cwd = await directories.create(), target = path.join(cwd, "missing.txt"), definition = readDefinition("check_missing");
+	const actionSemantics = new ActionSemanticsRegistry([PI_ACTION_SEMANTICS.definition("read")!, definition]);
+	const reader = createReadTool(cwd), tools = [reader, { ...reader, name: definition.tool }];
+	let consumers = 0;
+	const check = bindResourceOperation(async view => {
+		consumers++; return { isError: false, result: { details: undefined, content: [fauxText(String(await view.exists!(target)))] } };
+	}, path.parse(cwd).root);
+	const f = systemHost(cwd, tools, { actionSemantics, executionWorlds: [resourceWorld(actionSemantics)], resolveInvocation: (tool, input) =>
+		tool === "read" ? resolvePiToolInvocation(tool, input, { cwd, environment: {} }) :
+			{ executor: "check-missing", identity: {}, semantics: definition, ...check } });
+	await using _cleanup = onExit(f.dispose);
+	using reads = capturedReadProof();
+	await f.start();
+	await expect(f.execute("read", { path: "missing.txt" })).rejects.toMatchObject({ code: "ENOENT" });
+	await f.finish(); await f.start("consumer");
+	expect(textOutput(await f.execute(definition.tool, { path: "missing.txt" }))).toBe("false");
+	expect(consumers).toBe(1); expect(f.fallbacks).toEqual(["read"]);
+	reads.onlyExistence(f.actors.at(-1)!, target);
+});
+
 test.each([[false, true], [true, true], [false, false], [true, false]])("observes and reuses work with prediction sources off (production %s, reuse %s)", async (enabled, reuseEnabled) => {
 	const cwd = await directories.create(), tools = [createReadTool(cwd)], learning: boolean[] = [];
 	for (const name of ["a", "b"]) await writeText(cwd, `${name}.txt`, name);
@@ -76,6 +97,7 @@ test.each([[false, true], [true, true], [false, false], [true, false]])("observe
 	f.host.runtime.subscribe({ actor_observed: event => { observed.push(String(event.concrete.path)); } });
 	for (const turn of ["first", "second"]) {
 		await f.start(turn);
+		await f.host.runtime.settingsChanged();
 		for (const name of ["a", "b"]) expect(textOutput(await f.execute("read", { path: `${name}.txt` }))).toBe(name);
 		await f.finish();
 		unsubscribe();
@@ -556,6 +578,8 @@ test.for(["reopened", "inflight", "completed", "binding", "reverse", "deep", "ad
 	await leafGate.entered;
 	if (mode === "completed" || deep) await f.ready([files[deep ? 5 : 2]!], "pattern_aware");
 	const original = leafSignal; slowGate.release(); await slow; await nextTurn();
+	if (added) await f.ready([files[4]!], "pattern_aware");
+	if (replaces) await expect.poll(() => predictions(2)).toMatchObject([{ settlement: { observation: "unobserved", cause: { code: "superseded" } } }]);
 	await f.finish();
 	if (mode !== "binding") expect(original?.aborted).toBe(false);
 	expect(predictions(2)).toMatchObject(replaces ? [{ settlement: { observation: "unobserved", cause: { code: "superseded" } } }] : []);
@@ -789,7 +813,7 @@ test.for(["independent", "unchanged", "batch", "batch-known", "mismatch-text", "
 	const cwd = await directories.create(), sandbox = new WorkspaceSandboxService(), release = deferred(), forecast = deferred(), observing = deferred(), firstResult = deferred();
 	const learning = mode.startsWith("learning-"), captured = mode.startsWith("learning-captured-"), cross = learning && /cross-tool|unkeyed/.test(mode), stale = mode.endsWith("stale"), unused = mode.endsWith("unused");
 	const retired = mode.startsWith("learning-retired-");
-	const partial = !captured && (stale || retired && unused);
+	const partial = stale || retired && unused;
 	using reads = capturedReadProof();
 	let allow = true, seeding = captured, changed = false;
 	const actualFirst = mode.startsWith("actual-before-"), normalized = mode.startsWith("canonical"), wrong = mode.startsWith("mismatch") || mode === "canonical-mismatch";
@@ -845,7 +869,7 @@ test.for(["independent", "unchanged", "batch", "batch-known", "mismatch-text", "
 				const result = await invocation.filesystem!(view, request), text = textOutput(result.result);
 				return text === textOutput(expected[0]!) ? result : { ...result, result: { ...result.result,
 					content: [fauxText(text + (unused ? "" : String(await view.readFile(path.join(cwd, "child.txt")))))] } };
-			} : invocation.filesystem!, cwd) : {}),
+			} : invocation.filesystem!, retired ? cwd : invocation.filesystemRoot!) : {}),
 			...(bound && tool === names[0] && (normalized || mode === "normalizer-failure") ? { observation: { ...EXACT_TOOL_OBSERVATION, version, content: normalized ? schema : undefined, canonicalize } } : {}) }; },
 		preflight: context => allow && !(mode === "denied-root" && context.toolName !== child.tool || mode === "denied-child" && context.toolName === child.tool),
 		executionWorlds: [world, sandbox.createExecutionWorld({ driver: "git" })].map(world => ({ ...world, speculation: { ...world.speculation!, execute: async context => {

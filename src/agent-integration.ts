@@ -91,6 +91,8 @@ export interface CreateSpeculativeActionHostOptions extends DrafterModelOptions 
 	readonly speculativeExecutionWorldEnabled?: (backend: string) => boolean;
 	/** Optional persistence root for workspace-hashed PatternAware state. */
 	readonly patternStateDirectory?: string;
+	/** The configured owner already reserved the store directory; publication may not recreate it. */
+	readonly patternStoreReservedRoot?: boolean;
 	/** Stable logical workspace identity when physical checkout paths are ephemeral. */
 	readonly patternWorkspaceIdentity?: string;
 	/** Optional injected store, primarily for embedding and deterministic tests. */
@@ -181,6 +183,7 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 		actionSemantics,
 		projectionRules,
 		stateDirectory: options.patternStateDirectory,
+		reservedRoot: options.patternStoreReservedRoot,
 		workspaceIdentity: options.patternWorkspaceIdentity,
 		store: options.patternStore,
 	});

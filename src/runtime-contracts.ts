@@ -305,7 +305,8 @@ export interface SpeculativeActionRuntime<SessionID, Output, StartInput, Consume
 	/** Use the original trackActorTool arrival when preparation follows an asynchronous boundary. */
 	readonly prepareActorCall: (input: ConsumeInput, signal?: AbortSignal, issuedAt?: number) => Promise<PreparedActorCall<Output> | undefined>;
 	readonly finishTurn: (input: FinishInput) => Promise<void>;
-	readonly settingsChanged: (settings: SpeculativeActionSettings) => Promise<void>;
+	/** Refresh through the adapter unless the caller supplies a complete runtime policy. */
+	readonly settingsChanged: (settings?: SpeculativeActionSettings) => Promise<void>;
 	readonly disposeSession: (sessionID: SessionID) => Promise<void>;
 	readonly dispose: () => Promise<void>;
 }

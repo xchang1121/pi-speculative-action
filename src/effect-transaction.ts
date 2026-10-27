@@ -112,13 +112,13 @@ export class EffectTransactionCoordinator<Output> {
 		const inputsOnly = capture.inputsOnly;
 		return Object.freeze({
 			...(inputsOnly ? { inputsOnly } : {}),
-			get inputSource() { return owned.stateValue === "begun" && inputsOnly ? capture.inputSource : undefined; },
+			get inputSource() { return owned.stateValue === "begun" ? capture.inputSource : undefined; },
 			seal: async (output?: Output) => {
 				this.transition(owned, "begun", "sealing");
 				try {
-					if (!inputsOnly && output === undefined) throw new Error("authoritative_result_missing");
+					if (!inputsOnly && !capture.inputSource && output === undefined) throw new Error("authoritative_result_missing");
 					const branch = await capture.seal(output);
-					if (inputsOnly && !branch.inputsOnly) {
+					if ((inputsOnly || output === undefined) && !branch.inputsOnly) {
 						await branch.dispose();
 						throw new Error("input_only_capture_required");
 					}

@@ -203,7 +203,7 @@ export async function validateWorldBranch<Output>(branch: Pick<WorldBranch<Outpu
 export interface WorldResultCapture<Output> {
 	/** The capture retains inputs only; it cannot authorize reuse of the captured action's output. */
 	readonly inputsOnly?: true;
-	/** Revocable input sink available during the authoritative execution. */
+	/** Revocable inputs available during execution and sealable after failure; does not grant output authority. */
 	readonly inputSource?: object;
 	/** Transfer completed work at most once. Only input captures may seal without a successful output. */
 	readonly seal: (output?: Output) => WorldBranch<Output> | Promise<WorldBranch<Output>>;

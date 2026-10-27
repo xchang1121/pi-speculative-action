@@ -243,7 +243,7 @@ export type HeldExecDecision = { readonly observeTiming?: (timing: HeldExecTimin
 	  } & ({ readonly exitCode: number; readonly continuation?: never } |
 		{ readonly exitCode?: never; readonly continuation: { readonly image: Buffer; readonly physicalRoot: string } })));
 
-export interface LinuxHeldExecOptions { readonly storeRoot: string; readonly binary?: string; readonly observerBinary?: string; readonly signal?: AbortSignal; }
+export interface LinuxHeldExecOptions { readonly storeRoot: string; readonly reservedRoot?: boolean; readonly binary?: string; readonly observerBinary?: string; readonly signal?: AbortSignal; }
 
 type ActiveExecution = ReturnType<LinuxHeldExecBoundary["createAttachment"]>;
 
@@ -302,7 +302,7 @@ export class LinuxHeldExecBoundary {
 		let native: Awaited<ReturnType<typeof qualifyNativeStartup>>;
 		try { native = await startupScope.exit(() => qualifyNativeStartup(binary, { observer: options.observerBinary, signal: options.signal })); }
 		catch (error) { options.signal?.throwIfAborted(); throw new Error(`held-exec functional probe failed${await inheritedTracer()}: ${error instanceof Error ? error.message : error}`, { cause: error }); }
-		await mkdir(options.storeRoot, { recursive: true, mode: 0o700 });
+		if (!options.reservedRoot) await mkdir(options.storeRoot, { recursive: true, mode: 0o700 });
 		await chmod(options.storeRoot, 0o700);
 		const candidate = path.join(options.storeRoot, `held-${process.pid}-${randomBytes(6).toString("hex")}.sock`);
 		const socketPath = Buffer.byteLength(candidate) < 104

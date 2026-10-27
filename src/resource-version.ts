@@ -15,7 +15,7 @@ import { containsFilesystemPath, filesystemPathKey, relativeFilesystemPath } fro
 import { RuntimeLifecycleLane, SharedAbortScope } from "./runtime-lifecycle.ts";
 import { TimelineInterval } from "./task-timing.ts";
 import type { ValidationMetrics } from "./settlement.ts";
-import { ChunkedContent, ContentChunkPool, parseContentManifest, contentDigest, contentMemory, readContent, type ContentVersion, type ContentChunkLimits, type ChunkedContentManifest } from "./content-chunks.ts";
+import { ChunkedContent, ContentChunkPool, DEFAULT_CONTENT_LIMITS, parseContentManifest, contentDigest, contentMemory, readContent, type ContentVersion, type ContentChunkLimits, type ChunkedContentManifest } from "./content-chunks.ts";
 import type { ProvenanceCertificateStore } from "./reuse-store.ts";
 import { validateArtifact, type ArtifactReference } from "./artifact-reference.ts";
 import { isSha256Digest, sha256Digest, type Sha256Digest } from "./stable-value-hash.ts";
@@ -66,7 +66,47 @@ export type ResourceVersionValidation = ResourceValidationMetrics & {
 };
 
 export type ResourceChangeSet = { readonly uncertain: boolean; readonly paths: ReadonlyArray<string>; };
-export interface ResourceInputPersistence { readonly store: ProvenanceCertificateStore; readonly limits?: Partial<ContentChunkLimits>; }
+export interface ResourceInputPersistence {
+	readonly store: ProvenanceCertificateStore; readonly limits?: Partial<ContentChunkLimits>;
+	/** Explicit internal state: this cache and its aliases are outside the source-unchanged guarantee. */
+	readonly internalCache?: boolean;
+	/** Ephemeral shared lease; never serialized or restored as execution authority. */
+	readonly contents?: ContentChunkPool;
+	readonly memory?: ResourceInputMemory;
+}
+
+/** Shared retention accounting permits nested queries without serializing their consumers. */
+class ResourceInputMemory {
+	private retained = 0;
+	readonly limit: number;
+	constructor(limit: number) { this.limit = limit; }
+	get bytes(): number { return this.retained; }
+	get remainingBytes(): number { return this.limit - this.retained; }
+	change(bytes: number): void {
+		if (bytes > this.remainingBytes) throw new Error("resource_snapshot_budget_exceeded");
+		if (this.retained + bytes < 0) throw new Error("resource_snapshot_budget_underflow");
+		this.retained += bytes;
+	}
+}
+const observationBytes = (key: string, entry: ResourceObservation) =>
+	(key.length + entry.path.length + entry.fingerprint.length + (entry.stamp?.length ?? 0)) * 2 + 128;
+class ResourceObservations extends Map<string, ResourceObservation> {
+	private readonly memory?: ResourceInputMemory;
+	private bytes = 0;
+	constructor(memory?: ResourceInputMemory, entries?: Iterable<readonly [string, ResourceObservation]>) {
+		super(); this.memory = memory;
+		try { for (const [key, value] of entries ?? []) this.set(key, value); } catch (error) { this.clear(); throw error; }
+	}
+	override set(key: string, value: ResourceObservation): this {
+		const prior = this.get(key), bytes = observationBytes(key, value) - (prior ? observationBytes(key, prior) : 0);
+		this.memory?.change(bytes); this.bytes += bytes; return super.set(key, value);
+	}
+	override delete(key: string): boolean {
+		const prior = this.get(key), bytes = prior ? observationBytes(key, prior) : 0;
+		this.memory?.change(-bytes); this.bytes -= bytes; return super.delete(key);
+	}
+	override clear(): void { this.memory?.change(-this.bytes); this.bytes = 0; super.clear(); }
+}
 
 /** A captured tree entry as Git stages it: a regular file's object id, or a symbolic link's target. */
 export type TreeObject = { readonly mode: number; readonly blob: string; readonly link?: never } | { readonly mode: number; readonly link: string; readonly blob?: never };
@@ -225,7 +265,10 @@ export class ResourceReadView {
 	private owner?: ResourceReadView;
 	private loadOwner = false;
 	private failure?: Error;
-	private capturedBytes = 0;
+	private allocatedBytes = 0;
+	private readonly memory?: ResourceInputMemory;
+	private get capturedBytes(): number { return this.allocatedBytes; }
+	private set capturedBytes(bytes: number) { this.memory?.change(bytes - this.allocatedBytes); this.allocatedBytes = bytes; }
 	private objectCount = 0;
 	private inputEpoch = 0;
 	private sealed = false;
@@ -250,9 +293,10 @@ export class ResourceReadView {
 	private readonly contentOwners = new Map<ContentChunkPool, { readonly dispose: () => Promise<void> }>();
 	readonly verifyingInputs: boolean;
 	constructor(maxBytes: number, load?: (dependency: ResourceDependency) => Promise<void>, boundary?: ResourceReadView["boundary"],
-		observeObject?: ResourceReadView["observeObject"], storage?: ContentChunkPool | "verify") {
+		observeObject?: ResourceReadView["observeObject"], storage?: ContentChunkPool | "verify", memory?: ResourceInputMemory) {
 		if (!Number.isFinite(maxBytes) || maxBytes < 0) throw new Error("resource_snapshot_budget_invalid");
 		this.maxBytes = maxBytes;
+		this.memory = memory;
 		this.load = load;
 		this.boundary = boundary;
 		this.observeObject = observeObject;
@@ -261,7 +305,7 @@ export class ResourceReadView {
 		if (this.contents) this.retainContentPool(this.contents);
 	}
 	get bytes(): number { return this.capturedBytes; }
-	get remainingBytes(): number { return Math.max(0, this.maxBytes - this.capturedBytes); }
+	get remainingBytes(): number { return Math.max(0, Math.min(this.maxBytes - this.capturedBytes, this.memory?.remainingBytes ?? this.maxBytes)); }
 	get hasPreparedInputs(): boolean { return [...this.prepared?.bindings.values() ?? []].some(entries => [...entries.values()].some(entry => entry.retained && !entry.revoked && entry.destination.retained)); }
 	get canRetainObject(): boolean { return !this.verifyingInputs && process.platform === "linux" && this.objectCount < 64; }
 	get retained(): boolean { return this.failure === undefined && this.owner?.retained !== false; }
@@ -274,23 +318,23 @@ export class ResourceReadView {
 		return resources;
 	}
 	/** Read completed entries without allowing a borrower to load or seal its active owner. */
-	readOnly(load = false): ResourceReadView {
+	readOnly(load = false, memory = this.memory): ResourceReadView {
 		this.assertComplete();
-		return Object.assign(new ResourceReadView(0), { entries: this.entries, owner: this, sealed: true, boundary: this.boundary, prepared: this.prepared, loadOwner: load });
+		return Object.assign(new ResourceReadView(0, undefined, undefined, undefined, undefined, memory), { entries: this.entries, owner: this, sealed: true, boundary: this.boundary, prepared: this.prepared, loadOwner: load });
 	}
 	/** Keep proven path metadata; payloads and preparations remain with their original owner. */
-	retainMetadata(observations: ReadonlyMap<string, ResourceObservation>, maxBytes: number): ResourceReadView | undefined {
+	retainMetadata(observations: ReadonlyMap<string, ResourceObservation>, maxBytes: number, memory = this.memory): ResourceReadView | undefined {
 		this.assertComplete();
 		if (maxBytes <= 0) return undefined;
 		// The root proof still anchors queries whose retained metadata belongs to another token.
 		let retained = this.boundary?.dependency && observations.has(this.boundary.dependency)
-			? new ResourceReadView(maxBytes, undefined, this.boundary) : undefined;
+			? new ResourceReadView(maxBytes, undefined, this.boundary, undefined, undefined, memory) : undefined;
 		for (const observation of observations.values()) for (let target: string | undefined = filesystemPathKey(observation.path); target;) {
 			const entry = this.entries.get(target);
 			if (!entry || retained?.entries.has(target)) break;
 			const dependency = entry.metadata?.dependency && observations.has(entry.metadata.dependency) ? entry.metadata.dependency : entry.dependency;
 			if (!dependency || !observations.has(dependency)) break;
-			retained ??= new ResourceReadView(maxBytes);
+			retained ??= new ResourceReadView(maxBytes, undefined, undefined, undefined, undefined, memory);
 			retained.capture(target, resourceMetadata(entry, dependency));
 			if (!retained.retained) { void retained.dispose(); return undefined; }
 			target = entry.type === "alias" ? entry.target : undefined;
@@ -330,7 +374,7 @@ export class ResourceReadView {
 		if (this.sealed) throw new Error("resource_snapshot_not_capturing");
 		if (this.failure) { if (this.load) throw this.failure; return false; }
 		if (!isSafeCount(bytes)) throw new Error("resource_snapshot_budget_invalid");
-		if (this.bytes + bytes > this.maxBytes) {
+		if (bytes > this.remainingBytes) {
 			this.failure = new Error("resource_snapshot_budget_exceeded");
 			for (const entry of this.entries.values()) this.releaseObject(entry);
 			this.entries.clear(); this.objectCount = 0;
@@ -358,7 +402,7 @@ export class ResourceReadView {
 			Buffer.byteLength(retained.metadata?.dependency ?? "") + 64 + objectBytes + 32 * (Number(!!retained.computation) + Number(!!retained.metadata?.computation && retained.metadata.computation !== retained.computation)) + (retained.type === "file" ? retained.content ? contentMemory(retained.content) : retained.version ? 96 : 0 : retained.type === "directory"
 				? retained.entries?.reduce((sum, name) => sum + Buffer.byteLength(name) + 16, 0) ?? 0
 				: retained.type === "alias" ? Buffer.byteLength(retained.target ?? "") + Buffer.byteLength(retained.link) : 0);
-		if (retained.object !== undefined && (this.bytes + bytes - (previous?.bytes ?? 0) - reservedBytes > this.maxBytes ||
+		if (retained.object !== undefined && (bytes - (previous?.bytes ?? 0) - reservedBytes > this.remainingBytes ||
 			this.objectCount - Number(previous?.object !== undefined) >= 64)) {
 			this.releaseObject(retained); retained = { ...retained, object: undefined, objectBytes: undefined }; bytes -= objectBytes;
 		}
@@ -520,14 +564,14 @@ export class ResourceReadView {
 				computationBytes += evaluation.dependencies.length * 96;
 				pending.shareable = !view.foreignInputs;
 				if (pending.shareable && view.collectProofs?.size) for (const proof of view.collectProofs.values())
-					(pending.proofs ??= []).push(proof.manager.retain({ ...proof, view: undefined }));
+					(pending.proofs ??= []).push(proof.manager.retain({ ...proof, view: undefined }, undefined, this.memory));
 			}, (observed, commit) => {
 				if (commit === false) return observed && this.observed?.(observed, false);
 				pending.dependencies = observed;
 				if (owner.sealed && this.missing && observed) {
 					const proofs = this.observed?.(observed, false);
 					if (!proofs || [...observed].some(key => !proofs.some(proof => proof.observations.has(key)))) pending.dependencies = undefined;
-					else for (const proof of proofs) (pending.proofs ??= []).push(proof.manager.retain({ ...proof, view: undefined }));
+					else for (const proof of proofs) (pending.proofs ??= []).push(proof.manager.retain({ ...proof, view: undefined }, undefined, this.memory));
 				}
 			}).then(async () => {
 				if (!resource) throw new Error("resource_preparation_missing");
@@ -541,7 +585,7 @@ export class ResourceReadView {
 				pending.cancellation.signal.throwIfAborted();
 				this.assertComplete(); destination.assertComplete();
 				const retention = destination.preparations();
-				if (inputEpoch === owner.inputEpoch && !destination.sealed && destination.bytes + bytes <= destination.maxBytes) {
+					if (inputEpoch === owner.inputEpoch && !destination.sealed && bytes <= destination.remainingBytes) {
 					let entries = retention.bindings.get(identity);
 					if (!entries) retention.bindings.set(identity, entries = new Map());
 					if (!entries.has(key) || entries.get(key) === pending) {
@@ -557,9 +601,9 @@ export class ResourceReadView {
 	/** Each evaluation owns its proof and failures while borrowing the input lifetime. */
 	async evaluate<T>(operation: (view: ResourceReadView) => Promise<T>, observed?: ResourceInputSource["observed"],
 		root?: string | { readonly root: string; readonly physicalRoot: string }, lookup = this.lookup, missing = this.missing,
-		acceptProofs = this.acceptProofs, validateInputs = this.validateInputs): Promise<T> {
+		acceptProofs = this.acceptProofs, validateInputs = this.validateInputs, memory = this.memory): Promise<T> {
 		return collectResourceComputation(async () => {
-			const view = this.readOnly(true);
+			const view = this.readOnly(true, memory);
 			view.dependencies = new Set();
 			Object.assign(view, { lookup, missing, acceptProofs, observed, validateInputs, onForeignInputs: this.onForeignInputs, collectProofs: this.collectProofs, preparing: this.preparing });
 			try {
@@ -599,39 +643,56 @@ export class ResourceReadView {
 		});
 	}
 	/** Persist owned data only; object pins, live resources, callbacks and timing receipts stay with this owner. */
-	async persistentSnapshot(observations: ReadonlyMap<string, ResourceObservation>, store: ProvenanceCertificateStore) {
+	async persistentSnapshot(observations: ReadonlyMap<string, ResourceObservation>, store: ProvenanceCertificateStore, inputs: readonly ResourceReadView[] = []) {
 		this.assertComplete(true);
 		if (!this.contents) throw new Error("persistent input storage is not configured");
-		const entries: PersistentResourceEntry[] = [];
-		for (const [target, entry] of this.entries) {
-			const { type, realPath, dependency } = entry;
-			const metadata = entry.metadata && { dependency: entry.metadata.dependency, size: entry.metadata.size };
-			let content: ChunkedContentManifest | undefined;
-			if (type === "file" && entry.content) {
-				const bytes = entry.content;
-				const version = bytes instanceof ChunkedContent ? bytes : (await this.contents.capture(async sink => {
-					await sink(bytes); return { bytesRead: bytes.length, hash: hash("sha256", bytes) };
-				})).content;
-				await version.publish(); content = version.manifest;
+		const sources = [...new Set([this, ...inputs])];
+		const aggregate = sources.length > 1 ? new ResourceReadView(this.remainingBytes, undefined, this.boundary, undefined, this.contents, this.memory) : this;
+		try {
+			if (aggregate !== this) for (const source of sources) {
+				source.assertComplete(true);
+				for (const [target, entry] of source.entries) {
+					const selected = entry.dependency && observations.has(entry.dependency) ? entry
+						: entry.metadata?.dependency && observations.has(entry.metadata.dependency) ? resourceMetadata(entry, entry.metadata.dependency) : undefined;
+					if (!selected) continue;
+					const { object: _object, objectBytes: _objectBytes, computation: _computation, ...data } = selected;
+					aggregate.capture(target, { ...data, metadata: selected.metadata && { ...selected.metadata, computation: undefined } });
+				}
 			}
-			entries.push([target, { type, realPath, dependency, metadata, ...(content ? { content } : {}),
-				...(type === "directory" ? { entries: entry.entries } : type === "alias" ? { target: entry.target, link: entry.link } : {}) }]);
-		}
-		const preparations: PersistentPreparation[] = [];
-		for (const [binding, values] of this.prepared?.bindings ?? []) for (const [key, prepared] of values) {
-			if (!this.boundary || typeof binding !== "string" || !prepared.retained || prepared.revoked || !prepared.data || prepared.destination !== this ||
-				!prepared.shareable || !prepared.dependencies || key.length > 65536 ||
-				prepared.resource && !containsFilesystemPath(this.boundary.root, prepared.resource) ||
-				prepared.boundary?.root !== this.boundary?.root || prepared.boundary?.physicalRoot !== this.boundary?.physicalRoot ||
-				!this.boundary?.dependency || !prepared.dependencies.has(this.boundary.dependency) || [...prepared.dependencies].some(key => !observations.has(key))) continue;
-			// A query may build through one view and retain in another. Its complete proof, not that temporary owner identity, closes the record.
-			const dependencies = new Set(prepared.dependencies);
-			if (prepared.proofs?.some(proof => proof.root !== this.boundary!.root || proof.physicalRoot !== this.boundary!.physicalRoot ||
-				[...proof.observations].some(([key, observation]) => observations.get(key)?.fingerprint !== observation.fingerprint))) continue;
-			for (const proof of prepared.proofs ?? []) for (const key of proof.observations.keys()) dependencies.add(key);
-			preparations.push({ binding, key, resource: prepared.resource, dependencies: [...dependencies], value: await store.artifacts.put(prepared.data) });
-		}
-		this.assertComplete(true); return { entries, preparations };
+			aggregate.seal();
+			const entries: PersistentResourceEntry[] = [];
+			for (const [target, entry] of aggregate.entries) {
+				const { type, realPath, dependency } = entry;
+				const metadata = entry.metadata && { dependency: entry.metadata.dependency, size: entry.metadata.size };
+				let content: ChunkedContentManifest | undefined;
+				if (type === "file" && entry.content) {
+					const bytes = entry.content;
+					const version = bytes instanceof ChunkedContent ? bytes : (await this.contents.capture(async sink => {
+						await sink(bytes); return { bytesRead: bytes.length, hash: hash("sha256", bytes) };
+					})).content;
+					if (version.pool.storeRoot !== store.root) throw new Error("persistent input content store changed");
+					await version.publish(); content = version.manifest;
+				}
+				entries.push([target, { type, realPath, dependency, metadata, ...(content ? { content } : {}),
+					...(type === "directory" ? { entries: entry.entries } : type === "alias" ? { target: entry.target, link: entry.link } : {}) }]);
+			}
+			const preparations: PersistentPreparation[] = [];
+			for (const [binding, values] of this.prepared?.bindings ?? []) for (const [key, prepared] of values) {
+				if (!this.boundary || typeof binding !== "string" || !prepared.retained || prepared.revoked || !prepared.data || prepared.destination !== this ||
+					!prepared.shareable || !prepared.dependencies || key.length > 65536 ||
+					prepared.resource && !containsFilesystemPath(this.boundary.root, prepared.resource) ||
+					prepared.boundary?.root !== this.boundary?.root || prepared.boundary?.physicalRoot !== this.boundary?.physicalRoot ||
+					!this.boundary?.dependency || !prepared.dependencies.has(this.boundary.dependency) || [...prepared.dependencies].some(key => !observations.has(key))) continue;
+				// A query may build through one view and retain in another. Its complete proof, not that temporary owner identity, closes the record.
+				const dependencies = new Set(prepared.dependencies);
+				if (prepared.proofs?.some(proof => proof.root !== this.boundary!.root || proof.physicalRoot !== this.boundary!.physicalRoot ||
+					[...proof.observations].some(([key, observation]) => observations.get(key)?.fingerprint !== observation.fingerprint))) continue;
+				for (const proof of prepared.proofs ?? []) for (const key of proof.observations.keys()) dependencies.add(key);
+				preparations.push({ binding, key, resource: prepared.resource, dependencies: [...dependencies], value: await store.artifacts.put(prepared.data) });
+			}
+			for (const source of sources) source.assertComplete(true);
+			return { entries, preparations };
+		} finally { if (aggregate !== this) await aggregate.dispose(); }
 	}
 	/** Restore into the same preparation table with fresh cancellation and lifetime state, never old execution authority. */
 	async restorePreparations(preparations: readonly PersistentPreparation[], store: ProvenanceCertificateStore, signal?: AbortSignal): Promise<void> {
@@ -658,16 +719,19 @@ export class ResourceReadView {
 	dispose(): void | Promise<void> {
 		this.failure = new Error("resource_snapshot_disposed");
 		if (this.owner) return;
+		if (this.disposal) return this.disposal;
 		for (const owner of this.contentOwners.values()) void this.preparations().lifetime.release(owner);
 		this.contentOwners.clear();
 		for (const entry of this.entries.values()) this.releaseObject(entry);
 		this.entries.clear(); this.objectCount = 0;
-		return this.disposal ??= this.prepared ? this.prepared.lifetime.close(async () => {
+		const pending = this.prepared ? this.prepared.lifetime.close(async () => {
 			await this.prepared!.lifetime.drain();
 			await Promise.allSettled([this.pending, ...[...this.prepared!.bindings.values()].flatMap(entries => [...entries.values()].filter(resource => resource.destination === this).map(resource =>
 				this.prepared!.lifetime.release(resource)))]);
 			this.prepared!.bindings.clear();
 		}) : this.pending?.then(() => {}, () => {});
+		if (pending) return this.disposal = pending.finally(() => { this.capturedBytes = 0; });
+		this.capturedBytes = 0;
 	}
 	private retainContentPool(pool: ContentChunkPool): void {
 		if (!this.contentOwners.has(pool)) this.contentOwners.set(pool, { dispose: pool.retain() });
@@ -937,21 +1001,38 @@ export class ResourceVersionManager {
 
 	/** Notification cursor for preparation; empty observations cannot validate or seal any resource. */
 	observeChanges(): Promise<ResourceVersionToken> { return this.captureToken([]); }
+	/** Keep discovery alive between independently rejected or released input records. */
+	acquire(): () => void | Promise<void> {
+		if (!this.open) throw new Error("resource_version_manager_closed");
+		this.references++; return releaseOnce(() => this.releaseCapture(new Map()));
+	}
 
 	/** Store a sealed input closure. Publication never upgrades its historical observations into current authority. */
-	async persist(token: ResourceVersionToken): Promise<Sha256Digest> {
+	async persist(token: ResourceVersionToken, inputs: readonly ResourceVersionToken[] = []): Promise<Sha256Digest> {
 		if (!this.open || token.manager !== this || token.root !== this.root || !token.view || !this.persistentInputs) throw new Error("persistent input owner changed");
 		await this.assertPersistentStore();
 		return this.persistentInputs.store.withPublication(async () => {
-			const observations = [...token.observations.values()].filter(observation => observation.scope !== "binding");
-			const { entries, preparations } = await token.view!.persistentSnapshot(new Map(observations.map(observation => [dependencyKey(observation), observation])), this.persistentInputs!.store);
-			const payload: PersistentResourcePayload = { root: this.root, physicalRoot: token.physicalRoot, observations, entries, preparations };
-			const references = new Map<Sha256Digest, ArtifactReference>();
-			for (const [, entry] of entries) for (const reference of entry.content?.chunks ?? []) if (reference) references.set(reference.digest, reference);
-			for (const preparation of preparations) references.set(preparation.value.digest, preparation.value);
-			token.view!.assertComplete(true);
-			if (!this.open || !observations.length) throw new Error("persistent input owner changed");
-			return (await this.persistentInputs!.store.putInputVersion(payload, [...references.values()])).id;
+			const sources = [...new Set([token, ...inputs.filter(input => input.view?.retained)])];
+			const proof = new ResourceObservations(this.persistentInputs!.memory);
+			try {
+				for (const source of sources) {
+					if (source.root !== token.root || source.physicalRoot !== token.physicalRoot) throw new Error("persistent input closure root changed");
+					for (const [key, observation] of source.observations) if (observation.scope !== "binding") {
+						if (proof.has(key) && proof.get(key)!.fingerprint !== observation.fingerprint) throw new Error("persistent input closure conflict");
+						proof.set(key, observation);
+					}
+				}
+				const observations = [...proof.values()];
+				const { entries, preparations } = await token.view!.persistentSnapshot(proof, this.persistentInputs!.store, sources.map(source => source.view!));
+				if (!entries.length && !preparations.length) throw new Error("persistent input closure empty");
+				const payload: PersistentResourcePayload = { root: this.root, physicalRoot: token.physicalRoot, observations, entries, preparations };
+				const references = new Map<Sha256Digest, ArtifactReference>();
+				for (const [, entry] of entries) for (const reference of entry.content?.chunks ?? []) if (reference) references.set(reference.digest, reference);
+				for (const preparation of preparations) references.set(preparation.value.digest, preparation.value);
+				token.view!.assertComplete(true);
+				if (!this.open || !observations.length) throw new Error("persistent input owner changed");
+				return (await this.persistentInputs!.store.putInputVersion(payload, [...references.values()])).id;
+			} finally { proof.clear(); }
 		});
 	}
 
@@ -963,9 +1044,14 @@ export class ResourceVersionManager {
 		return store.read(async signal => {
 			const record = await store.getInputVersion(id, signal); if (!record) return;
 			const payload = parsePersistentResourcePayload(record.payload, this.root);
-			const observations = new Map(payload.observations.map(observation => [dependencyKey(observation), observation]));
-			const contents = new ContentChunkPool(store, limits), view = new ResourceReadView(retainBytes, undefined,
-				{ root: this.root, physicalRoot: payload.physicalRoot, dependency: dependencyKey({ path: this.root, scope: "resolution" }) }, undefined, contents);
+			const proofBytes = payload.observations.reduce((sum, entry) => sum + observationBytes(dependencyKey(entry), entry), 0);
+			if (proofBytes > retainBytes) throw new Error("resource_snapshot_budget_exceeded");
+			const contents = this.persistentInputs!.contents ?? new ContentChunkPool(store, limits);
+			const observations = new ResourceObservations(this.persistentInputs!.memory, payload.observations.map(observation => [dependencyKey(observation), observation]));
+			let view: ResourceReadView;
+			try { view = new ResourceReadView(retainBytes - proofBytes, undefined,
+				{ root: this.root, physicalRoot: payload.physicalRoot, dependency: dependencyKey({ path: this.root, scope: "resolution" }) }, undefined, contents, this.persistentInputs!.memory); }
+			catch (error) { observations.clear(); throw error; }
 			this.references++;
 			const release = releaseOnce(() => this.releaseCapture(observations, view));
 			try {
@@ -992,10 +1078,15 @@ export class ResourceVersionManager {
 	}
 
 	/** Discover existing input closures without a separate ID index. The caller owns every yielded token. */
-	async *recover(retainBytes: number, options: { readonly maxCandidates?: number; readonly signal?: AbortSignal } = {}):
+	async *recover(retainBytes: number | (() => number), options: { readonly maxCandidates?: number; readonly signal?: AbortSignal } = {}):
 		AsyncGenerator<{ readonly id: Sha256Digest; readonly token: ResourceVersionToken }> {
 		if (!this.open || !this.persistentInputs || this.snapshotExcludes.size) throw new Error("persistent input owner changed");
-		if (!Number.isFinite(retainBytes) || retainBytes < 0) throw new Error("resource_snapshot_budget_invalid");
+		const budget = () => {
+			const bytes = typeof retainBytes === "number" ? retainBytes : retainBytes();
+			if (!Number.isFinite(bytes) || bytes < 0) throw new Error("resource_snapshot_budget_invalid");
+			return bytes;
+		};
+		budget();
 		const { store } = this.persistentInputs, { signal } = options;
 		signal?.throwIfAborted(); await this.assertPersistentStore();
 		for await (const record of store.candidatesInputVersions(options.maxCandidates ?? Math.min(store.limits.maxCertificates, 4096), signal)) {
@@ -1004,7 +1095,7 @@ export class ResourceVersionManager {
 			if ((record.payload as Partial<PersistentResourcePayload> | null)?.root !== this.root) continue;
 			let token: ResourceVersionToken | undefined;
 			try {
-				token = await this.restore(record.id, retainBytes, signal);
+				token = await this.restore(record.id, budget(), signal);
 				signal?.throwIfAborted(); store.signal.throwIfAborted();
 				if (!this.open) throw new Error("persistent input owner changed");
 			} catch (error) {
@@ -1018,7 +1109,7 @@ export class ResourceVersionManager {
 
 	/** Resolve existing ancestors before creating the cache: persistent capture must not write into its source. */
 	private async assertPersistentStore(): Promise<void> {
-		if (!this.persistentInputs) return;
+		if (!this.persistentInputs || this.persistentInputs.internalCache) return;
 		await withFilesystemReadView(undefined, async filesystem => {
 			const root = await filesystem.realpath(this.root), { path: resolved } = await resolveFilesystemDestination(this.persistentInputs!.store.root, filesystem);
 			if (containsFilesystemPath(root, resolved) || containsFilesystemPath(resolved, root)) throw new Error("persistent input cache must be outside its source tree");
@@ -1026,11 +1117,13 @@ export class ResourceVersionManager {
 	}
 
 	/** Own an evaluated query's evidence without keeping its input buffers or source branch alive. */
-	retain(token: ResourceVersionToken, metadataBytes?: number): ResourceVersionToken {
+	retain(token: ResourceVersionToken, metadataBytes?: number, memory = this.persistentInputs?.memory): ResourceVersionToken {
 		if (!this.open || token.manager !== this || token.root !== this.root || !token.observations.size)
 			throw new Error("resource_version_owner_changed");
-		const observations = new Map(token.observations);
-		const view = metadataBytes === undefined || !token.view?.retained ? undefined : token.view.retainMetadata(observations, metadataBytes);
+		const observations = new ResourceObservations(memory, token.observations);
+		let view: ResourceReadView | undefined;
+		try { view = metadataBytes === undefined || !token.view?.retained ? undefined : token.view.retainMetadata(observations, metadataBytes, memory); }
+		catch (error) { observations.clear(); throw error; }
 		this.references++;
 		return { ...token, observations, view, watching: false, preciseContent: Object.freeze([]), release: releaseOnce(() => this.releaseCapture(observations, view)) };
 	}
@@ -1039,7 +1132,7 @@ export class ResourceVersionManager {
 		providedInputs?: ReadonlyMap<string, ResourceInput>): Promise<ResourceVersionToken> {
 		if (!this.open) throw new Error("resource_version_manager_closed");
 		if (this.snapshotExcludes.size && retainBytes !== undefined) throw new Error("resource_filtered_snapshot_not_readable");
-		const observations = new Map<string, ResourceObservation>();
+		const observations = new ResourceObservations(this.persistentInputs?.memory);
 		const treeObjects = this.gitObjects && dependencies?.some((dependency) => dependency.scope === "tree_content") ? new Map<string, TreeObject>() : undefined;
 		let precise: Awaited<ReturnType<ResourceVersionManager["acquirePreciseWatches"]>> | undefined;
 		this.references++;
@@ -1072,7 +1165,8 @@ export class ResourceVersionManager {
 					view!.captureObject(target, content, key);
 					const { value, stamp } = content.entries ? fingerprintDirectory(content.stat, content.realPath, content.entries) : fingerprintFile(content);
 					observations.set(key, { ...dependency, stamp, fingerprint: digest({ path: filesystemPathKey(target), scope: dependency.scope, value }) });
-				}, retainBytes !== undefined && this.persistentInputs ? new ContentChunkPool(this.persistentInputs.store, this.persistentInputs.limits) : undefined);
+				}, retainBytes !== undefined && this.persistentInputs ? this.persistentInputs.contents ?? new ContentChunkPool(this.persistentInputs.store, this.persistentInputs.limits) : undefined,
+				this.persistentInputs?.memory);
 			if (view) observations.set(boundaryKey, { ...boundary, stamp: filesystemPathKey(physicalRoot),
 				fingerprint: digest({ path: filesystemPathKey(this.root), scope: "resolution", value: filesystemPathKey(physicalRoot) }) });
 			if (dependencies) await capture(dependencies);
@@ -1207,6 +1301,67 @@ export class ResourceVersionManager {
 }
 
 const managers = new Map<string, ResourceVersionManager>();
+const persistentManagers = new WeakMap<ResourceInputPersistence, Map<string, ResourceVersionManager>>();
+
+/** One call's finite input leases; records, proof checks and publication stay with the existing manager/store. */
+export class ResourceInputSession {
+	private readonly lifecycle = new RuntimeLifecycleLane();
+	private readonly restored = new Map<string, { readonly tokens: ResourceVersionToken[]; readonly ready: Promise<readonly ResourceVersionToken[]> }>();
+	private readonly owners = new Map<string, () => void | Promise<void>>();
+	private readonly published = new WeakSet<ResourceVersionToken>();
+	private readonly persistence: ResourceInputPersistence;
+	private readonly releaseContents: () => Promise<void>;
+	readonly memory: ResourceInputMemory;
+	readonly contents: ContentChunkPool;
+	readonly configuration: ResourceInputPersistence;
+	readonly maxBytes: number;
+	constructor(configuration: ResourceInputPersistence, maxBytes: number) {
+		if (!Number.isFinite(maxBytes) || maxBytes <= 0) throw new Error("resource_snapshot_budget_invalid");
+		this.configuration = configuration; this.maxBytes = maxBytes;
+		this.memory = new ResourceInputMemory(maxBytes);
+		this.contents = new ContentChunkPool(configuration.store, { ...configuration.limits,
+			maxStoredBytes: Math.min(configuration.limits?.maxStoredBytes ?? DEFAULT_CONTENT_LIMITS.maxStoredBytes, configuration.store.limits.maxBytes) });
+		this.releaseContents = this.contents.retain(); this.persistence = { ...configuration, contents: this.contents, memory: this.memory };
+	}
+	get bytes(): number { return this.memory.bytes; }
+	get remainingBytes(): number { return this.memory.remainingBytes; }
+	run<Value>(operation: () => Promise<Value>): Promise<Value> { return this.lifecycle.admit(operation); }
+	retain(token: ResourceVersionToken, metadataBytes?: number): ResourceVersionToken { return token.manager.retain(token, metadataBytes, this.memory); }
+	private manager(root: string): ResourceVersionManager {
+		if (this.lifecycle.sealed) throw new Error("resource_input_session_closed");
+		const key = path.resolve(root), manager = resourceManager(key, this.persistence);
+		if (!this.owners.has(key)) this.owners.set(key, manager.acquire());
+		return manager;
+	}
+	async capture(action: ActionKey | undefined, root: string, semantics: ActionSemanticsRegistry, maxBytes: number,
+		providedInputs?: ReadonlyMap<string, ResourceInput>): Promise<ResourceVersionToken> {
+		this.manager(root);
+		return captureResourceVersion(action, root, semantics, Math.min(maxBytes, this.remainingBytes), providedInputs, this.persistence);
+	}
+	async recover(root: string, signal: AbortSignal): Promise<readonly ResourceVersionToken[]> {
+		const key = path.resolve(root), prior = this.restored.get(key); if (prior) return prior.ready;
+		const tokens: ResourceVersionToken[] = [], manager = this.manager(key);
+		const ready = (async () => {
+			for await (const { token } of manager.recover(() => this.remainingBytes, { signal })) tokens.push(token);
+			return tokens;
+		})();
+		this.restored.set(key, { tokens, ready }); return ready;
+	}
+	async publish(token: ResourceVersionToken, signal?: AbortSignal, inputs: readonly ResourceVersionToken[] = []): Promise<void> {
+		if (signal?.aborted || this.lifecycle.sealed || this.published.has(token) || this.bytes > this.maxBytes ||
+			!token.view?.retained || token.view.contents !== this.contents || !(token.view.resources.length || token.view.hasPreparedInputs)) return;
+		try { await token.manager.persist(token, inputs); this.published.add(token); }
+		catch { /* Cache publication cannot replay or replace an already-consumed operation. */ }
+	}
+	dispose(): Promise<void> {
+		return this.lifecycle.close(async () => {
+			await this.lifecycle.drain();
+			await Promise.allSettled([...this.restored.values()].map(value => value.ready));
+			await Promise.allSettled([...this.restored.values()].flatMap(value => value.tokens).map(token => token.release())); this.restored.clear();
+			await this.releaseContents(); await Promise.allSettled([...this.owners.values()].map(release => release())); this.owners.clear();
+		});
+	}
+}
 
 export function resourceDependencies(action: ActionKey, root: string, actionSemantics: ActionSemanticsRegistry = PI_ACTION_SEMANTICS) {
 	const definition = actionSemantics.definition(action);
@@ -1216,26 +1371,29 @@ export function resourceDependencies(action: ActionKey, root: string, actionSema
 }
 
 export async function captureResourceVersion(action: ActionKey | undefined, root: string,
-	actionSemantics: ActionSemanticsRegistry = PI_ACTION_SEMANTICS, retainBytes?: number, providedInputs?: ReadonlyMap<string, ResourceInput>) {
+	actionSemantics: ActionSemanticsRegistry = PI_ACTION_SEMANTICS, retainBytes?: number, providedInputs?: ReadonlyMap<string, ResourceInput>, persistence?: ResourceInputPersistence) {
 	const dependencies = providedInputs ? [...providedInputs].map(([path, input]): ResourceDependency => ({ path,
 		scope: input === null || inputContent(input) ? "content" : "names" in input && input.names ? "names" : "type" }))
 		: action ? resourceDependencies(action, root, actionSemantics) : undefined;
 	if (dependencies?.length === 0 || (!dependencies && retainBytes === undefined)) throw new Error("resource_dependencies_unproven");
-	return resourceManager(root).capture(dependencies, retainBytes, providedInputs);
+	return resourceManager(root, persistence).capture(dependencies, retainBytes, providedInputs);
 }
 
 /** Shared notification cursor for preparation only; it cannot validate or seal an action's inputs. */
 export function observeResourceChanges(root: string): Promise<ResourceVersionToken> { return resourceManager(root).observeChanges(); }
 
-function resourceManager(root: string): ResourceVersionManager {
+function resourceManager(root: string, persistence?: ResourceInputPersistence): ResourceVersionManager {
 	const normalized = path.resolve(root);
-	let manager = managers.get(normalized);
+	let scope = persistence ? persistentManagers.get(persistence) : managers;
+	if (!scope) { scope = new Map(); persistentManagers.set(persistence!, scope); }
+	let manager = scope.get(normalized);
 	if (!manager) {
 		manager = new ResourceVersionManager(normalized, {
 			watch: path.dirname(normalized) !== normalized,
-			onIdle: () => { if (managers.get(normalized) === manager) { manager!.close(); managers.delete(normalized); } },
+			persistentInputs: persistence,
+			onIdle: () => { if (scope.get(normalized) === manager) { manager!.close(); scope.delete(normalized); } },
 		});
-		managers.set(normalized, manager);
+		scope.set(normalized, manager);
 	}
 	return manager;
 }
@@ -1277,10 +1435,10 @@ export function invalidateResourceInputs(tokens: readonly ResourceVersionToken[]
 	return [...new Set(tokens.flatMap(token => token.view?.invalidate(dependencies) ?? []))];
 }
 
-export function resourceProofBytes(versions: readonly ResourceVersionToken[]): number {
+export function resourceProofBytes(versions: readonly Pick<ResourceVersionToken, "observations">[]): number {
 	let bytes = 0;
 	for (const token of versions) for (const [key, entry] of token.observations)
-		bytes += (key.length + entry.path.length + entry.fingerprint.length + (entry.stamp?.length ?? 0)) * 2 + 128;
+		bytes += observationBytes(key, entry);
 	return bytes;
 }
 

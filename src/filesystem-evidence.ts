@@ -646,9 +646,9 @@ export async function assertNoSymlinkPath(root: string, target: string, capture?
 }
 
 /** Publish an owned JSON stage without deleting the previous snapshot on failure. */
-export async function writeJsonFile(file: string, value: unknown, space?: number, mode?: number): Promise<void> {
+export async function writeJsonFile(file: string, value: unknown, space?: number, mode?: number, reservedRoot = false): Promise<void> {
 	if (value === undefined) return fs.rm(file, { force: true });
-	await fs.mkdir(path.dirname(file), { recursive: true });
+	if (!reservedRoot) await fs.mkdir(path.dirname(file), { recursive: true });
 	const temporary = `${file}.${randomUUID()}.tmp`;
 	const handle = await fs.open(temporary, "wx", mode);
 	try {

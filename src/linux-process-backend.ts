@@ -259,7 +259,7 @@ export class LinuxProcessReuseBackend {
 				this.handoffs.clearCompleted();
 				await this.synchronous?.call("maintain", operation);
 				const result = await (operation === "gc" ? this.store.gc() : this.store.clear());
-				return { removedEntries: result.removedCertificates, removedArtifacts: result.removedArtifacts, removedBytes: result.removedBytes };
+				return { removedEntries: result.removedCertificates + result.removedInputVersions, removedArtifacts: result.removedArtifacts, removedBytes: result.removedBytes };
 			},
 		};
 	}
@@ -375,7 +375,7 @@ export class LinuxProcessReuseBackend {
 		if (!this.heldExec) {
 			const controller = new AbortController();
 			const entry: NonNullable<LinuxProcessReuseBackend["heldExec"]> = { controller, status: { state: "probing", detail: "Checking native process startup" },
-				ready: LinuxHeldExecBoundary.open({ storeRoot: this.options.storeRoot, binary: this.options.heldExecBinary, observerBinary: this.options.heldExecObserverBinary,
+				ready: LinuxHeldExecBoundary.open({ storeRoot: this.options.storeRoot, reservedRoot: this.options.store?.reservedRoot, binary: this.options.heldExecBinary, observerBinary: this.options.heldExecObserverBinary,
 					signal: AbortSignal.any([this.store.signal, controller.signal]) }).then(boundary => {
 						entry.status = { state: "ready", detail: "Native child startup and validated result reuse" }; return boundary;
 					}, error => { entry.status = { state: "unavailable", detail: errorMessage(error) }; throw error; }) };
@@ -760,7 +760,7 @@ export class LinuxProcessReuseBackend {
 
 	private async probe() {
 		if (process.platform !== "linux") throw new Error("Linux host required");
-		await mkdir(this.options.storeRoot, { recursive: true, mode: 0o700 });
+		if (!this.options.store?.reservedRoot) await mkdir(this.options.storeRoot, { recursive: true, mode: 0o700 });
 		await chmod(this.options.storeRoot, 0o700);
 		const [sandlock, strace, dispatcher] = await Promise.all([
 			resolveHostExecutable(this.options.sandlockBinary, "pi-speculative-sandlock", [path.join(os.homedir(), ".local", "bin", "pi-speculative-sandlock")]),

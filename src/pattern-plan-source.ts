@@ -1,5 +1,7 @@
 import { isSafeCount, nonNegativeFinite } from "./number-utils.ts";
-import { existsSync } from "node:fs";
+import { closeSync, existsSync } from "node:fs";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { withFilesystemReadView, type FilesystemReadView } from "./filesystem-evidence.ts";
 import path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ActionProjectionRule } from "./action-key-projection.ts";
@@ -22,6 +24,16 @@ type PatternTurn = { readonly events: Map<number, PatternAwareEventInput>; revis
 type FailedCommand = { readonly id: string; readonly tool: string; readonly input: Readonly<Record<string, unknown>>; readonly schemaHash?: string;
 	readonly paths: readonly string[]; requested: boolean };
 
+const predictionReads = new AsyncLocalStorage<FilesystemReadView>();
+const predict = <Value>(operation: () => Value): Promise<Value> => process.platform === "linux"
+	? withFilesystemReadView(undefined, async view => predictionReads.run(view, operation)) : Promise.resolve(operation());
+const predictionFileExists = (target: string): boolean => {
+	if (process.platform !== "linux") return existsSync(target);
+	const view = predictionReads.getStore();
+	if (!view) throw new Error("pattern_prediction_read_owner_missing");
+	try { closeSync(view.open(target, 0x200000)); return true; } catch { return false; }
+};
+
 export interface PatternPlanSourceController {
 	readonly source: AgentPlanSource;
 	readonly connect: (runtime: AgentRuntime) => () => void;
@@ -32,18 +44,19 @@ export interface PatternPlanSourceController {
 }
 
 export function createPatternPlanSource({
-	sessionID, cwd, actionSemantics, projectionRules, stateDirectory, workspaceIdentity, store: providedStore,
+	sessionID, cwd, actionSemantics, projectionRules, stateDirectory, reservedRoot, workspaceIdentity, store: providedStore,
 }: {
 	readonly sessionID: string;
 	readonly cwd: string;
 	readonly actionSemantics: ActionSemanticsRegistry;
 	readonly projectionRules: readonly ActionProjectionRule<ToolSettlement>[];
 	readonly stateDirectory?: string;
+	readonly reservedRoot?: boolean;
 	readonly workspaceIdentity?: string;
 	readonly store?: PatternAwareStore | Promise<PatternAwareStore>;
 }): PatternPlanSourceController {
 	cwd = path.resolve(cwd);
-	const patternActionSemantics = patternAwareActionSemantics(actionSemantics, cwd, projectionRules, existsSync);
+	const patternActionSemantics = patternAwareActionSemantics(actionSemantics, cwd, projectionRules, predictionFileExists);
 	let openedStore: { readonly key: string; readonly lease: Promise<PatternAwareStoreLease> } | undefined;
 	const ownedStores = new Map<string, Promise<PatternAwareStoreLease>>();
 	const lifecycle = new RuntimeLifecycleLane();
@@ -76,7 +89,7 @@ export function createPatternPlanSource({
 			const opening = { key: configurationKey, lease: Promise.resolve().then(async () => {
 				if (previous) await previous.lease.then(({ store }) => store.finishSession(sessionID))
 					.catch(() => undefined); // Failed loading cannot poison the next analyzer.
-				return retained ?? acquirePatternAwareStore(workspaceIdentity ?? cwd, patternSettings, stateDirectory, patternActionSemantics);
+				return retained ?? acquirePatternAwareStore(workspaceIdentity ?? cwd, patternSettings, stateDirectory, patternActionSemantics, reservedRoot);
 			}) };
 			// Predictions retain their analyzer for late feedback, including after returning to this configuration.
 			if (!retained) ownedStores.set(configurationKey, opening.lease);
@@ -142,7 +155,7 @@ export function createPatternPlanSource({
 			const turn = turnState(startInput.sessionID, startInput.turnID);
 			const store = await predictionStore(patternSettings, signal);
 			if (!store) return undefined;
-			const candidates = store.predict(startInput.sessionID, data.schemaHashes, patternSettings);
+			const candidates = await predict(() => store.predict(startInput.sessionID, data.schemaHashes, patternSettings));
 			const carried = carriedPredictions.get(startInput.sessionID), retry = retries(data.schemaHashes);
 			if (signal.aborted) return undefined;
 			carriedPredictions.delete(startInput.sessionID);
@@ -155,11 +168,11 @@ export function createPatternPlanSource({
 			const store = await predictionStore(patternSettings, signal);
 			if (!store) return undefined;
 			const id = `pattern:peer:${stableValueHash(batch.map(({ identity }) => identity.id))}`;
-			const candidates = store.predictAfterBatch(startInput.sessionID,
+			const candidates = await predict(() => store.predictAfterBatch(startInput.sessionID,
 				batch.map(({ candidate, output }) => predictedEvent(startInput, candidate, output, nonNegativeFinite(candidate.executionMs))),
 				data.schemaHashes, patternSettings,
 				// No calibrated joint confidence is supplied for the foreign batch; use a neutral prior.
-				{ visitedPatternIDs: [id], pathProbability: 0.5 });
+				{ visitedPatternIDs: [id], pathProbability: 0.5 }));
 			if (!candidates.length) return undefined;
 			const dependencies = batch.map(({ identity }) => ({ proposalID: identity.proposalID, actionID: identity.actionID,
 				identity: identity.id, condition: "execution_succeeded" as const }));
@@ -169,8 +182,8 @@ export function createPatternPlanSource({
 			if (signal.aborted || output === undefined) return undefined;
 			const context = feedbacks.get(feedback as object)?.context;
 			if (!context) return undefined;
-			const next = context.store.continue(context.continuation, predictedEvent(startInput, adoptedAction ?? candidate, output, nonNegativeFinite(candidate.executionMs)),
-				data.schemaHashes, trigger === "actor_adopted", patternSettings);
+			const next = await predict(() => context.store.continue(context.continuation, predictedEvent(startInput, adoptedAction ?? candidate, output, nonNegativeFinite(candidate.executionMs)),
+				data.schemaHashes, trigger === "actor_adopted", patternSettings));
 			if (!next.length) return undefined;
 			return { proposalID, source: "pattern_aware", revision,
 				upsert: planActions(next, context.store, [{ actionID, condition: "execution_succeeded" }], actionID),
@@ -205,7 +218,7 @@ export function createPatternPlanSource({
 				const store = await predictionStore(patternSettings, signal);
 				if (!store) return undefined;
 				const ordered = [...batch.entries()].sort(([left], [right]) => left - right).map(([, item]) => item);
-				const candidates = store.predictAfterBatch(consumeInput.sessionID, ordered, data.schemaHashes, patternSettings);
+				const candidates = await predict(() => store.predictAfterBatch(consumeInput.sessionID, ordered, data.schemaHashes, patternSettings));
 				const predicted = planActions(candidates, store);
 				// An observation can finish after its turn closes, or lose individual actions during admission.
 				const carried = { signature: patternPredictionSignature(candidates), pending: new Set(predicted.map((action) => action.feedback)), abandoned: false };
@@ -281,8 +294,11 @@ export function createPatternPlanSource({
 				await flushStores(true);
 			}),
 		}),
-		hints: ({ sessionID, schemaHashes, settings }) => admit(settings, async (patternSettings) => settings.enabled && patternSettings.enabled
-			? (await predictionStore(patternSettings))!.predict(sessionID, schemaHashes, patternSettings).slice(0, 4).map(({ tool, input, horizon }) => ({ tool, input, horizon })) : []),
+		hints: ({ sessionID, schemaHashes, settings }) => admit(settings, async (patternSettings) => {
+			if (!settings.enabled || !patternSettings.enabled) return [];
+			const store = await predictionStore(patternSettings);
+			return (await predict(() => store!.predict(sessionID, schemaHashes, patternSettings))).slice(0, 4).map(({ tool, input, horizon }) => ({ tool, input, horizon }));
+		}),
 		dispose: () => lifecycle.close(async () => {
 			await analysisTail;
 			await clearSession();
