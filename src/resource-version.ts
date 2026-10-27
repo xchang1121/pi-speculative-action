@@ -521,7 +521,15 @@ export class ResourceReadView {
 				pending.shareable = !view.foreignInputs;
 				if (pending.shareable && view.collectProofs?.size) for (const proof of view.collectProofs.values())
 					(pending.proofs ??= []).push(proof.manager.retain({ ...proof, view: undefined }));
-			}, (observed, commit) => { if (commit !== false) pending.dependencies = observed; else if (observed) return this.observed?.(observed, false); }).then(async () => {
+			}, (observed, commit) => {
+				if (commit === false) return observed && this.observed?.(observed, false);
+				pending.dependencies = observed;
+				if (owner.sealed && this.missing && observed) {
+					const proofs = this.observed?.(observed, false);
+					if (!proofs || [...observed].some(key => !proofs.some(proof => proof.observations.has(key)))) pending.dependencies = undefined;
+					else for (const proof of proofs) (pending.proofs ??= []).push(proof.manager.retain({ ...proof, view: undefined }));
+				}
+			}).then(async () => {
 				if (!resource) throw new Error("resource_preparation_missing");
 				if (registration && !registration.accepts(resource.value)) throw new Error("resource_preparation_data_invalid");
 				const data = registration && snapshotPreparation(resource.value);
@@ -611,12 +619,17 @@ export class ResourceReadView {
 		}
 		const preparations: PersistentPreparation[] = [];
 		for (const [binding, values] of this.prepared?.bindings ?? []) for (const [key, prepared] of values) {
-			if (!this.boundary || typeof binding !== "string" || !prepared.retained || prepared.revoked || !prepared.data || prepared.origin !== this || prepared.destination !== this ||
-				prepared.proofs?.length || !prepared.shareable || !prepared.dependencies || key.length > 65536 ||
+			if (!this.boundary || typeof binding !== "string" || !prepared.retained || prepared.revoked || !prepared.data || prepared.destination !== this ||
+				!prepared.shareable || !prepared.dependencies || key.length > 65536 ||
 				prepared.resource && !containsFilesystemPath(this.boundary.root, prepared.resource) ||
 				prepared.boundary?.root !== this.boundary?.root || prepared.boundary?.physicalRoot !== this.boundary?.physicalRoot ||
 				!this.boundary?.dependency || !prepared.dependencies.has(this.boundary.dependency) || [...prepared.dependencies].some(key => !observations.has(key))) continue;
-			preparations.push({ binding, key, resource: prepared.resource, dependencies: [...prepared.dependencies], value: await store.artifacts.put(prepared.data) });
+			// A query may build through one view and retain in another. Its complete proof, not that temporary owner identity, closes the record.
+			const dependencies = new Set(prepared.dependencies);
+			if (prepared.proofs?.some(proof => proof.root !== this.boundary!.root || proof.physicalRoot !== this.boundary!.physicalRoot ||
+				[...proof.observations].some(([key, observation]) => observations.get(key)?.fingerprint !== observation.fingerprint))) continue;
+			for (const proof of prepared.proofs ?? []) for (const key of proof.observations.keys()) dependencies.add(key);
+			preparations.push({ binding, key, resource: prepared.resource, dependencies: [...dependencies], value: await store.artifacts.put(prepared.data) });
 		}
 		this.assertComplete(true); return { entries, preparations };
 	}

@@ -11,7 +11,7 @@ import type { ArtifactReference } from "../src/artifact-reference.ts";
 import type { Sha256Digest } from "../src/stable-value-hash.ts";
 import { ContentChunkPool, CONTENT_CHUNK_BYTES, captureContent } from "../src/content-chunks.ts";
 import { FILESYSTEM_METADATA_FIELDS } from "../src/filesystem-evidence.ts";
-import { ResourceVersionManager, captureResourceVersion, type ResourceVersionToken } from "../src/resource-version.ts";
+import { ResourceVersionManager, captureResourceVersion, createSerializablePreparationBinding, validateResourceVersion, type ResourceVersionToken } from "../src/resource-version.ts";
 import { TimelineInterval } from "../src/task-timing.ts";
 import { ProvenanceCertificateStore } from "../src/reuse-store.ts";
 import { waitForCompletion } from "../src/runtime-lifecycle.ts";
@@ -60,7 +60,46 @@ linux("recovers a pure search computation under a fresh native binding", { timeo
 			if (mode !== "release") expect(next.output).toEqual(captured.output);
 			if (mode === "clear") { expect(next.prepared).toBe(1); captured.id = next.id; }
 		}
+		await f.store.clear();
+		const composed = await run("composed-produce"), recovered = await run("composed-discover");
+		expect(composed).toMatchObject({ prepared: 1, matches: 1, nativeMatches: 1 });
+		expect(recovered).toMatchObject({ id: composed.id, prepared: 1, matches: 0, nativeMatches: 0, materializations: 1, expired: false });
+		expect(recovered.pid).not.toBe(composed.pid); expect(recovered.output).toEqual(composed.output); expect(composed.output).toEqual(captured.output);
 		expect(await metadata([f.root, file])).toEqual(before);
+	} finally { await f.close(); }
+});
+
+linux("closes composed preparations over the original and destination versions after the original view retires", async () => {
+	const f = await fixture(), first = path.join(f.root, "first"), second = path.join(f.root, "second");
+	const binding = createSerializablePreparationBinding("composed-input-version-contract", value => typeof value === "string");
+	const proof = (token: ResourceVersionToken, keys?: ReadonlySet<string>) =>
+		[{ ...token, view: undefined, observations: new Map([...token.observations].filter(([key]) => !keys || keys.has(key))) }];
+	try {
+		await writeFile(second, ":tail");
+		for (const state of ["complete", "missing", "changed"] as const) {
+			await writeFile(first, "before"); let before = await metadata([f.root, first, second]);
+			const origin = await f.manager.capture([{ path: first, scope: "content" }], memoryBudget);
+			const destination = await f.manager.capture(undefined, memoryBudget); f.tokens.push(origin, destination);
+			const result = await origin.view!.evaluate(view => view.prepare(binding, state, async inputs => ({
+				value: (await inputs.readFile(first)).toString() + (await inputs.readFile(second)).toString(), bytes: 32, dispose() {} }),
+				async value => value, first), keys => proof(origin, keys), f.root, undefined,
+				async () => ({ view: destination.view!, observed: keys => proof(destination, keys) }), proofs => proofs,
+				async proofs => { expect((await validateResourceVersion(proofs)).expired).toBe(false); });
+			expect(result).toBe("before:tail"); await origin.release();
+			if (state === "changed") { await writeFile(first, "after"); before = await metadata([f.root, first, second]); }
+			if (state !== "missing") await destination.view!.readFile(first);
+			destination.view!.seal(); const id = await f.manager.persist(destination), record = (await f.store.getInputVersion(id))!;
+			const restored = (await f.manager.restore(id, memoryBudget))!; f.tokens.push(restored);
+			expect(restored).toBeDefined();
+			if (state !== "missing") {
+				let builds = 0;
+				const value = await restored.view!.prepare(binding, state, async inputs => { builds++; return {
+					value: (await inputs.readFile(first)).toString() + (await inputs.readFile(second)).toString(), bytes: 32, dispose() {} }; }, async value => value, first);
+				expect(value).toBe(state === "changed" ? "after:tail" : "before:tail"); expect(builds).toBe(Number(state === "changed"));
+			}
+			expect((record.payload as { preparations: unknown[] }).preparations).toHaveLength(Number(state === "complete"));
+			expect(await metadata([f.root, first, second])).toEqual(before);
+		}
 	} finally { await f.close(); }
 });
 
