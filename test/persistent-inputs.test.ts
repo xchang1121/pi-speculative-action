@@ -2,7 +2,7 @@ import { afterEach, expect, test, vi } from "vitest";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { promisify } from "node:util";
-import { mkdir, mkdtemp, open, lstat, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, open, link, lstat, lutimes, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import * as filesystem from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -11,6 +11,7 @@ import type { ArtifactReference } from "../src/artifact-reference.ts";
 import type { Sha256Digest } from "../src/stable-value-hash.ts";
 import { ContentChunkPool, CONTENT_CHUNK_BYTES, captureContent } from "../src/content-chunks.ts";
 import { FILESYSTEM_METADATA_FIELDS } from "../src/filesystem-evidence.ts";
+import * as evidence from "../src/filesystem-evidence.ts";
 import { ResourceVersionManager, captureResourceVersion, createSerializablePreparationBinding, validateResourceVersion, type ResourceVersionToken } from "../src/resource-version.ts";
 import { TimelineInterval } from "../src/task-timing.ts";
 import { ProvenanceCertificateStore } from "../src/reuse-store.ts";
@@ -130,16 +131,16 @@ linux("discovers a finite set of current input closures and releases undispatche
 			expect((await restored!.view!.readFile(file)).toString()).toBe("discoverable input");
 			expect(revision()).toBe(beforeRevision);
 		} finally { publisher.child.kill("SIGKILL"); await publisher.completed.catch(() => undefined); }
-		const native = await vi.importActual<typeof filesystem>("node:fs/promises");
+		const openSource = evidence.openFilesystemFile;
 		for (const mode of ["missing", "acquired", "cancel", "close"] as const) {
 			const current = await f.manager.persist(original), pause = gated(), controller = new AbortController();
 			const store = mode === "close" ? new ProvenanceCertificateStore(f.cache) : f.store;
 			const manager = mode === "close" ? new ResourceVersionManager(f.root, { watch: false, persistentInputs: { store } }) : f.manager;
 			let waiting = true, handle: filesystem.FileHandle | undefined, closing: Promise<void> | undefined;
-			const opening = vi.spyOn(filesystem, "open").mockImplementation(async (...args) => {
-				if (!waiting || !String(args[0]).startsWith(f.store.artifacts.root) || args[1] !== "r") return native.open(...args);
-				waiting = false; handle = mode === "missing" ? undefined : await native.open(...args);
-				await pause.wait(); return handle ?? native.open(...args);
+			const opening = vi.spyOn(evidence, "openFilesystemFile").mockImplementation(async (...args) => {
+				if (!waiting || !args[0].startsWith(f.store.artifacts.root)) return openSource(...args);
+				waiting = false; const opened = mode === "missing" ? undefined : await openSource(...args); handle = opened?.handle;
+				await pause.wait(); return opened ?? openSource(...args);
 			});
 			const restoring = manager.restore(current, memoryBudget, controller.signal);
 			const outcome = restoring.then(token => ({ token, error: undefined }), error => ({ token: undefined, error }));
@@ -394,15 +395,40 @@ linux("shares immutable chunk versions across publication, borrowing, damage, co
 		expect(pool.openChunks).toBe(0);
 		expect((await borrowed.read()).toString()).toBe(text);
 		const saved = await f.store.withPublication(async () => { await borrowed.publish(); return f.store.putInputVersion(borrowed.manifest, references); });
-		const cold = JSON.parse((await promisify(execFile)(process.execPath, ["--input-type=module", "-e", `
-			import { ContentChunkPool } from ${JSON.stringify(new URL("../src/content-chunks.ts", import.meta.url).href)};
-			import { ProvenanceCertificateStore } from ${JSON.stringify(new URL("../src/reuse-store.ts", import.meta.url).href)};
-			const store = new ProvenanceCertificateStore(${JSON.stringify(f.cache)}), pool = new ContentChunkPool(store);
-			try { const record = await store.getInputVersion(${JSON.stringify(saved.id)}), content = await pool.restore(record.payload);
-				console.log(JSON.stringify({ pid: process.pid, text: (await content.read()).toString(), bytes: pool.storedBytes }));
-			} finally { await pool.dispose(); await store.dispose(); }
-		`], { maxBuffer: 4 * CONTENT_CHUNK_BYTES })).stdout);
-		expect(cold.pid).not.toBe(process.pid); expect(cold.text).toBe(text); expect(cold.bytes).toBe(Buffer.byteLength(text));
+		for (const route of ["file", "hardlink", "symlink"] as const) {
+			const targets = [path.dirname(f.root), f.root, file];
+			for (const [index, reference] of references.entries()) {
+				const target = f.store.artifacts.artifactPath(reference.digest);
+				const source = route === "file" ? target : path.join(path.dirname(f.root), `cas-${route}-${index}`);
+				if (route !== "file") {
+					await writeFile(source, bytes.subarray(index * CONTENT_CHUNK_BYTES, (index + 1) * CONTENT_CHUNK_BYTES));
+					await rm(target); await (route === "hardlink" ? link : symlink)(source, target);
+				}
+				await utimes(source, 915148800, 946684800);
+				if (route === "symlink") await lutimes(target, 915148800, 946684800);
+				targets.push(source, target, path.dirname(target));
+			}
+			const beforeReads = await metadata(targets);
+			for (const [index, reference] of references.entries()) {
+				expect(await f.store.artifacts.has(reference)).toBe(true);
+				expect(await metadata(targets), `${route}: availability`).toEqual(beforeReads);
+				expect(await f.store.artifacts.get(reference)).toEqual(bytes.subarray(index * CONTENT_CHUNK_BYTES, (index + 1) * CONTENT_CHUNK_BYTES));
+				expect(await metadata(targets), `${route}: direct read`).toEqual(beforeReads);
+			}
+			const closure = await f.store.artifacts.load(references);
+			try { expect(Buffer.concat(references.map(reference => closure!.read(reference)))).toEqual(bytes); }
+			finally { await closure?.dispose(); }
+			const cold = JSON.parse((await promisify(execFile)(process.execPath, ["--input-type=module", "-e", `
+				import { ContentChunkPool } from ${JSON.stringify(new URL("../src/content-chunks.ts", import.meta.url).href)};
+				import { ProvenanceCertificateStore } from ${JSON.stringify(new URL("../src/reuse-store.ts", import.meta.url).href)};
+				const store = new ProvenanceCertificateStore(${JSON.stringify(f.cache)}), pool = new ContentChunkPool(store);
+				try { const record = await store.getInputVersion(${JSON.stringify(saved.id)}), content = await pool.restore(record.payload);
+					console.log(JSON.stringify({ pid: process.pid, text: (await content.read()).toString(), bytes: pool.storedBytes }));
+				} finally { await pool.dispose(); await store.dispose(); }
+			`], { maxBuffer: 4 * CONTENT_CHUNK_BYTES })).stdout);
+			expect(cold.pid).not.toBe(process.pid); expect(cold.text).toBe(text); expect(cold.bytes).toBe(Buffer.byteLength(text));
+			expect(await metadata(targets), `${route}: direct, closure and cold reads`).toEqual(beforeReads);
+		}
 		await receiver.dispose(); expect(receiver.openChunks).toBe(0);
 		expect(opened.length).toBeGreaterThan(0); expect(opened.every(handle => handle.fd === -1)).toBe(true);
 	} finally { pause.release(); await pool.dispose(); await receiver.dispose(); await f.close(); }

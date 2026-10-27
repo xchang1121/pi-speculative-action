@@ -14,7 +14,7 @@ import { digestObject, isSha256Digest, sha256Digest, sha256DigestAsync, type Sha
 import { stableStringify } from "./stable-json.ts";
 import { nonNegativeNumber, positiveInteger } from "./setting-input.ts";
 import { isMissing as missing } from "./error-utils.ts";
-import { FilesystemObjectLease, mapFilesystem, openAnonymousFilesystemFile, type FilesystemObjectTransfer } from "./filesystem-evidence.ts";
+import { FilesystemObjectLease, mapFilesystem, openAnonymousFilesystemFile, openFilesystemFile, withFilesystemReadView, type FilesystemObjectTransfer } from "./filesystem-evidence.ts";
 import { RuntimeLifecycleLane, waitForCompletion } from "./runtime-lifecycle.ts";
 import { isSafeCount } from "./number-utils.ts";
 
@@ -67,8 +67,9 @@ export class ArtifactCAS {
 
 	/** Availability hint only; publication and adoption verify content. */
 	async has(reference: ArtifactReference): Promise<boolean> {
-		const info = await stat(this.artifactPath(reference.digest)).catch((error): undefined => { if (!missing(error)) throw error; });
-		return info?.isFile() === true && info.size === reference.size;
+		const info = await withFilesystemReadView(undefined, view => view.stat(this.artifactPath(reference.digest), true)
+			.catch((error): undefined => { if (!missing(error)) throw error; }));
+		return info?.isFile() === true && info.size === BigInt(reference.size);
 	}
 
 	/** Load and integrity-check a complete effect closure before any replay side effect begins. */
@@ -150,7 +151,7 @@ export class ArtifactReadView implements VerifiedArtifactClosure {
 				} else {
 					const imported = supplied && "object" in supplied ? FilesystemObjectLease.receive(supplied.object, true) : undefined;
 					if (supplied && !imported) return false;
-					const handle = imported?.handle ?? await open(this.cas.artifactPath(reference.digest), "r").catch(error => { if (!missing(error)) throw error; return undefined; });
+					const handle = imported?.handle ?? await openArtifactFile(this.cas.artifactPath(reference.digest));
 					if (!handle) return false;
 					try {
 						const stat = imported?.stat ?? await handle.stat({ bigint: true });
@@ -603,10 +604,20 @@ function decodeInputVersion(value: unknown): StoredInputVersion | undefined {
 	} catch { return undefined; }
 }
 
+/** Named cache objects may alias source inputs. The returned reader retains the verified noatime mount. */
+async function openArtifactFile(target: string): Promise<FileHandle | undefined> {
+	return withFilesystemReadView(undefined, async view => {
+		const opened = await openFilesystemFile(target, false, view).catch((error): undefined => { if (!missing(error)) throw error; });
+		if (!opened) return;
+		try { await opened.binding?.close(); return opened.handle; }
+		catch (error) { await opened.handle.close(); throw error; }
+	}, async handle => { await handle?.close(); });
+}
+
 /** One extra byte proves a size mismatch without loading an arbitrarily enlarged corrupt object. */
 async function readOptional(target: string, size: number, signal?: AbortSignal): Promise<Buffer | undefined> {
 	signal?.throwIfAborted();
-	const file = await open(target, "r").catch((error): undefined => { if (!missing(error)) throw error; });
+	const file = await openArtifactFile(target);
 	if (!file) return;
 	try {
 		const bytes = Buffer.allocUnsafe(size + 1); let offset = 0;
