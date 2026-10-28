@@ -31,19 +31,26 @@ export async function legacyCertificate(root: string, certificate: ProcessProven
 }
 
 /** A separate owner exercises the on-disk publication protocol, including native lock recovery on process exit. */
-export function storePeer(root: string, certificate?: ProcessProvenanceCertificate, values: readonly string[] = [], crash?: "publish" | "clear" | "legacy-clear" | "collect") {
+export function storePeer(root: string, certificate?: ProcessProvenanceCertificate, values: readonly string[] = [], crash?: "publish" | "clear" | "legacy-clear" | "collect",
+	checkpoint?: { readonly ticket: string; readonly action: "hold" | "consume" | "release" }) {
 	const child = spawn(process.execPath, ["--input-type=module", "--eval", `
 		import { DatabaseSync } from 'node:sqlite';
 		import filesystem from 'node:fs/promises';
 		import { syncBuiltinESMExports } from 'node:module';
 		import { randomUUID } from 'node:crypto';
 		const { ProvenanceCertificateStore } = await import(${JSON.stringify(new URL("../src/reuse-store.ts", import.meta.url).href)});
-		const { root, certificate, values, crash } = await new Promise(resolve => process.once('message', resolve));
+		const { root, certificate, values, crash, checkpoint } = await new Promise(resolve => process.once('message', resolve));
 		const alive = setInterval(() => {}, 1000);
 		const execute = DatabaseSync.prototype.exec;
 		DatabaseSync.prototype.exec = function (sql) { try { return execute.call(this, sql); } catch (error) {
-			if ((error.errcode & 0xff) === 5) { process.send('busy'); DatabaseSync.prototype.exec = execute; } throw error; } };
+			if ((error.errcode & 0xff) === 5) { if (!checkpoint) process.send('busy'); DatabaseSync.prototype.exec = execute; } throw error; } };
 		const store = new ProvenanceCertificateStore(root);
+		if (checkpoint) {
+			const claim = await store.claimProcessCheckpoint(checkpoint.ticket, certificate.id);
+			if (claim && checkpoint.action === 'hold') { process.send('claimed'); await new Promise(() => {}); }
+			if (claim) await claim(checkpoint.action === 'consume');
+			await store.dispose(); clearInterval(alive); process.send(claim ? 'claimed' : 'miss'); process.disconnect();
+		} else {
 		if (crash && crash !== 'collect') {
 			const operation = crash === 'publish' ? 'rename' : 'rm', original = filesystem[operation];
 			filesystem[operation] = async (...args) => {
@@ -59,11 +66,12 @@ export function storePeer(root: string, certificate?: ProcessProvenanceCertifica
 		for (const value of values) await store.artifacts.put(value);
 		if (crash === 'collect') await store.gc(); else await store.put(certificate);
 		await store.dispose(); clearInterval(alive); process.send('published'); process.disconnect();
+		}
 	`], { stdio: ["ignore", "pipe", "pipe", "ipc"] });
 	let errors = ""; child.stderr!.on("data", data => { errors += data; });
 	child.on("message", message => { if (message === "crash") child.kill("SIGKILL"); });
 	const completed = once(child, "close").then(([code]) => { if (code !== 0) throw new Error(`store peer exited ${code}: ${errors}`); });
 	const noticed = Promise.race([once(child, "message").then(([message]) => message as string), completed.then(() => { throw new Error("store peer exited before its notice"); })]);
-	void completed.catch(() => undefined); void noticed.catch(() => undefined); child.send({ root, certificate, values, crash });
+	void completed.catch(() => undefined); void noticed.catch(() => undefined); child.send({ root, certificate, values, crash, checkpoint });
 	return { child, noticed, completed };
 }

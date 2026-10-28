@@ -308,6 +308,55 @@ test("requires current owner authority for a one-shot result in its original tur
 	await f.consume(f.actor(), undefined);
 });
 
+test.each(["released", "consumed", "lost", "raced", "clear", "gc", "copy", "damaged"])("preserves checkpoint claim ownership across store reopen (%s)", async mode => {
+	const f = await fixture({ orphanGraceMs: 0 }), computation = TimelineInterval.serialize(new TimelineInterval(0, 20))!;
+	const image = await f.store.artifacts.put("saved process memory"), produced = await f.produce("prefix output", 1, true);
+	const certificate = sealProcessCertificate({ ...produced, result: { replayProfile: "buffered_noninteractive", journal: produced.result.journal,
+		continuation: { imageDigest: image.digest, imageBytes: image.size }, computation } });
+	const body = { sessionID: "session", sourceRoot: f.root, physicalRoot: f.root, context: sha256Digest("boot and native build"),
+		producer: { pid: process.pid, start: "1" }, certificate, computation, image };
+	let ticket = "";
+	await f.store.withPublication(async () => { ticket = await f.store.issueProcessCheckpoint(); await f.store.putProcessCheckpoint(ticket, body); });
+	await f.store.dispose(); const reopened = storeAt(f.root, { orphanGraceMs: 0 });
+	const candidates = async (store = reopened) => { const result = []; for await (const candidate of store.processCheckpoints(certificate.weakKey, certificate.prototype.executablePath, "session")) result.push(candidate); return result; };
+	expect(await candidates()).toMatchObject([{ ticket, certificate: { id: certificate.id } }]);
+	expect((await reopened.stats()).certificates).toBe(1);
+	await expect(reopened.claimProcessCheckpoint(ticket, sha256Digest("other certificate"))).resolves.toBeUndefined();
+	if (mode === "copy") {
+		await reopened.drain(); const copy = await directories.create(); await filesystem.cp(f.root, copy, { recursive: true });
+		const cloned = storeAt(copy); expect(await candidates(cloned)).toEqual([]);
+		await expect(cloned.claimProcessCheckpoint(ticket, certificate.id)).resolves.toBeUndefined();
+		await expect(cloned.issueProcessCheckpoint()).rejects.toThrow("issuer is unavailable"); return;
+	}
+	if (mode === "damaged") {
+		storeMetadata(f.root, database => database.prepare("UPDATE process_checkpoints SET value=? WHERE ticket=?").run("{}", ticket));
+		expect(await candidates()).toEqual([]); await expect(reopened.claimProcessCheckpoint(ticket, certificate.id)).resolves.toBeUndefined();
+		await reopened.gc(); expect((await reopened.stats()).certificates).toBe(0); return;
+	}
+	if (mode === "lost") {
+		const owner = peer(f.root, certificate, [], undefined, { ticket, action: "hold" }); expect(await owner.noticed).toBe("claimed");
+		const competing = peer(f.root, certificate, [], undefined, { ticket, action: "consume" }); expect(await competing.noticed).toBe("miss"); await competing.completed;
+		owner.child.kill("SIGKILL"); await expect(owner.completed).rejects.toThrow("store peer exited");
+		await expect(reopened.claimProcessCheckpoint(ticket, certificate.id)).resolves.toBeUndefined(); expect(await candidates()).toEqual([]);
+		await expect(reopened.putProcessCheckpoint(ticket, body)).rejects.toThrow("no longer publishable"); return;
+	}
+	if (mode === "raced") {
+		const owners = [0, 1].map(() => peer(f.root, certificate, [], undefined, { ticket, action: "consume" }));
+		expect((await Promise.all(owners.map(owner => owner.noticed))).sort()).toEqual(["claimed", "miss"]);
+		await Promise.all(owners.map(owner => owner.completed)); expect(await candidates()).toEqual([]); return;
+	}
+	const claim = await reopened.claimProcessCheckpoint(ticket, certificate.id); expect(claim).toBeDefined();
+	await expect(storeAt(f.root).claimProcessCheckpoint(ticket, certificate.id)).resolves.toBeUndefined();
+	if (mode === "clear") await reopened.clear();
+	if (mode === "gc") { reopened.configure({ maxBytes: 1 }); await reopened.gc(); }
+	await claim!(mode === "consumed"); await claim!(false);
+	if (mode === "released") { expect(await candidates()).toHaveLength(1); await (await reopened.claimProcessCheckpoint(ticket, certificate.id))!(true); }
+	expect(await candidates()).toEqual([]);
+	await expect(reopened.putProcessCheckpoint(ticket, body)).rejects.toThrow("no longer publishable");
+	const next = await reopened.issueProcessCheckpoint(); expect(next).not.toBe(ticket);
+	expect(Number(next.split(":").at(-1))).toBeGreaterThan(Number(ticket.split(":").at(-1)));
+});
+
 test("reopens, validates, repairs and collects persisted history without stale observations", async () => {
 	const f = await fixture({ maxCertificates: 257, orphanGraceMs: 0 }), certificates: ProcessProvenanceCertificate[] = [], legacy = new ArtifactCAS(path.join(f.root, "cas"));
 	const original = new TimelineInterval(10, 110, [{ computation: new TimelineInterval(20, 40), overhead: true },

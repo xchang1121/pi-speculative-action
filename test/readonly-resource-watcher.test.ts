@@ -1,5 +1,7 @@
 import { expect, test, vi } from "vitest";
 import fs, { link, lstat, lutimes, mkdir, mkdtemp, readFile, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import fsSync from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
@@ -23,6 +25,53 @@ const metadata = async (paths: readonly string[]) => Promise.all(paths.map(async
   const stat = await lstat(target, { bigint: true });
   return { target, fields: Object.fromEntries(filesystemEvidence.FILESYSTEM_METADATA_FIELDS.map(field => [field, String(stat[field])])) };
 }));
+
+linux("retains a directory identity while its entries change during descriptor adoption", async () => {
+  nativeProcessLibrary(process.env.PI_SPEC_HELD_EXEC!);
+  const root = await mkdtemp(path.join(os.tmpdir(), "pi-adopt-change-")), identity = await lstat(root, { bigint: true });
+  const stat = fsSync.fstatSync; let changed = false;
+  await using view = await filesystemEvidence.openFilesystemReadView();
+  const spy = vi.spyOn(fsSync, "fstatSync").mockImplementation(((...args: Parameters<typeof stat>) => {
+    const value = stat(...args);
+    if (!changed && BigInt(value.ino) === identity.ino && BigInt(value.dev) === identity.dev) {
+      changed = true; fsSync.writeFileSync(path.join(root, "created"), "current\n");
+    }
+    return value;
+  }) as typeof stat);
+  syncBuiltinESMExports();
+  try {
+    const handle = await view.pin(root, true);
+    try { expect((await handle.stat({ bigint: true })).ino).toBe(identity.ino); }
+    finally { await handle.close(); }
+    expect(changed).toBe(true);
+    expect((await filesystemEvidence.readFilesystemDirectory(root, view)).map(entry => entry.name)).toEqual(["created"]);
+  } finally { spy.mockRestore(); syncBuiltinESMExports(); await rm(root, { recursive: true, force: true }); }
+});
+
+linux.for(["once", "continuous", "io"])("prepares a complete workspace after a concurrent input change (%s)", async mode => {
+  nativeProcessLibrary(process.env.PI_SPEC_HELD_EXEC!);
+  const root = await mkdtemp(path.join(os.tmpdir(), "pi-prepare-change-")), file = path.join(root, "input");
+  const service = new WorkspaceSandboxService(), stat = filesystemEvidence.FilesystemReadView.prototype.stat;
+  let checks = 0, changes = 0;
+  await writeFile(file, "initial");
+  const spy = vi.spyOn(filesystemEvidence.FilesystemReadView.prototype, "stat").mockImplementation(async function(this: filesystemEvidence.FilesystemReadView, target, follow) {
+    if (target === file && !follow && ++checks % 2 === 0 && (mode !== "once" || !changes)) {
+      changes++;
+      if (mode === "io") throw Object.assign(new Error("capture I/O sentinel"), { code: "EIO" });
+      await writeFile(file, `changed-${changes}`);
+    }
+    return stat.call(this, target, follow);
+  });
+  try {
+    const prepared = service.prepare(root, { driver: "git" });
+    if (mode === "once") {
+      await expect(prepared).resolves.toMatchObject({ driver: "git" });
+      spy.mockRestore();
+      expect(await service.withWorkspace(root, workspace => readFile(path.join(workspace.sandboxRoot, "input"), "utf8"))).toBe("changed-1");
+    } else await expect(prepared).rejects.toThrow(mode === "io" ? "capture I/O sentinel" : "workspace changed repeatedly");
+    expect(changes).toBe(mode === "continuous" ? 3 : 1);
+  } finally { spy.mockRestore(); await service.dispose(); await rm(root, { recursive: true, force: true }); }
+});
 
 linux.for(["file", "directory", "missing", "handoff"])("settles admitted source queries before releasing their owner (%s)", { timeout: 30_000 }, async mode => {
   nativeProcessLibrary(process.env.PI_SPEC_HELD_EXEC!);

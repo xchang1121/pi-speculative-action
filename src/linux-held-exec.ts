@@ -227,7 +227,7 @@ export type HeldExecDecision = { readonly observeTiming?: (timing: HeldExecTimin
 	| ({
 			readonly kind: "replay";
 			/** Release a reservation only when the native peer has definitely performed no adoption effects. */
-			readonly settle?: (consumed: boolean) => void;
+			readonly settle?: (consumed: boolean) => void | Promise<void>;
 			readonly output: readonly { readonly fd: 1 | 2; readonly data: Buffer }[];
 			readonly resourceEvents?: readonly { readonly fd: number; readonly kind: ResourceTransitionKind; readonly data: Buffer; readonly requested?: number }[];
 			/** Applied after commit, before output. The caller owns predecessor proof and serialization of every OFD sharer. */
@@ -509,7 +509,10 @@ export class LinuxHeldExecBoundary {
 			}
 			if (!socket.destroyed) socket.end(active?.failure ? "F\n" : "C\n");
 		} finally {
-			if (decision?.kind === "replay") decision.settle?.(prepared);
+			if (decision?.kind === "replay") {
+				try { await decision.settle?.(prepared); } catch { /* A failed durable settlement leaves the claim unavailable. */ }
+				completedAt = performance.now();
+			}
 			if (active && decision?.observeTiming) try {
 				decision.observeTiming({ requestedAt, completedAt: completedAt ?? performance.now(), barrier: active.barrier, outcome,
 					...(committedAt !== undefined ? { committedAt } : {}), ...(native ? { native } : {}) });

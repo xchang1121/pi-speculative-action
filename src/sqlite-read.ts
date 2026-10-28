@@ -92,7 +92,8 @@ export class SQLiteReadOwner {
 function query(database: DatabaseSync, request: Request): Rows | undefined {
 	const version = Number(database.prepare("PRAGMA user_version").get()?.user_version);
 	if (version < 3) return undefined;
-	if (version !== 3) throw new Error(`unsupported provenance store version ${version}`);
+	if (version !== 3 && version !== 4) throw new Error(`unsupported provenance store version ${version}`);
+	if (version === 3 && /process_checkpoints|checkpoint_owner/.test(request.sql)) return undefined;
 	database.exec("PRAGMA query_only=ON");
 	const rows: Rows = []; let bytes = 0;
 	for (const row of database.prepare(request.sql).iterate(...request.parameters)) {

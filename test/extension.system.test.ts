@@ -22,6 +22,8 @@ import { idleResources } from "./agent-system-fixture.ts";
 import { Agent, type AgentTool } from "@earendil-works/pi-agent-core";
 import { deferred, onExit } from "./async.ts";
 import { toolUse as response } from "./model.ts";
+import { storeMetadata, storePeer } from "./process-fixture.ts";
+import { digestObject, sha256Digest } from "../src/stable-value-hash.ts";
 
 const adoptions = (settlement: PredictionSettlement) => settlement.observation === "observed" && settlement.match.matched && settlement.match.adoption.status === "adopted" ? [{ prediction: settlement.prediction, relation: settlement.match.relation }] : [];
 
@@ -130,17 +132,45 @@ test.each(["async", "sync", "async-no-reuse", "sync-no-reuse"])("keeps callbacks
 	}
 });
 
-test.each(["off", "on", ...(process.platform === "linux" ? ["", "-nested", "-stale", "-running", "-retired", "-unkeyed", "-inputs", "-inputs-stale", "-sync-producer", "-sync-consumer", "-sync-both", "-sync-stale", "-sync-lost", "-sync-inputs", "-sync-inputs-stale", "-sync-inputs-preempted", "-sync-inputs-preempted-stale", "-cold", "-cold-stale", "-sync-cold", "-sync-cold-stale", "-continuation", "-continuation-stale", "-continuation-cancel"].map(mode => `native${mode}`) : [])])("runs Pi session contracts through the default entry (%s)", async mode => {
+test.each(["off", "on", ...(process.platform === "linux" ? ["", "-nested", "-stale", "-running", "-retired", "-unkeyed", "-inputs", "-inputs-stale", "-sync-producer", "-sync-consumer", "-sync-both", "-sync-stale", "-sync-lost", "-sync-inputs", "-sync-inputs-stale", "-sync-inputs-preempted", "-sync-inputs-preempted-stale", "-cold", "-cold-stale", "-sync-cold", "-sync-cold-stale", "-continuation", "-continuation-stale", "-continuation-cancel", "-continuation-cold", "-continuation-cold-stale", "-continuation-cold-session", "-continuation-cold-damaged", "-continuation-cold-context", "-continuation-cold-lost"].map(mode => `native${mode}`) : [])])("runs Pi session contracts through the default entry (%s)", { timeout: 60_000 }, async mode => {
 	const enabled = mode !== "off", native = mode.startsWith("native"), running = mode === "native-running" || mode === "native-retired";
 	const live = mode.startsWith("native-continuation");
+	const restart = live && mode.includes("cold"), phase = restart ? process.env.PI_TEST_CONTINUATION_PHASE : undefined;
+	if (restart && !phase) {
+		const root = await directories.create(os.homedir());
+		for (const current of ["produce", "consume", ...(mode === "native-continuation-cold" ? ["repeat"] : [])]) {
+			if (current === "consume" && /damaged|context|lost/.test(mode)) {
+				const saved = JSON.parse(await readText(root, "produced.json"));
+				if (mode.endsWith("damaged")) { const bytes = await readFile(saved.imagePath); bytes[0] ^= 1; await writeFile(saved.imagePath, bytes); }
+				if (mode.endsWith("context")) storeMetadata(saved.cache, database => {
+					const { id: _id, ...body } = saved.record; body.context = sha256Digest("a different boot or helper build");
+					database.prepare("UPDATE process_checkpoints SET value=? WHERE ticket=?").run(JSON.stringify({ ...body, id: digestObject(body) }), body.ticket);
+				});
+				if (mode.endsWith("lost")) {
+					const peer = storePeer(saved.cache, saved.record.certificate, [], undefined, { ticket: saved.record.ticket, action: "hold" });
+					try { expect(await peer.noticed).toBe("claimed"); } finally { peer.child.kill("SIGKILL"); await peer.completed.catch(() => {}); }
+				}
+			}
+			await new Promise<void>((resolve, reject) => {
+			const child = spawn(process.execPath, ["node_modules/vitest/vitest.mjs", "--run", "test/extension.system.test.ts", "--testNamePattern", `^runs Pi session contracts through the default entry \\(${mode}\\)$`, "--maxWorkers=1", "--no-file-parallelism"], {
+				env: { ...process.env, PI_TEST_CONTINUATION_PHASE: current, PI_TEST_CONTINUATION_ROOT: root }, stdio: ["ignore", "pipe", "pipe"] });
+			let output = ""; for (const stream of [child.stdout, child.stderr]) stream.on("data", bytes => { output += bytes; });
+			child.once("error", reject); child.once("close", code => code ? reject(new Error(`${current}: ${output}`)) : resolve());
+			});
+		}
+		const produced = JSON.parse(await readText(root, "produced.json")), consumed = JSON.parse(await readText(root, "consumed.json"));
+		expect(produced.pid).not.toBe(consumed.pid); expect(produced.session === consumed.session).toBe(!mode.endsWith("session"));
+		return;
+	}
+	const consuming = restart && phase !== "produce";
 	const stale = mode.endsWith("stale"), inputs = mode.includes("inputs"), cold = mode.includes("cold"), preempted = mode.includes("preempted"), synchronous = (callID: string) => mode.startsWith("native-sync") &&
 		(!mode.endsWith("producer") && !mode.endsWith("consumer") || callID === (mode.endsWith("producer") ? "seed" : "check"));
-	const cwd = await directories.create(native ? os.homedir() : undefined), agentDir = path.join(cwd, "agent");
-	await mkdir(agentDir); vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
-	await writeFile(path.join(cwd, "notes.txt"), "one\ntwo\n");
+	const cwd = restart ? process.env.PI_TEST_CONTINUATION_ROOT! : await directories.create(native ? os.homedir() : undefined), agentDir = path.join(cwd, "agent");
+	await mkdir(agentDir, { recursive: true }); vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+	if (!consuming) await writeFile(path.join(cwd, "notes.txt"), "one\ntwo\n");
 	const tools = native ? ["produce_notes", "format_rows", "write", "read"] : ["read", "write", "edit", "format_rows", "late_rows"];
 	await writeFile(path.join(agentDir, "speculative-action.json"), JSON.stringify({ enabled, drafterEnabled: false,
-		patternAware: { enabled: false }, prepareObservedOperations: native, candidateLimit: preempted ? 2 : undefined,
+		patternAware: { enabled: false }, prepareObservedOperations: native && !consuming, candidateLimit: preempted ? 2 : undefined,
 		maxConcurrentActions: 4, predictionTimeoutMs: 10_000 }));
 	const actor = fauxProvider({ provider: "functional-actor", models: [{ id: "actor" }], tokensPerSecond: 4_000, tokenSize: { min: 1, max: 2 } });
 	actor.setResponses([
@@ -203,8 +233,9 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["", "-nested", "-sta
 	await resourceLoader.reload();
 	const modelRuntime = await ModelRuntime.create({ authPath: path.join(agentDir, "auth.json"), modelsPath: null, refreshOnCreate: false });
 	modelRuntime.registerNativeProvider(actor.provider);
-	const { session } = await createAgentSession({ cwd, agentDir, model: actor.getModel(), modelRuntime, settingsManager, resourceLoader,
-		sessionManager: SessionManager.inMemory(cwd), tools });
+	const sessionManager = !restart ? SessionManager.inMemory(cwd) : phase === "produce" || mode.endsWith("session") ? SessionManager.create(cwd, path.join(agentDir, "sessions")) :
+		SessionManager.open(JSON.parse(await readText(cwd, "produced.json")).file);
+	const { session } = await createAgentSession({ cwd, agentDir, model: actor.getModel(), modelRuntime, settingsManager, resourceLoader, sessionManager, tools });
 	const originalPrompt = session.agent.prompt, originalContinue = session.agent.continue;
 	const toolResults = (owner = session) => owner.messages.filter(message => message.role === "toolResult");
 	let inspection: ReturnType<typeof inspectProcessOwner> | undefined;
@@ -225,10 +256,23 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["", "-nested", "-sta
 		vi.spyOn(ownerPrototype, "processOwner").mockImplementation(function (this: LinuxProcessReuseBackend) {
 			if (!inspection) {
 				inspection = inspectProcessOwner(() => processOwner.call(this));
-				if (live) inspectionReady = inspection.inOwner(async state => {
+				if (live) inspectionReady = inspection.inOwner(async (state, delayedSettlement) => {
 					state.errors = state.method((await state.load("../src/linux-process-backend.ts")).LinuxProcessReuseBackend.prototype, "setError");
 					state.publications = state.method((await state.load("../src/process-handoff.ts")).ProcessHandoffRegistry.prototype, "publish");
-				});
+					if (delayedSettlement) {
+						const Store = (await state.load("../src/reuse-store.ts")).ProvenanceCertificateStore, claim = Store.prototype.claimProcessCheckpoint;
+						state.method(Store.prototype, "claimProcessCheckpoint", async function (this: unknown, ...args: unknown[]) {
+							const settle = await claim.apply(this, args); return settle && (async (consumed: boolean) => {
+								await new Promise(resolve => setTimeout(resolve, 25)); await settle(consumed); state.settledAt = performance.now();
+							});
+						});
+						const Backend = (await state.load("../src/linux-process-backend.ts")).LinuxProcessReuseBackend, decide = Backend.prototype.decideHeldExec;
+						state.method(Backend.prototype, "decideHeldExec", async function (this: unknown, ...args: unknown[]) {
+							const decision = await decide.apply(this, args); return decision.kind !== "replay" ? decision : { ...decision,
+								observeTiming: (timing: unknown) => { state.timing = timing; decision.observeTiming?.(timing); } };
+						});
+					}
+				}, mode === "native-continuation");
 			}
 			return processOwner.call(this);
 		});
@@ -255,6 +299,7 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["", "-nested", "-sta
 			}, ...args);
 		});
 		if (live) {
+			if (!consuming) {
 			await compileBenchmarkHelper(cwd, "worker", { code: `#include <stdio.h>
 #include <stdint.h>
 #include <unistd.h>
@@ -285,34 +330,50 @@ int main(int argc, char **argv) {
  return waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status) != 37;
 }` });
 			await commitBenchmarkFixture(cwd, "default-live-continuation");
+			}
 			const availableImage = () => inspection!.inOwner(state => state.publications.mock.calls.some((call: any) => {
 				const [key, work, certificate, , continuation] = call.arguments;
 				return certificate?.result.continuation && continuation?.image.length > 0 && call.this.results(key, work.scope).some((current: any) => current.id === certificate.id);
 			}));
 			let preparationError: unknown;
-			actor.setResponses([response("produce_notes", { text: "./launch seed; :" }, { id: "seed" }), async () => {
+			const checkID = phase === "repeat" ? "check-again" : "check";
+			const actual = response("format_rows", { text: `./launch ${stale ? "changed" : "actual"}; printf once >> marker` }, { id: checkID });
+			actor.setResponses([...(consuming ? [actual] : [response("produce_notes", { text: "./launch seed; :" }, { id: "seed" }), async () => {
 				try {
 				expect(inputBinding).toBeDefined();
 				await inspectionReady;
 				await expect.poll(availableImage, { timeout: 10_000 }).toBe(true);
 				if (mode.endsWith("cancel")) await qualificationHost.runtime.disposeSession(qualificationHost.sessionID);
-				return response("format_rows", { text: `./launch ${stale ? "changed" : "actual"}; printf once >> marker` }, { id: "check" });
+				return phase === "produce" ? fauxAssistantMessage("prepared") : actual;
 				} catch (error) { preparationError = error; throw error; }
-			}, fauxAssistantMessage("done")]);
+			}]), fauxAssistantMessage("done")]);
 			await session.prompt("Prepare the calculation, then finish it using the new input.");
 			if (preparationError) throw preparationError;
-			const results = toolResults(), reused = !stale && !mode.endsWith("cancel");
-			expect(results, JSON.stringify({ messages: session.messages, events, metrics: backend?.actorMetrics() })).toHaveLength(2);
-			expect(results.map(result => result.isError)).toEqual([false, false]);
-			expect(results[0]!.content).toEqual([fauxText("hook:own:produce_notes:ABC:7107042143181080257\n")]);
-			expect(results[1]!.content).toEqual([fauxText(`hook:own:format_rows:${stale ? "D" : "A"}XY:7107042143181080257\n`)]);
-			expect(calls).toEqual(["seed", "check"]); expect(await readText(cwd, "marker")).toBe("once");
-			expect(backend!.actorMetrics().hits, JSON.stringify({ metrics: backend!.actorMetrics(), owner: await inspection!.inOwner(state => ({
+			if (phase === "produce") {
+				expect(calls).toEqual(["seed"]);
+				const checkpoint = await inspection!.inOwner(async state => {
+					const call = state.publications.mock.calls.find((call: any) => call.arguments[4]?.checkpoint), store = Reflect.get(call.this, "store");
+					for await (const record of store.processCheckpoints(call.arguments[0], call.arguments[2].prototype.executablePath, call.arguments[1].scope.sessionID))
+						if (record.ticket === call.arguments[4].checkpoint) return { cache: store.root, record, imagePath: store.artifacts.artifactPath(record.image.digest) };
+					throw new Error("published checkpoint is missing");
+				});
+				await writeFile(path.join(cwd, "produced.json"), JSON.stringify({ pid: process.pid, session: sessionManager.getSessionId(), file: sessionManager.getSessionFile(), ...checkpoint }));
+				return;
+			}
+			const results = toolResults(), reused = !stale && !mode.endsWith("cancel") && (!restart || mode === "native-continuation-cold" && phase !== "repeat");
+			expect(results, JSON.stringify({ messages: session.messages, events, metrics: backend?.actorMetrics() })).toHaveLength(mode.endsWith("session") ? 1 : phase === "repeat" ? 3 : 2);
+			expect(results.every(result => result.isError === false)).toBe(true);
+			if (!mode.endsWith("session")) expect(results[0]!.content).toEqual([fauxText("hook:own:produce_notes:ABC:7107042143181080257\n")]);
+			expect(results.at(-1)!.content).toEqual([fauxText(`hook:own:format_rows:${stale ? "D" : "A"}XY:7107042143181080257\n`)]);
+			expect(calls).toEqual(consuming ? [checkID] : ["seed", "check"]); expect(await readText(cwd, "marker")).toBe(phase === "repeat" ? "onceonce" : "once");
+			expect(backend!.actorMetrics().hits, JSON.stringify({ metrics: backend!.actorMetrics(), owner: inspection && await inspection.inOwner(state => ({
 				errors: state.errors.mock.calls.map((call: any) => call.arguments[1]),
 				images: state.publications.mock.calls.flatMap((call: any) => { const [key, work, certificate] = call.arguments;
 					return certificate?.result.continuation ? [{ key, scope: work.scope, aborted: work.signal.aborted }] : []; }) })), events })).toBe(Number(reused));
 			expect(events.filter(event => event.type === "actor_action").at(-1)!.computation!.hiddenComputeMs > 0).toBe(reused);
 			if (reused) await expect.poll(availableImage).toBe(false);
+			if (mode === "native-continuation") expect(await inspection!.inOwner(state => state.timing.completedAt >= state.settledAt)).toBe(true);
+			if (phase === "consume") await writeFile(path.join(cwd, "consumed.json"), JSON.stringify({ pid: process.pid, session: sessionManager.getSessionId() }));
 			return;
 		}
 		await compileBenchmarkHelper(cwd, "slow", { code: "#include <stdio.h>\n#include <fcntl.h>\n#include <unistd.h>\nint main(int n,char**v){int f=fcntl(3,F_GETFD)<0?open(v[1],O_RDONLY):3;if(f<0)return 1;unsigned long h=5381;char c;while(read(f,&c,1)==1)h=h*33+c;close(f);for(volatile unsigned long i=0;i<40000000ul;i++)h^=i;printf(\"%s %lx\\n\",v[1],h);return 0;}\n" });

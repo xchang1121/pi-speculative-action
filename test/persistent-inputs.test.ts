@@ -228,8 +228,8 @@ linux("discovers a finite set of current input closures and releases undispatche
 		storeMetadata(f.cache, database => database.exec("DROP TABLE input_versions; PRAGMA user_version=2"));
 		await expect(f.manager.recover(memoryBudget).next()).resolves.toMatchObject({ done: true });
 		expect(storeMetadata(f.cache, database => database.prepare("PRAGMA user_version").get()!.user_version)).toBe(2);
-		storeMetadata(f.cache, database => database.exec("PRAGMA user_version=4"));
-		await expect(f.manager.recover(memoryBudget).next()).rejects.toThrow(/unsupported provenance store version 4/);
+		storeMetadata(f.cache, database => database.exec("PRAGMA user_version=5"));
+		await expect(f.manager.recover(memoryBudget).next()).rejects.toThrow(/unsupported provenance store version 5/);
 		storeMetadata(f.cache, database => database.exec("PRAGMA user_version=2"));
 		const original = await f.manager.capture([{ path: file, scope: "content" }], memoryBudget); f.tokens.push(original);
 		let id = await f.manager.persist(original); const record = (await f.store.getInputVersion(id))!;

@@ -80,7 +80,7 @@ export interface ProcessHandoff {
 	readonly advance?: () => Promise<boolean>;
 }
 
-export interface ProcessContinuation { readonly image: Buffer; readonly physicalRoot: string; readonly computation: TimelineInterval; }
+export interface ProcessContinuation { readonly image: Buffer; readonly physicalRoot: string; readonly computation: TimelineInterval; readonly checkpoint?: string; }
 
 /** In-memory capability for another isolated execution, never a proof of result equivalence. */
 export interface ProcessExecutionBinding {
@@ -369,7 +369,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 				reservation: record.claimState?.buffer as SharedArrayBuffer | undefined, key: record.key, executablePath: record.executablePath, scope: record.scope,
 				candidate: result.candidate, bytes: result.bytes, computation,
 				artifacts: artifacts.transfer,
-				...(continuation ? { continuation: { image: new Uint8Array(continuation.image), physicalRoot: continuation.physicalRoot, computation: resumed! } as const } : {}) } as const;
+				...(continuation ? { continuation: { image: new Uint8Array(continuation.image), physicalRoot: continuation.physicalRoot, computation: resumed!, checkpoint: continuation.checkpoint } as const } : {}) } as const;
 			const release = this.claim(record, oneShotResult(result.candidate), undefined, undefined, claims);
 			if (!release) { artifacts.release(); return; }
 			loans.push({ record, release: consumed => { try { release(consumed); } finally { artifacts.release(); } }, claims }); return transferred;
@@ -411,7 +411,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 				record.claimState = result.reservation && new Int32Array(result.reservation);
 				record.receipts = result.claims.map(claims => new Int32Array(claims));
 				retained = this.complete(result.key, record, { candidate: result.candidate, artifacts,
-					bytes: Buffer.byteLength(JSON.stringify([result.candidate, result.computation, result.continuation?.computation])) + artifacts.memoryBytes + (result.continuation?.image.length ?? 0), computation,
+					bytes: Buffer.byteLength(JSON.stringify([result.candidate, result.computation, result.continuation?.computation, result.continuation?.physicalRoot, result.continuation?.checkpoint])) + artifacts.memoryBytes + (result.continuation?.image.length ?? 0), computation,
 					...(result.continuation ? { continuation: { ...result.continuation, image: Buffer.from(result.continuation.image), computation: resumed! } } : {}) });
 			} finally { if (!retained) await artifacts.dispose(); }
 		} return Object.assign(close, { records: received }); } catch (error) { close(); throw error; }
@@ -423,7 +423,7 @@ export class ProcessHandoffRegistry<Invocation = never> {
 		if (this.byKey.get(key)?.get(handoff)?.state.status !== "running") throw new Error("process handoff is no longer running");
 		computation ??= continuation?.computation ?? new TimelineInterval(handoff.startedAt, performance.now());
 		const graphs = [...new Set([computation, ...(continuation ? [continuation.computation] : [])])].map(value => TimelineInterval.serialize(value));
-		const references = referencedArtifacts(candidate), metadata = Buffer.byteLength(JSON.stringify([candidate, graphs])) + (continuation?.image.length ?? 0);
+		const references = referencedArtifacts(candidate), metadata = Buffer.byteLength(JSON.stringify([candidate, graphs, continuation?.physicalRoot, continuation?.checkpoint])) + (continuation?.image.length ?? 0);
 		if (metadata > this.maxRetainedBytes || references.reduce((sum, reference) => sum + reference.size, 0) > this.store.limits.maxBytes) {
 			this.complete(key, handoff); return persist();
 		}

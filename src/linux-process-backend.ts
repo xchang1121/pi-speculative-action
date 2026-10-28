@@ -26,7 +26,7 @@ import {
 } from "./provenance-certificate.ts";
 import { digestObject, sha256Digest, type Sha256Digest } from "./stable-value-hash.ts";
 import {
-	filesystemMetadataDigest, filesystemObservationDigest, FILESYSTEM_METADATA_FIELDS, assertNoSymlinkPath, cachedCapture, captureFileDigest, captureFilesystemEntry, captureStableFile,
+	filesystemMetadataDigest, filesystemObservationDigest, filesystemMountTopology, FILESYSTEM_METADATA_FIELDS, assertNoSymlinkPath, cachedCapture, captureFileDigest, captureFilesystemEntry, captureStableFile,
 	hashExecutableFile, mapFilesystem, readFilesystemDirectoryImage, withFilesystemReadView, FilesystemReadView, rememberCapture, sameFilesystemIdentity, sharedWalk, walkFilesystemPath, type StableFilesystemCapture,
 } from "./filesystem-evidence.ts";
 import {
@@ -59,7 +59,7 @@ import type { ToolProcessInvocation } from "./tool-settlement.ts";
 import type { ResourceValidation } from "./settlement.ts";
 import {
 	ProcessHandoffOwnership, ProcessHandoffRegistry, sameScope, type ProcessContinuation, type ProcessExecutionBinding, type ProcessHandoff,
-	type ProcessHandoffBorrow, type ProcessHandoffLender,
+	type ProcessHandoffBorrow, type ProcessHandoffLender, type ProcessHandoffAcquisition,
 } from "./process-handoff.ts";
 import {
 	SynchronousProcessObserver, serializeNativeDependency, restoreNativeDependency, type SerializedProcessBinding, type SynchronousProcessRequest,
@@ -411,14 +411,15 @@ export class LinuxProcessReuseBackend {
 	async observeNative<Value>(sourceRoot: string, scope: ExecutionScope | undefined, signal: AbortSignal | undefined, execute: () => Promise<Value>): Promise<Value> {
 		let boundary: LinuxHeldExecBoundary | undefined;
 		const owner = snapshotExecutionScope(scope), observation = this.observations.getStore();
+		const checkpoints = !!owner && observation?.reuseEnabled !== false && await this.store.mayHaveProcessCheckpoints(owner.sessionID, undefined, signal);
 		try {
 			if (!this.disposed && process.platform === "linux" && ((observation?.learn && !observation.closed && sameScope(observation.scope, owner)) ||
-				this.hasReusableWork || await this.store.mayHaveCertificates(undefined, signal) || this.hasReusableWork)) {
+				this.hasReusableWork || checkpoints || await this.store.mayHaveCertificates(undefined, signal) || this.hasReusableWork)) {
 				const ready = await waitForCompletion(this.heldBoundary(), signal);
 				if (ready.status === "completed") boundary = ready.value;
 			}
 		} catch { /* Optional native observation leaves the actual callback authoritative. */ }
-		const options = this.nativeObservation(path.resolve(sourceRoot), owner, signal);
+		const options = { ...this.nativeObservation(path.resolve(sourceRoot), owner, signal), ...(checkpoints ? { descriptors: true as const } : {}) };
 		return boundary ? boundary.observe(options, execute, {
 			synchronous: (gate, skipRoot) => this.attachSynchronous({ ...options, gate, skipRoot }),
 			asynchronous: (gate, skipRoot) => this.attachSynchronous({ ...options, gate, skipRoot, asynchronous: true }),
@@ -667,9 +668,14 @@ export class LinuxProcessReuseBackend {
 					if (!external.complete) throw new Error(`unrepresentable writes outside the workspace: external_write:${[...external.before].find(([, value]) => !value)?.[0]}`);
 					return [...await sealSessionEvidence(session, external), ...external.changes];
 				}),
-				validate: async () => await readFile("/proc/self/mountinfo", "utf8") !== session.sourceMounts
-					? { status: "stale", cause: { stage: "freshness", code: "source_mount_policy_changed" }, metrics: { bytesRead: 0, filesRead: 0, mode: "exact" } }
-					: validateTransferredProcessEvidence(session.topLevelEvidence, session.incompleteReasons),
+				validate: async () => {
+					const paths = session.topLevelEvidence?.dependencies.flatMap(dependency => "path" in dependency ? [dependency.path,
+						...(dependency.kind === "file" ? dependency.aliases ?? [] : dependency.kind === "symlink" ? [path.resolve(path.dirname(dependency.path), dependency.target)] : [])] : []) ?? [];
+					const policy = (mounts: string) => JSON.stringify([filesystemMountTopology(mounts, [session.sourceRoot], true), filesystemMountTopology(mounts, paths)]);
+					return policy(await readFile("/proc/self/mountinfo", "utf8")) !== policy(session.sourceMounts)
+						? { status: "stale", cause: { stage: "freshness", code: "source_mount_policy_changed" }, metrics: { bytesRead: 0, filesRead: 0, mode: "exact" } }
+						: validateTransferredProcessEvidence(session.topLevelEvidence, session.incompleteReasons);
+				},
 				close: () => session.lifecycle.close(async () => {
 					controller.abort(new Error("Linux process session closed"));
 					try {
@@ -692,7 +698,8 @@ export class LinuxProcessReuseBackend {
 		input.signal?.throwIfAborted();
 		const sourceRoot = path.resolve(input.sourceRoot);
 		const sourceMounts = await readFile("/proc/self/mountinfo", "utf8");
-		if (input.workspace.metadataMounts !== undefined && input.workspace.metadataMounts !== sourceMounts) throw new Error("source mount policy changed during workspace capture");
+		if (input.workspace.metadataMounts !== undefined && filesystemMountTopology(input.workspace.metadataMounts, [sourceRoot], true) !==
+			filesystemMountTopology(sourceMounts, [sourceRoot], true)) throw new Error("source mount policy changed during workspace capture");
 		const projection = new ExecutionPathProjection({ sourceRoot, workspaceRoot: input.workspace.sandboxRoot });
 		const invocation = "environment" in input.invocation ? input.invocation : undefined;
 		const bound = "environment" in input.invocation ? undefined : this.boundInvocation(input.invocation, input.scope);
@@ -749,8 +756,7 @@ export class LinuxProcessReuseBackend {
 		if (this.disposal) return this.disposal;
 		this.disposed = true;
 		const handoffs = this.handoffs.dispose();
-		const store = this.store.dispose();
-		return this.disposal = this.resetNativeObservation().finally(() => Promise.all([this.replayWorkspace.dispose(), store, handoffs]));
+		return this.disposal = this.resetNativeObservation().finally(() => Promise.all([this.replayWorkspace.dispose(), this.store.dispose(), handoffs]));
 	}
 
 	private async resolveReady(): Promise<ReadyBackend> {
@@ -1252,6 +1258,14 @@ export class LinuxProcessReuseBackend {
 								if (!session.metrics.lastError || !outlet && !transferable) this.setError(session, detail);
 							}
 							stage = "handoff_registration";
+							if (continuation && work.scope) try {
+								const ticket = await this.store.issueProcessCheckpoint(), computation = TimelineInterval.serialize(continuation.computation);
+								if (!computation) throw new Error("checkpoint computation is unavailable");
+								await this.store.putProcessCheckpoint(ticket, { sessionID: work.scope.sessionID, sourceRoot: session.sourceRoot,
+									physicalRoot: continuation.physicalRoot, context: await this.checkpointContext(), producer: { pid: process.pid, start: await processStart(process.pid) },
+									certificate, computation, image: await this.store.artifacts.put(continuation.image) });
+								continuation = { ...continuation, checkpoint: ticket };
+							} catch (error) { this.setError(session, `checkpoint_publish:${failureDetail(error)}`); }
 							if (await this.handoffs.publish(weakKey, work, certificate, () => {
 								const { streams: _streams, imageSource: _imageSource, ...invocation } = request;
 								const binding = !outlet && this.handoffs.bind(weakKey, work, { ...invocation, cwd: logicalCwd, executable: image,
@@ -1349,7 +1363,7 @@ export class LinuxProcessReuseBackend {
 				const settle = decision.settle, claims = observation.claims; let pending = true;
 				Atomics.add(claims, 0, 1);
 				decision = { ...decision, settle: consumed => {
-					if (pending) { pending = false; if (!consumed) Atomics.sub(claims, 0, 1); settle?.(consumed); }
+					if (pending) { pending = false; if (!consumed) Atomics.sub(claims, 0, 1); return settle?.(consumed); }
 				} };
 			}
 			if (reserved && decision.kind === "continue" && decision.observeCompletion) {
@@ -1364,7 +1378,7 @@ export class LinuxProcessReuseBackend {
 		};
 		const learning = observation?.learn && !observation.closed && sameScope(observation.scope, scope) && observation.pending < LEARNED_LAUNCHES;
 		const order = observation ? Atomics.add(observation.ordering, 0, 1) + 1 : 0;
-		let settle: ((consumed: boolean) => void) | undefined, transferred = false;
+		let settle: ((consumed: boolean) => void | Promise<void>) | undefined, transferred = false;
 		this.add(undefined, "requests");
 		try {
 			process.signal?.throwIfAborted();
@@ -1380,7 +1394,8 @@ export class LinuxProcessReuseBackend {
 			}
 			if (learning) { observation!.pending++; reserved = true; }
 			const available = observation?.reuseEnabled !== false && (observation?.source && Atomics.load(observation.source.available, 0) ||
-				this.handoffs.mayHaveExecutable(executablePath) || await this.store.mayHaveCertificates(executablePath, process.signal) || this.handoffs.mayHaveExecutable(executablePath));
+				this.handoffs.mayHaveExecutable(executablePath) || await this.store.mayHaveCertificates(executablePath, process.signal) ||
+				scope && await this.store.mayHaveProcessCheckpoints(scope.sessionID, executablePath, process.signal) || this.handoffs.mayHaveExecutable(executablePath));
 			// Concurrent discovery is bounded, but a full retained set never shuts discovery off for the rest of the call.
 			if (!learning && !available) { this.add(undefined, "misses"); return measured({ kind: "continue" }); }
 			const inspected = await inspectHeldExecProcess(process.pid, executable, process.descriptors);
@@ -1424,8 +1439,16 @@ export class LinuxProcessReuseBackend {
 			const accepted = (producer: ProcessProducerProof) => actorReplayProducer(producer, sensitivePaths(this.options.storeRoot, this.options.deniedPaths));
 			const result = await this.handoffs.acquire({ key: weakKey, scope, signal: process.signal, borrow: observation?.source?.borrow,
 				lookup: (live, excludedCertificates, artifacts) => this.plan(weakKey, executablePath, projection, accepted, { live, artifacts, excludedCertificates, continuation: true, signal: process.signal }) });
-			const acquired = result.kind === "hit" ? result : undefined, { plan, continuation } = acquired ?? {};
+			let acquired = result.kind === "hit" ? result : undefined;
+			if (!acquired && scope && observation && !observation.closed && observation.reuseEnabled && sameScope(scope, observation.scope))
+				acquired = await this.restoreCheckpoint(weakKey, executablePath, sourceRoot, scope, projection, accepted, process.signal);
 			settle = acquired?.settle;
+			if (acquired?.continuation?.checkpoint) {
+				const claim = await this.store.claimProcessCheckpoint(acquired.continuation.checkpoint, acquired.plan.certificate.id);
+				if (!claim) { await settle?.(true); acquired = undefined; settle = undefined; }
+				else { const release = settle; settle = async consumed => { try { await claim(consumed); } finally { await release?.(consumed); } }; }
+			}
+			const { plan, continuation } = acquired ?? {};
 			if (!acquired || !plan || (plan.certificate.result.continuation ? !continuation || sha256Digest(continuation.image) !== plan.certificate.result.continuation.imageDigest :
 				plan.certificate.result.exit.kind !== "code")) {
 				this.add(undefined, "misses");
@@ -1458,6 +1481,8 @@ export class LinuxProcessReuseBackend {
 				commit: async () => {
 					try {
 						process.signal?.throwIfAborted();
+						if (continuation?.checkpoint && (!observation || observation.closed || !observation.reuseEnabled || !sameScope(scope, observation.scope)))
+							throw new Error("checkpoint consumer is no longer active");
 						await replayFilesystemEffects(observation?.effects ?? this.replayWorkspace, this.store, plan.artifacts, plan.certificate.result.journal, projection);
 					} catch (error) {
 						this.setError(undefined, `actor_child_commit:${errorMessage(error)}`);
@@ -1483,7 +1508,31 @@ export class LinuxProcessReuseBackend {
 		} catch (error) {
 			this.setError(undefined, `actor_child:${errorMessage(error)}`, "bypasses");
 			return measured({ kind: "continue" });
-		} finally { if (!transferred) settle?.(false); if (!completing) releaseLearning(); }
+		} finally { try { if (!transferred) await settle?.(false); } finally { if (!completing) releaseLearning(); } }
+	}
+
+	private async checkpointContext(): Promise<Sha256Digest> {
+		const binary = await resolveLinuxExecHelper(this.options.heldExecBinary);
+		const observer = this.options.heldExecObserverBinary ?? await stat(`${binary}.observer`).then(() => `${binary}.observer`, () => binary);
+		return digestObject({ boot: (await readFile("/proc/sys/kernel/random/boot_id", "utf8")).trim(), platform: await this.resolvePlatformFingerprint(),
+			build: await Promise.all([binary, observer, `${binary}.so`, `${binary}.node`, `${binary}.sqlite`].map(file => hashExecutableFile(file))) });
+	}
+	private async restoreCheckpoint(weakKey: Sha256Digest, executable: string, sourceRoot: string, scope: ExecutionScope, projection: ExecutionPathProjection,
+		acceptProducer: (producer: ProcessProducerProof) => boolean, signal?: AbortSignal): Promise<Extract<ProcessHandoffAcquisition<ReadyProcessPlan>, { kind: "hit" }> | undefined> {
+		let context: Sha256Digest | undefined;
+		for await (const record of this.store.processCheckpoints(weakKey, executable, scope.sessionID, signal)) {
+			// A still-live producer owns revocation. Its disk copy must not bypass that owner's refusal.
+			if (record.sourceRoot !== sourceRoot || record.image.size > Math.min(MAX_CONTINUATION_BYTES, this.store.limits.maxBytes) ||
+				await processStart(record.producer.pid).then(start => start === record.producer.start, error => { if (!missing(error)) throw error; return false; })) continue;
+			context ??= await this.checkpointContext(); if (record.context !== context) continue;
+			const computation = TimelineInterval.restore(record.computation); if (!computation) continue;
+			const image = await this.store.read(signal => this.store.artifacts.get(record.image, signal), signal).catch(() => undefined); if (!image) continue;
+			const plan = await this.plan(weakKey, executable, projection, acceptProducer, { live: [record.certificate], continuation: true, signal });
+			if (!plan) continue;
+			if (plan.certificate.id !== record.certificate.id) { await plan.artifacts.dispose(); continue; }
+			return { kind: "hit", plan, joined: false, continuation: { image, physicalRoot: record.physicalRoot, computation, checkpoint: record.ticket },
+				settle: () => plan.artifacts.dispose() };
+		}
 	}
 
 	/** Admission observes a stopped process; safe declines keep advancing its existing request. */
@@ -1917,6 +1966,11 @@ function reusedComputation(certificate: ProcessProvenanceCertificate,
 	const computation = acquired?.producer?.computation ?? TimelineInterval.restore(certificate.result.computation) ??
 		TimelineInterval.unknownReuse(`${certificate.id}:${certificate.createdAt}`);
 	return { computation, shared: acquired?.waiting, reused: true };
+}
+
+async function processStart(pid: number): Promise<string> {
+	const stat = await readFile(`/proc/${pid}/stat`, "utf8"), start = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19];
+	if (!start || !/^[0-9]+$/.test(start)) throw new Error("process lifetime is unavailable"); return start;
 }
 
 async function sealSessionEvidence(session: ActiveSession, external: Awaited<ReturnType<typeof privateCommits>>) {

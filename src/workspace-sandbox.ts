@@ -1426,11 +1426,12 @@ async function acquireSandboxBaseline(repository: PooledGitRepository, warmup = 
 			if (changes && !changes.uncertain && !changes.paths.length) return baseline;
 			if (!(await repository.versions.validate(baseline.version)).expired) return baseline;
 		}
-		for (let attempt = 0; attempt < 3; attempt++) {
+		for (let attempt = 0; attempt < WORKSPACE_TRANSACTION_STABILITY_ATTEMPTS; attempt++) {
 			// Preparation owns immutable bytes, not source freshness. Actual allocations capture exact
 			// evidence; borrowed process preparations validate their observed inputs and effects at adoption.
-			const version = await repository.versions.capture([{ path: repository.sourceRoot, scope: "tree_content" }]);
+			let version: ResourceVersionToken | undefined;
 			try {
+				version = await repository.versions.capture([{ path: repository.sourceRoot, scope: "tree_content" }]);
 				const aliases = [...version.observations.values()].flatMap(entry => entry.aliases ?? []).map(group => {
 					if (group.paths.length !== group.links) throw new Error("workspace hardlink namespace is not closed");
 					return group.paths.map(target => {
@@ -1453,8 +1454,10 @@ async function acquireSandboxBaseline(repository: PooledGitRepository, warmup = 
 				repository.baseline = { commit, tree, version, aliases };
 				baseline?.version.release();
 				return repository.baseline;
+			} catch (error) {
+				if (!(error instanceof FilesystemCaptureChangedError || isMissing(error))) throw error;
 			} finally {
-				if (repository.baseline?.version !== version) version.release();
+				if (repository.baseline?.version !== version) version?.release();
 			}
 		}
 		throw new Error("workspace changed repeatedly while preparing sandbox baseline");
@@ -1475,7 +1478,7 @@ async function stageTreeObjects(repository: PooledGitRepository, version: Resour
 					yield Buffer.from(`blob\nmark :${index + 1}\ndata ${size}\n`);
 					if (link) yield link;
 					else if (size) yield* reader!.handle.createReadStream({ autoClose: false, end: size - 1 });
-					if (reader && !sameFilesystemIdentity(reader.stat, await reader.handle.stat({ bigint: true }))) throw new Error("Git input changed while staging");
+					if (reader && !sameFilesystemIdentity(reader.stat, await reader.handle.stat({ bigint: true }))) throw new FilesystemCaptureChangedError("Git input changed while staging");
 					yield Buffer.from(`\nget-mark :${index + 1}\n`);
 				} finally { try { await reader?.handle.close(); } finally { await reader?.binding?.close(); } }
 			}

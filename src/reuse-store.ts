@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { readSync } from "node:fs";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { mkdir, open, readFile, readdir, rename, rm, stat, utimes, writeFile, type FileHandle } from "node:fs/promises";
+import { mkdir, open, readFile, readdir, realpath, rename, rm, stat, utimes, writeFile, type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { DatabaseSync, type SQLInputValue, type SQLOutputValue } from "node:sqlite";
 import { setTimeout as delay } from "node:timers/promises";
@@ -18,6 +18,7 @@ import { FilesystemObjectLease, mapFilesystem, openAnonymousFilesystemFile, open
 import { RuntimeLifecycleLane, waitForCompletion } from "./runtime-lifecycle.ts";
 import { isSafeCount } from "./number-utils.ts";
 import { SQLiteReadOwner } from "./sqlite-read.ts";
+import { normalizeTimelineComputation, type SerializedTimelineComputation } from "./timeline-computation.ts";
 
 /** maxCertificates is the shared metadata-record limit, including persistent input versions. */
 export interface ProvenanceStoreLimits { readonly maxCertificates: number; readonly maxBytes: number; }
@@ -43,6 +44,14 @@ export interface ProvenanceStoreGCResult { readonly removedCertificates: number;
 export interface StoredInputVersion {
 	readonly id: Sha256Digest; readonly createdAt: number; readonly schema: 1;
 	readonly payload: unknown; readonly artifacts: readonly ArtifactReference[];
+}
+
+/** A restart candidate carries evidence, never the old callback's live authority. */
+export interface StoredProcessCheckpoint {
+	readonly schema: 1; readonly id: Sha256Digest; readonly ticket: string; readonly createdAt: number;
+	readonly sessionID: string; readonly sourceRoot: string; readonly physicalRoot: string; readonly context: Sha256Digest;
+	readonly producer: { readonly pid: number; readonly start: string };
+	readonly certificate: ProcessProvenanceCertificate; readonly computation: SerializedTimelineComputation; readonly image: ArtifactReference;
 }
 
 export const DEFAULT_PROVENANCE_STORE_LIMITS: ProvenanceStoreLimits = Object.freeze({ maxCertificates: 4_096, maxBytes: 2 * 1024 * 1024 * 1024 });
@@ -308,6 +317,63 @@ export class ProvenanceCertificateStore {
 		return certificate;
 	}
 
+	/** Reserve once inside the capture's publication. Clear and collection never reset the issuer. */
+	issueProcessCheckpoint(): Promise<string> {
+		return this.exclusive(async database => {
+			const origin = await realpath(this.root);
+			database.prepare("INSERT OR IGNORE INTO checkpoint_owner VALUES (1, ?, 0, ?)").run(randomUUID(), origin);
+			const owner = database.prepare("SELECT issuer, sequence, origin FROM checkpoint_owner WHERE singleton=1").get()!;
+			if (owner.origin !== origin || !isSafeCount(Number(owner.sequence) + 1)) throw new Error("checkpoint issuer is unavailable");
+			const sequence = Number(owner.sequence) + 1, ticket = `${owner.issuer}:${sequence}`;
+			database.prepare("UPDATE checkpoint_owner SET sequence=? WHERE singleton=1").run(sequence);
+			database.prepare("INSERT INTO process_checkpoints(ticket, createdAt) VALUES (?, ?)").run(ticket, Date.now());
+			return ticket;
+		});
+	}
+	async putProcessCheckpoint(ticket: string, input: Omit<StoredProcessCheckpoint, "schema" | "id" | "createdAt" | "ticket">): Promise<StoredProcessCheckpoint> {
+		const body = { ...input, schema: 1 as const, ticket, createdAt: Date.now() }, record = decodeProcessCheckpoint(stableStringify({ ...body, id: digestObject(body) }));
+		if (!record) throw new Error("invalid process checkpoint");
+		const references = checkpointArtifacts(record);
+		return this.exclusive(async database => {
+			const owner = database.prepare("SELECT issuer, origin FROM checkpoint_owner WHERE singleton=1").get();
+			const issued = database.prepare("SELECT value FROM process_checkpoints WHERE ticket=?").get(ticket);
+			if (owner?.origin !== await realpath(this.root) || !ticket.startsWith(`${owner.issuer}:`) || !issued || issued.value !== null)
+				throw new Error("checkpoint ticket is no longer publishable");
+			const closure = await this.loadArtifacts(references);
+			if (!closure) throw new Error("checkpoint artifacts are unavailable");
+			await closure.dispose();
+			database.prepare("UPDATE process_checkpoints SET value=?, weakKey=?, executable=?, sessionID=?, createdAt=? WHERE ticket=?")
+				.run(stableStringify(record), record.certificate.weakKey, record.certificate.prototype.executablePath, record.sessionID, record.createdAt, ticket);
+			return record;
+		}, [`checkpoint:${ticket}`, ...references.map(reference => this.objectKey(this.artifacts.artifactPath(reference.digest)))]);
+	}
+	async mayHaveProcessCheckpoints(sessionID: string, executablePath?: string, signal?: AbortSignal): Promise<boolean> {
+		try { return !!(await this.query(`SELECT 1 FROM process_checkpoints WHERE sessionID=? AND claim IS NULL${executablePath ? " AND executable=?" : ""} LIMIT 1`,
+			[sessionID, ...(executablePath ? [executablePath] : [])], false, signal)).length; } catch { return false; }
+	}
+	async *processCheckpoints(weakKey: Sha256Digest, executablePath: string, sessionID: string, signal?: AbortSignal): AsyncGenerator<StoredProcessCheckpoint> {
+		const rows = await this.query("SELECT ticket, value FROM process_checkpoints WHERE weakKey=? AND executable=? AND sessionID=? AND claim IS NULL AND EXISTS (SELECT 1 FROM checkpoint_owner WHERE origin=?) ORDER BY createdAt DESC LIMIT ?",
+			[weakKey, executablePath, sessionID, await realpath(this.root), this.limits.maxCertificates], false, signal);
+		for (const row of rows) { signal?.throwIfAborted(); const record = decodeProcessCheckpoint(row.value); if (record?.ticket === row.ticket) yield record; }
+	}
+	/** Claim is durable before any native proposal. An unknown outcome stays claimed after a crash. */
+	async claimProcessCheckpoint(ticket: string, certificate: Sha256Digest): Promise<((consumed: boolean) => Promise<void>) | undefined> {
+		const claim = randomUUID();
+		const acquired = await this.exclusive(async database => {
+			const owner = database.prepare("SELECT origin FROM checkpoint_owner WHERE singleton=1").get();
+			const row = database.prepare("SELECT value, claim FROM process_checkpoints WHERE ticket=?").get(ticket), record = decodeProcessCheckpoint(row?.value);
+			if (owner?.origin !== await realpath(this.root) || !record || record.certificate.id !== certificate || row?.claim !== null) return false;
+			return !!database.prepare("UPDATE process_checkpoints SET claim=? WHERE ticket=? AND claim IS NULL").run(claim, ticket).changes;
+		}, [`checkpoint:${ticket}`]);
+		if (!acquired) return;
+		let settled = false;
+		return async consumed => {
+			if (settled) return; settled = true;
+			await this.exclusive(async database => { database.prepare(consumed ? "DELETE FROM process_checkpoints WHERE ticket=? AND claim=?" :
+				"UPDATE process_checkpoints SET claim=NULL WHERE ticket=? AND claim=?").run(ticket, claim); }, [`checkpoint:${ticket}`]);
+		};
+	}
+
 	/** Input metadata shares certificate publication, retention, and crash recovery; it grants no execution authority. */
 	async putInputVersion(payload: unknown, artifacts: readonly ArtifactReference[]): Promise<StoredInputVersion> {
 		const body = { schema: 1 as const, createdAt: Date.now(), payload, artifacts }, id = digestObject(body);
@@ -369,7 +435,7 @@ export class ProvenanceCertificateStore {
 		const limits = this.limits;
 		const inventory = await this.inventory(), referenced = new Set(inventory.roots.flatMap(record => record.references?.map(reference => reference.digest) ?? []));
 		const totalBytes = inventory.objects.reduce((total, record) => total + record.bytes, 0), artifacts = inventory.objects.filter(record => record.path).length;
-		return Object.freeze({ certificates: inventory.roots.filter(record => record.kind === "certificate").length, inputVersions: inventory.roots.filter(record => record.kind === "input").length,
+		return Object.freeze({ certificates: inventory.roots.filter(record => record.kind !== "input").length, inputVersions: inventory.roots.filter(record => record.kind === "input").length,
 			artifacts, totalBytes, orphanArtifacts: artifacts - [...referenced].filter(digest => inventory.artifacts.has(digest)).length, overBudget: inventory.roots.length > limits.maxCertificates || totalBytes > limits.maxBytes });
 	}
 
@@ -407,8 +473,8 @@ export class ProvenanceCertificateStore {
 		return this.exclusive(async database => {
 			const before = await this.inventory(database);
 			await mapFilesystem(await this.payloadRoots(), root => rm(root, { recursive: true, force: true }));
-			database.exec("DELETE FROM certificates; DELETE FROM input_versions; DELETE FROM changes WHERE path <> ''");
-			return { removedCertificates: before.roots.filter(record => record.kind === "certificate").length, removedInputVersions: before.roots.filter(record => record.kind === "input").length,
+			database.exec("DELETE FROM certificates; DELETE FROM input_versions; DELETE FROM process_checkpoints; DELETE FROM changes WHERE path <> ''");
+			return { removedCertificates: before.roots.filter(record => record.kind !== "input").length, removedInputVersions: before.roots.filter(record => record.kind === "input").length,
 				removedArtifacts: before.objects.filter(record => record.path).length, removedBytes: before.objects.reduce((total, record) => total + record.bytes, 0) };
 		}, [".clear"]);
 	}
@@ -434,10 +500,10 @@ export class ProvenanceCertificateStore {
 				if (current) {
 					await rm(record.path, { force: true }); result.removedArtifacts++; result.removedBytes += current.size;
 				}
-			} else if (/^(certificate|input):/.test(record.key)) {
-				const certificate = record.key.startsWith("certificate:"), table = certificate ? "certificates" : "input_versions";
-				const removed = Number(database.prepare(`DELETE FROM ${table} WHERE id = ?`).run(record.key.slice(record.key.indexOf(":") + 1)).changes);
-				if (certificate) result.removedCertificates += removed; else result.removedInputVersions += removed;
+			} else if (/^(certificate|input|checkpoint):/.test(record.key)) {
+				const input = record.key.startsWith("input:"), checkpoint = record.key.startsWith("checkpoint:"), table = input ? "input_versions" : checkpoint ? "process_checkpoints" : "certificates";
+				const removed = Number(database.prepare(`DELETE FROM ${table} WHERE ${checkpoint ? "ticket" : "id"} = ?`).run(record.key.slice(record.key.indexOf(":") + 1)).changes);
+				if (input) result.removedInputVersions += removed; else result.removedCertificates += removed;
 				result.removedBytes += removed ? record.bytes : 0;
 			}
 			database.prepare("DELETE FROM changes WHERE path = ?").run(record.key);
@@ -448,9 +514,14 @@ export class ProvenanceCertificateStore {
 
 	private async inventory(control?: DatabaseSync): Promise<StoreInventory> {
 		const read = (sql: string) => control ? Promise.resolve(control.prepare(sql).all()) : this.query(sql, [], true);
-		const records: StoredRoot[] = (await read("SELECT 'certificate' AS kind, id, value FROM certificates UNION ALL SELECT 'input', id, value FROM input_versions"))
+		const records: StoredRoot[] = (await read("SELECT 'certificate' AS kind, id, value FROM certificates UNION ALL SELECT 'input', id, value FROM input_versions UNION ALL SELECT 'checkpoint', ticket, value FROM process_checkpoints"))
 			.map(({ kind: storedKind, id, value }) => {
-				const kind = storedKind === "certificate" ? "certificate" : "input";
+				const kind = storedKind === "checkpoint" ? "checkpoint" : storedKind === "certificate" ? "certificate" : "input";
+				if (kind === "checkpoint") {
+					const record = decodeProcessCheckpoint(value);
+					return { key: `checkpoint:${id}`, kind, bytes: Buffer.byteLength(String(value)), modifiedAt: 0, createdAt: record?.createdAt ?? 0,
+						references: record?.ticket === id ? checkpointArtifacts(record) : undefined };
+				}
 				const record = kind === "certificate" ? decodeCertificate(value) : decodeInputVersion(value), valid = record?.id === id;
 				const references = !valid ? undefined : kind === "input" ? (record as StoredInputVersion).artifacts
 					: certificateReplayable(record as ProcessProvenanceCertificate, this.acceptedTaints) ? referencedArtifacts(record as ProcessProvenanceCertificate) : undefined;
@@ -523,8 +594,8 @@ export class ProvenanceCertificateStore {
 		try {
 			database.exec("PRAGMA synchronous=NORMAL");
 			const version = Number(await sqliteReady(() => database.prepare("PRAGMA user_version").get()?.user_version, signal));
-			if (version === 3) return database;
-			if (version > 3) throw new Error(`unsupported provenance store version ${version}`);
+			if (version === 4) return database;
+			if (version > 4) throw new Error(`unsupported provenance store version ${version}`);
 			await sqliteReady(() => database.exec("PRAGMA auto_vacuum=FULL; PRAGMA journal_mode=WAL"), signal);
 			await sqliteReady(() => database.exec("BEGIN IMMEDIATE"), signal);
 			database.exec("CREATE TABLE IF NOT EXISTS changes(path TEXT PRIMARY KEY, revision INTEGER NOT NULL); INSERT OR IGNORE INTO changes VALUES ('', 0); CREATE TABLE IF NOT EXISTS certificates(id TEXT PRIMARY KEY, value TEXT NOT NULL, weakKey TEXT NOT NULL, executable TEXT NOT NULL, createdAt REAL NOT NULL); CREATE INDEX IF NOT EXISTS candidates ON certificates(executable, weakKey, createdAt DESC, id DESC)");
@@ -543,14 +614,14 @@ export class ProvenanceCertificateStore {
 				database.exec("PRAGMA user_version=2; COMMIT");
 			}
 			await sqliteReady(() => database.exec("BEGIN IMMEDIATE"), signal);
-			database.exec("CREATE TABLE IF NOT EXISTS input_versions(id TEXT PRIMARY KEY, value TEXT NOT NULL); PRAGMA user_version=3; COMMIT");
+			database.exec("CREATE TABLE IF NOT EXISTS input_versions(id TEXT PRIMARY KEY, value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS checkpoint_owner(singleton INTEGER PRIMARY KEY CHECK(singleton=1), issuer TEXT NOT NULL, sequence INTEGER NOT NULL, origin TEXT NOT NULL); CREATE TABLE IF NOT EXISTS process_checkpoints(ticket TEXT PRIMARY KEY, value TEXT, weakKey TEXT, executable TEXT, sessionID TEXT, createdAt REAL NOT NULL, claim TEXT); CREATE INDEX IF NOT EXISTS checkpoint_candidates ON process_checkpoints(sessionID, executable, weakKey, createdAt DESC); PRAGMA user_version=4; COMMIT");
 			return database;
 		} catch (error) { database.close(); throw error; }
 	}
 }
 
 interface StoredFile { readonly key: string; readonly path?: string; readonly bytes: number; readonly modifiedAt: number; readonly digest?: Sha256Digest; }
-interface StoredRoot extends StoredFile { readonly kind: "certificate" | "input"; readonly references?: readonly ArtifactReference[]; readonly createdAt: number; }
+interface StoredRoot extends StoredFile { readonly kind: "certificate" | "input" | "checkpoint"; readonly references?: readonly ArtifactReference[]; readonly createdAt: number; }
 interface StoreInventory { readonly roots: readonly StoredRoot[]; readonly artifacts: ReadonlyMap<Sha256Digest, StoredFile>; readonly objects: readonly StoredFile[]; readonly retiredRoots: readonly string[]; }
 
 async function filesUnder(root: string): Promise<readonly string[]> {
@@ -596,6 +667,21 @@ async function publishImmutable(target: string, bytes: Uint8Array, reservedRoot?
 
 function decodeCertificate(value: unknown): ProcessProvenanceCertificate | undefined {
 	try { return typeof value === "string" ? parseProcessCertificate(JSON.parse(value)) : undefined; } catch { return undefined; }
+}
+
+function checkpointArtifacts(record: StoredProcessCheckpoint): readonly ArtifactReference[] { return [...referencedArtifacts(record.certificate), record.image]; }
+function decodeProcessCheckpoint(value: unknown): StoredProcessCheckpoint | undefined {
+	try {
+		if (typeof value !== "string" || Buffer.byteLength(value) > 8 * 1024 * 1024) return;
+		const record = JSON.parse(value) as StoredProcessCheckpoint, { id, ...body } = record, certificate = parseProcessCertificate(record.certificate);
+		if (record.schema !== 1 || !isSha256Digest(id) || digestObject(body) !== id || !Number.isFinite(record.createdAt) ||
+			!isSha256Digest(record.context) || !/^[0-9a-f-]{36}:[1-9][0-9]*$/.test(record.ticket) || typeof record.sessionID !== "string" || !record.sessionID || record.sessionID.length > 4096 ||
+			![record.sourceRoot, record.physicalRoot].every(value => typeof value === "string" && path.isAbsolute(value) && !value.includes("\0")) ||
+			!isSafeCount(record.producer.pid, 1) || !/^[0-9]+$/.test(record.producer.start) || !normalizeTimelineComputation(record.computation) ||
+			!certificate?.result.continuation || certificate.result.continuation.imageDigest !== record.image.digest ||
+			certificate.result.continuation.imageBytes !== record.image.size) return;
+		validateArtifact(record.image); return Object.freeze({ ...record, certificate });
+	} catch { return; }
 }
 
 function decodeInputVersion(value: unknown): StoredInputVersion | undefined {

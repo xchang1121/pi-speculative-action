@@ -170,14 +170,19 @@ export class FilesystemReadView {
 		if (this.closed) throw new Error("read-only filesystem view is closed");
 		if (this.descriptor === undefined) return;
 		const paths = [...(targets ?? this.observed)].map(target => path.resolve(target));
-		const relevant = (image: string) => image.split("\n").filter(line => {
-			const mount = (line.split(" ")[4] ?? "").replace(/\\([0-7]{3})/g, (_match, octal: string) => String.fromCharCode(Number.parseInt(octal, 8)));
-			return mount && paths.some(target => containsFilesystemPath(mount, target) || targets !== undefined && containsFilesystemPath(target, mount));
-		}).sort().join("\n");
+		const relevant = (image: string) => filesystemMountTopology(image, paths, targets !== undefined);
 		if (relevant(this.mounts) !== relevant(await fs.readFile("/proc/self/mountinfo", "utf8"))) throw new Error("filesystem mount topology changed during capture");
 	}
 	async close(): Promise<void> { if (!this.closed) { this.closed = true; if (this.descriptor !== undefined) closeSync(this.descriptor); this.descriptor = undefined; } }
 	[Symbol.asyncDispose](): Promise<void> { return this.close(); }
+}
+
+/** Mount records affecting these lookups; optional roots also qualify their descendants. */
+export function filesystemMountTopology(image: string, paths: readonly string[], descendants = false): string {
+	return image.split("\n").filter(line => {
+		const mount = (line.split(" ")[4] ?? "").replace(/\\([0-7]{3})/g, (_match, octal: string) => String.fromCharCode(Number.parseInt(octal, 8)));
+		return mount && paths.some(target => containsFilesystemPath(mount, target) || descendants && containsFilesystemPath(target, mount));
+	}).sort().join("\n");
 }
 
 function filesystemDescriptorHandle(fd: number, readable = false): FilesystemObjectHandle {
@@ -207,7 +212,11 @@ function adoptFilesystemDescriptor(nativeDescriptor: number, flags: number): num
 	let descriptor: number | undefined;
 	try {
 		descriptor = openSync(`/proc/self/fd/${nativeDescriptor}`, flags & ~constants.O_NOFOLLOW);
-		if (!sameFilesystemIdentity(fstatSync(nativeDescriptor, { bigint: true }), fstatSync(descriptor, { bigint: true }))) throw new Error("filesystem descriptor adoption changed identity");
+		// The native descriptor pins this inode. Mutable metadata belongs to the caller's
+		// capture validation; a concurrent write cannot turn this reopened descriptor into another object.
+		const native = fstatSync(nativeDescriptor, { bigint: true }), adopted = fstatSync(descriptor, { bigint: true });
+		if (native.dev !== adopted.dev || native.ino !== adopted.ino || (native.mode & 0o170000n) !== (adopted.mode & 0o170000n))
+			throw new Error("filesystem descriptor adoption changed identity");
 	} catch (error) { if (descriptor !== undefined) { closeSync(descriptor); descriptor = undefined; } throw error; }
 	return descriptor;
 }
