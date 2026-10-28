@@ -129,7 +129,7 @@ export async function createLinuxProcessBenchmark(
 	if (processImages === false) {
 		const binary = await resolveLinuxExecHelper(backendOptions.heldExecBinary ?? process.env.PI_SPEC_HELD_EXEC);
 		backendOptions.heldExecBinary = path.join(root, "held-exec");
-		for (const suffix of ["", ".node"]) await copyFile(binary + suffix, backendOptions.heldExecBinary + suffix);
+		for (const suffix of ["", ".node", ".sqlite"]) await copyFile(binary + suffix, backendOptions.heldExecBinary + suffix);
 	}
 	const backend = new LinuxProcessReuseBackend({ storeRoot, ...backendOptions });
 	const { inOwner, dispose: closeInspection } = inspectProcessOwner(() => Reflect.get(backend, "processOwner").call(backend));

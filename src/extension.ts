@@ -17,7 +17,8 @@ import { DEFAULTS } from "./common.ts";
 import { PATTERN_AWARE_PRESETS, patternAwarePersistenceFile, type PatternAwareSettings } from "./pattern-aware.ts";
 import { createClosedSearchProfile, createPiToolDefinitions, PI_CLOSED_SEARCH_TOOLS, resolvePiToolInvocation } from "./pi-tool-invocation.ts";
 import { checkLinuxEnvironment, installLinuxDependencies } from "./linux-setup.ts";
-import { createCompletedProcessExecutionWorld } from "./linux-process-world.ts";
+import { createRestorableProcessExecutionWorld } from "./linux-process-world.ts";
+import { LinuxHeldExecBoundary } from "./linux-held-exec.ts";
 import { emptyWorldReuseMetrics, executionCapabilityStatus, type ExecutionWorldDiagnosticSnapshot, type ExecutionWorldHealthState, type SpeculativeExecution,
 	type WorldReuseMetrics } from "./execution-world.ts";
 import { adaptProcessToolOperations, definedProcessEnvironment, ProcessExecutionCoordinator,
@@ -362,12 +363,13 @@ async function installController(
 	catch { /* An unavailable cache cannot prevent the original tools from running. */ }
 	const inputStore = new ProvenanceCertificateStore(storeRoot, { reservedRoot: true });
 	const rawProcessExecutor = adaptProcessToolOperations(createLocalBashOperations({ shellPath: getShellConfig(piToolSettings.shellPath).shell }));
-	const processCoordinator = new ProcessExecutionCoordinator(rawProcessExecutor);
+	const processCoordinator = new ProcessExecutionCoordinator({ execute: request => LinuxHeldExecBoundary.command(() => rawProcessExecutor.execute(request)) });
+	const processWorld = createRestorableProcessExecutionWorld({ coordinator: processCoordinator, tools: ["bash"], storeRoot, store: { reservedRoot: true } });
 	const workspaceSandbox = dependencies.createWorkspaceSandboxService?.() ?? new WorkspaceSandboxService();
 	const executionWorlds = [
 		...new Set([
 			...primaryExecutionWorlds,
-			createCompletedProcessExecutionWorld({ coordinator: processCoordinator, tools: ["bash"], storeRoot, store: { reservedRoot: true } }),
+			processWorld,
 			workspaceSandbox.createExecutionWorld(),
 			{ ...createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { maxBytes: () => currentSettings.resourceCacheMaxBytes,
 				persistentInputs: { store: inputStore, internalCache: true } }),
@@ -392,7 +394,7 @@ async function installController(
 	configureExecutionStorage();
 	let executionDiagnostics: readonly ExecutionWorldDiagnosticSnapshot[] = [];
 	const executionRoutes = (): ExecutionRoutesSnapshot => ({
-		worlds: executionDiagnostics, actorProcessReplay: { state: "unavailable", detail: "Finished Bash branches are validated before adoption; live Actor process replay is unavailable" }, primaryIDs: primaryExecutionWorldIDs,
+		worlds: executionDiagnostics, actorProcessReplay: processWorld.nativeDiagnostics(currentSettings.reuseEnabled && currentSettings.executionRouting.nativeFallback), primaryIDs: primaryExecutionWorldIDs,
 		searchDetail: !closedSearchEnabled() || (search && !search.profile) ? "Native Pi" : `${searchExecutionLabel(currentSettings.searchExecution)}; ${search?.profile ? [...search.profile.invocations.keys()].join(", ") + " prepared" : "not checked"}`,
 	});
 	const agentTools = new Map([...createPiToolDefinitions(context.cwd, {

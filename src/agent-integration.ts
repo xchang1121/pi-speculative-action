@@ -28,7 +28,7 @@ import { type ToolInvocation, type ToolSettlement, toolObservationKey } from "./
 import { ToolExecutionGateway, type ToolOperation } from "./tool-execution-gateway.ts";
 import { createSystemResourceMonitor, type ExecutionResourceMonitor } from "./system-resources.ts";
 import { UNRESTRICTED_PROCESS_EFFECTS } from "./effect-model.ts";
-import { isCompletedProcessExecutionWorld } from "./linux-process-world.ts";
+import { isCompletedProcessExecutionWorld, isRestorableProcessExecutionWorld } from "./linux-process-world.ts";
 
 const ACTOR_OPERATION = Symbol("actor-operation");
 const RAW_ACTOR_CALL = Symbol("raw-actor-call");
@@ -88,7 +88,7 @@ export interface CreateSpeculativeActionHostOptions extends DrafterModelOptions 
 	readonly actorForkPlanSource?: ActorForkPlanSource;
 	/** Ordered execution capabilities. A runtime-wide sandbox takes precedence over local fallbacks. */
 	readonly executionWorlds?: readonly AgentExecutionWorld[];
-	/** Dynamic policy for pre-Actor execution only; observation and Actor result reuse stay independent. */
+	/** Dynamic policy for speculative execution and the public Host's native route; resource observation stays independent. */
 	readonly speculativeExecutionWorldEnabled?: (backend: string) => boolean;
 	/** Optional persistence root for workspace-hashed PatternAware state. */
 	readonly patternStateDirectory?: string;
@@ -137,7 +137,9 @@ export { patternPlanActionID } from "./pattern-plan-source.ts";
  * Build source-neutral speculative plan execution for a host. The host owns lifecycle and tool interception.
  */
 export function createSpeculativeActionHost(sessionID: string, options: CreateSpeculativeActionHostOptions): SpeculativeActionHost {
-	return createAgentExecutionHost(sessionID, options, (world, operation) => world.isolation === "resource_snapshot" || operation === "speculation" &&
+	return createAgentExecutionHost(sessionID, options, (world, operation) => world.isolation === "resource_snapshot" ||
+		isRestorableProcessExecutionWorld(world) && operation !== "observation" &&
+			(operation === "speculation" || options.speculativeExecutionWorldEnabled?.(world.id) !== false) || operation === "speculation" &&
 		(world.isolation === "workspace_branch" || isCompletedProcessExecutionWorld(world))
 		? undefined : "Outside the supported resource closure; the Actor executes this operation");
 }

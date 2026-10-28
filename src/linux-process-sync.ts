@@ -113,7 +113,7 @@ export class SynchronousProcessObserver {
 		signal?.addEventListener("abort", abort, { once: true });
 		try {
 			const authority = await this.rpc.call<SharedArrayBuffer>("open", { id: lease.id, workspace, sourceRoot: input.sourceRoot, invocation,
-				scope: input.scope, producer: TimelineInterval.producer }, signal);
+				scope: input.scope, hasScopeOwner: !!input.acceptOperationScope, producer: TimelineInterval.producer }, signal);
 			const call = <Value>(operation: string, value?: unknown, request?: ProcessExecutionRequest, decode?: (value: unknown) => Promise<Value>) =>
 				this.rpc.call<Value>("session", { id: lease.id, operation, value }, request?.signal, request?.onData, decode);
 			const snapshot = () => this.read<SessionSnapshot>("snapshot", lease.id);

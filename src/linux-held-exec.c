@@ -3392,7 +3392,7 @@ static int trace(const char *socket_path, const char *token, const char *executi
 	if (transfer(3, &root, sizeof(root), 0) < 0 || root <= 0) return 71;
 	long flags = options | (descriptors ? PTRACE_O_TRACESYSGOOD : 0);
 	if (attach_owned(root, flags) < 0) return 72;
-	int status = 0, root_status = -1, retiring = 0, draining = 0, acknowledged = 0, admitted = 0;
+	int status = 0, root_status = -1, retiring = 0, draining = 0, acknowledged = 0, admitted = 0, launched = 0;
 	unsigned exec_events = !skip_root;
 	struct traced_process *processes = NULL;
 	domain.processes = &processes;
@@ -3519,12 +3519,16 @@ static int trace(const char *socket_path, const char *token, const char *executi
 			(void)transfer(3, valid ? "R" : "N", 1, 1); close(3); admitted = 1;
 		}
 		if (event == PTRACE_EVENT_EXEC && !process_owned(pid, &credentials)) retiring = draining = 1;
+		/* libuv's fork still contains the host's CLOEXEC pins. Start ancestry at
+		 * the actual launch, where only descriptors inherited by the program remain. */
+		if (event == PTRACE_EVENT_EXEC) launched = 1;
 		if (event == PTRACE_EVENT_VFORK || event == PTRACE_EVENT_VFORK_DONE) current->vforking = event == PTRACE_EVENT_VFORK;
 		if (descriptors && delivered == (SIGTRAP | 0x80)) {
-			if (!draining && observe_descriptor_syscall(current, &domain) < 0) goto fatal;
+			if (!draining && launched && observe_descriptor_syscall(current, &domain) < 0) goto fatal;
 			delivered = 0;
 		}
 		if (event == PTRACE_EVENT_FORK || event == PTRACE_EVENT_VFORK || event == PTRACE_EVENT_CLONE) {
+			if (!launched) domain.escaped = 1;
 			unsigned long child;
 			if (ptrace(PTRACE_GETEVENTMSG, pid, 0, &child) < 0) goto fatal;
 			struct traced_process *known = processes;

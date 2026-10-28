@@ -11,7 +11,7 @@ export {
 	type SpeculativeToolExecutionInput,
 } from "./agent-integration.ts";
 export { bindResourceOperation, createResourceSnapshotExecutionWorld, type AgentExecutionWorld, type SpeculativeAgentExecutionWorld, type SpeculativeToolExecutionContext, type ActorToolExecutionContext } from "./agent-execution-world.ts";
-export { createLinuxProcessExecutionWorld, createCompletedProcessExecutionWorld, type LinuxProcessExecutionWorldOptions } from "./linux-process-world.ts";
+export { createLinuxProcessExecutionWorld, createCompletedProcessExecutionWorld, createRestorableProcessExecutionWorld, type LinuxProcessExecutionWorldOptions } from "./linux-process-world.ts";
 export { LinuxProcessReuseBackend, type LinuxProcessBackendOptions, type LinuxProcessBackendStatus, type LinuxProcessSession } from "./linux-process-backend.ts";
 export { adaptProcessToolOperations, ProcessExecutionCoordinator, type ProcessExecutionRequest, type ProcessExecutionResult, type ProcessExecutor, type ProcessToolOperations } from "./process-execution.ts";
 export { WorkspaceSandboxService, type WorkspaceSandboxOptions } from "./workspace-sandbox.ts";

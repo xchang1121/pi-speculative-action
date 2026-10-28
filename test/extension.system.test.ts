@@ -6,12 +6,10 @@ import { fauxAssistantMessage, fauxProvider, fauxToolCall, fauxText } from "@ear
 import { AgentSession, convertToLlm, createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, type ExtensionAPI, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { afterEach, expect, test, vi } from "vitest";
 import { createSpeculativeActionExtension } from "../src/extension.ts";
-import { createAgentExecutionHost, createSpeculativeActionHost } from "../src/agent-integration.ts";
-import { createLinuxProcessExecutionWorld } from "../src/linux-process-world.ts";
+import { createSpeculativeActionHost } from "../src/agent-integration.ts";
 import { ProcessExecutionCoordinator } from "../src/process-execution.ts";
 import { currentExecutionScope } from "../src/execution-world.ts";
 import { LinuxProcessReuseBackend } from "../src/linux-process-backend.ts";
-import { WorkspaceSandboxService } from "../src/workspace-sandbox.ts";
 import type { ProcessExecutionBinding, ProcessHandoffRegistry } from "../src/process-handoff.ts";
 import * as operationPreparation from "../src/execution-preparation.ts";
 import type { PredictionSettlement } from "../src/settlement.ts";
@@ -44,7 +42,7 @@ test.skipIf(process.platform !== "linux").each(["reuse", "stale", "environment",
 	await writeFile(path.join(cwd, "value"), "one\n");
 	const command = 'cc main.c -o app && ./app && python3 -B check.py; printf "%s\\n" "$BASH_TEST_VERSION"';
 	expect(execFileSync("/bin/bash", ["-c", command], { cwd, encoding: "utf8" })).toBe("built:42\none\nfirst\n");
-	const nativeEntries = ["completedReplayExecutor", "observeNative", "observeBindings", "refreshNativeObservation"] as const;
+	const nativeEntries = ["completedReplayExecutor", "refreshNativeObservation"] as const;
 	const forbidden = nativeEntries.map(entry => vi.spyOn(LinuxProcessReuseBackend.prototype, entry).mockImplementation(() => { throw new Error(`unsupported entry: ${entry}`); }));
 	const events: SpeculativeActionEvent<string>[] = [], fallbacks: string[] = [];
 	let host!: ReturnType<typeof createSpeculativeActionHost>, turn!: Parameters<typeof host.startTurn>[0];
@@ -75,19 +73,21 @@ test.skipIf(process.platform !== "linux").each(["reuse", "stale", "environment",
 	expect(result, JSON.stringify(events)).toMatchObject({ isError: false, content: [fauxText(`built:42\n${mode === "stale" ? "two" : "one"}\n${mode === "environment" ? "second" : "first"}\n`)] });
 	const settled = events.filter(event => event.type === "actor_action").at(-1)!;
 	expect(fallbacks, JSON.stringify(events)).toEqual(mode === "reuse" ? [] : ["bash"]);
-	expect((settled.computation?.hiddenComputeMs ?? 0) > 0).toBe(mode === "reuse");
+	// A rejected whole branch can still consume unchanged, independently validated child work.
+	if (["reuse", "environment", "disabled", "routing-off"].includes(mode))
+		expect((settled.computation?.hiddenComputeMs ?? 0) > 0).toBe(mode === "reuse");
 	if (mode === "reuse") expect(settled.settlement.provider).toMatchObject({ kind: "actor", origin: "preview" });
 	for (const entry of forbidden) expect(entry).not.toHaveBeenCalled();
 });
 
-test.each(["async", "sync", "async-no-reuse", "sync-no-reuse"])("keeps unsupported callbacks on Actor and preserves Bash output and effects (%s)", async mode => {
+test.each(["async", "sync", "async-no-reuse", "sync-no-reuse"])("keeps callbacks authoritative and preserves Bash output and effects (%s)", async mode => {
 	const cwd = await directories.create(), agentDir = path.join(cwd, "agent"), calls: string[] = [];
 	await mkdir(agentDir); vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
 	await writeFile(path.join(agentDir, "speculative-action.json"), JSON.stringify({ enabled: true, reuseEnabled: !mode.endsWith("no-reuse"),
 		drafterEnabled: false, prepareObservedOperations: true, patternAware: { enabled: false }, executionRouting: { primary: true, nativeFallback: true } }));
 	await writeFile(path.join(cwd, "notes.txt"), "original\n");
 	await writeFile(path.join(cwd, "counter.cjs"), 'const fs=require("node:fs");fs.appendFileSync("runs","1");process.stdout.write(fs.readFileSync("notes.txt"));if(process.argv.includes("--fail"))process.exitCode=7;');
-	const nativeEntries = ["completedReplayExecutor", "observeNative", "observeBindings", "refreshNativeObservation"] as const;
+	const nativeEntries = ["completedReplayExecutor", "refreshNativeObservation"] as const;
 	const forbidden = nativeEntries.map(entry => vi.spyOn(LinuxProcessReuseBackend.prototype, entry).mockImplementation(() => { throw new Error(`unsupported entry: ${entry}`); }));
 	const actor = fauxProvider({ provider: "closure-actor", models: [{ id: "actor" }], tokensPerSecond: 4_000 });
 	const events: SpeculativeActionEvent<string>[] = [];
@@ -124,16 +124,15 @@ test.each(["async", "sync", "async-no-reuse", "sync-no-reuse"])("keeps unsupport
 	expect(await readText(cwd, "runs")).toBe("111"); expect(calls).toEqual(["seed", "failed"]);
 	for (const entry of forbidden) expect(entry).not.toHaveBeenCalled();
 	const bashEligible = process.platform === "linux" && !mode.endsWith("no-reuse");
-	expect(events.filter(event => event.type === "candidate" && event.state.status === "running" && (!bashEligible || event.candidate.tool !== "bash"))).toEqual([]);
 	for (const event of events.filter(event => event.type === "actor_action")) {
 		if (bashEligible && event.settlement.tool === "bash") continue;
 		expect(event.settlement.provider.kind).toBe("actor"); expect(event.computation?.hiddenComputeMs).toBe(0);
 	}
 });
 
-test.each(["off", "on", ...(process.platform === "linux" ? ["", "-nested", "-stale", "-running", "-retired", "-unkeyed", "-inputs", "-inputs-stale", "-sync-producer", "-sync-consumer", "-sync-both", "-sync-stale", "-sync-lost", "-sync-inputs", "-sync-inputs-stale", "-sync-inputs-preempted", "-sync-inputs-preempted-stale", "-cold", "-cold-stale", "-sync-cold", "-sync-cold-stale"].map(mode => `backend:native${mode}`) : [])])("runs Pi session contracts with the selected entry (%s)", async entry => {
-	const mode = entry.replace(/^backend:/, "");
+test.each(["off", "on", ...(process.platform === "linux" ? ["", "-nested", "-stale", "-running", "-retired", "-unkeyed", "-inputs", "-inputs-stale", "-sync-producer", "-sync-consumer", "-sync-both", "-sync-stale", "-sync-lost", "-sync-inputs", "-sync-inputs-stale", "-sync-inputs-preempted", "-sync-inputs-preempted-stale", "-cold", "-cold-stale", "-sync-cold", "-sync-cold-stale", "-continuation", "-continuation-stale", "-continuation-cancel"].map(mode => `native${mode}`) : [])])("runs Pi session contracts through the default entry (%s)", async mode => {
 	const enabled = mode !== "off", native = mode.startsWith("native"), running = mode === "native-running" || mode === "native-retired";
+	const live = mode.startsWith("native-continuation");
 	const stale = mode.endsWith("stale"), inputs = mode.includes("inputs"), cold = mode.includes("cold"), preempted = mode.includes("preempted"), synchronous = (callID: string) => mode.startsWith("native-sync") &&
 		(!mode.endsWith("producer") && !mode.endsWith("consumer") || callID === (mode.endsWith("producer") ? "seed" : "check"));
 	const cwd = await directories.create(native ? os.homedir() : undefined), agentDir = path.join(cwd, "agent");
@@ -187,19 +186,9 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["", "-nested", "-sta
 		} };
 	});
 
-	// Explicit backend qualification remains below the public Host's admission boundary.
-	const storeRoot = native ? await directories.create(os.homedir()) : path.join(agentDir, "backend-qualification");
-	const qualificationBackend = native ? new LinuxProcessReuseBackend({ storeRoot, store: { reservedRoot: true } }) : undefined;
-	const qualificationWorkspace = native ? new WorkspaceSandboxService() : undefined;
-	await using _backend = onExit(async () => { await qualificationBackend?.dispose(); await qualificationWorkspace?.dispose(); });
-	await qualificationBackend?.refreshNativeObservation(true);
-	if (native) expect(qualificationBackend!.nativeDiagnostics().state).toBe("ready");
 	let qualificationHost: ReturnType<typeof createSpeculativeActionHost>;
 	const extension = createSpeculativeActionExtension({
-		createWorkspaceSandboxService: qualificationWorkspace ? () => qualificationWorkspace : undefined,
-		createExecutionWorlds: native ? () => [createLinuxProcessExecutionWorld({ storeRoot, backend: qualificationBackend, workspaceSandbox: qualificationWorkspace,
-			tools: [], coordinator: new ProcessExecutionCoordinator({ execute: async () => { throw new Error("unbound process outlet"); } }) })] : undefined,
-		createHost: (id, options) => qualificationHost = (native ? createAgentExecutionHost : createSpeculativeActionHost)(id, {
+		createHost: (id, options) => qualificationHost = createSpeculativeActionHost(id, {
 		...options, resources: { initial: { cpuCount: 4, idleCpuCount: 4 }, sample: () => new Promise(() => {}) },
 		onEvent: event => { events.push(event); return options.onEvent?.(event); },
 	}) });
@@ -219,6 +208,7 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["", "-nested", "-sta
 	const originalPrompt = session.agent.prompt, originalContinue = session.agent.continue;
 	const toolResults = (owner = session) => owner.messages.filter(message => message.role === "toolResult");
 	let inspection: ReturnType<typeof inspectProcessOwner> | undefined;
+	let inspectionReady: Promise<void> | undefined;
 	let publication: Awaited<ReturnType<typeof holdOwnedProcessPublication>> | undefined;
 	await using _session = onExit(async () => {
 		for (const gate of Object.values(updated)) gate.resolve();
@@ -233,7 +223,14 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["", "-nested", "-sta
 		const ownerPrototype = LinuxProcessReuseBackend.prototype as unknown as { processOwner(): SynchronousProcessObserver };
 		const processOwner = ownerPrototype.processOwner;
 		vi.spyOn(ownerPrototype, "processOwner").mockImplementation(function (this: LinuxProcessReuseBackend) {
-			inspection ??= inspectProcessOwner(() => processOwner.call(this)); return processOwner.call(this);
+			if (!inspection) {
+				inspection = inspectProcessOwner(() => processOwner.call(this));
+				if (live) inspectionReady = inspection.inOwner(async state => {
+					state.errors = state.method((await state.load("../src/linux-process-backend.ts")).LinuxProcessReuseBackend.prototype, "setError");
+					state.publications = state.method((await state.load("../src/process-handoff.ts")).ProcessHandoffRegistry.prototype, "publish");
+				});
+			}
+			return processOwner.call(this);
 		});
 		let inputBinding: ProcessExecutionBinding | undefined;
 		if (mode === "native-sync-lost") {
@@ -247,16 +244,77 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["", "-nested", "-sta
 				} };
 			});
 		}
-		const observe = LinuxProcessReuseBackend.prototype.observeBindings, nested = !cold && !inputs && !mode.startsWith("native-sync") && !["native", "native-stale"].includes(mode);
+		const observe = LinuxProcessReuseBackend.prototype.observeBindings, nested = !live && !cold && !inputs && !mode.startsWith("native-sync") && !["native", "native-stale"].includes(mode);
 		vi.spyOn(LinuxProcessReuseBackend.prototype, "observeBindings").mockImplementation(function (this: LinuxProcessReuseBackend, scope, execute, receive, ...args) {
 			backend = this; return observe.call(this, scope, execute, (bindings, computations) => {
 				if (scope.callID === "seed") {
 					const registry = Reflect.get(this, "handoffs") as ProcessHandoffRegistry<{ readonly executable: string }>;
-					inputBinding = bindings.find(binding => registry.resolveBinding(binding, scope)?.executable === path.join(cwd, "slow"));
+					inputBinding = bindings.find(binding => registry.resolveBinding(binding, scope)?.executable === path.join(cwd, live ? "worker" : "slow"));
 				}
 				return receive(nested && scope.callID === "seed" ? bindings.slice(0, 1) : bindings, computations);
 			}, ...args);
 		});
+		if (live) {
+			await compileBenchmarkHelper(cwd, "worker", { code: `#include <stdio.h>
+#include <stdint.h>
+#include <unistd.h>
+int main(void) {
+ char input[3]; if (read(3, input, 1) != 1) return 71;
+ volatile uint64_t hash = 1; for (unsigned i = 0; i < 250000000; i++) hash = hash * 33 + i;
+ if (write(4, "R", 1) != 1) return 72;
+ for (int i = 1; i < 3; i++) if (read(3, input + i, 1) != 1) return 73;
+ printf("%c%c%c:%llu\\n", input[0], input[1], input[2], (unsigned long long)hash); return 37;
+}` });
+			await compileBenchmarkHelper(cwd, "launch", { code: `#define _GNU_SOURCE
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/wait.h>
+int main(int argc, char **argv) {
+ int input[2], ack[2], start[2]; if (argc != 2 || pipe(input) || pipe(ack) || pipe(start)) return 61;
+ if (write(input[1], argv[1][0] == 'c' ? "D" : "A", 1) != 1) return 62;
+ int child = fork(); if (child < 0) return 63;
+ if (!child) { close(start[1]); char go; if (read(start[0], &go, 1) != 1 || close(start[0])) _exit(64);
+  int a = fcntl(input[0], F_DUPFD_CLOEXEC, 10), b = fcntl(ack[1], F_DUPFD_CLOEXEC, 10);
+  if (a < 0 || b < 0 || dup2(a, 3) != 3 || dup2(b, 4) != 4) _exit(64);
+  close_range(5, ~0U, 0); execl("./worker", "worker", NULL); _exit(65); }
+ close(input[0]); close(ack[1]); close(start[0]);
+ if (write(start[1], "S", 1) != 1 || close(start[1])) return 66;
+ char ready; if (read(ack[0], &ready, 1) != 1 || ready != 'R') return 67;
+ if (write(input[1], argv[1][0] == 's' ? "BC" : "XY", 2) != 2) return 68;
+ close(input[1]); close(ack[0]); int status;
+ return waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status) != 37;
+}` });
+			await commitBenchmarkFixture(cwd, "default-live-continuation");
+			const availableImage = () => inspection!.inOwner(state => state.publications.mock.calls.some((call: any) => {
+				const [key, work, certificate, , continuation] = call.arguments;
+				return certificate?.result.continuation && continuation?.image.length > 0 && call.this.results(key, work.scope).some((current: any) => current.id === certificate.id);
+			}));
+			let preparationError: unknown;
+			actor.setResponses([response("produce_notes", { text: "./launch seed; :" }, { id: "seed" }), async () => {
+				try {
+				expect(inputBinding).toBeDefined();
+				await inspectionReady;
+				await expect.poll(availableImage, { timeout: 10_000 }).toBe(true);
+				if (mode.endsWith("cancel")) await qualificationHost.runtime.disposeSession(qualificationHost.sessionID);
+				return response("format_rows", { text: `./launch ${stale ? "changed" : "actual"}; printf once >> marker` }, { id: "check" });
+				} catch (error) { preparationError = error; throw error; }
+			}, fauxAssistantMessage("done")]);
+			await session.prompt("Prepare the calculation, then finish it using the new input.");
+			if (preparationError) throw preparationError;
+			const results = toolResults(), reused = !stale && !mode.endsWith("cancel");
+			expect(results, JSON.stringify({ messages: session.messages, events, metrics: backend?.actorMetrics() })).toHaveLength(2);
+			expect(results.map(result => result.isError)).toEqual([false, false]);
+			expect(results[0]!.content).toEqual([fauxText("hook:own:produce_notes:ABC:7107042143181080257\n")]);
+			expect(results[1]!.content).toEqual([fauxText(`hook:own:format_rows:${stale ? "D" : "A"}XY:7107042143181080257\n`)]);
+			expect(calls).toEqual(["seed", "check"]); expect(await readText(cwd, "marker")).toBe("once");
+			expect(backend!.actorMetrics().hits, JSON.stringify({ metrics: backend!.actorMetrics(), owner: await inspection!.inOwner(state => ({
+				errors: state.errors.mock.calls.map((call: any) => call.arguments[1]),
+				images: state.publications.mock.calls.flatMap((call: any) => { const [key, work, certificate] = call.arguments;
+					return certificate?.result.continuation ? [{ key, scope: work.scope, aborted: work.signal.aborted }] : []; }) })), events })).toBe(Number(reused));
+			expect(events.filter(event => event.type === "actor_action").at(-1)!.computation!.hiddenComputeMs > 0).toBe(reused);
+			if (reused) await expect.poll(availableImage).toBe(false);
+			return;
+		}
 		await compileBenchmarkHelper(cwd, "slow", { code: "#include <stdio.h>\n#include <fcntl.h>\n#include <unistd.h>\nint main(int n,char**v){int f=fcntl(3,F_GETFD)<0?open(v[1],O_RDONLY):3;if(f<0)return 1;unsigned long h=5381;char c;while(read(f,&c,1)==1)h=h*33+c;close(f);for(volatile unsigned long i=0;i<40000000ul;i++)h^=i;printf(\"%s %lx\\n\",v[1],h);return 0;}\n" });
 		await commitBenchmarkFixture(cwd, "sdk-callback");
 		const command = "./slow notes.txt" + (inputs ? " 3<notes.txt" : "");

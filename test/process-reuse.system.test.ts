@@ -296,6 +296,18 @@ async function fixture(options: ConstructorParameters<typeof ProvenanceCertifica
 	return { root, input, store, request, common, produce, lookup, output, registry, reserve, actor, publish, consume };
 }
 
+test("requires current owner authority for a one-shot result in its original turn", async () => {
+	const f = await fixture();
+	let permitted = true;
+	const owner = new ProcessHandoffOwnership(undefined, () => permitted), work = await f.reserve(owner);
+	await f.publish(work, "owned result");
+	permitted = false;
+	await f.consume(f.actor(), undefined);
+	permitted = true;
+	await f.consume(f.actor(), "owned result");
+	await f.consume(f.actor(), undefined);
+});
+
 test("reopens, validates, repairs and collects persisted history without stale observations", async () => {
 	const f = await fixture({ maxCertificates: 257, orphanGraceMs: 0 }), certificates: ProcessProvenanceCertificate[] = [], legacy = new ArtifactCAS(path.join(f.root, "cas"));
 	const original = new TimelineInterval(10, 110, [{ computation: new TimelineInterval(20, 40), overhead: true },

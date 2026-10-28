@@ -13,7 +13,7 @@ import type { ProcessExecutionRequest } from "./process-execution.ts";
 import { serializeNativeDependency, type SynchronousProcessRequest, type SynchronousProcessResult, type SerializedProcessBinding } from "./linux-process-sync.ts";
 
 // Composition stays in the worker entry: clients never import the services they delegate to.
-type NativeSessionInput = Parameters<LinuxProcessReuseBackend["open"]>[0];
+type NativeSessionInput = Parameters<LinuxProcessReuseBackend["open"]>[0] & { readonly hasScopeOwner?: boolean };
 type SessionSnapshot = Pick<SynchronousProcessResult, "bindings" | "computations" | "metrics">;
 
 async function serveWorkspaceObservation(port: MessagePort, clock: Int32Array, options: SandboxWorkspaceTransfer, workspaces: Map<string, SandboxWorkspaceContext>) {
@@ -110,7 +110,7 @@ async function serveNativeBackend(port: MessagePort, clock: Int32Array, options:
 			const adopted = (adoption: ExecutionOperationAdoption) => backend!.recordWorkerAdoption(id, adoption);
 			const accept = (scope: ExecutionScope) => [...grants.values()].some(grant => grant.scope?.sessionID === scope.sessionID &&
 				grant.scope.turnID === scope.turnID && grant.scope.callID === scope.callID && grant.owners?.includes(id));
-			const session = entry.session = await backend!.open({ ...input, signal: entry.controller.signal, onOperationAdopted: adopted, acceptOperationScope: accept,
+			const session = entry.session = await backend!.open({ ...input, signal: entry.controller.signal, onOperationAdopted: adopted, acceptOperationScope: input.hasScopeOwner ? accept : undefined,
 				onOperationJoinable: available => { entry.available = available; } });
 			if (entry.controller.signal.aborted) { await session.close(); entry.controller.signal.throwIfAborted(); }
 			retained.set(id, { ownership: new WeakRef(session.ownership), adopted, accept });

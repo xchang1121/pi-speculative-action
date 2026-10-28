@@ -10,19 +10,34 @@ import { toolErrorSettlement, type ToolInvocation } from "./tool-settlement.ts";
 import { WorkspaceSandboxService, type WorkspaceSandboxOptions } from "./workspace-sandbox.ts";
 import { isRecord } from "./stable-json.ts";
 
-const completedWorlds = new WeakSet<object>();
-export const isCompletedProcessExecutionWorld = (world: object) => completedWorlds.has(world);
+const hostWorlds = new WeakMap<object, boolean>();
+export const isCompletedProcessExecutionWorld = (world: object) => hostWorlds.get(world) === true;
+export const isRestorableProcessExecutionWorld = (world: object) => hostWorlds.get(world) === false;
+type HostProcessWorldOptions = Pick<LinuxProcessExecutionWorldOptions,
+	"coordinator" | "tools" | "storeRoot" | "store" | "sandlockBinary" | "straceBinary" | "heldExecBinary" | "deniedPaths">;
 
 /** Public Host route for finished, validated branches; it cannot observe or restore Actor processes. */
-export function createCompletedProcessExecutionWorld(options: Pick<LinuxProcessExecutionWorldOptions,
-	"coordinator" | "tools" | "storeRoot" | "store" | "sandlockBinary" | "straceBinary" | "heldExecBinary" | "deniedPaths">): SpeculativeAgentExecutionWorld {
+export function createCompletedProcessExecutionWorld(options: HostProcessWorldOptions): SpeculativeAgentExecutionWorld {
+	return createHostProcessWorld(options, true);
+}
+
+/** Native operations are admitted only through owned bindings and revalidated effects, inputs and handles. */
+export function createRestorableProcessExecutionWorld(options: HostProcessWorldOptions) {
+	return createHostProcessWorld(options, false);
+}
+
+function createHostProcessWorld(options: HostProcessWorldOptions, completedOnly: boolean) {
 	const { coordinator, tools, storeRoot, store, sandlockBinary, straceBinary, heldExecBinary, deniedPaths } = options;
-	const implementation = createLinuxProcessExecutionWorld({ coordinator, tools: Object.freeze([...tools]), storeRoot, store,
+	const configuration = { storeRoot, store,
 		...(sandlockBinary ? { sandlockBinary } : {}), ...(straceBinary ? { straceBinary } : {}), ...(heldExecBinary ? { heldExecBinary } : {}),
-		deniedPaths, driver: "git", completedOnly: true });
-	const world = Object.freeze({ ...implementation, id: "linux_completed_process", observeOperations: undefined,
-		speculation: Object.freeze({ ...implementation.speculation, tools: Object.freeze([...tools]) }) });
-	completedWorlds.add(world);
+		deniedPaths: deniedPaths && Object.freeze([...deniedPaths]), completedOnly };
+	const backend = new LinuxProcessReuseBackend(configuration);
+	const implementation = createLinuxProcessExecutionWorld({ ...configuration, coordinator, backend, tools: Object.freeze([...tools]), driver: "git" });
+	const world = Object.freeze({ ...implementation, id: completedOnly ? "linux_completed_process" : implementation.id,
+		observeOperations: completedOnly ? undefined : implementation.observeOperations,
+		nativeDiagnostics: (enabled?: boolean) => backend.nativeDiagnostics(enabled),
+		speculation: Object.freeze({ ...implementation.speculation, tools: completedOnly ? Object.freeze([...tools]) : undefined }) });
+	hostWorlds.set(world, completedOnly);
 	return world;
 }
 

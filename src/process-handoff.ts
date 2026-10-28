@@ -35,7 +35,7 @@ export class ProcessHandoffOwnership {
 	acceptsScope(producer: ExecutionScope | undefined, consumer: ExecutionScope | undefined, salvage = false): boolean {
 		if (!producer || !consumer || producer.sessionID !== consumer.sessionID) return false;
 		if (this.consumer) return sameScope(this.consumer, consumer) && this.consumer.callID === consumer.callID;
-		return sameScope(producer, consumer) || this.scopeOwner?.deref()?.(consumer, salvage) === true;
+		return this.scopeOwner ? this.scopeOwner.deref()?.(consumer, salvage) === true : sameScope(producer, consumer);
 	}
 
 	/** Observational only; a retained certificate must not keep an expired runtime alive. */

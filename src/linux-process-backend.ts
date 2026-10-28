@@ -2577,7 +2577,8 @@ async function acquireOutputChannels(parent: string, signal?: AbortSignal) {
 	try {
 		for (const fd of [1, 2]) {
 			signal?.throwIfAborted();
-			const socketPath = `/proc/self/fd/${directory.fd}/${fd}`;
+			// /proc/net/unix retains the literal name across processes, including /proc/self.
+			const socketPath = `/proc/self/fd/${directory.fd}/${process.pid}-${path.basename(root)}-${fd}`;
 			const entry = { server: net.createServer({ pauseOnConnect: true }), source: new net.Socket({ signal }), endpoint: "" } as typeof entries[number];
 			entries.push(entry);
 			entry.source.on("error", () => undefined); // Abort may precede the stream-drain observer.

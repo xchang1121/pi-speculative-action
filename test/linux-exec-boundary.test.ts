@@ -96,7 +96,7 @@ int main(int argc, char **argv) {
 		{ name: "running", command: "worker joined.txt", expected: "worker:before\n", file: "joined.txt", metrics: { ...hit, joinedHits: 1 } },
 		{ name: "stale", command: "worker stale.txt", expected: "worker:after\n", file: "stale.txt", metrics: miss },
 		{ name: "cwd", command: "/bin/pwd", expected: `${workspace}\n`, metrics: hit },
-		{ name: "security", command: "worker unused probe", expected: "nnp:0\n", metrics: { ...miss, lastError: expect.stringContaining("certificate_tainted") } },
+		{ name: "security", command: "worker unused probe", expected: execFileSync(path.join(workspace, "worker"), ["unused", "probe"], { cwd: workspace, encoding: "utf8" }), metrics: { ...miss, lastError: expect.stringContaining("certificate_tainted") } },
 		{ name: "hard-limit", command: "ulimit -H -s 65536; /bin/sh -c 'ulimit -H -s'", expected: "65536\n", metrics: miss },
 		{ name: "core-limit", command: "/bin/sh -c 'ulimit -H -c'", expected: execFileSync("/bin/sh", ["-c", "ulimit -H -c"], { encoding: "utf8" }), metrics: miss },
 		{ name: "proc-limits", command: "/bin/cat /proc/self/limits", expected: await readText("/proc/self/limits"), metrics: miss },

@@ -17,7 +17,7 @@ import { createLocalBashOperations, createReadTool, createGrepTool, createLsTool
 import { describe, expect, vi } from "vitest";
 import { buildActionKey, buildPiActionKey, PI_ACTION_SEMANTICS } from "../src/action-semantics.ts";
 import { linuxOverlayfsCapability } from "../src/linux-overlayfs.ts";
-import { LinuxHeldExecBoundary, type HeldExecProcess, type HeldExecTiming } from "../src/linux-held-exec.ts";
+import { LinuxHeldExecBoundary, resolveLinuxExecHelper, type HeldExecProcess, type HeldExecTiming } from "../src/linux-held-exec.ts";
 import { effectCommitFailure } from "../src/effect-transaction.ts";
 import { LinuxProcessReuseBackend, validateTransferredProcessEvidence, type LinuxProcessSession } from "../src/linux-process-backend.ts";
 import { ProcessHandoffRegistry, type ProcessExecutionBinding } from "../src/process-handoff.ts";
@@ -150,6 +150,44 @@ async function withPreparedWorker(fixture: LinuxProcessBenchmark, input: Paramet
 }
 
 describe("Linux process ExecutionWorld", () => {
+nativeTest("keeps output endpoint ownership distinct from another process with the same directory descriptor", async ({ benchmark }) => {
+	const fixture = await benchmark("pi-output-namespace-", "git");
+	await fixture.compile("foreign-output", { code: `${cHeaders("sys/un.h sys/socket.h unistd.h stdio.h stdlib.h fcntl.h")}
+int main(int argc, char **argv) {
+ if (argc != 3) return 61;
+ int directory = open(argv[1], O_RDONLY | O_DIRECTORY), target = atoi(argv[2]);
+ if (directory < 0 || dup2(directory, target) != target) return 62;
+ struct sockaddr_un address = {.sun_family = AF_UNIX};
+ snprintf(address.sun_path, sizeof(address.sun_path), "/proc/self/fd/%d/1", target);
+ int server = socket(AF_UNIX, SOCK_STREAM, 0), client = socket(AF_UNIX, SOCK_STREAM, 0);
+ if (server < 0 || client < 0 || bind(server, (void *)&address, sizeof(address)) || listen(server, 1) ||
+     connect(client, (void *)&address, sizeof(address)) || accept(server, NULL, NULL) < 0 || write(1, "ready", 5) != 5) return 63;
+ char byte; return read(0, &byte, 1) < 0;
+}` });
+	const foreign = path.join(fixture.root, "foreign"); await mkdir(foreign);
+	await fixture.commit("Output endpoint ownership"); await fixture.prepare();
+	await fixture.inOwner(async (state, binary, foreign) => {
+		const listen = state.net.Server.prototype.listen, read = state.fs.readFile;
+		state.method(state.net.Server.prototype, "listen", function(this: unknown, ...args: any[]) {
+			const socket = typeof args[0] === "string" ? args[0] : args[0]?.path;
+			if (/^\/proc\/self\/fd\/\d+\//.test(socket ?? "")) state.outputDirectory = socket.split("/")[4];
+			return listen.apply(this, args);
+		});
+		state.method(state.fs, "readFile", async (...args: any[]) => {
+			if (args[0] === "/proc/net/unix" && state.outputDirectory && !state.foreign) {
+				const { spawn } = await state.load("node:child_process"), { once } = await state.load("node:events");
+				state.foreign = spawn(binary, [foreign, state.outputDirectory]); state.foreignClosed = once(state.foreign, "close");
+				await once(state.foreign.stdout, "data");
+			}
+			return read(...args);
+		});
+	}, path.join(fixture.workspace, "foreign-output"), foreign);
+	await using _cleanup = onExit(() => fixture.inOwner(async state => { state.foreign?.stdin.end(); await state.foreignClosed; }));
+	await using branch = disposable(await fixture.fork("printf correct-output"));
+	expect(await fixture.inOwner(state => !!state.foreign)).toBe(true);
+	expect(textOutput(branch.output.result)).toBe("correct-output");
+});
+
 nativeTest.for(["argv", "MODE", "__proto__"])("preserves literal workspace text in %s", async (field, { benchmark }) => {
 	const fixture = await benchmark("pi-literal-input-", "git"); await fixture.prepare();
 	await fixture.workspaceSandbox.withWorkspace(fixture.workspace, async workspace => {
@@ -1978,6 +2016,7 @@ static int takePacket(int length,int peek,int truncated,char expected) {
 		const root = await mkdtemp(path.join(os.tmpdir(), "pi-held-transaction-"));
 		const binary = path.join(root, "helper");
 		for (const suffix of ["", ".node"]) await compileBenchmarkHelper(root, "helper" + suffix, { source: fileURLToPath(new URL("../src/linux-held-exec.c", import.meta.url)), arguments: ["-pthread", "-Werror", ...(suffix ? ["-shared", "-fPIC"] : [])] });
+		await filesystem.symlink((await resolveLinuxExecHelper(process.env.PI_SPEC_HELD_EXEC)) + ".sqlite", binary + ".sqlite");
 		const boundary = await LinuxHeldExecBoundary.open({ storeRoot: root, binary });
 		await using _cleanup = onExit(async () => { await boundary.close(); await rm(root, { recursive: true, force: true }); });
 		const actual = await vi.importActual<typeof childProcess>("node:child_process"), original = Reflect.get(actual.ChildProcess.prototype, "spawn");
@@ -2096,7 +2135,7 @@ int main(int n,char **v) { if(n!=2)return 90; pid_t child=!strcmp(v[1],"vfork")?
 		for (const stop of ["waiter", "preparing", "owner"]) {
 			const gate = path.join(root, `probe-${stop}`), marker = gate + "-pid", helper = gate + "-helper", storeRoot = gate + "-store";
 			await writeFile(helper, `#!/bin/sh\nif [ "$1" = "--attach-skip-code" ]; then echo $$ > '${marker}'; while [ ! -f '${gate}' ]; do sleep .01; done; fi\nexec '${Reflect.get(boundary, "observerBinary")}' "$@"\n`, { mode: 0o700 });
-			await filesystem.symlink(binary + ".node", helper + ".node");
+			for (const suffix of [".node", ".sqlite"]) await filesystem.symlink(binary + suffix, helper + suffix);
 			const backend = new LinuxProcessReuseBackend({ storeRoot, heldExecBinary: helper, heldExecObserverBinary: helper }), host = adaptProcessToolOperations(createLocalBashOperations({ shellPath: "/bin/bash" }));
 			const controller = new AbortController();
 			const execute = async (signal?: AbortSignal) => { let output = "";
