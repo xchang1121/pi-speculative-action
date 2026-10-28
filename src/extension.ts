@@ -15,15 +15,13 @@ import { toolSpeedup } from "./task-timing.ts";
 import { forceToolChoice } from "./drafter-plan-source.ts";
 import { DEFAULTS } from "./common.ts";
 import { PATTERN_AWARE_PRESETS, patternAwarePersistenceFile, type PatternAwareSettings } from "./pattern-aware.ts";
-import { createClosedSearchProfile, createPiToolDefinitions, PI_CLOSED_SEARCH_TOOLS, PI_OPERATION_TOOLS, resolvePiToolInvocation } from "./pi-tool-invocation.ts";
-import { LinuxProcessReuseBackend } from "./linux-process-backend.ts";
+import { createClosedSearchProfile, createPiToolDefinitions, PI_CLOSED_SEARCH_TOOLS, resolvePiToolInvocation } from "./pi-tool-invocation.ts";
 import { checkLinuxEnvironment, installLinuxDependencies } from "./linux-setup.ts";
-import { createLinuxProcessExecutionWorld } from "./linux-process-world.ts";
-import { executionCapabilityStatus, type ExecutionWorldDiagnosticSnapshot, type ExecutionWorldHealthState, type SpeculativeExecution,
+import { emptyWorldReuseMetrics, executionCapabilityStatus, type ExecutionWorldDiagnosticSnapshot, type ExecutionWorldHealthState, type SpeculativeExecution,
 	type WorldReuseMetrics } from "./execution-world.ts";
 import { adaptProcessToolOperations, definedProcessEnvironment, ProcessExecutionCoordinator,
 	type ProcessRouteSnapshot } from "./process-execution.ts";
-import { DEFAULT_PROVENANCE_STORE_LIMITS } from "./reuse-store.ts";
+import { DEFAULT_PROVENANCE_STORE_LIMITS, ProvenanceCertificateStore } from "./reuse-store.ts";
 import type { SpeculativeActionEvent } from "./runtime.ts";
 import { RuntimeLifecycleLane } from "./runtime-lifecycle.ts";
 import { millisecondsInput, nonEmptyTextInput, nonNegativeIntegerInput, nonNegativeNumberInput, optionalTextInput,
@@ -192,7 +190,7 @@ export function formatSpeculativeActionStatus(input: {
 		`Pattern predictions: ${settings.patternAware.enabled ? "On" : "Off"}; learning active; follow-up steps: ${settings.patternAware.multiStepEnabled ? "On" : "Off"} (alternatives/tool ${settings.patternAware.beamWidth}, depth ${settings.patternAware.maxPredictionDepth}, learn after ${settings.patternAware.minOccurrences}, gap ${settings.patternAware.maxFutureGap}, coverage ${formatPercent(settings.patternAware.futureGapCoverage)}, half-life ${settings.patternAware.decayHalfLifeEvents})`,
 		`Prebuilt modes: ${settings.patternAware.presets.length}/${PATTERN_AWARE_PRESETS.length} selected${settings.patternAware.enabled ? "" : " (inactive)"}; ${PATTERN_AWARE_PRESETS.filter(preset => settings.patternAware.presets.includes(preset.id)).map(preset => preset.label).join(", ") || "None"}`,
 		`Actor probe: ${self.enabled && self.forkEnabled ? `On (${self.forkTransport})` : "Off"}; target verification ${self.enabled ? "On" : "Off"}; early tool execution ${self.enabled && self.forkTransport !== "provider" && self.forkEnabled && self.forkActionEnabled ? self.forkTransport === "drafter" ? "On (Drafter)" : `On (tool-name confidence ≥${formatPercent(self.forkActionMinConfidence)})` : "Off"}; ${self.maxCandidates} candidates × ${self.maxDraftTokens} draft tokens; Actor Profile=${self.actorProfile}; ${self.draftFormat} (${syntaxSettingLabel(self.draftBoundary)} boundary); ${self.forkTransport === "sidecar" ? self.endpoint : FORK_TRANSPORT_LABELS[self.forkTransport]}`,
-		`Execution routing: unified ${settings.executionRouting.primary ? "On" : "Off"}; native fallback ${settings.executionRouting.nativeFallback ? "On" : "Off"}; Actor always available`,
+		`Execution routing: admitted providers ${settings.executionRouting.primary ? "On" : "Off"}; local file routes ${settings.executionRouting.nativeFallback ? "On" : "Off"}; Actor always available`,
 		`Search execution: ${searchExecutionLabel(settings.searchExecution)}`,
 		`Tool calls reused: ${formatRatio(metrics.speculativeHits, metrics.actorActions)}; ${metrics.exactReuseHits} exact, ${metrics.partialResultReuseHits} partial, ${metrics.inputReuseHits} inputs`,
 		...(hasProcessReuse(metrics.actorProcessReuse)
@@ -361,30 +359,23 @@ async function installController(
 		storeRoot = await realpath(storeRoot);
 	}
 	catch { /* An unavailable cache cannot prevent the original tools from running. */ }
-	const processBackend = new LinuxProcessReuseBackend({ storeRoot, store: { reservedRoot: true } });
+	const inputStore = new ProvenanceCertificateStore(storeRoot, { reservedRoot: true });
 	const rawProcessExecutor = adaptProcessToolOperations(createLocalBashOperations({ shellPath: getShellConfig(piToolSettings.shellPath).shell }));
-	const completedReplay = processBackend.completedReplayExecutor(rawProcessExecutor, {
-		sourceRoot: context.cwd, invocation: request => resolvePiToolInvocation("bash", { command: request.command, timeout: request.timeout }, {
-			cwd: request.cwd, environment: definedProcessEnvironment(request.environment), shellPath: piToolSettings.shellPath,
-		})?.process,
-	});
-	const processCoordinator = new ProcessExecutionCoordinator({
-		execute: request => (currentSettings.reuseEnabled ? completedReplay : rawProcessExecutor).execute(request),
-	});
+	const processCoordinator = new ProcessExecutionCoordinator(rawProcessExecutor);
 	const workspaceSandbox = dependencies.createWorkspaceSandboxService?.() ?? new WorkspaceSandboxService();
 	const executionWorlds = [
 		...new Set([
 			...primaryExecutionWorlds,
-			createLinuxProcessExecutionWorld({
-				coordinator: processCoordinator,
-				tools: PI_OPERATION_TOOLS.process,
-				backend: processBackend,
-				storeRoot,
-				workspaceSandbox,
-			}),
 			workspaceSandbox.createExecutionWorld(),
-			createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { maxBytes: () => currentSettings.resourceCacheMaxBytes,
-				persistentInputs: { store: processBackend.store, internalCache: true } }),
+			{ ...createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { maxBytes: () => currentSettings.resourceCacheMaxBytes,
+				persistentInputs: { store: inputStore, internalCache: true } }),
+				storage: {
+					configure: ({ maxEntries, maxBytes }: { maxEntries: number; maxBytes: number }) => inputStore.configure({ maxCertificates: maxEntries, maxBytes }),
+					maintain: async (operation: "gc" | "clear") => {
+						const result = await (operation === "gc" ? inputStore.gc() : inputStore.clear());
+						return { removedEntries: result.removedCertificates + result.removedInputVersions, removedArtifacts: result.removedArtifacts, removedBytes: result.removedBytes };
+					},
+				}, dispose: () => inputStore.dispose() },
 		]),
 	];
 	const primaryExecutionWorldIDs = new Set(primaryExecutionWorlds.map((world) => world.id));
@@ -399,7 +390,7 @@ async function installController(
 	configureExecutionStorage();
 	let executionDiagnostics: readonly ExecutionWorldDiagnosticSnapshot[] = [];
 	const executionRoutes = (): ExecutionRoutesSnapshot => ({
-		worlds: executionDiagnostics, actorProcessReplay: processBackend.nativeDiagnostics(true), primaryIDs: primaryExecutionWorldIDs,
+		worlds: executionDiagnostics, actorProcessReplay: { state: "unavailable", detail: "Native process reuse is outside the supported resource closure; Actor execution is unchanged" }, primaryIDs: primaryExecutionWorldIDs,
 		searchDetail: !closedSearchEnabled() || (search && !search.profile) ? "Native Pi" : `${searchExecutionLabel(currentSettings.searchExecution)}; ${search?.profile ? [...search.profile.invocations.keys()].join(", ") + " prepared" : "not checked"}`,
 	});
 	const agentTools = new Map([...createPiToolDefinitions(context.cwd, {
@@ -419,7 +410,7 @@ async function installController(
 			: sdkToolInvocation(tool).semantics?.requirements])), executionRoutes(),
 	);
 	const runtimeSettings = () => currentSettings;
-	const visibleMetrics = (): SpeculativeActionMetrics => ({ ...currentMetrics, actorProcessReuse: processBackend.actorMetrics() });
+	const visibleMetrics = (): SpeculativeActionMetrics => ({ ...currentMetrics, actorProcessReuse: emptyWorldReuseMetrics() });
 	function renderFooter(): void {
 		if (!ui) return;
 		ui.setStatus(STATUS_KEY, formatSpeculativeFooter(settings(), visibleMetrics(), executionRoutes()));
@@ -472,11 +463,10 @@ async function installController(
 		if (refresh) await resetSearch();
 		const preparations = [
 			closedSearchEnabled() ? prepareSearch() : undefined,
-			refresh ? processBackend.refreshNativeObservation(true) : undefined,
 			Promise.resolve().then(() => host.executionWorldDiagnostics(refresh)),
 		] as const;
 		// A failed provider cannot detach preparation from refresh or shutdown ownership.
-		const [, , diagnostics] = await Promise.all(preparations).finally(() => Promise.allSettled(preparations));
+		const [, diagnostics] = await Promise.all(preparations).finally(() => Promise.allSettled(preparations));
 		executionDiagnostics = diagnostics;
 		await recoverSpeculation(() => host.runtime.settingsChanged());
 		renderFooter();
@@ -599,7 +589,7 @@ async function installController(
 				return Promise.resolve().then(() => settingsStore.flush())
 				.finally(() => host.dispose())
 				.finally(disconnectProbe)
-				.finally(() => workspaceSandbox.dispose())
+					.finally(() => workspaceSandbox.dispose())
 				.finally(() => selfSpeculation.dispose())
 				.finally(resetSearch).finally(() => {
 					try { dependencies.onMetrics?.(visibleMetrics(), routes); } catch { /* Reporting cannot change cleanup. */ }
@@ -941,7 +931,7 @@ async function openExecutionRoutes(
 ): Promise<void> {
 	await recoverSpeculation(() => controller.refreshExecutionDiagnostics(true));
 	ctx.ui.notify(
-		`Sources predict available tool calls; resource proofs and permissions determine execution and reuse. Replay, Observe, and Fork are independent runtime capabilities. Order: unified environment → local safe fallback → Actor. Local routes include sealed file inputs, private workspace transactions, and qualified native processes. Diagnostics refresh enabled providers only.\n${executionWorldSummary(controller.toolCapabilities(), controller.executionRoutes())}`,
+		`Supported reuse covers bound file inputs, deterministic computations and qualified file transactions. Native processes and external runtime sandboxes execute through the Actor. The same boundary applies to prediction, result capture, internal observation and capability refresh; settings cannot widen it.\n${executionWorldSummary(controller.toolCapabilities(), controller.executionRoutes())}`,
 		"info",
 	);
 	return runSettingsMenu(ctx, editor, "Execution routes", settings => {

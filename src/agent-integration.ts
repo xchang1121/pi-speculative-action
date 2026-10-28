@@ -136,6 +136,13 @@ export { patternPlanActionID } from "./pattern-plan-source.ts";
  * Build source-neutral speculative plan execution for a host. The host owns lifecycle and tool interception.
  */
 export function createSpeculativeActionHost(sessionID: string, options: CreateSpeculativeActionHostOptions): SpeculativeActionHost {
+	return createAgentExecutionHost(sessionID, options, (world, operation) => world.isolation === "resource_snapshot" || operation === "speculation" && world.isolation === "workspace_branch"
+		? undefined : "Outside the supported resource closure; the Actor executes this operation");
+}
+
+/** Internal engine assembly for backend qualification. The public Pi Host always applies its resource closure. */
+export function createAgentExecutionHost(sessionID: string, options: CreateSpeculativeActionHostOptions,
+	admission?: (world: AgentExecutionWorld, operation: "speculation" | "observation" | "observeOperations") => string | undefined): SpeculativeActionHost {
 	const actionSemantics = options.actionSemantics ?? PI_ACTION_SEMANTICS;
 	const projectionRules = resolveActionProjectionRules([...options.projectionRules ?? [], PI_BASH_TIMEOUT_PROJECTION_RULE, PI_GREP_LITERAL_PROJECTION_RULE], actionSemantics);
 	let inputMaxBytes = DEFAULTS.resourceCacheMaxBytes;
@@ -145,7 +152,8 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 	) {
 		executionWorlds.push(createResourceSnapshotExecutionWorld(actionSemantics, { maxBytes: () => inputMaxBytes }));
 	}
-	const executionGateway = new ToolExecutionGateway(executionWorlds, options.speculativeExecutionWorldEnabled);
+	const inClosure = (world: AgentExecutionWorld) => !admission?.(world, "speculation");
+	const executionGateway = new ToolExecutionGateway(executionWorlds, options.speculativeExecutionWorldEnabled, undefined, admission);
 	const resolveExecutionRoute = (tool: string, signal?: AbortSignal, action?: ActionKey, parentCheckpoint?: WorldCheckpoint) => {
 		const definition = actionSemantics.definition(action ?? tool);
 		return definition && executionGateway.resolve({ tool, action, parentCheckpoint,
@@ -338,7 +346,7 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 				try { return await (prepared?.withInputs ? prepared.withInputs(execute) : execute()); }
 				finally {
 					if ((bound.invocation?.semantics ?? actionSemantics.definition(bound.action ?? bound.tool))?.effect !== "observation") {
-						await TimelineInterval.outside(() => Promise.allSettled(executionWorlds.map(async world => world.actorFallbackSettled?.())));
+						await TimelineInterval.outside(() => Promise.allSettled(executionWorlds.filter(inClosure).map(async world => world.actorFallbackSettled?.())));
 					}
 				}
 			}, {
@@ -367,7 +375,7 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 			try {
 				await runtime.finishTurn({ sessionID, turnID, tool: "", args: {}, tools: [], terminal });
 			} finally {
-				const closed = await Promise.allSettled(executionWorlds.map(async world => world.finishTurn?.(turnID)));
+				const closed = await Promise.allSettled(executionWorlds.filter(inClosure).map(async world => world.finishTurn?.(turnID)));
 				const failures = closed.flatMap(result => result.status === "rejected" ? [result.reason] : []);
 				if (failures.length) throw new AggregateError(failures, "Execution world turn cleanup failed");
 			}

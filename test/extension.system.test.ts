@@ -6,10 +6,12 @@ import { fauxAssistantMessage, fauxProvider, fauxToolCall, fauxText } from "@ear
 import { AgentSession, convertToLlm, createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, type ExtensionAPI, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { afterEach, expect, test, vi } from "vitest";
 import { createSpeculativeActionExtension } from "../src/extension.ts";
-import { createSpeculativeActionHost } from "../src/agent-integration.ts";
+import { createAgentExecutionHost, createSpeculativeActionHost } from "../src/agent-integration.ts";
+import { createLinuxProcessExecutionWorld } from "../src/linux-process-world.ts";
 import { ProcessExecutionCoordinator } from "../src/process-execution.ts";
 import { currentExecutionScope } from "../src/execution-world.ts";
 import { LinuxProcessReuseBackend } from "../src/linux-process-backend.ts";
+import { WorkspaceSandboxService } from "../src/workspace-sandbox.ts";
 import type { ProcessExecutionBinding, ProcessHandoffRegistry } from "../src/process-handoff.ts";
 import * as operationPreparation from "../src/execution-preparation.ts";
 import type { PredictionSettlement } from "../src/settlement.ts";
@@ -27,7 +29,57 @@ const adoptions = (settlement: PredictionSettlement) => settlement.observation =
 const directories = temporaryDirectories("pi-extension-system-");
 afterEach(async () => { vi.unstubAllEnvs(); vi.restoreAllMocks(); await directories.dispose(); });
 
-test.each(["off", "on", ...(process.platform === "linux" ? ["", "-nested", "-stale", "-running", "-retired", "-unkeyed", "-inputs", "-inputs-stale", "-sync-producer", "-sync-consumer", "-sync-both", "-sync-stale", "-sync-lost", "-sync-inputs", "-sync-inputs-stale", "-sync-inputs-preempted", "-sync-inputs-preempted-stale", "-cold", "-cold-stale", "-sync-cold", "-sync-cold-stale"].map(mode => `native${mode}`) : [])])("runs the shipped extension through a real Pi session (%s)", async mode => {
+test.each(["async", "sync", "async-no-reuse", "sync-no-reuse"])("keeps unsupported callbacks and bash on the original Actor executor (%s)", async mode => {
+	const cwd = await directories.create(), agentDir = path.join(cwd, "agent"), calls: string[] = [];
+	await mkdir(agentDir); vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+	await writeFile(path.join(agentDir, "speculative-action.json"), JSON.stringify({ enabled: true, reuseEnabled: !mode.endsWith("no-reuse"),
+		drafterEnabled: false, prepareObservedOperations: true, patternAware: { enabled: false }, executionRouting: { primary: true, nativeFallback: true } }));
+	await writeFile(path.join(cwd, "notes.txt"), "original\n");
+	await writeFile(path.join(cwd, "counter.cjs"), 'const fs=require("node:fs");fs.appendFileSync("runs","1");process.stdout.write(fs.readFileSync("notes.txt"));if(process.argv.includes("--fail"))process.exitCode=7;');
+	const nativeEntries = ["completedReplayExecutor", "observeNative", "observeBindings", "refreshNativeObservation"] as const;
+	const forbidden = nativeEntries.map(entry => vi.spyOn(LinuxProcessReuseBackend.prototype, entry).mockImplementation(() => { throw new Error(`unsupported entry: ${entry}`); }));
+	const actor = fauxProvider({ provider: "closure-actor", models: [{ id: "actor" }], tokensPerSecond: 4_000 });
+	const events: SpeculativeActionEvent<string>[] = [];
+	const settingsManager = SettingsManager.inMemory({}, { projectTrusted: true });
+	const resourceLoader = new DefaultResourceLoader({ cwd, agentDir, settingsManager, noExtensions: true, extensionFactories: [pi => {
+		pi.registerTool({ name: "compute", label: "compute", description: "Runs the current native implementation", parameters: {
+			type: "object", properties: { fail: { type: "boolean" } }, required: ["fail"] }, execute: async (id, args, signal) => {
+			calls.push(id); const argv = ["counter.cjs", ...(args.fail ? ["--fail"] : [])];
+			const output = mode.startsWith("sync") ? execFileSync(process.execPath, argv, { cwd, encoding: "utf8" }) : await new Promise<string>((resolve, reject) => {
+				const child = spawn(process.execPath, argv, { cwd, signal }); let text = "";
+				child.stdout.on("data", bytes => { text += bytes; }); child.on("error", reject);
+				child.on("close", code => code ? reject(new Error(`${text}exit:${code}`)) : resolve(text));
+			});
+			return { content: [fauxText(output)], details: { id } };
+		} });
+	}, createSpeculativeActionExtension({ createHost: (id, options) => createSpeculativeActionHost(id, {
+		...options, onEvent: event => { events.push(event); options.onEvent?.(event); },
+	}) })] });
+	await resourceLoader.reload();
+	const modelRuntime = await ModelRuntime.create({ authPath: path.join(agentDir, "auth.json"), modelsPath: null, refreshOnCreate: false });
+	modelRuntime.registerNativeProvider(actor.provider);
+	const { session } = await createAgentSession({ cwd, agentDir, model: actor.getModel(), modelRuntime, settingsManager, resourceLoader,
+		sessionManager: SessionManager.inMemory(cwd), tools: ["compute", "bash"] });
+	await using _session = onExit(async () => { await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" }); session.dispose(); });
+	await session.bindExtensions({ mode: "print", onError: error => { throw error; } });
+	actor.setResponses([response("compute", { fail: false }, { id: "seed" }), async () => {
+		await writeFile(path.join(cwd, "notes.txt"), "changed\n");
+		return response("bash", { command: `"${process.execPath.replaceAll("\\", "/")}" counter.cjs` });
+	}, response("compute", { fail: true }, { id: "failed" }), fauxAssistantMessage("done")]);
+	await session.prompt("Run the three operations in order, preserving their outputs and failures.");
+	const results = session.messages.filter(message => message.role === "toolResult");
+	expect(results).toHaveLength(3); expect(results.map(result => result.isError)).toEqual([false, false, true]);
+	expect(results[0]!.content).toEqual([fauxText("original\n")]); expect(results[1]!.content).toEqual([fauxText("changed\n")]);
+	expect(await readText(cwd, "runs")).toBe("111"); expect(calls).toEqual(["seed", "failed"]);
+	for (const entry of forbidden) expect(entry).not.toHaveBeenCalled();
+	expect(events.filter(event => event.type === "candidate" && event.state.status === "running")).toEqual([]);
+	for (const event of events.filter(event => event.type === "actor_action")) {
+		expect(event.settlement.provider.kind).toBe("actor"); expect(event.computation?.hiddenComputeMs).toBe(0);
+	}
+});
+
+test.each(["off", "on", ...(process.platform === "linux" ? ["", "-nested", "-stale", "-running", "-retired", "-unkeyed", "-inputs", "-inputs-stale", "-sync-producer", "-sync-consumer", "-sync-both", "-sync-stale", "-sync-lost", "-sync-inputs", "-sync-inputs-stale", "-sync-inputs-preempted", "-sync-inputs-preempted-stale", "-cold", "-cold-stale", "-sync-cold", "-sync-cold-stale"].map(mode => `backend:native${mode}`) : [])])("runs Pi session contracts with the selected entry (%s)", async entry => {
+	const mode = entry.replace(/^backend:/, "");
 	const enabled = mode !== "off", native = mode.startsWith("native"), running = mode === "native-running" || mode === "native-retired";
 	const stale = mode.endsWith("stale"), inputs = mode.includes("inputs"), cold = mode.includes("cold"), preempted = mode.includes("preempted"), synchronous = (callID: string) => mode.startsWith("native-sync") &&
 		(!mode.endsWith("producer") && !mode.endsWith("consumer") || callID === (mode.endsWith("producer") ? "seed" : "check"));
@@ -82,7 +134,19 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["", "-nested", "-sta
 		} };
 	});
 
-	const extension = createSpeculativeActionExtension({ createHost: (id, options) => createSpeculativeActionHost(id, {
+	// Explicit backend qualification remains below the public Host's admission boundary.
+	const storeRoot = native ? await directories.create(os.homedir()) : path.join(agentDir, "backend-qualification");
+	const qualificationBackend = native ? new LinuxProcessReuseBackend({ storeRoot, store: { reservedRoot: true } }) : undefined;
+	const qualificationWorkspace = native ? new WorkspaceSandboxService() : undefined;
+	await using _backend = onExit(async () => { await qualificationBackend?.dispose(); await qualificationWorkspace?.dispose(); });
+	await qualificationBackend?.refreshNativeObservation(true);
+	if (native) expect(qualificationBackend!.nativeDiagnostics().state).toBe("ready");
+	let qualificationHost: ReturnType<typeof createSpeculativeActionHost>;
+	const extension = createSpeculativeActionExtension({
+		createWorkspaceSandboxService: qualificationWorkspace ? () => qualificationWorkspace : undefined,
+		createExecutionWorlds: native ? () => [createLinuxProcessExecutionWorld({ storeRoot, backend: qualificationBackend, workspaceSandbox: qualificationWorkspace,
+			tools: [], coordinator: new ProcessExecutionCoordinator({ execute: async () => { throw new Error("unbound process outlet"); } }) })] : undefined,
+		createHost: (id, options) => qualificationHost = (native ? createAgentExecutionHost : createSpeculativeActionHost)(id, {
 		...options, resources: { initial: { cpuCount: 4, idleCpuCount: 4 }, sample: () => new Promise(() => {}) },
 		onEvent: event => { events.push(event); return options.onEvent?.(event); },
 	}) });
@@ -174,7 +238,7 @@ test.each(["off", "on", ...(process.platform === "linux" ? ["", "-nested", "-sta
 			expect(results.at(-1)).toMatchObject({ isError: true }); expect(JSON.stringify(results.at(-1))).toContain("native handoff failed");
 			expect(await readText(cwd, "marker")).toBe("once"); expect(calls).toEqual(["seed", "check"]); return;
 		}
-		expect(results.at(-1)?.content, JSON.stringify(session.messages)).toEqual([fauxText("hook:own:format_rows:remaining:" + execFileSync("./slow", ["notes.txt"], { cwd, encoding: "utf8" }))]);
+		expect(results.at(-1)?.content, JSON.stringify({ messages: session.messages, events, worlds: await qualificationHost!.executionWorldDiagnostics() })).toEqual([fauxText("hook:own:format_rows:remaining:" + execFileSync("./slow", ["notes.txt"], { cwd, encoding: "utf8" }))]);
 		expect(results.every(result => !result.isError)).toBe(true); expect(await readText(cwd, "marker")).toBe("once");
 		expect(calls).toEqual(["seed", "check"]); expect(prepared).toEqual([initial, remaining]);
 		if (inputs) expect(summarizeSpeculativeTrace(events).inputReuseHits).toBe(1);

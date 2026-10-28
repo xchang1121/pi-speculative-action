@@ -349,17 +349,22 @@ export type ExecutionWorld<Context, Output, ObservationContext = Context> = Exec
 		  }
 	);
 
+type ExecutionWorldAdmission<Context, Output, ObservationContext> = (world: ExecutionWorld<Context, Output, ObservationContext>,
+	operation: "speculation" | "observation" | "observeOperations") => string | undefined;
+
 /** The only authority allowed to resolve, prepare, fork, and dispose speculative tool execution. */
 export class ExecutionWorldRouter<Context, Output, ObservationContext = Context> {
 	protected readonly lifecycle: RuntimeLifecycleLane;
 	private readonly speculationEnabled: (backend: string) => boolean;
+	private readonly admission?: ExecutionWorldAdmission<Context, Output, ObservationContext>;
 	private readonly worldsByID = new Map<string, ExecutionWorld<Context, Output, ObservationContext>>();
 	private readonly routeObservations = new Map<string, ExecutionWorldDiagnosticReport & { readonly cwd: string }>();
 
 	constructor(worlds: readonly ExecutionWorld<Context, Output, ObservationContext>[], speculationEnabled: (backend: string) => boolean = () => true,
-		lifecycle = new RuntimeLifecycleLane()) {
+		lifecycle = new RuntimeLifecycleLane(), admission?: ExecutionWorldAdmission<Context, Output, ObservationContext>) {
 		this.lifecycle = lifecycle;
 		this.speculationEnabled = speculationEnabled;
+		this.admission = admission;
 		for (const world of new Set(worlds)) {
 			if (!world.id.trim()) throw new Error("execution world id must not be empty");
 			if (!world.speculation && !world.observation && !world.observeOperations) throw new Error(`execution world ${world.id} provides no operation`);
@@ -380,6 +385,8 @@ export class ExecutionWorldRouter<Context, Output, ObservationContext = Context>
 		const world = this.worldsByID.get(route.backend);
 		if (!world || world.scope !== route.scope || world.isolation !== route.isolation)
 			throw new Error(`Execution world ${route.backend} is unavailable for ${route.isolation}`);
+		const rejected = this.admission?.(world, "speculation");
+		if (rejected) throw new Error(rejected);
 		if (!this.speculationEnabled(world.id)) throw new Error(`Execution world ${world.id} is disabled by routing policy`);
 		if (!world.speculation) throw new Error(`Execution world ${world.id} does not provide speculative execution`);
 		return this.lifecycle.admit(() => world.speculation!.execute(context));
@@ -389,7 +396,7 @@ export class ExecutionWorldRouter<Context, Output, ObservationContext = Context>
 		observe: (bindings: readonly ExecutionOperationBinding[], computations?: readonly TimelineDependency[]) => void, learn = false,
 		inputs?: (path?: string) => Iterable<object>, context?: { readonly cwd: string; readonly signal?: AbortSignal; readonly reuseEnabled?: boolean }): Promise<Value> {
 		for (const world of this.worldsByID.values()) {
-			if (!world.observeOperations) continue;
+			if (!world.observeOperations || this.admission?.(world, "observeOperations")) continue;
 			const next = execute;
 			execute = () => world.observeOperations!({ action, scope, learn, inputs, enabled: true, ...context }, next, observe);
 		}
@@ -429,6 +436,9 @@ export class ExecutionWorldRouter<Context, Output, ObservationContext = Context>
 	async diagnostics(input: ExecutionWorldDiagnosticsContext): Promise<readonly ExecutionWorldDiagnosticSnapshot[]> {
 		return this.lifecycle.admit(() => Promise.all(
 			[...this.worldsByID.values()].map(async (world) => {
+				const rejected = this.admission?.(world, "speculation");
+				if (rejected) return Object.freeze({ id: world.id, scope: world.scope, isolation: world.isolation,
+					capabilities: Object.freeze([]), state: "unavailable" as const, detail: rejected });
 				const speculation = world.speculation
 					? this.speculationEnabled(world.id)
 						? await this.diagnose(world.id, "speculation", world.speculation, input)
@@ -439,7 +449,7 @@ export class ExecutionWorldRouter<Context, Output, ObservationContext = Context>
 								detail: "Pre-execution disabled by routing policy",
 							}
 					: { capabilities: Object.freeze([]), state: "unavailable" as const, detail: "Speculative execution is not provided" };
-				const observation = world.observation ? await this.diagnose(world.id, "observation", world.observation, input) : undefined;
+				const observation = world.observation && !this.admission?.(world, "observation") ? await this.diagnose(world.id, "observation", world.observation, input) : undefined;
 				return Object.freeze({ id: world.id, scope: world.scope, isolation: world.isolation, ...speculation, ...(observation ? { observation } : {}) });
 			}),
 		));
@@ -456,7 +466,7 @@ export class ExecutionWorldRouter<Context, Output, ObservationContext = Context>
 	): Promise<Selected | undefined> {
 		for (const scope of ["runtime", "fallback"] as const) {
 			for (const world of this.worldsByID.values()) {
-				if (world.scope !== scope || request.backend !== undefined && request.backend !== world.id ||
+				if (this.admission?.(world, kind) || world.scope !== scope || request.backend !== undefined && request.backend !== world.id ||
 					(kind === "speculation" && !this.speculationEnabled(world.id))) continue;
 				const operation = world[kind];
 				if (!operation) continue;

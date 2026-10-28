@@ -15,7 +15,7 @@ import { createLinuxProcessExecutionWorld } from "../src/linux-process-world.ts"
 import { PI_OPERATION_TOOLS, resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { adaptProcessToolOperations, definedProcessEnvironment, ProcessExecutionCoordinator, type ProcessExecutionRequest, type ProcessExecutor } from "../src/process-execution.ts";
 import { WorkspaceSandboxService, type WorkspaceSandboxDriver } from "../src/workspace-sandbox.ts";
-import { createSpeculativeActionHost, type CreateSpeculativeActionHostOptions, type SpeculativeAgentSettingsInput } from "../src/agent-integration.ts";
+import { createAgentExecutionHost, type CreateSpeculativeActionHostOptions, type SpeculativeAgentSettingsInput } from "../src/agent-integration.ts";
 import { PatternAwareStore, patternAwareSettings, patternAwareActionSemantics } from "../src/pattern-aware.ts";
 import type { SpeculativeActionEvent } from "../src/events.ts";
 import { testModel } from "./model.ts";
@@ -29,7 +29,7 @@ export function patternProcessHost(fixture: LinuxProcessBenchmark, sessionID: st
 	options: Partial<CreateSpeculativeActionHostOptions> = {}, tools = [fixture.tool]) {
 	const events: SpeculativeActionEvent<string>[] = [], patternStore = new PatternAwareStore(patternAwareSettings(settings.patternAware), undefined,
 		patternAwareActionSemantics(PI_ACTION_SEMANTICS, fixture.workspace));
-	const host = createSpeculativeActionHost(sessionID, { cwd: fixture.workspace, patternStore,
+	const host = createAgentExecutionHost(sessionID, { cwd: fixture.workspace, patternStore,
 		complete: async () => { throw new Error("unexpected inference"); }, preflight: () => true, executionWorlds: [fixture.world],
 		getSettings: () => ({ enabled: true, drafterEnabled: false, ...settings }),
 		resolveInvocation: (tool, input) => resolvePiToolInvocation(tool, input, { cwd: fixture.workspace, environment: fixture.environment, shellPath: fixture.shellPath }),

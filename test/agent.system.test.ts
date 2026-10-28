@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
 import path from "node:path";
 import { fauxAssistantMessage, fauxToolCall, Type, fauxText, fauxThinking, type Context } from "@earendil-works/pi-ai";
-import { createEditTool, createFindTool, createGrepTool, createLsTool, createReadTool, createWriteTool } from "@earendil-works/pi-coding-agent";
+import { createBashTool, createEditTool, createFindTool, createGrepTool, createLsTool, createReadTool, createWriteTool } from "@earendil-works/pi-coding-agent";
 import { afterEach, expect, test, vi } from "vitest";
 import { WorkspaceSandboxService } from "../src/workspace-sandbox.ts";
 import { bindResourceOperation, filesystemExecutionDependsOn } from "../src/agent-execution-world.ts";
@@ -1234,7 +1234,7 @@ test.each(["ordered", "independent", "dependent"])("adopts only the proven effec
 	if (order === "independent") await expect(readFile(path.join(cwd, "unused.txt"))).rejects.toMatchObject({ code: "ENOENT" });
 });
 
-test.for(["unrelated", "changed", "descendant", "mutation", "mutation-stat", "mutation-split", "mutation-stale"])("retains native workflow results across prompts and validates Actor changes (%s)", async (change, { skip }) => {
+test.for(["unrelated", "changed", "descendant", "mutation", "mutation-stat", "mutation-split", "mutation-stale"])("returns native workflows to Actor while retaining qualified file transactions (%s)", async (change, { skip }) => {
 	if (process.platform !== "linux" || process.arch !== "x64") return skip("native process backend requires x86-64 Linux");
 	const mutation = change.startsWith("mutation"), metadata = change.endsWith("stat"), split = /split|stale/.test(change), stale = change.endsWith("stale");
 	const native = await createLinuxProcessBenchmark("pi-sealed-result-", mutation ? "overlayfs" : "git"), { workspace: cwd, workspaceSandbox: sandbox } = native;
@@ -1245,7 +1245,11 @@ test.for(["unrelated", "changed", "descendant", "mutation", "mutation-stat", "mu
 	const body = mutation ? `${split ? "stat --printf='%i:%z\\n' a.txt; " : ""}./reader` : "cat a.txt", command = body + (mutation ? "; printf once >> marker" : "");
 	const steps = mutation ? [{ tool: "write", input: { path: "a.txt", content: "prepared\n" } }, { tool: "bash", input: { command } }]
 		: [{ tool: "bash", input: { command: "cat a.txt" } }, { tool: "bash", input: { command: "cat c.txt" } }];
-	const f = systemHost(cwd, [native.tool, createWriteTool(cwd)], {
+	const actor = createBashTool(cwd, { shellPath: native.shellPath, exposeSessionEnvironment: false,
+		spawnHook: context => ({ ...context, env: { ...native.environment } }) });
+	using observed = vi.spyOn(native.backend, "observeNative");
+	using fingerprinted = vi.spyOn(native.backend, "fingerprint");
+	const f = systemHost(cwd, [actor, createWriteTool(cwd)], {
 		executionWorlds: [{ ...native.world, speculation: { ...native.world.speculation, execute: async context => {
 			const branch = await native.world.speculation.execute(context); if (!branch.inputsOnly) prepared.push(textOutput(branch.output.result)); return branch;
 		} } }, sandbox.createExecutionWorld()],
@@ -1262,9 +1266,10 @@ test.for(["unrelated", "changed", "descendant", "mutation", "mutation-stat", "mu
 			patternAware: { enabled: false } }),
 	});
 	await using _cleanup = onExit(async () => { await f.dispose(); await native.dispose(); });
-	const status = await native.backend.check(true); if (status.state !== "ready") return skip(status.detail);
 	await f.start(); if (!predict) await f.preview("bash", { command: "cat a.txt" });
-	await f.ready(predict ? 2 : 1); predict = false;
+	if (mutation) { await f.ready(); await expect.poll(() => drafted).toBe(2); }
+	else if (predict) await expect.poll(() => drafted).toBeGreaterThanOrEqual(1);
+	predict = false;
 	expect(await readText(cwd, "a.txt")).toBe("original\n");
 	await expect(readFile(path.join(cwd, "marker"))).rejects.toMatchObject({ code: "ENOENT" });
 	if (!mutation) { await f.finish(true); await f.start("next-prompt"); }
@@ -1275,13 +1280,15 @@ test.for(["unrelated", "changed", "descendant", "mutation", "mutation-stat", "mu
 	expect(textOutput(await f.execute("bash", { command }))).toBe(expected);
 	if (change === "descendant") { await f.finish(); await f.start("next"); expect(textOutput(await f.execute("bash", { command: "cat c.txt" }))).toBe("second\n"); }
 	await f.finish(true);
-	const actors = f.actors, timing = actors.at(-1)!.computation!, fallback = mutation || change === "changed";
-	expectHiddenCompute(timing, !metadata && !stale && change !== "changed");
-	expect(f.fallbacks, JSON.stringify(actors)).toEqual([...(mutation ? [] : ["write"]), ...(fallback ? ["bash"] : [])]);
-	expect(f.events.filter(event => event.type === "candidate" && event.state.status === "running")).toHaveLength(change === "descendant" || mutation ? 2 : 1);
+	const actors = f.actors, timing = actors.at(-1)!.computation!;
+	expectHiddenCompute(timing, false);
+	expect(f.fallbacks, JSON.stringify(actors)).toEqual([...(mutation ? [] : ["write"]), "bash", ...(change === "descendant" ? ["bash"] : [])]);
+	expect(f.events.filter(event => event.type === "candidate" && event.state.status === "running")).toHaveLength(Number(mutation));
+	expect(prepared).toEqual([]); expect(observed).not.toHaveBeenCalled(); expect(fingerprinted).not.toHaveBeenCalled();
+	expect(native.backend.actorMetrics()).toMatchObject({ hits: 0, wholeCommandRequests: 0 });
 	if (mutation) {
-		expect(requests).toBeGreaterThanOrEqual(2); expect(requests).toBeLessThanOrEqual(3); expect(actors.map(event => event.settlement.provider.kind)).toEqual(["speculative", fallback ? "actor" : "speculative"]);
-		expect(prepared[0] === expected).toBe(!metadata && !split); expect(native.backend.actorMetrics().hits).toBe(Number(!metadata && !stale)); expect(await readText(cwd, "marker")).toBe("once");
+		expect(requests).toBeGreaterThanOrEqual(2); expect(requests).toBeLessThanOrEqual(3); expect(actors.map(event => event.settlement.provider.kind)).toEqual(["speculative", "actor"]);
+		expect(await readText(cwd, "marker")).toBe("once");
 	}
 });
 
