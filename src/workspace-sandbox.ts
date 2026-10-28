@@ -7,7 +7,7 @@ import { execHostFile } from "./executable-path.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants, type BigIntStats } from "node:fs";
 import {
-	access, chmod, type FileHandle, link, lstat, lutimes, mkdir, mkdtemp, open, rename, rm, rmdir, unlink, utimes, writeFile,
+	access, chmod, type FileHandle, link, lstat, lutimes, mkdir, mkdtemp, open, readFile, rename, rm, rmdir, unlink, utimes, writeFile,
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -97,6 +97,8 @@ export interface SandboxWorkspaceContext {
 	readonly processRoot: string;
 	/** Native metadata for pinned snapshot objects; shared by every process in this private workspace. */
 	readonly metadataImage?: string;
+	/** Mount policy used to project source access times; adoption must revalidate it. */
+	readonly metadataMounts?: string;
 	readonly metadataObjects?: ReadonlyMap<string, string>;
 	readonly projectMetadata?: (stat: FilesystemObservationEvidence) => FilesystemObservationEvidence;
 	/** Root entry names owned by the isolation substrate and invisible to effect observation. */
@@ -138,7 +140,7 @@ export function nativeWorkspaceOwner(workspace: SandboxWorkspaceContext): Promis
 }
 export function nativeWorkspaceObservation(workspace: SandboxWorkspaceContext) { return workspaceOwners.get(workspace.sandboxRoot)?.observation; }
 const workspaceCapability = (workspace: SandboxWorkspaceContext) => [workspace.sourceRoot, workspace.sandboxRoot, workspace.processRoot,
-	workspace.metadataImage, workspace.metadataObjects, workspace.projectMetadata, workspace.observationExcludes, workspace.structure, workspace.structure.capture,
+	workspace.metadataImage, workspace.metadataMounts, workspace.metadataObjects, workspace.projectMetadata, workspace.observationExcludes, workspace.structure, workspace.structure.capture,
 	workspace.transactions, workspace.transactions.begin, workspace.transactions.dispose, workspace.captureChanges, workspace.sourceChanges];
 
 interface WorkspaceObservation extends SandboxWorkspaceContext, SandboxWorkspaceObservation {
@@ -152,13 +154,16 @@ function createWorkspaceObservation(data: SandboxWorkspaceObservation, sourceCha
 	const transactions = deferredWorkspaceTransactionDriver(() => createGitWorkspaceTransactionDriver(workspace));
 	workspace = {
 		...data, contents, structure, transactions, sourceChanges, observationExcludes: SNAPSHOT_EXCLUDES,
-		metadataImage: data.metadata?.image, metadataObjects: data.metadata?.image ? data.metadata.objects : undefined,
+		metadataImage: data.metadata?.image, metadataMounts: data.metadata?.mounts, metadataObjects: data.metadata?.image ? data.metadata.objects : undefined,
 		projectMetadata: (stat: FilesystemObservationEvidence): FilesystemObservationEvidence => {
 			const row = data.metadata?.mappings.get(`${stat.dev}:${stat.ino}`);
 			if (!row) return { ...stat, dev: data.sourceDevice };
-			const [physical, source] = row, links = source.nlink + stat.nlink - physical.nlink, unchanged = stat.size === physical.size && stat.mtimeNs === physical.mtimeNs && stat.ctimeNs === physical.ctimeNs;
+			const [physical, source, atimePolicy] = row, links = source.nlink + stat.nlink - physical.nlink, unchanged = stat.size === physical.size && stat.mtimeNs === physical.mtimeNs && stat.ctimeNs === physical.ctimeNs;
+			// Copying gives an object a new ctime, which can spuriously trigger relatime on its first read.
+			const copiedAccess = unchanged && stat.atimeNs > physical.atimeNs && (atimePolicy === 1 || atimePolicy === 2 &&
+				source.atimeNs > source.mtimeNs && source.atimeNs > source.ctimeNs && stat.atimeNs / 1_000_000_000n - source.atimeNs / 1_000_000_000n < 86400n);
 			return { ...Object.fromEntries(FILESYSTEM_OBSERVATION_FIELDS.map(field => [field,
-				stat[field] === physical[field] && (field !== "blocks" || unchanged) ? source[field] : stat[field]])),
+				stat[field] === physical[field] && (field !== "blocks" || unchanged) || field === "atimeNs" && copiedAccess ? source[field] : stat[field]])),
 				dev: data.sourceDevice, ino: source.ino, nlink: links < 0n ? 0n : links } as FilesystemObservationEvidence;
 		},
 		captureChanges: (frontier: readonly string[]) => collectSandboxChanges(workspace, frontier),
@@ -1136,13 +1141,22 @@ async function captureSnapshotMetadata(sourceRoot: string, copiedRoot = sourceRo
 async function preserveSnapshotMetadata(sourceRoot: string, sandboxRoot: string, processRoot: string, native: boolean,
 	captured?: ReadonlyMap<string, BigIntStats>, pin?: (target: string) => Promise<BigIntStats>) {
 	const original = captured ?? await captureSnapshotMetadata(sourceRoot), names = [...original.keys()].sort((a, b) => a.length - b.length);
+	const mounts = native ? await readFile("/proc/self/mountinfo", "utf8") : undefined;
+	const policies = mounts ? mounts.trim().split("\n").map(line => {
+		const fields = line.split(" ");
+		return { root: fields[4]!.replace(/\\([0-7]{3})/g, (_, octal: string) => String.fromCharCode(Number.parseInt(octal, 8))), flags: fields[5]!.split(",") };
+	}).sort((a, b) => b.root.length - a.root.length) : [];
+	const atimePolicy = (target: string, directory: boolean) => {
+		const flags = policies.find(mount => containsFilesystemPath(mount.root, target))?.flags ?? [];
+		return flags.includes("noatime") || flags.includes("ro") || directory && flags.includes("nodiratime") ? 1 : flags.includes("relatime") ? 2 : 0;
+	};
 	// Check each parent before populating its children: a stale checkout may contain a symlink in its place.
 	for (const resource of names) if (original.get(resource)!.isDirectory()) {
 		const target = path.join(sandboxRoot, resource), current = await lstat(target).catch(error => { if (isMissing(error)) return undefined; throw error; });
 		if (!current) await mkdir(target);
 		else if (!current.isDirectory()) throw new Error(`snapshot directory type changed: ${resource}`);
 	}
-	const translated: [string, BigIntStats][] = [], rows: [BigIntStats, BigIntStats][] = [], objects = new Map<string, string>();
+	const translated: [string, BigIntStats][] = [], rows: [BigIntStats, BigIntStats, number][] = [], objects = new Map<string, string>();
 	// Set parent modes last so a read-only directory cannot prevent its own snapshot from being populated.
 	for (const resource of names.reverse()) {
 		const source = original.get(resource)!, target = path.join(sandboxRoot, resource);
@@ -1160,15 +1174,16 @@ async function preserveSnapshotMetadata(sourceRoot: string, sandboxRoot: string,
 	for (const [target, source] of translated) {
 		if (!native && (!pin || !source.isFile())) continue;
 		const physical = await pin!(target);
-		if (native) rows.push([physical, source]);
+		if (native) rows.push([physical, source, atimePolicy(path.join(sourceRoot, path.relative(sandboxRoot, target)), source.isDirectory())]);
 	}
 	const image = native ? path.join(processRoot, "metadata.json") : undefined;
 	if (image) {
-		rows.push([await pin!(path.dirname(sandboxRoot)), await withFilesystemReadView(undefined, view => view.stat(path.dirname(sourceRoot)))]);
-		await writeFile(image, JSON.stringify(rows.map(row => row.map(stat => SNAPSHOT_METADATA_FIELDS.map(field => String(stat[field]))))), { flag: "wx", mode: 0o600 });
+		rows.push([await pin!(path.dirname(sandboxRoot)), await withFilesystemReadView(undefined, view => view.stat(path.dirname(sourceRoot))), atimePolicy(path.dirname(sourceRoot), true)]);
+		await writeFile(image, JSON.stringify(rows.map(([physical, source, policy]) => [
+			...[physical, source].map(stat => SNAPSHOT_METADATA_FIELDS.map(field => String(stat[field]))), policy])), { flag: "wx", mode: 0o600 });
 	}
 	const mappings = new Map(rows.map(row => [`${row[0].dev}:${row[0].ino}`, row]));
-	return { image, objects, mappings, modes: new Map([...original].map(([name, stat]) => [slash(name), process.platform === "win32" ? 0 : Number(stat.mode & 0o777n)])) };
+	return { image, mounts, objects, mappings, modes: new Map([...original].map(([name, stat]) => [slash(name), process.platform === "win32" ? 0 : Number(stat.mode & 0o777n)])) };
 }
 
 async function createGitWorkspaceTransactionDriver(workspace: ReturnType<typeof createWorkspaceObservation>): Promise<WorkspaceTransactionDriver> {

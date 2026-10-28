@@ -73,7 +73,7 @@ index 96309ec..f30b2a3 100644
          if policy.workdir.is_none() {
              return Err(anyhow!("--dry-run requires --workdir"));
 diff --git a/crates/sandlock-core/src/chroot/dispatch.rs b/crates/sandlock-core/src/chroot/dispatch.rs
-index 6e4ab93..3e50a6c 100644
+index 6e4ab93..601ee0a 100644
 --- a/crates/sandlock-core/src/chroot/dispatch.rs
 +++ b/crates/sandlock-core/src/chroot/dispatch.rs
 @@ -47,9 +47,10 @@
@@ -1118,7 +1118,7 @@ index 6e4ab93..3e50a6c 100644
      )
      .is_err()
      {
-@@ -1111,348 +1445,408 @@ pub(crate) async fn handle_chroot_write(
+@@ -1111,348 +1445,419 @@ pub(crate) async fn handle_chroot_write(
      notif_fd: RawFd,
      ctx: &ChrootCtx<'_>,
  ) -> NotifAction {
@@ -1305,6 +1305,7 @@ index 6e4ab93..3e50a6c 100644
 +    path: String,
 +    physical: [String; 14],
 +    original: [String; 14],
++    atime_policy: u8,
 +}
 +
 +fn input_key(path: &str) -> String {
@@ -1397,6 +1398,20 @@ index 6e4ab93..3e50a6c 100644
 -        let old_path = match read_path(notif, notif.data.args[1], notif_fd) {
 -            Some(p) => p,
 -            None => return NotifAction::Continue,
+-        };
+-        let new_path = match read_path(notif, notif.data.args[3], notif_fd) {
+-            Some(p) => p,
+-            None => return NotifAction::Continue,
+-        };
+-        // rename(2) moves the names themselves: a symlink on either side is
+-        // renamed, not chased.
+-        let (old_host, old_vp) = match resolve_chroot_path_nofollow(notif, notif.data.args[0] as i64, &old_path, ctx) {
+-            Some(r) => r,
+-            None => return NotifAction::Errno(libc::EACCES),
+-        };
+-        let (new_host, new_vp) = match resolve_chroot_path_nofollow(notif, notif.data.args[2] as i64, &new_path, ctx) {
+-            Some(r) => r,
+-            None => return NotifAction::Errno(libc::EACCES),
 +fn capture_input_image(cow: &mut crate::cow::seccomp::SeccompCowBranch, path: &Path, requested: &str,
 +    metadata: &MetadataImage) -> std::io::Result<()> {
 +    use std::fs::{self, OpenOptions};
@@ -1417,6 +1432,10 @@ index 6e4ab93..3e50a6c 100644
 +            if cow.resolve_read(original_path.trim_start_matches('/')) != path { return Err(invalid()); }
 +            let source = OpenOptions::new().read(true).custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(path)?;
 +            let original = descriptor_fields(source.as_raw_fd())?;
++            let mut mount: libc::statvfs = unsafe { std::mem::zeroed() };
++            if unsafe { libc::fstatvfs(source.as_raw_fd(), &mut mount) } != 0 { return Err(invalid()); }
++            let atime_policy = if mount.f_flag & (libc::ST_NOATIME | libc::ST_RDONLY) != 0 { 1 }
++                else if mount.f_flag & libc::ST_RELATIME != 0 { 2 } else { 0 };
 +            if original[2] as u32 & libc::S_IFMT != libc::S_IFREG || original[3] != 1 || original[7] < 0 || original[7] > 32 * 1024 * 1024 { return Err(invalid()); }
 +            let mut kind: libc::statfs = unsafe { std::mem::zeroed() };
 +            if unsafe { libc::fstatfs(source.as_raw_fd(), &mut kind) } != 0 ||
@@ -1450,24 +1469,10 @@ index 6e4ab93..3e50a6c 100644
 +            index_input_image(&images, original_path, requested, &key, false)?;
 +            if !cow.install_input(original_path, &working)? { return Err(invalid()); }
 +            let image = InputImage { path: original_path.to_string(), physical: descriptor_fields(writable.as_raw_fd())?.map(|value| value.to_string()),
-+                original: original.map(|value| value.to_string()) };
++                original: original.map(|value| value.to_string()), atime_policy };
 +            fs::write(&proof, serde_json::to_vec(&image)?)?;
 +            image
          };
--        let new_path = match read_path(notif, notif.data.args[3], notif_fd) {
--            Some(p) => p,
--            None => return NotifAction::Continue,
--        };
--        // rename(2) moves the names themselves: a symlink on either side is
--        // renamed, not chased.
--        let (old_host, old_vp) = match resolve_chroot_path_nofollow(notif, notif.data.args[0] as i64, &old_path, ctx) {
--            Some(r) => r,
--            None => return NotifAction::Errno(libc::EACCES),
--        };
--        let (new_host, new_vp) = match resolve_chroot_path_nofollow(notif, notif.data.args[2] as i64, &new_path, ctx) {
--            Some(r) => r,
--            None => return NotifAction::Errno(libc::EACCES),
--        };
 -        if !ctx.can_write(&old_vp) || !ctx.can_write(&new_vp) {
 -            return NotifAction::Errno(libc::EACCES);
 -        }
@@ -1489,7 +1494,7 @@ index 6e4ab93..3e50a6c 100644
 +        let current = OpenOptions::new().read(true).custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
 +            .open(cow.resolve_read(original_path.trim_start_matches('/')))?;
 +        if descriptor_fields(current.as_raw_fd())?[..2] != physical[..2] { return Err(invalid()); }
-+        metadata.objects.write().unwrap().insert((physical[0] as u64, physical[1] as u64), (physical, original));
++        metadata.objects.write().unwrap().insert((physical[0] as u64, physical[1] as u64), (physical, original, image.atime_policy));
 +        index_input_image(&images, original_path, requested, &key, true)?;
 +        Ok(())
 +    })();
@@ -1521,17 +1526,17 @@ index 6e4ab93..3e50a6c 100644
 +/// recycled under a retained identity, including after rename, unlink, or replacement.
 +#[derive(Debug, Default)]
 +pub struct MetadataImage {
-+    objects: std::sync::RwLock<std::collections::HashMap<(u64, u64), ([i128; 14], [i128; 14])>>,
++    objects: std::sync::RwLock<std::collections::HashMap<(u64, u64), ([i128; 14], [i128; 14], u8)>>,
 +}
 +
 +impl MetadataImage {
 +    pub fn decode(bytes: &[u8]) -> std::io::Result<Self> {
-+        let rows: Vec<([String; 14], [String; 14])> = serde_json::from_slice(bytes)?;
++        let rows: Vec<([String; 14], [String; 14], u8)> = serde_json::from_slice(bytes)?;
 +        let parse = |row: [String; 14]| -> std::io::Result<[i128; 14]> {
 +            Ok(row.into_iter().map(|value| value.parse()).collect::<Result<Vec<i128>, _>>()
 +                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?.try_into().unwrap())
          };
-+        Self::from_rows(rows.into_iter().map(|(a, b)| Ok((parse(a)?, parse(b)?))).collect::<std::io::Result<Vec<_>>>()?)
++        Self::from_rows(rows.into_iter().map(|(a, b, policy)| Ok((parse(a)?, parse(b)?, policy))).collect::<std::io::Result<Vec<_>>>()?)
      }
 
 -    if nr == libc::SYS_symlinkat {
@@ -1561,15 +1566,16 @@ index 6e4ab93..3e50a6c 100644
 -                        _ => {}
 -                    }
 -                }
-+    fn from_rows(rows: Vec<([i128; 14], [i128; 14])>) -> std::io::Result<Self> {
++    fn from_rows(rows: Vec<([i128; 14], [i128; 14], u8)>) -> std::io::Result<Self> {
 +        let invalid = |message| std::io::Error::new(std::io::ErrorKind::InvalidData, message);
 +        if rows.len() > 100_002 { return Err(invalid("metadata object bound exceeded")); }
 +        let mut image = Self::default();
-+        for (physical, original) in rows {
++        for (physical, original, policy) in rows {
++            if policy > 2 { return Err(invalid("invalid access-time policy")); }
 +            if !physical[..10].iter().chain(&original[..10]).all(|value| *value >= 0 && *value <= u64::MAX as i128) {
 +                return Err(invalid("invalid metadata value"));
 +            }
-+            if image.objects.get_mut().unwrap().insert((physical[0] as u64, physical[1] as u64), (physical, original)).is_some() {
++            if image.objects.get_mut().unwrap().insert((physical[0] as u64, physical[1] as u64), (physical, original, policy)).is_some() {
 +                return Err(invalid("duplicate snapshot object"));
              }
          }
@@ -1749,7 +1755,7 @@ index 6e4ab93..3e50a6c 100644
 -            &host_path,
 -        );
 +    fn inode(&self, device: u64, inode: u64) -> u64 {
-+        self.objects.read().unwrap().get(&(device, inode)).map_or(inode, |(_, source)| source[1] as u64)
++        self.objects.read().unwrap().get(&(device, inode)).map_or(inode, |(_, source, _)| source[1] as u64)
      }
 
 -    if nr == libc::SYS_truncate {
@@ -1778,10 +1784,15 @@ index 6e4ab93..3e50a6c 100644
 -            }
 +    fn project(&self, values: &mut [i128; 14]) {
 +        let objects = self.objects.read().unwrap();
-+        let Some((before, source)) = objects.get(&(values[0] as u64, values[1] as u64)) else { return; };
++        let Some((before, source, policy)) = objects.get(&(values[0] as u64, values[1] as u64)) else { return; };
 +        let unchanged = [7, 11, 12].iter().all(|index| values[*index] == before[*index]);
++        // A copy's new ctime can trigger relatime even when the source would keep its atime.
++        // Explicit timestamps and writes change ctime and must retain their actual result.
++        let copied_access = unchanged && values[10] > before[10] && (*policy == 1 || *policy == 2
++            && source[10] > source[11] && source[10] > source[12]
++            && values[10].div_euclid(1_000_000_000) - source[10].div_euclid(1_000_000_000) < 86400);
 +        for index in [2, 4, 5, 6, 7, 8, 9, 10, 11, 12] {
-+            if values[index] == before[index] && (index != 9 || unchanged) { values[index] = source[index]; }
++            if values[index] == before[index] && (index != 9 || unchanged) || index == 10 && copied_access { values[index] = source[index]; }
 +        }
 +        values[0] = source[0]; values[1] = source[1]; values[13] = source[13];
 +        values[3] = (source[3] + values[3] - before[3]).max(0);
@@ -1836,7 +1847,7 @@ index 6e4ab93..3e50a6c 100644
 
      // Let libc lay the struct out. Hand-packing it in field order is an
      // x86_64 assumption: aarch64 and riscv64 put st_mode and st_nlink before
-@@ -1476,6 +1870,11 @@ fn stat_and_write(notif: &SeccompNotif, notif_fd: RawFd, path: &Path) -> NotifAc
+@@ -1476,6 +1881,11 @@ fn stat_and_write(notif: &SeccompNotif, notif_fd: RawFd, path: &Path) -> NotifAc
          return NotifAction::Errno(last_errno(libc::ENOENT));
      }
 
@@ -1848,7 +1859,7 @@ index 6e4ab93..3e50a6c 100644
      let bytes = unsafe {
          std::slice::from_raw_parts(
              &st as *const libc::stat as *const u8,
-@@ -1488,6 +1887,8 @@ fn stat_and_write(notif: &SeccompNotif, notif_fd: RawFd, path: &Path) -> NotifAc
+@@ -1488,6 +1898,8 @@ fn stat_and_write(notif: &SeccompNotif, notif_fd: RawFd, path: &Path) -> NotifAc
      NotifAction::ReturnValue(0)
  }
 
@@ -1857,7 +1868,7 @@ index 6e4ab93..3e50a6c 100644
  pub(crate) async fn handle_chroot_stat(
      notif: &SeccompNotif,
      _chroot_state: &Arc<Mutex<ChrootState>>,
-@@ -1496,98 +1897,101 @@ pub(crate) async fn handle_chroot_stat(
+@@ -1496,98 +1908,101 @@ pub(crate) async fn handle_chroot_stat(
      ctx: &ChrootCtx<'_>,
  ) -> NotifAction {
      let nr = notif.data.nr as i64;
@@ -1909,6 +1920,12 @@ index 6e4ab93..3e50a6c 100644
 -    let (_, host_path, vp) = match resolved {
 -        Ok(r) => r,
 -        Err(a) => return a,
+-    };
+-    if !ctx.can_read(&vp) { return NotifAction::Errno(libc::EACCES); }
+-
+-    let real_path = match cow_resolve(cow_state, &host_path).await {
+-        Ok(p) => p,
+-        Err(a) => return a,
 +        let path = match path { Some(path) if !extended || !path.is_empty() => path, _ => return NotifAction::Continue };
 +        let resolve = if flags & libc::AT_SYMLINK_NOFOLLOW != 0 { resolve_chroot_path_nofollow } else { resolve_chroot_path_existing };
 +        let (host_path, vp) = match resolve(notif, dirfd, &path, ctx) { Ok(paths) => paths, Err(errno) => return NotifAction::Errno(errno) };
@@ -1916,12 +1933,6 @@ index 6e4ab93..3e50a6c 100644
 +        let real_path = match cow_resolve(cow_state, &host_path).await { Ok(path) => path, Err(action) => return action };
 +        (real_path, mounted_device(ctx, &host_path, &vp, flags & libc::AT_SYMLINK_NOFOLLOW == 0))
      };
--    if !ctx.can_read(&vp) { return NotifAction::Errno(libc::EACCES); }
--
--    let real_path = match cow_resolve(cow_state, &host_path).await {
--        Ok(p) => p,
--        Err(a) => return a,
--    };
 -
 -    if nr == libc::SYS_faccessat || nr == crate::arch::SYS_FACCESSAT2 {
 -        return if real_path.exists() || real_path.is_symlink() {
@@ -2035,7 +2046,7 @@ index 6e4ab93..3e50a6c 100644
          return NotifAction::Continue;
      }
      NotifAction::ReturnValue(0)
-@@ -1687,7 +2091,7 @@ pub(crate) async fn handle_chroot_readlink(
+@@ -1687,7 +2102,7 @@ pub(crate) async fn handle_chroot_readlink(
      // (needed because memfd-backed binaries would show "/memfd:sandlock-exec" otherwise).
      if path == format!("{}/exe", own_proc) {
          let cs = chroot_state.lock().await;
@@ -2044,7 +2055,7 @@ index 6e4ab93..3e50a6c 100644
              let s = exe.to_string_lossy();
              return write_target(s.as_bytes());
          }
-@@ -1704,8 +2108,8 @@ pub(crate) async fn handle_chroot_readlink(
+@@ -1704,8 +2119,8 @@ pub(crate) async fn handle_chroot_readlink(
      // readlink must read the link itself, never what it points at, which is
      // exactly what the no-follow resolver gives.
      let (host_path, _) = match resolve_chroot_path_nofollow(notif, dirfd, &path, ctx) {
@@ -2055,7 +2066,7 @@ index 6e4ab93..3e50a6c 100644
      };
 
      // COW
-@@ -1716,7 +2120,12 @@ pub(crate) async fn handle_chroot_readlink(
+@@ -1716,7 +2131,12 @@ pub(crate) async fn handle_chroot_readlink(
              if cow.matches(&host_str) {
                  let target = match cow.handle_readlink(&host_str) {
                      Some(t) => t,
@@ -2069,7 +2080,7 @@ index 6e4ab93..3e50a6c 100644
                  };
                  drop(cs);
                  return write_target(target.as_bytes());
-@@ -1726,7 +2135,7 @@ pub(crate) async fn handle_chroot_readlink(
+@@ -1726,7 +2146,7 @@ pub(crate) async fn handle_chroot_readlink(
 
      let target = match std::fs::read_link(&host_path) {
          Ok(t) => t,
@@ -2078,7 +2089,7 @@ index 6e4ab93..3e50a6c 100644
      };
 
      // Strip chroot/mount prefix from absolute targets
-@@ -1742,96 +2151,8 @@ pub(crate) async fn handle_chroot_readlink(
+@@ -1742,96 +2162,8 @@ pub(crate) async fn handle_chroot_readlink(
  // xattr handler
  // ============================================================
 
@@ -2177,7 +2188,7 @@ index 6e4ab93..3e50a6c 100644
  pub(crate) async fn handle_chroot_xattr(
      notif: &SeccompNotif,
      _chroot_state: &Arc<Mutex<ChrootState>>,
-@@ -1839,100 +2160,60 @@ pub(crate) async fn handle_chroot_xattr(
+@@ -1839,100 +2171,60 @@ pub(crate) async fn handle_chroot_xattr(
      notif_fd: RawFd,
      ctx: &ChrootCtx<'_>,
  ) -> NotifAction {
@@ -2266,7 +2277,10 @@ index 6e4ab93..3e50a6c 100644
 -                Err(a) => return a,
 -            };
 -            xattr_read(notif, notif_fd, &c_path, Some(&name), follow, 2, 3)
--        }
++        if buffer_index != 0 {
++            args[buffer_index] = if !writing && buffer.is_empty() { 0 } else { buffer.as_mut_ptr() as u64 };
++            args[buffer_index + 1] = buffer.len() as u64;
+         }
 -        XattrOp::List => xattr_read(notif, notif_fd, &c_path, None, follow, 1, 2),
 -        XattrOp::Set => {
 -            let name = match read_name() {
@@ -2295,9 +2309,11 @@ index 6e4ab93..3e50a6c 100644
 -            } else {
 -                NotifAction::ReturnValue(0)
 -            }
-+        if buffer_index != 0 {
-+            args[buffer_index] = if !writing && buffer.is_empty() { 0 } else { buffer.as_mut_ptr() as u64 };
-+            args[buffer_index + 1] = buffer.len() as u64;
++        let ret = unsafe { libc::syscall(nr, args[0], args[1], args[2], args[3], args[4]) };
++        if ret < 0 { return Err(NotifAction::Errno(last_errno(if writing { libc::EIO } else { libc::ENODATA }))); }
++        if !writing && !buffer.is_empty() && ret > 0 {
++            write_child_mem(notif_fd, notif.id, notif.pid, notif.data.args[buffer_index], &buffer[..ret as usize])
++                .map_err(|_| NotifAction::Errno(libc::EFAULT))?;
          }
 -        XattrOp::Remove => {
 -            let name = match read_name() {
@@ -2311,12 +2327,7 @@ index 6e4ab93..3e50a6c 100644
 -            } else {
 -                NotifAction::ReturnValue(0)
 -            }
-+        let ret = unsafe { libc::syscall(nr, args[0], args[1], args[2], args[3], args[4]) };
-+        if ret < 0 { return Err(NotifAction::Errno(last_errno(if writing { libc::EIO } else { libc::ENODATA }))); }
-+        if !writing && !buffer.is_empty() && ret > 0 {
-+            write_child_mem(notif_fd, notif.id, notif.pid, notif.data.args[buffer_index], &buffer[..ret as usize])
-+                .map_err(|_| NotifAction::Errno(libc::EFAULT))?;
-         }
+-        }
 -    }
 +        Ok(ret)
 +    }.await;
@@ -2324,7 +2335,7 @@ index 6e4ab93..3e50a6c 100644
  }
 
  // ============================================================
-@@ -1940,18 +2221,15 @@ pub(crate) async fn handle_chroot_xattr(
+@@ -1940,18 +2232,15 @@ pub(crate) async fn handle_chroot_xattr(
  // ============================================================
 
  pub(crate) async fn handle_chroot_getdents(
@@ -2350,7 +2361,7 @@ index 6e4ab93..3e50a6c 100644
  }
 
  // ============================================================
-@@ -2043,6 +2321,20 @@ pub(crate) async fn handle_chroot_fchdir(
+@@ -2043,6 +2332,20 @@ pub(crate) async fn handle_chroot_fchdir(
      NotifAction::Continue
  }
 
@@ -2371,7 +2382,7 @@ index 6e4ab93..3e50a6c 100644
  // ============================================================
  // getcwd handler
  // ============================================================
-@@ -2092,12 +2384,38 @@ pub(crate) async fn handle_chroot_statfs(
+@@ -2092,12 +2395,38 @@ pub(crate) async fn handle_chroot_statfs(
          None => return NotifAction::Continue,
      };
 
@@ -2414,7 +2425,7 @@ index 6e4ab93..3e50a6c 100644
          Ok(c) => c,
          Err(a) => return a,
      };
-@@ -2118,327 +2436,6 @@ pub(crate) async fn handle_chroot_statfs(
+@@ -2118,327 +2447,6 @@ pub(crate) async fn handle_chroot_statfs(
      NotifAction::ReturnValue(0)
  }
 
@@ -2742,7 +2753,7 @@ index 6e4ab93..3e50a6c 100644
  #[cfg(test)]
  mod self_rewrite_tests {
      use super::canon_proc_self;
-@@ -2475,13 +2472,19 @@ mod mount_ro_tests {
+@@ -2475,13 +2483,19 @@ mod mount_ro_tests {
          writable: &'a [PathBuf],
          processes: &'a Arc<ProcessIndex>,
      ) -> ChrootCtx<'a> {
@@ -2762,7 +2773,7 @@ index 6e4ab93..3e50a6c 100644
              processes,
          }
      }
-@@ -2511,3 +2514,52 @@ mod mount_ro_tests {
+@@ -2511,3 +2525,79 @@ mod mount_ro_tests {
          assert!(c.can_write(Path::new("/data/file")));
      }
  }
@@ -2814,6 +2825,33 @@ index 6e4ab93..3e50a6c 100644
 +        symlink(&original, &replacement).unwrap();
 +        assert_eq!(index_input_image(&images, name, replacement.to_str().unwrap(), &input_key(name), true).unwrap_err().raw_os_error(), Some(libc::EAGAIN));
 +    }
++
++    #[test]
++    fn copied_access_time_respects_source_policy_and_mutations() {
++        let second = 1_000_000_000;
++        let physical = [1, 2, libc::S_IFREG as i128 | 0o644, 1, 1000, 1000, 0, 4, 4096, 8, 20 * second, 10 * second, 30 * second, 0];
++        let mut original = physical;
++        original[1] = 7; original[12] = 15 * second;
++        for (policy, changed, access, expected) in [
++            (0, false, 40 * second, 40 * second),
++            (1, false, 40 * second, 20 * second),
++            (2, false, 40 * second, 20 * second),
++            (2, false, 86420 * second, 86420 * second),
++            (2, true, 40 * second, 40 * second),
++        ] {
++            let image = MetadataImage::from_rows(vec![(physical, original, policy)]).unwrap();
++            let mut observed = physical; observed[10] = access;
++            if changed { observed[12] += second; }
++            image.project(&mut observed);
++            assert_eq!(observed[1], 7); assert_eq!(observed[10], expected);
++        }
++        original[10] = original[12];
++        let image = MetadataImage::from_rows(vec![(physical, original, 2)]).unwrap();
++        let mut observed = physical; observed[10] = 40 * second;
++        image.project(&mut observed); assert_eq!(observed[10], 40 * second);
++        assert!(MetadataImage::from_rows(vec![(physical, original, 3)]).is_err());
++    }
++
 +}
 diff --git a/crates/sandlock-core/src/chroot/resolve.rs b/crates/sandlock-core/src/chroot/resolve.rs
 index f796767..c5ff80f 100644

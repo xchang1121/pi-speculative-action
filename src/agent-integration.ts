@@ -28,6 +28,7 @@ import { type ToolInvocation, type ToolSettlement, toolObservationKey } from "./
 import { ToolExecutionGateway, type ToolOperation } from "./tool-execution-gateway.ts";
 import { createSystemResourceMonitor, type ExecutionResourceMonitor } from "./system-resources.ts";
 import { UNRESTRICTED_PROCESS_EFFECTS } from "./effect-model.ts";
+import { isCompletedProcessExecutionWorld } from "./linux-process-world.ts";
 
 const ACTOR_OPERATION = Symbol("actor-operation");
 const RAW_ACTOR_CALL = Symbol("raw-actor-call");
@@ -136,7 +137,8 @@ export { patternPlanActionID } from "./pattern-plan-source.ts";
  * Build source-neutral speculative plan execution for a host. The host owns lifecycle and tool interception.
  */
 export function createSpeculativeActionHost(sessionID: string, options: CreateSpeculativeActionHostOptions): SpeculativeActionHost {
-	return createAgentExecutionHost(sessionID, options, (world, operation) => world.isolation === "resource_snapshot" || operation === "speculation" && world.isolation === "workspace_branch"
+	return createAgentExecutionHost(sessionID, options, (world, operation) => world.isolation === "resource_snapshot" || operation === "speculation" &&
+		(world.isolation === "workspace_branch" || isCompletedProcessExecutionWorld(world))
 		? undefined : "Outside the supported resource closure; the Actor executes this operation");
 }
 

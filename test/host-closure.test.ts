@@ -7,17 +7,21 @@ import { resourceWorld, systemHost, expectHiddenCompute } from "./agent-system-f
 import { temporaryDirectories } from "./filesystem.ts";
 import { onExit } from "./async.ts";
 import { textOutput } from "./linux-process-fixture.ts";
+import { createCompletedProcessExecutionWorld } from "../src/linux-process-world.ts";
+import { ProcessExecutionCoordinator } from "../src/process-execution.ts";
 
 const directories = temporaryDirectories("pi-host-closure-");
 afterEach(directories.dispose);
 
-test.for(["native", "external"] as const)("rejects every unsupported execution entry before provider work (%s)", async kind => {
+test.for(["native", "external", "copied-completed"] as const)("rejects every unsupported execution entry before provider work (%s)", async kind => {
 	const cwd = await directories.create(), probes: string[] = [];
 	await writeFile(path.join(cwd, "input.txt"), "bound input");
 	const entered = async (entry: string): Promise<never> => { probes.push(entry); throw new Error("outside resource closure"); };
+	const source = kind === "copied-completed" ? createCompletedProcessExecutionWorld({ storeRoot: path.join(cwd, "store"), tools: ["read"],
+		coordinator: new ProcessExecutionCoordinator({ execute: () => entered("process") }) }) : resourceWorld();
 	let disposed = 0;
 	const outside: AgentExecutionWorld = {
-		...resourceWorld(), id: `outside-${kind}`,
+		...source, id: kind === "copied-completed" ? source.id : `outside-${kind}`,
 		scope: "runtime", isolation: "runtime_sandbox",
 		speculation: { ...resourceWorld().speculation!, fingerprint: () => entered("fingerprint"), prepare: () => entered("prepare"),
 			diagnostics: () => entered("diagnostics"), execute: () => entered("execute") },
@@ -25,7 +29,7 @@ test.for(["native", "external"] as const)("rejects every unsupported execution e
 			diagnostics: () => entered("observation-diagnostics") },
 		observeOperations: () => entered("observeOperations"),
 		actorFallbackSettled: () => entered("actorFallbackSettled"), finishTurn: () => entered("finishTurn"),
-		dispose: async () => { disposed++; },
+		dispose: async () => { disposed++; await source.dispose?.(); },
 	};
 	const f = systemHost(cwd, [createReadTool(cwd)], { executionWorlds: [outside] });
 	await using _cleanup = onExit(f.dispose);

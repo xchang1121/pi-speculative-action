@@ -10,6 +10,22 @@ import { toolErrorSettlement, type ToolInvocation } from "./tool-settlement.ts";
 import { WorkspaceSandboxService, type WorkspaceSandboxOptions } from "./workspace-sandbox.ts";
 import { isRecord } from "./stable-json.ts";
 
+const completedWorlds = new WeakSet<object>();
+export const isCompletedProcessExecutionWorld = (world: object) => completedWorlds.has(world);
+
+/** Public Host route for finished, validated branches; it cannot observe or restore Actor processes. */
+export function createCompletedProcessExecutionWorld(options: Pick<LinuxProcessExecutionWorldOptions,
+	"coordinator" | "tools" | "storeRoot" | "store" | "sandlockBinary" | "straceBinary" | "heldExecBinary" | "deniedPaths">): SpeculativeAgentExecutionWorld {
+	const { coordinator, tools, storeRoot, store, sandlockBinary, straceBinary, heldExecBinary, deniedPaths } = options;
+	const implementation = createLinuxProcessExecutionWorld({ coordinator, tools: Object.freeze([...tools]), storeRoot, store,
+		...(sandlockBinary ? { sandlockBinary } : {}), ...(straceBinary ? { straceBinary } : {}), ...(heldExecBinary ? { heldExecBinary } : {}),
+		deniedPaths, driver: "git", completedOnly: true });
+	const world = Object.freeze({ ...implementation, id: "linux_completed_process", observeOperations: undefined,
+		speculation: Object.freeze({ ...implementation.speculation, tools: Object.freeze([...tools]) }) });
+	completedWorlds.add(world);
+	return world;
+}
+
 export interface LinuxProcessExecutionWorldOptions extends LinuxProcessBackendOptions, WorkspaceSandboxOptions {
 	readonly coordinator: ProcessExecutionCoordinator;
 	/** Tools whose complete process outlet is bound by this host, not all process-shaped effect contracts. */
@@ -23,9 +39,10 @@ export interface LinuxProcessExecutionWorldOptions extends LinuxProcessBackendOp
 export function createLinuxProcessExecutionWorld(
 	options: LinuxProcessExecutionWorldOptions,
 ): SpeculativeAgentExecutionWorld {
-	const backend = options.backend ?? new LinuxProcessReuseBackend(options);
-	const workspaceSandbox = options.workspaceSandbox ?? new WorkspaceSandboxService();
-	const ownsWorkspaceSandbox = options.workspaceSandbox === undefined;
+	const { coordinator, backend: suppliedBackend, workspaceSandbox: suppliedWorkspace, ...configuration } = options;
+	const backend = suppliedBackend ?? new LinuxProcessReuseBackend(configuration);
+	const workspaceSandbox = suppliedWorkspace ?? new WorkspaceSandboxService();
+	const ownsWorkspaceSandbox = suppliedWorkspace === undefined;
 	workspaceSandbox.useContentStore(backend.store);
 	const { gitBinary, driver, overlayfsBinary, fusermountBinary } = options;
 	// Processes observe their inputs' times and inodes: an overlay over the workspace itself shows the Actor's own.
@@ -128,7 +145,7 @@ export function createLinuxProcessExecutionWorld(
 						try {
 							if (operation) { const result = await session.executeBinding(operation);
 								return { result: { content: [], details: result.suspended ? { suspended: true } : { exit: result.exit } }, isError: false }; }
-							const result = await options.coordinator.runWith({ execute: async request => {
+							const result = await coordinator.runWith({ execute: async request => {
 								launches++; return { exitCode } = await session!.executor.execute(request);
 							} }, () => context.tool.execute(context.callID, context.args as never, context.signal));
 							if (!launches) throw new Error("process-backed tool bypassed the process execution outlet");
@@ -143,7 +160,7 @@ export function createLinuxProcessExecutionWorld(
 				const commit = branch.commit.bind(branch), dispose = branch.dispose?.bind(branch);
 				return Object.assign(branch, {
 					computationDependencies: session!.computationDependencies(),
-					operations: Object.freeze(session!.executionBindings().map(binding => describeOperation(binding, context.action))),
+					operations: Object.freeze(options.completedOnly ? [] : session!.executionBindings().map(binding => describeOperation(binding, context.action))),
 					commit: () => { if (operation) throw new Error("internal process output cannot commit an enclosing tool"); return session!.ownership.commit(commit); },
 					dispose: async () => { try { await dispose?.(); } finally { await session!.dispose?.(); } },
 				});

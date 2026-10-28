@@ -17,6 +17,7 @@ import { DEFAULTS } from "./common.ts";
 import { PATTERN_AWARE_PRESETS, patternAwarePersistenceFile, type PatternAwareSettings } from "./pattern-aware.ts";
 import { createClosedSearchProfile, createPiToolDefinitions, PI_CLOSED_SEARCH_TOOLS, resolvePiToolInvocation } from "./pi-tool-invocation.ts";
 import { checkLinuxEnvironment, installLinuxDependencies } from "./linux-setup.ts";
+import { createCompletedProcessExecutionWorld } from "./linux-process-world.ts";
 import { emptyWorldReuseMetrics, executionCapabilityStatus, type ExecutionWorldDiagnosticSnapshot, type ExecutionWorldHealthState, type SpeculativeExecution,
 	type WorldReuseMetrics } from "./execution-world.ts";
 import { adaptProcessToolOperations, definedProcessEnvironment, ProcessExecutionCoordinator,
@@ -190,7 +191,7 @@ export function formatSpeculativeActionStatus(input: {
 		`Pattern predictions: ${settings.patternAware.enabled ? "On" : "Off"}; learning active; follow-up steps: ${settings.patternAware.multiStepEnabled ? "On" : "Off"} (alternatives/tool ${settings.patternAware.beamWidth}, depth ${settings.patternAware.maxPredictionDepth}, learn after ${settings.patternAware.minOccurrences}, gap ${settings.patternAware.maxFutureGap}, coverage ${formatPercent(settings.patternAware.futureGapCoverage)}, half-life ${settings.patternAware.decayHalfLifeEvents})`,
 		`Prebuilt modes: ${settings.patternAware.presets.length}/${PATTERN_AWARE_PRESETS.length} selected${settings.patternAware.enabled ? "" : " (inactive)"}; ${PATTERN_AWARE_PRESETS.filter(preset => settings.patternAware.presets.includes(preset.id)).map(preset => preset.label).join(", ") || "None"}`,
 		`Actor probe: ${self.enabled && self.forkEnabled ? `On (${self.forkTransport})` : "Off"}; target verification ${self.enabled ? "On" : "Off"}; early tool execution ${self.enabled && self.forkTransport !== "provider" && self.forkEnabled && self.forkActionEnabled ? self.forkTransport === "drafter" ? "On (Drafter)" : `On (tool-name confidence ≥${formatPercent(self.forkActionMinConfidence)})` : "Off"}; ${self.maxCandidates} candidates × ${self.maxDraftTokens} draft tokens; Actor Profile=${self.actorProfile}; ${self.draftFormat} (${syntaxSettingLabel(self.draftBoundary)} boundary); ${self.forkTransport === "sidecar" ? self.endpoint : FORK_TRANSPORT_LABELS[self.forkTransport]}`,
-		`Execution routing: admitted providers ${settings.executionRouting.primary ? "On" : "Off"}; local file routes ${settings.executionRouting.nativeFallback ? "On" : "Off"}; Actor always available`,
+		`Execution routing: admitted providers ${settings.executionRouting.primary ? "On" : "Off"}; local routes ${settings.executionRouting.nativeFallback ? "On" : "Off"}; Actor always available`,
 		`Search execution: ${searchExecutionLabel(settings.searchExecution)}`,
 		`Tool calls reused: ${formatRatio(metrics.speculativeHits, metrics.actorActions)}; ${metrics.exactReuseHits} exact, ${metrics.partialResultReuseHits} partial, ${metrics.inputReuseHits} inputs`,
 		...(hasProcessReuse(metrics.actorProcessReuse)
@@ -366,6 +367,7 @@ async function installController(
 	const executionWorlds = [
 		...new Set([
 			...primaryExecutionWorlds,
+			createCompletedProcessExecutionWorld({ coordinator: processCoordinator, tools: ["bash"], storeRoot, store: { reservedRoot: true } }),
 			workspaceSandbox.createExecutionWorld(),
 			{ ...createResourceSnapshotExecutionWorld(PI_ACTION_SEMANTICS, { maxBytes: () => currentSettings.resourceCacheMaxBytes,
 				persistentInputs: { store: inputStore, internalCache: true } }),
@@ -390,7 +392,7 @@ async function installController(
 	configureExecutionStorage();
 	let executionDiagnostics: readonly ExecutionWorldDiagnosticSnapshot[] = [];
 	const executionRoutes = (): ExecutionRoutesSnapshot => ({
-		worlds: executionDiagnostics, actorProcessReplay: { state: "unavailable", detail: "Native process reuse is outside the supported resource closure; Actor execution is unchanged" }, primaryIDs: primaryExecutionWorldIDs,
+		worlds: executionDiagnostics, actorProcessReplay: { state: "unavailable", detail: "Finished Bash branches are validated before adoption; live Actor process replay is unavailable" }, primaryIDs: primaryExecutionWorldIDs,
 		searchDetail: !closedSearchEnabled() || (search && !search.profile) ? "Native Pi" : `${searchExecutionLabel(currentSettings.searchExecution)}; ${search?.profile ? [...search.profile.invocations.keys()].join(", ") + " prepared" : "not checked"}`,
 	});
 	const agentTools = new Map([...createPiToolDefinitions(context.cwd, {
@@ -931,7 +933,7 @@ async function openExecutionRoutes(
 ): Promise<void> {
 	await recoverSpeculation(() => controller.refreshExecutionDiagnostics(true));
 	ctx.ui.notify(
-		`Supported reuse covers bound file inputs, deterministic computations and qualified file transactions. Native processes and external runtime sandboxes execute through the Actor. The same boundary applies to prediction, result capture, internal observation and capability refresh; settings cannot widen it.\n${executionWorldSummary(controller.toolCapabilities(), controller.executionRoutes())}`,
+		`Reuse covers bound file inputs, deterministic computations and qualified file transactions. On supported Linux hosts, completed Bash branches can also be adopted after validation. Unsupported or changed inputs fall back to the Actor; live process restoration and external runtime sandboxes remain unavailable.\n${executionWorldSummary(controller.toolCapabilities(), controller.executionRoutes())}`,
 		"info",
 	);
 	return runSettingsMenu(ctx, editor, "Execution routes", settings => {

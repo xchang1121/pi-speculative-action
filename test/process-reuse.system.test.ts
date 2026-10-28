@@ -109,12 +109,17 @@ test.each([
 	{ reason: "unparsed_metadata:stat:101", calls: ['stat("/work/input", {st_mode=S_IFREG|0644}) = 0'] },
 	{ reason: "metadata_changed:/work/input", calls: [1, 2].map(size => `statx(AT_FDCWD, "/work/input", AT_SYMLINK_NOFOLLOW, STATX_SIZE, {stx_mask=STATX_SIZE, stx_size=${size}}) = 0`) },
 	{ reason: "metadata_changed:/work/accessed", calls: [1, 2].map(time => `statx(AT_FDCWD, "/work/accessed", 0, STATX_ATIME, {stx_mask=STATX_ATIME, stx_atime={tv_sec=${time}, tv_nsec=0}}) = 0`) },
-])("derives trace completeness from every recorded rejection ($reason)", async ({ calls, reason }) => {
+])("retains incomplete traces and metadata conflicts for transaction qualification ($reason)", async ({ calls, reason }) => {
 	const { prefix } = await processTrace(['1.000000 execve("/tools/worker", ["worker"], []) = 0', ...calls.map((call, index) => `1.00000${index + 1} ${call}`), "1.000009 +++ exited with 0 +++\n"].join("\n"));
 	const observed = await observeStrace(prefix, "/tools/worker", "/work");
-	expect(observed.incompleteReasons).toContain(reason);
-	expect(observed.complete).toBe(false);
-	expect(observed.taints).toContain("trace_incomplete");
+	if (reason.startsWith("metadata_changed:")) {
+		expect(observed.metadataChanges).toEqual([reason.slice("metadata_changed:".length)]);
+		expect(observed.complete).toBe(true);
+	} else {
+		expect(observed.incompleteReasons).toContain(reason);
+		expect(observed.complete).toBe(false);
+		expect(observed.taints).toContain("trace_incomplete");
+	}
 });
 
 test.each(['3</tools>, "worker", ["worker"], [], 0', '3</tools/worker>, "", ["worker"], [], AT_EMPTY_PATH'])("selects execveat by its directory or descriptor binding (%s)", async args => {
@@ -132,9 +137,9 @@ test.each([false, true])("attributes private external writes only to an owned br
 	const observed = await observeStrace(prefix, "/tools/worker", "/work", {
 		brokeredWrites: pid => pid === (owned ? 101 : 102) ? [target] : undefined,
 	});
-	expect(observed.complete).toBe(owned);
+	expect(observed.complete).toBe(true);
 	expect(observed.external).toEqual(owned ? [target] : []);
-	expect(observed.incompleteReasons).toEqual(owned ? [] : [`metadata_changed:${target}`]);
+	expect(observed.metadataChanges ?? []).toEqual(owned ? [] : [target]);
 });
 
 test("tracks shared cwd and resumed writes across growing ordered trace chunks", async () => {

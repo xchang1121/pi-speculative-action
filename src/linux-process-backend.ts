@@ -93,6 +93,8 @@ export interface LinuxProcessBackendOptions {
 	readonly straceBinary?: string;
 	readonly heldExecBinary?: string;
 	readonly heldExecObserverBinary?: string;
+	/** Seal finished commands without capturing resumable process images. */
+	readonly completedOnly?: boolean;
 	/** Additional host paths that speculative processes must never read. */
 	readonly deniedPaths?: readonly string[];
 }
@@ -271,7 +273,7 @@ export class LinuxProcessReuseBackend {
 			const ready = await this.resolveReady();
 			return {
 				state: "ready",
-				detail: `Landlock/seccomp virtual filesystem + strace provenance ready; ${ready.imageLibrary
+				detail: this.options.completedOnly ? "Finished command branches ready; live process capture disabled" : `Landlock/seccomp virtual filesystem + strace provenance ready; ${ready.imageLibrary
 					? "single-thread live I/O continuation available" : "live I/O continuation unavailable; setup:linux enables the capture tier"}`,
 				fingerprint: ready.fingerprint,
 				sandlockBinary: ready.sandlock,
@@ -665,7 +667,9 @@ export class LinuxProcessReuseBackend {
 					if (!external.complete) throw new Error(`unrepresentable writes outside the workspace: external_write:${[...external.before].find(([, value]) => !value)?.[0]}`);
 					return [...await sealSessionEvidence(session, external), ...external.changes];
 				}),
-				validate: () => validateTransferredProcessEvidence(session.topLevelEvidence, session.incompleteReasons),
+				validate: async () => await readFile("/proc/self/mountinfo", "utf8") !== session.sourceMounts
+					? { status: "stale", cause: { stage: "freshness", code: "source_mount_policy_changed" }, metrics: { bytesRead: 0, filesRead: 0, mode: "exact" } }
+					: validateTransferredProcessEvidence(session.topLevelEvidence, session.incompleteReasons),
 				close: () => session.lifecycle.close(async () => {
 					controller.abort(new Error("Linux process session closed"));
 					try {
@@ -687,6 +691,8 @@ export class LinuxProcessReuseBackend {
 		const readyAt = performance.now();
 		input.signal?.throwIfAborted();
 		const sourceRoot = path.resolve(input.sourceRoot);
+		const sourceMounts = await readFile("/proc/self/mountinfo", "utf8");
+		if (input.workspace.metadataMounts !== undefined && input.workspace.metadataMounts !== sourceMounts) throw new Error("source mount policy changed during workspace capture");
 		const projection = new ExecutionPathProjection({ sourceRoot, workspaceRoot: input.workspace.sandboxRoot });
 		const invocation = "environment" in input.invocation ? input.invocation : undefined;
 		const bound = "environment" in input.invocation ? undefined : this.boundInvocation(input.invocation, input.scope);
@@ -706,7 +712,7 @@ export class LinuxProcessReuseBackend {
 		const server = net.createServer({ allowHalfOpen: true }, (socket) => this.serve(session, socket));
 		const gitDirectory = await lstat(path.join(sourceRoot, ".git")).then((info) => info.isDirectory() ? path.join(sourceRoot, ".git") : undefined, () => undefined);
 		const session = {
-			token, processRoot, sourceRoot, projection, deniedPaths, producer, nestedProducer, socketPath,
+			token, processRoot, sourceRoot, sourceMounts, projection, deniedPaths, producer, nestedProducer, socketPath,
 			// The workspace's own repository stays read-only instead of exposing the snapshot's repository.
 			...(gitDirectory ? { gitDirectory } : {}), workspace: input.workspace, invocation,
 			scope: snapshotExecutionScope(input.scope),
@@ -786,7 +792,9 @@ export class LinuxProcessReuseBackend {
 			const routing = path.join(mountProbe, "routing"), launcher = path.join(routing, "dispatcher");
 			await mkdir(routing); await copyFile(dispatcher, launcher); await chmod(launcher, 0o755);
 			await writeFile(path.join(physicalRoot, "script-position"), "#!/bin/sh\nexit 42\n", { mode: 0o700 });
-			const metadataImage = path.join(physicalRoot, "metadata.json"); await writeFile(metadataImage, "[]", { mode: 0o600 });
+			const metadataImage = path.join(physicalRoot, "metadata.json"), metadataStat = await lstat(path.join(physicalRoot, "script-position"), { bigint: true });
+			const metadataRow = FILESYSTEM_METADATA_FIELDS.map(field => String(metadataStat[field]));
+			await writeFile(metadataImage, JSON.stringify([[metadataRow, metadataRow, 0]]), { mode: 0o600 });
 			const command = straceCommand(strace, path.join(physicalRoot, "context"), [
 				sandlock,
 				...sandboxPolicyArguments(logicalRoot, [], [physicalRoot], [{ virtualPath: logicalRoot, hostPath: physicalRoot, readOnly: false },
@@ -814,8 +822,10 @@ export class LinuxProcessReuseBackend {
 				void capture.catch(() => channel.destroy());
 				return () => capture;
 			} });
-			if (outcome.signal || outcome.code !== 0) throw new Error(`process execution context probe failed${await inheritedTracer()}`);
+			if (outcome.signal || outcome.code !== 0) throw new Error("process execution context probe did not finish");
 			if (!validProcessContext(executionContext)) throw new Error("process execution context probe returned invalid data");
+		} catch (cause) {
+			throw new Error(`process execution/metadata policy probe failed; rebuild with npm run setup:linux${await inheritedTracer()}`, { cause });
 		} finally {
 			await rm(mountProbe, { recursive: true, force: true });
 		}
@@ -971,7 +981,7 @@ export class LinuxProcessReuseBackend {
 					} }).catch(error => { if (!missing(error) || privateBefore.entries.size) throw error; return undefined; });
 					const tracePrefix = path.join(traceRoot, "process");
 					const image = session.projection.toLogical(executable), [invokedPath, comm] = observedPrototype.invocation!, dispatcher = session.interposition;
-					const launchPath = request.imageSource ?? image, logicalCwd = session.projection.toLogical(request.cwd), live = !!captureWorkspace && !outlet && !!ready.imageLibrary;
+					const launchPath = request.imageSource ?? image, logicalCwd = session.projection.toLogical(request.cwd), live = !this.options.completedOnly && !!captureWorkspace && !outlet && !!ready.imageLibrary;
 					descriptors = createProcessDescriptorCapture(session, traceRoot, request, live);
 					const { inputs, descriptorManifest, descriptorReportPath, descriptorImages, directoryImages, inheritedFiles, outputPipes: unchangedOutputPipes } = descriptors;
 					const outputPipes = request.outputPipes?.some(Boolean);
@@ -2020,12 +2030,17 @@ async function captureDependencies(session: ActiveSession, snapshot: WorkspaceSt
 		}
 		return true;
 	})();
+	const vanishedPrivateObject = async (target: string) => external.before.get(target)?.kind === "absence" &&
+		!retainedExternal.has(target) && await privateObjectsUnmoved();
+	for (const target of observations.flatMap(part => part.metadataChanges ?? [])) if (!await vanishedPrivateObject(target)) {
+		taints.add("mutable_input"); incompleteReasons.add(`metadata_changed:${target}`);
+	}
 	const atStart = async (dependency: DynamicDependency) => {
 		if (dependency.kind !== "fd" && dependency.kind !== "lock" && external.before.has(dependency.path)) {
 			const initial = external.before.get(dependency.path);
 			// Only a private object created AND removed by this run can discard its metadata.
 			// A retained output's identity must still agree with the object the Actor will see.
-			if (dependency.kind !== "metadata" || initial?.kind === "absence" && !retainedExternal.has(dependency.path) && await privateObjectsUnmoved()) return initial;
+			if (dependency.kind !== "metadata" || await vanishedPrivateObject(dependency.path)) return initial;
 		}
 		const physical = dependency.kind === "fd" ? undefined : session.projection.toPhysical(dependency.path);
 		const relative = physical && relativeFilesystemPath(snapshot.root, physical);

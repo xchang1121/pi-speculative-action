@@ -42,6 +42,8 @@ export interface StraceObservation {
 	/** Every process its trace holds, a brokered run's launcher among them. */
 	readonly pids?: readonly number[];
 	readonly incompleteReasons: readonly string[];
+	/** Conflicting observations require an enclosing transaction to prove the private object vanished. */
+	readonly metadataChanges?: readonly string[];
 	/** Bounded diagnostic names only; never dependency evidence or a completeness condition. */
 	readonly unsupportedSyscalls?: readonly string[];
 	readonly unsupportedSyscallsTruncated?: true;
@@ -774,9 +776,7 @@ export async function observeStrace(
 	// What it wrote outside the workspace, and the directories holding those names, change by its own hand.
 	const touched = new Set([...external, ...[...written].flatMap(name => semanticRoots.map(root => path.posix.join(root, name.slice(2))))]
 		.flatMap(target => [target, path.posix.dirname(target)]));
-	for (const observed of changedMetadata) if (!touched.has(observed)) {
-		taints.add("mutable_input"); incomplete.add(`metadata_changed:${observed}`);
-	}
+	const metadataChanges = [...changedMetadata].filter(observed => !touched.has(observed)).sort();
 	if (incomplete.size) taints.add("trace_incomplete");
 	return {
 		complete: !incomplete.size,
@@ -790,6 +790,7 @@ export async function observeStrace(
 		pids: [...selected.keys()],
 		tracedProcesses: [...selected].filter(([pid, { lines, start }]) => start < Math.min(lines.length, brokered.get(pid) ?? Infinity)).length,
 		incompleteReasons: Object.freeze([...incomplete].sort()),
+		...(metadataChanges.length ? { metadataChanges: Object.freeze(metadataChanges) } : {}),
 		...(unsupportedSyscalls.size ? { unsupportedSyscalls: Object.freeze([...unsupportedSyscalls].sort()) } : {}),
 		...(unsupportedSyscallsTruncated ? { unsupportedSyscallsTruncated: true as const } : {}),
 		written: [...written].map(name => name.slice(2)).sort(), external: [...external].sort(),

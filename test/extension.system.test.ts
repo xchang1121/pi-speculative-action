@@ -20,6 +20,7 @@ import { summarizeSpeculativeTrace } from "../src/trace-summary.ts";
 import { commitBenchmarkFixture, compileBenchmarkHelper, holdOwnedProcessPublication, inspectProcessOwner } from "./linux-process-fixture.ts";
 import type { SpeculativeActionEvent } from "../src/runtime.ts";
 import { readText, temporaryDirectories } from "./filesystem.ts";
+import { idleResources } from "./agent-system-fixture.ts";
 import { Agent, type AgentTool } from "@earendil-works/pi-agent-core";
 import { deferred, onExit } from "./async.ts";
 import { toolUse as response } from "./model.ts";
@@ -29,7 +30,57 @@ const adoptions = (settlement: PredictionSettlement) => settlement.observation =
 const directories = temporaryDirectories("pi-extension-system-");
 afterEach(async () => { vi.unstubAllEnvs(); vi.restoreAllMocks(); await directories.dispose(); });
 
-test.each(["async", "sync", "async-no-reuse", "sync-no-reuse"])("keeps unsupported callbacks and bash on the original Actor executor (%s)", async mode => {
+test.skipIf(process.platform !== "linux").each(["reuse", "stale", "environment", "outside-mount", "disabled", "routing-off"])(
+	"consumes finished Bash through the default Pi extension (%s)", { timeout: 60_000 }, async mode => {
+	const cwd = await directories.create(os.homedir()), agentDir = await directories.create(os.homedir());
+	vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+	vi.stubEnv("PWD", mode === "outside-mount" ? "/proc" : cwd);
+	vi.stubEnv("BASH_TEST_VERSION", "first");
+	await writeFile(path.join(agentDir, "speculative-action.json"), JSON.stringify({ enabled: true, drafterEnabled: false,
+		reuseEnabled: mode !== "disabled", prepareObservedOperations: true, patternAware: { enabled: false },
+		executionRouting: { nativeFallback: mode !== "routing-off" }, predictionTimeoutMs: 30_000 }));
+	await writeFile(path.join(cwd, "main.c"), '#include <stdio.h>\nint main(void){puts("built:42");return 0;}\n');
+	await writeFile(path.join(cwd, "check.py"), 'print(open("value").read(), end="")\n');
+	await writeFile(path.join(cwd, "value"), "one\n");
+	const command = 'cc main.c -o app && ./app && python3 -B check.py; printf "%s\\n" "$BASH_TEST_VERSION"';
+	expect(execFileSync("/bin/bash", ["-c", command], { cwd, encoding: "utf8" })).toBe("built:42\none\nfirst\n");
+	const nativeEntries = ["completedReplayExecutor", "observeNative", "observeBindings", "refreshNativeObservation"] as const;
+	const forbidden = nativeEntries.map(entry => vi.spyOn(LinuxProcessReuseBackend.prototype, entry).mockImplementation(() => { throw new Error(`unsupported entry: ${entry}`); }));
+	const events: SpeculativeActionEvent<string>[] = [], fallbacks: string[] = [];
+	let host!: ReturnType<typeof createSpeculativeActionHost>, turn!: Parameters<typeof host.startTurn>[0];
+	const extension = createSpeculativeActionExtension({ createHost: (id, options) => {
+		host = createSpeculativeActionHost(id, { ...options, resources: idleResources(2), onEvent: event => { events.push(event); return options.onEvent?.(event); } });
+		return { ...host, startTurn: (input, signal) => { turn = input; return host.startTurn(input, signal); },
+			execute: (input, signal, executor) => host.execute(input, signal, operation => { fallbacks.push(input.tool); return executor(operation); }) };
+	} });
+	const settingsManager = SettingsManager.inMemory({}, { projectTrusted: true });
+	const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager, noExtensions: true, extensionFactories: [extension] });
+	await loader.reload();
+	const actor = fauxProvider({ provider: "default-bash", models: [{ id: "actor" }], tokensPerSecond: 4_000 });
+	const modelRuntime = await ModelRuntime.create({ authPath: path.join(agentDir, "auth.json"), modelsPath: null, refreshOnCreate: false });
+	modelRuntime.registerNativeProvider(actor.provider);
+	const { session } = await createAgentSession({ cwd, agentDir, model: actor.getModel(), modelRuntime, settingsManager, resourceLoader: loader,
+		sessionManager: SessionManager.inMemory(cwd), tools: ["bash"] });
+	await using _session = onExit(async () => { await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" }); session.dispose(); });
+	await session.bindExtensions({ mode: "print", onError: error => { throw error; } });
+	actor.setResponses([async () => {
+		await host.previewActorCall({ turnID: turn.turnID, id: "bash-default", tool: "bash", args: { command }, tools: turn.tools });
+		if (!["disabled", "routing-off"].includes(mode)) await expect.poll(() => events.some(event => event.type === "candidate" && event.state.status === "succeeded"), { timeout: 30_000 }).toBe(true);
+		if (mode === "stale") await writeFile(path.join(cwd, "value"), "two\n");
+		if (mode === "environment") vi.stubEnv("BASH_TEST_VERSION", "second");
+		return response("bash", { command }, { id: "bash-default" });
+	}, fauxAssistantMessage("done")]);
+	await session.prompt("Build the program and run the Python check.");
+	const result = session.messages.find(message => message.role === "toolResult");
+	expect(result, JSON.stringify(events)).toMatchObject({ isError: false, content: [fauxText(`built:42\n${mode === "stale" ? "two" : "one"}\n${mode === "environment" ? "second" : "first"}\n`)] });
+	const settled = events.filter(event => event.type === "actor_action").at(-1)!;
+	expect(fallbacks, JSON.stringify(events)).toEqual(mode === "reuse" ? [] : ["bash"]);
+	expect((settled.computation?.hiddenComputeMs ?? 0) > 0).toBe(mode === "reuse");
+	if (mode === "reuse") expect(settled.settlement.provider).toMatchObject({ kind: "actor", origin: "preview" });
+	for (const entry of forbidden) expect(entry).not.toHaveBeenCalled();
+});
+
+test.each(["async", "sync", "async-no-reuse", "sync-no-reuse"])("keeps unsupported callbacks on Actor and preserves Bash output and effects (%s)", async mode => {
 	const cwd = await directories.create(), agentDir = path.join(cwd, "agent"), calls: string[] = [];
 	await mkdir(agentDir); vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
 	await writeFile(path.join(agentDir, "speculative-action.json"), JSON.stringify({ enabled: true, reuseEnabled: !mode.endsWith("no-reuse"),
@@ -72,8 +123,10 @@ test.each(["async", "sync", "async-no-reuse", "sync-no-reuse"])("keeps unsupport
 	expect(results[0]!.content).toEqual([fauxText("original\n")]); expect(results[1]!.content).toEqual([fauxText("changed\n")]);
 	expect(await readText(cwd, "runs")).toBe("111"); expect(calls).toEqual(["seed", "failed"]);
 	for (const entry of forbidden) expect(entry).not.toHaveBeenCalled();
-	expect(events.filter(event => event.type === "candidate" && event.state.status === "running")).toEqual([]);
+	const bashEligible = process.platform === "linux" && !mode.endsWith("no-reuse");
+	expect(events.filter(event => event.type === "candidate" && event.state.status === "running" && (!bashEligible || event.candidate.tool !== "bash"))).toEqual([]);
 	for (const event of events.filter(event => event.type === "actor_action")) {
+		if (bashEligible && event.settlement.tool === "bash") continue;
 		expect(event.settlement.provider.kind).toBe("actor"); expect(event.computation?.hiddenComputeMs).toBe(0);
 	}
 });
