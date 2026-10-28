@@ -6,9 +6,10 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { BigIntStats } from "node:fs";
 import { CapturedFilesystemObject, mapFilesystem, sameFilesystemIdentity, withFilesystemReadView, type CapturedFilesystemTransfer, type StableFilesystemCapture } from "./filesystem-evidence.ts";
 import { PI_ACTION_SEMANTICS, type ActionKey, type ActionSemanticsRegistry } from "./action-semantics.ts";
+import { DEFAULTS } from "./common.ts";
 import type { ExecutionWorld, ExecutionScope, ExecutionResourceContext, WorldBranch, WorldOutput, WorldCheckpoint, WorldResultCapture } from "./execution-world.ts";
 import { effectCommitFailure } from "./effect-transaction.ts";
-import { effectCapabilitiesCover, RESOURCE_OBSERVATION_EFFECTS, WORKSPACE_PATH_MUTATION_EFFECTS } from "./effect-model.ts";
+import { effectCapabilitiesCover, RESOURCE_OBSERVATION_EFFECTS } from "./effect-model.ts";
 import { captureResourceVersion, collectResourceComputation, invalidateResourceInputs, releaseResourceVersion, resourceProofBytes, validateResourceVersion,
 	ResourceReadView, ResourceInputSession, type ResourceInputPersistence, type ResourceInput, type ResourceObservation, type ResourceVersionToken, type ToolFilesystemOperations, type ToolFilesystemStat } from "./resource-version.ts";
 import { cause } from "./settlement.ts";
@@ -56,55 +57,44 @@ export async function filesystemExecutionDependsOn(action: ActionKey, parent: Ac
 /** Observe Actor reads; only explicitly bound operations may execute ahead over sealed resource data. */
 export function createResourceSnapshotExecutionWorld(
 	actionSemantics: ActionSemanticsRegistry = PI_ACTION_SEMANTICS,
-	operations?: { readonly maxBytes: () => number; readonly persistentInputs?: ResourceInputPersistence },
+	operations: { readonly maxBytes: () => number; readonly persistentInputs?: ResourceInputPersistence } = { maxBytes: () => DEFAULTS.resourceCacheMaxBytes },
 ): AgentExecutionWorld {
-	const canObserve = process.platform !== "win32";
-	const persistence = process.platform === "linux" ? operations?.persistentInputs : undefined;
-	const capturesInputs = (action: ActionKey | undefined, invocation: ToolInvocation | undefined) => !!operations &&
-		(!!invocation?.captureInputs || process.platform === "linux" && (!!invocation?.process || !action || actionSemantics.effect(action) !== "observation"));
+	const persistence = process.platform === "linux" ? operations.persistentInputs : undefined;
 	const route = {
 		capabilities: RESOURCE_OBSERVATION_EFFECTS.capabilities,
 		fingerprint: () => "resource-version",
 		diagnostics: () => ({
 			state: "ready" as const,
-			detail: "Sealed file inputs; host reads may update access times (not an OS snapshot)",
+			detail: "Bound file inputs and deterministic computations; unbound host results are not reusable",
 		}),
 	};
 	return {
 		id: "resource_version",
-		observeOperations: ({ inputs, reuseEnabled }, execute) => actorResourceInputs.run(operations && reuseEnabled !== false
+		observeOperations: ({ inputs, reuseEnabled }, execute) => actorResourceInputs.run(reuseEnabled !== false
 			? { inputs, maxBytes: operations.maxBytes, persistentInputs: persistence } : undefined, execute),
 		scope: "fallback",
 		isolation: "resource_snapshot",
-		observation: { ...route, capabilities: [...(canObserve ? route.capabilities : []), ...(operations ? WORKSPACE_PATH_MUTATION_EFFECTS.capabilities : [])],
-			inputsOnly: request => capturesInputs(request.action, (request.executionContext ?? request.action?.executionContext) as ToolInvocation | undefined),
-			diagnostics: () => canObserve ? route.diagnostics() : { state: operations ? "ready" : "unavailable", detail: "Explicit input and computation bindings are available; host read windows remain unproven on Windows" },
+		observation: { ...route, inputsOnly: () => true,
 			capture: async (context) => {
 				const invocation = context.executionContext ?? context.action?.executionContext as ToolInvocation | undefined;
-				const session = persistence && new ResourceInputSession(persistence, operations!.maxBytes());
+				const session = persistence && new ResourceInputSession(persistence, operations.maxBytes());
 				try {
-					if (operations && invocation?.captureInputs) return invocation.captureInputs(context.action, operations.maxBytes(), context.callID, session);
-					const inputsOnly = capturesInputs(context.action, invocation);
-					if (!inputsOnly && (!context.action || !canObserve || actionSemantics.definition(context.action)?.effect !== "observation")) throw new Error("Actor input capture requires an explicit binding");
-					const root = inputsOnly ? invocation?.filesystemRoot ?? context.cwd : context.cwd;
-					const budget = operations && (inputsOnly || invocation?.filesystem) ? operations.maxBytes() : undefined;
-					const version = session && budget !== undefined ? await session.capture(inputsOnly ? undefined : context.action, root, actionSemantics, budget)
-						: await captureResourceVersion(inputsOnly ? undefined : context.action, root, actionSemantics, budget);
-					return resourceCapture([version], context.action, actionSemantics, inputsOnly, inputsOnly ? undefined : async () => {
-						const validation = await version.manager.seal(version);
-						if (validation.expired) throw new Error(validation.reason ?? "resource observation window changed");
-					}, undefined, undefined, session);
+					if (invocation?.captureInputs) return invocation.captureInputs(context.action, operations.maxBytes(), context.callID, session);
+					const root = invocation?.filesystemRoot ?? context.cwd, budget = operations.maxBytes();
+					const version = session ? await session.capture(undefined, root, actionSemantics, budget)
+						: await captureResourceVersion(undefined, root, actionSemantics, budget);
+					return resourceCapture([version], context.action, actionSemantics, true, undefined, undefined, undefined, session);
 				} catch (error) { await session?.dispose(); throw error; }
 			} },
-		...(operations ? { speculation: {
+		speculation: {
 			...route,
 			dependsOn: filesystemExecutionDependsOn,
 			fingerprint: (request) => {
-				if (request.action && !(request.action.executionContext as ToolInvocation | undefined)?.filesystem) throw new Error("Resource execution requires an explicitly bound operation");
+				if (request.action && !readonlyResourceInvocation(request.action, actionSemantics)) throw new Error("Resource execution requires an explicitly bound read-only operation");
 				return route.fingerprint();
 			},
 			execute: async (context) => {
-				const invocation = context.action.executionContext as ToolInvocation | undefined, execute = invocation?.filesystem;
+				const invocation = readonlyResourceInvocation(context.action, actionSemantics), execute = invocation?.filesystem;
 				if (!execute || context.parentCheckpoint) throw new Error("Resource execution context is not supported");
 				const session = persistence && new ResourceInputSession(persistence, operations.maxBytes());
 				try {
@@ -114,8 +104,14 @@ export function createResourceSnapshotExecutionWorld(
 					return resourceSnapshotBranch({ output: query.output }, query.versions, context.action, actionSemantics, query.inputSource, persistence);
 				} finally { await session?.dispose(); }
 			},
-		} } : {}),
+		},
 	};
+}
+
+function readonlyResourceInvocation(action: ActionKey, semantics: ActionSemanticsRegistry): ToolInvocation | undefined {
+	const invocation = action.executionContext as ToolInvocation | undefined, definition = action.semantics ?? semantics.definition(action);
+	return invocation?.filesystem && definition?.effect === "observation" && definition.resourceScope &&
+		effectCapabilitiesCover(RESOURCE_OBSERVATION_EFFECTS.capabilities, definition.requirements) ? invocation : undefined;
 }
 
 const resourceVersions = new WeakMap<object, () => readonly ResourceVersionToken[]>();
@@ -295,9 +291,9 @@ function resourceSnapshotBranch<Outcome extends WorldOutput<ToolSettlement>>(
 		},
 		...(version.view ? { reconstruct: async (request: Parameters<NonNullable<WorldBranch<ToolSettlement>["reconstruct"]>>[0]) => {
 			request.signal.throwIfAborted();
-			const invocation = request.action.executionContext as ToolInvocation | undefined, definition = request.action.semantics ?? semantics.definition(request.action);
+			const invocation = readonlyResourceInvocation(request.action, semantics);
 			const execute = invocation?.filesystem, root = invocation?.filesystemRoot ?? (request.action.executionFingerprint === executionFingerprint ? version.root : undefined);
-			if (!owned || !execute || !root || definition?.effect !== "observation" || !definition.resourceScope || !effectCapabilitiesCover(RESOURCE_OBSERVATION_EFFECTS.capabilities, definition.requirements)) return undefined;
+			if (!owned || !execute || !root) return undefined;
 			const maxBytes = Math.max(0, version.view!.remainingBytes - inputBytes(versions.slice(1)));
 			const session = persistence && maxBytes > 0 ? new ResourceInputSession(persistence, maxBytes) : undefined;
 			try {

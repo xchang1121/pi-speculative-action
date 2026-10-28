@@ -58,6 +58,35 @@ function capturedReadProof() {
 const directories = temporaryDirectories("pi-agent-system-");
 afterEach(directories.dispose);
 
+test.for(["unbound", "bound", "default-unbound", "default-bound"])("requires actual resource bindings at every capture entry (%s)", async mode => {
+	const cwd = await directories.create(), definition = readDefinition("inspect_input"), args = { path: "input.txt" };
+	const actionSemantics = new ActionSemanticsRegistry([definition]), bound = mode.endsWith("-bound") || mode === "bound";
+	await writeText(cwd, args.path, "source");
+	let calls = 0;
+	const result = (text: string) => ({ content: [fauxText(text)], details: undefined });
+	const tool = { ...createReadTool(cwd), name: definition.tool, execute: async () => result(`unobserved-${++calls}`) };
+	const binding = bound ? bindResourceOperation(async view => {
+		calls++; return { result: result((await view.readFile(path.join(cwd, args.path))).toString()), isError: false };
+	}, cwd, undefined, true) : {};
+	const f = systemHost(cwd, [tool], { actionSemantics,
+		executionWorlds: mode.startsWith("default-") ? [] : [resourceWorld(actionSemantics)],
+		resolveInvocation: () => ({ executor: "closure-input", identity: {}, semantics: definition, ...binding }),
+	});
+	await using _cleanup = onExit(f.dispose);
+	for (const turn of ["first", "second"]) {
+		await f.start(turn);
+		expect(textOutput(await f.execute(tool.name, args))).toBe(bound ? "source" : `unobserved-${turn === "first" ? 1 : 2}`);
+		await f.finish();
+	}
+	if (bound) {
+		expectHiddenCompute(f.actors.at(-1)!.computation!, true);
+		expect(f.fallbacks).toEqual([tool.name]);
+	} else {
+		expect(calls).toBe(2); expect(f.fallbacks).toEqual([tool.name, tool.name]);
+		expectHiddenCompute(f.actors.at(-1)!.computation!, false);
+	}
+});
+
 test.skipIf(process.platform === "win32")("retains independent inputs after a qualified observation fails", async () => {
 	const cwd = await directories.create(), target = path.join(cwd, "missing.txt"), definition = readDefinition("check_missing");
 	const actionSemantics = new ActionSemanticsRegistry([PI_ACTION_SEMANTICS.definition("read")!, definition]);

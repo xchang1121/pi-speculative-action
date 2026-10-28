@@ -2,6 +2,9 @@ import { expect, test, vi } from "vitest";
 import fs, { link, lstat, lutimes, mkdir, mkdtemp, readFile, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 import * as filesystemEvidence from "../src/filesystem-evidence.ts";
 import { nativeProcessLibrary } from "../src/process-startup.mjs";
 import { ResourceVersionManager, type ResourceVersionToken } from "../src/resource-version.ts";
@@ -14,7 +17,6 @@ import { resolvePiToolInvocation } from "../src/pi-tool-invocation.ts";
 import { captureAbsenceDependency, captureDirectoryDependency, captureFileDependency, captureMetadataDependency, captureSymlinkDependency, validateDynamicDependencyCertificate } from "../src/provenance-validation.ts";
 import { ProcessReusePlanner, ProvenanceCertificateStore, sealProcessCertificate } from "../src/process-reuse.ts";
 import { PROCESS_CERTIFICATE } from "./process-fixture.ts";
-import { linuxOverlayfsCapability, mountLinuxOverlayfs, type LinuxOverlayfsMount } from "../src/linux-overlayfs.ts";
 
 const linux = test.skipIf(process.platform !== "linux" || !process.env.PI_SPEC_HELD_EXEC);
 const metadata = async (paths: readonly string[]) => Promise.all(paths.map(async target => {
@@ -442,14 +444,32 @@ linux("captures, consumes and revalidates resource inputs without changing sourc
 });
 
 linux("rejects mount crossings before reading an unqualified filesystem", { timeout: 30_000 }, async () => {
+  const command = promisify(execFile), namespace = await fs.readlink("/proc/self/ns/mnt");
+  if (!process.env.PI_TEST_MOUNT_NAMESPACE_PARENT) {
+    const output = await mkdtemp(path.join(os.tmpdir(), "pi-mount-qualification-")), report = path.join(output, "tests.json");
+    try {
+      const cli = path.join(path.dirname(fileURLToPath(import.meta.resolve("vitest/package.json"))), "vitest.mjs");
+      await command("unshare", ["--user", "--map-root-user", "--mount", "--propagation", "private", process.execPath,
+        cli, "run", fileURLToPath(import.meta.url), "--testNamePattern", "^rejects mount crossings before reading an unqualified filesystem$",
+        "--maxWorkers=1", "--no-file-parallelism", "--reporter=json", "--outputFile", report],
+      { env: { ...process.env, PI_TEST_MOUNT_NAMESPACE_PARENT: namespace }, timeout: 25_000, maxBuffer: 1024 * 1024 });
+      expect(JSON.parse(await readFile(report, "utf8"))).toMatchObject({ numPassedTests: 1, numFailedTests: 0 });
+    } finally { await rm(output, { recursive: true, force: true }); }
+    return;
+  }
+  expect(namespace).not.toBe(process.env.PI_TEST_MOUNT_NAMESPACE_PARENT);
   nativeProcessLibrary(process.env.PI_SPEC_HELD_EXEC!);
-  expect((await linuxOverlayfsCapability()).available).toBe(true);
+  for (const type of ["tmpfs", "bind"]) {
   const fixture = await mkdtemp(path.join(os.tmpdir(), "pi-readonly-mounts-")), source = path.join(fixture, "source");
   const input = path.join(source, "input"), route = path.join(source, "route");
   const lowerRoot = path.join(fixture, "lower"), privateRoot = path.join(fixture, "private"), mountRoot = path.join(privateRoot, "workspace");
-  let mounted: LinuxOverlayfsMount | undefined;
-  const mount = async () => { mounted = await mountLinuxOverlayfs({ lowerRoot, privateRoot }); };
-  const unmount = async () => { await mounted!.close(); mounted = undefined; };
+  let mounted = false;
+  const mount = async () => {
+    await command("mount", type === "bind" ? ["--bind", lowerRoot, mountRoot] : ["-t", "tmpfs", "-o", "mode=700,nosuid,nodev", "tmpfs", mountRoot]);
+    mounted = true;
+    if (type === "tmpfs") await writeFile(path.join(mountRoot, "input"), "mounted\n");
+  };
+  const unmount = async () => { await command("umount", [mountRoot]); mounted = false; };
   // Change a real mount at the initial snapshot boundary; never synthesize mountinfo content.
   const openDuring = async (change: () => Promise<void>) => {
     const original = fs.readFile;
@@ -504,5 +524,6 @@ linux("rejects mount crossings before reading an unqualified filesystem", { time
       await expect(view.verify()).rejects.toThrow("mount topology changed");
     }
     expect(await metadata(paths)).toEqual(before);
-  } finally { await mounted?.close(); await rm(fixture, { recursive: true, force: true }); }
+  } finally { if (mounted) await unmount(); await rm(fixture, { recursive: true, force: true }); }
+  }
 });

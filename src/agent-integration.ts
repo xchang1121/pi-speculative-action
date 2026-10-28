@@ -138,11 +138,12 @@ export { patternPlanActionID } from "./pattern-plan-source.ts";
 export function createSpeculativeActionHost(sessionID: string, options: CreateSpeculativeActionHostOptions): SpeculativeActionHost {
 	const actionSemantics = options.actionSemantics ?? PI_ACTION_SEMANTICS;
 	const projectionRules = resolveActionProjectionRules([...options.projectionRules ?? [], PI_BASH_TIMEOUT_PROJECTION_RULE, PI_GREP_LITERAL_PROJECTION_RULE], actionSemantics);
+	let inputMaxBytes = DEFAULTS.resourceCacheMaxBytes;
 	const executionWorlds = [...new Set(options.executionWorlds ?? [])];
 	if (
 		!executionWorlds.some((world) => world.id === "resource_version" && world.scope === "fallback" && world.isolation === "resource_snapshot")
 	) {
-		executionWorlds.push(createResourceSnapshotExecutionWorld(actionSemantics));
+		executionWorlds.push(createResourceSnapshotExecutionWorld(actionSemantics, { maxBytes: () => inputMaxBytes }));
 	}
 	const executionGateway = new ToolExecutionGateway(executionWorlds, options.speculativeExecutionWorldEnabled);
 	const resolveExecutionRoute = (tool: string, signal?: AbortSignal, action?: ActionKey, parentCheckpoint?: WorldCheckpoint) => {
@@ -155,6 +156,7 @@ export function createSpeculativeActionHost(sessionID: string, options: CreateSp
 		const { patternAware, selfSpeculation, drafterMaxDepth, drafterMaxTokens, drafterTaskMaxRequests, drafterTaskMaxTokens,
 			drafterDeterministicCandidates, drafterTemperatureMin, drafterTemperatureMax, drafterPatternHints, ...policy } =
 			normalizeSpeculativeAgentSettings(await options.getSettings?.());
+		inputMaxBytes = policy.resourceCacheMaxBytes;
 		return {
 			...policy,
 			sourceConfig: {
